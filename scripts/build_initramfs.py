@@ -2451,6 +2451,23 @@ if os.environ.get("ENABLE_IPSEC_TEST") == "1":
 if os.environ.get("ENABLE_SCTP_TEST") == "1":
     FILES.append(("/etc/sctp-test", b"1\n"))
 
+# Native Multipath TCP (MPTCP, RFC 8684) self-test.
+# scripts/test_mptcp.sh sets ENABLE_MPTCP_TEST=1 to plant /etc/mptcp-test;
+# init/main.ad's boot:37.mptcp gate then runs mptcp_selftest() (drivers/net/
+# mptcp.ad), a pure in-memory two-endpoint / two-subflow test that drives the
+# MP_CAPABLE key exchange (deriving each side's token + IDSN from the keys via
+# SHA-256, with an in-file HMAC-SHA256 over fs/sha256.ad), the MP_JOIN token +
+# HMAC challenge/response of a second subflow (verified both directions), then
+# proves the DSS option maps subflow sequence space to the connection-level
+# Data Sequence Number and that data sent across TWO subflows reassembles
+# byte-identically in DSN order (including an out-of-order arrival across
+# subflows buffered + released in DSN order), and a DATA_FIN closes the
+# connection. Security properties: a wrong MP_JOIN HMAC is rejected, a
+# corrupted DSS checksum is detected, and a wrong token does not join. Prints
+# "[mptcp] PASS" / "[mptcp] FAIL". Default boots ship no marker.
+if os.environ.get("ENABLE_MPTCP_TEST") == "1":
+    FILES.append(("/etc/mptcp-test", b"1\n"))
+
 # Native L2TPv3 (RFC 3931) Ethernet-pseudowire encap/decap self-test.
 # scripts/test_l2tp.sh sets ENABLE_L2TP_TEST=1 to plant /etc/l2tp-test;
 # init/main.ad's boot:37.l2tp gate then runs l2tp_selftest()

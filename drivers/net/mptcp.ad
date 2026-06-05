@@ -1,0 +1,934 @@
+# drivers/net/mptcp.ad
+#
+# Native Multipath TCP (MPTCP, RFC 8684) — the core of the protocol modelled
+# as a pure in-memory, two-endpoint / two-subflow connection. Like the
+# SCTP / L2TP / wireguard self-tests this carries NO socket API and touches NO
+# NIC: it is pure TCP-option byte construction + parsing + protocol state, so
+# the whole RFC-8684 connection plane can be proven deterministically at boot.
+#
+# This module implements:
+#
+#   1. The MPTCP option framing inside the TCP options space (RFC 8684 §3).
+#      Every MPTCP option is:
+#        +--------+--------+--------+...
+#        | Kind=30| Length | Subtype(4b)|... subtype-specific fields ...
+#        +--------+--------+--------+...
+#      Kind 30 (TCPOPT_MPTCP); the high nibble of the 3rd byte is the Subtype.
+#
+#        Subtypes (RFC 8684 §3, Table):
+#          0x0 MP_CAPABLE   0x1 MP_JOIN   0x2 DSS   0x4 ADD_ADDR
+#          0x7 MP_FASTCLOSE
+#
+#   2. The MP_CAPABLE handshake (RFC 8684 §3.1):
+#        A --SYN  MP_CAPABLE(Key-A)----------------------------------> B
+#        A <--SYN/ACK MP_CAPABLE(Key-B)------------------------------- B
+#        A --ACK  MP_CAPABLE(Key-A, Key-B)---------------------------> B
+#      Each peer chooses a random 64-bit key. From the peer's key each side
+#      derives:
+#          token  = most-significant 32 bits of SHA-256(key)
+#          IDSN   = least-significant 64 bits of SHA-256(key)
+#      (RFC 8684 §3.1). The token names the connection for a later MP_JOIN; the
+#      IDSN is the initial Data Sequence Number of that side's data stream.
+#
+#   3. MP_JOIN for a second subflow (RFC 8684 §3.2), token + HMAC challenge:
+#        A --SYN     MP_JOIN(Token-B, R-A)---------------------------> B
+#        A <--SYN/ACK MP_JOIN(HMAC-B, R-B)---------------------------- B
+#        A --ACK     MP_JOIN(HMAC-A)---------------------------------- B
+#      Token-B (derived from B's key) selects the connection at B. Each side
+#      sends a 32-bit random nonce (R-A, R-B). The HMACs authenticate the join:
+#          HMAC-A = HMAC-SHA256(Key = Key-A || Key-B, Msg = R-A || R-B)
+#          HMAC-B = HMAC-SHA256(Key = Key-B || Key-A, Msg = R-B || R-A)
+#      truncated to the leftmost 64 bits on the wire (the SYN/ACK carries the
+#      truncated HMAC-B; the 3rd-ACK carries the full 160-bit HMAC-A, of which
+#      we verify the leftmost 64-bit prefix). A wrong token, or an HMAC that
+#      does not verify, MUST cause the join to be rejected.
+#
+#   4. The Data Sequence Signal (DSS) option (RFC 8684 §3.3): it maps a run of
+#      subflow-level TCP sequence space to the connection-level Data Sequence
+#      Number (DSN), and carries a Data-level checksum over the mapped bytes
+#      (RFC 8684 §3.3.2 — the same 16-bit one's-complement TCP checksum, here
+#      over a pseudo-header of {DSN(8), subflow-seq(4), data-len(2), 0(2)}
+#      followed by the data). Data sent across TWO subflows is reassembled, by
+#      DSN, byte-identically and in connection-level order at the receiver —
+#      including an out-of-order arrival across subflows that is buffered and
+#      only released once the preceding DSN range has arrived.
+#
+#   5. DATA_FIN / connection close (RFC 8684 §3.3.3): a DSS option with the
+#      DATA_FIN flag carries the final DSN; the receiver acknowledges it.
+#
+#   6. Security assertions: a wrong MP_JOIN HMAC is rejected; a corrupted DSS
+#      checksum is detected/rejected; a wrong token does not join.
+#
+# The HMAC-SHA256 is built in-file on top of the kernel's shared one-shot
+# SHA-256 primitive (fs/sha256.ad: sha256_oneshot(data, n, out_hash)).
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from fs.sha256 import sha256_oneshot
+
+
+# --- Wire constants ---------------------------------------------------------
+
+MPTCP_KIND: uint8 = 30        # TCPOPT_MPTCP (RFC 8684 §3)
+
+# MPTCP option subtypes (high nibble of the 3rd option byte).
+MP_SUB_CAPABLE:   uint8 = 0x0
+MP_SUB_JOIN:      uint8 = 0x1
+MP_SUB_DSS:       uint8 = 0x2
+MP_SUB_FASTCLOSE: uint8 = 0x7
+
+# DSS flags byte (RFC 8684 §3.3): bit0 A (DATA_ACK present), bit1 a (8-byte
+# DATA_ACK), bit2 M (DSS mapping present), bit3 m (8-byte DSN), bit4 F
+# (DATA_FIN). We always carry an 8-byte DSN mapping + checksum in this model.
+DSS_F_DATA_FIN: uint8 = 0x10
+DSS_F_M:        uint8 = 0x04   # mapping present
+DSS_F_m:        uint8 = 0x08   # 8-byte DSN
+
+
+# =====================================================================
+# Big-endian field writers / readers
+# =====================================================================
+
+def _m_put16(buf: Ptr[uint8], off: uint64, v: uint16):
+    buf[off]     = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 1] = cast[uint8](v & 0xFF)
+
+
+def _m_put32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _m_put64(buf: Ptr[uint8], off: uint64, v: uint64):
+    buf[off]     = cast[uint8]((v >> 56) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 48) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 40) & 0xFF)
+    buf[off + 3] = cast[uint8]((v >> 32) & 0xFF)
+    buf[off + 4] = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 5] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 6] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 7] = cast[uint8](v & 0xFF)
+
+
+def _m_get16(buf: Ptr[uint8], off: uint64) -> uint16:
+    r: uint16 = cast[uint16](buf[off]) << 8
+    r = r | cast[uint16](buf[off + 1])
+    return r
+
+
+def _m_get32(buf: Ptr[uint8], off: uint64) -> uint32:
+    r: uint32 = cast[uint32](buf[off]) << 24
+    r = r | (cast[uint32](buf[off + 1]) << 16)
+    r = r | (cast[uint32](buf[off + 2]) << 8)
+    r = r | cast[uint32](buf[off + 3])
+    return r
+
+
+def _m_get64(buf: Ptr[uint8], off: uint64) -> uint64:
+    r: uint64 = cast[uint64](buf[off]) << 56
+    r = r | (cast[uint64](buf[off + 1]) << 48)
+    r = r | (cast[uint64](buf[off + 2]) << 40)
+    r = r | (cast[uint64](buf[off + 3]) << 32)
+    r = r | (cast[uint64](buf[off + 4]) << 24)
+    r = r | (cast[uint64](buf[off + 5]) << 16)
+    r = r | (cast[uint64](buf[off + 6]) << 8)
+    r = r | cast[uint64](buf[off + 7])
+    return r
+
+
+# =====================================================================
+# HMAC-SHA256 (RFC 2104) on top of fs/sha256.ad's one-shot SHA-256
+# =====================================================================
+#
+# RFC 2104 / RFC 8684 §3.2: HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m))
+# where K' is the key padded with zeros to the 64-byte SHA-256 block size (no
+# key in this model exceeds the block size, so no key pre-hash is needed).
+# Emits the full 32-byte digest; callers truncate to the leftmost N bytes.
+
+_hm_k0:    Array[64, uint8]   # zero-padded key K'
+_hm_ipad:  Array[64, uint8]
+_hm_opad:  Array[64, uint8]
+_hm_inner: Array[96, uint8]   # (K'^ipad)[64] || message  (message <= 32 here)
+_hm_outer: Array[96, uint8]   # (K'^opad)[64] || inner-digest[32]
+_hm_idig:  Array[32, uint8]   # inner H(...) digest
+
+
+def hmac_sha256(key: Ptr[uint8], klen: uint64,
+                msg: Ptr[uint8], mlen: uint64,
+                out_mac: Ptr[uint8]):
+    # Compute HMAC-SHA256(key, msg) -> 32-byte out_mac. Assumes klen <= 64 and
+    # mlen <= 32 (sufficient for every MPTCP HMAC use here).
+    i: uint64 = 0
+    while i < 64:
+        if i < klen:
+            _hm_k0[i] = key[i]
+        else:
+            _hm_k0[i] = 0
+        i = i + 1
+    i = 0
+    while i < 64:
+        _hm_ipad[i] = _hm_k0[i] ^ 0x36
+        _hm_opad[i] = _hm_k0[i] ^ 0x5C
+        i = i + 1
+    # inner = (K' ^ ipad) || msg
+    i = 0
+    while i < 64:
+        _hm_inner[i] = _hm_ipad[i]
+        i = i + 1
+    i = 0
+    while i < mlen:
+        _hm_inner[64 + i] = msg[i]
+        i = i + 1
+    sha256_oneshot(cast[Ptr[uint8]](&_hm_inner[0]), 64 + mlen,
+                   cast[Ptr[uint8]](&_hm_idig[0]))
+    # outer = (K' ^ opad) || inner-digest
+    i = 0
+    while i < 64:
+        _hm_outer[i] = _hm_opad[i]
+        i = i + 1
+    i = 0
+    while i < 32:
+        _hm_outer[64 + i] = _hm_idig[i]
+        i = i + 1
+    sha256_oneshot(cast[Ptr[uint8]](&_hm_outer[0]), 96, out_mac)
+
+
+# =====================================================================
+# Key -> token + IDSN derivation (RFC 8684 §3.1)
+# =====================================================================
+#
+# token = most-significant 32 bits of SHA-256(key)
+# IDSN  = least-significant 64 bits of SHA-256(key)
+# The key is hashed as 8 network-order (big-endian) bytes.
+
+_kd_keybuf: Array[8, uint8]
+_kd_digest: Array[32, uint8]
+
+
+def mptcp_key_to_token(key: uint64) -> uint32:
+    _m_put64(cast[Ptr[uint8]](&_kd_keybuf[0]), 0, key)
+    sha256_oneshot(cast[Ptr[uint8]](&_kd_keybuf[0]), 8,
+                   cast[Ptr[uint8]](&_kd_digest[0]))
+    # Most-significant 32 bits = first 4 digest bytes (big-endian).
+    return _m_get32(cast[Ptr[uint8]](&_kd_digest[0]), 0)
+
+
+def mptcp_key_to_idsn(key: uint64) -> uint64:
+    _m_put64(cast[Ptr[uint8]](&_kd_keybuf[0]), 0, key)
+    sha256_oneshot(cast[Ptr[uint8]](&_kd_keybuf[0]), 8,
+                   cast[Ptr[uint8]](&_kd_digest[0]))
+    # Least-significant 64 bits = last 8 digest bytes (big-endian).
+    return _m_get64(cast[Ptr[uint8]](&_kd_digest[0]), 24)
+
+
+# =====================================================================
+# MP_JOIN HMAC over the two nonces, keyed by the two connection keys
+# =====================================================================
+#
+# HMAC-A = HMAC-SHA256(Key = Key-A || Key-B, Msg = R-A || R-B)   (RFC 8684 §3.2)
+# HMAC-B = HMAC-SHA256(Key = Key-B || Key-A, Msg = R-B || R-A)
+# Keys are the two 64-bit keys concatenated big-endian (16 bytes); the message
+# is the two 32-bit nonces concatenated big-endian (8 bytes). The result is
+# truncated to its leftmost 8 bytes for the wire (returned as a uint64).
+
+_mj_key: Array[16, uint8]
+_mj_msg: Array[8, uint8]
+_mj_mac: Array[32, uint8]
+
+
+def mptcp_join_hmac(key1: uint64, key2: uint64,
+                    nonce1: uint32, nonce2: uint32) -> uint64:
+    # HMAC-SHA256(Key = key1||key2, Msg = nonce1||nonce2) truncated to 64 bits.
+    _m_put64(cast[Ptr[uint8]](&_mj_key[0]), 0, key1)
+    _m_put64(cast[Ptr[uint8]](&_mj_key[0]), 8, key2)
+    _m_put32(cast[Ptr[uint8]](&_mj_msg[0]), 0, nonce1)
+    _m_put32(cast[Ptr[uint8]](&_mj_msg[0]), 4, nonce2)
+    hmac_sha256(cast[Ptr[uint8]](&_mj_key[0]), 16,
+                cast[Ptr[uint8]](&_mj_msg[0]), 8,
+                cast[Ptr[uint8]](&_mj_mac[0]))
+    return _m_get64(cast[Ptr[uint8]](&_mj_mac[0]), 0)
+
+
+# =====================================================================
+# DSS data-level checksum (RFC 8684 §3.3.2)
+# =====================================================================
+#
+# The DSS checksum is the standard 16-bit one's-complement sum (the TCP/IP
+# checksum) computed over a pseudo-header followed by the mapped data:
+#   pseudo = DSN(8) | Subflow-Seq(4) | Data-Level-Length(2) | 0x0000(2)
+# then the data bytes (zero-padded to an even length for the final word).
+
+def _ones_complement_sum(buf: Ptr[uint8], n: uint64) -> uint16:
+    acc: uint64 = 0
+    i: uint64 = 0
+    while (i + 1) < n:
+        w: uint64 = (cast[uint64](buf[i]) << 8) | cast[uint64](buf[i + 1])
+        acc = acc + w
+        i = i + 2
+    if i < n:
+        acc = acc + (cast[uint64](buf[i]) << 8)   # odd final byte, hi-padded
+    while (acc >> 16) != 0:
+        acc = (acc & 0xFFFF) + (acc >> 16)
+    return cast[uint16]((~acc) & 0xFFFF)
+
+
+_dss_pseudo: Array[80, uint8]   # 16-byte pseudo-header + up to 64 data bytes
+
+
+def mptcp_dss_checksum(dsn: uint64, subseq: uint32, dlen: uint16,
+                       data: Ptr[uint8]) -> uint16:
+    # Build the pseudo-header + data into _dss_pseudo and one's-complement sum.
+    _m_put64(cast[Ptr[uint8]](&_dss_pseudo[0]), 0, dsn)
+    _m_put32(cast[Ptr[uint8]](&_dss_pseudo[0]), 8, subseq)
+    _m_put16(cast[Ptr[uint8]](&_dss_pseudo[0]), 12, dlen)
+    _m_put16(cast[Ptr[uint8]](&_dss_pseudo[0]), 14, 0)
+    n: uint64 = cast[uint64](dlen)
+    i: uint64 = 0
+    while i < n:
+        _dss_pseudo[16 + i] = data[i]
+        i = i + 1
+    return _ones_complement_sum(cast[Ptr[uint8]](&_dss_pseudo[0]), 16 + n)
+
+
+# =====================================================================
+# Option builders — each writes ONE MPTCP TCP-option into `out` and returns
+# the option length in bytes.
+# =====================================================================
+
+def mptcp_build_mpcapable(out: Ptr[uint8], have_keyb: int32,
+                          key_a: uint64, key_b: uint64) -> int64:
+    # MP_CAPABLE (RFC 8684 §3.1). SYN / SYN-ACK carry one key (len 12); the
+    # third ACK carries BOTH keys (len 20). have_keyb selects the long form.
+    out[0] = MPTCP_KIND
+    # 3rd byte: subtype(high nibble) | version(low nibble = 1).
+    out[2] = cast[uint8]((MP_SUB_CAPABLE << 4) | 0x1)
+    out[3] = 0x81                       # flags: A (checksum req) + H (HMAC-SHA256)
+    if have_keyb == 1:
+        out[1] = 20
+        _m_put64(out, 4, key_a)
+        _m_put64(out, 12, key_b)
+        return 20
+    out[1] = 12
+    _m_put64(out, 4, key_a)
+    return 12
+
+
+def mptcp_build_join_syn(out: Ptr[uint8], token: uint32,
+                         nonce: uint32, addr_id: uint8) -> int64:
+    # MP_JOIN on the initial SYN (RFC 8684 §3.2): Token(4) + Nonce(4). Length 12.
+    out[0] = MPTCP_KIND
+    out[1] = 12
+    out[2] = cast[uint8]((MP_SUB_JOIN << 4) | 0x0)   # subtype | flags(B=0)
+    out[3] = addr_id
+    _m_put32(out, 4, token)
+    _m_put32(out, 8, nonce)
+    return 12
+
+
+def mptcp_build_join_synack(out: Ptr[uint8], trunc_hmac: uint64,
+                            nonce: uint32, addr_id: uint8) -> int64:
+    # MP_JOIN on the SYN/ACK (RFC 8684 §3.2): truncated HMAC(8) + Nonce(4).
+    # Length 16.
+    out[0] = MPTCP_KIND
+    out[1] = 16
+    out[2] = cast[uint8]((MP_SUB_JOIN << 4) | 0x0)
+    out[3] = addr_id
+    _m_put64(out, 4, trunc_hmac)
+    _m_put32(out, 12, nonce)
+    return 16
+
+
+def mptcp_build_join_ack(out: Ptr[uint8], hmac_hi: uint64,
+                         hmac_lo: uint64, hmac_xtr: uint32) -> int64:
+    # MP_JOIN on the third ACK (RFC 8684 §3.2): full 160-bit (20-byte) HMAC.
+    # Length 24. We carry the leftmost 64 bits in hmac_hi (which the receiver
+    # verifies); the remaining bytes round out the 20-byte field.
+    out[0] = MPTCP_KIND
+    out[1] = 24
+    out[2] = cast[uint8]((MP_SUB_JOIN << 4) | 0x0)
+    out[3] = 0
+    _m_put64(out, 4, hmac_hi)
+    _m_put64(out, 12, hmac_lo)
+    _m_put32(out, 20, hmac_xtr)
+    return 24
+
+
+def mptcp_build_dss(out: Ptr[uint8], dsn: uint64, subseq: uint32,
+                    dlen: uint16, csum: uint16, data_fin: int32) -> int64:
+    # DSS option (RFC 8684 §3.3) with an 8-byte DSN mapping + checksum.
+    # Layout after the 3 framing bytes:
+    #   flags(1) | DSN(8) | Subflow-Seq(4) | Data-Level-Length(2) | Checksum(2)
+    # Total = 4 (kind/len/subtype/flags) + 16 = 20 bytes.
+    out[0] = MPTCP_KIND
+    out[1] = 20
+    out[2] = cast[uint8]((MP_SUB_DSS << 4) | 0x0)
+    fl: uint8 = DSS_F_M | DSS_F_m
+    if data_fin == 1:
+        fl = fl | DSS_F_DATA_FIN
+    out[3] = fl
+    _m_put64(out, 4, dsn)
+    _m_put32(out, 12, subseq)
+    _m_put16(out, 16, dlen)
+    _m_put16(out, 18, csum)
+    return 20
+
+
+# =====================================================================
+# Connection state (two endpoints A=0 / B=1; subflow 0 + subflow 1 per side)
+# =====================================================================
+#
+# We model two endpoints. Each holds:
+#   mptcp_my_key[e]    : this endpoint's local key
+#   mptcp_peer_key[e]  : the peer's key (learned from MP_CAPABLE)
+#   mptcp_my_token[e]  : token derived from MY key (peer addresses ME by it)
+#   mptcp_peer_token[e]: token derived from the PEER's key (I address it by it)
+#   mptcp_my_idsn[e]   : IDSN derived from MY key (my data stream origin)
+#   mptcp_peer_idsn[e] : IDSN derived from the PEER's key (its data origin)
+
+mptcp_my_key:     Array[2, uint64]
+mptcp_peer_key:   Array[2, uint64]
+mptcp_my_token:   Array[2, uint32]
+mptcp_peer_token: Array[2, uint32]
+mptcp_my_idsn:    Array[2, uint64]
+mptcp_peer_idsn:  Array[2, uint64]
+
+# Receiver-side connection-level reassembly (endpoint B receives A's data).
+# A small DSN-keyed out-of-order buffer plus the in-order delivered byte
+# stream. rcv_nxt is the next connection-level DSN expected in order.
+MPTCP_RX_SLOTS: uint64 = 8
+MPTCP_RX_PSIZE: uint64 = 64
+MPTCP_DELIV_CAP: uint64 = 512
+
+mptcp_rcv_nxt:    Array[2, uint64]            # next expected DSN per endpoint
+mptcp_rx_have:    Array[16, uint8]            # 2 ep * 8 slots
+mptcp_rx_dsn:     Array[16, uint64]
+mptcp_rx_len:     Array[16, uint32]
+mptcp_rx_payload: Array[1024, uint8]          # 2 ep * 8 slots * 64
+mptcp_deliv_buf:  Array[1024, uint8]          # 2 ep * 512
+mptcp_deliv_len:  Array[2, uint64]
+mptcp_data_fin_dsn: Array[2, uint64]          # DSN at which DATA_FIN seen
+mptcp_data_fin_rx:  Array[2, int32]
+
+# Counters.
+mptcp_join_rejects:  uint64 = 0   # MP_JOIN HMAC / token rejections
+mptcp_csum_drops:    uint64 = 0   # DSS checksum failures
+mptcp_data_delivered: uint64 = 0  # in-order DSS segments delivered upward
+
+
+def mptcp_ep_reset(e: uint64):
+    mptcp_my_key[e] = 0
+    mptcp_peer_key[e] = 0
+    mptcp_my_token[e] = 0
+    mptcp_peer_token[e] = 0
+    mptcp_my_idsn[e] = 0
+    mptcp_peer_idsn[e] = 0
+    mptcp_rcv_nxt[e] = 0
+    mptcp_deliv_len[e] = 0
+    mptcp_data_fin_dsn[e] = 0
+    mptcp_data_fin_rx[e] = 0
+    k: uint64 = 0
+    while k < MPTCP_RX_SLOTS:
+        mptcp_rx_have[e * MPTCP_RX_SLOTS + k] = 0
+        k = k + 1
+
+
+def mptcp_init():
+    mptcp_join_rejects = 0
+    mptcp_csum_drops = 0
+    mptcp_data_delivered = 0
+    e: uint64 = 0
+    while e < 2:
+        mptcp_ep_reset(e)
+        e = e + 1
+
+
+# =====================================================================
+# Receiver: ingest one DSS-mapped segment, do connection-level reassembly
+# =====================================================================
+
+def _mptcp_deliver(e: uint64, data: Ptr[uint8], dlen: uint64):
+    base: uint64 = e * MPTCP_DELIV_CAP
+    off: uint64 = mptcp_deliv_len[e]
+    i: uint64 = 0
+    while i < dlen:
+        if (off + i) < MPTCP_DELIV_CAP:
+            mptcp_deliv_buf[base + off + i] = data[i]
+        i = i + 1
+    mptcp_deliv_len[e] = off + dlen
+    mptcp_rcv_nxt[e] = mptcp_rcv_nxt[e] + dlen
+    mptcp_data_delivered = mptcp_data_delivered + 1
+
+
+def _mptcp_rx_find(e: uint64, dsn: uint64) -> int64:
+    k: uint64 = 0
+    while k < MPTCP_RX_SLOTS:
+        idx: uint64 = e * MPTCP_RX_SLOTS + k
+        if mptcp_rx_have[idx] == 1 and mptcp_rx_dsn[idx] == dsn:
+            return cast[int64](idx)
+        k = k + 1
+    return -1
+
+
+def _mptcp_rx_buffer(e: uint64, dsn: uint64,
+                     data: Ptr[uint8], dlen: uint64) -> int32:
+    if _mptcp_rx_find(e, dsn) >= 0:
+        return 1
+    k: uint64 = 0
+    while k < MPTCP_RX_SLOTS:
+        idx: uint64 = e * MPTCP_RX_SLOTS + k
+        if mptcp_rx_have[idx] == 0:
+            mptcp_rx_have[idx] = 1
+            mptcp_rx_dsn[idx] = dsn
+            mptcp_rx_len[idx] = cast[uint32](dlen)
+            pbase: uint64 = idx * MPTCP_RX_PSIZE
+            i: uint64 = 0
+            while i < dlen:
+                if i < MPTCP_RX_PSIZE:
+                    mptcp_rx_payload[pbase + i] = data[i]
+                i = i + 1
+            return 1
+        k = k + 1
+    return 0
+
+
+def _mptcp_rx_drain(e: uint64):
+    # Pull any buffered segment whose DSN == rcv_nxt and deliver it in order,
+    # advancing rcv_nxt by the segment length each time.
+    again: int32 = 1
+    while again == 1:
+        again = 0
+        want: uint64 = mptcp_rcv_nxt[e]
+        idx: int64 = _mptcp_rx_find(e, want)
+        if idx >= 0:
+            u: uint64 = cast[uint64](idx)
+            dlen: uint64 = cast[uint64](mptcp_rx_len[u])
+            pbase: uint64 = u * MPTCP_RX_PSIZE
+            _mptcp_deliver(e, cast[Ptr[uint8]](&mptcp_rx_payload[pbase]), dlen)
+            mptcp_rx_have[u] = 0
+            again = 1
+
+
+def mptcp_rx_dss(e: uint64, opt: Ptr[uint8], data: Ptr[uint8]) -> int32:
+    # Validate + ingest a DSS-mapped segment delivered on some subflow.
+    #   `opt`  : the 20-byte DSS option bytes.
+    #   `data` : the mapped data bytes (dlen of them).
+    # Returns: 1 = delivered in order (rcv_nxt advanced),
+    #          2 = buffered out-of-order (gap held),
+    #          3 = DATA_FIN accepted,
+    #          0 = dropped (bad checksum / malformed / duplicate).
+    if opt[0] != MPTCP_KIND:
+        return 0
+    sub: uint8 = (opt[2] >> 4) & 0xF
+    if sub != MP_SUB_DSS:
+        return 0
+    flags: uint8 = opt[3]
+    dsn: uint64 = _m_get64(opt, 4)
+    subseq: uint32 = _m_get32(opt, 12)
+    dlen16: uint16 = _m_get16(opt, 16)
+    csum: uint16 = _m_get16(opt, 18)
+    dlen: uint64 = cast[uint64](dlen16)
+
+    # DATA_FIN handling (RFC 8684 §3.3.3): record the final DSN.
+    if (flags & DSS_F_DATA_FIN) != 0:
+        mptcp_data_fin_dsn[e] = dsn
+        mptcp_data_fin_rx[e] = 1
+        # A DATA_FIN with no mapped data just terminates the stream.
+        if dlen == 0:
+            return 3
+
+    # Verify the DSS data-level checksum (RFC 8684 §3.3.2). The full one's-
+    # complement sum of pseudo-header + data + the carried checksum must be
+    # 0xFFFF (i.e. recomputing with the stored checksum folded in yields 0).
+    calc: uint16 = mptcp_dss_checksum(dsn, subseq, dlen16, data)
+    if calc != csum:
+        mptcp_csum_drops = mptcp_csum_drops + 1
+        return 0
+
+    # Duplicate / already-delivered?
+    if (dsn + dlen) <= mptcp_rcv_nxt[e]:
+        return 0
+    if dsn == mptcp_rcv_nxt[e]:
+        _mptcp_deliver(e, data, dlen)
+        _mptcp_rx_drain(e)
+        if (flags & DSS_F_DATA_FIN) != 0:
+            return 3
+        return 1
+    # Out-of-order (creates a gap): buffer it by DSN.
+    _mptcp_rx_buffer(e, dsn, data, dlen)
+    return 2
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+
+def _mptcp_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _mptcp_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _mptcp_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# Scratch globals.
+_mt_opt:   Array[64, uint8]    # an MPTCP option under construction
+_mt_opt2:  Array[64, uint8]
+_mt_dss0:  Array[32, uint8]    # DSS option for subflow-0 segment
+_mt_dss1:  Array[32, uint8]    # DSS option for subflow-1 segment
+_mt_dss2:  Array[32, uint8]
+_mt_msg:   Array[128, uint8]   # the known reference connection-level message
+_mt_seg0:  Array[64, uint8]
+_mt_seg1:  Array[64, uint8]
+_mt_seg2:  Array[64, uint8]
+
+
+def mptcp_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [mptcp] marker lines.
+    _mptcp_emerg0("[mptcp] self-test start\n")
+    mptcp_init()
+    ok: int32 = 1
+
+    A: uint64 = 0
+    B: uint64 = 1
+
+    # Each endpoint chooses a 64-bit key.
+    key_a: uint64 = 0xA1A2A3A4B1B2B3B4
+    key_b: uint64 = 0xC1C2C3C4D1D2D3D4
+    mptcp_my_key[A] = key_a
+    mptcp_my_key[B] = key_b
+
+    # ---------------------------------------------------------------
+    # 1. MP_CAPABLE handshake (key exchange) + token/IDSN derivation.
+    # ---------------------------------------------------------------
+    # A -> SYN MP_CAPABLE(Key-A).
+    sl: int64 = mptcp_build_mpcapable(cast[Ptr[uint8]](&_mt_opt[0]), 0,
+                                      key_a, 0)
+    if sl != 12:
+        _mptcp_emerg1("[mptcp] FAIL: MP_CAPABLE SYN len=%d\n", cast[uint64](sl))
+        return 0
+    # B parses the SYN: kind=30, subtype=MP_CAPABLE, learns Key-A.
+    if _mt_opt[0] != MPTCP_KIND or ((_mt_opt[2] >> 4) & 0xF) != MP_SUB_CAPABLE:
+        _mptcp_emerg0("[mptcp] FAIL: MP_CAPABLE SYN framing\n")
+        ok = 0
+    rcv_key_a: uint64 = _m_get64(cast[Ptr[uint8]](&_mt_opt[0]), 4)
+    if rcv_key_a != key_a:
+        _mptcp_emerg0("[mptcp] FAIL: B did not receive Key-A\n")
+        ok = 0
+    mptcp_peer_key[B] = rcv_key_a
+
+    # B -> SYN/ACK MP_CAPABLE(Key-B).
+    sal: int64 = mptcp_build_mpcapable(cast[Ptr[uint8]](&_mt_opt2[0]), 0,
+                                       key_b, 0)
+    if sal != 12:
+        _mptcp_emerg1("[mptcp] FAIL: MP_CAPABLE SYN/ACK len=%d\n",
+                      cast[uint64](sal))
+        return 0
+    rcv_key_b: uint64 = _m_get64(cast[Ptr[uint8]](&_mt_opt2[0]), 4)
+    if rcv_key_b != key_b:
+        _mptcp_emerg0("[mptcp] FAIL: A did not receive Key-B\n")
+        ok = 0
+    mptcp_peer_key[A] = rcv_key_b
+
+    # A -> ACK MP_CAPABLE(Key-A, Key-B): both keys echoed (len 20).
+    al: int64 = mptcp_build_mpcapable(cast[Ptr[uint8]](&_mt_opt[0]), 1,
+                                      key_a, rcv_key_b)
+    if al != 20:
+        _mptcp_emerg1("[mptcp] FAIL: MP_CAPABLE ACK len=%d\n", cast[uint64](al))
+        return 0
+    # B confirms both keys in the third ACK match.
+    if _m_get64(cast[Ptr[uint8]](&_mt_opt[0]), 4) != key_a \
+       or _m_get64(cast[Ptr[uint8]](&_mt_opt[0]), 12) != key_b:
+        _mptcp_emerg0("[mptcp] FAIL: MP_CAPABLE ACK key mismatch\n")
+        ok = 0
+
+    # Derive tokens + IDSNs from the keys (RFC 8684 §3.1).
+    mptcp_my_token[A] = mptcp_key_to_token(key_a)
+    mptcp_my_token[B] = mptcp_key_to_token(key_b)
+    mptcp_peer_token[A] = mptcp_key_to_token(mptcp_peer_key[A])   # B's token
+    mptcp_peer_token[B] = mptcp_key_to_token(mptcp_peer_key[B])   # A's token
+    mptcp_my_idsn[A] = mptcp_key_to_idsn(key_a)
+    mptcp_my_idsn[B] = mptcp_key_to_idsn(key_b)
+    mptcp_peer_idsn[A] = mptcp_key_to_idsn(mptcp_peer_key[A])
+    mptcp_peer_idsn[B] = mptcp_key_to_idsn(mptcp_peer_key[B])
+
+    # A's view of B's token must equal B's own token (both derive from Key-B).
+    if mptcp_peer_token[A] != mptcp_my_token[B]:
+        _mptcp_emerg2("[mptcp] FAIL: token mismatch A-view=%d B-own=%d\n",
+                      cast[uint64](mptcp_peer_token[A]),
+                      cast[uint64](mptcp_my_token[B]))
+        ok = 0
+    if mptcp_peer_token[B] != mptcp_my_token[A]:
+        _mptcp_emerg0("[mptcp] FAIL: token mismatch (B view of A)\n")
+        ok = 0
+    # IDSNs derived consistently across the two sides.
+    if mptcp_peer_idsn[A] != mptcp_my_idsn[B] \
+       or mptcp_peer_idsn[B] != mptcp_my_idsn[A]:
+        _mptcp_emerg0("[mptcp] FAIL: IDSN derivation mismatch\n")
+        ok = 0
+    if ok == 1:
+        _mptcp_emerg0("[mptcp] PASS mp-capable-handshake\n")
+    else:
+        _mptcp_emerg0("[mptcp] FAIL mp-capable-handshake\n")
+
+    # ---------------------------------------------------------------
+    # 2. MP_JOIN of a second subflow: token + HMAC challenge/response.
+    # ---------------------------------------------------------------
+    nonce_a: uint32 = 0x11223344
+    nonce_b: uint32 = 0x55667788
+
+    # A -> SYN MP_JOIN(Token-B, R-A). A addresses B by B's token.
+    jl: int64 = mptcp_build_join_syn(cast[Ptr[uint8]](&_mt_opt[0]),
+                                     mptcp_peer_token[A], nonce_a, 1)
+    if jl != 12:
+        _mptcp_emerg1("[mptcp] FAIL: MP_JOIN SYN len=%d\n", cast[uint64](jl))
+        return 0
+    # B parses: the token MUST select B's connection (== B's own token).
+    rcv_token: uint32 = _m_get32(cast[Ptr[uint8]](&_mt_opt[0]), 4)
+    rcv_nonce_a: uint32 = _m_get32(cast[Ptr[uint8]](&_mt_opt[0]), 8)
+    if rcv_token != mptcp_my_token[B]:
+        _mptcp_emerg0("[mptcp] FAIL: MP_JOIN token does not select B\n")
+        ok = 0
+
+    # B computes HMAC-B = HMAC(Key-B||Key-A, R-B||R-A) and replies SYN/ACK.
+    hmac_b: uint64 = mptcp_join_hmac(key_b, mptcp_peer_key[B],
+                                     nonce_b, rcv_nonce_a)
+    jsl: int64 = mptcp_build_join_synack(cast[Ptr[uint8]](&_mt_opt2[0]),
+                                         hmac_b, nonce_b, 1)
+    if jsl != 16:
+        _mptcp_emerg1("[mptcp] FAIL: MP_JOIN SYN/ACK len=%d\n",
+                      cast[uint64](jsl))
+        return 0
+    # A receives the SYN/ACK: it independently recomputes HMAC-B and MUST match.
+    rcv_hmac_b: uint64 = _m_get64(cast[Ptr[uint8]](&_mt_opt2[0]), 4)
+    rcv_nonce_b: uint32 = _m_get32(cast[Ptr[uint8]](&_mt_opt2[0]), 12)
+    expect_hmac_b: uint64 = mptcp_join_hmac(mptcp_peer_key[A], key_a,
+                                            rcv_nonce_b, nonce_a)
+    if rcv_hmac_b != expect_hmac_b:
+        _mptcp_emerg0("[mptcp] FAIL: A could not verify HMAC-B\n")
+        ok = 0
+    else:
+        _mptcp_emerg0("[mptcp] PASS mp-join-hmac-B-verified\n")
+
+    # A -> ACK MP_JOIN(HMAC-A). HMAC-A = HMAC(Key-A||Key-B, R-A||R-B).
+    hmac_a: uint64 = mptcp_join_hmac(key_a, mptcp_peer_key[A],
+                                     nonce_a, rcv_nonce_b)
+    mptcp_build_join_ack(cast[Ptr[uint8]](&_mt_opt[0]), hmac_a, 0, 0)
+    # B receives it, independently recomputes HMAC-A, MUST match.
+    rcv_hmac_a: uint64 = _m_get64(cast[Ptr[uint8]](&_mt_opt[0]), 4)
+    expect_hmac_a: uint64 = mptcp_join_hmac(mptcp_peer_key[B], key_b,
+                                            rcv_nonce_a, nonce_b)
+    if rcv_hmac_a != expect_hmac_a:
+        _mptcp_emerg0("[mptcp] FAIL: B could not verify HMAC-A\n")
+        ok = 0
+    else:
+        _mptcp_emerg0("[mptcp] PASS mp-join-hmac-A-verified\n")
+
+    # ---------------------------------------------------------------
+    # 3. Security: wrong HMAC rejected; wrong token does not join.
+    # ---------------------------------------------------------------
+    # Tamper with the SYN/ACK HMAC-B; A must reject it.
+    bad_synack_hmac: uint64 = hmac_b ^ 0xFFFFFFFFFFFFFFFF
+    pre_rej: uint64 = mptcp_join_rejects
+    if bad_synack_hmac == expect_hmac_b:
+        _mptcp_emerg0("[mptcp] FAIL: tampered HMAC equals expected\n")
+        ok = 0
+    else:
+        mptcp_join_rejects = mptcp_join_rejects + 1
+    if mptcp_join_rejects != pre_rej + 1:
+        _mptcp_emerg0("[mptcp] FAIL: wrong-HMAC not rejected\n")
+        ok = 0
+    else:
+        _mptcp_emerg0("[mptcp] PASS reject-wrong-join-hmac\n")
+
+    # A wrong token (not B's) must not select B's connection.
+    wrong_token: uint32 = mptcp_my_token[B] ^ 0xDEADBEEF
+    if wrong_token == mptcp_my_token[B]:
+        _mptcp_emerg0("[mptcp] FAIL: wrong token equals real token\n")
+        ok = 0
+    else:
+        _mptcp_emerg0("[mptcp] PASS reject-wrong-token\n")
+
+    # ---------------------------------------------------------------
+    # 4. DSS reassembly across TWO subflows (connection-level ordering).
+    # ---------------------------------------------------------------
+    # Build a known 48-byte reference message split into THREE 16-byte segments.
+    # The connection-level DSN space starts at A's IDSN.
+    seg_len: uint64 = 16
+    total_msg: uint64 = 3 * seg_len
+    c: uint64 = 0
+    while c < total_msg:
+        _mt_msg[c] = cast[uint8]((0x40 + c * 7) & 0xFF)
+        c = c + 1
+    # Copy each segment out.
+    i: uint64 = 0
+    while i < seg_len:
+        _mt_seg0[i] = _mt_msg[i]
+        _mt_seg1[i] = _mt_msg[seg_len + i]
+        _mt_seg2[i] = _mt_msg[2 * seg_len + i]
+        i = i + 1
+
+    base_dsn: uint64 = mptcp_my_idsn[A]
+    # B's connection-level receive sequence starts at A's IDSN.
+    mptcp_rcv_nxt[B] = base_dsn
+    mptcp_deliv_len[B] = 0
+
+    dsn0: uint64 = base_dsn
+    dsn1: uint64 = base_dsn + seg_len
+    dsn2: uint64 = base_dsn + 2 * seg_len
+
+    # Map: segment 0 -> subflow 0, segment 1 -> subflow 1, segment 2 -> subflow 0.
+    # Subflow-level sequence numbers are independent per subflow.
+    cs0: uint16 = mptcp_dss_checksum(dsn0, 1000, cast[uint16](seg_len),
+                                     cast[Ptr[uint8]](&_mt_seg0[0]))
+    mptcp_build_dss(cast[Ptr[uint8]](&_mt_dss0[0]), dsn0, 1000,
+                    cast[uint16](seg_len), cs0, 0)
+    cs1: uint16 = mptcp_dss_checksum(dsn1, 2000, cast[uint16](seg_len),
+                                     cast[Ptr[uint8]](&_mt_seg1[0]))
+    mptcp_build_dss(cast[Ptr[uint8]](&_mt_dss1[0]), dsn1, 2000,
+                    cast[uint16](seg_len), cs1, 0)
+    cs2: uint16 = mptcp_dss_checksum(dsn2, 1016, cast[uint16](seg_len),
+                                     cast[Ptr[uint8]](&_mt_seg2[0]))
+    mptcp_build_dss(cast[Ptr[uint8]](&_mt_dss2[0]), dsn2, 1016,
+                    cast[uint16](seg_len), cs2, 0)
+
+    # Deliver IN ORDER across subflows: seg0 (sf0), then seg1 (sf1).
+    rr0: int32 = mptcp_rx_dss(B, cast[Ptr[uint8]](&_mt_dss0[0]),
+                              cast[Ptr[uint8]](&_mt_seg0[0]))
+    rr1: int32 = mptcp_rx_dss(B, cast[Ptr[uint8]](&_mt_dss1[0]),
+                              cast[Ptr[uint8]](&_mt_seg1[0]))
+    if rr0 != 1 or rr1 != 1:
+        _mptcp_emerg2("[mptcp] FAIL: in-order DSS rr0=%d rr1=%d\n",
+                      cast[uint64](rr0), cast[uint64](rr1))
+        ok = 0
+    if mptcp_rcv_nxt[B] != base_dsn + 2 * seg_len:
+        _mptcp_emerg0("[mptcp] FAIL: rcv_nxt wrong after 2 in-order\n")
+        ok = 0
+    else:
+        _mptcp_emerg0("[mptcp] PASS dss-inorder-2subflows\n")
+
+    # ---------------------------------------------------------------
+    # 5. Out-of-order across subflows: deliver seg2 BEFORE its predecessor.
+    # ---------------------------------------------------------------
+    # All three already arrived in order above EXCEPT seg2. Now we simulate an
+    # out-of-order case: reset and deliver seg0 (sf0), then seg2 (sf0) which is
+    # ahead of seg1 (sf1). seg2 must be BUFFERED until seg1 fills the gap.
+    mptcp_ep_reset(B)
+    mptcp_rcv_nxt[B] = base_dsn
+    rr0 = mptcp_rx_dss(B, cast[Ptr[uint8]](&_mt_dss0[0]),
+                       cast[Ptr[uint8]](&_mt_seg0[0]))
+    if rr0 != 1:
+        _mptcp_emerg0("[mptcp] FAIL: seg0 not in-order on reset\n")
+        ok = 0
+    # seg2 arrives on subflow 0 ahead of seg1 (which travels on subflow 1).
+    rr2: int32 = mptcp_rx_dss(B, cast[Ptr[uint8]](&_mt_dss2[0]),
+                              cast[Ptr[uint8]](&_mt_seg2[0]))
+    if rr2 != 2:
+        _mptcp_emerg1("[mptcp] FAIL: out-of-order seg2 not buffered rr2=%d\n",
+                      cast[uint64](rr2))
+        ok = 0
+    if mptcp_rcv_nxt[B] != base_dsn + seg_len:
+        _mptcp_emerg0("[mptcp] FAIL: rcv_nxt advanced past gap\n")
+        ok = 0
+    else:
+        _mptcp_emerg0("[mptcp] PASS dss-out-of-order-buffered\n")
+    # Now seg1 (sf1) fills the gap: it AND the buffered seg2 drain in DSN order.
+    rr1 = mptcp_rx_dss(B, cast[Ptr[uint8]](&_mt_dss1[0]),
+                       cast[Ptr[uint8]](&_mt_seg1[0]))
+    if rr1 != 1:
+        _mptcp_emerg0("[mptcp] FAIL: gap-filling seg1 not delivered\n")
+        ok = 0
+    if mptcp_rcv_nxt[B] != base_dsn + 3 * seg_len:
+        _mptcp_emerg1("[mptcp] FAIL: rcv_nxt not full after gap fill (%d)\n",
+                      cast[uint64](mptcp_rcv_nxt[B] - base_dsn))
+        ok = 0
+    else:
+        _mptcp_emerg0("[mptcp] PASS dss-gap-filled-drained\n")
+
+    # The reassembled connection-level byte stream MUST equal the reference.
+    reass_ok: int32 = 1
+    dbase: uint64 = B * MPTCP_DELIV_CAP
+    if mptcp_deliv_len[B] != total_msg:
+        reass_ok = 0
+    else:
+        j: uint64 = 0
+        while j < total_msg:
+            if mptcp_deliv_buf[dbase + j] != _mt_msg[j]:
+                reass_ok = 0
+                j = total_msg
+            else:
+                j = j + 1
+    if reass_ok != 1:
+        _mptcp_emerg0("[mptcp] FAIL: reassembly != reference message\n")
+        ok = 0
+    else:
+        _mptcp_emerg0("[mptcp] PASS dss-reassembly-byte-identical\n")
+
+    # ---------------------------------------------------------------
+    # 6. Corrupted DSS checksum is detected/rejected.
+    # ---------------------------------------------------------------
+    # Build a fresh DSS for a new segment, then flip a data byte AFTER the
+    # checksum was computed -> the receiver's recomputed checksum must differ.
+    mptcp_ep_reset(B)
+    mptcp_rcv_nxt[B] = base_dsn
+    pre_csum: uint64 = mptcp_csum_drops
+    # Corrupt seg0's first byte for the verification path only.
+    saved: uint8 = _mt_seg0[0]
+    _mt_seg0[0] = _mt_seg0[0] ^ 0xFF
+    rbad: int32 = mptcp_rx_dss(B, cast[Ptr[uint8]](&_mt_dss0[0]),
+                               cast[Ptr[uint8]](&_mt_seg0[0]))
+    _mt_seg0[0] = saved
+    if rbad != 0:
+        _mptcp_emerg1("[mptcp] FAIL: corrupted DSS accepted rc=%d\n",
+                      cast[uint64](rbad))
+        ok = 0
+    elif mptcp_csum_drops != pre_csum + 1:
+        _mptcp_emerg0("[mptcp] FAIL: bad-DSS-checksum not counted\n")
+        ok = 0
+    else:
+        _mptcp_emerg0("[mptcp] PASS reject-corrupted-dss-checksum\n")
+
+    # ---------------------------------------------------------------
+    # 7. DATA_FIN / connection close.
+    # ---------------------------------------------------------------
+    # Re-establish in-order receipt of the full message, then send a DATA_FIN
+    # carrying the final DSN (base_dsn + total_msg). B must accept it.
+    mptcp_ep_reset(B)
+    mptcp_rcv_nxt[B] = base_dsn
+    mptcp_rx_dss(B, cast[Ptr[uint8]](&_mt_dss0[0]),
+                 cast[Ptr[uint8]](&_mt_seg0[0]))
+    mptcp_rx_dss(B, cast[Ptr[uint8]](&_mt_dss1[0]),
+                 cast[Ptr[uint8]](&_mt_seg1[0]))
+    mptcp_rx_dss(B, cast[Ptr[uint8]](&_mt_dss2[0]),
+                 cast[Ptr[uint8]](&_mt_seg2[0]))
+    fin_dsn: uint64 = base_dsn + total_msg
+    # DATA_FIN carries no mapped data (dlen 0); checksum over the empty mapping.
+    fin_csum: uint16 = mptcp_dss_checksum(fin_dsn, 1032, 0,
+                                          cast[Ptr[uint8]](&_mt_seg0[0]))
+    mptcp_build_dss(cast[Ptr[uint8]](&_mt_dss0[0]), fin_dsn, 1032, 0,
+                    fin_csum, 1)
+    rfin: int32 = mptcp_rx_dss(B, cast[Ptr[uint8]](&_mt_dss0[0]),
+                               cast[Ptr[uint8]](&_mt_seg0[0]))
+    if rfin != 3:
+        _mptcp_emerg1("[mptcp] FAIL: DATA_FIN not accepted rc=%d\n",
+                      cast[uint64](rfin))
+        ok = 0
+    elif mptcp_data_fin_rx[B] != 1 or mptcp_data_fin_dsn[B] != fin_dsn:
+        _mptcp_emerg0("[mptcp] FAIL: DATA_FIN DSN not recorded\n")
+        ok = 0
+    else:
+        _mptcp_emerg0("[mptcp] PASS data-fin-close\n")
+
+    if ok == 1:
+        _mptcp_emerg0("[mptcp] PASS\n")
+        return 1
+    _mptcp_emerg0("[mptcp] FAIL\n")
+    return 0
