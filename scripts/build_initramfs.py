@@ -1646,6 +1646,18 @@ if os.environ.get("ENABLE_EXT4_HTREE_TEST") == "1":
 if os.environ.get("ENABLE_EXT4_HTINS_TEST") == "1":
     FILES.append(("/etc/ext4-htins-test", b"1\n"))
 
+# ext4 large_dir (3-level htree growth) WRITE self-test.
+# scripts/test_ext4_largedir.sh sets ENABLE_EXT4_LARGEDIR_TEST=1 to plant
+# /etc/ext4-largedir-test. init/main.ad detects the marker after the ext4
+# mount and calls ext4_largedir_selftest() (fs/ext4.ad): it resolves the
+# on-disk near-full 2-level "lgdir" dir_index directory and inserts new
+# names until the dx_root overflows and the tree grows to 3 index levels
+# (indirect_levels==2, gated on the superblock's INCOMPAT_LARGEDIR), then
+# verifies every inserted name resolves via the 3-level hash descend. WRITES
+# the mounted image, so opt-in via the marker; default boots omit it.
+if os.environ.get("ENABLE_EXT4_LARGEDIR_TEST") == "1":
+    FILES.append(("/etc/ext4-largedir-test", b"1\n"))
+
 # ext4 extent-FREE / no-leak self-test. scripts/test_ext4_extent_free.sh
 # sets ENABLE_EXT4EXTFREE_TEST=1 to plant /etc/ext4extfree-test.
 # init/main.ad detects the marker after the ext4 mount and calls
