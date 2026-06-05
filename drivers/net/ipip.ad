@@ -1,0 +1,519 @@
+# drivers/net/ipip.ad
+#
+# ipip — IPv4-in-IPv4 encapsulation (RFC 2003), IP protocol 4.
+# A point-to-point L3 tunnel: a complete inner IPv4 packet is carried,
+# verbatim, inside an OUTER IPv4 packet whose protocol field is 4 (IPIP)
+# and whose src/dst are the configured tunnel endpoints. There is NO
+# intermediate shim header at all — the outer IPv4 header is immediately
+# followed by the original inner IPv4 packet (RFC 2003 §3.1):
+#
+#   +----------------------------------------------------------+
+#   | Outer IPv4 (20)   proto=4 (IPIP), correct len + csum      |
+#   +----------------------------------------------------------+
+#   | Inner IPv4 packet (the original datagram, unmodified)     |
+#   +----------------------------------------------------------+
+#
+# Per RFC 2003 §3.1 the encapsulator does NOT decrement the inner TTL;
+# the outer header gets its own TTL from the tunnel config. The outer
+# header's Total Length covers OuterIP(20) + the entire inner packet.
+#
+# We reuse the native stack's ip_csum16 (RFC-1071 ones'-complement
+# Internet checksum) for the outer IPv4 header checksum, exactly as
+# drivers/net/gre.ad does.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.ip import ip_csum16, IP_HDR_LEN, IP_TTL
+
+
+# --- Wire constants ----------------------------------------------------
+
+# IANA IP protocol number for IPv4 encapsulation (RFC 2003 §1; "IPIP").
+IPPROTO_IPIP: uint8 = 4
+
+# Outer overhead before the inner packet: just the 20-byte outer IPv4
+# header (no shim header in RFC 2003).
+IPIP_OUTER_OVERHEAD: uint64 = 20      # == IP_HDR_LEN
+
+
+# Counters (mirror the /sys-visible accounting a real ipip netdev keeps).
+ipip_tx_encaps: uint64 = 0
+ipip_rx_decaps: uint64 = 0
+ipip_rx_drops:  uint64 = 0
+
+
+# =====================================================================
+# Tunnel table: a small (local,remote) keyed lookup
+# =====================================================================
+#
+# A real ipip netdev is point-to-point with a configured local + remote
+# endpoint. A fixed-size table resolves a known set of tunnels by key.
+
+IPIP_TUN_MAX: uint64 = 16
+
+ipip_tun_inuse:  Array[16, uint8]      # 1 if slot holds a tunnel
+ipip_tun_key:    Array[16, uint32]     # tunnel key (host order)
+ipip_tun_local:  Array[16, uint32]     # local endpoint IPv4 (host order)
+ipip_tun_remote: Array[16, uint32]     # remote endpoint IPv4 (host order)
+
+
+def ipip_init():
+    # Reset the tunnel table and counters. Idempotent.
+    i: uint64 = 0
+    while i < IPIP_TUN_MAX:
+        ipip_tun_inuse[i]  = 0
+        ipip_tun_key[i]    = 0
+        ipip_tun_local[i]  = 0
+        ipip_tun_remote[i] = 0
+        i = i + 1
+    ipip_tx_encaps = 0
+    ipip_rx_decaps = 0
+    ipip_rx_drops  = 0
+
+
+def ipip_tunnel_add(key: uint32, local_ip: uint32, remote_ip: uint32) -> int32:
+    # Install (or overwrite) a tunnel keyed by `key`. Returns the slot
+    # index on success, -1 if the table is full. An existing entry for the
+    # same key is overwritten.
+    i: uint64 = 0
+    free_slot: int32 = -1
+    while i < IPIP_TUN_MAX:
+        if ipip_tun_inuse[i] != 0:
+            if ipip_tun_key[i] == key:
+                free_slot = cast[int32](i)
+                i = IPIP_TUN_MAX
+        else:
+            if free_slot < 0:
+                free_slot = cast[int32](i)
+        if i < IPIP_TUN_MAX:
+            i = i + 1
+    if free_slot < 0:
+        return -1
+    slot: uint64 = cast[uint64](free_slot)
+    ipip_tun_inuse[slot]  = 1
+    ipip_tun_key[slot]    = key
+    ipip_tun_local[slot]  = local_ip
+    ipip_tun_remote[slot] = remote_ip
+    return cast[int32](free_slot)
+
+
+def ipip_tunnel_lookup(key: uint32, out_local: Ptr[uint32],
+                       out_remote: Ptr[uint32]) -> int32:
+    # Resolve a tunnel by key. On a hit, writes the local IPv4 into
+    # *out_local and the remote IPv4 into *out_remote (if non-NULL) and
+    # returns the slot index. Returns -1 if the key is unknown.
+    i: uint64 = 0
+    while i < IPIP_TUN_MAX:
+        if ipip_tun_inuse[i] != 0:
+            if ipip_tun_key[i] == key:
+                if out_local != cast[Ptr[uint32]](0):
+                    out_local[0] = ipip_tun_local[i]
+                if out_remote != cast[Ptr[uint32]](0):
+                    out_remote[0] = ipip_tun_remote[i]
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# =====================================================================
+# Big-endian field writers / readers
+# =====================================================================
+
+def _ipip_put16(buf: Ptr[uint8], off: uint64, v: uint16):
+    buf[off]     = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    buf[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+def _ipip_get16(buf: Ptr[uint8], off: uint64) -> uint16:
+    hi: uint16 = cast[uint16](buf[off]) << 8
+    lo: uint16 = cast[uint16](buf[off + 1])
+    return hi | lo
+
+
+def _ipip_put32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _ipip_get32(buf: Ptr[uint8], off: uint64) -> uint32:
+    r: uint32 = cast[uint32](buf[off]) << 24
+    r = r | (cast[uint32](buf[off + 1]) << 16)
+    r = r | (cast[uint32](buf[off + 2]) << 8)
+    r = r | cast[uint32](buf[off + 3])
+    return r
+
+
+# =====================================================================
+# ENCAP
+# =====================================================================
+
+def ipip_encap(inner: Ptr[uint8], inner_len: uint64,
+               src_ip: uint32, dst_ip: uint32,
+               out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Build the full outer IPIP frame into `out` and return its total
+    # length, or a negative code on error (-1 buffer too small, -4 inner
+    # too short to be an IPv4 packet).
+    #
+    #   out = OuterIP(20) | inner IPv4 packet (verbatim)
+    #
+    # All outer IPv4 lengths and the IPv4 header checksum are computed
+    # correctly. Per RFC 2003 the inner packet is copied unmodified — its
+    # TTL is NOT decremented here.
+    if inner_len < IP_HDR_LEN:
+        return -4
+    total: uint64 = IP_HDR_LEN + inner_len
+    if total > out_cap:
+        return -1
+
+    # --- Outer IPv4 header (offset 0..19) ---
+    out[0] = 0x45                            # version 4, IHL 5
+    out[1] = 0                               # DSCP/ECN
+    _ipip_put16(out, 2, cast[uint16](total)) # total length
+    _ipip_put16(out, 4, 0)                   # id
+    _ipip_put16(out, 6, 0)                   # flags/frag = 0
+    out[8]  = IP_TTL                         # outer TTL (tunnel config)
+    out[9]  = IPPROTO_IPIP                   # protocol 4 (IPIP)
+    _ipip_put16(out, 10, 0)                  # checksum (computed below)
+    _ipip_put32(out, 12, src_ip)             # outer src IPv4
+    _ipip_put32(out, 16, dst_ip)             # outer dst IPv4
+    ip_csum: uint16 = ip_csum16(out, IP_HDR_LEN)
+    _ipip_put16(out, 10, ip_csum)
+
+    # --- Inner IPv4 packet copied verbatim after the outer header ---
+    i: uint64 = 0
+    while i < inner_len:
+        out[IP_HDR_LEN + i] = inner[i]
+        i = i + 1
+
+    ipip_tx_encaps = ipip_tx_encaps + 1
+    return cast[int64](total)
+
+
+# =====================================================================
+# DECAP
+# =====================================================================
+
+def ipip_is_ipip(frame: Ptr[uint8], length: uint64) -> int32:
+    # Validate that `frame` is a well-formed IPIP outer frame: long enough,
+    # outer is IPv4 with IHL 5 and proto==4. Returns 1 if it is IPIP, else 0.
+    if length < (IP_HDR_LEN + IP_HDR_LEN):
+        return 0
+    if (frame[0] & 0xF0) != 0x40:                  # outer IPv4
+        return 0
+    if (frame[0] & 0x0F) != 0x05:                  # IHL 5 (no options)
+        return 0
+    if frame[9] != IPPROTO_IPIP:                   # protocol 4
+        return 0
+    # Inner must look like an IPv4 packet too (version 4).
+    if (frame[IP_HDR_LEN] & 0xF0) != 0x40:
+        return 0
+    return 1
+
+
+def ipip_decap(frame: Ptr[uint8], length: uint64, our_endpoint: uint32,
+               out_inner: Ptr[uint8], out_cap: uint64) -> int64:
+    # Recover the inner IPv4 packet from an IPIP outer frame. Copies the
+    # inner packet byte-for-byte into out_inner and returns its length, or
+    # a negative code:
+    #   -1 not IPIP / malformed (wrong proto, not IPv4, too short)
+    #   -2 inner buffer too small
+    #   -5 outer destination is not our endpoint
+    if ipip_is_ipip(frame, length) != 1:
+        ipip_rx_drops = ipip_rx_drops + 1
+        return -1
+    # The outer destination must be the configured local endpoint of this
+    # tunnel; otherwise this frame is not addressed to us.
+    outer_dst: uint32 = _ipip_get32(frame, 16)
+    if outer_dst != our_endpoint:
+        ipip_rx_drops = ipip_rx_drops + 1
+        return -5
+
+    inner_off: uint64 = IP_HDR_LEN
+    inner_len: uint64 = length - inner_off
+    if inner_len > out_cap:
+        return -2
+    i: uint64 = 0
+    while i < inner_len:
+        out_inner[i] = frame[inner_off + i]
+        i = i + 1
+    ipip_rx_decaps = ipip_rx_decaps + 1
+    return cast[int64](inner_len)
+
+
+# =====================================================================
+# Send-by-key: encap an inner IPv4 packet to whichever remote endpoint
+# the tunnel table maps the key to (using its configured local source IP).
+# Returns the outer frame length built into `out`, or negative
+# (-3 = key not in the tunnel table).
+# =====================================================================
+
+def ipip_send_by_key(inner: Ptr[uint8], inner_len: uint64, key: uint32,
+                     out: Ptr[uint8], out_cap: uint64) -> int64:
+    local_ip: uint32 = 0
+    remote_ip: uint32 = 0
+    hit: int32 = ipip_tunnel_lookup(key, cast[Ptr[uint32]](&local_ip),
+                                    cast[Ptr[uint32]](&remote_ip))
+    if hit < 0:
+        return -3
+    return ipip_encap(inner, inner_len, local_ip, remote_ip, out, out_cap)
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+#
+# Mirrors drivers/net/gre.ad::gre_selftest. Pure in-memory: build a known
+# inner IPv4/UDP packet, ENCAP -> DECAP round-trip, assert byte-identity
+# and outer fields (proto 4, valid IPv4 checksum, correct total length,
+# inner bytes at the right offset), plus negative tests that a
+# wrong-protocol frame and a wrong-destination frame are both rejected.
+
+def _ipip_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _ipip_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _ipip_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# Generously-sized scratch globals. An inner packet here is tiny (<128
+# bytes) but the buffers are sized for a full MTU + outer overhead so an
+# undersized Array[] can't silently overflow into adjacent globals.
+IPIP_T_INNER_CAP: uint64 = 1600
+IPIP_T_OUTER_CAP: uint64 = 1700
+_ipipt_inner:  Array[1600, uint8]
+_ipipt_outer:  Array[1700, uint8]
+_ipipt_recov:  Array[1600, uint8]
+
+
+def _ipip_build_inner(seed: uint8) -> uint64:
+    # Build a deterministic inner IPv4/UDP packet: a 20-byte IPv4 header
+    # (proto 17, valid header checksum) + an 8-byte UDP header + payload.
+    # Returns the inner packet length.
+    udp_payload: uint64 = 24
+    udp_len: uint64 = 8 + udp_payload          # UDP header + payload
+    total: uint64 = IP_HDR_LEN + udp_len
+    _ipipt_inner[0] = 0x45                       # version 4, IHL 5
+    _ipipt_inner[1] = 0
+    _ipip_put16(cast[Ptr[uint8]](&_ipipt_inner[0]), 2, cast[uint16](total))
+    _ipip_put16(cast[Ptr[uint8]](&_ipipt_inner[0]), 4, 0)
+    _ipip_put16(cast[Ptr[uint8]](&_ipipt_inner[0]), 6, 0)
+    _ipipt_inner[8] = IP_TTL
+    _ipipt_inner[9] = 17                         # inner proto UDP
+    _ipip_put16(cast[Ptr[uint8]](&_ipipt_inner[0]), 10, 0)
+    # inner src/dst 192.168.1.seed -> 192.168.2.seed
+    _ipip_put32(cast[Ptr[uint8]](&_ipipt_inner[0]), 12,
+                (192 << 24) | (168 << 16) | (1 << 8) | cast[uint32](seed))
+    _ipip_put32(cast[Ptr[uint8]](&_ipipt_inner[0]), 16,
+                (192 << 24) | (168 << 16) | (2 << 8) | cast[uint32](seed))
+    ic: uint16 = ip_csum16(cast[Ptr[uint8]](&_ipipt_inner[0]), IP_HDR_LEN)
+    _ipip_put16(cast[Ptr[uint8]](&_ipipt_inner[0]), 10, ic)
+    # UDP header at offset IP_HDR_LEN: sport 4000, dport 5000, len, csum 0.
+    uoff: uint64 = IP_HDR_LEN
+    _ipip_put16(cast[Ptr[uint8]](&_ipipt_inner[0]), uoff + 0, 4000)
+    _ipip_put16(cast[Ptr[uint8]](&_ipipt_inner[0]), uoff + 2, 5000)
+    _ipip_put16(cast[Ptr[uint8]](&_ipipt_inner[0]), uoff + 4,
+                cast[uint16](udp_len))
+    _ipip_put16(cast[Ptr[uint8]](&_ipipt_inner[0]), uoff + 6, 0)
+    i: uint64 = 0
+    while i < udp_payload:
+        _ipipt_inner[uoff + 8 + i] = cast[uint8](
+            (cast[uint32](seed) + cast[uint32](i)) & 0xFF)
+        i = i + 1
+    return total
+
+
+def _ipip_check_outer(out_len: uint64, inner_len: uint64,
+                      exp_src: uint32, exp_dst: uint32) -> int32:
+    # Assert the outer-frame invariants for a freshly-built frame in
+    # _ipipt_outer: proto 4, valid IPv4 checksum, correct total length,
+    # correct outer src/dst, and that the inner bytes sit at offset 20 and
+    # are byte-identical to _ipipt_inner. Returns 1 on all-OK, 0 on FAIL.
+    ok: int32 = 1
+    exp_len: uint64 = IP_HDR_LEN + inner_len
+    if out_len != exp_len:
+        _ipip_emerg2("[ipip] FAIL: outer len %d != %d\n", out_len, exp_len)
+        ok = 0
+
+    # Outer IP protocol must be 4 (IPIP).
+    if _ipipt_outer[9] != IPPROTO_IPIP:
+        _ipip_emerg1("[ipip] FAIL: outer proto %d != 4\n",
+                     cast[uint64](_ipipt_outer[9]))
+        ok = 0
+
+    # Outer header total-length field must equal out_len.
+    hdr_total: uint16 = _ipip_get16(cast[Ptr[uint8]](&_ipipt_outer[0]), 2)
+    if cast[uint64](hdr_total) != out_len:
+        _ipip_emerg2("[ipip] FAIL: outer total-len field %d != %d\n",
+                     cast[uint64](hdr_total), out_len)
+        ok = 0
+
+    # Outer IPv4 header checksum must verify: ones'-complement sum over the
+    # full 20-byte header (csum field included) must be 0.
+    whole_ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](&_ipipt_outer[0]),
+                                      IP_HDR_LEN)
+    if whole_ip_csum != 0:
+        _ipip_emerg1("[ipip] FAIL: outer IP header self-sum=%x (want 0)\n",
+                     cast[uint64](whole_ip_csum))
+        ok = 0
+
+    # Outer src/dst endpoints.
+    osrc: uint32 = _ipip_get32(cast[Ptr[uint8]](&_ipipt_outer[0]), 12)
+    odst: uint32 = _ipip_get32(cast[Ptr[uint8]](&_ipipt_outer[0]), 16)
+    if osrc != exp_src:
+        _ipip_emerg2("[ipip] FAIL: outer src %x != %x\n",
+                     cast[uint64](osrc), cast[uint64](exp_src))
+        ok = 0
+    if odst != exp_dst:
+        _ipip_emerg2("[ipip] FAIL: outer dst %x != %x\n",
+                     cast[uint64](odst), cast[uint64](exp_dst))
+        ok = 0
+
+    # Inner bytes must sit at offset 20, byte-identical.
+    j: uint64 = 0
+    same: int32 = 1
+    while j < inner_len:
+        if _ipipt_outer[IP_HDR_LEN + j] != _ipipt_inner[j]:
+            same = 0
+            j = inner_len
+        else:
+            j = j + 1
+    if same != 1:
+        _ipip_emerg0("[ipip] FAIL: inner bytes not at correct offset\n")
+        ok = 0
+
+    return ok
+
+
+def ipip_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [ipip] marker lines.
+    _ipip_emerg0("[ipip] self-test start\n")
+    ipip_init()
+    ok: int32 = 1
+
+    # Tunnel endpoints:
+    #   tunnel key 0x4000: local 10.0.0.1 <-> remote 10.0.0.2
+    local_ip:  uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 1
+    remote_ip: uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 2
+    t_slot: int32 = ipip_tunnel_add(0x4000, local_ip, remote_ip)
+    if t_slot < 0:
+        _ipip_emerg0("[ipip] FAIL: tunnel add\n")
+        return 0
+    _ipip_emerg0("[ipip] PASS tunnel-add (key 0x4000 10.0.0.1<->10.0.0.2)\n")
+
+    # The tunnel table must resolve the key to the right endpoints.
+    rl: uint32 = 0
+    rr: uint32 = 0
+    if ipip_tunnel_lookup(0x4000, cast[Ptr[uint32]](&rl),
+                          cast[Ptr[uint32]](&rr)) < 0:
+        _ipip_emerg0("[ipip] FAIL: tunnel lookup miss\n")
+        ok = 0
+    if rl != local_ip or rr != remote_ip:
+        _ipip_emerg0("[ipip] FAIL: tunnel lookup wrong endpoints\n")
+        ok = 0
+    else:
+        _ipip_emerg0("[ipip] PASS tunnel-lookup\n")
+
+    # --- Round-trip: ENCAP a known inner IPv4/UDP packet, verify the outer
+    # header, DECAP it, assert the recovered inner is byte-identical. ---
+    inner_len: uint64 = _ipip_build_inner(0x11)
+    out_len: int64 = ipip_send_by_key(
+        cast[Ptr[uint8]](&_ipipt_inner[0]), inner_len, 0x4000,
+        cast[Ptr[uint8]](&_ipipt_outer[0]), IPIP_T_OUTER_CAP)
+    if out_len < 0:
+        _ipip_emerg1("[ipip] FAIL: send_by_key rc=%d\n", cast[uint64](out_len))
+        return 0
+    if _ipip_check_outer(cast[uint64](out_len), inner_len,
+                         local_ip, remote_ip) != 1:
+        ok = 0
+    else:
+        _ipip_emerg0("[ipip] encap header valid OK\n")
+
+    # DECAP at the remote endpoint (its local endpoint is `remote_ip`).
+    rec_len: int64 = ipip_decap(cast[Ptr[uint8]](&_ipipt_outer[0]),
+        cast[uint64](out_len), remote_ip,
+        cast[Ptr[uint8]](&_ipipt_recov[0]), IPIP_T_INNER_CAP)
+    if rec_len < 0:
+        _ipip_emerg1("[ipip] FAIL: decap rc=%d\n", cast[uint64](rec_len))
+        return 0
+    if cast[uint64](rec_len) != inner_len:
+        _ipip_emerg2("[ipip] FAIL: recovered len %d != %d\n",
+                     cast[uint64](rec_len), inner_len)
+        ok = 0
+    identical: int32 = 1
+    i: uint64 = 0
+    while i < inner_len:
+        if _ipipt_recov[i] != _ipipt_inner[i]:
+            identical = 0
+            i = inner_len
+        else:
+            i = i + 1
+    if identical != 1:
+        _ipip_emerg0("[ipip] FAIL: inner payload not byte-identical\n")
+        ok = 0
+    else:
+        _ipip_emerg0("[ipip] PASS roundtrip-byte-identical\n")
+
+    # --- Negative 1: wrong outer protocol must be rejected. ---
+    # Re-encap fresh, then flip the outer protocol byte to something !=4.
+    inner_len2: uint64 = _ipip_build_inner(0x22)
+    out_len2: int64 = ipip_encap(
+        cast[Ptr[uint8]](&_ipipt_inner[0]), inner_len2, local_ip, remote_ip,
+        cast[Ptr[uint8]](&_ipipt_outer[0]), IPIP_T_OUTER_CAP)
+    if out_len2 < 0:
+        _ipip_emerg0("[ipip] FAIL: encap for wrong-proto test\n")
+        return 0
+    _ipipt_outer[9] = 47                         # pretend GRE, not IPIP
+    badp: int64 = ipip_decap(cast[Ptr[uint8]](&_ipipt_outer[0]),
+        cast[uint64](out_len2), remote_ip,
+        cast[Ptr[uint8]](&_ipipt_recov[0]), IPIP_T_INNER_CAP)
+    if badp != -1:
+        _ipip_emerg1("[ipip] FAIL: wrong-proto frame accepted (rc=%d)\n",
+                     cast[uint64](badp))
+        ok = 0
+    else:
+        _ipip_emerg0("[ipip] PASS reject-wrong-proto\n")
+
+    # --- Negative 2: wrong outer destination must be rejected. ---
+    # Re-encap a clean frame; decap claiming OUR endpoint is some other IP.
+    inner_len3: uint64 = _ipip_build_inner(0x33)
+    out_len3: int64 = ipip_encap(
+        cast[Ptr[uint8]](&_ipipt_inner[0]), inner_len3, local_ip, remote_ip,
+        cast[Ptr[uint8]](&_ipipt_outer[0]), IPIP_T_OUTER_CAP)
+    if out_len3 < 0:
+        _ipip_emerg0("[ipip] FAIL: encap for wrong-dst test\n")
+        return 0
+    other_ip: uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 99
+    badd: int64 = ipip_decap(cast[Ptr[uint8]](&_ipipt_outer[0]),
+        cast[uint64](out_len3), other_ip,
+        cast[Ptr[uint8]](&_ipipt_recov[0]), IPIP_T_INNER_CAP)
+    if badd != -5:
+        _ipip_emerg1("[ipip] FAIL: wrong-dst frame accepted (rc=%d)\n",
+                     cast[uint64](badd))
+        ok = 0
+    else:
+        _ipip_emerg0("[ipip] PASS reject-wrong-dst\n")
+
+    # Sanity: the same clean frame decaps fine at the correct endpoint.
+    good: int64 = ipip_decap(cast[Ptr[uint8]](&_ipipt_outer[0]),
+        cast[uint64](out_len3), remote_ip,
+        cast[Ptr[uint8]](&_ipipt_recov[0]), IPIP_T_INNER_CAP)
+    if good < 0:
+        _ipip_emerg1("[ipip] FAIL: clean frame rejected (rc=%d)\n",
+                     cast[uint64](good))
+        ok = 0
+
+    if ok == 1:
+        _ipip_emerg0("[ipip] PASS\n")
+        return 1
+    _ipip_emerg0("[ipip] FAIL\n")
+    return 0

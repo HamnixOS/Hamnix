@@ -1,0 +1,559 @@
+# drivers/net/sit.ad
+#
+# sit / 6in4 — IPv6-in-IPv4 encapsulation (RFC 4213 §3), IP protocol 41.
+# A point-to-point (or 6to4) tunnel: a complete inner IPv6 packet is
+# carried, verbatim, inside an OUTER IPv4 packet whose protocol field is
+# 41 (IPv6 encapsulation) and whose src/dst are the configured tunnel
+# endpoints. As with RFC 2003 ipip there is NO intermediate shim header —
+# the outer IPv4 header is immediately followed by the original inner IPv6
+# packet (RFC 4213 §3.5):
+#
+#   +----------------------------------------------------------+
+#   | Outer IPv4 (20)   proto=41 (IPv6 encap), correct len+csum |
+#   +----------------------------------------------------------+
+#   | Inner IPv6 packet (header + payload, unmodified)          |
+#   +----------------------------------------------------------+
+#
+# The outer header's Total Length covers OuterIP(20) + the entire inner
+# IPv6 packet (40-byte fixed header + its payload). The inner IPv6 Hop
+# Limit is NOT decremented by encapsulation (RFC 4213 §3.3 treats the
+# encapsulator as a link, not a forwarding hop for the inner packet).
+#
+# We reuse the native stack's ip_csum16 for the outer IPv4 header
+# checksum, exactly as drivers/net/gre.ad and drivers/net/ipip.ad do. The
+# inner IPv6 header carries no header checksum of its own (RFC 8200 §3),
+# so byte-identical recovery is the proof of inner integrity.
+#
+# 6to4 (RFC 3056) derives a /48 prefix 2002:V4ADDR::/48 from a public
+# IPv4 address; sit_6to4_prefix() models that derivation for the
+# well-known 2002::/16 prefix, though the core requirement is the
+# encap/decap round-trip plus the rejection paths.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.ip import ip_csum16, IP_HDR_LEN, IP_TTL
+from drivers.net.ipv6 import IP6_HDR_LEN
+
+
+# --- Wire constants ----------------------------------------------------
+
+# IANA IP protocol number for IPv6 encapsulation (RFC 4213 §3; "6in4").
+IPPROTO_IPV6: uint8 = 41
+
+# Outer overhead before the inner packet: just the 20-byte outer IPv4
+# header (no shim header in RFC 4213 §3).
+SIT_OUTER_OVERHEAD: uint64 = 20      # == IP_HDR_LEN
+
+
+# Counters (mirror the /sys-visible accounting a real sit netdev keeps).
+sit_tx_encaps: uint64 = 0
+sit_rx_decaps: uint64 = 0
+sit_rx_drops:  uint64 = 0
+
+
+# =====================================================================
+# Tunnel table: a small (local,remote) keyed lookup
+# =====================================================================
+
+SIT_TUN_MAX: uint64 = 16
+
+sit_tun_inuse:  Array[16, uint8]      # 1 if slot holds a tunnel
+sit_tun_key:    Array[16, uint32]     # tunnel key (host order)
+sit_tun_local:  Array[16, uint32]     # local endpoint IPv4 (host order)
+sit_tun_remote: Array[16, uint32]     # remote endpoint IPv4 (host order)
+
+
+def sit_init():
+    # Reset the tunnel table and counters. Idempotent.
+    i: uint64 = 0
+    while i < SIT_TUN_MAX:
+        sit_tun_inuse[i]  = 0
+        sit_tun_key[i]    = 0
+        sit_tun_local[i]  = 0
+        sit_tun_remote[i] = 0
+        i = i + 1
+    sit_tx_encaps = 0
+    sit_rx_decaps = 0
+    sit_rx_drops  = 0
+
+
+def sit_tunnel_add(key: uint32, local_ip: uint32, remote_ip: uint32) -> int32:
+    # Install (or overwrite) a tunnel keyed by `key`. Returns the slot
+    # index on success, -1 if the table is full.
+    i: uint64 = 0
+    free_slot: int32 = -1
+    while i < SIT_TUN_MAX:
+        if sit_tun_inuse[i] != 0:
+            if sit_tun_key[i] == key:
+                free_slot = cast[int32](i)
+                i = SIT_TUN_MAX
+        else:
+            if free_slot < 0:
+                free_slot = cast[int32](i)
+        if i < SIT_TUN_MAX:
+            i = i + 1
+    if free_slot < 0:
+        return -1
+    slot: uint64 = cast[uint64](free_slot)
+    sit_tun_inuse[slot]  = 1
+    sit_tun_key[slot]    = key
+    sit_tun_local[slot]  = local_ip
+    sit_tun_remote[slot] = remote_ip
+    return cast[int32](free_slot)
+
+
+def sit_tunnel_lookup(key: uint32, out_local: Ptr[uint32],
+                      out_remote: Ptr[uint32]) -> int32:
+    # Resolve a tunnel by key. On a hit, writes the local IPv4 into
+    # *out_local and the remote IPv4 into *out_remote (if non-NULL) and
+    # returns the slot index. Returns -1 if the key is unknown.
+    i: uint64 = 0
+    while i < SIT_TUN_MAX:
+        if sit_tun_inuse[i] != 0:
+            if sit_tun_key[i] == key:
+                if out_local != cast[Ptr[uint32]](0):
+                    out_local[0] = sit_tun_local[i]
+                if out_remote != cast[Ptr[uint32]](0):
+                    out_remote[0] = sit_tun_remote[i]
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# =====================================================================
+# Big-endian field writers / readers
+# =====================================================================
+
+def _sit_put16(buf: Ptr[uint8], off: uint64, v: uint16):
+    buf[off]     = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    buf[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+def _sit_get16(buf: Ptr[uint8], off: uint64) -> uint16:
+    hi: uint16 = cast[uint16](buf[off]) << 8
+    lo: uint16 = cast[uint16](buf[off + 1])
+    return hi | lo
+
+
+def _sit_put32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _sit_get32(buf: Ptr[uint8], off: uint64) -> uint32:
+    r: uint32 = cast[uint32](buf[off]) << 24
+    r = r | (cast[uint32](buf[off + 1]) << 16)
+    r = r | (cast[uint32](buf[off + 2]) << 8)
+    r = r | cast[uint32](buf[off + 3])
+    return r
+
+
+# =====================================================================
+# 6to4 prefix derivation (RFC 3056 §2)
+# =====================================================================
+#
+# A 6to4 site derives the 48-bit prefix 2002:V4ADDR::/48 from a globally
+# routable IPv4 address V4ADDR. Write the 16-byte derived prefix (the rest
+# zeroed) into out16. The IPv4 address is in host order.
+
+def sit_6to4_prefix(v4: uint32, out16: Ptr[uint8]):
+    i: uint64 = 0
+    while i < 16:
+        out16[i] = 0
+        i = i + 1
+    out16[0] = 0x20                    # 2002::/16 well-known prefix
+    out16[1] = 0x02
+    out16[2] = cast[uint8]((v4 >> 24) & 0xFF)   # embed the IPv4 address
+    out16[3] = cast[uint8]((v4 >> 16) & 0xFF)
+    out16[4] = cast[uint8]((v4 >> 8) & 0xFF)
+    out16[5] = cast[uint8](v4 & 0xFF)
+
+
+# =====================================================================
+# ENCAP
+# =====================================================================
+
+def sit_encap(inner: Ptr[uint8], inner_len: uint64,
+              src_ip: uint32, dst_ip: uint32,
+              out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Build the full outer 6in4 frame into `out` and return its total
+    # length, or a negative code on error (-1 buffer too small, -4 inner
+    # too short to be an IPv6 packet).
+    #
+    #   out = OuterIP(20) | inner IPv6 packet (verbatim)
+    #
+    # All outer IPv4 lengths and the IPv4 header checksum are computed
+    # correctly. The inner IPv6 packet is copied unmodified.
+    if inner_len < IP6_HDR_LEN:
+        return -4
+    total: uint64 = IP_HDR_LEN + inner_len
+    if total > out_cap:
+        return -1
+
+    # --- Outer IPv4 header (offset 0..19) ---
+    out[0] = 0x45                            # version 4, IHL 5
+    out[1] = 0                               # DSCP/ECN
+    _sit_put16(out, 2, cast[uint16](total))  # total length
+    _sit_put16(out, 4, 0)                    # id
+    _sit_put16(out, 6, 0)                    # flags/frag = 0
+    out[8]  = IP_TTL                         # outer TTL (tunnel config)
+    out[9]  = IPPROTO_IPV6                   # protocol 41 (IPv6 encap)
+    _sit_put16(out, 10, 0)                   # checksum (computed below)
+    _sit_put32(out, 12, src_ip)              # outer src IPv4
+    _sit_put32(out, 16, dst_ip)              # outer dst IPv4
+    ip_csum: uint16 = ip_csum16(out, IP_HDR_LEN)
+    _sit_put16(out, 10, ip_csum)
+
+    # --- Inner IPv6 packet copied verbatim after the outer header ---
+    i: uint64 = 0
+    while i < inner_len:
+        out[IP_HDR_LEN + i] = inner[i]
+        i = i + 1
+
+    sit_tx_encaps = sit_tx_encaps + 1
+    return cast[int64](total)
+
+
+# =====================================================================
+# DECAP
+# =====================================================================
+
+def sit_is_sit(frame: Ptr[uint8], length: uint64) -> int32:
+    # Validate that `frame` is a well-formed 6in4 outer frame: long enough,
+    # outer is IPv4 with IHL 5 and proto==41, and the inner looks like an
+    # IPv6 packet (version 6). Returns 1 if it is 6in4, else 0.
+    if length < (IP_HDR_LEN + IP6_HDR_LEN):
+        return 0
+    if (frame[0] & 0xF0) != 0x40:                  # outer IPv4
+        return 0
+    if (frame[0] & 0x0F) != 0x05:                  # IHL 5 (no options)
+        return 0
+    if frame[9] != IPPROTO_IPV6:                   # protocol 41
+        return 0
+    # Inner must look like an IPv6 packet (version nibble 6).
+    if (frame[IP_HDR_LEN] & 0xF0) != 0x60:
+        return 0
+    return 1
+
+
+def sit_decap(frame: Ptr[uint8], length: uint64, our_endpoint: uint32,
+              out_inner: Ptr[uint8], out_cap: uint64) -> int64:
+    # Recover the inner IPv6 packet from a 6in4 outer frame. Copies the
+    # inner packet byte-for-byte into out_inner and returns its length, or
+    # a negative code:
+    #   -1 not 6in4 / malformed (wrong proto, not IPv6 inner, too short)
+    #   -2 inner buffer too small
+    #   -5 outer destination is not our endpoint
+    if sit_is_sit(frame, length) != 1:
+        sit_rx_drops = sit_rx_drops + 1
+        return -1
+    outer_dst: uint32 = _sit_get32(frame, 16)
+    if outer_dst != our_endpoint:
+        sit_rx_drops = sit_rx_drops + 1
+        return -5
+
+    inner_off: uint64 = IP_HDR_LEN
+    inner_len: uint64 = length - inner_off
+    if inner_len > out_cap:
+        return -2
+    i: uint64 = 0
+    while i < inner_len:
+        out_inner[i] = frame[inner_off + i]
+        i = i + 1
+    sit_rx_decaps = sit_rx_decaps + 1
+    return cast[int64](inner_len)
+
+
+# =====================================================================
+# Send-by-key: encap an inner IPv6 packet to whichever remote endpoint the
+# tunnel table maps the key to (using its configured local source IP).
+# Returns the outer frame length built into `out`, or negative
+# (-3 = key not in the tunnel table).
+# =====================================================================
+
+def sit_send_by_key(inner: Ptr[uint8], inner_len: uint64, key: uint32,
+                    out: Ptr[uint8], out_cap: uint64) -> int64:
+    local_ip: uint32 = 0
+    remote_ip: uint32 = 0
+    hit: int32 = sit_tunnel_lookup(key, cast[Ptr[uint32]](&local_ip),
+                                   cast[Ptr[uint32]](&remote_ip))
+    if hit < 0:
+        return -3
+    return sit_encap(inner, inner_len, local_ip, remote_ip, out, out_cap)
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+#
+# Mirrors drivers/net/gre.ad / drivers/net/ipip.ad self-tests. Pure
+# in-memory: build a known inner IPv6 packet, ENCAP -> DECAP round-trip,
+# assert byte-identity and outer fields (proto 41, valid IPv4 checksum,
+# correct total length, inner bytes at offset 20), plus negative tests
+# that a wrong-protocol frame and a wrong-destination frame are rejected.
+
+def _sit_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _sit_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _sit_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+SIT_T_INNER_CAP: uint64 = 1600
+SIT_T_OUTER_CAP: uint64 = 1700
+_sitt_inner:  Array[1600, uint8]
+_sitt_outer:  Array[1700, uint8]
+_sitt_recov:  Array[1600, uint8]
+
+
+def _sit_build_inner(seed: uint8) -> uint64:
+    # Build a deterministic inner IPv6/UDP packet: a 40-byte IPv6 header
+    # (next-header 17 = UDP, hop limit 64) + an 8-byte UDP header + payload.
+    # Returns the inner packet length. The IPv6 header carries no checksum.
+    udp_payload: uint64 = 24
+    udp_len: uint64 = 8 + udp_payload          # UDP header + payload
+    total: uint64 = IP6_HDR_LEN + udp_len
+    # --- IPv6 header @ offset 0 ---
+    _sitt_inner[0] = 0x60                        # version 6, TC 0
+    _sitt_inner[1] = 0                           # flow label hi
+    _sitt_inner[2] = 0
+    _sitt_inner[3] = 0
+    _sit_put16(cast[Ptr[uint8]](&_sitt_inner[0]), 4, cast[uint16](udp_len))
+    _sitt_inner[6] = 17                          # next header = UDP
+    _sitt_inner[7] = 64                          # hop limit
+    # src 2001:db8:1::seed, dst 2001:db8:2::seed (16 bytes each)
+    j: uint64 = 0
+    while j < 16:
+        _sitt_inner[8 + j] = 0
+        _sitt_inner[24 + j] = 0
+        j = j + 1
+    _sitt_inner[8] = 0x20
+    _sitt_inner[9] = 0x01
+    _sitt_inner[10] = 0x0d
+    _sitt_inner[11] = 0xb8
+    _sitt_inner[13] = 0x01                       # src subnet 1
+    _sitt_inner[23] = seed                       # src low byte
+    _sitt_inner[24] = 0x20
+    _sitt_inner[25] = 0x01
+    _sitt_inner[26] = 0x0d
+    _sitt_inner[27] = 0xb8
+    _sitt_inner[29] = 0x02                       # dst subnet 2
+    _sitt_inner[39] = seed                       # dst low byte
+    # --- UDP header @ offset 40 ---
+    uoff: uint64 = IP6_HDR_LEN
+    _sit_put16(cast[Ptr[uint8]](&_sitt_inner[0]), uoff + 0, 4000)
+    _sit_put16(cast[Ptr[uint8]](&_sitt_inner[0]), uoff + 2, 5000)
+    _sit_put16(cast[Ptr[uint8]](&_sitt_inner[0]), uoff + 4,
+               cast[uint16](udp_len))
+    _sit_put16(cast[Ptr[uint8]](&_sitt_inner[0]), uoff + 6, 0)
+    i: uint64 = 0
+    while i < udp_payload:
+        _sitt_inner[uoff + 8 + i] = cast[uint8](
+            (cast[uint32](seed) + cast[uint32](i)) & 0xFF)
+        i = i + 1
+    return total
+
+
+def _sit_check_outer(out_len: uint64, inner_len: uint64,
+                     exp_src: uint32, exp_dst: uint32) -> int32:
+    # Assert the outer-frame invariants for a freshly-built frame in
+    # _sitt_outer: proto 41, valid IPv4 checksum, correct total length,
+    # correct outer src/dst, and that the inner bytes sit at offset 20 and
+    # are byte-identical to _sitt_inner. Returns 1 on all-OK, 0 on FAIL.
+    ok: int32 = 1
+    exp_len: uint64 = IP_HDR_LEN + inner_len
+    if out_len != exp_len:
+        _sit_emerg2("[sit] FAIL: outer len %d != %d\n", out_len, exp_len)
+        ok = 0
+
+    # Outer IP protocol must be 41 (IPv6 encapsulation).
+    if _sitt_outer[9] != IPPROTO_IPV6:
+        _sit_emerg1("[sit] FAIL: outer proto %d != 41\n",
+                    cast[uint64](_sitt_outer[9]))
+        ok = 0
+
+    # Outer header total-length field must equal out_len.
+    hdr_total: uint16 = _sit_get16(cast[Ptr[uint8]](&_sitt_outer[0]), 2)
+    if cast[uint64](hdr_total) != out_len:
+        _sit_emerg2("[sit] FAIL: outer total-len field %d != %d\n",
+                    cast[uint64](hdr_total), out_len)
+        ok = 0
+
+    # Outer IPv4 header checksum must verify (self-sum over 20 bytes == 0).
+    whole_ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](&_sitt_outer[0]),
+                                      IP_HDR_LEN)
+    if whole_ip_csum != 0:
+        _sit_emerg1("[sit] FAIL: outer IP header self-sum=%x (want 0)\n",
+                    cast[uint64](whole_ip_csum))
+        ok = 0
+
+    # Outer src/dst endpoints.
+    osrc: uint32 = _sit_get32(cast[Ptr[uint8]](&_sitt_outer[0]), 12)
+    odst: uint32 = _sit_get32(cast[Ptr[uint8]](&_sitt_outer[0]), 16)
+    if osrc != exp_src:
+        _sit_emerg2("[sit] FAIL: outer src %x != %x\n",
+                    cast[uint64](osrc), cast[uint64](exp_src))
+        ok = 0
+    if odst != exp_dst:
+        _sit_emerg2("[sit] FAIL: outer dst %x != %x\n",
+                    cast[uint64](odst), cast[uint64](exp_dst))
+        ok = 0
+
+    # Inner IPv6 bytes must sit at offset 20, byte-identical.
+    j: uint64 = 0
+    same: int32 = 1
+    while j < inner_len:
+        if _sitt_outer[IP_HDR_LEN + j] != _sitt_inner[j]:
+            same = 0
+            j = inner_len
+        else:
+            j = j + 1
+    if same != 1:
+        _sit_emerg0("[sit] FAIL: inner IPv6 bytes not at correct offset\n")
+        ok = 0
+
+    return ok
+
+
+def sit_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [sit] marker lines.
+    _sit_emerg0("[sit] self-test start\n")
+    sit_init()
+    ok: int32 = 1
+
+    # Tunnel endpoints:
+    #   tunnel key 0x2900: local 10.0.0.1 <-> remote 10.0.0.2
+    local_ip:  uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 1
+    remote_ip: uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 2
+    t_slot: int32 = sit_tunnel_add(0x2900, local_ip, remote_ip)
+    if t_slot < 0:
+        _sit_emerg0("[sit] FAIL: tunnel add\n")
+        return 0
+    _sit_emerg0("[sit] PASS tunnel-add (key 0x2900 10.0.0.1<->10.0.0.2)\n")
+
+    rl: uint32 = 0
+    rr: uint32 = 0
+    if sit_tunnel_lookup(0x2900, cast[Ptr[uint32]](&rl),
+                         cast[Ptr[uint32]](&rr)) < 0:
+        _sit_emerg0("[sit] FAIL: tunnel lookup miss\n")
+        ok = 0
+    if rl != local_ip or rr != remote_ip:
+        _sit_emerg0("[sit] FAIL: tunnel lookup wrong endpoints\n")
+        ok = 0
+    else:
+        _sit_emerg0("[sit] PASS tunnel-lookup\n")
+
+    # --- 6to4 prefix derivation (RFC 3056): 2002:V4ADDR::/48. ---
+    # For 192.0.2.1 (0xC0000201) the prefix is 2002:c000:0201::/48.
+    p16: Array[16, uint8]
+    sit_6to4_prefix(0xC0000201, cast[Ptr[uint8]](&p16[0]))
+    if p16[0] != 0x20 or p16[1] != 0x02:
+        _sit_emerg0("[sit] FAIL: 6to4 well-known prefix wrong\n")
+        ok = 0
+    if p16[2] != 0xC0 or p16[3] != 0x00 or p16[4] != 0x02 or p16[5] != 0x01:
+        _sit_emerg0("[sit] FAIL: 6to4 embedded v4 wrong\n")
+        ok = 0
+    if ok == 1:
+        _sit_emerg0("[sit] PASS 6to4-prefix (2002:c000:0201::/48)\n")
+
+    # --- Round-trip: ENCAP a known inner IPv6/UDP packet, verify the outer
+    # header, DECAP it, assert the recovered inner is byte-identical. ---
+    inner_len: uint64 = _sit_build_inner(0x11)
+    out_len: int64 = sit_send_by_key(
+        cast[Ptr[uint8]](&_sitt_inner[0]), inner_len, 0x2900,
+        cast[Ptr[uint8]](&_sitt_outer[0]), SIT_T_OUTER_CAP)
+    if out_len < 0:
+        _sit_emerg1("[sit] FAIL: send_by_key rc=%d\n", cast[uint64](out_len))
+        return 0
+    if _sit_check_outer(cast[uint64](out_len), inner_len,
+                        local_ip, remote_ip) != 1:
+        ok = 0
+    else:
+        _sit_emerg0("[sit] encap header valid OK\n")
+
+    rec_len: int64 = sit_decap(cast[Ptr[uint8]](&_sitt_outer[0]),
+        cast[uint64](out_len), remote_ip,
+        cast[Ptr[uint8]](&_sitt_recov[0]), SIT_T_INNER_CAP)
+    if rec_len < 0:
+        _sit_emerg1("[sit] FAIL: decap rc=%d\n", cast[uint64](rec_len))
+        return 0
+    if cast[uint64](rec_len) != inner_len:
+        _sit_emerg2("[sit] FAIL: recovered len %d != %d\n",
+                    cast[uint64](rec_len), inner_len)
+        ok = 0
+    identical: int32 = 1
+    i: uint64 = 0
+    while i < inner_len:
+        if _sitt_recov[i] != _sitt_inner[i]:
+            identical = 0
+            i = inner_len
+        else:
+            i = i + 1
+    if identical != 1:
+        _sit_emerg0("[sit] FAIL: inner IPv6 payload not byte-identical\n")
+        ok = 0
+    else:
+        _sit_emerg0("[sit] PASS roundtrip-byte-identical\n")
+
+    # --- Negative 1: wrong outer protocol must be rejected. ---
+    inner_len2: uint64 = _sit_build_inner(0x22)
+    out_len2: int64 = sit_encap(
+        cast[Ptr[uint8]](&_sitt_inner[0]), inner_len2, local_ip, remote_ip,
+        cast[Ptr[uint8]](&_sitt_outer[0]), SIT_T_OUTER_CAP)
+    if out_len2 < 0:
+        _sit_emerg0("[sit] FAIL: encap for wrong-proto test\n")
+        return 0
+    _sitt_outer[9] = 4                           # pretend IPIP (4), not 41
+    badp: int64 = sit_decap(cast[Ptr[uint8]](&_sitt_outer[0]),
+        cast[uint64](out_len2), remote_ip,
+        cast[Ptr[uint8]](&_sitt_recov[0]), SIT_T_INNER_CAP)
+    if badp != -1:
+        _sit_emerg1("[sit] FAIL: wrong-proto frame accepted (rc=%d)\n",
+                    cast[uint64](badp))
+        ok = 0
+    else:
+        _sit_emerg0("[sit] PASS reject-wrong-proto\n")
+
+    # --- Negative 2: wrong outer destination must be rejected. ---
+    inner_len3: uint64 = _sit_build_inner(0x33)
+    out_len3: int64 = sit_encap(
+        cast[Ptr[uint8]](&_sitt_inner[0]), inner_len3, local_ip, remote_ip,
+        cast[Ptr[uint8]](&_sitt_outer[0]), SIT_T_OUTER_CAP)
+    if out_len3 < 0:
+        _sit_emerg0("[sit] FAIL: encap for wrong-dst test\n")
+        return 0
+    other_ip: uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 99
+    badd: int64 = sit_decap(cast[Ptr[uint8]](&_sitt_outer[0]),
+        cast[uint64](out_len3), other_ip,
+        cast[Ptr[uint8]](&_sitt_recov[0]), SIT_T_INNER_CAP)
+    if badd != -5:
+        _sit_emerg1("[sit] FAIL: wrong-dst frame accepted (rc=%d)\n",
+                    cast[uint64](badd))
+        ok = 0
+    else:
+        _sit_emerg0("[sit] PASS reject-wrong-dst\n")
+
+    # Sanity: the same clean frame decaps fine at the correct endpoint.
+    good: int64 = sit_decap(cast[Ptr[uint8]](&_sitt_outer[0]),
+        cast[uint64](out_len3), remote_ip,
+        cast[Ptr[uint8]](&_sitt_recov[0]), SIT_T_INNER_CAP)
+    if good < 0:
+        _sit_emerg1("[sit] FAIL: clean frame rejected (rc=%d)\n",
+                    cast[uint64](good))
+        ok = 0
+
+    if ok == 1:
+        _sit_emerg0("[sit] PASS\n")
+        return 1
+    _sit_emerg0("[sit] FAIL\n")
+    return 0

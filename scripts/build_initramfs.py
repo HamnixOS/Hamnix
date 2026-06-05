@@ -2509,6 +2509,29 @@ if os.environ.get("ENABLE_IPVLAN_TEST") == "1":
 if os.environ.get("ENABLE_NAT64_TEST") == "1":
     FILES.append(("/etc/nat64-test", b"1\n"))
 
+# Native IPv4-in-IPv4 tunnel (RFC 2003, "ipip") encap/decap self-test.
+# scripts/test_ipip.sh sets ENABLE_IPIP_TEST=1 to plant /etc/ipip-test;
+# init/main.ad's boot:37.ipip gate then runs ipip_selftest()
+# (drivers/net/ipip.ad), a pure in-memory test that ENCAPs a known inner
+# IPv4/UDP packet in an outer IPv4 header (protocol 4) with the correct
+# total-length and a valid outer header checksum, DECAPs it byte-identically,
+# and rejects a wrong-protocol and a wrong-destination outer frame. Prints
+# "[ipip] PASS" / "[ipip] FAIL". Default boots ship no marker.
+if os.environ.get("ENABLE_IPIP_TEST") == "1":
+    FILES.append(("/etc/ipip-test", b"1\n"))
+
+# Native 6in4 / sit tunnel (RFC 4213, IPv6-in-IPv4) encap/decap self-test.
+# scripts/test_sit.sh sets ENABLE_SIT_TEST=1 to plant /etc/sit-test;
+# init/main.ad's boot:37.sit gate then runs sit_selftest() (drivers/net/sit.ad),
+# a pure in-memory test that ENCAPs a known inner IPv6/UDP packet in an outer
+# IPv4 header (protocol 41) with the correct total-length and a valid outer
+# header checksum, checks the RFC 3056 6to4 prefix (2002::/16) derivation,
+# DECAPs the frame byte-identically, and rejects a wrong-protocol and a
+# wrong-destination outer frame. Prints "[sit] PASS" / "[sit] FAIL". Default
+# boots ship no marker.
+if os.environ.get("ENABLE_SIT_TEST") == "1":
+    FILES.append(("/etc/sit-test", b"1\n"))
+
 # Native L2TPv3 (RFC 3931) Ethernet-pseudowire encap/decap self-test.
 # scripts/test_l2tp.sh sets ENABLE_L2TP_TEST=1 to plant /etc/l2tp-test;
 # init/main.ad's boot:37.l2tp gate then runs l2tp_selftest()
