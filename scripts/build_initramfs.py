@@ -2324,6 +2324,21 @@ if os.environ.get("ENABLE_GENEVE_TEST") == "1":
 if os.environ.get("ENABLE_MACSEC_TEST") == "1":
     FILES.append(("/etc/macsec-test", b"1\n"))
 
+# Native WireGuard (Noise_IKpsk2 over UDP) self-test. scripts/test_wireguard.sh
+# sets ENABLE_WIREGUARD_TEST=1 to plant /etc/wireguard-test; init/main.ad's
+# boot:37.wireguard gate then runs wireguard_selftest() (drivers/net/
+# wireguard.ad), a pure in-memory two-peer loopback test that: runs RFC 8439
+# ChaCha20-Poly1305, RFC 7748 X25519 and BLAKE2s known-answer vectors; runs the
+# full Noise_IKpsk2 handshake (handshake-initiation + handshake-response with a
+# pre-shared key) deriving matching transport keys on both peers (X25519 ECDH +
+# HKDF-BLAKE2s key schedule); round-trips an inner packet A->B and B->A
+# byte-identical via ChaCha20-Poly1305 transport messages; and proves the
+# security properties (wrong key, replayed counter, and tampered ciphertext all
+# rejected). Prints "[wireguard] PASS" / "[wireguard] FAIL". Default boots ship
+# no marker.
+if os.environ.get("ENABLE_WIREGUARD_TEST") == "1":
+    FILES.append(("/etc/wireguard-test", b"1\n"))
+
 # Native L2TPv3 (RFC 3931) Ethernet-pseudowire encap/decap self-test.
 # scripts/test_l2tp.sh sets ENABLE_L2TP_TEST=1 to plant /etc/l2tp-test;
 # init/main.ad's boot:37.l2tp gate then runs l2tp_selftest()

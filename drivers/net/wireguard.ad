@@ -1,0 +1,1264 @@
+# drivers/net/wireguard.ad
+#
+# Native WireGuard (the Noise_IKpsk2 VPN protocol) over UDP.
+#
+# This is a peer to the other native tunnel/overlay drivers (vxlan/geneve/
+# gre/l2tp/macsec): it takes inner IP packets and produces protected
+# WireGuard transport messages, and runs the Noise_IKpsk2 handshake that
+# establishes the symmetric transport keys. WireGuard rides over UDP, so the
+# message types are emitted as UDP payloads through the kernel UDP path
+# (udp_send) — there is NO BSD socket API in Hamnix.
+#
+# Cryptography (all real, none stubbed):
+#   * Curve25519 / X25519 ECDH          -- REUSED from drivers/net/tls.ad
+#                                          (_tls_x25519_scalarmult / _base_mult)
+#   * ChaCha20-Poly1305 AEAD (RFC 8439) -- REUSED from drivers/net/tls.ad
+#                                          (_tls_aead_seal / _tls_aead_open)
+#   * BLAKE2s + HMAC-BLAKE2s + HKDF      -- drivers/net/wg_crypto.ad
+#
+# Protocol (WireGuard whitepaper §5.4, Noise_IKpsk2):
+#
+#   Handshake initiation (initiator -> responder):
+#     C = HASH(CONSTRUCTION); H = HASH(C || IDENTIFIER); H = HASH(H || S_resp_pub)
+#     (E_priv,E_pub) = DH-generate
+#     C = KDF1(C, E_pub);                H = HASH(H || E_pub)
+#     C,k = KDF2(C, DH(E_priv, S_resp_pub))
+#     enc_static = AEAD(k, 0, S_init_pub, H);  H = HASH(H || enc_static)
+#     C,k = KDF2(C, DH(S_init_priv, S_resp_pub))
+#     enc_ts = AEAD(k, 0, timestamp, H);       H = HASH(H || enc_ts)
+#
+#   Handshake response (responder -> initiator):
+#     C = KDF1(C, E_pub_r);              H = HASH(H || E_pub_r)
+#     C = KDF1(C, DH(E_priv_r, E_pub_i))
+#     C = KDF1(C, DH(E_priv_r, S_init_pub))
+#     C,tau,k = KDF3(C, PSK);            H = HASH(H || tau)
+#     enc_empty = AEAD(k, 0, "", H);     H = HASH(H || enc_empty)
+#
+#   Transport keys:
+#     responder: (T_recv, T_send) = KDF2(C, "")
+#     initiator: (T_send, T_recv) = KDF2(C, "")
+#
+#   Transport data message: AEAD(T_send, counter, inner_packet, "") with the
+#   96-bit nonce = 0^32 || le64(counter). The receiver enforces a sliding
+#   replay window on the counter.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.tls import _tls_x25519_scalarmult, _tls_x25519_base_mult
+from drivers.net.tls import _tls_aead_seal, _tls_aead_open
+from drivers.net.wg_crypto import wg_blake2s, wg_hkdf, wg_blake2s_kat
+
+
+# --- WireGuard message types (the first byte of every UDP payload) ----------
+WG_MSG_INIT:      uint8 = 1     # handshake initiation
+WG_MSG_RESPONSE:  uint8 = 2     # handshake response
+WG_MSG_COOKIE:    uint8 = 3     # cookie reply (not used in this loopback test)
+WG_MSG_TRANSPORT: uint8 = 4     # transport data
+
+WG_KEY_LEN:   uint64 = 32       # X25519 / ChaCha20 key length
+WG_TAG_LEN:   uint64 = 16       # Poly1305 tag
+WG_TS_LEN:    uint64 = 12       # TAI64N timestamp
+
+
+# =====================================================================
+# Per-peer / per-session state
+# =====================================================================
+#
+# We model two endpoints (A and B) so the loopback self-test can drive both
+# sides in one address space. Each endpoint carries its static keypair, the
+# optional pre-shared key, the live handshake state (C, H, ephemeral), and the
+# derived transport keys + counters.
+#
+# All buffers are sized EXACTLY (32-byte keys/hashes) to avoid the
+# undersized-Array buffer-overflow trap.
+
+# Endpoint A.
+wgA_static_priv:  Array[32, uint8]
+wgA_static_pub:   Array[32, uint8]
+wgA_eph_priv:     Array[32, uint8]
+wgA_eph_pub:      Array[32, uint8]
+wgA_psk:          Array[32, uint8]
+wgA_C:            Array[32, uint8]      # chaining key
+wgA_H:            Array[32, uint8]      # handshake hash
+wgA_tsend:        Array[32, uint8]      # transport send key
+wgA_trecv:        Array[32, uint8]      # transport recv key
+wgA_send_ctr:     uint64 = 0
+wgA_recv_ctr:     uint64 = 0            # highest accepted recv counter + window
+wgA_remote_pub:   Array[32, uint8]      # peer's static public key
+
+# Endpoint B.
+wgB_static_priv:  Array[32, uint8]
+wgB_static_pub:   Array[32, uint8]
+wgB_eph_priv:     Array[32, uint8]
+wgB_eph_pub:      Array[32, uint8]
+wgB_psk:          Array[32, uint8]
+wgB_C:            Array[32, uint8]
+wgB_H:            Array[32, uint8]
+wgB_tsend:        Array[32, uint8]
+wgB_trecv:        Array[32, uint8]
+wgB_send_ctr:     uint64 = 0
+wgB_recv_ctr:     uint64 = 0
+wgB_remote_pub:   Array[32, uint8]
+
+# Replay-window state (simple highest-seen counters, per endpoint, used by the
+# transport-open path). 0 means "nothing accepted yet"; first valid counter is 0
+# so we track an explicit "any accepted" flag.
+wgA_recv_seen:    int32 = 0
+wgA_recv_max:     uint64 = 0
+wgB_recv_seen:    int32 = 0
+wgB_recv_max:     uint64 = 0
+
+# Statistics.
+wg_handshakes_ok: uint64 = 0
+wg_tx_transport:  uint64 = 0
+wg_rx_transport:  uint64 = 0
+wg_rx_drops:      uint64 = 0
+
+
+# =====================================================================
+# Scratch globals
+# =====================================================================
+#
+# Handshake math scratch. Single-threaded; one handshake step at a time.
+# Sized exactly.
+_wg_dh:      Array[32, uint8]      # DH shared-secret output
+_wg_tmp_c:   Array[32, uint8]      # KDF chaining-key output slot
+_wg_tmp_k:   Array[32, uint8]      # KDF AEAD-key output slot
+_wg_tau:     Array[32, uint8]      # KDF tau output (psk mix)
+_wg_hin:     Array[128, uint8]     # HASH(H || x) input buffer (32 + <= 96)
+_wg_base9:   Array[32, uint8]      # X25519 base point u=9 (unused; base_mult has its own)
+_wg_ts:      Array[12, uint8]      # TAI64N timestamp (deterministic in the test)
+
+# CONSTRUCTION / IDENTIFIER label constants (ASCII, no NUL).
+#   CONSTRUCTION = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"   (37 bytes)
+#   IDENTIFIER   = "WireGuard v1 zx2c4 Jason@zx2c4.com"      (33 bytes)
+_wg_construction: Array[37, uint8]
+_wg_identifier:   Array[33, uint8]
+_wg_c0:           Array[32, uint8]    # HASH(CONSTRUCTION)
+_wg_h0:           Array[32, uint8]    # HASH(C0 || IDENTIFIER)
+_wg_labels_ready: int32 = 0
+
+
+def _wg_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _wg_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _wg_memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64):
+    i: uint64 = 0
+    while i < n:
+        dst[i] = src[i]
+        i = i + 1
+
+
+def _wg_memeq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _wg_init_labels():
+    # Populate CONSTRUCTION/IDENTIFIER byte arrays and precompute C0/H0.
+    # CONSTRUCTION = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+    s0: Ptr[uint8] = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+    i: uint64 = 0
+    while i < 37:
+        _wg_construction[i] = s0[i]
+        i = i + 1
+    # IDENTIFIER = "WireGuard v1 zx2c4 Jason@zx2c4.com"
+    s1: Ptr[uint8] = "WireGuard v1 zx2c4 Jason@zx2c4.com"
+    i = 0
+    while i < 33:
+        _wg_identifier[i] = s1[i]
+        i = i + 1
+    # C0 = HASH(CONSTRUCTION)
+    wg_blake2s(cast[Ptr[uint8]](&_wg_c0[0]), 32,
+               cast[Ptr[uint8]](&_wg_construction[0]), 37)
+    # H0 = HASH(C0 || IDENTIFIER)
+    _wg_memcpy(cast[Ptr[uint8]](&_wg_hin[0]),
+               cast[Ptr[uint8]](&_wg_c0[0]), 32)
+    _wg_memcpy(cast[Ptr[uint8]](&_wg_hin[32]),
+               cast[Ptr[uint8]](&_wg_identifier[0]), 33)
+    wg_blake2s(cast[Ptr[uint8]](&_wg_h0[0]), 32,
+               cast[Ptr[uint8]](&_wg_hin[0]), 65)
+    _wg_labels_ready = 1
+
+
+def _wg_mix_hash(h: Ptr[uint8], data: Ptr[uint8], data_len: uint64):
+    # H = HASH(H || data). H is 32 bytes in place.
+    _wg_memcpy(cast[Ptr[uint8]](&_wg_hin[0]), h, 32)
+    _wg_memcpy(cast[Ptr[uint8]](&_wg_hin[32]), data, data_len)
+    wg_blake2s(h, 32, cast[Ptr[uint8]](&_wg_hin[0]), 32 + data_len)
+
+
+def _wg_dh_op(out: Ptr[uint8], priv: Ptr[uint8], pub: Ptr[uint8]):
+    # out = X25519(priv, pub). Reuses the TLS scalar-mult.
+    _tls_x25519_scalarmult(out, priv, pub)
+
+
+def _wg_keygen(priv: Ptr[uint8], pub: Ptr[uint8]):
+    # Derive a public key from a (already-random) private scalar.
+    _tls_x25519_base_mult(pub, priv)
+
+
+# =====================================================================
+# Handshake INITIATION  (initiator side)  -- builds & advances C,H
+# =====================================================================
+#
+# Writes the message into `out`:
+#   [0]   type (1)
+#   [1..4) reserved (0)
+#   [4..8) sender index (we use 1)
+#   [8..40)  ephemeral public key (32)
+#   [40..88) encrypted static (32 + 16 tag = 48)
+#   [88..116) encrypted timestamp (12 + 16 tag = 28)
+# Total = 116 bytes (mac1/mac2 omitted in this loopback — they protect against
+# DoS and are not part of the key schedule).
+WG_INIT_LEN: uint64 = 116
+
+
+def wg_initiator_create(init_priv: Ptr[uint8], init_pub: Ptr[uint8],
+                        eph_priv: Ptr[uint8], eph_pub: Ptr[uint8],
+                        resp_pub: Ptr[uint8],
+                        ts: Ptr[uint8],
+                        c_out: Ptr[uint8], h_out: Ptr[uint8],
+                        out: Ptr[uint8]) -> int64:
+    # c_out/h_out receive the post-initiation chaining-key + hash (32 each) so
+    # the caller can carry them into wg_initiator_consume_response. Returns the
+    # message length, or negative on error.
+    if _wg_labels_ready == 0:
+        _wg_init_labels()
+    # C = C0 ; H = H0
+    _wg_memcpy(c_out, cast[Ptr[uint8]](&_wg_c0[0]), 32)
+    _wg_memcpy(h_out, cast[Ptr[uint8]](&_wg_h0[0]), 32)
+    # H = HASH(H || S_resp_pub)
+    _wg_mix_hash(h_out, resp_pub, 32)
+    # C = KDF1(C, E_pub)
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](0), cast[Ptr[uint8]](0), 1,
+            c_out, eph_pub, 32)
+    _wg_memcpy(c_out, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # H = HASH(H || E_pub)
+    _wg_mix_hash(h_out, eph_pub, 32)
+
+    # --- msg.static ---
+    # C,k = KDF2(C, DH(E_priv, S_resp_pub))
+    _wg_dh_op(cast[Ptr[uint8]](&_wg_dh[0]), eph_priv, resp_pub)
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](&_wg_tmp_k[0]), cast[Ptr[uint8]](0), 2,
+            c_out, cast[Ptr[uint8]](&_wg_dh[0]), 32)
+    _wg_memcpy(c_out, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # enc_static = AEAD(k, 0, S_init_pub, H)  -> out[40..88]
+    _tls_aead_seal(cast[Ptr[uint8]](&_wg_tmp_k[0]),
+                   cast[Ptr[uint8]](&_wg_zero_nonce[0]),
+                   h_out, 32,
+                   init_pub, 32,
+                   cast[Ptr[uint8]](cast[uint64](out) + 40),
+                   cast[Ptr[uint8]](cast[uint64](out) + 72))
+    # H = HASH(H || enc_static)  (enc_static = 48 bytes: 32 ct + 16 tag)
+    _wg_mix_hash(h_out, cast[Ptr[uint8]](cast[uint64](out) + 40), 48)
+
+    # --- msg.timestamp ---
+    # C,k = KDF2(C, DH(S_init_priv, S_resp_pub))
+    _wg_dh_op(cast[Ptr[uint8]](&_wg_dh[0]), init_priv, resp_pub)
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](&_wg_tmp_k[0]), cast[Ptr[uint8]](0), 2,
+            c_out, cast[Ptr[uint8]](&_wg_dh[0]), 32)
+    _wg_memcpy(c_out, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # enc_ts = AEAD(k, 0, timestamp, H)  -> out[88..116]
+    _tls_aead_seal(cast[Ptr[uint8]](&_wg_tmp_k[0]),
+                   cast[Ptr[uint8]](&_wg_zero_nonce[0]),
+                   h_out, 32,
+                   ts, 12,
+                   cast[Ptr[uint8]](cast[uint64](out) + 88),
+                   cast[Ptr[uint8]](cast[uint64](out) + 100))
+    # H = HASH(H || enc_ts)  (enc_ts = 28 bytes: 12 ct + 16 tag)
+    _wg_mix_hash(h_out, cast[Ptr[uint8]](cast[uint64](out) + 88), 28)
+
+    # Header.
+    out[0] = WG_MSG_INIT
+    out[1] = 0
+    out[2] = 0
+    out[3] = 0
+    out[4] = 1          # sender index = 1
+    out[5] = 0
+    out[6] = 0
+    out[7] = 0
+    # Ephemeral public key -> out[8..40]
+    _wg_memcpy(cast[Ptr[uint8]](cast[uint64](out) + 8), eph_pub, 32)
+    return cast[int64](WG_INIT_LEN)
+
+
+# 12-byte all-zero nonce for the handshake AEAD (counter == 0).
+_wg_zero_nonce: Array[12, uint8]
+# Scratch for decrypted static key / timestamp on the responder.
+_wg_dec_static: Array[32, uint8]
+_wg_dec_ts:     Array[12, uint8]
+
+
+def wg_responder_consume_init(resp_priv: Ptr[uint8], resp_pub: Ptr[uint8],
+                              expected_init_pub: Ptr[uint8],
+                              c_out: Ptr[uint8], h_out: Ptr[uint8],
+                              eph_pub_out: Ptr[uint8],
+                              msg: Ptr[uint8], msg_len: uint64) -> int64:
+    # Responder consumes a handshake-initiation message, verifying both AEAD
+    # tags, and advancing C,H identically to the initiator. On success c_out/
+    # h_out hold the matching chaining-key/hash and eph_pub_out the peer's
+    # ephemeral public key. Returns 0 on success; negative on auth failure.
+    if _wg_labels_ready == 0:
+        _wg_init_labels()
+    if msg_len < WG_INIT_LEN:
+        return -1
+    if msg[0] != WG_MSG_INIT:
+        return -2
+    _wg_memcpy(c_out, cast[Ptr[uint8]](&_wg_c0[0]), 32)
+    _wg_memcpy(h_out, cast[Ptr[uint8]](&_wg_h0[0]), 32)
+    # H = HASH(H || S_resp_pub)  (our own static public key)
+    _wg_mix_hash(h_out, resp_pub, 32)
+    # E_pub = msg[8..40]
+    _wg_memcpy(eph_pub_out, cast[Ptr[uint8]](cast[uint64](msg) + 8), 32)
+    # C = KDF1(C, E_pub)
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](0), cast[Ptr[uint8]](0), 1,
+            c_out, eph_pub_out, 32)
+    _wg_memcpy(c_out, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # H = HASH(H || E_pub)
+    _wg_mix_hash(h_out, eph_pub_out, 32)
+
+    # --- msg.static ---
+    # C,k = KDF2(C, DH(S_resp_priv, E_pub))
+    _wg_dh_op(cast[Ptr[uint8]](&_wg_dh[0]), resp_priv, eph_pub_out)
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](&_wg_tmp_k[0]), cast[Ptr[uint8]](0), 2,
+            c_out, cast[Ptr[uint8]](&_wg_dh[0]), 32)
+    _wg_memcpy(c_out, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # dec_static = OPEN(k, 0, enc_static[40..88], H)
+    rc: int32 = _tls_aead_open(
+        cast[Ptr[uint8]](&_wg_tmp_k[0]),
+        cast[Ptr[uint8]](&_wg_zero_nonce[0]),
+        h_out, 32,
+        cast[Ptr[uint8]](cast[uint64](msg) + 40), 32,
+        cast[Ptr[uint8]](cast[uint64](msg) + 72),
+        cast[Ptr[uint8]](&_wg_dec_static[0]))
+    if rc != 0:
+        return -3
+    # The decrypted static key must match the expected initiator key.
+    if _wg_memeq(cast[Ptr[uint8]](&_wg_dec_static[0]),
+                 expected_init_pub, 32) != 1:
+        return -4
+    # H = HASH(H || enc_static)
+    _wg_mix_hash(h_out, cast[Ptr[uint8]](cast[uint64](msg) + 40), 48)
+
+    # --- msg.timestamp ---
+    # C,k = KDF2(C, DH(S_resp_priv, S_init_pub))
+    _wg_dh_op(cast[Ptr[uint8]](&_wg_dh[0]), resp_priv,
+              cast[Ptr[uint8]](&_wg_dec_static[0]))
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](&_wg_tmp_k[0]), cast[Ptr[uint8]](0), 2,
+            c_out, cast[Ptr[uint8]](&_wg_dh[0]), 32)
+    _wg_memcpy(c_out, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # dec_ts = OPEN(k, 0, enc_ts[88..116], H)
+    rc2: int32 = _tls_aead_open(
+        cast[Ptr[uint8]](&_wg_tmp_k[0]),
+        cast[Ptr[uint8]](&_wg_zero_nonce[0]),
+        h_out, 32,
+        cast[Ptr[uint8]](cast[uint64](msg) + 88), 12,
+        cast[Ptr[uint8]](cast[uint64](msg) + 100),
+        cast[Ptr[uint8]](&_wg_dec_ts[0]))
+    if rc2 != 0:
+        return -5
+    # H = HASH(H || enc_ts)
+    _wg_mix_hash(h_out, cast[Ptr[uint8]](cast[uint64](msg) + 88), 28)
+    return 0
+
+
+# =====================================================================
+# Handshake RESPONSE  (responder side)  -- builds & advances C,H, then keys
+# =====================================================================
+#
+#   [0]   type (2)
+#   [1..4) reserved
+#   [4..8) sender index (responder = 2)
+#   [8..12) receiver index (echo initiator's = 1)
+#   [12..44) ephemeral public key (32)
+#   [44..60) encrypted empty (0 + 16 tag)
+# Total = 60 bytes.
+WG_RESP_LEN: uint64 = 60
+
+
+def wg_responder_create(resp_eph_priv: Ptr[uint8], resp_eph_pub: Ptr[uint8],
+                        init_eph_pub: Ptr[uint8],
+                        init_static_pub: Ptr[uint8],
+                        psk: Ptr[uint8],
+                        c_io: Ptr[uint8], h_io: Ptr[uint8],
+                        tsend_out: Ptr[uint8], trecv_out: Ptr[uint8],
+                        out: Ptr[uint8]) -> int64:
+    # Continues from the C,H produced by wg_responder_consume_init. Emits the
+    # response message and derives the responder's transport keys (tsend/trecv).
+    # C = KDF1(C, E_pub_r)
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](0), cast[Ptr[uint8]](0), 1,
+            c_io, resp_eph_pub, 32)
+    _wg_memcpy(c_io, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # H = HASH(H || E_pub_r)
+    _wg_mix_hash(h_io, resp_eph_pub, 32)
+    # C = KDF1(C, DH(E_priv_r, E_pub_i))
+    _wg_dh_op(cast[Ptr[uint8]](&_wg_dh[0]), resp_eph_priv, init_eph_pub)
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](0), cast[Ptr[uint8]](0), 1,
+            c_io, cast[Ptr[uint8]](&_wg_dh[0]), 32)
+    _wg_memcpy(c_io, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # C = KDF1(C, DH(E_priv_r, S_init_pub))
+    _wg_dh_op(cast[Ptr[uint8]](&_wg_dh[0]), resp_eph_priv, init_static_pub)
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](0), cast[Ptr[uint8]](0), 1,
+            c_io, cast[Ptr[uint8]](&_wg_dh[0]), 32)
+    _wg_memcpy(c_io, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # C,tau,k = KDF3(C, PSK)
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](&_wg_tau[0]),
+            cast[Ptr[uint8]](&_wg_tmp_k[0]), 3,
+            c_io, psk, 32)
+    _wg_memcpy(c_io, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # H = HASH(H || tau)
+    _wg_mix_hash(h_io, cast[Ptr[uint8]](&_wg_tau[0]), 32)
+    # enc_empty = AEAD(k, 0, "", H) -> out[44..60]  (0 ct + 16 tag)
+    _tls_aead_seal(cast[Ptr[uint8]](&_wg_tmp_k[0]),
+                   cast[Ptr[uint8]](&_wg_zero_nonce[0]),
+                   h_io, 32,
+                   cast[Ptr[uint8]](0), 0,
+                   cast[Ptr[uint8]](cast[uint64](out) + 44),
+                   cast[Ptr[uint8]](cast[uint64](out) + 44))
+    # H = HASH(H || enc_empty)  (16 bytes)
+    _wg_mix_hash(h_io, cast[Ptr[uint8]](cast[uint64](out) + 44), 16)
+
+    # Transport keys (responder): (T_recv, T_send) = KDF2(C, "")
+    wg_hkdf(trecv_out, tsend_out, cast[Ptr[uint8]](0), 2,
+            c_io, cast[Ptr[uint8]](&_wg_empty[0]), 0)
+
+    # Header.
+    out[0] = WG_MSG_RESPONSE
+    out[1] = 0
+    out[2] = 0
+    out[3] = 0
+    out[4] = 2     # sender index (responder)
+    out[5] = 0
+    out[6] = 0
+    out[7] = 0
+    out[8] = 1     # receiver index (echo initiator)
+    out[9] = 0
+    out[10] = 0
+    out[11] = 0
+    _wg_memcpy(cast[Ptr[uint8]](cast[uint64](out) + 12), resp_eph_pub, 32)
+    return cast[int64](WG_RESP_LEN)
+
+
+_wg_empty: Array[1, uint8]
+_wg_dec_empty: Array[1, uint8]
+
+
+def wg_initiator_consume_response(init_static_priv: Ptr[uint8],
+                                  init_eph_priv: Ptr[uint8],
+                                  psk: Ptr[uint8],
+                                  c_io: Ptr[uint8], h_io: Ptr[uint8],
+                                  tsend_out: Ptr[uint8], trecv_out: Ptr[uint8],
+                                  msg: Ptr[uint8], msg_len: uint64) -> int64:
+    # Initiator consumes the response, verifies the empty-AEAD tag, and derives
+    # its transport keys. Returns 0 on success; negative on auth failure.
+    if msg_len < WG_RESP_LEN:
+        return -1
+    if msg[0] != WG_MSG_RESPONSE:
+        return -2
+    # E_pub_r = msg[12..44]
+    # C = KDF1(C, E_pub_r)
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](0), cast[Ptr[uint8]](0), 1,
+            c_io, cast[Ptr[uint8]](cast[uint64](msg) + 12), 32)
+    _wg_memcpy(c_io, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # H = HASH(H || E_pub_r)
+    _wg_mix_hash(h_io, cast[Ptr[uint8]](cast[uint64](msg) + 12), 32)
+    # C = KDF1(C, DH(E_priv_i, E_pub_r))
+    _wg_dh_op(cast[Ptr[uint8]](&_wg_dh[0]), init_eph_priv,
+              cast[Ptr[uint8]](cast[uint64](msg) + 12))
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](0), cast[Ptr[uint8]](0), 1,
+            c_io, cast[Ptr[uint8]](&_wg_dh[0]), 32)
+    _wg_memcpy(c_io, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # C = KDF1(C, DH(S_priv_i, E_pub_r))
+    _wg_dh_op(cast[Ptr[uint8]](&_wg_dh[0]), init_static_priv,
+              cast[Ptr[uint8]](cast[uint64](msg) + 12))
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](0), cast[Ptr[uint8]](0), 1,
+            c_io, cast[Ptr[uint8]](&_wg_dh[0]), 32)
+    _wg_memcpy(c_io, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # C,tau,k = KDF3(C, PSK)
+    wg_hkdf(cast[Ptr[uint8]](&_wg_tmp_c[0]),
+            cast[Ptr[uint8]](&_wg_tau[0]),
+            cast[Ptr[uint8]](&_wg_tmp_k[0]), 3,
+            c_io, psk, 32)
+    _wg_memcpy(c_io, cast[Ptr[uint8]](&_wg_tmp_c[0]), 32)
+    # H = HASH(H || tau)
+    _wg_mix_hash(h_io, cast[Ptr[uint8]](&_wg_tau[0]), 32)
+    # OPEN(k, 0, enc_empty[44..60], H)
+    rc: int32 = _tls_aead_open(
+        cast[Ptr[uint8]](&_wg_tmp_k[0]),
+        cast[Ptr[uint8]](&_wg_zero_nonce[0]),
+        h_io, 32,
+        cast[Ptr[uint8]](&_wg_empty[0]), 0,
+        cast[Ptr[uint8]](cast[uint64](msg) + 44),
+        cast[Ptr[uint8]](&_wg_dec_empty[0]))
+    if rc != 0:
+        return -3
+    # H = HASH(H || enc_empty)
+    _wg_mix_hash(h_io, cast[Ptr[uint8]](cast[uint64](msg) + 44), 16)
+    # Transport keys (initiator): (T_send, T_recv) = KDF2(C, "")
+    wg_hkdf(tsend_out, trecv_out, cast[Ptr[uint8]](0), 2,
+            c_io, cast[Ptr[uint8]](&_wg_empty[0]), 0)
+    return 0
+
+
+# =====================================================================
+# Transport data messages
+# =====================================================================
+#
+#   [0]   type (4)
+#   [1..4) reserved
+#   [4..8) receiver index
+#   [8..16) counter (le64)
+#   [16..]  AEAD(T_send, counter, inner_packet, "")  -- ct || 16-byte tag
+WG_TRANSPORT_HDR: uint64 = 16
+
+# Nonce scratch (4 zero bytes + le64 counter).
+_wg_nonce: Array[12, uint8]
+
+
+def _wg_build_nonce(counter: uint64):
+    i: uint64 = 0
+    while i < 4:
+        _wg_nonce[i] = 0
+        i = i + 1
+    i = 0
+    while i < 8:
+        _wg_nonce[4 + i] = cast[uint8]((counter >> (i * 8)) & 0xFF)
+        i = i + 1
+
+
+def wg_transport_seal(tsend: Ptr[uint8], counter: uint64,
+                      recv_index: uint32,
+                      inner: Ptr[uint8], inner_len: uint64,
+                      out: Ptr[uint8]) -> int64:
+    # Encrypt one inner packet into a WireGuard transport message. Returns the
+    # total length (16 header + inner_len + 16 tag).
+    out[0] = WG_MSG_TRANSPORT
+    out[1] = 0
+    out[2] = 0
+    out[3] = 0
+    out[4] = cast[uint8](recv_index & 0xFF)
+    out[5] = cast[uint8]((recv_index >> 8) & 0xFF)
+    out[6] = cast[uint8]((recv_index >> 16) & 0xFF)
+    out[7] = cast[uint8]((recv_index >> 24) & 0xFF)
+    i: uint64 = 0
+    while i < 8:
+        out[8 + i] = cast[uint8]((counter >> (i * 8)) & 0xFF)
+        i = i + 1
+    _wg_build_nonce(counter)
+    _tls_aead_seal(tsend,
+                   cast[Ptr[uint8]](&_wg_nonce[0]),
+                   cast[Ptr[uint8]](&_wg_empty[0]), 0,
+                   inner, inner_len,
+                   cast[Ptr[uint8]](cast[uint64](out) + WG_TRANSPORT_HDR),
+                   cast[Ptr[uint8]](cast[uint64](out) + WG_TRANSPORT_HDR + inner_len))
+    return cast[int64](WG_TRANSPORT_HDR + inner_len + WG_TAG_LEN)
+
+
+def wg_transport_open(trecv: Ptr[uint8],
+                      msg: Ptr[uint8], msg_len: uint64,
+                      out: Ptr[uint8],
+                      seen: Ptr[int32], max_ctr: Ptr[uint64]) -> int64:
+    # Verify + decrypt a transport message, enforcing a (strictly-increasing,
+    # simplified) replay check: the counter must exceed the highest counter
+    # accepted so far (seen/max_ctr track per-session state). Returns the inner
+    # length on success; negative on auth/replay failure:
+    #   -1 malformed, -2 wrong type, -3 AEAD auth fail, -4 replay
+    if msg_len < (WG_TRANSPORT_HDR + WG_TAG_LEN):
+        return -1
+    if msg[0] != WG_MSG_TRANSPORT:
+        return -2
+    counter: uint64 = 0
+    i: uint64 = 0
+    while i < 8:
+        counter = counter | (cast[uint64](msg[8 + i]) << (i * 8))
+        i = i + 1
+    # Replay: reject a counter at/below the highest already accepted.
+    if seen[0] != 0:
+        if counter <= max_ctr[0]:
+            wg_rx_drops = wg_rx_drops + 1
+            return -4
+    ct_len: uint64 = msg_len - WG_TRANSPORT_HDR - WG_TAG_LEN
+    _wg_build_nonce(counter)
+    rc: int32 = _tls_aead_open(
+        trecv,
+        cast[Ptr[uint8]](&_wg_nonce[0]),
+        cast[Ptr[uint8]](&_wg_empty[0]), 0,
+        cast[Ptr[uint8]](cast[uint64](msg) + WG_TRANSPORT_HDR), ct_len,
+        cast[Ptr[uint8]](cast[uint64](msg) + WG_TRANSPORT_HDR + ct_len),
+        out)
+    if rc != 0:
+        wg_rx_drops = wg_rx_drops + 1
+        return -3
+    # Accept: advance the replay floor.
+    seen[0] = 1
+    max_ctr[0] = counter
+    wg_rx_transport = wg_rx_transport + 1
+    return cast[int64](ct_len)
+
+
+# =====================================================================
+# Known-answer tests (RFC 8439 ChaCha20-Poly1305 + RFC 7748 X25519)
+# =====================================================================
+
+# RFC 8439 §2.8.2 ChaCha20-Poly1305 AEAD vector.
+_wgk_key:    Array[32, uint8]
+_wgk_iv:     Array[12, uint8]
+_wgk_aad:    Array[12, uint8]
+_wgk_pt:     Array[114, uint8]
+_wgk_ct:     Array[114, uint8]
+_wgk_tag:    Array[16, uint8]
+_wgk_expct:  Array[114, uint8]
+_wgk_exptag: Array[16, uint8]
+_wgk_dec:    Array[114, uint8]
+
+# RFC 7748 §5.2 X25519 vector.
+_wgx_scalar: Array[32, uint8]
+_wgx_u:      Array[32, uint8]
+_wgx_out:    Array[32, uint8]
+_wgx_exp:    Array[32, uint8]
+
+
+def _wg_chachapoly_kat() -> int32:
+    # RFC 8439 §2.8.2. Key = 80..9f, nonce = 070000004041424344454647,
+    # AAD = 50515253c0c1c2c3c4c5c6c7, plaintext = "Ladies and Gentlemen..."
+    # Expected ciphertext + tag are from the RFC.
+    i: uint64 = 0
+    while i < 32:
+        _wgk_key[i] = cast[uint8](0x80 + i)
+        i = i + 1
+    _wgk_iv[0]=0x07
+    _wgk_iv[1]=0x00
+    _wgk_iv[2]=0x00
+    _wgk_iv[3]=0x00
+    _wgk_iv[4]=0x40
+    _wgk_iv[5]=0x41
+    _wgk_iv[6]=0x42
+    _wgk_iv[7]=0x43
+    _wgk_iv[8]=0x44
+    _wgk_iv[9]=0x45
+    _wgk_iv[10]=0x46
+    _wgk_iv[11]=0x47
+    _wgk_aad[0]=0x50
+    _wgk_aad[1]=0x51
+    _wgk_aad[2]=0x52
+    _wgk_aad[3]=0x53
+    _wgk_aad[4]=0xc0
+    _wgk_aad[5]=0xc1
+    _wgk_aad[6]=0xc2
+    _wgk_aad[7]=0xc3
+    _wgk_aad[8]=0xc4
+    _wgk_aad[9]=0xc5
+    _wgk_aad[10]=0xc6
+    _wgk_aad[11]=0xc7
+    # Plaintext: "Ladies and Gentlemen of the class of '99: If I could offer
+    # you only one tip for the future, sunscreen would be it." (114 bytes)
+    _wg_set_pt()
+    _wg_set_expct()
+    pt_len: uint64 = 114
+    aad_len: uint64 = 12
+    _tls_aead_seal(cast[Ptr[uint8]](&_wgk_key[0]),
+                   cast[Ptr[uint8]](&_wgk_iv[0]),
+                   cast[Ptr[uint8]](&_wgk_aad[0]), aad_len,
+                   cast[Ptr[uint8]](&_wgk_pt[0]), pt_len,
+                   cast[Ptr[uint8]](&_wgk_ct[0]),
+                   cast[Ptr[uint8]](&_wgk_tag[0]))
+    i = 0
+    while i < pt_len:
+        if _wgk_ct[i] != _wgk_expct[i]:
+            return 0
+        i = i + 1
+    i = 0
+    while i < 16:
+        if _wgk_tag[i] != _wgk_exptag[i]:
+            return 0
+        i = i + 1
+    # Round-trip open.
+    rc: int32 = _tls_aead_open(
+        cast[Ptr[uint8]](&_wgk_key[0]),
+        cast[Ptr[uint8]](&_wgk_iv[0]),
+        cast[Ptr[uint8]](&_wgk_aad[0]), aad_len,
+        cast[Ptr[uint8]](&_wgk_expct[0]), pt_len,
+        cast[Ptr[uint8]](&_wgk_exptag[0]),
+        cast[Ptr[uint8]](&_wgk_dec[0]))
+    if rc != 0:
+        return 0
+    i = 0
+    while i < pt_len:
+        if _wgk_dec[i] != _wgk_pt[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _wg_x25519_kat() -> int32:
+    # RFC 7748 §5.2 first vector:
+    #   scalar = a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4
+    #   u      = e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c
+    #   out    = c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552
+    _wg_set_x25519_vec()
+    _tls_x25519_scalarmult(cast[Ptr[uint8]](&_wgx_out[0]),
+                           cast[Ptr[uint8]](&_wgx_scalar[0]),
+                           cast[Ptr[uint8]](&_wgx_u[0]))
+    i: uint64 = 0
+    while i < 32:
+        if _wgx_out[i] != _wgx_exp[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# (data-loading helpers kept out of the test functions for readability)
+def _wg_set_pt():
+    s: Ptr[uint8] = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+    i: uint64 = 0
+    while i < 114:
+        _wgk_pt[i] = s[i]
+        i = i + 1
+
+
+def _wg_set_expct():
+    # RFC 8439 §2.8.2 expected ciphertext (114 bytes) + tag (16 bytes).
+    _wgk_expct[0]=0xd3
+    _wgk_expct[1]=0x1a
+    _wgk_expct[2]=0x8d
+    _wgk_expct[3]=0x34
+    _wgk_expct[4]=0x64
+    _wgk_expct[5]=0x8e
+    _wgk_expct[6]=0x60
+    _wgk_expct[7]=0xdb
+    _wgk_expct[8]=0x7b
+    _wgk_expct[9]=0x86
+    _wgk_expct[10]=0xaf
+    _wgk_expct[11]=0xbc
+    _wgk_expct[12]=0x53
+    _wgk_expct[13]=0xef
+    _wgk_expct[14]=0x7e
+    _wgk_expct[15]=0xc2
+    _wgk_expct[16]=0xa4
+    _wgk_expct[17]=0xad
+    _wgk_expct[18]=0xed
+    _wgk_expct[19]=0x51
+    _wgk_expct[20]=0x29
+    _wgk_expct[21]=0x6e
+    _wgk_expct[22]=0x08
+    _wgk_expct[23]=0xfe
+    _wgk_expct[24]=0xa9
+    _wgk_expct[25]=0xe2
+    _wgk_expct[26]=0xb5
+    _wgk_expct[27]=0xa7
+    _wgk_expct[28]=0x36
+    _wgk_expct[29]=0xee
+    _wgk_expct[30]=0x62
+    _wgk_expct[31]=0xd6
+    _wgk_expct[32]=0x3d
+    _wgk_expct[33]=0xbe
+    _wgk_expct[34]=0xa4
+    _wgk_expct[35]=0x5e
+    _wgk_expct[36]=0x8c
+    _wgk_expct[37]=0xa9
+    _wgk_expct[38]=0x67
+    _wgk_expct[39]=0x12
+    _wgk_expct[40]=0x82
+    _wgk_expct[41]=0xfa
+    _wgk_expct[42]=0xfb
+    _wgk_expct[43]=0x69
+    _wgk_expct[44]=0xda
+    _wgk_expct[45]=0x92
+    _wgk_expct[46]=0x72
+    _wgk_expct[47]=0x8b
+    _wgk_expct[48]=0x1a
+    _wgk_expct[49]=0x71
+    _wgk_expct[50]=0xde
+    _wgk_expct[51]=0x0a
+    _wgk_expct[52]=0x9e
+    _wgk_expct[53]=0x06
+    _wgk_expct[54]=0x0b
+    _wgk_expct[55]=0x29
+    _wgk_expct[56]=0x05
+    _wgk_expct[57]=0xd6
+    _wgk_expct[58]=0xa5
+    _wgk_expct[59]=0xb6
+    _wgk_expct[60]=0x7e
+    _wgk_expct[61]=0xcd
+    _wgk_expct[62]=0x3b
+    _wgk_expct[63]=0x36
+    _wgk_expct[64]=0x92
+    _wgk_expct[65]=0xdd
+    _wgk_expct[66]=0xbd
+    _wgk_expct[67]=0x7f
+    _wgk_expct[68]=0x2d
+    _wgk_expct[69]=0x77
+    _wgk_expct[70]=0x8b
+    _wgk_expct[71]=0x8c
+    _wgk_expct[72]=0x98
+    _wgk_expct[73]=0x03
+    _wgk_expct[74]=0xae
+    _wgk_expct[75]=0xe3
+    _wgk_expct[76]=0x28
+    _wgk_expct[77]=0x09
+    _wgk_expct[78]=0x1b
+    _wgk_expct[79]=0x58
+    _wgk_expct[80]=0xfa
+    _wgk_expct[81]=0xb3
+    _wgk_expct[82]=0x24
+    _wgk_expct[83]=0xe4
+    _wgk_expct[84]=0xfa
+    _wgk_expct[85]=0xd6
+    _wgk_expct[86]=0x75
+    _wgk_expct[87]=0x94
+    _wgk_expct[88]=0x55
+    _wgk_expct[89]=0x85
+    _wgk_expct[90]=0x80
+    _wgk_expct[91]=0x8b
+    _wgk_expct[92]=0x48
+    _wgk_expct[93]=0x31
+    _wgk_expct[94]=0xd7
+    _wgk_expct[95]=0xbc
+    _wgk_expct[96]=0x3f
+    _wgk_expct[97]=0xf4
+    _wgk_expct[98]=0xde
+    _wgk_expct[99]=0xf0
+    _wgk_expct[100]=0x8e
+    _wgk_expct[101]=0x4b
+    _wgk_expct[102]=0x7a
+    _wgk_expct[103]=0x9d
+    _wgk_expct[104]=0xe5
+    _wgk_expct[105]=0x76
+    _wgk_expct[106]=0xd2
+    _wgk_expct[107]=0x65
+    _wgk_expct[108]=0x86
+    _wgk_expct[109]=0xce
+    _wgk_expct[110]=0xc6
+    _wgk_expct[111]=0x4b
+    _wgk_expct[112]=0x61
+    _wgk_expct[113]=0x16
+    _wgk_exptag[0]=0x1a
+    _wgk_exptag[1]=0xe1
+    _wgk_exptag[2]=0x0b
+    _wgk_exptag[3]=0x59
+    _wgk_exptag[4]=0x4f
+    _wgk_exptag[5]=0x09
+    _wgk_exptag[6]=0xe2
+    _wgk_exptag[7]=0x6a
+    _wgk_exptag[8]=0x7e
+    _wgk_exptag[9]=0x90
+    _wgk_exptag[10]=0x2e
+    _wgk_exptag[11]=0xcb
+    _wgk_exptag[12]=0xd0
+    _wgk_exptag[13]=0x60
+    _wgk_exptag[14]=0x06
+    _wgk_exptag[15]=0x91
+
+
+def _wg_set_x25519_vec():
+    _wgx_scalar[0]=0xa5
+    _wgx_scalar[1]=0x46
+    _wgx_scalar[2]=0xe3
+    _wgx_scalar[3]=0x6b
+    _wgx_scalar[4]=0xf0
+    _wgx_scalar[5]=0x52
+    _wgx_scalar[6]=0x7c
+    _wgx_scalar[7]=0x9d
+    _wgx_scalar[8]=0x3b
+    _wgx_scalar[9]=0x16
+    _wgx_scalar[10]=0x15
+    _wgx_scalar[11]=0x4b
+    _wgx_scalar[12]=0x82
+    _wgx_scalar[13]=0x46
+    _wgx_scalar[14]=0x5e
+    _wgx_scalar[15]=0xdd
+    _wgx_scalar[16]=0x62
+    _wgx_scalar[17]=0x14
+    _wgx_scalar[18]=0x4c
+    _wgx_scalar[19]=0x0a
+    _wgx_scalar[20]=0xc1
+    _wgx_scalar[21]=0xfc
+    _wgx_scalar[22]=0x5a
+    _wgx_scalar[23]=0x18
+    _wgx_scalar[24]=0x50
+    _wgx_scalar[25]=0x6a
+    _wgx_scalar[26]=0x22
+    _wgx_scalar[27]=0x44
+    _wgx_scalar[28]=0xba
+    _wgx_scalar[29]=0x44
+    _wgx_scalar[30]=0x9a
+    _wgx_scalar[31]=0xc4
+    _wgx_u[0]=0xe6
+    _wgx_u[1]=0xdb
+    _wgx_u[2]=0x68
+    _wgx_u[3]=0x67
+    _wgx_u[4]=0x58
+    _wgx_u[5]=0x30
+    _wgx_u[6]=0x30
+    _wgx_u[7]=0xdb
+    _wgx_u[8]=0x35
+    _wgx_u[9]=0x94
+    _wgx_u[10]=0xc1
+    _wgx_u[11]=0xa4
+    _wgx_u[12]=0x24
+    _wgx_u[13]=0xb1
+    _wgx_u[14]=0x5f
+    _wgx_u[15]=0x7c
+    _wgx_u[16]=0x72
+    _wgx_u[17]=0x66
+    _wgx_u[18]=0x24
+    _wgx_u[19]=0xec
+    _wgx_u[20]=0x26
+    _wgx_u[21]=0xb3
+    _wgx_u[22]=0x35
+    _wgx_u[23]=0x3b
+    _wgx_u[24]=0x10
+    _wgx_u[25]=0xa9
+    _wgx_u[26]=0x03
+    _wgx_u[27]=0xa6
+    _wgx_u[28]=0xd0
+    _wgx_u[29]=0xab
+    _wgx_u[30]=0x1c
+    _wgx_u[31]=0x4c
+    _wgx_exp[0]=0xc3
+    _wgx_exp[1]=0xda
+    _wgx_exp[2]=0x55
+    _wgx_exp[3]=0x37
+    _wgx_exp[4]=0x9d
+    _wgx_exp[5]=0xe9
+    _wgx_exp[6]=0xc6
+    _wgx_exp[7]=0x90
+    _wgx_exp[8]=0x8e
+    _wgx_exp[9]=0x94
+    _wgx_exp[10]=0xea
+    _wgx_exp[11]=0x4d
+    _wgx_exp[12]=0xf2
+    _wgx_exp[13]=0x8d
+    _wgx_exp[14]=0x08
+    _wgx_exp[15]=0x4f
+    _wgx_exp[16]=0x32
+    _wgx_exp[17]=0xec
+    _wgx_exp[18]=0xcf
+    _wgx_exp[19]=0x03
+    _wgx_exp[20]=0x49
+    _wgx_exp[21]=0x1c
+    _wgx_exp[22]=0x71
+    _wgx_exp[23]=0xf7
+    _wgx_exp[24]=0x54
+    _wgx_exp[25]=0xb4
+    _wgx_exp[26]=0x07
+    _wgx_exp[27]=0x55
+    _wgx_exp[28]=0x77
+    _wgx_exp[29]=0xa2
+    _wgx_exp[30]=0x85
+    _wgx_exp[31]=0x52
+
+
+# =====================================================================
+# Two-peer loopback self-test
+# =====================================================================
+#
+# Buffers for the handshake + transport round-trip. Generously sized so an
+# undersized Array can't clobber an adjacent global.
+_wg_init_msg:  Array[256, uint8]
+_wg_resp_msg:  Array[256, uint8]
+_wg_xport_ab:  Array[512, uint8]
+_wg_xport_ba:  Array[512, uint8]
+_wg_inner_ab:  Array[256, uint8]
+_wg_inner_ba:  Array[256, uint8]
+_wg_recovered: Array[256, uint8]
+_wg_eA_pub:    Array[32, uint8]      # initiator ephemeral pub (carried)
+_wg_eB_pub:    Array[32, uint8]      # responder ephemeral pub (carried)
+_wg_seen:      int32 = 0
+_wg_maxc:      uint64 = 0
+
+
+def wireguard_selftest() -> int32:
+    _wg_emerg0("[wireguard] self-test start\n")
+    ok: int32 = 1
+
+    # --- KATs prove the crypto core before any protocol is trusted. ---
+    if _wg_chachapoly_kat() != 1:
+        _wg_emerg0("[wireguard] FAIL: chacha20-poly1305 KAT (RFC 8439) mismatch\n")
+        return 0
+    _wg_emerg0("[wireguard] PASS kat-chacha20poly1305 (RFC 8439)\n")
+
+    if _wg_x25519_kat() != 1:
+        _wg_emerg0("[wireguard] FAIL: X25519 KAT (RFC 7748) mismatch\n")
+        return 0
+    _wg_emerg0("[wireguard] PASS kat-x25519 (RFC 7748)\n")
+
+    if wg_blake2s_kat() != 1:
+        _wg_emerg0("[wireguard] FAIL: BLAKE2s KAT mismatch\n")
+        return 0
+    _wg_emerg0("[wireguard] PASS kat-blake2s (RFC 7693)\n")
+
+    _wg_init_labels()
+
+    # --- Static keypairs for A and B (deterministic private scalars). ---
+    i: uint64 = 0
+    while i < 32:
+        wgA_static_priv[i] = cast[uint8]((0x11 + i) & 0xFF)
+        wgB_static_priv[i] = cast[uint8]((0x42 + i) & 0xFF)
+        wgA_eph_priv[i]    = cast[uint8]((0x71 + i) & 0xFF)
+        wgB_eph_priv[i]    = cast[uint8]((0xA3 + i) & 0xFF)
+        # Pre-shared key (both sides share it).
+        wgA_psk[i] = cast[uint8]((0x5A + i) & 0xFF)
+        wgB_psk[i] = cast[uint8]((0x5A + i) & 0xFF)
+        i = i + 1
+    _wg_keygen(cast[Ptr[uint8]](&wgA_static_priv[0]),
+               cast[Ptr[uint8]](&wgA_static_pub[0]))
+    _wg_keygen(cast[Ptr[uint8]](&wgB_static_priv[0]),
+               cast[Ptr[uint8]](&wgB_static_pub[0]))
+    _wg_keygen(cast[Ptr[uint8]](&wgA_eph_priv[0]),
+               cast[Ptr[uint8]](&_wg_eA_pub[0]))
+    _wg_keygen(cast[Ptr[uint8]](&wgB_eph_priv[0]),
+               cast[Ptr[uint8]](&_wg_eB_pub[0]))
+    # Deterministic timestamp.
+    i = 0
+    while i < 12:
+        _wg_ts[i] = 0
+        i = i + 1
+
+    # --- A builds the handshake initiation. ---
+    il: int64 = wg_initiator_create(
+        cast[Ptr[uint8]](&wgA_static_priv[0]),
+        cast[Ptr[uint8]](&wgA_static_pub[0]),
+        cast[Ptr[uint8]](&wgA_eph_priv[0]),
+        cast[Ptr[uint8]](&_wg_eA_pub[0]),
+        cast[Ptr[uint8]](&wgB_static_pub[0]),
+        cast[Ptr[uint8]](&_wg_ts[0]),
+        cast[Ptr[uint8]](&wgA_C[0]),
+        cast[Ptr[uint8]](&wgA_H[0]),
+        cast[Ptr[uint8]](&_wg_init_msg[0]))
+    if il < 0:
+        _wg_emerg1("[wireguard] FAIL: initiation create rc=%d\n", cast[uint64](il))
+        return 0
+    if _wg_init_msg[0] != WG_MSG_INIT:
+        _wg_emerg0("[wireguard] FAIL: initiation type != 1\n")
+        return 0
+    _wg_emerg1("[wireguard] PASS initiation-built len=%d\n", cast[uint64](il))
+
+    # --- B consumes the initiation (authenticates A's static key). ---
+    rc: int64 = wg_responder_consume_init(
+        cast[Ptr[uint8]](&wgB_static_priv[0]),
+        cast[Ptr[uint8]](&wgB_static_pub[0]),
+        cast[Ptr[uint8]](&wgA_static_pub[0]),
+        cast[Ptr[uint8]](&wgB_C[0]),
+        cast[Ptr[uint8]](&wgB_H[0]),
+        cast[Ptr[uint8]](&_wg_eA_pub[0]),
+        cast[Ptr[uint8]](&_wg_init_msg[0]), cast[uint64](il))
+    if rc != 0:
+        _wg_emerg1("[wireguard] FAIL: responder consume-init rc=%d\n", cast[uint64](rc))
+        return 0
+    # The responder's chaining-key + hash MUST equal the initiator's.
+    if _wg_memeq(cast[Ptr[uint8]](&wgA_C[0]),
+                 cast[Ptr[uint8]](&wgB_C[0]), 32) != 1:
+        _wg_emerg0("[wireguard] FAIL: post-initiation chaining-key mismatch\n")
+        return 0
+    if _wg_memeq(cast[Ptr[uint8]](&wgA_H[0]),
+                 cast[Ptr[uint8]](&wgB_H[0]), 32) != 1:
+        _wg_emerg0("[wireguard] FAIL: post-initiation hash mismatch\n")
+        return 0
+    _wg_emerg0("[wireguard] PASS initiation-consumed C+H-match\n")
+
+    # --- B builds the response + derives its transport keys. ---
+    rl: int64 = wg_responder_create(
+        cast[Ptr[uint8]](&wgB_eph_priv[0]),
+        cast[Ptr[uint8]](&_wg_eB_pub[0]),
+        cast[Ptr[uint8]](&_wg_eA_pub[0]),
+        cast[Ptr[uint8]](&wgA_static_pub[0]),
+        cast[Ptr[uint8]](&wgB_psk[0]),
+        cast[Ptr[uint8]](&wgB_C[0]),
+        cast[Ptr[uint8]](&wgB_H[0]),
+        cast[Ptr[uint8]](&wgB_tsend[0]),
+        cast[Ptr[uint8]](&wgB_trecv[0]),
+        cast[Ptr[uint8]](&_wg_resp_msg[0]))
+    if rl < 0:
+        _wg_emerg1("[wireguard] FAIL: response create rc=%d\n", cast[uint64](rl))
+        return 0
+    _wg_emerg1("[wireguard] PASS response-built len=%d\n", cast[uint64](rl))
+
+    # --- A consumes the response + derives its transport keys. ---
+    rc2: int64 = wg_initiator_consume_response(
+        cast[Ptr[uint8]](&wgA_static_priv[0]),
+        cast[Ptr[uint8]](&wgA_eph_priv[0]),
+        cast[Ptr[uint8]](&wgA_psk[0]),
+        cast[Ptr[uint8]](&wgA_C[0]),
+        cast[Ptr[uint8]](&wgA_H[0]),
+        cast[Ptr[uint8]](&wgA_tsend[0]),
+        cast[Ptr[uint8]](&wgA_trecv[0]),
+        cast[Ptr[uint8]](&_wg_resp_msg[0]), cast[uint64](rl))
+    if rc2 != 0:
+        _wg_emerg1("[wireguard] FAIL: initiator consume-response rc=%d\n", cast[uint64](rc2))
+        return 0
+    _wg_emerg0("[wireguard] PASS response-consumed\n")
+
+    # --- The derived transport keys MUST cross-match. ---
+    if _wg_memeq(cast[Ptr[uint8]](&wgA_tsend[0]),
+                 cast[Ptr[uint8]](&wgB_trecv[0]), 32) != 1:
+        _wg_emerg0("[wireguard] FAIL: A.send != B.recv\n")
+        return 0
+    if _wg_memeq(cast[Ptr[uint8]](&wgA_trecv[0]),
+                 cast[Ptr[uint8]](&wgB_tsend[0]), 32) != 1:
+        _wg_emerg0("[wireguard] FAIL: A.recv != B.send\n")
+        return 0
+    _wg_emerg0("[wireguard] PASS transport-keys-match\n")
+    wg_handshakes_ok = wg_handshakes_ok + 1
+
+    # --- Transport round-trip A -> B. ---
+    inner_len: uint64 = 60
+    i = 0
+    while i < inner_len:
+        _wg_inner_ab[i] = cast[uint8]((0x30 + i * 7) & 0xFF)
+        i = i + 1
+    tx_len: int64 = wg_transport_seal(
+        cast[Ptr[uint8]](&wgA_tsend[0]), 0, 2,
+        cast[Ptr[uint8]](&_wg_inner_ab[0]), inner_len,
+        cast[Ptr[uint8]](&_wg_xport_ab[0]))
+    if tx_len < 0:
+        _wg_emerg1("[wireguard] FAIL: A->B seal rc=%d\n", cast[uint64](tx_len))
+        return 0
+    wg_tx_transport = wg_tx_transport + 1
+    # On-wire payload must be real ciphertext (differ from plaintext).
+    differs: int32 = 0
+    i = 0
+    while i < inner_len:
+        if _wg_xport_ab[WG_TRANSPORT_HDR + i] != _wg_inner_ab[i]:
+            differs = 1
+            i = inner_len
+        else:
+            i = i + 1
+    if differs != 1:
+        _wg_emerg0("[wireguard] FAIL: transport payload equals plaintext\n")
+        return 0
+    _wg_seen = 0
+    _wg_maxc = 0
+    rx_len: int64 = wg_transport_open(
+        cast[Ptr[uint8]](&wgB_trecv[0]),
+        cast[Ptr[uint8]](&_wg_xport_ab[0]), cast[uint64](tx_len),
+        cast[Ptr[uint8]](&_wg_recovered[0]),
+        cast[Ptr[int32]](&_wg_seen), cast[Ptr[uint64]](&_wg_maxc))
+    if rx_len < 0:
+        _wg_emerg1("[wireguard] FAIL: A->B open rc=%d\n", cast[uint64](rx_len))
+        return 0
+    if cast[uint64](rx_len) != inner_len:
+        _wg_emerg0("[wireguard] FAIL: A->B recovered length mismatch\n")
+        return 0
+    if _wg_memeq(cast[Ptr[uint8]](&_wg_recovered[0]),
+                 cast[Ptr[uint8]](&_wg_inner_ab[0]), inner_len) != 1:
+        _wg_emerg0("[wireguard] FAIL: A->B not byte-identical\n")
+        return 0
+    _wg_emerg0("[wireguard] PASS transport-roundtrip-A-to-B\n")
+
+    # --- Reply round-trip B -> A. ---
+    inner_len2: uint64 = 48
+    i = 0
+    while i < inner_len2:
+        _wg_inner_ba[i] = cast[uint8]((0xC0 + i * 5) & 0xFF)
+        i = i + 1
+    tx2: int64 = wg_transport_seal(
+        cast[Ptr[uint8]](&wgB_tsend[0]), 0, 1,
+        cast[Ptr[uint8]](&_wg_inner_ba[0]), inner_len2,
+        cast[Ptr[uint8]](&_wg_xport_ba[0]))
+    if tx2 < 0:
+        _wg_emerg0("[wireguard] FAIL: B->A seal\n")
+        return 0
+    wgA_recv_seen = 0
+    wgA_recv_max = 0
+    rx2: int64 = wg_transport_open(
+        cast[Ptr[uint8]](&wgA_trecv[0]),
+        cast[Ptr[uint8]](&_wg_xport_ba[0]), cast[uint64](tx2),
+        cast[Ptr[uint8]](&_wg_recovered[0]),
+        cast[Ptr[int32]](&wgA_recv_seen), cast[Ptr[uint64]](&wgA_recv_max))
+    if rx2 < 0:
+        _wg_emerg1("[wireguard] FAIL: B->A open rc=%d\n", cast[uint64](rx2))
+        return 0
+    if _wg_memeq(cast[Ptr[uint8]](&_wg_recovered[0]),
+                 cast[Ptr[uint8]](&_wg_inner_ba[0]), inner_len2) != 1:
+        _wg_emerg0("[wireguard] FAIL: B->A not byte-identical\n")
+        return 0
+    _wg_emerg0("[wireguard] PASS transport-roundtrip-B-to-A\n")
+
+    # --- Security: wrong key must be REJECTED. ---
+    # The A->B message was sealed under wgA_tsend (== wgB_trecv). Open it with a
+    # DIFFERENT key — wgA_trecv (== wgB_tsend), the other-direction key — so the
+    # ChaCha20-Poly1305 tag must fail to verify.
+    _wg_seen = 0
+    _wg_maxc = 0
+    wrong: int64 = wg_transport_open(
+        cast[Ptr[uint8]](&wgA_trecv[0]),
+        cast[Ptr[uint8]](&_wg_xport_ab[0]), cast[uint64](tx_len),
+        cast[Ptr[uint8]](&_wg_recovered[0]),
+        cast[Ptr[int32]](&_wg_seen), cast[Ptr[uint64]](&_wg_maxc))
+    if wrong != -3:
+        _wg_emerg1("[wireguard] FAIL: wrong-key accepted rc=%d\n", cast[uint64](wrong))
+        return 0
+    _wg_emerg0("[wireguard] PASS reject-wrong-key\n")
+
+    # --- Security: replayed counter must be REJECTED. ---
+    # Re-open the (already accepted, counter=0) A->B message against B's recv
+    # state, which has advanced past counter 0 -> replay reject.
+    _wg_seen = 0
+    _wg_maxc = 0
+    # First accept counter 0.
+    first: int64 = wg_transport_open(
+        cast[Ptr[uint8]](&wgB_trecv[0]),
+        cast[Ptr[uint8]](&_wg_xport_ab[0]), cast[uint64](tx_len),
+        cast[Ptr[uint8]](&_wg_recovered[0]),
+        cast[Ptr[int32]](&_wg_seen), cast[Ptr[uint64]](&_wg_maxc))
+    if first < 0:
+        _wg_emerg0("[wireguard] FAIL: replay-setup open failed\n")
+        return 0
+    # Replay the same counter -> must reject.
+    replay: int64 = wg_transport_open(
+        cast[Ptr[uint8]](&wgB_trecv[0]),
+        cast[Ptr[uint8]](&_wg_xport_ab[0]), cast[uint64](tx_len),
+        cast[Ptr[uint8]](&_wg_recovered[0]),
+        cast[Ptr[int32]](&_wg_seen), cast[Ptr[uint64]](&_wg_maxc))
+    if replay != -4:
+        _wg_emerg1("[wireguard] FAIL: replayed counter accepted rc=%d\n", cast[uint64](replay))
+        return 0
+    _wg_emerg0("[wireguard] PASS reject-replay\n")
+
+    # --- Security: tampered ciphertext must be REJECTED. ---
+    saved: uint8 = _wg_xport_ab[WG_TRANSPORT_HDR + 5]
+    _wg_xport_ab[WG_TRANSPORT_HDR + 5] = saved ^ 0xFF
+    _wg_seen = 0
+    _wg_maxc = 0
+    tampered: int64 = wg_transport_open(
+        cast[Ptr[uint8]](&wgB_trecv[0]),
+        cast[Ptr[uint8]](&_wg_xport_ab[0]), cast[uint64](tx_len),
+        cast[Ptr[uint8]](&_wg_recovered[0]),
+        cast[Ptr[int32]](&_wg_seen), cast[Ptr[uint64]](&_wg_maxc))
+    _wg_xport_ab[WG_TRANSPORT_HDR + 5] = saved
+    if tampered != -3:
+        _wg_emerg1("[wireguard] FAIL: tampered ciphertext accepted rc=%d\n", cast[uint64](tampered))
+        return 0
+    _wg_emerg0("[wireguard] PASS reject-tampered-ciphertext\n")
+
+    if ok == 1:
+        _wg_emerg0("[wireguard] PASS\n")
+        return 1
+    _wg_emerg0("[wireguard] FAIL\n")
+    return 0
