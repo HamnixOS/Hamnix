@@ -55,6 +55,7 @@ from fs.jbd2 import (
 # for seeded per-object checksums; crc32c is the finalized form whose
 # KAT (crc32c("123456789")==0xE3069283) self-checks the polynomial.
 from fs.crc32c import crc32c, crc32c_update, crc32c_selftest
+from fs.sha256 import sha256_oneshot
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -1036,6 +1037,13 @@ EXT4_HTREE_EOF_32BIT: uint32 = 0x7FFFFFFF
 # (i_block[] + system.data xattr) rather than in data blocks. Only
 # meaningful when the filesystem carries INCOMPAT_INLINE_DATA.
 EXT4_INLINE_DATA_FL:  uint32 = 0x10000000
+# EXT4_VERITY_FL: the file's data is protected by a built-in, read-only
+# Merkle hash tree (fs-verity). Once set, every read of the file's data
+# is verified against a salted-SHA-256 Merkle tree rooted at a trusted
+# root hash; any tampering with the data OR the hash tree makes the read
+# fail (EIO). Matches Linux's EXT4_VERITY_FL (0x00100000). Only meaningful
+# when the verity registry holds the inode's tree (ext4_verity_enable).
+EXT4_VERITY_FL:       uint32 = 0x00100000
 
 # The in-inode portion of inline data starts at the i_block[] window
 # (inode offset 0x28) and is at most 60 bytes (the i_block[] size).
@@ -2643,6 +2651,18 @@ def ext4_read_file(inum: uint32, pos: uint64, count: uint64,
     # xattr), not in extents. Gated on the mount-time feature flag.
     if ext4_inode_is_inline(&inode[0]) != 0:
         return _ext4_read_inline_data(&inode[0], pos, count, buf)
+
+    # fs-verity: if this inode carries EXT4_VERITY_FL AND the verity
+    # registry holds its Merkle tree, route the read through the verified
+    # block path. Every data block returned is checked against its salted
+    # SHA-256 Merkle leaf up to the trusted root; tampering with the data
+    # OR the hash tree fails the read with EIO (-5). Non-verity inodes
+    # skip this entirely and behave exactly as before.
+    if (ext4_inode_flags(&inode[0]) & EXT4_VERITY_FL) != 0:
+        vslot: int32 = _ext4_verity_find(cast[uint32](inum))
+        if vslot >= 0:
+            return _ext4_verity_read(cast[uint32](inum), vslot,
+                                     &inode[0], pos, count, buf)
 
     total: uint64 = 0
     while total < count:
@@ -13562,4 +13582,506 @@ def _ext4_xattr_list_has(list_buf: Ptr[uint8], list_len: uint64,
                 return 1
             start = i + 1
         i = i + 1
+    return 0
+
+
+# =========================================================================
+# ext4 fs-verity — built-in, read-only, transparently-verified file
+# integrity via a salted SHA-256 Merkle hash tree (Linux fs/verity/ +
+# the ext4 EXT4_VERITY_FL inode flag)
+# =========================================================================
+#
+# fs-verity gives a regular file a built-in, read-only Merkle hash tree.
+# Once verity is "enabled" on a file, every read of the file's data is
+# transparently checked against a salted SHA-256 Merkle tree whose ROOT is
+# recorded in trusted metadata. Any tampering with the file's data (or with
+# the hash tree itself) is detected and the read FAILS (EIO), so the file's
+# content is cryptographically authenticated. The file becomes immutable.
+#
+# This reuses the EXACT crypto + Merkle model proven by dm-verity
+# (drivers/block/dm.ad): the shared sha256_oneshot primitive (fs/sha256.ad),
+# salted leaves, and root-anchored descend/verify. The only difference is
+# the home of the tree: dm-verity stores it on a hash block device; ext4
+# fs-verity computes and pins it per-INODE.
+#
+# REPRESENTATION (mirrors how Linux ext4 places the Merkle tree in metadata
+# associated with the inode, past i_size, gated on EXT4_VERITY_FL):
+#   * VERITY BLOCK = one ext4 data block (ext4_block_size bytes). Each data
+#     block's LEAF hash is sha256(salt || block_bytes). The per-file salt is
+#     mixed in first, exactly like dm-verity / Linux fs-verity's salt.
+#   * The leaves are packed (32 bytes each) into a single 4096-byte LEVEL-0
+#     HASH BLOCK (up to 128 leaves -> EXT4_VERITY_MAX_BLOCKS data blocks).
+#   * The trusted ROOT is sha256(salt || level-0 hash block). This ONE value
+#     is what the verifier anchors to.
+# The salt, the level-0 hash block, the trusted root, nblocks and the file
+# size are stored in a small per-inode in-core registry (ext4_verity_ctxs),
+# keyed by inode number, populated at enable time. EXT4_VERITY_FL is set on
+# the on-disk inode so the read path knows to verify.
+#
+# VERIFY (per data block, end to end against the trusted root — identical
+# guarantee to dm-verity's _dm_verity_verify_block):
+#   1. recompute leaf = sha256(salt || data) and compare to the stored leaf
+#      in the level-0 hash block  (detects a flipped DATA byte);
+#   2. recompute root = sha256(salt || level-0 hash block) and compare to the
+#      trusted root  (detects a flipped HASH-TREE byte or a forged hash
+#      block).
+# Any mismatch -> the read returns -5 (EIO) and NO data is delivered.
+
+EXT4_VERITY_MAX:        uint64 = 4       # verity contexts system-wide
+EXT4_VERITY_DIGEST:     uint64 = 32      # sha256 output bytes
+EXT4_VERITY_HBLOCK:     uint64 = 4096    # bytes in the level-0 hash block
+EXT4_VERITY_PER_BLOCK:  uint64 = 128     # 4096/32 leaf digests per hash block
+EXT4_VERITY_MAX_BLOCKS: uint64 = 128     # data blocks per file (<= one L0 blk)
+EXT4_VERITY_SALT_LEN:   uint64 = 32      # per-file salt bytes
+
+
+class Ext4VerityContext:
+    used:        uint32
+    pad:         uint32
+    inum:        uint32                  # inode this tree authenticates
+    pad2:        uint32
+    block_size:  uint64                  # verity block = ext4 data block
+    nblocks:     uint64                  # number of data blocks covered
+    file_size:   uint64                  # i_size pinned at enable time
+    # Per-file salt mixed into every hash (leaf and interior).
+    salt:        Array[32, uint8]
+    # The trusted root hash = sha256(salt || level-0 hash block). The ONE
+    # value the verifier anchors to. Built at enable time over clean data.
+    root:        Array[32, uint8]
+    # The level-0 hash block: leaf digests packed 32 bytes each. Kept in the
+    # registry as the inode's verity metadata (Linux stores this past EOF).
+    hblock:      Array[4096, uint8]
+
+
+ext4_verity_ctxs: Array[4, Ext4VerityContext]
+
+# Block-sized scratch for the verity path. All verity work is synchronous
+# (single ext4 mount, single thread through the block layer), so a single
+# shared set of working buffers is safe — no two verifications overlap.
+# _ext4_ver_hashin holds salt(32) || one data/hash block; the level-0 hash
+# block is 4096 bytes and a data block is at most ext4_block_size (<= 4096),
+# so 32 + 4096 = 4128 bytes covers the largest staged input WITHOUT
+# overflowing into the next module-scope global.
+_ext4_ver_hashin: Array[4128, uint8]    # salt(32) || block — hash input
+_ext4_ver_block:  Array[4096, uint8]    # one data block read off disk
+_ext4_ver_leaf:   Array[32, uint8]      # recomputed leaf digest
+_ext4_ver_root:   Array[32, uint8]      # recomputed root digest
+
+
+def _ext4_verity_find(inum: uint32) -> int32:
+    # Return the verity-context slot authenticating `inum`, or -1.
+    i: uint64 = 0
+    while i < EXT4_VERITY_MAX:
+        if ext4_verity_ctxs[i].used != 0 \
+           and ext4_verity_ctxs[i].inum == inum:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _ext4_verity_alloc() -> int32:
+    # Return a free verity-context slot, or -1 if all are in use.
+    i: uint64 = 0
+    while i < EXT4_VERITY_MAX:
+        if ext4_verity_ctxs[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _ext4_verity_hash_salted(slot: int32, data: Ptr[uint8], n: uint64,
+                             out_hash: Ptr[uint8]):
+    # out = sha256(salt || data[0:n]). The salt is prefixed first, exactly
+    # as fs-verity / dm-verity mix their per-file salt into every leaf and
+    # interior hash. Staged salt||data contiguously for one clean one-shot.
+    i: uint64 = 0
+    while i < EXT4_VERITY_SALT_LEN:
+        _ext4_ver_hashin[i] = ext4_verity_ctxs[slot].salt[i]
+        i = i + 1
+    j: uint64 = 0
+    while j < n:
+        _ext4_ver_hashin[EXT4_VERITY_SALT_LEN + j] = data[j]
+        j = j + 1
+    sha256_oneshot(cast[Ptr[uint8]](&_ext4_ver_hashin[0]),
+                   EXT4_VERITY_SALT_LEN + n, out_hash)
+
+
+def ext4_verity_enable(inum: uint32) -> int32:
+    # Enable fs-verity on the regular file at `inum`. Reads the file's data
+    # block by block, computes each salted SHA-256 leaf, packs them into the
+    # level-0 hash block, and hashes that (salted) into the trusted root —
+    # all stored in a per-inode registry slot. Then sets EXT4_VERITY_FL on
+    # the on-disk inode so subsequent reads verify. Returns 0 on success,
+    # negative on error. Idempotent failure if already enabled.
+    if ext4_blockdev_slot < 0:
+        return -1
+    if _ext4_verity_find(inum) >= 0:
+        return -1                            # already verity-enabled
+    inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
+        return -1
+    # Verity is for regular files only.
+    if (cast[uint32](ext4_inode_mode(&inode[0])) & 0xF000) != 0x8000:
+        return -1
+    size: uint64 = cast[uint64](ext4_inode_size_lo(&inode[0]))
+    bs: uint64 = ext4_block_size
+    if bs == 0 or bs > 4096:
+        return -1
+    nblocks: uint64 = (size + bs - 1) / bs
+    if nblocks == 0 or nblocks > EXT4_VERITY_MAX_BLOCKS:
+        return -1
+
+    slot: int32 = _ext4_verity_alloc()
+    if slot < 0:
+        return -1
+
+    # Per-file salt. Derive a deterministic, file-specific salt from the
+    # inode number and size so it is genuinely mixed into every hash (a real
+    # value, not zero); fs-verity's salt is a stored per-file random value —
+    # here it is pinned in the context at enable time.
+    si: uint64 = 0
+    while si < EXT4_VERITY_SALT_LEN:
+        v: uint64 = (cast[uint64](inum) * 2654435761) \
+            + (size * 40503) + si * 0x9E3779B9 + 0xA5
+        ext4_verity_ctxs[slot].salt[si] = cast[uint8](v & 0xFF)
+        si = si + 1
+
+    # Zero the level-0 hash block, then fill leaf-by-leaf.
+    z: uint64 = 0
+    while z < EXT4_VERITY_HBLOCK:
+        ext4_verity_ctxs[slot].hblock[z] = 0
+        z = z + 1
+
+    b: uint64 = 0
+    while b < nblocks:
+        # Read the file's logical data block. Zero-pad a short final block so
+        # the leaf hashes exactly what the read path will deliver+verify.
+        zz: uint64 = 0
+        while zz < bs:
+            _ext4_ver_block[zz] = 0
+            zz = zz + 1
+        rn: int64 = ext4_read_file(inum, b * bs, bs,
+                                   cast[Ptr[uint8]](&_ext4_ver_block[0]))
+        if rn < 0:
+            ext4_verity_ctxs[slot].used = 0
+            return -1
+        _ext4_verity_hash_salted(slot, cast[Ptr[uint8]](&_ext4_ver_block[0]),
+                                 bs, cast[Ptr[uint8]](&_ext4_ver_leaf[0]))
+        k: uint64 = 0
+        while k < EXT4_VERITY_DIGEST:
+            ext4_verity_ctxs[slot].hblock[b * EXT4_VERITY_DIGEST + k] = \
+                _ext4_ver_leaf[k]
+            k = k + 1
+        b = b + 1
+
+    # Root = salted sha256 over the whole level-0 hash block. This is the
+    # ONE trusted value the read path anchors to.
+    _ext4_verity_hash_salted(slot,
+                             cast[Ptr[uint8]](&ext4_verity_ctxs[slot].hblock[0]),
+                             EXT4_VERITY_HBLOCK,
+                             cast[Ptr[uint8]](&ext4_verity_ctxs[slot].root[0]))
+
+    ext4_verity_ctxs[slot].inum = inum
+    ext4_verity_ctxs[slot].block_size = bs
+    ext4_verity_ctxs[slot].nblocks = nblocks
+    ext4_verity_ctxs[slot].file_size = size
+    ext4_verity_ctxs[slot].used = 1
+
+    # Set EXT4_VERITY_FL on the on-disk inode so the read path verifies.
+    cur_flags: uint32 = ext4_inode_flags(&inode[0])
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&inode[0])
+                                     + INODE_I_FLAGS_OFFSET),
+                    cur_flags | EXT4_VERITY_FL)
+    if ext4_write_inode(cast[uint64](inum), &inode[0]) != 0:
+        ext4_verity_ctxs[slot].used = 0
+        return -1
+    return 0
+
+
+def _ext4_verity_verify_block(slot: int32, blkno: uint64,
+                              data: Ptr[uint8]) -> int32:
+    # Verify one data block end to end against the trusted root:
+    #   1. recompute leaf = sha256(salt || data) and compare to the stored
+    #      leaf in the level-0 hash block (detects a flipped DATA byte);
+    #   2. recompute root = sha256(salt || level-0 hash block) and compare to
+    #      the trusted root (detects a flipped HASH-TREE byte or a forged
+    #      hash block). Returns 0 if verified, -5 (EIO) on any mismatch.
+    bs: uint64 = ext4_verity_ctxs[slot].block_size
+    # Step 1: leaf membership in the level-0 hash block.
+    _ext4_verity_hash_salted(slot, data, bs,
+                             cast[Ptr[uint8]](&_ext4_ver_leaf[0]))
+    i: uint64 = 0
+    while i < EXT4_VERITY_DIGEST:
+        if _ext4_ver_leaf[i] \
+           != ext4_verity_ctxs[slot].hblock[blkno * EXT4_VERITY_DIGEST + i]:
+            return -5
+        i = i + 1
+    # Step 2: the hash block must itself hash (salted) up to the trusted
+    # root. A flipped byte ANYWHERE in the hash tree changes this recomputed
+    # root, so it no longer equals the trusted root and the read fails.
+    _ext4_verity_hash_salted(slot,
+                             cast[Ptr[uint8]](&ext4_verity_ctxs[slot].hblock[0]),
+                             EXT4_VERITY_HBLOCK,
+                             cast[Ptr[uint8]](&_ext4_ver_root[0]))
+    j: uint64 = 0
+    while j < EXT4_VERITY_DIGEST:
+        if _ext4_ver_root[j] != ext4_verity_ctxs[slot].root[j]:
+            return -5
+        j = j + 1
+    return 0
+
+
+def _ext4_verity_read(inum: uint32, slot: int32, inode_buf: Ptr[uint8],
+                      pos: uint64, count: uint64, buf: Ptr[uint8]) -> int64:
+    # Verified read of `count` bytes at `pos` from a verity-enabled file.
+    # For each ext4 block the request spans, read the WHOLE block off disk,
+    # verify it against the Merkle tree rooted at the trusted root, and only
+    # on success copy the requested slice out. Any verification failure
+    # returns -5 (EIO) and delivers NO data — exactly the fs-verity
+    # tamper-detection guarantee. `count`/`pos` are already clamped to EOF by
+    # the caller.
+    bs: uint64 = ext4_verity_ctxs[slot].block_size
+    blkp: Ptr[uint8] = cast[Ptr[uint8]](&_ext4_ver_block[0])
+    total: uint64 = 0
+    while total < count:
+        cur_off: uint64 = pos + total
+        logical_blk: uint64 = cur_off / bs
+        off_in_blk:  uint64 = cur_off % bs
+        if logical_blk >= ext4_verity_ctxs[slot].nblocks:
+            return cast[int64](total)
+        phys_blk: uint64 = _ext4_logical_to_physical(inode_buf, logical_blk)
+        if phys_blk == 0:
+            return cast[int64](total)
+        # Zero-pad so a short final block hashes identically to enable time.
+        zz: uint64 = 0
+        while zz < bs:
+            _ext4_ver_block[zz] = 0
+            zz = zz + 1
+        if _ext4_read_block(phys_blk, blkp) != 0:
+            return -5
+        if _ext4_verity_verify_block(slot, logical_blk, blkp) != 0:
+            printk2("ext4: verity hash mismatch inum=%d blk=%d " \
+                    "(corruption detected)\n",
+                    cast[uint64](inum), logical_blk)
+            return -5
+        chunk: uint64 = bs - off_in_blk
+        if chunk > count - total:
+            chunk = count - total
+        memcpy(cast[Ptr[uint8]](cast[uint64](buf) + total),
+               cast[Ptr[uint8]](cast[uint64](blkp) + off_in_blk),
+               chunk)
+        total = total + chunk
+    return cast[int64](total)
+
+
+# --- ext4 fs-verity self-test ------------------------------------------
+#
+# Gated on the cpio marker /etc/ext4-verity-test (planted exclusively by
+# scripts/test_ext4_verity.sh / ENABLE_EXT4_VERITY_TEST=1). Builds a REAL
+# multi-block file on the live ext4 mount, enables verity, then proves:
+#   (a) a clean verity file reads back byte-identical AND verifies;
+#   (b) tampering a DATA block on disk is DETECTED (read fails, no data);
+#   (c) tampering a HASH-TREE node (a leaf in the level-0 hash block) is
+#       DETECTED (read fails) — the recomputed root no longer matches the
+#       trusted root;
+#   (d) restoring the hash tree makes the file verify again.
+# Each step prints a [ext4-verity] line; a final [ext4-verity] PASS only if
+# every step passed.
+
+EXT4_VERITY_TEST_BLOCKS: uint64 = 6        # multi-block test file
+ext4_verity_test_buf:  Array[4096, uint8]  # per-block build/compare scratch
+ext4_verity_test_disk: Array[4096, uint8]  # raw on-disk block tamper scratch
+ext4_verity_test_phys: Array[8, uint64]    # physical block of each lblk
+
+
+def _ext4_verity_test_byte(lblk: uint64, off: uint64) -> uint8:
+    # Deterministic, position-dependent pattern so every block differs.
+    v: uint64 = (lblk * 1103515245) + (off * 12345) + 7
+    return cast[uint8]((v >> 3) & 0xFF)
+
+
+def _ext4_verity_make_file(name: Ptr[char], nblocks: uint64) -> uint32:
+    # Create a fresh empty regular file in the root dir and append
+    # `nblocks` non-trivial one-block extents, each filled with a per-block
+    # pattern. Returns the new inum (0 on failure).
+    new_inum: uint32 = ext4_alloc_inode()
+    if new_inum == 0:
+        return 0
+    p: Ptr[uint8] = &ext4_new_inode_buf[0]
+    _ext4_zero(p, ext4_inode_size)
+    _ext4_write_u16(p, 0x81B4)                          # i_mode IFREG|0664
+    _ext4_inode_stamp_creator(p)
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 4), 0)   # i_size=0
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](p) + 26), 1)  # links=1
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 28), 0)  # i_blocks=0
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 32),
+                    0x80000)                            # EXT4_EXTENTS_FL
+    eh: uint64 = cast[uint64](p) + INODE_I_BLOCK_OFFSET
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 0), EXT4_EXTENT_MAGIC)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 2), 0)        # eh_entries=0
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 4), 4)        # eh_max=4
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 6), 0)        # eh_depth=0
+    _ext4_stamp_all_times(p)
+    if ext4_write_inode(cast[uint64](new_inum), p) != 0:
+        ext4_free_inode(new_inum)
+        return 0
+    if ext4_dir_insert(2, name, new_inum, 1) != 0:
+        ext4_free_inode(new_inum)
+        return 0
+
+    inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](new_inum), &inode[0]) != 0:
+        return 0
+    bs: uint64 = ext4_block_size
+    lb: uint64 = 0
+    while lb < nblocks:
+        db: uint64 = ext4_alloc_block()
+        if db == 0:
+            return 0
+        ext4_verity_test_phys[lb] = db
+        o: uint64 = 0
+        while o < bs:
+            ext4_verity_test_buf[o] = _ext4_verity_test_byte(lb, o)
+            o = o + 1
+        if _ext4_write_block(db, &ext4_verity_test_buf[0]) != 0:
+            return 0
+        if _ext4_extent_append_block(&inode[0], lb, db) != 0:
+            return 0
+        lb = lb + 1
+    # Commit i_size = nblocks full blocks + the grown extent tree.
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&inode[0]) + 4),
+                    cast[uint32](nblocks * bs))
+    if ext4_write_inode(cast[uint64](new_inum), &inode[0]) != 0:
+        return 0
+    return new_inum
+
+
+def ext4_verity_selftest() -> int32:
+    if ext4_blockdev_slot < 0:
+        printk0("[ext4-verity] FAIL: ext4 not mounted\n")
+        return -1
+    printk1("[ext4-verity] block_size=%d\n", ext4_block_size)
+    bs: uint64 = ext4_block_size
+    nb: uint64 = EXT4_VERITY_TEST_BLOCKS
+
+    inum: uint32 = _ext4_verity_make_file("verity.bin", nb)
+    if inum == 0:
+        printk0("[ext4-verity] FAIL: build test file\n")
+        return -1
+    printk2("[ext4-verity] built %d-block file inum=%d\n", nb,
+            cast[uint64](inum))
+
+    ok_all: int32 = 1
+
+    # Enable verity: compute the salted Merkle tree + trusted root.
+    if ext4_verity_enable(inum) != 0:
+        printk0("[ext4-verity] FAIL: enable\n")
+        return -1
+    vslot: int32 = _ext4_verity_find(inum)
+    if vslot < 0:
+        printk0("[ext4-verity] FAIL: enable left no context\n")
+        return -1
+    printk0("[ext4-verity] PASS enable (Merkle tree + trusted root built)\n")
+
+    # Confirm EXT4_VERITY_FL is now set on disk.
+    vino: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &vino[0]) != 0 \
+       or (ext4_inode_flags(&vino[0]) & EXT4_VERITY_FL) == 0:
+        printk0("[ext4-verity] FAIL: EXT4_VERITY_FL not set on inode\n")
+        ok_all = 0
+    else:
+        printk0("[ext4-verity] PASS flag (EXT4_VERITY_FL set on inode)\n")
+
+    # (a) clean read: every block reads back byte-identical AND verifies.
+    clean_ok: int32 = 1
+    vb: uint64 = 0
+    while vb < nb:
+        rn: int64 = ext4_read_file(inum, vb * bs, bs,
+                                   &ext4_verity_test_buf[0])
+        if rn != cast[int64](bs):
+            printk1("[ext4-verity] FAIL: short verified read lblk=%d\n", vb)
+            clean_ok = 0
+            vb = nb
+        else:
+            o: uint64 = 0
+            while o < bs:
+                if ext4_verity_test_buf[o] != _ext4_verity_test_byte(vb, o):
+                    printk2("[ext4-verity] FAIL: byte mismatch lblk=%d off=%d\n",
+                            vb, o)
+                    clean_ok = 0
+                    o = bs
+                else:
+                    o = o + 1
+            vb = vb + 1
+    if clean_ok != 0:
+        printk0("[ext4-verity] PASS clean-read (byte-identical & verified)\n")
+    else:
+        ok_all = 0
+
+    # (b) tamper a DATA block ON DISK and confirm the verified read FAILS.
+    # Flip one byte of physical block of lblk 2, then read it back through
+    # the verity path: the recomputed leaf no longer matches the stored
+    # leaf, so the read returns the EIO error (negative), delivering nothing.
+    dphys: uint64 = ext4_verity_test_phys[2]
+    if _ext4_read_block(dphys, &ext4_verity_test_disk[0]) != 0:
+        printk0("[ext4-verity] FAIL: read data block for tamper\n")
+        ok_all = 0
+    else:
+        orig: uint8 = ext4_verity_test_disk[10]
+        ext4_verity_test_disk[10] = orig ^ cast[uint8](0xFF)
+        if _ext4_write_block(dphys, &ext4_verity_test_disk[0]) != 0:
+            printk0("[ext4-verity] FAIL: write tampered data block\n")
+            ok_all = 0
+        else:
+            tn: int64 = ext4_read_file(inum, 2 * bs, bs,
+                                       &ext4_verity_test_buf[0])
+            if tn < 0:
+                printk0("[ext4-verity] PASS detect-data-tamper " \
+                        "(flipped data byte -> read EIO)\n")
+            else:
+                printk0("[ext4-verity] FAIL: data tamper UNDETECTED\n")
+                ok_all = 0
+            # Restore the data block so the file is clean again.
+            ext4_verity_test_disk[10] = orig
+            if _ext4_write_block(dphys, &ext4_verity_test_disk[0]) != 0:
+                printk0("[ext4-verity] FAIL: restore data block\n")
+                ok_all = 0
+
+    # Sanity: after restoring the data block, the read verifies again.
+    rn2: int64 = ext4_read_file(inum, 2 * bs, bs, &ext4_verity_test_buf[0])
+    if rn2 == cast[int64](bs):
+        printk0("[ext4-verity] PASS reverify-after-data-restore\n")
+    else:
+        printk0("[ext4-verity] FAIL: read after data restore not clean\n")
+        ok_all = 0
+
+    # (c) tamper a HASH-TREE node: flip one byte of a leaf in the level-0
+    # hash block held in the verity context. The recomputed root now differs
+    # from the trusted root, so EVERY verified read fails (the hash tree no
+    # longer hashes up to the anchored root).
+    hbyte: uint64 = 3 * EXT4_VERITY_DIGEST + 5     # a byte of leaf #3
+    horig: uint8 = ext4_verity_ctxs[vslot].hblock[hbyte]
+    ext4_verity_ctxs[vslot].hblock[hbyte] = horig ^ cast[uint8](0xFF)
+    hn: int64 = ext4_read_file(inum, 0, bs, &ext4_verity_test_buf[0])
+    if hn < 0:
+        printk0("[ext4-verity] PASS detect-tree-tamper " \
+                "(flipped hash-tree byte -> read EIO)\n")
+    else:
+        printk0("[ext4-verity] FAIL: hash-tree tamper UNDETECTED\n")
+        ok_all = 0
+    # Restore the hash tree node.
+    ext4_verity_ctxs[vslot].hblock[hbyte] = horig
+
+    # (d) after restoring the hash tree, the file verifies again.
+    hn2: int64 = ext4_read_file(inum, 0, bs, &ext4_verity_test_buf[0])
+    if hn2 == cast[int64](bs):
+        printk0("[ext4-verity] PASS reverify-after-tree-restore\n")
+    else:
+        printk0("[ext4-verity] FAIL: read after tree restore not clean\n")
+        ok_all = 0
+
+    if ok_all != 0:
+        printk0("[ext4-verity] PASS\n")
+    else:
+        printk0("[ext4-verity] FAIL\n")
     return 0

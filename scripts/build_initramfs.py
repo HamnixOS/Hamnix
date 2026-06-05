@@ -984,6 +984,18 @@ if os.environ.get("ENABLE_EXT4DIR_TEST") == "1":
 if os.environ.get("ENABLE_EXT4_MKDIR_TEST") == "1":
     FILES.append(("/etc/ext4-mkdir-test", b"1\n"))
 
+# ext4 fs-verity (EXT4_VERITY_FL Merkle-tree authenticity) self-test.
+# scripts/test_ext4_verity.sh sets ENABLE_EXT4_VERITY_TEST=1 to plant
+# /etc/ext4-verity-test. init/main.ad detects the marker after the ext4
+# mount and calls ext4_verity_selftest() (fs/ext4.ad): it builds a REAL
+# multi-block file on the live ext4 mount, enables verity (salted SHA-256
+# Merkle tree + trusted root), reads it back verified byte-identical, then
+# proves tampering a data block AND a hash-tree node are both DETECTED
+# (read fails EIO). Writes to the mounted image, so it is opt-in. Default
+# boots omit the marker so it never fires.
+if os.environ.get("ENABLE_EXT4_VERITY_TEST") == "1":
+    FILES.append(("/etc/ext4-verity-test", b"1\n"))
+
 # ext4 fast_commit (COMPAT_FAST_COMMIT) self-test. scripts/
 # test_ext4_fast_commit.sh sets ENABLE_EXT4_FC_TEST=1 to plant
 # /etc/ext4-fc-test. init/main.ad detects the marker after the ext4
