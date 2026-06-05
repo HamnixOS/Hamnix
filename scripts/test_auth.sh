@@ -39,28 +39,26 @@
 # before feeding each password line — the interactive program must be
 # fully up and blocked in its read() before the keystrokes arrive.
 #
-# Single boot of a writable ext4 disk image (built by build_img.sh).
+# Boots the INSTALLED ext4-on-NVMe system (the golden disk produced by the
+# real installer, scripts/build_installed_nvme.sh) — the baked hamnix.img
+# was retired; a real system is installed onto a disk, never shipped as a
+# pre-baked root image. The boot harness lives in scripts/_installed_boot.sh.
 #
-# SKIPS CLEANLY (exit 0) when /dev/kvm or OVMF firmware is unavailable
-# (mirrors test_useradd.sh / test_img_uefi_boot.sh).
+# SKIPS CLEANLY (exit 0) when /dev/kvm, OVMF, or the golden disk is
+# unavailable (the shared helper gates this).
 #
 # Env overrides:
-#   HAMNIX_IMG         image path                (default: build/hamnix.img)
+#   GOLDEN_NVME        installed disk path       (default: build/hamnix-installed.qcow2)
 #   OVMF_FD            OVMF firmware path        (default: auto-resolved)
-#   SHELL_BOOT_WAIT    seconds to wait for the   (default: 90)
+#   SHELL_BOOT_WAIT    seconds to wait for the   (default: 200)
 #                      interactive-prompt marker
-#   HAMNIX_SKIP_BUILD  1 = reuse existing image  (default: rebuild)
+#   HAMNIX_SKIP_BUILD  1 = require an existing golden disk (no rebuild)
 
 set -uo pipefail
 
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-# shellcheck source=_build_lock.sh
-source "$PROJ_ROOT/scripts/_build_lock.sh"
-
-HAMNIX_IMG="${HAMNIX_IMG:-build/hamnix.img}"
-SHELL_BOOT_WAIT="${SHELL_BOOT_WAIT:-90}"
 KERNEL_BANNER="Hamnix kernel booting"
 PROMPT_MARKER="handing off to interactive shell"
 
@@ -78,105 +76,27 @@ M_WHOAMI="HAMNIX_AUTH_WHOAMI"
 M_SU_BAD="HAMNIX_AUTH_SU_BAD"
 M_DONE="HAMNIX_AUTH_DONE_99"
 
-# --- environment gates (skip cleanly) ---------------------------------
-if [ ! -e /dev/kvm ]; then
-    echo "[test_auth] SKIP: /dev/kvm absent (KVM required; boot too slow without it)" >&2
-    exit 0
-fi
-
-OVMF_FD="${OVMF_FD:-}"
-if [ -z "$OVMF_FD" ]; then
-    if [ -f /usr/share/ovmf/OVMF.fd ]; then
-        OVMF_FD=/usr/share/ovmf/OVMF.fd
-    elif [ -f /usr/share/OVMF/OVMF_CODE.fd ]; then
-        OVMF_FD=/usr/share/OVMF/OVMF_CODE.fd
-    elif [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ]; then
-        OVMF_FD=/usr/share/OVMF/OVMF_CODE_4M.fd
-    fi
-fi
-if [ -z "$OVMF_FD" ] || [ ! -f "$OVMF_FD" ]; then
-    echo "[test_auth] SKIP: OVMF firmware not found (apt install ovmf)" >&2
-    exit 0
-fi
-
-# --- build the image --------------------------------------------------
-if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
-    echo "[test_auth] building disk image via build_img.sh"
-    rm -f "$HAMNIX_IMG"
-    bash "$PROJ_ROOT/scripts/build_img.sh"
-fi
-if [ ! -f "$HAMNIX_IMG" ]; then
-    echo "[test_auth] FAIL: $HAMNIX_IMG missing after build_img.sh." >&2
-    exit 1
-fi
-
-OVMF_RW=$(mktemp --tmpdir hamnix-auth.ovmf.XXXXXX.fd)
-IMG_RW=$(mktemp --tmpdir hamnix-auth.disk.XXXXXX.img)
-LOG=$(mktemp --tmpdir hamnix-auth.b1.XXXXXX.log)
-INFIFO=$(mktemp --tmpdir -u hamnix-auth-in.XXXXXX)
-cp "$OVMF_FD" "$OVMF_RW"
-cp "$HAMNIX_IMG" "$IMG_RW"
-mkfifo "$INFIFO"
-
-cleanup() {
-    [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null
-    rm -f "$OVMF_RW" "$IMG_RW" "$INFIFO"
-}
-trap cleanup EXIT
-
-boot_wait() {
-    local log="$1"
-    local i
-    for i in $(seq 1 "$SHELL_BOOT_WAIT"); do
-        if grep -a -q "$PROMPT_MARKER" "$log"; then
-            return 0
-        fi
-        if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-            echo "[test_auth] qemu exited before reaching the prompt." >&2
-            tail -80 "$log" >&2
-            return 1
-        fi
-        sleep 1
-    done
-    return 1
-}
-
-# Send a shell command line + settle.
-type_cmd() {
-    printf '%s\n' "$1" >&3
-    sleep "${2:-4}"
-}
-
-# Send a RAW line (e.g. a password fed to an interactive program that
-# reads with echo suppressed). Identical mechanics to type_cmd, named
-# separately for readability at the call sites.
-type_line() {
-    printf '%s\n' "$1" >&3
-    sleep "${2:-3}"
-}
+# --- boot the installed system (gates KVM/OVMF/golden disk; SKIPs clean) -
+# shellcheck source=_installed_boot.sh
+source "$PROJ_ROOT/scripts/_installed_boot.sh"
 
 # ====================================================================
 # BOOT — create alice, set her password, authenticate (right + wrong).
 # ====================================================================
-exec 4<>"$INFIFO"
-exec 3>"$INFIFO"
-
-qemu-system-x86_64 \
-    -enable-kvm -cpu host \
-    -bios "$OVMF_RW" \
-    -drive file="$IMG_RW",format=raw,if=virtio \
-    -m 512M \
-    -nographic -no-reboot -monitor none \
-    -serial stdio \
-    <&4 > "$LOG" 2>&1 &
-QEMU_PID=$!
+installed_boot_start
 
 echo "[test_auth] waiting up to ${SHELL_BOOT_WAIT}s for the interactive prompt..."
-if ! boot_wait "$LOG"; then
+if ! installed_boot_wait; then
     echo "[test_auth] FAIL: prompt marker not seen." >&2
     exit 1
 fi
 echo "[test_auth] prompt reached; driving the auth flow."
+
+# Send a shell command line + settle.
+type_cmd() { installed_type "$1" "${2:-4}"; }
+# Send a RAW line (e.g. a password fed to an interactive program that reads
+# with echo suppressed). Identical mechanics, named separately for clarity.
+type_line() { installed_type "$1" "${2:-3}"; }
 
 # GENEROUS settle before the very first keystroke after boot.
 sleep 6
@@ -218,11 +138,9 @@ type_cmd "echo $M_WHOAMI" 4
 type_cmd "echo $M_DONE" 3
 sleep 3
 
-kill "$QEMU_PID" 2>/dev/null
-wait "$QEMU_PID" 2>/dev/null
-exec 3>&-
-exec 4>&-
+installed_boot_stop
 
+LOG="$INSTALLED_LOG"
 echo "[test_auth] --- serial log ---"
 cat "$LOG"
 echo "[test_auth] --- end serial log ---"
@@ -230,7 +148,6 @@ echo "[test_auth] --- end serial log ---"
 # Sanitize (strip CRs + CSI/SGR escapes).
 CLEAN=$(mktemp --tmpdir hamnix-auth.clean.XXXXXX.log)
 sed -e 's/\r//g' -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' "$LOG" > "$CLEAN"
-trap 'cleanup; rm -f "$CLEAN"' EXIT
 
 slice() {
     awk -v a="$1" -v b="$2" '
@@ -301,6 +218,7 @@ if grep -a -q -E "TRAP: vector|page fault" "$LOG"; then
     fail=1
 fi
 
+rm -f "$CLEAN"
 if [ "$fail" -eq 0 ]; then
     echo "[test_auth] PASS — Hamnix is a real multi-user system: useradd -> passwd -> su authenticates (right ok, wrong denied)."
     rm -f "$LOG"
