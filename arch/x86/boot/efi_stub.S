@@ -26,7 +26,9 @@
  *      c. SFSP->OpenVolume() to get the volume root EFI_FILE_PROTOCOL.
  *      d. root->Open(L"\\hamnix-kernel.elf", READ) to get the kernel
  *         ELF file handle.
- *      e. BootServices->AllocatePool(32 MiB) for a scratch buffer.
+ *      e. BootServices->AllocatePool(KERNEL_ELF_BUF_SIZE) for a scratch
+ *         buffer big enough to hold the WHOLE kernel ELF (incl. the
+ *         large self-hosted-installer kernel; see KERNEL_ELF_BUF_SIZE).
  *      f. kernel_file->Read(buffer) — pulls the entire ELF into memory.
  *      g. Verify "\x7fELF" magic + ELFCLASS32 (Hamnix kernel is
  *         elf32-i386 by design — every test's `qemu -kernel` argument
@@ -171,9 +173,16 @@
      * and ExitBootServices, invalidating MapKey — re-fetch and retry).
      *
      * KERNEL_ELF_BUF_SIZE: AllocatePool capacity for the kernel ELF.
-     * Today's kernel.elf is ~3.6 MB; reserve 32 MiB to leave room for
-     * growth (initramfs blob lives in .rodata and is the dominant
-     * size driver).
+     * EFI_FILE.Read clamps to this capacity (it returns the smaller of
+     * requested/remaining bytes), so a kernel ELF LARGER than this is
+     * silently TRUNCATED: the late PT_LOAD segments then copy garbage and
+     * the kernel faults the instant control jumps to it. The dominant
+     * size driver is the embedded initramfs blob (.byte-encoded cpio in
+     * .rodata, ~6x its raw size). A normal boot kernel is ~7 MB, but the
+     * SELF-HOSTED INSTALLER kernel embeds an in-RAM squashfs payload in
+     * its cpio and weighs ~37 MB. Reserve 96 MiB so the largest installer
+     * kernel loads whole with headroom (AllocatePool of 96 MiB is fine on
+     * OVMF + real HW; the stub's page tables identity-map [0,512 GiB)).
      *
      * HAMNIX_HANDOFF_MAGIC: "HAMX" little-endian, used as a sanity
      * check on the handoff table that arch/x86/boot/header.S plants
@@ -185,7 +194,7 @@
      */
     .equ EFI_MMAP_BUF_SIZE,         65536
     .equ EFI_EXIT_RETRY_MAX,        4
-    .equ KERNEL_ELF_BUF_SIZE,       (32 * 1024 * 1024)
+    .equ KERNEL_ELF_BUF_SIZE,       (96 * 1024 * 1024)
     .equ HAMNIX_HANDOFF_MAGIC,      0x484D4158  /* "HAMX" */
     .equ MULTIBOOT1_MAGIC,          0x1BADB002
 
@@ -315,7 +324,7 @@ efi_main:
     testq   %rax, %rax
     jnz     .Lefi_elfload_fail
 
-    /* ----- 4e. AllocatePool(EfiLoaderData, 32 MiB, &Buffer) ---------
+    /* ----- 4e. AllocatePool(EfiLoaderData, KERNEL_ELF_BUF_SIZE, &Buffer) -
      *
      * EFI_BOOT_SERVICES.AllocatePool is at offset 64.
      * Signature:

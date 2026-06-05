@@ -190,6 +190,7 @@ build_adder_user install_file_to_slot # installer: copy one local file → targe
 build_adder_user install_rootfs_from_manifest  # installer: walk manifest, install_file_to_slot each (target_path source_path) pair
 build_adder_user haminstall           # installer: one-shot on-target install (GPT+mkfs+ESP+rootfs) with live-root safety guard
 build_adder_user losetup              # attach/detach a file as a loop block device via /dev/loop/ctl
+build_adder_user sqfs_to_blk          # installer: stream a file from an in-RAM squashfs -> block dev (no media read)
 
 # --- X11 server + client (user/x11/ subdirectory) -------------------
 # The source lives in user/x11/<name>.ad but the ELF goes into

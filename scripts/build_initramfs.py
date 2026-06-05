@@ -2207,6 +2207,38 @@ if os.environ.get("ENABLE_XHCI_KO_REAL", "0") == "1":
     if os.environ.get("ENABLE_XHCI_KO_REAL_MMIO", "0") == "1":
         FILES.append(("/etc/xhci-ko-real-mmio", b"1\n"))
 
+# IN-RAM-SQUASHFS INSTALLER MEDIUM. scripts/build_installer_img.sh sets
+# HAMNIX_INSTALLER_BLOB=1 (and HAMNIX_INSTALLER_SQFS=<path>) to pack the
+# installer's ENTIRE rootfs payload into the firmware-loaded cpio as a
+# single squashfs file at /rootfs.sqfs. The squashfs holds the raw ext4
+# rootfs image AND the NVMe ESP FAT image as inner files; the installer
+# (etc/install_nvme.hamsh) streams them out of the IN-RAM squashfs via
+# sqfs_to_blk -> the kernel loop_sqfs_extract path, and writes them to
+# the NVMe target — it NEVER reads the install media's own block device.
+# The /etc/installer-medium marker tells init/main.ad to skip ALL media
+# storage bring-up (native + .ko USB) so the installer is purely
+# RAM-resident, which is the whole point (the native USB driver is broken
+# on the real NUC target). Only the installer build sets this; normal/dev
+# cpios are NOT bloated by the ~hundreds-of-MiB squashfs payload.
+if os.environ.get("HAMNIX_INSTALLER_BLOB") == "1":
+    _sqfs_path = os.environ.get("HAMNIX_INSTALLER_SQFS", "")
+    if not _sqfs_path:
+        raise SystemExit("[build_initramfs] HAMNIX_INSTALLER_BLOB=1 but "
+                         "HAMNIX_INSTALLER_SQFS=<path> not set")
+    _sqfs_p = Path(_sqfs_path)
+    if not _sqfs_p.is_absolute():
+        _sqfs_p = Path(__file__).resolve().parent.parent / _sqfs_p
+    if not _sqfs_p.is_file():
+        raise SystemExit(f"[build_initramfs] HAMNIX_INSTALLER_SQFS="
+                         f"{_sqfs_path}: file not found")
+    _sqfs_bytes = _sqfs_p.read_bytes()
+    FILES.append(("/rootfs.sqfs", _sqfs_bytes))
+    FILES.append(("/etc/installer-medium", b"1\n"))
+    print(f"[build_initramfs] HAMNIX_INSTALLER_BLOB=1: packed in-RAM "
+          f"squashfs payload /rootfs.sqfs "
+          f"({len(_sqfs_bytes)/(1<<20):.1f} MiB) + /etc/installer-medium "
+          f"marker.", flush=True)
+
 # Native Intel HDA audio self-test. scripts/test_hda_audio.sh sets
 # ENABLE_AUDIO_TEST=1 to plant /etc/audio-test; init/main.ad's boot:37.aud
 # gate then runs audio_selftest(), which synthesizes a square-wave tone,

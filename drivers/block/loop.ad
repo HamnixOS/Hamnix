@@ -29,13 +29,19 @@
 
 from kernel.block.blk import (
     BlockDeviceOps, register_blockdev, blk_unregister_by_name,
-    SECTOR_SIZE,
+    SECTOR_SIZE, find_blockdev, blk_write_sectors, blk_capacity_sectors,
 )
 from fs.vfs import (
     vfs_resolve_backing,
     vfs_pread_backing, vfs_pwrite_backing,
 )
-from kernel.printk.printk import printk0, printk1, printk2
+from fs.squashfs import (
+    sqfs_mount, sqfs_lookup_ref, sqfs_file_size, sqfs_read,
+)
+from kernel.printk.printk import (
+    printk0, printk1, printk2, printk_set_level,
+)
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_NOTICE
 
 
 # Per-loop-device state. priv passed to read/write_sectors is
@@ -207,6 +213,148 @@ def loop_detach(slot: int32) -> int32:
     return 0
 
 
+# --- in-RAM squashfs -> block device streamer -----------------------
+#
+# The four-step UEFI installer (etc/install_nvme.hamsh) must source its
+# ext4 rootfs + ESP payloads from a squashfs that the FIRMWARE loaded
+# into RAM as part of the install-media cpio — NEVER from the install
+# media's own block device (on a real NUC the media is a USB stick whose
+# native driver is broken; reading it would defeat the in-RAM model).
+#
+# loop_sqfs_extract() chains the existing primitives end-to-end, entirely
+# in the kernel, so userland triggers the whole flow with one ctl-file
+# write:
+#
+#   1. loop_attach(sqfs_path)              the in-RAM cpio file
+#      `/rootfs.sqfs` becomes /dev/blk/loopN (file-backed block device).
+#   2. sqfs_mount(loopN_slot)              parse the squashfs superblock.
+#   3. sqfs_lookup_ref(inner_path)         resolve e.g. /rootfs.ext4 to an
+#      inode ref; sqfs_file_size gives its byte length.
+#   4. stream sqfs_read(...) -> blk_write_sectors(dst_slot, ...)
+#      decompress the payload out of the in-RAM squashfs sector-by-sector
+#      and write it straight to the native NVMe partition. The media
+#      block device is NEVER touched.
+#
+# This is the load-bearing "no media read" guarantee: the only block
+# READ here is from the loop-backed in-RAM squashfs (which is cpio data
+# in RAM), and the only block WRITE is to the NVMe install target.
+
+SQFS_STREAM_CHUNK: uint64 = 65536          # 64 KiB per read/write round
+sqfs_stream_buf: Array[65536, uint8]
+
+
+def loop_sqfs_extract(sqfs_path: Ptr[char], inner_path: Ptr[char],
+                      dst_name: Ptr[char]) -> int32:
+    # Returns 0 on success, a negative error otherwise:
+    #   -1  loop_attach of the squashfs file failed
+    #   -2  sqfs_mount failed
+    #   -3  inner file not found in the squashfs
+    #   -4  sqfs_file_size failed
+    #   -5  destination block device not found
+    #   -6  destination too small for the payload
+    #   -7  a squashfs read failed mid-stream
+    #   -8  a destination block write failed mid-stream
+    # NOTICE level on the load-bearing markers so they survive
+    # console_set_interactive's INFO gate — the installer runs AFTER the
+    # interactive shell starts, so INFO-level prints are silenced. The
+    # installer test asserts on these "[sqfs-extract]" lines.
+    printk_set_level(PRINTK_LEVEL_NOTICE)
+    printk0("[sqfs-extract] start (in-RAM squashfs -> block device)\n")
+    loop_slot: int32 = loop_attach(sqfs_path)
+    if loop_slot < 0:
+        printk1("[sqfs-extract] loop_attach failed rc=%d\n",
+                cast[uint64](cast[int64](loop_slot)))
+        return -1
+    # loop_attach registers /dev/blk/loopN; resolve that name to the
+    # block-layer slot sqfs_mount consumes.
+    name_buf: Array[16, uint8]
+    _loop_name_build(loop_slot, &name_buf[0])
+    blk_slot: int32 = find_blockdev(cast[Ptr[char]](&name_buf[0]))
+    if blk_slot < 0:
+        printk0("[sqfs-extract] loop block slot not found\n")
+        loop_detach(loop_slot)
+        return -1
+    if sqfs_mount(blk_slot) != 0:
+        printk_set_level(PRINTK_LEVEL_NOTICE)
+        printk0("[sqfs-extract] sqfs_mount failed\n")
+        loop_detach(loop_slot)
+        return -2
+    printk_set_level(PRINTK_LEVEL_NOTICE)
+    printk0("[sqfs-extract] in-RAM squashfs mounted\n")
+    ref: uint64 = 0
+    if sqfs_lookup_ref(inner_path, &ref) != 0:
+        printk0("[sqfs-extract] inner file not found in squashfs\n")
+        loop_detach(loop_slot)
+        return -3
+    payload_size: uint64 = 0
+    if sqfs_file_size(ref, &payload_size) != 0:
+        printk0("[sqfs-extract] sqfs_file_size failed\n")
+        loop_detach(loop_slot)
+        return -4
+    printk_set_level(PRINTK_LEVEL_NOTICE)
+    printk1("[sqfs-extract] payload size=%d bytes\n", payload_size)
+
+    dst_slot: int32 = find_blockdev(dst_name)
+    if dst_slot < 0:
+        printk0("[sqfs-extract] destination block device not found\n")
+        loop_detach(loop_slot)
+        return -5
+    dst_cap_sectors: uint64 = blk_capacity_sectors(dst_slot)
+    payload_sectors: uint64 = (payload_size + SECTOR_SIZE - 1) / SECTOR_SIZE
+    if payload_sectors > dst_cap_sectors:
+        printk2("[sqfs-extract] dst too small: need %d sectors, have %d\n",
+                payload_sectors, dst_cap_sectors)
+        loop_detach(loop_slot)
+        return -6
+
+    # Stream the payload: read SQFS_STREAM_CHUNK bytes out of the in-RAM
+    # squashfs, write them to the destination starting at LBA 0. The last
+    # chunk is zero-padded up to a whole sector so the block write is
+    # sector-aligned (the trailing zeros land past EOF of the ext4 image
+    # inside its partition — harmless slack).
+    off: uint64 = 0
+    dst_lba: uint64 = 0
+    report_step: uint64 = 16777216             # log every 16 MiB
+    next_report: uint64 = report_step
+    while off < payload_size:
+        want: uint64 = SQFS_STREAM_CHUNK
+        if want > payload_size - off:
+            want = payload_size - off
+        nr: int64 = sqfs_read(ref, off, &sqfs_stream_buf[0], want)
+        if nr <= 0:
+            printk1("[sqfs-extract] sqfs_read failed at off=%d\n", off)
+            loop_detach(loop_slot)
+            return -7
+        got: uint64 = cast[uint64](nr)
+        # Zero-pad the tail up to a whole sector for an aligned write.
+        wbytes: uint64 = got
+        if (wbytes % SECTOR_SIZE) != 0:
+            pad: uint64 = SECTOR_SIZE - (wbytes % SECTOR_SIZE)
+            p: uint64 = 0
+            while p < pad:
+                sqfs_stream_buf[wbytes + p] = 0
+                p = p + 1
+            wbytes = wbytes + pad
+        wsectors: uint64 = wbytes / SECTOR_SIZE
+        wrc: int32 = blk_write_sectors(dst_slot, dst_lba, wsectors,
+                                       &sqfs_stream_buf[0])
+        if wrc != 0:
+            printk1("[sqfs-extract] blk_write failed at lba=%d\n", dst_lba)
+            loop_detach(loop_slot)
+            return -8
+        dst_lba = dst_lba + wsectors
+        off = off + got
+        if off >= next_report:
+            printk2("[sqfs-extract] streamed %d of %d bytes\n",
+                    off, payload_size)
+            next_report = next_report + report_step
+    printk_set_level(PRINTK_LEVEL_NOTICE)
+    printk1("[sqfs-extract] DONE: wrote %d bytes from in-RAM squashfs\n",
+            payload_size)
+    loop_detach(loop_slot)
+    return 0
+
+
 # --- /dev/loop/ctl control surface ----------------------------------
 #
 # Global write-only control file. Verbs (one per write, '\n' or
@@ -286,6 +434,36 @@ def _lc_parse_u64(buf: Ptr[uint8], n: uint64, pos: uint64,
     return pos
 
 
+# Three NUL-terminated scratch token buffers for the sqfs_extract verb.
+lc_tok_a: Array[256, uint8]
+lc_tok_b: Array[256, uint8]
+lc_tok_c: Array[256, uint8]
+
+
+def _lc_copy_token(buf: Ptr[uint8], n: uint64, pos: uint64,
+                   out: Ptr[uint8], out_max: uint64,
+                   end_out: Ptr[uint64]) -> int32:
+    # Copy the whitespace-delimited token starting at pos into `out`
+    # (NUL-terminated). Returns 1 on a non-empty token (end position
+    # written to *end_out, past the token), 0 if no token remains.
+    pos = _lc_skip_ws(buf, n, pos)
+    if pos >= n or buf[pos] == 0:
+        end_out[0] = pos
+        return 0
+    w: uint64 = 0
+    while pos < n and buf[pos] != 0 and buf[pos] != 32 and buf[pos] != 9 \
+            and buf[pos] != 10:
+        if w < out_max - 1:
+            out[w] = buf[pos]
+            w = w + 1
+        pos = pos + 1
+    out[w] = 0
+    end_out[0] = pos
+    if w == 0:
+        return 0
+    return 1
+
+
 def loopctl_write(buf: Ptr[uint8], count: uint64) -> int64:
     # Parse one verb line. Returns `count` bytes consumed on success, a
     # negative errno on a parse / attach / detach failure.
@@ -331,6 +509,34 @@ def loopctl_write(buf: Ptr[uint8], count: uint64) -> int64:
         rc: int32 = loop_detach(cast[int32](idx))
         if rc < 0:
             return -22                             # -EINVAL
+        return cast[int64](count)
+    if _lc_starts_with(bp, n, "sqfs_extract") != 0:
+        # sqfs_extract <sqfs_file_path> <inner_file_path> <dst_blockdev>
+        # Mount the in-RAM squashfs file, look up the inner file, and
+        # stream it block-by-block to the named destination block device.
+        # Used by etc/install_nvme.hamsh so the installer sources its
+        # rootfs/ESP payloads from RAM, never from the media block dev.
+        pos: uint64 = 12                           # past "sqfs_extract"
+        ep: uint64 = 0
+        if _lc_copy_token(bp, n, pos, &lc_tok_a[0], 256, &ep) == 0:
+            printk0("loop: sqfs_extract: missing sqfs path\n")
+            return -22
+        pos = ep
+        if _lc_copy_token(bp, n, pos, &lc_tok_b[0], 256, &ep) == 0:
+            printk0("loop: sqfs_extract: missing inner file path\n")
+            return -22
+        pos = ep
+        if _lc_copy_token(bp, n, pos, &lc_tok_c[0], 256, &ep) == 0:
+            printk0("loop: sqfs_extract: missing dst block device\n")
+            return -22
+        erc: int32 = loop_sqfs_extract(
+            cast[Ptr[char]](&lc_tok_a[0]),
+            cast[Ptr[char]](&lc_tok_b[0]),
+            cast[Ptr[char]](&lc_tok_c[0]))
+        if erc != 0:
+            printk1("loop: sqfs_extract failed rc=%d\n",
+                    cast[uint64](cast[int64](erc)))
+            return -5                              # -EIO
         return cast[int64](count)
     if _lc_starts_with(bp, n, "list") != 0:
         # No state change — the listing is produced by reads. Accept it

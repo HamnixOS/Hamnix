@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# scripts/build_installer_img.sh — build the IN-RAM-SQUASHFS install
+# medium: build/hamnix-installer.img.
+#
+# THE "NO MEDIA READ" INSTALLER (design: the install brief). The install
+# medium produced here is an ESP-ONLY GPT image:
+#
+#   GPT disk
+#   └── Partition 1: ESP (FAT12)
+#         \EFI\BOOT\BOOTX64.EFI   the native PE/COFF stub (efi_stub.S)
+#         \hamnix-kernel.elf      the INSTALLER kernel — its cpio embeds
+#                                 /rootfs.sqfs (the full rootfs payload)
+#                                 + /etc/install_nvme.hamsh + the
+#                                 /etc/installer-medium marker.
+#
+# There is DELIBERATELY NO ext4 partition 2 on this medium. The entire
+# installer rootfs payload rides in the firmware-loaded cpio as a single
+# squashfs file; the installer reads its payload from the IN-RAM squashfs,
+# NEVER from the media block device. On the real NUC target the install
+# media is a USB stick whose native driver is broken, so any runtime media
+# read would defeat the in-RAM model — the ESP-only layout is itself the
+# load-bearing proof the USB path is gone.
+#
+# THE TWO-KERNEL BREAK (avoids an infinite "kernel embeds an ESP that
+# embeds the kernel" recursion):
+#   * INSTALLED kernel  = the normal kernel with an EMPTY cpio (boots off
+#                         the NVMe ext4 root). This is what lands inside
+#                         /esp.img (and thus on the NVMe ESP after install).
+#   * INSTALLER kernel  = a kernel whose cpio embeds /rootfs.sqfs. This is
+#                         what lands on the install-medium ESP and runs the
+#                         installer in RAM. It is a SEPARATE build artifact.
+#
+# Squashfs payload (built here, gzip-compressed):
+#   /rootfs.sqfs
+#     ├── /rootfs.ext4   the full ext4 root (build_rootfs_img.py output)
+#     └── /esp.img       the NVMe ESP FAT image (installed kernel + stub)
+#
+# Build artifacts are NOT committed (the kernel/cpio/squashfs are large);
+# the git 100 MB push limit does not apply.
+#
+# Env overrides:
+#   HAMNIX_INSTALLER_IMG_OUT   output image      (default: build/hamnix-installer.img)
+#   HAMNIX_ROOTFS_SIZE_MB      shipped ext4 MiB  (default: 512)
+#   HAMNIX_TARGET_ESP_MB       NVMe ESP FAT MiB  (default: 64; must match
+#                              install_nvme.hamsh's ESP partition size)
+
+set -euo pipefail
+
+PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJ_ROOT"
+
+# shellcheck source=_build_lock.sh
+source "$PROJ_ROOT/scripts/_build_lock.sh"
+
+OUT="${HAMNIX_INSTALLER_IMG_OUT:-build/hamnix-installer.img}"
+INSTALLED_KERNEL="build/hamnix-installed-kernel.elf"
+INSTALLER_KERNEL="build/hamnix-installer-kernel.elf"
+EFI_STUB="build/hamnix-bootx64.efi"
+ROOTFS_IMG="build/hamnix-rootfs.img"
+SQFS_IMG="build/hamnix-rootfs.sqfs"
+export HAMNIX_ROOTFS_SIZE_MB="${HAMNIX_ROOTFS_SIZE_MB:-512}"
+TARGET_ESP_MB="${HAMNIX_TARGET_ESP_MB:-64}"
+
+# --- Host-tool sanity -------------------------------------------------
+need_tool() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "[build_installer_img] ERROR: '$1' not found in PATH." >&2
+        echo "[build_installer_img]   apt-get install mtools binutils squashfs-tools parted e2fsprogs" >&2
+        exit 1
+    fi
+}
+need_tool mformat
+need_tool mcopy
+need_tool mmd
+need_tool as
+need_tool ld
+need_tool dd
+need_tool file
+need_tool mksquashfs
+PARTED="/sbin/parted"; [ -x "$PARTED" ] || PARTED="$(command -v parted || true)"
+[ -n "$PARTED" ] || { echo "[build_installer_img] ERROR: parted not found" >&2; exit 1; }
+
+mkdir -p build
+
+# --- Stage 1: userland + the ext4 rootfs payload ----------------------
+echo "[build_installer_img] Stage 1: build userland + modules + ext4 rootfs payload."
+bash scripts/build_user.sh
+bash scripts/build_modules.sh
+HAMNIX_ROOTFS_OUT="$ROOTFS_IMG" python3 scripts/build_rootfs_img.py
+[ -f "$ROOTFS_IMG" ] || { echo "[build_installer_img] ERROR: $ROOTFS_IMG not built" >&2; exit 1; }
+
+# --- Stage 2: the native UEFI stub ------------------------------------
+echo "[build_installer_img] Stage 2: build native UEFI PE/COFF stub."
+EFI_STUB_SRC="arch/x86/boot/efi_stub.S"
+STUB_TMP=$(mktemp -d)
+trap 'rm -rf "$STUB_TMP"' EXIT
+as --64 -o "$STUB_TMP/efi_stub.o" "$EFI_STUB_SRC"
+ld -m i386pep --subsystem 10 -e efi_main --image-base 0 \
+   --no-dynamic-linker -nostdlib \
+   -o "$EFI_STUB" "$STUB_TMP/efi_stub.o"
+file "$EFI_STUB" | grep -q "PE32+ executable for EFI" \
+    || { echo "[build_installer_img] ERROR: stub is not PE32+ EFI" >&2; exit 1; }
+
+# --- Stage 3: the INSTALLED kernel (empty cpio; boots off NVMe ext4) --
+# This is the kernel that lands on the NVMe ESP. It carries no installer
+# payload — the installed disk boots off its ext4 root, exactly like
+# build_img.sh's shipped image. Native USB stays the default (the install
+# writes a real disk; the installed system is what reads it at boot — on a
+# NUC that is NVMe, not USB).
+echo "[build_installer_img] Stage 3: compile INSTALLED kernel (empty cpio)."
+env HAMNIX_CPIO_EMPTY=1 INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
+rm -f "$INSTALLED_KERNEL"
+python3 -m compiler.adder compile --target=x86_64-bare-metal \
+    init/main.ad -o "$INSTALLED_KERNEL"
+[ -f "$INSTALLED_KERNEL" ] || { echo "[build_installer_img] ERROR: installed kernel not built" >&2; exit 1; }
+echo "[build_installer_img]   installed kernel: $(file -b "$INSTALLED_KERNEL")"
+
+# --- Stage 4: the NVMe ESP FAT image (esp.img) ------------------------
+# A real FAT12 ESP carrying the EFI stub + the INSTALLED kernel. This is
+# what install_nvme.hamsh streams onto the NVMe ESP partition. Its size
+# MUST be <= the NVMe ESP partition (HAMNIX_TARGET_ESP_MB) the installer
+# carves, since the streamer writes it verbatim starting at LBA 0.
+echo "[build_installer_img] Stage 4: build NVMe ESP FAT image (esp.img)."
+INSTALLED_KERNEL_BYTES=$(stat -c%s "$INSTALLED_KERNEL")
+NEED_MB=$(( (INSTALLED_KERNEL_BYTES + (8 * 1024 * 1024)) / (1024 * 1024) ))
+if [ "$NEED_MB" -ge "$TARGET_ESP_MB" ]; then
+    echo "[build_installer_img] ERROR: installed kernel (${INSTALLED_KERNEL_BYTES} B)" >&2
+    echo "[build_installer_img]   does not fit a ${TARGET_ESP_MB} MiB ESP; raise HAMNIX_TARGET_ESP_MB" >&2
+    echo "[build_installer_img]   AND the ESP size in etc/install_nvme.hamsh." >&2
+    exit 1
+fi
+# Size the FAT image a hair UNDER the partition so the verbatim stream
+# fits: use TARGET_ESP_MB minus 1 MiB of slack, floored at 32.
+ESP_IMG_MB=$(( TARGET_ESP_MB - 1 ))
+[ "$ESP_IMG_MB" -ge 32 ] || ESP_IMG_MB=32
+TARGET_ESP="$STUB_TMP/esp.img"
+dd if=/dev/zero of="$TARGET_ESP" bs=1M count="$ESP_IMG_MB" status=none
+mformat -i "$TARGET_ESP" -h 64 -s 32 -c 32 -t $(( ESP_IMG_MB * 64 )) -v HAMNIX ::
+mmd -i "$TARGET_ESP" "::/EFI"
+mmd -i "$TARGET_ESP" "::/EFI/BOOT"
+mcopy -o -i "$TARGET_ESP" "$EFI_STUB"          "::/EFI/BOOT/BOOTX64.EFI"
+mcopy -o -i "$TARGET_ESP" "$INSTALLED_KERNEL"  "::/hamnix-kernel.elf"
+echo "[build_installer_img]   NVMe ESP image: ${ESP_IMG_MB} MiB (BOOTX64.EFI + installed kernel)."
+
+# --- Stage 5: the squashfs payload (rootfs.ext4 + esp.img) ------------
+# Pack BOTH payloads into one gzip squashfs the installer reads in RAM.
+# The reader (fs/squashfs.ad) supports gzip (id=1) + xz (id=4) and a
+# block size up to 1 MiB; mksquashfs' 128 KiB default is well within.
+echo "[build_installer_img] Stage 5: build in-RAM squashfs payload."
+SQFS_STAGE=$(mktemp -d)
+cp "$ROOTFS_IMG"  "$SQFS_STAGE/rootfs.ext4"
+cp "$TARGET_ESP"  "$SQFS_STAGE/esp.img"
+rm -f "$SQFS_IMG"
+mksquashfs "$SQFS_STAGE" "$SQFS_IMG" -comp gzip -noappend -no-progress \
+    -no-xattrs >/dev/null
+rm -rf "$SQFS_STAGE"
+SQFS_BYTES=$(stat -c%s "$SQFS_IMG")
+echo "[build_installer_img]   squashfs: $SQFS_IMG ($(( SQFS_BYTES / 1024 / 1024 )) MiB)."
+
+# --- Stage 6: the INSTALLER kernel (cpio embeds the squashfs) ---------
+echo "[build_installer_img] Stage 6: compile INSTALLER kernel (cpio embeds /rootfs.sqfs)."
+env HAMNIX_INSTALLER_BLOB=1 HAMNIX_INSTALLER_SQFS="$SQFS_IMG" \
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
+rm -f "$INSTALLER_KERNEL"
+python3 -m compiler.adder compile --target=x86_64-bare-metal \
+    init/main.ad -o "$INSTALLER_KERNEL"
+[ -f "$INSTALLER_KERNEL" ] || { echo "[build_installer_img] ERROR: installer kernel not built" >&2; exit 1; }
+echo "[build_installer_img]   installer kernel: $(file -b "$INSTALLER_KERNEL")"
+
+# --- Stage 7: the install-medium ESP (BOOTX64.EFI + installer kernel) -
+echo "[build_installer_img] Stage 7: build install-medium ESP (FAT)."
+INSTALLER_KERNEL_BYTES=$(stat -c%s "$INSTALLER_KERNEL")
+MEDIA_ESP_MB=$(( (INSTALLER_KERNEL_BYTES + (16 * 1024 * 1024)) / (1024 * 1024) ))
+[ "$MEDIA_ESP_MB" -ge 32 ] || MEDIA_ESP_MB=32
+MEDIA_ESP="$STUB_TMP/media_esp.img"
+dd if=/dev/zero of="$MEDIA_ESP" bs=1M count="$MEDIA_ESP_MB" status=none
+mformat -i "$MEDIA_ESP" -h 64 -s 32 -c 32 -t $(( MEDIA_ESP_MB * 64 )) -v HAMNIXINST ::
+mmd -i "$MEDIA_ESP" "::/EFI"
+mmd -i "$MEDIA_ESP" "::/EFI/BOOT"
+mcopy -o -i "$MEDIA_ESP" "$EFI_STUB"          "::/EFI/BOOT/BOOTX64.EFI"
+mcopy -o -i "$MEDIA_ESP" "$INSTALLER_KERNEL"  "::/hamnix-kernel.elf"
+echo "[build_installer_img]   install-medium ESP: ${MEDIA_ESP_MB} MiB (installer kernel embeds ${SQFS_BYTES} B squashfs)."
+
+# --- Stage 8: assemble the ESP-ONLY GPT install medium ----------------
+# Layout: [1 MiB GPT] [ESP partition ONLY] [1 MiB GPT backup]. NO ext4
+# partition 2 — there is physically NOTHING on the media for the
+# installer to read.
+echo "[build_installer_img] Stage 8: assemble ESP-ONLY GPT install medium."
+ALIGN_MB=1
+ESP_START_MB=$ALIGN_MB
+ESP_END_MB=$(( ESP_START_MB + MEDIA_ESP_MB ))
+TOTAL_MB=$(( ESP_END_MB + ALIGN_MB ))
+rm -f "$OUT"
+dd if=/dev/zero of="$OUT" bs=1M count="$TOTAL_MB" status=none
+"$PARTED" -s "$OUT" mklabel gpt
+"$PARTED" -s "$OUT" mkpart ESP fat32 "${ESP_START_MB}MiB" "${ESP_END_MB}MiB"
+"$PARTED" -s "$OUT" set 1 esp on
+dd if="$MEDIA_ESP" of="$OUT" bs=1M seek="$ESP_START_MB" conv=notrunc status=none
+
+# --- Verify: GPT has EXACTLY ONE partition (the ESP) ------------------
+echo "[build_installer_img] GPT partition table (must be ESP-ONLY):"
+"$PARTED" -s "$OUT" unit s print 2>/dev/null | sed 's/^/    /'
+NPARTS=$("$PARTED" -s "$OUT" unit s print 2>/dev/null \
+            | awk '/^[ ]*[0-9]+/ {n++} END {print n+0}')
+if [ "$NPARTS" -ne 1 ]; then
+    echo "[build_installer_img] ERROR: install medium has $NPARTS partitions; must be 1 (ESP-only)." >&2
+    exit 1
+fi
+echo "[build_installer_img]   ESP-ONLY layout confirmed (1 partition; no ext4 to read)."
+
+IMG_BYTES=$(stat -c%s "$OUT")
+echo "[build_installer_img] DONE: $OUT"
+echo "[build_installer_img]   total image  : ${IMG_BYTES} bytes ($(( IMG_BYTES / 1024 / 1024 )) MiB)"
+echo "[build_installer_img]   ESP part 1   : ${MEDIA_ESP_MB} MiB (BOOTX64.EFI + installer kernel)"
+echo "[build_installer_img]   in-RAM sqfs  : ${SQFS_BYTES} bytes (rootfs.ext4 + esp.img), embedded in the kernel cpio"
+echo "[build_installer_img] Boot it: attach as the install media + a blank NVMe target; run /etc/install_nvme.hamsh."
+echo "[build_installer_img] Test:    bash scripts/test_installer_nvme_inram.sh"
