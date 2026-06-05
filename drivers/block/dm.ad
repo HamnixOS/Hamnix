@@ -80,415 +80,24 @@ from fs.crc32c import (
 from fs.sha256 import (
     sha256_oneshot,
 )
+# AES-256-XTS (the aes-xts-plain64 sector transform) was factored out into
+# fs/aes_xts.ad so ext4 fscrypt can reuse the EXACT same proven cipher
+# (per-file content encryption) without duplicating crypto — mirroring how
+# SHA-256 was factored into fs/sha256.ad for the salted-Merkle features.
+# dm-crypt drives it through aes_xts_set_key (load the 64-byte XTS key into
+# the shared data+tweak schedules) + aes_xts_encrypt_unit / aes_xts_decrypt_
+# unit (one 512-byte sector = one whole data unit, tweaked by the virtual
+# sector number).
+from fs.aes_xts import (
+    aes_xts_set_key, aes_xts_encrypt_unit, aes_xts_decrypt_unit,
+)
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
-# =========================================================================
-# AES-256 block cipher (FIPS 197) — self-contained, forward + inverse
-# =========================================================================
-#
-# A real 14-round AES with a 256-bit master key. Unlike tls.ad's GCM
-# path (encrypt-only, single shared schedule), XTS needs BOTH the
-# forward and the inverse cipher and TWO live key schedules at once (a
-# data key and a tweak key), so this implementation owns two 240-byte
-# expanded schedules. The S-box / inverse S-box / GF(2^8) tables are
-# built once at init. All working state is module-scope .bss: dm-crypt
-# I/O is serialised through the synchronous block layer, so a single
-# shared block-state buffer is safe (no two crypt transfers overlap).
-
-_dm_aes_sbox:     Array[256, uint8]   # forward S-box
-_dm_aes_isbox:    Array[256, uint8]   # inverse S-box
-_dm_aes_inited:   int32 = 0
-# GF(2^8) log/exp scratch for S-box construction.
-_dm_aes_log:      Array[256, uint16]
-_dm_aes_exp:      Array[256, uint8]
-
-# Two independent 240-byte AES-256 expanded schedules: index 0 = data
-# key, index 1 = tweak key. Both forward; the data key also gets an
-# inverse schedule for the decrypt path.
-_dm_aes_rk_data:  Array[240, uint8]
-_dm_aes_rk_tweak: Array[240, uint8]
-_dm_aes_block_st: Array[16, uint8]    # working state for one block
-
-
-def _dm_aes_rotl8(v: uint8, n: uint64) -> uint8:
-    x: uint64 = cast[uint64](v) & 0xFF
-    return cast[uint8](((x << n) | (x >> (8 - n))) & 0xFF)
-
-
-def _dm_aes_xtime(b: uint8) -> uint8:
-    # b * x mod (x^8 + x^4 + x^3 + x + 1) in GF(2^8).
-    v: uint64 = cast[uint64](b) & 0xFF
-    t: uint64 = (v << 1) & 0xFF
-    if (v & 0x80) != 0:
-        t = t ^ 0x1B
-    return cast[uint8](t & 0xFF)
-
-
-def _dm_aes_gfmul(a: uint8, b: uint8) -> uint8:
-    # Full GF(2^8) multiply (used for the inverse MixColumns constants
-    # 9, 11, 13, 14). Russian-peasant.
-    av: uint64 = cast[uint64](a) & 0xFF
-    bv: uint64 = cast[uint64](b) & 0xFF
-    p:  uint64 = 0
-    i:  uint64 = 0
-    while i < 8:
-        if (bv & 1) != 0:
-            p = p ^ av
-        hi: uint64 = av & 0x80
-        av = (av << 1) & 0xFF
-        if hi != 0:
-            av = av ^ 0x1B
-        bv = bv >> 1
-        i = i + 1
-    return cast[uint8](p & 0xFF)
-
-
-def _dm_aes_init():
-    # Build the forward S-box (FIPS 197 §5.1.1) and its inverse at
-    # runtime via a GF(2^8) log/exp table with generator g=3.
-    if _dm_aes_inited != 0:
-        return
-    _dm_aes_inited = 1
-    i: uint64 = 0
-    x: uint16 = 1
-    while i < 255:
-        _dm_aes_exp[i] = cast[uint8](x & 0xFF)
-        _dm_aes_log[x & 0xFF] = cast[uint16](i)
-        x2: uint16 = (x << 1) & 0xFF
-        if (x & 0x80) != 0:
-            x2 = x2 ^ 0x1B
-        x = x2 ^ x
-        x = x & 0xFF
-        i = i + 1
-    _dm_aes_exp[255] = _dm_aes_exp[0]
-    _dm_aes_sbox[0] = 0x63
-    b: uint64 = 1
-    while b < 256:
-        inv: uint8 = _dm_aes_exp[(255 - cast[uint64](_dm_aes_log[b])) & 0xFF]
-        v: uint8 = inv
-        s: uint8 = v \
-            ^ _dm_aes_rotl8(v, 1) \
-            ^ _dm_aes_rotl8(v, 2) \
-            ^ _dm_aes_rotl8(v, 3) \
-            ^ _dm_aes_rotl8(v, 4) \
-            ^ 0x63
-        _dm_aes_sbox[b] = s
-        b = b + 1
-    # Inverse S-box: isbox[sbox[b]] = b.
-    b = 0
-    while b < 256:
-        _dm_aes_isbox[_dm_aes_sbox[b]] = cast[uint8](b)
-        b = b + 1
-
-
-def _dm_aes256_expand(master: Ptr[uint8], rk: Ptr[uint8]):
-    # FIPS 197 §5.2, AES-256: Nk=8, Nr=14, 240-byte expanded key into the
-    # caller-supplied 240-byte schedule buffer `rk`.
-    _dm_aes_init()
-    i: uint64 = 0
-    while i < 32:
-        rk[i] = master[i]
-        i = i + 1
-    rcon: uint8 = 0x01
-    i = 32
-    while i < 240:
-        t0: uint8 = rk[i - 4]
-        t1: uint8 = rk[i - 3]
-        t2: uint8 = rk[i - 2]
-        t3: uint8 = rk[i - 1]
-        word_idx: uint64 = i / 4
-        if (word_idx & 7) == 0:
-            r0: uint8 = _dm_aes_sbox[t1] ^ rcon
-            r1: uint8 = _dm_aes_sbox[t2]
-            r2: uint8 = _dm_aes_sbox[t3]
-            r3: uint8 = _dm_aes_sbox[t0]
-            t0 = r0
-            t1 = r1
-            t2 = r2
-            t3 = r3
-            rcon = _dm_aes_xtime(rcon)
-        elif (word_idx & 7) == 4:
-            t0 = _dm_aes_sbox[t0]
-            t1 = _dm_aes_sbox[t1]
-            t2 = _dm_aes_sbox[t2]
-            t3 = _dm_aes_sbox[t3]
-        rk[i + 0] = rk[i - 32 + 0] ^ t0
-        rk[i + 1] = rk[i - 32 + 1] ^ t1
-        rk[i + 2] = rk[i - 32 + 2] ^ t2
-        rk[i + 3] = rk[i - 32 + 3] ^ t3
-        i = i + 4
-
-
-def _dm_aes256_encrypt(rk: Ptr[uint8], out_blk: Ptr[uint8],
-                       in_blk: Ptr[uint8]):
-    # Encrypt one 16-byte block under the 240-byte schedule `rk` (Nr=14).
-    # State held column-major s[c*4 + r].
-    i: uint64 = 0
-    while i < 16:
-        _dm_aes_block_st[i] = in_blk[i] ^ rk[i]
-        i = i + 1
-    rnd: uint64 = 1
-    while rnd <= 13:
-        i = 0
-        while i < 16:
-            _dm_aes_block_st[i] = _dm_aes_sbox[_dm_aes_block_st[i]]
-            i = i + 1
-        # ShiftRows
-        t1: uint8 = _dm_aes_block_st[1]
-        _dm_aes_block_st[1] = _dm_aes_block_st[5]
-        _dm_aes_block_st[5] = _dm_aes_block_st[9]
-        _dm_aes_block_st[9] = _dm_aes_block_st[13]
-        _dm_aes_block_st[13] = t1
-        t2a: uint8 = _dm_aes_block_st[2]
-        t2b: uint8 = _dm_aes_block_st[6]
-        _dm_aes_block_st[2] = _dm_aes_block_st[10]
-        _dm_aes_block_st[6] = _dm_aes_block_st[14]
-        _dm_aes_block_st[10] = t2a
-        _dm_aes_block_st[14] = t2b
-        t3: uint8 = _dm_aes_block_st[15]
-        _dm_aes_block_st[15] = _dm_aes_block_st[11]
-        _dm_aes_block_st[11] = _dm_aes_block_st[7]
-        _dm_aes_block_st[7] = _dm_aes_block_st[3]
-        _dm_aes_block_st[3] = t3
-        # MixColumns
-        c: uint64 = 0
-        while c < 4:
-            s0: uint8 = _dm_aes_block_st[c * 4 + 0]
-            s1: uint8 = _dm_aes_block_st[c * 4 + 1]
-            s2: uint8 = _dm_aes_block_st[c * 4 + 2]
-            s3: uint8 = _dm_aes_block_st[c * 4 + 3]
-            x0: uint8 = _dm_aes_xtime(s0)
-            x1: uint8 = _dm_aes_xtime(s1)
-            x2: uint8 = _dm_aes_xtime(s2)
-            x3: uint8 = _dm_aes_xtime(s3)
-            _dm_aes_block_st[c * 4 + 0] = x0 ^ (x1 ^ s1) ^ s2 ^ s3
-            _dm_aes_block_st[c * 4 + 1] = s0 ^ x1 ^ (x2 ^ s2) ^ s3
-            _dm_aes_block_st[c * 4 + 2] = s0 ^ s1 ^ x2 ^ (x3 ^ s3)
-            _dm_aes_block_st[c * 4 + 3] = (x0 ^ s0) ^ s1 ^ s2 ^ x3
-            c = c + 1
-        rk_base: uint64 = rnd * 16
-        i = 0
-        while i < 16:
-            _dm_aes_block_st[i] = _dm_aes_block_st[i] ^ rk[rk_base + i]
-            i = i + 1
-        rnd = rnd + 1
-    # Final round: SubBytes + ShiftRows + AddRoundKey (no MixColumns).
-    i = 0
-    while i < 16:
-        _dm_aes_block_st[i] = _dm_aes_sbox[_dm_aes_block_st[i]]
-        i = i + 1
-    t1f: uint8 = _dm_aes_block_st[1]
-    _dm_aes_block_st[1] = _dm_aes_block_st[5]
-    _dm_aes_block_st[5] = _dm_aes_block_st[9]
-    _dm_aes_block_st[9] = _dm_aes_block_st[13]
-    _dm_aes_block_st[13] = t1f
-    t2af: uint8 = _dm_aes_block_st[2]
-    t2bf: uint8 = _dm_aes_block_st[6]
-    _dm_aes_block_st[2] = _dm_aes_block_st[10]
-    _dm_aes_block_st[6] = _dm_aes_block_st[14]
-    _dm_aes_block_st[10] = t2af
-    _dm_aes_block_st[14] = t2bf
-    t3f: uint8 = _dm_aes_block_st[15]
-    _dm_aes_block_st[15] = _dm_aes_block_st[11]
-    _dm_aes_block_st[11] = _dm_aes_block_st[7]
-    _dm_aes_block_st[7] = _dm_aes_block_st[3]
-    _dm_aes_block_st[3] = t3f
-    i = 0
-    while i < 16:
-        out_blk[i] = _dm_aes_block_st[i] ^ rk[14 * 16 + i]
-        i = i + 1
-
-
-def _dm_aes256_decrypt(rk: Ptr[uint8], out_blk: Ptr[uint8],
-                       in_blk: Ptr[uint8]):
-    # Inverse cipher (FIPS 197 §5.3) — the equivalent-inverse-free
-    # straightforward form: AddRoundKey(last), then 13 rounds of
-    # InvShiftRows, InvSubBytes, AddRoundKey, InvMixColumns, then a final
-    # InvShiftRows + InvSubBytes + AddRoundKey(0).
-    i: uint64 = 0
-    while i < 16:
-        _dm_aes_block_st[i] = in_blk[i] ^ rk[14 * 16 + i]
-        i = i + 1
-    rnd: int64 = 13
-    while rnd >= 1:
-        # InvShiftRows: row r is right-rotated by r columns.
-        t1: uint8 = _dm_aes_block_st[13]
-        _dm_aes_block_st[13] = _dm_aes_block_st[9]
-        _dm_aes_block_st[9] = _dm_aes_block_st[5]
-        _dm_aes_block_st[5] = _dm_aes_block_st[1]
-        _dm_aes_block_st[1] = t1
-        t2a: uint8 = _dm_aes_block_st[2]
-        t2b: uint8 = _dm_aes_block_st[6]
-        _dm_aes_block_st[2] = _dm_aes_block_st[10]
-        _dm_aes_block_st[6] = _dm_aes_block_st[14]
-        _dm_aes_block_st[10] = t2a
-        _dm_aes_block_st[14] = t2b
-        t3: uint8 = _dm_aes_block_st[3]
-        _dm_aes_block_st[3] = _dm_aes_block_st[7]
-        _dm_aes_block_st[7] = _dm_aes_block_st[11]
-        _dm_aes_block_st[11] = _dm_aes_block_st[15]
-        _dm_aes_block_st[15] = t3
-        # InvSubBytes
-        i = 0
-        while i < 16:
-            _dm_aes_block_st[i] = _dm_aes_isbox[_dm_aes_block_st[i]]
-            i = i + 1
-        # AddRoundKey
-        rk_base: uint64 = cast[uint64](rnd) * 16
-        i = 0
-        while i < 16:
-            _dm_aes_block_st[i] = _dm_aes_block_st[i] ^ rk[rk_base + i]
-            i = i + 1
-        # InvMixColumns
-        c: uint64 = 0
-        while c < 4:
-            s0: uint8 = _dm_aes_block_st[c * 4 + 0]
-            s1: uint8 = _dm_aes_block_st[c * 4 + 1]
-            s2: uint8 = _dm_aes_block_st[c * 4 + 2]
-            s3: uint8 = _dm_aes_block_st[c * 4 + 3]
-            _dm_aes_block_st[c * 4 + 0] = _dm_aes_gfmul(s0, 14) \
-                ^ _dm_aes_gfmul(s1, 11) ^ _dm_aes_gfmul(s2, 13) \
-                ^ _dm_aes_gfmul(s3, 9)
-            _dm_aes_block_st[c * 4 + 1] = _dm_aes_gfmul(s0, 9) \
-                ^ _dm_aes_gfmul(s1, 14) ^ _dm_aes_gfmul(s2, 11) \
-                ^ _dm_aes_gfmul(s3, 13)
-            _dm_aes_block_st[c * 4 + 2] = _dm_aes_gfmul(s0, 13) \
-                ^ _dm_aes_gfmul(s1, 9) ^ _dm_aes_gfmul(s2, 14) \
-                ^ _dm_aes_gfmul(s3, 11)
-            _dm_aes_block_st[c * 4 + 3] = _dm_aes_gfmul(s0, 11) \
-                ^ _dm_aes_gfmul(s1, 13) ^ _dm_aes_gfmul(s2, 9) \
-                ^ _dm_aes_gfmul(s3, 14)
-            c = c + 1
-        rnd = rnd - 1
-    # Final round: InvShiftRows + InvSubBytes + AddRoundKey(0).
-    t1f: uint8 = _dm_aes_block_st[13]
-    _dm_aes_block_st[13] = _dm_aes_block_st[9]
-    _dm_aes_block_st[9] = _dm_aes_block_st[5]
-    _dm_aes_block_st[5] = _dm_aes_block_st[1]
-    _dm_aes_block_st[1] = t1f
-    t2af: uint8 = _dm_aes_block_st[2]
-    t2bf: uint8 = _dm_aes_block_st[6]
-    _dm_aes_block_st[2] = _dm_aes_block_st[10]
-    _dm_aes_block_st[6] = _dm_aes_block_st[14]
-    _dm_aes_block_st[10] = t2af
-    _dm_aes_block_st[14] = t2bf
-    t3f: uint8 = _dm_aes_block_st[3]
-    _dm_aes_block_st[3] = _dm_aes_block_st[7]
-    _dm_aes_block_st[7] = _dm_aes_block_st[11]
-    _dm_aes_block_st[11] = _dm_aes_block_st[15]
-    _dm_aes_block_st[15] = t3f
-    i = 0
-    while i < 16:
-        _dm_aes_block_st[i] = _dm_aes_isbox[_dm_aes_block_st[i]]
-        i = i + 1
-    i = 0
-    while i < 16:
-        out_blk[i] = _dm_aes_block_st[i] ^ rk[i]
-        i = i + 1
-
-
-# =========================================================================
-# AES-XTS (IEEE Std 1619-2007) — the aes-xts-plain64 sector transform
-# =========================================================================
-#
-# XTS encrypts/decrypts a sector as a sequence of 16-byte blocks under a
-# data key, masked by a per-block tweak. The tweak for block 0 of a
-# sector is T0 = AES_tweakkey(IV) where IV = the 64-bit sector number
-# little-endian in a 16-byte block (dm-crypt "plain64"). For each
-# subsequent block the tweak is multiplied by alpha = x in GF(2^128)
-# (the polynomial x^128 + x^7 + x^2 + x + 1, LSB-first byte order).
-#   encrypt:  C = AES_datakey(P ^ T) ^ T
-#   decrypt:  P = AES_datakey^-1(C ^ T) ^ T
-# A 512-byte sector is exactly 32 whole AES blocks, so no ciphertext
-# stealing is ever required.
-
-_dm_xts_tweak:  Array[16, uint8]   # running tweak T for the current sector
-_dm_xts_tmp:    Array[16, uint8]   # P ^ T / C ^ T scratch
-
-
-def _dm_xts_mul_alpha(t: Ptr[uint8]):
-    # Multiply the 128-bit value t by alpha = x in GF(2^128), little-
-    # endian byte order (IEEE 1619). Left-shift the whole 128-bit value
-    # by one bit; if the high bit (bit 127) carried out, XOR 0x87 into
-    # byte 0.
-    carry: uint64 = 0
-    i: uint64 = 0
-    while i < 16:
-        cur: uint64 = cast[uint64](t[i]) & 0xFF
-        newv: uint64 = ((cur << 1) | carry) & 0xFF
-        carry = (cur >> 7) & 1
-        t[i] = cast[uint8](newv)
-        i = i + 1
-    if carry != 0:
-        t[0] = t[0] ^ 0x87
-
-
-def _dm_xts_init_tweak(sector: uint64):
-    # T0 = AES_tweakkey(plain64 IV). IV = sector number little-endian in
-    # bytes 0..7, zero in 8..15.
-    iv: Array[16, uint8]
-    i: uint64 = 0
-    while i < 8:
-        iv[i] = cast[uint8]((sector >> (i * 8)) & 0xFF)
-        i = i + 1
-    while i < 16:
-        iv[i] = 0
-        i = i + 1
-    _dm_aes256_encrypt(cast[Ptr[uint8]](&_dm_aes_rk_tweak[0]),
-                       cast[Ptr[uint8]](&_dm_xts_tweak[0]),
-                       cast[Ptr[uint8]](&iv[0]))
-
-
-def _dm_xts_encrypt_sector(sector: uint64,
-                           dst: Ptr[uint8], src: Ptr[uint8]):
-    # XTS-encrypt one 512-byte sector (32 blocks). Assumes the data and
-    # tweak schedules are already expanded into _dm_aes_rk_data /
-    # _dm_aes_rk_tweak.
-    _dm_xts_init_tweak(sector)
-    tw:  Ptr[uint8] = cast[Ptr[uint8]](&_dm_xts_tweak[0])
-    tmp: Ptr[uint8] = cast[Ptr[uint8]](&_dm_xts_tmp[0])
-    dkey: Ptr[uint8] = cast[Ptr[uint8]](&_dm_aes_rk_data[0])
-    blk: uint64 = 0
-    while blk < 32:
-        base: uint64 = blk * 16
-        j: uint64 = 0
-        while j < 16:
-            tmp[j] = src[base + j] ^ tw[j]
-            j = j + 1
-        _dm_aes256_encrypt(dkey, cast[Ptr[uint8]](
-            cast[uint64](dst) + base), tmp)
-        j = 0
-        while j < 16:
-            dst[base + j] = dst[base + j] ^ tw[j]
-            j = j + 1
-        _dm_xts_mul_alpha(tw)
-        blk = blk + 1
-
-
-def _dm_xts_decrypt_sector(sector: uint64,
-                           dst: Ptr[uint8], src: Ptr[uint8]):
-    # XTS-decrypt one 512-byte sector (32 blocks).
-    _dm_xts_init_tweak(sector)
-    tw:  Ptr[uint8] = cast[Ptr[uint8]](&_dm_xts_tweak[0])
-    tmp: Ptr[uint8] = cast[Ptr[uint8]](&_dm_xts_tmp[0])
-    dkey: Ptr[uint8] = cast[Ptr[uint8]](&_dm_aes_rk_data[0])
-    blk: uint64 = 0
-    while blk < 32:
-        base: uint64 = blk * 16
-        j: uint64 = 0
-        while j < 16:
-            tmp[j] = src[base + j] ^ tw[j]
-            j = j + 1
-        _dm_aes256_decrypt(dkey, cast[Ptr[uint8]](
-            cast[uint64](dst) + base), tmp)
-        j = 0
-        while j < 16:
-            dst[base + j] = dst[base + j] ^ tw[j]
-            j = j + 1
-        _dm_xts_mul_alpha(tw)
-        blk = blk + 1
+# AES-256 (FIPS 197) + AES-XTS (IEEE 1619) cipher moved to fs/aes_xts.ad
+# (shared with ext4 fscrypt). dm-crypt drives it via aes_xts_set_key +
+# aes_xts_encrypt_unit / aes_xts_decrypt_unit; see the import above.
 
 
 # =========================================================================
@@ -1143,12 +752,9 @@ def _dm_find_target(dev: Ptr[MappedDevice], vlba: uint64) -> int32:
 
 
 def _dm_crypt_load_keys(dev: Ptr[MappedDevice]):
-    # Expand this mapped device's 64-byte XTS key into the two AES-256
-    # schedules: bytes 0..31 = data key, bytes 32..63 = tweak key.
-    _dm_aes256_expand(cast[Ptr[uint8]](&dev[0].key[0]),
-                      cast[Ptr[uint8]](&_dm_aes_rk_data[0]))
-    _dm_aes256_expand(cast[Ptr[uint8]](&dev[0].key[32]),
-                      cast[Ptr[uint8]](&_dm_aes_rk_tweak[0]))
+    # Load this mapped device's 64-byte XTS key (bytes 0..31 = data key,
+    # 32..63 = tweak key) into the shared AES-256-XTS schedules.
+    aes_xts_set_key(cast[Ptr[uint8]](&dev[0].key[0]))
 
 
 def _dm_linear_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
@@ -1182,7 +788,7 @@ def _dm_crypt_io(dev: Ptr[MappedDevice], t: Ptr[DmTarget],
             cast[uint64](buf) + s * SECTOR_SIZE)
         if is_write != 0:
             # plaintext (cur) -> ciphertext (staging) -> backing store
-            _dm_xts_encrypt_sector(vsec, stagep, cur)
+            aes_xts_encrypt_unit(vsec, SECTOR_SIZE, stagep, cur)
             rc: int32 = blk_write_sectors(t[0].under_slot, ulba, 1, stagep)
             if rc != 0:
                 return rc
@@ -1191,7 +797,7 @@ def _dm_crypt_io(dev: Ptr[MappedDevice], t: Ptr[DmTarget],
             rc2: int32 = blk_read_sectors(t[0].under_slot, ulba, 1, stagep)
             if rc2 != 0:
                 return rc2
-            _dm_xts_decrypt_sector(vsec, cur, stagep)
+            aes_xts_decrypt_unit(vsec, SECTOR_SIZE, cur, stagep)
         s = s + 1
     return 0
 
@@ -4134,13 +3740,10 @@ def _dm_xts_kat() -> int32:
         i = i + 1
     # Load the schedules directly from the KAT key (data = bytes 0..31,
     # tweak = bytes 32..63) and XTS-encrypt the whole sector.
-    _dm_aes256_expand(cast[Ptr[uint8]](&_dm_kat_key[0]),
-                      cast[Ptr[uint8]](&_dm_aes_rk_data[0]))
-    _dm_aes256_expand(cast[Ptr[uint8]](&_dm_kat_key[32]),
-                      cast[Ptr[uint8]](&_dm_aes_rk_tweak[0]))
-    _dm_xts_encrypt_sector(_DM_KAT_SECTOR,
-                           cast[Ptr[uint8]](&_dm_kat_ct[0]),
-                           cast[Ptr[uint8]](&_dm_kat_pt[0]))
+    aes_xts_set_key(cast[Ptr[uint8]](&_dm_kat_key[0]))
+    aes_xts_encrypt_unit(_DM_KAT_SECTOR, SECTOR_SIZE,
+                         cast[Ptr[uint8]](&_dm_kat_ct[0]),
+                         cast[Ptr[uint8]](&_dm_kat_pt[0]))
     # First and last ciphertext blocks must match the reference.
     if _dm_buf_eq(&_dm_kat_ct[0], &_dm_kat_ct_first[0], 16) != 1:
         _dm_emerg0("[device-mapper] KAT first block mismatch\n")
@@ -4149,13 +3752,10 @@ def _dm_xts_kat() -> int32:
         _dm_emerg0("[device-mapper] KAT last block mismatch\n")
         return 0
     # Decrypt round-trip: must reproduce the plaintext exactly.
-    _dm_aes256_expand(cast[Ptr[uint8]](&_dm_kat_key[0]),
-                      cast[Ptr[uint8]](&_dm_aes_rk_data[0]))
-    _dm_aes256_expand(cast[Ptr[uint8]](&_dm_kat_key[32]),
-                      cast[Ptr[uint8]](&_dm_aes_rk_tweak[0]))
-    _dm_xts_decrypt_sector(_DM_KAT_SECTOR,
-                           cast[Ptr[uint8]](&_dm_kat_out[0]),
-                           cast[Ptr[uint8]](&_dm_kat_ct[0]))
+    aes_xts_set_key(cast[Ptr[uint8]](&_dm_kat_key[0]))
+    aes_xts_decrypt_unit(_DM_KAT_SECTOR, SECTOR_SIZE,
+                         cast[Ptr[uint8]](&_dm_kat_out[0]),
+                         cast[Ptr[uint8]](&_dm_kat_ct[0]))
     if _dm_buf_eq(&_dm_kat_out[0], &_dm_kat_pt[0], SECTOR_SIZE) != 1:
         _dm_emerg0("[device-mapper] KAT decrypt round-trip mismatch\n")
         return 0

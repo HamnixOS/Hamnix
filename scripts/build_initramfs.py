@@ -996,6 +996,21 @@ if os.environ.get("ENABLE_EXT4_MKDIR_TEST") == "1":
 if os.environ.get("ENABLE_EXT4_VERITY_TEST") == "1":
     FILES.append(("/etc/ext4-verity-test", b"1\n"))
 
+# ext4 fscrypt (EXT4_ENCRYPT_FL per-file content encryption) self-test.
+# scripts/test_ext4_fscrypt.sh sets ENABLE_EXT4_FSCRYPT_TEST=1 to plant
+# /etc/ext4-fscrypt-test. init/main.ad detects the marker after the ext4
+# mount and calls ext4_fscrypt_selftest() (fs/ext4.ad): it builds a REAL
+# multi-block file on the live ext4 mount, sets an fscrypt policy (derives a
+# per-file AES-256-XTS content key via HKDF-SHA256, sets EXT4_ENCRYPT_FL),
+# writes a known plaintext ENCRYPTED to disk, then proves the file reads back
+# byte-identical, the raw on-disk block is genuine ciphertext (not the
+# plaintext), the XTS tweak (= logical block number) makes equal plaintext
+# encrypt to different ciphertext, and the wrong key recovers only garbage.
+# Writes to the mounted image, so it is opt-in. Default boots omit the marker
+# so it never fires.
+if os.environ.get("ENABLE_EXT4_FSCRYPT_TEST") == "1":
+    FILES.append(("/etc/ext4-fscrypt-test", b"1\n"))
+
 # ext4 fast_commit (COMPAT_FAST_COMMIT) self-test. scripts/
 # test_ext4_fast_commit.sh sets ENABLE_EXT4_FC_TEST=1 to plant
 # /etc/ext4-fc-test. init/main.ad detects the marker after the ext4

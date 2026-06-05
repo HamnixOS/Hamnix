@@ -56,6 +56,13 @@ from fs.jbd2 import (
 # KAT (crc32c("123456789")==0xE3069283) self-checks the polynomial.
 from fs.crc32c import crc32c, crc32c_update, crc32c_selftest
 from fs.sha256 import sha256_oneshot
+# AES-256-XTS (the aes-xts-plain64 data-unit transform shared with dm-crypt,
+# fs/aes_xts.ad) — ext4 fscrypt uses it for per-file content encryption at
+# rest: each data block is XTS-transformed under the file's content key with
+# the file LOGICAL BLOCK NUMBER as the tweak/data-unit index.
+from fs.aes_xts import (
+    aes_xts_set_key, aes_xts_encrypt_unit, aes_xts_decrypt_unit,
+)
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -1044,6 +1051,13 @@ EXT4_INLINE_DATA_FL:  uint32 = 0x10000000
 # fail (EIO). Matches Linux's EXT4_VERITY_FL (0x00100000). Only meaningful
 # when the verity registry holds the inode's tree (ext4_verity_enable).
 EXT4_VERITY_FL:       uint32 = 0x00100000
+# EXT4_ENCRYPT_FL: the file's data is stored ENCRYPTED at rest (fscrypt).
+# Once set, every data block is AES-256-XTS-transformed under a per-file
+# content key (the file logical block number is the XTS tweak) before it
+# hits the backing device, and decrypted transparently on read. Matches
+# Linux's EXT4_ENCRYPT_FL (0x00000800). Only meaningful when the fscrypt
+# registry holds the inode's content key (ext4_fscrypt_set_policy).
+EXT4_ENCRYPT_FL:      uint32 = 0x00000800
 
 # The in-inode portion of inline data starts at the i_block[] window
 # (inode offset 0x28) and is at most 60 bytes (the i_block[] size).
@@ -2663,6 +2677,18 @@ def ext4_read_file(inum: uint32, pos: uint64, count: uint64,
         if vslot >= 0:
             return _ext4_verity_read(cast[uint32](inum), vslot,
                                      &inode[0], pos, count, buf)
+
+    # fscrypt: if this inode carries EXT4_ENCRYPT_FL AND the fscrypt registry
+    # holds its per-file content key, route the read through the decrypt
+    # path. Each ext4 data block was stored AES-256-XTS-encrypted (tweak =
+    # file logical block number); the decrypt path fetches the CIPHERTEXT off
+    # disk and XTS-decrypts it back to plaintext. Non-encrypted inodes skip
+    # this entirely and behave exactly as before.
+    if (ext4_inode_flags(&inode[0]) & EXT4_ENCRYPT_FL) != 0:
+        cslot: int32 = _ext4_fscrypt_find(cast[uint32](inum))
+        if cslot >= 0:
+            return _ext4_fscrypt_read(cast[uint32](inum), cslot,
+                                      &inode[0], pos, count, buf)
 
     total: uint64 = 0
     while total < count:
@@ -14084,4 +14110,540 @@ def ext4_verity_selftest() -> int32:
         printk0("[ext4-verity] PASS\n")
     else:
         printk0("[ext4-verity] FAIL\n")
+    return 0
+
+
+# =========================================================================
+# ext4 fscrypt — per-file CONTENT encryption at rest via AES-256-XTS
+# (Linux fs/crypto/ + the ext4 EXT4_ENCRYPT_FL inode flag)
+# =========================================================================
+#
+# fscrypt gives a regular file transparent content confidentiality: every
+# data block is stored ENCRYPTED on the backing device and decrypted only on
+# read. This is the CONFIDENTIALITY analogue of fs-verity's read-path
+# interception (which gives INTEGRITY): both gate on a per-inode flag and a
+# per-inode in-core context, route the data path through a crypto transform,
+# and behave exactly as before for unflagged inodes.
+#
+# CRYPTO (reuses the EXACT AES-256-XTS proven by dm-crypt, fs/aes_xts.ad —
+# the same cipher Linux fscrypt uses for file contents):
+#   * Each ext4 DATA BLOCK is one XTS "data unit". The XTS tweak/data-unit
+#     index is the file LOGICAL BLOCK NUMBER (Linux fscrypt's per-file
+#     IV_INO_LBLK default uses the logical block as the IV). Two different
+#     logical blocks therefore encrypt identical plaintext to DIFFERENT
+#     ciphertext, and every block is independently seekable.
+#   * The per-file 64-byte XTS content key (32-byte data key || 32-byte tweak
+#     key) is DERIVED from a 32-byte master key with a real HKDF-SHA256
+#     (RFC 5869) expand step keyed by the inode number, mirroring how Linux
+#     fscrypt derives per-file keys from the master key with HKDF-SHA512.
+#     The derived key is genuinely one-way from the master (NOT a memcpy):
+#     recovering it requires the master key.
+#
+# REPRESENTATION: the derived content key, the file size and block count are
+# pinned in a small per-inode in-core registry (ext4_fscrypt_ctxs), keyed by
+# inode number, populated at policy-set time. EXT4_ENCRYPT_FL is set on the
+# on-disk inode so the read path knows to decrypt.
+#
+# WRITE: ext4_fscrypt_write_block(ctx, lblk, plaintext) XTS-encrypts the
+#   block (tweak = lblk) under the content key and writes the CIPHERTEXT to
+#   the backing device — the on-disk bytes are NOT the plaintext.
+# READ: _ext4_fscrypt_read routes an EXT4_ENCRYPT_FL inode through a decrypt
+#   step that XTS-decrypts each block (same key + tweak) back to plaintext.
+
+EXT4_FSCRYPT_MAX:     uint64 = 4       # fscrypt contexts system-wide
+EXT4_FSCRYPT_KEYLEN:  uint64 = 64      # AES-256-XTS key: 32 data + 32 tweak
+EXT4_FSCRYPT_MKLEN:   uint64 = 32      # master-key length (bytes)
+
+
+class Ext4FscryptContext:
+    used:        uint32
+    pad:         uint32
+    inum:        uint32                  # inode this key encrypts
+    pad2:        uint32
+    block_size:  uint64                  # crypto data unit = ext4 data block
+    nblocks:     uint64                  # number of data blocks covered
+    file_size:   uint64                  # i_size pinned at policy-set time
+    # The per-file derived 64-byte AES-256-XTS content key (data||tweak).
+    key:         Array[64, uint8]
+
+
+ext4_fscrypt_ctxs: Array[4, Ext4FscryptContext]
+
+# Block-sized scratch for the fscrypt path. All fscrypt work is synchronous
+# (single ext4 mount, single thread through the block layer), so a single
+# shared set of working buffers is safe — no two transforms overlap. Both
+# buffers are 4096 = the largest ext4 block, so a worst-case data block fits
+# WITHOUT overflowing into the next module-scope global.
+_ext4_fscr_block:  Array[4096, uint8]   # one data block (plain or cipher)
+_ext4_fscr_stage:  Array[4096, uint8]   # XTS staging (cipher <-> plain)
+
+# HMAC-SHA256 scratch for the HKDF key-derivation (RFC 2104 / RFC 5869).
+# SHA-256 block size is 64 bytes; the master key (32) fits in one block, so
+# the padded key buffers are 64 bytes. The HKDF info string plus a 1-byte
+# counter plus a 32-byte T(prev) is small; 128 bytes covers the largest HMAC
+# message staged here WITHOUT overflowing into the next global.
+_ext4_fscr_kpad:   Array[64, uint8]     # padded HMAC key (K0)
+_ext4_fscr_ipad:   Array[128, uint8]    # ipad-key || message
+_ext4_fscr_opad:   Array[128, uint8]    # opad-key || inner-hash
+_ext4_fscr_inner:  Array[32, uint8]     # inner SHA-256 digest
+_ext4_fscr_tprev:  Array[32, uint8]     # HKDF T(i-1) feedback
+
+
+def _ext4_fscrypt_find(inum: uint32) -> int32:
+    # Return the fscrypt-context slot holding the content key for `inum`,
+    # or -1.
+    i: uint64 = 0
+    while i < EXT4_FSCRYPT_MAX:
+        if ext4_fscrypt_ctxs[i].used != 0 \
+           and ext4_fscrypt_ctxs[i].inum == inum:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _ext4_fscrypt_alloc() -> int32:
+    # Return a free fscrypt-context slot, or -1 if all are in use.
+    i: uint64 = 0
+    while i < EXT4_FSCRYPT_MAX:
+        if ext4_fscrypt_ctxs[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _ext4_hmac_sha256(key: Ptr[uint8], klen: uint64,
+                      msg: Ptr[uint8], mlen: uint64,
+                      out_mac: Ptr[uint8]):
+    # HMAC-SHA256 (RFC 2104): out = H((K0 ^ opad) || H((K0 ^ ipad) || msg)).
+    # K0 is the key zero-padded to the 64-byte SHA-256 block (keys longer
+    # than 64 bytes are first hashed; here klen <= 32 so that branch is
+    # never needed, but we honour the longer-key rule for correctness).
+    bs: uint64 = 64
+    # Build K0 in _ext4_fscr_kpad.
+    z: uint64 = 0
+    while z < bs:
+        _ext4_fscr_kpad[z] = 0
+        z = z + 1
+    if klen > bs:
+        sha256_oneshot(key, klen, cast[Ptr[uint8]](&_ext4_fscr_kpad[0]))
+    else:
+        c0: uint64 = 0
+        while c0 < klen:
+            _ext4_fscr_kpad[c0] = key[c0]
+            c0 = c0 + 1
+    # inner = (K0 ^ ipad) || msg
+    i: uint64 = 0
+    while i < bs:
+        _ext4_fscr_ipad[i] = _ext4_fscr_kpad[i] ^ 0x36
+        i = i + 1
+    j: uint64 = 0
+    while j < mlen:
+        _ext4_fscr_ipad[bs + j] = msg[j]
+        j = j + 1
+    sha256_oneshot(cast[Ptr[uint8]](&_ext4_fscr_ipad[0]), bs + mlen,
+                   cast[Ptr[uint8]](&_ext4_fscr_inner[0]))
+    # outer = (K0 ^ opad) || inner
+    i = 0
+    while i < bs:
+        _ext4_fscr_opad[i] = _ext4_fscr_kpad[i] ^ 0x5C
+        i = i + 1
+    k: uint64 = 0
+    while k < 32:
+        _ext4_fscr_opad[bs + k] = _ext4_fscr_inner[k]
+        k = k + 1
+    sha256_oneshot(cast[Ptr[uint8]](&_ext4_fscr_opad[0]), bs + 32, out_mac)
+
+
+def _ext4_fscrypt_derive_key(master: Ptr[uint8], inum: uint32,
+                             out_key: Ptr[uint8]):
+    # Derive the per-file 64-byte AES-256-XTS content key from the 32-byte
+    # master key using HKDF-Expand (RFC 5869) with HMAC-SHA256, keyed by the
+    # inode number — mirroring Linux fscrypt's per-file key derivation from a
+    # master key. PRK = master key. For each 32-byte output block:
+    #   T(n) = HMAC(PRK, T(n-1) || info || n), info = "ext4fscrypt" || inum.
+    # 64 bytes need two HMAC blocks (T(1), T(2)). The derived key is genuinely
+    # one-way from the master (recovering it requires the master key) — NOT a
+    # memcpy of the master.
+    info: Array[19, uint8]               # "ext4fscrypt"(11) + inum(4) + ctr(1) [+slack]
+    # The fixed 11-byte HKDF info label "ext4fscrypt" (ASCII), set byte by
+    # byte to avoid relying on string-literal subscripting.
+    info[0]  = 101                       # 'e'
+    info[1]  = 120                       # 'x'
+    info[2]  = 116                       # 't'
+    info[3]  = 52                        # '4'
+    info[4]  = 102                       # 'f'
+    info[5]  = 115                       # 's'
+    info[6]  = 99                        # 'c'
+    info[7]  = 114                       # 'r'
+    info[8]  = 121                       # 'y'
+    info[9]  = 112                       # 'p'
+    info[10] = 116                       # 't'
+    info[11] = cast[uint8](inum & 0xFF)
+    info[12] = cast[uint8]((inum >> 8) & 0xFF)
+    info[13] = cast[uint8]((inum >> 16) & 0xFF)
+    info[14] = cast[uint8]((inum >> 24) & 0xFF)
+    # HKDF-Expand: produce 64 bytes as T(1)||T(2).
+    n: uint64 = 1
+    produced: uint64 = 0
+    while produced < EXT4_FSCRYPT_KEYLEN:
+        # Stage the HMAC message: T(prev) (only for n>1) || info(15) || n.
+        mlen: uint64 = 0
+        if n > 1:
+            p: uint64 = 0
+            while p < 32:
+                _ext4_fscr_stage[mlen] = _ext4_fscr_tprev[p]
+                mlen = mlen + 1
+                p = p + 1
+        q: uint64 = 0
+        while q < 15:
+            _ext4_fscr_stage[mlen] = info[q]
+            mlen = mlen + 1
+            q = q + 1
+        _ext4_fscr_stage[mlen] = cast[uint8](n & 0xFF)
+        mlen = mlen + 1
+        _ext4_hmac_sha256(master, EXT4_FSCRYPT_MKLEN,
+                          cast[Ptr[uint8]](&_ext4_fscr_stage[0]), mlen,
+                          cast[Ptr[uint8]](&_ext4_fscr_tprev[0]))
+        c: uint64 = 0
+        while c < 32 and produced < EXT4_FSCRYPT_KEYLEN:
+            out_key[produced] = _ext4_fscr_tprev[c]
+            produced = produced + 1
+            c = c + 1
+        n = n + 1
+
+
+def ext4_fscrypt_set_policy(inum: uint32, master: Ptr[uint8]) -> int32:
+    # Register an fscrypt encryption policy on the regular file at `inum`:
+    # derive its per-file AES-256-XTS content key from the master key, pin it
+    # in a registry slot, and set EXT4_ENCRYPT_FL on the on-disk inode so the
+    # read path decrypts. Returns 0 on success, negative on error.
+    if ext4_blockdev_slot < 0:
+        return -1
+    if _ext4_fscrypt_find(inum) >= 0:
+        return -1                            # already has a policy
+    inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
+        return -1
+    # fscrypt is for regular files only.
+    if (cast[uint32](ext4_inode_mode(&inode[0])) & 0xF000) != 0x8000:
+        return -1
+    size: uint64 = cast[uint64](ext4_inode_size_lo(&inode[0]))
+    bs: uint64 = ext4_block_size
+    if bs == 0 or bs > 4096:
+        return -1
+    nblocks: uint64 = (size + bs - 1) / bs
+
+    slot: int32 = _ext4_fscrypt_alloc()
+    if slot < 0:
+        return -1
+
+    _ext4_fscrypt_derive_key(master, inum,
+                             cast[Ptr[uint8]](&ext4_fscrypt_ctxs[slot].key[0]))
+    ext4_fscrypt_ctxs[slot].inum = inum
+    ext4_fscrypt_ctxs[slot].block_size = bs
+    ext4_fscrypt_ctxs[slot].nblocks = nblocks
+    ext4_fscrypt_ctxs[slot].file_size = size
+    ext4_fscrypt_ctxs[slot].used = 1
+
+    # Set EXT4_ENCRYPT_FL on the on-disk inode so the read path decrypts.
+    cur_flags: uint32 = ext4_inode_flags(&inode[0])
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&inode[0])
+                                     + INODE_I_FLAGS_OFFSET),
+                    cur_flags | EXT4_ENCRYPT_FL)
+    if ext4_write_inode(cast[uint64](inum), &inode[0]) != 0:
+        ext4_fscrypt_ctxs[slot].used = 0
+        return -1
+    return 0
+
+
+def ext4_fscrypt_write_block(slot: int32, lblk: uint64, phys: uint64,
+                             plaintext: Ptr[uint8]) -> int32:
+    # Encrypt one ext4 data block (`plaintext`, block_size bytes) with
+    # AES-256-XTS under the file's content key, using the file LOGICAL BLOCK
+    # NUMBER (`lblk`) as the XTS tweak/data-unit index, then write the
+    # CIPHERTEXT to physical block `phys`. The plaintext NEVER reaches the
+    # backing device. Returns 0 on success, negative on error.
+    if slot < 0:
+        return -1
+    bs: uint64 = ext4_fscrypt_ctxs[slot].block_size
+    aes_xts_set_key(cast[Ptr[uint8]](&ext4_fscrypt_ctxs[slot].key[0]))
+    aes_xts_encrypt_unit(lblk, bs,
+                         cast[Ptr[uint8]](&_ext4_fscr_stage[0]), plaintext)
+    return _ext4_write_block(phys, &_ext4_fscr_stage[0])
+
+
+def _ext4_fscrypt_read(inum: uint32, slot: int32, inode_buf: Ptr[uint8],
+                       pos: uint64, count: uint64, buf: Ptr[uint8]) -> int64:
+    # Decrypting read of `count` bytes at `pos` from an fscrypt-enabled file.
+    # For each ext4 block the request spans, read the WHOLE ciphertext block
+    # off disk, AES-256-XTS-decrypt it (tweak = logical block number) under
+    # the file's content key, and copy out the requested slice. `count`/`pos`
+    # are already clamped to EOF by the caller.
+    bs: uint64 = ext4_fscrypt_ctxs[slot].block_size
+    aes_xts_set_key(cast[Ptr[uint8]](&ext4_fscrypt_ctxs[slot].key[0]))
+    total: uint64 = 0
+    while total < count:
+        cur_off: uint64 = pos + total
+        logical_blk: uint64 = cur_off / bs
+        off_in_blk:  uint64 = cur_off % bs
+        phys_blk: uint64 = _ext4_logical_to_physical(inode_buf, logical_blk)
+        if phys_blk == 0:
+            return cast[int64](total)
+        if _ext4_read_block(phys_blk, &_ext4_fscr_stage[0]) != 0:
+            return cast[int64](total)
+        # XTS-decrypt the ciphertext block into the plaintext block buffer.
+        aes_xts_decrypt_unit(logical_blk, bs,
+                             cast[Ptr[uint8]](&_ext4_fscr_block[0]),
+                             cast[Ptr[uint8]](&_ext4_fscr_stage[0]))
+        chunk: uint64 = bs - off_in_blk
+        if chunk > count - total:
+            chunk = count - total
+        memcpy(cast[Ptr[uint8]](cast[uint64](buf) + total),
+               cast[Ptr[uint8]](cast[uint64](&_ext4_fscr_block[0])
+                                + off_in_blk),
+               chunk)
+        total = total + chunk
+    return cast[int64](total)
+
+
+# --- ext4 fscrypt self-test --------------------------------------------
+#
+# Gated on the cpio marker /etc/ext4-fscrypt-test (planted exclusively by
+# scripts/test_ext4_fscrypt.sh / ENABLE_EXT4_FSCRYPT_TEST=1). Builds a REAL
+# multi-block file on the live ext4 mount, sets an fscrypt policy, writes a
+# known plaintext ENCRYPTED to disk, then proves with real AES-256-XTS:
+#   (a) the file reads back byte-identical through the decrypt path;
+#   (b) the RAW on-disk block (read beneath the encryption layer) is genuine
+#       CIPHERTEXT, NOT the plaintext;
+#   (c) two different logical blocks with identical plaintext produce
+#       DIFFERENT ciphertext (the XTS tweak = block number is applied);
+#   (d) decrypting with the WRONG key yields garbage, not the plaintext.
+# Each step prints a [ext4-fscrypt] line; a final [ext4-fscrypt] PASS only if
+# every step passed.
+
+EXT4_FSCRYPT_TEST_BLOCKS: uint64 = 4        # multi-block test file
+ext4_fscrypt_test_buf:  Array[4096, uint8]  # per-block build/compare scratch
+ext4_fscrypt_test_disk: Array[4096, uint8]  # raw on-disk ciphertext scratch
+ext4_fscrypt_test_dec:  Array[4096, uint8]  # wrong-key decrypt scratch
+ext4_fscrypt_test_phys: Array[8, uint64]    # physical block of each lblk
+ext4_fscrypt_test_mk:   Array[32, uint8]    # the test master key
+ext4_fscrypt_test_wk:   Array[64, uint8]    # a deliberately-wrong XTS key
+
+
+def _ext4_fscrypt_test_byte(off: uint64) -> uint8:
+    # Deterministic plaintext pattern that is IDENTICAL for every logical
+    # block (no lblk term), so subcheck (c) can prove the XTS tweak alone
+    # makes two blocks' ciphertext differ.
+    v: uint64 = (off * 12345) + 7
+    return cast[uint8]((v >> 3) & 0xFF)
+
+
+def ext4_fscrypt_selftest() -> int32:
+    if ext4_blockdev_slot < 0:
+        printk0("[ext4-fscrypt] FAIL: ext4 not mounted\n")
+        return -1
+    printk1("[ext4-fscrypt] block_size=%d\n", ext4_block_size)
+    bs: uint64 = ext4_block_size
+    nb: uint64 = EXT4_FSCRYPT_TEST_BLOCKS
+
+    # Pin a non-trivial master key for the test.
+    mi: uint64 = 0
+    while mi < 32:
+        ext4_fscrypt_test_mk[mi] = cast[uint8]((mi * 37 + 11) & 0xFF)
+        mi = mi + 1
+
+    ok_all: int32 = 1
+
+    # Reserve the registry slot + derive the per-file key BEFORE building the
+    # file, so the file builder can encrypt each block as it writes it. We
+    # create the file first to get an inum, then set the policy, then (since
+    # the file has no data yet) the make-file path encrypts using the slot.
+    # To keep the build-then-encrypt order simple we: alloc inum via make,
+    # but make needs the slot. So set the policy on a zero-length file first.
+    inum: uint32 = ext4_alloc_inode()
+    if inum == 0:
+        printk0("[ext4-fscrypt] FAIL: alloc inode\n")
+        return -1
+    # Stamp a minimal empty regular file so set_policy accepts it.
+    pp: Ptr[uint8] = &ext4_new_inode_buf[0]
+    _ext4_zero(pp, ext4_inode_size)
+    _ext4_write_u16(pp, 0x81B4)
+    _ext4_inode_stamp_creator(pp)
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](pp) + 4), 0)
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](pp) + 26), 1)
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](pp) + 28), 0)
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](pp) + 32), 0x80000)
+    ehp: uint64 = cast[uint64](pp) + INODE_I_BLOCK_OFFSET
+    _ext4_write_u16(cast[Ptr[uint8]](ehp + 0), EXT4_EXTENT_MAGIC)
+    _ext4_write_u16(cast[Ptr[uint8]](ehp + 2), 0)
+    _ext4_write_u16(cast[Ptr[uint8]](ehp + 4), 4)
+    _ext4_write_u16(cast[Ptr[uint8]](ehp + 6), 0)
+    _ext4_stamp_all_times(pp)
+    if ext4_write_inode(cast[uint64](inum), pp) != 0:
+        printk0("[ext4-fscrypt] FAIL: write empty inode\n")
+        return -1
+    if ext4_dir_insert(2, "fscrypt.bin", inum, 1) != 0:
+        printk0("[ext4-fscrypt] FAIL: link test file\n")
+        return -1
+
+    # Set the fscrypt policy: derive the content key + set EXT4_ENCRYPT_FL.
+    if ext4_fscrypt_set_policy(inum, &ext4_fscrypt_test_mk[0]) != 0:
+        printk0("[ext4-fscrypt] FAIL: set policy\n")
+        return -1
+    cslot: int32 = _ext4_fscrypt_find(inum)
+    if cslot < 0:
+        printk0("[ext4-fscrypt] FAIL: policy left no context\n")
+        return -1
+    printk0("[ext4-fscrypt] PASS set-policy (per-file AES-256-XTS key " \
+            "derived via HKDF-SHA256)\n")
+
+    # Confirm EXT4_ENCRYPT_FL is now set on disk.
+    cino: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &cino[0]) != 0 \
+       or (ext4_inode_flags(&cino[0]) & EXT4_ENCRYPT_FL) == 0:
+        printk0("[ext4-fscrypt] FAIL: EXT4_ENCRYPT_FL not set on inode\n")
+        ok_all = 0
+    else:
+        printk0("[ext4-fscrypt] PASS flag (EXT4_ENCRYPT_FL set on inode)\n")
+
+    # Now append the data blocks, encrypting each with the file's key. The
+    # plaintext is identical for every block.
+    if ext4_read_inode(cast[uint64](inum), &cino[0]) != 0:
+        printk0("[ext4-fscrypt] FAIL: re-read inode for data append\n")
+        return -1
+    lb: uint64 = 0
+    while lb < nb:
+        db: uint64 = ext4_alloc_block()
+        if db == 0:
+            printk0("[ext4-fscrypt] FAIL: alloc data block\n")
+            return -1
+        ext4_fscrypt_test_phys[lb] = db
+        o: uint64 = 0
+        while o < bs:
+            ext4_fscrypt_test_buf[o] = _ext4_fscrypt_test_byte(o)
+            o = o + 1
+        if ext4_fscrypt_write_block(cslot, lb, db,
+                                    &ext4_fscrypt_test_buf[0]) != 0:
+            printk0("[ext4-fscrypt] FAIL: encrypt+write block\n")
+            return -1
+        if _ext4_extent_append_block(&cino[0], lb, db) != 0:
+            printk0("[ext4-fscrypt] FAIL: extent append\n")
+            return -1
+        lb = lb + 1
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&cino[0]) + 4),
+                    cast[uint32](nb * bs))
+    if ext4_write_inode(cast[uint64](inum), &cino[0]) != 0:
+        printk0("[ext4-fscrypt] FAIL: commit i_size\n")
+        return -1
+    # Refresh the context's block count now the file has data.
+    ext4_fscrypt_ctxs[cslot].nblocks = nb
+    ext4_fscrypt_ctxs[cslot].file_size = nb * bs
+    printk2("[ext4-fscrypt] built %d-block encrypted file inum=%d\n", nb,
+            cast[uint64](inum))
+
+    # (a) read back byte-identical through the decrypt path.
+    clean_ok: int32 = 1
+    cb: uint64 = 0
+    while cb < nb:
+        rn: int64 = ext4_read_file(inum, cb * bs, bs,
+                                   &ext4_fscrypt_test_buf[0])
+        if rn != cast[int64](bs):
+            printk1("[ext4-fscrypt] FAIL: short decrypted read lblk=%d\n", cb)
+            clean_ok = 0
+            cb = nb
+        else:
+            o2: uint64 = 0
+            while o2 < bs:
+                if ext4_fscrypt_test_buf[o2] != _ext4_fscrypt_test_byte(o2):
+                    printk2("[ext4-fscrypt] FAIL: plaintext mismatch " \
+                            "lblk=%d off=%d\n", cb, o2)
+                    clean_ok = 0
+                    o2 = bs
+                else:
+                    o2 = o2 + 1
+            cb = cb + 1
+    if clean_ok != 0:
+        printk0("[ext4-fscrypt] PASS decrypt-roundtrip " \
+                "(reads back byte-identical plaintext)\n")
+    else:
+        ok_all = 0
+
+    # (b) the RAW on-disk block is genuine CIPHERTEXT, NOT plaintext.
+    cipher_ok: int32 = 1
+    if _ext4_read_block(ext4_fscrypt_test_phys[0],
+                        &ext4_fscrypt_test_disk[0]) != 0:
+        printk0("[ext4-fscrypt] FAIL: read raw on-disk block\n")
+        ok_all = 0
+        cipher_ok = 0
+    else:
+        same: int32 = 1
+        differ: uint64 = 0
+        o3: uint64 = 0
+        while o3 < bs:
+            if ext4_fscrypt_test_disk[o3] != _ext4_fscrypt_test_byte(o3):
+                same = 0
+                differ = differ + 1
+            o3 = o3 + 1
+        if same != 0:
+            printk0("[ext4-fscrypt] FAIL: on-disk block equals plaintext " \
+                    "(not encrypted!)\n")
+            ok_all = 0
+            cipher_ok = 0
+        else:
+            printk1("[ext4-fscrypt] PASS on-disk-ciphertext " \
+                    "(raw block != plaintext, %d bytes differ)\n", differ)
+
+    # (c) two logical blocks with IDENTICAL plaintext produce DIFFERENT
+    # ciphertext (the XTS tweak = logical block number is genuinely applied).
+    if cipher_ok != 0 and nb >= 2:
+        if _ext4_read_block(ext4_fscrypt_test_phys[1],
+                            &ext4_fscrypt_test_dec[0]) != 0:
+            printk0("[ext4-fscrypt] FAIL: read second on-disk block\n")
+            ok_all = 0
+        else:
+            blk_same: int32 = 1
+            o4: uint64 = 0
+            while o4 < bs:
+                if ext4_fscrypt_test_disk[o4] != ext4_fscrypt_test_dec[o4]:
+                    blk_same = 0
+                    o4 = bs
+                else:
+                    o4 = o4 + 1
+            if blk_same != 0:
+                printk0("[ext4-fscrypt] FAIL: identical plaintext encrypted " \
+                        "to identical ciphertext (tweak not applied!)\n")
+                ok_all = 0
+            else:
+                printk0("[ext4-fscrypt] PASS tweak-differs " \
+                        "(same plaintext, different blocks -> different " \
+                        "ciphertext)\n")
+
+    # (d) decrypting with the WRONG key yields garbage, not the plaintext.
+    wi: uint64 = 0
+    while wi < 64:
+        ext4_fscrypt_test_wk[wi] = cast[uint8]((wi * 53 + 99) & 0xFF)
+        wi = wi + 1
+    aes_xts_set_key(cast[Ptr[uint8]](&ext4_fscrypt_test_wk[0]))
+    aes_xts_decrypt_unit(0, bs,
+                         cast[Ptr[uint8]](&ext4_fscrypt_test_dec[0]),
+                         cast[Ptr[uint8]](&ext4_fscrypt_test_disk[0]))
+    wrong_matches: int32 = 1
+    o5: uint64 = 0
+    while o5 < bs:
+        if ext4_fscrypt_test_dec[o5] != _ext4_fscrypt_test_byte(o5):
+            wrong_matches = 0
+            o5 = bs
+        else:
+            o5 = o5 + 1
+    if wrong_matches != 0:
+        printk0("[ext4-fscrypt] FAIL: wrong key recovered the plaintext!\n")
+        ok_all = 0
+    else:
+        printk0("[ext4-fscrypt] PASS wrong-key " \
+                "(decrypting with a different key yields garbage)\n")
+
+    if ok_all != 0:
+        printk0("[ext4-fscrypt] PASS\n")
+    else:
+        printk0("[ext4-fscrypt] FAIL\n")
     return 0
