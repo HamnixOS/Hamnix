@@ -158,36 +158,19 @@ qemu-system-x86_64 \
     <&4 > "$STAGE_B_LOG" 2>&1 &
 QEMU_B_PID=$!
 
-echo "[test_installer_nvme_inram] Stage B: waiting up to ${BOOT_TIMEOUT}s for installer shell prompt..."
-booted=0
-for _ in $(seq 1 "$BOOT_TIMEOUT"); do
-    if grep -a -q "$PROMPT_MARKER" "$STAGE_B_LOG"; then booted=1; break; fi
-    if ! kill -0 "$QEMU_B_PID" 2>/dev/null; then
-        echo "[test_installer_nvme_inram] FAIL Stage B: qemu exited before the installer shell." >&2
-        tail -80 "$STAGE_B_LOG" >&2
-        exit 1
-    fi
-    sleep 1
-done
-if [ "$booted" -ne 1 ]; then
-    echo "[test_installer_nvme_inram] FAIL Stage B: installer shell prompt not seen in ${BOOT_TIMEOUT}s." >&2
-    tail -80 "$STAGE_B_LOG" >&2
-    exit 1
-fi
-echo "[test_installer_nvme_inram] Stage B: installer shell ready; driving the NVMe installer."
-sleep 6
-
-type_b() { printf '%s\n' "$1" >&3; sleep "${2:-4}"; }
-
-# Confirm the native NVMe block device is live before installing.
-type_b "cat /dev/blk/nvme0n1/size" 4
-# Kick off the installer; poll for its own completion marker (the stream
-# of a ~512 MiB ext4 payload out of the in-RAM squashfs is slow under
-# TCG/KVM, so we DON'T use a fixed sleep).
-type_b "hamsh /etc/install_nvme.hamsh" 2
+# The installer now AUTO-RUNS at boot. /etc/rc.boot detects the
+# /etc/installer-medium marker and sources /etc/install_nvme.hamsh ITSELF
+# (the real NUC target has no keyboard, so nothing can type the command).
+# So there is no "type the installer at a prompt" step anymore, and the
+# installer branch of rc.boot never sources rc.boot.full — the
+# PROMPT_MARKER ("handing off to interactive shell") is NOT printed on the
+# installer medium. We just boot and poll for the installer's own
+# completion marker. The boot + a ~512 MiB ext4 stream out of the in-RAM
+# squashfs is slow under TCG/KVM, so the budget folds boot into the wait.
 INSTALL_WAIT="${INSTALL_WAIT:-400}"
+echo "[test_installer_nvme_inram] Stage B: booting installer medium; waiting up to $((BOOT_TIMEOUT + INSTALL_WAIT))s for the auto-run installer to finish..."
 installed=0
-for _ in $(seq 1 "$INSTALL_WAIT"); do
+for _ in $(seq 1 $((BOOT_TIMEOUT + INSTALL_WAIT))); do
     if grep -a -q '\[install-nvme\] install complete on /dev/blk/nvme0n1' "$STAGE_B_LOG"; then
         installed=1; break
     fi
@@ -221,7 +204,10 @@ check_b() {
     fi
 }
 check_b "$KERNEL_BANNER" "installer media: kernel banner (EFI stub -> kernel)"
-check_b "$PROMPT_MARKER" "installer media: reached installer shell (in-RAM)"
+# rc.boot auto-detected the installer medium and started the installer
+# itself (no keyboard needed) — this is the keyboard-less auto-run gate.
+check_b 'installer medium detected -- auto-running' \
+        "rc.boot auto-ran the installer (no keyboard)"
 # The installer medium marker made the kernel skip ALL media USB bring-up.
 check_b 'installer medium .in-RAM squashfs.: USB root bring-up SKIPPED entirely' \
         "kernel skipped media USB bring-up (in-RAM installer medium)"

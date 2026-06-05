@@ -63,10 +63,37 @@ echo 'rc.boot: device binds applied'
 #     carries the full toolset, so the shell still has commands.
 # The `source` runs in THIS hamsh process (PID 1), so every bind/`=` in
 # the full rc persists into the interactive shell's namespace.
+# --- installer medium: AUTO-RUN the in-RAM NVMe installer -----------
+# The in-RAM-squashfs install medium carries /etc/installer-medium in the
+# cpio (planted ONLY by scripts/build_installer_img.sh). On that medium the
+# whole boot exists to run /etc/install_nvme.hamsh, and the real NUC target
+# has NO working keyboard — so the installer MUST start itself; there is no
+# one to type it. `cat` exits nonzero when the marker is absent (every
+# normal/installed boot), so try/except falls straight through to the
+# regular sysroot hand-off. When the marker IS present we source the
+# installer and STOP — we never mount a sysroot partition or run the full
+# rc, because the installer owns the box and writes the NVMe target raw.
+# hamsh try/except reacts ONLY to the LAST command in the try block, so the
+# existence probe MUST be the sole command in its own try. We set a flag and
+# branch with `if` — folding the probe and the action into one try block would
+# make the INSTALLED system (marker absent, `cat` fails) still run the action
+# and re-partition its own boot disk (a self-wipe loop).
+installer_medium = 1
 try {
-    bind '#sysroot' /
-    echo 'rc.boot: sysroot partition mounted at /'
+    cat /etc/installer-medium
 } except {
-    echo 'rc.boot: no sysroot partition (#sysroot absent) -- cpio fallback'
+    installer_medium = 0
 }
-source /etc/rc.boot.full
+if $installer_medium > 0 {
+    echo 'rc.boot: installer medium detected -- auto-running /etc/install_nvme.hamsh'
+    source /etc/install_nvme.hamsh
+} else {
+    # --- normal boot: mount the sysroot subtree at / ----------------
+    try {
+        bind '#sysroot' /
+        echo 'rc.boot: sysroot partition mounted at /'
+    } except {
+        echo 'rc.boot: no sysroot partition (#sysroot absent) -- cpio fallback'
+    }
+    source /etc/rc.boot.full
+}
