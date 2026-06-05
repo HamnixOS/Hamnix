@@ -2388,6 +2388,22 @@ if os.environ.get("ENABLE_WIREGUARD_TEST") == "1":
 if os.environ.get("ENABLE_IPSEC_TEST") == "1":
     FILES.append(("/etc/ipsec-test", b"1\n"))
 
+# Native SCTP (Stream Control Transmission Protocol, RFC 4960) self-test.
+# scripts/test_sctp.sh sets ENABLE_SCTP_TEST=1 to plant /etc/sctp-test;
+# init/main.ad's boot:37.sctp gate then runs sctp_selftest() (drivers/net/
+# sctp.ad), a pure in-memory two-endpoint test that drives the full 4-way
+# association handshake (INIT -> INIT ACK with a State Cookie -> COOKIE ECHO ->
+# COOKIE ACK) carrying + verifying the per-direction Verification Tags, then
+# proves reliable in-order DATA delivery on a stream (TSN/SID/SSN DATA chunks
+# reassembled byte-identically, an out-of-order arrival buffered and released
+# in stream order, a SACK reporting the missing TSN as a gap-ack block, and a
+# retransmit closing the gap + advancing the Cumulative TSN Ack), and the
+# security properties (a wrong Verification Tag rejected, a corrupted packet
+# failing the CRC32c per RFC 3309, reusing fs/crc32c.ad). Prints "[sctp] PASS"
+# / "[sctp] FAIL". Default boots ship no marker.
+if os.environ.get("ENABLE_SCTP_TEST") == "1":
+    FILES.append(("/etc/sctp-test", b"1\n"))
+
 # Native L2TPv3 (RFC 3931) Ethernet-pseudowire encap/decap self-test.
 # scripts/test_l2tp.sh sets ENABLE_L2TP_TEST=1 to plant /etc/l2tp-test;
 # init/main.ad's boot:37.l2tp gate then runs l2tp_selftest()
