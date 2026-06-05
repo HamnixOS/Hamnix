@@ -368,6 +368,13 @@ extern def syscall_entry()
 extern def enter_user_mode(entry: uint64, stack: uint64)
 extern def user_demo_entry()
 extern def local_irq_disable()
+# Nesting-safe IRQ mask used to make the fork/clone create+COW-share
+# critical section atomic w.r.t. timer preemption (see do_clone): the
+# child is STATE_READY out of create_user_task_argv but its address
+# space isn't COW-shared until after, so a preemption could dispatch it
+# onto an empty PML4.
+extern def local_irq_save() -> uint64
+extern def local_irq_restore(flags: uint64)
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def load_cr3(value: uint64)
@@ -1891,12 +1898,20 @@ def do_clone(flags: uint64, child_stack: uint64,
         # %r9 across the syscall and the child does `call *%r9` after
         # the syscall returns. Without preserving user_r9 here, the
         # child calls into NULL.
+        # RACE FIX: mask IRQs across create + PML4 share. The thread is
+        # STATE_READY out of create_user_thread but is still pointed at
+        # the fresh BSP-clone PML4 until set_task_cr3 below repoints it
+        # at the creator's address space. A preemption in between would
+        # dispatch the thread onto a PML4 that lacks its own user stack
+        # mapping -> fault. Hold IRQs off until the share is done.
+        _clone_irq: uint64 = local_irq_save()
         child_slot: int32 = create_user_thread(parent_user_rip,
                                                0x5f5f7468725f5f5f,    # "__thr___"
                                                child_stack, 0, 0,
                                                user_r9,
                                                user_rdx, user_r8)
         if child_slot < 0:
+            local_irq_restore(_clone_irq)
             set_current_errstr("clone: out of tasks")
             return cast[int64](-11)           # -EAGAIN
         # CLONE_VM: the thread SHARES the creator's address space, so
@@ -1907,6 +1922,11 @@ def do_clone(flags: uint64, child_stack: uint64,
         # in the creator's PML4 and the thread #UDs on its own stack.
         set_task_cr3(child_slot,
                      task_pml4(cast[int32](current_idx_get())))
+        # End of the PML4-critical window: the thread now points at the
+        # creator's complete address space, so the scheduler may safely
+        # dispatch it. Re-enable IRQs; the inheritance below tolerates
+        # preemption.
+        local_irq_restore(_clone_irq)
         # Inherit Linux-ABI mode (pthread_create only happens in
         # Linux user binaries; defensive against future native callers).
         if parent[0].is_linux_userspace != 0:
@@ -1985,10 +2005,19 @@ def do_clone(flags: uint64, child_stack: uint64,
     # into create_user_task_argv; the non-zero value tells it to skip
     # the fresh-stack allocation and plant our RSP into the iret frame.
     parent_idx: uint64 = current_idx_get()
+    # RACE FIX: mask IRQs across create + COW-share. create_user_task_argv
+    # marks the child STATE_READY, but its address space is not populated
+    # until vm_cow_share_all / vma_fork_copy below. A timer preemption in
+    # between would let _pick_next() dispatch the child onto its fresh
+    # (empty) PML4 -> wild jump. The COW helpers' own boot-CR3 IRQ
+    # save/restore nests safely under this mask (they save IF=0, restore
+    # it, leaving IRQs masked).
+    _fork_irq: uint64 = local_irq_save()
     slot: int32 = create_user_task_argv(parent_user_rip,
                                         0x5f5f666f726b5f5f,        # "__fork__"
                                         parent_user_rsp, 0, 0)
     if slot < 0:
+        local_irq_restore(_fork_irq)
         set_current_errstr("fork: out of tasks")
         return cast[int64](-11)               # -EAGAIN
     child_pml4: uint64 = task_pml4(slot)
@@ -2020,6 +2049,7 @@ def do_clone(flags: uint64, child_stack: uint64,
     if vm_cow_share_all(parent_pml4, child_pml4, img_lo, img_hi,
                         brk_lo, brk_mx, ust_lo, ust_sz,
                         parent_user_rsp) < 0:
+        local_irq_restore(_fork_irq)
         set_current_errstr("fork: address-space COW share OOM")
         return cast[int64](-12)               # -ENOMEM
 
@@ -2031,6 +2061,7 @@ def do_clone(flags: uint64, child_stack: uint64,
     # the child's own munmap / mremap stays honest. This makes the WHOLE
     # address space (image + brk + stack + mmap) copy-on-write on fork.
     if vma_fork_copy(cslot, parent_idx, child_pml4) < 0:
+        local_irq_restore(_fork_irq)
         set_current_errstr("fork: vma copy OOM")
         return cast[int64](-12)               # -ENOMEM
 
@@ -2042,6 +2073,12 @@ def do_clone(flags: uint64, child_stack: uint64,
     # vaddrs, so the cursors carry over unchanged. base/end track the
     # used heap; max bounds the reserved window.
     set_task_brk_range(cslot, brk_lo, task_brk_end(parent_idx), brk_mx)
+    # End of the create+COW critical section: the child's PML4 is fully
+    # populated (COW image/brk/stack + mmap VMAs). It is now safe for the
+    # scheduler to dispatch it; re-enable IRQs (restore caller's prior
+    # IF). The signal/fd/seccomp inheritance below only refines an
+    # already-runnable, address-space-complete child.
+    local_irq_restore(_fork_irq)
     printk1("fork: child pid=%d given a private address space\n",
             cast[int32](task_pid_at(slot)))
 
@@ -2733,11 +2770,21 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
             new_rsp = _build_user_argv(ustack_top,
                                        cast[uint64](&_exec_argv_ptrs[0]),
                                        &argc_out, &argv_out)
+        # RACE FIX: mask IRQs across create + user-vaddr/stack/vDSO
+        # mapping. create_user_task_argv marks the child STATE_READY, but
+        # its ET_EXEC image mapping + user stack PTEs aren't installed
+        # into the child PML4 until just below. A timer preemption in
+        # between would let _pick_next() dispatch the child onto a PML4
+        # missing its image/stack -> wild jump. Hold IRQs off until the
+        # mappings exist (the install helpers' boot-CR3 IRQ save/restore
+        # nests safely under this mask).
+        _spawn_irq: uint64 = local_irq_save()
         slot: int32 = create_user_task_argv(
             entry, 0x5f5f7370776e5f5f,         # "__spwn__"
             new_rsp, argc_out, argv_out,
         )
         if slot < 0:
+            local_irq_restore(_spawn_irq)
             set_current_errstr("spawn: out of tasks")
             return cast[uint64](-1)
         # Per-process address space: record the loaded image span +
@@ -2786,8 +2833,9 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # load_cr3 to its broken PML4, and freeze the box. Reap the slot
         # back to STATE_FREE first so the failure is clean + survivable.
         if elf_apply_last_user_mapping(task_pml4(slot)) < 0:
-            printk0("spawn: user-mapping install failed; task slot reaped\n")
             task_reap(slot)
+            local_irq_restore(_spawn_irq)
+            printk0("spawn: user-mapping install failed; task slot reaped\n")
             set_current_errstr("spawn: cannot map binary (kernel-image collision?)")
             return cast[uint64](-8)            # -ENOEXEC
         # M16.36: install per-task PT entries for the child's user
@@ -2797,8 +2845,9 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # PTEs at that point).
         if elf_install_user_stack(task_pml4(slot), ustack,
                                   LINUX_USTACK_SIZE) < 0:
-            printk0("spawn: user-stack install failed; task slot reaped\n")
             task_reap(slot)
+            local_irq_restore(_spawn_irq)
+            printk0("spawn: user-stack install failed; task slot reaped\n")
             set_current_errstr("spawn: cannot map stack")
             return cast[uint64](-12)           # -ENOMEM
         # #169 vDSO: map the shared vDSO ELF + time data page into the
@@ -2810,6 +2859,12 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # back to the syscall — so we don't reap the slot on it.
         if is_linux != 0:
             vdso_map_into_user(task_pml4(slot))
+        # End of the address-space-critical window: the child's image,
+        # user stack, and vDSO are now mapped into its PML4, so the
+        # scheduler may safely dispatch it. Re-enable IRQs (restoring the
+        # caller's prior IF); the fd/namespace/stdio wiring below only
+        # refines an already-runnable, mapped child.
+        local_irq_restore(_spawn_irq)
         # U5: SYS_SPAWN runs in the parent's context. If the loaded
         # image is a Linux-ABI ELF, flip is_linux_userspace on the
         # *child* slot (not current) so the new task's syscalls route

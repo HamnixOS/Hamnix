@@ -107,6 +107,12 @@ read_cr2:
     movq    %cr2, %rax
     ret
 
+    .align 16
+    .globl read_cr3
+read_cr3:
+    movq    %cr3, %rax
+    ret
+
 /* ---------- invlpg_one(va: uint64) ------------------------------- *
  *
  * Invalidate the TLB entry for a single page. After the COW handler

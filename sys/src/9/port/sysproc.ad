@@ -46,6 +46,7 @@ from kernel.sched.core import (
     set_task_detached, set_task_parent_pid,
 )
 from fs.elf import vm_cow_share_all
+from mm.cow import cow_boot_cr3
 from mm.vma import vma_fork_copy
 # task_table is module-private to core.ad; we need a per-slot read of
 # the saved kernel-stack pointer so we can patch the callee-saved
@@ -67,6 +68,23 @@ from sys.src.port9.port.chan import (
 )
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+# Nesting-safe IRQ mask: do_rfork creates the child STATE_READY (inside
+# create_user_task_argv) and only AFTERWARDS COW-shares its address
+# space (vm_cow_share_all / vma_fork_copy). A timer IRQ in that window
+# would let _pick_next() dispatch the child onto its fresh, un-shared
+# PML4 -> wild jump. Mask IRQs across the whole create+COW critical
+# section so the child is never dispatched before its mappings exist.
+extern def local_irq_save() -> uint64
+extern def local_irq_restore(flags: uint64)
+# Boot-CR3 guard primitives. The child's kstack frame is built (inside
+# create_user_task_argv) under the pristine boot CR3, but the rbp-slot
+# patch below runs back in the PARENT's context — whose low-RAM identity
+# map for the freshly-alloc'd kstack chunk may have been CRACKED/COW-
+# remapped by execve + ASLR. A kstack-physical-address write then lands
+# on the WRONG physical page (observed: child's iret SS slot clobbered to
+# 0x8000 -> #GP at the bootstrap iretq). Build the patch under boot CR3.
+extern def read_cr3() -> uint64
+extern def load_cr3(value: uint64)
 
 
 # RF* flag bits — numerically identical to 9front's <plan9/libc.h>
@@ -299,11 +317,18 @@ def _rfork_thread(f: uint64, child_stack: uint64, tls: uint64) -> int32:
     # user_r9/rdx/r8: the native rfork-thread ABI does not park a
     # worker function in a register (that is a musl/glibc __clone
     # detail); the child simply runs straight-line user code.
+    # RACE FIX: mask IRQs across create + PML4 share (see do_rfork's main
+    # path). The RFMEM thread is STATE_READY out of create_user_thread
+    # but still on the fresh BSP-clone PML4 until set_task_cr3 repoints it
+    # at the creator's address space; a preemption between would dispatch
+    # it onto a PML4 lacking its user mappings.
+    _rfthr_irq: uint64 = local_irq_save()
     slot: int32 = create_user_thread(parent_user_rip,
                                      0x5f5f72667468725f,    # "__rfthr_"
                                      child_stack, 0, 0,
                                      0, 0, 0)
     if slot < 0:
+        local_irq_restore(_rfthr_irq)
         set_current_errstr("rfork: out of tasks")
         return -11                              # -EAGAIN
 
@@ -313,6 +338,10 @@ def _rfork_thread(f: uint64, child_stack: uint64, tls: uint64) -> int32:
     # VMAs, multi-chunk large mappings) is visible to it. Identical to
     # do_clone's set_task_cr3 step.
     set_task_cr3(slot, task_pml4(cast[int32](current_idx_get())))
+    # End of the PML4-critical window: the thread now points at the
+    # creator's complete address space. Re-enable IRQs; the inheritance
+    # below tolerates preemption.
+    local_irq_restore(_rfthr_irq)
 
     # Inherit the ABI mode. Native rfork callers are is_linux_userspace
     # == 0; mirror defensively so a future Linux consumer of native
@@ -489,6 +518,14 @@ def do_rfork(flags: int32, child_stack: uint64, tls: uint64,
     # plant our RSP into the iret frame. _build_initial_kstack
     # zero-fills the rax slot, so the child sees a 0 return from
     # rfork().
+    # RACE FIX: mask IRQs across create + COW-share. The child is
+    # marked STATE_READY at the end of create_user_task_argv, but its
+    # address space is not COW-shared until vm_cow_share_all /
+    # vma_fork_copy below. A timer preemption in between would dispatch
+    # the child onto its fresh (empty) PML4. Hold IRQs off for the whole
+    # critical section; the COW helpers' own boot-CR3 IRQ save/restore
+    # nests safely (they save IF=0 and restore it, leaving IRQs masked).
+    _rfork_irq: uint64 = local_irq_save()
     slot: int32 = create_user_task_argv(
         parent_user_rip,
         0x5f5f72666f726b5f,                     # "__rfork_"
@@ -496,6 +533,7 @@ def do_rfork(flags: int32, child_stack: uint64, tls: uint64,
         0, 0,
     )
     if slot < 0:
+        local_irq_restore(_rfork_irq)
         set_current_errstr("rfork: out of tasks")
         return -11                              # -EAGAIN
     pidx: uint64 = current_idx_get()
@@ -521,6 +559,7 @@ def do_rfork(flags: int32, child_stack: uint64, tls: uint64,
                         task_brk_base(pidx), task_brk_max(pidx),
                         task_ustack_lo(pidx), task_ustack_sz(pidx),
                         parent_user_rsp) < 0:
+        local_irq_restore(_rfork_irq)
         set_current_errstr("rfork: address-space COW share OOM")
         return -12                              # -ENOMEM
     # Anonymous + file-backed mmap VMAs — COW-shared between parent and
@@ -528,6 +567,7 @@ def do_rfork(flags: int32, child_stack: uint64, tls: uint64,
     # faults and copies one page), same lazy scheme as the three fixed
     # regions above.
     if vma_fork_copy(cslot, pidx, child_pml4) < 0:
+        local_irq_restore(_rfork_irq)
         set_current_errstr("rfork: vma copy OOM")
         return -12                              # -ENOMEM
     # Propagate the address-space bookkeeping so a grandchild rfork
@@ -547,8 +587,23 @@ def do_rfork(flags: int32, child_stack: uint64, tls: uint64,
     # %rbp lives at sp + 40. The child's stack is a byte-for-byte
     # copy at the SAME virtual address, so user_rbp is already
     # correct for the child — no translation.
+    #
+    # child_sp is a RAW kstack-physical (identity) address. We are back
+    # on the PARENT's CR3 here (vm_cow_share_all restored it), whose
+    # low-RAM identity map for this kstack chunk may have been cracked /
+    # COW-remapped by the parent's own execve+ASLR — writing through it
+    # would corrupt an unrelated physical page (this is what clobbered
+    # the child's iret SS slot to 0x8000 -> #GP at the bootstrap iretq).
+    # Drop to the pristine boot CR3 (identity-maps ALL low RAM) for the
+    # single store, exactly like the _build_initial_kstack guard does.
     child_sp: uint64 = task_initial_sp(slot)
+    _rbp_live_cr3: uint64 = read_cr3()
+    _rbp_boot_cr3: uint64 = cow_boot_cr3()
+    if _rbp_boot_cr3 != 0:
+        load_cr3(_rbp_boot_cr3)
     cast[Ptr[uint64]](child_sp + 40)[0] = user_rbp
+    if _rbp_boot_cr3 != 0:
+        load_cr3(_rbp_live_cr3)
 
     # Inherit fs_base + Linux-ABI bit + vfork_done state from the
     # parent. Native rfork callers leave fs_base = 0, but defensive
@@ -586,6 +641,13 @@ def do_rfork(flags: int32, child_stack: uint64, tls: uint64,
     # of the WHOLE user stack, RFENVG is honoured for free. RFMEM would
     # have shared the address space (no copy) — already short-circuited
     # above with -ENOSYS.
+
+    # End of the create+COW critical section: the child's PML4 is fully
+    # populated (COW image/brk/stack + mmap VMAs), its initial kstack
+    # frame is patched, and its fd table / namespace / note group are
+    # inherited. It is now safe for the scheduler to dispatch it.
+    # Re-enable IRQs, restoring the caller's prior IF.
+    local_irq_restore(_rfork_irq)
 
     child_pid: uint64 = task_pid_at(slot)
     printk1("rfork: child created, pid=%d\n", cast[int32](child_pid))

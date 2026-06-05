@@ -270,6 +270,29 @@ local_irq_disable:
     cli
     ret
 
+/* ---------- local_irq_save / local_irq_restore ------------------ *
+ * Nesting-safe IRQ masking. local_irq_save() snapshots RFLAGS (which
+ * carries the IF bit) into %rax and then disables IRQs (cli).
+ * local_irq_restore(flags) writes the saved RFLAGS back, so IF is
+ * re-enabled ONLY if it was set when saved. This makes the guards
+ * safe to nest: an inner save/restore pair invoked while IRQs are
+ * already off will keep them off, never spuriously re-enabling. */
+    .align 16
+    .globl local_irq_save
+local_irq_save:
+    pushfq
+    popq %rax
+    cli
+    ret
+
+    .align 16
+    .globl local_irq_restore
+local_irq_restore:
+    /* %rdi = saved RFLAGS */
+    pushq %rdi
+    popfq
+    ret
+
 /* ---------- spin_pause: pause + check, used by busy-wait loops --- *
  * `rep; nop` is the canonical x86 pause hint. */
     .align 16

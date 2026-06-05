@@ -67,6 +67,18 @@ FILES = [
 if os.environ.get("ENABLE_TLS_SMOKE") == "1":
     FILES.append(("/etc/tls-test", b"1\n"))
 
+# ENABLE_NVME_SELFTEST=1 plants /etc/nvme-selftest. init/main.ad's NVMe
+# bring-up (nvme_init) gates its DESTRUCTIVE self-test battery
+# (write-smoke/blk-smoke/PRP/multi-queue/health/AER — all WRITE to LBA
+# 1/2/4 = the GPT region) on this marker. The nvme self-test scripts
+# (test_nvme_write/multiq/health/aer/prp, test_block_layer_write) attach
+# a SCRATCH NVMe disk and set ENABLE_NVME_SELFTEST=1 so the destructive
+# markers print; the normal boot + the installer/installed NVMe paths
+# leave the marker absent so the on-disk partition table is never
+# clobbered.
+if os.environ.get("ENABLE_NVME_SELFTEST") == "1":
+    FILES.append(("/etc/nvme-selftest", b"1\n"))
+
 # Chunked-transfer-encoding decoder smoke. See
 # scripts/test_net_https_chunked.sh; the harness sets
 # ENABLE_TLS_CHUNKED_SMOKE=1 to plant /etc/tls-chunked-test, and

@@ -62,7 +62,11 @@ extern def kthread_bootstrap()
 extern def tss_set_rsp0(rsp0: uint64)
 extern def local_irq_disable()
 extern def local_irq_enable()
+# Nesting-safe IRQ save/restore (see fs/elf.ad for rationale).
+extern def local_irq_save() -> uint64
+extern def local_irq_restore(flags: uint64)
 extern def get_bsp_cr3() -> uint64
+extern def read_cr3() -> uint64
 extern def load_cr3(value: uint64)
 # Physical end of the loaded kernel image. The page allocator's memblock
 # floor is set at (or just above) this address by e820_init, so NO
@@ -681,19 +685,36 @@ STATE_STOPPED: uint64 = 4
 # sched_ap_launch() transitions it directly to STATE_RUNNING.
 STATE_PARKED: uint64 = 5
 
-# Per-task kernel stack. 16 KiB (4 pages, buddy order 2) — a single
-# 4 KiB page is NOT enough for the deepest in-kernel call chain, the
-# TLS 1.3 handshake (drivers/net/tls.ad: X25519 + AES-256 key
-# schedule + SHA-256 + certificate-chain parsing + HKDF + transcript
-# hashing, with nested frames up to ~0x170 bytes). On a 4 KiB kstack
-# tls_handshake() overran the page and — because create_user_thread
-# allocates the kstack immediately above the task's user stack — the
-# overflow silently corrupted the user stack (smashing apt's saved
-# return address, causing a ring-3 #UD at a bogus rip). KSTACK_ORDER
-# is the buddy-allocator order matching KSTACK_SIZE; keep them in
-# sync (2^KSTACK_ORDER * 4096 == KSTACK_SIZE).
-KSTACK_SIZE:  uint64 = 16384
-KSTACK_ORDER: int32  = 2
+# Per-task kernel stack. 32 KiB (8 pages, buddy order 3). The deepest
+# in-kernel call chain is NOT a single 4 KiB page — two distinct chains
+# have overrun smaller stacks:
+#
+#   * The TLS 1.3 handshake (drivers/net/tls.ad: X25519 + AES-256 key
+#     schedule + SHA-256 + certificate-chain parsing + HKDF + transcript
+#     hashing, nested frames up to ~0x170 bytes) overran a 4 KiB kstack,
+#     which prompted the 16 KiB (order-2) bump.
+#
+#   * The rfork/fork path (do_rfork -> create_user_task_argv ->
+#     vm_cow_share_all -> per-page _cow_resolve_pte_slot table-cracking
+#     under the boot-CR3 guard, all while rc.boot sources its script)
+#     overran the 16 KiB kstack by a few quads. Because the buddy
+#     allocator hands a new child's kstack the block PHYSICALLY ADJACENT
+#     below the running parent's (parent kstack 0x6020000.., child
+#     0x601c000..0x6020000), the parent's overflow wrote a user-stack
+#     pointer into the child's iret-frame SS slot at child_ktop-8
+#     (0x601fff8) — corrupting it to a non-canonical selector and
+#     faulting #GP on the bootstrap iretq when the child was first
+#     dispatched. That intermittent (~50%) spawn crash is why 16 KiB was
+#     not enough; 32 KiB clears the deepest fork chain with headroom.
+#
+# Because create_user_thread allocates the kstack immediately above the
+# task's user stack, an overflow also silently corrupts the user stack
+# (smashing a saved return address -> ring-3 #UD at a bogus rip). Both
+# failure modes are the same root cause: too little kstack. KSTACK_ORDER
+# is the buddy-allocator order matching KSTACK_SIZE; keep them in sync
+# (2^KSTACK_ORDER * 4096 == KSTACK_SIZE).
+KSTACK_SIZE:  uint64 = 32768
+KSTACK_ORDER: int32  = 3
 USTACK_SIZE: uint64 = 4096
 
 # Boot-GDT selectors (matches arch/x86/boot/header.S).
@@ -1757,7 +1778,11 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     task_table[s].kstack_base = kstack
     task_table[s].kstack_top  = kstack_top
     task_table[s].ustack_base = 0
-    task_table[s].state       = STATE_READY
+    # RACE FIX (mirrors create_user_thread): do NOT publish the slot as
+    # STATE_READY until cr3 + all fd/signal fields are initialized at the
+    # end of the function. The slot stays STATE_FREE (invisible to
+    # _pick_next) during init so a timer IRQ can't dispatch a half-built
+    # kernel thread.
     task_table[s].is_user     = 0
     task_table[s].name0       = name0
     # Kernel threads share the BSP's page table (no per-task mappings
@@ -1863,6 +1888,8 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     _init_fd_table(s)
     next_pid = next_pid + 1
     nr_tasks_spawned = nr_tasks_spawned + 1
+    # RACE FIX: publish as runnable only after full init (see note above).
+    task_table[s].state = STATE_READY
     return slot
 
 
@@ -1924,11 +1951,31 @@ def create_user_thread(entry: uint64, name0: uint64,
             return -1
         ustack_top = ustack + USTACK_SIZE
 
+    # Boot-CR3 guard around the kstack frame build. _build_initial_kstack
+    # writes the fresh iret/bootstrap frame to the kstack pages as RAW
+    # PHYSICAL (identity) addresses. This runs in the CALLER's context —
+    # for a forking parent (rfork / hamsh `ns {}`) the live CR3 is that
+    # parent's PML4, whose low-RAM identity map for the just-alloc'd
+    # kstack chunk may have been CRACKED/COW-remapped by execve + ASLR.
+    # Writing kstack_top-relative vaddrs then lands on the WRONG physical
+    # page (observed: the child's real kstack stays full of stale
+    # emit_raw frames, so __switch_to_asm rets into garbage -> #GP at the
+    # bootstrap iretq). The pristine boot CR3 maps ALL of low RAM
+    # identity, so build the frame under it, then restore. Same guard the
+    # PML4 clone above and the COW-share path in fs/elf.ad already use.
+    _ks_live_cr3: uint64 = read_cr3()
+    _ks_boot_cr3: uint64 = cow_boot_cr3()
+    _ks_irq: uint64 = 0
+    if _ks_boot_cr3 != 0:
+        _ks_irq = local_irq_save()
+        load_cr3(_ks_boot_cr3)
     sp: uint64 = _build_initial_kstack(
         kstack_top, USER_CS_R3, USER_DS_R3, ustack_top, entry,
         argc, argv, user_r9, user_rdx, user_r8,
     )
-
+    if _ks_boot_cr3 != 0:
+        load_cr3(_ks_live_cr3)
+        local_irq_restore(_ks_irq)
     s: uint64 = cast[uint64](slot)
     task_table[s].sp          = sp
     task_table[s].pid         = next_pid
@@ -1942,7 +1989,21 @@ def create_user_thread(entry: uint64, name0: uint64,
     task_table[s].kstack_base = kstack
     task_table[s].kstack_top  = kstack_top
     task_table[s].ustack_base = ustack
-    task_table[s].state       = STATE_READY
+    # NOTE: state is DELIBERATELY NOT set to STATE_READY here. The slot
+    # stays STATE_FREE (as returned by _find_free_slot) until the very
+    # end of this function — see the STATE_READY assignment just before
+    # `return slot`. RACE FIX: marking the task runnable here, before
+    # task_table[s].cr3 (set ~50 lines below, after the PML4 clone) and
+    # before the dozens of field scrubs that follow, opened a window
+    # where a timer IRQ → schedule() → _pick_next() could dispatch this
+    # HALF-INITIALIZED task. The scheduler would then load_cr3(cr3=0 /
+    # stale .bss) and __switch_to a task with no kstack/cr3 set up,
+    # producing a wild jump into garbage (observed: #GP rip=0x8006, the
+    # stale AP-trampoline bytes, with a user-range rsp). _pick_next only
+    # considers STATE_READY slots, so leaving this STATE_FREE until fully
+    # built keeps the partial task invisible to the scheduler. (UP-safe:
+    # no other path calls _find_free_slot from IRQ context, so the slot
+    # cannot be re-claimed mid-init.)
     task_table[s].is_user     = 1
     task_table[s].name0       = name0
     task_table[s].parent_pid  = task_table[current_idx_pcpu].pid
@@ -1968,8 +2029,34 @@ def create_user_thread(entry: uint64, name0: uint64,
     pml4_src: uint64 = cow_boot_cr3()
     if pml4_src == 0:
         pml4_src = get_bsp_cr3()
+    # The clone reads the boot PML4 (pml4_src) and writes the freshly
+    # alloc_page()'d new_pml4 — both are PHYSICAL page-table pages in low
+    # RAM. They are reachable ONLY if the CURRENTLY-ACTIVE CR3 still
+    # identity-maps the 2 MiB chunk each lives in. That is NOT guaranteed:
+    # the live CR3 belongs to the spawning/forking parent, whose user-half
+    # page tables have been CRACKED by elf_install_user_mapping / the COW
+    # fork path. On a UEFI boot with several hundred MiB of RAM the boot
+    # PML4 itself lands high (~485 MiB), and a parent's cracked PD can have
+    # dropped the identity entry for that exact chunk (observed: pd[243]
+    # P=0), so the raw memcpy below #PF'd reading pml4_src. The BSP/boot
+    # CR3 maps ALL of low RAM identity by construction, so run the clone
+    # under it, then restore the caller's CR3. Pure physical-identity work
+    # in between (no user-half access), so the switch is safe.
+    #
+    # Switch to the PRISTINE boot PML4 (cow_boot_cr3 / pml4_src), which is
+    # the snapshot taken in cow_init() before any user-half cracking, so it
+    # maps the full low-RAM identity. Reading pml4_src and writing new_pml4
+    # both resolve under it. Restore the caller's CR3 immediately after.
+    _clone_live_cr3: uint64 = read_cr3()
+    _clone_irq_flags: uint64 = 0
+    if pml4_src != 0:
+        _clone_irq_flags = local_irq_save()
+        load_cr3(pml4_src)
     memcpy(cast[Ptr[uint8]](new_pml4),
            cast[Ptr[uint8]](pml4_src), 4096)
+    if pml4_src != 0:
+        load_cr3(_clone_live_cr3)
+        local_irq_restore(_clone_irq_flags)
     task_table[s].cr3 = new_pml4
     # U1: default new user tasks to native Hamnix ABI. The Linux ELF
     # loader path (future U-series milestone) will call
@@ -2155,6 +2242,18 @@ def create_user_thread(entry: uint64, name0: uint64,
     _inherit_cwd_from_parent(s)
     next_pid = next_pid + 1
     nr_tasks_spawned = nr_tasks_spawned + 1
+    # RACE FIX (ordering): publish the task as runnable ONLY now that
+    # cr3, kstack, sp, and every signal/fd/namespace field are fully
+    # initialized — NOT mid-function before task_table[s].cr3 was set.
+    # On x86 stores retire in program order, so once this STATE_READY
+    # store is visible every field store above it is too. This closes
+    # the plain spawn-path window where a timer IRQ → _pick_next() could
+    # dispatch a task whose cr3 was still 0. The fork/rfork/clone paths
+    # additionally COW-share the address space AFTER this returns; those
+    # callers mask IRQs across the create+COW critical section (see
+    # do_rfork / do_clone) so the child can't be dispatched onto an
+    # un-shared PML4 before its mappings exist.
+    task_table[s].state = STATE_READY
     return slot
 
 
@@ -3674,6 +3773,19 @@ def _free_task_user_pagetables(su: uint64):
     PT_P:    uint64 = 0x1
     pml4: Ptr[uint64] = cast[Ptr[uint64]](cr3 & PT_ADDR)
     bpml4: Ptr[uint64] = cast[Ptr[uint64]](boot_cr3 & PT_ADDR)
+    # UEFI-high-RAM guard: this walk dereferences the EXITING task's PDPT/
+    # PD/PT pages via raw physical pointers, but it runs in the PARENT's
+    # context (the parent's CR3 is live). On a UEFI boot with several
+    # hundred MiB of RAM those table pages can land HIGH (~1 GiB), and the
+    # parent's CRACKED CR3 may have dropped the identity entry for that
+    # chunk (observed: #PF cr2=0x3e63a000 here during task_reap of an
+    # exited child). The PRISTINE boot CR3 identity-maps ALL of RAM by
+    # construction, so run the pure-physical walk under it and restore the
+    # caller's CR3 after. free_page only touches the higher-half buddy
+    # metadata (mapped in the boot CR3 too), so the switch is safe.
+    _ftp_live_cr3: uint64 = read_cr3()
+    _ftp_irq: uint64 = local_irq_save()
+    load_cr3(boot_cr3)
     li: uint64 = 0
     while li < 256:
         e: uint64 = pml4[li]
@@ -3711,6 +3823,8 @@ def _free_task_user_pagetables(su: uint64):
                 pi = pi + 1
             free_page(pdpt_phys)
         li = li + 1
+    load_cr3(_ftp_live_cr3)
+    local_irq_restore(_ftp_irq)
 
 
 def task_reap(slot: int32):
