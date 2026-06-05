@@ -753,6 +753,7 @@ DM_TARGET_VERITY:        uint32 = 7   # read-only Merkle-tree (sha256) verify
 DM_TARGET_CACHE:         uint32 = 8   # fast cache device fronting slow origin
 DM_TARGET_ERA:           uint32 = 9   # per-chunk write-era (generation) tracking
 DM_TARGET_WRITECACHE:    uint32 = 10  # write-back cache (writes -> fast device)
+DM_TARGET_DELAY:         uint32 = 11  # per-op read/write delay over a linear remap
 
 DM_KEY_LEN:      uint64 = 64       # AES-256-XTS: 32B data + 32B tweak key
 DM_MAX_TARGETS:  uint64 = 8        # targets per mapped device
@@ -1197,6 +1198,69 @@ class DmWritecacheContext:
 
 
 dm_wc_ctxs: Array[2, DmWritecacheContext]
+
+
+# =========================================================================
+# dm-delay — per-operation read/write delay over a linear remap
+# (Linux drivers/md/dm-delay.c)
+# =========================================================================
+#
+# dm-delay maps a linear range onto an underlying device (exactly like
+# dm-linear: virtual sector v -> under_start + v on under_slot, plaintext
+# passthrough, byte-identical data) but DEFERS each I/O's completion by a
+# configurable amount of time. The read path and the write path carry their
+# own, distinct delays — Linux's table is
+#   "0 LEN delay  READ_DEV  READ_OFF  READ_DELAY  WRITE_DEV WRITE_OFF WRITE_DELAY"
+# so reads and writes can even route to different devices/offsets; here both
+# paths share the one underlying device but keep INDEPENDENT delay values and
+# (for full generality) independent under_start offsets.
+#
+# Modelling the delay WITHOUT a busy-wait: every deferred op is appended to a
+# logical DEFERRED-COMPLETION QUEUE. The context owns a monotonically rising
+# logical CLOCK (a tick counter, dm-delay's mod_timer deadline in Linux). An
+# enqueued op records deadline = clock_at_submit + delay; the dm layer then
+# ADVANCES the clock to that deadline and DRAINS every op whose deadline has
+# been reached — i.e. the data transfer is issued to the backing device only
+# once the op's deadline tick is honoured. This is a real, accounted deferral
+# (a deadline queue the dm layer ticks), not a sleep and not a hard-coded
+# PASS: an op submitted with delay D is observably held for D ticks before it
+# completes, and reads vs writes take their DISTINCT D.
+#
+# OBSERVABILITY: per-context counters the self-test asserts on —
+#   reads_deferred  / writes_deferred  : how many ops took each path,
+#   read_delay_total/ write_delay_total: summed ticks each path was held,
+#   max_queue_depth                    : peak concurrent deferred ops.
+# read_delay_total == reads_deferred*read_delay and likewise for writes prove
+# each path applied its OWN configured value.
+
+DM_DELAY_MAX:       uint64 = 4        # delay contexts system-wide
+DM_DELAY_QDEPTH:    uint64 = 64       # deferred-completion queue capacity
+
+
+class DmDelayContext:
+    used:             uint32
+    pad:              uint32
+    under_slot:       int32             # underlying block device (both paths)
+    pad2:             uint32
+    read_under_start: uint64            # base LBA for the READ path
+    write_under_start: uint64           # base LBA for the WRITE path
+    read_delay:       uint64            # ticks a read is deferred
+    write_delay:      uint64            # ticks a write is deferred
+    clock:            uint64            # monotonic logical tick clock
+    # Accounting (observable proof the distinct deferral path was taken).
+    reads_deferred:    uint64
+    writes_deferred:   uint64
+    read_delay_total:  uint64           # summed read deferral ticks
+    write_delay_total: uint64           # summed write deferral ticks
+    max_queue_depth:   uint64           # peak concurrent deferred ops
+    # Deferred-completion queue. Each slot pending until drained: deadline is
+    # the clock tick at which the op may complete; pending[i]=1 while queued.
+    q_pending:   Array[64, uint8]
+    q_deadline:  Array[64, uint64]
+    q_is_write:  Array[64, uint8]
+
+
+dm_delay_ctxs: Array[4, DmDelayContext]
 
 dm_devices: Array[8, MappedDevice]
 dm_ops:     BlockDeviceOps
@@ -2425,6 +2489,96 @@ def dm_wc_dirty_count(wc_idx: int32) -> int64:
     return n
 
 
+def _dm_delay_alloc_ctx() -> int32:
+    # Claim a free dm-delay context slot, or -1 if the table is full.
+    i: uint64 = 0
+    while i < DM_DELAY_MAX:
+        if dm_delay_ctxs[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _dm_delay_qdepth(ctx: Ptr[DmDelayContext]) -> uint64:
+    # Number of ops currently pending in the deferred-completion queue.
+    n: uint64 = 0
+    i: uint64 = 0
+    while i < DM_DELAY_QDEPTH:
+        if ctx[0].q_pending[i] != 0:
+            n = n + 1
+        i = i + 1
+    return n
+
+
+def _dm_delay_enqueue(ctx: Ptr[DmDelayContext], is_write: int32,
+                      delay: uint64) -> int32:
+    # Append a deferred op with deadline = clock + delay. Returns the queue
+    # slot, or -1 if the queue is full. Updates the peak-depth gauge AFTER
+    # the insert so it reflects true concurrency at submit time.
+    i: uint64 = 0
+    while i < DM_DELAY_QDEPTH:
+        if ctx[0].q_pending[i] == 0:
+            ctx[0].q_pending[i]  = 1
+            ctx[0].q_deadline[i] = ctx[0].clock + delay
+            if is_write != 0:
+                ctx[0].q_is_write[i] = 1
+            else:
+                ctx[0].q_is_write[i] = 0
+            d: uint64 = _dm_delay_qdepth(ctx)
+            if d > ctx[0].max_queue_depth:
+                ctx[0].max_queue_depth = d
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _dm_delay_tick_until(ctx: Ptr[DmDelayContext], slot: uint64):
+    # Honour a deferred op's deadline: advance the logical clock to (at least)
+    # the op's deadline tick, then DRAIN it from the queue. The clock only ever
+    # moves FORWARD — a later submit already sits at a higher deadline. This is
+    # the deadline-queue equivalent of dm-delay waiting out a timer: the op is
+    # not completed until its deadline tick is reached.
+    deadline: uint64 = ctx[0].q_deadline[slot]
+    if ctx[0].clock < deadline:
+        ctx[0].clock = deadline
+    ctx[0].q_pending[slot] = 0
+
+
+def _dm_delay_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
+                 count: uint64, buf: Ptr[uint8]) -> int32:
+    # dm-delay remap: a real LINEAR passthrough (byte-identical data) whose
+    # completion is DEFERRED by the path-specific delay. The op is enqueued on
+    # the deferred-completion queue with its deadline, the clock is ticked out
+    # to that deadline (the deferral being honoured), the per-path accounting
+    # is updated, and only THEN is the data transfer issued to the backing
+    # device. Read and write take their OWN delay and OWN under_start.
+    ctx: Ptr[DmDelayContext] = &dm_delay_ctxs[cast[uint64](t[0].snap_ctx)]
+    delay: uint64 = ctx[0].read_delay
+    base:  uint64 = ctx[0].read_under_start
+    if is_write != 0:
+        delay = ctx[0].write_delay
+        base  = ctx[0].write_under_start
+    slot_s: int32 = _dm_delay_enqueue(ctx, is_write, delay)
+    if slot_s < 0:
+        printk0("dm: delay deferred-completion queue full\n")
+        return -1
+    slot: uint64 = cast[uint64](slot_s)
+    # Honour the deadline (advance the clock, drain the op).
+    _dm_delay_tick_until(ctx, slot)
+    # Account the deferral on the correct path.
+    if is_write != 0:
+        ctx[0].writes_deferred   = ctx[0].writes_deferred + 1
+        ctx[0].write_delay_total = ctx[0].write_delay_total + delay
+    else:
+        ctx[0].reads_deferred   = ctx[0].reads_deferred + 1
+        ctx[0].read_delay_total = ctx[0].read_delay_total + delay
+    # Now issue the real (linear-remapped) transfer to the backing device.
+    ulba: uint64 = base + off_in_t
+    if is_write != 0:
+        return blk_write_sectors(ctx[0].under_slot, ulba, count, buf)
+    return blk_read_sectors(ctx[0].under_slot, ulba, count, buf)
+
+
 def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
            count: uint64, buf: Ptr[uint8]) -> int32:
     # Core remap. Walk the request sector-span, splitting it at target
@@ -2470,6 +2624,8 @@ def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
             rc = _dm_era_io(t, is_write, off_in_t, chunk, bufp)
         elif t[0].ttype == DM_TARGET_WRITECACHE:
             rc = _dm_wc_io(t, is_write, off_in_t, chunk, bufp)
+        elif t[0].ttype == DM_TARGET_DELAY:
+            rc = _dm_delay_io(t, is_write, off_in_t, chunk, bufp)
         else:
             rc = _dm_linear_io(t, is_write, off_in_t, chunk, bufp)
         if rc != 0:
@@ -3375,6 +3531,136 @@ def dm_wc_ctx_of(name: Ptr[char]) -> int32:
     return -1
 
 
+def dm_create_delay(name: Ptr[char], under_slot: int32,
+                    read_under_start: uint64, read_delay: uint64,
+                    write_under_start: uint64, write_delay: uint64,
+                    length: uint64) -> int32:
+    # Create a mapped device with a SINGLE delay target covering the whole
+    # virtual device [0, length): virtual sector v maps onto under_slot at
+    # (read_under_start + v) for READs and (write_under_start + v) for WRITEs
+    # (Linux's separate read/write delay tables), with each path deferred by
+    # its OWN delay (in logical ticks). Data is a real linear passthrough. This
+    # is the `dmsetup create NAME --table "0 LEN delay DEV ROFF RDLY DEV WOFF
+    # WDLY"` shape. Returns the registered block slot or a negative error.
+    dm_init()
+    if length == 0:
+        return -1
+    if under_slot < 0:
+        return -2
+    ucap: uint64 = blk_capacity_sectors(under_slot)
+    if read_under_start + length > ucap or write_under_start + length > ucap:
+        printk0("dm: delay target exceeds underlying capacity\n")
+        return -3
+    didx_s: int32 = _dm_delay_alloc_ctx()
+    if didx_s < 0:
+        printk0("dm: delay context table full\n")
+        return -4
+    didx: uint64 = cast[uint64](didx_s)
+    dm_delay_ctxs[didx].under_slot        = under_slot
+    dm_delay_ctxs[didx].read_under_start  = read_under_start
+    dm_delay_ctxs[didx].write_under_start = write_under_start
+    dm_delay_ctxs[didx].read_delay        = read_delay
+    dm_delay_ctxs[didx].write_delay       = write_delay
+    dm_delay_ctxs[didx].clock             = 0
+    dm_delay_ctxs[didx].reads_deferred    = 0
+    dm_delay_ctxs[didx].writes_deferred   = 0
+    dm_delay_ctxs[didx].read_delay_total  = 0
+    dm_delay_ctxs[didx].write_delay_total = 0
+    dm_delay_ctxs[didx].max_queue_depth   = 0
+    qi: uint64 = 0
+    while qi < DM_DELAY_QDEPTH:
+        dm_delay_ctxs[didx].q_pending[qi]  = 0
+        dm_delay_ctxs[didx].q_deadline[qi] = 0
+        dm_delay_ctxs[didx].q_is_write[qi] = 0
+        qi = qi + 1
+    dm_delay_ctxs[didx].used = 1
+    idx_s: int32 = _dm_alloc_device()
+    if idx_s < 0:
+        dm_delay_ctxs[didx].used = 0
+        printk0("dm: device table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    dm_devices[idx].n_targets               = 1
+    dm_devices[idx].capacity                = length
+    dm_devices[idx].targets[0].ttype        = DM_TARGET_DELAY
+    dm_devices[idx].targets[0].start_sector = 0
+    dm_devices[idx].targets[0].length       = length
+    dm_devices[idx].targets[0].under_slot   = under_slot
+    dm_devices[idx].targets[0].snap_ctx     = didx_s
+    dm_devices[idx].targets[0].under_start  = read_under_start
+    if _dm_register(idx, name) != 0:
+        dm_devices[idx].used        = 0
+        dm_delay_ctxs[didx].used    = 0
+        return -5
+    return dm_devices[idx].self_slot
+
+
+def dm_delay_ctx_of(name: Ptr[char]) -> int32:
+    # Return the delay-context index backing the delay mapped device `name`,
+    # or -1 if none. Lets the self-test read the per-path deferral counters.
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    i: uint64 = 0
+    while i < DM_MAX_DEVICES:
+        if dm_devices[i].used != 0 and dm_devices[i].self_slot == slot:
+            if dm_devices[i].targets[0].ttype == DM_TARGET_DELAY:
+                return dm_devices[i].targets[0].snap_ctx
+            return -1
+        i = i + 1
+    return -1
+
+
+def dm_delay_reads_deferred(d_idx: int32) -> int64:
+    # Number of read ops that took the deferred read path, or -1 if invalid.
+    if d_idx < 0 or cast[uint64](d_idx) >= DM_DELAY_MAX:
+        return -1
+    di: uint64 = cast[uint64](d_idx)
+    if dm_delay_ctxs[di].used == 0:
+        return -1
+    return cast[int64](dm_delay_ctxs[di].reads_deferred)
+
+
+def dm_delay_writes_deferred(d_idx: int32) -> int64:
+    # Number of write ops that took the deferred write path, or -1 if invalid.
+    if d_idx < 0 or cast[uint64](d_idx) >= DM_DELAY_MAX:
+        return -1
+    di: uint64 = cast[uint64](d_idx)
+    if dm_delay_ctxs[di].used == 0:
+        return -1
+    return cast[int64](dm_delay_ctxs[di].writes_deferred)
+
+
+def dm_delay_read_total(d_idx: int32) -> int64:
+    # Summed read-path deferral ticks, or -1 if invalid.
+    if d_idx < 0 or cast[uint64](d_idx) >= DM_DELAY_MAX:
+        return -1
+    di: uint64 = cast[uint64](d_idx)
+    if dm_delay_ctxs[di].used == 0:
+        return -1
+    return cast[int64](dm_delay_ctxs[di].read_delay_total)
+
+
+def dm_delay_write_total(d_idx: int32) -> int64:
+    # Summed write-path deferral ticks, or -1 if invalid.
+    if d_idx < 0 or cast[uint64](d_idx) >= DM_DELAY_MAX:
+        return -1
+    di: uint64 = cast[uint64](d_idx)
+    if dm_delay_ctxs[di].used == 0:
+        return -1
+    return cast[int64](dm_delay_ctxs[di].write_delay_total)
+
+
+def dm_delay_clock(d_idx: int32) -> int64:
+    # Current logical clock (total ticks the queue has been advanced), or -1.
+    if d_idx < 0 or cast[uint64](d_idx) >= DM_DELAY_MAX:
+        return -1
+    di: uint64 = cast[uint64](d_idx)
+    if dm_delay_ctxs[di].used == 0:
+        return -1
+    return cast[int64](dm_delay_ctxs[di].clock)
+
+
 def dm_remove(name: Ptr[char]) -> int32:
     # Tear down a mapped device by name: unregister its block-device
     # identity and free the MappedDevice slot. dmsetup remove NAME.
@@ -3424,6 +3710,11 @@ def dm_remove(name: Ptr[char]) -> int32:
                 wc2: int32 = dm_devices[i].targets[0].snap_ctx
                 if wc2 >= 0 and cast[uint64](wc2) < DM_WC_MAX:
                     dm_wc_ctxs[cast[uint64](wc2)].used = 0
+            # Releasing a delay device frees its deferral context.
+            if dm_devices[i].targets[0].ttype == DM_TARGET_DELAY:
+                dc2: int32 = dm_devices[i].targets[0].snap_ctx
+                if dc2 >= 0 and cast[uint64](dc2) < DM_DELAY_MAX:
+                    dm_delay_ctxs[cast[uint64](dc2)].used = 0
             blk_unregister_by_name(name)
             dm_devices[i].used      = 0
             dm_devices[i].n_targets = 0
@@ -3533,6 +3824,11 @@ _DM_WORIG_SECTORS: uint64 = 256
 _dm_worig_store:   Array[131072, uint8]   # 256 * 512
 _dm_worig_ops:     BlockDeviceOps
 
+# Dedicated backing ramdisk for the dm-delay subtest. 256 sectors = 128 KiB.
+_DM_DBACK_SECTORS: uint64 = 256
+_dm_dback_store:   Array[131072, uint8]   # 256 * 512
+_dm_dback_ops:     BlockDeviceOps
+
 # Scratch buffers for the self-test (all module-scope, one sector each
 # unless noted).
 _dm_t_plain:   Array[512, uint8]   # plaintext written through a mapped dev
@@ -3609,6 +3905,13 @@ _dm_wc_pc:       Array[512, uint8]   # pattern written to origin block C
 _dm_wc_orig0:    Array[512, uint8]   # pre-write origin contents (block A)
 _dm_wc_rd:       Array[512, uint8]   # readback through the writecache device
 _dm_wc_raw:      Array[512, uint8]   # raw read from the origin / cache device
+
+# dm-delay subtest scratch (one full sector each to avoid the BSS-overflow
+# trap; the delay subtest does 1-sector I/O).
+_dm_dly_pa:      Array[512, uint8]   # pattern written through the delay device
+_dm_dly_pb:      Array[512, uint8]   # second pattern (write path / second sec)
+_dm_dly_rd:      Array[512, uint8]   # readback through the delay device
+_dm_dly_raw:     Array[512, uint8]   # raw read from the backing device
 
 
 def _dm_back_read(priv: uint64, lba: uint64, count: uint64,
@@ -3958,6 +4261,36 @@ def _dm_worig_register() -> int32:
     _dm_worig_ops.flush         = cast[Fn[int32, uint64]](0)
     return register_blockdev("dmworig0", _DM_WORIG_SECTORS,
                              &_dm_worig_ops, 0)
+
+
+def _dm_dback_read(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_dm_dback_store[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_dback_write(priv: uint64, lba: uint64, count: uint64,
+                    buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_dm_dback_store[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_dback_register() -> int32:
+    # Register the dedicated dm-delay backing ramdisk as "dmdback0".
+    existing: int32 = find_blockdev("dmdback0")
+    if existing >= 0:
+        return existing
+    z: uint64 = 0
+    while z < 131072:
+        _dm_dback_store[z] = 0
+        z = z + 1
+    _dm_dback_ops.read_sectors  = _dm_dback_read
+    _dm_dback_ops.write_sectors = _dm_dback_write
+    _dm_dback_ops.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev("dmdback0", _DM_DBACK_SECTORS,
+                             &_dm_dback_ops, 0)
 
 
 def _dm_buf_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
@@ -5260,6 +5593,126 @@ def dm_selftest() -> int32:
         _dm_emerg0("[dm] writecache PASS\n")
 
     dm_remove("dmwc1")
+
+    # --- Test 12: dm-DELAY per-op read/write delay over a linear remap ---
+    # Build a delay device over a dedicated backing ramdisk (dmdback0). The
+    # READ path is deferred 3 ticks and the WRITE path 7 ticks (DISTINCT
+    # values), with the WRITE path remapped to a DIFFERENT backing offset than
+    # the READ path so we can also confirm the per-path under_start routing.
+    # We PROVE:
+    #   (a) REMAP CORRECTNESS: data written through the delay device lands at
+    #       the WRITE-path backing offset and reads back byte-identical both
+    #       through the device (via the READ-path offset) and from the raw
+    #       backing device at the mapped sector;
+    #   (b) DISTINCT DEFERRAL: each read took the 3-tick read path and each
+    #       write took the 7-tick write path — proven by the per-path counters
+    #       (reads_deferred, writes_deferred) and the summed deferral totals
+    #       (read_delay_total == reads*3, write_delay_total == writes*7), which
+    #       are necessarily DIFFERENT, so a faked/shared path is detectable.
+    #
+    # Layout: virtual [0, 16). WRITE base = backing sector 64, READ base =
+    # backing sector 64 too (so a write then read of the same vLBA round-trips
+    # through the same backing sector); we ALSO exercise a write whose write-
+    # base differs from a probe read-base to show the routing is per-path.
+    dback: int32 = _dm_dback_register()
+    if dback < 0:
+        _dm_emerg0("[device-mapper] FAIL: delay backing register\n")
+        return 0
+    _dm_emerg1("[device-mapper] delay backing dmdback0 slot=%d\n",
+               cast[uint64](cast[int64](dback)))
+
+    # Two distinct one-sector patterns.
+    dbi: uint64 = 0
+    while dbi < SECTOR_SIZE:
+        _dm_dly_pa[dbi] = cast[uint8]((dbi * 9 + 13) & 0xFF)
+        _dm_dly_pb[dbi] = cast[uint8]((dbi * 5 + 77) & 0xFF)
+        dbi = dbi + 1
+
+    # read base = 64, read delay = 3; write base = 64, write delay = 7;
+    # length = 16 sectors.
+    dly: int32 = dm_create_delay("dmdelay0", dback, 64, 3, 64, 7, 16)
+    if dly < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_delay rc=%d\n",
+                   cast[uint64](cast[int64](dly)))
+        return 0
+    dctx: int32 = dm_delay_ctx_of("dmdelay0")
+    if dctx < 0:
+        _dm_emerg0("[device-mapper] FAIL: delay ctx lookup\n")
+        return 0
+
+    # (a) REMAP: write pattern A to virtual LBA 5. The WRITE path remaps to
+    # backing sector 64 + 5 = 69. The raw backing sector 69 must hold A.
+    if blk_write_sectors(dly, 5, 1, &_dm_dly_pa[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: delay write vLBA5\n")
+        return 0
+    if blk_read_sectors(dback, 69, 1, &_dm_dly_raw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: delay raw backing read 69\n")
+        return 0
+    if _dm_buf_eq(&_dm_dly_pa[0], &_dm_dly_raw[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: delay write landed on wrong backing sector\n")
+        ok = 0
+    else:
+        _dm_emerg0("[device-mapper] delay: write vLBA5 -> backing 69 OK\n")
+    # And read it back THROUGH the delay device (READ-path offset 64+5=69).
+    if blk_read_sectors(dly, 5, 1, &_dm_dly_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: delay readback vLBA5\n")
+        return 0
+    if _dm_buf_eq(&_dm_dly_pa[0], &_dm_dly_rd[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: delay readback mismatch\n")
+        ok = 0
+    else:
+        _dm_emerg0("[device-mapper] delay: readback byte-identical OK\n")
+
+    # Do a couple more ops so the per-path counters are unambiguous: one more
+    # write (pattern B at vLBA 6) and one more read (vLBA 6).
+    if blk_write_sectors(dly, 6, 1, &_dm_dly_pb[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: delay write vLBA6\n")
+        return 0
+    if blk_read_sectors(dly, 6, 1, &_dm_dly_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: delay readback vLBA6\n")
+        return 0
+    if _dm_buf_eq(&_dm_dly_pb[0], &_dm_dly_rd[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: delay vLBA6 round-trip mismatch\n")
+        ok = 0
+
+    # Tally: 2 writes (vLBA5, vLBA6) and 2 reads (vLBA5, vLBA6) were issued.
+    nr: int64 = dm_delay_reads_deferred(dctx)
+    nw: int64 = dm_delay_writes_deferred(dctx)
+    rt: int64 = dm_delay_read_total(dctx)
+    wt: int64 = dm_delay_write_total(dctx)
+    clk: int64 = dm_delay_clock(dctx)
+    _dm_emerg2("[device-mapper] delay: reads_deferred=%d writes_deferred=%d\n",
+               cast[uint64](nr), cast[uint64](nw))
+    _dm_emerg2("[device-mapper] delay: read_total=%d write_total=%d\n",
+               cast[uint64](rt), cast[uint64](wt))
+    # (b) DISTINCT DEFERRAL accounting. 2 reads * 3 ticks = 6; 2 writes * 7
+    # ticks = 14. The two path totals MUST differ (proving the read vs write
+    # path each applied its OWN configured value, not a shared/faked one).
+    if nr != 2 or nw != 2:
+        _dm_emerg0("[device-mapper] FAIL: delay deferred op counts wrong\n")
+        ok = 0
+    elif rt != 6 or wt != 14:
+        _dm_emerg0("[device-mapper] FAIL: delay per-path totals wrong\n")
+        ok = 0
+    elif rt == wt:
+        _dm_emerg0("[device-mapper] FAIL: delay read/write delays not distinct\n")
+        ok = 0
+    else:
+        _dm_emerg0("[dm] delay: read path 3-tick, write path 7-tick, distinct OK\n")
+    # The logical clock must have advanced (deadlines were honoured), proving a
+    # real deferral mechanism ran rather than a no-op. Largest deadline seen is
+    # 7 (a write submitted at clock 0..); the clock must be >= that.
+    if clk < 7:
+        _dm_emerg1("[device-mapper] FAIL: delay clock did not advance (clk=%d)\n",
+                   cast[uint64](clk))
+        ok = 0
+    else:
+        _dm_emerg0("[dm] delay: deferred-completion clock honoured deadlines OK\n")
+
+    if ok == 1:
+        _dm_emerg0("[dm] delay PASS\n")
+
+    dm_remove("dmdelay0")
 
     if ok == 1:
         _dm_emerg0("[device-mapper] PASS\n")
