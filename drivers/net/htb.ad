@@ -1,0 +1,483 @@
+# drivers/net/htb.ad
+#
+# Native traffic control: an HTB (Hierarchical Token Bucket) classful qdisc.
+#
+# This implements the core of Linux's `tc qdisc add ... htb` classful shaper:
+# a hierarchy of classes, each with an assured `rate` and a `ceil` (maximum)
+# rate, modelled with TWO token buckets per class exactly like Linux HTB:
+#
+#   * the RATE bucket (tokens)  — fills at the class's assured `rate`. A class
+#                                 whose rate bucket has credit may send at its
+#                                 own expense (it is "green", CAN_SEND).
+#   * the CEIL bucket (ctokens) — fills at the class's `ceil` (>= rate). When
+#                                 a class's rate bucket is empty but its ceil
+#                                 bucket still has credit, the class is
+#                                 "yellow" (MAY_BORROW): it may BORROW from its
+#                                 parent up to ceil. When both are empty it is
+#                                 "red" (CANT_SEND) and must wait.
+#
+# Borrowing: a leaf with no rate credit asks its PARENT for credit. The parent
+# lends out of its own rate/ceil buckets. A class can therefore exceed its
+# assured rate (up to ceil) when its siblings are idle, but never exceeds its
+# own ceil bucket — so it is capped at ceil even when the whole link is idle.
+#
+# Virtual time is INJECTED in abstract "ticks" (TICKS_PER_SEC ticks == 1s),
+# matching drivers/net/qdisc.ad. ONE token buys ONE byte. Refill math per
+# bucket, identical accrual-preserving form to qdisc.ad's tbf_refill():
+#
+#       elapsed = now - last_update
+#       gained  = (rate * elapsed) / TICKS_PER_SEC
+#       tokens  = min(tokens + gained, depth)
+#       last_update advances by the whole ticks actually banked
+#
+# Module-scope globals only (no heap structs). The hierarchy is fixed-size
+# parallel arrays. The self-test reconfigures it between scenarios.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+
+
+# --- Time base (shared convention with qdisc.ad) ---------------------------
+HTB_TICKS_PER_SEC: uint64 = 1000
+
+
+# --- Class table -----------------------------------------------------------
+#
+# A small fixed hierarchy: index 0 is the ROOT class, indices 1.. are its
+# children (leaves). HTB_MAX_CLASSES caps the table. Each class has:
+#   * htb_parent[i]  — parent class index (root's parent is itself, 0).
+#   * htb_rate[i]    — assured rate (bytes/sec).
+#   * htb_ceil[i]    — ceiling rate (bytes/sec), >= rate.
+#   * htb_tokens[i]  — RATE bucket level (bytes).
+#   * htb_ctokens[i] — CEIL bucket level (bytes).
+#   * htb_burst[i]   — RATE bucket depth (bytes).
+#   * htb_cburst[i]  — CEIL bucket depth (bytes), >= burst.
+#   * htb_last[i]    — virtual time the buckets were last refilled.
+#   * htb_deq_bytes[i] / htb_deq_pkts[i] — per-class dequeue accounting.
+
+HTB_MAX_CLASSES: uint64 = 8
+
+htb_nclasses: uint64 = 0
+
+htb_parent:    Array[8, uint64]
+htb_rate:      Array[8, uint64]
+htb_ceil:      Array[8, uint64]
+htb_tokens:    Array[8, uint64]
+htb_ctokens:   Array[8, uint64]
+htb_burst:     Array[8, uint64]
+htb_cburst:    Array[8, uint64]
+htb_last:      Array[8, uint64]
+htb_deq_bytes: Array[8, uint64]
+htb_deq_pkts:  Array[8, uint64]
+
+
+# --- Per-leaf packet backlog (FIFO ring per class) -------------------------
+#
+# Each class has a small FIFO of pending packet lengths. We only enqueue into
+# leaves. HTB_QLEN is the per-class ring depth.
+
+HTB_QLEN: uint64 = 64
+
+# Flat [class * HTB_QLEN + slot] backing store of packet lengths.
+htb_q_len:  Array[512, uint64]      # 8 classes * 64 slots
+htb_q_head: Array[8, uint64]
+htb_q_tail: Array[8, uint64]
+htb_q_cnt:  Array[8, uint64]
+
+
+def htb_reset():
+    # Wipe the whole hierarchy back to empty.
+    htb_nclasses = 0
+    i: uint64 = 0
+    while i < HTB_MAX_CLASSES:
+        htb_parent[i]    = 0
+        htb_rate[i]      = 0
+        htb_ceil[i]      = 0
+        htb_tokens[i]    = 0
+        htb_ctokens[i]   = 0
+        htb_burst[i]     = 0
+        htb_cburst[i]    = 0
+        htb_last[i]      = 0
+        htb_deq_bytes[i] = 0
+        htb_deq_pkts[i]  = 0
+        htb_q_head[i]    = 0
+        htb_q_tail[i]    = 0
+        htb_q_cnt[i]     = 0
+        i = i + 1
+
+
+def htb_add_class(parent: uint64, rate: uint64, ceil: uint64, burst: uint64,
+                  cburst: uint64, now: uint64) -> uint64:
+    # Register a class; returns its index. The buckets START FULL (a fresh HTB
+    # class admits a full burst immediately), anchored to virtual time `now`.
+    idx: uint64 = htb_nclasses
+    htb_parent[idx]  = parent
+    htb_rate[idx]    = rate
+    htb_ceil[idx]    = ceil
+    htb_burst[idx]   = burst
+    htb_cburst[idx]  = cburst
+    htb_tokens[idx]  = burst
+    htb_ctokens[idx] = cburst
+    htb_last[idx]    = now
+    htb_nclasses     = htb_nclasses + 1
+    return idx
+
+
+def _htb_refill_one(i: uint64, now: uint64):
+    # Refill class i's RATE and CEIL buckets to virtual time `now`. The two
+    # buckets share one last_update; we advance it by the whole ticks the
+    # RATE bucket banks (rate <= ceil so the ceil bucket banks >= as many,
+    # never under-credited). Mirrors qdisc.ad's accrual-preserving refill.
+    if now <= htb_last[i]:
+        return
+    elapsed: uint64 = now - htb_last[i]
+    r: uint64 = htb_rate[i]
+    c: uint64 = htb_ceil[i]
+    if r == 0:
+        return
+    gained: uint64 = (r * elapsed) / HTB_TICKS_PER_SEC
+    if gained == 0:
+        return
+    cgained: uint64 = (c * elapsed) / HTB_TICKS_PER_SEC
+    consumed_ticks: uint64 = (gained * HTB_TICKS_PER_SEC) / r
+    htb_last[i] = htb_last[i] + consumed_ticks
+
+    nt: uint64 = htb_tokens[i] + gained
+    if nt > htb_burst[i]:
+        nt = htb_burst[i]
+    htb_tokens[i] = nt
+
+    nc: uint64 = htb_ctokens[i] + cgained
+    if nc > htb_cburst[i]:
+        nc = htb_cburst[i]
+    htb_ctokens[i] = nc
+
+
+def htb_refill_all(now: uint64):
+    # Refill every class's buckets to `now`.
+    i: uint64 = 0
+    while i < htb_nclasses:
+        _htb_refill_one(i, now)
+        i = i + 1
+
+
+def htb_enqueue(cls: uint64, nbytes: uint64) -> int32:
+    # Append a packet of nbytes into leaf class `cls`'s FIFO. Returns 1 on
+    # success, 0 if the ring is full (tail drop).
+    if htb_q_cnt[cls] >= HTB_QLEN:
+        return 0
+    slot: uint64 = cls * HTB_QLEN + htb_q_tail[cls]
+    htb_q_len[slot] = nbytes
+    htb_q_tail[cls] = (htb_q_tail[cls] + 1) % HTB_QLEN
+    htb_q_cnt[cls]  = htb_q_cnt[cls] + 1
+    return 1
+
+
+def htb_peek(cls: uint64) -> uint64:
+    # Length of the head packet of class `cls` (0 if empty — callers check cnt).
+    if htb_q_cnt[cls] == 0:
+        return 0
+    slot: uint64 = cls * HTB_QLEN + htb_q_head[cls]
+    return htb_q_len[slot]
+
+
+def _htb_pop(cls: uint64):
+    # Drop the head packet of class `cls`.
+    htb_q_head[cls] = (htb_q_head[cls] + 1) % HTB_QLEN
+    htb_q_cnt[cls]  = htb_q_cnt[cls] - 1
+
+
+# --- HTB charge / dequeue --------------------------------------------------
+#
+# To send `n` bytes for a leaf, we walk from the leaf up to the root. At each
+# level a class is the "level we charge against". Linux HTB classifies each
+# class as:
+#   CAN_SEND   : tokens >= n  -> it can pay from its OWN rate bucket (green)
+#   MAY_BORROW : tokens < n but ctokens >= n -> it must borrow from its parent
+#   CANT_SEND  : ctokens < n -> red, cannot send now
+#
+# A leaf can send iff, walking up, we find an ancestor that CAN_SEND while
+# every class in between is at least MAY_BORROW (ctokens >= n). When the leaf
+# itself CAN_SEND, no borrowing happens (it pays itself). When it must borrow,
+# the cost is charged to the lending ancestor's RATE bucket and the ceil
+# (ctokens) bucket of every class on the path is decremented (you consumed
+# ceil credit at every level you traversed).
+
+def htb_can_dequeue(cls: uint64, n: uint64) -> int32:
+    # Returns 1 if leaf `cls` may send `n` bytes right now, else 0. Pure
+    # predicate — does NOT charge. Walks leaf->root.
+    #
+    # Linux HTB classifies a class by its CEIL (ctoken) bucket FIRST: if a
+    # class's ctokens < n it is RED (CANT_SEND) and may neither send nor lend,
+    # FULL STOP — even if its own rate bucket still has credit. This is what
+    # caps a class at its ceiling. Only when ctokens >= n does the rate bucket
+    # distinguish GREEN (tokens >= n: pays from its own assured rate, send
+    # allowed) from YELLOW (tokens < n: must BORROW from the parent, so the
+    # parent must in turn be at least YELLOW). The ceil constraint therefore
+    # applies at EVERY level on the borrow path.
+    cur: uint64 = cls
+    while True:
+        if htb_ctokens[cur] < n:
+            # Over this level's ceiling — RED: cannot send / cannot lend.
+            return 0
+        if htb_tokens[cur] >= n:
+            # GREEN: this level can pay from its own assured rate — allowed.
+            return 1
+        # YELLOW: ctokens >= n but tokens < n -> borrow from the parent.
+        if cur == htb_parent[cur]:
+            # Root borrowing from itself with no rate credit -> blocked.
+            return 0
+        cur = htb_parent[cur]
+    return 0
+
+
+def htb_charge(cls: uint64, n: uint64):
+    # Charge `n` bytes for a send by leaf `cls`. Decrements ctokens on every
+    # class from the leaf up to (and including) the ancestor that pays from
+    # its rate bucket; decrements that paying ancestor's rate tokens. Assumes
+    # htb_can_dequeue(cls, n) == 1.
+    cur: uint64 = cls
+    while True:
+        # Every level on the path spends ceil credit.
+        if htb_ctokens[cur] >= n:
+            htb_ctokens[cur] = htb_ctokens[cur] - n
+        else:
+            htb_ctokens[cur] = 0
+        if htb_tokens[cur] >= n:
+            # Paying level: spend its rate tokens and stop climbing.
+            htb_tokens[cur] = htb_tokens[cur] - n
+            return
+        # Borrowed at this level; climb to the parent which actually pays.
+        if cur == htb_parent[cur]:
+            return
+        cur = htb_parent[cur]
+
+
+def htb_dequeue_one(cls: uint64) -> int32:
+    # Try to dequeue the head packet of leaf `cls` at the CURRENT bucket state.
+    # Returns 1 if a packet was sent (and accounted), 0 if it could not be
+    # sent now (insufficient tokens/ctokens) or the queue is empty.
+    if htb_q_cnt[cls] == 0:
+        return 0
+    n: uint64 = htb_peek(cls)
+    if htb_can_dequeue(cls, n) != 1:
+        return 0
+    htb_charge(cls, n)
+    _htb_pop(cls)
+    htb_deq_bytes[cls] = htb_deq_bytes[cls] + n
+    htb_deq_pkts[cls]  = htb_deq_pkts[cls] + 1
+    return 1
+
+
+def htb_deq_bytes_of(cls: uint64) -> uint64:
+    return htb_deq_bytes[cls]
+
+
+def htb_deq_pkts_of(cls: uint64) -> uint64:
+    return htb_deq_pkts[cls]
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, injected virtual clock)
+# =====================================================================
+
+def _htb_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _htb_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _htb_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# A deterministic service loop: advance time in fixed steps from t=0 to
+# `end_tick` in `step` increments. At each step refill all buckets, then run a
+# round-robin dequeue pass over the two leaves until no more packets can be
+# sent this instant. Models a work-conserving HTB scheduler clocked by the
+# injected virtual time.
+
+def _htb_run(leaf_a: uint64, leaf_b: uint64, end_tick: uint64, step: uint64):
+    t: uint64 = 0
+    while t <= end_tick:
+        htb_refill_all(t)
+        # Drain everything sendable at this instant, alternating leaves so
+        # neither starves the other (DRR-ish fairness within an instant).
+        progressed: int32 = 1
+        while progressed == 1:
+            progressed = 0
+            ra: int32 = htb_dequeue_one(leaf_a)
+            if ra == 1:
+                progressed = 1
+            rb: int32 = htb_dequeue_one(leaf_b)
+            if rb == 1:
+                progressed = 1
+        t = t + step
+
+
+def htb_selftest() -> int32:
+    _htb_emerg0("[htb] self-test start\n")
+    ok: int32 = 1
+
+    # ------------------------------------------------------------------
+    # Scenario 1 — FAIR SHARE: both leaves backlogged each get ~their rate.
+    #
+    # Link root: rate 2000 B/s, ceil 2000 B/s (the whole link).
+    # Leaf A: rate 1000 B/s, ceil 2000 B/s.
+    # Leaf B: rate 1000 B/s, ceil 2000 B/s.
+    # Both are kept fully backlogged for 1 second of virtual time. Each must
+    # receive close to its assured 1000 B (neither starves). Packets are
+    # 100 B; we feed each leaf a fresh packet whenever its queue drains.
+    # ------------------------------------------------------------------
+    htb_reset()
+    # Buckets start full at the burst depth; keep burst small so steady-state
+    # rate dominates the measurement window. burst=200, cburst=200.
+    root1: uint64 = htb_add_class(0, 2000, 2000, 200, 200, 0)
+    a1: uint64 = htb_add_class(root1, 1000, 2000, 200, 200, 0)
+    b1: uint64 = htb_add_class(root1, 1000, 2000, 200, 200, 0)
+    # Prefill deep backlogs so both stay active the whole window.
+    fillp: uint64 = 0
+    while fillp < 64:
+        htb_enqueue(a1, 100)
+        htb_enqueue(b1, 100)
+        fillp = fillp + 1
+    # Refeed loop: service 1s in 10-tick steps, topping up queues so both
+    # leaves never drain (always backlogged).
+    t1: uint64 = 0
+    while t1 <= 1000:
+        htb_refill_all(t1)
+        # Keep both leaves backlogged.
+        if htb_q_cnt[a1] < 4:
+            htb_enqueue(a1, 100)
+            htb_enqueue(a1, 100)
+            htb_enqueue(a1, 100)
+            htb_enqueue(a1, 100)
+        if htb_q_cnt[b1] < 4:
+            htb_enqueue(b1, 100)
+            htb_enqueue(b1, 100)
+            htb_enqueue(b1, 100)
+            htb_enqueue(b1, 100)
+        prog1: int32 = 1
+        while prog1 == 1:
+            prog1 = 0
+            if htb_dequeue_one(a1) == 1:
+                prog1 = 1
+            if htb_dequeue_one(b1) == 1:
+                prog1 = 1
+        t1 = t1 + 10
+    ba: uint64 = htb_deq_bytes_of(a1)
+    bb: uint64 = htb_deq_bytes_of(b1)
+    _htb_emerg2("[htb] fair-share over 1s: A=%d B=%d bytes\n", ba, bb)
+    # Each guaranteed 1000 B/s; over ~1s both should be near 1000 (allow the
+    # initial full burst + tick granularity slop). Assert neither starves:
+    # both must get at least 800 B and roughly equal shares.
+    if ba < 800:
+        _htb_emerg1("[htb] FAIL: leaf A starved, got %d (< 800)\n", ba)
+        ok = 0
+    if bb < 800:
+        _htb_emerg1("[htb] FAIL: leaf B starved, got %d (< 800)\n", bb)
+        ok = 0
+    # Fairness: the two shares must be within 25% of each other.
+    diff1: uint64 = 0
+    if ba > bb:
+        diff1 = ba - bb
+    else:
+        diff1 = bb - ba
+    if diff1 > 400:
+        _htb_emerg2("[htb] FAIL: unfair share A=%d B=%d (diff > 400)\n", ba, bb)
+        ok = 0
+    if ok == 1:
+        _htb_emerg0("[htb] PASS fair-share (both leaves get assured rate)\n")
+
+    # ------------------------------------------------------------------
+    # Scenario 2 — BORROW: one leaf idle, the active leaf borrows above its
+    # rate up to ceil.
+    #
+    # root: rate 2000 B/s, ceil 2000 B/s.
+    # Leaf A: rate 1000 B/s, ceil 2000 B/s. Leaf B: rate 1000, ceil 2000 but
+    # IDLE (no traffic). A is backlogged. Because B is idle, A may borrow the
+    # spare assured bandwidth from root up to its OWN ceil (2000 B/s) — so A's
+    # throughput over 1s should EXCEED its 1000 B/s assured rate and approach
+    # 2000 B/s.
+    # ------------------------------------------------------------------
+    htb_reset()
+    root2: uint64 = htb_add_class(0, 2000, 2000, 200, 200, 0)
+    a2: uint64 = htb_add_class(root2, 1000, 2000, 200, 200, 0)
+    b2: uint64 = htb_add_class(root2, 1000, 2000, 200, 200, 0)
+    t2: uint64 = 0
+    while t2 <= 1000:
+        htb_refill_all(t2)
+        if htb_q_cnt[a2] < 4:
+            htb_enqueue(a2, 100)
+            htb_enqueue(a2, 100)
+            htb_enqueue(a2, 100)
+            htb_enqueue(a2, 100)
+        # B stays idle (never enqueued).
+        prog2: int32 = 1
+        while prog2 == 1:
+            prog2 = 0
+            if htb_dequeue_one(a2) == 1:
+                prog2 = 1
+        t2 = t2 + 10
+    ba2: uint64 = htb_deq_bytes_of(a2)
+    _htb_emerg1("[htb] borrow over 1s (B idle): A=%d bytes\n", ba2)
+    # A must clearly exceed its 1000 B/s assured rate (borrowing) and approach
+    # the ceil 2000 B/s. Assert it got well above its rate.
+    if ba2 <= 1200:
+        _htb_emerg1("[htb] FAIL: A did not borrow, got %d (<= 1200)\n", ba2)
+        ok = 0
+    else:
+        _htb_emerg1("[htb] PASS borrow (A=%d > rate, borrowed up toward ceil)\n",
+                    ba2)
+
+    # ------------------------------------------------------------------
+    # Scenario 3 — CEIL CAP: with the WHOLE link idle for A, A still never
+    # exceeds its ceiling.
+    #
+    # root: rate 5000, ceil 5000 (plenty). Leaf A: rate 1000 B/s, ceil
+    # 1500 B/s. A is the only traffic and is backlogged for 1s. Even with the
+    # entire link free, A must be capped at its ceil (1500 B/s) — it should
+    # send ABOUT 1500 B over 1s, and crucially NOT more than ~1500 + burst.
+    # ------------------------------------------------------------------
+    htb_reset()
+    root3: uint64 = htb_add_class(0, 5000, 5000, 200, 200, 0)
+    a3: uint64 = htb_add_class(root3, 1000, 1500, 200, 200, 0)
+    t3: uint64 = 0
+    while t3 <= 1000:
+        htb_refill_all(t3)
+        if htb_q_cnt[a3] < 4:
+            htb_enqueue(a3, 100)
+            htb_enqueue(a3, 100)
+            htb_enqueue(a3, 100)
+            htb_enqueue(a3, 100)
+        prog3: int32 = 1
+        while prog3 == 1:
+            prog3 = 0
+            if htb_dequeue_one(a3) == 1:
+                prog3 = 1
+        t3 = t3 + 10
+    ba3: uint64 = htb_deq_bytes_of(a3)
+    _htb_emerg1("[htb] ceil-cap over 1s (link free): A=%d bytes\n", ba3)
+    # Ceil is 1500 B/s. Over 1s the conforming budget is initial burst (200)
+    # + ceil*1s = 1700 B. A must NOT exceed that — assert capped at ceil.
+    if ba3 > 1700:
+        _htb_emerg1("[htb] FAIL: A exceeded ceil, got %d (> 1700)\n", ba3)
+        ok = 0
+    # And it must actually have used its ceil (got well above its 1000 rate).
+    if ba3 < 1300:
+        _htb_emerg1("[htb] FAIL: A under-served at ceil, got %d (< 1300)\n", ba3)
+        ok = 0
+    if ok == 1:
+        _htb_emerg1("[htb] PASS ceil-cap (A=%d capped at ceil, never above)\n",
+                    ba3)
+
+    if ok == 1:
+        _htb_emerg0("[htb] PASS\n")
+        return 1
+    _htb_emerg0("[htb] FAIL\n")
+    return 0

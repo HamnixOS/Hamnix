@@ -2573,6 +2573,32 @@ if os.environ.get("ENABLE_BOND_TEST") == "1":
 if os.environ.get("ENABLE_QDISC_TEST") == "1":
     FILES.append(("/etc/qdisc-test", b"1\n"))
 
+# Native HTB (Hierarchical Token Bucket) classful qdisc self-test.
+# scripts/test_htb.sh sets ENABLE_HTB_TEST=1 to plant /etc/htb-test;
+# init/main.ad's boot:37.htb gate then runs htb_selftest() (drivers/net/htb.ad),
+# a pure in-memory test that drives REAL per-class rate/ceil token + ctoken
+# bucket accounting against an INJECTED virtual clock: two backlogged sibling
+# leaves each get their assured rate (no starvation); when one sibling is idle
+# the active leaf BORROWS above its rate up to its ceil; and a leaf is CAPPED at
+# its ceil even with the whole link free. Prints "[htb] PASS" / "[htb] FAIL".
+# Default boots ship no marker so it is a no-op everywhere else.
+if os.environ.get("ENABLE_HTB_TEST") == "1":
+    FILES.append(("/etc/htb-test", b"1\n"))
+
+# Native fq_codel (Flow Queue + CoDel AQM) qdisc self-test.
+# scripts/test_fqcodel.sh sets ENABLE_FQCODEL_TEST=1 to plant /etc/fqcodel-test;
+# init/main.ad's boot:37.fqcodel gate then runs fqcodel_selftest()
+# (drivers/net/fq_codel.ad), a pure in-memory test that drives REAL flow hashing
+# + DRR new/old-flow scheduling and the per-flow CoDel control law
+# (interval/sqrt(count) with a real integer isqrt) against an INJECTED virtual
+# clock: a sparse flow is not starved by a bulk flow; a standing queue above
+# TARGET for >= INTERVAL is dropped at the accelerating control-law cadence and
+# dropping STOPS once sojourn recovers; a queue below TARGET suffers zero drops.
+# Prints "[fqcodel] PASS" / "[fqcodel] FAIL". Default boots ship no marker so it
+# is a no-op everywhere else.
+if os.environ.get("ENABLE_FQCODEL_TEST") == "1":
+    FILES.append(("/etc/fqcodel-test", b"1\n"))
+
 # Linux-style overlayfs (union filesystem) self-test. scripts/test_overlayfs.sh
 # sets ENABLE_OVERLAYFS_TEST=1 to plant /etc/overlayfs-test; init/main.ad's
 # boot:37.ovl gate then runs overlayfs_selftest() (fs/overlayfs.ad), which

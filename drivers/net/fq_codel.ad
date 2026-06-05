@@ -1,0 +1,639 @@
+# drivers/net/fq_codel.ad
+#
+# Native traffic control: fq_codel (Flow Queue + CoDel AQM), Linux's default
+# qdisc. Two cooperating mechanisms:
+#
+#   1. FLOW QUEUEING (FQ): packets are hashed by their flow key into one of N
+#      flow queues. Queues are serviced by Deficit Round Robin (DRR) with a
+#      byte QUANTUM, and NEW (recently-empty) flows are put on a separate "new
+#      flows" list serviced ahead of the "old flows" list — so a freshly
+#      arrived sparse flow gets immediate, low-latency service and a bulk flow
+#      cannot starve it.
+#
+#   2. CoDel (Controlled Delay) per flow queue: each dequeued packet's SOJOURN
+#      time (dequeue_tick - enqueue_tick) is compared to TARGET. While sojourn
+#      stays >= TARGET continuously for at least INTERVAL, the queue enters the
+#      DROPPING state and sheds packets on the CoDel control-law schedule —
+#      the next drop is due INTERVAL/sqrt(count) after the previous one, so the
+#      drop cadence ACCELERATES as the running drop count grows. When a
+#      dequeued packet's sojourn falls back below TARGET, dropping STOPS.
+#
+# All time is INJECTED in abstract "ticks" (matching drivers/net/qdisc.ad).
+# A real integer square root (no floats) implements the control law.
+#
+# Module-scope globals only; fixed-size parallel arrays. The self-test
+# reconfigures between scenarios.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+
+
+# --- CoDel parameters (in ticks) -------------------------------------------
+FQC_TARGET:   uint64 = 5       # acceptable standing sojourn (ticks)
+FQC_INTERVAL: uint64 = 100     # sliding window to confirm a standing queue
+FQC_QUANTUM:  uint64 = 300     # DRR byte quantum per round
+
+# --- Flow-queue table ------------------------------------------------------
+FQC_NFLOWS: uint64 = 1024      # number of hash buckets (flow queues)
+FQC_QLEN:   uint64 = 64        # per-flow ring depth
+
+
+# --- Integer square root (Newton's method, no floats) ----------------------
+def fqc_isqrt(n: uint64) -> uint64:
+    # Returns floor(sqrt(n)). Pure integer Newton iteration.
+    if n == 0:
+        return 0
+    if n < 4:
+        return 1
+    # Initial guess: n. Converge downward.
+    x: uint64 = n
+    y: uint64 = (x + 1) / 2
+    while y < x:
+        x = y
+        y = (x + n / x) / 2
+    return x
+
+
+# =====================================================================
+# Flow-queue state
+# =====================================================================
+#
+# Each flow queue is a FIFO ring of (length, enqueue_tick) pairs, plus the
+# CoDel control state. Active queues are tracked on two lists (new/old) via
+# small index arrays for the DRR scheduler.
+
+# Flat backing rings: [flow * FQC_QLEN + slot].
+# We use a smaller live set than FQC_NFLOWS for storage — only a handful of
+# flows are ever active in a test. We hash into FQC_NFLOWS buckets but back
+# each ACTIVE bucket with ring storage indexed by the bucket id modulo a small
+# pool. To keep it simple and correct, allocate rings for ALL buckets would be
+# huge; instead the self-test uses a small number of distinct flow keys, so we
+# store rings for the full bucket count but with a tiny QLEN is also large.
+#
+# Pragmatic sizing: 1024 buckets * 64 slots * 2 fields would be 128K entries.
+# That is fine as static arrays here.
+
+fqc_qlen_arr:  Array[65536, uint64]   # packet length, [flow*64 + slot]  (1024*64)
+fqc_qenq_arr:  Array[65536, uint64]   # enqueue tick,  [flow*64 + slot]
+fqc_q_head:    Array[1024, uint64]
+fqc_q_tail:    Array[1024, uint64]
+fqc_q_cnt:     Array[1024, uint64]
+
+# DRR deficit per flow (bytes).
+fqc_deficit:   Array[1024, uint64]
+
+# CoDel per-flow state.
+fqc_dropping:    Array[1024, uint64]  # 1 if in dropping state
+fqc_first_above: Array[1024, uint64]  # tick when sojourn first went >= TARGET (0 = none)
+fqc_drop_next:   Array[1024, uint64]  # next scheduled drop tick
+fqc_count:       Array[1024, uint64]  # running drop count (control law)
+
+# Active-flow membership: which flows are "new" vs "old". We keep simple
+# ordered lists as index arrays + counts.
+FQC_MAXACTIVE: uint64 = 64
+fqc_new_list:  Array[64, uint64]
+fqc_new_cnt:   uint64 = 0
+fqc_old_list:  Array[64, uint64]
+fqc_old_cnt:   uint64 = 0
+fqc_onlist:    Array[1024, uint64]    # 0 = not listed, 1 = new, 2 = old
+
+# Global accounting.
+fqc_total_drops: uint64 = 0
+fqc_total_deq:   uint64 = 0
+
+
+def fqc_reset():
+    i: uint64 = 0
+    while i < FQC_NFLOWS:
+        fqc_q_head[i]     = 0
+        fqc_q_tail[i]     = 0
+        fqc_q_cnt[i]      = 0
+        fqc_deficit[i]    = 0
+        fqc_dropping[i]   = 0
+        fqc_first_above[i] = 0
+        fqc_drop_next[i]  = 0
+        fqc_count[i]      = 0
+        fqc_onlist[i]     = 0
+        i = i + 1
+    fqc_new_cnt = 0
+    fqc_old_cnt = 0
+    fqc_total_drops = 0
+    fqc_total_deq = 0
+
+
+def fqc_hash(flowkey: uint64) -> uint64:
+    # Simple deterministic hash into FQC_NFLOWS buckets. A small mixing then a
+    # modulo. Distinct keys land in distinct buckets for the small test keys.
+    h: uint64 = flowkey * 2654435761
+    h = h ^ (h / 65536)
+    return h % FQC_NFLOWS
+
+
+def _fqc_add_new(flow: uint64):
+    # Put `flow` on the new-flows list if it is not on any list.
+    if fqc_onlist[flow] != 0:
+        return
+    if fqc_new_cnt < FQC_MAXACTIVE:
+        fqc_new_list[fqc_new_cnt] = flow
+        fqc_new_cnt = fqc_new_cnt + 1
+        fqc_onlist[flow] = 1
+        fqc_deficit[flow] = FQC_QUANTUM
+
+
+def fqc_enqueue(flowkey: uint64, nbytes: uint64, now: uint64) -> int32:
+    # Hash to a flow, append (nbytes, now) to its ring, and mark the flow
+    # active (new). Returns 1 on success, 0 on ring-full tail drop.
+    flow: uint64 = fqc_hash(flowkey)
+    if fqc_q_cnt[flow] >= FQC_QLEN:
+        return 0
+    slot: uint64 = flow * FQC_QLEN + fqc_q_tail[flow]
+    fqc_qlen_arr[slot] = nbytes
+    fqc_qenq_arr[slot] = now
+    fqc_q_tail[flow] = (fqc_q_tail[flow] + 1) % FQC_QLEN
+    fqc_q_cnt[flow]  = fqc_q_cnt[flow] + 1
+    _fqc_add_new(flow)
+    return 1
+
+
+def _fqc_peek_len(flow: uint64) -> uint64:
+    slot: uint64 = flow * FQC_QLEN + fqc_q_head[flow]
+    return fqc_qlen_arr[slot]
+
+
+def _fqc_peek_enq(flow: uint64) -> uint64:
+    slot: uint64 = flow * FQC_QLEN + fqc_q_head[flow]
+    return fqc_qenq_arr[slot]
+
+
+def _fqc_pop(flow: uint64):
+    fqc_q_head[flow] = (fqc_q_head[flow] + 1) % FQC_QLEN
+    fqc_q_cnt[flow]  = fqc_q_cnt[flow] - 1
+
+
+# --- CoDel per-flow dequeue with the control law ---------------------------
+#
+# Returns the length of the packet handed UP (the one that was actually
+# transmitted) or 0 if the flow emptied. Implements RFC 8289 / Linux codel:
+# pop the head, compute sojourn = now - enqueue_tick, run the OK_TO_DROP +
+# control-law machinery, dropping head packets (and popping fresh ones) as the
+# schedule dictates, and return the first packet that is kept.
+
+def _fqc_codel_dequeue(flow: uint64, now: uint64) -> uint64:
+    while fqc_q_cnt[flow] > 0:
+        slen: uint64 = _fqc_peek_len(flow)
+        senq: uint64 = _fqc_peek_enq(flow)
+        sojourn: uint64 = 0
+        if now >= senq:
+            sojourn = now - senq
+
+        # Track the standing-above-target window (first_above_time).
+        ok_to_drop: int32 = 0
+        if sojourn < FQC_TARGET:
+            # Sojourn dropped below target — reset the window; not droppable.
+            fqc_first_above[flow] = 0
+        else:
+            if fqc_first_above[flow] == 0:
+                # First time at/above target: schedule the confirmation point.
+                fqc_first_above[flow] = now + FQC_INTERVAL
+            else:
+                if now >= fqc_first_above[flow]:
+                    # Sojourn has been >= target for a full INTERVAL.
+                    ok_to_drop = 1
+
+        if fqc_dropping[flow] == 1:
+            # We are in the dropping state.
+            if sojourn < FQC_TARGET:
+                # Good queue again — leave the dropping state, keep this pkt.
+                fqc_dropping[flow] = 0
+                fqc_total_deq = fqc_total_deq + 1
+                _fqc_pop(flow)
+                return slen
+            # Still bad: drop packets while now >= drop_next, accelerating the
+            # cadence with the running count via the control law.
+            while fqc_dropping[flow] == 1 and now >= fqc_drop_next[flow] and fqc_q_cnt[flow] > 0:
+                # Drop this head packet.
+                _fqc_pop(flow)
+                fqc_total_drops = fqc_total_drops + 1
+                fqc_count[flow] = fqc_count[flow] + 1
+                # Control law: next drop INTERVAL/sqrt(count) after the last.
+                rt: uint64 = fqc_isqrt(fqc_count[flow])
+                if rt == 0:
+                    rt = 1
+                fqc_drop_next[flow] = fqc_drop_next[flow] + FQC_INTERVAL / rt
+                # Re-evaluate the new head packet's sojourn.
+                if fqc_q_cnt[flow] == 0:
+                    return 0
+                slen = _fqc_peek_len(flow)
+                senq = _fqc_peek_enq(flow)
+                if now >= senq:
+                    sojourn = now - senq
+                else:
+                    sojourn = 0
+                if sojourn < FQC_TARGET:
+                    # Recovered mid-burst — stop dropping, keep this packet.
+                    fqc_dropping[flow] = 0
+                    fqc_total_deq = fqc_total_deq + 1
+                    _fqc_pop(flow)
+                    return slen
+            # Not yet time for the next drop — hand this packet up.
+            fqc_total_deq = fqc_total_deq + 1
+            _fqc_pop(flow)
+            return slen
+        else:
+            # Not currently dropping. Enter dropping if ok_to_drop.
+            if ok_to_drop == 1:
+                # Enter the dropping state: drop this head packet, seed count
+                # and the next-drop schedule per the control law.
+                _fqc_pop(flow)
+                fqc_total_drops = fqc_total_drops + 1
+                fqc_dropping[flow] = 1
+                fqc_count[flow] = fqc_count[flow] + 1
+                rt2: uint64 = fqc_isqrt(fqc_count[flow])
+                if rt2 == 0:
+                    rt2 = 1
+                fqc_drop_next[flow] = now + FQC_INTERVAL / rt2
+                # Loop to evaluate the NEXT head packet (which we may keep).
+            else:
+                # Good packet — hand it up.
+                fqc_total_deq = fqc_total_deq + 1
+                _fqc_pop(flow)
+                return slen
+    return 0
+
+
+# --- DRR scheduler over active flows ---------------------------------------
+#
+# fqc_dequeue() picks the next flow to service: new-flows list first, then
+# old-flows. A flow with enough deficit transmits one packet (via CoDel);
+# otherwise it gets a quantum credit and moves to the tail of the old list.
+# Returns the flow id served (and writes the packet length to fqc_last_len),
+# or returns FQC_NFLOWS when nothing is available.
+
+fqc_last_len:  uint64 = 0
+fqc_last_flow: uint64 = 0
+
+
+def _fqc_remove_from_new() -> uint64:
+    # Pop the head of the new list (shift down). Returns the flow, or
+    # FQC_NFLOWS if empty.
+    if fqc_new_cnt == 0:
+        return FQC_NFLOWS
+    f: uint64 = fqc_new_list[0]
+    i: uint64 = 1
+    while i < fqc_new_cnt:
+        fqc_new_list[i - 1] = fqc_new_list[i]
+        i = i + 1
+    fqc_new_cnt = fqc_new_cnt - 1
+    return f
+
+
+def _fqc_remove_from_old() -> uint64:
+    if fqc_old_cnt == 0:
+        return FQC_NFLOWS
+    f: uint64 = fqc_old_list[0]
+    i: uint64 = 1
+    while i < fqc_old_cnt:
+        fqc_old_list[i - 1] = fqc_old_list[i]
+        i = i + 1
+    fqc_old_cnt = fqc_old_cnt - 1
+    return f
+
+
+def _fqc_append_old(flow: uint64):
+    if fqc_old_cnt < FQC_MAXACTIVE:
+        fqc_old_list[fqc_old_cnt] = flow
+        fqc_old_cnt = fqc_old_cnt + 1
+        fqc_onlist[flow] = 2
+
+
+def fqc_dequeue(now: uint64) -> uint64:
+    # One DRR service step. Returns the served flow id, or FQC_NFLOWS if no
+    # flow could deliver a packet. On success fqc_last_len holds the bytes and
+    # fqc_last_flow the flow.
+    # Bounded number of attempts to avoid spinning: try at most (new+old)
+    # rounds plus headroom.
+    attempts: uint64 = 0
+    maxa: uint64 = (fqc_new_cnt + fqc_old_cnt) * 2 + 4
+    while attempts < maxa:
+        attempts = attempts + 1
+        # Prefer a new flow.
+        use_new: int32 = 0
+        flow: uint64 = FQC_NFLOWS
+        if fqc_new_cnt > 0:
+            flow = fqc_new_list[0]
+            use_new = 1
+        else:
+            if fqc_old_cnt > 0:
+                flow = fqc_old_list[0]
+            else:
+                return FQC_NFLOWS
+
+        # If the flow is empty, drop it off its list entirely.
+        if fqc_q_cnt[flow] == 0:
+            if use_new == 1:
+                _fqc_remove_from_new()
+            else:
+                _fqc_remove_from_old()
+            fqc_onlist[flow] = 0
+            fqc_deficit[flow] = 0
+            # A new flow that emptied is just gone (not demoted). Continue.
+        else:
+            # Grant a quantum if deficit is exhausted, then rotate.
+            if fqc_deficit[flow] == 0:
+                fqc_deficit[flow] = FQC_QUANTUM
+                # Rotate to the OLD list tail (new flows get one shot then age).
+                if use_new == 1:
+                    _fqc_remove_from_new()
+                else:
+                    _fqc_remove_from_old()
+                _fqc_append_old(flow)
+                # Continue scheduling (this flow will be considered again).
+            else:
+                # Peek the head packet length to check the deficit. Note CoDel
+                # may drop the head; we charge the transmitted packet's bytes.
+                served_len: uint64 = _fqc_codel_dequeue(flow, now)
+                if served_len == 0:
+                    # Flow drained (possibly fully by CoDel drops). Remove it.
+                    if use_new == 1:
+                        _fqc_remove_from_new()
+                    else:
+                        _fqc_remove_from_old()
+                    fqc_onlist[flow] = 0
+                    fqc_deficit[flow] = 0
+                    # try again for another flow
+                else:
+                    # Charge the deficit by the transmitted bytes.
+                    if fqc_deficit[flow] >= served_len:
+                        fqc_deficit[flow] = fqc_deficit[flow] - served_len
+                    else:
+                        fqc_deficit[flow] = 0
+                    fqc_last_len = served_len
+                    fqc_last_flow = flow
+                    # If the flow is now empty, drop it off the list.
+                    if fqc_q_cnt[flow] == 0:
+                        if use_new == 1:
+                            _fqc_remove_from_new()
+                        else:
+                            _fqc_remove_from_old()
+                        fqc_onlist[flow] = 0
+                        fqc_deficit[flow] = 0
+                    return flow
+    return FQC_NFLOWS
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, injected virtual clock)
+# =====================================================================
+
+def _fqc_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _fqc_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _fqc_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+def fqcodel_selftest() -> int32:
+    _fqc_emerg0("[fqcodel] self-test start\n")
+    ok: int32 = 1
+
+    # ------------------------------------------------------------------
+    # Sanity — the integer square root underpinning the control law.
+    # ------------------------------------------------------------------
+    if fqc_isqrt(0) != 0:
+        ok = 0
+    if fqc_isqrt(1) != 1:
+        ok = 0
+    if fqc_isqrt(4) != 2:
+        ok = 0
+    if fqc_isqrt(8) != 2:
+        ok = 0
+    if fqc_isqrt(9) != 3:
+        ok = 0
+    if fqc_isqrt(15) != 3:
+        ok = 0
+    if fqc_isqrt(16) != 4:
+        ok = 0
+    if fqc_isqrt(100) != 10:
+        ok = 0
+    if fqc_isqrt(99) != 9:
+        ok = 0
+    if fqc_isqrt(1000000) != 1000:
+        ok = 0
+    if ok == 1:
+        _fqc_emerg0("[fqcodel] PASS isqrt (integer control-law sqrt correct)\n")
+    else:
+        _fqc_emerg0("[fqcodel] FAIL: isqrt incorrect\n")
+
+    # ------------------------------------------------------------------
+    # Scenario 1 — FLOW ISOLATION + DRR fairness.
+    #
+    # Two distinct flow keys hash to two different queues. We enqueue a BULK
+    # flow (many packets) and a SPARSE flow (a few packets), all at t=0 (small
+    # sojourn so CoDel never fires). DRR with the new-flows preference must
+    # interleave them so the sparse flow's packets are NOT starved behind the
+    # whole bulk backlog — the sparse flow should be fully served early.
+    # ------------------------------------------------------------------
+    fqc_reset()
+    keyA: uint64 = 1001      # bulk
+    keyB: uint64 = 2002      # sparse
+    hA: uint64 = fqc_hash(keyA)
+    hB: uint64 = fqc_hash(keyB)
+    if hA == hB:
+        _fqc_emerg2("[fqcodel] FAIL: keys collide hA=%d hB=%d\n", hA, hB)
+        ok = 0
+    # Bulk: 20 packets of 100 B. Sparse: 3 packets of 100 B. All at t=0.
+    bi: uint64 = 0
+    while bi < 20:
+        fqc_enqueue(keyA, 100, 0)
+        bi = bi + 1
+    si: uint64 = 0
+    while si < 3:
+        fqc_enqueue(keyB, 100, 0)
+        si = si + 1
+    # Service at t=2 (sojourn=2 < TARGET=5 so no CoDel drops). Record the
+    # service order; find at which dequeue index the sparse flow finishes.
+    served_sparse: uint64 = 0
+    sparse_done_at: uint64 = 0
+    total_served: uint64 = 0
+    di: uint64 = 0
+    while di < 30:
+        f: uint64 = fqc_dequeue(2)
+        if f == FQC_NFLOWS:
+            di = 30
+        else:
+            total_served = total_served + 1
+            if f == hB:
+                served_sparse = served_sparse + 1
+                if served_sparse == 3:
+                    sparse_done_at = total_served
+            di = di + 1
+    _fqc_emerg2("[fqcodel] isolation: sparse fully served by dequeue #%d of %d total\n",
+                sparse_done_at, total_served)
+    if served_sparse != 3:
+        _fqc_emerg1("[fqcodel] FAIL: sparse flow not fully served (%d/3)\n",
+                    served_sparse)
+        ok = 0
+    if total_served != 23:
+        _fqc_emerg1("[fqcodel] FAIL: total served %d != 23\n", total_served)
+        ok = 0
+    # The sparse flow must finish well before the bulk backlog drains (not
+    # starved at the very end). With new-flow preference it should complete
+    # within the first ~handful of dequeues, certainly before #20.
+    if sparse_done_at >= 20:
+        _fqc_emerg1("[fqcodel] FAIL: sparse starved, done only at #%d\n",
+                    sparse_done_at)
+        ok = 0
+    if ok == 1:
+        _fqc_emerg0("[fqcodel] PASS flow-isolation (sparse not starved by bulk, DRR fair)\n")
+
+    # ------------------------------------------------------------------
+    # Scenario 2 — CoDel drops on a STANDING queue, cadence accelerates, then
+    # STOPS once sojourn recovers.
+    #
+    # One flow. Enqueue a long backlog whose head packets have a LARGE sojourn
+    # (> TARGET) sustained beyond INTERVAL, so CoDel must enter dropping and
+    # shed packets at the control-law cadence. We enqueue packets at t=0 and
+    # dequeue them much later (now large) so sojourn is huge; later we enqueue
+    # FRESH packets (small sojourn) at the tail so that once the old ones are
+    # gone, dropping stops.
+    # ------------------------------------------------------------------
+    fqc_reset()
+    keyC: uint64 = 3003
+    hC: uint64 = fqc_hash(keyC)
+    # Model a PERSISTENTLY congested ("standing") queue: the flow is always
+    # backlogged and every packet sits in the queue far longer than TARGET. We
+    # keep the flow backlogged across the whole CoDel confirmation INTERVAL and
+    # beyond by continuously topping the queue up with packets whose enqueue
+    # timestamps trail the current time by a fixed BIG sojourn (so each dequeued
+    # head has sojourn ~= STANDING_LAG >> TARGET). CoDel must observe sojourn
+    # >= TARGET continuously for >= INTERVAL, enter the dropping state, and then
+    # shed packets at the accelerating control-law cadence.
+    #
+    # Prime the queue with a deep backlog of old packets first.
+    ci: uint64 = 0
+    while ci < 24:
+        fqc_enqueue(keyC, 100, 0)
+        ci = ci + 1
+    drops_before: uint64 = fqc_total_drops
+    # STANDING_LAG is the persistent sojourn every head packet experiences. It
+    # is comfortably above TARGET (5) so the queue is always "bad".
+    standing_lag: uint64 = 50
+    # Advance `now` past the first-above-target observation + a full INTERVAL so
+    # CoDel confirms the standing queue, then keep going so the control law
+    # fires several drops. Start now so the priming packets already exceed
+    # TARGET, and step in INTERVAL-sized chunks of virtual time.
+    tt: uint64 = standing_lag
+    steps: uint64 = 0
+    while steps < 800:
+        # Keep the queue backlogged with a fresh head whose sojourn is exactly
+        # standing_lag (enqueued standing_lag ticks in the past). This models a
+        # flow that never drains — a genuine standing queue.
+        if fqc_q_cnt[hC] < 8:
+            fill: uint64 = 0
+            while fill < 8:
+                fqc_enqueue(keyC, 100, tt - standing_lag)
+                fill = fill + 1
+        fqc_dequeue(tt)
+        tt = tt + 1
+        steps = steps + 1
+    drops_codel: uint64 = fqc_total_drops - drops_before
+    _fqc_emerg2("[fqcodel] standing queue shed %d CoDel drops, count=%d\n",
+                drops_codel, fqc_count[hC])
+    if drops_codel == 0:
+        _fqc_emerg0("[fqcodel] FAIL: standing queue triggered no CoDel drops\n")
+        ok = 0
+    # The control law accelerates: with count growing, drop intervals shrink,
+    # so over a sustained standing window several drops fire and the running
+    # count climbs well past 1. Confirm multiple drops were scheduled.
+    if fqc_count[hC] < 3:
+        _fqc_emerg1("[fqcodel] FAIL: control-law count did not advance (%d)\n",
+                    fqc_count[hC])
+        ok = 0
+    if ok == 1:
+        _fqc_emerg2("[fqcodel] PASS codel-drops (standing queue shed %d, count=%d accel)\n",
+                    drops_codel, fqc_count[hC])
+
+    # RECOVERY: the standing queue clears and the flow now offers only FRESH
+    # packets (sojourn ~1 << TARGET). CoDel must LEAVE the dropping state on the
+    # first below-target dequeue and shed ZERO further packets. We drain off any
+    # remaining old packets, then feed low-sojourn packets and assert no more
+    # drops occur.
+    # First, drain whatever old backlog remains (advancing time so they leave).
+    drain_t: uint64 = tt
+    dn: uint64 = 0
+    while dn < 64:
+        fqc_dequeue(drain_t)
+        drain_t = drain_t + 1
+        dn = dn + 1
+    drops_after_drain: uint64 = fqc_total_drops
+    # Now offer fresh packets and dequeue them immediately (sojourn 1 < TARGET).
+    rg: uint64 = 0
+    rnow: uint64 = drain_t
+    while rg < 80:
+        fqc_enqueue(keyC, 100, rnow)
+        fqc_dequeue(rnow + 1)
+        rnow = rnow + 4
+        rg = rg + 1
+    drops_in_recovery: uint64 = fqc_total_drops - drops_after_drain
+    _fqc_emerg2("[fqcodel] recovery: dropping=%d, drops while good=%d\n",
+                fqc_dropping[hC], drops_in_recovery)
+    if drops_in_recovery != 0:
+        _fqc_emerg1("[fqcodel] FAIL: dropping did not stop, shed %d while good\n",
+                    drops_in_recovery)
+        ok = 0
+    if fqc_dropping[hC] != 0:
+        _fqc_emerg0("[fqcodel] FAIL: flow stuck in dropping state after recovery\n")
+        ok = 0
+    if ok == 1:
+        _fqc_emerg0("[fqcodel] PASS codel-recovery (dropping stops once sojourn < TARGET)\n")
+
+    # Verify the control-law cadence truly accelerates: interval/sqrt(count)
+    # decreases as count rises. Compare the gap at count=1 vs count=4.
+    gap_c1: uint64 = FQC_INTERVAL / fqc_isqrt(1)     # = 100
+    gap_c4: uint64 = FQC_INTERVAL / fqc_isqrt(4)     # = 50
+    gap_c16: uint64 = FQC_INTERVAL / fqc_isqrt(16)   # = 25
+    if gap_c1 <= gap_c4 or gap_c4 <= gap_c16:
+        _fqc_emerg0("[fqcodel] FAIL: control-law cadence does not accelerate\n")
+        ok = 0
+    else:
+        _fqc_emerg2("[fqcodel] PASS control-law cadence accelerates (%d -> %d ticks)\n",
+                    gap_c1, gap_c16)
+
+    # ------------------------------------------------------------------
+    # Scenario 3 — a GOOD queue (sojourn always < TARGET) suffers ZERO drops.
+    #
+    # One flow. Enqueue packets and dequeue them immediately (sojourn 0-1 <
+    # TARGET=5). No CoDel drop must ever occur.
+    # ------------------------------------------------------------------
+    fqc_reset()
+    keyD: uint64 = 4004
+    drops_d_before: uint64 = fqc_total_drops
+    gi: uint64 = 0
+    gnow: uint64 = 0
+    while gi < 50:
+        # enqueue at gnow, dequeue at gnow+1 -> sojourn 1 < TARGET.
+        fqc_enqueue(keyD, 100, gnow)
+        fqc_dequeue(gnow + 1)
+        gnow = gnow + 10
+        gi = gi + 1
+    drops_good: uint64 = fqc_total_drops - drops_d_before
+    _fqc_emerg1("[fqcodel] good-queue drops = %d (must be 0)\n", drops_good)
+    if drops_good != 0:
+        _fqc_emerg1("[fqcodel] FAIL: good queue dropped %d packets\n", drops_good)
+        ok = 0
+    else:
+        _fqc_emerg0("[fqcodel] PASS good-queue (zero CoDel drops below target)\n")
+
+    if ok == 1:
+        _fqc_emerg0("[fqcodel] PASS\n")
+        return 1
+    _fqc_emerg0("[fqcodel] FAIL\n")
+    return 0
