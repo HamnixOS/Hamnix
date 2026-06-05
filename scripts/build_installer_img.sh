@@ -172,7 +172,11 @@ echo "[build_installer_img]   squashfs: $SQFS_IMG ($(( SQFS_BYTES / 1024 / 1024 
 # --- Stage 6: the INSTALLER kernel (cpio embeds the squashfs) ---------
 echo "[build_installer_img] Stage 6: compile INSTALLER kernel (cpio embeds /rootfs.sqfs)."
 env HAMNIX_INSTALLER_BLOB=1 HAMNIX_INSTALLER_SQFS="$SQFS_IMG" \
+    ENABLE_LOG_SLOW="${ENABLE_LOG_SLOW:-0}" \
     INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
+if [ "${ENABLE_LOG_SLOW:-0}" = "1" ]; then
+    echo "[build_installer_img]   page-pause log capture ENABLED (/etc/log-slow planted)."
+fi
 rm -f "$INSTALLER_KERNEL"
 python3 -m compiler.adder compile --target=x86_64-bare-metal \
     init/main.ad -o "$INSTALLER_KERNEL"
