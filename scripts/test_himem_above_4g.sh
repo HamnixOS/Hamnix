@@ -10,7 +10,9 @@
 # ALL 512 pdpt_low entries (512× 1 GiB = low 512 GiB) with a proper
 # 64-bit phys base split across the entry's low/high dwords.
 #
-# This test boots build/hamnix.img under OVMF (UEFI) with -m 8G so the
+# This test boots the INSTALLED ext4-on-NVMe system (the golden disk
+# produced by the real installer, scripts/build_installed_nvme.sh) under
+# OVMF (UEFI) with -m 8G so the
 # firmware reports a real above-4-GiB region that is ALSO the LARGEST
 # free region (at -m 6G the below-4-GiB chunk is still the largest, so
 # memblock would pick it and the bug would hide). At 8G the ~4 GiB
@@ -35,25 +37,22 @@
 # this script echoes, gated on log markers — NOT on the qemu exit code
 # (a -no-reboot kernel that we kill, or a benign rc=124 timeout, is fine).
 #
-# SKIPS CLEANLY (exit 0) when /dev/kvm or OVMF firmware is unavailable.
+# SKIPS CLEANLY (exit 0) when /dev/kvm, OVMF, or the golden disk is
+# unavailable (the shared helper gates this).
 #
 # Env overrides:
-#   HAMNIX_IMG         image path                (default: build/hamnix.img)
+#   GOLDEN_NVME        installed disk path       (default: build/hamnix-installed.qcow2)
 #   OVMF_FD            OVMF firmware path        (default: auto-resolved)
 #   HIMEM_RAM          guest RAM size            (default: 8G)
 #   HIMEM_BOOT_WAIT    seconds to wait for the   (default: 120)
 #                      shell-ready marker
-#   HAMNIX_SKIP_BUILD  1 = reuse existing image  (default: rebuild)
+#   HAMNIX_SKIP_BUILD  1 = require an existing golden disk (no rebuild)
 
 set -uo pipefail
 
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-# shellcheck source=_build_lock.sh
-source "$PROJ_ROOT/scripts/_build_lock.sh"
-
-HAMNIX_IMG="${HAMNIX_IMG:-build/hamnix.img}"
 HIMEM_RAM="${HIMEM_RAM:-8G}"
 HIMEM_BOOT_WAIT="${HIMEM_BOOT_WAIT:-120}"
 KERNEL_BANNER="Hamnix kernel booting"
@@ -64,90 +63,30 @@ HIMEM_FAIL_MARKER="[himem] FAIL"
 # real failure mode (per-task PML4 + user stack above 4 GiB) is fixed.
 PROMPT_MARKER="handing off to interactive shell"
 
-# --- environment gates (skip cleanly) ---------------------------------
-if [ ! -e /dev/kvm ]; then
-    echo "[himem_above_4g] SKIP: /dev/kvm absent (KVM required; boot too slow without it)" >&2
-    exit 0
-fi
+# Run the installed system with > 4 GiB of guest RAM so the firmware
+# reports an above-4-GiB region for the kernel to exercise. The boot
+# harness reads INSTALLED_BOOT_MEM for the guest RAM size.
+export INSTALLED_BOOT_MEM="$HIMEM_RAM"
 
-# OVMF resolution: prefer the Debian-style single-file /usr/share/ovmf/
-# OVMF.fd; fall back to the split /usr/share/OVMF/OVMF_CODE*.fd packaging.
-OVMF_FD="${OVMF_FD:-}"
-if [ -z "$OVMF_FD" ]; then
-    if [ -f /usr/share/ovmf/OVMF.fd ]; then
-        OVMF_FD=/usr/share/ovmf/OVMF.fd
-    elif [ -f /usr/share/OVMF/OVMF_CODE.fd ]; then
-        OVMF_FD=/usr/share/OVMF/OVMF_CODE.fd
-    elif [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ]; then
-        OVMF_FD=/usr/share/OVMF/OVMF_CODE_4M.fd
-    fi
-fi
-if [ -z "$OVMF_FD" ] || [ ! -f "$OVMF_FD" ]; then
-    echo "[himem_above_4g] SKIP: OVMF firmware not found (tried /usr/share/ovmf/OVMF.fd and /usr/share/OVMF/OVMF_CODE*.fd; apt install ovmf)" >&2
-    exit 0
-fi
+# --- boot the installed system (gates KVM/OVMF/golden disk; SKIPs clean) -
+# shellcheck source=_installed_boot.sh
+source "$PROJ_ROOT/scripts/_installed_boot.sh"
 
-# --- build the image --------------------------------------------------
-if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
-    echo "[himem_above_4g] building disk image via build_img.sh"
-    rm -f "$HAMNIX_IMG"
-    bash "$PROJ_ROOT/scripts/build_img.sh"
-fi
-if [ ! -f "$HAMNIX_IMG" ]; then
-    echo "[himem_above_4g] FAIL: $HAMNIX_IMG missing after build_img.sh." >&2
-    exit 1
-fi
-
-# OVMF persists UEFI variables back into the firmware file, so it needs a
-# writable copy. The disk is also opened r/w — copy it so a re-run starts
-# from a pristine image.
-OVMF_RW=$(mktemp --tmpdir hamnix-himem.ovmf.XXXXXX.fd)
-IMG_RW=$(mktemp --tmpdir hamnix-himem.disk.XXXXXX.img)
-LOG=$(mktemp --tmpdir hamnix-himem.XXXXXX.log)
-cp "$OVMF_FD" "$OVMF_RW"
-cp "$HAMNIX_IMG" "$IMG_RW"
-
-cleanup() {
-    [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null
-    rm -f "$OVMF_RW" "$IMG_RW"
-}
-trap cleanup EXIT
-
-echo "[himem_above_4g] booting build/hamnix.img under UEFI with -m ${HIMEM_RAM}"
-
-# Boot the image as a DISK via virtio-blk with > 4 GiB of RAM so the
-# firmware reports an above-4-GiB region for the kernel to exercise.
-qemu-system-x86_64 \
-    -enable-kvm -cpu host \
-    -bios "$OVMF_RW" \
-    -drive file="$IMG_RW",format=raw,if=virtio \
-    -m "$HIMEM_RAM" \
-    -nographic -no-reboot -monitor none \
-    -serial stdio \
-    < /dev/null > "$LOG" 2>&1 &
-QEMU_PID=$!
+echo "[himem_above_4g] booting the installed NVMe system under UEFI with -m ${HIMEM_RAM}"
+installed_boot_start
 
 # --- wait for the shell-ready marker ----------------------------------
 # We wait for the END-TO-END marker (the interactive prompt), not just
 # the synthetic [himem] marker: reaching the shell is what exercises the
 # real above-4-GiB per-task PML4 + user-stack allocations. The [himem]
 # self-test fires much earlier, so by the time the prompt appears it is
-# already in the log.
+# already in the log. installed_boot_wait returns non-zero if the marker
+# never appears, but the marker checks below are authoritative either way.
 echo "[himem_above_4g] waiting up to ${HIMEM_BOOT_WAIT}s for the shell-ready marker..."
-for _ in $(seq 1 "$HIMEM_BOOT_WAIT"); do
-    if grep -a -q -F "$PROMPT_MARKER" "$LOG"; then
-        break
-    fi
-    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-        # qemu exited (triple-fault reboot suppressed by -no-reboot, or a
-        # clean halt). The marker checks below are authoritative.
-        break
-    fi
-    sleep 1
-done
+installed_boot_wait "$HIMEM_BOOT_WAIT" || true
 
-kill "$QEMU_PID" 2>/dev/null
-wait "$QEMU_PID" 2>/dev/null
+LOG="$INSTALLED_LOG"
+installed_boot_stop
 
 # --- assertions (marker-gated, NOT exit-code-gated) -------------------
 fail=0

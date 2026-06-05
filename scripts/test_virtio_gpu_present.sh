@@ -12,12 +12,16 @@
 #     -> pixels on the virtio-gpu scanout.
 #
 # This is the first real GPU DEVICE data path beyond the GOP linear
-# framebuffer. We boot the SHIPPED image (build/hamnix.img) under OVMF
-# with `-device virtio-gpu-pci` as the ONLY display, so QEMU's
-# `screendump` captures the virtio-gpu scanout the kernel flushed into.
-# The boot-flag marker /etc/virtio-gpu-test (planted via
-# ENABLE_VIRTIO_GPU_TEST=1) makes init/main.ad's boot:37.vgpu gate paint
-# + flush the known four-quadrant pattern DURING boot — no shell needed.
+# framebuffer. We boot the ESP-only installer medium
+# (build/hamnix-installer.img) under OVMF with `-device virtio-gpu-pci` as
+# the ONLY display, so QEMU's `screendump` captures the virtio-gpu scanout
+# the kernel flushed into. The boot-flag marker /etc/virtio-gpu-test is
+# read from the initramfs at boot (init/main.ad boot:37.vgpu), so we build
+# the medium with ENABLE_VIRTIO_GPU_TEST=1 to plant it into the installer
+# kernel's initramfs; boot:37.vgpu then paints + flushes the known
+# four-quadrant pattern DURING boot — no shell needed. (The baked
+# build/hamnix.img was retired; the installer medium is a real product
+# artifact and the present hook fires the same way on its kernel.)
 #
 # The `-kernel` multiboot path can NOT be used here: this host's QEMU
 # (10.x) refuses the multiboot kernel under any VGA/VBE device ("multiboot
@@ -50,8 +54,8 @@ cd "$PROJ_ROOT"
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
 
-HAMNIX_IMG="${HAMNIX_IMG:-build/hamnix.img}"
-BOOT_WAIT="${BOOT_WAIT:-120}"
+HAMNIX_INSTALLER_IMG="${HAMNIX_INSTALLER_IMG:-build/hamnix-installer.img}"
+BOOT_WAIT="${BOOT_WAIT:-200}"
 
 # --- environment gates (skip cleanly) ---------------------------------
 if [ ! -e /dev/kvm ]; then
@@ -71,17 +75,18 @@ if [ -z "$OVMF_FD" ] || [ ! -f "$OVMF_FD" ]; then
     exit 0
 fi
 
-# --- build the image WITH the virtio-gpu present marker ---------------
-# ENABLE_VIRTIO_GPU_TEST=1 plants /etc/virtio-gpu-test, which survives
-# into the empty-cpio shipped image (build_initramfs.py emits /etc/*
-# markers even in the HAMNIX_CPIO_EMPTY=1 path build_img.sh uses).
+# --- build the installer medium WITH the virtio-gpu present marker ----
+# ENABLE_VIRTIO_GPU_TEST=1 plants /etc/virtio-gpu-test into the installer
+# kernel's initramfs (build_initramfs.py reads that env even through
+# build_installer_img.sh). The present hook reads the marker from the
+# initramfs at boot, so the medium's own kernel paints the test pattern.
 if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
-    echo "[test_vgpu] (1/2) building disk image (ENABLE_VIRTIO_GPU_TEST=1)"
-    rm -f "$HAMNIX_IMG"
-    ENABLE_VIRTIO_GPU_TEST=1 bash "$PROJ_ROOT/scripts/build_img.sh"
+    echo "[test_vgpu] (1/2) building installer medium (ENABLE_VIRTIO_GPU_TEST=1)"
+    rm -f "$HAMNIX_INSTALLER_IMG"
+    ENABLE_VIRTIO_GPU_TEST=1 bash "$PROJ_ROOT/scripts/build_installer_img.sh"
 fi
-if [ ! -f "$HAMNIX_IMG" ]; then
-    echo "[test_vgpu] FAIL: $HAMNIX_IMG missing after build_img.sh" >&2
+if [ ! -f "$HAMNIX_INSTALLER_IMG" ]; then
+    echo "[test_vgpu] FAIL: $HAMNIX_INSTALLER_IMG missing after build_installer_img.sh" >&2
     exit 1
 fi
 
@@ -91,7 +96,7 @@ LOG=$(mktemp --tmpdir hamnix-vgpu.XXXXXX.log)
 MON=$(mktemp --tmpdir -u hamnix-vgpu-mon.XXXXXX)
 SHOT=$(mktemp --tmpdir hamnix-vgpu.XXXXXX.ppm)
 cp "$OVMF_FD" "$OVMF_RW"
-cp "$HAMNIX_IMG" "$IMG_RW"
+cp "$HAMNIX_INSTALLER_IMG" "$IMG_RW"
 
 cleanup() {
     [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null
@@ -103,7 +108,9 @@ echo "[test_vgpu] (2/2) booting under OVMF with -device virtio-gpu-pci (sole dis
 
 # virtio-gpu-pci is the ONLY display device (-vga none), so screendump
 # captures the virtio-gpu scanout — the surface the kernel flushed into.
-# -monitor on a unix socket lets us screendump it.
+# -monitor on a unix socket lets us screendump it. The medium boots via its
+# ESP (FAT) so it is attached as a plain virtio-blk disk; the present hook
+# fires from the initramfs marker during boot.
 qemu-system-x86_64 \
     -enable-kvm -cpu host \
     -bios "$OVMF_RW" \

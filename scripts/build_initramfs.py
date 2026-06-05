@@ -2675,9 +2675,10 @@ def _embed_usb_hcd_chain(here: Path) -> bytes:
     controller is brought up THROUGH these .kos BEFORE the ext4 root is
     online, so the .ko bytes MUST live in the initramfs (the rootfs
     partition is unreadable until USB enumerates). Both the normal fat
-    cpio and the HAMNIX_CPIO_EMPTY=1 shipped-image path (build_img.sh)
-    call this so the export surface (xhci_init_driver / xhci_run /
-    xhci_gen_setup) resolves identically in either build.
+    cpio and the HAMNIX_CPIO_EMPTY=1 installed-kernel path
+    (build_installer_img.sh Stage 3) call this so the export surface
+    (xhci_init_driver / xhci_run / xhci_gen_setup) resolves identically in
+    either build.
 
     See the inline notes at the original call site: the dep filename for
     xhci_hcd is the DASH form (xhci-hcd.ko) because `modinfo -F depends
@@ -2754,9 +2755,10 @@ def build_archive() -> bytes:
     here = Path(__file__).resolve().parent.parent
 
     # HAMNIX_CPIO_EMPTY=1 — emit a cpio that contains NO files, only the
-    # TRAILER. Used by scripts/build_img.sh for the installed-system raw
-    # disk image (build/hamnix.img): that image boots ENTIRELY off the
-    # ext4 root (the kernel binds '#sysroot' / and ELF-loads /init off
+    # TRAILER. Used by scripts/build_installer_img.sh (Stage 3) for the
+    # INSTALLED-system kernel that lands on the NVMe ESP: that system boots
+    # ENTIRELY off the ext4 root (the kernel binds '#sysroot' / and ELF-loads
+    # /init off
     # the partition — see init/main.ad + docs/rootfs_partition.md), so
     # the kernel needs NO embedded userland at all. The cpio symbol
     # (initramfs_cpio_base/size, fs/cpio.ad) still exists so the kernel
@@ -2784,7 +2786,7 @@ def build_archive() -> bytes:
         print("[build_initramfs] HAMNIX_CPIO_EMPTY=1: emitting %d /etc boot "
               "markers + trailer (installed disk boots off ext4)." % n_markers)
         # The .ko-default root-on-USB path (ENABLE_XHCI_KO_REAL=1, the
-        # shipped-image default in build_img.sh) brings the USB controller
+        # installed-kernel default in build_installer_img.sh) brings the USB controller
         # up THROUGH the Linux xhci_hcd.ko stack BEFORE the ext4 root is
         # online. The /etc/xhci-ko* markers above tell the kernel to take
         # that path, but the controller cannot enumerate — and the cross-

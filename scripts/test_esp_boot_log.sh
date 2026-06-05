@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test_esp_boot_log.sh — ACCEPTANCE GATE for ESP boot-log
-# persistence (kernel/printk/esp_log.ad + the \LOG.TXT preallocation in
-# scripts/build_img.sh).
+# persistence (kernel/printk/esp_log.ad + the \LOG.TXT preallocation now
+# carried on the installed system's NVMe ESP by scripts/build_installer_img.sh).
 #
 # Proves the kernel actually FLUSHES its printk ring to the FAT ESP, so
 # that on a real-hardware boot (Intel NUC, no serial port) the user can
@@ -9,34 +9,33 @@
 # \LOG.TXT to see why the box died.
 #
 # Flow:
-#   1. build build/hamnix.img via build_img.sh (preallocates \LOG.TXT)
-#   2. boot it under OVMF off a virtio disk (same path as
-#      test_img_uefi_boot.sh) far enough to log boot markers, then power
-#      it down.
+#   1. ensure the golden installed disk exists (build_installed_nvme.sh,
+#      the real installer path; its NVMe ESP preallocates \LOG.TXT).
+#   2. boot a fresh RAW copy of it under OVMF off an NVMe drive far enough
+#      to log boot markers, then power it down. (A RAW copy — not qcow2 —
+#      so we can mcopy \LOG.TXT straight off its ESP afterward.)
 #   3. pull \LOG.TXT back OFF partition 1 (the FAT ESP) of the RESULTING
 #      disk image with `mcopy -i` at the ESP's byte offset.
 #   4. assert the recovered file contains real boot markers — proving
 #      the log was written to disk, not merely held in RAM.
 #
-# SKIPS CLEANLY (exit 0) when /dev/kvm or OVMF firmware is unavailable.
+# SKIPS CLEANLY (exit 0) when /dev/kvm, OVMF, mksquashfs, the golden disk,
+# or mcopy is unavailable.
 #
 # Env overrides:
-#   HAMNIX_IMG         image path                (default: build/hamnix.img)
+#   GOLDEN_NVME        installed disk path       (default: build/hamnix-installed.qcow2)
 #   OVMF_FD            OVMF firmware path        (default: auto-resolved)
-#   BOOT_WAIT          seconds to wait for the   (default: 90)
+#   BOOT_WAIT          seconds to wait for the   (default: 200)
 #                      shell-ready marker
-#   HAMNIX_SKIP_BUILD  1 = reuse existing image  (default: rebuild)
+#   HAMNIX_SKIP_BUILD  1 = require an existing golden disk (no rebuild)
 
 set -uo pipefail
 
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-# shellcheck source=_build_lock.sh
-source "$PROJ_ROOT/scripts/_build_lock.sh"
-
-HAMNIX_IMG="${HAMNIX_IMG:-build/hamnix.img}"
-BOOT_WAIT="${BOOT_WAIT:-90}"
+GOLDEN_NVME="${GOLDEN_NVME:-build/hamnix-installed.qcow2}"
+BOOT_WAIT="${BOOT_WAIT:-200}"
 # Markers the kernel logs during boot. The early one proves we captured
 # the start of boot; the late one proves a later boot PHASE made it to
 # disk too (the whole point — not just the last few lines).
@@ -72,27 +71,45 @@ if ! command -v mcopy >/dev/null 2>&1; then
     exit 0
 fi
 
-# --- build the image --------------------------------------------------
-if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
-    echo "[test_esp_log] building disk image via build_img.sh"
-    rm -f "$HAMNIX_IMG"
-    bash "$PROJ_ROOT/scripts/build_img.sh"
+# --- ensure the golden installed disk exists --------------------------
+# build_installed_nvme.sh installs ONCE via the real installer path and
+# gates cleanly (exit 0, no disk) when KVM/OVMF/mksquashfs is missing.
+if [ ! -f "$GOLDEN_NVME" ]; then
+    echo "[test_esp_log] golden installed disk absent; building it via build_installed_nvme.sh"
+    bash "$PROJ_ROOT/scripts/build_installed_nvme.sh"
 fi
-if [ ! -f "$HAMNIX_IMG" ]; then
-    echo "[test_esp_log] FAIL: $HAMNIX_IMG missing after build_img.sh." >&2
-    exit 1
+if [ ! -f "$GOLDEN_NVME" ]; then
+    echo "[test_esp_log] SKIP: golden installed disk $GOLDEN_NVME unavailable (mksquashfs/installer path gated)." >&2
+    exit 0
 fi
 
+# --- materialise a RAW writable copy we can both boot AND mcopy from ---
+# The golden disk is qcow2; mcopy can only read a FAT volume out of a RAW
+# image at a byte offset. Convert a fresh copy to RAW, boot THAT as the
+# NVMe root, then read \LOG.TXT straight off its ESP afterward.
+OVMF_RW=$(mktemp --tmpdir hamnix-esplog.ovmf.XXXXXX.fd)
+IMG_RW=$(mktemp --tmpdir hamnix-esplog.disk.XXXXXX.img)
+LOG=$(mktemp --tmpdir hamnix-esplog.XXXXXX.log)
+RECOVERED=$(mktemp --tmpdir hamnix-esplog.recovered.XXXXXX.txt)
+cp "$OVMF_FD" "$OVMF_RW"
+qemu-img convert -O raw "$GOLDEN_NVME" "$IMG_RW"
+
+cleanup() {
+    [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null
+    rm -f "$OVMF_RW" "$IMG_RW" "$RECOVERED"
+}
+trap cleanup EXIT
+
 # --- locate the ESP (partition 1) byte offset within the image --------
-# build_img.sh aligns the ESP at 1 MiB. Read it back from the GPT so
-# this test stays correct if the layout math changes.
+# The installer carves the NVMe ESP at LBA 2048 (1 MiB). Read it back from
+# the GPT so this test stays correct if the layout math changes.
 PARTED="/sbin/parted"
 [ -x "$PARTED" ] || PARTED="$(command -v parted || true)"
 ESP_START_SECTOR=""
 if [ -n "$PARTED" ]; then
     # `unit s print` lists each partition's start sector; partition 1 is
     # the ESP. Grab the first data row's start (strip the trailing 's').
-    ESP_START_SECTOR=$("$PARTED" -s "$HAMNIX_IMG" unit s print 2>/dev/null \
+    ESP_START_SECTOR=$("$PARTED" -s "$IMG_RW" unit s print 2>/dev/null \
         | awk '/^ *1 /{gsub(/s/,"",$2); print $2; exit}')
 fi
 # Fall back to the documented 1 MiB alignment if parted is unavailable
@@ -103,26 +120,14 @@ fi
 ESP_OFFSET_BYTES=$(( ESP_START_SECTOR * 512 ))
 echo "[test_esp_log] ESP starts at sector ${ESP_START_SECTOR} (byte ${ESP_OFFSET_BYTES})."
 
-# --- boot under OVMF (writable disk copy so the flush sticks) ---------
-OVMF_RW=$(mktemp --tmpdir hamnix-esplog.ovmf.XXXXXX.fd)
-IMG_RW=$(mktemp --tmpdir hamnix-esplog.disk.XXXXXX.img)
-LOG=$(mktemp --tmpdir hamnix-esplog.XXXXXX.log)
-RECOVERED=$(mktemp --tmpdir hamnix-esplog.recovered.XXXXXX.txt)
-cp "$OVMF_FD" "$OVMF_RW"
-cp "$HAMNIX_IMG" "$IMG_RW"
-
-cleanup() {
-    [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null
-    rm -f "$OVMF_RW" "$IMG_RW" "$RECOVERED"
-}
-trap cleanup EXIT
-
+# --- boot under OVMF off the RAW NVMe copy (the flush sticks to it) ----
 # No interactive input needed — we only need the kernel to boot far
 # enough to flush. Drive stdin from /dev/null.
 qemu-system-x86_64 \
     -enable-kvm -cpu host \
     -bios "$OVMF_RW" \
-    -drive file="$IMG_RW",format=raw,if=virtio \
+    -drive file="$IMG_RW",format=raw,if=none,id=nvmeroot \
+    -device nvme,drive=nvmeroot,serial=hamnvme01,bootindex=0 \
     -m 512M \
     -nographic -no-reboot -monitor none \
     -serial stdio \

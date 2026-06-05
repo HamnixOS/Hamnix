@@ -136,11 +136,23 @@ ESP_IMG_MB=$(( TARGET_ESP_MB - 1 ))
 TARGET_ESP="$STUB_TMP/esp.img"
 dd if=/dev/zero of="$TARGET_ESP" bs=1M count="$ESP_IMG_MB" status=none
 mformat -i "$TARGET_ESP" -h 64 -s 32 -c 32 -t $(( ESP_IMG_MB * 64 )) -v HAMNIX ::
+# Preallocate \LOG.TXT FIRST (before any other file) so its data extent is
+# the first contiguous cluster run — the kernel (kernel/printk/esp_log.ad)
+# locates this extent at boot and overwrites it in place to persist the
+# printk ring. This is the SAME boot-log-persistence preallocation the
+# retired build_img.sh did; it now rides on the installed system's NVMe ESP
+# so scripts/test_esp_boot_log.sh keeps its coverage on the installed disk.
+# HAMNIX_ESP_LOG_SIZE MUST match ESP_LOG_BYTES in esp_log.ad (default
+# 262144 = 256 KiB). Fill with newlines so the file is clean text to EOF.
+HAMNIX_ESP_LOG_SIZE="${HAMNIX_ESP_LOG_SIZE:-262144}"
+ESP_LOG_SRC="$STUB_TMP/log.txt"
+head -c "$HAMNIX_ESP_LOG_SIZE" /dev/zero | tr '\0' '\n' > "$ESP_LOG_SRC"
+mcopy -o -i "$TARGET_ESP" "$ESP_LOG_SRC" "::/LOG.TXT"
 mmd -i "$TARGET_ESP" "::/EFI"
 mmd -i "$TARGET_ESP" "::/EFI/BOOT"
 mcopy -o -i "$TARGET_ESP" "$EFI_STUB"          "::/EFI/BOOT/BOOTX64.EFI"
 mcopy -o -i "$TARGET_ESP" "$INSTALLED_KERNEL"  "::/hamnix-kernel.elf"
-echo "[build_installer_img]   NVMe ESP image: ${ESP_IMG_MB} MiB (BOOTX64.EFI + installed kernel)."
+echo "[build_installer_img]   NVMe ESP image: ${ESP_IMG_MB} MiB (LOG.TXT + BOOTX64.EFI + installed kernel)."
 
 # --- Stage 5: the squashfs payload (rootfs.ext4 + esp.img) ------------
 # Pack BOTH payloads into one gzip squashfs the installer reads in RAM.
@@ -175,11 +187,18 @@ MEDIA_ESP_MB=$(( (INSTALLER_KERNEL_BYTES + (16 * 1024 * 1024)) / (1024 * 1024) )
 MEDIA_ESP="$STUB_TMP/media_esp.img"
 dd if=/dev/zero of="$MEDIA_ESP" bs=1M count="$MEDIA_ESP_MB" status=none
 mformat -i "$MEDIA_ESP" -h 64 -s 32 -c 32 -t $(( MEDIA_ESP_MB * 64 )) -v HAMNIXINST ::
+# Preallocate \LOG.TXT FIRST on the install-medium ESP too (same rationale
+# as the NVMe ESP above): the installer medium IS the USB stick the box
+# boots on the serial-less NUC, so scripts/test_esp_boot_log_usb.sh boots
+# this image as a USB mass-storage device and recovers \LOG.TXT off its
+# ESP. Without this preallocation esp_log has no extent to arm on the USB
+# ESP — the exact original bug. Reuse the size/fill from Stage 4.
+mcopy -o -i "$MEDIA_ESP" "$ESP_LOG_SRC" "::/LOG.TXT"
 mmd -i "$MEDIA_ESP" "::/EFI"
 mmd -i "$MEDIA_ESP" "::/EFI/BOOT"
 mcopy -o -i "$MEDIA_ESP" "$EFI_STUB"          "::/EFI/BOOT/BOOTX64.EFI"
 mcopy -o -i "$MEDIA_ESP" "$INSTALLER_KERNEL"  "::/hamnix-kernel.elf"
-echo "[build_installer_img]   install-medium ESP: ${MEDIA_ESP_MB} MiB (installer kernel embeds ${SQFS_BYTES} B squashfs)."
+echo "[build_installer_img]   install-medium ESP: ${MEDIA_ESP_MB} MiB (LOG.TXT + installer kernel embeds ${SQFS_BYTES} B squashfs)."
 
 # --- Stage 8: assemble the ESP-ONLY GPT install medium ----------------
 # Layout: [1 MiB GPT] [ESP partition ONLY] [1 MiB GPT backup]. NO ext4

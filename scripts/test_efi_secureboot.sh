@@ -26,8 +26,11 @@
 #      generated fresh per build by scripts/gen_secureboot_blob.py.
 #
 # BOOT PATH: EFI runtime calls require REAL firmware, so this test boots
-# the installed disk image (build/hamnix.img) under OVMF (UEFI) via
-# virtio-blk + KVM — the same invocation as scripts/test_img_uefi_boot.sh.
+# the ESP-only installer medium build/hamnix-installer.img — a real
+# signed-bootable ESP — under OVMF (UEFI) via virtio-blk + KVM. The
+# /etc/efi-test marker + Secure Boot fixtures are planted into the
+# INSTALLER kernel's initramfs by building the medium with ENABLE_EFI_TEST=1
+# (build_initramfs.py reads that env even through build_installer_img.sh).
 # The kernel self-tests run during start_kernel (before the interactive
 # shell), so their [efi]/[secureboot] markers land early in the serial log.
 #
@@ -69,20 +72,22 @@ if [ -z "$OVMF_FD" ] || [ ! -f "$OVMF_FD" ]; then
     exit 0
 fi
 
-# --- build the disk image WITH the /etc/efi-test marker + fixtures ----
-# build_img.sh internally runs build_initramfs.py; we must pass
-# ENABLE_EFI_TEST=1 through to it so the marker + Secure Boot fixtures get
-# planted into the embedded initramfs. build_img.sh honours the same env
-# the kernel build reads.
+# --- build the installer medium WITH the /etc/efi-test marker + fixtures -
+# build_installer_img.sh internally runs build_initramfs.py for the
+# installer kernel; ENABLE_EFI_TEST=1 (exported here) reaches that python
+# process even through the `env` prefix, planting the marker + Secure Boot
+# fixtures into the installer kernel's initramfs. The marker is read from
+# the initramfs at boot (init/main.ad boot:37.efi), so the medium's own
+# kernel runs the self-tests.
 echo "[test_efi] (1/3) generating Secure Boot fixtures (self-check)"
 python3 scripts/gen_secureboot_blob.py
 
-echo "[test_efi] (2/3) building disk image with ENABLE_EFI_TEST=1"
-HAMNIX_IMG="${HAMNIX_IMG:-build/hamnix.img}"
-rm -f "$HAMNIX_IMG"
-ENABLE_EFI_TEST=1 bash "$PROJ_ROOT/scripts/build_img.sh"
-if [ ! -f "$HAMNIX_IMG" ]; then
-    echo "[test_efi] FAIL: $HAMNIX_IMG missing after build_img.sh." >&2
+echo "[test_efi] (2/3) building installer medium with ENABLE_EFI_TEST=1"
+HAMNIX_INSTALLER_IMG="${HAMNIX_INSTALLER_IMG:-build/hamnix-installer.img}"
+rm -f "$HAMNIX_INSTALLER_IMG"
+ENABLE_EFI_TEST=1 bash "$PROJ_ROOT/scripts/build_installer_img.sh"
+if [ ! -f "$HAMNIX_INSTALLER_IMG" ]; then
+    echo "[test_efi] FAIL: $HAMNIX_INSTALLER_IMG missing after build_installer_img.sh." >&2
     exit 1
 fi
 
@@ -92,7 +97,7 @@ OVMF_RW=$(mktemp --tmpdir hamnix-efi.ovmf.XXXXXX.fd)
 IMG_RW=$(mktemp --tmpdir hamnix-efi.disk.XXXXXX.img)
 LOG=$(mktemp --tmpdir hamnix-efi.XXXXXX.log)
 cp "$OVMF_FD" "$OVMF_RW"
-cp "$HAMNIX_IMG" "$IMG_RW"
+cp "$HAMNIX_INSTALLER_IMG" "$IMG_RW"
 
 cleanup() {
     [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null
@@ -100,7 +105,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[test_efi] (3/3) booting the image under OVMF (UEFI) + KVM"
+echo "[test_efi] (3/3) booting the installer medium under OVMF (UEFI) + KVM"
 qemu-system-x86_64 \
     -enable-kvm -cpu host \
     -bios "$OVMF_RW" \

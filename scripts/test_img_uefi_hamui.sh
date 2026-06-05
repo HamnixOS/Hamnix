@@ -3,9 +3,10 @@
 # boot path (build/hamnix.img under OVMF/UEFI, GOP framebuffer).
 #
 # This is the test that the ~100 `-kernel` tests could NOT be: it boots the
-# SHIPPED image the way it ships (OVMF firmware -> ESP -> kernel ELF ->
-# ext4 root, EFI GOP framebuffer), then proves the windowing stack works
-# from userland OFF EXT4:
+# INSTALLED ext4-on-NVMe system (the golden disk produced by the real
+# installer, scripts/build_installed_nvme.sh) under OVMF firmware -> ESP ->
+# kernel ELF -> ext4 root, EFI GOP framebuffer, then proves the windowing
+# stack works from userland OFF EXT4:
 #
 #   1. boot to the interactive shell (ext4 root, no cpio userland)
 #   2. `cat /dev/fb` succeeds — the synthetic /dev/fb cdev RESOLVES under
@@ -19,29 +20,31 @@
 #   4. a QEMU framebuffer screendump is NON-BLANK (the daemon painted a
 #      desktop into the GOP framebuffer — actual pixels, not just a marker).
 #
-# SKIPS CLEANLY (exit 0) when /dev/kvm or OVMF firmware is unavailable.
+# SKIPS CLEANLY (exit 0) when /dev/kvm, OVMF, mksquashfs, or the golden
+# installed disk is unavailable.
 #
 # Env overrides:
-#   HAMNIX_IMG         image path                (default: build/hamnix.img)
+#   GOLDEN_NVME        installed disk path       (default: build/hamnix-installed.qcow2)
 #   OVMF_FD            OVMF firmware path        (default: auto-resolved)
-#   SHELL_BOOT_WAIT    seconds to wait for the   (default: 90)
+#   SHELL_BOOT_WAIT    seconds to wait for the   (default: 200)
 #                      interactive-prompt marker
-#   HAMNIX_SKIP_BUILD  1 = reuse existing image  (default: rebuild)
+#   HAMNIX_SKIP_BUILD  1 = require an existing golden disk (no rebuild)
 
 set -uo pipefail
 
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-# shellcheck source=_build_lock.sh
-source "$PROJ_ROOT/scripts/_build_lock.sh"
-
-HAMNIX_IMG="${HAMNIX_IMG:-build/hamnix.img}"
-SHELL_BOOT_WAIT="${SHELL_BOOT_WAIT:-90}"
+GOLDEN_NVME="${GOLDEN_NVME:-build/hamnix-installed.qcow2}"
+SHELL_BOOT_WAIT="${SHELL_BOOT_WAIT:-200}"
 KERNEL_BANNER="Hamnix kernel booting"
 PROMPT_MARKER="handing off to interactive shell"
 
 # --- environment gates (skip cleanly) ---------------------------------
+# These GFX tests need a framebuffer + screendump, which the serial-only
+# _installed_boot.sh helper cannot provide, so we boot a fresh writable
+# COPY of the golden installed disk directly here. Gating mirrors the
+# helper / build_installed_nvme.sh.
 if [ ! -e /dev/kvm ]; then
     echo "[test_img_hamui] SKIP: /dev/kvm absent (KVM required; boot too slow without it)" >&2
     exit 0
@@ -62,30 +65,32 @@ if [ -z "$OVMF_FD" ] || [ ! -f "$OVMF_FD" ]; then
     exit 0
 fi
 
-# --- build the image --------------------------------------------------
-if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
-    echo "[test_img_hamui] building disk image via build_img.sh"
-    rm -f "$HAMNIX_IMG"
-    bash "$PROJ_ROOT/scripts/build_img.sh"
+# --- ensure the golden installed disk exists --------------------------
+# build_installed_nvme.sh installs ONCE via the real installer path and
+# gates cleanly (exit 0, no disk) when KVM/OVMF/mksquashfs is missing.
+if [ ! -f "$GOLDEN_NVME" ]; then
+    echo "[test_img_hamui] golden installed disk absent; building it via build_installed_nvme.sh"
+    bash "$PROJ_ROOT/scripts/build_installed_nvme.sh"
 fi
-if [ ! -f "$HAMNIX_IMG" ]; then
-    echo "[test_img_hamui] FAIL: $HAMNIX_IMG missing after build_img.sh." >&2
-    exit 1
+if [ ! -f "$GOLDEN_NVME" ]; then
+    echo "[test_img_hamui] SKIP: golden installed disk $GOLDEN_NVME unavailable (mksquashfs/installer path gated)." >&2
+    exit 0
 fi
 
 OVMF_RW=$(mktemp --tmpdir hamnix-hamui.ovmf.XXXXXX.fd)
-IMG_RW=$(mktemp --tmpdir hamnix-hamui.disk.XXXXXX.img)
+DISK_RW=$(mktemp --tmpdir hamnix-hamui.disk.XXXXXX.qcow2)
 LOG=$(mktemp --tmpdir hamnix-hamui.XXXXXX.log)
 INFIFO=$(mktemp --tmpdir -u hamnix-hamui-in.XXXXXX)
 MON=$(mktemp --tmpdir -u hamnix-hamui-mon.XXXXXX)
 SHOT=$(mktemp --tmpdir hamnix-hamui.XXXXXX.ppm)
 cp "$OVMF_FD" "$OVMF_RW"
-cp "$HAMNIX_IMG" "$IMG_RW"
+# Fresh writable COPY of the golden disk (never boot the golden master).
+cp "$GOLDEN_NVME" "$DISK_RW"
 mkfifo "$INFIFO"
 
 cleanup() {
     [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null
-    rm -f "$OVMF_RW" "$IMG_RW" "$INFIFO" "$MON" "$SHOT"
+    rm -f "$OVMF_RW" "$DISK_RW" "$INFIFO" "$MON" "$SHOT"
 }
 trap cleanup EXIT
 
@@ -93,11 +98,14 @@ exec 4<>"$INFIFO"
 exec 3>"$INFIFO"
 
 # -vga std gives a real GOP framebuffer under OVMF; -monitor on a unix
-# socket lets us screendump the framebuffer the daemon paints.
+# socket lets us screendump the framebuffer the daemon paints. The root is
+# the installed ext4-on-NVMe disk (golden copy) instead of the retired
+# baked hamnix.img.
 qemu-system-x86_64 \
     -enable-kvm -cpu host \
     -bios "$OVMF_RW" \
-    -drive file="$IMG_RW",format=raw,if=virtio \
+    -drive file="$DISK_RW",format=qcow2,if=none,id=nvmeroot \
+    -device nvme,drive=nvmeroot,serial=hamnvme01,bootindex=0 \
     -m 1G \
     -vga std -display none -no-reboot \
     -monitor "unix:$MON,server,nowait" \

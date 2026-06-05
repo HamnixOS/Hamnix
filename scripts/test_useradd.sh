@@ -56,28 +56,30 @@
 #   E. BOOT 2's kernel log shows `.hamnix-roots: #bob -> bob` (durable
 #      sentinel line + top-level dir survived the reboot).
 #
-# SKIPS CLEANLY (exit 0) when /dev/kvm or OVMF firmware is unavailable
-# (mirrors test_img_distro_isolation.sh / test_img_uefi_boot.sh). The
-# Debian-subsystem probe (assertion D) is itself gated on the busybox
-# fixture; if absent we skip ONLY that probe and still assert A/B/C/E.
+# Boots the INSTALLED ext4-on-NVMe system (the golden disk produced by the
+# real installer, scripts/build_installed_nvme.sh) — the baked hamnix.img
+# was retired; a real system is installed onto a disk, never shipped as a
+# pre-baked root image. The boot harness lives in scripts/_installed_boot.sh,
+# whose per-test writable disk copy persists boot-1's useradd edits into
+# boot-2 (exactly the old single-IMG_RW two-boot pattern).
+#
+# SKIPS CLEANLY (exit 0) when /dev/kvm, OVMF, or the golden disk is
+# unavailable (the shared helper gates this). The Debian-subsystem probe
+# (assertion D) is itself gated on the busybox fixture; if absent we skip
+# ONLY that probe and still assert A/B/C/E.
 #
 # Env overrides:
-#   HAMNIX_IMG         image path                (default: build/hamnix.img)
+#   GOLDEN_NVME        installed disk path       (default: build/hamnix-installed.qcow2)
 #   OVMF_FD            OVMF firmware path        (default: auto-resolved)
-#   SHELL_BOOT_WAIT    seconds to wait for the   (default: 90)
+#   SHELL_BOOT_WAIT    seconds to wait for the   (default: 200)
 #                      interactive-prompt marker
-#   HAMNIX_SKIP_BUILD  1 = reuse existing image  (default: rebuild)
+#   HAMNIX_SKIP_BUILD  1 = require an existing golden disk (no rebuild)
 
 set -uo pipefail
 
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-# shellcheck source=_build_lock.sh
-source "$PROJ_ROOT/scripts/_build_lock.sh"
-
-HAMNIX_IMG="${HAMNIX_IMG:-build/hamnix.img}"
-SHELL_BOOT_WAIT="${SHELL_BOOT_WAIT:-90}"
 KERNEL_BANNER="Hamnix kernel booting"
 PROMPT_MARKER="handing off to interactive shell"
 
@@ -93,12 +95,6 @@ M_DONE="HAMNIX_UA_DONE_99"
 # /home listing, the per-user-home isolation is broken.
 BOB_FILE="HAMNIX_BOB_ONLY_MARKER"
 
-# --- environment gates (skip cleanly) ---------------------------------
-if [ ! -e /dev/kvm ]; then
-    echo "[test_useradd] SKIP: /dev/kvm absent (KVM required; boot too slow without it)" >&2
-    exit 0
-fi
-
 # busybox fixture gates ONLY the distro-isolation probe (assertion D).
 HAVE_BUSYBOX=1
 if [ ! -f "$PROJ_ROOT/tests/u-binary/u_busybox_musl" ]; then
@@ -106,92 +102,20 @@ if [ ! -f "$PROJ_ROOT/tests/u-binary/u_busybox_musl" ]; then
     echo "[test_useradd] note: tests/u-binary/u_busybox_musl absent — skipping the distro-root probe (D); A/B/C/E still asserted." >&2
 fi
 
-OVMF_FD="${OVMF_FD:-}"
-if [ -z "$OVMF_FD" ]; then
-    if [ -f /usr/share/ovmf/OVMF.fd ]; then
-        OVMF_FD=/usr/share/ovmf/OVMF.fd
-    elif [ -f /usr/share/OVMF/OVMF_CODE.fd ]; then
-        OVMF_FD=/usr/share/OVMF/OVMF_CODE.fd
-    elif [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ]; then
-        OVMF_FD=/usr/share/OVMF/OVMF_CODE_4M.fd
-    fi
-fi
-if [ -z "$OVMF_FD" ] || [ ! -f "$OVMF_FD" ]; then
-    echo "[test_useradd] SKIP: OVMF firmware not found (apt install ovmf)" >&2
-    exit 0
-fi
+# --- boot the installed system (gates KVM/OVMF/golden disk; SKIPs clean) -
+# shellcheck source=_installed_boot.sh
+source "$PROJ_ROOT/scripts/_installed_boot.sh"
 
-# --- build the image --------------------------------------------------
-if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
-    echo "[test_useradd] building disk image via build_img.sh"
-    rm -f "$HAMNIX_IMG"
-    bash "$PROJ_ROOT/scripts/build_img.sh"
-fi
-if [ ! -f "$HAMNIX_IMG" ]; then
-    echo "[test_useradd] FAIL: $HAMNIX_IMG missing after build_img.sh." >&2
-    exit 1
-fi
-
-OVMF_RW=$(mktemp --tmpdir hamnix-ua.ovmf.XXXXXX.fd)
-IMG_RW=$(mktemp --tmpdir hamnix-ua.disk.XXXXXX.img)
-LOG1=$(mktemp --tmpdir hamnix-ua.b1.XXXXXX.log)
-LOG2=$(mktemp --tmpdir hamnix-ua.b2.XXXXXX.log)
-INFIFO=$(mktemp --tmpdir -u hamnix-ua-in.XXXXXX)
-cp "$OVMF_FD" "$OVMF_RW"
-# IMPORTANT: the SAME IMG_RW is reused across both boots — boot 1's
-# useradd edits to .hamnix-roots + the new bob/ dir must persist for
-# boot 2's sentinel-parser assertion. So we do NOT re-copy the pristine
-# image between boots.
-cp "$HAMNIX_IMG" "$IMG_RW"
-mkfifo "$INFIFO"
-
-cleanup() {
-    [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null
-    rm -f "$OVMF_RW" "$IMG_RW" "$INFIFO"
-}
-trap cleanup EXIT
-
-boot_wait() {
-    # $1 = log file to watch. Returns 0 on prompt seen, 1 otherwise.
-    local log="$1"
-    local i
-    for i in $(seq 1 "$SHELL_BOOT_WAIT"); do
-        if grep -a -q "$PROMPT_MARKER" "$log"; then
-            return 0
-        fi
-        if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-            echo "[test_useradd] qemu exited before reaching the prompt." >&2
-            tail -80 "$log" >&2
-            return 1
-        fi
-        sleep 1
-    done
-    return 1
-}
-
-type_cmd() {
-    printf '%s\n' "$1" >&3
-    sleep "${2:-4}"
-}
+type_cmd() { installed_type "$1" "${2:-4}"; }
 
 # ====================================================================
-# BOOT 1 — run useradd + exercise the live #bob home server.
+# BOOT 1 — run useradd + exercise the live #bob home server. The helper's
+# per-test writable disk copy persists boot-1's edits into boot-2.
 # ====================================================================
-exec 4<>"$INFIFO"
-exec 3>"$INFIFO"
-
-qemu-system-x86_64 \
-    -enable-kvm -cpu host \
-    -bios "$OVMF_RW" \
-    -drive file="$IMG_RW",format=raw,if=virtio \
-    -m 512M \
-    -nographic -no-reboot -monitor none \
-    -serial stdio \
-    <&4 > "$LOG1" 2>&1 &
-QEMU_PID=$!
+installed_boot_start
 
 echo "[test_useradd] BOOT 1: waiting up to ${SHELL_BOOT_WAIT}s for prompt..."
-if ! boot_wait "$LOG1"; then
+if ! installed_boot_wait; then
     echo "[test_useradd] FAIL: BOOT 1 prompt marker not seen." >&2
     exit 1
 fi
@@ -226,30 +150,21 @@ fi
 type_cmd "echo $M_DONE" 2
 sleep 3
 
-kill "$QEMU_PID" 2>/dev/null
-wait "$QEMU_PID" 2>/dev/null
-exec 3>&-
-exec 4>&-
+installed_boot_stop
+
+# Capture boot-1's log before BOOT 2 overwrites $INSTALLED_LOG.
+LOG1="$INSTALLED_LOG"
 
 # ====================================================================
-# BOOT 2 — reboot the SAME disk; the sentinel parser should now find the
-# durable `bob bob` line + top-level bob/ dir and log `#bob -> bob`.
+# BOOT 2 — reboot the SAME (per-test) disk copy; the sentinel parser
+# should now find the durable `bob bob` line + top-level bob/ dir and log
+# `#bob -> bob`. The helper reuses boot-1's writable disk copy, so bob's
+# edits persist.
 # ====================================================================
 echo "[test_useradd] BOOT 2: rebooting the same disk to verify durable .hamnix-roots edit..."
-exec 4<>"$INFIFO"
-exec 3>"$INFIFO"
+installed_boot_start
 
-qemu-system-x86_64 \
-    -enable-kvm -cpu host \
-    -bios "$OVMF_RW" \
-    -drive file="$IMG_RW",format=raw,if=virtio \
-    -m 512M \
-    -nographic -no-reboot -monitor none \
-    -serial stdio \
-    <&4 > "$LOG2" 2>&1 &
-QEMU_PID=$!
-
-if ! boot_wait "$LOG2"; then
+if ! installed_boot_wait; then
     echo "[test_useradd] FAIL: BOOT 2 prompt marker not seen." >&2
     exit 1
 fi
@@ -257,10 +172,10 @@ echo "[test_useradd] BOOT 2: prompt reached."
 type_cmd "echo HAMNIX_UA_BOOT2_DONE" 2
 sleep 2
 
-kill "$QEMU_PID" 2>/dev/null
-wait "$QEMU_PID" 2>/dev/null
-exec 3>&-
-exec 4>&-
+installed_boot_stop
+
+# Capture boot-2's log.
+LOG2="$INSTALLED_LOG"
 
 echo "[test_useradd] --- BOOT 1 serial log ---"
 cat "$LOG1"
@@ -271,7 +186,7 @@ echo "[test_useradd] --- end serial logs ---"
 # Sanitize boot-1 log (strip CRs + CSI/SGR escapes; busybox ls colorizes).
 CLEAN=$(mktemp --tmpdir hamnix-ua.clean.XXXXXX.log)
 sed -e 's/\r//g' -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' "$LOG1" > "$CLEAN"
-trap 'cleanup; rm -f "$CLEAN"' EXIT
+trap '_ib_cleanup; rm -f "$CLEAN"' EXIT
 
 slice() {
     awk -v a="$1" -v b="$2" '

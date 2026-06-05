@@ -17,11 +17,12 @@
 # all subsequent flushes land on the stick.
 #
 # Flow:
-#   1. build build/hamnix.img via build_img.sh (preallocates \LOG.TXT)
+#   1. build the ESP-only installer medium build/hamnix-installer.img via
+#      build_installer_img.sh (its media ESP now preallocates \LOG.TXT) —
+#      this IS the real USB stick the serial-less NUC boots on.
 #   2. boot it under OVMF as a USB MASS-STORAGE device on qemu-xhci, with
-#      NO virtio/AHCI/NVMe disk attached (same QEMU shape as
-#      scripts/test_img_usb_boot.sh) far enough to log boot markers, then
-#      power it down.
+#      NO virtio/AHCI/NVMe disk attached, far enough to log boot markers,
+#      then power it down.
 #   3. pull \LOG.TXT back OFF partition 1 (the FAT ESP) of the RESULTING
 #      disk image with `mcopy -i ...@@<offset>` (same readback as
 #      scripts/test_esp_boot_log.sh).
@@ -33,11 +34,11 @@
 # usb-storage, or mcopy are unavailable.
 #
 # Env overrides:
-#   HAMNIX_IMG         image path                (default: build/hamnix.img)
+#   HAMNIX_INSTALLER_IMG  installer medium path  (default: build/hamnix-installer.img)
 #   OVMF_FD            OVMF firmware path        (default: auto-resolved)
-#   BOOT_WAIT          seconds to wait for the   (default: 90)
+#   BOOT_WAIT          seconds to wait for the   (default: 200)
 #                      shell-ready marker
-#   HAMNIX_SKIP_BUILD  1 = reuse existing image  (default: rebuild)
+#   HAMNIX_SKIP_BUILD  1 = reuse an existing installer medium (no rebuild)
 
 set -uo pipefail
 
@@ -47,8 +48,8 @@ cd "$PROJ_ROOT"
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
 
-HAMNIX_IMG="${HAMNIX_IMG:-build/hamnix.img}"
-BOOT_WAIT="${BOOT_WAIT:-90}"
+HAMNIX_INSTALLER_IMG="${HAMNIX_INSTALLER_IMG:-build/hamnix-installer.img}"
+BOOT_WAIT="${BOOT_WAIT:-200}"
 # Markers the kernel logs during boot. The early one proves we captured
 # the start of boot; the late one proves a later boot PHASE made it to
 # the USB ESP too (the whole point — not just the last few lines).
@@ -110,25 +111,25 @@ if ! command -v mcopy >/dev/null 2>&1; then
     exit 0
 fi
 
-# --- build the image --------------------------------------------------
+# --- build the installer medium ---------------------------------------
 if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
-    echo "[test_esp_log_usb] building disk image via build_img.sh"
-    rm -f "$HAMNIX_IMG"
-    bash "$PROJ_ROOT/scripts/build_img.sh"
+    echo "[test_esp_log_usb] building the ESP-only installer medium via build_installer_img.sh"
+    rm -f "$HAMNIX_INSTALLER_IMG"
+    bash "$PROJ_ROOT/scripts/build_installer_img.sh"
 fi
-if [ ! -f "$HAMNIX_IMG" ]; then
-    echo "[test_esp_log_usb] FAIL: $HAMNIX_IMG missing after build_img.sh." >&2
+if [ ! -f "$HAMNIX_INSTALLER_IMG" ]; then
+    echo "[test_esp_log_usb] FAIL: $HAMNIX_INSTALLER_IMG missing after build_installer_img.sh." >&2
     exit 1
 fi
 
 # --- locate the ESP (partition 1) byte offset within the image --------
-# build_img.sh aligns the ESP at 1 MiB. Read it back from the GPT so this
-# test stays correct if the layout math changes.
+# build_installer_img.sh aligns the ESP at 1 MiB. Read it back from the
+# GPT so this test stays correct if the layout math changes.
 PARTED="/sbin/parted"
 [ -x "$PARTED" ] || PARTED="$(command -v parted || true)"
 ESP_START_SECTOR=""
 if [ -n "$PARTED" ]; then
-    ESP_START_SECTOR=$("$PARTED" -s "$HAMNIX_IMG" unit s print 2>/dev/null \
+    ESP_START_SECTOR=$("$PARTED" -s "$HAMNIX_INSTALLER_IMG" unit s print 2>/dev/null \
         | awk '/^ *1 /{gsub(/s/,"",$2); print $2; exit}')
 fi
 if ! [[ "$ESP_START_SECTOR" =~ ^[0-9]+$ ]]; then
@@ -143,7 +144,7 @@ IMG_RW=$(mktemp --tmpdir hamnix-esplog-usb.disk.XXXXXX.img)
 LOG=$(mktemp --tmpdir hamnix-esplog-usb.XXXXXX.log)
 RECOVERED=$(mktemp --tmpdir hamnix-esplog-usb.recovered.XXXXXX.txt)
 cp "$OVMF_FD" "$OVMF_RW"
-cp "$HAMNIX_IMG" "$IMG_RW"
+cp "$HAMNIX_INSTALLER_IMG" "$IMG_RW"
 
 cleanup() {
     [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null

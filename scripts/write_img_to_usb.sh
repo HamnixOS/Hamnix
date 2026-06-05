@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# scripts/write_img_to_usb.sh — flash build/hamnix.img to a USB stick.
+# scripts/write_img_to_usb.sh — flash build/hamnix-installer.img to a USB stick.
 #
-# Hamnix ships a UEFI-only raw GPT disk image (build/hamnix.img, built by
-# scripts/build_img.sh): a FAT ESP that the firmware boots + an ext4 root
-# the kernel binds as '#sysroot'. Flashing it to a USB stick (or any disk)
-# gives a bootable installed system.
+# Hamnix ships a UEFI-only ESP-only GPT installer medium
+# (build/hamnix-installer.img, built by scripts/build_installer_img.sh): a
+# FAT ESP that the firmware boots into the in-RAM installer, which then lays
+# a real GPT + ext4 root onto the target disk. Flashing this medium to a USB
+# stick gives a bootable installer (a real system is installed onto a disk,
+# never shipped as a pre-baked root image).
 #
 # Wrapper around `sudo dd` with the safety checks the bare `dd` invocation
 # in docs/REAL_HARDWARE.md doesn't enforce:
 #
-#   - refuses to run unless build/hamnix.img exists (suggests build_img.sh)
+#   - refuses to run unless the medium exists (suggests build_installer_img.sh)
 #   - refuses /dev/sda by default (typical host system disk lives there)
 #   - refuses devices >64 GiB by default (looks more like an internal disk
 #     than a USB stick) unless --force is passed
@@ -24,7 +26,7 @@
 # Flags:
 #   --force                   allow devices larger than 64 GiB
 #   --really-i-mean-sda       allow /dev/sda explicitly
-#   --img PATH                use a different image (default: build/hamnix.img)
+#   --img PATH                use a different image (default: build/hamnix-installer.img)
 #   --yes                     skip the interactive confirmation prompt
 #                             (still prints the partition table; for CI)
 #
@@ -34,11 +36,11 @@
 set -euo pipefail
 
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMG_DEFAULT="$PROJ_ROOT/build/hamnix.img"
+IMG_DEFAULT="$PROJ_ROOT/build/hamnix-installer.img"
 
 usage() {
     cat <<EOF
-write_img_to_usb.sh — flash build/hamnix.img to a USB stick.
+write_img_to_usb.sh — flash build/hamnix-installer.img to a USB stick.
 
 Usage:
     bash scripts/write_img_to_usb.sh /dev/sdX [flags]
@@ -54,10 +56,10 @@ Flags:
 The script wraps:
     sudo dd if=<img> of=/dev/sdX bs=4M conv=fsync status=progress
 
-It refuses to run if the image is missing (suggests scripts/build_img.sh),
-prints the device size / model / current partitions, and prompts for an
-explicit 'yes' before writing. See docs/REAL_HARDWARE.md for the full
-real-hardware boot procedure.
+It refuses to run if the image is missing (suggests
+scripts/build_installer_img.sh), prints the device size / model / current
+partitions, and prompts for an explicit 'yes' before writing. See
+docs/REAL_HARDWARE.md for the full real-hardware boot procedure.
 EOF
 }
 
@@ -121,7 +123,7 @@ fi
 if [ ! -f "$IMG_PATH" ]; then
     echo "[write_img_to_usb] ERROR: image not found at '$IMG_PATH'." >&2
     if [ "$IMG_PATH" = "$IMG_DEFAULT" ]; then
-        echo "[write_img_to_usb]   Build it first:  bash scripts/build_img.sh" >&2
+        echo "[write_img_to_usb]   Build it first:  bash scripts/build_installer_img.sh" >&2
     else
         echo "[write_img_to_usb]   Pass --img PATH to point at an existing image." >&2
     fi
@@ -133,7 +135,7 @@ GPT_SIG=$(dd if="$IMG_PATH" bs=1 skip=512 count=8 2>/dev/null || true)
 if [ "$GPT_SIG" != "EFI PART" ]; then
     echo "[write_img_to_usb] ERROR: '$IMG_PATH' is not a GPT disk image" >&2
     echo "[write_img_to_usb]   (no 'EFI PART' signature at LBA 1)." >&2
-    echo "[write_img_to_usb]   Build it with: bash scripts/build_img.sh" >&2
+    echo "[write_img_to_usb]   Build it with: bash scripts/build_installer_img.sh" >&2
     file "$IMG_PATH" >&2 || true
     exit 1
 fi
