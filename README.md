@@ -57,13 +57,24 @@ loop through userspace-posted srvfds. See
   apt/dpkg). Asus i5-4210U boots to hamsh prompt in Legacy/BIOS mode
   (built-in keyboard unresponsive — leading hypothesis: EHCI-routed,
   not i8042). See [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md).
+- **In-RAM installer image** (`build/hamnix-installer.img`) via
+  `scripts/build_installer_img.sh` — **the recommended real-hardware
+  artifact.** An ESP-only GPT image: UEFI firmware loads the installer
+  kernel plus an embedded squashfs of the root filesystem entirely into
+  RAM, so Hamnix never reads the boot medium after handoff (the
+  unfinished native USB driver is never on the path). The in-RAM
+  installer partitions the target's internal NVMe, writes a persistent
+  ext4 root + ESP, and reboots off the NVMe alone. Proven end-to-end
+  under OVMF+KVM by `scripts/test_installer_nvme_inram.sh`.
 - **UEFI-only GPT disk image** (`build/hamnix.img`) via
   `scripts/build_img.sh` — a raw, installed-system-shaped disk: a FAT
   EFI System Partition (the native PE/COFF stub + kernel ELF) plus a
   512 MiB ext4 root. UEFI firmware launches the stub, which SFSP-loads
   the kernel off the ESP; the kernel then boots entirely off the ext4
-  root (no embedded cpio). BIOS/legacy boot is dropped; Hamnix is
-  UEFI-only by design.
+  root (no embedded cpio). The right artifact for **VM boot** and direct
+  disk provisioning; its kernel mounts root off the boot medium, so it
+  is not the preferred USB-stick path on real hardware. BIOS/legacy boot
+  is dropped; Hamnix is UEFI-only by design.
 - **Linux ABI** — ~250 syscalls; 24 stock Debian `.ko` modules load
   cleanly. CPython 3.11.10 and busybox 1.36 run as musl static-PIE
   binaries. Real Debian `apt 3.0.3` + `dpkg 1.22.22` install packages
@@ -170,20 +181,29 @@ testing also `ovmf`.
 git clone https://github.com/HamnixOS/Hamnix
 cd Hamnix
 
-./scripts/build_img.sh                 # produces build/hamnix.img (UEFI GPT disk)
+./scripts/build_installer_img.sh       # produces build/hamnix-installer.img (real-HW installer)
+./scripts/build_img.sh                 # produces build/hamnix.img (UEFI GPT disk, VM/provision)
 ./scripts/test_img_uefi_boot.sh        # boots hamnix.img under OVMF (apt install ovmf)
 ```
 
+`build/hamnix-installer.img` is the **recommended real-hardware
+artifact**: an ESP-only GPT image whose kernel + embedded squashfs root
+are loaded entirely into RAM by firmware, so Hamnix never reads the boot
+medium. It then writes a persistent ext4 root to the target's internal
+NVMe and reboots off that disk alone — keeping the unfinished native USB
+driver off the boot path.
+
 `build/hamnix.img` is a raw, installed-system-shaped GPT disk image
 (UEFI-only): a FAT EFI System Partition carrying the PE/COFF stub +
-kernel ELF, and an ext4 root the kernel boots off directly. Hamnix is
+kernel ELF, and an ext4 root the kernel boots off directly. It is the
+right artifact for VM boot and direct disk provisioning. Hamnix is
 UEFI-only; there is no BIOS/GRUB path. (`scripts/build_iso.sh` is now a
 thin deprecation shim that delegates to `build_img.sh`.)
 
-Flash to USB and boot on real hardware:
+Flash to USB and boot on real hardware (use the installer image):
 
 ```bash
-sudo dd if=build/hamnix.img of=/dev/sdX bs=4M conv=fsync status=progress   # confirm /dev/sdX first!
+sudo dd if=build/hamnix-installer.img of=/dev/sdX bs=4M conv=fsync status=progress   # confirm /dev/sdX first!
 sync
 ```
 

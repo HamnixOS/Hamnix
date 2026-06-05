@@ -1,17 +1,25 @@
 # Booting Hamnix
 
-Hamnix is **UEFI-only**. The user-facing, installable artifact is a raw
-GPT disk image shaped exactly like an installed system,
-`build/hamnix.img`, built by `scripts/build_img.sh`. There is no
-BIOS/GRUB/El-Torito/hybrid-MBR path anymore; legacy boot was dropped.
+Hamnix is **UEFI-only**. There is no BIOS/GRUB/El-Torito/hybrid-MBR path
+anymore; legacy boot was dropped.
 
-This document covers the two ways to boot Hamnix today:
+This document covers the three ways to boot Hamnix today:
 
-1. **Installed-system disk image** (`build/hamnix.img`) — the shipped
-   artifact. UEFI firmware boots it the way a real install boots; the
-   kernel then runs entirely off the image's ext4 root (no embedded
-   cpio). This is the priority path.
-2. **Developer dev loop** via `scripts/run_x86_bare.sh` — boots the
+1. **In-RAM installer image** (`build/hamnix-installer.img`) — the
+   recommended artifact for **real hardware** (built by
+   `scripts/build_installer_img.sh`). An ESP-only GPT image: the firmware
+   loads the installer kernel + an embedded squashfs of the root
+   filesystem entirely into RAM, so Hamnix never reads the boot medium.
+   The in-RAM installer then writes a persistent ext4 root + ESP to the
+   target's internal NVMe disk and reboots. This sidesteps the unfinished
+   native USB driver. See §3.
+2. **Installed-system disk image** (`build/hamnix.img`, built by
+   `scripts/build_img.sh`) — UEFI firmware boots it the way a real
+   install boots; the kernel then runs entirely off the image's ext4 root
+   (no embedded cpio). The right artifact for **VM boot** and direct disk
+   provisioning, but its kernel mounts root off the boot medium, so it is
+   not the preferred USB-stick path on real hardware.
+3. **Developer dev loop** via `scripts/run_x86_bare.sh` — boots the
    kernel ELF directly under QEMU `-kernel` (through a small GRUB-ISO
    PATH shim). This developer/test path STILL boots from an embedded
    cpio root, so the in-kernel cpio machinery is retained for it; the
@@ -356,6 +364,29 @@ A USB stick written this way is bootable from **UEFI firmware only**
 There is no legacy/BIOS MBR boot path — enable UEFI in firmware setup.
 
 ## 3. Real-hardware boot
+
+The recommended real-hardware artifact is the **in-RAM installer image**,
+built by:
+
+```sh
+bash scripts/build_installer_img.sh        # -> build/hamnix-installer.img
+```
+
+This is an ESP-only GPT image. UEFI firmware loads the installer kernel
+plus an embedded squashfs of the root filesystem **entirely into RAM**,
+so Hamnix never reads the boot medium after the firmware hands off — the
+unfinished native USB driver is never on the path. The in-RAM installer
+then partitions the target's internal NVMe disk, writes a persistent
+ext4 root + ESP onto it, and reboots off the NVMe alone. Write it to a
+USB stick exactly like any disk image:
+
+```sh
+sudo dd if=build/hamnix-installer.img of=/dev/sdX bs=4M conv=fsync status=progress
+```
+
+The four-step model (firmware loads blob → in-RAM installer shell →
+write ext4-on-NVMe → reboot off NVMe) is proven end-to-end under
+OVMF+KVM by `scripts/test_installer_nvme_inram.sh`.
 
 For the full install + boot procedure on physical machines (USB stick
 write, firmware boot menus per vendor, expected hardware coverage,

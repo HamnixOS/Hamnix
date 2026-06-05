@@ -4,9 +4,27 @@ This document is the practical, mechanical guide for putting the Hamnix
 disk image on a USB stick, booting it on real x86_64 hardware, and
 reporting what worked + what didn't.
 
-Hamnix is **UEFI-only**. The installable artifact is `build/hamnix.img`,
-a raw GPT disk image shaped like an installed system (built by
-`scripts/build_img.sh`). There is no BIOS/legacy/CSM boot path.
+Hamnix is **UEFI-only**. There is no BIOS/legacy/CSM boot path.
+
+**The recommended real-hardware install artifact is the in-RAM installer
+image, `build/hamnix-installer.img`** (built by
+`scripts/build_installer_img.sh`). This is the path that works around the
+unfinished native USB driver on real machines: UEFI firmware loads the
+whole installer — kernel plus a squashfs of the root filesystem — into
+RAM off the USB stick's ESP, so **Hamnix never has to read the USB stick
+itself**. The in-RAM installer then writes a full ext4 root + ESP onto
+the target's internal **NVMe** disk (native NVMe driver) and reboots into
+a persistent installed system. See §3.
+
+> **Why not just `dd` `build/hamnix.img` to the stick?** `build/hamnix.img`
+> (built by `scripts/build_img.sh`) is an *installed-system-shaped* image:
+> its kernel mounts the ext4 root off the **boot medium** at runtime. In a
+> VM (virtio-blk / emulated NVMe) that works fine, and it remains the right
+> artifact for VM boot and direct disk provisioning. But on a real NUC the
+> boot medium is the USB stick, so that runtime root read goes through the
+> native xHCI/USB driver, which is broken on that hardware — the very
+> reason the in-RAM installer exists. Prefer `build/hamnix-installer.img`
+> for physical machines.
 
 It **extends** [`BOOT.md`](BOOT.md) — that doc covers QEMU and the
 disk-image build pipeline; this one covers the steps and expectations
@@ -31,16 +49,18 @@ a target box you can power-cycle:
 
 ```sh
 # On the build host:
-bash scripts/build_img.sh                           # ~30s if cached, ~3 min cold
-sudo dd if=build/hamnix.img of=/dev/sdX bs=4M conv=fsync status=progress  # confirm /dev/sdX first!
+bash scripts/build_installer_img.sh                 # produces build/hamnix-installer.img (ESP-only)
+sudo dd if=build/hamnix-installer.img of=/dev/sdX bs=4M conv=fsync status=progress  # confirm /dev/sdX first!
 sync
 ```
 
 Then plug the stick into the target box, enter the UEFI firmware boot
 menu (see vendor key table in §4), pick the USB device, and watch the
-serial console — or screen, if no serial cable. You're looking for
-the marker sequence in §5. Total time after the first image build is
-< 5 min per attempt; report results to the GitHub issue tracker (§8).
+serial console — or screen, if no serial cable. The firmware loads the
+installer entirely into RAM (no USB read by Hamnix); the installer writes
+a fresh ext4 root + ESP to the internal NVMe disk and you reboot off NVMe.
+You're looking for the marker sequence in §5. Report results to the
+GitHub issue tracker (§8).
 
 The rest of this doc unpacks each step.
 
@@ -280,22 +300,44 @@ the surface below is still QEMU + OVMF verification only.
 
 ## 3. Producing a bootable USB stick
 
-### Build the disk image
+### Build the installer image (recommended for real hardware)
 
 From a Linux build host:
 
 ```sh
 git clone https://github.com/ruapotato/Hamnix.git
 cd Hamnix
+bash scripts/build_installer_img.sh   # produces build/hamnix-installer.img (ESP-only)
+file build/hamnix-installer.img       # should report:
+                                      #   DOS/MBR boot sector ... GPT ...
+```
+
+`build/hamnix-installer.img` is a raw GPT disk image with a **single**
+FAT ESP partition. The ESP carries the UEFI stub (`\EFI\BOOT\BOOTX64.EFI`)
+and the **installer kernel**, whose embedded cpio holds a squashfs of the
+root filesystem (the ext4 image + the target's ESP image). There is **no
+ext4 partition on the stick** — the whole installer rides in the
+firmware-loaded blob, so Hamnix never reads the USB stick. On boot the
+in-RAM installer (`etc/install_nvme.hamsh`) partitions the target's
+internal NVMe disk, streams the ext4 root + ESP onto it from the in-RAM
+squashfs, and the machine reboots into a persistent NVMe-rooted system.
+
+### Build the installed-system disk image (VM / direct-provision)
+
+For VM boot or when you are writing directly to the target's disk (not a
+USB stick), build the installed-system image instead:
+
+```sh
 bash scripts/build_img.sh          # produces build/hamnix.img (~546 MB)
-file build/hamnix.img              # should report:
-                                   #   DOS/MBR boot sector ... GPT ...
 ```
 
 `build/hamnix.img` is a raw GPT disk image: a 32 MiB FAT ESP
 (partition 1, carrying the UEFI stub + `hamnix-kernel.elf`) followed
 by a 512 MiB ext4 root partition (partition 2, carrying the userland
-and the `.hamnix-roots` sentinel). The total is ~546 MiB.
+and the `.hamnix-roots` sentinel). Its kernel mounts the ext4 root off
+the **boot medium** — fine over virtio/NVMe in a VM, but on a USB stick
+that runtime read needs the native USB driver (see the note in the
+intro). For physical machines, prefer the installer image above.
 
 Required Debian/Ubuntu packages:
 
@@ -324,14 +366,16 @@ disk).
 
 ### Write the image — Linux
 
-`build/hamnix.img` is a raw disk image — write it byte-for-byte to the
-USB stick with `dd`. **Confirm the target device first** (see above);
-`dd` will silently destroy whichever device you point it at.
+`build/hamnix-installer.img` is a raw disk image — write it byte-for-byte
+to the USB stick with `dd`. **Confirm the target device first** (see
+above); `dd` will silently destroy whichever device you point it at.
+(Substitute `build/hamnix.img` if you deliberately want the
+installed-system image rather than the installer.)
 
 ```sh
 USB=/dev/sdX                       # replace X with the letter you confirmed above
 sudo umount ${USB}?* 2>/dev/null   # unmount any auto-mounted partitions
-sudo dd if=build/hamnix.img of=$USB bs=4M conv=fsync status=progress
+sudo dd if=build/hamnix-installer.img of=$USB bs=4M conv=fsync status=progress
 sync
 ```
 
