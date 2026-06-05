@@ -70,7 +70,14 @@ if [ -f "$_IB_ROOT/$GOLDEN_NVME" ]; then
 fi
 [ -f "$GOLDEN_NVME" ] || _ib_skip "golden installed disk could not be built (see build_installed_nvme.sh output)"
 
-# --- per-boot scratch state -------------------------------------------
+# --- per-test scratch state -------------------------------------------
+# The writable disk + OVMF copy are created ONCE per test (on the first
+# installed_boot_start) and REUSED across subsequent boots in the same test,
+# so a multi-boot test (e.g. useradd: write on boot 1, verify persistence on
+# boot 2) sees its own writes survive — exactly like the old single-IMG_RW
+# two-boot pattern. The COPY is per-test (never the golden disk itself), so a
+# state-mutating test can never poison the golden master. The log + input
+# fifo are fresh PER BOOT.
 INSTALLED_LOG=""
 _IB_OVMF_RW=""
 _IB_DISK_RW=""
@@ -83,16 +90,20 @@ _ib_cleanup() {
 }
 trap _ib_cleanup EXIT
 
-# installed_boot_start — boot a FRESH copy of the golden disk; opens fd 3 as
-# the guest's serial stdin and captures the console to $INSTALLED_LOG.
+# installed_boot_start — boot the test's writable installed disk; opens fd 3
+# as the guest's serial stdin and captures the console to $INSTALLED_LOG.
+# The first call makes a fresh per-test COPY of the golden disk; later calls
+# reuse that same copy (writes from earlier boots persist).
 installed_boot_start() {
-    _IB_OVMF_RW=$(mktemp --tmpdir hamnix-ib.ovmf.XXXXXX.fd)
-    _IB_DISK_RW=$(mktemp --tmpdir hamnix-ib.disk.XXXXXX.qcow2)
+    if [ -z "$_IB_DISK_RW" ]; then
+        _IB_OVMF_RW=$(mktemp --tmpdir hamnix-ib.ovmf.XXXXXX.fd)
+        _IB_DISK_RW=$(mktemp --tmpdir hamnix-ib.disk.XXXXXX.qcow2)
+        cp "$OVMF_FD" "$_IB_OVMF_RW"
+        # Per-test writable copy so state-mutating tests never poison golden.
+        cp "$GOLDEN_NVME" "$_IB_DISK_RW"
+    fi
     INSTALLED_LOG=$(mktemp --tmpdir hamnix-ib.boot.XXXXXX.log)
     _IB_INFIFO=$(mktemp --tmpdir -u hamnix-ib-in.XXXXXX)
-    cp "$OVMF_FD" "$_IB_OVMF_RW"
-    # Fresh writable copy so state-mutating tests never poison the golden disk.
-    cp "$GOLDEN_NVME" "$_IB_DISK_RW"
     mkfifo "$_IB_INFIFO"
 
     exec 4<>"$_IB_INFIFO"
@@ -137,10 +148,14 @@ installed_type() {
     sleep "${2:-4}"
 }
 
-# installed_boot_stop — stop the guest and close the serial fds.
+# installed_boot_stop — stop the guest, close the serial fds, and drop the
+# per-boot input fifo (the writable disk persists for any subsequent boot).
 installed_boot_stop() {
     kill "$QEMU_PID" 2>/dev/null
     wait "$QEMU_PID" 2>/dev/null
     exec 3>&- 2>/dev/null || true
     exec 4>&- 2>/dev/null || true
+    rm -f "$_IB_INFIFO"
+    _IB_INFIFO=""
+    QEMU_PID=""
 }
