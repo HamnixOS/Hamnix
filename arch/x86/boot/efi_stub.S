@@ -194,7 +194,14 @@
      */
     .equ EFI_MMAP_BUF_SIZE,         65536
     .equ EFI_EXIT_RETRY_MAX,        4
+    /* KERNEL_ELF_BUF_SIZE is now only a last-resort fallback used when
+     * EFI_FILE.GetInfo fails to report the kernel's real size; the
+     * primary path queries the actual file size and allocates exactly
+     * that (+1 guard page), so the buffer can never truncate the kernel
+     * ELF however large it grows (the embedded initramfs/squashfs is the
+     * size driver — a self-hosted installer kernel exceeds 120 MiB). */
     .equ KERNEL_ELF_BUF_SIZE,       (96 * 1024 * 1024)
+    .equ EFI_FILE_INFO_BUF_SIZE,    512
     .equ HAMNIX_HANDOFF_MAGIC,      0x484D4158  /* "HAMX" */
     .equ MULTIBOOT1_MAGIC,          0x1BADB002
 
@@ -324,7 +331,50 @@ efi_main:
     testq   %rax, %rax
     jnz     .Lefi_elfload_fail
 
-    /* ----- 4e. AllocatePool(EfiLoaderData, KERNEL_ELF_BUF_SIZE, &Buffer) -
+    /* ----- 4d.5 File->GetInfo(EFI_FILE_INFO) to learn the real size --
+     *
+     * EFI_FILE_PROTOCOL.GetInfo is at offset 64.
+     * Signature:
+     *   EFI_STATUS GetInfo(EFI_FILE_PROTOCOL *This,    // rcx
+     *                      EFI_GUID *InformationType,  // rdx
+     *                      UINTN *BufferSize,          // r8 (IN/OUT)
+     *                      VOID *Buffer);              // r9
+     * On success efi_file_info_buf+8 holds the 64-bit FileSize. On any
+     * error we fall back to the fixed KERNEL_ELF_BUF_SIZE allocation.
+     */
+    movq    $EFI_FILE_INFO_BUF_SIZE, efi_file_info_size(%rip)
+    movq    efi_kernel_file(%rip), %rcx
+    leaq    file_info_guid(%rip), %rdx
+    leaq    efi_file_info_size(%rip), %r8
+    leaq    efi_file_info_buf(%rip), %r9
+    movq    efi_kernel_file(%rip), %rax
+    movq    64(%rax), %rax                  /* ->GetInfo */
+    subq    $0x20, %rsp
+    call    *%rax
+    addq    $0x20, %rsp
+    testq   %rax, %rax
+    jnz     .Lefi_getinfo_fallback
+
+    /* FileSize lives at offset 8 of EFI_FILE_INFO. Round up to a 4 KiB
+     * page and add one guard page so the ELF magic + phdr walk can never
+     * run off the tail of the allocation. */
+    movq    efi_file_info_buf+8(%rip), %rax
+    addq    $0x1fff, %rax
+    andq    $-0x1000, %rax
+    /* Floor at 1 MiB to guard against a bogus/zero reported size. */
+    cmpq    $0x100000, %rax
+    jae     .Lefi_size_ok
+    movq    $0x100000, %rax
+.Lefi_size_ok:
+    movq    %rax, efi_kernel_alloc_size(%rip)
+    jmp     .Lefi_have_size
+
+.Lefi_getinfo_fallback:
+    movq    $KERNEL_ELF_BUF_SIZE, efi_kernel_alloc_size(%rip)
+
+.Lefi_have_size:
+
+    /* ----- 4e. AllocatePool(EfiLoaderData, alloc_size, &Buffer) ------
      *
      * EFI_BOOT_SERVICES.AllocatePool is at offset 64.
      * Signature:
@@ -334,7 +384,7 @@ efi_main:
      * EfiLoaderData = 2.
      */
     movq    $2, %rcx                        /* EfiLoaderData */
-    movq    $KERNEL_ELF_BUF_SIZE, %rdx
+    movq    efi_kernel_alloc_size(%rip), %rdx
     leaq    efi_kernel_buf(%rip), %r8
     movq    efi_boot_services(%rip), %rax
     movq    64(%rax), %rax                  /* ->AllocatePool */
@@ -347,10 +397,11 @@ efi_main:
     /* ----- 4f. File->Read(File, &BufferSize, Buffer) ---------------
      *
      * EFI_FILE_PROTOCOL.Read is at offset 32.
-     * BufferSize is IN/OUT: we set it to our capacity, the call
-     * writes back the actual bytes read.
+     * BufferSize is IN/OUT: we set it to our allocation capacity (>= the
+     * real file size), the call writes back the actual bytes read.
      */
-    movq    $KERNEL_ELF_BUF_SIZE, efi_kernel_size(%rip)
+    movq    efi_kernel_alloc_size(%rip), %rax
+    movq    %rax, efi_kernel_size(%rip)
     movq    efi_kernel_file(%rip), %rcx
     leaq    efi_kernel_size(%rip), %rdx
     movq    efi_kernel_buf(%rip), %r8
@@ -1307,6 +1358,15 @@ sfsp_guid:
     .short  0x11d2
     .byte   0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b
 
+    /* EFI_FILE_INFO_GUID:
+     *   09576e92-6d3f-11d2-8e39-00a0c969723b   (UEFI 2.10 §13.5) */
+    .align 8
+file_info_guid:
+    .long   0x09576e92
+    .short  0x6d3f
+    .short  0x11d2
+    .byte   0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b
+
     /* EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID:
      *   9042a9de-23dc-4a38-96fb-7aded080516a   (UEFI 2.10 §12.9) */
     .align 8
@@ -1364,6 +1424,8 @@ efi_kernel_file:            .quad 0
 efi_kernel_buf:             .quad 0
     .globl efi_kernel_size
 efi_kernel_size:            .quad 0
+efi_kernel_alloc_size:      .quad 0         /* AllocatePool capacity (real file size +1 page, or fallback) */
+efi_file_info_size:         .quad 0         /* GetInfo BufferSize (IN cap / OUT used) */
     /* Address of _x86_start_after_loader pulled out of the kernel's
      * handoff table (planted by arch/x86/boot/header.S). Stored as a
      * uint32 because the kernel is elf32-i386 (VMAs < 4 GiB). */
@@ -1489,6 +1551,10 @@ efi_stub_stack_top:
     .globl efi_mmap_buf
 efi_mmap_buf:
     .skip EFI_MMAP_BUF_SIZE
+
+    .align 16
+efi_file_info_buf:
+    .skip EFI_FILE_INFO_BUF_SIZE
 
     .align 4096
     .globl efi_pml4
