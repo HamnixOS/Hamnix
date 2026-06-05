@@ -2494,6 +2494,21 @@ if os.environ.get("ENABLE_MACVLAN_TEST") == "1":
 if os.environ.get("ENABLE_IPVLAN_TEST") == "1":
     FILES.append(("/etc/ipvlan-test", b"1\n"))
 
+# Native stateful NAT64 (RFC 6146 + the RFC 6145 stateless IP/ICMP translation
+# algorithm) self-test. scripts/test_nat64.sh sets ENABLE_NAT64_TEST=1 to plant
+# /etc/nat64-test; init/main.ad's boot:37.nat64 gate then runs nat64_selftest()
+# (drivers/net/nat64.ad), a pure in-memory test that maps IPv4 into IPv6 with
+# the RFC 6052 Well-Known Prefix 64:ff9b::/96, creates a stateful 5-tuple
+# session on the first outbound IPv6->IPv4 packet and matches the return on the
+# session table, translates UDP/TCP/ICMP Echo both ways (rewriting headers,
+# TTL/HopLimit, the pool source port, and recomputing the IPv4 header checksum
+# plus the pseudo-header L4/ICMPv6 checksums so they validate), and proves two
+# security rejections (an inbound IPv4 packet with no matching session is
+# dropped; an outbound v6 destination lacking the prefix is rejected). Prints
+# "[nat64] PASS" / "[nat64] FAIL". Default boots ship no marker.
+if os.environ.get("ENABLE_NAT64_TEST") == "1":
+    FILES.append(("/etc/nat64-test", b"1\n"))
+
 # Native L2TPv3 (RFC 3931) Ethernet-pseudowire encap/decap self-test.
 # scripts/test_l2tp.sh sets ENABLE_L2TP_TEST=1 to plant /etc/l2tp-test;
 # init/main.ad's boot:37.l2tp gate then runs l2tp_selftest()

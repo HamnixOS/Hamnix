@@ -1,0 +1,1281 @@
+# drivers/net/nat64.ad
+#
+# Native stateful NAT64 (RFC 6146) built on the RFC 6145 stateless IP/ICMP
+# translation algorithm. Like the wireguard/ipsec/sctp self-tests this carries
+# NO socket API and touches NO NIC: it is pure packet-buffer construction +
+# parsing + translation state, so the whole NAT64 data plane can be proven
+# deterministically at boot.
+#
+# NAT64 lets IPv6-only hosts reach IPv4-only servers. The IPv4 internet is
+# embedded inside IPv6 via the Well-Known Prefix 64:ff9b::/96 (RFC 6052): an
+# IPv4 address X.Y.Z.W appears to the IPv6 host as 64:ff9b::X.Y.Z.W (the IPv4
+# address occupies the LAST 32 bits of the /96).
+#
+# This module implements:
+#
+#   1. Address mapping (RFC 6052) with the Well-Known Prefix 64:ff9b::/96:
+#        v4 -> v6:  X.Y.Z.W  ==>  64:ff9b:0000:0000:0000:0000:X.Y.Z.W
+#        v6 -> v4:  the prefix is validated (the first 12 bytes MUST equal
+#                   64:ff9b:: with zero in bytes 4..11), then the trailing
+#                   4 bytes are extracted as the IPv4 address.
+#
+#   2. A stateful Binding Information Base / Session Table (RFC 6146 §3.2):
+#      an IPv6 host (v6 src addr+port) talking out to an IPv4 destination is
+#      given a binding to (the configured NAT64 pool IPv4 address + an assigned
+#      pool port). A session is keyed by the full 5-tuple. The first outbound
+#      packet CREATES the session; the matching inbound reply is LOOKED UP
+#      against the session table (matching the IPv4 dst==pool, dst port==assigned
+#      port, src==the remote IPv4, src port==the remote port, and protocol) and
+#      translated back to the original IPv6 host. An inbound packet with NO
+#      matching session is DROPPED (RFC 6146 §3.5 — no spurious state created
+#      from the outside).
+#
+#   3. IPv6 -> IPv4 translation (outbound, RFC 6145 §5):
+#      rebuild a 20-byte IPv4 header (version/IHL=0x45, TTL = HopLimit - 1,
+#      protocol = next-header, src = pool addr, dst = mapped IPv4), recompute the
+#      IPv4 header checksum (ip_csum16), and recompute the L4 checksum (TCP/UDP)
+#      over the NEW IPv4 pseudo-header (the addresses + ports changed).
+#
+#   4. IPv4 -> IPv6 translation (inbound, RFC 6145 §4):
+#      build a valid 40-byte IPv6 header (version 6, traffic class 0, flow label
+#      0, hop limit = TTL - 1, next-header = protocol), src = 64:ff9b::<remote
+#      v4>, dst = the session's original IPv6 host, recompute the L4 checksum
+#      over the IPv6 pseudo-header.
+#
+#   5. ICMP <-> ICMPv6 translation (RFC 6145 §4.2/§5.2):
+#      Echo Request  ICMPv4 type 8  <-> ICMPv6 type 128
+#      Echo Reply    ICMPv4 type 0  <-> ICMPv6 type 129
+#      The ICMP Identifier acts as the session "port". The ICMPv6 checksum,
+#      UNLIKE the ICMPv4 checksum, covers the IPv6 pseudo-header, so it is fully
+#      recomputed on each translation.
+#
+# The Internet checksum (RFC 1071) is reused from drivers/net/ip.ad (ip_csum16)
+# for the IPv4 header; the transport/ICMPv6 pseudo-header checksums are folded
+# the same RFC-1071 way in-module.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.ip import ip_csum16, IP_HDR_LEN, IPPROTO_UDP, IPPROTO_TCP, \
+    IPPROTO_ICMP
+from drivers.net.ipv6 import IP6_HDR_LEN, IP6PROTO_UDP, IP6PROTO_TCP, \
+    IP6PROTO_ICMPV6
+
+
+# --- Wire constants ---------------------------------------------------------
+
+# ICMP / ICMPv6 message types translated by NAT64 (RFC 6145 §4.2/§5.2).
+NAT64_ICMP4_ECHO_REQUEST:  uint8 = 8
+NAT64_ICMP4_ECHO_REPLY:    uint8 = 0
+NAT64_ICMP6_ECHO_REQUEST:  uint8 = 128
+NAT64_ICMP6_ECHO_REPLY:    uint8 = 129
+
+# Transport / ICMP header lengths used when laying out test packets.
+NAT64_UDP_HDR_LEN:  uint64 = 8     # sport(2) dport(2) len(2) csum(2)
+NAT64_TCP_HDR_LEN:  uint64 = 20    # minimal TCP header (no options)
+NAT64_ICMP_HDR_LEN: uint64 = 8     # type(1) code(1) csum(2) id(2) seq(2)
+
+
+# --- Session table (RFC 6146 §3.2) -----------------------------------------
+#
+# A session is keyed by the full 5-tuple as seen on the IPv6 side at creation
+# time, plus the IPv4-side mapping assigned to it. We store both halves so the
+# inbound return path can match on the IPv4 5-tuple and recover the original
+# IPv6 host + port.
+#
+# Per-session fields (parallel arrays, one row per session index):
+#   v6_src[16]   : the IPv6 host's source address (16 bytes)
+#   v6_dst[16]   : the IPv6 destination (64:ff9b::<remote v4>)
+#   v6_sport     : the IPv6 host's L4 source port (or ICMP Identifier)
+#   remote_v4    : the remote IPv4 address (extracted from v6_dst), 4 bytes
+#   remote_port  : the remote IPv4 L4 port (== v6 dst port; unchanged)
+#   pool_port    : the IPv4 source port assigned from the pool
+#   proto        : IPv4 protocol number of the session (UDP/TCP/ICMP)
+#   used         : 1 if this row is an active session
+
+NAT64_MAX_SESSIONS: uint64 = 32
+
+n64_sess_v6_src:      Array[512, uint8]    # 32 * 16
+n64_sess_v6_dst:      Array[512, uint8]    # 32 * 16
+n64_sess_remote_v4:   Array[128, uint8]    # 32 * 4
+n64_sess_v6_sport:    Array[32, uint16]
+n64_sess_remote_port: Array[32, uint16]
+n64_sess_pool_port:   Array[32, uint16]
+n64_sess_proto:       Array[32, uint8]
+n64_sess_used:        Array[32, uint8]
+
+# The configured NAT64 IPv4 pool address (RFC 6146 — the public IPv4 the
+# IPv6 hosts are masqueraded behind). 4 bytes, network order.
+n64_pool_v4: Array[4, uint8]
+
+# Next pool port to hand out (RFC 6146 §3.5.1.1 — implementation may assign
+# any free port; a monotonic counter is sufficient and deterministic here).
+n64_next_pool_port: uint16 = 0
+
+# Counters (suffixed _cnt so they never collide with a function name; in Adder
+# a function and a global share one namespace).
+n64_sessions_created_cnt: uint64 = 0
+n64_inbound_nomatch_cnt:  uint64 = 0
+n64_prefix_reject_cnt:    uint64 = 0
+
+
+# --- The Well-Known Prefix 64:ff9b::/96 (RFC 6052 §2.1) ---------------------
+# Bytes 0..1 = 0x0064, bytes 2..3 = 0xff9b, bytes 4..11 = 0, bytes 12..15 = v4.
+n64_wkp: Array[12, uint8]
+
+
+def _n64_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _n64_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _n64_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+def nat64_init():
+    # Reset the session table + configure the pool address and Well-Known
+    # Prefix. The pool address used in this model is 192.0.2.1 (TEST-NET-1,
+    # RFC 5737) so the assertions use a documented address.
+    i: uint64 = 0
+    while i < NAT64_MAX_SESSIONS:
+        n64_sess_used[i] = 0
+        n64_sess_proto[i] = 0
+        n64_sess_v6_sport[i] = 0
+        n64_sess_remote_port[i] = 0
+        n64_sess_pool_port[i] = 0
+        i = i + 1
+    n64_pool_v4[0] = 192
+    n64_pool_v4[1] = 0
+    n64_pool_v4[2] = 2
+    n64_pool_v4[3] = 1
+    n64_next_pool_port = 40000
+    n64_sessions_created_cnt = 0
+    n64_inbound_nomatch_cnt = 0
+    n64_prefix_reject_cnt = 0
+    # Well-Known Prefix 64:ff9b::/96.
+    n64_wkp[0] = 0x00
+    n64_wkp[1] = 0x64
+    n64_wkp[2] = 0xff
+    n64_wkp[3] = 0x9b
+    j: uint64 = 4
+    while j < 12:
+        n64_wkp[j] = 0
+        j = j + 1
+
+
+# --- byte helpers -----------------------------------------------------------
+
+def _n64_get16(buf: Ptr[uint8], off: uint64) -> uint16:
+    # Read a big-endian 16-bit word.
+    hi: uint32 = cast[uint32](buf[off])
+    lo: uint32 = cast[uint32](buf[off + 1])
+    return cast[uint16]((hi << 8) | lo)
+
+
+def _n64_put16(buf: Ptr[uint8], off: uint64, v: uint16):
+    # Write a big-endian 16-bit word.
+    buf[off] = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    buf[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+# --- Address mapping (RFC 6052) --------------------------------------------
+
+def nat64_v4_to_v6(v4: Ptr[uint8], out6: Ptr[uint8]):
+    # Embed an IPv4 address (4 bytes) into an IPv6 address using the
+    # Well-Known Prefix: out6 = 64:ff9b:: <v4 in the last 32 bits>.
+    i: uint64 = 0
+    while i < 12:
+        out6[i] = n64_wkp[i]
+        i = i + 1
+    out6[12] = v4[0]
+    out6[13] = v4[1]
+    out6[14] = v4[2]
+    out6[15] = v4[3]
+
+
+def nat64_v6_has_prefix(v6: Ptr[uint8]) -> int32:
+    # Return 1 if the 16-byte IPv6 address carries the Well-Known Prefix
+    # 64:ff9b::/96 (the first 12 bytes match), else 0. RFC 6146 requires the
+    # v6-side destination of an outbound packet to carry the configured prefix;
+    # anything else is not a NAT64 destination and is rejected.
+    i: uint64 = 0
+    while i < 12:
+        if v6[i] != n64_wkp[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def nat64_v6_to_v4(v6: Ptr[uint8], out4: Ptr[uint8]) -> int32:
+    # Extract the embedded IPv4 address from a 64:ff9b::/96 IPv6 address.
+    # Returns 1 on success, 0 if the prefix does not match (rejection).
+    if nat64_v6_has_prefix(v6) != 1:
+        return 0
+    out4[0] = v6[12]
+    out4[1] = v6[13]
+    out4[2] = v6[14]
+    out4[3] = v6[15]
+    return 1
+
+
+# --- Pseudo-header transport checksums --------------------------------------
+
+def _n64_l4_csum_v4(src4: Ptr[uint8], dst4: Ptr[uint8], proto: uint8,
+                    l4: Ptr[uint8], l4_len: uint64) -> uint16:
+    # RFC 768/793 IPv4 transport checksum over the pseudo-header
+    # [src(4) | dst(4) | zero(1) | proto(1) | l4_len(2)] followed by the L4
+    # header+payload. The L4 checksum field MUST be zeroed by the caller
+    # before this is computed. Returns the folded one's-complement result.
+    sum32: uint32 = 0
+    sum32 = sum32 + ((cast[uint32](src4[0]) << 8) | cast[uint32](src4[1]))
+    sum32 = sum32 + ((cast[uint32](src4[2]) << 8) | cast[uint32](src4[3]))
+    sum32 = sum32 + ((cast[uint32](dst4[0]) << 8) | cast[uint32](dst4[1]))
+    sum32 = sum32 + ((cast[uint32](dst4[2]) << 8) | cast[uint32](dst4[3]))
+    sum32 = sum32 + cast[uint32](proto)
+    sum32 = sum32 + (cast[uint32](l4_len) & 0xFFFF)
+    # L4 bytes.
+    end_pairs: uint64 = l4_len & ~cast[uint64](1)
+    p: uint64 = 0
+    while p < end_pairs:
+        sum32 = sum32 + ((cast[uint32](l4[p]) << 8) | cast[uint32](l4[p + 1]))
+        p = p + 2
+    if p < l4_len:
+        sum32 = sum32 + (cast[uint32](l4[p]) << 8)
+    while (sum32 >> 16) != 0:
+        sum32 = (sum32 & 0xFFFF) + (sum32 >> 16)
+    return cast[uint16](~sum32 & 0xFFFF)
+
+
+def _n64_l4_csum_v6(src6: Ptr[uint8], dst6: Ptr[uint8], next_hdr: uint8,
+                    l4: Ptr[uint8], l4_len: uint64) -> uint16:
+    # RFC 2460 §8.1 IPv6 pseudo-header checksum over
+    # [src(16) | dst(16) | upper-layer-len(4) | zero(3) | next_hdr(1)] then the
+    # L4 header+payload. The L4 checksum field MUST be zeroed by the caller.
+    sum32: uint32 = 0
+    i: uint64 = 0
+    while i < 16:
+        sum32 = sum32 + ((cast[uint32](src6[i]) << 8) | cast[uint32](src6[i + 1]))
+        sum32 = sum32 + ((cast[uint32](dst6[i]) << 8) | cast[uint32](dst6[i + 1]))
+        i = i + 2
+    sum32 = sum32 + (cast[uint32](l4_len) & 0xFFFF)
+    sum32 = sum32 + ((cast[uint32](l4_len) >> 16) & 0xFFFF)
+    sum32 = sum32 + cast[uint32](next_hdr)
+    end_pairs: uint64 = l4_len & ~cast[uint64](1)
+    p: uint64 = 0
+    while p < end_pairs:
+        sum32 = sum32 + ((cast[uint32](l4[p]) << 8) | cast[uint32](l4[p + 1]))
+        p = p + 2
+    if p < l4_len:
+        sum32 = sum32 + (cast[uint32](l4[p]) << 8)
+    while (sum32 >> 16) != 0:
+        sum32 = (sum32 & 0xFFFF) + (sum32 >> 16)
+    return cast[uint16](~sum32 & 0xFFFF)
+
+
+def _n64_icmp4_csum(l4: Ptr[uint8], l4_len: uint64) -> uint16:
+    # ICMPv4 checksum (RFC 792): plain RFC-1071 sum over the ICMP message ONLY
+    # (no pseudo-header). The checksum field must be zeroed by the caller.
+    return ip_csum16(l4, l4_len)
+
+
+# --- Session table operations (RFC 6146 §3.2) -------------------------------
+
+def _n64_sess_v6src_eq(idx: uint64, v6: Ptr[uint8]) -> int32:
+    base: uint64 = idx * 16
+    i: uint64 = 0
+    while i < 16:
+        if n64_sess_v6_src[base + i] != v6[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _n64_sess_remote4_eq(idx: uint64, v4: Ptr[uint8]) -> int32:
+    base: uint64 = idx * 4
+    if n64_sess_remote_v4[base + 0] != v4[0]:
+        return 0
+    if n64_sess_remote_v4[base + 1] != v4[1]:
+        return 0
+    if n64_sess_remote_v4[base + 2] != v4[2]:
+        return 0
+    if n64_sess_remote_v4[base + 3] != v4[3]:
+        return 0
+    return 1
+
+
+def nat64_session_lookup_out(v6_src: Ptr[uint8], v6_dst: Ptr[uint8],
+                             v6_sport: uint16, remote_port: uint16,
+                             proto: uint8) -> int64:
+    # Find an existing session matching the OUTBOUND (IPv6-side) 5-tuple.
+    # Returns the session index, or -1 if none.
+    i: uint64 = 0
+    while i < NAT64_MAX_SESSIONS:
+        if n64_sess_used[i] == 1:
+            if n64_sess_proto[i] == proto:
+                if n64_sess_v6_sport[i] == v6_sport:
+                    if n64_sess_remote_port[i] == remote_port:
+                        if _n64_sess_v6src_eq(i, v6_src) == 1:
+                            v4: Array[4, uint8]
+                            if nat64_v6_to_v4(v6_dst, cast[Ptr[uint8]](&v4[0])) == 1:
+                                if _n64_sess_remote4_eq(i, cast[Ptr[uint8]](&v4[0])) == 1:
+                                    return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def nat64_session_create(v6_src: Ptr[uint8], v6_dst: Ptr[uint8],
+                         v6_sport: uint16, remote_port: uint16,
+                         proto: uint8) -> int64:
+    # Create a new session for an outbound flow (RFC 6146 §3.5.1). Assigns a
+    # pool port. Returns the new session index, or -1 if the table is full or
+    # the destination does not carry the Well-Known Prefix.
+    v4: Array[4, uint8]
+    if nat64_v6_to_v4(v6_dst, cast[Ptr[uint8]](&v4[0])) != 1:
+        return -1
+    slot: int64 = -1
+    i: uint64 = 0
+    while i < NAT64_MAX_SESSIONS:
+        if n64_sess_used[i] == 0:
+            slot = cast[int64](i)
+            i = NAT64_MAX_SESSIONS
+        else:
+            i = i + 1
+    if slot < 0:
+        return -1
+    s: uint64 = cast[uint64](slot)
+    base16: uint64 = s * 16
+    k: uint64 = 0
+    while k < 16:
+        n64_sess_v6_src[base16 + k] = v6_src[k]
+        n64_sess_v6_dst[base16 + k] = v6_dst[k]
+        k = k + 1
+    base4: uint64 = s * 4
+    n64_sess_remote_v4[base4 + 0] = v4[0]
+    n64_sess_remote_v4[base4 + 1] = v4[1]
+    n64_sess_remote_v4[base4 + 2] = v4[2]
+    n64_sess_remote_v4[base4 + 3] = v4[3]
+    n64_sess_v6_sport[s] = v6_sport
+    n64_sess_remote_port[s] = remote_port
+    n64_sess_pool_port[s] = n64_next_pool_port
+    n64_next_pool_port = n64_next_pool_port + 1
+    n64_sess_proto[s] = proto
+    n64_sess_used[s] = 1
+    n64_sessions_created_cnt = n64_sessions_created_cnt + 1
+    return slot
+
+
+def nat64_session_lookup_in(remote_v4: Ptr[uint8], remote_port: uint16,
+                            pool_port: uint16, proto: uint8) -> int64:
+    # Find a session matching the INBOUND (IPv4-side) 5-tuple: the packet's
+    # IPv4 src == the session's remote_v4, src port == remote_port, dst port ==
+    # the assigned pool_port, dst == the pool address, and protocol. Returns the
+    # session index, or -1 (RFC 6146 §3.5.2 — no match => drop, NO state
+    # created from the outside).
+    i: uint64 = 0
+    while i < NAT64_MAX_SESSIONS:
+        if n64_sess_used[i] == 1:
+            if n64_sess_proto[i] == proto:
+                if n64_sess_pool_port[i] == pool_port:
+                    if n64_sess_remote_port[i] == remote_port:
+                        if _n64_sess_remote4_eq(i, remote_v4) == 1:
+                            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+# =====================================================================
+# IPv6 -> IPv4 translation (outbound), RFC 6145 §5 + RFC 6146 §3.5.1
+# =====================================================================
+#
+# Input  in6: a full IPv6 packet [ IPv6 hdr(40) | L4 ]. The L4 source port is
+#             the IPv6 host's port; the destination carries the Well-Known
+#             Prefix embedding the target IPv4 address.
+# Output out4: a full IPv4 packet [ IPv4 hdr(20) | L4 ] with src = pool, dst =
+#             the embedded IPv4, src port = the assigned pool port. Returns the
+#             total IPv4 packet length, or -1 on rejection.
+
+def nat64_translate_6to4(in6: Ptr[uint8], in6_len: uint64,
+                         out4: Ptr[uint8]) -> int64:
+    if in6_len < IP6_HDR_LEN:
+        return -1
+    # Parse IPv6 header.
+    next_hdr: uint8 = in6[6]
+    hop_limit: uint8 = in6[7]
+    v6_src: Ptr[uint8] = cast[Ptr[uint8]](&in6[8])
+    v6_dst: Ptr[uint8] = cast[Ptr[uint8]](&in6[24])
+    l4_in: Ptr[uint8] = cast[Ptr[uint8]](&in6[IP6_HDR_LEN])
+    l4_len: uint64 = in6_len - IP6_HDR_LEN
+
+    # Validate the destination carries the Well-Known Prefix (else reject).
+    if nat64_v6_has_prefix(v6_dst) != 1:
+        n64_prefix_reject_cnt = n64_prefix_reject_cnt + 1
+        return -1
+
+    # Map the v6 next-header to the IPv4 protocol number.
+    v4_proto: uint8 = 0
+    if next_hdr == IP6PROTO_UDP:
+        v4_proto = IPPROTO_UDP
+    elif next_hdr == IP6PROTO_TCP:
+        v4_proto = IPPROTO_TCP
+    elif next_hdr == IP6PROTO_ICMPV6:
+        v4_proto = IPPROTO_ICMP
+    else:
+        return -1
+
+    # Extract the embedded remote IPv4 destination.
+    remote4: Array[4, uint8]
+    if nat64_v6_to_v4(v6_dst, cast[Ptr[uint8]](&remote4[0])) != 1:
+        return -1
+
+    # Determine the session key port (L4 src port, or ICMP Identifier).
+    v6_sport: uint16 = 0
+    remote_port: uint16 = 0
+    if v4_proto == IPPROTO_ICMP:
+        # ICMPv6 Echo: id is at bytes 4..5 of the ICMP message.
+        v6_sport = _n64_get16(l4_in, 4)
+        remote_port = v6_sport
+    else:
+        v6_sport = _n64_get16(l4_in, 0)       # L4 source port
+        remote_port = _n64_get16(l4_in, 2)    # L4 destination port
+
+    # Find-or-create the session.
+    sidx: int64 = nat64_session_lookup_out(v6_src, v6_dst, v6_sport,
+                                           remote_port, v4_proto)
+    if sidx < 0:
+        sidx = nat64_session_create(v6_src, v6_dst, v6_sport, remote_port,
+                                    v4_proto)
+        if sidx < 0:
+            return -1
+    s: uint64 = cast[uint64](sidx)
+    pool_port: uint16 = n64_sess_pool_port[s]
+
+    # --- Build the IPv4 header (20 bytes) ---
+    total_len: uint64 = IP_HDR_LEN + l4_len
+    out4[0] = 0x45                              # version 4, IHL 5
+    out4[1] = 0                                 # DSCP/ECN 0
+    _n64_put16(out4, 2, cast[uint16](total_len))
+    out4[4] = 0                                 # identification
+    out4[5] = 0
+    out4[6] = 0x40                              # flags = DF, frag offset 0
+    out4[7] = 0
+    out4[8] = hop_limit - 1                     # TTL = HopLimit - 1
+    out4[9] = v4_proto
+    out4[10] = 0                                # checksum (computed below)
+    out4[11] = 0
+    # src = pool address.
+    out4[12] = n64_pool_v4[0]
+    out4[13] = n64_pool_v4[1]
+    out4[14] = n64_pool_v4[2]
+    out4[15] = n64_pool_v4[3]
+    # dst = embedded remote IPv4.
+    out4[16] = remote4[0]
+    out4[17] = remote4[1]
+    out4[18] = remote4[2]
+    out4[19] = remote4[3]
+    hc: uint16 = ip_csum16(out4, IP_HDR_LEN)
+    _n64_put16(out4, 10, hc)
+
+    # --- Copy + rewrite the L4 payload ---
+    out_l4: Ptr[uint8] = cast[Ptr[uint8]](&out4[IP_HDR_LEN])
+    c: uint64 = 0
+    while c < l4_len:
+        out_l4[c] = l4_in[c]
+        c = c + 1
+
+    src4: Ptr[uint8] = cast[Ptr[uint8]](&out4[12])
+    dst4: Ptr[uint8] = cast[Ptr[uint8]](&out4[16])
+
+    if v4_proto == IPPROTO_UDP:
+        # Rewrite source port to the pool port; recompute the checksum.
+        _n64_put16(out_l4, 0, pool_port)
+        out_l4[6] = 0                           # zero csum field
+        out_l4[7] = 0
+        ck: uint16 = _n64_l4_csum_v4(src4, dst4, IPPROTO_UDP, out_l4, l4_len)
+        # A computed UDP checksum of 0 is transmitted as 0xFFFF (RFC 768).
+        if ck == 0:
+            ck = 0xFFFF
+        _n64_put16(out_l4, 6, ck)
+    elif v4_proto == IPPROTO_TCP:
+        _n64_put16(out_l4, 0, pool_port)
+        out_l4[16] = 0                          # zero TCP csum field
+        out_l4[17] = 0
+        ck2: uint16 = _n64_l4_csum_v4(src4, dst4, IPPROTO_TCP, out_l4, l4_len)
+        _n64_put16(out_l4, 16, ck2)
+    else:
+        # ICMPv6 -> ICMPv4. Translate the type, rewrite the Identifier to the
+        # pool port, and recompute the ICMPv4 checksum (no pseudo-header).
+        t: uint8 = l4_in[0]
+        if t == NAT64_ICMP6_ECHO_REQUEST:
+            out_l4[0] = NAT64_ICMP4_ECHO_REQUEST
+        elif t == NAT64_ICMP6_ECHO_REPLY:
+            out_l4[0] = NAT64_ICMP4_ECHO_REPLY
+        else:
+            return -1
+        out_l4[1] = 0                           # code 0 for echo
+        _n64_put16(out_l4, 4, pool_port)        # Identifier = pool port
+        out_l4[2] = 0                           # zero csum field
+        out_l4[3] = 0
+        ck3: uint16 = _n64_icmp4_csum(out_l4, l4_len)
+        _n64_put16(out_l4, 2, ck3)
+
+    return cast[int64](total_len)
+
+
+# =====================================================================
+# IPv4 -> IPv6 translation (inbound), RFC 6145 §4 + RFC 6146 §3.5.2
+# =====================================================================
+#
+# Input  in4: a full IPv4 packet [ IPv4 hdr(20) | L4 ] arriving from the IPv4
+#             internet, destined to the pool address + an assigned pool port.
+# Output out6: a full IPv6 packet [ IPv6 hdr(40) | L4 ] addressed back to the
+#             original IPv6 host recovered from the session table. Returns the
+#             total IPv6 packet length, or -1 if NO session matches (drop).
+
+def nat64_translate_4to6(in4: Ptr[uint8], in4_len: uint64,
+                         out6: Ptr[uint8]) -> int64:
+    if in4_len < IP_HDR_LEN:
+        return -1
+    ihl: uint64 = cast[uint64](in4[0] & 0x0F) * 4
+    if ihl < IP_HDR_LEN:
+        return -1
+    ttl: uint8 = in4[8]
+    proto: uint8 = in4[9]
+    src4: Ptr[uint8] = cast[Ptr[uint8]](&in4[12])
+    l4_in: Ptr[uint8] = cast[Ptr[uint8]](&in4[ihl])
+    l4_len: uint64 = in4_len - ihl
+
+    # Map IPv4 protocol -> IPv6 next header.
+    next_hdr: uint8 = 0
+    if proto == IPPROTO_UDP:
+        next_hdr = IP6PROTO_UDP
+    elif proto == IPPROTO_TCP:
+        next_hdr = IP6PROTO_TCP
+    elif proto == IPPROTO_ICMP:
+        next_hdr = IP6PROTO_ICMPV6
+    else:
+        return -1
+
+    # Recover the inbound 5-tuple. remote_port = L4 source port (or ICMP id),
+    # pool_port = L4 destination port (or ICMP id for echo reply).
+    remote_port: uint16 = 0
+    pool_port: uint16 = 0
+    if proto == IPPROTO_ICMP:
+        # The Identifier (bytes 4..5) is the pool port we assigned.
+        pool_port = _n64_get16(l4_in, 4)
+        # For an echo reply the remote is identified by the same id space; the
+        # session was keyed with remote_port == v6_sport == the original id.
+        # We recover remote_port from the matched session below, so seed it with
+        # the same id (echo request/reply share the Identifier).
+        remote_port = pool_port
+    else:
+        remote_port = _n64_get16(l4_in, 0)    # remote (server) src port
+        pool_port = _n64_get16(l4_in, 2)      # our assigned pool dst port
+
+    # Look up the session by the IPv4-side tuple. For ICMP we relax the
+    # remote_port match (the reply's id equals the pool port, not the original
+    # v6 id), so match on pool_port + remote_v4 + proto.
+    sidx: int64 = -1
+    if proto == IPPROTO_ICMP:
+        i: uint64 = 0
+        while i < NAT64_MAX_SESSIONS:
+            if n64_sess_used[i] == 1:
+                if n64_sess_proto[i] == IPPROTO_ICMP:
+                    if n64_sess_pool_port[i] == pool_port:
+                        if _n64_sess_remote4_eq(i, src4) == 1:
+                            sidx = cast[int64](i)
+                            i = NAT64_MAX_SESSIONS
+                        else:
+                            i = i + 1
+                    else:
+                        i = i + 1
+                else:
+                    i = i + 1
+            else:
+                i = i + 1
+    else:
+        sidx = nat64_session_lookup_in(src4, remote_port, pool_port, proto)
+    if sidx < 0:
+        # No matching session — drop (no spurious binding).
+        n64_inbound_nomatch_cnt = n64_inbound_nomatch_cnt + 1
+        return -1
+    s: uint64 = cast[uint64](sidx)
+
+    # Destination IPv6 = the original IPv6 host. Source IPv6 = 64:ff9b::<remote>.
+    base16: uint64 = s * 16
+    v6_dst: Ptr[uint8] = cast[Ptr[uint8]](&n64_sess_v6_src[base16])
+    orig_v6_sport: uint16 = n64_sess_v6_sport[s]
+
+    # --- Build the IPv6 header (40 bytes) ---
+    out6[0] = 0x60                              # version 6, traffic class 0
+    out6[1] = 0
+    out6[2] = 0                                 # flow label 0
+    out6[3] = 0
+    _n64_put16(out6, 4, cast[uint16](l4_len))   # payload length
+    out6[6] = next_hdr
+    out6[7] = ttl - 1                           # hop limit = TTL - 1
+    # source = 64:ff9b::<remote v4>.
+    src6: Array[16, uint8]
+    nat64_v4_to_v6(src4, cast[Ptr[uint8]](&src6[0]))
+    k: uint64 = 0
+    while k < 16:
+        out6[8 + k] = src6[k]
+        out6[24 + k] = v6_dst[k]
+        k = k + 1
+
+    # --- Copy + rewrite the L4 payload ---
+    out_l4: Ptr[uint8] = cast[Ptr[uint8]](&out6[IP6_HDR_LEN])
+    c: uint64 = 0
+    while c < l4_len:
+        out_l4[c] = l4_in[c]
+        c = c + 1
+
+    src6p: Ptr[uint8] = cast[Ptr[uint8]](&out6[8])
+    dst6p: Ptr[uint8] = cast[Ptr[uint8]](&out6[24])
+
+    if proto == IPPROTO_UDP:
+        # Rewrite the destination port back to the original v6 host's port.
+        _n64_put16(out_l4, 2, orig_v6_sport)
+        out_l4[6] = 0
+        out_l4[7] = 0
+        ck: uint16 = _n64_l4_csum_v6(src6p, dst6p, IP6PROTO_UDP, out_l4, l4_len)
+        if ck == 0:
+            ck = 0xFFFF
+        _n64_put16(out_l4, 6, ck)
+    elif proto == IPPROTO_TCP:
+        _n64_put16(out_l4, 2, orig_v6_sport)
+        out_l4[16] = 0
+        out_l4[17] = 0
+        ck2: uint16 = _n64_l4_csum_v6(src6p, dst6p, IP6PROTO_TCP, out_l4, l4_len)
+        _n64_put16(out_l4, 16, ck2)
+    else:
+        # ICMPv4 -> ICMPv6. Translate the type and rewrite the Identifier back
+        # to the original v6 id; recompute the ICMPv6 checksum (covers the IPv6
+        # pseudo-header).
+        t: uint8 = l4_in[0]
+        if t == NAT64_ICMP4_ECHO_REQUEST:
+            out_l4[0] = NAT64_ICMP6_ECHO_REQUEST
+        elif t == NAT64_ICMP4_ECHO_REPLY:
+            out_l4[0] = NAT64_ICMP6_ECHO_REPLY
+        else:
+            return -1
+        out_l4[1] = 0
+        _n64_put16(out_l4, 4, orig_v6_sport)    # Identifier = original v6 id
+        out_l4[2] = 0
+        out_l4[3] = 0
+        ck3: uint16 = _n64_l4_csum_v6(src6p, dst6p, IP6PROTO_ICMPV6,
+                                      out_l4, l4_len)
+        _n64_put16(out_l4, 2, ck3)
+
+    return cast[int64](IP6_HDR_LEN + l4_len)
+
+
+# =====================================================================
+# Self-test (pure in-memory)
+# =====================================================================
+
+# Scratch buffers, generously sized; one IPv6 packet + one IPv4 packet at a time.
+N64_BUF: uint64 = 256
+_n64_in:  Array[256, uint8]     # input packet
+_n64_out: Array[256, uint8]     # translated output
+_n64_re:  Array[256, uint8]     # re-translated (round-trip) packet
+
+# The IPv6 host + remote IPv4 used across the test.
+_n64_host6:  Array[16, uint8]   # the IPv6 host's address (e.g. 2001:db8::1)
+_n64_dst6:   Array[16, uint8]   # 64:ff9b::<remote v4>
+_n64_remote4: Array[4, uint8]   # the remote IPv4 server, 198.51.100.5
+
+
+def _n64_setup_addrs():
+    # IPv6 host 2001:db8::1.
+    i: uint64 = 0
+    while i < 16:
+        _n64_host6[i] = 0
+        i = i + 1
+    _n64_host6[0] = 0x20
+    _n64_host6[1] = 0x01
+    _n64_host6[2] = 0x0d
+    _n64_host6[3] = 0xb8
+    _n64_host6[15] = 0x01
+    # Remote IPv4 server 198.51.100.5 (TEST-NET-2, RFC 5737).
+    _n64_remote4[0] = 198
+    _n64_remote4[1] = 51
+    _n64_remote4[2] = 100
+    _n64_remote4[3] = 5
+    nat64_v4_to_v6(cast[Ptr[uint8]](&_n64_remote4[0]),
+                   cast[Ptr[uint8]](&_n64_dst6[0]))
+
+
+def _n64_build_v6_udp(sport: uint16, dport: uint16, payload0: uint8,
+                      payload1: uint8) -> uint64:
+    # Build an IPv6/UDP packet into _n64_in with a 2-byte payload. Returns the
+    # total length. The UDP checksum is filled with the correct IPv6 value.
+    pl_len: uint64 = NAT64_UDP_HDR_LEN + 2
+    total: uint64 = IP6_HDR_LEN + pl_len
+    z: uint64 = 0
+    while z < total:
+        _n64_in[z] = 0
+        z = z + 1
+    _n64_in[0] = 0x60
+    _n64_put16(cast[Ptr[uint8]](&_n64_in[0]), 4, cast[uint16](pl_len))
+    _n64_in[6] = IP6PROTO_UDP
+    _n64_in[7] = 64                              # hop limit
+    k: uint64 = 0
+    while k < 16:
+        _n64_in[8 + k] = _n64_host6[k]
+        _n64_in[24 + k] = _n64_dst6[k]
+        k = k + 1
+    l4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_in[IP6_HDR_LEN])
+    _n64_put16(l4, 0, sport)
+    _n64_put16(l4, 2, dport)
+    _n64_put16(l4, 4, cast[uint16](pl_len))      # UDP length
+    l4[8] = payload0
+    l4[9] = payload1
+    l4[6] = 0
+    l4[7] = 0
+    ck: uint16 = _n64_l4_csum_v6(cast[Ptr[uint8]](&_n64_in[8]),
+                                 cast[Ptr[uint8]](&_n64_in[24]),
+                                 IP6PROTO_UDP, l4, pl_len)
+    if ck == 0:
+        ck = 0xFFFF
+    _n64_put16(l4, 6, ck)
+    return total
+
+
+def _n64_build_v4_udp_reply(remote4: Ptr[uint8], pool4: Ptr[uint8],
+                            sport: uint16, dport: uint16,
+                            payload0: uint8, payload1: uint8) -> uint64:
+    # Build an IPv4/UDP reply into _n64_in (from the remote server to the pool).
+    pl_len: uint64 = NAT64_UDP_HDR_LEN + 2
+    total: uint64 = IP_HDR_LEN + pl_len
+    z: uint64 = 0
+    while z < total:
+        _n64_in[z] = 0
+        z = z + 1
+    _n64_in[0] = 0x45
+    _n64_put16(cast[Ptr[uint8]](&_n64_in[0]), 2, cast[uint16](total))
+    _n64_in[6] = 0x40
+    _n64_in[8] = 64
+    _n64_in[9] = IPPROTO_UDP
+    _n64_in[12] = remote4[0]
+    _n64_in[13] = remote4[1]
+    _n64_in[14] = remote4[2]
+    _n64_in[15] = remote4[3]
+    _n64_in[16] = pool4[0]
+    _n64_in[17] = pool4[1]
+    _n64_in[18] = pool4[2]
+    _n64_in[19] = pool4[3]
+    hc: uint16 = ip_csum16(cast[Ptr[uint8]](&_n64_in[0]), IP_HDR_LEN)
+    _n64_put16(cast[Ptr[uint8]](&_n64_in[0]), 10, hc)
+    l4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_in[IP_HDR_LEN])
+    _n64_put16(l4, 0, sport)
+    _n64_put16(l4, 2, dport)
+    _n64_put16(l4, 4, cast[uint16](pl_len))
+    l4[8] = payload0
+    l4[9] = payload1
+    l4[6] = 0
+    l4[7] = 0
+    ck: uint16 = _n64_l4_csum_v4(cast[Ptr[uint8]](&_n64_in[12]),
+                                 cast[Ptr[uint8]](&_n64_in[16]),
+                                 IPPROTO_UDP, l4, pl_len)
+    if ck == 0:
+        ck = 0xFFFF
+    _n64_put16(l4, 6, ck)
+    return total
+
+
+def _n64_check_v4_hdr_csum(p: Ptr[uint8]) -> int32:
+    # A valid IPv4 header folds the RFC-1071 sum (incl. the stored checksum) to
+    # zero. ip_csum16 over the 20-byte header returns 0 for a good header.
+    if ip_csum16(p, IP_HDR_LEN) == 0:
+        return 1
+    return 0
+
+
+def _n64_check_l4_csum_v4(p: Ptr[uint8], proto: uint8) -> int32:
+    # Recompute the IPv4 transport checksum over the packet and verify it folds
+    # to zero (a correct checksum makes the pseudo-header sum complement to 0).
+    ihl: uint64 = cast[uint64](p[0] & 0x0F) * 4
+    total: uint64 = cast[uint64](_n64_get16(p, 2))
+    l4: Ptr[uint8] = cast[Ptr[uint8]](&p[ihl])
+    l4_len: uint64 = total - ihl
+    got: uint16 = _n64_l4_csum_v4(cast[Ptr[uint8]](&p[12]),
+                                  cast[Ptr[uint8]](&p[16]), proto, l4, l4_len)
+    if got == 0:
+        return 1
+    return 0
+
+
+def _n64_check_l4_csum_v6(p: Ptr[uint8], next_hdr: uint8) -> int32:
+    # Recompute the IPv6 transport/ICMPv6 checksum and verify it folds to zero.
+    pl_len: uint64 = cast[uint64](_n64_get16(p, 4))
+    l4: Ptr[uint8] = cast[Ptr[uint8]](&p[IP6_HDR_LEN])
+    got: uint16 = _n64_l4_csum_v6(cast[Ptr[uint8]](&p[8]),
+                                  cast[Ptr[uint8]](&p[24]), next_hdr, l4, pl_len)
+    if got == 0:
+        return 1
+    return 0
+
+
+def _n64_v4_bytes_eq(p: Ptr[uint8], off: uint64, b0: uint8, b1: uint8,
+                     b2: uint8, b3: uint8) -> int32:
+    if p[off + 0] != b0:
+        return 0
+    if p[off + 1] != b1:
+        return 0
+    if p[off + 2] != b2:
+        return 0
+    if p[off + 3] != b3:
+        return 0
+    return 1
+
+
+def _n64_addr16_eq(p: Ptr[uint8], off: uint64, ref: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while i < 16:
+        if p[off + i] != ref[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def nat64_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [nat64] marker lines.
+    _n64_emerg0("[nat64] self-test start\n")
+    nat64_init()
+    _n64_setup_addrs()
+    ok: int32 = 1
+
+    # ----------------------------------------------------------------
+    # 0. Address mapping (RFC 6052).
+    # ----------------------------------------------------------------
+    map6: Array[16, uint8]
+    nat64_v4_to_v6(cast[Ptr[uint8]](&_n64_remote4[0]),
+                   cast[Ptr[uint8]](&map6[0]))
+    if map6[0] != 0x00 or map6[1] != 0x64 or map6[2] != 0xff or map6[3] != 0x9b:
+        _n64_emerg0("[nat64] FAIL: WKP prefix bytes wrong\n")
+        ok = 0
+    if _n64_v4_bytes_eq(cast[Ptr[uint8]](&map6[0]), 12,
+                        198, 51, 100, 5) != 1:
+        _n64_emerg0("[nat64] FAIL: embedded v4 wrong\n")
+        ok = 0
+    back4: Array[4, uint8]
+    if nat64_v6_to_v4(cast[Ptr[uint8]](&map6[0]),
+                      cast[Ptr[uint8]](&back4[0])) != 1:
+        _n64_emerg0("[nat64] FAIL: v6->v4 extraction rejected a WKP addr\n")
+        ok = 0
+    if _n64_v4_bytes_eq(cast[Ptr[uint8]](&back4[0]), 0,
+                        198, 51, 100, 5) != 1:
+        _n64_emerg0("[nat64] FAIL: v6->v4 produced wrong v4\n")
+        ok = 0
+    if ok == 1:
+        _n64_emerg0("[nat64] PASS address-mapping-rfc6052\n")
+
+    # ----------------------------------------------------------------
+    # 1. UDP outbound (IPv6 -> IPv4): session creation + translation.
+    # ----------------------------------------------------------------
+    v6_sport: uint16 = 51000
+    v4_dport: uint16 = 53            # talking to a DNS server, say
+    in_len: uint64 = _n64_build_v6_udp(v6_sport, v4_dport, 0xAB, 0xCD)
+    # Sanity: the input v6 UDP checksum we built must itself verify.
+    if _n64_check_l4_csum_v6(cast[Ptr[uint8]](&_n64_in[0]), IP6PROTO_UDP) != 1:
+        _n64_emerg0("[nat64] FAIL: built v6 UDP checksum invalid\n")
+        ok = 0
+    out_len: int64 = nat64_translate_6to4(cast[Ptr[uint8]](&_n64_in[0]),
+                                          in_len, cast[Ptr[uint8]](&_n64_out[0]))
+    if out_len < 0:
+        _n64_emerg0("[nat64] FAIL: 6->4 UDP translation rejected\n")
+        return 0
+    if n64_sessions_created_cnt != 1:
+        _n64_emerg0("[nat64] FAIL: no session created on first outbound\n")
+        ok = 0
+    # The IPv4 header: version 0x45, proto UDP, src=pool 192.0.2.1, dst=remote.
+    if _n64_out[0] != 0x45:
+        _n64_emerg0("[nat64] FAIL: v4 version/IHL not 0x45\n")
+        ok = 0
+    if _n64_out[9] != IPPROTO_UDP:
+        _n64_emerg0("[nat64] FAIL: v4 proto not UDP\n")
+        ok = 0
+    if _n64_out[8] != 63:
+        _n64_emerg0("[nat64] FAIL: TTL != HopLimit-1\n")
+        ok = 0
+    if _n64_v4_bytes_eq(cast[Ptr[uint8]](&_n64_out[0]), 12,
+                        192, 0, 2, 1) != 1:
+        _n64_emerg0("[nat64] FAIL: v4 src != pool address\n")
+        ok = 0
+    if _n64_v4_bytes_eq(cast[Ptr[uint8]](&_n64_out[0]), 16,
+                        198, 51, 100, 5) != 1:
+        _n64_emerg0("[nat64] FAIL: v4 dst != remote\n")
+        ok = 0
+    # Source port rewritten to the assigned pool port (40000).
+    out_l4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_out[IP_HDR_LEN])
+    assigned_port: uint16 = _n64_get16(out_l4, 0)
+    if assigned_port != 40000:
+        _n64_emerg0("[nat64] FAIL: v4 src port not the assigned pool port\n")
+        ok = 0
+    # Checksums of the translated packet must validate.
+    if _n64_check_v4_hdr_csum(cast[Ptr[uint8]](&_n64_out[0])) != 1:
+        _n64_emerg0("[nat64] FAIL: translated v4 header checksum invalid\n")
+        ok = 0
+    if _n64_check_l4_csum_v4(cast[Ptr[uint8]](&_n64_out[0]), IPPROTO_UDP) != 1:
+        _n64_emerg0("[nat64] FAIL: translated v4 UDP checksum invalid\n")
+        ok = 0
+    # Payload preserved.
+    if out_l4[8] != 0xAB or out_l4[9] != 0xCD:
+        _n64_emerg0("[nat64] FAIL: UDP payload corrupted in 6->4\n")
+        ok = 0
+    if ok == 1:
+        _n64_emerg0("[nat64] PASS udp-outbound-6to4\n")
+
+    # ----------------------------------------------------------------
+    # 2. UDP inbound (IPv4 -> IPv6): session lookup + reverse translation.
+    # ----------------------------------------------------------------
+    # The remote replies: src=remote:53, dst=pool:assigned_port.
+    rep_len: uint64 = _n64_build_v4_udp_reply(
+        cast[Ptr[uint8]](&_n64_remote4[0]), cast[Ptr[uint8]](&n64_pool_v4[0]),
+        v4_dport, assigned_port, 0x12, 0x34)
+    r6: int64 = nat64_translate_4to6(cast[Ptr[uint8]](&_n64_in[0]), rep_len,
+                                     cast[Ptr[uint8]](&_n64_re[0]))
+    if r6 < 0:
+        _n64_emerg0("[nat64] FAIL: 4->6 UDP return translation rejected\n")
+        return 0
+    # No NEW session created on the return path.
+    if n64_sessions_created_cnt != 1:
+        _n64_emerg0("[nat64] FAIL: return path created a spurious session\n")
+        ok = 0
+    # IPv6 header: version 6, next-header UDP, hop limit = TTL-1.
+    if (_n64_re[0] & 0xF0) != 0x60:
+        _n64_emerg0("[nat64] FAIL: 4->6 not IPv6 version 6\n")
+        ok = 0
+    if _n64_re[6] != IP6PROTO_UDP:
+        _n64_emerg0("[nat64] FAIL: 4->6 next-header not UDP\n")
+        ok = 0
+    if _n64_re[7] != 63:
+        _n64_emerg0("[nat64] FAIL: 4->6 hop limit != TTL-1\n")
+        ok = 0
+    # src = 64:ff9b::<remote>, dst = the original IPv6 host.
+    if _n64_addr16_eq(cast[Ptr[uint8]](&_n64_re[0]), 8,
+                      cast[Ptr[uint8]](&_n64_dst6[0])) != 1:
+        _n64_emerg0("[nat64] FAIL: 4->6 src != 64:ff9b::remote\n")
+        ok = 0
+    if _n64_addr16_eq(cast[Ptr[uint8]](&_n64_re[0]), 24,
+                      cast[Ptr[uint8]](&_n64_host6[0])) != 1:
+        _n64_emerg0("[nat64] FAIL: 4->6 dst != original IPv6 host\n")
+        ok = 0
+    # The destination port restored to the original v6 host's source port.
+    re_l4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_re[IP6_HDR_LEN])
+    if _n64_get16(re_l4, 2) != v6_sport:
+        _n64_emerg0("[nat64] FAIL: 4->6 dst port != original v6 sport\n")
+        ok = 0
+    if _n64_check_l4_csum_v6(cast[Ptr[uint8]](&_n64_re[0]), IP6PROTO_UDP) != 1:
+        _n64_emerg0("[nat64] FAIL: 4->6 UDP checksum invalid\n")
+        ok = 0
+    if re_l4[8] != 0x12 or re_l4[9] != 0x34:
+        _n64_emerg0("[nat64] FAIL: UDP payload corrupted in 4->6\n")
+        ok = 0
+    if ok == 1:
+        _n64_emerg0("[nat64] PASS udp-inbound-4to6\n")
+
+    # ----------------------------------------------------------------
+    # 3. TCP flow both directions.
+    # ----------------------------------------------------------------
+    if _n64_tcp_flow() != 1:
+        ok = 0
+    else:
+        _n64_emerg0("[nat64] PASS tcp-flow-6to4-and-4to6\n")
+
+    # ----------------------------------------------------------------
+    # 4. ICMP Echo request/reply translation.
+    # ----------------------------------------------------------------
+    if _n64_icmp_flow() != 1:
+        ok = 0
+    else:
+        _n64_emerg0("[nat64] PASS icmp-echo-translate\n")
+
+    # ----------------------------------------------------------------
+    # 5. Security rejection: inbound IPv4 with NO matching session is dropped.
+    # ----------------------------------------------------------------
+    before_nomatch: uint64 = n64_inbound_nomatch_cnt
+    before_created: uint64 = n64_sessions_created_cnt
+    # A reply that doesn't match any session (wrong pool port 9999).
+    bad_len: uint64 = _n64_build_v4_udp_reply(
+        cast[Ptr[uint8]](&_n64_remote4[0]), cast[Ptr[uint8]](&n64_pool_v4[0]),
+        v4_dport, 9999, 0xEE, 0xFF)
+    bad6: int64 = nat64_translate_4to6(cast[Ptr[uint8]](&_n64_in[0]), bad_len,
+                                       cast[Ptr[uint8]](&_n64_re[0]))
+    if bad6 >= 0:
+        _n64_emerg0("[nat64] FAIL: inbound with no session was NOT dropped\n")
+        ok = 0
+    if n64_inbound_nomatch_cnt != before_nomatch + 1:
+        _n64_emerg0("[nat64] FAIL: no-match drop not counted\n")
+        ok = 0
+    if n64_sessions_created_cnt != before_created:
+        _n64_emerg0("[nat64] FAIL: unmatched inbound created a binding\n")
+        ok = 0
+    if ok == 1:
+        _n64_emerg0("[nat64] PASS reject-inbound-no-session\n")
+
+    # ----------------------------------------------------------------
+    # 6. Security rejection: outbound v6 dst WITHOUT the prefix is rejected.
+    # ----------------------------------------------------------------
+    before_prefix: uint64 = n64_prefix_reject_cnt
+    npl: uint64 = _n64_build_v6_udp(52000, 80, 0x01, 0x02)
+    # Corrupt the destination so it no longer carries the Well-Known Prefix.
+    _n64_in[24] = 0x20      # was 0x00 (64:..) -> 2001:.. : not the WKP
+    badout: int64 = nat64_translate_6to4(cast[Ptr[uint8]](&_n64_in[0]), npl,
+                                         cast[Ptr[uint8]](&_n64_out[0]))
+    if badout >= 0:
+        _n64_emerg0("[nat64] FAIL: non-prefix v6 dst was NOT rejected\n")
+        ok = 0
+    if n64_prefix_reject_cnt != before_prefix + 1:
+        _n64_emerg0("[nat64] FAIL: prefix-reject not counted\n")
+        ok = 0
+    if ok == 1:
+        _n64_emerg0("[nat64] PASS reject-missing-prefix\n")
+
+    if ok == 1:
+        _n64_emerg0("[nat64] PASS\n")
+        return 1
+    _n64_emerg0("[nat64] FAIL\n")
+    return 0
+
+
+def _n64_tcp_flow() -> int32:
+    # Build an IPv6/TCP outbound packet, translate to IPv4, then build the
+    # matching IPv4/TCP reply and translate back, asserting bytes + checksums.
+    ok: int32 = 1
+    pl_len: uint64 = NAT64_TCP_HDR_LEN + 2
+    total: uint64 = IP6_HDR_LEN + pl_len
+    z: uint64 = 0
+    while z < total:
+        _n64_in[z] = 0
+        z = z + 1
+    _n64_in[0] = 0x60
+    _n64_put16(cast[Ptr[uint8]](&_n64_in[0]), 4, cast[uint16](pl_len))
+    _n64_in[6] = IP6PROTO_TCP
+    _n64_in[7] = 64
+    k: uint64 = 0
+    while k < 16:
+        _n64_in[8 + k] = _n64_host6[k]
+        _n64_in[24 + k] = _n64_dst6[k]
+        k = k + 1
+    v6_sport: uint16 = 51500
+    v4_dport: uint16 = 80
+    l4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_in[IP6_HDR_LEN])
+    _n64_put16(l4, 0, v6_sport)
+    _n64_put16(l4, 2, v4_dport)
+    # seq=1, ack=0, data offset 0x50 (5*4=20), flags SYN.
+    l4[4] = 0
+    l4[5] = 0
+    l4[6] = 0
+    l4[7] = 1
+    l4[12] = 0x50
+    l4[13] = 0x02       # SYN
+    l4[NAT64_TCP_HDR_LEN] = 0x55
+    l4[NAT64_TCP_HDR_LEN + 1] = 0x66
+    l4[16] = 0
+    l4[17] = 0
+    ck6: uint16 = _n64_l4_csum_v6(cast[Ptr[uint8]](&_n64_in[8]),
+                                  cast[Ptr[uint8]](&_n64_in[24]),
+                                  IP6PROTO_TCP, l4, pl_len)
+    _n64_put16(l4, 16, ck6)
+
+    o: int64 = nat64_translate_6to4(cast[Ptr[uint8]](&_n64_in[0]), total,
+                                    cast[Ptr[uint8]](&_n64_out[0]))
+    if o < 0:
+        _n64_emerg0("[nat64] FAIL: 6->4 TCP translation rejected\n")
+        return 0
+    if _n64_out[9] != IPPROTO_TCP:
+        _n64_emerg0("[nat64] FAIL: TCP v4 proto wrong\n")
+        ok = 0
+    if _n64_check_v4_hdr_csum(cast[Ptr[uint8]](&_n64_out[0])) != 1:
+        _n64_emerg0("[nat64] FAIL: TCP v4 header checksum invalid\n")
+        ok = 0
+    if _n64_check_l4_csum_v4(cast[Ptr[uint8]](&_n64_out[0]), IPPROTO_TCP) != 1:
+        _n64_emerg0("[nat64] FAIL: TCP v4 checksum invalid\n")
+        ok = 0
+    out_l4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_out[IP_HDR_LEN])
+    tcp_pool_port: uint16 = _n64_get16(out_l4, 0)
+
+    # Build the IPv4/TCP reply: src=remote:80, dst=pool:tcp_pool_port.
+    rpl: uint64 = NAT64_TCP_HDR_LEN + 2
+    rtotal: uint64 = IP_HDR_LEN + rpl
+    z2: uint64 = 0
+    while z2 < rtotal:
+        _n64_in[z2] = 0
+        z2 = z2 + 1
+    _n64_in[0] = 0x45
+    _n64_put16(cast[Ptr[uint8]](&_n64_in[0]), 2, cast[uint16](rtotal))
+    _n64_in[6] = 0x40
+    _n64_in[8] = 64
+    _n64_in[9] = IPPROTO_TCP
+    _n64_in[12] = _n64_remote4[0]
+    _n64_in[13] = _n64_remote4[1]
+    _n64_in[14] = _n64_remote4[2]
+    _n64_in[15] = _n64_remote4[3]
+    _n64_in[16] = n64_pool_v4[0]
+    _n64_in[17] = n64_pool_v4[1]
+    _n64_in[18] = n64_pool_v4[2]
+    _n64_in[19] = n64_pool_v4[3]
+    rhc: uint16 = ip_csum16(cast[Ptr[uint8]](&_n64_in[0]), IP_HDR_LEN)
+    _n64_put16(cast[Ptr[uint8]](&_n64_in[0]), 10, rhc)
+    rl4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_in[IP_HDR_LEN])
+    _n64_put16(rl4, 0, v4_dport)         # server src port 80
+    _n64_put16(rl4, 2, tcp_pool_port)    # dst = our pool port
+    rl4[12] = 0x50
+    rl4[13] = 0x12                       # SYN|ACK
+    rl4[NAT64_TCP_HDR_LEN] = 0x77
+    rl4[NAT64_TCP_HDR_LEN + 1] = 0x88
+    rl4[16] = 0
+    rl4[17] = 0
+    rck: uint16 = _n64_l4_csum_v4(cast[Ptr[uint8]](&_n64_in[12]),
+                                  cast[Ptr[uint8]](&_n64_in[16]),
+                                  IPPROTO_TCP, rl4, rpl)
+    _n64_put16(rl4, 16, rck)
+
+    r: int64 = nat64_translate_4to6(cast[Ptr[uint8]](&_n64_in[0]), rtotal,
+                                    cast[Ptr[uint8]](&_n64_re[0]))
+    if r < 0:
+        _n64_emerg0("[nat64] FAIL: 4->6 TCP reply rejected\n")
+        return 0
+    if _n64_re[6] != IP6PROTO_TCP:
+        _n64_emerg0("[nat64] FAIL: 4->6 TCP next-header wrong\n")
+        ok = 0
+    if _n64_addr16_eq(cast[Ptr[uint8]](&_n64_re[0]), 24,
+                      cast[Ptr[uint8]](&_n64_host6[0])) != 1:
+        _n64_emerg0("[nat64] FAIL: 4->6 TCP dst != original host\n")
+        ok = 0
+    re_l4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_re[IP6_HDR_LEN])
+    if _n64_get16(re_l4, 2) != v6_sport:
+        _n64_emerg0("[nat64] FAIL: 4->6 TCP dst port not restored\n")
+        ok = 0
+    if _n64_check_l4_csum_v6(cast[Ptr[uint8]](&_n64_re[0]), IP6PROTO_TCP) != 1:
+        _n64_emerg0("[nat64] FAIL: 4->6 TCP checksum invalid\n")
+        ok = 0
+    if re_l4[NAT64_TCP_HDR_LEN] != 0x77 or re_l4[NAT64_TCP_HDR_LEN + 1] != 0x88:
+        _n64_emerg0("[nat64] FAIL: TCP payload corrupted in 4->6\n")
+        ok = 0
+    return ok
+
+
+def _n64_icmp_flow() -> int32:
+    # Build an ICMPv6 Echo Request (type 128), translate to ICMPv4 (type 8),
+    # then build the ICMPv4 Echo Reply (type 0) and translate to ICMPv6 (129).
+    ok: int32 = 1
+    pl_len: uint64 = NAT64_ICMP_HDR_LEN + 2
+    total: uint64 = IP6_HDR_LEN + pl_len
+    z: uint64 = 0
+    while z < total:
+        _n64_in[z] = 0
+        z = z + 1
+    _n64_in[0] = 0x60
+    _n64_put16(cast[Ptr[uint8]](&_n64_in[0]), 4, cast[uint16](pl_len))
+    _n64_in[6] = IP6PROTO_ICMPV6
+    _n64_in[7] = 64
+    k: uint64 = 0
+    while k < 16:
+        _n64_in[8 + k] = _n64_host6[k]
+        _n64_in[24 + k] = _n64_dst6[k]
+        k = k + 1
+    icmp_id: uint16 = 0x1234
+    icmp_seq: uint16 = 1
+    l4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_in[IP6_HDR_LEN])
+    l4[0] = NAT64_ICMP6_ECHO_REQUEST
+    l4[1] = 0
+    _n64_put16(l4, 4, icmp_id)
+    _n64_put16(l4, 6, icmp_seq)
+    l4[8] = 0xDE
+    l4[9] = 0xAD
+    l4[2] = 0
+    l4[3] = 0
+    ick: uint16 = _n64_l4_csum_v6(cast[Ptr[uint8]](&_n64_in[8]),
+                                  cast[Ptr[uint8]](&_n64_in[24]),
+                                  IP6PROTO_ICMPV6, l4, pl_len)
+    _n64_put16(l4, 2, ick)
+
+    o: int64 = nat64_translate_6to4(cast[Ptr[uint8]](&_n64_in[0]), total,
+                                    cast[Ptr[uint8]](&_n64_out[0]))
+    if o < 0:
+        _n64_emerg0("[nat64] FAIL: 6->4 ICMP translation rejected\n")
+        return 0
+    out_l4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_out[IP_HDR_LEN])
+    if _n64_out[9] != IPPROTO_ICMP:
+        _n64_emerg0("[nat64] FAIL: ICMP v4 proto wrong\n")
+        ok = 0
+    if out_l4[0] != NAT64_ICMP4_ECHO_REQUEST:
+        _n64_emerg0("[nat64] FAIL: ICMPv6 128 not -> ICMPv4 8\n")
+        ok = 0
+    if _n64_check_v4_hdr_csum(cast[Ptr[uint8]](&_n64_out[0])) != 1:
+        _n64_emerg0("[nat64] FAIL: ICMP v4 header checksum invalid\n")
+        ok = 0
+    # ICMPv4 checksum (no pseudo-header) must fold to 0.
+    if ip_csum16(out_l4, pl_len) != 0:
+        _n64_emerg0("[nat64] FAIL: ICMPv4 checksum invalid\n")
+        ok = 0
+    icmp_pool_id: uint16 = _n64_get16(out_l4, 4)
+
+    # Build the ICMPv4 Echo Reply: src=remote, dst=pool, id=icmp_pool_id.
+    rtotal: uint64 = IP_HDR_LEN + pl_len
+    z2: uint64 = 0
+    while z2 < rtotal:
+        _n64_in[z2] = 0
+        z2 = z2 + 1
+    _n64_in[0] = 0x45
+    _n64_put16(cast[Ptr[uint8]](&_n64_in[0]), 2, cast[uint16](rtotal))
+    _n64_in[6] = 0x40
+    _n64_in[8] = 64
+    _n64_in[9] = IPPROTO_ICMP
+    _n64_in[12] = _n64_remote4[0]
+    _n64_in[13] = _n64_remote4[1]
+    _n64_in[14] = _n64_remote4[2]
+    _n64_in[15] = _n64_remote4[3]
+    _n64_in[16] = n64_pool_v4[0]
+    _n64_in[17] = n64_pool_v4[1]
+    _n64_in[18] = n64_pool_v4[2]
+    _n64_in[19] = n64_pool_v4[3]
+    rhc: uint16 = ip_csum16(cast[Ptr[uint8]](&_n64_in[0]), IP_HDR_LEN)
+    _n64_put16(cast[Ptr[uint8]](&_n64_in[0]), 10, rhc)
+    rl4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_in[IP_HDR_LEN])
+    rl4[0] = NAT64_ICMP4_ECHO_REPLY
+    rl4[1] = 0
+    _n64_put16(rl4, 4, icmp_pool_id)
+    _n64_put16(rl4, 6, icmp_seq)
+    rl4[8] = 0xBE
+    rl4[9] = 0xEF
+    rl4[2] = 0
+    rl4[3] = 0
+    rck: uint16 = ip_csum16(rl4, pl_len)
+    _n64_put16(rl4, 2, rck)
+
+    r: int64 = nat64_translate_4to6(cast[Ptr[uint8]](&_n64_in[0]), rtotal,
+                                    cast[Ptr[uint8]](&_n64_re[0]))
+    if r < 0:
+        _n64_emerg0("[nat64] FAIL: 4->6 ICMP reply rejected (no session)\n")
+        return 0
+    re_l4: Ptr[uint8] = cast[Ptr[uint8]](&_n64_re[IP6_HDR_LEN])
+    if _n64_re[6] != IP6PROTO_ICMPV6:
+        _n64_emerg0("[nat64] FAIL: 4->6 ICMP next-header wrong\n")
+        ok = 0
+    if re_l4[0] != NAT64_ICMP6_ECHO_REPLY:
+        _n64_emerg0("[nat64] FAIL: ICMPv4 0 not -> ICMPv6 129\n")
+        ok = 0
+    # Identifier restored to the original v6 id.
+    if _n64_get16(re_l4, 4) != icmp_id:
+        _n64_emerg0("[nat64] FAIL: 4->6 ICMP id not restored\n")
+        ok = 0
+    if _n64_addr16_eq(cast[Ptr[uint8]](&_n64_re[0]), 24,
+                      cast[Ptr[uint8]](&_n64_host6[0])) != 1:
+        _n64_emerg0("[nat64] FAIL: 4->6 ICMP dst != original host\n")
+        ok = 0
+    if _n64_check_l4_csum_v6(cast[Ptr[uint8]](&_n64_re[0]), IP6PROTO_ICMPV6) != 1:
+        _n64_emerg0("[nat64] FAIL: 4->6 ICMPv6 checksum invalid\n")
+        ok = 0
+    if re_l4[8] != 0xBE or re_l4[9] != 0xEF:
+        _n64_emerg0("[nat64] FAIL: ICMP payload corrupted in 4->6\n")
+        ok = 0
+    return ok
