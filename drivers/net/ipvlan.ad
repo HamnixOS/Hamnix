@@ -1,0 +1,515 @@
+# drivers/net/ipvlan.ad
+#
+# ipvlan — multiple virtual interfaces over one parent netdev that SHARE the
+# parent's MAC (Linux drivers/net/ipvlan/). This is the distinguishing property
+# vs macvlan: where macvlan gives each sub-interface a UNIQUE MAC, ipvlan
+# slaves all advertise the SAME MAC (the parent's), and traffic is steered by
+# IP address instead. This keeps the host to a single MAC on the wire (useful
+# where the switch/port limits MAC count, or for bonded uplinks).
+#
+#   parent eth0  (MAC P)
+#     ├── ipvlan0 (MAC P, IP 10.0.0.1)
+#     ├── ipvlan1 (MAC P, IP 10.0.0.2)
+#     └── ipvlan2 (MAC P, IP 10.0.0.3)
+#
+# Modes (Linux IPVLAN_MODE_*):
+#   l2 — the parent acts like a switch keyed on the destination MAC (which is
+#        the shared parent MAC) and then the destination IP. Slaves on the same
+#        parent can switch frames to each other in-host; broadcast/ARP is
+#        flooded across slaves. Frames whose dst MAC is the parent MAC are
+#        demuxed to the slave owning the destination IP.
+#   l3 — pure L3 routing: the parent steers SOLELY on destination IP. There is
+#        no ARP/broadcast across slaves; the dst MAC is irrelevant for steering
+#        (it stays the parent MAC). A packet whose dst IP matches no slave is
+#        dropped (no default flood).
+#
+# Pure in-memory; reuses the Ethernet frame layout from drivers/net/eth.ad and
+# the IPv4 header field offsets from drivers/net/ip.ad (src_addr at IP-header
+# byte 12, dst_addr at byte 16; the IP header sits right after the 14-byte
+# Ethernet header in a 0x0800 frame). The self-test pushes hand-built frames
+# through the L2 and L3 demux paths between virtual endpoints, like the vlan/
+# bridge tests — no NIC required.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.eth import ETH_HDR_LEN, ETH_P_IP
+
+
+# --- Wire constants ----------------------------------------------------
+
+IPVLAN_MAC_LEN: uint64 = 6           # an Ethernet MAC is 6 octets
+IPVLAN_DST_OFF: uint64 = 0           # dst MAC at frame offset 0..5
+IPVLAN_SRC_OFF: uint64 = 6           # src MAC at frame offset 6..11
+IPVLAN_ETYPE_OFF: uint64 = 12        # ethertype at frame offset 12..13
+
+# IPv4 header offsets, RELATIVE to the start of the Ethernet frame. The IP
+# header begins immediately after the 14-byte Ethernet header. src_addr is at
+# IP byte 12, dst_addr at IP byte 16 (drivers/net/ip.ad IpHdr layout).
+IPVLAN_IP_SRC_OFF: uint64 = 26       # ETH_HDR_LEN(14) + 12
+IPVLAN_IP_DST_OFF: uint64 = 30       # ETH_HDR_LEN(14) + 16
+IPVLAN_IP_MINLEN:  uint64 = 34       # 14 Ethernet + 20 IPv4 minimum
+
+# Modes (mirror Linux IPVLAN_MODE_L2 / _L3).
+IPVLAN_MODE_L2: uint8 = 0
+IPVLAN_MODE_L3: uint8 = 1
+
+
+# =====================================================================
+# Per-ipvlan slave table (over a single parent)
+# =====================================================================
+#
+# Each slave shares the parent MAC and owns ONE IPv4 address. A fixed-size
+# table registers a known set of slaves and resolves a destination IP (and, in
+# L2 mode, the shared MAC) to the owning slave.
+
+IPVLAN_IF_MAX: uint64 = 16
+
+ipvlan_inuse:  Array[16, uint8]      # 1 if slot holds an ipvlan slave
+ipvlan_ip:     Array[16, uint32]     # the slave's IPv4 (packed big-endian)
+ipvlan_parent: Array[16, uint8]      # parent netdev index this slave rides
+ipvlan_mode:   Array[16, uint8]      # IPVLAN_MODE_* for this slave
+
+# The shared parent MAC (every slave on the parent advertises this MAC).
+ipvlan_parent_mac: Array[6, uint8]
+
+# Counters.
+ipvlan_rx_l2_cnt:   uint64 = 0       # L2-mode frames switched to a slave
+ipvlan_rx_l3_cnt:   uint64 = 0       # L3-mode packets routed to a slave
+ipvlan_rx_flood:    uint64 = 0       # L2-mode broadcast floods
+ipvlan_rx_nomatch:  uint64 = 0       # packets whose dst IP matched no slave
+ipvlan_rx_wrongmac: uint64 = 0       # L2 frames not addressed to parent MAC
+
+
+def ipvlan_init():
+    # Reset the slave table, parent MAC, and counters. Idempotent.
+    i: uint64 = 0
+    while i < IPVLAN_IF_MAX:
+        ipvlan_inuse[i]  = 0
+        ipvlan_ip[i]     = 0
+        ipvlan_parent[i] = 0
+        ipvlan_mode[i]   = 0
+        i = i + 1
+    m: uint64 = 0
+    while m < IPVLAN_MAC_LEN:
+        ipvlan_parent_mac[m] = 0
+        m = m + 1
+    ipvlan_rx_l2_cnt   = 0
+    ipvlan_rx_l3_cnt   = 0
+    ipvlan_rx_flood    = 0
+    ipvlan_rx_nomatch  = 0
+    ipvlan_rx_wrongmac = 0
+
+
+def ipvlan_set_parent_mac(mac6: Ptr[uint8]):
+    # Set the shared MAC every slave on the parent advertises.
+    i: uint64 = 0
+    while i < IPVLAN_MAC_LEN:
+        ipvlan_parent_mac[i] = mac6[i]
+        i = i + 1
+
+
+# --- helpers -----------------------------------------------------------
+
+def _ipv_mac_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # 1 if the two 6-byte MACs are equal, else 0.
+    i: uint64 = 0
+    while i < IPVLAN_MAC_LEN:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _ipv_is_broadcast(mac: Ptr[uint8]) -> int32:
+    # 1 if the MAC is ff:ff:ff:ff:ff:ff (L2 broadcast).
+    i: uint64 = 0
+    while i < IPVLAN_MAC_LEN:
+        if mac[i] != 0xff:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _ipv_read_ip(frame: Ptr[uint8], off: uint64) -> uint32:
+    # Read a 4-byte IPv4 address (big-endian on the wire) at frame byte `off`
+    # into a host uint32. Matches the packing drivers/net/ip.ad uses.
+    b0: uint32 = cast[uint32](frame[off])
+    b1: uint32 = cast[uint32](frame[off + 1])
+    b2: uint32 = cast[uint32](frame[off + 2])
+    b3: uint32 = cast[uint32](frame[off + 3])
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+
+def ipvlan_frame_dst_ip(frame: Ptr[uint8], length: uint64) -> uint32:
+    # Extract the destination IPv4 address from an Ethernet/IPv4 frame, or 0 if
+    # the frame is too short or not IPv4 (caller treats 0 as "no IPv4 dst").
+    if length < IPVLAN_IP_MINLEN:
+        return 0
+    hi: uint16 = cast[uint16](frame[IPVLAN_ETYPE_OFF])
+    lo: uint16 = cast[uint16](frame[IPVLAN_ETYPE_OFF + 1])
+    etype: uint16 = (hi << 8) | lo
+    if etype != ETH_P_IP:
+        return 0
+    return _ipv_read_ip(frame, IPVLAN_IP_DST_OFF)
+
+
+# =====================================================================
+# Slave registration / lookup
+# =====================================================================
+
+def ipvlan_add(ip: uint32, parent: uint8, mode: uint8) -> int32:
+    # Register an ipvlan slave owning IPv4 `ip` over `parent` in `mode`.
+    # Returns the slot index, or -1 if the table is full or a slave on that
+    # parent already owns that IP (IPs must be unique per parent).
+    i: uint64 = 0
+    while i < IPVLAN_IF_MAX:
+        if ipvlan_inuse[i] != 0:
+            if ipvlan_parent[i] == parent:
+                if ipvlan_ip[i] == ip:
+                    return -1
+        i = i + 1
+    i = 0
+    free_slot: int32 = -1
+    while i < IPVLAN_IF_MAX:
+        if ipvlan_inuse[i] == 0:
+            free_slot = cast[int32](i)
+            i = IPVLAN_IF_MAX
+        else:
+            i = i + 1
+    if free_slot < 0:
+        return -1
+    slot: uint64 = cast[uint64](free_slot)
+    ipvlan_inuse[slot]  = 1
+    ipvlan_ip[slot]     = ip
+    ipvlan_parent[slot] = parent
+    ipvlan_mode[slot]   = mode
+    return free_slot
+
+
+def ipvlan_lookup_ip(parent: uint8, ip: uint32) -> int32:
+    # Resolve a destination IPv4 to the slave owning it on `parent`, or -1 if
+    # no slave on that parent owns it. This is the L3-route / L2-switch
+    # predicate after the MAC step.
+    i: uint64 = 0
+    while i < IPVLAN_IF_MAX:
+        if ipvlan_inuse[i] != 0:
+            if ipvlan_parent[i] == parent:
+                if ipvlan_ip[i] == ip:
+                    return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# =====================================================================
+# RX demux
+# =====================================================================
+
+# RX result codes.
+IPVLAN_RX_DROP:    int32 = -1        # no slave owns the dst IP
+IPVLAN_RX_FLOOD:   int32 = -2        # L2 broadcast/ARP flooded to all slaves
+IPVLAN_RX_WRONGMAC: int32 = -3       # L2 frame not addressed to the parent MAC
+
+
+def ipvlan_rx_l2(parent: uint8, frame: Ptr[uint8], length: uint64) -> int32:
+    # L2-mode demux. The parent switches on the destination MAC (which must be
+    # the shared parent MAC, the only unicast MAC any slave answers to), then
+    # on the destination IP:
+    #   * broadcast dst MAC -> IPVLAN_RX_FLOOD (delivered to all slaves).
+    #   * dst MAC == parent MAC, dst IP owned by a slave -> that slave's slot.
+    #   * dst MAC == parent MAC, dst IP owned by nobody  -> IPVLAN_RX_DROP.
+    #   * dst MAC != parent MAC (and not broadcast)      -> IPVLAN_RX_WRONGMAC.
+    if length < ETH_HDR_LEN:
+        return IPVLAN_RX_DROP
+    dst: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](frame) + IPVLAN_DST_OFF)
+    if _ipv_is_broadcast(dst) == 1:
+        ipvlan_rx_flood = ipvlan_rx_flood + 1
+        return IPVLAN_RX_FLOOD
+    if _ipv_mac_eq(dst, cast[Ptr[uint8]](&ipvlan_parent_mac[0])) != 1:
+        ipvlan_rx_wrongmac = ipvlan_rx_wrongmac + 1
+        return IPVLAN_RX_WRONGMAC
+    dip: uint32 = ipvlan_frame_dst_ip(frame, length)
+    slot: int32 = ipvlan_lookup_ip(parent, dip)
+    if slot < 0:
+        ipvlan_rx_nomatch = ipvlan_rx_nomatch + 1
+        return IPVLAN_RX_DROP
+    ipvlan_rx_l2_cnt = ipvlan_rx_l2_cnt + 1
+    return slot
+
+
+def ipvlan_rx_l3(parent: uint8, frame: Ptr[uint8], length: uint64) -> int32:
+    # L3-mode demux. Steering is PURELY on destination IP; the dst MAC is
+    # irrelevant (it stays the parent MAC and is not consulted), and there is
+    # no broadcast/flood across slaves. A packet whose dst IP matches no slave
+    # is dropped (IPVLAN_RX_DROP) — no default flood, the key L3 distinction.
+    if length < IPVLAN_IP_MINLEN:
+        return IPVLAN_RX_DROP
+    dip: uint32 = ipvlan_frame_dst_ip(frame, length)
+    if dip == 0:
+        # Non-IPv4 in L3 mode has no routing key -> drop.
+        ipvlan_rx_nomatch = ipvlan_rx_nomatch + 1
+        return IPVLAN_RX_DROP
+    slot: int32 = ipvlan_lookup_ip(parent, dip)
+    if slot < 0:
+        ipvlan_rx_nomatch = ipvlan_rx_nomatch + 1
+        return IPVLAN_RX_DROP
+    ipvlan_rx_l3_cnt = ipvlan_rx_l3_cnt + 1
+    return slot
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+
+def _ipv_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _ipv_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _ipv_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+IPVLAN_T_CAP: uint64 = 1600
+_ipvt_frame: Array[1600, uint8]      # scratch frame
+
+_ipvt_pmac:  Array[6, uint8]         # the shared parent MAC
+_ipvt_bcast: Array[6, uint8]         # ff:ff:ff:ff:ff:ff
+_ipvt_other: Array[6, uint8]         # a MAC that is NOT the parent MAC
+_ipvt_src:   Array[6, uint8]         # an arbitrary source MAC
+
+
+def _ipv_set_mac(dst: Ptr[uint8], b: uint8):
+    i: uint64 = 0
+    while i < IPVLAN_MAC_LEN:
+        dst[i] = b
+        i = i + 1
+
+
+def _ipv_make_ip(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> uint32:
+    # Pack a dotted-quad into a host uint32 (same order _ipv_read_ip returns).
+    return (cast[uint32](b0) << 24) | (cast[uint32](b1) << 16) | \
+           (cast[uint32](b2) << 8) | cast[uint32](b3)
+
+
+def _ipv_build_frame(dstmac: Ptr[uint8], srcmac: Ptr[uint8],
+                     dst_ip: uint32, seed: uint8) -> uint64:
+    # Build a deterministic Ethernet/IPv4 frame into _ipvt_frame:
+    #   dst MAC, src MAC, ethertype 0x0800, a 20-byte IPv4 header with the
+    #   given dst IP (and a fixed src IP), then a small payload.
+    i: uint64 = 0
+    while i < IPVLAN_MAC_LEN:
+        _ipvt_frame[IPVLAN_DST_OFF + i] = dstmac[i]
+        _ipvt_frame[IPVLAN_SRC_OFF + i] = srcmac[i]
+        i = i + 1
+    # EtherType 0x0800.
+    _ipvt_frame[IPVLAN_ETYPE_OFF]     = cast[uint8](
+        (cast[uint32](ETH_P_IP) >> 8) & 0xFF)
+    _ipvt_frame[IPVLAN_ETYPE_OFF + 1] = cast[uint8](
+        cast[uint32](ETH_P_IP) & 0xFF)
+    # Minimal IPv4 header (only the fields the demux reads matter; zero the
+    # rest). version/IHL = 0x45 at IP byte 0 = frame byte 14.
+    h: uint64 = ETH_HDR_LEN
+    while h < (ETH_HDR_LEN + 20):
+        _ipvt_frame[h] = 0
+        h = h + 1
+    _ipvt_frame[ETH_HDR_LEN] = 0x45
+    # src IP = 10.0.0.99 (frame bytes 26..29).
+    _ipvt_frame[IPVLAN_IP_SRC_OFF]     = 10
+    _ipvt_frame[IPVLAN_IP_SRC_OFF + 1] = 0
+    _ipvt_frame[IPVLAN_IP_SRC_OFF + 2] = 0
+    _ipvt_frame[IPVLAN_IP_SRC_OFF + 3] = 99
+    # dst IP from the packed argument (frame bytes 30..33).
+    _ipvt_frame[IPVLAN_IP_DST_OFF]     = cast[uint8]((dst_ip >> 24) & 0xFF)
+    _ipvt_frame[IPVLAN_IP_DST_OFF + 1] = cast[uint8]((dst_ip >> 16) & 0xFF)
+    _ipvt_frame[IPVLAN_IP_DST_OFF + 2] = cast[uint8]((dst_ip >> 8) & 0xFF)
+    _ipvt_frame[IPVLAN_IP_DST_OFF + 3] = cast[uint8](dst_ip & 0xFF)
+    # Payload.
+    plen: uint64 = 16
+    j: uint64 = 0
+    while j < plen:
+        _ipvt_frame[ETH_HDR_LEN + 20 + j] = cast[uint8](
+            (cast[uint32](seed) + cast[uint32](j)) & 0xFF)
+        j = j + 1
+    return ETH_HDR_LEN + 20 + plen
+
+
+def ipvlan_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [ipvlan] marker lines.
+    _ipv_emerg0("[ipvlan] self-test start\n")
+    ipvlan_init()
+    ok: int32 = 1
+
+    # Shared parent MAC P = 12:34:56:78:9a:bc-style; use a constant pattern.
+    _ipvt_pmac[0] = 0x02
+    _ipvt_pmac[1] = 0x11
+    _ipvt_pmac[2] = 0x22
+    _ipvt_pmac[3] = 0x33
+    _ipvt_pmac[4] = 0x44
+    _ipvt_pmac[5] = 0x55
+    ipvlan_set_parent_mac(cast[Ptr[uint8]](&_ipvt_pmac[0]))
+    _ipv_set_mac(cast[Ptr[uint8]](&_ipvt_bcast[0]), 0xff)
+    _ipv_set_mac(cast[Ptr[uint8]](&_ipvt_other[0]), 0x99)
+    _ipv_set_mac(cast[Ptr[uint8]](&_ipvt_src[0]),   0x77)
+
+    # Slave IPs.
+    ip1: uint32 = _ipv_make_ip(10, 0, 0, 1)   # ipvlan0
+    ip2: uint32 = _ipv_make_ip(10, 0, 0, 2)   # ipvlan1
+    ip_unknown: uint32 = _ipv_make_ip(10, 0, 0, 250)  # owned by nobody
+
+    # --- L2 mode: register two slaves on parent 0 sharing the parent MAC. ---
+    s0: int32 = ipvlan_add(ip1, 0, IPVLAN_MODE_L2)
+    s1: int32 = ipvlan_add(ip2, 0, IPVLAN_MODE_L2)
+    if s0 < 0 or s1 < 0:
+        _ipv_emerg0("[ipvlan] FAIL: L2 slave add\n")
+        return 0
+    _ipv_emerg0("[ipvlan] PASS l2-slave-add (10.0.0.1, 10.0.0.2)\n")
+
+    # The slaves SHARE one MAC — the parent MAC. Prove the shared-MAC property:
+    # both are reached at the parent MAC, neither owns a distinct MAC.
+    _ipv_emerg0("[ipvlan] slaves share the parent MAC (no per-slave MAC)\n")
+
+    # Duplicate IP on the same parent is rejected.
+    if ipvlan_add(ip1, 0, IPVLAN_MODE_L2) >= 0:
+        _ipv_emerg0("[ipvlan] FAIL: duplicate IP accepted\n")
+        ok = 0
+    else:
+        _ipv_emerg0("[ipvlan] PASS reject-duplicate-ip\n")
+
+    # --- L2 delivery: frame to parent MAC + dst IP 10.0.0.2 -> ipvlan1. ---
+    _ipv_build_frame(cast[Ptr[uint8]](&_ipvt_pmac[0]),
+                     cast[Ptr[uint8]](&_ipvt_src[0]), ip2, 0x11)
+    d2: int32 = ipvlan_rx_l2(0, cast[Ptr[uint8]](&_ipvt_frame[0]),
+                             IPVLAN_T_CAP)
+    if d2 != s1:
+        _ipv_emerg2("[ipvlan] FAIL: L2 dst .2 switched to %d (want %d)\n",
+                    cast[uint64](d2), cast[uint64](s1))
+        ok = 0
+    else:
+        _ipv_emerg0("[ipvlan] PASS l2-switch-to-slave2 (parent MAC + .2)\n")
+
+    # L2 to parent MAC + dst IP 10.0.0.1 -> ipvlan0 (proves both slaves share
+    # the SAME MAC yet are distinguished by IP).
+    _ipv_build_frame(cast[Ptr[uint8]](&_ipvt_pmac[0]),
+                     cast[Ptr[uint8]](&_ipvt_src[0]), ip1, 0x22)
+    d1: int32 = ipvlan_rx_l2(0, cast[Ptr[uint8]](&_ipvt_frame[0]),
+                             IPVLAN_T_CAP)
+    if d1 != s0:
+        _ipv_emerg2("[ipvlan] FAIL: L2 dst .1 switched to %d (want %d)\n",
+                    cast[uint64](d1), cast[uint64](s0))
+        ok = 0
+    else:
+        _ipv_emerg0("[ipvlan] PASS l2-switch-to-slave1 (shared MAC, by IP)\n")
+
+    # L2: a frame to the parent MAC but an unknown dst IP -> dropped.
+    _ipv_build_frame(cast[Ptr[uint8]](&_ipvt_pmac[0]),
+                     cast[Ptr[uint8]](&_ipvt_src[0]), ip_unknown, 0x33)
+    dnl: int32 = ipvlan_rx_l2(0, cast[Ptr[uint8]](&_ipvt_frame[0]),
+                              IPVLAN_T_CAP)
+    if dnl != IPVLAN_RX_DROP:
+        _ipv_emerg1("[ipvlan] FAIL: L2 unknown IP not dropped (rc=%d)\n",
+                    cast[uint64](dnl))
+        ok = 0
+    else:
+        _ipv_emerg0("[ipvlan] PASS l2-unknown-ip-dropped\n")
+
+    # L2: a broadcast dst MAC floods to all slaves.
+    _ipv_build_frame(cast[Ptr[uint8]](&_ipvt_bcast[0]),
+                     cast[Ptr[uint8]](&_ipvt_src[0]), ip1, 0x44)
+    dfl: int32 = ipvlan_rx_l2(0, cast[Ptr[uint8]](&_ipvt_frame[0]),
+                              IPVLAN_T_CAP)
+    if dfl != IPVLAN_RX_FLOOD:
+        _ipv_emerg1("[ipvlan] FAIL: L2 broadcast not flooded (rc=%d)\n",
+                    cast[uint64](dfl))
+        ok = 0
+    else:
+        _ipv_emerg0("[ipvlan] PASS l2-broadcast-flood\n")
+
+    # L2: a frame whose dst MAC is NOT the parent MAC is rejected (a slave only
+    # answers to the shared parent MAC).
+    _ipv_build_frame(cast[Ptr[uint8]](&_ipvt_other[0]),
+                     cast[Ptr[uint8]](&_ipvt_src[0]), ip1, 0x55)
+    dwm: int32 = ipvlan_rx_l2(0, cast[Ptr[uint8]](&_ipvt_frame[0]),
+                              IPVLAN_T_CAP)
+    if dwm != IPVLAN_RX_WRONGMAC:
+        _ipv_emerg1("[ipvlan] FAIL: L2 wrong-MAC not rejected (rc=%d)\n",
+                    cast[uint64](dwm))
+        ok = 0
+    else:
+        _ipv_emerg0("[ipvlan] PASS l2-wrong-mac-rejected\n")
+
+    # --- L3 mode: register two slaves on parent 1, route purely on dst IP. ---
+    l0: int32 = ipvlan_add(ip1, 1, IPVLAN_MODE_L3)
+    l1: int32 = ipvlan_add(ip2, 1, IPVLAN_MODE_L3)
+    if l0 < 0 or l1 < 0:
+        _ipv_emerg0("[ipvlan] FAIL: L3 slave add\n")
+        return 0
+    _ipv_emerg0("[ipvlan] PASS l3-slave-add (10.0.0.1, 10.0.0.2)\n")
+
+    # L3 steering is by dst IP ALONE — the dst MAC is irrelevant. Build a frame
+    # whose dst MAC is the OTHER (non-parent) MAC but dst IP 10.0.0.2; L3 must
+    # still route it to slave .2 (proving MAC is not consulted in L3).
+    _ipv_build_frame(cast[Ptr[uint8]](&_ipvt_other[0]),
+                     cast[Ptr[uint8]](&_ipvt_src[0]), ip2, 0x66)
+    r2: int32 = ipvlan_rx_l3(1, cast[Ptr[uint8]](&_ipvt_frame[0]),
+                             IPVLAN_T_CAP)
+    if r2 != l1:
+        _ipv_emerg2("[ipvlan] FAIL: L3 dst .2 routed to %d (want %d)\n",
+                    cast[uint64](r2), cast[uint64](l1))
+        ok = 0
+    else:
+        _ipv_emerg0("[ipvlan] PASS l3-route-by-ip-only (.2, MAC ignored)\n")
+
+    # L3: dst IP 10.0.0.1 -> slave .1.
+    _ipv_build_frame(cast[Ptr[uint8]](&_ipvt_pmac[0]),
+                     cast[Ptr[uint8]](&_ipvt_src[0]), ip1, 0x77)
+    r1: int32 = ipvlan_rx_l3(1, cast[Ptr[uint8]](&_ipvt_frame[0]),
+                             IPVLAN_T_CAP)
+    if r1 != l0:
+        _ipv_emerg2("[ipvlan] FAIL: L3 dst .1 routed to %d (want %d)\n",
+                    cast[uint64](r1), cast[uint64](l0))
+        ok = 0
+    else:
+        _ipv_emerg0("[ipvlan] PASS l3-route-to-slave1\n")
+
+    # L3: a packet whose dst IP matches no slave is DROPPED — no flood (the key
+    # distinction from L2 mode, where broadcast would flood).
+    nm_before: uint64 = ipvlan_rx_nomatch
+    _ipv_build_frame(cast[Ptr[uint8]](&_ipvt_pmac[0]),
+                     cast[Ptr[uint8]](&_ipvt_src[0]), ip_unknown, 0x88)
+    rnl: int32 = ipvlan_rx_l3(1, cast[Ptr[uint8]](&_ipvt_frame[0]),
+                              IPVLAN_T_CAP)
+    if rnl != IPVLAN_RX_DROP:
+        _ipv_emerg1("[ipvlan] FAIL: L3 unknown IP not dropped (rc=%d)\n",
+                    cast[uint64](rnl))
+        ok = 0
+    if ipvlan_rx_nomatch != (nm_before + 1):
+        _ipv_emerg0("[ipvlan] FAIL: L3 rx-nomatch counter not bumped\n")
+        ok = 0
+    if rnl == IPVLAN_RX_DROP and ipvlan_rx_nomatch == (nm_before + 1):
+        _ipv_emerg0("[ipvlan] PASS l3-unknown-ip-dropped-no-flood\n")
+
+    # L3: even a BROADCAST dst MAC does not flood in L3 mode — it routes by IP
+    # (here the dst IP is a slave, so it still lands on that slave; there is no
+    # L2-style flood path in L3).
+    _ipv_build_frame(cast[Ptr[uint8]](&_ipvt_bcast[0]),
+                     cast[Ptr[uint8]](&_ipvt_src[0]), ip1, 0x99)
+    rbc: int32 = ipvlan_rx_l3(1, cast[Ptr[uint8]](&_ipvt_frame[0]),
+                              IPVLAN_T_CAP)
+    if rbc != l0:
+        _ipv_emerg1("[ipvlan] FAIL: L3 broadcast-MAC not routed by IP (rc=%d)\n",
+                    cast[uint64](rbc))
+        ok = 0
+    else:
+        _ipv_emerg0("[ipvlan] PASS l3-no-flood-routes-by-ip\n")
+
+    if ok == 1:
+        _ipv_emerg0("[ipvlan] PASS\n")
+        return 1
+    _ipv_emerg0("[ipvlan] FAIL\n")
+    return 0

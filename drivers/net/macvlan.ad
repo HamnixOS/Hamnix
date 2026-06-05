@@ -1,0 +1,521 @@
+# drivers/net/macvlan.ad
+#
+# macvlan — multiple virtual Ethernet interfaces stacked over ONE parent
+# netdev, each with its OWN distinct MAC address (Linux drivers/net/macvlan.c).
+#
+# The distinguishing property vs ipvlan: every macvlan sub-interface owns a
+# UNIQUE MAC. The parent NIC is put in promiscuous mode and each frame the
+# parent receives is demultiplexed to the macvlan whose MAC equals the frame's
+# destination MAC. A frame a macvlan sends out leaves the parent carrying that
+# macvlan's OWN source MAC (not the parent's).
+#
+#   parent eth0  (MAC P)
+#     ├── macvlan0 (MAC A)
+#     ├── macvlan1 (MAC B)
+#     └── macvlan2 (MAC C)
+#
+#   RX on parent, dst==B  -> steered to macvlan1
+#   RX on parent, dst==ff:ff:ff:ff:ff:ff -> broadcast, delivered per mode
+#   TX from macvlan2       -> frame.src forced to C, handed to parent egress
+#
+# Modes (Linux MACVLAN_MODE_*):
+#   bridge  — sub-interfaces on the same parent can talk to each other
+#             directly in-host; an egress frame whose dst MAC matches a peer
+#             macvlan is delivered to that peer WITHOUT leaving for the wire.
+#   private — sub-interfaces on the same parent are ISOLATED: a frame from one
+#             macvlan addressed to a peer macvlan on the same parent is DROPPED
+#             (it is not delivered to the peer, nor reflected back). Frames for
+#             the outside world still egress to the parent normally.
+#
+# This module is pure in-memory and reuses the Ethernet frame layout +
+# MAC-compare idioms from drivers/net/eth.ad / drivers/net/bridge.ad. No NIC
+# is required: the self-test pushes hand-built frames through the RX-demux and
+# egress paths between virtual endpoints, exactly like the vlan/bridge tests.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.eth import ETH_HDR_LEN, ETH_P_IP
+
+
+# --- Wire constants ----------------------------------------------------
+
+MACVLAN_MAC_LEN: uint64 = 6          # an Ethernet MAC is 6 octets
+MACVLAN_DST_OFF: uint64 = 0          # dst MAC at frame offset 0..5
+MACVLAN_SRC_OFF: uint64 = 6          # src MAC at frame offset 6..11
+
+# Modes (mirror Linux MACVLAN_MODE_PRIVATE / _BRIDGE).
+MACVLAN_MODE_PRIVATE: uint8 = 0
+MACVLAN_MODE_BRIDGE:  uint8 = 1
+
+
+# =====================================================================
+# Per-macvlan interface table (over a single parent)
+# =====================================================================
+#
+# A fixed-size table of macvlan sub-interfaces. Each entry binds a unique MAC
+# and a parent index; the mode is a per-parent attribute (Linux configures the
+# mode on the macvlan, but all macvlans over one parent share a mode — we store
+# it per-entry and treat same-parent entries uniformly).
+
+MACVLAN_IF_MAX: uint64 = 16
+
+macvlan_inuse:  Array[16, uint8]      # 1 if slot holds a macvlan
+macvlan_mac:    Array[96, uint8]      # MACVLAN_IF_MAX * 6 (flattened MACs)
+macvlan_parent: Array[16, uint8]      # parent netdev index this macvlan rides
+macvlan_mode:   Array[16, uint8]      # MACVLAN_MODE_* for this macvlan
+
+# Counters (mirror the /sys-visible accounting a real macvlan keeps).
+macvlan_rx_unicast:   uint64 = 0      # frames demuxed to a sub-interface
+macvlan_rx_bcast:     uint64 = 0      # broadcast/multicast frames delivered
+macvlan_rx_nomatch:   uint64 = 0      # frames for an unknown MAC, dropped
+macvlan_tx_local:     uint64 = 0      # bridge-mode peer-to-peer deliveries
+macvlan_tx_wire:      uint64 = 0      # frames that egressed to the parent
+macvlan_tx_isolated:  uint64 = 0      # private-mode peer frames dropped
+
+
+def macvlan_init():
+    # Reset the interface table and counters. Idempotent.
+    i: uint64 = 0
+    while i < MACVLAN_IF_MAX:
+        macvlan_inuse[i]  = 0
+        macvlan_parent[i] = 0
+        macvlan_mode[i]   = 0
+        i = i + 1
+    k: uint64 = 0
+    while k < (MACVLAN_IF_MAX * MACVLAN_MAC_LEN):
+        macvlan_mac[k] = 0
+        k = k + 1
+    macvlan_rx_unicast  = 0
+    macvlan_rx_bcast    = 0
+    macvlan_rx_nomatch  = 0
+    macvlan_tx_local    = 0
+    macvlan_tx_wire     = 0
+    macvlan_tx_isolated = 0
+
+
+# --- MAC helpers (same idiom as bridge.ad / eth.ad) --------------------
+
+def _mv_mac_ptr(slot: uint64) -> Ptr[uint8]:
+    # Address of the 6-byte MAC for macvlan `slot` in the flat array.
+    return cast[Ptr[uint8]](&macvlan_mac[slot * MACVLAN_MAC_LEN])
+
+
+def _mv_mac_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # 1 if the two 6-byte MACs are equal, else 0.
+    i: uint64 = 0
+    while i < MACVLAN_MAC_LEN:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _mv_is_broadcast(mac: Ptr[uint8]) -> int32:
+    # 1 if the MAC is ff:ff:ff:ff:ff:ff (L2 broadcast).
+    i: uint64 = 0
+    while i < MACVLAN_MAC_LEN:
+        if mac[i] != 0xff:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _mv_is_multicast(mac: Ptr[uint8]) -> int32:
+    # 1 if the I/G (group) bit of the first octet is set. Broadcast is a
+    # special case of multicast.
+    if (cast[uint64](mac[0]) & 0x01) == 1:
+        return 1
+    return 0
+
+
+# =====================================================================
+# Interface registration
+# =====================================================================
+
+def macvlan_add(mac6: Ptr[uint8], parent: uint8, mode: uint8) -> int32:
+    # Register a macvlan sub-interface with the unique MAC `mac6` over parent
+    # netdev `parent`, in `mode`. Returns the slot index, or -1 if the table is
+    # full or a macvlan with that MAC already exists (MACs must be unique).
+    # An existing macvlan on the same parent with the same MAC is rejected.
+    i: uint64 = 0
+    while i < MACVLAN_IF_MAX:
+        if macvlan_inuse[i] != 0:
+            if _mv_mac_eq(_mv_mac_ptr(i), mac6) == 1:
+                return -1
+        i = i + 1
+    i = 0
+    free_slot: int32 = -1
+    while i < MACVLAN_IF_MAX:
+        if macvlan_inuse[i] == 0:
+            free_slot = cast[int32](i)
+            i = MACVLAN_IF_MAX
+        else:
+            i = i + 1
+    if free_slot < 0:
+        return -1
+    slot: uint64 = cast[uint64](free_slot)
+    macvlan_inuse[slot]  = 1
+    macvlan_parent[slot] = parent
+    macvlan_mode[slot]   = mode
+    dst: Ptr[uint8] = _mv_mac_ptr(slot)
+    j: uint64 = 0
+    while j < MACVLAN_MAC_LEN:
+        dst[j] = mac6[j]
+        j = j + 1
+    return free_slot
+
+
+def macvlan_lookup_mac(parent: uint8, mac6: Ptr[uint8]) -> int32:
+    # Resolve a destination MAC to the macvlan slot that owns it on `parent`,
+    # or -1 if no macvlan on that parent has that MAC. This is the RX-demux
+    # predicate and the bridge-mode peer-lookup.
+    i: uint64 = 0
+    while i < MACVLAN_IF_MAX:
+        if macvlan_inuse[i] != 0:
+            if macvlan_parent[i] == parent:
+                if _mv_mac_eq(_mv_mac_ptr(i), mac6) == 1:
+                    return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# =====================================================================
+# RX demux (parent -> sub-interface)
+# =====================================================================
+
+# RX-demux result codes.
+MACVLAN_RX_DROP:  int32 = -1         # no macvlan owns the dst MAC
+MACVLAN_RX_BCAST: int32 = -2         # broadcast/multicast (delivered per mode)
+
+
+def macvlan_rx_demux(parent: uint8, frame: Ptr[uint8], length: uint64) -> int32:
+    # Steer a frame received on `parent` to the macvlan that owns its
+    # destination MAC. Returns the macvlan slot for a unicast match, the
+    # special MACVLAN_RX_BCAST code for a broadcast/multicast frame (which the
+    # caller floods to all sub-interfaces on the parent), or MACVLAN_RX_DROP
+    # if no macvlan owns the unicast destination.
+    if length < ETH_HDR_LEN:
+        return MACVLAN_RX_DROP
+    dst: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](frame) + MACVLAN_DST_OFF)
+    if _mv_is_broadcast(dst) == 1:
+        macvlan_rx_bcast = macvlan_rx_bcast + 1
+        return MACVLAN_RX_BCAST
+    if _mv_is_multicast(dst) == 1:
+        macvlan_rx_bcast = macvlan_rx_bcast + 1
+        return MACVLAN_RX_BCAST
+    slot: int32 = macvlan_lookup_mac(parent, dst)
+    if slot < 0:
+        macvlan_rx_nomatch = macvlan_rx_nomatch + 1
+        return MACVLAN_RX_DROP
+    macvlan_rx_unicast = macvlan_rx_unicast + 1
+    return slot
+
+
+# =====================================================================
+# Egress (sub-interface -> parent / peer)
+# =====================================================================
+
+# Egress result codes.
+MACVLAN_TX_WIRE:     int32 = -10     # frame egressed to the parent (wire)
+MACVLAN_TX_BADSLOT:  int32 = -11     # source slot is not an active macvlan
+MACVLAN_TX_RUNT:     int32 = -12     # frame shorter than an Ethernet header
+MACVLAN_TX_ISOLATED: int32 = -13     # private-mode peer delivery blocked
+
+
+def macvlan_egress(src_slot: uint64, frame: Ptr[uint8], length: uint64) -> int32:
+    # Send `frame` out of the macvlan in `src_slot`. The frame's SOURCE MAC is
+    # forced to the macvlan's own MAC (Linux stamps the sub-interface MAC on
+    # egress). Then forwarding is decided:
+    #
+    #   * If the destination MAC belongs to a PEER macvlan on the same parent:
+    #       - bridge  mode: deliver locally -> return the peer's slot index.
+    #       - private mode: BLOCK -> return MACVLAN_TX_ISOLATED.
+    #   * Otherwise (broadcast, or a MAC not owned by any same-parent macvlan):
+    #       the frame egresses to the parent -> return MACVLAN_TX_WIRE.
+    #
+    # Other negatives: MACVLAN_TX_BADSLOT, MACVLAN_TX_RUNT.
+    if src_slot >= MACVLAN_IF_MAX:
+        return MACVLAN_TX_BADSLOT
+    if macvlan_inuse[src_slot] == 0:
+        return MACVLAN_TX_BADSLOT
+    if length < ETH_HDR_LEN:
+        return MACVLAN_TX_RUNT
+
+    # Stamp our own MAC as the source (egress source-MAC rewrite).
+    own: Ptr[uint8] = _mv_mac_ptr(src_slot)
+    src: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](frame) + MACVLAN_SRC_OFF)
+    i: uint64 = 0
+    while i < MACVLAN_MAC_LEN:
+        src[i] = own[i]
+        i = i + 1
+
+    parent: uint8 = macvlan_parent[src_slot]
+    dst: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](frame) + MACVLAN_DST_OFF)
+
+    # Broadcast/multicast leaves for the parent (also flooded to peers by a
+    # real bridge-mode parent, but the wire path is the load-bearing verdict).
+    if _mv_is_broadcast(dst) == 1:
+        macvlan_tx_wire = macvlan_tx_wire + 1
+        return MACVLAN_TX_WIRE
+
+    peer: int32 = macvlan_lookup_mac(parent, dst)
+    if peer < 0:
+        # Not a same-parent peer — goes to the wire.
+        macvlan_tx_wire = macvlan_tx_wire + 1
+        return MACVLAN_TX_WIRE
+
+    # Destination is a peer macvlan on the same parent. Mode decides.
+    mode: uint8 = macvlan_mode[src_slot]
+    if mode == MACVLAN_MODE_BRIDGE:
+        macvlan_tx_local = macvlan_tx_local + 1
+        return peer
+    # private mode: same-parent peer traffic is isolated.
+    macvlan_tx_isolated = macvlan_tx_isolated + 1
+    return MACVLAN_TX_ISOLATED
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+
+def _mv_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _mv_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _mv_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# Scratch frame buffers. Largest frame is a 1514-byte MTU Ethernet frame;
+# round to 1600 so an undersized Array can't overflow into the next global.
+MACVLAN_T_CAP: uint64 = 1600
+_mvt_frame: Array[1600, uint8]       # scratch frame for build/demux/egress
+
+# Known test MACs.
+_mvt_mac_a: Array[6, uint8]          # macvlan0's MAC
+_mvt_mac_b: Array[6, uint8]          # macvlan1's MAC
+_mvt_mac_x: Array[6, uint8]          # an off-host (wire) destination MAC
+_mvt_mac_u: Array[6, uint8]          # a MAC owned by no macvlan
+
+
+def _mv_set_mac(dst: Ptr[uint8], b: uint8):
+    # Fill a 6-byte MAC with the repeated octet `b` (e.g. aa:aa:..).
+    i: uint64 = 0
+    while i < MACVLAN_MAC_LEN:
+        dst[i] = b
+        i = i + 1
+
+
+def _mv_build_frame(dstmac: Ptr[uint8], srcmac: Ptr[uint8], seed: uint8) -> uint64:
+    # Build a deterministic Ethernet frame into _mvt_frame:
+    #   dst = dstmac, src = srcmac, ethertype 0x0800 (IPv4), payload f(seed).
+    # Returns the frame length.
+    plen: uint64 = 40
+    i: uint64 = 0
+    while i < MACVLAN_MAC_LEN:
+        _mvt_frame[MACVLAN_DST_OFF + i] = dstmac[i]
+        _mvt_frame[MACVLAN_SRC_OFF + i] = srcmac[i]
+        i = i + 1
+    # EtherType 0x0800 at offset 12..13 (big-endian).
+    _mvt_frame[12] = cast[uint8]((cast[uint32](ETH_P_IP) >> 8) & 0xFF)
+    _mvt_frame[13] = cast[uint8](cast[uint32](ETH_P_IP) & 0xFF)
+    j: uint64 = 0
+    while j < plen:
+        _mvt_frame[ETH_HDR_LEN + j] = cast[uint8](
+            (cast[uint32](seed) + cast[uint32](j)) & 0xFF)
+        j = j + 1
+    return ETH_HDR_LEN + plen
+
+
+def macvlan_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [macvlan] marker lines.
+    _mv_emerg0("[macvlan] self-test start\n")
+    macvlan_init()
+    ok: int32 = 1
+
+    # Test MACs. These are proper locally-administered UNICAST addresses: the
+    # first octet has the locally-administered bit set (0x02) and the I/G
+    # (group/multicast) bit CLEAR (low bit 0), so they are real unicast MACs —
+    # the remaining 5 octets carry a distinct pattern per interface.
+    _mv_set_mac(cast[Ptr[uint8]](&_mvt_mac_a[0]), 0xAA)   # macvlan0
+    _mv_set_mac(cast[Ptr[uint8]](&_mvt_mac_b[0]), 0xBB)   # macvlan1
+    _mv_set_mac(cast[Ptr[uint8]](&_mvt_mac_x[0]), 0xCC)   # off-host (wire)
+    _mv_set_mac(cast[Ptr[uint8]](&_mvt_mac_u[0]), 0xDD)   # owned by nobody
+    _mvt_mac_a[0] = 0x02
+    _mvt_mac_b[0] = 0x06
+    _mvt_mac_x[0] = 0x0A
+    _mvt_mac_u[0] = 0x0E
+
+    # --- Register two macvlans over parent 0, each its OWN distinct MAC. ---
+    # macvlan0 = A, macvlan1 = B. (Mode set per-scenario below.)
+    s0: int32 = macvlan_add(cast[Ptr[uint8]](&_mvt_mac_a[0]), 0,
+                            MACVLAN_MODE_BRIDGE)
+    s1: int32 = macvlan_add(cast[Ptr[uint8]](&_mvt_mac_b[0]), 0,
+                            MACVLAN_MODE_BRIDGE)
+    if s0 < 0 or s1 < 0:
+        _mv_emerg0("[macvlan] FAIL: macvlan add\n")
+        return 0
+    # The two MACs must be distinct (the defining macvlan property).
+    if _mv_mac_eq(cast[Ptr[uint8]](&_mvt_mac_a[0]),
+                  cast[Ptr[uint8]](&_mvt_mac_b[0])) == 1:
+        _mv_emerg0("[macvlan] FAIL: test MACs not distinct\n")
+        ok = 0
+    else:
+        _mv_emerg0("[macvlan] PASS distinct-macs (macvlan0=A macvlan1=B)\n")
+
+    # A duplicate MAC must be rejected (MACs are unique).
+    if macvlan_add(cast[Ptr[uint8]](&_mvt_mac_a[0]), 0,
+                   MACVLAN_MODE_BRIDGE) >= 0:
+        _mv_emerg0("[macvlan] FAIL: duplicate MAC accepted\n")
+        ok = 0
+    else:
+        _mv_emerg0("[macvlan] PASS reject-duplicate-mac\n")
+
+    # --- RX demux: a frame addressed to A is steered to macvlan0 only. ---
+    _mv_build_frame(cast[Ptr[uint8]](&_mvt_mac_a[0]),
+                    cast[Ptr[uint8]](&_mvt_mac_x[0]), 0x11)
+    da: int32 = macvlan_rx_demux(0, cast[Ptr[uint8]](&_mvt_frame[0]),
+                                 MACVLAN_T_CAP)
+    if da != s0:
+        _mv_emerg2("[macvlan] FAIL: dst=A demuxed to %d (want %d)\n",
+                   cast[uint64](da), cast[uint64](s0))
+        ok = 0
+    else:
+        _mv_emerg0("[macvlan] PASS rx-demux-to-A\n")
+
+    # A frame addressed to B is steered to macvlan1 only.
+    _mv_build_frame(cast[Ptr[uint8]](&_mvt_mac_b[0]),
+                    cast[Ptr[uint8]](&_mvt_mac_x[0]), 0x22)
+    db: int32 = macvlan_rx_demux(0, cast[Ptr[uint8]](&_mvt_frame[0]),
+                                 MACVLAN_T_CAP)
+    if db != s1:
+        _mv_emerg2("[macvlan] FAIL: dst=B demuxed to %d (want %d)\n",
+                   cast[uint64](db), cast[uint64](s1))
+        ok = 0
+    else:
+        _mv_emerg0("[macvlan] PASS rx-demux-to-B\n")
+
+    # A frame for an UNKNOWN MAC (owned by no macvlan) is delivered to none.
+    nm_before: uint64 = macvlan_rx_nomatch
+    _mv_build_frame(cast[Ptr[uint8]](&_mvt_mac_u[0]),
+                    cast[Ptr[uint8]](&_mvt_mac_x[0]), 0x33)
+    du: int32 = macvlan_rx_demux(0, cast[Ptr[uint8]](&_mvt_frame[0]),
+                                 MACVLAN_T_CAP)
+    if du != MACVLAN_RX_DROP:
+        _mv_emerg1("[macvlan] FAIL: unknown dst not dropped (rc=%d)\n",
+                   cast[uint64](du))
+        ok = 0
+    if macvlan_rx_nomatch != (nm_before + 1):
+        _mv_emerg0("[macvlan] FAIL: rx-nomatch counter not bumped\n")
+        ok = 0
+    if du == MACVLAN_RX_DROP and macvlan_rx_nomatch == (nm_before + 1):
+        _mv_emerg0("[macvlan] PASS rx-demux-unknown-dropped\n")
+
+    # Broadcast is delivered per-mode (flood marker), not unicast-steered.
+    _mv_set_mac(cast[Ptr[uint8]](&_mvt_mac_u[0]), 0xff)  # reuse as ff:ff:..
+    _mv_build_frame(cast[Ptr[uint8]](&_mvt_mac_u[0]),
+                    cast[Ptr[uint8]](&_mvt_mac_x[0]), 0x44)
+    dbc: int32 = macvlan_rx_demux(0, cast[Ptr[uint8]](&_mvt_frame[0]),
+                                  MACVLAN_T_CAP)
+    if dbc != MACVLAN_RX_BCAST:
+        _mv_emerg1("[macvlan] FAIL: broadcast not flagged (rc=%d)\n",
+                   cast[uint64](dbc))
+        ok = 0
+    else:
+        _mv_emerg0("[macvlan] PASS rx-demux-broadcast-flood\n")
+    _mv_set_mac(cast[Ptr[uint8]](&_mvt_mac_u[0]), 0xDD)  # restore
+
+    # --- TX egress source-MAC rewrite + wire path. ---
+    # macvlan1 (B) sends to off-host X: src MAC must become B, dst not a peer
+    # so it egresses to the wire.
+    _mv_build_frame(cast[Ptr[uint8]](&_mvt_mac_x[0]),
+                    cast[Ptr[uint8]](&_mvt_mac_a[0]), 0x55)  # bogus src
+    tw: int32 = macvlan_egress(cast[uint64](s1),
+                               cast[Ptr[uint8]](&_mvt_frame[0]),
+                               MACVLAN_T_CAP)
+    if tw != MACVLAN_TX_WIRE:
+        _mv_emerg1("[macvlan] FAIL: egress-to-wire rc=%d\n", cast[uint64](tw))
+        ok = 0
+    else:
+        # The frame's source MAC must now equal B (macvlan1's own MAC).
+        src: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&_mvt_frame[0]) + MACVLAN_SRC_OFF)
+        if _mv_mac_eq(src, cast[Ptr[uint8]](&_mvt_mac_b[0])) != 1:
+            _mv_emerg0("[macvlan] FAIL: egress did not stamp own src MAC\n")
+            ok = 0
+        else:
+            _mv_emerg0("[macvlan] PASS tx-egress-srcmac-rewrite + wire\n")
+
+    # --- bridge mode: peer-to-peer delivery WITHOUT leaving the host. ---
+    # Re-register both as BRIDGE (they already are). macvlan0 (A) -> B should
+    # deliver locally to macvlan1 (slot s1).
+    _mv_build_frame(cast[Ptr[uint8]](&_mvt_mac_b[0]),
+                    cast[Ptr[uint8]](&_mvt_mac_x[0]), 0x66)
+    bp: int32 = macvlan_egress(cast[uint64](s0),
+                               cast[Ptr[uint8]](&_mvt_frame[0]),
+                               MACVLAN_T_CAP)
+    if bp != s1:
+        _mv_emerg2("[macvlan] FAIL: bridge A->B delivered to %d (want %d)\n",
+                   cast[uint64](bp), cast[uint64](s1))
+        ok = 0
+    else:
+        # And the source MAC was stamped to A.
+        src2: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&_mvt_frame[0]) + MACVLAN_SRC_OFF)
+        if _mv_mac_eq(src2, cast[Ptr[uint8]](&_mvt_mac_a[0])) != 1:
+            _mv_emerg0("[macvlan] FAIL: bridge egress src MAC not A\n")
+            ok = 0
+        else:
+            _mv_emerg0("[macvlan] PASS bridge-mode-peer-to-peer (A->B local)\n")
+
+    # --- private mode: peer-to-peer on the same parent is BLOCKED. ---
+    # Reset and register A,B on parent 1 in PRIVATE mode.
+    macvlan_init()
+    p0: int32 = macvlan_add(cast[Ptr[uint8]](&_mvt_mac_a[0]), 1,
+                            MACVLAN_MODE_PRIVATE)
+    p1: int32 = macvlan_add(cast[Ptr[uint8]](&_mvt_mac_b[0]), 1,
+                            MACVLAN_MODE_PRIVATE)
+    if p0 < 0 or p1 < 0:
+        _mv_emerg0("[macvlan] FAIL: private-mode add\n")
+        return 0
+    iso_before: uint64 = macvlan_tx_isolated
+    _mv_build_frame(cast[Ptr[uint8]](&_mvt_mac_b[0]),
+                    cast[Ptr[uint8]](&_mvt_mac_x[0]), 0x77)
+    pv: int32 = macvlan_egress(cast[uint64](p0),
+                               cast[Ptr[uint8]](&_mvt_frame[0]),
+                               MACVLAN_T_CAP)
+    if pv != MACVLAN_TX_ISOLATED:
+        _mv_emerg1("[macvlan] FAIL: private A->B not isolated (rc=%d)\n",
+                   cast[uint64](pv))
+        ok = 0
+    if macvlan_tx_isolated != (iso_before + 1):
+        _mv_emerg0("[macvlan] FAIL: tx-isolated counter not bumped\n")
+        ok = 0
+    if pv == MACVLAN_TX_ISOLATED and macvlan_tx_isolated == (iso_before + 1):
+        _mv_emerg0("[macvlan] PASS private-mode-peer-isolated (A->B blocked)\n")
+
+    # In private mode, a frame to an OFF-host MAC still egresses to the wire.
+    _mv_build_frame(cast[Ptr[uint8]](&_mvt_mac_x[0]),
+                    cast[Ptr[uint8]](&_mvt_mac_a[0]), 0x88)
+    pw: int32 = macvlan_egress(cast[uint64](p0),
+                               cast[Ptr[uint8]](&_mvt_frame[0]),
+                               MACVLAN_T_CAP)
+    if pw != MACVLAN_TX_WIRE:
+        _mv_emerg1("[macvlan] FAIL: private off-host not wired (rc=%d)\n",
+                   cast[uint64](pw))
+        ok = 0
+    else:
+        _mv_emerg0("[macvlan] PASS private-mode-offhost-egresses-wire\n")
+
+    if ok == 1:
+        _mv_emerg0("[macvlan] PASS\n")
+        return 1
+    _mv_emerg0("[macvlan] FAIL\n")
+    return 0

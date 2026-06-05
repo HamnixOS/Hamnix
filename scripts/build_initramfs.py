@@ -2468,6 +2468,32 @@ if os.environ.get("ENABLE_SCTP_TEST") == "1":
 if os.environ.get("ENABLE_MPTCP_TEST") == "1":
     FILES.append(("/etc/mptcp-test", b"1\n"))
 
+# Native macvlan (Linux drivers/net/macvlan.c) virtual-link self-test.
+# scripts/test_macvlan.sh sets ENABLE_MACVLAN_TEST=1 to plant /etc/macvlan-test;
+# init/main.ad's boot:37.macvlan gate then runs macvlan_selftest() (drivers/net/
+# macvlan.ad), a pure in-memory test that stacks multiple virtual interfaces
+# over ONE parent netdev, each with its OWN distinct MAC, and proves: RX demux
+# steers a frame to the macvlan owning its destination MAC (and drops a frame
+# for an unknown MAC); egress stamps the macvlan's own source MAC; bridge-mode
+# peers on the same parent deliver to each other in-host; private-mode peer
+# traffic is isolated (blocked) while off-host traffic still egresses. Prints
+# "[macvlan] PASS" / "[macvlan] FAIL". Default boots ship no marker.
+if os.environ.get("ENABLE_MACVLAN_TEST") == "1":
+    FILES.append(("/etc/macvlan-test", b"1\n"))
+
+# Native ipvlan (Linux drivers/net/ipvlan/) virtual-link self-test.
+# scripts/test_ipvlan.sh sets ENABLE_IPVLAN_TEST=1 to plant /etc/ipvlan-test;
+# init/main.ad's boot:37.ipvlan gate then runs ipvlan_selftest() (drivers/net/
+# ipvlan.ad), a pure in-memory test that stacks multiple virtual interfaces over
+# one parent that SHARE the parent's MAC, and proves: L2 mode switches on the
+# shared MAC then destination IP (delivering to the slave owning the dst IP,
+# flooding broadcast, dropping an unknown dst IP, rejecting a wrong dst MAC);
+# L3 mode routes PURELY on destination IP (MAC irrelevant, no flood) and drops a
+# packet whose dst IP matches no slave. Prints "[ipvlan] PASS" / "[ipvlan] FAIL".
+# Default boots ship no marker.
+if os.environ.get("ENABLE_IPVLAN_TEST") == "1":
+    FILES.append(("/etc/ipvlan-test", b"1\n"))
+
 # Native L2TPv3 (RFC 3931) Ethernet-pseudowire encap/decap self-test.
 # scripts/test_l2tp.sh sets ENABLE_L2TP_TEST=1 to plant /etc/l2tp-test;
 # init/main.ad's boot:37.l2tp gate then runs l2tp_selftest()
