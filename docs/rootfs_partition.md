@@ -2,11 +2,18 @@
 
 ## TL;DR
 
-Hamnix ships a UEFI-only GPT disk image, `build/hamnix.img`, built by
-`scripts/build_img.sh`. It has a small FAT ESP (the PE/COFF stub +
-kernel ELF) and **one** ext4 partition that holds the entire live
-system. That single ext4 carries a `.hamnix-roots` sentinel at its
-root with one `<word> <relpath>` line per **named root**:
+> **Note:** the baked `build/hamnix.img` (and `scripts/build_img.sh`)
+> are **retired**. The installer (`build/hamnix-installer.img`) lays the
+> layout described here onto a real disk; the golden VM copy is
+> `build/hamnix-installed.qcow2` from `scripts/build_installed_nvme.sh`.
+> References to `build/hamnix.img` below describe that same on-disk
+> layout and are kept as the structural reference.
+
+A Hamnix install is a UEFI-only GPT disk (laid down by the installer on
+NVMe). It has a small FAT ESP (the PE/COFF stub + kernel ELF) and
+**one** ext4 partition that holds the entire live system. That single
+ext4 carries a `.hamnix-roots` sentinel at its root with one
+`<word> <relpath>` line per **named root**:
 
 ```
 sysroot   sysroot

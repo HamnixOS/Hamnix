@@ -66,15 +66,14 @@ loop through userspace-posted srvfds. See
   installer partitions the target's internal NVMe, writes a persistent
   ext4 root + ESP, and reboots off the NVMe alone. Proven end-to-end
   under OVMF+KVM by `scripts/test_installer_nvme_inram.sh`.
-- **UEFI-only GPT disk image** (`build/hamnix.img`) via
-  `scripts/build_img.sh` — a raw, installed-system-shaped disk: a FAT
-  EFI System Partition (the native PE/COFF stub + kernel ELF) plus a
-  512 MiB ext4 root. UEFI firmware launches the stub, which SFSP-loads
-  the kernel off the ESP; the kernel then boots entirely off the ext4
-  root (no embedded cpio). The right artifact for **VM boot** and direct
-  disk provisioning; its kernel mounts root off the boot medium, so it
-  is not the preferred USB-stick path on real hardware. BIOS/legacy boot
-  is dropped; Hamnix is UEFI-only by design.
+- **Installed ext4-on-NVMe system** — there is no pre-baked root disk
+  image anymore. A real system is laid down by the installer above onto
+  a real disk (GPT + ESP + ext4 root on NVMe); the resulting golden disk
+  for VM testing is `build/hamnix-installed.qcow2`, produced by
+  `scripts/build_installed_nvme.sh` running the real installer path once.
+  Feature tests boot a fresh copy of that installed disk via the shared
+  harness `scripts/_installed_boot.sh`. BIOS/legacy boot is dropped;
+  Hamnix is UEFI-only by design.
 - **Linux ABI** — ~250 syscalls; 24 stock Debian `.ko` modules load
   cleanly. CPython 3.11.10 and busybox 1.36 run as musl static-PIE
   binaries. Real Debian `apt 3.0.3` + `dpkg 1.22.22` install packages
@@ -108,10 +107,9 @@ loop through userspace-posted srvfds. See
 - **Installer** — `etc/install.hamsh`: `hpm install`-driven Debian-
   installer-shape script. Partitions disk, mkfs ESP + ext4 rootfs,
   installs from a local mini-repo, plants `/etc/passwd` + `/etc/shadow`,
-  ext4 grow-to-fit on first boot. (The shipped `build/hamnix.img` is
-  itself already an installed-system-shaped GPT image; on a real disk
-  the ext4 root grows to fill the disk and every named root draws from
-  that one shared pool.)
+  ext4 grow-to-fit on first boot. (There is no pre-baked root image; the
+  installer lays the ext4 root onto the real disk, where it grows to fill
+  the disk and every named root draws from that one shared pool.)
 - **Multi-user auth** — `useradd` / `passwd` / `login` / `su` /
   `whoami` real end-to-end; `/dev/auth` cdev with `setpass` verb;
   `SYS_SETUID_AUTH` (300) syscall; SHA-512 shadow hashes (rate-limited).
@@ -182,23 +180,24 @@ git clone https://github.com/HamnixOS/Hamnix
 cd Hamnix
 
 ./scripts/build_installer_img.sh       # produces build/hamnix-installer.img (real-HW installer)
-./scripts/build_img.sh                 # produces build/hamnix.img (UEFI GPT disk, VM/provision)
-./scripts/test_img_uefi_boot.sh        # boots hamnix.img under OVMF (apt install ovmf)
+./scripts/build_installed_nvme.sh      # installs once → build/hamnix-installed.qcow2 (golden VM disk)
+./scripts/test_installer_nvme_inram.sh # OVMF: installer writes ext4-on-NVMe, reboots off it
 ```
 
-`build/hamnix-installer.img` is the **recommended real-hardware
-artifact**: an ESP-only GPT image whose kernel + embedded squashfs root
-are loaded entirely into RAM by firmware, so Hamnix never reads the boot
-medium. It then writes a persistent ext4 root to the target's internal
-NVMe and reboots off that disk alone — keeping the unfinished native USB
-driver off the boot path.
+`build/hamnix-installer.img` is the **only install artifact**: an
+ESP-only GPT image whose kernel + embedded squashfs root are loaded
+entirely into RAM by firmware, so Hamnix never reads the boot medium. It
+then writes a persistent ext4 root to the target's internal NVMe and
+reboots off that disk alone — keeping the unfinished native USB driver
+off the boot path.
 
-`build/hamnix.img` is a raw, installed-system-shaped GPT disk image
-(UEFI-only): a FAT EFI System Partition carrying the PE/COFF stub +
-kernel ELF, and an ext4 root the kernel boots off directly. It is the
-right artifact for VM boot and direct disk provisioning. Hamnix is
-UEFI-only; there is no BIOS/GRUB path. (`scripts/build_iso.sh` is now a
-thin deprecation shim that delegates to `build_img.sh`.)
+There is no pre-baked root disk image. A real system is the ext4-on-NVMe
+result of running that installer on a disk. For VM testing,
+`scripts/build_installed_nvme.sh` runs the real installer path once into
+a golden disk `build/hamnix-installed.qcow2`; feature tests boot a fresh
+copy of it via `scripts/_installed_boot.sh`. Hamnix is UEFI-only; there
+is no BIOS/GRUB path. (`scripts/build_iso.sh` is now a thin shim that
+delegates to `build_installer_img.sh`.)
 
 Flash to USB and boot on real hardware (use the installer image):
 
@@ -299,7 +298,7 @@ init/            start_kernel(), /init shim, boot smoke tests
 
 kernel-modules/  M1..M15 stock-Linux .ko regression baseline
 tests/           Integration tests + compiler regression fixtures
-scripts/         build_img.sh, test_*.sh, build_packages.py, gen_install_manifest.py
+scripts/         build_installer_img.sh, test_*.sh, build_packages.py, gen_install_manifest.py
 docs/            Project documentation (see index below)
 memory/          Orchestrator session memory (not in repo)
 ```
@@ -327,8 +326,8 @@ memory/          Orchestrator session memory (not in repo)
 - [`docs/9p.md`](docs/9p.md) — 9P2000 wire spec.
 - [`docs/distro-namespaces.md`](docs/distro-namespaces.md) — Phase C.5
   distro-shape namespace design.
-- [`docs/BOOT.md`](docs/BOOT.md) — building + booting the UEFI GPT
-  disk image (`hamnix.img`).
+- [`docs/BOOT.md`](docs/BOOT.md) — building + booting the UEFI installer
+  image and the installed ext4-on-NVMe system.
 - [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md) — physical-hardware
   procedure + per-vendor firmware checklist.
 - [`docs/x86-backend.md`](docs/x86-backend.md) — hand-written backend

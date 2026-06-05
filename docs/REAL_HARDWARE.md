@@ -16,15 +16,17 @@ itself**. The in-RAM installer then writes a full ext4 root + ESP onto
 the target's internal **NVMe** disk (native NVMe driver) and reboots into
 a persistent installed system. See §3.
 
-> **Why not just `dd` `build/hamnix.img` to the stick?** `build/hamnix.img`
-> (built by `scripts/build_img.sh`) is an *installed-system-shaped* image:
-> its kernel mounts the ext4 root off the **boot medium** at runtime. In a
-> VM (virtio-blk / emulated NVMe) that works fine, and it remains the right
-> artifact for VM boot and direct disk provisioning. But on a real NUC the
-> boot medium is the USB stick, so that runtime root read goes through the
-> native xHCI/USB driver, which is broken on that hardware — the very
-> reason the in-RAM installer exists. Prefer `build/hamnix-installer.img`
-> for physical machines.
+> **There is no pre-baked `build/hamnix.img` to `dd` anymore** — it (and
+> `scripts/build_img.sh`) are **retired**. A real system is the
+> ext4-on-NVMe disk the installer writes, not a pre-baked root image.
+> Always write `build/hamnix-installer.img` to the stick; on a real NUC
+> the boot medium would otherwise have to be read through the native
+> xHCI/USB driver (broken on that hardware) — the very reason the in-RAM
+> installer exists. For VM testing the installed system is reproduced as
+> the golden disk `build/hamnix-installed.qcow2`
+> (`scripts/build_installed_nvme.sh`). Historical references to
+> `build/hamnix.img` below are preserved as the record of the earlier
+> baked-image model.
 
 It **extends** [`BOOT.md`](BOOT.md) — that doc covers QEMU and the
 disk-image build pipeline; this one covers the steps and expectations

@@ -14,21 +14,27 @@ For the current end-state plus open blockers, see [README.md](README.md).
 For docs/architecture spec, see [docs/architecture.md](docs/architecture.md).
 For agent-orchestrated development workflow, see [README.md§Agent-orchestrated development](README.md#agent-orchestrated-development).
 
-> **Current boot model (read this before the milestone log below).** The
-> shipped artifact is now `build/hamnix.img` — a raw **UEFI-only** GPT
-> disk image (~546 MiB: a 32 MiB FAT ESP + a 512 MiB ext4 root
-> partition), built by `scripts/build_img.sh`. UEFI firmware launches
-> the native PE/COFF stub at `\EFI\BOOT\BOOTX64.EFI`, which ELF-loads
-> `\hamnix-kernel.elf` off the ESP; the kernel then finds the ext4 root
-> partition via its `.hamnix-roots` sentinel, binds `#sysroot` at `/`,
-> and ELF-loads `/init` directly off ext4. **There is no BIOS/legacy/CSM
-> path, no GRUB, and no bootable ISO** — `scripts/build_iso.sh` is now a
-> deprecation shim that delegates to `build_img.sh`. The in-kernel cpio
-> initramfs is retained **only** for the developer `-kernel` test path
-> (the shipped image carries an empty trailer-only cpio,
-> `HAMNIX_CPIO_EMPTY=1`). Many milestone rows below are date-stamped
-> historical records of the earlier hybrid-ISO / BIOS+UEFI model and are
-> preserved as history, not current state.
+> **Current boot model (read this before the milestone log below).**
+> There is **no pre-baked root disk image** anymore. The single install
+> artifact is `build/hamnix-installer.img` (built by
+> `scripts/build_installer_img.sh`) — an ESP-only **UEFI-only** GPT image
+> whose kernel + embedded squashfs root are loaded entirely into RAM by
+> firmware; the in-RAM installer then partitions the target's NVMe and
+> writes a persistent **GPT + ESP + ext4 root**, then reboots off that
+> disk alone. The installed system boots when UEFI launches the native
+> PE/COFF stub off the NVMe ESP, which ELF-loads `\hamnix-kernel.elf`;
+> the kernel finds the ext4 root via its `.hamnix-roots` sentinel, binds
+> `#sysroot` at `/`, and ELF-loads `/init` off ext4. For VM testing,
+> `scripts/build_installed_nvme.sh` runs that real installer path once
+> into a golden disk `build/hamnix-installed.qcow2`, and feature tests
+> boot a fresh copy via `scripts/_installed_boot.sh`. **There is no
+> BIOS/legacy/CSM path, no GRUB, and no bootable ISO** —
+> `scripts/build_iso.sh` is now a shim that delegates to
+> `build_installer_img.sh`. The in-kernel cpio initramfs is retained for
+> the developer `-kernel` test path and as the installer's in-RAM root.
+> Many milestone rows below are date-stamped historical records of the
+> earlier hybrid-ISO / baked-image model and are preserved as history,
+> not current state.
 
 ---
 

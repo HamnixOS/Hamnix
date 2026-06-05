@@ -3,22 +3,33 @@
 Hamnix is **UEFI-only**. There is no BIOS/GRUB/El-Torito/hybrid-MBR path
 anymore; legacy boot was dropped.
 
-This document covers the three ways to boot Hamnix today:
+> **RETIRED: the baked `build/hamnix.img` + `scripts/build_img.sh`.** A
+> real system is never shipped as a pre-baked ext4 disk image — that is
+> what the **installer** produces on a real disk. The single install
+> artifact is now `build/hamnix-installer.img`; the installed system is
+> the ext4-on-NVMe result of running it. For VM testing,
+> `scripts/build_installed_nvme.sh` runs the real installer once into the
+> golden disk `build/hamnix-installed.qcow2`, and feature tests boot a
+> fresh copy via `scripts/_installed_boot.sh`. Sections below that still
+> describe `build/hamnix.img` / `build_img.sh` are **historical** and
+> preserved as the record of the earlier baked-image model.
+
+This document covers the ways to boot Hamnix today:
 
 1. **In-RAM installer image** (`build/hamnix-installer.img`) — the
-   recommended artifact for **real hardware** (built by
-   `scripts/build_installer_img.sh`). An ESP-only GPT image: the firmware
-   loads the installer kernel + an embedded squashfs of the root
-   filesystem entirely into RAM, so Hamnix never reads the boot medium.
-   The in-RAM installer then writes a persistent ext4 root + ESP to the
-   target's internal NVMe disk and reboots. This sidesteps the unfinished
-   native USB driver. See §3.
-2. **Installed-system disk image** (`build/hamnix.img`, built by
-   `scripts/build_img.sh`) — UEFI firmware boots it the way a real
-   install boots; the kernel then runs entirely off the image's ext4 root
-   (no embedded cpio). The right artifact for **VM boot** and direct disk
-   provisioning, but its kernel mounts root off the boot medium, so it is
-   not the preferred USB-stick path on real hardware.
+   single install artifact, for both **real hardware** and VM testing
+   (built by `scripts/build_installer_img.sh`). An ESP-only GPT image:
+   the firmware loads the installer kernel + an embedded squashfs of the
+   root filesystem entirely into RAM, so Hamnix never reads the boot
+   medium. The in-RAM installer then writes a persistent ext4 root + ESP
+   to the target's internal NVMe disk and reboots. This sidesteps the
+   unfinished native USB driver. See §3.
+2. **Installed ext4-on-NVMe system** — the disk the installer above lays
+   down (GPT + ESP + ext4 root). The golden VM copy
+   `build/hamnix-installed.qcow2` is produced by
+   `scripts/build_installed_nvme.sh`; tests boot a fresh copy through
+   `scripts/_installed_boot.sh`. (The retired `build/hamnix.img` was a
+   pre-baked stand-in for exactly this disk.)
 3. **Developer dev loop** via `scripts/run_x86_bare.sh` — boots the
    kernel ELF directly under QEMU `-kernel` (through a small GRUB-ISO
    PATH shim). This developer/test path STILL boots from an embedded
