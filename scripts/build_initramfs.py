@@ -2375,6 +2375,19 @@ if os.environ.get("ENABLE_MACSEC_TEST") == "1":
 if os.environ.get("ENABLE_WIREGUARD_TEST") == "1":
     FILES.append(("/etc/wireguard-test", b"1\n"))
 
+# Native IPsec ESP (RFC 4303 transport mode, AES-GCM per RFC 4106) self-test.
+# scripts/test_ipsec.sh sets ENABLE_IPSEC_TEST=1 to plant /etc/ipsec-test;
+# init/main.ad's boot:37.ipsec gate then runs ipsec_selftest() (drivers/net/
+# ipsec.ad), a pure in-memory two-endpoint test that installs an A->B SA pair
+# sharing a key/SPI, ENCAPsulates a known payload into SPI|seq|ciphertext|ICV
+# (reusing the TLS AES-GCM AEAD), DECAPsulates it back byte-identical with the
+# correct next-header, and proves the security properties (flipped ciphertext/
+# ICV fails the GCM ICV, replayed seq rejected by the anti-replay window, fresh
+# in-window seq accepted and advances the window, seq numbers increase). Prints
+# "[ipsec] PASS" / "[ipsec] FAIL". Default boots ship no marker.
+if os.environ.get("ENABLE_IPSEC_TEST") == "1":
+    FILES.append(("/etc/ipsec-test", b"1\n"))
+
 # Native L2TPv3 (RFC 3931) Ethernet-pseudowire encap/decap self-test.
 # scripts/test_l2tp.sh sets ENABLE_L2TP_TEST=1 to plant /etc/l2tp-test;
 # init/main.ad's boot:37.l2tp gate then runs l2tp_selftest()

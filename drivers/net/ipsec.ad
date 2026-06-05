@@ -1,0 +1,728 @@
+# drivers/net/ipsec.ad
+#
+# Native IPsec ESP (Encapsulating Security Payload), TRANSPORT mode, with
+# AES-GCM (RFC 4303 §2,§3.3-3.4; RFC 4106 "The Use of Galois/Counter Mode
+# (GCM) in IPsec ESP"). This is the standard IPsec data-plane: an SA-keyed,
+# authenticated-encrypted upper-layer payload carried in an ESP header inside
+# IP, with anti-replay protection.
+#
+# There is NO socket API here — like the wireguard/macsec self-tests this is
+# pure in-kernel packet-buffer transformation. The AES-GCM-128/256 AEAD
+# primitive is REUSED from the native stack's TLS implementation
+# (drivers/net/tls.ad: _tls_aes_gcm_seal / _tls_aes_gcm_open) exactly as
+# MACsec reuses it — we do NOT reimplement AES or GHASH.
+#
+# ESP packet layout (RFC 4303 §2), transport mode, combined-mode AES-GCM:
+#
+#   +---------------------------------------------------------------+
+#   | SPI (4)            | Security Parameters Index                 |
+#   +---------------------------------------------------------------+
+#   | Sequence Number (4)                                           |
+#   +---------------------------------------------------------------+   ^
+#   | Payload Data (variable)  -- the inner upper-layer payload      |   | ENCRYPTED
+#   | (e.g. a UDP or ICMP message)                                  |   |
+#   +---------------------------------------------------------------+   |
+#   | Padding (0..255) | Pad Length (1) | Next Header (1)            |   v  (ESP trailer)
+#   +---------------------------------------------------------------+
+#   | Integrity Check Value — ICV (16)  -- the GCM auth tag          |
+#   +---------------------------------------------------------------+
+#
+#   The SPI + Sequence Number are the AAD (authenticated, in clear). The
+#   Payload Data + ESP trailer (pad || pad-len || next-header) are the AEAD
+#   plaintext (encrypted + authenticated). The 16-byte ICV is the GCM tag.
+#
+# AES-GCM for ESP nonce/IV (RFC 4106 §3,§4):
+#   * The SA carries a 4-byte implicit "salt" (the GCM salt, key material that
+#     is NOT transmitted) plus the negotiated key.
+#   * The on-the-wire ESP layout in RFC 4106 places an 8-byte explicit IV
+#     between the seq-number and the ciphertext. To keep the data-plane
+#     deterministic we DERIVE that 8-byte IV from the 64-bit sequence number
+#     (extended seq, RFC 4303 §3.3.3) rather than carrying a separate random
+#     IV — both peers compute the same IV from the seq they both see. The
+#     12-byte GCM nonce is then salt(4) || IV(8).
+#   * The AAD is the SPI(4) || Sequence Number(4) (RFC 4106 §5: when the ESN
+#     and a separate IV are not on the wire, the AAD is the ESP header).
+#
+# Anti-replay (RFC 4303 §3.4.3): the inbound SA keeps a sliding window — the
+# highest validated sequence number `rx_high` and a 64-bit bitmap of which of
+# the preceding 64 sequence numbers have already been seen. A packet is
+# rejected if its seq is <= rx_high - 64 (too old / left of the window) or if
+# its bit is already set (a duplicate). The window only advances AFTER the GCM
+# ICV verifies — a forged packet can never poison the replay state.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.tls import _tls_aes_gcm_seal, _tls_aes_gcm_open
+
+
+# --- Wire / SA constants ----------------------------------------------------
+
+IPSEC_SPI_LEN:   uint64 = 4     # Security Parameters Index
+IPSEC_SEQ_LEN:   uint64 = 4     # on-wire (low 32 bits of) Sequence Number
+IPSEC_ESP_HDR:   uint64 = 8     # SPI(4) + Seq(4)
+IPSEC_ICV_LEN:   uint64 = 16    # GCM authentication tag
+IPSEC_SALT_LEN:  uint64 = 4     # GCM salt (implicit, not transmitted)
+IPSEC_IV_LEN:    uint64 = 8     # 8-byte IV derived from the 64-bit seq
+IPSEC_NONCE_LEN: uint64 = 12    # GCM nonce = salt(4) || IV(8)
+IPSEC_KEY_LEN:   uint64 = 16    # GCM-AES-128 key (RFC 4106 default deployment)
+
+# Anti-replay window width (RFC 4303 §3.4.3). 64 fits one uint64 bitmap.
+IPSEC_REPLAY_WIN: uint64 = 64
+
+# SA-table directions.
+IPSEC_DIR_OUT: int32 = 0
+IPSEC_DIR_IN:  int32 = 1
+
+# Maximum number of SAs the model holds (a couple per direction is plenty).
+IPSEC_MAX_SA: uint64 = 8
+
+
+# Counters (mirror the /proc-visible xfrm statistics a real SAD keeps).
+ipsec_tx_protected:      uint64 = 0
+ipsec_rx_validated:      uint64 = 0
+ipsec_rx_drops_icv:      uint64 = 0    # ICV verification failures
+ipsec_rx_drops_replay:   uint64 = 0    # anti-replay rejections
+ipsec_rx_drops_nosa:     uint64 = 0    # no SA for the SPI
+ipsec_rx_drops_bad:      uint64 = 0    # malformed / too short
+
+
+# =====================================================================
+# Security Association (SA) table
+# =====================================================================
+#
+# Each SA is stored in parallel arrays indexed by SA slot (no nested structs
+# in this language). A slot is "in use" when ipsec_sa_used[slot] == 1.
+#
+#   ipsec_sa_spi[slot]     : 32-bit SPI
+#   ipsec_sa_dir[slot]     : IPSEC_DIR_OUT / IPSEC_DIR_IN
+#   ipsec_sa_key[slot*16..]: 16-byte AES-GCM key
+#   ipsec_sa_salt[slot*4..]: 4-byte GCM salt
+#   ipsec_sa_seq[slot]     : outbound: next seq to emit (starts at 1)
+#   ipsec_sa_rx_high[slot] : inbound: highest validated seq (replay window top)
+#   ipsec_sa_rx_bmap[slot] : inbound: 64-bit bitmap of seen seqs below rx_high
+
+ipsec_sa_used:    Array[8, uint8]
+ipsec_sa_spi:     Array[8, uint32]
+ipsec_sa_dir:     Array[8, int32]
+ipsec_sa_key:     Array[128, uint8]    # 8 slots * 16 bytes
+ipsec_sa_salt:    Array[32, uint8]     # 8 slots * 4 bytes
+ipsec_sa_seq:     Array[8, uint64]     # outbound next seq
+ipsec_sa_rx_high: Array[8, uint64]     # inbound replay window top
+ipsec_sa_rx_bmap: Array[8, uint64]     # inbound replay bitmap
+
+
+def ipsec_init():
+    # Reset counters + clear the SA table. Idempotent.
+    ipsec_tx_protected = 0
+    ipsec_rx_validated = 0
+    ipsec_rx_drops_icv = 0
+    ipsec_rx_drops_replay = 0
+    ipsec_rx_drops_nosa = 0
+    ipsec_rx_drops_bad = 0
+    i: uint64 = 0
+    while i < IPSEC_MAX_SA:
+        ipsec_sa_used[i] = 0
+        ipsec_sa_spi[i] = 0
+        ipsec_sa_dir[i] = 0
+        ipsec_sa_seq[i] = 1
+        ipsec_sa_rx_high[i] = 0
+        ipsec_sa_rx_bmap[i] = 0
+        i = i + 1
+
+
+def ipsec_install_sa(slot: uint64, spi: uint32, dir: int32,
+                     key: Ptr[uint8], salt: Ptr[uint8]):
+    # Install a Security Association into `slot` (0..IPSEC_MAX_SA-1).
+    #   spi  : 32-bit SPI selecting this SA inbound.
+    #   dir  : IPSEC_DIR_OUT (this end encapsulates) or IPSEC_DIR_IN.
+    #   key  : 16-byte AES-GCM key.
+    #   salt : 4-byte GCM salt (implicit IV material, not transmitted).
+    if slot >= IPSEC_MAX_SA:
+        return
+    ipsec_sa_used[slot] = 1
+    ipsec_sa_spi[slot] = spi
+    ipsec_sa_dir[slot] = dir
+    kbase: uint64 = slot * IPSEC_KEY_LEN
+    i: uint64 = 0
+    while i < IPSEC_KEY_LEN:
+        ipsec_sa_key[kbase + i] = key[i]
+        i = i + 1
+    sbase: uint64 = slot * IPSEC_SALT_LEN
+    i = 0
+    while i < IPSEC_SALT_LEN:
+        ipsec_sa_salt[sbase + i] = salt[i]
+        i = i + 1
+    # Fresh SA state: outbound seq starts at 1 (RFC 4303 §3.3.3 — seq 0 is
+    # never used); inbound replay window empty.
+    ipsec_sa_seq[slot] = 1
+    ipsec_sa_rx_high[slot] = 0
+    ipsec_sa_rx_bmap[slot] = 0
+
+
+def ipsec_find_sa_in(spi: uint32) -> int64:
+    # Return the slot index of the inbound SA matching `spi`, or -1.
+    i: uint64 = 0
+    while i < IPSEC_MAX_SA:
+        if ipsec_sa_used[i] == 1 and ipsec_sa_dir[i] == IPSEC_DIR_IN \
+           and ipsec_sa_spi[i] == spi:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+# =====================================================================
+# Big-endian field writers / readers
+# =====================================================================
+
+def _esp_put32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _esp_get32(buf: Ptr[uint8], off: uint64) -> uint32:
+    r: uint32 = cast[uint32](buf[off]) << 24
+    r = r | (cast[uint32](buf[off + 1]) << 16)
+    r = r | (cast[uint32](buf[off + 2]) << 8)
+    r = r | cast[uint32](buf[off + 3])
+    return r
+
+
+def _esp_put64(buf: Ptr[uint8], off: uint64, v: uint64):
+    i: uint64 = 0
+    while i < 8:
+        shift: uint64 = (7 - i) * 8
+        buf[off + i] = cast[uint8]((v >> shift) & 0xFF)
+        i = i + 1
+
+
+# =====================================================================
+# GCM nonce + AAD construction (RFC 4106)
+# =====================================================================
+#
+# Nonce (12 bytes) = salt(4) || IV(8). The 8-byte IV is the 64-bit sequence
+# number in big-endian, so both peers derive the same nonce from the seq they
+# both observe. AAD (8 bytes) = SPI(4) || Seq(4) — the ESP header in clear.
+
+_esp_nonce: Array[12, uint8]
+_esp_aad:   Array[8, uint8]
+
+
+def _esp_build_nonce(salt: Ptr[uint8], seq: uint64):
+    i: uint64 = 0
+    while i < IPSEC_SALT_LEN:
+        _esp_nonce[i] = salt[i]
+        i = i + 1
+    # IV = 64-bit seq, big-endian, in the trailing 8 bytes.
+    _esp_put64(cast[Ptr[uint8]](&_esp_nonce[0]), IPSEC_SALT_LEN, seq)
+
+
+def _esp_build_aad(spi: uint32, seq: uint64):
+    # AAD = SPI(4) || low-32 Seq(4), big-endian (the on-wire ESP header).
+    _esp_put32(cast[Ptr[uint8]](&_esp_aad[0]), 0, spi)
+    _esp_put32(cast[Ptr[uint8]](&_esp_aad[0]), 4, cast[uint32](seq & 0xFFFFFFFF))
+
+
+# =====================================================================
+# ESP trailer plaintext staging buffer
+# =====================================================================
+#
+# The AEAD plaintext is [ payload | pad | pad-len(1) | next-header(1) ]. We
+# stage it contiguously in a scratch buffer before sealing. Sized for a full
+# jumbo-ish payload + trailer + headroom so an undersized Array can't silently
+# overflow into the next module-scope global.
+IPSEC_PT_CAP: uint64 = 4096
+_esp_pt:  Array[4096, uint8]    # staged plaintext (payload + trailer)
+_esp_dec: Array[4096, uint8]    # decrypted plaintext (payload + trailer)
+
+
+# =====================================================================
+# OUTBOUND — esp_protect / encapsulate
+# =====================================================================
+
+def esp_protect(slot: uint64,
+                payload: Ptr[uint8], payload_len: uint64,
+                next_hdr: uint8,
+                out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Encapsulate an inner upper-layer payload into an ESP packet for the
+    # outbound SA in `slot`, using its monotonically-increasing sequence
+    # number. next_hdr is the IP protocol number of the inner payload (e.g.
+    # 17=UDP, 1=ICMP). Emits SPI(4) || Seq(4) || ciphertext || ICV(16) into
+    # `out`. Returns the ESP packet length, or a negative code:
+    #   -1 buffer too small  -2 no SA / wrong direction  -3 payload too big
+    if slot >= IPSEC_MAX_SA:
+        return -2
+    if ipsec_sa_used[slot] != 1 or ipsec_sa_dir[slot] != IPSEC_DIR_OUT:
+        return -2
+
+    seq: uint64 = ipsec_sa_seq[slot]
+    spi: uint32 = ipsec_sa_spi[slot]
+
+    # ESP trailer: pad to a 4-byte boundary of (payload + pad-len + next-hdr),
+    # per RFC 4303 §2.4 (a combined-mode cipher imposes no block alignment, but
+    # a small alignment keeps the ciphertext length tidy). Compute pad so that
+    # (payload_len + pad + 2) is a multiple of 4.
+    tlv: uint64 = payload_len + 2          # pad-len + next-header occupy 2 bytes
+    pad: uint64 = (4 - (tlv & 0x3)) & 0x3
+    pt_len: uint64 = payload_len + pad + 2
+    if pt_len > IPSEC_PT_CAP:
+        return -3
+
+    total: uint64 = IPSEC_ESP_HDR + pt_len + IPSEC_ICV_LEN
+    if total > out_cap:
+        return -1
+
+    # --- Stage the AEAD plaintext: payload | pad | pad-len | next-header. ---
+    i: uint64 = 0
+    while i < payload_len:
+        _esp_pt[i] = payload[i]
+        i = i + 1
+    # Padding bytes are the monotonically increasing 1,2,...,pad (RFC 4303
+    # §2.4 default padding).
+    i = 0
+    while i < pad:
+        _esp_pt[payload_len + i] = cast[uint8]((i + 1) & 0xFF)
+        i = i + 1
+    _esp_pt[payload_len + pad]     = cast[uint8](pad & 0xFF)   # Pad Length
+    _esp_pt[payload_len + pad + 1] = next_hdr                  # Next Header
+
+    # --- ESP header in clear: SPI || Seq (low 32 bits on the wire). ---
+    _esp_put32(out, 0, spi)
+    _esp_put32(out, 4, cast[uint32](seq & 0xFFFFFFFF))
+
+    # --- GCM nonce (salt||seq) + AAD (SPI||Seq), RFC 4106. ---
+    sbase: uint64 = slot * IPSEC_SALT_LEN
+    _esp_build_nonce(cast[Ptr[uint8]](&ipsec_sa_salt[sbase]), seq)
+    _esp_build_aad(spi, seq)
+
+    # --- AEAD seal: encrypt the staged plaintext, append the 16-byte ICV. ---
+    kbase: uint64 = slot * IPSEC_KEY_LEN
+    ct_off: uint64 = IPSEC_ESP_HDR
+    icv_off: uint64 = ct_off + pt_len
+    _tls_aes_gcm_seal(
+        cast[Ptr[uint8]](&ipsec_sa_key[kbase]), IPSEC_KEY_LEN,
+        cast[Ptr[uint8]](&_esp_nonce[0]),
+        cast[Ptr[uint8]](&_esp_aad[0]), IPSEC_ESP_HDR,
+        cast[Ptr[uint8]](&_esp_pt[0]), pt_len,
+        cast[Ptr[uint8]](cast[uint64](out) + ct_off),
+        cast[Ptr[uint8]](cast[uint64](out) + icv_off))
+
+    # Advance the outbound sequence number (RFC 4303 §3.3.3 — monotonic,
+    # never reused; seq 0 is forbidden so skip it on the 32-bit wrap).
+    ipsec_sa_seq[slot] = seq + 1
+    if (ipsec_sa_seq[slot] & 0xFFFFFFFF) == 0:
+        ipsec_sa_seq[slot] = ipsec_sa_seq[slot] + 1
+
+    ipsec_tx_protected = ipsec_tx_protected + 1
+    return cast[int64](total)
+
+
+# =====================================================================
+# Anti-replay window (RFC 4303 §3.4.3)
+# =====================================================================
+
+def _esp_replay_check(slot: uint64, seq: uint64) -> int32:
+    # Pre-auth replay check: 1 = acceptable (continue to ICV verify), 0 =
+    # reject (duplicate or too old). Does NOT mutate the window — that only
+    # happens on a verified packet via _esp_replay_advance.
+    high: uint64 = ipsec_sa_rx_high[slot]
+    if seq == 0:
+        return 0                       # seq 0 is never valid (RFC 4303 §3.3.3)
+    if high == 0:
+        return 1                       # first packet on this SA — always fresh
+    if seq > high:
+        return 1                       # to the right of the window — fresh
+    # seq <= high: it falls within (or to the left of) the window.
+    diff: uint64 = high - seq
+    if diff >= IPSEC_REPLAY_WIN:
+        return 0                       # too old — left of the window
+    bit: uint64 = cast[uint64](1) << diff
+    if (ipsec_sa_rx_bmap[slot] & bit) != 0:
+        return 0                       # duplicate — already seen
+    return 1
+
+
+def _esp_replay_advance(slot: uint64, seq: uint64):
+    # Post-auth window update (RFC 4303 §3.4.3). Called ONLY after the GCM ICV
+    # verifies, so a forged packet can never poison the replay state.
+    #
+    # The bitmap tracks which seqs at-or-below the window top `rx_high` have
+    # been seen, with bit `(rx_high - s)` representing seq `s`. Bit 0 therefore
+    # always represents the current top `rx_high` itself, and is set whenever a
+    # seq becomes (or already is) the top — so a later replay of the top is
+    # caught by _esp_replay_check.
+    high: uint64 = ipsec_sa_rx_high[slot]
+    if seq > high:
+        shift: uint64 = seq - high
+        if shift >= IPSEC_REPLAY_WIN:
+            ipsec_sa_rx_bmap[slot] = 0
+        else:
+            ipsec_sa_rx_bmap[slot] = ipsec_sa_rx_bmap[slot] << shift
+        ipsec_sa_rx_high[slot] = seq
+        # Mark the new top (bit 0) as seen.
+        ipsec_sa_rx_bmap[slot] = ipsec_sa_rx_bmap[slot] | cast[uint64](1)
+    else:
+        diff: uint64 = high - seq
+        if diff < IPSEC_REPLAY_WIN:
+            ipsec_sa_rx_bmap[slot] = ipsec_sa_rx_bmap[slot] \
+                                     | (cast[uint64](1) << diff)
+
+
+# =====================================================================
+# INBOUND — esp_deprotect / decapsulate
+# =====================================================================
+
+def esp_deprotect(esp: Ptr[uint8], esp_len: uint64,
+                  out_payload: Ptr[uint8], out_cap: uint64,
+                  out_next_hdr: Ptr[uint8],
+                  out_seq: Ptr[uint64]) -> int64:
+    # Parse + authenticate-decrypt an ESP packet. Looks up the inbound SA by
+    # the SPI, enforces the anti-replay window, verifies the GCM ICV (rejecting
+    # on mismatch, emitting NO plaintext), strips the trailer, and recovers the
+    # inner payload + next-header. Returns the recovered payload length, or a
+    # negative code:
+    #   -1 malformed / too short
+    #   -2 no inbound SA for the SPI
+    #   -3 out buffer too small
+    #   -4 anti-replay rejection (duplicate / too old)
+    #   -5 ICV verification failed (tamper / wrong key)
+    if esp_len < (IPSEC_ESP_HDR + IPSEC_ICV_LEN):
+        ipsec_rx_drops_bad = ipsec_rx_drops_bad + 1
+        return -1
+
+    spi: uint32 = _esp_get32(esp, 0)
+    seq32: uint32 = _esp_get32(esp, 4)
+    seq: uint64 = cast[uint64](seq32)
+
+    sidx: int64 = ipsec_find_sa_in(spi)
+    if sidx < 0:
+        ipsec_rx_drops_nosa = ipsec_rx_drops_nosa + 1
+        return -2
+    slot: uint64 = cast[uint64](sidx)
+
+    # --- Anti-replay window check BEFORE any crypto (cheap pre-filter). ---
+    if _esp_replay_check(slot, seq) != 1:
+        ipsec_rx_drops_replay = ipsec_rx_drops_replay + 1
+        return -4
+
+    ct_off: uint64 = IPSEC_ESP_HDR
+    icv_off: uint64 = esp_len - IPSEC_ICV_LEN
+    if icv_off < ct_off:
+        ipsec_rx_drops_bad = ipsec_rx_drops_bad + 1
+        return -1
+    ct_len: uint64 = icv_off - ct_off
+    if ct_len > IPSEC_PT_CAP:
+        ipsec_rx_drops_bad = ipsec_rx_drops_bad + 1
+        return -1
+
+    # --- GCM nonce (salt||seq) + AAD (SPI||Seq), RFC 4106. ---
+    sbase: uint64 = slot * IPSEC_SALT_LEN
+    _esp_build_nonce(cast[Ptr[uint8]](&ipsec_sa_salt[sbase]), seq)
+    _esp_build_aad(spi, seq)
+
+    # --- AEAD open: verify the ICV; on mismatch NO plaintext is emitted. ---
+    kbase: uint64 = slot * IPSEC_KEY_LEN
+    rc: int32 = _tls_aes_gcm_open(
+        cast[Ptr[uint8]](&ipsec_sa_key[kbase]), IPSEC_KEY_LEN,
+        cast[Ptr[uint8]](&_esp_nonce[0]),
+        cast[Ptr[uint8]](&_esp_aad[0]), IPSEC_ESP_HDR,
+        cast[Ptr[uint8]](cast[uint64](esp) + ct_off), ct_len,
+        cast[Ptr[uint8]](cast[uint64](esp) + icv_off),
+        cast[Ptr[uint8]](&_esp_dec[0]))
+    if rc != 0:
+        ipsec_rx_drops_icv = ipsec_rx_drops_icv + 1
+        return -5
+
+    # --- Strip the ESP trailer: [...payload | pad | pad-len | next-header]. ---
+    if ct_len < 2:
+        ipsec_rx_drops_bad = ipsec_rx_drops_bad + 1
+        return -1
+    pad_len: uint64 = cast[uint64](_esp_dec[ct_len - 2])
+    next_hdr: uint8 = _esp_dec[ct_len - 1]
+    if (pad_len + 2) > ct_len:
+        ipsec_rx_drops_bad = ipsec_rx_drops_bad + 1
+        return -1
+    payload_len: uint64 = ct_len - pad_len - 2
+    if payload_len > out_cap:
+        return -3
+
+    # --- ICV verified — NOW advance the replay window (never before). ---
+    _esp_replay_advance(slot, seq)
+
+    i: uint64 = 0
+    while i < payload_len:
+        out_payload[i] = _esp_dec[i]
+        i = i + 1
+    if out_next_hdr != cast[Ptr[uint8]](0):
+        out_next_hdr[0] = next_hdr
+    if out_seq != cast[Ptr[uint64]](0):
+        out_seq[0] = seq
+
+    ipsec_rx_validated = ipsec_rx_validated + 1
+    return cast[int64](payload_len)
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+#
+# Proves the REAL ESP transport-mode round-trip + the security properties:
+#   1. PROTECT a known payload on the A->B outbound SA, DEPROTECT on B's
+#      matching inbound SA -> byte-identical plaintext + correct next-header.
+#   2. A flipped ciphertext byte -> ICV REJECT (no plaintext).
+#   3. A flipped ICV byte -> ICV REJECT.
+#   4. A replayed (already-seen seq) packet -> anti-replay REJECT.
+#   5. A fresh in-window seq is accepted and advances the window.
+#   6. Sequence numbers increase across multiple protected packets.
+
+def _esp_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _esp_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _esp_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# Generously-sized scratch globals — payload + ESP overhead with MTU headroom
+# so an undersized Array can't silently overflow into adjacent globals.
+IPSEC_T_CAP: uint64 = 2048
+_ipt_payload: Array[2048, uint8]      # original inner payload
+_ipt_out:     Array[2048, uint8]      # protected ESP packet
+_ipt_recov:   Array[2048, uint8]      # recovered payload
+_ipt_key:     Array[16, uint8]
+_ipt_salt:    Array[4, uint8]
+_ipt_payload2: Array[2048, uint8]     # a second, different payload
+_ipt_out2:    Array[2048, uint8]      # second protected ESP packet
+
+
+def _esp_build_payload(buf: Ptr[uint8], seed: uint8, plen: uint64):
+    # Deterministic inner upper-layer payload.
+    i: uint64 = 0
+    while i < plen:
+        buf[i] = cast[uint8]((cast[uint32](seed) + cast[uint32](i) * 7) & 0xFF)
+        i = i + 1
+
+
+def ipsec_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [ipsec] marker lines.
+    _esp_emerg0("[ipsec] self-test start\n")
+    ipsec_init()
+    ok: int32 = 1
+
+    # --- SA setup: an A->B pair sharing a key/SPI. Slot 0 = A's outbound SA,
+    #     slot 1 = B's inbound SA, both with the same SPI + key + salt. ---
+    test_spi: uint32 = 0xDEADBEEF
+    i: uint64 = 0
+    while i < 16:
+        _ipt_key[i] = cast[uint8](0x40 + i)
+        i = i + 1
+    i = 0
+    while i < 4:
+        _ipt_salt[i] = cast[uint8](0xA0 + i)
+        i = i + 1
+    ipsec_install_sa(0, test_spi, IPSEC_DIR_OUT,
+                     cast[Ptr[uint8]](&_ipt_key[0]),
+                     cast[Ptr[uint8]](&_ipt_salt[0]))
+    ipsec_install_sa(1, test_spi, IPSEC_DIR_IN,
+                     cast[Ptr[uint8]](&_ipt_key[0]),
+                     cast[Ptr[uint8]](&_ipt_salt[0]))
+
+    # next-header for the inner payload (17 = UDP).
+    nh_udp: uint8 = 17
+    plen: uint64 = 53
+    _esp_build_payload(cast[Ptr[uint8]](&_ipt_payload[0]), 0x33, plen)
+
+    # --- 1. PROTECT (A) then DEPROTECT (B) -> byte-identical + next-header. ---
+    prot_len: int64 = esp_protect(0,
+        cast[Ptr[uint8]](&_ipt_payload[0]), plen, nh_udp,
+        cast[Ptr[uint8]](&_ipt_out[0]), IPSEC_T_CAP)
+    if prot_len < 0:
+        _esp_emerg1("[ipsec] FAIL: protect rc=%d\n", cast[uint64](prot_len))
+        return 0
+    # Wire seq must be 1 (first packet on the SA).
+    wseq: uint32 = _esp_get32(cast[Ptr[uint8]](&_ipt_out[0]), 4)
+    if wseq != 1:
+        _esp_emerg1("[ipsec] FAIL: first wire seq %d != 1\n", cast[uint64](wseq))
+        ok = 0
+    # Wire SPI must echo the SA's SPI.
+    wspi: uint32 = _esp_get32(cast[Ptr[uint8]](&_ipt_out[0]), 0)
+    if wspi != test_spi:
+        _esp_emerg1("[ipsec] FAIL: wire SPI %x mismatch\n", cast[uint64](wspi))
+        ok = 0
+
+    # The on-wire ciphertext must genuinely differ from the plaintext.
+    differs: int32 = 0
+    i = 0
+    while i < plen:
+        if _ipt_out[IPSEC_ESP_HDR + i] != _ipt_payload[i]:
+            differs = 1
+            i = plen
+        else:
+            i = i + 1
+    if differs != 1:
+        _esp_emerg0("[ipsec] FAIL: payload not encrypted (equals plaintext)\n")
+        ok = 0
+    else:
+        _esp_emerg0("[ipsec] PASS payload-is-ciphertext\n")
+
+    rnh: uint8 = 0
+    rseq: uint64 = 0
+    rec_len: int64 = esp_deprotect(
+        cast[Ptr[uint8]](&_ipt_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_ipt_recov[0]), IPSEC_T_CAP,
+        cast[Ptr[uint8]](&rnh), cast[Ptr[uint64]](&rseq))
+    if rec_len < 0:
+        _esp_emerg1("[ipsec] FAIL: deprotect rc=%d\n", cast[uint64](rec_len))
+        return 0
+    if cast[uint64](rec_len) != plen:
+        _esp_emerg2("[ipsec] FAIL: recovered len %d != %d\n",
+                    cast[uint64](rec_len), plen)
+        ok = 0
+    identical: int32 = 1
+    i = 0
+    while i < plen:
+        if _ipt_recov[i] != _ipt_payload[i]:
+            identical = 0
+            i = plen
+        else:
+            i = i + 1
+    if identical != 1:
+        _esp_emerg0("[ipsec] FAIL: recovered payload not byte-identical\n")
+        ok = 0
+    else:
+        _esp_emerg0("[ipsec] PASS roundtrip-byte-identical\n")
+    if rnh != nh_udp:
+        _esp_emerg2("[ipsec] FAIL: next-header %d != %d\n",
+                    cast[uint64](rnh), cast[uint64](nh_udp))
+        ok = 0
+    else:
+        _esp_emerg0("[ipsec] PASS next-header=17(udp)\n")
+    if rseq != 1:
+        _esp_emerg1("[ipsec] FAIL: recovered seq %d != 1\n", cast[uint64](rseq))
+        ok = 0
+
+    # --- 2. Tamper a ciphertext byte -> ICV REJECT (no plaintext). Reset B's
+    #     inbound SA so the replay window doesn't reject it first. ---
+    ipsec_install_sa(1, test_spi, IPSEC_DIR_IN,
+                     cast[Ptr[uint8]](&_ipt_key[0]),
+                     cast[Ptr[uint8]](&_ipt_salt[0]))
+    sct: uint8 = _ipt_out[IPSEC_ESP_HDR + 5]
+    _ipt_out[IPSEC_ESP_HDR + 5] = sct ^ 0xFF
+    badct: int64 = esp_deprotect(
+        cast[Ptr[uint8]](&_ipt_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_ipt_recov[0]), IPSEC_T_CAP,
+        cast[Ptr[uint8]](&rnh), cast[Ptr[uint64]](&rseq))
+    _ipt_out[IPSEC_ESP_HDR + 5] = sct
+    if badct != -5:
+        _esp_emerg1("[ipsec] FAIL: tampered ciphertext accepted rc=%d\n",
+                    cast[uint64](badct))
+        ok = 0
+    else:
+        _esp_emerg0("[ipsec] PASS reject-tampered-ciphertext\n")
+
+    # --- 3. Tamper an ICV byte -> ICV REJECT. ---
+    icv_off: uint64 = cast[uint64](prot_len) - IPSEC_ICV_LEN
+    sicv: uint8 = _ipt_out[icv_off]
+    _ipt_out[icv_off] = sicv ^ 0x80
+    badicv: int64 = esp_deprotect(
+        cast[Ptr[uint8]](&_ipt_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_ipt_recov[0]), IPSEC_T_CAP,
+        cast[Ptr[uint8]](&rnh), cast[Ptr[uint64]](&rseq))
+    _ipt_out[icv_off] = sicv
+    if badicv != -5:
+        _esp_emerg1("[ipsec] FAIL: tampered ICV accepted rc=%d\n",
+                    cast[uint64](badicv))
+        ok = 0
+    else:
+        _esp_emerg0("[ipsec] PASS reject-tampered-icv\n")
+
+    # --- 4. Replay: deprotect the seq-1 packet cleanly (advances the window),
+    #     then deprotect the SAME packet again -> anti-replay REJECT. ---
+    ipsec_install_sa(1, test_spi, IPSEC_DIR_IN,
+                     cast[Ptr[uint8]](&_ipt_key[0]),
+                     cast[Ptr[uint8]](&_ipt_salt[0]))
+    first: int64 = esp_deprotect(
+        cast[Ptr[uint8]](&_ipt_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_ipt_recov[0]), IPSEC_T_CAP,
+        cast[Ptr[uint8]](&rnh), cast[Ptr[uint64]](&rseq))
+    if first < 0:
+        _esp_emerg1("[ipsec] FAIL: replay-setup deprotect rc=%d\n",
+                    cast[uint64](first))
+        ok = 0
+    replay: int64 = esp_deprotect(
+        cast[Ptr[uint8]](&_ipt_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_ipt_recov[0]), IPSEC_T_CAP,
+        cast[Ptr[uint8]](&rnh), cast[Ptr[uint64]](&rseq))
+    if replay != -4:
+        _esp_emerg1("[ipsec] FAIL: replayed seq accepted rc=%d\n",
+                    cast[uint64](replay))
+        ok = 0
+    else:
+        _esp_emerg0("[ipsec] PASS reject-replayed-seq\n")
+
+    # --- 5. A fresh in-window seq is accepted + advances the window. Protect a
+    #     SECOND packet (seq 2) on A and deprotect it on B — its seq must be
+    #     accepted (seq 2 > the window top of 1) and recovered identically. ---
+    plen2: uint64 = 41
+    _esp_build_payload(cast[Ptr[uint8]](&_ipt_payload2[0]), 0x9C, plen2)
+    nh_icmp: uint8 = 1
+    prot2: int64 = esp_protect(0,
+        cast[Ptr[uint8]](&_ipt_payload2[0]), plen2, nh_icmp,
+        cast[Ptr[uint8]](&_ipt_out2[0]), IPSEC_T_CAP)
+    if prot2 < 0:
+        _esp_emerg1("[ipsec] FAIL: protect#2 rc=%d\n", cast[uint64](prot2))
+        return 0
+    wseq2: uint32 = _esp_get32(cast[Ptr[uint8]](&_ipt_out2[0]), 4)
+    if wseq2 != 2:
+        _esp_emerg1("[ipsec] FAIL: second wire seq %d != 2\n", cast[uint64](wseq2))
+        ok = 0
+    else:
+        _esp_emerg0("[ipsec] PASS seq-increments (seq2=2)\n")
+    rnh2: uint8 = 0
+    rseq2: uint64 = 0
+    rec2: int64 = esp_deprotect(
+        cast[Ptr[uint8]](&_ipt_out2[0]), cast[uint64](prot2),
+        cast[Ptr[uint8]](&_ipt_recov[0]), IPSEC_T_CAP,
+        cast[Ptr[uint8]](&rnh2), cast[Ptr[uint64]](&rseq2))
+    if rec2 < 0:
+        _esp_emerg1("[ipsec] FAIL: deprotect#2 rc=%d\n", cast[uint64](rec2))
+        ok = 0
+    identical2: int32 = 1
+    i = 0
+    while i < plen2:
+        if _ipt_recov[i] != _ipt_payload2[i]:
+            identical2 = 0
+            i = plen2
+        else:
+            i = i + 1
+    if identical2 != 1 or rnh2 != nh_icmp or rseq2 != 2:
+        _esp_emerg0("[ipsec] FAIL: fresh in-window packet not accepted cleanly\n")
+        ok = 0
+    else:
+        _esp_emerg0("[ipsec] PASS accept-fresh-in-window-seq\n")
+
+    # The window must now reject a replay of seq 1 too (it's behind seq 2).
+    replay1: int64 = esp_deprotect(
+        cast[Ptr[uint8]](&_ipt_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_ipt_recov[0]), IPSEC_T_CAP,
+        cast[Ptr[uint8]](&rnh), cast[Ptr[uint64]](&rseq))
+    if replay1 != -4:
+        _esp_emerg1("[ipsec] FAIL: old seq#1 accepted after window advanced rc=%d\n",
+                    cast[uint64](replay1))
+        ok = 0
+    else:
+        _esp_emerg0("[ipsec] PASS window-advanced-rejects-old-seq\n")
+
+    if ok == 1:
+        _esp_emerg0("[ipsec] PASS\n")
+        return 1
+    _esp_emerg0("[ipsec] FAIL\n")
+    return 0
