@@ -58,6 +58,7 @@ build_adder_user cat                  # M16.37: streams files to stdout
 build_adder_user aplay                # native HDA: streams a PCM/WAV file to /dev/audio
 build_adder_user dup_demo             # M16.41: exercises sys_dup / sys_dup2
 build_adder_user ls                   # M16.46: directory listing
+build_adder_user lsblk                # enumerate /dev/blk devices + sizes (pre-install disk check)
 build_adder_user pwd                  # M16.47: print working dir
 build_adder_user head                 # M16.57: first N lines
 build_adder_user wc                   # M16.57: line/word/byte count
