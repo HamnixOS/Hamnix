@@ -75,9 +75,26 @@ new design but must pass for real).
   cpio-fallthrough rule). Worktree grep of backend-selection predicates =
   0. Verified green: `test_dev/net/proc_namespace.sh` + installer Stage B
   (ext4 magic `0xEF53` on NVMe through the mount table).
-- [ ] **Phase 4 — unify fds on `Chan`** (#390). Retire the ~24
+- [~] **Phase 4 — unify fds on `Chan`** (#390). Retire the
   collision-prone `FD_*_MARK` magic-integer ranges; every fd becomes a
-  `Chan` pointer through the `namec` devtab.
+  `Chan` through the `namec` devtab.
+  - [x] **Phase 4a — stateless native cdevs** (`091fde11`). The 13
+    stateless synthetic-cdev marks (`FD_CONS`/`DEVNULL`/`DEVZERO`/`TIME`/
+    `PID`/`RANDOM`/`MOUSE`/`CPUINFO`/`MEMINFO`/`UPTIME`/`LOADAVG`/`VERSION`/
+    `HOSTNAME`) now open as `FD_CHAN_MARK` fds carrying an inline-chan id
+    `_chan_id_make_inline(DEV_<x>)`; all behavior lives in namec's
+    `_devtab_read`/`_devtab_write`. Per-mark read/write/close/fstat arms +
+    the 13 constants deleted (net −142 lines). Console detection now
+    resolves `DEV_CONS` via `namec_chan_dev_type`. Verified green:
+    `test_dev`/`test_net`/`test_proc_namespace.sh`.
+  - [ ] **Phase 4b — stateful native fds.** `FD_EXT4`/`TMPFS`/`FAT`/
+    `BUFFER`/`DIR`/`PIPE_R`/`PIPE_W`/`SOCKET`/`BLK`/`STAT`/`MOUNTS`/
+    `DISKSTATS`/`AUTH`/`VTCTL`/`DEVFD`/`PROC_BASE` carry per-fd offset/
+    inode/buffer state; needs a pool-`ChanT` lifecycle (extend the handle
+    + slot alloc/free) before they can move off marks. Layer-2 linux_abi
+    event fds (epoll/eventfd/timerfd/signalfd/inotify/iouring/perf/bpf/
+    pidfd) stay marks by design (boundary-discipline law — not namespace
+    files).
 
 ## Now — useful-system gap fill (priority-ordered, locked with user 2026-05-28)
 
