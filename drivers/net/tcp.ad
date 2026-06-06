@@ -74,6 +74,16 @@ from arch.x86.kernel.time import get_jiffies, pit_monotonic_us
 # STATE_READY peer can be scheduled in. See kernel/sched/core.ad for the
 # full rationale.
 from kernel.sched.core import kernel_cond_resched
+# Event-driven rx wait: a reader blocked on a slot's rx ring sleeps on
+# that slot's WaitQueue and is woken DIRECTLY by the virtio-net rx IRQ
+# (which drains the ring into the slot and calls wq_wake_all). The
+# bounded-timeout commit is the TCG safety net: if MSI-X rx IRQs are not
+# delivered (emulation), the sleep still wakes itself ~every tick to
+# re-pump virtio_net_poll() and re-check, degrading to today's poll with
+# no wedge. See kernel/sched/core.ad for the WaitQueue contract.
+from kernel.sched.core import WaitQueue, wq_init, wq_wake_all
+from kernel.sched.core import wq_wait_prepare, wq_wait_cancel
+from kernel.sched.core import wq_wait_commit_timeout, WQ_EINTR, WQ_TIMEOUT
 
 
 # TCP control-block states (RFC 793). Numbered to match the order
@@ -228,6 +238,17 @@ tcp_slot_rx_data:   Array[2097152, uint8] # 8 slots * 262144 bytes
 tcp_slot_rx_head:   Array[8, uint64]      # consumer position (drain)
 tcp_slot_rx_tail:   Array[8, uint64]      # producer position (append)
 tcp_slot_rx_count:  Array[8, uint64]      # bytes currently buffered
+
+# Per-slot rx/event wait queue. A task blocked in tcp_recv (waiting for
+# data), tcp_connect (waiting for SYN-ACK), tcp_send (waiting for the
+# ACK) or tcp_accept (waiting for a child) sleeps on the WaitQueue of the
+# relevant slot. The rx IRQ path (virtio_net_poll -> tcp_rx) calls
+# wq_wake_all on this queue whenever it makes a slot's wait-condition
+# true: data deposited, state advanced to ESTABLISHED, a child accepted,
+# a FIN/RST seen. Woken directly from IRQ context (wq_wake_all is IRQ-
+# safe: rq_lock only, never schedule()). For listeners, the LISTEN slot's
+# own queue is the accept queue (children enqueue + wake the parent).
+tcp_slot_rx_wq:     Array[8, WaitQueue]
 
 # Per-slot flag: did we observe a FIN from the peer? Latched the
 # first time we see it; cleared on tcp_close completion.
@@ -1399,6 +1420,9 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
         tcp_resets_in = tcp_resets_in + 1
         printk1("[tcp] RST on slot=%d -> CLOSED\n", slot)
         tcp_slot_state[slot] = TCP_CLOSED
+        # Wake any waiter (connect / recv / send) so it observes the
+        # CLOSED state and returns the appropriate error promptly.
+        wq_wake_all(&tcp_slot_rx_wq[slot])
         return
 
     payload_off: uint64 = hdr_bytes
@@ -1434,6 +1458,12 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
                 # tcp_accept hands children out in arrival order even
                 # when several connect concurrently.
                 _tcp_accept_enqueue(slot)
+                # Wake the tcp_accept waiter blocked on the LISTEN slot:
+                # a child connection is now ready to be handed out. The
+                # waiter sleeps on the parent listener's own queue.
+                parent_b: uint8 = tcp_slot_parent[slot]
+                if parent_b != 0xFF:
+                    wq_wake_all(&tcp_slot_rx_wq[cast[uint64](parent_b)])
                 printk1("[tcp] accepted slot=%d -> ESTABLISHED\n", slot)
                 state = TCP_ESTABLISHED
                 # Fall through to the ESTABLISHED block below in case
@@ -1511,6 +1541,9 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
                 _tcp_build_and_send(slot, TCP_ACK,
                                     cast[Ptr[uint8]](0), 0)
                 tcp_slot_state[slot] = TCP_ESTABLISHED
+                # Wake the tcp_connect waiter blocked on this slot — the
+                # active-open handshake just completed.
+                wq_wake_all(&tcp_slot_rx_wq[slot])
                 printk1("[tcp] slot=%d -> ESTABLISHED\n", slot)
                 return
         # Anything else in SYN_SENT is a protocol error; drop.
@@ -1573,6 +1606,11 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
                     tcp_slot_rx_tail[slot] = tail
                     tcp_slot_rx_count[slot] = tcp_slot_rx_count[slot] \
                         + seg_payload_len
+                    # Event-driven wake: data just landed in this slot's
+                    # ring. Wake any tcp_recv blocked on it (IRQ context
+                    # safe). On the fast path this is the rx IRQ → an
+                    # instant reader wake with no poll latency.
+                    wq_wake_all(&tcp_slot_rx_wq[slot])
                     tcp_slot_rcv_nxt[slot] = seq32 + cast[uint32](seg_payload_len)
                     tcp_in_data = tcp_in_data + seg_payload_len
                     # This in-order arrival may have closed (part of) a
@@ -1592,6 +1630,9 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
             # finish the four-way termination.
             tcp_slot_rcv_nxt[slot] = tcp_slot_rcv_nxt[slot] + 1
             tcp_slot_saw_fin[slot] = 1
+            # Wake a blocked reader so it observes EOF (saw_fin + empty
+            # ring -> tcp_recv returns 0) without waiting for a poll tick.
+            wq_wake_all(&tcp_slot_rx_wq[slot])
             printk1("[tcp] FIN on established slot=%d\n", slot)
             # ACK the FIN. We stay ESTABLISHED-like (Linux would go
             # CLOSE_WAIT here) until the local side calls tcp_close.
@@ -1608,6 +1649,9 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
                 tcp_slot_dupacks[slot] = 0
                 # RTT sample + clear retransmission for the data segment.
                 _tcp_clear_pending(slot, ack32)
+                # Wake a tcp_send waiter blocked for this ACK so it can
+                # confirm delivery without a poll tick of latency.
+                wq_wake_all(&tcp_slot_rx_wq[slot])
             else:
                 # Duplicate / stale ACK. A pure ACK (no data, no window
                 # change) that repeats the highest ack# and we still have
@@ -1818,8 +1862,22 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
             # ever came back, so this is a timeout, not a refusal.
             tcp_slot_state[slot] = TCP_CLOSED
             return TCP_ERR_TIMEOUT
-        # Preempt-class wedge-fix: see _tcp_prime_arp above.
-        kernel_cond_resched()
+        # Event-driven SYN-ACK wait. tcp_rx wakes us the instant the
+        # state flips to ESTABLISHED (or CLOSED on RST). The bounded
+        # ~1-tick commit is BOTH the TCG fallback (re-poll if no rx IRQ)
+        # AND what keeps _tcp_check_retrans's RTO ticking: each timeout
+        # loop re-fires the retransmit check, so SYN retransmit-on-RTO
+        # still works exactly as before. jiffies advances during the
+        # sti;hlt in wq_wait_commit_timeout, so the deadline still elapses.
+        wq_wait_prepare(&tcp_slot_rx_wq[slot])
+        if tcp_slot_state[slot] == TCP_ESTABLISHED \
+                or tcp_slot_state[slot] == TCP_CLOSED:
+            wq_wait_cancel(&tcp_slot_rx_wq[slot])
+        else:
+            wrc: int32 = wq_wait_commit_timeout(&tcp_slot_rx_wq[slot], 1)
+            if wrc == WQ_EINTR:
+                tcp_slot_state[slot] = TCP_CLOSED
+                return TCP_ERR_TIMEOUT
     printk1("[tcp] connect timeout on slot=%d\n", slot)
     tcp_slot_state[slot] = TCP_CLOSED
     return TCP_ERR_TIMEOUT
@@ -1869,8 +1927,18 @@ def tcp_send(slot_signed: int32, buf: Ptr[uint8],
         if rtx < 0:
             # Exceeded TCP_MAX_RETRIES — peer has gone dark.
             return -1
-        # Preempt-class wedge-fix: see _tcp_prime_arp above.
-        kernel_cond_resched()
+        # Event-driven ACK wait. tcp_rx wakes us when a fresh ACK
+        # advances snd_una. Bounded ~1-tick commit re-fires
+        # _tcp_check_retrans (RFC 6298 backoff intact) and serves as the
+        # TCG re-poll fallback.
+        wq_wait_prepare(&tcp_slot_rx_wq[slot])
+        if tcp_slot_snd_una[slot] >= target_ack \
+                or tcp_slot_state[slot] == TCP_CLOSED:
+            wq_wait_cancel(&tcp_slot_rx_wq[slot])
+        else:
+            wrc: int32 = wq_wait_commit_timeout(&tcp_slot_rx_wq[slot], 1)
+            if wrc == WQ_EINTR:
+                return -1
     # Even with retransmit we couldn't get an ACK. Return -1 so the
     # caller can distinguish a lost segment from a clean send.
     printk1("[tcp] send ACK timeout slot=%d\n", slot)
@@ -1915,6 +1983,12 @@ def tcp_recv(slot_signed: int32, buf: Ptr[uint8],
         budget_us = 5000000                       # 5 s default
     start_us: uint64 = pit_monotonic_us()
     while True:
+        # Pump the rx ring once. On the fast path the IRQ has already
+        # deposited (and woken us); this re-check covers an IF=0 window
+        # and the very first pass. The two-phase wq wait below closes the
+        # lost-wakeup race: we re-check rx_count AFTER linking onto the
+        # queue, so a deposit-and-wake landing between the check and the
+        # sleep cannot be missed.
         virtio_net_poll()
         avail: uint64 = tcp_slot_rx_count[slot]
         if avail > 0:
@@ -1963,12 +2037,30 @@ def tcp_recv(slot_signed: int32, buf: Ptr[uint8],
         # Wall-clock deadline check off the free-running PIT counter.
         if pit_monotonic_us() - start_us >= budget_us:
             return 0                      # treat timeout-with-no-data as 0
-        # Preempt-class fairness: even though pit_monotonic_us advances
-        # under IF=0 (so we don't WEDGE here the way the get_jiffies
-        # loops do), this poll would still monopolise the CPU and
-        # starve any STATE_READY peer. kernel_cond_resched gives the
-        # peer a window to run.
-        kernel_cond_resched()
+        # Event-driven block: sleep on the slot's rx wait queue instead
+        # of spin-polling. The rx IRQ (virtio_net_poll -> tcp_rx deposit)
+        # calls wq_wake_all(&tcp_slot_rx_wq[slot]) the instant data lands,
+        # so a working IRQ gives us a zero-latency wake (fast path). The
+        # two-phase prepare/recheck closes the lost-wakeup window: after
+        # we link onto the queue we RE-CHECK the ring; a deposit racing in
+        # between the top-of-loop check and the sleep is caught here.
+        #
+        # TCG fallback (option a): wq_wait_commit_timeout sleeps at most
+        # ~1 tick; if no rx IRQ ever fires (emulated MSI-X drops), the
+        # 100 Hz timer wakes us via WQ_TIMEOUT and we loop back to
+        # virtio_net_poll() — degrading to today's poll, never wedging.
+        wq_wait_prepare(&tcp_slot_rx_wq[slot])
+        # Re-check the wake conditions now that we are queued. If any is
+        # already true, cancel the wait and loop to handle it at the top.
+        if tcp_slot_rx_count[slot] > 0 \
+                or tcp_slot_saw_fin[slot] != 0 \
+                or tcp_slot_state[slot] == TCP_CLOSED:
+            wq_wait_cancel(&tcp_slot_rx_wq[slot])
+        else:
+            wrc: int32 = wq_wait_commit_timeout(&tcp_slot_rx_wq[slot], 1)
+            if wrc == WQ_EINTR:
+                # Interrupted by a signal — abort the blocking read.
+                return -1
 
 
 def tcp_slot_at_eof(slot_signed: int32) -> int32:
@@ -2268,6 +2360,38 @@ def _tcp_accept_dequeue(lslot: uint64) -> int32:
     return -1
 
 
+def _tcp_accept_ready(lslot: uint64, listen_port: uint16) -> uint64:
+    # Non-destructive predicate: is there a child ready for tcp_accept to
+    # hand out on this listener? Mirrors tcp_accept's two lookup paths
+    # (backlog FIFO + table-scan fallback) but consumes nothing. Used to
+    # re-check the accept wait-condition after wq_wait_prepare so a child
+    # that reached ESTABLISHED between the top-of-loop scan and our sleep
+    # is not missed (the lost-wakeup close).
+    rb: uint64 = lslot * TCP_ACCEPT_BACKLOG
+    cnt: uint64 = tcp_slot_acc_count[lslot]
+    hh: uint64 = tcp_slot_acc_head[lslot]
+    j: uint64 = 0
+    while j < cnt:
+        pos: uint64 = hh + j
+        if pos >= TCP_ACCEPT_BACKLOG:
+            pos = pos - TCP_ACCEPT_BACKLOG
+        c: uint64 = cast[uint64](tcp_slot_acc_ring[rb + pos])
+        if c < TCP_NUM_SLOTS:
+            if tcp_slot_state[c] == TCP_ESTABLISHED:
+                if tcp_slot_accepted[c] == 0:
+                    return 1
+        j = j + 1
+    i: uint64 = 0
+    while i < TCP_NUM_SLOTS:
+        if i != lslot:
+            if tcp_slot_state[i] == TCP_ESTABLISHED:
+                if tcp_slot_local_p[i] == listen_port:
+                    if tcp_slot_accepted[i] == 0:
+                        return 1
+        i = i + 1
+    return 0
+
+
 def tcp_accept(listener_slot: int32, timeout_jiffies: uint64) -> int32:
     # Block (well, poll) until a connection completes the three-way
     # handshake on the same local_port as `listener_slot` and
@@ -2310,13 +2434,23 @@ def tcp_accept(listener_slot: int32, timeout_jiffies: uint64) -> int32:
                             printk1("[tcp] accept returning slot=%d\n", i)
                             return cast[int32](i)
             i = i + 1
-        # Preempt-class wedge-fix. This is THE site sshd's net_accept
-        # hits: without kernel_cond_resched a sshd `while served < 64`
-        # accept-loop pins the CPU forever — jiffies frozen under
-        # IF=0, hamsh (PID 1) never gets scheduled and the
-        # `[hamsh-alive]` heartbeat never appears. The sti+hlt+cli
-        # window in kernel_cond_resched is what unwedges it.
-        kernel_cond_resched()
+        # Event-driven accept wait. A child reaching ESTABLISHED enqueues
+        # on this listener's backlog and wakes tcp_slot_rx_wq[lslot] (see
+        # the SYN_RECV->ESTABLISHED transition in tcp_rx). We sleep on the
+        # listener's own queue. The bounded ~1-tick commit is the TCG
+        # fallback (re-poll if no rx IRQ) and the very thing that keeps
+        # hamsh (PID 1) scheduled: each timeout opens the IRQ window and,
+        # crucially, the sleeper is OFF the runqueue (STATE_WAIT) between
+        # ticks so peers run freely — strictly better than the old spin.
+        wq_wait_prepare(&tcp_slot_rx_wq[lslot])
+        if _tcp_accept_ready(lslot, listen_port) != 0:
+            wq_wait_cancel(&tcp_slot_rx_wq[lslot])
+        else:
+            wrc: int32 = wq_wait_commit_timeout(&tcp_slot_rx_wq[lslot], 1)
+            if wrc == WQ_EINTR:
+                printk1("[tcp] accept interrupted on listener slot=%d\n",
+                        lslot)
+                return -1
     printk1("[tcp] accept timeout on listener slot=%d\n", lslot)
     return -1
 
@@ -2886,6 +3020,7 @@ def tcp_init():
         tcp_slot_rx_head[i] = 0
         tcp_slot_rx_tail[i] = 0
         tcp_slot_rx_count[i] = 0
+        wq_init(&tcp_slot_rx_wq[i])
         tcp_slot_saw_fin[i] = 0
         tcp_slot_last_send[i] = 0
         tcp_slot_rto[i] = TCP_RTO_INITIAL
