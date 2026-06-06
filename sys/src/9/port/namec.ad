@@ -301,7 +301,29 @@ class ChanT:
     mode:      int32               # OREAD(0)/OWRITE(1)/ORDWR(2)
     srvfd:     int32               # DEV_MNT: the 9P transport fd; else -1
     p9_fid:    int32               # DEV_MNT: walked+opened fid; else -1
-    pad0:      int32               # keep the struct 8-byte sized
+    # --- fd→Chan unification: generic stateful-fd payload ------------
+    # The pool used to back ONLY DEV_MNT chans (srvfd/p9_fid above). The
+    # fd→Chan migration routes every STATEFUL fd family through the SAME
+    # pool, so a pool chan now carries a generic backing-resource handle
+    # that each stateful dev_type interprets in its own way:
+    #
+    #   * back_slot  — a small integer slot id into the family's own
+    #     backing table (a tmpfs slot, an ext4 open-file slot, a FAT
+    #     slot, ...). The release arm in namec_close keys on dev_type to
+    #     hand this back to the right backend.
+    #   * back_ptr   — a 64-bit backing pointer (needed by FD_DIR's
+    #     kmalloc'd listing buffer, and any future ptr-backed family).
+    #     Unused families leave it 0.
+    #
+    # refcount makes the pool chan FORK/DUP-safe: copy_fd_entry bumps it,
+    # namec_close decrements and only the LAST close runs the dev_type
+    # release. DEV_MNT chans already needed this (a forked 9P fd today
+    # shares the slot with NO refcount — second close double-clunks);
+    # the generic field fixes that pre-existing hazard too.
+    back_slot: int32               # family backing-table slot id; else -1
+    refcount:  int32               # live references to this pool chan
+    back_ptr:  uint64              # family backing pointer (FD_DIR); else 0
+    pad0:      int32               # keep the struct shape padded
 
 
 # --- chan id encoding -----------------------------------------------
@@ -373,17 +395,26 @@ def _chan_id_make_inline_wsys_draw(dev_type: int32, wid: int32,
     return CHAN_INLINE_TAG | (layer << 16) | (wid << 8) | dev_type
 
 
-# --- chan pool (DEV_MNT only) ---------------------------------------
+# --- chan pool (all STATEFUL fd families) ---------------------------
 #
-# Fixed pool — 64 live mounted-9P Chans is comfortable for the boot
-# recipe plus a handful of distro shells, and a fixed pool dodges
-# Adder's nested-frame Array bug (top-level storage only). Slot 0 is
-# never handed out so a zero chan-id can mean "no chan" at the fd
-# layer. Only DEV_MNT chans live here; inline cdev chans never touch
-# the pool.
-CHAN_POOL_CAP: uint64 = 64
+# Fixed pool. It used to back ONLY DEV_MNT mounted-9P Chans (64 was
+# ample for the boot recipe + a few distro shells). The fd→Chan
+# migration routes every STATEFUL fd family through this SAME pool, so
+# the cap is now sized against the fd-layer worst case, not the mount
+# count.
+#
+# SIZING: a pool chan is allocated per DISTINCT stateful open (fork/dup
+# SHARE a chan via refcount — they do NOT allocate). The absolute upper
+# bound is therefore NR_FDS (16) × live tasks (task_table is 16) = 256
+# distinct stateful fds across the whole system at once. 512 = 2× that
+# worst case, comfortable headroom, and the struct is tiny (a handful
+# of int32s + one uint64), so the BSS cost is trivial. A fixed pool
+# also dodges Adder's nested-frame Array bug (top-level storage only).
+# Slot 0 is never handed out so a zero chan-id means "no chan" at the
+# fd layer. Inline cdev chans never touch the pool.
+CHAN_POOL_CAP: uint64 = 512
 
-chan_pool: Array[64, ChanT]
+chan_pool: Array[512, ChanT]
 chan_pool_inited: int32 = 0
 
 
@@ -393,10 +424,13 @@ def namec_init():
     # table, and flips the lazy-init guard.
     i: uint64 = 0
     while i < CHAN_POOL_CAP:
-        chan_pool[i].in_use   = 0
-        chan_pool[i].dev_type = DEV_NONE
-        chan_pool[i].srvfd    = -1
-        chan_pool[i].p9_fid   = -1
+        chan_pool[i].in_use    = 0
+        chan_pool[i].dev_type  = DEV_NONE
+        chan_pool[i].srvfd     = -1
+        chan_pool[i].p9_fid    = -1
+        chan_pool[i].back_slot = -1
+        chan_pool[i].refcount  = 0
+        chan_pool[i].back_ptr  = 0
         i = i + 1
     chan_pool_inited = 1
 
@@ -404,12 +438,17 @@ def namec_init():
 def _chan_alloc() -> int32:
     # Hand out the lowest free pool slot (1..CHAN_POOL_CAP-1; slot 0 is
     # reserved as the "no chan" sentinel). Returns the slot index, or
-    # -1 if the pool is exhausted.
+    # -1 if the pool is exhausted. The slot starts with refcount 1 (the
+    # one fd that namec is handing it back to) and a cleared backing
+    # payload; the caller stamps dev_type / back_slot / back_ptr.
     if chan_pool_inited == 0:
         namec_init()
     s: uint64 = 1
     while s < CHAN_POOL_CAP:
         if chan_pool[s].in_use == 0:
+            chan_pool[s].refcount  = 1
+            chan_pool[s].back_slot = -1
+            chan_pool[s].back_ptr  = 0
             return cast[int32](s)
         s = s + 1
     return -1
@@ -421,10 +460,13 @@ def _chan_free(slot: int32):
     su: uint64 = cast[uint64](slot)
     if su >= CHAN_POOL_CAP:
         return
-    chan_pool[su].in_use   = 0
-    chan_pool[su].dev_type = DEV_NONE
-    chan_pool[su].srvfd    = -1
-    chan_pool[su].p9_fid   = -1
+    chan_pool[su].in_use    = 0
+    chan_pool[su].dev_type  = DEV_NONE
+    chan_pool[su].srvfd     = -1
+    chan_pool[su].p9_fid    = -1
+    chan_pool[su].back_slot = -1
+    chan_pool[su].refcount  = 0
+    chan_pool[su].back_ptr  = 0
 
 
 def _chan_pool_valid(slot: int32) -> int32:
@@ -1328,17 +1370,46 @@ def namec_write(cid: int32, off: uint64, buf: Ptr[uint8],
 
 
 def namec_close(cid: int32) -> int32:
-    # Release a Chan. An inline cdev chan has no allocated state, so
-    # close is a no-op success. A DEV_MNT chan clunks its 9P fid (so
-    # the server reclaims it) then frees the pool slot.
+    # Release one reference to a Chan. An inline cdev chan has no
+    # allocated state, so close is a no-op success. A pool chan is
+    # refcounted (fork/dup bumped the count via namec_chan_ref): this
+    # DECREMENTS, and only the LAST reference runs the dev_type release
+    # and frees the slot. That makes both explicit-close (vfs_close) and
+    # exit-cleanup (close_fd_in_task → namec_close) share ONE release
+    # path with no double-free.
+    #
+    #   * DEV_MNT  — clunk the 9P fid so the server reclaims it.
+    #   * (future stateful families key their backing-slot release here
+    #     by dev_type, e.g. tmpfs_release_anon(back_slot).)
     if _chan_id_valid(cid) == 0:
         return -9                                           # -EBADF
     if _chan_id_is_inline(cid) != 0:
         return 0
     su: uint64 = cast[uint64](cid)
+    # Drop one reference. Not the last? leave the chan live for the
+    # other holders (a forked/dup'd fd).
+    if chan_pool[su].refcount > 1:
+        chan_pool[su].refcount = chan_pool[su].refcount - 1
+        return 0
+    # Last reference — run the per-dev_type backing release, then free.
     if chan_pool[su].dev_type == DEV_MNT:
         p9c_clunk(chan_pool[su].srvfd, chan_pool[su].p9_fid)
     _chan_free(cid)
+    return 0
+
+
+def namec_chan_ref(cid: int32) -> int32:
+    # fork/dup hook: bump a pool chan's refcount so a copied fd shares
+    # the SAME backing resource and the FIRST namec_close doesn't yank
+    # it out from under the other holder. An inline cdev chan carries no
+    # state, so referencing it is a no-op (the id round-trips verbatim).
+    # Returns 0 on success, -9 (-EBADF) on an invalid id.
+    if _chan_id_valid(cid) == 0:
+        return -9
+    if _chan_id_is_inline(cid) != 0:
+        return 0
+    su: uint64 = cast[uint64](cid)
+    chan_pool[su].refcount = chan_pool[su].refcount + 1
     return 0
 
 
@@ -1367,6 +1438,43 @@ def namec_chan_is_mounted(cid: int32) -> int32:
     if chan_pool[cast[uint64](cid)].dev_type == DEV_MNT:
         return 1
     return 0
+
+
+def namec_chan_is_pool(cid: int32) -> int32:
+    # 1 iff `cid` names a live POOL chan (allocated slot, refcounted),
+    # as opposed to an inline cdev chan (stateless, no slot). The fd
+    # layer's exit-cleanup uses this to decide whether an FD_CHAN_MARK
+    # fd needs a namec_close release at all.
+    if _chan_id_valid(cid) == 0:
+        return 0
+    if _chan_id_is_inline(cid) != 0:
+        return 0
+    return 1
+
+
+def namec_chan_back_slot(cid: int32) -> int32:
+    # The family backing-table slot id a pool chan carries (a tmpfs
+    # slot, an ext4 open-file slot, ...). -1 for an inline cdev chan,
+    # an invalid id, or a pool chan with no backing slot (DEV_MNT uses
+    # srvfd/p9_fid instead). Stateful families recover their backing
+    # handle through this so the per-fd dispatch (read/write/lseek/
+    # fstat) can reach the right backend entry.
+    if _chan_id_valid(cid) == 0:
+        return -1
+    if _chan_id_is_inline(cid) != 0:
+        return -1
+    return chan_pool[cast[uint64](cid)].back_slot
+
+
+def namec_chan_refcount(cid: int32) -> int32:
+    # Debug/test accessor: the live reference count on a pool chan, or
+    # 0 for an inline/invalid id. Tests assert refcount-on-fork is
+    # correct (a forked stateful fd bumps to 2; last close drops to 0).
+    if _chan_id_valid(cid) == 0:
+        return 0
+    if _chan_id_is_inline(cid) != 0:
+        return 0
+    return chan_pool[cast[uint64](cid)].refcount
 
 
 def namec_live_count() -> uint64:
