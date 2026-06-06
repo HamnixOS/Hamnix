@@ -240,9 +240,12 @@ STATUS.md). What remains, off the critical path and parallelisable:
   overhead landed.
 
 ### §7 Entropy / RNG
-- [ ] ChaCha20 CSPRNG promotion beyond M16.96 (RDRAND/RDSEED seeding
-  +  reseed cadence); distinct blocking `/dev/random` vs non-blocking
-  `/dev/urandom` — today both alias the same pool (D5/F2).
+- [~] ChaCha20 CSPRNG: RDRAND/RDSEED seeding + fast-key-erasure DONE;
+  periodic **reseed cadence** now folds fresh hw entropy on a byte
+  (1 MiB) or jiffies budget for post-compromise secrecy
+  (sys/src/9/port/devrandom.ad `_maybe_reseed`). `/dev/random` ≡
+  `/dev/urandom` aliasing is intentional modern-Linux semantics (both
+  non-blocking once seeded), so no split needed.
 
 ### §8 SMP & scheduler
 - [~] **MADT-driven SMP landed** (2026-05-30): `arch/x86/kernel/smp.ad`

@@ -97,6 +97,7 @@ check "RFC 8439 §2.3.2 ChaCha20 KAT matches"  "[random] KAT RFC8439-2.3.2 ChaCh
 check "output is nonconstant"                 "[random] output nonconstant OK"
 check "successive reads differ (ratchet)"     "[random] successive reads differ OK"
 check "large reads differ (no short period)"  "[random] large reads differ (no short period) OK"
+check "reseed mutates pool (post-compromise)" "[random] reseed mutates pool OK"
 check "CSPRNG self-test PASS banner"          "[random] PASS"
 
 if [ "$fail" -ne 0 ]; then
@@ -104,4 +105,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[random] PASS — ChaCha20 (RFC 8439) fast-key-erasure CSPRNG: known-answer cipher core verified, output nonconstant, ratchet advances, no short period"
+echo "[random] PASS — ChaCha20 (RFC 8439) fast-key-erasure CSPRNG: known-answer cipher core verified, output nonconstant, ratchet advances, no short period, periodic reseed mutates pool"
