@@ -45,7 +45,11 @@
 #     matching u_termios.ad exactly.
 #   * fd_buf packs (slot << 1) | is_master so one marker serves both ends.
 
-from kernel.sched.core import yield_to_others
+from kernel.sched.core import (
+    yield_to_others, WaitQueue, wq_init, wq_wake_all,
+    wq_sleep_interruptible, WQ_EINTR,
+    wq_wait_prepare, wq_wait_cancel, wq_wait_commit,
+)
 
 
 # --- FD marker ------------------------------------------------------
@@ -126,6 +130,15 @@ pty_m2s_cnt:  Array[16, uint64]
 pty_s2m_buf:  Array[65536, uint8]        # 16 * 4096
 pty_s2m_head: Array[16, uint64]
 pty_s2m_cnt:  Array[16, uint64]
+
+# Event-driven blocking wait queues, one per pty slot per direction.
+# A SLAVE read that finds the m2s queue empty sleeps on pty_m2s_wq[slot]
+# (woken by pty_master_write / master-close); a MASTER read that finds
+# the s2m queue empty sleeps on pty_s2m_wq[slot] (woken by
+# pty_slave_write / slave-close). Replaces the per-iteration
+# yield_to_others poll. Head fields zero-initialised (empty queues).
+pty_m2s_wq:  Array[16, WaitQueue]
+pty_s2m_wq:  Array[16, WaitQueue]
 
 
 def _pty_set_termios_defaults(slot: uint64):
@@ -244,6 +257,10 @@ def pty_alloc_pair() -> int32:
             pty_m2s_cnt[slot] = 0
             pty_s2m_head[slot] = 0
             pty_s2m_cnt[slot] = 0
+            # Recycled-slot hygiene: empty both wait queues so a new pair
+            # never inherits a previous tenant's stale waiter link.
+            wq_init(&pty_m2s_wq[slot])
+            wq_init(&pty_s2m_wq[slot])
             _pty_set_termios_defaults(slot)
             pty_ws_row[slot] = 24
             pty_ws_col[slot] = 80
@@ -278,6 +295,10 @@ def pty_master_unref(slot: int32):
     su: uint64 = cast[uint64](slot)
     if pty_mref[su] > 0:
         pty_mref[su] = pty_mref[su] - 1
+    # Event-driven EOF: the master going away means a blocked slave reader
+    # must wake to observe EOF (pty_slave_read returns 0 when pty_mref==0).
+    if pty_mref[su] == 0:
+        wq_wake_all(&pty_m2s_wq[su])
     _pty_maybe_free(su)
 
 
@@ -287,6 +308,10 @@ def pty_slave_unref(slot: int32):
     su: uint64 = cast[uint64](slot)
     if pty_sref[su] > 0:
         pty_sref[su] = pty_sref[su] - 1
+    # Event-driven EOF: the slave going away means a blocked master reader
+    # must wake to observe EOF (pty_master_read returns 0 when pty_sref==0).
+    if pty_sref[su] == 0:
+        wq_wake_all(&pty_s2m_wq[su])
     _pty_maybe_free(su)
 
 
@@ -402,6 +427,8 @@ def pty_setwinsz(slot: int32, inp: uint64) -> int64:
 
 def _pty_echo_byte(slot: uint64, c: int32):
     _pty_q_push(slot, 1, cast[uint8](c & 0xFF))
+    # Echo lands on the master's read (s2m) queue — wake a master reader.
+    wq_wake_all(&pty_s2m_wq[slot])
 
 
 def _pty_echo_erase(slot: uint64):
@@ -409,6 +436,7 @@ def _pty_echo_erase(slot: uint64):
     _pty_q_push(slot, 1, 8)
     _pty_q_push(slot, 1, 32)
     _pty_q_push(slot, 1, 8)
+    wq_wake_all(&pty_s2m_wq[slot])
 
 
 # --- master write: feed the slave input queue ----------------------
@@ -427,6 +455,10 @@ def pty_master_write(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
         if _pty_q_push(su, 0, buf[n]) == 0:
             break                            # queue full — short write
         n = n + 1
+    # Event-driven: the slave's input (m2s) queue grew — wake any slave
+    # reader sleeping on it.
+    if n > 0:
+        wq_wake_all(&pty_m2s_wq[su])
     return cast[int64](n)
 
 
@@ -454,6 +486,10 @@ def pty_slave_write(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
         if _pty_q_push(su, 1, b) == 0:
             break
         n = n + 1
+    # Event-driven: the master's read (s2m) queue grew — wake any master
+    # reader sleeping on it.
+    if n > 0:
+        wq_wake_all(&pty_s2m_wq[su])
     return cast[int64](n)
 
 
@@ -476,7 +512,18 @@ def pty_master_read(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # If the slave end is gone and nothing is queued, EOF.
         if pty_sref[su] == 0:
             return 0
-        yield_to_others()
+        # Event-driven, two-phase to close the SMP lost-wakeup window:
+        # queue on the master-read (s2m) wait queue FIRST, then re-check
+        # the queue + slave-ref while queued. If a slave write/echo raced
+        # in (or the slave closed) between the loop test and here, cancel
+        # and re-loop; otherwise commit to sleep. Woken by pty_slave_write
+        # / echo / pty_slave_unref. A signal-wake returns WQ_EINTR.
+        wq_wait_prepare(&pty_s2m_wq[su])
+        if _pty_q_cnt(su, 1) != 0 or pty_sref[su] == 0:
+            wq_wait_cancel(&pty_s2m_wq[su])
+            continue
+        if wq_wait_commit(&pty_s2m_wq[su]) != 0:
+            return cast[int64](WQ_EINTR)
     n: uint64 = 0
     while n < count:
         b: int32 = _pty_q_pop(su, 1)
@@ -542,7 +589,16 @@ def pty_slave_read(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
         while _pty_q_cnt(su, 0) == 0:
             if pty_mref[su] == 0:
                 return 0                     # master gone — EOF
-            yield_to_others()
+            # Event-driven, two-phase (close SMP lost-wakeup window): queue
+            # on the slave-read (m2s) wait queue first, re-check while
+            # queued, cancel+reloop if a master write/close raced in, else
+            # commit to sleep. A signal-wake returns WQ_EINTR.
+            wq_wait_prepare(&pty_m2s_wq[su])
+            if _pty_q_cnt(su, 0) != 0 or pty_mref[su] == 0:
+                wq_wait_cancel(&pty_m2s_wq[su])
+                continue
+            if wq_wait_commit(&pty_m2s_wq[su]) != 0:
+                return cast[int64](WQ_EINTR)
         n: uint64 = 0
         while n < count:
             b: int32 = _pty_q_pop(su, 0)
@@ -567,7 +623,19 @@ def pty_slave_read(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
                 if n > 0:
                     return cast[int64](n)
                 return 0
-            yield_to_others()
+            # Event-driven, two-phase (close SMP lost-wakeup window): queue
+            # on the slave-read (m2s) wait queue first, re-check while
+            # queued, cancel+reloop if a master write/close raced in, else
+            # commit to sleep. A signal-wake returns WQ_EINTR (deliver any
+            # partial line we already cooked, else -EINTR).
+            wq_wait_prepare(&pty_m2s_wq[su])
+            if _pty_q_cnt(su, 0) != 0 or pty_mref[su] == 0:
+                wq_wait_cancel(&pty_m2s_wq[su])
+                continue
+            if wq_wait_commit(&pty_m2s_wq[su]) != 0:
+                if n > 0:
+                    return cast[int64](n)
+                return cast[int64](WQ_EINTR)
             continue
         c: int32 = got
         # CR → NL (ICRNL)

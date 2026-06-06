@@ -46,6 +46,9 @@ from kernel.sched.core import (
     FD_FAT_MARK, FD_EXT4_MARK,
     FD_DIR_MARK, FD_SOCKET_MARK,
     close_fd_in_task, copy_fd_entry, yield_to_others,
+    console_wq_sleep, wq_sleep_interruptible, WaitQueue, wq_init,
+    wq_wake_all, wq_wake_one, WQ_EINTR,
+    wq_wait_prepare, wq_wait_cancel, wq_wait_commit,
     get_cwd_buf, current_idx_get, set_current_errstr,
     # docs/security.md Phase 5: VFS permission check needs the caller's
     # uid/gid to compare against the file's owner/group/mode bits.
@@ -145,7 +148,7 @@ from sys.src.port9.port.chan import (
 from sys.src.port9.port.devfd import (
     devfd_read, devfd_write,
     devfd_read_pipe_writers, devfd_write_pipe_readers,
-    devfd_slot_kind,
+    devfd_slot_kind, devfd_slot_arg,
     FD_DEVFD_MARK, DEVFD_PIPE_R, DEVFD_PIPE_W, DEVFD_CONS,
 )
 # V3/V3.5: `#s/<name>` name-server dispatch. devsrv_open returns the
@@ -222,7 +225,7 @@ from fs.tmpfs import (
 from fs.pipe import (
     pipe_alloc, pipe_read, pipe_write,
     pipe_readers, pipe_writers,
-    pipe_readable, pipe_writable,
+    pipe_readable, pipe_writable, pipe_read_wq,
 )
 # V5: bidirectional socketpair transport. Each fd marked
 # FD_SOCKETPAIR_MARK is a single fd you can read AND write — retires
@@ -5214,13 +5217,29 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         df_num: int32 = cast[int32](cast[uint32](task[0].fd_buf[fdu]))
         df_pg:  uint64 = pgrp_current()
         if devfd_slot_kind(df_pg, df_num) == DEVFD_PIPE_R:
+            # The devfd's arg is the backing pipe slot — sleep on that
+            # pipe's read wait queue (event-driven) rather than poll-
+            # yielding. pipe_write / pipe_close_writer wake it; a signal
+            # wake returns WQ_EINTR.
+            dpr_slot: int32 = devfd_slot_arg(df_pg, df_num)
+            dwq: Ptr[WaitQueue] = pipe_read_wq(dpr_slot)
             while True:
                 dn: int64 = devfd_read(df_pg, df_num, buf, count)
                 if dn > 0:
                     return dn
                 if devfd_read_pipe_writers(df_pg, df_num) == 0:
                     return 0                       # all writers gone
-                yield_to_others()
+                # Two-phase wait (close SMP lost-wakeup window): queue
+                # first, re-check the backing pipe while queued, cancel if
+                # a writer raced bytes in / closed, else commit to sleep.
+                wq_wait_prepare(dwq)
+                if pipe_readable(dpr_slot) != 0 \
+                        or devfd_read_pipe_writers(df_pg, df_num) == 0:
+                    wq_wait_cancel(dwq)
+                    continue
+                rcd: int32 = wq_wait_commit(dwq)
+                if rcd != 0:
+                    return cast[int64](WQ_EINTR)
         return devfd_read(df_pg, df_num, buf, count)
     if file_idx == FD_P9_MARK:
         # V1 legacy 9P-mounted file path — retained as a non-regressing
@@ -5483,10 +5502,13 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
                 return tv
             yield_to_others()
     if file_idx == FD_PIPE_MARK_R:
-        # Blocking read: yield until pipe_read returns >0 OR every
-        # writer has closed (EOF). We don't sleep on a wait queue
-        # yet — yield_to_others() just rotates the runqueue, and the
-        # timer ISR / sibling syscalls eventually push data into us.
+        # Blocking read: sleep on the pipe's read wait queue until a
+        # writer enqueues bytes (pipe_write wakes us) OR the last writer
+        # closes (pipe_close_writer wakes us so we observe EOF). This is
+        # the event-driven model — the reader is STATE_WAIT (off the
+        # runqueue) while idle, woken directly by the producer rather than
+        # re-polled on every 100 Hz timer tick. A signal-wake returns
+        # WQ_EINTR so the read aborts with -EINTR.
         slot: int32 = cast[int32](task[0].fd_buf[fdu])
         while True:
             n: int64 = pipe_read(slot, buf, count)
@@ -5494,7 +5516,20 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
                 return n
             if pipe_writers(slot) == 0:
                 return 0                       # all writers gone -> EOF
-            yield_to_others()
+            # Two-phase wait to close the SMP lost-wakeup window: queue
+            # ourselves FIRST, then re-check the pipe (and writer count)
+            # while queued. If a writer raced bytes in / closed between the
+            # checks above and here, the recheck sees it and we cancel
+            # instead of sleeping forever. Only commit to sleep when the
+            # pipe is still empty AND a writer still exists.
+            pwq: Ptr[WaitQueue] = pipe_read_wq(slot)
+            wq_wait_prepare(pwq)
+            if pipe_readable(slot) != 0 or pipe_writers(slot) == 0:
+                wq_wait_cancel(pwq)
+                continue
+            rcp: int32 = wq_wait_commit(pwq)
+            if rcp != 0:
+                return cast[int64](WQ_EINTR)
     if file_idx == FD_SOCKETPAIR_MARK:
         # V5: bidirectional read. The packed fd_buf encodes (slot << 1
         # | direction); end A reads ring_b, end B reads ring_a. We
@@ -5554,7 +5589,17 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
             if c < 0:
                 c = uart_rx_pop()
             if c < 0:
-                yield_to_others()
+                # Event-driven block: sleep on the console input wait queue
+                # until a producer (UART RX IRQ / keyboard / wsys inject)
+                # wakes us, instead of re-polling the FIFO on every timer
+                # tick. A signal-wake (Ctrl-C) returns WQ_EINTR; surface it
+                # as -EINTR so the read aborts (unless we already collected
+                # bytes, in which case return the short read like Linux).
+                rcw: int32 = console_wq_sleep()
+                if rcw != 0:
+                    if n > 0:
+                        return cast[int64](n)
+                    return cast[int64](WQ_EINTR)
                 continue
             buf[n] = cast[uint8](c & 0xFF)
             n = n + 1

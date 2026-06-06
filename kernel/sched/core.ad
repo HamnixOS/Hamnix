@@ -678,6 +678,31 @@ class TaskStruct:
     wchar:         uint64
     syscr:         uint64
     syscw:         uint64
+    # Event-driven wait queues (replace the timer-tick poll-yield model).
+    # A task blocked on a resource (console FIFO, pipe read end, pty peer
+    # queue) is linked onto a per-resource WaitQueue and moved to
+    # STATE_WAIT — OFF the runqueue, so _pick_next never selects it and
+    # the timer tick never re-polls it. The producer (UART RX IRQ, pipe
+    # write, pty peer write) calls wq_wake_one/wq_wake_all which moves the
+    # waiter(s) back to STATE_READY and unlinks them.
+    #
+    #   wait_next     — intrusive singly-linked list link: 1 + the slot
+    #                   index of the NEXT waiter on the same queue, or 0
+    #                   for "end of list / not linked". The +1 bias lets 0
+    #                   mean "no link" even though slot 0 is a valid task.
+    #   wait_on       — 1 + the slot index head this task is queued under,
+    #                   or 0 if not on any queue. Used only as a "still
+    #                   linked?" flag by wq_sleep's unlink-on-return so a
+    #                   racing producer wake (which already unlinked us) is
+    #                   handled idempotently.
+    #   wait_signaled — set to 1 by the signal path when it force-wakes a
+    #                   STATE_WAIT task, so wq_sleep_interruptible knows the
+    #                   wake was a signal (return -EINTR) rather than data.
+    # All 0 on a fresh slot — zeroed in sched_init_task_weight. Placed at
+    # the END of TaskStruct so no earlier offset shifts.
+    wait_next:     uint64
+    wait_on:       uint64
+    wait_signaled: uint64
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -696,6 +721,15 @@ STATE_STOPPED: uint64 = 4
 # _pick_next() skips it (only schedules READY/RUNNING).  The AP's
 # sched_ap_launch() transitions it directly to STATE_RUNNING.
 STATE_PARKED: uint64 = 5
+
+# Event-driven wait: the task is blocked on a resource wait queue (console
+# input FIFO, pipe read end, pty peer queue). It is OFF the runqueue —
+# _pick_next() skips anything != STATE_READY, so a STATE_WAIT task is never
+# dispatched and never re-polled on the timer tick. A producer's
+# wq_wake_one/wq_wake_all moves it back to STATE_READY; the signal path also
+# force-wakes it (so a blocked read returns -EINTR on Ctrl-C). This is the
+# Linux TASK_INTERRUPTIBLE shape — sleep until explicitly woken, not poll.
+STATE_WAIT: uint64 = 6
 
 # Per-task kernel stack. 32 KiB (8 pages, buddy order 3). The deepest
 # in-kernel call chain is NOT a single 4 KiB page — two distinct chains
@@ -1539,6 +1573,11 @@ def sched_init_task_weight(slot: uint64):
     task_table[slot].wchar  = 0
     task_table[slot].syscr  = 0
     task_table[slot].syscw  = 0
+    # Event-driven wait-queue link state starts clean on a recycled slot:
+    # not linked onto any queue, no pending signal-wake flag.
+    task_table[slot].wait_next     = 0
+    task_table[slot].wait_on       = 0
+    task_table[slot].wait_signaled = 0
     # getrlimit/setrlimit/prlimit64: seed this slot's per-task resource limits
     # to Linux defaults (8 MiB stack, 1024 nofile, infinite else).
     rlimit_init_task(slot)
@@ -4439,6 +4478,347 @@ def kernel_cond_resched():
         schedule()
 
 
+# --- Event-driven wait queues ------------------------------------
+#
+# Replaces the timer-tick poll-yield model for blocking I/O. A reader
+# that finds its resource empty links itself onto the resource's
+# WaitQueue, transitions to STATE_WAIT (off the runqueue — _pick_next
+# never selects it, the timer tick never re-polls it), and idles. The
+# producer (UART RX IRQ, pipe write, pty peer write) that makes data
+# available calls wq_wake_one / wq_wake_all, which moves the waiter(s)
+# back to STATE_READY and unlinks them. The signal path also force-wakes
+# a STATE_WAIT task so a blocked read returns -EINTR on Ctrl-C.
+#
+# This is the Linux TASK_INTERRUPTIBLE shape: sleep until explicitly
+# woken, not spin-poll. The win on a busy multi-task box is that the
+# sleeper is genuinely OFF the runqueue — it consumes no scheduler
+# rotations and is not re-polled every 10 ms. On a single-idle-task box
+# (e.g. hamsh alone, blocked on stdin) the behaviour necessarily
+# converges to "hlt until the producer IRQ fires", which is correct and
+# unavoidable: there is literally nothing else to run.
+#
+# Intrusive singly-linked list (Linux shape, no fixed caps): WaitQueue
+# holds a head field (1 + the slot index of the first waiter, or 0 for
+# empty). Each task's wait_next field is 1 + the slot index of the next
+# waiter (or 0 for end-of-list). The +1 bias lets 0 mean "none" while
+# slot 0 stays a valid task.
+#
+# SMP safety: all queue + state mutation is done under rq_lock, the same
+# lock schedule() uses for task_table[*].state. rq_lock is NEVER held
+# across the hlt in wq_sleep (deadlock + the producer IRQ that wakes us
+# needs to take rq_lock). wq_wake_* is safe from IRQ context — it takes
+# rq_lock, flips states, releases, and NEVER calls schedule().
+
+# EINTR (4): wq_sleep_interruptible returns -EINTR when the wake was a
+# signal-wake (Ctrl-C etc.) rather than a data-wake, so the caller aborts
+# the read with -EINTR exactly like a Linux interruptible sleep.
+WQ_EINTR: int32 = -4
+
+class WaitQueue:
+    # head: 1 + slot index of the first waiter, or 0 for empty.
+    head: uint64
+
+
+def wq_init(wq: Ptr[WaitQueue]):
+    wq[0].head = 0
+
+
+def _wq_unlink_locked(wq: Ptr[WaitQueue], slot: uint64) -> uint64:
+    # Remove `slot` from `wq`'s waiter list if present. Returns 1 if it
+    # was actually on the list, 0 if not (already unlinked by a racing
+    # waker). Caller MUST hold rq_lock. Clears the task's wait_next /
+    # wait_on link state on success.
+    cur: uint64 = wq[0].head
+    if cur == 0:
+        return 0
+    target: uint64 = slot + 1
+    if cur == target:
+        # Head removal.
+        wq[0].head = task_table[slot].wait_next
+        task_table[slot].wait_next = 0
+        task_table[slot].wait_on   = 0
+        return 1
+    # Walk to find the predecessor.
+    prev_b: uint64 = cur
+    while prev_b != 0:
+        prev_slot: uint64 = prev_b - 1
+        nxt: uint64 = task_table[prev_slot].wait_next
+        if nxt == target:
+            task_table[prev_slot].wait_next = task_table[slot].wait_next
+            task_table[slot].wait_next = 0
+            task_table[slot].wait_on   = 0
+            return 1
+        prev_b = nxt
+    return 0
+
+
+def wq_sleep_interruptible(wq: Ptr[WaitQueue]) -> int32:
+    # Block the current task on `wq` until a producer wakes it (return 0)
+    # or a signal is delivered (return -EINTR). MUST be called from
+    # syscall (ring-0) context with no kernel spinlock held. On entry the
+    # caller has already re-checked the resource and found it empty.
+    #
+    # HAZARD (see schedule()): when this task is the ONLY runnable thing
+    # (the common idle case), we must NOT route through schedule() with a
+    # non-RUNNING/non-READY state — schedule() would take its "no live
+    # tasks; halting" branch and HALT THE BOX. So: only hand off to
+    # schedule() when another task IS ready; otherwise idle on a
+    # sti;hlt;cli loop (IF=1 so the producer's IRQ can fire and wake us),
+    # re-checking the wakeup condition (state flipped back to READY) and
+    # pending signals each iteration. On a busy box the task is STATE_WAIT
+    # and off the runqueue while it waits; on an idle box this converges
+    # to hlt-until-IRQ, which is correct.
+    cur: uint64 = current_idx_pcpu
+
+    # Fast path: a signal is already pending — don't sleep, abort now.
+    if signal_pending(cur) != 0:
+        return WQ_EINTR
+
+    spinlock_lock(&rq_lock)
+    # Link onto the queue head (LIFO is fine; order among waiters on the
+    # same resource is unspecified) and go to sleep.
+    task_table[cur].wait_signaled = 0
+    task_table[cur].wait_next = wq[0].head
+    task_table[cur].wait_on   = cur + 1
+    wq[0].head = cur + 1
+    task_table[cur].state = STATE_WAIT
+    spinlock_unlock(&rq_lock)
+
+    rc: int32 = 0
+    while True:
+        # Are we still asleep on the queue? A producer wake (wq_wake_*)
+        # or a signal force-wake flips us to STATE_READY and unlinks us.
+        spinlock_lock(&rq_lock)
+        still_waiting: uint64 = 0
+        if task_table[cur].state == STATE_WAIT:
+            still_waiting = 1
+        spinlock_unlock(&rq_lock)
+
+        if still_waiting == 0:
+            # We were woken. wait_signaled distinguishes a signal-wake
+            # from a data-wake.
+            if task_table[cur].wait_signaled != 0:
+                rc = WQ_EINTR
+            break
+
+        # A signal posted to us while we sleep must also break us out,
+        # even if the signal path didn't reach the force-wake (defensive).
+        if signal_pending(cur) != 0:
+            spinlock_lock(&rq_lock)
+            _wq_unlink_locked(wq, cur)
+            if task_table[cur].state == STATE_WAIT:
+                task_table[cur].state = STATE_RUNNING
+            spinlock_unlock(&rq_lock)
+            rc = WQ_EINTR
+            break
+
+        # If another task is ready, give it the CPU via schedule() —
+        # we're STATE_WAIT so schedule() picks the peer and we come back
+        # here only when re-readied. If nobody else is ready, idle-hlt
+        # with IF=1 so the producer IRQ can fire and wake us. We MUST NOT
+        # call schedule() in the no-peer case — its halt branch panics.
+        if _another_task_ready() != 0:
+            schedule()
+            # When schedule() returns to us we have been re-dispatched,
+            # which only happens after a wake flipped us READY->RUNNING.
+            # Loop to re-test state at the top (covers the spurious case).
+        else:
+            local_irq_enable()
+            cpu_idle_enter()
+            asm_volatile("hlt")
+            cpu_idle_leave()
+            local_irq_disable()
+
+    # Belt-and-braces: guarantee we are fully unlinked and runnable
+    # before returning (handles any racing-wake corner).
+    spinlock_lock(&rq_lock)
+    _wq_unlink_locked(wq, cur)
+    if task_table[cur].state == STATE_WAIT:
+        task_table[cur].state = STATE_RUNNING
+    spinlock_unlock(&rq_lock)
+    task_table[cur].wait_signaled = 0
+    return rc
+
+
+# --- Two-phase wait (closes the SMP lost-wakeup window) ----------
+#
+# wq_sleep_interruptible above has an inherent race on SMP: the caller
+# does its resource check (e.g. pipe_read -> 0) OUTSIDE any lock, then
+# calls wq_sleep_interruptible which links + sleeps. Between those two
+# steps a producer on ANOTHER CPU can fill the resource and call
+# wq_wake_* — finding the queue still empty (we haven't linked yet), so
+# it wakes nobody. We then link and sleep forever with data waiting.
+# The console path papers over this with a 100 Hz timer-tick re-wake,
+# but pipe/pty have no such net.
+#
+# The fix is the standard Linux prepare_to_wait / condition-recheck /
+# finish_wait dance:
+#
+#   wq_wait_prepare(wq)         # link current onto wq, set STATE_WAIT
+#   if resource_now_ready():    # RE-CHECK after we are queued
+#       wq_wait_cancel(wq)      # unlink, back to RUNNING, consume data
+#   else:
+#       rc = wq_wait_commit(wq) # actually sleep until woken / signalled
+#
+# Because the producer takes rq_lock in wq_wake_* and we hold rq_lock
+# across "link + set STATE_WAIT" in wq_wait_prepare, the recheck after
+# prepare cannot miss a wake: either the producer's wake ran before our
+# prepare (so our recheck sees the data and we cancel), or it runs after
+# (so it finds us queued and wakes us). No lost wakeup.
+def wq_wait_prepare(wq: Ptr[WaitQueue]):
+    # Phase 1: atomically link the current task onto `wq` and mark it
+    # STATE_WAIT. After this returns the caller MUST re-check its resource
+    # condition and then call exactly one of wq_wait_cancel (condition now
+    # true) or wq_wait_commit (sleep). Caller holds NO spinlock on entry.
+    cur: uint64 = current_idx_pcpu
+    spinlock_lock(&rq_lock)
+    task_table[cur].wait_signaled = 0
+    task_table[cur].wait_next = wq[0].head
+    task_table[cur].wait_on   = cur + 1
+    wq[0].head = cur + 1
+    task_table[cur].state = STATE_WAIT
+    spinlock_unlock(&rq_lock)
+
+
+def wq_wait_cancel(wq: Ptr[WaitQueue]):
+    # Abort a prepared wait WITHOUT sleeping: the post-prepare recheck
+    # found the resource ready. Unlink from `wq` and return to STATE_RUNNING.
+    cur: uint64 = current_idx_pcpu
+    spinlock_lock(&rq_lock)
+    _wq_unlink_locked(wq, cur)
+    if task_table[cur].state == STATE_WAIT:
+        task_table[cur].state = STATE_RUNNING
+    spinlock_unlock(&rq_lock)
+    task_table[cur].wait_signaled = 0
+
+
+def wq_wait_commit(wq: Ptr[WaitQueue]) -> int32:
+    # Phase 2: the resource is still not ready after prepare — actually
+    # sleep until a producer wake or a signal. Returns 0 on a data-wake,
+    # WQ_EINTR on a signal-wake. Same halt-hazard discipline as
+    # wq_sleep_interruptible: only schedule() when a peer is ready, else
+    # sti;hlt;cli idle. Current task is ALREADY linked + STATE_WAIT from
+    # wq_wait_prepare.
+    cur: uint64 = current_idx_pcpu
+    rc: int32 = 0
+    while True:
+        spinlock_lock(&rq_lock)
+        still_waiting: uint64 = 0
+        if task_table[cur].state == STATE_WAIT:
+            still_waiting = 1
+        spinlock_unlock(&rq_lock)
+
+        if still_waiting == 0:
+            if task_table[cur].wait_signaled != 0:
+                rc = WQ_EINTR
+            break
+
+        if signal_pending(cur) != 0:
+            spinlock_lock(&rq_lock)
+            _wq_unlink_locked(wq, cur)
+            if task_table[cur].state == STATE_WAIT:
+                task_table[cur].state = STATE_RUNNING
+            spinlock_unlock(&rq_lock)
+            rc = WQ_EINTR
+            break
+
+        if _another_task_ready() != 0:
+            schedule()
+        else:
+            local_irq_enable()
+            cpu_idle_enter()
+            asm_volatile("hlt")
+            cpu_idle_leave()
+            local_irq_disable()
+
+    spinlock_lock(&rq_lock)
+    _wq_unlink_locked(wq, cur)
+    if task_table[cur].state == STATE_WAIT:
+        task_table[cur].state = STATE_RUNNING
+    spinlock_unlock(&rq_lock)
+    task_table[cur].wait_signaled = 0
+    return rc
+
+
+def wq_wake_one(wq: Ptr[WaitQueue]):
+    # Move the first waiter on `wq` (if any) from STATE_WAIT back to
+    # STATE_READY and unlink it. Safe from IRQ context. Never calls
+    # schedule().
+    spinlock_lock(&rq_lock)
+    h: uint64 = wq[0].head
+    if h != 0:
+        slot: uint64 = h - 1
+        wq[0].head = task_table[slot].wait_next
+        task_table[slot].wait_next = 0
+        task_table[slot].wait_on   = 0
+        if task_table[slot].state == STATE_WAIT:
+            task_table[slot].wait_signaled = 0
+            task_table[slot].state = STATE_READY
+    spinlock_unlock(&rq_lock)
+
+
+def wq_wake_all(wq: Ptr[WaitQueue]):
+    # Move EVERY waiter on `wq` from STATE_WAIT back to STATE_READY and
+    # empty the queue. Safe from IRQ context. Never calls schedule().
+    spinlock_lock(&rq_lock)
+    h: uint64 = wq[0].head
+    while h != 0:
+        slot: uint64 = h - 1
+        nxt: uint64 = task_table[slot].wait_next
+        task_table[slot].wait_next = 0
+        task_table[slot].wait_on   = 0
+        if task_table[slot].state == STATE_WAIT:
+            task_table[slot].wait_signaled = 0
+            task_table[slot].state = STATE_READY
+        h = nxt
+    wq[0].head = 0
+    spinlock_unlock(&rq_lock)
+
+
+# Global console-input wait queue. A task blocked in the FD_STDIN_MARK /
+# devcons_read arm sleeps here; the producers that fill the console input
+# FIFOs (UART RX IRQ, PS/2 / USB keyboard, wsys cmd injection) call
+# console_input_wake() after pushing a byte. One shared queue for all
+# console-input readers is correct: any reader can consume the next byte,
+# so wake_all (let every blocked reader re-check) is the safe semantics.
+console_wq: WaitQueue
+
+
+def console_input_wake():
+    # Producer-side wake for the console input FIFOs (stdin / /dev/cons).
+    # Called from the UART RX IRQ drain, the keyboard push path, and the
+    # wsys cmd-injection push. Safe from IRQ context (wq_wake_all takes
+    # rq_lock and never schedules). A no-op when nobody is blocked.
+    wq_wake_all(&console_wq)
+
+
+def console_wq_sleep() -> int32:
+    # Reader-side: block the current task on the console input wait queue.
+    # Returns 0 on a data-wake (re-check the FIFO), -EINTR on a signal-wake.
+    return wq_sleep_interruptible(&console_wq)
+
+
+def wq_wake_one_signal(slot: uint64):
+    # Signal-wake one specific task: if it is STATE_WAIT (blocked on some
+    # wait queue), unlink it from whatever queue it is on and set it
+    # STATE_READY with wait_signaled=1 so its wq_sleep_interruptible
+    # returns -EINTR. Called from the signal-post path. Caller MUST hold
+    # rq_lock (signal_post runs under the same discipline). No-op if the
+    # task is not currently sleeping on a queue.
+    #
+    # We don't have a back-pointer to the WaitQueue struct, so we can't
+    # walk its list to splice the node out. Instead we mark the task READY
+    # + signaled and leave the stale forward link in place: wq_sleep's
+    # post-wake _wq_unlink_locked(wq, cur) (it DOES know its wq) cleans the
+    # node out of the list before returning, and wq_wake_* tolerate a
+    # not-STATE_WAIT node (they only re-ready STATE_WAIT tasks). Clearing
+    # wait_on marks "no longer logically queued".
+    if task_table[slot].state == STATE_WAIT:
+        task_table[slot].wait_signaled = 1
+        task_table[slot].wait_on       = 0
+        task_table[slot].state         = STATE_READY
+
+
 # --- §3: signals -------------------------------------------------
 #
 # Bitmap-based signal subsystem. Every TaskStruct carries:
@@ -4534,6 +4914,14 @@ def signal_post(slot: uint64, sig: uint64):
     # stop signal to an already-STOPPED task) never reach here, so an
     # un-latched signal is correctly not counted.
     task_account_signal_at(slot)
+    # Event-driven wait: a task blocked on a resource wait queue (STATE_WAIT)
+    # must be force-woken so its wq_sleep_interruptible returns -EINTR and the
+    # blocked read aborts. Without this a SIGINT (Ctrl-C) posted to a hamsh
+    # sleeping on stdin would only be observed on the NEXT data byte. Hold
+    # rq_lock (same discipline as schedule()/wq_wake_*) across the state flip.
+    spinlock_lock(&rq_lock)
+    wq_wake_one_signal(slot)
+    spinlock_unlock(&rq_lock)
 
 
 def signal_pending(slot: uint64) -> uint64:
