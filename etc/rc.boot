@@ -35,12 +35,21 @@ echo 'rc.boot: bootstrap rc starting'
 # The kernel exposes raw devices under '#X' letter aliases. These three
 # binds give them their conventional Plan 9 path names in the ambient
 # namespace; every command hamsh later spawns inherits this table.
-#   bind '#s' /srv   — name-server directory
-#   bind '#p' /proc  — per-task introspection
-#   bind '#/' /n     — conventional mount-point parent
+#   bind '#s' /srv      — name-server directory
+#   bind '#p' /proc     — per-task introspection
+#   bind '#/' /n        — conventional mount-point parent
+#   bind '#c' /dev      — device directory server (cons/null/zero/blk)
+#   bind '#b' /dev/blk  — block-device server (nvme0n1, sd0, vda, ...)
+# The '#b' bind is a LONGER prefix than '#c', so /dev/blk/<name> routes
+# to the block server while /dev/<other> stays with the '#c' dev server
+# (longest-prefix match). This is what makes `ls /dev`, `ls /dev/blk`,
+# and `lsblk` enumerate devices through the namespace instead of a
+# kernel literal-path match.
 bind '#s' /srv
 bind '#p' /proc
 bind '#/' /n
+bind '#c' /dev
+bind '#b' /dev/blk
 echo 'rc.boot: device binds applied'
 
 # --- mount the sysroot subtree at / ---------------------------------

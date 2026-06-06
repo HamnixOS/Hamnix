@@ -120,10 +120,14 @@ from linux_abi.u_pty import (
 # (slot, mode) in fd_buf and a byte offset in fd_pos. Dispatch arms
 # below route reads/writes to blk_read_sectors/blk_write_sectors.
 from sys.src.port9.port.devblk import (
-    devblk_read, devblk_write, devblk_path_match,
+    devblk_read, devblk_write, devblk_path_match, devblk_leaf_match,
     devblk_capacity_bytes,
     FD_BLK_MARK,
 )
+# Block-device server directory walk (`#b` / /dev/blk listing). The
+# per-device byte/size/ctl streams come from devblk above; the
+# enumeration of registered device NAMES comes from blk_listdir.
+from kernel.block.blk import blk_listdir
 # Loop (file-backed block) device control surface. /dev/loop/ctl is a
 # global write-to-attach / read-to-list cdev; the loop block devices it
 # spawns appear under /dev/blk/loopN (served by devblk above). FD_LOOP_MARK
@@ -142,6 +146,7 @@ from sys.src.port9.port.devproc import (
 from sys.src.port9.port.chan import (
     chan_resolve_prefix, chan_find_srv_prefix,
     chan_resolve_union_candidate,
+    chan_dir_mount_children,
     pgrp_current,
     # Phase 6: long-form `#<word>` device names route through the
     # named-stack and by-id alias tables.
@@ -1232,7 +1237,7 @@ def vfs_open(name: Ptr[char]) -> int32:
     # at the same name. See _open_hash_alias for the per-letter routing
     # (#s, #p, #c, #/).
     if name[0] == 35:                                  # '#'
-        return _open_hash_alias(name)
+        return _open_hash_alias(name, 0)               # OREAD
     # /dev/null and /dev/zero are matched before any prefix-routed
     # FS — they're synthetic, with no on-disk backing.
     if _path_eq_const(name, "/dev/null", 9) != 0:
@@ -1502,6 +1507,172 @@ def _open_dir_srv() -> int32:
     task[0].fd_buf[fdu]    = buf
     task[0].fd_buflen[fdu] = cast[uint64](n)
     return fd
+
+
+def _open_dir_blk() -> int32:
+    # `#b` (post-bind /dev/blk) directory listing. Render the live
+    # block-device names into a kmalloc'd FD_DIR_MARK buffer so
+    # getdents64 + `ls`/`lsblk` see "nvme0n1", "nvme0n1p1", "vda", ...
+    # The names come from blk_listdir (kernel/block/blk.ad), which walks
+    # the registered blockdev table — NOT a literal string match here.
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        return EMFILE
+    buf: uint64 = kmalloc(DIR_BUF_SIZE)
+    if buf == 0:
+        return cast[int32](-12)                       # -ENOMEM
+    n: int64 = blk_listdir(cast[Ptr[uint8]](buf), DIR_BUF_SIZE)
+    if n < 0:
+        kfree(buf)
+        return ENOENT
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu]    = FD_DIR_MARK
+    task[0].fd_pos[fdu]    = 0
+    task[0].fd_buf[fdu]    = buf
+    task[0].fd_buflen[fdu] = cast[uint64](n)
+    return fd
+
+
+def _dev_dir_emit(buf: Ptr[uint8], count: uint64, out: uint64,
+                  s: Ptr[uint8]) -> uint64:
+    # Append the NUL-terminated name `s` as a "NAME\n" line into buf at
+    # offset `out`, capped at `count`. Returns the new offset. A line
+    # that would overflow the buffer is dropped (out is left unchanged).
+    nlen: uint64 = 0
+    while s[nlen] != 0:
+        nlen = nlen + 1
+    if nlen == 0:
+        return out
+    if out + nlen + 1 > count:
+        return out
+    j: uint64 = 0
+    while j < nlen:
+        buf[out + j] = s[j]
+        j = j + 1
+    buf[out + nlen] = 10                               # '\n'
+    return out + nlen + 1
+
+
+def _open_dir_dev() -> int32:
+    # `#c` (post-bind /dev) directory listing. /dev is a device server:
+    # its children are the device NODES the kernel exposes, not on-disk
+    # files. We list the block subtree (`blk`, itself a `#b`-served
+    # directory) plus the always-present synthetic stdio cdevs (cons,
+    # null, zero). The enumeration comes from this server through the
+    # `bind '#c' /dev`, NOT a literal "/dev" string-match in vfs_listdir.
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        return EMFILE
+    buf: uint64 = kmalloc(DIR_BUF_SIZE)
+    if buf == 0:
+        return cast[int32](-12)                       # -ENOMEM
+    bp: Ptr[uint8] = cast[Ptr[uint8]](buf)
+    out: uint64 = 0
+    out = _dev_dir_emit(bp, DIR_BUF_SIZE, out, "blk")
+    out = _dev_dir_emit(bp, DIR_BUF_SIZE, out, "cons")
+    out = _dev_dir_emit(bp, DIR_BUF_SIZE, out, "null")
+    out = _dev_dir_emit(bp, DIR_BUF_SIZE, out, "zero")
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu]    = FD_DIR_MARK
+    task[0].fd_pos[fdu]    = 0
+    task[0].fd_buf[fdu]    = buf
+    task[0].fd_buflen[fdu] = out
+    return fd
+
+
+def _open_dev_leaf(leaf: Ptr[char], wr: int32) -> int32:
+    # `#c/<leaf>` open (post-bind /dev/<leaf>). Forward to the per-device
+    # handlers WITHOUT re-resolving the name (which would re-rewrite
+    # /dev/<leaf> back to #c/<leaf> and loop). Covers the synthetic
+    # stdio cdevs inline, the stateful per-fd cdevs (auth/fuse/ptmx/pts/
+    # loop), and finally the namec devtab probe for the introspection
+    # cdevs (cons, time, random, mouse, cpuinfo, ...). This is what keeps
+    # `bind '#c' /dev` from shadowing the many /dev/* cdevs that vfs_open
+    # / vfs_open_write otherwise match by literal path. `wr` is 1 for an
+    # OWRITE/ORDWR open, 0 for OREAD — it only changes the namec probe
+    # mode (every other cdev opens r/w-agnostically).
+    #
+    #   blk[/...]  -> the block subtree (#b server). A bare "blk" is the
+    #                 directory; "blk/<name>..." routes to devblk.
+    if leaf[0] == 0:
+        return _open_dir_dev()
+    # blk / blk/<name>... — route to the block server.
+    if leaf[0] == 98 and leaf[1] == 108 and leaf[2] == 107:    # "blk"
+        if leaf[3] == 0:
+            return _open_dir_blk()
+        if leaf[3] == 47:                                      # "blk/<...>"
+            blp: uint64 = 0
+            blrc: int32 = devblk_leaf_match(
+                cast[Ptr[char]](cast[uint64](leaf) + 4), &blp)
+            if blrc == 1:
+                return _open_blk_marked(blp)
+            set_current_errstr("blk: no such device")
+            return ENOENT
+    # Synthetic stdio cdevs (matched inline; no namec devtab entry).
+    if _cstr_eq_dev(leaf, "null") != 0:
+        return _open_dev_marked(FD_DEVNULL_MARK)
+    if _cstr_eq_dev(leaf, "zero") != 0:
+        return _open_dev_marked(FD_DEVZERO_MARK)
+    if _cstr_eq_dev(leaf, "cons") != 0:
+        return _open_dev_marked(FD_CONS_MARK)
+    # Stateful per-fd cdevs with no namec devtab entry — these were
+    # matched by literal "/dev/<x>" path in vfs_open/vfs_open_write
+    # BEFORE the namec probe, so reach them here too (the `bind '#c'
+    # /dev` rewrites their conventional path to `#c/<x>`).
+    if _cstr_eq_dev(leaf, "auth") != 0:
+        return _open_auth_marked()
+    if _cstr_eq_dev(leaf, "fuse") != 0:
+        return _open_fuse_conn_marked()
+    if _cstr_eq_dev(leaf, "ptmx") != 0:
+        return _open_ptmx()
+    # Rebuild "/dev/<leaf>" once; reused by the /dev/pts/<N> matcher,
+    # the loop-ctl matcher, and the namec devtab probe below.
+    scratch: Array[64, uint8]
+    scratch[0] = 47                                            # '/'
+    scratch[1] = 100                                           # 'd'
+    scratch[2] = 101                                           # 'e'
+    scratch[3] = 118                                           # 'v'
+    scratch[4] = 47                                            # '/'
+    k: uint64 = 0
+    while leaf[k] != 0 and k + 6 < 64:
+        scratch[5 + k] = cast[uint8](leaf[k] & 0xFF)
+        k = k + 1
+    scratch[5 + k] = 0
+    leaf_full: Ptr[char] = cast[Ptr[char]](&scratch[0])
+    # /dev/pts/<N> — slave PTY end.
+    pts_n: int32 = _pts_path_index(leaf_full)
+    if pts_n >= -1:
+        if pts_n == -1:
+            set_current_errstr("pts: no such terminal")
+            return ENOENT
+        return _open_pts(pts_n)
+    # /dev/loop/ctl — loop-device control file.
+    if loopctl_path_match(leaf_full) == 1:
+        return _open_loop_marked()
+    # Everything else: the namec devtab probe (time / random / mouse /
+    # cpuinfo / meminfo / uptime / loadavg / version / hostname / stat /
+    # mounts / diskstats / ...).
+    chan_fd: int32 = _namec_open(leaf_full, wr)
+    if chan_fd != P9_NO_MOUNT:
+        return chan_fd
+    set_current_errstr("dev: no such device")
+    return ENOENT
+
+
+def _cstr_eq_dev(a: Ptr[char], b: Ptr[uint8]) -> int32:
+    # NUL-terminated equality for short device leaf names.
+    i: uint64 = 0
+    while True:
+        ca: int32 = a[i] & 0xFF
+        cb: int32 = cast[int32](b[i])
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+    return 0
 
 
 def _open_dir_n() -> int32:
@@ -1950,8 +2121,11 @@ def _ns_ext4_slurp_by_id(name: Ptr[char], buf_out: Ptr[uint64],
     return 1
 
 
-def _open_hash_alias(name: Ptr[char]) -> int32:
-    # V3.5: Plan 9 `#X` device-alias dispatch.
+def _open_hash_alias(name: Ptr[char], wr: int32) -> int32:
+    # V3.5: Plan 9 `#X` device-alias dispatch. `wr` is 1 for an
+    # OWRITE/ORDWR open, 0 for OREAD; threaded to `#c/<leaf>` so the
+    # namec write-mode probe (e.g. /dev/hostname write) is honoured when
+    # the open arrives through the `bind '#c' /dev` rewrite.
     #
     # Each letter routes opens to a different kernel device. Userspace
     # init (user/init.ad) does the `bind '#X' /<conventional>` calls
@@ -2036,8 +2210,36 @@ def _open_hash_alias(name: Ptr[char]) -> int32:
     # AND '#c/<leaf>' so future devcons paths (e.g. '#c/cons',
     # '#c/consctl') can land here without a routing change.
     if letter == 99:                                   # 'c'
-        if name[2] == 0 or name[2] == 47:
-            return _open_dev_marked(FD_CONS_MARK)
+        # `#c` is the conventional /dev device server. Init does
+        # `bind '#c' /dev`, so an open of /dev/<x> arrives here as
+        # `#c/<x>`. Bare `#c` is the DIRECTORY itself (`ls /dev`):
+        # enumerate the device children. `#c/<leaf>` forwards to the
+        # well-known per-device handlers via _open_dev_leaf (cons / null
+        # / zero / blk / namec cdevs) so the bind doesn't shadow them.
+        if name[2] == 0:
+            return _open_dir_dev()
+        if name[2] == 47:                              # '#c/<leaf>'
+            return _open_dev_leaf(cast[Ptr[char]](
+                cast[uint64](name) + 3), wr)
+        return ENOENT
+    # '#b' — block-device server. Init does `bind '#b' /dev/blk`, so an
+    # open of /dev/blk/<name>{,/size,/ctl} arrives here as `#b/<name>...`.
+    # Bare `#b` is the DIRECTORY (`ls /dev/blk`): enumerate the live
+    # device names via blk_listdir. `#b/<leaf>` resolves the per-device
+    # byte/size/ctl stream through devblk_leaf_match — the SAME devblk
+    # backend the literal /dev/blk/<name> path uses, just reached via the
+    # namespace bind instead of the legacy string-match.
+    if letter == 98:                                   # 'b'
+        if name[2] == 0:
+            return _open_dir_blk()
+        if name[2] == 47:                              # '#b/<leaf>'
+            blp: uint64 = 0
+            blrc: int32 = devblk_leaf_match(
+                cast[Ptr[char]](cast[uint64](name) + 3), &blp)
+            if blrc == 1:
+                return _open_blk_marked(blp)
+            set_current_errstr("blk: no such device")
+            return ENOENT
         return ENOENT
     # '#/' — root-dir slot. Synthetic empty directory; identical
     # shape to V3's `/n` (V3.5 rename: the concept is "anywhere bind
@@ -2157,7 +2359,7 @@ def vfs_open_write(name: Ptr[char]) -> int32:
         wfd: int32 = _open_hash_named_write(name)
         if wfd != P9_NO_MOUNT:
             return wfd
-        return _open_hash_alias(name)
+        return _open_hash_alias(name, 1)               # OWRITE
     if _path_eq_const(name, "/dev/null", 9) != 0:
         return _open_dev_marked(FD_DEVNULL_MARK)
     if _path_eq_const(name, "/dev/zero", 9) != 0:
@@ -2802,6 +3004,47 @@ def _listdir_hash_long(name: Ptr[char], buf: Ptr[uint8],
                                   buf, count)
 
 
+def vfs_listdir_ns(orig: Ptr[char], name: Ptr[char], buf: Ptr[uint8],
+                   count: uint64) -> int64:
+    # Plan 9 namespace-aware directory listing. `name` is the resolved
+    # path (post chan_resolve_prefix); `orig` is the conventional path
+    # the caller asked for (pre-resolution). First fill `buf` from the
+    # backing FS / device server (vfs_listdir), then — keyed on `orig`,
+    # which is the directory's name in the AMBIENT namespace — APPEND
+    # the names of any mount-table bindings whose parent is `orig`.
+    #
+    # That second step is what makes `bind '#c' /dev` / `bind '#s' /srv`
+    # show up as `dev` / `srv` in `ls /` even though no on-disk FS
+    # carries those entries: the bound name lives in the namespace
+    # (mtab), not on disk. Keying on `orig` (not the resolved `name`) is
+    # essential because `/` itself is a bind target (sysroot bound at
+    # `/`), so `name` would be `#by-id/.../sysroot` and lose the `/dev`
+    # sibling. `orig` keeps the conventional `/` that the mtab children
+    # hang off.
+    n: int64 = vfs_listdir(name, buf, count)
+    # Canonicalise `orig` (which may be relative — `ls` with no arg
+    # passes the cwd, `ls .` passes ".") to an absolute conventional
+    # directory path. This is the key the mtab children hang off; a raw
+    # `#X` request is a device-server target whose children come from
+    # the server itself and gets no synthesis.
+    if orig[0] == 35:                                  # '#'
+        return n
+    canon: Array[256, uint8]
+    if _resolve_path_canonical(orig, &canon[0], 256) != 0:
+        return n
+    base: uint64 = 0
+    if n > 0:
+        base = cast[uint64](n)
+    total: int64 = chan_dir_mount_children(&canon[0], buf,
+                                           count, base)
+    # If the backend had no listing (error/empty) AND no mount child was
+    # synthesized, propagate the backend's result so a genuinely invalid
+    # path still surfaces -EINVAL rather than an empty directory.
+    if n < 0 and total == 0:
+        return n
+    return total
+
+
 def vfs_listdir(name: Ptr[char], buf: Ptr[uint8],
                 count: uint64) -> int64:
     # Path-resolution wrapper. Routes the calling listdir to the
@@ -2854,6 +3097,25 @@ def vfs_listdir(name: Ptr[char], buf: Ptr[uint8],
             return devsrv_list(buf, count)
         if name[1] == 47 and name[2] == 0:             # '#/'
             return 0
+        # `#b` (post-bind /dev/blk) — list the live block-device names
+        # straight from the kernel's blockdev table. This is what makes
+        # `ls /dev/blk` and lsblk's sys_listdir("/dev/blk") enumerate
+        # the devices through the namespace bind, not a literal match.
+        if name[1] == 98 and name[2] == 0:             # '#b'
+            return blk_listdir(buf, count)
+        # `#c` (post-bind /dev) — list the device server's children
+        # (blk + the synthetic stdio cdevs). `_dev_listdir` mirrors
+        # _open_dir_dev's child set so `ls /dev` and getdents agree.
+        if name[1] == 99 and name[2] == 0:             # '#c'
+            return _dev_listdir(buf, count)
+        # `#c/<leaf>` listdir — only `blk` is itself a directory; route
+        # it to the block server. (Other leaves are non-directory cdevs.)
+        if name[1] == 99 and name[2] == 47:            # '#c/<leaf>'
+            sub: Ptr[char] = cast[Ptr[char]](cast[uint64](name) + 3)
+            if sub[0] == 98 and sub[1] == 108 and sub[2] == 107 \
+                    and sub[3] == 0:                   # "blk"
+                return blk_listdir(buf, count)
+            return cast[int64](EINVAL)
         # Long-form named-root aliases: `#by-id/<uuid>/sysroot/bin`
         # (the frozen `bind '#sysroot' /` form) and bare `#<word>/...`
         # both list the partition directory they alias. Mirrors
@@ -2869,6 +3131,19 @@ def vfs_listdir(name: Ptr[char], buf: Ptr[uint8],
 
 
 _empty_str: Array[1, uint8]
+
+
+def _dev_listdir(buf: Ptr[uint8], count: uint64) -> int64:
+    # Directory walk for the /dev device server (`#c`). Emits the same
+    # child set _open_dir_dev installs into its FD_DIR_MARK buffer, so a
+    # getdents-based `ls /dev` and a sys_listdir("/dev") agree: the block
+    # subtree plus the synthetic stdio cdevs.
+    out: uint64 = 0
+    out = _dev_dir_emit(buf, count, out, "blk")
+    out = _dev_dir_emit(buf, count, out, "cons")
+    out = _dev_dir_emit(buf, count, out, "null")
+    out = _dev_dir_emit(buf, count, out, "zero")
+    return cast[int64](out)
 
 
 ENAMETOOLONG: int32 = -36
