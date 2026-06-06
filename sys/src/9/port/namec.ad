@@ -278,8 +278,32 @@ DEV_AUDIOIN:   int32 = 47          # /dev/audioin
 # regular devtab cdevs.
 DEV_NULL:      int32 = 48          # /dev/null
 DEV_ZERO:      int32 = 49          # /dev/zero
+# fd→Chan unification: on-disk regular-file fds. UNLIKE the cdevs above
+# these are POOL chans (the inline tag is CLEAR), exactly like DEV_MNT —
+# each carries a per-open backing-table slot id in ChanT.back_slot:
+#   * DEV_EXT4_FILE — back_slot is an ext4 open-file slot (ext4_open /
+#     ext4_open_create_or_trunc). Read -> ext4_read_file(inum,...);
+#     write -> ext4_write_open_file(slot,...); close -> ext4_close(slot).
+#     One dev_type covers BOTH read and write opens — the ext4 slot table
+#     is mode-agnostic (a slot is just an inum snapshot).
+#   * DEV_FAT_FILE — back_slot is the RAW FAT fd_buf word: a read open-
+#     file slot, OR (write-mode) the write-slot index with the
+#     FAT_FD_WRITE_BIT (0x80000000) set. fat_close routes either flavour;
+#     namec_read/namec_write peel the bit to pick the read vs write body.
+# These replace the legacy FD_EXT4_MARK / FD_FAT_MARK per-task-array
+# marks: the on-disk file fd is now a unified FD_CHAN_MARK fd whose
+# release happens in namec_close, so a task that exits holding one no
+# longer leaks its fs slot (the whole point of the fold).
+DEV_EXT4_FILE: int32 = 50          # on-disk ext4 regular file (pool)
+DEV_FAT_FILE:  int32 = 51          # on-disk FAT regular file (pool)
 
-DEV_MAX:       int32 = 50
+DEV_MAX:       int32 = 52
+
+# The FAT write-mode bit as carried in a DEV_FAT_FILE chan's back_slot
+# (a copy of fs/vfs.ad's FAT_FD_WRITE_BIT / fs/fat.ad's
+# FAT_WRITE_SLOT_BIT). A back_slot with this bit set is a write-mode FAT
+# fd; namec masks it off to recover the write-slot index.
+FAT_CHAN_WRITE_BIT: int32 = -2147483648    # 0x80000000 as int32
 
 
 # --- Chan: the universal handle -------------------------------------
@@ -487,10 +511,14 @@ def _chan_id_valid(cid: int32) -> int32:
     # NOTE: DEV_MNT (36) is NOT an inline cdev — it is the sentinel for
     # pool-backed mounted-9P chans. Inline cdevs span DEV_NONE+1..DEV_MNT-1
     # (the original devtab) PLUS DEV_MNT+1..DEV_MAX-1 (the VT family and
-    # any future additions above DEV_MNT). DEV_MNT itself is excluded.
+    # any future additions above DEV_MNT). DEV_MNT itself is excluded —
+    # so are DEV_EXT4_FILE / DEV_FAT_FILE, which (like DEV_MNT) are
+    # POOL-only dev_types: an inline-tagged id never legitimately carries
+    # them.
     if _chan_id_is_inline(cid) != 0:
         dt: int32 = _chan_id_inline_dev(cid)
-        if dt > DEV_NONE and dt < DEV_MAX and dt != DEV_MNT:
+        if dt > DEV_NONE and dt < DEV_MAX and dt != DEV_MNT \
+                and dt != DEV_EXT4_FILE and dt != DEV_FAT_FILE:
             return 1
         return 0
     return _chan_pool_valid(cid)
@@ -1119,6 +1147,83 @@ def _mnt_write(slot: uint64, off: uint64, buf: Ptr[uint8],
                      off, buf, cast[uint32](count))
 
 
+# --- on-disk regular files: DEV_EXT4_FILE / DEV_FAT_FILE ------------
+#
+# The fd→Chan fold for ext4/FAT file fds. Each is a POOL chan (like
+# DEV_MNT) carrying its fs open-file slot in back_slot. The fd layer's
+# open helper (fs/vfs.ad::_open_ext4_read / _open_fat_read and the
+# write-open arms) calls one of the namec_open_* allocators below,
+# stashes the returned slot id in an FD_CHAN_MARK fd, and read/write/
+# close all funnel through namec_read/namec_write/namec_close on
+# dev_type — exactly the DEV_MNT shape. The byte offset is the caller's
+# fd_pos (NOT stored in the Chan), same as the mountrpc leg.
+#
+# ext4_open / ext4_read_file / ext4_open_inum / ext4_write_open_file /
+# ext4_close and the fat_* siblings are resolved BY NAME (the whole-
+# kernel Adder merge links them). namec must not `import fs.ext4` /
+# `fs.fat` — that would form a namec -> fs -> ... -> namec import cycle
+# — so we call them directly, the same by-name pattern core.ad uses for
+# namec_close itself.
+
+def namec_open_ext4_file(slot: int32) -> int32:
+    # Wrap an already-opened ext4 open-file slot in a DEV_EXT4_FILE pool
+    # chan. Returns the chan id (a pool slot index), or -1 if the pool is
+    # exhausted (caller then ext4_close(slot) to avoid leaking it).
+    cs: int32 = _chan_alloc()
+    if cs < 0:
+        return -1
+    su: uint64 = cast[uint64](cs)
+    chan_pool[su].in_use    = 1
+    chan_pool[su].dev_type  = DEV_EXT4_FILE
+    chan_pool[su].mode      = 0
+    chan_pool[su].back_slot = slot
+    return cs
+
+
+def namec_open_fat_file(slot: int32) -> int32:
+    # Wrap a FAT fd_buf word (read open-file slot, or write-slot index
+    # with FAT_CHAN_WRITE_BIT set) in a DEV_FAT_FILE pool chan. Returns
+    # the chan id, or -1 on pool exhaustion.
+    cs: int32 = _chan_alloc()
+    if cs < 0:
+        return -1
+    su: uint64 = cast[uint64](cs)
+    chan_pool[su].in_use    = 1
+    chan_pool[su].dev_type  = DEV_FAT_FILE
+    chan_pool[su].mode      = 0
+    chan_pool[su].back_slot = slot
+    return cs
+
+
+def _ext4file_read(slot: uint64, off: uint64, buf: Ptr[uint8],
+                   count: uint64) -> int64:
+    inum: uint32 = ext4_open_inum(chan_pool[slot].back_slot)
+    return ext4_read_file(inum, off, count, buf)
+
+
+def _ext4file_write(slot: uint64, off: uint64, buf: Ptr[uint8],
+                    count: uint64) -> int64:
+    return ext4_write_open_file(chan_pool[slot].back_slot, buf, off, count)
+
+
+def _fatfile_read(slot: uint64, off: uint64, buf: Ptr[uint8],
+                  count: uint64) -> int64:
+    bs: int32 = chan_pool[slot].back_slot
+    if (bs & FAT_CHAN_WRITE_BIT) != 0:
+        return -22                                          # -EINVAL: write fd
+    first: uint64 = fat_open_first_cluster(bs)
+    size:  uint64 = fat_open_size(bs)
+    return fat_read(first, size, off, count, buf)
+
+
+def _fatfile_write(slot: uint64, off: uint64, buf: Ptr[uint8],
+                   count: uint64) -> int64:
+    bs: int32 = chan_pool[slot].back_slot
+    if (bs & FAT_CHAN_WRITE_BIT) == 0:
+        return -30                                          # -EROFS: read fd
+    return fat_write_slot(bs & 0x7FFFFFFF, buf, off, count)
+
+
 # --- namec(): the universal open path -------------------------------
 #
 # Resolve `path` to a Chan. Probe order mirrors Plan 9's namec walk:
@@ -1330,6 +1435,10 @@ def namec_read(cid: int32, off: uint64, buf: Ptr[uint8],
     su: uint64 = cast[uint64](cid)
     if chan_pool[su].dev_type == DEV_MNT:
         return _mnt_read(su, off, buf, count)
+    if chan_pool[su].dev_type == DEV_EXT4_FILE:
+        return _ext4file_read(su, off, buf, count)
+    if chan_pool[su].dev_type == DEV_FAT_FILE:
+        return _fatfile_read(su, off, buf, count)
     return _devtab_read(chan_pool[su].dev_type, 0, 0, off, buf, count)
 
 
@@ -1366,6 +1475,10 @@ def namec_write(cid: int32, off: uint64, buf: Ptr[uint8],
     su: uint64 = cast[uint64](cid)
     if chan_pool[su].dev_type == DEV_MNT:
         return _mnt_write(su, off, buf, count)
+    if chan_pool[su].dev_type == DEV_EXT4_FILE:
+        return _ext4file_write(su, off, buf, count)
+    if chan_pool[su].dev_type == DEV_FAT_FILE:
+        return _fatfile_write(su, off, buf, count)
     return _devtab_write(chan_pool[su].dev_type, 0, 0, off, buf, count)
 
 
@@ -1394,6 +1507,16 @@ def namec_close(cid: int32) -> int32:
     # Last reference — run the per-dev_type backing release, then free.
     if chan_pool[su].dev_type == DEV_MNT:
         p9c_clunk(chan_pool[su].srvfd, chan_pool[su].p9_fid)
+    elif chan_pool[su].dev_type == DEV_EXT4_FILE:
+        # Release the ext4 open-file slot. ext4_close clears the slot's
+        # `used` flag; the inum/size snapshot is recycled with it.
+        ext4_close(chan_pool[su].back_slot)
+    elif chan_pool[su].dev_type == DEV_FAT_FILE:
+        # Release the FAT slot. fat_close peels FAT_WRITE_SLOT_BIT and
+        # routes a write-mode word to the write-slot table, a read word
+        # to the read open-file table — so the RAW back_slot word is
+        # exactly what it expects.
+        fat_close(chan_pool[su].back_slot)
     _chan_free(cid)
     return 0
 
