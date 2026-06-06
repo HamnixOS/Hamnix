@@ -63,10 +63,18 @@ new design but must pass for real).
   **`vfs_open` now has exactly ONE resolution path — zero literal
   special-cases.** (`#e` env-as-files is still absent — a small future
   add, not a bypass; tracked separately if pursued.)
-- [ ] **Phase 3 — real `mount()`** (#389). No `sys_mount`/`vfs_mount`
-  exists today; ~53 `is_*_path` predicate branches dispatch filesystems.
-  Add a mountable-FS-server interface so ext4/fat/tmpfs/cpio attach at
-  namespace points; delete the `is_*_path` ladder.
+- [x] **Phase 3 — real `mount()`** (#389, COMPLETE, `a563d31b`). New
+  `fs/vfs_mount.ad` holds a real VFS mount table (`vfs_mount`/`vfs_umount`
+  + longest-prefix `_mount_lookup_slot`); `/`=cpio, `/tmp`=tmpfs,
+  `/var`=tmpfs(shadow), `/mnt`=FAT, `/ext`=ext4 register at init. The ~70
+  `is_*_path` backend-SELECTION branches across `vfs_open`/`open_write`/
+  `listdir`/`stat`/`unlink`/`rmdir`/`mkdir`/`rename`/`symlink`/`link`/
+  `truncate`/`chmod`/`set_mtime`/`resolve_backing` are gone — replaced by
+  three primitives: `vfs_fs_kind(path)` (→ backend id), `vfs_fs_rel(path)`
+  (backend-relative tail), `vfs_fs_shadow(path)` (the /var tmpfs-first /
+  cpio-fallthrough rule). Worktree grep of backend-selection predicates =
+  0. Verified green: `test_dev/net/proc_namespace.sh` + installer Stage B
+  (ext4 magic `0xEF53` on NVMe through the mount table).
 - [ ] **Phase 4 — unify fds on `Chan`** (#390). Retire the ~24
   collision-prone `FD_*_MARK` magic-integer ranges; every fd becomes a
   `Chan` pointer through the `namec` devtab.
