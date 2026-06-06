@@ -2449,14 +2449,23 @@ def vfs_open_write(name: Ptr[char]) -> int32:
             return slot
         if ino_existed < 0:
             _vfs_inotify_notify(name, IN_CREATE)
+        # fd→Chan fold: a write-mode tmpfs fd shares the DEV_TMPFS_FILE
+        # pool-chan path with the read fd (a tmpfs slot is mode-agnostic).
+        # namec_write routes to tmpfs_write; namec_close frees no slot for
+        # a named file (only anon memfd slots are reclaimed there).
+        t_cid: int32 = namec_open_tmpfs_file(slot)
+        if t_cid < 0:
+            return EMFILE
         task: Ptr[TaskStruct] = current_task()
         fd: int32 = _alloc_fd(task)
         if fd < 0:
+            namec_close(t_cid)
             return EMFILE
         fdu: uint64 = cast[uint64](fd)
-        task[0].fd_idx[fdu] = FD_TMPFS_MARK
+        task[0].fd_idx[fdu] = FD_CHAN_MARK
         task[0].fd_pos[fdu] = 0
-        task[0].fd_buf[fdu] = cast[uint64](slot)
+        task[0].fd_buf[fdu] = cast[uint64](cast[uint32](t_cid))
+        task[0].fd_buflen[fdu] = 0
         return fd
     if vfs_fs_kind(name) == FS_KIND_EXT4:
         # Subdir-aware (post-M16.x): ext4_open_create_or_trunc splits
@@ -2784,8 +2793,9 @@ def vfs_fsync(fd: int32) -> int32:
     # write returns. fsync's remaining job is the device-cache
     # barrier — ext4_fsync issues blk_flush on the mounted device.
     #
-    #   FD_EXT4_MARK  →  ext4_fsync (real device barrier)
-    #   FD_TMPFS_MARK →  0 (tmpfs is RAM-backed; nothing to flush)
+    #   DEV_EXT4_FILE chan  →  ext4_fsync (real device barrier)
+    #   DEV_TMPFS_FILE chan →  0 (tmpfs is RAM-backed; nothing to flush —
+    #                            falls through the ext4 check to return 0)
     #   other fds     →  0 (pipes/sockets/devnull have no durable
     #                       backing — fsync is a successful no-op,
     #                       which is what Linux returns for them too)
@@ -2838,7 +2848,8 @@ def vfs_ftruncate(fd: int32, length: uint64) -> int32:
     # namec_chan_back_slot, then truncate exactly as the legacy
     # FD_EXT4_MARK arm did.
     if file_idx == FD_CHAN_MARK:
-        if namec_chan_dev_type(_fd_chan_id(task, fdu)) == DEV_EXT4_FILE:
+        ch_dt: int32 = namec_chan_dev_type(_fd_chan_id(task, fdu))
+        if ch_dt == DEV_EXT4_FILE:
             eslot: int32 = namec_chan_back_slot(_fd_chan_id(task, fdu))
             inum: uint32 = ext4_open_inum(eslot)
             if inum == 0:
@@ -2848,14 +2859,14 @@ def vfs_ftruncate(fd: int32, length: uint64) -> int32:
             # Keep the cached open-file size coherent for read-back.
             ext4_set_open_size(eslot, length)
             return 0
+        if ch_dt == DEV_TMPFS_FILE:
+            # §memfd: ftruncate on a tmpfs / memfd file. Recover the tmpfs
+            # slot through the chan; tmpfs_ftruncate enforces F_SEAL_SHRINK
+            # / GROW / WRITE and resizes. It returns 0 or a negative tmpfs
+            # errno (-EPERM / -EINVAL) which is already the Linux value.
+            tslot: int32 = namec_chan_back_slot(_fd_chan_id(task, fdu))
+            return tmpfs_ftruncate(tslot, length)
         return EINVAL
-    if file_idx == FD_TMPFS_MARK:
-        # §memfd: ftruncate on a tmpfs / memfd file. fd_buf holds the
-        # tmpfs slot; tmpfs_ftruncate enforces F_SEAL_SHRINK / GROW /
-        # WRITE and resizes. It returns 0 or a negative tmpfs errno
-        # (-EPERM / -EINVAL) which is already the Linux errno value.
-        tslot: int32 = cast[int32](task[0].fd_buf[fdu])
-        return tmpfs_ftruncate(tslot, length)
     return EINVAL
 
 
@@ -4077,27 +4088,30 @@ def vfs_fd_backing_info(fd: int32, out_marker: Ptr[uint32],
         out_backing[0] = cast[uint64](fi)
         out_size[0]    = initramfs_entry_size(cast[uint64](fi))
         return 0
-    if fi == FD_TMPFS_MARK:
-        slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        out_marker[0]  = FD_TMPFS_MARK
-        out_backing[0] = cast[uint64](cast[uint32](slot))
-        out_size[0]    = tmpfs_size(slot)
-        return 0
-    # fd→Chan fold: an ext4 file fd is an FD_CHAN_MARK fd backed by a
-    # DEV_EXT4_FILE pool chan. file-backed mmap still resolves the STABLE
-    # inum (not the recyclable slot) so the #PF / writeback path keeps
-    # working after the fd closes — recover the ext4 slot through
-    # namec_chan_back_slot, then snapshot inum/size. The backing marker
-    # stays FD_EXT4_MARK: vfs_pread_backing / vfs_pwrite_backing key on
-    # it (an inum-addressed read/write, no fd / chan needed). FAT files
-    # are not mmap-backed, so there is no DEV_FAT_FILE arm here.
+    # fd→Chan fold: ext4 and tmpfs file fds are now FD_CHAN_MARK fds
+    # backed by a DEV_EXT4_FILE / DEV_TMPFS_FILE pool chan. file-backed
+    # mmap resolves a STABLE backing identity so the #PF / writeback path
+    # keeps working after the fd closes:
+    #   * ext4 → the STABLE inum (not the recyclable slot); backing marker
+    #     FD_EXT4_MARK so vfs_pread/pwrite_backing do an inum-addressed I/O.
+    #   * tmpfs → the tmpfs slot IS the backing handle (no inum equivalent;
+    #     this matches the legacy FD_TMPFS_MARK behaviour, which mmap'd the
+    #     slot directly); backing marker FD_TMPFS_MARK.
+    # FAT files are not mmap-backed, so there is no DEV_FAT_FILE arm here.
     if fi == FD_CHAN_MARK:
-        if namec_chan_dev_type(_fd_chan_id(task, fdu)) == DEV_EXT4_FILE:
+        chdt: int32 = namec_chan_dev_type(_fd_chan_id(task, fdu))
+        if chdt == DEV_EXT4_FILE:
             slot: int32 = namec_chan_back_slot(_fd_chan_id(task, fdu))
             inum: uint32 = ext4_open_inum(slot)
             out_marker[0]  = FD_EXT4_MARK
             out_backing[0] = cast[uint64](inum)
             out_size[0]    = ext4_open_size(slot)
+            return 0
+        if chdt == DEV_TMPFS_FILE:
+            tslot: int32 = namec_chan_back_slot(_fd_chan_id(task, fdu))
+            out_marker[0]  = FD_TMPFS_MARK
+            out_backing[0] = cast[uint64](cast[uint32](tslot))
+            out_size[0]    = tmpfs_size(tslot)
             return 0
         return cast[int32](ENODEV)
     if fi == FD_BUFFER_MARK:
@@ -4111,10 +4125,11 @@ def vfs_fd_backing_info(fd: int32, out_marker: Ptr[uint32],
 
 # Stable backing-FS kind of an open fd, for fstatfs(2). Returns:
 #   0 = ext4, 1 = tmpfs, 2 = FAT, 3 = ramfs/cpio (default).
-# fd→Chan fold: ext4/FAT file fds are now FD_CHAN_MARK fds whose backing
-# kind lives in the pool chan's dev_type (DEV_EXT4_FILE / DEV_FAT_FILE),
-# NOT in fd_idx. The Layer-2 statfs shim can't read dev_type without
-# importing namec, so it asks here. tmpfs keeps its own FD_TMPFS_MARK.
+# fd→Chan fold: ext4/FAT/tmpfs file fds are now FD_CHAN_MARK fds whose
+# backing kind lives in the pool chan's dev_type (DEV_EXT4_FILE /
+# DEV_FAT_FILE / DEV_TMPFS_FILE), NOT in fd_idx. The Layer-2 statfs shim
+# can't read dev_type without importing namec, so it asks here. tmpfs
+# reports as ramfs (kind 1) — the legacy FD_TMPFS_MARK path returned 1.
 def vfs_fd_statfs_kind(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
@@ -4122,12 +4137,12 @@ def vfs_fd_statfs_kind(fd: int32) -> int32:
     task: Ptr[TaskStruct] = current_task()
     fdu: uint64 = cast[uint64](fd)
     fi: uint32 = task[0].fd_idx[fdu]
-    if fi == FD_TMPFS_MARK:
-        return 1
     if fi == FD_CHAN_MARK:
         dt: int32 = namec_chan_dev_type(_fd_chan_id(task, fdu))
         if dt == DEV_EXT4_FILE:
             return 0
+        if dt == DEV_TMPFS_FILE:
+            return 1
         if dt == DEV_FAT_FILE:
             return 2
         return 3
@@ -4291,14 +4306,25 @@ def _open_tmpfs_read(name: Ptr[char]) -> int32:
     slot: int32 = tmpfs_lookup(cur)
     if slot < 0:
         return ENOENT
+    # fd→Chan fold: a tmpfs file read fd is now a unified FD_CHAN_MARK fd
+    # backed by a DEV_TMPFS_FILE pool chan (namec_open_tmpfs_file). The
+    # tmpfs entry slot rides in the chan's back_slot; read/write/lseek/
+    # close all dispatch through namec_read/write/close on dev_type. A
+    # named /tmp,/var slot persists by path — namec_close frees no slot
+    # (only anon memfd slots are reclaimed there).
+    cid: int32 = namec_open_tmpfs_file(slot)
+    if cid < 0:
+        return EMFILE
     task: Ptr[TaskStruct] = current_task()
     fd: int32 = _alloc_fd(task)
     if fd < 0:
+        namec_close(cid)
         return EMFILE
     fdu: uint64 = cast[uint64](fd)
-    task[0].fd_idx[fdu] = FD_TMPFS_MARK
+    task[0].fd_idx[fdu] = FD_CHAN_MARK
     task[0].fd_pos[fdu] = 0
-    task[0].fd_buf[fdu] = cast[uint64](slot)
+    task[0].fd_buf[fdu] = cast[uint64](cast[uint32](cid))
+    task[0].fd_buflen[fdu] = 0
     return fd
 
 
@@ -4312,30 +4338,51 @@ def vfs_open_memfd(name: Ptr[char], allow_sealing: int32) -> int32:
     slot: int32 = tmpfs_create_anon(name, allow_sealing)
     if slot < 0:
         return slot                                   # -ENOSPC from tmpfs
+    # fd→Chan fold: a memfd shares the DEV_TMPFS_FILE pool-chan path with
+    # named tmpfs files (the tmpfs slot is mode-/origin-agnostic). The
+    # seal state (F_SEAL_*) lives on the slot; vfs_fd_tmpfs_slot recovers
+    # it through the chan's back_slot. namec_close sees tmpfs_is_anon!=0
+    # on last ref and reclaims the anon slot — so a dup'd / forked memfd
+    # is refcounted correctly and only the final close frees it.
+    cid: int32 = namec_open_tmpfs_file(slot)
+    if cid < 0:
+        tmpfs_release_anon(slot)
+        return EMFILE
     task: Ptr[TaskStruct] = current_task()
     fd: int32 = _alloc_fd(task)
     if fd < 0:
-        tmpfs_release_anon(slot)
+        namec_close(cid)
         return EMFILE
     fdu: uint64 = cast[uint64](fd)
-    task[0].fd_idx[fdu] = FD_TMPFS_MARK
+    task[0].fd_idx[fdu] = FD_CHAN_MARK
     task[0].fd_pos[fdu] = 0
-    task[0].fd_buf[fdu] = cast[uint64](slot)
+    task[0].fd_buf[fdu] = cast[uint64](cast[uint32](cid))
+    task[0].fd_buflen[fdu] = 0
     return fd
 
 
 def vfs_fd_tmpfs_slot(fd: int32) -> int32:
-    # §memfd: return the tmpfs slot index backing an FD_TMPFS_MARK fd, or
-    # -1 if `fd` is not a tmpfs/memfd fd. The fcntl(F_ADD_SEALS /
-    # F_GET_SEALS) shim uses this to reach the slot's seal state.
+    # §memfd: return the tmpfs slot index backing a tmpfs/memfd fd, or
+    # -1 if `fd` is not one. The fcntl(F_ADD_SEALS / F_GET_SEALS) shim
+    # uses this to reach the slot's seal state.
+    #
+    # fd→Chan fold: a tmpfs fd is now an FD_CHAN_MARK fd whose chan is a
+    # DEV_TMPFS_FILE pool chan. The slot no longer lives in fd_buf (that
+    # holds the opaque chan id) — recover it through the chan: confirm
+    # the fd is FD_CHAN_MARK AND its dev_type is DEV_TMPFS_FILE, then
+    # return namec_chan_back_slot(cid), which IS the tmpfs entry slot the
+    # seal state hangs off. Getting this wrong silently breaks F_SEAL_*.
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return -1
     task: Ptr[TaskStruct] = current_task()
     fdu: uint64 = cast[uint64](fd)
-    if task[0].fd_idx[fdu] != FD_TMPFS_MARK:
+    if task[0].fd_idx[fdu] != FD_CHAN_MARK:
         return -1
-    return cast[int32](task[0].fd_buf[fdu])
+    cid: int32 = _fd_chan_id(task, fdu)
+    if namec_chan_dev_type(cid) != DEV_TMPFS_FILE:
+        return -1
+    return namec_chan_back_slot(cid)
 
 
 def _open_auth_marked() -> int32:
@@ -5396,20 +5443,10 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # Linux returns EISDIR for read(2) on a directory fd. Callers
         # are expected to use getdents64() instead.
         return cast[int64](EISDIR)
-    if file_idx == FD_TMPFS_MARK:
-        # tmpfs read — fd_buf holds the tmpfs slot index; size moves
-        # under us if someone is writing in parallel, but at this
-        # scale (uniprocessor, no preempt during fs ops) we just
-        # snapshot the current size at each read. tmpfs_read walks the
-        # per-file chunk chain, so a single read straddling chunk
-        # boundaries (now 64 KiB each) is handled inside tmpfs.
-        slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        pos:  uint64 = task[0].fd_pos[fdu]
-        n:    uint64 = tmpfs_read(slot, buf, pos, count)
-        if n == 0:
-            return 0
-        task[0].fd_pos[fdu] = pos + n
-        return cast[int64](n)
+    # fd→Chan fold: the legacy FD_TMPFS_MARK read arm is GONE. A tmpfs /
+    # memfd read fd is now an FD_CHAN_MARK fd (DEV_TMPFS_FILE pool chan);
+    # the FD_CHAN_MARK arm at the head of vfs_read dispatches it through
+    # namec_read into _tmpfsfile_read.
     if file_idx == FD_EVENTFD_MARK:
         # §5: a blocking read(2) on an eventfd. The 8-byte counter is
         # returned (and reset, or decremented in semaphore mode) once it
@@ -5567,6 +5604,15 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         nc: int64 = namec_write(chan_id, coff, buf, count)
         if nc > 0:
             task[0].fd_pos[fdu] = coff + cast[uint64](nc)
+            # #155: a tmpfs write is an inotify IN_MODIFY on the file's
+            # parent directory. This hook moved here from the retired
+            # FD_TMPFS_MARK write arm — tmpfs_slot_name recovers the full
+            # absolute path from the chan's tmpfs back_slot.
+            if namec_chan_dev_type(chan_id) == DEV_TMPFS_FILE:
+                _vfs_inotify_notify(
+                    cast[Ptr[char]](tmpfs_slot_name(
+                        namec_chan_back_slot(chan_id))),
+                    IN_MODIFY)
         return nc
     if file_idx == FD_P9_MARK:
         # V1 legacy 9P write path — non-regressing fallback for any
@@ -5795,17 +5841,12 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     if file_idx == FD_DIR_MARK:
         # write(2) on a directory fd is EISDIR in Linux.
         return cast[int64](EISDIR)
-    if file_idx == FD_TMPFS_MARK:
-        slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        pos:  uint64 = task[0].fd_pos[fdu]
-        n: uint64 = tmpfs_write(slot, buf, pos, count)
-        task[0].fd_pos[fdu] = pos + n
-        # #155: a tmpfs write is an inotify IN_MODIFY on the file's parent
-        # directory. tmpfs_slot_name recovers the full absolute path.
-        if n != 0:
-            _vfs_inotify_notify(cast[Ptr[char]](tmpfs_slot_name(slot)),
-                                IN_MODIFY)
-        return cast[int64](n)
+    # fd→Chan fold: the legacy FD_TMPFS_MARK write arm is GONE. A tmpfs /
+    # memfd write fd is now an FD_CHAN_MARK fd (DEV_TMPFS_FILE pool chan)
+    # dispatched through the FD_CHAN_MARK arm at the head of vfs_write into
+    # namec_write -> _tmpfsfile_write. The #155 inotify IN_MODIFY post that
+    # used to live here moved INTO that FD_CHAN_MARK head (it owns
+    # _vfs_inotify_notify / tmpfs_slot_name, which namec must not import).
     # fd→Chan fold: the legacy FD_FAT_MARK / FD_EXT4_MARK write arms are
     # GONE. A write-mode FAT / ext4 file fd is now an FD_CHAN_MARK fd
     # (DEV_FAT_FILE / DEV_EXT4_FILE pool chan); the FD_CHAN_MARK arm at
@@ -6116,23 +6157,22 @@ def vfs_close(fd: int32) -> int32:
     if file_idx == FD_INOTIFY_MARK:
         uino_release(cast[int32](task[0].fd_buf[fdu]) - 1)
     # #155: closing a tmpfs fd posts an inotify IN_CLOSE_WRITE on its
-    # parent directory. tmpfs read/write fds share FD_TMPFS_MARK, so this
-    # fires for both; an inotify watcher filters by its requested mask, so
-    # a watcher uninterested in IN_CLOSE_WRITE never sees it.
-    if file_idx == FD_TMPFS_MARK:
-        _vfs_inotify_notify(
-            cast[Ptr[char]](tmpfs_slot_name(cast[int32](task[0].fd_buf[fdu]))),
-            IN_CLOSE_WRITE)
-        # §memfd: an anonymous memfd file is reachable only through its
-        # open fds (no path). Closing the last fd must reclaim the slot.
-        # Named /tmp,/var tmpfs files persist by path, so only anon slots
-        # are released here. (A dup'd memfd shares the slot; like the
-        # Layer-2 epoll/eventfd arms above, release-on-first-close is the
-        # accepted scope — Linux memfd users under test do not dup. A
-        # slot refcount is the V2 hardening.)
-        memfd_slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        if tmpfs_is_anon(memfd_slot) != 0:
-            tmpfs_release_anon(memfd_slot)
+    # parent directory. fd→Chan fold: a tmpfs fd is now an FD_CHAN_MARK
+    # fd whose chan is DEV_TMPFS_FILE, so key on the chan's dev_type and
+    # recover the path from its tmpfs back_slot. This fires PER CLOSE
+    # (matching the legacy FD_TMPFS_MARK behaviour) and must run BEFORE
+    # close_fd_in_task → namec_close, which may free the slot (so
+    # tmpfs_slot_name would no longer resolve). The §memfd anon-slot
+    # reclaim MOVED into namec_close's DEV_TMPFS_FILE arm: it now fires
+    # only on the LAST reference (tmpfs_is_anon), fixing the old
+    # release-on-first-close UAF for a dup'd / forked memfd.
+    if file_idx == FD_CHAN_MARK:
+        tc_cid: int32 = _fd_chan_id(task, fdu)
+        if namec_chan_dev_type(tc_cid) == DEV_TMPFS_FILE:
+            _vfs_inotify_notify(
+                cast[Ptr[char]](tmpfs_slot_name(
+                    namec_chan_back_slot(tc_cid))),
+                IN_CLOSE_WRITE)
     # /proc/<pid>/<file> fds carry no per-fd backing — devproc_close
     # is a no-op success today (kept as a hook so future per-fd
     # snapshot support can land without re-plumbing the close path).
@@ -6212,25 +6252,9 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
         # errstr "no seek on /proc"; we don't have ESPIPE wired up
         # yet so EINVAL is the closest fit).
         return cast[int64](EINVAL)
-    if file_idx == FD_TMPFS_MARK:
-        slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        size: uint64 = tmpfs_size(slot)
-        new_pos: int64 = 0
-        if whence == SEEK_SET:
-            new_pos = offset
-        elif whence == SEEK_CUR:
-            new_pos = cast[int64](task[0].fd_pos[fdu]) + offset
-        elif whence == SEEK_END:
-            new_pos = cast[int64](size) + offset
-        else:
-            return cast[int64](EINVAL)
-        if new_pos < 0:
-            return cast[int64](EINVAL)
-        task[0].fd_pos[fdu] = cast[uint64](new_pos)
-        return new_pos
-    # fd→Chan fold: the FD_FAT_MARK / FD_EXT4_MARK lseek arms are GONE.
-    # A FAT / ext4 file fd is an FD_CHAN_MARK fd and seeks through the
-    # arm below.
+    # fd→Chan fold: the FD_TMPFS_MARK / FD_FAT_MARK / FD_EXT4_MARK lseek
+    # arms are GONE. A tmpfs / FAT / ext4 file fd is an FD_CHAN_MARK fd
+    # and seeks through the arm below.
     if file_idx == FD_P9_MARK or file_idx == FD_CHAN_MARK:
         # 9P / namec-Chan seek. SEEK_SET / SEEK_CUR just adjust fd_pos
         # — a subsequent vfs_read passes the new offset through to the
@@ -6255,9 +6279,17 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
             if file_idx != FD_CHAN_MARK:
                 return cast[int64](EINVAL)
             ch_dt: int32 = namec_chan_dev_type(_fd_chan_id(task, fdu))
-            if ch_dt != DEV_EXT4_FILE and ch_dt != DEV_FAT_FILE:
+            if ch_dt == DEV_TMPFS_FILE:
+                # tmpfs read/write fds carry no cached fd_buflen size (a
+                # tmpfs file grows under in-place writes); snapshot the
+                # live size through the chan's tmpfs back_slot instead.
+                tsz: uint64 = tmpfs_size(namec_chan_back_slot(
+                                            _fd_chan_id(task, fdu)))
+                new_pos = cast[int64](tsz) + offset
+            elif ch_dt == DEV_EXT4_FILE or ch_dt == DEV_FAT_FILE:
+                new_pos = cast[int64](task[0].fd_buflen[fdu]) + offset
+            else:
                 return cast[int64](EINVAL)
-            new_pos = cast[int64](task[0].fd_buflen[fdu]) + offset
         else:
             return cast[int64](EINVAL)
         if new_pos < 0:
