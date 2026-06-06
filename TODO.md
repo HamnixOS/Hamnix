@@ -52,17 +52,17 @@ new design but must pass for real).
 - [x] **Phase 1 — `/dev` reference template** (`3a887b2c`). `#b`/`#c`
   bindable device servers; `ls /dev`, `/dev/blk`, `lsblk` resolve through
   the namespace. `scripts/test_dev_namespace.sh`.
-- [~] **Phase 2 — literal-arm sweep** (#388, mostly LANDED `878e9a1b`).
-  DONE: `/net` (`_open_net` → bound `#I` IP server + `devnet_listdir`),
-  `/dev/loop` and `/dev/blk` literal arms deleted (served by the `#c`/`#b`
-  binds), dead `devblk_path_match` import removed, `/dev/cons`/`null`/`zero`
-  confirmed to have no residual literal arms. `scripts/test_net_namespace.sh`
-  + `test_dev_namespace.sh` green on `main`. REMAINING sub-task: `/proc`
-  literal bypass (`devproc_path_match` + static `procfs_render`) — entangled
-  with the well-known renderers + Layer-2 `/proc/<name>`→`/dev` translation,
-  so `#p` must serve `ls /proc` and every well-known file before the literal
-  arms can go. `#e` env still absent. End state: `vfs_open` has ONE
-  resolution path.
+- [x] **Phase 2 — literal-arm sweep** (#388, COMPLETE). `/net` (`_open_net`
+  → bound `#I` IP server + `devnet_listdir`, `878e9a1b`), `/dev/loop`/
+  `/dev/blk` literal arms deleted (served by `#c`/`#b` binds; dead
+  `devblk_path_match` import removed), and `/proc` (`devproc_path_match` +
+  `is_proc_path`→`_open_proc` pre-namec arms deleted; new `devproc_listdir`
+  so bare `#p` lists static files + live pids and `#p/<pid>` lists the
+  per-task leaves; `cc9443cc`). `scripts/test_net_namespace.sh` +
+  `test_dev_namespace.sh` + `test_proc_namespace.sh` all green on `main`.
+  **`vfs_open` now has exactly ONE resolution path — zero literal
+  special-cases.** (`#e` env-as-files is still absent — a small future
+  add, not a bypass; tracked separately if pursued.)
 - [ ] **Phase 3 — real `mount()`** (#389). No `sys_mount`/`vfs_mount`
   exists today; ~53 `is_*_path` predicate branches dispatch filesystems.
   Add a mountable-FS-server interface so ext4/fat/tmpfs/cpio attach at
