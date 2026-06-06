@@ -152,6 +152,12 @@ from drivers.audio.audio_cdev import (
 from sys.src.port9.port.devvt import (
     devvt_read, devvt_write, devvtctl_write,
 )
+# DEV_DIR_FILE's _dirfile_read copies bytes out of the kmalloc'd "NAME\n"
+# listing buffer carried in back_ptr. memcpy is the kernel's C-runtime
+# symbol (the same one every other port file pulls in via `extern def`);
+# the whole kernel links as one merged unit so this only brings the name
+# into scope — there is no separate link step where a cycle could bite.
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
 # --- FD_CHAN_MARK ---------------------------------------------------
@@ -305,8 +311,23 @@ DEV_FAT_FILE:  int32 = 51          # on-disk FAT regular file (pool)
 #     mark; memfd F_SEAL_* seal state lives on the slot, reached via the
 #     chan's back_slot (fs/vfs.ad::vfs_fd_tmpfs_slot).
 DEV_TMPFS_FILE: int32 = 52         # in-RAM tmpfs / memfd regular file (pool)
+#   * DEV_DIR_FILE — a ptr-backed POOL chan for an opened-as-fd directory.
+#     UNLIKE the file families above (which carry a small integer slot id
+#     in back_slot), the DIR family carries the kmalloc'd "NAME\n" listing
+#     buffer directly: back_ptr = buffer pointer, back_slot = buffer length
+#     (a dir buffer is small — DIR_BUF_SIZE — so the length fits int32 and
+#     overloads back_slot exactly the way the file families overload it).
+#     Read -> _dirfile_read copies from back_ptr+off (getdents64 walks it
+#     via the vfs_fd_dir_* accessors); there is NO write (dir fds are
+#     read-only). Close -> kfree(back_ptr) on last ref. This replaces the
+#     legacy FD_DIR_MARK per-task-array mark + its core.ad kfree: the dir
+#     fd is now a unified FD_CHAN_MARK fd whose buffer is refcounted, so a
+#     fork/dup'd dir fd shares ONE buffer and a task that exits holding a
+#     dir fd no longer leaks it. The per-fd read CURSOR stays in the task
+#     (fd_pos) — only the buffer pointer+length move into the Chan.
+DEV_DIR_FILE:  int32 = 53          # opened-as-fd directory listing (pool, ptr-backed)
 
-DEV_MAX:       int32 = 53
+DEV_MAX:       int32 = 54
 
 # The FAT write-mode bit as carried in a DEV_FAT_FILE chan's back_slot
 # (a copy of fs/vfs.ad's FAT_FD_WRITE_BIT / fs/fat.ad's
@@ -528,7 +549,7 @@ def _chan_id_valid(cid: int32) -> int32:
         dt: int32 = _chan_id_inline_dev(cid)
         if dt > DEV_NONE and dt < DEV_MAX and dt != DEV_MNT \
                 and dt != DEV_EXT4_FILE and dt != DEV_FAT_FILE \
-                and dt != DEV_TMPFS_FILE:
+                and dt != DEV_TMPFS_FILE and dt != DEV_DIR_FILE:
             return 1
         return 0
     return _chan_pool_valid(cid)
@@ -1221,6 +1242,26 @@ def namec_open_fat_file(slot: int32) -> int32:
     return cs
 
 
+def namec_open_dir_file(buf_ptr: uint64, buf_len: int32) -> int32:
+    # Wrap a kmalloc'd "NAME\n" directory-listing buffer in a ptr-backed
+    # DEV_DIR_FILE pool chan. UNLIKE the file families, the DIR family
+    # carries the buffer DIRECTLY: back_ptr = the buffer pointer,
+    # back_slot = the buffer length (small — fits int32). Read dispatches
+    # to _dirfile_read; the last close kfree()s back_ptr. Returns the chan
+    # id, or -1 on pool exhaustion (caller must kfree(buf_ptr) and fail
+    # the open on -1).
+    cs: int32 = _chan_alloc()
+    if cs < 0:
+        return -1
+    su: uint64 = cast[uint64](cs)
+    chan_pool[su].in_use    = 1
+    chan_pool[su].dev_type  = DEV_DIR_FILE
+    chan_pool[su].mode      = 0
+    chan_pool[su].back_slot = buf_len
+    chan_pool[su].back_ptr  = buf_ptr
+    return cs
+
+
 def _ext4file_read(slot: uint64, off: uint64, buf: Ptr[uint8],
                    count: uint64) -> int64:
     inum: uint32 = ext4_open_inum(chan_pool[slot].back_slot)
@@ -1266,6 +1307,30 @@ def _tmpfsfile_write(slot: uint64, off: uint64, buf: Ptr[uint8],
     # post stays in fs/vfs.ad's write path (it owns _vfs_inotify_notify).
     n: uint64 = tmpfs_write(chan_pool[slot].back_slot, buf, off, count)
     return cast[int64](n)
+
+
+def _dirfile_read(slot: uint64, off: uint64, buf: Ptr[uint8],
+                  count: uint64) -> int64:
+    # Copy bytes out of a DEV_DIR_FILE chan's kmalloc'd "NAME\n" listing
+    # buffer (back_ptr) starting at offset `off`, capped at the buffer
+    # length (back_slot). This is the RAW-byte reader getdents64 walks
+    # through the vfs_fd_dir_* accessors; a direct read(2) on a directory
+    # fd is intercepted as -EISDIR before reaching here (the fd layer's
+    # FD_CHAN_MARK arm short-circuits DEV_DIR_FILE). Dir fds are READ-ONLY,
+    # so there is no _dirfile_write. The per-fd cursor stays in the task's
+    # fd_pos — this helper just reads at the caller-supplied offset.
+    blen: uint64 = cast[uint64](cast[uint32](chan_pool[slot].back_slot))
+    if off >= blen:
+        return 0
+    remaining: uint64 = blen - off
+    take: uint64 = count
+    if take > remaining:
+        take = remaining
+    if take == 0:
+        return 0
+    src: uint64 = chan_pool[slot].back_ptr + off
+    memcpy(buf, cast[Ptr[uint8]](src), take)
+    return cast[int64](take)
 
 
 # --- namec(): the universal open path -------------------------------
@@ -1485,6 +1550,8 @@ def namec_read(cid: int32, off: uint64, buf: Ptr[uint8],
         return _fatfile_read(su, off, buf, count)
     if chan_pool[su].dev_type == DEV_TMPFS_FILE:
         return _tmpfsfile_read(su, off, buf, count)
+    if chan_pool[su].dev_type == DEV_DIR_FILE:
+        return _dirfile_read(su, off, buf, count)
     return _devtab_read(chan_pool[su].dev_type, 0, 0, off, buf, count)
 
 
@@ -1575,6 +1642,14 @@ def namec_close(cid: int32) -> int32:
         # two apart on the same back_slot.
         if tmpfs_is_anon(chan_pool[su].back_slot) != 0:
             tmpfs_release_anon(chan_pool[su].back_slot)
+    elif chan_pool[su].dev_type == DEV_DIR_FILE:
+        # fd→Chan fold: a directory listing fd's kmalloc'd "NAME\n" buffer
+        # rides in back_ptr (ported from the legacy FD_DIR_MARK close arm
+        # in kernel/sched/core.ad). The buffer is shared by every fd that
+        # forked/dup'd this chan (refcounted), so only the LAST close frees
+        # it — exactly the leak the fold removes for dir fds.
+        if chan_pool[su].back_ptr != 0:
+            kfree(chan_pool[su].back_ptr)
     _chan_free(cid)
     return 0
 
@@ -1645,6 +1720,21 @@ def namec_chan_back_slot(cid: int32) -> int32:
     if _chan_id_is_inline(cid) != 0:
         return -1
     return chan_pool[cast[uint64](cid)].back_slot
+
+
+def namec_chan_back_ptr(cid: int32) -> uint64:
+    # The family backing POINTER a ptr-backed pool chan carries. Today only
+    # DEV_DIR_FILE uses it (the kmalloc'd "NAME\n" listing buffer); every
+    # other family leaves back_ptr 0. 0 for an inline cdev chan, an invalid
+    # id, or a pool chan with no backing pointer. The fd layer's getdents64
+    # accessor (vfs_fd_dir_buf) recovers a folded dir fd's buffer through
+    # this, mirroring how vfs_fd_tmpfs_slot recovers a tmpfs slot via
+    # namec_chan_back_slot.
+    if _chan_id_valid(cid) == 0:
+        return 0
+    if _chan_id_is_inline(cid) != 0:
+        return 0
+    return chan_pool[cast[uint64](cid)].back_ptr
 
 
 def namec_chan_refcount(cid: int32) -> int32:
