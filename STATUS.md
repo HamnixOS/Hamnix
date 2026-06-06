@@ -857,3 +857,24 @@ ET_DYN/mmap ASLR (gated on vaddr≠phys uaccess decoupling, `#163`), GPU
 acceleration (`#182`/`#183`), aarch64 (`#175`), and the NUC USB metal
 bring-up (`#238`/`#242`).
 
+## Wave — 2026-06-05: namespace-purity base cleanup (Plan 9 file-server discipline)
+
+| Item | What | Status |
+|------|------|--------|
+| **NVMe behind a PCIe root port** | `_nvme_pci_find_class` scanned bus 0 only, so the NUC's NVMe (behind a PCH root port on a secondary bus) was never discovered and the installer couldn't read the target disk. Replaced with a bridge-aware BFS scan (class 0x06/0x04 bridges enqueue their secondary bus from config 0x18; multifunction honored via header-type bit 7). `894baf8c`. | **Done** |
+| **`/dev` + `/dev/blk` as bindable Plan 9 device servers** | `ls /dev` failed ("listdir failed") and `/dev/blk` was reachable only through a kernel literal-path string-match (`devblk_path_match`) — no directory walk, un-bindable, un-Plan-9. Introduced `#b` (block-device server → `/dev/blk`, lists registered devices via `blk_listdir`, `#b/<leaf>` → `devblk` backend) and reused `#c` as the `/dev` device-directory server (authentic Plan 9 cons-device model: serves `cons`/`null`/`zero` + the `blk` subtree). `etc/rc.boot` now `bind '#c' /dev` + `bind '#b' /dev/blk`; longest-prefix match routes `/dev/blk/*` to `#b` and `/dev/<other>` to `#c`. Stateful cdevs (`auth`/`fuse`/`ptmx`/`pts`/`loop`) rerouted through the `#c` leaf handler so `passwd`/`su`/PTYs/`losetup` keep working; console preserved via `#c/cons` → `FD_CONS_MARK`. `ls /`→dev, `ls /dev`→blk, `ls /dev/blk`→nvme0n1, `lsblk`, and `cat /dev/blk/nvme0n1/size` all verified green on `main`. `scripts/test_dev_namespace.sh`. `3a887b2c`. | **Done** |
+
+**Architecture mandate opened (the base-shape track).** The `/dev` fix is the
+reference template for a deeper cleanup: the kernel VFS currently resolves many
+paths through a hardcoded literal-string ladder (`devblk_path_match`,
+`loopctl_path_match`, `_open_net` for `/net`, `devproc_path_match`/`procfs_render`
+for `/proc`) *before* — and mostly instead of — the real namespace machinery, and
+the on-disk/synthetic filesystems are selected by ~53 `is_*_path` predicate
+branches with **no real `mount()`** at all (only `bind`). Per user direction, the
+endgame loop will eliminate **all** literal-path bypasses (everything becomes a
+`#X` file server bound by init), then introduce a real `mount` so ext4/fat/tmpfs/cpio
+attach at namespace points, then unify every fd onto the `Chan` abstraction
+(retiring the ~24 collision-prone `FD_*_MARK` magic-integer ranges). Big-bang
+rewrites are sanctioned where they're the right fix; each phase must still boot +
+pass the test sweep.
+

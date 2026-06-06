@@ -40,6 +40,33 @@ retrofitted backwards.
 
 ---
 
+## TOP PRIORITY — namespace-purity base cleanup (locked with user 2026-06-05)
+
+The base must be Plan 9 to the bone: **no global filesystem, no hardcoded
+path bypasses — everything is namespaces + file servers.** Finish this
+*before* pouring agents back into breadth work (ARM, GPU, drivers). See
+[[memory/project_namespace_purity_mandate]]. Big-bang rewrites sanctioned;
+each phase must still boot + pass the sweep (tests may be rewritten to the
+new design but must pass for real).
+
+- [x] **Phase 1 — `/dev` reference template** (`3a887b2c`). `#b`/`#c`
+  bindable device servers; `ls /dev`, `/dev/blk`, `lsblk` resolve through
+  the namespace. `scripts/test_dev_namespace.sh`.
+- [ ] **Phase 2 — literal-arm sweep** (#388). Convert the remaining
+  literal interceptors to bound `#X` servers + populate `etc/rc.boot`:
+  `/net` (`_open_net` → `#I`, highest value), `/dev/loop`, `/proc` (drop
+  literal `devproc_path_match`/`procfs_render`, keep `#p`), `/dev/cons`/
+  `null`/`zero` (verify no residual literal arms), `#e` env. Also delete
+  the now-dead `devblk_path_match` fallback. End state: `vfs_open` has ONE
+  resolution path.
+- [ ] **Phase 3 — real `mount()`** (#389). No `sys_mount`/`vfs_mount`
+  exists today; ~53 `is_*_path` predicate branches dispatch filesystems.
+  Add a mountable-FS-server interface so ext4/fat/tmpfs/cpio attach at
+  namespace points; delete the `is_*_path` ladder.
+- [ ] **Phase 4 — unify fds on `Chan`** (#390). Retire the ~24
+  collision-prone `FD_*_MARK` magic-integer ranges; every fd becomes a
+  `Chan` pointer through the `namec` devtab.
+
 ## Now — useful-system gap fill (priority-ordered, locked with user 2026-05-28)
 
 1. [x] **hamUI Phase 4a** — LANDED: layered draw protocol cdev
