@@ -40,16 +40,20 @@ echo 'rc.boot: bootstrap rc starting'
 #   bind '#/' /n        — conventional mount-point parent
 #   bind '#c' /dev      — device directory server (cons/null/zero/blk)
 #   bind '#b' /dev/blk  — block-device server (nvme0n1, sd0, vda, ...)
+#   bind '#I' /net      — IP device server (tcp/udp/icmp, clone, conns)
 # The '#b' bind is a LONGER prefix than '#c', so /dev/blk/<name> routes
 # to the block server while /dev/<other> stays with the '#c' dev server
 # (longest-prefix match). This is what makes `ls /dev`, `ls /dev/blk`,
 # and `lsblk` enumerate devices through the namespace instead of a
-# kernel literal-path match.
+# kernel literal-path match. '#I' is the Plan 9 IP stack: a `/net/tcp/clone`
+# open is rewritten to `#I/tcp/clone`, so the whole networking surface is
+# namespace-resolved (no literal /net match in the kernel).
 bind '#s' /srv
 bind '#p' /proc
 bind '#/' /n
 bind '#c' /dev
 bind '#b' /dev/blk
+bind '#I' /net
 echo 'rc.boot: device binds applied'
 
 # --- mount the sysroot subtree at / ---------------------------------
