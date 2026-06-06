@@ -2614,6 +2614,22 @@ if os.environ.get("ENABLE_OVERLAYFS_TEST") == "1":
     FILES.append(("/etc/overlayfs-test", b"1\n"))
 
 
+# --- master gate marker for the boot:37 developer self-test battery ---
+# init/main.ad runs its ~87-probe self-test scan ONLY when /etc/run-selftests
+# is present. Each individual test still needs its own /etc/<x>-test marker to
+# actually execute, but this master marker is what arms the scan at all. Plant
+# it for EVERY build EXCEPT the two production kernels: the installed disk
+# (HAMNIX_CPIO_EMPTY=1) and the installer medium (HAMNIX_INSTALLER_BLOB=1).
+# Those ship to real hardware and must never run the developer battery — it is
+# pure noise and a stray probe can wedge the boot (the kmodsys hang observed on
+# the keyboard-less NUC). Every test build keeps its self-tests because none of
+# them set these production flags; a marker is only useful with this present.
+_is_production = (os.environ.get("HAMNIX_CPIO_EMPTY") == "1"
+                  or os.environ.get("HAMNIX_INSTALLER_BLOB") == "1")
+if not _is_production:
+    FILES.append(("/etc/run-selftests", b"1\n"))
+
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
