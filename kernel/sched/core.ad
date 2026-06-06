@@ -44,7 +44,7 @@ from kernel.sched.loadavg import (
 )
 # SMP: per-CPU id for current-task tracking and TSS gating.
 from arch.x86.kernel.setup_percpu import get_cpu_id
-from arch.x86.kernel.time import get_jiffies
+from arch.x86.kernel.time import get_jiffies, get_jiffies_addr
 
 extern def __switch_to_asm(prev: Ptr[uint8], next: Ptr[uint8])
 extern def enter_first_task(task: Ptr[uint8])
@@ -99,6 +99,16 @@ extern def read_cr4() -> uint64
 extern def cpuid_get(leaf: uint32, subleaf: uint32, out: Ptr[uint32])
 extern def fninit_helper()
 extern def write_cr4(value: uint64)
+
+# AP-idle thermal fix: MONITOR/MWAIT primitives (bodies in
+# arch/x86/kernel/cpuregs_asm.S). _ap_monitor arms the address-range
+# monitor on a watched word; _ap_mwait parks the core in a low-power
+# state until that word is WRITTEN by another CPU. Neither needs an
+# interrupt or an armed LAPIC — which is exactly why they are correct
+# for the AP idle loop (the AP's LAPIC is software-disabled, so a plain
+# hlt would wedge it). See sched_ap_idle_loop's no-work branch.
+extern def _ap_monitor(addr: uint64)
+extern def _ap_mwait(hints: uint64, ext: uint64)
 
 # V2.5: Pgrp lifecycle entry-points implemented in sys/src/9/port/chan.ad.
 # Declared extern here so task_exit_current can call pgrp_ref_dec without
@@ -2830,19 +2840,72 @@ def sched_ap_idle_loop():
             spinlock_unlock(&rq_lock)
         else:
             spinlock_unlock(&rq_lock)
-            # No ready kernel task right now. We do NOT hlt: the AP's LAPIC
-            # is software-disabled (no SVR enable — see ap_main_hamnix),
+            # No ready kernel task right now. We do NOT plain-hlt: the AP's
+            # LAPIC is software-disabled (no SVR enable — see ap_main_hamnix),
             # so nothing would ever wake a halted AP, and enabling AP
-            # interrupt delivery needs per-AP IDT/TSS we don't have. Instead
-            # spin a bounded PAUSE burst, then loop back to re-scan the shared
-            # runqueue. Under QEMU TCG's round-robin vCPU scheduler the PAUSE
-            # burst yields host time back to the BSP so it can spawn/advance
-            # the workers we then steal; on real HW PAUSE is cheap and the
-            # re-scan latency is bounded by the burst length.
-            relax: uint64 = 0
-            while relax < 4096:
-                cpu_relax()
-                relax = relax + 1
+            # interrupt delivery needs per-AP IDT/TSS we don't have.
+            #
+            # THERMAL FIX: on real (passively-cooled) silicon the old
+            # behaviour — a bounded PAUSE burst then re-scan, forever — pins
+            # every idle AP at ~100% CPU and overheats the box. MONITOR/MWAIT
+            # idles the core in a genuine low-power state (≈0% busy) WITHOUT
+            # needing an interrupt or an armed LAPIC: the core arms MONITOR on
+            # a memory word and MWAIT wakes when that word is WRITTEN by
+            # another CPU. We monitor `jiffies`, which the BSP timer ISR
+            # increments every tick, so a sleeping AP is guaranteed to wake at
+            # least once per tick (~HZ Hz) to re-scan — worst-case steal
+            # latency ≈1 tick, and 0% busy in between.
+            if g_ap_mwait_ok != 0:
+                # --- Low-power MWAIT path (real silicon) -----------------
+                # Arm the monitor on the per-tick jiffies word FIRST, then
+                # re-scan the runqueue once more before sleeping. This closes
+                # the classic lost-wakeup race: if a task was enqueued between
+                # our failed scan above and arming MONITOR, the re-scan catches
+                # it and we skip MWAIT; and any enqueue that lands AFTER we arm
+                # but writes a different line is still bounded by the next
+                # jiffies tick writing the monitored line. We do NOT hold
+                # rq_lock across MONITOR/MWAIT.
+                _ap_monitor(get_jiffies_addr())
+                # Re-scan for a stealable READY kernel task.
+                rescan: uint64 = 0
+                woke: uint64 = 0
+                spinlock_lock(&rq_lock)
+                while rescan < NTASKS and sched_ap_steal_enabled != 0:
+                    if rescan != my_idle_slot and rescan != 0:
+                        if task_table[rescan].state == STATE_READY:
+                            if task_table[rescan].is_user == 0:
+                                woke = 1
+                                rescan = NTASKS
+                    rescan = rescan + 1
+                spinlock_unlock(&rq_lock)
+                # One-time-per-CPU banner that this AP idles via mwait.
+                bit: uint64 = cast[uint64](1) << my_cpu_id
+                if (_ap_idle_mode_logged & bit) == 0:
+                    _ap_idle_mode_logged = _ap_idle_mode_logged | bit
+                    printk1("SMP: cpu%d idle via mwait\n", my_cpu_id)
+                if woke == 0:
+                    # Still nothing — park in the low-power state. We wake on
+                    # the next jiffies write (≤1 tick) or any earlier store to
+                    # the monitored line, then loop back to the top to scan.
+                    _ap_mwait(0, 0)
+                # If woke != 0 we just fall through and re-loop immediately to
+                # acquire rq_lock and dispatch the task we spotted.
+            else:
+                # --- PAUSE fallback (no MONITOR/MWAIT, e.g. QEMU TCG) -----
+                # Unchanged original behaviour: spin a bounded PAUSE burst,
+                # then loop back to re-scan the shared runqueue. Under QEMU
+                # TCG's round-robin vCPU scheduler the PAUSE burst yields host
+                # time back to the BSP so it can spawn/advance the workers we
+                # then steal; on real HW PAUSE is cheap and the re-scan
+                # latency is bounded by the burst length.
+                pbit: uint64 = cast[uint64](1) << my_cpu_id
+                if (_ap_idle_mode_logged & pbit) == 0:
+                    _ap_idle_mode_logged = _ap_idle_mode_logged | pbit
+                    printk1("SMP: cpu%d idle via pause\n", my_cpu_id)
+                relax: uint64 = 0
+                while relax < 4096:
+                    cpu_relax()
+                    relax = relax + 1
 
 
 def sched_prepare_ap_idle(cpu_id: uint64) -> int32:
@@ -5997,6 +6060,39 @@ ap_idle_dispatches:  uint64 = 0
 # (proving cpu0 gets load), then back to 1 to hand the remainder to the AP
 # (proving cpu1 gets load). Production code never touches it.
 sched_ap_steal_enabled: uint64 = 1
+
+# AP-idle thermal fix state.
+#   g_ap_mwait_ok   — 1 iff this CPU advertises MONITOR/MWAIT (CPUID.1:
+#                     ECX bit 3). Probed ONCE by _ap_probe_mwait() at SMP
+#                     init. When 0, sched_ap_idle_loop's no-work branch
+#                     falls back to the original bounded PAUSE burst
+#                     (correct on QEMU TCG, which may not implement
+#                     MONITOR/MWAIT). When 1, idle APs MWAIT on the
+#                     per-tick `jiffies` word and drop to ≈0% CPU instead
+#                     of spinning N-1 cores hot (the real-NUC thermal
+#                     defect this fixes).
+#   _ap_idle_mode_logged — per-CPU one-shot bitmask so each AP prints its
+#                     chosen idle path (mwait vs pause) exactly once, not
+#                     every loop. Bit (1<<cpu_id) is set after the banner.
+g_ap_mwait_ok:         uint64 = 0
+_ap_idle_mode_logged:  uint64 = 0
+
+
+def _ap_probe_mwait():
+    # One-time MONITOR/MWAIT capability probe. Call once from the BSP at
+    # SMP init (before/around smp_boot_aps). CPUID leaf 1, ECX bit 3 is
+    # the architectural MONITOR/MWAIT feature flag (Intel SDM Vol.2A).
+    # Real NUC silicon sets it; QEMU TCG generally does not, so the AP
+    # idle loop keeps its PAUSE fallback there.
+    leaf1: Array[4, uint32]
+    cpuid_get(cast[uint32](1), cast[uint32](0), &leaf1[0])
+    ecx: uint64 = cast[uint64](leaf1[2])
+    if (ecx & 0x8) != 0:
+        g_ap_mwait_ok = 1
+        printk0("SMP: MONITOR/MWAIT supported — APs idle via mwait\n")
+    else:
+        g_ap_mwait_ok = 0
+        printk0("SMP: no MONITOR/MWAIT — APs idle via pause fallback\n")
 
 
 def _sched_fair_worker():

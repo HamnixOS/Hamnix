@@ -130,3 +130,51 @@ read_cr3:
 invlpg_one:
     invlpg  (%rdi)
     ret
+
+/* ---------- _ap_monitor(addr: uint64) --------------------------- *
+ *
+ * AP idle power fix: arm the MONITOR hardware on the cache line that
+ * contains `addr`. After this the core "watches" that line; a later
+ * MWAIT will wake when any CPU WRITES to it (or on certain other
+ * events). Pairs with _ap_mwait below.
+ *
+ * MONITOR: EAX = linear address to watch, ECX = extensions (0),
+ *          EDX = hints (0). No memory operand bytes are read; the
+ *          address is taken from EAX (DS:EAX). Privileged-friendly:
+ *          executes at CPL=0 with no interrupts required.
+ *
+ * SysV ABI: %rdi = address to monitor. No return, no GP clobbers
+ * beyond the scratch %rax/%rcx/%rdx (all caller-saved).
+ */
+    .align 16
+    .globl _ap_monitor
+_ap_monitor:
+    movq    %rdi, %rax                 /* watched linear address -> EAX */
+    xorq    %rcx, %rcx                 /* ECX = 0 (no extensions) */
+    xorq    %rdx, %rdx                 /* EDX = 0 (no hints) */
+    monitor                            /* arm address-range monitor */
+    ret
+
+/* ---------- _ap_mwait(hints: uint64, ext: uint64) --------------- *
+ *
+ * AP idle power fix: enter the implementation-dependent optimized
+ * (low-power) state armed by a preceding MONITOR. The core stays
+ * there until the monitored line is written by another CPU, then
+ * resumes right after MWAIT. Crucially this needs NO interrupt and
+ * NO armed LAPIC — exactly why it is correct for the AP idle loop
+ * whose LAPIC is software-disabled.
+ *
+ * MWAIT: EAX = hints (0 => C1/default state), ECX = extensions
+ *        (bit 0 = treat masked interrupts as break events; we pass 0
+ *        since APs run with IF effectively unused here and we always
+ *        re-scan after waking anyway).
+ *
+ * SysV ABI: %rdi = hints, %rsi = ext. No return value.
+ */
+    .align 16
+    .globl _ap_mwait
+_ap_mwait:
+    movq    %rdi, %rax                 /* hints -> EAX */
+    movq    %rsi, %rcx                 /* extensions -> ECX */
+    mwait                              /* enter optimized idle state */
+    ret
