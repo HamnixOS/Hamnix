@@ -15,6 +15,7 @@
 # Plus each fixture's "done" banner and a hamsh-responsive sentinel.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -52,27 +53,16 @@ echo "[test_devdiskstats] (5/5) Boot QEMU + drive both fixtures via hamsh"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
+# Marker-gated input (scripts/_qemu_drive.sh): wait for hamsh's readiness
+# banner before feeding each command, instead of a fixed `sleep 3` that
+# races a slower boot and silently drops the first keystroke.
 set +e
-(
-    sleep 3
-    printf '/bin/test_devdiskstats\n'
-    sleep 2
-    printf '/bin/test_devsysstat\n'
-    sleep 2
-    printf 'echo POST_DISKSTATS_OK\n'
-    sleep 1
-    printf 'exit\n'
-    sleep 1
-) | timeout 20s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 70 -- \
+    "/bin/test_devdiskstats" 3 \
+    "/bin/test_devsysstat" 3 \
+    "echo POST_DISKSTATS_OK" 2 \
+    "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_devdiskstats] --- captured output ---"

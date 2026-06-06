@@ -97,6 +97,7 @@ check() {
 check "self-test ran"                 "[diskstats] self-test start"
 check "ram0 baseline snapshot"        "[diskstats] ram0 baseline"
 check "ram0 counter delta printed"    "[diskstats] ram0 delta"
+check "rd_ticks absorbed io_ticks"    "[diskstats] rd_ticks absorbed io_ticks, wr_ticks flat OK"
 check "in_flight settled to 0"        "[diskstats] in_flight settled to 0 OK"
 check "idle witness unchanged"        "[diskstats] idle witness unchanged OK"
 check "diskstats self-test PASS"      "[diskstats] PASS"
