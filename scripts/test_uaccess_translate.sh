@@ -48,7 +48,10 @@ ELF=build/hamnix-kernel.elf
 
 echo "[test_uaccess] (1/2) Build initramfs + kernel"
 bash scripts/build_user.sh >/dev/null
-INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
+# uaccess_syscall_test() is gated behind /etc/uaccess-sc-test; this is the
+# only harness that drives it, so plant the marker for THIS build.
+INIT_ELF=build/user/init.elf ENABLE_UACCESS_SC_TEST=1 \
+    python3 scripts/build_initramfs.py >/dev/null
 python3 -m compiler.adder compile \
     --target=x86_64-bare-metal \
     init/main.ad \

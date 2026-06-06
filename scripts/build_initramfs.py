@@ -2630,6 +2630,16 @@ if not _is_production:
     FILES.append(("/etc/run-selftests", b"1\n"))
 
 
+# uaccess_syscall_test() (init/main.ad, run at early boot before userland)
+# drives do_syscall(SYS_GETCWD) from kernel context against a vaddr != phys
+# mapping. It is a #163 developer proof that can fault the box under TCG, so
+# unlike the rest of the battery it is gated by its OWN marker and runs ONLY
+# for scripts/test_uaccess_translate.sh (ENABLE_UACCESS_SC_TEST=1) — never on
+# a normal, random-test, installer, or production boot.
+if os.environ.get("ENABLE_UACCESS_SC_TEST") == "1":
+    FILES.append(("/etc/uaccess-sc-test", b"1\n"))
+
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
