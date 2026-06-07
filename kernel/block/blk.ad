@@ -302,6 +302,10 @@ def blk_unregister_by_name(name: Ptr[char]) -> int32:
         if blockdev_table[i].used != 0 \
                 and _blk_name_eq(&blockdev_table[i].name[0],
                                  &cand[0]) != 0:
+            # Drop any buffer-cache sectors owned by this slot BEFORE the
+            # slot can be reused: a fresh device registered into the same
+            # index must never read the previous device's stale sectors.
+            _bcache_invalidate_slot(cast[int32](i))
             blockdev_table[i].used             = 0
             blockdev_table[i].capacity_sectors = 0
             blockdev_table[i].priv             = 0
@@ -338,11 +342,208 @@ def find_blockdev(name: Ptr[char]) -> int32:
     return -1
 
 
+# --- write-through block buffer cache --------------------------------
+#
+# Linux maps this to its buffer/page cache (mm/filemap.c + fs/buffer.c):
+# block reads that hit the cache skip the device entirely. We are far
+# smaller — a fixed direct-hashed pool of 512-byte sectors with CLOCK-ish
+# LRU eviction — but the goal is identical: re-reading the same sector
+# must not re-hit the physical device. On the real NUC's flash that is a
+# wear win; everywhere it is a latency win.
+#
+# Granularity is one 512-byte SECTOR (the blk API unit). The cache sits
+# INSIDE blk_read_sectors / blk_write_sectors — above the driver-ops
+# dispatch and below all ~480 FS/stacked-driver callers — so every caller
+# benefits transparently and coherence is automatic: the ONLY sector
+# mutation path is blk_write_sectors, which write-throughs to the device
+# AND refreshes (or invalidates) the cached copy, so a cached sector can
+# never go stale behind a write.
+#
+# Keyed by (dev_slot, lba). Drivers never call blk_read_sectors on
+# themselves, so the backing device read in the miss path is never itself
+# cached — no recursion, no double-accounting.
+#
+# Coherence note for stacked devices (dm/md/loop/partition): each layer
+# issues blk_read_sectors / blk_write_sectors against its PARENT slot, so
+# each layer's sectors are cached under that parent's slot independently.
+# Because every layer's writes ALSO traverse blk_write_sectors, every
+# cached layer stays coherent. Double-caching a stacked stack is accepted
+# for this first cut.
+
+BCACHE_NSLOTS:  uint64 = 512          # 512 sectors = 256 KiB of .bss
+BCACHE_PROBE:   uint64 = 16           # linear-probe window for hash collisions
+
+
+class BcacheEntry:
+    valid:    uint32                  # 0 = empty slot, 1 = holds a sector
+    pad:      uint32
+    dev_slot: int32                   # owning block-device slot
+    pad2:     int32
+    lba:      uint64                  # sector LBA within that device
+    lru:      uint64                  # last-access clock stamp (LRU eviction)
+
+
+# Metadata table and a PARALLEL flat byte pool for the sector data. Data
+# is kept out of the struct (a 512-byte Array field inside a struct in a
+# big table risks the known Adder struct-with-array miscompile); the data
+# for entry i lives at bcache_data[i*512 .. i*512+512).
+bcache_meta: Array[512, BcacheEntry]
+bcache_data: Array[262144, uint8]     # 512 entries * 512 bytes
+
+# Monotonic access clock for LRU. Wrap is a non-issue for any realistic
+# uptime (a uint64 at one tick per cache op never wraps).
+bcache_clock_g: uint64 = 0
+
+# Observability counters (exposed via accessors below for the self-test
+# and any future /proc/bcache renderer).
+bcache_hits_g:      uint64 = 0
+bcache_misses_g:    uint64 = 0
+bcache_evictions_g: uint64 = 0
+bcache_inserts_g:   uint64 = 0
+
+
+def bcache_hits() -> uint64:
+    return bcache_hits_g
+
+
+def bcache_misses() -> uint64:
+    return bcache_misses_g
+
+
+def bcache_evictions() -> uint64:
+    return bcache_evictions_g
+
+
+def bcache_inserts() -> uint64:
+    return bcache_inserts_g
+
+
+def _bcache_hash(slot: int32, lba: uint64) -> uint64:
+    # Mix (slot, lba) into a bucket index. Fibonacci-hash the lba and fold
+    # the slot in so adjacent LBAs on the same device spread across buckets
+    # rather than colliding in a run.
+    k: uint64 = (cast[uint64](slot) * cast[uint64](1099511628211)) ^ lba
+    k = k * cast[uint64](11400714819323198485)
+    return (k >> 40) % BCACHE_NSLOTS
+
+
+def _bcache_lookup(slot: int32, lba: uint64) -> int64:
+    # Return the meta index of the resident (slot, lba) sector, or -1 on a
+    # miss. Linear-probe a BCACHE_PROBE window from the hash bucket.
+    h: uint64 = _bcache_hash(slot, lba)
+    p: uint64 = 0
+    while p < BCACHE_PROBE:
+        idx: uint64 = (h + p) % BCACHE_NSLOTS
+        if bcache_meta[idx].valid != 0 \
+                and bcache_meta[idx].dev_slot == slot \
+                and bcache_meta[idx].lba == lba:
+            return cast[int64](idx)
+        p = p + 1
+    return -1
+
+
+def _bcache_pick_victim(slot: int32, lba: uint64) -> uint64:
+    # Choose a meta slot to populate for (slot, lba): prefer an EMPTY slot
+    # in the probe window; failing that, evict the least-recently-used slot
+    # in the window. Always returns a usable index.
+    h: uint64 = _bcache_hash(slot, lba)
+    p: uint64 = 0
+    while p < BCACHE_PROBE:
+        idx: uint64 = (h + p) % BCACHE_NSLOTS
+        if bcache_meta[idx].valid == 0:
+            return idx
+        p = p + 1
+    # No empty slot: evict LRU within the window.
+    best: uint64 = h % BCACHE_NSLOTS
+    best_lru: uint64 = bcache_meta[best].lru
+    p = 1
+    while p < BCACHE_PROBE:
+        idx: uint64 = (h + p) % BCACHE_NSLOTS
+        if bcache_meta[idx].lru < best_lru:
+            best = idx
+            best_lru = bcache_meta[idx].lru
+        p = p + 1
+    bcache_evictions_g = bcache_evictions_g + 1
+    return best
+
+
+def _bcache_store(slot: int32, lba: uint64, src: Ptr[uint8]):
+    # Insert (or overwrite) one sector's worth of bytes for (slot, lba).
+    # If the sector is already resident, refresh its data in place (write
+    # coherence). Otherwise pick a victim and populate it.
+    existing: int64 = _bcache_lookup(slot, lba)
+    idx: uint64 = 0
+    if existing >= 0:
+        idx = cast[uint64](existing)
+    else:
+        idx = _bcache_pick_victim(slot, lba)
+        bcache_inserts_g = bcache_inserts_g + 1
+    dst: Ptr[uint8] = &bcache_data[idx * SECTOR_SIZE]
+    j: uint64 = 0
+    while j < SECTOR_SIZE:
+        dst[j] = src[j]
+        j = j + 1
+    bcache_meta[idx].valid    = 1
+    bcache_meta[idx].dev_slot = slot
+    bcache_meta[idx].lba      = lba
+    bcache_clock_g = bcache_clock_g + 1
+    bcache_meta[idx].lru = bcache_clock_g
+
+
+def _bcache_copy_out(idx: uint64, dst: Ptr[uint8]):
+    # Copy a resident sector out to the caller's buffer and stamp it MRU.
+    src: Ptr[uint8] = &bcache_data[idx * SECTOR_SIZE]
+    j: uint64 = 0
+    while j < SECTOR_SIZE:
+        dst[j] = src[j]
+        j = j + 1
+    bcache_clock_g = bcache_clock_g + 1
+    bcache_meta[idx].lru = bcache_clock_g
+
+
+def bcache_invalidate_all():
+    # Drop the ENTIRE buffer cache. Used by self-tests that must measure
+    # real device I/O without prior cache residency confounding the
+    # diskstats deltas; not on any normal path.
+    i: uint64 = 0
+    while i < BCACHE_NSLOTS:
+        bcache_meta[i].valid    = 0
+        bcache_meta[i].dev_slot = -1
+        bcache_meta[i].lba      = 0
+        i = i + 1
+
+
+def _bcache_invalidate_slot(slot: int32):
+    # Drop EVERY cached sector owned by `slot`. Called when a device is
+    # unregistered so a later registration reusing the same slot index can
+    # never read a previous device's stale sectors (silent corruption).
+    i: uint64 = 0
+    while i < BCACHE_NSLOTS:
+        if bcache_meta[i].valid != 0 and bcache_meta[i].dev_slot == slot:
+            bcache_meta[i].valid    = 0
+            bcache_meta[i].dev_slot = -1
+            bcache_meta[i].lba      = 0
+        i = i + 1
+
+
+def _bcache_all_resident(slot: int32, lba: uint64, count: uint64) -> int32:
+    # Returns 1 iff EVERY sector in [lba, lba+count) is currently cached.
+    i: uint64 = 0
+    while i < count:
+        if _bcache_lookup(slot, lba + i) < 0:
+            return 0
+        i = i + 1
+    return 1
+
+
 def blk_read_sectors(slot: int32, lba: uint64, count: uint64,
                      buf: Ptr[uint8]) -> int32:
     # Synchronous read. Validates the range against the device's
-    # capacity, then tail-calls the driver's read_sectors. Mirrors
-    # Linux's bdev_read_iter at a much smaller scale.
+    # capacity, then either serves the whole span from the buffer cache
+    # (no device I/O, no diskstats bump — re-reads must show flat rd_ios)
+    # or, on any miss, does the existing single device read for the whole
+    # span and populates the cache. Mirrors Linux's bdev_read_iter at a
+    # much smaller scale.
     if slot < 0:
         return -1
     su: uint64 = cast[uint64](slot)
@@ -353,6 +554,20 @@ def blk_read_sectors(slot: int32, lba: uint64, count: uint64,
         printk2("blk: short read: lba=%d cap=%d\n",
                 lba, blockdev_table[su].capacity_sectors)
         return -1
+    # --- buffer cache: full-span hit serves WITHOUT touching the device.
+    # No diskstats / in_flight / inblock accounting on a hit: no device I/O
+    # happened, which is the whole point — a re-read must show flat rd_ios.
+    if count > 0 and _bcache_all_resident(slot, lba, count) != 0:
+        i: uint64 = 0
+        while i < count:
+            hidx: int64 = _bcache_lookup(slot, lba + i)
+            _bcache_copy_out(cast[uint64](hidx),
+                             &buf[i * SECTOR_SIZE])
+            i = i + 1
+        bcache_hits_g = bcache_hits_g + 1
+        return 0
+    if count > 0:
+        bcache_misses_g = bcache_misses_g + 1
     ops: Ptr[BlockDeviceOps] = blockdev_table[su].ops
     priv: uint64 = blockdev_table[su].priv
     fn: Fn[int32, uint64, uint64, uint64, Ptr[uint8]] = ops[0].read_sectors
@@ -379,6 +594,12 @@ def blk_read_sectors(slot: int32, lba: uint64, count: uint64,
         # (ru_inblock). `su` is the device slot, NOT a task — attribution is
         # current-task inside the helper.
         current_task_account_inblock(count)
+        # Populate the buffer cache for each sector just read, so the next
+        # read of this span is served from cache without a device hit.
+        ci: uint64 = 0
+        while ci < count:
+            _bcache_store(slot, lba + ci, &buf[ci * SECTOR_SIZE])
+            ci = ci + 1
     return rc
 
 
@@ -421,6 +642,15 @@ def blk_write_sectors(slot: int32, lba: uint64, count: uint64,
         # getrusage(2): charge the CALLING task `count` 512-byte block writes
         # (ru_oublock). `su` is the device slot, NOT a task.
         current_task_account_oublock(count)
+        # Write-through coherence: refresh every cached sector in the span
+        # with the bytes just written. _bcache_store updates a resident
+        # entry in place (and seeds a missing one), so no cached sector is
+        # ever left stale behind a write. Write-through only — no dirty /
+        # writeback bookkeeping.
+        ci: uint64 = 0
+        while ci < count:
+            _bcache_store(slot, lba + ci, &buf[ci * SECTOR_SIZE])
+            ci = ci + 1
     return rc
 
 
@@ -1374,6 +1604,12 @@ def blk_diskstats_selftest() -> int32:
         _blk_ds_emerg0("[diskstats] note: no idle witness device\n")
 
     # Issue a KNOWN amount of real block I/O through blk_read_sectors.
+    # Drop the buffer cache first so every read below is a genuine device
+    # read (the diskstats deltas count REAL device I/O; a warm cache would
+    # serve some reads without bumping the counters and break the delta
+    # assertions). Re-invalidated before the overlapping burst for the
+    # same reason.
+    bcache_invalidate_all()
     bufp: Ptr[uint8] = &_blk_ds_scratch[0]
     k: uint64 = 0
     while k < _DS_TEST_SINGLES:
@@ -1383,6 +1619,7 @@ def blk_diskstats_selftest() -> int32:
                            cast[uint64](cast[int64](rc)))
             return 0
         k = k + 1
+    bcache_invalidate_all()
     rcb: int32 = blk_read_sectors(slot, 0, _DS_TEST_BURST, bufp)
     if rcb != 0:
         _blk_ds_emerg1("[diskstats] FAIL: burst read rc=%d\n",
@@ -1455,4 +1692,150 @@ def blk_diskstats_selftest() -> int32:
         _blk_ds_emerg0("[diskstats] PASS\n")
         return 1
     _blk_ds_emerg0("[diskstats] FAIL\n")
+    return 0
+
+
+# --- buffer-cache self-test -------------------------------------------
+#
+# Gated boot self-test (init/main.ad boot:37.bcache, planted
+# /etc/bcache-test). PROVES the write-through block buffer cache:
+#
+#   1. Pick the RAM block device ram0 (writable scratch).
+#   2. WRITE a known pattern to a 4-sector span so the backing device and
+#      the cache agree, then DROP the whole cache.
+#   3. READ the span once (a cold MISS that populates the cache) and snapshot
+#      the device rd_ios + cache hit counter.
+#   4. READ the same span again: assert the cache HIT counter rose, the MISS
+#      counter did NOT, and the device rd_ios for ram0 stayed FLAT (no second
+#      device I/O — the entire point).
+#   5. WRITE a NEW pattern to one sector, then READ it back and assert the
+#      NEW bytes come out (no stale cached sector behind a write).
+#
+# Each marker line stamps EMERG so it reaches serial even at the prompt.
+
+_BC_TEST_BASE:    uint64 = 16        # avoid sectors the diskstats test touches
+_BC_TEST_SPAN:    uint64 = 4
+_bc_wbuf: Array[2048, uint8]         # 4 sectors out
+_bc_rbuf: Array[2048, uint8]         # 4 sectors back
+
+
+def _bc_fill(buf: Ptr[uint8], n: uint64, seed: uint64):
+    i: uint64 = 0
+    while i < n:
+        buf[i] = cast[uint8]((seed + i) & 0xFF)
+        i = i + 1
+
+
+def _bc_cmp(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def blk_bcache_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [bcache] marker lines.
+    _blk_ds_emerg0("[bcache] self-test start\n")
+
+    slot: int32 = find_blockdev("ram0")
+    if slot < 0:
+        _blk_ds_emerg0("[bcache] FAIL: ram0 not registered\n")
+        return 0
+    su: uint64 = cast[uint64](slot)
+
+    span_bytes: uint64 = _BC_TEST_SPAN * SECTOR_SIZE
+    ok: int32 = 1
+
+    # (1) Seed the span on the device with a known pattern, then drop the
+    # whole cache so the first read below is a guaranteed cold miss.
+    _bc_fill(&_bc_wbuf[0], span_bytes, 0x40)
+    wrc: int32 = blk_write_sectors(slot, _BC_TEST_BASE, _BC_TEST_SPAN,
+                                   &_bc_wbuf[0])
+    if wrc != 0:
+        _blk_ds_emerg1("[bcache] FAIL: seed write rc=%d\n",
+                       cast[uint64](cast[int64](wrc)))
+        return 0
+    bcache_invalidate_all()
+
+    # (2) Cold read: a full MISS that populates the cache. Snapshot the
+    # device rd_ios and the cache hit counter immediately after.
+    rd_a: uint64 = blk_stats_rd_ios(slot)
+    hit_a: uint64 = bcache_hits()
+    miss_a: uint64 = bcache_misses()
+    rc1: int32 = blk_read_sectors(slot, _BC_TEST_BASE, _BC_TEST_SPAN,
+                                  &_bc_rbuf[0])
+    if rc1 != 0:
+        _blk_ds_emerg1("[bcache] FAIL: cold read rc=%d\n",
+                       cast[uint64](cast[int64](rc1)))
+        return 0
+    if _bc_cmp(&_bc_rbuf[0], &_bc_wbuf[0], span_bytes) == 0:
+        _blk_ds_emerg0("[bcache] FAIL: cold read returned wrong bytes\n")
+        ok = 0
+    rd_b: uint64 = blk_stats_rd_ios(slot)
+    miss_b: uint64 = bcache_misses()
+    _blk_ds_emerg2("[bcache] cold read: rd_ios %d -> %d (device I/O)\n",
+                   rd_a, rd_b)
+    if rd_b == rd_a:
+        _blk_ds_emerg0("[bcache] FAIL: cold read did NOT hit the device\n")
+        ok = 0
+    if miss_b == miss_a:
+        _blk_ds_emerg0("[bcache] FAIL: cold read did not count a miss\n")
+        ok = 0
+
+    # (3) Warm read of the SAME span: must be a cache HIT, device rd_ios
+    # FLAT, hit counter up by 1, miss counter unchanged.
+    hit_c: uint64 = bcache_hits()
+    miss_c: uint64 = bcache_misses()
+    rc2: int32 = blk_read_sectors(slot, _BC_TEST_BASE, _BC_TEST_SPAN,
+                                  &_bc_rbuf[0])
+    if rc2 != 0:
+        _blk_ds_emerg1("[bcache] FAIL: warm read rc=%d\n",
+                       cast[uint64](cast[int64](rc2)))
+        return 0
+    if _bc_cmp(&_bc_rbuf[0], &_bc_wbuf[0], span_bytes) == 0:
+        _blk_ds_emerg0("[bcache] FAIL: warm read returned wrong bytes\n")
+        ok = 0
+    rd_c: uint64 = blk_stats_rd_ios(slot)
+    hit_d: uint64 = bcache_hits()
+    miss_d: uint64 = bcache_misses()
+    _blk_ds_emerg2("[bcache] warm read: rd_ios %d (was %d) — must be FLAT\n",
+                   rd_c, rd_b)
+    if rd_c != rd_b:
+        _blk_ds_emerg0("[bcache] FAIL: warm read hit the device (rd_ios moved)\n")
+        ok = 0
+    if hit_d != hit_c + 1:
+        _blk_ds_emerg2("[bcache] FAIL: hit counter %d -> %d (expected +1)\n",
+                       hit_c, hit_d)
+        ok = 0
+    if miss_d != miss_c:
+        _blk_ds_emerg0("[bcache] FAIL: warm read counted a miss\n")
+        ok = 0
+    if rd_c == rd_b and hit_d == hit_c + 1 and miss_d == miss_c:
+        _blk_ds_emerg0("[bcache] PASS: warm read served from cache, device FLAT\n")
+
+    # (4) Write-through coherence: overwrite one sector with NEW bytes, then
+    # read it back. The cached copy must reflect the new bytes (no stale).
+    _bc_fill(&_bc_wbuf[0], SECTOR_SIZE, 0xA5)
+    wrc2: int32 = blk_write_sectors(slot, _BC_TEST_BASE, 1, &_bc_wbuf[0])
+    if wrc2 != 0:
+        _blk_ds_emerg1("[bcache] FAIL: coherence write rc=%d\n",
+                       cast[uint64](cast[int64](wrc2)))
+        return 0
+    rc3: int32 = blk_read_sectors(slot, _BC_TEST_BASE, 1, &_bc_rbuf[0])
+    if rc3 != 0:
+        _blk_ds_emerg1("[bcache] FAIL: post-write read rc=%d\n",
+                       cast[uint64](cast[int64](rc3)))
+        return 0
+    if _bc_cmp(&_bc_rbuf[0], &_bc_wbuf[0], SECTOR_SIZE) == 0:
+        _blk_ds_emerg0("[bcache] FAIL: stale cached sector after write\n")
+        ok = 0
+    else:
+        _blk_ds_emerg0("[bcache] PASS: write-through coherence, no stale sector\n")
+
+    if ok == 1:
+        _blk_ds_emerg0("[bcache] PASS\n")
+        return 1
+    _blk_ds_emerg0("[bcache] FAIL\n")
     return 0

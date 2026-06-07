@@ -494,6 +494,16 @@ if os.environ.get("ENABLE_SMP_SOAK") == "1":
 if os.environ.get("ENABLE_SCHED_FAIR") == "1":
     FILES.append(("/etc/sched-fair", b"1\n"))
 
+# Write-through block buffer cache self-test. scripts/test_bcache.sh sets
+# ENABLE_BCACHE_TEST=1 to plant /etc/bcache-test. init/main.ad at
+# boot:37.bcache detects the marker and calls blk_bcache_selftest()
+# (kernel/block/blk.ad): it writes/reads ram0 through blk_read_sectors /
+# blk_write_sectors and asserts a warm re-read is served from the cache
+# (device rd_ios FLAT, hit counter rises) and that a write keeps the cache
+# coherent (no stale sector). Default boots omit the marker.
+if os.environ.get("ENABLE_BCACHE_TEST") == "1":
+    FILES.append(("/etc/bcache-test", b"1\n"))
+
 # GPU track #181 Phase 0: native Vulkan-shaped software-rasterizer spine
 # self-test. scripts/test_vk_software_raster.sh sets ENABLE_VK_TEST=1 to
 # plant /etc/vk-test. init/main.ad at boot:37.vk detects the marker and
