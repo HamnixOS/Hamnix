@@ -406,8 +406,12 @@ user_demo_entry:
     .align 16
     .globl smp_user_probe_entry
 smp_user_probe_entry:
-    /* brief CPU-bound spin so the task is unambiguously dispatched */
-    movq    $2000000, %rcx
+    /* brief CPU-bound spin so the task is unambiguously dispatched.
+     * Kept small: under TCG a multi-million-iteration spin can outlast
+     * the BSP self-test's poll budget, so the SYS_WRITE banner (the
+     * ring3->ring0 proof) never lands. 50k is enough to be observably
+     * scheduled while still reaching the syscall promptly. */
+    movq    $50000, %rcx
 .Lspin_probe:
     decq    %rcx
     jnz     .Lspin_probe
