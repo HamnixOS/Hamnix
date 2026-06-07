@@ -199,14 +199,21 @@ after_reaped=$(extract_nth "TasksReaped" 2)
 echo "[memleak_soak] BEFORE: PagesInUse=${before_pages:-?} VmaNodesLive=${before_vma:-?} TasksLive=${before_tasks:-?} Spawned=${before_spawned:-?} Reaped=${before_reaped:-?}"
 echo "[memleak_soak] AFTER:  PagesInUse=${after_pages:-?}  VmaNodesLive=${after_vma:-?}  TasksLive=${after_tasks:-?}  Spawned=${after_spawned:-?}  Reaped=${after_reaped:-?}"
 
-# Validate spawn/reap accounting: every spawned task should be reaped.
-if [ -n "$after_spawned" ] && [ -n "$after_reaped" ]; then
+# Validate spawn/reap accounting: every task spawned DURING the soak should
+# be reaped. (spawned - reaped) counts all still-live spawned tasks, which
+# always includes the persistent boot tasks (init + the shells) that are
+# alive by design and never reaped. Compare against the boot baseline rather
+# than a magic constant so this auto-tracks the persistent-task count if it
+# changes again — a true leak shows up as growth above that baseline.
+if [ -n "$after_spawned" ] && [ -n "$after_reaped" ] \
+   && [ -n "$before_spawned" ] && [ -n "$before_reaped" ]; then
     unreaped=$(( after_spawned - after_reaped ))
-    echo "[memleak_soak] Unreaped tasks (spawned - reaped): ${unreaped}"
-    if [ "$unreaped" -le 2 ]; then
-        echo "[memleak_soak] OK: spawn/reap accounting balanced (unreaped=${unreaped})"
+    base_unreaped=$(( before_spawned - before_reaped ))
+    echo "[memleak_soak] Unreaped tasks (spawned - reaped): ${unreaped} (boot baseline ${base_unreaped})"
+    if [ "$unreaped" -le "$base_unreaped" ]; then
+        echo "[memleak_soak] OK: spawn/reap accounting balanced (unreaped=${unreaped} <= baseline ${base_unreaped})"
     else
-        echo "[memleak_soak] FAIL: ${unreaped} tasks spawned but never reaped"
+        echo "[memleak_soak] FAIL: ${unreaped} live spawned tasks exceeds boot baseline ${base_unreaped} (leak)"
         fail=1
     fi
 fi
