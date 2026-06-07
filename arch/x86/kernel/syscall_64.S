@@ -59,11 +59,20 @@ syscall_entry:
      * user stack first so we can restore it on return.
      */
     pushq   %r12                      /* park user %r12 on user stack */
+    pushq   %r13                      /* park user %r13 (per-CPU scratch) */
 
-    /* %r12 = current task's kernel stack top (TSS.RSP0). schedule()
-     * keeps tss64.rsp0 pointed at task->kstack_top on every switch. */
-    leaq    tss64(%rip), %r12
-    movq    4(%r12), %r12
+    /* %r12 = current task's kernel stack top = THIS CPU's TSS.RSP0.
+     * schedule() keeps per_cpu_tss[cpu_id].rsp0 pointed at
+     * task->kstack_top on every switch. PER-CPU: the syscall runs on
+     * whatever CPU the user task is on, so we must read THAT CPU's TSS,
+     * not a single global one — index per_cpu_tss[] by cpu_id (%gs:0,
+     * the cpu_id_pcpu slot; kernel %gs is the per-CPU area base, no
+     * swapgs in Hamnix). TSS_STRIDE = 128 = 1<<7. */
+    movq    %gs:0, %r12               /* r12 = cpu_id                    */
+    shlq    $7, %r12                  /* r12 = cpu_id * 128 (TSS_STRIDE) */
+    movabsq $per_cpu_tss, %r13        /* r13 = &per_cpu_tss[0]           */
+    addq    %r13, %r12                /* r12 = &per_cpu_tss[cpu_id]      */
+    movq    4(%r12), %r12             /* r12 = TSS.RSP0 (kstack top)     */
 
     /* Park user RSP at kstack_top - 8, then switch to that slot.
      * After this, subsequent pushes land below the user-RSP slot,
@@ -147,8 +156,9 @@ syscall_entry:
      * pulls user %r12 from the user stack and sysretq returns. */
     popq    %rcx                      /* user RIP    */
     popq    %r11                      /* user RFLAGS */
-    popq    %rsp                      /* user rsp    */
-    popq    %r12                      /* user %r12   */
+    popq    %rsp                      /* user rsp (= user_rsp - 16) */
+    popq    %r13                      /* user %r13 (parked 2nd, lowest) */
+    popq    %r12                      /* user %r12 (parked 1st)     */
 
     sysretq                           /* CPL 0 -> 3, RIP=%rcx       */
 
@@ -381,6 +391,42 @@ user_demo_entry:
 .user_demo_hang:
     jmp     .user_demo_hang
 
+/* ---------- smp_user_probe_entry: ring-3 STAGE-A SMP proof -------- *
+ * A minimal ring-3 payload used by smp_user_ap_selftest() to prove a
+ * USER task can run on a NON-BSP CPU (AP) without faulting. It:
+ *   1. busy-loops briefly (so it is observably "running" CPU-bound and
+ *      the dispatch accounting records the CPU it ran on), then
+ *   2. issues ONE SYS_WRITE banner — this is the load-bearing step: the
+ *      SYSCALL from CPL3 on the AP reads the AP's OWN per_cpu_tss RSP0
+ *      (the Stage-A fix); a missing/shared TSS would fault here, then
+ *   3. SYS_EXIT, which self-reaps the task back to the AP idle loop.
+ * Kept deliberately syscall-light (no open/read of files) so the proof
+ * exercises exactly the ring3->ring0 transition the per-CPU TSS enables,
+ * with no dependency on a per-task fd table.                            */
+    .align 16
+    .globl smp_user_probe_entry
+smp_user_probe_entry:
+    /* brief CPU-bound spin so the task is unambiguously dispatched */
+    movq    $2000000, %rcx
+.Lspin_probe:
+    decq    %rcx
+    jnz     .Lspin_probe
+
+    /* SYS_WRITE(2, banner, len) — stderr, via the AP's per-CPU TSS RSP0 */
+    movq    $2, %rdi
+    leaq    smp_user_probe_banner(%rip), %rsi
+    movq    $smp_user_probe_banner_end - smp_user_probe_banner, %rdx
+    movq    $8, %rax                   /* SYS_WRITE                  */
+    syscall
+
+    /* SYS_EXIT(0) — never returns; task self-reaps to AP idle loop */
+    movq    $0, %rdi
+    movq    $1, %rax                   /* SYS_EXIT                   */
+    syscall
+
+.smp_user_probe_hang:
+    jmp     .smp_user_probe_hang
+
 /* ---------- user-mode .data / .rodata ----------------------------
  * fname_motd is a string literal we point SYS_OPEN at. user_read_buf
  * is the 64-byte chunk SYS_READ fills.  Both pages are U=1 because
@@ -397,6 +443,9 @@ user_seek_label_end:
 user_eot:
     .ascii "\n[user] (stderr) done.\n"
 user_eot_end:
+smp_user_probe_banner:
+    .ascii "[smp_user] ring3 task ran a syscall on its CPU\n"
+smp_user_probe_banner_end:
 
     .section .data
     .align 8

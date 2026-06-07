@@ -66,6 +66,10 @@ extern def cpu_relax()
 extern def enter_first_task_sysret(task: Ptr[uint8])
 extern def kthread_bootstrap()
 extern def tss_set_rsp0(rsp0: uint64)
+# Stage-A SMP proof: a minimal ring-3 payload (busy-loop + one SYS_WRITE
+# + SYS_EXIT) used by smp_user_ap_selftest() to prove a USER task runs on
+# a non-BSP CPU through that CPU's own per-CPU TSS. Body in syscall_64.S.
+extern def smp_user_probe_entry()
 extern def local_irq_disable()
 extern def local_irq_enable()
 # Atomic sti;hlt — the idle CPU's race-free wait primitive (Linux's
@@ -2317,12 +2321,13 @@ def _pick_next() -> int32:
     # Eligibility (unchanged from the round-robin version):
     #   • Only STATE_READY is considered — a STATE_RUNNING task is already
     #     executing on some CPU and must not be double-dispatched.
-    #   • On AP cores (cpu_id != 0) user tasks (is_user != 0) are SKIPPED.
-    #     User tasks require TSS.RSP0 to be per-CPU (so IRQ-from-user lands
-    #     on the right kernel stack), which is not yet implemented.  APs only
-    #     run kernel threads; this constraint is relaxed once per-CPU TSSs
-    #     are wired up.  On the BSP (cpu_id == 0) all READY tasks are
-    #     eligible.
+    #   • User tasks (is_user != 0) are now eligible on ANY CPU. Each CPU
+    #     has its OWN per-CPU TSS (per_cpu_tss[], loaded with ltr during
+    #     bring-up) whose RSP0 schedule() keeps pointing at the dispatched
+    #     task's kstack, so a ring3->ring0 transition (IRQ/syscall from a
+    #     user task) on an AP lands on the right kernel stack instead of
+    #     faulting. This is the change that lets the second CPU run USER
+    #     work — the old "is_user==0 on APs" pin is gone.
     #   • Slot 0 is the BSP boot task and must only run on the BSP.
     #
     # Tie-break: among equal-vruntime eligibles we prefer a DIFFERENT slot
@@ -2350,9 +2355,10 @@ def _pick_next() -> int32:
     while r < NTASKS:
         if task_table[r].state == STATE_READY:
             relig: uint64 = 0
-            if on_bsp != 0 or task_table[r].is_user == 0:
-                if on_bsp != 0 or r != 0:
-                    relig = 1
+            # Slot 0 (BSP boot task) is BSP-only; everything else (incl.
+            # user tasks) is eligible on any CPU thanks to per-CPU TSS.
+            if on_bsp != 0 or r != 0:
+                relig = 1
             if relig != 0 and sched_is_realtime(r) != 0:
                 rp:  uint64 = g_rt_priority[r]
                 rsq: uint64 = g_rt_enqueue_seq[r]
@@ -2382,9 +2388,10 @@ def _pick_next() -> int32:
     while i < NTASKS:
         if task_table[i].state == STATE_READY:
             elig: uint64 = 0
-            if on_bsp != 0 or task_table[i].is_user == 0:
-                if on_bsp != 0 or i != 0:
-                    elig = 1
+            # Slot 0 (BSP boot task) is BSP-only; everything else (incl.
+            # user tasks) is eligible on any CPU thanks to per-CPU TSS.
+            if on_bsp != 0 or i != 0:
+                elig = 1
             if elig != 0:
                 v: uint64 = task_table[i].vruntime
                 if best < 0:
@@ -2496,12 +2503,12 @@ def schedule():
     # Update RSP0 BEFORE the swap so a stray CPL-3 IRQ that happens
     # between this point and the next sysret/iretq still lands on
     # the right stack.
-    # SMP gate: TSS.RSP0 is a SINGLE global TSS shared by all CPUs.
-    # Only the BSP (cpu 0) can safely write it — an AP updating TSS.RSP0
-    # would corrupt the BSP's IRQ-from-user landing stack.  APs only run
-    # kernel threads (is_user == 0), so they never need RSP0 updates.
-    if get_cpu_id() == 0:
-        tss_set_rsp0(task_table[nxt].kstack_top)
+    # PER-CPU TSS: tss_set_rsp0 now indexes per_cpu_tss[] by the CALLING
+    # CPU's logical id (read from %gs:0), so every CPU updates ITS OWN
+    # TSS.RSP0 — there is no shared TSS to corrupt. This is what lets an
+    # AP run user tasks: a ring3->ring0 transition on the AP loads RSP0
+    # from the AP's own TSS. Always update; cheap and correct on all CPUs.
+    tss_set_rsp0(task_table[nxt].kstack_top)
 
     # Switch page tables if the incoming task uses a different PML4.
     # Skipping the write when CR3 wouldn't change avoids a needless
@@ -2825,7 +2832,12 @@ def sched_ap_idle_loop():
                 # of the same task's stack frame.
                 if scan != 0:
                     if task_table[scan].state == STATE_READY:
-                        if task_table[scan].is_user == 0:
+                        # Per-CPU TSS now lets an AP run USER tasks too: it
+                        # has its own TSS.RSP0 (set below before the switch)
+                        # so a ring3->ring0 transition on this AP is safe.
+                        # The old `is_user == 0` filter that pinned user work
+                        # to the BSP is gone.
+                        if True:
                             sv: uint64 = task_table[scan].vruntime
                             srt: uint64 = sched_is_realtime(scan)
                             spri: uint64 = g_rt_priority[scan]
@@ -2865,6 +2877,26 @@ def sched_ap_idle_loop():
             # #151: record the dispatch on THIS CPU (SMP balance marker).
             sched_note_dispatch(nxt)
             ap_idle_dispatches = ap_idle_dispatches + 1
+
+            # PER-CPU TSS / user-task dispatch on an AP. Mirror the prologue
+            # of schedule() so a USER task dispatched here behaves exactly as
+            # on the BSP:
+            #   • TSS.RSP0 -> this task's kstack_top so a ring3->ring0
+            #     transition (IRQ/syscall) on THIS AP lands on the right
+            #     kernel stack (tss_set_rsp0 indexes the AP's own per_cpu_tss).
+            #   • CR3 -> this task's PML4 so its user address space is live
+            #     before iretq/sysret reaches CPL 3. The idle kthread's cr3 is
+            #     the kernel PML4 (get_bsp_cr3, set in kthread_create), and a
+            #     user task has its own private PML4; switch only when they
+            #     differ, exactly like schedule()'s __switch_mm fast-path.
+            #     On switch-BACK, the user task's own schedule() call already
+            #     reloads the idle kthread's (kernel) CR3 via the same guard,
+            #     so no CR3 fix-up is needed after __switch_to_asm returns.
+            #   • FS_BASE -> this task's TLS base (0 for native/kernel tasks).
+            tss_set_rsp0(task_table[nxt].kstack_top)
+            if task_table[nxt].cr3 != task_table[my_idle_slot].cr3:
+                load_cr3(task_table[nxt].cr3)
+            write_msr(SCHED_IA32_FS_BASE, task_table[nxt].fs_base)
             spinlock_unlock(&rq_lock)
 
             # Context-switch to the real task.  When it eventually calls
@@ -2905,9 +2937,12 @@ def sched_ap_idle_loop():
             while rescan < NTASKS and sched_ap_steal_enabled != 0:
                 if rescan != my_idle_slot and rescan != 0:
                     if task_table[rescan].state == STATE_READY:
-                        if task_table[rescan].is_user == 0:
-                            woke = 1
-                            rescan = NTASKS
+                        # Per-CPU TSS: user tasks are runnable on this AP too,
+                        # so a READY user task must also block the hlt (else
+                        # we'd sleep through a dispatchable user task and only
+                        # pick it up on the next IPI). Drop the is_user filter.
+                        woke = 1
+                        rescan = NTASKS
                 rescan = rescan + 1
             spinlock_unlock(&rq_lock)
             # One-time-per-CPU banner: this AP idles via hlt + reschedule IPI.
@@ -6777,3 +6812,91 @@ def sched_fair_smp_selftest():
         # The test script distinguishes the -smp 1 and -smp 2 cases.
         printk0("[sched_fair] NOTE: workers ran on a single CPU (smp1 or AP idle)\n")
     printk0("[sched_fair] self-test complete\n")
+
+
+# STAGE A per-CPU TSS proof (gated on /etc/smp-user in the initramfs,
+# planted by build_initramfs.py when ENABLE_SMP_USER=1). Proves the
+# headline Stage-A deliverable: a USER task (is_user=1, CPL3) is
+# dispatched and runs on a NON-BSP CPU (cpu1) without faulting — which is
+# only possible because each CPU now has its own per_cpu_tss (loaded with
+# ltr during bring-up) whose RSP0 the AP dispatch path keeps pointing at
+# the running task's kstack, so the ring3->ring0 transition the task's
+# SYS_WRITE/SYS_EXIT triggers on the AP lands on a valid kernel stack.
+#
+# Method (mirrors sched_fair_smp_selftest's phase-2 AP hand-off, but with
+# a USER task instead of a kthread):
+#   1. Fence the AP OFF, create the user task running smp_user_probe_entry
+#      (STATE_READY, detached so it self-reaps on SYS_EXIT).
+#   2. Fence the AP ON and kick it with smp_send_reschedule(); the BSP does
+#      NOT call schedule() — it only spin-polls — so the BSP never steals
+#      the task and the AP is the only CPU that can run it.
+#   3. While the task is alive, snapshot its cpu_runs[1] (dispatches on
+#      cpu1) — keep the max seen, since the slot is recycled on self-reap.
+#   4. Assert the task ran on cpu1 and emit a PASS/FAIL banner the test
+#      script greps.
+# Runs on the BSP boot task before start_first_task(), same context the
+# soak / sched-fair self-tests use.
+smp_user_probe_done: uint64 = 0
+
+
+def smp_user_ap_selftest():
+    printk0("[smp_user] starting Stage-A per-CPU-TSS USER-on-AP self-test\n")
+    if get_cpus_online() < 2:
+        printk0("[smp_user] NOTE: only 1 CPU online — cannot prove AP user run\n")
+        printk0("[smp_user] self-test complete\n")
+        return
+
+    # Phase 1: create the user probe task with the AP fenced off so the
+    # BSP can't see it dispatched anywhere yet. is_user=1 is set by
+    # create_user_task (CPL3 task with its own PML4 + user stack).
+    sched_ap_steal_enabled = 0
+    smp_user_probe_done = 0
+    local_irq_disable()
+    spinlock_lock(&rq_lock)
+    uslot: int32 = create_user_task(cast[uint64](&smp_user_probe_entry), 0)
+    if uslot >= 0:
+        task_table[cast[uint64](uslot)].detached = 1
+    spinlock_unlock(&rq_lock)
+    local_irq_enable()
+    if uslot < 0:
+        printk0("[smp_user] FAIL: could not create user probe task\n")
+        return
+    us: uint64 = cast[uint64](uslot)
+    printk1("[smp_user] user probe task @ slot %d (is_user=%d)\n", us)
+
+    # Phase 2: hand it to the AP. Enable steal, kick the AP out of HLT, and
+    # spin-poll WITHOUT scheduling on the BSP so only the AP can run it.
+    cpu1_seen: uint64 = 0
+    sched_ap_steal_enabled = 1
+    smp_send_reschedule()
+    MAXI_U: uint64 = 4000000
+    itu: uint64 = 0
+    while task_table[us].state != STATE_FREE and itu < MAXI_U:
+        # Snapshot dispatches-on-cpu1 while the slot is still live (it is
+        # recycled the instant the task self-reaps to STATE_FREE).
+        c1: uint64 = task_table[us].cpu_runs[1]
+        if c1 > cpu1_seen:
+            cpu1_seen = c1
+        r: uint64 = 0
+        while r < 512:
+            cpu_relax()
+            r = r + 1
+        itu = itu + 1
+        # Keep nudging: under TCG the AP may re-HLT between dispatches.
+        smp_send_reschedule()
+    # One last snapshot in case it ran-and-reaped between our checks.
+    c1f: uint64 = task_table[us].cpu_runs[1]
+    if c1f > cpu1_seen:
+        cpu1_seen = c1f
+    # Re-fence the AP for the rest of boot.
+    sched_ap_steal_enabled = 0
+
+    printk2("[smp_user] AP diag: idle_laps=%d ap_dispatches=%d\n",
+            ap_idle_laps, ap_idle_dispatches)
+    printk1("[smp_user] user probe dispatched on cpu1: %d time(s)\n",
+            cpu1_seen)
+    if cpu1_seen > 0:
+        printk0("[smp_user] PASS: USER task ran on a non-BSP CPU (cpu1) via per-CPU TSS\n")
+    else:
+        printk0("[smp_user] FAIL: USER task never dispatched on cpu1\n")
+    printk0("[smp_user] self-test complete\n")

@@ -380,7 +380,7 @@ get_trap_diag_ist_stack_top:
     leaq    _trap_diag_ist_stack_top(%rip), %rax
     ret
 
-/* ---------- tss_set_ist1: install IST1 into the already-active TSS  *
+/* ---------- tss_set_ist1: install IST1 into the CALLING CPU's TSS  *
  * AMD64 TSS layout (matches tss_asm.S header comment):
  *   offset 0   reserved   (4)
  *   offset 4   RSP0       (8)
@@ -391,12 +391,23 @@ get_trap_diag_ist_stack_top:
  *   offset 44  IST2       (8)
  *   ...
  * The CPU re-reads TSS.IST1 on the next exception-with-IST entry; no
- * TR reload required (mirrors tss_set_rsp0 in tss_asm.S).             */
+ * TR reload required (mirrors tss_set_rsp0 in tss_asm.S).
+ *
+ * Per-CPU: indexes per_cpu_tss[] (in tss_asm.S) by the calling CPU's
+ * logical id (cpu_id_pcpu @ %gs:0), so each CPU sets its OWN #DF stack. */
+    .equ TSS_STRIDE_TRAP, 128
+    .equ NR_TSS_CPUS_TRAP, 16
     .align 16
     .globl tss_set_ist1
 tss_set_ist1:
-    leaq    tss64(%rip), %rax           /* tss64 lives in tss_asm.S    */
-    movq    %rdi, 36(%rax)              /* TSS.IST1 = arg              */
+    movq    %gs:0, %rcx                 /* rcx = cpu_id (cpu_id_pcpu)  */
+    cmpq    $NR_TSS_CPUS_TRAP, %rcx
+    jb      1f
+    xorq    %rcx, %rcx                  /* clamp bogus id to 0          */
+1:  imulq   $TSS_STRIDE_TRAP, %rcx, %rax
+    movabsq $per_cpu_tss, %r11
+    addq    %r11, %rax                  /* rax = &per_cpu_tss[cpu_id]   */
+    movq    %rdi, 36(%rax)              /* TSS.IST1 = arg               */
     ret
 
 /* ---------- BSS storage ------------------------------------------ */

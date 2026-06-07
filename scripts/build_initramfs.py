@@ -494,6 +494,15 @@ if os.environ.get("ENABLE_SMP_SOAK") == "1":
 if os.environ.get("ENABLE_SCHED_FAIR") == "1":
     FILES.append(("/etc/sched-fair", b"1\n"))
 
+# Stage-A per-CPU TSS proof. scripts/test_smp_user.sh sets ENABLE_SMP_USER=1
+# to plant /etc/smp-user. init/main.ad at boot:37.smp_user detects the
+# marker and calls smp_user_ap_selftest() (kernel/sched/core.ad): it spawns
+# a CPL3 USER task and fences it onto the AP, proving a user task runs on a
+# non-BSP CPU (cpu1) through that CPU's own per-CPU TSS. Default boots omit
+# the marker.
+if os.environ.get("ENABLE_SMP_USER") == "1":
+    FILES.append(("/etc/smp-user", b"1\n"))
+
 # Write-through block buffer cache self-test. scripts/test_bcache.sh sets
 # ENABLE_BCACHE_TEST=1 to plant /etc/bcache-test. init/main.ad at
 # boot:37.bcache detects the marker and calls blk_bcache_selftest()
