@@ -55,6 +55,26 @@ spinlock_lock:
 .Lspin_done:
     ret
 
+/* ---------- spinlock_trylock(ptr: Ptr[uint32]) -> uint32 ----------
+ * Single atomic attempt to acquire. Returns 1 (in %eax) if the lock was
+ * free and is now held by the caller, 0 if it was already held (no spin).
+ * Used by the scheduler's cross-CPU work-steal / migration paths to take
+ * a SECOND runqueue lock without risking deadlock: if the trylock fails
+ * the caller backs off and retries with a strict lock ordering, so two
+ * CPUs can never wedge holding each other's rq lock.
+ */
+    .align 16
+    .globl spinlock_trylock
+spinlock_trylock:
+    /* %rdi = lock word address (uint32 *) */
+    movl    $1, %eax                    /* value to swap in (1 = locked) */
+    xchgl   %eax, (%rdi)                /* %eax <- old value, [rdi] <- 1 */
+    /* old==0 => we acquired it => return 1; old==1 => held => return 0. */
+    testl   %eax, %eax
+    setz    %al                         /* %al = (old == 0) ? 1 : 0 */
+    movzbl  %al, %eax
+    ret
+
 /* ---------- spinlock_unlock(ptr: Ptr[uint32]) --------------------- */
     .align 16
     .globl spinlock_unlock

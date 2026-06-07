@@ -50,7 +50,10 @@ from arch.x86.kernel.time import get_jiffies
 # SMP reschedule IPI: kick idle APs out of HLT when a kernel task becomes
 # runnable so they re-scan the shared runqueue (Linux's smp_send_reschedule).
 # No-op on a uniprocessor boot (gated on cpus_online > 1 inside the helper).
-from arch.x86.kernel.apic import smp_send_reschedule
+from arch.x86.kernel.apic import smp_send_reschedule, smp_send_reschedule_cpu
+# Per-CPU runqueue (#6): how many CPUs are live, so the placement / steal
+# logic knows the valid logical-CPU id range to spread runnable work over.
+from arch.x86.kernel.smp import get_cpus_online
 
 extern def __switch_to_asm(prev: Ptr[uint8], next: Ptr[uint8])
 extern def enter_first_task(task: Ptr[uint8])
@@ -58,6 +61,9 @@ extern def enter_first_task(task: Ptr[uint8])
 # Used to protect shared runqueue mutations so APs and BSP don't race.
 extern def spinlock_lock(ptr: Ptr[uint32])
 extern def spinlock_unlock(ptr: Ptr[uint32])
+# Per-CPU rq (#6): single-shot acquire for cross-CPU steal/migration; returns
+# 1 if acquired, 0 if already held (no spin) so the caller can back off.
+extern def spinlock_trylock(ptr: Ptr[uint32]) -> uint32
 extern def cpu_relax()
 # M16.155: SYSRETQ-based first-user-task dispatch — the shipping
 # first-task entry path. Both enter_first_task (IRETQ) and
@@ -705,6 +711,18 @@ class TaskStruct:
     wait_next:     uint64
     wait_on:       uint64
     wait_signaled: uint64
+    # Per-CPU runqueue (#6): the logical CPU id whose runqueue currently
+    # OWNS this task while it is STATE_READY or STATE_RUNNING. _pick_next()
+    # on CPU c considers ONLY slots with rq_cpu == c, so the dispatch hot
+    # path consults the LOCAL runqueue under the LOCAL rq lock alone — no
+    # global lock. Set when a task is made runnable (sched_enqueue_on /
+    # placement), updated atomically under the owning rq lock when a task is
+    # work-stolen / migrated to another CPU. Slot 0 (BSP boot task) is always
+    # rq_cpu == 0. A STATE_WAIT / STATE_FREE / STATE_STOPPED task's rq_cpu is
+    # stale (meaningless) until it is re-enqueued. 0 on a fresh slot — zeroed
+    # in sched_init_task_weight. Placed at the END of TaskStruct so no
+    # earlier offset shifts.
+    rq_cpu:        uint64
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -791,26 +809,219 @@ next_pid:    uint64 = 1
 # idle kthread slot when it first enters sched_ap_launch().
 current_idx_pcpu: Percpu[uint64]
 
-# Runqueue spinlock.  A single test-and-set lock protecting:
-#   • task_table[*].state mutations in schedule() / sched_ap_idle_loop()
-#   • _find_free_slot() / _pick_next() scans that must see consistent state
+# =====================================================================
+# Per-CPU runqueue locking model (#6 — mirrors Linux's per-CPU struct rq)
+# =====================================================================
 #
-# The lock is NOT held across the __switch_to_asm call itself — only
-# during the brief window of state reads and writes before the switch.
-# This keeps the hold time tiny and avoids deadlock on re-entry
-# (a task that wakes up after being switched to must not try to re-acquire
-# a lock that it doesn't hold yet).
+# BEFORE: one global `rq_lock` serialised EVERY task_table[*].state
+# mutation AND every _pick_next() scan, so two CPUs picking work at the
+# same time contended on a single word. That is the bottleneck this work
+# removes.
 #
-# Hamnix scheduler spinlock design note:
-#   Uniprocessor (BSP-only): the BSP timer ISR fires with interrupts off
-#   (x86 gates interrupts on IRQ entry), so schedule() is naturally
-#   serialised and the lock is always free — the xchg round-trips cache
-#   but never spins, adding negligible latency.
-#   Multiprocessor: an AP calls schedule() from its idle loop (no timer
-#   ISR — APs do NOT have their LAPIC timer armed) while the BSP may call
-#   it from its timer ISR.  The lock prevents a simultaneous double-pick
-#   of the same READY task.
+# AFTER: the runnable set is PARTITIONED per CPU. Each runnable/running
+# task records the logical CPU that owns it in `rq_cpu` (a TaskStruct
+# field). Two locks now exist:
+#
+#   rq_locks[c]  — protects CPU c's runqueue: the READY/RUNNING membership
+#                  of tasks with rq_cpu == c, and the READY<->RUNNING flips
+#                  the dispatch path performs on them. The DISPATCH HOT PATH
+#                  (schedule() on CPU c, sched_ap_idle_loop() on CPU c) takes
+#                  ONLY rq_locks[c]. No global lock on the hot path.
+#
+#   wq_lock      — a single global lock protecting WAIT-QUEUE LIST STRUCTURE
+#                  (WaitQueue.head, task wait_next / wait_on / wait_signaled)
+#                  and the WAIT<->READY transitions of sleepers. This mirrors
+#                  Linux, where wait_queue_head_t has its OWN spinlock,
+#                  distinct from rq->lock. Wake/sleep are not the dispatch
+#                  hot path, so a shared lock here is fine and keeps the
+#                  lost-wakeup proof simple.
+#
+# LOCK ORDERING (deadlock avoidance) — strict, documented rule:
+#   1. wq_lock is the OUTER lock. When a wake needs to flip a sleeper to
+#      READY it takes wq_lock first, then rq_locks[target] (inner). The
+#      dispatch path takes ONLY rq_locks[c] and NEVER wq_lock, so the two
+#      classes never invert.
+#   2. When TWO rq locks are needed at once (cross-CPU work-steal /
+#      migration), they are acquired in ASCENDING cpu-index order, OR via
+#      spinlock_trylock-and-back-off. The steal path here uses trylock on
+#      the victim rq while holding the thief's own rq lock, and simply skips
+#      the steal if the trylock fails — never blocking, never inverting.
+#
+# Neither lock is held across __switch_to_asm: a task switched away from
+# re-enters schedule() later and must not try to re-acquire a lock it no
+# longer holds. Hold windows stay tiny (a scan + a couple of stores).
+#
+# Uniprocessor (BSP-only): the BSP timer ISR fires with IF=0, so schedule()
+# is naturally serialised; rq_locks[0] / wq_lock are always free (the xchg
+# round-trips cache but never spins).
+NR_RQ: uint64 = 16
+rq_locks: Array[16, uint32]
+wq_lock: uint32 = 0
+
+# DEPRECATED single global rq lock. Retained ONLY as the wq_lock alias name
+# was a bigger rename; all former rq_lock sites have been migrated to either
+# wq_lock (wait-queue list + WAIT transitions) or rq_locks[cpu] (runqueue
+# membership). Kept defined to avoid an accidental dangling reference; it is
+# no longer taken anywhere.
 rq_lock: uint32 = 0
+
+
+# IRQ-safe locking (#6): every scheduler lock (wq_lock and rq_locks[*]) is
+# taken with LOCAL INTERRUPTS DISABLED, mirroring Linux's raw_spin_lock_irq*
+# discipline on rq->lock. WHY: wq_wake_*/signal_post run from DEVICE IRQ
+# context and now take rq_locks[target] (to home a woken task). If a CPU
+# held an rq lock with IRQs enabled and a device IRQ fired into wq_wake
+# wanting the SAME lock, the interrupted holder could never release it →
+# self-deadlock. Disabling IRQs around every scheduler-lock hold removes
+# the window entirely.
+#
+# Saved-flags handling: the dispatch/steal paths nest up to TWO scheduler
+# locks (steal holds the local rq lock then trylocks a victim rq). We keep a
+# small PER-CPU stack of saved IRQ-flag words, indexed by get_cpu_id() (a
+# plain Array[NCPU] rather than Percpu[Array] — the latter miscompiles).
+# Depth 4 is ample (max nest = local rq + victim rq, plus wq_lock + one rq).
+_SCHED_IRQ_DEPTH: uint64 = 4
+_sched_irq_flags: Array[64, uint64]      # NR_RQ(16) * depth(4)
+_sched_irq_sp:    Array[16, uint64]      # per-cpu stack pointer (0..depth)
+
+
+def _sched_irq_push():
+    # Disable local IRQs, saving the prior flag word onto this CPU's stack.
+    cid: uint64 = get_cpu_id()
+    if cid >= NR_RQ:
+        cid = 0
+    fl: uint64 = local_irq_save()
+    sp: uint64 = _sched_irq_sp[cid]
+    if sp < _SCHED_IRQ_DEPTH:
+        _sched_irq_flags[cid * _SCHED_IRQ_DEPTH + sp] = fl
+        _sched_irq_sp[cid] = sp + 1
+    # If we ever overflow (should not at depth 4) we simply leave IRQs
+    # disabled until an unbalanced pop; safer than corrupting memory.
+
+
+def _sched_irq_pop():
+    # Restore the IRQ flag word saved by the matching _sched_irq_push.
+    cid: uint64 = get_cpu_id()
+    if cid >= NR_RQ:
+        cid = 0
+    sp: uint64 = _sched_irq_sp[cid]
+    if sp > 0:
+        sp = sp - 1
+        _sched_irq_sp[cid] = sp
+        local_irq_restore(_sched_irq_flags[cid * _SCHED_IRQ_DEPTH + sp])
+    else:
+        # Unbalanced pop (should not happen): default to enabling IRQs.
+        local_irq_enable()
+
+
+def _rq_lock_cpu(cpu: uint64):
+    # Acquire CPU `cpu`'s runqueue lock with local IRQs disabled (IRQ-safe).
+    # Bounds-guarded (a stray out-of-range cpu would corrupt memory).
+    _sched_irq_push()
+    if cpu < NR_RQ:
+        spinlock_lock(&rq_locks[cpu])
+    else:
+        spinlock_lock(&rq_locks[0])
+
+
+def _rq_unlock_cpu(cpu: uint64):
+    if cpu < NR_RQ:
+        spinlock_unlock(&rq_locks[cpu])
+    else:
+        spinlock_unlock(&rq_locks[0])
+    _sched_irq_pop()
+
+
+def _rq_trylock_cpu(cpu: uint64) -> uint32:
+    # IRQ-safe trylock: disable IRQs, attempt acquire. On SUCCESS leave IRQs
+    # disabled (a matching _rq_unlock_cpu will pop). On FAILURE restore IRQs
+    # immediately (no lock was taken, so no nesting to unwind).
+    _sched_irq_push()
+    got: uint32 = 0
+    if cpu < NR_RQ:
+        got = spinlock_trylock(&rq_locks[cpu])
+    else:
+        got = spinlock_trylock(&rq_locks[0])
+    if got == 0:
+        _sched_irq_pop()
+    return got
+
+
+def _wq_lock_irq():
+    # Acquire the global wait-queue lock with local IRQs disabled.
+    _sched_irq_push()
+    spinlock_lock(&wq_lock)
+
+
+def _wq_unlock_irq():
+    spinlock_unlock(&wq_lock)
+    _sched_irq_pop()
+
+
+def sched_pick_target_cpu(slot: uint64) -> uint64:
+    # Per-CPU rq (#6): choose which CPU's runqueue a newly-runnable task
+    # should be placed on. Placement policy (Linux's select_task_rq, much
+    # simplified): pick the ONLINE CPU currently owning the FEWEST runnable
+    # (STATE_READY) tasks, so wakeups spread load. Slot 0 (the BSP boot
+    # task) is always BSP-pinned. A user/kernel task is eligible on any
+    # online CPU (Stage A: per-CPU TSS lets APs run user tasks).
+    #
+    # Caller should hold no rq lock spanning all CPUs; this is a heuristic
+    # read of per-CPU READY counts and a stale count only costs a slightly
+    # uneven placement that the work-steal path later rebalances.
+    if slot == 0:
+        return 0
+    nonline: uint64 = get_cpus_online()
+    if nonline <= 1:
+        return 0
+    best_cpu:   uint64 = 0
+    best_count: uint64 = 0xFFFFFFFFFFFFFFFF
+    c: uint64 = 0
+    while c < nonline and c < NR_RQ:
+        cnt: uint64 = 0
+        i: uint64 = 0
+        while i < NTASKS:
+            if task_table[i].state == STATE_READY:
+                if task_table[i].rq_cpu == c:
+                    cnt = cnt + 1
+            i = i + 1
+        if cnt < best_count:
+            best_count = cnt
+            best_cpu = c
+        c = c + 1
+    return best_cpu
+
+
+def sched_make_ready_on(slot: uint64, target_cpu: uint64):
+    # Per-CPU rq (#6): place `slot` on CPU `target_cpu`'s runqueue and make
+    # it STATE_READY, holding ONLY that CPU's rq lock. Sends a DIRECTED
+    # reschedule IPI to target_cpu so an idle owner falls out of HLT and
+    # dispatches it. Caller must NOT hold target_cpu's rq lock. May be held
+    # under wq_lock (lock order wq_lock -> rq_locks[c] is honoured here).
+    #
+    # Slot 0 is BSP-pinned: force its owner to CPU 0 regardless of the
+    # requested target so the BSP boot task never migrates to an AP.
+    tc: uint64 = target_cpu
+    if slot == 0:
+        tc = 0
+    if tc >= NR_RQ:
+        tc = 0
+    _rq_lock_cpu(tc)
+    task_table[slot].rq_cpu = tc
+    task_table[slot].state  = STATE_READY
+    _rq_unlock_cpu(tc)
+    # Kick the owning CPU (directed). No-op on a uniprocessor; if tc is the
+    # caller's own CPU the IPI self-targets harmlessly (handler just EOIs).
+    smp_send_reschedule_cpu(tc)
+
+
+def sched_make_ready(slot: uint64):
+    # Convenience wrapper: choose a target CPU via the placement policy and
+    # enqueue `slot` there. Used by the generic "this task just became
+    # runnable" sites (new task create, SIGCONT resume, etc.).
+    tc: uint64 = sched_pick_target_cpu(slot)
+    sched_make_ready_on(slot, tc)
+
 
 # Per-AP idle kthread slot indices.  Index = logical CPU id (1..MAX_CPUS-1).
 # sched_prepare_ap_idle() (called by smp_boot_aps before booting each AP)
@@ -1443,6 +1654,11 @@ def rtsched_selftest() -> int32:
     task_table[ub].is_user = 0
     task_table[ua].vruntime = 0
     task_table[ub].vruntime = 0
+    # PER-CPU RUNQUEUE (#6): this self-test runs on the BSP and calls
+    # _pick_next() directly, which only considers rq_cpu == get_cpu_id() (0).
+    # Home both fabricated fixtures on the BSP runqueue so the probe sees them.
+    task_table[ua].rq_cpu = 0
+    task_table[ub].rq_cpu = 0
 
     pass_all: int32 = 1
 
@@ -1580,6 +1796,10 @@ def sched_init_task_weight(slot: uint64):
     task_table[slot].wait_next     = 0
     task_table[slot].wait_on       = 0
     task_table[slot].wait_signaled = 0
+    # Per-CPU rq (#6): a fresh/recycled slot defaults to the BSP runqueue.
+    # The real owning CPU is assigned when the task is first made runnable
+    # (sched_make_ready / placement). Slot 0 (BSP boot task) stays 0.
+    task_table[slot].rq_cpu        = 0
     # getrlimit/setrlimit/prlimit64: seed this slot's per-task resource limits
     # to Linux defaults (8 MiB stack, 1024 nofile, infinite else).
     rlimit_init_task(slot)
@@ -1941,6 +2161,14 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     _init_fd_table(s)
     next_pid = next_pid + 1
     nr_tasks_spawned = nr_tasks_spawned + 1
+    # PER-CPU RUNQUEUE (#6): a freshly-created kthread is HOMED on the
+    # creating CPU's runqueue. This preserves today's create-then-run-here
+    # affinity (the creator's own schedule() picks it up) and the IRQ-mask
+    # mitigation in fork/clone callers; the work-steal / pull path later
+    # migrates it to an idle core if one is starving. rq_cpu MUST be set
+    # BEFORE the STATE_READY publish so any CPU that observes the READY store
+    # also sees the correct owner (x86 stores retire in program order).
+    task_table[s].rq_cpu = get_cpu_id()
     # RACE FIX: publish as runnable only after full init (see note above).
     task_table[s].state = STATE_READY
     return slot
@@ -2306,6 +2534,12 @@ def create_user_thread(entry: uint64, name0: uint64,
     # callers mask IRQs across the create+COW critical section (see
     # do_rfork / do_clone) so the child can't be dispatched onto an
     # un-shared PML4 before its mappings exist.
+    # PER-CPU RUNQUEUE (#6): home the child on the creating CPU's runqueue
+    # (rq_cpu set BEFORE the READY publish). Combined with the caller's
+    # IRQ-mask across create+COW, this keeps the child off any dispatcher
+    # until its address space is fully shared; the pull/steal path migrates
+    # it later if another core is idle.
+    task_table[s].rq_cpu = get_cpu_id()
     task_table[s].state = STATE_READY
     return slot
 
@@ -2318,17 +2552,24 @@ def _pick_next() -> int32:
     # over the <=16-slot task_table — no red-black tree needed at this
     # scale; matches the existing array model.
     #
-    # Eligibility (unchanged from the round-robin version):
+    # PER-CPU RUNQUEUE (#6): this scan now considers ONLY tasks that this
+    # CPU's runqueue OWNS — i.e. rq_cpu == get_cpu_id(). The caller holds
+    # this CPU's rq lock (rq_locks[my_cpu]); no global lock is taken. Tasks
+    # owned by OTHER CPUs are invisible here (they are dispatched by their
+    # own CPU, or pulled over by the work-steal path which RE-ASSIGNS rq_cpu
+    # under the destination lock first). This is what removes the global
+    # lock from the dispatch hot path.
+    #
+    # Eligibility:
     #   • Only STATE_READY is considered — a STATE_RUNNING task is already
     #     executing on some CPU and must not be double-dispatched.
-    #   • User tasks (is_user != 0) are now eligible on ANY CPU. Each CPU
-    #     has its OWN per-CPU TSS (per_cpu_tss[], loaded with ltr during
-    #     bring-up) whose RSP0 schedule() keeps pointing at the dispatched
-    #     task's kstack, so a ring3->ring0 transition (IRQ/syscall from a
-    #     user task) on an AP lands on the right kernel stack instead of
-    #     faulting. This is the change that lets the second CPU run USER
-    #     work — the old "is_user==0 on APs" pin is gone.
-    #   • Slot 0 is the BSP boot task and must only run on the BSP.
+    #   • rq_cpu must equal this CPU (local-runqueue membership).
+    #   • User tasks are eligible on ANY CPU (Stage A: per-CPU TSS), so a
+    #     user task whose rq_cpu == my_cpu is picked here just like a kernel
+    #     task — the old "is_user==0 on APs" pin stays gone.
+    #   • Slot 0 is the BSP boot task: rq_cpu is forced to 0 for it, so it
+    #     only ever appears in the BSP's local scan. The explicit on_bsp
+    #     guard below is belt-and-braces.
     #
     # Tie-break: among equal-vruntime eligibles we prefer a DIFFERENT slot
     # than current_idx_pcpu when one exists, so two CPU-bound tasks at the
@@ -2343,8 +2584,9 @@ def _pick_next() -> int32:
     # round-robin rotation among equal-priority RR peers. The CFS-lite scan
     # below is reached ONLY when no realtime task is runnable, so normal
     # tasks behave EXACTLY as before whenever no RT task competes.
+    my_cpu: uint64 = get_cpu_id()
     on_bsp: uint64 = 0
-    if get_cpu_id() == 0:
+    if my_cpu == 0:
         on_bsp = 1
     cur: uint64 = current_idx_pcpu
 
@@ -2353,7 +2595,7 @@ def _pick_next() -> int32:
     rt_best_seq: uint64 = 0
     r: uint64 = 0
     while r < NTASKS:
-        if task_table[r].state == STATE_READY:
+        if task_table[r].state == STATE_READY and task_table[r].rq_cpu == my_cpu:
             relig: uint64 = 0
             # Slot 0 (BSP boot task) is BSP-only; everything else (incl.
             # user tasks) is eligible on any CPU thanks to per-CPU TSS.
@@ -2386,7 +2628,7 @@ def _pick_next() -> int32:
     best_v: uint64 = 0
     i: uint64 = 0
     while i < NTASKS:
-        if task_table[i].state == STATE_READY:
+        if task_table[i].state == STATE_READY and task_table[i].rq_cpu == my_cpu:
             elig: uint64 = 0
             # Slot 0 (BSP boot task) is BSP-only; everything else (incl.
             # user tasks) is eligible on any CPU thanks to per-CPU TSS.
@@ -2410,47 +2652,153 @@ def _pick_next() -> int32:
     return best
 
 
+def _sched_try_pull_locked(my_cpu: uint64) -> int32:
+    # PER-CPU RUNQUEUE (#6) — PULL-side load balancing. Called by a CPU that
+    # found its OWN runqueue empty (in schedule() / AP idle); it tries to
+    # steal one runnable task from a BUSIER cpu's runqueue and re-home it on
+    # `my_cpu` so the idle core does useful work. Returns the migrated slot,
+    # or -1 if nothing could be pulled.
+    #
+    # CALLER MUST already hold rq_locks[my_cpu]. We acquire the VICTIM cpu's
+    # rq lock with spinlock_trylock ONLY (never blocking): lock order between
+    # two rq locks is "ascending cpu index", but rather than enforce that
+    # ordering we simply back off — if the victim lock is contended we skip
+    # that victim this pass. This makes deadlock structurally impossible: a
+    # CPU never SPINS on a second rq lock while holding its first.
+    #
+    # Eligibility to steal a slot `s` from victim `v`:
+    #   • STATE_READY and rq_cpu == v (genuinely on victim's runqueue).
+    #   • s != 0 (the BSP boot task never migrates off cpu 0).
+    #   • Not currently the victim's running task (handled by STATE_READY:
+    #     a RUNNING task is not READY, so it is never stolen).
+    # We pick the SMALLEST-vruntime eligible victim task (most starved),
+    # mirroring the AP idle loop's existing steal heuristic, and re-stamp
+    # its rq_cpu to my_cpu so the very next _pick_next() on my_cpu sees it.
+    nonline: uint64 = get_cpus_online()
+    if nonline <= 1:
+        return -1
+    v: uint64 = 0
+    while v < nonline and v < NR_RQ:
+        if v != my_cpu:
+            # Try to grab the victim's rq lock without blocking.
+            if _rq_trylock_cpu(v) != 0:
+                steal: int32  = -1
+                steal_v: uint64 = 0
+                s: uint64 = 0
+                while s < NTASKS:
+                    if s != 0 and task_table[s].state == STATE_READY \
+                       and task_table[s].rq_cpu == v:
+                        sv: uint64 = task_table[s].vruntime
+                        if steal < 0 or sv < steal_v:
+                            steal = cast[int32](s)
+                            steal_v = sv
+                    s = s + 1
+                if steal >= 0:
+                    su2: uint64 = cast[uint64](steal)
+                    # Re-home onto my_cpu while BOTH rq locks are held, so
+                    # neither CPU's _pick_next can observe the slot as
+                    # belonging to both at once.
+                    task_table[su2].rq_cpu = my_cpu
+                    _rq_unlock_cpu(v)
+                    return steal
+                _rq_unlock_cpu(v)
+        v = v + 1
+    return -1
+
+
 def schedule():
     # Called from timer_interrupt() (preemption) and from
     # task_exit_current() (cooperative drop). Round-robins the
     # runqueue; updates TSS.RSP0 to the new task's kstack so a
     # subsequent CPL-3 IRQ lands there; then __switch_to.
     #
-    # SMP safety: rq_lock is held during the _pick_next() scan and all
-    # task_table state mutations, then RELEASED before __switch_to_asm.
-    # The lock must not be held across the context switch: the task we
-    # switch away from will re-enter schedule() later (via another
-    # timer tick or cooperative yield) and would deadlock if it tried
-    # to re-acquire a lock it no longer holds.
+    # PER-CPU RUNQUEUE (#6): the dispatch hot path takes ONLY this CPU's own
+    # rq lock (rq_locks[my_cpu]) — never a global lock. _pick_next() scans
+    # only THIS CPU's runnable set (rq_cpu == my_cpu); the prev->READY and
+    # nxt->RUNNING flips below touch only tasks this CPU owns. So two CPUs
+    # dispatching at the same time no longer contend.
     #
-    # On uniprocessor the BSP timer ISR fires with local interrupts
-    # disabled (x86 gates IF on hardware IRQ entry), so rq_lock is
-    # always free on the BSP path — the xchg is a cache round-trip but
-    # never spins.  On AP paths (AP idle loop, cooperative yields from
-    # tasks running on an AP) the lock may briefly contend with the BSP
-    # timer ISR, but the BSP holds it only for microseconds.
-    spinlock_lock(&rq_lock)
+    # The lock must not be held across __switch_to_asm: the task we switch
+    # away from re-enters schedule() later (via another timer tick or
+    # cooperative yield) and would deadlock if it tried to re-acquire a lock
+    # it no longer holds.
+    #
+    # On uniprocessor the BSP timer ISR fires with local interrupts disabled
+    # (x86 gates IF on hardware IRQ entry), so rq_locks[0] is always free on
+    # the BSP path — the xchg is a cache round-trip but never spins.
+    my_cpu: uint64 = get_cpu_id()
+    _rq_lock_cpu(my_cpu)
     nxt_signed: int32 = _pick_next()
     if nxt_signed < 0:
-        # Nobody to run. If even the current task is no longer ready,
-        # there are no live tasks at all; halt the box.
+        # PER-CPU RUNQUEUE (#6): nothing on OUR local runqueue. Before giving
+        # up, try to PULL one runnable task from a busier cpu (load balance),
+        # so an idle core that called schedule() picks up cross-cpu work
+        # instead of stalling. _sched_try_pull_locked re-homes a victim task
+        # onto my_cpu (rq_cpu = my_cpu) under both rq locks, so the retry
+        # _pick_next() below sees it as local.
+        if _sched_try_pull_locked(my_cpu) >= 0:
+            nxt_signed = _pick_next()
+    if nxt_signed < 0:
+        # Nobody to run on THIS cpu's runqueue (and nothing to pull). If even
+        # the current task is no longer ready, this cpu has no live local
+        # task.
         if task_table[current_idx_pcpu].state != STATE_RUNNING and \
            task_table[current_idx_pcpu].state != STATE_READY:
-            spinlock_unlock(&rq_lock)
-            # System-halt notice: stamp EMERG so it always reaches the
-            # live console even after userland went interactive and the
-            # console-loglevel gate tightened (see early_8250.ad).
-            printk_set_level(PRINTK_LEVEL_EMERG)
-            printk0("schedule: no live tasks; halting\n")
-            local_irq_disable()
+            _rq_unlock_cpu(my_cpu)
+            # An AP whose LOCAL runqueue drained is NOT a system-halt
+            # condition — it just returns to its idle loop and HLTs until a
+            # reschedule IPI brings (or it steals) work. Halting the box from
+            # an AP here would wrongly kill a system that still has runnable
+            # work on the BSP.
+            if my_cpu != 0:
+                return
+            # On the BSP: the current task is no longer runnable (it exited /
+            # was reaped / stopped) so we MUST switch away and never resume
+            # it. With per-CPU runqueues a globally-empty LOCAL rq no longer
+            # implies a dead system — another cpu may own the only runnable
+            # task, or every task may be asleep in STATE_WAIT awaiting an IRQ.
+            # So instead of halting outright we IDLE-LOOP: each pass we sti;hlt
+            # (so a device IRQ or reschedule IPI can wake a task / hand us back
+            # work via a future enqueue onto cpu0), then retry a local pick +
+            # cross-cpu pull. We break out (and the box halts) ONLY when the
+            # system is provably dead: no READY task anywhere AND no STATE_WAIT
+            # task that an interrupt could ever revive.
             while True:
+                _rq_lock_cpu(my_cpu)
+                rs: int32 = _pick_next()
+                if rs < 0:
+                    if _sched_try_pull_locked(my_cpu) >= 0:
+                        rs = _pick_next()
+                if rs >= 0:
+                    # Found / pulled work: re-home current_idx onto it and
+                    # context-switch away from the dead task. We re-enter the
+                    # main switch sequence by recursing into schedule(): the
+                    # local rq now has a READY task, so the recursion takes
+                    # the normal switch path and never returns here.
+                    _rq_unlock_cpu(my_cpu)
+                    schedule()
+                    return
+                _rq_unlock_cpu(my_cpu)
+                if _any_task_runnable_global() == 0 and _sched_any_waiter() == 0:
+                    # Provably dead system: nothing runnable, nothing asleep
+                    # that an IRQ could revive. Halt the box.
+                    printk_set_level(PRINTK_LEVEL_EMERG)
+                    printk0("schedule: no live tasks; halting\n")
+                    local_irq_disable()
+                    while True:
+                        asm_volatile("hlt")
+                # Idle one beat with IF=1 so an IRQ / reschedule IPI can fire
+                # and make work runnable, then loop to retry the pick.
+                local_irq_enable()
+                cpu_idle_enter()
                 asm_volatile("hlt")
-        spinlock_unlock(&rq_lock)
+                cpu_idle_leave()
+        _rq_unlock_cpu(my_cpu)
         return
 
     nxt: uint64 = cast[uint64](nxt_signed)
     if nxt == current_idx_pcpu:
-        spinlock_unlock(&rq_lock)
+        _rq_unlock_cpu(my_cpu)
         return  # only one ready task
 
     prev: uint64 = current_idx_pcpu
@@ -2463,10 +2811,13 @@ def schedule():
         prev_was_running = 1
     if task_table[prev].state == STATE_RUNNING:
         task_table[prev].state = STATE_READY
+        # prev stays on THIS cpu's runqueue (it was running here).
+        task_table[prev].rq_cpu = my_cpu
     task_table[nxt].state = STATE_RUNNING
+    task_table[nxt].rq_cpu = my_cpu
     current_idx_pcpu = nxt
 
-    spinlock_unlock(&rq_lock)
+    _rq_unlock_cpu(my_cpu)
 
     # §13: ctxt accounting — this is a real (prev != next) context
     # switch, so count it. /dev/stat's "ctxt" column reads this back.
@@ -2532,16 +2883,52 @@ def schedule():
 
 
 def _another_task_ready() -> uint64:
-    # Returns 1 if some slot OTHER than current_idx_pcpu is STATE_READY —
-    # i.e. there is genuinely a runnable peer to preempt in favour of.
-    # schedule()/_pick_next would early-return when current is the
-    # only READY/RUNNING slot, so the timer ISR uses this to avoid the
-    # cost (and the EOI-ordering subtlety) of a no-op schedule() call.
+    # Returns 1 if some slot OTHER than current_idx_pcpu is STATE_READY ON
+    # THIS CPU'S RUNQUEUE (rq_cpu == my_cpu) — i.e. there is genuinely a
+    # LOCAL runnable peer that schedule() on this CPU would actually switch
+    # to. PER-CPU RUNQUEUE (#6): made CPU-local because _pick_next() only
+    # dispatches local-rq tasks now; a READY task owned by ANOTHER CPU is
+    # not dispatchable here, so it must NOT make this CPU's wq-sleep loop
+    # spin calling a no-op schedule(). The wq-sleep idle path falls through
+    # to sti;hlt instead, and the producer's directed reschedule IPI (plus
+    # the timer tick) wakes it.
+    my_cpu: uint64 = get_cpu_id()
     i: uint64 = 0
     while i < NTASKS:
         if i != current_idx_pcpu:
-            if task_table[i].state == STATE_READY:
+            if task_table[i].state == STATE_READY and \
+               task_table[i].rq_cpu == my_cpu:
                 return 1
+        i = i + 1
+    return 0
+
+
+def _any_task_runnable_global() -> uint64:
+    # Returns 1 if ANY slot on ANY cpu's runqueue is STATE_READY. Used only
+    # by the BSP halt decision in schedule(): the box must halt only when
+    # there is genuinely no runnable work ANYWHERE (and the current task is
+    # not runnable either). A per-CPU-local empty rq is NOT a halt condition.
+    i: uint64 = 0
+    while i < NTASKS:
+        if task_table[i].state == STATE_READY:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _sched_any_waiter() -> uint64:
+    # Returns 1 if ANY slot is in a state an interrupt could later make
+    # runnable: STATE_WAIT (blocked on a wait queue, woken by a producer
+    # IRQ) or STATE_STOPPED (woken by SIGCONT). Used together with
+    # _any_task_runnable_global() by the BSP halt decision: the box halts
+    # only when there is NEITHER runnable work NOR a revivable sleeper. A
+    # RUNNING task elsewhere also counts (it will eventually re-enter the
+    # scheduler), so include it for safety.
+    i: uint64 = 0
+    while i < NTASKS:
+        st: uint64 = task_table[i].state
+        if st == STATE_WAIT or st == STATE_STOPPED or st == STATE_RUNNING:
+            return 1
         i = i + 1
     return 0
 
@@ -2802,22 +3189,15 @@ def sched_ap_idle_loop():
     printk1("SMP: cpu%d kthread alive\n", my_cpu_id)
 
     while True:
-        # Acquire the runqueue lock and look for a READY kernel task.
-        spinlock_lock(&rq_lock)
+        # PER-CPU RUNQUEUE (#6): acquire ONLY this cpu's rq lock and look for
+        # a READY task that THIS cpu's runqueue owns (rq_cpu == my_cpu_id).
+        _rq_lock_cpu(my_cpu_id)
         ap_idle_laps = ap_idle_laps + 1
         my_idle_slot: uint64 = current_idx_pcpu
-        # #151 SMP load balance / work-steal: scan for the smallest-
-        # vruntime STATE_READY kernel-only task other than our own idle
-        # slot, and pull it onto THIS core. Picking by vruntime (rather
-        # than first-fit) means a CPU with an empty/short runqueue steals
-        # the most-starved runnable task from the busier shared set — a
-        # CFS-lite balancing decision over the single shared task_table.
-        #
-        # Realtime override: a runnable realtime (FIFO/RR) kernel task
-        # outranks ALL CFS-lite kernel tasks here too, and among RT peers
-        # the highest rt_priority (then oldest enqueue sequence) wins —
-        # mirroring _pick_next so an AP never runs a normal task while an
-        # eligible realtime kthread is starving.
+        # Scan our LOCAL runqueue for the best dispatchable task: realtime
+        # (FIFO/RR) tier first (highest rt_priority, then oldest enqueue
+        # sequence), else the smallest-vruntime CFS-lite task — mirroring
+        # _pick_next exactly, but restricted to rq_cpu == my_cpu_id.
         found_slot: int32 = -1
         found_v: uint64 = 0
         found_rt:  uint64 = 0
@@ -2827,16 +3207,13 @@ def sched_ap_idle_loop():
         while scan < NTASKS and sched_ap_steal_enabled != 0:
             if scan != my_idle_slot:
                 # Slot 0 is the BSP boot task — never dispatch it on an AP.
-                # The BSP's schedule() manages slot 0's execution context;
-                # an AP picking it up would cause split-brain dual-CPU execution
-                # of the same task's stack frame.
-                if scan != 0:
+                # (rq_cpu==0 for slot 0 keeps it off our local scan anyway;
+                # the explicit guard is belt-and-braces.)
+                if scan != 0 and task_table[scan].rq_cpu == my_cpu_id:
                     if task_table[scan].state == STATE_READY:
                         # Per-CPU TSS now lets an AP run USER tasks too: it
                         # has its own TSS.RSP0 (set below before the switch)
                         # so a ring3->ring0 transition on this AP is safe.
-                        # The old `is_user == 0` filter that pinned user work
-                        # to the BSP is gone.
                         if True:
                             sv: uint64 = task_table[scan].vruntime
                             srt: uint64 = sched_is_realtime(scan)
@@ -2867,12 +3244,25 @@ def sched_ap_idle_loop():
                                 found_seq = sseq
             scan = scan + 1
 
+        # Nothing on our LOCAL runqueue: try to PULL one runnable task from a
+        # busier cpu (work-steal / load balance). _sched_try_pull_locked
+        # re-homes a victim's rq_cpu onto my_cpu_id under both rq locks, so a
+        # successful pull becomes a local READY task we dispatch immediately.
+        if found_slot < 0 and sched_ap_steal_enabled != 0:
+            pulled: int32 = _sched_try_pull_locked(my_cpu_id)
+            if pulled >= 0:
+                found_slot = pulled
+
         if found_slot >= 0:
             nxt: uint64 = cast[uint64](found_slot)
             # Put idle task into READY so schedule() can switch back to
-            # us when the real task yields or exits.
-            task_table[my_idle_slot].state = STATE_READY
-            task_table[nxt].state = STATE_RUNNING
+            # us when the real task yields or exits. Both the idle slot and
+            # the dispatched task belong to THIS cpu's runqueue (rq_cpu set)
+            # so the task's own schedule() will re-pick the idle slot here.
+            task_table[my_idle_slot].state  = STATE_READY
+            task_table[my_idle_slot].rq_cpu = my_cpu_id
+            task_table[nxt].state  = STATE_RUNNING
+            task_table[nxt].rq_cpu = my_cpu_id
             current_idx_pcpu = nxt
             # #151: record the dispatch on THIS CPU (SMP balance marker).
             sched_note_dispatch(nxt)
@@ -2897,7 +3287,7 @@ def sched_ap_idle_loop():
             if task_table[nxt].cr3 != task_table[my_idle_slot].cr3:
                 load_cr3(task_table[nxt].cr3)
             write_msr(SCHED_IA32_FS_BASE, task_table[nxt].fs_base)
-            spinlock_unlock(&rq_lock)
+            _rq_unlock_cpu(my_cpu_id)
 
             # Context-switch to the real task.  When it eventually calls
             # schedule() and finds the idle slot is STATE_READY, it will
@@ -2906,12 +3296,13 @@ def sched_ap_idle_loop():
                             cast[Ptr[uint8]](&task_table[nxt]))
 
             # Re-establish idle as STATE_RUNNING and current.
-            spinlock_lock(&rq_lock)
-            task_table[my_idle_slot].state = STATE_RUNNING
+            _rq_lock_cpu(my_cpu_id)
+            task_table[my_idle_slot].state  = STATE_RUNNING
+            task_table[my_idle_slot].rq_cpu = my_cpu_id
             current_idx_pcpu = my_idle_slot
-            spinlock_unlock(&rq_lock)
+            _rq_unlock_cpu(my_cpu_id)
         else:
-            spinlock_unlock(&rq_lock)
+            _rq_unlock_cpu(my_cpu_id)
             # No ready kernel task right now. LINUX-MIRROR IDLE: the AP now
             # HLTs with interrupts ENABLED and is woken by a directed
             # RESCHEDULE IPI (vector 0xF2), sent by whichever CPU made a
@@ -2930,21 +3321,25 @@ def sched_ap_idle_loop():
             # now on MUST raise the resched IPI — which is held pending while
             # IF=0 and fires the instant safe_halt()'s `sti; hlt` enables it.
             # No wakeup can be lost in the window.
+            # PER-CPU RUNQUEUE (#6): rescan for ANY READY task ANYWHERE (our
+            # local runqueue OR another cpu's, which we can work-steal). If
+            # any exists we skip hlt and loop back to dispatch / pull it. The
+            # scan reads task state without taking a remote rq lock — that is
+            # safe for a "should I skip hlt" hint: a stale read only ever
+            # causes a spurious extra loop, never a lost wakeup (a real
+            # enqueue after this point raises the directed reschedule IPI,
+            # held pending across the IF=0 window and fired by safe_halt's
+            # atomic sti;hlt). Slot 0 (BSP task) is excluded — an AP never
+            # runs it.
             local_irq_disable()
             rescan: uint64 = 0
             woke: uint64 = 0
-            spinlock_lock(&rq_lock)
             while rescan < NTASKS and sched_ap_steal_enabled != 0:
                 if rescan != my_idle_slot and rescan != 0:
                     if task_table[rescan].state == STATE_READY:
-                        # Per-CPU TSS: user tasks are runnable on this AP too,
-                        # so a READY user task must also block the hlt (else
-                        # we'd sleep through a dispatchable user task and only
-                        # pick it up on the next IPI). Drop the is_user filter.
                         woke = 1
                         rescan = NTASKS
                 rescan = rescan + 1
-            spinlock_unlock(&rq_lock)
             # One-time-per-CPU banner: this AP idles via hlt + reschedule IPI.
             bit: uint64 = cast[uint64](1) << my_cpu_id
             if (_ap_idle_mode_logged & bit) == 0:
@@ -2981,23 +3376,21 @@ def sched_prepare_ap_idle(cpu_id: uint64) -> int32:
     #
     # Interrupt-disable window: kthread_create() leaves the slot STATE_READY;
     # we must flip it to STATE_PARKED before the BSP timer ISR can see it.
-    # Disable local interrupts to prevent the timer ISR (which takes rq_lock)
-    # from racing us — spinlock_lock + a concurrently-firing IRQ that also
-    # takes the same lock would deadlock since the ISR can't be preempted.
-    local_irq_disable()
-    spinlock_lock(&rq_lock)
+    # _wq_lock_irq() disables local interrupts (IRQ-safe global state lock) so
+    # the timer ISR — which may enter the scheduler and take rq/wq locks —
+    # cannot race us; a concurrently-firing IRQ that also takes the same lock
+    # would deadlock since the ISR can't be preempted.
+    _wq_lock_irq()
     slot: int32 = kthread_create(cast[uint64](&sched_ap_idle_loop), 0)
     if slot < 0:
-        spinlock_unlock(&rq_lock)
-        local_irq_enable()
+        _wq_unlock_irq()
         printk1("SMP: sched_prepare_ap_idle cpu%d: no free slot\n", cpu_id)
         return -1
     su: uint64 = cast[uint64](slot)
     # kthread_create sets STATE_READY; park it so BSP can't schedule it
     # and create_user_task can't reclaim the slot.
     task_table[su].state = STATE_PARKED
-    spinlock_unlock(&rq_lock)
-    local_irq_enable()
+    _wq_unlock_irq()
     # Record for sched_ap_launch to find.  Written AFTER the slot is safely
     # parked: the AP's spin loop reads ap_idle_slots[cpu_id] and enters the
     # kthread only once this write is visible (x86 TSO guarantees the store
@@ -4599,7 +4992,7 @@ def wq_sleep_interruptible(wq: Ptr[WaitQueue]) -> int32:
     if signal_pending(cur) != 0:
         return WQ_EINTR
 
-    spinlock_lock(&rq_lock)
+    _wq_lock_irq()
     # Link onto the queue head (LIFO is fine; order among waiters on the
     # same resource is unspecified) and go to sleep.
     task_table[cur].wait_signaled = 0
@@ -4607,17 +5000,17 @@ def wq_sleep_interruptible(wq: Ptr[WaitQueue]) -> int32:
     task_table[cur].wait_on   = cur + 1
     wq[0].head = cur + 1
     task_table[cur].state = STATE_WAIT
-    spinlock_unlock(&rq_lock)
+    _wq_unlock_irq()
 
     rc: int32 = 0
     while True:
         # Are we still asleep on the queue? A producer wake (wq_wake_*)
         # or a signal force-wake flips us to STATE_READY and unlinks us.
-        spinlock_lock(&rq_lock)
+        _wq_lock_irq()
         still_waiting: uint64 = 0
         if task_table[cur].state == STATE_WAIT:
             still_waiting = 1
-        spinlock_unlock(&rq_lock)
+        _wq_unlock_irq()
 
         if still_waiting == 0:
             # We were woken. wait_signaled distinguishes a signal-wake
@@ -4629,11 +5022,11 @@ def wq_sleep_interruptible(wq: Ptr[WaitQueue]) -> int32:
         # A signal posted to us while we sleep must also break us out,
         # even if the signal path didn't reach the force-wake (defensive).
         if signal_pending(cur) != 0:
-            spinlock_lock(&rq_lock)
+            _wq_lock_irq()
             _wq_unlink_locked(wq, cur)
             if task_table[cur].state == STATE_WAIT:
                 task_table[cur].state = STATE_RUNNING
-            spinlock_unlock(&rq_lock)
+            _wq_unlock_irq()
             rc = WQ_EINTR
             break
 
@@ -4656,11 +5049,11 @@ def wq_sleep_interruptible(wq: Ptr[WaitQueue]) -> int32:
 
     # Belt-and-braces: guarantee we are fully unlinked and runnable
     # before returning (handles any racing-wake corner).
-    spinlock_lock(&rq_lock)
+    _wq_lock_irq()
     _wq_unlink_locked(wq, cur)
     if task_table[cur].state == STATE_WAIT:
         task_table[cur].state = STATE_RUNNING
-    spinlock_unlock(&rq_lock)
+    _wq_unlock_irq()
     task_table[cur].wait_signaled = 0
     return rc
 
@@ -4696,24 +5089,24 @@ def wq_wait_prepare(wq: Ptr[WaitQueue]):
     # condition and then call exactly one of wq_wait_cancel (condition now
     # true) or wq_wait_commit (sleep). Caller holds NO spinlock on entry.
     cur: uint64 = current_idx_pcpu
-    spinlock_lock(&rq_lock)
+    _wq_lock_irq()
     task_table[cur].wait_signaled = 0
     task_table[cur].wait_next = wq[0].head
     task_table[cur].wait_on   = cur + 1
     wq[0].head = cur + 1
     task_table[cur].state = STATE_WAIT
-    spinlock_unlock(&rq_lock)
+    _wq_unlock_irq()
 
 
 def wq_wait_cancel(wq: Ptr[WaitQueue]):
     # Abort a prepared wait WITHOUT sleeping: the post-prepare recheck
     # found the resource ready. Unlink from `wq` and return to STATE_RUNNING.
     cur: uint64 = current_idx_pcpu
-    spinlock_lock(&rq_lock)
+    _wq_lock_irq()
     _wq_unlink_locked(wq, cur)
     if task_table[cur].state == STATE_WAIT:
         task_table[cur].state = STATE_RUNNING
-    spinlock_unlock(&rq_lock)
+    _wq_unlock_irq()
     task_table[cur].wait_signaled = 0
 
 
@@ -4727,11 +5120,11 @@ def wq_wait_commit(wq: Ptr[WaitQueue]) -> int32:
     cur: uint64 = current_idx_pcpu
     rc: int32 = 0
     while True:
-        spinlock_lock(&rq_lock)
+        _wq_lock_irq()
         still_waiting: uint64 = 0
         if task_table[cur].state == STATE_WAIT:
             still_waiting = 1
-        spinlock_unlock(&rq_lock)
+        _wq_unlock_irq()
 
         if still_waiting == 0:
             if task_table[cur].wait_signaled != 0:
@@ -4739,11 +5132,11 @@ def wq_wait_commit(wq: Ptr[WaitQueue]) -> int32:
             break
 
         if signal_pending(cur) != 0:
-            spinlock_lock(&rq_lock)
+            _wq_lock_irq()
             _wq_unlink_locked(wq, cur)
             if task_table[cur].state == STATE_WAIT:
                 task_table[cur].state = STATE_RUNNING
-            spinlock_unlock(&rq_lock)
+            _wq_unlock_irq()
             rc = WQ_EINTR
             break
 
@@ -4756,11 +5149,11 @@ def wq_wait_commit(wq: Ptr[WaitQueue]) -> int32:
             cpu_idle_leave()
             local_irq_disable()
 
-    spinlock_lock(&rq_lock)
+    _wq_lock_irq()
     _wq_unlink_locked(wq, cur)
     if task_table[cur].state == STATE_WAIT:
         task_table[cur].state = STATE_RUNNING
-    spinlock_unlock(&rq_lock)
+    _wq_unlock_irq()
     task_table[cur].wait_signaled = 0
     return rc
 
@@ -4786,11 +5179,11 @@ def wq_wait_commit_timeout(wq: Ptr[WaitQueue], ticks: uint64) -> int32:
     deadline: uint64 = get_jiffies() + ticks
     rc: int32 = 0
     while True:
-        spinlock_lock(&rq_lock)
+        _wq_lock_irq()
         still_waiting: uint64 = 0
         if task_table[cur].state == STATE_WAIT:
             still_waiting = 1
-        spinlock_unlock(&rq_lock)
+        _wq_unlock_irq()
 
         if still_waiting == 0:
             if task_table[cur].wait_signaled != 0:
@@ -4798,11 +5191,11 @@ def wq_wait_commit_timeout(wq: Ptr[WaitQueue], ticks: uint64) -> int32:
             break
 
         if signal_pending(cur) != 0:
-            spinlock_lock(&rq_lock)
+            _wq_lock_irq()
             _wq_unlink_locked(wq, cur)
             if task_table[cur].state == STATE_WAIT:
                 task_table[cur].state = STATE_RUNNING
-            spinlock_unlock(&rq_lock)
+            _wq_unlock_irq()
             rc = WQ_EINTR
             break
 
@@ -4810,11 +5203,11 @@ def wq_wait_commit_timeout(wq: Ptr[WaitQueue], ticks: uint64) -> int32:
         # deadline without anyone waking us. Unlink and report TIMEOUT so
         # the caller re-pumps the device. This is the TCG fallback edge.
         if get_jiffies() >= deadline:
-            spinlock_lock(&rq_lock)
+            _wq_lock_irq()
             _wq_unlink_locked(wq, cur)
             if task_table[cur].state == STATE_WAIT:
                 task_table[cur].state = STATE_RUNNING
-            spinlock_unlock(&rq_lock)
+            _wq_unlock_irq()
             rc = WQ_TIMEOUT
             break
 
@@ -4827,21 +5220,39 @@ def wq_wait_commit_timeout(wq: Ptr[WaitQueue], ticks: uint64) -> int32:
             cpu_idle_leave()
             local_irq_disable()
 
-    spinlock_lock(&rq_lock)
+    _wq_lock_irq()
     _wq_unlink_locked(wq, cur)
     if task_table[cur].state == STATE_WAIT:
         task_table[cur].state = STATE_RUNNING
-    spinlock_unlock(&rq_lock)
+    _wq_unlock_irq()
     task_table[cur].wait_signaled = 0
     return rc
+
+
+def _wq_place_woken(slot: uint64):
+    # Per-CPU rq (#6): a waiter just transitioned WAIT->READY under wq_lock.
+    # Assign it an owning runqueue (rq_cpu) and direct a reschedule IPI to
+    # that CPU so an idle owner wakes and dispatches it. Called WHILE wq_lock
+    # is held (lock order wq_lock -> rq_locks[target] is honoured by
+    # sched_make_ready_on internally taking only the TARGET rq lock). The
+    # state is already STATE_READY; sched_make_ready_on re-stamps it READY
+    # under the target rq lock (idempotent) and sets rq_cpu atomically there.
+    tc: uint64 = sched_pick_target_cpu(slot)
+    sched_make_ready_on(slot, tc)
 
 
 def wq_wake_one(wq: Ptr[WaitQueue]):
     # Move the first waiter on `wq` (if any) from STATE_WAIT back to
     # STATE_READY and unlink it. Safe from IRQ context. Never calls
     # schedule().
-    woke: uint64 = 0
-    spinlock_lock(&rq_lock)
+    #
+    # Per-CPU rq (#6): the wait-queue LIST + the WAIT->READY flip are done
+    # under wq_lock (the wait-queue lock, distinct from the per-CPU rq
+    # locks). The woken task is then HOMED on a target cpu's runqueue and a
+    # DIRECTED reschedule IPI is sent to exactly that cpu.
+    woke:      uint64 = 0
+    woke_slot: uint64 = 0
+    spinlock_lock(&wq_lock)
     h: uint64 = wq[0].head
     if h != 0:
         slot: uint64 = h - 1
@@ -4851,21 +5262,18 @@ def wq_wake_one(wq: Ptr[WaitQueue]):
         if task_table[slot].state == STATE_WAIT:
             task_table[slot].wait_signaled = 0
             task_table[slot].state = STATE_READY
+            _wq_place_woken(slot)
             woke = 1
-    spinlock_unlock(&rq_lock)
-    # A kernel task just became runnable: kick any idle AP out of HLT so it
-    # re-scans the runqueue and can work-steal it. Sent OUTSIDE rq_lock (the
-    # resched IPI handler takes no lock, but ICR-busy spins shouldn't hold
-    # rq_lock). No-op on a uniprocessor boot.
-    if woke != 0:
-        smp_send_reschedule()
+            woke_slot = slot
+    spinlock_unlock(&wq_lock)
 
 
 def wq_wake_all(wq: Ptr[WaitQueue]):
     # Move EVERY waiter on `wq` from STATE_WAIT back to STATE_READY and
     # empty the queue. Safe from IRQ context. Never calls schedule().
-    woke: uint64 = 0
-    spinlock_lock(&rq_lock)
+    # Each woken task is homed on a target rq + directed-IPI'd (see
+    # wq_wake_one). The wait-queue list is walked under wq_lock.
+    spinlock_lock(&wq_lock)
     h: uint64 = wq[0].head
     while h != 0:
         slot: uint64 = h - 1
@@ -4875,14 +5283,10 @@ def wq_wake_all(wq: Ptr[WaitQueue]):
         if task_table[slot].state == STATE_WAIT:
             task_table[slot].wait_signaled = 0
             task_table[slot].state = STATE_READY
-            woke = 1
+            _wq_place_woken(slot)
         h = nxt
     wq[0].head = 0
-    spinlock_unlock(&rq_lock)
-    # One or more kernel tasks became runnable — wake idle APs (see
-    # wq_wake_one). No-op on a uniprocessor boot.
-    if woke != 0:
-        smp_send_reschedule()
+    spinlock_unlock(&wq_lock)
 
 
 # Global console-input wait queue. A task blocked in the FD_STDIN_MARK /
@@ -4923,10 +5327,16 @@ def wq_wake_one_signal(slot: uint64):
     # node out of the list before returning, and wq_wake_* tolerate a
     # not-STATE_WAIT node (they only re-ready STATE_WAIT tasks). Clearing
     # wait_on marks "no longer logically queued".
+    #
+    # Per-CPU rq (#6): home the freshly-readied task onto a target runqueue
+    # and direct a reschedule IPI to that CPU (same as wq_wake_one). Caller
+    # holds wq_lock, so the wq_lock -> rq_locks[target] order is honoured by
+    # _wq_place_woken -> sched_make_ready_on.
     if task_table[slot].state == STATE_WAIT:
         task_table[slot].wait_signaled = 1
         task_table[slot].wait_on       = 0
         task_table[slot].state         = STATE_READY
+        _wq_place_woken(slot)
 
 
 # --- §3: signals -------------------------------------------------
@@ -5028,18 +5438,12 @@ def signal_post(slot: uint64, sig: uint64):
     # must be force-woken so its wq_sleep_interruptible returns -EINTR and the
     # blocked read aborts. Without this a SIGINT (Ctrl-C) posted to a hamsh
     # sleeping on stdin would only be observed on the NEXT data byte. Hold
-    # rq_lock (same discipline as schedule()/wq_wake_*) across the state flip.
-    spinlock_lock(&rq_lock)
+    # wq_lock (same discipline as wq_wake_*) across the state flip; the
+    # woken task is homed on a target runqueue and directed-IPI'd inside
+    # wq_wake_one_signal -> _wq_place_woken, so no extra broadcast is needed.
+    _wq_lock_irq()
     wq_wake_one_signal(slot)
-    became_ready: uint64 = 0
-    if task_table[slot].state == STATE_READY:
-        became_ready = 1
-    spinlock_unlock(&rq_lock)
-    # If the signal made the target runnable (it was STATE_WAIT or
-    # STATE_STOPPED), kick idle APs so one can pick it up promptly instead of
-    # waiting for the next scan. Sent outside rq_lock; no-op on uniprocessor.
-    if became_ready != 0:
-        smp_send_reschedule()
+    _wq_unlock_irq()
 
 
 def signal_pending(slot: uint64) -> uint64:
@@ -6487,12 +6891,12 @@ smp_soak_heartbeat: uint64 = 0
 
 def _smp_soak_kthread():
     # Body of each short-lived soak kthread. Increment the completion
-    # counter (under rq_lock to avoid a torn 64-bit read-modify-write
+    # counter (under wq_lock to avoid a torn 64-bit read-modify-write
     # on the shared counter), then exit.  The task is marked detached
     # before this runs so task_exit_current self-reaps it (STATE_FREE).
-    spinlock_lock(&rq_lock)
+    _wq_lock_irq()
     smp_soak_done = smp_soak_done + 1
-    spinlock_unlock(&rq_lock)
+    _wq_unlock_irq()
     task_exit_current(0)
 
 
@@ -6531,22 +6935,19 @@ def smp_kthread_soak_run():
         batch_start: uint64 = smp_soak_done
         b: uint64 = 0
         while b < SMP_SOAK_BATCH:
-            local_irq_disable()
-            spinlock_lock(&rq_lock)
+            _wq_lock_irq()
             slot: int32 = kthread_create(
                 cast[uint64](&_smp_soak_kthread), 0)
             if slot >= 0:
                 # Mark detached: kthread self-reaps without a parent wait.
                 task_table[cast[uint64](slot)].detached = 1
                 total_launched = total_launched + 1
-                spinlock_unlock(&rq_lock)
-                local_irq_enable()
+                _wq_unlock_irq()
             else:
                 # Slot exhaustion (NTASKS=16, BATCH=4 — should not happen).
                 # Re-enable IRQs, schedule() to let pending kthreads run
                 # and free their slots, then retry this iteration.
-                spinlock_unlock(&rq_lock)
-                local_irq_enable()
+                _wq_unlock_irq()
                 schedule()
                 b = b - 1    # retry this slot
             b = b + 1
@@ -6671,12 +7072,12 @@ def _sched_fair_worker():
     # BEFORE exiting, while our slot is still live. current_idx_pcpu is the
     # slot we are running in (per-CPU). Reading our own cpu_runs here is
     # safe; reading it after self-reap would race slot recycling.
-    spinlock_lock(&rq_lock)
+    _wq_lock_irq()
     my_slot: uint64 = current_idx_pcpu
     sched_fair_cpu0_total = sched_fair_cpu0_total + task_table[my_slot].cpu_runs[0]
     sched_fair_cpu1_total = sched_fair_cpu1_total + task_table[my_slot].cpu_runs[1]
     sched_fair_done = sched_fair_done + 1
-    spinlock_unlock(&rq_lock)
+    _wq_unlock_irq()
     task_exit_current(0)
 
 
@@ -6744,13 +7145,11 @@ def sched_fair_smp_selftest():
     sched_ap_steal_enabled = 0
     w: uint64 = 0
     while (w + 1) < SCHED_FAIR_NWORKERS:
-        local_irq_disable()
-        spinlock_lock(&rq_lock)
+        _wq_lock_irq()
         slot: int32 = kthread_create(cast[uint64](&_sched_fair_worker), 0)
         if slot >= 0:
             task_table[cast[uint64](slot)].detached = 1
-        spinlock_unlock(&rq_lock)
-        local_irq_enable()
+        _wq_unlock_irq()
         w = w + 1
     iters: uint64 = 0
     while (sched_fair_done + 1) < SCHED_FAIR_NWORKERS and iters < MAXI:
@@ -6758,13 +7157,11 @@ def sched_fair_smp_selftest():
         iters = iters + 1
 
     # --- Phase 2: launch the final worker, hand it to the AP (fence on) --
-    local_irq_disable()
-    spinlock_lock(&rq_lock)
+    _wq_lock_irq()
     lslot: int32 = kthread_create(cast[uint64](&_sched_fair_worker), 0)
     if lslot >= 0:
         task_table[cast[uint64](lslot)].detached = 1
-    spinlock_unlock(&rq_lock)
-    local_irq_enable()
+    _wq_unlock_irq()
     sched_ap_steal_enabled = 1
     # Linux-mirror idle: the AP is HLTed waiting for a reschedule IPI. Now
     # that the final worker is runnable AND steal is enabled, kick the AP so
@@ -6851,13 +7248,11 @@ def smp_user_ap_selftest():
     # create_user_task (CPL3 task with its own PML4 + user stack).
     sched_ap_steal_enabled = 0
     smp_user_probe_done = 0
-    local_irq_disable()
-    spinlock_lock(&rq_lock)
+    _wq_lock_irq()
     uslot: int32 = create_user_task(cast[uint64](&smp_user_probe_entry), 0)
     if uslot >= 0:
         task_table[cast[uint64](uslot)].detached = 1
-    spinlock_unlock(&rq_lock)
-    local_irq_enable()
+    _wq_unlock_irq()
     if uslot < 0:
         printk0("[smp_user] FAIL: could not create user probe task\n")
         return
