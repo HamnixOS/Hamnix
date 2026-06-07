@@ -46,7 +46,11 @@ from kernel.sched.loadavg import (
 )
 # SMP: per-CPU id for current-task tracking and TSS gating.
 from arch.x86.kernel.setup_percpu import get_cpu_id
-from arch.x86.kernel.time import get_jiffies, get_jiffies_addr
+from arch.x86.kernel.time import get_jiffies
+# SMP reschedule IPI: kick idle APs out of HLT when a kernel task becomes
+# runnable so they re-scan the shared runqueue (Linux's smp_send_reschedule).
+# No-op on a uniprocessor boot (gated on cpus_online > 1 inside the helper).
+from arch.x86.kernel.apic import smp_send_reschedule
 
 extern def __switch_to_asm(prev: Ptr[uint8], next: Ptr[uint8])
 extern def enter_first_task(task: Ptr[uint8])
@@ -64,6 +68,10 @@ extern def kthread_bootstrap()
 extern def tss_set_rsp0(rsp0: uint64)
 extern def local_irq_disable()
 extern def local_irq_enable()
+# Atomic sti;hlt — the idle CPU's race-free wait primitive (Linux's
+# native_safe_halt). Used by the AP idle loop to park until a reschedule
+# IPI wakes it. Body in arch/x86/kernel/irq_asm.S.
+extern def safe_halt()
 # Nesting-safe IRQ save/restore (see fs/elf.ad for rationale).
 extern def local_irq_save() -> uint64
 extern def local_irq_restore(flags: uint64)
@@ -101,16 +109,6 @@ extern def read_cr4() -> uint64
 extern def cpuid_get(leaf: uint32, subleaf: uint32, out: Ptr[uint32])
 extern def fninit_helper()
 extern def write_cr4(value: uint64)
-
-# AP-idle thermal fix: MONITOR/MWAIT primitives (bodies in
-# arch/x86/kernel/cpuregs_asm.S). _ap_monitor arms the address-range
-# monitor on a watched word; _ap_mwait parks the core in a low-power
-# state until that word is WRITTEN by another CPU. Neither needs an
-# interrupt or an armed LAPIC — which is exactly why they are correct
-# for the AP idle loop (the AP's LAPIC is software-disabled, so a plain
-# hlt would wedge it). See sched_ap_idle_loop's no-work branch.
-extern def _ap_monitor(addr: uint64)
-extern def _ap_mwait(hints: uint64, ext: uint64)
 
 # V2.5: Pgrp lifecycle entry-points implemented in sys/src/9/port/chan.ad.
 # Declared extern here so task_exit_current can call pgrp_ref_dec without
@@ -2775,8 +2773,9 @@ def task_exit_current(code: int64):
 #            release lock, __switch_to_asm), loop again when the task
 #            eventually comes back (via schedule() → switch back to idle).
 #        (c) HLTs with interrupts enabled when no READY task is available
-#            (LAPIC timer is NOT armed on APs — they wake via the poll
-#            loop after the hlt).
+#            (LAPIC timer is NOT armed on APs — they wake via a directed
+#            RESCHEDULE IPI, vector 0xF2, sent by whichever CPU made a
+#            kernel task runnable; Linux's smp_send_reschedule model).
 #
 # Safety invariants:
 #   • APs NEVER pick user tasks (is_user != 0): those require per-AP TSS
@@ -2881,72 +2880,57 @@ def sched_ap_idle_loop():
             spinlock_unlock(&rq_lock)
         else:
             spinlock_unlock(&rq_lock)
-            # No ready kernel task right now. We do NOT plain-hlt: the AP's
-            # LAPIC is software-disabled (no SVR enable — see ap_main_hamnix),
-            # so nothing would ever wake a halted AP, and enabling AP
-            # interrupt delivery needs per-AP IDT/TSS we don't have.
+            # No ready kernel task right now. LINUX-MIRROR IDLE: the AP now
+            # HLTs with interrupts ENABLED and is woken by a directed
+            # RESCHEDULE IPI (vector 0xF2), sent by whichever CPU made a
+            # kernel task runnable (smp_send_reschedule, called from the
+            # wakeup/enqueue paths). This replaces the old NetWare-ish hack
+            # that MWAIT'd on the global `jiffies` word and relied on the BSP
+            # timer ISR writing it ~100×/s to poll the runqueue. The AP's
+            # LAPIC SVR is now software-enabled and the IDT is loaded (see
+            # ap_main_hamnix step 3), so a halted AP can actually take the IPI.
             #
-            # THERMAL FIX: on real (passively-cooled) silicon the old
-            # behaviour — a bounded PAUSE burst then re-scan, forever — pins
-            # every idle AP at ~100% CPU and overheats the box. MONITOR/MWAIT
-            # idles the core in a genuine low-power state (≈0% busy) WITHOUT
-            # needing an interrupt or an armed LAPIC: the core arms MONITOR on
-            # a memory word and MWAIT wakes when that word is WRITTEN by
-            # another CPU. We monitor `jiffies`, which the BSP timer ISR
-            # increments every tick, so a sleeping AP is guaranteed to wake at
-            # least once per tick (~HZ Hz) to re-scan — worst-case steal
-            # latency ≈1 tick, and 0% busy in between.
-            if g_ap_mwait_ok != 0:
-                # --- Low-power MWAIT path (real silicon) -----------------
-                # Arm the monitor on the per-tick jiffies word FIRST, then
-                # re-scan the runqueue once more before sleeping. This closes
-                # the classic lost-wakeup race: if a task was enqueued between
-                # our failed scan above and arming MONITOR, the re-scan catches
-                # it and we skip MWAIT; and any enqueue that lands AFTER we arm
-                # but writes a different line is still bounded by the next
-                # jiffies tick writing the monitored line. We do NOT hold
-                # rq_lock across MONITOR/MWAIT.
-                _ap_monitor(get_jiffies_addr())
-                # Re-scan for a stealable READY kernel task.
-                rescan: uint64 = 0
-                woke: uint64 = 0
-                spinlock_lock(&rq_lock)
-                while rescan < NTASKS and sched_ap_steal_enabled != 0:
-                    if rescan != my_idle_slot and rescan != 0:
-                        if task_table[rescan].state == STATE_READY:
-                            if task_table[rescan].is_user == 0:
-                                woke = 1
-                                rescan = NTASKS
-                    rescan = rescan + 1
-                spinlock_unlock(&rq_lock)
-                # One-time-per-CPU banner that this AP idles via mwait.
-                bit: uint64 = cast[uint64](1) << my_cpu_id
-                if (_ap_idle_mode_logged & bit) == 0:
-                    _ap_idle_mode_logged = _ap_idle_mode_logged | bit
-                    printk1("SMP: cpu%d idle via mwait\n", my_cpu_id)
-                if woke == 0:
-                    # Still nothing — park in the low-power state. We wake on
-                    # the next jiffies write (≤1 tick) or any earlier store to
-                    # the monitored line, then loop back to the top to scan.
-                    _ap_mwait(0, 0)
-                # If woke != 0 we just fall through and re-loop immediately to
-                # acquire rq_lock and dispatch the task we spotted.
+            # Two-phase lost-wakeup guard (Linux's TIF_NEED_RESCHED-after-
+            # disable pattern): disable IRQs, then re-scan the runqueue ONE
+            # more time. If a task appeared between our failed scan above and
+            # here we skip hlt and loop to dispatch it; otherwise we are
+            # provably idle at the moment IRQs go off, so any enqueue from
+            # now on MUST raise the resched IPI — which is held pending while
+            # IF=0 and fires the instant safe_halt()'s `sti; hlt` enables it.
+            # No wakeup can be lost in the window.
+            local_irq_disable()
+            rescan: uint64 = 0
+            woke: uint64 = 0
+            spinlock_lock(&rq_lock)
+            while rescan < NTASKS and sched_ap_steal_enabled != 0:
+                if rescan != my_idle_slot and rescan != 0:
+                    if task_table[rescan].state == STATE_READY:
+                        if task_table[rescan].is_user == 0:
+                            woke = 1
+                            rescan = NTASKS
+                rescan = rescan + 1
+            spinlock_unlock(&rq_lock)
+            # One-time-per-CPU banner: this AP idles via hlt + reschedule IPI.
+            bit: uint64 = cast[uint64](1) << my_cpu_id
+            if (_ap_idle_mode_logged & bit) == 0:
+                _ap_idle_mode_logged = _ap_idle_mode_logged | bit
+                printk1("SMP: cpu%d idle via hlt+ipi\n", my_cpu_id)
+            cpu_idle_enter()
+            if woke == 0:
+                # Provably idle with IRQs off: park until the reschedule IPI
+                # (or any other interrupt) fires. safe_halt() is an atomic
+                # `sti; hlt`, so a resched IPI raised after our re-scan but
+                # before the hlt is held pending and wakes us immediately —
+                # no lost wakeup. On return IRQs are enabled (iret restored
+                # IF=1); we re-disable below to balance cpu_idle_leave's view.
+                safe_halt()
+                local_irq_disable()
             else:
-                # --- PAUSE fallback (no MONITOR/MWAIT, e.g. QEMU TCG) -----
-                # Unchanged original behaviour: spin a bounded PAUSE burst,
-                # then loop back to re-scan the shared runqueue. Under QEMU
-                # TCG's round-robin vCPU scheduler the PAUSE burst yields host
-                # time back to the BSP so it can spawn/advance the workers we
-                # then steal; on real HW PAUSE is cheap and the re-scan
-                # latency is bounded by the burst length.
-                pbit: uint64 = cast[uint64](1) << my_cpu_id
-                if (_ap_idle_mode_logged & pbit) == 0:
-                    _ap_idle_mode_logged = _ap_idle_mode_logged | pbit
-                    printk1("SMP: cpu%d idle via pause\n", my_cpu_id)
-                relax: uint64 = 0
-                while relax < 4096:
-                    cpu_relax()
-                    relax = relax + 1
+                # A task appeared in the re-scan — skip hlt, re-enable IRQs,
+                # and loop straight back to the top to dispatch it.
+                local_irq_enable()
+            cpu_idle_leave()
+            local_irq_enable()
 
 
 def sched_prepare_ap_idle(cpu_id: uint64) -> int32:
@@ -4821,6 +4805,7 @@ def wq_wake_one(wq: Ptr[WaitQueue]):
     # Move the first waiter on `wq` (if any) from STATE_WAIT back to
     # STATE_READY and unlink it. Safe from IRQ context. Never calls
     # schedule().
+    woke: uint64 = 0
     spinlock_lock(&rq_lock)
     h: uint64 = wq[0].head
     if h != 0:
@@ -4831,12 +4816,20 @@ def wq_wake_one(wq: Ptr[WaitQueue]):
         if task_table[slot].state == STATE_WAIT:
             task_table[slot].wait_signaled = 0
             task_table[slot].state = STATE_READY
+            woke = 1
     spinlock_unlock(&rq_lock)
+    # A kernel task just became runnable: kick any idle AP out of HLT so it
+    # re-scans the runqueue and can work-steal it. Sent OUTSIDE rq_lock (the
+    # resched IPI handler takes no lock, but ICR-busy spins shouldn't hold
+    # rq_lock). No-op on a uniprocessor boot.
+    if woke != 0:
+        smp_send_reschedule()
 
 
 def wq_wake_all(wq: Ptr[WaitQueue]):
     # Move EVERY waiter on `wq` from STATE_WAIT back to STATE_READY and
     # empty the queue. Safe from IRQ context. Never calls schedule().
+    woke: uint64 = 0
     spinlock_lock(&rq_lock)
     h: uint64 = wq[0].head
     while h != 0:
@@ -4847,9 +4840,14 @@ def wq_wake_all(wq: Ptr[WaitQueue]):
         if task_table[slot].state == STATE_WAIT:
             task_table[slot].wait_signaled = 0
             task_table[slot].state = STATE_READY
+            woke = 1
         h = nxt
     wq[0].head = 0
     spinlock_unlock(&rq_lock)
+    # One or more kernel tasks became runnable — wake idle APs (see
+    # wq_wake_one). No-op on a uniprocessor boot.
+    if woke != 0:
+        smp_send_reschedule()
 
 
 # Global console-input wait queue. A task blocked in the FD_STDIN_MARK /
@@ -4998,7 +4996,15 @@ def signal_post(slot: uint64, sig: uint64):
     # rq_lock (same discipline as schedule()/wq_wake_*) across the state flip.
     spinlock_lock(&rq_lock)
     wq_wake_one_signal(slot)
+    became_ready: uint64 = 0
+    if task_table[slot].state == STATE_READY:
+        became_ready = 1
     spinlock_unlock(&rq_lock)
+    # If the signal made the target runnable (it was STATE_WAIT or
+    # STATE_STOPPED), kick idle APs so one can pick it up promptly instead of
+    # waiting for the next scan. Sent outside rq_lock; no-op on uniprocessor.
+    if became_ready != 0:
+        smp_send_reschedule()
 
 
 def signal_pending(slot: uint64) -> uint64:
@@ -6510,6 +6516,11 @@ def smp_kthread_soak_run():
                 b = b - 1    # retry this slot
             b = b + 1
 
+        # NB: this soak deliberately drains the batch on the BSP via the
+        # cooperative schedule() loop below — it does NOT kick the AP. The
+        # AP idle loop HLTs waiting for a reschedule IPI; leaving it parked
+        # here keeps the drain on cpu0 deterministic (the dedicated AP work-
+        # steal coverage lives in the #151 sched-fair test, which DOES kick).
         # Drive each kthread to completion via cooperative schedule() calls.
         # The BSP is the boot task (slot 0, STATE_RUNNING); each schedule()
         # call rotates to the next READY kthread, which runs to completion
@@ -6595,38 +6606,15 @@ ap_idle_dispatches:  uint64 = 0
 # (proving cpu1 gets load). Production code never touches it.
 sched_ap_steal_enabled: uint64 = 1
 
-# AP-idle thermal fix state.
-#   g_ap_mwait_ok   — 1 iff this CPU advertises MONITOR/MWAIT (CPUID.1:
-#                     ECX bit 3). Probed ONCE by _ap_probe_mwait() at SMP
-#                     init. When 0, sched_ap_idle_loop's no-work branch
-#                     falls back to the original bounded PAUSE burst
-#                     (correct on QEMU TCG, which may not implement
-#                     MONITOR/MWAIT). When 1, idle APs MWAIT on the
-#                     per-tick `jiffies` word and drop to ≈0% CPU instead
-#                     of spinning N-1 cores hot (the real-NUC thermal
-#                     defect this fixes).
+# AP-idle state.
 #   _ap_idle_mode_logged — per-CPU one-shot bitmask so each AP prints its
-#                     chosen idle path (mwait vs pause) exactly once, not
+#                     idle banner ("idle via hlt+ipi") exactly once, not
 #                     every loop. Bit (1<<cpu_id) is set after the banner.
-g_ap_mwait_ok:         uint64 = 0
+#                     The old MONITOR/MWAIT probe (g_ap_mwait_ok /
+#                     _ap_probe_mwait) is gone: idle APs now HLT and wake on
+#                     a reschedule IPI (Linux-mirror), so there is no
+#                     capability gate and no jiffies-poll fallback.
 _ap_idle_mode_logged:  uint64 = 0
-
-
-def _ap_probe_mwait():
-    # One-time MONITOR/MWAIT capability probe. Call once from the BSP at
-    # SMP init (before/around smp_boot_aps). CPUID leaf 1, ECX bit 3 is
-    # the architectural MONITOR/MWAIT feature flag (Intel SDM Vol.2A).
-    # Real NUC silicon sets it; QEMU TCG generally does not, so the AP
-    # idle loop keeps its PAUSE fallback there.
-    leaf1: Array[4, uint32]
-    cpuid_get(cast[uint32](1), cast[uint32](0), &leaf1[0])
-    ecx: uint64 = cast[uint64](leaf1[2])
-    if (ecx & 0x8) != 0:
-        g_ap_mwait_ok = 1
-        printk0("SMP: MONITOR/MWAIT supported — APs idle via mwait\n")
-    else:
-        g_ap_mwait_ok = 0
-        printk0("SMP: no MONITOR/MWAIT — APs idle via pause fallback\n")
 
 
 def _sched_fair_worker():
@@ -6696,10 +6684,12 @@ def sched_fair_smp_selftest():
     # self-reaping, so we only ever read these shared totals, never a freed/
     # recycled slot.
     #
-    # The AP idle loop free-runs: it busy-polls the shared runqueue rather
-    # than halting (its LAPIC is software-disabled, so a halted AP would
-    # never wake — see ap_main_hamnix). sched_ap_steal_enabled fences the AP
-    # so we can place load deterministically across two bounded phases:
+    # The AP idle loop HLTs when no work is ready and is woken by a
+    # reschedule IPI (vector 0xF2) sent from the spawn/wake paths (Linux-
+    # mirror idle; see ap_main_hamnix + sched_ap_idle_loop). This phase
+    # explicitly kicks the AP with smp_send_reschedule() after enabling
+    # steal. sched_ap_steal_enabled fences the AP so we can place load
+    # deterministically across two bounded phases:
     #
     #   Phase 1 (AP fenced OFF): launch N-1 workers and let the BSP
     #     schedule() drain them to completion. Each runs entirely on cpu0
@@ -6741,6 +6731,10 @@ def sched_fair_smp_selftest():
     spinlock_unlock(&rq_lock)
     local_irq_enable()
     sched_ap_steal_enabled = 1
+    # Linux-mirror idle: the AP is HLTed waiting for a reschedule IPI. Now
+    # that the final worker is runnable AND steal is enabled, kick the AP so
+    # it falls out of HLT and work-steals it (no jiffies poll any more).
+    smp_send_reschedule()
     iters = 0
     while sched_fair_done < SCHED_FAIR_NWORKERS and iters < MAXI:
         relax2: uint64 = 0
@@ -6748,6 +6742,8 @@ def sched_fair_smp_selftest():
             cpu_relax()
             relax2 = relax2 + 1
         iters = iters + 1
+        # Keep nudging: under TCG the AP may have re-HLTed between steals.
+        smp_send_reschedule()
     # Re-fence the AP for the remainder of boot now that the test is done.
     sched_ap_steal_enabled = 0
 

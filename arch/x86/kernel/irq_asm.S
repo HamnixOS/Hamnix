@@ -110,6 +110,18 @@ irq_stub_\n:
  */
     IRQ_STUB 240
 
+/* ---------- IPI vector 242 (0xF2): RESCHEDULE ------------------- *
+ * A dedicated stub for the cross-CPU reschedule IPI.  An idle AP HLTs
+ * with interrupts enabled; smp_send_reschedule() targets it with this
+ * vector so the AP falls out of HLT and re-scans the runqueue.  Same
+ * prologue/epilogue/iretq shape as irq_stub_240 — funnels through
+ * common_irq so do_irq() dispatches to irq_handlers[242] (resched_ipi)
+ * and sends the single LAPIC EOI afterwards.  The handler body is
+ * nearly empty: the wakeup (the IPI itself bumping the AP out of HLT)
+ * IS the point.
+ */
+    IRQ_STUB 242
+
 /* ---------- common IRQ dispatch ---------------------------------- */
     .align 16
     .globl common_irq
@@ -299,4 +311,24 @@ local_irq_restore:
     .globl cpu_relax
 cpu_relax:
     pause
+    ret
+
+/* ---------- safe_halt: atomic sti;hlt (Linux native_safe_halt) --- *
+ * Enable interrupts and HLT in one breath. The x86 architecture
+ * guarantees that an interrupt cannot be serviced between `sti` and
+ * the instruction that follows it (sti delays IF taking effect by one
+ * instruction), so `sti; hlt` is race-free: any interrupt that was
+ * pending — or that the wakeup path raised AFTER the caller's final
+ * runqueue re-scan but BEFORE this call — fires precisely at the hlt,
+ * waking the core immediately rather than wedging it.
+ *
+ * This is the idle CPU's wait primitive: the AP idle loop re-scans the
+ * runqueue with IRQs OFF, finds no work, then calls safe_halt() to park
+ * until the reschedule IPI (vector 0xF2) bumps it out of hlt. On return
+ * IRQs are ENABLED (the iret from the IPI handler restores IF=1). */
+    .align 16
+    .globl safe_halt
+safe_halt:
+    sti
+    hlt
     ret
