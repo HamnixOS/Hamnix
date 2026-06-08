@@ -2241,19 +2241,27 @@ if os.environ.get("ENABLE_XHCI_KO_REAL", "0") == "1":
     if os.environ.get("ENABLE_XHCI_KO_REAL_MMIO", "0") == "1":
         FILES.append(("/etc/xhci-ko-real-mmio", b"1\n"))
 
-# IN-RAM-SQUASHFS INSTALLER MEDIUM. scripts/build_installer_img.sh sets
+# IN-RAM INSTALLER MEDIUM. scripts/build_installer_img.sh sets
 # HAMNIX_INSTALLER_BLOB=1 (and HAMNIX_INSTALLER_SQFS=<path>) to pack the
-# installer's ENTIRE rootfs payload into the firmware-loaded cpio as a
-# single squashfs file at /rootfs.sqfs. The squashfs holds the raw ext4
-# rootfs image AND the NVMe ESP FAT image as inner files; the installer
-# (etc/install_nvme.hamsh) streams them out of the IN-RAM squashfs via
-# sqfs_to_blk -> the kernel loop_sqfs_extract path, and writes them to
-# the NVMe target — it NEVER reads the install media's own block device.
-# The /etc/installer-medium marker tells init/main.ad to skip ALL media
-# storage bring-up (native + .ko USB) so the installer is purely
+# installer payload into the firmware-loaded cpio. Two in-RAM sources:
+#
+#   /rootfs.sqfs        a squashfs holding the NVMe ESP FAT image
+#                       (esp.img). The installer streams the ESP out via
+#                       sqfs_to_blk -> the kernel loop_sqfs_extract path
+#                       onto the target ESP partition (FAT byte-copy —
+#                       there is no per-file FAT writer).
+#   /iso-packages/main  the native package repo (index.json + *.tar.gz),
+#                       packed below. The installer populates the target
+#                       ext4 ROOT by `hpm --repo=file:///iso-packages
+#                       install hamnix-base` — a real Debian-style package
+#                       install, NOT a golden-image stream.
+#
+# Either way the installer NEVER reads the install media's own block
+# device. The /etc/installer-medium marker tells init/main.ad to skip ALL
+# media storage bring-up (native + .ko USB) so the installer is purely
 # RAM-resident, which is the whole point (the native USB driver is broken
 # on the real NUC target). Only the installer build sets this; normal/dev
-# cpios are NOT bloated by the ~hundreds-of-MiB squashfs payload.
+# cpios are NOT bloated by the squashfs + package payload.
 if os.environ.get("HAMNIX_INSTALLER_BLOB") == "1":
     _sqfs_path = os.environ.get("HAMNIX_INSTALLER_SQFS", "")
     if not _sqfs_path:
@@ -2272,6 +2280,42 @@ if os.environ.get("HAMNIX_INSTALLER_BLOB") == "1":
           f"squashfs payload /rootfs.sqfs "
           f"({len(_sqfs_bytes)/(1<<20):.1f} MiB) + /etc/installer-medium "
           f"marker.", flush=True)
+
+    # DEBIAN-STYLE PACKAGE INSTALL: ship the native package repo IN RAM so
+    # the installer can `hpm --repo=file:///iso-packages install hamnix-base`
+    # onto the freshly-mkfs'd target ext4 — a real package install (not a
+    # golden-image stream). scripts/build_packages.py emits
+    # build/packages/main/ (index.json + packages/*.tar.gz); we mirror that
+    # tree into the cpio at /iso-packages/main/. The repo is firmware-loaded
+    # into RAM with the rest of the cpio, so NO media read is needed (the
+    # whole in-RAM model survives the broken-USB NUC target).
+    _pkg_repo_env = os.environ.get("HAMNIX_INSTALLER_PKG_REPO", "")
+    if _pkg_repo_env:
+        _repo_root = Path(_pkg_repo_env)
+    else:
+        _repo_root = Path(__file__).resolve().parent.parent / "build" / "packages"
+    _repo_main = _repo_root / "main"
+    if not (_repo_main / "index.json").is_file():
+        raise SystemExit(
+            f"[build_initramfs] HAMNIX_INSTALLER_BLOB=1 but the package repo "
+            f"{_repo_main}/index.json is missing — run "
+            f"scripts/build_packages.py (build_installer_img.sh Stage 1 does "
+            f"this).")
+    _repo_count = 0
+    _repo_bytes = 0
+    for _root, _dirs, _names in os.walk(_repo_main):
+        for _nm in _names:
+            _abs = Path(_root) / _nm
+            _rel = _abs.relative_to(_repo_main)
+            _cpio_path = "/iso-packages/main/" + str(_rel).replace(os.sep, "/")
+            _data = _abs.read_bytes()
+            FILES.append((_cpio_path, _data))
+            _repo_count += 1
+            _repo_bytes += len(_data)
+    print(f"[build_initramfs] HAMNIX_INSTALLER_BLOB=1: packed in-RAM package "
+          f"repo /iso-packages/main/ ({_repo_count} files, "
+          f"{_repo_bytes/(1<<20):.1f} MiB) for the Debian-style root "
+          f"install.", flush=True)
 
 # Native Intel HDA audio self-test. scripts/test_hda_audio.sh sets
 # ENABLE_AUDIO_TEST=1 to plant /etc/audio-test; init/main.ad's boot:37.aud

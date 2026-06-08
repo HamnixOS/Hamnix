@@ -82,12 +82,32 @@ PARTED="/sbin/parted"; [ -x "$PARTED" ] || PARTED="$(command -v parted || true)"
 
 mkdir -p build
 
-# --- Stage 1: userland + the ext4 rootfs payload ----------------------
+# --- Stage 1: userland + the ext4 rootfs payload + package repo -------
 echo "[build_installer_img] Stage 1: build userland + modules + ext4 rootfs payload."
 bash scripts/build_user.sh
 bash scripts/build_modules.sh
 HAMNIX_ROOTFS_OUT="$ROOTFS_IMG" python3 scripts/build_rootfs_img.py
 [ -f "$ROOTFS_IMG" ] || { echo "[build_installer_img] ERROR: $ROOTFS_IMG not built" >&2; exit 1; }
+# DEBIAN-STYLE INSTALL: build the native package repo. The interactive
+# `install` command (and the auto installer) populate the target ext4 root
+# by `hpm --repo=file:///iso-packages install hamnix-base` — a real
+# package install, not a golden-image dd. build_initramfs.py mirrors
+# build/packages/main/ into the installer cpio at /iso-packages/main/ so
+# the repo is firmware-loaded into RAM (no media read on the NUC).
+#
+# HAMNIX_BOOTLOADER_SLIM=1: the hamnix-bootloader package is metadata-only
+# here. The installer lays the ESP (BOOTX64.EFI + kernel) onto the target
+# via sqfs_to_blk from the in-RAM esp.img — NOT from the bootloader
+# package's files — so the package needs no kernel ELF payload. This also
+# decouples the package build from build_iso.sh (which produces
+# build/hamnix-kernel.elf); this installer pipeline builds its own
+# kernels in Stages 3/6 and never invokes build_iso.sh.
+echo "[build_installer_img] Stage 1: build native package repo (build/packages/main)."
+HAMNIX_BOOTLOADER_SLIM=1 python3 scripts/build_packages.py
+[ -f "build/packages/main/index.json" ] || {
+    echo "[build_installer_img] ERROR: build/packages/main/index.json not built" >&2
+    exit 1
+}
 
 # --- Stage 2: the native UEFI stub ------------------------------------
 echo "[build_installer_img] Stage 2: build native UEFI PE/COFF stub."
@@ -154,13 +174,18 @@ mcopy -o -i "$TARGET_ESP" "$EFI_STUB"          "::/EFI/BOOT/BOOTX64.EFI"
 mcopy -o -i "$TARGET_ESP" "$INSTALLED_KERNEL"  "::/hamnix-kernel.elf"
 echo "[build_installer_img]   NVMe ESP image: ${ESP_IMG_MB} MiB (LOG.TXT + BOOTX64.EFI + installed kernel)."
 
-# --- Stage 5: the squashfs payload (rootfs.ext4 + esp.img) ------------
-# Pack BOTH payloads into one gzip squashfs the installer reads in RAM.
-# The reader (fs/squashfs.ad) supports gzip (id=1) + xz (id=4) and a
-# block size up to 1 MiB; mksquashfs' 128 KiB default is well within.
-echo "[build_installer_img] Stage 5: build in-RAM squashfs payload."
+# --- Stage 5: the squashfs payload (esp.img only) ---------------------
+# DEBIAN-STYLE INSTALL: the squashfs now carries ONLY the NVMe ESP FAT
+# image. The target ROOT is no longer a golden-image stream — it is a real
+# package install (`hpm install hamnix-base` from the in-RAM /iso-packages
+# repo onto the freshly-mkfs'd ext4). So the ~512 MiB rootfs.ext4 is NO
+# LONGER packed here, which keeps the RAM-resident installer payload small
+# (important on the NUC). The ESP is byte-copied because FAT has no
+# per-file kernel writer. The reader (fs/squashfs.ad) supports gzip (id=1)
+# + xz (id=4) and a block size up to 1 MiB; mksquashfs' 128 KiB default is
+# well within.
+echo "[build_installer_img] Stage 5: build in-RAM squashfs payload (esp.img only)."
 SQFS_STAGE=$(mktemp -d)
-cp "$ROOTFS_IMG"  "$SQFS_STAGE/rootfs.ext4"
 cp "$TARGET_ESP"  "$SQFS_STAGE/esp.img"
 rm -f "$SQFS_IMG"
 mksquashfs "$SQFS_STAGE" "$SQFS_IMG" -comp gzip -noappend -no-progress \

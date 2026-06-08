@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 # scripts/test_installer_nvme_inram.sh — END-TO-END proof of the
-# IN-RAM-SQUASHFS install flow: the installer sources its rootfs + ESP
-# payloads from a squashfs the FIRMWARE loaded into RAM (inside the kernel
-# cpio), NEVER from the install media's own block device. Targets a native
-# NVMe disk; demonstrable entirely in a VM under OVMF/qemu (no real HW).
+# DEBIAN-STYLE in-RAM install flow: the installer sources its payload from
+# RAM (inside the firmware-loaded kernel cpio), NEVER from the install
+# media's own block device — AND it populates the target ROOT as PACKAGES
+# (hpm install hamnix-base), not as a golden-image byte stream. Targets a
+# native NVMe disk; demonstrable entirely in a VM under OVMF/qemu (no HW).
 #
 # WHY THIS IS DISTINCT FROM test_installer_nvme.sh. The original installer
 # ended its payload copy with `dd_blk /dev/blk/vdap2 /dev/blk/nvme0n1p2` —
 # a RUNTIME read of the install MEDIA's ext4 partition. On the real NUC
 # target the media is a USB stick whose native driver is broken, so that
-# read defeats the whole in-RAM-installer model. This test proves the
-# fix: the install medium is an ESP-ONLY GPT image (NO ext4 partition to
-# read), and the installer streams its payload out of the in-RAM squashfs.
+# read defeats the whole in-RAM-installer model. This test proves the fix:
+# the install medium is an ESP-ONLY GPT image (NO ext4 partition to read);
+# the installer streams ONLY the target ESP out of the in-RAM squashfs and
+# installs the target ROOT from the in-RAM package repo via hpm.
+#
+# TWO in-RAM sources, NEITHER a media read:
+#   /rootfs.sqfs (esp.img)  -> ESP byte-copy via sqfs_to_blk (no FAT writer)
+#   /iso-packages/main      -> hpm package repo for the ext4 ROOT install
 #
 # Stages:
 #   Stage A: build the ESP-only install medium (build_installer_img.sh ->
@@ -19,13 +25,13 @@
 #            THE HOST that the medium has EXACTLY ONE partition (the ESP) —
 #            there is physically nothing on the media to read.
 #   Stage B: boot the install medium under OVMF (virtio-blk = install
-#            media; -device nvme = blank target). Drive the installer over
-#            the serial shell. Assert: the install completed, the log shows
-#            the payload came from the IN-RAM squashfs (a "[sqfs-extract]"
-#            kernel line + the installer's "sourcing ... from in-RAM
-#            squashfs" markers), AND a real GPT + ext4 superblock actually
-#            landed on the NVMe qcow2 (read the raw bytes back on the HOST
-#            — REAL verification, not a log marker).
+#            media; -device nvme = blank target). rc.boot auto-runs the
+#            installer (no keyboard). Assert: the install completed; the
+#            log shows the Debian-style package path (`install --auto` ->
+#            `hpm install hamnix-base` from file:///iso-packages) and the
+#            ESP came from the IN-RAM squashfs ("[sqfs-extract]"); AND a
+#            real GPT + ext4 superblock actually landed on the NVMe qcow2
+#            (read the raw bytes back on the HOST — REAL verification).
 #   Stage C: boot the NVMe qcow2 ALONE under OVMF (NO install media).
 #            Assert the kernel mounted ext4-on-NVMe and reached a shell
 #            with ZERO 'command not found'.
@@ -53,7 +59,7 @@ NVME_SIZE="${NVME_SIZE:-2G}"
 INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer.img}"
 NVME_IMG="${NVME_IMG:-build/installed-nvme-inram.qcow2}"
 KERNEL_BANNER="Hamnix kernel booting"
-PROMPT_MARKER="handing off to interactive shell"
+PROMPT_MARKER="ed-readline-first"
 
 # --- environment gates (skip cleanly) --------------------------------
 if [ ! -e /dev/kvm ]; then
@@ -171,7 +177,10 @@ INSTALL_WAIT="${INSTALL_WAIT:-400}"
 echo "[test_installer_nvme_inram] Stage B: booting installer medium; waiting up to $((BOOT_TIMEOUT + INSTALL_WAIT))s for the auto-run installer to finish..."
 installed=0
 for _ in $(seq 1 $((BOOT_TIMEOUT + INSTALL_WAIT))); do
-    if grep -a -q '\[install-nvme\] install complete on /dev/blk/nvme0n1' "$STAGE_B_LOG"; then
+    # The package-based installer ends with the install_nvme.hamsh wrapper's
+    # own "install complete" line (the inner `install` command also prints
+    # "[install] install complete on ...").
+    if grep -a -q '\[install-nvme\] install complete' "$STAGE_B_LOG"; then
         installed=1; break
     fi
     if ! kill -0 "$QEMU_B_PID" 2>/dev/null; then
@@ -215,20 +224,29 @@ check_b 'installer medium .in-RAM squashfs.: USB root bring-up SKIPPED entirely'
 check_b '\[nvme\] registered as block slot=' "native NVMe driver registered nvme0n1"
 # The installer ran its steps.
 check_b '\[install-nvme\] Hamnix NVMe installer' "installer banner"
-# KEYSTONE (in-RAM source): the payload came from the in-RAM squashfs.
-check_b '\[install-nvme\] sourcing rootfs from in-RAM squashfs' \
-        "installer sourced rootfs from in-RAM squashfs (not the media)"
-check_b '\[install-nvme\] sourcing ESP from in-RAM squashfs' \
-        "installer sourced ESP from in-RAM squashfs (not the media)"
-# The kernel-side squashfs extractor actually ran (mount + stream).
-check_b '\[sqfs-extract\] start' "kernel sqfs-extract streamer ran"
+# DEBIAN-STYLE INSTALL: the wrapper handed off to the `install --auto`
+# package-based installer (not a golden-image byte stream).
+check_b 'running: install --auto' "wrapper invoked the package-based install --auto"
+check_b '\[install\] Installing Hamnix .Debian-style package install.' \
+        "install command ran in Debian-style package mode"
+# The ROOT was populated via hpm packages (the whole point of the rewrite):
+# refresh the in-RAM repo, then install the hamnix-base metapackage onto
+# the freshly-mkfs'd ext4 via the --target-dev ctl path.
+check_b 'hpm.*refresh|\[install\] .4/5. hpm refresh' "hpm refreshed the in-RAM package index"
+check_b '\[install\] .5/5. hpm install hamnix-base' "installer installed hamnix-base as packages"
+check_b 'hpm: installed hamnix-base' "hpm reported hamnix-base installed onto the target"
+# KEYSTONE (in-RAM source): the ESP came from the in-RAM squashfs; the
+# root package repo is the in-RAM /iso-packages — neither is a media read.
+check_b 'file:///iso-packages' "installer used the in-RAM package repo (not a media read)"
+# The kernel-side squashfs extractor still runs for the ESP byte-copy.
+check_b '\[sqfs-extract\] start' "kernel sqfs-extract streamer ran (ESP byte-copy)"
 check_b '\[sqfs-extract\] in-RAM squashfs mounted' "in-RAM squashfs mounted"
-check_b '\[sqfs-extract\] DONE: wrote ' "kernel sqfs-extract completed a payload stream"
+check_b '\[sqfs-extract\] DONE: wrote ' "kernel sqfs-extract completed the ESP stream"
 # GPT actually landed on NVMe.
 check_b '\[gpt\] init OK' "GPT init on NVMe target"
 check_b '\[gpt\] mkpart idx=0 ' "ESP mkpart on NVMe"
 check_b '\[gpt\] mkpart idx=1 ' "rootfs mkpart on NVMe"
-check_b '\[install-nvme\] install complete on /dev/blk/nvme0n1' "installer reported complete"
+check_b '\[install-nvme\] install complete' "installer reported complete"
 check_b 'loop-enter' "shell re-entered interactive loop after install"
 
 # REAL verification: read the NVMe qcow2 back on the HOST and assert a
@@ -348,5 +366,5 @@ fi
 echo "[test_installer_nvme_inram] Stage C: PASS (installed system booted off ext4-on-NVMe)"
 
 echo "[test_installer_nvme_inram] ALL STAGES PASS"
-echo "[test_installer_nvme_inram]   ESP-only install medium -> in-RAM squashfs -> ext4 root + ESP on NVMe -> reboot -> installed-root shell (NO media read)"
+echo "[test_installer_nvme_inram]   ESP-only install medium -> in-RAM ESP squashfs + hpm package repo -> mkfs ext4 root + hpm install hamnix-base + ESP on NVMe -> reboot -> installed-root shell (NO media read, Debian-style package root)"
 exit 0

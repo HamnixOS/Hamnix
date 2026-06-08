@@ -525,13 +525,19 @@ def _files_drv_snd_hda() -> list[tuple[Path, str]]:
 
 
 # ---- hamnix-installer-tools ----------------------------------------
-# Just the partitioner + dd_blk. mkfs_* moved to hamnix-fs-*; hpm is
-# its own package; hpm's solver pulls them in via the metapackage.
+# The partitioner + dd_blk + sqfs_to_blk + the `install` front-end. mkfs_*
+# moved to hamnix-fs-*; hpm is its own package; hpm's solver pulls them in
+# via the metapackage. `install` is the interactive/auto Debian-style
+# installer command, and sqfs_to_blk is the ESP byte-streamer it spawns;
+# shipping both means the installed system can itself reinstall onto a new
+# disk.
 
 def _files_installer_tools() -> list[tuple[Path, str]]:
     f: list[tuple[Path, str]] = []
     _add_user_bin(f, "hamnix_partition")
     _add_user_bin(f, "dd_blk")
+    _add_user_bin(f, "sqfs_to_blk")
+    _add_user_bin(f, "install")
     return f
 
 

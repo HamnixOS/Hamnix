@@ -190,6 +190,7 @@ build_adder_user dd_blk               # installer: sector-aligned /dev/blk/SRC -
 build_adder_user install_file_to_slot # installer: copy one local file → target ext4 partition (via /ctl install_file verb)
 build_adder_user install_rootfs_from_manifest  # installer: walk manifest, install_file_to_slot each (target_path source_path) pair
 build_adder_user haminstall           # installer: one-shot on-target install (GPT+mkfs+ESP+rootfs) with live-root safety guard
+build_adder_user install              # installer: interactive `install` (disk picker + confirm) + --auto; Debian-style hpm package root install
 build_adder_user losetup              # attach/detach a file as a loop block device via /dev/loop/ctl
 build_adder_user sqfs_to_blk          # installer: stream a file from an in-RAM squashfs -> block dev (no media read)
 

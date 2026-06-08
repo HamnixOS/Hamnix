@@ -2595,7 +2595,7 @@ def _load_installed() -> int32:
     # 1 on absent file (treated as "no packages installed yet").
     inst_count = 0
     inst_file_n = 0
-    fd: int32 = sys_open("/var/lib/hpm/installed.json")
+    fd: int32 = sys_open(cast[Ptr[char]](_db_path(cast[Ptr[uint8]]("installed.json"))))
     if fd < 0:
         return 1
     total: uint64 = 0
@@ -3450,6 +3450,274 @@ def _set_target_prefix_override(path: Ptr[uint8]):
     target_prefix_override[n] = 0
 
 
+# -- target block device (Debian-style fresh-disk install) ------------
+#
+# `--target-dev=<devpath>` (e.g. /dev/blk/nvme0n1p2) makes hpm lay each
+# package's files DIRECTLY onto a freshly-mkfs'd ext4 partition via the
+# kernel's `<devpath>/ctl install_file <relpath> <len>\n<body>` verb —
+# the SAME proven ext4-write primitive install_rootfs_from_manifest
+# uses. This is how the installer turns a `hpm install hamnix-base` into
+# a real Debian-debootstrap-style root population: partition + mkfs the
+# disk, then unpack the base package set onto it as PACKAGES, not a dd of
+# a golden image. No writable-ext4 VFS mount is needed — the kernel
+# applies each file straight to the on-disk ext4 at the target slot.
+#
+# When target_dev is empty hpm writes files the classic way (sys_open_
+# write into the live VFS, honouring --target-prefix for distro roots).
+target_dev_buf: Array[128, uint8]          # NUL-terminated; empty = unset
+target_dev_ctl_fd: int32 = -1              # cached open ctl fd for the dev
+
+# Wire-format scratch for the install_file verb. The header is small;
+# the body is the file bytes copied straight from tar_buf. Sized to the
+# kernel install_file body cap (4 MiB) plus header slack.
+DEV_WIRE_CAP: uint64 = 4259840             # 4 MiB body + 64 KiB header
+dev_wire_buf: Array[4259840, uint8]
+
+
+def _set_target_dev(path: Ptr[uint8]):
+    n: uint64 = strlen_u8(path)
+    if n == 0:
+        target_dev_buf[0] = 0
+        return
+    if n > 126:
+        n = 126
+    i: uint64 = 0
+    while i < n:
+        target_dev_buf[i] = path[i]
+        i = i + 1
+    target_dev_buf[n] = 0
+
+
+dev_ctl_path_buf: Array[160, uint8]
+
+
+def _target_dev_ctl_open() -> int32:
+    # Open (and cache) "<target_dev>/ctl" for write. Returns the fd or -1.
+    if target_dev_ctl_fd >= 0:
+        return target_dev_ctl_fd
+    n: uint64 = 0
+    while target_dev_buf[n] != 0 and n < 158:
+        dev_ctl_path_buf[n] = target_dev_buf[n]
+        n = n + 1
+    suf: Ptr[uint8] = "/ctl"
+    si: uint64 = 0
+    while suf[si] != 0 and n < 159:
+        dev_ctl_path_buf[n] = suf[si]
+        n = n + 1
+        si = si + 1
+    dev_ctl_path_buf[n] = 0
+    fd: int32 = sys_open_write(cast[Ptr[char]](&dev_ctl_path_buf[0]))
+    if fd < 0:
+        write_str(2, "hpm: cannot open ")
+        write_str(2, &dev_ctl_path_buf[0])
+        write_str(2, " for write (target-dev)\n")
+        return -1
+    target_dev_ctl_fd = fd
+    return fd
+
+
+def _dev_install_file(rel_path: Ptr[uint8], body: Ptr[uint8],
+                      body_len: uint64) -> int32:
+    # Apply one file to the target ext4 partition via the kernel
+    # install_file ctl verb. rel_path is partition-relative (no leading
+    # '/'); the kernel mkdir -p's the parents. Returns 0 on success.
+    if body_len > 4194304:
+        write_str(2, "hpm: target-dev file exceeds 4 MiB install_file cap: ")
+        write_str(2, rel_path)
+        write_str(2, "\n")
+        return -1
+    fd: int32 = _target_dev_ctl_open()
+    if fd < 0:
+        return -1
+    # Compose "install_file <rel> <len>\n<body>".
+    pos: uint64 = 0
+    pre: Ptr[uint8] = "install_file "
+    pi2: uint64 = 0
+    while pre[pi2] != 0:
+        dev_wire_buf[pos] = pre[pi2]
+        pos = pos + 1
+        pi2 = pi2 + 1
+    # Skip any leading '/' on rel_path so the path is partition-relative.
+    ri: uint64 = 0
+    if rel_path[0] == 47:
+        ri = 1
+    while rel_path[ri] != 0:
+        dev_wire_buf[pos] = rel_path[ri]
+        pos = pos + 1
+        ri = ri + 1
+    dev_wire_buf[pos] = 32                          # ' '
+    pos = pos + 1
+    # Decimal length.
+    if body_len == 0:
+        dev_wire_buf[pos] = 48
+        pos = pos + 1
+    else:
+        ld: Array[24, uint8]
+        ln: uint64 = 0
+        bv: uint64 = body_len
+        while bv != 0:
+            ld[ln] = cast[uint8](bv % 10) + 48
+            bv = bv / 10
+            ln = ln + 1
+        while ln > 0:
+            ln = ln - 1
+            dev_wire_buf[pos] = ld[ln]
+            pos = pos + 1
+    dev_wire_buf[pos] = 10                          # '\n'
+    pos = pos + 1
+    # Body.
+    k: uint64 = 0
+    while k < body_len:
+        dev_wire_buf[pos + k] = body[k]
+        k = k + 1
+    pos = pos + body_len
+    wn: int64 = sys_write(fd, &dev_wire_buf[0], pos)
+    if wn < 0:
+        write_str(2, "hpm: target-dev install_file rejected for ")
+        write_str(2, rel_path)
+        write_str(2, "\n")
+        return -1
+    return 0
+
+
+def _dev_mkdir(rel_path: Ptr[uint8]) -> int32:
+    # mkdir -p `rel_path` on the target ext4 partition via the ctl verb.
+    # rel_path is partition-relative. Returns 0 on success.
+    fd: int32 = _target_dev_ctl_open()
+    if fd < 0:
+        return -1
+    line: Array[1088, uint8]
+    pos: uint64 = 0
+    pre: Ptr[uint8] = "mkdir "
+    pi2: uint64 = 0
+    while pre[pi2] != 0:
+        line[pos] = pre[pi2]
+        pos = pos + 1
+        pi2 = pi2 + 1
+    ri: uint64 = 0
+    if rel_path[0] == 47:
+        ri = 1
+    while rel_path[ri] != 0 and pos < 1086:
+        line[pos] = rel_path[ri]
+        pos = pos + 1
+        ri = ri + 1
+    line[pos] = 10
+    pos = pos + 1
+    sys_write(fd, &line[0], pos)
+    return 0
+
+
+# -- alt-root package DB path ------------------------------------------
+#
+# The package state directory (/var/lib/hpm/{installed,history,channels}.
+# json) is per-root: a Debian-style install into an alternate root must
+# write the DB ONTO that target root, not the live system's /var. When
+# target_prefix_override is set (e.g. "/mnt/newroot/"), every DB path is
+# rewritten to "<override>var/lib/hpm/...". With no override the path is
+# the plain absolute "/var/lib/hpm/...". This is what makes `hpm
+# --target-prefix=/mnt/newroot install` lay down a SELF-CONTAINED root:
+# the installed-package database travels with the files it tracks.
+#
+# When target_dev is set, the DB instead rides onto the target ext4 via
+# the install_file ctl verb at the partition-relative path
+# "var/lib/hpm/installed.json".
+
+db_path_buf: Array[512, uint8]
+
+
+def _db_path(suffix: Ptr[uint8]) -> Ptr[uint8]:
+    # Compose the package-DB path for `suffix` (e.g. "installed.json").
+    # Returns a pointer into db_path_buf, reused per call (callers use
+    # it immediately for a single open). With an override set the result
+    # is "<override>var/lib/hpm/<suffix>"; otherwise "/var/lib/hpm/<suffix>".
+    p: uint64 = 0
+    if target_prefix_override[0] != 0:
+        ov: uint64 = 0
+        while target_prefix_override[ov] != 0 and p + 1 < 512:
+            db_path_buf[p] = target_prefix_override[ov]
+            p = p + 1
+            ov = ov + 1
+        # override ends in '/'; append "var/lib/hpm/".
+        rel: Ptr[uint8] = "var/lib/hpm/"
+        ri: uint64 = 0
+        while rel[ri] != 0 and p + 1 < 512:
+            db_path_buf[p] = rel[ri]
+            p = p + 1
+            ri = ri + 1
+    else:
+        abs_: Ptr[uint8] = "/var/lib/hpm/"
+        ai: uint64 = 0
+        while abs_[ai] != 0 and p + 1 < 512:
+            db_path_buf[p] = abs_[ai]
+            p = p + 1
+            ai = ai + 1
+    si: uint64 = 0
+    while suffix[si] != 0 and p + 1 < 512:
+        db_path_buf[p] = suffix[si]
+        p = p + 1
+        si = si + 1
+    db_path_buf[p] = 0
+    return &db_path_buf[0]
+
+
+def _db_mkdir():
+    # Ensure the DB directory (target-aware) exists. _mkdir_p needs an
+    # absolute-style path; _db_path already produces one (with or without
+    # the override). We mkdir each prefix of "<...>var/lib/hpm".
+    dir_: Ptr[uint8] = _db_path(cast[Ptr[uint8]](""))
+    # Strip the trailing '/' so _mkdir_p makes the hpm dir itself too.
+    n: uint64 = strlen_u8(dir_)
+    tmp: Array[512, uint8]
+    i: uint64 = 0
+    while i < n:
+        tmp[i] = dir_[i]
+        i = i + 1
+    if n > 0 and tmp[n - 1] == 47:
+        n = n - 1
+    tmp[n] = 0
+    _mkdir_p(&tmp[0])
+    sys_mkdir(cast[Ptr[char]](&tmp[0]))
+
+
+def _write_db_file(suffix: Ptr[uint8], buf: Ptr[uint8],
+                   length: uint64) -> int32:
+    # Persist a package-DB file (e.g. "installed.json"). When target_dev
+    # is set, the DB rides onto the target ext4 partition at the
+    # partition-relative "var/lib/hpm/<suffix>" via the install_file ctl
+    # verb (so a fresh-disk install records its DB on the installed
+    # root). Otherwise it goes to the live VFS at the target-prefix-aware
+    # path. Returns 0 on success, -1 on failure.
+    if target_dev_buf[0] != 0:
+        rel: Array[64, uint8]
+        rp: Ptr[uint8] = "var/lib/hpm/"
+        ri: uint64 = 0
+        while rp[ri] != 0:
+            rel[ri] = rp[ri]
+            ri = ri + 1
+        si: uint64 = 0
+        while suffix[si] != 0 and ri + 1 < 64:
+            rel[ri] = suffix[si]
+            ri = ri + 1
+            si = si + 1
+        rel[ri] = 0
+        return _dev_install_file(&rel[0], buf, length)
+    _db_mkdir()
+    fd: int32 = sys_open_write(cast[Ptr[char]](_db_path(suffix)))
+    if fd < 0:
+        write_str(2, "hpm: cannot open ")
+        write_str(2, suffix)
+        write_str(2, " for write\n")
+        return -1
+    wn: int64 = _write_full(fd, buf, length)
+    sys_close(fd)
+    if wn < 0 or cast[uint64](wn) != length:
+        write_str(2, "hpm: short write on ")
+        write_str(2, suffix)
+        write_str(2, "\n")
+        return -1
+    return 0
+
+
 def _is_esp_target(target: Ptr[uint8], target_len: uint64) -> int32:
     # #esp: hpm doesn't lay down files itself (the ESP is FAT-on-block,
     # not Hamnix-file-server-addressable). install.hamsh handles ESP
@@ -3824,9 +4092,11 @@ def _stage_extract_files(tar_len: uint64, target_prefix: Ptr[uint8]) -> int32:
         rel_len: uint64 = tail_len - files_pfx_len
 
         if rel_len == 0:
-            # Bare "files/" directory entry — make sure target_prefix
-            # exists, then skip.
-            sys_mkdir(cast[Ptr[char]](target_prefix))
+            # Bare "files/" directory entry. With a target dev there is
+            # nothing partition-relative to create (it's "/"); the live
+            # tmpfs case mkdirs the prefix dir.
+            if target_dev_buf[0] == 0:
+                sys_mkdir(cast[Ptr[char]](target_prefix))
             off = off + 512 + body_blocks * 512
             continue
 
@@ -3864,10 +4134,16 @@ def _stage_extract_files(tar_len: uint64, target_prefix: Ptr[uint8]) -> int32:
             ri = ri + 1
         extract_path_buf[po] = 0
 
+        # `safe_buf` already holds the partition-relative path (the part
+        # under files/), NUL-terminated. Used for the target-dev path.
+
         if typeflag == 53:                               # '5' = dir
-            # mkdir -p the full path itself.
-            _mkdir_p(&extract_path_buf[0])
-            sys_mkdir(cast[Ptr[char]](&extract_path_buf[0]))
+            if target_dev_buf[0] != 0:
+                # mkdir -p on the target ext4 partition via the ctl verb.
+                _dev_mkdir(&safe_buf[0])
+            else:
+                _mkdir_p(&extract_path_buf[0])
+                sys_mkdir(cast[Ptr[char]](&extract_path_buf[0]))
             off = off + 512 + body_blocks * 512
             continue
 
@@ -3878,27 +4154,37 @@ def _stage_extract_files(tar_len: uint64, target_prefix: Ptr[uint8]) -> int32:
             off = off + 512 + body_blocks * 512
             continue
 
-        # Regular file. mkdir -p the parent, then write the body.
-        _dirname_mkdir_p(&extract_path_buf[0])
+        # Regular file.
         body_off: uint64 = off + 512
         if body_off + size > tar_len:
             write_str(2, "hpm: tar body overflows archive\n")
             return -1
-        fd: int32 = sys_open_write(cast[Ptr[char]](&extract_path_buf[0]))
-        if fd < 0:
-            write_str(2, "hpm: cannot create ")
-            write_str(2, &extract_path_buf[0])
-            write_str(2, "\n")
-            return -1
-        if size > 0:
-            wn: int64 = _write_full(fd, &tar_buf[body_off], size)
-            if wn < 0 or cast[uint64](wn) != size:
-                write_str(2, "hpm: short write extracting ")
+
+        if target_dev_buf[0] != 0:
+            # Lay the file onto the target ext4 partition via the kernel
+            # install_file verb (Debian-style fresh-disk package install).
+            # The kernel mkdir -p's parents, so no _dirname_mkdir_p here.
+            if _dev_install_file(&safe_buf[0], &tar_buf[body_off],
+                                 size) != 0:
+                return -1
+        else:
+            # mkdir -p the parent, then write the body into the live VFS.
+            _dirname_mkdir_p(&extract_path_buf[0])
+            fd: int32 = sys_open_write(cast[Ptr[char]](&extract_path_buf[0]))
+            if fd < 0:
+                write_str(2, "hpm: cannot create ")
                 write_str(2, &extract_path_buf[0])
                 write_str(2, "\n")
-                sys_close(fd)
                 return -1
-        sys_close(fd)
+            if size > 0:
+                wn: int64 = _write_full(fd, &tar_buf[body_off], size)
+                if wn < 0 or cast[uint64](wn) != size:
+                    write_str(2, "hpm: short write extracting ")
+                    write_str(2, &extract_path_buf[0])
+                    write_str(2, "\n")
+                    sys_close(fd)
+                    return -1
+            sys_close(fd)
 
         # Record the relative path (under files/) for installed.json.
         if _new_files_record(&warn_buf[rel_start], rel_len) != 0:
@@ -4112,6 +4398,58 @@ def _installed_emit_new(name: Ptr[uint8], version: Ptr[uint8],
     return 0
 
 
+def _inst_append_inmemory(name: Ptr[uint8], version: Ptr[uint8],
+                          target: Ptr[uint8], pinned: int32) -> int32:
+    # Append a just-installed package to the in-memory inst_* state.
+    # Used in target-dev mode where the DB lives on a WRITE-ONLY target
+    # ext4 partition (the install_file ctl verb cannot read it back), so
+    # we cannot _load_installed() between closure packages — each pkg's
+    # DB rewrite must reflect every PRECEDING pkg. We append the name /
+    # version / target bytes into inst_buf and record the spans, with an
+    # empty files slice (remove during a fresh install isn't needed).
+    if inst_count >= INST_MAX:
+        write_str(2, "hpm: in-memory installed table full\n")
+        return -1
+    nl: uint64 = strlen_u8(name)
+    vl: uint64 = strlen_u8(version)
+    tl: uint64 = strlen_u8(target)
+    if inst_len + nl + vl + tl + 3 > 131072:
+        write_str(2, "hpm: in-memory installed buffer full\n")
+        return -1
+    i: uint64 = inst_count
+    # name
+    inst_name_off[i] = inst_len
+    inst_name_len[i] = nl
+    k: uint64 = 0
+    while k < nl:
+        inst_buf[inst_len + k] = name[k]
+        k = k + 1
+    inst_len = inst_len + nl
+    # version
+    inst_ver_off[i] = inst_len
+    inst_ver_len[i] = vl
+    k = 0
+    while k < vl:
+        inst_buf[inst_len + k] = version[k]
+        k = k + 1
+    inst_len = inst_len + vl
+    # target
+    inst_target_off[i] = inst_len
+    inst_target_len[i] = tl
+    k = 0
+    while k < tl:
+        inst_buf[inst_len + k] = target[k]
+        k = k + 1
+    inst_len = inst_len + tl
+    inst_at_off[i] = inst_len
+    inst_at_len[i] = 0
+    inst_pinned[i] = pinned
+    inst_file_start[i] = inst_file_n
+    inst_file_count[i] = 0
+    inst_count = inst_count + 1
+    return 0
+
+
 def _installed_rewrite_with_added(name: Ptr[uint8], version: Ptr[uint8],
                                   target: Ptr[uint8],
                                   pinned: int32) -> int32:
@@ -4154,15 +4492,11 @@ def _installed_rewrite_with_added(name: Ptr[uint8], version: Ptr[uint8],
     if _rw_put_lit(cast[Ptr[uint8]]("\n  ]\n}\n")) != 0:
         return -1
 
-    # Write to /var/lib/hpm/installed.json (truncate-on-open).
-    fd: int32 = sys_open_write("/var/lib/hpm/installed.json")
-    if fd < 0:
-        write_str(2, "hpm: cannot open /var/lib/hpm/installed.json for write\n")
-        return -1
-    wn: int64 = _write_full(fd, &rewrite_buf[0], rewrite_n)
-    sys_close(fd)
-    if wn < 0 or cast[uint64](wn) != rewrite_n:
-        write_str(2, "hpm: short write on installed.json\n")
+    # Persist installed.json — target-dev / target-prefix aware so an
+    # alt-root or fresh-disk install records its DB on the target root,
+    # not the live system.
+    if _write_db_file(cast[Ptr[uint8]]("installed.json"),
+                      &rewrite_buf[0], rewrite_n) != 0:
         return -1
     return 0
 
@@ -4196,14 +4530,8 @@ def _installed_rewrite_with_removed(name: Ptr[uint8]) -> int32:
         i = i + 1
     if _rw_put_lit(cast[Ptr[uint8]]("\n  ]\n}\n")) != 0:
         return -1
-    fd: int32 = sys_open_write("/var/lib/hpm/installed.json")
-    if fd < 0:
-        write_str(2, "hpm: cannot open /var/lib/hpm/installed.json for write\n")
-        return -1
-    wn: int64 = _write_full(fd, &rewrite_buf[0], rewrite_n)
-    sys_close(fd)
-    if wn < 0 or cast[uint64](wn) != rewrite_n:
-        write_str(2, "hpm: short write on installed.json\n")
+    if _write_db_file(cast[Ptr[uint8]]("installed.json"),
+                      &rewrite_buf[0], rewrite_n) != 0:
         return -1
     return 0
 
@@ -4243,12 +4571,8 @@ def _installed_rewrite_with_pin(name: Ptr[uint8], pin_v: int32) -> int32:
         i = i + 1
     if _rw_put_lit(cast[Ptr[uint8]]("\n  ]\n}\n")) != 0:
         return -1
-    fd: int32 = sys_open_write("/var/lib/hpm/installed.json")
-    if fd < 0:
-        return -1
-    wn: int64 = _write_full(fd, &rewrite_buf[0], rewrite_n)
-    sys_close(fd)
-    if wn < 0 or cast[uint64](wn) != rewrite_n:
+    if _write_db_file(cast[Ptr[uint8]]("installed.json"),
+                      &rewrite_buf[0], rewrite_n) != 0:
         return -1
     return 0
 
@@ -6427,7 +6751,13 @@ def _install_one_by_repo_idx(pi: uint64, pinned: int32) -> int32:
         if _installed_rewrite_with_added(&name_buf[0], &v_cstr[0],
                                          &target_cstr[0], pinned) != 0:
             return 1
-        if _load_installed() < 0:
+        # target-dev DB is write-only (install_file ctl verb); keep the
+        # in-memory state in sync by appending rather than reloading.
+        if target_dev_buf[0] != 0:
+            if _inst_append_inmemory(&name_buf[0], &v_cstr[0],
+                                     &target_cstr[0], pinned) != 0:
+                return 1
+        elif _load_installed() < 0:
             return 1
         if _record_txn(cast[Ptr[uint8]]("install"), &name_buf[0],
                        &v_cstr[0], cast[Ptr[uint8]]("absent")) != 0:
@@ -6486,8 +6816,13 @@ def _install_one_by_repo_idx(pi: uint64, pinned: int32) -> int32:
                                      &target_cstr[0], pinned) != 0:
         return 1
     # Reload installed.json so subsequent in-loop conflict checks see
-    # the just-added package's file list.
-    if _load_installed() < 0:
+    # the just-added package's file list. In target-dev mode the DB sits
+    # on a write-only target partition; append in memory instead.
+    if target_dev_buf[0] != 0:
+        if _inst_append_inmemory(&name_buf[0], &v_cstr[0],
+                                 &target_cstr[0], pinned) != 0:
+            return 1
+    elif _load_installed() < 0:
         return 1
     if _record_txn(cast[Ptr[uint8]]("install"), &name_buf[0],
                    &v_cstr[0], cast[Ptr[uint8]]("absent")) != 0:
@@ -7116,7 +7451,11 @@ Commands:\n\
 Flags:\n\
   --repo=<url>            file:// or https:// repo (default https://255.one/)\n\
   --target-prefix=<path>  install under <path> instead of `/` — used by\n\
-                          the installer to populate /mnt/newroot\n"
+                          the installer to populate /mnt/newroot\n\
+  --target-dev=<devpath>  install onto a freshly-mkfs'd ext4 partition\n\
+                          (e.g. /dev/blk/nvme0n1p2) via the kernel\n\
+                          install_file ctl verb — Debian-style fresh-disk\n\
+                          package install used by `install`\n"
     write_str(2, s)
     return 2
 
@@ -7159,6 +7498,23 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             write_str(1, "hpm: target-prefix=")
             write_str(1, &target_prefix_override[0])
             write_str(1, "\n")
+            ai = ai + 1
+            continue
+        # Match "--target-dev=" (13 chars).
+        pfx_d: Ptr[uint8] = "--target-dev="
+        is_td: int32 = 1
+        idd: uint64 = 0
+        while idd < 13:
+            if a[idd] != pfx_d[idd]:
+                is_td = 0
+                break
+            idd = idd + 1
+        if is_td != 0:
+            rest3: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](a) + 13)
+            _set_target_dev(rest3)
+            write_str(1, "hpm: target-dev=")
+            write_str(1, &target_dev_buf[0])
+            write_str(1, " (package install onto fresh ext4 partition)\n")
             ai = ai + 1
             continue
         break
