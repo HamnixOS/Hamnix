@@ -122,6 +122,19 @@ irq_stub_\n:
  */
     IRQ_STUB 242
 
+/* ---------- IPI vector 243 (0xF3): CPU STOP --------------------- *
+ * A dedicated stub for the cross-CPU stop IPI.  The BSP broadcasts this
+ * from the poweroff / reboot path (halt_other_cpus()) BEFORE the ACPI S5
+ * / reset write so every other CPU parks permanently in `cli; hlt`.  Same
+ * prologue/epilogue shape as the other IPI stubs — funnels through
+ * common_irq so do_irq() dispatches to irq_handlers[243] (stop_ipi).  Note
+ * that handler never returns: it bumps the ack counter then HLTs forever,
+ * so the iretq/EOI tail of common_irq is never reached for this vector
+ * (the AP is dead).  That's intentional: a stopped AP cannot spin and
+ * overheat the board if S5 fails to cut power.
+ */
+    IRQ_STUB 243
+
 /* ---------- common IRQ dispatch ---------------------------------- */
     .align 16
     .globl common_irq
