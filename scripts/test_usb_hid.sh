@@ -97,12 +97,13 @@ timeout 15s qemu-system-x86_64 \
     -serial stdio \
     -device qemu-xhci \
     -device usb-kbd \
+    -device usb-mouse \
     > "$LOG" 2>&1
 rc=$?
 set -e
 
 echo "[test_usb_hid] --- captured USB-relevant boot output ---"
-grep -E "xhci|usb_hid|atkbd:|hid:" "$LOG" || true
+grep -E "xhci|usb_hid|usb_hid_mouse|atkbd:|hid:" "$LOG" || true
 echo "[test_usb_hid] --- end ---"
 
 fail=0
@@ -160,11 +161,26 @@ else
     fail=1
 fi
 
+# --- HID MOUSE translator self-test ----------------------------------
+# The boot-protocol mouse driver (hid_mouse_report) runs a synthetic
+# report battery at boot, packing each into the devmouse FIFO and
+# popping it back to assert the encoding. 7 cases as of this commit.
+if grep -F -q "[usb_hid_mouse] self-test PASS (7 cases)" "$LOG"; then
+    echo "[test_usb_hid] OK: HID boot-MOUSE translator self-test PASS"
+else
+    echo "[test_usb_hid] MISS: HID mouse self-test PASS banner absent"
+    fail=1
+fi
+
 # --- Negative checks --------------------------------------------------
 # Whatever order the markers appeared in, the HID self-test must NOT
 # have reported a failure line.
 if grep -F -q "[usb_hid] self-test FAIL" "$LOG"; then
     echo "[test_usb_hid] MISS: HID self-test FAIL line present"
+    fail=1
+fi
+if grep -F -q "[usb_hid_mouse] self-test FAIL" "$LOG"; then
+    echo "[test_usb_hid] MISS: HID mouse self-test FAIL line present"
     fail=1
 fi
 
