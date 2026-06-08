@@ -651,6 +651,36 @@ class X86CodeGen:
         # that symbol, and `gen_call`'s direct-call classification
         # consults `defined_funcs`.
         self._collect_class_methods(program)
+
+        # ABI INVARIANT: the logical CPU id (`cpu_id_pcpu`,
+        # smp_processor_id) MUST live at per-CPU byte offset 0. The
+        # hand-written low-level asm — read_cpu_id_percpu, syscall_entry,
+        # tss_set_rsp0/tss_get_rsp0 (tss_asm.S), tss_set_ist1 (trap_asm.S)
+        # — reads the CPU id with a literal `mov %gs:0` because a
+        # cross-object `(cpu_id_pcpu - __per_cpu_template_start)` symbol
+        # difference is NOT relocatable at assemble time. So the codegen,
+        # which owns the .data..percpu layout, must pin cpu_id_pcpu to
+        # offset 0 rather than let it fall wherever module declaration
+        # order happens to place it. Without this pin, a Percpu global
+        # declared in an earlier-imported module (e.g. local_timer_ticks
+        # in arch/x86/kernel/time.ad) lands at offset 0, the asm reads
+        # THAT as the CPU id, indexes a wild per_cpu_tss[] slot, and a
+        # timer IRQ from userspace triple-faults (regression #402).
+        # Reserve offset 0 here, before the order-dependent Pass-1 walk;
+        # the walk skips it because the offset is already assigned. Only
+        # pin when cpu_id_pcpu is actually a declared Percpu global (the
+        # kernel), so other targets don't get a phantom 8-byte gap.
+        _has_cpu_id_pcpu = any(
+            isinstance(d, VarDecl)
+            and d.name == 'cpu_id_pcpu'
+            and isinstance(d.var_type, PercpuType)
+            for d in program.declarations
+        )
+        if _has_cpu_id_pcpu:
+            self.percpu_size = 8       # cpu_id_pcpu occupies [0, 8)
+            self.percpu_globals.add('cpu_id_pcpu')
+            self.percpu_offsets['cpu_id_pcpu'] = 0
+
         for decl in program.declarations:
             match decl:
                 case ExternDecl(name=name):
@@ -679,17 +709,23 @@ class X86CodeGen:
                 case VarDecl(name=name, var_type=var_type):
                     self.global_var_types[name] = var_type
                     if isinstance(var_type, PercpuType):
-                        # Assign a per-CPU area byte offset to this var.
-                        # Pack with natural alignment of the base type.
-                        base = var_type.base_type
-                        align = self.natural_align(base)
-                        size = self.get_type_size(base)
-                        self.percpu_size = (
-                            (self.percpu_size + align - 1) & ~(align - 1)
-                        )
-                        self.percpu_globals.add(name)
-                        self.percpu_offsets[name] = self.percpu_size
-                        self.percpu_size += size
+                        # cpu_id_pcpu was pinned to offset 0 above (ABI
+                        # invariant for the hand-written %gs:0 asm); don't
+                        # reassign it.
+                        if name in self.percpu_offsets:
+                            pass
+                        else:
+                            # Assign a per-CPU area byte offset to this var.
+                            # Pack with natural alignment of the base type.
+                            base = var_type.base_type
+                            align = self.natural_align(base)
+                            size = self.get_type_size(base)
+                            self.percpu_size = (
+                                (self.percpu_size + align - 1) & ~(align - 1)
+                            )
+                            self.percpu_globals.add(name)
+                            self.percpu_offsets[name] = self.percpu_size
+                            self.percpu_size += size
 
         # Pass 2: emit code.
         self.emit('    .text')

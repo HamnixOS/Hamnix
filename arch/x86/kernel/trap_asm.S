@@ -394,13 +394,15 @@ get_trap_diag_ist_stack_top:
  * TR reload required (mirrors tss_set_rsp0 in tss_asm.S).
  *
  * Per-CPU: indexes per_cpu_tss[] (in tss_asm.S) by the calling CPU's
- * logical id (cpu_id_pcpu @ %gs:0), so each CPU sets its OWN #DF stack. */
+ * logical id (cpu_id_pcpu, read via %gs:0 — the codegen pins it to
+ * per-CPU offset 0; see setup_percpu_asm.S), so each CPU sets its OWN
+ * #DF stack. */
     .equ TSS_STRIDE_TRAP, 128
     .equ NR_TSS_CPUS_TRAP, 16
     .align 16
     .globl tss_set_ist1
 tss_set_ist1:
-    movq    %gs:0, %rcx                 /* rcx = cpu_id (cpu_id_pcpu)  */
+    movq    %gs:0, %rcx                 /* rcx = cpu_id (pinned offset 0) */
     cmpq    $NR_TSS_CPUS_TRAP, %rcx
     jb      1f
     xorq    %rcx, %rcx                  /* clamp bogus id to 0          */

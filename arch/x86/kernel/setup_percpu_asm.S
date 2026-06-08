@@ -15,11 +15,28 @@
  *                          per-CPU; IA32_KERNEL_GS_BASE is for the
  *                          swapgs-on-syscall path we don't have yet.
  *
- *   read_cpu_id_percpu() - read the 8 bytes at %gs:0. The convention
- *                          (set up in setup_per_cpu_areas) is that
- *                          offset 0 of every per-CPU area stores the
- *                          logical CPU id (so smp_processor_id()
- *                          becomes a one-instruction load).
+ *   read_cpu_id_percpu() - read the logical CPU id out of the per-CPU
+ *                          area via `mov %gs:0`. This relies on a hard
+ *                          ABI INVARIANT enforced by the Adder codegen
+ *                          (compiler/codegen_x86.py): the `cpu_id_pcpu`
+ *                          Percpu[uint64] slot is PINNED to per-CPU byte
+ *                          offset 0, ahead of every other Percpu global,
+ *                          so smp_processor_id() is a one-instruction
+ *                          load on both the codegen and the asm side.
+ *
+ *                          A cross-object symbol-difference displacement
+ *                          `%gs:(cpu_id_pcpu - __per_cpu_template_start)`
+ *                          would be ideal but does NOT assemble: with
+ *                          both symbols external to this .S, GNU as can't
+ *                          emit a relocation for their difference. So we
+ *                          depend on the codegen pin instead. If that pin
+ *                          is ever removed, every `%gs:0` cpu_id read
+ *                          here / in tss_asm.S / syscall_64.S /
+ *                          trap_asm.S breaks (regression #402: a Percpu
+ *                          global landing at offset 0 was read as the CPU
+ *                          id, indexing a wild per_cpu_tss[] slot and
+ *                          triple-faulting on the first userspace timer
+ *                          IRQ).
  */
 
     .code64
@@ -40,6 +57,7 @@ wrmsr_gsbase:
     .align 16
     .globl read_cpu_id_percpu
 read_cpu_id_percpu:
+    /* cpu_id_pcpu pinned to per-CPU offset 0 by the codegen — see header. */
     movq    %gs:0, %rax
     ret
 

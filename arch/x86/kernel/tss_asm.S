@@ -210,13 +210,17 @@ tss64_percpu_init:
  * schedule() each time we context-switch to a new user task so that a
  * subsequent IRQ-from-user lands on THAT task's kernel stack. Indexes
  * per_cpu_tss[] by the calling CPU's logical id (read from %gs:0, the
- * cpu_id_pcpu slot). The CPU re-reads TSS.RSP0 on the next CPL change
+ * cpu_id_pcpu slot, which the codegen pins to per-CPU offset 0).
+ * The CPU re-reads TSS.RSP0 on the next CPL change
  * automatically; no TR reload needed.                              */
     .align 16
     .globl tss_set_rsp0
 tss_set_rsp0:
     movq    %rdi, %rsi             /* rsi = rsp0                        */
-    movq    %gs:0, %rdi            /* rdi = cpu_id (cpu_id_pcpu @ gs:0) */
+    /* rdi = cpu_id. Read via %gs:0 — the codegen PINS cpu_id_pcpu to
+     * per-CPU offset 0 (ABI invariant, see setup_percpu_asm.S header).
+     * Matches read_cpu_id_percpu and the codegen's cpu_id_pcpu read. */
+    movq    %gs:0, %rdi
     call    tss_base_for          /* rax = &per_cpu_tss[cpu_id]        */
     movq    %rsi, 4(%rax)
     ret
@@ -226,7 +230,7 @@ tss_set_rsp0:
     .align 16
     .globl tss_get_rsp0
 tss_get_rsp0:
-    movq    %gs:0, %rdi
+    movq    %gs:0, %rdi            /* cpu_id @ pinned per-CPU offset 0   */
     call    tss_base_for
     movq    4(%rax), %rax
     ret

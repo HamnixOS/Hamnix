@@ -65,10 +65,16 @@ syscall_entry:
      * schedule() keeps per_cpu_tss[cpu_id].rsp0 pointed at
      * task->kstack_top on every switch. PER-CPU: the syscall runs on
      * whatever CPU the user task is on, so we must read THAT CPU's TSS,
-     * not a single global one — index per_cpu_tss[] by cpu_id (%gs:0,
-     * the cpu_id_pcpu slot; kernel %gs is the per-CPU area base, no
-     * swapgs in Hamnix). TSS_STRIDE = 128 = 1<<7. */
-    movq    %gs:0, %r12               /* r12 = cpu_id                    */
+     * not a single global one — index per_cpu_tss[] by cpu_id (the
+     * cpu_id_pcpu slot; kernel %gs is the per-CPU area base, no swapgs
+     * in Hamnix). cpu_id is read via %gs:0: the Adder codegen PINS
+     * cpu_id_pcpu to per-CPU offset 0 (ABI invariant — see
+     * setup_percpu_asm.S). Regression #402 was exactly this read picking
+     * up a different Percpu global (local_timer_ticks) that had drifted
+     * to offset 0: the timer-tick counter was used as a CPU id, indexed
+     * a wild per_cpu_tss[] slot, and the garbage RSP0 #GP'd on the
+     * kernel-stack write below. TSS_STRIDE = 128 = 1<<7. */
+    movq    %gs:0, %r12               /* r12 = cpu_id (pinned offset 0)  */
     shlq    $7, %r12                  /* r12 = cpu_id * 128 (TSS_STRIDE) */
     movabsq $per_cpu_tss, %r13        /* r13 = &per_cpu_tss[0]           */
     addq    %r13, %r12                /* r12 = &per_cpu_tss[cpu_id]      */
