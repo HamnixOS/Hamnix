@@ -646,6 +646,15 @@ if os.environ.get("ENABLE_FATLFN_TEST") == "1":
 if os.environ.get("ENABLE_EXFAT_TEST") == "1":
     FILES.append(("/etc/exfat-test", b"1\n"))
 
+# exFAT WRITE self-test. scripts/test_exfat_write.sh sets
+# ENABLE_EXFAT_WRITE_TEST=1 to plant /etc/exfat-write-test; init/main.ad
+# at boot:37.exfatw detects the marker and runs exfat_write_selftest(),
+# which mounts a writable exFAT image attached as sd0, CREATES a new
+# file (bitmap alloc + FAT link + data write + dir entry-set append),
+# and reads it back asserting the content.
+if os.environ.get("ENABLE_EXFAT_WRITE_TEST") == "1":
+    FILES.append(("/etc/exfat-write-test", b"1\n"))
+
 # #168: REAL ACPI S5 poweroff + reboot self-test.
 # scripts/test_acpi_poweroff.sh sets ENABLE_ACPI_TEST=1 to plant
 # /etc/acpi-test. init/main.ad at boot:37.acpi detects the marker, logs
