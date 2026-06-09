@@ -131,6 +131,10 @@ if wait_for 'hamsh\$' 90; then
     send_selftest 'echo MARK_DEBUG_BEGIN; hamUId daemon debugfixselftest' '\[DEBUG\] (PASS|FAIL)' 60 2
     # P0b focused-window keystroke routing proof.
     send_selftest 'echo MARK_TERM_BEGIN; hamUId daemon terminalselftest' 'TERM IO (PASS|FAIL)' 60 2
+    # DEPERF dirty-rect present scaling proof: a single-window content update
+    # presents ONLY that window's rect and the presented area does NOT grow
+    # with the open-window count (the user's "slower with each window" bug).
+    send_selftest 'echo MARK_DEPERF_BEGIN; hamUId daemon deperfselftest' '\[DEPERF\] (PASS|FAIL)' 60 2
 fi
 
 exec 3>&-
@@ -159,7 +163,7 @@ if ! grep -aq 'DAEMON up screen=' "$LOG"; then
 fi
 
 echo "[test_hamUI_debugfixes] --- captured serial markers ---"
-grep -aE 'DAEMON up|DAEMON console takeover|DAEMON fbctl absent|\[DETRAY\]|\[DEBUG\]|TERM IO|HAMFM_READY|MARK_' "$LOG" | head -60
+grep -aE 'DAEMON up|DAEMON console takeover|DAEMON fbctl absent|\[DETRAY\]|\[DEBUG\]|\[DEPERF\]|TERM IO|HAMFM_READY|MARK_' "$LOG" | head -60
 echo "[test_hamUI_debugfixes] --- end ---"
 
 fail=0
@@ -208,10 +212,17 @@ else
     fail=1
 fi
 
+# --- DEPERF: dirty-rect present scales with the changed rect, not -------
+# O(screen * windows), and is independent of the open-window count.
+assert_marker '\[DEPERF\] single-window content update presents ONLY that window' 'DEPERF: a single-window update presents only that window rect (not the full screen)'
+assert_marker '\[DEPERF\] single-window present area is window-count INDEPENDENT OK' 'DEPERF: presented area does NOT grow with the number of open windows'
+assert_marker '\[DEPERF\] whole-screen change still escalates to a full present OK' 'DEPERF: a genuine whole-screen change still does a full present'
+assert_marker '\[DEPERF\] PASS' 'DEPERF: dirty-rect present scaling self-test ran to completion'
+
 # Any explicit FAIL marker from a self-test is a hard failure.
-if grep -aqE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL' "$LOG"; then
+if grep -aqE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL|\[DEPERF\] FAIL' "$LOG"; then
     echo "[test_hamUI_debugfixes] FAIL: a self-test reported a failure:"
-    grep -aE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL' "$LOG" | head
+    grep -aE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL|\[DEPERF\] FAIL' "$LOG" | head
     fail=1
 fi
 
