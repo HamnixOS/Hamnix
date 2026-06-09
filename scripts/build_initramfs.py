@@ -513,6 +513,16 @@ if os.environ.get("ENABLE_SMP_USER") == "1":
 if os.environ.get("ENABLE_BCACHE_TEST") == "1":
     FILES.append(("/etc/bcache-test", b"1\n"))
 
+# ENABLE_RFORK_COW_TEST=1 to plant /etc/rfork-cow-test. init/main.ad at
+# boot:37.rfcow detects the marker and calls elf32_wx_span_reset_selftest()
+# (fs/elf.ad): it plants a bogus non-zero W^X RO-span count (as if an
+# ELF64 binary loaded first), loads the native ELF32 /init image, and
+# asserts the loader reset the spans to 0. Guards the PID-1 rfork-COW
+# fatal #PF (a stale RO span flipped the ELF32 image's .data RO, so the
+# first rfork child's write faulted verbatim-RO). Default boots omit it.
+if os.environ.get("ENABLE_RFORK_COW_TEST") == "1":
+    FILES.append(("/etc/rfork-cow-test", b"1\n"))
+
 # GPU track #181 Phase 0: native Vulkan-shaped software-rasterizer spine
 # self-test. scripts/test_vk_software_raster.sh sets ENABLE_VK_TEST=1 to
 # plant /etc/vk-test. init/main.ad at boot:37.vk detects the marker and
