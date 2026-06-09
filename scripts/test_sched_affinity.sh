@@ -69,8 +69,12 @@ python3 -m compiler.adder compile \
     -o "$ELF" >/dev/null
 
 echo "[test_sched_affinity] (3/3) Boot QEMU -smp 2 (no disk image — pure tmpfs)"
+# The selftest emits [SCHED_AFFINITY] PASS within ~3s of uptime, then the
+# kernel idles at the hamsh prompt forever (no halt-on-done), so the qemu
+# never exits on its own. Self-bound it with timeout; PASS is gated on the
+# log marker below, not on the qemu exit code (124 on timeout is expected).
 set +e
-qemu-system-x86_64 \
+timeout -k 5 240 qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
