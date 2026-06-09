@@ -140,6 +140,11 @@ if wait_for 'hamsh\$' 90; then
     # (3) pointer-move stays off the full-present path AND per-pixel compositing
     # is window-count bounded (occlusion skip).
     send_selftest 'echo MARK_DEUSE_BEGIN; hamUId daemon deusabilityselftest' '\[DEUSE\] (PASS|FAIL)' 60 2
+    # DEAPPS proofs: the icon-grid file manager (enumerate + classify +
+    # folder-click navigation + up affordance) and the Kate-like text editor
+    # (keystroke buffer edits through the real focused-window key path + a
+    # file load/save round-trip).
+    send_selftest 'echo MARK_DEAPPS_BEGIN; hamUId daemon deappsselftest' '\[DEAPPS\] (PASS|FAIL)' 60 2
 fi
 
 exec 3>&-
@@ -168,7 +173,7 @@ if ! grep -aq 'DAEMON up screen=' "$LOG"; then
 fi
 
 echo "[test_hamUI_debugfixes] --- captured serial markers ---"
-grep -aE 'DAEMON up|DAEMON console takeover|DAEMON fbctl absent|\[DETRAY\]|\[DEBUG\]|\[DEPERF\]|TERM IO|HAMFM_READY|MARK_' "$LOG" | head -60
+grep -aE 'DAEMON up|DAEMON console takeover|DAEMON fbctl absent|\[DETRAY\]|\[DEBUG\]|\[DEPERF\]|\[DEUSE\]|\[DEAPPS\]|TERM IO|HAMFM_READY|MARK_' "$LOG" | head -80
 echo "[test_hamUI_debugfixes] --- end ---"
 
 fail=0
@@ -200,7 +205,7 @@ assert_marker '\[DETRAY\] PASS'                'P2b: tray-layout self-test ran t
 
 # --- P2a + P1b: banner wall-clock dismissal + file manager ----------
 assert_marker '\[DEBUG\] banner wall-clock dismissal OK' 'P2a: Welcome banner dismisses on a wall-clock deadline (no presents)'
-assert_marker '\[DEBUG\] hamfm window opened'            'P1b: /bin/hamfm opened a real window rooted at argv[1] (HAMFM_READY)'
+assert_marker '\[DEBUG\] file-manager window opened'     'P1b: the DE file manager (in-compositor APP_FILEMGR) opened rooted at the requested dir'
 assert_marker '\[DEBUG\] PASS'                           'P2a/P1b self-test ran to completion'
 
 # --- P0b: a keystroke lands in the FOCUSED DE window, not elsewhere --
@@ -236,10 +241,22 @@ assert_marker '\[DEUSE\] hover-only pointer move stays off the full-present path
 assert_marker '\[DEUSE\] per-pixel compositing is window-count INDEPENDENT (occlusion) OK' 'DEUSE BUG2b: per-pixel compositing cost does not grow with window count'
 assert_marker '\[DEUSE\] PASS' 'DEUSE: DE-usability self-test ran to completion'
 
+# --- DEAPPS: the two new in-compositor desktop apps --------------------
+# The user reported the text-based file manager needs an icon grid and the
+# vi editor doesn't work / wants a Kate-like GUI editor. APP_FILEMGR is an
+# icon-grid file manager; APP_EDITOR is a GUI text editor. Both are proved
+# through the real DE code paths with no framebuffer.
+assert_marker '\[DEAPPS\] file manager enumerated /tmp entries=' 'DEAPPS FM: the icon-grid file manager enumerated a directory + classified dir-vs-file cells'
+assert_marker '\[DEAPPS\] file manager folder-click navigation /->/etc OK' 'DEAPPS FM: clicking a folder cell navigates into it (model current path changes)'
+assert_marker '\[DEAPPS\] file manager up-affordance /etc->/ OK' 'DEAPPS FM: the ".." up affordance returns to the parent directory'
+assert_marker '\[DEAPPS\] editor keystrokes (insert/backspace/enter/arrow) buffer+caret OK' 'DEAPPS ED: keystrokes through the focused-window key path edit the buffer + move the caret exactly'
+assert_marker '\[DEAPPS\] editor load+save round-trip bytes=' 'DEAPPS ED: load-from-path + save-to-path round-trip (re-read bytes match)'
+assert_marker '\[DEAPPS\] PASS' 'DEAPPS: file-manager + text-editor self-test ran to completion'
+
 # Any explicit FAIL marker from a self-test is a hard failure.
-if grep -aqE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL|\[DEPERF\] FAIL|\[DEUSE\] FAIL' "$LOG"; then
+if grep -aqE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL|\[DEPERF\] FAIL|\[DEUSE\] FAIL|\[DEAPPS\] FAIL' "$LOG"; then
     echo "[test_hamUI_debugfixes] FAIL: a self-test reported a failure:"
-    grep -aE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL|\[DEPERF\] FAIL|\[DEUSE\] FAIL' "$LOG" | head
+    grep -aE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL|\[DEPERF\] FAIL|\[DEUSE\] FAIL|\[DEAPPS\] FAIL' "$LOG" | head
     fail=1
 fi
 
