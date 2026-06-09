@@ -84,6 +84,11 @@ build_adder_user mkdir                # M16.65: no-op stub (flat tmpfs)
 build_adder_user basename             # M16.66: strip path prefix
 build_adder_user dirname              # M16.66: keep path prefix
 build_adder_user cut                  # M16.66: -c column / range slice
+build_adder_user paste                # merge lines of files (-d DELIM, -s serial)
+build_adder_user comm                 # compare two SORTED files (3-col, -1/-2/-3)
+build_adder_user split                # split a file into pieces (-l lines / -b bytes)
+build_adder_user realpath             # canonicalise a path to absolute form
+build_adder_user truncate             # set a file's size (-s SIZE, K/M suffix)
 build_adder_user tr                   # M16.66: SRC->DST byte translate
 build_adder_user od                   # M16.66: -An -tx1 hex dump
 build_adder_user printf               # M16.66: %s/%d + \n/\t/\\ escapes
