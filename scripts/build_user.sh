@@ -94,6 +94,11 @@ build_adder_user nproc                # online CPU count from /proc/cpuinfo cpus
 build_adder_user printenv             # print env (argv NAME=VALUE convention) or a named value
 build_adder_user tty                  # print stdin terminal name (/dev/cons) via /fd/0 kind
 build_adder_user mktemp               # create unique temp file/dir (-d) from a TEMPLATE
+build_adder_user join                 # relational join of two SORTED files (-1/-2 field, -t sep)
+build_adder_user expand               # convert tabs to spaces honoring column (-t N)
+build_adder_user unexpand             # leading-blank runs to tabs (-a all, -t N)
+build_adder_user shuf                 # random permutation of lines (-n N, -i LO-HI, -e ARGS)
+build_adder_user factor               # prime factorization of integers (argv or stdin)
 build_adder_user tr                   # M16.66: SRC->DST byte translate
 build_adder_user od                   # M16.66: -An -tx1 hex dump
 build_adder_user printf               # M16.66: %s/%d + \n/\t/\\ escapes
