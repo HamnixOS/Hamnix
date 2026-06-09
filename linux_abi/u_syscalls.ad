@@ -501,6 +501,12 @@ from kernel.sched.core import (
     rlimit_get_cur, rlimit_get_max, rlimit_set,
     # getpriority(2)/setpriority(2): the real per-task POSIX nice store.
     sched_get_nice, sched_set_nice,
+    # sched_setaffinity/getaffinity: the real per-task CPU-affinity store
+    # honored by the per-CPU-runqueue scheduler (placement/steal/migration).
+    sched_get_affinity, sched_set_affinity,
+    # sched_affinity_selftest: kernel-side affinity-enforcement self-test,
+    # gated on /etc/sched-affinity-test (scripts/test_sched_affinity.sh).
+    sched_affinity_selftest,
     # sched_setscheduler/getscheduler/setparam/getparam + priority-range:
     # realtime policy mechanism (SCHED_FIFO/SCHED_RR) in core.ad.
     sched_set_scheduler, sched_get_policy, sched_get_rt_priority,
@@ -597,6 +603,10 @@ from kernel.block.blk import blk_read_sectors
 # region present in the task's OWN PML4 as a private 4 KiB PTE chain.
 from fs.elf import elf_install_user_heap, vm_map_user_page
 from arch.x86.kernel.time import get_jiffies, tsc_monotonic_ns, HZ
+# membarrier(2): MEMBARRIER_CMD_GLOBAL / PRIVATE_EXPEDITED issue a real
+# system-wide memory barrier — a local fence plus an all-but-self IPI that
+# forces every other online CPU through a serialising interrupt entry.
+from arch.x86.kernel.apic import smp_membarrier_broadcast
 # getrandom(2) draws from the same kernel CSPRNG as /dev/random and
 # /dev/urandom — one shared ChaCha20 fast-key-erasure pool.
 from sys.src.port9.port.devrandom import devrandom_read
@@ -4951,30 +4961,44 @@ def _u_ppoll(a0: uint64, a1: uint64, a2: uint64,
 
 # --- #165: sched affinity / getcpu / membarrier -------------------
 #
-# Hamnix presents a single logical CPU to Linux userspace (the guest
-# scheduler is uniprocessor from the ABI's point of view), so the
-# affinity surface has exactly one valid CPU: 0.
+# sched_setaffinity/getaffinity store and ENFORCE a real per-task CPU
+# affinity bitmask in the task struct (cpu_affinity). The native per-CPU-
+# runqueue scheduler honors it: placement, work-steal, and the deferred
+# migration of a preempted task all keep a task on a CPU whose bit is set
+# (see kernel/sched/core.ad sched_set_affinity / sched_affinity_pick_cpu /
+# sched_cpu_allowed). pid==0 resolves to the calling task; a nonzero pid is
+# looked up by pid. The user mask pointer is validated via copy_to/from_user.
 
 def _u_sched_getaffinity(a0: uint64, a1: uint64, a2: uint64,
                          a3: uint64, a4: uint64, a5: uint64) -> int64:
     # long sched_getaffinity(pid_t pid, size_t cpusetsize,
     #                        cpu_set_t *mask)
     #   a0 = pid, a1 = cpusetsize (bytes), a2 = mask.
-    # Write a mask with only CPU 0 set (bit 0 of the first byte) and zero
-    # the rest of the supplied buffer. Returns the number of bytes
-    # written into the mask (glibc's sched_getaffinity uses the return
-    # value to size its CPU_SETSIZE loop). pthread/OpenMP runtimes call
-    # this at startup to count CPUs; returning a 1-CPU mask is correct.
+    # Write the stored per-task affinity mask into the user buffer (low
+    # bytes first, the rest zero-filled) and return the number of bytes
+    # written (glibc uses the return value to size its CPU_SETSIZE loop).
     if a2 == 0 or a1 == 0:
         return ELINUX_INVAL
+    slot: uint64 = 0
+    rc: int64 = _u_sched_resolve_slot(a0, &slot)
+    if rc != 0:
+        return rc
+    mask: uint64 = sched_get_affinity(slot)
     n: uint64 = a1
     if n > 128:
-        n = 128                                        # cap the zero-fill
+        n = 128                                        # cap the buffer fill
+    # Build a kernel-side byte image of the mask (8 bytes of real mask,
+    # then zero), then copy_to_user it so the user pointer is validated.
+    kbuf: Array[128, uint8]
     i: uint64 = 0
     while i < n:
-        cast[Ptr[uint8]](a2 + i)[0] = 0
+        if i < 8:
+            kbuf[i] = cast[uint8]((mask >> (i * 8)) & 0xFF)
+        else:
+            kbuf[i] = 0
         i = i + 1
-    cast[Ptr[uint8]](a2)[0] = 1                        # CPU 0 only
+    if copy_to_user(a2, cast[uint64](&kbuf[0]), n) != 0:
+        return ELINUX_FAULT
     return cast[int64](n)
 
 
@@ -4982,9 +5006,32 @@ def _u_sched_setaffinity(a0: uint64, a1: uint64, a2: uint64,
                          a3: uint64, a4: uint64, a5: uint64) -> int64:
     # long sched_setaffinity(pid_t pid, size_t cpusetsize,
     #                        const cpu_set_t *mask)
-    # With one CPU there is nothing to pin — any mask that includes CPU 0
-    # is satisfiable, an empty mask is -EINVAL. We accept and return 0.
-    if a2 == 0:
+    #   a0 = pid, a1 = cpusetsize (bytes), a2 = mask.
+    # Read the low 8 bytes of the user mask (CPUs 0..63 — far beyond the 16
+    # logical CPUs the scheduler tracks), validate via copy_from_user, then
+    # apply it. sched_set_affinity stores the mask AND re-homes/marks the
+    # task for migration if it currently sits on a now-forbidden CPU. An
+    # effective mask with no online CPU is -EINVAL.
+    if a2 == 0 or a1 == 0:
+        return ELINUX_INVAL
+    slot: uint64 = 0
+    rc: int64 = _u_sched_resolve_slot(a0, &slot)
+    if rc != 0:
+        return rc
+    # Copy up to 8 mask bytes from userspace (validates the pointer).
+    nread: uint64 = a1
+    if nread > 8:
+        nread = 8
+    maskbuf: uint64 = 0
+    if copy_from_user(cast[uint64](&maskbuf), a2, nread) != 0:
+        return ELINUX_FAULT
+    mask: uint64 = maskbuf
+    if nread < 8:
+        # Only the low `nread` bytes are meaningful; clear the rest.
+        keep: uint64 = (cast[uint64](1) << (nread * 8)) - 1
+        mask = mask & keep
+    ar: int64 = sched_set_affinity(slot, mask)
+    if ar < 0:
         return ELINUX_INVAL
     return 0
 
@@ -5005,19 +5052,105 @@ def _u_membarrier(a0: uint64, a1: uint64, a2: uint64,
                   a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int membarrier(int cmd, unsigned int flags, int cpu_id)
     #   cmd 0 = MEMBARRIER_CMD_QUERY: return the bitmask of supported
-    #   commands. We support the GLOBAL / PRIVATE_EXPEDITED barriers as
-    #   no-ops: on a single CPU with no concurrent kernel-side memory
-    #   reordering across the syscall boundary, the system-wide barrier
-    #   every membarrier command requests is already satisfied by the
-    #   syscall entry/exit serialisation. Userspace RCU / liburcu probes
-    #   QUERY then issues the barrier; both succeed.
-    MEMBARRIER_CMD_QUERY: uint64 = 0
-    # Advertise the four commonly-probed commands as available.
-    MB_SUPPORTED: int64 = 0x29                          # GLOBAL|PRIV_EXP|PRIV_EXP_REG bits
+    #            commands.
+    #   GLOBAL / PRIVATE_EXPEDITED: issue a REAL system-wide memory barrier
+    #            (smp_membarrier_broadcast: local mfence + an all-but-self IPI
+    #            that drives every other online CPU through a serialising
+    #            interrupt entry). The *_REGISTER_* commands are accepted as
+    #            successful no-ops — this kernel needs no per-process opt-in
+    #            registration before the expedited barrier is usable.
+    #
+    # The supported-commands bitmask QUERY returns is built from the SAME
+    # MB_* bit constants the dispatch below honors, so QUERY can never claim
+    # a command the handler does not actually implement.
+    MEMBARRIER_CMD_QUERY:                       uint64 = 0
+    MEMBARRIER_CMD_GLOBAL:                      uint64 = 1   # bit 0
+    MEMBARRIER_CMD_GLOBAL_EXPEDITED:            uint64 = 2   # bit 1
+    MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED:   uint64 = 4   # bit 2
+    MEMBARRIER_CMD_PRIVATE_EXPEDITED:           uint64 = 8   # bit 3
+    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED:  uint64 = 16  # bit 4
+    # Bitmask of every command we honor below. QUERY returns exactly this.
+    MB_SUPPORTED: int64 = cast[int64](MEMBARRIER_CMD_GLOBAL
+                                      | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+                                      | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+                                      | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+                                      | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED)
+    # No flags / cpu_id modes are modelled — reject any nonzero flags so we
+    # never silently ignore a MEMBARRIER_CMD_FLAG_CPU request.
+    if a1 != 0:
+        return ELINUX_INVAL
     if a0 == MEMBARRIER_CMD_QUERY:
         return MB_SUPPORTED
-    # Any concrete barrier command is a successful no-op here.
-    return 0
+    if a0 == MEMBARRIER_CMD_GLOBAL \
+       or a0 == MEMBARRIER_CMD_GLOBAL_EXPEDITED \
+       or a0 == MEMBARRIER_CMD_PRIVATE_EXPEDITED:
+        # Real system-wide barrier: local fence + remote serialising IPIs.
+        smp_membarrier_broadcast()
+        return 0
+    if a0 == MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED \
+       or a0 == MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED:
+        # Registration is a successful no-op (no per-process opt-in needed).
+        return 0
+    # Unknown command.
+    return ELINUX_INVAL
+
+
+# --- sched_setaffinity / membarrier Linux-ABI self-test ------------------
+#
+# Gated on /etc/sched-affinity-test (planted exclusively by
+# scripts/test_sched_affinity.sh). Drives:
+#   * the REAL affinity store + scheduler enforcement (sched_affinity_selftest
+#     in kernel/sched/core.ad), and
+#   * the REAL _u_membarrier dispatch (QUERY returns a nonzero supported mask
+#     that includes the commands we honor; GLOBAL / PRIVATE_EXPEDITED return 0
+#     after issuing a real system-wide barrier).
+# Prints per-check markers and a terminal "[SCHED_AFFINITY] PASS" / "... FAIL".
+
+def sched_affinity_membarrier_selftest():
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    failures: int32 = 0
+
+    # --- affinity: real store + scheduler enforcement -----------------
+    if sched_affinity_selftest() != 0:
+        printk0("[affinity] mask round-trip + scheduler enforcement OK\n")
+    else:
+        printk0("[affinity] FAIL store/enforcement\n")
+        failures = failures + 1
+
+    # --- membarrier QUERY: nonzero supported mask ---------------------
+    MEMBARRIER_CMD_QUERY:             uint64 = 0
+    MEMBARRIER_CMD_GLOBAL:            uint64 = 1
+    MEMBARRIER_CMD_PRIVATE_EXPEDITED: uint64 = 8
+    q: int64 = _u_membarrier(MEMBARRIER_CMD_QUERY, 0, 0, 0, 0, 0)
+    if q > 0 \
+       and (cast[uint64](q) & MEMBARRIER_CMD_GLOBAL) != 0 \
+       and (cast[uint64](q) & MEMBARRIER_CMD_PRIVATE_EXPEDITED) != 0:
+        printk1("[membarrier] QUERY supported-mask=0x%x OK\n", cast[uint64](q))
+    else:
+        printk1("[membarrier] FAIL QUERY mask=0x%x\n", cast[uint64](q))
+        failures = failures + 1
+
+    # --- membarrier GLOBAL: real barrier, returns 0 -------------------
+    g: int64 = _u_membarrier(MEMBARRIER_CMD_GLOBAL, 0, 0, 0, 0, 0)
+    if g == 0:
+        printk0("[membarrier] GLOBAL barrier OK\n")
+    else:
+        printk1("[membarrier] FAIL GLOBAL rc=%d\n", cast[uint64](g))
+        failures = failures + 1
+
+    # --- membarrier PRIVATE_EXPEDITED: real barrier, returns 0 --------
+    p: int64 = _u_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0, 0, 0, 0)
+    if p == 0:
+        printk0("[membarrier] PRIVATE_EXPEDITED barrier OK\n")
+    else:
+        printk1("[membarrier] FAIL PRIVATE_EXPEDITED rc=%d\n", cast[uint64](p))
+        failures = failures + 1
+
+    if failures == 0:
+        printk0("[SCHED_AFFINITY] PASS\n")
+    else:
+        printk1("[SCHED_AFFINITY] FAIL (%d checks failed)\n",
+                cast[uint64](failures))
 
 
 # =====================================================================

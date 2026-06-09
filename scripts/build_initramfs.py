@@ -1648,6 +1648,21 @@ if os.environ.get("ENABLE_LINKAT_TEST") == "1":
 if os.environ.get("ENABLE_STATX_GETRANDOM_TEST") == "1":
     FILES.append(("/etc/statx-test", b"1\n"))
 
+# sched_setaffinity(2)/sched_getaffinity(2)/membarrier(2) Linux-ABI self-test.
+# scripts/test_sched_affinity.sh sets ENABLE_SCHED_AFFINITY_TEST=1 to plant
+# /etc/sched-affinity-test. init/main.ad at boot:37.aff detects the marker and
+# calls sched_affinity_membarrier_selftest() (linux_abi/u_syscalls.ad): it
+# drives the REAL per-task CPU-affinity store (cpu_affinity in the task struct)
+# and its enforcement by the per-CPU-runqueue scheduler — a single-CPU mask
+# round-trips through set/get, placement/migration only ever lands a task on an
+# allowed CPU, and on an SMP boot a CPU1-pinned task is enqueued on CPU1's
+# runqueue. It also drives the REAL membarrier dispatch (QUERY returns a nonzero
+# supported mask; GLOBAL/PRIVATE_EXPEDITED issue a real barrier and return 0).
+# Purely in-RAM (task_table + LAPIC) so it needs no disk image; default boots
+# omit the marker so it never fires.
+if os.environ.get("ENABLE_SCHED_AFFINITY_TEST") == "1":
+    FILES.append(("/etc/sched-affinity-test", b"1\n"))
+
 # MBR extended/logical-partition (EBR chain) self-test. scripts/
 # test_partebr.sh sets ENABLE_PARTEBR_TEST=1 to plant /etc/partebr-test
 # and attaches a raw "vda" disk carrying an MBR + extended container +
