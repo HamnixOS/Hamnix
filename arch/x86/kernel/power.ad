@@ -35,6 +35,16 @@ from drivers.acpi.acpi import acpi_s5_ready, acpi_pm1a_cnt, acpi_pm1b_cnt
 from drivers.acpi.acpi import acpi_slp_typa, acpi_slp_typb
 from drivers.acpi.acpi import acpi_reset_reg_supported, acpi_reset_reg_space
 from drivers.acpi.acpi import acpi_reset_reg_addr, acpi_reset_reg_value
+from drivers.acpi.acpi import acpi_enable_power_button, acpi_power_button_armed
+from drivers.acpi.acpi import acpi_sci_int_gsi, acpi_pm1a_sts_port, acpi_pm1b_sts_port
+from drivers.acpi.acpi import acpi_sci_polarity_low, acpi_sci_trigger_level
+
+# SCI plumbing: the power-button SCI is a LEVEL-triggered active-LOW pin,
+# so route it with ioapic_redirect (NOT the ISA edge variant) and install
+# the do_irq dispatch handler with register_irq_handler. do_irq sends the
+# single LAPIC EOI after the handler returns, so the handler must NOT EOI.
+from arch.x86.kernel.apic import ioapic_redirect, ioapic_redirect_flags
+from arch.x86.kernel.irq import register_irq_handler
 
 extern def local_irq_disable()
 
@@ -143,6 +153,10 @@ def _do_poweroff():
         pm1b: uint32 = acpi_pm1b_cnt()
         # SLP_EN is bit 13 (0x2000); SLP_TYP occupies bits 10..12.
         va: uint32 = (cast[uint32](typa) << 10) | 0x2000
+        # EMERG so the S5 banner survives the post-interactive console-
+        # loglevel gate (this path runs after the shell is interactive when
+        # reached from the power-button SCI; an INFO line would be dropped).
+        printk_set_level(PRINTK_LEVEL_EMERG)
         printk2("[acpi] S5 write PM1a_CNT=%p val=%p\n",
                 cast[uint64](pm1a), cast[uint64](va))
         outw(cast[uint16](va), cast[uint16](pm1a))
@@ -235,6 +249,89 @@ def _do_reboot():
         int3
     """)
     _hlt_forever()
+
+
+# --- ACPI power-button SCI handler ----------------------------------
+#
+# Real-hardware bug (the NUC): a short power-button press latches
+# PWRBTN_STS (PM1 status bit 8) and asserts a LEVEL-triggered, active-LOW
+# SCI on FADT.SCI_INT. With no handler to write-1-to-clear that status
+# bit, the level interrupt re-fires forever — pegging a core (fan maxes)
+# — and the machine never powers off. This handler clears the status (so
+# the level line de-asserts) and drives a clean S5 via power_action.
+#
+# CPU vector for the SCI. Existing allocations: TIMER=0x20, UART RX=0x24,
+# IPIs at 0xF0/0xF2/0xF3, spurious 0xFF. 0x25 (37) is free; its IDT gate
+# is wired by idt_init()'s 32..95 loop (irq_stub_37 -> do_irq(37)).
+SCI_IRQ_VECTOR: uint32 = 0x25
+
+# PM1 status bits we recognise in the SCI handler.
+PM1_STS_PWRBTN_PW: uint16 = 0x100   # power-button status (bit 8)
+
+
+def acpi_sci_irq():
+    # do_irq() vector-0x25 handler. Read PM1a (and PM1b) status; if the
+    # power-button bit is set, clear it write-1-to-clear (de-asserting the
+    # level SCI) and trigger a clean poweroff. Any other latched PM1 status
+    # bit is written back to clear it too, so an unrelated fixed event can't
+    # wedge the level line. do_irq() sends the LAPIC EOI after we return —
+    # do NOT EOI here. (power_action(POWER_POWEROFF) does not return on the
+    # power-button path.)
+    sts_a_port: uint16 = acpi_pm1a_sts_port()
+    sts_b_port: uint16 = acpi_pm1b_sts_port()
+    sts: uint16 = inw(sts_a_port)
+    if sts_b_port != 0:
+        sts = sts | inw(sts_b_port)
+    # EMERG so this survives the post-interactive console-loglevel gate (the
+    # SCI fires while the shell is interactive; an INFO-level line would be
+    # dropped on the serial console — same reason power_action re-stamps).
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1("[acpi] SCI fired: PM1_STS=%p\n", cast[uint64](cast[uint32](sts)))
+
+    if (sts & PM1_STS_PWRBTN_PW) != 0:
+        # Clear PWRBTN_STS first so the level line drops and the SCI
+        # stops re-firing, THEN power off (power_action never returns).
+        outw(PM1_STS_PWRBTN_PW, sts_a_port)
+        if sts_b_port != 0:
+            outw(PM1_STS_PWRBTN_PW, sts_b_port)
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[acpi] power-button SCI: PWRBTN_STS set -> poweroff\n")
+        power_action(POWER_POWEROFF)
+        return
+
+    # Some other fixed event (timer/GBL/...). Write the latched bits back
+    # to clear them so they can't hold the level line asserted. We don't
+    # act on them otherwise.
+    if sts != 0:
+        outw(sts, sts_a_port)
+        if sts_b_port != 0:
+            outw(sts, sts_b_port)
+
+
+def enable_acpi_power_button():
+    # Wire the power-button SCI end-to-end. Order: arm the PM1 enable bit +
+    # take ACPI ownership (acpi_enable_power_button), register the do_irq
+    # handler, then route the SCI GSI through the IOAPIC (level/active-low).
+    # No-op on a machine without a PM1a event block. Call once at boot after
+    # apic_init()/IOAPIC bring-up; acpi_init() (FADT parse) ran earlier.
+    acpi_enable_power_button()
+    if acpi_power_button_armed() == 0:
+        printk0("[acpi] power button not armed — SCI not routed\n")
+        return
+    register_irq_handler(cast[uint64](SCI_IRQ_VECTOR), acpi_sci_irq)
+    gsi: uint32 = acpi_sci_int_gsi()
+    # Route with the polarity/trigger the firmware actually wired (parsed
+    # from a MADT Type-2 override). ACPI default is level/active-low, but
+    # QEMU declares the SCI active-HIGH — using the wrong polarity makes the
+    # IOAPIC treat the line as permanently deasserted so the SCI never fires.
+    pol_low: int32 = acpi_sci_polarity_low()
+    trig_level: int32 = acpi_sci_trigger_level()
+    ioapic_redirect_flags(gsi, SCI_IRQ_VECTOR, 0, trig_level, pol_low)
+    printk2("[acpi] power-button SCI routed: GSI=%d -> vec=0x%x",
+            cast[uint64](gsi), cast[uint64](SCI_IRQ_VECTOR))
+    printk2(" (pol_low=%d trig_level=%d)\n",
+            cast[uint64](cast[uint32](pol_low)),
+            cast[uint64](cast[uint32](trig_level)))
 
 
 def power_action(action: int32):
