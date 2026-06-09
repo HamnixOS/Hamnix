@@ -98,8 +98,30 @@ try {
     installer_medium = 0
 }
 if $installer_medium > 0 {
-    echo 'rc.boot: installer medium detected -- auto-running /etc/install_nvme.hamsh'
-    source /etc/install_nvme.hamsh
+    # First-class LIVE image: the install medium is a "try before you
+    # install" environment, not an auto-wipe appliance. Decide between
+    # auto-installing and booting the live desktop by asking the installer
+    # whether a target distinct from the boot medium exists.
+    #   `install --probe` exits 0 when a real install target is present
+    #   (e.g. the keyboard-less NUC's blank NVMe) and nonzero when the only
+    #   disk IS the boot medium (e.g. a VM where the image is attached as an
+    #   ordinary virtio disk). In the latter case auto-installing would
+    #   erase the running installer (#410 self-clobber), so we boot live.
+    # try/except reacts ONLY to the LAST command, so the probe is its sole
+    # statement; a nonzero exit lands in except and clears have_target.
+    have_target = 1
+    try {
+        install --probe
+    } except {
+        have_target = 0
+    }
+    if $have_target > 0 {
+        echo 'rc.boot: install target present -- auto-running /etc/install_nvme.hamsh'
+        source /etc/install_nvme.hamsh
+    } else {
+        echo 'rc.boot: only the boot medium present -- booting LIVE environment'
+        source /etc/rc.boot.full
+    }
 } else {
     # --- normal boot: mount the sysroot subtree at / ----------------
     try {
