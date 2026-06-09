@@ -89,6 +89,11 @@ build_adder_user comm                 # compare two SORTED files (3-col, -1/-2/-
 build_adder_user split                # split a file into pieces (-l lines / -b bytes)
 build_adder_user realpath             # canonicalise a path to absolute form
 build_adder_user truncate             # set a file's size (-s SIZE, K/M suffix)
+build_adder_user stat                 # file/inode status: name/size/type (-c %n/%s/%F)
+build_adder_user nproc                # online CPU count from /proc/cpuinfo cpus_online
+build_adder_user printenv             # print env (argv NAME=VALUE convention) or a named value
+build_adder_user tty                  # print stdin terminal name (/dev/cons) via /fd/0 kind
+build_adder_user mktemp               # create unique temp file/dir (-d) from a TEMPLATE
 build_adder_user tr                   # M16.66: SRC->DST byte translate
 build_adder_user od                   # M16.66: -An -tx1 hex dump
 build_adder_user printf               # M16.66: %s/%d + \n/\t/\\ escapes
