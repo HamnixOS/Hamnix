@@ -35,7 +35,17 @@
 # Resolve the lock path relative to this script's location, so it
 # follows the worktree. ${BASH_SOURCE} is scripts/_build_lock.sh
 # inside whichever checkout sourced us.
-_HAMNIX_BUILD_LOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build"
+#
+# Opt-in build isolation: when HAMNIX_BUILD_DIR is set, the lock (and the
+# auto-wiped outputs) live in that caller-chosen directory instead. Two
+# builds in ONE checkout with DIFFERENT HAMNIX_BUILD_DIR then take
+# DIFFERENT locks and run in parallel. Unset → the historical
+# script-relative ../build path.
+if [ -n "${HAMNIX_BUILD_DIR:-}" ]; then
+    _HAMNIX_BUILD_LOCK_DIR="$HAMNIX_BUILD_DIR"
+else
+    _HAMNIX_BUILD_LOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build"
+fi
 mkdir -p "$_HAMNIX_BUILD_LOCK_DIR"
 _HAMNIX_BUILD_LOCK="$_HAMNIX_BUILD_LOCK_DIR/.build_lock"
 _HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-120}"
@@ -88,6 +98,13 @@ fi
 rm -rf "$_HAMNIX_BUILD_LOCK_DIR"/user "$_HAMNIX_BUILD_LOCK_DIR"/mod \
        "$_HAMNIX_BUILD_LOCK_DIR"/iso "$_HAMNIX_BUILD_LOCK_DIR"/*.elf \
        "$_HAMNIX_BUILD_LOCK_DIR"/*.iso 2>/dev/null || true
+# The in-source blob (default builds) AND an isolated build-dir blob
+# (HAMNIX_BUILD_DIR builds) are both poison surfaces — wipe whichever
+# applies. For the default case _HAMNIX_BUILD_LOCK_DIR is ../build so the
+# first path resolves to ../fs/initramfs_blob.S as before; the second is
+# a harmless no-op. For an isolated build dir the second path is the live
+# blob and the first is a no-op.
 rm -f "$_HAMNIX_BUILD_LOCK_DIR/../fs/initramfs_blob.S" 2>/dev/null || true
+rm -f "$_HAMNIX_BUILD_LOCK_DIR/initramfs_blob.S" 2>/dev/null || true
 
 export HAMNIX_BUILD_LOCK_HELD="$_HAMNIX_BUILD_LOCK"

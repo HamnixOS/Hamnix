@@ -15,6 +15,7 @@ deleted in the legacy cleanup; only the x86_64 backend ships now.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -690,6 +691,29 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
         for p in (project_root / path_root).rglob("*.S")
         if p != boot_s and p != head_s
     )
+
+    # Opt-in build isolation: when an isolated build dir is in play, the
+    # generated initramfs blob lives OUTSIDE the globbed source tree (so
+    # concurrent builds in one checkout don't clobber a shared
+    # fs/initramfs_blob.S). HAMNIX_INITRAMFS_BLOB names it explicitly;
+    # otherwise it's derived from HAMNIX_BUILD_DIR. When set, drop any
+    # in-source initramfs_blob.S from the glob (a stale one would
+    # double-define initramfs_cpio_start/end/size/base) and link the
+    # override instead. Unset → glob is untouched (historical behavior).
+    blob_override = os.environ.get("HAMNIX_INITRAMFS_BLOB")
+    if not blob_override and os.environ.get("HAMNIX_BUILD_DIR"):
+        blob_override = os.path.join(
+            os.environ["HAMNIX_BUILD_DIR"], "initramfs_blob.S")
+    if blob_override:
+        blob_path = Path(blob_override)
+        if not blob_path.exists():
+            print(f"Error: HAMNIX_BUILD_DIR/HAMNIX_INITRAMFS_BLOB points at "
+                  f"{blob_path}, which does not exist. Run "
+                  f"build_initramfs.py with the same HAMNIX_BUILD_DIR first.",
+                  file=sys.stderr)
+            return False
+        extra_s = [p for p in extra_s if p.name != "initramfs_blob.S"]
+        extra_s.append(blob_path)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)

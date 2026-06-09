@@ -4000,7 +4000,16 @@ def emit_asm(archive: bytes, dest: Path) -> None:
 if __name__ == "__main__":
     here = Path(__file__).resolve().parent.parent
     archive = build_archive()
-    dest = here / "fs" / "initramfs_blob.S"
+    # Opt-in build isolation: when HAMNIX_BUILD_DIR is set, emit the blob
+    # there instead of the shared in-source fs/initramfs_blob.S so two
+    # builds in ONE checkout don't clobber each other. Default (unset) is
+    # byte-for-byte the historical path.
+    build_dir = os.environ.get("HAMNIX_BUILD_DIR")
+    if build_dir:
+        dest = Path(build_dir) / "initramfs_blob.S"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        dest = here / "fs" / "initramfs_blob.S"
     emit_asm(archive, dest)
     print(f"Wrote {dest} ({len(archive)} bytes archive, "
           f"{len(FILES)} files)")

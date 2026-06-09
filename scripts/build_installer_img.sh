@@ -49,15 +49,25 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+# Opt-in build isolation: HAMNIX_BUILD_DIR relocates the per-invocation
+# image/kernel outputs, the generated initramfs blob, and the build lock
+# into a caller-chosen directory so two builds in ONE checkout don't
+# clobber each other. Default (unset) → the historical build/ tree.
+# Export it so the kernel compile (compiler.adder) and build_initramfs.py
+# sub-invocations agree on the blob location and lock dir.
+OUTDIR="${HAMNIX_BUILD_DIR:-$PROJ_ROOT/build}"
+mkdir -p "$OUTDIR"
+export HAMNIX_BUILD_DIR="$OUTDIR"
+
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
 
-OUT="${HAMNIX_INSTALLER_IMG_OUT:-build/hamnix-installer.img}"
-INSTALLED_KERNEL="build/hamnix-installed-kernel.elf"
-INSTALLER_KERNEL="build/hamnix-installer-kernel.elf"
-EFI_STUB="build/hamnix-bootx64.efi"
-ROOTFS_IMG="build/hamnix-rootfs.img"
-SQFS_IMG="build/hamnix-rootfs.sqfs"
+OUT="${HAMNIX_INSTALLER_IMG_OUT:-$OUTDIR/hamnix-installer.img}"
+INSTALLED_KERNEL="$OUTDIR/hamnix-installed-kernel.elf"
+INSTALLER_KERNEL="$OUTDIR/hamnix-installer-kernel.elf"
+EFI_STUB="$OUTDIR/hamnix-bootx64.efi"
+ROOTFS_IMG="$OUTDIR/hamnix-rootfs.img"
+SQFS_IMG="$OUTDIR/hamnix-rootfs.sqfs"
 export HAMNIX_ROOTFS_SIZE_MB="${HAMNIX_ROOTFS_SIZE_MB:-512}"
 TARGET_ESP_MB="${HAMNIX_TARGET_ESP_MB:-64}"
 
