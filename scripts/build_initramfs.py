@@ -1621,6 +1621,20 @@ if os.environ.get("ENABLE_ACCESS_MODE_TEST") == "1":
 if os.environ.get("ENABLE_TMPFS_READLINK_TEST") == "1":
     FILES.append(("/etc/tmpfs-readlink-test", b"1\n"))
 
+# symlink(2)/link(2)/utimensat(2) Linux-ABI self-test. scripts/
+# test_linkat.sh sets ENABLE_LINKAT_TEST=1 to plant /etc/linkat-test.
+# init/main.ad at boot:37.lat detects the marker and calls
+# linkat_selftest() (linux_abi/u_syscalls.ad): it drives the newly-wired
+# SYS_symlink/SYS_symlinkat/SYS_link/SYS_utimensat family through the real
+# Linux-ABI dispatch on the live tmpfs backend, asserting that a symlink's
+# stored target round-trips via readlink, a hardlink aliases the same data
+# byte, a cross-backend link returns -EXDEV (the Plan 9 file-server
+# boundary), and utimensat returns 0 / -ENOENT / -EFAULT correctly.
+# Purely RAM-backed (tmpfs) so it needs no disk image; default boots omit
+# the marker so it never fires.
+if os.environ.get("ENABLE_LINKAT_TEST") == "1":
+    FILES.append(("/etc/linkat-test", b"1\n"))
+
 # MBR extended/logical-partition (EBR chain) self-test. scripts/
 # test_partebr.sh sets ENABLE_PARTEBR_TEST=1 to plant /etc/partebr-test
 # and attaches a raw "vda" disk carrying an MBR + extended container +
