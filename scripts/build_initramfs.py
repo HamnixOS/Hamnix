@@ -1635,6 +1635,19 @@ if os.environ.get("ENABLE_TMPFS_READLINK_TEST") == "1":
 if os.environ.get("ENABLE_LINKAT_TEST") == "1":
     FILES.append(("/etc/linkat-test", b"1\n"))
 
+# getrandom(2)/statx(2) direct-syscall Linux-ABI self-test. scripts/
+# test_statx_getrandom.sh sets ENABLE_STATX_GETRANDOM_TEST=1 to plant
+# /etc/statx-test. init/main.ad at boot:37.sxg detects the marker and calls
+# statx_getrandom_selftest() (linux_abi/u_syscalls.ad): it drives the
+# getrandom(318) + statx(332) direct top-level syscalls through the real
+# Linux-ABI dispatch, asserting getrandom serves full-length differing
+# entropy (and 0 for a zero-length request) and statx reports the directory
+# type bit + nlink>=1 for /etc, the regular-file type bit + exact size for a
+# planted /tmp file, and -ENOENT for a missing path. Purely RAM-backed
+# (tmpfs) so it needs no disk image; default boots omit the marker.
+if os.environ.get("ENABLE_STATX_GETRANDOM_TEST") == "1":
+    FILES.append(("/etc/statx-test", b"1\n"))
+
 # MBR extended/logical-partition (EBR chain) self-test. scripts/
 # test_partebr.sh sets ENABLE_PARTEBR_TEST=1 to plant /etc/partebr-test
 # and attaches a raw "vda" disk carrying an MBR + extended container +
