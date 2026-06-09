@@ -51,9 +51,19 @@
 #   clear_user(uvaddr, n)                   -> bytes NOT cleared (0 = ok)
 
 from kernel.printk.printk import printk0, printk1, printk2
-from kernel.sched.core import current_task, TaskStruct
+from kernel.sched.core import current_task, TaskStruct, current_idx_get
 from mm.page_alloc import alloc_page, free_page
-from fs.elf import vm_map_user_page
+from fs.elf import vm_map_user_page, cow_handle_write_fault
+
+# Demand-paging / swap-in resolvers used by uaccess_fault_in. Declared
+# extern (NOT a `from mm.vma import`) to AVOID adding a module-dependency
+# edge mm.uaccess -> mm.vma: that edge reorders the topological compile
+# sort and surfaces an unrelated extern/def collision (core.ad's
+# `extern def pgrp_ref_dec` vs chan.ad's real def). The flat kernel
+# symbol namespace resolves these at link time regardless. Same
+# cycle-break trick core.ad uses for pgrp_ref_dec.
+extern def vma_demand_fault(slot: uint64, pml4_phys: uint64, fault_va: uint64) -> int32
+extern def vma_swap_in_fault(slot: uint64, pml4_phys: uint64, fault_va: uint64) -> int32
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
@@ -165,6 +175,63 @@ def _ua_bytes_to_page_end(uvaddr: uint64) -> uint64:
     return UA_PAGE_4K - (uvaddr & UA_OFF_4K)
 
 
+# uaccess_fault_in — software resolution of a recoverable fault on a user
+# page that uaccess_resolve could NOT translate (returned 0).
+#
+# The page-table walk in uaccess_resolve is read-only: it never allocates
+# or maps. But a user range handed to a syscall is frequently backed by a
+# page that is legitimately mapped in the task's VMA list yet not yet
+# materialised in the page tables — a never-touched BSS/anon demand page,
+# a swapped-out anon page, or (for a write) a COW page still shared
+# read-only after fork. The hardware #PF handler (do_page_fault) resolves
+# exactly these on a real fault, but copy_to_user/copy_from_user reach the
+# page through a kernel-side walk that BYPASSES the #PF path, so without
+# this they would wrongly report -EFAULT for a perfectly valid address.
+#
+# This mirrors do_page_fault's recoverable cases for the CURRENT task:
+#   * not-present  -> swap-in (if a swap PTE) else demand-zero/file fill
+#   * present + write wanted -> COW copy
+# Returns 1 if it populated/repaired the page (caller should re-resolve),
+# 0 if the fault is genuinely unrecoverable (real EFAULT).
+def uaccess_fault_in(pml4_phys: uint64, uvaddr: uint64,
+                     need_write: int32) -> int32:
+    slot: uint64 = current_idx_get()
+    # Not-present first: a 0 from uaccess_resolve is most often a page the
+    # task owns (VMA) but has never faulted in. Try swap-in, then the
+    # demand-zero / file-backed path — the same order do_page_fault uses.
+    swp_rc: int32 = vma_swap_in_fault(slot, pml4_phys, uvaddr)
+    if swp_rc == 1:
+        return 1
+    if swp_rc < 0:
+        return 0
+    dpf_rc: int32 = vma_demand_fault(slot, pml4_phys, uvaddr)
+    if dpf_rc == 1:
+        return 1
+    if dpf_rc < 0:
+        return 0
+    # dpf_rc == 0: not a not-present demand fault. For a WRITE, the page
+    # may be present-but-read-only because it is COW-shared post-fork;
+    # resolve it exactly as a write #PF would.
+    if need_write != 0:
+        cow_rc: int32 = cow_handle_write_fault(pml4_phys, uvaddr)
+        if cow_rc == 1:
+            return 1
+    return 0
+
+
+# uaccess_resolve_fault — uaccess_resolve with one software fault-in retry.
+# Returns the resolved physical address, or 0 if even after a fault-in the
+# page cannot be translated (a genuine EFAULT).
+def uaccess_resolve_fault(pml4_phys: uint64, uvaddr: uint64,
+                          need_write: int32) -> uint64:
+    phys: uint64 = uaccess_resolve(pml4_phys, uvaddr, need_write)
+    if phys != 0:
+        return phys
+    if uaccess_fault_in(pml4_phys, uvaddr, need_write) != 1:
+        return 0
+    return uaccess_resolve(pml4_phys, uvaddr, need_write)
+
+
 # --- copy_from_user ------------------------------------------------
 #
 # Copy `n` bytes from user virtual address `usrc` into kernel buffer
@@ -178,7 +245,7 @@ def copy_from_user(kdst: uint64, usrc: uint64, n: uint64) -> uint64:
     cur_u: uint64 = usrc
     cur_k: uint64 = kdst
     while remaining > 0:
-        phys: uint64 = uaccess_resolve(pml4, cur_u, 0)
+        phys: uint64 = uaccess_resolve_fault(pml4, cur_u, 0)
         if phys == 0:
             return remaining
         chunk: uint64 = _ua_bytes_to_page_end(cur_u)
@@ -204,7 +271,7 @@ def copy_to_user(udst: uint64, ksrc: uint64, n: uint64) -> uint64:
     cur_u: uint64 = udst
     cur_k: uint64 = ksrc
     while remaining > 0:
-        phys: uint64 = uaccess_resolve(pml4, cur_u, 1)
+        phys: uint64 = uaccess_resolve_fault(pml4, cur_u, 1)
         if phys == 0:
             return remaining
         chunk: uint64 = _ua_bytes_to_page_end(cur_u)
@@ -302,7 +369,7 @@ def strncpy_from_user(kdst: uint64, usrc: uint64, maxlen: uint64) -> int64:
     # bytes, then always NUL-terminate.
     cap: uint64 = maxlen - 1
     while copied < cap:
-        phys: uint64 = uaccess_resolve(pml4, cur_u, 0)
+        phys: uint64 = uaccess_resolve_fault(pml4, cur_u, 0)
         if phys == 0:
             return UA_EFAULT
         # Bytes available in this frame before the next page boundary.
@@ -336,7 +403,7 @@ def clear_user(uvaddr: uint64, n: uint64) -> uint64:
     remaining: uint64 = n
     cur_u: uint64 = uvaddr
     while remaining > 0:
-        phys: uint64 = uaccess_resolve(pml4, cur_u, 1)
+        phys: uint64 = uaccess_resolve_fault(pml4, cur_u, 1)
         if phys == 0:
             return remaining
         chunk: uint64 = _ua_bytes_to_page_end(cur_u)
