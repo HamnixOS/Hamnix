@@ -73,6 +73,11 @@ build_adder_user sleep                # M16.64: jiffies-based delay
 build_adder_user sort                 # M16.64: insertion sort of stdin
 build_adder_user tee                  # M16.64: fan stdin to stdout + file
 build_adder_user rev                  # M16.64: per-line reverse
+build_adder_user uniq                 # collapse adjacent dup lines (-c/-d/-u)
+build_adder_user nl                   # number stdin lines (-ba/-bt)
+build_adder_user tac                  # cat in reverse line order
+build_adder_user fold                 # wrap lines to width (-w N)
+build_adder_user cksum                # POSIX CRC32 + byte count of stdin
 build_adder_user rm                   # M16.65: tmpfs unlink
 build_adder_user touch                # M16.65: create-empty / truncate
 build_adder_user mkdir                # M16.65: no-op stub (flat tmpfs)
