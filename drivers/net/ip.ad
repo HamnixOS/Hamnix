@@ -255,6 +255,252 @@ def ip_have_gateway() -> int32:
     return 1
 
 
+# =====================================================================
+# IPv4 forwarding information base (FIB) — longest-prefix-match routing
+# =====================================================================
+#
+# THE GAP THIS CLOSES vs Linux
+# ----------------------------
+# Before this, ip_send() knew exactly two routes: the single on-link
+# subnet (our address & netmask) reached its destination directly, and
+# EVERYTHING else went to one hardcoded default gateway (ip_gateway).
+# There was no way to express "10.5.0.0/16 is reachable via the router
+# at 192.168.1.254" — a routing concept every real IPv4 host supports
+# (Linux: `ip route add`, classic `route add -net`). A box with two
+# upstreams, or a subnet that lives behind a non-default router, simply
+# could not be reached.
+#
+# This FIB is a fixed-size route table consulted by ip_send() on every
+# outbound packet via ip_route_lookup(), which performs a true
+# longest-prefix match (LPM): among all routes whose network matches the
+# destination, the one with the most prefix bits (most specific) wins.
+# A /32 host route beats a /24 subnet route beats a /0 default route.
+#
+# Each route is: (dest network, prefix length, gateway, flags). A route
+# with RT_ONLINK set is directly reachable (ARP the destination itself);
+# otherwise the packet is sent to the route's gateway (ARP the gateway).
+# The legacy auto-derived on-link subnet route and the single default
+# gateway are folded into this lookup so existing behaviour is preserved
+# exactly when no extra routes are installed.
+#
+# Native resource control is via SYS_NETCFG ctl ops (ROUTE_ADD /
+# ROUTE_GET), driven from the `route` command — Plan-9-style ctl writes,
+# NOT a Linux syscall. No dynamic allocation: a fixed bank of slots.
+
+IP_FIB_MAX:   uint64 = 16        # operator-installed routes
+
+# Route flags.
+RT_INUSE:     uint8 = 0x01       # slot occupied
+RT_ONLINK:    uint8 = 0x02       # directly reachable (ARP dst, not gw)
+
+# Parallel flat arrays (Adder discipline: module-scope arrays).
+# Networks/masks/gateways are stored as packed big-endian uint32 so the
+# LPM compare is a single masked equality test, not four byte compares.
+ip_fib_net:    Array[16, uint32]  # route network, host bits zeroed
+ip_fib_mask:   Array[16, uint32]  # contiguous prefix mask
+ip_fib_plen:   Array[16, uint8]   # prefix length 0..32 (LPM tiebreak)
+ip_fib_gw:     Array[16, uint32]  # next-hop gateway (0 when on-link)
+ip_fib_flags:  Array[16, uint8]   # RT_INUSE | RT_ONLINK
+
+
+def _ip_pack_be(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> uint32:
+    # Pack four address octets (network order, b0 most significant) into
+    # a uint32. Identical to _ip_pack4 but local to the FIB section for
+    # clarity of intent.
+    r: uint32 = cast[uint32](b0) & 0xFF
+    r = (r << 8) | (cast[uint32](b1) & 0xFF)
+    r = (r << 8) | (cast[uint32](b2) & 0xFF)
+    r = (r << 8) | (cast[uint32](b3) & 0xFF)
+    return r
+
+
+def _ip_plen_to_mask(plen: uint8) -> uint32:
+    # Convert a prefix length (0..32) into a contiguous big-endian mask.
+    # plen 0 -> 0x00000000, plen 24 -> 0xFFFFFF00, plen 32 -> 0xFFFFFFFF.
+    if plen == 0:
+        return 0
+    if plen >= 32:
+        return 0xFFFFFFFF
+    # All-ones shifted left by (32 - plen), masked to 32 bits.
+    return cast[uint32]((0xFFFFFFFF << (32 - cast[uint32](plen))) & 0xFFFFFFFF)
+
+
+def _ip_mask_to_plen(mask: uint32) -> uint8:
+    # Count the leading one-bits of a (assumed contiguous) mask. Used to
+    # turn an operator-supplied dotted netmask into a prefix length for
+    # the LPM tiebreak.
+    n: uint8 = 0
+    bit: uint32 = 0x80000000
+    while bit != 0:
+        if (mask & bit) == 0:
+            return n
+        n = n + 1
+        bit = bit >> 1
+    return n
+
+
+def ip_route_add(net0: uint8, net1: uint8, net2: uint8, net3: uint8,
+                 mask0: uint8, mask1: uint8, mask2: uint8, mask3: uint8,
+                 gw0: uint8, gw1: uint8, gw2: uint8, gw3: uint8,
+                 onlink: uint8) -> int32:
+    # Install (or replace) a route. The network is canonicalised by the
+    # mask (host bits cleared) so the stored key is exact. If a route
+    # with the same (network, prefix) already exists it is overwritten —
+    # idempotent re-adds, like `ip route replace`. Returns 0 on success,
+    # -1 if the table is full.
+    mask: uint32 = _ip_pack_be(mask0, mask1, mask2, mask3)
+    net:  uint32 = _ip_pack_be(net0, net1, net2, net3) & mask
+    gw:   uint32 = _ip_pack_be(gw0, gw1, gw2, gw3)
+    plen: uint8  = _ip_mask_to_plen(mask)
+    flags: uint8 = RT_INUSE
+    if onlink == 1:
+        flags = flags | RT_ONLINK
+    # Replace a same-prefix duplicate if present.
+    i: uint64 = 0
+    while i < IP_FIB_MAX:
+        if (ip_fib_flags[i] & RT_INUSE) != 0:
+            if ip_fib_net[i] == net and ip_fib_plen[i] == plen:
+                ip_fib_mask[i]  = mask
+                ip_fib_gw[i]    = gw
+                ip_fib_flags[i] = flags
+                return 0
+        i = i + 1
+    # Otherwise claim the first free slot.
+    i = 0
+    while i < IP_FIB_MAX:
+        if (ip_fib_flags[i] & RT_INUSE) == 0:
+            ip_fib_net[i]   = net
+            ip_fib_mask[i]  = mask
+            ip_fib_plen[i]  = plen
+            ip_fib_gw[i]    = gw
+            ip_fib_flags[i] = flags
+            return 0
+        i = i + 1
+    printk0("ip_route_add: FIB full\n")
+    return -1
+
+
+# ip_route_lookup result is returned via these module-scope scratch
+# globals to avoid out-params (the Adder calling convention has no
+# multi-return). After a call returning 1, ip_rt_onlink / ip_rt_nexthop*
+# describe the next hop. Single-NIC, non-preemptible TX path, so a
+# global result slot is safe (same rationale as ip_next_id).
+ip_rt_found:    int32 = 0
+ip_rt_onlink:   uint8 = 0
+ip_rt_nexthop0: uint8 = 0
+ip_rt_nexthop1: uint8 = 0
+ip_rt_nexthop2: uint8 = 0
+ip_rt_nexthop3: uint8 = 0
+
+
+def ip_route_lookup(d0: uint8, d1: uint8, d2: uint8, d3: uint8) -> int32:
+    # Longest-prefix-match route lookup for destination d0.d1.d2.d3.
+    # Consults, in priority order that LPM naturally enforces:
+    #   1. operator-installed FIB routes (any prefix length),
+    #   2. the auto on-link subnet route (our address & netmask),
+    #   3. the single default gateway (0.0.0.0/0).
+    # Populates ip_rt_onlink + ip_rt_nexthop{0..3} and returns 1 on a
+    # hit, 0 if the destination is unroutable (no matching route and no
+    # default gateway). The chosen next hop is the address to ARP: the
+    # destination itself when on-link, else the gateway.
+    dst: uint32 = _ip_pack_be(d0, d1, d2, d3)
+    best_plen: int32 = -1
+    best_onlink: uint8 = 0
+    best_nh: uint32 = 0
+
+    # --- 1. operator FIB, longest-prefix wins ----------------------
+    i: uint64 = 0
+    while i < IP_FIB_MAX:
+        if (ip_fib_flags[i] & RT_INUSE) != 0:
+            if (dst & ip_fib_mask[i]) == ip_fib_net[i]:
+                pl: int32 = cast[int32](ip_fib_plen[i])
+                if pl > best_plen:
+                    best_plen = pl
+                    if (ip_fib_flags[i] & RT_ONLINK) != 0:
+                        best_onlink = 1
+                        best_nh = dst
+                    else:
+                        best_onlink = 0
+                        best_nh = ip_fib_gw[i]
+        i = i + 1
+
+    # --- 2. auto on-link subnet route (more specific than default) -
+    # _ip_in_subnet encodes our address+netmask (or the /24 fallback).
+    # Its effective prefix length is the netmask's; when no explicit
+    # mask is set the /24 fallback is treated as /24 for the tiebreak.
+    if _ip_in_subnet(d0, d1, d2, d3) == 1:
+        sub_plen: int32 = 24
+        if ip_mask_set == 1:
+            sub_plen = cast[int32](_ip_mask_to_plen(
+                _ip_pack_be(ip_netmask[0], ip_netmask[1],
+                            ip_netmask[2], ip_netmask[3])))
+        if sub_plen > best_plen:
+            best_plen = sub_plen
+            best_onlink = 1
+            best_nh = dst
+
+    # --- 3. default gateway, 0.0.0.0/0 -----------------------------
+    if best_plen < 0:
+        if ip_gw_set == 0:
+            ip_rt_found = 0
+            return 0
+        best_onlink = 0
+        best_nh = _ip_pack_be(ip_gateway[0], ip_gateway[1],
+                              ip_gateway[2], ip_gateway[3])
+
+    ip_rt_onlink   = best_onlink
+    ip_rt_nexthop0 = cast[uint8]((best_nh >> 24) & 0xFF)
+    ip_rt_nexthop1 = cast[uint8]((best_nh >> 16) & 0xFF)
+    ip_rt_nexthop2 = cast[uint8]((best_nh >> 8) & 0xFF)
+    ip_rt_nexthop3 = cast[uint8](best_nh & 0xFF)
+    ip_rt_found    = 1
+    return 1
+
+
+# FIB enumeration accessors for SYS_NETCFG ROUTE_GET (the `route`
+# command lists operator routes through these; the auto subnet/default
+# routes are synthesised by `route` itself from the GET op).
+def ip_fib_slot_used(i: uint64) -> int32:
+    if i >= IP_FIB_MAX:
+        return 0
+    if (ip_fib_flags[i] & RT_INUSE) != 0:
+        return 1
+    return 0
+
+
+def ip_fib_slot_net_b(i: uint64, byte: uint64) -> uint8:
+    return cast[uint8]((ip_fib_net[i] >> cast[uint32]((3 - byte) * 8)) & 0xFF)
+
+
+def ip_fib_slot_mask_b(i: uint64, byte: uint64) -> uint8:
+    return cast[uint8]((ip_fib_mask[i] >> cast[uint32]((3 - byte) * 8)) & 0xFF)
+
+
+def ip_fib_slot_gw_b(i: uint64, byte: uint64) -> uint8:
+    return cast[uint8]((ip_fib_gw[i] >> cast[uint32]((3 - byte) * 8)) & 0xFF)
+
+
+def ip_fib_slot_onlink(i: uint64) -> uint8:
+    if (ip_fib_flags[i] & RT_ONLINK) != 0:
+        return 1
+    return 0
+
+
+def ip_fib_max() -> uint64:
+    return IP_FIB_MAX
+
+
+def ip_fib_clear():
+    i: uint64 = 0
+    while i < IP_FIB_MAX:
+        ip_fib_net[i]   = 0
+        ip_fib_mask[i]  = 0
+        ip_fib_plen[i]  = 0
+        ip_fib_gw[i]    = 0
+        ip_fib_flags[i] = 0
+        i = i + 1
+
+
 # --- Internet checksum --------------------------------------------
 #
 # RFC 1071: ones' complement of the ones' complement sum of the
@@ -869,19 +1115,18 @@ def ip_send(dst_b0: uint8, dst_b1: uint8, dst_b2: uint8, dst_b3: uint8,
     elif _ip_is_broadcast(dst_b0, dst_b1, dst_b2, dst_b3) == 1:
         dst_mac = cast[Ptr[uint8]](&bcast[0])
     else:
-        if _ip_in_subnet(dst_b0, dst_b1, dst_b2, dst_b3) == 1:
-            lookup_ip[0] = dst_b0
-            lookup_ip[1] = dst_b1
-            lookup_ip[2] = dst_b2
-            lookup_ip[3] = dst_b3
-        else:
-            if ip_gw_set == 0:
-                printk0("ip_send: no gateway configured\n")
-                return -1
-            lookup_ip[0] = ip_gateway[0]
-            lookup_ip[1] = ip_gateway[1]
-            lookup_ip[2] = ip_gateway[2]
-            lookup_ip[3] = ip_gateway[3]
+        # FIB longest-prefix-match next-hop selection. On a hit,
+        # ip_rt_onlink tells us whether to ARP the destination
+        # (on-link) or the route's gateway; ip_rt_nexthop{0..3} is the
+        # exact address to ARP. A miss means no matching route and no
+        # default gateway — the destination is unroutable.
+        if ip_route_lookup(dst_b0, dst_b1, dst_b2, dst_b3) == 0:
+            printk0("ip_send: no route to host\n")
+            return -1
+        lookup_ip[0] = ip_rt_nexthop0
+        lookup_ip[1] = ip_rt_nexthop1
+        lookup_ip[2] = ip_rt_nexthop2
+        lookup_ip[3] = ip_rt_nexthop3
         # Stash the address into a local before the call so the
         # codegen for the call site doesn't re-evaluate &lookup_ip[0]
         # while register args may already be set (the same codegen
@@ -1039,7 +1284,10 @@ def ip_init():
         ip_gateway[i] = 0
         ip_netmask[i] = 0
         i = i + 1
+    ip_fib_clear()
     ip_reasm_init()
+    if _ip_fib_marker_present() == 1:
+        ip_fib_selftest()
     # Run the reassembly self-test on every boot that exercises the net
     # stack, gated on the /etc/ipreasm-test cpio marker (planted by
     # scripts/test_net_ipreasm.sh). This driver-internal gate avoids any
@@ -1316,3 +1564,159 @@ def ip_reasm_selftest():
     else:
         printk1("[ip-reasm] %d FAILURE(S)\n",
                 cast[uint64](ip_reasm_st_fails))
+
+
+# =====================================================================
+# IPv4 FIB longest-prefix-match self-test
+# =====================================================================
+#
+# Deterministic, NIC-free exercise of the REAL ip_route_lookup() LPM
+# path. Builds a small FIB and asserts that several destinations resolve
+# to the correct next hop and on-link/via-gateway disposition, proving:
+#   1. a /32 host route beats an overlapping /24 subnet route,
+#   2. a /24 subnet route beats the /0 default route,
+#   3. an on-link route ARPs the DESTINATION, an off-link route ARPs the
+#      route's GATEWAY,
+#   4. a destination matching only the default route uses the default
+#      gateway, and
+#   5. with no default route and no matching route, lookup MISSES
+#      (unroutable) rather than silently picking a wrong next hop.
+# A final "[ip-fib] PASS-ALL" sentinel is what scripts/test_net_iproute.sh
+# greps for. Gated at boot on the /etc/iproute-test cpio marker so it
+# never runs on a normal boot.
+
+ip_fib_st_fails: int32 = 0
+
+
+def _ip_fib_marker_present() -> int32:
+    # Scan the initramfs for "/etc/iproute-test" (17 chars + NUL = 18
+    # bytes). Mirrors _ip_reasm_marker_present so no init/main.ad edit is
+    # needed to wire the test in.
+    cpio_init()
+    n: uint64 = initramfs_entry_count()
+    idx: uint64 = 0
+    while idx < n:
+        nm: Ptr[char] = initramfs_entry_name(idx)
+        ok: int32 = 1
+        tgt: Ptr[uint8] = "/etc/iproute-test"
+        j: uint64 = 0
+        while j < 18:
+            if cast[uint8](nm[j]) != tgt[j]:
+                ok = 0
+                j = 18
+            else:
+                j = j + 1
+        if ok == 1:
+            return 1
+        idx = idx + 1
+    return 0
+
+
+def _ip_fib_check(name: Ptr[uint8], ok: int32):
+    if ok != 0:
+        printk1("[ip-fib] %s PASS\n", cast[uint64](name))
+    else:
+        printk1("[ip-fib] %s FAIL\n", cast[uint64](name))
+        ip_fib_st_fails = ip_fib_st_fails + 1
+
+
+def _ip_fib_nh_is(b0: uint8, b1: uint8, b2: uint8, b3: uint8,
+                  onlink: uint8) -> int32:
+    # Assert the most recent ip_route_lookup result is a hit with the
+    # given next hop and on-link disposition.
+    if ip_rt_found != 1:
+        return 0
+    if ip_rt_onlink != onlink:
+        return 0
+    if ip_rt_nexthop0 != b0:
+        return 0
+    if ip_rt_nexthop1 != b1:
+        return 0
+    if ip_rt_nexthop2 != b2:
+        return 0
+    if ip_rt_nexthop3 != b3:
+        return 0
+    return 1
+
+
+def ip_fib_selftest():
+    # Build a known topology entirely in the FIB (no NIC, no DHCP, no
+    # auto subnet/default — we clear those first so this isolates the
+    # operator-route LPM logic precisely).
+    ip_fib_st_fails = 0
+    ip_fib_clear()
+    # Start from a clean address/gateway state so the auto subnet route
+    # and default-gateway fallback don't perturb the operator-route LPM
+    # assertions below.
+    ip_our_set = 0
+    ip_mask_set = 0
+    ip_gw_set = 0
+
+    # Routes:
+    #   10.5.0.0/16   via 192.168.1.254        (off-link, subnet)
+    #   10.5.7.0/24   via 192.168.1.253        (off-link, more specific)
+    #   10.5.7.42/32  on-link                  (host route, ARP dst)
+    #   0.0.0.0/0     via 192.168.1.1          (default)
+    ip_route_add(10, 5, 0, 0,   255, 255, 0, 0,
+                 192, 168, 1, 254, 0)
+    ip_route_add(10, 5, 7, 0,   255, 255, 255, 0,
+                 192, 168, 1, 253, 0)
+    ip_route_add(10, 5, 7, 42,  255, 255, 255, 255,
+                 0, 0, 0, 0, 1)
+    ip_route_add(0, 0, 0, 0,    0, 0, 0, 0,
+                 192, 168, 1, 1, 0)
+
+    # 1. /16 subnet match → its gateway (192.168.1.254), off-link.
+    ip_route_lookup(10, 5, 99, 1)
+    _ip_fib_check("slash16-subnet-via-gw",
+                  _ip_fib_nh_is(192, 168, 1, 254, 0))
+
+    # 2. /24 beats the overlapping /16 → 192.168.1.253.
+    ip_route_lookup(10, 5, 7, 9)
+    _ip_fib_check("slash24-beats-slash16",
+                  _ip_fib_nh_is(192, 168, 1, 253, 0))
+
+    # 3. /32 host route beats the /24 → on-link, ARP the dest itself.
+    ip_route_lookup(10, 5, 7, 42)
+    _ip_fib_check("slash32-host-beats-slash24-onlink",
+                  _ip_fib_nh_is(10, 5, 7, 42, 1))
+
+    # 4. No specific route → default gateway 192.168.1.1, off-link.
+    ip_route_lookup(8, 8, 8, 8)
+    _ip_fib_check("default-route-via-gw",
+                  _ip_fib_nh_is(192, 168, 1, 1, 0))
+
+    # 5. Drop the default route; an unrouted dst must MISS, not guess.
+    ip_fib_clear()
+    ip_route_add(10, 5, 7, 0, 255, 255, 255, 0,
+                 192, 168, 1, 253, 0)
+    miss_ok: int32 = 0
+    if ip_route_lookup(8, 8, 8, 8) == 0:
+        miss_ok = 1
+    _ip_fib_check("no-default-no-match-misses", miss_ok)
+
+    # 6. Replace-in-place: re-adding the same prefix updates the gw and
+    #    does not consume a second slot.
+    ip_fib_clear()
+    ip_route_add(172, 16, 0, 0, 255, 255, 0, 0, 192, 168, 1, 10, 0)
+    ip_route_add(172, 16, 0, 0, 255, 255, 0, 0, 192, 168, 1, 20, 0)
+    used: uint64 = 0
+    s: uint64 = 0
+    while s < IP_FIB_MAX:
+        if ip_fib_slot_used(s) == 1:
+            used = used + 1
+        s = s + 1
+    ip_route_lookup(172, 16, 5, 5)
+    repl_ok: int32 = 0
+    if used == 1 and _ip_fib_nh_is(192, 168, 1, 20, 0) == 1:
+        repl_ok = 1
+    _ip_fib_check("same-prefix-readd-replaces", repl_ok)
+
+    # Leave the FIB clean for the live stack.
+    ip_fib_clear()
+
+    if ip_fib_st_fails == 0:
+        printk0("[ip-fib] PASS-ALL\n")
+    else:
+        printk1("[ip-fib] %d FAILURE(S)\n",
+                cast[uint64](ip_fib_st_fails))
