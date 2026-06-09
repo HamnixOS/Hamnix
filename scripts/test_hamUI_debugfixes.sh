@@ -135,6 +135,11 @@ if wait_for 'hamsh\$' 90; then
     # presents ONLY that window's rect and the presented area does NOT grow
     # with the open-window count (the user's "slower with each window" bug).
     send_selftest 'echo MARK_DEPERF_BEGIN; hamUId daemon deperfselftest' '\[DEPERF\] (PASS|FAIL)' 60 2
+    # DEUSE DE-usability proofs: (1) NO keystroke loss under a slow-frame
+    # backlog, (2) the panel context menu box fits its widest label (no clip),
+    # (3) pointer-move stays off the full-present path AND per-pixel compositing
+    # is window-count bounded (occlusion skip).
+    send_selftest 'echo MARK_DEUSE_BEGIN; hamUId daemon deusabilityselftest' '\[DEUSE\] (PASS|FAIL)' 60 2
 fi
 
 exec 3>&-
@@ -219,10 +224,22 @@ assert_marker '\[DEPERF\] single-window present area is window-count INDEPENDENT
 assert_marker '\[DEPERF\] whole-screen change still escalates to a full present OK' 'DEPERF: a genuine whole-screen change still does a full present'
 assert_marker '\[DEPERF\] PASS' 'DEPERF: dirty-rect present scaling self-test ran to completion'
 
+# --- DEUSE: the three user-reported DE-usability fixes -----------------
+# BUG 1: no keystrokes are lost even when far more bytes than the old
+# 16x256 per-frame cap are queued (slow-frame backlog).
+assert_marker '\[DEUSE\] keystroke integrity: NONE dropped under backlog OK' 'DEUSE BUG1: no keystroke loss under a slow-frame backlog'
+# BUG 3: the panel context menu box is wide enough for its widest label.
+assert_marker '\[DEUSE\] panel context menu box fits its widest label OK' 'DEUSE BUG3: panel context menu box fits its widest label (no clip)'
+# BUG 2: pointer-move stays off the full-present path; per-pixel compositing
+# is window-count independent (occlusion skip).
+assert_marker '\[DEUSE\] hover-only pointer move stays off the full-present path OK' 'DEUSE BUG2a: hover-only pointer move does not force a full present'
+assert_marker '\[DEUSE\] per-pixel compositing is window-count INDEPENDENT (occlusion) OK' 'DEUSE BUG2b: per-pixel compositing cost does not grow with window count'
+assert_marker '\[DEUSE\] PASS' 'DEUSE: DE-usability self-test ran to completion'
+
 # Any explicit FAIL marker from a self-test is a hard failure.
-if grep -aqE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL|\[DEPERF\] FAIL' "$LOG"; then
+if grep -aqE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL|\[DEPERF\] FAIL|\[DEUSE\] FAIL' "$LOG"; then
     echo "[test_hamUI_debugfixes] FAIL: a self-test reported a failure:"
-    grep -aE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL|\[DEPERF\] FAIL' "$LOG" | head
+    grep -aE '\[DETRAY\] FAIL|\[DEBUG\] FAIL|TERM IO FAIL|\[DEPERF\] FAIL|\[DEUSE\] FAIL' "$LOG" | head
     fail=1
 fi
 
