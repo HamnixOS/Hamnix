@@ -3333,6 +3333,218 @@ def _ext4_num_groups() -> uint64:
     return (span + ext4_blocks_per_grp - 1) / ext4_blocks_per_grp
 
 
+# --- allocator metadata maintenance (free counts + metadata_csum) ----
+#
+# The block/inode allocators mutate a group's bitmap in place. For the
+# on-disk image to stay e2fsck-clean every such mutation must ALSO:
+#   * adjust that group's GDT free-block / free-inode count,
+#   * (metadata_csum) recompute the group's bitmap csum + bg_checksum,
+#   * adjust the superblock's free-block / free-inode count + s_checksum
+#     and write the superblock back.
+# These helpers centralise that bookkeeping so alloc/free stay symmetric
+# and a write→e2fsck round-trip is green on a metadata_csum FS (the
+# shape the installer's grown root carries). On a no-csum FS the csum
+# steps are skipped but the free-count maintenance still runs.
+
+def _ext4_mounted_gd_csum(desc: Ptr[uint8], group: uint64) -> uint16:
+    # bg_checksum for the MOUNTED volume, mirroring _ext4_resize_gd_csum
+    # but seeded by the mounted ext4_csum_seed and sized by ext4_desc_size.
+    g_le: Array[4, uint8]
+    _ext4_write_u32(&g_le[0], cast[uint32](group))
+    crc: uint32 = crc32c_update(ext4_csum_seed, &g_le[0], 4)
+    crc = crc32c_update(crc, desc, EXT4_BG_CHECKSUM)
+    zero2: Array[2, uint8]
+    zero2[0] = 0
+    zero2[1] = 0
+    crc = crc32c_update(crc, &zero2[0], 2)
+    after: uint64 = EXT4_BG_CHECKSUM + 2
+    if ext4_desc_size > after:
+        crc = crc32c_update(
+            crc,
+            cast[Ptr[uint8]](cast[uint64](desc) + after),
+            ext4_desc_size - after)
+    return cast[uint16](crc & 0xFFFF)
+
+
+def _ext4_gd_update_after_bitmap(grp: uint64, is_inode: int32,
+                                 bitmap: Ptr[uint8],
+                                 free_delta: int64) -> int32:
+    # Read group `grp`'s descriptor, apply `free_delta` to its free-block
+    # (is_inode==0) or free-inode (is_inode!=0) count, refresh the matching
+    # bitmap csum (metadata_csum only), recompute bg_checksum, and write
+    # the GDT block back. `bitmap` is the FULL bitmap block just persisted.
+    desc_byte_off: uint64 = grp * ext4_desc_size
+    gdt_block:     uint64 = ext4_gdt_block + desc_byte_off / ext4_block_size
+    within:        uint64 = desc_byte_off % ext4_block_size
+    if _ext4_read_block(gdt_block, &ext4_blk_buf[0]) != 0:
+        return -1
+    entry: uint64 = cast[uint64](&ext4_blk_buf[0]) + within
+
+    # --- free count (lo + optional hi half) ---
+    free_lo_off: uint64 = EXT4_BG_FREE_BLOCKS_LO
+    free_hi_off: uint64 = EXT4_BG_FREE_BLOCKS_HI
+    if is_inode != 0:
+        free_lo_off = EXT4_BG_FREE_INODES_LO
+        free_hi_off = EXT4_BG_FREE_INODES_HI
+    cur: uint64 = cast[uint64](_ext4_read_u16(
+        cast[Ptr[uint8]](entry + free_lo_off)))
+    has_hi: int32 = 0
+    if ext4_64bit != 0 and ext4_desc_size >= 64:
+        has_hi = 1
+        cur = cur | (cast[uint64](_ext4_read_u16(
+            cast[Ptr[uint8]](entry + free_hi_off))) << 16)
+    new_free: uint64 = cast[uint64](cast[int64](cur) + free_delta)
+    _ext4_write_u16(cast[Ptr[uint8]](entry + free_lo_off),
+                    cast[uint16](new_free & 0xFFFF))
+    if has_hi != 0:
+        _ext4_write_u16(cast[Ptr[uint8]](entry + free_hi_off),
+                        cast[uint16]((new_free >> 16) & 0xFFFF))
+
+    # --- bitmap csum (metadata_csum only) ---
+    if ext4_metadata_csum != 0:
+        # Linux checksums the live-bit span, not the whole block: block
+        # bitmaps over clusters_per_group/8, inode bitmaps over
+        # (inodes_per_group+7)/8 — both capped at the block size.
+        csum_bytes: uint64 = ext4_clusters_per_grp / 8
+        lo_off: uint64 = EXT4_BG_BLOCK_BITMAP_CSUM_LO
+        hi_off: uint64 = EXT4_BG_BLOCK_BITMAP_CSUM_HI
+        if is_inode != 0:
+            csum_bytes = (ext4_inodes_per_grp + 7) / 8
+            lo_off = EXT4_BG_INODE_BITMAP_CSUM_LO
+            hi_off = EXT4_BG_INODE_BITMAP_CSUM_HI
+        if csum_bytes > ext4_block_size:
+            csum_bytes = ext4_block_size
+        bcsum: uint32 = crc32c_update(ext4_csum_seed, bitmap, csum_bytes)
+        _ext4_write_u16(cast[Ptr[uint8]](entry + lo_off),
+                        cast[uint16](bcsum & 0xFFFF))
+        if ext4_desc_size >= 64:
+            _ext4_write_u16(cast[Ptr[uint8]](entry + hi_off),
+                            cast[uint16]((bcsum >> 16) & 0xFFFF))
+        # bg_checksum LAST — it folds the rest of the descriptor.
+        bg_c: uint16 = _ext4_mounted_gd_csum(
+            cast[Ptr[uint8]](entry), grp)
+        _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_CHECKSUM), bg_c)
+
+    return _ext4_write_block(gdt_block, &ext4_blk_buf[0])
+
+
+def _ext4_gd_inode_alloc_update(grp: uint64, group_rel_bit: uint64,
+                                bitmap: Ptr[uint8]) -> int32:
+    # Inode-allocation GDT maintenance for group `grp`: free-inode count
+    # -1, refresh bg_itable_unused (the count of high inodes never yet
+    # used), refresh inode-bitmap csum + bg_checksum, write GDT back.
+    #
+    # bg_itable_unused: inodes [ipg - itable_unused + 1 .. ipg] are the
+    # never-used tail. Allocating group-relative bit `group_rel_bit`
+    # (0-based) consumes inode (group_rel_bit+1); if that reaches into the
+    # unused tail, shrink itable_unused so it only covers inodes ABOVE the
+    # one we just allocated. e2fsck flags an allocated inode that still
+    # sits inside the unused-tail region, which is exactly the bug a naive
+    # bitmap-only alloc hits.
+    desc_byte_off: uint64 = grp * ext4_desc_size
+    gdt_block:     uint64 = ext4_gdt_block + desc_byte_off / ext4_block_size
+    within:        uint64 = desc_byte_off % ext4_block_size
+    if _ext4_read_block(gdt_block, &ext4_blk_buf[0]) != 0:
+        return -1
+    entry: uint64 = cast[uint64](&ext4_blk_buf[0]) + within
+
+    # free-inode count -1 (lo + optional hi).
+    cur: uint64 = cast[uint64](_ext4_read_u16(
+        cast[Ptr[uint8]](entry + EXT4_BG_FREE_INODES_LO)))
+    has_hi: int32 = 0
+    if ext4_64bit != 0 and ext4_desc_size >= 64:
+        has_hi = 1
+        cur = cur | (cast[uint64](_ext4_read_u16(
+            cast[Ptr[uint8]](entry + EXT4_BG_FREE_INODES_HI))) << 16)
+    if cur > 0:
+        cur = cur - 1
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FREE_INODES_LO),
+                    cast[uint16](cur & 0xFFFF))
+    if has_hi != 0:
+        _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FREE_INODES_HI),
+                        cast[uint16]((cur >> 16) & 0xFFFF))
+
+    # itable_unused: only meaningful under metadata_csum / gdt_csum. If
+    # the allocated inode falls within the unused tail, pull the watermark
+    # down to (ipg - (group_rel_bit + 1)) so the allocated inode is no
+    # longer counted as "never used".
+    iu_lo: uint64 = cast[uint64](_ext4_read_u16(
+        cast[Ptr[uint8]](entry + EXT4_BG_ITABLE_UNUSED_LO)))
+    itu: uint64 = iu_lo
+    if has_hi != 0:
+        itu = itu | (cast[uint64](_ext4_read_u16(
+            cast[Ptr[uint8]](entry + EXT4_BG_ITABLE_UNUSED_HI))) << 16)
+    used_inodes: uint64 = group_rel_bit + 1
+    if ext4_inodes_per_grp > used_inodes:
+        max_unused: uint64 = ext4_inodes_per_grp - used_inodes
+        if itu > max_unused:
+            itu = max_unused
+            _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_ITABLE_UNUSED_LO),
+                            cast[uint16](itu & 0xFFFF))
+            if has_hi != 0:
+                _ext4_write_u16(
+                    cast[Ptr[uint8]](entry + EXT4_BG_ITABLE_UNUSED_HI),
+                    cast[uint16]((itu >> 16) & 0xFFFF))
+
+    if ext4_metadata_csum != 0:
+        # Inode bitmap csum spans (inodes_per_group+7)/8 bytes (live bits
+        # only), capped at the block size — matching Linux.
+        ib_bytes: uint64 = (ext4_inodes_per_grp + 7) / 8
+        if ib_bytes > ext4_block_size:
+            ib_bytes = ext4_block_size
+        bcsum: uint32 = crc32c_update(ext4_csum_seed, bitmap, ib_bytes)
+        _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_INODE_BITMAP_CSUM_LO),
+                        cast[uint16](bcsum & 0xFFFF))
+        if ext4_desc_size >= 64:
+            _ext4_write_u16(
+                cast[Ptr[uint8]](entry + EXT4_BG_INODE_BITMAP_CSUM_HI),
+                cast[uint16]((bcsum >> 16) & 0xFFFF))
+        bg_c: uint16 = _ext4_mounted_gd_csum(cast[Ptr[uint8]](entry), grp)
+        _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_CHECKSUM), bg_c)
+
+    return _ext4_write_block(gdt_block, &ext4_blk_buf[0])
+
+
+def _ext4_sb_adjust_free(d_blocks: int64, d_inodes: int64) -> int32:
+    # Apply free-count deltas to the on-disk superblock, recompute
+    # s_checksum (metadata_csum only), and write the SB back to sectors
+    # 2..3. Keeps the global ext4_sb_buf in sync so a later mount/csum
+    # check agrees. The mounted-volume read path never wrote the SB back,
+    # so without this an alloc left the on-disk free counts stale and
+    # e2fsck flagged "Free blocks/inodes count wrong".
+    if ext4_blockdev_slot < 0:
+        return -1
+    if d_blocks != 0:
+        fb_lo: uint64 = cast[uint64](_ext4_read_u32(
+            cast[Ptr[uint8]](cast[uint64](&ext4_sb_buf[0])
+                             + EXT4_SB_OFF_FREE_BLOCKS_LO)))
+        fb: uint64 = fb_lo
+        if ext4_64bit != 0:
+            fb = fb | (cast[uint64](_ext4_read_u32(
+                cast[Ptr[uint8]](cast[uint64](&ext4_sb_buf[0])
+                                 + EXT4_SB_OFF_FREE_BLOCKS_HI))) << 32)
+        fb = cast[uint64](cast[int64](fb) + d_blocks)
+        _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&ext4_sb_buf[0])
+                        + EXT4_SB_OFF_FREE_BLOCKS_LO),
+                        cast[uint32](fb & 0xFFFFFFFF))
+        if ext4_64bit != 0:
+            _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&ext4_sb_buf[0])
+                            + EXT4_SB_OFF_FREE_BLOCKS_HI),
+                            cast[uint32]((fb >> 32) & 0xFFFFFFFF))
+    if d_inodes != 0:
+        fi: uint32 = _ext4_read_u32(
+            cast[Ptr[uint8]](cast[uint64](&ext4_sb_buf[0])
+                             + EXT4_SB_OFF_FREE_INODES))
+        fi = cast[uint32](cast[int64](cast[uint64](fi)) + d_inodes)
+        _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&ext4_sb_buf[0])
+                        + EXT4_SB_OFF_FREE_INODES), fi)
+    if ext4_metadata_csum != 0:
+        sc: uint32 = _ext4_sb_csum()
+        _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&ext4_sb_buf[0])
+                        + EXT4_SB_OFF_CHECKSUM), sc)
+    return blk_write_sectors(ext4_blockdev_slot, 2, 2, &ext4_sb_buf[0])
+
+
 def ext4_alloc_block() -> uint64:
     # Find a free data block by scanning every block group in order,
     # mark it allocated, write that group's bitmap back. Returns the
@@ -3382,6 +3594,15 @@ def ext4_alloc_block() -> uint64:
                                                      &ext4_bitmap_buf[0]) != 0:
                                     printk0("ext4: bitmap write failed\n")
                                     return 0
+                                # Keep the on-disk bookkeeping consistent:
+                                # one fewer free block in this group + the
+                                # superblock, refreshed bitmap csum + group/
+                                # sb checksums (metadata_csum). Without this
+                                # an alloc leaves e2fsck flagging stale free
+                                # counts / bad bitmap csums.
+                                _ext4_gd_update_after_bitmap(
+                                    g, 0, &ext4_bitmap_buf[0], -1)
+                                _ext4_sb_adjust_free(-1, 0)
                                 # Group g's bit 0 is cluster 0, whose first
                                 # block is first_data_block + g*bpg. Bit C
                                 # maps to block base + C*cluster_ratio. With
@@ -3432,8 +3653,12 @@ def ext4_free_block(block_nr: uint64) -> int32:
     bit_idx:  uint64 = bit % 8
     mask: uint8 = cast[uint8](1) << cast[uint8](bit_idx)
     ext4_bitmap_buf[byte_idx] = ext4_bitmap_buf[byte_idx] & (~mask)
-    return _ext4_write_block(bm_block,
-                             &ext4_bitmap_buf[0])
+    if _ext4_write_block(bm_block, &ext4_bitmap_buf[0]) != 0:
+        return -1
+    # One more free block in this group + the superblock; refresh csums.
+    _ext4_gd_update_after_bitmap(g, 0, &ext4_bitmap_buf[0], 1)
+    _ext4_sb_adjust_free(1, 0)
+    return 0
 
 
 def ext4_bitmap_smoke_test() -> int32:
@@ -3532,8 +3757,14 @@ def ext4_alloc_inode() -> uint32:
                                          &ext4_bitmap_buf[0]) != 0:
                         printk0("ext4: inode bitmap write failed\n")
                         return 0
+                    # GDT free-inode count / itable_unused / inode-bitmap
+                    # csum + bg_checksum, then the superblock free count.
+                    rel_bit: uint64 = byte_idx * 8 + bit_idx
+                    _ext4_gd_inode_alloc_update(0, rel_bit,
+                                                &ext4_bitmap_buf[0])
+                    _ext4_sb_adjust_free(0, -1)
                     # bit (byte*8 + bit) → inode (group*ipg + bit + 1)
-                    return cast[uint32](byte_idx * 8 + bit_idx + 1)
+                    return cast[uint32](rel_bit + 1)
                 bit_idx = bit_idx + 1
         byte_idx = byte_idx + 1
     printk0("ext4: no free inode in group 0\n")
@@ -3565,8 +3796,14 @@ def ext4_free_inode(inum: uint32) -> int32:
     bit_idx:  uint64 = rel % 8
     mask: uint8 = cast[uint8](1) << cast[uint8](bit_idx)
     ext4_bitmap_buf[byte_idx] = ext4_bitmap_buf[byte_idx] & (~mask)
-    return _ext4_write_block(bm_block,
-                             &ext4_bitmap_buf[0])
+    if _ext4_write_block(bm_block, &ext4_bitmap_buf[0]) != 0:
+        return -1
+    # One more free inode in group 0 + the superblock; refresh csums.
+    # (itable_unused is a never-used watermark — it only shrinks, so a
+    # free leaves it alone.)
+    _ext4_gd_update_after_bitmap(0, 1, &ext4_bitmap_buf[0], 1)
+    _ext4_sb_adjust_free(0, 1)
+    return 0
 
 
 # --- inode write + file create (M16.63) ---------------------------
@@ -11183,11 +11420,16 @@ def ext4_useradd_root(name: Ptr[char]) -> int32:
 #     fine even when the bit is set; per-group bitmaps just don't
 #     get packed into a flex pool.
 #
+# metadata_csum (RO_COMPAT_METADATA_CSUM): SUPPORTED. When the SB
+# declares the feature the grow recomputes, for every new group, the
+# crc32c group-descriptor checksum (bg_checksum), the block- and
+# inode-bitmap checksums (bg_*_bitmap_csum_lo/hi), and the trailing
+# superblock s_checksum — all seeded by crc32c(~0, s_uuid). The result
+# passes `e2fsck -f`. The legacy uninit_bg crc16 (RO_COMPAT_GDT_CSUM
+# WITHOUT metadata_csum) is NOT maintained and still refused.
+#
 # Out of scope:
 #   * Online resize (would need block-layer + journal coordination).
-#   * metadata_csum / gdt_csum checksum recompute. scripts/build_rootfs_img.py
-#     builds the rootfs with -O ^metadata_csum, so checksums are
-#     disabled and not maintained — we refuse the grow if they're on.
 #   * 64bit blocks_count > 2^32. Refused; current installer disks are
 #     all way under 4 TiB.
 #   * Journal (rootfs is mkfs -O ^has_journal).
@@ -11262,6 +11504,10 @@ ext4_resize_sb_buf: Array[4096, uint8]
 # Scratch buffer for writing a single FS block during the grow. Big
 # enough for 4 KiB blocks; the inode-table-zeroing loop reuses it.
 ext4_resize_blk_buf: Array[4096, uint8]
+
+# Second scratch buffer so the old-last-group padding fixup can hold a
+# bitmap block while ext4_resize_blk_buf holds the GDT block.
+ext4_resize_bm_buf: Array[4096, uint8]
 
 
 def _ext4_resize_log_features(compat: uint32, incompat: uint32,
@@ -11378,12 +11624,23 @@ def ext4_resize_check(slot: int32,
     if (compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL) != 0:
         printk0("[ext4_resize] refuse: HAS_JOURNAL set (journal replay needed)\n")
         return EXT4_RESIZE_EINVAL
+    # metadata_csum (RO_COMPAT_METADATA_CSUM) IS supported: the grow path
+    # recomputes the crc32c group-descriptor, block/inode-bitmap, and
+    # superblock checksums for every new group. The legacy uninit_bg
+    # checksum (RO_COMPAT_GDT_CSUM) WITHOUT metadata_csum uses a crc16 we
+    # don't maintain, so refuse that combination only.
+    has_meta_csum: int32 = 0
     if (ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) != 0:
-        printk0("[ext4_resize] refuse: METADATA_CSUM set (no checksum support)\n")
+        has_meta_csum = 1
+    if (ro_compat & EXT4_FEATURE_RO_COMPAT_GDT_CSUM) != 0 \
+       and has_meta_csum == 0:
+        printk0("[ext4_resize] refuse: GDT_CSUM (uninit_bg crc16) without metadata_csum\n")
         return EXT4_RESIZE_EINVAL
-    if (ro_compat & EXT4_FEATURE_RO_COMPAT_GDT_CSUM) != 0:
-        printk0("[ext4_resize] refuse: GDT_CSUM set (no checksum support)\n")
-        return EXT4_RESIZE_EINVAL
+    if has_meta_csum != 0:
+        if crc32c_selftest() == 0:
+            printk0("[ext4_resize] refuse: crc32c KAT failed; can't maintain metadata_csum\n")
+            return EXT4_RESIZE_EINVAL
+        printk0("[ext4_resize] metadata_csum present; grow will recompute checksums\n")
     if (incompat & EXT4_FEATURE_INCOMPAT_META_BG) != 0:
         printk0("[ext4_resize] refuse: META_BG set (alt GDT layout unsupported)\n")
         return EXT4_RESIZE_EINVAL
@@ -11514,6 +11771,93 @@ EXT4_BG_FLAG_INODE_UNINIT: uint16 = 0x1
 EXT4_BG_FLAG_BLOCK_UNINIT: uint16 = 0x2
 EXT4_BG_FLAG_INODE_ZEROED: uint16 = 0x4
 
+# metadata_csum per-group bitmap checksum fields. The block-bitmap and
+# inode-bitmap crc32c is split into a u16 LO in the 32-byte descriptor
+# core and (on a >=64-byte / 64bit descriptor) a u16 HI in the extended
+# half. Mirrors struct ext4_group_desc bg_block_bitmap_csum_{lo,hi} /
+# bg_inode_bitmap_csum_{lo,hi}.
+EXT4_BG_BLOCK_BITMAP_CSUM_LO: uint64 = 0x18
+EXT4_BG_INODE_BITMAP_CSUM_LO: uint64 = 0x1A
+EXT4_BG_BLOCK_BITMAP_CSUM_HI: uint64 = 0x38
+EXT4_BG_INODE_BITMAP_CSUM_HI: uint64 = 0x3A
+
+# resize-local metadata_csum state. The resize path runs OFFLINE against
+# `slot` — which is not necessarily the currently-mounted FS — so the
+# global ext4_metadata_csum / ext4_csum_seed (owned by ext4_init for the
+# mounted volume) can't be trusted here. _ext4_resize_read_sb seeds these
+# from the resize SB's own UUID + feature bits before any group is built.
+ext4_resize_metadata_csum: int32  = 0
+ext4_resize_csum_seed:     uint32 = 0
+
+
+def _ext4_resize_arm_csum(sb: Ptr[uint8]):
+    # Derive the resize-local crc32c seed + feature flag from the SB
+    # image currently in the resize scratch buffer. The seed is the RAW
+    # running register crc32c_update(~0, s_uuid, 16) — the same form
+    # ext4_init computes for the mounted volume and the same form Linux
+    # uses when the metadata_csum_seed feature is OFF (our test images
+    # mint with ^metadata_csum_seed so s_uuid IS the seed source). A
+    # broken crc32c primitive disables csum maintenance rather than
+    # silently writing garbage checksums.
+    ext4_resize_metadata_csum = 0
+    ext4_resize_csum_seed = 0
+    ro_compat: uint32 = _ext4_resize_sb_u32(sb,
+                                            EXT4_SB_OFF_FEATURE_RO_COMPAT)
+    if (ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) == 0:
+        return
+    if crc32c_selftest() == 0:
+        printk0("[ext4_resize] crc32c KAT failed; refusing csum grow\n")
+        return
+    ext4_resize_csum_seed = crc32c_update(
+        0xFFFFFFFF,
+        cast[Ptr[uint8]](cast[uint64](sb) + EXT4_SB_OFF_UUID), 16)
+    ext4_resize_metadata_csum = 1
+
+
+def _ext4_resize_bitmap_csum(bitmap: Ptr[uint8], nbytes: uint64) -> uint32:
+    # crc32c over a whole bitmap block, seeded by the fs csum_seed.
+    # ext4_block_bitmap_csum / ext4_inode_bitmap_csum checksum the FULL
+    # bitmap block (block_size bytes), not just the live-bit prefix —
+    # the tail "past end of group" bits are part of the on-disk image
+    # e2fsck folds, so `nbytes` is always the block size here.
+    return crc32c_update(ext4_resize_csum_seed, bitmap, nbytes)
+
+
+def _ext4_resize_gd_csum(desc: Ptr[uint8], group: uint64,
+                         desc_size: uint64) -> uint16:
+    # crc32c group-descriptor checksum (metadata_csum variant of
+    # ext4_group_desc_csum). Chain mirrors the Linux kernel EXACTLY:
+    #   crc = crc32c(csum_seed, &group_le32, 4)
+    #   crc = crc32c(crc, gdp, offsetof(bg_checksum))      # [0, 0x1E)
+    #   crc = crc32c(crc, &dummy_zero, 2)                  # checksum field as 0
+    #   crc = crc32c(crc, gdp + 0x20, desc_size - 0x20)    # [0x20, desc_size)
+    # NOTE: the 2-byte bg_checksum field is folded in as TWO ZERO BYTES,
+    # not skipped. Skipping it (folding only [0,0x1E)+[0x20,end]) yields a
+    # different crc and e2fsck rejects it.
+    g_le: Array[4, uint8]
+    _ext4_write_u32(&g_le[0], cast[uint32](group))
+    crc: uint32 = crc32c_update(ext4_resize_csum_seed, &g_le[0], 4)
+    crc = crc32c_update(crc, desc, EXT4_BG_CHECKSUM)
+    zero2: Array[2, uint8]
+    zero2[0] = 0
+    zero2[1] = 0
+    crc = crc32c_update(crc, &zero2[0], 2)
+    after: uint64 = EXT4_BG_CHECKSUM + 2
+    if desc_size > after:
+        crc = crc32c_update(
+            crc,
+            cast[Ptr[uint8]](cast[uint64](desc) + after),
+            desc_size - after)
+    return cast[uint16](crc & 0xFFFF)
+
+
+def _ext4_resize_sb_csum_seed(sb: Ptr[uint8]) -> uint32:
+    # crc32c over the 1 KiB superblock image MINUS its trailing 4-byte
+    # s_checksum. RAW register (no final xor) — same as _ext4_sb_csum
+    # but against the resize scratch buffer rather than the mounted
+    # ext4_sb_buf.
+    return crc32c_update(0xFFFFFFFF, sb, EXT4_SB_OFF_CHECKSUM)
+
 
 def _ext4_resize_pow_test(n: uint64, base: uint64) -> int32:
     # Return 1 iff `n` is a non-zero power of `base` (base^k for some
@@ -11622,7 +11966,10 @@ def _ext4_resize_write_gdt_entry(slot: int32, block_size: uint64,
                                  itab_blk: uint64,
                                  free_blocks: uint64,
                                  free_inodes: uint64,
-                                 itab_blocks: uint64) -> int32:
+                                 itab_blocks: uint64,
+                                 bbm_csum: uint32,
+                                 ibm_csum: uint32,
+                                 itab_unused: uint64) -> int32:
     # Splice a new GDT entry for `group` into the primary GDT. The
     # GDT entry lives at byte offset group * desc_size from the start
     # of the GDT (first_data_block + 1). The block holding the entry
@@ -11651,22 +11998,29 @@ def _ext4_resize_write_gdt_entry(slot: int32, block_size: uint64,
     _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FREE_INODES_LO),
                     cast[uint16](free_inodes & 0xFFFF))
     _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_USED_DIRS_LO), 0)
-    # bg_flags is only honoured when the RO_COMPAT_GDT_CSUM feature
-    # (aka uninit_bg, 0x10 in s_feature_ro_compat) is set. Without
-    # it, ext4_setup_system_zone refuses non-zero flags as "marked
-    # uninitialized without feature set" — and our rootfs ships
-    # WITHOUT gdt_csum (mkfs -O ^metadata_csum and no ^gdt_csum
-    # override leaves it off). Zero is the safe default.
-    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FLAGS),
-                    cast[uint16](0))
-    # bg_itable_unused is a lazy-init hint (only honoured under
-    # gdt_csum/uninit_bg). With the feature off, zero is the safe
-    # value — "no skip optimization, scan the whole table". Our
-    # inode table was just zeroed so scanning gives the same answer.
+    # bg_flags: when metadata_csum is on we set INODE_ZEROED (the inode
+    # table was just fully zeroed, so a mount-time lazy-init scrubber
+    # must NOT re-zero it) and bg_itable_unused = the unused-inode count
+    # (every inode in a fresh group is unused). These hints are honoured
+    # under metadata_csum and let e2fsck skip scanning the zeroed table.
+    # Without metadata_csum, the legacy ^gdt_csum semantics apply: non-
+    # zero flags are refused as "uninit without feature set", so we
+    # keep flags == 0 / itable_unused == 0 there exactly as before.
+    bg_flags_v: uint16 = 0
+    itu_v: uint64 = 0
+    if ext4_resize_metadata_csum != 0:
+        bg_flags_v = EXT4_BG_FLAG_INODE_ZEROED
+        itu_v = itab_unused
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FLAGS), bg_flags_v)
     _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_ITABLE_UNUSED_LO),
-                    cast[uint16](0))
-    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_CHECKSUM), 0)
-    # 64-byte descriptor: zero the _hi halves (still under 32 bits).
+                    cast[uint16](itu_v & 0xFFFF))
+    # Per-bitmap crc32c (low halves). Zero is the correct stored value
+    # when metadata_csum is off (the fields are reserved/ignored).
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_BLOCK_BITMAP_CSUM_LO),
+                    cast[uint16](bbm_csum & 0xFFFF))
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_INODE_BITMAP_CSUM_LO),
+                    cast[uint16](ibm_csum & 0xFFFF))
+    # 64-byte descriptor: fill the _hi halves.
     if desc_size >= 64:
         _ext4_write_u32(cast[Ptr[uint8]](entry + EXT4_BG_BLOCK_BITMAP_HI),
                         cast[uint32]((bm_blk >> 32) & 0xFFFFFFFF))
@@ -11680,12 +12034,133 @@ def _ext4_resize_write_gdt_entry(slot: int32, block_size: uint64,
                         cast[uint16]((free_inodes >> 16) & 0xFFFF))
         _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_USED_DIRS_HI), 0)
         _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_ITABLE_UNUSED_HI),
-                        cast[uint16](0))
+                        cast[uint16]((itu_v >> 16) & 0xFFFF))
+        _ext4_write_u16(
+            cast[Ptr[uint8]](entry + EXT4_BG_BLOCK_BITMAP_CSUM_HI),
+            cast[uint16]((bbm_csum >> 16) & 0xFFFF))
+        _ext4_write_u16(
+            cast[Ptr[uint8]](entry + EXT4_BG_INODE_BITMAP_CSUM_HI),
+            cast[uint16]((ibm_csum >> 16) & 0xFFFF))
+    # bg_checksum LAST — it folds the rest of the (now-final) descriptor.
+    # Under metadata_csum it's a crc32c truncated to 16 bits; otherwise
+    # zero (the legacy uninit_bg crc16 is unused on our images).
+    bg_csum_v: uint16 = 0
+    if ext4_resize_metadata_csum != 0:
+        bg_csum_v = _ext4_resize_gd_csum(cast[Ptr[uint8]](entry),
+                                         group, desc_size)
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_CHECKSUM), bg_csum_v)
     if _ext4_resize_write_block(slot, block_size, gdt_blk,
                                 &ext4_resize_blk_buf[0]) != 0:
         printk1("[ext4_resize] gdt write FAIL group=%d\n", group)
         return -1
     return 0
+
+
+def _ext4_resize_fixup_old_tail(slot: int32, block_size: uint64,
+                                first_data_block: uint64,
+                                desc_size: uint64,
+                                blocks_per_group: uint64,
+                                old_group: uint64,
+                                old_blocks_count: uint64,
+                                new_blocks_count: uint64,
+                                clusters_per_group: uint64) -> int64:
+    # Fix the group that WAS the filesystem's last group before the grow.
+    # ext4 block bitmaps address blocks_per_group bits, but only the
+    # blocks below s_blocks_count are real; the tail bits are padding set
+    # to 1. When the grow raises s_blocks_count, blocks that were padding
+    # in old_group become REAL FREE data blocks, so their bitmap bits must
+    # be CLEARED and the group's free count raised. Without this e2fsck
+    # reports "Block bitmap differences" + a wrong free count for the old
+    # tail group (and "Padding ... not set" if the new tail isn't padded).
+    #
+    # Returns the number of newly-freed blocks (>=0) or -1 on I/O error.
+    # The caller folds the freed count into the superblock free-block sum.
+    grp_first: uint64 = first_data_block + old_group * blocks_per_group
+    # Old valid bits in this group: [0, old_valid). After grow the group
+    # is fully real up to min(grp_first+bpg, new_blocks_count).
+    old_end: uint64 = old_blocks_count
+    if old_end > grp_first + blocks_per_group:
+        old_end = grp_first + blocks_per_group
+    new_end: uint64 = new_blocks_count
+    if new_end > grp_first + blocks_per_group:
+        new_end = grp_first + blocks_per_group
+    if new_end <= old_end:
+        return 0                       # nothing newly valid in this group
+
+    old_valid: uint64 = old_end - grp_first      # bit index of first pad
+    new_valid: uint64 = new_end - grp_first      # bit index of new first pad
+
+    # Read this group's descriptor to find its block bitmap + free count.
+    gdt_byte_off: uint64 = old_group * desc_size
+    gdt_blk: uint64 = first_data_block + 1 + (gdt_byte_off / block_size)
+    within: uint64 = gdt_byte_off % block_size
+    if _ext4_resize_read_block(slot, block_size, gdt_blk,
+                               &ext4_resize_blk_buf[0]) != 0:
+        return -1
+    entry: uint64 = cast[uint64](&ext4_resize_blk_buf[0]) + within
+    bm_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](entry
+                                   + EXT4_BG_BLOCK_BITMAP_LO))
+    bm_blk: uint64 = cast[uint64](bm_lo)
+    if desc_size >= 64:
+        bm_hi: uint32 = _ext4_read_u32(cast[Ptr[uint8]](entry
+                                       + EXT4_BG_BLOCK_BITMAP_HI))
+        bm_blk = bm_blk | (cast[uint64](bm_hi) << 32)
+    if bm_blk == 0:
+        return -1
+    if _ext4_resize_read_block(slot, block_size, bm_blk,
+                               &ext4_resize_bm_buf[0]) != 0:
+        return -1
+    # Clear bits [old_valid, new_valid) — now real free blocks.
+    freed: uint64 = 0
+    b: uint64 = old_valid
+    while b < new_valid:
+        byte_i: uint64 = b / 8
+        bit_i:  uint64 = b % 8
+        mask: uint8 = cast[uint8](1) << cast[uint8](bit_i)
+        if (ext4_resize_bm_buf[byte_i] & mask) != 0:
+            ext4_resize_bm_buf[byte_i] = ext4_resize_bm_buf[byte_i] & (~mask)
+            freed = freed + 1
+        b = b + 1
+    if _ext4_resize_write_block(slot, block_size, bm_blk,
+                                &ext4_resize_bm_buf[0]) != 0:
+        return -1
+
+    # Raise the group's free-block count by `freed` (lo + optional hi).
+    cur_lo: uint16 = _ext4_read_u16(cast[Ptr[uint8]](entry
+                                    + EXT4_BG_FREE_BLOCKS_LO))
+    cur: uint64 = cast[uint64](cur_lo)
+    if desc_size >= 64:
+        cur_hi: uint16 = _ext4_read_u16(cast[Ptr[uint8]](entry
+                                        + EXT4_BG_FREE_BLOCKS_HI))
+        cur = cur | (cast[uint64](cur_hi) << 16)
+    cur = cur + freed
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FREE_BLOCKS_LO),
+                    cast[uint16](cur & 0xFFFF))
+    if desc_size >= 64:
+        _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FREE_BLOCKS_HI),
+                        cast[uint16]((cur >> 16) & 0xFFFF))
+
+    # Refresh this group's block-bitmap csum + bg_checksum (metadata_csum).
+    if ext4_resize_metadata_csum != 0:
+        bbm_bytes: uint64 = clusters_per_group / 8
+        if bbm_bytes > block_size:
+            bbm_bytes = block_size
+        bbm_c: uint32 = _ext4_resize_bitmap_csum(&ext4_resize_bm_buf[0],
+                                                 bbm_bytes)
+        _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_BLOCK_BITMAP_CSUM_LO),
+                        cast[uint16](bbm_c & 0xFFFF))
+        if desc_size >= 64:
+            _ext4_write_u16(
+                cast[Ptr[uint8]](entry + EXT4_BG_BLOCK_BITMAP_CSUM_HI),
+                cast[uint16]((bbm_c >> 16) & 0xFFFF))
+        bg_c: uint16 = _ext4_resize_gd_csum(cast[Ptr[uint8]](entry),
+                                            old_group, desc_size)
+        _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_CHECKSUM), bg_c)
+
+    if _ext4_resize_write_block(slot, block_size, gdt_blk,
+                                &ext4_resize_blk_buf[0]) != 0:
+        return -1
+    return cast[int64](freed)
 
 
 def ext4_resize_grow(slot: int32, new_blocks_count: uint64) -> int32:
@@ -11707,6 +12182,11 @@ def ext4_resize_grow(slot: int32, new_blocks_count: uint64) -> int32:
     if _ext4_resize_sb_u16(sb, EXT4_SB_OFF_MAGIC) != EXT4_MAGIC:
         return EXT4_RESIZE_EINVAL
 
+    # Arm metadata_csum maintenance from THIS sb's own UUID + feature
+    # bits (offline grow: the global mount state belongs to a different
+    # volume). All the per-group csum writes below no-op when it's off.
+    _ext4_resize_arm_csum(sb)
+
     log_bs: uint32 = _ext4_resize_sb_u32(sb,
                                          EXT4_SB_OFF_LOG_BLOCK_SIZE)
     blk_sz: uint64 = cast[uint64](1024) << cast[uint64](log_bs)
@@ -11714,6 +12194,12 @@ def ext4_resize_grow(slot: int32, new_blocks_count: uint64) -> int32:
                               EXT4_SB_OFF_FIRST_DATA_BLOCK))
     bpg: uint64 = cast[uint64](_ext4_resize_sb_u32(sb,
                               EXT4_SB_OFF_BLOCKS_PER_GROUP))
+    # clusters_per_group (bigalloc); equals bpg with bigalloc off. Used
+    # to size block-bitmap csums (Linux folds clusters_per_group/8 bytes).
+    cpg: uint64 = cast[uint64](_ext4_resize_sb_u32(sb,
+                              EXT4_SB_OFF_CLUSTERS_PER_GROUP))
+    if cpg == 0:
+        cpg = bpg
     ipg: uint64 = cast[uint64](_ext4_resize_sb_u32(sb,
                               EXT4_SB_OFF_INODES_PER_GROUP))
     isize: uint64 = cast[uint64](_ext4_resize_sb_u16(sb,
@@ -11861,6 +12347,15 @@ def ext4_resize_grow(slot: int32, new_blocks_count: uint64) -> int32:
                                     &ext4_resize_blk_buf[0]) != 0:
             printk1("[ext4_resize] ibm write FAIL group=%d\n", g)
             return EXT4_RESIZE_EIO
+        # Snapshot the inode-bitmap crc32c off the very buffer we just
+        # wrote. Linux checksums the inode bitmap over (ipg+7)/8 bytes
+        # — the live-bit span, NOT the whole block — so the tail padding
+        # bits we set above are NOT folded into the inode-bitmap csum.
+        ibm_csum: uint32 = 0
+        if ext4_resize_metadata_csum != 0:
+            ibm_bytes: uint64 = (ipg + 7) / 8
+            ibm_csum = _ext4_resize_bitmap_csum(&ext4_resize_blk_buf[0],
+                                                ibm_bytes)
 
         # 3) Build + write the block bitmap.
         _ext4_resize_build_block_bitmap(&ext4_resize_blk_buf[0],
@@ -11871,13 +12366,27 @@ def ext4_resize_grow(slot: int32, new_blocks_count: uint64) -> int32:
                                     &ext4_resize_blk_buf[0]) != 0:
             printk1("[ext4_resize] bm write FAIL group=%d\n", g)
             return EXT4_RESIZE_EIO
+        # Block bitmap csum spans clusters_per_group/8 bytes (== bpg/8
+        # with bigalloc off), capped at the block size. For 1 KiB blocks
+        # this equals blk_sz, but compute it explicitly so non-1-KiB
+        # geometries stay correct.
+        bbm_csum: uint32 = 0
+        if ext4_resize_metadata_csum != 0:
+            bbm_bytes: uint64 = cpg / 8
+            if bbm_bytes > blk_sz:
+                bbm_bytes = blk_sz
+            bbm_csum = _ext4_resize_bitmap_csum(&ext4_resize_blk_buf[0],
+                                                bbm_bytes)
 
-        # 4) Write GDT entry for this group.
+        # 4) Write GDT entry for this group. itable_unused == ipg: every
+        # inode in the fresh group is unused, so e2fsck may skip the
+        # (zeroed) table entirely under metadata_csum.
         if _ext4_resize_write_gdt_entry(slot, blk_sz, fdb, desc_sz,
                                         g, bm_blk, ibm_blk, itab_blk,
                                         free_blocks_this_group,
                                         free_inodes_this_group,
-                                        inode_table_blocks) != 0:
+                                        inode_table_blocks,
+                                        bbm_csum, ibm_csum, ipg) != 0:
             return EXT4_RESIZE_EIO
 
         added_blocks = added_blocks + group_blocks
@@ -11892,10 +12401,29 @@ def ext4_resize_grow(slot: int32, new_blocks_count: uint64) -> int32:
                     g, free_blocks_this_group)
         g = g + 1
 
-    # 5) Update primary SB and write it back.
-    new_total_blocks: uint64 = cur_blocks + added_blocks
+    # 4.5) Fix the OLD last group's padding. Before the grow its bitmap
+    # marked blocks at/after the old s_blocks_count as padding (used);
+    # raising s_blocks_count turns those into real free data blocks, so
+    # their bits must be cleared and the group's free count + csums
+    # refreshed. `tail_freed` is folded into the SB free-block total.
+    tail_freed: int64 = _ext4_resize_fixup_old_tail(
+        slot, blk_sz, fdb, desc_sz, bpg,
+        old_groups - 1, cur_blocks, new_blocks, cpg)
+    if tail_freed < 0:
+        printk0("[ext4_resize] old-tail padding fixup FAILED\n")
+        return EXT4_RESIZE_EIO
+    if tail_freed > 0:
+        printk2("[ext4_resize_grow]   old tail group %d freed +%d pad block(s)\n",
+                old_groups - 1, cast[uint64](tail_freed))
+
+    # 5) Update primary SB and write it back. The total block count is
+    # the whole-group target (fdb + new_groups*bpg), NOT cur_blocks +
+    # appended-group blocks — the latter omits the first_data_block
+    # offset and the padding blocks the old tail group just reclaimed.
+    new_total_blocks: uint64 = new_blocks
     new_total_inodes: uint64 = cast[uint64](cur_inodes) + added_inodes
-    new_free_blocks: uint64 = cur_free_blocks + added_free_blocks
+    new_free_blocks: uint64 = cur_free_blocks + added_free_blocks \
+                              + cast[uint64](tail_freed)
     new_free_inodes: uint64 = cast[uint64](cur_free_inodes) \
                               + added_free_inodes
 
@@ -11958,6 +12486,16 @@ def ext4_resize_grow(slot: int32, new_blocks_count: uint64) -> int32:
         printk0("[ext4_resize_grow] cleared COMPAT_RESIZE_INODE + s_reserved_gdt_blocks\n")
         printk0("[ext4_resize_grow]   (inode #7 reservations are stale post-grow)\n")
 
+    # Recompute s_checksum LAST, over the now-final SB image. crc32c of
+    # the 1 KiB superblock minus the trailing 4-byte field. No-op when
+    # metadata_csum is off (the field is reserved there). Must run after
+    # every other SB field mutation above so the digest covers them.
+    if ext4_resize_metadata_csum != 0:
+        sb_c: uint32 = _ext4_resize_sb_csum_seed(sb)
+        _ext4_write_u32(
+            cast[Ptr[uint8]](cast[uint64](sb) + EXT4_SB_OFF_CHECKSUM),
+            sb_c)
+
     # Superblock lives at byte offset 1024 (= sectors 2..3). Our
     # scratch buffer holds the 1 KiB SB at offset 0; write_sectors
     # takes a 1024-byte chunk = 2 sectors.
@@ -11979,6 +12517,7 @@ def ext4_resize_grow(slot: int32, new_blocks_count: uint64) -> int32:
     printk2("[ext4_resize_grow]       inodes %d -> %d\n",
             cast[uint64](cur_inodes), new_total_inodes)
     return EXT4_RESIZE_OK
+
 
 
 # --- extended attributes (xattr) + POSIX ACLs ---------------------
