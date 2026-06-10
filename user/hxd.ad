@@ -1,0 +1,442 @@
+# user/hxd.ad
+#
+# Hamnix `hxd` — an interactive, full-screen hex + ASCII file viewer, the
+# Hamnix analogue of `xxd` / `hexdump -C` but scrollable in a terminal TUI.
+#
+#   hxd <file>
+#
+# WHAT IT DOES
+#   Renders classic hex-dump rows: an 8-hex-digit byte offset, then 16
+#   bytes shown as two-digit hex (grouped 8 + 8 with a gap), then an ASCII
+#   gutter (printable bytes shown literally, everything else as '.'). The
+#   view scrolls a row or a page at a time; a bottom status line shows the
+#   filename, the current byte offset, the total file size and a percent.
+#
+# FILESYSTEM FACTS (this OS)
+#   * There is NO stat(2) / fstat(2). File SIZE is taken exactly as
+#     user/stat.ad and user/hdu.ad do it: sys_open + sys_lseek(fd, 0,
+#     SEEK_END) returns the byte length. We then seek back and read only
+#     the bytes currently visible on screen, so an arbitrarily large file
+#     never has to be slurped into RAM — each repaint pages from disk.
+#
+# INPUT MODEL (copied verbatim from user/hamfm.ad / user/hdu.ad / hlog)
+#   hxd owns the raw console: fd 0/1/2 are bound to the raw console with
+#   NO kernel line-cooking and NO echo. It reads one keystroke at a time
+#   off fd 0 with sys_read_nb + sys_yield and repaints the whole screen
+#   with ANSI escapes on every state change. Arrow keys arrive a byte at a
+#   time (ESC '[' A/B ...) and are reassembled by a tiny state machine;
+#   PgUp/PgDn arrive as ESC '[' <n> '~' with a numeric accumulator.
+#
+# KEYS
+#   j / Down      scroll down one row
+#   k / Up        scroll up one row
+#   PgDn / Space  page down
+#   PgUp          page up
+#   g / Home      jump to the top of the file
+#   G / End       jump to the end of the file
+#   q             quit (restores the cursor, clears the screen, exit 0)
+#
+# Never spawns a child (a detached rfork from inside a windowed child hits
+# a known-buggy path) — everything is done in-process.
+
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_lseek(fd: int32, offset: int64, whence: int32) -> int64
+extern def sys_yield() -> int32
+
+
+# --- capacity --------------------------------------------------------
+SCREEN_ROWS: uint64 = 22            # visible hex rows (status bar is +1)
+BYTES_PER_ROW: uint64 = 16          # bytes shown on each row
+SEEK_END:    int32 = 2
+SEEK_SET:    int32 = 0
+NAME_CAP:    uint64 = 256          # bytes stored of the filename for the bar
+
+# Per-page disk buffer: SCREEN_ROWS * BYTES_PER_ROW = 22 * 16 = 352 bytes.
+page_buf: Array[352, uint8]
+page_len: uint64 = 0               # live bytes read into page_buf this paint
+
+# A single rendered output row is assembled here before one sys_write.
+#   8 (offset) + 2 (": ") + 16*3 (hex bytes) + 1 (group gap) + 2 ("  ")
+#   + 16 (ascii) + slack
+row_out: Array[128, uint8]
+
+# Filename for the status bar (NUL-terminated, capped).
+name_buf: Array[256, uint8]
+name_len: uint64 = 0
+
+fd: int32 = -1
+file_size: uint64 = 0              # total bytes in the file
+top: uint64 = 0                    # byte offset of the first visible row
+
+running: int32 = 1
+
+# Escape-parser state: 0 ground, 1 saw ESC, 2 saw ESC[ (CSI).
+esc_state: int32 = 0
+esc_param: uint64 = 0
+
+
+# ====================================================================
+# Small string helpers
+# ====================================================================
+def cstr_len(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_cstr(fd_w: int32, s: Ptr[uint8]):
+    sys_write(fd_w, s, cstr_len(s))
+
+
+# 0..9 -> '0'..'9' (48..57); 10..15 -> 'a'..'f' (97..102). Lowercase hex.
+def hex_digit(v: uint8) -> uint8:
+    if v < 10:
+        return v + 48
+    return v + 87
+
+
+# Write an unsigned decimal number to fd 1.
+def write_u64(v: uint64):
+    if v == 0:
+        write_cstr(1, cast[Ptr[uint8]]("0"))
+        return
+    tmp: Array[20, uint8]
+    n: uint64 = 0
+    while v > 0:
+        tmp[n] = cast[uint8](48 + v % 10)
+        v = v / 10
+        n = n + 1
+    out: Array[20, uint8]
+    i: uint64 = 0
+    while i < n:
+        out[i] = tmp[n - 1 - i]
+        i = i + 1
+    sys_write(1, &out[0], n)
+
+
+# ====================================================================
+# Geometry helpers
+# ====================================================================
+# Total number of hex rows in the whole file (a trailing partial row,
+# e.g. a 1-byte tail, still counts as one row). An empty file is 0 rows.
+def total_rows() -> uint64:
+    if file_size == 0:
+        return 0
+    return (file_size + BYTES_PER_ROW - 1) / BYTES_PER_ROW
+
+
+# Greatest valid `top` (in bytes): the file's last full screen, snapped to
+# a row boundary. Always a multiple of BYTES_PER_ROW.
+def max_top() -> uint64:
+    tr: uint64 = total_rows()
+    if tr <= SCREEN_ROWS:
+        return 0
+    return (tr - SCREEN_ROWS) * BYTES_PER_ROW
+
+
+def clamp_top():
+    mt: uint64 = max_top()
+    if top > mt:
+        top = mt
+    # Keep `top` row-aligned regardless of how it was nudged.
+    top = (top / BYTES_PER_ROW) * BYTES_PER_ROW
+
+
+# ====================================================================
+# Disk paging: read the SCREEN_ROWS*BYTES_PER_ROW window at `top`.
+# ====================================================================
+def load_page():
+    page_len = 0
+    if fd < 0:
+        return
+    if top >= file_size:
+        return
+    want: uint64 = SCREEN_ROWS * BYTES_PER_ROW
+    avail: uint64 = file_size - top
+    if want > avail:
+        want = avail
+    if sys_lseek(fd, cast[int64](top), SEEK_SET) < 0:
+        return
+    got_total: uint64 = 0
+    while got_total < want:
+        chunk: int64 = sys_read(fd, cast[Ptr[uint8]](cast[uint64](&page_buf[0]) + got_total), want - got_total)
+        if chunk <= 0:
+            break
+        got_total = got_total + cast[uint64](chunk)
+    page_len = got_total
+
+
+# ====================================================================
+# Rendering
+# ====================================================================
+# Build one hex-dump row covering [row_off, row_off+16) into row_out and
+# write it. `base` is the index into page_buf where this row's bytes live;
+# `nbytes` is how many of the 16 bytes actually exist (the rest are blank).
+def draw_row(row_off: uint64, base: uint64, nbytes: uint64):
+    p: uint64 = 0
+    # 8-hex-digit offset.
+    shift: int64 = 28
+    while shift >= 0:
+        nib: uint8 = cast[uint8]((row_off >> cast[uint64](shift)) & 15)
+        row_out[p] = hex_digit(nib)
+        p = p + 1
+        shift = shift - 4
+    row_out[p] = 58                 # ':'
+    p = p + 1
+    row_out[p] = 32                 # ' '
+    p = p + 1
+    # 16 bytes of hex, grouped 8 + 8 with an extra gap between halves.
+    b: uint64 = 0
+    while b < BYTES_PER_ROW:
+        if b == 8:
+            row_out[p] = 32         # gap between the two 8-byte groups
+            p = p + 1
+        if b < nbytes:
+            v: uint8 = page_buf[base + b]
+            row_out[p] = hex_digit(v >> 4)
+            p = p + 1
+            row_out[p] = hex_digit(v & 15)
+            p = p + 1
+        else:
+            row_out[p] = 32         # blank slot past EOF
+            p = p + 1
+            row_out[p] = 32
+            p = p + 1
+        row_out[p] = 32             # trailing space after each byte
+        p = p + 1
+    # ASCII gutter, bracketed.
+    row_out[p] = 32
+    p = p + 1
+    row_out[p] = 124                # '|'
+    p = p + 1
+    a: uint64 = 0
+    while a < nbytes:
+        c: uint8 = page_buf[base + a]
+        if c >= 32 and c < 127:
+            row_out[p] = c
+        else:
+            row_out[p] = 46         # '.'
+        p = p + 1
+        a = a + 1
+    row_out[p] = 124                # '|'
+    p = p + 1
+    sys_write(1, &row_out[0], p)
+
+
+def redraw():
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[?25l\x1b[H"))
+    # Header (reverse video).
+    write_cstr(1, cast[Ptr[uint8]]("\r\x1b[K\x1b[7m hxd  "))
+    if name_len > 0:
+        sys_write(1, &name_buf[0], name_len)
+    write_cstr(1, cast[Ptr[uint8]]("   "))
+    write_u64(file_size)
+    write_cstr(1, cast[Ptr[uint8]](" bytes\x1b[0m\r\n"))
+
+    load_page()
+    r: uint64 = 0
+    while r < SCREEN_ROWS:
+        write_cstr(1, cast[Ptr[uint8]]("\r\x1b[K"))
+        row_off: uint64 = top + r * BYTES_PER_ROW
+        base: uint64 = r * BYTES_PER_ROW
+        if base < page_len:
+            nbytes: uint64 = page_len - base
+            if nbytes > BYTES_PER_ROW:
+                nbytes = BYTES_PER_ROW
+            draw_row(row_off, base, nbytes)
+        write_cstr(1, cast[Ptr[uint8]]("\r\n"))
+        r = r + 1
+
+    # Status bar: filename, current offset, total, percent.
+    write_cstr(1, cast[Ptr[uint8]]("\r\x1b[K\x1b[7m "))
+    if name_len > 0:
+        sys_write(1, &name_buf[0], name_len)
+    write_cstr(1, cast[Ptr[uint8]]("  off "))
+    write_u64(top)
+    write_cstr(1, cast[Ptr[uint8]]("/"))
+    write_u64(file_size)
+    write_cstr(1, cast[Ptr[uint8]]("  "))
+    pct: uint64 = 0
+    mt: uint64 = max_top()
+    if mt > 0:
+        pct = (top * 100) / mt
+    else:
+        if file_size > 0:
+            pct = 100
+    if pct > 100:
+        pct = 100
+    write_u64(pct)
+    write_cstr(1, cast[Ptr[uint8]]("%  j/k scroll  Space/PgDn  PgUp  g/G top/end  q quit"))
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[0m"))
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[H"))
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[?25h"))
+
+
+# ====================================================================
+# Scrolling actions (always clamped at both ends)
+# ====================================================================
+def scroll_down():
+    mt: uint64 = max_top()
+    if top + BYTES_PER_ROW <= mt:
+        top = top + BYTES_PER_ROW
+    else:
+        top = mt
+
+
+def scroll_up():
+    if top >= BYTES_PER_ROW:
+        top = top - BYTES_PER_ROW
+    else:
+        top = 0
+
+
+def page_down():
+    top = top + SCREEN_ROWS * BYTES_PER_ROW
+    clamp_top()
+
+
+def page_up():
+    step: uint64 = SCREEN_ROWS * BYTES_PER_ROW
+    if top >= step:
+        top = top - step
+    else:
+        top = 0
+    clamp_top()
+
+
+def go_top():
+    top = 0
+
+
+def go_end():
+    top = max_top()
+
+
+# ====================================================================
+# Key dispatch + escape state machine (modelled on user/hamfm.ad)
+# ====================================================================
+def dispatch(c: uint8):
+    if c == 113:                        # 'q' — quit
+        running = 0
+    elif c == 106:                      # 'j' — down
+        scroll_down()
+    elif c == 107:                      # 'k' — up
+        scroll_up()
+    elif c == 32:                       # Space — page down
+        page_down()
+    elif c == 103:                      # 'g' — top
+        go_top()
+    elif c == 71:                       # 'G' — end
+        go_end()
+
+
+def feed_byte(c: uint8):
+    if esc_state == 1:
+        if c == 91:                     # '[' — CSI
+            esc_state = 2
+            esc_param = 0
+            return
+        esc_state = 0
+        dispatch(c)
+        return
+    if esc_state == 2:
+        if c >= 48 and c <= 57:         # accumulate a numeric parameter
+            esc_param = esc_param * 10 + cast[uint64](c - 48)
+            return
+        esc_state = 0
+        if c == 65:                     # Up
+            scroll_up()
+        elif c == 66:                   # Down
+            scroll_down()
+        elif c == 72:                   # 'H' — Home
+            go_top()
+        elif c == 70:                   # 'F' — End
+            go_end()
+        elif c == 126:                  # '~' — PgUp/PgDn/Home/End finalizer
+            if esc_param == 6:          # ESC [ 6 ~ — Page Down
+                page_down()
+            elif esc_param == 5:        # ESC [ 5 ~ — Page Up
+                page_up()
+            elif esc_param == 1:        # ESC [ 1 ~ — Home
+                go_top()
+            elif esc_param == 7:        # ESC [ 7 ~ — Home (rxvt)
+                go_top()
+            elif esc_param == 4:        # ESC [ 4 ~ — End
+                go_end()
+            elif esc_param == 8:        # ESC [ 8 ~ — End (rxvt)
+                go_end()
+        return
+    if c == 27:
+        esc_state = 1
+        return
+    dispatch(c)
+
+
+# ====================================================================
+# Setup
+# ====================================================================
+# Copy argv[1] into name_buf (NUL-terminated, capped at NAME_CAP-1).
+def set_name(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and i < NAME_CAP - 1:
+        name_buf[i] = s[i]
+        i = i + 1
+    name_buf[i] = 0
+    name_len = i
+
+
+# ====================================================================
+# Main loop
+# ====================================================================
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_cstr(2, cast[Ptr[uint8]]("usage: hxd <file>\n"))
+        return 1
+
+    set_name(cast[Ptr[uint8]](argv[1]))
+
+    fd = sys_open(cast[Ptr[char]](argv[1]))
+    if fd < 0:
+        write_cstr(2, cast[Ptr[uint8]]("hxd: cannot open "))
+        write_cstr(2, &name_buf[0])
+        write_cstr(2, cast[Ptr[uint8]]("\n"))
+        return 1
+
+    sz: int64 = sys_lseek(fd, 0, SEEK_END)
+    if sz < 0:
+        file_size = 0
+    else:
+        file_size = cast[uint64](sz)
+    sys_lseek(fd, 0, SEEK_SET)
+
+    top = 0
+
+    # Readiness banner: a stable one-line marker emitted to stdout BEFORE
+    # the first repaint so a driving test can poll the serial log and only
+    # send navigation keys once hxd owns the raw console (no ANSI so it
+    # survives screen clears in the log). Mirrors hdu's HDU_READY.
+    write_cstr(1, cast[Ptr[uint8]]("HXD_READY\n"))
+
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[2J\x1b[H"))
+    redraw()
+
+    rb: Array[1, uint8]
+    while running != 0:
+        n: int64 = sys_read_nb(0, &rb[0], 1)
+        if n < 0:
+            break
+        if n == 0:
+            sys_yield()
+            continue
+        feed_byte(rb[0])
+        if running != 0:
+            redraw()
+
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[2J\x1b[H\x1b[?25h"))
+    sys_close(fd)
+    return 0
