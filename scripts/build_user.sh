@@ -174,6 +174,8 @@ build_adder_user hamterm              # hamui GUI terminal: runs commands via re
 build_adder_user hamedit              # hamui GUI text editor: open/save real files
 build_adder_user hamfiles             # hamui GUI file browser: sys_listdir + launch hamedit
 build_adder_user hamde                # hamui-based DE panel (Applications menu + clock + taskbar)
+build_adder_user hamcalc              # integer calculator on the hamui toolkit (lib/hamui.ad)
+build_adder_user hamclock             # clock + stopwatch on the hamui toolkit (lib/hamui.ad)
 build_adder_user top                  # M16.87: one-shot /proc dashboard
 build_adder_user ifconfig             # M16.87: stub lo 127.0.0.1/8
 build_adder_user ping                 # native Adder ping: Plan-9-shaped /net/icmp client
