@@ -39,26 +39,28 @@
 # convenience <button>/<input> tags hard-code their own colours, so the
 # toolkit draws its own chrome for full theming control.
 #
-# EVENTS — and the limitation we hit
-# ==================================
+# EVENTS — per-window structured event files
+# ===========================================
 # The compositor OWNS pointer routing (focus window, click/drag/scroll)
-# and gates the keyboard internally; it does NOT expose a per-window
-# structured pointer/focus event file a client can read. The thinnest
-# client-consumable surfaces the existing channels allow are:
-#   * /dev/mouse  — one ASCII line per event "<dx> <dy> <buttons> <dz>"
-#                   (RELATIVE deltas + a button bitmap bit0=L bit1=R
-#                   bit2=M). We accumulate deltas into an absolute cursor
-#                   ourselves and clamp to the window.
-#   * fd 0 (stdin / the console) — typed characters for the focused entry.
-# So hamui_run() polls /dev/mouse + stdin, hit-tests the widget tree, and
-# dispatches. LIMITATION: because the pointer is relative and not
-# window-routed, a real multi-window DE needs the compositor to expose a
-# per-window pointer-event file (absolute x/y in window space + buttons,
-# already known to the compositor's router) and a key-event file for the
-# focused window. Adding those compositor event APIs is a deliberate
-# FOLLOW-UP — out of scope here, flagged in the report. The event loop
-# below is structured so that swapping the input source for such a file
-# is a one-function change (see _hamui_poll_pointer / _hamui_poll_keys).
+# and gates the keyboard internally, and now EXPOSES that per window via
+# two structured event files under /dev/wsys/<wid>/ :
+#   * /dev/wsys/<wid>/pointer — one ASCII line per ROUTED pointer event
+#                   "<type> <x> <y> <buttons> <dz>\n". type: m=motion
+#                   d=button-down u=button-up s=scroll. x,y are ABSOLUTE
+#                   WINDOW-LOCAL pixels (the compositor already mapped
+#                   screen->window for this target window), so we set the
+#                   cursor directly — no delta accumulation, no clamp.
+#                   buttons = decimal bitmap (bit0=L bit1=R bit2=M),
+#                   dz = signed scroll notch.
+#   * /dev/wsys/<wid>/keys — one ASCII line per key event for the FOCUSED
+#                   window only, "<type> <code>\n" (type d=press), where
+#                   `code` is the byte/keycode fed to _h_dispatch_key
+#                   exactly as a stdin byte used to be.
+# So hamui_run() polls /dev/wsys/<wid>/{pointer,keys} (NON-BLOCKING, so one
+# source never stalls the other), hit-tests the widget tree, and
+# dispatches. The toolkit isolates ALL input in _h_poll_pointer /
+# _h_poll_keys; nothing downstream (hit-test / click / scroll / key
+# routing) changed.
 #
 # COMPILER QUIRKS HONOURED (see memory/feedback_compiler_quirks)
 # ==============================================================
@@ -120,7 +122,7 @@ HAMUI_K_TEXTVIEW:  int32 = 25        # multi-line editable text
 HAMUI_K_GRID:      int32 = 26        # grid container (cell coords + span)
 HAMUI_K_DIALOG:    int32 = 27        # modal overlay container
 
-# Mouse button bitmap (from /dev/mouse).
+# Pointer button bitmap (from /dev/wsys/<wid>/pointer "buttons" field).
 HAMUI_BTN_L: int32 = 1
 
 # Alignment constants for halign/valign.
@@ -218,11 +220,16 @@ w_count: uint64 = 0
 win_wid:   int32 = -1
 win_root:  int32 = -1                # root widget id
 win_focus: int32 = -1                # focused widget id (-1 none)
-# Absolute cursor, accumulated from /dev/mouse relative deltas.
+# Absolute WINDOW-LOCAL cursor. The compositor now delivers absolute
+# window-space x/y on /dev/wsys/<wid>/pointer, so we set this directly from
+# each event rather than accumulating relative deltas.
 cur_x:     int32 = 320
 cur_y:     int32 = 240
 prev_btn:  int32 = 0                 # button bitmap from the previous poll
-mouse_fd:  int32 = -1
+# Per-window event-file fds (opened lazily, cached). -1 = not yet open / no
+# compositor window for this wid.
+pointer_fd: int32 = -1
+keys_fd:    int32 = -1
 # Damage/dirty tracking: the tree is dirty (needs relayout+repaint) until
 # the first paint, and again whenever state mutates. hamui_step() only
 # emits markup when this is set, so unchanged frames write nothing.
@@ -317,6 +324,17 @@ def _h_build_path(wid: int32, layer: Ptr[uint8], leaf: Ptr[uint8]):
     path_buf[i] = 0
 
 
+# Build "/dev/wsys/<wid>/<leaf>" (the per-window event/control files that
+# live directly under the wid dir, e.g. "pointer" / "keys") into path_buf.
+def _h_build_wsys_path(wid: int32, leaf: Ptr[uint8]):
+    i: uint64 = 0
+    i = _h_puts(&path_buf[0], i, "/dev/wsys/")
+    i = i + _h_u32_to_dec(cast[uint32](wid), &path_buf[i])
+    i = _h_putc(&path_buf[0], i, 47)                 # '/'
+    i = _h_puts(&path_buf[0], i, leaf)
+    path_buf[i] = 0
+
+
 # ====================================================================
 # Widget construction API (the public, GTK/Qt-flavoured surface).
 # Every constructor returns a widget id (int32). Attach a child to a
@@ -396,7 +414,8 @@ def hamui_init():
     cur_x = 320
     cur_y = 240
     prev_btn = 0
-    mouse_fd = -1
+    pointer_fd = -1
+    keys_fd = -1
     tree_dirty = 1
 
 
@@ -2404,8 +2423,26 @@ def _h_dispatch_key(c: uint8):
         _h_tv_insert(win_focus, c)
 
 
-# Parse one /dev/mouse line "<dx> <dy> <buttons> <dz>" -> accumulate.
-mouse_line: Array[64, uint8]
+# Event-line scratch. The compositor delivers per-window event lines on
+# /dev/wsys/<wid>/{pointer,keys}; one non-blocking read may return several
+# whole '\n'-terminated lines, so the buffer holds a batch.
+HAMUI_EV_BUF: uint64 = 256
+pointer_buf: Array[256, uint8]
+keys_buf:    Array[256, uint8]
+
+# Read the leading event-type char (skipping spaces/tabs), advancing pos
+# past it. Returns 0 if none remain.
+def _h_parse_type(buf: Ptr[uint8], pos: Ptr[uint64], cap: uint64) -> uint8:
+    i: uint64 = pos[0]
+    while i < cap and (buf[i] == 32 or buf[i] == 9):
+        i = i + 1
+    if i >= cap:
+        pos[0] = i
+        return 0
+    c: uint8 = buf[i]
+    pos[0] = i + 1
+    return c
+
 
 def _h_parse_signed(buf: Ptr[uint8], pos: Ptr[uint64], cap: uint64) -> int32:
     i: uint64 = pos[0]
@@ -2455,65 +2492,107 @@ def _h_route_scroll(px: int32, py: int32, dz: int32):
         i = i - 1
 
 
-# Poll the pointer once (non-blocking). Returns 1 if a fresh L-button
-# press edge fired a click this poll, else 0. NOTE: swap this body for a
-# per-window pointer-event file read when the compositor grows one.
+# Advance `pos` to just past the next '\n' (or to `cap` if the buffer ends
+# without one — a partial tail line is then dropped, which is acceptable:
+# the compositor enqueues whole lines and our buffer batches several).
+def _h_skip_line(buf: Ptr[uint8], pos: Ptr[uint64], cap: uint64):
+    i: uint64 = pos[0]
+    while i < cap and buf[i] != 10:
+        i = i + 1
+    if i < cap:
+        i = i + 1                                     # consume the '\n'
+    pos[0] = i
+
+
+# Poll the pointer once (non-blocking) from /dev/wsys/<wid>/pointer.
+# Returns 1 if a fresh L-button press edge fired a click (or a scroll)
+# this poll, else 0. x/y arrive as ABSOLUTE WINDOW-LOCAL coords already
+# routed by the compositor, so we set the cursor directly (no delta accum,
+# no clamp). Lines: "<type> <x> <y> <buttons> <dz>\n".
 def _h_poll_pointer() -> int32:
-    if mouse_fd < 0:
-        mouse_fd = sys_open(cast[Ptr[char]]("/dev/mouse"))
-    if mouse_fd < 0:
-        return 0
+    if pointer_fd < 0:
+        _h_build_wsys_path(win_wid, "pointer")
+        pointer_fd = sys_open(cast[Ptr[char]](&path_buf[0]))
+    if pointer_fd < 0:
+        return 0                                      # no window -> no-op
     clicked: int32 = 0
-    n: int64 = sys_read_nb(mouse_fd, &mouse_line[0], 63)
+    n: int64 = sys_read_nb(pointer_fd, &pointer_buf[0], HAMUI_EV_BUF - 1)
     while n > 0:
+        cap: uint64 = cast[uint64](n)
         pos: Array[1, uint64]
         pos[0] = 0
-        cap: uint64 = cast[uint64](n)
-        dx: int32 = _h_parse_signed(&mouse_line[0], &pos[0], cap)
-        dy: int32 = _h_parse_signed(&mouse_line[0], &pos[0], cap)
-        btn: int32 = _h_parse_signed(&mouse_line[0], &pos[0], cap)
-        dz: int32 = _h_parse_signed(&mouse_line[0], &pos[0], cap)
-        cur_x = cur_x + dx
-        cur_y = cur_y + dy
-        if cur_x < 0:
-            cur_x = 0
-        if cur_x >= cast[int32](HAMUI_WIN_W):
-            cur_x = cast[int32](HAMUI_WIN_W) - 1
-        if cur_y < 0:
-            cur_y = 0
-        if cur_y >= cast[int32](HAMUI_WIN_H):
-            cur_y = cast[int32](HAMUI_WIN_H) - 1
-        # Rising edge of the left button == a click.
-        was_l: int32 = prev_btn & HAMUI_BTN_L
-        is_l: int32 = btn & HAMUI_BTN_L
-        if is_l != 0 and was_l == 0:
-            _h_route_click(cur_x, cur_y)
-            clicked = 1
-            tree_dirty = 1
-        # Wheel scroll over a scrolledwindow / textview under the cursor.
-        if dz != 0:
-            _h_route_scroll(cur_x, cur_y, dz)
-            clicked = 1
-            tree_dirty = 1
-        prev_btn = btn
-        n = sys_read_nb(mouse_fd, &mouse_line[0], 63)
+        while pos[0] < cap:
+            t: uint8 = _h_parse_type(&pointer_buf[0], &pos[0], cap)
+            if t == 0:
+                break
+            x:   int32 = _h_parse_signed(&pointer_buf[0], &pos[0], cap)
+            y:   int32 = _h_parse_signed(&pointer_buf[0], &pos[0], cap)
+            btn: int32 = _h_parse_signed(&pointer_buf[0], &pos[0], cap)
+            dz:  int32 = _h_parse_signed(&pointer_buf[0], &pos[0], cap)
+            _h_skip_line(&pointer_buf[0], &pos[0], cap)
+            # Absolute window-local position — set directly.
+            cur_x = x
+            cur_y = y
+            if t == 100:                              # 'd' button-down
+                # Left-button press edge == a click (router already chose us).
+                if (btn & HAMUI_BTN_L) != 0 and (prev_btn & HAMUI_BTN_L) == 0:
+                    _h_route_click(cur_x, cur_y)
+                    clicked = 1
+                    tree_dirty = 1
+                prev_btn = btn
+            elif t == 117:                            # 'u' button-up
+                prev_btn = btn
+            elif t == 115:                            # 's' scroll
+                if dz != 0:
+                    _h_route_scroll(cur_x, cur_y, dz)
+                    clicked = 1
+                    tree_dirty = 1
+            else:                                     # 'm' motion (or other)
+                # A motion line still carries the live button bitmap; track
+                # it so a press that arrives folded into motion still edges.
+                if (btn & HAMUI_BTN_L) != 0 and (prev_btn & HAMUI_BTN_L) == 0:
+                    _h_route_click(cur_x, cur_y)
+                    clicked = 1
+                    tree_dirty = 1
+                prev_btn = btn
+                # Some compositors fold scroll into a nonzero dz on any line.
+                if dz != 0:
+                    _h_route_scroll(cur_x, cur_y, dz)
+                    clicked = 1
+                    tree_dirty = 1
+        n = sys_read_nb(pointer_fd, &pointer_buf[0], HAMUI_EV_BUF - 1)
     return clicked
 
 
-key_buf: Array[16, uint8]
-
-# Poll the keyboard (stdin) once, non-blocking. Returns chars consumed.
-# NOTE: swap for a per-window key-event file when the compositor grows one.
+# Poll the keyboard once (non-blocking) from /dev/wsys/<wid>/keys. The
+# compositor gates the keyboard and only feeds the FOCUSED window's queue.
+# Lines: "<type> <code>\n" with type 'd'=press; we feed `code` bytes to the
+# existing key dispatch exactly as stdin bytes were fed before (so the
+# backspace / arrow-ESC-sequence / caret editing behaviour is preserved).
 def _h_poll_keys() -> int32:
-    n: int64 = sys_read_nb(0, &key_buf[0], 16)
-    if n <= 0:
-        return 0
-    i: uint64 = 0
-    while i < cast[uint64](n):
-        _h_dispatch_key(key_buf[i])
-        i = i + 1
-    tree_dirty = 1
-    return cast[int32](n)
+    if keys_fd < 0:
+        _h_build_wsys_path(win_wid, "keys")
+        keys_fd = sys_open(cast[Ptr[char]](&path_buf[0]))
+    if keys_fd < 0:
+        return 0                                      # no window -> no-op
+    consumed: int32 = 0
+    n: int64 = sys_read_nb(keys_fd, &keys_buf[0], HAMUI_EV_BUF - 1)
+    while n > 0:
+        cap: uint64 = cast[uint64](n)
+        pos: Array[1, uint64]
+        pos[0] = 0
+        while pos[0] < cap:
+            t: uint8 = _h_parse_type(&keys_buf[0], &pos[0], cap)
+            if t == 0:
+                break
+            code: int32 = _h_parse_signed(&keys_buf[0], &pos[0], cap)
+            _h_skip_line(&keys_buf[0], &pos[0], cap)
+            if t == 100:                              # 'd' press/typed
+                _h_dispatch_key(cast[uint8](code))
+                consumed = consumed + 1
+                tree_dirty = 1
+        n = sys_read_nb(keys_fd, &keys_buf[0], HAMUI_EV_BUF - 1)
+    return consumed
 
 
 # One render+dispatch step: poll input, and if anything changed, relayout
