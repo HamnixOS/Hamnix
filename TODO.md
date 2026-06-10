@@ -71,24 +71,51 @@ replaces the ~70 `is_*_path` backend-selection branches).
 ## Now — useful-system gap fill
 
 1. [ ] **hamUI Phase 4d** — bitmap font store (mono/sans/serif BDF).
-2. [ ] **`lib/hamui.ad` — GTK/Qt-style widget toolkit (NEXT MAJOR TRACK)**
-   — retained-mode widget library wrapping H-§G over the
-   `/dev/wsys/<wid>/draw/<layer>/{markup,fb}` protocol
-   (Window/Layer/Rect/Text/Image/Button/Input/Event + event loop +
-   layout/containers). Make GUI apps easy to write, GTK/Qt-style.
-   See [[memory/project_app_language_decision]] — Adder + hamsh,
-   no third tier. **Gated behind the DE-input/efficiency rework
-   landing** (that agent owns `user/hamUId.ad`; the toolkit builds on
-   the same compositor input/event plumbing — don't dispatch until it
-   merges or they collide).
+2. [~] **`lib/hamui.ad` — GTK/Qt-style widget toolkit (CURRENT PRIMARY
+   TRACK)** — retained-mode widget library over the
+   `/dev/wsys/<wid>/draw/<layer>/{markup,fb}` protocol. v1 LANDED
+   (`3a45c4de`, 980 lines): box/fixed containers + label/button/entry/
+   checkbox/list, measure+arrange layout, pull-based event model,
+   /dev/mouse + stdin input polling. See [[memory/project_gui_toolkit_de_rewrite]].
+   **User directive 2026-06-10: make this "epic" — MATE-class — BEFORE
+   the DE rewrite.** Required before #3 is unlocked:
+   - [ ] **Widget set**: menu/menubar, scrolledwindow + scrolling,
+     dialog/modal, notebook/tabs, radio (grouped), slider/scale,
+     spinbutton, combobox, progressbar, separator, image, toolbar,
+     statusbar, treeview/grid, multi-line editable textview.
+   - [ ] **Layout**: grid container; per-widget align/expand/fill
+     (hexpand/vexpand/halign/valign) so panels and dialogs lay out like
+     GTK; min/natural size negotiation.
+   - [ ] **Dynamic editing**: insert/delete at caret, cursor movement,
+     selection — not just append-only (terminal + text editor need it).
+   - [ ] **Widget destruction** + damage/dirty tracking (repaint only
+     changed regions, not the whole buffer every frame).
+   - [ ] **Real per-window input** — depends on #2b below (compositor
+     event file). Until it lands, keep the /dev/mouse + stdin shim; the
+     swap is a one-function change (`_h_poll_pointer`/`_h_poll_keys`).
+2b. [ ] **Compositor per-window input event file** (DISJOINT track,
+   owns `user/hamUId.ad` + `devwsys.ad`, NOT `lib/hamui.ad`) — expose a
+   per-window pointer-event file (absolute window-space x/y + button
+   bitmap, already known to the compositor router) and a key-event file
+   for the focused window. This is the #1 blocker for real multi-window
+   interactivity; toolkit input swaps onto it once it lands.
 3. [ ] **Rewrite the entire DE on `lib/hamui.ad`** — the current
    `user/hamUId.ad` (~23.6k lines) hand-draws every widget from raw
    framebuffer primitives in one monolith. User directive 2026-06-10:
-   "Writing in primitives like what we are is a terrible idea." Once #2
-   exists, redo the whole desktop environment on top of the toolkit
-   instead of bespoke primitive draws inside the compositor.
-4. [ ] **hamsh `use hamui`** — bindings on top of #2. May require
+   "Writing in primitives like what we are is a terrible idea." **GATED:
+   only start once #2 is MATE-class** (full widget set + grid/align +
+   dynamic editing). Redo the whole desktop environment on top of the
+   toolkit instead of bespoke primitive draws inside the compositor.
+4. [ ] **Basic apps on the toolkit** (after #2 API is stable) — terminal,
+   text editor, file browser, plus games Snake + 2048. These validate the
+   toolkit is genuinely app-grade, and seed the DE app suite.
+5. [ ] **hamsh `use hamui`** — bindings on top of #2. May require
    hamsh extensions for closures + event loop + persistent state.
+
+> **ARM64 is deprioritized below desktop work (user directive 2026-06-10).**
+> Phase 50 (MAP_SHARED across address spaces) preserved on branch
+> `worktree-agent-a48facf53ef25a377` (`6f217d09`), NOT landed. Resume ARM
+> only when the desktop/toolkit track is in good shape.
 
 ## hamUI later phases (after Phase 4)
 
