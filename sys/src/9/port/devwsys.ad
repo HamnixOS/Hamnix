@@ -86,6 +86,112 @@ wsys_slot_in_use: Array[9, int32]
 wsys_slot_pid:    Array[9, uint64]
 
 
+# --- per-window damage / dirty tracking (hot-path fast skip) ---------
+#
+# THE PER-FRAME PROBLEM
+# ---------------------
+# The compositor (user/hamUId.ad) walks every live window each frame and
+# re-reads its full draw markup + the z-ordered draw listing back out of
+# this server — even when nothing about that window changed since the
+# last frame. That is a lot of redundant snapshot/copy work for a static
+# desktop (the common case: most windows idle, one cursor blinking).
+#
+# THE FIX (additive, backward-compatible)
+# ---------------------------------------
+# Every MUTATING write to a window's draw/layer state bumps a per-window
+# 64-bit serial (wsys_win_serial[wid]) and unions the touched layer's
+# geometry into a per-window dirty rectangle. The compositor reads a tiny
+# new file to learn "what changed since serial N" and skips re-reading
+# the windows whose serial it already has:
+#
+#   /dev/wsys/<N>/serial   ->  "<serial>\n"          (this window only)
+#   /dev/wsys/damage       ->  one line per live wid:
+#                              "<wid> <serial> <dx0> <dy0> <dx1> <dy1>\n"
+#                              where dx0..dy1 is the accumulated dirty
+#                              rect since the window was last marked
+#                              clean (an empty rect renders as 0 0 0 0).
+#
+# A serial of 0 never appears for a live window: the counter starts at 1
+# on first mutation and only increases, so the compositor can store "last
+# seen serial = 0" for a brand-new window and is guaranteed to see it as
+# dirty on the first frame. Reading these files has NO side effects — the
+# compositor explicitly acks consumption by writing the serial it has
+# processed back to /dev/wsys/<N>/serial, which folds the dirty rect down
+# (see devwsys_serial_write). That keeps the read path pure (snapshot-
+# once) while still letting the dirty rect reset precisely.
+
+wsys_win_serial: Array[9, uint64]    # 0 = never mutated; monotonic up
+
+# Per-window accumulated dirty rectangle, in window-local pixels. Stored
+# as an inclusive-exclusive box [x0,y0)..[x1,y1). x1<=x0 means "empty".
+wsys_dirty_x0: Array[9, int64]
+wsys_dirty_y0: Array[9, int64]
+wsys_dirty_x1: Array[9, int64]
+wsys_dirty_y1: Array[9, int64]
+
+
+def _wsys_dirty_clear(wid: int32):
+    # Reset a window's dirty rect to empty. Does NOT touch the serial —
+    # the serial is monotonic and only the rect is "consumed".
+    u: uint64 = cast[uint64](wid)
+    wsys_dirty_x0[u] = 0
+    wsys_dirty_y0[u] = 0
+    wsys_dirty_x1[u] = 0
+    wsys_dirty_y1[u] = 0
+
+
+def _wsys_dirty_add(wid: int32, x0: int64, y0: int64,
+                    x1: int64, y1: int64):
+    # Union [x0,y0)..[x1,y1) into the window's accumulated dirty rect.
+    # An x1<=x0 or y1<=y0 box is empty and contributes nothing.
+    if x1 <= x0 or y1 <= y0:
+        return
+    u: uint64 = cast[uint64](wid)
+    if wsys_dirty_x1[u] <= wsys_dirty_x0[u] \
+            or wsys_dirty_y1[u] <= wsys_dirty_y0[u]:
+        # Current rect empty — adopt the incoming box verbatim.
+        wsys_dirty_x0[u] = x0
+        wsys_dirty_y0[u] = y0
+        wsys_dirty_x1[u] = x1
+        wsys_dirty_y1[u] = y1
+        return
+    if x0 < wsys_dirty_x0[u]:
+        wsys_dirty_x0[u] = x0
+    if y0 < wsys_dirty_y0[u]:
+        wsys_dirty_y0[u] = y0
+    if x1 > wsys_dirty_x1[u]:
+        wsys_dirty_x1[u] = x1
+    if y1 > wsys_dirty_y1[u]:
+        wsys_dirty_y1[u] = y1
+
+
+def _wsys_mark_dirty(wid: int32, x0: int64, y0: int64,
+                     x1: int64, y1: int64):
+    # The single choke point every mutating draw write funnels through:
+    # bump the monotonic per-window serial and accumulate the dirty box.
+    # `wid` is assumed already validated live by the caller. Also
+    # invalidates the cached draw listing for this window (the listing
+    # text is regenerated lazily on the next read at the new serial).
+    if wid <= 0:
+        return
+    u: uint64 = cast[uint64](wid)
+    if u >= MAX_WINDOWS:
+        return
+    wsys_win_serial[u] = wsys_win_serial[u] + 1
+    _wsys_dirty_add(wid, x0, y0, x1, y1)
+    _wsys_draw_listing_cache_gen[u] = 0      # force listing-cache miss
+
+
+def wsys_win_serial_get(wid: int32) -> uint64:
+    # Public: the current mutation serial for `wid` (0 = never mutated).
+    if wid <= 0:
+        return 0
+    u: uint64 = cast[uint64](wid)
+    if u >= MAX_WINDOWS:
+        return 0
+    return wsys_win_serial[u]
+
+
 def _wsys_init_if_needed():
     # Lazy init: stamp wid 1 (foreground) as in_use the first time we
     # touch the table. The pid is filled in on the first devcons_write
@@ -380,6 +486,11 @@ def _wsys_reset_rings(wid: int32):
     wsys_cmd_head[u] = 0
     # Drop any draw layers a recycled wid's previous tenant created.
     _wsys_draw_reset_window(wid)
+    # Reset damage tracking so a recycled wid starts with a fresh serial
+    # and an empty dirty rect (the compositor sees it as brand new).
+    wsys_win_serial[u] = 0
+    _wsys_dirty_clear(wid)
+    _wsys_draw_listing_cache_gen[u] = 0
 
 
 # --- ASCII formatting helpers ----------------------------------------
@@ -626,6 +737,105 @@ def devwsys_listing_read(off: uint64, buf: Ptr[uint8],
         return 0
     scratch: Array[1024, uint8]
     n: uint64 = _wsys_render_listing(&scratch[0], 1024)
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+# --- damage / serial files (hot-path fast skip) ----------------------
+
+def devwsys_serial_read(wid: int32, off: uint64, buf: Ptr[uint8],
+                        count: uint64) -> int64:
+    # /dev/wsys/<N>/serial -> "<serial>\n". The window's monotonic
+    # mutation counter (0 = never mutated). The compositor reads this
+    # cheaply per frame; if it equals the value it last composited, the
+    # window is unchanged and the compositor skips re-reading draw/markup.
+    if count == 0:
+        return 0
+    if wsys_wid_in_use(wid) == 0:
+        return -2
+    scratch: Array[32, uint8]
+    u: uint64 = cast[uint64](wid)
+    n: uint64 = _wsys_u64_to_dec(wsys_win_serial[u], &scratch[0])
+    scratch[n] = 10
+    n = n + 1
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_serial_write(wid: int32, buf: Ptr[uint8],
+                         count: uint64) -> int64:
+    # The compositor ACKs a composited serial by writing it back here.
+    # If the acked serial is >= the window's current serial, the dirty
+    # rect is consumed (reset to empty) — the compositor has repainted
+    # everything up to that serial. A stale ack (older than current)
+    # leaves the rect intact so pending damage isn't lost. A digit-less
+    # write is a no-op (mirrors the z/opacity redirect-flush handling).
+    if wsys_wid_in_use(wid) == 0:
+        return -2
+    if _wsys_buf_has_digit(buf, count) == 0:
+        return cast[int64](count)
+    acked: int64 = _wsys_tok_to_i64(buf, 0, count)
+    if acked < 0:
+        return cast[int64](count)
+    u: uint64 = cast[uint64](wid)
+    if cast[uint64](acked) >= wsys_win_serial[u]:
+        _wsys_dirty_clear(wid)
+    return cast[int64](count)
+
+
+def _wsys_render_damage(out: Ptr[uint8], cap: uint64) -> uint64:
+    # /dev/wsys/damage listing. One line per live wid:
+    #   "<wid> <serial> <dx0> <dy0> <dx1> <dy1>\n"
+    # The compositor reads this ONE file per frame, diffs each wid's
+    # serial against its own last-composited table, and only re-reads /
+    # re-composites the windows whose serial advanced — using the dirty
+    # rect to bound the repaint. An empty dirty rect renders "0 0 0 0".
+    _wsys_init_if_needed()
+    pos: uint64 = 0
+    w: uint64 = 1
+    while w < MAX_WINDOWS:
+        if wsys_slot_in_use[w] != 0:
+            if pos + 128 >= cap:
+                break
+            pos = pos + _wsys_u64_to_dec(w, &out[pos])
+            out[pos] = 32
+            pos = pos + 1
+            pos = pos + _wsys_u64_to_dec(wsys_win_serial[w], &out[pos])
+            out[pos] = 32
+            pos = pos + 1
+            # Dirty rect, normalised so an empty box renders as 0 0 0 0.
+            dx0: int64 = wsys_dirty_x0[w]
+            dy0: int64 = wsys_dirty_y0[w]
+            dx1: int64 = wsys_dirty_x1[w]
+            dy1: int64 = wsys_dirty_y1[w]
+            if dx1 <= dx0 or dy1 <= dy0:
+                dx0 = 0
+                dy0 = 0
+                dx1 = 0
+                dy1 = 0
+            pos = _wsys_emit_i64(out, pos, dx0)
+            out[pos] = 32
+            pos = pos + 1
+            pos = _wsys_emit_i64(out, pos, dy0)
+            out[pos] = 32
+            pos = pos + 1
+            pos = _wsys_emit_i64(out, pos, dx1)
+            out[pos] = 32
+            pos = pos + 1
+            pos = _wsys_emit_i64(out, pos, dy1)
+            out[pos] = 10
+            pos = pos + 1
+        w = w + 1
+    return pos
+
+
+def devwsys_damage_read(off: uint64, buf: Ptr[uint8],
+                        count: uint64) -> int64:
+    # wsys-level damage snapshot. Read-only, snapshot-once (honours off so
+    # `cat /dev/wsys/damage` terminates). NO side effects — consumption is
+    # acked per-window via devwsys_serial_write.
+    if count == 0:
+        return 0
+    scratch: Array[1024, uint8]
+    n: uint64 = _wsys_render_damage(&scratch[0], 1024)
     return _wsys_copy_out(&scratch[0], n, off, buf, count)
 
 
@@ -923,7 +1133,13 @@ def devwsys_draw_ctl_write(wid: int32, buf: Ptr[uint8],
         idx: int32 = _wsys_draw_layer_index(wid, np, namelen)
         if idx < 0:
             return cast[int64](count)
-        wsys_layer_in_use[_wsys_draw_base(wid, cast[uint64](idx))] = 0
+        bx: uint64 = _wsys_draw_base(wid, cast[uint64](idx))
+        # Removing a layer dirties the region it occupied (the pixels it
+        # used to cover must be repainted by whatever was behind it).
+        _wsys_mark_dirty(wid, wsys_layer_x[bx], wsys_layer_y[bx],
+                         wsys_layer_x[bx] + wsys_layer_w[bx],
+                         wsys_layer_y[bx] + wsys_layer_h[bx])
+        wsys_layer_in_use[bx] = 0
         return cast[int64](count)
     if _wsys_tok_eq(buf, verb_start, verb_end, "clear") != 0:
         idx2: int32 = _wsys_draw_layer_index(wid, np, namelen)
@@ -932,15 +1148,22 @@ def devwsys_draw_ctl_write(wid: int32, buf: Ptr[uint8],
         b2: uint64 = _wsys_draw_base(wid, cast[uint64](idx2))
         wsys_layer_markup_len[b2] = 0
         wsys_layer_fb_len[b2] = 0
+        _wsys_mark_dirty(wid, wsys_layer_x[b2], wsys_layer_y[b2],
+                         wsys_layer_x[b2] + wsys_layer_w[b2],
+                         wsys_layer_y[b2] + wsys_layer_h[b2])
         return cast[int64](count)
     if _wsys_tok_eq(buf, verb_start, verb_end, "setz") != 0:
         idx3: int32 = _wsys_draw_layer_index(wid, np, namelen)
         if idx3 < 0:
             return cast[int64](count)
+        b3: uint64 = _wsys_draw_base(wid, cast[uint64](idx3))
         zp: uint64 = _wsys_tok_skip_space(buf, name_end, count)
         ze: uint64 = _wsys_tok_end(buf, zp, count)
-        wsys_layer_z[_wsys_draw_base(wid, cast[uint64](idx3))] = \
-            _wsys_tok_to_i64(buf, zp, ze)
+        wsys_layer_z[b3] = _wsys_tok_to_i64(buf, zp, ze)
+        # A z change reorders compositing — dirty the layer's extent.
+        _wsys_mark_dirty(wid, wsys_layer_x[b3], wsys_layer_y[b3],
+                         wsys_layer_x[b3] + wsys_layer_w[b3],
+                         wsys_layer_y[b3] + wsys_layer_h[b3])
         return cast[int64](count)
     # Unknown verb — accept-and-ignore (don't wedge a stray writer).
     return cast[int64](count)
@@ -1003,6 +1226,8 @@ def _wsys_draw_mklayer(wid: int32, name: Ptr[uint8], namelen: uint64,
     wsys_layer_h[b] = lh
     wsys_layer_markup_len[b] = 0
     wsys_layer_fb_len[b] = 0
+    # A new layer dirties the region it will occupy.
+    _wsys_mark_dirty(wid, 0, 0, lw, lh)
     return cast[int64](count)
 
 
@@ -1040,6 +1265,28 @@ def _wsys_draw_lowest_unlisted_z(wid: int32, prev_z: int64,
                     best_z = z
         s = s + 1
     return best
+
+
+# --- draw-listing render CACHE (hot-path: skip re-serialisation) -----
+#
+# The compositor reads /dev/wsys/<N>/draw every frame to get the z-sorted
+# layer listing. Regenerating it from scratch each time runs an O(n^2)
+# selection sort plus a full re-serialise into scratch — wasted work when
+# the window's layers haven't changed. We cache the rendered text per
+# window, keyed by the window's mutation serial. A read whose window
+# serial matches the cached gen reuses the bytes verbatim; any mutating
+# write zeroes the cached gen (see _wsys_mark_dirty) so the next read
+# regenerates exactly once. gen 0 is the "no valid cache" sentinel —
+# matches the serial-starts-at-1 invariant, so a freshly-mutated window
+# (serial>=1) never spuriously hits a stale gen-0 cache.
+#
+# Cache storage: one 4 KiB text buffer per window (same cap as the
+# scratch the read handler used) plus a length + gen per window.
+WSYS_DRAW_LISTING_CAP: uint64 = 4096
+
+_wsys_draw_listing_cache: Array[36864, uint8]    # 9 * 4096
+_wsys_draw_listing_cache_len: Array[9, uint64]
+_wsys_draw_listing_cache_gen: Array[9, uint64]
 
 
 def _wsys_render_draw_listing(wid: int32, out: Ptr[uint8],
@@ -1102,9 +1349,26 @@ def devwsys_draw_listing_read(wid: int32, off: uint64,
         return 0
     if wsys_wid_in_use(wid) == 0:
         return -2
-    scratch: Array[4096, uint8]
-    n: uint64 = _wsys_render_draw_listing(wid, &scratch[0], 4096)
-    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+    u: uint64 = cast[uint64](wid)
+    cbase: uint64 = u * WSYS_DRAW_LISTING_CAP
+    gen: uint64 = wsys_win_serial[u]
+    # Cache hit: the cached gen equals the live serial AND the cache is
+    # valid (gen != 0). Reuse the stored bytes — no sort, no re-render.
+    # gen 0 (a window never mutated) always re-renders the empty listing;
+    # it is cheap (zero layers) and the sentinel guards against a stale
+    # gen-0 cache masking a real change.
+    if gen != 0 and _wsys_draw_listing_cache_gen[u] == gen:
+        return _wsys_copy_out(&_wsys_draw_listing_cache[cbase],
+                              _wsys_draw_listing_cache_len[u],
+                              off, buf, count)
+    # Cache miss: regenerate into the per-window cache buffer, then stamp
+    # the gen so subsequent reads at this serial are free.
+    n: uint64 = _wsys_render_draw_listing(
+        wid, &_wsys_draw_listing_cache[cbase], WSYS_DRAW_LISTING_CAP)
+    _wsys_draw_listing_cache_len[u] = n
+    _wsys_draw_listing_cache_gen[u] = gen
+    return _wsys_copy_out(&_wsys_draw_listing_cache[cbase], n,
+                          off, buf, count)
 
 
 # --- per-leaf read/write --------------------------------------------
@@ -1168,8 +1432,11 @@ def devwsys_draw_z_write(wid: int32, slot: int32,
     # set by the preceding write. Always report the bytes consumed.
     if _wsys_buf_has_digit(buf, count) == 0:
         return cast[int64](count)
-    wsys_layer_z[_wsys_draw_base(wid, cast[uint64](slot))] = \
-        _wsys_tok_to_i64(buf, 0, count)
+    bz: uint64 = _wsys_draw_base(wid, cast[uint64](slot))
+    wsys_layer_z[bz] = _wsys_tok_to_i64(buf, 0, count)
+    _wsys_mark_dirty(wid, wsys_layer_x[bz], wsys_layer_y[bz],
+                     wsys_layer_x[bz] + wsys_layer_w[bz],
+                     wsys_layer_y[bz] + wsys_layer_h[bz])
     return cast[int64](count)
 
 
@@ -1199,7 +1466,11 @@ def devwsys_draw_opacity_write(wid: int32, slot: int32,
         v = 0
     if v > 255:
         v = 255
-    wsys_layer_opacity[_wsys_draw_base(wid, cast[uint64](slot))] = v
+    bo: uint64 = _wsys_draw_base(wid, cast[uint64](slot))
+    wsys_layer_opacity[bo] = v
+    _wsys_mark_dirty(wid, wsys_layer_x[bo], wsys_layer_y[bo],
+                     wsys_layer_x[bo] + wsys_layer_w[bo],
+                     wsys_layer_y[bo] + wsys_layer_h[bo])
     return cast[int64](count)
 
 
@@ -1234,6 +1505,11 @@ def devwsys_draw_geometry_write(wid: int32, slot: int32,
     if _wsys_draw_slot_live(wid, slot) == 0:
         return -2
     b: uint64 = _wsys_draw_base(wid, cast[uint64](slot))
+    # Old extent is dirty (the layer is vacating it); union with the new
+    # extent below so a MOVE repaints both the old and new boxes.
+    _wsys_mark_dirty(wid, wsys_layer_x[b], wsys_layer_y[b],
+                     wsys_layer_x[b] + wsys_layer_w[b],
+                     wsys_layer_y[b] + wsys_layer_h[b])
     p: uint64 = _wsys_tok_skip_space(buf, 0, count)
     e: uint64 = _wsys_tok_end(buf, p, count)
     if p != e:
@@ -1250,6 +1526,10 @@ def devwsys_draw_geometry_write(wid: int32, slot: int32,
     e = _wsys_tok_end(buf, p, count)
     if p != e:
         wsys_layer_h[b] = _wsys_tok_to_i64(buf, p, e)
+    # New extent is dirty too.
+    _wsys_mark_dirty(wid, wsys_layer_x[b], wsys_layer_y[b],
+                     wsys_layer_x[b] + wsys_layer_w[b],
+                     wsys_layer_y[b] + wsys_layer_h[b])
     return cast[int64](count)
 
 
@@ -1289,6 +1569,10 @@ def devwsys_draw_markup_write(wid: int32, slot: int32, off: uint64,
     end: uint64 = off + take
     if end > wsys_layer_markup_len[b]:
         wsys_layer_markup_len[b] = end
+    # New markup content dirties the layer's full extent.
+    _wsys_mark_dirty(wid, wsys_layer_x[b], wsys_layer_y[b],
+                     wsys_layer_x[b] + wsys_layer_w[b],
+                     wsys_layer_y[b] + wsys_layer_h[b])
     return cast[int64](take)
 
 
@@ -1324,7 +1608,35 @@ def devwsys_draw_fb_write(wid: int32, slot: int32, off: uint64,
     end: uint64 = off + take
     if end > wsys_layer_fb_len[b]:
         wsys_layer_fb_len[b] = end
+    # Refine the dirty rect to the affected pixel ROWS: the fb is row-
+    # major RGBA8888 at the layer's width, so map the touched byte range
+    # [off, off+take) to a row span and dirty the full-width strip those
+    # rows cover. Falls back to the whole layer extent if width is 0.
+    _wsys_mark_dirty_fb_rows(wid, b, off, take)
     return cast[int64](take)
+
+
+def _wsys_mark_dirty_fb_rows(wid: int32, b: uint64,
+                             off: uint64, take: uint64):
+    # Translate a byte range written into an fb (row-major RGBA8888 at the
+    # layer's width) into a window-local dirty rectangle covering the full
+    # width of the rows the bytes fall in.
+    lw: int64 = wsys_layer_w[b]
+    lx: int64 = wsys_layer_x[b]
+    ly: int64 = wsys_layer_y[b]
+    if lw <= 0:
+        # Unknown stride — dirty the whole layer extent conservatively.
+        _wsys_mark_dirty(wid, lx, ly, lx + lw, ly + wsys_layer_h[b])
+        return
+    bytes_per_row: uint64 = cast[uint64](lw) * 4
+    if bytes_per_row == 0:
+        _wsys_mark_dirty(wid, lx, ly, lx + lw, ly + wsys_layer_h[b])
+        return
+    row0: uint64 = off / bytes_per_row
+    row1: uint64 = (off + take + bytes_per_row - 1) / bytes_per_row
+    y0: int64 = ly + cast[int64](row0)
+    y1: int64 = ly + cast[int64](row1)
+    _wsys_mark_dirty(wid, lx, y0, lx + lw, y1)
 
 
 # --- name->slot resolution for namec --------------------------------
@@ -1371,6 +1683,8 @@ def wsys_draw_ensure_fb_layer(wid: int32, name: Ptr[uint8],
         wsys_layer_kind[be] = WSYS_LAYER_KIND_FB
         wsys_layer_w[be] = w
         wsys_layer_h[be] = h
+        _wsys_mark_dirty(wid, wsys_layer_x[be], wsys_layer_y[be],
+                         wsys_layer_x[be] + w, wsys_layer_y[be] + h)
         return existing
     slot: int32 = _wsys_draw_free_slot(wid)
     if slot < 0:
@@ -1388,6 +1702,7 @@ def wsys_draw_ensure_fb_layer(wid: int32, name: Ptr[uint8],
     wsys_layer_h[b] = h
     wsys_layer_markup_len[b] = 0
     wsys_layer_fb_len[b] = 0
+    _wsys_mark_dirty(wid, 0, 0, w, h)
     return slot
 
 
@@ -1409,4 +1724,8 @@ def wsys_draw_fb_store(wid: int32, slot: int32,
         wsys_layer_fb[base + i] = src[i]
         i = i + 1
     wsys_layer_fb_len[b] = take
+    # Whole-layer fb store dirties the layer's full extent.
+    _wsys_mark_dirty(wid, wsys_layer_x[b], wsys_layer_y[b],
+                     wsys_layer_x[b] + wsys_layer_w[b],
+                     wsys_layer_y[b] + wsys_layer_h[b])
     return cast[int64](take)
