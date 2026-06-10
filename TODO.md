@@ -46,47 +46,19 @@ The base must be Plan 9 to the bone: **no global filesystem, no hardcoded
 path bypasses — everything is namespaces + file servers.** Finish this
 *before* pouring agents back into breadth work (ARM, GPU, drivers). See
 [[memory/project_namespace_purity_mandate]]. Big-bang rewrites sanctioned;
-each phase must still boot + pass the sweep (tests may be rewritten to the
-new design but must pass for real).
+each phase must still boot + pass the sweep.
 
-- [x] **Phase 1 — `/dev` reference template** (`3a887b2c`). `#b`/`#c`
-  bindable device servers; `ls /dev`, `/dev/blk`, `lsblk` resolve through
-  the namespace. `scripts/test_dev_namespace.sh`.
-- [x] **Phase 2 — literal-arm sweep** (#388, COMPLETE). `/net` (`_open_net`
-  → bound `#I` IP server + `devnet_listdir`, `878e9a1b`), `/dev/loop`/
-  `/dev/blk` literal arms deleted (served by `#c`/`#b` binds; dead
-  `devblk_path_match` import removed), and `/proc` (`devproc_path_match` +
-  `is_proc_path`→`_open_proc` pre-namec arms deleted; new `devproc_listdir`
-  so bare `#p` lists static files + live pids and `#p/<pid>` lists the
-  per-task leaves; `cc9443cc`). `scripts/test_net_namespace.sh` +
-  `test_dev_namespace.sh` + `test_proc_namespace.sh` all green on `main`.
-  **`vfs_open` now has exactly ONE resolution path — zero literal
-  special-cases.** (`#e` env-as-files is still absent — a small future
-  add, not a bypass; tracked separately if pursued.)
-- [x] **Phase 3 — real `mount()`** (#389, COMPLETE, `a563d31b`). New
-  `fs/vfs_mount.ad` holds a real VFS mount table (`vfs_mount`/`vfs_umount`
-  + longest-prefix `_mount_lookup_slot`); `/`=cpio, `/tmp`=tmpfs,
-  `/var`=tmpfs(shadow), `/mnt`=FAT, `/ext`=ext4 register at init. The ~70
-  `is_*_path` backend-SELECTION branches across `vfs_open`/`open_write`/
-  `listdir`/`stat`/`unlink`/`rmdir`/`mkdir`/`rename`/`symlink`/`link`/
-  `truncate`/`chmod`/`set_mtime`/`resolve_backing` are gone — replaced by
-  three primitives: `vfs_fs_kind(path)` (→ backend id), `vfs_fs_rel(path)`
-  (backend-relative tail), `vfs_fs_shadow(path)` (the /var tmpfs-first /
-  cpio-fallthrough rule). Worktree grep of backend-selection predicates =
-  0. Verified green: `test_dev/net/proc_namespace.sh` + installer Stage B
-  (ext4 magic `0xEF53` on NVMe through the mount table).
+Phases 1–3 DONE (see STATUS.md): `/dev` reference template (#388), literal-
+arm sweep (`vfs_open` now has exactly ONE resolution path — zero literal
+special-cases), and real `mount()` (#389, `a563d31b` — a VFS mount table
+replaces the ~70 `is_*_path` backend-selection branches).
+
 - [~] **Phase 4 — unify fds on `Chan`** (#390). Retire the
   collision-prone `FD_*_MARK` magic-integer ranges; every fd becomes a
   `Chan` through the `namec` devtab.
-  - [x] **Phase 4a — stateless native cdevs** (`091fde11`). The 13
-    stateless synthetic-cdev marks (`FD_CONS`/`DEVNULL`/`DEVZERO`/`TIME`/
-    `PID`/`RANDOM`/`MOUSE`/`CPUINFO`/`MEMINFO`/`UPTIME`/`LOADAVG`/`VERSION`/
-    `HOSTNAME`) now open as `FD_CHAN_MARK` fds carrying an inline-chan id
-    `_chan_id_make_inline(DEV_<x>)`; all behavior lives in namec's
-    `_devtab_read`/`_devtab_write`. Per-mark read/write/close/fstat arms +
-    the 13 constants deleted (net −142 lines). Console detection now
-    resolves `DEV_CONS` via `namec_chan_dev_type`. Verified green:
-    `test_dev`/`test_net`/`test_proc_namespace.sh`.
+  - [x] Phase 4a — stateless native cdevs DONE (`091fde11`): the 13
+    stateless synthetic cdevs open as `FD_CHAN_MARK` fds; behavior lives
+    in namec's `_devtab_read`/`_devtab_write`.
   - [ ] **Phase 4b — stateful native fds.** `FD_EXT4`/`TMPFS`/`FAT`/
     `BUFFER`/`DIR`/`PIPE_R`/`PIPE_W`/`SOCKET`/`BLK`/`STAT`/`MOUNTS`/
     `DISKSTATS`/`AUTH`/`VTCTL`/`DEVFD`/`PROC_BASE` carry per-fd offset/
@@ -96,39 +68,27 @@ new design but must pass for real).
     pidfd) stay marks by design (boundary-discipline law — not namespace
     files).
 
-## Now — useful-system gap fill (priority-ordered, locked with user 2026-05-28)
+## Now — useful-system gap fill
 
-1. [x] **hamUI Phase 4a** — LANDED: layered draw protocol cdev
-   (`/dev/wsys/<wid>/draw/<name>/{kind,z,opacity,geometry,markup,fb}`
-   + `ctl` verbs `mklayer`/`rmlayer`/`setz`/`ls`).
-2. [x] **hamUI Phase 4b** — LANDED: `hamUId` userland renderer daemon
-   (hamML parser, bitmap-font rasteriser, compositor).
-3. [x] **hamUI Phase 4c** — LANDED: `/dev/fb` framebuffer cdev; drag-
-   title-to-move + click-to-close window management; drag-to-create
-   gesture; GNOME2/MATE-style panel with Applications menu, taskbar
-   (window-list buttons), minimize buttons, and live clock.
-4. [ ] **hamUI Phase 4d** — bitmap font store (mono/sans/serif BDF).
-5. [ ] **`lib/hamui.ad`** — Adder graphics library wrapping H-§G
-   (Window/Layer/Rect/Text/Image/Button/Input/Event + event loop).
+1. [ ] **hamUI Phase 4d** — bitmap font store (mono/sans/serif BDF).
+2. [ ] **`lib/hamui.ad` — GTK/Qt-style widget toolkit (NEXT MAJOR TRACK)**
+   — retained-mode widget library wrapping H-§G over the
+   `/dev/wsys/<wid>/draw/<layer>/{markup,fb}` protocol
+   (Window/Layer/Rect/Text/Image/Button/Input/Event + event loop +
+   layout/containers). Make GUI apps easy to write, GTK/Qt-style.
    See [[memory/project_app_language_decision]] — Adder + hamsh,
-   no third tier.
-6. [ ] **hamsh `use hamui`** — bindings on top of #5. May require
+   no third tier. **Gated behind the DE-input/efficiency rework
+   landing** (that agent owns `user/hamUId.ad`; the toolkit builds on
+   the same compositor input/event plumbing — don't dispatch until it
+   merges or they collide).
+3. [ ] **Rewrite the entire DE on `lib/hamui.ad`** — the current
+   `user/hamUId.ad` (~23.6k lines) hand-draws every widget from raw
+   framebuffer primitives in one monolith. User directive 2026-06-10:
+   "Writing in primitives like what we are is a terrible idea." Once #2
+   exists, redo the whole desktop environment on top of the toolkit
+   instead of bespoke primitive draws inside the compositor.
+4. [ ] **hamsh `use hamui`** — bindings on top of #2. May require
    hamsh extensions for closures + event loop + persistent state.
-7. [x] **Outgoing `ssh` client** — LANDED (#170): crypto + key exchange
-   + channels; dials out (including to self).
-8. [x] **Pipes + job control in hamsh** — LANDED: `&` background,
-    `bg`/`fg`/`jobs`, Ctrl-Z → SIGTSTP / SIGCONT. Process groups
-    and pipelines work end-to-end.
-9. [x] **Real editor** — LANDED: `vi` native modal text editor
-    (`user/vi.ad`).
-10. [x] **`tar` + `gzip` / `gunzip`** — LANDED: ustar archiver
-    (`user/tar.ad`) + DEFLATE compressor/decompressor (`user/gzip.ad`,
-    `user/gunzip.ad`). xz/LZMA2 decompression also landed
-    (`lib/xz/xz.ad`).
-11. [x] **Audio** — LANDED (#152): PCM playback path (snd_hda sound out).
-12. [x] **`hpm update` + rollback** — LANDED: `hpm update` and
-    transactional history + `hpm rollback` shipped (`b011ce9`,
-    `65e6685`).
 
 ## hamUI later phases (after Phase 4)
 
@@ -235,10 +195,6 @@ STATUS.md). What remains, off the critical path and parallelisable:
 - [ ] `io_uring` SQ/CQ rings — deferred (much larger than epoll;
   epoll covers most real Linux daemons).
 
-### §6 Timekeeping
-- [x] vDSO (#169): `gettimeofday`/`clock_gettime` without syscall
-  overhead landed.
-
 ### §7 Entropy / RNG
 - [~] ChaCha20 CSPRNG: RDRAND/RDSEED seeding + fast-key-erasure DONE;
   periodic **reseed cadence** now folds fresh hw entropy on a byte
@@ -256,16 +212,9 @@ STATUS.md). What remains, off the critical path and parallelisable:
   landed (#139, #151). **Open**: work stealing, CPU affinity.
 
 ### §10 Networking
-- [x] Congestion control (#166): slow-start + congestion-avoidance
-  (RFC 5681) landed.
-- [x] Multi-listener accept queue + window scaling + SACK + timestamps
-  (#166) landed.
-- [x] IPv6 (#156): addr, ND, ICMPv6, UDP/TCP over v6 + DNS AAAA landed.
 - [ ] Generic unicast ARP helper; ICMP time-exceeded / redirect.
 
 ### §12 Filesystem write maturity
-- [x] ext4 extent index-node support (#189): depth>0 extent trees for
-  >512 MiB files landed.
 - [~] ext4 directory-op maturity (rmdir + dir-rename `..` fixup) — in
   flight (#245).
 - [ ] ext4 truncate on index-node files; growing a full ext4 directory
@@ -277,12 +226,6 @@ STATUS.md). What remains, off the critical path and parallelisable:
 - [ ] Per-backend errstr (ext4 / fat / blk) + user-mode `perror` helper.
 
 ### §14 Resource control & security (stretch)
-- [x] Per-namespace CPU/memory caps (#174): namespace-native, not
-  cgroups.
-- [x] seccomp-lite (#160): per-task syscall filter at the Layer-2
-  dispatch boundary.
-- [x] POSIX capabilities (#296): `capget`/`capset(2)` (drop-root
-  daemons).
 - [ ] `seccomp-bpf` (full classic-BPF program).
 
 ### §15 Compiler / language infra
@@ -312,8 +255,6 @@ STATUS.md). What remains, off the critical path and parallelisable:
   `drivers/nvme/nvme.ad` (not yet audited).
 - [ ] Real NIC silicon: e1000e EEPROM walk on a physical Intel NIC;
   r8169 RX on physical RTL8168; Broadcom tg3; Intel igb.
-- [x] EFI Runtime Services (`GetTime`, `GetVariable`) + PE `.reloc`
-  table + image signing (#171, Secure Boot) landed.
 - [ ] Drop the FAT12 32 MiB ESP cap via the GPT-ESP path.
 - [ ] NUC network silent on real I219 — needs hardware time.
 
@@ -325,15 +266,10 @@ STATUS.md). What remains, off the critical path and parallelisable:
 - [ ] Partition: extended-CHS chains, BSD disklabel, APM; GPT UTF-16
   names into the block tag; `mount /dev/sd0p1 /mnt` path-to-slot
   resolver.
-- [x] On-target installer (#172): lays down a fresh GPT disk (FAT ESP +
-  UEFI stub + ext4 root) from a running system. (No GRUB / MBR — the
-  boot path is the native UEFI stub.)
 - [ ] ext4 mkfs multi-block-group layout; journal (jbd2) at mkfs time.
 
 ## Input
 
-- [x] International keyboard layouts + mouse scroll + BT HID (#178)
-  landed.
 - [ ] Dead-key / compose / IME; blocking read on `/dev/mouse`; MADT
   IRQ-override consumption.
 
@@ -362,8 +298,6 @@ STATUS.md). What remains, off the critical path and parallelisable:
   2026-05-27; see `memory/project_nonfree_repo.md`).
 - [ ] Browser (Firefox / Chromium) in a hamUI window — gated on
   hamUI Phase 5 (X11 bridge).
-- [x] Suspend / power management (#168): ACPI suspend/resume + thermal
-  + battery + ACPI shutdown landed.
 - [~] Multi-arch (ARM64) (#175): Adder aarch64 backend landed — both
   `aarch64-linux` (runnable Linux ELF) and `aarch64-bare-metal`
   (QEMU `virt` boot stub over PL011 UART). **Open**: full bare-metal
