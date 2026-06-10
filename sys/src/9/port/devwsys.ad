@@ -60,6 +60,8 @@
 
 from kernel.sched.core import (
     current_task_pid, current_task_uid, console_input_wake,
+    WaitQueue, wq_init, wq_wait_prepare, wq_wait_cancel,
+    wq_wait_commit, wq_wake_one, WQ_EINTR,
 )
 from sys.src.port9.port.chan import (
     MountEntry, Pgrp, MNT_CAP,
@@ -472,6 +474,187 @@ def wsys_cmd_pop() -> int32:
     return _wsys_cmd_pop_wid(w)
 
 
+# --- per-window structured INPUT EVENT rings ------------------------
+#
+# THE PROBLEM
+# -----------
+# The compositor (user/hamUId.ad) OWNS pointer routing + focus + keyboard
+# gating: it knows the absolute cursor position, which window the pointer
+# is over / dragging / focused, the button bitmap and the scroll delta.
+# But until now it exposed NONE of that to clients as a per-window event
+# stream — client GUI apps had to scrape RELATIVE /dev/mouse deltas and
+# raw stdin and re-derive everything. That cannot drive a real multi-
+# window DE.
+#
+# THE FIX (this section)
+# ----------------------
+# Two NEW per-wid files surface the data the compositor already computes:
+#
+#   /dev/wsys/<wid>/pointer   structured, ROUTED pointer events in
+#                             ABSOLUTE WINDOW-SPACE coordinates. One ASCII
+#                             line per event:
+#                                 "<type> <x> <y> <buttons> <dz>\n"
+#                             type:    m=motion  d=button-down  u=button-up
+#                                      s=scroll
+#                             x,y:     pointer position in WINDOW-LOCAL
+#                                      pixels (compositor already mapped
+#                                      screen->window for the target win)
+#                             buttons: decimal bitmap (bit0=L bit1=R bit2=M)
+#                             dz:      scroll-wheel notch (signed; 0 if none)
+#                             A window only sees events the compositor's
+#                             router decided belong to it (pointer over it
+#                             / drag-target / focus-target).
+#
+#   /dev/wsys/<wid>/keys      key events for the FOCUSED window only. One
+#                             ASCII line per event:
+#                                 "<type> <code>\n"
+#                             type: d=press/typed  u=release
+#                             code: decimal byte/keycode (a typed char's
+#                                   ASCII value, or a VT-sequence byte).
+#                             Only the focused window's queue is fed (the
+#                             compositor gates the keyboard centrally, then
+#                             routes the chosen bytes here).
+#
+# EVENT-DRIVEN I/O (NO poll-yield)
+# --------------------------------
+# Each ring has a per-wid WaitQueue. A client `sys_read` on an empty ring
+# BLOCKS on that queue (STATE_WAIT, off the runqueue — Linux-style
+# TASK_INTERRUPTIBLE) via the two-phase wq_wait_prepare / recheck /
+# wq_wait_commit dance, exactly like the pipe reader in fs/vfs.ad. The
+# compositor's WRITE (devwsys_pointer_write / devwsys_keys_write) appends
+# the event line and calls wq_wake_one to wake the blocked client. No
+# timer-tick re-poll, no busy spin.
+#
+# OVERFLOW POLICY: DROP NEWEST. The rings are sized generously (one ASCII
+# event line is short); if a client falls so far behind that its ring is
+# full, the just-arrived event is dropped rather than evicting older,
+# already-queued events — input order is preserved and the client never
+# observes a torn line. (Pointer motion is the high-rate stream and is
+# the natural thing to coalesce/lose on a slow consumer.)
+#
+# Each ring is a byte FIFO with tail<=head cursors that compact to 0 when
+# drained (mirrors the cmd queue shape, which never wraps mid-line). A
+# read returns whole bytes up to `count`; a client reads line-at-a-time
+# by scanning for '\n'. `off` is IGNORED — these are live event streams,
+# not snapshot files.
+
+WSYS_PTR_SIZE:  uint64 = 4096
+WSYS_KEYS_SIZE: uint64 = 2048
+
+wsys_ptr_buf:   Array[36864, uint8]    # 9 * 4096
+wsys_ptr_tail:  Array[9, uint64]
+wsys_ptr_head:  Array[9, uint64]
+wsys_ptr_wq:    Array[9, WaitQueue]
+
+wsys_keys_buf:  Array[18432, uint8]    # 9 * 2048
+wsys_keys_tail: Array[9, uint64]
+wsys_keys_head: Array[9, uint64]
+wsys_keys_wq:   Array[9, WaitQueue]
+
+wsys_evt_wq_inited: int32 = 0
+
+
+def _wsys_evt_wq_init_if_needed():
+    # Lazy one-shot init of every per-wid event wait queue. BSS-zeroes the
+    # WaitQueue.head to 0 already (== empty), but stamp it explicitly so a
+    # warm path sees a clean queue.
+    if wsys_evt_wq_inited != 0:
+        return
+    w: uint64 = 0
+    while w < MAX_WINDOWS:
+        wq_init(&wsys_ptr_wq[w])
+        wq_init(&wsys_keys_wq[w])
+        w = w + 1
+    wsys_evt_wq_inited = 1
+
+
+def _wsys_ptr_compact(wid: int32):
+    u: uint64 = cast[uint64](wid)
+    if wsys_ptr_tail[u] == wsys_ptr_head[u]:
+        wsys_ptr_tail[u] = 0
+        wsys_ptr_head[u] = 0
+
+
+def _wsys_keys_compact(wid: int32):
+    u: uint64 = cast[uint64](wid)
+    if wsys_keys_tail[u] == wsys_keys_head[u]:
+        wsys_keys_tail[u] = 0
+        wsys_keys_head[u] = 0
+
+
+def _wsys_ptr_push_byte(wid: int32, c: uint8) -> int32:
+    # Append one byte to wid's pointer ring. Returns 1 on success, 0 if
+    # the ring is full (DROP NEWEST). Does NOT wake — the caller wakes
+    # once per complete event line.
+    _wsys_ptr_compact(wid)
+    u: uint64 = cast[uint64](wid)
+    if wsys_ptr_head[u] >= WSYS_PTR_SIZE:
+        return 0
+    base: uint64 = u * WSYS_PTR_SIZE
+    wsys_ptr_buf[base + wsys_ptr_head[u]] = c
+    wsys_ptr_head[u] = wsys_ptr_head[u] + 1
+    return 1
+
+
+def _wsys_keys_push_byte(wid: int32, c: uint8) -> int32:
+    _wsys_keys_compact(wid)
+    u: uint64 = cast[uint64](wid)
+    if wsys_keys_head[u] >= WSYS_KEYS_SIZE:
+        return 0
+    base: uint64 = u * WSYS_KEYS_SIZE
+    wsys_keys_buf[base + wsys_keys_head[u]] = c
+    wsys_keys_head[u] = wsys_keys_head[u] + 1
+    return 1
+
+
+def _wsys_ptr_pop_into(wid: int32, out: Ptr[uint8], count: uint64) -> int64:
+    # Drain up to `count` queued bytes from wid's pointer ring into `out`,
+    # oldest first. Returns the byte count (0 if the ring is empty).
+    u: uint64 = cast[uint64](wid)
+    n: uint64 = 0
+    base: uint64 = u * WSYS_PTR_SIZE
+    while n < count and wsys_ptr_tail[u] < wsys_ptr_head[u]:
+        out[n] = wsys_ptr_buf[base + wsys_ptr_tail[u]]
+        wsys_ptr_tail[u] = wsys_ptr_tail[u] + 1
+        n = n + 1
+    _wsys_ptr_compact(wid)
+    return cast[int64](n)
+
+
+def _wsys_keys_pop_into(wid: int32, out: Ptr[uint8], count: uint64) -> int64:
+    u: uint64 = cast[uint64](wid)
+    n: uint64 = 0
+    base: uint64 = u * WSYS_KEYS_SIZE
+    while n < count and wsys_keys_tail[u] < wsys_keys_head[u]:
+        out[n] = wsys_keys_buf[base + wsys_keys_tail[u]]
+        wsys_keys_tail[u] = wsys_keys_tail[u] + 1
+        n = n + 1
+    _wsys_keys_compact(wid)
+    return cast[int64](n)
+
+
+def _wsys_ptr_readable(wid: int32) -> int32:
+    u: uint64 = cast[uint64](wid)
+    if wsys_ptr_tail[u] < wsys_ptr_head[u]:
+        return 1
+    return 0
+
+
+def _wsys_keys_readable(wid: int32) -> int32:
+    u: uint64 = cast[uint64](wid)
+    if wsys_keys_tail[u] < wsys_keys_head[u]:
+        return 1
+    return 0
+
+
+def _wsys_reset_evt_rings(wid: int32):
+    u: uint64 = cast[uint64](wid)
+    wsys_ptr_tail[u] = 0
+    wsys_ptr_head[u] = 0
+    wsys_keys_tail[u] = 0
+    wsys_keys_head[u] = 0
+
+
 def _wsys_reset_rings(wid: int32):
     # Zero the ring cursors for `wid`. Called from alloc/free so a
     # recycled slot doesn't leak the previous tenant's bytes. The
@@ -484,6 +667,7 @@ def _wsys_reset_rings(wid: int32):
     wsys_output_count[u] = 0
     wsys_cmd_tail[u] = 0
     wsys_cmd_head[u] = 0
+    _wsys_reset_evt_rings(wid)
     # Drop any draw layers a recycled wid's previous tenant created.
     _wsys_draw_reset_window(wid)
     # Reset damage tracking so a recycled wid starts with a fresh serial
@@ -852,6 +1036,94 @@ def devwsys_cmd_write(wid: int32, buf: Ptr[uint8],
 
 def devwsys_readonly_write(buf: Ptr[uint8], count: uint64) -> int64:
     return -1
+
+
+# --- structured input-event WRITE (compositor) ----------------------
+#
+# The compositor (user/hamUId.ad) is the SOLE writer of these files. It
+# opens "/dev/wsys/<wid>/pointer" / "/dev/wsys/<wid>/keys" for write and
+# emits already-routed, window-space ASCII event lines (it has done the
+# hit-test / focus decision; the kernel just buffers + wakes). A write
+# appends the bytes verbatim and wakes one blocked reader once the line
+# is in. Newest is dropped if the ring is full.
+
+def devwsys_pointer_write(wid: int32, buf: Ptr[uint8],
+                          count: uint64) -> int64:
+    if wsys_wid_in_use(wid) == 0:
+        return -2
+    _wsys_evt_wq_init_if_needed()
+    i: uint64 = 0
+    while i < count:
+        _wsys_ptr_push_byte(wid, buf[i])           # DROP-NEWEST on full
+        i = i + 1
+    # Wake one blocked reader (the focused/target client) so it picks up
+    # the event promptly — event-driven, no timer-tick re-poll.
+    wq_wake_one(&wsys_ptr_wq[cast[uint64](wid)])
+    return cast[int64](count)
+
+
+def devwsys_keys_write(wid: int32, buf: Ptr[uint8],
+                       count: uint64) -> int64:
+    if wsys_wid_in_use(wid) == 0:
+        return -2
+    _wsys_evt_wq_init_if_needed()
+    i: uint64 = 0
+    while i < count:
+        _wsys_keys_push_byte(wid, buf[i])
+        i = i + 1
+    wq_wake_one(&wsys_keys_wq[cast[uint64](wid)])
+    return cast[int64](count)
+
+
+# --- structured input-event READ (client, BLOCKING) -----------------
+#
+# A client GUI app reads these to receive routed events. The read BLOCKS
+# (event-driven; STATE_WAIT off the runqueue) until the compositor writes
+# an event, using the two-phase prepare/recheck/commit wait so the SMP
+# producer-on-another-CPU wake can never be lost. `off` is IGNORED — a
+# live stream, not a snapshot. Returns whole bytes (line-framed by the
+# client scanning for '\n'); a signal-wake returns -EINTR.
+
+def devwsys_pointer_read(wid: int32, off: uint64, buf: Ptr[uint8],
+                         count: uint64) -> int64:
+    if count == 0:
+        return 0
+    if wsys_wid_in_use(wid) == 0:
+        return -2
+    _wsys_evt_wq_init_if_needed()
+    while True:
+        if _wsys_ptr_readable(wid) != 0:
+            return _wsys_ptr_pop_into(wid, buf, count)
+        # Queue ourselves FIRST, then re-check while queued so a write
+        # racing in between cannot leave us asleep with data waiting.
+        pwq: Ptr[WaitQueue] = &wsys_ptr_wq[cast[uint64](wid)]
+        wq_wait_prepare(pwq)
+        if _wsys_ptr_readable(wid) != 0:
+            wq_wait_cancel(pwq)
+            continue
+        rc: int32 = wq_wait_commit(pwq)
+        if rc != 0:
+            return cast[int64](WQ_EINTR)
+
+
+def devwsys_keys_read(wid: int32, off: uint64, buf: Ptr[uint8],
+                      count: uint64) -> int64:
+    if count == 0:
+        return 0
+    if wsys_wid_in_use(wid) == 0:
+        return -2
+    _wsys_evt_wq_init_if_needed()
+    while True:
+        if _wsys_keys_readable(wid) != 0:
+            return _wsys_keys_pop_into(wid, buf, count)
+        kwq: Ptr[WaitQueue] = &wsys_keys_wq[cast[uint64](wid)]
+        wq_wait_prepare(kwq)
+        if _wsys_keys_readable(wid) != 0:
+            wq_wait_cancel(kwq)
+            continue
+        rc: int32 = wq_wait_commit(kwq)
+        if rc != 0:
+            return cast[int64](WQ_EINTR)
 
 
 # --- foreground routing introspection -------------------------------
