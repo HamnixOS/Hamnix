@@ -2817,6 +2817,19 @@ if os.environ.get("ENABLE_SPINE_SELFTEST") == "1":
     FILES.append(("/etc/hamui-spine-test", b"1\n"))
 
 
+# Increment-2 (MATE-mirror DE rewrite) TERMINAL app-spine proof
+# (scripts/test_hamUI_termspine_gop.sh, ENABLE_TERM_SELFTEST=1). Same shape
+# as the spine marker above: plant /etc/hamui-term-test so the PROVEN
+# 2-token `hamUId daemon` autostart routes into the autoflag-48 terminal
+# self-test (spawn /bin/hamterm as its own process, prove window-only spawn
+# damage + on-screen markup + a focus-gated `echo TERMOK` command driving a
+# REAL /bin/hamsh whose output renders live in the window + no leak to the
+# /dev/cons shell). Runs once, exits 0 (restart:on-failure won't relaunch).
+# Test build only.
+if os.environ.get("ENABLE_TERM_SELFTEST") == "1":
+    FILES.append(("/etc/hamui-term-test", b"1\n"))
+
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
@@ -3203,7 +3216,8 @@ def build_archive() -> bytes:
                         # selftest build, drop hamde.svc so hamUId autostarts
                         # deterministically.
                         if (os.environ.get("ENABLE_MKC_SELFTEST") == "1"
-                                or os.environ.get("ENABLE_SPINE_SELFTEST") == "1") \
+                                or os.environ.get("ENABLE_SPINE_SELFTEST") == "1"
+                                or os.environ.get("ENABLE_TERM_SELFTEST") == "1") \
                                 and ef.name == "services.d" \
                                 and sub.name == "hamde.svc":
                             print("  [selftest] skipping "
