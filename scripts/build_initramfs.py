@@ -324,6 +324,19 @@ if os.environ.get("ENABLE_IPV6_SELFTEST") == "1":
 if os.environ.get("ENABLE_XHCI_SELFTEST") == "1":
     FILES.append(("/etc/xhci-selftest", b"1\n"))
 
+# Installer-medium HID-input regression aid. The REAL installer build
+# (HAMNIX_INSTALLER_BLOB=1, scripts/build_installer_img.sh) plants
+# /etc/installer-medium ALONGSIDE the multi-hundred-MiB squashfs + package
+# payload. For a fast, focused VM regression of the installer-medium USB
+# HID-INPUT bring-up path (init/main.ad calls xhci_init_force() under this
+# marker so the USB-only NUC's mouse/keyboard come up for the DE), set
+# ENABLE_INSTALLER_MEDIUM_MARKER=1 to plant ONLY the marker — no squashfs,
+# no package repo. scripts/test_installer_usb_hid_input.sh uses this so the
+# test boots in seconds instead of building the full installer image.
+# Default boots ship no marker; the real installer build uses the BLOB path.
+if os.environ.get("ENABLE_INSTALLER_MEDIUM_MARKER") == "1":
+    FILES.append(("/etc/installer-medium", b"1\n"))
+
 # Framebuffer page-pause log-capture aid. Set ENABLE_LOG_SLOW=1 to plant
 # /etc/log-slow; init/main.ad (boot:03) then makes the GOP text console
 # pause ~1 s and stamp an OCR delimiter ("### HAMNIX-LOGPAGE NNNN ###")
