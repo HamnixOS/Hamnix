@@ -168,6 +168,8 @@ build_adder_user help                 # discovery: man-page index + `help <topic
 build_adder_user hamUI                # hamUI Phase 2: multi-window CLI (new/list/close)
 build_adder_user hamUId               # hamUI Phase 4b: userland renderer (render <wid> -> AI-readable dump)
 build_adder_user hamui_demo           # GTK/Qt-style toolkit (lib/hamui.ad) demo: label/button/entry/check/list
+build_adder_user ham2048              # 2048 game on the hamui toolkit (lib/hamui.ad)
+build_adder_user hamsnake             # Snake game on the hamui toolkit (lib/hamui.ad)
 build_adder_user top                  # M16.87: one-shot /proc dashboard
 build_adder_user ifconfig             # M16.87: stub lo 127.0.0.1/8
 build_adder_user ping                 # native Adder ping: Plan-9-shaped /net/icmp client
