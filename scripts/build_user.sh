@@ -139,6 +139,7 @@ build_adder_user kill                 # sys_kill(pid, sig); -SIG flag
 build_adder_user sed                  # single s/A/B/ replace per line
 build_adder_user vi                   # modal full-screen editor (NORMAL/INSERT/ex)
 build_adder_user hamfm                # TUI file manager (navigate dirs, view files)
+build_adder_user hdu                  # ncdu-style interactive disk-usage browser (recursive sizes, bar, navigate)
 build_adder_user awk                  # literal {print $N} only
 build_adder_user less                 # alias for more (24-line pager)
 build_adder_user xargs                # stdin tokens -> sys_spawn argv
