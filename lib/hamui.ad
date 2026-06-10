@@ -1,0 +1,980 @@
+# lib/hamui.ad
+#
+# hamui — a GTK/Qt-style retained-mode widget toolkit for Hamnix.
+#
+# WHY THIS EXISTS
+# ===============
+# The desktop (user/hamUId.ad, ~23k lines) hand-draws every widget from
+# raw framebuffer primitives in one monolith. The project owner rejected
+# that: "Writing in primitives ... is a terrible idea ... create a solid
+# GTK/QT style library and then redo the entire desktop environment."
+# This file is step 1: the client-side widget library. A later track
+# rewrites the DE on top of it, so the API is designed for that consumer.
+#
+# CLIENT-SIDE means: this runs in an ORDINARY userland process and draws
+# by writing the window-system (wsys) draw protocol that the compositor
+# already parses. It is a CONSUMER of the compositor, NOT part of it. We
+# never touch user/hamUId.ad — we speak its existing on-disk protocol.
+#
+# THE DRAW SUBSTRATE (verified against user/hamUId.ad + devwsys.ad)
+# ================================================================
+# A window `wid` owns LAYERS under /dev/wsys/<wid>/draw/ :
+#   * control verbs go to     /dev/wsys/<wid>/draw/ctl
+#       mklayer <name> markup [w h]   (markup defaults to full 640x480)
+#       setz <name> <n>               (compositing order, z ascending)
+#       clear <name>                  (empty a layer's body)
+#       rmlayer <name>
+#   * a markup layer's body is written to
+#       /dev/wsys/<wid>/draw/<name>/markup
+#     and the compositor parses "hamML v1" out of it:
+#       <rect x y w h fill=#rrggbb/>          filled rectangle
+#       <line x1 y1 x2 y2 stroke=#rrggbb width=n/>
+#       <text x y fill=#rrggbb>CONTENT</text> 8x16 mono, top-left at (x,y),
+#                                             advance 8 px per glyph
+#       <group transform="translate(dx,dy)">...</group>
+#     Colours: "#rrggbb" is the portable form (also "#rgb","rgba(...)").
+#     The whole window is 640x480; markup uses ABSOLUTE window coords.
+#
+# We compose everything from <rect>/<line>/<text>; the compositor's
+# convenience <button>/<input> tags hard-code their own colours, so the
+# toolkit draws its own chrome for full theming control.
+#
+# EVENTS — and the limitation we hit
+# ==================================
+# The compositor OWNS pointer routing (focus window, click/drag/scroll)
+# and gates the keyboard internally; it does NOT expose a per-window
+# structured pointer/focus event file a client can read. The thinnest
+# client-consumable surfaces the existing channels allow are:
+#   * /dev/mouse  — one ASCII line per event "<dx> <dy> <buttons> <dz>"
+#                   (RELATIVE deltas + a button bitmap bit0=L bit1=R
+#                   bit2=M). We accumulate deltas into an absolute cursor
+#                   ourselves and clamp to the window.
+#   * fd 0 (stdin / the console) — typed characters for the focused entry.
+# So hamui_run() polls /dev/mouse + stdin, hit-tests the widget tree, and
+# dispatches. LIMITATION: because the pointer is relative and not
+# window-routed, a real multi-window DE needs the compositor to expose a
+# per-window pointer-event file (absolute x/y in window space + buttons,
+# already known to the compositor's router) and a key-event file for the
+# focused window. Adding those compositor event APIs is a deliberate
+# FOLLOW-UP — out of scope here, flagged in the report. The event loop
+# below is structured so that swapping the input source for such a file
+# is a one-function change (see _hamui_poll_pointer / _hamui_poll_keys).
+#
+# COMPILER QUIRKS HONOURED (see memory/feedback_compiler_quirks)
+# ==============================================================
+#   * big buffers live at MODULE scope (no large locals);
+#   * string literals are passed as call-site Ptr[uint8] (NOT stored in
+#     NUL-initialised globals);
+#   * NO adjacent string-literal concatenation;
+#   * augmented assignment (+=) is available.
+
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield() -> int32
+
+
+# ====================================================================
+# Caps. A widget tree is fixed-size parallel arrays (Hamnix userland has
+# no malloc); the limits lift by widening these. 128 widgets is generous
+# for an app or a DE panel.
+# ====================================================================
+
+HAMUI_MAX_WIDGETS: uint64 = 128
+HAMUI_WIN_W:       uint64 = 640
+HAMUI_WIN_H:       uint64 = 480
+HAMUI_LABEL_CAP:   uint64 = 64        # per-widget text cap (label/entry/list item)
+
+# Widget kinds.
+HAMUI_K_NONE:    int32 = 0
+HAMUI_K_BOX_V:   int32 = 1            # vertical container
+HAMUI_K_BOX_H:   int32 = 2            # horizontal container
+HAMUI_K_FIXED:   int32 = 3            # absolute-position container
+HAMUI_K_LABEL:   int32 = 4
+HAMUI_K_BUTTON:  int32 = 5
+HAMUI_K_ENTRY:   int32 = 6
+HAMUI_K_CHECK:   int32 = 7
+HAMUI_K_LIST:    int32 = 8
+
+# Mouse button bitmap (from /dev/mouse).
+HAMUI_BTN_L: int32 = 1
+
+
+# ====================================================================
+# Widget tree — parallel arrays indexed by a widget id (0..count-1).
+# id 0 is the implicit root content widget of a window.
+# ====================================================================
+
+w_kind:    Array[128, int32]
+w_parent:  Array[128, int32]         # -1 for the root
+w_visible: Array[128, int32]
+# Geometry, filled by the layout pass (absolute window coords).
+w_x:       Array[128, int32]
+w_y:       Array[128, int32]
+w_w:       Array[128, int32]
+w_h:       Array[128, int32]
+# Requested size for leaf widgets / fixed children (0 => auto/measure).
+w_req_w:   Array[128, int32]
+w_req_h:   Array[128, int32]
+# Container layout: spacing between children + padding inside the box.
+w_spacing: Array[128, int32]
+w_pad:     Array[128, int32]
+# Text payload (label/button/entry/checkbox label). Flat LABEL_CAP each.
+w_text:    Array[8192, uint8]        # 128 * 64
+# State scalars (meaning depends on kind):
+#   CHECK : 0/1 checked
+#   ENTRY : caret index (== current text length; append-only v1)
+#   LIST  : selected row index (-1 = none)
+w_state:   Array[128, int32]
+# Per-widget signal flag: set when the widget is activated (button click,
+# checkbox toggle, list-row select). The app drains these via
+# hamui_take_event(). A pull-based signal model (instead of C-style
+# function-pointer callbacks) keeps the toolkit free of fragile indirect
+# calls and is trivial to consume — see the demo. 0 = no pending signal.
+w_signal:  Array[128, int32]
+# List rows: a separate flat store. Each list owns up to LIST_MAX_ROWS.
+HAMUI_LIST_MAX_ROWS: uint64 = 16
+w_list_first: Array[128, int32]      # first row slot in the row store, -1 none
+w_list_count: Array[128, int32]
+
+# List-row store.
+HAMUI_ROW_CAP: uint64 = 64
+list_row_text: Array[2048, uint8]    # 32 rows total * 64
+list_row_used: int32 = 0
+
+w_count: uint64 = 0
+
+# Theme colours, "#rrggbb" literals fetched on demand (see colour getters).
+# We keep them as small selectors so callers can retheme later; v1 uses a
+# clean neutral palette.
+
+
+# ====================================================================
+# Window object. A window owns a wid + its draw layers. v1 supports one
+# top-level window per process (the common app case); the DE rewrite will
+# instantiate many, one per app, which the compositor already multiplexes.
+# ====================================================================
+
+win_wid:   int32 = -1
+win_root:  int32 = -1                # root widget id
+win_focus: int32 = -1                # focused widget id (-1 none)
+# Absolute cursor, accumulated from /dev/mouse relative deltas.
+cur_x:     int32 = 320
+cur_y:     int32 = 240
+prev_btn:  int32 = 0                 # button bitmap from the previous poll
+mouse_fd:  int32 = -1
+
+
+# ====================================================================
+# Small string / number helpers (self-contained — no libc).
+# ====================================================================
+
+def _h_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _h_u32_to_dec(value: uint32, out: Ptr[uint8]) -> uint64:
+    # Decimal, no newline. Returns digit count.
+    if value == 0:
+        out[0] = 48
+        return 1
+    digits: Array[16, uint8]
+    n: uint64 = 0
+    v: uint32 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def _h_i32_to_dec(value: int32, out: Ptr[uint8]) -> uint64:
+    if value < 0:
+        out[0] = 45                                  # '-'
+        return 1 + _h_u32_to_dec(cast[uint32](0 - value), &out[1])
+    return _h_u32_to_dec(cast[uint32](value), &out[0])
+
+
+def _h_putc(buf: Ptr[uint8], pos: uint64, c: uint8) -> uint64:
+    buf[pos] = c
+    return pos + 1
+
+
+def _h_puts(buf: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
+    p: uint64 = pos
+    k: uint64 = 0
+    while s[k] != 0:
+        buf[p] = s[k]
+        p = p + 1
+        k = k + 1
+    return p
+
+
+# ====================================================================
+# Path builder: "/dev/wsys/<wid>/draw[/<layer>][/<leaf>]" into path_buf.
+# ====================================================================
+
+path_buf: Array[256, uint8]
+
+def _h_build_path(wid: int32, layer: Ptr[uint8], leaf: Ptr[uint8]):
+    i: uint64 = 0
+    i = _h_puts(&path_buf[0], i, "/dev/wsys/")
+    i = i + _h_u32_to_dec(cast[uint32](wid), &path_buf[i])
+    i = _h_puts(&path_buf[0], i, "/draw")
+    if layer != cast[Ptr[uint8]](0) and layer[0] != 0:
+        i = _h_putc(&path_buf[0], i, 47)             # '/'
+        i = _h_puts(&path_buf[0], i, layer)
+        if leaf != cast[Ptr[uint8]](0) and leaf[0] != 0:
+            i = _h_putc(&path_buf[0], i, 47)
+            i = _h_puts(&path_buf[0], i, leaf)
+    path_buf[i] = 0
+
+
+# ====================================================================
+# Widget construction API (the public, GTK/Qt-flavoured surface).
+# Every constructor returns a widget id (int32). Attach a child to a
+# container with hamui_add(parent, child).
+# ====================================================================
+
+def _h_alloc(kind: int32) -> int32:
+    if w_count >= HAMUI_MAX_WIDGETS:
+        return -1
+    id: int32 = cast[int32](w_count)
+    u: uint64 = w_count
+    w_kind[u] = kind
+    w_parent[u] = -1
+    w_visible[u] = 1
+    w_x[u] = 0
+    w_y[u] = 0
+    w_w[u] = 0
+    w_h[u] = 0
+    w_req_w[u] = 0
+    w_req_h[u] = 0
+    w_spacing[u] = 4
+    w_pad[u] = 6
+    w_state[u] = 0
+    w_signal[u] = 0
+    w_list_first[u] = -1
+    w_list_count[u] = 0
+    w_text[u * HAMUI_LABEL_CAP] = 0
+    w_count = w_count + 1
+    return id
+
+
+def _h_set_text(id: int32, s: Ptr[uint8]):
+    base: uint64 = cast[uint64](id) * HAMUI_LABEL_CAP
+    i: uint64 = 0
+    while s[i] != 0 and i < HAMUI_LABEL_CAP - 1:
+        w_text[base + i] = s[i]
+        i = i + 1
+    w_text[base + i] = 0
+
+
+def _h_text_len(id: int32) -> uint64:
+    base: uint64 = cast[uint64](id) * HAMUI_LABEL_CAP
+    n: uint64 = 0
+    while w_text[base + n] != 0:
+        n = n + 1
+    return n
+
+
+def hamui_init():
+    # Reset the toolkit. Call once before building a tree.
+    w_count = 0
+    list_row_used = 0
+    win_wid = -1
+    win_root = -1
+    win_focus = -1
+    cur_x = 320
+    cur_y = 240
+    prev_btn = 0
+    mouse_fd = -1
+
+
+def hamui_vbox() -> int32:
+    return _h_alloc(HAMUI_K_BOX_V)
+
+
+def hamui_hbox() -> int32:
+    return _h_alloc(HAMUI_K_BOX_H)
+
+
+def hamui_fixed() -> int32:
+    return _h_alloc(HAMUI_K_FIXED)
+
+
+def hamui_label(text: Ptr[uint8]) -> int32:
+    id: int32 = _h_alloc(HAMUI_K_LABEL)
+    if id >= 0:
+        _h_set_text(id, text)
+    return id
+
+
+def hamui_button(text: Ptr[uint8]) -> int32:
+    id: int32 = _h_alloc(HAMUI_K_BUTTON)
+    if id >= 0:
+        _h_set_text(id, text)
+    return id
+
+
+def hamui_entry() -> int32:
+    id: int32 = _h_alloc(HAMUI_K_ENTRY)
+    if id >= 0:
+        w_state[cast[uint64](id)] = 0                # caret = 0
+        w_req_w[cast[uint64](id)] = 160
+    return id
+
+
+def hamui_checkbox(text: Ptr[uint8]) -> int32:
+    id: int32 = _h_alloc(HAMUI_K_CHECK)
+    if id >= 0:
+        _h_set_text(id, text)
+    return id
+
+
+def hamui_list() -> int32:
+    id: int32 = _h_alloc(HAMUI_K_LIST)
+    if id >= 0:
+        w_state[cast[uint64](id)] = -1               # no selection
+        w_req_w[cast[uint64](id)] = 180
+    return id
+
+
+def hamui_list_add(list_id: int32, text: Ptr[uint8]):
+    # Append a row to a listbox.
+    if list_id < 0:
+        return
+    lu: uint64 = cast[uint64](list_id)
+    if w_kind[lu] != HAMUI_K_LIST:
+        return
+    if cast[uint64](w_list_count[lu]) >= HAMUI_LIST_MAX_ROWS:
+        return
+    if cast[uint64](list_row_used) >= 32:
+        return
+    slot: int32 = list_row_used
+    if w_list_first[lu] < 0:
+        w_list_first[lu] = slot
+    base: uint64 = cast[uint64](slot) * HAMUI_ROW_CAP
+    i: uint64 = 0
+    while text[i] != 0 and i < HAMUI_ROW_CAP - 1:
+        list_row_text[base + i] = text[i]
+        i = i + 1
+    list_row_text[base + i] = 0
+    w_list_count[lu] = w_list_count[lu] + 1
+    list_row_used = list_row_used + 1
+
+
+def hamui_set_size(id: int32, w: int32, h: int32):
+    if id < 0:
+        return
+    w_req_w[cast[uint64](id)] = w
+    w_req_h[cast[uint64](id)] = h
+
+
+def hamui_set_spacing(id: int32, spacing: int32, pad: int32):
+    if id < 0:
+        return
+    w_spacing[cast[uint64](id)] = spacing
+    w_pad[cast[uint64](id)] = pad
+
+
+def hamui_fixed_place(id: int32, x: int32, y: int32):
+    # For children of a FIXED container: absolute offset within the parent.
+    if id < 0:
+        return
+    w_x[cast[uint64](id)] = x
+    w_y[cast[uint64](id)] = y
+
+
+def hamui_add(parent: int32, child: int32):
+    if parent < 0 or child < 0:
+        return
+    w_parent[cast[uint64](child)] = parent
+
+
+def hamui_set_visible(id: int32, vis: int32):
+    if id >= 0:
+        w_visible[cast[uint64](id)] = vis
+
+
+def hamui_checked(id: int32) -> int32:
+    if id < 0:
+        return 0
+    return w_state[cast[uint64](id)]
+
+
+def hamui_list_selected(id: int32) -> int32:
+    if id < 0:
+        return -1
+    return w_state[cast[uint64](id)]
+
+
+def hamui_entry_text(id: int32) -> Ptr[uint8]:
+    if id < 0:
+        return cast[Ptr[uint8]](0)
+    return &w_text[cast[uint64](id) * HAMUI_LABEL_CAP]
+
+
+def hamui_take_event() -> int32:
+    # Pull-based signal drain (GTK-style "signal", but polled). Returns the
+    # id of one widget that fired since the last drain and clears its flag,
+    # or -1 when none are pending. Call in a loop to handle all pending
+    # events:  while (id = hamui_take_event()) >= 0: ... handle id ...
+    i: uint64 = 0
+    while i < w_count:
+        if w_signal[i] != 0:
+            w_signal[i] = 0
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def hamui_signalled(id: int32) -> int32:
+    # Non-draining check: did this specific widget fire? Clears the flag.
+    if id < 0:
+        return 0
+    u: uint64 = cast[uint64](id)
+    if w_signal[u] != 0:
+        w_signal[u] = 0
+        return 1
+    return 0
+
+
+# ====================================================================
+# LAYOUT PASS — measure then arrange. Sizes are computed bottom-up; the
+# root fills the window. We do a single recursive-ish pass implemented
+# iteratively over the (parent-before-child) creation order is NOT
+# guaranteed, so we measure with explicit recursion via a helper.
+# ====================================================================
+
+# Intrinsic size of a leaf widget (its "natural" measure).
+def _h_measure_leaf(id: int32, out_w: Ptr[int32], out_h: Ptr[int32]):
+    u: uint64 = cast[uint64](id)
+    k: int32 = w_kind[u]
+    tl: int32 = cast[int32](_h_text_len(id))
+    if k == HAMUI_K_LABEL:
+        out_w[0] = tl * 8 + 2
+        out_h[0] = 16
+    elif k == HAMUI_K_BUTTON:
+        out_w[0] = tl * 8 + 16
+        out_h[0] = 24
+    elif k == HAMUI_K_ENTRY:
+        out_w[0] = 160
+        out_h[0] = 22
+    elif k == HAMUI_K_CHECK:
+        out_w[0] = tl * 8 + 22                        # box + gap + label
+        out_h[0] = 18
+    elif k == HAMUI_K_LIST:
+        out_w[0] = 180
+        out_h[0] = cast[int32](w_list_count[u]) * 18 + 4
+        if out_h[0] < 22:
+            out_h[0] = 22
+    else:
+        out_w[0] = 0
+        out_h[0] = 0
+    # Honour an explicit requested size if larger / set.
+    if w_req_w[u] > out_w[0]:
+        out_w[0] = w_req_w[u]
+    if w_req_h[u] > out_h[0]:
+        out_h[0] = w_req_h[u]
+
+
+def _h_is_container(k: int32) -> int32:
+    if k == HAMUI_K_BOX_V or k == HAMUI_K_BOX_H or k == HAMUI_K_FIXED:
+        return 1
+    return 0
+
+
+# Measure widget `id` into w_w/w_h. Recurses into children first.
+def _h_measure(id: int32):
+    u: uint64 = cast[uint64](id)
+    k: int32 = w_kind[u]
+    if _h_is_container(k) == 0:
+        ow: Array[1, int32]
+        oh: Array[1, int32]
+        _h_measure_leaf(id, &ow[0], &oh[0])
+        w_w[u] = ow[0]
+        w_h[u] = oh[0]
+        return
+    # Container: measure children, then sum/stack.
+    pad: int32 = w_pad[u]
+    sp: int32 = w_spacing[u]
+    acc_main: int32 = 0
+    max_cross: int32 = 0
+    nvis: int32 = 0
+    c: uint64 = 0
+    while c < w_count:
+        if w_parent[c] == id and w_visible[c] != 0:
+            _h_measure(cast[int32](c))
+            cw: int32 = w_w[c]
+            ch: int32 = w_h[c]
+            if k == HAMUI_K_BOX_V:
+                acc_main = acc_main + ch
+                if cw > max_cross:
+                    max_cross = cw
+            elif k == HAMUI_K_BOX_H:
+                acc_main = acc_main + cw
+                if ch > max_cross:
+                    max_cross = ch
+            else:
+                # FIXED: bounding box of placed children.
+                ext_w: int32 = w_x[c] + cw
+                ext_h: int32 = w_y[c] + ch
+                if ext_w > acc_main:
+                    acc_main = ext_w
+                if ext_h > max_cross:
+                    max_cross = ext_h
+            nvis = nvis + 1
+        c = c + 1
+    if k == HAMUI_K_BOX_V:
+        gaps: int32 = 0
+        if nvis > 1:
+            gaps = (nvis - 1) * sp
+        w_w[u] = max_cross + pad * 2
+        w_h[u] = acc_main + gaps + pad * 2
+    elif k == HAMUI_K_BOX_H:
+        gaps2: int32 = 0
+        if nvis > 1:
+            gaps2 = (nvis - 1) * sp
+        w_w[u] = acc_main + gaps2 + pad * 2
+        w_h[u] = max_cross + pad * 2
+    else:
+        w_w[u] = acc_main + pad * 2
+        w_h[u] = max_cross + pad * 2
+    # Honour explicit container size if set larger.
+    if w_req_w[u] > w_w[u]:
+        w_w[u] = w_req_w[u]
+    if w_req_h[u] > w_h[u]:
+        w_h[u] = w_req_h[u]
+
+
+# Arrange: place `id` at (x,y) using its already-measured size, then lay
+# out children.
+def _h_arrange(id: int32, x: int32, y: int32):
+    u: uint64 = cast[uint64](id)
+    w_x[u] = x
+    w_y[u] = y
+    k: int32 = w_kind[u]
+    if _h_is_container(k) == 0:
+        return
+    pad: int32 = w_pad[u]
+    sp: int32 = w_spacing[u]
+    cx: int32 = x + pad
+    cy: int32 = y + pad
+    c: uint64 = 0
+    while c < w_count:
+        if w_parent[c] == id and w_visible[c] != 0:
+            if k == HAMUI_K_BOX_V:
+                _h_arrange(cast[int32](c), cx, cy)
+                cy = cy + w_h[c] + sp
+            elif k == HAMUI_K_BOX_H:
+                _h_arrange(cast[int32](c), cx, cy)
+                cx = cx + w_w[c] + sp
+            else:
+                # FIXED: child's stored w_x/w_y are offsets within parent.
+                _h_arrange(cast[int32](c), x + pad + w_x[c], y + pad + w_y[c])
+        c = c + 1
+
+
+def hamui_layout():
+    # Root fills the window content area.
+    if win_root < 0:
+        return
+    ru: uint64 = cast[uint64](win_root)
+    _h_measure(win_root)
+    # Let the root expand to the window if it measured smaller.
+    if w_w[ru] < cast[int32](HAMUI_WIN_W):
+        w_w[ru] = cast[int32](HAMUI_WIN_W)
+    if w_h[ru] < cast[int32](HAMUI_WIN_H):
+        w_h[ru] = cast[int32](HAMUI_WIN_H)
+    _h_arrange(win_root, 0, 0)
+
+
+# ====================================================================
+# PAINT PASS — emit hamML into a single markup buffer, then write it to
+# the window's "ui" markup layer in one syscall.
+# ====================================================================
+
+markup_buf: Array[8192, uint8]
+mk_pos: uint64 = 0
+
+
+def _h_mk_reset():
+    mk_pos = 0
+
+
+def _h_mk_str(s: Ptr[uint8]):
+    if mk_pos < 8000:
+        mk_pos = _h_puts(&markup_buf[0], mk_pos, s)
+
+
+def _h_mk_int(v: int32):
+    if mk_pos < 8000:
+        mk_pos = mk_pos + _h_i32_to_dec(v, &markup_buf[mk_pos])
+
+
+# Emit "<rect x.. y.. w.. h.. fill=#rrggbb/>"
+def _h_rect(x: int32, y: int32, w: int32, h: int32, col: Ptr[uint8]):
+    if w <= 0 or h <= 0:
+        return
+    _h_mk_str("<rect x=")
+    _h_mk_int(x)
+    _h_mk_str(" y=")
+    _h_mk_int(y)
+    _h_mk_str(" w=")
+    _h_mk_int(w)
+    _h_mk_str(" h=")
+    _h_mk_int(h)
+    _h_mk_str(" fill=")
+    _h_mk_str(col)
+    _h_mk_str("/>\n")
+
+
+# Emit a 1px border as four thin rects (keeps the parser trivial).
+def _h_border(x: int32, y: int32, w: int32, h: int32, col: Ptr[uint8]):
+    _h_rect(x, y, w, 1, col)
+    _h_rect(x, y + h - 1, w, 1, col)
+    _h_rect(x, y, 1, h, col)
+    _h_rect(x + w - 1, y, 1, h, col)
+
+
+# Emit "<text x.. y.. fill=#rrggbb>CONTENT</text>" from a widget's text.
+def _h_text_widget(id: int32, x: int32, y: int32, col: Ptr[uint8]):
+    _h_mk_str("<text x=")
+    _h_mk_int(x)
+    _h_mk_str(" y=")
+    _h_mk_int(y)
+    _h_mk_str(" fill=")
+    _h_mk_str(col)
+    _h_mk_str(">")
+    base: uint64 = cast[uint64](id) * HAMUI_LABEL_CAP
+    i: uint64 = 0
+    while w_text[base + i] != 0 and mk_pos < 8000:
+        c: uint8 = w_text[base + i]
+        # Never let a literal '<' or '>' corrupt the markup stream.
+        if c == 60 or c == 62:
+            c = 32
+        mk_pos = _h_putc(&markup_buf[0], mk_pos, c)
+        i = i + 1
+    _h_mk_str("</text>\n")
+
+
+# Emit a literal string as hamML text (for list rows / dynamic text).
+def _h_text_lit(s: Ptr[uint8], x: int32, y: int32, col: Ptr[uint8]):
+    _h_mk_str("<text x=")
+    _h_mk_int(x)
+    _h_mk_str(" y=")
+    _h_mk_int(y)
+    _h_mk_str(" fill=")
+    _h_mk_str(col)
+    _h_mk_str(">")
+    i: uint64 = 0
+    while s[i] != 0 and mk_pos < 8000:
+        c: uint8 = s[i]
+        if c == 60 or c == 62:
+            c = 32
+        mk_pos = _h_putc(&markup_buf[0], mk_pos, c)
+        i = i + 1
+    _h_mk_str("</text>\n")
+
+
+def _h_paint_widget(id: int32):
+    u: uint64 = cast[uint64](id)
+    if w_visible[u] == 0:
+        return
+    k: int32 = w_kind[u]
+    x: int32 = w_x[u]
+    y: int32 = w_y[u]
+    w: int32 = w_w[u]
+    h: int32 = w_h[u]
+    if k == HAMUI_K_LABEL:
+        _h_text_widget(id, x + 1, y, "#e0e0e0")
+    elif k == HAMUI_K_BUTTON:
+        # Highlight the button if it owns focus (keyboard/visual cue).
+        fill: Ptr[uint8] = "#4a6da7"
+        if win_focus == id:
+            fill = "#5f86c4"
+        _h_rect(x, y, w, h, fill)
+        _h_border(x, y, w, h, "#26344f")
+        _h_text_widget(id, x + 8, y + 4, "#ffffff")
+    elif k == HAMUI_K_ENTRY:
+        _h_rect(x, y, w, h, "#202020")
+        bc: Ptr[uint8] = "#555555"
+        if win_focus == id:
+            bc = "#4a6da7"
+        _h_border(x, y, w, h, bc)
+        _h_text_widget(id, x + 4, y + 3, "#f0f0f0")
+        # Caret after the typed text when focused.
+        if win_focus == id:
+            caret_x: int32 = x + 4 + cast[int32](_h_text_len(id)) * 8
+            _h_rect(caret_x, y + 3, 1, 16, "#f0f0f0")
+    elif k == HAMUI_K_CHECK:
+        _h_rect(x, y, 16, 16, "#202020")
+        _h_border(x, y, 16, 16, "#888888")
+        if w_state[u] != 0:
+            # A filled check mark (inner box).
+            _h_rect(x + 3, y + 3, 10, 10, "#5fc46d")
+        _h_text_widget(id, x + 22, y, "#e0e0e0")
+    elif k == HAMUI_K_LIST:
+        _h_rect(x, y, w, h, "#181818")
+        _h_border(x, y, w, h, "#555555")
+        sel: int32 = w_state[u]
+        first: int32 = w_list_first[u]
+        r: int32 = 0
+        while r < w_list_count[u]:
+            ry: int32 = y + 2 + r * 18
+            if r == sel:
+                _h_rect(x + 1, ry, w - 2, 18, "#4a6da7")
+            rowbase: uint64 = cast[uint64](first + r) * HAMUI_ROW_CAP
+            _h_text_lit(&list_row_text[rowbase], x + 4, ry + 1, "#f0f0f0")
+            r = r + 1
+    # Containers paint no chrome in v1 (transparent layout boxes).
+    return
+
+
+def hamui_paint():
+    # Clear, paint a window background, then every widget (creation order
+    # == back-to-front; containers are transparent so order is fine).
+    _h_mk_reset()
+    _h_rect(0, 0, cast[int32](HAMUI_WIN_W), cast[int32](HAMUI_WIN_H), "#2b2b2b")
+    i: uint64 = 0
+    while i < w_count:
+        _h_paint_widget(cast[int32](i))
+        i = i + 1
+    # Write the whole buffer to the "ui" markup layer in one syscall.
+    if win_wid < 0:
+        return
+    _h_build_path(win_wid, "ui", "markup")
+    fd: int32 = sys_open_write(cast[Ptr[char]](&path_buf[0]))
+    if fd >= 0:
+        sys_write(fd, &markup_buf[0], mk_pos)
+        sys_close(fd)
+
+
+# ====================================================================
+# WINDOW + LAYER setup.
+# ====================================================================
+
+def _h_ctl(verb: Ptr[uint8]):
+    _h_build_path(win_wid, cast[Ptr[uint8]](0), "ctl")
+    fd: int32 = sys_open_write(cast[Ptr[char]](&path_buf[0]))
+    if fd >= 0:
+        sys_write(fd, verb, _h_strlen(verb))
+        sys_close(fd)
+
+
+def hamui_window_on(root: int32, wid: int32) -> int32:
+    # Bind the toolkit to an EXISTING window `wid` and create the single
+    # "ui" markup layer the toolkit paints into. `root` is the content
+    # widget. Returns the wid on success, -1 on a bad arg.
+    #
+    # WHY a wid is supplied, not self-allocated: the kernel's
+    # SYS_WSYS_ALLOC is hostowner-only and REFUSES self-registration
+    # (syscall.ad: "wsys_alloc: refuses self-registration"). A window is
+    # always created FOR a process by whoever spawned it (the compositor /
+    # launcher allocates the wid and hands it to the child, e.g. via argv).
+    # So the toolkit consumes a wid the app already owns. The foreground
+    # serial-console shell owns wid 1, which is why hamui_window() defaults
+    # there for the standalone / headless-test case.
+    if root < 0 or wid < 1:
+        return -1
+    win_root = root
+    win_wid = wid
+    _h_ctl("mklayer ui markup\n")
+    _h_ctl("setz ui 10\n")
+    return win_wid
+
+
+def hamui_window(root: int32) -> int32:
+    # Convenience: bind to wid 1 (the foreground window of the calling
+    # shell). The DE rewrite passes an explicit per-app wid via
+    # hamui_window_on() instead.
+    return hamui_window_on(root, 1)
+
+
+def hamui_window_wid() -> int32:
+    return win_wid
+
+
+# ====================================================================
+# EVENT PASS — hit-test pointer + dispatch keys.
+# ====================================================================
+
+# Topmost visible leaf/interactive widget containing (px,py). Returns -1.
+def _h_hit_test(px: int32, py: int32) -> int32:
+    # Walk in REVERSE creation order so later (front) widgets win.
+    i: int64 = cast[int64](w_count) - 1
+    while i >= 0:
+        u: uint64 = cast[uint64](i)
+        if w_visible[u] != 0 and _h_is_container(w_kind[u]) == 0:
+            x: int32 = w_x[u]
+            y: int32 = w_y[u]
+            if px >= x and px < x + w_w[u] and py >= y and py < y + w_h[u]:
+                return cast[int32](i)
+        i = i - 1
+    return -1
+
+
+def _h_dispatch_click(tid: int32):
+    if tid < 0:
+        return
+    u: uint64 = cast[uint64](tid)
+    k: int32 = w_kind[u]
+    if k == HAMUI_K_BUTTON:
+        win_focus = tid
+        w_signal[u] = 1                              # fire the button signal
+    elif k == HAMUI_K_ENTRY:
+        win_focus = tid
+    elif k == HAMUI_K_CHECK:
+        win_focus = tid
+        if w_state[u] != 0:
+            w_state[u] = 0
+        else:
+            w_state[u] = 1
+        w_signal[u] = 1                              # toggled
+    elif k == HAMUI_K_LIST:
+        win_focus = tid
+        # Which row was hit?
+        row: int32 = (cur_y - (w_y[u] + 2)) / 18
+        if row >= 0 and row < w_list_count[u]:
+            w_state[u] = row
+            w_signal[u] = 1                          # selection changed
+
+
+# Append a typed character to the focused entry (printable ASCII only).
+def _h_dispatch_key(c: uint8):
+    if win_focus < 0:
+        return
+    u: uint64 = cast[uint64](win_focus)
+    if w_kind[u] != HAMUI_K_ENTRY:
+        return
+    if c == 8 or c == 127:                            # backspace / DEL
+        n: uint64 = _h_text_len(win_focus)
+        if n > 0:
+            w_text[u * HAMUI_LABEL_CAP + (n - 1)] = 0
+        return
+    if c < 32 or c > 126:
+        return
+    n2: uint64 = _h_text_len(win_focus)
+    if n2 < HAMUI_LABEL_CAP - 1:
+        w_text[u * HAMUI_LABEL_CAP + n2] = c
+        w_text[u * HAMUI_LABEL_CAP + n2 + 1] = 0
+
+
+# Parse one /dev/mouse line "<dx> <dy> <buttons> <dz>" -> accumulate.
+mouse_line: Array[64, uint8]
+
+def _h_parse_signed(buf: Ptr[uint8], pos: Ptr[uint64], cap: uint64) -> int32:
+    i: uint64 = pos[0]
+    while i < cap and (buf[i] == 32 or buf[i] == 9):
+        i = i + 1
+    neg: int32 = 0
+    if i < cap and buf[i] == 45:                      # '-'
+        neg = 1
+        i = i + 1
+    v: int32 = 0
+    while i < cap and buf[i] >= 48 and buf[i] <= 57:
+        v = v * 10 + cast[int32](buf[i]) - 48
+        i = i + 1
+    pos[0] = i
+    if neg != 0:
+        return 0 - v
+    return v
+
+
+# Poll the pointer once (non-blocking). Returns 1 if a fresh L-button
+# press edge fired a click this poll, else 0. NOTE: swap this body for a
+# per-window pointer-event file read when the compositor grows one.
+def _h_poll_pointer() -> int32:
+    if mouse_fd < 0:
+        mouse_fd = sys_open(cast[Ptr[char]]("/dev/mouse"))
+    if mouse_fd < 0:
+        return 0
+    clicked: int32 = 0
+    n: int64 = sys_read_nb(mouse_fd, &mouse_line[0], 63)
+    while n > 0:
+        pos: Array[1, uint64]
+        pos[0] = 0
+        cap: uint64 = cast[uint64](n)
+        dx: int32 = _h_parse_signed(&mouse_line[0], &pos[0], cap)
+        dy: int32 = _h_parse_signed(&mouse_line[0], &pos[0], cap)
+        btn: int32 = _h_parse_signed(&mouse_line[0], &pos[0], cap)
+        cur_x = cur_x + dx
+        cur_y = cur_y + dy
+        if cur_x < 0:
+            cur_x = 0
+        if cur_x >= cast[int32](HAMUI_WIN_W):
+            cur_x = cast[int32](HAMUI_WIN_W) - 1
+        if cur_y < 0:
+            cur_y = 0
+        if cur_y >= cast[int32](HAMUI_WIN_H):
+            cur_y = cast[int32](HAMUI_WIN_H) - 1
+        # Rising edge of the left button == a click.
+        was_l: int32 = prev_btn & HAMUI_BTN_L
+        is_l: int32 = btn & HAMUI_BTN_L
+        if is_l != 0 and was_l == 0:
+            tid: int32 = _h_hit_test(cur_x, cur_y)
+            _h_dispatch_click(tid)
+            clicked = 1
+        prev_btn = btn
+        n = sys_read_nb(mouse_fd, &mouse_line[0], 63)
+    return clicked
+
+
+key_buf: Array[16, uint8]
+
+# Poll the keyboard (stdin) once, non-blocking. Returns chars consumed.
+# NOTE: swap for a per-window key-event file when the compositor grows one.
+def _h_poll_keys() -> int32:
+    n: int64 = sys_read_nb(0, &key_buf[0], 16)
+    if n <= 0:
+        return 0
+    i: uint64 = 0
+    while i < cast[uint64](n):
+        _h_dispatch_key(key_buf[i])
+        i = i + 1
+    return cast[int32](n)
+
+
+# One render+dispatch step: poll input, and if anything changed, relayout
+# and repaint. Returns 1 if it repainted. Useful for embedding in a host
+# loop or for a single-shot render (call once after building the tree).
+def hamui_step() -> int32:
+    dirty: int32 = 0
+    if _h_poll_pointer() != 0:
+        dirty = 1
+    if _h_poll_keys() != 0:
+        dirty = 1
+    if dirty != 0:
+        hamui_layout()
+        hamui_paint()
+    return dirty
+
+
+# Render the current tree once (layout + paint) with no input polling.
+# The headless `hamUId render <wid>` test path drives exactly this output.
+def hamui_render():
+    hamui_layout()
+    hamui_paint()
+
+
+# The app run-loop. Lays out + paints once, then polls input forever,
+# repainting on change. Yields between polls so it never busy-burns a CPU.
+def hamui_run():
+    hamui_render()
+    while True:
+        hamui_step()
+        sys_yield()
