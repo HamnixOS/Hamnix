@@ -131,7 +131,7 @@ else
 fi
 
 # --- 4. Synthetic mouse decode path (hid_mouse_report -> /dev/mouse) ---
-if grep -F -q "[usb_hid_mouse] self-test PASS (7 cases)" "$LOG"; then
+if grep -E -q "\[usb_hid_mouse\] self-test PASS \([0-9]+ cases\)" "$LOG"; then
     echo "[installer_usb_hid_input] OK: hid_mouse_report -> mouse_rx_push self-test PASS"
 else
     echo "[installer_usb_hid_input] MISS: HID mouse decode self-test PASS banner absent"

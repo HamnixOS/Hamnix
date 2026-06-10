@@ -67,6 +67,7 @@ from drivers.pci.pci import (
 )
 from mm.page_alloc import alloc_pages
 from drivers.usb.hid import hid_init, hid_kbd_report, hid_mouse_report
+from drivers.input.auxmouse import mouse_rx_pop
 from drivers.input.atkbd import kbd_rx_pop
 from fs.cpio import cpio_init, initramfs_entry_count, initramfs_entry_name
 from arch.x86.kernel.smp import is_bare_metal, is_bare_metal_with_diag
@@ -395,6 +396,17 @@ class XhciState:
     mouse_enabled:     uint32     # 1 once the interrupt-IN ring is armed
     mouse_live_attached: uint32   # 1 on a real live enumeration
     mouse_reports_received: uint32
+    # Composite combo-device support. A wireless KB+mouse "unifying"
+    # receiver (the common real-NUC setup) is ONE usb device on ONE port
+    # exposing TWO HID interfaces — a keyboard (ep1-IN) AND a mouse
+    # (usually ep2-IN). The separate-port mouse attach can't find a second
+    # port for it, so the mouse interface is enumerated on the SAME device
+    # slot the keyboard already addressed. When that happens
+    # mouse_slot_id == kbd_slot_id, so xhci_poll can no longer route by
+    # slot id alone; it routes mouse vs keyboard by which DMA buffer the
+    # completed report landed in. This flag tells the poll loop to use the
+    # buffer-address discriminator instead of the slot-id one.
+    mouse_shares_kbd_slot: uint32 # 1 = mouse interface lives on kbd's slot
 
     # Configuration descriptor scratch (config + interface + endpoints
     # are all crammed into one byte run; 256 bytes is plenty for a
@@ -1548,13 +1560,27 @@ def xhci_init_ex(force_bare_metal: int32) -> int32:
             printk0("[xhci] live keyboard attach disabled by /etc/xhci-no-attach marker\n")
         else:
             _xhci_v1_attach_keyboard()
-            # A real user attaches BOTH a keyboard and a mouse. After the
-            # keyboard's slot is up, bring up a SECOND slot for a USB HID
-            # boot-protocol mouse on a different port so the DE cursor
-            # comes up on USB-only boxes (the Intel NUC has no PS/2 mouse,
-            # so /dev/mouse was never fed before this). Non-fatal: a
-            # mouse-attach failure leaves the keyboard fully working.
-            _xhci_v1_attach_mouse()
+            # A real user attaches a keyboard AND a mouse. Two shapes:
+            #
+            #  (a) Composite combo device — ONE wireless receiver exposing
+            #      a keyboard interface AND a mouse interface on a single
+            #      port (Logitech unifying / generic 2.4 GHz combo). This
+            #      is the COMMON real-NUC setup. _xhci_v1_attach_keyboard
+            #      already addressed that device, so we bring the mouse
+            #      interface up ADDITIVELY on the SAME slot. Before this,
+            #      _xhci_v1_attach_mouse found no second port for the combo
+            #      and gave up, leaving the cursor dead on the NUC while the
+            #      keyboard worked — the exact reported symptom.
+            #
+            #  (b) Two separate devices on two ports — the classic case;
+            #      _xhci_v1_attach_mouse brings up a second slot.
+            #
+            # Try the same-slot combo first; only fall back to the
+            # separate-port attach when the keyboard's device had no mouse
+            # interface. Both are NON-FATAL — a mouse-attach failure leaves
+            # the keyboard fully working.
+            if _xhci_v1_attach_mouse_same_slot() == 0:
+                _xhci_v1_attach_mouse()
     else:
         printk0("[xhci] V1 transfer-engine bringup skipped\n")
 
@@ -3765,6 +3791,42 @@ def xhci_attach_mass_storage() -> uint32:
 
 # --- Interrupt-IN endpoint poll path -----------------------------
 
+def _xhci_mouse_arm_one():
+    # Enqueue ONE Normal TRB on the MOUSE interrupt-IN Transfer Ring and
+    # ring the mouse slot's doorbell at the mouse's ACTUAL endpoint DCI.
+    # This is the single arming path for the mouse ring — used by both the
+    # mouse attach and the poll-loop re-arm — and it works regardless of
+    # whether the mouse has its own slot or shares the keyboard's slot
+    # (composite combo device). The doorbell endpoint is (ep*2)+1, NOT a
+    # hardcoded ep1-IN(=3): a composite mouse interface routinely sits on
+    # ep2-IN (DCI 5) because the keyboard already owns ep1-IN, and ringing
+    # DCI 3 there would tickle the wrong endpoint so the controller would
+    # never post a mouse Transfer Event (silent dead mouse on real HW).
+    slot_idx: uint64 = cast[uint64](xhci.mouse_int_buf_idx)
+    buf_addr: uint64 = xhci.mouse_int_buf + slot_idx * 8
+    next_idx: uint32 = xhci.mouse_int_buf_idx + 1
+    if next_idx >= 512:
+        next_idx = 0
+    xhci.mouse_int_buf_idx = next_idx
+    plo: uint32 = cast[uint32](buf_addr & 0xFFFFFFFF)
+    phi: uint32 = cast[uint32]((buf_addr >> 32) & 0xFFFFFFFF)
+    sts: uint32 = 8
+    ctl: uint32 = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC_BIT
+    if xhci.mouse_int_cycle != 0:
+        ctl = ctl | TRB_CYCLE_BIT
+    _xhci_trb_write(xhci.mouse_int_ring, xhci.mouse_int_enqueue,
+                    plo, phi, sts, ctl)
+    xhci.mouse_int_enqueue = xhci.mouse_int_enqueue + 1
+    if xhci.mouse_int_enqueue >= RING_USABLE:
+        _xhci_ring_set_link_cycle(xhci.mouse_int_ring,
+                                  xhci.mouse_int_cycle)
+        xhci.mouse_int_enqueue = 0
+        xhci.mouse_int_cycle = xhci.mouse_int_cycle ^ 1
+    db_addr: uint64 = xhci.db_base + cast[uint64](xhci.mouse_slot_id) \
+                                   * XHCI_DB_STRIDE
+    _xhci_w32(db_addr, (xhci.mouse_int_ep * 2) + 1)
+
+
 def _xhci_int_arm_one():
     # Enqueue ONE Normal TRB on the KEYBOARD interrupt-IN Transfer Ring.
     # Thin wrapper over the generalized arm helper, preserving the
@@ -3781,34 +3843,20 @@ def _xhci_int_arm_one_slot(which_slot: uint32):
     # report both from the param-pointer AND from the slot id baked into
     # the event TRB. Endpoint id 3 (ep1-IN) is used for both — each slot
     # has its own DCBAA context, so there is no collision.
+    # The mouse-ring arm path is normally selected by the slot id. But a
+    # composite combo device puts the mouse interface on the SAME device
+    # slot as the keyboard (mouse_slot_id == kbd_slot_id), so the slot id
+    # alone can't disambiguate. In that shared-slot case the mouse ring is
+    # armed exclusively via _xhci_mouse_arm_one(); the generic per-slot
+    # arm here only ever needs to drive the KEYBOARD ring, so we skip the
+    # is_mouse branch when the slots coincide.
     is_mouse: int32 = 0
-    if xhci.mouse_slot_id != 0 and which_slot == xhci.mouse_slot_id:
+    if xhci.mouse_slot_id != 0 and which_slot == xhci.mouse_slot_id \
+       and xhci.mouse_shares_kbd_slot == 0:
         is_mouse = 1
 
     if is_mouse != 0:
-        slot_idx: uint64 = cast[uint64](xhci.mouse_int_buf_idx)
-        buf_addr: uint64 = xhci.mouse_int_buf + slot_idx * 8
-        next_idx: uint32 = xhci.mouse_int_buf_idx + 1
-        if next_idx >= 512:
-            next_idx = 0
-        xhci.mouse_int_buf_idx = next_idx
-        plo: uint32 = cast[uint32](buf_addr & 0xFFFFFFFF)
-        phi: uint32 = cast[uint32]((buf_addr >> 32) & 0xFFFFFFFF)
-        sts: uint32 = 8
-        ctl: uint32 = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC_BIT
-        if xhci.mouse_int_cycle != 0:
-            ctl = ctl | TRB_CYCLE_BIT
-        _xhci_trb_write(xhci.mouse_int_ring, xhci.mouse_int_enqueue,
-                        plo, phi, sts, ctl)
-        xhci.mouse_int_enqueue = xhci.mouse_int_enqueue + 1
-        if xhci.mouse_int_enqueue >= RING_USABLE:
-            _xhci_ring_set_link_cycle(xhci.mouse_int_ring,
-                                      xhci.mouse_int_cycle)
-            xhci.mouse_int_enqueue = 0
-            xhci.mouse_int_cycle = xhci.mouse_int_cycle ^ 1
-        db_addr: uint64 = xhci.db_base + cast[uint64](which_slot) \
-                                       * XHCI_DB_STRIDE
-        _xhci_w32(db_addr, 3)
+        _xhci_mouse_arm_one()
         return
 
     slot_idx: uint64 = cast[uint64](xhci.kbd_int_buf_idx)
@@ -3883,8 +3931,25 @@ def xhci_poll():
                     # hid_mouse_report. (Both endpoints are ep1-IN on
                     # distinct slots, so the slot id is the discriminator.)
                     evt_slot: uint32 = (c >> 24) & 0xFF
-                    if xhci.mouse_slot_id != 0 \
-                       and evt_slot == xhci.mouse_slot_id:
+                    # Route mouse vs keyboard. Normally the slot id is the
+                    # discriminator (each device has its own slot). But a
+                    # composite combo device puts BOTH HID interfaces on
+                    # ONE slot (mouse_shares_kbd_slot==1); there the event
+                    # slot id matches BOTH, so we disambiguate by which DMA
+                    # buffer the completed report landed in — the mouse ring
+                    # points its TRBs into mouse_int_buf (a distinct 4 KiB
+                    # page from kbd_int_buf), so p falling inside that page
+                    # means it's a mouse report.
+                    is_mouse_evt: int32 = 0
+                    if xhci.mouse_slot_id != 0:
+                        if xhci.mouse_shares_kbd_slot != 0:
+                            if xhci.mouse_int_buf != 0 \
+                               and p >= xhci.mouse_int_buf \
+                               and p < xhci.mouse_int_buf + 4096:
+                                is_mouse_evt = 1
+                        elif evt_slot == xhci.mouse_slot_id:
+                            is_mouse_evt = 1
+                    if is_mouse_evt != 0:
                         # Boot-mouse report. Feed it to the mouse HID
                         # driver, which packs it into the devmouse FIFO.
                         # The Transfer Event status low 24 bits hold the
@@ -3900,8 +3965,11 @@ def xhci_poll():
                                          cast[int32](mouse_rlen))
                         xhci.mouse_reports_received = \
                             xhci.mouse_reports_received + 1
-                        # Re-arm a fresh IN TRB on the MOUSE ring.
-                        _xhci_int_arm_one_slot(xhci.mouse_slot_id)
+                        # Re-arm a fresh IN TRB on the MOUSE ring (its own
+                        # arming path — works for both own-slot and
+                        # shared-slot composite devices, and rings the
+                        # mouse's true endpoint doorbell).
+                        _xhci_mouse_arm_one()
                         _xhci_evt_advance()
                         drained = drained + 1
                         # Skip the keyboard accounting below for this
@@ -4591,10 +4659,10 @@ def _xhci_v1_attach_mouse():
 
     # Arm 4 read TRBs on the mouse interrupt-IN ring.
     printk0("[boot:01.h.m] xhci mouse attach: arm interrupt-IN ring\n")
-    _xhci_int_arm_one_slot(slot)
-    _xhci_int_arm_one_slot(slot)
-    _xhci_int_arm_one_slot(slot)
-    _xhci_int_arm_one_slot(slot)
+    _xhci_mouse_arm_one()
+    _xhci_mouse_arm_one()
+    _xhci_mouse_arm_one()
+    _xhci_mouse_arm_one()
 
     xhci.mouse_enabled = 1
     xhci.mouse_live_attached = 1
@@ -4604,6 +4672,153 @@ def _xhci_v1_attach_mouse():
     # /dev/mouse -> the DE cursor. This line is the load-bearing proof on
     # the NUC boot log that USB HID mouse input is LIVE and polling.
     printk0("[boot:01.h.n] xhci mouse attach: complete (interrupt-IN polling LIVE via timer tick)\n")
+
+
+# --- Composite combo-device mouse attach (SAME slot as the keyboard) ---
+#
+# The dominant real-world setup on a USB-only box like the Intel NUC is a
+# wireless KB+mouse "unifying" receiver: ONE usb device on ONE port that
+# exposes TWO HID interfaces — a boot keyboard (ep1-IN) AND a boot mouse
+# (usually ep2-IN). _xhci_v1_attach_keyboard already enumerated and
+# addressed that device, fetched its full config descriptor into cfg_buf,
+# and issued SET_CONFIGURATION. The separate-port _xhci_v1_attach_mouse
+# can't find a SECOND port for such a device, so the mouse interface would
+# never be brought up and /dev/mouse never fed — the exact "keyboard works,
+# mouse dead" symptom seen on the NUC.
+#
+# This routine re-walks the keyboard device's still-resident config
+# descriptor for a mouse interface; if present it configures that
+# interface's interrupt-IN endpoint ADDITIVELY on the keyboard's existing
+# slot (a second Configure Endpoint command) and arms it on its own ring.
+# Returns 1 if a same-slot mouse was attached, 0 if none was present (so
+# the caller can fall back to the separate-port attach for a real two-
+# device setup).
+def _xhci_v1_attach_mouse_same_slot() -> int32:
+    if xhci.kbd_slot_id == 0:
+        return 0
+    if xhci.cfg_buf == 0:
+        return 0
+    total: uint16 = xhci.cfg_total_len
+    if total < 9:
+        return 0
+
+    printk0("[boot:01.g.a] xhci same-slot mouse: walk kbd config for mouse iface\n")
+    m_int_ep:  uint32 = 0
+    m_int_mps: uint32 = 8
+    m_int_intv: uint32 = 10
+    m_intf:    uint8 = 0
+    off: uint64 = 9
+    found_mouse_intf: int32 = 0
+    while off + 2 <= cast[uint64](total):
+        dlen:  uint8 = cast[Ptr[uint8]](xhci.cfg_buf + off)[0]
+        dtype: uint8 = cast[Ptr[uint8]](xhci.cfg_buf + off + 1)[0]
+        if dlen == 0:
+            off = cast[uint64](total)              # break
+        else:
+            dptr: Ptr[uint8] = cast[Ptr[uint8]](xhci.cfg_buf + off)
+            if dtype == 0x04:                      # interface descriptor
+                if usb_if_class(dptr) == USB_CLASS_HID \
+                   and usb_if_protocol(dptr) == USB_PROTOCOL_MOUSE:
+                    m_intf = usb_if_number(dptr)
+                    found_mouse_intf = 1
+                    printk1("[boot:01.g.a.1] same-slot mouse interface matched (bInterfaceProtocol=0x02 MOUSE) intf=%d\n",
+                            cast[uint64](m_intf))
+                else:
+                    found_mouse_intf = 0
+            elif dtype == 0x05:                    # endpoint descriptor
+                if found_mouse_intf == 1 \
+                   and usb_ep_is_interrupt_in(dptr) != 0:
+                    m_int_ep = cast[uint32](usb_ep_address(dptr) & 0xF)
+                    m_int_mps = cast[uint32](usb_ep_max_packet(dptr) \
+                                            & 0x07FF)
+                    m_int_intv = cast[uint32](usb_ep_interval(dptr))
+                    if m_int_mps == 0:
+                        m_int_mps = 8
+                    off = cast[uint64](total)      # break
+            off = off + cast[uint64](dlen)
+    if m_int_ep == 0:
+        # No mouse interface on the keyboard's device — not a combo.
+        return 0
+
+    # Allocate the mouse's interrupt-IN ring + DMA buffer. The slot, ep0,
+    # and device contexts are SHARED with the keyboard (same device), so
+    # we don't allocate or re-address anything there.
+    printk0("[boot:01.g.b] xhci same-slot mouse: alloc int ring/buf\n")
+    xhci.mouse_int_ring = alloc_pages(0)
+    xhci.mouse_int_buf  = alloc_pages(0)
+    if xhci.mouse_int_ring == 0 or xhci.mouse_int_buf == 0:
+        printk0("[xhci] same-slot mouse alloc failed (non-fatal)\n")
+        return 0
+    memset(cast[Ptr[uint8]](xhci.mouse_int_buf), 0, 4096)
+    xhci.mouse_int_enqueue = 0
+    xhci.mouse_int_cycle   = 1
+    xhci.mouse_int_buf_idx = 0
+    _xhci_ring_init(xhci.mouse_int_ring, 1)
+
+    xhci.mouse_slot_id   = xhci.kbd_slot_id
+    xhci.mouse_port      = xhci.kbd_port
+    xhci.mouse_speed     = xhci.kbd_speed
+    xhci.mouse_int_ep    = m_int_ep
+    xhci.mouse_int_mps   = m_int_mps
+    xhci.mouse_shares_kbd_slot = 1
+
+    # SET_CONFIGURATION if the keyboard path didn't already issue it. The
+    # keyboard attach only reaches its SET_CONFIGURATION AFTER it found a
+    # keyboard interrupt-IN endpoint; on a mouse-ONLY device it bails at
+    # the descriptor walk first (int_ep==0), leaving kbd_enabled==0 and the
+    # device addressed-but-not-configured. A combo device with a real
+    # keyboard interface (kbd_enabled==1) is already configured, so we must
+    # NOT re-issue SET_CONFIGURATION there (it would reset the device's
+    # interface/endpoint state and drop the keyboard's armed endpoint).
+    if xhci.kbd_enabled == 0:
+        printk0("[boot:01.g.b2] xhci same-slot mouse: SET_CONFIGURATION (mouse-only device)\n")
+        if xhci_control_transfer(
+            USB_RT_SET_CONFIGURATION, USB_REQ_SET_CONFIGURATION,
+            cast[uint16](xhci.cfg_value), 0, 0, 0) < 0:
+            printk0("[xhci] same-slot mouse SET_CONFIGURATION failed (non-fatal)\n")
+
+    # SET_PROTOCOL(BOOT) + SET_IDLE on the MOUSE interface. xhci_control_
+    # transfer drives the shared (keyboard) ep0, which already targets the
+    # combo device's slot — exactly what we want for its mouse interface.
+    printk0("[boot:01.g.c] xhci same-slot mouse: SET_PROTOCOL(BOOT)\n")
+    if xhci_control_transfer(
+        USB_RT_SET_PROTOCOL, HID_REQ_SET_PROTOCOL,
+        HID_PROTOCOL_BOOT, cast[uint16](m_intf), 0, 0) < 0:
+        printk0("[xhci] same-slot mouse SET_PROTOCOL(BOOT) failed (non-fatal)\n")
+    printk0("[boot:01.g.d] xhci same-slot mouse: SET_IDLE\n")
+    if xhci_control_transfer(
+        USB_RT_SET_IDLE, HID_REQ_SET_IDLE,
+        0, cast[uint16](m_intf), 0, 0) < 0:
+        printk0("[xhci] same-slot mouse SET_IDLE failed (non-fatal)\n")
+
+    # Configure the mouse interrupt-IN endpoint ADDITIVELY on the keyboard
+    # slot. ctx_entries must be the max DCI in the RESULTING context, which
+    # is this endpoint's DCI (ep2-IN -> 5); _xhci_v1_configure_endpoint
+    # clamps ce = max(ctx_entries, ep_id) so passing ep_id is correct, and
+    # it preserves the slot Speed/port the keyboard already set.
+    printk0("[boot:01.g.e] xhci same-slot mouse: Configure Endpoint (additive)\n")
+    ep_id: uint32 = (m_int_ep * 2) + 1
+    if _xhci_v1_configure_endpoint(xhci.kbd_slot_id, ep_id, EP_TYPE_INT_IN,
+                                   m_int_mps, m_int_intv,
+                                   xhci.mouse_int_ring, ep_id, 0,
+                                   xhci.kbd_speed) != 0:
+        printk0("[xhci] same-slot mouse Configure Endpoint failed (non-fatal)\n")
+        xhci.mouse_slot_id = 0
+        xhci.mouse_shares_kbd_slot = 0
+        return 0
+
+    printk0("[boot:01.g.f] xhci same-slot mouse: arm interrupt-IN ring\n")
+    _xhci_mouse_arm_one()
+    _xhci_mouse_arm_one()
+    _xhci_mouse_arm_one()
+    _xhci_mouse_arm_one()
+
+    xhci.mouse_enabled = 1
+    xhci.mouse_live_attached = 1
+    printk1("[xhci] USB mouse enabled (composite combo device, shares kbd slot %d): events armed\n",
+            cast[uint64](xhci.kbd_slot_id))
+    printk0("[boot:01.g.g] xhci same-slot mouse attach: complete (interrupt-IN polling LIVE via timer tick)\n")
+    return 1
 
 
 def _xhci_mouse_restore_ep0(slot: uint32, port: uint32, ep0: uint64,
@@ -4916,6 +5131,138 @@ def xhci_v2_selftest():
     xhci.kbd_enabled = saved_enabled
     if saved_slot == 0:
         xhci.kbd_slot_id = 0
+
+
+# =====================================================================
+# Composite combo-device routing self-test (shared-slot mouse).
+# =====================================================================
+#
+# QEMU has no composite KB+mouse HID device, so the real-HW combo path
+# (one slot, two interfaces) can't be exercised by plugging a device.
+# This synthetic test proves the LOAD-BEARING new logic: when the mouse
+# shares the keyboard's slot (mouse_shares_kbd_slot==1, mouse_slot_id ==
+# kbd_slot_id), xhci_poll must route a completed report by which DMA
+# buffer it landed in — a report in mouse_int_buf goes to hid_mouse_report
+# (-> /dev/mouse), NOT to the keyboard FIFO. It also confirms a report in
+# the KEYBOARD buffer on the same slot still routes to the keyboard.
+#
+# We forge a 3-byte boot-mouse report (dx=+7, no buttons) into a real
+# mouse_int_buf page, point the controller's interrupt-IN ring/buf state
+# at it, set the shared-slot flags, inject a Transfer Event at the event-
+# ring cursor, and call xhci_poll(). PASS asserts the decoded /dev/mouse
+# packet carries dx=+7 and that mouse_reports_received bumped by one.
+xhci_combo_mouse_buf: Array[8, uint8]
+
+def xhci_combo_routing_selftest():
+    printk0("[xhci_combo] self-test: shared-slot mouse report routing\n")
+
+    # Snapshot + stand up a minimal shared-slot configuration.
+    saved_mslot:   uint32 = xhci.mouse_slot_id
+    saved_share:   uint32 = xhci.mouse_shares_kbd_slot
+    saved_mbuf:    uint64 = xhci.mouse_int_buf
+    saved_mring:   uint64 = xhci.mouse_int_ring
+    saved_mep:     uint32 = xhci.mouse_int_ep
+    saved_menab:   uint32 = xhci.mouse_enabled
+    saved_kslot:   uint32 = xhci.kbd_slot_id
+    saved_kenab:   uint32 = xhci.kbd_enabled
+    saved_synth:   uint32 = xhci.synthetic_inject_active
+
+    if xhci.kbd_slot_id == 0:
+        xhci.kbd_slot_id = 1
+    # The mouse rides the keyboard's slot — the combo-device shape.
+    xhci.mouse_slot_id         = xhci.kbd_slot_id
+    xhci.mouse_shares_kbd_slot = 1
+    xhci.mouse_enabled         = 1
+    xhci.kbd_enabled           = 1
+    xhci.mouse_int_ep          = 2          # ep2-IN, the typical combo mouse ep
+    if xhci.mouse_int_ring == 0:
+        xhci.mouse_int_ring = alloc_pages(0)
+        if xhci.mouse_int_ring != 0:
+            _xhci_ring_init(xhci.mouse_int_ring, 1)
+    # Point mouse_int_buf at a real, distinct page so the poll loop's
+    # buffer-range discriminator (p in [mouse_int_buf, +4096)) can fire.
+    xhci.mouse_int_buf = cast[uint64](&xhci_combo_mouse_buf[0])
+    xhci.synthetic_inject_active = 1
+
+    pass_count: uint32 = 0
+    fail_count: uint32 = 0
+
+    # Drain any stray /dev/mouse + kbd FIFO state.
+    while mouse_rx_pop() != -1:
+        pass
+    while kbd_rx_pop() >= 0:
+        pass
+
+    # Forge a 3-byte boot-mouse report: buttons=0, dx=+7, dy=0.
+    xhci_combo_mouse_buf[0] = 0
+    xhci_combo_mouse_buf[1] = 7
+    xhci_combo_mouse_buf[2] = 0
+
+    before_mreports: uint32 = xhci.mouse_reports_received
+
+    # Inject a Transfer Event whose param-pointer is INSIDE mouse_int_buf
+    # (length 3 = a 3-byte boot-mouse report, residual 5). The event TRB's
+    # slot id is kbd_slot_id (== mouse_slot_id here) — exactly the combo
+    # case where slot id can't disambiguate, so only the buffer-address
+    # route gets it to the mouse.
+    _xhci_v1_inject_transfer_event(
+        cast[uint64](&xhci_combo_mouse_buf[0]), 3)
+    xhci_poll()
+
+    # The mouse report must have gone to /dev/mouse, NOT the keyboard FIFO.
+    mpkt: int32 = mouse_rx_pop()
+    if mpkt == -1:
+        fail_count = fail_count + 1
+        printk0("[xhci_combo] FAIL: no /dev/mouse packet (report misrouted)\n")
+    else:
+        # Decode dx (low 16 bits, signed) the way devmouse packs it.
+        graw: uint64 = cast[uint64](mpkt) & 0xFFFF
+        gdx: int32 = cast[int32](graw)
+        if (graw & 0x8000) != 0:
+            gdx = cast[int32](graw | 0xFFFFFFFFFFFF0000)
+        if gdx == 7:
+            pass_count = pass_count + 1
+        else:
+            fail_count = fail_count + 1
+            printk1("[xhci_combo] FAIL: /dev/mouse dx=%d (want 7)\n",
+                    cast[uint64](cast[uint32](gdx)))
+
+    if xhci.mouse_reports_received - before_mreports != 1:
+        fail_count = fail_count + 1
+        printk0("[xhci_combo] FAIL: mouse_reports_received did not bump\n")
+
+    # The keyboard FIFO must be empty — the mouse report must NOT have
+    # been mistaken for a keystroke.
+    if kbd_rx_pop() != -1:
+        fail_count = fail_count + 1
+        printk0("[xhci_combo] FAIL: mouse report leaked into kbd FIFO\n")
+    else:
+        pass_count = pass_count + 1
+
+    # Restore state.
+    xhci.mouse_slot_id         = saved_mslot
+    xhci.mouse_shares_kbd_slot = saved_share
+    xhci.mouse_int_buf         = saved_mbuf
+    xhci.mouse_int_ring        = saved_mring
+    xhci.mouse_int_ep          = saved_mep
+    xhci.mouse_enabled         = saved_menab
+    xhci.kbd_enabled           = saved_kenab
+    xhci.synthetic_inject_active = saved_synth
+    if saved_kslot == 0:
+        xhci.kbd_slot_id = 0
+    while mouse_rx_pop() != -1:
+        pass
+    while kbd_rx_pop() >= 0:
+        pass
+
+    if fail_count == 0:
+        printk1("[xhci_combo] shared-slot routing PASS (%d checks)\n",
+                cast[uint64](pass_count))
+        printk0("[usb_hid_combo] PASS\n")
+    else:
+        printk1("[xhci_combo] shared-slot routing FAIL (%d failures)\n",
+                cast[uint64](fail_count))
+        printk0("[usb_hid_combo] FAIL\n")
 
 
 # =====================================================================
