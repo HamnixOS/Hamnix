@@ -93,12 +93,16 @@ replaces the ~70 `is_*_path` backend-selection branches).
    - [ ] **Real per-window input** — depends on #2b below (compositor
      event file). Until it lands, keep the /dev/mouse + stdin shim; the
      swap is a one-function change (`_h_poll_pointer`/`_h_poll_keys`).
-2b. [ ] **Compositor per-window input event file** (DISJOINT track,
-   owns `user/hamUId.ad` + `devwsys.ad`, NOT `lib/hamui.ad`) — expose a
+2b. [x] **Compositor per-window input event file** (#424, LANDED) — a
    per-window pointer-event file (absolute window-space x/y + button
-   bitmap, already known to the compositor router) and a key-event file
-   for the focused window. This is the #1 blocker for real multi-window
-   interactivity; toolkit input swaps onto it once it lands.
+   bitmap) and a key-event file for the focused window.
+2c. [x] **KEYSTONE — live compositor renders external client "ui" markup**
+   (#425, VERIFIED + pushed `29f17dc1`) — the live hamUId compositor
+   rasterises an arbitrary hamui client's "ui" markup layer into the live
+   frame, proven on a REAL EFI GOP framebuffer (OVMF) by
+   `scripts/test_hamUI_markupclient_gop.sh` (six markup markers + PASS,
+   composited pixels sampled via daemon_pixel). This was the gate on item 3
+   below; the MATE-mirror DE rewrite is now UNGATED.
 3. [~] **Rewrite the entire DE as a MATE MIRROR on `lib/hamui.ad`** — the
    current `user/hamUId.ad` (24.4k lines) is one monolith owning fb +
    input + WM + per-app rendering + compositing. User directive
