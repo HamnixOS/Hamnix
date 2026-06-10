@@ -37,9 +37,10 @@
 from drivers.video.console.fb_text import (
     fb_get_initialized, fb_get_width, fb_get_height,
     fb_get_pitch, fb_get_bpp, fb_get_pixfmt,
-    fb_present_rgba_row,
+    fb_present_rgba_row, fb_init, FB_PIXFMT_RGB,
     fb_console_suspend, fb_console_resume, fb_console_is_suspended,
 )
+from kernel.printk.printk import printk0
 # Dirty-rectangle present (P4d) reads the changed rectangle's pixels from
 # the compositor's own RGBA source buffer in ITS address space, so it
 # must walk the current task's page tables via copy_from_user.
@@ -299,16 +300,26 @@ def _fbctl_match(buf: Ptr[uint8], count: uint64, word: Ptr[uint8],
 FBCTL_RECT_MAGIC:  uint32 = 0x54434552         # 'R','E','C','T' LE
 FBCTL_RECT_HDRLEN: uint64 = 52
 
-# Per-row scratch for the source pixels copied out of the caller's
-# address space. 8192 px * 4 = 32768 bytes covers up to an 8K-wide
-# rectangle row; wider rows are handled by tiling the copy in chunks.
-FBCTL_ROW_MAXPX:   uint64 = 8192
-fbctl_row_scratch: Array[32768, uint8]
+# Staging buffer for the source pixels copied out of the caller's address
+# space. Sized at 65536 bytes = 16384 RGBA pixels. For a sub-width rect
+# this holds one row (tiled in FBCTL_ROW_MAXPX-pixel chunks when a single
+# row is wider than the buffer). For the full-width contiguous FAST PATH
+# (src_x0==0, w==fb_width, src_pitch_px==fb_width) the rectangle's rows are
+# contiguous in the source frame, so we coalesce SEVERAL whole rows into one
+# copy_from_user (cutting the per-row page-table-walk + fault-resolve setup
+# cost) and then blast them back-to-back to the write-combining framebuffer.
+FBCTL_SCRATCH_BYTES: uint64 = 65536
+FBCTL_ROW_MAXPX:     uint64 = 16384            # FBCTL_SCRATCH_BYTES / 4
+fbctl_row_scratch: Array[65536, uint8]
 
 # Instrumentation: number of dirty-rect presents and total rows blitted,
-# so a test can confirm the path ran without a screendump.
+# so a test can confirm the path ran without a screendump. A REJECTED
+# (malformed / out-of-bounds) rect bumps neither presents nor rows, and
+# additionally fbctl_rect_rejects so a test can prove it was actively
+# refused rather than silently clipped.
 fbctl_rect_presents: uint64 = 0
 fbctl_rect_rows:     uint64 = 0
+fbctl_rect_rejects:  uint64 = 0
 
 
 def devfbctl_rect_present_count() -> uint64:
@@ -317,6 +328,10 @@ def devfbctl_rect_present_count() -> uint64:
 
 def devfbctl_rect_rows_count() -> uint64:
     return fbctl_rect_rows
+
+
+def devfbctl_rect_reject_count() -> uint64:
+    return fbctl_rect_rejects
 
 
 def _fbctl_is_rect(buf: Ptr[uint8], count: uint64) -> int32:
@@ -329,13 +344,146 @@ def _fbctl_is_rect(buf: Ptr[uint8], count: uint64) -> int32:
     return 0
 
 
+# Decoded + validated RECT geometry. _fbctl_rect_validate() fills this in
+# and returns 1 (accept) or 0 (reject); on accept w/h are already clamped to
+# the screen. Returning the result through a module-scope record keeps the
+# validation as ONE pure, separately-testable function (no multi-value
+# return in Adder) that BOTH the live copy_from_user path and the kernel-
+# source self-test path funnel through, so the bounds proof covers the real
+# code.
+fbv_dst_x: uint64 = 0
+fbv_dst_y: uint64 = 0
+fbv_w:     uint64 = 0
+fbv_h:     uint64 = 0
+fbv_src_pitch_px: uint64 = 0
+fbv_src_x0:       uint64 = 0
+fbv_src_y0:       uint64 = 0
+fbv_full_width:   int32  = 0     # 1 iff the coalescible full-width fast path
+
+# u64 overflow-safe "a + b would wrap" predicate (1 iff a + b > U64_MAX).
+def _fbctl_add_overflows(a: uint64, b: uint64) -> int32:
+    # 0xFFFFFFFFFFFFFFFF - a is the headroom left before wrapping.
+    if b > (0xFFFFFFFFFFFFFFFF - a):
+        return 1
+    return 0
+
+
+# u64 overflow-safe "a * b would wrap" predicate (1 iff a * b > U64_MAX).
+def _fbctl_mul_overflows(a: uint64, b: uint64) -> int32:
+    if a == 0 or b == 0:
+        return 0
+    if a > (0xFFFFFFFFFFFFFFFF / b):
+        return 1
+    return 0
+
+
+def _fbctl_rect_validate(dst_x: uint64, dst_y: uint64, w: uint64, h: uint64,
+                         src_ptr: uint64, src_pitch_px: uint64,
+                         src_x0: uint64, src_y0: uint64) -> int32:
+    # HARDENING — every field is attacker-controllable (it arrived through a
+    # userland write -> copy_from_user). Reject anything that could scribble
+    # past the framebuffer, overflow the source-offset arithmetic, or read
+    # outside the named source frame. On accept, fbv_* hold the (clamped)
+    # geometry and fbv_full_width flags the contiguous fast path. Returns 1
+    # = accept, 0 = reject. Pure: no I/O, no globals beyond fbv_* outputs.
+    scr_w: uint64 = fb_get_width()
+    scr_h: uint64 = fb_get_height()
+    if scr_w == 0 or scr_h == 0:
+        return 0
+    # Degenerate / null geometry: nothing to present.
+    if w == 0 or h == 0 or src_ptr == 0 or src_pitch_px == 0:
+        return 0
+    # Destination origin must be on-screen. (dst_x/dst_y come from u32 header
+    # fields so they cannot themselves overflow a u64, but be explicit.)
+    if dst_x >= scr_w or dst_y >= scr_h:
+        return 0
+    # Clamp the rectangle to the screen on the destination side. dst_x<scr_w
+    # and dst_y<scr_h already hold, so the subtractions cannot underflow and
+    # dst_x + w / dst_y + h are bounded by 2*scr (no u64 overflow).
+    if dst_x + w > scr_w:
+        w = scr_w - dst_x
+    if dst_y + h > scr_h:
+        h = scr_h - dst_y
+    # The source rectangle must stay inside the caller's named frame. The
+    # source frame is src_pitch_px pixels wide; its rightmost in-rect column
+    # is src_x0 + w - 1, which must be < src_pitch_px. (w>=1 here.)
+    if _fbctl_add_overflows(src_x0, w) != 0:
+        return 0
+    if src_x0 + w > src_pitch_px:
+        return 0
+    # Guard the per-row source byte-offset math against u64 wrap. The
+    # farthest source byte we will touch is for row (src_y0 + h - 1):
+    #   off = ((src_row * src_pitch_px) + (src_x0 + w - 1)) * 4
+    # then usrc = src_ptr + off. Reject if ANY step would overflow, so a
+    # crafted src_y0/src_pitch_px can never wrap usrc to an unintended page.
+    if _fbctl_add_overflows(src_y0, h) != 0:
+        return 0
+    last_row: uint64 = src_y0 + h - 1
+    if _fbctl_mul_overflows(last_row, src_pitch_px) != 0:
+        return 0
+    rowbase: uint64 = last_row * src_pitch_px
+    if _fbctl_add_overflows(rowbase, src_x0 + w) != 0:
+        return 0
+    last_px: uint64 = rowbase + (src_x0 + w - 1)
+    if _fbctl_mul_overflows(last_px, 4) != 0:
+        return 0
+    last_off: uint64 = last_px * 4
+    # The last byte touched is src_ptr + last_off + 3 (the 4th byte of the
+    # last pixel). Guard each add separately so last_off + 4 cannot itself
+    # wrap and slip a bad range past the src_ptr check.
+    if _fbctl_add_overflows(last_off, 4) != 0:
+        return 0
+    if _fbctl_add_overflows(src_ptr, last_off + 4) != 0:
+        return 0
+    # Accept. Publish the validated/clamped geometry.
+    fbv_dst_x = dst_x
+    fbv_dst_y = dst_y
+    fbv_w     = w
+    fbv_h     = h
+    fbv_src_pitch_px = src_pitch_px
+    fbv_src_x0       = src_x0
+    fbv_src_y0       = src_y0
+    # FAST PATH eligibility: the rectangle spans the full screen width AND
+    # the full source pitch starting at source column 0, so its h rows are
+    # one contiguous run of pixels in the source frame and can be fetched in
+    # multi-row batches and blitted back-to-back. (w was clamped to <=scr_w;
+    # for full-width it equals scr_w.)
+    fbv_full_width = 0
+    if src_x0 == 0 and w == scr_w and src_pitch_px == scr_w:
+        fbv_full_width = 1
+    return 1
+
+
+def _fbctl_rect_blit_rows(src_base: Ptr[uint8], pitch_px: uint64,
+                          src_x0: uint64, dst_x: uint64, dst_y0: uint64,
+                          first_row: uint64, nrows: uint64, w: uint64):
+    # Blit `nrows` already-fetched source rows (held in `src_base`, a
+    # row-major RGBA8888 kernel buffer of `pitch_px` pixels per row) to the
+    # framebuffer via the per-pixel conversion STORE helper. Row r of the
+    # batch lands at screen row dst_y0 + first_row + r, reading source
+    # column src_x0. This is the SINGLE conversion/blit primitive shared by
+    # the live present path and the self-test, so the on-screen result is
+    # bit-identical to the original per-row code.
+    r: uint64 = 0
+    while r < nrows:
+        scr_y: uint64 = dst_y0 + first_row + r
+        # src_y within this batch buffer is just `r`; the helper computes the
+        # byte base as (src_y * pitch_px + src_x0) * 4 via src_y + the column
+        # term, so pass src_y=r and start the source pointer at column src_x0.
+        fb_present_rgba_row(r, dst_x, scr_y, w,
+                            &src_base[src_x0 * 4], pitch_px)
+        fbctl_rect_rows = fbctl_rect_rows + 1
+        r = r + 1
+
+
 def _fbctl_rect_present(buf: Ptr[uint8]) -> int64:
     # Decode the RECT header (already in a kernel buffer — the syscall
     # write path bounced it through copy_from_user) and blit the named
     # rectangle from the caller's source frame to scanout. Returns
     # FBCTL_RECT_HDRLEN (bytes consumed) on success so a streaming writer
     # advances correctly; never returns an error that would wedge the
-    # writer (a degenerate rectangle is simply a no-op present).
+    # writer (a degenerate/malformed rectangle is a no-op present that
+    # consumes the header but presents nothing).
     if fb_get_initialized() == 0:
         return cast[int64](FBCTL_RECT_HDRLEN)
     dst_x: uint64 = cast[uint64](cast[Ptr[uint32]](&buf[4])[0])
@@ -347,54 +495,92 @@ def _fbctl_rect_present(buf: Ptr[uint8]) -> int64:
     src_x0:       uint64 = cast[Ptr[uint64]](&buf[36])[0]
     src_y0:       uint64 = cast[Ptr[uint64]](&buf[44])[0]
 
-    if w == 0 or h == 0 or src_ptr == 0 or src_pitch_px == 0:
+    # Centralised bounds + overflow hardening. A reject is counted and the
+    # header is consumed (so the writer never wedges) but NOTHING is blitted.
+    if _fbctl_rect_validate(dst_x, dst_y, w, h, src_ptr, src_pitch_px,
+                            src_x0, src_y0) == 0:
+        fbctl_rect_rejects = fbctl_rect_rejects + 1
         return cast[int64](FBCTL_RECT_HDRLEN)
 
-    scr_w: uint64 = fb_get_width()
-    scr_h: uint64 = fb_get_height()
-    # Clip the rectangle to the screen on the destination side so we
-    # never ask fb_present_rgba_row for an off-screen row (it also clips,
-    # but clamping here bounds the copy work too).
-    if dst_x >= scr_w or dst_y >= scr_h:
-        return cast[int64](FBCTL_RECT_HDRLEN)
-    if dst_x + w > scr_w:
-        w = scr_w - dst_x
-    if dst_y + h > scr_h:
-        h = scr_h - dst_y
+    # Read back the validated/clamped geometry.
+    dst_x = fbv_dst_x
+    dst_y = fbv_dst_y
+    w     = fbv_w
+    h     = fbv_h
+    src_pitch_px = fbv_src_pitch_px
+    src_x0       = fbv_src_x0
+    src_y0       = fbv_src_y0
 
-    row: uint64 = 0
-    while row < h:
-        # Bytes to fetch for this source row: w pixels * 4. Tile the
-        # copy_from_user if the row exceeds the scratch buffer width.
-        scr_y: uint64 = dst_y + row
-        src_row: uint64 = src_y0 + row
+    row_bytes_fp: uint64 = w * 4
+    # Only take the coalescing fast path if at least ONE full-width row fits
+    # in the staging buffer; otherwise fall through to the row-tiling general
+    # path (which chunks a too-wide row in FBCTL_ROW_MAXPX-pixel pieces).
+    if fbv_full_width != 0 and row_bytes_fp <= FBCTL_SCRATCH_BYTES:
+        # FAST PATH: full-width contiguous band. The h rows are one
+        # contiguous pixel run in the source (pitch == w == scr_w, x0 == 0),
+        # so coalesce as many rows as fit in the staging buffer into a single
+        # copy_from_user, then blit the whole batch — fewer page-walk setups
+        # and large WC bursts.
+        row_bytes: uint64 = row_bytes_fp
+        rows_per_batch: uint64 = FBCTL_SCRATCH_BYTES / row_bytes
+        if rows_per_batch == 0:
+            rows_per_batch = 1
+        row: uint64 = 0
+        while row < h:
+            batch: uint64 = h - row
+            if batch > rows_per_batch:
+                batch = rows_per_batch
+            # Contiguous source offset of this batch's first pixel.
+            usrc: uint64 = src_ptr + ((src_y0 + row) * src_pitch_px) * 4
+            nbytes: uint64 = batch * row_bytes
+            residual: uint64 = copy_from_user(
+                cast[uint64](&fbctl_row_scratch[0]), usrc, nbytes)
+            got_rows: uint64 = batch
+            if residual != 0:
+                # Faulted partway — blit only the whole rows that landed.
+                got_rows = (nbytes - residual) / row_bytes
+            if got_rows > 0:
+                _fbctl_rect_blit_rows(&fbctl_row_scratch[0], w, 0,
+                                      dst_x, dst_y, row, got_rows, w)
+            if residual != 0:
+                break
+            row = row + batch
+        fbctl_rect_presents = fbctl_rect_presents + 1
+        return cast[int64](FBCTL_RECT_HDRLEN)
+
+    # GENERAL PATH: sub-width rect. Fetch + blit one source row at a time,
+    # tiling the copy_from_user when a single row is wider than the staging
+    # buffer. The source byte math is overflow-guarded by the validator.
+    row2: uint64 = 0
+    while row2 < h:
+        scr_y: uint64 = dst_y + row2
+        src_row: uint64 = src_y0 + row2
         col: uint64 = 0
+        faulted: int32 = 0
         while col < w:
             chunk_px: uint64 = w - col
             if chunk_px > FBCTL_ROW_MAXPX:
                 chunk_px = FBCTL_ROW_MAXPX
-            # Source byte offset of this row-chunk's first pixel.
-            usrc: uint64 = src_ptr + \
+            usrc2: uint64 = src_ptr + \
                 ((src_row * src_pitch_px) + (src_x0 + col)) * 4
-            residual: uint64 = copy_from_user(
-                cast[uint64](&fbctl_row_scratch[0]), usrc, chunk_px * 4)
-            if residual != 0:
-                # Faulted partway — present whatever fully landed and
-                # stop this row. Never wedge the writer. Bytes actually
-                # copied = chunk_px*4 - residual; only whole RGBA pixels
-                # (4 bytes each) are safe to blit.
-                got_px: uint64 = (chunk_px * 4 - residual) / 4
+            residual2: uint64 = copy_from_user(
+                cast[uint64](&fbctl_row_scratch[0]), usrc2, chunk_px * 4)
+            if residual2 != 0:
+                got_px: uint64 = (chunk_px * 4 - residual2) / 4
                 if got_px > 0:
                     fb_present_rgba_row(0, dst_x + col, scr_y, got_px,
                                         &fbctl_row_scratch[0], got_px)
-                break
-            # The scratch holds chunk_px contiguous RGBA pixels as a
-            # 1-row-of-chunk_px source; present it at (dst_x+col, scr_y).
-            fb_present_rgba_row(0, dst_x + col, scr_y, chunk_px,
-                                &fbctl_row_scratch[0], chunk_px)
-            col = col + chunk_px
+                faulted = 1
+                col = w
+            else:
+                fb_present_rgba_row(0, dst_x + col, scr_y, chunk_px,
+                                    &fbctl_row_scratch[0], chunk_px)
+                col = col + chunk_px
         fbctl_rect_rows = fbctl_rect_rows + 1
-        row = row + 1
+        if faulted != 0:
+            row2 = h
+        else:
+            row2 = row2 + 1
     fbctl_rect_presents = fbctl_rect_presents + 1
     return cast[int64](FBCTL_RECT_HDRLEN)
 
@@ -487,3 +673,221 @@ def devfbctl_read(off: uint64, buf: Ptr[uint8], count: uint64) -> int64:
         buf[i] = scratch[off + i]
         i = i + 1
     return cast[int64](take)
+
+
+# --- RECT present self-test (scripts/test_fbctl_rect.sh) -------------
+#
+# Drives the binary RECT dirty-rectangle present path end-to-end IN KERNEL
+# context (no userland, no screendump) and asserts:
+#   * a VALID rect is ACCEPTED -> devfbctl_rect_present_count() increments,
+#     reject count unchanged;
+#   * an OUT-OF-BOUNDS rect (dst past the screen, source past the named
+#     frame, and an overflow-crafted source offset) is REJECTED ->
+#     reject count increments, present count unchanged, and the framebuffer
+#     is NOT scribbled past its real extent;
+#   * the conversion/coalescing blit core reproduces the exact RGBA->FB
+#     packing the original per-row path produced (pixel-identical result);
+#   * the magic-tag disambiguation still routes a 52-byte RECT to the
+#     present path while the ASCII suspend/resume verbs are untouched.
+#
+# A small SYNTHETIC framebuffer is stood up in a kernel BSS array via
+# fb_init so the test never depends on a real VBE/GOP mode (it runs under
+# -nographic). copy_from_user from a kernel (US=0) source legitimately
+# faults, so the "valid present" assertion checks the COUNTER path (an
+# accepted rect bumps presents) while the pixel-exactness is proven against
+# the synthetic FB through the same _fbctl_rect_blit_rows core the live
+# path uses with an in-kernel source.
+
+# 32 x 16 synthetic framebuffer, 32bpp -> 4*32*16 = 2048 bytes. Height must
+# be >= GLYPH_H (16) and width >= GLYPH_W (8) for fb_init to accept the mode;
+# 32 x 16 yields a 4 x 1 character grid, well within the fb_text grid caps.
+# A guard band of sentinel bytes past the live extent catches any over-write.
+FBT_W:     uint64 = 32
+FBT_H:     uint64 = 16
+FBT_LIVE:  uint64 = 2048                 # FBT_W * FBT_H * 4
+fbt_fb:    Array[2304, uint8]            # 2048 live + 256 guard bytes
+# Source frame the same 32 x 16 size, RGBA8888.
+fbt_src:   Array[2048, uint8]
+
+
+def _fbt_put_le32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8](v & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _fbt_put_le64(buf: Ptr[uint8], off: uint64, v: uint64):
+    k: uint64 = 0
+    while k < 8:
+        buf[off + k] = cast[uint8]((v >> (k * 8)) & 0xFF)
+        k = k + 1
+
+
+def _fbt_build_rect(hdr: Ptr[uint8], dst_x: uint32, dst_y: uint32,
+                    w: uint32, h: uint32, src_ptr: uint64,
+                    src_pitch_px: uint64, src_x0: uint64, src_y0: uint64):
+    # Compose the exact 52-byte LE RECT header (wire format unchanged).
+    _fbt_put_le32(hdr, 0, FBCTL_RECT_MAGIC)
+    _fbt_put_le32(hdr, 4, dst_x)
+    _fbt_put_le32(hdr, 8, dst_y)
+    _fbt_put_le32(hdr, 12, w)
+    _fbt_put_le32(hdr, 16, h)
+    _fbt_put_le64(hdr, 20, src_ptr)
+    _fbt_put_le64(hdr, 28, src_pitch_px)
+    _fbt_put_le64(hdr, 36, src_x0)
+    _fbt_put_le64(hdr, 44, src_y0)
+
+
+def fbctl_rect_selftest() -> int32:
+    # Returns 1 PASS / 0 FAIL; prints "[fbrect] ..." markers for the harness.
+    printk0("[fbrect] start\n")
+    fail: int32 = 0
+
+    # Stand up the synthetic RGB framebuffer in BSS. pixfmt 0 = RGB byte
+    # order (low byte = red) so the packed FB word is predictable.
+    z: uint64 = 0
+    while z < 2304:
+        fbt_fb[z] = 0
+        z = z + 1
+    # Sentinel-fill the guard region (bytes FBT_LIVE..2303) so an over-write
+    # is detectable: any change away from 0xAB flags scribbling past the FB.
+    z = FBT_LIVE
+    while z < 2304:
+        fbt_fb[z] = 0xAB
+        z = z + 1
+    fbbase: uint64 = cast[uint64](&fbt_fb[0])
+    rc: int32 = fb_init(fbbase, FBT_W * 4, FBT_W, FBT_H, 32, FB_PIXFMT_RGB)
+    if rc != 0:
+        printk0("[fbrect] FAIL fb_init synthetic mode rejected\n")
+        return 0
+
+    # Fill the source frame with a recognisable gradient: pixel (x,y) ->
+    # R=x, G=y, B=x+y, A=0xFF.
+    y: uint64 = 0
+    while y < FBT_H:
+        x: uint64 = 0
+        while x < FBT_W:
+            o: uint64 = (y * FBT_W + x) * 4
+            fbt_src[o]     = cast[uint8](x)
+            fbt_src[o + 1] = cast[uint8](y)
+            fbt_src[o + 2] = cast[uint8](x + y)
+            fbt_src[o + 3] = 0xFF
+            x = x + 1
+        y = y + 1
+    srcbase: uint64 = cast[uint64](&fbt_src[0])
+
+    # --- (1) magic disambiguation + accepted-rect counter via devfbctl_write
+    p0: uint64 = devfbctl_rect_present_count()
+    r0: uint64 = devfbctl_rect_reject_count()
+    hdr: Array[52, uint8]
+    # A valid full-frame rect. copy_from_user(srcbase) faults (kernel US=0
+    # page), so no pixels land — but an ACCEPTED rect must bump presents.
+    _fbt_build_rect(&hdr[0], 0, 0, cast[uint32](FBT_W), cast[uint32](FBT_H),
+                    srcbase, FBT_W, 0, 0)
+    wrc: int64 = devfbctl_write(0, &hdr[0], 52)
+    if wrc != cast[int64](FBCTL_RECT_HDRLEN):
+        printk0("[fbrect] FAIL valid RECT return != 52\n")
+        fail = 1
+    if devfbctl_rect_present_count() != p0 + 1:
+        printk0("[fbrect] FAIL valid RECT did not increment presents\n")
+        fail = 1
+    if devfbctl_rect_reject_count() != r0:
+        printk0("[fbrect] FAIL valid RECT bumped reject count\n")
+        fail = 1
+    else:
+        printk0("[fbrect] OK valid RECT accepted (presents++)\n")
+
+    # --- (2) OUT-OF-BOUNDS rects must be REJECTED (presents flat, rejects++)
+    p1: uint64 = devfbctl_rect_present_count()
+    rj1: uint64 = devfbctl_rect_reject_count()
+    # (2a) destination origin off-screen.
+    _fbt_build_rect(&hdr[0], cast[uint32](FBT_W), 0, 4, 4, srcbase,
+                    FBT_W, 0, 0)
+    devfbctl_write(0, &hdr[0], 52)
+    # (2b) source rectangle wider than the named source frame (src_x0 + w >
+    # src_pitch_px): would read past the source row.
+    _fbt_build_rect(&hdr[0], 0, 0, 8, 4, srcbase, FBT_W, FBT_W - 2, 0)
+    devfbctl_write(0, &hdr[0], 52)
+    # (2c) overflow-crafted source offset: a huge src_y0 * src_pitch_px that
+    # would wrap u64 and alias an unintended address.
+    _fbt_build_rect(&hdr[0], 0, 0, 4, 4, srcbase,
+                    0x4000000000000000, 0, 0x4000000000000000)
+    devfbctl_write(0, &hdr[0], 52)
+    if devfbctl_rect_present_count() != p1:
+        printk0("[fbrect] FAIL OOB rect was presented\n")
+        fail = 1
+    if devfbctl_rect_reject_count() != rj1 + 3:
+        printk0("[fbrect] FAIL OOB rects not all rejected\n")
+        fail = 1
+    else:
+        printk0("[fbrect] OK 3 out-of-bounds rects rejected\n")
+    # Guard region must still be pristine sentinel — nothing scribbled past
+    # the live framebuffer.
+    gz: uint64 = FBT_LIVE
+    guard_ok: int32 = 1
+    while gz < 2304:
+        if fbt_fb[gz] != 0xAB:
+            guard_ok = 0
+            gz = 2304
+        else:
+            gz = gz + 1
+    if guard_ok == 0:
+        printk0("[fbrect] FAIL framebuffer over-write detected\n")
+        fail = 1
+    else:
+        printk0("[fbrect] OK no over-write past framebuffer extent\n")
+
+    # --- (3) pixel-exactness of the conversion/coalescing blit core.
+    # Drive the SHARED _fbctl_rect_blit_rows with an in-kernel source (no
+    # copy_from_user) and verify every FB word equals the RGB-packed source.
+    rows0: uint64 = devfbctl_rect_rows_count()
+    _fbctl_rect_blit_rows(&fbt_src[0], FBT_W, 0, 0, 0, 0, FBT_H, FBT_W)
+    if devfbctl_rect_rows_count() != rows0 + FBT_H:
+        printk0("[fbrect] FAIL blit core row count wrong\n")
+        fail = 1
+    pix_ok: int32 = 1
+    yy: uint64 = 0
+    while yy < FBT_H and pix_ok != 0:
+        xx: uint64 = 0
+        while xx < FBT_W:
+            so: uint64 = (yy * FBT_W + xx) * 4
+            r: uint32 = cast[uint32](fbt_src[so])
+            g: uint32 = cast[uint32](fbt_src[so + 1])
+            b: uint32 = cast[uint32](fbt_src[so + 2])
+            want: uint32 = r | (g << 8) | (b << 16)
+            fo: uint64 = yy * (FBT_W * 4) + xx * 4
+            got: uint32 = cast[Ptr[uint32]](&fbt_fb[fo])[0]
+            if got != want:
+                pix_ok = 0
+                xx = FBT_W
+            else:
+                xx = xx + 1
+        yy = yy + 1
+    if pix_ok == 0:
+        printk0("[fbrect] FAIL blit core pixel mismatch\n")
+        fail = 1
+    else:
+        printk0("[fbrect] OK blit core pixel-identical RGBA->FB pack\n")
+
+    # --- (4) full-width fast-path eligibility flag set for a full-frame rect.
+    fwv: int32 = _fbctl_rect_validate(0, 0, FBT_W, FBT_H, srcbase, FBT_W,
+                                      0, 0)
+    if fwv != 1 or fbv_full_width != 1:
+        printk0("[fbrect] FAIL full-width fast path not selected\n")
+        fail = 1
+    else:
+        printk0("[fbrect] OK full-width contiguous fast path selected\n")
+    # A sub-width rect must NOT take the fast path.
+    swv: int32 = _fbctl_rect_validate(0, 0, 4, 4, srcbase, FBT_W, 1, 1)
+    if swv != 1 or fbv_full_width != 0:
+        printk0("[fbrect] FAIL sub-width rect mis-flagged fast path\n")
+        fail = 1
+    else:
+        printk0("[fbrect] OK sub-width rect uses general path\n")
+
+    if fail != 0:
+        printk0("[fbrect] FAIL\n")
+        return 0
+    printk0("[fbrect] PASS\n")
+    return 1

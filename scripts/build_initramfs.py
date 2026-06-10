@@ -620,6 +620,15 @@ if os.environ.get("ENABLE_IOURING_TEST") == "1":
 if os.environ.get("ENABLE_SPLICE_TEST") == "1":
     FILES.append(("/etc/splice-test", b"1\n"))
 
+# /dev/fbctl dirty-rectangle RECT present hardening + fast-path self-test.
+# scripts/test_fbctl_rect.sh sets ENABLE_FBRECT_TEST=1 to plant
+# /etc/fbrect-test; init/main.ad at boot:37.fbrect detects the marker and
+# runs fbctl_rect_selftest() (drivers/video/fb_cdev.ad). The self-test
+# mutates the text-console geometry (it stands up a synthetic framebuffer),
+# so it is opt-in — default boots ship no marker and are unaffected.
+if os.environ.get("ENABLE_FBRECT_TEST") == "1":
+    FILES.append(("/etc/fbrect-test", b"1\n"))
+
 # close_range(2) + statx(2) self-test. scripts/test_close_range.sh sets
 # ENABLE_CLOSERANGE_TEST=1 to plant /etc/closerange-test; init/main.ad at
 # boot:37.closerange detects the marker and runs close_range_selftest().
