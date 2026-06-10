@@ -69,6 +69,7 @@ from kernel.block.blk import (
 )
 from fs.ext4 import ext4_mkfs, ext4_install_file_to_slot, ext4_mkdir_at_slot
 from fs.fat_mkfs import fat_mkfs
+from mm.slab import kmalloc, kfree
 from drivers.block.partition import (
     gpt_init, gpt_mkpart, partition_rescan,
     GPT_GUID_LINUX_FS_LOW, GPT_GUID_LINUX_FS_HIGH,
@@ -476,13 +477,87 @@ DEVBLK_INSTALL_PATH_MAX: uint64 = 1024
 devblk_install_name: Array[1024, uint8]
 
 
+# Streaming-reassembly state for install_file bodies that arrive across
+# multiple write(2) calls.
+#
+# SYS_READ/WRITE route through copy_from_user + a fixed 4 KiB kernel
+# bounce buffer (arch/x86/kernel/syscall.ad UA_BOUNCE_SZ), so a single
+# userland sys_write of an N-byte buffer is delivered to vfs_write — and
+# thus to this ctl handler — as ceil(N/4096) back-to-back chunked writes.
+# The original install_file protocol assumed the WHOLE "header + body"
+# arrived in ONE count, which silently broke for any file whose header+
+# body exceeded one page (etc/rc.boot at 6868 bytes was the first). We
+# reassemble the body into a per-install kmalloc'd staging buffer, then
+# hand the contiguous body to ext4_install_file_to_slot exactly once.
+#
+# Only ONE install_file may stream at a time (hpm writes sequentially);
+# a fresh "install_file " header while a stream is active aborts the
+# stale one (frees its buffer) before starting over.
+devblk_inst_active: int32 = 0
+devblk_inst_buf: uint64 = 0                       # kmalloc'd body staging
+devblk_inst_size: uint64 = 0                      # expected body length
+devblk_inst_got: uint64 = 0                       # body bytes staged so far
+devblk_inst_slot: int32 = -1                      # target block slot
+
+
+def _devblk_install_reset():
+    # Drop any in-flight streaming install and free its staging buffer.
+    if devblk_inst_buf != 0:
+        kfree(devblk_inst_buf)
+    devblk_inst_buf = 0
+    devblk_inst_active = 0
+    devblk_inst_size = 0
+    devblk_inst_got = 0
+    devblk_inst_slot = -1
+
+
+def _devblk_install_finalize() -> int64:
+    # The full body is staged contiguously in devblk_inst_buf; commit it
+    # to ext4 and clear the streaming state. Returns 0 on success, a
+    # negative errno on I/O failure.
+    rc: int32 = ext4_install_file_to_slot(
+        devblk_inst_slot, cast[Ptr[char]](&devblk_install_name[0]),
+        cast[Ptr[uint8]](devblk_inst_buf), devblk_inst_size)
+    sz: uint64 = devblk_inst_size
+    sl: int32 = devblk_inst_slot
+    _devblk_install_reset()
+    if rc != 0:
+        return -5                                 # -EIO
+    printk2("[devblk] install_file slot=%d size=%d OK\n",
+            cast[uint64](sl), sz)
+    return 0
+
+
+def _devblk_ctl_install_body(buf: Ptr[uint8], count: uint64) -> int64:
+    # Continuation chunk: the ENTIRE `buf` is body bytes for the install
+    # currently streaming. Append up to the outstanding remainder, and
+    # finalize once the whole body has arrived.
+    remain: uint64 = devblk_inst_size - devblk_inst_got
+    take: uint64 = count
+    if take > remain:
+        take = remain                             # ignore any tail slop
+    dst: uint64 = devblk_inst_buf + devblk_inst_got
+    i: uint64 = 0
+    while i < take:
+        cast[Ptr[uint8]](dst)[i] = buf[i]
+        i = i + 1
+    devblk_inst_got = devblk_inst_got + take
+    if devblk_inst_got >= devblk_inst_size:
+        rc: int64 = _devblk_install_finalize()
+        if rc != 0:
+            return rc
+    return cast[int64](count)
+
+
 def _devblk_ctl_install_file(slot: int32, buf: Ptr[uint8],
                              count: uint64) -> int64:
-    # Wire format (single write): "install_file <PATH> <SIZE>\n<BODY>"
+    # Header chunk. Wire format: "install_file <PATH> <SIZE>\n<BODY>"
     # where <PATH> is a token of non-space bytes (may include '/'
     # separators; intermediate dirs get mkdir -p'd by the kernel),
-    # <SIZE> is a decimal u64, and <BODY> is exactly SIZE bytes
-    # immediately following the newline that terminates the header.
+    # <SIZE> is a decimal u64, and <BODY> is SIZE bytes following the
+    # header newline — possibly continuing into later write(2) chunks
+    # (see the streaming state above; the 4 KiB bounce buffer caps how
+    # much body rides along in this first chunk).
     #
     # Routes to fs/ext4.ad::ext4_install_file_to_slot, which save/
     # restores the singleton ext4 mount globals around the install so
@@ -491,6 +566,9 @@ def _devblk_ctl_install_file(slot: int32, buf: Ptr[uint8],
     # Returns `count` bytes consumed on success, a negative errno on
     # parse / I/O failure (so the caller's write(2) gets the right
     # short-write / -1 distinction).
+    # A new header supersedes any half-streamed prior install.
+    if devblk_inst_active != 0:
+        _devblk_install_reset()
     if count < 13:
         return -22                                # -EINVAL
     pos: uint64 = 13                              # past "install_file "
@@ -523,20 +601,38 @@ def _devblk_ctl_install_file(slot: int32, buf: Ptr[uint8],
         printk0("[devblk] install_file: missing newline after header\n")
         return -22
     pos = pos + 1                                 # past '\n'
-    # The remaining count-pos bytes must equal body_size.
     avail: uint64 = count - pos
-    if avail < body_size:
-        printk2("[devblk] install_file: short body have=%d want=%d\n",
-                avail, body_size)
-        return -22
     body: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + pos)
-    rc: int32 = ext4_install_file_to_slot(
-        slot, cast[Ptr[char]](&devblk_install_name[0]),
-        body, body_size)
-    if rc != 0:
-        return -5                                 # -EIO
-    printk2("[devblk] install_file slot=%d size=%d OK\n",
-            cast[uint64](slot), body_size)
+    # Fast path: the entire body rode along in this first chunk — commit
+    # directly without any staging allocation.
+    if avail >= body_size:
+        rc: int32 = ext4_install_file_to_slot(
+            slot, cast[Ptr[char]](&devblk_install_name[0]),
+            body, body_size)
+        if rc != 0:
+            return -5                             # -EIO
+        printk2("[devblk] install_file slot=%d size=%d OK\n",
+                cast[uint64](slot), body_size)
+        return cast[int64](count)
+    # Slow path: body spans multiple write chunks. Stage it.
+    if body_size == 0:
+        return -22
+    sbuf: uint64 = kmalloc(body_size)
+    if sbuf == 0:
+        printk1("[devblk] install_file: staging alloc failed size=%d\n",
+                body_size)
+        return -12                                # -ENOMEM
+    devblk_inst_buf = sbuf
+    devblk_inst_size = body_size
+    devblk_inst_got = 0
+    devblk_inst_slot = slot
+    devblk_inst_active = 1
+    # Copy whatever body bytes rode along in this header chunk.
+    i: uint64 = 0
+    while i < avail:
+        cast[Ptr[uint8]](devblk_inst_buf)[i] = body[i]
+        i = i + 1
+    devblk_inst_got = avail
     return cast[int64](count)
 
 
@@ -546,11 +642,14 @@ def _devblk_ctl_write(slot: int32, buf: Ptr[uint8],
     # then parse + dispatch.
     #
     # SPECIAL CASE: the "install_file" verb passes a file body
-    # immediately after the header line in the SAME write, so the
-    # body bytes blow past the 255-byte command-buf cap. We detect
-    # it BEFORE the capped copy and route to a dedicated handler
-    # that reads the full `buf` directly without intermediate
-    # buffering.
+    # immediately after the header line, so the body bytes blow past
+    # the 255-byte command-buf cap AND, because SYS_WRITE chunks every
+    # write through a 4 KiB bounce buffer, may span several writes. If
+    # a body is mid-stream, EVERY byte of this write is body data (it
+    # may even start with the literal "install_file " — that's content,
+    # not a new verb), so the active-stream check MUST come first.
+    if devblk_inst_active != 0:
+        return _devblk_ctl_install_body(buf, count)
     if count >= 13:
         if _ctl_starts_with(buf, count, "install_file ") != 0:
             return _devblk_ctl_install_file(slot, buf, count)
