@@ -74,11 +74,31 @@ fi
 # are the stronger gate when the box reaches interactive input.
 echo "[test_hamui_render] (1b) Offline: demo embeds the toolkit's hamML emitters"
 demo_fail=0
-for tok in '<rect x=' '<text x=' 'fill=' '#4a6da7' 'mklayer ui markup' 'setz ui'; do
+# Core protocol + primitive emitters, plus distinctive fills/markup from
+# the expanded MATE-class widget set (progress green #5fc46d, image
+# placeholder #303848 + its diagonal <line, slider/menu/notebook chrome).
+# These prove the new widgets' paint code is linked + reachable, not just
+# the v1 set.
+for tok in '<rect x=' '<text x=' '<line x1=' 'fill=' 'stroke=' \
+           '#4a6da7' '#5fc46d' '#303848' '#5f86c4' \
+           'mklayer ui markup' 'setz ui'; do
     if grep -aF -q "$tok" build/user/hamui_demo.elf; then
         echo "[test_hamui_render] OK: demo binary contains hamML/protocol token: ${tok}"
     else
         echo "[test_hamui_render] MISS: demo binary lacks token: ${tok}"
+        demo_fail=1
+    fi
+done
+# The expanded public API surface must be linked (menubar, notebook, grid,
+# treeview, textview, slider, progressbar, combo, dialog, radio).
+for sym in hamui_menubar hamui_notebook hamui_grid hamui_treeview \
+           hamui_textview hamui_slider hamui_progress hamui_combo \
+           hamui_dialog hamui_radio hamui_spin hamui_scrolled \
+           hamui_destroy; do
+    if grep -aF -q "$sym" build/user/hamui_demo.elf; then
+        echo "[test_hamui_render] OK: demo links expanded-toolkit symbol: ${sym}"
+    else
+        echo "[test_hamui_render] MISS: demo lacks expanded-toolkit symbol: ${sym}"
         demo_fail=1
     fi
 done
