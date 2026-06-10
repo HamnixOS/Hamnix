@@ -144,9 +144,9 @@ loop through userspace-posted srvfds. See
   share one kernel routine that flushes filesystems, then ACPI-S5
   poweroff / i8042 reset / triple-fault reboot.
 - **SMP** — MADT-driven N-AP bringup; per-CPU `%gs`, per-CPU
-  `current_task`; APs participate in the shared runqueue (single
-  runqueue with spinlock; per-CPU runqueues + load balancing are a
-  follow-up).
+  `current_task`; per-CPU runqueues with load balancing
+  (`sched_pick_target_cpu`); idle APs HLT and wake on a reschedule IPI
+  (tickless).
 - **Virtual terminals** — VT1..VT4 (`/dev/vt/1`..`/dev/vt/4` +
   `/dev/vt/ctl`); `chvt <N>` switches the active console; Alt+F1..F4
   keyboard shortcuts.

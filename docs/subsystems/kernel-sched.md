@@ -62,10 +62,12 @@ also supports **realtime policies** (`sched_set_scheduler`,
 (`rlimit_get_cur/max/set`), **OOM-adjust** (`oom_adj_*`), and **CPU
 affinity** (`sched_get_affinity`).
 
-SMP: APs participate in a **single shared runqueue** guarded by a
-spinlock (`_rq_lock_cpu`/`_rq_unlock_cpu`, with `_sched_irq_push/pop`
-for IRQ-safe sections). Wait queues use `_wq_lock_irq`. Per-CPU
-runqueues + load balancing are a tracked follow-up, not yet present.
+SMP: each CPU owns a **per-CPU runqueue** (mirrors Linux's per-CPU
+`struct rq`), locked via `_rq_lock_cpu(cpu)`/`_rq_unlock_cpu` with
+`_sched_irq_push/pop` for IRQ-safe sections; tasks home to a CPU and
+new work is placed by `sched_pick_target_cpu`. Wait queues use
+`_wq_lock_irq`. Idle APs HLT and are woken by a reschedule IPI
+(tickless), not a PAUSE/MWAIT spin.
 
 ## Entry points
 

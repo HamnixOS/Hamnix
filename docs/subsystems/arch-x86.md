@@ -67,8 +67,9 @@ stack alignment, `ENDBR64` for IBT, no red zone, RIP-relative `.rodata`
 (see [../x86-backend.md](../x86-backend.md)).
 
 SMP: `smp.ad` reads the ACPI MADT, starts each AP through the realmode
-trampoline, sets up per-CPU `%gs`/TSS, and joins the AP to the shared
-runqueue. AP idle uses CPUID-gated MONITOR/MWAIT (PAUSE fallback on TCG).
+trampoline, sets up per-CPU `%gs`/TSS, and gives the AP its own per-CPU
+runqueue. Idle APs HLT and are woken by a reschedule IPI (tickless); the
+old MWAIT-on-jiffies idle hack is gone.
 
 ## Entry points
 
