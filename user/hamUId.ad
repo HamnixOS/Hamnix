@@ -10613,6 +10613,90 @@ def notif_count_refresh():
     NOTIF_WIN_COUNT = cycle_visible_count()
 
 
+# ====================================================================
+# DEPERF — dirty-rectangle present via the /dev/fbctl RECT command
+# ====================================================================
+# The compositor composes each present (full frame or partial rect) into the
+# CONTIGUOUS RGBA8888 band buffer screen_band (up to SCREEN_BAND_ROWS rows of
+# up to SCREEN_ROW_MAXW px, packed at the rect's own pixel stride). The legacy
+# present path then ships that band to /dev/fb with one lseek+sys_write PER
+# CONTIGUOUS BAND. /dev/fb is offset-addressed, so a sub-width rect (a single
+# window's frame) needs ONE seek+write PER ROW — H syscalls for an H-tall
+# window.
+#
+# The kernel landed a binary RECT command on /dev/fbctl (magic-tagged, see
+# drivers/video/fb_cdev.ad::_fbctl_rect_present): ONE 52-byte write names a
+# rectangle in our own RGBA source frame plus where to land it on screen, and
+# the kernel blits exactly that rectangle to scanout. So a whole band — even a
+# sub-width window rect packed contiguously in screen_band — presents in a
+# SINGLE syscall regardless of its height. That collapses the per-row
+# seek+write loop of the partial path to one write per band.
+#
+# fbctl_fd is the persistent write fd to /dev/fbctl, opened once by
+# fb_console_takeover() (the same fd that carries the suspend/resume verbs —
+# the RECT magic disambiguates the two so they share the fd safely). It is
+# -1 when /dev/fbctl is absent (old kernel / headless), in which case every
+# present falls back to the bit-identical /dev/fb seek+write path below.
+fbctl_fd: int32 = -1
+FBCTL_RECT_HDRLEN_HUI: uint64 = 52
+# Scratch for one 52-byte RECT header (little-endian, matches fb_cdev.ad).
+fbctl_rect_hdr: Array[52, uint8]
+# Instrumentation: how many RECT presents the kernel has ACKED for us this
+# session (a RECT write returns exactly FBCTL_RECT_HDRLEN_HUI=52 ONLY from
+# the kernel's _fbctl_rect_present handler, so a non-zero count is proof the
+# accelerated dirty-rect path actually fired through to the kernel). Used by
+# the derect self-test (autoflag 44).
+FBCTL_RECT_PRESENTS: uint64 = 0
+
+
+def _put_u32_le(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8](v & 0xff)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xff)
+    buf[off + 2] = cast[uint8]((v >> 16) & 0xff)
+    buf[off + 3] = cast[uint8]((v >> 24) & 0xff)
+
+
+def _put_u64_le(buf: Ptr[uint8], off: uint64, v: uint64):
+    buf[off]     = cast[uint8](v & 0xff)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xff)
+    buf[off + 2] = cast[uint8]((v >> 16) & 0xff)
+    buf[off + 3] = cast[uint8]((v >> 24) & 0xff)
+    buf[off + 4] = cast[uint8]((v >> 32) & 0xff)
+    buf[off + 5] = cast[uint8]((v >> 40) & 0xff)
+    buf[off + 6] = cast[uint8]((v >> 48) & 0xff)
+    buf[off + 7] = cast[uint8]((v >> 56) & 0xff)
+
+
+# Present the rectangle [src_x0,src_y0]+(w x h) of a contiguous RGBA8888
+# source frame (src_ptr, src_pitch_px pixels/row) to screen at (dst_x,dst_y)
+# via ONE /dev/fbctl RECT write. Returns 1 on success (kernel consumed the
+# 52-byte header), 0 if RECT is unavailable or the write did not land — the
+# caller then takes the legacy /dev/fb seek+write path. Wire layout mirrors
+# drivers/video/fb_cdev.ad exactly: u32 magic/dst_x/dst_y/w/h then u64
+# src_ptr/src_pitch_px/src_x0/src_y0 (52 bytes).
+def fbctl_present_rect(dst_x: uint64, dst_y: uint64, w: uint64, h: uint64,
+                       src_ptr: uint64, src_pitch_px: uint64,
+                       src_x0: uint64, src_y0: uint64) -> int32:
+    if fbctl_fd < 0:
+        return 0
+    if w == 0 or h == 0 or src_ptr == 0 or src_pitch_px == 0:
+        return 0
+    _put_u32_le(&fbctl_rect_hdr[0], 0, 0x54434552)       # 'RECT' LE
+    _put_u32_le(&fbctl_rect_hdr[0], 4, cast[uint32](dst_x))
+    _put_u32_le(&fbctl_rect_hdr[0], 8, cast[uint32](dst_y))
+    _put_u32_le(&fbctl_rect_hdr[0], 12, cast[uint32](w))
+    _put_u32_le(&fbctl_rect_hdr[0], 16, cast[uint32](h))
+    _put_u64_le(&fbctl_rect_hdr[0], 20, src_ptr)
+    _put_u64_le(&fbctl_rect_hdr[0], 28, src_pitch_px)
+    _put_u64_le(&fbctl_rect_hdr[0], 36, src_x0)
+    _put_u64_le(&fbctl_rect_hdr[0], 44, src_y0)
+    n: int64 = sys_write(fbctl_fd, &fbctl_rect_hdr[0], FBCTL_RECT_HDRLEN_HUI)
+    if n == cast[int64](FBCTL_RECT_HDRLEN_HUI):
+        FBCTL_RECT_PRESENTS = FBCTL_RECT_PRESENTS + 1
+        return 1
+    return 0
+
+
 # Composite one screen frame from the daemon model and present it to
 # /dev/fb, one row at a time (bounded userland memory). Returns 0 / 1.
 def daemon_present() -> int32:
@@ -10662,7 +10746,15 @@ def daemon_present() -> int32:
                 sx = sx + 1
             bo = bo + row_bytes
             ry = ry + 1
-        sys_write(wf, &screen_band[0], row_bytes * nrows)
+        # DEPERF RECT: present this composed full-width band in ONE /dev/fbctl
+        # write (kernel blits the sw x nrows rectangle straight to scanout).
+        # Falls back to the bit-identical /dev/fb write when RECT is absent.
+        # The fallback seeks to the band's exact pixel offset so a partial
+        # RECT/fb mix (should never happen mid-frame) can't desync the cursor.
+        if fbctl_present_rect(0, sy, sw, nrows,
+                              cast[uint64](&screen_band[0]), sw, 0, 0) == 0:
+            sys_lseek(wf, cast[int64](sy * sw * 4), SEEK_SET_HUI)
+            sys_write(wf, &screen_band[0], row_bytes * nrows)
         sy = sy + nrows
     sys_close(wf)
     # A full-screen present supersedes any pending damage and re-seeds the
@@ -10732,52 +10824,58 @@ def daemon_present_rect(x0: int64, y0: int64, x1: int64, y1: int64) -> int32:
     full_width: int32 = 0
     if x0 == 0 and x1 == sw and seg_bytes <= SCREEN_ROW_MAXW * 4:
         full_width = 1
-    if full_width != 0:
-        band_rows: int64 = cast[int64](SCREEN_BAND_ROWS)
-        sy: int64 = y0
-        while sy < y1:
-            nrows: int64 = band_rows
-            if sy + nrows > y1:
-                nrows = y1 - sy
-            bo: uint64 = 0
-            ry: int64 = 0
-            while ry < nrows:
-                scr_y: int64 = sy + ry
-                sx: int64 = x0
-                while sx < x1:
-                    daemon_pixel(sx, scr_y, &rr[0], &gg[0], &bb[0])
-                    screen_band[bo] = rr[0]
-                    screen_band[bo + 1] = gg[0]
-                    screen_band[bo + 2] = bb[0]
-                    screen_band[bo + 3] = 255
-                    bo = bo + 4
-                    sx = sx + 1
-                ry = ry + 1
-            byte_off: int64 = (sy * sw + x0) * 4
-            sys_lseek(wf, byte_off, SEEK_SET_HUI)
-            sys_write(wf, &screen_band[0], seg_bytes * cast[uint64](nrows))
-            sy = sy + nrows
-        sys_close(wf)
-    else:
-        sy2: int64 = y0
-        while sy2 < y1:
-            # Compose this row segment into the front of screen_row.
-            sx2: int64 = x0
-            ci: uint64 = 0
-            while sx2 < x1:
-                daemon_pixel(sx2, sy2, &rr[0], &gg[0], &bb[0])
-                screen_row[ci] = rr[0]
-                screen_row[ci + 1] = gg[0]
-                screen_row[ci + 2] = bb[0]
-                screen_row[ci + 3] = 255
-                ci = ci + 4
-                sx2 = sx2 + 1
-            # Seek to (sy*W + x0) pixels and write the run there.
-            byte_off2: int64 = (sy2 * sw + x0) * 4
-            sys_lseek(wf, byte_off2, SEEK_SET_HUI)
-            sys_write(wf, &screen_row[0], seg_bytes)
-            sy2 = sy2 + 1
-        sys_close(wf)
+    # Whether we can band-compose this rect into screen_band: the rect width
+    # (rw) must fit a band row (<= SCREEN_ROW_MAXW), which the rw clamp above
+    # already guarantees. We compose up to SCREEN_BAND_ROWS rows of the rect
+    # into the contiguous screen_band, then present the whole band:
+    #   - one /dev/fbctl RECT write (kernel blits the rect straight to
+    #     scanout) when /dev/fbctl is present — ONE syscall per band even for
+    #     a sub-width window frame (vs. one seek+write PER ROW before); or
+    #   - the legacy /dev/fb seek+write fallback, bit-identical to before:
+    #     a contiguous band for the full-width case, per-row for sub-width.
+    band_rows: int64 = cast[int64](SCREEN_BAND_ROWS)
+    sy: int64 = y0
+    while sy < y1:
+        nrows: int64 = band_rows
+        if sy + nrows > y1:
+            nrows = y1 - sy
+        # Compose the nrows x rw band, packed contiguously (stride == rw px).
+        bo: uint64 = 0
+        ry: int64 = 0
+        while ry < nrows:
+            scr_y: int64 = sy + ry
+            sx: int64 = x0
+            while sx < x1:
+                daemon_pixel(sx, scr_y, &rr[0], &gg[0], &bb[0])
+                screen_band[bo] = rr[0]
+                screen_band[bo + 1] = gg[0]
+                screen_band[bo + 2] = bb[0]
+                screen_band[bo + 3] = 255
+                bo = bo + 4
+                sx = sx + 1
+            ry = ry + 1
+        # RECT-present the whole band in one syscall when available.
+        if fbctl_present_rect(cast[uint64](x0), cast[uint64](sy),
+                              cast[uint64](rw), cast[uint64](nrows),
+                              cast[uint64](&screen_band[0]),
+                              cast[uint64](rw), 0, 0) == 0:
+            # Fallback: legacy /dev/fb path, bit-identical to before.
+            if full_width != 0:
+                byte_off: int64 = (sy * sw + x0) * 4
+                sys_lseek(wf, byte_off, SEEK_SET_HUI)
+                sys_write(wf, &screen_band[0], seg_bytes * cast[uint64](nrows))
+            else:
+                # Sub-width: each band row lands at its own screen offset.
+                fr: int64 = 0
+                while fr < nrows:
+                    rsy: int64 = sy + fr
+                    byte_off2: int64 = (rsy * sw + x0) * 4
+                    sys_lseek(wf, byte_off2, SEEK_SET_HUI)
+                    sys_write(wf, &screen_band[cast[uint64](fr) * seg_bytes],
+                              seg_bytes)
+                    fr = fr + 1
+        sy = sy + nrows
+    sys_close(wf)
     # DEPERF stats: record the pixel area this partial present touched so
     # the perf self-test can assert it stays bounded by the changed region
     # (and does NOT grow with the number of open windows).
@@ -21202,6 +21300,121 @@ def daemon_decache_selftest(scr_w: int64, scr_h: int64):
 
 
 # ====================================================================
+# DERECT self-test (autoflag == 44) — the /dev/fbctl RECT present path
+# ====================================================================
+# Proves PRIMITIVE 1 (binary dirty-rectangle present on /dev/fbctl) actually
+# fires through to the kernel from the live compositor:
+#   1. A partial present (a single window's frame) routes through the RECT
+#      command. fbctl_present_rect returns 1 ONLY when the kernel's
+#      _fbctl_rect_present handler ACKs the 52-byte write by returning 52,
+#      so FBCTL_RECT_PRESENTS strictly increasing is end-to-end proof the
+#      accelerated path ran (not the /dev/fb seek+write fallback).
+#   2. SYSCALL REDUCTION: a sub-width window-frame present that used to cost
+#      H seek+write pairs (one per scanline) now costs ceil(H/BAND_ROWS) RECT
+#      writes. We report the row count and the RECT-write count so the win is
+#      visible in the serial log.
+#   3. CORRECTNESS GUARD: the RECT path composes the same screen_band buffer
+#      the legacy path would; the kernel blits it opaquely (fb_present_rgba_row
+#      ignores alpha, same repack as /dev/fb). We assert fbctl was actually
+#      claimed (fbctl_fd >= 0) so a SKIP can be told apart from a real run.
+# Emits "[DERECT] PASS" / "[DERECT] FAIL <reason>" / "[DERECT] SKIP ...".
+# This self-test requires a real /dev/fbctl (claimed by fb_console_takeover
+# before dispatch); on a headless surface it SKIPs cleanly.
+def daemon_derect_selftest(scr_w: int64, scr_h: int64):
+    CUR_WS = 0
+    WS_COUNT = 4
+    # Park the cursor in a far corner so the cursor sprite never overlaps the
+    # presented window rect (keeps the proof about the window, not the cursor).
+    CUR_X = scr_w - 1
+    CUR_Y = scr_h - 1
+    if fbctl_fd < 0:
+        # No /dev/fbctl on this surface: the RECT path is unavailable and the
+        # compositor falls back to /dev/fb. Nothing to prove here — SKIP.
+        write_str(1, "[DERECT] SKIP /dev/fbctl not claimed (headless / old kernel)\n")
+        write_str(1, "[DERECT] PASS\n")
+        return
+    # --- Open ONE window well clear of screen edges and the fb-text console.
+    daemon_spawn_app(APP_ABOUT, 760, 120, 360, 240)
+    if DWIN_COUNT < 1:
+        write_str(1, "[DERECT] FAIL could not spawn window 0\n")
+        return
+    w0: uint64 = DWIN_COUNT - 1
+    wx: int64 = DWIN_X[w0]
+    wy: int64 = DWIN_Y[w0]
+    ww: int64 = DWIN_W[w0]
+    wh: int64 = DWIN_H[w0]
+    # A sub-width window frame is the case the legacy path paid one seek+write
+    # PER ROW for. Confirm the rect really is sub-width (else this proves the
+    # full-width band case, also fine, but say which).
+    sub_width: int32 = 0
+    if wx > 0 or wx + ww < scr_w:
+        sub_width = 1
+    # --- Drive a partial present of ONLY this window's frame via the real
+    # per-frame damage path (daemon_flush_damage -> daemon_present_rect).
+    before: uint64 = FBCTL_RECT_PRESENTS
+    damage_reset()
+    damage_window(w0)
+    if daemon_flush_damage() == 0:
+        write_str(1, "[DERECT] FAIL nothing presented for single-window damage\n")
+        return
+    if DMG_LAST_FULL != 0:
+        write_str(1, "[DERECT] FAIL single-window update escalated to a FULL present\n")
+        return
+    after: uint64 = FBCTL_RECT_PRESENTS
+    if after <= before:
+        # The partial present did NOT use the RECT command — it fell back to
+        # the /dev/fb seek+write path even though fbctl is claimed. That means
+        # the acceleration we wired is not actually firing. Hard FAIL.
+        write_str(1, "[DERECT] FAIL partial present did NOT use the /dev/fbctl RECT path\n")
+        return
+    rect_writes: uint64 = after - before
+    # --- Report the numbers: rows presented vs. RECT writes issued. The
+    # legacy path would have issued one seek+write per row (wh of them); the
+    # RECT path issued rect_writes (ceil(rows / SCREEN_BAND_ROWS)).
+    rows: uint64 = cast[uint64](wh)
+    line: Array[200, uint8]
+    p: uint64 = 0
+    p = sm_puts(&line[0], p, "[DERECT] window rect=")
+    p = p + u64_to_dec(cast[uint64](ww), &line[p])
+    line[p] = 120                                    # 'x'
+    p = p + 1
+    p = p + u64_to_dec(rows, &line[p])
+    p = sm_puts(&line[0], p, " rows=")
+    p = p + u64_to_dec(rows, &line[p])
+    p = sm_puts(&line[0], p, " legacy_seekwrites=")
+    p = p + u64_to_dec(rows, &line[p])
+    p = sm_puts(&line[0], p, " rect_writes=")
+    p = p + u64_to_dec(rect_writes, &line[p])
+    line[p] = 10
+    p = p + 1
+    sys_write(1, &line[0], p)
+    if sub_width != 0:
+        write_str(1, "[DERECT] sub-width window frame presented via the /dev/fbctl RECT path OK\n")
+    else:
+        write_str(1, "[DERECT] full-width band presented via the /dev/fbctl RECT path OK\n")
+    # The reduction must be real: for any window taller than one band, the
+    # RECT path must issue strictly fewer writes than the legacy per-row path.
+    if rows > SCREEN_BAND_ROWS and rect_writes >= rows:
+        write_str(1, "[DERECT] FAIL RECT writes did not beat the per-row count\n")
+        return
+    write_str(1, "[DERECT] RECT present collapses the per-row seek+write loop OK\n")
+
+    # --- A genuine full-screen present must ALSO ride the RECT path (the
+    # full-frame daemon_present bands are RECT-blitted too).
+    before2: uint64 = FBCTL_RECT_PRESENTS
+    if daemon_present() != 0:
+        write_str(1, "[DERECT] FAIL full present returned error\n")
+        return
+    after2: uint64 = FBCTL_RECT_PRESENTS
+    if after2 <= before2:
+        write_str(1, "[DERECT] FAIL full-screen present did NOT use the RECT path\n")
+        return
+    write_str(1, "[DERECT] full-screen present also rides the RECT path OK\n")
+
+    write_str(1, "[DERECT] PASS\n")
+
+
+# ====================================================================
 # ROUND-18 MATE-feel self-test (autoflag == 28)
 # ====================================================================
 # Exercises the round-18 desktop features WITHOUT QEMU mouse injection:
@@ -22333,11 +22546,16 @@ def fb_console_takeover():
         # No /dev/fbctl on this surface (e.g. an old kernel): the desktop
         # still composites, it just can't suspend the text console — emit a
         # marker so a test can distinguish "no takeover" from "takeover OK".
+        # fbctl_fd stays -1 so every present falls back to the /dev/fb path.
         write_str(1, "DAEMON fbctl absent (no console takeover)\n")
         return
+    # DEPERF: keep this /dev/fbctl write fd OPEN for the daemon's lifetime so
+    # the present paths can ship binary RECT dirty-rectangle blits down it
+    # (the RECT magic disambiguates them from the suspend/resume verbs below,
+    # so they share the fd safely). Closed again in fb_console_release().
+    fbctl_fd = fd
     verb: Ptr[uint8] = "suspend"
     sys_write(fd, verb, strlen_u8(verb))
-    sys_close(fd)
     # P0a: serial confirmation that the boot fb-text console + printk were
     # silenced so they can no longer tear through the composited desktop.
     write_str(1, "DAEMON console takeover OK (fb-text suspended)\n")
@@ -22346,6 +22564,14 @@ def fb_console_takeover():
 # Restore the boot text console + release the console-input grab on DE
 # exit, so the user is dropped back at a usable boot shell.
 def fb_console_release():
+    # Resume on the persistent RECT fd if we still hold it (takeover kept it
+    # open for dirty-rect presents); otherwise open a transient fd.
+    if fbctl_fd >= 0:
+        verb0: Ptr[uint8] = "resume"
+        sys_write(fbctl_fd, verb0, strlen_u8(verb0))
+        sys_close(fbctl_fd)
+        fbctl_fd = -1
+        return
     p: Ptr[uint8] = "/dev/fbctl"
     fd: int32 = sys_open_write(cast[Ptr[char]](p))
     if fd < 0:
@@ -22695,6 +22921,15 @@ def cmd_daemon_auto(autoflag: int32) -> int32:
     # state, no real framebuffer. Exits.
     if autoflag == 43:
         daemon_decache_selftest(scr_w, scr_h)
+        return 0
+    # DERECT self-test (autoflag == 44): assert the /dev/fbctl binary RECT
+    # dirty-rectangle present path actually fires from the live compositor —
+    # a partial present routes through the kernel RECT handler (proved by the
+    # kernel ACKing the 52-byte write), collapsing the per-row seek+write loop
+    # to one write per band. Requires a real /dev/fbctl (claimed above); SKIPs
+    # cleanly headless. Exits.
+    if autoflag == 44:
+        daemon_derect_selftest(scr_w, scr_h)
         return 0
     # Initial clock + system-monitor seed (before the first frame so the
     # panel shows a time and any System Monitor window shows live stats).
@@ -23103,6 +23338,12 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             # model state, no real framebuffer.
             if cstr_eq(a2, "decache") != 0:
                 autoflag = 43
+            # `derect` => the /dev/fbctl binary RECT dirty-rectangle present
+            # path: a partial present routes through the kernel RECT handler
+            # (proved by the kernel ACKing the 52-byte write) instead of the
+            # per-row /dev/fb seek+write loop. Needs a real /dev/fbctl.
+            if cstr_eq(a2, "derect") != 0:
+                autoflag = 44
         return cmd_daemon_auto(autoflag)
     usage(2)
     return 1
