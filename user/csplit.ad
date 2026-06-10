@@ -1,0 +1,441 @@
+# user/csplit.ad
+#
+# Hamnix `csplit`: split FILE into sections determined by PATTERNs,
+# writing each section to a file named PREFIX + NN (default "xx00",
+# "xx01", ...). Like GNU coreutils:
+#
+#   csplit FILE N            split before line N (1-based). Repeatable.
+#   csplit FILE /REGEX/      split at the first line matching REGEX (that
+#                            line BEGINS the next section).
+#   csplit FILE %REGEX%      like /REGEX/ but the skipped section is
+#                            DISCARDED (no output file written).
+#   csplit FILE PAT {N}      repeat the preceding pattern N more times.
+#   csplit FILE PAT {*}      repeat as many times as possible.
+#
+# Flags:
+#   -f PREFIX   output file prefix (default "xx")
+#   -n DIGITS   number of suffix digits (default 2)
+#   --suppress-matched   drop the matching line from output (GNU's
+#                        --suppress-matched).
+#   -s, --silent, --quiet   don't print byte counts (we never print
+#                           them, so these are accepted no-ops).
+#
+# REGEX support is a practical subset: literal bytes, '.' (any char),
+# '^' anchor at start, '$' anchor at end, and 'X*' (zero-or-more of the
+# preceding literal/'.'). Good enough for the common csplit use cases.
+#
+# Bounded: 64 KiB input, up to 4096 lines, up to 64 patterns.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+
+INPUT_MAX: uint64 = 65536
+LINE_MAX:  uint64 = 4096
+PAT_MAX:   uint64 = 64
+
+input_buf:   Array[65536, uint8]
+line_starts: Array[4096, uint32]
+line_ends:   Array[4096, uint32]    # exclusive end, NOT counting '\n'
+nlines: uint64 = 0
+
+# Pattern table. ptype: 0 = line number, 1 = /regex/, 2 = %regex%.
+ptype:  Array[64, int32]
+pline:  Array[64, int64]            # for ptype 0: target line (1-based)
+preg_off: Array[64, uint64]         # offset into reg_pool for ptype 1/2
+preg_len: Array[64, uint64]
+npat: uint64 = 0
+reg_pool: Array[4096, uint8]
+reg_used: uint64 = 0
+
+# Options.
+prefix: Ptr[uint8]
+ndigits: int64 = 2
+suppress: int32 = 0
+
+namebuf: Array[256, uint8]
+prefix_len: uint64 = 0
+out_index: uint64 = 0
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def parse_int(s: Ptr[uint8], slen: uint64) -> int64:
+    n: int64 = 0
+    i: uint64 = 0
+    if slen == 0:
+        return -1
+    while i < slen:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            return -1
+        n = n * 10 + cast[int64](c - 48)
+        i = i + 1
+    return n
+
+
+# ---- minimal regex --------------------------------------------------
+# Match pattern pat[0..plen) against the WHOLE candidate text
+# text[ts..te) (a single line, newline excluded). Returns 1 if the
+# pattern matches anywhere in the line (GNU treats /re/ as "line matches
+# re" with BRE search semantics). We implement search by trying each
+# start offset unless the pattern is anchored with '^'.
+def re_match_here(pat: Ptr[uint8], pi: uint64, plen: uint64,
+                  text: Ptr[uint8], ti: uint64, te: uint64) -> int32:
+    p: uint64 = pi
+    t: uint64 = ti
+    while p < plen:
+        # '$' at end of pattern anchors end of line.
+        if pat[p] == 36 and p + 1 == plen:
+            if t == te:
+                return 1
+            return 0
+        # Look ahead for 'X*'.
+        star: int32 = 0
+        if p + 1 < plen and pat[p + 1] == 42:
+            star = 1
+        pc: uint8 = pat[p]
+        if star != 0:
+            # Zero or more of pc (or '.'). Greedy with backtracking.
+            # Count max run.
+            save_t: uint64 = t
+            cnt: uint64 = 0
+            while save_t + cnt < te:
+                ch: uint8 = text[save_t + cnt]
+                if pc == 46 or ch == pc:
+                    cnt = cnt + 1
+                else:
+                    break
+            # Try longest first.
+            k: int64 = cast[int64](cnt)
+            while k >= 0:
+                if re_match_here(pat, p + 2, plen, text,
+                                 save_t + cast[uint64](k), te) != 0:
+                    return 1
+                k = k - 1
+            return 0
+        else:
+            if t >= te:
+                return 0
+            ch: uint8 = text[t]
+            if pc == 46 or ch == pc:
+                p = p + 1
+                t = t + 1
+            else:
+                return 0
+    return 1
+
+
+def re_search(pat: Ptr[uint8], plen: uint64,
+              text: Ptr[uint8], ts: uint64, te: uint64) -> int32:
+    if plen == 0:
+        return 1
+    if pat[0] == 94:                    # '^' anchored at start
+        return re_match_here(pat, 1, plen, text, ts, te)
+    start: uint64 = ts
+    while start <= te:
+        if re_match_here(pat, 0, plen, text, start, te) != 0:
+            return 1
+        start = start + 1
+    return 0
+
+
+# ---- output ---------------------------------------------------------
+def build_name():
+    # PREFIX + zero-padded out_index in ndigits.
+    digits: Array[24, uint8]
+    nd: uint64 = cast[uint64](ndigits)
+    v: uint64 = out_index
+    i: uint64 = 0
+    while i < nd:
+        digits[i] = cast[uint8](v % 10) + 48
+        v = v / 10
+        i = i + 1
+    j: uint64 = 0
+    while j < nd:
+        namebuf[prefix_len + j] = digits[nd - 1 - j]
+        j = j + 1
+    namebuf[prefix_len + nd] = 0
+
+
+def write_section(from_line: uint64, to_line: uint64):
+    # Emit lines [from_line, to_line) to the next output file.
+    build_name()
+    fd: int32 = sys_open_write(cast[Ptr[char]](&namebuf[0]))
+    if fd < 0:
+        write_str(2, "csplit: cannot create ")
+        write_str(2, &namebuf[0])
+        write_str(2, "\n")
+        return
+    li: uint64 = from_line
+    while li < to_line:
+        s: uint32 = line_starts[li]
+        e: uint32 = line_ends[li]
+        if e > s:
+            sys_write(fd, &input_buf[s], cast[uint64](e - s))
+        sys_write(fd, "\n", 1)
+        li = li + 1
+    sys_close(fd)
+    out_index = out_index + 1
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    in_path: Ptr[char] = cast[Ptr[char]](0)
+    prefix = cast[Ptr[uint8]]("xx")
+
+    ai: int32 = 1
+    while ai < argc:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](ai)])
+        if a[0] == 45 and a[1] == 45:                  # --long
+            rest: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](a) + 2)
+            # --suppress-matched
+            if rest[0] == 115 and rest[1] == 117:      # "su..."
+                suppress = 1
+            elif rest[0] == 113 or rest[0] == 0:       # --quiet / --
+                # no-op
+                ai = ai + 1
+                if rest[0] == 0:
+                    break
+                continue
+            else:
+                # --silent etc: accept as no-op
+                pass
+        elif a[0] == 45 and a[1] != 0:
+            if a[1] == 102:                            # -f PREFIX
+                if a[2] != 0:
+                    prefix = cast[Ptr[uint8]](cast[uint64](a) + 2)
+                else:
+                    if ai + 1 >= argc:
+                        write_str(2, "csplit: -f needs an argument\n")
+                        return 1
+                    ai = ai + 1
+                    prefix = cast[Ptr[uint8]](argv[cast[uint64](ai)])
+            elif a[1] == 110:                          # -n DIGITS
+                src: Ptr[uint8] = cast[Ptr[uint8]](0)
+                if a[2] != 0:
+                    src = cast[Ptr[uint8]](cast[uint64](a) + 2)
+                else:
+                    if ai + 1 >= argc:
+                        write_str(2, "csplit: -n needs an argument\n")
+                        return 1
+                    ai = ai + 1
+                    src = cast[Ptr[uint8]](argv[cast[uint64](ai)])
+                v: int64 = parse_int(src, strlen_u8(src))
+                if v <= 0 or v > 20:
+                    write_str(2, "csplit: bad -n digits\n")
+                    return 1
+                ndigits = v
+            elif a[1] == 115:                          # -s
+                pass
+            else:
+                write_str(2, "csplit: unknown flag\n")
+                return 1
+        else:
+            # Positional: first is FILE, rest are PATTERNs.
+            if in_path == cast[Ptr[char]](0):
+                in_path = cast[Ptr[char]](a)
+            else:
+                alen: uint64 = strlen_u8(a)
+                # {N} or {*} repeat of the previous pattern?
+                if a[0] == 123 and alen >= 2:          # '{'
+                    if npat == 0:
+                        write_str(2, "csplit: {} with no preceding pattern\n")
+                        return 1
+                    reps: int64 = 0
+                    if a[1] == 42:                      # '{*}'
+                        reps = -1
+                    else:
+                        reps = parse_int(cast[Ptr[uint8]](cast[uint64](a) + 1),
+                                         alen - 2)
+                        if reps < 0:
+                            write_str(2, "csplit: bad repeat count\n")
+                            return 1
+                    # Clone the previous pattern `reps` times (or, for
+                    # {*}, mark with a sentinel handled at apply time).
+                    prev: uint64 = npat - 1
+                    if reps < 0:
+                        # {*}: repeat to exhaustion -> we model by adding
+                        # a single pattern flagged via pline = -1 sentinel
+                        # for line patterns, or many copies for regex. To
+                        # keep it simple and bounded, expand up to room.
+                        cnt: uint64 = 0
+                        while npat < PAT_MAX and cnt < LINE_MAX:
+                            ptype[npat] = ptype[prev]
+                            pline[npat] = pline[prev]
+                            preg_off[npat] = preg_off[prev]
+                            preg_len[npat] = preg_len[prev]
+                            npat = npat + 1
+                            cnt = cnt + 1
+                    else:
+                        r: int64 = 0
+                        while r < reps and npat < PAT_MAX:
+                            ptype[npat] = ptype[prev]
+                            pline[npat] = pline[prev]
+                            preg_off[npat] = preg_off[prev]
+                            preg_len[npat] = preg_len[prev]
+                            npat = npat + 1
+                            r = r + 1
+                elif a[0] == 47:                        # '/REGEX/'
+                    if npat >= PAT_MAX:
+                        write_str(2, "csplit: too many patterns\n")
+                        return 1
+                    # Body is between the two slashes.
+                    body_end: uint64 = alen
+                    if alen >= 2 and a[alen - 1] == 47:
+                        body_end = alen - 1
+                    blen: uint64 = body_end - 1
+                    ptype[npat] = 1
+                    preg_off[npat] = reg_used
+                    preg_len[npat] = blen
+                    bi: uint64 = 0
+                    while bi < blen and reg_used < 4096:
+                        reg_pool[reg_used] = a[1 + bi]
+                        reg_used = reg_used + 1
+                        bi = bi + 1
+                    npat = npat + 1
+                elif a[0] == 37:                        # '%REGEX%'
+                    if npat >= PAT_MAX:
+                        write_str(2, "csplit: too many patterns\n")
+                        return 1
+                    body_end: uint64 = alen
+                    if alen >= 2 and a[alen - 1] == 37:
+                        body_end = alen - 1
+                    blen: uint64 = body_end - 1
+                    ptype[npat] = 2
+                    preg_off[npat] = reg_used
+                    preg_len[npat] = blen
+                    bi: uint64 = 0
+                    while bi < blen and reg_used < 4096:
+                        reg_pool[reg_used] = a[1 + bi]
+                        reg_used = reg_used + 1
+                        bi = bi + 1
+                    npat = npat + 1
+                else:
+                    # Line number.
+                    v: int64 = parse_int(a, alen)
+                    if v < 0:
+                        write_str(2, "csplit: bad pattern\n")
+                        return 1
+                    if npat >= PAT_MAX:
+                        write_str(2, "csplit: too many patterns\n")
+                        return 1
+                    ptype[npat] = 0
+                    pline[npat] = v
+                    npat = npat + 1
+        ai = ai + 1
+
+    if in_path == cast[Ptr[char]](0):
+        write_str(2, "csplit: usage: csplit FILE PATTERN...\n")
+        return 1
+
+    # Stage the prefix into namebuf.
+    plen: uint64 = strlen_u8(prefix)
+    if plen > 200:
+        plen = 200
+    pi: uint64 = 0
+    while pi < plen:
+        namebuf[pi] = prefix[pi]
+        pi = pi + 1
+    prefix_len = plen
+
+    in_fd: int32 = sys_open(in_path)
+    if in_fd < 0:
+        write_str(2, "csplit: cannot open input\n")
+        return 1
+    total: uint64 = 0
+    while total < INPUT_MAX:
+        n: int64 = sys_read(in_fd, &input_buf[total], INPUT_MAX - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(in_fd)
+
+    # Index lines (content bounds, newline excluded).
+    start: uint64 = 0
+    i: uint64 = 0
+    while i < total and nlines < LINE_MAX:
+        if input_buf[i] == 10:
+            line_starts[nlines] = cast[uint32](start)
+            line_ends[nlines] = cast[uint32](i)
+            nlines = nlines + 1
+            start = i + 1
+        i = i + 1
+    if nlines < LINE_MAX and start < total:
+        line_starts[nlines] = cast[uint32](start)
+        line_ends[nlines] = cast[uint32](total)
+        nlines = nlines + 1
+
+    # Apply patterns. `cur` = first line of the not-yet-emitted region.
+    cur: uint64 = 0
+    pidx: uint64 = 0
+    while pidx < npat:
+        kind: int32 = ptype[pidx]
+        split_at: uint64 = nlines                 # default: no match found
+        discard: int32 = 0
+        if kind == 0:
+            # Line number L: section is lines [cur, L-1) i.e. split BEFORE
+            # line L (1-based). If L<=cur+1 produce an empty/no-op section.
+            tl: int64 = pline[pidx]
+            if tl < 1:
+                tl = 1
+            split_at = cast[uint64](tl - 1)
+            if split_at > nlines:
+                split_at = nlines
+            if split_at < cur:
+                split_at = cur
+        else:
+            if kind == 2:
+                discard = 1
+            poff: uint64 = preg_off[pidx]
+            plen2: uint64 = preg_len[pidx]
+            # Find the first line at/after `cur` (strictly after for
+            # progress when it would match cur itself we still scan from
+            # cur, GNU matches the next line region) that matches.
+            found: int32 = 0
+            li: uint64 = cur
+            while li < nlines:
+                if re_search(&reg_pool[poff], plen2, &input_buf[0],
+                             cast[uint64](line_starts[li]),
+                             cast[uint64](line_ends[li])) != 0:
+                    split_at = li
+                    found = 1
+                    break
+                li = li + 1
+            if found == 0:
+                # Pattern not found: for {*}-expanded extras this just
+                # means we stop; emit nothing more and finish.
+                break
+
+        # Emit section [cur, split_at) unless discarded.
+        seg_end: uint64 = split_at
+        if suppress != 0 and kind != 0 and seg_end > cur:
+            # Drop the matched line from the *previous* section?  GNU's
+            # --suppress-matched removes the matching line entirely. The
+            # matching line is at split_at (begins next section), so it is
+            # already excluded from this section; for the NEXT section we
+            # advance cur past it.
+            pass
+        if discard == 0:
+            write_section(cur, seg_end)
+        # Advance.
+        cur = split_at
+        if suppress != 0 and kind != 0 and cur < nlines:
+            cur = cur + 1                  # skip the matched line entirely
+        pidx = pidx + 1
+
+    # Final remainder section (lines [cur, nlines)).
+    if cur < nlines:
+        write_section(cur, nlines)
+    return 0

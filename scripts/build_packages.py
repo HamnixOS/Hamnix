@@ -307,17 +307,18 @@ def _files_hamsh() -> list[tuple[Path, str]]:
 
 COREUTILS_BINS = (
     "ascii", "awk", "base64", "basename", "cal", "cat", "clear", "cmp",
-    "cp", "crond", "crontab", "cut", "date", "df", "diff", "dirname",
+    "cp", "crond", "crontab", "csplit", "cut", "date", "df", "diff",
+    "dircolors", "dirname",
     "distrofs", "dmesg",
     "du", "echo", "ed", "env_show", "expr", "false", "find", "free",
     "getty", "grep", "halt", "hamwd", "head", "hostname", "id",
     "insmod", "kill", "less", "ln", "login", "ls", "lsblk", "lsmod",
     "md5sum",
-    "mkdir", "more", "motd", "mv", "nsbindprobe", "nsrun", "od",
-    "p9srv_demo", "passwd", "pgrep", "poweroff", "preempt_demo",
+    "mkdir", "more", "motd", "mv", "nsbindprobe", "nsrun", "numfmt", "od",
+    "p9srv_demo", "passwd", "pgrep", "poweroff", "pr", "preempt_demo",
     "preempt_hog", "printf", "ps", "pwd", "reboot", "rev", "rm",
     "rmmod", "sed", "seq", "sleep", "sort", "strings", "su", "tail",
-    "tee", "test", "top", "touch", "tr", "true", "uname", "uptime",
+    "tee", "test", "top", "touch", "tr", "true", "tsort", "uname", "uptime",
     "u_server", "u_tlstest", "vi", "watch", "wc", "whatis", "which",
     "whoami", "xargs", "yes",
 )

@@ -99,6 +99,11 @@ build_adder_user expand               # convert tabs to spaces honoring column (
 build_adder_user unexpand             # leading-blank runs to tabs (-a all, -t N)
 build_adder_user shuf                 # random permutation of lines (-n N, -i LO-HI, -e ARGS)
 build_adder_user factor               # prime factorization of integers (argv or stdin)
+build_adder_user csplit               # split FILE into sections on PATTERNs (xx00, xx01, ...)
+build_adder_user numfmt               # convert numbers to/from human-readable forms
+build_adder_user pr                   # paginate text for printing (header + columns)
+build_adder_user tsort                # topological sort of whitespace-separated token pairs
+build_adder_user dircolors            # emit shell command setting LS_COLORS
 build_adder_user tr                   # M16.66: SRC->DST byte translate
 build_adder_user od                   # M16.66: -An -tx1 hex dump
 build_adder_user printf               # M16.66: %s/%d + \n/\t/\\ escapes
