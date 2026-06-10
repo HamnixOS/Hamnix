@@ -1,0 +1,360 @@
+# user/hamfiles.ad
+#
+# hamfiles — a real GUI file browser built on the hamui widget toolkit
+# (lib/hamui.ad). It proves the toolkit drives a navigation app:
+# a toolbar, a treeview of the current directory, and a path statusbar,
+# backed by real directory reads.
+#
+# Layout (640x480 window):
+#   * toolbar  — Up / Open / Refresh / Quit buttons
+#   * treeview — two columns: Name, Type ("dir"/"file"); one row per
+#                directory entry, plus a ".." row to ascend
+#   * statusbar — the current directory path
+#
+# REAL OS INTEGRATION
+# -------------------
+# Directory read: sys_listdir(path) returns a packed run of newline-
+#   separated names (the same kernel API user/ls.ad and user/hamfm.ad
+#   use). We split on '\n'/'\0', drop "." / "..", and fill the treeview.
+# Directory test: Hamnix has no stat(2); per user/find.ad and
+#   user/hamfm.ad, a successful sys_listdir on a candidate full path
+#   means it is a directory. We use that to tag each row dir/file.
+# Navigate: Enter/Open on a "dir" row (or the ".." row) rebuilds the
+#   current path and re-reads; ".." ascends to the parent.
+# Open file: Enter/Open on a "file" row sys_spawn's `/bin/hamedit
+#   <fullpath>` so the selected file opens in the GUI editor.
+#
+# HONEST GAP: the editor launch is a real sys_spawn of /bin/hamedit with
+# the file path as argv[1] (hamedit preloads argv[1] — see its main());
+# hamfiles does NOT waitpid the editor (it stays usable while the editor
+# runs). The treeview shows the parent ("..") row first; a treeview has
+# no distinct double-click in the toolkit, so a single click on a row (or
+# select + Open) is the activate action: descend if it's a dir, open in
+# hamedit if it's a file.
+#
+# TOOLKIT LIMITS (not faked, honest constraints of lib/hamui.ad):
+#   * a treeview holds at most HAMUI_LIST_MAX_ROWS (16) rows, so we show
+#     the ".." row + up to ROWS_VISIBLE (15) directory entries per view;
+#   * the toolkit's global row pool (HAMUI_ROW_SLOTS, 128) is allocated
+#     monotonically with no public clear API. A treeview's own 16-row cap
+#     means a REUSED treeview saturates and can never show new rows, so
+#     each navigation destroys the old treeview and creates a fresh one
+#     (the 256-widget arena, not the row pool, absorbs the new widget).
+#     The hard ceiling is therefore the 128-slot row pool: roughly 8
+#     directory views (128 / 16 rows) before the pool is spent. That is a
+#     lib/hamui.ad limit, not faked app behavior; the right fix is a
+#     treeview-clear API in the toolkit (owned by the toolkit agent).
+
+from lib.hamui import (
+    hamui_init, hamui_vbox, hamui_label, hamui_button, hamui_toolbar,
+    hamui_statusbar, hamui_treeview, hamui_treeview_add, hamui_add,
+    hamui_window, hamui_set_size, hamui_set_expand, hamui_tree_selected,
+    hamui_step, hamui_take_event, hamui_status_set, hamui_render,
+    hamui_destroy
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_listdir(path: Ptr[char], buf: Ptr[uint8],
+                       count: uint64) -> int64
+extern def sys_getcwd(buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_yield()
+
+
+# --- module-scope buffers (no malloc; fixed arrays only) -------------
+PATH_CAP:    uint64 = 1024
+LIST_CAP:    uint64 = 4096
+MAX_ENTRIES: uint64 = 256
+NAME_CAP:    uint64 = 64
+ROW_CAP:     uint64 = 160
+# A treeview holds at most 16 rows (HAMUI_LIST_MAX_ROWS); we reserve row
+# 0 for ".." and show up to ROWS_VISIBLE real entries.
+ROWS_VISIBLE: uint64 = 15
+
+cur_path:     Array[1024, uint8]
+cur_path_len: uint64 = 0
+
+list_buf:  Array[4096, uint8]
+full_path: Array[1024, uint8]
+
+# Entry table: packed names + per-entry length + dir flag.
+name_store: Array[16384, uint8]            # MAX_ENTRIES * NAME_CAP
+name_len:   Array[256, uint64]
+ent_is_dir: Array[256, int32]
+num_entries: uint64 = 0
+
+# Scratch for a treeview row string ("name\ttype").
+row_buf: Array[160, uint8]
+
+# argv for the editor spawn.
+ed_argv: Array[4, uint64]
+
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
+
+
+def name_ptr(i: uint64) -> Ptr[uint8]:
+    return &name_store[i * NAME_CAP]
+
+
+# Build full_path = cur_path + "/" + name(i), avoiding a double slash
+# when cur_path is exactly "/".
+def build_full_path(i: uint64):
+    j: uint64 = 0
+    while j < cur_path_len and j < PATH_CAP - 1:
+        full_path[j] = cur_path[j]
+        j = j + 1
+    if j == 0 or full_path[j - 1] != 47:
+        full_path[j] = 47
+        j = j + 1
+    nl: uint64 = name_len[i]
+    p: Ptr[uint8] = name_ptr(i)
+    k: uint64 = 0
+    while k < nl and j < PATH_CAP - 1:
+        full_path[j] = p[k]
+        j = j + 1
+        k = k + 1
+    full_path[j] = 0
+
+
+# Replace cur_path with its parent. Root ("/") stays root.
+def go_parent():
+    if cur_path_len <= 1:
+        cur_path[0] = 47
+        cur_path[1] = 0
+        cur_path_len = 1
+        return
+    n: uint64 = cur_path_len
+    if cur_path[n - 1] == 47:
+        n = n - 1
+    while n > 1 and cur_path[n - 1] != 47:
+        n = n - 1
+    if n > 1:
+        n = n - 1
+    if n == 0:
+        n = 1
+    cur_path[n] = 0
+    cur_path_len = n
+
+
+# Set cur_path from full_path (after descending into a dir).
+def set_cur_path_from_full():
+    i: uint64 = 0
+    while full_path[i] != 0 and i < PATH_CAP - 1:
+        cur_path[i] = full_path[i]
+        i = i + 1
+    if i == 0:
+        cur_path[0] = 47
+        i = 1
+    cur_path[i] = 0
+    cur_path_len = i
+
+
+# A successful sys_listdir on the full path means a directory.
+def probe_is_dir() -> int32:
+    probe: Array[16, uint8]
+    n: int64 = sys_listdir(cast[Ptr[char]](&full_path[0]), &probe[0], 16)
+    if n >= 0:
+        return 1
+    return 0
+
+
+# Re-read cur_path into the entry table.
+def load_dir():
+    num_entries = 0
+    n: int64 = sys_listdir(cast[Ptr[char]](&cur_path[0]), &list_buf[0],
+                           LIST_CAP)
+    if n < 0:
+        return
+    nu: uint64 = cast[uint64](n)
+    i: uint64 = 0
+    while i < nu:
+        c: uint8 = list_buf[i]
+        if c == 10 or c == 0:
+            i = i + 1
+            continue
+        j: uint64 = i
+        while j < nu:
+            d: uint8 = list_buf[j]
+            if d == 10 or d == 0:
+                break
+            j = j + 1
+        nl: uint64 = j - i
+        keep: int32 = 1
+        if nl == 1 and list_buf[i] == 46:
+            keep = 0
+        if nl == 2 and list_buf[i] == 46 and list_buf[i + 1] == 46:
+            keep = 0
+        if keep != 0 and num_entries < MAX_ENTRIES:
+            store: uint64 = nl
+            if store > NAME_CAP - 1:
+                store = NAME_CAP - 1
+            dst: Ptr[uint8] = name_ptr(num_entries)
+            k: uint64 = 0
+            while k < store:
+                dst[k] = list_buf[i + k]
+                k = k + 1
+            dst[store] = 0
+            name_len[num_entries] = store
+            build_full_path(num_entries)
+            ent_is_dir[num_entries] = probe_is_dir()
+            num_entries = num_entries + 1
+        i = j + 1
+
+
+# Compose "name\ttype" into row_buf for treeview_add.
+def make_row(i: uint64):
+    p: Ptr[uint8] = name_ptr(i)
+    j: uint64 = 0
+    while p[j] != 0 and j < ROW_CAP - 8:
+        row_buf[j] = p[j]
+        j = j + 1
+    row_buf[j] = 9                        # '\t' column separator
+    j = j + 1
+    if ent_is_dir[i] != 0:
+        row_buf[j] = 100                  # 'd'
+        row_buf[j + 1] = 105              # 'i'
+        row_buf[j + 2] = 114              # 'r'
+        j = j + 3
+    else:
+        row_buf[j] = 102                  # 'f'
+        row_buf[j + 1] = 105              # 'i'
+        row_buf[j + 2] = 108              # 'l'
+        row_buf[j + 3] = 101              # 'e'
+        j = j + 4
+    row_buf[j] = 0
+
+
+# (Re)build the treeview from the entry table. The first row is always
+# ".." (parent). Capped at ROWS_VISIBLE real entries because a treeview
+# holds at most 16 rows.
+def populate_tree(tree: int32):
+    hamui_treeview_add(tree, "..\tdir")
+    i: uint64 = 0
+    while i < num_entries and i < ROWS_VISIBLE:
+        make_row(i)
+        hamui_treeview_add(tree, &row_buf[0])
+        i = i + 1
+
+
+# Destroy the old treeview, allocate a fresh one (the 16-row cap on a
+# reused treeview means rows can't be replaced in place), re-read the
+# current directory, and repopulate. Returns the new treeview id, or the
+# old id unchanged if the arena is exhausted.
+def rebuild_tree(root: int32, old_tree: int32, sbar: int32) -> int32:
+    hamui_destroy(old_tree)
+    tree: int32 = hamui_treeview(2)
+    if tree < 0:
+        hamui_status_set(sbar, "widget arena full")
+        return old_tree
+    hamui_set_size(tree, 632, 410)
+    hamui_set_expand(tree, 1, 1)
+    hamui_add(root, tree)
+    load_dir()
+    populate_tree(tree)
+    hamui_status_set(sbar, &cur_path[0])
+    return tree
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    hamui_init()
+
+    # Start at the cwd (or "/" if that fails).
+    cn: int64 = sys_getcwd(&cur_path[0], PATH_CAP)
+    if cn > 0:
+        cur_path_len = cast[uint64](cn)
+        cur_path[cur_path_len] = 0
+    else:
+        cur_path[0] = 47
+        cur_path[1] = 0
+        cur_path_len = 1
+
+    root: int32 = hamui_vbox()
+
+    tbar: int32 = hamui_toolbar()
+    hamui_set_size(tbar, 640, 30)
+    hamui_add(root, tbar)
+    btn_up:      int32 = hamui_button("Up")
+    hamui_add(tbar, btn_up)
+    btn_open:    int32 = hamui_button("Open")
+    hamui_add(tbar, btn_open)
+    btn_refresh: int32 = hamui_button("Refresh")
+    hamui_add(tbar, btn_refresh)
+    btn_quit:    int32 = hamui_button("Quit")
+    hamui_add(tbar, btn_quit)
+    hamui_add(tbar, hamui_label("hamfiles"))
+
+    # The directory listing.
+    tree: int32 = hamui_treeview(2)
+    hamui_set_size(tree, 632, 410)
+    hamui_set_expand(tree, 1, 1)
+    hamui_add(root, tree)
+
+    sbar: int32 = hamui_statusbar("/")
+    hamui_set_size(sbar, 640, 20)
+    hamui_add(root, sbar)
+
+    load_dir()
+    populate_tree(tree)
+    hamui_status_set(sbar, &cur_path[0])
+
+    wid: int32 = hamui_window(root)
+    if wid < 0:
+        _puts(2, "hamfiles: could not allocate a window\n")
+        return 1
+    _puts(1, "HAMFILES ready\n")
+
+    hamui_render()
+
+    running: int32 = 1
+    while running != 0:
+        hamui_step()
+        ev: int32 = hamui_take_event()
+        while ev >= 0:
+            if ev == btn_quit:
+                running = 0
+            elif ev == btn_up:
+                go_parent()
+                tree = rebuild_tree(root, tree, sbar)
+            elif ev == btn_refresh:
+                tree = rebuild_tree(root, tree, sbar)
+            elif ev == btn_open or ev == tree:
+                sel: int32 = hamui_tree_selected(tree)
+                # Row 0 is the synthetic "..".
+                if sel == 0:
+                    go_parent()
+                    tree = rebuild_tree(root, tree, sbar)
+                elif sel > 0:
+                    idx: uint64 = cast[uint64](sel - 1)
+                    if idx < num_entries:
+                        build_full_path(idx)
+                        if ent_is_dir[idx] != 0:
+                            set_cur_path_from_full()
+                            tree = rebuild_tree(root, tree, sbar)
+                        else:
+                            # Launch the GUI editor on the file.
+                            ed_argv[0] = cast[uint64]("/bin/hamedit")
+                            ed_argv[1] = cast[uint64](&full_path[0])
+                            ed_argv[2] = 0
+                            pid: int32 = sys_spawn(
+                                cast[Ptr[char]]("/bin/hamedit"),
+                                &ed_argv[0], 0, 1,
+                                cast[Ptr[uint64]](0))
+                            if pid >= 0:
+                                hamui_status_set(sbar, "opened in hamedit")
+                            else:
+                                hamui_status_set(sbar, "spawn failed")
+            ev = hamui_take_event()
+        sys_yield()
+
+    return 0

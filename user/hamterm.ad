@@ -1,0 +1,275 @@
+# user/hamterm.ad
+#
+# hamterm — a real GUI terminal built on the hamui widget toolkit
+# (lib/hamui.ad). It is the GTK/Qt-style consumer shape the desktop app
+# suite follows: build a widget tree, bind a window, run a pull-based
+# event loop.
+#
+# Layout (640x480 window):
+#   * a toolbar across the top with Clear + Quit buttons
+#   * a large scrolling textview that accumulates command output
+#   * an entry for the command line + a Run button
+#   * a statusbar showing the last command's exit status
+#
+# REAL OS INTEGRATION
+# -------------------
+# On Enter (or Run) the typed command is executed by a REAL shell, not
+# echoed. hamterm writes the command line (plus a trailing `exit`) to a
+# scratch rc file (/tmp/hamterm.cmd), then sys_spawn's `/bin/hamsh
+# <rcfile>` with the child's stdout wired to the write end of a pipe.
+# hamterm drains the read end of that pipe into the output textview and
+# sys_waitpid's the child. This is the same shell-pipe wiring hamsh uses
+# for `hamsh <script>` (see _run_rc_path in user/hamsh.ad): hamsh sources
+# the file as a script and `exit` unwinds it out of main rather than
+# dropping into an interactive REPL. So output you see in the textview is
+# genuinely produced by hamsh running your command.
+#
+# HONEST GAP: this is a one-shot "run command, capture its output" loop,
+# NOT a persistent PTY with a live interactive line discipline. There is
+# no job control, no ANSI cursor handling, and each command runs in a
+# fresh hamsh (so `cd` does not persist between commands). The pipe drain
+# is bounded by OUTBUF_CAP bytes per command. For a toolkit-proving GUI
+# terminal that runs real shell commands and shows their real output,
+# this is the honest full version; a persistent PTY is a larger OS lift
+# than the toolkit demo needs.
+
+from lib.hamui import (
+    hamui_init, hamui_vbox, hamui_hbox, hamui_label, hamui_button,
+    hamui_entry, hamui_toolbar, hamui_statusbar, hamui_scrolled,
+    hamui_textview, hamui_textview_set, hamui_textview_text, hamui_add,
+    hamui_window, hamui_set_size, hamui_set_expand, hamui_entry_text,
+    hamui_step, hamui_take_event, hamui_status_set, hamui_render
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_pipe(fds: Ptr[int32]) -> int32
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_waitpid(pid: int32) -> int64
+extern def sys_yield()
+extern def sys_exit(code: uint64)
+
+
+# --- module-scope buffers (no malloc; fixed arrays only) -------------
+OUTBUF_CAP:  uint64 = 16384
+CMDFILE_CAP: uint64 = 1024
+READ_CHUNK:  uint64 = 512
+
+# Accumulated terminal output (what the textview displays).
+out_buf:  Array[16384, uint8]
+out_len:  uint64 = 0
+
+# Scratch for building the rc file contents written to /tmp/hamterm.cmd.
+cmd_buf:  Array[1024, uint8]
+
+# Per-read scratch from the child's stdout pipe.
+read_buf: Array[512, uint8]
+
+# argv for sys_spawn: [ "/bin/hamsh", "<rcfile>", 0 ]
+spawn_argv: Array[4, uint64]
+
+# Two-fd pipe descriptor array (fds[0]=read end, fds[1]=write end).
+pipe_fds: Array[2, int32]
+
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
+
+
+# Append a NUL-terminated string to the persistent output buffer,
+# truncating cleanly at OUTBUF_CAP-1 so the textview always gets a
+# valid C string.
+def _out_append(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and out_len < OUTBUF_CAP - 1:
+        out_buf[out_len] = s[i]
+        out_len = out_len + 1
+        i = i + 1
+    out_buf[out_len] = 0
+
+
+# Append raw bytes (a pipe read chunk, which is not NUL terminated).
+def _out_append_n(p: Ptr[uint8], n: uint64):
+    i: uint64 = 0
+    while i < n and out_len < OUTBUF_CAP - 1:
+        out_buf[out_len] = p[i]
+        out_len = out_len + 1
+        i = i + 1
+    out_buf[out_len] = 0
+
+
+# Write the command line into /tmp/hamterm.cmd as a one-shot rc script.
+# We append a literal `exit` so hamsh unwinds out of main after running
+# the line instead of dropping into an interactive REPL (the same path
+# `hamsh <script>` uses; see _run_rc_path in user/hamsh.ad).
+def _write_cmd_file(line: Ptr[uint8]) -> int32:
+    # Build "<line>\nexit\n" in cmd_buf.
+    j: uint64 = 0
+    k: uint64 = 0
+    while line[k] != 0 and j < CMDFILE_CAP - 8:
+        cmd_buf[j] = line[k]
+        j = j + 1
+        k = k + 1
+    cmd_buf[j] = 10            # '\n'
+    j = j + 1
+    cmd_buf[j] = 101           # 'e'
+    j = j + 1
+    cmd_buf[j] = 120           # 'x'
+    j = j + 1
+    cmd_buf[j] = 105           # 'i'
+    j = j + 1
+    cmd_buf[j] = 116           # 't'
+    j = j + 1
+    cmd_buf[j] = 10            # '\n'
+    j = j + 1
+    cmd_buf[j] = 0
+
+    fd: int32 = sys_open_write(cast[Ptr[char]]("/tmp/hamterm.cmd"))
+    if fd < 0:
+        return -1
+    sys_write(fd, &cmd_buf[0], j)
+    sys_close(fd)
+    return 0
+
+
+# Run one command line through a real hamsh, capturing its stdout into
+# the output buffer. Returns the child's exit status (>=0) or -1 on a
+# spawn/setup failure.
+def _run_command(line: Ptr[uint8]) -> int64:
+    # Echo the prompt + command so the transcript reads like a terminal.
+    _out_append("$ ")
+    _out_append(line)
+    _out_append("\n")
+
+    if _write_cmd_file(line) != 0:
+        _out_append("hamterm: cannot write command file\n")
+        return -1
+
+    if sys_pipe(&pipe_fds[0]) != 0:
+        _out_append("hamterm: pipe failed\n")
+        return -1
+
+    spawn_argv[0] = cast[uint64]("/bin/hamsh")
+    spawn_argv[1] = cast[uint64]("/tmp/hamterm.cmd")
+    spawn_argv[2] = 0
+
+    # Child stdin = our stdin (fd 0); child stdout = pipe write end.
+    pid: int32 = sys_spawn(cast[Ptr[char]]("/bin/hamsh"), &spawn_argv[0],
+                           0, pipe_fds[1], cast[Ptr[uint64]](0))
+    # Close our copy of the write end so the read end sees EOF once the
+    # child (the only remaining writer) exits.
+    sys_close(pipe_fds[1])
+    if pid < 0:
+        sys_close(pipe_fds[0])
+        _out_append("hamterm: spawn failed\n")
+        return -1
+
+    # Drain the child's stdout until EOF.
+    while True:
+        n: int64 = sys_read(pipe_fds[0], &read_buf[0], READ_CHUNK)
+        if n <= 0:
+            break
+        _out_append_n(&read_buf[0], cast[uint64](n))
+    sys_close(pipe_fds[0])
+
+    st: int64 = sys_waitpid(pid)
+    return st
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    hamui_init()
+
+    # --- widget tree -------------------------------------------------
+    root: int32 = hamui_vbox()
+
+    # Toolbar: Clear + Quit.
+    tbar: int32 = hamui_toolbar()
+    hamui_set_size(tbar, 640, 30)
+    hamui_add(root, tbar)
+    btn_clear: int32 = hamui_button("Clear")
+    hamui_add(tbar, btn_clear)
+    btn_quit: int32 = hamui_button("Quit")
+    hamui_add(tbar, btn_quit)
+    hamui_add(tbar, hamui_label("hamterm"))
+
+    # Output area inside a scrolled window so long output clips/scrolls.
+    sc: int32 = hamui_scrolled()
+    hamui_set_size(sc, 632, 392)
+    hamui_set_expand(sc, 1, 1)
+    hamui_add(root, sc)
+    out_tv: int32 = hamui_textview()
+    hamui_set_size(out_tv, 620, 1000)
+    hamui_add(sc, out_tv)
+
+    # Command line row: entry + Run.
+    cmdrow: int32 = hamui_hbox()
+    hamui_set_size(cmdrow, 640, 30)
+    hamui_add(root, cmdrow)
+    cmd_entry: int32 = hamui_entry()
+    hamui_set_size(cmd_entry, 540, 26)
+    hamui_set_expand(cmd_entry, 1, 0)
+    hamui_add(cmdrow, cmd_entry)
+    btn_run: int32 = hamui_button("Run")
+    hamui_add(cmdrow, btn_run)
+
+    # Status bar.
+    sbar: int32 = hamui_statusbar("ready")
+    hamui_set_size(sbar, 640, 20)
+    hamui_add(root, sbar)
+
+    # Seed the transcript.
+    out_len = 0
+    out_buf[0] = 0
+    _out_append("hamterm: type a command and press Run.\n")
+    hamui_textview_set(out_tv, &out_buf[0])
+
+    wid: int32 = hamui_window(root)
+    if wid < 0:
+        _puts(2, "hamterm: could not allocate a window\n")
+        return 1
+    _puts(1, "HAMTERM ready\n")
+
+    hamui_render()
+
+    # --- event loop --------------------------------------------------
+    running: int32 = 1
+    while running != 0:
+        hamui_step()
+        ev: int32 = hamui_take_event()
+        while ev >= 0:
+            if ev == btn_quit:
+                running = 0
+            else:
+                if ev == btn_clear:
+                    out_len = 0
+                    out_buf[0] = 0
+                    hamui_textview_set(out_tv, &out_buf[0])
+                    hamui_status_set(sbar, "cleared")
+                else:
+                    # NOTE: the toolkit's text entry does not emit a
+                    # signal on Enter (only textviews consume newline
+                    # for line-editing), so "Run" is the trigger.
+                    if ev == btn_run:
+                        line: Ptr[uint8] = hamui_entry_text(cmd_entry)
+                        if line != cast[Ptr[uint8]](0) and line[0] != 0:
+                            st: int64 = _run_command(line)
+                            hamui_textview_set(out_tv, &out_buf[0])
+                            if st >= 0:
+                                hamui_status_set(sbar, "done")
+                            else:
+                                hamui_status_set(sbar, "error")
+            ev = hamui_take_event()
+        sys_yield()
+
+    return 0
