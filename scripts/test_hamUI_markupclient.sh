@@ -37,19 +37,26 @@
 # wsys draw-surface cdev and the live present path.
 
 . "$(dirname "$0")/_build_lock.sh"
+# The kernel is a higher-half elf64 image; qemu's `-kernel` rejects it.
+# _kernel_iso.sh installs a build/binshim/qemu-system-x86_64 wrapper
+# (prepended to PATH) that transparently wraps the ELF in a GRUB ISO and
+# boots it via -cdrom, so the `-kernel <elf>` below Just Works.
+. "$(dirname "$0")/_kernel_iso.sh"
 
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 ELF=build/hamnix-kernel.elf
+READY="[hamsh] M16.35 shell ready"
+OVERALL_TIMEOUT=160
 
 echo "[test_hamUI_markupclient] (1/4) Build userland"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
 
-echo "[test_hamUI_markupclient] (2/4) Build initramfs"
-python3 scripts/build_initramfs.py >/dev/null
+echo "[test_hamUI_markupclient] (2/4) Build initramfs (+ markup-client selftest marker)"
+ENABLE_MKC_SELFTEST=1 python3 scripts/build_initramfs.py >/dev/null
 
 echo "[test_hamUI_markupclient] (3/4) Rebuild kernel image"
 python3 -m compiler.adder compile \
@@ -64,32 +71,32 @@ fi
 
 echo "[test_hamUI_markupclient] (4/4) Boot QEMU + run the markup-client self-test"
 
-LOG="$(mktemp)"
-trap 'rm -f "$LOG"' EXIT
+LOG="${MKC_LOG:-$(mktemp)}"
+trap '[ -z "${MKC_LOG:-}" ] && rm -f "$LOG"' EXIT
+
+# --- NO serial injection. The proof runs INSIDE the autostart hamUId
+#     daemon: at runlevel 5 etc/services.d/hamuid.svc launches `hamUId
+#     daemon`, which (with the /etc/hamui-mkc-test marker planted above)
+#     runs daemon_markup_client_selftest inline right after it grabs
+#     /dev/fb, then exits. This sidesteps the console-takeover race that
+#     made a serial-injected `hamUId daemon markupclient` unreliable: once
+#     the autostart daemon owns the console, fed serial bytes never reach a
+#     shell. Just boot and capture the daemon's "[markup-client]" markers.
+#     READ="$READY" is unused for injection but kept as a boot-progress
+#     reference. ---
+: "$READY"
 
 set +e
-(
-    # A freshly-booted PID-1 hamsh drops the FIRST serial command line it
-    # sees (it never echoes it), so prime the line discipline with a couple
-    # of harmless newlines + a sentinel echo FIRST, wait for the prompt to
-    # settle, THEN send the real daemon-launch on a guaranteed-fresh line.
-    # The daemon launch can't be re-sent in a loop (a second daemon would
-    # fight over /dev/fb), so priming is the deterministic alternative.
-    sleep 8
-    printf '\n'
-    sleep 2
-    printf 'echo MARK_MKC_PRIME\n'
-    sleep 2
-    printf 'echo MARK_MKC_BEGIN; hamUId daemon markupclient\n'
-    sleep 28
-) | timeout 90s qemu-system-x86_64 \
+timeout "${OVERALL_TIMEOUT}s" qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -vga std \
     -display none \
     -no-reboot \
     -m 256M \
+    -monitor none \
     -serial stdio \
+    < /dev/null \
     > "$LOG" 2>&1
 rc=$?
 set -e

@@ -2786,6 +2786,25 @@ if os.environ.get("ENABLE_UACCESS_SC_TEST") == "1":
     FILES.append(("/etc/uaccess-sc-test", b"1\n"))
 
 
+# The hamUId markup-client keystone proof (scripts/test_hamUI_markupclient.sh
+# and scripts/test_hamUI_markupclient_gop.sh, ENABLE_MKC_SELFTEST=1). Rather
+# than race a serial-injected command against the runlevel-5 console takeover
+# (the autostart hamUId daemon grabs the console the moment hamsh is ready), we
+# plant a /etc/hamui-mkc-test MARKER FILE. The normal etc/services.d/hamuid.svc
+# autostarts the daemon as the PROVEN 2-token `hamUId daemon` — the exact exec
+# line the supervisor reliably brings up to "DAEMON up screen=WxH" on a real
+# EFI GOP framebuffer. The daemon's verb dispatch (user/hamUId.ad) opens this
+# marker when no argv[2] was given and, if present, routes into the autoflag-46
+# markup-client selftest: it owns /dev/fb, runs daemon_markup_client_selftest
+# inline, prints the [markup-client] markers + PASS, then exits 0 (so
+# restart:on-failure does not relaunch it). This replaces an earlier svc
+# OVERRIDE to a 3-token `hamUId daemon markupclient` exec line — the autostart
+# path never brought that override up (the proven autostart is the unmodified
+# 2-token svc), so the keystone selftest never ran. Test build only.
+if os.environ.get("ENABLE_MKC_SELFTEST") == "1":
+    FILES.append(("/etc/hamui-mkc-test", b"1\n"))
+
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
@@ -3162,6 +3181,22 @@ def build_archive() -> bytes:
                     continue
                 for sub in sorted(ef.iterdir()):
                     if sub.is_file():
+                        # The markup-client keystone selftest needs the
+                        # hamUId daemon (autoflag 46) to be the runlevel-5
+                        # hami service that the supervisor autostarts. Both
+                        # hamde.svc and hamuid.svc are enabled at runlevel 5,
+                        # and the supervisor brings up only ONE of them per
+                        # boot (whichever sorts first) — `hamde.svc` < `hamuid.svc`,
+                        # so hamde would win and starve hamUId. For the
+                        # selftest build, drop hamde.svc so hamUId autostarts
+                        # deterministically.
+                        if os.environ.get("ENABLE_MKC_SELFTEST") == "1" \
+                                and ef.name == "services.d" \
+                                and sub.name == "hamde.svc":
+                            print("  [mkc-selftest] skipping "
+                                  "etc/services.d/hamde.svc so hamUId "
+                                  "autostarts the markup-client selftest")
+                            continue
                         data = sub.read_bytes()
                         name = "/etc/" + ef.name + "/" + sub.name
                         blob += cpio_entry(name, data)

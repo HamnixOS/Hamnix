@@ -99,13 +99,33 @@ replaces the ~70 `is_*_path` backend-selection branches).
    bitmap, already known to the compositor router) and a key-event file
    for the focused window. This is the #1 blocker for real multi-window
    interactivity; toolkit input swaps onto it once it lands.
-3. [ ] **Rewrite the entire DE on `lib/hamui.ad`** — the current
-   `user/hamUId.ad` (~23.6k lines) hand-draws every widget from raw
-   framebuffer primitives in one monolith. User directive 2026-06-10:
-   "Writing in primitives like what we are is a terrible idea." **GATED:
-   only start once #2 is MATE-class** (full widget set + grid/align +
-   dynamic editing). Redo the whole desktop environment on top of the
-   toolkit instead of bespoke primitive draws inside the compositor.
+3. [~] **Rewrite the entire DE as a MATE MIRROR on `lib/hamui.ad`** — the
+   current `user/hamUId.ad` (24.4k lines) is one monolith owning fb +
+   input + WM + per-app rendering + compositing. User directive
+   2026-06-10 (after VM test): "I want a mirror mate. Might be good to
+   literally translate the mate code into adder, building out any missing
+   pieces as we go." Mirror MATE's *component architecture & behaviour*
+   (session → marco WM → mate-panel → apps-as-hamui-clients), translating
+   logic module-by-module and filling toolkit gaps in `lib/hamui.ad` as we
+   hit them — NOT a literal 1:1 GTK port. Decision: do NOT patch the
+   monolith's perf/input; both bugs are architectural and the rewrite
+   fixes them at the root. Two VM-confirmed root causes the rewrite MUST
+   design out:
+   - **Input leaks to the serial/boot shell + no real focus.** Daemon
+     reads keys from `/dev/cons` — the SAME source the boot hamsh reads;
+     console-takeover only reliably suspends fb-text *output*, so when the
+     UART-input grab doesn't hold, keystrokes reach both. And focus is
+     hardwired to the topmost window (`daemon_focus_slot`→`DWIN_COUNT-1`),
+     no click-to-focus. FIX: a real focus model + input routed only to the
+     focused client; the DE must own input exclusively (no `/dev/cons`
+     sharing with a backing shell).
+   - **Multi-second terminal-open lag.** Spawning a window forces a
+     FULL-SCREEN present, and `daemon_pixel()` is a procedural per-pixel
+     scene-graph query over every screen pixel (O(W×H), iterating all
+     windows per pixel) — millions of calls per open on emulated CPU. FIX:
+     blit-based, damage-clipped compositor that composes from cached
+     per-window backbuffers (memcpy/blit), never per-pixel scene queries
+     for the whole screen; window-open damages only its own rect.
 4. [ ] **Basic apps on the toolkit** (after #2 API is stable) — terminal,
    text editor, file browser, plus games Snake + 2048. These validate the
    toolkit is genuinely app-grade, and seed the DE app suite.
