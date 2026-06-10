@@ -164,8 +164,11 @@ fi
 # --- HID MOUSE translator self-test ----------------------------------
 # The boot-protocol mouse driver (hid_mouse_report) runs a synthetic
 # report battery at boot, packing each into the devmouse FIFO and
-# popping it back to assert the encoding. 7 cases as of this commit.
-if grep -F -q "[usb_hid_mouse] self-test PASS (7 cases)" "$LOG"; then
+# popping it back to assert the encoding. 15 assertions as of #416:
+# 7 cursor cases + dz==0 round-trips on the 3-byte (no-wheel) reports,
+# plus 4-byte wheel-up / wheel-down round-trips and a length-guard case
+# proving a stale byte3 in a 3-byte report injects no phantom scroll.
+if grep -F -q "[usb_hid_mouse] self-test PASS (15 cases)" "$LOG"; then
     echo "[test_usb_hid] OK: HID boot-MOUSE translator self-test PASS"
 else
     echo "[test_usb_hid] MISS: HID mouse self-test PASS banner absent"
