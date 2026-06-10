@@ -130,6 +130,27 @@ replaces the ~70 `is_*_path` backend-selection branches).
      blit-based, damage-clipped compositor that composes from cached
      per-window backbuffers (memcpy/blit), never per-pixel scene queries
      for the whole screen; window-open damages only its own rect.
+
+   **Increment 1 LANDED + VM-VERIFIED (`cb9563ea`, pushed).** The
+   component-split spine is proven on a REAL EFI GOP framebuffer by
+   `scripts/test_hamUI_appspine_gop.sh` (nine OK markers + PASS). The
+   first desktop app (`user/hamecho.ad`) runs as its OWN process,
+   spawned by the compositor with a kernel-allocated wid, its hamui "ui"
+   markup composited live. BOTH root causes designed out and asserted:
+   (a) a focus-gated keystroke crosses into the separate process AND does
+   NOT leak to the `/dev/cons` boot/serial shell — input ownership is now
+   a real exclusive `/dev/fbctl` `grab`/`ungrab` claim, decoupled from
+   the fb-text `suspend` hack and released on DE exit; (b) opening the app
+   damages only its own window rect (`DMG_LAST_FULL==0`, no full-screen
+   recomposite). Kernel surface added: `/dev/wsys/self` (client
+   self-discovers its post-spawn wid) + non-blocking
+   `/dev/wsys/<wid>/{keys,pointer}` reads. Also fixed a latent toolkit
+   bug: `lib/hamui.ad::_h_ctl` wrote to the bare read-only `.../draw`
+   listing (NULL-layer path collapse silently dropped every `mklayer`),
+   so no external hamui client could create its own "ui" layer until now.
+   NEXT increments: extract a real terminal as a separate-process client;
+   port the session→WM→panel split so apps are launched/focus-managed
+   like mate-panel/marco rather than hand-drawn in the monolith.
 4. [ ] **Basic apps on the toolkit** (after #2 API is stable) — terminal,
    text editor, file browser, plus games Snake + 2048. These validate the
    toolkit is genuinely app-grade, and seed the DE app suite.
