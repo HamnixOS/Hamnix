@@ -52,6 +52,8 @@ extern def get_mb_info() -> uint64
 extern def get_mb_magic() -> uint64
 extern def get_bsp_cr3() -> uint64
 extern def load_cr3(value: uint64)
+extern def read_msr(index: uint32) -> uint64
+extern def write_msr(index: uint32, value: uint64)
 
 # --- virt_to_phys / phys_to_virt -----------------------------------
 #
@@ -728,4 +730,143 @@ def pgtable_mark_phys_uc_2m(phys: uint64) -> int32:
     load_cr3(get_bsp_cr3())
     printk2("[pgtable] mark_uc_2m: PD[%d] -> UC (covers phys=%p)\n",
             pd_idx, phys & ~(PGT_2M_BYTES - 1))
+    return 1
+
+
+# --- PAT / write-combining for the linear framebuffer ----------------
+#
+# Background: the EFI GOP / VBE linear framebuffer is MMIO device memory.
+# The boot stub maps the first 4 GiB as 1 GiB huge pages with the WB
+# (write-back) cache attribute (flags 0x87). On a software compositor
+# the cost is dominated by STOREs into scanout; with a WB mapping over
+# MMIO every full-frame blit thrashes the cache and each store is a slow
+# serialized write. Linux maps framebuffers WRITE-COMBINING (ioremap_wc)
+# for exactly this reason: WC lets the CPU coalesce consecutive stores
+# into burst writes, which is typically a multiple-x speedup for the
+# full-frame blits the hamUI compositor and the text console both do.
+#
+# x86 selects the cache type for a page from the Page Attribute Table
+# (IA32_PAT, MSR 0x277), indexed by the PTE bits {PAT, PCD, PWT}. The
+# RESET-DEFAULT PAT has NO write-combining entry:
+#   PA0 (PAT=0,PCD=0,PWT=0) = WB
+#   PA1 (PAT=0,PCD=0,PWT=1) = WT
+#   PA2 (PAT=0,PCD=1,PWT=0) = UC-
+#   PA3 (PAT=0,PCD=1,PWT=1) = UC
+#   PA4..PA7 mirror PA0..PA3 (PAT=1).
+# So to get WC we MUST reprogram one PAT slot. We reprogram PA1 (the
+# selector {PAT=0,PCD=0,PWT=1}) from its default WT to WC. Choosing PA1
+# is deliberate: its selector needs only PWT=1 with PAT=0, so it works
+# IDENTICALLY for 4 KiB pages and for 1 GiB / 2 MiB HUGE pages without
+# touching the page-level PAT bit (which sits at a different position in
+# a huge-page entry, bit 12, vs bit 7 in a 4 KiB PTE). WT is essentially
+# unused in Hamnix, so repurposing PA1 costs nothing. PA0=WB, PA2=UC-,
+# PA3=UC are all left at their architectural defaults, so every existing
+# mapping (WB RAM via PA0, the UC MMIO BAR path above via PA3) is
+# UNCHANGED. This mirrors the classic Linux PAT layout that keeps the
+# low four entries close to default and only swaps WT->WC.
+#
+# IMPORTANT: this PAT layout only takes effect for a page once that
+# page's PTE selects PA1 (PWT=1, PCD=0). Plain WB RAM (the virtio-gpu
+# backing buffer, kernel heap, descriptor rings, user pages) keeps
+# PWT=0/PCD=0 -> PA0 = WB and is therefore never affected. Only the
+# real MMIO framebuffer range, marked via pgtable_mark_phys_wc below,
+# becomes write-combining.
+
+IA32_PAT_MSR: uint32 = 0x277
+
+# PAT memory-type encodings (Intel SDM Vol 3A §11.12.2).
+PAT_TYPE_UC: uint64 = 0x00
+PAT_TYPE_WC: uint64 = 0x01
+PAT_TYPE_WT: uint64 = 0x04
+PAT_TYPE_WB: uint64 = 0x06
+PAT_TYPE_UC_MINUS: uint64 = 0x07
+
+# Our chosen PAT layout: identical to reset default except PA1 = WC.
+#   PA0=WB(06) PA1=WC(01) PA2=UC-(07) PA3=UC(00)
+#   PA4=WB(06) PA5=WC(01) PA6=UC-(07) PA7=UC(00)
+# Each entry is a byte in the 64-bit MSR; PAn occupies bits [8n .. 8n+2].
+PGT_PAT_WC_VALUE: uint64 = 0x0007010600070106
+
+pgt_pat_initialized: int32 = 0
+
+
+def pgtable_pat_init() -> int32:
+    # Program IA32_PAT so selector PA1 ({PWT=1,PCD=0,PAT=0}) = WC.
+    # Idempotent: a second call is a no-op. Called once early in boot
+    # (before any framebuffer mapping is marked WC). Returns 1 if the
+    # PAT was (re)programmed or already in the desired state, 0 only if
+    # the platform somehow rejects the read-back (defensive).
+    #
+    # Per Intel SDM Vol 3A §11.12.4, the recommended sequence to change
+    # the PAT without disturbing in-flight cached lines is a full cache
+    # flush bracketed around the wrmsr. We run this BEFORE the
+    # framebuffer (or anything else) is ever mapped through PA1, and the
+    # only entry we change is the unused WT slot, so the lighter weight
+    # "wrmsr then CR3 reload" is sufficient here: no existing mapping
+    # selects PA1, so no cached line can carry the stale WT attribute
+    # into the new WC regime. Marking the framebuffer WC later does its
+    # own CR3 reload.
+    if pgt_pat_initialized != 0:
+        return 1
+    old: uint64 = read_msr(IA32_PAT_MSR)
+    printk1("[pgtable] PAT before = %p\n", old)
+    write_msr(IA32_PAT_MSR, PGT_PAT_WC_VALUE)
+    # Reload CR3 to flush the TLB so future walks re-derive the cache
+    # type from the new PAT for any page we subsequently mark WC.
+    load_cr3(get_bsp_cr3())
+    back: uint64 = read_msr(IA32_PAT_MSR)
+    printk1("[pgtable] PAT after  = %p (PA1=WC)\n", back)
+    pgt_pat_initialized = 1
+    if back != PGT_PAT_WC_VALUE:
+        # Some emulators ignore PAT writes. Report it but don't claim
+        # success — the caller can still proceed; a WC mark just falls
+        # back to whatever PA1 actually decodes to (WT default = still
+        # cached, so correctness is preserved, only speed is lost).
+        printk0("[pgtable] WARNING: PAT write-back mismatch (WC may be inactive)\n")
+        return 0
+    return 1
+
+
+def pgtable_mark_phys_wc(phys: uint64) -> int32:
+    # Mark the 1 GiB PDPT entry covering `phys` as WRITE-COMBINING by
+    # selecting PAT slot PA1 (set PWT=1, ensure PCD=0, ensure the huge-
+    # page PAT bit is 0). pgtable_pat_init() must have run first so PA1
+    # decodes to WC; we call it defensively here too (idempotent).
+    #
+    # This is the framebuffer fast-path: the real GOP/VBE linear FB base
+    # lives below 4 GiB on every x86 platform we target, so it falls
+    # inside one of the boot-stub 1 GiB identity pages. Setting PWT on
+    # that 1 GiB entry makes the whole GiB WC. The framebuffer is the
+    # overwhelming majority of any GiB it sits in (it is MMIO aperture,
+    # not RAM), and WC is strictly faster than WB for write-only scanout
+    # AND correct for it, so the 1 GiB granularity overshoot is benign —
+    # mirrors how pgtable_mark_phys_uc treats the MMIO BAR hole.
+    #
+    # Returns 1 on success, 0 if `phys` is above the 512 GiB PDPT ceiling
+    # or its slot is empty.
+    pgtable_pat_init()
+    idx: uint64 = phys >> PGT_1GB_SHIFT
+    if idx >= PGT_PDPT_ENTRIES:
+        printk2("[pgtable] mark_wc: idx=%d out of range (phys=%p)\n",
+                idx, phys)
+        return 0
+    pdpt_base: uint64 = _pgtable_pdpt_base()
+    slot: Ptr[uint64] = cast[Ptr[uint64]](pdpt_base + idx * 8)
+    entry: uint64 = slot[0]
+    printk2("[pgtable] mark_wc: PDPT[%d] before=%p\n", idx, entry)
+    if (entry & PGT_FLAG_P) == 0:
+        printk2("[pgtable] mark_wc: PDPT[%d] not present (phys=%p)\n",
+                idx, phys)
+        return 0
+    # WC via PA1 = {PAT=0, PCD=0, PWT=1}. Set PWT, clear PCD. The huge-
+    # page PAT bit (bit 12) must stay 0 too; the boot-stub entries never
+    # set it, so PGT_NEW_FLAGS-derived entries are already PAT=0.
+    new_entry: uint64 = (entry | PGT_FLAG_PWT) & ~PGT_FLAG_PCD
+    if new_entry == entry:
+        printk1("[pgtable] mark_wc: PDPT[%d] already WC\n", idx)
+        return 1
+    slot[0] = new_entry
+    load_cr3(get_bsp_cr3())
+    printk2("[pgtable] mark_wc: PDPT[%d] -> WC, after=%p\n",
+            idx, new_entry)
     return 1

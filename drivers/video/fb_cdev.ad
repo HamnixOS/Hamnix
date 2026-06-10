@@ -40,6 +40,10 @@ from drivers.video.console.fb_text import (
     fb_present_rgba_row,
     fb_console_suspend, fb_console_resume, fb_console_is_suspended,
 )
+# Dirty-rectangle present (P4d) reads the changed rectangle's pixels from
+# the compositor's own RGBA source buffer in ITS address space, so it
+# must walk the current task's page tables via copy_from_user.
+from mm.uaccess import copy_from_user
 # P0b: the framebuffer-takeover verb ALSO grabs the physical console
 # input for the compositor's pid, so the boot/login hamsh sharing
 # /dev/cons cannot race the DE for keystrokes.
@@ -256,9 +260,155 @@ def _fbctl_match(buf: Ptr[uint8], count: uint64, word: Ptr[uint8],
     return 1
 
 
+# --- dirty-rectangle present (P4d) ----------------------------------
+#
+# Today /dev/fb only supports presenting a WHOLE frame (offset-addressed
+# RGBA8888, WIDTH x HEIGHT). For a software compositor that re-renders
+# only a few changed windows per frame, blitting the entire screen every
+# frame is pure waste — the changed area is usually a tiny fraction of
+# the screen.
+#
+# This adds a SUB-RECTANGLE present path as a binary control command on
+# /dev/fbctl. The caller writes a fixed 52-byte little-endian header that
+# names a rectangle in ITS OWN RGBA8888 source frame and where to land it
+# on screen; the kernel copies ONLY that rectangle's pixels (row by row,
+# fetched from the caller's address space via copy_from_user) straight to
+# scanout via the same fb_present_rgba_row STORE helper the full-frame
+# path uses. No persistent state, no cross-process protocol — it is a
+# one-shot "present this rectangle now" kernel capability.
+#
+# Header layout (all little-endian, offsets in bytes):
+#   +0   u32  magic = 0x54434552  ('RECT' as LE bytes R,E,C,T)
+#   +4   u32  dst_x        screen column of the rectangle's left edge
+#   +8   u32  dst_y        screen row    of the rectangle's top edge
+#   +12  u32  w            rectangle width  in pixels
+#   +16  u32  h            rectangle height in pixels
+#   +20  u64  src_ptr      user-virtual base of the source RGBA8888 frame
+#   +28  u64  src_pitch_px pixels per source row (the source frame width)
+#   +36  u64  src_x0       source column of the rectangle's left edge
+#   +44  u64  src_y0       source row    of the rectangle's top edge
+# Total: 52 bytes. The magic disambiguates this from the text verbs
+# ("suspend"/"resume"), whose first bytes are ASCII letters and can never
+# collide with the 0x54434552 magic.
+#
+# The full-frame /dev/fb write path is UNTOUCHED: a caller that never
+# emits a RECT command behaves exactly as before. Out-of-screen / out-of-
+# source pixels are clipped by fb_present_rgba_row (screen side) and by
+# the clamps below (source side), so a bad rectangle can never scribble
+# outside scanout.
+FBCTL_RECT_MAGIC:  uint32 = 0x54434552         # 'R','E','C','T' LE
+FBCTL_RECT_HDRLEN: uint64 = 52
+
+# Per-row scratch for the source pixels copied out of the caller's
+# address space. 8192 px * 4 = 32768 bytes covers up to an 8K-wide
+# rectangle row; wider rows are handled by tiling the copy in chunks.
+FBCTL_ROW_MAXPX:   uint64 = 8192
+fbctl_row_scratch: Array[32768, uint8]
+
+# Instrumentation: number of dirty-rect presents and total rows blitted,
+# so a test can confirm the path ran without a screendump.
+fbctl_rect_presents: uint64 = 0
+fbctl_rect_rows:     uint64 = 0
+
+
+def devfbctl_rect_present_count() -> uint64:
+    return fbctl_rect_presents
+
+
+def devfbctl_rect_rows_count() -> uint64:
+    return fbctl_rect_rows
+
+
+def _fbctl_is_rect(buf: Ptr[uint8], count: uint64) -> int32:
+    # 1 iff buf begins with the RECT magic AND carries a full header.
+    if count < FBCTL_RECT_HDRLEN:
+        return 0
+    magic: uint32 = cast[Ptr[uint32]](&buf[0])[0]
+    if magic == FBCTL_RECT_MAGIC:
+        return 1
+    return 0
+
+
+def _fbctl_rect_present(buf: Ptr[uint8]) -> int64:
+    # Decode the RECT header (already in a kernel buffer — the syscall
+    # write path bounced it through copy_from_user) and blit the named
+    # rectangle from the caller's source frame to scanout. Returns
+    # FBCTL_RECT_HDRLEN (bytes consumed) on success so a streaming writer
+    # advances correctly; never returns an error that would wedge the
+    # writer (a degenerate rectangle is simply a no-op present).
+    if fb_get_initialized() == 0:
+        return cast[int64](FBCTL_RECT_HDRLEN)
+    dst_x: uint64 = cast[uint64](cast[Ptr[uint32]](&buf[4])[0])
+    dst_y: uint64 = cast[uint64](cast[Ptr[uint32]](&buf[8])[0])
+    w:     uint64 = cast[uint64](cast[Ptr[uint32]](&buf[12])[0])
+    h:     uint64 = cast[uint64](cast[Ptr[uint32]](&buf[16])[0])
+    src_ptr:      uint64 = cast[Ptr[uint64]](&buf[20])[0]
+    src_pitch_px: uint64 = cast[Ptr[uint64]](&buf[28])[0]
+    src_x0:       uint64 = cast[Ptr[uint64]](&buf[36])[0]
+    src_y0:       uint64 = cast[Ptr[uint64]](&buf[44])[0]
+
+    if w == 0 or h == 0 or src_ptr == 0 or src_pitch_px == 0:
+        return cast[int64](FBCTL_RECT_HDRLEN)
+
+    scr_w: uint64 = fb_get_width()
+    scr_h: uint64 = fb_get_height()
+    # Clip the rectangle to the screen on the destination side so we
+    # never ask fb_present_rgba_row for an off-screen row (it also clips,
+    # but clamping here bounds the copy work too).
+    if dst_x >= scr_w or dst_y >= scr_h:
+        return cast[int64](FBCTL_RECT_HDRLEN)
+    if dst_x + w > scr_w:
+        w = scr_w - dst_x
+    if dst_y + h > scr_h:
+        h = scr_h - dst_y
+
+    row: uint64 = 0
+    while row < h:
+        # Bytes to fetch for this source row: w pixels * 4. Tile the
+        # copy_from_user if the row exceeds the scratch buffer width.
+        scr_y: uint64 = dst_y + row
+        src_row: uint64 = src_y0 + row
+        col: uint64 = 0
+        while col < w:
+            chunk_px: uint64 = w - col
+            if chunk_px > FBCTL_ROW_MAXPX:
+                chunk_px = FBCTL_ROW_MAXPX
+            # Source byte offset of this row-chunk's first pixel.
+            usrc: uint64 = src_ptr + \
+                ((src_row * src_pitch_px) + (src_x0 + col)) * 4
+            residual: uint64 = copy_from_user(
+                cast[uint64](&fbctl_row_scratch[0]), usrc, chunk_px * 4)
+            if residual != 0:
+                # Faulted partway — present whatever fully landed and
+                # stop this row. Never wedge the writer. Bytes actually
+                # copied = chunk_px*4 - residual; only whole RGBA pixels
+                # (4 bytes each) are safe to blit.
+                got_px: uint64 = (chunk_px * 4 - residual) / 4
+                if got_px > 0:
+                    fb_present_rgba_row(0, dst_x + col, scr_y, got_px,
+                                        &fbctl_row_scratch[0], got_px)
+                break
+            # The scratch holds chunk_px contiguous RGBA pixels as a
+            # 1-row-of-chunk_px source; present it at (dst_x+col, scr_y).
+            fb_present_rgba_row(0, dst_x + col, scr_y, chunk_px,
+                                &fbctl_row_scratch[0], chunk_px)
+            col = col + chunk_px
+        fbctl_rect_rows = fbctl_rect_rows + 1
+        row = row + 1
+    fbctl_rect_presents = fbctl_rect_presents + 1
+    return cast[int64](FBCTL_RECT_HDRLEN)
+
+
 def devfbctl_write(off: uint64, buf: Ptr[uint8], count: uint64) -> int64:
     if count == 0:
         return 0
+    # Dirty-rectangle present: a binary RECT command (magic-tagged) blits
+    # one sub-rectangle from the caller's source frame to scanout. Checked
+    # BEFORE the text verbs because its leading bytes are a binary magic,
+    # not ASCII — the two can never be confused. Backward compatible: a
+    # caller that never emits a RECT command sees identical behaviour.
+    if _fbctl_is_rect(buf, count) != 0:
+        return _fbctl_rect_present(buf)
     susp: Array[8, uint8]
     susp[0] = 115                                    # 's'
     susp[1] = 117                                    # 'u'

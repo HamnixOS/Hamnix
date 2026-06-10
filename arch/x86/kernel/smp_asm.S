@@ -85,6 +85,10 @@ read_cr4:
     movq    %cr4, %rax
     ret
 
+/* Generic MSR access (read_msr / write_msr) lives in
+ * arch/x86/kernel/syscall_64.S. The PAT (IA32_PAT = 0x277) setup in
+ * arch/x86/mm/pgtable.ad declares them `extern` and reuses those. */
+
 /* The linker symbols __ap_trampoline_load / __ap_trampoline_size and
  * the trampoline-local ap_cr3_value / ap_landing_addr / ap_stack_top
  * are absolute values we can't name directly from Adder. We stash
