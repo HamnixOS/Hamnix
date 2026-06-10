@@ -882,3 +882,15 @@ attach at namespace points, then unify every fd onto the `Chan` abstraction
 rewrites are sanctioned where they're the right fix; each phase must still boot +
 pass the test sweep.
 
+## Wave — 2026-06-10: DE feature depth + userland TUI/CLI breadth
+
+| Item | What | Status |
+|------|------|--------|
+| **Mouse scroll-wheel → focused-window scroll** | End-to-end wheel path: `drivers/usb/hid.ad` reads the boot-mouse byte-3 signed wheel delta only when the report `length >= 4` and threads it through a parallel `dz` side-channel (`mouse_rx_push_dz`) so the legacy packed-int32 mouse word stays byte-for-byte unchanged; `drivers/input/auxmouse.ad` `MouseEvent` gains a real `dz` field + `mouse_rx_pop_dz`; `sys/src/9/port/devmouse.ad` emits a 4-field `<dx> <dy> <btn> <dz>` packet (legacy 3-field parses as dz=0); `user/hamUId.ad` `daemon_apply_packet` parses the optional 4th field and (gated `dz != 0`) calls new `daemon_scroll_focused`, injecting Up/Down arrow CSI runs into the focused window's stdin. Pure-motion cursor fast-path untouched (verified backward-compat). `8cf14f51`. (`#416`) | **Done** |
+| **DE window-shade (double-click titlebar roll-up)** | Classic MATE/GNOME2 "shade": double-clicking the bare title bar (min/close boxes hit-tested first) collapses the window to `SHADE_H` so only the titlebar shows; a second double-click restores the stored full height. The shade state machine (`DWIN_SHADED`/`DWIN_SHADE_H`, context-menu + keyboard paths, `DWIN_H`-keyed render/hit-test/damage) already existed; this rebinds the double-click gesture (was maximize) to `window_toggle_shade` and updates `daemon_round3_selftest`. `8bacb61e`. (`#418`) | **Done** |
+| **`hxd` — interactive hex+ASCII viewer** | New `user/hxd.ad`: full-screen scrollable xxd/`hexdump -C` style viewer (offset + grouped two-digit hex + ASCII gutter); raw-TUI (no echo/line-cook, `sys_read_nb`+`sys_yield`, ANSI repaint, arrow/PgUp/PgDn/g/G/q). Pages from disk per repaint (never slurps), size via `sys_lseek(SEEK_END)`, emits `HXD_READY`. `f8c6b6dc`. (`#419`) | **Done** |
+| **`tree` — recursive directory lister** | New `user/tree.ad`: box-drawing tree (`├──`/`└──`/`│`), name-sorted, `-L` depth / `-d` dirs-only / `-a` dotfiles, `N directories, M files` footer; dir detection via `sys_listdir` (no stat), bounded depth/children. `ac9750cf`. (`#420`) | **Done** |
+| **DE scroll-wheel regression guard** | `scripts/test_de_scrollwheel_guard.sh`: boot-free grep guard asserting all four links of the wheel chain (hid `length>=4`+`mouse_rx_push_dz`, auxmouse `dz`/push/pop, devmouse 4-field + optional-dz write, hamUId `daemon_scroll_focused` defined AND called). Locks the load-bearing feature against silent regression. `ec9a4c37`. (`#421`) | **Done** |
+
+Earlier the same session also landed `top` (interactive auto-refresh, byte-identical `-bn1`), `hdu` (ncdu-style disk-usage browser), `hlog` (dmesg-w/journalctl-f kernel-log follower over `/proc/kmsg`), and their System Tools menu registration in the GNOME2 launcher.
+
