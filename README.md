@@ -307,6 +307,12 @@ memory/          Orchestrator session memory (not in repo)
 
 ## Documentation index
 
+**Start here: [`docs/README.md`](docs/README.md)** — the navigable,
+per-subsystem documentation map (generated from source, kept in sync per
+[`docs/CONVENTIONS.md`](docs/CONVENTIONS.md)). The links below are the
+cross-cutting design specs; the subsystem docs live under
+[`docs/subsystems/`](docs/subsystems/).
+
 - [`STATUS.md`](STATUS.md) — full M / L / U milestone log.
 - [`TODO.md`](TODO.md) — what's still open.
 - [`docs/architecture.md`](docs/architecture.md) — layered model,
