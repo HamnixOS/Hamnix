@@ -65,7 +65,14 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
 
 set +e
-qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 60 \
+# 600s wall: the DEFAULT boot (rc.boot full + init 5 services incl. the
+# hamUId DE + VT gettys) has been observed to take ~45s to ~280s to a
+# live serial readline under TCG + host load, and the qemu_drive
+# FEEDER_SYNC handshake only starts feeding after that (the command
+# replay adds another ~30s of delays + TCG exec time). The markers gate
+# correctness; the wall is just a hang backstop — a healthy run exits
+# well before it.
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 600 \
     -- "/bin/echo BANNER-BB-SH" 1 \
        'enter linux { /bin/sh -c "echo BUSYBOX_SH_OK" }' 5 \
        "/bin/echo BANNER-BB-ECHO" 1 \
@@ -83,7 +90,7 @@ echo "[test_linux_sh] --- end output ---"
 fail=0
 
 # 1. rc.boot defined the linux runtime namespace.
-if grep -F -q "rc.boot: linux runtime namespace defined" "$LOG"; then
+if grep -a -F -q "rc.boot: linux runtime namespace defined" "$LOG"; then
     echo "[test_linux_sh] OK: rc.boot defined the linux ns value"
 else
     echo "[test_linux_sh] MISS: rc.boot did not define linux"
@@ -92,7 +99,7 @@ fi
 
 # 2. busybox sh ran: `sh -c "echo BUSYBOX_SH_OK"` prints the marker.
 #    This is the primary regression — `enter linux { /bin/sh }` works.
-if grep -F -q "BUSYBOX_SH_OK" "$LOG"; then
+if grep -a -F -q "BUSYBOX_SH_OK" "$LOG"; then
     echo "[test_linux_sh] OK: enter linux { /bin/sh -c ... } printed BUSYBOX_SH_OK"
 else
     echo "[test_linux_sh] FAIL: BUSYBOX_SH_OK not seen — /bin/sh stalled or absent"
@@ -102,7 +109,7 @@ fi
 # 3. busybox echo applet ran via /bin/echo (an applet symlink to
 #    /var/lib/distros/default/bin/busybox in the cpio archive). This
 #    proves the cpio S_IFLNK resolver in fs/vfs.ad does its job.
-if grep -F -q "HELLO_FROM_BB_ECHO" "$LOG"; then
+if grep -a -F -q "HELLO_FROM_BB_ECHO" "$LOG"; then
     echo "[test_linux_sh] OK: enter linux { /bin/echo ... } resolved via S_IFLNK"
 else
     echo "[test_linux_sh] FAIL: HELLO_FROM_BB_ECHO not seen — applet symlink broken"
@@ -114,21 +121,21 @@ fi
 #    set depends on which cpio entries fall under the bind. The
 #    primary signal is "no kernel trap" + the BANNER-BB-LS marker
 #    appeared, which the qemu_drive replay above already gates.
-if grep -F -q "BANNER-BB-LS" "$LOG"; then
+if grep -a -F -q "BANNER-BB-LS" "$LOG"; then
     echo "[test_linux_sh] OK: ran /bin/ls / inside the linux ns (diag)"
 else
     echo "[test_linux_sh] MISS: /bin/ls / banner not seen"
     fail=1
 fi
 
-if grep -F -q "TRAP: vector" "$LOG"; then
+if grep -a -F -q "TRAP: vector" "$LOG"; then
     echo "[test_linux_sh] DIAG: CPU exception observed"
-    grep -F "TRAP: vector" "$LOG" | head -5 || true
+    grep -a -F "TRAP: vector" "$LOG" | head -5 || true
     fail=1
 fi
-if grep -F -q "page fault" "$LOG"; then
+if grep -a -F -q "page fault" "$LOG"; then
     echo "[test_linux_sh] DIAG: page fault observed"
-    grep -F "page fault" "$LOG" | head -5 || true
+    grep -a -F "page fault" "$LOG" | head -5 || true
     fail=1
 fi
 

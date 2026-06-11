@@ -165,7 +165,7 @@ fail=0
 check_present() {
     local needle="$1"
     local label="$2"
-    if grep -F -q "$needle" "$LOG"; then
+    if grep -a -F -q "$needle" "$LOG"; then
         echo "[test_linux_apt_install] OK: $label"
     else
         echo "[test_linux_apt_install] MISS: $label  ('$needle')"

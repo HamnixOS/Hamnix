@@ -46,6 +46,14 @@
 # (space-separated). Default machine: -smp 2 -m 256M, -nographic,
 # -no-reboot, serial to the logfile.
 #
+# After the ready marker the driver performs a FEEDER_SYNC echo
+# handshake: it re-sends `echo FEEDER_SYNC` once a second until that
+# text echoes back on the serial log, proving a live readline is
+# actually consuming stdin (the banner alone is not proof — on a
+# default-/init boot it prints BEFORE rc.boot runs, and the first
+# serial line is dropped by a fresh readline). Set QEMU_DRIVE_NO_SYNC=1
+# to skip the handshake for non-shell stdin consumers.
+#
 # Returns QEMU's exit code in the global QEMU_DRIVE_RC.
 
 # Pull in the higher-half kernel boot shim. _kernel_iso.sh installs a
@@ -83,8 +91,12 @@ qemu_drive() {
         # Wait (bounded) for the readiness marker on the serial log.
         local waited=0
         local marker_seen=0
+        # -a: QEMU's serial log carries NUL/escape bytes (varies run to
+        # run with boot timing); without it grep may classify the log
+        # as binary and silently never match the marker, so the feeder
+        # sends NOTHING and the test starves with a live prompt.
         while [ "$waited" -lt "$overall_timeout" ]; do
-            if [ -f "$logfile" ] && grep -F -q "$ready_marker" "$logfile"; then
+            if [ -f "$logfile" ] && grep -a -F -q "$ready_marker" "$logfile"; then
                 marker_seen=1
                 break
             fi
@@ -100,9 +112,44 @@ qemu_drive() {
             exec 9>&-
             return 0
         fi
-        # A short settle so hamsh has finished printing the prompt and
-        # has a live SYS_READ on stdin before the first byte lands.
-        sleep 1
+        # SYNC HANDSHAKE — the ready marker is NOT proof the shell is
+        # consuming stdin:
+        #   * On a default-/init boot the serial hamsh prints its
+        #     "shell ready" banner BEFORE sourcing /etc/rc.boot; its
+        #     interactive readline only starts consuming stdin after
+        #     rc.boot hands off (tens of seconds later). Bytes typed in
+        #     that window are silently dropped — task #439's root cause.
+        #   * rc.boot also spawns VT gettys whose hamsh instances print
+        #     the same banner, so "first banner on the log" may not even
+        #     be the serial shell.
+        #   * A freshly-booted readline drops the FIRST serial line it
+        #     is sent (never echoes it).
+        # So: re-send an idempotent probe until its text echoes back on
+        # the serial log, which proves a live readline is consuming our
+        # bytes. Only then feed the real commands. The probe is
+        # idempotent (`echo`), so a duplicate landing twice is harmless.
+        # Opt out with QEMU_DRIVE_NO_SYNC=1 (for non-shell consumers).
+        if [ "${QEMU_DRIVE_NO_SYNC:-0}" != "1" ]; then
+            local probes=0
+            while [ "$probes" -lt "$overall_timeout" ]; do
+                printf 'echo FEEDER_SYNC\n' >&9
+                sleep 1
+                # -a: the serial log carries escape/NUL bytes; without
+                # it grep may classify the log as binary and not match.
+                if grep -a -F -q "FEEDER_SYNC" "$logfile" 2>/dev/null; then
+                    break
+                fi
+                probes=$((probes + 1))
+            done
+            if [ "$probes" -ge "$overall_timeout" ]; then
+                echo "[qemu_drive] FEEDER_SYNC never echoed within" \
+                     "${overall_timeout}s — readline not consuming stdin?" >&2
+            fi
+        else
+            # A short settle so the consumer has a live SYS_READ on
+            # stdin before the first byte lands.
+            sleep 1
+        fi
         local i
         for i in "${!cmds[@]}"; do
             printf '%s\n' "${cmds[$i]}" >&9
