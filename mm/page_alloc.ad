@@ -24,10 +24,46 @@
 # large-kmalloc path in slab.ad uses order >0 for blocks > 2 KiB.
 
 from mm.memblock import memblock_alloc
+from mm.cow import cow_boot_cr3
+
+# CR3 primitives for the boot-CR3 guard below (assembly intrinsics,
+# same externs kernel/sched/core.ad and mm/vma.ad declare).
+extern def local_irq_save() -> uint64
+extern def local_irq_restore(flags: uint64)
+extern def read_cr3() -> uint64
+extern def load_cr3(value: uint64)
 
 PAGE_SIZE:  uint64 = 4096
 PAGE_SHIFT: int32  = 12
 MAX_ORDER:  int32  = 10            # 2^10 pages = 1024 = 4 MiB
+
+# --- BOOT-CR3 GUARD --------------------------------------------------
+#
+# Every free list in this file is INTRUSIVE: the `next` link lives in
+# the first 8 bytes of the free chunk itself and is read/written
+# through a raw PHYSICAL-address pointer (cast[Ptr[uint64]](phys)).
+# That is only correct when phys X is identity-mapped at VA X in the
+# CURRENT CR3. Hamnix has no kernel-half direct map of RAM
+# (phys_to_virt covers the high-half image only), so these accesses
+# rely on the identity mapping — which a USER CR3 does not guarantee:
+# a native task's image/stack/brk window is identity-mapped at its
+# pool phys range, and after an rfork/fork COW crack those user VAs
+# point at DIFFERENT frames. A link store at "phys" X issued while
+# such a CR3 is live lands in the task's own COW page instead; a link
+# load reads user data. The free lists cross-link or self-cycle, and
+# the next _try_remove_buddy walk spins forever with IRQs masked —
+# the observed whole-system lockup after `enter linux` exits were
+# reaped (QEMU regdump: CPU0 at _try_remove_buddy, IF=0, user CR3).
+#
+# Fix at the allocator layer: every public entry point that touches a
+# free-list link runs its body under the PRISTINE BOOT CR3, which
+# identity-maps ALL of RAM by construction (the same guard
+# _free_task_user_pagetables uses for its raw-physical walk). IRQs
+# are masked across the borrowed-CR3 window so no interrupt handler
+# can observe it. The switch is skipped when the live CR3 already IS
+# the boot root (early boot, kthreads, callers like task_reap that
+# batch under the guard themselves) — then the wrap costs two reads.
+_PA_CR3_MASK: uint64 = 0x000FFFFFFFFFF000
 
 # One free list per order. Each slot is the head address of that order's
 # free chain (0 if empty); each free run carries its next-free pointer
@@ -51,9 +87,29 @@ nr_pages_freed_total: uint64 = 0
 def alloc_pages(order: int32) -> uint64:
     # Returns a page-aligned base address of 2^order contiguous 4 KiB
     # pages, or 0 on OOM. Caller "owns" the entire run until they
-    # call free_pages(addr, order). nr_pages_free is bumped along
-    # every code path that adds/removes from order-0's free list so
-    # the counter stays consistent across split / merge / direct free.
+    # call free_pages(addr, order). Boot-CR3 guard: see header above —
+    # the free-list link loads/stores in _alloc_pages_raw must resolve
+    # through a CR3 that identity-maps all of RAM.
+    _ap_live: uint64 = read_cr3()
+    _ap_irq: uint64 = local_irq_save()
+    _ap_boot: uint64 = cow_boot_cr3()
+    _ap_sw: int32 = 0
+    if _ap_boot != 0 and (_ap_boot & _PA_CR3_MASK) != (_ap_live & _PA_CR3_MASK):
+        load_cr3(_ap_boot)
+        _ap_sw = 1
+    ret: uint64 = _alloc_pages_raw(order)
+    if _ap_sw != 0:
+        load_cr3(_ap_live)
+    local_irq_restore(_ap_irq)
+    return ret
+
+
+def _alloc_pages_raw(order: int32) -> uint64:
+    # Body of alloc_pages; must run under an identity-mapping CR3
+    # (the public wrapper guarantees it). nr_pages_free is bumped
+    # along every code path that adds/removes from order-0's free
+    # list so the counter stays consistent across split / merge /
+    # direct free.
     if order < 0:
         return 0
     if order > MAX_ORDER:
@@ -70,8 +126,9 @@ def alloc_pages(order: int32) -> uint64:
 
     # Path 2: split a higher-order run into two halves of this order;
     # return one half, put the other half on this order's free list.
+    # (Recurse on the RAW body — the wrapper already holds the guard.)
     if order < MAX_ORDER:
-        higher: uint64 = alloc_pages(order + 1)
+        higher: uint64 = _alloc_pages_raw(order + 1)
         if higher != 0:
             half: uint64 = PAGE_SIZE << o
             buddy: uint64 = higher + half
@@ -117,9 +174,27 @@ def _try_remove_buddy(target: uint64, order: int32) -> int32:
 
 
 def free_pages(addr: uint64, order: int32):
-    # Return a run to the allocator. If its buddy at the same order
-    # is already free, MERGE them into a single order-(N+1) block and
-    # recurse; this is the canonical buddy algorithm (mirrors
+    # Return a run to the allocator. Boot-CR3 guard: see header above —
+    # the buddy-merge walk and the free-list push in _free_pages_raw
+    # must resolve through a CR3 that identity-maps all of RAM.
+    _fp_live: uint64 = read_cr3()
+    _fp_irq: uint64 = local_irq_save()
+    _fp_boot: uint64 = cow_boot_cr3()
+    _fp_sw: int32 = 0
+    if _fp_boot != 0 and (_fp_boot & _PA_CR3_MASK) != (_fp_live & _PA_CR3_MASK):
+        load_cr3(_fp_boot)
+        _fp_sw = 1
+    _free_pages_raw(addr, order)
+    if _fp_sw != 0:
+        load_cr3(_fp_live)
+    local_irq_restore(_fp_irq)
+
+
+def _free_pages_raw(addr: uint64, order: int32):
+    # Body of free_pages; must run under an identity-mapping CR3 (the
+    # public wrapper guarantees it). If the freed run's buddy at the
+    # same order is already free, MERGE them into a single order-(N+1)
+    # block and recurse; this is the canonical buddy algorithm (mirrors
     # __free_one_page in mm/page_alloc.c). Stops at MAX_ORDER.
     if addr == 0:
         return
@@ -161,14 +236,25 @@ def free_pages(addr: uint64, order: int32):
 def count_free_at_order(order: int32) -> uint64:
     # Walk one order's free list and count entries. Used by the
     # M16.23 smoke test to demonstrate buddy merging. Not on a hot
-    # path so the O(N) walk is fine.
+    # path so the O(N) walk is fine. Boot-CR3 guard: the link walk
+    # reads through raw physical pointers.
     if order < 0 or order > MAX_ORDER:
         return 0
+    _cf_live: uint64 = read_cr3()
+    _cf_irq: uint64 = local_irq_save()
+    _cf_boot: uint64 = cow_boot_cr3()
+    _cf_sw: int32 = 0
+    if _cf_boot != 0 and (_cf_boot & _PA_CR3_MASK) != (_cf_live & _PA_CR3_MASK):
+        load_cr3(_cf_boot)
+        _cf_sw = 1
     n: uint64 = 0
     p: uint64 = free_pages_order[cast[uint64](order)]
     while p != 0:
         n = n + 1
         p = cast[Ptr[uint64]](p)[0]
+    if _cf_sw != 0:
+        load_cr3(_cf_live)
+    local_irq_restore(_cf_irq)
     return n
 
 
@@ -246,8 +332,19 @@ def region_alloc(size: uint64) -> uint64:
     if b >= 0:
         head: uint64 = region_bucket_head[cast[uint64](b)]
         if head != 0:
-            # Pop the pooled chunk; its first 8 bytes hold the next link.
+            # Pop the pooled chunk; its first 8 bytes hold the next
+            # link — a raw physical access, so take the boot-CR3 guard.
+            _ra_live: uint64 = read_cr3()
+            _ra_irq: uint64 = local_irq_save()
+            _ra_boot: uint64 = cow_boot_cr3()
+            _ra_sw: int32 = 0
+            if _ra_boot != 0 and (_ra_boot & _PA_CR3_MASK) != (_ra_live & _PA_CR3_MASK):
+                load_cr3(_ra_boot)
+                _ra_sw = 1
             region_bucket_head[cast[uint64](b)] = cast[Ptr[uint64]](head)[0]
+            if _ra_sw != 0:
+                load_cr3(_ra_live)
+            local_irq_restore(_ra_irq)
             return head
     # Cold miss (or unpoolable size): carve fresh from memblock.
     return memblock_alloc(rsize, 4096)
@@ -267,8 +364,19 @@ def region_free(addr: uint64, size: uint64):
         return
     # Push onto this bucket's free list (intrusive next-link in the
     # chunk's first 8 bytes — the chunk is dead memory until reused).
+    # Raw physical store: take the boot-CR3 guard.
+    _rf_live: uint64 = read_cr3()
+    _rf_irq: uint64 = local_irq_save()
+    _rf_boot: uint64 = cow_boot_cr3()
+    _rf_sw: int32 = 0
+    if _rf_boot != 0 and (_rf_boot & _PA_CR3_MASK) != (_rf_live & _PA_CR3_MASK):
+        load_cr3(_rf_boot)
+        _rf_sw = 1
     cast[Ptr[uint64]](addr)[0] = region_bucket_head[cast[uint64](b)]
     region_bucket_head[cast[uint64](b)] = addr
+    if _rf_sw != 0:
+        load_cr3(_rf_live)
+    local_irq_restore(_rf_irq)
 
 
 # --- bring-up + stats ----------------------------------------------

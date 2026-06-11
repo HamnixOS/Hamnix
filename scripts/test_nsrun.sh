@@ -149,7 +149,7 @@ fail=0
 check_marker() {
     local marker="$1"
     local label="$2"
-    if grep -F -q "$marker" "$LOG"; then
+    if grep -a -F -q "$marker" "$LOG"; then
         echo "[test_nsrun] OK: $label"
     else
         echo "[test_nsrun] MISS: $label ($marker)"
@@ -158,9 +158,9 @@ check_marker() {
 }
 
 # Any per-assertion FAIL line means a round-trip / isolation check broke.
-if grep -F -q "[nsrun_test] FAIL:" "$LOG"; then
+if grep -a -F -q "[nsrun_test] FAIL:" "$LOG"; then
     echo "[test_nsrun] MISS: per-assertion FAIL line(s) present:"
-    grep -F "[nsrun_test] FAIL:" "$LOG" | sed 's/^/  /'
+    grep -a -F "[nsrun_test] FAIL:" "$LOG" | sed 's/^/  /'
     fail=1
 else
     echo "[test_nsrun] OK: no per-assertion FAIL lines"
@@ -187,7 +187,7 @@ check_marker "[nsrun_test] isolation OK" "parent /var/lib/dpkg untouched"
 # Per-invocation /srv names: the post name must carry the pid so two
 # concurrent nsruns never collide. Assert the suffixed-name shape is
 # present in the log (the daemon-spawn path posts it).
-if grep -E -q '\[nsrun\] pid=[0-9]+' "$LOG"; then
+if grep -a -E -q '\[nsrun\] pid=[0-9]+' "$LOG"; then
     echo "[test_nsrun] OK: /srv post name is per-pid (nsrun.distrofs.<pid>.<sub>)"
 else
     echo "[test_nsrun] MISS: no per-pid marker — /srv name not pid-suffixed"
@@ -198,7 +198,7 @@ fi
 # Each must report a DIFFERENT pid (a fresh process) — proving the
 # per-pid /srv names (nsrun.distrofs.<pid>.<sub>) are genuinely
 # distinct across runs.
-pids=$(grep -E -o '\[nsrun\] pid=[0-9]+' "$LOG" | grep -E -o '[0-9]+' | sort -u)
+pids=$(grep -a -E -o '\[nsrun\] pid=[0-9]+' "$LOG" | grep -a -E -o '[0-9]+' | sort -u)
 pid_count=$(echo "$pids" | grep -c . || true)
 if [ "$pid_count" -ge 3 ]; then
     echo "[test_nsrun] OK: three nsrun runs used distinct pids ($(echo $pids | tr '\n' ' ')) -> distinct /srv names"
@@ -215,14 +215,14 @@ fi
 # each mounting /var + /usr + /etc, we expect 9 "distrofs mounted at"
 # lines total. The known leak errstr ("p9c_attach (conn alloc)") must
 # NOT appear at all — its presence means the table still leaks.
-if grep -F -q "p9c_attach (conn alloc)" "$LOG"; then
+if grep -a -F -q "p9c_attach (conn alloc)" "$LOG"; then
     echo "[test_nsrun] MISS: 'p9c_attach (conn alloc)' present — 9P conn table still leaks"
     fail=1
 else
     echo "[test_nsrun] OK: no 'p9c_attach (conn alloc)' — conn table released between runs"
 fi
 
-mount_count=$(grep -F -c "[nsrun] distrofs mounted at" "$LOG" || true)
+mount_count=$(grep -a -F -c "[nsrun] distrofs mounted at" "$LOG" || true)
 if [ "$mount_count" -ge 9 ]; then
     echo "[test_nsrun] OK: all three nsrun runs mounted all three subtrees ($mount_count mount lines)"
 else
@@ -234,7 +234,7 @@ fi
 # (write) must ALL reach PASS. With the p9_conns leak fixed there is
 # no longer a tolerated-failure case: 3+ sequential nsrun cycles MUST
 # all succeed.
-pass_count=$(grep -F -c "[nsrun_test] PASS" "$LOG" || true)
+pass_count=$(grep -a -F -c "[nsrun_test] PASS" "$LOG" || true)
 if [ "$pass_count" -ge 4 ]; then
     echo "[test_nsrun] OK: all four fixture runs reached PASS ($pass_count)"
 else

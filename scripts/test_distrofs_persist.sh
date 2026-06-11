@@ -130,33 +130,33 @@ rc2=$?
 set -e
 
 echo "[test_distrofs_persist] --- boot #1 distrofs/dfsp lines ---"
-grep -E '\[dfsp\]|\[distrofs\]' "$LOG1" || true
+grep -a -E '\[dfsp\]|\[distrofs\]' "$LOG1" || true
 echo "[test_distrofs_persist] --- boot #2 distrofs/dfsp lines ---"
-grep -E '\[dfsp\]|\[distrofs\]' "$LOG2" || true
+grep -a -E '\[dfsp\]|\[distrofs\]' "$LOG2" || true
 echo "[test_distrofs_persist] --- end ---"
 
 fail=0
 
 # Any fixture FAIL line on either boot fails the test.
-if grep -F -q "[dfsp] FAIL:" "$LOG1"; then
+if grep -a -F -q "[dfsp] FAIL:" "$LOG1"; then
     echo "[test_distrofs_persist] MISS: boot #1 fixture FAIL line(s):"
-    grep -F "[dfsp] FAIL:" "$LOG1" | sed 's/^/  /'
+    grep -a -F "[dfsp] FAIL:" "$LOG1" | sed 's/^/  /'
     fail=1
 fi
-if grep -F -q "[dfsp] FAIL:" "$LOG2"; then
+if grep -a -F -q "[dfsp] FAIL:" "$LOG2"; then
     echo "[test_distrofs_persist] MISS: boot #2 fixture FAIL line(s):"
-    grep -F "[dfsp] FAIL:" "$LOG2" | sed 's/^/  /'
+    grep -a -F "[dfsp] FAIL:" "$LOG2" | sed 's/^/  /'
     fail=1
 fi
 
 # Boot 1: the file was created, written and clunked.
-if grep -F -q "[dfsp] write done" "$LOG1"; then
+if grep -a -F -q "[dfsp] write done" "$LOG1"; then
     echo "[test_distrofs_persist] OK: boot #1 created + wrote pkgfile"
 else
     echo "[test_distrofs_persist] MISS: boot #1 did not finish the write"
     fail=1
 fi
-if grep -F -q "[dfsp] WRITE PASS" "$LOG1"; then
+if grep -a -F -q "[dfsp] WRITE PASS" "$LOG1"; then
     echo "[test_distrofs_persist] OK: boot #1 snapshot taken (WRITE PASS)"
 else
     echo "[test_distrofs_persist] MISS: boot #1 WRITE PASS missing"
@@ -165,13 +165,13 @@ fi
 
 # Boot 1: distrofs must have persisted to the ext4 backing (not the
 # silent no-backing path). The startup banner confirms a backing.
-if grep -F -q "[distrofs] persist failed" "$LOG1"; then
+if grep -a -F -q "[distrofs] persist failed" "$LOG1"; then
     echo "[test_distrofs_persist] MISS: boot #1 reported persist failure"
     fail=1
 fi
 
 # Boot 2: a FRESH distrofs restored the snapshot from the ext4 volume.
-if grep -F -q "[distrofs] restored snapshot from ext4 backing" "$LOG2"; then
+if grep -a -F -q "[distrofs] restored snapshot from ext4 backing" "$LOG2"; then
     echo "[test_distrofs_persist] OK: boot #2 distrofs restored its ext4 snapshot"
 else
     echo "[test_distrofs_persist] MISS: boot #2 did not restore a snapshot"
@@ -179,13 +179,13 @@ else
 fi
 
 # THE PROOF: boot 2 read the boot-1 marker back byte-for-byte.
-if grep -F -q "[dfsp] read match OK" "$LOG2"; then
+if grep -a -F -q "[dfsp] read match OK" "$LOG2"; then
     echo "[test_distrofs_persist] OK: marker survived the reboot (persistence)"
 else
     echo "[test_distrofs_persist] MISS: marker NOT recovered after reboot"
     fail=1
 fi
-if grep -F -q "[dfsp] READ PASS" "$LOG2"; then
+if grep -a -F -q "[dfsp] READ PASS" "$LOG2"; then
     echo "[test_distrofs_persist] OK: boot #2 READ PASS"
 else
     echo "[test_distrofs_persist] MISS: boot #2 READ PASS missing"
@@ -193,7 +193,7 @@ else
 fi
 
 # No CPU exception on either boot.
-if grep -F -q "TRAP: vector" "$LOG1" || grep -F -q "TRAP: vector" "$LOG2"; then
+if grep -a -F -q "TRAP: vector" "$LOG1" || grep -a -F -q "TRAP: vector" "$LOG2"; then
     echo "[test_distrofs_persist] DIAG: kernel reported a CPU exception"
     fail=1
 fi
