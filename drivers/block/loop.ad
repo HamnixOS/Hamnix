@@ -31,6 +31,8 @@ from kernel.block.blk import (
     BlockDeviceOps, register_blockdev, blk_unregister_by_name,
     SECTOR_SIZE, find_blockdev, blk_write_sectors, blk_capacity_sectors,
 )
+from drivers.block.brd import brd_register_dynamic
+from mm.memblock import memblock_alloc
 from fs.vfs import (
     vfs_resolve_backing,
     vfs_pread_backing, vfs_pwrite_backing,
@@ -355,6 +357,140 @@ def loop_sqfs_extract(sqfs_path: Ptr[char], inner_path: Ptr[char],
     return 0
 
 
+# --- LIVE-medium distro root bringup (#410 Item 2) -------------------
+#
+# A LIVE boot off the installer medium (no install) still wants the
+# Debian namespace: `enter linux { bind '#distro' / ... }`. On the
+# installed system #distro is a subtree of the NVMe ext4 partition; on
+# the live medium there is NO readable disk at all (ESP-only GPT, USB
+# driver broken on the NUC) — everything must come out of the
+# firmware-loaded in-RAM squashfs.
+#
+# loop_sqfs_live_root() chains:
+#   1. loop_attach(sqfs_path)        /rootfs.sqfs (cpio file) -> loopN
+#   2. sqfs_mount + sqfs_lookup_ref  resolve e.g. /live-distro.ext4
+#   3. memblock_alloc(payload)       carve a RAM backing buffer
+#   4. sqfs_read -> buffer           decompress the ext4 image into RAM
+#   5. brd_register_dynamic("live0") expose the buffer as a block dev
+#   6. live_root_hook(blk_slot)      init/main.ad mounts the ext4,
+#      parses its .hamnix-roots sentinel, and name_push()es #distro —
+#      the SAME named-root machinery the installed disk uses.
+#
+# The hook indirection avoids an import cycle (init/main.ad already
+# imports this file).
+
+loop_live_root_hook: Fn[int32, int32]
+
+
+def loop_set_live_root_hook(fn: Fn[int32, int32]):
+    loop_live_root_hook = fn
+
+
+def loop_sqfs_live_root(sqfs_path: Ptr[char], inner_path: Ptr[char]) -> int32:
+    # Returns 0 on success, a negative error otherwise:
+    #   -1  loop_attach of the squashfs file failed
+    #   -2  sqfs_mount failed
+    #   -3  inner file not found in the squashfs
+    #   -4  sqfs_file_size failed
+    #   -5  memblock_alloc failed (not enough boot RAM)
+    #   -6  a squashfs read failed mid-stream
+    #   -7  RAM block-device registration failed
+    #   -8  the live-root mount hook failed (or none registered)
+    # NOTICE level so the markers survive console_set_interactive's INFO
+    # gate — the live test asserts on these "[live-root]" lines.
+    printk_set_level(PRINTK_LEVEL_NOTICE)
+    printk0("[live-root] start (in-RAM squashfs -> RAM distro root)\n")
+    loop_slot: int32 = loop_attach(sqfs_path)
+    if loop_slot < 0:
+        printk1("[live-root] loop_attach failed rc=%d\n",
+                cast[uint64](cast[int64](loop_slot)))
+        return -1
+    name_buf: Array[16, uint8]
+    _loop_name_build(loop_slot, &name_buf[0])
+    blk_slot: int32 = find_blockdev(cast[Ptr[char]](&name_buf[0]))
+    if blk_slot < 0:
+        printk0("[live-root] loop block slot not found\n")
+        loop_detach(loop_slot)
+        return -1
+    if sqfs_mount(blk_slot) != 0:
+        printk_set_level(PRINTK_LEVEL_NOTICE)
+        printk0("[live-root] sqfs_mount failed\n")
+        loop_detach(loop_slot)
+        return -2
+    ref: uint64 = 0
+    if sqfs_lookup_ref(inner_path, &ref) != 0:
+        printk0("[live-root] inner image not found in squashfs\n")
+        loop_detach(loop_slot)
+        return -3
+    payload_size: uint64 = 0
+    if sqfs_file_size(ref, &payload_size) != 0:
+        printk0("[live-root] sqfs_file_size failed\n")
+        loop_detach(loop_slot)
+        return -4
+    printk_set_level(PRINTK_LEVEL_NOTICE)
+    printk1("[live-root] live distro image: %d bytes\n", payload_size)
+
+    # Whole-sector backing region (the image is mkfs output, already a
+    # MiB multiple; round up defensively).
+    nsectors: uint64 = (payload_size + SECTOR_SIZE - 1) / SECTOR_SIZE
+    nbytes: uint64 = nsectors * SECTOR_SIZE
+    base: uint64 = memblock_alloc(nbytes, 4096)
+    if base == 0:
+        printk1("[live-root] memblock_alloc(%d) failed — not enough RAM\n",
+                nbytes)
+        loop_detach(loop_slot)
+        return -5
+
+    # Stream-decompress straight into the backing buffer (no bounce
+    # buffer needed — sqfs_read writes to a caller pointer).
+    off: uint64 = 0
+    report_step: uint64 = 16777216             # log every 16 MiB
+    next_report: uint64 = report_step
+    while off < payload_size:
+        want: uint64 = SQFS_STREAM_CHUNK
+        if want > payload_size - off:
+            want = payload_size - off
+        nr: int64 = sqfs_read(ref, off, cast[Ptr[uint8]](base + off), want)
+        if nr <= 0:
+            printk1("[live-root] sqfs_read failed at off=%d\n", off)
+            loop_detach(loop_slot)
+            return -6
+        off = off + cast[uint64](nr)
+        if off >= next_report:
+            printk2("[live-root] streamed %d of %d bytes\n",
+                    off, payload_size)
+            next_report = next_report + report_step
+    # Zero the rounding tail so the device never exposes stale RAM.
+    z: uint64 = payload_size
+    zp: Ptr[uint8] = cast[Ptr[uint8]](base)
+    while z < nbytes:
+        zp[z] = 0
+        z = z + 1
+    # The squashfs side is done — free the loop slot before mounting.
+    loop_detach(loop_slot)
+
+    live_slot: int32 = brd_register_dynamic("live0", base, nbytes)
+    if live_slot < 0:
+        printk0("[live-root] RAM block-device registration failed\n")
+        return -7
+    printk_set_level(PRINTK_LEVEL_NOTICE)
+    printk2("[live-root] /dev/blk/live0 ready (%d bytes, slot=%d)\n",
+            nbytes, cast[uint64](cast[int64](live_slot)))
+
+    hook: Fn[int32, int32] = loop_live_root_hook
+    if hook == cast[Fn[int32, int32]](0):
+        printk0("[live-root] no live-root mount hook registered\n")
+        return -8
+    hrc: int32 = hook(live_slot)
+    if hrc != 0:
+        printk1("[live-root] live-root mount hook failed rc=%d\n",
+                cast[uint64](cast[int64](hrc)))
+        return -8
+    printk_set_level(PRINTK_LEVEL_NOTICE)
+    printk0("[live-root] DONE: live distro root mounted (#distro posted)\n")
+    return 0
+
+
 # --- /dev/loop/ctl control surface ----------------------------------
 #
 # Global write-only control file. Verbs (one per write, '\n' or
@@ -536,6 +672,29 @@ def loopctl_write(buf: Ptr[uint8], count: uint64) -> int64:
         if erc != 0:
             printk1("loop: sqfs_extract failed rc=%d\n",
                     cast[uint64](cast[int64](erc)))
+            return -5                              # -EIO
+        return cast[int64](count)
+    if _lc_starts_with(bp, n, "sqfs_live_root") != 0:
+        # sqfs_live_root <sqfs_file_path> <inner_image_path>
+        # LIVE-medium bringup: decompress the inner ext4 image out of the
+        # in-RAM squashfs into a fresh RAM block device and post its
+        # .hamnix-roots named roots (#distro). Triggered by the rc.boot
+        # LIVE branch via user/live_distro_up.
+        pos: uint64 = 14                           # past "sqfs_live_root"
+        ep: uint64 = 0
+        if _lc_copy_token(bp, n, pos, &lc_tok_a[0], 256, &ep) == 0:
+            printk0("loop: sqfs_live_root: missing sqfs path\n")
+            return -22
+        pos = ep
+        if _lc_copy_token(bp, n, pos, &lc_tok_b[0], 256, &ep) == 0:
+            printk0("loop: sqfs_live_root: missing inner image path\n")
+            return -22
+        lrc: int32 = loop_sqfs_live_root(
+            cast[Ptr[char]](&lc_tok_a[0]),
+            cast[Ptr[char]](&lc_tok_b[0]))
+        if lrc != 0:
+            printk1("loop: sqfs_live_root failed rc=%d\n",
+                    cast[uint64](cast[int64](lrc)))
             return -5                              # -EIO
         return cast[int64](count)
     if _lc_starts_with(bp, n, "list") != 0:

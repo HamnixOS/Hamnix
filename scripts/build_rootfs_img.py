@@ -51,6 +51,18 @@ ENV:
                           When 0, skip the real Debian closure; image
                           contains only busybox. The kernel still posts
                           the file server, just with less content.
+  HAMNIX_ROOTFS_LIVE      0/1               (default: 0)
+                          When 1, build the LIVE-medium distro image
+                          (#410 Item 2): ONLY the distro/ subtree + a
+                          `distro distro` sentinel — no sysroot/ (the
+                          live system's native userland rides in the
+                          installer cpio, not on this image). This
+                          image is packed into /rootfs.sqfs, extracted
+                          to a RAM block device at live boot, and
+                          posted as the #distro named root so `enter
+                          linux { ... }` works with NO install and NO
+                          media read. Auto-sizing uses a tighter
+                          headroom because every byte is boot RAM.
 
 NOT in the image (out of scope for the file server — these live in the
 init namespace, served from cpio or '#' devices):
@@ -379,6 +391,25 @@ def _stage_sysroot_etc(sysroot: Path) -> int:
     return n
 
 
+def _stage_distro(distro: Path) -> None:
+    """Stage the distro/ subtree: real Debian closure + busybox."""
+    minbase = HERE / "tests" / "distros" / "debian-minbase" / "rootfs"
+    real_debian_raw = os.environ.get("HAMNIX_DEFAULT_REAL_DEBIAN", "1")
+    if real_debian_raw in ("0", "", "off", "no"):
+        print(f"[build_rootfs_img] HAMNIX_DEFAULT_REAL_DEBIAN={real_debian_raw}: "
+              f"skipping real Debian closure", flush=True)
+    elif not minbase.is_dir():
+        print(f"[build_rootfs_img] WARN: {minbase.relative_to(HERE)} "
+              f"absent — distro/ subtree will contain only busybox",
+              flush=True)
+    else:
+        n, b = _stage_real_debian(distro, minbase)
+        print(f"[build_rootfs_img] staged {n} Debian apt/dpkg files "
+              f"({b/(1<<20):.1f} MiB) into distro/ from "
+              f"{minbase.relative_to(HERE)}", flush=True)
+    _stage_busybox(distro)
+
+
 def _stage_directory(staging: Path):
     """Mirror the multi-root file-server contents into `staging`.
 
@@ -399,21 +430,7 @@ def _stage_directory(staging: Path):
     distro.mkdir(parents=True, exist_ok=True)
 
     # --- distro/ subtree: the real Debian closure + busybox ----------
-    minbase = HERE / "tests" / "distros" / "debian-minbase" / "rootfs"
-    real_debian_raw = os.environ.get("HAMNIX_DEFAULT_REAL_DEBIAN", "1")
-    if real_debian_raw in ("0", "", "off", "no"):
-        print(f"[build_rootfs_img] HAMNIX_DEFAULT_REAL_DEBIAN={real_debian_raw}: "
-              f"skipping real Debian closure", flush=True)
-    elif not minbase.is_dir():
-        print(f"[build_rootfs_img] WARN: {minbase.relative_to(HERE)} "
-              f"absent — distro/ subtree will contain only busybox",
-              flush=True)
-    else:
-        n, b = _stage_real_debian(distro, minbase)
-        print(f"[build_rootfs_img] staged {n} Debian apt/dpkg files "
-              f"({b/(1<<20):.1f} MiB) into distro/ from "
-              f"{minbase.relative_to(HERE)}", flush=True)
-    _stage_busybox(distro)
+    _stage_distro(distro)
 
     # --- sysroot/ subtree: native Adder tools + /etc -----------------
     tn, tb = _stage_adder_tools(sysroot)
@@ -425,6 +442,27 @@ def _stage_directory(staging: Path):
           f"(incl. rc.boot.full)", flush=True)
 
     _stage_hamnix_roots(staging)
+
+
+def _stage_directory_live(staging: Path):
+    """Stage the LIVE-medium distro image (#410 Item 2).
+
+    Layout (vs. the installed multi-root image): ONLY the Debian distro
+    subtree, posted as #distro. There is NO sysroot/ — on the live
+    medium the native Adder userland + /etc ride in the installer
+    kernel's cpio (firmware-loaded, no media read), so duplicating them
+    here would only burn boot RAM. The sentinel declares the single
+    root:
+
+        distro    distro
+    """
+    distro = staging / "distro"
+    distro.mkdir(parents=True, exist_ok=True)
+    _stage_distro(distro)
+    sentinel = staging / ".hamnix-roots"
+    sentinel.write_text("distro    distro\n", encoding="ascii")
+    print("[build_rootfs_img] planted LIVE .hamnix-roots sentinel "
+          "(declares #distro -> distro/ only)", flush=True)
 
 
 def _stage_hamnix_roots(staging: Path) -> None:
@@ -497,7 +535,7 @@ def _du_bytes(path: Path) -> int:
     return total
 
 
-def _pick_size_mb(staging_bytes: int) -> int:
+def _pick_size_mb(staging_bytes: int, live: bool = False) -> int:
     raw = os.environ.get("HAMNIX_ROOTFS_SIZE_MB", "").strip()
     if raw:
         try:
@@ -505,10 +543,16 @@ def _pick_size_mb(staging_bytes: int) -> int:
         except ValueError:
             raise SystemExit(
                 f"HAMNIX_ROOTFS_SIZE_MB={raw!r}: must be an integer")
+    staged_mib = (staging_bytes + (1 << 20) - 1) // (1 << 20)
+    if live:
+        # Live image is extracted to a RAM block device at boot — every
+        # MiB here is boot RAM. Keep ext4-metadata + writable-scratch
+        # headroom tight: +16 MiB metadata, +16 MiB scratch, floor 48.
+        size_mib = staged_mib + 16 + 16
+        return max(size_mib, 48)
     # Auto-size: staging bytes + 64 MiB ext4 metadata + 32 MiB future
     # apt-install scratch headroom. Floor at 96 MiB so an empty image
     # still has comfortable headroom for an apt cache.
-    staged_mib = (staging_bytes + (1 << 20) - 1) // (1 << 20)
     size_mib = staged_mib + 64 + 32
     if size_mib < 96:
         size_mib = 96
@@ -527,10 +571,14 @@ def build_image(out_path: Path) -> Path:
     try:
         staging = stage_root / "rootfs"
         staging.mkdir(parents=True)
-        _stage_directory(staging)
+        live = os.environ.get("HAMNIX_ROOTFS_LIVE", "0") == "1"
+        if live:
+            _stage_directory_live(staging)
+        else:
+            _stage_directory(staging)
 
         staged_bytes = _du_bytes(staging)
-        size_mib = _pick_size_mb(staged_bytes)
+        size_mib = _pick_size_mb(staged_bytes, live=live)
         print(f"[build_rootfs_img] staged {staged_bytes/(1<<20):.1f} MiB; "
               f"creating {size_mib} MiB ext4 image at {out_path}",
               flush=True)
