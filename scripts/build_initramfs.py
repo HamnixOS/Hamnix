@@ -629,6 +629,16 @@ if os.environ.get("ENABLE_SPLICE_TEST") == "1":
 if os.environ.get("ENABLE_FBRECT_TEST") == "1":
     FILES.append(("/etc/fbrect-test", b"1\n"))
 
+# /dev/fbpix framebuffer pixel READ-BACK (hamshot screenshot leaf)
+# self-test. scripts/test_fbpix.sh sets ENABLE_FBPIX_TEST=1 to plant
+# /etc/fbpix-test; init/main.ad at boot:37.fbpix detects the marker and
+# runs fbpix_selftest() (drivers/video/fb_cdev.ad). The self-test stands
+# up a synthetic framebuffer (mutates the text-console geometry) and
+# leaves it live for the userland fixture, so it is opt-in — default
+# boots ship no marker and are unaffected.
+if os.environ.get("ENABLE_FBPIX_TEST") == "1":
+    FILES.append(("/etc/fbpix-test", b"1\n"))
+
 # close_range(2) + statx(2) self-test. scripts/test_close_range.sh sets
 # ENABLE_CLOSERANGE_TEST=1 to plant /etc/closerange-test; init/main.ad at
 # boot:37.closerange detects the marker and runs close_range_selftest().
