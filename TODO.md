@@ -313,13 +313,17 @@ The Phase D inversion + §1..§13 critical path is **closed** (see
 STATUS.md). What remains, off the critical path and parallelisable:
 
 ### Latent crashes
-- [ ] `#DF` at `load_cr3+0x3` (the `ret` after `mov %rdi,%cr3`) when a
-  freshly-built CR3's kernel half is unmapped (stale/uninitialised PML4
-  entry; trap rsp lands in low memory ~0x6693200). Fires *after* test
-  success in both ntpd and non-ntpd runs, so the suite still passes —
-  but it's a real double-fault. Likely cause: a new address space's
-  top-level PML4 isn't inheriting the kernel higher-half mappings before
-  the switch. Surfaced during hamUI Phase 2 landing.
+- [x] `#DF` at `load_cr3+0x3` — **RESOLVED** (`557f6ee3`, see STATUS.md
+  2026-06-11 wave). The kernel-half-unmapped hypothesis was disproven
+  (a `[cr3-sync]` assert now guards that invariant); real causes were
+  thread-group address-space teardown on leader reap + an SMP
+  publish-before-inherit window in `create_user_thread`.
+- [ ] Intermittent ASLR NX/RSVD page fault on high ET_DYN load bias
+  (~1-in-4 boots of `test_thread_leader_exit.sh`): user NX exec-fault at
+  the top of the [4 GiB, 5 GiB) bias window, then kernel PF err=0x9
+  (reserved-bit ⇒ corrupt PTE) during coredump capture. Pre-existing
+  since ASLR Stage 2 (`46491912`), exposed by the new fixture. (`#438`,
+  agent in flight; evidence in task description.)
 
 ### Phase D follow-ups
 - [ ] Layer-2 `/proc → /dev` translation as a namespace bind (retire
