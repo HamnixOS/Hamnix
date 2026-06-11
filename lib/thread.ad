@@ -1,0 +1,351 @@
+# lib/thread.ad
+#
+# #443: native threading library for Adder userland.
+#
+# WHAT THIS IS
+# ============
+# A small, obvious threads + sync API for NATIVE Hamnix programs:
+#
+#   tid: int32 = thread_spawn(fn, arg)   # fn: def f(arg: uint64) -> uint64
+#   thread_join(tid)                     # sleeps until fn returned/exited
+#
+#   m: Array[1, Mutex]; mutex_init(&m[0])
+#   mutex_lock(&m[0]); ...critical section...; mutex_unlock(&m[0])
+#
+#   c: Array[1, Chan]; chan_init(&c[0])
+#   chan_send(&c[0], v); v = chan_recv(&c[0])   # bounded, blocking
+#
+# THE SHAPE UNDERNEATH (all Plan 9, no Linux)
+# ===========================================
+# * Threads are rfork(RFPROC|RFMEM|RFNOWAIT) — the native Plan 9 thread
+#   path (sys/src/9/port/sysproc.ad::_rfork_thread). The child shares
+#   the address space and runs on a stack this library mmaps.
+# * Blocking sync is the native semacquire(2)/semrelease(2) pair
+#   (sys/src/9/port/sems.ad, syscalls 314/315). The fast path never
+#   enters the kernel: it uses the compiler's LOCK-prefixed
+#   atomic_add32/atomic_cas32 intrinsics and only syscalls on
+#   contention — exactly Plan 9's lock()/qlock() construction.
+# * thread_join is just semacquire on a per-thread "done" word that the
+#   KERNEL releases from task_exit_current (SYS_SETEXITSEM, 316) after
+#   the thread can never touch its user stack again — so join may
+#   safely munmap the stack with no exiter/joiner race.
+#
+# STACKS AND THE RFMEM VMA GAP
+# ============================
+# _rfork_thread shares the PML4 but NOT the creator's vma_list, so a
+# thread cannot demand-fault pages of an mmap'd region (the fault
+# handler finds no VMA in the thread's task). v1 mitigation: the
+# spawner PRE-FAULTS every page of the new stack by touching it before
+# rfork. Full VMA-list sharing (with refcounting) is a kernel follow-up.
+#
+# TLS: v1 passes tls=0 to rfork (thread inherits the creator's %fs
+# base). Per-thread TLS blocks are future work; nothing in this library
+# needs them (the trampoline finds its slot by stack-range lookup).
+#
+# COMPILER QUIRKS HONOURED: big state at module scope; string literals
+# at call sites; no adjacent-literal concat.
+
+extern def sys_rfork_thread(flags: int32, child_stack: uint64,
+                            tls: uint64) -> int32
+extern def sys_exit(code: uint64)
+extern def sys_yield() -> int32
+extern def sys_mmap(addr: uint64, len: uint64, prot: int32, flags: int32,
+                    fd: int32, off: uint64) -> int64
+extern def sys_munmap(addr: uint64, len: uint64) -> int32
+extern def sys_semacquire(addr: uint64, block: int32) -> int32
+extern def sys_semrelease(addr: uint64, count: int64) -> int64
+extern def sys_setexitsem(addr: uint64) -> int32
+
+# rfork bits (numerically identical to <plan9/libc.h>; see sysproc.ad).
+THR_RFPROC:   int32 = 0x001
+THR_RFMEM:    int32 = 0x002
+THR_RFNOWAIT: int32 = 0x100
+
+# mmap bits (native SYS_MMAP, Linux-numbered prot/flags).
+THR_PROT_READ:  int32 = 0x1
+THR_PROT_WRITE: int32 = 0x2
+THR_MAP_PRIVATE: int32 = 0x02
+THR_MAP_ANON:    int32 = 0x20
+
+# Per-thread stack size. 64 KiB is generous for native Adder code (no
+# deep libc below us); bump if a consumer ever needs more.
+THR_STACK_SIZE: uint64 = 65536
+
+# Errors (negative-errno style, matching the syscall layer).
+THR_EAGAIN: int32 = -11        # no free thread slot
+THR_ENOMEM: int32 = -12        # stack mmap failed
+THR_EINVAL: int32 = -22        # bad fn / unknown tid
+
+SEM_EINTR: int32 = -4          # semacquire interrupted; retry
+
+
+# ---------------------------------------------------------------------
+# Thread table. Parallel arrays at module scope (compiler quirk: keep
+# big state out of locals). A slot is claimed lock-free with
+# atomic_cas32 on thr_state, so concurrent spawns from multiple threads
+# are safe.
+# ---------------------------------------------------------------------
+THR_MAX: uint64 = 64
+
+THR_FREE:   uint32 = 0
+THR_INUSE:  uint32 = 1
+
+thr_state: Array[64, uint32]    # THR_FREE / THR_INUSE (CAS-claimed)
+thr_tid:   Array[64, int32]     # kernel pid of the thread
+thr_stack: Array[64, uint64]    # mmap base of its stack (0 = none)
+thr_fn:    Array[64, uint64]    # entry fn, cast from Fn[uint64, uint64]
+thr_arg:   Array[64, uint64]    # opaque arg handed to fn
+thr_done:  Array[64, uint32]    # exit semaphore: kernel semreleases on exit
+
+
+def _thr_sem_acquire(addr: uint64):
+    # Blocking semacquire with EINTR retry — every sleeper in this
+    # library funnels through here so signal wakes never surface as
+    # spurious failures to callers.
+    while True:
+        rc: int32 = sys_semacquire(addr, 1)
+        if rc == 1:
+            return
+        if rc != SEM_EINTR:
+            # EFAULT etc. — a library-internal address can't legally
+            # fault; treat as fatal for this thread rather than spin.
+            sys_exit(70)
+        # interrupted: retry
+
+
+def _thread_trampoline():
+    # Entry RIP parked at the top of every spawned thread's stack: the
+    # kernel's rfork-thread path makes the child resume after `syscall`
+    # in sys_rfork_thread and `ret` straight into this function.
+    #
+    # Find our slot by stack-range lookup: a local's address is inside
+    # exactly one registered [stack, stack+SIZE) window. This avoids
+    # needing TLS or an argument register across the rfork boundary.
+    marker: uint64 = 0
+    here: uint64 = cast[uint64](&marker)
+    slot: uint64 = 0
+    found: uint64 = THR_MAX
+    while slot < THR_MAX:
+        base: uint64 = thr_stack[slot]
+        if base != 0 and here >= base and here < base + THR_STACK_SIZE:
+            found = slot
+            # keep scanning? no — stack ranges are disjoint by
+            # construction (each is a private mmap).
+            slot = THR_MAX
+        else:
+            slot = slot + 1
+    if found == THR_MAX:
+        # Can't identify ourselves — nothing sane to do but exit; the
+        # joiner (if any) would hang, but this is unreachable unless
+        # the table was corrupted.
+        sys_exit(71)
+        return
+
+    # FIRST: register the exit-notification semaphore, BEFORE running
+    # user code — so even an fn that crashes/exits early still releases
+    # the joiner. The kernel fires it from task_exit_current after this
+    # thread is irrevocably off this stack.
+    sys_setexitsem(cast[uint64](&thr_done[found]))
+
+    fn: Fn[uint64, uint64] = cast[Fn[uint64, uint64]](thr_fn[found])
+    fn(thr_arg[found])
+    sys_exit(0)
+
+
+def thread_spawn(fn: Fn[uint64, uint64], arg: uint64) -> int32:
+    # Spawn a native thread running fn(arg). Returns its tid (> 0) or a
+    # negative errno. The thread shares this address space (RFMEM) and
+    # is detached at the rfork level (RFNOWAIT — no zombie); lifecycle
+    # is managed by thread_join via the exit semaphore instead.
+    if cast[uint64](fn) == 0:
+        return THR_EINVAL
+
+    # Claim a slot lock-free.
+    slot: uint64 = 0
+    claimed: uint64 = THR_MAX
+    while slot < THR_MAX:
+        if thr_state[slot] == THR_FREE:
+            old: uint32 = atomic_cas32(cast[uint64](&thr_state[slot]),
+                                       THR_FREE, THR_INUSE)
+            if old == THR_FREE:
+                claimed = slot
+                slot = THR_MAX
+            else:
+                slot = slot + 1
+        else:
+            slot = slot + 1
+    if claimed == THR_MAX:
+        return THR_EAGAIN
+
+    # Stack: anonymous private mapping...
+    base64: int64 = sys_mmap(0, THR_STACK_SIZE,
+                             THR_PROT_READ | THR_PROT_WRITE,
+                             THR_MAP_PRIVATE | THR_MAP_ANON, -1, 0)
+    if base64 <= 0:
+        thr_state[claimed] = THR_FREE
+        return THR_ENOMEM
+    base: uint64 = cast[uint64](base64)
+
+    # ...PRE-FAULTED page by page: the thread itself cannot demand-fault
+    # (RFMEM shares the PML4 but not the VMA list — see file header), so
+    # every page must be materialised by US, in the creator, now.
+    off: uint64 = 0
+    while off < THR_STACK_SIZE:
+        cast[Ptr[uint8]](base + off)[0] = 0
+        off = off + 4096
+
+    thr_tid[claimed] = 0
+    thr_stack[claimed] = base
+    thr_fn[claimed] = cast[uint64](fn)
+    thr_arg[claimed] = arg
+    thr_done[claimed] = 0
+
+    # Park the trampoline RIP at the top word; the child `ret`s into it.
+    # top = base + SIZE - 16 keeps the post-ret RSP ≡ 8 (mod 16), the
+    # standard post-call x86_64 ABI alignment.
+    top: uint64 = base + THR_STACK_SIZE - 16
+    cast[Ptr[uint64]](top)[0] = cast[uint64](&_thread_trampoline)
+
+    flags: int32 = THR_RFPROC | THR_RFMEM | THR_RFNOWAIT
+    rc: int32 = sys_rfork_thread(flags, top, 0)
+
+    if rc == 0:
+        # Defensive: the child is supposed to `ret` into the trampoline
+        # and never come this way. If a kernel change ever makes it fall
+        # through, exit instead of running the creator's code twice.
+        sys_exit(72)
+        return 0
+    if rc < 0:
+        sys_munmap(base, THR_STACK_SIZE)
+        thr_stack[claimed] = 0
+        thr_state[claimed] = THR_FREE
+        return rc
+
+    thr_tid[claimed] = rc
+    return rc
+
+
+def thread_join(tid: int32) -> int32:
+    # Block until thread `tid` has exited, then reclaim its stack and
+    # slot. Returns 0, or THR_EINVAL for an unknown tid.
+    #
+    # The wait is a plain semacquire on the thread's done word — the
+    # kernel semreleases it from task_exit_current AFTER the thread can
+    # never touch its stack again, so the munmap below is race-free.
+    if tid <= 0:
+        return THR_EINVAL
+    slot: uint64 = 0
+    found: uint64 = THR_MAX
+    while slot < THR_MAX:
+        if thr_state[slot] == THR_INUSE and thr_tid[slot] == tid:
+            found = slot
+            slot = THR_MAX
+        else:
+            slot = slot + 1
+    if found == THR_MAX:
+        return THR_EINVAL
+
+    _thr_sem_acquire(cast[uint64](&thr_done[found]))
+
+    base: uint64 = thr_stack[found]
+    if base != 0:
+        sys_munmap(base, THR_STACK_SIZE)
+    thr_stack[found] = 0
+    thr_tid[found] = 0
+    thr_state[found] = THR_FREE
+    return 0
+
+
+# ---------------------------------------------------------------------
+# Mutex — Plan 9 semaphore-lock construction (9front libc lock()):
+# an atomic contender count `key` plus a kernel semaphore `sem` that
+# only contended paths touch.
+#
+#   lock:   if atomic_add(key, +1) returned old 0  -> we own it, NO syscall
+#           else                                   -> semacquire(sem)
+#   unlock: if atomic_add(key, -1) returned old 1  -> no waiters, NO syscall
+#           else                                   -> semrelease(sem, 1)
+#
+# Invariant: key counts owner+waiters; sem carries exactly the number
+# of release tokens owed to blocked waiters.
+# ---------------------------------------------------------------------
+class Mutex:
+    key: uint32
+    sem: uint32
+
+
+def mutex_init(m: Ptr[Mutex]):
+    m[0].key = 0
+    m[0].sem = 0
+
+
+def mutex_lock(m: Ptr[Mutex]):
+    if atomic_add32(cast[uint64](&m[0].key), 1) == 0:
+        return                          # uncontended fast path
+    _thr_sem_acquire(cast[uint64](&m[0].sem))
+
+
+def mutex_unlock(m: Ptr[Mutex]):
+    # -1 as a uint32 add: two's-complement 0xFFFFFFFF.
+    if atomic_add32(cast[uint64](&m[0].key), 0xFFFFFFFF) == 1:
+        return                          # nobody was waiting
+    sys_semrelease(cast[uint64](&m[0].sem), 1)
+
+
+# ---------------------------------------------------------------------
+# Chan — bounded blocking channel of uint64, Plan 9 libthread shape.
+# Two counting semaphores (items/space) gate the blocking; a mutex
+# protects the ring indices. Capacity fixed at 16 (power of two).
+# ---------------------------------------------------------------------
+CHAN_CAP: uint64 = 16
+
+class Chan:
+    lock_key: uint32
+    lock_sem: uint32
+    items: uint32          # counting sem: filled slots
+    space: uint32          # counting sem: empty slots
+    rd: uint64
+    wr: uint64
+    buf: Array[16, uint64]
+
+
+def chan_init(c: Ptr[Chan]):
+    c[0].lock_key = 0
+    c[0].lock_sem = 0
+    c[0].items = 0
+    c[0].space = cast[uint32](CHAN_CAP)
+    c[0].rd = 0
+    c[0].wr = 0
+
+
+def _chan_lock(c: Ptr[Chan]):
+    if atomic_add32(cast[uint64](&c[0].lock_key), 1) == 0:
+        return
+    _thr_sem_acquire(cast[uint64](&c[0].lock_sem))
+
+
+def _chan_unlock(c: Ptr[Chan]):
+    if atomic_add32(cast[uint64](&c[0].lock_key), 0xFFFFFFFF) == 1:
+        return
+    sys_semrelease(cast[uint64](&c[0].lock_sem), 1)
+
+
+def chan_send(c: Ptr[Chan], v: uint64):
+    # Blocks while the channel is full.
+    _thr_sem_acquire(cast[uint64](&c[0].space))
+    _chan_lock(c)
+    c[0].buf[c[0].wr & (CHAN_CAP - 1)] = v
+    c[0].wr = c[0].wr + 1
+    _chan_unlock(c)
+    sys_semrelease(cast[uint64](&c[0].items), 1)
+
+
+def chan_recv(c: Ptr[Chan]) -> uint64:
+    # Blocks while the channel is empty.
+    _thr_sem_acquire(cast[uint64](&c[0].items))
+    _chan_lock(c)
+    v: uint64 = c[0].buf[c[0].rd & (CHAN_CAP - 1)]
+    c[0].rd = c[0].rd + 1
+    _chan_unlock(c)
+    sys_semrelease(cast[uint64](&c[0].space), 1)
+    return v

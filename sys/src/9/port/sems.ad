@@ -1,0 +1,231 @@
+# sys/src/9/port/sems.ad
+#
+# #443: Native Plan 9-shape user semaphores — semacquire / semrelease.
+#
+# WHY THIS SHAPE
+# ==============
+# Hamnix's native layer is Plan 9-shaped: native code does NOT get Linux
+# syscall clones (futex lives in the linux_abi shim, Layer 2, and stays
+# there). Plan 9's user-level synchronisation primitive is the semaphore
+# pair semacquire(2)/semrelease(2) — 9front added them precisely so
+# libthread/libc locks could sleep in the kernel instead of spinning.
+# We expose exactly that contract natively:
+#
+#   semacquire(addr, block):  wait until *addr > 0, atomically decrement
+#                             it, return 1. If block == 0 and *addr <= 0,
+#                             return 0 immediately. Returns -EINTR (-4,
+#                             errstr "interrupted") on a signal wake and
+#                             -EFAULT (-14) on a bad address.
+#   semrelease(addr, count):  atomically add `count` to *addr and wake
+#                             every waiter parked on it. Returns count.
+#
+# The semaphore WORD is a user-space uint32 (futex width; Plan 9 uses
+# `long`, which is also 32-bit there). The fast path never enters the
+# kernel at all — userland (lib/thread.ad) uses the compiler's
+# LOCK-prefixed atomic intrinsics and only syscalls on contention,
+# exactly like Plan 9's lock()/qlock() built over semacquire.
+#
+# IMPLEMENTATION
+# ==============
+# Internally this is the kernel's existing event-driven WaitQueue
+# machinery (kernel/sched/core.ad: wq_wait_prepare / wq_wait_cancel /
+# wq_wait_commit / wq_wake_all) — the same race-free prepare/recheck/
+# commit shape every other sleeper in the kernel uses. We do NOT
+# duplicate the Layer-2 futex table (linux_abi/u_syscalls.ad): that one
+# is a confined Linux-ABI facility with Linux yield-loop semantics; this
+# one is Layer-1, sleeps properly OFF the runqueue, and wakes via
+# directed reschedule IPIs.
+#
+# Address -> wait-queue mapping: a small open hash of WaitQueue buckets
+# keyed by the user VIRTUAL address. Collisions are benign — wake_all on
+# a shared bucket just makes the colliding waiters re-check their own
+# semaphore word and re-sleep (the standard hashed-futex design).
+# Virtual-address keying means two processes mapping the same physical
+# page at different vaddrs would not match — fine for the native thread
+# use-case where RFMEM threads SHARE the address space, so the joiner
+# and the exiting thread always agree on the vaddr.
+#
+# The kernel-side decrement must be atomic AGAINST USER-MODE writers on
+# other CPUs (a thread_spawn'd sibling doing the lock fast path with the
+# atomic_* intrinsics), so we resolve the user vaddr to its physical
+# frame (mm/uaccess.ad's page-table walk, with the demand/COW fault-in
+# retry) and run the compiler's LOCK CMPXCHG / LOCK XADD intrinsics on
+# the kernel's identity mapping of that frame. Same physical memory,
+# x86-coherent, genuinely atomic across CPLs and CPUs.
+#
+# EXIT NOTIFICATION (thread_join)
+# ===============================
+# sems_init() registers sem_exitsem_release() as the scheduler's
+# exitsem_release_hook. A native thread registers a user address via
+# SYS_SETEXITSEM; task_exit_current fires the hook AFTER the thread can
+# never touch its user stack again, so thread_join == semacquire on that
+# address with no joiner/exiter stack race. Mirrors (and is layered
+# exactly like) the Linux-ABI CLEARTID futex-wake hook.
+
+from kernel.sched.core import (
+    WaitQueue, wq_init,
+    wq_wait_prepare, wq_wait_cancel, wq_wait_commit,
+    wq_wake_all, WQ_EINTR,
+    register_exitsem_release_hook,
+    set_task_exit_sem, set_current_errstr,
+    current_idx_get,
+)
+from mm.uaccess import (
+    uaccess_current_pml4, uaccess_resolve, uaccess_resolve_fault,
+)
+from kernel.printk.printk import printk0
+
+
+# Hash buckets. 64 WaitQueues = 512 bytes of BSS; collisions only cost
+# spurious re-checks, never correctness.
+SEMWQ_N:    uint64 = 64
+SEMWQ_MASK: uint64 = 63
+
+sem_wqs: Array[64, WaitQueue]
+
+# Errno values (native negative-errno convention, same numbers the rest
+# of the syscall layer uses).
+SEM_EFAULT: int32 = -14
+SEM_EINTR:  int32 = -4
+
+
+def _sem_bucket(uaddr: uint64) -> Ptr[WaitQueue]:
+    # uint32 sem words are 4-aligned in practice; fold the address down
+    # past the low 2 bits and mix a higher shear so nearby words spread.
+    h: uint64 = (uaddr >> 2) ^ (uaddr >> 9)
+    return &sem_wqs[h & SEMWQ_MASK]
+
+
+def _sem_try_dec(phys: uint64) -> int32:
+    # One atomic acquire attempt on the RESOLVED kernel-visible address:
+    # decrement *phys iff it is > 0. Returns 1 acquired, 0 unavailable.
+    # The CAS loop only retries while the word is positive AND moving —
+    # a contended-but-available semaphore. The word is treated as
+    # SIGNED int32 so a (buggy) negative value parks instead of
+    # underflowing further.
+    while True:
+        v: uint32 = cast[Ptr[uint32]](phys)[0]
+        if cast[int32](v) <= 0:
+            return 0
+        old: uint32 = atomic_cas32(phys, v, v - 1)
+        if old == v:
+            return 1
+        # Lost the race — somebody else moved the word; re-read.
+    return 0                                          # unreachable
+
+
+def do_semacquire(uaddr: uint64, block: int32) -> int32:
+    # Plan 9 semacquire(2). See file header for the contract.
+    if uaddr == 0:
+        set_current_errstr("semacquire: nil address")
+        return SEM_EFAULT
+    # First resolve goes through the fault-in path so a demand/COW page
+    # is materialised exactly once; re-checks after wq_wait_prepare use
+    # the NON-allocating walk (we are STATE_WAIT there — must not run
+    # the demand-fault machinery in that state).
+    pml4: uint64 = uaccess_current_pml4()
+    phys: uint64 = uaccess_resolve_fault(pml4, uaddr, 1)
+    if phys == 0:
+        set_current_errstr("semacquire: bad address")
+        return SEM_EFAULT
+
+    if _sem_try_dec(phys) == 1:
+        return 1
+    if block == 0:
+        return 0
+
+    wq: Ptr[WaitQueue] = _sem_bucket(uaddr)
+    while True:
+        # Race-free sleep: link first, re-check, then commit — a
+        # semrelease that lands between the check and the sleep finds
+        # us already on the queue and its wq_wake_all flips us READY,
+        # so wq_wait_commit returns immediately. Standard prepare/
+        # recheck/commit shape (see pipe/console readers).
+        wq_wait_prepare(wq)
+        # Re-resolve without fault-in: the page was materialised above;
+        # if it vanished (racing munmap) that is a genuine fault.
+        phys = uaccess_resolve(pml4, uaddr, 1)
+        if phys == 0:
+            wq_wait_cancel(wq)
+            set_current_errstr("semacquire: bad address")
+            return SEM_EFAULT
+        if _sem_try_dec(phys) == 1:
+            wq_wait_cancel(wq)
+            return 1
+        rc: int32 = wq_wait_commit(wq)
+        if rc == WQ_EINTR:
+            set_current_errstr("interrupted")
+            return SEM_EINTR
+        # Data wake (or collision wake): loop and re-attempt the
+        # decrement. Another waiter may have consumed the release —
+        # that is the correct semaphore semantics, we just re-sleep.
+    return 0                                          # unreachable
+
+
+def do_semrelease(uaddr: uint64, count: int64) -> int64:
+    # Plan 9 semrelease(2): *addr += count (atomic), wake all waiters.
+    if uaddr == 0:
+        set_current_errstr("semrelease: nil address")
+        return cast[int64](SEM_EFAULT)
+    if count <= 0:
+        set_current_errstr("semrelease: bad count")
+        return -22                                   # -EINVAL
+    pml4: uint64 = uaccess_current_pml4()
+    phys: uint64 = uaccess_resolve_fault(pml4, uaddr, 1)
+    if phys == 0:
+        set_current_errstr("semrelease: bad address")
+        return cast[int64](SEM_EFAULT)
+    atomic_add32(phys, cast[uint32](count))
+    # Wake EVERY waiter on the bucket: hash collisions mean some of
+    # them may be parked on a different word (they re-check and
+    # re-sleep), and a multi-count release must give every parked
+    # acquirer a shot. Each woken task re-runs _sem_try_dec, so exactly
+    # `value` of them win — no thundering-herd correctness issue, just
+    # a bounded re-check.
+    wq_wake_all(_sem_bucket(uaddr))
+    return count
+
+
+def do_setexitsem(uaddr: uint64) -> int32:
+    # #443: register `uaddr` as the CURRENT task's exit-notification
+    # semaphore. On task exit the kernel semrelease's it (increment +
+    # wake) after the task is irrevocably off its user stack — the
+    # native join handshake. uaddr == 0 clears a prior registration.
+    # The address is validated lazily at exit time (the exit path
+    # tolerates a vanished mapping); we sanity-resolve here only to
+    # give the caller an early -EFAULT for a garbage pointer.
+    if uaddr != 0:
+        pml4: uint64 = uaccess_current_pml4()
+        if uaccess_resolve_fault(pml4, uaddr, 1) == 0:
+            set_current_errstr("setexitsem: bad address")
+            return SEM_EFAULT
+    set_task_exit_sem(cast[int32](current_idx_get()), uaddr)
+    return 0
+
+
+def sem_exitsem_release(uaddr: uint64) -> int32:
+    # Exit-time hook body (registered with the scheduler by sems_init).
+    # Runs in task_exit_current's context: the dying task is still
+    # `current`, its cr3 / address space is still live, so the resolve
+    # walks the right page tables. Tolerates a vanished mapping (the
+    # joiner may have torn the region down already — then nobody can be
+    # waiting on it either).
+    pml4: uint64 = uaccess_current_pml4()
+    phys: uint64 = uaccess_resolve(pml4, uaddr, 1)
+    if phys == 0:
+        return 0
+    atomic_add32(phys, 1)
+    wq_wake_all(_sem_bucket(uaddr))
+    return 1
+
+
+def sems_init():
+    # Kernel bring-up: zero the bucket heads (defensive — BSS should be
+    # clean, but a recycled boot image must not inherit stale links)
+    # and register the exit-notification hook with the scheduler.
+    i: uint64 = 0
+    while i < SEMWQ_N:
+        wq_init(&sem_wqs[i])
+        i = i + 1
+    register_exitsem_release_hook(sem_exitsem_release)
+    printk0("[sems] native semacquire/semrelease ready; exit-sem hook registered\n")
