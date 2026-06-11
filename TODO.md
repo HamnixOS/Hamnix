@@ -322,12 +322,12 @@ STATUS.md). What remains, off the critical path and parallelisable:
   (a `[cr3-sync]` assert now guards that invariant); real causes were
   thread-group address-space teardown on leader reap + an SMP
   publish-before-inherit window in `create_user_thread`.
-- [ ] Intermittent ASLR NX/RSVD page fault on high ET_DYN load bias
-  (~1-in-4 boots of `test_thread_leader_exit.sh`): user NX exec-fault at
-  the top of the [4 GiB, 5 GiB) bias window, then kernel PF err=0x9
-  (reserved-bit ⇒ corrupt PTE) during coredump capture. Pre-existing
-  since ASLR Stage 2 (`46491912`), exposed by the new fixture. (`#438`,
-  agent in flight; evidence in task description.)
+- [x] Intermittent ASLR NX/RSVD page fault on high ET_DYN load bias —
+  **RESOLVED** (`d91fb1c9`, see STATUS.md 2026-06-11 wave). Not an ASLR
+  bug: `do_syscall`'s 28 KiB frame + Linux-ABI bounce buffers overflowed
+  the 32 KiB kstack, corrupting the page table the buddy allocator had
+  placed below it. Out-lined `_sysarm_*` arms, 64 KiB kstack + canary
+  panic, new frame gate `scripts/test_do_syscall_frame.sh`. (`#438`)
 
 ### Phase D follow-ups
 - [ ] Layer-2 `/proc → /dev` translation as a namespace bind (retire
