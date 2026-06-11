@@ -176,6 +176,7 @@ build_adder_user hamfiles             # hamui GUI file browser: sys_listdir + la
 build_adder_user hamde                # hamui-based DE panel (Applications menu + clock + taskbar)
 build_adder_user hamcalc              # integer calculator on the hamui toolkit (lib/hamui.ad)
 build_adder_user hamclock             # clock + stopwatch on the hamui toolkit (lib/hamui.ad)
+build_adder_user hammon               # live system monitor (uptime/mem/process list) on the hamui toolkit (lib/hamui.ad) — reads /proc/uptime,/proc/meminfo,/proc/tasks
 build_adder_user hamecho              # Increment-1 DE rewrite: first SEPARATE-PROCESS app; echoes routed keys (proves focus-gated input ownership)
 build_adder_user top                  # M16.87: one-shot /proc dashboard
 build_adder_user ifconfig             # M16.87: stub lo 127.0.0.1/8

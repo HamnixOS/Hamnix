@@ -1,0 +1,377 @@
+# user/hammon.ad
+#
+# hammon — a live GUI system monitor (GNOME System Monitor / htop in
+# spirit) built entirely on the hamui widget toolkit (lib/hamui.ad). It
+# is a genuine separate-process hamui client, structured exactly like
+# user/hamfiles.ad and user/hamclock.ad: it builds a widget tree once,
+# binds a window, then drives the toolkit's pull-based event loop
+# (hamui_step + hamui_take_event + sys_yield) forever, periodically
+# re-reading /proc and repainting.
+#
+# Layout (640x480 window):
+#   * toolbar   — Refresh / Quit buttons + a "hammon" label
+#   * summary   — three labels: Uptime, Memory (total/free/used%), Tasks
+#   * treeview  — process table, three columns: PID / S(tate) / COMMAND,
+#                 one row per /proc/tasks entry
+#   * statusbar — last-refresh summary line
+#
+# REAL OS INTEGRATION — every number comes from /proc, none are faked.
+# The M16.36+ kernel exposes exactly these /proc snapshots (and only
+# these), so hammon shows precisely what the OS reports:
+#
+#   /proc/uptime   - centiseconds (jiffies @100Hz) since boot. We read
+#                    the leading integer, divide by 100 to seconds, and
+#                    render H:MM:SS. (Same parse as user/uptime.ad and
+#                    hamUId's sysmon_refresh.)
+#   /proc/meminfo  - Linux-shaped "MemTotal: <NNN> kB" / "MemFree: <NNN>
+#                    kB" lines. We parse both, derive used = total-free
+#                    and used% = used*100/total. (Same fields as
+#                    user/free.ad.) No swap/buffers/cached rows exist
+#                    yet, so we don't invent them.
+#   /proc/tasks    - one line per task: "<pid> <state> <comm>\n" (see
+#                    fs/procfs.ad / user/pgrep.ad). We tokenize each line
+#                    into PID / state / comm and fill the process table.
+#
+# HONEST GAP: the kernel does NOT yet expose per-process CPU time or a
+# system-wide CPU-busy counter via /proc, so hammon does NOT show a CPU%
+# column or a CPU usage gauge — that data simply is not available from
+# /proc. We show what IS available (uptime, total/free/used memory, and
+# the live process list) rather than fabricating CPU numbers. When the
+# kernel grows a /proc/stat-style busy counter, a CPU row can be added
+# the same way the memory row is computed here.
+#
+# TOOLKIT NOTE: the process table uses ONE long-lived treeview that is
+# cleared and repopulated in place each refresh via hamui_treeview_clear
+# (which recycles the pooled row slots), so an indefinitely-running
+# monitor never burns through the toolkit's 128-slot row pool. A
+# treeview holds at most HAMUI_LIST_MAX_ROWS (16) rows, so we show up to
+# ROWS_VISIBLE (16) tasks — the 32-slot kernel task table rarely has
+# more than that live at once.
+
+from lib.hamui import (
+    hamui_init, hamui_vbox, hamui_label, hamui_button, hamui_toolbar,
+    hamui_statusbar, hamui_treeview, hamui_treeview_add, hamui_treeview_clear,
+    hamui_add, hamui_window, hamui_set_size, hamui_set_expand,
+    hamui_set_text, hamui_status_set, hamui_step, hamui_take_event,
+    hamui_render
+)
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_yield() -> int32
+
+
+# --- tiny stdout helpers (for the boot/diagnostic line) --------------
+def _m_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _m_puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _m_strlen(s))
+
+
+# ====================================================================
+# STATE (module scope — no malloc, fixed arrays only)
+# ====================================================================
+PROC_CAP:     uint64 = 8192
+ROWS_VISIBLE: uint64 = 16
+ROW_CAP:      uint64 = 96
+
+# Idle sys_yield iterations between auto-refreshes (mirrors user/top.ad's
+# poll counter — no new time syscalls, just count idle yields).
+REFRESH_YIELDS: uint64 = 200000
+
+# /proc read scratch.
+proc_buf:  Array[8192, uint8]
+
+# Rendered summary lines.
+up_line:   Array[64, uint8]
+mem_line:  Array[96, uint8]
+task_line: Array[64, uint8]
+# One process-table row ("pid\tstate\tcomm").
+row_buf:   Array[96, uint8]
+
+# widget ids (set at build time)
+lbl_up:   int32 = 0
+lbl_mem:  int32 = 0
+lbl_task: int32 = 0
+proc_tree: int32 = 0
+sbar:     int32 = 0
+
+
+# ---- write a decimal uint into buf at pos, return new pos ------------
+def _m_putnum(buf: Ptr[uint8], pos: uint64, v: uint64) -> uint64:
+    if v == 0:
+        buf[pos] = 48
+        return pos + 1
+    tmp: Array[24, uint8]
+    t: uint64 = 0
+    while v != 0:
+        tmp[t] = cast[uint8](v % 10) + 48
+        v = v / 10
+        t = t + 1
+    p: uint64 = pos
+    while t > 0:
+        t = t - 1
+        buf[p] = tmp[t]
+        p = p + 1
+    return p
+
+
+# ---- write a literal string into buf at pos, return new pos ----------
+def _m_puts_buf(buf: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
+    p: uint64 = pos
+    i: uint64 = 0
+    while s[i] != 0:
+        buf[p] = s[i]
+        p = p + 1
+        i = i + 1
+    return p
+
+
+# ---- read a whole /proc file into proc_buf, return bytes read -------
+def _m_slurp(path: Ptr[char]) -> uint64:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return 0
+    total: uint64 = 0
+    while total < PROC_CAP:
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](&proc_buf[0]) + total), PROC_CAP - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    return total
+
+
+# ---- parse the integer value of a "Label: NNN" line in proc_buf -----
+# Scans proc_buf[0..n) for the literal label, then reads the first run
+# of digits after it. Returns 0 if not found.
+def _m_field(n: uint64, label: Ptr[uint8]) -> uint64:
+    ll: uint64 = _m_strlen(label)
+    if ll == 0 or ll > n:
+        return 0
+    limit: uint64 = n - ll
+    i: uint64 = 0
+    while i <= limit:
+        j: uint64 = 0
+        hit: int32 = 1
+        while j < ll:
+            if proc_buf[i + j] != label[j]:
+                hit = 0
+                break
+            j = j + 1
+        if hit != 0:
+            k: uint64 = i + ll
+            while k < n and (proc_buf[k] < 48 or proc_buf[k] > 57):
+                k = k + 1
+            v: uint64 = 0
+            while k < n and proc_buf[k] >= 48 and proc_buf[k] <= 57:
+                v = v * 10 + cast[uint64](proc_buf[k] - 48)
+                k = k + 1
+            return v
+        i = i + 1
+    return 0
+
+
+# ====================================================================
+# REFRESH — re-read /proc and push new text into the widgets.
+# ====================================================================
+def refresh_uptime():
+    n: uint64 = _m_slurp("/proc/uptime")
+    cs: uint64 = 0
+    k: uint64 = 0
+    while k < n and proc_buf[k] >= 48 and proc_buf[k] <= 57:
+        cs = cs * 10 + cast[uint64](proc_buf[k] - 48)
+        k = k + 1
+    secs: uint64 = cs / 100
+    hh: uint64 = secs / 3600
+    mm: uint64 = (secs / 60) % 60
+    ss: uint64 = secs % 60
+    p: uint64 = 0
+    p = _m_puts_buf(&up_line[0], p, "Uptime: ")
+    p = _m_putnum(&up_line[0], p, hh)
+    up_line[p] = 58                      # ':'
+    p = p + 1
+    up_line[p] = cast[uint8](mm / 10) + 48
+    p = p + 1
+    up_line[p] = cast[uint8](mm % 10) + 48
+    p = p + 1
+    up_line[p] = 58                      # ':'
+    p = p + 1
+    up_line[p] = cast[uint8](ss / 10) + 48
+    p = p + 1
+    up_line[p] = cast[uint8](ss % 10) + 48
+    p = p + 1
+    up_line[p] = 0
+    hamui_set_text(lbl_up, &up_line[0])
+
+
+def refresh_mem():
+    n: uint64 = _m_slurp("/proc/meminfo")
+    total: uint64 = _m_field(n, "MemTotal:")
+    free_kb: uint64 = _m_field(n, "MemFree:")
+    used: uint64 = 0
+    if total >= free_kb:
+        used = total - free_kb
+    pct: uint64 = 0
+    if total > 0:
+        pct = (used * 100) / total
+    p: uint64 = 0
+    p = _m_puts_buf(&mem_line[0], p, "Mem: ")
+    p = _m_putnum(&mem_line[0], p, used)
+    p = _m_puts_buf(&mem_line[0], p, " / ")
+    p = _m_putnum(&mem_line[0], p, total)
+    p = _m_puts_buf(&mem_line[0], p, " kB used (")
+    p = _m_putnum(&mem_line[0], p, pct)
+    p = _m_puts_buf(&mem_line[0], p, "%), free ")
+    p = _m_putnum(&mem_line[0], p, free_kb)
+    p = _m_puts_buf(&mem_line[0], p, " kB")
+    mem_line[p] = 0
+    hamui_set_text(lbl_mem, &mem_line[0])
+
+
+# Build one "pid\tstate\tcomm" row from a /proc/tasks line spanning
+# proc_buf[start..end), writing it into row_buf (NUL-terminated).
+def make_task_row(start: uint64, end: uint64):
+    p: uint64 = 0
+    # Field 0: PID — copy digits up to the first space.
+    i: uint64 = start
+    while i < end and proc_buf[i] != 32 and p < ROW_CAP - 8:
+        row_buf[p] = proc_buf[i]
+        p = p + 1
+        i = i + 1
+    row_buf[p] = 9                       # '\t'
+    p = p + 1
+    # Skip spaces, then field 1: state — copy up to next space.
+    while i < end and proc_buf[i] == 32:
+        i = i + 1
+    while i < end and proc_buf[i] != 32 and p < ROW_CAP - 4:
+        row_buf[p] = proc_buf[i]
+        p = p + 1
+        i = i + 1
+    row_buf[p] = 9                       # '\t'
+    p = p + 1
+    # Skip spaces, then field 2: comm — rest of the line.
+    while i < end and proc_buf[i] == 32:
+        i = i + 1
+    while i < end and p < ROW_CAP - 1:
+        row_buf[p] = proc_buf[i]
+        p = p + 1
+        i = i + 1
+    row_buf[p] = 0
+
+
+def refresh_tasks():
+    n: uint64 = _m_slurp("/proc/tasks")
+    hamui_treeview_clear(proc_tree)
+    shown: uint64 = 0
+    pos: uint64 = 0
+    while pos < n and shown < ROWS_VISIBLE:
+        end: uint64 = pos
+        while end < n and proc_buf[end] != 10:
+            end = end + 1
+        if end > pos:
+            make_task_row(pos, end)
+            hamui_treeview_add(proc_tree, &row_buf[0])
+            shown = shown + 1
+        pos = end + 1
+    # Task-count summary line + status bar.
+    p: uint64 = 0
+    p = _m_puts_buf(&task_line[0], p, "Tasks shown: ")
+    p = _m_putnum(&task_line[0], p, shown)
+    task_line[p] = 0
+    hamui_set_text(lbl_task, &task_line[0])
+    hamui_status_set(sbar, &up_line[0])
+
+
+def refresh_all():
+    refresh_uptime()
+    refresh_mem()
+    refresh_tasks()
+
+
+# ====================================================================
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    hamui_init()
+
+    root: int32 = hamui_vbox()
+
+    # ---- toolbar ----
+    tbar: int32 = hamui_toolbar()
+    hamui_set_size(tbar, 640, 30)
+    hamui_add(root, tbar)
+    btn_refresh: int32 = hamui_button("Refresh")
+    hamui_add(tbar, btn_refresh)
+    btn_quit: int32 = hamui_button("Quit")
+    hamui_add(tbar, btn_quit)
+    hamui_add(tbar, hamui_label("hammon - system monitor"))
+
+    # ---- summary labels ----
+    lbl_up = hamui_label("Uptime: 0:00:00")
+    hamui_set_size(lbl_up, 632, 22)
+    hamui_add(root, lbl_up)
+
+    lbl_mem = hamui_label("Mem: 0 / 0 kB used (0%), free 0 kB")
+    hamui_set_size(lbl_mem, 632, 22)
+    hamui_add(root, lbl_mem)
+
+    lbl_task = hamui_label("Tasks shown: 0")
+    hamui_set_size(lbl_task, 632, 22)
+    hamui_add(root, lbl_task)
+
+    # column header for the process table
+    hdr: int32 = hamui_label("  PID    S  COMMAND")
+    hamui_set_size(hdr, 632, 22)
+    hamui_add(root, hdr)
+
+    # ---- process table (3 columns: PID / state / command) ----
+    proc_tree = hamui_treeview(3)
+    hamui_set_size(proc_tree, 632, 360)
+    hamui_set_expand(proc_tree, 1, 1)
+    hamui_add(root, proc_tree)
+
+    sbar = hamui_statusbar("hammon")
+    hamui_set_size(sbar, 640, 20)
+    hamui_add(root, sbar)
+
+    wid: int32 = hamui_window(root)
+    if wid < 0:
+        _m_puts(2, "hammon: could not allocate a window\n")
+        return 1
+
+    _m_puts(1, "HAMMON ready\n")
+
+    refresh_all()
+    hamui_render()
+
+    # ---- event / refresh loop ---------------------------------------
+    running: int32 = 1
+    idle: uint64 = 0
+    while running != 0:
+        hamui_step()
+        ev: int32 = hamui_take_event()
+        while ev >= 0:
+            if ev == btn_quit:
+                running = 0
+            elif ev == btn_refresh:
+                refresh_all()
+                idle = 0
+            ev = hamui_take_event()
+
+        # Auto-refresh after a bounded number of idle yields so it is a
+        # live monitor without a dedicated timer syscall.
+        idle = idle + 1
+        if idle >= REFRESH_YIELDS:
+            idle = 0
+            refresh_all()
+
+        sys_yield()
+
+    return 0
