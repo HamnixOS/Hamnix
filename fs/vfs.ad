@@ -136,13 +136,14 @@ from kernel.block.blk import blk_listdir
 from sys.src.port9.port.devproc import (
     devproc_open, devproc_path_match, devproc_listdir,
 )
-# Phase C / M16.107: mount-table prefix rewrite. resolve_path consults
-# the per-task namespace before the existing cpio / tmpfs / ext4
-# routing so a successful bind() of "/sysroot" -> "/etc" makes
-# /sysroot/motd open the same bytes /etc/motd would have.
+# F1 substrate: ns_walk is THE per-Pgrp namespace walk — the single
+# authority for what a '/'-anchored name means in the calling task's
+# namespace. resolve_path drives it candidate-by-candidate (it owns
+# the backend existence probes) and localizes the returned server
+# specs back to backend keys. There is no global fall-through: a path
+# no binding covers is ENOENT.
 from sys.src.port9.port.chan import (
-    chan_resolve_prefix, chan_find_srv_prefix,
-    chan_resolve_union_candidate,
+    ns_walk, chan_find_srv_prefix,
     chan_dir_mount_children,
     pgrp_current,
     # Phase 6: long-form `#<word>` device names route through the
@@ -3397,6 +3398,73 @@ def _normalize_inplace(buf: Ptr[uint8]):
 # `while nth < ...` bound cleanly. Keep in sync with chan.ad MNT_CAP.
 MNT_CAP_PROBE: uint64 = 32
 
+# Chain-hop cap for resolve_path's walk loop. A hop happens when a
+# union member's frozen to_path is itself a '/'-anchored name (only
+# possible when the bound source was SRV-covered at bind time, or for
+# a directly SRV-covered path). 4 is generous — freeze-at-bind
+# collapses FILE->FILE chains, so real chains are depth 1-2.
+NS_HOP_CAP: uint64 = 4
+
+
+def _spec_localize(spec: Ptr[uint8], out: Ptr[uint8],
+                   cap: uint64) -> int32:
+    # Localize a kernel file-server spec to the server's backend key
+    # space. The per-Pgrp walk (ns_walk) is the authority on WHETHER a
+    # name resolves; the backends below keep their long-standing
+    # internal path keys, and vfs_mount.ad's table is demoted to a
+    # backend-internal key router. The localizations:
+    #
+    #   #r<rest> -> <rest>          ("" -> "/")   boot file server
+    #   #t<rest> -> <rest>          ("" -> "/")   tmpfs server
+    #   #e<rest> -> "/ext" + rest                 ext4 server
+    #   #f<rest> -> "/mnt" + rest                 FAT server
+    #
+    # <rest> must be empty or start with '/' — otherwise the spec is a
+    # multi-char `#<word>` named root (e.g. `#root`, `#tmp`), NOT one
+    # of ours. Specs for other servers (#c, #s, #by-id/..., ...) are
+    # not localized; vfs_open's `#` dispatch arms own them.
+    #
+    # Returns 1 (out populated), 0 (not a localizable spec; out
+    # untouched), -1 (overflow).
+    if spec[0] != 35:                                # '#'
+        return 0
+    c: uint8 = spec[1]
+    pre: Ptr[uint8] = cast[Ptr[uint8]](0)
+    if c == cast[uint8]('r') or c == cast[uint8]('t'):
+        pre = cast[Ptr[uint8]]("")
+    elif c == cast[uint8]('e'):
+        pre = cast[Ptr[uint8]]("/ext")
+    elif c == cast[uint8]('f'):
+        pre = cast[Ptr[uint8]]("/mnt")
+    else:
+        return 0
+    nxt: uint8 = spec[2]
+    if nxt != 0 and nxt != 47:                       # not '/' or NUL
+        return 0                                     # multi-char word
+    o: uint64 = 0
+    i: uint64 = 0
+    while pre[i] != 0:
+        if o + 1 >= cap:
+            return -1
+        out[o] = pre[i]
+        o = o + 1
+        i = i + 1
+    i = 2
+    while spec[i] != 0:
+        if o + 1 >= cap:
+            return -1
+        out[o] = spec[i]
+        o = o + 1
+        i = i + 1
+    if o == 0:
+        # Bare "#r" / "#t" — the server root.
+        if cap < 2:
+            return -1
+        out[0] = 47                                  # '/'
+        o = 1
+    out[o] = 0
+    return 1
+
 
 def _union_cpio_exists(resolved: Ptr[uint8]) -> int32:
     # 1 if `resolved` (NUL-terminated absolute path) names a cpio /
@@ -3492,117 +3560,138 @@ def _resolve_path_canonical(input: Ptr[char], output: Ptr[uint8],
     return ENAMETOOLONG
 
 
+def _rp_copy(dst: Ptr[uint8], src: Ptr[uint8], count: uint64) -> int32:
+    # Bounded NUL-terminated copy for resolve_path's buffers.
+    # Returns 0 on success, ENAMETOOLONG on overflow.
+    i: uint64 = 0
+    while i + 1 < count:
+        c: uint8 = src[i]
+        dst[i] = c
+        if c == 0:
+            return 0
+        i = i + 1
+    if count > 0:
+        dst[i] = 0
+    return ENAMETOOLONG
+
+
 def resolve_path(input: Ptr[char], output: Ptr[uint8],
                  count: uint64) -> int32:
-    # Produce an absolute, normalised path in `output` from `input`
-    # (which may be absolute or relative, with or without "." /
-    # ".."). Returns 0 on success, -ENAMETOOLONG if the absolute
-    # form (before normalisation) wouldn't fit.
+    # Resolve `input` (absolute or relative, with or without "."/"..")
+    # through the calling task's NAMESPACE into a backend-addressable
+    # name in `output`. Returns 0 on success, -ENAMETOOLONG on
+    # overflow, -ENOENT when no binding in the caller's Pgrp covers
+    # the path.
     #
-    # Phase C / M16.107: after canonicalisation, consult the per-task
-    # mount table via chan_resolve_prefix(). On a longest-prefix
-    # match, the bound `from` prefix is rewritten to the entry's
-    # `to` prefix and the rewritten path replaces `output[]`. This
-    # is what makes `bind("/etc", "/sysroot")` cause subsequent
-    # `open("/sysroot/motd")` to land on the cpio-backed /etc/motd.
-    # No match: leave `output` as the canonical form — the original
-    # behaviour pre-mount-table.
+    # F1 substrate (audit #444): this is a per-Pgrp namespace WALK, not
+    # a prefix veneer over a global path table. The pipeline:
     #
-    # V3.5: `#X` device-alias paths bypass canonicalisation +
-    # mount-table rewrite entirely. They're a Plan 9-shape direct-
-    # to-device reference — there's nothing for `.`/`..`/cwd-prepend
-    # to do (the first character isn't `/`), and `chan_resolve_prefix`
-    # only rewrites `/`-prefixed paths anyway. Copy the input through
-    # verbatim so vfs_open's `#`-prefix dispatch sees the raw alias.
+    #   1. Canonicalise (cwd-prepend + "."/".." compaction).
+    #   2. ns_walk (chan.ad): find the DEEPEST bound name covering the
+    #      canonical path in the CURRENT Pgrp's mount table — FILE
+    #      binds and SRV (9P) mounts compete by depth — and enumerate
+    #      the union members at that point in Plan 9 search order
+    #      (MBEFORE newest-first -> MREPL -> MAFTER).
+    #   3. For each member: localize its server spec (`#r/#t/#e/#f`)
+    #      to the backend key space and probe existence; the first
+    #      member that exists wins. A SRV member terminates the walk
+    #      with the path itself (namec's chan_find_srv_prefix routes
+    #      it). Foreign specs (#c, #s, #by-id/...) aren't probeable
+    #      here — they win only as the head fall-back, exactly as
+    #      before (vfs_open's `#` arms own them).
+    #   4. No member exists -> fall back to the union head (member 0)
+    #      so creates/writes under a bind resolve to the head member.
+    #   5. UNBOUND -> -ENOENT. There is NO global root to fall through
+    #      to: the default boot namespace is itself a set of bindings
+    #      (pgrp_init), and a hermetic RFCNAMEG child sees only what
+    #      its recipe bound.
+    #
+    # `#X` direct inputs bypass canonicalisation (Plan 9 direct server
+    # reference — kernel device-root syntax). Our own server specs are
+    # localized so `cat '#r/etc/motd'` works; other specs pass through
+    # verbatim to vfs_open's `#` dispatch.
+    scratch: Array[256, uint8]
+    local: Array[256, uint8]
+    head: Array[256, uint8]
     if input[0] == 35:                                 # '#'
         i: uint64 = 0
-        while i + 1 < count:
+        while i + 1 < count and i + 1 < 256:
             c: uint8 = cast[uint8](input[i] & 0xFF)
-            output[i] = c
+            scratch[i] = c
             if c == 0:
-                return 0
+                lrc0: int32 = _spec_localize(&scratch[0], &local[0], 256)
+                if lrc0 < 0:
+                    return ENAMETOOLONG
+                if lrc0 == 1:
+                    return _rp_copy(output, &local[0], count)
+                return _rp_copy(output, &scratch[0], count)
             i = i + 1
-        output[i] = 0
+        scratch[i] = 0
         return ENAMETOOLONG
     rc: int32 = _resolve_path_canonical(input, output, count)
     if rc != 0:
         return rc
-    # Mount-table rewrite. The helper writes into a scratch buffer
-    # then copies back into `output` on a hit. Doing the copy here
-    # (rather than passing `output` as both src and dst) avoids any
-    # aliasing risk inside chan_resolve_prefix when the rewritten
-    # path is longer than the input.
-    #
-    # Union mounts (MBEFORE / MAFTER): a single name `OLD` may stack
-    # several sources. chan_resolve_union_candidate enumerates the
-    # members in Plan-9 search order (MBEFORE newest-first -> MREPL ->
-    # MAFTER oldest-first); we probe each rewrite for existence and use
-    # the FIRST member where the target actually exists. This is what
-    # makes a file from EITHER union member visible at the union point.
-    # If no member's target exists we fall back to the union head
-    # (candidate 0) so creates / writes under a bind still resolve
-    # exactly as the old longest-prefix MREPL path did.
-    scratch: Array[256, uint8]
-    head_scratch: Array[256, uint8]
-    have_head: int32 = 0
-    nth: uint64 = 0
-    while nth < MNT_CAP_PROBE:
-        ucand: int32 = chan_resolve_union_candidate(output, &scratch[0],
-                                                    count, nth)
-        if ucand == 0:
-            # No binding matches this path at all — leave the canonical
-            # form untouched (original pre-mount-table behaviour).
-            return 0
-        if ucand == -1:
-            return ENAMETOOLONG
-        if ucand == -2:
-            # Ran past the last member: no candidate's target existed.
-            # Fall back to the union head (highest-priority member).
-            if have_head == 0:
+    hop: uint64 = 0
+    while hop < NS_HOP_CAP:
+        have_head: int32 = 0
+        advanced: int32 = 0
+        nth: uint64 = 0
+        while nth < MNT_CAP_PROBE:
+            wrc: int32 = ns_walk(output, &scratch[0], 256, nth)
+            if wrc == 0:
+                # UNBOUND — nothing in this namespace serves the path.
+                return ENOENT
+            if wrc == 2:
+                # SRV mount is the selected member: `output` already
+                # holds the 9P-visible name. Done.
                 return 0
-            i: uint64 = 0
-            while i + 1 < count:
-                c: uint8 = head_scratch[i]
-                output[i] = c
-                if c == 0:
-                    return 0
-                i = i + 1
-            output[i] = 0
-            return ENAMETOOLONG
-        # ucand == 1: scratch holds the nth member rewrite. Remember
-        # the head (candidate 0) for the fall-back, then probe it.
-        if nth == 0:
-            hi: uint64 = 0
-            while hi + 1 < count:
-                head_scratch[hi] = scratch[hi]
-                if scratch[hi] == 0:
-                    hi = count
+            if wrc == -1:
+                return ENAMETOOLONG
+            if wrc == -2:
+                # Past the last member: no candidate's target existed.
+                nth = MNT_CAP_PROBE
+            else:
+                # wrc == 1: scratch holds the nth member's rewrite.
+                if scratch[0] == 35:                   # '#' spec
+                    lrc: int32 = _spec_localize(&scratch[0],
+                                                &local[0], 256)
+                    if lrc < 0:
+                        return ENAMETOOLONG
+                    if lrc == 1:
+                        # Our server: probe the localized backend key.
+                        if have_head == 0:
+                            _rp_copy(&head[0], &local[0], 256)
+                            have_head = 1
+                        if _union_resolved_exists(&local[0]) != 0:
+                            return _rp_copy(output, &local[0], count)
+                    else:
+                        # Foreign server spec (#c, #s, #by-id/...,
+                        # frozen named roots): not probeable here.
+                        # Eligible as the head fall-back only.
+                        if have_head == 0:
+                            _rp_copy(&head[0], &scratch[0], 256)
+                            have_head = 1
+                    nth = nth + 1
                 else:
-                    hi = hi + 1
-            have_head = 1
-        if _union_resolved_exists(&scratch[0]) != 0:
-            i2: uint64 = 0
-            while i2 + 1 < count:
-                c2: uint8 = scratch[i2]
-                output[i2] = c2
-                if c2 == 0:
-                    return 0
-                i2 = i2 + 1
-            output[i2] = 0
-            return ENAMETOOLONG
-        nth = nth + 1
-    # MNT_CAP_PROBE exhausted (more members than the cap) — use head.
-    if have_head != 0:
-        i3: uint64 = 0
-        while i3 + 1 < count:
-            c3: uint8 = head_scratch[i3]
-            output[i3] = c3
-            if c3 == 0:
-                return 0
-            i3 = i3 + 1
-        output[i3] = 0
-        return ENAMETOOLONG
-    return 0
+                    # '/'-anchored rewrite: the frozen source was
+                    # SRV-covered at bind time — chain hop. Re-walk
+                    # the rewritten path.
+                    if _rp_copy(output, &scratch[0], count) != 0:
+                        return ENAMETOOLONG
+                    advanced = 1
+                    nth = MNT_CAP_PROBE
+        if advanced != 0:
+            hop = hop + 1
+        else:
+            # Union exhausted without an existing member: fall back to
+            # the head (highest-priority member) so creates/writes
+            # under a bind resolve there.
+            if have_head == 0:
+                return ENOENT
+            return _rp_copy(output, &head[0], count)
+    # Hop cap exceeded — treat as a broken chain (cycle), not a fall-
+    # through.
+    return ENOENT
 
 
 def vfs_pipe(out_fds: Ptr[int32]) -> int32:
