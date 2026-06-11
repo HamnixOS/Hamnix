@@ -5,11 +5,13 @@
 #
 # distrofs (user/distrofs.ad) is the userland 9P file-server that
 # backs the distro-shaped namespace. It serves from RAM tables for
-# speed, but snapshots those tables to a file on the mounted ext4
-# volume (sys_dfs_save) on every Tclunk of a written fid + at clean
-# EOF, and reloads the snapshot on startup (sys_dfs_load). The ext4
-# image is distrofs's PRIVATE backing store — not a globally-mounted
-# path; the namespace VIEW stays ephemeral, the STATE is durable.
+# speed, but snapshots those tables to "#part0/distrofs<inst>.dat" on
+# the ext4 volume — ordinary namespace file I/O plus a /dev/sync
+# durability barrier (the old SYS_DFS_LOAD/SAVE private kernel channel
+# is RETIRED) — on every Tclunk of a written fid + at clean EOF, and
+# reloads the snapshot on startup. The ext4 image is distrofs's
+# PRIVATE backing store — not a globally-mounted path; the namespace
+# VIEW stays ephemeral, the STATE is durable.
 #
 # Two-boot proof (same shape as scripts/test_ext4_fsync.sh):
 #
@@ -91,41 +93,54 @@ trap 'rm -f "$LOG1" "$LOG2" "$DISK"; INIT_ELF=build/user/init.elf python3 script
 
 echo "[test_distrofs_persist] (6/6) Boot #1 — write the marked file, snapshot, halt"
 set +e
-(
-    sleep 3
-    printf '/bin/test_distrofs_persist write\n'
-    sleep 4
-    printf 'exit\n'
-    sleep 1
-) | timeout 60s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -drive file="$DISK",if=virtio,format=raw \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG1" 2>&1
+
+# Marker-gated feeder (same proven shape as test_9p_concurrency.sh):
+# a freshly-booted hamsh sometimes drops the FIRST serial command line
+# (it never echoes), and fixed sleeps race a slowing boot. Gate on the
+# shell-ready marker, then RE-SEND the command until its echo shows up
+# in the log — keyed on the echo (immediate on receipt), NOT the
+# fixture marker, so a slow but received run is never double-driven.
+#   $1 = serial log file   $2 = fixture argv word (write|read)
+#   $3 = fixture finish regex (grep -E)
+drive_boot() {
+    local log="$1" word="$2" donere="$3"
+    (
+        for _ in $(seq 1 40); do
+            grep -q "loop-enter" "$log" 2>/dev/null && break
+            sleep 0.5
+        done
+        sleep 1
+        printf '/bin/test_distrofs_persist %s\n' "$word"
+        for _ in $(seq 1 10); do
+            sleep 1.5
+            grep -q "bin/test_distrofs_persist" "$log" 2>/dev/null && break
+            printf '/bin/test_distrofs_persist %s\n' "$word"
+        done
+        # Wait for the fixture to finish (PASS or FAIL), then exit.
+        for _ in $(seq 1 60); do
+            grep -Eq "$donere" "$log" 2>/dev/null && break
+            sleep 0.5
+        done
+        sleep 1
+        printf 'exit\n'
+        sleep 1
+    ) | timeout 90s qemu-system-x86_64 \
+        -kernel "$ELF" \
+        -drive file="$DISK",if=virtio,format=raw \
+        -smp 2 \
+        -nographic \
+        -no-reboot \
+        -m 256M \
+        -monitor none \
+        -serial stdio \
+        > "$log" 2>&1
+}
+
+drive_boot "$LOG1" write '\[dfsp\] (WRITE PASS|FAIL)'
 rc1=$?
 
 echo "[test_distrofs_persist]        Boot #2 — re-attach the SAME disk, read it back"
-(
-    sleep 3
-    printf '/bin/test_distrofs_persist read\n'
-    sleep 4
-    printf 'exit\n'
-    sleep 1
-) | timeout 60s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -drive file="$DISK",if=virtio,format=raw \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG2" 2>&1
+drive_boot "$LOG2" read '\[dfsp\] (READ PASS|FAIL)'
 rc2=$?
 set -e
 

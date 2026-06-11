@@ -1,0 +1,399 @@
+# tests/test_9p_concurrency.ad
+#
+# V6 — tagged 9P concurrency gate: TWO tasks drive the SAME kernel 9P
+# mount at once and the kernel must put >=2 T-msgs in flight.
+#
+# Where tests/test_9p_realfd.ad proved a single-task create/write/read
+# round-trip, THIS fixture proves the V6 RPC-pool rework in
+# sys/src/9/port/9p_client.ad actually multiplexes: two processes loop
+# open/read/close against the same mounted distrofs concurrently, so
+# the client must allocate distinct tags, send while another request is
+# unanswered, and tag-demux the responses back to the right waiters.
+#
+# PROOF OF CONCURRENCY: the kernel prints a one-shot marker
+#
+#     [9p] tagged concurrency: N T-msgs in flight
+#
+# the first time its in-flight count reaches >=2 (see _rpc_exchange in
+# 9p_client.ad). scripts/test_9p_concurrency.sh greps for it IN
+# ADDITION to this fixture's own PASS marker. A client that secretly
+# serializes (the old V1..V5 single-outstanding behaviour) would still
+# pass the I/O assertions but never print the kernel marker.
+#
+# SHAPE:
+#
+#   parent (this binary, no args)            child (this binary, "reader")
+#   ──────────────────────────────           ────────────────────────────
+#   pipes + spawn /bin/distrofs
+#   srv_post/srv_open
+#   mount /p9conc  (p9rx:<fd>: spec)
+#   create+write /p9conc/.../status
+#   spawn self with argv[1]="reader" ──────► (inherits a pgrp_clone whose
+#   poll-open .../ready until it exists       mtab deep-copy includes the
+#        │                                    /p9conc mount)
+#        │                                   create .../ready  ◄ handshake
+#        ▼                                   loop W times:
+#   loop W times:                                open/read/close status
+#       open/read/close status                prints "[9pconc] reader done"
+#   waitpid(child)
+#   teardown distrofs
+#   "[9pconc] PASS"
+#
+# The ready-file handshake guarantees the two read loops genuinely
+# overlap (the parent does not start its loop until the child is
+# already executing 9P traffic). Even the handshake itself is
+# concurrent 9P traffic: the parent's poll-opens race the child's
+# Tcreate on the wire.
+#
+# MARKERS grepped by scripts/test_9p_concurrency.sh:
+#
+#   [9pconc] start
+#   [9pconc] mount OK
+#   [9pconc] seed OK
+#   [9pconc] reader spawned
+#   [9pconc] reader ready
+#   [9pconc] reader done
+#   [9pconc] parent loop done
+#   [9pconc] PASS
+#   [9p] tagged concurrency      (kernel-side, the actual proof)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_pipe(fds: Ptr[int32]) -> int32
+extern def sys_waitpid(pid: uint64) -> int64
+extern def sys_kill(pid: int32, sig: int32) -> int32
+extern def sys_exit(code: uint64)
+extern def sys_srv_post(name: Ptr[char], srvfd: int32) -> int32
+extern def sys_srv_open(name: Ptr[char]) -> int32
+extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_mount(srvfd: int32, afd: int32, old: Ptr[char],
+                     flag: int32, spec: Ptr[char]) -> int32
+
+MREPL: int32 = 0
+SIGKILL: int32 = 9
+
+# How many open/read/close round trips EACH side performs once both
+# loops are live. Every iteration is a Twalk(+Topen)+Tread+Tclunk
+# burst, so 2 x LOOPS iterations gives the demux thousands of chances
+# to overlap — one overlap is enough to fire the kernel marker.
+LOOPS: uint64 = 300
+
+# Parent-side cap on ready-file poll-opens before giving up on the
+# child (each poll is itself a full 9P walk, so this is generous).
+READY_POLL_MAX: uint64 = 20000
+
+# Top-level scratch buffers (Adder nested-frame Array bug avoidance).
+c2s_fds: Array[2, int32]
+s2c_fds: Array[2, int32]
+spawn_argv: Array[2, uint64]
+reader_argv: Array[3, uint64]
+read_buf: Array[64, uint8]
+err_buf:  Array[128, uint8]
+spec_buf: Array[32, uint8]      # holds "p9rx:<NN>:" + NUL
+mx_buf:   Array[32, uint8]      # /dev/9pmax snapshot ("<n>\n")
+
+# Paths / names as string-literal globals (compiler quirk U9 is fixed,
+# so no byte-by-byte builds needed).
+mount_path: Array[16, uint8] = "/p9conc"
+file_path:  Array[40, uint8] = "/p9conc/var/lib/dpkg/status"
+ready_path: Array[40, uint8] = "/p9conc/var/lib/dpkg/ready"
+srv_name:   Array[16, uint8] = "p9conc"
+self_path:  Array[32, uint8] = "/bin/test_9p_concurrency"
+distrofs_path: Array[16, uint8] = "/bin/distrofs"
+reader_arg: Array[8, uint8] = "reader"
+
+# Payload seeded into the shared file: "deadbeef pkg\n" (13 bytes).
+payload: Array[16, uint8] = "deadbeef pkg\n"
+PAYLOAD_LEN: uint64 = 13
+
+
+def strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen(s))
+
+
+def dump_errstr(label: Ptr[uint8]):
+    sys_errstr(&err_buf[0], 128)
+    write_str(1, label)
+    write_str(1, &err_buf[0])
+    write_str(1, "\n")
+
+
+def write_dec(fd: int32, value: uint64):
+    if value == 0:
+        sys_write(fd, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(fd, &out[0], i)
+
+
+def fill_spec(rx_fd: int32):
+    # Build "p9rx:<rx_fd>:" + NUL into spec_buf (the magic prefix
+    # 9p_client.ad::_parse_rx_prefix strips before Tversion runs).
+    spec_buf[0] = 112    # 'p'
+    spec_buf[1] = 57     # '9'
+    spec_buf[2] = 114    # 'r'
+    spec_buf[3] = 120    # 'x'
+    spec_buf[4] = 58     # ':'
+    pos: uint64 = 5
+    v: uint64 = cast[uint64](rx_fd)
+    if v == 0:
+        spec_buf[pos] = 48                                # '0'
+        pos = pos + 1
+    else:
+        digits: Array[8, uint8]
+        n: uint64 = 0
+        while v != 0:
+            digits[n] = cast[uint8](v % 10) + 48
+            v = v / 10
+            n = n + 1
+        while n > 0:
+            n = n - 1
+            spec_buf[pos] = digits[n]
+            pos = pos + 1
+    spec_buf[pos] = 58                                    # ':'
+    spec_buf[pos + 1] = 0
+
+
+def read_loop(who: Ptr[uint8]) -> int32:
+    # The shared inner loop: LOOPS x (open -> read -> verify -> close)
+    # against the mounted distrofs file. Every iteration is real 9P
+    # wire traffic through the kernel client.
+    it: uint64 = 0
+    while it < LOOPS:
+        rfd: int32 = sys_open(cast[Ptr[char]](&file_path[0]))
+        if rfd < 0:
+            write_str(1, "[9pconc] FAIL: ")
+            write_str(1, who)
+            dump_errstr(" open errstr=")
+            return -1
+        n: int64 = sys_read(rfd, &read_buf[0], 64)
+        if n < 0:
+            write_str(1, "[9pconc] FAIL: ")
+            write_str(1, who)
+            dump_errstr(" read errstr=")
+            sys_close(rfd)
+            return -1
+        if cast[uint64](n) != PAYLOAD_LEN:
+            write_str(1, "[9pconc] FAIL: ")
+            write_str(1, who)
+            write_str(1, " short read at it=")
+            write_dec(1, it)
+            write_str(1, "\n")
+            sys_close(rfd)
+            return -1
+        i: uint64 = 0
+        while i < PAYLOAD_LEN:
+            if read_buf[i] != payload[i]:
+                write_str(1, "[9pconc] FAIL: ")
+                write_str(1, who)
+                write_str(1, " payload mismatch at it=")
+                write_dec(1, it)
+                write_str(1, "\n")
+                sys_close(rfd)
+                return -1
+            i = i + 1
+        sys_close(rfd)
+        it = it + 1
+    return 0
+
+
+def reader_main() -> int32:
+    # Child side. The spawn gave us a pgrp_clone of the parent's
+    # namespace whose mtab deep-copy includes the /p9conc mount, so the
+    # mounted distrofs is visible here with zero extra setup.
+    #
+    # 1. Handshake: create the ready file THROUGH THE MOUNT. The
+    #    parent's poll-open of this path races our Tcreate on the wire
+    #    — concurrency starts here, before the loops even begin.
+    wfd: int32 = sys_open_write(cast[Ptr[char]](&ready_path[0]))
+    if wfd < 0:
+        dump_errstr("[9pconc] FAIL: reader ready-create errstr=")
+        return 1
+    sys_write(wfd, "r\n", 2)
+    sys_close(wfd)
+    # 2. The read loop proper, racing the parent's identical loop.
+    if read_loop("reader") < 0:
+        return 1
+    write_str(1, "[9pconc] reader done\n")
+    return 0
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # Reader-child invocation: /bin/test_9p_concurrency reader
+    if argc >= 2:
+        a1: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        if cast[uint64](a1) != 0 and a1[0] == 114:        # 'r'
+            return reader_main()
+
+    write_str(1, "[9pconc] start\n")
+
+    # 1. Pipes. c2s = client->server (T-msgs); s2c = server->client (R).
+    if sys_pipe(&c2s_fds[0]) < 0:
+        dump_errstr("[9pconc] FAIL: sys_pipe c2s errstr=")
+        return 1
+    if sys_pipe(&s2c_fds[0]) < 0:
+        dump_errstr("[9pconc] FAIL: sys_pipe s2c errstr=")
+        return 2
+    c2s_rfd: int32 = c2s_fds[0]                       # server reads T
+    c2s_wfd: int32 = c2s_fds[1]                       # kernel writes T
+    s2c_rfd: int32 = s2c_fds[0]                       # kernel reads R
+    s2c_wfd: int32 = s2c_fds[1]                       # server writes R
+
+    # 2. Spawn /bin/distrofs with stdin=c2s_rfd, stdout=s2c_wfd.
+    spawn_argv[0] = cast[uint64](&distrofs_path[0])
+    spawn_argv[1] = 0
+    srv_pid: int32 = sys_spawn(cast[Ptr[char]](&distrofs_path[0]),
+                               &spawn_argv[0],
+                               c2s_rfd, s2c_wfd, cast[Ptr[uint64]](0))
+    if srv_pid < 0:
+        dump_errstr("[9pconc] FAIL: sys_spawn distrofs errstr=")
+        return 3
+    sys_close(c2s_rfd)
+    sys_close(s2c_wfd)
+
+    # 3. Post + reopen the T-side writer end, then mount.
+    if sys_srv_post(cast[Ptr[char]](&srv_name[0]), c2s_wfd) < 0:
+        dump_errstr("[9pconc] FAIL: sys_srv_post errstr=")
+        return 4
+    srv_fd: int32 = sys_srv_open(cast[Ptr[char]](&srv_name[0]))
+    if srv_fd < 0:
+        dump_errstr("[9pconc] FAIL: sys_srv_open errstr=")
+        return 5
+    fill_spec(s2c_rfd)
+    rc: int32 = sys_mount(srv_fd, -1,
+                          cast[Ptr[char]](&mount_path[0]),
+                          MREPL,
+                          cast[Ptr[char]](&spec_buf[0]))
+    if rc < 0:
+        dump_errstr("[9pconc] FAIL: sys_mount errstr=")
+        return 6
+    write_str(1, "[9pconc] mount OK\n")
+
+    # 4. Seed the shared file both loops will hammer.
+    wfd: int32 = sys_open_write(cast[Ptr[char]](&file_path[0]))
+    if wfd < 0:
+        dump_errstr("[9pconc] FAIL: seed create errstr=")
+        return 7
+    wn: int64 = sys_write(wfd, &payload[0], PAYLOAD_LEN)
+    sys_close(wfd)
+    if wn < 0 or cast[uint64](wn) != PAYLOAD_LEN:
+        write_str(1, "[9pconc] FAIL: seed write short\n")
+        return 8
+    write_str(1, "[9pconc] seed OK\n")
+
+    # 5. Spawn OURSELVES in reader mode. The legacy integer-fd spawn
+    #    path pgrp_clones the parent namespace (mtab deep-copy), so the
+    #    child sees /p9conc. stdin/stdout = -1 -> inherit fds 0/1.
+    reader_argv[0] = cast[uint64](&self_path[0])
+    reader_argv[1] = cast[uint64](&reader_arg[0])
+    reader_argv[2] = 0
+    rdr_pid: int32 = sys_spawn(cast[Ptr[char]](&self_path[0]),
+                               &reader_argv[0],
+                               -1, -1, cast[Ptr[uint64]](0))
+    if rdr_pid < 0:
+        dump_errstr("[9pconc] FAIL: sys_spawn reader errstr=")
+        return 9
+    write_str(1, "[9pconc] reader spawned\n")
+
+    # 6. Handshake: poll-open the ready file until the child has
+    #    created it. Each failed poll is itself a 9P walk racing the
+    #    child's traffic.
+    polls: uint64 = 0
+    seen: int32 = 0
+    while polls < READY_POLL_MAX:
+        pfd: int32 = sys_open(cast[Ptr[char]](&ready_path[0]))
+        if pfd >= 0:
+            sys_close(pfd)
+            seen = 1
+            break
+        polls = polls + 1
+    if seen == 0:
+        write_str(1, "[9pconc] FAIL: reader never created ready file\n")
+        sys_kill(rdr_pid, SIGKILL)
+        sys_waitpid(cast[uint64](rdr_pid))
+        sys_kill(srv_pid, SIGKILL)
+        sys_waitpid(cast[uint64](srv_pid))
+        return 10
+    write_str(1, "[9pconc] reader ready\n")
+
+    # 7. Parent read loop, racing the child's.
+    if read_loop("parent") < 0:
+        sys_kill(rdr_pid, SIGKILL)
+        sys_waitpid(cast[uint64](rdr_pid))
+        sys_kill(srv_pid, SIGKILL)
+        sys_waitpid(cast[uint64](srv_pid))
+        return 11
+    write_str(1, "[9pconc] parent loop done\n")
+
+    # 8. Reap the reader (its "[9pconc] reader done" marker is the
+    #    child-side success signal the script greps for).
+    sys_waitpid(cast[uint64](rdr_pid))
+
+    # 9. Teardown — close the transport ends, reap distrofs.
+    sys_close(srv_fd)
+    sys_close(c2s_wfd)
+    sys_close(s2c_rfd)
+    sys_kill(srv_pid, SIGKILL)
+    sys_waitpid(cast[uint64](srv_pid))
+
+    # 10. THE kernel-measured concurrency proof: /dev/9pmax renders
+    #     9p_client.ad's high-water mark of simultaneously in-flight
+    #     (SENT, unanswered) T-messages. Two tasks just hammered one
+    #     mount; the V6 pool must have had >= 2 outstanding at least
+    #     once. Read in-guest because the kernel's one-shot printk
+    #     announce is INFO-level and this fixture runs from the
+    #     INTERACTIVE shell — console_set_interactive() has already
+    #     gated INFO printk to the ring buffer only, so the announce
+    #     never reaches the captured serial console. A client that
+    #     secretly serializes passes every I/O assertion above but
+    #     reads back 1 here — and FAILs.
+    mx_fd: int32 = sys_open("/dev/9pmax")
+    if mx_fd < 0:
+        write_str(1, "[9pconc] FAIL: open /dev/9pmax\n")
+        return 12
+    mx_n: int64 = sys_read(mx_fd, &mx_buf[0], 31)
+    sys_close(mx_fd)
+    if mx_n <= 0:
+        write_str(1, "[9pconc] FAIL: read /dev/9pmax\n")
+        return 13
+    mx_val: uint64 = 0
+    mi: int64 = 0
+    while mi < mx_n:
+        mc: uint8 = mx_buf[cast[uint64](mi)]
+        if mc >= 48 and mc <= 57:
+            mx_val = mx_val * 10 + cast[uint64](mc - 48)
+        mi = mi + 1
+    write_str(1, "[9pconc] inflight_max=")
+    write_dec(1, mx_val)
+    write_str(1, "\n")
+    if mx_val < 2:
+        write_str(1, "[9pconc] FAIL: inflight_max < 2 — client serialized\n")
+        return 14
+
+    write_str(1, "[9pconc] PASS\n")
+    return 0

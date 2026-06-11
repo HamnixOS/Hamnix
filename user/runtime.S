@@ -1137,41 +1137,10 @@ sys_srv_open:
     .size sys_srv_open, .-sys_srv_open
 
 
-    /* --- sys_dfs_load(inst, buf, max_len) -> int64 ------------------
-     * distrofs persistent backing: load distrofs instance `inst`'s
-     * RAM-table snapshot from the ext4 volume into `buf` (up to
-     * `max_len` bytes). Returns bytes read, 0 if no snapshot exists
-     * yet, -1 if no ext4 volume is mounted / on I/O error. distrofs
-     * (user/distrofs.ad) calls this once at startup so an installed
-     * package survives a reboot. The backing-file name is kernel-
-     * owned — only the small instance id (0..15) is passed, never a
-     * path (namespace law: the ext4 image is distrofs's private
-     * backing store, not a globally-mounted route). Three args fit
-     * the SysV/syscall-ABI overlap directly — no register shuffle. */
-    .globl sys_dfs_load
-    .type sys_dfs_load, @function
-sys_dfs_load:
-    movq    $283, %rax              /* SYS_DFS_LOAD */
-    syscall
-    ret
-    .size sys_dfs_load, .-sys_dfs_load
-
-
-    /* --- sys_dfs_save(inst, buf, length) -> int64 -------------------
-     * distrofs persistent backing: persist `length` bytes from `buf`
-     * as distrofs instance `inst`'s RAM-table snapshot on the ext4
-     * volume, fsync'd. Returns bytes written, -1 on failure. distrofs
-     * calls this when a write-mode fid is clunked and at clean
-     * shutdown, so the durable STATE tracks the ephemeral namespace
-     * VIEW. Three args fit the SysV/syscall-ABI overlap directly —
-     * no register shuffle. */
-    .globl sys_dfs_save
-    .type sys_dfs_save, @function
-sys_dfs_save:
-    movq    $284, %rax              /* SYS_DFS_SAVE */
-    syscall
-    ret
-    .size sys_dfs_save, .-sys_dfs_save
+    /* (sys_dfs_load / sys_dfs_save — syscalls 283/284 — REMOVED.
+     * distrofs persists its snapshot through a real namespace file
+     * ("#part0/distrofs<inst>.dat") + the /dev/sync barrier now; the
+     * numbers are retired and must never be reused.) */
 
 
     /* --- sys_useradd_root(name) -> int32 ----------------------------

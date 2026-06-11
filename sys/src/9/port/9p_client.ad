@@ -42,29 +42,66 @@
 #       parses with p9_decode_stat from lib/9p/9p.ad.
 #
 # Implementation notes:
-#   - V1 is SYNCHRONOUS — at most one outstanding T-msg per
-#     connection. Tag matching is not used to demux concurrent
-#     requests; it's only there for the spec's sake. Tag wraps
-#     every 65534 messages (we skip NOTAG = 0xFFFF).
-#   - Fid allocator: per-connection, 32 fids, simple high-water
-#     mark + free bitmap. Fid 0 is reserved as the root fid (set by
-#     attach). Fids 1..31 are spendable on Twalk.
+#   - V6 is TAG-CONCURRENT (Plan 9 mnt.c shape). Multiple tasks can
+#     each have one T-msg outstanding on the same connection at the
+#     same time; R-msgs are demultiplexed by TAG. Each in-flight
+#     request owns an RPC slot from a small global pool (its own
+#     msize-sized buffer + tag + WaitQueue). The wire dance:
+#       * TX: one sender at a time per connection (tx_busy claim
+#         under p9c_lock) pushes its whole T-msg, then releases.
+#       * RX: the waiters SELF-ELECT a reader (rx_busy claim). The
+#         reader pulls one whole R-msg at a time off the wire, tag-
+#         matches it to an RPC slot, copies the bytes into THAT
+#         slot's buffer, marks it DONE and wakes its WaitQueue. The
+#         reader keeps reading until its OWN rpc completes, then
+#         releases readership and wakes every still-pending waiter
+#         so one of them elects itself the next reader.
+#       * Waiters that are not the reader park on their rpc's
+#         WaitQueue via the two-phase wq_wait_prepare /
+#         wq_wait_commit_timeout dance (kernel/sched/core.ad). The
+#         small tick timeout is a lost-wake safety net: on timeout
+#         the waiter just re-checks and re-arms — never an error.
+#   - Tflush: a waiter woken by a SIGNAL (WQ_EINTR — task killed /
+#     noted) cancels its pending request with Tflush(oldtag) on a
+#     RESERVED rpc slot (so flush can't starve on pool exhaustion).
+#     Per the spec, an Rflush response means the old tag is dead and
+#     its slot is reclaimed. A server that answers Rerror (doesn't
+#     implement flush) may still send the old response later, so the
+#     original rpc is parked as a ZOMBIE: the slot + tag stay
+#     reserved until the stale R-msg arrives and is drained (or the
+#     connection is torn down). Either way no tag is ever reused
+#     while the server might still respond to it.
+#   - Tag allocator: per-connection counter under p9c_lock, skipping
+#     NOTAG (0xFFFF) and any tag still bound to a live rpc on the
+#     same connection (wrap-around safety).
+#   - Fid allocator: per-connection, 64 fids, free bitmap. Fid 0 is
+#     reserved as the root fid (set by attach). Fids 1..63 are
+#     spendable on Twalk. 64 matches user/distrofs.ad's FID_CAP.
 #   - msize: client offers P9C_MSIZE (128 KiB). Server's Rversion
-#     msize is honoured if smaller. The shared encode/decode buffer
-#     in this module is sized for the default; raising msize beyond
-#     P9C_BUF_LEN requires growing p9c_scratch to match.
-#   - I/O dispatch: every srvfd I/O goes through _p9_send + _p9_recv.
-#     In real mode those funnel through vfs_read / vfs_write on the
-#     supplied srvfd. In SMOKE mode (set by p9c_register_smoke_pipes)
-#     they bypass the fd table and operate on two kernel pipe slots
-#     directly — one for T-msgs going out, one for R-msgs coming
-#     back. The init/p9_smoke.ad fixture drives the responder inline
-#     after every T-msg send so reads always see a fully-buffered R.
+#     msize is honoured if smaller. Each normal RPC slot's buffer is
+#     P9C_BUF_LEN; raising msize requires growing p9c_rpc_buf.
+#   - I/O dispatch: every srvfd I/O goes through _rpc_exchange. In
+#     SMOKE mode (set by p9c_register_smoke_pipes) the exchange is
+#     fully synchronous on two kernel pipe slots, with the
+#     init/p9_smoke.ad responder pumped inline after every T-msg —
+#     the boot-time fixture predates the scheduler's wait queues, so
+#     it must not park.
 #
-# What V1 does NOT do:
-#   - Tauth (no auth — we send NOFID as afid)
+# Tauth: the WIRE PLUMBING exists — p9c_auth() below runs a real
+# Tauth/Rauth exchange and returns the established afid. What is
+# STILL MISSING for actual authentication (documented, not faked):
+#   - the auth-file protocol: after Rauth the client must READ/WRITE
+#     the afid to run an auth handshake (p9sk1/factotum dance) before
+#     presenting it to Tattach. Hamnix has no factotum and no
+#     auth-protocol state machine, so there is nothing to say on the
+#     afid yet.
+#   - fauth(2) / a userland surface: do_mount has no way to receive
+#     an authenticated afd (its afd argument is accepted and ignored)
+#     and always Tattaches with afid=NOFID. Servers that demand auth
+#     will answer Rerror to that Tattach, which is the honest result.
+#
+# What V6 does NOT do:
 #   - Twstat (V0 codec ships the bytes; no kernel surface here)
-#   - Concurrent in-flight requests
 #   - Connection drop / reconnection
 #
 # Files this collaborates with:
@@ -85,6 +122,8 @@ from lib.9p.9p import (
     p9_emit_twrite,  p9_decode_rwrite,
     p9_emit_tclunk,  p9_decode_rclunk,
     p9_emit_tstat,   p9_decode_rstat,
+    p9_emit_tauth,   p9_decode_rauth,
+    p9_emit_tflush,
     p9_decode_rerror,
     P9_NOFID, P9_NOTAG,
     P9_MSIZE_DEFAULT,
@@ -93,7 +132,7 @@ from lib.9p.9p import (
     P9_TCREATE, P9_RCREATE,
     P9_TREAD, P9_RREAD, P9_TWRITE, P9_RWRITE,
     P9_TCLUNK, P9_RCLUNK, P9_TSTAT, P9_RSTAT,
-    P9_RERROR,
+    P9_RERROR, P9_RFLUSH, P9_RAUTH,
     P9_QTDIR, P9_QTFILE,
 )
 from fs.pipe import (
@@ -101,10 +140,11 @@ from fs.pipe import (
 )
 # V5: bidirectional socketpair transport. When the mount's srvfd is a
 # socketpair endpoint (an FD_CHAN_MARK fd carrying a DEV_SOCKETPAIR
-# chan — Phase 4c socket fold), _p9_send / _p9_recv push T-msgs and
-# pull R-msgs through the SAME fd — no `p9rx:` smuggle needed.
-# fs.socketpair has no dep on fs.vfs (just slab + printk), so we avoid
-# the fs.vfs ↔ 9p_client cycle that direct vfs imports would trigger.
+# chan — Phase 4c socket fold), _conn_write_bytes / _conn_read_bytes
+# push T-msgs and pull R-msgs through the SAME fd — no `p9rx:` smuggle
+# needed. fs.socketpair has no dep on fs.vfs (just slab + printk), so
+# we avoid the fs.vfs ↔ 9p_client cycle that direct vfs imports would
+# trigger.
 from fs.socketpair import (
     sockpair_read, sockpair_write, sockpair_peer_alive,
     sockpair_unpack_slot, sockpair_unpack_dir,
@@ -117,8 +157,22 @@ from fs.socketpair import (
 # imports 9p_client, so a direct import would form a cycle).
 from kernel.sched.core import (
     TaskStruct, current_task, yield_to_others,
+    WaitQueue, wq_init, wq_wake_all,
+    wq_wait_prepare, wq_wait_cancel, wq_wait_commit_timeout,
+    WQ_EINTR, WQ_TIMEOUT,
+    current_idx_get,
 )
 from kernel.printk.printk import printk0, printk1, printk2
+
+# SMP: the RPC pool + per-conn tx/rx claims are mutated from any task
+# on any CPU. p9c_lock guards ALL of that state. Critical sections are
+# a handful of loads/stores — never held across transport I/O, yields,
+# wq_* calls or printk. 9P state is never touched from IRQ context, and
+# kernel (syscall) context is not preempted by the timer (preempt_tick
+# only fires against ring-3), so a plain spinlock is sufficient — same
+# pattern as drivers/tty/serial/early_8250.ad's console_tx_lock.
+extern def spinlock_lock(ptr: Ptr[uint32])
+extern def spinlock_unlock(ptr: Ptr[uint32])
 
 # FD_P9_MARK: per-fd marker for handles opened against a 9P-mounted
 # path. fs/vfs.ad routes vfs_read / vfs_write / vfs_close on these
@@ -141,10 +195,12 @@ FD_P9_MARK: uint32 = 0xFFFFFFE3
 P9C_MSIZE: uint32 = 131072
 P9C_BUF_LEN: uint64 = 131072
 
-# Per-connection fid pool size. Fid 0 is the root; 1..31 are
-# spendable on Twalk. 32 leaves plenty of headroom for the smoke
-# test (uses fids 0 + 1) without bloating the table.
-P9C_FIDS_PER_CONN: uint64 = 32
+# Per-connection fid pool size. Fid 0 is the root; 1..63 are
+# spendable on Twalk. 64 matches user/distrofs.ad's FID_CAP, so the
+# kernel client can keep as many files open per mount as the
+# reference server can serve (32 used to be the choke point under
+# concurrent open-heavy workloads).
+P9C_FIDS_PER_CONN: uint64 = 64
 
 P9C_MAX_CONNS: uint64 = 16
 
@@ -166,8 +222,14 @@ class P9Conn:
     # the conn is torn down and its p9_conns slot reclaimed — which is
     # what lets a second nsrun reuse the low srvfd numbers cleanly.
     owner_refs:    int32          # 0 = orphaned (slot reclaimable)
-    fid_used:      Array[32, uint8]   # per-fid used bit (1 == in use)
-    # Smoke-test bypass. When smoke_mode != 0, _p9_send / _p9_recv
+    fid_used:      Array[64, uint8]   # per-fid used bit (1 == in use)
+    # V6 wire claims (guarded by p9c_lock). tx_busy serialises T-msg
+    # sends — one whole message hits the wire at a time, so concurrent
+    # requests never interleave bytes. rx_busy elects ONE reader at a
+    # time to demux R-msgs by tag (see _rpc_exchange / _p9_read_one).
+    tx_busy:       int32
+    rx_busy:       int32
+    # Smoke-test bypass. When smoke_mode != 0, _conn_write_bytes / _conn_read_bytes
     # operate on smoke_tx_slot / smoke_rx_slot rather than the srvfd.
     # The responder pump is invoked after every send to keep reads
     # synchronous.
@@ -196,7 +258,7 @@ class P9Conn:
     # the mounting task's context, where the fds ARE valid — we resolve
     # srvfd → tx pipe slot and rx_srvfd → rx pipe slot ONCE and cache
     # the slot indices here. Pipe slots are global kernel objects, so
-    # _p9_send / _p9_recv can use the cached slots from any task. A
+    # _conn_write_bytes / _conn_read_bytes can use the cached slots from any task. A
     # value of -1 means "not a pipe / not resolved" — the per-call
     # _fd_to_pipe_slot path is kept as the fallback.
     tx_pipe_slot:  int32
@@ -207,7 +269,7 @@ class P9Conn:
     # namespace (a shell-spawned `cat` reading a 9P-mounted file) does
     # not have that fd, so a per-call _fd_to_sockpair via current_task
     # fails for it. Resolved ONCE at attach and cached here — socketpair
-    # slots are global kernel objects, so _p9_send / _p9_recv drive the
+    # slots are global kernel objects, so _conn_write_bytes / _conn_read_bytes drive the
     # wire from any task. sock_slot < 0 means "not a socketpair / not
     # resolved" — the per-call _fd_to_sockpair path is the fallback.
     sock_slot:     int32
@@ -216,11 +278,74 @@ class P9Conn:
 
 p9_conns: Array[16, P9Conn]
 
-# Shared encode/decode buffer. V1 is synchronous and uses a single
-# global scratchpad — one msize-sized buffer for the most recent
-# T-msg / R-msg. A real concurrent client would per-tag this. Size
-# tracks P9C_BUF_LEN above.
-p9c_scratch: Array[131072, uint8]
+# --- V6 RPC slot pool ----------------------------------------------
+#
+# One slot per in-flight request. Replaces the single global
+# p9c_scratch: each outstanding T-msg owns a private encode/decode
+# buffer, a tag, and a WaitQueue its issuer can park on. 4 NORMAL
+# slots bound the in-flight depth (4 concurrent requests across all
+# connections — enough for every present consumer; a 5th requester
+# yield-waits for a free slot). 2 further slots are RESERVED FOR
+# TFLUSH so that cancelling a pending request can never deadlock on
+# pool exhaustion (Plan 9's mntflushalloc plays the same trick).
+# Flush slots carry a small buffer — Tflush is 9 bytes, Rflush is 7.
+#
+# State machine (all transitions under p9c_lock):
+#   FREE -> CLAIMED            _rpc_begin (buffer being encoded)
+#   CLAIMED -> SENT            _rpc_exchange, just before wire send
+#   SENT -> DONE               reader matched + delivered the R-msg
+#   SENT -> ERR                transport died / oversized response
+#   SENT -> ZOMBIE             waiter EINTR'd and Tflush couldn't
+#                              confirm the tag's death (slot + tag
+#                              quarantined until the stale R arrives
+#                              or the conn is torn down)
+#   DONE/ERR/CLAIMED -> FREE   _rpc_free (issuer done decoding)
+#   ZOMBIE -> FREE             reader drained the stale R-msg, or
+#                              _conn_release reaped the conn
+
+P9C_NRPC:        uint64 = 6
+P9C_NRPC_NORMAL: uint64 = 4          # slots 0..3; 4..5 = flush-only
+P9C_FLUSH_BUF_LEN: uint64 = 256
+
+RPC_FREE:    int32 = 0
+RPC_CLAIMED: int32 = 1
+RPC_SENT:    int32 = 2
+RPC_DONE:    int32 = 3
+RPC_ERR:     int32 = 4
+RPC_ZOMBIE:  int32 = 5
+
+# Parallel arrays (Adder nested-frame quirk: keep plain top-level
+# arrays rather than an Array of a buffer-bearing class).
+p9c_rpc_state: Array[6, int32]
+p9c_rpc_conn:  Array[6, int32]       # owning conn slot, -1 when FREE
+p9c_rpc_tag:   Array[6, uint16]
+p9c_rpc_resp:  Array[6, int32]       # response length once DONE
+p9c_rpc_wq:    Array[6, WaitQueue]
+
+p9c_rpc_buf:       Array[524288, uint8]   # 4 normal slots x 128 KiB
+p9c_rpc_flushbuf:  Array[512, uint8]      # 2 flush slots x 256 B
+
+# Guards the rpc pool, per-conn tx_busy/rx_busy, tag allocation.
+p9c_lock: uint32 = 0
+
+# Tagged-concurrency tripwire: the high-water mark of simultaneously
+# SENT requests, and a one-shot serial marker the moment it first
+# reaches 2 — scripts/test_9p_concurrency.sh greps for it to prove
+# two T-msgs really were on the wire at once.
+p9c_inflight_max:       uint64 = 0
+p9c_inflight_announced: int32 = 0
+
+
+def _rpc_buf(r: uint64) -> Ptr[uint8]:
+    if r < P9C_NRPC_NORMAL:
+        return &p9c_rpc_buf[r * P9C_BUF_LEN]
+    return &p9c_rpc_flushbuf[(r - P9C_NRPC_NORMAL) * P9C_FLUSH_BUF_LEN]
+
+
+def _rpc_buf_len(r: uint64) -> uint64:
+    if r < P9C_NRPC_NORMAL:
+        return P9C_BUF_LEN
+    return P9C_FLUSH_BUF_LEN
 
 
 # -- low-level connection helpers ----------------------------------
@@ -268,6 +393,8 @@ def _conn_alloc(srvfd: int32) -> int32:
     p9_conns[su].rx_pipe_slot  = -1
     p9_conns[su].sock_slot     = -1
     p9_conns[su].sock_dir      = 0
+    p9_conns[su].tx_busy       = 0
+    p9_conns[su].rx_busy       = 0
     # Clear fid_used.
     i: uint64 = 0
     while i < P9C_FIDS_PER_CONN:
@@ -297,11 +424,39 @@ def _conn_release(slot: int32):
     p9_conns[su].sock_slot     = -1
     p9_conns[su].sock_dir      = 0
     p9_conns[su].root_fid      = 0xFFFFFFFF
+    p9_conns[su].tx_busy       = 0
+    p9_conns[su].rx_busy       = 0
     # Clear the fid pool so a reused slot starts with no fids held.
     i: uint64 = 0
     while i < P9C_FIDS_PER_CONN:
         p9_conns[su].fid_used[i] = 0
         i = i + 1
+    # Reap every rpc slot still bound to this connection. A live
+    # waiter on this conn would be a caller bug (teardown runs when
+    # the last owner drops), but ZOMBIEs are expected: a flushed
+    # request whose stale response never arrived is quarantined here
+    # and the conn drop is what finally guarantees the server forgot
+    # the tag. ERR/DONE leftovers are reclaimed the same way. Any
+    # parked waiter is woken so it observes the FREE state and bails
+    # (the waiter loop treats an unexpected state as an error).
+    # State flips under p9c_lock; wakes AFTER release (never call
+    # wq_* with p9c_lock held).
+    reaped: Array[6, int32]
+    r: uint64 = 0
+    spinlock_lock(&p9c_lock)
+    while r < P9C_NRPC:
+        reaped[r] = 0
+        if p9c_rpc_conn[r] == slot and p9c_rpc_state[r] != RPC_FREE:
+            p9c_rpc_state[r] = RPC_FREE
+            p9c_rpc_conn[r]  = -1
+            reaped[r] = 1
+        r = r + 1
+    spinlock_unlock(&p9c_lock)
+    r = 0
+    while r < P9C_NRPC:
+        if reaped[r] != 0:
+            wq_wake_all(&p9c_rpc_wq[r])
+        r = r + 1
 
 
 # -- connection teardown (p9c_detach) ------------------------------
@@ -330,9 +485,9 @@ def _conn_try_clunk_all(slot: int32):
     # server can release its per-fid state promptly. A 9P connection
     # drop implicitly clunks every fid server-side anyway (docs/9p.md
     # §2.2), so a failed clunk here is harmless — we tolerate it and
-    # press on. p9c_clunk routes through _p9_send / _p9_recv, which
+    # press on. p9c_clunk routes through _conn_write_bytes / _conn_read_bytes, which
     # already self-protect against a dead / closed transport (a closed
-    # srvfd makes _fd_to_pipe_slot return -1 and _p9_send return -1
+    # srvfd makes _fd_to_pipe_slot return -1 and _conn_write_bytes return -1
     # without touching any pipe). That means this is also safe to call
     # from the task-exit path where the transport fd is already gone:
     # the clunk simply no-ops.
@@ -380,7 +535,7 @@ def p9c_detach(srvfd: int32) -> int32:
     #
     # Re-entrancy: this runs at unmount / task-teardown time. The only
     # outbound work is _conn_try_clunk_all, which funnels through
-    # _p9_send / _p9_recv exactly like every other op — i.e. through
+    # _conn_write_bytes / _conn_read_bytes exactly like every other op — i.e. through
     # fs/pipe.ad's ring buffers (or fs/socketpair.ad), never a nested
     # vfs_* dispatch. So it mirrors the care the rest of this module
     # already takes and cannot re-enter the channel layer.
@@ -397,35 +552,61 @@ def p9c_detach(srvfd: int32) -> int32:
     return 0
 
 
-def _alloc_tag(slot: int32) -> uint16:
-    # Auto-increment, skip P9_NOTAG (0xFFFF). V1 is synchronous so
-    # we don't need to track outstanding tags — every emit's tag is
-    # discarded the moment the matching R-msg arrives.
+def _tag_alloc_locked(slot: int32) -> uint16:
+    # Allocate a wire tag for a new request on conn `slot`. Caller
+    # HOLDS p9c_lock. Auto-increment, skip P9_NOTAG (0xFFFF) and any
+    # tag still bound to a live rpc on the same connection — after a
+    # 65534-message wrap a ZOMBIE could still be quarantining an old
+    # tag, and handing it out again would corrupt the demux.
     su: uint64 = cast[uint64](slot)
-    t: uint16 = p9_conns[su].next_tag
-    nxt: uint32 = cast[uint32](t) + 1
-    if nxt >= 0xFFFF:
-        nxt = 1
-    p9_conns[su].next_tag = cast[uint16](nxt)
-    return t
+    attempts: uint32 = 0
+    while attempts < 0xFFFF:
+        t: uint16 = p9_conns[su].next_tag
+        nxt: uint32 = cast[uint32](t) + 1
+        if nxt >= 0xFFFF:
+            nxt = 1
+        p9_conns[su].next_tag = cast[uint16](nxt)
+        # Collision scan over the (tiny) rpc pool.
+        clash: int32 = 0
+        r: uint64 = 0
+        while r < P9C_NRPC:
+            if p9c_rpc_state[r] != RPC_FREE \
+                    and p9c_rpc_conn[r] == slot \
+                    and p9c_rpc_tag[r] == t:
+                clash = 1
+            r = r + 1
+        if clash == 0:
+            return t
+        attempts = attempts + 1
+    # Unreachable in practice (6 rpc slots can't hold 65534 tags);
+    # fall back to the raw counter rather than wedging.
+    return p9_conns[su].next_tag
 
 
 def _alloc_fid(slot: int32) -> uint32:
-    # Return a fresh fid in 1..31. Returns 0xFFFFFFFF on exhaustion.
+    # Return a fresh fid in 1..63. Returns 0xFFFFFFFF on exhaustion.
+    # V6: under p9c_lock — two tasks walking the same connection
+    # concurrently must not both test-and-set the same fid bit (a
+    # duplicate fid would silently cross their files on the server).
     su: uint64 = cast[uint64](slot)
+    got: uint32 = 0xFFFFFFFF
+    spinlock_lock(&p9c_lock)
     i: uint64 = 1                  # 0 is the root, reserved
     while i < P9C_FIDS_PER_CONN:
-        if p9_conns[su].fid_used[i] == 0:
+        if got == 0xFFFFFFFF and p9_conns[su].fid_used[i] == 0:
             p9_conns[su].fid_used[i] = 1
-            return cast[uint32](i)
+            got = cast[uint32](i)
         i = i + 1
-    return 0xFFFFFFFF
+    spinlock_unlock(&p9c_lock)
+    return got
 
 
 def _free_fid(slot: int32, fid: uint32):
     su: uint64 = cast[uint64](slot)
     if cast[uint64](fid) < P9C_FIDS_PER_CONN:
+        spinlock_lock(&p9c_lock)
         p9_conns[su].fid_used[cast[uint64](fid)] = 0
+        spinlock_unlock(&p9c_lock)
 
 
 # Smoke-test pump hook. Set by init/p9_smoke.ad at boot. When non-
@@ -444,7 +625,7 @@ def p9c_register_smoke_pump(hook: uint64):
 
 
 def p9c_register_smoke_pipes(slot: int32, tx_slot: int32, rx_slot: int32):
-    # Mark a connection as "smoke" — _p9_send / _p9_recv will route
+    # Mark a connection as "smoke" — _conn_write_bytes / _conn_read_bytes will route
     # through the pipe slots instead of the fd table. Called by
     # init/p9_smoke.ad immediately after p9c_attach succeeds but
     # BEFORE the first real Tversion send (we re-use a pre-allocated
@@ -457,18 +638,14 @@ def p9c_register_smoke_pipes(slot: int32, tx_slot: int32, rx_slot: int32):
 
 # -- send / recv abstraction ---------------------------------------
 #
-# Every emitted T-msg is laid into p9c_scratch via the codec, then
-# pushed into the connection. Every R-msg is pulled out of the
-# connection back into p9c_scratch, ready for the codec decoder.
+# Every emitted T-msg is laid into its rpc slot's buffer via the
+# codec, then pushed onto the wire under the conn's tx claim. R-msgs
+# are pulled off the wire by the elected reader and demuxed BY TAG
+# into the matching rpc slot's buffer (see _rpc_exchange).
 #
 # In smoke mode: pipe_write / pipe_read against the registered
 # slots, with the pump hook invoked between send and recv so the
 # responder has a chance to react synchronously.
-#
-# In real mode (no smoke_mode): we'd dispatch through fs/vfs.ad's
-# vfs_read / vfs_write on the srvfd. V1's smoke responder is the
-# only consumer in this milestone; the real-fd path is stubbed so
-# the call shape lands and V4 can fill it in.
 
 def _smoke_pump_call(slot: int32) -> int32:
     # Synchronous trampoline into init/p9_smoke.ad's responder.
@@ -552,14 +729,14 @@ def _fd_to_pipe_slot(srvfd: int32, want_writer: int32) -> int32:
 
 
 # HAMSH §6 / §18 stage-4 tripwire: a monotonic count of 9P T-messages
-# this kernel has put on the wire. _p9_send is the single chokepoint
-# every Tversion / Tattach / Twalk / Topen / Tread / Twrite / Tclunk
-# flows through, so incrementing it here counts ALL mountrpc traffic.
-# Surfaced as the read-only file /dev/mountrpc (devmountrpc.ad). The
-# §18 stage-4 acceptance test reads it before and after a LOCAL
-# pipeline and asserts the delta is ZERO — proving a local pipe is
-# direct Chan reads, never 9P marshalling. Same shape as Phase D's
-# FD_*_MARK tripwire tests.
+# this kernel has put on the wire. _rpc_exchange is the single
+# chokepoint every Tversion / Tattach / Twalk / Topen / Tread /
+# Twrite / Tclunk / Tflush flows through, so incrementing it there
+# counts ALL mountrpc traffic. Surfaced as the read-only file
+# /dev/mountrpc (devmountrpc.ad). The §18 stage-4 acceptance test
+# reads it before and after a LOCAL pipeline and asserts the delta is
+# ZERO — proving a local pipe is direct Chan reads, never 9P
+# marshalling. Same shape as Phase D's FD_*_MARK tripwire tests.
 mountrpc_count: uint64 = 0
 
 
@@ -569,43 +746,32 @@ def mountrpc_count_get() -> uint64:
     return mountrpc_count
 
 
-def _p9_send(slot: int32, n_bytes: int32) -> int32:
-    # Push p9c_scratch[0..n_bytes] to the wire (or pipe). In smoke
-    # mode this writes into the tx pipe slot then drives the
-    # responder so the rx pipe slot is primed when _p9_recv runs.
-    if n_bytes <= 0:
-        return -1
-    # HAMSH §6 tripwire: every 9P T-message is one mountrpc. Count it
-    # here, the single send chokepoint, BEFORE the transport branch so
-    # smoke-mode and real-fd traffic are both tallied.
-    mountrpc_count = mountrpc_count + 1
+def p9c_inflight_max_get() -> uint64:
+    # High-water mark of simultaneously SENT (in-flight, unanswered)
+    # T-messages across the RPC pool. Surfaced as the read-only file
+    # /dev/9pmax (devmountrpc.ad) so the tagged-concurrency gate can
+    # read the kernel-measured proof (>=2) from inside the guest.
+    # The one-shot printk announce below is INFO-level: once hamsh is
+    # interactive, console_set_interactive() gates INFO printk to the
+    # ring buffer only (early_8250.ad), so the announce never reaches
+    # the serial console a test harness captures — the file read-back
+    # is the console-gate-proof surface.
+    return p9c_inflight_max
+
+
+def _conn_write_bytes(slot: int32, src: Ptr[uint8], n_bytes: uint64) -> int32:
+    # Push n_bytes from src onto conn `slot`'s wire (real transports
+    # only — smoke mode is handled inline in _rpc_exchange). Caller
+    # holds the conn's tx claim, so the message cannot interleave with
+    # another sender's bytes. Returns 0 on success, -1 on a dead /
+    # absent transport.
     su: uint64 = cast[uint64](slot)
-    if p9_conns[su].smoke_mode != 0:
-        tx: int32 = p9_conns[su].smoke_tx_slot
-        # pipe_write may report a short count under back-pressure; in
-        # the smoke test the responder hasn't drained yet so we trust
-        # PIPE_CAP (fs/pipe.ad) to swallow one msize-sized T-msg.
-        # Smoke messages stay well under PIPE_CAP, so the strict
-        # equality is safe in practice.
-        written: int64 = pipe_write(tx, &p9c_scratch[0],
-                                    cast[uint64](n_bytes))
-        if written != cast[int64](n_bytes):
-            return -1
-        # Drive the responder synchronously. After this the rx pipe
-        # holds exactly one R-msg.
-        if _smoke_pump_call(slot) != 0:
-            return -1
-        return n_bytes
-    # V5: socketpair transport. Try it FIRST so a bidirectional
-    # transport (rio etc.) doesn't have to thread the rx-side fd
-    # through the V4.1 `p9rx:` magic. The same fd carries both
-    # directions; sockpair_write enqueues into the caller's outbound
-    # ring, sockpair_read in _p9_recv drains the peer's inbound ring.
-    # Prefer the socketpair (slot, dir) cached at attach time — it is
-    # task-independent, so a process that inherited this namespace but
+    # V5: socketpair transport first (bidirectional, no p9rx smuggle).
+    # Prefer the (slot, dir) cached at attach time — it is task-
+    # independent, so a process that inherited this namespace but
     # never had the transport fd open can still drive the wire. Fall
-    # back to a per-call current-task translation only when nothing was
-    # cached (legacy paths).
+    # back to a per-call current-task translation only when nothing
+    # was cached (legacy paths).
     sp_slot: int32 = p9_conns[su].sock_slot
     sp_dir:  int32 = p9_conns[su].sock_dir
     sp_ok:   int32 = 0
@@ -615,11 +781,10 @@ def _p9_send(slot: int32, n_bytes: int32) -> int32:
         sp_ok = 1
     if sp_ok != 0:
         pushed_sp: uint64 = 0
-        total_sp:  uint64 = cast[uint64](n_bytes)
-        while pushed_sp < total_sp:
+        while pushed_sp < n_bytes:
             n: int64 = sockpair_write(sp_slot, sp_dir,
-                                      &p9c_scratch[pushed_sp],
-                                      total_sp - pushed_sp)
+                                      &src[pushed_sp],
+                                      n_bytes - pushed_sp)
             if n < 0:
                 return -1
             if n == 0:
@@ -629,88 +794,46 @@ def _p9_send(slot: int32, n_bytes: int32) -> int32:
                 yield_to_others()
             else:
                 pushed_sp = pushed_sp + cast[uint64](n)
-        return n_bytes
-    # V4.1: real-fd dispatch. Decode the connection's srvfd into a
-    # pipe slot and pipe_write the bytes directly. We deliberately
-    # bypass vfs_write to avoid re-entrancy on the per-task fd_buf /
-    # fd_pos state — _p9_send is called from inside vfs_open dispatch
-    # (the FD_P9_MARK route in fs/vfs.ad invokes p9c_walk_open_path,
-    # which lands here), and vfs_write on the same task's fd table
-    # would race the dispatcher's own pos accounting.
-    # Prefer the pipe slot cached at attach time — it is task-
-    # independent, so a process that inherited this namespace (and so
-    # does NOT have the transport fd open) can still drive the wire.
-    # Fall back to a per-call fd-table translation only when no slot
-    # was cached (legacy / smoke / non-pipe transports).
+        return 0
+    # V4.1: pipe-pair dispatch. We deliberately bypass vfs_write to
+    # avoid re-entrancy on the per-task fd_buf / fd_pos state — this
+    # is called from inside vfs_open dispatch (the FD_P9_MARK route in
+    # fs/vfs.ad invokes p9c_walk_open_path, which lands here). Prefer
+    # the pipe slot cached at attach time (task-independent).
     pipe_slot: int32 = p9_conns[su].tx_pipe_slot
     if pipe_slot < 0:
         pipe_slot = _fd_to_pipe_slot(p9_conns[su].srvfd, 1)
     if pipe_slot < 0:
-        # Not a pipe fd — preserve the V1 -1 stub so non-pipe srvfds
+        # Not a pipe fd — preserve the -1 stub so non-pipe srvfds
         # (e.g. the /etc/motd fd test_p9mount.ad uses to assert the
         # mount-srvfd-rejection path) still see a visible failure.
         return -1
-    # Push the whole T-msg out. pipe_write reports a short count when
-    # the ring is full; we yield + retry. PIPE_CAP (fs/pipe.ad) is
-    # sized to one full P9C_MSIZE T-msg, so a Twrite carrying a
-    # multi-KB payload normally lands in one shot; the loop is the
-    # back-pressure safety net for a slow consumer.
     pushed: uint64 = 0
-    total: uint64 = cast[uint64](n_bytes)
-    while pushed < total:
-        n: int64 = pipe_write(pipe_slot, &p9c_scratch[pushed],
-                              total - pushed)
-        if n < 0:
+    while pushed < n_bytes:
+        n2: int64 = pipe_write(pipe_slot, &src[pushed],
+                               n_bytes - pushed)
+        if n2 < 0:
             return -1
-        if n == 0:
+        if n2 == 0:
             # Ring full. If readers == 0 the peer has hung up and we
             # should give up (EPIPE-shape); otherwise yield and retry.
             if pipe_readers(pipe_slot) == 0:
                 return -1
             yield_to_others()
         else:
-            pushed = pushed + cast[uint64](n)
-    return n_bytes
+            pushed = pushed + cast[uint64](n2)
+    return 0
 
 
-def _p9_recv(slot: int32) -> int32:
-    # Pull one whole R-msg into p9c_scratch[0..returned]. In smoke
-    # mode the responder has already populated the rx pipe slot.
-    # Reads the 4-byte size header first, then the remainder of the
-    # message, so partial pipe reads don't desync us.
+def _conn_read_bytes(slot: int32, dst: Ptr[uint8], n_bytes: uint64) -> int32:
+    # Pull exactly n_bytes off conn `slot`'s wire into dst (real
+    # transports only). Caller holds the conn's rx claim — exactly one
+    # reader at a time, so message framing can't be split between two
+    # tasks. Blocks with yield (the producer is a userspace server
+    # task). Returns 0 on success, -1 on hangup / dead transport (a
+    # half-message would desync the codec, so EOF mid-message is a
+    # hard error).
     su: uint64 = cast[uint64](slot)
-    if p9_conns[su].smoke_mode != 0:
-        rx: int32 = p9_conns[su].smoke_rx_slot
-        # Read the 7-byte header (size[4] type[1] tag[2]). pipe_read
-        # may short-return; loop until we have 7 bytes.
-        got: uint64 = 0
-        while got < 7:
-            n: int64 = pipe_read(rx, &p9c_scratch[got], 7 - got)
-            if n <= 0:
-                return -1
-            got = got + cast[uint64](n)
-        # Decode size from the header.
-        sz: uint32 = 0
-        ty: uint8 = 0
-        tg: uint16 = 0
-        rc: int32 = p9_decode_header(&p9c_scratch[0], 7, &sz, &ty, &tg)
-        if rc != 0:
-            return -1
-        total: uint64 = cast[uint64](sz)
-        if total < 7 or total > P9C_BUF_LEN:
-            return -1
-        # Pull the body.
-        while got < total:
-            n: int64 = pipe_read(rx, &p9c_scratch[got], total - got)
-            if n <= 0:
-                return -1
-            got = got + cast[uint64](n)
-        return cast[int32](total)
-    # V5: socketpair transport. Same as _p9_send — try the
-    # bidirectional path before the V4.1 pipe-pair fallback. R-msgs
-    # come back on the same fd the T-msgs went out on. Prefer the
-    # (slot, dir) cached at attach time so a task that inherited the
-    # namespace without the transport fd can still receive.
     sp_slot: int32 = p9_conns[su].sock_slot
     sp_dir:  int32 = p9_conns[su].sock_dir
     sp_ok:   int32 = 0
@@ -719,11 +842,10 @@ def _p9_recv(slot: int32) -> int32:
     elif _fd_to_sockpair(p9_conns[su].srvfd, &sp_slot, &sp_dir) != 0:
         sp_ok = 1
     if sp_ok != 0:
-        # Read 7-byte header first to learn the total message length.
         got_sp: uint64 = 0
-        while got_sp < 7:
+        while got_sp < n_bytes:
             nh: int64 = sockpair_read(sp_slot, sp_dir,
-                                       &p9c_scratch[got_sp], 7 - got_sp)
+                                      &dst[got_sp], n_bytes - got_sp)
             if nh < 0:
                 return -1
             if nh == 0:
@@ -732,37 +854,9 @@ def _p9_recv(slot: int32) -> int32:
                 yield_to_others()
             else:
                 got_sp = got_sp + cast[uint64](nh)
-        sz_sp: uint32 = 0
-        ty_sp: uint8 = 0
-        tg_sp: uint16 = 0
-        rc_sp: int32 = p9_decode_header(&p9c_scratch[0], 7,
-                                        &sz_sp, &ty_sp, &tg_sp)
-        if rc_sp != 0:
-            return -1
-        total_sp: uint64 = cast[uint64](sz_sp)
-        if total_sp < 7 or total_sp > P9C_BUF_LEN:
-            return -1
-        while got_sp < total_sp:
-            nb: int64 = sockpair_read(sp_slot, sp_dir,
-                                      &p9c_scratch[got_sp],
-                                      total_sp - got_sp)
-            if nb < 0:
-                return -1
-            if nb == 0:
-                if sockpair_peer_alive(sp_slot, sp_dir) == 0:
-                    return -1
-                yield_to_others()
-            else:
-                got_sp = got_sp + cast[uint64](nb)
-        return cast[int32](total_sp)
-    # V4.1: real-fd dispatch. R-msgs come back on the connection's
-    # rx_srvfd if it was set (the standard userspace-pipe-pair case);
-    # otherwise we fall back to srvfd (a future bidirectional
-    # transport like a socketpair). Same vfs.ad re-entrancy concern as
-    # _p9_send drives us through pipe_read directly.
-    # Prefer the rx pipe slot cached at attach time (task-independent;
-    # see the matching note in _p9_send). Fall back to a per-call
-    # fd-table translation only when no slot was cached.
+        return 0
+    # Pipe pair: R-msgs come back on rx_srvfd's pipe (the `p9rx:`
+    # smuggle); prefer the slot cached at attach time.
     rx_slot: int32 = p9_conns[su].rx_pipe_slot
     if rx_slot < 0:
         rx_fd: int32 = p9_conns[su].rx_srvfd
@@ -771,15 +865,9 @@ def _p9_recv(slot: int32) -> int32:
         rx_slot = _fd_to_pipe_slot(rx_fd, 0)
     if rx_slot < 0:
         return -1
-    # Block until we have a full 7-byte header. pipe_read returns 0
-    # for "ring empty right now"; we yield + retry. If writers == 0
-    # the peer has hung up before posting a complete R-msg → -1
-    # (mirrors vfs_read's EOF-vs-would-block discrimination on
-    # FD_PIPE_MARK_R, but we surface a hard error rather than a short
-    # read because a half-message would desync the codec).
     got: uint64 = 0
-    while got < 7:
-        n: int64 = pipe_read(rx_slot, &p9c_scratch[got], 7 - got)
+    while got < n_bytes:
+        n: int64 = pipe_read(rx_slot, &dst[got], n_bytes - got)
         if n < 0:
             return -1
         if n == 0:
@@ -788,26 +876,414 @@ def _p9_recv(slot: int32) -> int32:
             yield_to_others()
         else:
             got = got + cast[uint64](n)
+    return 0
+
+
+# -- RPC slot lifecycle ---------------------------------------------
+
+def _rpc_begin(conn_slot: int32, want_flush: int32) -> int32:
+    # Claim an rpc slot for a new request on `conn_slot` and assign
+    # its wire tag. Normal requests draw from slots 0..3 and WAIT
+    # (yield-loop) when all four are in flight — back-pressure, not
+    # failure. Tflush draws from the reserved slots 4..5 and returns
+    # -1 when both are busy (the caller then quarantines its rpc as a
+    # ZOMBIE instead of flushing — never a deadlock).
+    lo: uint64 = 0
+    hi: uint64 = P9C_NRPC_NORMAL
+    if want_flush != 0:
+        lo = P9C_NRPC_NORMAL
+        hi = P9C_NRPC
+    while True:
+        found: int32 = -1
+        spinlock_lock(&p9c_lock)
+        r: uint64 = lo
+        while r < hi:
+            if p9c_rpc_state[r] == RPC_FREE and found < 0:
+                found = cast[int32](r)
+            r = r + 1
+        if found >= 0:
+            fu: uint64 = cast[uint64](found)
+            p9c_rpc_state[fu] = RPC_CLAIMED
+            p9c_rpc_conn[fu]  = conn_slot
+            p9c_rpc_tag[fu]   = _tag_alloc_locked(conn_slot)
+            p9c_rpc_resp[fu]  = 0
+            wq_init(&p9c_rpc_wq[fu])
+        spinlock_unlock(&p9c_lock)
+        if found >= 0:
+            return found
+        if want_flush != 0:
+            return -1
+        yield_to_others()
+
+
+def _rpc_free(r: int32):
+    ru: uint64 = cast[uint64](r)
+    spinlock_lock(&p9c_lock)
+    p9c_rpc_state[ru] = RPC_FREE
+    p9c_rpc_conn[ru]  = -1
+    spinlock_unlock(&p9c_lock)
+
+
+def _rpc_zombie(r: int32):
+    # Quarantine an aborted-but-unconfirmed request: the slot + tag
+    # stay reserved so the tag can't be reissued while the server
+    # might still answer it. The reader that eventually receives the
+    # stale R-msg drains it and frees the slot; _conn_release reaps
+    # any zombie that outlives its connection. If the response
+    # already arrived (state DONE) the tag IS dead — free directly.
+    ru: uint64 = cast[uint64](r)
+    spinlock_lock(&p9c_lock)
+    if p9c_rpc_state[ru] == RPC_SENT:
+        p9c_rpc_state[ru] = RPC_ZOMBIE
+    else:
+        p9c_rpc_state[ru] = RPC_FREE
+        p9c_rpc_conn[ru]  = -1
+    spinlock_unlock(&p9c_lock)
+
+
+def _conn_rx_fail(conn_slot: int32):
+    # The elected reader hit a transport error: no further R-msg will
+    # ever arrive on this connection. Fail every outstanding request
+    # (SENT -> ERR) and reap the zombies, then wake all their waiters.
+    # State flips under p9c_lock; wakes after release.
+    failed: Array[6, int32]
+    r: uint64 = 0
+    spinlock_lock(&p9c_lock)
+    while r < P9C_NRPC:
+        failed[r] = 0
+        if p9c_rpc_conn[r] == conn_slot:
+            if p9c_rpc_state[r] == RPC_SENT:
+                p9c_rpc_state[r] = RPC_ERR
+                failed[r] = 1
+            elif p9c_rpc_state[r] == RPC_ZOMBIE:
+                p9c_rpc_state[r] = RPC_FREE
+                p9c_rpc_conn[r]  = -1
+        r = r + 1
+    spinlock_unlock(&p9c_lock)
+    r = 0
+    while r < P9C_NRPC:
+        if failed[r] != 0:
+            wq_wake_all(&p9c_rpc_wq[r])
+        r = r + 1
+
+
+def _p9_read_one(conn_slot: int32) -> int32:
+    # THE DEMUX (Plan 9 mnt.c mountmux shape). Pull ONE whole R-msg
+    # off conn `conn_slot`'s wire, tag-match it to an rpc slot, copy
+    # the bytes into THAT slot's buffer, mark it DONE and wake its
+    # waiter. Unmatched tags (a server inventing responses) and
+    # zombie tags (flush-aborted requests) are drained into a discard
+    # buffer so the stream stays framed. Caller holds the rx claim.
+    # Returns 0 on success (one message consumed), -1 on transport
+    # error (caller must _conn_rx_fail + drop readership).
+    hdr: Array[8, uint8]
+    if _conn_read_bytes(conn_slot, &hdr[0], 7) < 0:
+        return -1
     sz: uint32 = 0
     ty: uint8 = 0
     tg: uint16 = 0
-    rc: int32 = p9_decode_header(&p9c_scratch[0], 7, &sz, &ty, &tg)
-    if rc != 0:
+    if p9_decode_header(&hdr[0], 7, &sz, &ty, &tg) != 0:
         return -1
     total: uint64 = cast[uint64](sz)
     if total < 7 or total > P9C_BUF_LEN:
         return -1
-    while got < total:
-        n: int64 = pipe_read(rx_slot, &p9c_scratch[got], total - got)
-        if n < 0:
-            return -1
-        if n == 0:
-            if pipe_writers(rx_slot) == 0:
+    # Find the rpc this tag belongs to.
+    mrpc: int32 = -1
+    zombie: int32 = 0
+    spinlock_lock(&p9c_lock)
+    r: uint64 = 0
+    while r < P9C_NRPC:
+        if mrpc < 0 and p9c_rpc_conn[r] == conn_slot \
+                and p9c_rpc_tag[r] == tg:
+            if p9c_rpc_state[r] == RPC_SENT:
+                mrpc = cast[int32](r)
+            elif p9c_rpc_state[r] == RPC_ZOMBIE:
+                mrpc = cast[int32](r)
+                zombie = 1
+        r = r + 1
+    spinlock_unlock(&p9c_lock)
+    deliver: int32 = 0
+    if mrpc >= 0 and zombie == 0 \
+            and total <= _rpc_buf_len(cast[uint64](mrpc)):
+        deliver = 1
+    if deliver != 0:
+        mu: uint64 = cast[uint64](mrpc)
+        dst: Ptr[uint8] = _rpc_buf(mu)
+        dst[0] = hdr[0]
+        dst[1] = hdr[1]
+        dst[2] = hdr[2]
+        dst[3] = hdr[3]
+        dst[4] = hdr[4]
+        dst[5] = hdr[5]
+        dst[6] = hdr[6]
+        if total > 7:
+            if _conn_read_bytes(conn_slot, &dst[7], total - 7) < 0:
                 return -1
-            yield_to_others()
+        spinlock_lock(&p9c_lock)
+        p9c_rpc_resp[mu]  = cast[int32](total)
+        p9c_rpc_state[mu] = RPC_DONE
+        spinlock_unlock(&p9c_lock)
+        wq_wake_all(&p9c_rpc_wq[mu])
+        return 0
+    # Drain path: zombie response, stranger tag, or an oversized
+    # response (protocol violation — for a SENT rpc that also means
+    # ERR below). Chunk the body into a small local buffer.
+    left: uint64 = total - 7
+    sink: Array[256, uint8]
+    while left > 0:
+        take: uint64 = left
+        if take > 256:
+            take = 256
+        if _conn_read_bytes(conn_slot, &sink[0], take) < 0:
+            return -1
+        left = left - take
+    if mrpc >= 0:
+        mu2: uint64 = cast[uint64](mrpc)
+        if zombie != 0:
+            # The stale response a flush-aborted request was waiting
+            # out. The tag is now provably dead — reclaim the slot.
+            _rpc_free(mrpc)
         else:
+            # SENT but response too large for the slot's buffer:
+            # protocol violation. Fail just this rpc.
+            spinlock_lock(&p9c_lock)
+            p9c_rpc_state[mu2] = RPC_ERR
+            spinlock_unlock(&p9c_lock)
+            wq_wake_all(&p9c_rpc_wq[mu2])
+    return 0
+
+
+def _rpc_state_get(r: int32) -> int32:
+    ru: uint64 = cast[uint64](r)
+    spinlock_lock(&p9c_lock)
+    st: int32 = p9c_rpc_state[ru]
+    spinlock_unlock(&p9c_lock)
+    return st
+
+
+def _rpc_flush_abort(conn_slot: int32, r: int32) -> int32:
+    # A waiter was interrupted by a signal (task killed / noted) while
+    # its request was outstanding. Cancel the request honestly with
+    # Tflush(oldtag) per docs/9p.md so the tag doesn't leak:
+    #   * Rflush     -> the server promises oldtag is dead: free it.
+    #   * Rerror     -> server doesn't implement flush; the old
+    #                   response may still arrive: quarantine ZOMBIE.
+    #   * can't send -> transport trouble: quarantine ZOMBIE (conn
+    #                   teardown reaps it).
+    # Always returns -1 (the original request is reported failed to
+    # the interrupted caller either way).
+    ru: uint64 = cast[uint64](r)
+    fr: int32 = _rpc_begin(conn_slot, 1)
+    if fr < 0:
+        _rpc_zombie(r)
+        return -1
+    fu: uint64 = cast[uint64](fr)
+    fbuf: Ptr[uint8] = _rpc_buf(fu)
+    c: P9Cursor
+    p9_cursor_init(&c, fbuf, _rpc_buf_len(fu))
+    n: int32 = p9_emit_tflush(&c, p9c_rpc_tag[fu], p9c_rpc_tag[ru])
+    if n < 0:
+        _rpc_free(fr)
+        _rpc_zombie(r)
+        return -1
+    # NON-interruptible exchange: the signal that got us here is still
+    # pending, so an interruptible wait would EINTR instantly and
+    # we'd recurse. _rpc_exchange(interruptible=0) yields through the
+    # pending-signal case instead.
+    rn: int32 = _rpc_exchange(conn_slot, fr, n, 0)
+    if rn < 0:
+        # Flush itself failed (transport died). The conn-level rx
+        # failure path has already ERR'd outstanding requests; make
+        # sure ours is not leaked either way.
+        _rpc_zombie(r)
+        return -1
+    confirmed: int32 = 0
+    if fbuf[4] == P9_RFLUSH:
+        confirmed = 1
+    _rpc_free(fr)
+    if confirmed != 0:
+        _rpc_free(r)
+    else:
+        _rpc_zombie(r)
+    return -1
+
+
+def _rpc_exchange(conn_slot: int32, r: int32, n_bytes: int32,
+                  interruptible: int32) -> int32:
+    # Send rpc `r`'s T-msg and wait for its tag-matched R-msg.
+    # Returns the response length (>= 7; bytes in _rpc_buf(r), caller
+    # decodes then calls _rpc_free) or -1 on failure — in which case
+    # the rpc slot has ALREADY been released (or quarantined as a
+    # zombie); the caller must not free it again.
+    if n_bytes <= 0:
+        _rpc_free(r)
+        return -1
+    # HAMSH §6 tripwire: every 9P T-message is one mountrpc. Count it
+    # here, the single send chokepoint, BEFORE the transport branch so
+    # smoke-mode and real-fd traffic are both tallied.
+    mountrpc_count = mountrpc_count + 1
+    su: uint64 = cast[uint64](conn_slot)
+    ru: uint64 = cast[uint64](r)
+    buf: Ptr[uint8] = _rpc_buf(ru)
+    # --- smoke mode: fully synchronous, boot-time single-task -------
+    if p9_conns[su].smoke_mode != 0:
+        tx: int32 = p9_conns[su].smoke_tx_slot
+        written: int64 = pipe_write(tx, buf, cast[uint64](n_bytes))
+        if written != cast[int64](n_bytes):
+            _rpc_free(r)
+            return -1
+        # Drive the responder synchronously; the rx pipe then holds
+        # exactly one R-msg.
+        if _smoke_pump_call(conn_slot) != 0:
+            _rpc_free(r)
+            return -1
+        rx: int32 = p9_conns[su].smoke_rx_slot
+        got: uint64 = 0
+        while got < 7:
+            n: int64 = pipe_read(rx, &buf[got], 7 - got)
+            if n <= 0:
+                _rpc_free(r)
+                return -1
             got = got + cast[uint64](n)
-    return cast[int32](total)
+        sz: uint32 = 0
+        ty: uint8 = 0
+        tg: uint16 = 0
+        if p9_decode_header(buf, 7, &sz, &ty, &tg) != 0:
+            _rpc_free(r)
+            return -1
+        total: uint64 = cast[uint64](sz)
+        if total < 7 or total > _rpc_buf_len(ru):
+            _rpc_free(r)
+            return -1
+        while got < total:
+            n2: int64 = pipe_read(rx, &buf[got], total - got)
+            if n2 <= 0:
+                _rpc_free(r)
+                return -1
+            got = got + cast[uint64](n2)
+        return cast[int32](total)
+    # --- real transports: tagged concurrency -------------------------
+    # 1. Claim TX (one whole T-msg on the wire at a time).
+    while True:
+        got_tx: int32 = 0
+        spinlock_lock(&p9c_lock)
+        if p9_conns[su].tx_busy == 0:
+            p9_conns[su].tx_busy = 1
+            got_tx = 1
+        spinlock_unlock(&p9c_lock)
+        if got_tx != 0:
+            break
+        yield_to_others()
+    # 2. Mark SENT *before* the bytes hit the wire so the reader (any
+    #    task, any CPU) can match the response the instant it appears.
+    #    Track the in-flight high-water mark for the concurrency
+    #    tripwire while we hold the lock anyway.
+    announce: uint64 = 0
+    spinlock_lock(&p9c_lock)
+    p9c_rpc_state[ru] = RPC_SENT
+    inflight: uint64 = 0
+    ri: uint64 = 0
+    while ri < P9C_NRPC:
+        if p9c_rpc_state[ri] == RPC_SENT:
+            inflight = inflight + 1
+        ri = ri + 1
+    if inflight > p9c_inflight_max:
+        p9c_inflight_max = inflight
+    if inflight >= 2 and p9c_inflight_announced == 0:
+        p9c_inflight_announced = 1
+        announce = inflight
+    spinlock_unlock(&p9c_lock)
+    if announce != 0:
+        printk1("[9p] tagged concurrency: %d T-msgs in flight\n",
+                announce)
+    # 3. Send, then release TX.
+    send_rc: int32 = _conn_write_bytes(conn_slot, buf,
+                                       cast[uint64](n_bytes))
+    spinlock_lock(&p9c_lock)
+    p9_conns[su].tx_busy = 0
+    spinlock_unlock(&p9c_lock)
+    if send_rc < 0:
+        _rpc_free(r)
+        return -1
+    # 4. Await the tag-matched response. Whoever holds the rx claim
+    #    reads + demuxes for everyone; everyone else parks on their
+    #    own rpc's WaitQueue.
+    while True:
+        st: int32 = _rpc_state_get(r)
+        if st == RPC_DONE:
+            return p9c_rpc_resp[ru]
+        if st == RPC_ERR:
+            _rpc_free(r)
+            return -1
+        if st != RPC_SENT:
+            # FREE/CLAIMED here means the conn was torn down under us
+            # (_conn_release reaped the pool). Do NOT double-free.
+            return -1
+        # Try to become the reader.
+        got_rx: int32 = 0
+        spinlock_lock(&p9c_lock)
+        if p9_conns[su].rx_busy == 0:
+            p9_conns[su].rx_busy = 1
+            got_rx = 1
+        spinlock_unlock(&p9c_lock)
+        if got_rx != 0:
+            # WE are the reader: pull messages until our own rpc
+            # resolves, delivering everyone else's along the way.
+            rd_err: int32 = 0
+            while _rpc_state_get(r) == RPC_SENT and rd_err == 0:
+                if _p9_read_one(conn_slot) < 0:
+                    rd_err = 1
+            if rd_err != 0:
+                _conn_rx_fail(conn_slot)
+            # Drop readership, then wake every still-pending waiter on
+            # this conn so one of them elects itself the next reader
+            # (our own response arriving doesn't mean theirs has).
+            spinlock_lock(&p9c_lock)
+            p9_conns[su].rx_busy = 0
+            pend: Array[6, int32]
+            rp: uint64 = 0
+            while rp < P9C_NRPC:
+                pend[rp] = 0
+                if p9c_rpc_conn[rp] == conn_slot \
+                        and p9c_rpc_state[rp] == RPC_SENT:
+                    pend[rp] = 1
+                rp = rp + 1
+            spinlock_unlock(&p9c_lock)
+            rp = 0
+            while rp < P9C_NRPC:
+                if pend[rp] != 0:
+                    wq_wake_all(&p9c_rpc_wq[rp])
+                rp = rp + 1
+            # Loop: re-check our own state.
+        else:
+            # Someone else is reading. Park on our rpc's WaitQueue
+            # with the two-phase dance (prepare / re-check / commit)
+            # so a wake between check and sleep can't be lost. The
+            # small timeout is a belt-and-braces re-poll: on TIMEOUT
+            # we just re-check and re-arm.
+            wq_wait_prepare(&p9c_rpc_wq[ru])
+            recheck: int32 = _rpc_state_get(r)
+            rx_now: int32 = 0
+            spinlock_lock(&p9c_lock)
+            rx_now = p9_conns[su].rx_busy
+            spinlock_unlock(&p9c_lock)
+            if recheck != RPC_SENT or rx_now == 0:
+                # Resolved while we were preparing, or the readership
+                # freed up — don't sleep, re-run the loop.
+                wq_wait_cancel(&p9c_rpc_wq[ru])
+            else:
+                wrc: int32 = wq_wait_commit_timeout(&p9c_rpc_wq[ru], 2)
+                if wrc == WQ_EINTR:
+                    if interruptible != 0:
+                        # Task signalled: cancel the pending request
+                        # honestly (Tflush) so the tag doesn't leak.
+                        return _rpc_flush_abort(conn_slot, r)
+                    # Non-interruptible (the flush exchange itself):
+                    # the pending signal makes every commit return
+                    # EINTR immediately — yield so the server task
+                    # can actually run, then re-check.
+                    yield_to_others()
+                # 0 (woken) / WQ_TIMEOUT: fall through and re-check.
 
 
 # -- Tversion ------------------------------------------------------
@@ -816,8 +1292,20 @@ def _p9_negotiate(slot: int32) -> int32:
     # Issue Tversion with msize=P9C_MSIZE / version="9P2000".
     # Accept the smaller of (offered, returned) as the operating
     # msize; reject if the server replies "unknown".
+    r: int32 = _rpc_begin(slot, 0)
+    if r < 0:
+        return -1
+    ru: uint64 = cast[uint64](r)
+    # Tversion is sent with tag NOTAG and the server answers with tag
+    # NOTAG — override the slot's allocated tag so the demux matches
+    # the Rversion to THIS rpc. (Version always runs before any other
+    # op on the conn, so NOTAG can't collide with a live tag here.)
+    spinlock_lock(&p9c_lock)
+    p9c_rpc_tag[ru] = P9_NOTAG
+    spinlock_unlock(&p9c_lock)
+    buf: Ptr[uint8] = _rpc_buf(ru)
     c: P9Cursor
-    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
+    p9_cursor_init(&c, buf, _rpc_buf_len(ru))
     ver: Array[8, uint8]
     ver[0] = 57  # '9'
     ver[1] = 80  # 'P'
@@ -827,31 +1315,36 @@ def _p9_negotiate(slot: int32) -> int32:
     ver[5] = 48
     n: int32 = p9_emit_tversion(&c, P9_NOTAG, P9C_MSIZE, &ver[0], 6)
     if n < 0:
+        _rpc_free(r)
         return -1
-    if _p9_send(slot, n) < 0:
-        return -1
-    rn: int32 = _p9_recv(slot)
+    rn: int32 = _rpc_exchange(slot, r, n, 1)
     if rn < 0:
         return -1
     # Could be Rversion or Rerror.
-    if p9c_scratch[4] == P9_RERROR:
+    if buf[4] == P9_RERROR:
+        _rpc_free(r)
         return -1
     tg_out: uint16 = 0
     ms_out: uint32 = 0
     ver_ptr: Ptr[uint8] = cast[Ptr[uint8]](0)
     ver_len: uint64 = 0
     consumed: int64 = p9_decode_rversion(
-        &p9c_scratch[0], cast[uint64](rn),
+        buf, cast[uint64](rn),
         &tg_out, &ms_out, &ver_ptr, &ver_len)
     if consumed < cast[int64](0):
+        _rpc_free(r)
         return -1
     # Reject "unknown" — the server doesn't speak 9P2000.
+    # (ver_ptr aims into the rpc buffer; inspect BEFORE freeing.)
     if ver_len != 6:
+        _rpc_free(r)
         return -1
     if ver_ptr[0] != 57 or ver_ptr[1] != 80 \
             or ver_ptr[2] != 50 or ver_ptr[3] != 48 \
             or ver_ptr[4] != 48 or ver_ptr[5] != 48:
+        _rpc_free(r)
         return -1
+    _rpc_free(r)
     su: uint64 = cast[uint64](slot)
     if ms_out < p9_conns[su].msize:
         p9_conns[su].msize = ms_out
@@ -965,7 +1458,7 @@ def p9c_attach_run(slot: int32, aname: Ptr[char],
     aname = _parse_rx_prefix(slot, aname)
     # Resolve the transport fds to GLOBAL pipe slot indices NOW, while
     # we still run in the mounting task's context (its fd table has
-    # srvfd / rx_srvfd open). The cached slots let _p9_send / _p9_recv
+    # srvfd / rx_srvfd open). The cached slots let _conn_write_bytes / _conn_read_bytes
     # drive the connection from ANY task that later inherits this
     # namespace — e.g. a dpkg spawned inside an nsrun distrofs
     # namespace, whose own fd table never had the transport fds. A
@@ -995,10 +1488,19 @@ def p9c_attach_run(slot: int32, aname: Ptr[char],
     su: uint64 = cast[uint64](slot)
     p9_conns[su].fid_used[0] = 1
     root: uint32 = 0
-    # Emit Tattach.
+    # Emit Tattach. NOTE the rollback ordering on every failure path:
+    # the op frees its OWN rpc first (where needed), then releases the
+    # conn — _conn_release reaps any rpc still bound to the conn, so
+    # the order only matters for not double-freeing.
+    r: int32 = _rpc_begin(slot, 0)
+    if r < 0:
+        _conn_release(slot)
+        return -1
+    ru: uint64 = cast[uint64](r)
+    buf: Ptr[uint8] = _rpc_buf(ru)
     c: P9Cursor
-    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
-    tag: uint16 = _alloc_tag(slot)
+    p9_cursor_init(&c, buf, _rpc_buf_len(ru))
+    tag: uint16 = p9c_rpc_tag[ru]
     uname_p: Ptr[uint8] = cast[Ptr[uint8]](uname)
     aname_p: Ptr[uint8] = cast[Ptr[uint8]](aname)
     uname_l: uint64 = 0
@@ -1011,16 +1513,16 @@ def p9c_attach_run(slot: int32, aname: Ptr[char],
                                uname_p, uname_l,
                                aname_p, aname_l)
     if n < 0:
+        _rpc_free(r)
         _conn_release(slot)
         return -1
-    if _p9_send(slot, n) < 0:
-        _conn_release(slot)
-        return -1
-    rn: int32 = _p9_recv(slot)
+    rn: int32 = _rpc_exchange(slot, r, n, 1)
     if rn < 0:
+        # rpc already released/zombied inside _rpc_exchange.
         _conn_release(slot)
         return -1
-    if p9c_scratch[4] == P9_RERROR:
+    if buf[4] == P9_RERROR:
+        _rpc_free(r)
         _conn_release(slot)
         return -1
     tg_out: uint16 = 0
@@ -1028,8 +1530,9 @@ def p9c_attach_run(slot: int32, aname: Ptr[char],
     qv: uint32 = 0
     qp: uint64 = 0
     consumed: int64 = p9_decode_rattach(
-        &p9c_scratch[0], cast[uint64](rn),
+        buf, cast[uint64](rn),
         &tg_out, &qt, &qv, &qp)
+    _rpc_free(r)
     if consumed < cast[int64](0):
         _conn_release(slot)
         return -1
@@ -1059,23 +1562,28 @@ def p9c_walk(srvfd: int32, fid: int32, names: Ptr[Ptr[char]],
         name_ptrs[cast[uint64](i)] = cast[Ptr[uint8]](np)
         name_lens[cast[uint64](i)] = _cstrlen(np)
         i = i + 1
+    r: int32 = _rpc_begin(slot, 0)
+    if r < 0:
+        _free_fid(slot, new_fid)
+        return -1
+    ru: uint64 = cast[uint64](r)
+    buf: Ptr[uint8] = _rpc_buf(ru)
     c: P9Cursor
-    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
-    tag: uint16 = _alloc_tag(slot)
+    p9_cursor_init(&c, buf, _rpc_buf_len(ru))
+    tag: uint16 = p9c_rpc_tag[ru]
     sent: int32 = p9_emit_twalk(&c, tag, cast[uint32](fid), new_fid,
                                 cast[uint16](n_names),
                                 &name_ptrs[0], &name_lens[0])
     if sent < 0:
+        _rpc_free(r)
         _free_fid(slot, new_fid)
         return -1
-    if _p9_send(slot, sent) < 0:
-        _free_fid(slot, new_fid)
-        return -1
-    rn: int32 = _p9_recv(slot)
+    rn: int32 = _rpc_exchange(slot, r, sent, 1)
     if rn < 0:
         _free_fid(slot, new_fid)
         return -1
-    if p9c_scratch[4] == P9_RERROR:
+    if buf[4] == P9_RERROR:
+        _rpc_free(r)
         _free_fid(slot, new_fid)
         return -1
     tg_out: uint16 = 0
@@ -1084,8 +1592,9 @@ def p9c_walk(srvfd: int32, fid: int32, names: Ptr[Ptr[char]],
     qvers:  Array[16, uint32]
     qpaths: Array[16, uint64]
     consumed: int64 = p9_decode_rwalk(
-        &p9c_scratch[0], cast[uint64](rn),
+        buf, cast[uint64](rn),
         &tg_out, &nwq, &qtypes[0], &qvers[0], &qpaths[0])
+    _rpc_free(r)
     if consumed < cast[int64](0):
         _free_fid(slot, new_fid)
         return -1
@@ -1121,19 +1630,24 @@ def p9c_open(srvfd: int32, fid: int32, mode: int32) -> int32:
     slot: int32 = _conn_find_by_srvfd(srvfd)
     if slot < 0:
         return -1
+    r: int32 = _rpc_begin(slot, 0)
+    if r < 0:
+        return -1
+    ru: uint64 = cast[uint64](r)
+    buf: Ptr[uint8] = _rpc_buf(ru)
     c: P9Cursor
-    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
-    tag: uint16 = _alloc_tag(slot)
+    p9_cursor_init(&c, buf, _rpc_buf_len(ru))
+    tag: uint16 = p9c_rpc_tag[ru]
     n: int32 = p9_emit_topen(&c, tag, cast[uint32](fid),
                              cast[uint8](mode & 0xFF))
     if n < 0:
+        _rpc_free(r)
         return -1
-    if _p9_send(slot, n) < 0:
-        return -1
-    rn: int32 = _p9_recv(slot)
+    rn: int32 = _rpc_exchange(slot, r, n, 1)
     if rn < 0:
         return -1
-    if p9c_scratch[4] == P9_RERROR:
+    if buf[4] == P9_RERROR:
+        _rpc_free(r)
         return -1
     tg_out: uint16 = 0
     qt: uint8 = 0
@@ -1141,8 +1655,9 @@ def p9c_open(srvfd: int32, fid: int32, mode: int32) -> int32:
     qp: uint64 = 0
     iou: uint32 = 0
     consumed: int64 = p9_decode_ropen(
-        &p9c_scratch[0], cast[uint64](rn),
+        buf, cast[uint64](rn),
         &tg_out, &qt, &qv, &qp, &iou)
+    _rpc_free(r)
     if consumed < cast[int64](0):
         return -1
     return 0
@@ -1162,9 +1677,10 @@ def p9c_open(srvfd: int32, fid: int32, mode: int32) -> int32:
 # DMAPPEND / DMEXCL high bits). `open_mode` is the Plan 9 open-mode
 # byte the new fid ends up open with.
 #
-# Returns 0 on success, -1 on any failure. Routes through _p9_send /
-# _p9_recv exactly like every other op — i.e. through fs/pipe.ad's
-# pipe_write / pipe_read directly, never the re-entrant vfs_* path.
+# Returns 0 on success, -1 on any failure. Routes through
+# _rpc_exchange exactly like every other op — i.e. through
+# fs/pipe.ad's pipe_write / pipe_read directly, never the re-entrant
+# vfs_* path.
 
 def p9c_create(srvfd: int32, fid: int32, name: Ptr[char],
                perm: uint32, open_mode: int32) -> int32:
@@ -1177,20 +1693,25 @@ def p9c_create(srvfd: int32, fid: int32, name: Ptr[char],
     name_l: uint64 = _cstrlen(name)
     if name_l == 0:
         return -1
+    r: int32 = _rpc_begin(slot, 0)
+    if r < 0:
+        return -1
+    ru: uint64 = cast[uint64](r)
+    buf: Ptr[uint8] = _rpc_buf(ru)
     c: P9Cursor
-    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
-    tag: uint16 = _alloc_tag(slot)
+    p9_cursor_init(&c, buf, _rpc_buf_len(ru))
+    tag: uint16 = p9c_rpc_tag[ru]
     n: int32 = p9_emit_tcreate(&c, tag, cast[uint32](fid),
                                name_p, name_l, perm,
                                cast[uint8](open_mode & 0xFF))
     if n < 0:
+        _rpc_free(r)
         return -1
-    if _p9_send(slot, n) < 0:
-        return -1
-    rn: int32 = _p9_recv(slot)
+    rn: int32 = _rpc_exchange(slot, r, n, 1)
     if rn < 0:
         return -1
-    if p9c_scratch[4] == P9_RERROR:
+    if buf[4] == P9_RERROR:
+        _rpc_free(r)
         return -1
     tg_out: uint16 = 0
     qt: uint8 = 0
@@ -1198,8 +1719,9 @@ def p9c_create(srvfd: int32, fid: int32, name: Ptr[char],
     qp: uint64 = 0
     iou: uint32 = 0
     consumed: int64 = p9_decode_rcreate(
-        &p9c_scratch[0], cast[uint64](rn),
+        buf, cast[uint64](rn),
         &tg_out, &qt, &qv, &qp, &iou)
+    _rpc_free(r)
     if consumed < cast[int64](0):
         return -1
     return 0
@@ -1212,9 +1734,14 @@ def p9c_read(srvfd: int32, fid: int32, offset: uint64,
     slot: int32 = _conn_find_by_srvfd(srvfd)
     if slot < 0:
         return cast[int64](-1)
+    r: int32 = _rpc_begin(slot, 0)
+    if r < 0:
+        return cast[int64](-1)
+    ru: uint64 = cast[uint64](r)
+    rbuf: Ptr[uint8] = _rpc_buf(ru)
     c: P9Cursor
-    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
-    tag: uint16 = _alloc_tag(slot)
+    p9_cursor_init(&c, rbuf, _rpc_buf_len(ru))
+    tag: uint16 = p9c_rpc_tag[ru]
     # Cap count at msize-minus-headers (24-ish). We use msize-24 as a
     # safe floor; codec / responder share the same envelope.
     su: uint64 = cast[uint64](slot)
@@ -1225,28 +1752,30 @@ def p9c_read(srvfd: int32, fid: int32, offset: uint64,
         take = cap
     n: int32 = p9_emit_tread(&c, tag, cast[uint32](fid), offset, take)
     if n < 0:
+        _rpc_free(r)
         return cast[int64](-1)
-    if _p9_send(slot, n) < 0:
-        return cast[int64](-1)
-    rn: int32 = _p9_recv(slot)
+    rn: int32 = _rpc_exchange(slot, r, n, 1)
     if rn < 0:
         return cast[int64](-1)
-    if p9c_scratch[4] == P9_RERROR:
+    if rbuf[4] == P9_RERROR:
+        _rpc_free(r)
         return cast[int64](-1)
     tg_out: uint16 = 0
     data_ptr: Ptr[uint8] = cast[Ptr[uint8]](0)
     cnt_out: uint32 = 0
     consumed: int64 = p9_decode_rread(
-        &p9c_scratch[0], cast[uint64](rn),
+        rbuf, cast[uint64](rn),
         &tg_out, &data_ptr, &cnt_out)
     if consumed < cast[int64](0):
+        _rpc_free(r)
         return cast[int64](-1)
-    # Copy out.
+    # Copy out (data_ptr aims into the rpc buffer — copy BEFORE free).
     i: uint64 = 0
     cu: uint64 = cast[uint64](cnt_out)
     while i < cu:
         buf[i] = data_ptr[i]
         i = i + 1
+    _rpc_free(r)
     return cast[int64](cu)
 
 
@@ -1257,9 +1786,14 @@ def p9c_write(srvfd: int32, fid: int32, offset: uint64,
     slot: int32 = _conn_find_by_srvfd(srvfd)
     if slot < 0:
         return cast[int64](-1)
+    r: int32 = _rpc_begin(slot, 0)
+    if r < 0:
+        return cast[int64](-1)
+    ru: uint64 = cast[uint64](r)
+    rbuf: Ptr[uint8] = _rpc_buf(ru)
     c: P9Cursor
-    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
-    tag: uint16 = _alloc_tag(slot)
+    p9_cursor_init(&c, rbuf, _rpc_buf_len(ru))
+    tag: uint16 = p9c_rpc_tag[ru]
     su: uint64 = cast[uint64](slot)
     ms: uint32 = p9_conns[su].msize
     cap: uint32 = ms - 24
@@ -1269,19 +1803,20 @@ def p9c_write(srvfd: int32, fid: int32, offset: uint64,
     n: int32 = p9_emit_twrite(&c, tag, cast[uint32](fid),
                               offset, buf, take)
     if n < 0:
+        _rpc_free(r)
         return cast[int64](-1)
-    if _p9_send(slot, n) < 0:
-        return cast[int64](-1)
-    rn: int32 = _p9_recv(slot)
+    rn: int32 = _rpc_exchange(slot, r, n, 1)
     if rn < 0:
         return cast[int64](-1)
-    if p9c_scratch[4] == P9_RERROR:
+    if rbuf[4] == P9_RERROR:
+        _rpc_free(r)
         return cast[int64](-1)
     tg_out: uint16 = 0
     cnt_out: uint32 = 0
     consumed: int64 = p9_decode_rwrite(
-        &p9c_scratch[0], cast[uint64](rn),
+        rbuf, cast[uint64](rn),
         &tg_out, &cnt_out)
+    _rpc_free(r)
     if consumed < cast[int64](0):
         return cast[int64](-1)
     return cast[int64](cnt_out)
@@ -1293,23 +1828,29 @@ def p9c_clunk(srvfd: int32, fid: int32) -> int32:
     slot: int32 = _conn_find_by_srvfd(srvfd)
     if slot < 0:
         return -1
+    r: int32 = _rpc_begin(slot, 0)
+    if r < 0:
+        return -1
+    ru: uint64 = cast[uint64](r)
+    buf: Ptr[uint8] = _rpc_buf(ru)
     c: P9Cursor
-    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
-    tag: uint16 = _alloc_tag(slot)
+    p9_cursor_init(&c, buf, _rpc_buf_len(ru))
+    tag: uint16 = p9c_rpc_tag[ru]
     n: int32 = p9_emit_tclunk(&c, tag, cast[uint32](fid))
     if n < 0:
+        _rpc_free(r)
         return -1
-    if _p9_send(slot, n) < 0:
-        return -1
-    rn: int32 = _p9_recv(slot)
+    rn: int32 = _rpc_exchange(slot, r, n, 1)
     if rn < 0:
         return -1
-    if p9c_scratch[4] == P9_RERROR:
+    if buf[4] == P9_RERROR:
+        _rpc_free(r)
         _free_fid(slot, cast[uint32](fid))
         return -1
     tg_out: uint16 = 0
     consumed: int64 = p9_decode_rclunk(
-        &p9c_scratch[0], cast[uint64](rn), &tg_out)
+        buf, cast[uint64](rn), &tg_out)
+    _rpc_free(r)
     if consumed < cast[int64](0):
         return -1
     _free_fid(slot, cast[uint32](fid))
@@ -1323,18 +1864,23 @@ def p9c_stat(srvfd: int32, fid: int32, out_stat: Ptr[uint8],
     slot: int32 = _conn_find_by_srvfd(srvfd)
     if slot < 0:
         return cast[int64](-1)
+    r: int32 = _rpc_begin(slot, 0)
+    if r < 0:
+        return cast[int64](-1)
+    ru: uint64 = cast[uint64](r)
+    buf: Ptr[uint8] = _rpc_buf(ru)
     c: P9Cursor
-    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
-    tag: uint16 = _alloc_tag(slot)
+    p9_cursor_init(&c, buf, _rpc_buf_len(ru))
+    tag: uint16 = p9c_rpc_tag[ru]
     n: int32 = p9_emit_tstat(&c, tag, cast[uint32](fid))
     if n < 0:
+        _rpc_free(r)
         return cast[int64](-1)
-    if _p9_send(slot, n) < 0:
-        return cast[int64](-1)
-    rn: int32 = _p9_recv(slot)
+    rn: int32 = _rpc_exchange(slot, r, n, 1)
     if rn < 0:
         return cast[int64](-1)
-    if p9c_scratch[4] == P9_RERROR:
+    if buf[4] == P9_RERROR:
+        _rpc_free(r)
         return cast[int64](-1)
     # Body: starts at offset 7 (after the size+type+tag header), and
     # carries 2-byte outer length + Stat record. We hand the outer
@@ -1342,12 +1888,92 @@ def p9c_stat(srvfd: int32, fid: int32, out_stat: Ptr[uint8],
     # p9_decode_stat). rn-7 == bytes in body.
     body_len: uint64 = cast[uint64](rn) - 7
     if body_len > stat_max:
+        _rpc_free(r)
         return cast[int64](-1)
     i: uint64 = 0
     while i < body_len:
-        out_stat[i] = p9c_scratch[7 + i]
+        out_stat[i] = buf[7 + i]
         i = i + 1
+    _rpc_free(r)
     return cast[int64](body_len)
+
+
+# -- p9c_auth ------------------------------------------------------
+#
+# Tauth wire plumbing (see the header's Tauth note for what is still
+# missing before this amounts to real authentication). Runs
+# Tauth(afid, uname, aname) on an established connection and returns
+# the afid on Rauth, or -1 on Rerror / any failure. The 13-byte aqid
+# is written into out_aqid when non-null (same layout p9c_walk uses).
+# The afid comes from the ordinary fid pool, so the caller can later
+# p9c_clunk it. Servers that don't require auth (every in-tree server
+# today, distrofs included) answer Rerror — the honest result.
+
+def p9c_auth(srvfd: int32, uname: Ptr[char], aname: Ptr[char],
+             out_aqid: Ptr[uint8]) -> int32:
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return -1
+    afid: uint32 = _alloc_fid(slot)
+    if afid == 0xFFFFFFFF:
+        return -1
+    r: int32 = _rpc_begin(slot, 0)
+    if r < 0:
+        _free_fid(slot, afid)
+        return -1
+    ru: uint64 = cast[uint64](r)
+    buf: Ptr[uint8] = _rpc_buf(ru)
+    c: P9Cursor
+    p9_cursor_init(&c, buf, _rpc_buf_len(ru))
+    tag: uint16 = p9c_rpc_tag[ru]
+    uname_l: uint64 = 0
+    aname_l: uint64 = 0
+    if uname != cast[Ptr[char]](0):
+        uname_l = _cstrlen(uname)
+    if aname != cast[Ptr[char]](0):
+        aname_l = _cstrlen(aname)
+    n: int32 = p9_emit_tauth(&c, tag, afid,
+                             cast[Ptr[uint8]](uname), uname_l,
+                             cast[Ptr[uint8]](aname), aname_l)
+    if n < 0:
+        _rpc_free(r)
+        _free_fid(slot, afid)
+        return -1
+    rn: int32 = _rpc_exchange(slot, r, n, 1)
+    if rn < 0:
+        _free_fid(slot, afid)
+        return -1
+    if buf[4] != P9_RAUTH:
+        # Rerror (or anything unexpected): no afid was established.
+        _rpc_free(r)
+        _free_fid(slot, afid)
+        return -1
+    tg_out: uint16 = 0
+    qt: uint8 = 0
+    qv: uint32 = 0
+    qp: uint64 = 0
+    consumed: int64 = p9_decode_rauth(
+        buf, cast[uint64](rn),
+        &tg_out, &qt, &qv, &qp)
+    _rpc_free(r)
+    if consumed < cast[int64](0):
+        _free_fid(slot, afid)
+        return -1
+    if out_aqid != cast[Ptr[uint8]](0):
+        out_aqid[0] = qt
+        out_aqid[1] = cast[uint8](qv & 0xFF)
+        out_aqid[2] = cast[uint8]((qv >> 8) & 0xFF)
+        out_aqid[3] = cast[uint8]((qv >> 16) & 0xFF)
+        out_aqid[4] = cast[uint8]((qv >> 24) & 0xFF)
+        out_aqid[5]  = cast[uint8](qp & 0xFF)
+        out_aqid[6]  = cast[uint8]((qp >> 8) & 0xFF)
+        out_aqid[7]  = cast[uint8]((qp >> 16) & 0xFF)
+        out_aqid[8]  = cast[uint8]((qp >> 24) & 0xFF)
+        out_aqid[9]  = cast[uint8]((qp >> 32) & 0xFF)
+        out_aqid[10] = cast[uint8]((qp >> 40) & 0xFF)
+        out_aqid[11] = cast[uint8]((qp >> 48) & 0xFF)
+        out_aqid[12] = cast[uint8]((qp >> 56) & 0xFF)
+    return cast[int32](afid)
 
 
 # -- per-conn introspection helpers used by syschan + vfs ----------
@@ -1381,22 +2007,41 @@ P9C_MAX_NAME_LEN: uint64 = 128
 P9C_MAX_COMPONENTS: uint64 = 16
 
 
-# Component storage for p9c_walk_open_path. Top-level Arrays per the
+# Component storage for the path helpers. Top-level Arrays per the
 # Adder nested-frame quirk -- declaring Array[16, Array[128, uint8]]
 # inside the function body trips a layout bug we already shipped a
 # note about in feedback_compiler_quirks.md.
-_p9c_path_comp_storage: Array[2048, uint8]   # 16 * 128
-_p9c_path_comp_ptrs:    Array[16, Ptr[char]]
+#
+# V6: the storage is PER-TASK (indexed by current_idx_get(), NTASKS
+# = 16 lanes). With tagged concurrency two tasks can be inside a
+# path helper at the same time, so a single shared lane would let
+# one task's split clobber another's components mid-walk.
+P9C_PATH_LANES: uint64 = 16              # == NTASKS (kernel/sched/core.ad)
+
+_p9c_path_comp_storage: Array[32768, uint8]      # 16 tasks * 16 comps * 128
+_p9c_path_comp_ptrs:    Array[256, Ptr[char]]    # 16 tasks * 16 comps
+
+
+def _path_lane() -> uint64:
+    # The calling task's lane index. current_idx_get() is the per-CPU
+    # current task slot, always < NTASKS == P9C_PATH_LANES.
+    t: uint64 = current_idx_get()
+    if t >= P9C_PATH_LANES:
+        t = 0
+    return t
 
 
 def p9c_walk_open_path(srvfd: int32, root_fid: int32,
                        rel_path: Ptr[uint8],
                        open_mode: int32) -> int32:
     # rel_path is e.g. "/hello" or "hello" or "" (root). We chain a
-    # component into the shared top-level _p9c_path_comp_storage
-    # buffer at byte offsets 0..128, 128..256, ... and hand a pointer
-    # array to p9c_walk. V1 is synchronous so the shared buffer's
-    # single-call lifetime is safe; V4 grows per-conn storage.
+    # component into this task's lane of the top-level
+    # _p9c_path_comp_storage buffer at byte offsets 0..128, 128..256,
+    # ... and hand a pointer array to p9c_walk. The lane is private to
+    # the calling task, so concurrent walks can't clobber each other.
+    lane: uint64 = _path_lane()
+    st_base: uint64 = lane * (P9C_MAX_COMPONENTS * P9C_MAX_NAME_LEN)
+    pt_base: uint64 = lane * P9C_MAX_COMPONENTS
     n_comp: uint64 = 0
     # Skip a leading '/'.
     i: uint64 = 0
@@ -1404,7 +2049,7 @@ def p9c_walk_open_path(srvfd: int32, root_fid: int32,
         i = 1
     # Split.
     while rel_path[i] != 0 and n_comp < P9C_MAX_COMPONENTS:
-        base: uint64 = n_comp * P9C_MAX_NAME_LEN
+        base: uint64 = st_base + n_comp * P9C_MAX_NAME_LEN
         # Copy bytes until '/' or NUL.
         cidx: uint64 = 0
         while rel_path[i] != 0 and rel_path[i] != 47 \
@@ -1414,7 +2059,7 @@ def p9c_walk_open_path(srvfd: int32, root_fid: int32,
             i = i + 1
         _p9c_path_comp_storage[base + cidx] = 0
         if cidx > 0:
-            _p9c_path_comp_ptrs[n_comp] = cast[Ptr[char]](
+            _p9c_path_comp_ptrs[pt_base + n_comp] = cast[Ptr[char]](
                 &_p9c_path_comp_storage[base])
             n_comp = n_comp + 1
         if rel_path[i] == 47:
@@ -1422,7 +2067,7 @@ def p9c_walk_open_path(srvfd: int32, root_fid: int32,
     # Walk.
     qid_out: Array[13, uint8]
     new_fid: int32 = p9c_walk(srvfd, cast[int32](root_fid),
-                              cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                              cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[pt_base]),
                               cast[int32](n_comp), &qid_out[0])
     if new_fid < 0:
         return -1
@@ -1448,8 +2093,8 @@ def p9c_walk_open_path(srvfd: int32, root_fid: int32,
 # A path with no leaf (empty, "/", or trailing '/') is rejected — you
 # cannot create "the root" or an unnamed file.
 #
-# Re-entrancy: p9c_walk + p9c_create both funnel through _p9_send /
-# _p9_recv, which talk to fs/pipe.ad's ring buffers directly. No nested
+# Re-entrancy: p9c_walk + p9c_create both funnel through
+# _rpc_exchange, which talks to fs/pipe.ad's ring buffers directly. No nested
 # vfs_* dispatch — safe to call from inside vfs_open_for_write.
 
 def p9c_walk_create_path(srvfd: int32, root_fid: int32,
@@ -1476,16 +2121,19 @@ def p9c_walk_create_path(srvfd: int32, root_fid: int32,
     leaf_len: uint64 = plen - leaf_start
     if leaf_len == 0 or leaf_len + 1 >= P9C_MAX_NAME_LEN:
         return -1                                # empty / oversized leaf
-    # Split the parent components into the shared top-level storage,
+    # Split the parent components into this task's storage lane,
     # exactly like p9c_walk_open_path does. We stop the component scan
     # at leaf_start so the leaf itself is never treated as a walk
     # component.
+    lane: uint64 = _path_lane()
+    st_base: uint64 = lane * (P9C_MAX_COMPONENTS * P9C_MAX_NAME_LEN)
+    pt_base: uint64 = lane * P9C_MAX_COMPONENTS
     n_comp: uint64 = 0
     i: uint64 = 0
     if rel_path[0] == 47:                        # skip a leading '/'
         i = 1
     while i < leaf_start and n_comp < P9C_MAX_COMPONENTS:
-        base: uint64 = n_comp * P9C_MAX_NAME_LEN
+        base: uint64 = st_base + n_comp * P9C_MAX_NAME_LEN
         cidx: uint64 = 0
         while i < leaf_start and rel_path[i] != 47 \
                 and cidx + 1 < P9C_MAX_NAME_LEN:
@@ -1494,7 +2142,7 @@ def p9c_walk_create_path(srvfd: int32, root_fid: int32,
             i = i + 1
         _p9c_path_comp_storage[base + cidx] = 0
         if cidx > 0:
-            _p9c_path_comp_ptrs[n_comp] = cast[Ptr[char]](
+            _p9c_path_comp_ptrs[pt_base + n_comp] = cast[Ptr[char]](
                 &_p9c_path_comp_storage[base])
             n_comp = n_comp + 1
         if i < leaf_start and rel_path[i] == 47:
@@ -1505,23 +2153,23 @@ def p9c_walk_create_path(srvfd: int32, root_fid: int32,
     # exactly the parent fid Tcreate needs.
     qid_out: Array[13, uint8]
     parent_fid: int32 = p9c_walk(srvfd, root_fid,
-                                 cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                                 cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[pt_base]),
                                  cast[int32](n_comp), &qid_out[0])
     if parent_fid < 0:
         return -1
     # Stage the leaf as a NUL-terminated cstring in component slot 0 of
-    # the shared storage (the parent walk has already consumed it for
-    # the walk emit, so reusing the front slot is safe — synchronous
-    # single-call lifetime).
+    # this task's lane (the parent walk has already consumed it for
+    # the walk emit, so reusing the front slot is safe — the lane is
+    # private to this task for the call's lifetime).
     k: uint64 = 0
     while k < leaf_len:
-        _p9c_path_comp_storage[k] = rel_path[leaf_start + k]
+        _p9c_path_comp_storage[st_base + k] = rel_path[leaf_start + k]
         k = k + 1
-    _p9c_path_comp_storage[k] = 0
+    _p9c_path_comp_storage[st_base + k] = 0
     # Tcreate mutates parent_fid in place: on success it now references
     # the new file and is left open for open_mode I/O.
     if p9c_create(srvfd, parent_fid,
-                  cast[Ptr[char]](&_p9c_path_comp_storage[0]),
+                  cast[Ptr[char]](&_p9c_path_comp_storage[st_base]),
                   perm, open_mode) < 0:
         p9c_clunk(srvfd, parent_fid)
         return -1
@@ -1543,13 +2191,14 @@ def p9c_walk_create_path(srvfd: int32, root_fid: int32,
 # any failure. No fid is left open — every walked / created fid is
 # clunked before return.
 #
-# Per-component leaf storage is a dedicated top-level buffer so this
-# routine never aliases _p9c_path_comp_storage (it walks one name at
-# a time, so a single-slot buffer suffices).
+# Per-component leaf storage is a dedicated top-level buffer (one
+# 128-byte lane per task) so this routine never aliases
+# _p9c_path_comp_storage (it walks one name at a time, so a
+# single-slot lane suffices).
 
 DMDIR_BIT: uint32 = 0x80000000          # 9P perm DMDIR (docs/9p.md §3.8)
 
-_p9c_mkdir_leaf: Array[128, uint8]      # one NUL-terminated component
+_p9c_mkdir_leaf: Array[2048, uint8]     # 16 tasks * one 128-byte component
 
 
 def p9c_walk_mkdir_path(srvfd: int32, root_fid: int32,
@@ -1557,6 +2206,9 @@ def p9c_walk_mkdir_path(srvfd: int32, root_fid: int32,
     slot: int32 = _conn_find_by_srvfd(srvfd)
     if slot < 0:
         return -1
+    lane: uint64 = _path_lane()
+    pt_base: uint64 = lane * P9C_MAX_COMPONENTS
+    lf_base: uint64 = lane * P9C_MAX_NAME_LEN
     plen: uint64 = 0
     while rel_path[plen] != 0:
         plen = plen + 1
@@ -1566,7 +2218,7 @@ def p9c_walk_mkdir_path(srvfd: int32, root_fid: int32,
     # walked to so far. It starts as a fresh clone of the root.
     qroot: Array[13, uint8]
     cur_fid: int32 = p9c_walk(srvfd, root_fid,
-                              cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                              cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[pt_base]),
                               0, &qroot[0])
     if cur_fid < 0:
         return -1
@@ -1575,14 +2227,14 @@ def p9c_walk_mkdir_path(srvfd: int32, root_fid: int32,
         i = 1
     ok: int32 = 0
     while i < plen and ok == 0:
-        # Extract the next component into _p9c_mkdir_leaf.
+        # Extract the next component into this task's leaf lane.
         cidx: uint64 = 0
         while i < plen and rel_path[i] != 47 \
                 and cidx + 1 < P9C_MAX_NAME_LEN:
-            _p9c_mkdir_leaf[cidx] = rel_path[i]
+            _p9c_mkdir_leaf[lf_base + cidx] = rel_path[i]
             cidx = cidx + 1
             i = i + 1
-        _p9c_mkdir_leaf[cidx] = 0
+        _p9c_mkdir_leaf[lf_base + cidx] = 0
         # Skip the '/' separator(s) (tolerate "a//b" and a trailing '/').
         while i < plen and rel_path[i] == 47:
             i = i + 1
@@ -1591,10 +2243,11 @@ def p9c_walk_mkdir_path(srvfd: int32, root_fid: int32,
         # Try to walk into the component from the current directory. A
         # success means it already exists; clunk cur_fid, adopt the
         # walked fid as the new current directory.
-        _p9c_path_comp_ptrs[0] = cast[Ptr[char]](&_p9c_mkdir_leaf[0])
+        _p9c_path_comp_ptrs[pt_base] = cast[Ptr[char]](
+            &_p9c_mkdir_leaf[lf_base])
         qc: Array[13, uint8]
         step_fid: int32 = p9c_walk(srvfd, cur_fid,
-                                   cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                                   cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[pt_base]),
                                    1, &qc[0])
         if step_fid >= 0:
             # Component exists. If it is a file (qid.type bit 0x80 ==
@@ -1614,7 +2267,7 @@ def p9c_walk_mkdir_path(srvfd: int32, root_fid: int32,
             # do not lose the parent fid for a failed create. We just
             # Tcreate on a fresh clone of cur_fid.
             clone_fid: int32 = p9c_walk(srvfd, cur_fid,
-                                        cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                                        cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[pt_base]),
                                         0, &qc[0])
             if clone_fid < 0:
                 p9c_clunk(srvfd, cur_fid)
@@ -1622,7 +2275,7 @@ def p9c_walk_mkdir_path(srvfd: int32, root_fid: int32,
             else:
                 # Tcreate the directory (DMDIR | 0o755, opened OREAD).
                 cr: int32 = p9c_create(srvfd, clone_fid,
-                                       cast[Ptr[char]](&_p9c_mkdir_leaf[0]),
+                                       cast[Ptr[char]](&_p9c_mkdir_leaf[lf_base]),
                                        DMDIR_BIT | 0x1ED, 0)
                 if cr < 0:
                     p9c_clunk(srvfd, clone_fid)
@@ -1635,7 +2288,7 @@ def p9c_walk_mkdir_path(srvfd: int32, root_fid: int32,
                     p9c_clunk(srvfd, clone_fid)
                     qd: Array[13, uint8]
                     next_fid: int32 = p9c_walk(srvfd, cur_fid,
-                                               cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                                               cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[pt_base]),
                                                1, &qd[0])
                     p9c_clunk(srvfd, cur_fid)
                     if next_fid < 0:
@@ -1651,7 +2304,7 @@ def p9c_walk_mkdir_path(srvfd: int32, root_fid: int32,
 def p9c_encode_fd_buf(srvfd: int32, fid: int32) -> uint64:
     # Pack (srvfd, fid) into a single uint64 so a task fd's fd_buf
     # slot can carry both. srvfd is signed but always small (0..15);
-    # fid is unsigned 32-bit but our pool caps at 31.
+    # fid is unsigned 32-bit but our pool caps at 63.
     s: uint64 = cast[uint64](srvfd) & 0xFFFFFFFF
     f: uint64 = cast[uint64](fid) & 0xFFFFFFFF
     return (s << 32) | f
