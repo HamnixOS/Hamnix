@@ -193,8 +193,13 @@ replaces the ~70 `is_*_path` backend-selection branches).
    19db22e0; embedded in hamclock), hamsh `hamui` builtin verbs for dialogs/
    tooltips/calendar (DONE: 99e7e058) — widgets compile-verified, not yet
    VM-verified. Compositor perf prereqs LANDED + VM-verified: /dev/wsys gen
-   leaf + SYS_WAITFDS(313) (28741f0b) — hamUId gen+waitfds consumption (kill
-   busy-poll main loop + every-8-frames re-rasterize) IN FLIGHT (agent).
+   leaf + SYS_WAITFDS(313) (28741f0b). hamUId EVENT-DRIVEN MAIN LOOP LANDED
+   (merged 7324821c, 2026-06-10, VM-verified on main): compositor parks in
+   sys_waitfds (jiffy-verified real sleep, no yield spin), gen-gated markup
+   re-rasterize (zero re-rasterizes/presents across idle frames; repaint
+   present bounded by the window rect; pure cursor move neither re-rasterizes
+   nor presents). Gate `scripts/test_hamUI_evloop_gop.sh` (OVMF/GOP) green on
+   main alongside the mouse GOP regression gate.
 
    **MOUSE FIXED IN VM (2026-06-10, merged 5e492591, VM-verified on main).**
    "Mouse doesn't move at all even in the VM" root-caused through THREE
