@@ -194,25 +194,34 @@ mcopy -o -i "$TARGET_ESP" "$EFI_STUB"          "::/EFI/BOOT/BOOTX64.EFI"
 mcopy -o -i "$TARGET_ESP" "$INSTALLED_KERNEL"  "::/hamnix-kernel.elf"
 echo "[build_installer_img]   NVMe ESP image: ${ESP_IMG_MB} MiB (LOG.TXT + BOOTX64.EFI + installed kernel)."
 
-# --- Stage 5: the squashfs payload (esp.img only) ---------------------
-# DEBIAN-STYLE INSTALL: the squashfs now carries ONLY the NVMe ESP FAT
-# image. The target ROOT is no longer a golden-image stream — it is a real
-# package install (`hpm install hamnix-base` from the in-RAM /iso-packages
-# repo onto the freshly-mkfs'd ext4). So the ~512 MiB rootfs.ext4 is NO
-# LONGER packed here, which keeps the RAM-resident installer payload small
-# (important on the NUC). The ESP is byte-copied because FAT has no
-# per-file kernel writer. The reader (fs/squashfs.ad) supports gzip (id=1)
-# + xz (id=4) and a block size up to 1 MiB; mksquashfs' 128 KiB default is
-# well within.
-echo "[build_installer_img] Stage 5: build in-RAM squashfs payload (esp.img only)."
+# --- Stage 5: the squashfs payload (esp.img + live-distro.ext4) -------
+# DEBIAN-STYLE INSTALL: the squashfs carries the NVMe ESP FAT image (the
+# target ROOT is a real package install — `hpm install hamnix-base` from
+# the in-RAM /iso-packages repo — not a golden-image stream) PLUS the
+# LIVE-medium Debian distro image (#410 Item 2): a compact ext4 whose
+# .hamnix-roots declares #distro only. On a LIVE boot (no install
+# target) rc.boot triggers `sqfs_live_root /rootfs.sqfs
+# /live-distro.ext4` which extracts it into a RAM block device and
+# posts #distro, so `enter linux { ... }` runs real Debian binaries
+# with NOTHING read from the media. The ESP is byte-copied because FAT
+# has no per-file kernel writer. The reader (fs/squashfs.ad) supports
+# gzip (id=1) + xz (id=4) and a block size up to 1 MiB; mksquashfs'
+# 128 KiB default is well within.
+echo "[build_installer_img] Stage 5: build in-RAM squashfs payload (esp.img + live-distro.ext4)."
+LIVE_DISTRO_IMG="$OUTDIR/hamnix-live-distro.img"
+HAMNIX_ROOTFS_LIVE=1 HAMNIX_ROOTFS_OUT="$LIVE_DISTRO_IMG" \
+    HAMNIX_ROOTFS_SIZE_MB="${HAMNIX_LIVE_DISTRO_SIZE_MB:-}" \
+    python3 scripts/build_rootfs_img.py
+[ -f "$LIVE_DISTRO_IMG" ] || { echo "[build_installer_img] ERROR: $LIVE_DISTRO_IMG not built" >&2; exit 1; }
 SQFS_STAGE=$(mktemp -d)
-cp "$TARGET_ESP"  "$SQFS_STAGE/esp.img"
+cp "$TARGET_ESP"      "$SQFS_STAGE/esp.img"
+cp "$LIVE_DISTRO_IMG" "$SQFS_STAGE/live-distro.ext4"
 rm -f "$SQFS_IMG"
 mksquashfs "$SQFS_STAGE" "$SQFS_IMG" -comp gzip -noappend -no-progress \
     -no-xattrs >/dev/null
 rm -rf "$SQFS_STAGE"
 SQFS_BYTES=$(stat -c%s "$SQFS_IMG")
-echo "[build_installer_img]   squashfs: $SQFS_IMG ($(( SQFS_BYTES / 1024 / 1024 )) MiB)."
+echo "[build_installer_img]   squashfs: $SQFS_IMG ($(( SQFS_BYTES / 1024 / 1024 )) MiB; live distro $(stat -c%s "$LIVE_DISTRO_IMG") B raw)."
 
 # --- Stage 6: the INSTALLER kernel (cpio embeds the squashfs) ---------
 echo "[build_installer_img] Stage 6: compile INSTALLER kernel (cpio embeds /rootfs.sqfs)."

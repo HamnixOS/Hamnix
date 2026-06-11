@@ -120,6 +120,21 @@ if $installer_medium > 0 {
         source /etc/install_nvme.hamsh
     } else {
         echo 'rc.boot: only the boot medium present -- booting LIVE environment'
+        # LIVE Debian namespace (#410 Item 2): extract live-distro.ext4
+        # out of the in-RAM /rootfs.sqfs into a RAM block device and
+        # post its #distro named root (kernel does the work; see
+        # drivers/block/loop.ad::loop_sqfs_live_root). Spawned DETACHED
+        # so the desktop/heartbeat boot timing is unaffected — the
+        # `linux`/`debian` ns recipes captured by rc.boot.full bind
+        # '#distro' at ENTER time, so `enter linux { ... }` works as
+        # soon as the kernel prints "[live-root] DONE". `ns { }` is an
+        # empty overlay: the tool inherits this boot namespace (it only
+        # needs /dev/loop/ctl).
+        livens = ns {
+        }
+        livesvc = spawn detached livens {
+            live_distro_up
+        }
         source /etc/rc.boot.full
     }
 } else {
