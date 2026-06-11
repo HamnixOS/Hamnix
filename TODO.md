@@ -215,8 +215,13 @@ replaces the ~70 `is_*_path` backend-selection branches).
    injection): BOTH PS/2 relative and usb-tablet absolute paths move the
    compositor cursor end-to-end. The desync class-bug would also have killed
    live USB keyboard input on selftest boots.
-   hamUId.ad-touching → real volume/battery/network applets (model
-   values today; needs real backends), Display/Mouse/keyboard-layout settings
+   **APPLET BACKENDS REAL (2026-06-10, merged 5c714321, VM-verified on
+   main).** Volume round-trips the real HDA mixer (`/dev/audioctl` verbs +
+   `/dev/audio` re-read, new master-mute latch preserving level); network
+   applet reads a new `/net/addr` leaf on the 1 s housekeeping tick; battery
+   shows truthful AC-power when no battery is present (hardcoded 72% gone).
+   Gate `scripts/test_hamUI_volume_gop.sh` green alongside evloop/mouse/mixer.
+   hamUId.ad-touching remaining → Display/Mouse/keyboard-layout settings
    panels, external notification + system-tray client-registration API, image
    wallpaper, screensaver+password-lock, real session save/restore, inter-app
    drag-and-drop. PDF viewer (atril) deferred (needs font/PDF stack). Serialize
