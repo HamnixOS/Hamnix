@@ -193,8 +193,23 @@ replaces the ~70 `is_*_path` backend-selection branches).
    19db22e0; embedded in hamclock), hamsh `hamui` builtin verbs for dialogs/
    tooltips/calendar (DONE: 99e7e058) — widgets compile-verified, not yet
    VM-verified. Compositor perf prereqs LANDED + VM-verified: /dev/wsys gen
-   leaf + SYS_WAITFDS(313) (28741f0b) — next: hamUId consumes gen+waitfds to
-   kill the busy-poll main loop + every-8-frames re-rasterize.
+   leaf + SYS_WAITFDS(313) (28741f0b) — hamUId gen+waitfds consumption (kill
+   busy-poll main loop + every-8-frames re-rasterize) IN FLIGHT (agent).
+
+   **MOUSE FIXED IN VM (2026-06-10, merged 5e492591, VM-verified on main).**
+   "Mouse doesn't move at all even in the VM" root-caused through THREE
+   stacked bugs: (1) usb-tablet (QEMU's default absolute pointer) was never
+   enumerated — added tablet attach + absolute-coord side channel through
+   /dev/mouse to hamUId (f5d17401); (2) xHCI Transfer Event param is the
+   completed TRB's address, not the data buffer — live events were misrouted
+   (2ea70db3); (3) the boot-time synthetic xHCI selftests forged events at
+   the event-ring consumer cursor, desyncing consumer vs producer AND leaving
+   ERDP ahead so QEMU's ring-full heuristic silently dropped every later real
+   event — fixed by cursor+ERDP rewind + forged-TRB scrub (01bd6034,
+   9a6d598d). Gate `scripts/test_hamUI_mouse_gop.sh` (OVMF/GOP + QMP
+   injection): BOTH PS/2 relative and usb-tablet absolute paths move the
+   compositor cursor end-to-end. The desync class-bug would also have killed
+   live USB keyboard input on selftest boots.
    hamUId.ad-touching → real volume/battery/network applets (model
    values today; needs real backends), Display/Mouse/keyboard-layout settings
    panels, external notification + system-tray client-registration API, image
