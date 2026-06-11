@@ -782,7 +782,7 @@ uaccess layer, and broad driver/filesystem maturity.
 
 | Item | What | Status |
 |------|------|--------|
-| **Real `copy_to/from_user` uaccess** | `mm/uaccess.ad` per-task PML4-walking accessors adopted at the hot syscall sites — a bad user pointer returns `-EFAULT` instead of #PF-panicking. (`461bd27b`,`#163`) | **Partial** — vaddr≠phys decoupling (the half that unblocks full ASLR) still deferred for a serialized pass. |
+| **Real `copy_to/from_user` uaccess** | `mm/uaccess.ad` per-task PML4-walking accessors adopted across the syscall surface: hot sites (`461bd27b`) plus a full audit sweep converting the native syscall surface, `linux_abi/u_syscalls.ad`, and Plan 9 `syschan.ad` path copies (`940fb65b`,`751cade9`); marker-gated in-VM selftest probes converted handlers for `-EFAULT` on unmapped pointers and was un-masked from a cpio_init ordering bug (`4d265540`,`fb2a1d61`). (`#163`) | **Done** — gates verify vaddr≠phys translation end-to-end through converted handlers. |
 | **Linux syscall ABI completeness audit + fill** | U-series coverage sweep vs real `strace`: readlink/arch_prctl/pwrite64/pwritev/preadv/statfs/sysinfo/times/getrusage and dozens more. (`#165`,`#200`,`#203`,`#213`) | **Done** |
 | **Deep `/proc` fidelity** | Real `/proc/stat`, `/proc/PID/{stat,statm,status,io,limits,maps}` fields: utime/stime, page faults, ctx-switch counts, vsize, starttime, priority/nice, pgrp, flags, child accounting, per-task rlimits. (`#216`–`#235`) | **Done** |
 | **Pseudo-terminals (PTY)** | 16 master/slave pairs entirely in the Linux-ABI shim (`linux_abi/u_pty.ad`) with cooked/raw line discipline (ICANON/ECHO/OPOST/ONLCR) + termios + winsize, wired through real syscall dispatch for tmux/screen/sshd. (`63dbd57b`) | **Done** |
