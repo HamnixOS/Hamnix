@@ -64,8 +64,36 @@ from fs.pipe import (
     pipe_read, pipe_write, pipe_writers, pipe_readers,
     pipe_inc_reader, pipe_inc_writer,
     pipe_close_reader, pipe_close_writer,
+    pipe_readable, pipe_read_wq,
 )
-from sys.src.port9.port.devcons import devcons_read, devcons_write
+from sys.src.port9.port.devcons import (
+    devcons_read, devcons_write, devcons_read_nb, devcons_poll_readable,
+)
+# Phase 4c: the pipe blocking loops moved here from fs/vfs.ad's retired
+# FD_DEVFD_MARK arms (a devfd fd is a DEV_DEVFD inline chan now; namec's
+# _devtab arms dispatch to devfd_read_blocking / devfd_write_blocking).
+# Event-driven: a pipe-R backing sleeps on the pipe's read wait queue
+# (two-phase prepare/recheck/commit, WQ_EINTR on signal wake) — NEVER a
+# timer-tick poll-yield loop.
+from kernel.sched.core import (
+    WaitQueue, wq_wait_prepare, wq_wait_cancel, wq_wait_commit,
+    WQ_EINTR, yield_to_others,
+)
+# Phase 4c self-test plumbing (devfdchan_selftest below): the boot
+# task's fd table is uninitialised at boot:37 (same caveat devproc.ad's
+# procfd_selftest documents), so the self-test frees two high fd slots
+# via the setters before opening `#d/<N>` and restores them after.
+from kernel.sched.core import (
+    current_idx_get, FD_CLOSED_MARK,
+    task_fd_idx_at, task_fd_buf_at,
+    task_set_fd_idx_at, task_set_fd_buf_at,
+)
+from kernel.printk.printk import printk0, printk1, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+# Phase 4c self-test: pipe_alloc_chan seeds the backing pipe slot the
+# /fd binds wrap (no owning refs of its own — the binds hold them, the
+# exact ownership model the shell's pipeline wiring uses).
+from fs.pipe import pipe_alloc_chan
 # HAMSH §7: a redirect (`cmd > file`) binds an on-disk file's channel
 # at /fd/N. The backing is a tmpfs slot — tmpfs entries are GLOBAL and
 # task-independent (fs/tmpfs.ad), so the channel is addressable from
@@ -75,18 +103,12 @@ from sys.src.port9.port.devcons import devcons_read, devcons_write
 from fs.tmpfs import tmpfs_write, tmpfs_size, tmpfs_read
 
 
-# --- FD_DEVFD_MARK --------------------------------------------------
-#
-# The fd-table marker for "this integer fd is the Layer-2 mapping onto
-# an /fd/N name". fd_buf carries the fd-NUMBER N (0,1,2,...). vfs_read
-# / vfs_write on such an fd resolve the name /fd/N through the calling
-# task's Pgrp devfd table and route to the bound backing channel.
-#
-# Colocated here (next to its dispatch code) following the same
-# pattern namec.ad's FD_CHAN_MARK and 9p_client.ad's FD_P9_MARK use —
-# no kernel/sched/core.ad churn. Value sits below namec.ad's
-# FD_CHAN_MARK (0xFFFFFFE0) and clear of every FD_<NAME>_MARK.
-FD_DEVFD_MARK: uint32 = 0xFFFFFFDF
+# Phase 4c: FD_DEVFD_MARK (0xFFFFFFDF) is RETIRED. An `#d/<N>` fd is an
+# FD_CHAN_MARK fd carrying a DEV_DEVFD INLINE chan id whose wid bits
+# hold the fd-NUMBER N (namec_chan_id_devfd). The per-I/O resolution
+# below is unchanged: the BACKING channel is looked up in the calling
+# task's Pgrp devfd table at read/write time, so a child that inherits
+# the fd resolves /fd/N in ITS namespace.
 
 
 # --- backing-channel descriptor kinds -------------------------------
@@ -469,6 +491,112 @@ def devfd_write_pipe_readers(pgrp: uint64, fdnum: int32) -> int64:
     return cast[int64](pipe_readers(devfd_arg[base + cast[uint64](fdnum)]))
 
 
+# --- blocking / non-blocking / poll wrappers (Phase 4c) ---------------
+#
+# These are the fd-facing entry points namec's DEV_DEVFD arms dispatch
+# to (sys/src/9/port/namec.ad: _devtab_read / _devtab_write /
+# namec_read_nb / namec_poll_readable). They moved here verbatim from
+# fs/vfs.ad's retired FD_DEVFD_MARK arms so the blocking semantics —
+# event-driven pipe sleep, EPIPE-on-no-readers chunked write — live
+# next to the table they resolve against.
+
+def devfd_read_blocking(pgrp: uint64, fdnum: int32, buf: Ptr[uint8],
+                        count: uint64) -> int64:
+    # A pipe read end blocks until bytes arrive OR every writer has
+    # closed (EOF). Event-driven: sleep on the backing pipe's read wait
+    # queue; pipe_write / pipe_close_writer wake it; a signal wake
+    # returns WQ_EINTR. Every other backing kind (console / file) is
+    # served by the devfd_read primitive directly (devcons_read carries
+    # its own blocking semantics).
+    if devfd_slot_kind(pgrp, fdnum) == DEVFD_PIPE_R:
+        dpr_slot: int32 = devfd_slot_arg(pgrp, fdnum)
+        dwq: Ptr[WaitQueue] = pipe_read_wq(dpr_slot)
+        while True:
+            dn: int64 = devfd_read(pgrp, fdnum, buf, count)
+            if dn > 0:
+                return dn
+            if devfd_read_pipe_writers(pgrp, fdnum) == 0:
+                return 0                       # all writers gone — EOF
+            # Two-phase wait (close SMP lost-wakeup window): queue
+            # first, re-check the backing pipe while queued, cancel if
+            # a writer raced bytes in / closed, else commit to sleep.
+            wq_wait_prepare(dwq)
+            if pipe_readable(dpr_slot) != 0 \
+                    or devfd_read_pipe_writers(pgrp, fdnum) == 0:
+                wq_wait_cancel(dwq)
+                continue
+            rcd: int32 = wq_wait_commit(dwq)
+            if rcd != 0:
+                return cast[int64](WQ_EINTR)
+    return devfd_read(pgrp, fdnum, buf, count)
+
+
+def devfd_write_blocking(pgrp: uint64, fdnum: int32, buf: Ptr[uint8],
+                         count: uint64) -> int64:
+    # A pipe write end blocks-yields until the full count is enqueued;
+    # EPIPE once every reader is gone (short count if some bytes
+    # already landed). Other backings (console / file) never block at
+    # this layer — serve them via the devfd_write primitive.
+    if devfd_slot_kind(pgrp, fdnum) == DEVFD_PIPE_W:
+        total: uint64 = 0
+        while total < count:
+            if devfd_write_pipe_readers(pgrp, fdnum) == 0:
+                if total > 0:
+                    return cast[int64](total)
+                return cast[int64](-32)        # -EPIPE
+            chunk: int64 = devfd_write(pgrp, fdnum,
+                cast[Ptr[uint8]](cast[uint64](buf) + total),
+                count - total)
+            if chunk > 0:
+                total = total + cast[uint64](chunk)
+            else:
+                yield_to_others()
+        return cast[int64](total)
+    return devfd_write(pgrp, fdnum, buf, count)
+
+
+def devfd_read_nb(pgrp: uint64, fdnum: int32, buf: Ptr[uint8],
+                  count: uint64) -> int64:
+    # SYS_READ_NB on a devfd fd: >0 bytes, 0 = would-block, -1 = EOF.
+    # A CONS backing probes the console rings without parking; a pipe-R
+    # backing maps the (empty ring, no writers) state to a true EOF the
+    # way the pipe nb arm does; file backings are non-blocking already.
+    k: int32 = devfd_slot_kind(pgrp, fdnum)
+    if k == DEVFD_CONS:
+        return devcons_read_nb(buf, count)
+    if k == DEVFD_PIPE_R:
+        n_p: int64 = devfd_read(pgrp, fdnum, buf, count)
+        if n_p > 0:
+            return n_p
+        if devfd_read_pipe_writers(pgrp, fdnum) == 0:
+            return -1                          # true EOF
+        return 0                               # would-block
+    return devfd_read(pgrp, fdnum, buf, count)
+
+
+def devfd_poll_readable(pgrp: uint64, fdnum: int32) -> int32:
+    # SYS_WAITFDS readiness probe (namec_poll_readable's DEV_DEVFD arm).
+    # Non-destructive. Class contract matches namec_poll_readable:
+    #   1 = ready now; 0 = not ready but the producer is wired to
+    #   waitfds_notify() (console input wake / pipe_write / pipe
+    #   writer-close); 2 = not ready, no wake wiring (jiffy re-probe).
+    k: int32 = devfd_slot_kind(pgrp, fdnum)
+    if k == DEVFD_CONS:
+        if devcons_poll_readable() != 0:
+            return 1
+        return 0                               # console_input_wake wired
+    if k == DEVFD_PIPE_R:
+        a: int32 = devfd_slot_arg(pgrp, fdnum)
+        if pipe_readable(a) != 0:
+            return 1
+        if pipe_writers(a) == 0:
+            return 1                           # EOF is readable
+        return 0                               # pipe_write/close wired
+    # Files, write ends, unbound slots: a read returns immediately
+    # (bytes, EOF, or -EBADF) — always "ready".
+    return 1
+
+
 # --- Pgrp lifecycle hooks -------------------------------------------
 #
 # devfd_clone_row — called from chan.ad's pgrp_clone() when a Pgrp is
@@ -512,3 +640,122 @@ def devfd_free_row(pgrp: uint64):
         _devfd_release_slot(row, s)
         s = s + 1
     devfd_owner[cast[uint64](row)] = 0
+
+
+# --- Phase 4c boot self-test ----------------------------------------
+#
+# devfdchan_selftest — proves the FD_DEVFD_MARK → DEV_DEVFD inline-chan
+# fold end to end WITHOUT serial input (scripts/test_devfd_chan.sh boots
+# with stdin </dev/null and greps the [DEVFDCHAN] marker):
+#
+#   * `#d/<N>` open lands an FD_CHAN_MARK fd whose chan id is the
+#     DEV_DEVFD inline encoding of N (namec_chan_devfd_num round-trip).
+#   * write through #d/5 (pipe write-bind) → read through #d/6 (pipe
+#     read-bind) carries the payload — the namec _devtab_read/_write
+#     DEV_DEVFD arms resolve the per-Pgrp table at I/O time.
+#   * vfs_waitfds_probe(rfd) flips 1 → 0 across the drain. This is the
+#     mandated namec_poll_readable DEV_DEVFD arm: the LEGACY mark fell
+#     through to "always ready", so probe-after-drain == 0 is the
+#     regression tripwire for /fd/N polls.
+#   * vfs_lseek on a #d fd is rejected (dup-style fds have no cursor).
+#
+# pgrp_current / vfs_* / namec_chan_devfd_num are resolved BY NAME (the
+# whole-kernel Adder merge) — chan.ad, vfs.ad and namec.ad all import
+# devfd.ad, so a literal import here would cycle. Returns 1 PASS, 0
+# FAIL. PUBLIC so init/main.ad can call it.
+
+def devfdchan_selftest() -> int32:
+    pg: uint64 = pgrp_current()
+
+    # Backing pipe with NO owning refs — the two /fd binds below hold
+    # them, exactly the shell's pipeline ownership model.
+    ps: int32 = pipe_alloc_chan()
+    if ps < 0:
+        printk0("[DEVFDCHAN] FAIL pipe_alloc_chan\n")
+        return 0
+    if devfd_bind_pipe_w(pg, 5, ps) < 0 or devfd_bind_pipe_r(pg, 6, ps) < 0:
+        printk0("[DEVFDCHAN] FAIL devfd_bind\n")
+        return 0
+
+    # The boot task's fd table is uninitialised (all-zero ≠
+    # FD_CLOSED_MARK ⇒ _alloc_fd sees every slot in use): free slots
+    # 10 + 11 deterministically, restore them on the way out.
+    boot_slot: int32 = cast[int32](current_idx_get())
+    s10i: uint32 = task_fd_idx_at(boot_slot, 10)
+    s10b: uint64 = task_fd_buf_at(boot_slot, 10)
+    s11i: uint32 = task_fd_idx_at(boot_slot, 11)
+    s11b: uint64 = task_fd_buf_at(boot_slot, 11)
+    task_set_fd_idx_at(boot_slot, 10, FD_CLOSED_MARK)
+    task_set_fd_buf_at(boot_slot, 10, 0)
+    task_set_fd_idx_at(boot_slot, 11, FD_CLOSED_MARK)
+    task_set_fd_buf_at(boot_slot, 11, 0)
+
+    ok: int32 = 1
+    wfd: int32 = vfs_open("#d/5")
+    rfd: int32 = vfs_open("#d/6")
+    if wfd < 0 or rfd < 0:
+        printk1("[DEVFDCHAN] FAIL open wfd=%d\n",
+                cast[uint64](cast[uint32](wfd)))
+        ok = 0
+
+    if ok == 1:
+        # Representation check: the fd rides a DEV_DEVFD inline chan
+        # whose wid byte decodes back to the /fd number.
+        wcid: int32 = cast[int32](cast[uint32](
+            task_fd_buf_at(boot_slot, cast[uint64](wfd))))
+        rcid: int32 = cast[int32](cast[uint32](
+            task_fd_buf_at(boot_slot, cast[uint64](rfd))))
+        if namec_chan_devfd_num(wcid) != 5 or namec_chan_devfd_num(rcid) != 6:
+            printk1("[DEVFDCHAN] FAIL chan encode wcid=%x\n",
+                    cast[uint64](cast[uint32](wcid)))
+            ok = 0
+
+    if ok == 1:
+        payload: Array[16, uint8]
+        payload[0] = 104        # 'h'
+        payload[1] = 105        # 'i'
+        payload[2] = 52         # '4'
+        payload[3] = 99         # 'c'
+        wn: int64 = vfs_write(wfd, &payload[0], 4)
+        if wn != 4:
+            printk1("[DEVFDCHAN] FAIL write rc=%d\n", cast[uint64](wn))
+            ok = 0
+        if ok == 1 and vfs_waitfds_probe(rfd) != 1:
+            printk0("[DEVFDCHAN] FAIL probe!=1 with bytes queued\n")
+            ok = 0
+        if ok == 1:
+            rbuf: Array[16, uint8]
+            rn: int64 = vfs_read(rfd, &rbuf[0], 16)
+            if rn != 4 or rbuf[0] != 104 or rbuf[1] != 105 or rbuf[2] != 52 or rbuf[3] != 99:
+                printk1("[DEVFDCHAN] FAIL read rc=%d\n", cast[uint64](rn))
+                ok = 0
+        if ok == 1 and vfs_waitfds_probe(rfd) != 0:
+            # Drained + a live writer ⇒ class 0 (wired, not ready).
+            # The legacy mark regressed this to always-1.
+            printk0("[DEVFDCHAN] FAIL probe!=0 after drain\n")
+            ok = 0
+        if ok == 1 and vfs_lseek(rfd, 0, 0) >= 0:
+            printk0("[DEVFDCHAN] FAIL lseek accepted on #d fd\n")
+            ok = 0
+
+    # Teardown: close the chan fds, restore the boot task's slots,
+    # unbind /fd/5 + /fd/6 (devfd_bind DEVFD_NONE drops the pipe refs
+    # via _devfd_release_slot, freeing the pipe at 0 readers/writers).
+    if wfd >= 0:
+        vfs_close(wfd)
+    if rfd >= 0:
+        vfs_close(rfd)
+    task_set_fd_idx_at(boot_slot, 10, s10i)
+    task_set_fd_buf_at(boot_slot, 10, s10b)
+    task_set_fd_idx_at(boot_slot, 11, s11i)
+    task_set_fd_buf_at(boot_slot, 11, s11b)
+    devfd_bind(pg, 5, DEVFD_NONE, 0)
+    devfd_bind(pg, 6, DEVFD_NONE, 0)
+
+    if ok == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[DEVFDCHAN] FAIL\n")
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[DEVFDCHAN] PASS #d open/write/read/probe/lseek over DEV_DEVFD chans\n")
+    return 1
