@@ -65,12 +65,14 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
 
 set +e
-# 300s wall: the DEFAULT boot (rc.boot full + init 5 services incl. the
-# hamUId DE + VT gettys) takes anywhere from ~45s to ~160s to a live
-# serial readline under TCG + host load, and the qemu_drive FEEDER_SYNC
-# handshake only starts feeding after that. The markers gate
-# correctness; the wall is just a hang backstop.
-qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 300 \
+# 600s wall: the DEFAULT boot (rc.boot full + init 5 services incl. the
+# hamUId DE + VT gettys) has been observed to take ~45s to ~280s to a
+# live serial readline under TCG + host load, and the qemu_drive
+# FEEDER_SYNC handshake only starts feeding after that (the command
+# replay adds another ~30s of delays + TCG exec time). The markers gate
+# correctness; the wall is just a hang backstop — a healthy run exits
+# well before it.
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 600 \
     -- "/bin/echo BANNER-BB-SH" 1 \
        'enter linux { /bin/sh -c "echo BUSYBOX_SH_OK" }' 5 \
        "/bin/echo BANNER-BB-ECHO" 1 \
