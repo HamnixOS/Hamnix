@@ -323,9 +323,8 @@ device, /dev/mountrpc tripwire) judged honestly Plan 9. Gaps, ranked:
    u_pty/u_epoll/u_fuse (vfs.ad:109,328,346) and carries Linux fd-kind arms;
    arch syscall.ad/time.ad import vdso/loader. Fix: shim registers fd
    kinds/paths via init-time hook table; vdso export inverts.
-5. [x→#445] **BUG: SYS_SYMLINK==SYS_MSYNC==305** — native ln -s dead,
-   masked because the selftest calls vfs_symlink() directly. Agent
-   dispatched (renumber msync, userland symlink gate).
+5. [x] **#445 LANDED** — SYS_SYMLINK/SYS_MSYNC collision fixed (msync →
+   317; symlink + msync userland gates green). See STATUS.md.
 6. [ ] **Phase G unfinished**: 23 programs still sys_spawn (hamsh spawns
    every command via SYS_SPAWN, hamsh.ad:2910), 16 still sys_listdir, 4
    sys_kill. Fix: libc spawn() over rfork+exec, then delete the syscall.
@@ -342,20 +341,6 @@ device, /dev/mountrpc tripwire) judged honestly Plan 9. Gaps, ranked:
    chan.ad:1308 hardcodes /var/lib/distros/default.
 Also noted: MCREATE recorded-not-honored on create (chan.ad:1876);
 do_mount ignores afd / fauth unimplemented.
-
-## Native userland threading (#443, user-queued 2026-06-11)
-
-- [ ] **`lib/thread.ad`** — ergonomic native threads even though the DE
-  doesn't need them yet (user: "we definitely want to support native
-  threads in user land"). Kernel side already exists and is SMP-proven:
-  `rfork(RFPROC|RFMEM)` thread path (`sys/src/9/port/sysproc.ad:283`),
-  futex, per-CPU runqueues; musl/glibc pthreads green (u27/u28 gates).
-  Missing layer: spawn/join/mutex (+condvar/channels, Plan 9 libthread
-  flavor) for native Adder code, Plan 9-shaped sync ABI (semacquire/
-  rendezvous semantics, NOT a Linux-futex clone in the native namespace),
-  and Adder compiler atomic intrinsics (cmpxchg/xadd) — language layer,
-  per policy. Future consumer: client-side rasterization workers after
-  the #442 DE reshape.
 
 ## hamUI later phases (after Phase 4)
 
@@ -433,6 +418,16 @@ The Phase D inversion + §1..§13 critical path is **closed** (see
 STATUS.md). What remains, off the critical path and parallelisable:
 
 ### Latent crashes
+- [ ] **#439 probabilistic post-exit whole-system wedge** (`test_linux_sh`
+  red): right after a `task: pid N exited` line the guest goes totally
+  silent (no prompt, no echo, no printk) until the qemu timeout —
+  IF=0-spin shape. PRE-EXISTING: reproduces at deb3b83f (pure #439
+  branch, no #443) ~1-in-2 runs, so the #443 threading merge and #445
+  renumber are exonerated; #439's boot-CR3 reclaim guard in `task_reap`
+  is necessary but evidently not sufficient. Root-cause agent in flight
+  (2026-06-11); failure logs: /tmp/m445_test_linux_sh.log,
+  /tmp/solo_linux_sh.log, /tmp/bisect443_linux_sh.log,
+  /tmp/bisect439_rep1.log.
 - [x] `#DF` at `load_cr3+0x3` — **RESOLVED** (`557f6ee3`, see STATUS.md
   2026-06-11 wave). The kernel-half-unmapped hypothesis was disproven
   (a `[cr3-sync]` assert now guards that invariant); real causes were
