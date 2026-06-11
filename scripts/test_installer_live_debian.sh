@@ -84,13 +84,19 @@ if [ -z "$OVMF_FD" ] || [ ! -f "$OVMF_FD" ]; then
     exit 0
 fi
 
-# --- ensure the installer image exists --------------------------------
-if [ ! -f "$INSTALLER_IMG" ]; then
-    if [ "${HAMNIX_SKIP_BUILD:-0}" = "1" ]; then
+# --- ensure the installer image exists AND is fresh -------------------
+# Staleness defect (found during the #410 W^X hunt): an existing image
+# was reused as-is, so kernel changes (e.g. an aslr toggle) silently
+# never reached the guest — the gate "tested" an old kernel. Default is
+# now to REBUILD every run; HAMNIX_SKIP_BUILD=1 keeps the fast path for
+# callers that just built it.
+if [ "${HAMNIX_SKIP_BUILD:-0}" = "1" ]; then
+    if [ ! -f "$INSTALLER_IMG" ]; then
         echo "$TAG SKIP: $INSTALLER_IMG absent and HAMNIX_SKIP_BUILD=1." >&2
         exit 0
     fi
-    echo "$TAG installer image absent; building via build_installer_img.sh (~6 min)"
+else
+    echo "$TAG rebuilding installer image via build_installer_img.sh (~6 min; HAMNIX_SKIP_BUILD=1 to reuse)"
     bash "$PROJ_ROOT/scripts/build_installer_img.sh"
 fi
 if [ ! -f "$INSTALLER_IMG" ]; then
