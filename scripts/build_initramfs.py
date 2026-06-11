@@ -2853,10 +2853,21 @@ if os.environ.get("ENABLE_MENUTERM_SELFTEST") == "1":
     FILES.append(("/etc/hamui-menuterm-test", b"1\n"))
 
 
+# Live mouse-motion proof (scripts/test_hamUI_mouse_gop.sh,
+# ENABLE_MOUSETEST_SELFTEST=1). Plant /etc/hamui-mouse-test so the PROVEN
+# 2-token `hamUId daemon` autostart routes into the autoflag-50 live
+# pointer-injection self-test: the daemon pumps /dev/mouse and reports
+# "[mousetest] PASS" only when BOTH injected PS/2 relative motion (QMP
+# input-send-event rel) and usb-tablet absolute motion (QMP abs) actually
+# move CUR_X/CUR_Y. Runs once, exits 0. Test build only.
+if os.environ.get("ENABLE_MOUSETEST_SELFTEST") == "1":
+    FILES.append(("/etc/hamui-mouse-test", b"1\n"))
+
+
 # Event-driven compositor scheduling proof
 # (scripts/test_hamUI_evloop_gop.sh, ENABLE_EVLOOP_SELFTEST=1). Same shape as
 # the markers above: plant /etc/hamui-evloop-test so the PROVEN 2-token
-# `hamUId daemon` autostart routes into the autoflag-50 event-loop self-test,
+# `hamUId daemon` autostart routes into the autoflag-51 event-loop self-test,
 # which asserts evl_wait() really parks in sys_waitfds (jiffy-verified),
 # markup bodies re-rasterize ONLY on a per-layer gen change (idle frames do
 # ZERO body reads / presents), the gen-triggered present is bounded by the
@@ -3256,6 +3267,7 @@ def build_archive() -> bytes:
                                 or os.environ.get("ENABLE_SPINE_SELFTEST") == "1"
                                 or os.environ.get("ENABLE_TERM_SELFTEST") == "1"
                                 or os.environ.get("ENABLE_MENUTERM_SELFTEST") == "1"
+                                or os.environ.get("ENABLE_MOUSETEST_SELFTEST") == "1"
                                 or os.environ.get("ENABLE_EVLOOP_SELFTEST") == "1") \
                                 and ef.name == "services.d" \
                                 and sub.name == "hamde.svc":

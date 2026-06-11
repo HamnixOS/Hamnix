@@ -26,7 +26,7 @@
 # installer image with ENABLE_EVLOOP_SELFTEST=1, which makes
 # build_initramfs.py plant /etc/hamui-evloop-test (and drop hamde.svc so
 # hamUId autostarts deterministically). The PROVEN 2-token `hamUId daemon`
-# autostart finds that marker and routes into autoflag 50 ->
+# autostart finds that marker and routes into autoflag 51 ->
 # daemon_evloop_selftest, which runs inline against the SAME
 # daemon_frame()/evl_wait() code the live loop uses, then exits cleanly.
 #
@@ -184,7 +184,7 @@ assert_marker '\[evloop\] cursor_cheap_ok=1'         'a pure cursor move neither
 assert_marker '\[evloop\] PASS'                      'the full event-loop self-test ran to completion'
 
 if [ "$fail" -eq 0 ]; then
-    echo "[test_evloop_gop] capture method: builds the installer live image with the autostart evloop svc marker, boots it under a REAL EFI GOP framebuffer (OVMF/-vga std); at runlevel 5 the supervisor autostarts hamUId in autoflag-50 event-loop self-test mode, which parks in sys_waitfds (jiffy-verified), injects a hamui markup client, and proves body re-rasterizes happen ONLY on per-layer gen changes with window-rect-bounded presents"
+    echo "[test_evloop_gop] capture method: builds the installer live image with the autostart evloop svc marker, boots it under a REAL EFI GOP framebuffer (OVMF/-vga std); at runlevel 5 the supervisor autostarts hamUId in autoflag-51 event-loop self-test mode, which parks in sys_waitfds (jiffy-verified), injects a hamui markup client, and proves body re-rasterizes happen ONLY on per-layer gen changes with window-rect-bounded presents"
     echo "[test_evloop_gop] PASS"
     [ "${EVLOOP_KEEP_LOG:-0}" = "1" ] || rm -f "$LOG"
     exit 0
