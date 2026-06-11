@@ -5,11 +5,13 @@
 #
 # distrofs (user/distrofs.ad) is the userland 9P file-server that
 # backs the distro-shaped namespace. It serves from RAM tables for
-# speed, but snapshots those tables to a file on the mounted ext4
-# volume (sys_dfs_save) on every Tclunk of a written fid + at clean
-# EOF, and reloads the snapshot on startup (sys_dfs_load). The ext4
-# image is distrofs's PRIVATE backing store — not a globally-mounted
-# path; the namespace VIEW stays ephemeral, the STATE is durable.
+# speed, but snapshots those tables to "#part0/distrofs<inst>.dat" on
+# the ext4 volume — ordinary namespace file I/O plus a /dev/sync
+# durability barrier (the old SYS_DFS_LOAD/SAVE private kernel channel
+# is RETIRED) — on every Tclunk of a written fid + at clean EOF, and
+# reloads the snapshot on startup. The ext4 image is distrofs's
+# PRIVATE backing store — not a globally-mounted path; the namespace
+# VIEW stays ephemeral, the STATE is durable.
 #
 # Two-boot proof (same shape as scripts/test_ext4_fsync.sh):
 #
