@@ -53,14 +53,33 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 
 set +e
 (
-    # Pacing mirrors test_p9mount.sh: let the kernel finish boot
-    # (smoke tests + sched_init) before hamsh starts reading stdin.
-    sleep 3
+    # Marker-gated feeder (same proven shape as test_distrofs_persist.sh /
+    # test_9p_concurrency.sh): a freshly-booted hamsh sometimes drops the
+    # FIRST serial command line (it never echoes), and fixed sleeps race a
+    # slowing boot. Gate on the shell-ready marker, then RE-SEND the
+    # command until its echo shows up in the log — keyed on the echo
+    # (immediate on receipt), NOT the fixture marker, so a slow but
+    # received run is never double-driven.
+    for _ in $(seq 1 40); do
+        grep -q "loop-enter" "$LOG" 2>/dev/null && break
+        sleep 0.5
+    done
+    sleep 1
     printf '/bin/test_ns_isolation\n'
-    sleep 4
+    for _ in $(seq 1 10); do
+        sleep 1.5
+        grep -q "bin/test_ns_isolation" "$LOG" 2>/dev/null && break
+        printf '/bin/test_ns_isolation\n'
+    done
+    # Wait for the fixture to finish (PASS or a FAIL line), then exit.
+    for _ in $(seq 1 40); do
+        grep -Eq '\[ns_isolation\] (PASS|FAIL)' "$LOG" 2>/dev/null && break
+        sleep 0.5
+    done
+    sleep 1
     printf 'exit\n'
     sleep 1
-) | timeout 25s qemu-system-x86_64 \
+) | timeout 90s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
