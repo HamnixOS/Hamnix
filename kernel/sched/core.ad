@@ -775,9 +775,9 @@ STATE_WAIT: uint64 = 6
 # missing fds) could be dispatched mid-construction.
 STATE_EMBRYO: uint64 = 7
 
-# Per-task kernel stack. 32 KiB (8 pages, buddy order 3). The deepest
-# in-kernel call chain is NOT a single 4 KiB page — two distinct chains
-# have overrun smaller stacks:
+# Per-task kernel stack. 64 KiB (16 pages, buddy order 4). The deepest
+# in-kernel call chain is NOT a single 4 KiB page — three distinct
+# chains have overrun smaller stacks:
 #
 #   * The TLS 1.3 handshake (drivers/net/tls.ad: X25519 + AES-256 key
 #     schedule + SHA-256 + certificate-chain parsing + HKDF + transcript
@@ -797,14 +797,32 @@ STATE_EMBRYO: uint64 = 7
 #     dispatched. That intermittent (~50%) spawn crash is why 16 KiB was
 #     not enough; 32 KiB clears the deepest fork chain with headroom.
 #
+#   * The #410 live-root bringup (vfs_write -> loopctl_write ->
+#     loop_sqfs_live_root -> sqfs stream -> ext4_init ->
+#     _try_parse_hamnix_roots with ~5 KiB of parse locals) overran the
+#     32 KiB kstack. The dominant cost is NOT the leaf chain: Adder's
+#     codegen gives EVERY local in a function a distinct frame slot, so
+#     do_syscall's giant dispatch body (4x 4 KiB bounce buffers + dozens
+#     of path/stat staging arrays across its case arms) is a single
+#     0x6e10-byte (28 KiB) frame that is live across EVERY syscall —
+#     leaving ~4 KiB of real budget on a 32 KiB stack. Observed exactly
+#     like the fork-chain overrun: intermittent (~2/3) corruption of
+#     whatever buddy block sits below the kstack (a cracked PT page ->
+#     "kstack page not present" #PF at the vfs_write epilogue; live data
+#     -> [stack-smash] canary mismatch in a high frame). 64 KiB restores
+#     ~36 KiB of callee headroom. The real waste — the dispatcher frame
+#     — wants either compiler stack-slot reuse for disjoint case arms or
+#     hoisting the Array-heavy syscall bodies into helper functions;
+#     tracked as a follow-up, the sizing here must still cover it today.
+#
 # Because create_user_thread allocates the kstack immediately above the
 # task's user stack, an overflow also silently corrupts the user stack
 # (smashing a saved return address -> ring-3 #UD at a bogus rip). Both
 # failure modes are the same root cause: too little kstack. KSTACK_ORDER
 # is the buddy-allocator order matching KSTACK_SIZE; keep them in sync
 # (2^KSTACK_ORDER * 4096 == KSTACK_SIZE).
-KSTACK_SIZE:  uint64 = 32768
-KSTACK_ORDER: int32  = 3
+KSTACK_SIZE:  uint64 = 65536
+KSTACK_ORDER: int32  = 4
 USTACK_SIZE: uint64 = 4096
 
 # Boot-GDT selectors (matches arch/x86/boot/header.S).
@@ -2528,7 +2546,7 @@ def create_user_thread(entry: uint64, name0: uint64,
         printk0("create_user_task: no free task slot\n")
         return -1
 
-    # KSTACK_SIZE (16 KiB) worth of pages — a single page is too small
+    # KSTACK_SIZE worth of pages — a single page is too small
     # for the TLS 1.3 handshake's call depth, and the overflow would
     # corrupt the user stack allocated just below it (see KSTACK_SIZE).
     kstack: uint64 = alloc_pages(KSTACK_ORDER)
@@ -5923,15 +5941,27 @@ def waitfds_wq_ptr() -> Ptr[WaitQueue]:
 
 # --- console input grab (P0b) ---------------------------------------
 #
-# A userland compositor (hamUId) GRABs the physical console input
-# (PS/2 keyboard + UART RX) while the graphical session is up, so the
+# A userland compositor (hamUId) GRABs the LOCAL console input — the
+# physical PS/2 keyboard — while the graphical session is up, so the
 # boot/login hamsh that shares /dev/cons cannot race it for keystrokes.
-# While grabbed, ONLY the grabbing pid may pop a physical input byte
-# (devcons_read / devcons_read_nb consult console_input_grabbed_by()).
-# Any other reader is treated as if no byte were available — its
+# While grabbed, ONLY the grabbing pid may pop a keyboard byte
+# (devcons_read / devcons_read_nb consult the predicates below). Any
+# other reader is treated as if no keyboard byte were available — its
 # blocking read parks on console_wq, its non-blocking read returns
 # "would block". The wsys cmd-injection queue is NOT gated (so `echo >
 # /dev/wsys/<wid>/cmd` still works for every window). 0 == ungrabbed.
+#
+# The UART is NOT part of the grab: the serial line is a SEPARATE
+# terminal from the local keyboard+framebuffer console (exactly like
+# ttyS0 vs tty1+X on Linux, or a second #t line on Plan 9). While a
+# compositor holds the grab, UART RX bytes belong to the serial-console
+# shell — the holder must NOT pop them, or a desktop event loop that
+# drains /dev/cons every frame eats the serial user's keystrokes and
+# the serial session goes dead (hit by the #410 live-Debian gate: the
+# DE starved the serial hamsh of the `enter linux { dpkg }` command).
+# So the grab PARTITIONS physical input: holder gets the keyboard,
+# everyone else keeps the serial line. Ungrabbed, both rings stay
+# first-come-first-served as before.
 console_input_grab_pid: uint64 = 0
 
 
@@ -5957,15 +5987,28 @@ def console_input_grabbed_by() -> uint64:
     return console_input_grab_pid
 
 
-def console_input_may_pop_current() -> int32:
-    # 1 iff the CURRENT task is allowed to pop a PHYSICAL console-input
-    # byte right now: either the console is ungrabbed, or the current
-    # task IS the grab holder.
+def console_input_may_pop_kbd_current() -> int32:
+    # 1 iff the CURRENT task may pop a PHYSICAL KEYBOARD byte right
+    # now: either the console is ungrabbed, or the current task IS the
+    # grab holder (the compositor owns the local keyboard).
     if console_input_grab_pid == 0:
         return 1
     if current_task_pid() == console_input_grab_pid:
         return 1
     return 0
+
+
+def console_input_may_pop_uart_current() -> int32:
+    # 1 iff the CURRENT task may pop a UART RX (serial line) byte right
+    # now. The serial line is its own terminal: ungrabbed it is
+    # first-come-first-served, but while a compositor holds the grab
+    # the HOLDER is excluded — serial bytes are reserved for the
+    # serial-console shell (see the partition comment above).
+    if console_input_grab_pid == 0:
+        return 1
+    if current_task_pid() == console_input_grab_pid:
+        return 0
+    return 1
 
 
 def console_wq_sleep() -> int32:

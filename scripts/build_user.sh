@@ -236,6 +236,7 @@ build_adder_user haminstall           # installer: one-shot on-target install (G
 build_adder_user install              # installer: interactive `install` (disk picker + confirm) + --auto; Debian-style hpm package root install
 build_adder_user losetup              # attach/detach a file as a loop block device via /dev/loop/ctl
 build_adder_user sqfs_to_blk          # installer: stream a file from an in-RAM squashfs -> block dev (no media read)
+build_adder_user live_distro_up       # live medium: extract live-distro.ext4 from the in-RAM squashfs -> RAM blockdev, post #distro (#410)
 
 # --- X11 server + client (user/x11/ subdirectory) -------------------
 # The source lives in user/x11/<name>.ad but the ELF goes into

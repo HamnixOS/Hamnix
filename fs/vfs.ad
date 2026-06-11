@@ -50,7 +50,7 @@ from kernel.sched.core import (
     FD_SOCKET_MARK,
     close_fd_in_task, copy_fd_entry, yield_to_others,
     console_wq_sleep, wq_sleep_interruptible, WaitQueue, wq_init,
-    console_input_may_pop_current,
+    console_input_may_pop_kbd_current, console_input_may_pop_uart_current,
     wq_wake_all, wq_wake_one, WQ_EINTR, WQ_TIMEOUT,
     wq_wait_prepare, wq_wait_cancel, wq_wait_commit,
     wq_wait_commit_timeout, waitfds_wq_ptr,
@@ -4194,8 +4194,30 @@ def vfs_fd_inode(fd: int32) -> uint64:
     # import list stable.
     if cast[uint64](fi) < cast[uint64](0xFE000000):
         return cast[uint64](fi) + 1
-    # Special-backed fd: combine the marker with fd_buf (backing slot
-    # or buffer address) so distinct tmpfs/ext4/... files get distinct
+    # fd→Chan fold: ext4 / tmpfs file fds are FD_CHAN_MARK fds whose
+    # fd_buf holds the CHAN ID — a pool slot that is RECYCLED on close.
+    # Keying st_ino off it broke ld.so on the ext4-backed Debian root
+    # (#410): libmd.so.0 was opened/mmapped/closed, then libselinux.so.1
+    # reused the same chan id, fstat returned the SAME (dev,ino), and
+    # _dl_map_object_from_fd aliased libselinux to the already-loaded
+    # libmd ("version 'LIBSELINUX_1.0' not found ... libmd.so.0").
+    # Resolve the STABLE backing identity instead — the same one
+    # vfs_fd_backing_info hands to file-backed mmap:
+    #   * ext4  → the on-disk inum (distinct tag 0x41..).
+    #   * tmpfs → the tmpfs slot, stable for the file's lifetime
+    #     (distinct tag 0x42..).
+    if fi == FD_CHAN_MARK:
+        chdt: int32 = namec_chan_dev_type(_fd_chan_id(task, fdu))
+        if chdt == DEV_EXT4_FILE:
+            eslot: int32 = namec_chan_back_slot(_fd_chan_id(task, fdu))
+            return cast[uint64](0x4100000000000000) \
+                   | cast[uint64](ext4_open_inum(eslot))
+        if chdt == DEV_TMPFS_FILE:
+            tslot: int32 = namec_chan_back_slot(_fd_chan_id(task, fdu))
+            return cast[uint64](0x4200000000000000) \
+                   | cast[uint64](cast[uint32](tslot))
+    # Other special-backed fd kinds: combine the marker with fd_buf
+    # (backing slot or buffer address) so distinct files get distinct
     # inodes. The 0x4000_0000_0000_0000 bit keeps the whole value out
     # of the initramfs index range.
     return cast[uint64](0x4000000000000000) \
@@ -5295,22 +5317,24 @@ def vfs_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # keyboard input works.
         console_set_interactive()
         # P0b: while a compositor (hamUId) holds the console-input grab,
-        # ONLY the grab holder may pop physical keyboard/UART bytes. The
-        # boot/login hamsh that shares the serial console reads stdin via
-        # THIS FD_STDIN_MARK arm, so without this gate it races the DE for
-        # every UART byte — the user's keystrokes mostly land in the serial
-        # shell (and get echoed to serial) instead of the focused DE
-        # terminal. Mirrors devcons_read_nb: a non-holder still drains its
-        # own wsys cmd-injection queue, never the shared kbd/uart rings.
-        may_phys: int32 = console_input_may_pop_current()
+        # the grab PARTITIONS physical input (see kernel/sched/core.ad):
+        # the holder owns the PS/2 keyboard ring, every other reader
+        # keeps the UART. The boot/login hamsh that shares the serial
+        # console reads stdin via THIS FD_STDIN_MARK arm — without the
+        # kbd gate it would race the DE for keystrokes typed at the
+        # desktop, and without the uart EXEMPTION the DE's per-frame
+        # /dev/cons drain would starve the serial session entirely
+        # (#410 live-Debian gate). Mirrors devcons_read_nb.
+        may_kbd: int32 = console_input_may_pop_kbd_current()
+        may_uart: int32 = console_input_may_pop_uart_current()
         # hamUI Phase 1: prefer the wsys cmd-injection queue. An
         # outside agent writing `echo foo > /dev/wsys/1/cmd` queues
         # bytes here that hamsh's ed_readline drains exactly as it
         # would real keystrokes — no shell-side change required.
         c: int32 = wsys_cmd_pop()
-        if c < 0 and may_phys != 0:
+        if c < 0 and may_kbd != 0:
             c = kbd_rx_pop()
-        if c < 0 and may_phys != 0:
+        if c < 0 and may_uart != 0:
             c = uart_rx_pop()
         if c < 0:
             return 0                            # would-block
@@ -5730,20 +5754,22 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # printk chatter stops corrupting the line the user types.
         # console_set_interactive() is idempotent and cheap.
         console_set_interactive()
-        # P0b: same console-input grab gate as devcons_read / the non-
-        # blocking stdin arm. While the DE holds the grab, a non-holder
-        # (the boot/login hamsh on the serial console) must NOT pop the
-        # shared kbd/UART rings — otherwise it races the compositor for
-        # the user's keystrokes and they end up echoed in the serial
-        # shell instead of the focused DE terminal. A non-holder still
-        # drains its own wsys cmd-injection queue; with no physical byte
-        # available it parks on console_wq below until the grab releases
-        # or a cmd is injected.
+        # P0b: same console-input grab PARTITION as devcons_read / the
+        # non-blocking stdin arm (see kernel/sched/core.ad). While the
+        # DE holds the grab, a non-holder (the boot/login hamsh on the
+        # serial console) must NOT pop the keyboard ring — otherwise it
+        # races the compositor for keystrokes typed at the desktop —
+        # but it KEEPS the UART ring: the serial line is its own
+        # terminal, and gating it under the grab starved the serial
+        # session dead while the DE was up (#410 live-Debian gate). A
+        # non-holder with no poppable byte parks on console_wq below
+        # until a serial byte / cmd injection / grab release wakes it.
         n: uint64 = 0
         while n < count:
             # Re-evaluate the grab each iteration so a release (DE exit)
             # is picked up by a parked reader on its next wake.
-            may_phys: int32 = console_input_may_pop_current()
+            may_kbd: int32 = console_input_may_pop_kbd_current()
+            may_uart: int32 = console_input_may_pop_uart_current()
             # M16.75: check the PS/2 keyboard FIFO first, then UART.
             # Either input source feeds stdin transparently — useful
             # for real-hardware boot where the user is typing on a
@@ -5754,9 +5780,9 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
             # arm is the legacy stdin path that hamsh still uses for
             # the blocking-read case.
             c: int32 = wsys_cmd_pop()
-            if c < 0 and may_phys != 0:
+            if c < 0 and may_kbd != 0:
                 c = kbd_rx_pop()
-            if c < 0 and may_phys != 0:
+            if c < 0 and may_uart != 0:
                 c = uart_rx_pop()
             if c < 0:
                 # Event-driven block: sleep on the console input wait queue
