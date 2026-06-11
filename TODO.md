@@ -151,6 +151,25 @@ replaces the ~70 `is_*_path` backend-selection branches).
    NEXT increments: extract a real terminal as a separate-process client;
    port the session→WM→panel split so apps are launched/focus-managed
    like mate-panel/marco rather than hand-drawn in the monolith.
+
+   **Increment 2 LANDED + VM-VERIFIED (`9dc4716c`, pushed).** A real
+   terminal (`user/hamterm.ad`) now runs as its OWN compositor-spawned
+   process: it self-discovers its wid via `/dev/wsys/self`, binds with
+   `hamui_window_on`, seeds keyboard focus on its command entry, and runs
+   real `/bin/hamsh` commands whose output renders live in the window —
+   proven on a REAL EFI GOP framebuffer by
+   `scripts/test_hamUI_termspine_gop.sh` (PASS). Both root causes hold for
+   the terminal too: opening it damages only its own rect (no full-screen
+   recomposite), and a focus-gated command crosses into the separate
+   process WITHOUT leaking keystrokes to the `/dev/cons` shell. A first
+   attempt failed its GOP gate because the self-test's markup-detect step
+   spun up to 400 full-screen composites (blowing the 240s budget); the
+   markup path itself was fine — fixed by waiting on a cheap
+   `markup_client_probe()` (one `open()` of the layer) then presenting
+   once. hamterm is still ONE-SHOT run-capture, not a persistent PTY
+   (the honest remaining gap). NEXT: unify the other "Terminal" launchers
+   (Applications-menu, panel) onto `daemon_spawn_terminal`; persistent
+   PTY/job-control/ANSI; then the session→WM→panel component split.
 4. [ ] **Basic apps on the toolkit** (after #2 API is stable) — terminal,
    text editor, file browser, plus games Snake + 2048. These validate the
    toolkit is genuinely app-grade, and seed the DE app suite.
