@@ -4433,18 +4433,38 @@ def task_pml4(slot: int32) -> uint64:
 
 def set_task_cr3(slot: int32, cr3: uint64):
     # Point a task at an existing PML4. Used by the CLONE_VM thread
-    # path in do_clone: a pthread shares its creator's address space,
-    # so it must run on the SAME page table — otherwise per-task
-    # page-table overlays (e.g. mm/vma.ad's multi-chunk VMA backing,
-    # which mmaps the 8 MiB glibc thread stack as several buddy chunks
-    # stitched together by elf_install_user_mapping) are invisible to
-    # the thread and it faults on its own stack. Sharing the PML4 is
-    # safe: task_reap never frees a task's cr3 page, so there is no
-    # double-free / use-after-free when the thread and its creator
-    # exit independently. The freshly-cloned PML4 create_user_thread
-    # allocated is simply abandoned (the same leak task_reap already
-    # tolerates for kstack/ustack).
-    task_table[cast[uint64](slot)].cr3 = cr3
+    # path in do_clone and by _rfork_thread (RFMEM): a thread shares
+    # its creator's address space, so it must run on the SAME page
+    # table — otherwise per-task page-table overlays (e.g. mm/vma.ad's
+    # multi-chunk VMA backing, which mmaps the 8 MiB glibc thread stack
+    # as several buddy chunks stitched together by
+    # elf_install_user_mapping) are invisible to the thread and it
+    # faults on its own stack.
+    #
+    # Sharing the PML4 is safe because task_reap's shared-address-space
+    # guard tears the mm down only when the LAST non-FREE slot
+    # referencing the cr3 is reaped — no double-free / use-after-free
+    # whatever order the thread and its creator exit in. (The old
+    # safety story here — "task_reap never frees a task's cr3 page" —
+    # stopped being true when reap-time resource reclaim landed; that
+    # stale invariant was exactly the latent load_cr3+0x3 #DF.)
+    #
+    # The freshly-cloned PML4 create_user_thread allocated for this
+    # slot is released here rather than leaked: at this point it is a
+    # verbatim memcpy of the pristine boot PML4 — the thread's stack is
+    # caller-supplied and no ELF was loaded into the slot, so no
+    # user-half cracking has hung private sub-tables off it; the bare
+    # page is the only thing to free. Guards keep this a no-op if the
+    # slot somehow already points at the target, the boot snapshot, or
+    # the BSP kernel PML4.
+    su: uint64 = cast[uint64](slot)
+    old_pml4: uint64 = task_table[su].cr3 & 0x000FFFFFFFFFF000
+    new_pml4: uint64 = cr3 & 0x000FFFFFFFFFF000
+    if old_pml4 != 0 and old_pml4 != new_pml4 \
+            and old_pml4 != (cow_boot_cr3() & 0x000FFFFFFFFFF000) \
+            and old_pml4 != (get_bsp_cr3() & 0x000FFFFFFFFFF000):
+        free_page(old_pml4)
+    task_table[su].cr3 = cr3
 
 
 def task_kstack_top(slot: int32) -> uint64:
@@ -4582,6 +4602,26 @@ def _free_task_user_pagetables(su: uint64):
     _ftp_live_cr3: uint64 = read_cr3()
     _ftp_irq: uint64 = local_irq_save()
     load_cr3(boot_cr3)
+    # [cr3-sync] structural assert: a per-task PML4's KERNEL half
+    # (slots 256..511) must still be ENTRY-IDENTICAL to the pristine
+    # boot PML4 — task PML4s are memcpy-cloned from it at creation and
+    # no path may crack or add a kernel-half PML4 entry per-task
+    # (module_map and the MMIO-UC splits mutate the SHARED lower-level
+    # PDPT/PD pages, never a PML4 slot, so they propagate to every
+    # clone). Divergence means some new code built a kernel-half entry
+    # behind the clones' back — the classic Linux vmalloc_fault bug
+    # shape: every OTHER task's PML4 (and every future clone) lacks the
+    # entry, and the first load_cr3 into one of those #DFs on the
+    # unmapped fetch of load_cr3's `ret`. Make it loud the moment it
+    # happens instead of crashing later.
+    ksync: uint64 = 256
+    while ksync < 512:
+        if pml4[ksync] != bpml4[ksync]:
+            printk2("[cr3-sync] WARNING: task PML4 kernel-half slot %d diverges from boot (entry=%p)\n",
+                    ksync, pml4[ksync])
+            ksync = 512
+        else:
+            ksync = ksync + 1
     li: uint64 = 0
     while li < 256:
         e: uint64 = pml4[li]
@@ -4657,6 +4697,163 @@ def task_reap(slot: int32):
             task_table[psr].cstime_ticks = task_table[psr].cstime_ticks + task_table[su].stime_ticks + task_table[su].cstime_ticks
             task_table[psr].cminflt      = task_table[psr].cminflt + task_table[su].minflt + task_table[su].cminflt
             task_table[psr].cmajflt      = task_table[psr].cmajflt + task_table[su].majflt + task_table[su].cmajflt
+    # SHARED-ADDRESS-SPACE GUARD — root-cause fix for the latent #DF at
+    # load_cr3+0x3 ("freshly-built CR3's kernel half unmapped", trap rsp
+    # in low memory, fires after suite PASS markers).
+    #
+    # CLONE_VM | CLONE_THREAD threads (do_clone) and rfork RFMEM threads
+    # (_rfork_thread) run on the CREATOR's PML4 — set_task_cr3 points
+    # the thread's cr3 at the SAME physical page. The reclaim arms below
+    # (vma_clear, brk-reserve free, _free_task_user_pagetables,
+    # free_page(cr3)) were written for the one-task-one-mm case and tore
+    # the SHARED address space down while other members still ran on it:
+    #
+    #   * Reaping a multithreaded process's LEADER (exit_group does not
+    #     terminate its threads) freed the live PML4 + user page tables
+    #     + heap + thread stacks out from under the still-running
+    #     threads. The buddy allocator re-issued the PML4 page, a later
+    #     allocation scribbled it, and the next dispatch of a surviving
+    #     thread did load_cr3(<scribbled page>): the instruction fetch
+    #     of load_cr3's own `ret` (kernel text) no longer resolved, the
+    #     #PF handler was unreachable through the same garbage tables,
+    #     and the CPU raised #DF at load_cr3+0x3.
+    #   * Reaping BOTH a thread and its creator double-freed the shared
+    #     PML4 page — buddy free-list corruption that hands the same
+    #     page to two owners, so some future task's freshly-built CR3
+    #     gets scribbled by its co-owner: same #DF, deferred.
+    #
+    # Invariant enforced here: the address space is torn down EXACTLY
+    # ONCE, by the LAST non-FREE task slot referencing its cr3. If any
+    # other slot still shares this cr3 we transfer the owner-only
+    # bookkeeping (image/interp/ustack phys runs, brk cursors, VMA list)
+    # to that survivor and skip every address-space arm below; the
+    # survivor's own reap repeats this scan and frees only when it is
+    # genuinely last. (A LIVE survivor is preferred as heir — it will be
+    # reaped through this same chokepoint later; an EXITED zombie sharer
+    # still blocks the free, because reaping IT later must not find a
+    # stale cr3 pointing at a recycled page.)
+    my_mm: uint64 = task_table[su].cr3 & 0x000FFFFFFFFFF000
+    # Thread-group ZOMBIE sweep. An EXITED sharer of this mm whose own
+    # parent is (a) gone or (b) a member of this same thread group is a
+    # CLONE_THREAD / RFMEM sibling no live task can ever wait() on —
+    # Linux self-reaps such threads at exit; Hamnix folds their reap in
+    # here at the group's reap chokepoint. Without this, a joined-and-
+    # exited pthread's zombie slot would (post-guard, below) pin the
+    # shared address space forever AND leak its task slot — the
+    # pre-existing thread-slot zombie leak, now closed. A zombie whose
+    # parent is alive OUTSIDE the group (e.g. the group LEADER, whose
+    # parent is the shell) is left alone: that parent's waitpid owns it.
+    if my_mm != 0:
+        zj: uint64 = 0
+        while zj < NTASKS:
+            if zj != su and task_table[zj].state == STATE_EXITED \
+                    and (task_table[zj].cr3 & 0x000FFFFFFFFFF000) == my_mm:
+                zswp: int32 = 0
+                zp: int32 = task_lookup_by_pid(task_table[zj].parent_pid)
+                if zp < 0:
+                    zswp = 1            # orphan: nobody can ever reap it
+                elif (task_table[cast[uint64](zp)].cr3 & 0x000FFFFFFFFFF000) == my_mm:
+                    zswp = 1            # parent is in this thread group
+                if zswp != 0:
+                    zu: uint64 = zj
+                    # Owner bookkeeping a zombie may hold (it can have
+                    # inherited it through an earlier deferred reap):
+                    # pull it onto su so the teardown below sees it.
+                    if task_table[zu].image_phys != 0 \
+                            and task_table[su].image_phys == 0:
+                        task_table[su].image_phys    = task_table[zu].image_phys
+                        task_table[su].image_phys_sz = task_table[zu].image_phys_sz
+                    if task_table[zu].interp_phys != 0 \
+                            and task_table[su].interp_phys == 0:
+                        task_table[su].interp_phys    = task_table[zu].interp_phys
+                        task_table[su].interp_phys_sz = task_table[zu].interp_phys_sz
+                    if task_table[zu].ustack_phys != 0 \
+                            and task_table[su].ustack_phys == 0:
+                        task_table[su].ustack_phys    = task_table[zu].ustack_phys
+                        task_table[su].ustack_phys_sz = task_table[zu].ustack_phys_sz
+                    if task_table[zu].brk_base != 0 \
+                            and task_table[su].brk_base == 0:
+                        task_table[su].brk_base = task_table[zu].brk_base
+                        task_table[su].brk_end  = task_table[zu].brk_end
+                        task_table[su].brk_max  = task_table[zu].brk_max
+                    vma_adopt(zu, su)
+                    task_table[zu].image_phys     = 0
+                    task_table[zu].image_phys_sz  = 0
+                    task_table[zu].interp_phys    = 0
+                    task_table[zu].interp_phys_sz = 0
+                    task_table[zu].ustack_phys    = 0
+                    task_table[zu].ustack_phys_sz = 0
+                    task_table[zu].brk_base = 0
+                    task_table[zu].brk_end  = 0
+                    task_table[zu].brk_max  = 0
+                    task_table[zu].cr3 = 0
+                    # Slot-private resources: the thread's kstack, and
+                    # its own-allocated user stack page if any (caller-
+                    # supplied-stack threads have ustack_base == 0).
+                    if task_table[zu].is_user != 0 \
+                            and task_table[zu].kstack_base != 0:
+                        free_pages(task_table[zu].kstack_base, KSTACK_ORDER)
+                        task_table[zu].kstack_base = 0
+                    if task_table[zu].ustack_base != 0:
+                        free_page(task_table[zu].ustack_base)
+                        task_table[zu].ustack_base = 0
+                    nr_tasks_reaped = nr_tasks_reaped + 1
+                    task_table[zu].state = STATE_FREE
+            zj = zj + 1
+    mm_heir: int32 = -1
+    mm_heir_live: int32 = 0
+    if my_mm != 0:
+        hj: uint64 = 0
+        while hj < NTASKS:
+            if hj != su and task_table[hj].state != STATE_FREE \
+                    and (task_table[hj].cr3 & 0x000FFFFFFFFFF000) == my_mm:
+                if task_table[hj].state != STATE_EXITED:
+                    if mm_heir_live == 0:
+                        mm_heir = cast[int32](hj)
+                        mm_heir_live = 1
+                elif mm_heir < 0:
+                    mm_heir = cast[int32](hj)
+            hj = hj + 1
+    if my_mm != 0:
+        printk2("[tlx-dbg] reap slot=%d heir=%d\n",
+                su, cast[uint64](cast[int64](mm_heir)))
+    if mm_heir >= 0:
+        hu: uint64 = cast[uint64](mm_heir)
+        # Hand the owner-only reclaim bookkeeping to the heir so the
+        # final reap returns everything once. The heir is a thread-group
+        # sibling: its own owner fields are 0 (threads never own the
+        # image/interp/spawn-stack) except the brk cursors, which it
+        # already carries with identical values — the guards keep this
+        # idempotent either way.
+        if task_table[su].image_phys != 0 and task_table[hu].image_phys == 0:
+            task_table[hu].image_phys    = task_table[su].image_phys
+            task_table[hu].image_phys_sz = task_table[su].image_phys_sz
+        if task_table[su].interp_phys != 0 \
+                and task_table[hu].interp_phys == 0:
+            task_table[hu].interp_phys    = task_table[su].interp_phys
+            task_table[hu].interp_phys_sz = task_table[su].interp_phys_sz
+        if task_table[su].ustack_phys != 0 \
+                and task_table[hu].ustack_phys == 0:
+            task_table[hu].ustack_phys    = task_table[su].ustack_phys
+            task_table[hu].ustack_phys_sz = task_table[su].ustack_phys_sz
+        if task_table[su].brk_base != 0 and task_table[hu].brk_base == 0:
+            task_table[hu].brk_base = task_table[su].brk_base
+            task_table[hu].brk_end  = task_table[su].brk_end
+            task_table[hu].brk_max  = task_table[su].brk_max
+        vma_adopt(su, hu)
+        # Zero this slot's references: every address-space arm below is
+        # now a structural no-op for this reap, while the slot-private
+        # arms (kstack, thread-allocated ustack_base page) still run.
+        task_table[su].image_phys     = 0
+        task_table[su].image_phys_sz  = 0
+        task_table[su].interp_phys    = 0
+        task_table[su].interp_phys_sz = 0
+        task_table[su].ustack_phys    = 0
+        task_table[su].ustack_phys_sz = 0
+        task_table[su].brk_base = 0
+        task_table[su].brk_end  = 0
+        task_table[su].brk_max  = 0
+        task_table[su].cr3 = 0
     # 0. mmap-backed VMAs (anonymous + file-backed). A DYNAMIC binary's
     #    ld.so mmaps each DT_NEEDED DSO (libc.so.6 ~2 MiB, etc.) via
     #    SYS_mmap -> vma_alloc, which EAGERLY alloc_pages the backing.
@@ -4731,9 +4928,20 @@ def task_reap(slot: int32):
         task_table[su].interp_phys    = 0
         task_table[su].interp_phys_sz = 0
     # 3. Private user-half page tables (PDPT/PD/PT), then the PML4 page.
+    #    (Skipped via cr3==0 when the shared-mm guard above found a
+    #    surviving thread-group sharer — the heir's final reap frees.)
     if task_table[su].cr3 != 0:
         _free_task_user_pagetables(su)
-        free_page(task_table[su].cr3 & 0x000FFFFFFFFFF000)
+        pml4_pg: uint64 = task_table[su].cr3 & 0x000FFFFFFFFFF000
+        # Defence-in-depth: never hand the pristine boot snapshot or
+        # the live BSP kernel PML4 to the buddy allocator, whatever the
+        # slot bookkeeping says (kthreads carry cr3 == get_bsp_cr3();
+        # freeing THAT page would scribble the kernel address space for
+        # every CPU). A user task's cr3 is always a private clone, so
+        # this guard never fires on the normal path.
+        if pml4_pg != (cow_boot_cr3() & 0x000FFFFFFFFFF000) \
+                and pml4_pg != (get_bsp_cr3() & 0x000FFFFFFFFFF000):
+            free_page(pml4_pg)
         task_table[su].cr3 = 0
     # 4. Kernel stack (user-task kstacks come from alloc_pages; kthread
     #    kstacks come from memblock and have is_user==0 — skip those).
