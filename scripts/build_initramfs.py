@@ -2830,6 +2830,19 @@ if os.environ.get("ENABLE_TERM_SELFTEST") == "1":
     FILES.append(("/etc/hamui-term-test", b"1\n"))
 
 
+# Increment-3a (MATE-mirror DE rewrite) MENU-TERMINAL proof
+# (scripts/test_hamUI_menuterm_gop.sh, ENABLE_MENUTERM_SELFTEST=1). Same shape
+# as the term marker above: plant /etc/hamui-menuterm-test so the PROVEN
+# 2-token `hamUId daemon` autostart routes into the autoflag-49 menu-Terminal
+# self-test, which drives the Applications-menu "Terminal" entry's real
+# dispatch (menu_launch(0, ...)) and asserts it spawns /bin/hamterm as a
+# SEPARATE process (wid + stdout pipe + auto-detected hamui markup), NOT the
+# dormant in-daemon APP_TERM hand-drawn grid. Runs once, exits 0
+# (restart:on-failure won't relaunch). Test build only.
+if os.environ.get("ENABLE_MENUTERM_SELFTEST") == "1":
+    FILES.append(("/etc/hamui-menuterm-test", b"1\n"))
+
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
@@ -3217,7 +3230,8 @@ def build_archive() -> bytes:
                         # deterministically.
                         if (os.environ.get("ENABLE_MKC_SELFTEST") == "1"
                                 or os.environ.get("ENABLE_SPINE_SELFTEST") == "1"
-                                or os.environ.get("ENABLE_TERM_SELFTEST") == "1") \
+                                or os.environ.get("ENABLE_TERM_SELFTEST") == "1"
+                                or os.environ.get("ENABLE_MENUTERM_SELFTEST") == "1") \
                                 and ef.name == "services.d" \
                                 and sub.name == "hamde.svc":
                             print("  [selftest] skipping "
