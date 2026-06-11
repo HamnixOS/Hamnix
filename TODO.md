@@ -332,9 +332,10 @@ device, /dev/mountrpc tripwire) judged honestly Plan 9. Gaps, ranked:
    net/epoll-family/ptmx/fuse still mark-based; pipes = highest-leverage
    next fold (9p_client special-cases pipe slots). NR_FDS=16 per task will
    pinch real Debian userland.
-8. [ ] **9P depth**: client is synchronous (1 outstanding tag), no
-   Tauth/Tflush; distrofs (flagship userland server) persists via private
-   kernel syscalls SYS_DFS_LOAD/SAVE — give it a real file/#b backing.
+8. [x] **#451 LANDED** — 9P depth: tagged-concurrency client (6-slot RPC
+   pool, Tflush-on-EINTR, elected-reader demux, /dev/9pmax proof);
+   distrofs persists to `#part0/distrofs<inst>.dat` + /dev/sync barrier;
+   SYS_DFS_LOAD/SAVE retired. See STATUS.md.
 9. [ ] **Residual literal paths**: /dev/auth, /dev/fuse, /dev/ptmx+pts
    pre-namec matches in vfs_open; modprobe reads ten /etc/*-ko flag files
    from kernel context (→ one ctl file); coredump hardcodes /tmp/core;
@@ -423,11 +424,19 @@ STATUS.md). What remains, off the critical path and parallelisable:
   silent (no prompt, no echo, no printk) until the qemu timeout —
   IF=0-spin shape. PRE-EXISTING: reproduces at deb3b83f (pure #439
   branch, no #443) ~1-in-2 runs, so the #443 threading merge and #445
-  renumber are exonerated; #439's boot-CR3 reclaim guard in `task_reap`
-  is necessary but evidently not sufficient. Root-cause agent in flight
-  (2026-06-11); failure logs: /tmp/m445_test_linux_sh.log,
-  /tmp/solo_linux_sh.log, /tmp/bisect443_linux_sh.log,
-  /tmp/bisect439_rep1.log.
+  renumber are exonerated. MECHANISM CAPTURED (2026-06-11 agent):
+  `buddy: DOUBLE FREE addr=0x8e17000 order=0 prev-site=2 cur-site=3`
+  then `free-list CYCLE at order=0` — `_try_remove_buddy` then spins
+  the cyclic list with IRQs masked = the silent wedge. WIP fix
+  snapshot-committed at `50c89725` (branch
+  worktree-agent-ae2373654138b1014): SMP spinlocks for memblock bump
+  cursor + buddy/region zone lock + slab + vma, plus double-free/cycle
+  detectors. NOT sufficient — an A/B run on a detector ELF still hit
+  the CYCLE panic (/tmp/ab_fix.log), so a genuine double-free (same
+  page freed from two sites, likely a reclaim path in task_reap vs
+  another owner) persists; locks alone can't fix that. Continuation
+  agent dispatched 2026-06-11. Evidence: /tmp/slim_captured.log,
+  /tmp/ab_base.log, /tmp/ab_fix.log, /tmp/bisect439_rep1.log.
 - [x] `#DF` at `load_cr3+0x3` — **RESOLVED** (`557f6ee3`, see STATUS.md
   2026-06-11 wave). The kernel-half-unmapped hypothesis was disproven
   (a `[cr3-sync]` assert now guards that invariant); real causes were
