@@ -37,6 +37,8 @@ from drivers.tty.serial.early_8250 import (
     console_set_interactive,
 )
 from drivers.input.atkbd import kbd_rx_pop
+# SYS_WAITFDS: jiffy clock for the timeout deadline (HZ=100, 10ms/tick).
+from arch.x86.kernel.time import get_jiffies
 from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
 from drivers.tty.serial.early_8250 import PRINTK_LEVEL_WARN, PRINTK_LEVEL_EMERG
 from kernel.sched.core import (
@@ -48,14 +50,17 @@ from kernel.sched.core import (
     close_fd_in_task, copy_fd_entry, yield_to_others,
     console_wq_sleep, wq_sleep_interruptible, WaitQueue, wq_init,
     console_input_may_pop_current,
-    wq_wake_all, wq_wake_one, WQ_EINTR,
+    wq_wake_all, wq_wake_one, WQ_EINTR, WQ_TIMEOUT,
     wq_wait_prepare, wq_wait_cancel, wq_wait_commit,
+    wq_wait_commit_timeout, waitfds_wq_ptr,
     get_cwd_buf, current_idx_get, set_current_errstr,
     # docs/security.md Phase 5: VFS permission check needs the caller's
     # uid/gid to compare against the file's owner/group/mode bits.
     current_task_uid, current_task_gid,
 )
-from sys.src.port9.port.devcons import devcons_read, devcons_read_nb, devcons_write
+from sys.src.port9.port.devcons import (
+    devcons_read, devcons_read_nb, devcons_write, devcons_poll_readable,
+)
 # hamUI Phase 1: the FD_STDIN_MARK arms (the legacy non-/dev/cons stdin
 # path that hamsh's ed_readline still hits) consult the wsys cmd queue
 # FIRST so an outside writer's `echo foo > /dev/wsys/1/cmd` arrives at
@@ -200,6 +205,8 @@ from sys.src.port9.port.namec import (
     namec_open_ext4_file, namec_open_fat_file, namec_open_dir_file,
     FD_CHAN_MARK, NAMEC_FALLTHROUGH, NAMEC_ENOENT, NAMEC_EMFILE,
     DEV_CONS, DEV_EXT4_FILE, DEV_FAT_FILE, DEV_DIR_FILE,
+    # SYS_WAITFDS: per-Chan non-destructive readiness probe.
+    namec_poll_readable,
 )
 from fs.cpio import (
     cpio_init,
@@ -4000,6 +4007,112 @@ def vfs_fd_poll(fd: int32) -> uint32:
         return 0
     # Regular file, stdio, cdev, dir — always ready for both.
     return 0x0005                           # POLLIN | POLLOUT
+
+
+# --- SYS_WAITFDS: native multi-fd readiness wait ---------------------
+#
+# vfs_waitfds(fds, nfds, timeout_ms) parks the caller until ANY of the
+# named fds would return data from a read, then returns the INDEX of
+# the first ready fd. -1 on timeout, -EINTR(-4) on signal wake.
+#
+# DESIGN — single shared queue, not per-fd registration. A task's
+# wait_next is a single link, so a task can sit on exactly ONE
+# WaitQueue at a time (Linux solves this with per-poll wait_queue_entry
+# allocations; we have no heap). Instead every readiness PRODUCER that
+# is part of the wait mesh calls kernel/sched/core.ad's
+# waitfds_notify() (console input incl. UART IRQ + PS/2 kbd + wsys cmd
+# inject + 100Hz tick, pipe_write, pipe writer-close EOF, devwsys
+# pointer/keys writes), and the sleeper re-SCANS its whole fd set on
+# every wake. nfds is tiny (<= NR_FDS = 16) so a re-scan is cheap.
+#
+# Probe classes (per fd, non-destructive, consumes nothing):
+#   1  ready now
+#   0  not ready; producer is wired to waitfds_notify(), a real
+#      data-edge wake will arrive
+#   2  not ready; producer NOT wired (e.g. PS/2 mouse IRQ ring, net
+#      sockets) — the sleep slice is capped at 1 jiffy so the fd is
+#      re-probed at tick granularity. Still a real HLT-parked sleep
+#      (STATE_WAIT off the runqueue), never a busy spin.
+
+def vfs_waitfds_probe(fd: int32) -> int32:
+    # Classify one fd for vfs_waitfds. See class table above.
+    rc: int32 = _check_fd(fd)
+    if rc != 0:
+        return 1            # bad fd: "ready" — the error surfaces on read
+    task: Ptr[TaskStruct] = current_task()
+    fdu: uint64 = cast[uint64](fd)
+    fi: uint32 = task[0].fd_idx[fdu]
+    if fi == FD_CLOSED_MARK:
+        return 1
+    if fi == FD_PIPE_MARK_R:
+        slot: int32 = cast[int32](task[0].fd_buf[fdu])
+        if pipe_readable(slot) != 0:
+            return 1
+        if pipe_writers(slot) == 0:
+            return 1                        # EOF is readable
+        return 0                            # pipe_write/close notify us
+    if fi == FD_STDIN_MARK:
+        # Legacy console stdin (same byte sources as /dev/cons).
+        if devcons_poll_readable() != 0:
+            return 1
+        return 0                            # console_input_wake notifies
+    if fi == FD_CHAN_MARK:
+        return namec_poll_readable(_fd_chan_id(task, fdu))
+    # Everything else: fall back on the non-destructive poll bitmap.
+    # POLLIN/POLLERR/POLLHUP/POLLNVAL all mean "a read won't block".
+    bits: uint32 = vfs_fd_poll(fd)
+    if (bits & 0x0039) != 0:                # POLLIN|POLLERR|POLLHUP|POLLNVAL
+        return 1
+    return 2                                # no wake wiring: jiffy re-probe
+
+
+def vfs_waitfds(fds: Ptr[int32], nfds: uint64, timeout_ms: int64) -> int64:
+    # Block until one of fds[0..nfds) is read-ready. Returns the lowest
+    # ready index, -1 on timeout, -4 (-EINTR) on signal wake. A
+    # timeout_ms <= 0 means "poll once, never sleep".
+    if nfds == 0:
+        return -1
+    if nfds > cast[uint64](_VFS_NR_FDS):
+        nfds = cast[uint64](_VFS_NR_FDS)
+    # Deadline in jiffies, rounding the ms budget UP so a 5ms request
+    # still sleeps at least one 10ms tick rather than zero.
+    now: uint64 = get_jiffies()
+    deadline: uint64 = now
+    if timeout_ms > 0:
+        deadline = now + cast[uint64]((timeout_ms + 9) / 10)
+    while True:
+        # Scan phase: first ready fd wins.
+        any_fallback: int32 = 0
+        i: uint64 = 0
+        while i < nfds:
+            cls: int32 = vfs_waitfds_probe(fds[i])
+            if cls == 1:
+                return cast[int64](i)
+            if cls == 2:
+                any_fallback = 1
+            i = i + 1
+        now = get_jiffies()
+        if now >= deadline:
+            return -1
+        # Sleep phase: two-phase prepare/recheck/commit on the shared
+        # waitfds queue so a producer's wake between scan and sleep is
+        # never lost.
+        slice_j: uint64 = deadline - now
+        if any_fallback != 0 and slice_j > 1:
+            slice_j = 1                     # jiffy-granular re-probe
+        wq_wait_prepare(waitfds_wq_ptr())
+        # Recheck under registration: a wake that fired after the scan
+        # above would otherwise be missed for the whole slice.
+        i = 0
+        while i < nfds:
+            if vfs_waitfds_probe(fds[i]) == 1:
+                wq_wait_cancel(waitfds_wq_ptr())
+                return cast[int64](i)
+            i = i + 1
+        wrc: int32 = wq_wait_commit_timeout(waitfds_wq_ptr(), slice_j)
+        if wrc == WQ_EINTR:
+            return -4                       # -EINTR
+        # WQ_TIMEOUT or data wake: loop re-scans and re-checks deadline.
 
 
 def vfs_fd_inode(fd: int32) -> uint64:

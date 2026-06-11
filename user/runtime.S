@@ -880,6 +880,23 @@ sys_vk_window_frame:
     .size sys_vk_window_frame, .-sys_vk_window_frame
 
 
+    /* --- sys_waitfds(fds, nfds, timeout_ms) -> int64 -----------------
+     * Native multi-fd readiness wait (kernel WaitQueue-parked — the
+     * select/poll replacement for native event loops). fds = pointer
+     * to an int32 array, nfds = entry count (<= 16), timeout_ms =
+     * budget in milliseconds (rounded up to 10ms jiffies). Returns the
+     * lowest index whose fd is read-ready, -1 on timeout, -4 (-EINTR)
+     * on signal wake. 3-arg form: rdi/rsi/rdx already match a0/a1/a2.
+     * Number 313 (next free after SYS_VK_WINDOW_FRAME=312). */
+    .globl sys_waitfds
+    .type sys_waitfds, @function
+sys_waitfds:
+    movq    $313, %rax              /* SYS_WAITFDS */
+    syscall
+    ret
+    .size sys_waitfds, .-sys_waitfds
+
+
     /* --- sys_pipechan() -> int32 ------------------------------------
      * HAMSH §7: create a local pipe Chan pair; returns the pipe SLOT
      * id (NOT fds). The shell threads the slot into two sys_fdbind

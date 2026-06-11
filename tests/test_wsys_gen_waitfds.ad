@@ -1,0 +1,304 @@
+# tests/test_wsys_gen_waitfds.ad
+#
+# Regression fixture for TWO kernel features that unblock compositor
+# performance work:
+#
+#   A. /dev/wsys/<N>/draw/<layer>/gen — read-only per-layer content
+#      GENERATION counter. Bumped by exactly 1 on every successful
+#      markup/fb content write; reading it is cheap and NEVER consumes
+#      or alters the markup body.
+#
+#   B. SYS_WAITFDS(fds, nfds, timeout_ms) — native multi-fd readiness
+#      wait. Parks the caller on the kernel waitfds WaitQueue (a real
+#      HLT-class sleep, not a spin) until one of the fds would read
+#      without blocking; returns the lowest ready index, -1 on timeout.
+#
+# Assertions (greppable "[test_wgw] <marker>=1" lines):
+#   gen_layer_ok      mklayer accepted + gen leaf readable
+#   gen_zero_ok       fresh layer reads gen 0
+#   gen_bumps_ok      two markup writes bump gen by EXACTLY 2 (+1 each)
+#   gen_read_pure_ok  reading gen repeatedly does not consume/alter the
+#                     markup body, and does not itself bump gen
+#   wf_index_ok       waitfds on [empty, ready] pipes returns index 1
+#   wf_timeout_ok     waitfds on a never-ready pipe returns -1
+#   wf_timeout_blocked_ok  ...after >= ~250ms of wall time (jiffy delta
+#                     proves it parked rather than returning instantly)
+#   wf_wake_ok        waitfds on an empty pipe wakes with index 0 when a
+#                     forked child writes after a 300ms sleep
+#   wf_blocked_ok     ...and the parent measurably blocked >= ~200ms
+#
+# Build/run via scripts/test_wsys_gen_waitfds.sh.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_pipe(fds: Ptr[int32]) -> int32
+extern def sys_rfork(flags: int32) -> int32
+extern def sys_waitpid(pid: uint64) -> int64
+extern def sys_get_jiffies() -> uint64
+extern def sys_nanosleep(req: Ptr[uint64], rem: uint64) -> int64
+extern def sys_waitfds(fds: Ptr[int32], nfds: uint64,
+                       timeout_ms: int64) -> int64
+extern def sys_exit(code: uint64)
+
+# Plan 9 POSIX-fork combo (matches tests/test_rfork.ad).
+RFPROC:  int32 = 0x001
+RFFDG:   int32 = 0x004
+RFNAMEG: int32 = 0x008
+RFENVG:  int32 = 0x010
+
+
+def strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen(s))
+
+
+def write_dec(fd: int32, value: uint64):
+    if value == 0:
+        sys_write(fd, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(fd, &out[0], i)
+
+
+def _bytes_contains(buf: Ptr[uint8], n: uint64, needle: Ptr[uint8]) -> int32:
+    nn: uint64 = strlen(needle)
+    if nn == 0:
+        return 1
+    if nn > n:
+        return 0
+    limit: uint64 = n - nn
+    i: uint64 = 0
+    while i <= limit:
+        j: uint64 = 0
+        ok: int32 = 1
+        while j < nn:
+            if buf[i + j] != needle[j]:
+                ok = 0
+            j = j + 1
+        if ok != 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _read_path(path: Ptr[char], buf: Ptr[uint8], cap: uint64) -> int64:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while total < cap:
+        n: int64 = sys_read(fd, &buf[total], cap - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    return cast[int64](total)
+
+
+def _write_path(path: Ptr[char], s: Ptr[uint8]) -> int64:
+    fd: int32 = sys_open_write(path)
+    if fd < 0:
+        return -1
+    r: int64 = sys_write(fd, s, strlen(s))
+    sys_close(fd)
+    return r
+
+
+def _parse_u64(buf: Ptr[uint8], n: uint64) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < n:
+        c: uint8 = buf[i]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[uint64](c) - 48
+        i = i + 1
+    return v
+
+
+def _read_gen(path: Ptr[char]) -> int64:
+    # Read "<gen>\n" and return it as an int64, or -1 on read failure.
+    b: Array[64, uint8]
+    n: int64 = _read_path(path, &b[0], 64)
+    if n <= 0:
+        return -1
+    return cast[int64](_parse_u64(&b[0], cast[uint64](n)))
+
+
+def _sleep_ms(ms: uint64):
+    # nanosleep with a {tv_sec, tv_nsec} pair laid out as two uint64s.
+    ts: Array[2, uint64]
+    ts[0] = ms / 1000
+    ts[1] = (ms % 1000) * 1000000
+    sys_nanosleep(&ts[0], 0)
+
+
+def main() -> int32:
+    write_str(1, "[test_wgw] start\n")
+    fails: int32 = 0
+
+    # =========== Part A: per-layer gen leaf ===========================
+
+    # ---- A1. Create a markup layer; its gen leaf must read back. ----
+    _write_path("/dev/wsys/1/draw/ctl", "mklayer gtest markup 64 32\n")
+    g0: int64 = _read_gen("/dev/wsys/1/draw/gtest/gen")
+    if g0 < 0:
+        write_str(1, "[test_wgw] gen leaf unreadable FAIL\n")
+        fails = fails + 1
+    else:
+        write_str(1, "[test_wgw] gen_layer_ok=1\n")
+
+    # ---- A2. A fresh layer starts at gen 0. --------------------------
+    if g0 == 0:
+        write_str(1, "[test_wgw] gen_zero_ok=1\n")
+    else:
+        write_str(1, "[test_wgw] fresh gen=")
+        write_dec(1, cast[uint64](g0))
+        write_str(1, " (want 0) FAIL\n")
+        fails = fails + 1
+
+    # ---- A3. Each markup write bumps gen by exactly 1. ---------------
+    _write_path("/dev/wsys/1/draw/gtest/markup", "hello-gen-one\n")
+    g1: int64 = _read_gen("/dev/wsys/1/draw/gtest/gen")
+    _write_path("/dev/wsys/1/draw/gtest/markup", "hello-gen-two\n")
+    g2: int64 = _read_gen("/dev/wsys/1/draw/gtest/gen")
+    if g1 == g0 + 1 and g2 == g0 + 2:
+        write_str(1, "[test_wgw] gen_bumps_ok=1\n")
+    else:
+        write_str(1, "[test_wgw] gen after 2 writes: g1=")
+        write_dec(1, cast[uint64](g1))
+        write_str(1, " g2=")
+        write_dec(1, cast[uint64](g2))
+        write_str(1, " FAIL\n")
+        fails = fails + 1
+
+    # ---- A4. Reading gen is PURE: repeated gen reads neither consume -
+    # ---- the markup body nor change the counter. ---------------------
+    ga: int64 = _read_gen("/dev/wsys/1/draw/gtest/gen")
+    gb: int64 = _read_gen("/dev/wsys/1/draw/gtest/gen")
+    mbuf: Array[256, uint8]
+    mn: int64 = _read_path("/dev/wsys/1/draw/gtest/markup", &mbuf[0], 256)
+    body_ok: int32 = 0
+    if mn > 0:
+        body_ok = _bytes_contains(&mbuf[0], cast[uint64](mn),
+                                  "hello-gen-two")
+    if ga == g2 and gb == g2 and body_ok != 0:
+        write_str(1, "[test_wgw] gen_read_pure_ok=1\n")
+    else:
+        write_str(1, "[test_wgw] gen read not pure FAIL\n")
+        fails = fails + 1
+
+    # =========== Part B: SYS_WAITFDS ==================================
+
+    # Two pipes: A gets data, B never does (write end stays open so the
+    # read end never turns EOF-readable).
+    pa: Array[2, int32]
+    pb: Array[2, int32]
+    if sys_pipe(&pa[0]) < 0 or sys_pipe(&pb[0]) < 0:
+        write_str(1, "[test_wgw] pipe alloc FAIL\n")
+        write_str(1, "[test_wgw] FAIL\n")
+        return 1
+
+    # ---- B1. Index selection: [empty B, ready A] -> index 1. ---------
+    sys_write(pa[1], "x", 1)
+    wfds: Array[4, int32]
+    wfds[0] = pb[0]
+    wfds[1] = pa[0]
+    idx: int64 = sys_waitfds(&wfds[0], 2, 1000)
+    if idx == 1:
+        write_str(1, "[test_wgw] wf_index_ok=1\n")
+    else:
+        write_str(1, "[test_wgw] waitfds index=")
+        write_dec(1, cast[uint64](idx))
+        write_str(1, " (want 1) FAIL\n")
+        fails = fails + 1
+    drain: Array[8, uint8]
+    sys_read(pa[0], &drain[0], 1)              # A is empty again
+
+    # ---- B2. Timeout: never-ready fd returns -1 after ~the budget. ---
+    wfds[0] = pb[0]
+    tj0: uint64 = sys_get_jiffies()
+    trc: int64 = sys_waitfds(&wfds[0], 1, 300)
+    tj1: uint64 = sys_get_jiffies()
+    if trc == -1:
+        write_str(1, "[test_wgw] wf_timeout_ok=1\n")
+    else:
+        write_str(1, "[test_wgw] timeout rc=")
+        write_dec(1, cast[uint64](trc))
+        write_str(1, " (want -1) FAIL\n")
+        fails = fails + 1
+    telapsed: uint64 = tj1 - tj0
+    # 300ms = 30 jiffies at HZ=100. Accept 25..200 (scheduling slop up,
+    # but a spin-return-instantly bug reads as < 5 and FAILs).
+    if telapsed >= 25 and telapsed <= 200:
+        write_str(1, "[test_wgw] wf_timeout_blocked_ok=1\n")
+    else:
+        write_str(1, "[test_wgw] timeout elapsed jiffies=")
+        write_dec(1, telapsed)
+        write_str(1, " (want ~30) FAIL\n")
+        fails = fails + 1
+
+    # ---- B3. Real wake: child writes pipe A after 300ms; the parent's
+    # ---- waitfds must park, then wake with index 0. -------------------
+    flags: int32 = RFPROC | RFFDG | RFNAMEG | RFENVG
+    rc: int32 = sys_rfork(flags)
+    if rc < 0:
+        write_str(1, "[test_wgw] rfork FAIL\n")
+        fails = fails + 1
+    elif rc == 0:
+        # Child: sleep, write the wake byte, exit. RFFDG copied the fd
+        # table, so pa[1] names the same pipe object as the parent's.
+        _sleep_ms(300)
+        sys_write(pa[1], "w", 1)
+        sys_exit(0)
+        return 0
+    else:
+        wfds[0] = pa[0]
+        wj0: uint64 = sys_get_jiffies()
+        widx: int64 = sys_waitfds(&wfds[0], 1, 5000)
+        wj1: uint64 = sys_get_jiffies()
+        if widx == 0:
+            write_str(1, "[test_wgw] wf_wake_ok=1\n")
+        else:
+            write_str(1, "[test_wgw] wake idx=")
+            write_dec(1, cast[uint64](widx))
+            write_str(1, " (want 0) FAIL\n")
+            fails = fails + 1
+        welapsed: uint64 = wj1 - wj0
+        # Child slept 300ms (~30 jiffies) before writing; the parent
+        # must have parked for at least ~200ms of that.
+        if welapsed >= 20:
+            write_str(1, "[test_wgw] wf_blocked_ok=1\n")
+        else:
+            write_str(1, "[test_wgw] wake elapsed jiffies=")
+            write_dec(1, welapsed)
+            write_str(1, " (want >= 20) FAIL\n")
+            fails = fails + 1
+        sys_waitpid(cast[uint64](rc))
+
+    if fails == 0:
+        write_str(1, "[test_wgw] PASS\n")
+        return 0
+    write_str(1, "[test_wgw] FAIL\n")
+    return 1
