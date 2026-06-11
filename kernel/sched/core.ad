@@ -762,6 +762,19 @@ STATE_PARKED: uint64 = 5
 # Linux TASK_INTERRUPTIBLE shape — sleep until explicitly woken, not poll.
 STATE_WAIT: uint64 = 6
 
+# Thread under construction (CLONE_THREAD / rfork RFMEM). The slot is
+# claimed (so _find_free_slot cannot hand it out) and its cr3 already
+# points at the CREATOR's shared PML4, but the caller (do_clone /
+# _rfork_thread) is still wiring up inheritance: fs_base (CLONE_SETTLS),
+# the fd table, seccomp, cwd, tid bookkeeping. _pick_next only picks
+# STATE_READY, so an EMBRYO is invisible to EVERY dispatcher — including
+# the OTHER CPU's idle pull/steal path, which an IRQ mask on the creating
+# CPU never blocked. The creator publishes the thread runnable with
+# task_publish_thread_ready() only after the LAST inheritance store.
+# This closes the SMP window where a half-built thread (garbage %fs TLS,
+# missing fds) could be dispatched mid-construction.
+STATE_EMBRYO: uint64 = 7
+
 # Per-task kernel stack. 32 KiB (8 pages, buddy order 3). The deepest
 # in-kernel call chain is NOT a single 4 KiB page — two distinct chains
 # have overrun smaller stacks:
@@ -2468,13 +2481,14 @@ def create_user_task_argv(entry: uint64, name0: uint64,
     # so the child resumes with the parent's r9 (the musl __clone
     # wrapper parks the worker function there).
     return create_user_thread(entry, name0, user_rsp, argc, argv,
-                              0, 0, 0)
+                              0, 0, 0, 0)
 
 
 def create_user_thread(entry: uint64, name0: uint64,
                        user_rsp: uint64, argc: uint64,
                        argv: uint64, user_r9: uint64,
-                       user_rdx: uint64, user_r8: uint64) -> int32:
+                       user_rdx: uint64, user_r8: uint64,
+                       share_cr3: uint64) -> int32:
     # Allocate kstack + ustack, build a freshly-preempted-looking
     # stack image whose iret frame returns to CPL=3 at `entry`.
     # If `user_rsp` is non-zero the caller is supplying a stack with
@@ -2488,6 +2502,27 @@ def create_user_thread(entry: uint64, name0: uint64,
     # user_rdx / user_r8 likewise carry the parent's %rdx / %r8 for
     # the CLONE_THREAD path: glibc's clone3 child does `call *%rdx`
     # with the argument in %r8. SYS_SPAWN callers pass 0 for all three.
+    #
+    # share_cr3: non-zero ONLY on the thread paths (CLONE_VM|CLONE_THREAD
+    # in do_clone, rfork RFMEM in _rfork_thread). The thread runs on the
+    # CREATOR's PML4 — we point cr3 at it DIRECTLY at creation instead of
+    # cloning a boot PML4 the caller would immediately discard. The old
+    # alloc-clone-then-set_task_cr3 dance had two defects: (a) the
+    # abandoned boot-clone page leaked on every thread spawn, and (b) the
+    # window between STATE_READY and the cr3 repoint let ANOTHER CPU's
+    # steal/pull dispatcher run the thread on the stale boot clone — an
+    # IRQ mask on the creating CPU never closed that. Freeing the stale
+    # clone at repoint time (the obvious leak fix) then freed a PML4 the
+    # other CPU was actively USING as its live CR3: the freed page got
+    # reallocated + scribbled, the running task's PTEs turned to garbage
+    # (observed: a text-page PTE misread as a swap entry -> bogus
+    # "swap-in OOM" halt; the original latent #DF at load_cr3+0x3 is the
+    # same corruption surfacing later). With share_cr3 the thread's cr3
+    # is correct BEFORE it ever becomes visible, and no disposable page
+    # exists to leak or free. The task is additionally published as
+    # STATE_EMBRYO (not READY) so the caller can finish fs_base/fd/tid
+    # inheritance before any dispatcher anywhere can pick it — see
+    # task_publish_thread_ready().
     slot: int32 = _find_free_slot()
     if slot < 0:
         printk0("create_user_task: no free task slot\n")
@@ -2581,41 +2616,50 @@ def create_user_thread(entry: uint64, name0: uint64,
     # tables on first touch. Fall back to the live CR3 only if
     # cow_init() has not run yet (defensive — task creation always
     # follows mem_init()).
-    new_pml4: uint64 = alloc_page()
-    if new_pml4 == 0:
-        return -1
-    pml4_src: uint64 = cow_boot_cr3()
-    if pml4_src == 0:
-        pml4_src = get_bsp_cr3()
-    # The clone reads the boot PML4 (pml4_src) and writes the freshly
-    # alloc_page()'d new_pml4 — both are PHYSICAL page-table pages in low
-    # RAM. They are reachable ONLY if the CURRENTLY-ACTIVE CR3 still
-    # identity-maps the 2 MiB chunk each lives in. That is NOT guaranteed:
-    # the live CR3 belongs to the spawning/forking parent, whose user-half
-    # page tables have been CRACKED by elf_install_user_mapping / the COW
-    # fork path. On a UEFI boot with several hundred MiB of RAM the boot
-    # PML4 itself lands high (~485 MiB), and a parent's cracked PD can have
-    # dropped the identity entry for that exact chunk (observed: pd[243]
-    # P=0), so the raw memcpy below #PF'd reading pml4_src. The BSP/boot
-    # CR3 maps ALL of low RAM identity by construction, so run the clone
-    # under it, then restore the caller's CR3. Pure physical-identity work
-    # in between (no user-half access), so the switch is safe.
-    #
-    # Switch to the PRISTINE boot PML4 (cow_boot_cr3 / pml4_src), which is
-    # the snapshot taken in cow_init() before any user-half cracking, so it
-    # maps the full low-RAM identity. Reading pml4_src and writing new_pml4
-    # both resolve under it. Restore the caller's CR3 immediately after.
-    _clone_live_cr3: uint64 = read_cr3()
-    _clone_irq_flags: uint64 = 0
-    if pml4_src != 0:
-        _clone_irq_flags = local_irq_save()
-        load_cr3(pml4_src)
-    memcpy(cast[Ptr[uint8]](new_pml4),
-           cast[Ptr[uint8]](pml4_src), 4096)
-    if pml4_src != 0:
-        load_cr3(_clone_live_cr3)
-        local_irq_restore(_clone_irq_flags)
-    task_table[s].cr3 = new_pml4
+    if share_cr3 != 0:
+        # Thread path (CLONE_THREAD / rfork RFMEM): run on the creator's
+        # PML4, no clone at all. The creator is alive and mid-syscall,
+        # so its PML4 cannot be reaped out from under us before the
+        # EMBRYO->READY publish.
+        task_table[s].cr3 = share_cr3
+    else:
+        new_pml4: uint64 = alloc_page()
+        if new_pml4 == 0:
+            return -1
+        pml4_src: uint64 = cow_boot_cr3()
+        if pml4_src == 0:
+            pml4_src = get_bsp_cr3()
+        # The clone reads the boot PML4 (pml4_src) and writes the freshly
+        # alloc_page()'d new_pml4 — both are PHYSICAL page-table pages in
+        # low RAM. They are reachable ONLY if the CURRENTLY-ACTIVE CR3
+        # still identity-maps the 2 MiB chunk each lives in. That is NOT
+        # guaranteed: the live CR3 belongs to the spawning/forking parent,
+        # whose user-half page tables have been CRACKED by
+        # elf_install_user_mapping / the COW fork path. On a UEFI boot
+        # with several hundred MiB of RAM the boot PML4 itself lands high
+        # (~485 MiB), and a parent's cracked PD can have dropped the
+        # identity entry for that exact chunk (observed: pd[243] P=0), so
+        # the raw memcpy below #PF'd reading pml4_src. The BSP/boot CR3
+        # maps ALL of low RAM identity by construction, so run the clone
+        # under it, then restore the caller's CR3. Pure physical-identity
+        # work in between (no user-half access), so the switch is safe.
+        #
+        # Switch to the PRISTINE boot PML4 (cow_boot_cr3 / pml4_src),
+        # which is the snapshot taken in cow_init() before any user-half
+        # cracking, so it maps the full low-RAM identity. Reading pml4_src
+        # and writing new_pml4 both resolve under it. Restore the caller's
+        # CR3 immediately after.
+        _clone_live_cr3: uint64 = read_cr3()
+        _clone_irq_flags: uint64 = 0
+        if pml4_src != 0:
+            _clone_irq_flags = local_irq_save()
+            load_cr3(pml4_src)
+        memcpy(cast[Ptr[uint8]](new_pml4),
+               cast[Ptr[uint8]](pml4_src), 4096)
+        if pml4_src != 0:
+            load_cr3(_clone_live_cr3)
+            local_irq_restore(_clone_irq_flags)
+        task_table[s].cr3 = new_pml4
     # U1: default new user tasks to native Hamnix ABI. The Linux ELF
     # loader path (future U-series milestone) will call
     # set_linux_userspace_mode(slot, 1) after this returns to flip the
@@ -2817,8 +2861,33 @@ def create_user_thread(entry: uint64, name0: uint64,
     # until its address space is fully shared; the pull/steal path migrates
     # it later if another core is idle.
     task_table[s].rq_cpu = get_cpu_id()
-    task_table[s].state = STATE_READY
+    # Thread path (share_cr3): publish EMBRYO, not READY. The caller
+    # (do_clone / _rfork_thread) still has inheritance stores to make
+    # (fs_base TLS, fd table, seccomp, cwd, tid bookkeeping) and an IRQ
+    # mask on THIS cpu cannot keep another CPU's steal/pull dispatcher
+    # from picking a READY task. _pick_next ignores EMBRYO everywhere;
+    # the caller flips it READY via task_publish_thread_ready() after
+    # the last inheritance store.
+    if share_cr3 != 0:
+        task_table[s].state = STATE_EMBRYO
+    else:
+        task_table[s].state = STATE_READY
     return slot
+
+
+def task_publish_thread_ready(slot: int32):
+    # Final step of CLONE_THREAD / rfork-RFMEM creation: the creator has
+    # finished every inheritance store, so the EMBRYO becomes dispatchable.
+    # On x86 stores retire in program order — once this READY store is
+    # visible to another CPU's dispatcher, every inheritance store before
+    # it is too.
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    if s >= NTASKS:
+        return
+    if task_table[s].state == STATE_EMBRYO:
+        task_table[s].state = STATE_READY
 
 
 # --- public: schedule / lifecycle ---------------------------------
@@ -4432,38 +4501,26 @@ def task_pml4(slot: int32) -> uint64:
 
 
 def set_task_cr3(slot: int32, cr3: uint64):
-    # Point a task at an existing PML4. Used by the CLONE_VM thread
-    # path in do_clone and by _rfork_thread (RFMEM): a thread shares
-    # its creator's address space, so it must run on the SAME page
-    # table — otherwise per-task page-table overlays (e.g. mm/vma.ad's
-    # multi-chunk VMA backing, which mmaps the 8 MiB glibc thread stack
-    # as several buddy chunks stitched together by
-    # elf_install_user_mapping) are invisible to the thread and it
-    # faults on its own stack.
+    # Point a task at an existing PML4 — a PLAIN store, nothing more.
     #
-    # Sharing the PML4 is safe because task_reap's shared-address-space
-    # guard tears the mm down only when the LAST non-FREE slot
-    # referencing the cr3 is reaped — no double-free / use-after-free
-    # whatever order the thread and its creator exit in. (The old
-    # safety story here — "task_reap never frees a task's cr3 page" —
-    # stopped being true when reap-time resource reclaim landed; that
-    # stale invariant was exactly the latent load_cr3+0x3 #DF.)
+    # HISTORY / WARNING: the CLONE_VM thread path in do_clone and
+    # _rfork_thread (RFMEM) used to create a thread with a fresh
+    # boot-clone PML4 and then repoint it here at the creator's. That
+    # design is GONE — create_user_thread now takes share_cr3 and the
+    # thread's cr3 is correct before the slot is ever visible. Do NOT
+    # resurrect a "free the old PML4 here" optimization: between the
+    # old READY publish and this store, another CPU's steal/pull
+    # dispatcher could already be RUNNING the task on its old cr3 (an
+    # IRQ mask on the creating CPU does not stop that), so freeing the
+    # old page froze a live CR3 -> reallocated + scribbled page tables
+    # -> garbage PTEs (#DF at load_cr3+0x3 / bogus swap-entry PTE
+    # "swap-in OOM" halts).
     #
-    # The freshly-cloned PML4 create_user_thread allocated for this
-    # slot is released here rather than leaked: at this point it is a
-    # verbatim memcpy of the pristine boot PML4 — the thread's stack is
-    # caller-supplied and no ELF was loaded into the slot, so no
-    # user-half cracking has hung private sub-tables off it; the bare
-    # page is the only thing to free. Guards keep this a no-op if the
-    # slot somehow already points at the target, the boot snapshot, or
-    # the BSP kernel PML4.
+    # Sharing a PML4 across slots is safe because task_reap's
+    # shared-address-space guard tears the mm down only when the LAST
+    # non-FREE slot referencing the cr3 is reaped — no double-free /
+    # use-after-free whatever order the thread and its creator exit in.
     su: uint64 = cast[uint64](slot)
-    old_pml4: uint64 = task_table[su].cr3 & 0x000FFFFFFFFFF000
-    new_pml4: uint64 = cr3 & 0x000FFFFFFFFFF000
-    if old_pml4 != 0 and old_pml4 != new_pml4 \
-            and old_pml4 != (cow_boot_cr3() & 0x000FFFFFFFFFF000) \
-            and old_pml4 != (get_bsp_cr3() & 0x000FFFFFFFFFF000):
-        free_page(old_pml4)
     task_table[su].cr3 = cr3
 
 
@@ -4617,6 +4674,10 @@ def _free_task_user_pagetables(su: uint64):
     ksync: uint64 = 256
     while ksync < 512:
         if pml4[ksync] != bpml4[ksync]:
+            # NOTICE level: must surface on the live serial console even
+            # after console_set_interactive() tightens the gate to INFO —
+            # this fires once and then the system likely #DFs.
+            printk_set_level(PRINTK_LEVEL_NOTICE)
             printk2("[cr3-sync] WARNING: task PML4 kernel-half slot %d diverges from boot (entry=%p)\n",
                     ksync, pml4[ksync])
             ksync = 512
@@ -4814,9 +4875,6 @@ def task_reap(slot: int32):
                 elif mm_heir < 0:
                     mm_heir = cast[int32](hj)
             hj = hj + 1
-    if my_mm != 0:
-        printk2("[tlx-dbg] reap slot=%d heir=%d\n",
-                su, cast[uint64](cast[int64](mm_heir)))
     if mm_heir >= 0:
         hu: uint64 = cast[uint64](mm_heir)
         # Hand the owner-only reclaim bookkeeping to the heir so the
