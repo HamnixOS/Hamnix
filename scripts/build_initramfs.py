@@ -1585,6 +1585,15 @@ if os.environ.get("ENABLE_PROCLIMITS_TEST"):
 if os.environ.get("ENABLE_PROCFD_TEST"):
     FILES.append(("/etc/procfd-test", b"1\n"))
 
+# Phase 4c `#d/<N>` DEV_DEVFD inline-chan self-test. scripts/test_devfd_chan.sh
+# sets ENABLE_DEVFDCHAN_TEST=1 to plant /etc/devfdchan-test. init/main.ad
+# detects the marker and calls devfdchan_selftest() (devfd.ad): pipe binds at
+# /fd/5 + /fd/6 opened as `#d/5` / `#d/6` chans, payload round-trip, waitfds
+# probe 1 → 0 across the drain, lseek rejected; emits the [DEVFDCHAN] PASS
+# banner. Needs no extra device.
+if os.environ.get("ENABLE_DEVFDCHAN_TEST"):
+    FILES.append(("/etc/devfdchan-test", b"1\n"))
+
 # /proc/<pid>/ctl write-surface self-test. scripts/test_procctl.sh sets
 # ENABLE_PROCCTL_TEST=1 to plant /etc/procctl-test. init/main.ad detects the
 # marker and calls procctl_selftest() (devproc.ad): it drives the real

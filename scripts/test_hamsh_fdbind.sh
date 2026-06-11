@@ -18,6 +18,7 @@
 
 . "$(dirname "$0")/_build_lock.sh"
 . "$(dirname "$0")/_hamsh_log.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,37 +35,31 @@ python3 -m compiler.adder compile \
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
+# Prompt-gated drive (scripts/_qemu_drive.sh): wait for hamsh's banner
+# before sending the first command, instead of a fixed `sleep 3` that
+# loses the first line whenever boot is slow (the input used to be
+# shoved at the 16550 RX FIFO before hamsh was even up — the classic
+# fixed-sleep flake this harness exists to kill). Command list, in
+# order:
+#   * §6 tripwire: sample /dev/mountrpc BEFORE a local pipe.
+#   * pipe: a | b carries data through a pipe Chan.
+#   * a 3-stage pipeline still wires every /fd correctly.
+#   * §6 tripwire: sample mountrpc AFTER — a local pipe must NOT
+#     marshal 9P, so the counter is unchanged.
+#   * redirect: cmd > file binds a file Chan at /fd/1. echo is a hamsh
+#     builtin (runs in-process), so redirect an EXTERNAL — the last
+#     pipeline stage `cat` gets the `> file` bind.
+#   * dup: cmd 2>&1 — /fd/2's Chan IS /fd/1's Chan.
 set +e
-(
-    sleep 3
-    # --- §6 tripwire: sample the mountrpc counter BEFORE a local pipe.
-    printf 'echo MRPC_BEFORE `{ cat /dev/mountrpc }\n'
-    sleep 2
-    # --- pipe: a | b carries data through a pipe Chan.
-    printf 'echo PIPE_PAYLOAD | cat\n'
-    sleep 2
-    # --- a 3-stage pipeline still wires every /fd correctly.
-    printf 'echo three stage line | cat | cat\n'
-    sleep 2
-    # --- §6 tripwire: sample mountrpc AFTER the local pipelines.
-    #     A local pipe must NOT marshal 9P — the counter is unchanged.
-    printf 'echo MRPC_AFTER `{ cat /dev/mountrpc }\n'
-    sleep 2
-    # --- redirect: cmd > file binds a file Chan at /fd/1. echo is a
-    #     hamsh builtin (runs in-process), so redirect an EXTERNAL —
-    #     the last pipeline stage `cat` gets the `> file` bind.
-    printf 'echo REDIR_CONTENT | cat > /tmp/fdbind_out\n'
-    sleep 2
-    printf 'cat /tmp/fdbind_out\n'
-    sleep 2
-    # --- dup: cmd 2>&1 — /fd/2's Chan IS /fd/1's Chan.
-    printf 'echo DUP_LINE 2>&1\n'
-    sleep 2
-    printf 'exit\n'
-    sleep 1
-) | timeout 60s qemu-system-x86_64 \
-    -kernel "$ELF" -smp 2 -nographic -no-reboot -m 256M \
-    -monitor none -serial stdio > "$LOG" 2>&1
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 120 \
+    -- 'echo MRPC_BEFORE `{ cat /dev/mountrpc }' 2 \
+       'echo PIPE_PAYLOAD | cat' 3 \
+       'echo three stage line | cat | cat' 3 \
+       'echo MRPC_AFTER `{ cat /dev/mountrpc }' 2 \
+       'echo REDIR_CONTENT | cat > /tmp/fdbind_out' 3 \
+       'cat /tmp/fdbind_out' 2 \
+       'echo DUP_LINE 2>&1' 2 \
+       'exit' 1
 set -e
 
 echo "[test_hamsh_fdbind] --- captured ---"
