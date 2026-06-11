@@ -44,7 +44,24 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 
 set +e
 (
-    sleep 3
+    # Gate on hamsh's readline coming up instead of a fixed sleep.
+    # Under host load the boot takes well over 3s to reach the prompt
+    # and a fixed-sleep feeder silently drops EVERY early command
+    # (cat HELLO/NESTED/FILE49, ls|wc, the WRITE_VIA_SHELL echo...)
+    # while the later ones still land — a confusing partial-MISS
+    # pattern that looks like an ext4 regression but isn't.
+    for _ in $(seq 1 240); do
+        if grep -aq "loop-enter" "$LOG" 2>/dev/null; then break; fi
+        sleep 0.25
+    done
+    # The freshly-booted readline drops the first serial line it is
+    # sent (never echoes it). Re-send a sync probe until its
+    # keystrokes echo back, then start the real commands.
+    for _ in $(seq 1 20); do
+        printf 'echo FEEDER_SYNC\n'
+        sleep 1
+        if grep -aq "FEEDER_SYNC" "$LOG" 2>/dev/null; then break; fi
+    done
     printf 'cat /ext/HELLO.TXT\n'
     sleep 1
     # M16.68: HELLO_LINK is a symlink to /HELLO.TXT planted in the
@@ -94,7 +111,7 @@ set +e
     sleep 2
     printf 'exit\n'
     sleep 1
-) | timeout 55s qemu-system-x86_64 \
+) | timeout 150s qemu-system-x86_64 \
     -kernel "$ELF" \
     -drive file=build/ext4.img,if=virtio,format=raw \
     -smp 2 \
