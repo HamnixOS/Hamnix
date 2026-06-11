@@ -47,8 +47,10 @@ from mm.cow import (
     cow_share_page, cow_page_is_shared, cow_drop_page,
     cow_ref_inc, cow_boot_cr3,
 )
-from kernel.printk.printk import printk0, printk1, printk2
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_WARN
 from kernel.panic import panic
+from kernel.sched.core import register_elf_dbg_watch_hooks
 # §4: PT_INTERP loading looks up the interpreter binary (typically
 # /lib64/ld-linux-x86-64.so.2) through the calling process's namespace.
 # fs.vfs depends on nothing in fs.elf, so this import doesn't form a
@@ -1770,6 +1772,149 @@ def elf_set_range_ro(pml4_phys: uint64, vlow: uint64,
                         invlpg_one(va)
         va = va + PAGE_SIZE_4K
     return 0
+
+
+# --- #438 PTE-corruption watch (debug instrumentation) -------------------
+# Arms a watch on a [vlow, vhigh) -> phys image mapping in a given PML4 and
+# re-validates the leaf PTEs from arbitrary checkpoints. The first
+# checkpoint that sees a diverged/garbage PTE prints its tag, bracketing
+# the corrupting code path between two checkpoints.
+elf_dbg_watch_pml4:  uint64 = 0
+elf_dbg_watch_vlow:  uint64 = 0
+elf_dbg_watch_vhigh: uint64 = 0
+elf_dbg_watch_phys:  uint64 = 0
+elf_dbg_watch_fired: int32  = 0
+
+
+def elf_dbg_watch_arm(pml4_phys: uint64, vlow: uint64, vhigh: uint64,
+                      phys_base: uint64):
+    # Late-bind the scheduler-side checkpoints (core.ad can't import
+    # fs.elf — cycle via fs.vfs — so it calls through registered hooks).
+    register_elf_dbg_watch_hooks(elf_dbg_watch_check, elf_dbg_watch_disarm)
+    elf_dbg_watch_pml4  = pml4_phys
+    elf_dbg_watch_vlow  = vlow
+    elf_dbg_watch_vhigh = vhigh
+    elf_dbg_watch_phys  = phys_base
+    elf_dbg_watch_fired = 0
+    printk_set_level(PRINTK_LEVEL_WARN)
+    printk2("[438] watch armed: [%p, %p)\n", vlow, vhigh)
+    printk_set_level(PRINTK_LEVEL_WARN)
+    printk2("[438]   pml4=%p phys=%p\n", pml4_phys, phys_base)
+    elf_dbg_watch_check(0)
+
+
+def elf_dbg_watch_disarm(pml4_phys: uint64):
+    # Legit teardown of the watched address space — stop watching so the
+    # post-free garbage isn't reported as corruption.
+    if elf_dbg_watch_pml4 != 0 and elf_dbg_watch_pml4 == pml4_phys:
+        printk_set_level(PRINTK_LEVEL_WARN)
+        printk1("[438] watch disarmed (teardown of pml4=%p)\n", pml4_phys)
+        elf_dbg_watch_pml4 = 0
+
+
+def elf_dbg_watch_dump(pml4_phys: uint64, fault_va: uint64):
+    # #438: print the RAW entries of the full 4-level walk of fault_va
+    # in the FAULTING task's PML4 — called from do_page_fault at the
+    # moment of the unexplained fault, so we see the exact bit pattern
+    # the CPU rejected (NX? upper-level reserved bits? wrong phys?).
+    if elf_dbg_watch_pml4 == 0:
+        return
+    if fault_va < elf_dbg_watch_vlow or fault_va >= elf_dbg_watch_vhigh:
+        return
+    printk_set_level(PRINTK_LEVEL_WARN)
+    printk2("[438] fault cr3-pml4=%p watched=%p\n",
+            pml4_phys, elf_dbg_watch_pml4)
+    _saved_cr3: uint64 = read_cr3()
+    _boot_cr3: uint64 = cow_boot_cr3()
+    _irq: uint64 = 0
+    if _boot_cr3 != 0:
+        _irq = local_irq_save()
+        load_cr3(_boot_cr3)
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys)
+    e4: uint64 = pml4[(fault_va >> 39) & 0x1FF]
+    e3: uint64 = 0
+    e2: uint64 = 0
+    e1: uint64 = 0
+    if (e4 & PT_FLAG_P) != 0:
+        pdpt: Ptr[uint64] = cast[Ptr[uint64]](e4 & PT_ADDR_MASK)
+        e3 = pdpt[(fault_va >> 30) & 0x1FF]
+        if (e3 & PT_FLAG_P) != 0 and (e3 & PT_FLAG_PS) == 0:
+            pd: Ptr[uint64] = cast[Ptr[uint64]](e3 & PT_ADDR_MASK)
+            e2 = pd[(fault_va >> 21) & 0x1FF]
+            if (e2 & PT_FLAG_P) != 0 and (e2 & PT_FLAG_PS) == 0:
+                pt: Ptr[uint64] = cast[Ptr[uint64]](e2 & PT_ADDR_MASK)
+                e1 = pt[(fault_va >> 12) & 0x1FF]
+    if _boot_cr3 != 0:
+        load_cr3(_saved_cr3)
+        local_irq_restore(_irq)
+    printk_set_level(PRINTK_LEVEL_WARN)
+    printk1("[438] walk dump for va=%p\n", fault_va)
+    printk_set_level(PRINTK_LEVEL_WARN)
+    printk2("[438]   pml4e=%p pdpte=%p\n", e4, e3)
+    printk_set_level(PRINTK_LEVEL_WARN)
+    printk2("[438]   pde=%p pte=%p\n", e2, e1)
+
+
+def elf_dbg_watch_check(tag: uint64):
+    # Validate every leaf PTE of the watched range. Prints (once) on the
+    # first divergence. Walks raw physical table pages under the pristine
+    # boot CR3 (same guard as elf_install_user_mapping).
+    if elf_dbg_watch_pml4 == 0 or elf_dbg_watch_fired != 0:
+        return
+    _saved_cr3: uint64 = read_cr3()
+    _boot_cr3: uint64 = cow_boot_cr3()
+    _irq: uint64 = 0
+    if _boot_cr3 != 0:
+        _irq = local_irq_save()
+        load_cr3(_boot_cr3)
+    bad_va:  uint64 = 0
+    bad_pte: uint64 = 0
+    bad_lvl: uint64 = 0
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](elf_dbg_watch_pml4)
+    va: uint64 = elf_dbg_watch_vlow
+    while va < elf_dbg_watch_vhigh and bad_va == 0:
+        e: uint64 = pml4[(va >> 39) & 0x1FF]
+        if (e & PT_FLAG_P) == 0 or (e & PT_FLAG_NX) != 0:
+            bad_va = va
+            bad_pte = e
+            bad_lvl = 4
+        else:
+            pdpt: Ptr[uint64] = cast[Ptr[uint64]](e & PT_ADDR_MASK)
+            e = pdpt[(va >> 30) & 0x1FF]
+            if (e & PT_FLAG_P) == 0 or (e & PT_FLAG_PS) != 0 \
+                    or (e & PT_FLAG_NX) != 0:
+                bad_va = va
+                bad_pte = e
+                bad_lvl = 3
+            else:
+                pd: Ptr[uint64] = cast[Ptr[uint64]](e & PT_ADDR_MASK)
+                e = pd[(va >> 21) & 0x1FF]
+                if (e & PT_FLAG_P) == 0 or (e & PT_FLAG_PS) != 0 \
+                        or (e & PT_FLAG_NX) != 0:
+                    bad_va = va
+                    bad_pte = e
+                    bad_lvl = 2
+                else:
+                    pt: Ptr[uint64] = cast[Ptr[uint64]](e & PT_ADDR_MASK)
+                    e = pt[(va >> 12) & 0x1FF]
+                    want_phys: uint64 = elf_dbg_watch_phys \
+                        + (va - elf_dbg_watch_vlow)
+                    if (e & PT_FLAG_P) == 0 \
+                            or (e & PT_ADDR_MASK) != want_phys \
+                            or (e & cast[uint64](0x7FF0000000000000)) != 0:
+                        bad_va = va
+                        bad_pte = e
+                        bad_lvl = 1
+        va = va + PAGE_SIZE_4K
+    if _boot_cr3 != 0:
+        load_cr3(_saved_cr3)
+        local_irq_restore(_irq)
+    if bad_va != 0:
+        elf_dbg_watch_fired = 1
+        printk_set_level(PRINTK_LEVEL_WARN)
+        printk2("[438] CORRUPT at tag=%d lvl=%d\n", tag, bad_lvl)
+        printk_set_level(PRINTK_LEVEL_WARN)
+        printk2("[438]   va=%p entry=%p\n", bad_va, bad_pte)
 
 
 def elf_apply_last_user_mapping(pml4_phys: uint64) -> int32:
