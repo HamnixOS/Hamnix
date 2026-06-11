@@ -924,6 +924,52 @@ sys_waitfds:
     .size sys_waitfds, .-sys_waitfds
 
 
+    /* --- sys_semacquire(addr, block) -> int32 ------------------------
+     * #443: native Plan 9 semacquire(2). Waits until the user uint32
+     * at `addr` is > 0, atomically decrements it, returns 1. With
+     * block == 0 it never sleeps and returns 0 if unavailable.
+     * Returns -EINTR (-4) on a signal wake, -EFAULT (-14) on a bad
+     * address. The blocked task sleeps OFF the runqueue on the
+     * kernel's hashed semaphore wait queues (sys/src/9/port/sems.ad).
+     * SysV a0/a1 align with the syscall ABI — no shuffle. */
+    .globl sys_semacquire
+    .type sys_semacquire, @function
+sys_semacquire:
+    movq    $314, %rax              /* SYS_SEMACQUIRE */
+    syscall
+    ret
+    .size sys_semacquire, .-sys_semacquire
+
+
+    /* --- sys_semrelease(addr, count) -> int64 -------------------------
+     * #443: native Plan 9 semrelease(2). Atomically adds `count` (> 0)
+     * to the user uint32 at `addr` and wakes every semacquire waiter
+     * parked on it. Returns count, or -errno. */
+    .globl sys_semrelease
+    .type sys_semrelease, @function
+sys_semrelease:
+    movq    $315, %rax              /* SYS_SEMRELEASE */
+    syscall
+    ret
+    .size sys_semrelease, .-sys_semrelease
+
+
+    /* --- sys_setexitsem(addr) -> int32 --------------------------------
+     * #443: register `addr` as the CALLING task's exit-notification
+     * semaphore. On task exit the kernel semreleases it (atomic
+     * increment + wake) AFTER the task can never touch its user stack
+     * again — so thread_join() is literally semacquire on this word
+     * and may safely reclaim the dead thread's stack on return.
+     * addr == 0 clears a prior registration. Returns 0 / -EFAULT. */
+    .globl sys_setexitsem
+    .type sys_setexitsem, @function
+sys_setexitsem:
+    movq    $316, %rax              /* SYS_SETEXITSEM */
+    syscall
+    ret
+    .size sys_setexitsem, .-sys_setexitsem
+
+
     /* --- sys_pipechan() -> int32 ------------------------------------
      * HAMSH §7: create a local pipe Chan pair; returns the pipe SLOT
      * id (NOT fds). The shell threads the slot into two sys_fdbind

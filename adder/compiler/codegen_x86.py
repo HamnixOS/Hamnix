@@ -64,8 +64,19 @@ ARG_REGS = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"]
 #   asm_volatile(s): general inline asm — emit the string literal verbatim
 #     as a `.text` instruction. Zero-operand for now (the brief's required
 #     #3 extension); supports cli/sti/pause/mfence/etc.
+#   atomic_cas32/64(addr, expected, desired) -> old value: LOCK CMPXCHG.
+#     The swap happened iff the returned old value == expected.
+#   atomic_add32/64(addr, delta) -> old value: LOCK XADD. The new value
+#     in memory is old + delta; a negative delta is passed as its
+#     two's-complement bit pattern (e.g. 0xFFFFFFFF for -1 on the 32-bit
+#     form). These are the language-level SMP primitives userland
+#     mutexes (lib/thread.ad) and the kernel's native semaphore path
+#     (sys/src/9/port/sems.ad) are built on — real LOCK-prefixed
+#     read-modify-writes, not load/op/store sequences.
 X86_INTRINSICS = {"outb", "inb", "outl", "inl", "outw", "inw",
-                  "asm_volatile"}
+                  "asm_volatile",
+                  "atomic_cas32", "atomic_cas64",
+                  "atomic_add32", "atomic_add64"}
 
 
 # Stack-protector: minimum Array[N, T] N to flag a function as canary-
@@ -3825,6 +3836,58 @@ class X86CodeGen:
                 line = line.strip()
                 if line:
                     self.emit(f"    {line}")
+        elif name in ("atomic_cas32", "atomic_cas64"):
+            # atomic_cas32/64(addr, expected, desired) -> OLD value.
+            #
+            # LOCK CMPXCHG: compares the accumulator (expected) with
+            # *addr; if equal, *addr = desired. In BOTH cases the
+            # accumulator ends up holding the value that was in memory
+            # before the instruction (on success it is untouched and
+            # already == expected; on failure the CPU loads it from
+            # memory). So "old == expected" is the success test, with
+            # no separate flags plumbing needed.
+            #
+            # Marshal via push/pop like the other intrinsics so the
+            # argument sub-expressions can use any scratch register:
+            #   args[0] addr     -> %rdx (pointer, any width)
+            #   args[1] expected -> %rax (cmpxchg's implicit operand)
+            #   args[2] desired  -> %rcx (cmpxchg's explicit source)
+            if len(args) != 3:
+                raise CodeGenError(f"{name} expects (addr, expected, desired)")
+            wide = name.endswith("64")
+            self.gen_expr(args[0])           # addr -> %rax
+            self.emit("    pushq %rax")
+            self.gen_expr(args[1])           # expected -> %rax
+            self.emit("    pushq %rax")
+            self.gen_expr(args[2])           # desired -> %rax
+            self.emit("    movq %rax, %rcx")
+            self.emit("    popq %rax")       # expected
+            self.emit("    popq %rdx")       # addr
+            if wide:
+                self.emit("    lock cmpxchgq %rcx, (%rdx)")
+            else:
+                self.emit("    lock cmpxchgl %ecx, (%rdx)")
+                # Zero-extend the 32-bit old value: on the EQUAL path
+                # cmpxchgl leaves %rax untouched, so stale high bits
+                # from the caller's expected expression would leak into
+                # the uint32 result without this.
+                self.emit("    movl %eax, %eax")
+        elif name in ("atomic_add32", "atomic_add64"):
+            # atomic_add32/64(addr, delta) -> OLD value (LOCK XADD).
+            # Memory ends up holding old + delta. Subtraction = pass the
+            # two's-complement bit pattern of the negative delta.
+            if len(args) != 2:
+                raise CodeGenError(f"{name} expects (addr, delta)")
+            wide = name.endswith("64")
+            self.gen_expr(args[0])           # addr -> %rax
+            self.emit("    pushq %rax")
+            self.gen_expr(args[1])           # delta -> %rax
+            self.emit("    popq %rdx")       # addr
+            if wide:
+                self.emit("    lock xaddq %rax, (%rdx)")
+            else:
+                self.emit("    lock xaddl %eax, (%rdx)")
+                self.emit("    movl %eax, %eax")  # zero-extend old value
         else:
             raise CodeGenError(f"x86: unknown intrinsic '{name}'")
 
