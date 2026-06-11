@@ -45,6 +45,13 @@ done
 
 if [ -z "$KELF" ]; then
     echo "$MARKER no kernel ELF found; building a kernel..." >&2
+    # The kernel links against generated initramfs accessors
+    # (initramfs_cpio_base/size in fs/initramfs_blob.S), so the blob must
+    # be (re)generated before the compile — same recipe as
+    # test_thread_leader_exit.sh. Restore the default blob on exit so we
+    # don't leave a surprise embedded cpio for the next build.
+    trap 'INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
+    python3 scripts/build_initramfs.py
     python3 -m compiler.adder compile --target=x86_64-bare-metal \
         init/main.ad -o build/hamnix-framecheck-kernel.elf
     KELF=build/hamnix-framecheck-kernel.elf
@@ -54,9 +61,11 @@ echo "$MARKER checking $KELF"
 
 # Extract do_syscall's disassembly (from its label line to the next
 # function label).
+# NB: awk must consume objdump's whole stream (no early `exit`) — exiting
+# mid-pipe SIGPIPEs objdump, and set -e -o pipefail turns that into rc=141.
 DIS="$(objdump -d "$KELF" | awk '
     /^[0-9a-f]+ <do_syscall>:$/ { infn = 1; next }
-    infn && /^[0-9a-f]+ <.*>:$/ { exit }
+    infn && /^[0-9a-f]+ <.*>:$/ { infn = 0 }
     infn { print }
 ')"
 
