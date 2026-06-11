@@ -2864,6 +2864,20 @@ if os.environ.get("ENABLE_MOUSETEST_SELFTEST") == "1":
     FILES.append(("/etc/hamui-mouse-test", b"1\n"))
 
 
+# Event-driven compositor scheduling proof
+# (scripts/test_hamUI_evloop_gop.sh, ENABLE_EVLOOP_SELFTEST=1). Same shape as
+# the markers above: plant /etc/hamui-evloop-test so the PROVEN 2-token
+# `hamUId daemon` autostart routes into the autoflag-51 event-loop self-test,
+# which asserts evl_wait() really parks in sys_waitfds (jiffy-verified),
+# markup bodies re-rasterize ONLY on a per-layer gen change (idle frames do
+# ZERO body reads / presents), the gen-triggered present is bounded by the
+# window rect, a dead child's EOF'd stdout pipe gets closed (no hot-spin),
+# and a pure cursor move stays on the blit fast path. Runs once, exits 0.
+# Test build only.
+if os.environ.get("ENABLE_EVLOOP_SELFTEST") == "1":
+    FILES.append(("/etc/hamui-evloop-test", b"1\n"))
+
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
@@ -3253,7 +3267,8 @@ def build_archive() -> bytes:
                                 or os.environ.get("ENABLE_SPINE_SELFTEST") == "1"
                                 or os.environ.get("ENABLE_TERM_SELFTEST") == "1"
                                 or os.environ.get("ENABLE_MENUTERM_SELFTEST") == "1"
-                                or os.environ.get("ENABLE_MOUSETEST_SELFTEST") == "1") \
+                                or os.environ.get("ENABLE_MOUSETEST_SELFTEST") == "1"
+                                or os.environ.get("ENABLE_EVLOOP_SELFTEST") == "1") \
                                 and ef.name == "services.d" \
                                 and sub.name == "hamde.svc":
                             print("  [selftest] skipping "

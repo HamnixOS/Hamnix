@@ -66,6 +66,11 @@ extern def sys_pipe(fds: Ptr[int32]) -> int32
 # this daemon composites the result like any other window).
 extern def sys_vk_window_frame(wid: int32, reserved: int32,
                                frame: int64) -> int64
+# Event loop (#evloop): native multi-fd readiness wait (SYS_WAITFDS=313).
+# Returns the lowest ready index, -1 on timeout, -4 on EINTR; timeout_ms
+# <= 0 polls once. The daemon parks here instead of sys_yield-spinning.
+extern def sys_waitfds(fds: Ptr[int32], nfds: uint64, timeout_ms: int64) -> int64
+extern def sys_getpid() -> int32
 
 
 # ---- window + layer caps (mirror the kernel cdev surface) ----------
@@ -881,6 +886,26 @@ def read_layer_opacity(wid: int32, slot: uint64) -> int64:
     sys_close(fd)
     if n <= 0:
         return 255
+    return parse_i64_span(&num_buf[0], 0, cast[uint64](n))
+
+
+# EVLOOP: read the per-layer content generation counter for window `wid`'s
+# "ui" layer — /dev/wsys/<wid>/draw/ui/gen, "<gen>\n". The read is PURE
+# (never consumes the markup body, never bumps the counter), so it is the
+# cheap "did the client repaint?" probe the event loop polls instead of
+# unconditionally re-rasterizing bodies. Returns -1 when the layer (or its
+# gen leaf) is not available.
+def read_layer_gen_ui(wid: int32) -> int64:
+    if wid < 2:
+        return -1
+    build_path(wid, "ui", "gen")
+    fd: int32 = sys_open(cast[Ptr[char]](&path_buf[0]))
+    if fd < 0:
+        return -1
+    n: int64 = read_whole(fd, &num_buf[0], 64)
+    sys_close(fd)
+    if n <= 0:
+        return -1
     return parse_i64_span(&num_buf[0], 0, cast[uint64](n))
 
 
@@ -1750,6 +1775,7 @@ def daemon_markup_read_body(wi: uint64) -> int32:
     markup_body_bw[wi] = body_w
     markup_body_bh[wi] = body_h
     markup_body_ready[wi] = 1
+    EVL_STAT_BODY_READS = EVL_STAT_BODY_READS + 1
     return 1
 
 
@@ -1794,25 +1820,39 @@ def markup_sync():
         if DWIN_MARKUP[wi] == 0 and markup_client_probe(wi) != 0:
             DWIN_MARKUP[wi] = 1
             newly_detected = 1
-        # DEPERF #410: the EXPENSIVE part — daemon_markup_read_body's
-        # composite_window /dev/wsys file read — runs when the coarse frame
-        # tick says a body re-read is due (MARKUP_DUE), OR the FIRST time a
-        # window is detected as a markup client (newly_detected). The latter
-        # guarantees a freshly-spawned client's content rasterises on the SAME
-        # present that detects it, instead of waiting up to MARKUP_SYNC_EVERY
-        # frames for the next due tick — which matters both for snappy window
-        # opens AND for direct daemon_present() callers (self-tests) that
-        # bypass the main loop's MARKUP_DUE re-arm. Cursor-only and window-move
-        # presents (no new client, no due tick) still pay ZERO markup file I/O.
-        if (MARKUP_DUE != 0 or newly_detected != 0) and DWIN_MARKUP[wi] != 0:
-            if daemon_markup_read_body(wi) != 0:
-                # Body content changed -> its surface cache is stale.
-                DWIN_CONTENT_DIRTY[wi] = 1
+        # EVLOOP: the EXPENSIVE part — daemon_markup_read_body's
+        # composite_window /dev/wsys file read — is GEN-GATED. A body
+        # re-read runs only when:
+        #   * the kernel's per-layer gen counter says the client repainted
+        #     since our last rasterize (g != evl_gen[wi]),
+        #   * the window was JUST detected as a markup client (so its
+        #     content rasterises on the same present that detects it),
+        #   * the cached body was invalidated (raise/close slot moves,
+        #     resize), or
+        #   * MARKUP_DUE forces a one-shot re-read of everything (first
+        #     present, workspace switch, theme recolour).
+        # Cursor-only and window-move presents pay ONE pure gen read per
+        # markup window and ZERO body rasterizes when nothing changed.
+        if DWIN_MARKUP[wi] != 0:
+            # Read gen BEFORE the body so a client repaint racing the
+            # rasterize bumps gen past evl_gen and re-triggers next frame.
+            g: int64 = read_layer_gen_ui(DWIN_WID[wi])
+            due: int32 = 0
+            if MARKUP_DUE != 0 or newly_detected != 0:
+                due = 1
+            if markup_body_ready[wi] == 0:
+                due = 1
+            if g >= 0 and g != evl_gen[wi]:
+                due = 1
+            if due != 0:
+                if daemon_markup_read_body(wi) != 0:
+                    # Body content changed -> its surface cache is stale.
+                    DWIN_CONTENT_DIRTY[wi] = 1
+                    evl_gen[wi] = g
         wi = wi + 1
-    # DEPERF #410: a due tick has now been serviced by this present; clear it
-    # so subsequent presents this tick (cursor moves, window drags) skip the
-    # /dev/wsys body reads entirely. The main loop re-arms MARKUP_DUE every
-    # MARKUP_SYNC_EVERY frames.
+    # The one-shot force latch has been serviced by this present; clear it
+    # so subsequent presents (cursor moves, window drags) are purely
+    # gen-gated.
     MARKUP_DUE = 0
 
 
@@ -8387,17 +8427,39 @@ CUR_Y: int64 = 0
 LAST_CUR_X: int64 = 0
 LAST_CUR_Y: int64 = 0
 DAMAGE_PENDING: int32 = 0
-# DEPERF #410: markup-client file-read throttle. markup_sync() does N
-# /dev/wsys file reads (one composite_window per markup window) and MUST NOT
-# run on the per-present hot path — especially not on cursor-only or window-
-# move presents. We gate it to a coarse frame tick so a busy mouse pays ZERO
-# markup file I/O. MARKUP_SYNC_EVERY frames between body re-reads; counted by
-# the main loop, which then sets MARKUP_DUE so the next present's
-# window_cache_sync actually reads bodies. A one-shot probe still latches
-# DWIN_MARKUP cheaply (no body read) so client auto-detect is unaffected.
-MARKUP_SYNC_EVERY: uint64 = 8
-MARKUP_SYNC_CTR:   uint64 = 0
+# EVLOOP: markup-client body reads are GEN-GATED, not frame-throttled.
+# The kernel exports /dev/wsys/<N>/draw/<layer>/gen — a read-only per-layer
+# content generation counter bumped +1 per successful markup/fb write
+# (reading it never consumes the body). markup_sync() re-reads a window's
+# body ONLY when its ui-layer gen differs from the last gen we rasterized
+# (cached in evl_gen[]), when the client was newly detected, or when the
+# cached body was invalidated (markup_body_ready==0). MARKUP_DUE stays as
+# a one-shot "force re-read everything" latch (first present, workspace
+# switch, theme recolour) — there is NO periodic every-N-frames re-read
+# any more.
 MARKUP_DUE:        int32 = 1     # force a body re-read on the first present
+# evl_gen[wi]: ui-layer gen at the time of the slot's last successful body
+# rasterize; -1 = never read / unknown (forces a read when gen is exposed).
+evl_gen: Array[8, int64]         # DMAX slots
+# Event-loop wait state: fds the daemon parks on in sys_waitfds.
+evl_wait_fds: Array[16, int32]   # _VFS_NR_FDS cap
+# Adaptive wait timeouts (ms): fast while a cycle overlay counts idle
+# frames, anim while any time-based animation is live (notify fade, OSD
+# TTL, urgent blink, drag, keyboard mode), idle otherwise (clock tick +
+# sysmon refresh only need ~1s granularity; 250ms keeps them snappy).
+EVL_TIMEOUT_FAST_MS: int64 = 10
+EVL_TIMEOUT_ANIM_MS: int64 = 30
+EVL_TIMEOUT_IDLE_MS: int64 = 250
+EVL_LAST_HK_JIFFY: uint64 = 0    # once-per-second housekeeping gate
+EVL_PREV_WINS: uint64 = 0        # window-count delta tracking across frames
+EVL_NOTIFY_LAST_ALPHA: int64 = -1  # last painted notify alpha (-1 = none)
+EVL_URGENT_LAST_ON: int32 = -1   # last painted urgent-blink phase
+# Observable event-loop counters (read by the evloop selftest; also handy
+# for ad-hoc perf triage). PRESENTS counts daemon_flush_damage presents,
+# BODY_READS counts successful markup body rasterizes, WAITS counts parks.
+EVL_STAT_WAITS: uint64 = 0
+EVL_STAT_PRESENTS: uint64 = 0
+EVL_STAT_BODY_READS: uint64 = 0
 # ---- DEPERF: per-frame dirty-rectangle accumulator -----------------
 # The main loop used to force a FULL-SCREEN recomposite (daemon_present,
 # O(W*H*windows)) on nearly every event — a single shell line, a hover
@@ -9379,7 +9441,16 @@ def term_pump(slot: uint64) -> int32:
     while iters < 16:
         n: int64 = sys_read_nb(fd, &term_rx[0], 1024)
         iters = iters + 1
-        if n <= 0:
+        if n < 0:
+            # TRUE EOF: the child exited and no writer holds the pipe.
+            # An EOF'd pipe reads as permanently "ready" to sys_waitfds,
+            # so a dead child's stdout would otherwise hot-spin the event
+            # loop forever. Close it and forget the fd; the window keeps
+            # its last grid contents.
+            sys_close(fd)
+            DWIN_OUT_FD[slot] = -1
+            break
+        if n == 0:
             break
         term_feed(slot, &term_rx[0], n)
         got = 1
@@ -11326,8 +11397,9 @@ def daemon_present_rect(x0: int64, y0: int64, x1: int64, y1: int64) -> int32:
     # composite. A pure window move leaves every cache valid (rerendered==0)
     # so the rect is blitted from cache; a content-dirty window is refilled
     # once here, then read from cache for each pixel in the rect. markup_sync's
-    # EXPENSIVE /dev/wsys body reads are gated by MARKUP_DUE (DEPERF #410), so
-    # a window-move present pays no markup file I/O.
+    # EXPENSIVE /dev/wsys body reads are GEN-GATED (EVLOOP: per-layer gen
+    # counter, plus the one-shot MARKUP_DUE latch), so a window-move present
+    # pays no markup body I/O when no client repainted.
     window_cache_sync()
     sw: int64 = cast[int64](FBG_W)
     sh: int64 = cast[int64](FBG_H)
@@ -11501,6 +11573,7 @@ def damage_full():
 def daemon_flush_damage() -> int32:
     if DMG_VALID == 0:
         return 0
+    EVL_STAT_PRESENTS = EVL_STAT_PRESENTS + 1
     if DMG_FULL != 0:
         daemon_present()
         damage_reset()
@@ -11634,6 +11707,7 @@ def daemon_spawn_window_prog(prog: Ptr[char],
     DWIN_VK[slot] = 0
     DWIN_MARKUP[slot] = 0              # set later if the window publishes "ui"
     markup_body_ready[slot] = 0
+    evl_gen[slot] = -1              # EVLOOP: no body rasterized yet
     DWIN_APP[slot] = APP_TERM
     DWIN_SNAP[slot] = 0
     DWIN_SHADED[slot] = 0
@@ -11711,6 +11785,7 @@ def daemon_spawn_app(app: int32, rx: int64, ry: int64, rw: int64, rh: int64):
     DWIN_VK[slot] = 0
     DWIN_MARKUP[slot] = 0              # built-in apps draw procedurally
     markup_body_ready[slot] = 0
+    evl_gen[slot] = -1              # EVLOOP: no body rasterized yet
     DWIN_APP[slot] = app
     DWIN_SNAP[slot] = 0
     DWIN_SHADED[slot] = 0
@@ -11906,6 +11981,14 @@ def slot_copy(dst: uint64, src: uint64):
     while i < GRID_CELLS:
         term_grid[db + i] = term_grid[sb + i]
         i = i + 1
+    # EVLOOP: markup-client identity travels with the window. The body
+    # buffers are too big to move, so invalidate the cached body instead;
+    # markup_sync treats a flagged-but-not-ready slot as due and
+    # re-rasterizes it on the next present (gen-gating alone would
+    # otherwise leave a compacted markup window blank forever).
+    DWIN_MARKUP[dst] = DWIN_MARKUP[src]
+    evl_gen[dst] = evl_gen[src]
+    markup_body_ready[dst] = 0
     # DEPERF #409: a different window now lives in `dst`; its cached
     # backbuffer is stale. Invalidate so it refills on the next composite
     # (slot_copy runs only during table compaction on close — rare).
@@ -12097,6 +12180,19 @@ def slot_swap(a: uint64, b: uint64):
         term_grid[ab + i] = term_grid[bb + i]
         term_grid[bb + i] = g
         i = i + 1
+    # EVLOOP: markup-client identity travels with the window on a raise.
+    # The body buffers are too big to swap; invalidate both cached bodies
+    # so markup_sync (which treats flagged-but-not-ready as due) re-reads
+    # them on the next present. Without this, gen-gating would leave a
+    # raised markup window's body blank/stale forever.
+    imk: int32 = DWIN_MARKUP[a]
+    DWIN_MARKUP[a] = DWIN_MARKUP[b]
+    DWIN_MARKUP[b] = imk
+    eg: int64 = evl_gen[a]
+    evl_gen[a] = evl_gen[b]
+    evl_gen[b] = eg
+    markup_body_ready[a] = 0
+    markup_body_ready[b] = 0
     # DEPERF #409: a slot swap moves window state between cache slots and
     # changes which window is front-most (focus chrome). Rather than swap
     # the bulky per-slot backbuffers, invalidate both slots so each is
@@ -23802,6 +23898,216 @@ def daemon_menu_term_selftest(scr_w: int64, scr_h: int64):
     write_str(1, "[menuterm] PASS\n")
 
 
+# ====================================================================
+# EVENT-LOOP self-test (autoflag == 51)
+# ====================================================================
+# Proves the compositor's EVENT-DRIVEN scheduling end-to-end on a real
+# framebuffer, against the SAME daemon_frame()/evl_wait() code the live
+# loop runs:
+#   park_ok            evl_wait() really SLEEPS in sys_waitfds (jiffy-
+#                      verified wall-clock delta) — not a yield spin.
+#   detect_ok          a client publishing a "ui" markup layer is auto-
+#                      detected by the gen-driven frame path and its body
+#                      rasterized — no periodic re-read needed.
+#   idle_norerender_ok with NO gen change, repeated frames do ZERO markup
+#                      body re-rasterizes (the old unconditional every-8-
+#                      frames re-read is gone).
+#   idle_nopresent_ok  ...and present nothing at all.
+#   gen_rerender_ok    ONE client repaint (a markup write bumps the kernel
+#                      per-layer gen counter) triggers a body re-read
+#                      within a bounded number of frames.
+#   gen_bounded_ok     that re-read presents ONLY the window's rect (no
+#                      full-screen recomposite).
+#   gen_consumed_ok    the gen edge is consumed: counters stable again.
+#   park_live_ok       with a live markup window (and the dead child's
+#                      EOF'd stdout pipe already closed by term_pump),
+#                      evl_wait still really sleeps — proves a dead
+#                      child's pipe cannot hot-spin the loop.
+#   cursor_cheap_ok    a pure cursor move neither re-rasterizes a body nor
+#                      flushes a damage present (cursor-cell fast path).
+# Markers print as "[evloop] <name>=0|1" + a final PASS/FAIL.
+
+def evl_mark(name: Ptr[uint8], ok: int32):
+    write_str(1, "[evloop] ")
+    write_str(1, name)
+    if ok != 0:
+        write_str(1, "=1\n")
+    else:
+        write_str(1, "=0\n")
+
+
+def daemon_evloop_selftest(scr_w: int64, scr_h: int64):
+    CUR_WS = 0
+    fail: int32 = 0
+    write_str(1, "[evloop] start\n")
+
+    # --- Settle: drain any boot-time input noise so the park legs below
+    # measure a genuinely idle wait (a stray buffered mouse/console byte
+    # would make sys_waitfds return immediately).
+    st: int32 = 0
+    while st < 3:
+        daemon_frame(scr_w, scr_h)
+        st = st + 1
+
+    # --- park: evl_wait must really sleep (idle timeout: no windows, no
+    # animations -> EVL_TIMEOUT_IDLE_MS=250, i.e. ~25 jiffies at HZ=100).
+    j0: uint64 = sys_get_jiffies()
+    evl_wait()
+    j1: uint64 = sys_get_jiffies()
+    park_ok: int32 = 0
+    if j1 - j0 >= 10:
+        park_ok = 1
+    evl_mark("park_ok", park_ok)
+    if park_ok == 0:
+        fail = 1
+
+    # --- spawn a chrome-only window with a real kernel wid (the /bin/true
+    # child exits immediately — which also exercises the EOF-pipe close in
+    # term_pump, see park_live_ok below).
+    win_x: int64 = 700
+    win_y: int64 = 120
+    win_w: int64 = 320
+    win_h: int64 = 260
+    if win_x + win_w > scr_w:
+        win_x = scr_w - win_w - 8
+    if win_x < 0:
+        win_x = 8
+    daemon_spawn_window_prog(cast[Ptr[char]]("/bin/true"),
+                             win_x, win_y, win_w, win_h)
+    if DWIN_COUNT == 0:
+        write_str(1, "[evloop] FAIL no window spawned\n")
+        return
+    sl: uint64 = DWIN_COUNT - 1
+    wid: int32 = DWIN_WID[sl]
+    if wid < 2:
+        write_str(1, "[evloop] FAIL no wid for window\n")
+        return
+    bw: int64 = DWIN_W[sl] - 4
+    bh: int64 = DWIN_H[sl] - TITLE_H - 2
+    # Inject a hamui-style "ui" markup layer exactly like a real client.
+    if mkc_inject_ui(wid, bw, bh) == 0:
+        write_str(1, "[evloop] FAIL cannot inject ui markup\n")
+        return
+
+    # --- detect: the gen-driven frame path must auto-detect the client
+    # and rasterize its first body within a few frames (no MARKUP_DUE
+    # periodic tick exists to do it for us any more).
+    fr: int32 = 0
+    while fr < 10 and (DWIN_MARKUP[sl] == 0 or markup_body_ready[sl] == 0):
+        daemon_frame(scr_w, scr_h)
+        fr = fr + 1
+    detect_ok: int32 = 0
+    if DWIN_MARKUP[sl] != 0 and markup_body_ready[sl] != 0:
+        detect_ok = 1
+    evl_mark("detect_ok", detect_ok)
+    if detect_ok == 0:
+        write_str(1, "[evloop] FAIL\n")
+        return
+
+    # --- idle: no gen change -> ZERO body re-rasterizes and ZERO presents
+    # across many frames. This is the heart of the event-driven rewrite:
+    # the old loop re-read every markup body every 8th frame forever.
+    # (Pin the housekeeping clock so the once-a-second panel/clock refresh
+    # can't fire mid-assertion and confuse the present counters.)
+    EVL_LAST_HK_JIFFY = sys_get_jiffies()
+    base_reads: uint64 = EVL_STAT_BODY_READS
+    base_pres: uint64 = EVL_STAT_PRESENTS
+    fi: int32 = 0
+    while fi < 10:
+        daemon_frame(scr_w, scr_h)
+        fi = fi + 1
+    idle_reads_ok: int32 = 0
+    if EVL_STAT_BODY_READS == base_reads:
+        idle_reads_ok = 1
+    evl_mark("idle_norerender_ok", idle_reads_ok)
+    if idle_reads_ok == 0:
+        fail = 1
+    idle_pres_ok: int32 = 0
+    if EVL_STAT_PRESENTS == base_pres:
+        idle_pres_ok = 1
+    evl_mark("idle_nopresent_ok", idle_pres_ok)
+    if idle_pres_ok == 0:
+        fail = 1
+
+    # --- gen: ONE client repaint bumps the kernel per-layer gen counter;
+    # the next frames must re-read the body (bounded count) and present
+    # only the window's own rect.
+    if mkc_inject_ui(wid, bw, bh) == 0:
+        write_str(1, "[evloop] FAIL cannot re-inject ui markup\n")
+        return
+    EVL_LAST_HK_JIFFY = sys_get_jiffies()
+    g_reads: uint64 = EVL_STAT_BODY_READS
+    fg: int32 = 0
+    while fg < 5 and EVL_STAT_BODY_READS == g_reads:
+        daemon_frame(scr_w, scr_h)
+        fg = fg + 1
+    gen_rerender_ok: int32 = 0
+    if EVL_STAT_BODY_READS > g_reads:
+        gen_rerender_ok = 1
+    evl_mark("gen_rerender_ok", gen_rerender_ok)
+    if gen_rerender_ok == 0:
+        fail = 1
+    gen_bounded_ok: int32 = 0
+    if DMG_LAST_FULL == 0 and DMG_LAST_AREA <= DWIN_W[sl] * DWIN_H[sl]:
+        gen_bounded_ok = 1
+    evl_mark("gen_bounded_ok", gen_bounded_ok)
+    if gen_bounded_ok == 0:
+        fail = 1
+    # ...and the gen edge is consumed: counters stable again afterwards.
+    c_reads: uint64 = EVL_STAT_BODY_READS
+    fc: int32 = 0
+    while fc < 10:
+        daemon_frame(scr_w, scr_h)
+        fc = fc + 1
+    gen_consumed_ok: int32 = 0
+    if EVL_STAT_BODY_READS == c_reads:
+        gen_consumed_ok = 1
+    evl_mark("gen_consumed_ok", gen_consumed_ok)
+    if gen_consumed_ok == 0:
+        fail = 1
+
+    # --- park_live: the /bin/true child exited long ago; its stdout pipe
+    # hit EOF and term_pump must have CLOSED it (DWIN_OUT_FD == -1), or
+    # this wait would return instantly forever (EOF pipes are permanently
+    # "ready" to sys_waitfds). A markup window is on screen so the timeout
+    # is EVL_TIMEOUT_ANIM_MS=30 (~3 jiffies); assert the wait really
+    # slept >= 2 jiffies AND the fd is gone.
+    pl_fd_ok: int32 = 0
+    if DWIN_OUT_FD[sl] < 0:
+        pl_fd_ok = 1
+    pj0: uint64 = sys_get_jiffies()
+    evl_wait()
+    pj1: uint64 = sys_get_jiffies()
+    park_live_ok: int32 = 0
+    if pl_fd_ok != 0 and pj1 - pj0 >= 2:
+        park_live_ok = 1
+    evl_mark("park_live_ok", park_live_ok)
+    if park_live_ok == 0:
+        fail = 1
+
+    # --- cursor: a pure pointer move must neither re-rasterize a markup
+    # body nor flush a damage present (it takes the cursor-cell blit fast
+    # path). Move the cursor a little and run one frame.
+    EVL_LAST_HK_JIFFY = sys_get_jiffies()
+    cu_reads: uint64 = EVL_STAT_BODY_READS
+    cu_pres: uint64 = EVL_STAT_PRESENTS
+    CUR_X = CUR_X + 15
+    if CUR_X >= scr_w - 2:
+        CUR_X = scr_w - 20
+    daemon_frame(scr_w, scr_h)
+    cursor_cheap_ok: int32 = 0
+    if EVL_STAT_BODY_READS == cu_reads and EVL_STAT_PRESENTS == cu_pres:
+        cursor_cheap_ok = 1
+    evl_mark("cursor_cheap_ok", cursor_cheap_ok)
+    if cursor_cheap_ok == 0:
+        fail = 1
+
+    if fail != 0:
+        write_str(1, "[evloop] FAIL\n")
+        return
+    write_str(1, "[evloop] PASS\n")
+
+
 def daemon_vk_window_selftest(scr_w: int64, scr_h: int64):
     # --- Step 1: create a normal window at a fixed on-screen position.
     # 320x260 box on the RIGHT half (clear of the kernel fb text console
@@ -24427,6 +24733,325 @@ def daemon_pump_terms() -> int32:
     return changed
 
 
+# ====================================================================
+# EVLOOP — event-driven compositor scheduling
+# ====================================================================
+# The main loop no longer busy-polls (sys_yield each iteration) or
+# re-rasterizes markup bodies on a blind every-N-frames tick. Instead it:
+#   1. runs ONE frame of event processing + damage accumulation
+#      (daemon_frame), presenting only what changed, then
+#   2. PARKS in sys_waitfds on the daemon's input fds (mouse, console,
+#      every window's stdout pipe) with an adaptive timeout (evl_wait).
+# Idle CPU is ~zero: with nothing animating the daemon sleeps in the
+# kernel waitfds WaitQueue for EVL_TIMEOUT_IDLE_MS per wake, and a wake
+# does no present unless something actually damaged the scene.
+#
+# Markup clients (hamterm etc.) repaint by WRITING their wsys layer, which
+# is not an fd the daemon can park on — so each frame polls the kernel's
+# pure per-layer gen counter (/dev/wsys/<N>/draw/ui/gen) and damages a
+# window ONLY when its gen moved (evl_poll_markup). The expensive body
+# rasterize then happens inside the present via the gen-gated markup_sync.
+
+# Jiffy of the last window-count increase: freshly-spawned clients get an
+# ANIM-cadence detection boost (snappy first paint) without committing a
+# long-lived plain terminal to fast polling forever.
+EVL_SPAWN_BOOST_JIFFY: uint64 = 0
+EVL_SPAWN_BOOST_TTL: uint64 = 300        # jiffies (3 s)
+
+
+# Per-frame markup damage generator: detect new markup clients and pick up
+# repaints signalled by the kernel's per-layer gen counter. Pure reads only
+# (an open probe / a gen read); the body rasterize stays in markup_sync.
+def evl_poll_markup():
+    wi: uint64 = 0
+    while wi < DWIN_COUNT:
+        if win_on_cur_ws(wi) == 0:
+            wi = wi + 1
+            continue
+        if DWIN_APP[wi] != APP_TERM or DWIN_VK[wi] != 0:
+            wi = wi + 1
+            continue
+        if DWIN_MARKUP[wi] == 0:
+            # Not yet detected: cheap open()+close() probe. On first
+            # publish, damage the window — the present's markup_sync then
+            # latches DWIN_MARKUP and rasterizes the first body.
+            if markup_client_probe(wi) != 0:
+                damage_window(wi)
+        else:
+            # Detected client: did it repaint since our last rasterize?
+            g: int64 = read_layer_gen_ui(DWIN_WID[wi])
+            if markup_body_ready[wi] == 0 or (g >= 0 and g != evl_gen[wi]):
+                damage_window(wi)
+        wi = wi + 1
+
+
+# Gather the fds the daemon should park on. Order is stable (mouse,
+# console, then window pipes) but irrelevant: any readiness wakes the
+# loop, which re-pumps everything. Capped at the kernel's 16-fd limit.
+def evl_collect_fds() -> uint64:
+    n: uint64 = 0
+    if mouse_fd >= 0:
+        evl_wait_fds[n] = mouse_fd
+        n = n + 1
+    if cons_fd >= 0:
+        evl_wait_fds[n] = cons_fd
+        n = n + 1
+    wi: uint64 = 0
+    while wi < DWIN_COUNT and n < 16:
+        if DWIN_OUT_FD[wi] >= 0:
+            evl_wait_fds[n] = DWIN_OUT_FD[wi]
+            n = n + 1
+        wi = wi + 1
+    return n
+
+
+# 1 while any visible program-backed window is a (potential) markup client
+# whose repaints we can only see by polling its gen counter: a detected
+# markup window, or — within the post-spawn boost window — a candidate
+# that has not published its "ui" layer yet.
+def evl_markup_poll_hot() -> int32:
+    nowj: uint64 = sys_get_jiffies()
+    boost: int32 = 0
+    if EVL_SPAWN_BOOST_JIFFY != 0 and nowj - EVL_SPAWN_BOOST_JIFFY < EVL_SPAWN_BOOST_TTL:
+        boost = 1
+    wi: uint64 = 0
+    while wi < DWIN_COUNT:
+        if win_on_cur_ws(wi) != 0 and DWIN_APP[wi] == APP_TERM and DWIN_VK[wi] == 0:
+            if DWIN_MARKUP[wi] != 0:
+                return 1
+            if boost != 0 and DWIN_WID[wi] >= 2:
+                return 1
+        wi = wi + 1
+    return 0
+
+
+# Adaptive park timeout. FAST while the alt-tab cycler is counting idle
+# frames toward its auto-commit; ANIM while anything animates on a frame
+# cadence (drag rubber band, keyboard move/resize accent, notification
+# fade, OSD popups, urgency blink) or a markup client needs gen polling;
+# IDLE otherwise — the once-a-second clock/stat refresh only needs the
+# park to wake a few times a second.
+def evl_timeout_ms() -> int64:
+    if CYCLE_OPEN != 0:
+        return EVL_TIMEOUT_FAST_MS
+    if DRAG_ACTIVE != 0 or KMODE != 0:
+        return EVL_TIMEOUT_ANIM_MS
+    if NOTIFY_ACTIVE != 0:
+        return EVL_TIMEOUT_ANIM_MS
+    if osd_active() != 0 or ws_name_osd_active() != 0:
+        return EVL_TIMEOUT_ANIM_MS
+    if any_window_urgent() != 0:
+        return EVL_TIMEOUT_ANIM_MS
+    if evl_markup_poll_hot() != 0:
+        return EVL_TIMEOUT_ANIM_MS
+    return EVL_TIMEOUT_IDLE_MS
+
+
+# Park until input arrives or the adaptive timeout lapses. This is the
+# replacement for the old per-iteration sys_yield() busy-poll: the task
+# sleeps on the kernel waitfds WaitQueue (a real sleep — jiffy-verified by
+# tests/test_wsys_gen_waitfds.ad) and is woken by the pipe / console /
+# pointer producers directly.
+def evl_wait():
+    EVL_STAT_WAITS = EVL_STAT_WAITS + 1
+    n: uint64 = evl_collect_fds()
+    if n == 0:
+        # Defensive: nothing to park on (headless bring-up). Yield so we
+        # never hard-spin.
+        sys_yield()
+        return
+    sys_waitfds(&evl_wait_fds[0], n, evl_timeout_ms())
+
+
+# Damage exactly the notification banner's screen rectangle (mirrors the
+# banner placement in daemon_pixel). Used so the fade repaints a 260x44
+# box, not the whole screen, and so the final expiry erases it.
+def damage_notify_banner():
+    nbx: int64 = cast[int64](FBG_W) - NOTIFY_W - 8
+    nby: int64 = work_top(cast[int64](FBG_H)) + 8
+    if nbx < 0:
+        nbx = 0
+    damage_rect(nbx, nby, nbx + NOTIFY_W, nby + NOTIFY_H)
+
+
+# ONE frame of the event-driven main loop: pump every input source, turn
+# what actually changed into damage, present the damage union (or take the
+# cursor-cell fast path), and run coarse once-a-second housekeeping on the
+# real jiffy clock. Returns 1 when the daemon should quit (logout /
+# shutdown), else 0. Called by the main loop after every evl_wait() wake;
+# also drivable standalone by selftests to simulate frames.
+def daemon_frame(scr_w: int64, scr_h: int64) -> int32:
+    WM_FRAME = WM_FRAME + 1
+    # Start this frame's damage accumulation BEFORE the pumps so the
+    # damage they raise internally (a busy shell's own window rect from
+    # daemon_pump_terms) survives into this frame's flush. (The old loop
+    # reset AFTER pumping, silently dropping that damage.)
+    damage_reset()
+    ch: int32 = daemon_pump_mouse(scr_w, scr_h)
+    # Route keystrokes to the focused window's shell, then drain
+    # every shell's stdout into its terminal grid.
+    daemon_pump_keys(scr_w, scr_h)
+    # Alt-tab cycler: while the switcher popup is up, count idle frames
+    # since the last cycle keypress; auto-commit (raise the selection)
+    # once the user stops pressing F5/F6 (MATE releases on key-up). The
+    # park timeout drops to EVL_TIMEOUT_FAST_MS while the cycler is open
+    # so this idle count still converges quickly.
+    if CYCLE_OPEN != 0:
+        if CYCLE_PRESSED != 0:
+            CYCLE_IDLE = 0
+        else:
+            CYCLE_IDLE = CYCLE_IDLE + 1
+            if CYCLE_IDLE >= CYCLE_COMMIT:
+                cycle_commit()
+        ch = 1
+    CYCLE_PRESSED = 0
+    daemon_pump_terms()
+    # EVLOOP: markup-client refresh is GEN-DRIVEN. evl_poll_markup damages
+    # a markup window ONLY when the kernel's per-layer gen counter says the
+    # client repainted (or a new client published its "ui" layer); the
+    # present's markup_sync then re-rasterizes exactly those bodies. There
+    # is no periodic every-N-frames body re-read any more: a still desktop
+    # pays a pure gen read per visible client and NOTHING else.
+    evl_poll_markup()
+    cursor_moved: int32 = 0
+    if CUR_X != LAST_CUR_X or CUR_Y != LAST_CUR_Y:
+        cursor_moved = 1
+    # A mouse packet that mutated the scene (click/drag/menu/hover
+    # highlight/focus-raise). These are interaction-driven (not per-frame
+    # continuous) and can touch arbitrary regions (popups grow off-bar,
+    # z-order raises move whole windows), so keep them whole-screen for
+    # correctness — they are rare relative to the continuous costs above.
+    if MOUSE_SCENE_DIRTY != 0:
+        damage_full()
+        MOUSE_SCENE_DIRTY = 0
+    # A hover-highlight-only change repaints just the window that lost the
+    # highlight and the one that gained it — bounded by each window's own
+    # frame — instead of a whole-screen recomposite on pointer motion.
+    if MOUSE_HOVER_DIRTY != 0:
+        if MOUSE_HOVER_OLD >= 0 and cast[uint64](MOUSE_HOVER_OLD) < DWIN_COUNT:
+            damage_window(cast[uint64](MOUSE_HOVER_OLD))
+        if MOUSE_HOVER_NEW >= 0 and cast[uint64](MOUSE_HOVER_NEW) < DWIN_COUNT \
+           and MOUSE_HOVER_NEW != MOUSE_HOVER_OLD:
+            damage_window(cast[uint64](MOUSE_HOVER_NEW))
+        MOUSE_HOVER_DIRTY = 0
+        MOUSE_HOVER_OLD = -1
+        MOUSE_HOVER_NEW = -1
+    # A drag is in progress (rubber band must track the pointer, which
+    # is more than the cursor cell), or the alt-tab cycler is animating.
+    if DRAG_ACTIVE != 0:
+        damage_full()
+    if CYCLE_OPEN != 0:
+        damage_full()
+    # ROUND-21: while a keyboard move/resize mode is active, re-present
+    # every frame so its accent grab-frame stays drawn over the window.
+    if KMODE != 0:
+        damage_full()
+    # Window count changed. A NEW window only dirties its OWN rect, so
+    # damage just the newly-opened slots instead of escalating to a
+    # full-screen per-pixel present (the multi-second window-open cost).
+    # A window that CLOSED uncovers whatever was beneath it; that requires
+    # repainting the vacated region, which we can't cheaply bound per-slot
+    # here, so a net DECREASE still escalates to a full present (rare, and
+    # not on the hot open path).
+    if DWIN_COUNT != EVL_PREV_WINS:
+        if DWIN_COUNT > EVL_PREV_WINS:
+            ns: uint64 = EVL_PREV_WINS
+            while ns < DWIN_COUNT:
+                if win_on_cur_ws(ns) != 0:
+                    DWIN_CONTENT_DIRTY[ns] = 1
+                    damage_rect(DWIN_X[ns], DWIN_Y[ns],
+                                DWIN_X[ns] + DWIN_W[ns],
+                                DWIN_Y[ns] + DWIN_H[ns])
+                ns = ns + 1
+            # EVLOOP: boost markup-client detection to ANIM cadence for a
+            # few seconds so a just-spawned client's first paint shows up
+            # promptly even though it never touches its stdout pipe.
+            EVL_SPAWN_BOOST_JIFFY = sys_get_jiffies()
+        else:
+            damage_full()
+        EVL_PREV_WINS = DWIN_COUNT
+    # ROUND-7: age any on-screen notification banner. EVLOOP: the banner
+    # is wall-clock driven (notify_alpha), so re-present ONLY when its
+    # alpha actually changed — solid phase costs nothing, the fade
+    # repaints just the banner's 260x44 rect, and expiry erases it once.
+    if notify_tick() != 0:
+        na: int64 = notify_alpha()
+        if na != EVL_NOTIFY_LAST_ALPHA:
+            EVL_NOTIFY_LAST_ALPHA = na
+            damage_notify_banner()
+    elif EVL_NOTIFY_LAST_ALPHA >= 0:
+        EVL_NOTIFY_LAST_ALPHA = -1
+        damage_notify_banner()
+    # ROUND-15: collapse/reveal an autohide panel as the cursor nears the
+    # bar's edge; a flip slides the whole bar in/out (full-width band).
+    if panel_autohide_update(CUR_Y) != 0:
+        damage_full()
+    # ROUND-15: age the workspace-switch OSD popup; re-present each frame
+    # it is alive so it appears and then clears (centred overlay).
+    if osd_step() != 0:
+        damage_full()
+    # ROUND-17: age the workspace-name rename OSD the same way.
+    if ws_name_osd_step() != 0:
+        damage_full()
+    # ROUND-15: drive the urgency blink while any window demands attention
+    # so its taskbar button keeps pulsing. EVLOOP: repaint the panel band
+    # only when the blink phase actually FLIPS, not every frame.
+    if any_window_urgent() != 0:
+        urgent_phase_step()
+        ublit: int32 = urgent_blink_on()
+        if ublit != EVL_URGENT_LAST_ON:
+            EVL_URGENT_LAST_ON = ublit
+            damage_panel()
+    elif EVL_URGENT_LAST_ON >= 0:
+        EVL_URGENT_LAST_ON = -1
+        damage_panel()
+    # Once-a-second housekeeping on the REAL jiffy clock (HZ=100, so
+    # jiffies ARE centiseconds — exactly what clock_refresh expects).
+    # The old loop approximated time from yield iterations; the event
+    # loop sleeps, so it must use the real clock.
+    nowj: uint64 = sys_get_jiffies()
+    if EVL_LAST_HK_JIFFY == 0 or nowj - EVL_LAST_HK_JIFFY >= 100:
+        EVL_LAST_HK_JIFFY = nowj
+        # Refresh the clock + system-monitor stats. The clock + tray stats
+        # live in the panel band and the desktop monitor applet on the
+        # root, so damage just those regions instead of the whole screen.
+        clock_refresh(nowj)
+        sysmon_refresh(nowj)
+        # ROUND-19: push a sample into the desktop monitor applet's
+        # rolling CPU/MEM history graph.
+        dmon_push()
+        damage_panel()
+        damage_dmon_applet()
+        # A live System Monitor window (APP_SYSMON) shows the same
+        # once-a-second uptime/mem stats; damage each visible one so its
+        # body keeps updating without a whole-screen present.
+        smi: uint64 = 0
+        while smi < DWIN_COUNT:
+            if DWIN_APP[smi] == APP_SYSMON and win_on_cur_ws(smi) != 0:
+                damage_window(smi)
+            smi = smi + 1
+    # The fb-text console is SUSPENDED while we own the screen (P0a), so
+    # nothing else draws to /dev/fb. Present only the damage union
+    # accumulated this frame; if nothing was damaged but the pointer
+    # moved, the cheap cursor-cell blit handles it.
+    if daemon_flush_damage() == 0 and cursor_moved != 0:
+        daemon_present_cursor_move()
+    # Log Out / Shut Down (ROUND-8 session dialog) request a clean
+    # shutdown of the daemon so the console returns to the foreground
+    # shell. SESSION_INTENT distinguishes the two for the boot scripts.
+    if DAEMON_QUIT != 0:
+        # ROUND-19: persist the open windows so the next login can
+        # restore them (gnome-session "Remember currently running
+        # applications"). Best-effort; failure doesn't block logout.
+        session_save()
+        if SESSION_INTENT == 2:
+            write_str(1, "DAEMON shutdown\n")
+        else:
+            write_str(1, "DAEMON logout\n")
+        return 1
+    return 0
+
+
 # P0a/P0b: claim the framebuffer + physical console input exclusively.
 # Writing "suspend" to /dev/fbctl (1) silences the boot fb-text console /
 # printk so it can never tear through the composited desktop, and (2)
@@ -24585,7 +25210,7 @@ def cmd_daemon_auto(autoflag: int32) -> int32:
     # takeover suspends fb-TEXT output only; serial still flows.) Gated on the
     # self-tests so normal daemon runs keep the supervisor's log redirect.
     if autoflag == 46 or autoflag == 47 or autoflag == 48 or autoflag == 49 \
-       or autoflag == 50:
+       or autoflag == 50 or autoflag == 51:
         consw0: int32 = sys_open_write(cast[Ptr[char]]("/dev/cons"))
         if consw0 >= 0:
             sys_dup2(consw0, 1)
@@ -24723,6 +25348,15 @@ def cmd_daemon_auto(autoflag: int32) -> int32:
     # packet delivery: IRQ12/xHCI -> ring -> /dev/mouse -> compositor. Exits.
     if autoflag == 50:
         daemon_mouse_selftest(scr_w, scr_h)
+        return 0
+    # EVENT-LOOP self-test (autoflag == 51): prove the event-driven
+    # scheduling — evl_wait really parks in sys_waitfds (jiffy-verified),
+    # markup bodies re-rasterize ONLY on a per-layer gen change (no
+    # periodic re-read), the gen-triggered present is bounded by the
+    # window rect, a dead child's EOF'd pipe is closed (no hot-spin), and
+    # a pure cursor move stays on the blit fast path. Exits.
+    if autoflag == 51:
+        daemon_evloop_selftest(scr_w, scr_h)
         return 0
     # WORKSPACE self-test (autoflag == 9): create a window, switch virtual
     # desktops, and assert via composited-pixel sampling that the window is
@@ -24997,187 +25631,17 @@ def cmd_daemon_auto(autoflag: int32) -> int32:
     # ROUND-7: greet the user with a transient notification banner so the
     # notification surface is exercised on every real boot of the DE.
     notify_post("Welcome to Hamnix", "Click Applications to launch an app")
-    # Main loop. Cooperative: yield every idle iteration so we never
-    # monopolise the CPU and the spawned hamsh tasks still run.
-    prev_wins: uint64 = DWIN_COUNT
-    idle_ctr: uint64 = 0
-    # Uptime centisecond counter, approximated from idle iterations.
-    # Each sys_yield() is ~1-2ms on TCG; we add 2 each iteration.
-    # clock_refresh only fires once per 100 cs anyway (1 second).
-    loop_cs: uint64 = 0
+    # EVLOOP main loop: run ONE frame of event processing + damage-bounded
+    # presenting, then PARK in sys_waitfds on the daemon's input fds
+    # (mouse, console, window stdout pipes) until something is readable or
+    # the adaptive timeout lapses. There is NO busy-poll: an idle desktop
+    # sleeps on the kernel waitfds WaitQueue and burns ~zero CPU.
+    EVL_PREV_WINS = DWIN_COUNT
+    EVL_LAST_HK_JIFFY = 0
     while True:
-        WM_FRAME = WM_FRAME + 1
-        # DEPERF #410: arm the markup-client body re-read on a coarse frame
-        # tick. markup_sync() only does its expensive /dev/wsys file reads when
-        # MARKUP_DUE is set, so a busy mouse / window drag (many presents per
-        # tick) pays NO markup file I/O — they reuse the last-read bodies.
-        # (The matching damage of each markup window is raised below, AFTER
-        # damage_reset(), so it survives into this frame's present.)
-        MARKUP_SYNC_CTR = MARKUP_SYNC_CTR + 1
-        if MARKUP_SYNC_CTR >= MARKUP_SYNC_EVERY:
-            MARKUP_SYNC_CTR = 0
-            MARKUP_DUE = 1
-        ch: int32 = daemon_pump_mouse(scr_w, scr_h)
-        # Route keystrokes to the focused window's shell, then drain
-        # every shell's stdout into its terminal grid.
-        daemon_pump_keys(scr_w, scr_h)
-        # Alt-tab cycler: while the switcher popup is up, count idle frames
-        # since the last cycle keypress; auto-commit (raise the selection)
-        # once the user stops pressing F5/F6 (MATE releases on key-up).
-        if CYCLE_OPEN != 0:
-            if CYCLE_PRESSED != 0:
-                CYCLE_IDLE = 0
-            else:
-                CYCLE_IDLE = CYCLE_IDLE + 1
-                if CYCLE_IDLE >= CYCLE_COMMIT:
-                    cycle_commit()
-            ch = 1
-        CYCLE_PRESSED = 0
-        tch: int32 = daemon_pump_terms()
-        # DEPERF present decision: accumulate the UNION of the screen rects
-        # that actually changed this frame, then present only that union.
-        # Continuous per-frame costs (shell output, clock/stat refresh,
-        # notification fade, urgency blink) used to each force a FULL-SCREEN
-        # recomposite (O(W*H*windows)) — the reason the desktop ran ~1 fps and
-        # slowed with every window. Now they damage only their own rect.
-        # `cursor_moved` is the pure-pointer fast path taken when nothing else
-        # was damaged. `damage_full()` still escalates the genuinely whole-
-        # screen interactions (clicks/menus/drags/workspace switch).
-        damage_reset()
-        # DEPERF #410: on a markup re-read tick, damage every visible markup
-        # window so its throttled body refresh actually reaches the screen.
-        # Between ticks these windows are NOT damaged, so a still desktop pays
-        # no markup file I/O AND no recomposite.
-        if MARKUP_DUE != 0:
-            mki: uint64 = 0
-            while mki < DWIN_COUNT:
-                if DWIN_MARKUP[mki] != 0 and win_on_cur_ws(mki) != 0:
-                    damage_window(mki)
-                mki = mki + 1
-        cursor_moved: int32 = 0
-        if CUR_X != LAST_CUR_X or CUR_Y != LAST_CUR_Y:
-            cursor_moved = 1
-        # A mouse packet that mutated the scene (click/drag/menu/hover
-        # highlight/focus-raise). These are interaction-driven (not per-frame
-        # continuous) and can touch arbitrary regions (popups grow off-bar,
-        # z-order raises move whole windows), so keep them whole-screen for
-        # correctness — they are rare relative to the continuous costs above.
-        if MOUSE_SCENE_DIRTY != 0:
-            damage_full()
-            MOUSE_SCENE_DIRTY = 0
-        # BUG 2: a hover-highlight-only change repaints just the window that
-        # lost the highlight and the one that gained it — bounded by each
-        # window's own frame — instead of a whole-screen recomposite on every
-        # pointer motion over windows.
-        if MOUSE_HOVER_DIRTY != 0:
-            if MOUSE_HOVER_OLD >= 0 and cast[uint64](MOUSE_HOVER_OLD) < DWIN_COUNT:
-                damage_window(cast[uint64](MOUSE_HOVER_OLD))
-            if MOUSE_HOVER_NEW >= 0 and cast[uint64](MOUSE_HOVER_NEW) < DWIN_COUNT \
-               and MOUSE_HOVER_NEW != MOUSE_HOVER_OLD:
-                damage_window(cast[uint64](MOUSE_HOVER_NEW))
-            MOUSE_HOVER_DIRTY = 0
-            MOUSE_HOVER_OLD = -1
-            MOUSE_HOVER_NEW = -1
-        # Any shell emitted output (prompt / command echo). daemon_pump_terms
-        # already damaged each producing window's own rect (see there), so the
-        # `tch` flag itself adds no extra damage — a busy shell repaints just
-        # its window, NOT the whole screen.
-        # A drag is in progress (rubber band must track the pointer, which
-        # is more than the cursor cell), or the alt-tab cycler is animating.
-        if DRAG_ACTIVE != 0:
-            damage_full()
-        if CYCLE_OPEN != 0:
-            damage_full()
-        # ROUND-21: while a keyboard move/resize mode is active, re-present
-        # every frame so its accent grab-frame stays drawn over the window.
-        if KMODE != 0:
-            damage_full()
-        # DEPERF #410: window count changed. A NEW window only dirties its OWN
-        # rect, so damage just the newly-opened slots instead of escalating to
-        # a full-screen per-pixel present (the multi-second window-open cost).
-        # A window that CLOSED uncovers whatever was beneath it; that requires
-        # repainting the vacated region, which we can't cheaply bound per-slot
-        # here, so a net DECREASE still escalates to a full present (rare, and
-        # not on the hot open path the user complained about).
-        if DWIN_COUNT != prev_wins:
-            if DWIN_COUNT > prev_wins:
-                ns: uint64 = prev_wins
-                while ns < DWIN_COUNT:
-                    if win_on_cur_ws(ns) != 0:
-                        DWIN_CONTENT_DIRTY[ns] = 1
-                        damage_rect(DWIN_X[ns], DWIN_Y[ns],
-                                    DWIN_X[ns] + DWIN_W[ns],
-                                    DWIN_Y[ns] + DWIN_H[ns])
-                    ns = ns + 1
-            else:
-                damage_full()
-            prev_wins = DWIN_COUNT
-        idle_ctr = idle_ctr + 1
-        loop_cs = loop_cs + 2
-        # ROUND-7: age any on-screen notification banner; while it is up we
-        # re-present every frame so its fade animates smoothly. The banner can
-        # appear anywhere over the scene, so escalate to a full present while
-        # it is alive (transient — a few seconds, not a steady-state cost).
-        if notify_tick() != 0:
-            damage_full()
-        # ROUND-15: collapse/reveal an autohide panel as the cursor nears the
-        # bar's edge; a flip slides the whole bar in/out (full-width band).
-        if panel_autohide_update(CUR_Y) != 0:
-            damage_full()
-        # ROUND-15: age the workspace-switch OSD popup; re-present each frame
-        # it is alive so it appears and then clears (centred overlay).
-        if osd_step() != 0:
-            damage_full()
-        # ROUND-17: age the workspace-name rename OSD the same way.
-        if ws_name_osd_step() != 0:
-            damage_full()
-        # ROUND-15: drive the urgency blink while any window demands attention
-        # so its taskbar button keeps pulsing. Only the panel band changes.
-        if any_window_urgent() != 0:
-            urgent_phase_step()
-            damage_panel()
-        if idle_ctr >= 64:
-            idle_ctr = 0
-            # Refresh the clock + system-monitor stats once per idle cycle
-            # (~every second). The clock + tray stats live in the panel band
-            # and the desktop monitor applet on the root, so damage just those
-            # regions instead of the whole screen.
-            clock_refresh(loop_cs)
-            sysmon_refresh(loop_cs)
-            # ROUND-19: push a sample into the desktop monitor applet's
-            # rolling CPU/MEM history graph.
-            dmon_push()
-            damage_panel()
-            damage_dmon_applet()
-            # A live System Monitor window (APP_SYSMON) shows the same
-            # once-a-second uptime/mem stats; damage each visible one so its
-            # body keeps updating without a whole-screen present.
-            smi: uint64 = 0
-            while smi < DWIN_COUNT:
-                if DWIN_APP[smi] == APP_SYSMON and win_on_cur_ws(smi) != 0:
-                    damage_window(smi)
-                smi = smi + 1
-        # The fb-text console is now SUSPENDED while we own the screen
-        # (P0a), so we no longer force a periodic full re-present just to
-        # "reassert ownership" — nothing else draws to /dev/fb. We present
-        # only the damage union accumulated this frame; if nothing was damaged
-        # but the pointer moved, the cheap cursor-cell blit handles it.
-        if daemon_flush_damage() == 0 and cursor_moved != 0:
-            daemon_present_cursor_move()
-        # Log Out / Shut Down (ROUND-8 session dialog) request a clean
-        # shutdown of the daemon so the console returns to the foreground
-        # shell. SESSION_INTENT distinguishes the two for the boot scripts.
-        if DAEMON_QUIT != 0:
-            # ROUND-19: persist the open windows so the next login can
-            # restore them (gnome-session "Remember currently running
-            # applications"). Best-effort; failure doesn't block logout.
-            session_save()
-            if SESSION_INTENT == 2:
-                write_str(1, "DAEMON shutdown\n")
-            else:
-                write_str(1, "DAEMON logout\n")
+        if daemon_frame(scr_w, scr_h) != 0:
             break
-        sys_yield()
+        evl_wait()
     # Restore the boot text console + release the console-input grab so
     # the user lands back at a usable boot shell after logout/shutdown.
     fb_console_release()
@@ -25185,7 +25649,7 @@ def cmd_daemon_auto(autoflag: int32) -> int32:
 
 
 def usage(fd: int32):
-    write_str(fd, "Usage: hamUId render <wid> | hamUId present <wid> | hamUId daemon [autowin|wmselftest|panelselftest|terminalselftest|taskbarselftest|vkwindowselftest|workspaceselftest|decorationselftest|ctxmenuselftest|appsselftest|round3selftest|round4selftest|round5selftest|round6selftest|round7selftest|round8selftest|round9selftest|round10selftest|round11selftest|round12selftest|round13selftest|round14selftest|round15selftest|round16selftest|round17selftest|round18selftest|round19selftest|round20selftest|round21selftest|round22selftest|round23selftest|traylayoutselftest|debugfixselftest|deperfselftest|deusabilityselftest|deappsselftest]\n")
+    write_str(fd, "Usage: hamUId render <wid> | hamUId present <wid> | hamUId daemon [autowin|wmselftest|panelselftest|terminalselftest|taskbarselftest|vkwindowselftest|workspaceselftest|decorationselftest|ctxmenuselftest|appsselftest|round3selftest|round4selftest|round5selftest|round6selftest|round7selftest|round8selftest|round9selftest|round10selftest|round11selftest|round12selftest|round13selftest|round14selftest|round15selftest|round16selftest|round17selftest|round18selftest|round19selftest|round20selftest|round21selftest|round22selftest|round23selftest|traylayoutselftest|debugfixselftest|deperfselftest|deusabilityselftest|deappsselftest|mousetest|evloop]\n")
 
 
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
@@ -25474,6 +25938,13 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             # usb-tablet (absolute) motion actually moves CUR_X/CUR_Y.
             if cstr_eq(a2, "mousetest") != 0:
                 autoflag = 50
+            # `evloop` => event-driven compositor scheduling self-test:
+            # sys_waitfds park (jiffy-verified), gen-gated markup body
+            # re-rasterize (idle frames do ZERO body reads / presents),
+            # bounded gen-triggered present, EOF-pipe close, cursor blit
+            # fast path.
+            if cstr_eq(a2, "evloop") != 0:
+                autoflag = 51
         # Marker-file selftest hook: when the plain `daemon` autostart
         # (no argv[2]) finds /etc/hamui-mkc-test, route into autoflag 46
         # (the markup-client keystone selftest). This keeps the PROVEN
@@ -25524,6 +25995,16 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
                 sys_close(mtest_fd)
                 write_str(1, "[mousetest] marker found -> autoflag 50\n")
                 autoflag = 50
+        if autoflag == 0:
+            # Event-loop marker (ENABLE_EVLOOP_SELFTEST=1): the proven
+            # 2-token `hamUId daemon` autostart routes into the autoflag-51
+            # event-driven-scheduling self-test when build_initramfs.py
+            # planted /etc/hamui-evloop-test. Runs once + exits 0.
+            evl_fd: int32 = sys_open(cast[Ptr[char]]("/etc/hamui-evloop-test"))
+            if evl_fd >= 0:
+                sys_close(evl_fd)
+                write_str(1, "[evloop] marker found -> autoflag 51\n")
+                autoflag = 51
         if autoflag == 0:
             mkc_fd: int32 = sys_open(cast[Ptr[char]]("/etc/hamui-mkc-test"))
             if mkc_fd >= 0:
