@@ -285,15 +285,17 @@ replaces the ~70 `is_*_path` backend-selection branches).
 ## Plan 9 alignment audit findings (#444, 2026-06-11)
 
 **ALL findings queued as fix tracks (user 2026-06-11: "hammer the whole
-thing into a plan 9 shape"):** F1=#446 (keystone) **DONE 2026-06-11** —
-substrate rewritten, prefix-rewrite veneer eliminated, see STATUS row.
-F2=#447, F3=#448, F4=#449, F5=#445 (done), F6=#450, F7=#390 continuation,
-F8=#451 (done), F9=#452, F10=#453 (re-audit AFTER the wave lands: verify
-F1-F9 hold at depth + new axes — sched/mm coupling, driver boundary,
-userland conventions, security end-to-end, boot/init shape, docs
-honesty — and rank the NEXT divergences). With F1+F5+F8 landed, F2/F3/F9
-are now unblocked and can be dispatched (they touch files F1 rewrote);
-F6/F4 remain disjoint parallel slots.
+thing into a plan 9 shape"):** F1=#446 (keystone) **DONE 2026-06-11**.
+F5=#445 (done). F8=#451 (done). F9=#452 **DONE 2026-06-11** — residual
+literal-path sweep landed; 3 arms converted (`/dev/auth` onto namec,
+19 `/etc/<flag>` markers consolidated into `kernel/boot_flags.ad`,
+`/tmp/core` routed through per-Pgrp `ns_walk`, distro prefix lifted to
+named accessor); 4 arms DEFERRED-to-F4 (`/dev/fuse`, `/dev/ptmx`,
+`/dev/pts/<N>`, `/sys/fs/cgroup` — all wholly Linux-ABI). See STATUS
+row. **Remaining:** F2=#447 syscall→ctl sweep, F3=#448 server-boundary
+perms/factotum, F4=#449 linux_abi leaf inversion (now has the F9-tagged
+arms to pick up), F6=#450 Phase G finish, F7=#390 FD-mark fold
+continuation, F10=#453 re-audit AFTER the wave lands.
 
 Full ranked report delivered in-session; spine (Chan/namec/devtab, Pgrp
 binds, unions MREPL/MBEFORE/MAFTER, notes, /net no-sockets, /srv, #d fd
@@ -334,10 +336,16 @@ device, /dev/mountrpc tripwire) judged honestly Plan 9. Gaps, ranked:
    pool, Tflush-on-EINTR, elected-reader demux, /dev/9pmax proof);
    distrofs persists to `#part0/distrofs<inst>.dat` + /dev/sync barrier;
    SYS_DFS_LOAD/SAVE retired. See STATUS.md.
-9. [ ] **Residual literal paths**: /dev/auth, /dev/fuse, /dev/ptmx+pts
+9. [x] **Residual literal paths**: /dev/auth, /dev/fuse, /dev/ptmx+pts
    pre-namec matches in vfs_open; modprobe reads ten /etc/*-ko flag files
    from kernel context (→ one ctl file); coredump hardcodes /tmp/core;
-   chan.ad:1308 hardcodes /var/lib/distros/default.
+   chan.ad:1308 hardcodes /var/lib/distros/default. **F9 DONE** (`#452`,
+   merge `840410db` 2026-06-11): /dev/auth onto namec via
+   `NAMEC_NEEDS_AUTH`; 19 `/etc/<flag>` markers consolidated into new
+   `kernel/boot_flags.ad` (`boot_flag_get(name)` ctl, -283 lines);
+   `/tmp/core` routed through per-Pgrp `ns_walk`; distro prefix lifted to
+   named accessor. fuse/ptmx/pts/cgroup arms tagged DEFERRED-to-F4
+   (#449) — wholly Linux-ABI, no native caller. See STATUS row.
 Also noted: MCREATE recorded-not-honored on create (chan.ad:1876);
 do_mount ignores afd / fauth unimplemented.
 
