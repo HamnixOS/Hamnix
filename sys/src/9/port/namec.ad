@@ -73,7 +73,12 @@ from sys.src.port9.port.9p_client import (
 # matching devtab slot whose read/write delegate here. These are the
 # SAME bodies fs/vfs.ad's FD_<NAME>_MARK arms call — the inversion is
 # in WHO dispatches, not in the device code.
-from sys.src.port9.port.devcons import devcons_read, devcons_read_nb, devcons_write
+from sys.src.port9.port.devcons import (
+    devcons_read, devcons_read_nb, devcons_write, devcons_poll_readable,
+)
+# SYS_WAITFDS: non-destructive /dev/mouse readiness probe (PS/2 aux
+# ring). Import-only — the producer IRQ path lives in drivers/input.
+from drivers.input.auxmouse import mouse_rx_has
 from sys.src.port9.port.devtime import devtime_read, devtime_write
 from sys.src.port9.port.devpid import devpid_read, devpid_write
 from sys.src.port9.port.devrandom import devrandom_read, devrandom_write
@@ -127,6 +132,10 @@ from sys.src.port9.port.devwsys import (
     devwsys_pointer_read, devwsys_pointer_write,
     devwsys_keys_read, devwsys_keys_write,
     devwsys_pointer_read_nb, devwsys_keys_read_nb,
+    # SYS_WAITFDS readiness: per-layer gen leaf + non-destructive
+    # pointer/keys ring probes.
+    devwsys_draw_gen_read,
+    wsys_pointer_pending, wsys_keys_pending,
 )
 # Native power control: /dev/reboot. A write of "poweroff"/"reboot"/
 # "halt" funnels into the shared kernel power routine (which also backs
@@ -365,7 +374,15 @@ DEV_WSYS_KEYS:    int32 = 58       # /dev/wsys/<N>/keys    (focused-win keys)
 # layers + opens its /keys stream on the correct wid.
 DEV_WSYS_SELF:    int32 = 59       # /dev/wsys/self  (caller's own wid)
 
-DEV_MAX:       int32 = 60
+# Read-only per-layer content GENERATION counter (decimal + '\n'):
+# /dev/wsys/<N>/draw/<L>/gen — bumped by devwsys on every successful
+# markup/fb content write, so a compositor can skip re-reading an
+# unchanged body. Lives outside the contiguous 28..33 draw-leaf block
+# (those numbers are frozen by existing chan ids), so the layer-leaf
+# range gates below test it explicitly.
+DEV_WSYS_DRAW_GEN: int32 = 60      # /dev/wsys/<N>/draw/<L>/gen (ro)
+
+DEV_MAX:       int32 = 61
 
 # The FAT write-mode bit as carried in a DEV_FAT_FILE chan's back_slot
 # (a copy of fs/vfs.ad's FAT_FD_WRITE_BIT / fs/fat.ad's
@@ -889,6 +906,8 @@ def _devtab_lookup_wsys_draw(path: Ptr[char], pos: uint64, wid: int32,
         return DEV_WSYS_DRAW_MARKUP
     if _streq_at(path, leaf, "/fb") != 0:
         return DEV_WSYS_DRAW_FB
+    if _streq_at(path, leaf, "/gen") != 0:
+        return DEV_WSYS_DRAW_GEN
     return DEV_NONE
 
 
@@ -1070,6 +1089,8 @@ def _devtab_read(dev_type: int32, wid: int32, layer: int32, off: uint64,
         return devwsys_draw_markup_read(wid, layer, off, buf, count)
     if dev_type == DEV_WSYS_DRAW_FB:
         return devwsys_draw_fb_read(wid, layer, off, buf, count)
+    if dev_type == DEV_WSYS_DRAW_GEN:
+        return devwsys_draw_gen_read(wid, layer, off, buf, count)
     return -1
 
 
@@ -1241,7 +1262,8 @@ def _devtab_write(dev_type: int32, wid: int32, layer: int32,
             or dev_type == DEV_WSYS_OUTPUT or dev_type == DEV_WSYS_NS \
             or dev_type == DEV_WSYS_PID or dev_type == DEV_WSYS_UID \
             or dev_type == DEV_WSYS_KIND or dev_type == DEV_WSYS_GEOMETRY \
-            or dev_type == DEV_WSYS_DRAW or dev_type == DEV_WSYS_DAMAGE:
+            or dev_type == DEV_WSYS_DRAW or dev_type == DEV_WSYS_DAMAGE \
+            or dev_type == DEV_WSYS_DRAW_GEN:
         return devwsys_readonly_write(buf, count)
     return -1
 
@@ -1506,6 +1528,8 @@ def namec(path: Ptr[char], mode: int32) -> int32:
         if dev_type >= DEV_WSYS_DRAW_KIND \
                 and dev_type <= DEV_WSYS_DRAW_FB:
             return _chan_id_make_inline_wsys_draw(dev_type, wid, layer)
+        if dev_type == DEV_WSYS_DRAW_GEN:
+            return _chan_id_make_inline_wsys_draw(dev_type, wid, layer)
         return _chan_id_make_inline_wsys(dev_type, wid)
 
     # --- (3) not a chan — caller falls through to on-disk routing ---
@@ -1682,6 +1706,52 @@ def namec_read_nb(cid: int32, off: uint64, buf: Ptr[uint8],
     if chan_pool[su].dev_type == DEV_CONS:
         return devcons_read_nb(buf, count)
     return namec_read(cid, off, buf, count)
+
+
+def namec_poll_readable(cid: int32) -> int32:
+    # SYS_WAITFDS readiness probe for an FD_CHAN_MARK fd. Non-
+    # destructive — consumes nothing. Returns:
+    #   1  ready: a read would return data right now (or immediately,
+    #      for snapshot cdevs whose reads never block)
+    #   0  not ready, AND the producer is wired to waitfds_notify() so
+    #      a blocked vfs_waitfds will be woken on the readiness edge
+    #   2  not ready, NO wake wiring (producer lives outside the
+    #      notify mesh — e.g. the PS/2 mouse IRQ); the caller must cap
+    #      its sleep slice (1 jiffy) so the fd is re-probed promptly.
+    if _chan_id_valid(cid) == 0:
+        return 1                       # error surfaces on the read itself
+    if _chan_id_is_inline(cid) != 0:
+        idev: int32 = _chan_id_inline_dev(cid)
+        if idev == DEV_CONS:
+            # Wake-wired: console_input_wake() (UART IRQ, kbd push, wsys
+            # cmd inject, timer-tick belt-and-braces) kicks waitfds.
+            if devcons_poll_readable() != 0:
+                return 1
+            return 0
+        if idev == DEV_WSYS_POINTER:
+            # Wake-wired: devwsys_pointer_write calls waitfds_notify().
+            if wsys_pointer_pending(_chan_id_inline_wid(cid)) != 0:
+                return 1
+            return 0
+        if idev == DEV_WSYS_KEYS:
+            # Wake-wired: devwsys_keys_write calls waitfds_notify().
+            if wsys_keys_pending(_chan_id_inline_wid(cid)) != 0:
+                return 1
+            return 0
+        if idev == DEV_MOUSE:
+            # PS/2 aux ring probe. The producer IRQ path (drivers/input)
+            # has no waitfds hook, so an empty ring is class-2: the
+            # waiter re-probes at jiffy granularity (and the per-tick
+            # console_input_wake also re-kicks the queue each 10ms).
+            if mouse_rx_has() != 0:
+                return 1
+            return 2
+        # Every other inline cdev read is a non-blocking snapshot
+        # (procfs-style render-on-read) — always "ready".
+        return 1
+    # Pool chans (9P mounts, ext4/fat/tmpfs files, dirs): reads complete
+    # without parking on a waitqueue — treat as always ready.
+    return 1
 
 
 def namec_write(cid: int32, off: uint64, buf: Ptr[uint8],
