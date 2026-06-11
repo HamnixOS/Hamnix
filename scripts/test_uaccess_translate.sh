@@ -79,7 +79,9 @@ if grep -a -q "\[uaccess-sc\] FAIL" "$LOG"; then
     fail=1
 fi
 
-# All PASS markers present — four primitive-layer + the syscall-layer one.
+# All PASS markers present — four primitive-layer + the syscall-layer
+# ones (GETCWD copy-out, strncpy path copy-in, and the #163 sweep's
+# -EFAULT probes against converted handlers fed an unmapped pointer).
 need=(
     "copy_to_user reached the physical frame"
     "copy_from_user round-tripped through V"
@@ -87,6 +89,7 @@ need=(
     "RO page readable, write -> EFAULT"
     "SYS_GETCWD copied to the physical frame"
     "strncpy_from_user copied a path via V != phys"
+    "converted handlers -EFAULT on unmapped pointers"
 )
 for m in "${need[@]}"; do
     if grep -a -q -F "$m" "$LOG"; then
