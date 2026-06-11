@@ -285,28 +285,26 @@ replaces the ~70 `is_*_path` backend-selection branches).
 ## Plan 9 alignment audit findings (#444, 2026-06-11)
 
 **ALL findings queued as fix tracks (user 2026-06-11: "hammer the whole
-thing into a plan 9 shape"):** F1=#446 (keystone, SOLO agent), F2=#447,
-F3=#448, F4=#449, F5=#445 (in flight), F6=#450, F7=#390 continuation,
-F8=#451 (in flight), F9=#452, F10=#453 (re-audit AFTER the wave lands:
-verify F1-F9 hold at depth + new axes — sched/mm coupling, driver
-boundary, userland conventions, security end-to-end, boot/init shape,
-docs honesty — and rank the NEXT divergences). Dispatch order is
-disjointness-driven: F5+F8 now → F1 solo big-bang (owns fs/ +
-sys/src/9/port exclusively) → F2/F3/F9 sequenced after F1 (same files)
-∥ F6 (userland-side) and F4 (pairs with #390 pipes fold) as slots free
-→ F10 re-audit closes the loop.
+thing into a plan 9 shape"):** F1=#446 (keystone) **DONE 2026-06-11** —
+substrate rewritten, prefix-rewrite veneer eliminated, see STATUS row.
+F2=#447, F3=#448, F4=#449, F5=#445 (done), F6=#450, F7=#390 continuation,
+F8=#451 (done), F9=#452, F10=#453 (re-audit AFTER the wave lands: verify
+F1-F9 hold at depth + new axes — sched/mm coupling, driver boundary,
+userland conventions, security end-to-end, boot/init shape, docs
+honesty — and rank the NEXT divergences). With F1+F5+F8 landed, F2/F3/F9
+are now unblocked and can be dispatched (they touch files F1 rewrote);
+F6/F4 remain disjoint parallel slots.
 
 Full ranked report delivered in-session; spine (Chan/namec/devtab, Pgrp
 binds, unions MREPL/MBEFORE/MAFTER, notes, /net no-sockets, /srv, #d fd
 device, /dev/mountrpc tripwire) judged honestly Plan 9. Gaps, ranked:
-1. [ ] **Namespace is a prefix-rewrite veneer over a global path-keyed
-   VFS.** `chan_resolve_prefix` string-rewrites to absolute paths that
-   bottom out in ONE global mount table (`fs/vfs_mount.ad:215
-   vfs_fs_kind()`; unbound paths silently fall through to the global cpio
-   root; tmpfs explicitly global, devfd.ad:73). Fix direction: walk
-   element-by-element to Chans inside namec, per-Pgrp mount table,
-   unbound = ENOENT. Biggest structural lift; everything else fights this
-   substrate (e.g. the #by-id freeze dance, chan.ad:1329).
+1. [x] **Namespace is a prefix-rewrite veneer over a global path-keyed
+   VFS.** **F1 DONE** (`#446`, merge `af36bc2f` 2026-06-11): `ns_walk`
+   replaces `chan_resolve_prefix`; per-Pgrp mount table; unbound=ENOENT;
+   `pgrp_init()` plants 11 boot binds against server letters; RFCNAMEG
+   children use `pgrp_alloc()` (truly empty); `do_openchan` resolves
+   through the same pipeline. New gate `test_ns_enoent` proves empty
+   RFCNAMEG → ENOENT + targeted bind restore. See STATUS row.
 2. [ ] **Native syscall sprawl: 82 dispatch arms vs documented ~25.**
    Drift examples: SYS_NICE=311 duplicates /proc/<pid>/ctl `pri`;
    wsys/svc/dns/netcfg control as syscalls though file surfaces exist;
