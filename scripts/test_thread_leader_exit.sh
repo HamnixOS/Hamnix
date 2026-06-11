@@ -101,10 +101,12 @@ if grep -E -q '\[trap-diag\] vec=0x0*8[^0-9a-f]|TRAP: vector 8' "$LOG"; then
     fail=1
 fi
 
-# Diagnostics: surface next-gap signals for triage.
-if grep -E -q "trap-diag|TRAP: vector" "$LOG"; then
+# Diagnostics: surface next-gap signals for triage. Match only REAL
+# exception reports ("[trap-diag] vec=..."), not the boot-time
+# "[trap-diag] install:" IDT lines.
+if grep -E -q '\[trap-diag\] vec=|TRAP: vector' "$LOG"; then
     echo "[test_thread_leader_exit] DIAG: kernel reported a CPU exception"
-    grep -E "trap-diag|TRAP: vector" "$LOG" | head -5 || true
+    grep -E '\[trap-diag\] vec=|TRAP: vector' "$LOG" | head -5 || true
 fi
 if grep -F -q "cr3-sync" "$LOG"; then
     echo "[test_thread_leader_exit] DIAG: [cr3-sync] kernel-half divergence warning"
