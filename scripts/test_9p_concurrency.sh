@@ -8,14 +8,22 @@
 # T-msgs outstanding, and tag-demux the R-msgs back to the right
 # parked waiters.
 #
-# THE PROOF is a kernel-side one-shot marker printed by _rpc_exchange
-# the first time the in-flight count reaches 2:
+# THE PROOF is kernel-measured: 9p_client.ad tracks the high-water
+# mark of simultaneously SENT (in-flight, unanswered) T-messages and
+# surfaces it as the read-only file /dev/9pmax. After both loops the
+# fixture reads it back IN-GUEST and prints
 #
-#     [9p] tagged concurrency: N T-msgs in flight
+#     [9pconc] inflight_max=N
 #
+# and FAILs itself when N < 2. The script re-asserts N >= 2 from the
+# captured line. (The kernel also printk's a one-shot
+# "[9p] tagged concurrency: N T-msgs in flight" when the threshold is
+# first crossed — but real 9P traffic flows during EARLY BOOT, before
+# the harness's serial capture window opens, so that line can land
+# outside the log; the /dev/9pmax read-back is capture-window-proof.)
 # A client that secretly serializes (old single-outstanding behaviour)
-# would still pass every fixture I/O assertion — but never print this
-# line, and this test FAILs on its absence.
+# would still pass every fixture I/O assertion — but read back 1 here,
+# and this test FAILs.
 #
 # Pipeline (same shape as scripts/test_9p_realfd.sh):
 #   1. Build userland (hamsh + coreutils + distrofs).
@@ -135,8 +143,16 @@ check_marker "[9pconc] parent loop done" "parent read loop completed clean"
 check_marker "[9pconc] PASS"             "fixture reached PASS"
 
 # THE point of this gate: the kernel must have had >=2 T-msgs in
-# flight at least once. One-shot marker from 9p_client.ad::_rpc_exchange.
-check_marker "[9p] tagged concurrency"   "kernel saw >=2 outstanding T-msgs"
+# flight at least once. The fixture reads the kernel's high-water mark
+# back from /dev/9pmax and prints it; re-assert the value here.
+mxline=$(grep -F "[9pconc] inflight_max=" "$LOG" | head -1 || true)
+mxval=$(printf '%s\n' "$mxline" | sed -n 's/.*inflight_max=\([0-9][0-9]*\).*/\1/p')
+if [ -n "$mxval" ] && [ "$mxval" -ge 2 ]; then
+    echo "[test_9p_concurrency] OK: kernel saw >=2 outstanding T-msgs (inflight_max=$mxval)"
+else
+    echo "[test_9p_concurrency] MISS: kernel saw >=2 outstanding T-msgs (inflight_max='${mxval:-absent}')"
+    fail=1
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_9p_concurrency] FAIL (qemu rc=$rc)"
