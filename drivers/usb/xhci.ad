@@ -66,7 +66,7 @@ from drivers.pci.pci import (
     PCI_COMMAND_OFFSET, PCI_COMMAND_MEM, PCI_COMMAND_MASTER,
 )
 from mm.page_alloc import alloc_pages
-from drivers.usb.hid import hid_init, hid_kbd_report, hid_mouse_report
+from drivers.usb.hid import hid_init, hid_kbd_report, hid_mouse_report, hid_tablet_report
 from drivers.input.auxmouse import mouse_rx_pop
 from drivers.input.atkbd import kbd_rx_pop
 from fs.cpio import cpio_init, initramfs_entry_count, initramfs_entry_name
@@ -85,7 +85,7 @@ from drivers.usb.usb import (
     usb_cfg_total_length, usb_cfg_value,
     usb_ep_address, usb_ep_attrs, usb_ep_max_packet, usb_ep_interval,
     usb_ep_is_interrupt_in, usb_ep_is_bulk_in, usb_ep_is_bulk_out,
-    usb_if_class, usb_if_protocol, usb_if_number,
+    usb_if_class, usb_if_subclass, usb_if_protocol, usb_if_number,
 )
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
@@ -396,6 +396,10 @@ class XhciState:
     mouse_enabled:     uint32     # 1 once the interrupt-IN ring is armed
     mouse_live_attached: uint32   # 1 on a real live enumeration
     mouse_reports_received: uint32
+    # One-shot log latch for the first GENUINE (TRB completed on the
+    # live mouse/tablet transfer ring, not synthetic) interrupt-IN
+    # report — mirrors the keyboard's live_first_logged honesty latch.
+    mouse_live_first_logged: uint32
     # Composite combo-device support. A wireless KB+mouse "unifying"
     # receiver (the common real-NUC setup) is ONE usb device on ONE port
     # exposing TWO HID interfaces — a keyboard (ep1-IN) AND a mouse
@@ -407,6 +411,13 @@ class XhciState:
     # completed report landed in. This flag tells the poll loop to use the
     # buffer-address discriminator instead of the slot-id one.
     mouse_shares_kbd_slot: uint32 # 1 = mouse interface lives on kbd's slot
+    # 1 = the "mouse" interface is actually an HID absolute-coordinate
+    # pointing device (QEMU/Boxes usb-tablet: class 3, subclass 0,
+    # protocol 0). Reports are 6 bytes (buttons, X lo/hi, Y lo/hi,
+    # wheel) with X/Y in 0..0x7FFF; routed to hid_tablet_report()
+    # instead of hid_mouse_report(), and SET_PROTOCOL(BOOT) is skipped
+    # because tablets only speak the report protocol.
+    mouse_is_tablet: uint32
 
     # Configuration descriptor scratch (config + interface + endpoints
     # are all crammed into one byte run; 256 bytes is plenty for a
@@ -471,6 +482,23 @@ class XhciState:
     # regression-in-honesty the live test must catch. Cleared after each
     # synthetic injection so subsequent REAL completions count again.
     synthetic_inject_active: uint32
+    # Event-Ring consumer-cursor snapshot for the synthetic selftests.
+    # A forged event is written at the SOFTWARE dequeue cursor, but the
+    # CONTROLLER's producer (enqueue) position never moves. Consuming a
+    # forged event therefore leaves the consumer cursor AHEAD of the
+    # producer: every later REAL Transfer Event lands BEHIND the cursor
+    # and is never seen, the interrupt-IN rings are never re-armed
+    # (re-arm happens at harvest), and once the pre-armed TRBs are spent
+    # the device goes silent forever. The selftests snapshot the cursor
+    # via _xhci_evt_synth_begin and restore + scrub via
+    # _xhci_evt_synth_end. (Frozen usb-tablet bug #3: 5 forged selftest
+    # events == 5 armed tablet TRBs, so the live tablet never delivered
+    # a single report.)
+    synth_evt_saved_deq: uint32
+    synth_evt_saved_cyc: uint32
+    # Bounded poll-loop telemetry: number of Transfer Events already
+    # logged by xhci_poll's first-events trace (caps the spam).
+    evtlog_n: uint32
 
     # --- Mass-storage (BOT) slot state -----------------------------
     # A USB mass-storage device gets its own slot, distinct from the
@@ -3923,6 +3951,17 @@ def xhci_poll():
             ev_type: uint32 = (c >> TRB_TYPE_SHIFT) & 0x3F
             if ev_type == TRB_TYPE_TRANSFER_EVT:
                 cc: uint32 = (s >> 24) & 0xFF
+                # Bounded first-events trace: decisive telemetry for "the
+                # device enumerated but no event ever reached the HID
+                # layer" class of bugs (slot/EP/cc say which device+ring,
+                # p says which TRB completed). Caps itself after the
+                # first dozen Transfer Events of the boot.
+                if xhci.evtlog_n < 12:
+                    xhci.evtlog_n = xhci.evtlog_n + 1
+                    printk_va4("[xhci_evt] xfer slot=%d ep=%d cc=%d p=0x%x\n",
+                               cast[uint64]((c >> 24) & 0xFF),
+                               cast[uint64]((c >> 16) & 0x1F),
+                               cast[uint64](cc), p)
                 if cc == TRB_CC_SUCCESS or cc == TRB_CC_SHORT_PACKET:
                     # The slot id that completed this Transfer Event lives
                     # in bits 24..31 of the event TRB control dword. Use
@@ -3931,23 +3970,57 @@ def xhci_poll():
                     # hid_mouse_report. (Both endpoints are ep1-IN on
                     # distinct slots, so the slot id is the discriminator.)
                     evt_slot: uint32 = (c >> 24) & 0xFF
-                    # Route mouse vs keyboard. Normally the slot id is the
-                    # discriminator (each device has its own slot). But a
-                    # composite combo device puts BOTH HID interfaces on
-                    # ONE slot (mouse_shares_kbd_slot==1); there the event
-                    # slot id matches BOTH, so we disambiguate by which DMA
-                    # buffer the completed report landed in — the mouse ring
-                    # points its TRBs into mouse_int_buf (a distinct 4 KiB
-                    # page from kbd_int_buf), so p falling inside that page
-                    # means it's a mouse report.
+                    # `p` (the Transfer Event's parameter field) is the
+                    # PHYSICAL ADDRESS OF THE COMPLETED TRB (xHCI spec
+                    # 6.4.2.1 "TRB Pointer"), NOT the report data buffer —
+                    # exactly the semantics _xhci_wait_transfer_event_trb
+                    # documents and matches on for the (live-proven) bulk
+                    # path. A REAL controller event is therefore classified
+                    # by WHICH TRANSFER-RING page the completed TRB lives
+                    # in, and the report-data pointer is recovered from the
+                    # completed Normal TRB's own parameter field (qword 0).
+                    # The synthetic selftests instead FORGE events whose
+                    # param points directly at a report buffer inside
+                    # kbd_int_buf / mouse_int_buf, so those pass through
+                    # with data_p == p. (Before this fix the mouse/tablet
+                    # discriminator compared p against mouse_int_buf — the
+                    # DATA page — which a real event never hits: the live
+                    # usb-tablet's reports were misrouted to the keyboard
+                    # branch as garbage and the tablet ring was never
+                    # re-armed. Frozen-cursor bug #2.)
+                    in_mouse_ring: int32 = 0
+                    if xhci.mouse_int_ring != 0 \
+                       and p >= xhci.mouse_int_ring \
+                       and p < xhci.mouse_int_ring + 4096:
+                        in_mouse_ring = 1
+                    in_kbd_ring: int32 = 0
+                    if xhci.kbd_int_ring != 0 \
+                       and p >= xhci.kbd_int_ring \
+                       and p < xhci.kbd_int_ring + 4096:
+                        in_kbd_ring = 1
+                    data_p: uint64 = p
+                    if in_mouse_ring != 0 or in_kbd_ring != 0:
+                        trbw: Ptr[uint32] = cast[Ptr[uint32]](p)
+                        data_p = cast[uint64](trbw[0]) \
+                               | (cast[uint64](trbw[1]) << 32)
+                    # Route mouse vs keyboard. A real event's ring page is
+                    # the authoritative discriminator (works for BOTH the
+                    # own-slot and the shared-slot composite shapes). The
+                    # mouse_int_buf range keeps the synthetic combo
+                    # selftest's forged events routing to the mouse branch,
+                    # and the evt_slot compare remains as the final
+                    # own-slot fallback.
                     is_mouse_evt: int32 = 0
                     if xhci.mouse_slot_id != 0:
-                        if xhci.mouse_shares_kbd_slot != 0:
-                            if xhci.mouse_int_buf != 0 \
-                               and p >= xhci.mouse_int_buf \
-                               and p < xhci.mouse_int_buf + 4096:
-                                is_mouse_evt = 1
-                        elif evt_slot == xhci.mouse_slot_id:
+                        if in_mouse_ring != 0:
+                            is_mouse_evt = 1
+                        elif xhci.mouse_int_buf != 0 \
+                           and p >= xhci.mouse_int_buf \
+                           and p < xhci.mouse_int_buf + 4096:
+                            is_mouse_evt = 1
+                        elif xhci.mouse_shares_kbd_slot == 0 \
+                           and in_kbd_ring == 0 \
+                           and evt_slot == xhci.mouse_slot_id:
                             is_mouse_evt = 1
                     if is_mouse_evt != 0:
                         # Boot-mouse report. Feed it to the mouse HID
@@ -3961,10 +4034,24 @@ def xhci_poll():
                         mouse_rlen: uint32 = 0
                         if mouse_resid <= 8:
                             mouse_rlen = 8 - mouse_resid
-                        hid_mouse_report(cast[Ptr[uint8]](p),
-                                         cast[int32](mouse_rlen))
+                        if xhci.mouse_is_tablet != 0:
+                            # Absolute pointer (usb-tablet): 6-byte
+                            # report (buttons, X lo/hi, Y lo/hi, wheel)
+                            # with X/Y in 0..0x7FFF.
+                            hid_tablet_report(cast[Ptr[uint8]](data_p),
+                                              cast[int32](mouse_rlen))
+                        else:
+                            hid_mouse_report(cast[Ptr[uint8]](data_p),
+                                             cast[int32](mouse_rlen))
                         xhci.mouse_reports_received = \
                             xhci.mouse_reports_received + 1
+                        if xhci.mouse_live_attached != 0 \
+                           and xhci.mouse_live_first_logged == 0 \
+                           and in_mouse_ring != 0:
+                            xhci.mouse_live_first_logged = 1
+                            printk2("[xhci_mouse_live] first genuine interrupt-IN report (len=%d tablet=%d)\n",
+                                    cast[uint64](mouse_rlen),
+                                    cast[uint64](xhci.mouse_is_tablet))
                         # Re-arm a fresh IN TRB on the MOUSE ring (its own
                         # arming path — works for both own-slot and
                         # shared-slot composite devices, and rings the
@@ -3975,8 +4062,10 @@ def xhci_poll():
                         # Skip the keyboard accounting below for this
                         # mouse event by continuing the drain loop.
                         continue
-                    # p is the physical address of the completed 8-byte
-                    # boot-report buffer. report[2] is the first HID
+                    # data_p is the physical address of the completed
+                    # 8-byte boot-report buffer (recovered from the
+                    # completed TRB for real events, == p for synthetic
+                    # ones). report[2] is the first HID
                     # usage code; it is 0 on a "no keys down" report
                     # (the idle poll) and non-zero only when a key is
                     # actually pressed. We dispatch every report to the
@@ -3985,11 +4074,11 @@ def xhci_poll():
                     # CARRIES a keycode as a genuine live wire event —
                     # otherwise the idle poll stream would trip the live
                     # marker without any real keypress.
-                    rp: Ptr[uint8] = cast[Ptr[uint8]](p)
+                    rp: Ptr[uint8] = cast[Ptr[uint8]](data_p)
                     has_key: uint32 = 0
                     if cast[uint32](rp[2]) != 0:
                         has_key = 1
-                    hid_kbd_report(cast[Ptr[uint8]](p))
+                    hid_kbd_report(cast[Ptr[uint8]](data_p))
                     xhci.reports_received = xhci.reports_received + 1
                     # Genuine-wire accounting. This branch runs for BOTH
                     # the live timer-tick path and the synthetic
@@ -4567,6 +4656,12 @@ def _xhci_v1_attach_mouse():
     int_mps: uint32 = 8
     int_intv: uint32 = 10
     intf:    uint8 = 0
+    # Tablet candidate (HID class 3, subclass 0, protocol 0 — QEMU
+    # usb-tablet absolute pointer); a boot-protocol mouse still wins.
+    t_int_ep:  uint32 = 0
+    t_int_mps: uint32 = 8
+    t_int_intv: uint32 = 10
+    t_intf:    uint8 = 0
     off: uint64 = 9
     found_mouse_intf: int32 = 0
     while off + 2 <= cast[uint64](total):
@@ -4583,6 +4678,14 @@ def _xhci_v1_attach_mouse():
                     found_mouse_intf = 1
                     printk1("[boot:01.h.g.1] mouse interface matched (bInterfaceProtocol=0x02 MOUSE) intf=%d\n",
                             cast[uint64](intf))
+                elif usb_if_class(dptr) == USB_CLASS_HID \
+                   and usb_if_subclass(dptr) == 0 \
+                   and usb_if_protocol(dptr) == 0 \
+                   and t_int_ep == 0:
+                    t_intf = usb_if_number(dptr)
+                    found_mouse_intf = 2
+                    printk1("[boot:01.h.g.2] tablet candidate matched (HID subclass=0 protocol=0) intf=%d\n",
+                            cast[uint64](t_intf))
                 else:
                     found_mouse_intf = 0
             elif dtype == 0x05:                # endpoint descriptor
@@ -4595,7 +4698,23 @@ def _xhci_v1_attach_mouse():
                     if int_mps == 0:
                         int_mps = 8
                     off = cast[uint64](total)  # break
+                elif found_mouse_intf == 2 \
+                   and usb_ep_is_interrupt_in(dptr) != 0:
+                    t_int_ep = cast[uint32](usb_ep_address(dptr) & 0xF)
+                    t_int_mps = cast[uint32](usb_ep_max_packet(dptr) \
+                                            & 0x07FF)
+                    t_int_intv = cast[uint32](usb_ep_interval(dptr))
+                    if t_int_mps == 0:
+                        t_int_mps = 8
+                    found_mouse_intf = 0
             off = off + cast[uint64](dlen)
+    is_tablet: uint32 = 0
+    if int_ep == 0 and t_int_ep != 0:
+        int_ep  = t_int_ep
+        int_mps = t_int_mps
+        int_intv = t_int_intv
+        intf    = t_intf
+        is_tablet = 1
     if int_ep == 0:
         printk0("[xhci] no interrupt-IN endpoint on boot mouse intf (non-fatal)\n")
         _xhci_mouse_restore_ep0(saved_slot, saved_port, saved_ep0,
@@ -4606,6 +4725,7 @@ def _xhci_v1_attach_mouse():
         return
     xhci.mouse_int_ep  = int_ep
     xhci.mouse_int_mps = int_mps
+    xhci.mouse_is_tablet = is_tablet
     printk2("[xhci] mouse intf=%d ep=%d\n",
             cast[uint64](intf), cast[uint64](int_ep))
 
@@ -4623,12 +4743,16 @@ def _xhci_v1_attach_mouse():
         return
 
     # SET_PROTOCOL(BOOT) on the mouse HID interface — selects the
-    # 3-to-4-byte boot-mouse report shape (Protocol 2).
-    printk0("[boot:01.h.j] xhci mouse attach: SET_PROTOCOL(BOOT)\n")
-    if xhci_control_transfer(
-        USB_RT_SET_PROTOCOL, HID_REQ_SET_PROTOCOL,
-        HID_PROTOCOL_BOOT, cast[uint16](intf), 0, 0) < 0:
-        printk0("[xhci] mouse SET_PROTOCOL(BOOT) failed (non-fatal)\n")
+    # 3-to-4-byte boot-mouse report shape (Protocol 2). Tablets
+    # (subclass 0) only speak their report protocol, so skip it there.
+    if is_tablet == 0:
+        printk0("[boot:01.h.j] xhci mouse attach: SET_PROTOCOL(BOOT)\n")
+        if xhci_control_transfer(
+            USB_RT_SET_PROTOCOL, HID_REQ_SET_PROTOCOL,
+            HID_PROTOCOL_BOOT, cast[uint16](intf), 0, 0) < 0:
+            printk0("[xhci] mouse SET_PROTOCOL(BOOT) failed (non-fatal)\n")
+    else:
+        printk0("[boot:01.h.j] xhci tablet attach: report protocol (BOOT skipped)\n")
     # SET_IDLE(0, 0): report only on change.
     printk0("[boot:01.h.k] xhci mouse attach: SET_IDLE\n")
     if xhci_control_transfer(
@@ -4707,7 +4831,16 @@ def _xhci_v1_attach_mouse_same_slot() -> int32:
     m_int_mps: uint32 = 8
     m_int_intv: uint32 = 10
     m_intf:    uint8 = 0
+    # Tablet candidate (HID class 3, subclass 0, protocol 0 — the
+    # QEMU/Boxes usb-tablet absolute pointer). Tracked SEPARATELY so a
+    # boot-protocol mouse interface, if also present, always wins.
+    t_int_ep:  uint32 = 0
+    t_int_mps: uint32 = 8
+    t_int_intv: uint32 = 10
+    t_intf:    uint8 = 0
     off: uint64 = 9
+    # 0 = not inside a pointer interface, 1 = inside boot-mouse intf,
+    # 2 = inside tablet-candidate intf.
     found_mouse_intf: int32 = 0
     while off + 2 <= cast[uint64](total):
         dlen:  uint8 = cast[Ptr[uint8]](xhci.cfg_buf + off)[0]
@@ -4723,6 +4856,14 @@ def _xhci_v1_attach_mouse_same_slot() -> int32:
                     found_mouse_intf = 1
                     printk1("[boot:01.g.a.1] same-slot mouse interface matched (bInterfaceProtocol=0x02 MOUSE) intf=%d\n",
                             cast[uint64](m_intf))
+                elif usb_if_class(dptr) == USB_CLASS_HID \
+                   and usb_if_subclass(dptr) == 0 \
+                   and usb_if_protocol(dptr) == 0 \
+                   and t_int_ep == 0:
+                    t_intf = usb_if_number(dptr)
+                    found_mouse_intf = 2
+                    printk1("[boot:01.g.a.2] same-slot tablet candidate matched (HID subclass=0 protocol=0) intf=%d\n",
+                            cast[uint64](t_intf))
                 else:
                     found_mouse_intf = 0
             elif dtype == 0x05:                    # endpoint descriptor
@@ -4735,7 +4876,27 @@ def _xhci_v1_attach_mouse_same_slot() -> int32:
                     if m_int_mps == 0:
                         m_int_mps = 8
                     off = cast[uint64](total)      # break
+                elif found_mouse_intf == 2 \
+                   and usb_ep_is_interrupt_in(dptr) != 0:
+                    # Remember the tablet's endpoint but KEEP walking —
+                    # a later boot-mouse interface still takes priority.
+                    t_int_ep = cast[uint32](usb_ep_address(dptr) & 0xF)
+                    t_int_mps = cast[uint32](usb_ep_max_packet(dptr) \
+                                            & 0x07FF)
+                    t_int_intv = cast[uint32](usb_ep_interval(dptr))
+                    if t_int_mps == 0:
+                        t_int_mps = 8
+                    found_mouse_intf = 0
             off = off + cast[uint64](dlen)
+    is_tablet: uint32 = 0
+    if m_int_ep == 0 and t_int_ep != 0:
+        # No boot-protocol mouse, but an absolute tablet is present
+        # (the standard QEMU/GNOME-Boxes pointer). Bring it up.
+        m_int_ep  = t_int_ep
+        m_int_mps = t_int_mps
+        m_int_intv = t_int_intv
+        m_intf    = t_intf
+        is_tablet = 1
     if m_int_ep == 0:
         # No mouse interface on the keyboard's device — not a combo.
         return 0
@@ -4761,6 +4922,7 @@ def _xhci_v1_attach_mouse_same_slot() -> int32:
     xhci.mouse_int_ep    = m_int_ep
     xhci.mouse_int_mps   = m_int_mps
     xhci.mouse_shares_kbd_slot = 1
+    xhci.mouse_is_tablet = is_tablet
 
     # SET_CONFIGURATION if the keyboard path didn't already issue it. The
     # keyboard attach only reaches its SET_CONFIGURATION AFTER it found a
@@ -4780,11 +4942,16 @@ def _xhci_v1_attach_mouse_same_slot() -> int32:
     # SET_PROTOCOL(BOOT) + SET_IDLE on the MOUSE interface. xhci_control_
     # transfer drives the shared (keyboard) ep0, which already targets the
     # combo device's slot — exactly what we want for its mouse interface.
-    printk0("[boot:01.g.c] xhci same-slot mouse: SET_PROTOCOL(BOOT)\n")
-    if xhci_control_transfer(
-        USB_RT_SET_PROTOCOL, HID_REQ_SET_PROTOCOL,
-        HID_PROTOCOL_BOOT, cast[uint16](m_intf), 0, 0) < 0:
-        printk0("[xhci] same-slot mouse SET_PROTOCOL(BOOT) failed (non-fatal)\n")
+    # Tablets (subclass 0) do NOT support the boot protocol — they only
+    # speak their report protocol — so SET_PROTOCOL(BOOT) is skipped.
+    if is_tablet == 0:
+        printk0("[boot:01.g.c] xhci same-slot mouse: SET_PROTOCOL(BOOT)\n")
+        if xhci_control_transfer(
+            USB_RT_SET_PROTOCOL, HID_REQ_SET_PROTOCOL,
+            HID_PROTOCOL_BOOT, cast[uint16](m_intf), 0, 0) < 0:
+            printk0("[xhci] same-slot mouse SET_PROTOCOL(BOOT) failed (non-fatal)\n")
+    else:
+        printk0("[boot:01.g.c] xhci same-slot tablet: report protocol (BOOT skipped)\n")
     printk0("[boot:01.g.d] xhci same-slot mouse: SET_IDLE\n")
     if xhci_control_transfer(
         USB_RT_SET_IDLE, HID_REQ_SET_IDLE,
@@ -4805,6 +4972,7 @@ def _xhci_v1_attach_mouse_same_slot() -> int32:
         printk0("[xhci] same-slot mouse Configure Endpoint failed (non-fatal)\n")
         xhci.mouse_slot_id = 0
         xhci.mouse_shares_kbd_slot = 0
+        xhci.mouse_is_tablet = 0
         return 0
 
     printk0("[boot:01.g.f] xhci same-slot mouse: arm interrupt-IN ring\n")
@@ -4815,8 +4983,12 @@ def _xhci_v1_attach_mouse_same_slot() -> int32:
 
     xhci.mouse_enabled = 1
     xhci.mouse_live_attached = 1
-    printk1("[xhci] USB mouse enabled (composite combo device, shares kbd slot %d): events armed\n",
-            cast[uint64](xhci.kbd_slot_id))
+    if is_tablet != 0:
+        printk1("[xhci] USB tablet enabled (absolute pointer, shares kbd slot %d): events armed\n",
+                cast[uint64](xhci.kbd_slot_id))
+    else:
+        printk1("[xhci] USB mouse enabled (composite combo device, shares kbd slot %d): events armed\n",
+                cast[uint64](xhci.kbd_slot_id))
     printk0("[boot:01.g.g] xhci same-slot mouse attach: complete (interrupt-IN polling LIVE via timer tick)\n")
     return 1
 
@@ -4892,6 +5064,65 @@ def _xhci_v1_inject_transfer_event(buf_pa: uint64, length: uint32):
     p[3] = ctl
 
 
+def _xhci_evt_synth_begin():
+    # Snapshot the Event Ring consumer cursor before a selftest forges
+    # synthetic Transfer Events. Pair with _xhci_evt_synth_end.
+    xhci.synth_evt_saved_deq = xhci.evt_dequeue
+    xhci.synth_evt_saved_cyc = xhci.evt_cycle
+
+
+def _xhci_evt_synth_end():
+    # Restore the Event Ring consumer cursor after a synthetic-event
+    # selftest, and SCRUB the forged TRBs left behind in the ring.
+    #
+    # Why restore: the forged events advanced the SOFTWARE dequeue
+    # cursor, but the controller's producer position never moved.
+    # Leaving the cursor ahead means the controller's next N real events
+    # are posted BEHIND the cursor and silently ignored — and because
+    # interrupt-IN rings are only re-armed when an event is harvested,
+    # the armed TRBs drain to zero and live HID input dies permanently
+    # (the usb-tablet dead-pointer bug: the tablet's 5 armed TRBs were
+    # eaten by exactly 5 forged selftest events, so not one live report
+    # was ever seen).
+    #
+    # Why scrub: the forged TRBs still carry the cycle bit the rewound
+    # consumer expects at those positions; without flipping it, the
+    # consumer would re-consume the stale forged events as if they were
+    # real. The producer rewrites all 16 bytes of each slot (with the
+    # proper cycle) before the consumer legitimately reaches it again,
+    # so flipping the cycle bit is sufficient.
+    i: uint32 = xhci.synth_evt_saved_deq
+    c: uint32 = xhci.synth_evt_saved_cyc
+    while i != xhci.evt_dequeue:
+        trb: Ptr[uint32] = cast[Ptr[uint32]](xhci.event_ring \
+            + cast[uint64](i) * cast[uint64](TRB_SIZE))
+        trb[3] = (c ^ 1) & TRB_CYCLE_BIT
+        i = i + 1
+        if i >= EVT_RING_TRBS:
+            i = 0
+            c = c ^ 1
+    xhci.evt_dequeue = xhci.synth_evt_saved_deq
+    xhci.evt_cycle   = xhci.synth_evt_saved_cyc
+    # ALSO rewind the hardware ERDP register to the restored position.
+    # The selftest's xhci_poll batches flushed ERDP forward past the
+    # forged events, and _xhci_evt_flush_erdp is consumption-gated so
+    # nothing ever writes it back. A stale-AHEAD ERDP is fatal on QEMU:
+    # its event-ring-full heuristic ((producer_idx + 1) % ring_size ==
+    # erdp_idx) then matches forever and it SILENTLY DROPS every
+    # subsequent Transfer Event (hcd-xhci.c xhci_event "ER full, drop
+    # event" — no error event, no trace line). Proven via QEMU -trace:
+    # the live usb-tablet's interrupt-IN completed (xfer_success len=6)
+    # with NO queue_event following it. Rewriting ERDP to the true
+    # consumer position un-wedges live event delivery. (EHB ack bit 3
+    # set, mirroring _xhci_evt_flush_erdp.)
+    rew_erdp: uint64 = xhci.event_ring \
+        + cast[uint64](xhci.evt_dequeue) * cast[uint64](TRB_SIZE)
+    rew64: uint64 = (rew_erdp & 0xFFFFFFFFFFFFFFF0) | 0x8
+    rew_ir0: uint64 = xhci.rt_base + XHCI_RT_IR0
+    _xhci_w64(rew_ir0 + XHCI_IR_ERDP, rew64)
+    xhci.evt_consumed = 0
+
+
 def xhci_v1_selftest():
     # Deterministic transfer-engine round-trip. Builds a synthetic
     # boot-keyboard report ('a' key pressed), forces it into the
@@ -4918,6 +5149,7 @@ def xhci_v1_selftest():
     xhci_v1_test_buf[7] = 0
 
     buf_pa: uint64 = cast[uint64](&xhci_v1_test_buf[0])
+    _xhci_evt_synth_begin()
     _xhci_v1_inject_transfer_event(buf_pa, 8)
 
     # Drain (one event expected). Mark the injection as synthetic so
@@ -4929,6 +5161,9 @@ def xhci_v1_selftest():
     xhci_poll()
     after: uint32 = xhci.reports_received
     xhci.synthetic_inject_active = 0
+    # Rewind the Event Ring consumer to the controller's real producer
+    # position — forged events must not desync live event delivery.
+    _xhci_evt_synth_end()
 
     if after > before:
         printk1("[xhci_v1] transfer-engine PASS (%d reports)\n",
@@ -5055,6 +5290,7 @@ def xhci_v2_selftest():
     # All three injections below are synthetic forged events — keep
     # xhci_poll's live branch from counting them as genuine wire reports.
     xhci.synthetic_inject_active = 1
+    _xhci_evt_synth_begin()
 
     # Event 1 — 'h' (104).
     _xhci_v1_inject_transfer_event(cast[uint64](&xhci_v2_buf0[0]), 8)
@@ -5085,6 +5321,10 @@ def xhci_v2_selftest():
     else:
         fail_count = fail_count + 1
         printk1("[xhci_v2] FAIL: expected '!', got %d\n", cast[uint64](got))
+
+    # Rewind the Event Ring consumer to the controller's real producer
+    # position — forged events must not desync live event delivery.
+    _xhci_evt_synth_end()
 
     # The reports_received counter is the same one a live wire-side
     # event would bump — proves the timer-tick poll path's accounting.
@@ -5166,12 +5406,16 @@ def xhci_combo_routing_selftest():
     saved_kslot:   uint32 = xhci.kbd_slot_id
     saved_kenab:   uint32 = xhci.kbd_enabled
     saved_synth:   uint32 = xhci.synthetic_inject_active
+    saved_tablet:  uint32 = xhci.mouse_is_tablet
 
     if xhci.kbd_slot_id == 0:
         xhci.kbd_slot_id = 1
     # The mouse rides the keyboard's slot — the combo-device shape.
     xhci.mouse_slot_id         = xhci.kbd_slot_id
     xhci.mouse_shares_kbd_slot = 1
+    # This test forges a 3-byte BOOT-mouse report; force relative routing
+    # even if the live attach found an absolute tablet on this VM.
+    xhci.mouse_is_tablet       = 0
     xhci.mouse_enabled         = 1
     xhci.kbd_enabled           = 1
     xhci.mouse_int_ep          = 2          # ep2-IN, the typical combo mouse ep
@@ -5205,9 +5449,13 @@ def xhci_combo_routing_selftest():
     # slot id is kbd_slot_id (== mouse_slot_id here) — exactly the combo
     # case where slot id can't disambiguate, so only the buffer-address
     # route gets it to the mouse.
+    _xhci_evt_synth_begin()
     _xhci_v1_inject_transfer_event(
         cast[uint64](&xhci_combo_mouse_buf[0]), 3)
     xhci_poll()
+    # Rewind the Event Ring consumer to the controller's real producer
+    # position — forged events must not desync live event delivery.
+    _xhci_evt_synth_end()
 
     # The mouse report must have gone to /dev/mouse, NOT the keyboard FIFO.
     mpkt: int32 = mouse_rx_pop()
@@ -5248,6 +5496,7 @@ def xhci_combo_routing_selftest():
     xhci.mouse_enabled         = saved_menab
     xhci.kbd_enabled           = saved_kenab
     xhci.synthetic_inject_active = saved_synth
+    xhci.mouse_is_tablet       = saved_tablet
     if saved_kslot == 0:
         xhci.kbd_slot_id = 0
     while mouse_rx_pop() != -1:
