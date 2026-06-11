@@ -1594,6 +1594,16 @@ if os.environ.get("ENABLE_PROCFD_TEST"):
 if os.environ.get("ENABLE_DEVFDCHAN_TEST"):
     FILES.append(("/etc/devfdchan-test", b"1\n"))
 
+# Phase 4c DEV_PIPE_R/DEV_PIPE_W pool-chan self-test. scripts/test_pipe_chan.sh
+# sets ENABLE_PIPECHAN_TEST=1 to plant /etc/pipechan-test. init/main.ad detects
+# the marker and calls pipechan_selftest() (fs/pipe.ad): vfs_pipe() over the
+# pool-Chan representation, probe 0 -> 1 -> 0 across a payload round-trip,
+# dup+close chan-refcount tripwire, EOF after writer close, EPIPE after reader
+# close, 0x43-prefixed per-pipe inode identity, lseek rejected; emits the
+# [PIPECHAN] PASS banner. Needs no extra device.
+if os.environ.get("ENABLE_PIPECHAN_TEST"):
+    FILES.append(("/etc/pipechan-test", b"1\n"))
+
 # /proc/<pid>/ctl write-surface self-test. scripts/test_procctl.sh sets
 # ENABLE_PROCCTL_TEST=1 to plant /etc/procctl-test. init/main.ad detects the
 # marker and calls procctl_selftest() (devproc.ad): it drives the real

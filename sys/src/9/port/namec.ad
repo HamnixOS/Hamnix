@@ -73,6 +73,17 @@ from sys.src.port9.port.devfd import (
     devfd_read_blocking, devfd_write_blocking,
     devfd_read_nb, devfd_poll_readable,
 )
+# Phase 4c (pipe fold): DEV_PIPE_R / DEV_PIPE_W pool chans carry a
+# fs/pipe.ad slot in back_slot. The blocking I/O bodies live in
+# fs/pipe.ad (event-driven WaitQueue sleep — NEVER reintroduce a
+# poll-yield loop here); close releases ONE end-refcount on the last
+# chan reference. fs/pipe.ad sits below namec (imports slab/printk/
+# core only), so a direct import is cycle-free.
+from fs.pipe import (
+    pipe_read, pipe_read_blocking, pipe_write_blocking,
+    pipe_readers, pipe_writers, pipe_readable,
+    pipe_close_reader, pipe_close_writer,
+)
 from sys.src.port9.port.9p_client import (
     p9c_walk_open_path, p9c_walk_create_path,
     p9c_walk_mkdir_path,
@@ -468,7 +479,22 @@ DEV_LOOPCTL:   int32 = 66          # /dev/loop/ctl (inline, stateless)
 # dispatch there with pgrp_current().
 DEV_DEVFD:     int32 = 67          # /fd/N name fd (inline, wid = fd number)
 
-DEV_MAX:       int32 = 68
+# Phase 4c: an anonymous-pipe END (ex-FD_PIPE_MARK_R / FD_PIPE_MARK_W).
+# POOL chans — back_slot carries the fs/pipe.ad pipe-table slot, and the
+# chan's REFCOUNT is what fork/dup/spawn share (namec_chan_ref), so the
+# pipe end-refcounts (readers/writers) are owned ONE-PER-CHAN: vfs_pipe
+# allocates the pipe with readers=writers=1 and wraps each end in one
+# chan; the LAST namec_close on a chan runs pipe_close_reader /
+# pipe_close_writer. EOF/EPIPE semantics are unchanged — a forked read
+# fd used to bump `readers` per fd-copy, now it bumps the chan refcount
+# instead, and either way the reader count only hits 0 when every
+# holder is gone. Blocking bodies live in fs/pipe.ad
+# (pipe_read_blocking — two-phase WaitQueue sleep — and
+# pipe_write_blocking — chunked drain + yield, EPIPE).
+DEV_PIPE_R:    int32 = 68          # pipe read end (pool, slot-backed)
+DEV_PIPE_W:    int32 = 69          # pipe write end (pool, slot-backed)
+
+DEV_MAX:       int32 = 70
 
 # The FAT write-mode bit as carried in a DEV_FAT_FILE chan's back_slot
 # (a copy of fs/vfs.ad's FAT_FD_WRITE_BIT / fs/fat.ad's
@@ -710,7 +736,8 @@ def _chan_id_valid(cid: int32) -> int32:
                 and dt != DEV_EXT4_FILE and dt != DEV_FAT_FILE \
                 and dt != DEV_TMPFS_FILE and dt != DEV_DIR_FILE \
                 and dt != DEV_BUF_FILE and dt != DEV_PROC \
-                and dt != DEV_AUTH and dt != DEV_BLK:
+                and dt != DEV_AUTH and dt != DEV_BLK \
+                and dt != DEV_PIPE_R and dt != DEV_PIPE_W:
             return 1
         return 0
     return _chan_pool_valid(cid)
@@ -1606,6 +1633,47 @@ def namec_open_blk_file(pack: uint64) -> int32:
     return cs
 
 
+def namec_open_pipe_end(slot: int32, is_write: int32) -> int32:
+    # Phase 4c (pipe fold): wrap one END of a fs/pipe.ad pipe slot in a
+    # DEV_PIPE_R / DEV_PIPE_W pool chan. The caller owns one end-
+    # refcount on the pipe (pipe_alloc starts at readers=writers=1) and
+    # hands it to the chan: the LAST namec_close on this chan runs
+    # pipe_close_reader / pipe_close_writer. Returns the chan id, or -1
+    # on pool exhaustion (caller must drop the end-refcount itself to
+    # avoid leaking the pipe).
+    cs: int32 = _chan_alloc()
+    if cs < 0:
+        return -1
+    su: uint64 = cast[uint64](cs)
+    chan_pool[su].in_use    = 1
+    if is_write != 0:
+        chan_pool[su].dev_type = DEV_PIPE_W
+        chan_pool[su].mode     = 1
+    else:
+        chan_pool[su].dev_type = DEV_PIPE_R
+        chan_pool[su].mode     = 0
+    chan_pool[su].back_slot = slot
+    return cs
+
+
+def namec_chan_pipe_slot(cid: int32) -> int32:
+    # Phase 4c (pipe fold): the fs/pipe.ad slot behind a DEV_PIPE_R /
+    # DEV_PIPE_W chan, or -1 for any other chan kind. splice/tee
+    # (vfs_fd_pipe_slot) and the 9P srv-fd transport (9p_client.ad's
+    # _fd_to_pipe_slot, which calls this BY NAME — namec imports
+    # 9p_client, so the reverse import would cycle) recover the ring
+    # through this instead of branching on retired fd marks.
+    if _chan_id_valid(cid) == 0:
+        return -1
+    if _chan_id_is_inline(cid) != 0:
+        return -1
+    su: uint64 = cast[uint64](cid)
+    if chan_pool[su].dev_type == DEV_PIPE_R \
+            or chan_pool[su].dev_type == DEV_PIPE_W:
+        return chan_pool[su].back_slot
+    return -1
+
+
 def _ext4file_read(slot: uint64, off: uint64, buf: Ptr[uint8],
                    count: uint64) -> int64:
     inum: uint32 = ext4_open_inum(chan_pool[slot].back_slot)
@@ -1925,6 +1993,14 @@ def namec_read(cid: int32, off: uint64, buf: Ptr[uint8],
         # cursor (vfs advances fd_pos on return). By-name call (devblk
         # sits below vfs in the import graph).
         return devblk_read(chan_pool[su].back_ptr, off, buf, count)
+    if chan_pool[su].dev_type == DEV_PIPE_R:
+        # Phase 4c (pipe fold): blocking pipe read — the event-driven
+        # two-phase WaitQueue sleep lives in fs/pipe.ad. Stream-shaped:
+        # off is ignored (vfs advances fd_pos harmlessly). EOF (all
+        # writers gone) is 0; a signal wake is -EINTR.
+        return pipe_read_blocking(chan_pool[su].back_slot, buf, count)
+    if chan_pool[su].dev_type == DEV_PIPE_W:
+        return -9                          # -EBADF: can't read a write end
     return _devtab_read(chan_pool[su].dev_type, 0, 0, off, buf, count)
 
 
@@ -1967,6 +2043,18 @@ def namec_read_nb(cid: int32, off: uint64, buf: Ptr[uint8],
     su: uint64 = cast[uint64](cid)
     if chan_pool[su].dev_type == DEV_CONS:
         return devcons_read_nb(buf, count)
+    if chan_pool[su].dev_type == DEV_PIPE_R:
+        # Phase 4c (pipe fold): non-blocking pipe read. pipe_read is
+        # already non-blocking at the fs/pipe.ad layer; 0 there means
+        # "empty right now". Distinguish a closed pipe (no writers
+        # left) as a true EOF (-1) — the legacy FD_PIPE_MARK_R
+        # vfs_read_nb contract.
+        np: int64 = pipe_read(chan_pool[su].back_slot, buf, count)
+        if np > 0:
+            return np
+        if pipe_writers(chan_pool[su].back_slot) == 0:
+            return -1                      # true EOF
+        return 0                           # would-block
     return namec_read(cid, off, buf, count)
 
 
@@ -2021,6 +2109,28 @@ def namec_poll_readable(cid: int32) -> int32:
         # Every other inline cdev read is a non-blocking snapshot
         # (procfs-style render-on-read) — always "ready".
         return 1
+    # Phase 4c (pipe fold): pipe-end pool chans have REAL readiness.
+    pdt: int32 = chan_pool[cast[uint64](cid)].dev_type
+    if pdt == DEV_PIPE_R:
+        # Ready when bytes are queued OR every writer is gone (EOF is
+        # readable). Otherwise class 0 — the producers (pipe_write,
+        # pipe_close_writer) are wired to waitfds_notify(). Without
+        # this arm a folded pipe fd would regress to always-ready and
+        # vfs_waitfds would busy-spin on an empty pipe.
+        pslot: int32 = chan_pool[cast[uint64](cid)].back_slot
+        if pipe_readable(pslot) != 0:
+            return 1
+        if pipe_writers(pslot) == 0:
+            return 1                       # EOF is readable
+        return 0                           # pipe_write/close wired
+    if pdt == DEV_PIPE_W:
+        # Read-readiness probe on a WRITE end: only an all-readers-gone
+        # error state makes a read-shaped wait return (the legacy
+        # fallback surfaced POLLERR as "ready"). No producer wakes a
+        # write end's read-wait — class 2, jiffy re-probe.
+        if pipe_readers(chan_pool[cast[uint64](cid)].back_slot) == 0:
+            return 1                       # POLLERR — surfaces on use
+        return 2
     # Pool chans (9P mounts, ext4/fat/tmpfs files, dirs): reads complete
     # without parking on a waitqueue — treat as always ready.
     return 1
@@ -2067,6 +2177,17 @@ def namec_write(cid: int32, off: uint64, buf: Ptr[uint8],
         # sector-addressed at off; CTL writes parse a format/partition
         # verb; SIZE writes are rejected inside devblk_write.
         return devblk_write(chan_pool[su].back_ptr, off, buf, count)
+    if chan_pool[su].dev_type == DEV_PIPE_W:
+        # Phase 4c: pipe write end. Blocking ring write — the verbatim
+        # port of the legacy vfs FD_PIPE_MARK_W arm lives in fs/pipe.ad
+        # (pipe_write_blocking): EPIPE when no readers remain, partial
+        # count honored, yield while the ring is full. Stream-shaped:
+        # off ignored (a pipe has no cursor).
+        return pipe_write_blocking(chan_pool[su].back_slot, buf, count)
+    if chan_pool[su].dev_type == DEV_PIPE_R:
+        # Writing the READ end of a pipe is a bad fd, same answer the
+        # legacy FD_PIPE_MARK_R write arm gave.
+        return -9                                           # -EBADF
     return _devtab_write(chan_pool[su].dev_type, 0, 0, off, buf, count)
 
 
@@ -2137,6 +2258,20 @@ def namec_close(cid: int32) -> int32:
         # reaches here through close_fd_in_task — the legacy exit path
         # leaked the slot outright. By-name call (import cycle).
         devauth_close(chan_pool[su].back_slot)
+    elif chan_pool[su].dev_type == DEV_PIPE_R:
+        # Phase 4c: drop the read-end reference this chan OWNS. Because
+        # the chan itself is refcounted (fork/dup → namec_chan_ref), the
+        # pipe's readers count stays 1 per chan, and only the LAST fd
+        # holder reaches here — fixing the legacy model where every fd
+        # copy bumped pipe readers directly. pipe_close_reader wakes any
+        # blocked writer so it can see EPIPE.
+        pipe_close_reader(chan_pool[su].back_slot)
+    elif chan_pool[su].dev_type == DEV_PIPE_W:
+        # Phase 4c: last write-end fd gone — pipe_close_writer wakes the
+        # read_wq (EOF becomes readable) and pokes waitfds_notify so a
+        # parked poller re-probes; the pipe slot is reclaimed when both
+        # end counts hit zero (_maybe_free).
+        pipe_close_writer(chan_pool[su].back_slot)
     _chan_free(cid)
     return 0
 

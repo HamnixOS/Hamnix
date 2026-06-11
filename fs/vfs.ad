@@ -45,7 +45,7 @@ from drivers.tty.serial.early_8250 import PRINTK_LEVEL_WARN, PRINTK_LEVEL_EMERG
 from kernel.sched.core import (
     TaskStruct, current_task,
     FD_CLOSED_MARK, FD_STDIN_MARK, FD_STDOUT_MARK, FD_STDERR_MARK,
-    FD_BUFFER_MARK, FD_TMPFS_MARK, FD_PIPE_MARK_R, FD_PIPE_MARK_W,
+    FD_BUFFER_MARK, FD_TMPFS_MARK,
     FD_FAT_MARK, FD_EXT4_MARK,
     FD_SOCKET_MARK,
     close_fd_in_task, copy_fd_entry, yield_to_others,
@@ -213,6 +213,9 @@ from sys.src.port9.port.namec import (
     DEV_AUTH, DEV_BLK,
     # Phase 4c: `#d/<N>` fd-name fds are DEV_DEVFD inline chans.
     DEV_DEVFD, namec_chan_id_devfd, namec_chan_devfd_num,
+    # Phase 4c: pipe ends are DEV_PIPE_R / DEV_PIPE_W pool chans
+    # (back_slot = fs/pipe.ad ring slot).
+    DEV_PIPE_R, DEV_PIPE_W, namec_open_pipe_end, namec_chan_pipe_slot,
     # SYS_WAITFDS: per-Chan non-destructive readiness probe.
     namec_poll_readable,
 )
@@ -239,9 +242,12 @@ from fs.tmpfs import (
     tmpfs_create_anon, tmpfs_release_anon, tmpfs_ftruncate, tmpfs_is_anon,
 )
 from fs.pipe import (
-    pipe_alloc, pipe_read, pipe_write,
+    pipe_alloc, pipe_write,
     pipe_readers, pipe_writers,
-    pipe_readable, pipe_writable, pipe_read_wq,
+    pipe_readable, pipe_writable,
+    # Phase 4c: vfs_pipe rollback paths drop raw end-references when the
+    # chan pool is exhausted mid-allocation.
+    pipe_close_reader, pipe_close_writer,
 )
 # V5: bidirectional socketpair transport. Each fd marked
 # FD_SOCKETPAIR_MARK is a single fd you can read AND write — retires
@@ -3570,13 +3576,20 @@ def vfs_pipe(out_fds: Ptr[int32]) -> int32:
     # success; -EMFILE if the caller doesn't have two free fd slots,
     # -ENOSPC if the global pipe table is full. We allocate fds in
     # the parent task only — children inherit by dup'ing.
+    #
+    # Phase 4c: each pipe END rides its own DEV_PIPE_R / DEV_PIPE_W
+    # POOL chan (back_slot = pipe ring slot). pipe_alloc starts the
+    # ring at readers=1/writers=1; each chan OWNS one of those
+    # end-references, released by namec_close's DEV_PIPE arms on the
+    # LAST fd holder (fork/dup bumps the chan refcount, not the pipe
+    # counters).
     task: Ptr[TaskStruct] = current_task()
     rfd: int32 = _alloc_fd(task)
     if rfd < 0:
         return EMFILE
     # Provisionally mark rfd used so _alloc_fd skips it when we ask
     # for the second fd, but we haven't routed it anywhere yet.
-    task[0].fd_idx[cast[uint64](rfd)] = FD_PIPE_MARK_R
+    task[0].fd_idx[cast[uint64](rfd)] = FD_CHAN_MARK
     wfd: int32 = _alloc_fd(task)
     if wfd < 0:
         # Roll back the half-taken read fd before we error out.
@@ -3588,14 +3601,31 @@ def vfs_pipe(out_fds: Ptr[int32]) -> int32:
         task[0].fd_idx[cast[uint64](rfd)] = FD_CLOSED_MARK
         return ENOSPC
 
+    rch: int32 = namec_open_pipe_end(slot, 0)
+    if rch < 0:
+        # Chan pool exhausted — drop BOTH end-references so the ring
+        # slot is reclaimed, then roll the fds back.
+        pipe_close_reader(slot)
+        pipe_close_writer(slot)
+        task[0].fd_idx[cast[uint64](rfd)] = FD_CLOSED_MARK
+        return ENOSPC
+    wch: int32 = namec_open_pipe_end(slot, 1)
+    if wch < 0:
+        # The read chan now owns the reader ref; namec_close releases
+        # it. The writer ref is still raw — drop it directly.
+        namec_close(rch)
+        pipe_close_writer(slot)
+        task[0].fd_idx[cast[uint64](rfd)] = FD_CLOSED_MARK
+        return ENOSPC
+
     rfdu: uint64 = cast[uint64](rfd)
     wfdu: uint64 = cast[uint64](wfd)
-    task[0].fd_idx[rfdu] = FD_PIPE_MARK_R
+    task[0].fd_idx[rfdu] = FD_CHAN_MARK
     task[0].fd_pos[rfdu] = 0
-    task[0].fd_buf[rfdu] = cast[uint64](slot)
-    task[0].fd_idx[wfdu] = FD_PIPE_MARK_W
+    task[0].fd_buf[rfdu] = cast[uint64](cast[uint32](rch))
+    task[0].fd_idx[wfdu] = FD_CHAN_MARK
     task[0].fd_pos[wfdu] = 0
-    task[0].fd_buf[wfdu] = cast[uint64](slot)
+    task[0].fd_buf[wfdu] = cast[uint64](cast[uint32](wch))
 
     out_fds[0] = rfd
     out_fds[1] = wfd
@@ -3817,19 +3847,19 @@ def vfs_fd_pty_pack(fd: int32) -> int64:
 
 def vfs_fd_pipe_slot(fd: int32) -> int32:
     # splice/tee/vmsplice support: if `fd` is one end of an anonymous
-    # pipe (FD_PIPE_MARK_R or FD_PIPE_MARK_W), return the backing
-    # pipe-table slot stored in fd_buf; otherwise -1. The Layer-2 splice
-    # shim uses this both to recognise the pipe side of a splice and to
-    # drive a non-consuming tee against the ring directly.
+    # pipe (a DEV_PIPE_R / DEV_PIPE_W pool chan), return the backing
+    # pipe-table slot riding in the chan's back_slot; otherwise -1. The
+    # Layer-2 splice shim uses this both to recognise the pipe side of
+    # a splice and to drive a non-consuming tee against the ring
+    # directly.
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return -1
     task: Ptr[TaskStruct] = current_task()
     fdu: uint64 = cast[uint64](fd)
-    m: uint32 = task[0].fd_idx[fdu]
-    if m == FD_PIPE_MARK_R or m == FD_PIPE_MARK_W:
-        return cast[int32](task[0].fd_buf[fdu])
-    return -1
+    if task[0].fd_idx[fdu] != FD_CHAN_MARK:
+        return -1
+    return namec_chan_pipe_slot(cast[int32](cast[uint32](task[0].fd_buf[fdu])))
 
 
 def vfs_fd_is_pipe_read(fd: int32) -> int32:
@@ -3838,7 +3868,11 @@ def vfs_fd_is_pipe_read(fd: int32) -> int32:
     if rc != 0:
         return 0
     task: Ptr[TaskStruct] = current_task()
-    if task[0].fd_idx[cast[uint64](fd)] == FD_PIPE_MARK_R:
+    fdu: uint64 = cast[uint64](fd)
+    if task[0].fd_idx[fdu] != FD_CHAN_MARK:
+        return 0
+    cid: int32 = cast[int32](cast[uint32](task[0].fd_buf[fdu]))
+    if namec_chan_dev_type(cid) == DEV_PIPE_R:
         return 1
     return 0
 
@@ -3849,7 +3883,11 @@ def vfs_fd_is_pipe_write(fd: int32) -> int32:
     if rc != 0:
         return 0
     task: Ptr[TaskStruct] = current_task()
-    if task[0].fd_idx[cast[uint64](fd)] == FD_PIPE_MARK_W:
+    fdu: uint64 = cast[uint64](fd)
+    if task[0].fd_idx[fdu] != FD_CHAN_MARK:
+        return 0
+    cid: int32 = cast[int32](cast[uint32](task[0].fd_buf[fdu]))
+    if namec_chan_dev_type(cid) == DEV_PIPE_W:
         return 1
     return 0
 
@@ -4001,22 +4039,30 @@ def vfs_fd_poll(fd: int32) -> uint32:
         if devnet_data_at_eof(net_conn) != 0:
             ev_n = ev_n | 0x0011            # POLLHUP + POLLIN
         return ev_n
-    if fi == FD_PIPE_MARK_R:
-        slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        ev_pr: uint32 = 0
-        if pipe_readable(slot) != 0:
-            ev_pr = 0x0001
-        if pipe_writers(slot) == 0:
-            ev_pr = ev_pr | 0x0011          # POLLHUP + POLLIN (EOF readable)
-        return ev_pr
-    if fi == FD_PIPE_MARK_W:
-        slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        if pipe_readers(slot) == 0:
-            return 0x0008                   # POLLERR — no readers
-        ev_pw: uint32 = 0
-        if pipe_writable(slot) != 0:
-            ev_pw = 0x0004
-        return ev_pw
+    if fi == FD_CHAN_MARK:
+        # Phase 4c: pipe ends are DEV_PIPE_R / DEV_PIPE_W pool chans —
+        # render the same poll bits the legacy FD_PIPE_MARK arms did.
+        # Every other chan family keeps the regular-file answer
+        # (POLLIN|POLLOUT, always ready) it got from the fallthrough.
+        p_cid: int32 = cast[int32](cast[uint32](task[0].fd_buf[fdu]))
+        p_dev: int32 = namec_chan_dev_type(p_cid)
+        if p_dev == DEV_PIPE_R:
+            slot: int32 = namec_chan_back_slot(p_cid)
+            ev_pr: uint32 = 0
+            if pipe_readable(slot) != 0:
+                ev_pr = 0x0001
+            if pipe_writers(slot) == 0:
+                ev_pr = ev_pr | 0x0011      # POLLHUP + POLLIN (EOF readable)
+            return ev_pr
+        if p_dev == DEV_PIPE_W:
+            wslot: int32 = namec_chan_back_slot(p_cid)
+            if pipe_readers(wslot) == 0:
+                return 0x0008               # POLLERR — no readers
+            ev_pw: uint32 = 0
+            if pipe_writable(wslot) != 0:
+                ev_pw = 0x0004
+            return ev_pw
+        return 0x0005                       # other chans: POLLIN|POLLOUT
     if fi == FD_SOCKETPAIR_MARK:
         sp_pkd:  uint64 = task[0].fd_buf[fdu]
         sp_slot: int32 = sockpair_unpack_slot(sp_pkd)
@@ -4091,13 +4137,6 @@ def vfs_waitfds_probe(fd: int32) -> int32:
     fi: uint32 = task[0].fd_idx[fdu]
     if fi == FD_CLOSED_MARK:
         return 1
-    if fi == FD_PIPE_MARK_R:
-        slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        if pipe_readable(slot) != 0:
-            return 1
-        if pipe_writers(slot) == 0:
-            return 1                        # EOF is readable
-        return 0                            # pipe_write/close notify us
     if fi == FD_STDIN_MARK:
         # Legacy console stdin (same byte sources as /dev/cons).
         if devcons_poll_readable() != 0:
@@ -4227,6 +4266,14 @@ def vfs_fd_inode(fd: int32) -> uint64:
             tslot: int32 = namec_chan_back_slot(_fd_chan_id(task, fdu))
             return cast[uint64](0x4200000000000000) \
                    | cast[uint64](cast[uint32](tslot))
+        if chdt == DEV_PIPE_R or chdt == DEV_PIPE_W:
+            # Phase 4c: a pipe end's stable identity is its RING slot,
+            # not the recycled chan id — both ends of one pipe share the
+            # slot, dev_type keeps R and W inodes distinct (tag 0x43..).
+            pslot: int32 = namec_chan_back_slot(_fd_chan_id(task, fdu))
+            return cast[uint64](0x4300000000000000) \
+                   | (cast[uint64](cast[uint32](chdt)) << 32) \
+                   | cast[uint64](cast[uint32](pslot))
     # Other special-backed fd kinds: combine the marker with fd_buf
     # (backing slot or buffer address) so distinct files get distinct
     # inodes. The 0x4000_0000_0000_0000 bit keeps the whole value out
@@ -5275,17 +5322,6 @@ def vfs_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         if n_sk < 0:
             usock_set_state(sk_rec, USOCK_CLOSED)
         return n_sk
-    if file_idx == FD_PIPE_MARK_R:
-        # pipe_read is already non-blocking at the fs/pipe.ad layer; a
-        # 0 return there means "empty right now". Distinguish a closed
-        # pipe (no writers left) as a true EOF (-1).
-        slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        n_p: int64 = pipe_read(slot, buf, count)
-        if n_p > 0:
-            return n_p
-        if pipe_writers(slot) == 0:
-            return -1
-        return 0
     if file_idx == FD_NET_MARK:
         # ARCH §10: a non-blocking read of a /net data file. >0 bytes,
         # 0 = would-block, -1 = EOF/error. Only the data file has a
@@ -5379,13 +5415,18 @@ def vfs_write_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     file_idx: uint32 = task[0].fd_idx[fdu]
     if file_idx == FD_CLOSED_MARK:
         return cast[int64](EBADF)
-    if file_idx == FD_PIPE_MARK_W:
-        # A single non-blocking pipe write: pipe_write enqueues what the
-        # ring will take (0 when full). EPIPE if every reader is gone.
-        slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        if pipe_readers(slot) == 0:
-            return cast[int64](EPIPE)
-        return pipe_write(slot, buf, count)
+    if file_idx == FD_CHAN_MARK:
+        # Phase 4c: a pipe write end is a DEV_PIPE_W pool chan. A single
+        # non-blocking pipe write: pipe_write enqueues what the ring will
+        # take (0 when full). EPIPE if every reader is gone. Any other
+        # chan kind has no would-block notion — delegate to vfs_write.
+        wnb_cid: int32 = cast[int32](cast[uint32](task[0].fd_buf[fdu]))
+        if namec_chan_dev_type(wnb_cid) == DEV_PIPE_W:
+            slot: int32 = namec_chan_back_slot(wnb_cid)
+            if pipe_readers(slot) == 0:
+                return cast[int64](EPIPE)
+            return pipe_write(slot, buf, count)
+        return vfs_write(fd, buf, count)
     if file_idx == FD_SOCKETPAIR_MARK:
         sp_pkd:  uint64 = task[0].fd_buf[fdu]
         sp_slot: int32 = sockpair_unpack_slot(sp_pkd)
@@ -5663,35 +5704,6 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
             if tv != -11:
                 return tv
             yield_to_others()
-    if file_idx == FD_PIPE_MARK_R:
-        # Blocking read: sleep on the pipe's read wait queue until a
-        # writer enqueues bytes (pipe_write wakes us) OR the last writer
-        # closes (pipe_close_writer wakes us so we observe EOF). This is
-        # the event-driven model — the reader is STATE_WAIT (off the
-        # runqueue) while idle, woken directly by the producer rather than
-        # re-polled on every 100 Hz timer tick. A signal-wake returns
-        # WQ_EINTR so the read aborts with -EINTR.
-        slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        while True:
-            n: int64 = pipe_read(slot, buf, count)
-            if n > 0:
-                return n
-            if pipe_writers(slot) == 0:
-                return 0                       # all writers gone -> EOF
-            # Two-phase wait to close the SMP lost-wakeup window: queue
-            # ourselves FIRST, then re-check the pipe (and writer count)
-            # while queued. If a writer raced bytes in / closed between the
-            # checks above and here, the recheck sees it and we cancel
-            # instead of sleeping forever. Only commit to sleep when the
-            # pipe is still empty AND a writer still exists.
-            pwq: Ptr[WaitQueue] = pipe_read_wq(slot)
-            wq_wait_prepare(pwq)
-            if pipe_readable(slot) != 0 or pipe_writers(slot) == 0:
-                wq_wait_cancel(pwq)
-                continue
-            rcp: int32 = wq_wait_commit(pwq)
-            if rcp != 0:
-                return cast[int64](WQ_EINTR)
     if file_idx == FD_SOCKETPAIR_MARK:
         # V5: bidirectional read. The packed fd_buf encodes (slot << 1
         # | direction); end A reads ring_b, end B reads ring_a. We
@@ -5713,8 +5725,10 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     # DEV_EXT4_FILE pool chan); the FD_CHAN_MARK arm at the head of
     # vfs_read dispatches it through namec_read into _fatfile_read /
     # _ext4file_read. fd_pos is the byte offset (the DEV_MNT shape).
-    if file_idx == FD_PIPE_MARK_W:
-        return cast[int64](EBADF)              # can't read a write end
+    # Phase 4c: the FD_PIPE_MARK_R / FD_PIPE_MARK_W arms are GONE the
+    # same way — DEV_PIPE_R chans block inside namec_read →
+    # pipe_read_blocking (fs/pipe.ad, the verbatim two-phase WaitQueue
+    # port); a read on a DEV_PIPE_W chan answers -EBADF in namec_read.
     if file_idx == FD_STDIN_MARK:
         # M16.39: read from the software RX FIFO that timer_interrupt
         # drains the UART into. Ctrl-C (0x03) never lands in the FIFO
@@ -6052,26 +6066,12 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         return cast[int64](EINVAL)             # a signalfd is not writable
     if file_idx == FD_EPOLL_MARK:
         return cast[int64](EINVAL)             # an epoll fd is not writable
-    if file_idx == FD_PIPE_MARK_W:
-        # Blocking write: drain as much as the ring will accept,
-        # yielding when full until a reader makes room. EPIPE if
-        # every reader has closed (matches Linux's write-after-close
-        # error; no SIGPIPE yet — userland sees the errno).
-        slot: int32 = cast[int32](task[0].fd_buf[fdu])
-        total: uint64 = 0
-        while total < count:
-            if pipe_readers(slot) == 0:
-                if total > 0:
-                    return cast[int64](total)
-                return cast[int64](EPIPE)
-            chunk: int64 = pipe_write(slot,
-                cast[Ptr[uint8]](cast[uint64](buf) + total),
-                count - total)
-            if chunk > 0:
-                total = total + cast[uint64](chunk)
-            else:
-                yield_to_others()
-        return cast[int64](total)
+    # Phase 4c: the FD_PIPE_MARK_W blocking-write arm (and the
+    # FD_PIPE_MARK_R -EBADF arm below) are GONE — a pipe end is an
+    # FD_CHAN_MARK fd whose namec_write DEV_PIPE_W arm runs
+    # pipe_write_blocking (fs/pipe.ad, the verbatim port of the loop
+    # that lived here: EPIPE on no readers, partial count honored,
+    # yield while full).
     if file_idx == FD_SOCKETPAIR_MARK:
         # V5: bidirectional write. End A writes ring_a, end B writes
         # ring_b. Same blocking shape as the pipe path: yield when the
@@ -6095,8 +6095,6 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
             else:
                 yield_to_others()
         return cast[int64](total)
-    if file_idx == FD_PIPE_MARK_R:
-        return cast[int64](EBADF)              # can't write a read end
     if file_idx == FD_STDOUT_MARK or file_idx == FD_STDERR_MARK:
         # M16.77: mirror every byte to BOTH the UART and the VGA text
         # console. The UART feeds `-nographic` QEMU; the VGA / fb_text
@@ -6379,7 +6377,6 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
     # behaviour).
     if file_idx == FD_STDIN_MARK or file_idx == FD_STDOUT_MARK \
             or file_idx == FD_STDERR_MARK \
-            or file_idx == FD_PIPE_MARK_R or file_idx == FD_PIPE_MARK_W \
             or file_idx == FD_SOCKET_MARK \
             or file_idx == FD_SOCKETPAIR_MARK \
             or file_idx == FD_PTMX_MARK \
@@ -6407,10 +6404,13 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
         # glibc's _u_file_size_via_lseek probes stdout at startup and
         # must see "not seekable" for /fd/N stdio, or stdio buffering
         # misclassifies the stream as a zero-length regular file.
-        if file_idx == FD_CHAN_MARK \
-                and namec_chan_dev_type(
-                    _fd_chan_id(task, fdu)) == DEV_DEVFD:
-            return cast[int64](EINVAL)
+        # DEV_PIPE_R / DEV_PIPE_W get the same answer — a pipe has no
+        # cursor (the legacy mark ladder above said EINVAL too).
+        if file_idx == FD_CHAN_MARK:
+            sk_dt: int32 = namec_chan_dev_type(_fd_chan_id(task, fdu))
+            if sk_dt == DEV_DEVFD or sk_dt == DEV_PIPE_R \
+                    or sk_dt == DEV_PIPE_W:
+                return cast[int64](EINVAL)
         # 9P / namec-Chan seek. SEEK_SET / SEEK_CUR just adjust fd_pos
         # — a subsequent vfs_read passes the new offset through to the
         # DEV_MNT mountrpc leg's Tread (an inline cdev ignores the

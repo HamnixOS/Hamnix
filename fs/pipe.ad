@@ -22,11 +22,30 @@
 # signal subsystem lands.
 
 from mm.slab import kmalloc, kfree
-from kernel.printk.printk import printk0, printk1
+from kernel.printk.printk import printk0, printk1, printk_set_level
 # Event-driven blocking: a pipe read end that finds the ring empty sleeps
 # on the pipe's per-slot read_wq instead of poll-yielding on the timer
 # tick. The write path and the writer-close path wake it.
-from kernel.sched.core import WaitQueue, wq_init, wq_wake_all, waitfds_notify
+# Phase 4c (pipe fold): the BLOCKING loops moved here from fs/vfs.ad's
+# retired FD_PIPE_MARK_R/W arms — pipe_read_blocking parks on the
+# two-phase WaitQueue API (prepare → recheck → commit, WQ_EINTR on
+# signal); pipe_write_blocking is the chunked drain-and-yield writer.
+# namec's DEV_PIPE_R/DEV_PIPE_W pool-chan arms dispatch here.
+from kernel.sched.core import (
+    WaitQueue, wq_init, wq_wake_all, waitfds_notify,
+    wq_wait_prepare, wq_wait_cancel, wq_wait_commit, WQ_EINTR,
+    yield_to_others,
+    # Phase 4c gate plumbing (pipechan_selftest below): the boot task's
+    # fd table is uninitialised at boot — free a few high slots via the
+    # setters, restore after. copy_fd_entry is the REAL fork/dup hook
+    # (bumps the shared chan refcount), so the selftest can prove a
+    # dup'd pipe fd doesn't yank the end out from under its sibling.
+    TaskStruct, current_task, current_idx_get, copy_fd_entry,
+    FD_CLOSED_MARK,
+    task_fd_idx_at, task_fd_buf_at,
+    task_set_fd_idx_at, task_set_fd_buf_at,
+)
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -295,6 +314,61 @@ def pipe_read(slot: int32, dst: Ptr[uint8], count: uint64) -> int64:
     return cast[int64](take)
 
 
+def pipe_read_blocking(slot: int32, dst: Ptr[uint8],
+                       count: uint64) -> int64:
+    # Phase 4c (pipe fold): the blocking read body, verbatim from the
+    # retired fs/vfs.ad FD_PIPE_MARK_R arm. Sleep on the pipe's read
+    # wait queue until a writer enqueues bytes (pipe_write wakes us) OR
+    # the last writer closes (pipe_close_writer wakes us so we observe
+    # EOF). This is the event-driven model — the reader is STATE_WAIT
+    # (off the runqueue) while idle, woken directly by the producer
+    # rather than re-polled on every 100 Hz timer tick. A signal-wake
+    # returns WQ_EINTR so the read aborts with -EINTR.
+    while True:
+        n: int64 = pipe_read(slot, dst, count)
+        if n > 0:
+            return n
+        if pipe_writers(slot) == 0:
+            return 0                       # all writers gone -> EOF
+        # Two-phase wait to close the SMP lost-wakeup window: queue
+        # ourselves FIRST, then re-check the pipe (and writer count)
+        # while queued. If a writer raced bytes in / closed between the
+        # checks above and here, the recheck sees it and we cancel
+        # instead of sleeping forever. Only commit to sleep when the
+        # pipe is still empty AND a writer still exists.
+        pwq: Ptr[WaitQueue] = pipe_read_wq(slot)
+        wq_wait_prepare(pwq)
+        if pipe_readable(slot) != 0 or pipe_writers(slot) == 0:
+            wq_wait_cancel(pwq)
+            continue
+        rcp: int32 = wq_wait_commit(pwq)
+        if rcp != 0:
+            return cast[int64](WQ_EINTR)
+
+
+def pipe_write_blocking(slot: int32, src: Ptr[uint8],
+                        count: uint64) -> int64:
+    # Phase 4c (pipe fold): the blocking write body, verbatim from the
+    # retired fs/vfs.ad FD_PIPE_MARK_W arm. Drain as much as the ring
+    # will accept, yielding when full until a reader makes room. EPIPE
+    # (-32) if every reader has closed (matches Linux's write-after-
+    # close error; no SIGPIPE yet — userland sees the errno).
+    total: uint64 = 0
+    while total < count:
+        if pipe_readers(slot) == 0:
+            if total > 0:
+                return cast[int64](total)
+            return -32                     # -EPIPE
+        chunk: int64 = pipe_write(slot,
+            cast[Ptr[uint8]](cast[uint64](src) + total),
+            count - total)
+        if chunk > 0:
+            total = total + cast[uint64](chunk)
+        else:
+            yield_to_others()
+    return cast[int64](total)
+
+
 def pipe_write(slot: int32, src: Ptr[uint8], count: uint64) -> int64:
     # Returns bytes copied. 0 here means "ring is full right now" —
     # caller checks readers to distinguish from EPIPE.
@@ -330,3 +404,188 @@ def pipe_write(slot: int32, src: Ptr[uint8], count: uint64) -> int64:
         # pipe's read end.
         waitfds_notify()
     return cast[int64](take)
+
+
+# --- pipechan_selftest -----------------------------------------------
+#
+# Phase 4c gate: proves the FD_PIPE_MARK_R/W → DEV_PIPE_R/DEV_PIPE_W
+# pool-chan fold end to end WITHOUT serial input (the legacy pipe gates
+# drive hamsh over serial stdin, which this host loses; scripts/
+# test_pipe_chan.sh boots with stdin </dev/null and greps the
+# [PIPECHAN] marker):
+#
+#   * vfs_pipe lands TWO FD_CHAN_MARK fds whose chan ids resolve to the
+#     SAME ring slot via namec_chan_pipe_slot (representation check).
+#   * vfs_waitfds_probe(rfd) walks 0 → 1 → 0 across write/drain — the
+#     namec_poll_readable DEV_PIPE_R arm (class 0 = wired to
+#     waitfds_notify; the fold must NOT regress pipe polls to
+#     always-ready).
+#   * write via the chan (namec_write → pipe_write_blocking), read it
+#     back (namec_read → pipe_read_blocking) — payload carries through.
+#   * a dup'd read fd (copy_fd_entry — the REAL fork/dup hook, which
+#     bumps the CHAN refcount) is closed FIRST and the original still
+#     reads — the legacy model held one pipe ref PER FD; the chan model
+#     holds one per CHAN, released only on the last holder.
+#   * fstat identity: both ends report the 0x43-tagged ring-slot inode,
+#     R and W distinct (#410 stable-identity contract).
+#   * vfs_lseek is rejected (a pipe has no cursor).
+#   * close(wfd) → EOF: probe says ready, read returns 0.
+#   * fresh pipe, close(rfd) first → vfs_write answers -EPIPE (-32).
+#
+# vfs_* / namec_chan_pipe_slot are resolved BY NAME (the whole-kernel
+# Adder merge) — vfs.ad and namec.ad both import fs/pipe.ad, so a
+# literal import here would cycle. Returns 1 PASS, 0 FAIL. PUBLIC so
+# init/main.ad can call it.
+
+def pipechan_selftest() -> int32:
+    # The boot task's fd table is uninitialised (all-zero ≠
+    # FD_CLOSED_MARK ⇒ _alloc_fd sees every slot in use): free slots
+    # 10/11/12 deterministically, restore them on the way out.
+    boot_slot: int32 = cast[int32](current_idx_get())
+    s10i: uint32 = task_fd_idx_at(boot_slot, 10)
+    s10b: uint64 = task_fd_buf_at(boot_slot, 10)
+    s11i: uint32 = task_fd_idx_at(boot_slot, 11)
+    s11b: uint64 = task_fd_buf_at(boot_slot, 11)
+    s12i: uint32 = task_fd_idx_at(boot_slot, 12)
+    s12b: uint64 = task_fd_buf_at(boot_slot, 12)
+    task_set_fd_idx_at(boot_slot, 10, FD_CLOSED_MARK)
+    task_set_fd_buf_at(boot_slot, 10, 0)
+    task_set_fd_idx_at(boot_slot, 11, FD_CLOSED_MARK)
+    task_set_fd_buf_at(boot_slot, 11, 0)
+    task_set_fd_idx_at(boot_slot, 12, FD_CLOSED_MARK)
+    task_set_fd_buf_at(boot_slot, 12, 0)
+
+    ok: int32 = 1
+    fds: Array[2, int32]
+    fds[0] = -1
+    fds[1] = -1
+    if vfs_pipe(&fds[0]) != 0:
+        printk0("[PIPECHAN] FAIL vfs_pipe\n")
+        ok = 0
+    rfd: int32 = fds[0]
+    wfd: int32 = fds[1]
+
+    if ok == 1:
+        # Representation: both fds carry chan ids that resolve to the
+        # SAME pipe ring slot (and resolve at all — non-pipe chans
+        # answer -1).
+        rcid: int32 = cast[int32](cast[uint32](
+            task_fd_buf_at(boot_slot, cast[uint64](rfd))))
+        wcid: int32 = cast[int32](cast[uint32](
+            task_fd_buf_at(boot_slot, cast[uint64](wfd))))
+        rslot: int32 = namec_chan_pipe_slot(rcid)
+        wslot: int32 = namec_chan_pipe_slot(wcid)
+        if rslot < 0 or rslot != wslot:
+            printk1("[PIPECHAN] FAIL slot resolve rslot=%d\n",
+                    cast[uint64](cast[uint32](rslot)))
+            ok = 0
+
+    if ok == 1 and vfs_waitfds_probe(rfd) != 0:
+        # Empty pipe + live writer ⇒ class 0 (wired, not ready). The
+        # legacy FD_CHAN fallthrough said "always ready" — tripwire.
+        printk0("[PIPECHAN] FAIL probe!=0 on empty pipe\n")
+        ok = 0
+
+    if ok == 1:
+        payload: Array[8, uint8]
+        payload[0] = 112        # 'p'
+        payload[1] = 52         # '4'
+        payload[2] = 99         # 'c'
+        payload[3] = 33         # '!'
+        wn: int64 = vfs_write(wfd, &payload[0], 4)
+        if wn != 4:
+            printk1("[PIPECHAN] FAIL write rc=%d\n", cast[uint64](wn))
+            ok = 0
+        if ok == 1 and vfs_waitfds_probe(rfd) != 1:
+            printk0("[PIPECHAN] FAIL probe!=1 with bytes queued\n")
+            ok = 0
+
+    if ok == 1:
+        # Dup the READ end (the real fork/dup hook: bumps the chan
+        # refcount), close the dup — the original MUST still drain the
+        # payload. Under the legacy per-fd pipe refs this was safe by
+        # construction; under chans it proves namec_chan_ref/namec_close
+        # pair correctly.
+        tsk: Ptr[TaskStruct] = current_task()
+        if copy_fd_entry(tsk, 12, tsk, cast[uint64](rfd)) != 0:
+            printk0("[PIPECHAN] FAIL dup copy_fd_entry\n")
+            ok = 0
+        if ok == 1 and vfs_close(12) != 0:
+            printk0("[PIPECHAN] FAIL close(dup)\n")
+            ok = 0
+        if ok == 1:
+            rbuf: Array[8, uint8]
+            rn: int64 = vfs_read(rfd, &rbuf[0], 8)
+            if rn != 4 or rbuf[0] != 112 or rbuf[1] != 52 \
+                    or rbuf[2] != 99 or rbuf[3] != 33:
+                printk1("[PIPECHAN] FAIL read rc=%d\n", cast[uint64](rn))
+                ok = 0
+        if ok == 1 and vfs_waitfds_probe(rfd) != 0:
+            printk0("[PIPECHAN] FAIL probe!=0 after drain\n")
+            ok = 0
+
+    if ok == 1:
+        # Stable fstat identity (#410): 0x43-tagged ring-slot inodes,
+        # R and W ends distinct.
+        ir: uint64 = vfs_fd_inode(rfd)
+        iw: uint64 = vfs_fd_inode(wfd)
+        if (ir >> 56) != 0x43 or (iw >> 56) != 0x43 or ir == iw:
+            printk1("[PIPECHAN] FAIL inode tag ir=%x\n", ir)
+            ok = 0
+
+    if ok == 1 and vfs_lseek(rfd, 0, 0) >= 0:
+        printk0("[PIPECHAN] FAIL lseek accepted on pipe fd\n")
+        ok = 0
+
+    if ok == 1:
+        # EOF: last writer gone ⇒ probe says ready, read returns 0.
+        vfs_close(wfd)
+        wfd = -1
+        if vfs_waitfds_probe(rfd) != 1:
+            printk0("[PIPECHAN] FAIL probe!=1 at EOF\n")
+            ok = 0
+        if ok == 1:
+            ebuf: Array[8, uint8]
+            en: int64 = vfs_read(rfd, &ebuf[0], 8)
+            if en != 0:
+                printk1("[PIPECHAN] FAIL EOF read rc=%d\n",
+                        cast[uint64](en))
+                ok = 0
+
+    if ok == 1:
+        # EPIPE: fresh pipe, reader closed first ⇒ write answers -32.
+        vfs_close(rfd)
+        rfd = -1
+        fds2: Array[2, int32]
+        if vfs_pipe(&fds2[0]) != 0:
+            printk0("[PIPECHAN] FAIL second vfs_pipe\n")
+            ok = 0
+        else:
+            vfs_close(fds2[0])
+            pbuf: Array[4, uint8]
+            pbuf[0] = 120       # 'x'
+            pn: int64 = vfs_write(fds2[1], &pbuf[0], 1)
+            if pn != -32:
+                printk1("[PIPECHAN] FAIL EPIPE rc=%d\n", cast[uint64](pn))
+                ok = 0
+            vfs_close(fds2[1])
+
+    # Teardown: close whatever is still open, restore the boot slots.
+    if rfd >= 0:
+        vfs_close(rfd)
+    if wfd >= 0:
+        vfs_close(wfd)
+    task_set_fd_idx_at(boot_slot, 10, s10i)
+    task_set_fd_buf_at(boot_slot, 10, s10b)
+    task_set_fd_idx_at(boot_slot, 11, s11i)
+    task_set_fd_buf_at(boot_slot, 11, s11b)
+    task_set_fd_idx_at(boot_slot, 12, s12i)
+    task_set_fd_buf_at(boot_slot, 12, s12b)
+
+    if ok == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[PIPECHAN] FAIL\n")
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[PIPECHAN] PASS pipe()/dup/probe/EOF/EPIPE/fstat over DEV_PIPE chans\n")
+    return 1
