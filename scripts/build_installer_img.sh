@@ -144,6 +144,16 @@ python3 -m compiler.adder compile --target=x86_64-bare-metal \
     init/main.ad -o "$INSTALLED_KERNEL"
 [ -f "$INSTALLED_KERNEL" ] || { echo "[build_installer_img] ERROR: installed kernel not built" >&2; exit 1; }
 echo "[build_installer_img]   installed kernel: $(file -b "$INSTALLED_KERNEL")"
+# #410 Item 1 — HARD CPIO-INTENT ASSERT (installed kernel). The compiled
+# ELF's ACTUAL embedded cpio must match the manifest build_initramfs.py
+# just emitted (stale/raced-blob detector) and must NOT carry the
+# installer payload. Snapshot the manifest next to the kernel because
+# Stage 6 re-runs build_initramfs.py and overwrites it.
+INSTALLED_MANIFEST="$INSTALLED_KERNEL.cpio-manifest"
+cp "$OUTDIR/initramfs_blob.S.manifest" "$INSTALLED_MANIFEST"
+python3 scripts/verify_kernel_cpio.py \
+    --elf "$INSTALLED_KERNEL" --manifest "$INSTALLED_MANIFEST" \
+    --forbid /init --forbid /rootfs.sqfs
 
 # --- Stage 4: the NVMe ESP FAT image (esp.img) ------------------------
 # A real FAT12 ESP carrying the EFI stub + the INSTALLED kernel. This is
@@ -217,6 +227,25 @@ python3 -m compiler.adder compile --target=x86_64-bare-metal \
     init/main.ad -o "$INSTALLER_KERNEL"
 [ -f "$INSTALLER_KERNEL" ] || { echo "[build_installer_img] ERROR: installer kernel not built" >&2; exit 1; }
 echo "[build_installer_img]   installer kernel: $(file -b "$INSTALLER_KERNEL")"
+# #410 Item 1 — HARD CPIO-INTENT ASSERT (installer kernel). The compiled
+# ELF MUST embed the full live payload: /init + /rootfs.sqfs, and the ELF
+# must be at least as big as the squashfs it claims to carry. Also
+# re-assert the Stage 3 INSTALLED kernel now that the payload size is
+# known: an empty-cpio kernel must be smaller than the installer kernel
+# by AT LEAST the squashfs payload (if the blob raced and the installed
+# kernel got the installer blob, its size ~= the installer's and this
+# bound trips regardless of how small the squashfs is).
+INSTALLER_MANIFEST="$INSTALLER_KERNEL.cpio-manifest"
+cp "$OUTDIR/initramfs_blob.S.manifest" "$INSTALLER_MANIFEST"
+python3 scripts/verify_kernel_cpio.py \
+    --elf "$INSTALLER_KERNEL" --manifest "$INSTALLER_MANIFEST" \
+    --require /init --require /rootfs.sqfs \
+    --min-elf-size "$SQFS_BYTES"
+INSTALLER_ELF_BYTES=$(stat -c%s "$INSTALLER_KERNEL")
+python3 scripts/verify_kernel_cpio.py \
+    --elf "$INSTALLED_KERNEL" --manifest "$INSTALLED_MANIFEST" \
+    --forbid /init --forbid /rootfs.sqfs \
+    --max-elf-size $(( INSTALLER_ELF_BYTES - SQFS_BYTES ))
 
 # --- Stage 7: the install-medium ESP (BOOTX64.EFI + installer kernel) -
 echo "[build_installer_img] Stage 7: build install-medium ESP (FAT)."

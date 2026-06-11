@@ -22,6 +22,7 @@ time without re-running this script).
 """
 
 import os
+import sys
 from pathlib import Path
 
 # Autostub generator. Runs FIRST so any new bundled .ko's mechanical
@@ -4178,5 +4179,24 @@ if __name__ == "__main__":
     else:
         dest = here / "fs" / "initramfs_blob.S"
     emit_asm(archive, dest)
+    # #410 Item 1: alongside an isolated blob, emit a manifest of the cpio
+    # entry names so scripts/verify_kernel_cpio.py can assert the compiled
+    # kernel ELF actually embeds THIS archive (stale/raced-blob detector).
+    # The names are recovered by walking the REAL archive bytes (the same
+    # newc walk the verifier uses), not by trusting FILES — so the manifest
+    # is a faithful record of what was emitted. Gated on HAMNIX_BUILD_DIR
+    # so plain dev builds don't litter fs/ with manifest churn.
+    if build_dir:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from verify_kernel_cpio import walk_newc
+        walked = walk_newc(archive, 0)
+        if walked is None:
+            print("ERROR: freshly built archive does not walk as newc cpio",
+                  file=sys.stderr)
+            sys.exit(1)
+        names, _end = walked
+        manifest = dest.parent / (dest.name + ".manifest")
+        manifest.write_text("".join(n + "\n" for n in names))
+        print(f"Wrote {manifest} ({len(names)} entries)")
     print(f"Wrote {dest} ({len(archive)} bytes archive, "
           f"{len(FILES)} files)")
