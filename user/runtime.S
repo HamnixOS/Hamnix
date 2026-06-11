@@ -117,7 +117,26 @@ _start:
     movq    $8, %rax                        /* SYS_WRITE */
     movq    $2, %rdi                        /* fd 2 = stderr -> framebuffer */
     leaq    __runtime_start_mark(%rip), %rsi
-    movq    $__runtime_start_mark_end - __runtime_start_mark, %rdx
+    /* Byte count: load from __runtime_start_mark_len, a data word that
+     * progname.o strongly overrides alongside the string itself.
+     *
+     * NOT `$__runtime_start_mark_end - __runtime_start_mark`: both
+     * symbols are weak-defined in THIS translation unit's .rodata, so
+     * GNU as folds the difference to an assembly-time constant — the
+     * length of the weak "[runtime:unknown] _start\n" fallback (25).
+     * The leaq above, by contrast, is a relocation the linker resolves
+     * to the STRONG per-binary string from progname.o, which is
+     * usually shorter (e.g. "[runtime:wc] _start\n" = 20 bytes). The
+     * mismatch made every _start write up to 5 bytes PAST its banner:
+     * linker NOP padding (66 90 ...) plus the leading '[' of the weak
+     * fallback string — observed on the serial console as
+     * "fM-^PfM-^P[" garbage glued to the next line, which also
+     * suppressed the next kernel printk's "[NNNNNN] " prefix (the
+     * stray non-newline bytes mark the console line as already
+     * started). A length LOAD goes through the same weak-symbol
+     * relocation as the leaq, so string and count always travel
+     * together. */
+    movq    __runtime_start_mark_len(%rip), %rdx
     syscall
     popq    %rsi                            /* restore argv */
     popq    %rdi                            /* restore argc */
@@ -158,6 +177,14 @@ _start:
      */
     .section .rodata
     .align 8
+    .weak __runtime_start_mark_len
+__runtime_start_mark_len:
+    /* Folding `end - start` here is CORRECT: this quad describes the
+     * weak fallback string directly below, in the same TU. When
+     * progname.o overrides the string it overrides this length word
+     * too (strong __runtime_start_mark_len), so _start's runtime load
+     * always pairs the resolved string with its true byte count. */
+    .quad __runtime_start_mark_end - __runtime_start_mark
     .weak __runtime_start_mark
     .weak __runtime_start_mark_end
 __runtime_start_mark:
