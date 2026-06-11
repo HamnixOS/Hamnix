@@ -835,15 +835,29 @@ def assemble_and_link_x86_user(asm_file: Path, output: Path,
         hamnix_s.write_text(".code64\n" + asm_file.read_text())
 
         # TEMP_DEBUG_HAMSH_BRINGUP: per-binary marker override. Strong
-        # definitions of __runtime_start_mark / _end clobber the .weak
-        # fallback in user/runtime.S. .ascii (no trailing NUL) plus the
-        # bracketing labels means `_end - _start` is exactly the byte
-        # count we want passed as sys_write's count arg.
+        # definitions of __runtime_start_mark / _len / _end clobber the
+        # .weak fallbacks in user/runtime.S.
+        #
+        # __runtime_start_mark_len carries the byte count as DATA. The
+        # runtime's _start must not compute `$_end - _start` as an
+        # immediate: both weak symbols live in runtime.S's own .rodata,
+        # so GNU as folds that difference at assembly time to the weak
+        # fallback's length (25) even though the linker later resolves
+        # the string POINTER to this strong (shorter) one. The stale
+        # count made every _start write past its banner — linker NOP
+        # padding (66 90 ...) plus the '[' of the weak string leaked to
+        # the serial console as "fM-^PfM-^P[" garbage on the next line.
+        # A strong length word, folded HERE against this TU's own
+        # labels, is correct by construction and travels with the
+        # string through the same weak-override relocation.
         progname_s = tmpdir / "progname.S"
         progname_s.write_text(
             ".code64\n"
             "    .section .rodata\n"
             "    .align 8\n"
+            "    .globl __runtime_start_mark_len\n"
+            "__runtime_start_mark_len:\n"
+            "    .quad __runtime_start_mark_end - __runtime_start_mark\n"
             "    .globl __runtime_start_mark\n"
             "    .globl __runtime_start_mark_end\n"
             "__runtime_start_mark:\n"
