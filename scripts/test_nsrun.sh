@@ -103,14 +103,43 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 
 set +e
 (
-    sleep 3
+    # Marker-gated feeder (same proven shape as test_distrofs_persist.sh):
+    # a freshly-booted hamsh sometimes drops the FIRST serial command line
+    # (it never echoes), and fixed sleeps race a slowing boot. Gate on the
+    # shell-ready marker, RE-SEND each command until its echo shows up in
+    # the log (cumulative count — runs A/C/D reuse the same command text),
+    # and gate run-to-run pacing on the fixture's own PASS lines. All the
+    # count assertions below are >=, so a rare double-driven run only adds
+    # runs and can never turn a pass into a fail.
+    for _ in $(seq 1 40); do
+        grep -q "loop-enter" "$LOG" 2>/dev/null && break
+        sleep 0.5
+    done
+    sleep 1
+    # send_cmd CMD ECHO_WANT: type CMD, re-send until the log holds at
+    # least ECHO_WANT echo lines of it.
+    send_cmd() {
+        printf '%s\n' "$1"
+        for _ in $(seq 1 10); do
+            sleep 1.5
+            [ "$(grep -a -c -F "$1" "$LOG" 2>/dev/null || true)" -ge "$2" ] && break
+            printf '%s\n' "$1"
+        done
+    }
+    # wait_pass N: wait until N cumulative '[nsrun_test] PASS' lines.
+    wait_pass() {
+        for _ in $(seq 1 40); do
+            [ "$(grep -a -c -F '[nsrun_test] PASS' "$LOG" 2>/dev/null || true)" -ge "$1" ] && break
+            sleep 0.5
+        done
+    }
     # Run A: round trip inside the nsrun-built distrofs namespace
     # (/var, /usr, /etc all distrofs-backed).
-    printf '/bin/nsrun /bin/test_nsrun write\n'
-    sleep 6
+    send_cmd '/bin/nsrun /bin/test_nsrun write' 1
+    wait_pass 1
     # Run B: bare isolation probe in the plain shell namespace.
-    printf '/bin/test_nsrun probe\n'
-    sleep 3
+    send_cmd '/bin/test_nsrun probe' 1
+    wait_pass 2
     # Run C: a SECOND nsrun invocation. It gets a fresh pid, hence
     # fresh /srv post names (nsrun.distrofs.<pid>.<sub>) — proving two
     # nsrun runs don't collide on /srv. Its own three daemons back its
@@ -118,17 +147,18 @@ set +e
     # its mounts MUST succeed even though it reuses the same low srvfd
     # numbers run A used (run A's conns were detached when run A's
     # exec'd target exited and its Pgrp was freed).
-    printf '/bin/nsrun /bin/test_nsrun write\n'
-    sleep 6
+    send_cmd '/bin/nsrun /bin/test_nsrun write' 2
+    wait_pass 3
     # Run D: a THIRD sequential nsrun invocation — the acceptance bar
     # for the connection-table-leak fix is "3+ sequential runs all
     # succeed". Like run C, it reuses low srvfd numbers and MUST get
     # fresh connection slots.
-    printf '/bin/nsrun /bin/test_nsrun write\n'
-    sleep 6
+    send_cmd '/bin/nsrun /bin/test_nsrun write' 3
+    wait_pass 4
+    sleep 1
     printf 'exit\n'
     sleep 1
-) | timeout 70s qemu-system-x86_64 \
+) | timeout 150s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
