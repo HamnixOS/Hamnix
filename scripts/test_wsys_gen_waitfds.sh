@@ -48,14 +48,31 @@ echo "[test_wgw] (5/5) Boot QEMU + run the fixture via hamsh"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
+# Gate keystrokes on a boot-ready marker rather than fixed sleeps; the FIRST
+# serial line a freshly-booted hamsh sees is sometimes dropped, so re-send
+# the fixture command until its own banner appears.
 set +e
 (
-    sleep 8
-    printf '/bin/test_wsys_gen_waitfds\n'
-    sleep 8
+    for _i in $(seq 1 60); do
+        if grep -aqE 'hamsh\$|shell ready' "$LOG" 2>/dev/null; then break; fi
+        sleep 0.5
+    done
+    for _r in 1 2 3; do
+        printf '/bin/test_wsys_gen_waitfds\n'
+        for _j in $(seq 1 20); do
+            if grep -aqF '[test_wgw] start' "$LOG" 2>/dev/null; then break; fi
+            sleep 0.5
+        done
+        if grep -aqF '[test_wgw] start' "$LOG" 2>/dev/null; then break; fi
+    done
+    # Let the fixture finish (it prints PASS/FAIL), then leave.
+    for _j in $(seq 1 30); do
+        if grep -aqE '\[test_wgw\] (PASS|FAIL)' "$LOG" 2>/dev/null; then break; fi
+        sleep 0.5
+    done
     printf 'exit\n'
     sleep 2
-) | timeout 90s qemu-system-x86_64 \
+) | timeout 120s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
