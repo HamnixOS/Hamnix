@@ -170,6 +170,31 @@ replaces the ~70 `is_*_path` backend-selection branches).
    (the honest remaining gap). NEXT: unify the other "Terminal" launchers
    (Applications-menu, panel) onto `daemon_spawn_terminal`; persistent
    PTY/job-control/ANSI; then the session→WM→panel component split.
+
+   **Increment 3 LANDED (2026-06-10, pushed `a05d0eeb`).** (a) Menu/desktop
+   "Terminal" launchers now route to the separate-process `daemon_spawn_terminal`
+   (autoflag-49 GOP gate `scripts/test_hamUI_menuterm_gop.sh`). (b) DEPERF #410
+   cached-layer blit compositor (`6d769feb`): the per-pixel procedural scene walk
+   is cached in SCENE_CACHE, presents are pure memory blits, cursor moves blit a
+   12×12 cell — the fix for the 35s terminal-open + frozen mouse. (c) `hamterm`
+   is now a PERSISTENT interactive hamsh over pipes (cwd/env persist). (d) New
+   separate-process apps: `hammon` (system monitor) + `hamview` (PPM/BMP image
+   viewer). (e) Markup-rasterise fix: a freshly-spawned client's body is now read
+   on the present that first detects its "ui" layer (was waiting up to 8 frames /
+   never, for direct-present self-tests — the autoflag-49 FAIL).
+
+   **MATE GAP ANALYSIS (2026-06-10).** DE is far more complete than a naive read
+   suggests (marco-class WM, mate-panel menubar/pager/window-list, clipman,
+   control-center, notification history all exist). Real gaps, prioritized:
+   most-disjoint NEW apps / toolkit-only → screenshot tool (`hamshot`, needs a
+   small fb-grab hook), image viewer (DONE: hamview), file-chooser + modal-alert
+   dialog widgets (`lib/hamui.ad`), tooltip support (`lib/hamui.ad`), calendar
+   popup/widget. hamUId.ad-touching → real volume/battery/network applets (model
+   values today; needs real backends), Display/Mouse/keyboard-layout settings
+   panels, external notification + system-tray client-registration API, image
+   wallpaper, screensaver+password-lock, real session save/restore, inter-app
+   drag-and-drop. PDF viewer (atril) deferred (needs font/PDF stack). Serialize
+   the hamUId.ad-touching items (single 25k-line file) to avoid merge collisions.
 4. [ ] **Basic apps on the toolkit** (after #2 API is stable) — terminal,
    text editor, file browser, plus games Snake + 2048. These validate the
    toolkit is genuinely app-grade, and seed the DE app suite.
