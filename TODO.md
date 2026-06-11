@@ -59,14 +59,18 @@ replaces the ~70 `is_*_path` backend-selection branches).
   - [x] Phase 4a — stateless native cdevs DONE (`091fde11`): the 13
     stateless synthetic cdevs open as `FD_CHAN_MARK` fds; behavior lives
     in namec's `_devtab_read`/`_devtab_write`.
-  - [ ] **Phase 4b — stateful native fds.** `FD_EXT4`/`TMPFS`/`FAT`/
-    `BUFFER`/`DIR`/`PIPE_R`/`PIPE_W`/`SOCKET`/`BLK`/`STAT`/`MOUNTS`/
-    `DISKSTATS`/`AUTH`/`VTCTL`/`DEVFD`/`PROC_BASE` carry per-fd offset/
-    inode/buffer state; needs a pool-`ChanT` lifecycle (extend the handle
-    + slot alloc/free) before they can move off marks. Layer-2 linux_abi
-    event fds (epoll/eventfd/timerfd/signalfd/inotify/iouring/perf/bpf/
-    pidfd) stay marks by design (boundary-discipline law — not namespace
-    files).
+  - [x] Phase 4b — stateful native fds DONE (`40b16398`+`043a8962`,
+    merge `5b3cea28`): pool-`ChanT` lifecycle in namec (512-slot pool,
+    refcount, single release path); `FD_PROC`/`FD_AUTH`/`FD_BLK`/
+    `FD_LOOP` folded onto pool chans; new gates `test_authdev.sh` +
+    `test_loopctl.sh`.
+  - [ ] **Phase 4c — remaining stateful marks.** `FD_DEVFD` (26 sites/
+    5 files — MUST add a `DEV_DEVFD` arm to `namec_poll_readable` or
+    `/fd/N` polls regress always-ready), `FD_PIPE_R`/`FD_PIPE_W`
+    (48 sites/8 files), `FD_SOCKET`+`SOCKETPAIR` (89 sites/15 files).
+    Layer-2 linux_abi event fds (epoll/eventfd/timerfd/signalfd/
+    inotify/iouring/perf/bpf/pidfd) stay marks by design
+    (boundary-discipline law — not namespace files).
 
 ## Now — useful-system gap fill
 
