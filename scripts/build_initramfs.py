@@ -1604,6 +1604,18 @@ if os.environ.get("ENABLE_DEVFDCHAN_TEST"):
 if os.environ.get("ENABLE_PIPECHAN_TEST"):
     FILES.append(("/etc/pipechan-test", b"1\n"))
 
+# Phase 4c DEV_SOCKET/DEV_SOCKETPAIR pool-chan self-test.
+# scripts/test_sock_chan.sh sets ENABLE_SOCKCHAN_TEST=1 to plant
+# /etc/sockchan-test. init/main.ad detects the marker and calls
+# sockchan_selftest() (fs/socketpair.ad): vfs_socketpair() over the
+# pool-Chan representation, probe 2 -> 1 -> 2 across a payload round-trip,
+# both directions, dup+close chan-refcount tripwire, EOF + EPIPE after peer
+# close, 0x43-prefixed per-end inode identity, lseek rejected, plus the
+# DEV_SOCKET record-encoding round trip; emits the [SOCKCHAN] PASS banner.
+# Needs no extra device.
+if os.environ.get("ENABLE_SOCKCHAN_TEST"):
+    FILES.append(("/etc/sockchan-test", b"1\n"))
+
 # /proc/<pid>/ctl write-surface self-test. scripts/test_procctl.sh sets
 # ENABLE_PROCCTL_TEST=1 to plant /etc/procctl-test. init/main.ad detects the
 # marker and calls procctl_selftest() (devproc.ad): it drives the real

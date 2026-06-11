@@ -10,54 +10,59 @@
 #   ring_a    end A writes -> end B reads
 #   ring_b    end B writes -> end A reads
 #
-# fd_buf for a socketpair fd encodes (slot << 1) | direction. direction
-# = 0 is end A, direction = 1 is end B. The same slot index addresses
-# the pair regardless of which end the caller is using; the direction
-# bit picks which ring to read / write.
+# Phase 4c (socket fold): a socketpair endpoint is an FD_CHAN_MARK fd
+# backed by a DEV_SOCKETPAIR pool chan (sys/src/9/port/namec.ad) whose
+# back_slot carries the packed (slot << 1) | direction. direction = 0
+# is end A, direction = 1 is end B. The same slot index addresses the
+# pair regardless of which end the caller is using; the direction bit
+# picks which ring to read / write.
 #
 # Reference counting (per-endpoint):
 #   refs_a / refs_b each start at 1 (sys_socketpair returns one fd of
-#   each end). vfs_dup / vfs_dup2 / sys_spawn-style cross-task copies
-#   on a socketpair fd bump the matching end's count (vfs.ad does this
-#   manually since kernel/sched/core.ad is off-limits this milestone).
-#   vfs_close decrements the matching end. The slot is freed when
-#   refs_a + refs_b both hit 0.
+#   each end). Phase 4c (socket fold): each end-reference is owned
+#   ONE-PER-CHAN — fork/dup/spawn copies bump the DEV_SOCKETPAIR chan's
+#   refcount (kernel/sched/core.ad's copy_fd_entry CHAN arm), and the
+#   LAST namec_close on a chan runs sockpair_close for the end it owns.
+#   The slot is freed when refs_a + refs_b both hit 0. This retired the
+#   legacy hand-rolled inc/dec in vfs_dup/vfs_dup2/vfs_close and FIXED
+#   the documented leaks: task-exit cleanup (close_fd_in_task →
+#   namec_close) now releases the end, and spawn fd-copies now count.
 #
 #   "Peer is gone" (EOF on read, EPIPE on write) is `refs of the OTHER
 #   end == 0` — not the total. That way an endpoint duped within the
 #   same task / cross-task doesn't make a co-owner falsely look like
 #   the peer.
 #
-#   IMPORTANT: kernel/sched/core.ad is off-limits this milestone, so
-#   close_fd_in_task / copy_fd_entry don't know about
-#   FD_SOCKETPAIR_MARK. The intercepts live entirely in fs/vfs.ad
-#   (vfs_close / vfs_dup / vfs_dup2). Task-exit auto-cleanup runs
-#   through close_fd_in_task which DOES NOT decrement refs — a
-#   socketpair slot can leak if a task dies with its fds still open,
-#   AND sys_spawn's dup_fd_to_child copy_fd_entry path does NOT bump
-#   refs either. Practical consequence: socketpair fds inherited
-#   across spawn behave as "child gets a free reference; child exit
-#   is invisible to the parent's refcount". For the rio prerequisite
-#   (single-task fixtures + one-spawn 9P loop where the child closes
-#   its end implicitly via exit) that's a tractable contract. Lifting
-#   it cleanly requires editing core.ad's close_fd_in_task +
-#   copy_fd_entry once the parallel fence opens.
-#
 # Mirrors fs/pipe.ad's structural shape so the code reads side-by-side.
 
 from mm.slab import kmalloc, kfree
-from kernel.printk.printk import printk0, printk1
+from kernel.printk.printk import printk0, printk1, printk_set_level
+# Phase 4c (socket fold): the blocking read/write yield loops moved
+# HERE (verbatim) from fs/vfs.ad's retired FD_SOCKETPAIR_MARK arms —
+# namec_read/namec_write dispatch DEV_SOCKETPAIR chans into them.
+# core.ad does not import fs.socketpair, so this stays one-way.
+from kernel.sched.core import (
+    yield_to_others,
+    # Phase 4c gate plumbing (sockchan_selftest below): the boot task's
+    # fd table is uninitialised at boot — free a few high slots via the
+    # setters, restore after. copy_fd_entry is the REAL fork/dup hook
+    # (bumps the shared chan refcount), so the selftest can prove a
+    # dup'd socketpair fd doesn't yank the end out from under its
+    # sibling.
+    TaskStruct, current_task, current_idx_get, copy_fd_entry,
+    FD_CLOSED_MARK,
+    task_fd_idx_at, task_fd_buf_at,
+    task_set_fd_idx_at, task_set_fd_buf_at,
+)
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
-# FD_SOCKETPAIR_MARK: per-fd marker for sys_socketpair endpoints. Lives
-# here (alongside the rest of the SocketPair surface) to avoid editing
-# kernel/sched/core.ad — same pattern devstat.ad / devmounts.ad /
-# devdiskstats.ad / 9p_client.ad use for their marks. Picked one slot
-# below FD_P9_MARK (0xFFFFFFE3) to stay clear of the FD_*_MARK family
-# already defined in core.ad.
-FD_SOCKETPAIR_MARK: uint32 = 0xFFFFFFE2
+# Phase 4c (socket fold): the FD_SOCKETPAIR_MARK (0xFFFFFFE2) per-fd
+# marker is RETIRED — a socketpair endpoint is an FD_CHAN_MARK fd
+# backed by a DEV_SOCKETPAIR pool chan (back_slot = the packed value
+# below). The 0xFFFFFFE2 mark value is free for reuse.
 
 
 SOCKPAIR_MAX: uint64 = 32
@@ -329,3 +334,296 @@ def sockpair_write(slot: int32, direction: int32,
     sockpair_table[su].tail_b  = (tail + take) % cap
     sockpair_table[su].count_b = cnt + take
     return cast[int64](take)
+
+
+# --- blocking wrappers (Phase 4c socket fold) -----------------------
+#
+# Verbatim ports of the retired fs/vfs.ad FD_SOCKETPAIR_MARK read /
+# write arms. namec_read / namec_write dispatch a DEV_SOCKETPAIR chan
+# here. Same yield-loop blocking shape the legacy arms used — the
+# sockpair rings predate the WaitQueue mesh; wiring them event-driven
+# is a separate (non-representation) lift.
+
+def sockpair_read_blocking(slot: int32, direction: int32,
+                           dst: Ptr[uint8], count: uint64) -> int64:
+    # Bidirectional read: end A drains ring_b, end B drains ring_a.
+    # Block-yield until bytes arrive OR the peer end is gone (no
+    # future writes possible — surface EOF as 0).
+    while True:
+        n: int64 = sockpair_read(slot, direction, dst, count)
+        if n > 0:
+            return n
+        if sockpair_peer_alive(slot, direction) == 0:
+            return 0                       # peer closed -> EOF
+        yield_to_others()
+
+
+def sockpair_write_blocking(slot: int32, direction: int32,
+                            src: Ptr[uint8], count: uint64) -> int64:
+    # Bidirectional write: end A fills ring_a, end B fills ring_b.
+    # Yield while the destination ring is full until the peer drains.
+    # Peer-gone surfaces as EPIPE (-32) — unless a partial count
+    # already drained, which is returned instead (the legacy
+    # contract).
+    total: uint64 = 0
+    while total < count:
+        if sockpair_peer_alive(slot, direction) == 0:
+            if total > 0:
+                return cast[int64](total)
+            return -32                     # -EPIPE
+        chunk: int64 = sockpair_write(slot, direction,
+            cast[Ptr[uint8]](cast[uint64](src) + total),
+            count - total)
+        if chunk > 0:
+            total = total + cast[uint64](chunk)
+        else:
+            yield_to_others()
+    return cast[int64](total)
+
+
+# --- sockchan_selftest -----------------------------------------------
+#
+# Phase 4c gate: proves the FD_SOCKET_MARK / FD_SOCKETPAIR_MARK →
+# DEV_SOCKET / DEV_SOCKETPAIR pool-chan fold end to end WITHOUT serial
+# input (the legacy socket gates drive hamsh over serial stdin, which
+# this host loses; scripts/test_sock_chan.sh boots with stdin
+# </dev/null and greps the [SOCKCHAN] marker):
+#
+#   * vfs_socketpair lands TWO FD_CHAN_MARK fds whose chan ids resolve
+#     via namec_chan_sockpair_packed to the SAME pair slot with
+#     OPPOSITE direction bits (representation check).
+#   * vfs_waitfds_probe walks 2 → 1 → 2 across a payload round-trip —
+#     the namec_poll_readable DEV_SOCKETPAIR arm (class 2 = honest
+#     not-ready jiffy re-probe; the fold must NOT regress sockpair
+#     polls to always-ready, the legacy FD_CHAN fallthrough bug).
+#   * payload round-trips BOTH directions through namec_write /
+#     namec_read → sockpair_write_blocking / sockpair_read_blocking.
+#   * a dup'd end (copy_fd_entry — the REAL fork/dup hook, which bumps
+#     the CHAN refcount) is closed FIRST and the original still works —
+#     the legacy model hand-rolled sockpair_inc_ref in vfs_dup; the
+#     chan model holds one end-ref per CHAN, released on last holder.
+#   * fstat identity: both ends report the 0x43-tagged inode
+#     (dev_type << 32 | packed end), A and B DISTINCT (#410 contract).
+#   * vfs_lseek is rejected (a socket has no cursor).
+#   * close end A → end B reads EOF (0) and writes -EPIPE (-32).
+#   * DEV_SOCKET: vfs_alloc_socket_fd lands an FD_CHAN_MARK fd;
+#     vfs_fd_is_socket / vfs_fd_is_socketpair discriminate; the record
+#     encoding round-trips through vfs_socket_fd_set_record /
+#     vfs_socket_fd_get_record (the chan's back_slot); a record-less
+#     socket reads EOF and writes -EPIPE through the namec DEV_SOCKET
+#     arms (the legacy U35 stub contract).
+#
+# vfs_* / namec_chan_sockpair_packed are resolved BY NAME (the
+# whole-kernel Adder merge) — vfs.ad and namec.ad both import
+# fs/socketpair.ad, so a literal import here would cycle. Returns 1
+# PASS, 0 FAIL. PUBLIC so init/main.ad can call it.
+
+def sockchan_selftest() -> int32:
+    # The boot task's fd table is uninitialised (all-zero ≠
+    # FD_CLOSED_MARK ⇒ _alloc_fd sees every slot in use): free slots
+    # 10/11/12 deterministically, restore them on the way out.
+    boot_slot: int32 = cast[int32](current_idx_get())
+    s10i: uint32 = task_fd_idx_at(boot_slot, 10)
+    s10b: uint64 = task_fd_buf_at(boot_slot, 10)
+    s11i: uint32 = task_fd_idx_at(boot_slot, 11)
+    s11b: uint64 = task_fd_buf_at(boot_slot, 11)
+    s12i: uint32 = task_fd_idx_at(boot_slot, 12)
+    s12b: uint64 = task_fd_buf_at(boot_slot, 12)
+    task_set_fd_idx_at(boot_slot, 10, FD_CLOSED_MARK)
+    task_set_fd_buf_at(boot_slot, 10, 0)
+    task_set_fd_idx_at(boot_slot, 11, FD_CLOSED_MARK)
+    task_set_fd_buf_at(boot_slot, 11, 0)
+    task_set_fd_idx_at(boot_slot, 12, FD_CLOSED_MARK)
+    task_set_fd_buf_at(boot_slot, 12, 0)
+
+    ok: int32 = 1
+    fds: Array[2, int32]
+    fds[0] = -1
+    fds[1] = -1
+    if vfs_socketpair(&fds[0]) != 0:
+        printk0("[SOCKCHAN] FAIL vfs_socketpair\n")
+        ok = 0
+    afd: int32 = fds[0]
+    bfd: int32 = fds[1]
+
+    if ok == 1:
+        # Representation: both fds carry chan ids whose packed words
+        # name the SAME pair slot with OPPOSITE direction bits (and
+        # resolve at all — non-sockpair chans answer -1).
+        acid: int32 = cast[int32](cast[uint32](
+            task_fd_buf_at(boot_slot, cast[uint64](afd))))
+        bcid: int32 = cast[int32](cast[uint32](
+            task_fd_buf_at(boot_slot, cast[uint64](bfd))))
+        apk: int64 = namec_chan_sockpair_packed(acid)
+        bpk: int64 = namec_chan_sockpair_packed(bcid)
+        if apk < 0 or bpk < 0:
+            printk0("[SOCKCHAN] FAIL packed resolve\n")
+            ok = 0
+        elif sockpair_unpack_slot(cast[uint64](apk)) \
+                != sockpair_unpack_slot(cast[uint64](bpk)) \
+                or sockpair_unpack_dir(cast[uint64](apk)) \
+                == sockpair_unpack_dir(cast[uint64](bpk)):
+            printk0("[SOCKCHAN] FAIL slot/dir pairing\n")
+            ok = 0
+        if ok == 1 and vfs_fd_is_socketpair(afd) != 1:
+            printk0("[SOCKCHAN] FAIL is_socketpair(afd)!=1\n")
+            ok = 0
+
+    if ok == 1 and vfs_waitfds_probe(bfd) != 2:
+        # Empty pair + live peer ⇒ class 2 (honest not-ready,
+        # jiffy re-probe — the rings predate the WaitQueue mesh).
+        # The legacy FD_CHAN fallthrough said "always ready" — tripwire.
+        printk0("[SOCKCHAN] FAIL probe!=2 on empty pair\n")
+        ok = 0
+
+    if ok == 1:
+        payload: Array[8, uint8]
+        payload[0] = 115        # 's'
+        payload[1] = 112        # 'p'
+        payload[2] = 52         # '4'
+        payload[3] = 99         # 'c'
+        wn: int64 = vfs_write(afd, &payload[0], 4)
+        if wn != 4:
+            printk1("[SOCKCHAN] FAIL A-write rc=%d\n", cast[uint64](wn))
+            ok = 0
+        if ok == 1 and vfs_waitfds_probe(bfd) != 1:
+            printk0("[SOCKCHAN] FAIL probe!=1 with bytes queued\n")
+            ok = 0
+
+    if ok == 1:
+        # Dup end B (the real fork/dup hook: bumps the chan refcount),
+        # close the dup — the original MUST still drain the payload.
+        # Under the legacy model vfs_dup hand-rolled sockpair_inc_ref;
+        # under chans this proves namec_chan_incref/namec_close pair.
+        tsk: Ptr[TaskStruct] = current_task()
+        if copy_fd_entry(tsk, 12, tsk, cast[uint64](bfd)) != 0:
+            printk0("[SOCKCHAN] FAIL dup copy_fd_entry\n")
+            ok = 0
+        if ok == 1 and vfs_close(12) != 0:
+            printk0("[SOCKCHAN] FAIL close(dup)\n")
+            ok = 0
+        if ok == 1:
+            rbuf: Array[8, uint8]
+            rn: int64 = vfs_read(bfd, &rbuf[0], 8)
+            if rn != 4 or rbuf[0] != 115 or rbuf[1] != 112 \
+                    or rbuf[2] != 52 or rbuf[3] != 99:
+                printk1("[SOCKCHAN] FAIL B-read rc=%d\n", cast[uint64](rn))
+                ok = 0
+        if ok == 1 and vfs_waitfds_probe(bfd) != 2:
+            printk0("[SOCKCHAN] FAIL probe!=2 after drain\n")
+            ok = 0
+
+    if ok == 1:
+        # Reverse direction: B → A through the same chan arms.
+        rev: Array[4, uint8]
+        rev[0] = 107            # 'k'
+        rwn: int64 = vfs_write(bfd, &rev[0], 1)
+        rrn: int64 = -1
+        rrbuf: Array[4, uint8]
+        if rwn == 1:
+            rrn = vfs_read(afd, &rrbuf[0], 4)
+        if rwn != 1 or rrn != 1 or rrbuf[0] != 107:
+            printk1("[SOCKCHAN] FAIL reverse rc=%d\n", cast[uint64](rrn))
+            ok = 0
+
+    if ok == 1:
+        # Stable fstat identity (#410): 0x43-tagged packed-end inodes,
+        # A and B ends distinct.
+        ia: uint64 = vfs_fd_inode(afd)
+        ib: uint64 = vfs_fd_inode(bfd)
+        if (ia >> 56) != 0x43 or (ib >> 56) != 0x43 or ia == ib:
+            printk1("[SOCKCHAN] FAIL inode tag ia=%x\n", ia)
+            ok = 0
+
+    if ok == 1 and vfs_lseek(afd, 0, 0) >= 0:
+        printk0("[SOCKCHAN] FAIL lseek accepted on sockpair fd\n")
+        ok = 0
+
+    if ok == 1:
+        # Peer-gone: close end A ⇒ end B reads EOF, writes -EPIPE.
+        vfs_close(afd)
+        afd = -1
+        if vfs_waitfds_probe(bfd) != 1:
+            printk0("[SOCKCHAN] FAIL probe!=1 with peer gone\n")
+            ok = 0
+        if ok == 1:
+            ebuf: Array[4, uint8]
+            en: int64 = vfs_read(bfd, &ebuf[0], 4)
+            if en != 0:
+                printk1("[SOCKCHAN] FAIL EOF read rc=%d\n",
+                        cast[uint64](en))
+                ok = 0
+        if ok == 1:
+            pbuf: Array[4, uint8]
+            pbuf[0] = 120       # 'x'
+            pn: int64 = vfs_write(bfd, &pbuf[0], 1)
+            if pn != -32:
+                printk1("[SOCKCHAN] FAIL EPIPE rc=%d\n", cast[uint64](pn))
+                ok = 0
+
+    if ok == 1:
+        # DEV_SOCKET: a socket(2) fd is an FD_CHAN_MARK fd whose chan
+        # back_slot carries the legacy fdbuf record encoding.
+        vfs_close(bfd)
+        bfd = -1
+        skfd: int32 = vfs_alloc_socket_fd()
+        if skfd < 0:
+            printk0("[SOCKCHAN] FAIL vfs_alloc_socket_fd\n")
+            ok = 0
+        else:
+            if vfs_fd_is_socket(skfd) != 1 \
+                    or vfs_fd_is_socketpair(skfd) != 0:
+                printk0("[SOCKCHAN] FAIL socket discrimination\n")
+                ok = 0
+            if ok == 1 and vfs_socket_fd_get_record(skfd) != 0:
+                printk0("[SOCKCHAN] FAIL fresh record != 0\n")
+                ok = 0
+            if ok == 1:
+                if vfs_socket_fd_set_record(skfd, 7) != 0 \
+                        or vfs_socket_fd_get_record(skfd) != 7:
+                    printk0("[SOCKCHAN] FAIL record round-trip\n")
+                    ok = 0
+                vfs_socket_fd_set_record(skfd, 0)
+            if ok == 1:
+                # Record-less socket: read = EOF, write = -EPIPE (the
+                # legacy U35 stub contract, now via the DEV_SOCKET
+                # namec arms).
+                kbuf: Array[4, uint8]
+                kn: int64 = vfs_read(skfd, &kbuf[0], 4)
+                if kn != 0:
+                    printk1("[SOCKCHAN] FAIL socket EOF rc=%d\n",
+                            cast[uint64](kn))
+                    ok = 0
+                kbuf[0] = 121   # 'y'
+                kw: int64 = vfs_write(skfd, &kbuf[0], 1)
+                if kw != -32:
+                    printk1("[SOCKCHAN] FAIL socket EPIPE rc=%d\n",
+                            cast[uint64](kw))
+                    ok = 0
+            if ok == 1 and vfs_lseek(skfd, 0, 0) >= 0:
+                printk0("[SOCKCHAN] FAIL lseek accepted on socket fd\n")
+                ok = 0
+            if ok == 1 and (vfs_fd_inode(skfd) >> 56) != 0x43:
+                printk0("[SOCKCHAN] FAIL socket inode tag\n")
+                ok = 0
+            vfs_close(skfd)
+
+    # Teardown: close whatever is still open, restore the boot slots.
+    if afd >= 0:
+        vfs_close(afd)
+    if bfd >= 0:
+        vfs_close(bfd)
+    task_set_fd_idx_at(boot_slot, 10, s10i)
+    task_set_fd_buf_at(boot_slot, 10, s10b)
+    task_set_fd_idx_at(boot_slot, 11, s11i)
+    task_set_fd_buf_at(boot_slot, 11, s11b)
+    task_set_fd_idx_at(boot_slot, 12, s12i)
+    task_set_fd_buf_at(boot_slot, 12, s12b)
+
+    if ok == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[SOCKCHAN] FAIL\n")
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[SOCKCHAN] PASS socketpair/dup/probe/EOF/EPIPE/fstat + socket record over DEV_SOCKET chans\n")
+    return 1
