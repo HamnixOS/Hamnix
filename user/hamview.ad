@@ -1,0 +1,590 @@
+# user/hamview.ad
+#
+# hamview — an IMAGE VIEWER built on the hamui widget toolkit
+# (lib/hamui.ad). It is the MATE "Eye of MATE" / image-viewer equivalent:
+# a separate-process hamui client that opens an image file (argv[1], or a
+# built-in sample), decodes it, and displays it scaled+centred in a window
+# with the filename and dimensions in the title and status bar.
+#
+# WHY A SEPARATE PROCESS: like hamclock / hamterm, hamview is an ordinary
+# userland app that CONSUMES the compositor's on-disk wsys draw protocol.
+# It never touches user/hamUId.ad (the compositor) or lib/hamui.ad (the
+# toolkit) — it speaks the existing protocol the toolkit and compositor
+# already agree on.
+#
+# IMAGE FORMATS (decoded from scratch — no zlib/PNG):
+#   * PPM / PNM "P6" (binary RGB, the trivial NetPBM format): an ASCII
+#     header "P6 <w> <h> <maxval>\n" followed by w*h*3 raw RGB bytes.
+#   * BMP, uncompressed (BITMAPFILEHEADER + BITMAPINFOHEADER), 24bpp or
+#     32bpp, BI_RGB only. Rows are 4-byte aligned and stored BOTTOM-UP
+#     (positive biHeight) — we flip them. BGR(A) byte order -> RGBA.
+# These two are uncompressed and parse correctly with fixed arrays; we do
+# NOT attempt compressed formats (PNG/JPEG) which need an inflate/IDCT.
+#
+# HOW PIXELS REACH THE SCREEN (mirrors the compositor's own fb path):
+# The wsys draw protocol exposes per-window LAYERS. An "fb" layer holds a
+# raw RGBA8888 pixel buffer (capped at 256x256 by the compositor's
+# raster_image_fb / read_layer_fb, WSYS_DRAW_FB_CAP = 262144). A markup
+# layer can BLIT an fb layer with `<image src="fb:<name>" x y w h/>`. So:
+#   1. ctl: mklayer pix fb <fbw> <fbh>     (decoded image, scaled <=256)
+#   2. write RGBA bytes to /dev/wsys/<wid>/draw/pix/fb
+#   3. ctl: mklayer img markup ; setz img 6 (below the toolkit "ui" z=10
+#      so the title/status chrome stays on top)
+#   4. write "<image src="fb:pix" x y w h/>" to .../draw/img/markup,
+#      with x/y/w/h centring the image in the 640x480 content area.
+# The toolkit owns ONLY its own "ui" layer; our "pix"/"img" layers are
+# independent, so we drive them directly with sys_open_write/sys_write
+# without editing the toolkit.
+#
+# COMPILER QUIRKS HONOURED (memory/feedback_compiler_quirks):
+#   * big buffers at MODULE scope (no large locals, no malloc);
+#   * string literals returned/passed at the call site, never stored in a
+#     NUL-initialised global; NO adjacent string-literal concatenation;
+#   * cast[T](x), +=, &arr[0] used throughout.
+
+from lib.hamui import (
+    hamui_init, hamui_fixed, hamui_label, hamui_statusbar,
+    hamui_status_set, hamui_add, hamui_fixed_place, hamui_set_size,
+    hamui_set_text, hamui_window_on, hamui_focus, hamui_step,
+    hamui_render
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield() -> int32
+
+# ====================================================================
+# Caps (no malloc — every buffer is a fixed module global).
+# ====================================================================
+# Window content is 640x480. fb layers cap at 256x256 RGBA8888 in the
+# compositor, so we scale the source down to fit FB_MAX on its long edge.
+FB_MAX:      uint64 = 256
+WIN_W:       int64  = 640
+WIN_H:       int64  = 480
+
+# Raw file bytes. Cap the on-disk image at 1 MiB — enough for a 256x256
+# 32bpp BMP plus headers, or a generous PPM.
+RAW_CAP:     uint64 = 1048576
+_hv_raw_buf:     Array[1048576, uint8]
+_hv_raw_len:     uint64 = 0
+
+# Decoded source pixels, RGBA8888, before scaling. Cap at 512x512 source;
+# larger images are rejected (we still show their declared dimensions).
+SRC_MAX:     uint64 = 512
+_hv_src_buf:     Array[1048576, uint8]      # 512*512*4
+_hv_src_w:       uint64 = 0
+_hv_src_h:       uint64 = 0
+
+# Scaled output buffer pushed to the "pix" fb layer (<=256x256 RGBA8888).
+_hv_fb_buf:      Array[262144, uint8]       # 256*256*4
+_hv_fb_w:        uint64 = 0
+_hv_fb_h:        uint64 = 0
+
+# Scratch / path / markup buffers.
+_hv_path_buf:    Array[128, uint8]
+_hv_ctl_buf:     Array[64, uint8]
+_hv_markup_buf:  Array[256, uint8]
+_hv_status_buf:  Array[128, uint8]
+
+# widget ids
+_hv_lbl_title:   int32 = 0
+_hv_sbar:        int32 = 0
+
+
+# ====================================================================
+# Small string / number helpers (self-contained — no libc).
+# ====================================================================
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
+
+
+# Append a NUL-terminated source string into dst at pos; return new pos.
+def _put_s(dst: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
+    j: uint64 = 0
+    while s[j] != 0:
+        dst[pos] = s[j]
+        pos = pos + 1
+        j = j + 1
+    return pos
+
+
+# Append the decimal form of v into dst at pos; return new pos.
+def _put_dec(dst: Ptr[uint8], pos: uint64, v: uint64) -> uint64:
+    if v == 0:
+        dst[pos] = 48
+        return pos + 1
+    tmp: Array[24, uint8]
+    t: uint64 = 0
+    while v != 0:
+        tmp[t] = cast[uint8](v % 10) + 48
+        v = v / 10
+        t = t + 1
+    while t > 0:
+        t = t - 1
+        dst[pos] = tmp[t]
+        pos = pos + 1
+    return pos
+
+
+# Basename: pointer to the char after the last '/' in s.
+def _basename(s: Ptr[uint8]) -> Ptr[uint8]:
+    last: Ptr[uint8] = s
+    i: uint64 = 0
+    while s[i] != 0:
+        if s[i] == 47:                          # '/'
+            last = &s[i + 1]
+        i = i + 1
+    return last
+
+
+# ====================================================================
+# File loading.
+# ====================================================================
+def _load_file(path: Ptr[char]) -> int32:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while total < RAW_CAP:
+        n: int64 = sys_read(fd, &_hv_raw_buf[total], RAW_CAP - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    _hv_raw_len = total
+    if total == 0:
+        return -1
+    return 0
+
+
+# ====================================================================
+# PPM (P6) decode.  Header: "P6" <ws> W <ws> H <ws> MAXVAL <single-ws>
+# then W*H*3 raw RGB bytes.  Comments (# ... \n) are allowed in NetPBM
+# headers; we skip them.
+# ====================================================================
+def _is_space(c: uint8) -> int32:
+    if c == 32 or c == 9 or c == 10 or c == 13:
+        return 1
+    return 0
+
+
+# Skip whitespace and '#'-to-EOL comments starting at p; return new index.
+def _ppm_skip_ws(p: uint64) -> uint64:
+    while p < _hv_raw_len:
+        c: uint8 = _hv_raw_buf[p]
+        if _is_space(c) != 0:
+            p = p + 1
+        elif c == 35:                           # '#'
+            while p < _hv_raw_len and _hv_raw_buf[p] != 10:
+                p = p + 1
+        else:
+            break
+    return p
+
+
+# Parse a non-negative decimal at p; store value via out[0], return new idx.
+def _ppm_uint(p: uint64, out: Ptr[uint64]) -> uint64:
+    v: uint64 = 0
+    while p < _hv_raw_len and _hv_raw_buf[p] >= 48 and _hv_raw_buf[p] <= 57:
+        v = v * 10 + cast[uint64](_hv_raw_buf[p] - 48)
+        p = p + 1
+    out[0] = v
+    return p
+
+
+def _decode_ppm() -> int32:
+    if _hv_raw_len < 2 or _hv_raw_buf[0] != 80 or _hv_raw_buf[1] != 54:   # "P6"
+        return -1
+    p: uint64 = 2
+    wv: Array[1, uint64]
+    hv: Array[1, uint64]
+    mv: Array[1, uint64]
+    p = _ppm_skip_ws(p)
+    p = _ppm_uint(p, &wv[0])
+    p = _ppm_skip_ws(p)
+    p = _ppm_uint(p, &hv[0])
+    p = _ppm_skip_ws(p)
+    p = _ppm_uint(p, &mv[0])
+    # exactly ONE whitespace byte separates the header from the raster.
+    if p < _hv_raw_len and _is_space(_hv_raw_buf[p]) != 0:
+        p = p + 1
+    w: uint64 = wv[0]
+    h: uint64 = hv[0]
+    _hv_src_w = w
+    _hv_src_h = h
+    if w == 0 or h == 0 or w > SRC_MAX or h > SRC_MAX:
+        return -2                               # too big / empty: dims only
+    if mv[0] == 0 or mv[0] > 255:
+        return -1                               # only 8-bit channels
+    need: uint64 = w * h * 3
+    if p + need > _hv_raw_len:
+        return -1                               # truncated raster
+    # Expand RGB -> RGBA into _hv_src_buf.
+    i: uint64 = 0
+    n: uint64 = w * h
+    while i < n:
+        so: uint64 = p + i * 3
+        dofs: uint64 = i * 4
+        _hv_src_buf[dofs]     = _hv_raw_buf[so]
+        _hv_src_buf[dofs + 1] = _hv_raw_buf[so + 1]
+        _hv_src_buf[dofs + 2] = _hv_raw_buf[so + 2]
+        _hv_src_buf[dofs + 3] = 255
+        i = i + 1
+    return 0
+
+
+# ====================================================================
+# BMP decode (uncompressed BI_RGB, 24/32bpp, bottom-up).
+# Little-endian field readers off _hv_raw_buf.
+# ====================================================================
+def _rd_u16(off: uint64) -> uint64:
+    return cast[uint64](_hv_raw_buf[off]) | (cast[uint64](_hv_raw_buf[off + 1]) << 8)
+
+
+def _rd_u32(off: uint64) -> uint64:
+    return cast[uint64](_hv_raw_buf[off]) \
+        | (cast[uint64](_hv_raw_buf[off + 1]) << 8) \
+        | (cast[uint64](_hv_raw_buf[off + 2]) << 16) \
+        | (cast[uint64](_hv_raw_buf[off + 3]) << 24)
+
+
+def _decode_bmp() -> int32:
+    if _hv_raw_len < 54 or _hv_raw_buf[0] != 66 or _hv_raw_buf[1] != 77:   # "BM"
+        return -1
+    data_off: uint64 = _rd_u32(10)
+    hdr_size: uint64 = _rd_u32(14)              # BITMAPINFOHEADER = 40
+    if hdr_size < 40:
+        return -1
+    w: uint64 = _rd_u32(18)
+    raw_h: uint64 = _rd_u32(22)                 # treat as positive (bottom-up)
+    planes: uint64 = _rd_u16(26)
+    bpp: uint64 = _rd_u16(28)
+    compression: uint64 = _rd_u32(30)
+    h: uint64 = raw_h
+    _hv_src_w = w
+    _hv_src_h = h
+    if planes != 1:
+        return -1
+    if compression != 0:                        # BI_RGB only
+        return -1
+    if bpp != 24 and bpp != 32:
+        return -1
+    if w == 0 or h == 0 or w > SRC_MAX or h > SRC_MAX:
+        return -2                               # dims only
+    bytes_pp: uint64 = bpp / 8
+    # rows are padded to a 4-byte boundary.
+    row_stride: uint64 = ((w * bytes_pp + 3) / 4) * 4
+    if data_off + row_stride * h > _hv_raw_len:
+        return -1                               # truncated
+    # bottom-up: source row 0 is the BOTTOM of the image.
+    y: uint64 = 0
+    while y < h:
+        src_row: uint64 = data_off + (h - 1 - y) * row_stride
+        x: uint64 = 0
+        while x < w:
+            so: uint64 = src_row + x * bytes_pp
+            dofs: uint64 = (y * w + x) * 4
+            # BMP stores BGR(A); map to RGBA.
+            _hv_src_buf[dofs]     = _hv_raw_buf[so + 2]   # R
+            _hv_src_buf[dofs + 1] = _hv_raw_buf[so + 1]   # G
+            _hv_src_buf[dofs + 2] = _hv_raw_buf[so]       # B
+            if bytes_pp == 4:
+                a: uint8 = _hv_raw_buf[so + 3]
+                # Many 32bpp BMPs leave alpha 0; treat all-0 alpha as opaque.
+                if a == 0:
+                    a = 255
+                _hv_src_buf[dofs + 3] = a
+            else:
+                _hv_src_buf[dofs + 3] = 255
+            x = x + 1
+        y = y + 1
+    return 0
+
+
+# ====================================================================
+# Format dispatch on magic bytes.  Returns 0 ok, -2 dims-only (too big),
+# -1 unrecognised / corrupt.
+# ====================================================================
+def _decode() -> int32:
+    if _hv_raw_len >= 2 and _hv_raw_buf[0] == 80 and _hv_raw_buf[1] == 54:      # "P6"
+        return _decode_ppm()
+    if _hv_raw_len >= 2 and _hv_raw_buf[0] == 66 and _hv_raw_buf[1] == 77:      # "BM"
+        return _decode_bmp()
+    return -1
+
+
+# ====================================================================
+# Scale _hv_src_buf (_hv_src_w x _hv_src_h RGBA) down into _hv_fb_buf, preserving aspect,
+# so the long edge is <= FB_MAX.  Nearest-neighbour (the compositor blit
+# from fb -> window is also nearest-neighbour, so this is consistent).
+# ====================================================================
+def _scale_to_fb():
+    sw: uint64 = _hv_src_w
+    sh: uint64 = _hv_src_h
+    dw: uint64 = sw
+    dh: uint64 = sh
+    # shrink the long edge to FB_MAX (only ever downscale).
+    if dw > FB_MAX or dh > FB_MAX:
+        if dw >= dh:
+            dh = (dh * FB_MAX) / dw
+            dw = FB_MAX
+        else:
+            dw = (dw * FB_MAX) / dh
+            dh = FB_MAX
+    if dw == 0:
+        dw = 1
+    if dh == 0:
+        dh = 1
+    _hv_fb_w = dw
+    _hv_fb_h = dh
+    y: uint64 = 0
+    while y < dh:
+        sy: uint64 = (y * sh) / dh
+        x: uint64 = 0
+        while x < dw:
+            sx: uint64 = (x * sw) / dw
+            so: uint64 = (sy * sw + sx) * 4
+            dofs: uint64 = (y * dw + x) * 4
+            _hv_fb_buf[dofs]     = _hv_src_buf[so]
+            _hv_fb_buf[dofs + 1] = _hv_src_buf[so + 1]
+            _hv_fb_buf[dofs + 2] = _hv_src_buf[so + 2]
+            _hv_fb_buf[dofs + 3] = _hv_src_buf[so + 3]
+            x = x + 1
+        y = y + 1
+
+
+# ====================================================================
+# wsys draw plumbing — write our own pix(fb)+img(markup) layers.
+# ====================================================================
+def _build_draw_path(wid: int32, layer: Ptr[uint8], leaf: Ptr[uint8]):
+    # "/dev/wsys/<wid>/draw[/<layer>[/<leaf>]]" into _hv_path_buf.
+    i: uint64 = 0
+    i = _put_s(&_hv_path_buf[0], i, "/dev/wsys/")
+    i = _put_dec(&_hv_path_buf[0], i, cast[uint64](wid))
+    i = _put_s(&_hv_path_buf[0], i, "/draw")
+    if layer != cast[Ptr[uint8]](0) and layer[0] != 0:
+        _hv_path_buf[i] = 47
+        i = i + 1
+        i = _put_s(&_hv_path_buf[0], i, layer)
+        if leaf != cast[Ptr[uint8]](0) and leaf[0] != 0:
+            _hv_path_buf[i] = 47
+            i = i + 1
+            i = _put_s(&_hv_path_buf[0], i, leaf)
+    _hv_path_buf[i] = 0
+
+
+# Send a ctl verb (already in _hv_ctl_buf, length n) to .../draw/ctl.
+def _ctl(wid: int32, n: uint64):
+    _build_draw_path(wid, "ctl", cast[Ptr[uint8]](0))
+    fd: int32 = sys_open_write(cast[Ptr[char]](&_hv_path_buf[0]))
+    if fd >= 0:
+        sys_write(fd, &_hv_ctl_buf[0], n)
+        sys_close(fd)
+
+
+# Publish the decoded image: create the fb + markup layers and write them.
+# Returns 0 on success, -1 if the fb layer couldn't be written.
+def _publish_image(wid: int32) -> int32:
+    # 1. mklayer pix fb <_hv_fb_w> <_hv_fb_h>
+    n: uint64 = 0
+    n = _put_s(&_hv_ctl_buf[0], n, "mklayer pix fb ")
+    n = _put_dec(&_hv_ctl_buf[0], n, _hv_fb_w)
+    _hv_ctl_buf[n] = 32
+    n = n + 1
+    n = _put_dec(&_hv_ctl_buf[0], n, _hv_fb_h)
+    _hv_ctl_buf[n] = 10
+    n = n + 1
+    _ctl(wid, n)
+
+    # 2. write the RGBA pixels to .../draw/pix/fb
+    _build_draw_path(wid, "pix", "fb")
+    pf: int32 = sys_open_write(cast[Ptr[char]](&_hv_path_buf[0]))
+    if pf < 0:
+        return -1
+    sys_write(pf, &_hv_fb_buf[0], _hv_fb_w * _hv_fb_h * 4)
+    sys_close(pf)
+
+    # 3. mklayer img markup ; setz img 6 (under the toolkit "ui" at z=10).
+    n = 0
+    n = _put_s(&_hv_ctl_buf[0], n, "mklayer img markup\n")
+    _ctl(wid, n)
+    n = 0
+    n = _put_s(&_hv_ctl_buf[0], n, "setz img 6\n")
+    _ctl(wid, n)
+
+    # 4. centre the image in the 640x480 content area (leave room for the
+    #    title row at the top and the status bar at the bottom).
+    iw: int64 = cast[int64](_hv_fb_w)
+    ih: int64 = cast[int64](_hv_fb_h)
+    # available draw area: y in [48 .. WIN_H-28]
+    avail_h: int64 = (WIN_H - 28) - 48
+    px: int64 = (WIN_W - iw) / 2
+    py: int64 = 48 + (avail_h - ih) / 2
+    if px < 0:
+        px = 0
+    if py < 48:
+        py = 48
+
+    m: uint64 = 0
+    m = _put_s(&_hv_markup_buf[0], m, "<image src=\"fb:pix\" x=")
+    m = _put_dec(&_hv_markup_buf[0], m, cast[uint64](px))
+    m = _put_s(&_hv_markup_buf[0], m, " y=")
+    m = _put_dec(&_hv_markup_buf[0], m, cast[uint64](py))
+    m = _put_s(&_hv_markup_buf[0], m, " w=")
+    m = _put_dec(&_hv_markup_buf[0], m, _hv_fb_w)
+    m = _put_s(&_hv_markup_buf[0], m, " h=")
+    m = _put_dec(&_hv_markup_buf[0], m, _hv_fb_h)
+    m = _put_s(&_hv_markup_buf[0], m, "/>\n")
+
+    _build_draw_path(wid, "img", "markup")
+    mf: int32 = sys_open_write(cast[Ptr[char]](&_hv_path_buf[0]))
+    if mf >= 0:
+        sys_write(mf, &_hv_markup_buf[0], m)
+        sys_close(mf)
+    return 0
+
+
+# ====================================================================
+# Compose the status line: "<name> — <w>x<h> (<fmt>)" or an error.
+# ====================================================================
+def _set_status(name: Ptr[uint8], note: Ptr[uint8]):
+    p: uint64 = 0
+    p = _put_s(&_hv_status_buf[0], p, name)
+    p = _put_s(&_hv_status_buf[0], p, "  ")
+    if _hv_src_w != 0 and _hv_src_h != 0:
+        p = _put_dec(&_hv_status_buf[0], p, _hv_src_w)
+        _hv_status_buf[p] = 120                     # 'x'
+        p = p + 1
+        p = _put_dec(&_hv_status_buf[0], p, _hv_src_h)
+        _hv_status_buf[p] = 32
+        p = p + 1
+    p = _put_s(&_hv_status_buf[0], p, note)
+    _hv_status_buf[p] = 0
+    hamui_status_set(_hv_sbar, &_hv_status_buf[0])
+
+
+# Self-discover the wid the compositor allocated for us via /dev/wsys/self
+# (rendered "<wid>\n" for the calling task). argv[1]-as-number is NOT used
+# for the wid here because argv[1] is the image path; standalone runs fall
+# back to wid 1 (the foreground shell window).
+def _discover_wid() -> int32:
+    wid: int32 = 1
+    sfd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/self"))
+    if sfd >= 0:
+        sb: Array[16, uint8]
+        sn: int64 = sys_read_nb(sfd, &sb[0], 16)
+        sys_close(sfd)
+        if sn > 0:
+            sv: int32 = 0
+            i: uint64 = 0
+            while i < cast[uint64](sn) and sb[i] >= 48 and sb[i] <= 57:
+                sv = sv * 10 + cast[int32](sb[i]) - 48
+                i = i + 1
+            if sv >= 2:
+                wid = sv
+    return wid
+
+
+# ====================================================================
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    hamui_init()
+
+    # ---- build the (small) UI chrome: title + status bar ----
+    root: int32 = hamui_fixed()
+
+    _hv_lbl_title = hamui_label("hamview")
+    hamui_set_size(_hv_lbl_title, 632, 24)
+    hamui_fixed_place(_hv_lbl_title, 8, 12)
+    hamui_add(root, _hv_lbl_title)
+
+    _hv_sbar = hamui_statusbar("hamview")
+    hamui_set_size(_hv_sbar, 640, 20)
+    hamui_fixed_place(_hv_sbar, 0, 460)
+    hamui_add(root, _hv_sbar)
+
+    wid: int32 = _discover_wid()
+    bound: int32 = hamui_window_on(root, wid)
+    if bound < 0:
+        _puts(2, "hamview: could not bind window\n")
+        return 1
+    # Seed focus so routed keys (if any) have a home; harmless for a viewer.
+    hamui_focus(root)
+
+    # ---- resolve the file path (argv[1] or a built-in sample) ----
+    has_path: int32 = 0
+    path: Ptr[char] = cast[Ptr[char]]("/share/hamview/sample.ppm")
+    if argc > 1:
+        path = cast[Ptr[char]](argv[1])
+        has_path = 1
+
+    name: Ptr[uint8] = _basename(cast[Ptr[uint8]](path))
+
+    # Title shows the basename.
+    title_p: uint64 = 0
+    title_tmp: Array[96, uint8]
+    title_p = _put_s(&title_tmp[0], title_p, "hamview - ")
+    title_p = _put_s(&title_tmp[0], title_p, name)
+    title_tmp[title_p] = 0
+    hamui_set_text(_hv_lbl_title, &title_tmp[0])
+
+    # ---- load + decode ----
+    _hv_src_w = 0
+    _hv_src_h = 0
+    loaded: int32 = _load_file(path)
+    if loaded < 0:
+        if has_path != 0:
+            _set_status(name, "(cannot open)")
+        else:
+            _set_status(name, "(no image given)")
+        hamui_render()
+        _puts(1, "HAMVIEW ready\n")
+        _loop()
+        return 0
+
+    rc: int32 = _decode()
+    if rc == -2:
+        # Recognised header but too large for our 512x512 cap: show dims.
+        _set_status(name, "(too large to display)")
+        hamui_render()
+        _puts(1, "HAMVIEW ready\n")
+        _loop()
+        return 0
+    if rc < 0:
+        _set_status(name, "(unsupported: P6/BMP only)")
+        hamui_render()
+        _puts(1, "HAMVIEW ready\n")
+        _loop()
+        return 0
+
+    # ---- scale + publish the raster ----
+    _scale_to_fb()
+    if _publish_image(wid) < 0:
+        _set_status(name, "(blit failed)")
+    else:
+        _set_status(name, "")
+
+    # Publish toolkit chrome on top of our image layers.
+    hamui_render()
+    _puts(1, "HAMVIEW ready\n")
+    _loop()
+    return 0
+
+
+# Idle event loop — keep the window alive and let the toolkit service
+# pointer/key routing. The image layers are static, so we only step the
+# toolkit (which re-emits its "ui" layer on damage) and yield.
+def _loop():
+    while True:
+        hamui_step()
+        sys_yield()
