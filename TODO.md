@@ -64,10 +64,15 @@ replaces the ~70 `is_*_path` backend-selection branches).
     refcount, single release path); `FD_PROC`/`FD_AUTH`/`FD_BLK`/
     `FD_LOOP` folded onto pool chans; new gates `test_authdev.sh` +
     `test_loopctl.sh`.
-  - [ ] **Phase 4c — remaining stateful marks.** `FD_DEVFD` (26 sites/
-    5 files — MUST add a `DEV_DEVFD` arm to `namec_poll_readable` or
-    `/fd/N` polls regress always-ready), `FD_PIPE_R`/`FD_PIPE_W`
-    (48 sites/8 files), `FD_SOCKET`+`SOCKETPAIR` (89 sites/15 files).
+  - [x] **Phase 4c — remaining stateful marks DONE** (#440, merge
+    `26687d22`): `FD_DEVFD` → `DEV_DEVFD` inline chans (incl. the
+    `namec_poll_readable` arm), `FD_PIPE_R`/`FD_PIPE_W` → `DEV_PIPE_R`/
+    `DEV_PIPE_W` pool chans, `FD_SOCKET`+`SOCKETPAIR` → `DEV_SOCKET`/
+    `DEV_SOCKETPAIR` pool chans. New gates `test_devfd_chan.sh`,
+    `test_pipe_chan.sh`, `test_sock_chan.sh`; all VM-verified on the
+    merged tree (+ frame guard, heartbeat). Remainder mapped by audit
+    #444 finding 7 → continue in #390 (pipes-internals/stdio/net/
+    epoll-family; NR_FDS=16 lift).
     Layer-2 linux_abi event fds (epoll/eventfd/timerfd/signalfd/
     inotify/iouring/perf/bpf/pidfd) stay marks by design
     (boundary-discipline law — not namespace files).
@@ -230,6 +235,42 @@ replaces the ~70 `is_*_path` backend-selection branches).
    wallpaper, screensaver+password-lock, real session save/restore, inter-app
    drag-and-drop. PDF viewer (atril) deferred (needs font/PDF stack). Serialize
    the hamUId.ad-touching items (single 25k-line file) to avoid merge collisions.
+
+   **RIO-FAITHFUL RESHAPE (user directive 2026-06-11: "we really need to
+   address all of this").** The app-facing contract is already files-all-
+   the-way-down (draw by write, input by read), but three gaps separate it
+   from real Plan 9 — and the #441 latency deep-dive confirmed two of them
+   are also the live perf bugs:
+   - **(a) Per-window namespace bind.** Clients self-discover their wid via
+     `/dev/wsys/self` and build literal `/dev/wsys/<wid>/...` paths — a
+     global-path pattern of the class the namespace-purity mandate killed
+     elsewhere. Fix: compositor spawns each app with its window dir bound
+     at a fixed name (`/dev/win/`); clients open `/dev/win/keys` and never
+     learn their wid. Makes the DE nestable in principle (rio-in-rio).
+   - **(b) Blocking reads, not polling.** `hamui_run`/`hamui_step` busy-
+     spin `sys_read_nb` on pointer/keys + `sys_yield` — every client burns
+     100% CPU; #441 fingered this as the "whole DE crawls when a window is
+     open" cause. Kernel support exists (wsys keys/pointer are waitfds-
+     wakeable). Fix: `hamui_wait(extra_fd, timeout)` on `sys_waitfds` in
+     lib/hamui.ad. Gotcha found by #441: hamterm `_drain_shell` sets
+     `sh_alive=0` on EOF but never closes `sh_out_fd` — an EOF'd pipe is
+     permanently-ready to waitfds and would reintroduce the spin.
+   - **(c) Draw protocol carries images + dirty rects, not whole-window
+     text.** #441's root cause for keystroke latency: clients re-emit the
+     ENTIRE window markup per update; the compositor re-rasterizes the full
+     frame server-side (no damage info in the protocol). Plan 9's draw
+     device has clients submit rect-scoped ops against their own image.
+     Fix: move rasterization client-side (lib/hamui renders into its own
+     image), devwsys carries images + dirty rects, compositor becomes a
+     pure blitter. Also: `/dev/wsys/<N>/draw/ui/gen` is poll-only — make it
+     waitfds-wakeable so the compositor parks on client repaint.
+   - **(d) Longer-term:** window FS served by the userland compositor (9P
+     server) instead of in-kernel devwsys — the purer rio endpoint; fits
+     the MATE-mirror component split.
+   #441's three small contained hamUId fixes (cursor-ghost save-under,
+   markup body diff → sub-rect damage, hover damage narrowed to title band)
+   live on `worktree-agent-a3b8addc9e198a359` — protocol-compatible,
+   survive the reshape; merge after GOP verification.
 4. [ ] **Basic apps on the toolkit** (after #2 API is stable) — terminal,
    text editor, file browser, plus games Snake + 2048. These validate the
    toolkit is genuinely app-grade, and seed the DE app suite.
@@ -240,6 +281,81 @@ replaces the ~70 `is_*_path` backend-selection branches).
 > Phase 50 (MAP_SHARED across address spaces) preserved on branch
 > `worktree-agent-a48facf53ef25a377` (`6f217d09`), NOT landed. Resume ARM
 > only when the desktop/toolkit track is in good shape.
+
+## Plan 9 alignment audit findings (#444, 2026-06-11)
+
+**ALL findings queued as fix tracks (user 2026-06-11: "hammer the whole
+thing into a plan 9 shape"):** F1=#446 (keystone, SOLO agent), F2=#447,
+F3=#448, F4=#449, F5=#445 (in flight), F6=#450, F7=#390 continuation,
+F8=#451 (in flight), F9=#452, F10=#453 (re-audit AFTER the wave lands:
+verify F1-F9 hold at depth + new axes — sched/mm coupling, driver
+boundary, userland conventions, security end-to-end, boot/init shape,
+docs honesty — and rank the NEXT divergences). Dispatch order is
+disjointness-driven: F5+F8 now → F1 solo big-bang (owns fs/ +
+sys/src/9/port exclusively) → F2/F3/F9 sequenced after F1 (same files)
+∥ F6 (userland-side) and F4 (pairs with #390 pipes fold) as slots free
+→ F10 re-audit closes the loop.
+
+Full ranked report delivered in-session; spine (Chan/namec/devtab, Pgrp
+binds, unions MREPL/MBEFORE/MAFTER, notes, /net no-sockets, /srv, #d fd
+device, /dev/mountrpc tripwire) judged honestly Plan 9. Gaps, ranked:
+1. [ ] **Namespace is a prefix-rewrite veneer over a global path-keyed
+   VFS.** `chan_resolve_prefix` string-rewrites to absolute paths that
+   bottom out in ONE global mount table (`fs/vfs_mount.ad:215
+   vfs_fs_kind()`; unbound paths silently fall through to the global cpio
+   root; tmpfs explicitly global, devfd.ad:73). Fix direction: walk
+   element-by-element to Chans inside namec, per-Pgrp mount table,
+   unbound = ENOENT. Biggest structural lift; everything else fights this
+   substrate (e.g. the #by-id freeze dance, chan.ad:1329).
+2. [ ] **Native syscall sprawl: 82 dispatch arms vs documented ~25.**
+   Drift examples: SYS_NICE=311 duplicates /proc/<pid>/ctl `pri`;
+   wsys/svc/dns/netcfg control as syscalls though file surfaces exist;
+   timerfd/job-control/mmap in the native table (mmap directly contradicts
+   native-api.md:537). Fix: Phase-G-style sweep onto ctl files + honest
+   docs update.
+3. [ ] **Permissions = kernel literal-path funnel, not server-boundary.**
+   `fs/vfs.ad:1129 _vfs_check_perm` hardcodes /etc/shadow, /dev/blk,
+   /var/lib/hpm + ext4 mode bits + uid==1 bypass + global
+   vfs_auth_mediator_active backdoor; devauth reads /etc/shadow by literal
+   path from kernel context. Fix: enforce at attach/server boundary;
+   long-term userland factotum at /srv/factotum.
+4. [ ] **linux_abi is not a leaf**: native fs/vfs.ad imports
+   u_pty/u_epoll/u_fuse (vfs.ad:109,328,346) and carries Linux fd-kind arms;
+   arch syscall.ad/time.ad import vdso/loader. Fix: shim registers fd
+   kinds/paths via init-time hook table; vdso export inverts.
+5. [x→#445] **BUG: SYS_SYMLINK==SYS_MSYNC==305** — native ln -s dead,
+   masked because the selftest calls vfs_symlink() directly. Agent
+   dispatched (renumber msync, userland symlink gate).
+6. [ ] **Phase G unfinished**: 23 programs still sys_spawn (hamsh spawns
+   every command via SYS_SPAWN, hamsh.ad:2910), 16 still sys_listdir, 4
+   sys_kill. Fix: libc spawn() over rfork+exec, then delete the syscall.
+7. [ ] **FD-mark remainder** post-4c: stdio/tmpfs/pipes/socketpair/p9/
+   net/epoll-family/ptmx/fuse still mark-based; pipes = highest-leverage
+   next fold (9p_client special-cases pipe slots). NR_FDS=16 per task will
+   pinch real Debian userland.
+8. [ ] **9P depth**: client is synchronous (1 outstanding tag), no
+   Tauth/Tflush; distrofs (flagship userland server) persists via private
+   kernel syscalls SYS_DFS_LOAD/SAVE — give it a real file/#b backing.
+9. [ ] **Residual literal paths**: /dev/auth, /dev/fuse, /dev/ptmx+pts
+   pre-namec matches in vfs_open; modprobe reads ten /etc/*-ko flag files
+   from kernel context (→ one ctl file); coredump hardcodes /tmp/core;
+   chan.ad:1308 hardcodes /var/lib/distros/default.
+Also noted: MCREATE recorded-not-honored on create (chan.ad:1876);
+do_mount ignores afd / fauth unimplemented.
+
+## Native userland threading (#443, user-queued 2026-06-11)
+
+- [ ] **`lib/thread.ad`** — ergonomic native threads even though the DE
+  doesn't need them yet (user: "we definitely want to support native
+  threads in user land"). Kernel side already exists and is SMP-proven:
+  `rfork(RFPROC|RFMEM)` thread path (`sys/src/9/port/sysproc.ad:283`),
+  futex, per-CPU runqueues; musl/glibc pthreads green (u27/u28 gates).
+  Missing layer: spawn/join/mutex (+condvar/channels, Plan 9 libthread
+  flavor) for native Adder code, Plan 9-shaped sync ABI (semacquire/
+  rendezvous semantics, NOT a Linux-futex clone in the native namespace),
+  and Adder compiler atomic intrinsics (cmpxchg/xadd) — language layer,
+  per policy. Future consumer: client-side rasterization workers after
+  the #442 DE reshape.
 
 ## hamUI later phases (after Phase 4)
 
