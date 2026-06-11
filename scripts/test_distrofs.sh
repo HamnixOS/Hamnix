@@ -91,7 +91,7 @@ fail=0
 check_marker() {
     local marker="$1"
     local label="$2"
-    if grep -F -q "$marker" "$LOG"; then
+    if grep -a -F -q "$marker" "$LOG"; then
         echo "[test_distrofs] OK: $label"
     else
         echo "[test_distrofs] MISS: $label ($marker)"
@@ -100,9 +100,9 @@ check_marker() {
 }
 
 # Any per-assertion FAIL line means the round-trip broke somewhere.
-if grep -F -q "[distrofs] FAIL:" "$LOG"; then
+if grep -a -F -q "[distrofs] FAIL:" "$LOG"; then
     echo "[test_distrofs] MISS: per-assertion FAIL line(s) present:"
-    grep -F "[distrofs] FAIL:" "$LOG" | sed 's/^/  /'
+    grep -a -F "[distrofs] FAIL:" "$LOG" | sed 's/^/  /'
     fail=1
 else
     echo "[test_distrofs] OK: no per-assertion FAIL lines"

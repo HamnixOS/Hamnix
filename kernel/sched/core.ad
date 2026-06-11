@@ -28,6 +28,8 @@ from mm.cow import cow_boot_cr3
 from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
 from drivers.tty.serial.early_8250 import (
     PRINTK_LEVEL_EMERG, PRINTK_LEVEL_NOTICE,
+    # #439 TEMP DIAG: ring stats for the periodic [uart-ring] line.
+    uart_push_count, uart_ring_depth,
 )
 from fs.pipe import (
     pipe_close_reader, pipe_close_writer,
@@ -43,6 +45,7 @@ from fs.pipe import (
 # one switch event. See kernel/sched/loadavg.ad.
 from kernel.sched.loadavg import (
     loadavg_note_switch, cpu_idle_enter, cpu_idle_leave,
+    loadavg_get_ctxt,  # #439 TEMP DIAG: ctxt count in [uart-ring] line
 )
 # SMP: per-CPU id for current-task tracking and TSS gating.
 from arch.x86.kernel.setup_percpu import get_cpu_id
@@ -4758,6 +4761,39 @@ def task_reap(slot: int32):
             task_table[psr].cstime_ticks = task_table[psr].cstime_ticks + task_table[su].stime_ticks + task_table[su].cstime_ticks
             task_table[psr].cminflt      = task_table[psr].cminflt + task_table[su].minflt + task_table[su].cminflt
             task_table[psr].cmajflt      = task_table[psr].cmajflt + task_table[su].majflt + task_table[su].cmajflt
+    # BOOT-CR3 GUARD for the WHOLE reclaim sequence — root-cause fix for
+    # the post-`enter linux` whole-system lockup (CPU0 spinning forever in
+    # _try_remove_buddy with IF=0, observed via QEMU monitor regdump:
+    # RIP in mm/page_alloc free-list walk, CR3 = the reaping PARENT's
+    # user CR3).
+    #
+    # Every reclaim arm below (zombie-sweep kstack/ustack frees,
+    # vma_clear, vma_free_reserved_range, region_free image/interp,
+    # free_pages ustack/kstack, free_page PML4) manipulates the buddy /
+    # region allocators' INTRUSIVE free lists: the `next` link lives in
+    # the first 8 bytes of the freed frame itself and is read/written
+    # through a raw PHYSICAL-address pointer. That is only correct when
+    # phys X is identity-mapped at VA X in the CURRENT CR3. But task_reap
+    # runs in the PARENT's context on the parent's CRACKED user CR3,
+    # whose USER mappings (ELF image, 32 MiB brk reserve, mmap VMAs)
+    # SHADOW the low-physical pool addresses — so a link store at "phys"
+    # X lands in one of the reaper's own user pages instead, and a link
+    # load reads user data. The free lists cross-link / self-cycle, and
+    # the next _try_remove_buddy walk spins forever with interrupts
+    # masked (the syscall path runs IF=0), freezing every CPU's timer
+    # and the console: the exact test_linux_sh hang.
+    #
+    # The pristine boot CR3 identity-maps ALL of RAM by construction —
+    # the same guard _free_task_user_pagetables already uses for its own
+    # raw-physical walk. Run the WHOLE reclaim under it with IRQs off
+    # (an IRQ handler must not observe the borrowed CR3), restore after.
+    # All task_table / allocator metadata is kernel-half and mapped in
+    # the boot CR3 too, so every arm below is unaffected otherwise.
+    _rp_live_cr3: uint64 = read_cr3()
+    _rp_irq: uint64 = local_irq_save()
+    _rp_boot_cr3: uint64 = cow_boot_cr3()
+    if _rp_boot_cr3 != 0 and (_rp_boot_cr3 & 0x000FFFFFFFFFF000) != (_rp_live_cr3 & 0x000FFFFFFFFFF000):
+        load_cr3(_rp_boot_cr3)
     # SHARED-ADDRESS-SPACE GUARD — root-cause fix for the latent #DF at
     # load_cr3+0x3 ("freshly-built CR3's kernel half unmapped", trap rsp
     # in low memory, fires after suite PASS markers).
@@ -5006,6 +5042,11 @@ def task_reap(slot: int32):
     if task_table[su].is_user != 0 and task_table[su].kstack_base != 0:
         free_pages(task_table[su].kstack_base, KSTACK_ORDER)
         task_table[su].kstack_base = 0
+    # End of the BOOT-CR3 GUARD: every raw-physical free is done —
+    # restore the caller's CR3 and IRQ state before publishing the slot.
+    if (_rp_boot_cr3 & 0x000FFFFFFFFFF000) != (_rp_live_cr3 & 0x000FFFFFFFFFF000):
+        load_cr3(_rp_live_cr3)
+    local_irq_restore(_rp_irq)
     nr_tasks_reaped = nr_tasks_reaped + 1
     task_table[su].state = STATE_FREE
 
@@ -5871,11 +5912,41 @@ def wq_wake_all(wq: Ptr[WaitQueue]):
 console_wq: WaitQueue
 
 
+# #439 TEMP DIAG: console_input_wake runs every timer tick (belt-and-
+# braces drain in time.ad), so it doubles as a periodic stat emitter:
+# every ~500 calls print pushed-total / ring depth / grab holder /
+# pop-total. Removed with the rest of the #439 instrumentation.
+# (Declared here, above first use — the grab pid + pop counters are
+# consumed by console_input_wake before their P0b section below.)
+_ring_dbg_calls: uint64 = 0
+_uart_pop_dbg: uint64 = 0
+_uart_pop_total: uint64 = 0
+console_input_grab_pid: uint64 = 0
+
+
 def console_input_wake():
     # Producer-side wake for the console input FIFOs (stdin / /dev/cons).
     # Called from the UART RX IRQ drain, the keyboard push path, and the
     # wsys cmd-injection push. Safe from IRQ context (wq_wake_all takes
     # rq_lock and never schedules). A no-op when nobody is blocked.
+    _ring_dbg_calls = _ring_dbg_calls + 1
+    if _ring_dbg_calls % 500 == 0:
+        printk_set_level(PRINTK_LEVEL_NOTICE)
+        printk2("[uart-ring] pushed=%d depth=%d", uart_push_count(),
+                uart_ring_depth())
+        printk_set_level(PRINTK_LEVEL_NOTICE)
+        printk2(" grab=%d pops=%d", console_input_grab_pid,
+                _uart_pop_total)
+        # #439 TEMP DIAG: pid 2 (the serial shell) liveness — slot state
+        # tells blocked-in-WAIT apart from spinning READY/RUNNING.
+        _rdbg_slot2: int32 = task_lookup_by_pid(2)
+        if _rdbg_slot2 >= 0:
+            printk_set_level(PRINTK_LEVEL_NOTICE)
+            printk2(" p2st=%d sc=%d",
+                    task_table[cast[uint64](_rdbg_slot2)].state,
+                    loadavg_get_ctxt())
+        printk_set_level(PRINTK_LEVEL_NOTICE)
+        printk0("\n")
     wq_wake_all(&console_wq)
     # SYS_WAITFDS: a console-input byte also makes any /dev/cons or stdin
     # fd in a multi-fd wait readable — kick the global waitfds queue so a
@@ -5921,20 +5992,43 @@ def waitfds_wq_ptr() -> Ptr[WaitQueue]:
 
 # --- console input grab (P0b) ---------------------------------------
 #
-# A userland compositor (hamUId) GRABs the physical console input
-# (PS/2 keyboard + UART RX) while the graphical session is up, so the
-# boot/login hamsh that shares /dev/cons cannot race it for keystrokes.
-# While grabbed, ONLY the grabbing pid may pop a physical input byte
+# A userland compositor (hamUId) GRABs the physical KEYBOARD input
+# while the graphical session is up, so the boot/login hamsh that
+# shares /dev/cons cannot race it for keystrokes typed at the DE.
+# While grabbed, ONLY the grabbing pid may pop a keyboard byte
 # (devcons_read / devcons_read_nb consult console_input_grabbed_by()).
-# Any other reader is treated as if no byte were available — its
-# blocking read parks on console_wq, its non-blocking read returns
+# Any other reader is treated as if no keyboard byte were available —
+# its blocking read parks on console_wq, its non-blocking read returns
 # "would block". The wsys cmd-injection queue is NOT gated (so `echo >
 # /dev/wsys/<wid>/cmd` still works for every window). 0 == ungrabbed.
-console_input_grab_pid: uint64 = 0
+#
+# The UART RX ring is deliberately OUTSIDE the grab (#439): it is the
+# SERIAL CONSOLE — a separate physical channel from the keyboard a DE
+# user types on. Routing is the INVERSE of the keyboard while a grab
+# is held: the holder must NOT pop uart bytes (the DE polls /dev/cons
+# every present-loop iteration and would silently eat the serial
+# operator's keystrokes — exactly what killed serial input on every
+# default `init 5` boot), and every NON-holder keeps its serial
+# console. With no grab held, both rings flow to whoever reads first
+# (the historical single-console behavior).
+# (console_input_grab_pid is declared above console_input_wake — #439
+# TEMP DIAG reads it from the periodic stat line.)
 
 
 def console_input_grab(pid: uint64):
     console_input_grab_pid = pid
+    # #439 TEMP DIAG: surface who owns the grab on the serial log.
+    printk_set_level(PRINTK_LEVEL_NOTICE)
+    printk1("[cons-grab] pid=%d\n", pid)
+
+
+def uart_pop_debug_trace(site: uint64):
+    _uart_pop_total = _uart_pop_total + 1
+    if _uart_pop_dbg >= 64:
+        return
+    _uart_pop_dbg = _uart_pop_dbg + 1
+    printk_set_level(PRINTK_LEVEL_NOTICE)
+    printk2("[uart-pop] site=%d pid=%d\n", site, current_task_pid())
 
 
 def console_input_ungrab(pid: uint64):
@@ -5956,14 +6050,27 @@ def console_input_grabbed_by() -> uint64:
 
 
 def console_input_may_pop_current() -> int32:
-    # 1 iff the CURRENT task is allowed to pop a PHYSICAL console-input
-    # byte right now: either the console is ungrabbed, or the current
-    # task IS the grab holder.
+    # 1 iff the CURRENT task is allowed to pop a KEYBOARD input byte
+    # right now: either the console is ungrabbed, or the current task
+    # IS the grab holder.
     if console_input_grab_pid == 0:
         return 1
     if current_task_pid() == console_input_grab_pid:
         return 1
     return 0
+
+
+def console_input_may_pop_uart_current() -> int32:
+    # 1 iff the CURRENT task is allowed to pop a UART RX (serial
+    # console) byte right now. Inverse of the keyboard gate while a
+    # grab is held: the DE holder must NOT consume serial bytes (its
+    # /dev/cons poll loop would eat the serial operator's keystrokes),
+    # and every non-holder keeps its serial console (#439).
+    if console_input_grab_pid == 0:
+        return 1
+    if current_task_pid() == console_input_grab_pid:
+        return 0
+    return 1
 
 
 def console_wq_sleep() -> int32:

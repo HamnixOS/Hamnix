@@ -120,7 +120,7 @@ fail=0
 #     text, so it cannot come from a local echo of the keystrokes — the
 #     guest's own read(0) pulled the line through the cooked discipline
 #     and busybox ran it. This is the honesty-bar assertion.
-if grep -F -q "IN_42_OK" "$LOG"; then
+if grep -a -F -q "IN_42_OK" "$LOG"; then
     echo "[test_linux_interactive_tty] OK: guest consumed fd 0 + ran the typed command"
 else
     echo "[test_linux_interactive_tty] FAIL: IN_42_OK not seen —" \
@@ -133,7 +133,7 @@ fi
 #     start of the typed line, which appears in NO boot banner) shows up
 #     only because the discipline echoed the keystrokes — without the
 #     cooked-mode echo the typed bytes would be invisible.
-if grep -F -q "echo IN_" "$LOG"; then
+if grep -a -F -q "echo IN_" "$LOG"; then
     echo "[test_linux_interactive_tty] OK: cooked-mode echo surfaced the typed line"
 else
     echo "[test_linux_interactive_tty] FAIL: typed command never echoed —" \
@@ -142,14 +142,14 @@ else
 fi
 
 # (c) no kernel trap / page fault during the interactive session.
-if grep -F -q "TRAP: vector" "$LOG"; then
+if grep -a -F -q "TRAP: vector" "$LOG"; then
     echo "[test_linux_interactive_tty] DIAG: CPU exception observed"
-    grep -F "TRAP: vector" "$LOG" | head -5 || true
+    grep -a -F "TRAP: vector" "$LOG" | head -5 || true
     fail=1
 fi
-if grep -F -q "page fault" "$LOG"; then
+if grep -a -F -q "page fault" "$LOG"; then
     echo "[test_linux_interactive_tty] DIAG: page fault observed"
-    grep -F "page fault" "$LOG" | head -5 || true
+    grep -a -F "page fault" "$LOG" | head -5 || true
     fail=1
 fi
 

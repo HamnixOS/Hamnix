@@ -178,7 +178,7 @@ echo "[test_distro_namespace] --- end output ---"
 fail=0
 
 # 1. rc.boot defined the Linux runtime namespace value.
-if grep -F -q "rc.boot: linux runtime namespace defined" "$LOG"; then
+if grep -a -F -q "rc.boot: linux runtime namespace defined" "$LOG"; then
     echo "[test_distro_namespace] OK: rc.boot defined the linux ns value"
 else
     echo "[test_distro_namespace] MISS: rc.boot did not define linux"
@@ -269,7 +269,7 @@ assert_banner_value "BANNER-NATIVE-POST" "hamnix/0.1" \
     "post-enter native /etc/debian_version still reads Hamnix"
 
 # 6. The namespace verb chained with && (HAMSH_SPEC §11).
-if grep -F -q "CHAIN_OK" "$LOG"; then
+if grep -a -F -q "CHAIN_OK" "$LOG"; then
     echo "[test_distro_namespace] OK: enter linux { } && echo chains"
 else
     echo "[test_distro_namespace] MISS: enter did not chain with &&"
