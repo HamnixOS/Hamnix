@@ -18,9 +18,10 @@
 # and FAILs itself when N < 2. The script re-asserts N >= 2 from the
 # captured line. (The kernel also printk's a one-shot
 # "[9p] tagged concurrency: N T-msgs in flight" when the threshold is
-# first crossed — but real 9P traffic flows during EARLY BOOT, before
-# the harness's serial capture window opens, so that line can land
-# outside the log; the /dev/9pmax read-back is capture-window-proof.)
+# first crossed — but it is INFO-level and fires while the fixture
+# runs from the INTERACTIVE shell, after console_set_interactive()
+# gates INFO printk to the ring buffer only, so it never reaches the
+# captured serial console; the /dev/9pmax read-back is gate-proof.)
 # A client that secretly serializes (old single-outstanding behaviour)
 # would still pass every fixture I/O assertion — but read back 1 here,
 # and this test FAILs.
