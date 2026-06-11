@@ -675,7 +675,7 @@ sys_errstr:
      * Phase C / M16.107: Plan 9-shape namespace primitive. Graft
      * path `new` onto path `old` in the calling task's namespace;
      * after this, opens of `new/x` look up `old/x` via the kernel's
-     * resolve_path -> chan_resolve_prefix hook (`fs/vfs.ad`).
+     * resolve_path -> ns_walk hook (`fs/vfs.ad`).
      *
      * flag = MREPL (0) / MBEFORE / MAFTER / MCREATE / MCACHE bits per
      * docs/native-api.md; Phase C records the bit but only MREPL is
