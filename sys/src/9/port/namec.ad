@@ -417,7 +417,37 @@ DEV_BUF_FILE:  int32 = 62          # procfs/cgroup snapshot buffer (pool, ptr-ba
 # pattern core.ad uses for namec_close).
 DEV_PROC:      int32 = 63          # /proc/<pid>/<leaf> (pool, encoded back_slot)
 
-DEV_MAX:       int32 = 64
+# Phase 4b: a /dev/auth credential fd (ex-FD_AUTH_MARK). POOL chan;
+# back_slot carries the devauth AuthSlot pool index (user/pass buffers,
+# verification verdict, rate-limit timestamp all live in devauth.ad's
+# auth_pool — the chan is just the refcounted handle). Read/write/close
+# dispatch by NAME to devauth_read/devauth_write/devauth_close
+# (devauth.ad imports fs.vfs which imports namec — importing devauth
+# back here would cycle). Routing close through namec_close fixes the
+# legacy leak where a task that EXITED holding an auth fd never ran
+# vfs_close's FD_AUTH arm, stranding the AuthSlot (and its plaintext
+# pass_buf) forever; close_fd_in_task's chan fall-through now reaches
+# devauth_close on the last reference no matter how the fd dies.
+DEV_AUTH:      int32 = 64          # /dev/auth credential fd (pool, slot-backed)
+
+# Phase 4b: a /dev/blk/<name>{,/size,/ctl} block-device fd
+# (ex-FD_BLK_MARK). POOL chan; the 64-bit devblk pack
+# ((mode << 32) | slot — see devblk_pack) is wider than back_slot, so
+# it rides in back_ptr. Read/write dispatch by NAME to devblk_read /
+# devblk_write (devblk.ad sits below vfs in the import graph; by-name
+# keeps namec import-free of it). Stateless at close — the pack is a
+# cookie into kernel/block/blk.ad's global slot table, nothing to
+# release.
+DEV_BLK:       int32 = 65          # /dev/blk/<name> fd (pool, pack in back_ptr)
+
+# Phase 4b: the /dev/loop/ctl loop-device control cdev (ex-
+# FD_LOOP_MARK). INLINE chan — the ctl file carries no per-fd state
+# beyond the read cursor, which the FD_CHAN_MARK fd's fd_pos already
+# provides. Dispatch by NAME to loopctl_read / loopctl_write
+# (drivers/block/loop.ad imports fs.vfs imports namec — cycle).
+DEV_LOOPCTL:   int32 = 66          # /dev/loop/ctl (inline, stateless)
+
+DEV_MAX:       int32 = 67
 
 # The FAT write-mode bit as carried in a DEV_FAT_FILE chan's back_slot
 # (a copy of fs/vfs.ad's FAT_FD_WRITE_BIT / fs/fat.ad's
@@ -640,7 +670,8 @@ def _chan_id_valid(cid: int32) -> int32:
         if dt > DEV_NONE and dt < DEV_MAX and dt != DEV_MNT \
                 and dt != DEV_EXT4_FILE and dt != DEV_FAT_FILE \
                 and dt != DEV_TMPFS_FILE and dt != DEV_DIR_FILE \
-                and dt != DEV_BUF_FILE and dt != DEV_PROC:
+                and dt != DEV_BUF_FILE and dt != DEV_PROC \
+                and dt != DEV_AUTH and dt != DEV_BLK:
             return 1
         return 0
     return _chan_pool_valid(cid)
@@ -732,6 +763,11 @@ def _devtab_lookup(path: Ptr[char]) -> int32:
         return DEV_VT4
     if _streq(path, "/dev/vt/ctl") != 0:
         return DEV_VTCTL
+    # Phase 4b: /dev/loop/ctl — loop-device attach/detach/list control
+    # file (ex-FD_LOOP_MARK; the vfs literal-leaf arm is gone, this
+    # devtab entry is the only way in).
+    if _streq(path, "/dev/loop/ctl") != 0:
+        return DEV_LOOPCTL
     # task #178: /dev/keymap — keyboard-layout selector cdev.
     if _streq(path, "/dev/keymap") != 0:
         return DEV_KEYMAP
@@ -971,6 +1007,12 @@ def _devtab_read(dev_type: int32, wid: int32, layer: int32, off: uint64,
         if off > 0:
             return 0
         return devmountrpc_read(buf, count)
+    if dev_type == DEV_LOOPCTL:
+        # Phase 4b: /dev/loop/ctl read — render the attached-loop table.
+        # loopctl_read honours the off cursor itself (EOF on the second
+        # read so `cat /dev/loop/ctl` terminates). By-name call: loop.ad
+        # imports fs.vfs imports namec.
+        return loopctl_read(off, buf, count)
     if dev_type == DEV_NULL:
         # /dev/null reads always return EOF.
         return 0
@@ -1225,6 +1267,11 @@ def _devtab_write(dev_type: int32, wid: int32, layer: int32,
         return devvt_write(buf, count)
     if dev_type == DEV_VTCTL:
         return devvtctl_write(buf, count)
+    if dev_type == DEV_LOOPCTL:
+        # Phase 4b: /dev/loop/ctl write — parse one attach/detach verb
+        # per write (stateless across writes). By-name call: loop.ad
+        # imports fs.vfs imports namec.
+        return loopctl_write(buf, count)
     if dev_type == DEV_NULL:
         # /dev/null swallows writes silently — the full count is
         # returned as bytes-written.
@@ -1463,6 +1510,47 @@ def namec_open_proc_file(enc24: int32) -> int32:
     chan_pool[su].dev_type  = DEV_PROC
     chan_pool[su].mode      = 0
     chan_pool[su].back_slot = enc24
+    return cs
+
+
+def namec_open_auth_file(slot: int32) -> int32:
+    # Phase 4b: wrap a devauth AuthSlot pool index in a DEV_AUTH pool
+    # chan. The caller (fs/vfs.ad _open_auth_marked) has already
+    # devauth_alloc()'d the slot; all credential state lives in
+    # devauth.ad's auth_pool — the chan just refcounts the handle so a
+    # fork/dup'd auth fd shares ONE slot and only the LAST close returns
+    # it (the legacy raw-slot fd_buf copy double-freed on the first
+    # close). mode is ORDWR — the newshell idiom writes user/pass and
+    # reads the verdict on the same fd. Returns the chan id, or -1 on
+    # pool exhaustion (caller rolls the AuthSlot back).
+    cs: int32 = _chan_alloc()
+    if cs < 0:
+        return -1
+    su: uint64 = cast[uint64](cs)
+    chan_pool[su].in_use    = 1
+    chan_pool[su].dev_type  = DEV_AUTH
+    chan_pool[su].mode      = 2
+    chan_pool[su].back_slot = slot
+    return cs
+
+
+def namec_open_blk_file(pack: uint64) -> int32:
+    # Phase 4b: wrap a devblk (mode << 32 | slot) pack in a DEV_BLK pool
+    # chan. The pack is 64-bit so it rides in back_ptr (back_slot is
+    # int32). The caller (fs/vfs.ad _open_blk_marked) resolved the
+    # /dev/blk/<name>{,/size,/ctl} path through devblk_leaf_match
+    # already; the pack is a cookie into the global block-slot table, so
+    # close releases nothing beyond the pool slot. Returns the chan id,
+    # or -1 on pool exhaustion.
+    cs: int32 = _chan_alloc()
+    if cs < 0:
+        return -1
+    su: uint64 = cast[uint64](cs)
+    chan_pool[su].in_use    = 1
+    chan_pool[su].dev_type  = DEV_BLK
+    chan_pool[su].mode      = 2
+    chan_pool[su].back_slot = 0
+    chan_pool[su].back_ptr  = pack
     return cs
 
 
@@ -1771,6 +1859,20 @@ def namec_read(cid: int32, off: uint64, buf: Ptr[uint8],
         # devproc.ad imports namec, so importing back would cycle.
         return devproc_read(cast[uint32](chan_pool[su].back_slot),
                             off, buf, count)
+    if chan_pool[su].dev_type == DEV_AUTH:
+        # Phase 4b: /dev/auth read side — drain the rendered
+        # "ok <uid> <gid>\n" / "denied\n" verdict. devauth_read keeps its
+        # own response_pos cursor inside the AuthSlot, so the chan-level
+        # `off` is deliberately ignored (vfs advances fd_pos harmlessly).
+        # Called by NAME — devauth.ad imports fs.vfs imports namec, so
+        # importing devauth here would cycle.
+        return devauth_read(chan_pool[su].back_slot, buf, count)
+    if chan_pool[su].dev_type == DEV_BLK:
+        # Phase 4b: /dev/blk/<name>{,/size} read. back_ptr carries the
+        # devblk (mode << 32 | slot) pack; off is the RAW-mode byte
+        # cursor (vfs advances fd_pos on return). By-name call (devblk
+        # sits below vfs in the import graph).
+        return devblk_read(chan_pool[su].back_ptr, off, buf, count)
     return _devtab_read(chan_pool[su].dev_type, 0, 0, off, buf, count)
 
 
@@ -1884,6 +1986,17 @@ def namec_write(cid: int32, off: uint64, buf: Ptr[uint8],
         # with -1 + errstr. Called by name (no import — cycle).
         return devproc_write(cast[uint32](chan_pool[su].back_slot),
                              buf, count)
+    if chan_pool[su].dev_type == DEV_AUTH:
+        # Phase 4b: /dev/auth write side — "user <name>\n" /
+        # "pass <plaintext>\n" / "setpass ..." lines parsed into the
+        # AuthSlot; the verify + rate-limit (1 attempt/sec) live inside
+        # devauth_write. Stream-shaped: off ignored. By-name call (cycle).
+        return devauth_write(chan_pool[su].back_slot, buf, count)
+    if chan_pool[su].dev_type == DEV_BLK:
+        # Phase 4b: /dev/blk/<name>{,/ctl} write. RAW writes are
+        # sector-addressed at off; CTL writes parse a format/partition
+        # verb; SIZE writes are rejected inside devblk_write.
+        return devblk_write(chan_pool[su].back_ptr, off, buf, count)
     return _devtab_write(chan_pool[su].dev_type, 0, 0, off, buf, count)
 
 
@@ -1944,6 +2057,16 @@ def namec_close(cid: int32) -> int32:
         # shares this kfree-on-last-ref release.
         if chan_pool[su].back_ptr != 0:
             kfree(chan_pool[su].back_ptr)
+    elif chan_pool[su].dev_type == DEV_AUTH:
+        # Phase 4b: return the AuthSlot to the devauth pool. devauth_close
+        # zeroes the pass_buf so plaintext doesn't linger in kernel memory
+        # past the last fd's lifetime. Because this runs on the LAST
+        # reference only, a fork/dup'd auth fd no longer yanks the slot
+        # out from under its sibling (the legacy FD_AUTH_MARK close arm
+        # freed on the FIRST close), and a task that exits holding the fd
+        # reaches here through close_fd_in_task — the legacy exit path
+        # leaked the slot outright. By-name call (import cycle).
+        devauth_close(chan_pool[su].back_slot)
     _chan_free(cid)
     return 0
 
