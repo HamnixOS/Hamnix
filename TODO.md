@@ -186,12 +186,16 @@ replaces the ~70 `is_*_path` backend-selection branches).
    **MATE GAP ANALYSIS (2026-06-10).** DE is far more complete than a naive read
    suggests (marco-class WM, mate-panel menubar/pager/window-list, clipman,
    control-center, notification history all exist). Real gaps, prioritized:
-   most-disjoint NEW apps / toolkit-only → screenshot tool (`hamshot`, needs a
-   small fb-grab hook; agent in flight), image viewer (DONE: hamview),
-   file-chooser + modal-alert dialog widgets (DONE: 30764cdd), tooltip support
-   (DONE: 8661dabc), calendar popup/widget (DONE: 19db22e0; embedded in
-   hamclock) — all compile-verified, not yet VM-verified. hamsh `hamui` builtin
-   verbs for the new widgets: agent in flight. hamUId.ad-touching → real volume/battery/network applets (model
+   most-disjoint NEW apps / toolkit-only → screenshot tool (DONE: hamshot +
+   /dev/fbpix pixel read-back leaf, ec34fc41, VM-verified end-to-end), image
+   viewer (DONE: hamview), file-chooser + modal-alert dialog widgets (DONE:
+   30764cdd), tooltip support (DONE: 8661dabc), calendar popup/widget (DONE:
+   19db22e0; embedded in hamclock), hamsh `hamui` builtin verbs for dialogs/
+   tooltips/calendar (DONE: 99e7e058) — widgets compile-verified, not yet
+   VM-verified. Compositor perf prereqs LANDED + VM-verified: /dev/wsys gen
+   leaf + SYS_WAITFDS(313) (28741f0b) — next: hamUId consumes gen+waitfds to
+   kill the busy-poll main loop + every-8-frames re-rasterize.
+   hamUId.ad-touching → real volume/battery/network applets (model
    values today; needs real backends), Display/Mouse/keyboard-layout settings
    panels, external notification + system-tray client-registration API, image
    wallpaper, screensaver+password-lock, real session save/restore, inter-app
