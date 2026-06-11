@@ -160,10 +160,12 @@ QEMU_PID=$!
 exec 3> "$FIFO"
 
 wait_for() {
-    # wait_for <pattern> <seconds> — poll the serial log.
+    # wait_for <pattern> <seconds> — poll the serial log. -F: every
+    # marker is a LITERAL string ("[live-root] DONE" must not parse as
+    # a bracket expression — that regex can never match the log line).
     local pat="$1" secs="$2" i
     for i in $(seq 1 "$secs"); do
-        if grep -a -q "$pat" "$LOG"; then
+        if grep -a -F -q "$pat" "$LOG"; then
             return 0
         fi
         if ! kill -0 "$QEMU_PID" 2>/dev/null; then
@@ -184,7 +186,7 @@ send_until() {
         printf '%s\n' "$cmd" >&3
         local i
         for i in $(seq 1 15); do
-            if grep -a -q "$pat" "$LOG"; then
+            if grep -a -F -q "$pat" "$LOG"; then
                 return 0
             fi
             if ! kill -0 "$QEMU_PID" 2>/dev/null; then
@@ -195,7 +197,7 @@ send_until() {
             [ "$waited" -ge "$secs" ] && break
         done
     done
-    grep -a -q "$pat" "$LOG"
+    grep -a -F -q "$pat" "$LOG"
 }
 
 fail=0
