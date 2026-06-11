@@ -680,7 +680,7 @@ from mm.vma import (
 # the same physical write the raw deref used to do.
 from mm.uaccess import (
     copy_to_user, copy_from_user,
-    get_user_64, put_user_16, put_user_32, put_user_64,
+    get_user_8, get_user_64, put_user_16, put_user_32, put_user_64,
     strncpy_from_user,
     # splice self-test: stand up a real vaddr!=phys user mapping so the
     # vmsplice copy_from_user gather path is exercised against genuine
@@ -1528,6 +1528,102 @@ def _u_copyin_path(uptr: uint64, kdst: Ptr[uint8]) -> int64:
     return 0
 
 
+# #163: shared uaccess helpers for the Linux-ABI handler surface.
+#
+# The bulk read/write data path bounces through a 4 KiB kernel stack
+# buffer (the same grain the native SYS_READ/SYS_WRITE dispatch uses):
+# copy_from_user fetches the user bytes through the CURRENT task's page
+# tables, copy_to_user lands results the same way, so the handlers stay
+# correct when a user page is backed by a non-identity frame (ASLR /
+# swapped / COW'd). A faulting user pointer is -EFAULT, never a wedge.
+U_L_BOUNCE: uint64 = 4096
+
+
+def _u_user_first_byte(uptr: uint64) -> int32:
+    # First byte of a user string, fetched through the page tables.
+    # Returns 0..255, or -1 on a NULL / faulting pointer. Used by the
+    # *at() handlers' "is the path absolute?" probe — a bad pointer
+    # reads as "not absolute" and the downstream _u_copyin_path then
+    # reports the -EFAULT.
+    if uptr == 0:
+        return -1
+    fb: uint8 = 0
+    if get_user_8(uptr, &fb) != 0:
+        return -1
+    return cast[int32](fb)
+
+
+def _u_copyout_rc(uaddr: uint64, kbuf: Ptr[uint8], rc: int64) -> int64:
+    # Land `rc` bytes from a kernel bounce at the user buffer. Negative
+    # / zero rc values (errnos, EOF, would-block) pass through untouched
+    # so call sites can keep their existing rc plumbing. A partial
+    # copy-out reports the bytes that actually landed (the consumed
+    # source bytes are gone — same hazard Linux has); a total fault is
+    # -EFAULT.
+    if rc <= 0:
+        return rc
+    resid: uint64 = copy_to_user(uaddr, cast[uint64](kbuf),
+                                 cast[uint64](rc))
+    if resid == 0:
+        return rc
+    copied: uint64 = cast[uint64](rc) - resid
+    if copied == 0:
+        return ELINUX_EFAULT
+    return cast[int64](copied)
+
+
+def _u_vfs_read_user(fd: int32, ubuf: uint64, count: uint64) -> int64:
+    # Blocking read(2) tail: vfs_read into a kernel bounce, then
+    # copy_to_user. read(2) returns as soon as ANY data is available,
+    # so one bounce-sized vfs_read is the correct shape — a count
+    # larger than the bounce legally short-reads at 4 KiB.
+    rn: uint64 = count
+    if rn > U_L_BOUNCE:
+        rn = U_L_BOUNCE
+    rkb: Array[4096, uint8]
+    n: int64 = vfs_read(fd, cast[Ptr[uint8]](&rkb[0]), rn)
+    return _u_copyout_rc(ubuf, &rkb[0], n)
+
+
+def _u_vfs_write_user(fd: int32, ubuf: uint64, count: uint64) -> int64:
+    # write(2) tail: chunked copy_from_user + vfs_write loop so a
+    # >4 KiB write still transfers in full. A short vfs_write (pipe
+    # back-pressure) stops the loop and returns the partial count —
+    # standard write(2) semantics. A first-chunk errno (incl. EPIPE,
+    # which the call sites watch for SIGPIPE) propagates verbatim.
+    total: uint64 = 0
+    left: uint64 = count
+    u: uint64 = ubuf
+    wkb: Array[4096, uint8]
+    while left > 0:
+        chunk: uint64 = left
+        if chunk > U_L_BOUNCE:
+            chunk = U_L_BOUNCE
+        if copy_from_user(cast[uint64](&wkb[0]), u, chunk) != 0:
+            if total == 0:
+                return ELINUX_EFAULT
+            return cast[int64](total)
+        wn: int64 = vfs_write(fd, cast[Ptr[uint8]](&wkb[0]), chunk)
+        if wn < 0:
+            if total == 0:
+                return wn
+            return cast[int64](total)
+        total = total + cast[uint64](wn)
+        if cast[uint64](wn) < chunk:
+            return cast[int64](total)
+        left = left - chunk
+        u = u + chunk
+    return cast[int64](total)
+
+
+def _u_copyin_sockaddr16(uaddr: uint64, kdst: Ptr[uint8]) -> int64:
+    # Stage a 16-byte struct sockaddr_in from user space into a kernel
+    # buffer so the parse below never raw-derefs the user pointer.
+    if copy_from_user(cast[uint64](kdst), uaddr, 16) != 0:
+        return ELINUX_EFAULT
+    return 0
+
+
 # =====================================================================
 # Forwarders to Hamnix native primitives
 # =====================================================================
@@ -1557,11 +1653,12 @@ def _u_read(a0: uint64, a1: uint64, a2: uint64,
 
 def _u_read_body(a0: uint64, a1: uint64, a2: uint64,
                  a3: uint64, a4: uint64, a5: uint64) -> int64:
-    # #163 FOLLOW-UP: the data buffer (a1) is still passed raw into
-    # vfs_read/vfs_read_nb/utermios_console_read, which write it directly.
-    # Routing the bulk data path through copy_to_user needs a chunked
-    # kernel bounce buffer threaded into every vfs_read backend; deferred
-    # to keep this pass low-risk. access_ok already range-checks a1 here.
+    # #163: the bulk data path goes through a kernel bounce buffer +
+    # copy_to_user (_u_vfs_read_user / _u_copyout_rc) — vfs_read and
+    # friends only ever see kernel pointers now. The Layer-2 leaf
+    # helpers (nl_recv, afunix_*, uperf_read, uffd_read, uino_read,
+    # _fan_read, signalfd) already do their own copy_to_user
+    # internally, so they keep receiving the raw user address.
     fd: int32 = cast[int32](a0)
     marker: uint32 = vfs_fd_marker(fd)
     nonblock: int32 = _u_fd_is_nonblock(fd)
@@ -1676,18 +1773,24 @@ def _u_read_body(a0: uint64, a1: uint64, a2: uint64,
                 ready = utfd_readable(ts)
             if ready == 0:
                 return ELINUX_AGAIN
-        return vfs_read(fd, cast[Ptr[uint8]](a1), a2)
+        return _u_vfs_read_user(fd, a1, a2)
     # §5: O_NONBLOCK end-to-end. A would-block read on a non-blocking
     # socket / pipe fd must return -EAGAIN rather than yield-spinning in
     # vfs_read's blocking loop. vfs_read_nb returns >0 bytes ready,
     # 0 for would-block, -1 for a true EOF. We translate 0 -> -EAGAIN.
     if nonblock != 0:
-        nb: int64 = vfs_read_nb(fd, cast[Ptr[uint8]](a1), a2)
+        # #163: fill a kernel bounce, then copy_to_user. The 0 (would-
+        # block) / negative (EOF) cases never touch the user buffer.
+        rnb_cap: uint64 = a2
+        if rnb_cap > U_L_BOUNCE:
+            rnb_cap = U_L_BOUNCE
+        rnb_kb: Array[4096, uint8]
+        nb: int64 = vfs_read_nb(fd, cast[Ptr[uint8]](&rnb_kb[0]), rnb_cap)
         if nb == 0:
             return ELINUX_AGAIN
         if nb < 0:
             return 0                       # vfs_read_nb -1 == EOF
-        return nb
+        return _u_copyout_rc(a1, &rnb_kb[0], nb)
     # #164: a blocking read on a console-backed fd (an interactive
     # `enter linux { … }` guest's stdin) routes through the termios line
     # discipline — cooked-mode line editing + echo by default, raw bytes
@@ -1695,9 +1798,16 @@ def _u_read_body(a0: uint64, a1: uint64, a2: uint64,
     # actually reach (and be echoed for) the Linux guest. Pipes / files /
     # sockets are untouched: they keep the plain vfs_read path below.
     if vfs_fd_is_console(fd) != 0:
-        return utermios_console_read(cast[Ptr[uint8]](a1), a2)
-    n: int64 = vfs_read(fd, cast[Ptr[uint8]](a1), a2)
-    return n
+        # #163: the line discipline fills a kernel bounce; copy_to_user
+        # lands the cooked/raw bytes at the user buffer afterwards.
+        tc_cap: uint64 = a2
+        if tc_cap > U_L_BOUNCE:
+            tc_cap = U_L_BOUNCE
+        tc_kb: Array[4096, uint8]
+        tn: int64 = utermios_console_read(cast[Ptr[uint8]](&tc_kb[0]),
+                                          tc_cap)
+        return _u_copyout_rc(a1, &tc_kb[0], tn)
+    return _u_vfs_read_user(fd, a1, a2)
 
 
 def _u_write(a0: uint64, a1: uint64, a2: uint64,
@@ -1732,10 +1842,10 @@ def _u_write_body(a0: uint64, a1: uint64, a2: uint64,
     # pipe / socket fd must return -EAGAIN rather than yield-spinning in
     # vfs_write's blocking loop. vfs_write_nb returns >0 bytes accepted,
     # 0 for would-block, or a negative errno; 0 maps to -EAGAIN.
-    # #163 FOLLOW-UP: the data buffer (a1) is still passed raw into
-    # vfs_write/vfs_write_nb (the bulk data path); routing it through
-    # copy_from_user needs a chunked kernel bounce buffer in every vfs
-    # write backend — deferred. access_ok range-checks a1 at the gate.
+    # #163: the bulk data path stages through a kernel bounce buffer
+    # via copy_from_user (_u_vfs_write_user) — vfs_write/vfs_write_nb
+    # only ever see kernel pointers now. nl_send / afunix_* do their
+    # own copy_from_user internally and keep the raw user address.
     fd: int32 = cast[int32](a0)
     # AF_NETLINK: write(2) of nlmsghdr-framed request(s) builds + queues
     # the matching dump, same as send. Intercept before any vfs routing.
@@ -1765,11 +1875,21 @@ def _u_write_body(a0: uint64, a1: uint64, a2: uint64,
         return wr_sn
     n: int64 = 0
     if _u_fd_is_nonblock(fd) != 0:
-        n = vfs_write_nb(fd, cast[Ptr[uint8]](a1), a2)
+        # #163: stage one bounce-sized chunk via copy_from_user. A
+        # non-blocking write may legally accept fewer bytes than asked,
+        # so a single capped chunk is the correct shape.
+        wnb_cap: uint64 = a2
+        if wnb_cap > U_L_BOUNCE:
+            wnb_cap = U_L_BOUNCE
+        wnb_kb: Array[4096, uint8]
+        if wnb_cap != 0:
+            if copy_from_user(cast[uint64](&wnb_kb[0]), a1, wnb_cap) != 0:
+                return ELINUX_EFAULT
+        n = vfs_write_nb(fd, cast[Ptr[uint8]](&wnb_kb[0]), wnb_cap)
         if n == 0 and a2 != 0:
             return ELINUX_AGAIN
     else:
-        n = vfs_write(fd, cast[Ptr[uint8]](a1), a2)
+        n = _u_vfs_write_user(fd, a1, a2)
     if n == ELINUX_PIPE:
         signal_post(current_idx_get(), SIGPIPE)
     return n
@@ -2303,8 +2423,13 @@ def _u_pselect6(a0: uint64, a1: uint64, a2: uint64,
     bounded: int32 = 1
     tj: uint64 = UEP_WAIT_MAX_JIFFIES
     if a4 != 0:
-        sec:  uint64 = cast[Ptr[uint64]](a4)[0]
-        nsec: uint64 = cast[Ptr[uint64]](a4 + 8)[0]
+        # #163: fetch the user timespec through the page tables.
+        sec:  uint64 = 0
+        nsec: uint64 = 0
+        if get_user_64(a4, &sec) != 0:
+            return ELINUX_EFAULT
+        if get_user_64(a4 + 8, &nsec) != 0:
+            return ELINUX_EFAULT
         if sec == 0 and nsec == 0:
             bounded = 0
         else:
@@ -2784,7 +2909,7 @@ def _u_mkdirat(a0: uint64, a1: uint64, a2: uint64,
                a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int mkdirat(int dirfd, const char *pathname, mode_t mode)
     is_abs: int32 = 0
-    if a1 != 0 and cast[Ptr[uint8]](a1)[0] == 47:
+    if _u_user_first_byte(a1) == 47:                    # leading '/'
         is_abs = 1
     if a0 != AT_FDCWD_U64 and is_abs == 0:
         return ELINUX_NOSYS
@@ -2798,7 +2923,7 @@ def _u_unlinkat(a0: uint64, a1: uint64, a2: uint64,
     # land on vfs_unlink here (the VFS removes the dirent either way at
     # this milestone). AT_FDCWD / absolute only — see the block comment.
     is_abs: int32 = 0
-    if a1 != 0 and cast[Ptr[uint8]](a1)[0] == 47:
+    if _u_user_first_byte(a1) == 47:                    # leading '/'
         is_abs = 1
     if a0 != AT_FDCWD_U64 and is_abs == 0:
         return ELINUX_NOSYS
@@ -2856,7 +2981,7 @@ def _u_symlinkat(a0: uint64, a1: uint64, a2: uint64,
     # resolve_path already anchors a relative linkpath at the task cwd,
     # which is the AT_FDCWD behaviour. (target is never anchored.)
     is_abs: int32 = 0
-    if a2 != 0 and cast[Ptr[uint8]](a2)[0] == 47:
+    if _u_user_first_byte(a2) == 47:                    # leading '/'
         is_abs = 1
     if a1 != AT_FDCWD_U64 and is_abs == 0:
         return ELINUX_NOSYS
@@ -2907,10 +3032,10 @@ def _u_linkat(a0: uint64, a1: uint64, a2: uint64,
     # per-symlink no-follow distinction on hardlink creation); other flag
     # bits are ignored rather than failing the common AT_FDCWD ln(1) call.
     old_is_abs: int32 = 0
-    if a1 != 0 and cast[Ptr[uint8]](a1)[0] == 47:
+    if _u_user_first_byte(a1) == 47:                    # leading '/'
         old_is_abs = 1
     new_is_abs: int32 = 0
-    if a3 != 0 and cast[Ptr[uint8]](a3)[0] == 47:
+    if _u_user_first_byte(a3) == 47:                    # leading '/'
         new_is_abs = 1
     if a0 != AT_FDCWD_U64 and old_is_abs == 0:
         return ELINUX_NOSYS
@@ -2972,7 +3097,7 @@ def _u_utimensat(a0: uint64, a1: uint64, a2: uint64,
     # tv_nsec == UTIME_OMIT  -> that field unchanged.
     # AT_FDCWD / absolute only (resolve_path anchors relatives at cwd).
     is_abs: int32 = 0
-    if a1 != 0 and cast[Ptr[uint8]](a1)[0] == 47:
+    if _u_user_first_byte(a1) == 47:                    # leading '/'
         is_abs = 1
     if a0 != AT_FDCWD_U64 and is_abs == 0:
         return ELINUX_NOSYS
@@ -3015,7 +3140,7 @@ def _u_futimesat(a0: uint64, a1: uint64, a2: uint64,
     # struct timeval is {tv_sec, tv_usec} — 16 bytes per entry; mtime is
     # times[1] at offset 16. NULL times -> set to now. AT_FDCWD / absolute.
     is_abs: int32 = 0
-    if a1 != 0 and cast[Ptr[uint8]](a1)[0] == 47:
+    if _u_user_first_byte(a1) == 47:                    # leading '/'
         is_abs = 1
     if a0 != AT_FDCWD_U64 and is_abs == 0:
         return ELINUX_NOSYS
@@ -3090,8 +3215,14 @@ def _u_chmod(a0: uint64, a1: uint64, a2: uint64,
     # int chmod(const char *path, mode_t mode)
     if a0 == 0:
         return ELINUX_INVAL
+    # #163: copy the user path into a kernel scratch before resolve_path.
+    ch_path: Array[256, uint8]
+    ch_pin: int64 = _u_copyin_path(a0, &ch_path[0])
+    if ch_pin != 0:
+        return ch_pin
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&ch_path[0]),
+                             &abs_path[0], 256)
     if rc != 0:
         return ELINUX_NOENT
     fd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
@@ -3113,7 +3244,7 @@ def _u_fchmodat(a0: uint64, a1: uint64, a2: uint64,
                 a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int fchmodat(int dirfd, const char *path, mode_t mode, int flags)
     is_abs: int32 = 0
-    if a1 != 0 and cast[Ptr[uint8]](a1)[0] == 47:
+    if _u_user_first_byte(a1) == 47:                    # leading '/'
         is_abs = 1
     if a0 != AT_FDCWD_U64 and is_abs == 0:
         return ELINUX_NOSYS
@@ -3135,8 +3266,14 @@ def _u_chown(a0: uint64, a1: uint64, a2: uint64,
     # we have no symlinks to differentiate the no-follow variant).
     if a0 == 0:
         return ELINUX_INVAL
+    # #163: copy the user path into a kernel scratch before resolve_path.
+    co_path: Array[256, uint8]
+    co_pin: int64 = _u_copyin_path(a0, &co_path[0])
+    if co_pin != 0:
+        return co_pin
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&co_path[0]),
+                             &abs_path[0], 256)
     if rc != 0:
         return ELINUX_NOENT
     fd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
@@ -3159,10 +3296,10 @@ def _u_fchownat(a0: uint64, a1: uint64, a2: uint64,
     # int fchownat(int dirfd, const char *path, uid_t, gid_t, int flags)
     # AT_EMPTY_PATH (0x1000) with an empty path means "operate on dirfd
     # itself" — treat it as fchown(dirfd).
-    if (a4 & 0x1000) != 0 and (a1 == 0 or cast[Ptr[uint8]](a1)[0] == 0):
+    if (a4 & 0x1000) != 0 and (a1 == 0 or _u_user_first_byte(a1) <= 0):
         return _u_fchown(a0, a2, a3, 0, 0, 0)
     is_abs: int32 = 0
-    if a1 != 0 and cast[Ptr[uint8]](a1)[0] == 47:
+    if _u_user_first_byte(a1) == 47:                    # leading '/'
         is_abs = 1
     if a0 != AT_FDCWD_U64 and is_abs == 0:
         return ELINUX_NOSYS
@@ -3950,7 +4087,12 @@ def _u_connect(a0: uint64, a1: uint64, a2: uint64,
         if a2 < 16:
             set_current_errstr("connect: addrlen too short for sockaddr_in")
             return ELINUX_INVAL
-        uaddr: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        # #163: stage the sockaddr_in through a kernel copy.
+        ucsa: Array[16, uint8]
+        if _u_copyin_sockaddr16(a1, &ucsa[0]) != 0:
+            set_current_errstr("connect: bad sockaddr pointer")
+            return ELINUX_EFAULT
+        uaddr: Ptr[uint8] = cast[Ptr[uint8]](&ucsa[0])
         ufam: uint32 = cast[uint32](uaddr[0]) \
                      | (cast[uint32](uaddr[1]) << 8)
         if ufam != USOCK_AF_INET:
@@ -3986,7 +4128,12 @@ def _u_connect(a0: uint64, a1: uint64, a2: uint64,
         # sockaddr_in is 16 bytes — a shorter addrlen can't hold one.
         set_current_errstr("connect: addrlen too short for sockaddr_in")
         return ELINUX_INVAL
-    addr: Ptr[uint8] = cast[Ptr[uint8]](a1)
+    # #163: stage the sockaddr_in through a kernel copy.
+    csa: Array[16, uint8]
+    if _u_copyin_sockaddr16(a1, &csa[0]) != 0:
+        set_current_errstr("connect: bad sockaddr pointer")
+        return ELINUX_EFAULT
+    addr: Ptr[uint8] = cast[Ptr[uint8]](&csa[0])
     # sin_family — two host-order bytes, little-endian on x86_64.
     sin_family: uint32 = cast[uint32](addr[0]) \
                        | (cast[uint32](addr[1]) << 8)
@@ -4112,16 +4259,15 @@ def _u_tls_connect(a0: uint64, a1: uint64, a2: uint64,
     if hlen >= U_TLS_HOST_MAX:
         set_current_errstr("tls_connect: hostname too long")
         return ELINUX_INVAL
-    src: Ptr[uint8] = cast[Ptr[uint8]](a1)
-    i: uint64 = 0
-    while i < hlen:
-        b: uint8 = src[i]
-        if b == 0:
-            break
-        u_tls_host_buf[i] = b
-        i = i + 1
-    u_tls_host_buf[i] = 0
-    if i == 0:
+    # #163: strncpy_from_user walks the page tables, stops at an
+    # embedded NUL, and NUL-terminates the kernel copy — capped at
+    # hlen bytes (the caller's advisory length).
+    hr: int64 = strncpy_from_user(cast[uint64](&u_tls_host_buf[0]),
+                                  a1, hlen + 1)
+    if hr < 0:
+        set_current_errstr("tls_connect: bad hostname pointer")
+        return ELINUX_EFAULT
+    if hr == 0:
         set_current_errstr("tls_connect: empty hostname")
         return ELINUX_INVAL
     printk1("[u_tls] tls_connect fd=%d", cast[uint64](fd))
@@ -4193,11 +4339,19 @@ def _u_accept(a0: uint64, a1: uint64, a2: uint64,
         # Peer sockaddr_un out-param: AF_UNIX accepted peers are unnamed,
         # so report an addrlen of 2 (family only) when a buffer is given.
         if a1 != 0:
-            ua: Ptr[uint8] = cast[Ptr[uint8]](a1)
-            ua[0] = cast[uint8](AFU_AF_UNIX & 0xFF)
-            ua[1] = cast[uint8]((AFU_AF_UNIX >> 8) & 0xFF)
+            # #163: build the 2-byte family in kernel space, then
+            # copy_to_user it (fault => -EFAULT, fd already installed —
+            # close it so the caller doesn't leak a slot).
+            uxa: Array[2, uint8]
+            uxa[0] = cast[uint8](AFU_AF_UNIX & 0xFF)
+            uxa[1] = cast[uint8]((AFU_AF_UNIX >> 8) & 0xFF)
+            if copy_to_user(a1, cast[uint64](&uxa[0]), 2) != 0:
+                vfs_close(nufd)
+                return ELINUX_EFAULT
         if a2 != 0:
-            cast[Ptr[uint32]](a2)[0] = 2
+            if put_user_32(2, a2) != 0:
+                vfs_close(nufd)
+                return ELINUX_EFAULT
         return cast[int64](nufd)
     if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
@@ -4268,15 +4422,21 @@ def _u_accept(a0: uint64, a1: uint64, a2: uint64,
     # the family is reported faithfully (AF_INET) but ip/port come back
     # zero — matching the getpeername stub. addrlen is set to 16.
     if a1 != 0:
-        pa: Ptr[uint8] = cast[Ptr[uint8]](a1)
-        pa[0] = cast[uint8](USOCK_AF_INET & 0xFF)
-        pa[1] = cast[uint8]((USOCK_AF_INET >> 8) & 0xFF)
+        # #163: assemble the sockaddr_in in kernel space, copy_to_user.
+        pka: Array[16, uint8]
+        pka[0] = cast[uint8](USOCK_AF_INET & 0xFF)
+        pka[1] = cast[uint8]((USOCK_AF_INET >> 8) & 0xFF)
         i: uint64 = 2
         while i < 16:
-            pa[i] = 0
+            pka[i] = 0
             i = i + 1
+        if copy_to_user(a1, cast[uint64](&pka[0]), 16) != 0:
+            vfs_close(nfd)
+            return ELINUX_EFAULT
     if a2 != 0:
-        cast[Ptr[uint32]](a2)[0] = 16
+        if put_user_32(16, a2) != 0:
+            vfs_close(nfd)
+            return ELINUX_EFAULT
     printk2("[u_socket] accept: /net listener conn=%d -> conn=%d\n",
             cast[uint64](lconn), cast[uint64](conn_net))
     printk1("[u_socket] accept: new fd=%d\n", cast[uint64](nfd))
@@ -4336,7 +4496,12 @@ def _u_bind(a0: uint64, a1: uint64, a2: uint64,
         if a2 < 16:
             set_current_errstr("bind: addrlen too short for sockaddr_in")
             return ELINUX_INVAL
-        ua: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        # #163: stage the sockaddr_in through a kernel copy.
+        ubsa: Array[16, uint8]
+        if _u_copyin_sockaddr16(a1, &ubsa[0]) != 0:
+            set_current_errstr("bind: bad sockaddr pointer")
+            return ELINUX_EFAULT
+        ua: Ptr[uint8] = cast[Ptr[uint8]](&ubsa[0])
         ufam: uint32 = cast[uint32](ua[0]) | (cast[uint32](ua[1]) << 8)
         if ufam != USOCK_AF_INET:
             set_current_errstr("bind: sockaddr family not AF_INET")
@@ -4366,7 +4531,12 @@ def _u_bind(a0: uint64, a1: uint64, a2: uint64,
     if a2 < 16:
         set_current_errstr("bind: addrlen too short for sockaddr_in")
         return ELINUX_INVAL
-    addr: Ptr[uint8] = cast[Ptr[uint8]](a1)
+    # #163: stage the sockaddr_in through a kernel copy.
+    bsa: Array[16, uint8]
+    if _u_copyin_sockaddr16(a1, &bsa[0]) != 0:
+        set_current_errstr("bind: bad sockaddr pointer")
+        return ELINUX_EFAULT
+    addr: Ptr[uint8] = cast[Ptr[uint8]](&bsa[0])
     sin_family: uint32 = cast[uint32](addr[0]) \
                        | (cast[uint32](addr[1]) << 8)
     if sin_family != USOCK_AF_INET:
@@ -4463,7 +4633,8 @@ def _u_getsockname(a0: uint64, a1: uint64, a2: uint64,
     if vfs_fd_is_socket(cast[int32](a0)) == 0:
         return ELINUX_BADF
     if a2 != 0:
-        cast[Ptr[uint32]](a2)[0] = 0
+        if put_user_32(0, a2) != 0:                     # #163
+            return ELINUX_EFAULT
     return 0
 
 
@@ -4475,7 +4646,8 @@ def _u_getpeername(a0: uint64, a1: uint64, a2: uint64,
     if vfs_fd_is_socket(cast[int32](a0)) == 0:
         return ELINUX_BADF
     if a2 != 0:
-        cast[Ptr[uint32]](a2)[0] = 0
+        if put_user_32(0, a2) != 0:                     # #163
+            return ELINUX_EFAULT
     return 0
 
 
@@ -4508,7 +4680,9 @@ def _u_setsockopt(a0: uint64, a1: uint64, a2: uint64,
         return ELINUX_INVAL
     if a4 < 4:
         return ELINUX_INVAL
-    value: uint32 = cast[Ptr[uint32]](a3)[0]
+    value: uint32 = 0
+    if get_user_32(a3, &value) != 0:                    # #163
+        return ELINUX_EFAULT
     if usock_set_opt(rec, level, optname, value) != 0:
         set_current_errstr("setsockopt: unsupported option")
         return ELINUX_NOPROTOOPT
@@ -4544,8 +4718,12 @@ def _u_getsockopt(a0: uint64, a1: uint64, a2: uint64,
         return ELINUX_INVAL
     if a4 == 0:
         return ELINUX_INVAL
-    # The caller's *optlen must be able to hold an int.
-    if cast[Ptr[uint32]](a4)[0] < 4:
+    # The caller's *optlen must be able to hold an int. #163: fetched
+    # through the page tables.
+    gso_len: uint32 = 0
+    if get_user_32(a4, &gso_len) != 0:
+        return ELINUX_EFAULT
+    if gso_len < 4:
         return ELINUX_INVAL
     level:   uint32 = cast[uint32](a1)
     optname: uint32 = cast[uint32](a2)
@@ -4564,15 +4742,19 @@ def _u_getsockopt(a0: uint64, a1: uint64, a2: uint64,
                     result = uerr
             else:
                 result = 0
-            cast[Ptr[uint32]](a3)[0] = cast[uint32](result)
-            cast[Ptr[uint32]](a4)[0] = 4
+            if put_user_32(cast[uint32](result), a3) != 0:   # #163
+                return ELINUX_EFAULT
+            if put_user_32(4, a4) != 0:
+                return ELINUX_EFAULT
             return 0
     got: int32 = usock_get_opt(rec, level, optname)
     if got < 0:
         set_current_errstr("getsockopt: unsupported option")
         return ELINUX_NOPROTOOPT
-    cast[Ptr[uint32]](a3)[0] = cast[uint32](got)
-    cast[Ptr[uint32]](a4)[0] = 4
+    if put_user_32(cast[uint32](got), a3) != 0:              # #163
+        return ELINUX_EFAULT
+    if put_user_32(4, a4) != 0:
+        return ELINUX_EFAULT
     return 0
 
 
@@ -4638,7 +4820,15 @@ def _u_socketpair(a0: uint64, a1: uint64, a2: uint64,
         return 0
     # AF_INET / other: forward to vfs_pipe — a kernel pipe pair models a
     # bidirectional fd pair cleanly enough for the legacy probe path.
-    rc: int32 = vfs_pipe(cast[Ptr[int32]](a3))
+    # #163: vfs_pipe writes its int[2] into a kernel scratch; the result
+    # is then copy_to_user'd (a faulting sv pointer closes both fds).
+    spk: Array[2, int32]
+    rc: int32 = vfs_pipe(cast[Ptr[int32]](&spk[0]))
+    if rc == 0:
+        if copy_to_user(a3, cast[uint64](&spk[0]), 8) != 0:
+            vfs_close(spk[0])
+            vfs_close(spk[1])
+            return ELINUX_EFAULT
     return cast[int64](rc)
 
 
@@ -4691,7 +4881,12 @@ def _u_sendto(a0: uint64, a1: uint64, a2: uint64,
                 if a5 < 16:
                     set_current_errstr("sendto: addrlen too short")
                     return ELINUX_INVAL
-                da: Ptr[uint8] = cast[Ptr[uint8]](a4)
+                # #163: stage the sockaddr_in through a kernel copy.
+                dsa: Array[16, uint8]
+                if _u_copyin_sockaddr16(a4, &dsa[0]) != 0:
+                    set_current_errstr("sendto: bad sockaddr pointer")
+                    return ELINUX_EFAULT
+                da: Ptr[uint8] = cast[Ptr[uint8]](&dsa[0])
                 dfam: uint32 = cast[uint32](da[0]) \
                              | (cast[uint32](da[1]) << 8)
                 if dfam != USOCK_AF_INET:
@@ -4710,9 +4905,23 @@ def _u_sendto(a0: uint64, a1: uint64, a2: uint64,
                 if dst_ip == 0:
                     set_current_errstr("sendto: no peer (connect first)")
                     return ELINUX_NOTCONN
+            # #163: stage the datagram payload through a kernel bounce.
+            # The bounce (4 KiB) exceeds any UDP-over-Ethernet MTU, so
+            # an over-bounce datagram would have been -EMSGSIZE anyway;
+            # the cap preserves that answer.
+            uds_n: uint64 = a2
+            if uds_n > U_L_BOUNCE:
+                uds_n = U_L_BOUNCE
+            uds_kb: Array[4096, uint8]
+            if uds_n != 0:
+                if copy_from_user(cast[uint64](&uds_kb[0]), a1,
+                                  uds_n) != 0:
+                    set_current_errstr("sendto: bad buffer pointer")
+                    return ELINUX_EFAULT
             usn: int64 = udp_socket_sendto(uslot, dst_ip,
                                            cast[uint16](dst_port & 0xFFFF),
-                                           cast[Ptr[uint8]](a1), a2)
+                                           cast[Ptr[uint8]](&uds_kb[0]),
+                                           uds_n)
             if usn == -90:
                 set_current_errstr("sendto: datagram too large")
                 return ELINUX_MSGSIZE
@@ -4725,7 +4934,8 @@ def _u_sendto(a0: uint64, a1: uint64, a2: uint64,
     # §3: SIGPIPE on a send to a peer that has gone away — same
     # contract as write(2). vfs_write's FD_SOCKET_MARK arm returns
     # -EPIPE when the TCP slot is CLOSED / unconnected.
-    sn: int64 = vfs_write(fd, cast[Ptr[uint8]](a1), a2)
+    # #163: bounce-staged through copy_from_user.
+    sn: int64 = _u_vfs_write_user(fd, a1, a2)
     if sn == ELINUX_PIPE:
         signal_post(current_idx_get(), SIGPIPE)
     return sn
@@ -4757,15 +4967,19 @@ def _u_recvfrom(a0: uint64, a1: uint64, a2: uint64,
                 nrn = nl_recv(nlep_r, a1, a2)
         if a4 != 0:
             # sockaddr_nl source: family AF_NETLINK, nl_pid 0 (kernel).
-            na: Ptr[uint8] = cast[Ptr[uint8]](a4)
-            na[0] = cast[uint8](NL_AF_NETLINK & 0xFF)
-            na[1] = cast[uint8]((NL_AF_NETLINK >> 8) & 0xFF)
+            # #163: assembled in kernel space, then copy_to_user'd.
+            nka: Array[12, uint8]
+            nka[0] = cast[uint8](NL_AF_NETLINK & 0xFF)
+            nka[1] = cast[uint8]((NL_AF_NETLINK >> 8) & 0xFF)
             naz: uint64 = 2
             while naz < 12:
-                na[naz] = 0
+                nka[naz] = 0
                 naz = naz + 1
+            if copy_to_user(a4, cast[uint64](&nka[0]), 12) != 0:
+                return ELINUX_EFAULT
             if a5 != 0:
-                cast[Ptr[uint32]](a5)[0] = 12
+                if put_user_32(12, a5) != 0:
+                    return ELINUX_EFAULT
         return nrn
     # AF_UNIX: a DGRAM endpoint dequeues one datagram; a STREAM endpoint
     # degrades to read(2).
@@ -4784,12 +4998,14 @@ def _u_recvfrom(a0: uint64, a1: uint64, a2: uint64,
             # caller's addrlen so it reads no uninitialised bytes.
             if a4 != 0:
                 if a5 != 0:
-                    cast[Ptr[uint32]](a5)[0] = 0
+                    if put_user_32(0, a5) != 0:         # #163
+                        return ELINUX_EFAULT
             return urn
         # STREAM recvfrom degrades to read(2) — route via _u_read.
         if a4 != 0:
             if a5 != 0:
-                cast[Ptr[uint32]](a5)[0] = 0
+                if put_user_32(0, a5) != 0:             # #163
+                    return ELINUX_EFAULT
         return _u_read(a0, a1, a2, 0, 0, 0)
     if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
@@ -4799,8 +5015,13 @@ def _u_recvfrom(a0: uint64, a1: uint64, a2: uint64,
             uslot: int32 = usock_get_tcp_slot(rec)
             src_ip:   uint32 = 0
             src_port: uint16 = 0
+            # #163: receive into a kernel bounce, then copy_to_user.
+            udr_cap: uint64 = a2
+            if udr_cap > U_L_BOUNCE:
+                udr_cap = U_L_BOUNCE
+            udr_kb: Array[4096, uint8]
             urn: int64 = udp_socket_recvfrom(
-                uslot, cast[Ptr[uint8]](a1), a2, 500,
+                uslot, cast[Ptr[uint8]](&udr_kb[0]), udr_cap, 500,
                 cast[Ptr[uint32]](&src_ip),
                 cast[Ptr[uint16]](&src_port))
             if urn == -9:
@@ -4812,27 +5033,36 @@ def _u_recvfrom(a0: uint64, a1: uint64, a2: uint64,
                 # A latched ICMP error (port-unreachable) surfaced as
                 # the negative errno itself.
                 return urn
-            # Fill the source sockaddr_in out-param if requested.
+            # #163: land the datagram bytes at the user buffer.
+            urn = _u_copyout_rc(a1, &udr_kb[0], urn)
+            if urn < 0:
+                return urn
+            # Fill the source sockaddr_in out-param if requested —
+            # assembled in kernel space, then copy_to_user'd (#163).
             if a4 != 0:
-                sa: Ptr[uint8] = cast[Ptr[uint8]](a4)
-                sa[0] = cast[uint8](USOCK_AF_INET & 0xFF)
-                sa[1] = cast[uint8]((USOCK_AF_INET >> 8) & 0xFF)
-                sa[2] = cast[uint8]((cast[uint32](src_port) >> 8) & 0xFF)
-                sa[3] = cast[uint8](cast[uint32](src_port) & 0xFF)
-                sa[4] = cast[uint8]((src_ip >> 24) & 0xFF)
-                sa[5] = cast[uint8]((src_ip >> 16) & 0xFF)
-                sa[6] = cast[uint8]((src_ip >> 8) & 0xFF)
-                sa[7] = cast[uint8](src_ip & 0xFF)
+                ska: Array[16, uint8]
+                ska[0] = cast[uint8](USOCK_AF_INET & 0xFF)
+                ska[1] = cast[uint8]((USOCK_AF_INET >> 8) & 0xFF)
+                ska[2] = cast[uint8]((cast[uint32](src_port) >> 8) & 0xFF)
+                ska[3] = cast[uint8](cast[uint32](src_port) & 0xFF)
+                ska[4] = cast[uint8]((src_ip >> 24) & 0xFF)
+                ska[5] = cast[uint8]((src_ip >> 16) & 0xFF)
+                ska[6] = cast[uint8]((src_ip >> 8) & 0xFF)
+                ska[7] = cast[uint8](src_ip & 0xFF)
                 z: uint64 = 8
                 while z < 16:
-                    sa[z] = 0
+                    ska[z] = 0
                     z = z + 1
+                if copy_to_user(a4, cast[uint64](&ska[0]), 16) != 0:
+                    return ELINUX_EFAULT
                 if a5 != 0:
-                    cast[Ptr[uint32]](a5)[0] = 16
+                    if put_user_32(16, a5) != 0:
+                        return ELINUX_EFAULT
             return urn
     if a4 != 0:
         if a5 != 0:
-            cast[Ptr[uint32]](a5)[0] = 0
+            if put_user_32(0, a5) != 0:                 # #163
+                return ELINUX_EFAULT
     # SOCK_STREAM recvfrom degrades to read(2) — route through _u_read
     # so the §5 O_NONBLOCK path applies (a non-blocking stream socket's
     # would-block recv must return -EAGAIN, not yield-block).
@@ -4952,8 +5182,13 @@ def _u_ppoll(a0: uint64, a1: uint64, a2: uint64,
     # the readiness scan returns promptly either way.
     timeout_ms: uint64 = cast[uint64](-1)              # NULL tmo => block
     if a2 != 0:
-        ts_sec:  uint64 = cast[Ptr[uint64]](a2)[0]
-        ts_nsec: uint64 = cast[Ptr[uint64]](a2 + 8)[0]
+        # #163: fetch the user timespec through the page tables.
+        ts_sec:  uint64 = 0
+        ts_nsec: uint64 = 0
+        if get_user_64(a2, &ts_sec) != 0:
+            return ELINUX_EFAULT
+        if get_user_64(a2 + 8, &ts_nsec) != 0:
+            return ELINUX_EFAULT
         # Round nanoseconds up to whole milliseconds (poll's granularity).
         timeout_ms = ts_sec * 1000 + (ts_nsec + 999999) / 1000000
     return _u_poll(a0, a1, timeout_ms, 0, 0, 0)
@@ -5042,9 +5277,11 @@ def _u_getcpu(a0: uint64, a1: uint64, a2: uint64,
     # Single CPU / single NUMA node — report 0 for both. The third arg is
     # an unused legacy cache pointer (ignored since Linux 2.6.24).
     if a0 != 0:
-        cast[Ptr[uint32]](a0)[0] = 0
+        if put_user_32(0, a0) != 0:                     # #163
+            return ELINUX_EFAULT
     if a1 != 0:
-        cast[Ptr[uint32]](a1)[0] = 0
+        if put_user_32(0, a1) != 0:                     # #163
+            return ELINUX_EFAULT
     return 0
 
 
@@ -5839,11 +6076,18 @@ def _u_rt_sigaction(a0: uint64, a1: uint64, a2: uint64,
         # Write only the first 16 bytes (sa_handler + sa_flags). The
         # caller's sa_restorer / sa_mask slots are left as the caller
         # initialised them — they are inputs to us, not outputs.
-        cast[Ptr[uint64]](a2)[0]     = prev
-        cast[Ptr[uint64]](a2 + 8)[0] = prev_fl
+        # #163: put_user_64 walks the page tables; fault => -EFAULT.
+        if put_user_64(prev, a2) != 0:
+            return ELINUX_EFAULT
+        if put_user_64(prev_fl, a2 + 8) != 0:
+            return ELINUX_EFAULT
     if a1 != 0:
-        new_handler: uint64 = cast[Ptr[uint64]](a1)[0]
-        new_flags:   uint64 = cast[Ptr[uint64]](a1 + 8)[0]
+        new_handler: uint64 = 0
+        new_flags:   uint64 = 0
+        if get_user_64(a1, &new_handler) != 0:          # #163
+            return ELINUX_EFAULT
+        if get_user_64(a1 + 8, &new_flags) != 0:
+            return ELINUX_EFAULT
         set_task_sig_handler(slot, sig, new_handler)
         set_task_sig_flags(slot, sig, new_flags)
     return 0
@@ -5875,10 +6119,14 @@ def _u_rt_sigprocmask(a0: uint64, a1: uint64, a2: uint64,
     # oldset first — POSIX returns the PRE-call mask even when set!=0.
     # Convert kernel (bit N) → user (bit N-1).
     if a2 != 0:
-        cast[Ptr[uint64]](a2)[0] = old_k >> 1
+        if put_user_64(old_k >> 1, a2) != 0:            # #163
+            return ELINUX_EFAULT
     if a1 != 0:
-        # Convert user (bit N-1) → kernel (bit N).
-        want_k: uint64 = cast[Ptr[uint64]](a1)[0] << 1
+        # Convert user (bit N-1) → kernel (bit N). #163: page-table walk.
+        sm_user: uint64 = 0
+        if get_user_64(a1, &sm_user) != 0:
+            return ELINUX_EFAULT
+        want_k: uint64 = sm_user << 1
         new_mask: uint64 = old_k
         if a0 == SIG_BLOCK:
             new_mask = old_k | want_k
@@ -6065,17 +6313,24 @@ def _seccomp_install_strict(slot: uint64) -> int64:
     return 0
 
 
-def _seccomp_install_filter_allowlist(slot: uint64, words: Ptr[uint64]) -> int64:
-    # Arm FILTER mode with the 4-word (256-bit) allow-list bitmap pointed
-    # to by `words` (or all-zero if words==0 → only the implicit strict
-    # set is permitted). This is the "lite" stand-in for a compiled BPF
-    # program — see the module header for the simplification rationale.
+def _seccomp_install_filter_allowlist(slot: uint64, uwords: uint64) -> int64:
+    # Arm FILTER mode with the 4-word (256-bit) allow-list bitmap at the
+    # USER address `uwords` (or all-zero if uwords==0 → only the implicit
+    # strict set is permitted). This is the "lite" stand-in for a compiled
+    # BPF program — see the module header for the simplification rationale.
+    # #163: the bitmap is staged through copy_from_user; a faulting
+    # pointer is -EFAULT and the task's seccomp state is left untouched.
+    kw: Array[4, uint64]
+    kw[0] = 0
+    kw[1] = 0
+    kw[2] = 0
+    kw[3] = 0
+    if uwords != 0:
+        if copy_from_user(cast[uint64](&kw[0]), uwords, 32) != 0:
+            return ELINUX_EFAULT
     i: uint64 = 0
     while i < 4:
-        v: uint64 = 0
-        if words != cast[Ptr[uint64]](0):
-            v = words[i]
-        set_task_seccomp_filter(slot, i, v)
+        set_task_seccomp_filter(slot, i, kw[i])
         i = i + 1
     set_task_seccomp_mode(slot, SECCOMP_MODE_FILTER)
     return 0
@@ -6099,7 +6354,7 @@ def _u_seccomp(a0: uint64, a1: uint64, a2: uint64,
     if op == SECCOMP_SET_MODE_STRICT:
         return _seccomp_install_strict(slot)
     if op == SECCOMP_SET_MODE_FILTER:
-        return _seccomp_install_filter_allowlist(slot, cast[Ptr[uint64]](a2))
+        return _seccomp_install_filter_allowlist(slot, a2)
     set_current_errstr("seccomp: unsupported operation")
     return ELINUX_INVAL
 
@@ -6128,29 +6383,33 @@ def _u_prctl(a0: uint64, a1: uint64, a2: uint64,
     if a0 == 15:                                          # PR_SET_NAME
         if a1 == 0:
             return ELINUX_INVAL
+        # #163: pull the user name through strncpy_from_user into a
+        # kernel scratch (stops at NUL, NUL-terminates), then install
+        # it in comm. POSIX TASK_COMM_LEN is 16 INCLUDING the NUL.
+        nbuf: Array[16, uint8]
+        nlen: int64 = strncpy_from_user(cast[uint64](&nbuf[0]), a1, 16)
+        if nlen < 0:
+            return ELINUX_EFAULT
+        nbuf[15] = 0
         dst: Ptr[uint8] = get_task_comm_ptr(current_idx_get())
-        src: Ptr[uint8] = cast[Ptr[uint8]](a1)
         i: uint64 = 0
-        # Walk up to 15 bytes, stop on NUL, force-terminate at slot 15.
-        # POSIX TASK_COMM_LEN is 16 INCLUDING the trailing NUL.
-        do:
-            c: uint8 = src[i]
-            dst[i] = c
-            if c == 0:
-                return 0
+        ended: int32 = 0
+        while i < 16:
+            if ended == 0:
+                dst[i] = nbuf[i]
+                if nbuf[i] == 0:
+                    ended = 1
+            else:
+                dst[i] = 0
             i = i + 1
-        while i < 15
-        dst[15] = 0
         return 0
     if a0 == 16:                                          # PR_GET_NAME
         if a1 == 0:
             return ELINUX_INVAL
+        # #163: comm is kernel memory; copy_to_user lands all 16 bytes.
         src: Ptr[uint8] = get_task_comm_ptr(current_idx_get())
-        dst: Ptr[uint8] = cast[Ptr[uint8]](a1)
-        i: uint64 = 0
-        while i < 16:
-            dst[i] = src[i]
-            i = i + 1
+        if copy_to_user(a1, cast[uint64](src), 16) != 0:
+            return ELINUX_EFAULT
         return 0
     if a0 == PR_SET_SECCOMP:                              # #160
         # prctl(PR_SET_SECCOMP, mode, filter). mode==1 strict; mode==2
@@ -6160,7 +6419,7 @@ def _u_prctl(a0: uint64, a1: uint64, a2: uint64,
             return _seccomp_install_strict(current_idx_get())
         if a1 == SECCOMP_MODE_FILTER:
             return _seccomp_install_filter_allowlist(
-                current_idx_get(), cast[Ptr[uint64]](a2))
+                current_idx_get(), a2)
         set_current_errstr("prctl: bad seccomp mode")
         return ELINUX_INVAL
     if a0 == PR_GET_SECCOMP:                              # #160
@@ -6252,13 +6511,24 @@ def _u_readv(a0: uint64, a1: uint64, a2: uint64,
     total: int64 = 0
     i: uint64 = 0
     while i < cnt:
+        # #163: the iovec entry itself lives in user memory — fetch
+        # base/len through the page tables; the data lands via the
+        # bounce-buffer read tail (_u_vfs_read_user).
         entry: uint64 = iov + i * 16
-        base: uint64 = cast[Ptr[uint64]](entry)[0]
-        len:  uint64 = cast[Ptr[uint64]](entry + 8)[0]
+        base: uint64 = 0
+        len:  uint64 = 0
+        if get_user_64(entry, &base) != 0:
+            if total == 0:
+                return ELINUX_EFAULT
+            return total
+        if get_user_64(entry + 8, &len) != 0:
+            if total == 0:
+                return ELINUX_EFAULT
+            return total
         if len == 0:
             i = i + 1
             continue
-        n: int64 = vfs_read(fd, cast[Ptr[uint8]](base), len)
+        n: int64 = _u_vfs_read_user(fd, base, len)
         if n < 0:
             if total == 0:
                 return n                                  # propagate errno
@@ -6291,13 +6561,24 @@ def _u_writev(a0: uint64, a1: uint64, a2: uint64,
     i: uint64 = 0
     while i < cnt:
         # Each iovec entry: base at offset 0, len at offset 8.
+        # #163: the entry lives in user memory — fetch base/len through
+        # the page tables; the data is staged via the chunked bounce
+        # write tail (_u_vfs_write_user).
         entry: uint64 = iov + i * 16
-        base: uint64 = cast[Ptr[uint64]](entry)[0]
-        len:  uint64 = cast[Ptr[uint64]](entry + 8)[0]
+        base: uint64 = 0
+        len:  uint64 = 0
+        if get_user_64(entry, &base) != 0:
+            if total == 0:
+                return ELINUX_EFAULT
+            return total
+        if get_user_64(entry + 8, &len) != 0:
+            if total == 0:
+                return ELINUX_EFAULT
+            return total
         if len == 0:
             i = i + 1
             continue
-        n: int64 = vfs_write(fd, cast[Ptr[uint8]](base), len)
+        n: int64 = _u_vfs_write_user(fd, base, len)
         if n < 0:
             # §3: SIGPIPE if the underlying pipe / socket broke —
             # same contract as write(2)/sendto(2).
@@ -7102,7 +7383,7 @@ def _u_faccessat(a0: uint64, a1: uint64, a2: uint64,
     # `flags` (check against effective vs real uid) is moot in the
     # single-user model, so flags are ignored.
     is_abs: int32 = 0
-    if a1 != 0 and cast[Ptr[uint8]](a1)[0] == 47:           # leading '/'
+    if _u_user_first_byte(a1) == 47:                    # leading '/'
         is_abs = 1
     if a0 != AT_FDCWD_U64 and is_abs == 0:
         return ELINUX_NOSYS
@@ -7232,8 +7513,13 @@ def _u_select(a0: uint64, a1: uint64, a2: uint64,
     bounded: int32 = 1
     tj: uint64 = UEP_WAIT_MAX_JIFFIES
     if a4 != 0:
-        sec:  uint64 = cast[Ptr[uint64]](a4)[0]
-        usec: uint64 = cast[Ptr[uint64]](a4 + 8)[0]
+        # #163: fetch the user timeval through the page tables.
+        sec:  uint64 = 0
+        usec: uint64 = 0
+        if get_user_64(a4, &sec) != 0:
+            return ELINUX_EFAULT
+        if get_user_64(a4 + 8, &usec) != 0:
+            return ELINUX_EFAULT
         if sec == 0 and usec == 0:
             bounded = 0
         else:
@@ -7322,22 +7608,31 @@ def _u_unimpl_nanosleep(a0: uint64, a1: uint64, a2: uint64,
     # sti+hlt+cli so other tasks run and the LAPIC timer fires.
     if a0 == 0:
         return ELINUX_INVAL
-    ns_req_sec:  uint64 = cast[Ptr[uint64]](a0)[0]
-    ns_req_nsec: uint64 = cast[Ptr[uint64]](a0 + 8)[0]
+    # #163: fetch the user timespec through the page tables.
+    ns_req_sec:  uint64 = 0
+    ns_req_nsec: uint64 = 0
+    if get_user_64(a0, &ns_req_sec) != 0:
+        return ELINUX_EFAULT
+    if get_user_64(a0 + 8, &ns_req_nsec) != 0:
+        return ELINUX_EFAULT
     ns_dur_ns: uint64 = ns_req_sec * 1000000000 + ns_req_nsec
     if ns_dur_ns == 0:
         yield_to_others()
         if a1 != 0:
-            cast[Ptr[uint64]](a1)[0]     = 0
-            cast[Ptr[uint64]](a1 + 8)[0] = 0
+            if put_user_64(0, a1) != 0:
+                return ELINUX_EFAULT
+            if put_user_64(0, a1 + 8) != 0:
+                return ELINUX_EFAULT
         return 0
     ns_start: uint64 = tsc_monotonic_ns()
     ns_dl: uint64 = ns_start + ns_dur_ns
     while tsc_monotonic_ns() < ns_dl:
         kernel_cond_resched()
     if a1 != 0:
-        cast[Ptr[uint64]](a1)[0]     = 0
-        cast[Ptr[uint64]](a1 + 8)[0] = 0
+        if put_user_64(0, a1) != 0:
+            return ELINUX_EFAULT
+        if put_user_64(0, a1 + 8) != 0:
+            return ELINUX_EFAULT
     return 0
 
 
@@ -7362,8 +7657,13 @@ def _u_clock_nanosleep(a0: uint64, a1: uint64, a2: uint64,
     # untouched on a normal (uninterrupted) completion of an ABSTIME sleep.
     if a2 == 0:
         return ELINUX_INVAL
-    req_sec:  uint64 = cast[Ptr[uint64]](a2)[0]
-    req_nsec: uint64 = cast[Ptr[uint64]](a2 + 8)[0]
+    # #163: fetch the user timespec through the page tables.
+    req_sec:  uint64 = 0
+    req_nsec: uint64 = 0
+    if get_user_64(a2, &req_sec) != 0:
+        return ELINUX_EFAULT
+    if get_user_64(a2 + 8, &req_nsec) != 0:
+        return ELINUX_EFAULT
     target_ns: uint64 = 0
     if (a1 & LINUX_TIMER_ABSTIME) != 0:
         abs_ns: uint64 = req_sec * 1000000000 + req_nsec
@@ -8018,7 +8318,9 @@ def _u_unimpl_arch_prctl(a0: uint64, a1: uint64, a2: uint64,
     if a0 == ARCH_GET_FS:
         if a1 == 0:
             return ELINUX_INVAL
-        cast[Ptr[uint64]](a1)[0] = task_fs_base(cast[int32](current_idx_get()))
+        if put_user_64(task_fs_base(cast[int32](current_idx_get())),
+                       a1) != 0:                        # #163
+            return ELINUX_EFAULT
         return 0
     # ARCH_SET_GS: symmetric to ARCH_SET_FS but on IA32_GS_BASE (the
     # user/inactive GS the CPU swapgs's live on return-to-user). We do
@@ -8033,7 +8335,8 @@ def _u_unimpl_arch_prctl(a0: uint64, a1: uint64, a2: uint64,
     if a0 == ARCH_GET_GS:
         if a1 == 0:
             return ELINUX_INVAL
-        cast[Ptr[uint64]](a1)[0] = read_msr(IA32_GS_BASE)
+        if put_user_64(read_msr(IA32_GS_BASE), a1) != 0:  # #163
+            return ELINUX_EFAULT
         return 0
     return ELINUX_INVAL
 
@@ -8081,8 +8384,7 @@ def _u_openat(a0: uint64, a1: uint64, a2: uint64,
     if a1 == 0:
         return ELINUX_INVAL
     is_abs: int32 = 0
-    p: Ptr[char] = cast[Ptr[char]](a1)
-    if cast[uint8](p[0] & 0xFF) == 47:                # '/'
+    if _u_user_first_byte(a1) == 47:                  # '/' (#163)
         is_abs = 1
     if a0 != AT_FDCWD_U64 and is_abs == 0:
         printk1("linux_u: openat dirfd=%d unsupported\n", cast[int32](a0))
@@ -8266,16 +8568,28 @@ def _u_sigaltstack(a0: uint64, a1: uint64, a2: uint64,
     prev_size:  uint64 = get_task_alt_stack_size(slot)
     prev_flags: int32  = get_task_alt_stack_flags(slot)
     if a1 != 0:
-        cast[Ptr[uint64]](a1 + STACK_T_OFF_SP)[0]   = prev_sp
-        cast[Ptr[int32]](a1 + STACK_T_OFF_FLAGS)[0] = prev_flags
-        cast[Ptr[uint64]](a1 + STACK_T_OFF_SIZE)[0] = prev_size
+        # #163: write the stack_t fields through the page tables.
+        if put_user_64(prev_sp, a1 + STACK_T_OFF_SP) != 0:
+            return ELINUX_EFAULT
+        if put_user_32(cast[uint32](prev_flags),
+                       a1 + STACK_T_OFF_FLAGS) != 0:
+            return ELINUX_EFAULT
+        if put_user_64(prev_size, a1 + STACK_T_OFF_SIZE) != 0:
+            return ELINUX_EFAULT
     if a0 != 0:
-        new_sp:    uint64 = cast[Ptr[uint64]](a0 + STACK_T_OFF_SP)[0]
-        new_flags: int32  = cast[Ptr[int32]](a0 + STACK_T_OFF_FLAGS)[0]
-        new_size:  uint64 = cast[Ptr[uint64]](a0 + STACK_T_OFF_SIZE)[0]
+        # #163: fetch the new stack_t through the page tables.
+        new_sp:    uint64 = 0
+        new_fl32:  uint32 = 0
+        new_size:  uint64 = 0
+        if get_user_64(a0 + STACK_T_OFF_SP, &new_sp) != 0:
+            return ELINUX_EFAULT
+        if get_user_32(a0 + STACK_T_OFF_FLAGS, &new_fl32) != 0:
+            return ELINUX_EFAULT
+        if get_user_64(a0 + STACK_T_OFF_SIZE, &new_size) != 0:
+            return ELINUX_EFAULT
         set_task_alt_stack_sp(slot, new_sp)
         set_task_alt_stack_size(slot, new_size)
-        set_task_alt_stack_flags(slot, new_flags)
+        set_task_alt_stack_flags(slot, cast[int32](new_fl32))
     return 0
 
 
@@ -9063,7 +9377,11 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
         # the wake we'd be waiting for has already happened — return
         # -EAGAIN per the futex(2) man page. glibc/musl read this as
         # "spurious wakeup" and recheck the lock word.
-        cur: uint32 = cast[Ptr[uint32]](a0)[0]
+        # #163: every futex-word read goes through get_user_32 (a page-
+        # table-walked fetch); a faulting uaddr is -EFAULT, per Linux.
+        cur: uint32 = 0
+        if get_user_32(a0, &cur) != 0:
+            return ELINUX_EFAULT
         if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
             return ELINUX_AGAIN
         # If there's no other live Linux-ABI peer that could write
@@ -9080,7 +9398,8 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
                 yield_to_others()
                 if count_live_linux_peers() != 0:
                     break
-                cur = cast[Ptr[uint32]](a0)[0]
+                if get_user_32(a0, &cur) != 0:          # #163
+                    return ELINUX_EFAULT
                 if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
                     return 0
                 budget = budget + 1
@@ -9110,7 +9429,10 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
             yield_to_others()
             if futex_addr[su] == 0:
                 break
-            cur = cast[Ptr[uint32]](a0)[0]
+            if get_user_32(a0, &cur) != 0:              # #163
+                futex_addr[su] = 0
+                futex_slot[su] = -1
+                return ELINUX_EFAULT
             if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
                 # Value moved — pretend we were woken. Clear our slot
                 # ourselves so a stale entry doesn't haunt the table.
@@ -10059,8 +10381,18 @@ def _u_epoll_ctl(a0: uint64, a1: uint64, a2: uint64,
     events: uint32 = 0
     data0:  uint64 = 0
     if a3 != 0:
-        events = cast[Ptr[uint32]](a3)[0]
-        data0  = cast[Ptr[uint64]](a3 + 4)[0]
+        # #163: the packed 12-byte epoll_event is staged through
+        # copy_from_user (the 8-byte data field at offset 4 is
+        # unaligned and may straddle a page — copy_from_user re-walks
+        # at the boundary; a single get_user_64 could not).
+        eev: Array[12, uint8]
+        if copy_from_user(cast[uint64](&eev[0]), a3, 12) != 0:
+            return ELINUX_EFAULT
+        events = cast[Ptr[uint32]](&eev[0])[0]
+        ed_i: uint64 = 0
+        while ed_i < 8:
+            data0 = data0 | (cast[uint64](eev[4 + ed_i]) << (ed_i * 8))
+            ed_i = ed_i + 1
     if op == EPOLL_CTL_ADD:
         return uepoll_ctl_add(es, fd, events, data0)
     if op == EPOLL_CTL_MOD:
