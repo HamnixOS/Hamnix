@@ -3147,7 +3147,10 @@ def build_archive() -> bytes:
         if not p.exists():
             raise SystemExit(f"INIT_ELF={init_override}: file not found")
         data = p.read_bytes()
-        blob += cpio_entry("/init", data)
+        # F10-3 #456: 0o755 so an override /init (most tests use this
+        # to swap in hamsh.elf) lands with exec mode bits set. Matches
+        # the default /init handling further below.
+        blob += cpio_entry("/init", data, mode=0o100755)
         init_override_real = p.resolve()
         print(f"  embedded /init ({len(data)} bytes from "
               f"{p.relative_to(here) if p.is_relative_to(here) else p}) "
@@ -3187,8 +3190,16 @@ def build_archive() -> bytes:
             "/usr/bin/grep",
             "/usr/sbin/grep",
         ]
+        # F10-3 #456: executables under /bin, /sbin, /usr/bin, /usr/sbin
+        # ship with S_IFREG | 0o755 so a non-hostowner caller can exec
+        # them. Pre-F10-3 every userland task ran as uid 1 and the cpio
+        # dispatcher bypass admitted exec regardless of mode bits; with
+        # the default uid flipped to NOBODY (65534), the 0o644 entries
+        # would deny exec via the cpio mode-bit policy
+        # (_perm_check_cpio in fs/vfs.ad). Every real Unix ships
+        # binaries world-executable; do the same here.
         for applet in bb_applets:
-            blob += cpio_entry(applet, busybox_bytes)
+            blob += cpio_entry(applet, busybox_bytes, mode=0o100755)
         print(f"  staged busybox at {len(bb_applets)} applet paths "
               f"({len(bb_applets) * len(busybox_bytes)} bytes total)")
 
@@ -3221,13 +3232,24 @@ def build_archive() -> bytes:
             data = elf.read_bytes()
             if elf.name == "init.elf" and init_override_real is None:
                 # Default /init = the asm-built init.elf — kernel
-                # reads this at boot.
-                blob += cpio_entry("/init", data)
+                # reads this at boot. F10-3 #456: 0o755 so a future
+                # ext4 layout that exec()s /init through the dispatcher
+                # finds the exec bit set (the boot path itself loads
+                # /init directly into PID 1 without an exec-perm check,
+                # so this is defense-in-depth not load-bearing here).
+                blob += cpio_entry("/init", data, mode=0o100755)
                 print(f"  embedded /init ({len(data)} bytes from "
                       f"build/user/{elf.name})")
                 continue
+            # F10-3 #456: native userland ELFs land under /bin with
+            # S_IFREG | 0o755 so hamsh's PATH walker can exec them
+            # post-F10-3 (the default-uid-is-NOBODY flip in
+            # kernel/sched/core.ad's create_user_thread). The cpio
+            # dispatcher pre-F10-3 admitted exec for the implicit
+            # hostowner uid=1 default; with NOBODY as the default,
+            # /bin/* needs world-x mode bits.
             bin_name = "/bin/" + elf.stem
-            blob += cpio_entry(bin_name, data)
+            blob += cpio_entry(bin_name, data, mode=0o100755)
             print(f"  embedded {bin_name} ({len(data)} bytes from "
                   f"build/user/{elf.name})")
 
@@ -4089,7 +4111,10 @@ def build_archive() -> bytes:
             if f.is_file() and f.name != ".gitignore":
                 data = f.read_bytes()
                 name = "/bin/" + f.name
-                blob += cpio_entry(name, data)
+                # F10-3 #456: /bin/* needs the world-x mode bit since
+                # the post-F10-3 default user uid is NOBODY (65534) and
+                # _perm_check_cpio gates exec on the per-entry mode.
+                blob += cpio_entry(name, data, mode=0o100755)
                 print(f"  embedded {name} ({len(data)} bytes)")
 
     # U41: CPython stdlib-on-disk embedding hook (DEPRECATED).
