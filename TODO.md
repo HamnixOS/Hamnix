@@ -285,15 +285,13 @@ replaces the ~70 `is_*_path` backend-selection branches).
 ## Plan 9 alignment audit findings (#444, 2026-06-11)
 
 **ALL findings queued as fix tracks (user 2026-06-11: "hammer the whole
-thing into a plan 9 shape"):** F1=#446 (keystone) **DONE**. F5=#445
-**DONE**. F8=#451 **DONE**. F9=#452 **DONE**. F4=#449 **DONE 2026-06-11**
-— linux_abi/ is a true leaf, import direction inverted; new
-`linux_abi/init.ad` plants every shim hook at boot; acceptance grep
-empty; FD-kinds dispatched through hook table; the four F9-DEFERRED
-path arms (fuse/ptmx/pts/cgroup) now shim-registered. See STATUS row.
-**Remaining:** F2=#447 syscall→ctl sweep, F3=#448 server-boundary
-perms/factotum, F6=#450 Phase G finish, F7=#390 FD-mark fold
-continuation, F10=#453 re-audit AFTER the wave lands.
+thing into a plan 9 shape"):** F1=#446 **DONE**. F2=#447 **DONE
+2026-06-11** — 8 drift-arms retired onto ctl files; doc owns timerfd/
+job-control/mmap honestly. F4=#449 **DONE**. F5=#445 **DONE**.
+F8=#451 **DONE**. F9=#452 **DONE**. **Remaining:** F3=#448
+server-boundary perms/factotum, F6=#450 Phase G finish, F7=#390
+FD-mark fold continuation, F10=#453 re-audit AFTER the wave lands
+(6 of 10 closed today).
 
 Full ranked report delivered in-session; spine (Chan/namec/devtab, Pgrp
 binds, unions MREPL/MBEFORE/MAFTER, notes, /net no-sockets, /srv, #d fd
@@ -305,12 +303,18 @@ device, /dev/mountrpc tripwire) judged honestly Plan 9. Gaps, ranked:
    children use `pgrp_alloc()` (truly empty); `do_openchan` resolves
    through the same pipeline. New gate `test_ns_enoent` proves empty
    RFCNAMEG → ENOENT + targeted bind restore. See STATUS row.
-2. [ ] **Native syscall sprawl: 82 dispatch arms vs documented ~25.**
+2. [x] **Native syscall sprawl: 82 dispatch arms vs documented ~25.**
    Drift examples: SYS_NICE=311 duplicates /proc/<pid>/ctl `pri`;
    wsys/svc/dns/netcfg control as syscalls though file surfaces exist;
    timerfd/job-control/mmap in the native table (mmap directly contradicts
-   native-api.md:537). Fix: Phase-G-style sweep onto ctl files + honest
-   docs update.
+   native-api.md:537). **F2 DONE** (`#447`, merge `44e853b4` 2026-06-11):
+   8 drift-arms → 0; SYS_NICE/SYS_SVC_CTL/SYS_RESOLVE*/SYS_NETCFG/
+   SYS_WSYS_*/SYS_VK_WINDOW_FRAME all retired onto /proc/<pid>/ctl,
+   /proc/svc/ctl, /net/dns, /net/ipifc/ctl, /dev/wsys/ctl. Numbers
+   reserved as deprecated thin shims. timerfd kept (legitimate);
+   job-control flagged as out-of-scope drift; mmap deviation honestly
+   owned in `docs/native-api.md` (segattach migration scheduled). See
+   STATUS row.
 3. [ ] **Permissions = kernel literal-path funnel, not server-boundary.**
    `fs/vfs.ad:1129 _vfs_check_perm` hardcodes /etc/shadow, /dev/blk,
    /var/lib/hpm + ext4 mode bits + uid==1 bypass + global
