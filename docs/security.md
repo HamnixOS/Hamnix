@@ -227,6 +227,60 @@ ext4 backend, denying any non-hostowner userland open by mode bits;
 only the in-kernel credential mediator reaches the file, and only by
 calling the explicit kernel-context primitive.
 
+### F10-3 #456: default task uid model
+
+The uid model is **explicit by construction**, not by accident. Two
+named constants in `kernel/sched/core.ad` carry it:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `UID_HOSTOWNER` | 1 | The Plan-9 "glenda" / single system administrator. Owns the rootfs, runs `hpm`, edits `/etc/shadow`. |
+| `UID_NOBODY` | 65534 | The DEFAULT for every freshly-spawned task with no real parent identity. |
+
+The rules:
+
+1. **`kthread_create` stamps `UID_HOSTOWNER`.** Kernel threads run in
+   kernel context, have no userland surface, and are trusted by
+   construction (the kernel binary contains them).
+2. **`create_user_thread` inherits from the parent.** Fork and CLONE_THREAD
+   both copy `task_table[current_idx_pcpu].uid` into the child. This is
+   the Plan-9 contract: "child gets parent's identity."
+3. **The boot-time fallback in `create_user_thread` is `UID_NOBODY`.**
+   When `parent_uid == 0` (current task is the all-zero boot slot 0),
+   the fresh task lands at NOBODY (65534), NOT hostowner. Pre-F10-3 the
+   fallback was 1, which made every userland program before login run as
+   hostowner and silently fired the dispatcher's `uid == UID_HOSTOWNER`
+   bypass for the on-disk servers.
+4. **PID 1 (init) is upgraded to `UID_HOSTOWNER` EXPLICITLY.** Right
+   after `create_user_task(init_entry, ...)` returns the freshly-allocated
+   slot, `init/main.ad` calls
+   `set_task_uid_at(parent_slot, UID_HOSTOWNER)`. The boot path then
+   `start_first_task`s into PID 1, which is hostowner. There is no
+   window where PID 1 could be dispatched in the NOBODY state because
+   `start_first_task` only runs after the explicit setter retires.
+5. **Every subsequent task inherits.** hamsh forks from PID 1 (hostowner).
+   Its children, and their children, all inherit hostowner — until a
+   login flow explicitly downgrades them.
+6. **The login flow downgrades via `SYS_SETUID_AUTH`.** The user types
+   `su <name>` (or logs in over sshd / getty); the flow opens
+   `/dev/auth`, authenticates the password, and calls `SYS_SETUID_AUTH`
+   to flip the calling task's uid to the authenticated user's value.
+   Hostowner downgrades via `SYS_SETUID(N)` directly — the arch arm
+   gates on `current_task_uid() == UID_HOSTOWNER`, so a regular user
+   can never elevate, only downgrade themselves.
+7. **Kernel-context entry points bypass the gate.** `vfs_open_kernel` /
+   `vfs_open_write_kernel` are the in-kernel-mediator paths (devauth's
+   `_au_read_live_file`, `_au_setpass`); they don't go through
+   `chan_permission_check`, so they read/write 0600 files without
+   needing the caller's task uid to be hostowner. The kernel is trusted
+   by construction. No userland-reachable syscall opens these.
+
+`scripts/test_default_uid.sh` is the acceptance gate: a hamsh-spawned
+fixture asserts initial uid == 1, downgrades to 65534, and confirms
+the dispatcher denies `/dev/blk/sd0` to NOBODY (the per-server
+hostowner-only policy in `devblk_perm_check` actually fires once the
+hostowner bypass is no longer the default).
+
 ### Factotum (planned, F3 follow-up)
 
 Long-term, the in-kernel `devauth` becomes a thin shim to a userland
