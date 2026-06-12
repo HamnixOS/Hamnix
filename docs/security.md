@@ -115,22 +115,122 @@ never gets the hash, never has direct shadow access. This is the
 factotum-shape primitive — credential handling lives in a single
 audited kernel path.
 
-## Permissions
+## Permissions — server-boundary model (F3 #448, 2026-06-11)
 
-Files carry owner uid + group gid + 9 mode bits (`rwxrwxrwx`).
-Stored in:
-- Hamnix-native cdev returns: encode in the 9P-stat record
-- ext4 on disk: the existing ext4 owner/group/mode fields (Hamnix
-  already parses them on read; v1 will start writing them on create)
+Hamnix's kernel does **not** carry a global path-keyed permission
+policy. Per Plan 9, **permissions live at the file server you
+attached to**. A bind/mount establishes an authenticated channel; the
+server applies its own per-server policy on the ops that arrive on
+that channel.
 
-VFS open/create checks at every syscall boundary:
-1. Path resolves to a file/directory with owner U, group G, mode M.
-2. Caller has uid u, gid g.
-3. If u == U: use owner bits.
-4. Else if g == G: use group bits.
-5. Else: use other bits.
-6. Open request specifies OREAD/OWRITE/ORDWR; mode must permit it.
-7. On denial: `-EPERM`, errstr "permission denied".
+Concretely, every `vfs_open` / `vfs_open_write` / exec goes through
+`chan_permission_check(name, want)` in `fs/vfs.ad`. The dispatcher does
+**exactly one** decision: it identifies the file server that OWNS the
+path (cpio `#r`, tmpfs `#t`, ext4 `#e`, FAT `#f`, devs `#c`, block
+`#b`, proc `#p`, srv `#s`, net `#I`, auth `#auth`, root slot `#/`) and
+delegates to that server's `_perm_check_<server>` policy.
+
+| Server | Policy lives in | v1 policy |
+|--------|-----------------|-----------|
+| `#r` cpio | `_perm_check_cpio` (fs/vfs.ad) | read-only baked-in: reads world-OK, writes denied |
+| `#t` tmpfs | `_perm_check_tmpfs` | world-r/w scratch (/tmp, /var) |
+| `#e` ext4 | `_perm_check_ext4` (delegates to `ext4_inode_owner_at`) | enforces on-disk inode mode bits at the ext4 backend boundary |
+| `#f` FAT | `_perm_check_fat` | world-r/w (FAT volumes don't track owners) |
+| `#c` devs | `_perm_check_devcons` | world-r/w introspection knobs by default; per-cdev tightening at the cdev (e.g. `/dev/wsys/ctl` is hostowner-only in devwsys.ad) |
+| `#b` block | `_perm_check_devblk` | hostowner-only (raw block devices) |
+| `#p` proc | `_perm_check_devproc` | world-readable; ctl-file write authority enforced at devproc |
+| `#s` srv | `_perm_check_devsrv` | world-r/w; post wire-shape is the gate |
+| `#I` net | `_perm_check_devnet` | world-r/w; ipifc/ctl writes enforced at devnet |
+| `#auth` | `_perm_check_devauth` | world-r/w wire; rate-limit + constant-time compare inside the cdev are the real gate |
+| `#/` root slot | `_perm_check_rootslot` | no-op (bind/mount is the gate) |
+
+The kernel vfs has **no literal-path arms**. There is no `/etc/shadow`
+clause, no `/var/lib/hpm/` clause, no `/dev/blk/*` clause inside vfs;
+each of those is enforced where it belongs — ext4 mode bits at the
+ext4 backend, hpm at the userland `hpm` tool's `uid==1` gate, raw
+block at `_perm_check_devblk`.
+
+There is a **hostowner (uid 1) bypass at the dispatcher** that admits
+the historical Plan 9 convention "the hostowner owns the system." It
+is applied for the on-disk servers (`#e`, `#t`, `#r`) where the
+0600-mode `/etc/shadow` file would otherwise deny the legitimate
+hostowner read. Each server's policy retains the final say: `#b`
+(`_perm_check_devblk`) requires `uid == 1` rather than admitting a
+bypass, and a future per-user homedir server can ignore the bypass by
+returning `EPERM_PERM` for `uid == 1` from its own policy. The bypass
+is the **floor**, not the ceiling.
+
+### Kernel-mediator credential reads — `vfs_open_kernel`
+
+The credential mediator (`sys/src/9/port/devauth.ad`) reads
+`/etc/shadow` via `vfs_open_kernel(path)` / `vfs_open_write_kernel(path)`
+— explicit-by-construction kernel-context entry points that bypass the
+server-boundary gate. The CALLER (devauth) is privileged-by-construction:
+the entry point exists in the kernel binary, has no userland-reachable
+syscall, and is named for its single legitimate caller. This replaces
+the pre-F3 `vfs_auth_mediator_active` global flag that devauth raised
+around its `/etc/shadow` open — a flag whose existence the audit
+flagged as the antithesis of the server-boundary model.
+
+The Plan-9 invariant holds: **userland NEVER opens /etc/shadow
+directly** — the file's 0600 hostowner-owned mode is enforced at the
+ext4 backend, denying any non-hostowner userland open by mode bits;
+only the in-kernel credential mediator reaches the file, and only by
+calling the explicit kernel-context primitive.
+
+### Factotum (planned, F3 follow-up)
+
+Long-term, the in-kernel `devauth` becomes a thin shim to a userland
+**factotum** server posting at `/srv/factotum`. The wire shape factotum
+speaks is the same shape `devauth` speaks today:
+
+```
+fd = open("#s/factotum", ORDWR)
+write(fd, "user <name>\n")
+write(fd, "pass <plaintext>\n")
+read(fd, response)              # "ok\n <uid> <gid>\n" or "denied\n"
+close(fd)
+```
+
+A `setpass` verb extends the same wire shape:
+
+```
+write(fd, "setpass <plaintext>\n")
+read(fd, response)              # "ok\n" or "denied\n"
+```
+
+When factotum lands, the kernel `devauth` either becomes a thin
+forwarder to the posted srvfd or is deleted in favour of init posting
+`/srv/factotum` directly. `do_mount`'s `afd` parameter (today
+accepted-and-ignored, see `sys/src/9/port/syschan.ad`) is wired
+through `p9c_attach` at the same time: an attach to a server CARRIES
+the authenticated uname from the factotum exchange instead of the
+current empty string. This unlocks per-process attach-time identity —
+the Plan 9 "authenticated attach" shape.
+
+The wire shape is fixed by this commit so a follow-up agent can land
+factotum without churning the consumers (`hamsh`'s `newshell`, `su`,
+`login`, `sshd`).
+
+### Why the model changed (audit finding #448)
+
+The pre-F3 kernel had a literal-path policy funnel
+(`_vfs_check_perm`) that hard-coded `/etc/shadow`, `/dev/blk/*`,
+`/var/lib/hpm/*`, ext4 mode bits, a `uid==1` global bypass, and a
+`vfs_auth_mediator_active` global backdoor. The Plan 9 audit (#444,
+pillar 3) called this out as the antithesis of "permissions live at
+the attached server." F3 (#448) moves every clause to where it
+belongs: `_vfs_check_perm` is gone (replaced by the dispatcher
+`chan_permission_check`), the global backdoor is deleted, and ext4
+mode-bit enforcement is at the ext4 backend boundary, not in the
+kernel vfs.
+
+The dispatcher itself is small (≈25 lines) and contains no policy —
+it routes by server letter, exactly the same routing
+`_open_hash_alias` already does for the open path. Adding a new
+file server means writing a new `_perm_check_<X>`; the dispatcher
+gains one new arm. No existing servers see their policy churn when
+that lands.
 
 **No setuid / setgid / sticky.** These don't exist in the on-disk
 format Hamnix writes. (The kernel ignores them on Debian-side files
