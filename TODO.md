@@ -319,9 +319,14 @@ Twelve findings from the F10 second-pass audit; full text in
   the dispatch (-1 for unknown server vs -2 for unbound namespace).
   Pre-existing test_linux_sh failure root-caused to cpio mode +
   svc-supervised uid=2 — follow-up.
-- [ ] **F10-3 (#456)** — every fresh task starts uid=1 (`kernel/sched/
+- [x] **F10-3 (#456)** — every fresh task starts uid=1 (`kernel/sched/
   core.ad:2532`); F3's hostowner bypass fires pre-login. Flip default
-  to NOBODY uid; keep PID 1 as hostowner via inittab.
+  to NOBODY uid; keep PID 1 as hostowner via inittab. **DONE** (merge
+  `d3f2a02f`): UID_NOBODY=65534, UID_HOSTOWNER=1 named; create_user_thread
+  default flipped; init/main.ad explicit stamp for PID 1. Companion
+  cpio mode fix in build_initramfs.py (0o755 for /bin/* etc.) closes
+  the pre-existing test_linux_sh failure. New test_default_uid gate
+  exercises the full hostowner→NOBODY→deny chain.
 - [ ] **F10-4..F10-12 (#457)** — afd Tauth ignored, init/main.ad split
   (13,893 lines mixing selftests+boot), Plan 9 Dir record as
   first-class struct, nice/pri ctl-file uid gate, seccomp-lite to
