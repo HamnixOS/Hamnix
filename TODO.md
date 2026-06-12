@@ -285,13 +285,43 @@ replaces the ~70 `is_*_path` backend-selection branches).
 ## Plan 9 alignment audit findings (#444, 2026-06-11)
 
 **ALL findings queued as fix tracks (user 2026-06-11: "hammer the whole
-thing into a plan 9 shape"):** F1=#446 **DONE**. F2=#447 **DONE**.
-F3=#448 **DONE**. F4=#449 **DONE**. F5=#445 **DONE**. F6=#450 **DONE
-2026-06-11** — Phase G finished; SYS_SPAWN/LISTDIR/KILL retired onto
-`lib/p9.ad` helpers; 200-line kernel inheritance block gone. F8=#451
-**DONE**. F9=#452 **DONE**. **Remaining:** F7=#390 FD-mark fold
-continuation, F10=#453 re-audit AFTER the wave lands (8 of 10 closed
-today).
+thing into a plan 9 shape"):** F1=#446 **DONE (partial — see F10)**.
+F2=#447 **DONE (partial — see F10)**. F3=#448 **DONE (partial — see
+F10)**. F4=#449 **DONE**. F5=#445 **DONE**. F6=#450 **DONE**.
+F7=#390 FD-mark fold continuation (long-running). F8=#451 **DONE**.
+F9=#452 **DONE**. F10=#453 **DONE 2026-06-11** — second-pass audit
+landed (`audit_F10_report.md`, merge `1e6d7b90`); brutal honest: F1/F2/F3
+held in name only; 12 next-wave findings ranked.
+
+## F10 next-wave (queued 2026-06-11)
+
+Twelve findings from the F10 second-pass audit; full text in
+`audit_F10_report.md` on main. Top three deepest issued as #454/#455/
+#456; remaining nine bundled in #457.
+
+- [ ] **F10-1 (#454)** — wire `resolve_path` at top of `_vfs_open_post_perm`;
+  delete the literal `/dev/<leaf>` strcmp table in `_devtab_lookup`.
+  THE LOAD-BEARING fix: closes F1's bypass. After this, RFCNAMEG child
+  with no `bind '#c' /dev` actually gets ENOENT on `open("/dev/null")`.
+- [ ] **F10-2 (#455)** — `_path_owning_server` defaults to cpio + grant
+  on cpio miss = unknown paths are permissive. Switch default to
+  unknown→EPERM; move `_perm_check_<X>` bodies INTO their server files
+  ("policy lives in the server" claim made real).
+- [ ] **F10-3 (#456)** — every fresh task starts uid=1 (`kernel/sched/
+  core.ad:2532`); F3's hostowner bypass fires pre-login. Flip default
+  to NOBODY uid; keep PID 1 as hostowner via inittab.
+- [ ] **F10-4..F10-12 (#457)** — afd Tauth ignored, init/main.ad split
+  (13,893 lines mixing selftests+boot), Plan 9 Dir record as
+  first-class struct, nice/pri ctl-file uid gate, seccomp-lite to
+  native syscalls, Linux ABI is_*_path strcmp ladder, oom_score_adj
+  per-Pgrp not per-task, drivers/net/socket.ad rename, docs/
+  rootfs_partition.md stale chan_resolve_prefix reference.
+
+Two structural keystones the wave still owes (per F10 closing note):
+(1) `resolve_path` at every `vfs_open` entry (closes F10-1 + F10-2);
+(2) Plan 9 `Dir` record as universal directory enumeration shape
+(closes F10-6). After those, F3's perm bodies + F2's syscall thin-
+shimming become small isolated follow-ups.
 
 Full ranked report delivered in-session; spine (Chan/namec/devtab, Pgrp
 binds, unions MREPL/MBEFORE/MAFTER, notes, /net no-sockets, /srv, #d fd
