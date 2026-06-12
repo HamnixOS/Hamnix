@@ -440,6 +440,77 @@ data}`), process spawning via `/proc/clone`, and any future Layer
 Every current `SYS_*` mapped to its Plan 9 home. **None of these
 moves break Linux ABI** (Layer 2 has its own dispatch table).
 
+### F2 #447 — drift syscall retirements (2026-06-11)
+
+The 2026-06-11 audit (#444 F2 / task #447) called out a set of native
+syscall arms that duplicated work already file-shaped or that should
+have been file-shaped. The retirement set landed as Plan-9-shape ctl
+files alongside the existing surface:
+
+| Drift syscall | Reserved # | Replacement ctl file | Verbs |
+|----------|------:|-----------------|------|
+| `SYS_NICE` | 311 | `/proc/<pid>/ctl` | `pri <n>` |
+| `SYS_SVC_CTL` | 296 | `/proc/svc/ctl` | `start <name>` / `stop <name>` / `restart <name>` / `enable <name>` / `disable <name>` / `runlevel <digit>` / `unpublish <name>` |
+| `SYS_RESOLVE` | 269 | `/net/dns/lookup` (R/W) | write `<hostname>\n` then read for `<a.b.c.d>\n` or `fail\n` |
+| `SYS_RESOLVE_PTR` | 301 | `/net/dns/rlookup` (R/W) | write `<a.b.c.d>\n` then read for `<name>\n` or `fail\n` |
+| `SYS_NETCFG` SET_ADDR | 286 op 1 | `/net/ipifc/ctl` | `add addr <a.b.c.d> mask <a.b.c.d>` |
+| `SYS_NETCFG` SET_GW | 286 op 2 | `/net/ipifc/ctl` | `add gw <a.b.c.d>` |
+| `SYS_NETCFG` SET_DNS | 286 op 3 | `/net/dns` (R/W) | write `server <a.b.c.d>` ; read renders `<a.b.c.d> <source>\n` |
+| `SYS_NETCFG` ROUTE_ADD | 286 op 4 | `/net/ipifc/ctl` | `route add <net> <mask> <gw> [onlink]` |
+| `SYS_NETCFG` ROUTE_DEL | 286 op 6 | `/net/ipifc/ctl` | `route del <net> <mask> <gw>` |
+| `SYS_NETCFG` GET addr | 286 op 0 | `/net/addr` (existing) | host-level read |
+| `SYS_NETCFG` ROUTE_GET | 286 op 5 | (still syscall) | a future `/net/ipifc/route` directory would close the loop |
+| `SYS_WSYS_ALLOC` | 293 | `/dev/wsys/ctl` | write `alloc <pid>\n` then read same fd for assigned wid as decimal |
+| `SYS_WSYS_FREE` | 294 | `/dev/wsys/ctl` | `free <wid>\n` |
+| `SYS_VK_WINDOW_FRAME` | 312 | `/dev/wsys/ctl` | `frame <wid> <frame>\n` |
+
+All ctl files are hostowner-gated wherever the original syscall was
+(SYS_WSYS_*, SYS_VK_WINDOW_FRAME); the gate is enforced inside the
+write handler so a non-hostowner write returns -EPERM with errstr,
+matching the syscall semantics.
+
+**The syscall numbers stay reserved — do not reuse.** The syscall
+arms remain in place as deprecated thin shims around the same kernel
+helpers the new ctl files call (`sched_set_nice`, `svc_ctl_enqueue`,
+`dns_set_static_server`, `wsys_alloc_wid` etc.). Callers SHOULD
+migrate to the ctl-file form.
+
+**Not retired in F2 (legitimate "kernel-of-resource" shape, NOT drift):**
+
+- `SYS_TIMERFD_CREATE` (314) / `SYS_TIMERFD_SETTIME` (315). A timerfd
+  IS already a file — the syscall creates the resource (returns an
+  fd) and configures it. Re-shaping `timerfd_create` to `open("/dev/
+  timer/ctl")` + `write "create monotonic\n"` + read the resulting
+  fd is just adding ASCII bouncing for no architecture win. The
+  `settime` body itself is a write of a binary itimerspec to the fd
+  — that IS the Plan 9-shape ioctl-as-write. Kept.
+- `SYS_SETPGID` (273-ish) / `SYS_TCSETPGRP` / `SYS_WAITPID_JC`
+  (job-control family). These are POSIX shell-job-control primitives
+  (SIGTSTP / SIGCONT model). Plan 9 has no equivalent — the
+  equivalent Plan 9 surface would be `/proc/<pid>/ctl` for process-
+  group ops plus `/dev/cons/ctl` for the terminal-foreground-group
+  bit, and native hamsh has its own job-control model that bypasses
+  them anyway. They survive in the dispatch table because the
+  Linux-ABI shell (busybox / bash) calls them. **Tracked as
+  follow-up drift** — not in scope for F2's "Plan-9-shape
+  replacement" because the right home is a substantial design rather
+  than a thin ctl-file. Noted here for the next audit pass.
+- `SYS_MMAP` family (`mmap`/`mprotect`/`munmap`/`msync`). Plan 9
+  uses `segattach` / `segdetach` (273/274 are RESERVED — not built).
+  Native code today calls `SYS_MMAP` directly for anonymous regions
+  (the libc `malloc` path, big buffers, hamUI per-frame fb mapping).
+  **Honest deviation, documented:** `mmap` (file-backed) is NOT
+  built natively at all — Linux ABI's `mmap` is Layer 2; Layer 1
+  native code uses `kmalloc`-shape large reads/writes instead. For
+  anonymous regions, native code SHOULD eventually move to
+  `segattach`, but that's a multi-week build that depends on a
+  per-process segment table that doesn't exist yet (the L-shim has
+  one, native doesn't). For now `SYS_MMAP` stays native-ABI. The
+  reservation of `segattach`=273 stands; the migration is scheduled
+  but not gated on F2.
+
+### Pre-F2 retirements (Phase G / pre-2026-06-11)
+
 | Old name | Old # | Disposition | New name / path | Note |
 |----------|------:|-------------|-----------------|------|
 | `SYS_PUTC` | 0 | **→ path** | `write("/dev/cons", c, 1)` | Single-byte writer; delete the syscall after callers migrate. Phase G. |
@@ -526,19 +597,38 @@ moves break Linux ABI** (Layer 2 has its own dispatch table).
   and flags the conn TLS-active; vfs routes the conn's data file
   through `tls_recv`/`tls_send`/`tls_close_notify`. Native clients
   reach all of this via `user/net9.ad`'s `net_dial` / `net_dial_tls`
-  / `net_announce` / `net_accept`. Only DNS (`SYS_RESOLVE` 269) and
-  the netcfg syscall (`SYS_NETCFG` 286) remain as Layer-1-networking
-  syscalls — they are *not* `/net`-shaped yet.
+  / `net_announce` / `net_accept`.
+
+  **F2 #447 (2026-06-11):** DNS and netcfg ARE now `/net`-shaped.
+  Forward lookups go to `/net/dns/lookup` (write hostname, read
+  IPv4); reverse lookups to `/net/dns/rlookup`; DNS server pin to
+  `/net/dns` (`server X.Y.Z.W`); IP config to `/net/ipifc/ctl`
+  (`add addr ... mask ...`, `add gw ...`, `route add ...`, `route
+  del ...`). `SYS_RESOLVE` (269), `SYS_RESOLVE_PTR` (301), and
+  `SYS_NETCFG` (286) survive as deprecated thin-shim syscalls
+  around the same kernel helpers the new ctl files call; new code
+  should use the file form.
 - **`epoll`, `select`, `poll`.** Plan 9 blocks on a single fd at
   a time; concurrency comes from rfork-shared-fd-table workers
   per blocked fd. Layer 2 emulates `select` with helper threads
   and rendezvous.
 - **`ioctl`.** Every control surface is a `ctl` file.
-- **`mmap` (anonymous).** Use `segattach` (when implemented) or
-  large `kmalloc`-backed reads/writes. Linux ABI's `mmap` is
-  Layer 2; Layer 1 has no mmap.
+- **`mmap` (anonymous).** Plan 9 uses `segattach` / `segdetach`
+  (273/274 are reserved here). **F2 #447 (2026-06-11): honest
+  deviation.** Native code today calls `SYS_MMAP` directly for
+  anonymous regions (libc `malloc`, big buffers, hamUI per-frame fb
+  mapping). The replacement `segattach` is scheduled but not built —
+  it needs a per-process segment table the native side doesn't have
+  yet. So `SYS_MMAP`/`SYS_MPROTECT`/`SYS_MUNMAP`/`SYS_MSYNC` survive
+  in the native dispatch table even though they are not Plan-9-shape
+  — the alternative (rewrite every native big-buffer caller to
+  large-kmalloc plus a userspace allocator) is a multi-week build
+  with no boundary win today. The honest-deviation tag is here so a
+  later audit doesn't re-flag it as "drift" — it is a SCHEDULED
+  build, not undocumented sprawl.
 - **`mmap` (file).** Plan 9 does not have it. Memory-mapped I/O
   patterns are translated to read/write by Layer 2 when needed.
+  Native code does NOT have a file-backed mmap at all.
 - **`setuid`/`setgid` family (Linux shape).** Plan 9 has no
   privilege levels in the Unix sense; security is namespace-based
   (`bind` what the process can see). Hamnix's own

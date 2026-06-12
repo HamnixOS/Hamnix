@@ -63,12 +63,22 @@ from kernel.sched.core import (
     WaitQueue, wq_init, wq_wait_prepare, wq_wait_cancel,
     wq_wait_commit, wq_wake_one, WQ_EINTR,
     waitfds_notify,
+    # F2 #447: /dev/wsys/ctl `alloc` verb needs the SYS_WSYS_ALLOC arm's
+    # task-side effects: mark the bound shell task detached + parented
+    # to 0 so hamUI exiting doesn't strand it as a zombie. Look up the
+    # task by pid as the syscall arm does.
+    task_lookup_by_pid, set_task_detached, set_task_parent_pid,
+    set_current_errstr,
 )
 from sys.src.port9.port.chan import (
     MountEntry, Pgrp, MNT_CAP,
     pgrp_current, CHAN_KIND_SRV,
 )
 from mm.slab import kmalloc, kfree
+# F2 #447: /dev/wsys/ctl `frame <wid> <n>` calls the kernel software
+# rasterizer the same way SYS_VK_WINDOW_FRAME does — vk_window_demo
+# is the in-tree native demo renderer that GPU track #181 ships.
+from lib.vk.vk_window_demo import vk_window_render_frame
 
 
 # --- per-wid table ---------------------------------------------------
@@ -2149,4 +2159,226 @@ def wsys_draw_fb_store(wid: int32, slot: int32,
     _wsys_mark_dirty(wid, wsys_layer_x[b], wsys_layer_y[b],
                      wsys_layer_x[b] + wsys_layer_w[b],
                      wsys_layer_y[b] + wsys_layer_h[b])
+    return cast[int64](take)
+
+
+# ====================================================================
+# F2 #447 — /dev/wsys/ctl: system-wide wsys control file
+#
+# Plan-9-shape replacement for SYS_WSYS_ALLOC (293), SYS_WSYS_FREE
+# (294), and SYS_VK_WINDOW_FRAME (312). Writers send one ASCII verb
+# line:
+#
+#   alloc <pid>         claim the lowest free wid (2..MAX_WINDOWS-1)
+#                       for the bound shell pid; the assigned wid is
+#                       stashed in wsys_last_alloc_wid and the write
+#                       returns `bytes_consumed`. A subsequent read on
+#                       the same fd renders the assigned wid as
+#                       "<n>\n" (digits decimal), matching the
+#                       /dev/auth open/write/read/close idiom.
+#   free <wid>          release the named wid (>=2). wid 1 is reserved
+#                       for the foreground and is rejected.
+#   frame <wid> <n>     render Vulkan frame n into the named window
+#                       via the kernel software rasterizer.
+#
+# Hostowner-only — same threat model as the syscalls this replaces
+# (only the trusted DE may bind windows). The gate is `uid != 1` and
+# matches SYS_WSYS_ALLOC's gate in arch/x86/kernel/syscall.ad.
+#
+# DELIBERATELY MINIMUM VIABLE: the surface stays narrow so #442
+# wsys/rio reshape can extend it (additional verbs for chrome,
+# focus, snarf, ...) without conflicting with what landed here. The
+# verb table is the authoritative list — extending it is a Plan-9
+# version bump.
+
+# Global response slot for the "alloc" verb. Written by the wsys ctl
+# write arm on a successful alloc; read by the wsys ctl read arm. With
+# the hostowner-only producer there is a single writer; a read consumes
+# the slot (write a 0 sentinel afterwards) so back-to-back alloc/read
+# pairs work cleanly. -1 means "no result pending" — the read renders
+# "0\n" in that case to match Plan 9 ctl-file shape (a read of a ctl
+# with no result is empty / harmless).
+wsys_last_alloc_wid: int32 = -1
+
+
+def _wsys_ctl_is_ws(c: uint8) -> int32:
+    if c == 32 or c == 9 or c == 10 or c == 13:
+        return 1
+    return 0
+
+
+def _wsys_ctl_skip_ws(buf: Ptr[uint8], pos: uint64, count: uint64) -> uint64:
+    p: uint64 = pos
+    while p < count and _wsys_ctl_is_ws(buf[p]) == 1:
+        p = p + 1
+    return p
+
+
+def _wsys_ctl_token_end(buf: Ptr[uint8], pos: uint64, count: uint64) -> uint64:
+    p: uint64 = pos
+    while p < count and _wsys_ctl_is_ws(buf[p]) == 0:
+        p = p + 1
+    return p
+
+
+def _wsys_ctl_word_eq(buf: Ptr[uint8], start: uint64, end: uint64,
+                      word: Ptr[uint8]) -> int32:
+    wl: uint64 = 0
+    while word[wl] != 0:
+        wl = wl + 1
+    if end - start != wl:
+        return 0
+    i: uint64 = 0
+    while i < wl:
+        if buf[start + i] != word[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _wsys_ctl_parse_u64(buf: Ptr[uint8], start: uint64, end: uint64,
+                        out: Ptr[uint64]) -> int32:
+    # Parse a non-negative decimal integer in buf[start..end). Returns 1
+    # on success (value written through `out`), 0 on a non-digit or
+    # empty range.
+    if start >= end:
+        return 0
+    v: uint64 = 0
+    p: uint64 = start
+    while p < end:
+        c: uint8 = buf[p]
+        if c < 48 or c > 57:
+            return 0
+        v = v * 10 + cast[uint64](c) - 48
+        p = p + 1
+    out[0] = v
+    return 1
+
+
+def devwsys_ctl_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # F2 #447 system-wide wsys-ctl writer. Hostowner-only — non-uid-1
+    # callers get -EPERM. Returns the count consumed on success or -1
+    # with errstr on a parse/policy failure.
+    if current_task_uid() != 1:
+        set_current_errstr("/dev/wsys/ctl: permission denied (not hostowner)")
+        return -1
+    if count == 0:
+        return 0
+    p: uint64 = _wsys_ctl_skip_ws(buf, 0, count)
+    vs: uint64 = p
+    p = _wsys_ctl_token_end(buf, p, count)
+    ve: uint64 = p
+    if vs == ve:
+        set_current_errstr("/dev/wsys/ctl: missing verb")
+        return -1
+    # First numeric argument (alloc <pid>, free <wid>, frame <wid> ...).
+    p = _wsys_ctl_skip_ws(buf, p, count)
+    a1s: uint64 = p
+    p = _wsys_ctl_token_end(buf, p, count)
+    a1e: uint64 = p
+    arg1: uint64 = 0
+    if a1s == a1e:
+        set_current_errstr("/dev/wsys/ctl: missing argument")
+        return -1
+    if _wsys_ctl_parse_u64(buf, a1s, a1e, &arg1) == 0:
+        set_current_errstr("/dev/wsys/ctl: bad argument")
+        return -1
+
+    # alloc <pid> — mirrors SYS_WSYS_ALLOC's body.
+    if _wsys_ctl_word_eq(buf, vs, ve, "alloc") == 1:
+        # Refuse self-registration (the syscall arm did this too — a
+        # self-detach is nonsensical).
+        if arg1 == current_task_pid():
+            set_current_errstr("/dev/wsys/ctl: alloc refuses self-registration")
+            return -1
+        tgt: int32 = task_lookup_by_pid(arg1)
+        if tgt < 0:
+            set_current_errstr("/dev/wsys/ctl: alloc: no such pid")
+            return -1
+        w: int32 = wsys_alloc_wid(arg1)
+        if w < 0:
+            set_current_errstr("/dev/wsys/ctl: alloc: table full or pid already bound")
+            return -1
+        set_task_detached(tgt, 1)
+        set_task_parent_pid(tgt, 0)
+        wsys_last_alloc_wid = w
+        return cast[int64](count)
+
+    # free <wid>
+    if _wsys_ctl_word_eq(buf, vs, ve, "free") == 1:
+        if arg1 > 0xFFFFFFFF:
+            set_current_errstr("/dev/wsys/ctl: free: bad wid")
+            return -1
+        rc: int32 = wsys_free_wid(cast[int32](arg1))
+        if rc < 0:
+            set_current_errstr("/dev/wsys/ctl: free: bad wid or wid==1 (foreground)")
+            return -1
+        return cast[int64](count)
+
+    # frame <wid> <frame>
+    if _wsys_ctl_word_eq(buf, vs, ve, "frame") == 1:
+        # Second arg = frame number.
+        p = _wsys_ctl_skip_ws(buf, p, count)
+        a2s: uint64 = p
+        p = _wsys_ctl_token_end(buf, p, count)
+        a2e: uint64 = p
+        if a2s == a2e:
+            set_current_errstr("/dev/wsys/ctl: frame: missing frame number")
+            return -1
+        arg2: uint64 = 0
+        if _wsys_ctl_parse_u64(buf, a2s, a2e, &arg2) == 0:
+            set_current_errstr("/dev/wsys/ctl: frame: bad frame number")
+            return -1
+        if arg1 > 0xFFFFFFFF:
+            set_current_errstr("/dev/wsys/ctl: frame: bad wid")
+            return -1
+        vkrc: int32 = vk_window_render_frame(cast[int32](arg1),
+                                             cast[int64](arg2))
+        if vkrc != 0:
+            set_current_errstr("/dev/wsys/ctl: frame: render/present failed")
+            return -1
+        return cast[int64](count)
+
+    set_current_errstr("/dev/wsys/ctl: bad verb")
+    return -1
+
+
+def devwsys_ctl_read(off: uint64, buf: Ptr[uint8],
+                     count: uint64) -> int64:
+    # Render wsys_last_alloc_wid as "<n>\n". On a second read (off > 0)
+    # or no pending result, return EOF — the read consumes the slot.
+    if off > 0:
+        return 0
+    if wsys_last_alloc_wid < 0:
+        return 0
+    val: int32 = wsys_last_alloc_wid
+    wsys_last_alloc_wid = -1
+    # Decimal render into a small scratch (val is at most MAX_WINDOWS,
+    # so 2 digits + '\n' suffice — round up to 16 for safety).
+    scratch: Array[16, uint8]
+    n: uint64 = 0
+    if val == 0:
+        scratch[0] = 48
+        n = 1
+    else:
+        v: uint32 = cast[uint32](val)
+        digs: Array[16, uint8]
+        d: uint64 = 0
+        while v > 0:
+            digs[d] = cast[uint8](v % 10) + 48
+            v = v / 10
+            d = d + 1
+        while d > 0:
+            d = d - 1
+            scratch[n] = digs[d]
+            n = n + 1
+    scratch[n] = 10                                    # '\n'
+    n = n + 1
+    take: uint64 = count
+    if take > n:
+        take = n
+    i: uint64 = 0
+    while i < take:
+        buf[i] = scratch[i]
+        i = i + 1
     return cast[int64](take)
