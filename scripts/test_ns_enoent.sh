@@ -121,6 +121,25 @@ check "[ns_enoent] child /etc/inittab still ENOENT post-bind (expected)" \
       "an unrelated bind does not resurrect a global root"
 check "[ns_enoent] child /bin/cat ENOENT (expected)" \
       "never-bound subtree stays invisible"
+# F10-1 (#454) extension: the devtab leg of the substrate gate (the
+# audit's load-bearing finding). namec's _devtab_lookup keys on the
+# `#c/<leaf>` server-letter spelling only; /dev/<leaf> opens fail
+# ENOENT in an empty namespace exactly the same way /etc/inittab does
+# above.
+check "[ns_enoent] child /dev/null ENOENT (expected, devtab gated)" \
+      "F10-1: /dev/null is namespace-gated (no devtab strcmp bypass)"
+check "[ns_enoent] child /dev/zero ENOENT (expected, devtab gated)" \
+      "F10-1: /dev/zero is namespace-gated"
+check "[ns_enoent] child /dev/random ENOENT (expected, devtab gated)" \
+      "F10-1: /dev/random is namespace-gated"
+check "[ns_enoent] child /dev/cpuinfo ENOENT (expected, devtab gated)" \
+      "F10-1: /dev/cpuinfo is namespace-gated"
+check "[ns_enoent] child bind /dev <- #c ok" \
+      "F10-1: server-anchored #c bind into the empty namespace works"
+check "[ns_enoent] child /dev/null ok (post #c bind)" \
+      "F10-1: post-bind /dev/null opens via the devtab #c/<leaf> arm"
+check "[ns_enoent] child /dev/zero ok (post #c bind)" \
+      "F10-1: post-bind /dev/zero opens via the devtab #c/<leaf> arm"
 check "[ns_enoent] child PASS" \
       "child reached PASS"
 check "[ns_enoent] parent /etc/inittab ok post-child" \
