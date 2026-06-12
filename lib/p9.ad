@@ -1,0 +1,282 @@
+# lib/p9.ad
+#
+# #450 F6 — Plan 9-shape userland helpers for what used to be drift
+# syscalls (SYS_SPAWN / SYS_LISTDIR / SYS_KILL). The kernel side of
+# Phase G retires those three syscall arms (numbers stay reserved per
+# the F2 pattern); user code now uses the Plan-9-shape file + rfork
+# primitives directly. This library is the thin glue.
+#
+# The "200-line magic SYS_SPAWN inheritance block" in
+# arch/x86/kernel/syscall.ad goes away — the inheritance story is
+# expressed where it should be: in userland, via rfork's flag set + an
+# explicit dup2 + the existing sys_fdbind binding API. No kernel-side
+# spawn() exists. Every fork+exec happens in userland.
+#
+# WHAT THIS PROVIDES
+# ==================
+#
+#   spawn(path, argv, sin, sout, envp) -> int32
+#       Plan-9 rfork+exec replacement for the retired SYS_SPAWN.
+#       The flags are RFPROC | RFFDG | RFNAMEG so the child gets a
+#       PRIVATE COW namespace (including a private /fd-name table) and
+#       a PRIVATE fd table — same isolation guarantees the kernel arm
+#       used to provide. The child handles stdin/stdout redirection via
+#       sys_dup2 between rfork and exec for the legacy integer-fd case
+#       (sin/sout in [0, 16)); for the SPAWN_STDIO_NS sentinel (-2) the
+#       child runs untouched — the parent rebinds the child's /fd/N via
+#       sys_fdbind(pid, ...) BEFORE yielding to it (cooperative
+#       scheduler keeps the child STATE_READY across the spawn return).
+#
+#       Return: child pid in parent (>0), -1 on error (rfork failed),
+#       127 in the child on exec failure (sys_exit(127), matches the
+#       legacy "command not found" convention).
+#
+#   p9_note(pid, msg) -> int32
+#       Plan-9 note (signal) replacement for the retired SYS_KILL. Opens
+#       /proc/<pid>/note for write, writes `msg` (NUL-terminated), closes.
+#       Layer 2 maps Linux signal numbers to note strings (docs/native-api.md
+#       "Notes"); native callers pass the string directly.
+#       Return: 0 on success, -1 on error.
+#
+#   p9_listdir(path, buf, count) -> int64
+#       Plan-9 directory-read replacement for the retired SYS_LISTDIR.
+#       open(path, OREAD) + read(fd, buf, count) + close(fd). The
+#       backing FS still renders directory contents as "NAME\n" lines
+#       (DEV_DIR_FILE / _dirfile_read), so the format the syscall used
+#       to return is preserved here exactly. Callers parse "NAME\n"
+#       records the same way they did before. Migrating to native-api.md's
+#       9P Dir-record stream is a separate kernel-side track (the
+#       kernel's stat/fstat already build Dir records; the dir-read path
+#       still emits NAME\n until that switchover lands).
+#       Return: bytes written into `buf` on success (>= 0), -1 on error
+#       (open failure or the path is not a directory).
+#
+# COMPILER QUIRKS HONOURED: single-file module, no nested helpers, no
+# adjacent string-literal concatenation.
+
+extern def sys_rfork(flags: int32) -> int32
+extern def sys_execve_env(path: Ptr[char], argv: Ptr[uint64],
+                          envp: Ptr[uint64]) -> int32
+extern def sys_dup2(oldfd: int32, newfd: int32) -> int32
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+
+
+# rfork flag bits (mirror sys/src/9/port/sysproc.ad's RF* constants).
+P9_RFPROC:   int32 = 0x001
+P9_RFFDG:    int32 = 0x004
+P9_RFNAMEG:  int32 = 0x008
+P9_RFENVG:   int32 = 0x010
+
+
+# Sentinels carried over from the retired SYS_SPAWN ABI so callers don't
+# need to learn new constants. -2 means "spawn-in-namespace mode" (parent
+# does sys_fdbind on the child); -1 means "inherit parent's fd". Anything
+# in [0, 16) is a real parent fd to dup into the child's slot.
+P9_SPAWN_STDIO_NS: int32 = -2
+P9_SPAWN_STDIO_INHERIT: int32 = -1
+
+
+# _p9_path_buf: scratch path renderer for /proc/<pid>/note. Single-file
+# module scope so the buffer is BSS, matching the rest of the userland
+# convention (no malloc).
+_p9_path_buf: Array[64, uint8]
+
+
+def _p9_render_u32(v: uint32, out: Ptr[uint8], cap: uint64) -> uint64:
+    # Render `v` as decimal into `out`, NUL-terminated. Returns the
+    # length without the NUL. Caller guarantees cap >= 12.
+    if v == 0:
+        out[0] = 48                              # '0'
+        out[1] = 0
+        return 1
+    digits: Array[12, uint8]
+    n: uint64 = 0
+    vv: uint64 = cast[uint64](v)
+    while vv != 0 and n < 12:
+        digits[n] = cast[uint8](48 + (vv % 10))
+        vv = vv / 10
+        n = n + 1
+    # Reverse into out.
+    i: uint64 = 0
+    while i < n and i + 1 < cap:
+        out[i] = digits[n - 1 - i]
+        i = i + 1
+    out[i] = 0
+    return i
+
+
+def _p9_build_note_path(pid: int32) -> Ptr[char]:
+    # Render "/proc/<pid>/note" into _p9_path_buf and return it as
+    # Ptr[char]. NUL-terminated.
+    p: Ptr[uint8] = cast[Ptr[uint8]](&_p9_path_buf[0])
+    # "/proc/" prefix.
+    p[0] = 47                                    # '/'
+    p[1] = 112                                   # 'p'
+    p[2] = 114                                   # 'r'
+    p[3] = 111                                   # 'o'
+    p[4] = 99                                    # 'c'
+    p[5] = 47                                    # '/'
+    off: uint64 = 6
+    nlen: uint64 = _p9_render_u32(cast[uint32](pid),
+                                  cast[Ptr[uint8]](&_p9_path_buf[off]),
+                                  64 - off)
+    off = off + nlen
+    # "/note" suffix.
+    if off + 5 >= 64:
+        # Shouldn't happen — a 32-bit pid renders to <= 10 digits, so
+        # 6 + 10 + 5 = 21 bytes total — well under 64. Defensive only.
+        return cast[Ptr[char]](&_p9_path_buf[0])
+    p[off] = 47                                  # '/'
+    p[off + 1] = 110                             # 'n'
+    p[off + 2] = 111                             # 'o'
+    p[off + 3] = 116                             # 't'
+    p[off + 4] = 101                             # 'e'
+    p[off + 5] = 0
+    return cast[Ptr[char]](&_p9_path_buf[0])
+
+
+def _p9_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+# --- spawn() — rfork+exec, the SYS_SPAWN replacement ---------------
+
+def _p9_route_stdio_through_fdname(fdnum: int32, fdname: Ptr[char]):
+    # SPAWN_STDIO_NS contract: the child's integer fd `fdnum` resolves
+    # through the /fd/<N> name in its (already-cloned) Pgrp, so the
+    # parent's sys_fdbind(child_pid, fdnum, ...) rebinds take effect on
+    # the child's reads/writes. The OLD kernel SYS_SPAWN block did this
+    # by installing FD_CHAN_MARK + DEV_DEVFD inline-chan ids directly
+    # into the child's TaskStruct fd table. Userland can't write
+    # TaskStruct, but it can achieve the SAME routing by opening the
+    # /fd/<N> namespace name and dup2'ing the resulting fd onto fdnum:
+    # vfs.namec rewrites the open into the same FD_CHAN_MARK+DEV_DEVFD
+    # fd the kernel arm used to plant. Once dup2'd, integer-fd reads
+    # /writes route through /fd/<N> — and any subsequent
+    # sys_fdbind(child, N, ...) by the parent retargets that name.
+    newfd: int32 = sys_open(fdname)
+    if newfd < 0:
+        return
+    if newfd != fdnum:
+        sys_dup2(newfd, fdnum)
+        sys_close(newfd)
+
+
+def spawn(path: Ptr[char], argv: Ptr[uint64],
+          sin: int32, sout: int32, envp: Ptr[uint64]) -> int32:
+    # Plan 9-shape spawn. RFPROC creates the child; RFFDG gives it a
+    # PRIVATE fd-table copy; RFNAMEG gives it a PRIVATE COW Pgrp (which
+    # carries a COW copy of the caller's mtab + /fd-name table). These
+    # three flags reproduce the isolation the kernel's old SYS_SPAWN
+    # block did for SPAWN_STDIO_NS, without any kernel-side magic — the
+    # rfork primitive alone is enough.
+    flags: int32 = P9_RFPROC | P9_RFFDG | P9_RFNAMEG
+    pid: int32 = sys_rfork(flags)
+    if pid < 0:
+        return -1
+    if pid != 0:
+        # Parent: child pid is returned. The parent typically calls
+        # sys_fdbind(pid, ...) to wire pipe/redirect/dup at the child's
+        # /fd/N names; the cooperative scheduler keeps the child
+        # STATE_READY through this call so binds land before the child
+        # ever runs.
+        return pid
+    # Child: handle the integer-fd contract before exec.
+    #
+    # SPAWN_STDIO_NS (-2): the parent will rebind the child's /fd/N
+    # names via sys_fdbind, so the child must route its integer fd
+    # 0/1/2 through the /fd-name table for those binds to take effect
+    # on reads/writes. The OLD kernel arm planted FD_CHAN_MARK +
+    # DEV_DEVFD inline-chan ids directly; we achieve the same routing
+    # in userland by opening the /fd/<N> name and dup2'ing it onto
+    # the integer slot. The parent's sys_fdbind on the cloned-COW
+    # Pgrp's /fd-name table then steers what /fd/<N> resolves to.
+    if sin == P9_SPAWN_STDIO_NS:
+        _p9_route_stdio_through_fdname(0, cast[Ptr[char]]("/fd/0"))
+    if sout == P9_SPAWN_STDIO_NS:
+        _p9_route_stdio_through_fdname(1, cast[Ptr[char]]("/fd/1"))
+        # fd 2 / stderr: the OLD SYS_SPAWN block also routed fd 2
+        # through /fd/2. We do the same here so a child's writes to
+        # stderr land in the right place after a 2>&1 / 2>file
+        # parent-side rebind.
+        _p9_route_stdio_through_fdname(2, cast[Ptr[char]]("/fd/2"))
+    # Legacy integer-fd cases: an explicit fd number in [0, 16) means
+    # "dup2 the parent's fd N onto the child's fd 0 / 1". -1 means
+    # "inherit the parent's fd N" which RFFDG already gave us.
+    if sin >= 0 and sin < 16:
+        sys_dup2(sin, 0)
+    if sout >= 0 and sout < 16:
+        sys_dup2(sout, 1)
+    # exec. sys_execve_env doesn't return on success. On failure (bad
+    # path, malformed ELF, ENOENT) we exit 127 to match the legacy
+    # SYS_SPAWN "command not found" convention so callers can keep their
+    # exit-code probes.
+    sys_execve_env(path, argv, envp)
+    sys_exit(127)
+    return 127                                   # unreached
+
+
+# --- p9_note() — write a note string, the SYS_KILL replacement ------
+
+def p9_note(pid: int32, msg: Ptr[uint8]) -> int32:
+    # /proc/<pid>/note — open for write, write the note string,
+    # close. Plan 9's signal model: the message is what the target's
+    # registered note handler sees. With no handler installed today
+    # the kernel parks note_pending + the message on the target task;
+    # the cross-task drain that consumes note_pending without a handler
+    # is a separate kernel-side milestone (documented in
+    # sys/src/9/port/sysnote.ad). Caller gets a clean return on the
+    # write; semantics match what the F2 audit shipped for the rest of
+    # the drift retirement family.
+    path: Ptr[char] = _p9_build_note_path(pid)
+    fd: int32 = sys_open_write(path)
+    if fd < 0:
+        return -1
+    n: uint64 = _p9_strlen(msg)
+    rc: int64 = sys_write(fd, msg, n)
+    sys_close(fd)
+    if rc < 0:
+        return -1
+    return 0
+
+
+# --- p9_listdir() — read a directory, the SYS_LISTDIR replacement ---
+
+def p9_listdir(path: Ptr[char], buf: Ptr[uint8], count: uint64) -> int64:
+    # Open `path` as a directory and copy its rendered "NAME\n"
+    # listing into `buf`. The dir fd's read backing is DEV_DIR_FILE
+    # (_dirfile_read in sys/src/9/port/namec.ad) — it already produces
+    # the exact same "NAME\n"-packed format the retired SYS_LISTDIR
+    # used to return, so existing callers' parsing stays byte-identical
+    # without any format conversion in this wrapper. Returns the bytes
+    # written into `buf` (>= 0), or -1 on error (path doesn't exist,
+    # isn't a directory, or read failed).
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    total: int64 = 0
+    # Loop reads until EOF or the caller's buffer is full. Most
+    # directories fit in a single read of a 4 KiB+ buffer, but a tiny
+    # buffer paired with a large directory must drain across multiple
+    # reads — same shape sys_read uses on regular files.
+    while cast[uint64](total) < count:
+        rem: uint64 = count - cast[uint64](total)
+        slice_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + cast[uint64](total))
+        n: int64 = sys_read(fd, slice_ptr, rem)
+        if n < 0:
+            sys_close(fd)
+            return -1
+        if n == 0:
+            break                                 # EOF
+        total = total + n
+    sys_close(fd)
+    return total

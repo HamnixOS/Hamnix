@@ -367,21 +367,19 @@ sys_execve_env:
     .size sys_execve_env, .-sys_execve_env
 
 
-    /* --- sys_spawn(path, argv, stdin_fd, stdout_fd, envp) -> int32 --
-     * 5-arg syscall. SysV places arg 4 in %rcx and arg 5 in %r8,
-     * but the syscall ABI reserves %rcx for the user RIP and uses
-     * %r10 for arg 4. Shuffle %rcx -> %r10 before `syscall`; %r8
-     * (arg 5: envp) already lines up between the two ABIs.
-     * U17: envp is a Ptr[uint64] NULL-terminated array of cstring
-     * pointers to "NAME=VALUE\0", or 0 for empty env. */
-    .globl sys_spawn
-    .type sys_spawn, @function
-sys_spawn:
-    movq    %rcx, %r10              /* arg 4: stdout_fd */
-    movq    $11, %rax               /* SYS_SPAWN */
-    syscall
-    ret
-    .size sys_spawn, .-sys_spawn
+    /* --- RETIRED: SYS_SPAWN -----------------------------------------
+     * #450 F6 / Phase G: SYS_SPAWN (number 11) is retired from the
+     * native dispatch table. Native code uses lib/p9.ad's spawn()
+     * wrapper — Plan-9 rfork(RFPROC|RFFDG|RFNAMEG) + sys_execve in
+     * the child + dup2 for the legacy integer-fd cases (sin/sout in
+     * [0, 16)). The 200-line stdio/fd/Pgrp inheritance block that
+     * used to live in arch/x86/kernel/syscall.ad is gone with the
+     * arm; the inheritance story is rfork's flag set + the child's
+     * own dup2, not magic kernel-side wiring.
+     *
+     * Number 11 stays reserved (matches the F2 retirement pattern).
+     * Do not reintroduce a SYS_SPAWN wrapper here.
+     */
 
 
     /* --- sys_waitpid(pid) -> int64 (child exit_code or -errno) ------
@@ -393,7 +391,7 @@ sys_spawn:
      * WNOHANG poll: the kernel returns -EAGAIN without reaping, the
      * caller treats that as the child's status, and the EXITED child is
      * never reaped — leaking a task slot per such call until the table
-     * fills and every further sys_spawn fails ("command not found").
+     * fills and every further spawn() fails ("command not found").
      * Zeroing %rsi pins the documented "a1=0 -> blocking" contract. */
     .globl sys_waitpid
     .type sys_waitpid, @function
@@ -441,7 +439,7 @@ sys_pipe:
      * socketpair(2) call site land here unchanged. 4-arg syscall:
      * SysV places arg 4 in %rcx, but the syscall ABI reserves %rcx
      * for the user RIP and wants arg 4 in %r10. Shuffle %rcx -> %r10
-     * before SYSCALL (same pattern as sys_spawn / sys_mount). */
+     * before SYSCALL (same pattern as sys_mount). */
     .globl sys_socketpair
     .type sys_socketpair, @function
 sys_socketpair:
@@ -516,17 +514,36 @@ sys_resolve_ptr:
      * Syscall number 277 is unassigned in the dispatch table. */
 
 
-    /* --- sys_kill(pid, sig) -> int32 ---------------------------------
-     * Post `sig` into pid's pending-signal bitmap. Default
-     * disposition for every signal is TERM with exit code 128+sig
-     * — no per-process handlers yet. */
-    .globl sys_kill
-    .type sys_kill, @function
-sys_kill:
-    movq    $15, %rax               /* SYS_KILL */
+    /* --- sys_pgrp_kill(pgid, sig) -> int32 ---------------------------
+     * #450 F6 / Phase G: the positive-pid SYS_KILL drift arm is
+     * retired (positive-pid kills now go through Plan-9-shape
+     * /proc/<pid>/note writes via lib/p9.ad's p9_note). What survives
+     * here is the NEGATIVE-PID job-control branch — Unix
+     * kill(-pgid, sig), used by hamsh to broadcast SIGCONT/SIGTERM/
+     * SIGKILL to every member of a process group at once. F2 #447
+     * deliberately left the POSIX job-control family (SETPGID /
+     * TCSETPGRP / WAITPID_JC) in place as follow-up scope; the
+     * matching negative-pid SYS_KILL path comes along for the ride.
+     *
+     * Wrapper takes the GROUP id as a uint32 so the caller never has
+     * to construct the negative-pid convention themselves; we negate
+     * it on the way in. The kernel's SYS_KILL arm now accepts
+     * NEGATIVE pids ONLY (positive-pid -> -ENOSYS with errstr
+     * "kill: use /proc/<pid>/note").
+     *
+     * Three args fit the SysV / syscall-ABI overlap directly
+     * (pgid -> %edi, sig -> %esi) — but we need to negate %rdi
+     * before issuing the syscall, in place. */
+    .globl sys_pgrp_kill
+    .type sys_pgrp_kill, @function
+sys_pgrp_kill:
+    /* a0 = -pgid (signed) */
+    movl    %edi, %edi              /* zero-extend pgid -> %rdi */
+    negq    %rdi                    /* %rdi = -pgid */
+    movq    $15, %rax               /* SYS_KILL (kept for neg-pid only) */
     syscall
     ret
-    .size sys_kill, .-sys_kill
+    .size sys_pgrp_kill, .-sys_pgrp_kill
 
 
     /* --- sys_setpgid(pid, pgid) -> int32 -----------------------------
@@ -594,17 +611,18 @@ sys_dup2:
     .size sys_dup2, .-sys_dup2
 
 
-    /* --- sys_listdir(path, buf, count) -> int64 ----------------------
-     * Pack directory entries from `path` as "NAME.EXT\n" lines into
-     * `buf`, up to `count` bytes. Returns bytes written, or
-     * -errno. /mnt/* only for now. */
-    .globl sys_listdir
-    .type sys_listdir, @function
-sys_listdir:
-    movq    $18, %rax               /* SYS_LISTDIR */
-    syscall
-    ret
-    .size sys_listdir, .-sys_listdir
+    /* --- RETIRED: SYS_LISTDIR ---------------------------------------
+     * #450 F6 / Phase G: SYS_LISTDIR (number 18) is retired from the
+     * native dispatch table. Native code uses lib/p9.ad's p9_listdir()
+     * — Plan-9 open(path, OREAD) + read(fd, buf, count) + close(fd).
+     * The directory-fd's read backing (DEV_DIR_FILE / _dirfile_read in
+     * sys/src/9/port/namec.ad) emits the SAME "NAME\n" packed bytes
+     * the retired syscall used to produce, so userland glob parsing
+     * stays byte-for-byte identical.
+     *
+     * Number 18 stays reserved (matches the F2 retirement pattern).
+     * Do not reintroduce a SYS_LISTDIR wrapper here.
+     */
 
 
     /* --- sys_chdir(path) -> int32 ------------------------------------ */
@@ -862,7 +880,7 @@ sys_set_realtime:
      * (2..MAX_WINDOWS-1) in the kernel's wsys table. Returns the
      * assigned wid on success or -1 if the table is full / pid is
      * already bound. Hostowner-only on the kernel side. The /bin/hamUI
-     * tool calls this after sys_spawn'ing a detached hamsh — the wid
+     * tool calls this after spawn()'ing a detached hamsh — the wid
      * is the addressing key for /dev/wsys/<wid>/* from any namespace.
      * Number 293 (not 292) because F2's SYS_SET_REALTIME took 292. */
     .globl sys_wsys_alloc
