@@ -299,10 +299,15 @@ Twelve findings from the F10 second-pass audit; full text in
 `audit_F10_report.md` on main. Top three deepest issued as #454/#455/
 #456; remaining nine bundled in #457.
 
-- [ ] **F10-1 (#454)** — wire `resolve_path` at top of `_vfs_open_post_perm`;
+- [x] **F10-1 (#454)** — wire `resolve_path` at top of `_vfs_open_post_perm`;
   delete the literal `/dev/<leaf>` strcmp table in `_devtab_lookup`.
   THE LOAD-BEARING fix: closes F1's bypass. After this, RFCNAMEG child
   with no `bind '#c' /dev` actually gets ENOENT on `open("/dev/null")`.
+  **DONE** (merge `90736cce`): resolve_path wired at every public
+  vfs_open* entry (single resolve site avoids a double-resolve
+  non-idempotency bug); devtab literal table fully deleted; extended
+  test_ns_enoent proves both ENOENT-on-empty-ns and post-bind success.
+  Incidental REGRESSION FIX in test_p9_drift_ctls (F2 hold).
 - [ ] **F10-2 (#455)** — `_path_owning_server` defaults to cpio + grant
   on cpio miss = unknown paths are permissive. Switch default to
   unknown→EPERM; move `_perm_check_<X>` bodies INTO their server files
