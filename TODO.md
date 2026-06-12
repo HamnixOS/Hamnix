@@ -308,10 +308,17 @@ Twelve findings from the F10 second-pass audit; full text in
   non-idempotency bug); devtab literal table fully deleted; extended
   test_ns_enoent proves both ENOENT-on-empty-ns and post-bind success.
   Incidental REGRESSION FIX in test_p9_drift_ctls (F2 hold).
-- [ ] **F10-2 (#455)** — `_path_owning_server` defaults to cpio + grant
+- [x] **F10-2 (#455)** — `_path_owning_server` defaults to cpio + grant
   on cpio miss = unknown paths are permissive. Switch default to
   unknown→EPERM; move `_perm_check_<X>` bodies INTO their server files
-  ("policy lives in the server" claim made real).
+  ("policy lives in the server" claim made real). **DONE** (merge
+  `57df21e5`): SERVER_UNKNOWN default-deny added; per-server bodies
+  moved into their server files; real policies in the ex-stubs (devproc/
+  devnet/devblk now enforce uid checks); bonus F10-7 fix (devproc
+  pri/oomadj/policy uid gate). New test_perm_unknown_path gate proves
+  the dispatch (-1 for unknown server vs -2 for unbound namespace).
+  Pre-existing test_linux_sh failure root-caused to cpio mode +
+  svc-supervised uid=2 — follow-up.
 - [ ] **F10-3 (#456)** — every fresh task starts uid=1 (`kernel/sched/
   core.ad:2532`); F3's hostowner bypass fires pre-login. Flip default
   to NOBODY uid; keep PID 1 as hostowner via inittab.
