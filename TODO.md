@@ -285,16 +285,14 @@ replaces the ~70 `is_*_path` backend-selection branches).
 ## Plan 9 alignment audit findings (#444, 2026-06-11)
 
 **ALL findings queued as fix tracks (user 2026-06-11: "hammer the whole
-thing into a plan 9 shape"):** F1=#446 (keystone) **DONE 2026-06-11**.
-F5=#445 (done). F8=#451 (done). F9=#452 **DONE 2026-06-11** — residual
-literal-path sweep landed; 3 arms converted (`/dev/auth` onto namec,
-19 `/etc/<flag>` markers consolidated into `kernel/boot_flags.ad`,
-`/tmp/core` routed through per-Pgrp `ns_walk`, distro prefix lifted to
-named accessor); 4 arms DEFERRED-to-F4 (`/dev/fuse`, `/dev/ptmx`,
-`/dev/pts/<N>`, `/sys/fs/cgroup` — all wholly Linux-ABI). See STATUS
-row. **Remaining:** F2=#447 syscall→ctl sweep, F3=#448 server-boundary
-perms/factotum, F4=#449 linux_abi leaf inversion (now has the F9-tagged
-arms to pick up), F6=#450 Phase G finish, F7=#390 FD-mark fold
+thing into a plan 9 shape"):** F1=#446 (keystone) **DONE**. F5=#445
+**DONE**. F8=#451 **DONE**. F9=#452 **DONE**. F4=#449 **DONE 2026-06-11**
+— linux_abi/ is a true leaf, import direction inverted; new
+`linux_abi/init.ad` plants every shim hook at boot; acceptance grep
+empty; FD-kinds dispatched through hook table; the four F9-DEFERRED
+path arms (fuse/ptmx/pts/cgroup) now shim-registered. See STATUS row.
+**Remaining:** F2=#447 syscall→ctl sweep, F3=#448 server-boundary
+perms/factotum, F6=#450 Phase G finish, F7=#390 FD-mark fold
 continuation, F10=#453 re-audit AFTER the wave lands.
 
 Full ranked report delivered in-session; spine (Chan/namec/devtab, Pgrp
@@ -319,10 +317,16 @@ device, /dev/mountrpc tripwire) judged honestly Plan 9. Gaps, ranked:
    vfs_auth_mediator_active backdoor; devauth reads /etc/shadow by literal
    path from kernel context. Fix: enforce at attach/server boundary;
    long-term userland factotum at /srv/factotum.
-4. [ ] **linux_abi is not a leaf**: native fs/vfs.ad imports
+4. [x] **linux_abi is not a leaf**: native fs/vfs.ad imports
    u_pty/u_epoll/u_fuse (vfs.ad:109,328,346) and carries Linux fd-kind arms;
-   arch syscall.ad/time.ad import vdso/loader. Fix: shim registers fd
-   kinds/paths via init-time hook table; vdso export inverts.
+   arch syscall.ad/time.ad import vdso/loader. **F4 DONE** (`#449`, merge
+   `504e4cd7` 2026-06-11): import direction inverted; new
+   `linux_abi/init.ad` plants every shim hook at boot; acceptance grep
+   `grep -rn "import linux_abi" fs/ arch/ sys/ kernel/ drivers/ mm/ user/`
+   is empty. FD-kinds dispatched through the hook table (kept as
+   `FD_*_MARK` per Boundary-discipline law); the four F9-DEFERRED path
+   arms (fuse/ptmx/pts/cgroup) are now shim-registered path handlers.
+   See STATUS row.
 5. [x] **#445 LANDED** — SYS_SYMLINK/SYS_MSYNC collision fixed (msync →
    317; symlink + msync userland gates green). See STATUS.md.
 6. [ ] **Phase G unfinished**: 23 programs still sys_spawn (hamsh spawns
