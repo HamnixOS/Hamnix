@@ -285,13 +285,13 @@ replaces the ~70 `is_*_path` backend-selection branches).
 ## Plan 9 alignment audit findings (#444, 2026-06-11)
 
 **ALL findings queued as fix tracks (user 2026-06-11: "hammer the whole
-thing into a plan 9 shape"):** F1=#446 **DONE**. F2=#447 **DONE
-2026-06-11** — 8 drift-arms retired onto ctl files; doc owns timerfd/
-job-control/mmap honestly. F4=#449 **DONE**. F5=#445 **DONE**.
-F8=#451 **DONE**. F9=#452 **DONE**. **Remaining:** F3=#448
-server-boundary perms/factotum, F6=#450 Phase G finish, F7=#390
+thing into a plan 9 shape"):** F1=#446 **DONE**. F2=#447 **DONE**.
+F3=#448 **DONE 2026-06-11** — server-boundary perm dispatch landed;
+`_vfs_check_perm` gone; per-server policies; factotum wire-shape
+documented. F4=#449 **DONE**. F5=#445 **DONE**. F8=#451 **DONE**.
+F9=#452 **DONE**. **Remaining:** F6=#450 Phase G finish, F7=#390
 FD-mark fold continuation, F10=#453 re-audit AFTER the wave lands
-(6 of 10 closed today).
+(7 of 10 closed today).
 
 Full ranked report delivered in-session; spine (Chan/namec/devtab, Pgrp
 binds, unions MREPL/MBEFORE/MAFTER, notes, /net no-sockets, /srv, #d fd
@@ -315,12 +315,18 @@ device, /dev/mountrpc tripwire) judged honestly Plan 9. Gaps, ranked:
    job-control flagged as out-of-scope drift; mmap deviation honestly
    owned in `docs/native-api.md` (segattach migration scheduled). See
    STATUS row.
-3. [ ] **Permissions = kernel literal-path funnel, not server-boundary.**
+3. [x] **Permissions = kernel literal-path funnel, not server-boundary.**
    `fs/vfs.ad:1129 _vfs_check_perm` hardcodes /etc/shadow, /dev/blk,
    /var/lib/hpm + ext4 mode bits + uid==1 bypass + global
    vfs_auth_mediator_active backdoor; devauth reads /etc/shadow by literal
-   path from kernel context. Fix: enforce at attach/server boundary;
-   long-term userland factotum at /srv/factotum.
+   path from kernel context. **F3 DONE** (`#448`, merge `41be7d14`
+   2026-06-11): `_vfs_check_perm` gone; `vfs_auth_mediator_active` deleted;
+   ext4 mode-bits moved to `fs/ext4.ad`; new `chan_permission_check`
+   dispatcher (~25 lines) delegates to per-server `_perm_check_<X>`
+   policies; `devauth.ad` switched to explicit `vfs_open_kernel`/
+   `vfs_open_write_kernel` entry points. Follow-ups: `do_mount`/`afd`
+   wiring (TODO at syschan.ad:201) and userland factotum (wire-shape
+   documented in `docs/security.md`). See STATUS row.
 4. [x] **linux_abi is not a leaf**: native fs/vfs.ad imports
    u_pty/u_epoll/u_fuse (vfs.ad:109,328,346) and carries Linux fd-kind arms;
    arch syscall.ad/time.ad import vdso/loader. **F4 DONE** (`#449`, merge
