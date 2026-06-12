@@ -128,37 +128,86 @@ Concretely, every `vfs_open` / `vfs_open_write` / exec goes through
 **exactly one** decision: it identifies the file server that OWNS the
 path (cpio `#r`, tmpfs `#t`, ext4 `#e`, FAT `#f`, devs `#c`, block
 `#b`, proc `#p`, srv `#s`, net `#I`, auth `#auth`, root slot `#/`) and
-delegates to that server's `_perm_check_<server>` policy.
+delegates to that server's policy function. F10-2 (#455) moved each
+policy body INTO its server's .ad file (see the table below); the
+dispatcher imports each `<server>_perm_check` and calls it.
 
-| Server | Policy lives in | v1 policy |
-|--------|-----------------|-----------|
-| `#r` cpio | `_perm_check_cpio` (fs/vfs.ad) | read-only baked-in: reads world-OK, writes denied |
-| `#t` tmpfs | `_perm_check_tmpfs` | world-r/w scratch (/tmp, /var) |
-| `#e` ext4 | `_perm_check_ext4` (delegates to `ext4_inode_owner_at`) | enforces on-disk inode mode bits at the ext4 backend boundary |
-| `#f` FAT | `_perm_check_fat` | world-r/w (FAT volumes don't track owners) |
-| `#c` devs | `_perm_check_devcons` | world-r/w introspection knobs by default; per-cdev tightening at the cdev (e.g. `/dev/wsys/ctl` is hostowner-only in devwsys.ad) |
-| `#b` block | `_perm_check_devblk` | hostowner-only (raw block devices) |
-| `#p` proc | `_perm_check_devproc` | world-readable; ctl-file write authority enforced at devproc |
-| `#s` srv | `_perm_check_devsrv` | world-r/w; post wire-shape is the gate |
-| `#I` net | `_perm_check_devnet` | world-r/w; ipifc/ctl writes enforced at devnet |
-| `#auth` | `_perm_check_devauth` | world-r/w wire; rate-limit + constant-time compare inside the cdev are the real gate |
-| `#/` root slot | `_perm_check_rootslot` | no-op (bind/mount is the gate) |
+`vfs_link` and `vfs_symlink` (along with `vfs_open` / `vfs_open_write`
+/ `vfs_perm_check_exec` / `vfs_open_kernel`) now all resolve the
+caller's path through the per-Pgrp namespace BEFORE invoking the
+dispatcher, so every gate call sees the resolved `#X/...` form. An
+unbound path returns ENOENT at the F1 substrate gate before reaching
+the perm check.
+
+| Server | Policy lives in (F10-2 #455) | v1 policy |
+|--------|------------------------------|-----------|
+| `#r` cpio | `_perm_check_cpio` (fs/vfs.ad — the cpio backend has no .ad of its own; the mode-bit lookup is inline) | reads consult per-entry mode bits in the cpio header; writes categorically denied (cpio is baked) |
+| `#t` tmpfs | `tmpfs_perm_check` (fs/tmpfs.ad) | world-r/w (v1 tmpfs has no per-file owner/mode storage; TODO: tighten when TmpfsEntry grows uid/gid/mode) |
+| `#e` ext4 | `ext4_perm_check` (fs/ext4.ad), via vfs.ad's `_perm_check_ext4` shim | enforces on-disk inode mode bits (owner→group→other selector) at the ext4 backend boundary |
+| `#f` FAT | `fat_perm_check` (fs/fat.ad) | world-r/w (FAT volumes carry no per-file POSIX overlay; the device-policy "this stick is read-only" distinction is at the block layer) |
+| `#c` devs | `devcons_perm_check` (sys/src/9/port/devcons.ad) | world-r/w on the stateless cdevs (cons/null/zero/random/time/pid/cpuinfo/meminfo/uptime/loadavg/version/hostname/stat/mounts/diskstats/mouse); hostowner-only knobs (`/dev/wsys/ctl`, `/dev/keymap` write) are gated at the cdev itself |
+| `#b` block | `devblk_perm_check` (sys/src/9/port/devblk.ad) | hostowner-only (`caller_uid == 1`); raw block has no userland reach surface |
+| `#p` proc | `devproc_perm_check` (sys/src/9/port/devproc.ad) | reads world-OK; writes to `/proc/<pid>/{ctl,note,notepg,oom_score_adj}` require `caller_uid == target_uid` OR `caller_uid == 1`; `/proc/svc/ctl` is world-write (the supervisor is the policy point); `/proc/self/<leaf>` always admits the caller |
+| `#s` srv | `devsrv_perm_check` (sys/src/9/port/devsrv.ad) | world-r/w (SYS_SRV_POST validates the poster against the srvfd it's publishing; `#s` is a rendezvous, not a permission store) |
+| `#I` net | `devnet_perm_check` (drivers/net/devnet.ad) | reads world-OK; per-connection writes world-OK (sockets are user-level); host-level admin writes (`/net/dns` server pin, `/net/ipifc/ctl`, `/net/addr`) require `caller_uid == 1` |
+| `#auth` | `devauth_perm_check` (sys/src/9/port/devauth.ad) | world-r/w on the wire (anyone must be able to authenticate); the rate-limit (1/sec) + constant-time hash compare INSIDE the cdev are the real gate; the `setpass` verb's uid==self-or-1 gate lives inside `_au_setpass` |
+| `#/` root slot | no body — the dispatcher returns 0 inline | bind/mount is the gate (the slot is the namespace anchor, not a backed file server) |
+| `SERVER_UNKNOWN` | conservative trap | F10-2 default-deny: a path that doesn't match a known `#X` letter and doesn't fit a known FS-kind returns `EPERM_PERM`. Pre-F10-2 this fell through to cpio (server 1) — the audit's "silent grant" finding |
 
 The kernel vfs has **no literal-path arms**. There is no `/etc/shadow`
 clause, no `/var/lib/hpm/` clause, no `/dev/blk/*` clause inside vfs;
 each of those is enforced where it belongs — ext4 mode bits at the
 ext4 backend, hpm at the userland `hpm` tool's `uid==1` gate, raw
-block at `_perm_check_devblk`.
+block at `devblk_perm_check`.
 
 There is a **hostowner (uid 1) bypass at the dispatcher** that admits
 the historical Plan 9 convention "the hostowner owns the system." It
 is applied for the on-disk servers (`#e`, `#t`, `#r`) where the
 0600-mode `/etc/shadow` file would otherwise deny the legitimate
 hostowner read. Each server's policy retains the final say: `#b`
-(`_perm_check_devblk`) requires `uid == 1` rather than admitting a
-bypass, and a future per-user homedir server can ignore the bypass by
-returning `EPERM_PERM` for `uid == 1` from its own policy. The bypass
-is the **floor**, not the ceiling.
+(`devblk_perm_check`) requires `uid == 1` rather than admitting a
+bypass, `#p` (`devproc_perm_check`) admits hostowner for per-task
+writes (the Linux/Plan-9 nice rule), and a future per-user homedir
+server can ignore the bypass by returning `EPERM_PERM` for `uid == 1`
+from its own policy. The bypass is the **floor**, not the ceiling.
+
+### F10-2 #455: where the bodies actually live
+
+Pre-F10-2, every `_perm_check_<server>` body lived in `fs/vfs.ad` (the
+dispatcher's file), and most of them were stubs that returned 0 with
+a comment ("the backend enforces"). The F10 audit (audit_F10_report.md
+finding F10-2) called this out: the "policy lives at the server" claim
+was held in NAME ONLY. F10-2 moved every body INTO its server's file
+(see the rightmost column above) and tightened the eight stub policies
+to do something real:
+
+* `devblk_perm_check`: `caller_uid == 1` — hostowner-only on raw block.
+* `devproc_perm_check`: per-task uid match for writes; world-OK reads.
+  Plus a defense-in-depth uid gate INSIDE the ctl handler (the `pri` /
+  `oomadj` / `policy` verbs re-check the rule on the verb application,
+  so any direct `devproc_write` reach that bypassed the dispatcher
+  still refuses cross-user). This is the audit's F10-7 fix (the `pri`
+  verb previously had no uid gate at any layer).
+* `devnet_perm_check`: host-level admin writes require hostowner;
+  per-conn writes and all reads admit world.
+* `devcons_perm_check` / `devsrv_perm_check` / `devauth_perm_check` /
+  `tmpfs_perm_check` / `fat_perm_check`: explicitly admit world (the
+  policy that fits each surface's contract — auth needs everyone, srv
+  is a rendezvous, tmpfs/FAT have no mode storage in v1, the cdev
+  knobs gate at the cdev). Each carries a comment naming why and
+  (where applicable) a TODO for the future-tightening direction.
+* `SERVER_UNKNOWN` is a new sentinel: `_path_owning_server` returns it
+  for paths that match no known `#X` letter and no FS-kind, and the
+  dispatcher maps it to `EPERM_PERM`. This is defense-in-depth — the
+  F10-1 namespace resolve already returns ENOENT for unbound paths, so
+  the trap only fires for kernel-direct callers that bypassed
+  resolve_path. After F10-2, `vfs_link` and `vfs_symlink` also call
+  `resolve_path` first, so the only chan_permission_check callers that
+  could ever pass an unknown path are pre-existing in-kernel mediator
+  helpers — those route through `vfs_open_kernel` (which resolves) or
+  carry their own resolution.
+
+`scripts/test_perm_unknown_path.sh` is the acceptance gate.
 
 ### Kernel-mediator credential reads — `vfs_open_kernel`
 
@@ -228,9 +277,13 @@ kernel vfs.
 The dispatcher itself is small (≈25 lines) and contains no policy —
 it routes by server letter, exactly the same routing
 `_open_hash_alias` already does for the open path. Adding a new
-file server means writing a new `_perm_check_<X>`; the dispatcher
-gains one new arm. No existing servers see their policy churn when
-that lands.
+file server means writing a new `<server>_perm_check` in the server's
+own .ad file and importing it from `fs/vfs.ad`'s dispatcher; the
+dispatcher gains one new arm. No existing servers see their policy
+churn when that lands. (F10-2 moved every existing body to its
+server's file — only the cpio reader stays inline in `fs/vfs.ad`
+because the cpio "backend" is fs/cpio.ad's read-only blob and its
+mode-bit lookup is six lines.)
 
 **No setuid / setgid / sticky.** These don't exist in the on-disk
 format Hamnix writes. (The kernel ignores them on Debian-side files

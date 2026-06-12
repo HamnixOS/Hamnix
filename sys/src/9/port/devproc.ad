@@ -97,6 +97,13 @@ from kernel.sched.core import (
     task_fd_idx_at, task_fd_buf_at, TASK_NFDS,
     task_set_fd_idx_at, task_set_fd_buf_at,
     FD_CLOSED_MARK, FD_STDIN_MARK, FD_STDOUT_MARK, FD_STDERR_MARK,
+    # F10-2 #455: server-boundary perm enforcement on the `#p` proc
+    # server. devproc_perm_check (below) gates writes to /proc/<pid>/{ctl,
+    # note, notepg, oom_score_adj} on caller_uid == target_uid OR
+    # caller_uid == 1. Plus the in-handler `pri`/`policy`/`oomadj` ctl-
+    # verb gates re-check the same rule (defense-in-depth — any direct
+    # devproc_write reach that bypassed the dispatcher must still refuse).
+    task_uid_at, current_task_uid,
 )
 # The stateless local cdevs open as FD_CHAN_MARK fds carrying an inline
 # namec chan id; the /proc/<pid>/fd renderer resolves the dev_type to a
@@ -445,6 +452,124 @@ def devproc_path_match(path: Ptr[char]) -> int32:
     if _parse_proc_path(path, &pid_scratch, &kind_scratch) == 0:
         return 1
     return 0
+
+
+# F10-2 #455: server-boundary perm policy for the `#p` proc server.
+#
+# Reads are world-OK: proc is public-by-policy (any task may inspect
+# any other task's stat/status/cmdline/...). This matches the historical
+# Plan 9 /proc and the Linux /proc default.
+#
+# Writes to per-task ctl files (/proc/<pid>/{ctl, note, notepg,
+# oom_score_adj}) require caller_uid == target_uid OR caller_uid == 1
+# (hostowner). This is the Linux setpriority/CAP_SYS_NICE rule, applied
+# at the file-server boundary: no one renices another user's tasks
+# without hostowner.
+#
+# Writes to /proc/svc/ctl (service-supervisor request queue) are
+# world-OK: the SUPERVISOR is the policy point, not the file server
+# (matches the SYS_SVC_CTL replacement contract documented at the
+# devproc_write svc_ctl arm). A non-hostowner verb the supervisor
+# refuses (e.g. `unpublish foo`) is rejected by svc_ctl_text_apply, not
+# by this gate.
+#
+# `name` arrives here in the RESOLVED form: either `#p/<pid>/<leaf>`
+# (post-resolve_path) or the bare `/proc/<pid>/<leaf>` form when a
+# call site bypasses resolve_path (vfs_link/vfs_symlink). The parser
+# handles both spellings inline so a literal-path caller is gated too.
+#
+# Numeric contract matches the rest of the perm-check family.
+
+def _devproc_perm_path_pid(name: Ptr[char], out_pid: Ptr[uint64],
+                           out_is_self: Ptr[int32]) -> int32:
+    # Walk `name` and return:
+    #   0  if it names /proc/svc/ctl  (out_pid=0, out_is_self=0)
+    #   1  if it names /proc/<pid>/<leaf>  (out_pid set, out_is_self set)
+    #   2  if it names /proc/self/<leaf>  (out_pid=0, out_is_self=1)
+    #  -1  if not a recognised per-task or svc path (caller falls through
+    #      to the world-OK / world-readable default).
+    # Accepts both the `#p/...` resolved form and the literal `/proc/...`
+    # form. We don't reuse _parse_proc_path because it keys on `/proc/`.
+    off: uint64 = 0
+    if name[0] == 35 and name[1] == 112:                # "#p"
+        if name[2] == 0:
+            return -1                                   # bare `#p` directory
+        if name[2] != 47:                               # not `#p/...`
+            return -1
+        off = 3
+    elif name[0] == 47 and name[1] == 112 and name[2] == 114 \
+            and name[3] == 111 and name[4] == 99 \
+            and name[5] == 47:                          # "/proc/"
+        off = 6
+    else:
+        return -1
+    # svc/ctl? (no pid; world-OK shape — return 0).
+    if name[off + 0] == 115 and name[off + 1] == 118 \
+            and name[off + 2] == 99 and name[off + 3] == 47 \
+            and name[off + 4] == 99 and name[off + 5] == 116 \
+            and name[off + 6] == 108 \
+            and (name[off + 7] == 0 or name[off + 7] == 47):  # "svc/ctl"
+        out_pid[0] = 0
+        out_is_self[0] = 0
+        return 0
+    # /proc/self/<leaf>?
+    if name[off + 0] == 115 and name[off + 1] == 101 \
+            and name[off + 2] == 108 and name[off + 3] == 102 \
+            and name[off + 4] == 47:                    # "self/"
+        out_pid[0] = 0
+        out_is_self[0] = 1
+        return 2
+    # /proc/<digits>/<leaf>?
+    if _is_digit(cast[uint8](name[off] & 0xFF)) == 0:
+        return -1
+    pid: uint64 = 0
+    while _is_digit(cast[uint8](name[off] & 0xFF)) != 0:
+        pid = pid * 10 + cast[uint64](name[off] - 48)
+        off = off + 1
+    if name[off] != 47:                                 # need '/'
+        return -1
+    out_pid[0] = pid
+    out_is_self[0] = 0
+    return 1
+
+
+def devproc_perm_check(name: Ptr[char], want: int32,
+                       caller_uid: uint32) -> int32:
+    # Reads world-OK: proc is public-by-policy.
+    if (want & 2) == 0:                                 # PERM_W
+        return 0
+    # Hostowner always passes (administrative override). This mirrors the
+    # historical Plan 9 hostowner convention and matches the dispatcher's
+    # bypass for the on-disk servers (the proc server doesn't admit the
+    # dispatcher-level bypass because the proc-policy needs per-pid
+    # context only the server can compute; we apply it ourselves here).
+    if caller_uid == 1:
+        return 0
+    out_pid:     uint64 = 0
+    out_is_self: int32  = 0
+    cls: int32 = _devproc_perm_path_pid(name, &out_pid, &out_is_self)
+    if cls < 0:
+        # Unrecognised per-task path shape (e.g. a directory open of
+        # `#p` itself, or a `#p/<pid>` without a leaf). World-OK — the
+        # backend rejects writes the policy doesn't define.
+        return 0
+    if cls == 0:
+        # /proc/svc/ctl is world-OK. The supervisor is the policy point.
+        return 0
+    target_pid: uint64 = out_pid
+    if out_is_self != 0:
+        # /proc/self/<leaf> — caller writing to its OWN proc files.
+        # Always admitted.
+        return 0
+    # /proc/<digits>/<leaf>: resolve to target_uid.
+    target_slot: int32 = task_lookup_by_pid(target_pid)
+    if target_slot < 0:
+        # Pid vanished — let the backend surface ESRCH.
+        return 0
+    target_uid: uint32 = task_uid_at(target_slot)
+    if caller_uid == target_uid:
+        return 0
+    return -1
 
 
 # --- /proc directory enumeration -------------------------------------
@@ -1622,6 +1747,18 @@ def devproc_write(file_idx: uint32, buf: Ptr[uint8],
         ctl_target: int32 = task_lookup_by_pid(cast[uint64](pid_field))
         if ctl_target < 0:
             set_current_errstr("ctl: pid vanished")
+            return -1
+        # F10-2 #455 / F10-7: per-verb uid gate. The dispatcher's
+        # devproc_perm_check already refused this write for a non-matching
+        # uid at open() time, but a process that opened /proc/<pid>/ctl
+        # for ITS OWN pid and then setuid'd, or a kernel-context write that
+        # bypassed the dispatcher, must STILL refuse `pri`/`policy`/
+        # `oomadj` for a target task with a different uid. This is the F10-7
+        # (audit "the `pri` verb has no uid gate") fix.
+        ctl_caller_uid: uint32 = current_task_uid()
+        ctl_target_uid: uint32 = task_uid_at(ctl_target)
+        if ctl_caller_uid != 1 and ctl_caller_uid != ctl_target_uid:
+            set_current_errstr("ctl: permission denied")
             return -1
         ctl_slot: uint64 = cast[uint64](cast[uint32](ctl_target))
         parsed: int64 = 0
