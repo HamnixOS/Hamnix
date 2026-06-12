@@ -120,6 +120,10 @@ from sys.src.port9.port.namec import (
 # so the /proc fd renderer is exercised against the folded DEV_PIPE
 # representation, then unwinds both end-references on the way out.
 from fs.pipe import pipe_alloc, pipe_close_reader, pipe_close_writer
+# F2 #447: /proc/svc/ctl writes parse the verb here and route to the
+# in-kernel svc-ctl queue (svc_ctl_text_apply lives next to the queue
+# in fs/procfs.ad — same .ad as svc_ctl_enqueue / svc_proc_unpublish).
+from fs.procfs import svc_ctl_text_apply
 # M16.109: note delivery body lives in sysnote.ad so the same self-
 # delivery primitive can be re-used by future drivers (kbd Ctrl-C ->
 # postnote / segfault handler -> postnote etc.).
@@ -219,6 +223,19 @@ DEVPROC_KIND_OOM_SCORE_ADJ: uint32 = 13
 # `ls -l /proc/<pid>/fd` symlink-target column would. Backed by the real
 # per-task fd table (task_fd_idx_at/task_fd_buf_at, kernel/sched/core.ad).
 DEVPROC_KIND_FD:      uint32 = 14
+# F2 #447 (drift syscall retirement): /proc/svc/ctl — write-only Plan 9
+# control surface for the service supervisor. A write of one of:
+#   start <name>     stop <name>      restart <name>
+#   enable <name>    disable <name>   runlevel <digit>
+#   unpublish <name>
+# enqueues into the same in-kernel svc-ctl queue SYS_SVC_CTL used (or
+# drops the named svc-proc mirror entry, for unpublish). Reads return -1
+# + "ctl: not readable" — Plan 9 ctl-file contract. The kind has pid=0
+# in the encoding because /proc/svc/ctl is a system-wide control file,
+# not per-task: the devproc_write arm SKIPS the per-pid task_lookup that
+# the per-process DEVPROC_KIND_CTL arm does. SYS_SVC_CTL stays in place
+# as a thin shim around the same kernel helper (svc_ctl_text_apply).
+DEVPROC_KIND_SVC_CTL: uint32 = 15
 
 
 def _is_digit(c: uint8) -> int32:
@@ -312,6 +329,19 @@ def _parse_proc_path(path: Ptr[char], out_pid: Ptr[uint64],
             or path[3] != 111 or path[4] != 99 \
             or path[5] != 47:                    # "proc/"
         return -1
+    # F2 #447: system-wide control file /proc/svc/ctl — no pid in the
+    # path. Encode pid=0 (next_pid starts at 1, so pid 0 never names a
+    # live task) + DEVPROC_KIND_SVC_CTL. The devproc_write arm gates on
+    # the kind, NOT a pid lookup. /proc/svc itself (no /ctl) stays a
+    # static-procfs read-only render — _parse_proc_path returns -1 on
+    # that so the static renderer in fs/procfs.ad handles it.
+    if path[6] == 115 and path[7] == 118 and path[8] == 99 \
+            and path[9] == 47 \
+            and path[10] == 99 and path[11] == 116 and path[12] == 108 \
+            and path[13] == 0:                   # "svc/ctl"
+        out_pid[0] = 0
+        out_kind[0] = DEVPROC_KIND_SVC_CTL
+        return 0
     # Parse the pid component. `self` is an alias for the CALLING
     # task's pid — `/proc/self/ns` lets a program read its own
     # namespace without first having to discover its pid (HAMSH §14).
@@ -577,10 +607,14 @@ def devproc_open(path: Ptr[char]) -> int64:
     if _parse_proc_path(path, &pid64, &kind) != 0:
         set_current_errstr("/proc: malformed pid path")
         return -1
-    slot: int32 = task_lookup_by_pid(pid64)
-    if slot < 0:
-        set_current_errstr("no such pid")
-        return -1
+    # F2 #447: system-wide ctl files (DEVPROC_KIND_SVC_CTL) carry pid=0
+    # by convention — skip the per-task lookup that the per-pid kinds
+    # need. The write/read arms gate on kind, not pid_field.
+    if kind != DEVPROC_KIND_SVC_CTL:
+        slot: int32 = task_lookup_by_pid(pid64)
+        if slot < 0:
+            set_current_errstr("no such pid")
+            return -1
     # Encode pid+kind. Cap pid at 0xFFFF so the 16-bit field never
     # overflows out of the 24-bit encoding — at NTASKS=16 with
     # sequentially-allocated pids this is comfortable headroom.
@@ -1306,6 +1340,12 @@ def devproc_read(file_idx: uint32, off: uint64, buf: Ptr[uint8],
         return 0
     pid_field: uint32 = (file_idx >> 8) & 0xFFFF
     kind:      uint32 = file_idx & 0xFF
+    # F2 #447: system-wide /proc/svc/ctl carries pid=0 and is write-only.
+    # Refuse the read here BEFORE task_lookup_by_pid (pid 0 is not a live
+    # task slot — the read would otherwise surface "pid vanished").
+    if kind == DEVPROC_KIND_SVC_CTL:
+        set_current_errstr("ctl: not readable")
+        return -1
     slot: int32 = task_lookup_by_pid(cast[uint64](pid_field))
     if slot < 0:
         set_current_errstr("pid vanished")
@@ -1560,6 +1600,21 @@ def devproc_write(file_idx: uint32, buf: Ptr[uint8],
         # that's V5+ scope — the V3 surface only serves the renderer.
         set_current_errstr("ns: not writable")
         return -1
+    if kind == DEVPROC_KIND_SVC_CTL:
+        # F2 #447: system-wide /proc/svc/ctl — write a "<verb> <name>\n"
+        # line to enqueue a service-supervisor request (the
+        # SYS_SVC_CTL replacement, Plan-9 ctl-file shape). pid_field is
+        # 0 (sentinel); no per-task lookup. svc_ctl_text_apply lives in
+        # fs/procfs.ad next to the queue and dispatches to
+        # svc_ctl_enqueue / svc_proc_unpublish. The producer verbs are
+        # open to any process (mirrors the SYS_SVC_CTL gate — the
+        # supervisor is the policy point, not the kernel); the
+        # `unpublish` verb mirror is hostowner-only inside the helper.
+        # On a malformed line the helper sets errstr and returns -1; we
+        # surface that as the write(2) -1.
+        if svc_ctl_text_apply(buf, count) < 0:
+            return -1
+        return cast[int64](count)
     if kind == DEVPROC_KIND_CTL:
         # Plan 9 /proc/<pid>/ctl — write a control message to mutate the
         # target task. Resolve the embedded pid to a live slot exactly like

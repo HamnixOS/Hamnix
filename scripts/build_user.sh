@@ -132,7 +132,7 @@ build_adder_user test                 # M16.74: -z/-n/=/!= predicates
 build_adder_user banner               # M16.81: ASCII-art big text
 build_adder_user strings              # M16.81: print printable runs from a binary
 build_adder_user service              # native service mgmt: service <name> start|stop|restart|status|enable|disable
-build_adder_user initctl              # native runlevel control: initctl <N> (telinit alias) via SYS_SVC_CTL
+build_adder_user initctl              # native runlevel control: initctl <N> (telinit alias) via /proc/svc/ctl (F2 #447)
 build_adder_user halt                 # M16.82: graceful exit / future ACPI halt
 build_adder_user poweroff             # M16.82: same as halt for now
 build_adder_user reboot               # M16.82: future i8042 0xFE pulse
