@@ -141,8 +141,27 @@ name[s]    uid[s] gid[s] muid[s]      counted strings: 2 length + UTF-8
 listdir loop is `for each record in read(dirfd)`. Reference: 9front
 `stat(5)`.
 
-This replaces the existing `SYS_LISTDIR` (which returned a custom
-flat format).
+**Status (Phase G — #450 F6, 2026-06-11).** `SYS_LISTDIR` (number 18)
+is RETIRED from the native dispatch table; the number stays reserved
+per the F2 #447 pattern. Native callers use the `p9_listdir(path,
+buf, count)` wrapper in `lib/p9.ad` — it opens the directory with
+`OREAD`, reads the dir fd's bytes into the caller's buffer, and
+closes. The dir-fd's `DEV_DIR_FILE` backing
+(`sys/src/9/port/namec.ad::_dirfile_read`) still emits the same
+`"NAME\n"`-packed bytes the old syscall returned, so every existing
+glob parser keeps working byte-for-byte. Migrating that backing to
+emit Plan-9 Dir records (the full 9P `stat` shape described above)
+is a separate kernel-side milestone — the `do_stat`/`do_fstat`
+syscalls already build Dir records; the dir-read path still emits
+`NAME\n` until that switchover lands.
+
+Namespace mount-table children synthesis (the thing that makes `bind
+'#c' /dev` show up as `dev` in `ls /`) now lives on the open-dir
+path: `fs/vfs.ad::_open_dir_with` calls `chan_dir_mount_children`
+after the backing FS fills the listing, keyed on the conventional
+pre-`ns_walk` path stashed by the `SYS_OPEN` arm. The retired
+`SYS_LISTDIR` arm used to do this in `_sysarm_listdir`; the
+synthesis behaviour is preserved.
 
 ## Process control
 
@@ -524,15 +543,15 @@ migrate to the ctl-file form.
 | `SYS_WRITE` | 8 | Keep | `write` (8) | |
 | `SYS_LSEEK` | 9 | Keep | `seek` (9) | Renamed; same wire. |
 | `SYS_EXECVE` | 10 | Keep | `exec` (10) | |
-| `SYS_SPAWN` | 11 | **Deprecate** | `rfork(RFPROC|RFFDG|RFNAMEG|RFENVG)` + `exec` | Plan 9 has no spawn. Native callers (hamsh) rewrite as rfork+exec in Phase G. Linux ELFs never used this — they call `linux_abi/u_syscalls.ad`. |
+| `SYS_SPAWN` | 11 | **RETIRED (#450 F6, Phase G)** | `lib/p9.ad::spawn(path, argv, sin, sout, envp)` → `rfork(RFPROC\|RFFDG\|RFNAMEG)` + child `exec` (+ `dup2` for legacy integer-fd sin/sout, + `open("/fd/N") + dup2` for `SPAWN_STDIO_NS` sentinel routing). Number 11 RESERVED — do not reuse. 200+ line stdio/Pgrp inheritance block deleted from `arch/x86/kernel/syscall.ad`; the inheritance story is rfork's flag set, NOT kernel-side magic. |
 | `SYS_WAITPID` | 12 | Renumber → keep | `wait` (12) | One-arg `wait(status_ptr)` — pid arg dropped (Plan 9 waits for **any** child; libc helper reimplements pid-specific wait by looping). |
 | `SYS_OPEN_WRITE` | 13 | **Deprecate** | `open(path, OWRITE\|OTRUNC)` | Delete in Phase G. |
 | `SYS_PIPE` | 14 | Keep | `pipe` (14) | Wire identical. Both ends are bidirectional in Plan 9; we honour that. |
 | `SYS_SOCKETPAIR` | 53 | Keep (V5 shipped) | `socketpair` (53) | Linux number 53. `int socketpair(int domain, int type, int protocol, int sv[2])` returns two BIDIRECTIONAL fds. `domain` ignored; `type` must be `SOCK_STREAM` (1) or `SOCK_DGRAM` (2); `protocol` ignored. Each fd is full-duplex — writes on one appear as reads on the other. Backed by `fs/socketpair.ad`; 32-pair pool, 1 KiB rings per direction. Use this (not `SYS_PIPE`) for bidirectional transports (rio, in-kernel 9P client). |
-| `SYS_KILL` | 15 | **→ path** | `write("/proc/<pid>/note", msg)` | Layer 2 translates Linux signo to Plan 9 note string. Delete syscall in Phase G. |
+| `SYS_KILL` | 15 | **RETIRED for positive pid (#450 F6, Phase G)** | `lib/p9.ad::p9_note(pid, msg)` → `open("/proc/<pid>/note", OWRITE) + write(fd, msg) + close(fd)`. Layer 2 maps Linux signo to Plan 9 note string. **Negative-pid path SURVIVES** as the Unix process-group broadcast `kill(-pgid, sig)` — F2 #447 left the POSIX job-control family (SETPGID / TCSETPGRP / WAITPID_JC) in place as follow-up scope; this is part of that surface. Userland reaches it via `user/runtime.S::sys_pgrp_kill(pgid, sig)`. A positive-pid `SYS_KILL` call returns -ENOSYS with errstr "kill: positive-pid retired; use /proc/<pid>/note". Number 15 stays. |
 | `SYS_DUP` | 16 | Keep | `dup(fd, -1)` (16) | |
 | `SYS_DUP2` | 17 | **Merge** | `dup(fd, newfd)` (16) | One call covers both. Phase G removes the 17 entry. |
-| `SYS_LISTDIR` | 18 | **→ Dir reads** | `read(dirfd, buf, n)` | Returns Dir records (see "Directory format"). Existing custom format dies in Phase G. |
+| `SYS_LISTDIR` | 18 | **RETIRED (#450 F6, Phase G)** | `lib/p9.ad::p9_listdir(path, buf, count)` → `open(path, OREAD) + read(fd, buf, count) + close(fd)`. The dir-fd's `DEV_DIR_FILE` backing still emits the SAME `"NAME\n"`-packed bytes the syscall used to return, so userland glob parsing stays byte-identical. Number 18 RESERVED — do not reuse. `_sysarm_listdir` and the SYS_LISTDIR dispatch arm are gone from `arch/x86/kernel/syscall.ad`. Migrating the dir-read backing to native 9P Dir records is a SEPARATE kernel-side milestone. |
 | `SYS_CHDIR` | 19 | Keep | `chdir` (19) | |
 | `SYS_GETCWD` | 20 | **Flag** | Two options: (a) keep as syscall (pragmatic); (b) `fd2path(cwdfd, buf, n)` where `cwdfd` is always-open at fd 0 of `/proc/self`. Phase G picks. Plan 9 itself does not have getcwd. |
 | `SYS_UNLINK` | 21 | Rename | `remove` (263) | Wire identical. |
@@ -653,11 +672,18 @@ migrate to the ctl-file form.
    **Proposal:** in Phase D, widen `pipe()` to return two bidi
    endpoints; Layer 2 `pipe()` keeps the Linux unidi semantics
    by half-shutting each end on creation.
-3. **`SYS_SPAWN`.** No clean Plan 9 mapping (Plan 9 *always*
-   rfork+exec). All native callers are `user/hamsh.ad` and
-   coreutils. **Proposal:** add a tiny userspace wrapper
-   `spawn(path, argv) = { pid = rfork(...); if pid==0 exec(...);
-   return pid; }` in the native libc, retire the syscall.
+3. **`SYS_SPAWN` — LANDED #450 F6, 2026-06-11.** Userland wrapper
+   `lib/p9.ad::spawn(path, argv, sin, sout, envp)` rforks with
+   `RFPROC|RFFDG|RFNAMEG` (private fd-table copy + private COW Pgrp),
+   the child handles stdin/stdout for the legacy integer-fd cases
+   (`sys_dup2(sin, 0)` / `sys_dup2(sout, 1)` for sin/sout in [0, 16))
+   and the `SPAWN_STDIO_NS` sentinel case (open `/fd/0,1,2` and dup2
+   onto the integer slot — routes integer reads/writes through the
+   /fd-name table so the parent's `sys_fdbind(child_pid, ...)` for
+   pipes and redirects takes effect on the child's I/O). Then
+   `sys_execve_env`. The kernel's 200+ line stdio/Pgrp inheritance
+   block in `arch/x86/kernel/syscall.ad` is gone. Number 11 stays
+   reserved.
 4. **Module load/unload.** `init_module`/`delete_module` aren't
    Plan 9 primitives. **Proposal:** keep as Layer 0 helpers
    surfaced through native syscalls 175/176 for now, **and**
@@ -673,28 +699,52 @@ migrate to the ctl-file form.
 
 ## Worked example: hamsh internals after migration
 
-Today (Linux-shape native):
+#450 F6 (2026-06-11): the migration LANDED. Native callers use the
+thin `lib/p9.ad::spawn(path, argv, sin, sout, envp)` userland
+wrapper, which is exactly the rfork+exec body Plan 9 idiom:
 
 ```
-pid = SYS_SPAWN("/bin/ls", argv, stdin_fd, stdout_fd, envp)
-status = SYS_WAITPID(pid)
+# In lib/p9.ad:
+def spawn(path, argv, sin, sout, envp) -> int32:
+    pid = sys_rfork(RFPROC | RFFDG | RFNAMEG)
+    if pid != 0:
+        return pid                             # parent gets child pid
+    # Child: route stdio through /fd/N for the SPAWN_STDIO_NS
+    # sentinel (-2), or dup2 a legacy integer fd for sin/sout in
+    # [0, 16); -1 means "inherit", which RFFDG already copied.
+    if sin == SPAWN_STDIO_NS:
+        fd = sys_open("/fd/0"); sys_dup2(fd, 0); sys_close(fd)
+    if sout == SPAWN_STDIO_NS:
+        fd = sys_open("/fd/1"); sys_dup2(fd, 1); sys_close(fd)
+        fd = sys_open("/fd/2"); sys_dup2(fd, 2); sys_close(fd)
+    if sin >= 0:  sys_dup2(sin, 0)
+    if sout >= 0: sys_dup2(sout, 1)
+    sys_execve_env(path, argv, envp)
+    sys_exit(127)                              # "command not found"
 ```
 
-Phase G (Plan 9-shape native):
+Callers see the SAME 5-arg signature the retired SYS_SPAWN used —
+hamsh's `spawn_resolved`, `_wire_redirects`, the svc supervisor's
+uid-switch wrapper, every coreutils call site (`/bin/man`,
+`/bin/distrofs`, `/bin/httpd_worker`, ...) — all migrate by symbol
+rename only. The 200+ line kernel-side stdio/Pgrp inheritance block
+is GONE; the inheritance story is rfork's flag set plus the child's
+own dup2 / `open("/fd/N")` calls.
+
+Concrete hamsh wiring (`user/hamsh.ad::spawn_resolved` after migration):
 
 ```
-pid = rfork(RFPROC|RFFDG|RFNAMEG|RFENVG)
-if pid == 0:
-    # child: redirect stdio via dup, then exec
-    dup(stdout_fd, 1)
-    exec("/bin/ls", argv, envp)
-    exits("exec failed")
-status = wait(&exit_word)
+pid = spawn("/bin/ls", argv, SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
+# Cooperative scheduler: child is STATE_READY until we yield, so
+# pipe / redirect / dup binds land before it runs.
+sys_fdbind(pid, 1, DEVFD_PIPE_W, slot)
+status = sys_waitpid(pid)
 ```
 
-The `dup(stdout_fd, 1)` is namespace-local to the child because
-`rfork` was called with `RFFDG` (copy the fd table). The parent's
-fd 1 is untouched.
+`sys_fdbind` rewrites the bind under the child's `/fd/1` name in its
+COW-cloned Pgrp; the child's integer fd 1 (now backed by a
+FD_CHAN_MARK + DEV_DEVFD inline-chan opened on `/fd/1`) resolves
+through that bind every time the child writes.
 
 ## References
 
