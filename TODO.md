@@ -286,12 +286,12 @@ replaces the ~70 `is_*_path` backend-selection branches).
 
 **ALL findings queued as fix tracks (user 2026-06-11: "hammer the whole
 thing into a plan 9 shape"):** F1=#446 **DONE**. F2=#447 **DONE**.
-F3=#448 **DONE 2026-06-11** — server-boundary perm dispatch landed;
-`_vfs_check_perm` gone; per-server policies; factotum wire-shape
-documented. F4=#449 **DONE**. F5=#445 **DONE**. F8=#451 **DONE**.
-F9=#452 **DONE**. **Remaining:** F6=#450 Phase G finish, F7=#390
-FD-mark fold continuation, F10=#453 re-audit AFTER the wave lands
-(7 of 10 closed today).
+F3=#448 **DONE**. F4=#449 **DONE**. F5=#445 **DONE**. F6=#450 **DONE
+2026-06-11** — Phase G finished; SYS_SPAWN/LISTDIR/KILL retired onto
+`lib/p9.ad` helpers; 200-line kernel inheritance block gone. F8=#451
+**DONE**. F9=#452 **DONE**. **Remaining:** F7=#390 FD-mark fold
+continuation, F10=#453 re-audit AFTER the wave lands (8 of 10 closed
+today).
 
 Full ranked report delivered in-session; spine (Chan/namec/devtab, Pgrp
 binds, unions MREPL/MBEFORE/MAFTER, notes, /net no-sockets, /srv, #d fd
@@ -339,9 +339,17 @@ device, /dev/mountrpc tripwire) judged honestly Plan 9. Gaps, ranked:
    See STATUS row.
 5. [x] **#445 LANDED** — SYS_SYMLINK/SYS_MSYNC collision fixed (msync →
    317; symlink + msync userland gates green). See STATUS.md.
-6. [ ] **Phase G unfinished**: 23 programs still sys_spawn (hamsh spawns
+6. [x] **Phase G unfinished**: 23 programs still sys_spawn (hamsh spawns
    every command via SYS_SPAWN, hamsh.ad:2910), 16 still sys_listdir, 4
-   sys_kill. Fix: libc spawn() over rfork+exec, then delete the syscall.
+   sys_kill. **F6 DONE** (`#450`, merge `0137f0f5` 2026-06-11): new
+   `lib/p9.ad` (282 lines) provides `spawn(path,argv,sin,sout,envp)`
+   over `rfork(RFPROC|RFFDG|RFNAMEG)+exec`, `p9_note(pid,msg)` over
+   `/proc/<pid>/note`, `p9_listdir(path,buf,count)` over open+read. 38
+   user programs + 10 tests + lib/hamui.ad migrated; 200-line kernel
+   inheritance block at `arch/x86/kernel/syscall.ad` gone. Acceptance
+   grep `sys_spawn|sys_listdir|sys_kill` empty under user/+lib/.
+   SYS_KILL arm scoped to negative-pid (job-control broadcast); F2
+   follow-up scope. See STATUS row.
 7. [ ] **FD-mark remainder** post-4c: stdio/tmpfs/pipes/socketpair/p9/
    net/epoll-family/ptmx/fuse still mark-based; pipes = highest-leverage
    next fold (9p_client special-cases pipe slots). NR_FDS=16 per task will
