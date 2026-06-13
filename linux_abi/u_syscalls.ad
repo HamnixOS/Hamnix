@@ -664,6 +664,17 @@ from mm.memblock import (
 )
 # sysinfo(2) reports live load averages straight from the scheduler's
 # decayed accumulators (loadavg.ad), in load×100 fixed point.
+# §6: classic-BPF seccomp filter program (kernel/seccomp_bpf.ad). The
+# BPF interpreter and per-task installed-filter list live there; this
+# module is the prctl arm + the dispatch-time evaluator.
+from kernel.seccomp_bpf import (
+    bpf_install_filter, bpf_task_has_filter, bpf_run_all,
+    bpf_seccomp_data_build,
+    SECCOMP_RET_ACTION_FULL, SECCOMP_RET_DATA,
+    SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS,
+    SECCOMP_RET_KILL_THREAD, SECCOMP_RET_TRAP,
+    SECCOMP_RET_ERRNO, SECCOMP_RET_TRACE, SECCOMP_RET_LOG,
+)
 from kernel.sched.loadavg import (
     loadavg_get_load1_centi, loadavg_get_load5_centi,
     loadavg_get_load15_centi,
@@ -6153,6 +6164,25 @@ PR_GET_SECCOMP:      uint64 = 21
 #     bitmap_len  — bytes of user payload to copy; must be <= 32.
 #                   A shorter payload zero-fills the upper words.
 PR_SET_NATIVE_FILTER: uint64 = 0x10000
+# §6: install a classic-BPF program as a seccomp filter. Hamnix-namespace
+# extension (Linux PR_* < 80) so it can't collide with a future Linux
+# PR_SET_*.
+#
+#   prctl(PR_SET_SECCOMP_BPF, filter_addr, filter_len, 0, 0)
+#     filter_addr — user pointer to an array of `struct sock_filter`
+#                   (the cBPF program). Each entry is 8 bytes:
+#                   { u16 code; u8 jt; u8 jf; u32 k; }.
+#     filter_len  — number of instructions (NOT bytes); each is 8 B.
+#                   Must be >= 1, <= MAX_BPF_INSNS.
+#
+# This is the same cBPF program shape Linux seccomp-bpf accepts via
+# prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, sock_fprog*) — only the
+# CONTAINER is different. Linux passes a `struct sock_fprog` (len + ptr);
+# Hamnix takes (addr, len) as two flat prctl args, mirroring the
+# PR_SET_NATIVE_FILTER shape above. Avoiding the sock_fprog struct
+# sidesteps any ABI-shape ambiguity in how a static-PIE binary lays the
+# pointer field of a 16-byte mixed-width struct on the user stack.
+PR_SET_SECCOMP_BPF:   uint64 = 0x10001
 SECCOMP_MODE_DISABLED: uint64 = 0
 SECCOMP_MODE_STRICT:   uint64 = 1
 SECCOMP_MODE_FILTER:   uint64 = 2
@@ -6181,31 +6211,85 @@ def _seccomp_strict_allows(nr: uint64) -> int32:
     return 0
 
 
-def seccomp_check_entry(nr: uint64) -> int32:
-    # Called at syscall ENTRY by linux_u_syscall_dispatch. Returns 1 if
-    # the syscall is BLOCKED (the dispatcher must NOT run it; SIGSYS has
-    # been posted) and 0 if it is permitted (or seccomp is inactive).
+def seccomp_check_entry(nr: uint64,
+                        a0: uint64, a1: uint64, a2: uint64,
+                        a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # Called at syscall ENTRY by linux_u_syscall_dispatch. The return is
+    # an action code consumed by the dispatcher:
+    #   0   ALLOW — run the real handler.
+    #   1   BLOCKED with SIGSYS already posted; the dispatcher must
+    #       short-circuit. The pending SIGSYS is delivered by
+    #       do_syscall's exit-side signal_deliver_on_return (handler →
+    #       rt_sigframe; no handler → default kill 128+31).
+    #   <0  BLOCKED, return THIS value to userspace as the syscall rc.
+    #       Used by SECCOMP_RET_ERRNO from a §6 classic-BPF filter — a
+    #       Linux-shape ERRNO action returns -errno in the caller's
+    #       %rax without raising SIGSYS, so a process can install
+    #       "refuse open(2) with -EACCES" and keep running.
     slot: uint64 = current_idx_get()
     mode: uint64 = get_task_seccomp_mode(slot)
-    if mode == SECCOMP_MODE_DISABLED:
+
+    # ---- bitmap / strict path (#160) ----
+    if mode != SECCOMP_MODE_DISABLED:
+        allowed: int32 = 0
+        if mode == SECCOMP_MODE_STRICT:
+            allowed = _seccomp_strict_allows(nr)
+        else:
+            if _seccomp_strict_allows(nr) != 0:
+                allowed = 1
+            elif seccomp_filter_allows(slot, nr) != 0:
+                allowed = 1
+        if allowed == 0:
+            printk2("seccomp: pid=%d denied syscall nr=%d -> SIGSYS\n",
+                    cast[int32](current_task_pid()), cast[int32](nr))
+            signal_post(slot, SIGSYS)
+            return 1
+
+    # ---- §6 classic-BPF filter path ----
+    # If the task has no BPF filters installed this is a single
+    # bpf_task_has_filter check, so it stays cheap for the common
+    # unfiltered case. With filters present we build seccomp_data once
+    # and bpf_run_all walks every program, returning the cumulative
+    # MIN (Linux's "lowest-numbered action wins" rule).
+    if bpf_task_has_filter(slot) == 0:
         return 0
-    allowed: int32 = 0
-    if mode == SECCOMP_MODE_STRICT:
-        allowed = _seccomp_strict_allows(nr)
-    else:
-        # FILTER mode: the strict set is always permitted (so the task
-        # can read/write/exit/sigreturn around its denial), plus anything
-        # the installed allow-list bitmap names.
-        if _seccomp_strict_allows(nr) != 0:
-            allowed = 1
-        elif seccomp_filter_allows(slot, nr) != 0:
-            allowed = 1
-    if allowed != 0:
+    rip: uint64 = saved_user_rip_ptr()[0]
+    sd: Ptr[uint8] = bpf_seccomp_data_build(nr, rip, a0, a1, a2, a3, a4, a5)
+    raw: uint32 = bpf_run_all(slot, sd)
+    action: uint32 = raw & SECCOMP_RET_ACTION_FULL
+    data:   uint32 = raw & SECCOMP_RET_DATA
+    if action == SECCOMP_RET_ALLOW:
         return 0
-    # Denied. Post SIGSYS to ourselves; the do_syscall exit-side check
-    # delivers it (handler → rt_sigframe; no handler → terminate 128+31).
-    printk2("seccomp: pid=%d denied syscall nr=%d -> SIGSYS\n",
-            cast[int32](current_task_pid()), cast[int32](nr))
+    if action == SECCOMP_RET_LOG:
+        printk2("seccomp_bpf: pid=%d log nr=%d (LOG action, allowed)\n",
+                cast[int32](current_task_pid()), cast[int32](nr))
+        return 0
+    if action == SECCOMP_RET_ERRNO:
+        # `data` is the errno value. Linux caps it at 4095; we just
+        # propagate it. The kernel returns -data in the syscall rc.
+        printk2("seccomp_bpf: pid=%d nr=%d -> ERRNO %d\n",
+                cast[int32](nr), cast[int32](data), cast[int32](data))
+        # Defensive: a 0 errno would be "allow"; promote to EPERM (1).
+        e: uint32 = data
+        if e == 0:
+            e = 1
+        return cast[int64](0) - cast[int64](e)
+    if action == SECCOMP_RET_TRAP:
+        # Post SIGSYS just like the bitmap-deny path; userspace
+        # SIGSYS handler observes si_syscall=nr.
+        printk2("seccomp_bpf: pid=%d nr=%d -> TRAP (SIGSYS)\n",
+                cast[int32](current_task_pid()), cast[int32](nr))
+        signal_post(slot, SIGSYS)
+        return 1
+    if action == SECCOMP_RET_TRACE:
+        # Linux semantics: if no PTRACE_O_TRACESECCOMP tracer is
+        # attached the action is ALLOW. Hamnix doesn't implement the
+        # seccomp-trace ptrace event yet, so the safe-and-faithful
+        # downgrade is ALLOW; revisit when ptrace gains the option.
+        return 0
+    # KILL_PROCESS / KILL_THREAD / anything else → SIGSYS-kill.
+    printk2("seccomp_bpf: pid=%d nr=%d -> KILL (action=0x%x)\n",
+            cast[int32](current_task_pid()), cast[int32](action))
     signal_post(slot, SIGSYS)
     return 1
 
@@ -6357,6 +6441,16 @@ def _u_prctl(a0: uint64, a1: uint64, a2: uint64,
             ni = ni + 1
         set_task_seccomp_native_armed(slot_nf, 1)
         return 0
+    if a0 == PR_SET_SECCOMP_BPF:                          # §6: cBPF
+        # prctl(PR_SET_SECCOMP_BPF, filter_addr, filter_len). Stages
+        # `filter_len` cBPF instructions (8 B each) at user address
+        # `filter_addr` into the BPF program pool (kernel/seccomp_bpf.ad).
+        # Cumulative: a second install prepends another filter; every
+        # filter runs at every syscall and the LOWEST action wins
+        # (Linux seccomp-bpf semantics). Inherited across fork/clone
+        # via bpf_inherit_to_child in
+        # arch/x86/kernel/syscall.ad::seccomp_inherit_to_child.
+        return bpf_install_filter(current_idx_get(), a1, a2)
     return ELINUX_INVAL
 
 
@@ -13886,8 +13980,15 @@ def linux_u_syscall_dispatch(nr: uint64,
     # about to be killed, and faithful for a task that catches SIGSYS and
     # returns. Native/kernel paths never reach here (gated on
     # is_linux_userspace at the do_syscall fork upstream).
-    if seccomp_check_entry(nr) != 0:
-        return ptrace_syscall_exit_stop(cast[int64](-38))   # -ENOSYS
+    sc_act: int64 = seccomp_check_entry(nr, a0, a1, a2, a3, a4, a5)
+    if sc_act != 0:
+        # SIGSYS-block path: return -ENOSYS (the task is about to be
+        # SIGSYS'd). ERRNO-block path: return -errno verbatim so the
+        # filter's chosen errno reaches the caller's %rax intact.
+        rc_b: int64 = cast[int64](-38)
+        if sc_act < 0:
+            rc_b = sc_act
+        return ptrace_syscall_exit_stop(rc_b)
     rc: int64 = _linux_u_syscall_dispatch_inner(nr, a0, a1, a2, a3, a4, a5)
     return ptrace_syscall_exit_stop(rc)
 
