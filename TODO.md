@@ -49,11 +49,10 @@ audit #453 closed; report at `audit_F10_report.md`. F10-1 #454, F10-2
   pipes/socketpair/p9/net/epoll-family/ptmx/fuse still mark-based;
   pipes = highest-leverage next fold; `NR_FDS=16` per task will pinch
   Debian userland).
-- [~] **F10-6 #458** — Plan 9 `Dir` record minimum viable landed
-  (`b9572451`): `lib/p9dir.ad` wire format + `lib/p9.ad` decoder +
-  `SYS_LISTDIR_RECORDS=318` + devsrv emits Dir; deferred:
-  `_dirfile_read`/devproc migration (needs per-Chan `p9_dir_mode` flag)
-  and userland `ls`/`du` migration.
+- [x] **F10-6 #458** — Plan 9 `Dir` record MVP landed (`b9572451`);
+  followup per-Chan `p9_dir_mode` + `_dirfile_read` migration + ls/du
+  migration landed `73e95a06`. Remaining deferred: per-entry mtime
+  (per-FS hook needed) + devproc dir backing + flip-back to mode 0.
 - [~] **F10-4 (#457) structural landed `d193bbf8`** — do_mount no
   longer silently drops afd; Tauth runs when afd != -1, devauth-backed
   uname passed into Tattach. Test scaffolding compiles + boots green
