@@ -282,23 +282,6 @@ sys_listdir_records:
     .size sys_listdir_records, .-sys_listdir_records
 
 
-    /* --- sys_chan_dir_mode(fd, mode, path) -> int32 ------------------
-     * #458 F10-6 followup: flip a directory fd's Chan into Dir-record
-     * mode. fd must be an FD_CHAN_MARK directory fd. mode=1 enables;
-     * mode=0 disables (only valid before the transform has run). path
-     * is the absolute parent path the fd was opened against — the
-     * kernel uses it to stat each NAME\n entry during the transform.
-     * Returns 0 on success, -errno on failure.
-     */
-    .globl sys_chan_dir_mode
-    .type sys_chan_dir_mode, @function
-sys_chan_dir_mode:
-    movq    $319, %rax              /* SYS_CHAN_DIR_MODE */
-    syscall
-    ret
-    .size sys_chan_dir_mode, .-sys_chan_dir_mode
-
-
     /* --- sys_open_write(path) -> int32 -------------------------------
      * Open-or-create for write. Truncates an existing file. Tmpfs
      * paths (/tmp/*) are the only writable target as of M16.37. */
