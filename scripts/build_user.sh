@@ -149,6 +149,7 @@ build_adder_user hxd                  # TUI hex+ASCII file viewer (xxd/hexdump -
 build_adder_user tree                 # recursive directory lister with box-drawing connectors
 build_adder_user hdu                  # ncdu-style interactive disk-usage browser (recursive sizes, bar, navigate)
 build_adder_user hlog                 # TUI kernel-log viewer/follower (dmesg -w / journalctl -f) over /proc/kmsg
+build_adder_user oopsread             # F-oops: render persisted kernel panic record from /proc/oops
 build_adder_user awk                  # literal {print $N} only
 build_adder_user less                 # alias for more (24-line pager)
 build_adder_user xargs                # stdin tokens -> sys_spawn argv

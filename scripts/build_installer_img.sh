@@ -188,6 +188,15 @@ HAMNIX_ESP_LOG_SIZE="${HAMNIX_ESP_LOG_SIZE:-262144}"
 ESP_LOG_SRC="$STUB_TMP/log.txt"
 head -c "$HAMNIX_ESP_LOG_SIZE" /dev/zero | tr '\0' '\n' > "$ESP_LOG_SRC"
 mcopy -o -i "$TARGET_ESP" "$ESP_LOG_SRC" "::/LOG.TXT"
+# Preallocate \OOPS.BIN right after LOG.TXT (same contiguity rationale)
+# so kernel/printk/esp_log.ad can locate its data extent via the same
+# FAT root-dir scan and overwrite byte 0 in place when panic() fires.
+# Size MUST match ESP_OOPS_BYTES in esp_log.ad (default 65536 = 64 KiB).
+# A zero fill is fine — the kernel writes a fresh structured record.
+HAMNIX_ESP_OOPS_SIZE="${HAMNIX_ESP_OOPS_SIZE:-65536}"
+ESP_OOPS_SRC="$STUB_TMP/oops.bin"
+head -c "$HAMNIX_ESP_OOPS_SIZE" /dev/zero > "$ESP_OOPS_SRC"
+mcopy -o -i "$TARGET_ESP" "$ESP_OOPS_SRC" "::/OOPS.BIN"
 mmd -i "$TARGET_ESP" "::/EFI"
 mmd -i "$TARGET_ESP" "::/EFI/BOOT"
 mcopy -o -i "$TARGET_ESP" "$EFI_STUB"          "::/EFI/BOOT/BOOTX64.EFI"
@@ -271,6 +280,8 @@ mformat -i "$MEDIA_ESP" -h 64 -s 32 -c 32 -t $(( MEDIA_ESP_MB * 64 )) -v HAMNIXI
 # ESP. Without this preallocation esp_log has no extent to arm on the USB
 # ESP — the exact original bug. Reuse the size/fill from Stage 4.
 mcopy -o -i "$MEDIA_ESP" "$ESP_LOG_SRC" "::/LOG.TXT"
+# OOPS.BIN on the install-medium ESP too — see Stage 4 above.
+mcopy -o -i "$MEDIA_ESP" "$ESP_OOPS_SRC" "::/OOPS.BIN"
 mmd -i "$MEDIA_ESP" "::/EFI"
 mmd -i "$MEDIA_ESP" "::/EFI/BOOT"
 mcopy -o -i "$MEDIA_ESP" "$EFI_STUB"          "::/EFI/BOOT/BOOTX64.EFI"

@@ -346,6 +346,14 @@ if os.environ.get("ENABLE_XHCI_SELFTEST") == "1":
 if os.environ.get("ENABLE_INSTALLER_MEDIUM_MARKER") == "1":
     FILES.append(("/etc/installer-medium", b"1\n"))
 
+# F-oops capture self-test marker. OOPS_TEST=1 plants /etc/oops-test so
+# init/main.ad fires a deterministic panic right after esp_log_init has
+# armed OOPS.BIN's extent. scripts/test_kernel_oops_capture.sh boots
+# with this set, reads OOPS.BIN off the FAT volume the kernel wrote to,
+# and asserts the panic message + a backtrace addr persisted.
+if os.environ.get("OOPS_TEST") == "1":
+    FILES.append(("/etc/oops-test", b"1\n"))
+
 # Framebuffer page-pause log-capture aid. Set ENABLE_LOG_SLOW=1 to plant
 # /etc/log-slow; init/main.ad (boot:03) then makes the GOP text console
 # pause ~1 s and stamp an OCR delimiter ("### HAMNIX-LOGPAGE NNNN ###")
