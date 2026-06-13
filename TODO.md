@@ -103,8 +103,9 @@ cleanly** (per #459 above). When that's clear:
   `10e8dda5` (binary already existed).
 - [ ] **hamsh `use hamui`** — bindings; may need hamsh closures +
   event loop + persistent state.
-- [ ] Per-window namespace + elevation visible in `uid` / `ns` files
-  (`newshell hostowner`, `hamUI new -as hostowner`).
+- [x] Per-window `uid` / `ns` files on `#w` landed `5681bab4` — uid
+  walks `task_lookup_by_pid`→`task_uid_at` (SETUID-stamp reflects with
+  no bespoke hook); ns dumps the owning Pgrp's bindings.
 - [ ] X11/Xvfb bridge in a kind=fb layer (path to Firefox/Chromium).
 - [~] snarf clipboard + `wctl` resize/move + focus click/sloppy kernel
   surface landed `d3842a22`. Compositor hamUId.ad adoption (poll-loop
@@ -113,10 +114,10 @@ cleanly** (per #459 above). When that's clear:
 Remaining hamUId.ad-touching items (single 25k-line file, serialize
 to avoid merge collisions): Display/Mouse/keyboard-layout settings
 panels, external notification + system-tray client-registration API,
-screensaver+password-lock, real session save/restore, inter-app
-drag-and-drop. Image wallpaper landed `49b54267` (PPM loader + `/dev/
-wsys/ctl wallpaper <path>` verb + `/etc/wallpaper.ppm` autoload). PDF
-viewer (atril) deferred (needs font/PDF stack).
+real session save/restore, inter-app drag-and-drop. Image wallpaper
+landed `49b54267`. Screensaver+password-lock landed `860dfdd5` via
+hamlock+hamscreensaver. PDF viewer (atril) deferred (needs font/PDF
+stack).
 
 > **ARM64 deprioritized below desktop work (user 2026-06-10).** Phase
 > 50 preserved on `worktree-agent-a48facf53ef25a377` (`6f217d09`), NOT
