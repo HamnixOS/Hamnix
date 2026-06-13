@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# scripts/test_procnet.sh — /proc/net/{tcp,udp,arp,route,dev} live
-# network-state renderers (Linux text format).
+# scripts/test_procnet.sh — /proc/net/{tcp,udp,arp,route,dev,sockstat}
+# live network-state renderers (Linux text format).
 #
 # Boots the kernel once with /etc/procnet-test planted
 # (ENABLE_PROCNET_TEST=1). init/main.ad at boot:37.pnt detects the
@@ -12,6 +12,7 @@
 #   * /proc/net/arp   "IP address  HW type  Flags  HW address  Mask  Device"
 #   * /proc/net/route "Iface Destination Gateway Flags ..."
 #   * /proc/net/dev   two header lines + a `lo` row
+#   * /proc/net/sockstat "sockets: used N" + TCP/UDP inuse rows
 #
 # This proves render_net_* enumerate LIVE kernel network state (socket
 # table, TCB table, ARP cache, IP/gateway/netmask, net_device counters)
@@ -98,4 +99,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_procnet] PASS — /proc/net/{tcp,udp,arp,route,dev} render live network state in Linux format"
+echo "[test_procnet] PASS — /proc/net/{tcp,udp,arp,route,dev,sockstat} render live network state in Linux format"
