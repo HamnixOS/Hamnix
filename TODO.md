@@ -53,10 +53,11 @@ audit #453 closed; report at `audit_F10_report.md`. F10-1 #454, F10-2
   `SYS_LISTDIR_RECORDS=318` + devsrv emits Dir; deferred:
   `_dirfile_read`/devproc migration (needs per-Chan `p9_dir_mode` flag)
   and userland `ls`/`du` migration.
-- [ ] **F10-4..F10-5, F10-8, F10-10 (#457)** — afd Tauth ignored,
-  init/main.ad split (~14k lines mixing selftests + boot), seccomp-lite
-  to native syscalls, oom_score_adj per-Pgrp. (F10-7 closed as bonus in
-  F10-2; F10-9/F10-11/F10-12 landed `f9c61595`.)
+- [ ] **F10-4, F10-5, F10-10 (#457)** — afd Tauth ignored, init/main.ad
+  split (~14k lines mixing selftests + boot), oom_score_adj per-Pgrp
+  (deferred from F10-8 bundle: needs Pgrp struct edits). (F10-7 closed
+  bonus in F10-2; F10-8 landed `983e1ce8`; F10-9/F10-11/F10-12 landed
+  `f9c61595`.)
 - [ ] **#459** — DE doesn't load on fresh image post-F10 wave (pid
   exit code=127 on `init 5`). Likely cpio mode prefix gap or uid=NOBODY
   hitting a server policy. Investigate after wave settles.
