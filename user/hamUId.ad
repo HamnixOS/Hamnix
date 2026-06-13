@@ -2453,6 +2453,254 @@ def bg_cycle():
 
 
 # ====================================================================
+# DE image-wallpaper (PPM P6 backdrop)
+# ====================================================================
+# The compositor's root-window backdrop normally renders the solid
+# ROOT_R/G/B colour from the palette above. When an image wallpaper is
+# loaded, daemon_pixel samples the WALLPAPER_RGB buffer instead, centred
+# on the screen (or top-left clipped when the image is larger than the
+# screen — start simple, no scaling).
+#
+# Source format: NetPBM P6 (the simplest possible RGB bitmap, also the
+# format `hamshot` emits). Header:
+#
+#     P6\n
+#     <width> <height>\n          (whitespace-separated; comments allowed)
+#     255\n                       (maxval — only 255 is accepted)
+#     <raw 3*w*h bytes>           (R,G,B in row-major scanline order)
+#
+# Sizing: WALLPAPER_MAX_W * WALLPAPER_MAX_H * 3 bytes for the decoded
+# RGB buffer. Cap is 640x480 (matches the default framebuffer and any
+# committed sample image); a larger PPM is rejected at load. The read
+# buffer is sized for the BIGGEST sane file (header + pixels).
+#
+# Runtime reload: the kernel records the requested path via the
+# /dev/wsys/ctl `wallpaper <path>` verb; the compositor polls
+# /dev/wsys/wallpaper for "<gen> <path>\n" once per main-loop tick and
+# reloads on a gen bump.
+WALLPAPER_MAX_W: uint64 = 640
+WALLPAPER_MAX_H: uint64 = 480
+WALLPAPER_MAX_BYTES: uint64 = 921600          # 640 * 480 * 3
+WALLPAPER_FILE_CAP:  uint64 = 922112          # 921600 + 512 (PPM header slack)
+WALLPAPER_PATH_CAP:  uint64 = 256
+
+# Decoded RGB image.
+wallpaper_rgb: Array[921600, uint8]
+wallpaper_w:   uint64 = 0
+wallpaper_h:   uint64 = 0
+wallpaper_loaded: int32 = 0
+# Last gen we loaded for (matches the kernel's wsys_wallpaper_gen).
+wallpaper_gen_seen: uint64 = 0
+# Slow polling: only check the kernel wallpaper file every Nth present
+# tick to avoid hammering the namespace on the hot path.
+WALLPAPER_POLL_EVERY: uint64 = 32
+wallpaper_poll_tick:  uint64 = 0
+
+# Raw-file read buffer (held at module scope per compiler quirk: no big
+# locals). Sized for the worst-case PPM the compositor accepts.
+wallpaper_read_buf: Array[922112, uint8]
+
+# Last path we LOADED (so a redundant gen bump on the same path is still
+# accepted, but we have one place to read the chosen path from for the
+# selftest verb-dispatch test).
+wallpaper_path_buf: Array[256, uint8]
+wallpaper_path_len: uint64 = 0
+
+
+# Skip ASCII whitespace + any '#'-to-end-of-line comments (PPM permits
+# comments between header tokens). Returns the new offset.
+def _ppm_skip_ws(buf: Ptr[uint8], pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end:
+        c: uint8 = buf[p]
+        if c == 32 or c == 9 or c == 10 or c == 13:
+            p = p + 1
+            continue
+        if c == 35:                    # '#' comment to end of line
+            while p < end and buf[p] != 10:
+                p = p + 1
+            continue
+        break
+    return p
+
+
+# Parse one decimal token at buf[pos..end). On success writes the value
+# through `out` and returns the offset of the first byte AFTER the token.
+# On failure (no digits) returns `pos` unchanged.
+def _ppm_parse_uint(buf: Ptr[uint8], pos: uint64, end: uint64,
+                    out: Ptr[uint64]) -> uint64:
+    p: uint64 = pos
+    v: uint64 = 0
+    seen: uint64 = 0
+    while p < end:
+        c: uint8 = buf[p]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[uint64](c) - 48
+        seen = seen + 1
+        p = p + 1
+    if seen == 0:
+        return pos
+    out[0] = v
+    return p
+
+
+# Parse the PPM bytes in buf[0..count) into (w, h) and copy the raw RGB
+# scanlines into wallpaper_rgb. Returns 0 on success, negative on a
+# format/size error. Caps width/height at WALLPAPER_MAX_W/H.
+#
+# Accepted shape: "P6\n<w> <h>\n255\n<raw RGB>". Whitespace between
+# header tokens is flexible (one whitespace byte after "255" precedes
+# the raw pixel data, matching the spec).
+def ppm_parse_p6(buf: Ptr[uint8], count: uint64) -> int32:
+    if count < 11:
+        return -1
+    if buf[0] != 80 or buf[1] != 54:           # "P6"
+        return -1
+    # Whitespace after the magic.
+    if buf[2] != 32 and buf[2] != 9 and buf[2] != 10 and buf[2] != 13:
+        return -1
+    p: uint64 = 3
+    p = _ppm_skip_ws(buf, p, count)
+    w: uint64 = 0
+    np: uint64 = _ppm_parse_uint(buf, p, count, &w)
+    if np == p:
+        return -2
+    p = np
+    p = _ppm_skip_ws(buf, p, count)
+    h: uint64 = 0
+    np = _ppm_parse_uint(buf, p, count, &h)
+    if np == p:
+        return -2
+    p = np
+    p = _ppm_skip_ws(buf, p, count)
+    mx: uint64 = 0
+    np = _ppm_parse_uint(buf, p, count, &mx)
+    if np == p:
+        return -2
+    p = np
+    if mx != 255:
+        return -3
+    # Exactly ONE whitespace byte separates the maxval from the binary
+    # pixel block (P6 spec).
+    if p >= count:
+        return -4
+    c0: uint8 = buf[p]
+    if c0 != 32 and c0 != 9 and c0 != 10 and c0 != 13:
+        return -4
+    p = p + 1
+    if w == 0 or h == 0:
+        return -5
+    if w > WALLPAPER_MAX_W or h > WALLPAPER_MAX_H:
+        return -5
+    nbytes: uint64 = w * h * 3
+    if p + nbytes > count:
+        return -6
+    i: uint64 = 0
+    while i < nbytes:
+        wallpaper_rgb[i] = buf[p + i]
+        i = i + 1
+    wallpaper_w = w
+    wallpaper_h = h
+    wallpaper_loaded = 1
+    return 0
+
+
+# Try to load /etc/wallpaper.ppm (or the supplied path) into
+# wallpaper_rgb. Returns 0 on success, negative on failure (file not
+# present, header bad, dimensions over the cap, etc.). Failure is
+# SILENT (the daemon falls back to the solid backdrop), aside from a
+# one-line serial marker so a test can assert the path was attempted.
+def wallpaper_load_path(path: Ptr[char]) -> int32:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    n: int64 = read_whole(fd, &wallpaper_read_buf[0], WALLPAPER_FILE_CAP)
+    sys_close(fd)
+    if n <= 0:
+        return -1
+    rc: int32 = ppm_parse_p6(&wallpaper_read_buf[0], cast[uint64](n))
+    if rc != 0:
+        wallpaper_loaded = 0
+        wallpaper_w = 0
+        wallpaper_h = 0
+        return rc
+    # Announce so the selftest / boot log can assert a load fired.
+    pfx: Ptr[uint8] = "DESK wallpaper loaded "
+    sys_write(1, pfx, strlen_u8(pfx))
+    wb: Array[32, uint8]
+    nw: uint64 = u64_to_dec(wallpaper_w, &wb[0])
+    wb[nw] = 120                                       # 'x'
+    nw = nw + 1
+    nw = nw + u64_to_dec(wallpaper_h, &wb[nw])
+    wb[nw] = 10
+    nw = nw + 1
+    sys_write(1, &wb[0], nw)
+    return 0
+
+
+# Compositor poll: read /dev/wsys/wallpaper for "<gen> <path>\n" and, on
+# a gen bump from the kernel's `wallpaper <path>` verb, reload. Cheap
+# (one open/read/close), but gated to every WALLPAPER_POLL_EVERY ticks
+# so the present hot path isn't dominated by a namespace round-trip.
+def wallpaper_poll_kernel():
+    wallpaper_poll_tick = wallpaper_poll_tick + 1
+    if (wallpaper_poll_tick % WALLPAPER_POLL_EVERY) != 0:
+        return
+    wp: Ptr[uint8] = "/dev/wsys/wallpaper"
+    fd: int32 = sys_open(cast[Ptr[char]](wp))
+    if fd < 0:
+        return
+    rb: Array[320, uint8]
+    n: int64 = read_whole(fd, &rb[0], 320)
+    sys_close(fd)
+    if n <= 0:
+        return
+    total: uint64 = cast[uint64](n)
+    # "<gen> <path>\n" — parse gen, then take the rest of the line minus
+    # the trailing '\n' as path.
+    pos: Array[1, uint64]
+    pos[0] = 0
+    g: uint64 = 0
+    np: uint64 = _ppm_parse_uint(&rb[0], 0, total, &g)
+    if np == 0:
+        return
+    if g == 0 or g == wallpaper_gen_seen:
+        return
+    # Skip the single space.
+    if np >= total or rb[np] != 32:
+        return
+    np = np + 1
+    # Path: rb[np..total) minus a trailing '\n'.
+    pe: uint64 = total
+    if pe > np and rb[pe - 1] == 10:
+        pe = pe - 1
+    if pe == np:
+        return
+    plen: uint64 = pe - np
+    if plen >= WALLPAPER_PATH_CAP:
+        return
+    pbuf: Array[256, uint8]
+    i: uint64 = 0
+    while i < plen:
+        pbuf[i] = rb[np + i]
+        i = i + 1
+    pbuf[plen] = 0
+    if wallpaper_load_path(cast[Ptr[char]](&pbuf[0])) == 0:
+        # Remember the loaded path for the verb-dispatch selftest.
+        j: uint64 = 0
+        while j < plen:
+            wallpaper_path_buf[j] = pbuf[j]
+            j = j + 1
+        wallpaper_path_buf[plen] = 0
+        wallpaper_path_len = plen
+        wallpaper_gen_seen = g
+        # The whole backdrop changed — force a full-screen recomposite
+        # on the next frame so the new wallpaper lands at every pixel.
+        damage_full()
+
+
+# ====================================================================
 # ROUND-4: themeable title-bar accent palette (MATE "Appearance")
 # ====================================================================
 # The active-window title-bar gradient reads a top/bottom RGB pair from
@@ -10274,6 +10522,24 @@ def daemon_pixel(x: int64, y: int64,
     r: uint8 = ROOT_R
     g: uint8 = ROOT_G
     b: uint8 = ROOT_B
+    # Image wallpaper: when loaded, sample the decoded RGB buffer
+    # CENTRED on the screen (no scaling — start simple). Pixels OUTSIDE
+    # the image rect fall through to the solid backdrop colour, so a
+    # smaller-than-screen wallpaper gets a coloured matte automatically.
+    if wallpaper_loaded != 0 and wallpaper_w > 0 and wallpaper_h > 0:
+        sw: int64 = cast[int64](FBG_W)
+        sh: int64 = cast[int64](FBG_H)
+        iw: int64 = cast[int64](wallpaper_w)
+        ih: int64 = cast[int64](wallpaper_h)
+        ox: int64 = (sw - iw) / 2
+        oy: int64 = (sh - ih) / 2
+        ix: int64 = x - ox
+        iy: int64 = y - oy
+        if ix >= 0 and ix < iw and iy >= 0 and iy < ih:
+            o: uint64 = (cast[uint64](iy) * wallpaper_w + cast[uint64](ix)) * 3
+            r = wallpaper_rgb[o]
+            g = wallpaper_rgb[o + 1]
+            b = wallpaper_rgb[o + 2]
     # --- ROUND-19: desktop icons (painted on the root, under all windows) ---
     di: int64 = 0
     while di < DICON_COUNT:
@@ -25963,6 +26229,12 @@ def cmd_daemon_auto(autoflag: int32) -> int32:
     theme_apply()
     bg_palette_init()
     dicons_init()                        # ROUND-19: seed desktop launcher icons
+    # DE image-wallpaper: best-effort load of /etc/wallpaper.ppm at
+    # startup. Failure is silent (the solid palette backdrop stays).
+    # The kernel-side `wallpaper <path>` verb on /dev/wsys/ctl is the
+    # runtime-reload path: wallpaper_poll_kernel() picks up gen bumps.
+    dwp: Ptr[uint8] = "/etc/wallpaper.ppm"
+    wallpaper_load_path(cast[Ptr[char]](dwp))
     cp: Ptr[uint8] = "/dev/cons"
     cons_fd = sys_open(cast[Ptr[char]](cp))
     # (fd 1/2 were already reopened onto /dev/cons for the 46/47 self-tests
@@ -26382,6 +26654,11 @@ def cmd_daemon_auto(autoflag: int32) -> int32:
     EVL_PREV_WINS = DWIN_COUNT
     EVL_LAST_HK_JIFFY = 0
     while True:
+        # DE image-wallpaper: pick up runtime wallpaper changes posted
+        # by the kernel /dev/wsys/ctl `wallpaper <path>` verb. Gated
+        # internally to every WALLPAPER_POLL_EVERY iterations so the
+        # idle path stays event-driven.
+        wallpaper_poll_kernel()
         if daemon_frame(scr_w, scr_h) != 0:
             break
         evl_wait()
