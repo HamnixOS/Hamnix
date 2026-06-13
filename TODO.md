@@ -224,7 +224,8 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
 - [ ] `seccomp-bpf` (full classic-BPF program).
 
 ### §15 Compiler
-- [ ] `match`/`case` tokenization → implement.
+- [x] `match`/`case` statement landed `a9a701b1` — literal, name-bind,
+  wildcard `_`, OR `a|b`, sequence patterns. LANGUAGE.md updated.
 
 ### §17 stock-Linux `.ko` (lowest)
 - [ ] `MAX_EXPORTS` bumps; `usbcore`+`xhci_hcd`, `libphy`, `8021q`,
