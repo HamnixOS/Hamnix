@@ -178,6 +178,7 @@ build_adder_user hampanel             # DE panel extracted from daemon_pixel: st
 build_adder_user hamappmenu           # DE pivot wave 2: cascading Applications menu (v2 client; reads /dev/wsys/appmenu, writes /dev/wsys/appmenu/launch)
 build_adder_user hamcycler            # DE pivot wave 3: Alt-Tab window switcher overlay (v2 client; reads /dev/wsys/cycler, poked via /dev/wsys/cycler/show)
 build_adder_user hamcalpop            # DE pivot wave 4: clock-panel calendar drop-down popup (v2 client; reads /dev/wsys/calpop, poked via /dev/wsys/calpop/show; distinct from /bin/hamclock)
+build_adder_user hamrun               # DE pivot wave 4: Run-Application (Alt-F2) modal dialog (v2 client; reads /dev/wsys/run, poked via /dev/wsys/run/show, launches via /dev/wsys/run/launch)
 build_adder_user hamcalc              # integer calculator on the hamui toolkit (lib/hamui.ad)
 build_adder_user hamclock             # clock + stopwatch on the hamui toolkit (lib/hamui.ad)
 build_adder_user hamview              # image viewer (Eye-of-MATE equiv) on the hamui toolkit: decodes PPM(P6)/BMP, blits via an fb draw-layer

@@ -1,0 +1,298 @@
+# user/hamrun.ad
+#
+# hamrun — DE pivot wave 4: the MATE-style "Run Application..." (Alt-F2)
+# modal text-entry dialog, extracted out of user/hamUId.ad's daemon_pixel
+# cascade into a standalone v2 client (matches the wave-1 hampanel,
+# wave-2 hamappmenu, and wave-3 hamcycler pattern).
+#
+# Wire model
+# ----------
+# 1. The compositor publishes the dialog model (open flag + typed text)
+#    via the `run <open> <text>` verb on /dev/wsys/ctl. The snapshot is
+#    served at /dev/wsys/run as one line:
+#       "<show_serial> <open> <gen> <text>\n"
+# 2. The compositor spawns /bin/hamrun once at startup. Whenever the
+#    dialog state mutates (open/cancel/push/backspace/launch) it
+#    republishes the model and bumps the show serial by writing to
+#    /dev/wsys/run/show.
+# 3. We open OUR /dev/wsys/<wid>/wctl, write "version 2\n" to opt into
+#    the rio v2 blit protocol, then rasterise the centred dialog chrome
+#    (frame + title + text field + caret + hint) directly into our
+#    backbuffer via lib/hamui's hamui_v2_* family. The compositor blits
+#    our backbuffer to /dev/fb each frame.
+# 4. While `open` is 0 we leave the backbuffer cleared-to-transparent so
+#    the dialog is "off" (the kernel-side present is a no-op on an
+#    unchanged buffer). When `open` flips to 1 we paint the chrome.
+#
+# Why keyboard input still lives in the compositor
+# ------------------------------------------------
+# Like the cycler wave, only the RENDER moved out. The Alt-F2 hotkey,
+# Backspace/Enter/ESC handling, and the per-keystroke text mutation
+# remain in hamUId.ad's key path. Each mutation publishes a fresh
+# snapshot + pokes /dev/wsys/run/show so this client repaints. The
+# launch (Enter) is enqueued via /dev/wsys/run/launch which hamUId
+# drains on the next frame and turns into a daemon_spawn_window_prog.
+#
+# WHAT THIS REPLACES
+# ------------------
+# The ~55-line per-pixel "Run Application" modal cascade inside
+# daemon_pixel in user/hamUId.ad. That code is gone; this file is its
+# replacement.
+
+from lib.hamui import (
+    hamui_init, hamui_window_on, hamui_set_protocol_v2,
+    hamui_v2_clear, hamui_v2_fill_rect, hamui_v2_commit_rect,
+    hamui_v2_is_active,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield()
+extern def sys_exit(code: int32)
+
+
+# --- model storage --------------------------------------------------
+_hr_TEXT_CAP: uint64 = 128
+
+_hr_open: int32 = 0
+_hr_gen:  uint64 = 0
+_hr_show_serial: uint64 = 0
+_hr_last_show_serial: uint64 = 0xffffffffffffffff
+_hr_last_gen: uint64 = 0xffffffffffffffff
+
+_hr_text: Array[128, uint8]
+_hr_text_len: uint64 = 0
+
+
+# --- layout (window-local pixels, v2 backbuffer cap) ----------------
+# Mirrors the legacy RUN_W=320 / total-h dialog. The window itself is
+# the dialog frame — no surrounding desktop dim (the compositor still
+# dims behind via its damage path).
+_hr_WIN_W: int32 = 320
+_hr_WIN_H: int32 = 100
+_hr_PAD:   int32 = 14
+_hr_GLYPH_H: int32 = 6
+_hr_GLYPH_W: int32 = 7
+_hr_FIELD_H: int32 = 22
+
+
+# --- scratch --------------------------------------------------------
+_hr_snap_buf: Array[512, uint8]
+
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
+
+
+# --- snapshot parser ------------------------------------------------
+def _read_run_snapshot() -> int64:
+    fd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/run"))
+    if fd < 0:
+        return -1
+    n: int64 = sys_read(fd, &_hr_snap_buf[0], 512)
+    sys_close(fd)
+    return n
+
+
+def _parse_u64(pos: Ptr[uint64], end: uint64) -> uint64:
+    p: uint64 = pos[0]
+    v: uint64 = 0
+    while p < end and _hr_snap_buf[p] >= 48 and _hr_snap_buf[p] <= 57:
+        v = v * 10 + cast[uint64](_hr_snap_buf[p] - 48)
+        p = p + 1
+    pos[0] = p
+    return v
+
+
+def _skip_ws(pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end and (_hr_snap_buf[p] == 32 or _hr_snap_buf[p] == 9):
+        p = p + 1
+    return p
+
+
+def _parse_snapshot(n: uint64) -> int32:
+    # Returns 1 if anything CHANGED since the last parse (gen or
+    # show_serial differ), 0 otherwise.
+    if n == 0:
+        return 0
+    pos: Array[1, uint64]
+    pos[0] = 0
+    show_v: uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    open_v: uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    gen_v: uint64 = _parse_u64(&pos[0], n)
+    # Single separating space, then the text extends to '\n' / EOF.
+    p: uint64 = pos[0]
+    if p < n and _hr_snap_buf[p] == 32:
+        p = p + 1
+    ts: uint64 = p
+    while p < n and _hr_snap_buf[p] != 10:
+        p = p + 1
+    te: uint64 = p
+    tlen: uint64 = te - ts
+    if tlen >= _hr_TEXT_CAP:
+        tlen = _hr_TEXT_CAP - 1
+    k: uint64 = 0
+    while k < tlen:
+        _hr_text[k] = _hr_snap_buf[ts + k]
+        k = k + 1
+    _hr_text[tlen] = 0
+    _hr_text_len = tlen
+    _hr_show_serial = show_v
+    _hr_open = cast[int32](open_v)
+    _hr_gen = gen_v
+    changed: int32 = 0
+    if _hr_show_serial != _hr_last_show_serial:
+        changed = 1
+    if _hr_gen != _hr_last_gen:
+        changed = 1
+    _hr_last_show_serial = _hr_show_serial
+    _hr_last_gen = _hr_gen
+    return changed
+
+
+# --- crude glyph-block rendering ------------------------------------
+# Mirrors hamcycler/hamappmenu's _draw_text_blocks — one 4x6 block per
+# non-space char. Glyph fidelity will come later from str_ink-on-v2.
+def _draw_text_blocks(x: int32, y: int32, label: Ptr[uint8], len: uint64,
+                      r: uint8, g: uint8, b: uint8, max_w: int32):
+    i: uint64 = 0
+    cx: int32 = x
+    while i < len and cx + 4 <= x + max_w:
+        c: uint8 = label[i]
+        if c != 32:
+            hamui_v2_fill_rect(cx, y, 4, _hr_GLYPH_H, r, g, b)
+        cx = cx + _hr_GLYPH_W - 1
+        i = i + 1
+
+
+def _paint_closed():
+    # Dialog hidden: clear the backbuffer.
+    hamui_v2_clear(0, 0, 0)
+    hamui_v2_commit_rect(0, 0, _hr_WIN_W, _hr_WIN_H)
+
+
+def _paint_open():
+    # Background — matches the legacy 52/58/72 dialog body.
+    hamui_v2_clear(52, 58, 72)
+    # 1px frame (the legacy 120/150/210 highlight).
+    hamui_v2_fill_rect(0, 0, _hr_WIN_W, 1, 120, 150, 210)
+    hamui_v2_fill_rect(0, _hr_WIN_H - 1, _hr_WIN_W, 1, 120, 150, 210)
+    hamui_v2_fill_rect(0, 0, 1, _hr_WIN_H, 120, 150, 210)
+    hamui_v2_fill_rect(_hr_WIN_W - 1, 0, 1, _hr_WIN_H, 120, 150, 210)
+
+    # Title.
+    title: Ptr[uint8] = "Run Application"
+    _draw_text_blocks(_hr_PAD, _hr_PAD,
+                      title, _strlen(title),
+                      200, 215, 245,
+                      _hr_WIN_W - _hr_PAD * 2)
+
+    # Text-entry field (the dark sunken box).
+    fld_x: int32 = _hr_PAD
+    fld_y: int32 = _hr_PAD + _hr_GLYPH_H + 8
+    fld_w: int32 = _hr_WIN_W - _hr_PAD * 2
+    hamui_v2_fill_rect(fld_x, fld_y, fld_w, _hr_FIELD_H, 24, 26, 32)
+    # Field border.
+    hamui_v2_fill_rect(fld_x, fld_y, fld_w, 1, 90, 110, 150)
+    hamui_v2_fill_rect(fld_x, fld_y + _hr_FIELD_H - 1, fld_w, 1, 90, 110, 150)
+    hamui_v2_fill_rect(fld_x, fld_y, 1, _hr_FIELD_H, 90, 110, 150)
+    hamui_v2_fill_rect(fld_x + fld_w - 1, fld_y, 1, _hr_FIELD_H, 90, 110, 150)
+
+    # The typed command, plus a block caret at the end.
+    txt_y: int32 = fld_y + (_hr_FIELD_H - _hr_GLYPH_H) / 2
+    _draw_text_blocks(fld_x + 6, txt_y,
+                      &_hr_text[0], _hr_text_len,
+                      230, 236, 248,
+                      fld_w - 12)
+    # Caret: a 4x6 block right after the last drawn char.
+    car_x: int32 = fld_x + 6 + cast[int32](_hr_text_len) * (_hr_GLYPH_W - 1)
+    if car_x + 4 <= fld_x + fld_w - 2:
+        hamui_v2_fill_rect(car_x, txt_y, 4, _hr_GLYPH_H, 200, 210, 235)
+
+    # Hint line below the field.
+    hint: Ptr[uint8] = "Enter to run, Esc to cancel"
+    hint_y: int32 = fld_y + _hr_FIELD_H + 8
+    _draw_text_blocks(_hr_PAD, hint_y,
+                      hint, _strlen(hint),
+                      150, 158, 175,
+                      _hr_WIN_W - _hr_PAD * 2)
+
+    hamui_v2_commit_rect(0, 0, _hr_WIN_W, _hr_WIN_H)
+
+
+def _paint():
+    if _hr_open != 0:
+        _paint_open()
+    else:
+        _paint_closed()
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    hamui_init()
+    # Self-discover OUR wid via /dev/wsys/self (the same shape
+    # hamappmenu/hamcycler/hamecho use). argv[1] may override for tests.
+    wid: int32 = 1
+    self_path: Ptr[uint8] = "/dev/wsys/self"
+    sfd: int32 = sys_open(cast[Ptr[char]](self_path))
+    if sfd >= 0:
+        sbuf: Array[16, uint8]
+        sn: int64 = sys_read_nb(sfd, &sbuf[0], 16)
+        sys_close(sfd)
+        if sn > 0:
+            v: int32 = 0
+            i: uint64 = 0
+            while i < cast[uint64](sn) and sbuf[i] >= 48 and sbuf[i] <= 57:
+                v = v * 10 + cast[int32](sbuf[i]) - 48
+                i = i + 1
+            if v >= 2:
+                wid = v
+    if argc > 1:
+        ap: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        v2: int32 = 0
+        i2: uint64 = 0
+        while ap[i2] >= 48 and ap[i2] <= 57:
+            v2 = v2 * 10 + cast[int32](ap[i2]) - 48
+            i2 = i2 + 1
+        if v2 >= 1:
+            wid = v2
+
+    bound: int32 = hamui_window_on(0, wid)
+    if bound < 0:
+        _puts(2, "hamrun: could not bind window\n")
+        return 1
+    if hamui_set_protocol_v2() < 0:
+        _puts(2, "hamrun: v2 negotiate failed\n")
+        return 1
+
+    # Initial paint from whatever the compositor has already published.
+    n0: int64 = _read_run_snapshot()
+    if n0 > 0:
+        _parse_snapshot(cast[uint64](n0))
+    _paint()
+    rdy: Ptr[uint8] = "HAMRUN ready\n"
+    sys_write(1, rdy, _strlen(rdy))
+
+    # Long-lived event loop: poll the snapshot. On a gen or show_serial
+    # bump repaint. The compositor pokes /dev/wsys/run/show whenever the
+    # dialog state changes (no socket: we just resample the snapshot).
+    while True:
+        n: int64 = _read_run_snapshot()
+        if n > 0:
+            if _parse_snapshot(cast[uint64](n)) != 0:
+                _paint()
+        sys_yield()
+
+    return 0
