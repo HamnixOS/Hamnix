@@ -1,0 +1,303 @@
+# user/hamcycler.ad
+#
+# hamcycler — DE pivot wave 3: the MATE-style Alt-Tab window switcher
+# overlay, extracted out of user/hamUId.ad's daemon_pixel cascade into
+# a standalone v2 client (matches the wave-1 hampanel + wave-2
+# hamappmenu pattern).
+#
+# Wire model
+# ----------
+# 1. The compositor publishes the switcher model (open flag + selected
+#    row + per-candidate window list) via the `cycler <open> <sel>
+#    <payload>` verb on /dev/wsys/ctl. The snapshot is served at
+#    /dev/wsys/cycler (line-oriented text:
+#       "<show_serial> <open> <sel> <gen>\n"
+#       "W <wid> <title>\n"   -- one per candidate row
+#    ).
+# 2. The compositor spawns /bin/hamcycler at startup. On each key step
+#    (F5/F6 in our keymap) it republishes the model and bumps the show
+#    serial by writing to /dev/wsys/cycler/show.
+# 3. We open OUR /dev/wsys/<wid>/wctl, write "version 2\n" to opt into
+#    the rio v2 blit protocol, then rasterise the centred switcher
+#    chrome directly into our backbuffer via lib/hamui's hamui_v2_*
+#    family. The compositor blits our backbuffer to /dev/fb each frame.
+# 4. While `open` is 0 we leave the backbuffer cleared-to-transparent
+#    so the overlay is "off" (the kernel-side present is a no-op on an
+#    unchanged buffer). When `open` flips to 1 we paint the list +
+#    highlight the selected row.
+#
+# WHAT THIS REPLACES
+# ------------------
+# The ~55-line per-pixel "alt-tab switcher popup" cascade inside
+# daemon_pixel in user/hamUId.ad. That code is gone; this file is its
+# replacement. The keyboard input that drives cycle_step / cycle_commit
+# stays in the compositor — only the RENDER lives here.
+
+from lib.hamui import (
+    hamui_init, hamui_window_on, hamui_set_protocol_v2,
+    hamui_v2_clear, hamui_v2_fill_rect, hamui_v2_commit_rect,
+    hamui_v2_is_active,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield()
+extern def sys_exit(code: int32)
+
+
+# --- model storage --------------------------------------------------
+# Hard caps mirror the compositor publish path: at most 9 candidate
+# windows (one per DWIN slot) with short titles.
+_hc_MAX_ROWS:   uint64 = 9
+_hc_TITLE_CAP:  uint64 = 32
+
+_hc_open: int32 = 0
+_hc_sel:  int32 = 0
+_hc_gen:  uint64 = 0
+_hc_show_serial: uint64 = 0
+_hc_last_show_serial: uint64 = 0xffffffffffffffff
+_hc_last_gen: uint64 = 0xffffffffffffffff
+
+_hc_row_count: uint64 = 0
+_hc_row_title: Array[9, Array[32, uint8]]
+_hc_row_title_len: Array[9, uint64]
+
+
+# --- layout (window-local pixels, v2 backbuffer 320x200 cap) --------
+_hc_WIN_W: int32 = 300
+_hc_WIN_H: int32 = 200
+_hc_ROW_H: int32 = 18
+_hc_PAD:   int32 = 6
+_hc_HDR_H: int32 = 10
+
+
+# --- scratch --------------------------------------------------------
+_hc_snap_buf: Array[2200, uint8]
+
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
+
+
+# --- snapshot parser ------------------------------------------------
+def _read_cycler_snapshot() -> int64:
+    fd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/cycler"))
+    if fd < 0:
+        return -1
+    n: int64 = sys_read(fd, &_hc_snap_buf[0], 2200)
+    sys_close(fd)
+    return n
+
+
+def _skip_to_eol(pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end and _hc_snap_buf[p] != 10:
+        p = p + 1
+    if p < end:
+        p = p + 1
+    return p
+
+
+def _skip_ws(pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end and (_hc_snap_buf[p] == 32 or _hc_snap_buf[p] == 9):
+        p = p + 1
+    return p
+
+
+def _parse_u64(pos: Ptr[uint64], end: uint64) -> uint64:
+    p: uint64 = pos[0]
+    v: uint64 = 0
+    while p < end and _hc_snap_buf[p] >= 48 and _hc_snap_buf[p] <= 57:
+        v = v * 10 + cast[uint64](_hc_snap_buf[p] - 48)
+        p = p + 1
+    pos[0] = p
+    return v
+
+
+def _parse_snapshot(n: uint64) -> int32:
+    # Returns 1 if anything CHANGED since the last parse (open/sel/gen
+    # or show serial differ), 0 otherwise.
+    if n == 0:
+        return 0
+    pos: Array[1, uint64]
+    pos[0] = 0
+    show_v: uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    open_v: uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    sel_v: uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    gen_v: uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_to_eol(pos[0], n)
+    _hc_show_serial = show_v
+    _hc_open = cast[int32](open_v)
+    _hc_sel = cast[int32](sel_v)
+    _hc_gen = gen_v
+    # Parse W rows.
+    _hc_row_count = 0
+    p: uint64 = pos[0]
+    while p < n and _hc_row_count < _hc_MAX_ROWS:
+        if _hc_snap_buf[p] != 87:                # 'W'
+            p = _skip_to_eol(p, n)
+            continue
+        p = p + 1
+        if p < n and _hc_snap_buf[p] == 32:
+            p = p + 1
+        # wid (ignored for layout, but consumed)
+        pos[0] = p
+        _parse_u64(&pos[0], n)
+        p = _skip_ws(pos[0], n)
+        # title = rest of line
+        ts: uint64 = p
+        while p < n and _hc_snap_buf[p] != 10:
+            p = p + 1
+        te: uint64 = p
+        if p < n:
+            p = p + 1
+        tlen: uint64 = te - ts
+        if tlen >= _hc_TITLE_CAP:
+            tlen = _hc_TITLE_CAP - 1
+        k: uint64 = 0
+        while k < tlen:
+            _hc_row_title[_hc_row_count][k] = _hc_snap_buf[ts + k]
+            k = k + 1
+        _hc_row_title[_hc_row_count][tlen] = 0
+        _hc_row_title_len[_hc_row_count] = tlen
+        _hc_row_count = _hc_row_count + 1
+    changed: int32 = 0
+    if _hc_show_serial != _hc_last_show_serial:
+        changed = 1
+    if _hc_gen != _hc_last_gen:
+        changed = 1
+    _hc_last_show_serial = _hc_show_serial
+    _hc_last_gen = _hc_gen
+    return changed
+
+
+# --- crude glyph-block rendering ------------------------------------
+# Mirrors hamappmenu's _draw_text_rect — one 4x6 block per non-space
+# char, spaced 6 px apart. The list-of-candidates SHAPE is the point;
+# glyph fidelity comes later from str_ink-on-v2.
+def _draw_text_blocks(x: int32, y: int32, label: Ptr[uint8], len: uint64,
+                      r: uint8, g: uint8, b: uint8, max_w: int32):
+    i: uint64 = 0
+    cx: int32 = x
+    while i < len and cx + 4 <= x + max_w:
+        c: uint8 = label[i]
+        if c != 32:
+            hamui_v2_fill_rect(cx, y, 4, 6, r, g, b)
+        cx = cx + 6
+        i = i + 1
+
+
+def _paint_closed():
+    # Switcher hidden: clear the whole backbuffer so nothing of the
+    # previous frame's overlay lingers.
+    hamui_v2_clear(0, 0, 0)
+    hamui_v2_commit_rect(0, 0, _hc_WIN_W, _hc_WIN_H)
+
+
+def _paint_open():
+    # Background (matches the legacy CYC_R/G/B = 40/46/58).
+    hamui_v2_clear(40, 46, 58)
+    # 1px frame.
+    hamui_v2_fill_rect(0, 0, _hc_WIN_W, 1, 16, 18, 24)
+    hamui_v2_fill_rect(0, _hc_WIN_H - 1, _hc_WIN_W, 1, 16, 18, 24)
+    hamui_v2_fill_rect(0, 0, 1, _hc_WIN_H, 16, 18, 24)
+    hamui_v2_fill_rect(_hc_WIN_W - 1, 0, 1, _hc_WIN_H, 16, 18, 24)
+    # Rows.
+    i: uint64 = 0
+    while i < _hc_row_count:
+        y: int32 = _hc_PAD + cast[int32](i) * _hc_ROW_H
+        if y + _hc_ROW_H > _hc_WIN_H - _hc_PAD:
+            break
+        if cast[int32](i) == _hc_sel:
+            # Selected row: CYC_SEL_R/G/B = 70/100/170.
+            hamui_v2_fill_rect(_hc_PAD, y,
+                               _hc_WIN_W - _hc_PAD * 2, _hc_ROW_H,
+                               70, 100, 170)
+        # Title text. Inset 4px on top of the row pad.
+        ty: int32 = y + (_hc_ROW_H - 6) / 2
+        _draw_text_blocks(_hc_PAD + 4, ty,
+                          &_hc_row_title[i][0], _hc_row_title_len[i],
+                          235, 235, 240,
+                          _hc_WIN_W - _hc_PAD * 2 - 8)
+        i = i + 1
+    hamui_v2_commit_rect(0, 0, _hc_WIN_W, _hc_WIN_H)
+
+
+def _paint():
+    if _hc_open != 0 and _hc_row_count > 0:
+        _paint_open()
+    else:
+        _paint_closed()
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    hamui_init()
+    # Self-discover OUR wid via /dev/wsys/self (the same shape
+    # hamappmenu/hamecho use). argv[1] may override for tests.
+    wid: int32 = 1
+    self_path: Ptr[uint8] = "/dev/wsys/self"
+    sfd: int32 = sys_open(cast[Ptr[char]](self_path))
+    if sfd >= 0:
+        sbuf: Array[16, uint8]
+        sn: int64 = sys_read_nb(sfd, &sbuf[0], 16)
+        sys_close(sfd)
+        if sn > 0:
+            v: int32 = 0
+            i: uint64 = 0
+            while i < cast[uint64](sn) and sbuf[i] >= 48 and sbuf[i] <= 57:
+                v = v * 10 + cast[int32](sbuf[i]) - 48
+                i = i + 1
+            if v >= 2:
+                wid = v
+    if argc > 1:
+        ap: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        v2: int32 = 0
+        i2: uint64 = 0
+        while ap[i2] >= 48 and ap[i2] <= 57:
+            v2 = v2 * 10 + cast[int32](ap[i2]) - 48
+            i2 = i2 + 1
+        if v2 >= 1:
+            wid = v2
+
+    bound: int32 = hamui_window_on(0, wid)
+    if bound < 0:
+        _puts(2, "hamcycler: could not bind window\n")
+        return 1
+    if hamui_set_protocol_v2() < 0:
+        _puts(2, "hamcycler: v2 negotiate failed\n")
+        return 1
+
+    # Initial paint from whatever the compositor has already published.
+    n0: int64 = _read_cycler_snapshot()
+    if n0 > 0:
+        _parse_snapshot(cast[uint64](n0))
+    _paint()
+    rdy: Ptr[uint8] = "HAMCYCLER ready\n"
+    sys_write(1, rdy, _strlen(rdy))
+
+    # Long-lived event loop: poll the snapshot. On a serial or gen bump
+    # repaint. The cycler client lives for the whole DE session — the
+    # compositor pokes /dev/wsys/cycler/show whenever the overlay needs
+    # to wake (no socket: we just resample the snapshot file).
+    while True:
+        n: int64 = _read_cycler_snapshot()
+        if n > 0:
+            if _parse_snapshot(cast[uint64](n)) != 0:
+                _paint()
+        sys_yield()
+
+    return 0

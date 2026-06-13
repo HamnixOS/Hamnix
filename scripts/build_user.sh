@@ -176,6 +176,7 @@ build_adder_user hamfiles             # hamui GUI file browser: sys_listdir + la
 build_adder_user hamde                # hamui-based DE panel (Applications menu + clock + taskbar)
 build_adder_user hampanel             # DE panel extracted from daemon_pixel: standalone hamui-client app on the #442 (c) v2 blit protocol (taskbar + clock + Applications launcher)
 build_adder_user hamappmenu           # DE pivot wave 2: cascading Applications menu (v2 client; reads /dev/wsys/appmenu, writes /dev/wsys/appmenu/launch)
+build_adder_user hamcycler            # DE pivot wave 3: Alt-Tab window switcher overlay (v2 client; reads /dev/wsys/cycler, poked via /dev/wsys/cycler/show)
 build_adder_user hamcalc              # integer calculator on the hamui toolkit (lib/hamui.ad)
 build_adder_user hamclock             # clock + stopwatch on the hamui toolkit (lib/hamui.ad)
 build_adder_user hamview              # image viewer (Eye-of-MATE equiv) on the hamui toolkit: decodes PPM(P6)/BMP, blits via an fb draw-layer
