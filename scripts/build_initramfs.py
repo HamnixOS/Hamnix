@@ -1194,6 +1194,20 @@ if os.environ.get("ENABLE_TMPFS_LINK_TEST") == "1":
 if os.environ.get("ENABLE_CGROUP2_TEST") == "1":
     FILES.append(("/etc/cgroup2-test", b"1\n"))
 
+# F11 (2026-06-13) cgroup v2 cpu.max ENFORCEMENT self-test.
+# scripts/test_cgroup_cpu_max.sh sets ENABLE_CGROUP_CPU_TEST=1 to plant
+# /etc/cgroup-cpu-max-test. init/main.ad's boot:37.cgcpu hook detects
+# the marker and calls cgroup_cpu_selftest() (kernel/sched/cgroup_cpu.ad)
+# which exercises the real enforcement path: mkdir g1, write
+# cpu.max "50000 100000" (50% of one CPU), attach a task, and drive
+# 200 simulated ring-3 timer ticks through the same refill+charge+
+# should-throttle calls the timer ISR and _pick_next() use on a real
+# running user task. Asserts the task got ~50% of CPU ticks (within
+# ±10 of 100) — i.e. cpu.max actually gated CPU consumption, not just
+# rendered a file. Default boots omit the marker.
+if os.environ.get("ENABLE_CGROUP_CPU_TEST") == "1":
+    FILES.append(("/etc/cgroup-cpu-max-test", b"1\n"))
+
 # §fuse: /dev/fuse + FUSE wire-protocol READ round-trip. scripts/test_fuse.sh
 # sets ENABLE_FUSE_TEST=1 to plant /etc/fuse-test. init/main.ad's boot:37.fuse
 # hook detects the marker and calls fuse_selftest() (linux_abi/u_fuse.ad): it

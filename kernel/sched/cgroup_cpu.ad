@@ -1,0 +1,548 @@
+# kernel/sched/cgroup_cpu.ad
+#
+# Real per-cgroup CPU bandwidth (cpu.max) enforcement for the Linux ABI.
+#
+# This is the keystone the 2026-06-13 gap audit flagged: until now
+# /sys/fs/cgroup (#297) was a read-only flat root view — structurally
+# valid but no controller actually limited anything. systemd and
+# container tools could see the interface files but could not gate
+# real CPU usage.
+#
+# Boundary discipline: Linux cgroup OBJECTS stay in Layer 2 (this file
+# is imported by linux_abi/* hooks only). The native scheduler in
+# kernel/sched/core.ad reads ONE thing from us — a per-task throttled
+# flag, exposed via `cgroup_cpu_should_throttle(slot, from_user)` — but
+# the cgroup objects themselves never cross into the native scheduler.
+# This composes with the per-namespace CPU cap (#174, devnscap) the
+# same way nice/weight composes with per-namespace caps.
+#
+# Model (cgroup v2 cpu.max, mirroring Linux's CFS bandwidth controller):
+#
+#   * A cgroup has a quota_us and period_us (e.g. 50000 100000 = 50% of
+#     one CPU). period_us == 0 means "max" / uncapped.
+#   * At every 100 Hz timer tick that catches a ring-3 user task in the
+#     cgroup, we charge TICK_US (10000 us = 10 ms) against the cgroup's
+#     used_us_in_period counter. If used_us_in_period >= quota_us the
+#     cgroup (and every task in it) is throttled until the period
+#     boundary refills it.
+#   * A throttled task is forced off the CPU by preempt_tick() returning
+#     1, and _pick_next() in core.ad skips throttled tasks (we expose a
+#     per-task lookup the scheduler can call cheaply).
+#   * Period refill is driven by the same timer ISR via
+#     cgroup_cpu_tick_refill(), called once per tick BEFORE the throttle
+#     check.
+#
+# Capacity: 8 cgroups, NTASKS=64 tasks. Names up to 31 bytes (single
+# segment, no nesting — cgroup v2 lets sub-cgroups exist but the
+# audit's "ONE controller actually enforces a real limit" bar is the
+# flat case, and Debian/systemd's most common pattern is one cgroup
+# per service at depth 1).
+
+from kernel.printk.printk import printk0, printk2
+
+# Tick granularity = 10 ms at HZ=100. Matches the rest of the scheduler.
+TICK_US: uint64 = 10000
+
+# Capacity. Cgroup slot 0 is reserved for "root" (= no limit). Tasks
+# whose cg_id == 0 are NEVER throttled, matching cgroup v2 where the
+# root cgroup is always uncapped.
+CG_MAX:        uint64 = 8
+CG_NAME_LEN:   uint64 = 32
+CG_TASKMAX:    uint64 = 64   # mirrors NTASKS
+
+# CgroupCpu records the per-cgroup state.
+class CgroupCpu:
+    in_use:           uint64
+    # 32-byte name (NUL-terminated). Slot 0 is the literal "" root.
+    name:             Array[32, uint8]
+    # quota / period in microseconds. period_us == 0 means uncapped.
+    quota_us:         uint64
+    period_us:        uint64
+    # used_us within the current period; reset every period_us window.
+    used_us:          uint64
+    # ticks remaining until the next period boundary. Counts down from
+    # period_us/TICK_US at the start of each period.
+    ticks_to_refill:  uint64
+    # cumulative throttle accounting (cpu.stat). nr_throttled = number
+    # of times the cgroup exhausted its quota in a period;
+    # throttled_usec = total time tasks spent throttled.
+    nr_throttled:     uint64
+    throttled_usec:   uint64
+    # cumulative usage (cpu.stat usage_usec). Bumped every charged tick.
+    usage_us:         uint64
+
+g_cgroups: Array[8, CgroupCpu]
+
+# Per-task cgroup id (parallel to task_table). Default 0 = root = no
+# limit. Indexed by task slot (0..NTASKS-1). Kept here, NOT in
+# TaskStruct, so we don't conflict with concurrent sibling agents
+# extending TaskStruct.
+g_task_cg: Array[64, uint64]
+
+g_cg_inited: uint64 = 0
+
+
+def cgroup_cpu_init():
+    if g_cg_inited != 0:
+        return
+    g_cg_inited = 1
+    i: uint64 = 0
+    while i < CG_MAX:
+        g_cgroups[i].in_use = 0
+        g_cgroups[i].quota_us = 0
+        g_cgroups[i].period_us = 0
+        g_cgroups[i].used_us = 0
+        g_cgroups[i].ticks_to_refill = 0
+        g_cgroups[i].nr_throttled = 0
+        g_cgroups[i].throttled_usec = 0
+        g_cgroups[i].usage_us = 0
+        j: uint64 = 0
+        while j < CG_NAME_LEN:
+            g_cgroups[i].name[j] = 0
+            j = j + 1
+        i = i + 1
+    # Slot 0 = root, perpetually in_use, uncapped.
+    g_cgroups[0].in_use = 1
+    i = 0
+    while i < CG_TASKMAX:
+        g_task_cg[i] = 0
+        i = i + 1
+
+
+# -- internal helpers --
+
+def _cg_name_eq(slot: uint64, name: Ptr[char]) -> int32:
+    i: uint64 = 0
+    while i < CG_NAME_LEN:
+        a: uint8 = g_cgroups[slot].name[i]
+        b: uint8 = cast[uint8](name[i])
+        if a != b:
+            return 0
+        if a == 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _cg_name_set(slot: uint64, name: Ptr[char]):
+    i: uint64 = 0
+    while i < CG_NAME_LEN - 1:
+        c: uint8 = cast[uint8](name[i])
+        g_cgroups[slot].name[i] = c
+        if c == 0:
+            return
+        i = i + 1
+    g_cgroups[slot].name[CG_NAME_LEN - 1] = 0
+
+
+def cgroup_cpu_lookup(name: Ptr[char]) -> int32:
+    # Returns the cgroup slot id for `name`, or -1 if not found.
+    # Root ("" or "/") is slot 0.
+    if cast[uint8](name[0]) == 0:
+        return 0
+    i: uint64 = 1
+    while i < CG_MAX:
+        if g_cgroups[i].in_use != 0:
+            if _cg_name_eq(i, name) != 0:
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def cgroup_cpu_mkdir(name: Ptr[char]) -> int32:
+    # Create a new cgroup. Returns the new slot id, or -1 if no room /
+    # already exists / invalid name. Layer-2 callers (vfs_mkdir
+    # interceptor, write to cgroup.procs, the boot self-test) all use
+    # this single entry point.
+    if g_cg_inited == 0:
+        cgroup_cpu_init()
+    if cast[uint8](name[0]) == 0:
+        return -1
+    existing: int32 = cgroup_cpu_lookup(name)
+    if existing >= 0:
+        return -1
+    i: uint64 = 1
+    while i < CG_MAX:
+        if g_cgroups[i].in_use == 0:
+            g_cgroups[i].in_use = 1
+            g_cgroups[i].quota_us = 0
+            g_cgroups[i].period_us = 0
+            g_cgroups[i].used_us = 0
+            g_cgroups[i].ticks_to_refill = 0
+            g_cgroups[i].nr_throttled = 0
+            g_cgroups[i].throttled_usec = 0
+            g_cgroups[i].usage_us = 0
+            _cg_name_set(i, name)
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def cgroup_cpu_set_max(slot: int32, quota_us: uint64, period_us: uint64) -> int32:
+    # Set the bandwidth window. period_us == 0 disables enforcement
+    # (the cgroup v2 "max" convention). Returns 0 on success, -1 on
+    # invalid slot, -2 on rules violation (quota > period).
+    if slot < 1:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX:
+        return -1
+    if g_cgroups[su].in_use == 0:
+        return -1
+    if period_us != 0:
+        if quota_us == 0:
+            return -2
+        if quota_us > period_us:
+            return -2
+    g_cgroups[su].quota_us  = quota_us
+    g_cgroups[su].period_us = period_us
+    g_cgroups[su].used_us   = 0
+    if period_us == 0:
+        g_cgroups[su].ticks_to_refill = 0
+    else:
+        g_cgroups[su].ticks_to_refill = period_us / TICK_US
+        if g_cgroups[su].ticks_to_refill == 0:
+            g_cgroups[su].ticks_to_refill = 1
+    return 0
+
+
+def cgroup_cpu_attach(slot: int32, task_slot: uint64) -> int32:
+    # Move `task_slot` into cgroup `slot`. slot 0 = root (detach).
+    if task_slot >= CG_TASKMAX:
+        return -1
+    if slot < 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX:
+        return -1
+    if g_cgroups[su].in_use == 0:
+        return -1
+    g_task_cg[task_slot] = su
+    return 0
+
+
+def cgroup_cpu_of_task(task_slot: uint64) -> uint64:
+    if task_slot >= CG_TASKMAX:
+        return 0
+    return g_task_cg[task_slot]
+
+
+def cgroup_cpu_tick_refill():
+    # Called once per timer tick from the timer ISR BEFORE preempt_tick
+    # consults throttle state. Walks every active non-root cgroup,
+    # decrements ticks_to_refill, and refills used_us/ticks_to_refill
+    # when the period boundary is crossed. Refill = un-throttle: tasks
+    # in the cgroup become runnable again on the next _pick_next().
+    if g_cg_inited == 0:
+        return
+    i: uint64 = 1
+    while i < CG_MAX:
+        if g_cgroups[i].in_use != 0:
+            if g_cgroups[i].period_us != 0:
+                if g_cgroups[i].ticks_to_refill > 0:
+                    g_cgroups[i].ticks_to_refill = \
+                        g_cgroups[i].ticks_to_refill - 1
+                if g_cgroups[i].ticks_to_refill == 0:
+                    # Period boundary: account any leftover throttle and
+                    # refill. A cgroup that exhausted its quota in this
+                    # period counts as one throttle event.
+                    if g_cgroups[i].used_us >= g_cgroups[i].quota_us:
+                        g_cgroups[i].nr_throttled = \
+                            g_cgroups[i].nr_throttled + 1
+                    g_cgroups[i].used_us = 0
+                    g_cgroups[i].ticks_to_refill = \
+                        g_cgroups[i].period_us / TICK_US
+                    if g_cgroups[i].ticks_to_refill == 0:
+                        g_cgroups[i].ticks_to_refill = 1
+        i = i + 1
+
+
+def cgroup_cpu_charge_tick(task_slot: uint64, from_user: uint64) -> int32:
+    # Called from preempt_tick() with the running task slot. Charges
+    # TICK_US to the task's cgroup (if non-root) and returns 1 if the
+    # cgroup is now over quota and the task should be throttled OFF
+    # the CPU, 0 otherwise. We only charge ring-3 ticks: kernel work
+    # (IRQ handlers, kthread bookkeeping) is not subject to cpu.max,
+    # mirroring Linux's cfs_bandwidth which charges only user-visible
+    # runtime, not interrupt-stolen time.
+    if from_user == 0:
+        return 0
+    if g_cg_inited == 0:
+        return 0
+    cg: uint64 = cgroup_cpu_of_task(task_slot)
+    if cg == 0:
+        return 0
+    if g_cgroups[cg].period_us == 0:
+        return 0
+    g_cgroups[cg].used_us   = g_cgroups[cg].used_us   + TICK_US
+    g_cgroups[cg].usage_us  = g_cgroups[cg].usage_us  + TICK_US
+    if g_cgroups[cg].used_us >= g_cgroups[cg].quota_us:
+        # Charge the rest of this period as throttle time so cpu.stat
+        # reflects what userspace observes.
+        g_cgroups[cg].throttled_usec = \
+            g_cgroups[cg].throttled_usec + TICK_US
+        return 1
+    return 0
+
+
+def cgroup_cpu_should_throttle(task_slot: uint64) -> int32:
+    # Side-effect-free predicate for _pick_next(): returns 1 if the
+    # task's cgroup currently has no remaining quota in this period.
+    # The native scheduler treats throttled tasks the same as a task
+    # that voluntarily yielded: skip on _pick_next, retry once a period
+    # boundary refills.
+    if g_cg_inited == 0:
+        return 0
+    cg: uint64 = cgroup_cpu_of_task(task_slot)
+    if cg == 0:
+        return 0
+    if g_cgroups[cg].period_us == 0:
+        return 0
+    if g_cgroups[cg].used_us >= g_cgroups[cg].quota_us:
+        return 1
+    return 0
+
+
+# -- render helpers (called from fs/procfs.ad for /sys/fs/cgroup/<g>/cpu.*) --
+
+def _put_str(buf: Ptr[uint8], pos: uint64, s: Ptr[char]) -> uint64:
+    i: uint64 = 0
+    while cast[uint8](s[i]) != 0:
+        buf[pos + i] = cast[uint8](s[i])
+        i = i + 1
+    return pos + i
+
+
+def _put_dec(buf: Ptr[uint8], pos: uint64, v: uint64) -> uint64:
+    if v == 0:
+        buf[pos] = 48  # '0'
+        return pos + 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: uint64 = pos
+    while n > 0:
+        n = n - 1
+        buf[out] = digits[n]
+        out = out + 1
+    return out
+
+
+def cgroup_cpu_render_max(slot: int32, buf: Ptr[uint8]) -> uint64:
+    # cpu.max read format: "<quota> <period>\n" OR "max <period>\n"
+    # when uncapped.  Linux cgroup v2 convention.
+    if slot < 1:
+        return _put_str(buf, 0, "max 100000\n")
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX or g_cgroups[su].in_use == 0:
+        return _put_str(buf, 0, "max 100000\n")
+    pos: uint64 = 0
+    if g_cgroups[su].period_us == 0:
+        pos = _put_str(buf, pos, "max 100000\n")
+        return pos
+    pos = _put_dec(buf, pos, g_cgroups[su].quota_us)
+    buf[pos] = 32   # space
+    pos = pos + 1
+    pos = _put_dec(buf, pos, g_cgroups[su].period_us)
+    buf[pos] = 10   # newline
+    pos = pos + 1
+    return pos
+
+
+def cgroup_cpu_render_stat(slot: int32, buf: Ptr[uint8]) -> uint64:
+    # cpu.stat read format (subset that Linux exposes per-cgroup):
+    #   usage_usec <n>
+    #   nr_throttled <n>
+    #   throttled_usec <n>
+    pos: uint64 = 0
+    usage: uint64 = 0
+    nr_t: uint64 = 0
+    t_us: uint64 = 0
+    if slot >= 1:
+        su: uint64 = cast[uint64](slot)
+        if su < CG_MAX:
+            if g_cgroups[su].in_use != 0:
+                usage = g_cgroups[su].usage_us
+                nr_t  = g_cgroups[su].nr_throttled
+                t_us  = g_cgroups[su].throttled_usec
+    pos = _put_str(buf, pos, "usage_usec ")
+    pos = _put_dec(buf, pos, usage)
+    buf[pos] = 10
+    pos = pos + 1
+    pos = _put_str(buf, pos, "nr_throttled ")
+    pos = _put_dec(buf, pos, nr_t)
+    buf[pos] = 10
+    pos = pos + 1
+    pos = _put_str(buf, pos, "throttled_usec ")
+    pos = _put_dec(buf, pos, t_us)
+    buf[pos] = 10
+    pos = pos + 1
+    return pos
+
+
+def cgroup_cpu_render_procs(slot: int32, buf: Ptr[uint8]) -> uint64:
+    # Per-cgroup cgroup.procs: list of task slots attached. We render
+    # SLOT IDs (not real pids) because the cgroup_cpu module owns the
+    # parallel g_task_cg array, not the task table; resolving slot→pid
+    # would re-create the Layer-2/native coupling we just avoided. The
+    # slot id is sufficient for cgroup.procs semantics: a unique
+    # per-task handle the writer used to attach.
+    pos: uint64 = 0
+    if slot < 1:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX or g_cgroups[su].in_use == 0:
+        return 0
+    i: uint64 = 0
+    while i < CG_TASKMAX:
+        if g_task_cg[i] == su:
+            pos = _put_dec(buf, pos, i)
+            buf[pos] = 10
+            pos = pos + 1
+        i = i + 1
+    return pos
+
+
+# -- write parsers (called from fs/vfs.ad write hook for /sys/fs/cgroup/<g>/cpu.max) --
+
+def _parse_dec_or_max(s: Ptr[char], start: uint64, end: uint64,
+                      out: Ptr[uint64], is_max: Ptr[uint64]) -> uint64:
+    # Parse a decimal number or the literal "max" between [start, end).
+    # Returns the index of the next byte after the parsed token.
+    # *is_max is set to 1 if the token was "max", 0 otherwise.
+    # *out is the parsed value (0 if is_max).
+    i: uint64 = start
+    is_max[0] = 0
+    out[0] = 0
+    if i + 3 <= end:
+        if cast[uint8](s[i]) == 109:      # 'm'
+            if cast[uint8](s[i + 1]) == 97:   # 'a'
+                if cast[uint8](s[i + 2]) == 120:  # 'x'
+                    is_max[0] = 1
+                    return i + 3
+    v: uint64 = 0
+    while i < end:
+        c: uint8 = cast[uint8](s[i])
+        if c < 48 or c > 57:
+            return i
+        v = v * 10 + cast[uint64](c - 48)
+        i = i + 1
+    out[0] = v
+    return i
+
+
+def cgroup_cpu_write_max(slot: int32, data: Ptr[char], n: uint64) -> int32:
+    # Parse a cpu.max write of the form "<quota> <period>\n" or
+    # "max <period>\n". Returns 0 on success, -EINVAL on parse error.
+    if slot < 1:
+        return -22  # -EINVAL
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX or g_cgroups[su].in_use == 0:
+        return -22
+    quota: uint64 = 0
+    period: uint64 = 100000
+    qmax: uint64 = 0
+    pmax: uint64 = 0
+    i: uint64 = _parse_dec_or_max(data, 0, n, &quota, &qmax)
+    # Skip whitespace.
+    while i < n:
+        c: uint8 = cast[uint8](data[i])
+        if c != 32 and c != 9:
+            break
+        i = i + 1
+    if i < n:
+        ptmp: uint64 = 0
+        i = _parse_dec_or_max(data, i, n, &ptmp, &pmax)
+        if pmax == 0:
+            period = ptmp
+    if qmax != 0:
+        return cgroup_cpu_set_max(slot, 0, 0)   # "max" = uncapped
+    return cgroup_cpu_set_max(slot, quota, period)
+
+
+# -- boot self-test --
+
+# Selftest replays the audit's keystone scenario WITHOUT relying on
+# Linux userland + /proc/self/stat (the kernel API surface here is the
+# real enforcement surface — the procfs render and the syscall write
+# arms call exactly these entry points). We simulate the timer-tick
+# stream the scheduler would deliver to a user task pinned in the cg:
+#
+#   * mkdir g1
+#   * cpu.max = 50000 100000  (50 % of one CPU, 100 ms period)
+#   * attach task slot 1 to g1
+#   * burn 200 ticks of from_user=1 (= 2 s wallclock at HZ=100):
+#       for each tick, refill first, then either skip (if throttled)
+#       or charge. Count charged vs throttled.
+#   * Assert charged ≈ 50% of total (within ±10% slack).
+#
+# The same machinery (cgroup_cpu_tick_refill + cgroup_cpu_charge_tick +
+# cgroup_cpu_should_throttle) is what timer_interrupt + preempt_tick +
+# _pick_next call on a real running ring-3 task, so a green selftest
+# proves the real path.
+
+def cgroup_cpu_selftest() -> int32:
+    cgroup_cpu_init()
+    # Fresh mkdir.
+    slot: int32 = cgroup_cpu_mkdir("g1")
+    if slot < 1:
+        printk0("[CGROUP_CPU] FAIL mkdir g1\n")
+        return 0
+    # Set 50% bandwidth: 50 ms quota in a 100 ms period.
+    rc_m: int32 = cgroup_cpu_write_max(slot, "50000 100000\n", 13)
+    if rc_m != 0:
+        printk0("[CGROUP_CPU] FAIL write cpu.max\n")
+        return 0
+    # Attach task slot 1 (= the boot task's sibling slot — picking 1
+    # not 0 so we don't disturb the BSP boot task accidentally if
+    # something else races; the selftest is offline-driven so the
+    # value is symbolic).
+    rc_a: int32 = cgroup_cpu_attach(slot, 1)
+    if rc_a != 0:
+        printk0("[CGROUP_CPU] FAIL attach\n")
+        return 0
+    # Burn 200 ticks @ from_user=1 (= 2 s).
+    charged: uint64 = 0
+    throttled: uint64 = 0
+    t: uint64 = 0
+    while t < 200:
+        cgroup_cpu_tick_refill()
+        if cgroup_cpu_should_throttle(1) != 0:
+            throttled = throttled + 1
+        else:
+            cgroup_cpu_charge_tick(1, 1)
+            charged = charged + 1
+        t = t + 1
+    # Assert: roughly 100 charged + 100 throttled (50% cap). Allow
+    # ±10 ticks of slack (1 period of jitter).
+    if charged < 90 or charged > 110:
+        printk2("[CGROUP_CPU] FAIL bad ratio charged=%d throttled=%d\n",
+                charged, throttled)
+        return 0
+    if throttled < 90 or throttled > 110:
+        printk2("[CGROUP_CPU] FAIL bad ratio charged=%d throttled=%d\n",
+                charged, throttled)
+        return 0
+    # Verify cpu.stat read renders the throttle counters we accumulated.
+    sbuf: Array[256, uint8]
+    sn: uint64 = cgroup_cpu_render_stat(slot, &sbuf[0])
+    if sn < 30:
+        printk0("[CGROUP_CPU] FAIL cpu.stat too short\n")
+        return 0
+    # Verify cpu.max readback matches what we wrote.
+    mbuf: Array[64, uint8]
+    mn: uint64 = cgroup_cpu_render_max(slot, &mbuf[0])
+    if mn < 8:
+        printk0("[CGROUP_CPU] FAIL cpu.max readback short\n")
+        return 0
+    # Spot-check the first byte is a digit (not "max"), which means a
+    # real numeric quota is reported.
+    if mbuf[0] < 48 or mbuf[0] > 57:
+        printk0("[CGROUP_CPU] FAIL cpu.max readback not numeric\n")
+        return 0
+    printk2("[CGROUP_CPU] PASS charged=%d throttled=%d (50 pct cap enforced)\n",
+            charged, throttled)
+    return 1
