@@ -166,7 +166,8 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
   9 per-leaf binds in pgrp_init (cpuinfo/meminfo/uptime/loadavg/version/
   hostname/stat/mounts/diskstats); deleted ~180 lines of
   `_u_translate_proc_to_dev` string-rewrite.
-- [ ] Union mounts MBEFORE/MAFTER (flag recorded; longest-prefix only).
+- [x] Union mounts MBEFORE/MAFTER — kernel side already honored union
+  list ordering; test coverage bumped `8bb14542` (3 MAFTER assertions).
 - [x] `create(260)` DMDIR — already routed through `vfs_mkdir`; test
   coverage added `47ab21c5`.
 - [~] `stat`/`fstat` per-backend hooks — path-keyed `do_stat` migrated
