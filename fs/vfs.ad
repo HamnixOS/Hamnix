@@ -271,7 +271,15 @@ from sys.src.port9.port.namec import (
     DEV_PTMX, namec_open_ptmx, namec_chan_ptmx_pack,
     # SYS_WAITFDS: per-Chan non-destructive readiness probe.
     namec_poll_readable,
+    # F10-6 followup: per-Chan p9_dir_mode flag.
+    namec_chan_set_p9_dir_mode, namec_chan_get_p9_dir_mode,
+    namec_chan_set_back_ptr,
 )
+from lib.p9dir import (
+    p9_dir_encode_into,
+    P9_DMDIR, P9_DIR_FIXED_HDR, P9_DIR_MIN_REC,
+)
+from lib.9p.9p import P9_QTDIR, P9_QTFILE
 from fs.cpio import (
     cpio_init,
     initramfs_entry_count, initramfs_entry_name,
@@ -2169,6 +2177,282 @@ def _open_dir_with(name: Ptr[char], backend: int32) -> int32:
             if n2 > 0:
                 n = n2
     return _install_dir_fd(fd, buf, n)
+
+
+# --- F10-6 followup: NAME\n -> Dir-record transform ----------------
+#
+# A directory fd's back_ptr buffer was rendered by the open-time
+# listdir backends as a "NAME\n" line stream (see _open_dir_with /
+# _open_dir_srv / _open_dir_blk / etc.). When userspace flips the fd
+# into p9_dir_mode=1 (via SYS_CHAN_DIR_MODE), we walk the existing
+# NAME\n entries, ask the backing FS for per-entry size + mode + qid
+# via the same path-owning-server ladder do_stat uses, and re-encode
+# the listing as Plan-9 Dir wire-format records (lib/p9dir.ad).
+#
+# The transform is best-effort on metadata: if a stat lookup fails
+# (the entry is a synthesised mount-table child whose path doesn't
+# resolve through any backing FS, or the backing has no stat hook)
+# the record still emits with mode=0644 / length=0 — that way `ls -l`
+# never *drops* a name from its output. Real metadata for cpio /
+# tmpfs / ext4 leaves; default-filled for everything else (devs /
+# proc / srv / net / etc.). uid/gid carry "hostowner" to match the
+# convention devsrv_list_dir established in F10-6.
+
+DIR_XFORM_UID:  Array[16, uint8]               # "hostowner" + NUL
+DIR_XFORM_UID_INITED: int32 = 0
+
+
+def _dir_xform_init_uid():
+    # Plant the default uid/gid string into the BSS buffer once.
+    if DIR_XFORM_UID_INITED != 0:
+        return
+    DIR_XFORM_UID[0]  = 104                            # 'h'
+    DIR_XFORM_UID[1]  = 111                            # 'o'
+    DIR_XFORM_UID[2]  = 115                            # 's'
+    DIR_XFORM_UID[3]  = 116                            # 't'
+    DIR_XFORM_UID[4]  = 111                            # 'o'
+    DIR_XFORM_UID[5]  = 119                            # 'w'
+    DIR_XFORM_UID[6]  = 110                            # 'n'
+    DIR_XFORM_UID[7]  = 101                            # 'e'
+    DIR_XFORM_UID[8]  = 114                            # 'r'
+    DIR_XFORM_UID[9]  = 0
+    DIR_XFORM_UID_INITED = 1
+
+
+def _dir_xform_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _dir_xform_join(parent: Ptr[uint8], name: Ptr[uint8],
+                    name_len: uint64, out: Ptr[uint8],
+                    out_cap: uint64) -> uint64:
+    # Render "parent/name" into out, NUL-terminated. Returns the joined
+    # length (without the NUL). Returns 0 if the result would not fit.
+    p_len: uint64 = _dir_xform_strlen(parent)
+    # Strip trailing '/' from parent so "/" + "etc" -> "/etc" not "//etc".
+    while p_len > 1 and parent[p_len - 1] == 47:       # '/'
+        p_len = p_len - 1
+    need: uint64 = p_len + 1 + name_len + 1            # parent + '/' + name + NUL
+    if need > out_cap:
+        return 0
+    i: uint64 = 0
+    while i < p_len:
+        out[i] = parent[i]
+        i = i + 1
+    out[i] = 47                                        # '/'
+    i = i + 1
+    j: uint64 = 0
+    while j < name_len:
+        out[i + j] = name[j]
+        j = j + 1
+    out[i + name_len] = 0
+    return i + name_len
+
+
+def _dir_xform_lookup_meta(abs_path: Ptr[uint8],
+                           out_qtype: Ptr[uint8],
+                           out_mode: Ptr[uint32],
+                           out_qpath: Ptr[uint64],
+                           out_length: Ptr[uint64]) -> int32:
+    # Best-effort per-backend lookup. Populates qtype/mode/qpath/length
+    # for `abs_path` based on the owning server. Returns 0 on success
+    # (always — the fallbacks below ensure every reachable path produces
+    # *some* Dir record). Mirrors the do_stat ladder but stays in-kernel
+    # (no user-buffer write), so we can call it from the transform
+    # without crossing the uaccess boundary.
+    srv: int32 = vfs_path_owning_server(cast[Ptr[char]](abs_path))
+    # Defaults: regular file, mode 0644, qpath = 0, length = 0.
+    out_qtype[0]  = P9_QTFILE
+    out_mode[0]   = cast[uint32](0644)
+    out_qpath[0]  = 0
+    out_length[0] = 0
+    if srv == SERVER_CPIO:
+        # Inline cpio name lookup. Mirrors sysfile.ad::_cpio_lookup; the
+        # symbol there is module-private so we re-do the walk here.
+        idx: int32 = -1
+        cp_count: uint64 = initramfs_entry_count()
+        cp_i: uint64 = 0
+        while cp_i < cp_count:
+            cp_cand: Ptr[char] = initramfs_entry_name(cp_i)
+            cp_k: uint64 = 0
+            cp_eq: int32 = 1
+            while True:
+                cp_ca: int32 = cast[int32](abs_path[cp_k] & 0xFF)
+                cp_cb: int32 = cp_cand[cp_k]
+                if cp_ca != cp_cb:
+                    cp_eq = 0
+                    break
+                if cp_ca == 0:
+                    break
+                cp_k = cp_k + 1
+            if cp_eq != 0:
+                idx = cast[int32](cp_i)
+                cp_i = cp_count               # break
+            else:
+                cp_i = cp_i + 1
+        if idx >= 0:
+            out_qpath[0]  = cast[uint64](idx)
+            out_length[0] = initramfs_entry_size(cast[uint64](idx))
+            m: uint64 = initramfs_entry_mode(cast[uint64](idx))
+            # cpio mode carries POSIX type bits in the high nibble; if
+            # it's a directory, set DMDIR + QTDIR. Otherwise pass the
+            # perm bits straight through.
+            if (m & 0xF000) == 0x4000:                  # S_IFDIR
+                out_qtype[0] = P9_QTDIR
+                out_mode[0]  = P9_DMDIR | cast[uint32](m & 0xFFF)
+            else:
+                out_mode[0]  = cast[uint32](m & 0xFFF)
+                if out_mode[0] == 0:
+                    out_mode[0] = cast[uint32](0644)
+        return 0
+    if srv == SERVER_TMPFS:
+        slot: int32 = tmpfs_lookup(cast[Ptr[char]](abs_path))
+        if slot >= 0:
+            out_qpath[0] = cast[uint64](cast[uint32](slot))
+            if tmpfs_is_dir(slot) != 0:
+                out_qtype[0] = P9_QTDIR
+                out_mode[0]  = P9_DMDIR | cast[uint32](0755)
+            else:
+                out_length[0] = tmpfs_size(slot)
+        return 0
+    if srv == SERVER_EXT4:
+        leaf: Ptr[char] = vfs_fs_rel(cast[Ptr[char]](abs_path))
+        inum: uint32 = 0
+        fsize: uint64 = 0
+        if ext4_resolve_file(leaf, &inum, &fsize) != 0:
+            out_qpath[0]  = cast[uint64](inum)
+            out_length[0] = fsize
+            return 0
+        dinum: uint32 = ext4_resolve_dir(leaf)
+        if dinum != 0:
+            out_qtype[0] = P9_QTDIR
+            out_mode[0]  = P9_DMDIR | cast[uint32](0755)
+            out_qpath[0] = cast[uint64](dinum)
+        return 0
+    # Other servers (devs / proc / srv / net / auth / block / root /
+    # FAT): keep the defaults. ls -l will show "?-rw-r--r-- ? 0 NAME".
+    return 0
+
+
+def vfs_dir_xform_to_records(parent_path: Ptr[uint8],
+                             name_stream: Ptr[uint8],
+                             name_stream_len: uint64,
+                             out_buf: Ptr[uint8],
+                             out_cap: uint64) -> int64:
+    # F10-6 followup: NAME\n-line-stream -> Dir-record transform.
+    # `parent_path` is the absolute directory whose listing produced
+    # `name_stream`; we join each NAME to it for per-entry stat. The
+    # caller is responsible for kmalloc'ing `out_buf` (>= out_cap) and
+    # for kfree'ing the OLD NAME\n buffer once this returns successfully.
+    # Returns the bytes written to `out_buf` (>= 0), or -1 on encode
+    # overflow (the out buffer is too small for the full listing).
+    _dir_xform_init_uid()
+    uid_p: Ptr[uint8] = cast[Ptr[uint8]](&DIR_XFORM_UID[0])
+    uid_len: uint64 = 9                                # "hostowner"
+    out_pos: uint64 = 0
+    i: uint64 = 0
+    join_buf: Array[512, uint8]
+    while i < name_stream_len:
+        # One NAME\n entry starts at i. Find the '\n'.
+        start: uint64 = i
+        while i < name_stream_len and name_stream[i] != 10:
+            i = i + 1
+        nlen: uint64 = i - start
+        if i < name_stream_len:
+            i = i + 1                                  # skip the '\n'
+        if nlen == 0:
+            continue
+        # Skip "." and ".." — the legacy listdirs DON'T emit these for
+        # most backends, but some do; the Dir-record consumers don't
+        # want them either way (ls handles dot-entry suppression on its
+        # own; du shouldn't recurse into them).
+        if nlen == 1 and name_stream[start] == 46:     # '.'
+            continue
+        if nlen == 2 and name_stream[start] == 46 \
+                and name_stream[start + 1] == 46:      # '..'
+            continue
+        # Join parent + name -> abs_path (in the kernel scratch buffer).
+        abs_len: uint64 = _dir_xform_join(
+            parent_path,
+            cast[Ptr[uint8]](cast[uint64](name_stream) + start),
+            nlen,
+            cast[Ptr[uint8]](&join_buf[0]), 512)
+        qtype: uint8 = P9_QTFILE
+        mode: uint32 = cast[uint32](0644)
+        qpath: uint64 = 0
+        length: uint64 = 0
+        if abs_len > 0:
+            _dir_xform_lookup_meta(
+                cast[Ptr[uint8]](&join_buf[0]),
+                &qtype, &mode, &qpath, &length)
+        # Atime / mtime — no per-FS hook exposes mtime as a kernel-side
+        # u32 yet; emit 0 (epoch) for both. ls -l prints "Jan  1  1970"
+        # but the field is the wire-format slot _stat_hook_*'s
+        # _write_dir_record uses, so adding real mtime is a one-line
+        # change here once those hooks expose it.
+        wrote: uint64 = p9_dir_encode_into(
+            out_buf, out_pos, out_cap,
+            qtype, 0, qpath,
+            mode, 0, 0, length,
+            cast[Ptr[uint8]](cast[uint64](name_stream) + start), nlen,
+            uid_p, uid_len,
+            uid_p, uid_len,
+            uid_p, 0)
+        if wrote == 0:
+            # Out buffer full. Return what we've written so far —
+            # callers see a clean truncation rather than corruption.
+            return cast[int64](out_pos)
+        out_pos = out_pos + wrote
+    return cast[int64](out_pos)
+
+
+def vfs_chan_p9_dir_mode_set(cid: int32, mode: int32,
+                             parent_path: Ptr[uint8]) -> int32:
+    # F10-6 followup: SYS_CHAN_DIR_MODE landing point. Flip a DEV_DIR_FILE
+    # chan into Dir-record mode (mode=1) or back to NAME\n (mode=0; not
+    # supported once the buffer is transformed — returns -1). On success
+    # the chan's back_ptr is swapped from the NAME\n buffer to a freshly
+    # kmalloc'd Dir-record buffer, the old buffer is kfree'd, and the
+    # p9_dir_mode flag is set.
+    if namec_chan_dev_type(cid) != DEV_DIR_FILE:
+        return -1
+    if mode == 0:
+        if namec_chan_get_p9_dir_mode(cid) == 0:
+            return 0                                   # already off
+        return -1                                      # no flip-back
+    if mode != 1:
+        return -1
+    if namec_chan_get_p9_dir_mode(cid) == 1:
+        return 0                                       # already on
+    old_ptr: uint64 = namec_chan_back_ptr(cid)
+    old_len: int32 = namec_chan_back_slot(cid)
+    if old_ptr == 0:
+        # Empty directory — still mark Dir-mode but no buffer to
+        # transform. Subsequent reads return 0 (EOF) which is correct.
+        namec_chan_set_p9_dir_mode(cid, 1)
+        return 0
+    new_buf: uint64 = kmalloc(DIR_BUF_SIZE)
+    if new_buf == 0:
+        return -1
+    n: int64 = vfs_dir_xform_to_records(
+        parent_path,
+        cast[Ptr[uint8]](old_ptr), cast[uint64](cast[uint32](old_len)),
+        cast[Ptr[uint8]](new_buf), DIR_BUF_SIZE)
+    if n < 0:
+        kfree(new_buf)
+        return -1
+    # Swap the chan's back_ptr to the new buffer. The old NAME\n buffer
+    # is kfree'd here — the chan_close arm only frees what it sees in
+    # back_ptr at last-close, so we must release the old one now.
+    if namec_chan_set_back_ptr(cid, new_buf, cast[int32](n)) != 0:
+        kfree(new_buf)
+        return -1
+    kfree(old_ptr)
+    namec_chan_set_p9_dir_mode(cid, 1)
+    return 0
 
 
 def _open_dir_srv() -> int32:
