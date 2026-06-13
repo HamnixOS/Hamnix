@@ -1,0 +1,509 @@
+# user/hamcalpop.ad
+#
+# hamcalpop — DE pivot wave 4: the panel clock's drop-down monthly
+# calendar popup, extracted out of user/hamUId.ad's daemon_pixel
+# cascade into a standalone v2 client (matches the wave-1 hampanel +
+# wave-2 hamappmenu + wave-3 hamcycler pattern).
+#
+# This is DISTINCT from /bin/hamclock — hamclock is the standalone
+# clock APP (a hamUI v1 layered-draw clock face). This binary is the
+# panel-attached month grid that drops from clicking the panel clock.
+#
+# Wire model
+# ----------
+# 1. The compositor publishes the popup model (open flag + Y/M/D +
+#    "valid" flag) via the `calpop <open> <year> <month> <day>
+#    <valid>` verb on /dev/wsys/ctl. The snapshot is served at
+#    /dev/wsys/calpop:
+#       "<show_serial> <open> <year> <month> <day> <valid> <gen>\n"
+# 2. The compositor spawns /bin/hamcalpop at startup. Each time the
+#    user clicks the clock applet or the live clock refreshes Y/M/D,
+#    the compositor republishes the model and bumps the show serial
+#    by writing to /dev/wsys/calpop/show.
+# 3. We open OUR /dev/wsys/<wid>/wctl, write "version 2\n" to opt
+#    into the rio v2 blit protocol, then rasterise the month grid
+#    directly into our backbuffer via lib/hamui's hamui_v2_* family.
+#    The compositor blits our backbuffer to /dev/fb each frame.
+# 4. While `open` is 0 we leave the backbuffer cleared-to-transparent
+#    so the popup is "off". When `open` flips to 1 we paint the
+#    header band, day-of-week initials row, and the day grid with
+#    today highlighted (when valid == 1).
+#
+# WHAT THIS REPLACES
+# ------------------
+# The ~85-line per-pixel "clock calendar popup (monthly grid)"
+# cascade inside daemon_pixel in user/hamUId.ad. That code is gone;
+# this file is its replacement. The CLICK input that toggles the
+# popup (cal_toggle) and the live-clock refresh both stay in the
+# compositor — only the RENDER lives here.
+
+from lib.hamui import (
+    hamui_init, hamui_window_on, hamui_set_protocol_v2,
+    hamui_v2_clear, hamui_v2_fill_rect, hamui_v2_commit_rect,
+    hamui_v2_is_active,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield()
+extern def sys_exit(code: int32)
+
+
+# --- model storage --------------------------------------------------
+_hp_open:   int32 = 0
+_hp_year:   int64 = 2026
+_hp_month:  int64 = 1
+_hp_day:    int64 = 1
+_hp_valid:  int32 = 0
+_hp_gen:    uint64 = 0
+_hp_show_serial:      uint64 = 0
+_hp_last_show_serial: uint64 = 0xffffffffffffffff
+_hp_last_gen:         uint64 = 0xffffffffffffffff
+
+
+# --- layout (window-local pixels, mirrors legacy CAL_* sizing) ------
+# CAL_W = 176, CAL_CELL_W = 24, CAL_CELL_H = 18, CAL_HEAD_H = 22,
+# CAL_DOW_H = 16, +4 px frame padding. A 6-row month is the worst
+# case so we size the window for that and only paint up to cal_rows()
+# rows.
+_hp_WIN_W:    int32 = 176
+_hp_WIN_H:    int32 = 150     # 22 + 16 + 6*18 + 4 == 150
+_hp_CELL_W:   int32 = 24
+_hp_CELL_H:   int32 = 18
+_hp_HEAD_H:   int32 = 22
+_hp_DOW_H:    int32 = 16
+_hp_PAD:      int32 = 4
+
+# Body / header / text RGB — mirrors the legacy CAL_R/G/B constants.
+_hp_BG_R:     uint8 = 48
+_hp_BG_G:     uint8 = 54
+_hp_BG_B:     uint8 = 68
+_hp_HEAD_R:   uint8 = 34
+_hp_HEAD_G:   uint8 = 40
+_hp_HEAD_B:   uint8 = 52
+_hp_TXT_R:    uint8 = 228
+_hp_TXT_G:    uint8 = 232
+_hp_TXT_B:    uint8 = 240
+_hp_HEADTXT_R: uint8 = 170
+_hp_HEADTXT_G: uint8 = 210
+_hp_HEADTXT_B: uint8 = 255
+_hp_DOWTXT_R: uint8 = 150
+_hp_DOWTXT_G: uint8 = 170
+_hp_DOWTXT_B: uint8 = 200
+# Today-highlight (accent), mirrors MENU_SEL_R/G/B.
+_hp_SEL_R:    uint8 = 70
+_hp_SEL_G:    uint8 = 100
+_hp_SEL_B:    uint8 = 170
+_hp_FRAME_R:  uint8 = 20
+_hp_FRAME_G:  uint8 = 24
+_hp_FRAME_B:  uint8 = 32
+
+
+# --- scratch --------------------------------------------------------
+_hp_snap_buf: Array[256, uint8]
+
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
+
+
+# --- snapshot parser ------------------------------------------------
+def _read_calpop_snapshot() -> int64:
+    fd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/calpop"))
+    if fd < 0:
+        return -1
+    n: int64 = sys_read(fd, &_hp_snap_buf[0], 256)
+    sys_close(fd)
+    return n
+
+
+def _skip_to_eol(pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end and _hp_snap_buf[p] != 10:
+        p = p + 1
+    if p < end:
+        p = p + 1
+    return p
+
+
+def _skip_ws(pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end and (_hp_snap_buf[p] == 32 or _hp_snap_buf[p] == 9):
+        p = p + 1
+    return p
+
+
+def _parse_u64(pos: Ptr[uint64], end: uint64) -> uint64:
+    p: uint64 = pos[0]
+    v: uint64 = 0
+    while p < end and _hp_snap_buf[p] >= 48 and _hp_snap_buf[p] <= 57:
+        v = v * 10 + cast[uint64](_hp_snap_buf[p] - 48)
+        p = p + 1
+    pos[0] = p
+    return v
+
+
+def _parse_snapshot(n: uint64) -> int32:
+    # Returns 1 if anything CHANGED since the last parse (show serial
+    # or gen differ), 0 otherwise.
+    if n == 0:
+        return 0
+    pos: Array[1, uint64]
+    pos[0] = 0
+    show_v:  uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    open_v:  uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    year_v:  uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    month_v: uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    day_v:   uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    valid_v: uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    gen_v:   uint64 = _parse_u64(&pos[0], n)
+    _hp_show_serial = show_v
+    _hp_open  = cast[int32](open_v)
+    _hp_year  = cast[int64](year_v)
+    _hp_month = cast[int64](month_v)
+    _hp_day   = cast[int64](day_v)
+    _hp_valid = cast[int32](valid_v)
+    _hp_gen   = gen_v
+    changed: int32 = 0
+    if _hp_show_serial != _hp_last_show_serial:
+        changed = 1
+    if _hp_gen != _hp_last_gen:
+        changed = 1
+    _hp_last_show_serial = _hp_show_serial
+    _hp_last_gen = _hp_gen
+    return changed
+
+
+# --- calendar arithmetic --------------------------------------------
+def _is_leap(y: int64) -> int32:
+    if y % 400 == 0:
+        return 1
+    if y % 100 == 0:
+        return 0
+    if y % 4 == 0:
+        return 1
+    return 0
+
+
+def _days_in_month(y: int64, m: int64) -> int64:
+    if m == 2:
+        if _is_leap(y) != 0:
+            return 29
+        return 28
+    if m == 4 or m == 6 or m == 9 or m == 11:
+        return 30
+    return 31
+
+
+# Day-of-week (0=Sun..6=Sat) of the 1st of month m, year y. Sakamoto
+# specialised to day-of-month 1; mirrors hamUId's dow_first.
+def _dow_first(y: int64, m: int64) -> int64:
+    t0: int64 = 0
+    if m == 1:
+        t0 = 0
+    elif m == 2:
+        t0 = 3
+    elif m == 3:
+        t0 = 2
+    elif m == 4:
+        t0 = 5
+    elif m == 5:
+        t0 = 0
+    elif m == 6:
+        t0 = 3
+    elif m == 7:
+        t0 = 5
+    elif m == 8:
+        t0 = 1
+    elif m == 9:
+        t0 = 4
+    elif m == 10:
+        t0 = 6
+    elif m == 11:
+        t0 = 2
+    else:
+        t0 = 4
+    yy: int64 = y
+    if m < 3:
+        yy = yy - 1
+    w: int64 = (yy + yy / 4 - yy / 100 + yy / 400 + t0 + 1) % 7
+    if w < 0:
+        w = w + 7
+    return w
+
+
+def _cal_rows() -> int64:
+    if _hp_month < 1 or _hp_month > 12:
+        return 6
+    lead: int64 = _dow_first(_hp_year, _hp_month)
+    total: int64 = lead + _days_in_month(_hp_year, _hp_month)
+    rows: int64 = (total + 6) / 7
+    if rows < 4:
+        rows = 4
+    if rows > 6:
+        rows = 6
+    return rows
+
+
+def _cal_day_at(row: int64, col: int64) -> int64:
+    lead: int64 = _dow_first(_hp_year, _hp_month)
+    cell: int64 = row * 7 + col
+    d: int64 = cell - lead + 1
+    if d < 1 or d > _days_in_month(_hp_year, _hp_month):
+        return 0
+    return d
+
+
+# --- crude glyph-block rendering ------------------------------------
+# Mirrors hamcycler/hamappmenu's _draw_text_blocks — one 4x6 block per
+# non-space char, spaced 6 px apart. The month-grid SHAPE is the
+# point; glyph fidelity comes later from str_ink-on-v2.
+def _draw_text_blocks(x: int32, y: int32, label: Ptr[uint8], len: uint64,
+                      r: uint8, g: uint8, b: uint8, max_w: int32):
+    i: uint64 = 0
+    cx: int32 = x
+    while i < len and cx + 4 <= x + max_w:
+        c: uint8 = label[i]
+        if c != 32:
+            hamui_v2_fill_rect(cx, y, 4, 6, r, g, b)
+        cx = cx + 6
+        i = i + 1
+
+
+# Three-letter month name for the header (mirrors hamUId cal_month_name
+# but compact: one block-text row).
+def _month_name(m: int64) -> Ptr[uint8]:
+    if m == 1:
+        s1: Ptr[uint8] = "January"
+        return s1
+    if m == 2:
+        s2: Ptr[uint8] = "February"
+        return s2
+    if m == 3:
+        s3: Ptr[uint8] = "March"
+        return s3
+    if m == 4:
+        s4: Ptr[uint8] = "April"
+        return s4
+    if m == 5:
+        s5: Ptr[uint8] = "May"
+        return s5
+    if m == 6:
+        s6: Ptr[uint8] = "June"
+        return s6
+    if m == 7:
+        s7: Ptr[uint8] = "July"
+        return s7
+    if m == 8:
+        s8: Ptr[uint8] = "August"
+        return s8
+    if m == 9:
+        s9: Ptr[uint8] = "September"
+        return s9
+    if m == 10:
+        s10: Ptr[uint8] = "October"
+        return s10
+    if m == 11:
+        s11: Ptr[uint8] = "November"
+        return s11
+    s12: Ptr[uint8] = "December"
+    return s12
+
+
+def _dow_initial(col: int64) -> Ptr[uint8]:
+    if col == 0:
+        c0: Ptr[uint8] = "S"
+        return c0
+    if col == 1:
+        c1: Ptr[uint8] = "M"
+        return c1
+    if col == 2:
+        c2: Ptr[uint8] = "T"
+        return c2
+    if col == 3:
+        c3: Ptr[uint8] = "W"
+        return c3
+    if col == 4:
+        c4: Ptr[uint8] = "T"
+        return c4
+    if col == 5:
+        c5: Ptr[uint8] = "F"
+        return c5
+    c6: Ptr[uint8] = "S"
+    return c6
+
+
+_hp_num_buf: Array[8, uint8]
+
+
+def _paint_closed():
+    # Popup hidden: clear backbuffer so nothing of the previous frame
+    # lingers (matches hamcycler's _paint_closed).
+    hamui_v2_clear(0, 0, 0)
+    hamui_v2_commit_rect(0, 0, _hp_WIN_W, _hp_WIN_H)
+
+
+def _paint_open():
+    # Background body.
+    hamui_v2_clear(_hp_BG_R, _hp_BG_G, _hp_BG_B)
+    # 1px outer frame.
+    hamui_v2_fill_rect(0, 0, _hp_WIN_W, 1,
+                       _hp_FRAME_R, _hp_FRAME_G, _hp_FRAME_B)
+    hamui_v2_fill_rect(0, _hp_WIN_H - 1, _hp_WIN_W, 1,
+                       _hp_FRAME_R, _hp_FRAME_G, _hp_FRAME_B)
+    hamui_v2_fill_rect(0, 0, 1, _hp_WIN_H,
+                       _hp_FRAME_R, _hp_FRAME_G, _hp_FRAME_B)
+    hamui_v2_fill_rect(_hp_WIN_W - 1, 0, 1, _hp_WIN_H,
+                       _hp_FRAME_R, _hp_FRAME_G, _hp_FRAME_B)
+    # Header band (darker, full width).
+    hamui_v2_fill_rect(1, 1, _hp_WIN_W - 2, _hp_HEAD_H - 1,
+                       _hp_HEAD_R, _hp_HEAD_G, _hp_HEAD_B)
+    # Month name on the left of the header band.
+    mname: Ptr[uint8] = _month_name(_hp_month)
+    _draw_text_blocks(8, (_hp_HEAD_H - 6) / 2,
+                      mname, _strlen(mname),
+                      _hp_HEADTXT_R, _hp_HEADTXT_G, _hp_HEADTXT_B,
+                      _hp_WIN_W - 16 - 4 * 6 - 4)
+    # Year as 4 digits, right-aligned on the header band.
+    y4: int64 = _hp_year
+    _hp_num_buf[0] = cast[uint8](y4 / 1000 % 10) + 48
+    _hp_num_buf[1] = cast[uint8](y4 / 100 % 10) + 48
+    _hp_num_buf[2] = cast[uint8](y4 / 10 % 10) + 48
+    _hp_num_buf[3] = cast[uint8](y4 % 10) + 48
+    _hp_num_buf[4] = 0
+    yrx: int32 = _hp_WIN_W - 8 - 4 * 6
+    _draw_text_blocks(yrx, (_hp_HEAD_H - 6) / 2,
+                      &_hp_num_buf[0], 4,
+                      _hp_HEADTXT_R, _hp_HEADTXT_G, _hp_HEADTXT_B,
+                      4 * 6)
+    # Day-of-week initials row.
+    dow_top: int32 = _hp_HEAD_H
+    gx0: int32 = _hp_PAD
+    col: int64 = 0
+    while col < 7:
+        di: Ptr[uint8] = _dow_initial(col)
+        dlx: int32 = gx0 + cast[int32](col) * _hp_CELL_W \
+                     + (_hp_CELL_W - 4) / 2
+        dly: int32 = dow_top + (_hp_DOW_H - 6) / 2
+        _draw_text_blocks(dlx, dly, di, 1,
+                          _hp_DOWTXT_R, _hp_DOWTXT_G, _hp_DOWTXT_B,
+                          4)
+        col = col + 1
+    # Day grid.
+    grid_top: int32 = dow_top + _hp_DOW_H
+    rows: int64 = _cal_rows()
+    row: int64 = 0
+    while row < rows:
+        c: int64 = 0
+        while c < 7:
+            dval: int64 = _cal_day_at(row, c)
+            cell_x0: int32 = gx0 + cast[int32](c) * _hp_CELL_W
+            cell_y0: int32 = grid_top + cast[int32](row) * _hp_CELL_H
+            is_today: int32 = 0
+            if _hp_valid != 0 and dval != 0 and dval == _hp_day:
+                is_today = 1
+            if is_today != 0:
+                hamui_v2_fill_rect(cell_x0, cell_y0,
+                                   _hp_CELL_W, _hp_CELL_H,
+                                   _hp_SEL_R, _hp_SEL_G, _hp_SEL_B)
+            if dval != 0:
+                ndig: int64 = 0
+                if dval >= 10:
+                    _hp_num_buf[0] = cast[uint8](dval / 10) + 48
+                    _hp_num_buf[1] = cast[uint8](dval % 10) + 48
+                    _hp_num_buf[2] = 0
+                    ndig = 2
+                else:
+                    _hp_num_buf[0] = cast[uint8](dval) + 48
+                    _hp_num_buf[1] = 0
+                    ndig = 1
+                dnx: int32 = cell_x0 + (_hp_CELL_W
+                                        - cast[int32](ndig) * 6) / 2
+                dny: int32 = cell_y0 + (_hp_CELL_H - 6) / 2
+                _draw_text_blocks(dnx, dny, &_hp_num_buf[0],
+                                  cast[uint64](ndig),
+                                  _hp_TXT_R, _hp_TXT_G, _hp_TXT_B,
+                                  cast[int32](ndig) * 6)
+            c = c + 1
+        row = row + 1
+    hamui_v2_commit_rect(0, 0, _hp_WIN_W, _hp_WIN_H)
+
+
+def _paint():
+    if _hp_open != 0:
+        _paint_open()
+    else:
+        _paint_closed()
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    hamui_init()
+    # Self-discover OUR wid via /dev/wsys/self (same shape as
+    # hamappmenu/hamcycler). argv[1] may override for tests.
+    wid: int32 = 1
+    self_path: Ptr[uint8] = "/dev/wsys/self"
+    sfd: int32 = sys_open(cast[Ptr[char]](self_path))
+    if sfd >= 0:
+        sbuf: Array[16, uint8]
+        sn: int64 = sys_read_nb(sfd, &sbuf[0], 16)
+        sys_close(sfd)
+        if sn > 0:
+            v: int32 = 0
+            i: uint64 = 0
+            while i < cast[uint64](sn) and sbuf[i] >= 48 and sbuf[i] <= 57:
+                v = v * 10 + cast[int32](sbuf[i]) - 48
+                i = i + 1
+            if v >= 2:
+                wid = v
+    if argc > 1:
+        ap: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        v2: int32 = 0
+        i2: uint64 = 0
+        while ap[i2] >= 48 and ap[i2] <= 57:
+            v2 = v2 * 10 + cast[int32](ap[i2]) - 48
+            i2 = i2 + 1
+        if v2 >= 1:
+            wid = v2
+
+    bound: int32 = hamui_window_on(0, wid)
+    if bound < 0:
+        _puts(2, "hamcalpop: could not bind window\n")
+        return 1
+    if hamui_set_protocol_v2() < 0:
+        _puts(2, "hamcalpop: v2 negotiate failed\n")
+        return 1
+
+    # Initial paint from whatever the compositor has already published.
+    n0: int64 = _read_calpop_snapshot()
+    if n0 > 0:
+        _parse_snapshot(cast[uint64](n0))
+    _paint()
+    rdy: Ptr[uint8] = "HAMCALPOP ready\n"
+    sys_write(1, rdy, _strlen(rdy))
+
+    # Long-lived event loop: poll the snapshot. On a show-serial or gen
+    # bump, repaint. The calpop client lives for the whole DE session.
+    while True:
+        n: int64 = _read_calpop_snapshot()
+        if n > 0:
+            if _parse_snapshot(cast[uint64](n)) != 0:
+                _paint()
+        sys_yield()
+
+    return 0
