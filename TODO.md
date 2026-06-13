@@ -192,8 +192,10 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
   scaffolding committed. Runtime verification pending.
 
 ### §5 Modern async I/O (Layer 2 only)
-- [ ] `io_uring` SQ/CQ rings (deferred; epoll covers most real Linux
-  daemons).
+- [x] `io_uring` SQ/CQ rings — kernel shim already complete in main
+  (`linux_abi/u_iouring.ad` 2167 lines); userspace fixture landed
+  `65f870ca` proves SQE→CQE round-trip end-to-end. SQPOLL kernel thread
+  + IOSQE_IO_LINK chaining deferred.
 
 ### §7 Entropy
 - [~] ChaCha20 CSPRNG: seeding + fast-key-erasure + reseed cadence
