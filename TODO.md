@@ -44,7 +44,8 @@ audit #453 closed; report at `audit_F10_report.md`. F10-1 #454, F10-2
 #455, F10-3 #456 closed.
 
 **Open:**
-- [~] **F7 #390** — FD-mark fold continuation post-4c (stdio/tmpfs/
+- [~] **F7 #390** — FD_NET_MARK folded onto Chan dispatch `08acb40e`
+  (next chunk). Remaining: FD-mark fold continuation post-4c (stdio/tmpfs/
   pipes/socketpair/p9/net/epoll-family/ptmx/fuse still mark-based;
   pipes = highest-leverage next fold; `NR_FDS=16` per task will pinch
   Debian userland).
