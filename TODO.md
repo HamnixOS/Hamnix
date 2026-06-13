@@ -48,9 +48,11 @@ audit #453 closed; report at `audit_F10_report.md`. F10-1 #454, F10-2
   pipes/socketpair/p9/net/epoll-family/ptmx/fuse still mark-based;
   pipes = highest-leverage next fold; `NR_FDS=16` per task will pinch
   Debian userland).
-- [~] **F10-6 #458** — Plan 9 `Dir` record as first-class struct +
-  `p9_diread()` + kernel dir-read backings emit Dir records (the second
-  structural keystone per F10 closing note; lets `ls -l` work natively).
+- [~] **F10-6 #458** — Plan 9 `Dir` record minimum viable landed
+  (`b9572451`): `lib/p9dir.ad` wire format + `lib/p9.ad` decoder +
+  `SYS_LISTDIR_RECORDS=318` + devsrv emits Dir; deferred:
+  `_dirfile_read`/devproc migration (needs per-Chan `p9_dir_mode` flag)
+  and userland `ls`/`du` migration.
 - [ ] **F10-4..F10-5, F10-8, F10-10 (#457)** — afd Tauth ignored,
   init/main.ad split (~14k lines mixing selftests + boot), seccomp-lite
   to native syscalls, oom_score_adj per-Pgrp. (F10-7 closed as bonus in
