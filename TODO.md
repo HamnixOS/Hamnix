@@ -201,7 +201,10 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
   (#139, #151, #397). Open: work stealing, CPU affinity.
 
 ### §10 Networking
-- [ ] Generic unicast ARP helper; ICMP time-exceeded / redirect.
+- [~] Unicast ARP + gratuitous ARP + ICMP time-exceeded + ICMP redirect
+  helpers landed `056d4500`. Forwarding-path auto-wiring gated behind
+  `ip_forwarding_enabled` flag (default 0; Hamnix is a host, not a
+  router). Helpers exported + selftest-verified.
 
 ### §12 FS write maturity
 - [ ] ext4 truncate on index-node files; growing a full ext4 dir block.
