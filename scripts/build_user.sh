@@ -174,6 +174,7 @@ build_adder_user hamterm              # hamui GUI terminal: runs commands via re
 build_adder_user hamedit              # hamui GUI text editor: open/save real files
 build_adder_user hamfiles             # hamui GUI file browser: sys_listdir + launch hamedit
 build_adder_user hamde                # hamui-based DE panel (Applications menu + clock + taskbar)
+build_adder_user hampanel             # DE panel extracted from daemon_pixel: standalone hamui-client app on the #442 (c) v2 blit protocol (taskbar + clock + Applications launcher)
 build_adder_user hamcalc              # integer calculator on the hamui toolkit (lib/hamui.ad)
 build_adder_user hamclock             # clock + stopwatch on the hamui toolkit (lib/hamui.ad)
 build_adder_user hamview              # image viewer (Eye-of-MATE equiv) on the hamui toolkit: decodes PPM(P6)/BMP, blits via an fb draw-layer
