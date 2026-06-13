@@ -532,6 +532,66 @@ while i < n:
     i = i + 1
 ```
 
+### Match / case
+
+Adder has a Python-style `match` statement. It evaluates the scrutinee
+exactly once and dispatches to the **first matching arm** (no implicit
+fallthrough).
+
+```python
+match x:
+    case 0:
+        printk0("zero\n")
+    case 1 | 2 | 3:
+        printk0("small\n")
+    case n if n > 100:
+        printk0("big\n")
+    case [1, 2]:
+        printk0("the pair 1,2\n")
+    case [head, *rest]:
+        printk0("non-empty\n")
+    case _:
+        printk0("other\n")
+```
+
+Supported patterns:
+
+| Pattern              | Example                | Semantics                                              |
+|----------------------|------------------------|--------------------------------------------------------|
+| Literal              | `case 0:`, `case "x":` | matches when `scrutinee == literal` (also `True` / `False` / `None`, and a leading `-` for negative ints) |
+| Wildcard             | `case _:`              | always matches; binds nothing                          |
+| Name binding         | `case x:`              | always matches; binds `x` to the scrutinee in the body |
+| OR                   | `case a \| b \| c:`    | matches if any alternative matches (left-to-right)     |
+| Sequence             | `case [a, b]:`         | elementwise match against a `Ptr[T]` / `Array[N, T]` scrutinee; sub-patterns may be literals or name bindings |
+| Sequence with rest   | `case [a, *rest]:`     | leading sub-patterns match positionally; `*rest` is permitted at any position (at most one per pattern) |
+| Guard                | `case p if cond:`      | arm fires only when both pattern AND guard hold; on guard-fail, dispatch falls through to the next arm |
+
+Each `case` body is an indented block, identical to `if`/`elif`/`else`
+bodies. The match arms are required (at least one `case` per `match`);
+a final `case _:` is the conventional catch-all.
+
+**Lowering**: at codegen, `match` desugars to a chain of `if`/`elif`
+tests over a single materialised scrutinee local. Literal patterns
+become equality comparisons, OR patterns become short-circuit `or`s,
+sequence patterns become positional `scrut[i]` comparisons, and name
+patterns prepend a `VarDecl` binding at the top of the arm body.
+Guards lower as a nested `if guard: <body> else: <next-arm>` inside
+the arm so the bound names are visible to the guard expression.
+
+Limitations:
+* Sequence patterns rely on the caller to provide an
+  appropriately-long buffer — there is no `len()` primitive, so no
+  runtime length check is synthesised. The pattern's prefix length
+  effectively dictates the minimum index the codegen will read.
+* `*rest` is accepted but binds to the **scrutinee base pointer**, not
+  a slice (Adder has no slice type yet); use it for "match the prefix
+  and ignore the tail" idioms rather than for capturing the tail.
+* Nested OR / sequence sub-patterns inside a sequence pattern are
+  rejected by codegen with a clear error; flatten the cases instead.
+
+Regression fixture: `tests/test_compiler_match.ad` +
+`scripts/test_compiler_match.sh`.
+
 ---
 
 ## Classes (structs with optional static methods)

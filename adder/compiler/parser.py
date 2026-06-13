@@ -841,20 +841,31 @@ class Parser:
             self.expect(TokenType.NEWLINE)
             return AssertStmt(condition, message, self.make_span(tok))
 
-        # Match statement
+        # Match statement: `match <expr>: ( case <pattern> [if <guard>]: <body> )+`
         if self.match(TokenType.MATCH):
             expr = self.parse_expression()
             self.expect(TokenType.COLON)
             self.expect(TokenType.NEWLINE)
+            self.skip_newlines()
             self.expect(TokenType.INDENT)
 
             arms = []
-            while self.match(TokenType.CASE):
+            self.skip_newlines()
+            while self.check(TokenType.CASE):
+                case_tok = self.advance()  # consume CASE
                 pattern = self.parse_pattern()
+                guard = None
+                if self.match(TokenType.IF):
+                    guard = self.parse_expression()
                 arm_body = self.parse_block()
-                arms.append(MatchArm(pattern, arm_body))
+                arms.append(MatchArm(pattern, arm_body, guard,
+                                     self.make_span(case_tok)))
+                self.skip_newlines()
 
             self.expect(TokenType.DEDENT)
+            if not arms:
+                raise ParseError("match statement requires at least one case",
+                                 tok)
             return MatchStmt(expr, arms, self.make_span(tok))
 
         # Try/except/finally statement
@@ -1011,26 +1022,128 @@ class Parser:
         self.expect(TokenType.NEWLINE)
         return ExprStmt(expr, self.make_span(tok))
 
-    def parse_pattern(self) -> Pattern:
-        """Parse a match pattern."""
+    def parse_pattern(self) -> PatternNode:
+        """Parse a match-statement pattern.
+
+        Top level is an OR pattern: `p1 | p2 | p3`. A single alternative
+        is returned as itself (not wrapped in OrPattern). Each
+        alternative is one of:
+          * literal (int / negative-int / string / True / False / None)
+          * wildcard `_`
+          * name binding (`x`)
+          * sequence pattern `[a, b, *rest]`
+          * legacy variant pattern `Some(x)` / `None(args)` — produced as
+            the original `Pattern(name, bindings)` for backward compat.
+        """
+        tok = self.current()
+        first = self._parse_or_alternative()
+        if not self.check(TokenType.PIPE):
+            return first
+        alternatives = [first]
+        while self.match(TokenType.PIPE):
+            alternatives.append(self._parse_or_alternative())
+        return OrPattern(alternatives, self.make_span(tok))
+
+    def _parse_or_alternative(self) -> PatternNode:
+        """Parse a single non-OR pattern alternative."""
         tok = self.current()
 
-        # Wildcard
-        if self.check(TokenType.IDENT) and self.current().value == "_":
+        # Sequence pattern: [p1, p2, *rest]
+        if self.match(TokenType.LBRACKET):
+            return self._parse_sequence_pattern_tail(tok)
+
+        # Literal patterns: numbers, negative numbers, strings, True/False/None
+        if self.check(TokenType.NUMBER):
             self.advance()
-            return Pattern("_", [], self.make_span(tok))
+            if isinstance(tok.value, float):
+                return LiteralPattern(FloatLiteral(tok.value,
+                                                  self.make_span(tok)),
+                                      self.make_span(tok))
+            return LiteralPattern(IntLiteral(tok.value, self.make_span(tok)),
+                                  self.make_span(tok))
 
-        # Variant with optional bindings: Some(x) or None
-        name = self.expect(TokenType.IDENT).value
-        bindings = []
-        if self.match(TokenType.LPAREN):
-            if not self.check(TokenType.RPAREN):
-                bindings.append(self.expect(TokenType.IDENT).value)
-                while self.match(TokenType.COMMA):
+        if self.match(TokenType.MINUS):
+            # `-N` literal pattern (negative integer).
+            num_tok = self.expect(TokenType.NUMBER)
+            inner = IntLiteral(num_tok.value, self.make_span(num_tok))
+            neg = UnaryExpr(UnaryOp.NEG, inner, self.make_span(tok))
+            return LiteralPattern(neg, self.make_span(tok))
+
+        if self.check(TokenType.STRING):
+            self.advance()
+            combined = tok.value
+            while self.check(TokenType.STRING):
+                combined = combined + self.current().value
+                self.advance()
+            return LiteralPattern(StringLiteral(combined, self.make_span(tok)),
+                                  self.make_span(tok))
+
+        if self.match(TokenType.TRUE):
+            return LiteralPattern(BoolLiteral(True, self.make_span(tok)),
+                                  self.make_span(tok))
+
+        if self.match(TokenType.FALSE):
+            return LiteralPattern(BoolLiteral(False, self.make_span(tok)),
+                                  self.make_span(tok))
+
+        if self.match(TokenType.NONE):
+            return LiteralPattern(NoneLiteral(self.make_span(tok)),
+                                  self.make_span(tok))
+
+        # Identifier-headed: wildcard `_`, bare name binding `x`, or the
+        # legacy variant-with-bindings `Some(x)` (kept for older callers).
+        if self.check(TokenType.IDENT):
+            name = self.advance().value
+            if name == "_":
+                return WildcardPattern(self.make_span(tok))
+            if self.match(TokenType.LPAREN):
+                bindings = []
+                if not self.check(TokenType.RPAREN):
                     bindings.append(self.expect(TokenType.IDENT).value)
-            self.expect(TokenType.RPAREN)
+                    while self.match(TokenType.COMMA):
+                        bindings.append(self.expect(TokenType.IDENT).value)
+                self.expect(TokenType.RPAREN)
+                return Pattern(name, bindings, self.make_span(tok))
+            return NamePattern(name, self.make_span(tok))
 
-        return Pattern(name, bindings, self.make_span(tok))
+        raise ParseError("expected a match pattern", tok)
+
+    def _parse_sequence_pattern_tail(self, start_tok: Token) -> SequencePattern:
+        """Parse the elements of a `[...]` sequence pattern.
+
+        `start_tok` is the `[` token (already consumed by the caller)
+        used to anchor the span. Supports an empty sequence `[]`, a
+        list of sub-patterns, and at most one `*name` (or `*_`) rest
+        pattern anywhere in the list."""
+        elements: list[PatternNode] = []
+        rest_index: Optional[int] = None
+        rest_name: Optional[str] = None
+        if not self.check(TokenType.RBRACKET):
+            while True:
+                if self.match(TokenType.STAR):
+                    if rest_index is not None:
+                        raise ParseError(
+                            "sequence pattern may only have one '*' rest",
+                            self.current(),
+                        )
+                    rest_index = len(elements)
+                    if self.check(TokenType.IDENT):
+                        rname = self.advance().value
+                        rest_name = None if rname == "_" else rname
+                    else:
+                        raise ParseError(
+                            "expected name after '*' in sequence pattern",
+                            self.current(),
+                        )
+                    # Insert a placeholder so element indices line up.
+                    elements.append(WildcardPattern(None))
+                else:
+                    elements.append(self._parse_or_alternative())
+                if not self.match(TokenType.COMMA):
+                    break
+        self.expect(TokenType.RBRACKET)
+        return SequencePattern(elements, rest_index, rest_name,
+                               self.make_span(start_tok))
 
     # -------------------------------------------------------------------------
     # Declaration parsing

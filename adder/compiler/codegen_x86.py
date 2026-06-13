@@ -42,11 +42,14 @@ from .ast_nodes import (
     DoWhileStmt, ForStmt, ForUnpackStmt, BreakStmt, ContinueStmt, PassStmt,
     Expr, Stmt,
     CallExpr, Identifier, StringLiteral, IntLiteral, CharLiteral, BoolLiteral,
+    NoneLiteral, FloatLiteral,
     BinaryExpr, UnaryExpr, BinOp, UnaryOp,
     IndexExpr, MemberExpr, CastExpr, ContainerOfExpr,
     ConditionalExpr, SizeOfExpr,
     Type, PointerType, ArrayType, FunctionPointerType, PercpuType,
     ListType, DictType, TupleType, OptionalType,
+    MatchStmt, MatchArm, Pattern, LiteralPattern, WildcardPattern,
+    NamePattern, OrPattern, SequencePattern,
 )
 
 
@@ -1824,10 +1827,217 @@ class X86CodeGen:
             case PassStmt():
                 self.emit("    # pass")
 
+            case MatchStmt(expr=scrut, arms=arms):
+                self._gen_match(scrut, arms, stmt.span)
+
             case _:
                 raise CodeGenError(
                     f"x86: statement {type(stmt).__name__} not yet supported"
                 )
+
+    # -------------------------------------------------------------------------
+    # Match-statement lowering
+    # -------------------------------------------------------------------------
+
+    def _gen_match(self, scrut: Expr, arms: list,
+                   span) -> None:
+        """Lower a `match` statement to an if/elif chain.
+
+        The scrutinee is evaluated exactly once into a synthetic local
+        (`__matchN`); each arm contributes one elif test that compares
+        the scrutinee local against the pattern and (when the pattern
+        binds names) declares those bindings as locals at the top of the
+        arm body. Guards (`case p if g:`) AND into the test condition,
+        which preserves the right "skip to next arm on guard failure"
+        semantics because the chain has no fallthrough between arms.
+
+        Pattern -> test/body lowering:
+          * WildcardPattern / NamePattern -> always-true test (`1`).
+            NamePattern prepends a VarDecl binding `name = scrutinee`.
+          * LiteralPattern -> `scrutinee == literal`.
+          * OrPattern -> short-circuit OR over the alternatives' tests.
+            (Per Python's rule, every alternative must bind the same set
+            of names; we don't enforce that statically here — codegen
+            takes the first alternative's bindings, which is correct
+            when the rule is honored and produces a clean error from
+            the binding-VarDecls otherwise.)
+          * SequencePattern -> elementwise comparison via `scrut[i]`
+            for each non-rest sub-pattern. Length must be known at
+            compile time (i.e. the scrutinee is a fixed-size array);
+            we don't synthesize a runtime length check because Adder
+            has no `len()` primitive. A `*rest` element is permitted
+            in the syntax but is treated as a wildcard at codegen
+            (no slice is produced — Adder has no slice type yet).
+            Nested literal/name sub-patterns work; nested sequence/OR
+            sub-patterns are rejected with a clear error.
+        """
+        # 1) Materialise the scrutinee.
+        #
+        # Special case: if the scrutinee is a bare Identifier referring
+        # to an array-typed local/parameter, we can use it directly —
+        # IndexExpr on the original identifier hits the array-decay
+        # path and produces the right addressing for sequence patterns.
+        # Re-aliasing such an array via an int64 tmp would lose the
+        # array type information.
+        #
+        # General case: evaluate once into a fresh int64 local. The
+        # name is uniquified by `ctx.new_label` (whose tail counter we
+        # reuse to keep the ident valid).
+        scrut_is_aggregate_ident = False
+        if isinstance(scrut, Identifier) and self.ctx is not None \
+                and scrut.name in self.ctx.locals:
+            lvar = self.ctx.locals[scrut.name]
+            # Array-typed locals/params index naturally via IndexExpr;
+            # pointer-typed identifiers (Ptr[T]) likewise carry their
+            # value as the base address. Either way, reusing the
+            # identifier preserves the type info that IndexExpr needs.
+            if isinstance(lvar.var_type, (ArrayType, PointerType)):
+                scrut_is_aggregate_ident = True
+
+        if scrut_is_aggregate_ident:
+            tmp_ref = scrut
+        else:
+            label_id = self.ctx.new_label("match").rsplit("_", 1)[-1]
+            tmp_name = f"__match_{label_id}"
+            tmp_type = Type("int64", span)
+            var = self.ctx.alloc_local(tmp_name, 8, tmp_type)
+            self.gen_expr(scrut)
+            self._emit_local_store(var, "%rax")
+            tmp_ref = Identifier(tmp_name, span)
+
+        # 2) Build the chain.
+        #
+        # Each arm becomes an `if <pattern_match>: <bindings>; <body>`.
+        # When the arm has a guard, the guard must be evaluated AFTER
+        # the bindings (it may reference them) but a guard-fail still
+        # has to fall through to the next arm. We model that by
+        # wrapping the arm body in a nested IfStmt whose else-branch
+        # is the rest of the chain; if there's no guard, the arm just
+        # runs the bindings + body directly and the rest-of-chain
+        # lives in the outer IfStmt's else-branch.
+        #
+        # The chain is materialised as a single IfStmt with elif-style
+        # nesting via the `else_body` field — that produces the same
+        # asm shape as a hand-written `if/elif/else` cascade and reuses
+        # all of gen_if's existing label / fallthrough logic.
+        if not arms:
+            return
+
+        chain = self._build_arm_chain(arms, tmp_ref, span)
+        for s in chain:
+            self.gen_stmt(s)
+
+    def _build_arm_chain(self, arms, scrut: Expr, span) -> list:
+        """Build the IfStmt chain for `arms[0..]`.
+
+        Returns a list of statements (typically a single IfStmt) that
+        runs the first matching arm's body and otherwise recurses into
+        the rest of the arms. The recursion is unrolled iteratively
+        from the tail so we never blow the Python stack on long chains."""
+        # Build from the back: rest_stmts is the chain that handles
+        # arms[i+1:]. For the last arm rest_stmts is empty.
+        rest_stmts: list = []
+        for arm in reversed(arms):
+            bindings = self._pattern_bindings(arm.pattern, scrut)
+            pat_cond = self._pattern_to_cond(arm.pattern, scrut)
+            user_body = list(arm.body)
+            if arm.guard is not None:
+                # bindings -> if guard: user_body else: rest
+                inner_if = IfStmt(arm.guard, user_body, [],
+                                  rest_stmts if rest_stmts else None,
+                                  span)
+                arm_body = bindings + [inner_if]
+                outer_else = None  # the inner else already handles fallthrough
+            else:
+                arm_body = bindings + user_body
+                outer_else = rest_stmts if rest_stmts else None
+            outer_if = IfStmt(pat_cond, arm_body, [], outer_else, span)
+            rest_stmts = [outer_if]
+        return rest_stmts
+
+    def _pattern_to_cond(self, pat, scrut: Expr) -> Expr:
+        """Build the boolean test expression for `pat` against `scrut`."""
+        if isinstance(pat, WildcardPattern):
+            return IntLiteral(1, pat.span)
+        if isinstance(pat, NamePattern):
+            # Bare name always matches; the binding is emitted separately.
+            return IntLiteral(1, pat.span)
+        if isinstance(pat, LiteralPattern):
+            return BinaryExpr(BinOp.EQ, scrut, pat.value, pat.span)
+        if isinstance(pat, OrPattern):
+            if not pat.alternatives:
+                return IntLiteral(0, pat.span)
+            cond = self._pattern_to_cond(pat.alternatives[0], scrut)
+            for alt in pat.alternatives[1:]:
+                cond = BinaryExpr(BinOp.OR, cond,
+                                  self._pattern_to_cond(alt, scrut), pat.span)
+            return cond
+        if isinstance(pat, SequencePattern):
+            # Elementwise comparison via IndexExpr; the rest slot (if
+            # any) contributes no test because the rest binding has
+            # no length to verify (no len() primitive).
+            cond: Optional[Expr] = None
+            for i, sub in enumerate(pat.elements):
+                if pat.rest_index is not None and i == pat.rest_index:
+                    continue
+                if isinstance(sub, (WildcardPattern, NamePattern)):
+                    continue
+                if isinstance(sub, (OrPattern, SequencePattern)):
+                    raise CodeGenError(
+                        "x86: nested OR / sequence sub-patterns inside a "
+                        "sequence pattern are not yet supported"
+                    )
+                elem = IndexExpr(scrut, IntLiteral(i, pat.span), pat.span)
+                sub_cond = self._pattern_to_cond(sub, elem)
+                cond = sub_cond if cond is None else \
+                    BinaryExpr(BinOp.AND, cond, sub_cond, pat.span)
+            return cond if cond is not None else IntLiteral(1, pat.span)
+        if isinstance(pat, Pattern):
+            # Legacy variant pattern. Treat `_` as wildcard and a bare
+            # name with no bindings as a NamePattern; anything else
+            # (real enum variants) is out of scope for this lowering.
+            if pat.name == "_":
+                return IntLiteral(1, pat.span)
+            if not pat.bindings:
+                return IntLiteral(1, pat.span)
+            raise CodeGenError(
+                f"x86: legacy variant pattern '{pat.name}(...)' has no "
+                f"enum-variant lowering yet"
+            )
+        raise CodeGenError(
+            f"x86: unknown match pattern node {type(pat).__name__}"
+        )
+
+    def _pattern_bindings(self, pat, scrut: Expr) -> list:
+        """VarDecl statements to emit at the top of the arm body."""
+        out: list = []
+        if isinstance(pat, NamePattern):
+            out.append(VarDecl(pat.name, Type("int64", pat.span), scrut,
+                               False, pat.span))
+            return out
+        if isinstance(pat, OrPattern):
+            # Bindings of the FIRST alternative (Python's rule: all
+            # alternatives must bind the same set of names; we take the
+            # first as canonical).
+            if pat.alternatives:
+                return self._pattern_bindings(pat.alternatives[0], scrut)
+            return out
+        if isinstance(pat, SequencePattern):
+            for i, sub in enumerate(pat.elements):
+                if pat.rest_index is not None and i == pat.rest_index:
+                    # The rest slot binds to the scrutinee itself (a
+                    # pointer to the array base) when named — Adder has
+                    # no slice type, so this is the best we can offer.
+                    if pat.rest_name is not None:
+                        out.append(VarDecl(pat.rest_name,
+                                           Type("int64", pat.span),
+                                           scrut, False, pat.span))
+                    continue
+                elem = IndexExpr(scrut, IntLiteral(i, pat.span), pat.span)
+                out.extend(self._pattern_bindings(sub, elem))
+            return out
+        # Wildcard / Literal / legacy Pattern: no bindings.
+        return out
 
     # Map compound-assignment operator strings to BinOp enums.
     _COMPOUND_OP_MAP: dict = {

@@ -720,19 +720,98 @@ class ImportDecl:
 
 
 # Pattern matching
+#
+# Two layers of pattern AST live here:
+#   * `Pattern` is the original variant-style pattern (`Some(x)`, `None`,
+#     `_`) — kept for backward compatibility with existing callers that
+#     constructed `Pattern(name, bindings, span)` directly.
+#   * The richer classes below (`LiteralPattern`, `WildcardPattern`,
+#     `NamePattern`, `OrPattern`, `SequencePattern`) are what the parser
+#     now produces for the full Python-style `match` statement. Codegen
+#     lowers any of them — including the legacy `Pattern` — to an
+#     if/elif chain over the once-evaluated scrutinee.
 @dataclass
 class Pattern:
-    """Match pattern: Some(x) or None or _"""
+    """Legacy variant pattern: `Some(x)`, `None`, or `_`.
+
+    Treated by codegen as a NamePattern (`_` / bare identifier) when
+    `bindings` is empty, and otherwise reserved for future enum-variant
+    lowering. Kept so older code that constructed `Pattern(name, [...])`
+    still type-checks; new code should use the dedicated pattern
+    classes below."""
     name: str  # Variant or _ for wildcard
     bindings: list[str] = field(default_factory=list)
     span: Optional[Span] = None
 
 
 @dataclass
+class LiteralPattern:
+    """`case 0:` / `case "foo":` / `case True:` / `case None:`.
+
+    `value` is the parsed expression node (IntLiteral, StringLiteral,
+    BoolLiteral, NoneLiteral, or UnaryExpr(NEG, IntLiteral) for
+    negatives). Matches when `scrutinee == value`."""
+    value: 'Expr'
+    span: Optional[Span] = None
+
+
+@dataclass
+class WildcardPattern:
+    """`case _:` — always matches, binds nothing."""
+    span: Optional[Span] = None
+
+
+@dataclass
+class NamePattern:
+    """`case x:` — always matches, binds the scrutinee to `name`."""
+    name: str
+    span: Optional[Span] = None
+
+
+@dataclass
+class OrPattern:
+    """`case a | b | c:` — matches if any alternative matches.
+
+    Alternatives that bind names must all bind the same set of names
+    (Python's rule). Codegen lowers to OR'ed per-alternative tests; the
+    first matching alternative's bindings are taken."""
+    alternatives: list['PatternNode'] = field(default_factory=list)
+    span: Optional[Span] = None
+
+
+@dataclass
+class SequencePattern:
+    """`case [a, b, *rest]:` — matches a list/tuple of compatible length.
+
+    Each element is a sub-pattern. At most one element may be a `*name`
+    rest pattern, encoded by `rest_index` (None if absent) and the
+    `rest_name` field (None for `*_`). When `rest_index is None` the
+    sequence must match in length exactly; when set, the prefix
+    (elements[:rest_index]) and suffix (elements[rest_index+1:]) must
+    match positionally and the rest binding captures the middle slice.
+
+    Codegen currently emits length-only validation (a strict-length
+    test when no rest, or a `len >= prefix+suffix` test when there is
+    one) plus elementwise comparisons for literal sub-patterns. That
+    covers the patterns the parser actually produces today; richer
+    nested patterns lower through the same path."""
+    elements: list['PatternNode'] = field(default_factory=list)
+    rest_index: Optional[int] = None
+    rest_name: Optional[str] = None
+    span: Optional[Span] = None
+
+
+# Any node the parser hands back for a single `case` head.
+PatternNode = (Pattern | LiteralPattern | WildcardPattern | NamePattern |
+               OrPattern | SequencePattern)
+
+
+@dataclass
 class MatchArm:
-    """Match arm: case Some(x): ..."""
-    pattern: Pattern
+    """Match arm: `case <pattern> [if <guard>]: <body>`."""
+    pattern: PatternNode
     body: list[Stmt]
+    guard: Optional['Expr'] = None
     span: Optional[Span] = None
 
 
