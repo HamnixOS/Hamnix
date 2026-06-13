@@ -86,14 +86,11 @@ cleanly** (per #459 above). When that's clear:
   (insert/delete at caret, selection), widget destruction, damage/dirty
   tracking. v1 (#423, MATE-class baseline) + Increment 1/2/3 (#427-#429)
   landed — see STATUS rows.
-- [ ] **Rio-faithful reshape** (user 2026-06-11) — three gaps remain:
-  (a) per-window namespace bind (`/dev/win/` not `/dev/wsys/<wid>/`),
-  (b) blocking reads via `sys_waitfds` (kill the per-client 100% CPU
-  spin), (c) draw protocol carries images + dirty rects, not whole-
-  window text (move rasterization client-side, devwsys becomes a
-  blitter). #441's three small contained hamUId fixes on
-  `worktree-agent-a3b8addc9e198a359` are protocol-compatible — merge
-  after GOP verify.
+- [~] **Rio-faithful reshape** (user 2026-06-11): (a) `#w` per-process
+  namespace bind LANDED `616c41c4`; (b) blocking reads via WaitQueue
+  already in main (verified during a); (c) image+dirty-rect wire format
+  SPEC landed (40-line block at top of devwsys.ad), implementation
+  across devwsys+hamUId+lib/hamui deferred to next increment.
 - [ ] **Basic apps** (after toolkit stable): terminal, text editor,
   file browser, plus Snake + 2048.
 - [ ] **hamsh `use hamui`** — bindings; may need hamsh closures +
