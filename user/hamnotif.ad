@@ -1,0 +1,327 @@
+# user/hamnotif.ad
+#
+# hamnotif — DE pivot wave 7: the transient notification toast banner
+# extracted out of user/hamUId.ad's daemon_pixel cascade into a standalone
+# hamui v2 client (matches the wave-1 hampanel, wave-2 hamappmenu, wave-3
+# hamcycler, wave-4 hamcalpop/hamrun, and wave-5 hamlock pattern).
+#
+# Wire model
+# ----------
+# 1. The compositor publishes the toast model (active flag + 0..255 alpha
+#    + title + body) via the `notif <active> <alpha> <title>\t<body>` verb
+#    on /dev/wsys/ctl. The snapshot is served at /dev/wsys/notif as one
+#    line:
+#       "<show_serial> <active> <alpha> <gen> <title>\t<body>\n"
+# 2. The compositor spawns /bin/hamnotif once at startup. Whenever a new
+#    notification is posted (notify_post) or the wall-clock fade alpha
+#    crosses a bucket (notify_tick), it republishes the model and bumps
+#    the show serial by writing to /dev/wsys/notif/show.
+# 3. We open OUR /dev/wsys/<wid>/wctl, write "version 2\n" to opt into
+#    the rio v2 blit protocol, then rasterise the banner (dark slab + ink
+#    border + title line + body line) into our backbuffer via lib/hamui's
+#    hamui_v2_* family. The compositor blits our backbuffer to /dev/fb
+#    each frame.
+# 4. While `active` is 0 we leave the backbuffer cleared-to-transparent
+#    so the toast is "off". When `active` flips to 1 we paint the banner.
+#
+# Why the notification queue stays in the compositor
+# --------------------------------------------------
+# Like every other extraction wave, only the RENDER moved out. The
+# notify_post() entry point, the fade timer (notify_tick / notify_alpha),
+# and the message-tray history ring all stay in hamUId: a new notice is
+# armed by some compositor-side event (a window launch, a battery alert,
+# etc.), the compositor pushes the snapshot to the kernel, and the
+# client just rasterises whatever the snapshot says.
+#
+# WHAT THIS REPLACES
+# ------------------
+# The ~40-line per-pixel "notification banner" overlay inside
+# daemon_pixel in user/hamUId.ad. That code is gone; this file is its
+# replacement.
+
+from lib.hamui import (
+    hamui_init, hamui_window_on, hamui_set_protocol_v2,
+    hamui_v2_clear, hamui_v2_fill_rect, hamui_v2_commit_rect,
+    hamui_v2_is_active,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield()
+extern def sys_exit(code: int32)
+
+
+# --- model storage --------------------------------------------------
+_hn_active: int32 = 0
+_hn_alpha:  int32 = 0
+_hn_gen:    uint64 = 0
+_hn_show_serial:      uint64 = 0
+_hn_last_show_serial: uint64 = 0xffffffffffffffff
+_hn_last_gen:         uint64 = 0xffffffffffffffff
+
+# Title + body buffers. The kernel caps title at 40 and body at 64; we
+# size identically and NUL-terminate after copy.
+_hn_title: Array[64, uint8]
+_hn_title_len: uint64 = 0
+_hn_body:  Array[96, uint8]
+_hn_body_len: uint64 = 0
+
+
+# --- layout (window-local pixels, v2 backbuffer cap) ----------------
+# Mirrors the legacy NOTIFY_W=260 / NOTIFY_H=44 banner. The compositor
+# anchors the window at (work_top()+8) on the right edge of the screen.
+_hn_WIN_W: int32 = 260
+_hn_WIN_H: int32 = 44
+_hn_GLYPH_H: int32 = 6
+_hn_GLYPH_W: int32 = 7
+
+# Legacy banner colours (NOTIFY_R/G/B and NOTIFY_BORDER_R/G/B in hamUId).
+_hn_BG_R: uint8 = 40
+_hn_BG_G: uint8 = 46
+_hn_BG_B: uint8 = 60
+_hn_BORDER_R: uint8 = 110
+_hn_BORDER_G: uint8 = 150
+_hn_BORDER_B: uint8 = 230
+
+
+# --- scratch --------------------------------------------------------
+_hn_snap_buf: Array[384, uint8]
+
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
+
+
+# --- snapshot parser ------------------------------------------------
+def _read_notif_snapshot() -> int64:
+    fd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/notif"))
+    if fd < 0:
+        return -1
+    n: int64 = sys_read(fd, &_hn_snap_buf[0], 384)
+    sys_close(fd)
+    return n
+
+
+def _parse_u64(pos: Ptr[uint64], end: uint64) -> uint64:
+    p: uint64 = pos[0]
+    v: uint64 = 0
+    while p < end and _hn_snap_buf[p] >= 48 and _hn_snap_buf[p] <= 57:
+        v = v * 10 + cast[uint64](_hn_snap_buf[p] - 48)
+        p = p + 1
+    pos[0] = p
+    return v
+
+
+def _skip_ws(pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end and (_hn_snap_buf[p] == 32 or _hn_snap_buf[p] == 9):
+        p = p + 1
+    return p
+
+
+def _skip_one_space(pos: uint64, end: uint64) -> uint64:
+    if pos < end and _hn_snap_buf[pos] == 32:
+        return pos + 1
+    return pos
+
+
+def _parse_snapshot(n: uint64) -> int32:
+    # Returns 1 if anything CHANGED since the last parse (gen or
+    # show_serial differ), 0 otherwise.
+    if n == 0:
+        return 0
+    pos: Array[1, uint64]
+    pos[0] = 0
+    show_v:  uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    active_v: uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    alpha_v:  uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    gen_v:    uint64 = _parse_u64(&pos[0], n)
+    # Skip exactly one separator space before the title; the title spans
+    # to the first TAB, then the body spans from TAB+1 to the final '\n'.
+    pos[0] = _skip_one_space(pos[0], n)
+    end: uint64 = n
+    while end > pos[0] and (_hn_snap_buf[end - 1] == 10
+                            or _hn_snap_buf[end - 1] == 13):
+        end = end - 1
+    tab: uint64 = pos[0]
+    while tab < end and _hn_snap_buf[tab] != 9:
+        tab = tab + 1
+    title_len: uint64 = tab - pos[0]
+    if title_len > 63:
+        title_len = 63
+    i: uint64 = 0
+    while i < title_len:
+        _hn_title[i] = _hn_snap_buf[pos[0] + i]
+        i = i + 1
+    _hn_title[title_len] = 0
+    _hn_title_len = title_len
+    body_start: uint64 = tab
+    if body_start < end:
+        body_start = body_start + 1                    # skip the TAB
+    body_len: uint64 = end - body_start
+    if body_len > 95:
+        body_len = 95
+    j: uint64 = 0
+    while j < body_len:
+        _hn_body[j] = _hn_snap_buf[body_start + j]
+        j = j + 1
+    _hn_body[body_len] = 0
+    _hn_body_len = body_len
+    _hn_show_serial = show_v
+    _hn_active = cast[int32](active_v)
+    _hn_alpha = cast[int32](alpha_v)
+    _hn_gen = gen_v
+    changed: int32 = 0
+    if _hn_show_serial != _hn_last_show_serial:
+        changed = 1
+    if _hn_gen != _hn_last_gen:
+        changed = 1
+    _hn_last_show_serial = _hn_show_serial
+    _hn_last_gen = _hn_gen
+    return changed
+
+
+# --- crude glyph-block rendering ------------------------------------
+# Mirrors hamlock/hamcycler/hamappmenu/hamrun's _draw_text_blocks — one
+# 4x6 block per non-space char. Glyph fidelity will come later from
+# str_ink-on-v2.
+def _draw_text_blocks(x: int32, y: int32, label: Ptr[uint8], len: uint64,
+                      r: uint8, g: uint8, b: uint8, max_w: int32):
+    i: uint64 = 0
+    cx: int32 = x
+    while i < len and cx + 4 <= x + max_w:
+        c: uint8 = label[i]
+        if c != 32:
+            hamui_v2_fill_rect(cx, y, 4, _hn_GLYPH_H, r, g, b)
+        cx = cx + _hn_GLYPH_W - 1
+        i = i + 1
+
+
+def _paint_closed():
+    # Toast hidden: clear the backbuffer.
+    hamui_v2_clear(0, 0, 0)
+    hamui_v2_commit_rect(0, 0, _hn_WIN_W, _hn_WIN_H)
+
+
+def _alpha_blend(fg: uint8, bg: uint8, a: int32) -> uint8:
+    return cast[uint8]((cast[int64](fg) * cast[int64](a)
+                       + cast[int64](bg) * cast[int64](255 - a)) / 255)
+
+
+def _paint_open():
+    # Banner body: alpha-blended dark slab. We don't have access to the
+    # underlying desktop pixels in our v2 backbuffer (the compositor
+    # composites US over the scene), so we just paint the slab solid and
+    # let the fade-toward-zero alpha be effectively absorbed by the
+    # compositor's banner-rect damage logic. This is the same simplifying
+    # assumption hamlock makes for its curtain.
+    a: int32 = _hn_alpha
+    bgr: uint8 = _alpha_blend(_hn_BG_R, 0, a)
+    bgg: uint8 = _alpha_blend(_hn_BG_G, 0, a)
+    bgb: uint8 = _alpha_blend(_hn_BG_B, 0, a)
+    hamui_v2_clear(bgr, bgg, bgb)
+
+    # Border (2-pixel inset, matches the legacy on_nframe sweep).
+    br: uint8 = _alpha_blend(_hn_BORDER_R, 0, a)
+    bg: uint8 = _alpha_blend(_hn_BORDER_G, 0, a)
+    bb: uint8 = _alpha_blend(_hn_BORDER_B, 0, a)
+    hamui_v2_fill_rect(0, 0, _hn_WIN_W, 2, br, bg, bb)
+    hamui_v2_fill_rect(0, _hn_WIN_H - 2, _hn_WIN_W, 2, br, bg, bb)
+    hamui_v2_fill_rect(0, 0, 2, _hn_WIN_H, br, bg, bb)
+    hamui_v2_fill_rect(_hn_WIN_W - 2, 0, 2, _hn_WIN_H, br, bg, bb)
+
+    # Title on the first text line (legacy 255/255/255 ink), body on
+    # the second (legacy 200/210/225 ink). Indent matches the original.
+    tnx: int32 = 10
+    tny: int32 = 5
+    title_r: uint8 = _alpha_blend(255, 0, a)
+    title_g: uint8 = _alpha_blend(255, 0, a)
+    title_b: uint8 = _alpha_blend(255, 0, a)
+    _draw_text_blocks(tnx, tny, &_hn_title[0], _hn_title_len,
+                      title_r, title_g, title_b, _hn_WIN_W - 20)
+    bny: int32 = 5 + _hn_GLYPH_H + 2
+    body_r: uint8 = _alpha_blend(200, 0, a)
+    body_g: uint8 = _alpha_blend(210, 0, a)
+    body_b: uint8 = _alpha_blend(225, 0, a)
+    _draw_text_blocks(tnx, bny, &_hn_body[0], _hn_body_len,
+                      body_r, body_g, body_b, _hn_WIN_W - 20)
+
+    hamui_v2_commit_rect(0, 0, _hn_WIN_W, _hn_WIN_H)
+
+
+def _paint():
+    if _hn_active != 0:
+        _paint_open()
+    else:
+        _paint_closed()
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    hamui_init()
+    # Self-discover OUR wid via /dev/wsys/self (same shape hamlock uses).
+    # argv[1] may override for tests.
+    wid: int32 = 1
+    self_path: Ptr[uint8] = "/dev/wsys/self"
+    sfd: int32 = sys_open(cast[Ptr[char]](self_path))
+    if sfd >= 0:
+        sbuf: Array[16, uint8]
+        sn: int64 = sys_read_nb(sfd, &sbuf[0], 16)
+        sys_close(sfd)
+        if sn > 0:
+            v: int32 = 0
+            i: uint64 = 0
+            while i < cast[uint64](sn) and sbuf[i] >= 48 and sbuf[i] <= 57:
+                v = v * 10 + cast[int32](sbuf[i]) - 48
+                i = i + 1
+            if v >= 2:
+                wid = v
+    if argc > 1:
+        ap: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        v2: int32 = 0
+        i2: uint64 = 0
+        while ap[i2] >= 48 and ap[i2] <= 57:
+            v2 = v2 * 10 + cast[int32](ap[i2]) - 48
+            i2 = i2 + 1
+        if v2 >= 1:
+            wid = v2
+
+    bound: int32 = hamui_window_on(0, wid)
+    if bound < 0:
+        _puts(2, "hamnotif: could not bind window\n")
+        return 1
+    if hamui_set_protocol_v2() < 0:
+        _puts(2, "hamnotif: v2 negotiate failed\n")
+        return 1
+
+    # Initial paint from whatever the compositor has already published.
+    n0: int64 = _read_notif_snapshot()
+    if n0 > 0:
+        _parse_snapshot(cast[uint64](n0))
+    _paint()
+    rdy: Ptr[uint8] = "HAMNOTIF ready\n"
+    sys_write(1, rdy, _strlen(rdy))
+
+    # Long-lived event loop: poll the snapshot. On a gen or show_serial
+    # bump repaint. The compositor pokes /dev/wsys/notif/show whenever
+    # the toast state changes (no socket: we just resample the snapshot).
+    while True:
+        n: int64 = _read_notif_snapshot()
+        if n > 0:
+            if _parse_snapshot(cast[uint64](n)) != 0:
+                _paint()
+        sys_yield()
+
+    return 0
