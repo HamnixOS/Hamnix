@@ -53,11 +53,11 @@ audit #453 closed; report at `audit_F10_report.md`. F10-1 #454, F10-2
   followup per-Chan `p9_dir_mode` + `_dirfile_read` migration + ls/du
   migration landed `73e95a06`. Remaining deferred: per-entry mtime
   (per-FS hook needed) + devproc dir backing + flip-back to mode 0.
-- [~] **F10-4 (#457) structural landed `d193bbf8`** — do_mount no
-  longer silently drops afd; Tauth runs when afd != -1, devauth-backed
-  uname passed into Tattach. Test scaffolding compiles + boots green
-  but printk-based e2e verification was flaky (agent timeout). Re-tool
-  the test harness as follow-up. (F10-5 `a38cae28`; F10-7 bonus in
+- [x] **F10-4 (#457) full**: structural landed `d193bbf8`; e2e harness
+  retooled `e8428bb9` — root cause of the flake was that `[mount]
+  uname=` printks defaulted to INFO and got swallowed by the
+  post-interactive console-loglevel gate; fix pre-latches WARN before
+  each marker. All 7 checks green. (F10-5 `a38cae28`; F10-7 bonus in
   F10-2; F10-8 `983e1ce8`; F10-9/11/12 `f9c61595`; F10-10 `a31cfb00`.)
 - [~] **#459 fixed** `863f1765` — root cause was NOT the F10 wave but
   pre-existing F6 regression: `vfs_read` EISDIR short-circuit on
