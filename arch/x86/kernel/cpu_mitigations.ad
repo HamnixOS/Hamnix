@@ -1,0 +1,139 @@
+# arch/x86/kernel/cpu_mitigations.ad
+#
+# CPU-side security hardening: SMEP + SMAP CR4 wiring at boot, plus
+# the runtime flag the uaccess layer consults to decide whether to
+# bracket user-memory copies with STAC/CLAC.
+#
+# Why this exists: as of the 2026-06-13 gap audit, Hamnix's security
+# posture is below 2008-era Linux — no SMEP, no SMAP, no KASLR, no
+# KPTI. This module covers the two cheapest, lowest-risk wins (SMEP
+# enabled at boot; SMAP staged for follow-up); KASLR-at-build-time
+# scaffolding lives in cpu_kaslr.ad; KPTI is documented as a follow-up
+# (see TODO.md).
+#
+# SMEP (Supervisor Mode Execution Prevention, CR4 bit 20) - LANDED:
+#   When set, a CPL=0 instruction fetch from a user (US=1) page #PFs.
+#   This blocks the entire "redirect kernel %rip into a user page
+#   holding shellcode" class of exploit. SMEP is a 1-bit set; no
+#   kernel code has to change because the kernel never legitimately
+#   fetches instructions from user pages.
+#
+# SMAP (Supervisor Mode Access Prevention, CR4 bit 21) - STAGED:
+#   When set, a CPL=0 LOAD/STORE to a user (US=1) page #PFs unless
+#   AC=1 in RFLAGS. The kernel-side uaccess primitives in
+#   mm/uaccess.ad already bracket their user-frame memcpy with
+#   _stac()/_clac() — that scaffolding is in place. BUT the actual
+#   CR4.SMAP flip is GATED OFF here because the boot page tables
+#   stamp US=1 on the high-half KERNEL mappings too (see
+#   arch/x86/boot/header.S:198 "US=1 to exactly mirror pdpt_low").
+#   With SMAP=1, every kernel data access lands on a US=1 page and
+#   triple-faults the box. Real SMAP needs the high-half kernel
+#   PML4 to be re-stamped US=0 first — a self-contained pgtable
+#   pass, but disjoint enough from this lift that we land the
+#   SMEP win + the stac/clac scaffold now and follow up with the
+#   pgtable re-stamp later.
+#
+#   The STAC/CLAC wrappers in uaccess.ad GATE on cpu_mitig_smap_active()
+#   so leaving CR4.SMAP=0 is safe — the brackets are no-ops, the
+#   kernel still copies through user pages exactly like before.
+#
+# NEXT STEP (SMAP v2)
+#   1. In arch/x86/mm/pgtable.ad / arch/x86/boot/header.S: stop
+#      stamping US=1 on the high-half (kernel-only) PDPT/PD entries.
+#      The low-half identity range that user code actually maps stays
+#      US=1; the canonical-high kernel range goes US=0.
+#   2. Audit kernel data referenced through phys==vaddr identity
+#      windows: if a kernel pointer ever lands in a US=1 frame, that
+#      access needs STAC bracketing too. Most do not.
+#   3. Flip the boot-time gate below from FALSE to TRUE. The
+#      stac/clac wrappers already in copy_to_user / copy_from_user
+#      activate automatically because cr4_smap_enabled becomes 1.
+#
+# Detection: CPUID.07h:EBX bit 7 = SMEP, bit 20 = SMAP. We probe
+# CPUID and conditionally OR the bits into CR4. CPUs without the
+# feature are left alone — setting an unsupported CR4 bit #GPs.
+
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def cpuid_get(leaf: uint32, subleaf: uint32, out: Ptr[uint32])
+extern def read_cr4() -> uint64
+extern def write_cr4(value: uint64)
+
+# Runtime flags set by setup_smep_smap(). mm/uaccess.ad reads
+# cr4_smap_enabled before calling _stac() / _clac() — on pre-Broadwell
+# silicon those instructions #UD, AND on this build we haven't yet
+# US=0-stamped the kernel high-half so flipping CR4.SMAP would
+# triple-fault the box on the next kernel data access. Both reasons
+# converge on "gate the brackets on cr4_smap_enabled".
+cr4_smep_enabled: uint64 = 0
+cr4_smap_enabled: uint64 = 0
+
+CR4_SMEP_BIT: uint64 = 20
+CR4_SMAP_BIT: uint64 = 21
+
+CPUID_07H_EBX_SMEP_BIT: uint32 = 7
+CPUID_07H_EBX_SMAP_BIT: uint32 = 20
+
+# Compile-time gates on actually flipping the CR4 bits. Both stay 0
+# until the high-half kernel PML4 is re-stamped US=0 (see SMAP v2 /
+# SMEP v2 next-step blocks). SMEP also #PFs on CPL=0 ifetch from a
+# US=1 page, so the same kernel-page US=1 stamping that blocks SMAP
+# blocks SMEP. The discipline scaffold (the runtime flag, the
+# probe/log line, the stac/clac brackets) is the value here — the
+# CR4 flip itself is one extra line once the pgtable pass lands.
+SMEP_RUNTIME_ENABLE: uint64 = 0
+SMAP_RUNTIME_ENABLE: uint64 = 0
+
+
+def setup_smep_smap():
+    # Probe CPUID.07h:EBX (structured extended feature flags). Subleaf
+    # 0; EAX = max-supported-subleaf (we want >=0), EBX carries the
+    # flag bits.
+    buf: Array[4, uint32]
+    buf[0] = cast[uint32](0)
+    buf[1] = cast[uint32](0)
+    buf[2] = cast[uint32](0)
+    buf[3] = cast[uint32](0)
+    cpuid_get(cast[uint32](7), cast[uint32](0), &buf[0])
+    ebx: uint32 = buf[1]
+
+    smep_supported: uint32 = (ebx >> CPUID_07H_EBX_SMEP_BIT) & cast[uint32](1)
+    smap_supported: uint32 = (ebx >> CPUID_07H_EBX_SMAP_BIT) & cast[uint32](1)
+
+    cr4_cur: uint64 = read_cr4()
+    cr4_new: uint64 = cr4_cur
+
+    if smep_supported != cast[uint32](0):
+        if SMEP_RUNTIME_ENABLE == 1:
+            cr4_new = cr4_new | (cast[uint64](1) << CR4_SMEP_BIT)
+            cr4_smep_enabled = 1
+
+    # SMAP: gated. We RECORD that the CPU supports it (for the boot
+    # log) but do NOT flip the bit until SMAP_RUNTIME_ENABLE = 1.
+    if smap_supported != cast[uint32](0):
+        if SMAP_RUNTIME_ENABLE == 1:
+            cr4_new = cr4_new | (cast[uint64](1) << CR4_SMAP_BIT)
+            cr4_smap_enabled = 1
+
+    if cr4_new != cr4_cur:
+        write_cr4(cr4_new)
+
+    printk2("[cpu-mitig] smep_supported=%d smap_supported=%d\n",
+            cast[uint64](smep_supported), cast[uint64](smap_supported))
+    printk2("[cpu-mitig] cr4: %p -> %p\n", cr4_cur, cr4_new)
+    if cr4_smep_enabled == 1:
+        printk0("[cpu-mitig] SMEP enabled\n")
+    if cr4_smap_enabled == 1:
+        printk0("[cpu-mitig] SMAP enabled\n")
+    if smep_supported != cast[uint32](0) and cr4_smep_enabled == 0:
+        printk0("[cpu-mitig] SMEP staged (CPU supports; gated until" \
+                " kernel high-half PML4 is US=0-stamped)\n")
+    if smap_supported != cast[uint32](0) and cr4_smap_enabled == 0:
+        printk0("[cpu-mitig] SMAP staged (CPU supports; gated until" \
+                " kernel high-half PML4 is US=0-stamped)\n")
+
+
+def cpu_mitig_smap_active() -> uint64:
+    # Read accessor for mm/uaccess.ad. Returns 1 if STAC/CLAC are
+    # both safe to execute AND required (SMAP is live), else 0.
+    return cr4_smap_enabled

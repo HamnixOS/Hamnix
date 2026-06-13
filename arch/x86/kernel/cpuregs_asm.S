@@ -178,3 +178,37 @@ _ap_mwait:
     movq    %rsi, %rcx                 /* extensions -> ECX */
     mwait                              /* enter optimized idle state */
     ret
+
+/* ---------- _stac() / _clac() ------------------------------------ *
+ *
+ * SMAP (Supervisor Mode Access Prevention) discipline. When CR4.SMAP
+ * is set, a CPL=0 access to a user (US=1) page #PFs unless AC=1 in
+ * RFLAGS. STAC sets AC; CLAC clears it.
+ *
+ * The kernel-side uaccess primitives (mm/uaccess.ad::copy_to_user /
+ * copy_from_user) walk the running task's PML4, translate the user
+ * vaddr to a physical frame, then memcpy via the low-mem identity
+ * window. Because that destination IS a user-allocated page with
+ * US=1 in its PTE, a CPL=0 memcpy with SMAP enabled #PFs without
+ * STAC. We bracket the memcpy with _stac() / _clac().
+ *
+ * Both are no-ops on CPUs that lack SMAP (CR4.SMAP=0 means AC is a
+ * normal user-clearable flag; STAC/CLAC #UD on pre-Broadwell parts).
+ * The boot-time setup_smep_smap() only enables CR4.SMAP when CPUID
+ * reports SMAP support, so callers must be sure not to hit the asm
+ * on older silicon. We gate them via the global cr4_smap_enabled
+ * flag in init/main.ad — see uaccess.ad's _ua_stac / _ua_clac.
+ *
+ * SysV ABI: no args, no return, no clobbers.
+ */
+    .align 16
+    .globl _stac
+_stac:
+    stac
+    ret
+
+    .align 16
+    .globl _clac
+_clac:
+    clac
+    ret
