@@ -1,0 +1,372 @@
+# lib/font_bdf.ad
+#
+# #444-followup Phase 4d — pure-Adder BDF 2.1 parser for the hamUI/DE
+# font store. Consumes a flat byte buffer (Ptr[uint8] + length) holding
+# a BDF text file in the subset emitted by scripts/gen_bdf_fonts.py and
+# decodes printable-ASCII glyphs (0x20..0x7E) into a caller-supplied
+# glyph table:
+#
+#   - GLYPH_W[95], GLYPH_H[95]      per-glyph BBX width/height in pixels
+#   - GLYPH_OFF[95]                 byte offset into GLYPH_BITS where the
+#                                   glyph's bitmap rows start
+#   - GLYPH_BITS[GLYPH_BITS_CAP]    packed bitmap rows, one byte per row
+#                                   when w<=8, two bytes when 8<w<=16.
+#                                   MSB = leftmost pixel (BDF convention).
+#   - FONT_ASCENT, FONT_DESCENT     global font ascent/descent in pixels
+#   - FONT_BBX_W, FONT_BBX_H        FONTBOUNDINGBOX width/height
+#
+# The parser is deliberately tiny:
+#
+#   * one byte-pointer + length window over the input
+#   * line-at-a-time loop, splitting on '\n' / '\r'
+#   * keyword dispatch on the first whitespace-separated token of each
+#     line (STARTFONT, FONTBOUNDINGBOX, CHARS, STARTCHAR, ENCODING, BBX,
+#     BITMAP, ENDCHAR, ENDFONT)
+#   * inside BITMAP we read exactly `h` hex rows into GLYPH_BITS
+#   * unknown lines (PROPERTIES, COMMENT, SIZE, SWIDTH, DWIDTH, FONT_*)
+#     are tolerated — the parser SKIPS them. The FONT_ASCENT /
+#     FONT_DESCENT lines ARE read for layout convenience.
+#
+# Caller-supplied tables come in via Ptr[T] arguments so the same parser
+# can fill three different (mono/sans/serif) tables defined at the call
+# site. No allocations; all storage is the caller's.
+#
+# Return value of `font_bdf_parse`:
+#     >= 0   number of glyphs decoded (0..95)
+#     <  0   parse error:
+#               -1  buffer too small or missing STARTFONT
+#               -2  malformed BBX / BITMAP block
+#               -3  glyph bitmap too tall (height > 32)
+#               -4  GLYPH_BITS_CAP overflow
+
+extern def kmalloc(n: uint64) -> Ptr[uint8]
+extern def kfree(p: Ptr[uint8])
+
+# ---- shared constants (also used by callers) -----------------------
+FONT_BDF_N_GLYPHS: uint64 = 95          # ASCII 0x20..0x7E
+FONT_BDF_BASE_CP:  uint64 = 32          # first encoded codepoint
+FONT_BDF_MAX_ROWS: uint64 = 32          # max BBX h we accept
+
+
+# ---- internal helpers ----------------------------------------------
+
+def _is_ws(c: uint8) -> int32:
+    if c == 32 or c == 9:
+        return 1
+    return 0
+
+
+def _is_eol(c: uint8) -> int32:
+    if c == 10 or c == 13:
+        return 1
+    return 0
+
+
+def _hexdig(c: uint8) -> int32:
+    # ASCII hex digit -> 0..15, or -1.
+    if c >= 48 and c <= 57:
+        return cast[int32](c) - 48
+    if c >= 97 and c <= 102:
+        return cast[int32](c) - 97 + 10
+    if c >= 65 and c <= 70:
+        return cast[int32](c) - 65 + 10
+    return -1
+
+
+# Decimal int parse over buf[i..end). Stops at first non-digit. Returns
+# the value via out_v[0] and the post-parse offset (i.e. one past the
+# last digit consumed).
+def _parse_dec(buf: Ptr[uint8], i: uint64, end: uint64,
+               out_v: Ptr[int64]) -> uint64:
+    j: uint64 = i
+    neg: int32 = 0
+    if j < end and buf[j] == 45:                    # '-'
+        neg = 1
+        j = j + 1
+    v: int64 = 0
+    while j < end:
+        c: uint8 = buf[j]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[int64](cast[int32](c) - 48)
+        j = j + 1
+    if neg != 0:
+        v = 0 - v
+    out_v[0] = v
+    return j
+
+
+# Find end of the current line, returns offset of '\n' or `end`.
+def _eol_at(buf: Ptr[uint8], i: uint64, end: uint64) -> uint64:
+    j: uint64 = i
+    while j < end and buf[j] != 10:
+        j = j + 1
+    return j
+
+
+# Skip leading whitespace within a line span [i..eol).
+def _skip_ws(buf: Ptr[uint8], i: uint64, eol: uint64) -> uint64:
+    j: uint64 = i
+    while j < eol and _is_ws(buf[j]) != 0:
+        j = j + 1
+    return j
+
+
+# Return 1 if buf[i..eol) starts with the C-string kw (followed by ws or
+# eol), else 0. Caller passes nlen for speed.
+def _line_starts(buf: Ptr[uint8], i: uint64, eol: uint64,
+                 kw: Ptr[uint8], nlen: uint64) -> int32:
+    if (eol - i) < nlen:
+        return 0
+    k: uint64 = 0
+    while k < nlen:
+        if buf[i + k] != kw[k]:
+            return 0
+        k = k + 1
+    # next char must be ws or eol
+    if (i + nlen) >= eol:
+        return 1
+    nc: uint8 = buf[i + nlen]
+    if _is_ws(nc) != 0 or _is_eol(nc) != 0:
+        return 1
+    return 0
+
+
+# Parse one hex row (1 or 2 bytes worth). Stores up to bpr bytes at
+# out[0..bpr-1]. Returns 1 on success, 0 on malformed.
+def _parse_hex_row(buf: Ptr[uint8], i: uint64, eol: uint64,
+                   out: Ptr[uint8], bpr: uint64) -> int32:
+    j: uint64 = _skip_ws(buf, i, eol)
+    b: uint64 = 0
+    while b < bpr:
+        if (j + 1) >= eol:
+            # short row — treat as zero-padded tail (BDF allows odd
+            # nibble runs only for trailing zeros).
+            out[b] = 0
+            b = b + 1
+            continue
+        hi: int32 = _hexdig(buf[j])
+        lo: int32 = _hexdig(buf[j + 1])
+        if hi < 0 or lo < 0:
+            return 0
+        out[b] = cast[uint8]((hi * 16) + lo)
+        j = j + 2
+        b = b + 1
+    return 1
+
+
+# ====================================================================
+# Top-level parser
+# ====================================================================
+#
+# Tables: caller passes Ptr[T] to four arrays:
+#   gw[FONT_BDF_N_GLYPHS] : uint8     per-glyph width (0 = absent)
+#   gh[FONT_BDF_N_GLYPHS] : uint8     per-glyph height
+#   goff[FONT_BDF_N_GLYPHS]: uint32   byte offset into gbits
+#   gbits[GBITS_CAP]: uint8           packed bitmap rows
+# plus the cap. ascent/descent are returned via int64 ptrs (0 if not
+# present in the BDF).
+
+def font_bdf_parse(buf: Ptr[uint8], buflen: uint64,
+                   gw: Ptr[uint8], gh: Ptr[uint8],
+                   goff: Ptr[uint32], gbits: Ptr[uint8],
+                   gbits_cap: uint64,
+                   out_ascent: Ptr[int64],
+                   out_descent: Ptr[int64]) -> int64:
+    if buflen < 10:
+        return -1
+
+    # Initialise the table to "absent" (w=0, h=0).
+    k: uint64 = 0
+    while k < FONT_BDF_N_GLYPHS:
+        gw[k] = 0
+        gh[k] = 0
+        goff[k] = 0
+        k = k + 1
+    out_ascent[0] = 0
+    out_descent[0] = 0
+
+    # Look for STARTFONT in the first 256 bytes (skipping COMMENTs).
+    seen_startfont: int32 = 0
+    pos: uint64 = 0
+    sf_kw: Ptr[uint8] = "STARTFONT"
+    while pos < buflen and pos < 8192 and seen_startfont == 0:
+        eol: uint64 = _eol_at(buf, pos, buflen)
+        if _line_starts(buf, pos, eol, sf_kw, 9) != 0:
+            seen_startfont = 1
+        pos = eol + 1
+    if seen_startfont == 0:
+        return -1
+
+    # Now stream line-by-line. Track parser state inside STARTCHAR
+    # blocks via local variables.
+    in_char: int32 = 0
+    cur_enc: int64 = -1
+    cur_bbx_w: int64 = 0
+    cur_bbx_h: int64 = 0
+    bits_used: uint64 = 0
+    n_decoded: uint64 = 0
+
+    # scratch for read-back of single number
+    nval: Array[1, int64]
+
+    asc_kw: Ptr[uint8] = "FONT_ASCENT"
+    des_kw: Ptr[uint8] = "FONT_DESCENT"
+    sc_kw: Ptr[uint8] = "STARTCHAR"
+    en_kw: Ptr[uint8] = "ENCODING"
+    bbx_kw: Ptr[uint8] = "BBX"
+    bm_kw: Ptr[uint8] = "BITMAP"
+    ec_kw: Ptr[uint8] = "ENDCHAR"
+    ef_kw: Ptr[uint8] = "ENDFONT"
+
+    while pos < buflen:
+        eol: uint64 = _eol_at(buf, pos, buflen)
+        ls: uint64 = _skip_ws(buf, pos, eol)
+        if ls >= eol:
+            pos = eol + 1
+            continue
+
+        if _line_starts(buf, ls, eol, ef_kw, 7) != 0:
+            break
+
+        if _line_starts(buf, ls, eol, asc_kw, 11) != 0:
+            j: uint64 = _skip_ws(buf, ls + 11, eol)
+            _parse_dec(buf, j, eol, &nval[0])
+            out_ascent[0] = nval[0]
+            pos = eol + 1
+            continue
+
+        if _line_starts(buf, ls, eol, des_kw, 12) != 0:
+            j: uint64 = _skip_ws(buf, ls + 12, eol)
+            _parse_dec(buf, j, eol, &nval[0])
+            out_descent[0] = nval[0]
+            pos = eol + 1
+            continue
+
+        if _line_starts(buf, ls, eol, sc_kw, 9) != 0:
+            in_char = 1
+            cur_enc = -1
+            cur_bbx_w = 0
+            cur_bbx_h = 0
+            pos = eol + 1
+            continue
+
+        if in_char != 0:
+            if _line_starts(buf, ls, eol, en_kw, 8) != 0:
+                j: uint64 = _skip_ws(buf, ls + 8, eol)
+                _parse_dec(buf, j, eol, &nval[0])
+                cur_enc = nval[0]
+                pos = eol + 1
+                continue
+
+            if _line_starts(buf, ls, eol, bbx_kw, 3) != 0:
+                # BBX W H xoff yoff
+                j: uint64 = _skip_ws(buf, ls + 3, eol)
+                j = _parse_dec(buf, j, eol, &nval[0])
+                cur_bbx_w = nval[0]
+                j = _skip_ws(buf, j, eol)
+                j = _parse_dec(buf, j, eol, &nval[0])
+                cur_bbx_h = nval[0]
+                if cur_bbx_w < 0 or cur_bbx_h < 0:
+                    return -2
+                if cast[uint64](cur_bbx_h) > FONT_BDF_MAX_ROWS:
+                    return -3
+                pos = eol + 1
+                continue
+
+            if _line_starts(buf, ls, eol, bm_kw, 6) != 0:
+                # Next cur_bbx_h lines are hex rows. bpr = bytes/row.
+                bpr: uint64 = 1
+                if cur_bbx_w > 8:
+                    bpr = 2
+                if cur_bbx_w > 16:
+                    bpr = 3
+                if cur_bbx_w > 24:
+                    bpr = 4
+                # Reserve space in gbits for this glyph.
+                total: uint64 = bpr * cast[uint64](cur_bbx_h)
+                if bits_used + total > gbits_cap:
+                    return -4
+                row_dst: uint64 = bits_used
+                # Advance past BITMAP line
+                pos = eol + 1
+                # Read cur_bbx_h rows.
+                rr: uint64 = 0
+                ok: int32 = 1
+                while rr < cast[uint64](cur_bbx_h):
+                    if pos >= buflen:
+                        ok = 0
+                        rr = cast[uint64](cur_bbx_h)
+                    else:
+                        reol: uint64 = _eol_at(buf, pos, buflen)
+                        rls: uint64 = _skip_ws(buf, pos, reol)
+                        if rls >= reol:
+                            # blank line in BITMAP -> treat as zero row
+                            b: uint64 = 0
+                            while b < bpr:
+                                gbits[row_dst + rr * bpr + b] = 0
+                                b = b + 1
+                        else:
+                            r: int32 = _parse_hex_row(buf, rls, reol,
+                                                      &gbits[row_dst + rr * bpr],
+                                                      bpr)
+                            if r == 0:
+                                ok = 0
+                                rr = cast[uint64](cur_bbx_h)
+                        pos = reol + 1
+                    rr = rr + 1
+                if ok == 0:
+                    return -2
+
+                # Record glyph if encoding is in the printable-ASCII window.
+                if cur_enc >= cast[int64](FONT_BDF_BASE_CP) and \
+                   cur_enc < cast[int64](FONT_BDF_BASE_CP + FONT_BDF_N_GLYPHS):
+                    idx: uint64 = cast[uint64](cur_enc) - FONT_BDF_BASE_CP
+                    gw[idx] = cast[uint8](cur_bbx_w)
+                    gh[idx] = cast[uint8](cur_bbx_h)
+                    goff[idx] = cast[uint32](row_dst)
+                    n_decoded = n_decoded + 1
+                bits_used = bits_used + total
+                # Stay in_char; ENDCHAR closes it.
+                continue
+
+            if _line_starts(buf, ls, eol, ec_kw, 7) != 0:
+                in_char = 0
+                pos = eol + 1
+                continue
+
+        # default: skip unknown line
+        pos = eol + 1
+
+    return cast[int64](n_decoded)
+
+
+# Render one decoded glyph at (x,y) into an arbitrary "put-pixel"
+# callback. To stay agnostic of the renderer, we expose a simple
+# expand-bits-to-bytes helper instead: into `dst[0..(w*h)-1]` it writes
+# 1 if the pixel is ON, 0 if OFF, MSB-first within the source byte.
+# Callers (e.g. hamUId raster_glyph_bdf) then paint each ON pixel via
+# their own layer_put.
+def font_bdf_expand(gbits: Ptr[uint8], off: uint32,
+                    w: uint8, h: uint8, dst: Ptr[uint8]):
+    bpr: uint64 = 1
+    if cast[int32](w) > 8:
+        bpr = 2
+    if cast[int32](w) > 16:
+        bpr = 3
+    if cast[int32](w) > 24:
+        bpr = 4
+    rr: uint64 = 0
+    while rr < cast[uint64](h):
+        col: uint64 = 0
+        while col < cast[uint64](w):
+            byte_idx: uint64 = col / 8
+            bit_idx: uint64 = col % 8
+            src_byte: uint8 = gbits[cast[uint64](off) + rr * bpr + byte_idx]
+            mask: uint8 = cast[uint8](128 >> bit_idx)
+            if (src_byte & mask) != 0:
+                dst[rr * cast[uint64](w) + col] = 1
+            else:
+                dst[rr * cast[uint64](w) + col] = 0
+            col = col + 1
+        rr = rr + 1
