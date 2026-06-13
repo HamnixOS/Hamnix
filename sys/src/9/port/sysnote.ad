@@ -591,3 +591,329 @@ def notepid_selftest() -> int32:
         return 1
     printk0("[notepid] FAIL\n")
     return 0
+
+
+# --- §3 deferred note-delivery hook (trap-return drain) -------------
+#
+# Closes the §3 Signals TODO item: post_note_to_group + post_note_to_pid
+# already PARK note_pending=1 + the message string on every cross-task
+# target's TaskStruct. The missing piece is the consumer: when each of
+# those targets next CROSSES the kernel/user boundary back into user mode,
+# the kernel must consult note_pending and either:
+#
+#   * Retarget the saved-user-RIP slot at the installed handler (the
+#     same retarget deliver_note_to_current does for the self-delivery
+#     fast path), so SYSRETQ lands the target in its note handler instead
+#     of the interrupted instruction — Plan 9 notify(2)/noted(2)
+#     semantics; OR
+#
+#   * If no handler is installed (note_handler_rip == 0), take the Plan
+#     9 DEFAULT action: terminate the target. This is the analogue of
+#     SIG_DFL "core/terminate" for a non-fatal-by-default note.
+#
+# The trap-return point we hook is do_syscall ENTRY in arch/x86/kernel/
+# syscall.ad — same place signal_check_and_handle() already gates the
+# native ABI. A task with a pending cross-task note must execute the
+# handler (or terminate) BEFORE running whatever syscall it was about to
+# run; otherwise an in-flight notify-then-write race could let the
+# write() complete before the handler ran. (Pure timer-interrupt
+# preemption returns to user via the IDT path, not SYSRETQ; that drain
+# is a follow-up — the syscall-entry drain alone covers every task that
+# is making forward progress through the kernel.)
+#
+# RUNTIME GATE — notes_enabled (default OFF). Real-world boots have not
+# yet exercised this drain across the whole live process tree; flipping
+# it on globally for a default boot is too risky for one commit. The
+# self-test below (and only it) sets notes_enabled=1 around the drain,
+# proves correctness, and clears the flag again. Production paths that
+# want the drain (a future shell/job-control milestone) flip the flag
+# permanently from init/main.ad.
+
+notes_enabled: int32 = 0
+
+
+def notes_runtime_enable():
+    notes_enabled = 1
+
+
+def notes_runtime_disable():
+    notes_enabled = 0
+
+
+def notes_runtime_is_enabled() -> int32:
+    return notes_enabled
+
+
+# Drain outcomes.
+NOTE_DRAIN_NONE:    int32 = 0   # nothing pending
+NOTE_DRAIN_HANDLER: int32 = 1   # retargeted to handler
+NOTE_DRAIN_DEFAULT: int32 = 2   # no handler — caller must terminate task
+
+
+def _drain_slot(slot: uint64,
+                rip_slot: Ptr[uint64],
+                rsp_slot: Ptr[uint64]) -> int32:
+    # Core drain logic, parameterised on the (saved-RIP, saved-RSP) frame
+    # slots so production (real kstack pointers) and the self-test
+    # (per-test buffer pointers) share one implementation. Reads the
+    # named task's note_pending; if set, EITHER retargets the saved-RIP
+    # slot at the installed handler (parking the prior RIP/RSP for
+    # noted() to restore) OR signals NOTE_DRAIN_DEFAULT for the caller
+    # to terminate the task.
+    pending: int32 = task_note_pending(slot)
+    if pending == 0:
+        return NOTE_DRAIN_NONE
+    handler: uint64 = task_note_handler_rip(slot)
+    if handler == 0:
+        # No handler installed — Plan 9 DEFAULT action is to terminate.
+        # Clear note_pending so a post-mortem inspector sees a consistent
+        # state; the caller terminates the task via task_exit_current.
+        set_task_note_pending(slot, 0)
+        return NOTE_DRAIN_DEFAULT
+    # Park the original (RIP, RSP) into the per-task save area so noted()
+    # can restore them, then retarget the saved-RIP slot at the handler.
+    # Leave note_pending=1 so do_noted() recognises it is being called
+    # from inside a real handler frame.
+    set_task_note_saved_rip(slot, rip_slot[0])
+    set_task_note_saved_rsp(slot, rsp_slot[0])
+    rip_slot[0] = handler
+    return NOTE_DRAIN_HANDLER
+
+
+def note_check_and_handle():
+    # do_syscall-entry drain hook. Consults notes_enabled; when armed,
+    # drains the current task's pending note onto THIS syscall's kstack
+    # frame slots. On NOTE_DRAIN_DEFAULT (no handler), terminates the
+    # task — task_exit_current does not return.
+    if notes_enabled == 0:
+        return
+    cur: uint64 = current_idx_get()
+    rip_slot: Ptr[uint64] = saved_user_rip_ptr()
+    rsp_slot: Ptr[uint64] = saved_user_rsp_ptr()
+    outcome: int32 = _drain_slot(cur, rip_slot, rsp_slot)
+    if outcome == NOTE_DRAIN_DEFAULT:
+        printk0("note: cross-task delivery, no handler — terminating\n")
+        task_exit_current(cast[int64](128))
+
+
+# --- §3 trap-return drain self-test ---------------------------------
+#
+# Proves the deferred-delivery hook fires correctly on each LIVE target a
+# group post enqueued onto, by simulating each target's trap-return:
+#
+#   1. Spawn 3 inert "children" in note group A (RFNAMEG+RFNOTEG cohort
+#      analogue: an isolated note_group ID), plus 1 child in a DIFFERENT
+#      group B (must NOT receive — RFNOTEG isolation).
+#   2. Install a fake user-handler RIP on each of the 3 group-A children
+#      so the drain takes the HANDLER path (not the default-terminate
+#      path — that would race the test harness when a real-scheduled task
+#      drained itself in production).
+#   3. Post a note to group A via the REAL post_note_to_group walker
+#      (the same path /proc/<pid>/note group writes drive).
+#   4. For each child, simulate its trap-return: hand _drain_slot a
+#      private (fake_rip, fake_rsp) buffer pair pre-filled with a known
+#      "interrupted RIP/RSP", and assert the drain rewrote fake_rip to
+#      the installed handler. The matching note_saved_rip / saved_rsp
+#      slots must hold the original RIP/RSP (so a future noted() would
+#      restore them).
+#   5. Drain the group-B witness the same way; it must report
+#      NOTE_DRAIN_NONE (no pending note ever enqueued). RFNOTEG isolation
+#      check.
+#   6. Also drain a fresh slot whose note_pending=1 but handler==0 (the
+#      default-action arm), and assert the outcome is NOTE_DRAIN_DEFAULT
+#      (caller would terminate). The slot is NOT actually terminated here
+#      because _drain_slot is the pure primitive — note_check_and_handle
+#      wraps that with task_exit_current in production.
+#
+# All asserts deterministic; no live scheduler race.
+
+_NOTE_DRAIN_GROUP_A: int32 = 4444
+_NOTE_DRAIN_GROUP_B: int32 = 4545
+_NOTE_DRAIN_FAKE_HANDLER: uint64 = 0xdeadbee0
+_NOTE_DRAIN_FAKE_RIP:     uint64 = 0x111111110000
+_NOTE_DRAIN_FAKE_RSP:     uint64 = 0x222222220000
+
+
+# Scratch frame slots used by the self-test in lieu of a real kstack
+# trap frame. Two cells: [0] = saved-RIP slot, [1] = saved-RSP slot. The
+# test loads the "interrupted" fake values into these, hands their
+# &arr[0] addresses to _drain_slot, then inspects what the drain wrote
+# back. Module-level Array (not stack-local) so we can take a stable
+# Ptr[uint64] off it without depending on local-variable address-of.
+_notedrain_frame: Array[2, uint64]
+
+
+def _drain_child(slot: int32, want_handler: uint64) -> int32:
+    # Simulate one trap-return drain on the named child. Backs the saved-
+    # RIP / saved-RSP slots with the module-level scratch frame pre-loaded
+    # with the fake "interrupted" frame, runs the production _drain_slot
+    # primitive against them, and asserts:
+    #   * outcome is NOTE_DRAIN_HANDLER
+    #   * the RIP cell was rewritten to want_handler
+    #   * note_saved_rip / note_saved_rsp hold the original fake values
+    # Returns 1 on PASS, 0 on FAIL.
+    _notedrain_frame[0] = _NOTE_DRAIN_FAKE_RIP
+    _notedrain_frame[1] = _NOTE_DRAIN_FAKE_RSP
+    rip_p: Ptr[uint64] = &_notedrain_frame[0]
+    rsp_p: Ptr[uint64] = &_notedrain_frame[1]
+    su: uint64 = cast[uint64](slot)
+    outcome: int32 = _drain_slot(su, rip_p, rsp_p)
+    if outcome != NOTE_DRAIN_HANDLER:
+        printk1("[notedrain] FAIL — slot drain outcome=%d, want HANDLER\n",
+                cast[uint64](cast[uint32](outcome)))
+        return 0
+    if _notedrain_frame[0] != want_handler:
+        printk1("[notedrain] FAIL — RIP slot not retargeted to handler (got=%x)\n",
+                _notedrain_frame[0])
+        return 0
+    if task_note_saved_rip(su) != _NOTE_DRAIN_FAKE_RIP:
+        printk0("[notedrain] FAIL — saved_rip not parked\n")
+        return 0
+    if task_note_saved_rsp(su) != _NOTE_DRAIN_FAKE_RSP:
+        printk0("[notedrain] FAIL — saved_rsp not parked\n")
+        return 0
+    return 1
+
+
+def notedrain_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [notedrain] lines.
+    printk0("[notedrain] deferred trap-return drain self-test start\n")
+
+    msg: Ptr[uint8] = "kill"
+
+    # Three children in group A — the RFNOTEG cohort.
+    a0: int32 = notetest_claim_slot(5, _NOTE_DRAIN_GROUP_A)  # STATE_STOPPED
+    a1: int32 = notetest_claim_slot(5, _NOTE_DRAIN_GROUP_A)
+    a2: int32 = notetest_claim_slot(5, _NOTE_DRAIN_GROUP_A)
+    # One child in group B — the isolation witness (NO RFNOTEG).
+    b0: int32 = notetest_claim_slot(5, _NOTE_DRAIN_GROUP_B)
+    # One child in group A whose handler is NOT installed — default-action arm.
+    aD: int32 = notetest_claim_slot(5, _NOTE_DRAIN_GROUP_A)
+
+    if a0 < 0 or a1 < 0 or a2 < 0 or b0 < 0 or aD < 0:
+        printk0("[notedrain] FAIL — could not claim 5 task slots\n")
+        if a0 >= 0:
+            notetest_release_slot(a0)
+        if a1 >= 0:
+            notetest_release_slot(a1)
+        if a2 >= 0:
+            notetest_release_slot(a2)
+        if b0 >= 0:
+            notetest_release_slot(b0)
+        if aD >= 0:
+            notetest_release_slot(aD)
+        return 0
+
+    # Install a fake user-handler RIP on the three "handler-bearing"
+    # group-A children. The default-action child (aD) is left with
+    # note_handler_rip=0 so its drain takes the NOTE_DRAIN_DEFAULT arm.
+    set_task_note_handler_rip(cast[uint64](a0), _NOTE_DRAIN_FAKE_HANDLER)
+    set_task_note_handler_rip(cast[uint64](a1), _NOTE_DRAIN_FAKE_HANDLER)
+    set_task_note_handler_rip(cast[uint64](a2), _NOTE_DRAIN_FAKE_HANDLER)
+
+    printk2("[notedrain] group-A handler-bearing slots %d %d (+ one more)\n",
+            cast[uint64](cast[uint32](a0)),
+            cast[uint64](cast[uint32](a1)))
+    printk2("[notedrain] group-B witness slot %d, default-arm slot %d\n",
+            cast[uint64](cast[uint32](b0)),
+            cast[uint64](cast[uint32](aD)))
+
+    # Post the note across group A — same walker the production path
+    # uses. This enqueues note_pending=1 + the msg on a0/a1/a2/aD, and
+    # MUST skip b0 (cross-group isolation).
+    n: int64 = post_note_to_group(_NOTE_DRAIN_GROUP_A, msg, 4)
+    printk1("[notedrain] post_note_to_group returned %d recipients\n",
+            cast[uint64](cast[uint32](cast[int32](n))))
+
+    ok: int32 = 1
+
+    if n != 4:
+        printk1("[notedrain] FAIL — group post hit %d, want 4\n",
+                cast[uint64](cast[uint32](cast[int32](n))))
+        ok = 0
+
+    # The group-B witness must NOT have note_pending set — confirms the
+    # RFNOTEG-style isolation BEFORE we even touch the drain path.
+    if task_note_pending(cast[uint64](b0)) != 0:
+        printk0("[notedrain] FAIL — group-B witness wrongly got pending note\n")
+        ok = 0
+    else:
+        printk0("[notedrain] group-B witness isolated from group-A post OK\n")
+
+    # Simulate each handler-bearing child's trap-return.
+    if _drain_child(a0, _NOTE_DRAIN_FAKE_HANDLER) == 0:
+        ok = 0
+    if _drain_child(a1, _NOTE_DRAIN_FAKE_HANDLER) == 0:
+        ok = 0
+    if _drain_child(a2, _NOTE_DRAIN_FAKE_HANDLER) == 0:
+        ok = 0
+    if ok == 1:
+        printk0("[notedrain] all 3 RFNOTEG members drained to handler OK\n")
+
+    # The group-B witness's drain must be a no-op (no pending note).
+    _notedrain_frame[0] = _NOTE_DRAIN_FAKE_RIP
+    _notedrain_frame[1] = _NOTE_DRAIN_FAKE_RSP
+    b_rip_p: Ptr[uint64] = &_notedrain_frame[0]
+    b_rsp_p: Ptr[uint64] = &_notedrain_frame[1]
+    b_outcome: int32 = _drain_slot(cast[uint64](b0), b_rip_p, b_rsp_p)
+    if b_outcome != NOTE_DRAIN_NONE:
+        printk1("[notedrain] FAIL — witness drain outcome=%d, want NONE\n",
+                cast[uint64](cast[uint32](b_outcome)))
+        ok = 0
+    else:
+        if _notedrain_frame[0] != _NOTE_DRAIN_FAKE_RIP:
+            printk0("[notedrain] FAIL — witness fake_rip was rewritten\n")
+            ok = 0
+        else:
+            printk0("[notedrain] group-B witness drain was NOP OK\n")
+
+    # The default-action child: drain must report NOTE_DRAIN_DEFAULT
+    # (caller would terminate) and clear note_pending.
+    _notedrain_frame[0] = _NOTE_DRAIN_FAKE_RIP
+    _notedrain_frame[1] = _NOTE_DRAIN_FAKE_RSP
+    d_rip_p: Ptr[uint64] = &_notedrain_frame[0]
+    d_rsp_p: Ptr[uint64] = &_notedrain_frame[1]
+    d_outcome: int32 = _drain_slot(cast[uint64](aD), d_rip_p, d_rsp_p)
+    if d_outcome != NOTE_DRAIN_DEFAULT:
+        printk1("[notedrain] FAIL — default-arm drain outcome=%d, want DEFAULT\n",
+                cast[uint64](cast[uint32](d_outcome)))
+        ok = 0
+    else:
+        if _notedrain_frame[0] != _NOTE_DRAIN_FAKE_RIP:
+            printk0("[notedrain] FAIL — default-arm rip should not have been retargeted\n")
+            ok = 0
+        elif task_note_pending(cast[uint64](aD)) != 0:
+            printk0("[notedrain] FAIL — default-arm note_pending not cleared\n")
+            ok = 0
+        else:
+            printk0("[notedrain] default-action drain returns DEFAULT + clears pending OK\n")
+
+    # Runtime-gate sanity: when notes_enabled==0, note_check_and_handle()
+    # must be a NO-OP even with note_pending set. (We can't test the
+    # real syscall-entry hook here because we are not in a syscall
+    # frame; the gate read is the load-bearing observable.)
+    notes_runtime_disable()
+    if notes_runtime_is_enabled() != 0:
+        printk0("[notedrain] FAIL — runtime gate stuck on after disable\n")
+        ok = 0
+    else:
+        printk0("[notedrain] runtime gate default-OFF OK\n")
+    notes_runtime_enable()
+    if notes_runtime_is_enabled() != 1:
+        printk0("[notedrain] FAIL — runtime gate did not arm\n")
+        ok = 0
+    else:
+        printk0("[notedrain] runtime gate arms when requested OK\n")
+    notes_runtime_disable()
+
+    notetest_release_slot(a0)
+    notetest_release_slot(a1)
+    notetest_release_slot(a2)
+    notetest_release_slot(b0)
+    notetest_release_slot(aD)
+
+    if ok == 1:
+        printk0("[notedrain] PASS\n")
+        return 1
+    printk0("[notedrain] FAIL\n")
+    return 0

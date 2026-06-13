@@ -869,6 +869,20 @@ if os.environ.get("ENABLE_NOTEPG_TEST") == "1":
 if os.environ.get("ENABLE_NOTEPID_TEST") == "1":
     FILES.append(("/etc/notepid-test", b"1\n"))
 
+# §3 deferred trap-return note drain self-test.
+# scripts/test_notedrain.sh sets ENABLE_NOTEDRAIN_TEST=1 to plant
+# /etc/notedrain-test. init/main.ad at boot:37.ndrain detects the marker
+# and calls notedrain_selftest() (sys/src/9/port/sysnote.ad): it builds an
+# RFNOTEG cohort (3 children in group A with installed handlers, 1
+# witness in group B, 1 group-A child with no handler), runs the REAL
+# post_note_to_group walker, then simulates each child's trap-return via
+# the production _drain_slot primitive to PROVE the deferred-delivery hook
+# fires correctly (saved-RIP retarget to handler; default-action arm
+# returns NOTE_DRAIN_DEFAULT; cross-group witness is a NOP). Default
+# boots omit the marker so it never fires.
+if os.environ.get("ENABLE_NOTEDRAIN_TEST") == "1":
+    FILES.append(("/etc/notedrain-test", b"1\n"))
+
 # Real AHCI Native Command Queuing self-test. scripts/test_ahci_ncq.sh sets
 # ENABLE_AHCI_NCQ_TEST=1 to plant /etc/ahci-ncq-test. init/main.ad at
 # boot:37.ncq detects the marker and calls ahci_ncq_selftest()
