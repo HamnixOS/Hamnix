@@ -19,6 +19,10 @@
 #     /bind_union/onlyA.txt nor /bind_union/onlyB.txt resolves (reverted)
 #   * ISOLATION: a bind in a cloned child Pgrp is visible in the child
 #     but NOT after restoring the parent Pgrp (binds are per-namespace)
+#   * UNION (MAFTER): on a fresh /bind_union2, with /bind_src_a as the
+#     MREPL base and /bind_src_b added with MAFTER, BOTH /bind_union2/
+#     onlyA.txt ('AAA') AND /bind_union2/onlyB.txt ('BBB') resolve, AND
+#     the shared name resolves to 'FROM-A' (the base — REVERSE of MBEFORE)
 #   * the [bind] PASS banner
 #
 # Boot path: a raw 64-bit Hamnix ELF will NOT boot under `qemu -kernel`
@@ -110,6 +114,12 @@ check "child namespace sees its own bind" \
     "[bind] phase4 OK: child namespace sees its own bind (/iso_union/onlyB.txt -> 'BBB')"
 check "parent namespace does NOT see the child bind (isolation)" \
     "[bind] phase4 OK: parent namespace does NOT see child bind (isolation holds)"
+check "MAFTER base A still visible at union" \
+    "[bind] phase5 OK: union base A visible (/bind_union2/onlyA.txt -> 'AAA')"
+check "MAFTER member B visible at same union point" \
+    "[bind] phase5 OK: MAFTER member B visible (/bind_union2/onlyB.txt -> 'BBB')"
+check "MAFTER does NOT shadow base for shared name (reverse of MBEFORE)" \
+    "[bind] phase5 OK: MAFTER does NOT shadow base (/bind_union2/shared.txt -> 'FROM-A')"
 check "bind self-test PASS banner" \
     "[bind] PASS"
 
