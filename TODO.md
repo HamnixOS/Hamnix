@@ -221,7 +221,9 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
   `perror` helper landed `7591d9fc`. Migrated initctl/hpm/cat.
 
 ### §14 Security (stretch)
-- [ ] `seccomp-bpf` (full classic-BPF program).
+- [x] `seccomp-bpf` classic-BPF program landed via `2c81f4e3` cherry-
+  pick (kernel/seccomp_bpf.ad cBPF interpreter + per-task filter list +
+  fork inherit + PR_SET_SECCOMP_BPF prctl arm).
 
 ### §15 Compiler
 - [x] `match`/`case` statement landed `a9a701b1` — literal, name-bind,
