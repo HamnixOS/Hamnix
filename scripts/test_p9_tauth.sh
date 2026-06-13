@@ -81,40 +81,36 @@ echo "[test_p9_tauth] --- end output ---"
 
 fail=0
 
-if grep -a -F -q "[p9_tauth] start" "$LOG"; then
-    echo "[test_p9_tauth] OK: fixture ran"
-else
-    echo "[test_p9_tauth] MISS: fixture banner missing"
-    fail=1
-fi
+check() {
+    local marker="$1" label="$2"
+    if grep -a -F -q "$marker" "$LOG"; then
+        echo "[test_p9_tauth] OK: $label"
+    else
+        echo "[test_p9_tauth] MISS: $label ($marker)"
+        fail=1
+    fi
+}
 
-if grep -a -F -q "[mount] uname= (afd=-1)" "$LOG"; then
-    echo "[test_p9_tauth] OK: legacy afd=-1 marker fired"
-else
-    echo "[test_p9_tauth] MISS: legacy afd=-1 marker absent"
-    fail=1
-fi
+# Fixture-side acceptance (one marker per leg + the final PASS).
+check "[p9_tauth] start"                          "fixture ran"
+check "[ptauth:leg-A] afd=-1 do_mount ran"        "leg A: afd=-1 legacy path"
+check "[ptauth:leg-B] verified afd do_mount ran"  "leg B: verified afd authenticated path"
+check "[ptauth:leg-C] unverified afd rejected"    "leg C: unverified afd rejected"
+check "[test_p9_tauth] PASS"                      "fixture reached PASS"
 
-if grep -a -F -q "[mount] uname=live" "$LOG"; then
-    echo "[test_p9_tauth] OK: verified afd marker fired with principal name"
-else
-    echo "[test_p9_tauth] MISS: '[mount] uname=live' absent (afd dropped or wrong name)"
-    fail=1
-fi
-
-if grep -a -F -q "[p9_tauth] unverified afd rejected (expected)" "$LOG"; then
-    echo "[test_p9_tauth] OK: unverified afd was rejected"
-else
-    echo "[test_p9_tauth] MISS: unverified afd was not rejected"
-    fail=1
-fi
-
-if grep -a -F -q "[p9_tauth] PASS" "$LOG"; then
-    echo "[test_p9_tauth] OK: fixture reached PASS"
-else
-    echo "[test_p9_tauth] MISS: PASS line absent"
-    fail=1
-fi
+# Kernel-side acceptance: do_mount's [mount] uname=... printk is the
+# STRUCTURAL signal that afd is no longer silently dropped. The
+# printks are now pre-latched at WARN (sys/src/9/port/syschan.ad
+# imports printk_set_level + PRINTK_LEVEL_WARN) so they survive the
+# post-interactive console-loglevel gate in kernel/printk/printk.ad —
+# INFO is gated to the log buffer once userland is interactive, which
+# silently swallowed the markers in the F10-4 first cut. THAT was the
+# flake: the userland fixture ran cleanly but its kernel-side
+# structural markers never reached the serial log.
+check "[mount] uname= (afd=-1)" \
+      "kernel: legacy uname='' emitted for afd=-1"
+check "[mount] uname=live" \
+      "kernel: verified principal 'live' plumbed into Tattach uname"
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_p9_tauth] FAIL (qemu rc=$rc)"
