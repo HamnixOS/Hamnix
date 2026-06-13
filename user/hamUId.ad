@@ -11824,6 +11824,15 @@ def daemon_pixel(x: int64, y: int64,
 # cached scene pixel during the scanout copy.
 def cursor_pixel_over(x: int64, y: int64,
                       r: Ptr[uint8], g: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # DE perf: when the kernel-overlay cursor is live (KCURSOR_ACTIVE), the
+    # kernel paints the sprite on top of every compositor write — so this
+    # userland inline overlay would just duplicate the arrow (and leave a
+    # stale ghost during slow presents where CUR_X/CUR_Y advanced between
+    # the scene build and the on-the-wire blit). Back off so the kernel
+    # path is the SOLE cursor renderer; the legacy overlay only runs as a
+    # kernel-old fallback (no /dev/fbctl, or CURS unrecognised).
+    if KCURSOR_ACTIVE != 0:
+        return 0
     dx: int64 = x - CUR_X
     dy: int64 = y - CUR_Y
     if dx >= 0 and dy >= 0 and dx < 12 and dy < 12:
@@ -11877,6 +11886,27 @@ fbctl_fd: int32 = -1
 FBCTL_RECT_HDRLEN_HUI: uint64 = 52
 # Scratch for one 52-byte RECT header (little-endian, matches fb_cdev.ad).
 fbctl_rect_hdr: Array[52, uint8]
+# DE-perf cursor decouple: 24-byte CURS header (magic + i32 x + i32 y +
+# u32 visible + u32 flags + u32 _pad). The kernel keeps the cursor sprite
+# + position + saved underlay in fb_cdev.ad; we just push the new pointer
+# coords on every mouse pump so the on-screen cursor advances at mouse-rx
+# cadence even while the compositor's slow path (full present, window
+# drag composite) is in flight on the same thread.
+FBCTL_CURS_MAGIC_HUI:  uint32 = 0x53525543     # 'C','U','R','S' LE
+FBCTL_CURS_HDRLEN_HUI: uint64 = 24
+fbctl_curs_hdr: Array[24, uint8]
+# 1 iff at least one CURS write has been acked by the kernel (proves the
+# decoupled path is live; structural test_de_cursor_decouple asserts it
+# alongside the grep guards).
+FBCTL_CURS_PRESENTS: uint64 = 0
+# Track whether the kernel cursor overlay is in use. When the kernel
+# accepts a CURS write the compositor STOPS overlaying the cursor sprite
+# in scene_blit_rect (cursor_pixel_over) — otherwise both the kernel and
+# userland would paint the arrow, leaving a stale duplicate during slow
+# presents. If the kernel is too old (no CURS support — write returns
+# !=24) the legacy userland overlay takes over again so the cursor never
+# disappears on a kernel-old boot.
+KCURSOR_ACTIVE: int32 = 0
 # Instrumentation: how many RECT presents the kernel has ACKED for us this
 # session (a RECT write returns exactly FBCTL_RECT_HDRLEN_HUI=52 ONLY from
 # the kernel's _fbctl_rect_present handler, so a non-zero count is proof the
@@ -11931,6 +11961,66 @@ def fbctl_present_rect(dst_x: uint64, dst_y: uint64, w: uint64, h: uint64,
         FBCTL_RECT_PRESENTS = FBCTL_RECT_PRESENTS + 1
         return 1
     return 0
+
+
+# ====================================================================
+# DE perf: decouple cursor render from compositor hot path
+# ====================================================================
+# Push the live pointer position to the kernel cursor overlay. The kernel
+# (drivers/video/fb_cdev.ad CURS command) erases the sprite from its old
+# position, snapshots the new underlay, and paints the sprite at the new
+# coords — entirely independent of the compositor's per-frame work. This
+# means even when a slow daemon_present() (full-screen recomposite during
+# a window drag) is in flight, a cursor move that arrived between two
+# pumps WILL have already landed on screen via the kernel path.
+#
+# Wire layout (24 bytes, little-endian — matches FBCTL_CURS_HDRLEN /
+# _fbctl_curs_command in fb_cdev.ad):
+#   +0   u32  magic   = 0x53525543 ('C','U','R','S')
+#   +4   i32  x       cursor x in screen pixels
+#   +8   i32  y       cursor y
+#   +12  u32  visible 0 = hide, 1 = show
+#   +16  u32  flags   reserved (0)
+#   +20  u32  _pad    reserved (0)
+#
+# Returns 1 if the kernel acked the command (KCURSOR_ACTIVE latches to 1
+# so the legacy userland cursor_pixel_over overlay backs off and stops
+# painting a duplicate arrow); 0 if /dev/fbctl is absent or the kernel
+# is too old to recognise CURS (legacy overlay stays on as fallback).
+def _put_i32_le(buf: Ptr[uint8], off: uint64, v: int32):
+    u: uint32 = cast[uint32](v)
+    buf[off]     = cast[uint8](u & 0xff)
+    buf[off + 1] = cast[uint8]((u >> 8) & 0xff)
+    buf[off + 2] = cast[uint8]((u >> 16) & 0xff)
+    buf[off + 3] = cast[uint8]((u >> 24) & 0xff)
+
+
+def kcursor_send(x: int64, y: int64, visible: int32) -> int32:
+    if fbctl_fd < 0:
+        return 0
+    _put_u32_le(&fbctl_curs_hdr[0], 0, FBCTL_CURS_MAGIC_HUI)
+    _put_i32_le(&fbctl_curs_hdr[0], 4, cast[int32](x))
+    _put_i32_le(&fbctl_curs_hdr[0], 8, cast[int32](y))
+    vv: uint32 = 0
+    if visible != 0:
+        vv = 1
+    _put_u32_le(&fbctl_curs_hdr[0], 12, vv)
+    _put_u32_le(&fbctl_curs_hdr[0], 16, 0)
+    _put_u32_le(&fbctl_curs_hdr[0], 20, 0)
+    n: int64 = sys_write(fbctl_fd, &fbctl_curs_hdr[0],
+                         FBCTL_CURS_HDRLEN_HUI)
+    if n == cast[int64](FBCTL_CURS_HDRLEN_HUI):
+        FBCTL_CURS_PRESENTS = FBCTL_CURS_PRESENTS + 1
+        KCURSOR_ACTIVE = 1
+        return 1
+    return 0
+
+
+# Convenience: push the LIVE pointer position (CUR_X/CUR_Y) to the kernel
+# overlay. Called from daemon_pump_mouse on every packet so the kernel
+# cursor tracks at mouse-rx cadence, NOT at compositor present cadence.
+def kcursor_push_live() -> int32:
+    return kcursor_send(CUR_X, CUR_Y, 1)
 
 
 # ====================================================================
@@ -13195,7 +13285,17 @@ def daemon_pump_mouse(scr_w: int64, scr_h: int64) -> int32:
             if i < total:
                 i = i + 1
             if le > ls:
-                changed = daemon_apply_packet(ls, le, scr_w, scr_h) | changed
+                applied: int32 = daemon_apply_packet(ls, le, scr_w, scr_h)
+                # DE perf: decouple cursor render from compositor hot path.
+                # After EVERY packet that updated CUR_X/CUR_Y, push the new
+                # coords to the kernel overlay. This is the load-bearing
+                # latency win: even if the rest of this frame then takes a
+                # full daemon_present() (window drag, popup composite),
+                # the cursor sprite already advanced on scanout via the
+                # kernel write that happened HERE — between two pumps,
+                # before the slow path ran. One small syscall per packet.
+                kcursor_push_live()
+                changed = applied | changed
     return changed
 
 
@@ -26197,6 +26297,14 @@ def fb_console_takeover():
     # AND that the compositor now exclusively owns physical keyboard input.
     write_str(1, "DAEMON console takeover OK (fb-text suspended)\n")
     write_str(1, "DAEMON keyboard ownership grabbed (exclusive)\n")
+    # DE perf: seed the kernel-overlay cursor at the live pointer position
+    # so the very first frame already shows the kernel-painted arrow on
+    # scanout (KCURSOR_ACTIVE then latches and the userland
+    # cursor_pixel_over overlay backs off). If the kernel is too old to
+    # know the CURS command, the write returns !=24 and KCURSOR_ACTIVE
+    # stays 0 — the legacy in-line overlay carries the cursor as before.
+    if kcursor_push_live() != 0:
+        write_str(1, "DAEMON cursor decoupled (kernel overlay)\n")
 
 
 # Restore the boot text console + release the console-input grab on DE

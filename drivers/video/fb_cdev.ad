@@ -160,6 +160,13 @@ def devfb_write(off: uint64, buf: Ptr[uint8], count: uint64) -> int64:
         return -2
     if count == 0:
         return 0
+    # DE-perf cursor decouple: every devfb_write is a compositor blit that
+    # may overlap (and would overwrite) the kernel-overlay cursor sprite.
+    # Erase the sprite first so the OLD saved underlay lands back on screen
+    # before the compositor's pixels arrive; redraw on top after the write
+    # so the cursor stays on top of the freshly-presented frame.
+    was_visible_fb: int32 = kcur_visible
+    _kcursor_erase()
     w: uint64 = fb_get_width()
     h: uint64 = fb_get_height()
     if w == 0 or h == 0:
@@ -184,6 +191,10 @@ def devfb_write(off: uint64, buf: Ptr[uint8], count: uint64) -> int64:
         _fbdev_note_pixel(px, py, r, g, b)
         i = i + 4
         pix = pix + 1
+    # DE-perf cursor decouple: redraw the kernel cursor on top of the
+    # freshly-presented frame (no-op if the cursor was hidden).
+    if was_visible_fb != 0:
+        _kcursor_redraw()
     # Report the whole write as consumed (including any leading/trailing
     # partial-pixel bytes) so a streaming writer advances its cursor by
     # the full count and the next chunk lands at the right offset.
@@ -645,6 +656,315 @@ def _fbctl_rect_present(buf: Ptr[uint8]) -> int64:
     return cast[int64](FBCTL_RECT_HDRLEN)
 
 
+# --- /dev/fbctl : kernel-overlay CURSOR (DE perf: cursor decouple) ---
+#
+# The compositor's main loop renders cursor moves on the same hot path as
+# every other piece of scene work. During a window drag or a heavy popup
+# present the loop can spend hundreds of ms in a full-screen recomposite,
+# and the cursor sprite (a 12x12 arrow overlaid by user/hamUId.ad's
+# cursor_pixel_over during scene_blit_rect) is part of THAT pass — so the
+# pointer freezes whenever anything else is busy.
+#
+# DECOUPLE: lift the cursor sprite into the kernel as an OVERLAY layer
+# that is independent of the compositor's per-frame work. Userland writes
+# ONE 24-byte binary command to /dev/fbctl on every mouse pump:
+#
+#   Header (24 bytes, little-endian):
+#     +0   u32  magic   = 0x53525543  ('C','U','R','S')
+#     +4   i32  x       new cursor x (screen pixels)
+#     +8   i32  y       new cursor y
+#     +12  u32  visible 0 = hide cursor, 1 = show
+#     +16  u32  flags   reserved (must be 0)
+#     +20  u32  _pad
+#
+# The kernel keeps a 12x12 RGBA sprite (initialized once to the arrow
+# bitmap matching the userland cursor_pixel_over mask), the current
+# (kcur_x, kcur_y), and a 12x12 SAVE buffer holding the framebuffer
+# pixels that the sprite is currently covering. On every CURS write:
+#   1. Restore the SAVE buffer to scanout at the OLD position (erase).
+#   2. Snapshot the framebuffer pixels under the NEW position into SAVE.
+#   3. Blit the sprite (with its triangular mask) on top at NEW.
+# That is ~288 framebuffer reads + ~288 writes (regardless of compositor
+# state), runs in one short syscall, and is INDEPENDENT of any present
+# the compositor is doing — so cursor latency = mouse-rx -> CURS write,
+# never blocked by the compositor's slow path.
+#
+# COMPOSITION HOOK: the compositor's RECT and devfb_write paths can
+# OVERWRITE the sprite (the kernel doesn't refuse those blits — that
+# would deadlock layout). So _fbctl_rect_present and devfb_write ERASE
+# the cursor BEFORE the blit (so the saved pixels they restore reflect
+# the OLD compositor frame, not yet-stale overlap), let the blit land,
+# then RE-DRAW the cursor on top by re-snapshotting under the sprite
+# from the freshly-presented frame. Net result: the cursor sprite is
+# always on top of whatever the compositor most recently drew, with the
+# cursor position obeying the latest CURS write (which arrives from the
+# mouse pump independently of the compositor).
+FBCTL_CURS_MAGIC:  uint32 = 0x53525543         # 'C','U','R','S' LE
+FBCTL_CURS_HDRLEN: uint64 = 24
+KCURSOR_SPRITE_PX: uint64 = 12                 # 12 x 12 cursor sprite
+
+# Sprite + save buffer + state. RGBA8888 layout matches the rest of the
+# present pipeline. Sentinel kcur_save_valid==0 means "no pixels saved
+# yet" (first draw, or after erase).
+kcur_sprite_init: int32 = 0
+kcur_sprite:      Array[576, uint8]            # 12*12*4 RGBA
+kcur_sprite_mask: Array[144, uint8]            # 1 = opaque pixel, 0 = transparent
+kcur_save:        Array[576, uint8]            # pixels under the sprite
+kcur_save_valid:  int32 = 0
+kcur_save_x:      int64 = 0
+kcur_save_y:      int64 = 0
+kcur_x:           int64 = 0
+kcur_y:           int64 = 0
+kcur_visible:     int32 = 0
+# Instrumentation: how many CURS commands the kernel has serviced. A
+# non-zero count proves the decoupled path ran end-to-end (userland ->
+# kernel write -> sprite redraw on scanout), without needing a screendump.
+kcur_commands:    uint64 = 0
+
+
+def kcursor_command_count() -> uint64:
+    return kcur_commands
+
+
+def kcursor_visible() -> int32:
+    return kcur_visible
+
+
+def kcursor_get_x() -> int64:
+    return kcur_x
+
+
+def kcursor_get_y() -> int64:
+    return kcur_y
+
+
+def _kcursor_init_sprite():
+    # Build the same 12x12 down-right arrow the userland cursor_pixel_over
+    # used to draw inline: triangle mask dx<=dy, with a white outline at
+    # dx==dy, dy==11, dx==0; black fill elsewhere; transparent outside.
+    # Done once, lazily, so a kernel that never sees a CURS write pays no
+    # memory init cost.
+    if kcur_sprite_init != 0:
+        return
+    dy: int64 = 0
+    while dy < 12:
+        dx: int64 = 0
+        while dx < 12:
+            mi: uint64 = cast[uint64](dy * 12 + dx)
+            so: uint64 = mi * 4
+            if dx <= dy:
+                kcur_sprite_mask[mi] = 1
+                if dx == dy or dy == 11 or dx == 0:
+                    kcur_sprite[so]     = 255
+                    kcur_sprite[so + 1] = 255
+                    kcur_sprite[so + 2] = 255
+                else:
+                    kcur_sprite[so]     = 0
+                    kcur_sprite[so + 1] = 0
+                    kcur_sprite[so + 2] = 0
+                kcur_sprite[so + 3] = 255
+            else:
+                kcur_sprite_mask[mi] = 0
+                kcur_sprite[so]     = 0
+                kcur_sprite[so + 1] = 0
+                kcur_sprite[so + 2] = 0
+                kcur_sprite[so + 3] = 0
+            dx = dx + 1
+        dy = dy + 1
+    kcur_sprite_init = 1
+
+
+# Read one 32-bit framebuffer pixel at (sx, sy) into (r, g, b). Honours the
+# hardware pixel order so the SAVE buffer holds true RGB bytes (the
+# sprite's mask path then composes on top via fb_present_rgba_row, the
+# canonical store helper, keeping the RGBA->FB pack identical to every
+# other present). Returns 0 if the pixel is on-screen and read, else 1.
+def _kcursor_fb_read_pixel(sx: uint64, sy: uint64,
+                           r: Ptr[uint8], g: Ptr[uint8],
+                           b: Ptr[uint8]) -> int32:
+    if fb_get_initialized() == 0:
+        return 1
+    w: uint64 = fb_get_width()
+    h: uint64 = fb_get_height()
+    if sx >= w or sy >= h:
+        return 1
+    base: uint64 = fb_get_base()
+    if base == 0:
+        return 1
+    pitch: uint64 = fb_get_pitch()
+    bpp: uint64 = fb_get_bpp()
+    if bpp == 32:
+        off: uint64 = sy * pitch + sx * 4
+        pix: uint32 = cast[Ptr[uint32]](base + off)[0]
+        if fb_get_pixfmt() == FB_PIXFMT_RGB:
+            r[0] = cast[uint8](pix & 0xff)
+            g[0] = cast[uint8]((pix >> 8) & 0xff)
+            b[0] = cast[uint8]((pix >> 16) & 0xff)
+        else:
+            b[0] = cast[uint8](pix & 0xff)
+            g[0] = cast[uint8]((pix >> 8) & 0xff)
+            r[0] = cast[uint8]((pix >> 16) & 0xff)
+        return 0
+    # 24bpp fallback: 3 bytes per pixel (B, G, R per fb_present_rgba_row).
+    off2: uint64 = sy * pitch + sx * 3
+    b[0] = cast[Ptr[uint8]](base + off2)[0]
+    g[0] = cast[Ptr[uint8]](base + off2 + 1)[0]
+    r[0] = cast[Ptr[uint8]](base + off2 + 2)[0]
+    return 0
+
+
+# Snapshot the 12x12 framebuffer pixels at (x0, y0) into kcur_save. After
+# this _kcursor_paint() can blit the sprite on top, and _kcursor_erase()
+# can later restore the exact bits we covered (so the cursor can move
+# without leaving an arrow-shaped scar).
+def _kcursor_save_under(x0: int64, y0: int64):
+    if fb_get_initialized() == 0:
+        return
+    rr: Array[1, uint8]
+    gg: Array[1, uint8]
+    bb: Array[1, uint8]
+    dy: int64 = 0
+    while dy < 12:
+        dx: int64 = 0
+        while dx < 12:
+            so: uint64 = cast[uint64](dy * 12 + dx) * 4
+            sx: int64 = x0 + dx
+            sy: int64 = y0 + dy
+            if sx >= 0 and sy >= 0:
+                if _kcursor_fb_read_pixel(cast[uint64](sx),
+                                          cast[uint64](sy),
+                                          &rr[0], &gg[0], &bb[0]) == 0:
+                    kcur_save[so]     = rr[0]
+                    kcur_save[so + 1] = gg[0]
+                    kcur_save[so + 2] = bb[0]
+                    kcur_save[so + 3] = 255
+                else:
+                    # Off-screen pixel: store a transparent marker (alpha 0)
+                    # so _kcursor_restore_under leaves the FB alone here.
+                    kcur_save[so + 3] = 0
+            else:
+                kcur_save[so + 3] = 0
+            dx = dx + 1
+        dy = dy + 1
+    kcur_save_x = x0
+    kcur_save_y = y0
+    kcur_save_valid = 1
+
+
+# Restore the saved 12x12 underlay back to scanout. No-op if no save has
+# been taken since the last erase. Per-pixel store via fb_present_rgba_row
+# (the SAME conversion helper every other present uses) keeps the RGBA->FB
+# pack identical to a normal compositor write.
+def _kcursor_restore_under():
+    if kcur_save_valid == 0:
+        return
+    if fb_get_initialized() == 0:
+        return
+    w: uint64 = fb_get_width()
+    h: uint64 = fb_get_height()
+    dy: int64 = 0
+    while dy < 12:
+        sy: int64 = kcur_save_y + dy
+        if sy >= 0 and sy < cast[int64](h):
+            dx: int64 = 0
+            while dx < 12:
+                sx: int64 = kcur_save_x + dx
+                so: uint64 = cast[uint64](dy * 12 + dx) * 4
+                if sx >= 0 and sx < cast[int64](w) \
+                   and kcur_save[so + 3] != 0:
+                    # 1-pixel row through the canonical store helper.
+                    fb_present_rgba_row(0, cast[uint64](sx),
+                                        cast[uint64](sy), 1,
+                                        &kcur_save[so], 1)
+                dx = dx + 1
+        dy = dy + 1
+    kcur_save_valid = 0
+
+
+# Composite the cursor sprite onto scanout at (x0, y0). Caller has already
+# snapshotted the underlay via _kcursor_save_under. Only masked pixels of
+# the sprite are stored (the arrow body); transparent pixels leave the FB
+# alone, so the cursor is a true alpha-keyed sprite over the saved pixels.
+def _kcursor_paint(x0: int64, y0: int64):
+    if fb_get_initialized() == 0:
+        return
+    w: uint64 = fb_get_width()
+    h: uint64 = fb_get_height()
+    dy: int64 = 0
+    while dy < 12:
+        sy: int64 = y0 + dy
+        if sy >= 0 and sy < cast[int64](h):
+            dx: int64 = 0
+            while dx < 12:
+                sx: int64 = x0 + dx
+                mi: uint64 = cast[uint64](dy * 12 + dx)
+                if sx >= 0 and sx < cast[int64](w) \
+                   and kcur_sprite_mask[mi] != 0:
+                    so: uint64 = mi * 4
+                    fb_present_rgba_row(0, cast[uint64](sx),
+                                        cast[uint64](sy), 1,
+                                        &kcur_sprite[so], 1)
+                dx = dx + 1
+        dy = dy + 1
+
+
+# Erase the cursor sprite from scanout (restore the saved underlay). Used
+# both by the CURS-move path (before moving to a new position) and by the
+# composition hook (so a compositor blit lands on the un-occluded frame
+# rather than over the sprite). Safe to call when nothing is drawn.
+def _kcursor_erase():
+    if kcur_visible == 0:
+        return
+    _kcursor_restore_under()
+
+
+# Re-draw the cursor sprite at the CURRENT (kcur_x, kcur_y), snapshotting
+# the underlay from whatever the compositor most recently presented. Used
+# by the composition hook AFTER a blit so the sprite stays on top.
+def _kcursor_redraw():
+    if kcur_visible == 0:
+        return
+    _kcursor_init_sprite()
+    _kcursor_save_under(kcur_x, kcur_y)
+    _kcursor_paint(kcur_x, kcur_y)
+
+
+# Decode a 24-byte CURS command from a kernel buffer and apply it.
+# Returns FBCTL_CURS_HDRLEN bytes consumed (always, so a streaming writer
+# never wedges). A degenerate position (off-screen) is accepted and the
+# sprite simply clips — never an error.
+def _fbctl_curs_command(buf: Ptr[uint8]) -> int64:
+    if fb_get_initialized() == 0:
+        return cast[int64](FBCTL_CURS_HDRLEN)
+    nx: int32 = cast[Ptr[int32]](&buf[4])[0]
+    ny: int32 = cast[Ptr[int32]](&buf[8])[0]
+    vis: uint32 = cast[Ptr[uint32]](&buf[12])[0]
+    _kcursor_init_sprite()
+    # Erase whatever is currently drawn first (so the OLD save bits land
+    # back on screen before we move).
+    if kcur_visible != 0:
+        _kcursor_restore_under()
+    kcur_x = cast[int64](nx)
+    kcur_y = cast[int64](ny)
+    if vis != 0:
+        kcur_visible = 1
+        _kcursor_save_under(kcur_x, kcur_y)
+        _kcursor_paint(kcur_x, kcur_y)
+    else:
+        kcur_visible = 0
+    kcur_commands = kcur_commands + 1
+    return cast[int64](FBCTL_CURS_HDRLEN)
+
+
+def _fbctl_is_curs(buf: Ptr[uint8], count: uint64) -> int32:
+    if count < FBCTL_CURS_HDRLEN:
+        return 0
+    magic: uint32 = cast[Ptr[uint32]](&buf[0])[0]
+    if magic == FBCTL_CURS_MAGIC:
+        return 1
+    return 0
+
+
 def devfbctl_write(off: uint64, buf: Ptr[uint8], count: uint64) -> int64:
     if count == 0:
         return 0
@@ -654,7 +974,18 @@ def devfbctl_write(off: uint64, buf: Ptr[uint8], count: uint64) -> int64:
     # not ASCII — the two can never be confused. Backward compatible: a
     # caller that never emits a RECT command sees identical behaviour.
     if _fbctl_is_rect(buf, count) != 0:
-        return _fbctl_rect_present(buf)
+        # DE-perf cursor decouple: erase the kernel cursor BEFORE the blit
+        # so the saved underlay reflects the OLD compositor frame, not the
+        # sprite. Then re-draw on top AFTER the blit so the cursor sits on
+        # the freshly-presented pixels.
+        was_visible: int32 = kcur_visible
+        _kcursor_erase()
+        rv: int64 = _fbctl_rect_present(buf)
+        if was_visible != 0:
+            _kcursor_redraw()
+        return rv
+    if _fbctl_is_curs(buf, count) != 0:
+        return _fbctl_curs_command(buf)
     susp: Array[8, uint8]
     susp[0] = 115                                    # 's'
     susp[1] = 117                                    # 'u'
