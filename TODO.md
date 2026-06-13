@@ -98,9 +98,9 @@ cleanly** (per #459 above). When that's clear:
   already in main (verified during a); (c) image+dirty-rect wire format
   SPEC landed (40-line block at top of devwsys.ad), implementation
   across devwsys+hamUId+lib/hamui deferred to next increment.
-- [~] **Basic apps** — terminal+file browser landed earlier; Snake +
-  2048 menu-wired `5dd8b01b` (hamsnake/ham2048 binaries already existed,
-  added Applications-menu "Games" category). Remaining: text editor.
+- [x] **Basic apps** — terminal+file browser landed earlier; Snake +
+  2048 menu-wired `5dd8b01b`; text editor `hamedit` menu-wired
+  `10e8dda5` (binary already existed).
 - [ ] **hamsh `use hamui`** — bindings; may need hamsh closures +
   event loop + persistent state.
 - [ ] Per-window namespace + elevation visible in `uid` / `ns` files
@@ -113,9 +113,10 @@ cleanly** (per #459 above). When that's clear:
 Remaining hamUId.ad-touching items (single 25k-line file, serialize
 to avoid merge collisions): Display/Mouse/keyboard-layout settings
 panels, external notification + system-tray client-registration API,
-image wallpaper, screensaver+password-lock, real session save/restore,
-inter-app drag-and-drop. PDF viewer (atril) deferred (needs font/PDF
-stack).
+screensaver+password-lock, real session save/restore, inter-app
+drag-and-drop. Image wallpaper landed `49b54267` (PPM loader + `/dev/
+wsys/ctl wallpaper <path>` verb + `/etc/wallpaper.ppm` autoload). PDF
+viewer (atril) deferred (needs font/PDF stack).
 
 > **ARM64 deprioritized below desktop work (user 2026-06-10).** Phase
 > 50 preserved on `worktree-agent-a48facf53ef25a377` (`6f217d09`), NOT
