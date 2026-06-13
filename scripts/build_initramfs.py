@@ -314,6 +314,14 @@ if os.environ.get("ENABLE_NETCFG_SMOKE") == "1":
 if os.environ.get("ENABLE_IPV6_SELFTEST") == "1":
     FILES.append(("/etc/ipv6-test", b"1\n"))
 
+# §10 unicast ARP helper + ICMP time-exceeded + redirect selftest.
+# scripts/test_net_arp_icmp_helpers.sh sets ENABLE_NAI_HELPERS_TEST=1
+# to plant /etc/net-arp-icmp-helpers-test; tests/net_smoke.ad's
+# _nai_marker_present() gate then calls net_arp_icmp_helpers_selftest()
+# during net_smoke_test.
+if os.environ.get("ENABLE_NAI_HELPERS_TEST") == "1":
+    FILES.append(("/etc/net-arp-icmp-helpers-test", b"1\n"))
+
 # xHCI V1/V2 synthetic transfer-engine selftests. Gated the same way as
 # the markers above — see init/main.ad's xhci_marker_found gate. The
 # selftests forge Event-Ring state that real silicon won't agree with
