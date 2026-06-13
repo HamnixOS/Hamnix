@@ -163,8 +163,11 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
 - [ ] Layer-2 `/proc → /dev` translation as a namespace bind (retire
   `_u_translate_proc_to_dev` string-rewrite).
 - [ ] Union mounts MBEFORE/MAFTER (flag recorded; longest-prefix only).
-- [ ] `create(260)` DMDIR → real directory create.
-- [ ] `stat`/`fstat` per-backend hooks.
+- [x] `create(260)` DMDIR — already routed through `vfs_mkdir`; test
+  coverage added `47ab21c5`.
+- [~] `stat`/`fstat` per-backend hooks — path-keyed `do_stat` migrated
+  to F10-2-shape hook table `47ab21c5`. `do_fstat` already per-backend
+  inline; per-server hook migration deferred.
 - [x] `fd2path` exact open()-time path — landed `9f9d9db3`.
 - [x] `wstat` length/mtime/mode — already in `_apply_wstat` (verified +
   tested `9f9d9db3`). gid/muid still rejected with errstr; needs
