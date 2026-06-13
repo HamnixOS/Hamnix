@@ -1378,6 +1378,27 @@ if os.environ.get("ENABLE_CACHESTAT_TEST"):
     _cs_data = bytes(((i * 31 + 7) & 0xFF) for i in range(_cs_len))
     FILES.append(("/etc/cachestat-data", _cs_data))
 
+# openat2(2) (nr 437) + new-mount-API (open_tree/move_mount/fsopen/fsconfig/
+# fsmount/fspick) self-test. scripts/test_mount_api.sh sets ENABLE_MOUNT_API_TEST=1
+# to plant /etc/mount-api-test (the gate marker) AND two source-subtree fixtures
+# the test grafts into the namespace:
+#   /mnt_src/hello.txt = "MOUNTAPI-OK\n"   (proves a real bind makes the file
+#                                            visible at the bound target)
+#   /mnt_src/only.txt  = "ONLY\n"          (proves open_tree-clone + move_mount)
+# init/main.ad at boot:37.mountapi detects the marker and calls
+# mount_api_selftest() (linux_abi/u_mountapi.ad): it drives openat2's RESOLVE_*
+# path-restriction bits against the REAL resolver (NO_SYMLINKS/BENEATH/EXDEV +
+# the extensible-struct size contract) and the full fd-driven mount flow
+# (fsopen -> fsconfig source -> fsmount -> move_mount), grafting a REAL Plan-9
+# namespace bind via mnttab_bind so an openat2 of /mnt_dst/hello.txt resolves to
+# the /mnt_src source subtree, then reads back "MOUNTAPI-OK". Pure in-RAM. The
+# /mnt_dst and /mnt_clone targets are NOT planted — they only exist as namespace
+# binds the test creates. Default boots omit all of these files.
+if os.environ.get("ENABLE_MOUNT_API_TEST"):
+    FILES.append(("/etc/mount-api-test", b"1\n"))
+    FILES.append(("/mnt_src/hello.txt", b"MOUNTAPI-OK\n"))
+    FILES.append(("/mnt_src/only.txt", b"ONLY\n"))
+
 # ENABLE_PROCESS_VM_TEST=1 to plant /etc/process-vm-test. init/main.ad at
 # boot:37.process_vm detects the marker and calls process_vm_selftest()
 # (linux_abi/u_process_vm.ad): it builds a real SECOND address space (a fresh
@@ -1871,6 +1892,21 @@ if os.environ.get("ENABLE_EXT4_HTINS_TEST") == "1":
 # the mounted image, so opt-in via the marker; default boots omit it.
 if os.environ.get("ENABLE_EXT4_LARGEDIR_TEST") == "1":
     FILES.append(("/etc/ext4-largedir-test", b"1\n"))
+
+# Combined truncate-of-index-node + linear->htree directory growth self-test.
+# scripts/test_ext4_dirgrow.sh sets ENABLE_EXT4_DIRGROW_TEST=1 to plant
+# /etc/ext4-dirgrow-test. init/main.ad detects the marker after the ext4
+# mount and calls ext4_dirgrow_selftest() (fs/ext4.ad): (A) builds a
+# fragmented file forcing extent depth >= 1, truncates it back to one
+# block, asserts the tree folded to depth 0, the surviving block bytes
+# are intact, and the free-block count rose by at least the freed data-
+# block count; (B) mkdirs a fresh subdir of root, inserts files until the
+# linear block overflows and triggers _ext4_convert_linear_to_htree, then
+# asserts EXT4_INDEX_FL is set and every name resolves through the
+# standard lookup. WRITES the mounted image, so opt-in via the marker;
+# default boots omit it so it never fires.
+if os.environ.get("ENABLE_EXT4_DIRGROW_TEST") == "1":
+    FILES.append(("/etc/ext4-dirgrow-test", b"1\n"))
 
 # ext4 extent-FREE / no-leak self-test. scripts/test_ext4_extent_free.sh
 # sets ENABLE_EXT4EXTFREE_TEST=1 to plant /etc/ext4extfree-test.

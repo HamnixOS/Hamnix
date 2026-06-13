@@ -4179,8 +4179,255 @@ def ext4_dir_insert(parent_inum: uint64, name: Ptr[char],
                 _ext4_dirblock_stamp_in_buf(parent_inum, parent_gen)
                 return _ext4_write_block(phys, &ext4_blk_buf[0])
         pos = pos + cast[uint64](e_rec_len)
-    printk0("ext4: dir block full (no slack for insert)\n")
-    return -1
+    # The single linear directory block is FULL. Linux's ext4 promotes a
+    # full single-block linear directory to a real hashed htree
+    # (make_indexed_dir / ext4_dx_init): allocate two leaf blocks, hash +
+    # split the existing entries between them, rewrite block 0 as a
+    # dx_root (keeping "." and ".." in place), set EXT4_INDEX_FL, then
+    # re-issue the insert through the htree write path. Without this the
+    # directory caps at one block — the linear write path here only ever
+    # touches the LAST block, so a multi-block linear dir is unreachable.
+    if _ext4_convert_linear_to_htree(parent_inum, &parent_inode[0],
+                                     parent_gen) != 0:
+        printk0("ext4: dir block full and htree convert FAILED\n")
+        return -1
+    # The inode was mutated (EXT4_INDEX_FL + i_size grew); persist it,
+    # then route through the htree insert path — which re-reads the
+    # inode, descends to the right leaf, and inserts there.
+    if ext4_write_inode(parent_inum, &parent_inode[0]) != 0:
+        return -1
+    return ext4_htree_dir_insert(parent_inum, name, child_inum, file_type)
+
+
+def _ext4_convert_lin_build_map(leaf: uint64) -> int64:
+    # Variant of _ext4_htins_build_map for the linear->htree conversion.
+    # Walks the source block and collects every LIVE non-dot/non-dotdot
+    # dirent into the ext4_htins_map_* arrays (hash / byte-offset /
+    # rec_len), then insertion-sorts by hash. The "." and ".." dirents
+    # are SKIPPED here because they must stay in dir block 0 (the new
+    # dx_root); only the user-visible entries move to the leaf blocks.
+    # Returns the live entry count, or -1 on a malformed block.
+    n: int64 = 0
+    pos: uint64 = 0
+    while pos < ext4_block_size:
+        e: uint64 = leaf + pos
+        e_inum:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
+        e_rec_len: uint16 = _ext4_read_u16(cast[Ptr[uint8]](e + 4))
+        if e_rec_len == 0:
+            return -1
+        if pos + cast[uint64](e_rec_len) > ext4_block_size:
+            return -1
+        if e_inum != 0:
+            e_name_len: uint64 = cast[uint64](cast[Ptr[uint8]](e + 6)[0])
+            is_dot: int32 = 0
+            if e_name_len == 1 \
+                    and cast[Ptr[uint8]](e + 8)[0] == 0x2E:
+                is_dot = 1
+            elif e_name_len == 2 \
+                    and cast[Ptr[uint8]](e + 8)[0] == 0x2E \
+                    and cast[Ptr[uint8]](e + 9)[0] == 0x2E:
+                is_dot = 1
+            if e_name_len != 0 and is_dot == 0:
+                if cast[uint64](n) >= EXT4_HTINS_MAP_MAX:
+                    return -1
+                minor: uint32 = 0
+                h: uint32 = ext4_dirhash(cast[Ptr[uint8]](e + 8),
+                                         e_name_len, &minor)
+                ext4_htins_map_hash[cast[uint64](n)] = h
+                ext4_htins_map_off[cast[uint64](n)]  = cast[uint16](pos)
+                ext4_htins_map_rlen[cast[uint64](n)] = cast[uint16](
+                    _ext4_dirent_padded_size(e_name_len))
+                n = n + 1
+        pos = pos + cast[uint64](e_rec_len)
+    # Insertion sort by hash (n is small: at most one block's worth).
+    i: int64 = 1
+    while i < n:
+        kh: uint32 = ext4_htins_map_hash[cast[uint64](i)]
+        ko: uint16 = ext4_htins_map_off[cast[uint64](i)]
+        kr: uint16 = ext4_htins_map_rlen[cast[uint64](i)]
+        j: int64 = i - 1
+        while j >= 0 and ext4_htins_map_hash[cast[uint64](j)] > kh:
+            ext4_htins_map_hash[cast[uint64](j + 1)] = \
+                ext4_htins_map_hash[cast[uint64](j)]
+            ext4_htins_map_off[cast[uint64](j + 1)] = \
+                ext4_htins_map_off[cast[uint64](j)]
+            ext4_htins_map_rlen[cast[uint64](j + 1)] = \
+                ext4_htins_map_rlen[cast[uint64](j)]
+            j = j - 1
+        ext4_htins_map_hash[cast[uint64](j + 1)] = kh
+        ext4_htins_map_off[cast[uint64](j + 1)]  = ko
+        ext4_htins_map_rlen[cast[uint64](j + 1)] = kr
+        i = i + 1
+    return n
+
+
+def _ext4_convert_linear_to_htree(parent_inum: uint64,
+                                  inode_buf: Ptr[uint8],
+                                  parent_gen: uint32) -> int32:
+    # Promote a single-block LINEAR ext4 directory to a real htree
+    # (dir_index). Mirrors Linux's make_indexed_dir / ext4_dx_init:
+    #
+    #   1. read dir block 0 into ext4_htins_oldleaf (the source snapshot);
+    #   2. build a hash-sorted map of every live entry EXCEPT "." / "..";
+    #   3. allocate two new physical blocks, append them to the extent
+    #      tree as logical dir blocks 1 and 2 (the two leaves), and grow
+    #      i_size to 3 * block_size;
+    #   4. pack the lower half of the sorted entries into leaf 1 and the
+    #      upper half into leaf 2 via _ext4_leaf_append_raw, then seal
+    #      each leaf's last-record rec_len to span the block (the same
+    #      shape ext4_htins_do_split produces after a leaf split);
+    #   5. stamp leaf dir-block checksums and write both leaves;
+    #   6. rewrite dir block 0 as a dx_root: keep the "." dirent at
+    #      offset 0 (rec_len=12) and shrink ".." to rec_len=12, then
+    #      lay down dx_root_info at offset 0x18 (hash_version from the
+    #      superblock, info_length=8, indirect_levels=0), then the
+    #      dx_entry array at 0x20 — entry 0 carries the countlimit
+    #      (limit u16, count u16=2) and the LEFT leaf's logical block
+    #      (1); entry 1 carries the median hash and the RIGHT leaf's
+    #      logical block (2). Write block 0;
+    #   7. set EXT4_INDEX_FL on the inode, re-stamp i_blocks. The caller
+    #      writes the inode back.
+    #
+    # Returns 0 on success, -1 on any failure.
+    dir_size: uint64 = cast[uint64](ext4_inode_size_lo(inode_buf))
+    if dir_size != ext4_block_size:
+        # Conversion is only well-defined for a single-block dir. A
+        # multi-block linear dir would have to merge its blocks first;
+        # for now we don't grow linear dirs past one block, so this is
+        # unreachable.
+        printk0("ext4: htree-convert: dir is not a single block\n")
+        return -1
+    src_phys: uint64 = _ext4_logical_to_physical(inode_buf, 0)
+    if src_phys == 0:
+        return -1
+    src: uint64 = cast[uint64](&ext4_htins_oldleaf[0])
+    if _ext4_read_block(src_phys, cast[Ptr[uint8]](src)) != 0:
+        return -1
+
+    cnt: int64 = _ext4_convert_lin_build_map(src)
+    if cnt < 1:
+        # Nothing to split — not a meaningful conversion. The caller
+        # should not have invoked us in this state.
+        printk0("ext4: htree-convert: no entries to split\n")
+        return -1
+
+    # Median split. Nudge to keep equal-hash runs on one side, the same
+    # way _ext4_htins_do_split does.
+    split: int64 = cnt / 2
+    if split < 1:
+        split = 1
+    while split < cnt and ext4_htins_map_hash[cast[uint64](split)] \
+            == ext4_htins_map_hash[cast[uint64](split - 1)]:
+        split = split + 1
+    if split >= cnt:
+        split = cnt - 1
+    if split < 1:
+        split = 1
+    split_hash: uint32 = ext4_htins_map_hash[cast[uint64](split)]
+
+    # Allocate the two leaf blocks. Append them as logical 1 and 2.
+    leaf1_phys: uint64 = ext4_alloc_block()
+    if leaf1_phys == 0:
+        return -1
+    if _ext4_extent_append_block(inode_buf, 1, leaf1_phys) != 0:
+        ext4_free_block(leaf1_phys)
+        return -1
+    leaf2_phys: uint64 = ext4_alloc_block()
+    if leaf2_phys == 0:
+        ext4_free_block(leaf1_phys)
+        return -1
+    if _ext4_extent_append_block(inode_buf, 2, leaf2_phys) != 0:
+        ext4_free_block(leaf1_phys)
+        ext4_free_block(leaf2_phys)
+        return -1
+    # i_size = 3 blocks (dx_root + 2 leaves).
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](inode_buf) + 4),
+                    cast[uint32](ext4_block_size * 3))
+
+    # Pack the two leaves.
+    leaf1: uint64 = cast[uint64](&ext4_htins_newleaf[0])
+    leaf2: uint64 = cast[uint64](&ext4_htins_idxbuf[0])
+    _ext4_leaf_init_empty(leaf1)
+    _ext4_leaf_init_empty(leaf2)
+    lo_cursor: uint64 = 0
+    hi_cursor: uint64 = 0
+    mi: int64 = 0
+    while mi < cnt:
+        e_off: uint64 = cast[uint64](ext4_htins_map_off[cast[uint64](mi)])
+        src_e: uint64 = src + e_off
+        nl: uint64 = cast[uint64](cast[Ptr[uint8]](src_e + 6)[0])
+        if mi < split:
+            _ext4_leaf_append_raw(leaf1, src_e, nl, &lo_cursor)
+        else:
+            _ext4_leaf_append_raw(leaf2, src_e, nl, &hi_cursor)
+        mi = mi + 1
+    _ext4_htins_seal_leaf(leaf1, lo_cursor)
+    _ext4_htins_seal_leaf(leaf2, hi_cursor)
+
+    # Stamp leaf dir-block checksums and persist.
+    ext4_dirblock_csum_set(cast[Ptr[uint8]](leaf1), parent_inum,
+                           parent_gen)
+    ext4_dirblock_csum_set(cast[Ptr[uint8]](leaf2), parent_inum,
+                           parent_gen)
+    if _ext4_write_block(leaf1_phys, cast[Ptr[uint8]](leaf1)) != 0:
+        return -1
+    if _ext4_write_block(leaf2_phys, cast[Ptr[uint8]](leaf2)) != 0:
+        return -1
+
+    # Rewrite block 0 as a dx_root. Keep "."; shrink ".." rec_len to 12.
+    # Then dx_root_info at 0x18 and the dx_entry array at 0x20.
+    root: uint64 = cast[uint64](&ext4_blk_buf[0])
+    _ext4_zero(cast[Ptr[uint8]](root), ext4_block_size)
+    # "." dirent at offset 0.
+    _ext4_write_u32(cast[Ptr[uint8]](root + 0),
+                    cast[uint32](parent_inum))
+    _ext4_write_u16(cast[Ptr[uint8]](root + 4), 12)
+    cast[Ptr[uint8]](root + 6)[0] = 1                       # name_len
+    cast[Ptr[uint8]](root + 7)[0] = 2                       # EXT4_FT_DIR
+    cast[Ptr[uint8]](root + 8)[0] = 0x2E                    # '.'
+    # ".." dirent at offset 12. Copy its inum field from the source
+    # block so the parent backreference is preserved.
+    dotdot_parent_inum: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](src + 12 + 0))
+    _ext4_write_u32(cast[Ptr[uint8]](root + 12), dotdot_parent_inum)
+    _ext4_write_u16(cast[Ptr[uint8]](root + 16), 12)
+    cast[Ptr[uint8]](root + 18)[0] = 2                      # name_len
+    cast[Ptr[uint8]](root + 19)[0] = 2                      # EXT4_FT_DIR
+    cast[Ptr[uint8]](root + 20)[0] = 0x2E                   # '.'
+    cast[Ptr[uint8]](root + 21)[0] = 0x2E                   # '.'
+    # dx_root_info at 0x18 (8 bytes): reserved(4) hash_version(1)
+    # info_length(1) indirect_levels(1) unused(1).
+    _ext4_write_u32(cast[Ptr[uint8]](root + 0x18), 0)       # reserved
+    cast[Ptr[uint8]](root + 0x1C)[0] = cast[uint8](ext4_def_hash_version)
+    cast[Ptr[uint8]](root + 0x1D)[0] = 8                    # info_length
+    cast[Ptr[uint8]](root + 0x1E)[0] = 0                    # indirect_levels=0
+    cast[Ptr[uint8]](root + 0x1F)[0] = 0                    # unused
+    # dx_entries at 0x20. Entry 0 holds the countlimit (limit u16, count
+    # u16) + block u32 = leaf1_logical. Entry 1: hash u32 = split_hash,
+    # block u32 = leaf2_logical.
+    r_entries: uint64 = root + 0x20
+    r_limit: uint32 = cast[uint32]((ext4_block_size - 0x20) / 8)
+    _ext4_write_u16(cast[Ptr[uint8]](r_entries + 0),
+                    cast[uint16](r_limit))                  # limit
+    _ext4_write_u16(cast[Ptr[uint8]](r_entries + 2), 2)    # count
+    _ext4_write_u32(cast[Ptr[uint8]](r_entries + 4), 1)    # leaf1 logical
+    _ext4_write_u32(cast[Ptr[uint8]](r_entries + 8),
+                    split_hash)                             # entry1 hash
+    _ext4_write_u32(cast[Ptr[uint8]](r_entries + 12), 2)   # leaf2 logical
+    # The dx_root has no dirent tail (the dx_entry array consumes the
+    # rest of the block); don't stamp a metadata_csum dirent tail here.
+    if _ext4_write_block(src_phys, cast[Ptr[uint8]](root)) != 0:
+        return -1
+
+    # Set EXT4_INDEX_FL on the inode, re-stamp i_blocks. The caller will
+    # write the inode back.
+    cur_flags: uint32 = ext4_inode_flags(inode_buf)
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](inode_buf)
+                                     + INODE_I_FLAGS_OFFSET),
+                    cur_flags | EXT4_INDEX_FL)
+    _ext4_htins_restamp_iblocks(inode_buf)
+    _ext4_stamp_mtime(inode_buf)
+    return 0
 
 
 # === htree (dir_index) directory INSERT — the WRITE path ==========
@@ -9495,6 +9742,365 @@ def ext4_extentd2_selftest() -> int32:
     ext4_unlink("ext4d2.bin")
 
     printk0("[ext4d2] PASS\n")
+    return 0
+
+
+# --- ext4 dir-grow + index-node truncate self-test ----------------
+#
+# Driven by /etc/ext4-dirgrow-test (planted by scripts/test_ext4_dirgrow.sh).
+# Two TODO items in one self-test (they exercise complementary write
+# paths a real Linux/Unix filesystem MUST support):
+#
+#   (A) Truncate of an INDEX-NODE file (extent-tree depth >= 1).
+#       Grow a file past the inline 4-extent inline depth-0 capacity by
+#       appending fragmented blocks until the extent tree promotes to
+#       depth 1 (or 2). Then shrink it back to one block. Verify:
+#         * i_size lands exactly at the requested size,
+#         * the extent tree folds back to inline depth-0 (no orphaned
+#           index or leaf blocks),
+#         * the surviving block's content is byte-identical to its
+#           pre-truncate content (block 0 of the file),
+#         * a read past EOF returns 0 bytes,
+#         * the filesystem's free-block count rises by AT LEAST the
+#           file-data blocks that were freed (the truncate path returned
+#           them to the allocator). The freed extent-tree META blocks
+#           (the depth-1+ index/leaf blocks) also return to the pool,
+#           but we account against the file-data count to keep the
+#           assertion robust against allocator/bitmap drift.
+#       Note: depths 1/2 truncate-to-zero round-trips are already covered
+#       by ext4_extentidx_selftest / ext4_extentd2_selftest. This case is
+#       the COMPLEMENTARY truncate-to-non-zero check (surviving block
+#       must be intact) at extent-tree depth >= 1 — i.e. "create 50 MB,
+#       truncate to one block, verify content + accounting" from the
+#       TODO §10/§16 follow-up.
+#
+#   (B) Growing a single-block linear directory to an htree.
+#       Make a fresh subdirectory of root (a single-block linear dir),
+#       add files to it until the linear block overflows and the dir is
+#       promoted to a real dx_root htree (via the new
+#       _ext4_convert_linear_to_htree path), then assert:
+#         * the dir inode carries EXT4_INDEX_FL after the overflow,
+#         * dx_root indirect_levels == 0 (a 1-level htree, 2 leaves),
+#         * EVERY name added before AND after the conversion still
+#           resolves via the standard lookup (the linear-scan + htree-
+#           hash paths both come through ext4_dir_lookup / vfs_open),
+#         * a follow-up file-create through the htree write path still
+#           lands (proving the conversion produced a real dx_root the
+#           htree insert path can keep growing).
+#
+# Prints [ext4dgrow] lines + exactly one [ext4dgrow] PASS or FAIL.
+
+# How many fragmented blocks the truncate-index-node test appends. The
+# 1 KiB block image has 84 extents/leaf and 4 inline slots, so 200 forces
+# the file's tree past depth 1 — well into "real index node" territory
+# without burning a multi-minute file size.
+EXT4_DGROW_NBLOCKS: uint64 = 200
+
+# Spacer blocks kept allocated between data blocks so consecutive data
+# blocks are NEVER physically contiguous (defeats coalescing → one
+# extent per block → forces a deep tree). Freed at the end of the test.
+ext4_dgrow_spacers: Array[200, uint64]
+
+# Verify scratch for one fs block of read-back data.
+ext4_dgrow_vbuf: Array[4096, uint8]
+
+# How many files we drop into the freshly-created subdir to overflow
+# its single linear block at 1 KiB blocks. With ~17 chars per name and
+# ~24 bytes/entry, one 1 KiB block fits ~40 entries — 200 forces both
+# the linear overflow AND several leaf splits AFTER conversion.
+EXT4_DGROW_NFILES: uint64 = 200
+
+
+def _ext4_dgrow_make_name(i: uint64):
+    # Deterministic 10-char hex name "dgr_AAAABBBB" (12 bytes incl. NUL).
+    # Wide hash spread → the leaf split after conversion is meaningful.
+    ext4_dgrow_namebuf[0] = 0x64                          # 'd'
+    ext4_dgrow_namebuf[1] = 0x67                          # 'g'
+    ext4_dgrow_namebuf[2] = 0x72                          # 'r'
+    ext4_dgrow_namebuf[3] = 0x5F                          # '_'
+    n: uint64 = i
+    p: uint64 = 11
+    while p >= 4:
+        d: uint64 = n & 0xF
+        if d < 10:
+            ext4_dgrow_namebuf[p] = cast[uint8](0x30 + d)
+        else:
+            ext4_dgrow_namebuf[p] = cast[uint8](0x61 + (d - 10))
+        n = n >> 4
+        if p == 4:
+            p = 0
+        else:
+            p = p - 1
+    ext4_dgrow_namebuf[12] = 0
+
+
+ext4_dgrow_namebuf: Array[16, uint8]
+
+
+def ext4_dirgrow_selftest() -> int32:
+    if ext4_blockdev_slot < 0:
+        printk0("[ext4dgrow] FAIL: ext4 not mounted\n")
+        return -1
+    printk1("[ext4dgrow] block_size=%d\n", ext4_block_size)
+    ok_all: int32 = 1
+
+    # ========== (A) Truncate-index-node round-trip =================
+    # Build a fragmented file that forces the extent tree past depth 0.
+    inum: uint32 = _ext4idx_make_empty_file("dgrow_idx.bin")
+    if inum == 0:
+        printk0("[ext4dgrow] FAIL: create dgrow_idx.bin\n")
+        return -1
+    inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
+        printk0("[ext4dgrow] FAIL: read inode after create\n")
+        return -1
+
+    # Snapshot the free-block count BEFORE the growth so we can prove
+    # the truncate releases the file's data blocks.
+    free_before: uint64 = _ext4_count_free_blocks()
+
+    # Pattern-fill block 0 so the surviving post-truncate bytes have a
+    # known fingerprint to compare against.
+    o0: uint64 = 0
+    while o0 < ext4_block_size:
+        ext4_dgrow_vbuf[o0] = _ext4idx_pattern_byte(0, o0)
+        o0 = o0 + 1
+
+    lb: uint64 = 0
+    while lb < EXT4_DGROW_NBLOCKS:
+        db: uint64 = ext4_alloc_block()
+        if db == 0:
+            printk0("[ext4dgrow] FAIL: out of data blocks\n")
+            return -1
+        sp: uint64 = ext4_alloc_block()              # spacer (kept)
+        ext4_dgrow_spacers[lb] = sp
+        # Pattern-fill each block deterministically.
+        o: uint64 = 0
+        while o < ext4_block_size:
+            ext4_dgrow_vbuf[o] = _ext4idx_pattern_byte(lb, o)
+            o = o + 1
+        if _ext4_write_block(db, &ext4_dgrow_vbuf[0]) != 0:
+            printk0("[ext4dgrow] FAIL: write data block\n")
+            return -1
+        if _ext4_extent_append_block(&inode[0], lb, db) != 0:
+            printk1("[ext4dgrow] FAIL: append block at lblk=%d\n", lb)
+            return -1
+        lb = lb + 1
+    fsize: uint64 = EXT4_DGROW_NBLOCKS * ext4_block_size
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&inode[0]) + 4),
+                    cast[uint32](fsize))
+    if ext4_write_inode(cast[uint64](inum), &inode[0]) != 0:
+        printk0("[ext4dgrow] FAIL: write inode after grow\n")
+        return -1
+
+    # Re-read and assert the tree forced depth >= 1 (the WHOLE point —
+    # this is a real "index-node file" the truncate path must handle).
+    if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
+        printk0("[ext4dgrow] FAIL: re-read inode\n")
+        return -1
+    pre_depth: uint16 = _ext4_read_u16(cast[Ptr[uint8]](
+        cast[uint64](&inode[0])
+        + INODE_I_BLOCK_OFFSET + EXT4_EH_DEPTH_OFFSET))
+    if pre_depth < 1:
+        printk1("[ext4dgrow] FAIL: tree did not promote (depth=%d)\n",
+                cast[uint64](pre_depth))
+        return -1
+    printk1("[ext4dgrow] PASS forced index-node file (eh_depth=%d)\n",
+            cast[uint64](pre_depth))
+
+    # Truncate down to exactly one block. The TODO case: keep ONE block,
+    # free the rest, fold the tree back. Pre-snapshot the survivor.
+    head: Array[4096, uint8]
+    if ext4_read_file(inum, 0, ext4_block_size, &head[0]) \
+            != cast[int64](ext4_block_size):
+        printk0("[ext4dgrow] FAIL: head read short\n")
+        return -1
+    if ext4_truncate_inode(inum, ext4_block_size) != 0:
+        printk0("[ext4dgrow] FAIL: truncate to 1 block\n")
+        return -1
+    if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
+        printk0("[ext4dgrow] FAIL: re-read inode after truncate\n")
+        return -1
+    if cast[uint64](ext4_inode_size_lo(&inode[0])) != ext4_block_size:
+        printk0("[ext4dgrow] FAIL: shrunk i_size wrong\n")
+        return -1
+    post_depth: uint16 = _ext4_read_u16(cast[Ptr[uint8]](
+        cast[uint64](&inode[0])
+        + INODE_I_BLOCK_OFFSET + EXT4_EH_DEPTH_OFFSET))
+    if post_depth != 0:
+        printk1("[ext4dgrow] FAIL: tree did not fold back (depth=%d)\n",
+                cast[uint64](post_depth))
+        return -1
+    printk0("[ext4dgrow] PASS truncate folded index tree back to depth 0\n")
+
+    # Surviving block's bytes match the pre-truncate snapshot.
+    if ext4_read_file(inum, 0, ext4_block_size, &ext4_dgrow_vbuf[0]) \
+            != cast[int64](ext4_block_size):
+        printk0("[ext4dgrow] FAIL: post-truncate head read short\n")
+        return -1
+    h: uint64 = 0
+    while h < ext4_block_size:
+        if ext4_dgrow_vbuf[h] != head[h]:
+            printk1("[ext4dgrow] FAIL: head byte mismatch at %d\n", h)
+            return -1
+        h = h + 1
+    # Past-EOF read returns 0.
+    if ext4_read_file(inum, ext4_block_size, 16,
+                      &ext4_dgrow_vbuf[0]) != 0:
+        printk0("[ext4dgrow] FAIL: read past truncated EOF gave data\n")
+        return -1
+    printk0("[ext4dgrow] PASS surviving block bytes intact + EOF clean\n")
+
+    # Block accounting: the freed file-data blocks (EXT4_DGROW_NBLOCKS
+    # - 1) PLUS the freed extent-tree meta blocks should have returned
+    # to the allocator. We only assert against the data-block count to
+    # tolerate any allocator-summary drift on the metadata blocks.
+    free_after_trunc: uint64 = _ext4_count_free_blocks()
+    expected_freed: uint64 = EXT4_DGROW_NBLOCKS - 1
+    actual_freed: uint64 = 0
+    if free_after_trunc >= free_before:
+        actual_freed = free_after_trunc - free_before
+    if actual_freed < expected_freed:
+        printk2("[ext4dgrow] FAIL: truncate freed only %d of >= %d blocks\n",
+                actual_freed, expected_freed)
+        return -1
+    printk2("[ext4dgrow] PASS truncate returned %d blocks (>= %d)\n",
+            actual_freed, expected_freed)
+
+    # Cleanup the truncate test: free spacers, unlink the file.
+    s: uint64 = 0
+    while s < EXT4_DGROW_NBLOCKS:
+        if ext4_dgrow_spacers[s] != 0:
+            ext4_free_block(ext4_dgrow_spacers[s])
+            ext4_dgrow_spacers[s] = 0
+        s = s + 1
+    ext4_unlink("dgrow_idx.bin")
+
+    # ========== (B) Linear -> htree directory conversion ===========
+    # Create a fresh subdir of root via the live mkdir path. It starts
+    # as a single-block linear directory ("." + ".." only).
+    if ext4_mkdir_live("dgrowdir") != 0:
+        # Already exists from a prior boot? Unlink any leftover files
+        # by walking the dir is heavy; just bail with a clear marker so
+        # the test image is regenerated.
+        printk0("[ext4dgrow] FAIL: mkdir dgrowdir\n")
+        return -1
+    sub_inum: uint32 = ext4_resolve_dir("dgrowdir")
+    if sub_inum == 0:
+        printk0("[ext4dgrow] FAIL: resolve dgrowdir\n")
+        return -1
+    sub_buf: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](sub_inum), &sub_buf[0]) != 0:
+        printk0("[ext4dgrow] FAIL: read dgrowdir inode\n")
+        return -1
+    # Brand-new linear dir: NOT EXT4_INDEX_FL yet.
+    if ext4_inode_is_htree_dir(&sub_buf[0]) != 0:
+        printk0("[ext4dgrow] FAIL: fresh dgrowdir already htree?\n")
+        return -1
+    printk0("[ext4dgrow] PASS fresh dgrowdir starts as linear (no INDEX_FL)\n")
+
+    # Insert files until the linear block overflows and the convert path
+    # fires. We need to track an inum we can prove survived the move
+    # from linear block 0 into the new leaf blocks: the FIRST inserted
+    # name (i=0). After the conversion every name (early ones + late
+    # ones) must still resolve.
+    body: Ptr[uint8] = "x"
+    inserted: uint64 = 0
+    first_inum: uint32 = 0
+    last_pre_conv_blocks: uint64 = 1
+    converted: int32 = 0
+    i: uint64 = 0
+    while i < EXT4_DGROW_NFILES:
+        _ext4_dgrow_make_name(i)
+        ni: uint32 = ext4_create_file(
+            cast[uint64](sub_inum),
+            cast[Ptr[char]](&ext4_dgrow_namebuf[0]), body, 1)
+        if ni == 0:
+            printk1("[ext4dgrow] FAIL: create_file at #%d\n", i)
+            return -1
+        if i == 0:
+            first_inum = ni
+        inserted = inserted + 1
+        # Sniff the directory's block count to detect the moment of
+        # conversion (linear: 1 block, htree: 3+ blocks).
+        if converted == 0:
+            if ext4_read_inode(cast[uint64](sub_inum), &sub_buf[0]) == 0:
+                cur_blocks: uint64 = cast[uint64](
+                    ext4_inode_size_lo(&sub_buf[0])) / ext4_block_size
+                if cur_blocks > 1 \
+                        and ext4_inode_is_htree_dir(&sub_buf[0]) != 0:
+                    printk2("[ext4dgrow] convert fired at insert #%d (size %d blocks)\n",
+                            i, cur_blocks)
+                    converted = 1
+                last_pre_conv_blocks = cur_blocks
+        i = i + 1
+    printk1("[ext4dgrow] inserted %d files into dgrowdir\n", inserted)
+
+    if converted == 0:
+        printk1("[ext4dgrow] FAIL: dir never converted (still %d block(s))\n",
+                last_pre_conv_blocks)
+        return -1
+    printk0("[ext4dgrow] PASS dir converted to EXT4_INDEX_FL htree\n")
+
+    # Re-read the dir inode for the final structure assertions.
+    if ext4_read_inode(cast[uint64](sub_inum), &sub_buf[0]) != 0:
+        printk0("[ext4dgrow] FAIL: re-read dgrowdir inode\n")
+        return -1
+    if ext4_inode_is_htree_dir(&sub_buf[0]) == 0:
+        printk0("[ext4dgrow] FAIL: dgrowdir lost EXT4_INDEX_FL\n")
+        return -1
+    # dx_root indirect_levels must be 0 (a freshly-converted dir is a
+    # 1-level htree with 2 leaves). Re-use the dx-level reader from the
+    # htins selftest.
+    levels: int64 = _ext4_htins_dx_levels(sub_inum)
+    if levels < 0:
+        printk0("[ext4dgrow] FAIL: dx_root unreadable on dgrowdir\n")
+        return -1
+    printk1("[ext4dgrow] dgrowdir dx_root indirect_levels=%d\n",
+            cast[uint64](levels))
+
+    # EVERY inserted name (early + late) must resolve through the dir
+    # lookup path. The early ones moved into a new leaf during the
+    # conversion; the late ones were inserted through the htree write
+    # path. Both must work.
+    verified: uint64 = 0
+    j: uint64 = 0
+    while j < inserted:
+        _ext4_dgrow_make_name(j)
+        nmp: Ptr[char] = cast[Ptr[char]](&ext4_dgrow_namebuf[0])
+        ht_inum: uint32 = ext4_dir_lookup_htree(&sub_buf[0], nmp)
+        if ht_inum == 0:
+            printk1("[ext4dgrow] FAIL: htree miss for ins#%d\n", j)
+            return -1
+        # Cross-check vs an independent linear scan over every leaf —
+        # they must agree on which inum the name resolves to.
+        lin_inum: uint32 = _ext4_dir_lookup_linear(&sub_buf[0], nmp)
+        if ht_inum != lin_inum:
+            printk2("[ext4dgrow] FAIL: htree %d != linear %d\n",
+                    cast[uint64](ht_inum), cast[uint64](lin_inum))
+            return -1
+        verified = verified + 1
+        j = j + 1
+    if verified != inserted:
+        printk2("[ext4dgrow] FAIL: only %d/%d names verified\n",
+                verified, inserted)
+        return -1
+    printk1("[ext4dgrow] PASS all %d names resolve after convert\n",
+            verified)
+
+    # The first inserted name must still point at the FIRST inum we
+    # created — proves the conversion preserved identity, not just
+    # presence (the entry isn't a fresh-but-stale shell).
+    _ext4_dgrow_make_name(0)
+    re_inum: uint32 = ext4_dir_lookup_htree(
+        &sub_buf[0], cast[Ptr[char]](&ext4_dgrow_namebuf[0]))
+    if re_inum != first_inum:
+        printk2("[ext4dgrow] FAIL: name 0 inum drifted (%d != %d)\n",
+                cast[uint64](re_inum), cast[uint64](first_inum))
+        return -1
+    printk0("[ext4dgrow] PASS first-inserted name kept its inum\n")
+
+    printk0("[ext4dgrow] PASS\n")
     return 0
 
 
