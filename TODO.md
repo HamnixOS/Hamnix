@@ -77,7 +77,11 @@ law).
 DE/MATE-mirror work is **gated behind the P9-shape wave landing
 cleanly** (per #459 above). When that's clear:
 
-- [ ] **Phase 4d** — bitmap font store (mono/sans/serif BDF).
+- [~] **Phase 4d** — BDF font store landed `24d867eb`: 3 fonts under
+  `fonts/`, `lib/font_bdf.ad` parser, `<text font="sans">…</text>` markup
+  routed to family dispatch with mono fallback. Deferred: runtime BDF
+  file loading (compiled-in glyph tables for v1) + visual installer-image
+  screenshot.
 - [~] **`lib/hamui.ad` MATE-class widget set** — menu/menubar,
   scrolledwindow, dialog/modal, notebook/tabs, radio, slider/scale,
   spinbutton, combobox, progressbar, separator, image, toolbar,
