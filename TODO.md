@@ -164,10 +164,14 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
 - [ ] Union mounts MBEFORE/MAFTER (flag recorded; longest-prefix only).
 - [ ] `create(260)` DMDIR → real directory create.
 - [ ] `stat`/`fstat` per-backend hooks.
-- [ ] `fd2path` exact open()-time path (per-fd path slot in TaskStruct).
-- [ ] `wstat`/`fwstat` fields: `length`(truncate), `mtime`, `gid`/
-  `muid`, `mode` storage.
-- [ ] Delete the global `/var` tmpfs (last namespace-law debt).
+- [x] `fd2path` exact open()-time path — landed `9f9d9db3`.
+- [x] `wstat` length/mtime/mode — already in `_apply_wstat` (verified +
+  tested `9f9d9db3`). gid/muid still rejected with errstr; needs
+  per-inode storage (separate round).
+- [~] Delete the global `/var` tmpfs — per-Pgrp bind `/var → #t/var`
+  already in place at `chan.ad:925` (F1 substrate). Namespace contract
+  test added `9f9d9db3`. Backend-internal `vfs_mount` router entry
+  remains; removal requires FS routing model migration.
 
 ### §3 Signals
 - [ ] Plan 9 `note_group`-wide + cross-task `/proc/<pid>/note` —
