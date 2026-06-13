@@ -256,13 +256,17 @@ the kernel + EFI stub). FAT12's 4084-cluster ceiling caps it at
 ESPs. Live USB-style layouts use a separate ext4 partition; Hamnix
 does the same.
 
-### Don't auto-mount via chan_resolve_prefix chaining
-`chan_resolve_prefix` does ONE prefix rewrite per `vfs_open` call.
-A bind chain like `bind /usr /n/distros/usr` + `bind '#distro' /n/distros`
-won't double-resolve — the first call only resolves the outer-most
-match. Either resolve directly in one bind (`bind '#distro' /` is
-what the linux ns uses) or add an explicit re-entry loop to
-`chan_resolve_prefix` (deferred; risky due to cycle potential).
+### Don't auto-mount via deep bind chains
+`vfs_open` rewrites paths through `ns_walk` (sys/src/9/port/chan.ad),
+which does ONE longest-prefix lookup over the calling Pgrp's mount
+table per call. A bind chain like `bind /usr /n/distros/usr` +
+`bind '#distro' /n/distros` won't double-resolve — `ns_walk` picks
+the single deepest bound name covering the input path and stops; the
+result is NOT fed back through the walk. Either resolve directly in
+one bind (`bind '#distro' /` is what the linux ns uses) or build a
+flat per-Pgrp mount table whose longest prefix already covers the
+final name. Iterating `ns_walk` is deferred — bind cycles would
+loop and the longest-prefix rule is intentionally one-shot.
 
 ## Per-name file servers — shipped 2026-05-26
 

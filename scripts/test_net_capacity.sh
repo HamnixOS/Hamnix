@@ -15,7 +15,7 @@
 #       pool). The test interleaves two fragmented datagrams from two
 #       distinct sources and asserts BOTH reassemble byte-exactly.
 #
-#   (b) drivers/net/socket.ad — the combined kernel socket table was 16
+#   (b) drivers/net/sock_compat.ad — the combined kernel socket table was 16
 #       slots; the 17th socket() returned -ENFILE. Raised to KSOCK_MAX
 #       (64) with all parallel per-slot arrays resized in lockstep. The
 #       test allocates > 16 sockets and asserts none fail.

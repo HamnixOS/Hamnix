@@ -24,7 +24,7 @@ the Linux ABI shim — see [linux-abi.md](linux-abi.md).)
 | `drivers/net/icmp.ad` | ICMP / ping — `icmp_conn_*` connection API |
 | `drivers/net/tls.ad` | TLS 1.3 |
 | `drivers/net/sctp.ad`, `mptcp.ad` | SCTP, Multipath TCP |
-| `drivers/net/socket.ad` | socket-state glue for the Linux ABI |
+| `drivers/net/sock_compat.ad` | socket-state glue for the Linux ABI (no native sockets — see `user/net9.ad` for native Plan 9 /net) |
 
 ### L3 / routing / L2
 
