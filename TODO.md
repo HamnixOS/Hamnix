@@ -160,8 +160,10 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
   Triage deferred until F10 wave finishes.
 
 ### Phase D follow-ups
-- [ ] Layer-2 `/proc → /dev` translation as a namespace bind (retire
-  `_u_translate_proc_to_dev` string-rewrite).
+- [x] Layer-2 `/proc → /dev` namespace bind — landed `e09596bb`:
+  9 per-leaf binds in pgrp_init (cpuinfo/meminfo/uptime/loadavg/version/
+  hostname/stat/mounts/diskstats); deleted ~180 lines of
+  `_u_translate_proc_to_dev` string-rewrite.
 - [ ] Union mounts MBEFORE/MAFTER (flag recorded; longest-prefix only).
 - [x] `create(260)` DMDIR — already routed through `vfs_mkdir`; test
   coverage added `47ab21c5`.
