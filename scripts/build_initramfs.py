@@ -1634,6 +1634,17 @@ if os.environ.get("ENABLE_PROCCTL_TEST"):
 if os.environ.get("ENABLE_OOMADJ_TEST"):
     FILES.append(("/etc/oomadj-test", b"1\n"))
 
+# F10-10 (#457): per-Pgrp oom_score_adj field + clone-independence self-test.
+# scripts/test_pgrpoom.sh sets ENABLE_PGRPOOM_TEST=1 to plant /etc/pgrpoom-test.
+# init/main.ad detects the marker and calls pgrp_oomadj_selftest()
+# (sys/src/9/port/chan.ad): it round-trips a safe-range value through
+# pgrp_oom_score_adj_set/get, confirms the upper +1000 and lower -1000 clamps,
+# then exercises pgrp_clone INDEPENDENCE — set distinct values on parent and
+# clone and confirm neither mutation perturbs the other. Emits the
+# [PGRPOOM] PASS banner. Needs no extra device.
+if os.environ.get("ENABLE_PGRPOOM_TEST"):
+    FILES.append(("/etc/pgrpoom-test", b"1\n"))
+
 # F10-8 / #457: NATIVE seccomp-lite per-task syscall-filter self-test.
 # scripts/test_seccomp_native.sh sets ENABLE_SECCOMP_NATIVE_TEST=1 to
 # plant /etc/seccomp-native-test. init/main.ad detects the marker and
