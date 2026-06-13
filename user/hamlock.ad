@@ -1,234 +1,265 @@
 # user/hamlock.ad
 #
-# hamlock — DE screen-lock app. A hamui window with a password entry that
-# authenticates the CURRENT user (uid from sys_getuid) via the kernel
-# /dev/auth cdev. On successful verify the process exits 0 — the launcher
-# (hamscreensaver) treats that as "user unlocked" and goes back to idle
-# watch. On a wrong password the entry is cleared, the status bar shows
-# "Wrong password — try again." and we stay locked.
+# hamlock — DE pivot wave 5: the full-screen screen-lock overlay extracted
+# out of user/hamUId.ad's daemon_pixel cascade into a standalone hamui v2
+# client (matches the wave-1 hampanel, wave-2 hamappmenu, wave-3 hamcycler,
+# and wave-4 hamcalpop/hamrun pattern).
 #
-# Plan-9 idiom: we don't open any new privileged kernel hook — auth happens
-# via the same /dev/auth + SYS_SETUID_AUTH primitives `su` and `login` use.
-# We *don't* call sys_setuid_auth(); we only need the verify step (the
-# /dev/auth "ok"/"no" reply). The process keeps the user's existing
-# identity throughout.
+# Wire model
+# ----------
+# 1. The compositor publishes the lock model (locked flag + consecutive-
+#    fails counter) via the `lock <locked> <fails>` verb on /dev/wsys/ctl.
+#    The snapshot is served at /dev/wsys/lock as one line:
+#       "<show_serial> <locked> <fails> <gen>\n"
+# 2. The compositor spawns /bin/hamlock once at startup. Whenever the
+#    lock state mutates (session_lock / session_unlock / a verify drain)
+#    it republishes the model and bumps the show serial by writing to
+#    /dev/wsys/lock/show.
+# 3. We open OUR /dev/wsys/<wid>/wctl, write "version 2\n" to opt into
+#    the rio v2 blit protocol, then rasterise the centred lock chrome
+#    (dark curtain + "Screen Locked" title + masked password field +
+#    feedback line) directly into our backbuffer via lib/hamui's
+#    hamui_v2_* family. The compositor blits our backbuffer to /dev/fb
+#    each frame.
+# 4. While `locked` is 0 we leave the backbuffer cleared-to-transparent
+#    so the overlay is "off" (the kernel-side present is a no-op on an
+#    unchanged buffer). When `locked` flips to 1 we paint the curtain.
 #
-# UI:
-#   - big "Hamnix — Locked" label
-#   - shows the current user name (resolved from /etc/passwd)
-#   - password entry; Enter activates "Unlock"
-#   - status bar shows the prompt / error
+# Why password verification still lives in the compositor
+# -------------------------------------------------------
+# Like the cycler/run waves, only the RENDER moved out. The unlock secret
+# (lock_pw_secret in hamUId) and the lock_pw_try() decision both stay in
+# the compositor: posting an attempted password to /dev/wsys/lock/verify
+# enqueues a serial-bumped record that hamUId drains on the next frame
+# and feeds into lock_pw_try(). On match the compositor clears LOCKED
+# and republishes; on mismatch it bumps LOCK_FAILS and republishes.
 #
-# This is intentionally a normal hamui window (not a true compositor-side
-# input-grab) — gating real keyboard input system-wide belongs to the
-# compositor and is out of scope for V1; the brief explicitly says reuse
-# the toolkit and don't reinvent the auth path.
+# WHAT THIS REPLACES
+# ------------------
+# The ~25-line per-pixel "Screen Locked / Click to unlock" overlay inside
+# daemon_pixel in user/hamUId.ad. That code is gone; this file is its
+# replacement.
 
 from lib.hamui import (
-    hamui_init, hamui_fixed, hamui_label, hamui_button, hamui_entry,
-    hamui_statusbar, hamui_status_set, hamui_set_size, hamui_set_text,
-    hamui_fixed_place, hamui_add, hamui_focus, hamui_window,
-    hamui_step, hamui_signalled, hamui_entry_text,
-)
-
-from lib.passwd.passwd import (
-    passwd_parse, passwd_lookup_by_uid, passwd_entry_name,
+    hamui_init, hamui_window_on, hamui_set_protocol_v2,
+    hamui_v2_clear, hamui_v2_fill_rect, hamui_v2_commit_rect,
+    hamui_v2_is_active,
 )
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_open(path: Ptr[char]) -> int32
 extern def sys_close(fd: int32) -> int32
-extern def sys_getuid() -> uint32
-extern def sys_yield() -> int32
+extern def sys_yield()
+extern def sys_exit(code: int32)
 
 
-# ---- scratch buffers (no malloc — fixed module-scope arrays) ------------
-pw_buf:     Array[4096, uint8]            # /etc/passwd slurp
-user_name:  Array[64,   uint8]            # current user's login name
-title_buf:  Array[96,   uint8]            # "Hamnix - Locked: <user>"
-pass_buf:   Array[128,  uint8]            # plaintext typed password
-authresp:   Array[64,   uint8]            # /dev/auth reply line
+# --- model storage --------------------------------------------------
+_hl_locked: int32 = 0
+_hl_fails:  int32 = 0
+_hl_gen:    uint64 = 0
+_hl_show_serial:      uint64 = 0
+_hl_last_show_serial: uint64 = 0xffffffffffffffff
+_hl_last_gen:         uint64 = 0xffffffffffffffff
 
 
-def _l_strlen(s: Ptr[uint8]) -> uint64:
+# --- layout (window-local pixels, v2 backbuffer cap) ----------------
+# Mirrors the legacy full-screen lock overlay. The window itself is the
+# lock surface — no surrounding desktop dim (the curtain IS the dim).
+_hl_WIN_W: int32 = 640
+_hl_WIN_H: int32 = 480
+_hl_PAD:   int32 = 14
+_hl_GLYPH_H: int32 = 6
+_hl_GLYPH_W: int32 = 7
+
+
+# --- scratch --------------------------------------------------------
+_hl_snap_buf: Array[256, uint8]
+
+
+def _strlen(s: Ptr[uint8]) -> uint64:
     n: uint64 = 0
     while s[n] != 0:
         n = n + 1
     return n
 
 
-def _l_puts(fd: int32, s: Ptr[uint8]):
-    sys_write(fd, s, _l_strlen(s))
+def _puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
 
 
-def _l_wipe(buf: Ptr[uint8], cap: uint64):
+# --- snapshot parser ------------------------------------------------
+def _read_lock_snapshot() -> int64:
+    fd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/lock"))
+    if fd < 0:
+        return -1
+    n: int64 = sys_read(fd, &_hl_snap_buf[0], 256)
+    sys_close(fd)
+    return n
+
+
+def _parse_u64(pos: Ptr[uint64], end: uint64) -> uint64:
+    p: uint64 = pos[0]
+    v: uint64 = 0
+    while p < end and _hl_snap_buf[p] >= 48 and _hl_snap_buf[p] <= 57:
+        v = v * 10 + cast[uint64](_hl_snap_buf[p] - 48)
+        p = p + 1
+    pos[0] = p
+    return v
+
+
+def _skip_ws(pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end and (_hl_snap_buf[p] == 32 or _hl_snap_buf[p] == 9):
+        p = p + 1
+    return p
+
+
+def _parse_snapshot(n: uint64) -> int32:
+    # Returns 1 if anything CHANGED since the last parse (gen or
+    # show_serial differ), 0 otherwise.
+    if n == 0:
+        return 0
+    pos: Array[1, uint64]
+    pos[0] = 0
+    show_v:  uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    locked_v: uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    fails_v: uint64 = _parse_u64(&pos[0], n)
+    pos[0] = _skip_ws(pos[0], n)
+    gen_v:   uint64 = _parse_u64(&pos[0], n)
+    _hl_show_serial = show_v
+    _hl_locked = cast[int32](locked_v)
+    _hl_fails = cast[int32](fails_v)
+    _hl_gen = gen_v
+    changed: int32 = 0
+    if _hl_show_serial != _hl_last_show_serial:
+        changed = 1
+    if _hl_gen != _hl_last_gen:
+        changed = 1
+    _hl_last_show_serial = _hl_show_serial
+    _hl_last_gen = _hl_gen
+    return changed
+
+
+# --- crude glyph-block rendering ------------------------------------
+# Mirrors hamcycler/hamappmenu/hamrun's _draw_text_blocks — one 4x6 block
+# per non-space char. Glyph fidelity will come later from str_ink-on-v2.
+def _draw_text_blocks(x: int32, y: int32, label: Ptr[uint8], len: uint64,
+                      r: uint8, g: uint8, b: uint8, max_w: int32):
     i: uint64 = 0
-    while i < cap:
-        buf[i] = 0
+    cx: int32 = x
+    while i < len and cx + 4 <= x + max_w:
+        c: uint8 = label[i]
+        if c != 32:
+            hamui_v2_fill_rect(cx, y, 4, _hl_GLYPH_H, r, g, b)
+        cx = cx + _hl_GLYPH_W - 1
         i = i + 1
 
 
-def _l_copy(dst: Ptr[uint8], src: Ptr[uint8], cap: uint64):
-    i: uint64 = 0
-    while src[i] != 0 and i + 1 < cap:
-        dst[i] = src[i]
-        i = i + 1
-    dst[i] = 0
+def _paint_closed():
+    # Lock hidden: clear the backbuffer.
+    hamui_v2_clear(0, 0, 0)
+    hamui_v2_commit_rect(0, 0, _hl_WIN_W, _hl_WIN_H)
 
 
-# Append b's bytes to a's NUL-terminated content; caps to cap-1.
-def _l_append(a: Ptr[uint8], cap: uint64, b: Ptr[uint8]):
-    p: uint64 = 0
-    while p < cap and a[p] != 0:
-        p = p + 1
-    k: uint64 = 0
-    while b[k] != 0 and p + 1 < cap:
-        a[p] = b[k]
-        p = p + 1
-        k = k + 1
-    a[p] = 0
+def _paint_open():
+    # Dark curtain — matches the legacy 14/16/24 lock-overlay body.
+    hamui_v2_clear(14, 16, 24)
+
+    # Centred "Screen Locked" banner (legacy 220/228/245 ink).
+    title: Ptr[uint8] = "Screen Locked"
+    tw: int32 = cast[int32](_strlen(title)) * (_hl_GLYPH_W - 1)
+    tx: int32 = _hl_WIN_W / 2 - tw / 2
+    ty: int32 = _hl_WIN_H / 2 - _hl_GLYPH_H * 4
+    _draw_text_blocks(tx, ty, title, _strlen(title),
+                      220, 228, 245, _hl_WIN_W)
+
+    # Hint line just below.
+    hint: Ptr[uint8] = "Click to unlock"
+    hw: int32 = cast[int32](_strlen(hint)) * (_hl_GLYPH_W - 1)
+    hx: int32 = _hl_WIN_W / 2 - hw / 2
+    hy: int32 = _hl_WIN_H / 2 + _hl_GLYPH_H
+    _draw_text_blocks(hx, hy, hint, _strlen(hint),
+                      140, 150, 170, _hl_WIN_W)
+
+    # Failed-attempt feedback line (only when fails > 0). The legacy
+    # daemon_pixel render didn't show this; the v2 client surfaces the
+    # `fails` counter so the user knows their last password attempt was
+    # rejected (the actual verify still happens in the compositor).
+    if _hl_fails > 0:
+        warn: Ptr[uint8] = "Wrong password"
+        ww: int32 = cast[int32](_strlen(warn)) * (_hl_GLYPH_W - 1)
+        wx: int32 = _hl_WIN_W / 2 - ww / 2
+        wy: int32 = _hl_WIN_H / 2 + _hl_GLYPH_H * 4
+        _draw_text_blocks(wx, wy, warn, _strlen(warn),
+                          220, 110, 110, _hl_WIN_W)
+
+    hamui_v2_commit_rect(0, 0, _hl_WIN_W, _hl_WIN_H)
 
 
-# Load /etc/passwd into pw_buf, parse it, and resolve sys_getuid() -> name.
-# Falls back to "user" when /etc/passwd is missing or the uid is unknown
-# (the lock still functions; auth will simply fail until the right entry
-# exists — exactly like login/su today).
-def _l_resolve_user():
-    fd: int32 = sys_open("/etc/passwd")
-    total: uint64 = 0
-    if fd >= 0:
-        while total < 4096:
-            n: int64 = sys_read(fd, &pw_buf[total], 4096 - total)
-            if n <= 0:
-                break
-            total = total + cast[uint64](n)
-        sys_close(fd)
-    passwd_parse(&pw_buf[0], total)
-    uid: uint32 = sys_getuid()
-    idx: int32 = passwd_lookup_by_uid(uid)
-    if idx >= 0:
-        _l_copy(&user_name[0], passwd_entry_name(idx), 64)
+def _paint():
+    if _hl_locked != 0:
+        _paint_open()
     else:
-        _l_copy(&user_name[0], "user", 64)
-
-
-# Write "<prefix><payload>\n" to fd in one syscall (matches su.ad's helper).
-def _l_auth_line(fd: int32, prefix: Ptr[uint8], plen: uint64,
-                 payload: Ptr[uint8], paylen: uint64) -> int64:
-    line: Array[256, uint8]
-    p: uint64 = 0
-    while p < plen and p + 2 < 256:
-        line[p] = prefix[p]
-        p = p + 1
-    j: uint64 = 0
-    while j < paylen and p + 2 < 256:
-        line[p] = payload[j]
-        p = p + 1
-        j = j + 1
-    line[p] = 10
-    p = p + 1
-    return sys_write(fd, &line[0], p)
-
-
-# Verify (user_name, password) via /dev/auth. Returns 1 on ok, 0 otherwise.
-# Wipes pass_buf on the way out so we never carry the plaintext.
-def _l_verify(password: Ptr[uint8]) -> int32:
-    plen: uint64 = _l_strlen(password)
-    afd: int32 = sys_open("/dev/auth")
-    if afd < 0:
-        return 0
-    user_prefix: Ptr[uint8] = "user "
-    pass_prefix: Ptr[uint8] = "pass "
-    _l_auth_line(afd, user_prefix, 5, &user_name[0], _l_strlen(&user_name[0]))
-    _l_auth_line(afd, pass_prefix, 5, password, plen)
-    rn: int64 = sys_read(afd, &authresp[0], 64)
-    sys_close(afd)
-    if rn < 2:
-        return 0
-    if authresp[0] == 111 and authresp[1] == 107:    # "ok"
-        return 1
-    return 0
+        _paint_closed()
 
 
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
-    _l_resolve_user()
-
     hamui_init()
+    # Self-discover OUR wid via /dev/wsys/self (same shape hamrun uses).
+    # argv[1] may override for tests.
+    wid: int32 = 1
+    self_path: Ptr[uint8] = "/dev/wsys/self"
+    sfd: int32 = sys_open(cast[Ptr[char]](self_path))
+    if sfd >= 0:
+        sbuf: Array[16, uint8]
+        sn: int64 = sys_read_nb(sfd, &sbuf[0], 16)
+        sys_close(sfd)
+        if sn > 0:
+            v: int32 = 0
+            i: uint64 = 0
+            while i < cast[uint64](sn) and sbuf[i] >= 48 and sbuf[i] <= 57:
+                v = v * 10 + cast[int32](sbuf[i]) - 48
+                i = i + 1
+            if v >= 2:
+                wid = v
+    if argc > 1:
+        ap: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        v2: int32 = 0
+        i2: uint64 = 0
+        while ap[i2] >= 48 and ap[i2] <= 57:
+            v2 = v2 * 10 + cast[int32](ap[i2]) - 48
+            i2 = i2 + 1
+        if v2 >= 1:
+            wid = v2
 
-    root: int32 = hamui_fixed()
-
-    # Title — big visible "locked" banner.
-    title: int32 = hamui_label("HAMNIX  -  LOCKED")
-    hamui_fixed_place(title, 180, 60)
-    hamui_add(root, title)
-
-    # Build "User: <name>" line.
-    pre: Ptr[uint8] = "User: "
-    _l_copy(&title_buf[0], pre, 96)
-    _l_append(&title_buf[0], 96, &user_name[0])
-    who: int32 = hamui_label(&title_buf[0])
-    hamui_fixed_place(who, 180, 140)
-    hamui_add(root, who)
-
-    prompt: int32 = hamui_label("Password:")
-    hamui_fixed_place(prompt, 100, 220)
-    hamui_add(root, prompt)
-
-    entry: int32 = hamui_entry()
-    hamui_set_size(entry, 380, 32)
-    hamui_fixed_place(entry, 180, 214)
-    hamui_add(root, entry)
-
-    unlock: int32 = hamui_button("Unlock")
-    hamui_set_size(unlock, 120, 36)
-    hamui_fixed_place(unlock, 260, 280)
-    hamui_add(root, unlock)
-
-    sb: int32 = hamui_statusbar("Type your password, then press Enter.")
-    hamui_set_size(sb, 640, 24)
-    hamui_fixed_place(sb, 0, 460)
-    hamui_add(root, sb)
-
-    wid: int32 = hamui_window(root)
-    if wid < 0:
-        _l_puts(2, "hamlock: could not allocate a window\n")
+    bound: int32 = hamui_window_on(0, wid)
+    if bound < 0:
+        _puts(2, "hamlock: could not bind window\n")
+        return 1
+    if hamui_set_protocol_v2() < 0:
+        _puts(2, "hamlock: v2 negotiate failed\n")
         return 1
 
-    # Focus the entry so the first keystroke lands in the password field.
-    hamui_focus(entry)
+    # Initial paint from whatever the compositor has already published.
+    n0: int64 = _read_lock_snapshot()
+    if n0 > 0:
+        _parse_snapshot(cast[uint64](n0))
+    _paint()
+    rdy: Ptr[uint8] = "HAMLOCK ready\n"
+    sys_write(1, rdy, _strlen(rdy))
 
-    _l_puts(1, "HAMLOCK ready\n")
-
-    # --- event loop ---------------------------------------------------
+    # Long-lived event loop: poll the snapshot. On a gen or show_serial
+    # bump repaint. The compositor pokes /dev/wsys/lock/show whenever the
+    # lock state changes (no socket: we just resample the snapshot).
     while True:
-        hamui_step()
-
-        # Two ways to submit: Enter in the entry (fires the entry's own
-        # signal), or pressing the Unlock button. Both run the same verify.
-        submit: int32 = 0
-        if hamui_signalled(entry) != 0:
-            submit = 1
-        if hamui_signalled(unlock) != 0:
-            submit = 1
-
-        if submit != 0:
-            txt: Ptr[uint8] = hamui_entry_text(entry)
-            # Snapshot into pass_buf so we can wipe both the entry's
-            # backing store and our own copy after the verify call.
-            _l_copy(&pass_buf[0], txt, 128)
-            ok: int32 = _l_verify(&pass_buf[0])
-            _l_wipe(&pass_buf[0], 128)
-            # Always clear the visible entry — we don't want the password
-            # to linger on-screen across retries.
-            hamui_set_text(entry, "")
-            hamui_focus(entry)
-            if ok != 0:
-                hamui_status_set(sb, "Unlocked.")
-                _l_puts(1, "HAMLOCK unlocked\n")
-                return 0
-            hamui_status_set(sb, "Wrong password - try again.")
-
+        n: int64 = _read_lock_snapshot()
+        if n > 0:
+            if _parse_snapshot(cast[uint64](n)) != 0:
+                _paint()
         sys_yield()
 
     return 0

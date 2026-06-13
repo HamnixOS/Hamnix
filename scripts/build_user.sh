@@ -185,7 +185,7 @@ build_adder_user hamview              # image viewer (Eye-of-MATE equiv) on the 
 build_adder_user hamshot              # screenshot CLI (MATE-screenshot equiv): /dev/fb geometry + /dev/fbpix pixel stream -> P6 PPM (view with hamview)
 build_adder_user hammon               # live system monitor (uptime/mem/process list) on the hamui toolkit (lib/hamui.ad) — reads /proc/uptime,/proc/meminfo,/proc/tasks
 build_adder_user hamecho              # Increment-1 DE rewrite: first SEPARATE-PROCESS app; echoes routed keys (proves focus-gated input ownership)
-build_adder_user hamlock              # DE password lock: hamui password entry verified against /dev/auth (uses lib.passwd + lib.hamui)
+build_adder_user hamlock              # DE pivot wave 5: full-screen screen-lock overlay (v2 client; reads /dev/wsys/lock, poked via /dev/wsys/lock/show, verify posted to /dev/wsys/lock/verify)
 build_adder_user hamscreensaver       # DE screensaver daemon: idle timer then spawns /bin/hamlock; cycle repeats
 build_adder_user hamsession           # DE session save/restore: reads /dev/wsys/session snapshot, persists/replays the open window set
 build_adder_user top                  # M16.87: one-shot /proc dashboard
