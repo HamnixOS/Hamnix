@@ -1,0 +1,532 @@
+# user/hamappmenu.ad
+#
+# hamappmenu — DE pivot wave 2: the classic Applications cascading menu,
+# extracted out of the user/hamUId.ad daemon_pixel monolith into a
+# separate-process v2 client.
+#
+# Wire model
+# ----------
+# 1. hamUId publishes the catalogue (categories + entries) once on
+#    startup via the `appmenu <payload>` verb on /dev/wsys/ctl. The
+#    snapshot is served at /dev/wsys/appmenu (line-oriented text).
+# 2. hamUId spawns /bin/hamappmenu when the Apps trigger fires (panel
+#    button click, Apps hotkey).
+# 3. We open OUR /dev/wsys/<wid>/wctl, write "version 2\n" to opt into
+#    the rio blit protocol, then rasterise the cascading menu directly
+#    into the client backbuffer (lib/hamui.ad's hamui_v2_* family).
+# 4. On click we write the chosen prog path to /dev/wsys/appmenu/launch
+#    and exit. hamUId polls that snapshot, observes a serial bump, and
+#    invokes daemon_spawn_window_prog with the path.
+#
+# WHAT THIS REPLACES
+# ------------------
+# The ~115 LOC menu rendering blob inside daemon_pixel (Applications
+# drop-down + cascading category flyout) that drew the menu pixel-by-
+# pixel in the compositor's procedural cascade. That code is gone; this
+# file is its replacement.
+
+from lib.hamui import (
+    hamui_init, hamui_window_on, hamui_set_protocol_v2,
+    hamui_v2_clear, hamui_v2_fill_rect, hamui_v2_commit_rect,
+    hamui_v2_is_active, hamui_window_wid,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield()
+extern def sys_exit(code: int32)
+
+
+# --- catalogue storage -----------------------------------------------
+# Hard caps mirror what hamUId publishes (4 categories, ~20 entries).
+_am_MAX_CATS:  uint64 = 8
+_am_MAX_ITEMS: uint64 = 32
+_am_LABEL_CAP: uint64 = 48
+_am_PATH_CAP:  uint64 = 96
+
+_am_cat_count:  uint64 = 0
+_am_item_count: uint64 = 0
+
+_am_cat_label: Array[8, Array[48, uint8]]
+_am_cat_label_len: Array[8, uint64]
+
+_am_item_cat:        Array[32, int32]
+_am_item_prog:       Array[32, Array[96, uint8]]
+_am_item_prog_len:   Array[32, uint64]
+_am_item_label:      Array[32, Array[48, uint8]]
+_am_item_label_len:  Array[32, uint64]
+
+
+# --- layout constants (window-local pixels) --------------------------
+_am_WIN_W: int32 = 300
+_am_WIN_H: int32 = 200
+
+_am_CATCOL_W: int32 = 130
+_am_SUBCOL_W: int32 = 160
+_am_ROW_H:    int32 = 16
+
+# Hovered category (-1 = none). The submenu for this cat is shown.
+_am_HOVER_CAT: int32 = -1
+
+
+# --- tiny scratch ---------------------------------------------------
+_am_snap_buf:   Array[2080, uint8]
+_am_ptr_buf: Array[512, uint8]
+_am_launch_buf: Array[128, uint8]
+
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
+
+
+def _put_dec(out: Ptr[uint8], pos: uint64, v: uint64) -> uint64:
+    if v == 0:
+        out[pos] = 48
+        return pos + 1
+    tmp: Array[20, uint8]
+    t: uint64 = 0
+    while v != 0:
+        tmp[t] = cast[uint8](v % 10) + 48
+        v = v / 10
+        t = t + 1
+    p: uint64 = pos
+    while t > 0:
+        t = t - 1
+        out[p] = tmp[t]
+        p = p + 1
+    return p
+
+
+# --- snapshot parser -------------------------------------------------
+# Read /dev/wsys/appmenu into _am_snap_buf and parse out cat / item rows.
+# Format: "<gen>\n" then alternating "C name\n" and "I cat path label\n".
+def _read_appmenu_snapshot() -> int64:
+    fd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/appmenu"))
+    if fd < 0:
+        return -1
+    n: int64 = sys_read(fd, &_am_snap_buf[0], 2080)
+    sys_close(fd)
+    return n
+
+
+def _skip_to_eol(pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end and _am_snap_buf[p] != 10:
+        p = p + 1
+    if p < end:
+        p = p + 1
+    return p
+
+
+def _skip_ws(pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end and (_am_snap_buf[p] == 32 or _am_snap_buf[p] == 9):
+        p = p + 1
+    return p
+
+
+def _parse_u64_field(pos: Ptr[uint64], end: uint64,
+                     out: Ptr[uint64]) -> int32:
+    p: uint64 = pos[0]
+    v: uint64 = 0
+    have: int32 = 0
+    while p < end and _am_snap_buf[p] >= 48 and _am_snap_buf[p] <= 57:
+        v = v * 10 + cast[uint64](_am_snap_buf[p] - 48)
+        p = p + 1
+        have = 1
+    pos[0] = p
+    out[0] = v
+    return have
+
+
+def _parse_snapshot(n: uint64):
+    _am_cat_count = 0
+    _am_item_count = 0
+    # Skip the leading "<gen>\n" line.
+    p: uint64 = _skip_to_eol(0, n)
+    while p < n:
+        kind: uint8 = _am_snap_buf[p]
+        p = p + 1
+        if p < n and _am_snap_buf[p] == 32:
+            p = p + 1
+        if kind == 67:                     # 'C' category line
+            # Name extends to end-of-line.
+            s: uint64 = p
+            e: uint64 = s
+            while e < n and _am_snap_buf[e] != 10:
+                e = e + 1
+            ln: uint64 = e - s
+            if ln >= _am_LABEL_CAP:
+                ln = _am_LABEL_CAP - 1
+            if _am_cat_count < _am_MAX_CATS:
+                k: uint64 = 0
+                while k < ln:
+                    _am_cat_label[_am_cat_count][k] = _am_snap_buf[s + k]
+                    k = k + 1
+                _am_cat_label[_am_cat_count][ln] = 0
+                _am_cat_label_len[_am_cat_count] = ln
+                _am_cat_count = _am_cat_count + 1
+            p = e
+            if p < n:
+                p = p + 1
+        elif kind == 73:                   # 'I' item line
+            # "<cat-idx> <prog-path> <label>\n"
+            cidx: uint64 = 0
+            pos: Array[1, uint64]
+            pos[0] = p
+            _parse_u64_field(&pos[0], n, &cidx)
+            p = _skip_ws(pos[0], n)
+            # prog path = next whitespace-delimited token
+            ps: uint64 = p
+            while p < n and _am_snap_buf[p] != 32 and _am_snap_buf[p] != 9 \
+                    and _am_snap_buf[p] != 10:
+                p = p + 1
+            pe: uint64 = p
+            p = _skip_ws(p, n)
+            # label = remainder up to '\n'
+            ls: uint64 = p
+            while p < n and _am_snap_buf[p] != 10:
+                p = p + 1
+            le: uint64 = p
+            if p < n:
+                p = p + 1
+            if _am_item_count < _am_MAX_ITEMS:
+                plen: uint64 = pe - ps
+                if plen >= _am_PATH_CAP:
+                    plen = _am_PATH_CAP - 1
+                k2: uint64 = 0
+                while k2 < plen:
+                    _am_item_prog[_am_item_count][k2] = _am_snap_buf[ps + k2]
+                    k2 = k2 + 1
+                _am_item_prog[_am_item_count][plen] = 0
+                _am_item_prog_len[_am_item_count] = plen
+                llen: uint64 = le - ls
+                if llen >= _am_LABEL_CAP:
+                    llen = _am_LABEL_CAP - 1
+                k3: uint64 = 0
+                while k3 < llen:
+                    _am_item_label[_am_item_count][k3] = _am_snap_buf[ls + k3]
+                    k3 = k3 + 1
+                _am_item_label[_am_item_count][llen] = 0
+                _am_item_label_len[_am_item_count] = llen
+                _am_item_cat[_am_item_count] = cast[int32](cidx)
+                _am_item_count = _am_item_count + 1
+        else:
+            # Unknown line — skip.
+            p = _skip_to_eol(p, n)
+
+
+# --- crude 5x7 glyph rendering --------------------------------------
+# A real toolkit text path lives in lib/hamui's str_ink; we draw simple
+# filled blocks per character so the menu reads as labelled rows even
+# without the kernel font on the v2 backbuffer path. The cascading-menu
+# shape (hover-to-expand columns) is the point, not glyph fidelity.
+def _draw_text_rect(x: int32, y: int32, label: Ptr[uint8], len: uint64,
+                    fr: uint8, fg: uint8, fb: uint8):
+    # Draw each glyph as a 4x6 filled rect spaced 6 px apart. Truncate to
+    # what fits in the column.
+    i: uint64 = 0
+    cx: int32 = x
+    while i < len and cx + 4 <= x + _am_CATCOL_W:
+        c: uint8 = label[i]
+        if c != 32:
+            hamui_v2_fill_rect(cx, y, 4, 6, fr, fg, fb)
+        cx = cx + 6
+        i = i + 1
+
+
+def _paint_menu():
+    # Background: dark panel.
+    hamui_v2_clear(28, 32, 40)
+    # Category column.
+    hamui_v2_fill_rect(0, 0, _am_CATCOL_W, _am_WIN_H, 38, 42, 52)
+    # Category rows.
+    i: uint64 = 0
+    while i < _am_cat_count:
+        y: int32 = cast[int32](i) * _am_ROW_H
+        if cast[int32](i) == _am_HOVER_CAT:
+            hamui_v2_fill_rect(0, y, _am_CATCOL_W, _am_ROW_H, 70, 100, 160)
+        _draw_text_rect(8, y + 4, &_am_cat_label[i][0], _am_cat_label_len[i],
+                        220, 220, 220)
+        i = i + 1
+    # Right-edge ">" hint glyph on hovered cat.
+    if _am_HOVER_CAT >= 0:
+        hy: int32 = _am_HOVER_CAT * _am_ROW_H + 4
+        hamui_v2_fill_rect(_am_CATCOL_W - 8, hy, 4, 6, 220, 220, 220)
+    # Submenu column for the hovered category.
+    if _am_HOVER_CAT >= 0:
+        sx: int32 = _am_CATCOL_W
+        # Count items in this category to size the flyout.
+        n: uint64 = 0
+        k: uint64 = 0
+        while k < _am_item_count:
+            if _am_item_cat[k] == _am_HOVER_CAT:
+                n = n + 1
+            k = k + 1
+        sh: int32 = cast[int32](n) * _am_ROW_H
+        if sh < _am_ROW_H:
+            sh = _am_ROW_H
+        hamui_v2_fill_rect(sx, 0, _am_SUBCOL_W, sh, 48, 54, 66)
+        # Items.
+        row: int32 = 0
+        kk: uint64 = 0
+        while kk < _am_item_count:
+            if _am_item_cat[kk] == _am_HOVER_CAT:
+                y2: int32 = row * _am_ROW_H
+                _draw_text_rect(sx + 8, y2 + 4,
+                                &_am_item_label[kk][0], _am_item_label_len[kk],
+                                220, 220, 220)
+                row = row + 1
+            kk = kk + 1
+    hamui_v2_commit_rect(0, 0, _am_WIN_W, _am_WIN_H)
+
+
+# Hit-test the category column. Returns the category index at (x,y), or -1.
+def _hit_cat(x: int32, y: int32) -> int32:
+    if x < 0 or x >= _am_CATCOL_W:
+        return -1
+    if y < 0:
+        return -1
+    row: int32 = y / _am_ROW_H
+    if cast[uint64](row) >= _am_cat_count:
+        return -1
+    return row
+
+
+# Hit-test the open submenu. Returns the absolute item index, or -1.
+def _hit_item(x: int32, y: int32) -> int32:
+    if _am_HOVER_CAT < 0:
+        return -1
+    if x < _am_CATCOL_W or x >= _am_CATCOL_W + _am_SUBCOL_W:
+        return -1
+    if y < 0:
+        return -1
+    row: int32 = y / _am_ROW_H
+    # Walk items belonging to _am_HOVER_CAT, return the row-th.
+    seen: int32 = 0
+    k: uint64 = 0
+    while k < _am_item_count:
+        if _am_item_cat[k] == _am_HOVER_CAT:
+            if seen == row:
+                return cast[int32](k)
+            seen = seen + 1
+        k = k + 1
+    return -1
+
+
+# Write the chosen prog path to /dev/wsys/appmenu/launch.
+def _emit_launch(idx: int32) -> int32:
+    if idx < 0:
+        return -1
+    fd: int32 = sys_open_write(cast[Ptr[char]]("/dev/wsys/appmenu/launch"))
+    if fd < 0:
+        return -1
+    plen: uint64 = _am_item_prog_len[cast[uint64](idx)]
+    j: uint64 = 0
+    while j < plen and j < 127:
+        _am_launch_buf[j] = _am_item_prog[cast[uint64](idx)][j]
+        j = j + 1
+    _am_launch_buf[j] = 10
+    j = j + 1
+    sys_write(fd, &_am_launch_buf[0], j)
+    sys_close(fd)
+    return 0
+
+
+# --- pointer poll ----------------------------------------------------
+_am_ptr_fd: int32 = -1
+_am_prev_btn:   int32 = 0
+_am_last_x:     int32 = 0
+_am_last_y:     int32 = 0
+
+
+def _build_ptr_path(wid: int32, out: Ptr[uint8]):
+    pfx: Ptr[uint8] = "/dev/wsys/"
+    p: uint64 = 0
+    k: uint64 = 0
+    while pfx[k] != 0:
+        out[p] = pfx[k]
+        p = p + 1
+        k = k + 1
+    p = _put_dec(out, p, cast[uint64](wid))
+    sfx: Ptr[uint8] = "/pointer"
+    k = 0
+    while sfx[k] != 0:
+        out[p] = sfx[k]
+        p = p + 1
+        k = k + 1
+    out[p] = 0
+
+
+def _parse_signed_field(pos: Ptr[uint64], end: uint64) -> int32:
+    p: uint64 = pos[0]
+    neg: int32 = 0
+    if p < end and _am_ptr_buf[p] == 45:
+        neg = 1
+        p = p + 1
+    v: int32 = 0
+    while p < end and _am_ptr_buf[p] >= 48 and _am_ptr_buf[p] <= 57:
+        v = v * 10 + cast[int32](_am_ptr_buf[p]) - 48
+        p = p + 1
+    pos[0] = p
+    if neg != 0:
+        return -v
+    return v
+
+
+def _ptr_skip_ws(pos: Ptr[uint64], end: uint64):
+    p: uint64 = pos[0]
+    while p < end and (_am_ptr_buf[p] == 32 or _am_ptr_buf[p] == 9):
+        p = p + 1
+    pos[0] = p
+
+
+def _ptr_skip_line(pos: Ptr[uint64], end: uint64):
+    p: uint64 = pos[0]
+    while p < end and _am_ptr_buf[p] != 10:
+        p = p + 1
+    if p < end:
+        p = p + 1
+    pos[0] = p
+
+
+# Drain pointer events; returns the launch-item idx on a clean click,
+# -2 on a click that selects nothing but should dismiss us, -1 otherwise.
+def _drain_pointer(wid: int32) -> int32:
+    if _am_ptr_fd < 0:
+        ppath: Array[64, uint8]
+        _build_ptr_path(wid, &ppath[0])
+        _am_ptr_fd = sys_open(cast[Ptr[char]](&ppath[0]))
+    if _am_ptr_fd < 0:
+        return -1
+    result: int32 = -1
+    redraw: int32 = 0
+    n: int64 = sys_read_nb(_am_ptr_fd, &_am_ptr_buf[0], 512)
+    while n > 0:
+        cap: uint64 = cast[uint64](n)
+        pos: Array[1, uint64]
+        pos[0] = 0
+        while pos[0] < cap:
+            if pos[0] >= cap:
+                break
+            t: uint8 = _am_ptr_buf[pos[0]]
+            pos[0] = pos[0] + 1
+            if pos[0] < cap and _am_ptr_buf[pos[0]] == 32:
+                pos[0] = pos[0] + 1
+            x: int32 = _parse_signed_field(&pos[0], cap)
+            _ptr_skip_ws(&pos[0], cap)
+            y: int32 = _parse_signed_field(&pos[0], cap)
+            _ptr_skip_ws(&pos[0], cap)
+            btn: int32 = _parse_signed_field(&pos[0], cap)
+            _ptr_skip_line(&pos[0], cap)
+            _am_last_x = x
+            _am_last_y = y
+            # Hover tracking.
+            ch: int32 = _hit_cat(x, y)
+            if ch >= 0 and ch != _am_HOVER_CAT:
+                _am_HOVER_CAT = ch
+                redraw = 1
+            if t == 100:                  # 'd' press
+                if (btn & 1) != 0 and (_am_prev_btn & 1) == 0:
+                    # Click: prefer submenu hit, else cat hit (only opens),
+                    # else dismiss.
+                    ih: int32 = _hit_item(x, y)
+                    if ih >= 0:
+                        result = ih
+                    else:
+                        ch2: int32 = _hit_cat(x, y)
+                        if ch2 < 0:
+                            result = -2
+                _am_prev_btn = btn
+            elif t == 117:                # 'u' release
+                _am_prev_btn = btn
+            else:                         # motion (covers hover)
+                _am_prev_btn = btn
+        n = sys_read_nb(_am_ptr_fd, &_am_ptr_buf[0], 512)
+    if redraw != 0:
+        _paint_menu()
+    return result
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    hamui_init()
+    # Self-discover OUR wid via /dev/wsys/self (the compositor allocates
+    # it after spawning us, same shape as user/hamecho.ad).
+    wid: int32 = 1
+    self_path: Ptr[uint8] = "/dev/wsys/self"
+    sfd: int32 = sys_open(cast[Ptr[char]](self_path))
+    if sfd >= 0:
+        sbuf: Array[16, uint8]
+        sn: int64 = sys_read_nb(sfd, &sbuf[0], 16)
+        sys_close(sfd)
+        if sn > 0:
+            v: int32 = 0
+            i: uint64 = 0
+            while i < cast[uint64](sn) and sbuf[i] >= 48 and sbuf[i] <= 57:
+                v = v * 10 + cast[int32](sbuf[i]) - 48
+                i = i + 1
+            if v >= 2:
+                wid = v
+    if argc > 1:
+        ap: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        v2: int32 = 0
+        i2: uint64 = 0
+        while ap[i2] >= 48 and ap[i2] <= 57:
+            v2 = v2 * 10 + cast[int32](ap[i2]) - 48
+            i2 = i2 + 1
+        if v2 >= 1:
+            wid = v2
+
+    # Bind a minimal markup root (the compositor expects a "ui" layer to
+    # exist on the window before we activate v2). lib/hamui's helpers
+    # need an int32 root id; pass 0 to skip widget tree setup but still
+    # plant the "ui" layer.
+    bound: int32 = hamui_window_on(0, wid)
+    if bound < 0:
+        _puts(2, "hamappmenu: could not bind window\n")
+        return 1
+
+    # Opt into v2 (writes "version 2\n" to /dev/wsys/<wid>/wctl). After
+    # this point, hamui_v2_* commits land on the kernel-side per-window
+    # backbuffer the compositor blits to /dev/fb.
+    if hamui_set_protocol_v2() < 0:
+        _puts(2, "hamappmenu: v2 negotiate failed\n")
+        return 1
+
+    # Read + parse the catalogue snapshot from /dev/wsys/appmenu.
+    n: int64 = _read_appmenu_snapshot()
+    if n < 0:
+        _puts(2, "hamappmenu: could not read /dev/wsys/appmenu\n")
+        return 1
+    _parse_snapshot(cast[uint64](n))
+
+    # First paint, then announce ready (mirrors hamecho's ordering so the
+    # spine self-test never samples an unrendered frame).
+    _paint_menu()
+    rdy: Ptr[uint8] = "HAMAPPMENU ready\n"
+    sys_write(1, rdy, _strlen(rdy))
+
+    # Event loop. Pointer events drive hover repaint + click → launch.
+    while True:
+        rc: int32 = _drain_pointer(wid)
+        if rc >= 0:
+            # A click landed on an item — queue the launch + exit.
+            _emit_launch(rc)
+            sys_exit(0)
+        elif rc == -2:
+            # Click off-menu — dismiss without launching.
+            sys_exit(0)
+        sys_yield()
+
+    return 0
