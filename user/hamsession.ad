@@ -1,0 +1,359 @@
+# user/hamsession.ad
+#
+# hamsession — the MATE-equivalent "remember my open windows across
+# logout / login" helper for the Hamnix desktop, written in the Plan 9
+# idiom: the kernel exposes /dev/wsys/session as a snapshot text file
+# (one line per active window — "<wid> <pid> <app> <x> <y> <w> <h>");
+# this CLI either persists it to disk (save) or re-spawns each line's
+# app at its rect (restore).
+#
+#   hamsession save    [path]      default path: /home/.hamnix-session
+#   hamsession restore [path]
+#
+# WHERE THE FORMAT COMES FROM
+#   The compositor (user/hamUId.ad) calls /dev/wsys/ctl `setapp <wid>
+#   <path>` after each daemon_spawn_window_prog, so the kernel knows
+#   each wid's program path. The wctl request arrays carry the most
+#   recent x/y/w/h the compositor wrote (resize/move). Wids whose app
+#   path the compositor never registered render as "-" in the snapshot
+#   — restore skips them (they were either built-in DE windows with no
+#   replay path, or a registration race).
+#
+# RESTORE STRATEGY (Plan 9-shape)
+#   For each line, fork+execve the named program (lib.p9 spawn handles
+#   the namespace cloning / fd routing). The compositor allocates a
+#   wid for the new pid via the existing /dev/wsys/ctl `alloc <pid>`
+#   path triggered by daemon_spawn_window_prog (run by hamUId's
+#   panel-launch loop) — but a STANDALONE restore (no DE running) has
+#   no compositor to allocate a wid; in that case the spawned program
+#   simply runs without a window-server binding, which matches Plan 9's
+#   "if no rio, the prog inherits stdio". The geometry hint is written
+#   to /dev/wsys/<N>/wctl AFTER we look up the assigned wid via
+#   /dev/wsys/self in the child if the program cares. v1 just spawns;
+#   compositor cascade-placement picks up any not-yet-placed window.
+#
+# ADDER QUIRKS HONOURED
+#   * No heap — fixed module-level Array buffers.
+#   * Strings are Ptr[uint8]; no adjacent-literal concatenation; no
+#     module-scope string-literal globals (those live inside helpers).
+#
+# Build:
+#   python3 -m compiler.adder compile --target=x86_64-adder-user \
+#       user/hamsession.ad -o build/user/hamsession.elf
+#   scripts/build_user.sh wires this into the user-binary list.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+extern def sys_rfork(flags: int32) -> int32
+extern def sys_execve(path: Ptr[char], argv: Ptr[uint64]) -> int32
+
+
+# Plan 9 rfork flags (RFPROC | RFFDG | RFNAMEG = the spawn-a-child
+# trio). Locally redefined so this tool stays self-contained — lib.p9
+# spawn carries the same constants with the same values.
+HSESS_RFPROC:  int32 = 0x001
+HSESS_RFFDG:   int32 = 0x004
+HSESS_RFNAMEG: int32 = 0x008
+
+
+# Default save path. Returned as a call-site literal (Adder U9: no
+# module-scope string globals).
+def hsess_default_path() -> Ptr[char]:
+    p: Ptr[char] = "/home/.hamnix-session"
+    return p
+
+
+def hsess_session_path() -> Ptr[char]:
+    p: Ptr[char] = "/dev/wsys/session"
+    return p
+
+
+# --- tiny helpers ----------------------------------------------------
+
+def hsess_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def hsess_puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, hsess_strlen(s))
+
+
+def hsess_streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def hsess_is_space(c: uint8) -> int32:
+    if c == 32 or c == 9:
+        return 1
+    return 0
+
+
+# --- module-scope scratch buffers (Adder U9 nested-Array quirk) ------
+
+# Snapshot read scratch (kernel renderer caps at 2048 bytes).
+hsess_buf: Array[2048, uint8]
+hsess_buf_len: uint64 = 0
+
+# Per-line tokens used by restore. Path field caps at 128; the rect
+# fields fit in int64.
+hsess_app_buf: Array[128, uint8]
+hsess_app_len: uint64 = 0
+
+# argv for the spawned program. Slot 0 = path pointer, slot 1 = NUL.
+hsess_argv: Array[2, uint64]
+
+
+# Read /dev/wsys/session into hsess_buf, returning the length. -1 on
+# open failure (the cdev should always be present once the kernel has
+# finished init).
+def hsess_read_snapshot() -> int64:
+    fd: int32 = sys_open(hsess_session_path())
+    if fd < 0:
+        hsess_puts(2, "hamsession: cannot open /dev/wsys/session\n")
+        return -1
+    total: uint64 = 0
+    while total < 2048:
+        n: int64 = sys_read(fd, &hsess_buf[total], 2048 - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    hsess_buf_len = total
+    return cast[int64](total)
+
+
+# Copy hsess_buf[0..hsess_buf_len) to the named file. Returns 0 on
+# success, -1 on open / short-write failure.
+def hsess_write_file(path: Ptr[char]) -> int32:
+    fd: int32 = sys_open_write(path)
+    if fd < 0:
+        hsess_puts(2, "hamsession: cannot create save file\n")
+        return -1
+    if hsess_buf_len > 0:
+        n: int64 = sys_write(fd, &hsess_buf[0], hsess_buf_len)
+        if n != cast[int64](hsess_buf_len):
+            sys_close(fd)
+            hsess_puts(2, "hamsession: short write to save file\n")
+            return -1
+    sys_close(fd)
+    return 0
+
+
+# Load `path` into hsess_buf. Returns the byte count, or -1 on open
+# failure (no saved session yet — restore reports it and exits 0).
+def hsess_read_file(path: Ptr[char]) -> int64:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while total < 2048:
+        n: int64 = sys_read(fd, &hsess_buf[total], 2048 - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    hsess_buf_len = total
+    return cast[int64](total)
+
+
+# Decimal u64 render into out[pos..]; returns the new pos.
+def hsess_emit_u64(out: Ptr[uint8], pos: uint64, v: uint64) -> uint64:
+    if v == 0:
+        out[pos] = 48
+        return pos + 1
+    digs: Array[24, uint8]
+    d: uint64 = 0
+    val: uint64 = v
+    while val > 0:
+        digs[d] = cast[uint8](val % 10) + 48
+        val = val / 10
+        d = d + 1
+    p: uint64 = pos
+    while d > 0:
+        d = d - 1
+        out[p] = digs[d]
+        p = p + 1
+    return p
+
+
+# --- restore tokeniser ----------------------------------------------
+#
+# The snapshot's line shape is fixed: "<wid> <pid> <app> <x> <y> <w>
+# <h>\n". We walk the buffer line-by-line, copy the app token into
+# hsess_app_buf (NUL-terminated for sys_execve), and fork+exec it.
+# Unset app paths render as "-" — those lines are skipped.
+
+# Advance pos past spaces; returns new pos.
+def hsess_skip_ws(pos: uint64) -> uint64:
+    while pos < hsess_buf_len and hsess_is_space(hsess_buf[pos]) == 1:
+        pos = pos + 1
+    return pos
+
+
+# Skip a whitespace-bounded token; returns end-of-token pos.
+def hsess_token_end(pos: uint64) -> uint64:
+    while pos < hsess_buf_len:
+        c: uint8 = hsess_buf[pos]
+        if hsess_is_space(c) == 1 or c == 10:
+            break
+        pos = pos + 1
+    return pos
+
+
+# Advance to the start of the next line; returns new pos.
+def hsess_next_line(pos: uint64) -> uint64:
+    while pos < hsess_buf_len and hsess_buf[pos] != 10:
+        pos = pos + 1
+    if pos < hsess_buf_len:
+        pos = pos + 1
+    return pos
+
+
+# fork + execve the named program. Returns the child pid on success,
+# -1 on rfork failure. The child runs sys_execve and never returns;
+# on exec failure it exits 127 (matching lib.p9 spawn).
+def hsess_spawn(path: Ptr[char]) -> int32:
+    flags: int32 = HSESS_RFPROC | HSESS_RFFDG | HSESS_RFNAMEG
+    pid: int32 = sys_rfork(flags)
+    if pid < 0:
+        return -1
+    if pid != 0:
+        return pid
+    # Child: build argv[0]=path, argv[1]=0, then exec.
+    hsess_argv[0] = cast[uint64](path)
+    hsess_argv[1] = 0
+    sys_execve(path, &hsess_argv[0])
+    sys_exit(127)
+    return 127                                       # unreached
+
+
+# Parse the snapshot and re-spawn each line's app. Returns the number
+# of windows restored. Lines with app == "-" (no path registered) are
+# skipped without re-spawning.
+def hsess_restore_lines() -> int64:
+    pos: uint64 = 0
+    restored: int64 = 0
+    while pos < hsess_buf_len:
+        # Skip blank lines / leading newlines.
+        if hsess_buf[pos] == 10:
+            pos = pos + 1
+            continue
+        # Field 1: wid (consume + ignore).
+        pos = hsess_skip_ws(pos)
+        e: uint64 = hsess_token_end(pos)
+        if e == pos:
+            pos = hsess_next_line(pos)
+            continue
+        pos = e
+        # Field 2: pid (consume + ignore).
+        pos = hsess_skip_ws(pos)
+        e = hsess_token_end(pos)
+        if e == pos:
+            pos = hsess_next_line(pos)
+            continue
+        pos = e
+        # Field 3: app path.
+        pos = hsess_skip_ws(pos)
+        app_s: uint64 = pos
+        e = hsess_token_end(pos)
+        app_e: uint64 = e
+        pos = e
+        # Advance to end-of-line so the rect tokens (x/y/w/h) are
+        # consumed even though v1 doesn't honour them at spawn time —
+        # cascade-placement in the compositor handles initial position.
+        pos = hsess_next_line(pos)
+        # Empty / sentinel app: nothing to replay.
+        applen: uint64 = app_e - app_s
+        if applen == 0:
+            continue
+        if applen == 1 and hsess_buf[app_s] == 45:    # "-"
+            continue
+        # Copy to hsess_app_buf NUL-terminated for sys_execve.
+        if applen >= 128:
+            applen = 127
+        i: uint64 = 0
+        while i < applen:
+            hsess_app_buf[i] = hsess_buf[app_s + i]
+            i = i + 1
+        hsess_app_buf[applen] = 0
+        hsess_app_len = applen
+        pid: int32 = hsess_spawn(cast[Ptr[char]](&hsess_app_buf[0]))
+        if pid < 0:
+            hsess_puts(2, "hamsession: rfork failed\n")
+            # Carry on with the next line; one bad spawn shouldn't
+            # abort the whole restore.
+            continue
+        restored = restored + 1
+    return restored
+
+
+# --- save / restore drivers -----------------------------------------
+
+def hsess_cmd_save(path: Ptr[char]) -> int32:
+    n: int64 = hsess_read_snapshot()
+    if n < 0:
+        return 1
+    if hsess_write_file(path) != 0:
+        return 1
+    # Emit a deterministic marker for the integration test. Format:
+    # "hamsession: saved <bytes> bytes to <path>\n"
+    hsess_puts(1, "hamsession: saved ")
+    pbuf: Array[24, uint8]
+    pn: uint64 = hsess_emit_u64(&pbuf[0], 0, cast[uint64](n))
+    sys_write(1, &pbuf[0], pn)
+    hsess_puts(1, " bytes to ")
+    hsess_puts(1, cast[Ptr[uint8]](path))
+    hsess_puts(1, "\n")
+    return 0
+
+
+def hsess_cmd_restore(path: Ptr[char]) -> int32:
+    n: int64 = hsess_read_file(path)
+    if n < 0:
+        hsess_puts(1, "hamsession: no saved session at ")
+        hsess_puts(1, cast[Ptr[uint8]](path))
+        hsess_puts(1, "\n")
+        return 0
+    r: int64 = hsess_restore_lines()
+    hsess_puts(1, "hamsession: restored ")
+    rbuf: Array[24, uint8]
+    rn: uint64 = hsess_emit_u64(&rbuf[0], 0, cast[uint64](r))
+    sys_write(1, &rbuf[0], rn)
+    hsess_puts(1, " windows from ")
+    hsess_puts(1, cast[Ptr[uint8]](path))
+    hsess_puts(1, "\n")
+    return 0
+
+
+def hsess_usage() -> int32:
+    hsess_puts(2, "usage: hamsession save|restore [path]\n")
+    return 1
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        return hsess_usage()
+    verb: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    path: Ptr[char] = hsess_default_path()
+    if argc >= 3:
+        path = cast[Ptr[char]](argv[2])
+    if hsess_streq(verb, cast[Ptr[uint8]]("save")) != 0:
+        return hsess_cmd_save(path)
+    if hsess_streq(verb, cast[Ptr[uint8]]("restore")) != 0:
+        return hsess_cmd_restore(path)
+    return hsess_usage()
