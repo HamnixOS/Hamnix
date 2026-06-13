@@ -210,11 +210,15 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
 
 ### §12 FS write maturity
 - [ ] ext4 truncate on index-node files; growing a full ext4 dir block.
+  (One attempt `bc1cb9c8` reverted as `bb7ba653` — broke heartbeat boot
+  (0 ticks); index-node trim machinery already comprehensive in main, the
+  htree-grow conversion needs a different shape. Revisit.)
 
 ### §13 cdev / proc completions
 - [x] `/proc/net/*` — dev/route/arp/tcp/udp/sockstat all real
   (`e7d68cc3`).
-- [ ] Per-backend errstr + user-mode `perror` helper.
+- [x] Per-backend errstr (ext4/tmpfs/devnet prefixes) + userland
+  `perror` helper landed `7591d9fc`. Migrated initctl/hpm/cat.
 
 ### §14 Security (stretch)
 - [ ] `seccomp-bpf` (full classic-BPF program).
