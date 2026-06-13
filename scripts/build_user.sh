@@ -225,6 +225,7 @@ build_adder_user nice_hi              # #151 CFS-lite: high-priority (nice -20) 
 build_adder_user nice_lo              # #151 CFS-lite: low-priority  (nice +19) CPU hog
 build_adder_user nice_demo            # #151 CFS-lite: spawns nice_hi + nice_lo, proves CPU-share ratio
 build_adder_user test_hugepage        # §hugepage: 2 MiB MAP_HUGETLB mmap test (tests/test_hugepage.ad)
+build_adder_user test_errstr_perbackend  # TODO net-item: per-backend errstr prefixes + perror (tests/test_errstr_perbackend.ad)
 build_adder_user hpm                  # Hamnix package manager (docs/packages.md)
 build_adder_user mkfs_ext4            # installer: format a /dev/blk/<dev> as ext4 (via /ctl)
 build_adder_user mkfs_fat             # installer: format a /dev/blk/<dev> as FAT (via /ctl; stub)
