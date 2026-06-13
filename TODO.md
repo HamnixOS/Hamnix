@@ -53,11 +53,10 @@ audit #453 closed; report at `audit_F10_report.md`. F10-1 #454, F10-2
   `SYS_LISTDIR_RECORDS=318` + devsrv emits Dir; deferred:
   `_dirfile_read`/devproc migration (needs per-Chan `p9_dir_mode` flag)
   and userland `ls`/`du` migration.
-- [ ] **F10-4, F10-5, F10-10 (#457)** — afd Tauth ignored, init/main.ad
-  split (~14k lines mixing selftests + boot), oom_score_adj per-Pgrp
-  (deferred from F10-8 bundle: needs Pgrp struct edits). (F10-7 closed
-  bonus in F10-2; F10-8 landed `983e1ce8`; F10-9/F10-11/F10-12 landed
-  `f9c61595`.)
+- [ ] **F10-4, F10-5 (#457)** — afd Tauth ignored, init/main.ad split
+  (~14k lines mixing selftests + boot). (F10-7 closed bonus in F10-2;
+  F10-8 landed `983e1ce8`; F10-9/F10-11/F10-12 landed `f9c61595`;
+  F10-10 landed `a31cfb00`.)
 - [~] **#459 fixed** `863f1765` — root cause was NOT the F10 wave but
   pre-existing F6 regression: `vfs_read` EISDIR short-circuit on
   DEV_DIR_FILE made every `p9_listdir` return -1 since #450 (74ff35e7);
