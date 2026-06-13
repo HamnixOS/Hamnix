@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# scripts/test_de_snarf_wctl.sh — structural guard for the three DE
+# primitives that landed in "DE: snarf clipboard + wctl resize/move/focus":
+#
+#   1. /dev/snarf — global one-buffer clipboard (sys/src/9/port/devsnarf.ad).
+#                   Write replaces; read snapshots; max 64 KiB.
+#
+#   2. /dev/wsys/<N>/wctl — per-window rio-shape control file
+#                   (sys/src/9/port/devwsys.ad). Three verbs:
+#                       resize <w> <h>
+#                       move   <x> <y>
+#                       focus  click|sloppy
+#                   Snapshot read returns "<x> <y> <w> <h> <focus>\n".
+#
+#   3. Both surfaces wired into the namec devtab — DEV_SNARF +
+#      DEV_WSYS_WCTL constants, path resolvers ("#c/snarf",
+#      "#c/wsys/<N>/wctl"), and read/write dispatches.
+#
+# Grep-only (no QEMU boot). Same shape as
+# scripts/test_de_windowshade_guard.sh — fast, deterministic, calls out
+# the exact broken link by name.
+#
+# Pass marker:  PASS: DE snarf/wctl primitives intact
+# Fail marker:  FAIL: <which link broke>
+
+set -euo pipefail
+PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJ_ROOT"
+
+SNARF_SRC="sys/src/9/port/devsnarf.ad"
+WSYS_SRC="sys/src/9/port/devwsys.ad"
+NAMEC_SRC="sys/src/9/port/namec.ad"
+
+fail=0
+
+fail_link() {
+    echo "FAIL: $1" >&2
+    fail=1
+}
+
+require_file() {
+    if [ ! -f "$1" ]; then
+        fail_link "source file missing: $1"
+        return 1
+    fi
+    return 0
+}
+
+require_file "$SNARF_SRC" || true
+require_file "$WSYS_SRC"  || true
+require_file "$NAMEC_SRC" || true
+if [ "$fail" -ne 0 ]; then
+    echo "FAIL: DE snarf/wctl guard — required source file(s) missing" >&2
+    exit 1
+fi
+
+# --- /dev/snarf clipboard ----------------------------------------------------
+if ! grep -Eq "^def[[:space:]]+devsnarf_read" "$SNARF_SRC"; then
+    fail_link "snarf: devsnarf_read() definition gone"
+fi
+if ! grep -Eq "^def[[:space:]]+devsnarf_write" "$SNARF_SRC"; then
+    fail_link "snarf: devsnarf_write() definition gone"
+fi
+# 64 KiB cap is the spec'd ceiling — assert it stayed.
+if ! grep -Eq "SNARF_MAX[[:space:]]*:[[:space:]]*uint64[[:space:]]*=[[:space:]]*65536" "$SNARF_SRC"; then
+    fail_link "snarf: SNARF_MAX 64 KiB cap is gone or changed"
+fi
+# Backing buffer must exist with the same 64 KiB extent.
+if ! grep -Eq "snarf_buf:[[:space:]]*Array\[65536" "$SNARF_SRC"; then
+    fail_link "snarf: snarf_buf[65536] backing array gone"
+fi
+
+# --- /dev/wsys/<N>/wctl per-window control -----------------------------------
+if ! grep -Eq "^def[[:space:]]+devwsys_wctl_write" "$WSYS_SRC"; then
+    fail_link "wctl: devwsys_wctl_write() definition gone"
+fi
+if ! grep -Eq "^def[[:space:]]+devwsys_wctl_read" "$WSYS_SRC"; then
+    fail_link "wctl: devwsys_wctl_read() definition gone"
+fi
+# Three verbs must all parse — the verb strings appear as literals in
+# the parser.
+if ! grep -q '"resize"' "$WSYS_SRC"; then
+    fail_link "wctl: resize verb literal gone"
+fi
+if ! grep -q '"move"' "$WSYS_SRC"; then
+    fail_link "wctl: move verb literal gone"
+fi
+if ! grep -q '"focus"' "$WSYS_SRC"; then
+    fail_link "wctl: focus verb literal gone"
+fi
+# Both focus modes must be recognised.
+if ! grep -q '"click"' "$WSYS_SRC"; then
+    fail_link "wctl: 'click' focus mode literal gone"
+fi
+if ! grep -q '"sloppy"' "$WSYS_SRC"; then
+    fail_link "wctl: 'sloppy' focus mode literal gone"
+fi
+# Per-window storage backing the verbs.
+for arr in wsys_wctl_x wsys_wctl_y wsys_wctl_w wsys_wctl_h wsys_wctl_focus wsys_wctl_serial; do
+    if ! grep -Eq "${arr}:[[:space:]]*Array" "$WSYS_SRC"; then
+        fail_link "wctl: per-window storage ${arr}[] gone"
+    fi
+done
+# Compositor-facing accessor: per-window focus mode.
+if ! grep -Eq "^def[[:space:]]+wsys_wctl_focus_mode" "$WSYS_SRC"; then
+    fail_link "wctl: wsys_wctl_focus_mode() accessor gone — compositor can't read per-window focus policy"
+fi
+
+# --- namec.ad wiring ---------------------------------------------------------
+# DEV_ constants.
+if ! grep -Eq "^DEV_SNARF:[[:space:]]*int32" "$NAMEC_SRC"; then
+    fail_link "namec: DEV_SNARF constant gone"
+fi
+if ! grep -Eq "^DEV_WSYS_WCTL:[[:space:]]*int32" "$NAMEC_SRC"; then
+    fail_link "namec: DEV_WSYS_WCTL constant gone"
+fi
+# Import lines bring the backends into scope.
+if ! grep -q "from sys.src.port9.port.devsnarf import" "$NAMEC_SRC"; then
+    fail_link "namec: devsnarf import gone"
+fi
+if ! grep -q "devwsys_wctl_write" "$NAMEC_SRC"; then
+    fail_link "namec: devwsys_wctl_write not imported"
+fi
+if ! grep -q "devwsys_wctl_read" "$NAMEC_SRC"; then
+    fail_link "namec: devwsys_wctl_read not imported"
+fi
+# Path resolvers.
+if ! grep -q '"#c/snarf"' "$NAMEC_SRC"; then
+    fail_link "namec: #c/snarf path lookup gone"
+fi
+if ! grep -q '"/wctl"' "$NAMEC_SRC"; then
+    fail_link "namec: /dev/wsys/<N>/wctl path lookup gone"
+fi
+# Read + write dispatches (both surfaces).
+if ! grep -q "devsnarf_read(off, buf, count)" "$NAMEC_SRC"; then
+    fail_link "namec: devsnarf_read dispatch gone"
+fi
+if ! grep -q "devsnarf_write(buf, count)" "$NAMEC_SRC"; then
+    fail_link "namec: devsnarf_write dispatch gone"
+fi
+if ! grep -q "devwsys_wctl_read(wid, off, buf, count)" "$NAMEC_SRC"; then
+    fail_link "namec: devwsys_wctl_read dispatch gone"
+fi
+if ! grep -q "devwsys_wctl_write(wid, buf, count)" "$NAMEC_SRC"; then
+    fail_link "namec: devwsys_wctl_write dispatch gone"
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "FAIL: DE snarf/wctl primitives BROKEN (see link(s) above)" >&2
+    exit 1
+fi
+
+echo "PASS: DE snarf/wctl primitives intact"
+exit 0
