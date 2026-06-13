@@ -180,8 +180,11 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
   remains; removal requires FS routing model migration.
 
 ### §3 Signals
-- [ ] Plan 9 `note_group`-wide + cross-task `/proc/<pid>/note` —
-  needs a deferred note-delivery hook in the native trap-return path.
+- [~] Plan 9 `note_group` + cross-task `/proc/<pid>/note` structural
+  landed `660978bb` (salvaged): note_pending queue + flag in TaskStruct,
+  trap-return checks + delivers via handler or terminates;
+  `note_group_send(pgrp_id, msg)` broadcast; `scripts/test_notedrain.sh`
+  scaffolding committed. Runtime verification pending.
 
 ### §5 Modern async I/O (Layer 2 only)
 - [ ] `io_uring` SQ/CQ rings (deferred; epoll covers most real Linux
