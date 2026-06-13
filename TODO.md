@@ -106,7 +106,9 @@ cleanly** (per #459 above). When that's clear:
 - [ ] Per-window namespace + elevation visible in `uid` / `ns` files
   (`newshell hostowner`, `hamUI new -as hostowner`).
 - [ ] X11/Xvfb bridge in a kind=fb layer (path to Firefox/Chromium).
-- [ ] snarf (clipboard), `wctl` resize/move, focus policies.
+- [~] snarf clipboard + `wctl` resize/move + focus click/sloppy kernel
+  surface landed `d3842a22`. Compositor hamUId.ad adoption (poll-loop
+  honour requested rect + per-window focus mode) deferred.
 
 Remaining hamUId.ad-touching items (single 25k-line file, serialize
 to avoid merge collisions): Display/Mouse/keyboard-layout settings
@@ -205,7 +207,8 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
 - [ ] ext4 truncate on index-node files; growing a full ext4 dir block.
 
 ### §13 cdev / proc completions
-- [~] `/proc/net/*` — in flight.
+- [x] `/proc/net/*` — dev/route/arp/tcp/udp/sockstat all real
+  (`e7d68cc3`).
 - [ ] Per-backend errstr + user-mode `perror` helper.
 
 ### §14 Security (stretch)
