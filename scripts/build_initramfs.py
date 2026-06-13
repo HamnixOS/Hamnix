@@ -1634,6 +1634,16 @@ if os.environ.get("ENABLE_PROCCTL_TEST"):
 if os.environ.get("ENABLE_OOMADJ_TEST"):
     FILES.append(("/etc/oomadj-test", b"1\n"))
 
+# F10-8 / #457: NATIVE seccomp-lite per-task syscall-filter self-test.
+# scripts/test_seccomp_native.sh sets ENABLE_SECCOMP_NATIVE_TEST=1 to
+# plant /etc/seccomp-native-test. init/main.ad detects the marker and
+# calls seccomp_native_selftest() (kernel/sched/core.ad): it arms a
+# spare slot with an allow-only-SYS_GETPID(4) bitmap and asserts that
+# the do_syscall-entry probe permits nr=4, blocks nr=0/8 and nr>=256,
+# and refuses to disarm an armed filter (irrevocable). No extra device.
+if os.environ.get("ENABLE_SECCOMP_NATIVE_TEST"):
+    FILES.append(("/etc/seccomp-native-test", b"1\n"))
+
 # SCHED_FIFO/SCHED_RR realtime scheduling-policy self-test.
 # scripts/test_rtsched.sh sets ENABLE_RTSCHED_TEST=1 to plant /etc/rtsched-test.
 # init/main.ad detects the marker and calls rtsched_selftest()
