@@ -58,9 +58,12 @@ audit #453 closed; report at `audit_F10_report.md`. F10-1 #454, F10-2
   (deferred from F10-8 bundle: needs Pgrp struct edits). (F10-7 closed
   bonus in F10-2; F10-8 landed `983e1ce8`; F10-9/F10-11/F10-12 landed
   `f9c61595`.)
-- [ ] **#459** — DE doesn't load on fresh image post-F10 wave (pid
-  exit code=127 on `init 5`). Likely cpio mode prefix gap or uid=NOBODY
-  hitting a server policy. Investigate after wave settles.
+- [~] **#459 fixed** `863f1765` — root cause was NOT the F10 wave but
+  pre-existing F6 regression: `vfs_read` EISDIR short-circuit on
+  DEV_DIR_FILE made every `p9_listdir` return -1 since #450 (74ff35e7);
+  svc_load_all_defs silently registered nothing → runlevel-5 spawned
+  nothing. Fix drops the short-circuit, lets namec_read emit "NAME\n".
+  Follow-up: task-slot pool sizing under runlevel-5 burst (separate).
 
 ## Phase 4 — unify fds on `Chan` (#390)
 
