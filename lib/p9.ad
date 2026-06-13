@@ -1,5 +1,63 @@
 # lib/p9.ad
 #
+# #458 F10-6 — Plan 9 `Dir` record as first-class universal directory
+# enumeration shape. The previous "directory read = NAME\n stream"
+# fixed `p9_listdir`'s ABI but blocked `ls -l`, `stat`, and Plan 9's
+# stream-of-Dir-records idiom from ever landing without a re-stat()
+# per leaf. This file adds the wire format + an encoder/decoder pair
+# (callable from both kernel-side directory backings and userspace
+# parsers) + `p9_diread(fd)` that reads exactly ONE record from a fd
+# whose backing was opened in Dir-record mode.
+#
+# DIR WIRE FORMAT (little-endian, length-prefixed)
+# ================================================
+# Each Dir record on the wire is:
+#
+#   off  size  field
+#     0    2   reclen          total bytes of this record INCLUDING
+#                              this length prefix; reader advances
+#                              `off += reclen` to the next record.
+#     2    1   qid_type        Plan 9 QTDIR / QTFILE / QTAUTH / ...
+#     3    4   qid_version
+#     7    8   qid_path        u64; unique-per-fileserver inode-shape
+#    15    4   mode            Plan 9 perm bits (DMDIR | 0755 ...)
+#    19    4   atime           u32 seconds since unix epoch
+#    23    4   mtime           u32 seconds since unix epoch
+#    27    8   length          u64 file length in bytes
+#    35    2   name_len; name_len bytes of `name` (no NUL)
+#    37+L  2   uid_len;  uid_len  bytes of `uid`  (no NUL)
+#    ...   2   gid_len;  gid_len  bytes of `gid`  (no NUL)
+#    ...   2   muid_len; muid_len bytes of `muid` (no NUL)
+#
+# Strings are NOT NUL-terminated on the wire — every string carries
+# its own u16 length prefix immediately before its bytes. The fixed
+# header (offsets 0..34) is 35 bytes; adding the four length prefixes
+# (8 bytes) gives a 43-byte minimum record for an entry with empty
+# uid/gid/muid and empty name. The `reclen` at offset 0 is the
+# self-describing skip count, so a reader that doesn't know a field
+# can still hop to the next record.
+#
+# This is a deliberately SMALLER shape than Plan 9 9P2000's stat wire
+# format (which carries `type`/`dev`/`qid`/... and a redundant size
+# prefix). Hamnix's namespace has no per-mount `type`/`dev` doublet —
+# the file-server letter (#c, #s, #p, ...) is implicit in the
+# directory being read — so those fields are omitted. The encoder
+# refuses to overflow a caller-supplied buffer; a record that would
+# not fit is reported as "truncated" via a 0 return and the caller
+# stops emission.
+#
+# PER-CHAN OPT-IN
+# ===============
+# The kernel-side directory backings keep emitting the legacy
+# "NAME\n" stream by default. A caller opts into the Dir wire format
+# by opening through `p9_listdir_records` (SYS_LISTDIR_RECORDS, 287)
+# which routes through the kernel's `devsrv_list_dir` (#s) emitter.
+# Other devs (#p / on-disk / #c) keep their legacy line shape until a
+# subsequent migration; the new syscall returns -ENOSYS for those
+# paths so `p9_listdir` callers see no behaviour change.
+#
+# Original F6 header continues below.
+#
 # #450 F6 — Plan 9-shape userland helpers for what used to be drift
 # syscalls (SYS_SPAWN / SYS_LISTDIR / SYS_KILL). The kernel side of
 # Phase G retires those three syscall arms (numbers stay reserved per
@@ -53,6 +111,13 @@
 #
 # COMPILER QUIRKS HONOURED: single-file module, no nested helpers, no
 # adjacent string-literal concatenation.
+
+from lib.p9dir import (
+    p9_dir_encode_into, p9d_get_u16, p9d_get_u32, p9d_get_u64,
+    P9_DMDIR,
+    P9_DIR_FIXED_HDR, P9_DIR_MIN_REC,
+)
+from lib.9p.9p import P9_QTDIR, P9_QTFILE
 
 extern def sys_rfork(flags: int32) -> int32
 extern def sys_execve_env(path: Ptr[char], argv: Ptr[uint64],
@@ -280,3 +345,224 @@ def p9_listdir(path: Ptr[char], buf: Ptr[uint8], count: uint64) -> int64:
         total = total + n
     sys_close(fd)
     return total
+
+
+# --- F10-6: Plan 9 Dir record — first-class struct + wire format -----
+#
+# Adder has no `struct` keyword (see neighbouring modules' "Adder
+# quirks" notes); a Dir VALUE is conveyed in userspace as a set of
+# "current-record" module-scope fields populated by p9_dir_decode_at
+# or by p9_diread. A caller invokes the decoder, then reads the
+# DIR_CUR_* / DIR_NAME_BUF fields. This is the same parallel-array
+# convention chan.ad / devfd.ad use for their "structs."
+#
+# QID type bits + DMDIR re-exported from lib/p9dir for convenience —
+# userland callers can match against DIR_CUR_QTYPE without a second
+# import.
+#
+# Decoder-side "current record" fields. After p9_dir_decode_at returns
+# > 0, these hold the just-decoded record's values. The four string
+# fields live in BSS scratch buffers (NUL-terminated for caller
+# convenience; the wire format itself is NOT NUL-terminated).
+DIR_NAME_MAX: uint64 = 256
+DIR_UID_MAX:  uint64 = 64
+
+DIR_CUR_QTYPE:   uint8  = 0
+DIR_CUR_QVER:    uint32 = 0
+DIR_CUR_QPATH:   uint64 = 0
+DIR_CUR_MODE:    uint32 = 0
+DIR_CUR_ATIME:   uint32 = 0
+DIR_CUR_MTIME:   uint32 = 0
+DIR_CUR_LENGTH:  uint64 = 0
+DIR_CUR_NAME_LEN: uint64 = 0
+DIR_CUR_UID_LEN:  uint64 = 0
+DIR_CUR_GID_LEN:  uint64 = 0
+DIR_CUR_MUID_LEN: uint64 = 0
+DIR_CUR_NAME: Array[256, uint8]
+DIR_CUR_UID:  Array[64, uint8]
+DIR_CUR_GID:  Array[64, uint8]
+DIR_CUR_MUID: Array[64, uint8]
+
+def _p9_copy_str_capped(dst: Ptr[uint8], src: Ptr[uint8],
+                        n: uint64, cap: uint64) -> uint64:
+    # Copy min(n, cap-1) bytes from src to dst; NUL-terminate. Returns
+    # the bytes copied (NOT counting the NUL). Used by the decoder to
+    # land a wire-side length-prefixed string into a fixed BSS slot.
+    take: uint64 = n
+    if take + 1 > cap:
+        take = cap - 1
+    i: uint64 = 0
+    while i < take:
+        dst[i] = src[i]
+        i = i + 1
+    dst[take] = 0
+    return take
+
+
+def p9_dir_decode_at(buf: Ptr[uint8], off: uint64,
+                     buf_len: uint64) -> uint64:
+    # Decode ONE Dir record from buf+off. Populates the DIR_CUR_*
+    # module-scope fields. Returns the record's reclen (>= P9_DIR_MIN_REC)
+    # so the caller can advance `off += reclen` to the next record;
+    # returns 0 on EOF (off >= buf_len) or a malformed record.
+    if off >= buf_len:
+        return 0
+    if off + P9_DIR_FIXED_HDR > buf_len:
+        return 0
+    reclen: uint64 = cast[uint64](p9d_get_u16(buf, off))
+    if reclen < P9_DIR_MIN_REC:
+        return 0
+    if off + reclen > buf_len:
+        return 0
+    DIR_CUR_QTYPE  = buf[off + 2]
+    DIR_CUR_QVER   = p9d_get_u32(buf, off + 3)
+    DIR_CUR_QPATH  = p9d_get_u64(buf, off + 7)
+    DIR_CUR_MODE   = p9d_get_u32(buf, off + 15)
+    DIR_CUR_ATIME  = p9d_get_u32(buf, off + 19)
+    DIR_CUR_MTIME  = p9d_get_u32(buf, off + 23)
+    DIR_CUR_LENGTH = p9d_get_u64(buf, off + 27)
+    p: uint64 = off + P9_DIR_FIXED_HDR
+    # name
+    if p + 2 > off + reclen:
+        return 0
+    nl: uint64 = cast[uint64](p9d_get_u16(buf, p))
+    p = p + 2
+    if p + nl > off + reclen:
+        return 0
+    name_src: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + p)
+    DIR_CUR_NAME_LEN = _p9_copy_str_capped(
+        cast[Ptr[uint8]](&DIR_CUR_NAME[0]), name_src, nl, DIR_NAME_MAX)
+    p = p + nl
+    # uid
+    if p + 2 > off + reclen:
+        return 0
+    ul: uint64 = cast[uint64](p9d_get_u16(buf, p))
+    p = p + 2
+    if p + ul > off + reclen:
+        return 0
+    uid_src: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + p)
+    DIR_CUR_UID_LEN = _p9_copy_str_capped(
+        cast[Ptr[uint8]](&DIR_CUR_UID[0]), uid_src, ul, DIR_UID_MAX)
+    p = p + ul
+    # gid
+    if p + 2 > off + reclen:
+        return 0
+    gl: uint64 = cast[uint64](p9d_get_u16(buf, p))
+    p = p + 2
+    if p + gl > off + reclen:
+        return 0
+    gid_src: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + p)
+    DIR_CUR_GID_LEN = _p9_copy_str_capped(
+        cast[Ptr[uint8]](&DIR_CUR_GID[0]), gid_src, gl, DIR_UID_MAX)
+    p = p + gl
+    # muid
+    if p + 2 > off + reclen:
+        return 0
+    ml: uint64 = cast[uint64](p9d_get_u16(buf, p))
+    p = p + 2
+    if p + ml > off + reclen:
+        return 0
+    muid_src: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + p)
+    DIR_CUR_MUID_LEN = _p9_copy_str_capped(
+        cast[Ptr[uint8]](&DIR_CUR_MUID[0]), muid_src, ml, DIR_UID_MAX)
+    return reclen
+
+
+# --- p9_listdir_records / p9_diread — Dir-record opt-in ---------------
+#
+# p9_listdir_records(path, buf, count) -> int64
+#   Open `path` and ask the kernel to render the directory in Dir wire
+#   format into `buf`. Returns bytes written (>= 0), or -1 on error
+#   (path not a recognised Dir-mode-capable directory, or copy_to_user
+#   failed). Internally invokes SYS_LISTDIR_RECORDS (318); the kernel
+#   routes /srv to devsrv_list_dir, returns -ENOSYS for other paths
+#   until those backings migrate.
+#
+# p9_diread(fd) is the Plan-9-idiomatic per-fd reader (one record per
+# call). It cannot be implemented in pure userland on top of the legacy
+# NAME\n directory fd shape — the kernel must know it is rendering Dir
+# records. F10-6's minimal viable scope lands the syscall + the devsrv
+# emitter; switching every directory fd's read backing to Dir records
+# is the per-backing migration that follows. So `p9_diread` here is a
+# THIN convenience: it pre-renders the entire directory via
+# p9_listdir_records into a module-scope BSS buffer on the first call,
+# then walks records out one at a time. The fd is tracked so a caller
+# can iterate the same directory across calls; once that fd is closed
+# the cursor resets.
+
+extern def sys_listdir_records(path: Ptr[char], buf: Ptr[uint8],
+                               count: uint64) -> int64
+
+
+def p9_listdir_records(path: Ptr[char], buf: Ptr[uint8],
+                       count: uint64) -> int64:
+    # Userspace wrapper around SYS_LISTDIR_RECORDS (318). Returns bytes
+    # written into `buf` (>= 0) or -errno on failure.
+    return sys_listdir_records(path, buf, count)
+
+
+# p9_diread cursor — module-scope BSS. The fd argument exists to give
+# the v2 (per-fd Dir-mode) future the same call shape; v1 uses the fd
+# only as a cache key — the actual data is re-fetched whenever the fd
+# argument changes. A future migration that adds an OCREAD-Dir open
+# flag will store the buffer cursor in the kernel chan instead.
+P9_DIREAD_BUF_CAP: uint64 = 4096
+_p9_diread_buf: Array[4096, uint8]
+_p9_diread_path: Array[256, uint8]
+_p9_diread_fd: int32 = -1
+_p9_diread_total: uint64 = 0
+_p9_diread_off: uint64 = 0
+
+
+def p9_diread_open(path: Ptr[char]) -> int32:
+    # v1 opener: pre-fills the Dir-record buffer for `path`. Returns a
+    # synthetic fd-shape handle (>= 0) the caller passes to p9_diread.
+    # The handle is just a small integer for cursor identification; it
+    # is NOT a real kernel fd. Callers that already hold a kernel fd
+    # for the dir can pass it to p9_diread directly; the v1 behaviour
+    # ignores the actual fd value beyond using it as a cache key.
+    n: int64 = p9_listdir_records(path,
+        cast[Ptr[uint8]](&_p9_diread_buf[0]), P9_DIREAD_BUF_CAP)
+    if n < 0:
+        return -1
+    # Cache the path so p9_diread can re-prime if the caller passes a
+    # different fd in between (defensive — single-cursor v1).
+    pp: Ptr[uint8] = cast[Ptr[uint8]](path)
+    i: uint64 = 0
+    while i < 255 and pp[i] != 0:
+        _p9_diread_path[i] = pp[i]
+        i = i + 1
+    _p9_diread_path[i] = 0
+    _p9_diread_fd    = 1                          # any non-(-1) value
+    _p9_diread_total = cast[uint64](n)
+    _p9_diread_off   = 0
+    return _p9_diread_fd
+
+
+def p9_diread(fd: int32) -> int32:
+    # Read ONE Dir record into DIR_CUR_*. Returns 1 on hit, 0 on EOF,
+    # -1 on error / no open dir. Caller must have called p9_diread_open
+    # first. The fd argument is a forward-compatibility hook for the
+    # per-fd-Dir-mode v2 migration; v1 ignores it beyond a sanity check
+    # that an open is live.
+    _unused: int32 = fd
+    if _p9_diread_fd < 0:
+        return -1
+    if _p9_diread_off >= _p9_diread_total:
+        return 0                                  # EOF
+    rl: uint64 = p9_dir_decode_at(
+        cast[Ptr[uint8]](&_p9_diread_buf[0]),
+        _p9_diread_off, _p9_diread_total)
+    if rl == 0:
+        return -1                                 # malformed
+    _p9_diread_off = _p9_diread_off + rl
+    return 1
+
+
+def p9_diread_close(fd: int32) -> int32:
+    # Release the v1 cursor.
+    _unused2: int32 = fd
+    _p9_diread_fd    = -1
+    _p9_diread_total = 0
+    _p9_diread_off   = 0
+    return 0

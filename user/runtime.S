@@ -267,6 +267,21 @@ sys_open:
     .size sys_open, .-sys_open
 
 
+    /* --- sys_listdir_records(path, buf, count) -> int64 -------------
+     * #458 F10-6: Plan 9 Dir-record directory read. Kernel renders the
+     * directory at `path` into `buf` (capped at `count`) as a stream of
+     * Dir wire-format records (see lib/p9dir.ad). Returns bytes written
+     * (>= 0) or -errno. v1 supports /srv; other paths return -ENOSYS.
+     */
+    .globl sys_listdir_records
+    .type sys_listdir_records, @function
+sys_listdir_records:
+    movq    $318, %rax              /* SYS_LISTDIR_RECORDS */
+    syscall
+    ret
+    .size sys_listdir_records, .-sys_listdir_records
+
+
     /* --- sys_open_write(path) -> int32 -------------------------------
      * Open-or-create for write. Truncates an existing file. Tmpfs
      * paths (/tmp/*) are the only writable target as of M16.37. */
