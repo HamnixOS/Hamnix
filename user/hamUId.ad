@@ -12828,6 +12828,243 @@ def post_present_overlays():
         rx1: int64 = imax(DRAG_X0, CUR_X) + 1
         ry1: int64 = imax(DRAG_Y0, CUR_Y) + 1
         scene_blit_rect_outline(rx0, ry0, rx1, ry1, 255, 255, 0)
+    # #442 (c): blit any v2 windows' kernel-side backbuffers directly to
+    # scanout. v2 windows BYPASS the daemon_pixel cascade entirely — the
+    # body pixels come straight from the kernel's per-window backbuffer
+    # via /dev/wsys/<wid>/backbuffer. v0/v1 windows are untouched.
+    v2_present_dirty_windows()
+
+
+# ====================================================================
+# #442 (c) RIO BLIT PROTOCOL — compositor adoption.
+# ====================================================================
+#
+# For each daemon window flagged DWIN_PROTO_V2[slot] == 1, the
+# compositor STOPS running daemon_pixel over its area. Instead it reads
+# /dev/wsys/<wid>/bbstate to learn the v2 dirty rect, then reads the
+# matching slice of /dev/wsys/<wid>/backbuffer and writes those pixels
+# directly to /dev/fb at the window's screen position. ONE memcpy per
+# damaged client rect; no per-pixel scene-graph walk.
+
+DWIN_PROTO_V2: Array[8, int32]      # 1 = this window opted into v2
+
+# Kernel-side backbuffer dims (must mirror the kernel constants in
+# sys/src/9/port/devwsys.ad — same shape lib/hamui.ad exposes).
+V2_BB_W: uint64 = 320
+V2_BB_H: uint64 = 200
+V2_BB_STRIDE: uint64 = 1280
+V2_BB_BYTES_PER_WIN: uint64 = 256000
+
+# Per-window last-seen v2 frame serial. The compositor skips a window
+# whose serial has not advanced.
+V2_LAST_SERIAL: Array[8, uint64]
+
+# Scratch for the bbstate line + one row of backbuffer pixels.
+v2_bbstate_buf: Array[256, uint8]
+v2_row_buf: Array[2048, uint8]      # cap one v2 row (W*4 = 1280B) + slack
+
+
+def v2_path_buf_for(wid: int32, leaf: Ptr[uint8], out: Ptr[uint8]):
+    # "/dev/wsys/<wid>/<leaf>\0" into out[].
+    i: uint64 = 0
+    p: Ptr[uint8] = "/dev/wsys/"
+    while p[i] != 0:
+        out[i] = p[i]
+        i = i + 1
+    # decimal wid
+    w: int32 = wid
+    digs: Array[8, uint8]
+    d: uint64 = 0
+    if w == 0:
+        digs[0] = 48
+        d = 1
+    while w > 0:
+        digs[d] = cast[uint8](w % 10) + 48
+        w = w / 10
+        d = d + 1
+    while d > 0:
+        d = d - 1
+        out[i] = digs[d]
+        i = i + 1
+    out[i] = 47                                  # '/'
+    i = i + 1
+    j: uint64 = 0
+    while leaf[j] != 0:
+        out[i] = leaf[j]
+        i = i + 1
+        j = j + 1
+    out[i] = 0
+
+
+def v2_parse_decimal_u64(buf: Ptr[uint8], pos: uint64, end: uint64,
+                         out: Ptr[uint64]) -> uint64:
+    # Skip leading whitespace, then read decimal digits into *out.
+    # Returns the position just past the last digit consumed.
+    p: uint64 = pos
+    while p < end and (buf[p] == 32 or buf[p] == 9):
+        p = p + 1
+    v: uint64 = 0
+    while p < end:
+        c: uint8 = buf[p]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[uint64](c) - 48
+        p = p + 1
+    out[0] = v
+    return p
+
+
+def v2_parse_decimal_i64(buf: Ptr[uint8], pos: uint64, end: uint64,
+                         out: Ptr[int64]) -> uint64:
+    p: uint64 = pos
+    while p < end and (buf[p] == 32 or buf[p] == 9):
+        p = p + 1
+    neg: int32 = 0
+    if p < end and buf[p] == 45:                # '-'
+        neg = 1
+        p = p + 1
+    v: int64 = 0
+    while p < end:
+        c: uint8 = buf[p]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[int64](c) - 48
+        p = p + 1
+    if neg != 0:
+        v = -v
+    out[0] = v
+    return p
+
+
+def v2_read_bbstate(wid: int32, ver_out: Ptr[uint64],
+                    serial_out: Ptr[uint64],
+                    x0_out: Ptr[int64], y0_out: Ptr[int64],
+                    x1_out: Ptr[int64], y1_out: Ptr[int64]) -> int32:
+    # Returns 1 on success (fields filled), 0 on read failure / wid unused.
+    path_local: Array[64, uint8]
+    v2_path_buf_for(wid, "bbstate", &path_local[0])
+    fd: int32 = sys_open(cast[Ptr[char]](&path_local[0]))
+    if fd < 0:
+        return 0
+    n: int64 = sys_read(fd, &v2_bbstate_buf[0], 256)
+    sys_close(fd)
+    if n <= 0:
+        return 0
+    end: uint64 = cast[uint64](n)
+    pos: uint64 = 0
+    pos = v2_parse_decimal_u64(&v2_bbstate_buf[0], pos, end, ver_out)
+    pos = v2_parse_decimal_u64(&v2_bbstate_buf[0], pos, end, serial_out)
+    pos = v2_parse_decimal_i64(&v2_bbstate_buf[0], pos, end, x0_out)
+    pos = v2_parse_decimal_i64(&v2_bbstate_buf[0], pos, end, y0_out)
+    pos = v2_parse_decimal_i64(&v2_bbstate_buf[0], pos, end, x1_out)
+    pos = v2_parse_decimal_i64(&v2_bbstate_buf[0], pos, end, y1_out)
+    return 1
+
+
+def v2_blit_window_dirty_rect(slot: uint64, wid: int32,
+                              dx0: int64, dy0: int64,
+                              dx1: int64, dy1: int64):
+    # Read the dirty rect's pixels out of /dev/wsys/<wid>/backbuffer and
+    # write them straight to /dev/fb at the window's screen position
+    # (body origin = window x+2, y+title_h). Done one row at a time so
+    # the scratch stays bounded.
+    if dx1 <= dx0 or dy1 <= dy0:
+        return
+    # Clip to backbuffer dims.
+    cx0: int64 = dx0
+    cy0: int64 = dy0
+    cx1: int64 = dx1
+    cy1: int64 = dy1
+    if cx0 < 0:
+        cx0 = 0
+    if cy0 < 0:
+        cy0 = 0
+    if cx1 > cast[int64](V2_BB_W):
+        cx1 = cast[int64](V2_BB_W)
+    if cy1 > cast[int64](V2_BB_H):
+        cy1 = cast[int64](V2_BB_H)
+    if cx1 <= cx0 or cy1 <= cy0:
+        return
+    row_w: int64 = cx1 - cx0
+    row_bytes: int64 = row_w * 4
+    if row_bytes > 2048:
+        row_bytes = 2048
+    # Open backbuffer for reading.
+    bb_path: Array[64, uint8]
+    v2_path_buf_for(wid, "backbuffer", &bb_path[0])
+    bb_fd: int32 = sys_open(cast[Ptr[char]](&bb_path[0]))
+    if bb_fd < 0:
+        return
+    # Open /dev/fb for writing.
+    fbp: Ptr[uint8] = "/dev/fb"
+    fb_fd: int32 = sys_open_write(cast[Ptr[char]](fbp))
+    if fb_fd < 0:
+        sys_close(bb_fd)
+        return
+    # Window screen origin (body-corner = x+2, y+title_h).
+    wx: int64 = DWIN_X[slot]
+    wy: int64 = DWIN_Y[slot]
+    bx0_screen: int64 = wx + 2
+    by0_screen: int64 = wy + title_h_of(slot)
+    sw: int64 = cast[int64](FBG_W)
+    yy: int64 = cy0
+    while yy < cy1:
+        # Seek backbuffer to (yy, cx0).
+        src_off: int64 = yy * cast[int64](V2_BB_STRIDE) + cx0 * 4
+        sys_lseek(bb_fd, src_off, SEEK_SET_HUI)
+        nr: int64 = sys_read(bb_fd, &v2_row_buf[0], cast[uint64](row_bytes))
+        if nr <= 0:
+            break
+        # Write to /dev/fb at (bx0_screen + (cx0 - dx0), by0_screen + (yy - dy0)).
+        scr_y: int64 = by0_screen + (yy - dy0)
+        scr_x: int64 = bx0_screen + (cx0 - dx0)
+        if scr_y < 0 or scr_x < 0:
+            yy = yy + 1
+            continue
+        if scr_y >= cast[int64](FBG_H):
+            break
+        fb_off: int64 = (scr_y * sw + scr_x) * 4
+        sys_lseek(fb_fd, fb_off, SEEK_SET_HUI)
+        sys_write(fb_fd, &v2_row_buf[0], cast[uint64](nr))
+        yy = yy + 1
+    sys_close(bb_fd)
+    sys_close(fb_fd)
+
+
+def v2_present_dirty_windows():
+    # Per-frame: walk DWIN slots; for each v2 window whose kernel-side
+    # backbuffer frame serial advanced since LAST_SERIAL[slot], blit the
+    # kernel dirty rect to scanout. This is the architectural win: the
+    # entire daemon_pixel cascade is SKIPPED for v2 windows.
+    i: uint64 = 0
+    while i < DWIN_COUNT:
+        if DWIN_PROTO_V2[i] != 0:
+            wid: int32 = DWIN_WID[i]
+            if wid > 0:
+                ver_v: uint64 = 0
+                ser_v: uint64 = 0
+                dx0v: int64 = 0
+                dy0v: int64 = 0
+                dx1v: int64 = 0
+                dy1v: int64 = 0
+                ok: int32 = v2_read_bbstate(wid, &ver_v, &ser_v,
+                                            &dx0v, &dy0v, &dx1v, &dy1v)
+                if ok != 0 and ver_v >= 2 and ser_v != V2_LAST_SERIAL[i]:
+                    v2_blit_window_dirty_rect(i, wid, dx0v, dy0v, dx1v, dy1v)
+                    V2_LAST_SERIAL[i] = ser_v
+        i = i + 1
+
+
+def v2_window_mark_proto(slot: int32) -> int32:
+    # Compositor verb: flip DWIN_PROTO_V2[slot] on. Used by the spawn-
+    # path / drag-to-create path when a client signals v2 (e.g. via an
+    # argv flag or the wctl `version 2` write the client itself does).
+    # Returns 0 on success, -1 if slot is out of range.
+    if slot < 0 or cast[uint64](slot) >= DWIN_COUNT:
+        return -1
+    DWIN_PROTO_V2[cast[uint64](slot)] = 1
+    V2_LAST_SERIAL[cast[uint64](slot)] = 0
+    return 0
 
 
 # Present the union accumulated this frame. A full-screen escalation uses
