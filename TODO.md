@@ -49,16 +49,6 @@ audit #453 closed; report at `audit_F10_report.md`. F10-1 #454, F10-2
   pipes/socketpair/p9/net/epoll-family/ptmx/fuse still mark-based;
   pipes = highest-leverage next fold; `NR_FDS=16` per task will pinch
   Debian userland).
-- [x] **F10-6 #458** — Plan 9 `Dir` record MVP landed (`b9572451`);
-  followup per-Chan `p9_dir_mode` + `_dirfile_read` migration + ls/du
-  migration landed `73e95a06`. Remaining deferred: per-entry mtime
-  (per-FS hook needed) + devproc dir backing + flip-back to mode 0.
-- [x] **F10-4 (#457) full**: structural landed `d193bbf8`; e2e harness
-  retooled `e8428bb9` — root cause of the flake was that `[mount]
-  uname=` printks defaulted to INFO and got swallowed by the
-  post-interactive console-loglevel gate; fix pre-latches WARN before
-  each marker. All 7 checks green. (F10-5 `a38cae28`; F10-7 bonus in
-  F10-2; F10-8 `983e1ce8`; F10-9/11/12 `f9c61595`; F10-10 `a31cfb00`.)
 - [~] **#459 fixed** `863f1765` — root cause was NOT the F10 wave but
   pre-existing F6 regression: `vfs_read` EISDIR short-circuit on
   DEV_DIR_FILE made every `p9_listdir` return -1 since #450 (74ff35e7);
@@ -98,14 +88,8 @@ cleanly** (per #459 above). When that's clear:
   already in main (verified during a); (c) image+dirty-rect wire format
   SPEC landed (40-line block at top of devwsys.ad), implementation
   across devwsys+hamUId+lib/hamui deferred to next increment.
-- [x] **Basic apps** — terminal+file browser landed earlier; Snake +
-  2048 menu-wired `5dd8b01b`; text editor `hamedit` menu-wired
-  `10e8dda5` (binary already existed).
 - [ ] **hamsh `use hamui`** — bindings; may need hamsh closures +
   event loop + persistent state.
-- [x] Per-window `uid` / `ns` files on `#w` landed `5681bab4` — uid
-  walks `task_lookup_by_pid`→`task_uid_at` (SETUID-stamp reflects with
-  no bespoke hook); ns dumps the owning Pgrp's bindings.
 - [ ] X11/Xvfb bridge in a kind=fb layer (path to Firefox/Chromium).
 - [~] snarf clipboard + `wctl` resize/move + focus click/sloppy kernel
   surface landed `d3842a22`. Compositor hamUId.ad adoption (poll-loop
@@ -164,21 +148,9 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
   Triage deferred until F10 wave finishes.
 
 ### Phase D follow-ups
-- [x] Layer-2 `/proc → /dev` namespace bind — landed `e09596bb`:
-  9 per-leaf binds in pgrp_init (cpuinfo/meminfo/uptime/loadavg/version/
-  hostname/stat/mounts/diskstats); deleted ~180 lines of
-  `_u_translate_proc_to_dev` string-rewrite.
-- [x] Union mounts MBEFORE/MAFTER — kernel side already honored union
-  list ordering; test coverage bumped `8bb14542` (3 MAFTER assertions).
-- [x] `create(260)` DMDIR — already routed through `vfs_mkdir`; test
-  coverage added `47ab21c5`.
 - [~] `stat`/`fstat` per-backend hooks — path-keyed `do_stat` migrated
   to F10-2-shape hook table `47ab21c5`. `do_fstat` already per-backend
   inline; per-server hook migration deferred.
-- [x] `fd2path` exact open()-time path — landed `9f9d9db3`.
-- [x] `wstat` length/mtime/mode — already in `_apply_wstat` (verified +
-  tested `9f9d9db3`). gid/muid still rejected with errstr; needs
-  per-inode storage (separate round).
 - [~] Delete the global `/var` tmpfs — per-Pgrp bind `/var → #t/var`
   already in place at `chan.ad:925` (F1 substrate). Namespace contract
   test added `9f9d9db3`. Backend-internal `vfs_mount` router entry
@@ -192,10 +164,6 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
   scaffolding committed. Runtime verification pending.
 
 ### §5 Modern async I/O (Layer 2 only)
-- [x] `io_uring` SQ/CQ rings — kernel shim already complete in main
-  (`linux_abi/u_iouring.ad` 2167 lines); userspace fixture landed
-  `65f870ca` proves SQE→CQE round-trip end-to-end. SQPOLL kernel thread
-  + IOSQE_IO_LINK chaining deferred.
 
 ### §7 Entropy
 - [~] ChaCha20 CSPRNG: seeding + fast-key-erasure + reseed cadence
@@ -218,19 +186,10 @@ Phase D inversion + §1..§13 critical path is closed. What remains:
   htree-grow conversion needs a different shape. Revisit.)
 
 ### §13 cdev / proc completions
-- [x] `/proc/net/*` — dev/route/arp/tcp/udp/sockstat all real
-  (`e7d68cc3`).
-- [x] Per-backend errstr (ext4/tmpfs/devnet prefixes) + userland
-  `perror` helper landed `7591d9fc`. Migrated initctl/hpm/cat.
 
 ### §14 Security (stretch)
-- [x] `seccomp-bpf` classic-BPF program landed via `2c81f4e3` cherry-
-  pick (kernel/seccomp_bpf.ad cBPF interpreter + per-task filter list +
-  fork inherit + PR_SET_SECCOMP_BPF prctl arm).
 
 ### §15 Compiler
-- [x] `match`/`case` statement landed `a9a701b1` — literal, name-bind,
-  wildcard `_`, OR `a|b`, sequence patterns. LANGUAGE.md updated.
 
 ### §17 stock-Linux `.ko` (lowest)
 - [ ] `MAX_EXPORTS` bumps; `usbcore`+`xhci_hcd`, `libphy`, `8021q`,
