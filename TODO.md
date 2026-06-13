@@ -98,8 +98,9 @@ cleanly** (per #459 above). When that's clear:
   already in main (verified during a); (c) image+dirty-rect wire format
   SPEC landed (40-line block at top of devwsys.ad), implementation
   across devwsys+hamUId+lib/hamui deferred to next increment.
-- [ ] **Basic apps** (after toolkit stable): terminal, text editor,
-  file browser, plus Snake + 2048.
+- [~] **Basic apps** — terminal+file browser landed earlier; Snake +
+  2048 menu-wired `5dd8b01b` (hamsnake/ham2048 binaries already existed,
+  added Applications-menu "Games" category). Remaining: text editor.
 - [ ] **hamsh `use hamui`** — bindings; may need hamsh closures +
   event loop + persistent state.
 - [ ] Per-window namespace + elevation visible in `uid` / `ns` files
