@@ -44,8 +44,24 @@ from fs.vfs import (
     vfs_rename, vfs_mkdir, resolve_path,
     vfs_fd_backing_info,
     vfs_truncate, vfs_chmod, vfs_set_mtime,
+    vfs_fs_rel,
+    # Phase D follow-up: per-backend stat hooks. do_stat dispatches
+    # through vfs_path_owning_server (the F10-2 perm-check ladder)
+    # to a per-server stat hook (_stat_hook_cpio / tmpfs / ext4 /
+    # stub). The SERVER_* codes are the same integers returned by
+    # _path_owning_server (frozen 1..11 contract).
+    vfs_path_owning_server,
+    SERVER_CPIO, SERVER_TMPFS, SERVER_EXT4,
+    SERVER_FAT, SERVER_DEVS, SERVER_BLOCK,
+    SERVER_PROC, SERVER_SRV, SERVER_NET,
+    SERVER_AUTH, SERVER_ROOT, SERVER_UNKNOWN,
 )
-from fs.tmpfs import tmpfs_slot_name, tmpfs_size
+from fs.tmpfs import (
+    tmpfs_slot_name, tmpfs_size,
+    # Phase D follow-up: tmpfs stat hook reads slot kind + size
+    # straight off the in-RAM table.
+    tmpfs_lookup, tmpfs_is_dir,
+)
 from fs.fat import fat_open_size
 from fs.cpio import (
     initramfs_entry_count, initramfs_entry_name,
@@ -57,6 +73,9 @@ from fs.ext4 import ext4_create_file
 from fs.ext4 import (
     ext4_inode_owner_at, ext4_read_inode, ext4_write_inode,
     ext4_inode_set_mode, ext4_resolve_file,
+    # Phase D follow-up: ext4 stat hook uses ext4_resolve_dir to
+    # detect directory inodes (resolve_file returns 0 on dirs).
+    ext4_resolve_dir,
 )
 from fs.vfs import vfs_write, vfs_read
 
@@ -355,10 +374,119 @@ def do_create(path_user: uint64, flags: int32, mode: uint32) -> int64:
 
 
 # --- do_stat ------------------------------------------------------
-# Look up `path` in the initramfs (other FS backends to follow as
-# they grow stat support) and serialise a Dir record into `buf`.
-# Returns the number of bytes written on success, -1 on failure
-# with errstr set.
+# Phase D follow-up: do_stat dispatches through vfs_path_owning_server
+# (the F10-2 perm-check ladder) to a per-backend stat hook. Each
+# server contributes its own hook: cpio + tmpfs + ext4 produce REAL
+# metadata (inode/slot id, file size, dir-vs-file qtype); stub backends
+# (devs / proc / srv / net / auth / block / FAT / root) emit a "sane
+# defaults" synthetic Dir record so stat(2) always succeeds on a known
+# path, mirroring the chan_permission_check shape.
+#
+# Returns the number of bytes written on success, -1 on failure with
+# errstr set.
+
+def _stat_hook_cpio(abs_path: Ptr[uint8], buf_user: uint64,
+                    nbuf: uint64) -> int64:
+    # cpio archive lookup. qid.path = inode index (stable across runs
+    # because the cpio entries are laid out at link-time). cpio is flat,
+    # but the archive can carry dirs with mode 040755 — we don't model
+    # those today (every cpio hit is QTFILE / 0644).
+    idx: int32 = _cpio_lookup(abs_path)
+    if idx < 0:
+        set_current_errstr("stat failed: file does not exist")
+        return cast[int64](-1)
+    name_off: uint64 = _basename_offset(abs_path)
+    name_len: uint64 = _cstr_len_u8(abs_path) - name_off
+    size: uint64 = initramfs_entry_size(cast[uint64](idx))
+    return _write_dir_record(buf_user, nbuf,
+                             QTFILE, cast[uint64](idx),
+                             cast[uint32](0644),
+                             size,
+                             cast[Ptr[uint8]](cast[uint64](abs_path) + name_off),
+                             name_len)
+
+
+def _stat_hook_tmpfs(abs_path: Ptr[uint8], buf_user: uint64,
+                     nbuf: uint64) -> int64:
+    # tmpfs slot lookup. tmpfs slots remember their kind (file vs dir)
+    # and per-slot size; the slot id is the stable qid. mtime is the
+    # universal jiffies stamp _write_dir_record bakes in — when the
+    # caller writes through vfs_write the slot's size grows, so two
+    # back-to-back stats of a written file return DIFFERENT lengths
+    # (the visible-mtime proxy at this milestone).
+    slot: int32 = tmpfs_lookup(cast[Ptr[char]](abs_path))
+    if slot < 0:
+        set_current_errstr("stat failed: file does not exist")
+        return cast[int64](-1)
+    name_off: uint64 = _basename_offset(abs_path)
+    name_len: uint64 = _cstr_len_u8(abs_path) - name_off
+    qtype: uint8 = QTFILE
+    mode: uint32 = cast[uint32](0644)
+    sz: uint64 = 0
+    if tmpfs_is_dir(slot) != 0:
+        qtype = QTDIR
+        mode = DMDIR | cast[uint32](0755)
+    else:
+        sz = tmpfs_size(slot)
+    return _write_dir_record(buf_user, nbuf,
+                             qtype, cast[uint64](cast[uint32](slot)),
+                             mode, sz,
+                             cast[Ptr[uint8]](cast[uint64](abs_path) + name_off),
+                             name_len)
+
+
+def _stat_hook_ext4(abs_path: Ptr[uint8], buf_user: uint64,
+                    nbuf: uint64) -> int64:
+    # ext4: real on-disk inode + size. vfs_fs_rel strips the longest-
+    # match mount prefix (e.g. "/ext/bin/cat" → "bin/cat"). Try the
+    # file resolve first; if that misses, try the dir resolve so stat
+    # of an ext4 directory returns a QTDIR record. qid.path = inum
+    # (Plan 9 idiom: a stable per-file integer identity, sourced from
+    # the real ext4 inode number).
+    leaf: Ptr[char] = vfs_fs_rel(cast[Ptr[char]](abs_path))
+    inum: uint32 = 0
+    fsize: uint64 = 0
+    name_off: uint64 = _basename_offset(abs_path)
+    name_len: uint64 = _cstr_len_u8(abs_path) - name_off
+    if ext4_resolve_file(leaf, &inum, &fsize) != 0:
+        return _write_dir_record(buf_user, nbuf,
+                                 QTFILE, cast[uint64](inum),
+                                 cast[uint32](0644),
+                                 fsize,
+                                 cast[Ptr[uint8]](cast[uint64](abs_path) + name_off),
+                                 name_len)
+    dinum: uint32 = ext4_resolve_dir(leaf)
+    if dinum != 0:
+        return _write_dir_record(buf_user, nbuf,
+                                 QTDIR, cast[uint64](dinum),
+                                 DMDIR | cast[uint32](0755),
+                                 0,
+                                 cast[Ptr[uint8]](cast[uint64](abs_path) + name_off),
+                                 name_len)
+    set_current_errstr("stat failed: file does not exist")
+    return cast[int64](-1)
+
+
+def _stat_hook_stub(abs_path: Ptr[uint8], buf_user: uint64,
+                    nbuf: uint64, qid: uint64) -> int64:
+    # Sane-defaults hook used by backends that don't carry per-entry
+    # metadata at this milestone (devs / proc / srv / net / auth /
+    # block / FAT / root). Always succeeds (the path-owning-server
+    # ladder already accepted the path as belonging to a known server,
+    # so the entry is known to be a live surface). qid.path is the
+    # server code so two stats of the same backend share a qid prefix;
+    # mode is a read-only file (0444) for the conservative default —
+    # callers wanting write-mode should open the live server's ctl
+    # interface, not read the synthetic stat.
+    name_off: uint64 = _basename_offset(abs_path)
+    name_len: uint64 = _cstr_len_u8(abs_path) - name_off
+    return _write_dir_record(buf_user, nbuf,
+                             QTFILE, qid,
+                             cast[uint32](0444),
+                             0,
+                             cast[Ptr[uint8]](cast[uint64](abs_path) + name_off),
+                             name_len)
+
 
 def do_stat(path_user: uint64, buf_user: uint64,
             nbuf: uint64) -> int64:
@@ -371,21 +499,43 @@ def do_stat(path_user: uint64, buf_user: uint64,
     if rc != 0:
         set_current_errstr("stat failed: path too long")
         return cast[int64](-1)
-    # cpio / initramfs lookup. tmpfs / ext4 / fat support lands in a
-    # follow-up — for now those paths fall through to "not found".
-    idx: int32 = _cpio_lookup(&abs_path[0])
-    if idx < 0:
-        set_current_errstr("stat failed: file does not exist")
-        return cast[int64](-1)
-    # Build the Dir record. qid.path = inode index, qid.type = file
-    # (cpio is flat so we never hit DMDIR here), mode = 0644.
-    name_off: uint64 = _basename_offset(&abs_path[0])
-    name_len: uint64 = _cstr_len_u8(&abs_path[0]) - name_off
-    size: uint64 = initramfs_entry_size(cast[uint64](idx))
-    return _write_dir_record(buf_user, nbuf,
-                             QTFILE, cast[uint64](idx),
-                             cast[uint32](0644),
-                             size, &abs_path[name_off], name_len)
+    # Per-backend dispatch. The SERVER_* codes mirror the F10-2 perm-
+    # check ladder so add-a-backend = add-a-hook here.
+    srv: int32 = vfs_path_owning_server(cast[Ptr[char]](&abs_path[0]))
+    if srv == SERVER_CPIO:
+        return _stat_hook_cpio(&abs_path[0], buf_user, nbuf)
+    if srv == SERVER_TMPFS:
+        return _stat_hook_tmpfs(&abs_path[0], buf_user, nbuf)
+    if srv == SERVER_EXT4:
+        return _stat_hook_ext4(&abs_path[0], buf_user, nbuf)
+    if srv == SERVER_FAT:
+        return _stat_hook_stub(&abs_path[0], buf_user, nbuf,
+                               cast[uint64](SERVER_FAT))
+    if srv == SERVER_DEVS:
+        return _stat_hook_stub(&abs_path[0], buf_user, nbuf,
+                               cast[uint64](SERVER_DEVS))
+    if srv == SERVER_BLOCK:
+        return _stat_hook_stub(&abs_path[0], buf_user, nbuf,
+                               cast[uint64](SERVER_BLOCK))
+    if srv == SERVER_PROC:
+        return _stat_hook_stub(&abs_path[0], buf_user, nbuf,
+                               cast[uint64](SERVER_PROC))
+    if srv == SERVER_SRV:
+        return _stat_hook_stub(&abs_path[0], buf_user, nbuf,
+                               cast[uint64](SERVER_SRV))
+    if srv == SERVER_NET:
+        return _stat_hook_stub(&abs_path[0], buf_user, nbuf,
+                               cast[uint64](SERVER_NET))
+    if srv == SERVER_AUTH:
+        return _stat_hook_stub(&abs_path[0], buf_user, nbuf,
+                               cast[uint64](SERVER_AUTH))
+    if srv == SERVER_ROOT:
+        return _stat_hook_stub(&abs_path[0], buf_user, nbuf,
+                               cast[uint64](SERVER_ROOT))
+    # SERVER_UNKNOWN: the F10-2 default-deny trap. No backend claims
+    # the path → ENOENT-shape failure here.
+    set_current_errstr("stat failed: file does not exist")
+    return cast[int64](-1)
 
 
 # --- do_fstat -----------------------------------------------------

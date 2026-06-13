@@ -18,8 +18,14 @@
 #
 # The fixture exercises each primitive against a backend that does
 # support it today: stat / fstat / fd2path against the cpio-backed
-# /etc/motd, create + remove against tmpfs (/tmp/p9). DMDIR create
-# and pipe / socket fd2path return -1 with errstr; the fixture
+# /etc/motd, create + remove against tmpfs (/tmp/p9). Phase D follow-
+# ups added two extra cases:
+#   * create(DMDIR|0755) routes through vfs_mkdir to tmpfs_mkdir
+#     (markers: `create DMDIR /tmp/p9d ok`).
+#   * stat dispatches through vfs_path_owning_server so different
+#     backends produce different qid.path values + qid.type bits
+#     (marker: `stat hooks per-backend ok`).
+# Pipe / socket fd2path still return -1 with errstr; the fixture
 # doesn't exercise those gaps (they're documented in TODO.md).
 
 . "$(dirname "$0")/_build_lock.sh"
@@ -56,15 +62,18 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
-(
-    # Let the kernel finish its smoke tests before hamsh starts
-    # SYS_READ'ing stdin. Same pacing as scripts/test_rfork.sh.
-    sleep 3
-    printf '/bin/test_p9file\n'
-    sleep 3
-    printf 'exit\n'
-    sleep 1
-) | timeout 20s qemu-system-x86_64 \
+# Drive hamsh through a FIFO so we can gate keystrokes on the boot-ready
+# marker (memory note: interactive_test_wait_for_prompt). Fixed sleeps
+# alone pass in isolation but flake under integration when boot slows.
+# Re-send each command until its own marker appears in the log
+# (memory note: serial_test_first_cmd_dropped — freshly-booted hamsh
+# drops the FIRST serial command line).
+FIFO=$(mktemp -u)
+mkfifo "$FIFO"
+exec 9<>"$FIFO"
+rm -f "$FIFO"
+
+timeout 60s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -72,7 +81,50 @@ set +e
     -m 256M \
     -monitor none \
     -serial stdio \
-    > "$LOG" 2>&1
+    <&9 > "$LOG" 2>&1 &
+QEMU_PID=$!
+
+# Wait for hamsh's loop-enter / stage-08 prompt marker, then send the
+# fixture command. Re-send up to 6× until the [p9file] start banner
+# appears in the log.
+sent_marker=0
+for try in 1 2 3 4 5 6; do
+    waited=0
+    while [ $waited -lt 30 ]; do
+        if grep -F -q "[p9file] start" "$LOG" 2>/dev/null; then
+            sent_marker=1
+            break
+        fi
+        if grep -F -q "[hamsh:stage-08]" "$LOG" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if [ $sent_marker -eq 1 ]; then break; fi
+    printf '/bin/test_p9file\n' >&9
+    # Give hamsh a moment to consume + print before re-sending.
+    sleep 4
+    if grep -F -q "[p9file] start" "$LOG" 2>/dev/null; then
+        sent_marker=1
+        break
+    fi
+done
+
+# Wait for the PASS / final marker, with a hard cap so a crashed fixture
+# doesn't dangle the whole test.
+waited=0
+while [ $waited -lt 25 ]; do
+    if grep -F -q "[p9file] PASS" "$LOG" 2>/dev/null; then break; fi
+    if grep -F -q "[p9file] FAIL" "$LOG" 2>/dev/null; then break; fi
+    sleep 1
+    waited=$((waited + 1))
+done
+
+printf 'exit\n' >&9
+sleep 2
+exec 9>&-
+wait "$QEMU_PID" 2>/dev/null
 rc=$?
 set -e
 
@@ -127,6 +179,22 @@ if grep -F -q "[p9file] remove /tmp/p9 ok" "$LOG"; then
     echo "[test_p9file] OK: SYS_REMOVE (263) unlinked tmpfs file"
 else
     echo "[test_p9file] MISS: remove failed"
+    fail=1
+fi
+
+# Phase D follow-up A: create(DMDIR|0755) → vfs_mkdir → tmpfs_mkdir.
+if grep -F -q "[p9file] create DMDIR /tmp/p9d ok" "$LOG"; then
+    echo "[test_p9file] OK: SYS_CREATE DMDIR routed to tmpfs_mkdir"
+else
+    echo "[test_p9file] MISS: DMDIR create failed"
+    fail=1
+fi
+
+# Phase D follow-up B: per-backend stat hooks return distinct qids.
+if grep -F -q "[p9file] stat hooks per-backend ok" "$LOG"; then
+    echo "[test_p9file] OK: SYS_STAT_P9 dispatched per-backend"
+else
+    echo "[test_p9file] MISS: per-backend stat hooks failed"
     fail=1
 fi
 
