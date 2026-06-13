@@ -13,6 +13,38 @@ Markers: `[ ]` open · `[~]` in flight.
 
 ---
 
+## ⚠ Direction (2026-06-13)
+
+**Plan 9 reshape largely done; hard focus on DE performance.** User
+tested fresh installer in QEMU: DE loads but every interactive
+operation (rubber-band, menu open, window drag) drops UI to ~0.5 Hz.
+Spurious keystrokes appear when dragging windows. With one terminal +
+sysmon open, mouse is unusable. With nothing open, mouse is fast.
+
+**Architectural calls:**
+1. Mouse cursor MUST render independently of compositor work — never
+   gated by window / menu / lock paths.
+2. Panels and apps render through `lib/hamui.ad` (the GTK-like toolkit),
+   NOT raw primitives. Toolkit is the base, not the exception.
+3. Aspirationally that pipeline runs over the Vulkan spine (#181-185),
+   even software-rasterized — but immediate work is fixing the current
+   slow path.
+
+**Repro:**
+```
+bash scripts/build_installer_img.sh
+qemu-system-x86_64 -enable-kvm -cpu host \
+  -bios /usr/share/ovmf/OVMF.fd \
+  -drive file=./build/hamnix-installer.img,format=raw,if=virtio \
+  -m 1G -vga std -serial stdio -no-reboot
+```
+
+See memory [[project_de_perf_pivot]].
+
+NUC: boots; USB mouse still dead on metal (filed, not blocking).
+
+---
+
 ## ⚠ Namespace law
 
 Hamnix is **Plan 9-shaped. There is NO global filesystem route.** A
