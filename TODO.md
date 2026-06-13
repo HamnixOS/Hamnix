@@ -30,6 +30,15 @@ sysmon open, mouse is unusable. With nothing open, mouse is fast.
    even software-rasterized — but immediate work is fixing the current
    slow path.
 
+**Also broken in the same QEMU session** (see [[project_de_terminal_namespace]]):
+- DE terminal opens to an empty `/` — no `/bin`, no `/net`, no `/srv`.
+  In Plan 9 model files = capabilities; empty namespace = no powers.
+- Need a normal-user namespace template that `daemon_spawn_window_prog`
+  applies before exec.
+- Need an elevation path: `newshell hostowner` in the DE terminal must
+  rebind to the hostowner template (same mounts as the serial shell)
+  AND have access to `enter linux` (the L-shim distrofs namespace).
+
 **Repro:**
 ```
 bash scripts/build_installer_img.sh
