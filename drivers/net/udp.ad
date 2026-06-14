@@ -7,8 +7,14 @@
 #                DHCP client port) routes to dhcp_rx; the DNS
 #                client pool (53000..53003) routes to dns_rx; any
 #                other port is matched against the UDP socket
-#                table (a bound SOCK_DGRAM socket). A datagram with
-#                no listener triggers an ICMP port-unreachable.
+#                table (a bound SOCK_DGRAM socket). If still no
+#                match, the kernel-listener registry is walked —
+#                a general (port, handler_fn, peer_data) table
+#                installed via udp_register_listener (used by
+#                vxlan.ad on port 4789 and wireguard.ad on port
+#                51820 to receive their outer datagrams without
+#                pretending to be a userland socket). A datagram
+#                with no listener triggers an ICMP port-unreachable.
 #
 #   udp_send(...) builds the 8-byte UDP header in front of the
 #                payload and calls ip_send with protocol=17. The
@@ -26,7 +32,8 @@
 # This is a Layer-2 facility — it CONSUMES ip_send/udp_send, it is
 # not a substrate beneath the native stack.
 
-from kernel.printk.printk import printk0, printk1, printk2
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
 from drivers.net.ip import ip_send, IPPROTO_UDP
 from drivers.net.virtio_net import virtio_net_poll
 from arch.x86.kernel.time import pit_monotonic_us
@@ -468,6 +475,161 @@ def udp_deliver_icmp_error(orig_dst_ip: uint32, orig_dst_port: uint16,
 
 
 # =====================================================================
+# Kernel-listener registry (general port -> handler dispatch)
+# =====================================================================
+#
+# A fixed-size table of (port, handler_fn, peer_data) entries. The
+# entrypoint udp_register_listener installs a callback that udp_rx
+# invokes after DHCP / DNS / the bound-socket table have all missed.
+#
+# This is the generic in-kernel listener mechanism for native data
+# planes that want their outer UDP datagrams without going through the
+# Linux-ABI socket layer. Today's users:
+#
+#   port 4789  -> vxlan.ad (VXLAN bridge listener)
+#   port 51820 -> wireguard.ad (WG interface listener — does its own
+#                 dst_ip demux across A/B endpoints internally)
+#
+# Handler signature: (peer_data, src_ip, src_port, payload, payload_len)
+# where `payload` points at the UDP payload (NOT the UDP header) and
+# `peer_data` is the opaque uint64 the listener registered with.
+
+UDP_LISTENER_MAX: uint64 = 16
+
+# Handler function-pointer type. Adder Fn[] reads return-first, then
+# arg types: void return, then five argument types.
+_udp_listener_inuse:    Array[16, uint8]
+_udp_listener_port:     Array[16, uint16]
+_udp_listener_peer:     Array[16, uint64]
+_udp_listener_handler:  Array[16,
+    Fn[None, uint64, uint32, uint16, Ptr[uint8], uint64]]
+
+# Counters (smoke-friendly).
+udp_listener_dispatches: uint64 = 0
+
+
+def udp_listener_init():
+    # Reset the listener registry. Called from udp_init; idempotent.
+    i: uint64 = 0
+    while i < UDP_LISTENER_MAX:
+        _udp_listener_inuse[i]   = 0
+        _udp_listener_port[i]    = 0
+        _udp_listener_peer[i]    = 0
+        _udp_listener_handler[i] = cast[
+            Fn[None, uint64, uint32, uint16, Ptr[uint8], uint64]](0)
+        i = i + 1
+    udp_listener_dispatches = 0
+
+
+def udp_register_listener(port: uint16,
+                          handler: Fn[None, uint64, uint32, uint16,
+                                       Ptr[uint8], uint64],
+                          peer_data: uint64) -> int32:
+    # Install a listener on `port`. Returns the slot index on success,
+    # -1 if the table is full or arguments are bad. Re-registering on
+    # an already-claimed (port, peer_data) pair overwrites the handler.
+    if port == 0:
+        return -1
+    if handler == cast[
+            Fn[None, uint64, uint32, uint16, Ptr[uint8], uint64]](0):
+        return -1
+    i: uint64 = 0
+    while i < UDP_LISTENER_MAX:
+        if _udp_listener_inuse[i] != 0:
+            if _udp_listener_port[i] == port:
+                if _udp_listener_peer[i] == peer_data:
+                    _udp_listener_handler[i] = handler
+                    return cast[int32](i)
+        i = i + 1
+    i = 0
+    while i < UDP_LISTENER_MAX:
+        if _udp_listener_inuse[i] == 0:
+            _udp_listener_inuse[i]   = 1
+            _udp_listener_port[i]    = port
+            _udp_listener_peer[i]    = peer_data
+            _udp_listener_handler[i] = handler
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def udp_unregister_listener(port: uint16, peer_data: uint64) -> int32:
+    # Remove the (port, peer_data) listener. Returns 1 if removed, 0 if
+    # no matching entry was found.
+    i: uint64 = 0
+    while i < UDP_LISTENER_MAX:
+        if _udp_listener_inuse[i] != 0:
+            if _udp_listener_port[i] == port:
+                if _udp_listener_peer[i] == peer_data:
+                    _udp_listener_inuse[i]   = 0
+                    _udp_listener_port[i]    = 0
+                    _udp_listener_peer[i]    = 0
+                    _udp_listener_handler[i] = cast[
+                        Fn[None, uint64, uint32, uint16,
+                           Ptr[uint8], uint64]](0)
+                    return 1
+        i = i + 1
+    return 0
+
+
+def _udp_listener_dispatch(dst_port: uint16, src_ip: uint32,
+                           src_port: uint16, payload: Ptr[uint8],
+                           length: uint64) -> int32:
+    # Walk the registry; first matching (port) entry handles it.
+    # Returns 1 if a listener was dispatched, 0 if none matched.
+    i: uint64 = 0
+    while i < UDP_LISTENER_MAX:
+        if _udp_listener_inuse[i] != 0:
+            if _udp_listener_port[i] == dst_port:
+                udp_listener_dispatches = udp_listener_dispatches + 1
+                h: Fn[None, uint64, uint32, uint16, Ptr[uint8], uint64] = \
+                    _udp_listener_handler[i]
+                h(_udp_listener_peer[i], src_ip, src_port, payload, length)
+                return 1
+        i = i + 1
+    return 0
+
+
+def udp_local_inject(src_ip: uint32, src_port: uint16,
+                     dst_ip: uint32, dst_port: uint16,
+                     payload: Ptr[uint8], length: uint64) -> int32:
+    # In-VM loopback shim: synthesize a UDP datagram arriving from
+    # (src_ip:src_port) destined to (dst_ip:dst_port) and feed it
+    # through the real udp_rx demux. The datagram never crosses the
+    # NIC. Used by vxlan.ad and wireguard.ad to test wired data paths
+    # without needing a peer VM. Returns 1 on dispatch, 0 if udp_rx
+    # had no listener (port-unreachable path).
+    # `dst_ip` is currently informational — udp_rx is single-IP and
+    # does not filter on dst_ip; per-IP demux is the listener's own
+    # job (see wireguard's two-endpoint dispatcher).
+    if length + UDP_HDR_LEN > UDP_TX_BYTES:
+        return 0
+    udp_tx_buf[0] = cast[uint8]((cast[uint32](src_port) >> 8) & 0xFF)
+    udp_tx_buf[1] = cast[uint8](cast[uint32](src_port) & 0xFF)
+    udp_tx_buf[2] = cast[uint8]((cast[uint32](dst_port) >> 8) & 0xFF)
+    udp_tx_buf[3] = cast[uint8](cast[uint32](dst_port) & 0xFF)
+    ulen: uint16 = cast[uint16](UDP_HDR_LEN + length)
+    udp_tx_buf[4] = cast[uint8]((cast[uint32](ulen) >> 8) & 0xFF)
+    udp_tx_buf[5] = cast[uint8](cast[uint32](ulen) & 0xFF)
+    udp_tx_buf[6] = 0
+    udp_tx_buf[7] = 0
+    i: uint64 = 0
+    while i < length:
+        udp_tx_buf[UDP_HDR_LEN + i] = payload[i]
+        i = i + 1
+    sb0: uint8 = cast[uint8]((src_ip >> 24) & 0xFF)
+    sb1: uint8 = cast[uint8]((src_ip >> 16) & 0xFF)
+    sb2: uint8 = cast[uint8]((src_ip >> 8) & 0xFF)
+    sb3: uint8 = cast[uint8](src_ip & 0xFF)
+    before: uint64 = udp_listener_dispatches
+    udp_rx(cast[Ptr[uint8]](&udp_tx_buf[0]),
+           UDP_HDR_LEN + length, sb0, sb1, sb2, sb3)
+    if udp_listener_dispatches > before:
+        return 1
+    return 0
+
+
+# =====================================================================
 # UDP receive / transmit
 # =====================================================================
 
@@ -514,6 +676,14 @@ def udp_rx(payload: Ptr[uint8], length: uint64,
                        | cast[uint32](src_b3)
         _uds_enqueue(cast[uint64](sk), src_ip, src_port,
                      inner, inner_len)
+        return
+    # Kernel-listener registry (vxlan / wireguard / etc.).
+    listener_src_ip: uint32 = (cast[uint32](src_b0) << 24) \
+                            | (cast[uint32](src_b1) << 16) \
+                            | (cast[uint32](src_b2) << 8) \
+                            | cast[uint32](src_b3)
+    if _udp_listener_dispatch(dst_port, listener_src_ip, src_port,
+                              inner, inner_len) == 1:
         return
     # No listener. Bump the no-port counter and emit an ICMP
     # destination-unreachable / port-unreachable so the sender learns
@@ -570,7 +740,8 @@ def udp_init():
     udp_out_datagrams = 0
     udp_no_ports      = 0
     udp_socket_init()
-    printk0("udp: initialized (incl. socket table)\n")
+    udp_listener_init()
+    printk0("udp: initialized (incl. socket table + listener registry)\n")
 
 
 # Counter accessors for cross-module smokes (e1000e_traffic.ad's
@@ -658,3 +829,141 @@ def udp_netcap_dequeue_ok(slot_signed: int32, expect_byte0: uint8,
 # declaration is needed; we just call the symbols directly and trust
 # they exist at link time. (A forward `extern def` here would collide
 # with the real definition — see merge_programs in compiler/adder.py.)
+
+
+# =====================================================================
+# Listener-registry selftest (deterministic, no NIC required)
+# =====================================================================
+
+_udp_test_fired_count:  uint64 = 0
+_udp_test_last_peer:    uint64 = 0
+_udp_test_last_src_ip:  uint32 = 0
+_udp_test_last_src_port: uint16 = 0
+_udp_test_last_len:     uint64 = 0
+_udp_test_last_byte0:   uint8  = 0
+_udp_test_last_byte_last: uint8 = 0
+
+
+def _udp_test_listener(peer: uint64, src_ip: uint32, src_port: uint16,
+                       payload: Ptr[uint8], length: uint64):
+    _udp_test_fired_count   = _udp_test_fired_count + 1
+    _udp_test_last_peer     = peer
+    _udp_test_last_src_ip   = src_ip
+    _udp_test_last_src_port = src_port
+    _udp_test_last_len      = length
+    if length > 0:
+        _udp_test_last_byte0 = payload[0]
+        _udp_test_last_byte_last = payload[length - 1]
+
+
+_udp_test_payload: Array[64, uint8]
+
+
+def udp_listener_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [udp-listener] markers.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[udp-listener] self-test start\n")
+    udp_listener_init()
+    _udp_test_fired_count = 0
+    ok: int32 = 1
+
+    plen: uint64 = 32
+    i: uint64 = 0
+    while i < plen:
+        _udp_test_payload[i] = cast[uint8]((0x40 + i) & 0xFF)
+        i = i + 1
+
+    test_port: uint16 = 33333
+    peer_tag:  uint64 = 0xCAFEBABE
+    rc: int32 = udp_register_listener(test_port, _udp_test_listener,
+                                      peer_tag)
+    if rc < 0:
+        printk0("[udp-listener] FAIL: register rc<0\n")
+        return 0
+    printk0("[udp-listener] PASS register\n")
+
+    src_ip:   uint32 = (10 << 24) | (1 << 16) | (2 << 8) | 3
+    src_port: uint16 = 4242
+    dst_ip:   uint32 = (10 << 24) | (1 << 16) | (2 << 8) | 9
+    udp_local_inject(src_ip, src_port, dst_ip, test_port,
+                     cast[Ptr[uint8]](&_udp_test_payload[0]), plen)
+    if _udp_test_fired_count != 1:
+        printk1("[udp-listener] FAIL: fired_count=%d != 1\n",
+                _udp_test_fired_count)
+        ok = 0
+    else:
+        printk0("[udp-listener] PASS dispatch-fired-once\n")
+    if _udp_test_last_peer != peer_tag:
+        printk1("[udp-listener] FAIL: peer mismatch 0x%x\n",
+                _udp_test_last_peer)
+        ok = 0
+    else:
+        printk0("[udp-listener] PASS peer-data-roundtrip\n")
+    if _udp_test_last_src_ip != src_ip:
+        printk0("[udp-listener] FAIL: src_ip mismatch\n")
+        ok = 0
+    else:
+        printk0("[udp-listener] PASS src-ip-roundtrip\n")
+    if _udp_test_last_src_port != src_port:
+        printk1("[udp-listener] FAIL: src_port=%d\n",
+                cast[uint64](_udp_test_last_src_port))
+        ok = 0
+    else:
+        printk0("[udp-listener] PASS src-port-roundtrip\n")
+    if _udp_test_last_len != plen:
+        printk1("[udp-listener] FAIL: len=%d\n", _udp_test_last_len)
+        ok = 0
+    else:
+        printk0("[udp-listener] PASS payload-length-roundtrip\n")
+    if _udp_test_last_byte0 != _udp_test_payload[0]:
+        printk0("[udp-listener] FAIL: byte0 mismatch\n")
+        ok = 0
+    else:
+        if _udp_test_last_byte_last != _udp_test_payload[plen - 1]:
+            printk0("[udp-listener] FAIL: byte_last mismatch\n")
+            ok = 0
+        else:
+            printk0("[udp-listener] PASS payload-bytes-roundtrip\n")
+
+    urc: int32 = udp_unregister_listener(test_port, peer_tag)
+    if urc != 1:
+        printk0("[udp-listener] FAIL: unregister rc!=1\n")
+        ok = 0
+    else:
+        printk0("[udp-listener] PASS unregister\n")
+    udp_local_inject(src_ip, src_port, dst_ip, test_port,
+                     cast[Ptr[uint8]](&_udp_test_payload[0]), plen)
+    if _udp_test_fired_count != 1:
+        printk1("[udp-listener] FAIL: stale dispatch after unregister count=%d\n",
+                _udp_test_fired_count)
+        ok = 0
+    else:
+        printk0("[udp-listener] PASS no-dispatch-after-unregister\n")
+
+    other_port: uint16 = 33334
+    rc2: int32 = udp_register_listener(test_port, _udp_test_listener,
+                                       peer_tag)
+    if rc2 < 0:
+        printk0("[udp-listener] FAIL: re-register\n")
+        return 0
+    rc3: int32 = udp_register_listener(other_port, _udp_test_listener,
+                                       cast[uint64](0xDEADBEEF))
+    if rc3 < 0:
+        printk0("[udp-listener] FAIL: register other_port\n")
+        return 0
+    udp_local_inject(src_ip, src_port, dst_ip, other_port,
+                     cast[Ptr[uint8]](&_udp_test_payload[0]), plen)
+    if _udp_test_last_peer != cast[uint64](0xDEADBEEF):
+        printk0("[udp-listener] FAIL: other_port peer mismatch\n")
+        ok = 0
+    else:
+        printk0("[udp-listener] PASS multi-port-routing\n")
+
+    udp_unregister_listener(test_port, peer_tag)
+    udp_unregister_listener(other_port, cast[uint64](0xDEADBEEF))
+
+    if ok == 1:
+        printk0("[udp-listener] PASS\n")
+        return 1
+    printk0("[udp-listener] FAIL\n")
+    return 0

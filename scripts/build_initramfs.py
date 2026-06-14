@@ -2665,6 +2665,15 @@ if os.environ.get("ENABLE_VXLAN_OVERLAY_TEST") == "1":
 if os.environ.get("ENABLE_WIREGUARD_OVERLAY_TEST") == "1":
     FILES.append(("/etc/wireguard-overlay-test", b"1\n"))
 
+# UDP kernel-listener registry self-test. scripts/test_udp_listener_registry.sh
+# sets ENABLE_UDP_LISTENER_TEST=1 to plant /etc/udp-listener-test;
+# init/main.ad's boot:37.udp_listener gate runs udp_listener_selftest()
+# (drivers/net/udp.ad), exercising udp_register_listener +
+# udp_local_inject + udp_unregister_listener with a synthetic listener.
+# Prints "[udp-listener] PASS" / FAIL. Default boots ship no marker.
+if os.environ.get("ENABLE_UDP_LISTENER_TEST") == "1":
+    FILES.append(("/etc/udp-listener-test", b"1\n"))
+
 # Native IEEE 802.1Q VLAN tagging self-test. scripts/test_vlan.sh sets
 # ENABLE_VLAN_TEST=1 to plant /etc/vlan-test; init/main.ad's boot:37.vlan
 # gate then runs vlan_selftest() (drivers/net/vlan.ad), a pure in-memory

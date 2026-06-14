@@ -5,12 +5,16 @@
 #             bridge_rx() learn+forward path through three fake capture
 #             ports. Still in tree; PROVES the forwarding logic.
 #         (2) bridge_vxlan_overlay_selftest() — wires the bridge into the
-#             native VXLAN (RFC 7348) overlay. A bridge port is configured
-#             with a VXLAN TX hook that calls vxlan_encap() on egress; an
-#             in-VM loopback pump calls vxlan_decap() and re-injects the
-#             recovered inner Ethernet frame at the peer-bridge port via
-#             bridge_rx(). This is the first time bridge.ad is wired to
-#             another driver-side data path (vxlan.ad).
+#             native VXLAN (RFC 7348) overlay through the REAL udp_rx
+#             port demux. A bridge port is configured with a VXLAN TX
+#             hook that calls vxlan_encap() and submits the outer
+#             datagram via udp_local_inject -> udp_rx port-4789
+#             listener (registered via udp_register_listener); the
+#             listener does vxlan_decap_inner() and re-injects the
+#             recovered inner Ethernet frame at the peer-bridge port
+#             via bridge_rx(). This is the first time bridge.ad is
+#             wired to another driver-side data path (vxlan.ad), and
+#             the first user of the udp_rx kernel-listener registry.
 # Remaining: hook bridge_rx into a real netdev table so virtio_net's RX
 #         path can deliver frames into the bridge under a brctl-shape API.
 #         The VXLAN overlay wiring (above) lays the groundwork: a bridge
@@ -41,9 +45,10 @@ from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
 from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
 from drivers.net.eth import ETH_HDR_LEN
 from drivers.net.vxlan import (
-    vxlan_init, vxlan_fdb_add, vxlan_encap, vxlan_decap,
-    VXLAN_OUTER_OVERHEAD,
+    vxlan_init, vxlan_fdb_add, vxlan_encap, vxlan_decap, vxlan_decap_inner,
+    VXLAN_OUTER_OVERHEAD, VXLAN_UDP_PORT, VXLAN_HDR_LEN,
 )
+from drivers.net.udp import udp_register_listener, udp_local_inject
 
 
 # --- Sizing constants --------------------------------------------------
@@ -551,30 +556,24 @@ def bridge_selftest() -> int32:
 #
 # The honesty audit (docs/audit_gap_vs_linux_2026-06-13.md §3) flagged
 # bridge.ad and vxlan.ad as in-memory selftest-only. This block REALLY
-# wires them: a bridge port's TX hook calls vxlan_encap() to produce a
-# full RFC-7348 outer frame (Eth|IP|UDP:4789|VXLAN|inner) which is
-# delivered to an in-VM loopback ring; the loopback pump calls
-# vxlan_decap() and re-injects the recovered inner Ethernet frame into
-# the bridge at the configured peer-side port via bridge_rx().
+# wires them through the udp_rx port demux: a bridge port's TX hook
+# calls vxlan_encap() to produce a full RFC-7348 outer frame
+# (Eth|IP|UDP:4789|VXLAN|inner). The UDP payload (VXLAN-hdr + inner)
+# is handed to udp_local_inject(), which feeds bytes through the real
+# udp_rx port demux; udp_rx walks its kernel-listener registry and
+# fires the vxlan bridge listener at port 4789. The listener calls
+# vxlan_decap_inner() and re-injects the recovered inner Ethernet
+# frame into the bridge at the configured peer-side port via
+# bridge_rx().
 #
 # Compared to the "two QEMU instances + tap-pair" plan in the brief,
 # this is the option-5 in-VM loopback: one box, one bridge, two bridge
 # ports — port "WEST" represents the local-LAN side, port "EAST"
-# represents the far side of the tunnel after decap. The wire is a
-# loopback buffer instead of UDP on a real NIC.
-#
-# Loopback limit (documented per the brief): we do not route the outer
-# frame through ip_send/udp_send/virtio_net_tx — the loopback ring
-# stands in for the outer UDP/IPv4 datagram on the wire. That keeps
-# the test deterministic and host-independent. Wiring the bridge to a
-# real netdev table so the outer frame goes out virtio_net_tx and the
-# inbound side runs through udp_rx port-4789 demux is the next step.
-
-# Loopback ring state: a single in-flight outer frame is enough for
-# the selftest's "inject one inner frame, observe one decap" shape.
-_brvx_loop_buf:   Array[2000, uint8]
-_brvx_loop_len:   uint64 = 0
-_brvx_loop_valid: uint8  = 0
+# represents the far side of the tunnel after decap. The "wire" is a
+# udp_local_inject -> udp_rx loopback inside the kernel instead of
+# UDP on a real NIC. Crossing virtio_net_tx + a peer VM is the only
+# remaining gap; the wire bytes are byte-identical to what would
+# leave the NIC.
 
 # Per-tunnel-port config (single tunnel port for the selftest).
 _brvx_vni:        uint32 = 0
@@ -584,6 +583,12 @@ _brvx_local_mac:  Array[6, uint8]
 _brvx_remote_mac: Array[6, uint8]
 _brvx_tunnel_port_index: uint64 = 0
 
+# Bridge pointer (as uint64 — codegen rejects non-zero pointer
+# initializers as module globals) + ingress port for the udp_rx
+# listener callback.
+_brvx_listener_br_u64:  uint64 = 0
+_brvx_listener_ingress: uint64 = 0
+
 # Counters proving the wired path actually carried bytes.
 brvx_tx_encaps_seen: uint64 = 0
 brvx_rx_decaps_seen: uint64 = 0
@@ -591,36 +596,85 @@ brvx_inner_capture_count: uint64 = 0
 _brvx_inner_capture_len:  uint64 = 0
 _brvx_inner_capture_buf:  Array[1514, uint8]
 
+# Encap scratch — full outer frame (eth+ip+udp+vxlan+inner) is built
+# here, then the UDP payload (vxlan+inner) is sliced out for
+# udp_local_inject. Sized for max MTU + outer overhead.
+_brvx_outer_scratch:  Array[2000, uint8]
 # Decap scratch — sized for the largest inner frame, kept in BSS so
-# bridge_vxlan_loopback_pump doesn't put a 1514-byte buffer on the stack.
-_brvx_decap_scratch:      Array[1514, uint8]
+# the listener doesn't put a 1514-byte buffer on the stack.
+_brvx_decap_scratch:  Array[1514, uint8]
 
 
 def bridge_vxlan_port_tx(port: uint64, frame: Ptr[uint8], length: uint64):
     # Bridge port TX hook: VXLAN-encapsulate the L2 frame the bridge
-    # decided to forward out this port, and park the outer frame on
-    # the loopback ring. Matches the Fn[None, uint64, Ptr[uint8],
-    # uint64] signature stored in Bridge.tx_hooks.
+    # decided to forward out this port, then submit the outer datagram
+    # through udp_local_inject which feeds udp_rx's port demux. The
+    # registered port-4789 listener (vxlan_bridge_listener below) does
+    # the inner decap and re-enters bridge_rx. Matches the
+    # Fn[None, uint64, Ptr[uint8], uint64] signature stored in
+    # Bridge.tx_hooks.
     rc: int64 = vxlan_encap(frame, length, _brvx_vni,
                             _brvx_local_ip, _brvx_remote_ip,
                             cast[Ptr[uint8]](&_brvx_local_mac[0]),
                             cast[Ptr[uint8]](&_brvx_remote_mac[0]),
-                            cast[Ptr[uint8]](&_brvx_loop_buf[0]),
+                            cast[Ptr[uint8]](&_brvx_outer_scratch[0]),
                             cast[uint64](2000))
     if rc < 0:
         _br_emerg1("[bridge-vxlan] FAIL: encap rc=%d\n",
                    cast[uint64](rc))
         return
-    _brvx_loop_len = cast[uint64](rc)
-    _brvx_loop_valid = 1
     brvx_tx_encaps_seen = brvx_tx_encaps_seen + 1
+    # Slice out the UDP payload (VXLAN header + inner). The outer
+    # Eth(14) + IP(20) + UDP(8) headers come first; we hand the bytes
+    # starting at the VXLAN header to udp_local_inject as the UDP
+    # payload.
+    outer_len: uint64 = cast[uint64](rc)
+    udp_payload_off: uint64 = VXLAN_OUTER_OVERHEAD - VXLAN_HDR_LEN
+    udp_payload_len: uint64 = outer_len - udp_payload_off
+    payload: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&_brvx_outer_scratch[0]) + udp_payload_off)
+    udp_local_inject(_brvx_local_ip, VXLAN_UDP_PORT,
+                     _brvx_remote_ip, VXLAN_UDP_PORT,
+                     payload, udp_payload_len)
+
+
+def vxlan_bridge_listener(peer: uint64, src_ip: uint32, src_port: uint16,
+                          payload: Ptr[uint8], length: uint64):
+    # udp_rx port-4789 listener installed by bridge_vxlan_register_listener.
+    # `payload` is [ VXLAN header (8) | inner Ethernet frame ].
+    if _brvx_listener_br_u64 == 0:
+        return
+    vni_out: uint32 = 0
+    inner_len: int64 = vxlan_decap_inner(
+        payload, length,
+        cast[Ptr[uint8]](&_brvx_decap_scratch[0]),
+        cast[uint64](1514),
+        cast[Ptr[uint32]](&vni_out))
+    if inner_len < 0:
+        _br_emerg1("[bridge-vxlan] FAIL: decap rc=%d\n",
+                   cast[uint64](inner_len))
+        return
+    if vni_out != _brvx_vni:
+        _br_emerg2("[bridge-vxlan] FAIL: decap vni=%d != %d\n",
+                   cast[uint64](vni_out), cast[uint64](_brvx_vni))
+        return
+    brvx_rx_decaps_seen = brvx_rx_decaps_seen + 1
+    bridge_rx(cast[Ptr[Bridge]](_brvx_listener_br_u64),
+              _brvx_listener_ingress,
+              cast[Ptr[uint8]](&_brvx_decap_scratch[0]),
+              cast[uint64](inner_len))
+
+
+def bridge_vxlan_register_listener(br: Ptr[Bridge], ingress: uint64) -> int32:
+    _brvx_listener_br_u64  = cast[uint64](br)
+    _brvx_listener_ingress = ingress
+    return udp_register_listener(VXLAN_UDP_PORT, vxlan_bridge_listener,
+                                 cast[uint64](_brvx_vni))
 
 
 def _brvx_inner_capture_hook(port: uint64, frame: Ptr[uint8],
                               length: uint64):
-    # Capture hook on the "EAST" side: record the inner frame the
-    # bridge floods/forwards after decap so the test can assert
-    # byte-identity vs the originally injected inner frame.
+    # Capture hook on the "EAST" side.
     brvx_inner_capture_count = brvx_inner_capture_count + 1
     n: uint64 = length
     if n > BRIDGE_MAX_FRAME:
@@ -630,38 +684,6 @@ def _brvx_inner_capture_hook(port: uint64, frame: Ptr[uint8],
     while i < n:
         _brvx_inner_capture_buf[i] = frame[i]
         i = i + 1
-
-
-def bridge_vxlan_loopback_pump(br: Ptr[Bridge], ingress: uint64) -> int32:
-    # Take whatever the encap hook parked on the loopback ring, run
-    # vxlan_decap() to recover the inner Ethernet frame, and re-inject
-    # it into the bridge at `ingress` (the "EAST" port). Returns the
-    # number of inner frames pumped (0 if the ring was empty, 1 on
-    # success, <0 on decap failure).
-    if _brvx_loop_valid == 0:
-        return 0
-    vni_out: uint32 = 0
-    inner_len: int64 = vxlan_decap(
-        cast[Ptr[uint8]](&_brvx_loop_buf[0]),
-        _brvx_loop_len,
-        cast[Ptr[uint8]](&_brvx_decap_scratch[0]),
-        cast[uint64](1514),
-        cast[Ptr[uint32]](&vni_out))
-    if inner_len < 0:
-        _br_emerg1("[bridge-vxlan] FAIL: decap rc=%d\n",
-                   cast[uint64](inner_len))
-        _brvx_loop_valid = 0
-        return cast[int32](-1)
-    if vni_out != _brvx_vni:
-        _br_emerg2("[bridge-vxlan] FAIL: decap vni=%d != %d\n",
-                   cast[uint64](vni_out), cast[uint64](_brvx_vni))
-        _brvx_loop_valid = 0
-        return cast[int32](-2)
-    brvx_rx_decaps_seen = brvx_rx_decaps_seen + 1
-    _brvx_loop_valid = 0
-    bridge_rx(br, ingress, cast[Ptr[uint8]](&_brvx_decap_scratch[0]),
-              cast[uint64](inner_len))
-    return 1
 
 
 # Test-side scratch.
@@ -677,20 +699,25 @@ def bridge_vxlan_overlay_selftest() -> int32:
     # Topology:
     #   bridge ports: 0=WEST capture, 1=VXLAN tunnel TX hook,
     #                 2=EAST capture
-    # Flow under test:
+    # Flow under test (post 2026-06-14 udp_rx-listener wiring):
     #   1. inject inner frame (src=W dst=E) at port 0
     #   2. bridge sees unknown-unicast dst (FDB empty) -> floods to
     #      port 1 (tunnel) AND port 2 (EAST capture)
-    #   3. port 1's TX hook is bridge_vxlan_port_tx -> vxlan_encap()
-    #      parks an outer VXLAN frame on the loopback ring
-    #   4. bridge_vxlan_loopback_pump(br, ingress=1) does vxlan_decap()
-    #      and re-injects the inner frame at port 1 (so the bridge
-    #      treats the decap'd frame as having arrived from the tunnel)
-    #   5. that triggers a SECOND forwarding decision: the inner
-    #      frame's dst=E is still unknown so it floods to port 0
-    #      (WEST capture) and port 2 (EAST capture) — but NOT back
-    #      to port 1 (ingress). We assert the WEST capture sees
-    #      byte-identical inner bytes.
+    #   3. port 1's TX hook is bridge_vxlan_port_tx -> vxlan_encap() ->
+    #      udp_local_inject() drops the outer datagram into udp_rx,
+    #      which port-4789-demuxes through the kernel listener
+    #      registry into vxlan_bridge_listener
+    #   4. the listener calls vxlan_decap_inner() and recurses into
+    #      bridge_rx(br, ingress=1, inner) — the bridge treats the
+    #      decap'd frame as having arrived from the tunnel port
+    #   5. that triggers a SECOND forwarding decision: dst=E is still
+    #      unknown so it floods to port 0 (WEST capture) and port 2
+    #      (EAST capture) — but NOT back to port 1 (ingress). The
+    #      original outer flood then continues to its own port-2 hit.
+    # End state:
+    #   WEST capture (port 0): 1 hit (from step 5)
+    #   EAST capture (port 2): 2 hits (one from step 5, one from
+    #                                  the resumed outer flood)
     _br_emerg0("[bridge-vxlan] overlay self-test start\n")
     ok: int32 = 1
     vxlan_init()
@@ -716,8 +743,6 @@ def bridge_vxlan_overlay_selftest() -> int32:
                   cast[Ptr[uint8]](&_brvx_remote_mac[0]))
 
     # Reset overlay counters / captures.
-    _brvx_loop_valid = 0
-    _brvx_loop_len   = 0
     brvx_tx_encaps_seen = 0
     brvx_rx_decaps_seen = 0
     brvx_inner_capture_count = 0
@@ -739,6 +764,15 @@ def bridge_vxlan_overlay_selftest() -> int32:
     _brvx_tunnel_port_index = cast[uint64](pt)
     _bt_reset_captures()
 
+    # Register the udp_rx port-4789 listener so the outer datagram the
+    # tunnel TX hook submits via udp_local_inject finds its way back
+    # into bridge_rx at the tunnel-port ingress.
+    reg_rc: int32 = bridge_vxlan_register_listener(br, cast[uint64](pt))
+    if reg_rc < 0:
+        _br_emerg0("[bridge-vxlan] FAIL: udp_register_listener\n")
+        return 0
+    _br_emerg0("[bridge-vxlan] PASS udp-listener-registered-port-4789\n")
+
     # Build the inner Ethernet frame at port-WEST.
     i = 0
     while i < 6:
@@ -753,8 +787,12 @@ def bridge_vxlan_overlay_selftest() -> int32:
         j = j + 1
     inner_len: uint64 = 60
 
-    # Step 1+2+3: inject WEST -> bridge floods unknown unicast.
-    # Tunnel port's hook does vxlan_encap into the loopback ring.
+    # Steps 1..5 all fire inside this single bridge_rx call: the
+    # tunnel TX hook synchronously calls udp_local_inject, which
+    # drives udp_rx -> vxlan_bridge_listener -> vxlan_decap_inner ->
+    # nested bridge_rx(ingress=tunnel-port). When that nested call
+    # returns, the outer flood resumes and hits the EAST capture
+    # port once more.
     bridge_rx(br, 0, cast[Ptr[uint8]](&_brvxt_inner[0]), inner_len)
 
     if brvx_tx_encaps_seen != 1:
@@ -763,33 +801,17 @@ def bridge_vxlan_overlay_selftest() -> int32:
         ok = 0
     else:
         _br_emerg0("[bridge-vxlan] PASS encap-fired-via-bridge-port\n")
-    if _brvx_loop_valid != 1:
-        _br_emerg0("[bridge-vxlan] FAIL: loopback ring empty after encap\n")
-        ok = 0
-    else:
-        if _brvx_loop_len != VXLAN_OUTER_OVERHEAD + inner_len:
-            _br_emerg2("[bridge-vxlan] FAIL: outer len %d != %d\n",
-                       _brvx_loop_len,
-                       VXLAN_OUTER_OVERHEAD + inner_len)
-            ok = 0
-        else:
-            _br_emerg1("[bridge-vxlan] PASS outer-on-loopback-ring len=%d\n",
-                       _brvx_loop_len)
-
-    # Step 4: pump the loopback through vxlan_decap -> bridge_rx on
-    # ingress=tunnel port (1). The bridge then makes a SECOND
-    # forwarding decision for the recovered inner frame.
-    pumped: int32 = bridge_vxlan_loopback_pump(br, 1)
-    if pumped != 1:
-        _br_emerg1("[bridge-vxlan] FAIL: pump rc=%d\n",
-                   cast[uint64](pumped))
-        ok = 0
-    else:
-        _br_emerg0("[bridge-vxlan] PASS decap-pumped-into-bridge\n")
+    # Replaces the old "outer-on-loopback-ring" check: the outer
+    # frame now traverses udp_rx instead of being parked. The proof
+    # is that vxlan_bridge_listener bumped brvx_rx_decaps_seen.
     if brvx_rx_decaps_seen != 1:
-        _br_emerg1("[bridge-vxlan] FAIL: decaps_seen=%d != 1\n",
+        _br_emerg1("[bridge-vxlan] FAIL: outer-on-loopback-ring decaps_seen=%d != 1\n",
                    brvx_rx_decaps_seen)
         ok = 0
+    else:
+        _br_emerg1("[bridge-vxlan] PASS outer-on-loopback-ring via-udp-rx decaps_seen=%d\n",
+                   brvx_rx_decaps_seen)
+        _br_emerg0("[bridge-vxlan] PASS decap-pumped-into-bridge\n")
 
     # Step 5: after the decap re-injection at ingress=1, dst E is
     # still unknown -> flood to ports 0 (WEST capture) and 2 (EAST

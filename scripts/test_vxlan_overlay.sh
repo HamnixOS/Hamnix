@@ -6,21 +6,21 @@
 # calls bridge_vxlan_overlay_selftest() (drivers/net/bridge.ad).
 #
 # Unlike scripts/test_vxlan.sh (which round-trips encap/decap inside
-# vxlan.ad only) this test PROVES the cross-driver wiring: a bridge
-# port's TX hook is bridge_vxlan_port_tx() which calls vxlan_encap();
-# its output sits on an in-VM loopback ring; the loopback pump calls
-# vxlan_decap() and re-injects the inner Ethernet frame at the
-# peer-bridge port via bridge_rx(). The test asserts the inner frame
-# captured at a WEST-side bridge port is byte-identical to what was
-# originally injected on the EAST side.
+# vxlan.ad only) this test PROVES the cross-driver wiring through the
+# REAL udp_rx port demux: a bridge port's TX hook is
+# bridge_vxlan_port_tx() which calls vxlan_encap() then
+# udp_local_inject(); the bytes traverse the real udp_rx pipeline and
+# the port-4789 listener (registered via udp_register_listener in
+# drivers/net/udp.ad) calls vxlan_decap_inner() and re-injects the
+# inner Ethernet frame at the peer-bridge port via bridge_rx(). The
+# test asserts the inner frame captured at a WEST-side bridge port is
+# byte-identical to what was originally injected on the EAST side.
 #
 # This is the option-5 in-VM loopback chosen over the two-QEMU-instance
 # tap setup (per the task brief): one box, deterministic, host-
 # independent, but proves the same wiring property. The remaining gap
-# is routing the outer UDP/IPv4 datagram through virtio_net_tx /
-# udp_rx port-4789 demux instead of a loopback buffer — the inner
-# vxlan_encap byte stream is already RFC-7348-correct (proven by
-# test_vxlan.sh's checksum-recompute assertions).
+# is routing the outer UDP/IPv4 datagram across virtio_net_tx to a peer
+# VM — the udp_rx port demux + listener dispatch is real now.
 #
 # Pass marker:  [bridge-vxlan] PASS
 # Fail marker:  [bridge-vxlan] FAIL  /  [boot:37.vxlan_overlay] FAIL
@@ -103,4 +103,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_vxlan_overlay] PASS — native VXLAN overlay wired through the learning bridge: bridge_rx -> bridge port TX hook -> vxlan_encap -> in-VM loopback -> vxlan_decap -> bridge_rx delivers the inner Ethernet frame byte-identical to a capture port on the far side"
+echo "[test_vxlan_overlay] PASS — native VXLAN overlay wired through the learning bridge via the REAL udp_rx port-4789 demux: bridge_rx -> bridge port TX hook -> vxlan_encap -> udp_local_inject -> udp_rx -> vxlan_bridge_listener -> vxlan_decap_inner -> bridge_rx delivers the inner Ethernet frame byte-identical to a capture port on the far side"

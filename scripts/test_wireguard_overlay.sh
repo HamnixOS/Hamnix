@@ -8,26 +8,24 @@
 #
 # Unlike scripts/test_wireguard.sh (which round-trips encap/decap inside
 # wireguard.ad only and never leaves the protocol's own buffers) this
-# test PROVES the cross-driver wiring: a WG virtual interface's egress
-# hook is wg_iface_xmit() which calls wg_transport_seal() to produce a
-# real ChaCha20-Poly1305 transport message and parks it on an in-VM
-# UDP-shape wire ring (src/dst ip + port + payload). The wire pump
-# (wg_wire_pump) drains one outer datagram, port-51820-demuxes it
-# against a 2-endpoint listener registry, and feeds the payload into
-# wg_udp_rx() which dispatches by WG type byte (INIT=1, RESPONSE=2,
-# TRANSPORT=4) and on TRANSPORT calls wg_transport_open() to deliver
-# the inner packet at the peer's WG interface. The Noise IKpsk2
-# handshake (initiation + response) ALSO rides the same wire — the
-# whole protocol completes through the wire, no direct cross-endpoint
-# call.
+# test PROVES the cross-driver wiring through the REAL udp_rx port
+# demux: a WG virtual interface's egress hook is wg_iface_xmit() which
+# calls wg_transport_seal() to produce a real ChaCha20-Poly1305
+# transport message then hands it to udp_local_inject(). The bytes
+# traverse the real udp_rx pipeline and the port-51820 listener
+# (registered via udp_register_listener in drivers/net/udp.ad) is
+# wg_udp_listener — which src_ip-demuxes between the two endpoints
+# (A's outbound src == A_ep -> deliver to B, etc.) and calls
+# wg_udp_rx() to dispatch by WG type byte (INIT=1, RESPONSE=2,
+# TRANSPORT=4); on TRANSPORT, wg_transport_open() decrypts the inner
+# packet at the peer's WG interface. The Noise IKpsk2 handshake
+# (initiation + response) ALSO rides the same path.
 #
 # This is the option-5 in-VM loopback chosen over a two-QEMU + tap
 # setup (per the task brief): one box, deterministic, host-independent,
-# but proves the same wiring property. The remaining gap is routing
-# the outer UDP/IPv4 datagram through virtio_net_tx + udp_rx port-51820
-# demux instead of the wire ring — that needs a listener registry in
-# drivers/net/udp.ad (today the port demux is hardcoded for DHCP / DNS /
-# the socket table).
+# but proves the same wiring property. The remaining gap is crossing
+# virtio_net_tx to a peer VM — the udp_rx port demux + listener
+# dispatch is real now.
 #
 # Pass marker:  [wireguard-overlay] PASS
 # Fail marker:  [wireguard-overlay] FAIL  /  [boot:37.wireguard_overlay] FAIL
