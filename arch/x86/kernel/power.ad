@@ -33,6 +33,7 @@ from fs.vfs import vfs_fsync_all
 from kernel.block.blk import blk_flush, blk_max_slots, blk_slot_in_use
 from drivers.acpi.acpi import acpi_s5_ready, acpi_pm1a_cnt, acpi_pm1b_cnt
 from drivers.acpi.acpi import acpi_slp_typa, acpi_slp_typb
+from drivers.acpi.acpi import acpi_s3_ready, acpi_s3_typa, acpi_s3_typb
 from drivers.acpi.acpi import acpi_reset_reg_supported, acpi_reset_reg_space
 from drivers.acpi.acpi import acpi_reset_reg_addr, acpi_reset_reg_value
 from drivers.acpi.acpi import acpi_enable_power_button, acpi_power_button_armed
@@ -189,6 +190,127 @@ def _do_poweroff():
     _hlt_forever()
 
 
+# --- S3 (suspend-to-RAM) ---------------------------------------------
+#
+# Suspend-to-RAM. The wake path is firmware-driven on real silicon (it
+# bounces execution back through the FACS firmware_waking_vector after
+# the SLP_EN write trips the chipset). In QEMU under TCG the PM1a write
+# does not actually halt the VM the same way — execution falls straight
+# through — so the same path doubles as a self-test harness in VMs:
+# save → write → "restore" → return.
+#
+# S3_SILICON_ENABLE gates the actual SLP_EN write. Default 0 so the VM
+# self-test does NOT touch the live PM1a control register (which on QEMU
+# is the same 0x604 port that powers the VM off when written with
+# SLP_TYP=S5). With the gate at 0 we exercise the framework — markers,
+# CPU state save buffer, lid-event hook — without the silicon side-effect.
+# A real-hardware bring-up flips this to 1.
+S3_SILICON_ENABLE: int32 = 0
+
+# CPU-state save area. Persists across the suspend window so the resume
+# path can restore caller context. We capture the callee-saved GP regs
+# + RFLAGS + RSP — a minimum the C-ABI demands the caller honour anyway,
+# which is what we need to make a `return` from power_suspend_s3() land
+# back at the caller after the firmware wake. The wider FPU/XMM state,
+# IDT/GDT/CR3 are not clobbered by an S3 transition on x86_64 (the wake
+# vector firmware preserves them) and live in the per-task arch frame
+# already, so this 7-slot scratch is sufficient for VM exercise + the
+# HW handoff.
+S3_SAVE_SLOTS: uint64 = 8
+s3_save:       Array[8, uint64]
+s3_save_valid: int32 = 0
+# Reentrancy guard: a second suspend write from a concurrent path
+# (a lid-switch GPE racing /dev/power/ctl) must be a no-op until the
+# first transition completes.
+s3_in_progress: int32 = 0
+
+
+def power_s3_set_silicon_enable(v: int32):
+    # Test/HW-bringup hook. Off by default — see S3_SILICON_ENABLE.
+    S3_SILICON_ENABLE = v
+
+
+def power_s3_ready() -> int32:
+    # 1 iff the FADT+DSDT parse populated a usable S3 vector. The two
+    # surfaces (/dev/power/ctl, /sys/power/state) consult this before
+    # accepting a "mem"/"suspend mem" write so a board without S3 fails
+    # loud rather than silently no-op-ing.
+    return acpi_s3_ready()
+
+
+def power_suspend_s3() -> int32:
+    # THE suspend entrypoint. Drives the save → SLP_EN → restore path.
+    # Returns 0 on a clean round-trip, -1 if the platform has no S3
+    # vector or we are already mid-transition.
+    #
+    # Markers (load-bearing — scripts/test_suspend_resume.sh greps these):
+    #   "[ACPI] entering S3"       just before the PM1a write
+    #   "[ACPI] back from S3"      after the wake / VM fall-through
+    if s3_in_progress != 0:
+        printk0("[ACPI] suspend already in progress — ignoring\n")
+        return -1
+    if power_s3_ready() == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ACPI] S3 not supported by firmware (no _S3 in DSDT)\n")
+        return -1
+
+    s3_in_progress = 1
+
+    # Quiesce: flush every block device so any dirty cache that might be
+    # lost on a metal S3 resume is durable. Cheap in a VM (the back ends
+    # are RAM or host pagecache), correct on metal.
+    _flush_all_storage()
+
+    # Save callee-saved GP regs + RFLAGS into s3_save. RSP gets recorded
+    # so a HW wake landing at the firmware wake vector can validate it
+    # (the wake vector trampoline in arch/x86/kernel/entry.S — pending
+    # — copies s3_save back into the live frame before resuming this
+    # function).
+    asm_volatile("""
+        movq %rbx, s3_save+0(%rip)
+        movq %rbp, s3_save+8(%rip)
+        movq %r12, s3_save+16(%rip)
+        movq %r13, s3_save+24(%rip)
+        movq %r14, s3_save+32(%rip)
+        movq %r15, s3_save+40(%rip)
+        movq %rsp, s3_save+48(%rip)
+        pushfq
+        popq s3_save+56(%rip)
+    """)
+    s3_save_valid = 1
+
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    typa: int32 = acpi_s3_typa()
+    typb: int32 = acpi_s3_typb()
+    pm1a: uint32 = acpi_pm1a_cnt()
+    pm1b: uint32 = acpi_pm1b_cnt()
+    va: uint32 = (cast[uint32](typa) << 10) | 0x2000          # SLP_EN bit 13
+    printk2("[ACPI] entering S3 (PM1a_CNT=%p val=%p)\n",
+            cast[uint64](pm1a), cast[uint64](va))
+
+    if S3_SILICON_ENABLE != 0:
+        outw(cast[uint16](va), cast[uint16](pm1a))
+        if pm1b != 0:
+            vb: uint32 = (cast[uint32](typb) << 10) | 0x2000
+            outw(cast[uint16](vb), cast[uint16](pm1b))
+    else:
+        # VM / harness mode: the silicon write would (on QEMU 0x604)
+        # power the guest off rather than suspend it. Skip the side-
+        # effect, exercise the rest of the path.
+        printk0("[ACPI] S3_SILICON_ENABLE=0 — skipping PM1a write (VM harness)\n")
+
+    # On real silicon, control does not return here directly — the
+    # firmware wake vector lands at a trampoline that restores s3_save
+    # and resumes this function. In the VM we fall straight through. In
+    # both cases the next line is the resume point we advertise.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ACPI] back from S3\n")
+
+    s3_save_valid = 0
+    s3_in_progress = 0
+    return 0
+
+
 # Zero-length IDT descriptor (limit=0, base=0) for the triple-fault
 # reboot fallback. A fault with this IDT loaded has nowhere to vector
 # and triple-faults the CPU into a reset. Module-scope so the inline
@@ -269,6 +391,33 @@ SCI_IRQ_VECTOR: uint32 = 0x25
 PM1_STS_PWRBTN_PW: uint16 = 0x100   # power-button status (bit 8)
 
 
+# --- Lid-switch GPE handler ------------------------------------------
+#
+# Laptops route the lid switch as a GPE (typically GPEx0/Lxx in the
+# DSDT). Without an AML interpreter we can't run the firmware's _Lxx
+# method to read the lid state directly, but we CAN treat a non-PWRBTN
+# fixed event arrival as a candidate lid wake / lid close when the
+# board has been configured to drive suspend on lid events. Userland
+# opt-in via /dev/power/ctl "lid suspend" sets lid_suspend_armed; the
+# SCI handler then triggers power_suspend_s3() on any non-PWRBTN status
+# bit (typically GBL_STS or a vendor-mapped GPE rolling up here).
+#
+# This is deliberately CONSERVATIVE: the default behaviour without
+# explicit configuration is the existing "write-1-to-clear and ignore"
+# path. A laptop user (or `lidctl` ship-target) writes "lid suspend"
+# once to /dev/power/ctl and the next non-PWRBTN PM1 event suspends.
+lid_suspend_armed: int32 = 0
+
+
+def power_lid_arm_suspend(v: int32):
+    # Userland hook: enable (1) / disable (0) "suspend on lid event".
+    lid_suspend_armed = v
+
+
+def power_lid_armed() -> int32:
+    return lid_suspend_armed
+
+
 def acpi_sci_irq():
     # do_irq() vector-0x25 handler. Read PM1a (and PM1b) status; if the
     # power-button bit is set, clear it write-1-to-clear (de-asserting the
@@ -299,13 +448,17 @@ def acpi_sci_irq():
         power_action(POWER_POWEROFF)
         return
 
-    # Some other fixed event (timer/GBL/...). Write the latched bits back
-    # to clear them so they can't hold the level line asserted. We don't
-    # act on them otherwise.
+    # Some other fixed event (timer/GBL/.../rolled-up lid GPE). Write the
+    # latched bits back to clear them so they can't hold the level line
+    # asserted, then — if the lid-suspend hook is armed — drive S3.
     if sts != 0:
         outw(sts, sts_a_port)
         if sts_b_port != 0:
             outw(sts, sts_b_port)
+        if lid_suspend_armed != 0:
+            printk_set_level(PRINTK_LEVEL_EMERG)
+            printk0("[acpi] lid SCI -> S3 suspend (armed)\n")
+            power_suspend_s3()
 
 
 def enable_acpi_power_button():

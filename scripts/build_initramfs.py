@@ -354,6 +354,15 @@ if os.environ.get("ENABLE_INSTALLER_MEDIUM_MARKER") == "1":
 if os.environ.get("OOPS_TEST") == "1":
     FILES.append(("/etc/oops-test", b"1\n"))
 
+# S3 suspend-to-RAM self-test marker. ENABLE_SUSPEND_TEST=1 plants
+# /etc/suspend-test so init/main.ad (boot:13.S) drives a single S3
+# round-trip through arch/x86/kernel/power.ad::power_suspend_s3().
+# scripts/test_suspend_resume.sh boots with this set and asserts both
+# the entering/back markers AND that the hamsh idle heartbeat ticks
+# after the simulated resume.
+if os.environ.get("ENABLE_SUSPEND_TEST") == "1":
+    FILES.append(("/etc/suspend-test", b"1\n"))
+
 # Framebuffer page-pause log-capture aid. Set ENABLE_LOG_SLOW=1 to plant
 # /etc/log-slow; init/main.ad (boot:03) then makes the GOP text console
 # pause ~1 s and stamp an OCR delimiter ("### HAMNIX-LOGPAGE NNNN ###")
