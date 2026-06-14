@@ -36,7 +36,7 @@ across the whole tree at HEAD `d14a5cb2`.
 | WireGuard (Noise_IKpsk2) | drivers/net/wireguard.ad | in-memory selftest only | nothing (header claims "rides over UDP via udp_send" — not actually wired) | `wireguard_selftest()` from init + smoke |
 | IPsec ESP (RFC 4303) | drivers/net/ipsec.ad | in-memory selftest only | nothing | `ipsec_selftest()` from init + smoke |
 | MACsec (802.1AE) | drivers/net/macsec.ad | in-memory selftest only | nothing | `macsec_selftest()` from init + smoke |
-| VXLAN (RFC 7348) | drivers/net/vxlan.ad | in-memory selftest only | nothing — not routed through bridge or udp | `vxlan_selftest()` from init + smoke |
+| VXLAN (RFC 7348) | drivers/net/vxlan.ad | **wired through bridge (in-VM loopback)** | bridge.ad (vxlan_encap is a bridge port TX hook; vxlan_decap is the loopback-pump consumer). Outer UDP/IPv4 datagram still uses an in-VM loopback buffer rather than virtio_net_tx / udp_rx port-4789 demux. | `vxlan_selftest()` + `bridge_vxlan_overlay_selftest()` from init + smoke + scripts/test_vxlan_overlay.sh |
 | GENEVE (RFC 8926) | drivers/net/geneve.ad | in-memory selftest only | nothing | `geneve_selftest()` from init + smoke |
 | GRE (RFC 2784) | drivers/net/gre.ad | in-memory selftest only | nothing | `gre_selftest()` from init + smoke |
 | L2TPv3 (RFC 3931) | drivers/net/l2tp.ad | in-memory selftest only | nothing | `l2tp_selftest()` from init + smoke |
@@ -45,13 +45,21 @@ across the whole tree at HEAD `d14a5cb2`.
 | NAT64 (RFC 6146) | drivers/net/nat64.ad | in-memory selftest only | nothing | `nat64_selftest()` from init + smoke |
 | IGMPv2/v3 (RFC 2236/3376) | drivers/net/igmp.ad | in-memory selftest only | nothing | `igmp_selftest()` from init + smoke |
 | Bonding (active-backup, rr) | drivers/net/bond.ad | in-memory selftest only | nothing — slaves are fake records | `bond_selftest()` from init + smoke |
-| Bridge (learning FDB) | drivers/net/bridge.ad | in-memory selftest only | nothing — ports are fake TX-hook callbacks | `bridge_selftest()` from init + smoke |
+| Bridge (learning FDB) | drivers/net/bridge.ad | **wired to VXLAN (in-VM loopback)** | vxlan.ad (a bridge port's TX hook is bridge_vxlan_port_tx -> vxlan_encap; loopback pump calls vxlan_decap and re-enters bridge_rx). bridge_selftest still drives 3 fake capture ports for the bare forwarding-logic unit test. NIC-side wiring (enslave virtio-net under a brctl-shape API) still pending. | `bridge_selftest()` + `bridge_vxlan_overlay_selftest()` from init + smoke + scripts/test_vxlan_overlay.sh |
 | 802.1Q VLAN | drivers/net/vlan.ad | in-memory selftest only | nothing | `vlan_selftest()` from init + smoke |
 | ipvlan | drivers/net/ipvlan.ad | in-memory selftest only | nothing — parent NIC is a fake record | `ipvlan_selftest()` from init + smoke |
 | macvlan | drivers/net/macvlan.ad | in-memory selftest only | nothing — parent NIC is a fake record | `macvlan_selftest()` from init + smoke |
 
-**Total: 18/18 in-memory selftest only.** (17 from the audit list, plus
-bridge which the audit lumped into a "~3k total" multi-line row.)
+**Total (2026-06-14): 16/18 in-memory selftest only; 2/18 wired
+(VXLAN ↔ Bridge, in-VM loopback).** The VXLAN+Bridge wiring landed
+2026-06-14 — `bridge.ad` now imports `vxlan_encap`/`vxlan_decap` and
+a bridge port's TX hook is a VXLAN encap path; the loopback pump
+performs the decap and re-injects via `bridge_rx`. The byte-identity
+round-trip is proven by `scripts/test_vxlan_overlay.sh`. The outer
+UDP/IPv4 datagram is still an in-VM buffer rather than going through
+`virtio_net_tx` + `udp_rx` port-4789 demux — that is the next lift,
+but the wire bytes leaving `vxlan_encap` are already RFC-7348-correct
+(checksum-recompute proven by `test_vxlan.sh`).
 
 ## What each TODO(net-honesty) means in practice
 

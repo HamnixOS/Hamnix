@@ -2629,6 +2629,19 @@ if os.environ.get("ENABLE_GRE_TEST") == "1":
 if os.environ.get("ENABLE_BRIDGE_TEST") == "1":
     FILES.append(("/etc/bridge-test", b"1\n"))
 
+# Real wired-data-path test that bridges drivers/net/bridge.ad and
+# drivers/net/vxlan.ad. scripts/test_vxlan_overlay.sh sets
+# ENABLE_VXLAN_OVERLAY_TEST=1 to plant /etc/vxlan-overlay-test;
+# init/main.ad's boot:37.vxlan_overlay gate then runs
+# bridge_vxlan_overlay_selftest() (drivers/net/bridge.ad), which drives
+# the REAL bridge_rx -> bridge port TX hook -> vxlan_encap -> in-VM
+# loopback -> vxlan_decap -> bridge_rx round-trip and asserts the
+# inner Ethernet frame is byte-identical at a capture port after the
+# full RFC-7348 encap/decap. Prints "[bridge-vxlan] PASS" / FAIL.
+# Default boots ship no marker so it is a no-op everywhere else.
+if os.environ.get("ENABLE_VXLAN_OVERLAY_TEST") == "1":
+    FILES.append(("/etc/vxlan-overlay-test", b"1\n"))
+
 # Native IEEE 802.1Q VLAN tagging self-test. scripts/test_vlan.sh sets
 # ENABLE_VLAN_TEST=1 to plant /etc/vlan-test; init/main.ad's boot:37.vlan
 # gate then runs vlan_selftest() (drivers/net/vlan.ad), a pure in-memory
