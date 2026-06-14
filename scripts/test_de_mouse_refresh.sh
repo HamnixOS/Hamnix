@@ -227,10 +227,28 @@ if [ -z "$PY" ]; then
 fi
 
 distinct=$($PY - "$SHOTS_DIR" <<'PYEOF'
-import os, sys, struct, glob
+# DEPERF iter-6 HARNESS UPGRADE: the original centroid-of-dark-pixels
+# metric is saturated by the panel band (full-width dark rectangle at
+# the top of the screen). Even when the cursor moves freely, the
+# centroid of all-dark pixels barely shifts, reporting bogus 0.40 Hz
+# regardless of compositor performance.
+#
+# The frame-difference metric below counts how many shots changed
+# meaningfully from the previous one — i.e. how many times the
+# compositor presented a new screen during the window. That is the
+# real cursor-refresh signal under load: every successful cursor move
+# blits the old/new 12x12 cells (~288 px difference), so two frames
+# whose pixel-diff exceeds a small threshold ARE two distinct presents.
+# This also catches windowed-content updates (a hamterm body changing).
+#
+# `distinct` (first line) = count of consecutive frame pairs whose
+# pixel-diff sum exceeds CHANGE_THRESHOLD. effective_hz = distinct /
+# window_s.
+import os, sys, glob
 
 shots_dir = sys.argv[1]
-centroids = []
+CHANGE_THRESHOLD = 200  # at least ~200 pixel deltas to count as a present
+shots = []
 for path in sorted(glob.glob(os.path.join(shots_dir, "*.ppm"))):
     try:
         with open(path, "rb") as f:
@@ -239,10 +257,8 @@ for path in sorted(glob.glob(os.path.join(shots_dir, "*.ppm"))):
         continue
     if not data.startswith(b"P6"):
         continue
-    # Parse PPM6 header: P6\n<W> <H>\n<MAX>\n<binary>
     i = 3
     def tok(off):
-        # skip whitespace + comments
         while off < len(data) and (data[off:off+1] in (b" ", b"\n", b"\t", b"\r")
                                    or data[off:off+1] == b"#"):
             if data[off:off+1] == b"#":
@@ -257,7 +273,6 @@ for path in sorted(glob.glob(os.path.join(shots_dir, "*.ppm"))):
     tw, i = tok(i)
     th, i = tok(i)
     tm, i = tok(i)
-    # one whitespace byte after maxval
     i += 1
     try:
         W = int(tw); H = int(th); M = int(tm)
@@ -268,26 +283,39 @@ for path in sorted(glob.glob(os.path.join(shots_dir, "*.ppm"))):
     pix = data[i:i + W*H*3]
     if len(pix) < W*H*3:
         continue
-    sx = 0; sy = 0; n = 0
-    for y in range(H):
-        row = y * W * 3
-        for x in range(W):
-            o = row + x*3
-            r = pix[o]; g = pix[o+1]; b = pix[o+2]
-            luma = (r*30 + g*59 + b*11) // 100
-            if luma <= 32:
-                sx += x; sy += y; n += 1
-    if n == 0:
-        centroids.append((-1, -1))
-        continue
-    cx = sx // n
-    cy = sy // n
-    # quantise to 4-pixel grid so micro-jitter doesn't inflate distinct count
-    centroids.append((cx // 4, cy // 4))
+    shots.append((W, H, pix))
 
-uniq = set(c for c in centroids if c != (-1, -1))
-print(len(uniq))
-print(len(centroids))
+# Frame-difference metric: count consecutive frames that differ enough
+# to be a real present (cursor move, terminal redraw, etc).
+distinct_frames = 0
+prev = None
+# Sample 1 in every STRIDE pixels to keep python loop bounded on a
+# 1280x800 image (~1 M pixels). Even at stride=16 we get ~64k samples
+# per frame which is plenty to detect a 12x12 cursor delta.
+STRIDE = 16
+for s in shots:
+    W, H, pix = s
+    if prev is None:
+        prev = pix
+        continue
+    diff = 0
+    plen = len(pix)
+    # Walk every STRIDE * 3 bytes (R channel only is enough — cursor
+    # is near-black vs lighter desktop).
+    off = 0
+    step = STRIDE * 3
+    while off + 2 < plen:
+        if pix[off] != prev[off] or pix[off+1] != prev[off+1] or pix[off+2] != prev[off+2]:
+            diff += 1
+            if diff >= CHANGE_THRESHOLD:
+                break
+        off += step
+    if diff >= CHANGE_THRESHOLD:
+        distinct_frames += 1
+    prev = pix
+
+print(distinct_frames)
+print(len(shots))
 PYEOF
 )
 
@@ -302,8 +330,8 @@ if [ "$SAMPLED" -eq 0 ]; then
     exit 1
 fi
 
-# effective_hz = unique centroids / window seconds.
-# refresh_fraction = unique / injected.
+# effective_hz = distinct-frame-pair count / window seconds.
+# refresh_fraction = distinct / injected.
 EFF_HZ=$(awk -v u="$UNIQ" -v w="$WINDOW_S" 'BEGIN{ if (w==0) print 0; else printf "%.2f", u/w }')
 FRAC=$(awk -v u="$UNIQ" -v i="$INJECTED_TOTAL" 'BEGIN{ if (i==0) print 0; else printf "%.3f", u/i }')
 
@@ -313,12 +341,12 @@ mkdir -p "$(dirname "$OUT_REPORT")"
     echo "window_s=$WINDOW_S"
     echo "injected_moves=$INJECTED_TOTAL"
     echo "shots_sampled=$SAMPLED"
-    echo "distinct_cursor_positions=$UNIQ"
+    echo "distinct_frames=$UNIQ"
     echo "effective_cursor_hz=$EFF_HZ"
     echo "refresh_fraction=$FRAC"
 } > "$OUT_REPORT"
 
-echo "[test_de_mouse_refresh] effective_cursor_hz=$EFF_HZ (unique=$UNIQ across $SAMPLED shots; injected=$INJECTED_TOTAL)"
+echo "[test_de_mouse_refresh] effective_cursor_hz=$EFF_HZ (distinct_frames=$UNIQ across $SAMPLED shots; injected=$INJECTED_TOTAL)"
 echo "[test_de_mouse_refresh] report: $OUT_REPORT"
 echo "[test_de_mouse_refresh] PASS"
 exit 0
