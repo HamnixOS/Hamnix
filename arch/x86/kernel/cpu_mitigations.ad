@@ -58,6 +58,8 @@ from kernel.printk.printk import printk0, printk1, printk2
 extern def cpuid_get(leaf: uint32, subleaf: uint32, out: Ptr[uint32])
 extern def read_cr4() -> uint64
 extern def write_cr4(value: uint64)
+extern def get_bsp_cr3() -> uint64
+extern def load_cr3(value: uint64)
 
 # Runtime flags set by setup_smep_smap(). mm/uaccess.ad reads
 # cr4_smap_enabled before calling _stac() / _clac() — on pre-Broadwell
@@ -74,15 +76,81 @@ CR4_SMAP_BIT: uint64 = 21
 CPUID_07H_EBX_SMEP_BIT: uint32 = 7
 CPUID_07H_EBX_SMAP_BIT: uint32 = 20
 
-# Compile-time gates on actually flipping the CR4 bits. Both stay 0
-# until the high-half kernel PML4 is re-stamped US=0 (see SMAP v2 /
-# SMEP v2 next-step blocks). SMEP also #PFs on CPL=0 ifetch from a
-# US=1 page, so the same kernel-page US=1 stamping that blocks SMAP
-# blocks SMEP. The discipline scaffold (the runtime flag, the
-# probe/log line, the stac/clac brackets) is the value here — the
-# CR4 flip itself is one extra line once the pgtable pass lands.
-SMEP_RUNTIME_ENABLE: uint64 = 0
+# Compile-time gates on actually flipping the CR4 bits.
+#
+# SMEP_RUNTIME_ENABLE = 1: enabled. _restamp_pml4_subtree_us0 clears
+# US on PML4[511] (kernel high half) AND PML4[0] (low identity) below,
+# and fs/elf.ad's _elf_install_user_mapping_locked OR's US=1 back into
+# the PER-TASK PML4[0] when execve cracks it — so kernel CPL=0 ifetch
+# everywhere is on US=0 (SMEP-clean) and user CPL=3 ifetch lands on
+# US=1 leaves under a US=1 per-task directory chain.
+#
+# SMAP_RUNTIME_ENABLE = 0: STAGED. SMAP would have to coexist with the
+# cracked-PD identity range fs/elf.ad lays down: when /init's user
+# vaddr lives in the 0..1 GiB window, _build_identity_pd identity-maps
+# the entire 1 GiB with US=1 (so user code reaches its leaf with
+# effective US=1), but that ALSO turns the kernel's identity view of
+# the same 1 GiB into effective-US=1, and every kernel data load
+# inside that GiB (kmalloc returns / memblock pool / descriptor rings)
+# would then #PF under SMAP=1 without stac brackets — and those loads
+# live everywhere in the kernel, not just at the uaccess boundary.
+# The follow-up that unblocks SMAP is to teach _build_identity_pd to
+# stamp the kernel-visible identity range US=0 while only the leaf PT
+# entries that name the user's actual code/data pages keep US=1 — a
+# bigger fs/elf.ad surgery that is deferred to a SMAP-v3 lift.
+SMEP_RUNTIME_ENABLE: uint64 = 1
 SMAP_RUNTIME_ENABLE: uint64 = 0
+
+# Page-table walk constants. Mirror arch/x86/mm/pgtable.ad's PGT_ADDR_MASK
+# and the US (bit 2) / P (bit 0) flag bits so the high-half re-stamp pass
+# below is self-contained and doesn't depend on pgtable.ad's import surface.
+PGT_ADDR_MASK_KM: uint64 = 0x000FFFFFFFFFF000
+PGT_FLAG_P_KM:    uint64 = 0x1
+PGT_FLAG_US_KM:   uint64 = 0x4
+PGT_FLAG_PS_KM:   uint64 = 0x80
+
+
+def _restamp_pml4_subtree_us0(pml4_idx: uint64) -> uint64:
+    # Walk PML4[pml4_idx] -> PDPT -> [PD ->] leaves and clear US=1 on
+    # every present entry. Used for both the kernel high-half (idx=511)
+    # and an optional pass over the shared low identity map (idx=0).
+    cr3:  uint64 = get_bsp_cr3()
+    pml4: uint64 = cr3 & PGT_ADDR_MASK_KM
+    pml4_slot_addr: uint64 = pml4 + pml4_idx * cast[uint64](8)
+    pml4_slot: Ptr[uint64] = cast[Ptr[uint64]](pml4_slot_addr)
+    pml4e: uint64 = pml4_slot[0]
+    if (pml4e & PGT_FLAG_P_KM) == 0:
+        return 0
+    if (pml4e & PGT_FLAG_US_KM) != 0:
+        pml4_slot[0] = pml4e & ~PGT_FLAG_US_KM
+    pdpt_base: uint64 = pml4e & PGT_ADDR_MASK_KM
+    cleared: uint64 = 0
+    i: uint64 = 0
+    while i < cast[uint64](512):
+        pdpt_slot: Ptr[uint64] = cast[Ptr[uint64]](
+            pdpt_base + i * cast[uint64](8))
+        pdpte: uint64 = pdpt_slot[0]
+        if (pdpte & PGT_FLAG_P_KM) != 0:
+            if (pdpte & PGT_FLAG_PS_KM) != 0:
+                if (pdpte & PGT_FLAG_US_KM) != 0:
+                    pdpt_slot[0] = pdpte & ~PGT_FLAG_US_KM
+                    cleared = cleared + 1
+            else:
+                if (pdpte & PGT_FLAG_US_KM) != 0:
+                    pdpt_slot[0] = pdpte & ~PGT_FLAG_US_KM
+                pd_base: uint64 = pdpte & PGT_ADDR_MASK_KM
+                j: uint64 = 0
+                while j < cast[uint64](512):
+                    pd_slot: Ptr[uint64] = cast[Ptr[uint64]](
+                        pd_base + j * cast[uint64](8))
+                    pde: uint64 = pd_slot[0]
+                    if (pde & PGT_FLAG_P_KM) != 0:
+                        if (pde & PGT_FLAG_US_KM) != 0:
+                            pd_slot[0] = pde & ~PGT_FLAG_US_KM
+                            cleared = cleared + 1
+                    j = j + 1
+        i = i + 1
+    return cleared
 
 
 def setup_smep_smap():
@@ -100,6 +168,50 @@ def setup_smep_smap():
     smep_supported: uint32 = (ebx >> CPUID_07H_EBX_SMEP_BIT) & cast[uint32](1)
     smap_supported: uint32 = (ebx >> CPUID_07H_EBX_SMAP_BIT) & cast[uint32](1)
 
+    # Re-stamp the kernel high-half mappings US=0 BEFORE flipping CR4.
+    # With the boot stub's US=1 stamping on pdpt_high entries
+    # (header.S:198), enabling SMEP would #PF the next kernel ifetch and
+    # enabling SMAP would #PF the next kernel data load — both
+    # triple-fault the box. The re-stamp pass is a single PML4[511] →
+    # pdpt_high walk; the low identity map (PML4[0] → pdpt_low) where
+    # user pages live is deliberately left US=1.
+    restamped_hi: uint64 = 0
+    restamped_lo: uint64 = 0
+    if (SMEP_RUNTIME_ENABLE == 1 and smep_supported != cast[uint32](0)) or \
+       (SMAP_RUNTIME_ENABLE == 1 and smap_supported != cast[uint32](0)):
+        # High half (PML4[511]) — kernel image. Required for SMEP (the
+        # kernel's own ifetch lives here) and benign for everything else.
+        restamped_hi = _restamp_pml4_subtree_us0(cast[uint64](511))
+        printk1("[cpu-mitig] restamp: %d kernel high-half leaves US=0\n",
+                restamped_hi)
+        # Low identity (shared PML4[0] / pdpt_low) — also clear US.
+        # Two reasons:
+        #
+        #   - SMEP: the native .ko loader (arch/x86/kernel/module.ad)
+        #     elf_load_blob's modules into low identity RAM and calls
+        #     init_module via a direct CPL=0 jump to the ELF entry. With
+        #     pdpt_low US=1 every such ifetch #PF's the box. Clearing US
+        #     there allows the legitimate kernel-mode ifetch.
+        #
+        #   - SMAP: the kernel constantly touches alloc_page() / kmalloc()
+        #     returns at their low identity VAs. With SMAP=1 and pdpt_low
+        #     US=1 those would all #PF.
+        #
+        # The cost: user code in shared PML4[0] subtrees (i.e. before
+        # elf_install_user_mapping has cracked the per-task PML4[0])
+        # would walk to effective US=0 and CPL=3 access would fault.
+        # That's why fs/elf.ad's _elf_install_user_mapping_locked OR's
+        # PT_FLAG_US into the per-task PML4[0] directory entry when it
+        # cracks it (see the matching comment there): the per-task
+        # PML4[0] becomes US=1, the cracked PDPT/PD/PT below it carry
+        # US=1 leaves for user pages, the non-cracked PDPT entries
+        # below it remain the verbatim-copied US=0 leaves so kernel
+        # identity accesses outside the user range stay SMAP-clean.
+        restamped_lo = _restamp_pml4_subtree_us0(cast[uint64](0))
+        printk1("[cpu-mitig] restamp: %d low identity leaves US=0\n",
+                restamped_lo)
+        load_cr3(get_bsp_cr3())
+
     cr4_cur: uint64 = read_cr4()
     cr4_new: uint64 = cr4_cur
 
@@ -108,8 +220,6 @@ def setup_smep_smap():
             cr4_new = cr4_new | (cast[uint64](1) << CR4_SMEP_BIT)
             cr4_smep_enabled = 1
 
-    # SMAP: gated. We RECORD that the CPU supports it (for the boot
-    # log) but do NOT flip the bit until SMAP_RUNTIME_ENABLE = 1.
     if smap_supported != cast[uint32](0):
         if SMAP_RUNTIME_ENABLE == 1:
             cr4_new = cr4_new | (cast[uint64](1) << CR4_SMAP_BIT)
@@ -117,6 +227,14 @@ def setup_smep_smap():
 
     if cr4_new != cr4_cur:
         write_cr4(cr4_new)
+
+    # Read back CR4 to confirm the bits actually latched. Some CPUs /
+    # virtualisers silently mask unsupported bits; the read-back is the
+    # ground truth.
+    cr4_after: uint64 = read_cr4()
+    smep_live: uint64 = (cr4_after >> CR4_SMEP_BIT) & cast[uint64](1)
+    smap_live: uint64 = (cr4_after >> CR4_SMAP_BIT) & cast[uint64](1)
+    printk2("[mitig] CR4 SMEP=%d SMAP=%d\n", smep_live, smap_live)
 
     printk2("[cpu-mitig] smep_supported=%d smap_supported=%d\n",
             cast[uint64](smep_supported), cast[uint64](smap_supported))
