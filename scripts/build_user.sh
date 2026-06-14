@@ -195,6 +195,7 @@ build_adder_user hamsysmon            # DE pivot wave 2 (round 2): desktop syste
 build_adder_user hamctxmenu           # DE pivot wave 3 (round 2): right-click context menu (v2 client; reads /dev/wsys/ctxmenu, poked via /dev/wsys/ctxmenu/show)
 build_adder_user hamsnap              # DE pivot wave 4 (round 2): snap-zone preview during window move-drag (v2 client; reads /dev/wsys/snap, poked via /dev/wsys/snap/show)
 build_adder_user hamresize            # DE pivot wave 5 (round 2): live resize + kmode frame outline (v2 client; reads /dev/wsys/resize, poked via /dev/wsys/resize/show)
+build_adder_user hamosd               # DE pivot wave 6 (round 2): workspace/volume/brightness OSD popup (v2 client; reads /dev/wsys/osd, poked via /dev/wsys/osd/show)
 build_adder_user hamscreensaver       # DE screensaver daemon: idle timer then spawns /bin/hamlock; cycle repeats
 build_adder_user hamsession           # DE session save/restore: reads /dev/wsys/session snapshot, persists/replays the open window set
 build_adder_user top                  # M16.87: one-shot /proc dashboard
