@@ -57,9 +57,21 @@ syscall_entry:
      *
      * We use %r12 as a transient scratch — park user %r12 on the
      * user stack first so we can restore it on return.
+     *
+     * SMAP v3b: SYSCALL doesn't switch stacks — on entry %rsp still
+     * points at the user stack (US=1 page). The two pushq's below are
+     * CPL=0 stores to a US=1 page, which #PF under CR4.SMAP=1 unless
+     * RFLAGS.AC is set. STAC here; CLAC after we switch RSP to the
+     * kernel stack (TSS.RSP0) a few instructions down so SMAP protects
+     * the rest of kernel execution. STAC/CLAC are #UD on pre-Broadwell
+     * silicon, but cpu_mitigations.c only flips CR4.SMAP when CPUID
+     * reports SMAP — and the instructions themselves are legal whenever
+     * the CPU supports SMAP, regardless of CR4.SMAP state.
      */
+    stac                              /* SMAP: allow CPL=0 user-stack writes */
     pushq   %r12                      /* park user %r12 on user stack */
     pushq   %r13                      /* park user %r13 (per-CPU scratch) */
+    clac                              /* SMAP back on for the kernel body */
 
     /* %r12 = current task's kernel stack top = THIS CPU's TSS.RSP0.
      * schedule() keeps per_cpu_tss[cpu_id].rsp0 pointed at
@@ -163,6 +175,11 @@ syscall_entry:
     popq    %rcx                      /* user RIP    */
     popq    %r11                      /* user RFLAGS */
     popq    %rsp                      /* user rsp (= user_rsp - 16) */
+    /* SMAP v3b: the next two popq's read from the user stack at CPL=0,
+     * so we re-arm AC just for that window. SYSRETQ then reloads RFLAGS
+     * from %r11 (user's saved RFLAGS), which clears AC naturally — no
+     * explicit CLAC needed before the sysretq. */
+    stac                              /* SMAP: allow CPL=0 user-stack reads */
     popq    %r13                      /* user %r13 (parked 2nd, lowest) */
     popq    %r12                      /* user %r12 (parked 1st)     */
 
