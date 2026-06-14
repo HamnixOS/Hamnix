@@ -33,7 +33,7 @@ across the whole tree at HEAD `d14a5cb2`.
 | --- | --- | --- | --- | --- |
 | SCTP (RFC 4960) | drivers/net/sctp.ad | in-memory selftest only | nothing — no NIC, no /net, no skb path | `sctp_selftest()` called from init + smoke tests |
 | MPTCP (RFC 8684) | drivers/net/mptcp.ad | in-memory selftest only | nothing | `mptcp_selftest()` from init + smoke |
-| WireGuard (Noise_IKpsk2) | drivers/net/wireguard.ad | in-memory selftest only | nothing (header claims "rides over UDP via udp_send" — not actually wired) | `wireguard_selftest()` from init + smoke |
+| WireGuard (Noise_IKpsk2) | drivers/net/wireguard.ad | **wired through UDP-shape wire ring (in-VM loopback)** | in-VM UDP-shape wire ring: `wg_iface_xmit` -> `wg_transport_seal` parks an outer (src/dst ip, src/dst port=51820, payload) entry on a ring; `wg_wire_pump` port-51820 demuxes against a 2-endpoint listener registry and calls `wg_udp_rx` -> `wg_transport_open`. The Noise IKpsk2 handshake (init/response) also rides the same wire (type bytes 1/2). Outer UDP/IPv4 datagram does not yet go through virtio_net_tx / udp_rx (udp_rx's port demux is hardcoded — needs a listener registry). | `wireguard_selftest()` + `wireguard_overlay_selftest()` from init + smoke + scripts/test_wireguard_overlay.sh |
 | IPsec ESP (RFC 4303) | drivers/net/ipsec.ad | in-memory selftest only | nothing | `ipsec_selftest()` from init + smoke |
 | MACsec (802.1AE) | drivers/net/macsec.ad | in-memory selftest only | nothing | `macsec_selftest()` from init + smoke |
 | VXLAN (RFC 7348) | drivers/net/vxlan.ad | **wired through bridge (in-VM loopback)** | bridge.ad (vxlan_encap is a bridge port TX hook; vxlan_decap is the loopback-pump consumer). Outer UDP/IPv4 datagram still uses an in-VM loopback buffer rather than virtio_net_tx / udp_rx port-4789 demux. | `vxlan_selftest()` + `bridge_vxlan_overlay_selftest()` from init + smoke + scripts/test_vxlan_overlay.sh |
@@ -50,16 +50,27 @@ across the whole tree at HEAD `d14a5cb2`.
 | ipvlan | drivers/net/ipvlan.ad | in-memory selftest only | nothing — parent NIC is a fake record | `ipvlan_selftest()` from init + smoke |
 | macvlan | drivers/net/macvlan.ad | in-memory selftest only | nothing — parent NIC is a fake record | `macvlan_selftest()` from init + smoke |
 
-**Total (2026-06-14): 16/18 in-memory selftest only; 2/18 wired
-(VXLAN ↔ Bridge, in-VM loopback).** The VXLAN+Bridge wiring landed
-2026-06-14 — `bridge.ad` now imports `vxlan_encap`/`vxlan_decap` and
-a bridge port's TX hook is a VXLAN encap path; the loopback pump
-performs the decap and re-injects via `bridge_rx`. The byte-identity
-round-trip is proven by `scripts/test_vxlan_overlay.sh`. The outer
-UDP/IPv4 datagram is still an in-VM buffer rather than going through
-`virtio_net_tx` + `udp_rx` port-4789 demux — that is the next lift,
-but the wire bytes leaving `vxlan_encap` are already RFC-7348-correct
-(checksum-recompute proven by `test_vxlan.sh`).
+**Total (2026-06-14): 15/18 in-memory selftest only; 3/18 wired
+(VXLAN ↔ Bridge, WireGuard ↔ UDP-shape wire — all in-VM loopback).**
+The VXLAN+Bridge wiring landed 2026-06-14 — `bridge.ad` now imports
+`vxlan_encap`/`vxlan_decap` and a bridge port's TX hook is a VXLAN
+encap path; the loopback pump performs the decap and re-injects via
+`bridge_rx`. The byte-identity round-trip is proven by
+`scripts/test_vxlan_overlay.sh`. The WireGuard wiring landed
+2026-06-14 too — `wireguard.ad` now exposes `wg_iface_xmit`, a
+port-51820 `wg_wire_pump` + `wg_udp_rx` listener registry, and
+`wireguard_overlay_selftest()` which drives the full Noise IKpsk2
+handshake AND ChaCha20-Poly1305 transport datagrams between two
+endpoints (10.0.0.1:51820 <-> 10.0.0.2:51820) through an in-VM
+UDP-shape wire ring; the inner packet is byte-identical at the
+peer's WG interface after the round-trip. Proven by
+`scripts/test_wireguard_overlay.sh`. The outer UDP/IPv4 datagram
+is still an in-VM buffer rather than going through `virtio_net_tx`
++ `udp_rx` port-{4789,51820} demux — that is the next lift (it
+needs a listener registry in `drivers/net/udp.ad`, today the demux
+is hardcoded for DHCP-68, DNS-53000..53003, and the socket table).
+The wire bytes leaving `vxlan_encap` / `wg_transport_seal` are
+already correct (RFC-7348 / ChaCha20-Poly1305).
 
 ## What each TODO(net-honesty) means in practice
 

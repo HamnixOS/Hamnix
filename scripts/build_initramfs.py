@@ -2652,6 +2652,19 @@ if os.environ.get("ENABLE_BRIDGE_TEST") == "1":
 if os.environ.get("ENABLE_VXLAN_OVERLAY_TEST") == "1":
     FILES.append(("/etc/vxlan-overlay-test", b"1\n"))
 
+# Real wired-data-path test for drivers/net/wireguard.ad.
+# scripts/test_wireguard_overlay.sh sets ENABLE_WIREGUARD_OVERLAY_TEST=1 to
+# plant /etc/wireguard-overlay-test; init/main.ad's boot:37.wireguard_overlay
+# gate then runs wireguard_overlay_selftest() (drivers/net/wireguard.ad),
+# which drives the REAL wg_iface_xmit -> wg_transport_seal -> in-VM
+# UDP-shape wire ring -> wg_wire_pump (port-51820 demux) -> wg_udp_rx ->
+# wg_transport_open round-trip and asserts the inner packet is byte-
+# identical at the peer's WG virtual interface. The Noise IKpsk2 handshake
+# (init + response) ALSO rides the same wire (type bytes 1/2). Prints
+# "[wireguard-overlay] PASS" / FAIL. Default boots ship no marker.
+if os.environ.get("ENABLE_WIREGUARD_OVERLAY_TEST") == "1":
+    FILES.append(("/etc/wireguard-overlay-test", b"1\n"))
+
 # Native IEEE 802.1Q VLAN tagging self-test. scripts/test_vlan.sh sets
 # ENABLE_VLAN_TEST=1 to plant /etc/vlan-test; init/main.ad's boot:37.vlan
 # gate then runs vlan_selftest() (drivers/net/vlan.ad), a pure in-memory
