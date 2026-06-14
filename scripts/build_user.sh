@@ -192,6 +192,7 @@ build_adder_user hamnotif             # DE pivot wave 7: transient notification 
 build_adder_user hamsessui            # DE pivot wave 8: modal End Session dialog (Lock/Log Out/Shut Down/Cancel) (v2 client; reads /dev/wsys/sessui, poked via /dev/wsys/sessui/show)
 build_adder_user hamdesktop           # DE pivot wave 1 (round 2): desktop icon badges on the root layer (v2 client; reads /dev/wsys/desktop, poked via /dev/wsys/desktop/show)
 build_adder_user hamsysmon            # DE pivot wave 2 (round 2): desktop system-monitor applet (CPU/MEM bars) (v2 client; reads /dev/wsys/sysmon, poked via /dev/wsys/sysmon/show)
+build_adder_user hamctxmenu           # DE pivot wave 3 (round 2): right-click context menu (v2 client; reads /dev/wsys/ctxmenu, poked via /dev/wsys/ctxmenu/show)
 build_adder_user hamscreensaver       # DE screensaver daemon: idle timer then spawns /bin/hamlock; cycle repeats
 build_adder_user hamsession           # DE session save/restore: reads /dev/wsys/session snapshot, persists/replays the open window set
 build_adder_user top                  # M16.87: one-shot /proc dashboard
