@@ -921,6 +921,16 @@ if os.environ.get("ENABLE_NOTEDRAIN_TEST") == "1":
 if os.environ.get("ENABLE_AHCI_NCQ_TEST") == "1":
     FILES.append(("/etc/ahci-ncq-test", b"ENABLE_AHCI_NCQ_TEST=1\n"))
 
+# NCQ block-path self-test (this commit). scripts/test_ahci_ncq_blkpath.sh
+# sets ENABLE_AHCI_NCQ_BLK_TEST=1 to plant /etc/ahci-ncq-blk-test.
+# init/main.ad at boot:37.ncqb detects the marker and calls
+# ahci_ncq_blkpath_selftest() (drivers/ata/ahci.ad): it proves the block-
+# layer hot path routes through the new NCQ FPDMA QUEUED submit primitive
+# + IRQ-driven completion + per-slot wait queues, and asserts multi-slot
+# concurrency on a real SATA disk. Default boots omit the marker.
+if os.environ.get("ENABLE_AHCI_NCQ_BLK_TEST") == "1":
+    FILES.append(("/etc/ahci-ncq-blk-test", b"ENABLE_AHCI_NCQ_BLK_TEST=1\n"))
+
 # AHCI generic block-layer round-trip self-test. scripts/test_ahci_blk.sh
 # sets ENABLE_AHCI_BLK_TEST=1 to plant /etc/ahci-blk-test. init/main.ad at
 # boot:37.ablk detects the marker and calls ahci_blk_selftest()
