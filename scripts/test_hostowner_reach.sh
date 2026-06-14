@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # scripts/test_hostowner_reach.sh — arch audit §3.2 acceptance gate.
 #
-# Proves the 5 kernel-internal uid==1 checks in arch/x86/kernel/syscall.ad
+# Proves the 7 kernel-internal uid==1 checks in arch/x86/kernel/syscall.ad
 # (SYS_SETUID, SYS_USERADD_ROOT, SYS_SVC_PUBLISH, SYS_SET_REALTIME,
-# SYS_REBOOT) now route through the single named helper
-# `_syscall_require_hostowner` — uniform "<op>: hostowner-required
-# (uid=NNNN)" reason in errstr, single source of policy that a future
-# Plan-9 reshape can move in one place.
+# SYS_REBOOT, SYS_SVC_CTL verb 0 (poll), SYS_SVC_CTL verb 7 (read-out))
+# now route through the single named helper `_syscall_require_hostowner`
+# — uniform "<op>: hostowner-required (uid=NNNN)" reason in errstr,
+# single source of policy that a future Plan-9 reshape can move in one
+# place.
 #
 # Mirrors scripts/test_default_uid.sh: build hamsh + the test ELF,
 # plant /init = hamsh in the cpio, rebuild the kernel image, boot
@@ -104,10 +105,10 @@ check "[hostowner_reach] inherited hostowner (uid 1)" \
 check "[hostowner_reach] downgraded to NOBODY (65534)" \
       "SYS_SETUID downgrade observable"
 
-# Each of the 5 ops must surface "hostowner-required (uid=65534)" via
+# Each of the 7 ops must surface "hostowner-required (uid=65534)" via
 # errstr. The fixture itself does the substring check + logs op=...
 # rc=... errstr="..." per call.
-for op in setuid useradd svc_publish set_realtime reboot; do
+for op in setuid useradd svc_publish set_realtime reboot svc_ctl_poll svc_ctl_read; do
     check "op=$op " \
           "$op exercised as NOBODY"
 done
@@ -137,4 +138,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_hostowner_reach] PASS — arch audit §3.2 hostowner-reach cleanup verified: 5 kernel-internal uid==1 checks now route through _syscall_require_hostowner"
+echo "[test_hostowner_reach] PASS — arch audit §3.2 hostowner-reach cleanup verified: 7 kernel-internal uid==1 checks now route through _syscall_require_hostowner"
