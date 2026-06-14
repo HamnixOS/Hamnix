@@ -74,10 +74,11 @@ if ! grep -E "_wctl_word_eq" "$KERN_SRC" | grep -q "\"version\""; then
 fi
 
 # --- Link 3: per-window backbuffer storage + accessor seam -----------
-# 9 windows * 320*200*4 = 2 304 000 bytes. The flat Array is how the
-# kernel holds the v2 pixel state.
-if ! grep -Eq "^wsys_backbuffer:[[:space:]]+Array\[2304000," "$KERN_SRC"; then
-    fail_link "link 3 (devwsys.ad): wsys_backbuffer Array[2304000,uint8] is missing - no per-window backbuffer storage"
+# 9 windows * W*H*4 bytes. The flat Array is how the kernel holds the
+# v2 pixel state. Widened from 320x200 (2 304 000 B) to 1280x800
+# (36 864 000 B) so the panel can cover the full screen width.
+if ! grep -Eq "^wsys_backbuffer:[[:space:]]+Array\[(2304000|36864000)," "$KERN_SRC"; then
+    fail_link "link 3 (devwsys.ad): wsys_backbuffer Array[36864000,uint8] is missing - no per-window backbuffer storage"
 fi
 for fn in wsys_backbuffer_ptr wsys_backbuffer_dims_w wsys_backbuffer_dims_h \
           wsys_backbuffer_stride wsys_bb_serial_get wsys_bb_dirty_get \
@@ -153,9 +154,10 @@ for fn in hamui_set_protocol_v2 hamui_v2_is_active hamui_v2_clear \
     fi
 done
 # The client backbuffer must be at module scope (not a local —
-# 256000 bytes would blow Adder's frame).
-if ! grep -Eq "^h_v2_bb:[[:space:]]+Array\[256000," "$HAMUI_SRC"; then
-    fail_link "link 7 (lib/hamui.ad): h_v2_bb Array[256000,uint8] client backbuffer is missing"
+# multi-MB would blow Adder's frame). Widened to full screen
+# (1280x800x4 = 4 096 000 B) so the panel covers the full width.
+if ! grep -Eq "^h_v2_bb:[[:space:]]+Array\[(256000|4096000)," "$HAMUI_SRC"; then
+    fail_link "link 7 (lib/hamui.ad): h_v2_bb Array[4096000,uint8] client backbuffer is missing"
 fi
 # The commit primitive must compose a 'B' header (verb byte 66) and a
 # 'D' header (verb byte 68). We check via the verb-byte writes.
