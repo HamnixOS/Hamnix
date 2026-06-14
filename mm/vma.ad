@@ -600,6 +600,48 @@ def _vma_free_cow_range(pml4_phys: uint64, vlo: uint64, vhi: uint64):
         vaddr = vaddr + VMA_PAGE_SIZE
 
 
+def _vma_zap_priv_range(pml4_phys: uint64, vlo: uint64, vhi: uint64):
+    # #439 ZAP-ONLY teardown walk: clear every present 4 KiB PTE in
+    # [vlo, vhi) that lives in a TASK-PRIVATE page table, WITHOUT
+    # freeing the frames — the caller owns the frames through its own
+    # descriptors (chunk array / backing run) and returns them to the
+    # buddy allocator itself. This is the idempotence half of the
+    # ownership contract: teardown walks overlap (task_reap runs
+    # vma_clear and then the brk-reservation sweep over the SAME page
+    # tables; execve reuses the task's PML4), so any arm that frees
+    # frames while leaving their PTEs present hands the next walk a
+    # dangling mapping and the buddy allocator a DOUBLE FREE (free-list
+    # self-cycle → silent IRQs-off wedge). After this walk, a present
+    # PTE always means "frame not yet freed".
+    #
+    # BOOT-TABLE SAFETY: a slot that resolves to the SAME address
+    # through the pristine boot hierarchy is part of the global
+    # identity map every native task shares — never zap it (that would
+    # unmap kernel RAM system-wide). Only privately-cracked tables
+    # (per-task PDPT/PD/PT clones made by elf_install_user_mapping /
+    # _cow_resolve_pte_slot) are written. invlpg_one is harmless when
+    # the walked tables are not the live CR3 (dead-task reap) and
+    # required when they are (munmap on a live task).
+    if pml4_phys == 0:
+        return
+    boot: uint64 = cow_boot_cr3() & VMA_PT_ADDR_MASK
+    if (pml4_phys & VMA_PT_ADDR_MASK) == boot:
+        return
+    vaddr: uint64 = vlo
+    while vaddr < vhi:
+        pslot: uint64 = _vma_pte_slot_addr(pml4_phys, vaddr)
+        if pslot != 0:
+            bslot: uint64 = 0
+            if boot != 0:
+                bslot = _vma_pte_slot_addr(boot, vaddr)
+            if pslot != bslot:
+                pte: uint64 = cast[Ptr[uint64]](pslot)[0]
+                if (pte & VMA_PT_FLAG_P) != 0:
+                    cast[Ptr[uint64]](pslot)[0] = 0
+                    invlpg_one(vaddr)
+        vaddr = vaddr + VMA_PAGE_SIZE
+
+
 def _vma_node_free(slot: uint64, node: uint64, pml4_phys: uint64):
     # Release the node's backing pages (if any) then the node itself.
     # #174: `slot` identifies the owning task so a demand-paged node's
@@ -735,6 +777,16 @@ def _vma_node_free(slot: uint64, node: uint64, pml4_phys: uint64):
 
     nchunks: int32 = cast[Ptr[VmaNode]](node)[0].nchunks
     if nchunks > 0:
+        # #439 ZAP-before-free: a multi-chunk node's frames were mapped
+        # into the task's PML4 by an explicit overlay (the large-window
+        # path or a MAP_FIXED-at overlay — possibly INSIDE the task's
+        # brk reservation, which the reap/execve reservation sweep
+        # walks by PTE after this arm runs). Clear those PTEs BEFORE
+        # returning the chunks to the buddy allocator so no later
+        # PTE-walking teardown can resurrect a freed frame.
+        _vma_zap_priv_range(pml4_phys,
+                            cast[Ptr[VmaNode]](node)[0].start,
+                            cast[Ptr[VmaNode]](node)[0].end)
         carr: uint64 = cast[Ptr[VmaNode]](node)[0].chunks
         if carr != 0:
             i: int32 = 0
@@ -752,6 +804,14 @@ def _vma_node_free(slot: uint64, node: uint64, pml4_phys: uint64):
         return
     backing: uint64 = cast[Ptr[VmaNode]](node)[0].backing
     if backing != 0:
+        # #439 ZAP-before-free, same contract as the multi-chunk arm.
+        # For a NATIVE task the eager-identity node's PTEs are the
+        # shared boot identity map — _vma_zap_priv_range leaves those
+        # alone (boot-table safety) and only clears privately-cracked
+        # overlays.
+        _vma_zap_priv_range(pml4_phys,
+                            cast[Ptr[VmaNode]](node)[0].start,
+                            cast[Ptr[VmaNode]](node)[0].end)
         order: int32 = cast[Ptr[VmaNode]](node)[0].order
         free_pages(backing, order)
         # #174: the single-chunk eager path (vma_alloc) charged the VMA's
@@ -2929,6 +2989,64 @@ def vma_free_reserved_range(slot: uint64, vlo: uint64, vhi: uint64):
         return
     pml4: uint64 = task_pml4(cast[int32](slot))
     _vma_free_cow_range(pml4, vlo, vhi)
+
+
+def vma_release_brk_overlap(slot: uint64, vlo: uint64, vhi: uint64):
+    # #439 ownership transfer for MAP_FIXED inside the brk reservation.
+    #
+    # The brk arena is a RESERVED span tracked in task fields, not a
+    # VmaNode — so when an honest MAP_FIXED lands inside it, vma_alloc's
+    # carve pass finds nothing to release and the fresh overlay would
+    # simply overwrite the reservation's identity PTEs. That left the
+    # range with TWO owners: the new VMA node (frees its chunk frames at
+    # teardown) and the reservation sweep (vma_free_reserved_range walks
+    # the same vaddrs by PTE at reap/execve). The observed #439 double
+    # free was exactly this — busybox MAP_FIXEDs one page at brk_base;
+    # at reap the multi-chunk arm freed the overlay frame, then the brk
+    # sweep walked the stale PTE and freed it again, corrupting the
+    # buddy free list into a self-cycle (the IRQs-off wedge).
+    #
+    # Linux semantics: MAP_FIXED over the heap UNMAPS the covered heap
+    # pages. The mmap shim calls this with the intersection of the fixed
+    # request and [brk_base, brk_max) BEFORE vma_alloc: every present
+    # PTE frame in the overlap that is NOT owned by a VmaNode (node-
+    # owned frames are released by vma_alloc's carve, through the node's
+    # own teardown arm) is dropped through the COW refcount — a frame a
+    # forked relative still holds only loses one reference — and its PTE
+    # is zapped. The vaddr range then has exactly one owner at every
+    # instant, and the replaced arena frames are freed instead of
+    # leaking with zero owners.
+    if vhi <= vlo:
+        return
+    pml4: uint64 = task_pml4(cast[int32](slot))
+    if pml4 == 0:
+        return
+    boot: uint64 = cow_boot_cr3() & VMA_PT_ADDR_MASK
+    if (pml4 & VMA_PT_ADDR_MASK) == boot:
+        return
+    vaddr: uint64 = vlo & ~(VMA_PAGE_SIZE - 1)
+    while vaddr < vhi:
+        # Nodes are page-aligned, so a page is either fully inside a
+        # node or fully outside; any enclosing node owns this page.
+        if _vma_find_enclosing(slot, vaddr, vaddr + VMA_PAGE_SIZE) == 0:
+            pslot: uint64 = _vma_pte_slot_addr(pml4, vaddr)
+            if pslot != 0:
+                # Boot-table safety, same rule as _vma_zap_priv_range:
+                # never free/zap through a slot shared with the boot
+                # identity hierarchy.
+                bslot: uint64 = 0
+                if boot != 0:
+                    bslot = _vma_pte_slot_addr(boot, vaddr)
+                if pslot != bslot:
+                    pte: uint64 = cast[Ptr[uint64]](pslot)[0]
+                    if (pte & VMA_PT_FLAG_P) != 0:
+                        phys: uint64 = pte & VMA_PT_ADDR_MASK
+                        if phys != 0:
+                            if cow_drop_page(phys) != 0:
+                                free_page(phys)
+                        cast[Ptr[uint64]](pslot)[0] = 0
+                        invlpg_one(vaddr)
+        vaddr = vaddr + VMA_PAGE_SIZE
 
 
 # ---------------------------------------------------------------------
