@@ -192,6 +192,5 @@ fi
 
 size=$(wc -c < "$SHOT_OUT")
 echo "[test_de_screenshot] PASS: wrote $SHOT_OUT ($size bytes) via $CONVERTER."
-cp "$LOG" /tmp/de_screenshot_last.log
 rm -f "$LOG"
 exit 0
