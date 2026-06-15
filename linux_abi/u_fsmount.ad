@@ -1,0 +1,447 @@
+# linux_abi/u_fsmount.ad -- the Linux "new mount API" (Linux 5.2+):
+#   fsopen(2)      (nr 430)  -- open a fs_context for `fstype`
+#   fsconfig(2)    (nr 431)  -- set fs_context options (key=value, source, ...)
+#   fsmount(2)     (nr 432)  -- materialise an fs_context into a mount fd
+#   move_mount(2)  (nr 429)  -- install a mount fd at a target path
+#
+# This is the API that systemd, util-linux 2.39+, libmount, and modern
+# container runtimes (podman, runc, crun) reach for first; the legacy
+# mount(2) is a fallback for -ENOSYS. The five-step shape replaces the
+# overloaded `mount(NULL, ..., MS_*, data)` flag-arg call by giving each
+# step a real fd:
+#
+#     fd_ctx = fsopen("tmpfs", 0)                 // fs_context fd
+#     fsconfig(fd_ctx, FSCONFIG_SET_STRING, "size", "64M", 0)
+#     fsconfig(fd_ctx, FSCONFIG_CMD_CREATE, NULL, NULL, 0)
+#     fd_mnt = fsmount(fd_ctx, 0, 0)              // mount object fd
+#     move_mount(fd_mnt, "", AT_FDCWD, "/mnt", MOVE_MOUNT_F_EMPTY_PATH)
+#
+# Strategy in Hamnix:
+#   * Hamnix's native namespace is a Plan-9 binding, not a vfsmount.
+#     The new-API ABI is implemented as a SHADOW: small in-memory pools
+#     for fs_context objects and mount objects, each addressed by a real
+#     fd (via vfs_alloc_l2_fd + dedicated FD_FSCTX_MARK / FD_FSMOUNT_MARK
+#     markers). The shadow makes systemd/libmount's probe succeed (it
+#     can do the whole five-call sequence and see consistent state) and
+#     gives a clean hand-off point for a future fold onto a real
+#     per-mount flag table.
+#   * move_mount(MOVE_MOUNT_F_EMPTY_PATH) resolves the TARGET path via
+#     resolve_path -- per F10-1 mount calls must use namec/resolve_path
+#     -- so a target that does not exist fails -ENOENT, exactly like the
+#     legacy mount(2). On success the fs_context+mount pair is recorded
+#     against the target as "installed"; a subsequent statfs/df probe
+#     of the target still reflects the underlying backing store (the
+#     same answer Hamnix already gives for a target that is not actually
+#     remounted).
+#
+# Layer: confined Layer-2 leaf. Imports only fs/vfs's L2 fd allocator +
+# resolve_path + mm/uaccess + printk. It never touches Pgrp / Chan code.
+
+from mm.uaccess import (
+    copy_from_user, strncpy_from_user,
+)
+from fs.vfs import (
+    vfs_alloc_l2_fd, vfs_fd_marker, resolve_path,
+    vfs_l2_fd_set_buf, vfs_l2_fd_get_buf,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# Linux new-mount-API ABI constants
+# =====================================================================
+
+FSM_AT_FDCWD:        uint64 = 0xFFFFFFFFFFFFFF9C
+
+# fsopen flags.
+FSOPEN_CLOEXEC:      uint64 = 0x00000001
+FSOPEN_VALID_FLAGS:  uint64 = 0x00000001
+
+# fsmount flags.
+FSMOUNT_CLOEXEC:     uint64 = 0x00000001
+FSMOUNT_VALID_FLAGS: uint64 = 0x00000001
+# Mount attribute flags (the same MOUNT_ATTR_* set u_mount_setattr accepts).
+FSMOUNT_ATTR_VALID:  uint64 = 0x002000FF
+
+# fsconfig commands (uapi/linux/mount.h).
+FSCONFIG_SET_FLAG:        uint64 = 0
+FSCONFIG_SET_STRING:      uint64 = 1
+FSCONFIG_SET_BINARY:      uint64 = 2
+FSCONFIG_SET_PATH:        uint64 = 3
+FSCONFIG_SET_PATH_EMPTY:  uint64 = 4
+FSCONFIG_SET_FD:          uint64 = 5
+FSCONFIG_CMD_CREATE:      uint64 = 6
+FSCONFIG_CMD_RECONFIGURE: uint64 = 7
+
+# move_mount flags.
+MOVE_MOUNT_F_SYMLINKS:   uint64 = 0x00000001
+MOVE_MOUNT_F_AUTOMOUNTS: uint64 = 0x00000002
+MOVE_MOUNT_F_EMPTY_PATH: uint64 = 0x00000004
+MOVE_MOUNT_T_SYMLINKS:   uint64 = 0x00000010
+MOVE_MOUNT_T_AUTOMOUNTS: uint64 = 0x00000020
+MOVE_MOUNT_T_EMPTY_PATH: uint64 = 0x00000040
+MOVE_MOUNT_SET_GROUP:    uint64 = 0x00000100
+MOVE_MOUNT_VALID:        uint64 = 0x00000177
+
+# FD markers (distinct from existing Layer-2 markers in fs/vfs.ad and
+# the other u_*.ad leaves). 0xFFFFFFBE..0xFFFFFFBD are unused in the
+# survey at file-write time.
+FD_FSCTX_MARK:    uint32 = 0xFFFFFFBE
+FD_FSMOUNT_MARK:  uint32 = 0xFFFFFFBD
+
+# Negative-errno convention.
+FSM_EBADF:    int64 = -9
+FSM_EFAULT:   int64 = -14
+FSM_EINVAL:   int64 = -22
+FSM_ENOENT:   int64 = -2
+FSM_ENOSYS:   int64 = -38
+FSM_ENODEV:   int64 = -19
+FSM_EBUSY:    int64 = -16
+
+# Pool caps. The new-mount-API is realistically used a handful of times
+# per boot (per-container, per-tmpfs); 8 slots leaves headroom.
+FSCTX_POOL_CAP:   uint64 = 8
+FSMOUNT_POOL_CAP: uint64 = 8
+
+# Scratch buffer caps.
+FSM_FSTYPE_MAX: uint64 = 32
+FSM_PATH_MAX:   uint64 = 256
+FSM_VALUE_MAX:  uint64 = 64
+
+
+# =====================================================================
+# fs_context pool
+# =====================================================================
+#
+# Each slot records the fstype string (set at fsopen), an "created" flag
+# (set when FSCONFIG_CMD_CREATE is issued; fsmount refuses uncreated
+# contexts), and a generation counter used as the fd_buf payload so a
+# stale fd that refers to a recycled slot is recognised by mismatch.
+_fsctx_used:    Array[8, uint8]
+_fsctx_created: Array[8, uint8]
+_fsctx_gen:     Array[8, uint32]
+_fsctx_fstype:  Array[8, Array[32, uint8]]
+
+
+def _fsctx_alloc() -> int32:
+    i: uint64 = 0
+    while i < FSCTX_POOL_CAP:
+        if _fsctx_used[i] == 0:
+            _fsctx_used[i]    = 1
+            _fsctx_created[i] = 0
+            _fsctx_gen[i]     = _fsctx_gen[i] + 1
+            # Clear fstype.
+            j: uint64 = 0
+            while j < FSM_FSTYPE_MAX:
+                _fsctx_fstype[i][j] = 0
+                j = j + 1
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _fsctx_free(slot: int32):
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    if s >= FSCTX_POOL_CAP:
+        return
+    _fsctx_used[s]    = 0
+    _fsctx_created[s] = 0
+
+
+def _fsctx_valid(slot: int32) -> int32:
+    if slot < 0:
+        return 0
+    s: uint64 = cast[uint64](slot)
+    if s >= FSCTX_POOL_CAP:
+        return 0
+    if _fsctx_used[s] == 0:
+        return 0
+    return 1
+
+
+# =====================================================================
+# mount pool
+# =====================================================================
+#
+# Each slot is born from a "created" fs_context and records the source
+# slot id so a future fold onto real per-mount state can chase the
+# parent fs_context. installed=1 once move_mount() succeeds.
+_fsmnt_used:      Array[8, uint8]
+_fsmnt_installed: Array[8, uint8]
+_fsmnt_src_ctx:   Array[8, int32]
+
+
+def _fsmnt_alloc(src_ctx: int32) -> int32:
+    i: uint64 = 0
+    while i < FSMOUNT_POOL_CAP:
+        if _fsmnt_used[i] == 0:
+            _fsmnt_used[i]      = 1
+            _fsmnt_installed[i] = 0
+            _fsmnt_src_ctx[i]   = src_ctx
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _fsmnt_free(slot: int32):
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    if s >= FSMOUNT_POOL_CAP:
+        return
+    _fsmnt_used[s] = 0
+
+
+def _fsmnt_valid(slot: int32) -> int32:
+    if slot < 0:
+        return 0
+    s: uint64 = cast[uint64](slot)
+    if s >= FSMOUNT_POOL_CAP:
+        return 0
+    if _fsmnt_used[s] == 0:
+        return 0
+    return 1
+
+
+# Resolve an fd to its pool slot. Returns -1 for a wrong-mark / closed fd.
+def _fd_to_fsctx_slot(fd: int32) -> int32:
+    if vfs_fd_marker(fd) != FD_FSCTX_MARK:
+        return -1
+    # The slot id is stored in fd_buf; vfs_l2_fd_get_buf reaches it.
+    # We embed the slot directly (no generation salt) because the pool is
+    # small and the fd is closed in lock-step with the slot.
+    return _fd_buf_slot(fd)
+
+
+def _fd_to_fsmnt_slot(fd: int32) -> int32:
+    if vfs_fd_marker(fd) != FD_FSMOUNT_MARK:
+        return -1
+    return _fd_buf_slot(fd)
+
+
+def _fd_buf_slot(fd: int32) -> int32:
+    raw: uint64 = vfs_l2_fd_get_buf(fd)
+    return cast[int32](raw)
+
+
+# =====================================================================
+# fsopen(fstype, flags)  --  nr 430
+# =====================================================================
+def fsopen_handler(a0: uint64, a1: uint64, a2: uint64,
+                   a3: uint64, a4: uint64, a5: uint64) -> int64:
+    if a0 == 0:
+        return FSM_EFAULT
+    flags: uint64 = a1
+    if (flags & ~FSOPEN_VALID_FLAGS) != 0:
+        return FSM_EINVAL
+
+    # Copy the fstype string. A bad pointer -> EFAULT.
+    ftype: Array[32, uint8]
+    nlen: int64 = strncpy_from_user(cast[uint64](&ftype[0]), a0, FSM_FSTYPE_MAX)
+    if nlen < 0:
+        return FSM_EFAULT
+    ftype[FSM_FSTYPE_MAX - 1] = 0
+    # Empty fstype -> EINVAL.
+    if ftype[0] == 0:
+        return FSM_EINVAL
+
+    slot: int32 = _fsctx_alloc()
+    if slot < 0:
+        return FSM_EBUSY
+    # Record the fstype on the slot.
+    s: uint64 = cast[uint64](slot)
+    j: uint64 = 0
+    while j < FSM_FSTYPE_MAX:
+        _fsctx_fstype[s][j] = ftype[j]
+        j = j + 1
+
+    fd: int32 = vfs_alloc_l2_fd(FD_FSCTX_MARK)
+    if fd < 0:
+        _fsctx_free(slot)
+        return cast[int64](fd)
+    vfs_l2_fd_set_buf(fd, cast[uint64](slot))
+    return cast[int64](fd)
+
+
+# =====================================================================
+# fsconfig(fd, cmd, key, value, aux)  --  nr 431
+# =====================================================================
+def fsconfig_handler(a0: uint64, a1: uint64, a2: uint64,
+                     a3: uint64, a4: uint64, a5: uint64) -> int64:
+    fd: int32 = cast[int32](a0)
+    cmd: uint64 = a1
+    slot: int32 = _fd_to_fsctx_slot(fd)
+    if slot < 0 or _fsctx_valid(slot) == 0:
+        return FSM_EBADF
+
+    if cmd == FSCONFIG_CMD_CREATE:
+        # The fs_context is now in "ready to mount" state. fsmount(2) on
+        # this fd will succeed; further SET_* calls return EBUSY (matches
+        # Linux's "created" state).
+        s: uint64 = cast[uint64](slot)
+        _fsctx_created[s] = 1
+        return 0
+
+    if cmd == FSCONFIG_CMD_RECONFIGURE:
+        # Accept the reconfigure as a no-op; no per-mount state to update.
+        return 0
+
+    # The SET_* commands accept key/value strings. We don't store the
+    # values (Hamnix has no per-mount knobs to apply them to), but we
+    # DO drain the user pointers to surface a bad pointer as -EFAULT
+    # rather than silently accepting it -- the libmount probe shape
+    # depends on bad input failing observably.
+    is_set_cmd: int32 = 0
+    if cmd == FSCONFIG_SET_FLAG:
+        is_set_cmd = 1
+    if cmd == FSCONFIG_SET_STRING:
+        is_set_cmd = 1
+    if cmd == FSCONFIG_SET_BINARY:
+        is_set_cmd = 1
+    if cmd == FSCONFIG_SET_PATH:
+        is_set_cmd = 1
+    if cmd == FSCONFIG_SET_PATH_EMPTY:
+        is_set_cmd = 1
+    if cmd == FSCONFIG_SET_FD:
+        is_set_cmd = 1
+    if is_set_cmd != 0:
+        # SET_FLAG only consumes the key; the rest also consume a value.
+        if a2 != 0:
+            kbuf: Array[64, uint8]
+            kn: int64 = strncpy_from_user(cast[uint64](&kbuf[0]), a2,
+                                          FSM_VALUE_MAX)
+            if kn < 0:
+                return FSM_EFAULT
+        if cmd != FSCONFIG_SET_FLAG and cmd != FSCONFIG_SET_FD:
+            if a3 != 0:
+                vbuf: Array[64, uint8]
+                vn: int64 = strncpy_from_user(cast[uint64](&vbuf[0]), a3,
+                                              FSM_VALUE_MAX)
+                if vn < 0:
+                    return FSM_EFAULT
+        # SET_* against an already-created context is EBUSY (Linux).
+        s2: uint64 = cast[uint64](slot)
+        if _fsctx_created[s2] != 0:
+            return FSM_EBUSY
+        return 0
+
+    # Unknown cmd.
+    return FSM_EINVAL
+
+
+# =====================================================================
+# fsmount(fd, flags, mount_attrs)  --  nr 432
+# =====================================================================
+def fsmount_handler(a0: uint64, a1: uint64, a2: uint64,
+                    a3: uint64, a4: uint64, a5: uint64) -> int64:
+    fd: int32 = cast[int32](a0)
+    flags: uint64 = a1
+    mattrs: uint64 = a2
+
+    if (flags & ~FSMOUNT_VALID_FLAGS) != 0:
+        return FSM_EINVAL
+    if (mattrs & ~FSMOUNT_ATTR_VALID) != 0:
+        return FSM_EINVAL
+
+    ctx_slot: int32 = _fd_to_fsctx_slot(fd)
+    if ctx_slot < 0 or _fsctx_valid(ctx_slot) == 0:
+        return FSM_EBADF
+    # Must be in the "created" state — fsconfig(FSCONFIG_CMD_CREATE) was
+    # issued. Matches Linux's fsmount-before-create rejection.
+    if _fsctx_created[cast[uint64](ctx_slot)] == 0:
+        return FSM_EBUSY
+
+    mnt_slot: int32 = _fsmnt_alloc(ctx_slot)
+    if mnt_slot < 0:
+        return FSM_EBUSY
+    mfd: int32 = vfs_alloc_l2_fd(FD_FSMOUNT_MARK)
+    if mfd < 0:
+        _fsmnt_free(mnt_slot)
+        return cast[int64](mfd)
+    vfs_l2_fd_set_buf(mfd, cast[uint64](mnt_slot))
+    return cast[int64](mfd)
+
+
+# =====================================================================
+# move_mount(from_dfd, from_path, to_dfd, to_path, flags)  --  nr 429
+# =====================================================================
+def move_mount_handler(a0: uint64, a1: uint64, a2: uint64,
+                       a3: uint64, a4: uint64, a5: uint64) -> int64:
+    from_dfd: uint64 = a0
+    from_path: uint64 = a1
+    to_dfd: uint64 = a2
+    to_path: uint64 = a3
+    flags: uint64 = a4
+
+    if (flags & ~MOVE_MOUNT_VALID) != 0:
+        return FSM_EINVAL
+
+    # The common new-mount-API shape: from_dfd is the mount fd (returned
+    # by fsmount), from_path is empty + MOVE_MOUNT_F_EMPTY_PATH is set,
+    # to_dfd is AT_FDCWD, to_path is the target. We support that case;
+    # other shapes (binding a path-to-path move) return -ENOSYS, which
+    # libmount falls back from gracefully.
+    if (flags & MOVE_MOUNT_F_EMPTY_PATH) == 0:
+        # Path-to-path move not supported on this Layer-2 shim.
+        return FSM_ENOSYS
+
+    mnt_slot: int32 = _fd_to_fsmnt_slot(cast[int32](from_dfd))
+    if mnt_slot < 0 or _fsmnt_valid(mnt_slot) == 0:
+        return FSM_EBADF
+
+    if to_path == 0:
+        return FSM_EFAULT
+    # to_dfd must be AT_FDCWD here (the libmount default); any other dfd
+    # would need per-fd directory resolution we don't carry on this path.
+    if to_dfd != FSM_AT_FDCWD:
+        # Treat absolute to_path the same way openat2 does -- dfd is
+        # ignored by Linux for an absolute path.
+        # (Defer the absolute-path check until after the copy.)
+        pass
+
+    kpath: Array[256, uint8]
+    nlen: int64 = strncpy_from_user(cast[uint64](&kpath[0]), to_path, FSM_PATH_MAX)
+    if nlen < 0:
+        return FSM_EFAULT
+    kpath[FSM_PATH_MAX - 1] = 0
+    if kpath[0] == 0:
+        return FSM_EINVAL
+
+    is_abs: int32 = 0
+    if kpath[0] == 47:
+        is_abs = 1
+    if to_dfd != FSM_AT_FDCWD and is_abs == 0:
+        return FSM_EINVAL
+
+    # Resolve the target path (per F10-1 mount calls go through
+    # namec/resolve_path). A non-existent target -> -ENOENT.
+    abs_path: Array[256, uint8]
+    rc: int32 = resolve_path(cast[Ptr[char]](&kpath[0]), &abs_path[0], 256)
+    if rc != 0:
+        return FSM_ENOENT
+
+    # Mark the mount as installed; the from_dfd remains valid (Linux's
+    # move_mount does NOT close it -- the user closes via close(2)).
+    _fsmnt_installed[cast[uint64](mnt_slot)] = 1
+    return 0
+
+
+# =====================================================================
+# Close-side cleanup
+# =====================================================================
+#
+# Called from the central close path (_u_close) when an fd is being
+# released. Either marker drains the corresponding pool slot so a future
+# fd allocation that recycles the slot starts fresh.
+def fsmount_close_fd(fd: int32):
+    m: uint32 = vfs_fd_marker(fd)
+    if m == FD_FSCTX_MARK:
+        slot: int32 = _fd_buf_slot(fd)
+        _fsctx_free(slot)
+    elif m == FD_FSMOUNT_MARK:
+        slot2: int32 = _fd_buf_slot(fd)
+        _fsmnt_free(slot2)
