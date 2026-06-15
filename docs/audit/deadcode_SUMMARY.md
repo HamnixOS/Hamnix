@@ -15,7 +15,7 @@ like it the audit found.
 
 | # | Redundancy | Canonical (keep) | Redundant (retire) | Area |
 |---|---|---|---|---|
-| 1 | Mouse injection | `/dev/mouse` `devmouse_write` | `nudge`/`nudge_report`/`drag` verbs on `/dev/wsys/ctl` | kernel (devwsys) |
+| 1 | Mouse injection | `/dev/mouse` `devmouse_write` | ~~`nudge`/`nudge_report`/`drag` verbs on `/dev/wsys/ctl`~~ **RETIRED (A.1 done)** — verbs + `wsys_nudge_*` counters gone; all callers (rc.5 gate, test_de_cursor_nudge/edge_snap/alt_drag) drive `/dev/mouse`; cursor-FPS moved into the compositor (`[de_perf] cursor_fps=N`) | kernel (devwsys) |
 | 2 | rio/devwin window protocol | legacy `/dev/wsys` path | **devwin.ad + DEV_WIN_* in namec + `_rio_path`/`hamui_enable_rio_path` + `hamclock --rio`** — DEAD SCAFFOLDING (ENOSYS/EOF stubs, flag defaults off, nothing launches it) | DE + kernel |
 | 3 | DE panel | hamUId-spawned hampanel/hambottom stack | **`hamde.svc` → `/bin/hamde`** = a SECOND panel enabled at runlevel 5, overlapping the first (suspect cause of panel flakiness) | DE / services |
 | 4 | App windows | standalone hamcalc/hamsysmon/hamfm/hamedit apps | in-compositor `APP_CALC/SYSMON/FILEMGR/EDITOR` still live in the Applications menu (MATE-mirror externalisation only finished for Terminal) | DE |

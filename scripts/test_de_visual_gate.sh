@@ -4,8 +4,9 @@
 # Boots the installer image under OVMF/KVM and produces, for every
 # graphical boot:
 #
-#   1. A real cursor-FPS number, captured from the in-guest `nudge` /
-#      `nudge_report` ctl verbs the rc.5 hook fires.
+#   1. A real cursor-FPS number, emitted by the compositor once per second
+#      ([de_perf] cursor_fps=N) while the rc.5 hook drives the cursor via
+#      /dev/mouse absolute moves (A.1 consolidation — no injection ctl verb).
 #   2. A pre-spawn and post-spawn framebuffer PNG for each hamui app
 #      the rc.5 hook launches (hamclock hamcalc hamfm hamterm hammon
 #      hamctl hamshot hamnotify), captured live via the QEMU monitor
@@ -369,17 +370,19 @@ wait "$QEMU_PID" 2>/dev/null
 QEMU_PID=""
 
 # --- parse cursor_fps from the serial log ----------------------------
-# The kernel now stamps the [de_perf] line at EMERG level so it survives
-# console_set_interactive() suppression; EMERG printk still carries the
-# "[NNNNNN] " sequence prefix, so match the tag ANYWHERE on the line
-# (not anchored at ^). Pick the line with the highest consumed= (the
-# post-burst report, not the initial reset whose consumed is 0).
+# A.1: the compositor emits "[de_perf] cursor_fps=N presents=X window_cs=Z"
+# once per second (decoupled from any injection verb). The line is stamped
+# at EMERG level so it survives console_set_interactive() suppression; EMERG
+# printk still carries the "[NNNNNN] " sequence prefix, so match the tag
+# ANYWHERE on the line (not anchored at ^). Pick the BUSIEST line (highest
+# cursor_fps over the boot), which reflects the rc.5 cursor-drive window.
 FPS_LINE=$(grep -aE '\[de_perf\] cursor_fps=' "$LOG" \
-    | sort -t= -k3 -n | tail -1 || true)
+    | sed -nE 's/.*(cursor_fps=[0-9]+ presents=[0-9]+ window_cs=[0-9]+).*/\1/p' \
+    | sort -t= -k2 -n | tail -1 || true)
 CURSOR_FPS=$(printf '%s' "$FPS_LINE" | sed -nE 's/.*cursor_fps=([0-9]+).*/\1/p')
 CURSOR_FPS=${CURSOR_FPS:-0}
-CONSUMED=$(printf '%s' "$FPS_LINE" | sed -nE 's/.*consumed=([0-9]+).*/\1/p')
-CONSUMED=${CONSUMED:-0}
+PRESENTS=$(printf '%s' "$FPS_LINE" | sed -nE 's/.*presents=([0-9]+).*/\1/p')
+PRESENTS=${PRESENTS:-0}
 
 # --- DE-marker grep --------------------------------------------------
 DE_MARKERS=$(grep -aE '\[de_ws\] active=|\[de_kbd\]|\[de_notify\] render|hamUI stack started|\[de_perf\] cursor_fps=' "$LOG" \
@@ -391,7 +394,7 @@ SUMMARY="$OUT_DIR/SUMMARY.txt"
     echo "test_de_visual_gate summary ($TS)"
     echo "================================"
     echo "cursor_fps      = $CURSOR_FPS"
-    echo "consumed        = $CONSUMED"
+    echo "presents        = $PRESENTS"
     echo "fps_baseline    = $FPS_MIN"
     echo
     echo "per-app render status"

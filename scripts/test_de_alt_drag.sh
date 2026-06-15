@@ -51,7 +51,7 @@ BOOT_WAIT="${BOOT_WAIT:-120}"
 
 # ---------------- STRUCTURAL pre-check ----------------------------------
 HAMUID=user/hamUId.ad
-DEVWSYS=sys/src/9/port/devwsys.ad
+DEVMOUSE=sys/src/9/port/devmouse.ad
 struct_fail=0
 fail_marker() {
     echo "FAIL: DE Alt+drag structural marker missing: $1" >&2
@@ -76,11 +76,13 @@ grep -Fq 'ALT_RB_RESIZE' "$HAMUID" \
 grep -Fq '[de_altdrag] resize=W' "$HAMUID" \
     || fail_marker "[de_altdrag] resize=W boot-log marker"
 
-# (4) kernel /dev/wsys/ctl `drag` verb still parses an optional <altmask>.
-grep -Fq 'drag: bad altmask' "$DEVWSYS" \
-    || fail_marker "kernel /dev/wsys/ctl drag verb optional <altmask> arg"
-grep -Fq 'dbtn_u = dbtn_u | 0x80' "$DEVWSYS" \
-    || fail_marker "kernel drag verb wires altmask -> button bit 0x80"
+# (4) A.1: the Alt+drag injection path is now /dev/mouse (devmouse_write),
+# which passes the button bitmap (including the Alt bit 0x80) straight
+# through to mouse_rx_push_abs — the compositor decodes (btn & 0x80) above.
+grep -Fq 'def devmouse_write(' "$DEVMOUSE" \
+    || fail_marker "devmouse_write (/dev/mouse writable-mouse injection)"
+grep -Fq 'mouse_rx_push_abs(dx, dy, buttons, dz)' "$DEVMOUSE" \
+    || fail_marker "devmouse_write passes the full button bitmap (incl. 0x80) through"
 
 # (5) dispatch keyword + selftest function.
 grep -Fq '"dealtdrag"' "$HAMUID" \

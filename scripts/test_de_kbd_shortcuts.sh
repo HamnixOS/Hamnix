@@ -3,8 +3,8 @@
 # shortcuts the DE picked up (Alt-Tab / Ctrl-Alt-T / Alt-F4 / Super /
 # Super+D). The atkbd driver has no modifier encoding, so the chords
 # ride dedicated CSI codes (45..49) injected through the new
-# `/dev/wsys/ctl kbd <N>` verb — the keyboard analogue of the cursor
-# `nudge` verb. The compositor's key_process_chunk decodes the CSI and
+# `/dev/wsys/ctl kbd <N>` verb — the keyboard analogue of driving the
+# cursor via /dev/mouse. The compositor's key_process_chunk decodes the CSI and
 # fires the bound action, emitting a "[de_kbd] <name>=1" boot-log line
 # that this harness greps for.
 #

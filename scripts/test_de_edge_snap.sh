@@ -12,9 +12,10 @@
 #   [de_snap] <name>=1\n           (greppable: top|left|right|tl|tr|bl|br)
 #
 # This harness verifies the structural plumbing every run (source greps)
-# and exercises the runtime drag synthesizer (new /dev/wsys/ctl `drag
-# <ax> <ay> <btn>` verb — the move/release analogue of `nudge`) when the
-# kernel ELF is built and the host accepts -kernel boots.
+# and exercises the runtime drag synthesizer (A.1: the retired `drag`
+# ctl verb's job is now done by writing absolute-move lines with a button
+# bitmask to /dev/mouse — "<ax> <ay> <btn> 0 1") when the kernel ELF is
+# built and the host accepts -kernel boots.
 
 set -uo pipefail
 
@@ -30,15 +31,13 @@ HAMUID=user/hamUId.ad
 
 struct_fail=0
 
-# --- structural: drag ctl verb plumbing in devwsys -----------------------
+# --- structural: /dev/mouse abs-write injection path (replaces drag verb) -
+DEVMOUSE=sys/src/9/port/devmouse.ad
 for marker in \
-    'wsys_ctl_word_eq(buf, vs, ve, "drag")' \
-    'drag: missing ax' \
-    'drag: missing ay' \
-    'drag: missing btn' \
-    'mouse_rx_push_abs(cast[int32](dax_u),' ; do
-    if ! grep -aFq "$marker" "$DEVWSYS"; then
-        echo "[test_de_edge_snap] FAIL: devwsys marker missing: $marker" >&2
+    'def devmouse_write(' \
+    'mouse_rx_push_abs(dx, dy, buttons, dz)' ; do
+    if ! grep -aFq "$marker" "$DEVMOUSE"; then
+        echo "[test_de_edge_snap] FAIL: devmouse marker missing: $marker" >&2
         struct_fail=1
     fi
 done
@@ -91,7 +90,7 @@ fi
 if [ "$struct_fail" -ne 0 ]; then
     exit 1
 fi
-echo "[test_de_edge_snap] structural markers OK (drag ctl verb + snap_zone_for + 7 [de_snap] names + v2 overlay)."
+echo "[test_de_edge_snap] structural markers OK (/dev/mouse abs-write + snap_zone_for + 7 [de_snap] names + v2 overlay)."
 
 mkdir -p "$(dirname "$OUT_REPORT")"
 
@@ -184,15 +183,17 @@ if ! wait_for 'MARK_SNAP_READY' 10; then
     sleep 1
 fi
 
-# Smoke: exercise the `drag` ctl verb arg parsing + auxmouse push path.
-# (The compositor's WM gesture machine needs a pre-existing draggable
-# window whose titlebar is at known absolute coords; bootstrapping that
-# from a fresh hamsh is outside this harness's scope. We assert that the
-# verb is plumbed end-to-end — no errstr printk — and that the kernel
-# accepts the three required tokens.)
-printf 'drag 16384 16384 1 > /dev/wsys/ctl\n' >&3 ; sleep 0.2
-printf 'drag 32000 16384 1 > /dev/wsys/ctl\n' >&3 ; sleep 0.2
-printf 'drag 32000 16384 0 > /dev/wsys/ctl\n' >&3 ; sleep 0.4
+# Smoke: exercise the /dev/mouse absolute-move-with-buttons injection path
+# (A.1 — replaces the retired `drag` ctl verb). Format "<ax> <ay> <btn> 0 1":
+# abs=1 → ax/ay are 0..32767, btn is the button bitmask (1 = left held, 0 =
+# release). (The compositor's WM gesture machine needs a pre-existing
+# draggable window whose titlebar is at known absolute coords; bootstrapping
+# that from a fresh hamsh is outside this harness's scope. We assert that the
+# path is plumbed end-to-end — no errstr printk — and that the kernel accepts
+# the absolute-event line.)
+printf 'echo "16384 16384 1 0 1" > /dev/mouse\n' >&3 ; sleep 0.2
+printf 'echo "32000 16384 1 0 1" > /dev/mouse\n' >&3 ; sleep 0.2
+printf 'echo "32000 16384 0 0 1" > /dev/mouse\n' >&3 ; sleep 0.4
 sleep 1
 
 exec 3>&-
@@ -204,10 +205,10 @@ wait "$QEMU_PID" 2>/dev/null
 kill "$WD" 2>/dev/null
 QEMU_PID=""
 
-# Negative check: the `drag` verb must NOT have raised an errstr.
-if grep -aqE '/dev/wsys/ctl: drag: ' "$LOG"; then
-    echo "[test_de_edge_snap] FAIL: drag ctl verb errstr seen in log" >&2
-    grep -aE '/dev/wsys/ctl: drag: ' "$LOG" >&2 | head
+# Negative check: the /dev/mouse write must NOT have raised a write error.
+if grep -aqE '/dev/mouse: (write|bad|malformed)' "$LOG"; then
+    echo "[test_de_edge_snap] FAIL: /dev/mouse write error seen in log" >&2
+    grep -aE '/dev/mouse: ' "$LOG" >&2 | head
     exit 1
 fi
 
@@ -226,5 +227,5 @@ done
     echo "seen=$seen"
 } > "$OUT_REPORT"
 
-echo "[test_de_edge_snap] PASS: drag ctl verb wired; snap markers captured:${seen:- (none — drag did not land on a titlebar)}"
+echo "[test_de_edge_snap] PASS: /dev/mouse abs-drag wired; snap markers captured:${seen:- (none — drag did not land on a titlebar)}"
 exit 0
