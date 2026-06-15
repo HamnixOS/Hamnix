@@ -50,10 +50,23 @@ drift.
 - ~36 copy-pasted arch-independent AST-walk methods across codegen_x86.py / codegen_arm64.py → shared base/mixin.
 - 27 `test_*.sh` re-copy the OVMF-firmware + monitor-screendump block → extract `scripts/lib/_de_ovmf_screendump.sh` (+ installer-selftest + v2-guard helpers).
 
-## E. DECISIONS THAT NEED THE USER
+## E. DECISIONS (resolved 2026-06-15, orchestrator + user)
 
-- **dm.ad (~5090) + md.ad (~4852) = ~10k lines, entirely test-only** (reachable only from their own boot selftests; no production consumer). Keep as a product feature (device-mapper / md-RAID) or retire? This is a product call, not a mechanical cleanup.
-- The MCU-OS-era leftovers (`debug.sh` OpenOCD launcher, `.gdbinit`, M1 dev-kernel chain `build_x86_kernel.sh`+friends) — retire the retired-platform tooling?
+- **dm.ad (~5090) + md.ad (~4852): KEPT.** Not dead — exercised by their own
+  selftests, and they ARE the device-mapper + md-RAID Linux-parity features
+  built across Waves 3–12. "Test-only" is a production-*wiring* gap (no
+  `dmsetup`/`mdadm`-shape userland binds them to real block devices yet), not
+  deadness. Retiring ~10k lines of working/tested storage-parity code would
+  subtract from the Linux-competitor breadth for a one-time line-count win.
+  FOLLOW-UP (not blocking): wire dm/md to a production entry (dmsetup/mdadm
+  userland or a /dev binding) so they're reachable outside selftests.
+- **MCU/Pynux-era tooling: RETIRED** `scripts/debug.sh` (RP2040/STM32F4
+  OpenOCD launcher) + `.gdbinit` ("Pynux OS" era) — dead-platform, zero live
+  callers, untouched by CI. KEPT the x86 dev-kernel/module chain
+  (`build_x86_kernel.sh` + `run_x86_module.sh` + `make_initramfs.sh` +
+  `x86_kernel_config.sh` + `kernel-modules/hello`): it's the *current*-platform
+  out-of-tree `.ko` build demo, a self-contained working cluster, not
+  dead-platform — superseded-dev-convenience at most, low harm to keep.
 
 ## Action tiers
 
