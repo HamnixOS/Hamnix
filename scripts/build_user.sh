@@ -176,6 +176,7 @@ build_adder_user hamedit              # hamui GUI text editor: open/save real fi
 build_adder_user hamfiles             # hamui GUI file browser: sys_listdir + launch hamedit
 build_adder_user hamde                # hamui-based DE panel (Applications menu + clock + taskbar)
 build_adder_user hampanel             # DE panel extracted from daemon_pixel: standalone hamui-client app on the #442 (c) v2 blit protocol (taskbar + clock + Applications launcher)
+build_adder_user hambottom            # DE bottom panel (MATE-style window list strip + Show Desktop + workspace switcher; v2 client; reads /dev/wsys/session)
 build_adder_user hamappmenu           # DE pivot wave 2: cascading Applications menu (v2 client; reads /dev/wsys/appmenu, writes /dev/wsys/appmenu/launch)
 build_adder_user hamcycler            # DE pivot wave 3: Alt-Tab window switcher overlay (v2 client; reads /dev/wsys/cycler, poked via /dev/wsys/cycler/show)
 build_adder_user hamcalpop            # DE pivot wave 4: clock-panel calendar drop-down popup (v2 client; reads /dev/wsys/calpop, poked via /dev/wsys/calpop/show; distinct from /bin/hamclock)
