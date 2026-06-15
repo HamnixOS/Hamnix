@@ -18,6 +18,13 @@ were checked by their *string* export name, not just the Adder symbol.
 
 ---
 
+> **EXECUTED 2026-06-15 (branch worktree-cleanup-fs-linuxabi).** All 18 present
+> SAFE-REMOVE symbols below + §2a deleted; installer image build stayed green.
+> `vfs_open_node_l2` (listed in the summary) did not exist in tree — nothing to
+> remove (the live `_l2` sibling kept is `vfs_open_cgroup_l2`). NEEDS-REVIEW and
+> CLEAN items left untouched. Per-symbol notes: every SAFE-REMOVE had zero
+> non-comment callers on re-grep; all KEEP siblings verified live and retained.
+
 ## 1. DEAD CODE — zero-reference functions (SAFE-REMOVE)
 
 - [SAFE-REMOVE] linux_abi/u_syscalls.ad:5366 `_u_unimpl_fstat` — `-ENOSYS`
