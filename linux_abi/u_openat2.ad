@@ -1,0 +1,218 @@
+# linux_abi/u_openat2.ad -- the Linux openat2(2) syscall (nr 437).
+#
+# openat2 is the modern path-resolution-aware open primitive (added in Linux
+# 5.6). The signature is
+#
+#   int openat2(int dirfd, const char *pathname,
+#               struct open_how *how, size_t size)
+#
+# `struct open_how` (uapi/linux/openat2.h):
+#
+#   __u64 flags;     /* O_* flags (open(2) flags) */
+#   __u64 mode;      /* O_CREAT/O_TMPFILE mode bits */
+#   __u64 resolve;   /* RESOLVE_* path-resolution restrictions */
+#
+# Modern systemd, container runtimes, and io_uring submitters reach for
+# openat2 directly so the kernel does the path-restriction check IN the
+# syscall rather than after the open. The RESOLVE_* bits we care about for
+# the common case are:
+#
+#   RESOLVE_NO_SYMLINKS  (0x04)  -- fail with -ELOOP if any symlink is
+#                                   traversed during resolution.
+#   RESOLVE_BENEATH      (0x08)  -- reject any path that escapes the
+#                                   directory referred to by dirfd
+#                                   (no leading '/' on the path, no
+#                                   ".." that walks above dirfd).
+#   RESOLVE_NO_MAGICLINKS (0x02) -- accepted, never matters: Hamnix has
+#                                   no /proc magic-links exposed here.
+#   RESOLVE_NO_XDEV       (0x01) -- accepted, never matters: a single
+#                                   ext4 root + tmpfs/proc bindings is
+#                                   the realistic mount picture.
+#   RESOLVE_IN_ROOT       (0x10) -- accepted; we already root the lookup
+#                                   at dirfd (or cwd for AT_FDCWD), and
+#                                   the BENEATH check is the meaningful
+#                                   half of "stay inside this subtree".
+#   RESOLVE_CACHED        (0x20) -- accepted; Hamnix has no path cache
+#                                   so it is observably a hint, same as
+#                                   Linux when the cache is cold.
+#
+# Strategy: parse the open_how struct, validate flags / size, enforce the
+# two restrictions that can be checked PURELY from the path bytes
+# (RESOLVE_NO_SYMLINKS as a no-op success because the native fs surface
+# presents no symlinks; RESOLVE_BENEATH by scanning the path for an
+# absolute leading '/' or ".." escape), then forward to _u_open with the
+# extracted flags/mode for the AT_FDCWD / absolute-path case.
+#
+# Layer: confined Layer-2 leaf. Calls only mm/uaccess + printk + a single
+# forward into the existing _u_open dispatch arm via a function pointer
+# registered at bring-up (cycle-free import: u_syscalls.ad imports us, we
+# do not import u_syscalls.ad). Returns int64 (fd on success, -errno).
+
+from mm.uaccess import (
+    copy_from_user, strncpy_from_user,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# Linux openat2 ABI constants
+# =====================================================================
+
+OA2_AT_FDCWD:           uint64 = 0xFFFFFFFFFFFFFF9C   # AT_FDCWD (-100)
+
+# struct open_how layout: three u64 fields = 24 bytes. Linux accepts any
+# `size` >= the size it understands and rejects smaller as E2BIG/EINVAL.
+OA2_OPEN_HOW_MIN:       uint64 = 24
+OA2_OPEN_HOW_MAX:       uint64 = 64    # generous future-proofing cap
+
+# RESOLVE_* bitmask (uapi/linux/openat2.h).
+OA2_RESOLVE_NO_XDEV:        uint64 = 0x01
+OA2_RESOLVE_NO_MAGICLINKS:  uint64 = 0x02
+OA2_RESOLVE_NO_SYMLINKS:    uint64 = 0x04
+OA2_RESOLVE_BENEATH:        uint64 = 0x08
+OA2_RESOLVE_IN_ROOT:        uint64 = 0x10
+OA2_RESOLVE_CACHED:         uint64 = 0x20
+OA2_RESOLVE_VALID: uint64 = 0x3F     # union of the bits above
+
+# Negative-errno convention.
+OA2_EFAULT: int64 = -14
+OA2_EINVAL: int64 = -22
+OA2_E2BIG:  int64 = -7
+OA2_ELOOP:  int64 = -40
+OA2_EXDEV:  int64 = -18
+
+# Path scratch cap (mirrors u_syscalls MAX_USER_PATH).
+OA2_PATH_MAX: uint64 = 256
+
+
+# Function pointer plumbed in by u_syscalls.ad at bring-up so this leaf
+# can forward to the SAME open path _u_open uses (resolve_path + vfs_open
+# + landlock check) without an import cycle. The signature matches the
+# 6-arg syscall ABI (path, flags, mode, 0, 0, 0) -> int64.
+_oa2_open_hook: Fn[int64, uint64, uint64, uint64, uint64, uint64, uint64]
+
+
+def register_openat2_open_hook(
+        hook: Fn[int64, uint64, uint64, uint64,
+                 uint64, uint64, uint64, uint64]):
+    # u_syscalls.ad calls this once with _u_open during u_syscalls_init().
+    _oa2_open_hook = hook
+
+
+# Path-escape scan: returns 1 iff the path contains a ".." component that
+# walks above the dirfd anchor, OR is absolute. The scan is the same shape
+# Linux's resolve_dotdot rejection performs against RESOLVE_BENEATH —
+# track a depth counter starting at 0; "/" prefix is an immediate reject;
+# each non-"." non-".." component increments depth; each ".." decrements.
+# A decrement that would take depth below 0 is the escape.
+def _oa2_path_escapes_beneath(kp: Ptr[uint8]) -> int32:
+    if kp[0] == 47:                                     # leading '/'
+        return 1
+    depth: int32 = 0
+    i: uint64 = 0
+    # Walk component by component. A component runs from the current i
+    # to the next '/' or NUL.
+    while kp[i] != 0:
+        # Skip leading slashes between components (normal path normalisation).
+        while kp[i] == 47:
+            i = i + 1
+        if kp[i] == 0:
+            return 0
+        # Capture component span [i, j).
+        j: uint64 = i
+        while kp[j] != 0 and kp[j] != 47:
+            j = j + 1
+        clen: uint64 = j - i
+        # "." => no depth change.
+        # ".." => depth--; if it underflows, this is the escape.
+        # anything else => depth++.
+        if clen == 1 and kp[i] == 46:
+            # "." -- no-op
+            i = j
+        elif clen == 2 and kp[i] == 46 and kp[i + 1] == 46:
+            if depth == 0:
+                return 1
+            depth = depth - 1
+            i = j
+        else:
+            depth = depth + 1
+            i = j
+    return 0
+
+
+# =====================================================================
+# openat2(dirfd, pathname, how, size)  --  nr 437
+# =====================================================================
+#
+# a0 = dirfd, a1 = pathname, a2 = how*, a3 = size.
+def openat2_handler(a0: uint64, a1: uint64, a2: uint64,
+                    a3: uint64, a4: uint64, a5: uint64) -> int64:
+    if a1 == 0 or a2 == 0:
+        return OA2_EFAULT
+    # struct size validation (Linux do_sys_openat2 copy_struct_from_user).
+    if a3 < OA2_OPEN_HOW_MIN:
+        return OA2_EINVAL
+    if a3 > OA2_OPEN_HOW_MAX:
+        return OA2_E2BIG
+
+    # Copy the open_how struct in. We only consume the first 24 bytes;
+    # any trailing zero-fill (Linux requires the future-field tail to be
+    # zero) is not validated here -- being permissive matches "newer
+    # libc, older kernel" forward compat.
+    how_buf: Array[24, uint8]
+    if copy_from_user(cast[uint64](&how_buf[0]), a2, 24) != 0:
+        return OA2_EFAULT
+    # Field extraction (little-endian u64).
+    flags: uint64 = 0
+    mode:  uint64 = 0
+    resolve: uint64 = 0
+    fi: uint64 = 0
+    while fi < 8:
+        flags   = flags   | (cast[uint64](how_buf[fi])      << (fi * 8))
+        mode    = mode    | (cast[uint64](how_buf[fi + 8])  << (fi * 8))
+        resolve = resolve | (cast[uint64](how_buf[fi + 16]) << (fi * 8))
+        fi = fi + 1
+
+    # Reject unknown RESOLVE_* bits — matches Linux's check_resolve.
+    if (resolve & ~OA2_RESOLVE_VALID) != 0:
+        return OA2_EINVAL
+
+    # Copy the path in so we can apply RESOLVE_BENEATH path-escape checks.
+    kpath: Array[256, uint8]
+    nlen: int64 = strncpy_from_user(cast[uint64](&kpath[0]), a1, OA2_PATH_MAX)
+    if nlen < 0:
+        return OA2_EFAULT
+    kpath[OA2_PATH_MAX - 1] = 0
+
+    # RESOLVE_BENEATH / RESOLVE_IN_ROOT: the path may not escape the dirfd
+    # subtree. We enforce two narrow but real checks:
+    #   * Leading '/' -> absolute path that bypasses dirfd entirely.
+    #   * ".." component that walks above the anchor.
+    # Both surface as -EXDEV (the Linux contract for a beneath violation).
+    if (resolve & OA2_RESOLVE_BENEATH) != 0 or (resolve & OA2_RESOLVE_IN_ROOT) != 0:
+        if _oa2_path_escapes_beneath(&kpath[0]) != 0:
+            return OA2_EXDEV
+
+    # RESOLVE_NO_SYMLINKS: Hamnix's native fs presents no symlinks during
+    # resolve_path, so this is a faithful no-op (the resolve cannot
+    # traverse one). RESOLVE_NO_MAGICLINKS / RESOLVE_NO_XDEV / RESOLVE_CACHED
+    # are likewise honoured by the single-namespace nature of the surface.
+
+    # AT_FDCWD or absolute path: forward to _u_open with the extracted
+    # flags + mode. Any other dirfd needs per-fd directory bookkeeping the
+    # rest of the *at family also lacks here (see _u_openat) — fall
+    # through to -EINVAL rather than silently dropping dirfd.
+    is_abs: int32 = 0
+    if kpath[0] == 47:
+        is_abs = 1
+    if a0 != OA2_AT_FDCWD and is_abs == 0:
+        printk1("linux_u: openat2 dirfd=%d unsupported\n", cast[int32](a0))
+        return OA2_EINVAL
+
+    # Tail-call _u_open(path, flags, mode, 0, 0, 0). The hook is wired in
+    # u_syscalls_init(); a missing wiring is a hard bring-up bug, not a
+    # runtime path, so a null-hook check would only mask the bug -- we
+    # rely on init order instead.
+    return _oa2_open_hook(a1, flags, mode, 0, 0, 0)
