@@ -59,6 +59,31 @@ FILES = [
     ("/version",    b"Hamnix bare-metal kernel, M16.30 - ELF /init loader\n"),
 ]
 
+# Default DE wallpaper. user/hamUId.ad's startup path calls
+# wallpaper_load_path("/etc/wallpaper.ppm") best-effort; planting a real
+# PPM here is what stops the DE booting onto a flat grey backdrop. The
+# image is generated fresh per build by scripts/gen_default_wallpaper.py
+# (a hand-coded midnight-blue gradient + soft vignette + low ridges) so
+# we don't carry a ~900 KiB binary blob in git. Failure to generate is
+# tolerated — the DE just falls back to the ROOT_R/G/B solid colour, the
+# same behaviour as before this file shipped.
+def _build_default_wallpaper_bytes() -> bytes:
+    try:
+        import sys as _wp_sys
+        _wp_scripts_dir = str(Path(__file__).resolve().parent)
+        if _wp_scripts_dir not in _wp_sys.path:
+            _wp_sys.path.insert(0, _wp_scripts_dir)
+        from gen_default_wallpaper import build_default_wallpaper
+        return build_default_wallpaper()
+    except Exception as _exc:
+        print(f"[build_initramfs] gen_default_wallpaper failed: {_exc}")
+        return b""
+
+
+_wp_bytes = _build_default_wallpaper_bytes()
+if _wp_bytes:
+    FILES.append(("/etc/wallpaper.ppm", _wp_bytes))
+
 # Optional opt-in markers controlled by env vars. Used by per-test
 # harness scripts to enable kernel-side smoke tests that would
 # otherwise hang/regress unrelated test runs. See
