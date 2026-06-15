@@ -1005,13 +1005,22 @@ class Parser:
             self.expect(TokenType.NEWLINE)
             return Assignment(expr, value, span=self.make_span(tok))
 
-        # Compound assignment to complex target
+        # Compound assignment to complex target.
+        # Mirror the simple-target table — codegen.gen_assignment already
+        # handles all ten ops uniformly via _COMPOUND_OP_MAP for MemberExpr
+        # / IndexExpr targets (single-evaluation pattern). Restricting the
+        # parser to arithmetic ops was a stale carve-out.
         compound_ops = {
             TokenType.PLUS_EQUALS: '+',
             TokenType.MINUS_EQUALS: '-',
             TokenType.STAR_EQUALS: '*',
             TokenType.SLASH_EQUALS: '/',
             TokenType.PERCENT_EQUALS: '%',
+            TokenType.AMPERSAND_EQUALS: '&',
+            TokenType.PIPE_EQUALS: '|',
+            TokenType.CARET_EQUALS: '^',
+            TokenType.SHL_EQUALS: '<<',
+            TokenType.SHR_EQUALS: '>>',
         }
         for tt, op in compound_ops.items():
             if self.match(tt):

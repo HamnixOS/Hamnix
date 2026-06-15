@@ -2040,6 +2040,50 @@ class X86CodeGen:
         return out
 
     # Map compound-assignment operator strings to BinOp enums.
+    def _compound_target_signed(self, target: Expr) -> Optional[bool]:
+        """Return True/False if target's storage type is signed/unsigned.
+
+        Used by compound-assignment lowering (gen_assignment) to drive
+        signed vs logical shifts and signed vs unsigned div/mod on the
+        complex-target (MemberExpr / IndexExpr) read-modify-write path.
+        Returns None when the type can't be inferred — _emit_arith_rax_rcx
+        treats None as the historical (signed) default.
+        """
+        if isinstance(target, IndexExpr):
+            elem = self._index_elem_type(target.obj)
+            if elem is None:
+                return None
+            unsigned = self._is_unsigned_type(elem)
+            if unsigned is None:
+                return None
+            return not unsigned
+        if isinstance(target, MemberExpr):
+            obj_type = self.get_expr_type(target.obj)
+            if obj_type is None:
+                return None
+            tname = getattr(obj_type, "name", None)
+            if tname is None or tname not in self.structs:
+                return None
+            for fname, ftype, _foff in self.structs[tname].fields:
+                if fname == target.member:
+                    unsigned = self._is_unsigned_type(ftype)
+                    if unsigned is None:
+                        return None
+                    return not unsigned
+            return None
+        return None
+
+    def _index_elem_type(self, container: Expr) -> Optional[Type]:
+        """Element type of an indexable container, or None if unknown."""
+        t = self.get_expr_type(container)
+        if t is None:
+            return None
+        if isinstance(t, ArrayType):
+            return t.element_type
+        if hasattr(t, "base_type"):  # PointerType
+            return t.base_type
+        return None
+
     _COMPOUND_OP_MAP: dict = {
         '+':  BinOp.ADD,
         '-':  BinOp.SUB,
@@ -2109,7 +2153,15 @@ class X86CodeGen:
                                 self.emit("    movq %rcx, %rax")  # old -> rax
                                 self.emit("    popq %rcx")        # rhs -> rcx
                                 # Now %rax = old (left), %rcx = rhs (right).
-                                self._emit_arith_rax_rcx(bin_op)
+                                # Signedness of the in-place op follows the
+                                # FIELD type — `arr[i] >>= n` on uint64 must
+                                # be a logical shift; on int64 arithmetic.
+                                self._emit_arith_rax_rcx(
+                                    bin_op,
+                                    signed=self._is_unsigned_type(ftype) is False
+                                    if self._is_unsigned_type(ftype) is not None
+                                    else None,
+                                )
                                 self._emit_gs_store_sized(size, abs_off, "", "%rax")
                                 return
                 # Address-based path.
@@ -2122,7 +2174,11 @@ class X86CodeGen:
                 self.gen_expr(value)          # rhs -> rax
                 self.emit("    movq %rax, %rcx")   # rhs -> rcx
                 self.emit("    popq %rax")    # old value -> rax (left operand)
-                self._emit_arith_rax_rcx(bin_op)   # rax = old OP rhs
+                # Signedness follows the FIELD type (see Percpu branch).
+                self._emit_arith_rax_rcx(
+                    bin_op,
+                    signed=self._compound_target_signed(target),
+                )
                 self.emit("    popq %rcx")    # addr -> rcx
                 self.emit_store_sized(size, "%rcx", "%rax")
                 return
@@ -2144,7 +2200,12 @@ class X86CodeGen:
                     self.gen_expr(value)          # rhs -> rax
                     self.emit("    movq %rax, %rcx")
                     self.emit("    popq %rax")    # old value -> rax
-                    self._emit_arith_rax_rcx(bin_op)
+                    self._emit_arith_rax_rcx(
+                        bin_op,
+                        signed=self._is_unsigned_type(base.element_type) is False
+                        if self._is_unsigned_type(base.element_type) is not None
+                        else None,
+                    )
                     self.emit("    popq %rcx")    # scaled index -> rcx
                     self._emit_gs_store_sized(elem_size, offset, "(%rcx)", "%rax")
                     return
@@ -2158,7 +2219,11 @@ class X86CodeGen:
                 self.gen_expr(value)          # rhs -> rax
                 self.emit("    movq %rax, %rcx")   # rhs -> rcx
                 self.emit("    popq %rax")    # old value -> rax (left operand)
-                self._emit_arith_rax_rcx(bin_op)   # rax = old OP rhs
+                # Signedness follows the array ELEMENT type.
+                self._emit_arith_rax_rcx(
+                    bin_op,
+                    signed=self._compound_target_signed(target),
+                )
                 self.emit("    popq %rcx")    # addr -> rcx
                 self.emit_store_sized(size, "%rcx", "%rax")
                 return
@@ -2723,7 +2788,15 @@ class X86CodeGen:
         else:
             raise CodeGenError(f"x86: unknown identifier '{name}'")
 
-    def _emit_arith_rax_rcx(self, op: BinOp) -> None:
+    def _emit_arith_rax_rcx(self, op: BinOp,
+                            signed: Optional[bool] = None) -> None:
+        """Emit `rax = rax OP rcx` for compound-assignment lowering.
+
+        `signed=True` selects signed arithmetic for shifts / div / mod
+        (`sarq`, `idivq`); `signed=False` selects logical / unsigned
+        (`shrq`, `divq`); `signed=None` preserves the historical default
+        (signed) for callers that haven't been threaded through yet.
+        """
         """Emit arithmetic for `%rax OP %rcx` -> %rax.
 
         Used by compound-assignment lowering where %rax holds the OLD
@@ -2747,15 +2820,29 @@ class X86CodeGen:
             case BinOp.SHL:
                 self.emit("    shlq %cl, %rax")
             case BinOp.SHR:
-                # Default to arithmetic right-shift (signed).  Callers that
-                # truly need a logical shift should call gen_binary directly.
-                self.emit("    sarq %cl, %rax")
+                # Honour operand signedness: sarq (arithmetic, sign-fill)
+                # for signed, shrq (logical, zero-fill) for unsigned.
+                # Default to signed when caller didn't supply a hint, for
+                # backward compatibility.
+                if signed is False:
+                    self.emit("    shrq %cl, %rax")
+                else:
+                    self.emit("    sarq %cl, %rax")
             case BinOp.DIV | BinOp.IDIV:
-                self.emit("    cqo")
-                self.emit("    idivq %rcx")
+                if signed is False:
+                    # Unsigned 64/64 -> 64: %rdx must be zero, divq.
+                    self.emit("    xorq %rdx, %rdx")
+                    self.emit("    divq %rcx")
+                else:
+                    self.emit("    cqo")
+                    self.emit("    idivq %rcx")
             case BinOp.MOD:
-                self.emit("    cqo")
-                self.emit("    idivq %rcx")
+                if signed is False:
+                    self.emit("    xorq %rdx, %rdx")
+                    self.emit("    divq %rcx")
+                else:
+                    self.emit("    cqo")
+                    self.emit("    idivq %rcx")
                 self.emit("    movq %rdx, %rax")
             case _:
                 raise CodeGenError(
