@@ -241,7 +241,14 @@ KEYWORDS: dict[str, TokenType] = {
     "bool": TokenType.BOOL,
     "char": TokenType.CHAR,
     "str": TokenType.STR,
-    "bytes": TokenType.BYTES,
+    # NB: `bytes` and `field` were reserved keywords with no parser /
+    # codegen consumers — they shipped as `Could add BYTES type later`
+    # speculative names. Agents hit them as ordinary identifier names
+    # (`field` as a /proc/PID/stat loop var per quirks doc 2026-06-02;
+    # `bytes` as a parameter name). Un-reserved here so they parse as
+    # ordinary IDENTs. The `TokenType.BYTES` / `TokenType.FIELD` enum
+    # entries are retained so downstream consumers that match on
+    # TokenType still compile; they simply have no producer now.
     "int": TokenType.INT,
     "float": TokenType.FLOAT,
     "Array": TokenType.ARRAY,
@@ -253,7 +260,7 @@ KEYWORDS: dict[str, TokenType] = {
     # Python decorators/builtins used as keywords
     "dataclass": TokenType.DATACLASS,
     "isinstance": TokenType.ISINSTANCE,
-    "field": TokenType.FIELD,
+    # `field` removed — see `bytes` note above.
     "property": TokenType.PROPERTY,
     "staticmethod": TokenType.STATICMETHOD,
     "classmethod": TokenType.CLASSMETHOD,
