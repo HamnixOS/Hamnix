@@ -60,21 +60,22 @@ Evidence chain:
   triple; these binds support the legacy `/dev/wsys/<wid>/{...}` surface
   the DE terminal already uses, so they do not make the rio triple live.
 
-- [NEEDS-REVIEW] `sys/src/9/port/devwin.ad:1-214` — entire rio-faithful
-  facade — skeleton, never reached by a shipping launch — keep only if
-  the #442 rio reshape is going to be finished; otherwise it (plus the
-  `DEV_WIN_*` arms in namec.ad and the `_rio_path` / `_h_build_win_path` /
-  `_h_install_rio_bind` / `hamui_enable_rio_path` machinery in hamui.ad
-  and the `--rio` scan in hamclock.ad) is a removable dead branch. *(Kernel
-  file, outside the `user/`+`lib/` removal scope but reported because the
-  brief asked specifically for the rio/devwin verdict.)*
-- [NEEDS-REVIEW] `lib/hamui.ad:246,394,414,2254,2284,2240` `_rio_path`,
-  `_h_build_win_path`, `_h_install_rio_bind`, `hamui_enable_rio_path`,
-  rio branch of `_h_ctl` — only enabled by the unreachable `hamclock
-  --rio` — dead user-side half of the same scaffolding.
-- [NEEDS-REVIEW] `user/hamclock.ad:181-201` `--rio` argv scan +
-  `hamui_enable_rio_path(1)` — the lone enabler, never passed `--rio` by
-  any launcher.
+- [x] REMOVED `sys/src/9/port/devwin.ad:1-214` — entire rio-faithful
+  facade — skeleton, never reached by a shipping launch. Deleted the
+  whole file plus the `DEV_WIN_*` constants + dispatch/path-parse arms +
+  devwin import in namec.ad. Legacy `/dev/wsys/*` path untouched.
+- [x] REMOVED `lib/hamui.ad` `_rio_path`, `_h_build_win_path`,
+  `_h_install_rio_bind`, `hamui_enable_rio_path`, the `sys_bind` extern,
+  and the rio branch of `_h_ctl` / `hamui_window_on` — the only enabler
+  was the unreachable `hamclock --rio`. `_h_ctl` now always uses the
+  legacy `/dev/wsys/<wid>/draw/ctl` path. (The `version 2` v2-blit
+  substrate — `hamui_set_protocol_v2`, legacy `/dev/wsys/<wid>/wctl` —
+  is a SEPARATE live path and was left intact.)
+- [x] REMOVED `user/hamclock.ad` `--rio` argv scan
+  (`_k_argv_has_rio`) + `hamui_enable_rio_path(1)` call + import. hamclock
+  keeps working on the legacy path. Build green + DE screenshot verified
+  (panels + wallpaper render). `scripts/test_de_rio_blit.sh` guards the
+  live v2-blit substrate (not the removed scaffolding) and stays.
 
 ---
 
