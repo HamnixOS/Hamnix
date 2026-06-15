@@ -403,13 +403,29 @@ class ContainerOfExpr:
     span: Optional[Span] = None
 
 
+@dataclass
+class WalrusExpr:
+    """Assignment expression (walrus): `(name := value)`.
+
+    Evaluates `value` exactly once, assigns it to `name` (an existing
+    in-scope variable — Adder is statically typed, so a `:=` inside an
+    expression cannot introduce a new binding the way Python's PEP 572
+    does — declare `name` first with `name: T = init`), and yields the
+    assigned value. Primary use-case: `while (n := read_next()) > 0:`.
+    """
+    name: str
+    value: 'Expr'
+    span: Optional[Span] = None
+
+
 # Type alias for expressions
 Expr = (IntLiteral | FloatLiteral | StringLiteral | FStringLiteral |
         CharLiteral | BoolLiteral | NoneLiteral | Identifier |
         BinaryExpr | UnaryExpr | CallExpr | MethodCallExpr |
         IndexExpr | SliceExpr | MemberExpr | ListLiteral |
         DictLiteral | TupleLiteral | ListComprehension | ConditionalExpr |
-        LambdaExpr | SizeOfExpr | CastExpr | AsmExpr | ContainerOfExpr)
+        LambdaExpr | SizeOfExpr | CastExpr | AsmExpr | ContainerOfExpr |
+        WalrusExpr)
 
 
 # Statements

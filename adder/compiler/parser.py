@@ -675,6 +675,21 @@ class Parser:
             if self.check(TokenType.RPAREN):
                 self.advance()
                 return TupleLiteral([], self.make_span(tok))
+            # Walrus / assignment-expression: `(name := value)`.
+            # Adder doesn't allow bare `:=` outside parentheses (it would
+            # shadow the statement-level `x = expr` recogniser). The
+            # parenthesised form is the Python/Plan-9 idiom and is enough
+            # for the `while (n := next()) > 0:` use-case. The named
+            # variable must already be declared in scope — `:=` doesn't
+            # introduce a new binding (Adder is statically typed).
+            if (self.check(TokenType.IDENT)
+                    and self.peek().type == TokenType.WALRUS):
+                name_tok = self.advance()
+                self.advance()  # WALRUS
+                value = self.parse_expression()
+                self.expect(TokenType.RPAREN)
+                return WalrusExpr(name_tok.value, value,
+                                  self.make_span(tok))
             first = self.parse_expression()
             if self.match(TokenType.COMMA):
                 # Tuple

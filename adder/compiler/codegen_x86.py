@@ -45,7 +45,7 @@ from .ast_nodes import (
     NoneLiteral, FloatLiteral,
     BinaryExpr, UnaryExpr, BinOp, UnaryOp,
     IndexExpr, MemberExpr, CastExpr, ContainerOfExpr,
-    ConditionalExpr, SizeOfExpr,
+    ConditionalExpr, WalrusExpr, SizeOfExpr,
     Type, PointerType, ArrayType, FunctionPointerType, PercpuType,
     ListType, DictType, TupleType, OptionalType,
     MatchStmt, MatchArm, Pattern, LiteralPattern, WildcardPattern,
@@ -372,6 +372,12 @@ class X86CodeGen:
     def get_expr_type(self, expr: Expr) -> Optional[Type]:
         """Best-effort type of an expression. Returns None when unknown
         (callers must have a safe default)."""
+        if isinstance(expr, WalrusExpr):
+            # The type of `(name := value)` is the type of `name` (the
+            # already-declared local) — `:=` doesn't introduce a binding.
+            if self.ctx is not None and expr.name in self.ctx.locals:
+                return self.ctx.locals[expr.name].var_type
+            return None
         if isinstance(expr, Identifier):
             if self.ctx is not None and expr.name in self.ctx.locals:
                 return self.ctx.locals[expr.name].var_type
@@ -2644,6 +2650,28 @@ class X86CodeGen:
                 # its loader, which is why only runtime values were bitten.)
                 self.gen_expr(inner)
                 self._emit_cast_widen(inner, cast_to)
+
+            case WalrusExpr(name=wname, value=wvalue):
+                # `(name := value)` — assignment expression.
+                # Adder is statically typed, so `name` must already be in
+                # scope (declared earlier as a local with a type). We
+                # evaluate the RHS once into %rax, store it into the
+                # local's slot using the normal sized-store path (so
+                # sub-8-byte locals like int32 don't leave stale upper
+                # bits), and leave the assigned value in %rax for the
+                # surrounding expression to consume.
+                self.gen_expr(wvalue)
+                if self.ctx is None or wname not in self.ctx.locals:
+                    raise CodeGenError(
+                        f"x86: walrus `:=` target '{wname}' must be an "
+                        f"in-scope local (declare it first with a type)"
+                    )
+                var = self.ctx.locals[wname]
+                self._emit_local_store(var, "%rax")
+                # Re-load through the typed identifier path so the value
+                # left in %rax has the right sign/zero-extension for the
+                # enclosing expression (matches `n; n` evaluation).
+                self.gen_identifier(wname)
 
             case ConditionalExpr(condition=cond, then_expr=t_expr,
                                  else_expr=e_expr):

@@ -301,11 +301,48 @@ arr[2] = 3
 arr[2] *= 7         # arr[2] = 21
 ```
 
-Note: `/=`, `%=`, and `>>=` use signed arithmetic internally. For
-unsigned right-shift on unsigned types write `x = cast[uint32](x) >> n`.
+Note: `/=`, `%=`, and `>>=` honour the operand / target's signedness:
+signed types get `idivq` / `sarq`, unsigned types get `divq` / `shrq`.
+Works uniformly on simple-identifier targets and on complex
+(`arr[i]`, `obj.field`) targets.
 
 Regression fixture: `tests/test_compiler_augmented_assign.ad` +
 `scripts/test_compiler_augmented_assign.sh`.
+
+### Walrus / assignment expression `(name := value)`
+
+Adder supports Python's PEP 572 walrus operator for assigning a value
+inside an expression. Adder is statically typed, so `name` MUST be an
+already-declared local — `:=` does not introduce a new binding.
+
+Only the parenthesised form is accepted. A bare `:=` outside parens
+would shadow the statement-level `x = expr` recogniser, so the parser
+only looks for it after `(` IDENT WALRUS.
+
+```python
+def drain_stream() -> int64:
+    n: int64 = 0
+    total: int64 = 0
+    while (n := next_chunk()) > 0:
+        total = total + n
+    return total
+
+def split_on_match(x: int64) -> int64:
+    q: int64 = 0
+    if (q := x * x) > 100:
+        return q + 1
+    return q - 1
+```
+
+Caveat: binary operators in Adder evaluate the RIGHT operand first
+(stack-machine style). So `(n := f()) + n` reads `n` BEFORE the walrus
+runs — the left side's assignment is not visible to the right side.
+This differs from Python. Use the walrus on its own, or as the loop /
+guard condition, where the surrounding context evaluates it just
+once.
+
+Regression fixture: `tests/test_compiler_walrus.ad` +
+`scripts/test_compiler_walrus.sh`.
 
 ### Globals
 
