@@ -120,6 +120,16 @@ check "MAFTER member B visible at same union point" \
     "[bind] phase5 OK: MAFTER member B visible (/bind_union2/onlyB.txt -> 'BBB')"
 check "MAFTER does NOT shadow base for shared name (reverse of MBEFORE)" \
     "[bind] phase5 OK: MAFTER does NOT shadow base (/bind_union2/shared.txt -> 'FROM-A')"
+check "MCREATE probe sees an MCREATE member at the union point" \
+    "[bind] phase6 OK: mnttab_any_mcreate_covers reports MCREATE present"
+check "MCREATE target rewrites to the MCREATE member (B)" \
+    "[bind] phase6 OK: mnttab_create_target picked MCREATE member B (#r/bind_src_b/newfile.txt)"
+check "MCREATE back-compat: no MCREATE -> probe returns 0" \
+    "[bind] phase6 OK: back-compat (no MCREATE) -> probe returns 0"
+check "MCREATE back-compat: no MCREATE -> create_target returns 0 (legacy fallback)" \
+    "[bind] phase6 OK: back-compat (no MCREATE) -> create_target returns 0 (legacy fallback)"
+check "MCACHE-flagged bind stored harmlessly (stub) and still resolves" \
+    "[bind] phase7 OK: MCACHE-flagged bind still resolves (stub stored, harmless)"
 check "bind self-test PASS banner" \
     "[bind] PASS"
 
