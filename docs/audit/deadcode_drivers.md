@@ -37,89 +37,89 @@ LIVE, split by device.
 ### usb (highest-value cluster: 9-symbol unused setup/descriptor API)
 The HCDs (`xhci`/`ehci`) build USB SETUP packets and parse device descriptors
 inline; `usb.ad`'s struct + builder + accessor family is entirely self-referential.
-- [SAFE-REMOVE] drivers/usb/usb.ad:124 `UsbSetupPacket` — setup-packet struct, only used by the dead `usb_build_*` fns below — 0 external refs — remove with cluster
-- [SAFE-REMOVE] drivers/usb/usb.ad:132 `usb_build_get_descriptor` — 0 refs
-- [SAFE-REMOVE] drivers/usb/usb.ad:145 `usb_build_set_address` — 0 refs
-- [SAFE-REMOVE] drivers/usb/usb.ad:157 `usb_build_set_protocol` — 0 refs
-- [SAFE-REMOVE] drivers/usb/usb.ad:169 `usb_build_set_idle` — 0 refs
-- [SAFE-REMOVE] drivers/usb/usb.ad:203 `usb_dd_class` — 0 refs
-- [SAFE-REMOVE] drivers/usb/usb.ad:207 `usb_dd_vendor` — 0 refs
-- [SAFE-REMOVE] drivers/usb/usb.ad:211 `usb_dd_product` — 0 refs
-- [SAFE-REMOVE] drivers/usb/usb.ad:215 `usb_dd_num_configs` — 0 refs
+- [REMOVED] drivers/usb/usb.ad:124 `UsbSetupPacket` — setup-packet struct, only used by the dead `usb_build_*` fns below — 0 external refs — remove with cluster
+- [REMOVED] drivers/usb/usb.ad:132 `usb_build_get_descriptor` — 0 refs
+- [REMOVED] drivers/usb/usb.ad:145 `usb_build_set_address` — 0 refs
+- [REMOVED] drivers/usb/usb.ad:157 `usb_build_set_protocol` — 0 refs
+- [REMOVED] drivers/usb/usb.ad:169 `usb_build_set_idle` — 0 refs
+- [REMOVED] drivers/usb/usb.ad:203 `usb_dd_class` — 0 refs
+- [REMOVED] drivers/usb/usb.ad:207 `usb_dd_vendor` — 0 refs
+- [REMOVED] drivers/usb/usb.ad:211 `usb_dd_product` — 0 refs
+- [REMOVED] drivers/usb/usb.ad:215 `usb_dd_num_configs` — 0 refs
   (KEEP `usb_dd_max_packet_size0`@:219 — used by ehci.ad; KEEP all `usb_cfg_*`/`usb_ep_*`/`usb_if_*` config-descriptor accessors — used by both HCDs.)
 
 ### input (diagnostic getters / orphan diag block)
-- [SAFE-REMOVE] drivers/input/atkbd.ad:562 `keymap_current` — 0 non-def refs
-- [SAFE-REMOVE] drivers/input/atkbd.ad:721 `kbd_fifo_depth` — only ref is inside dead `atkbd_diag_tick` — no external caller
-- [SAFE-REMOVE] drivers/input/atkbd.ad:1149 `kbd_irq_count_get` — 0 refs
-- [SAFE-REMOVE] drivers/input/atkbd.ad:1243 `atkbd_diag_set_verbose` — 0 refs
-- [SAFE-REMOVE] drivers/input/atkbd.ad:1253 `atkbd_diag_get_verbose` — 0 refs
+- [REMOVED] drivers/input/atkbd.ad:562 `keymap_current` — 0 non-def refs
+- [LEFT-IN-PLACE: called by live atkbd_diag_tick] drivers/input/atkbd.ad:721 `kbd_fifo_depth` — only ref is inside dead `atkbd_diag_tick` — no external caller
+- [REMOVED] drivers/input/atkbd.ad:1149 `kbd_irq_count_get` — 0 refs
+- [REMOVED] drivers/input/atkbd.ad:1243 `atkbd_diag_set_verbose` — 0 refs
+- [REMOVED] drivers/input/atkbd.ad:1253 `atkbd_diag_get_verbose` — 0 refs
   (Review the whole ATKBD_DIAG block atkbd.ad:1212-1290 / `atkbd_diag_tick` as one self-contained orphan diag feature.)
-- [SAFE-REMOVE] drivers/input/auxmouse.ad:455 `mouse_irq_count_get` — 0 refs
-- [SAFE-REMOVE] drivers/input/auxmouse.ad:459 `mouse_pkt_count_get` — 0 refs
+- [REMOVED] drivers/input/auxmouse.ad:455 `mouse_irq_count_get` — 0 refs
+- [REMOVED] drivers/input/auxmouse.ad:459 `mouse_pkt_count_get` — 0 refs
 
 ### audio
-- [SAFE-REMOVE] drivers/audio/mixer.ad:154 `hda_mix_is_active` — 0 refs
-- [SAFE-REMOVE] drivers/audio/mixer.ad:163 `hda_mix_reset` — 0 refs
+- [REMOVED] drivers/audio/mixer.ad:154 `hda_mix_is_active` — 0 refs
+- [REMOVED] drivers/audio/mixer.ad:163 `hda_mix_reset` — 0 refs
 
 ### ata / nvme / virtio / block (trivial telemetry/convenience accessors)
-- [SAFE-REMOVE] drivers/ata/ahci.ad:1881 `ahci_identify_rotation` — SSD/HDD getter; `_ahci_id_rotation` set but never read — 0 refs
-- [SAFE-REMOVE] drivers/ata/ahci.ad:3491 `ahci_hotplug_irq_count` — telemetry getter — 0 refs
-- [SAFE-REMOVE] drivers/ata/ahci.ad:3495 `ahci_irq_count` — telemetry getter — 0 refs
-- [SAFE-REMOVE] drivers/nvme/nvme.ad:1476 `nvme_flush` — zero-ns wrapper over `nvme_flush_ns(1)`; only ns-variant used — 0 refs
-- [SAFE-REMOVE] drivers/nvme/nvme.ad:2753 `nvme_irq_count` — telemetry getter — 0 refs
-- [SAFE-REMOVE] drivers/virtio/virtio_pci.ad:143 `virtio_dev_config_read_u8` — u8 config reader; u16/u32/u64 siblings used — 0 refs
-- [SAFE-REMOVE] drivers/block/virtio_blk.ad:713 `virtio_blk_irq_count` — IRQ counter getter — 0 refs
-- [SAFE-REMOVE] drivers/block/virtio_blk.ad:725 `virtio_blk_irq_pin` — PCI INT-pin getter — 0 refs
+- [REMOVED] drivers/ata/ahci.ad:1881 `ahci_identify_rotation` — SSD/HDD getter; `_ahci_id_rotation` set but never read — 0 refs
+- [REMOVED] drivers/ata/ahci.ad:3491 `ahci_hotplug_irq_count` — telemetry getter — 0 refs
+- [REMOVED] drivers/ata/ahci.ad:3495 `ahci_irq_count` — telemetry getter — 0 refs
+- [REMOVED] drivers/nvme/nvme.ad:1476 `nvme_flush` — zero-ns wrapper over `nvme_flush_ns(1)`; only ns-variant used — 0 refs
+- [REMOVED] drivers/nvme/nvme.ad:2753 `nvme_irq_count` — telemetry getter — 0 refs
+- [REMOVED] drivers/virtio/virtio_pci.ad:143 `virtio_dev_config_read_u8` — u8 config reader; u16/u32/u64 siblings used — 0 refs
+- [REMOVED] drivers/block/virtio_blk.ad:713 `virtio_blk_irq_count` — IRQ counter getter — 0 refs
+- [REMOVED] drivers/block/virtio_blk.ad:725 `virtio_blk_irq_pin` — PCI INT-pin getter — 0 refs
 
 ### video (diagnostic getters orphaned from bring-up)
-- [SAFE-REMOVE] drivers/video/fb_cdev.ad:210 `devfb_first_nonzero_seen` — diag getter — 0 refs
-- [SAFE-REMOVE] drivers/video/fb_cdev.ad:214 `devfb_first_nonzero_x` — 0 refs
-- [SAFE-REMOVE] drivers/video/fb_cdev.ad:218 `devfb_first_nonzero_y` — 0 refs
-- [SAFE-REMOVE] drivers/video/fb_cdev.ad:222 `devfb_first_nonzero_r` — 0 refs
-- [SAFE-REMOVE] drivers/video/fb_cdev.ad:226 `devfb_first_nonzero_g` — 0 refs
-- [SAFE-REMOVE] drivers/video/fb_cdev.ad:230 `devfb_first_nonzero_b` — 0 refs
+- [REMOVED] drivers/video/fb_cdev.ad:210 `devfb_first_nonzero_seen` — diag getter — 0 refs
+- [REMOVED] drivers/video/fb_cdev.ad:214 `devfb_first_nonzero_x` — 0 refs
+- [REMOVED] drivers/video/fb_cdev.ad:218 `devfb_first_nonzero_y` — 0 refs
+- [REMOVED] drivers/video/fb_cdev.ad:222 `devfb_first_nonzero_r` — 0 refs
+- [REMOVED] drivers/video/fb_cdev.ad:226 `devfb_first_nonzero_g` — 0 refs
+- [REMOVED] drivers/video/fb_cdev.ad:230 `devfb_first_nonzero_b` — 0 refs
   (If all 6 go, `_fbdev_note_pixel`@:137 + its backing globals become dead too — follow-up sweep.)
-- [SAFE-REMOVE] drivers/video/fb_cdev.ad:725 `kcursor_command_count` — diag getter — 0 refs
-- [SAFE-REMOVE] drivers/video/fb_cdev.ad:729 `kcursor_visible` — 0 refs
-- [SAFE-REMOVE] drivers/video/fb_cdev.ad:733 `kcursor_get_x` — 0 refs
-- [SAFE-REMOVE] drivers/video/fb_cdev.ad:737 `kcursor_get_y` — 0 refs
-- [SAFE-REMOVE] drivers/video/virtio_gpu.ad:397 `virtio_gpu_present_rgba` — superseded by live `virtio_gpu_present_test_pattern` — 0 refs (remove or wire)
-- [SAFE-REMOVE] drivers/video/console/vga_text.ad:188 `vga_read_cursor_disabled` — paired diag getter; sibling has 1 ref, this 0 — remove
+- [REMOVED] drivers/video/fb_cdev.ad:725 `kcursor_command_count` — diag getter — 0 refs
+- [REMOVED] drivers/video/fb_cdev.ad:729 `kcursor_visible` — 0 refs
+- [REMOVED] drivers/video/fb_cdev.ad:733 `kcursor_get_x` — 0 refs
+- [REMOVED] drivers/video/fb_cdev.ad:737 `kcursor_get_y` — 0 refs
+- [REMOVED] drivers/video/virtio_gpu.ad:397 `virtio_gpu_present_rgba` — superseded by live `virtio_gpu_present_test_pattern` — 0 refs (remove or wire)
+- [REMOVED] drivers/video/console/vga_text.ad:188 `vga_read_cursor_disabled` — paired diag getter; sibling has 1 ref, this 0 — remove
 
 ### acpi / clocksource / tty
-- [SAFE-REMOVE] drivers/acpi/acpi.ad:620 `acpi_find_madt` — 0 refs
-- [SAFE-REMOVE] drivers/acpi/acpi.ad:664 `acpi_find_mcfg` — ECAM base comes via `acpi_pcie_ecam_base` — 0 refs
-- [SAFE-REMOVE] drivers/acpi/acpi.ad:669 `acpi_find_hpet` — HPET base comes via `acpi_hpet_base` — 0 refs
-- [SAFE-REMOVE] drivers/acpi/acpi.ad:1059 `acpi_pm1a_evt` — getter; consumers read `acpi_pm1a_sts_port` directly — 0 refs
-- [SAFE-REMOVE] drivers/acpi/acpi.ad:1065 `acpi_pm1b_evt` — 0 refs
-- [SAFE-REMOVE] drivers/clocksource/hpet.ad:120 `hpet_period_femtoseconds` — 0 refs
-- [SAFE-REMOVE] drivers/clocksource/hpet.ad:237 `hpet_clocksource_registered` — registration-status getter — 0 refs
-- [SAFE-REMOVE] drivers/tty/serial/early_8250.ad:267 `console_is_interactive` — only the setter (`console_set_interactive`, 21 refs) is used — 0 refs
-- [SAFE-REMOVE] drivers/tty/serial/early_8250.ad:438 `early_uart_rx_ready` — superseded by `uart_drain_hw_to_fifo`/`uart_rx_has` — 0 refs
-- [SAFE-REMOVE] drivers/tty/serial/early_8250.ad:589 `uart_rx_irq_get_count` — counter incremented in `uart_rx_irq_service` but never read out — 0 refs
+- [REMOVED] drivers/acpi/acpi.ad:620 `acpi_find_madt` — 0 refs
+- [REMOVED] drivers/acpi/acpi.ad:664 `acpi_find_mcfg` — ECAM base comes via `acpi_pcie_ecam_base` — 0 refs
+- [REMOVED] drivers/acpi/acpi.ad:669 `acpi_find_hpet` — HPET base comes via `acpi_hpet_base` — 0 refs
+- [REMOVED] drivers/acpi/acpi.ad:1059 `acpi_pm1a_evt` — getter; consumers read `acpi_pm1a_sts_port` directly — 0 refs
+- [REMOVED] drivers/acpi/acpi.ad:1065 `acpi_pm1b_evt` — 0 refs
+- [REMOVED] drivers/clocksource/hpet.ad:120 `hpet_period_femtoseconds` — 0 refs
+- [REMOVED] drivers/clocksource/hpet.ad:237 `hpet_clocksource_registered` — registration-status getter — 0 refs
+- [REMOVED] drivers/tty/serial/early_8250.ad:267 `console_is_interactive` — only the setter (`console_set_interactive`, 21 refs) is used — 0 refs
+- [REMOVED] drivers/tty/serial/early_8250.ad:438 `early_uart_rx_ready` — superseded by `uart_drain_hw_to_fifo`/`uart_rx_has` — 0 refs
+- [REMOVED] drivers/tty/serial/early_8250.ad:589 `uart_rx_irq_get_count` — counter incremented in `uart_rx_irq_service` but never read out — 0 refs
 
 ### net (functions)
-- [SAFE-REMOVE] drivers/net/dns.ad:1313 `dns_lookup_all` — all-A-records variant; 0 callers (only single-IP `dns_lookup` used)
-- [SAFE-REMOVE] drivers/net/dns.ad:1415 `dns_lookup_mx` — MX lookup; 0 callers, no mail subsystem
-- [SAFE-REMOVE] drivers/net/sock_compat.ad:137 `sock_table_bind` — 0 callers (only `sock_table_create` wired)
-- [SAFE-REMOVE] drivers/net/sock_compat.ad:151 `sock_table_lookup` — 0 callers
-- [SAFE-REMOVE] drivers/net/htb.ad:305 `_htb_run` — service-loop helper; selftest inlines loops — 0 callers
-- [SAFE-REMOVE] drivers/net/firewall.ad:1316 `firewall_ingress_if` — iface-aware hook never imported; ip.ad calls only no-iface `firewall_ingress` — 0 refs
-- [SAFE-REMOVE] drivers/net/firewall.ad:1322 `firewall_egress_if` — same — 0 refs
-- [SAFE-REMOVE] drivers/net/firewall.ad:343 `fw_set_policy` — single-chain back-compat shim; only firewall's own selftest; devfirewall uses `fw_set_chain_policy`
-- [SAFE-REMOVE] drivers/net/firewall.ad:350 `fw_get_policy` — same shim, selftest-only
+- [REMOVED] drivers/net/dns.ad:1313 `dns_lookup_all` — all-A-records variant; 0 callers (only single-IP `dns_lookup` used)
+- [REMOVED] drivers/net/dns.ad:1415 `dns_lookup_mx` — MX lookup; 0 callers, no mail subsystem
+- [REMOVED] drivers/net/sock_compat.ad:137 `sock_table_bind` — 0 callers (only `sock_table_create` wired)
+- [REMOVED] drivers/net/sock_compat.ad:151 `sock_table_lookup` — 0 callers
+- [REMOVED] drivers/net/htb.ad:305 `_htb_run` — service-loop helper; selftest inlines loops — 0 callers
+- [REMOVED] drivers/net/firewall.ad:1316 `firewall_ingress_if` — iface-aware hook never imported; ip.ad calls only no-iface `firewall_ingress` — 0 refs
+- [REMOVED] drivers/net/firewall.ad:1322 `firewall_egress_if` — same — 0 refs
+- [LEFT-IN-PLACE: imported by sys/./devfirewall.ad] drivers/net/firewall.ad:343 `fw_set_policy` — single-chain back-compat shim; only firewall's own selftest; devfirewall uses `fw_set_chain_policy`
+- [LEFT-IN-PLACE: imported by sys/./devfirewall.ad] drivers/net/firewall.ad:350 `fw_get_policy` — same shim, selftest-only
 
 ### net (unused constants / globals)
-- [SAFE-REMOVE] drivers/net/tls.ad:135,136 `TLS_VERSION_1_2`/`TLS_VERSION_1_3` — wire value hardcoded inline — 0 refs
-- [SAFE-REMOVE] drivers/net/tls.ad:146,149,165 `TLS_HS_END_OF_EARLY_DATA`,`TLS_HS_CERT_REQUEST`,`TLS_SIG_ED25519` — consts for unimplemented paths — 0 refs
-- [SAFE-REMOVE] drivers/net/tls.ad:171,174,175,179,180 `TLS_MAX_PLAINTEXT`,`TLS_AEAD_KEY`,`TLS_AEAD_IV`,`TLS_RANDOM_LEN`,`TLS_X25519_LEN` — used as inline literals — 0 refs
-- [SAFE-REMOVE] drivers/net/tls.ad:3569-3571 `TLS_CV_CONTEXT_LEN_SHA256/SHA384/MAX` — used as raw offsets — 0 refs
-- [SAFE-REMOVE] drivers/net/tls.ad:286-289 `tls_snap_state`/`tls_snap_buf`/`tls_snap_buflen`/`tls_snap_bits` — 4 unused "SHA-256 snapshot" globals (wasted BSS); snapshot fn uses `tls_sha_state`
-- [SAFE-REMOVE] drivers/net/r8169.ad:120,216,219,236,251 `RTL8169_ISR_TER`,`RTL8139_ERSR`,`RTL8139_CBR`,`RTL8139_TSD_TUN`,`RTL8139_RCR_AAP` — register/bit consts never read — 0 refs
-- [SAFE-REMOVE] drivers/net/virtio_net.ad:991 `VNET_TX_BUF_BYTES` — 2048 used inline at 812/813/825/826 — 0 refs
-- [SAFE-REMOVE] drivers/net/ipip.ad:41 `IPIP_OUTER_OVERHEAD` — `=20 == IP_HDR_LEN` (comment); code uses imported `IP_HDR_LEN` — 0 refs
-- [SAFE-REMOVE] drivers/net/sit.ad:51 `SIT_OUTER_OVERHEAD` — same — 0 refs
+- [REMOVED] drivers/net/tls.ad:135,136 `TLS_VERSION_1_2`/`TLS_VERSION_1_3` — wire value hardcoded inline — 0 refs
+- [REMOVED] drivers/net/tls.ad:146,149,165 `TLS_HS_END_OF_EARLY_DATA`,`TLS_HS_CERT_REQUEST`,`TLS_SIG_ED25519` — consts for unimplemented paths — 0 refs
+- [REMOVED] drivers/net/tls.ad:171,174,175,179,180 `TLS_MAX_PLAINTEXT`,`TLS_AEAD_KEY`,`TLS_AEAD_IV`,`TLS_RANDOM_LEN`,`TLS_X25519_LEN` — used as inline literals — 0 refs
+- [REMOVED] drivers/net/tls.ad:3569-3571 `TLS_CV_CONTEXT_LEN_SHA256/SHA384/MAX` — used as raw offsets — 0 refs
+- [REMOVED] drivers/net/tls.ad:286-289 `tls_snap_state`/`tls_snap_buf`/`tls_snap_buflen`/`tls_snap_bits` — 4 unused "SHA-256 snapshot" globals (wasted BSS); snapshot fn uses `tls_sha_state`
+- [REMOVED] drivers/net/r8169.ad:120,216,219,236,251 `RTL8169_ISR_TER`,`RTL8139_ERSR`,`RTL8139_CBR`,`RTL8139_TSD_TUN`,`RTL8139_RCR_AAP` — register/bit consts never read — 0 refs
+- [REMOVED] drivers/net/virtio_net.ad:991 `VNET_TX_BUF_BYTES` — 2048 used inline at 812/813/825/826 — 0 refs
+- [REMOVED] drivers/net/ipip.ad:41 `IPIP_OUTER_OVERHEAD` — `=20 == IP_HDR_LEN` (comment); code uses imported `IP_HDR_LEN` — 0 refs
+- [REMOVED] drivers/net/sit.ad:51 `SIT_OUTER_OVERHEAD` — same — 0 refs
 
 ---
 
