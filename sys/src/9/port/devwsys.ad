@@ -4223,6 +4223,252 @@ def devwsys_notif_show_write(buf: Ptr[uint8], count: uint64) -> int64:
 
 
 # ====================================================================
+# DE notification inbox — /dev/wsys/post
+#
+# A small fixed-size ring of pending notifications. Any process can write
+# a one-line notification record:
+#
+#   "<title>\t<body>\t<icon>\n"
+#
+# The kernel appends it to the inbox ring and bumps `wsys_post_serial`.
+# The compositor (hamUId daemon_pixel main loop) polls /dev/wsys/post on
+# each frame; when the serial advances, it drains the head slot, calls
+# notify_post(title, body) to arm the banner, and writes the ack-serial
+# back to /dev/wsys/post (the write-side ALSO consumes the head when the
+# payload starts with "ack ").
+#
+# Wire format
+# -----------
+# /dev/wsys/post (read, off==0 returns one line):
+#   "<post_serial> <ack_serial> <count> <title>\t<body>\t<icon>\n"
+# where `<count>` is the number of un-acked slots in the ring (0..8) and
+# the title/body/icon trio describes the HEAD slot (oldest un-acked).
+# When count is 0, title/body/icon are all empty.
+#
+# /dev/wsys/post (write):
+#   - "ack <serial>\n"  — compositor consumes the head slot whose post-
+#                         serial matches <serial>; bumps ack_serial.
+#   - other payloads   — parsed as "<title>\t<body>\t<icon>\n" and pushed
+#                         into the ring (drops the OLDEST slot if full).
+#
+# Boot-log marker: each successful push prints
+#   `[de_notify] title=... body=...`
+# so test scripts can confirm the round-trip.
+
+WSYS_POST_RING:      uint64 = 8
+WSYS_POST_TITLE_CAP: uint64 = 40
+WSYS_POST_BODY_CAP:  uint64 = 64
+WSYS_POST_ICON_CAP:  uint64 = 32
+
+wsys_post_titles: Array[320, uint8]    # 8 * 40
+wsys_post_bodies: Array[512, uint8]    # 8 * 64
+wsys_post_icons:  Array[256, uint8]    # 8 * 32
+wsys_post_tlen:   Array[8, uint64]
+wsys_post_blen:   Array[8, uint64]
+wsys_post_ilen:   Array[8, uint64]
+wsys_post_pserial: Array[8, uint64]    # per-slot post serial
+
+wsys_post_head:   uint64 = 0           # oldest un-acked index
+wsys_post_tail:   uint64 = 0           # next write index
+wsys_post_count:  uint64 = 0           # un-acked slot count
+wsys_post_serial: uint64 = 0           # bumps on every push
+wsys_post_ack_serial: uint64 = 0       # bumps on every ack-drain
+
+
+def _wsys_post_push(title_src: Ptr[uint8], title_len: uint64,
+                    body_src: Ptr[uint8], body_len: uint64,
+                    icon_src: Ptr[uint8], icon_len: uint64) -> int32:
+    if title_len > WSYS_POST_TITLE_CAP:
+        title_len = WSYS_POST_TITLE_CAP
+    if body_len > WSYS_POST_BODY_CAP:
+        body_len = WSYS_POST_BODY_CAP
+    if icon_len > WSYS_POST_ICON_CAP:
+        icon_len = WSYS_POST_ICON_CAP
+    slot: uint64 = wsys_post_tail
+    toff: uint64 = slot * WSYS_POST_TITLE_CAP
+    boff: uint64 = slot * WSYS_POST_BODY_CAP
+    ioff: uint64 = slot * WSYS_POST_ICON_CAP
+    i: uint64 = 0
+    while i < title_len:
+        wsys_post_titles[toff + i] = title_src[i]
+        i = i + 1
+    j: uint64 = 0
+    while j < body_len:
+        wsys_post_bodies[boff + j] = body_src[j]
+        j = j + 1
+    k: uint64 = 0
+    while k < icon_len:
+        wsys_post_icons[ioff + k] = icon_src[k]
+        k = k + 1
+    wsys_post_tlen[slot] = title_len
+    wsys_post_blen[slot] = body_len
+    wsys_post_ilen[slot] = icon_len
+    wsys_post_serial = wsys_post_serial + 1
+    wsys_post_pserial[slot] = wsys_post_serial
+    wsys_post_tail = (slot + 1) % WSYS_POST_RING
+    if wsys_post_count < WSYS_POST_RING:
+        wsys_post_count = wsys_post_count + 1
+    else:
+        # Ring full: oldest is overwritten; advance head.
+        wsys_post_head = (wsys_post_head + 1) % WSYS_POST_RING
+    # Boot-log marker so test harnesses can grep round-trip.
+    # Build "[de_notify] title=<title> body=<body>\n" in a stack buffer
+    # then emit via printk0 (single-line atomic UART write).
+    mbuf: Array[256, uint8]
+    mn: uint64 = 0
+    mpre: Ptr[uint8] = "[de_notify] title="
+    p2: uint64 = 0
+    while mpre[p2] != 0 and mn < 254:
+        mbuf[mn] = mpre[p2]
+        mn = mn + 1
+        p2 = p2 + 1
+    p3: uint64 = 0
+    while p3 < title_len and mn < 254:
+        mbuf[mn] = title_src[p3]
+        mn = mn + 1
+        p3 = p3 + 1
+    mmid: Ptr[uint8] = " body="
+    p4: uint64 = 0
+    while mmid[p4] != 0 and mn < 254:
+        mbuf[mn] = mmid[p4]
+        mn = mn + 1
+        p4 = p4 + 1
+    p5: uint64 = 0
+    while p5 < body_len and mn < 254:
+        mbuf[mn] = body_src[p5]
+        mn = mn + 1
+        p5 = p5 + 1
+    mbuf[mn] = 10
+    mn = mn + 1
+    mbuf[mn] = 0
+    printk0(cast[Ptr[char]](&mbuf[0]))
+    return 0
+
+
+def _wsys_post_ack(serial: uint64) -> int32:
+    # Drain the head slot if it matches `serial`. If serial is 0 we drain
+    # the head regardless (idempotent ack). On a successful drain, bump
+    # ack_serial so readers can detect consumption.
+    if wsys_post_count == 0:
+        return 0
+    head: uint64 = wsys_post_head
+    if serial != 0 and wsys_post_pserial[head] != serial:
+        return 0
+    wsys_post_head = (head + 1) % WSYS_POST_RING
+    wsys_post_count = wsys_post_count - 1
+    wsys_post_ack_serial = wsys_post_ack_serial + 1
+    return 1
+
+
+def devwsys_post_read(off: uint64, buf: Ptr[uint8],
+                      count: uint64) -> int64:
+    if off > 0:
+        return 0
+    scratch: Array[256, uint8]
+    n: uint64 = _wsys_emit_u64_dec(&scratch[0], 0, wsys_post_serial)
+    scratch[n] = 32
+    n = n + 1
+    n = _wsys_emit_u64_dec(&scratch[0], n, wsys_post_ack_serial)
+    scratch[n] = 32
+    n = n + 1
+    n = _wsys_emit_u64_dec(&scratch[0], n, wsys_post_count)
+    scratch[n] = 32
+    n = n + 1
+    if wsys_post_count > 0:
+        head: uint64 = wsys_post_head
+        toff: uint64 = head * WSYS_POST_TITLE_CAP
+        boff: uint64 = head * WSYS_POST_BODY_CAP
+        ioff: uint64 = head * WSYS_POST_ICON_CAP
+        # Emit head's slot serial so the compositor can pass it back to ack.
+        n = _wsys_emit_u64_dec(&scratch[0], n, wsys_post_pserial[head])
+        scratch[n] = 32
+        n = n + 1
+        i: uint64 = 0
+        while i < wsys_post_tlen[head]:
+            scratch[n] = wsys_post_titles[toff + i]
+            n = n + 1
+            i = i + 1
+        scratch[n] = 9
+        n = n + 1
+        j: uint64 = 0
+        while j < wsys_post_blen[head]:
+            scratch[n] = wsys_post_bodies[boff + j]
+            n = n + 1
+            j = j + 1
+        scratch[n] = 9
+        n = n + 1
+        k: uint64 = 0
+        while k < wsys_post_ilen[head]:
+            scratch[n] = wsys_post_icons[ioff + k]
+            n = n + 1
+            k = k + 1
+    else:
+        # No slot: emit "0 \t \t" placeholder so the parser shape is stable.
+        scratch[n] = 48
+        n = n + 1
+        scratch[n] = 32
+        n = n + 1
+        scratch[n] = 9
+        n = n + 1
+        scratch[n] = 9
+        n = n + 1
+    scratch[n] = 10
+    n = n + 1
+    take: uint64 = count
+    if take > n:
+        take = n
+    m: uint64 = 0
+    while m < take:
+        buf[m] = scratch[m]
+        m = m + 1
+    return cast[int64](take)
+
+
+def devwsys_post_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # Strip trailing \r/\n.
+    end: uint64 = count
+    while end > 0 and (buf[end - 1] == 10 or buf[end - 1] == 13):
+        end = end - 1
+    if end == 0:
+        return cast[int64](count)
+    # "ack <serial>" — compositor draining the head slot.
+    if end >= 3 and buf[0] == 97 and buf[1] == 99 and buf[2] == 107:
+        p: uint64 = 3
+        while p < end and (buf[p] == 32 or buf[p] == 9):
+            p = p + 1
+        ser: uint64 = 0
+        while p < end and buf[p] >= 48 and buf[p] <= 57:
+            ser = ser * 10 + cast[uint64](buf[p] - 48)
+            p = p + 1
+        _wsys_post_ack(ser)
+        return cast[int64](count)
+    # Otherwise: parse "<title>\t<body>\t<icon>" and push.
+    p: uint64 = 0
+    tab1: uint64 = p
+    while tab1 < end and buf[tab1] != 9:
+        tab1 = tab1 + 1
+    title_len: uint64 = tab1 - p
+    body_start: uint64 = tab1
+    if body_start < end:
+        body_start = body_start + 1
+    tab2: uint64 = body_start
+    while tab2 < end and buf[tab2] != 9:
+        tab2 = tab2 + 1
+    body_len: uint64 = tab2 - body_start
+    icon_start: uint64 = tab2
+    if icon_start < end:
+        icon_start = icon_start + 1
+    icon_len: uint64 = end - icon_start
+    if title_len == 0 and body_len == 0:
+        set_current_errstr("/dev/wsys/post: empty notification")
+        return -1
+    _wsys_post_push(&buf[p], title_len,
+                    &buf[body_start], body_len,
+                    &buf[icon_start], icon_len)
+    return cast[int64](count)
+
+
+# ====================================================================
 # DE pivot wave 5 — /dev/wsys/lock + /dev/wsys/lock/show + /dev/wsys/lock/verify
 #
 # The full-screen lock overlay ("Screen Locked / Click to unlock") used to be
