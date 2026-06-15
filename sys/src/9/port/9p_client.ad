@@ -1976,6 +1976,197 @@ def p9c_auth(srvfd: int32, uname: Ptr[char], aname: Ptr[char],
     return cast[int32](afid)
 
 
+# -- p9c_attach_authed_run -----------------------------------------
+#
+# F10-4 (#457) E2E: the full Plan 9 wire authentication handshake on a
+# freshly-allocated conn slot. Mirrors p9c_attach_run but inserts a real
+# Tauth + Twrite(afid, cred) BETWEEN Tversion and Tattach, then passes
+# the established afid into Tattach instead of P9_NOFID. Used by
+# syschan.ad::do_mount when the caller supplied a verified /dev/auth fd
+# AND the kernel knows the target server requires wire auth.
+#
+# Wire sequence:
+#   1. Tversion (msize negotiate) — via _p9_negotiate.
+#   2. Tauth(afid, uname, aname) — server returns Rauth(aqid) and binds
+#      afid to a fresh AuthFid record on its side. afid is allocated
+#      from the conn's ordinary fid pool here; clunk on any failure.
+#   3. Twrite(afid, offset=0, cred[..cred_len]) — write the credential
+#      blob to the afid. Hamnix's afid-protocol is one-shot (no
+#      challenge/response state machine): the server checks the cred
+#      against its own policy and marks the afid "authenticated" on
+#      match. cred_len == 0 is legal — the wire byte alone (a Twrite
+#      with zero count) is the "I have nothing to say" signal a
+#      no-cred-required server still accepts.
+#   4. Tattach(fid=0, afid, uname, aname) — the server validates that
+#      afid is in its "authenticated" set; an unauthenticated afid
+#      MUST receive Rerror per the Plan 9 spec.
+#   5. Tclunk(afid) — the established afid can be discarded once
+#      Tattach succeeded (it carries no further role).
+#
+# Returns the root fid (0) on success, -1 on any failure. On failure,
+# the conn slot is released so callers don't need to roll back.
+#
+# afd-shape note: the cred bytes here are the same bytes a userland
+# factotum would write into the afid. In the kernel-mediator world
+# (#458 follow-up) the cred IS the verified principal name extracted
+# from the /dev/auth AuthSlot — sufficient for any in-tree server,
+# since servers consult the same kernel uname table to authorize.
+
+def p9c_attach_authed_run(slot: int32, aname: Ptr[char],
+                          uname: Ptr[char],
+                          cred: Ptr[uint8], cred_len: uint32) -> int32:
+    # The shape mirrors p9c_attach_run: strip the optional "p9rx:<fd>:"
+    # transport-smuggle prefix off aname, cache the pipe/sockpair slots
+    # in the conn record so post-attach RPCs work from ANY task that
+    # inherits the namespace, then negotiate.
+    aname = _parse_rx_prefix(slot, aname)
+    su0: uint64 = cast[uint64](slot)
+    p9_conns[su0].tx_pipe_slot = _fd_to_pipe_slot(p9_conns[su0].srvfd, 1)
+    rxfd0: int32 = p9_conns[su0].rx_srvfd
+    if rxfd0 < 0:
+        rxfd0 = p9_conns[su0].srvfd
+    p9_conns[su0].rx_pipe_slot = _fd_to_pipe_slot(rxfd0, 0)
+    sp_s0: int32 = -1
+    sp_d0: int32 = 0
+    if _fd_to_sockpair(p9_conns[su0].srvfd, &sp_s0, &sp_d0) != 0:
+        p9_conns[su0].sock_slot = sp_s0
+        p9_conns[su0].sock_dir  = sp_d0
+    if _p9_negotiate(slot) < 0:
+        _conn_release(slot)
+        return -1
+    # Reserve the root fid (0) up front — _alloc_fid skips it once
+    # marked used, so the afid below won't collide.
+    su: uint64 = cast[uint64](slot)
+    p9_conns[su].fid_used[0] = 1
+    root: uint32 = 0
+
+    # --- Tauth(afid, uname, aname) ---------------------------------
+    afid: uint32 = _alloc_fid(slot)
+    if afid == 0xFFFFFFFF:
+        _conn_release(slot)
+        return -1
+    ra: int32 = _rpc_begin(slot, 0)
+    if ra < 0:
+        _free_fid(slot, afid)
+        _conn_release(slot)
+        return -1
+    rau: uint64 = cast[uint64](ra)
+    abuf: Ptr[uint8] = _rpc_buf(rau)
+    ca: P9Cursor
+    p9_cursor_init(&ca, abuf, _rpc_buf_len(rau))
+    atag: uint16 = p9c_rpc_tag[rau]
+    a_uname_l: uint64 = 0
+    a_aname_l: uint64 = 0
+    if uname != cast[Ptr[char]](0):
+        a_uname_l = _cstrlen(uname)
+    if aname != cast[Ptr[char]](0):
+        a_aname_l = _cstrlen(aname)
+    na: int32 = p9_emit_tauth(&ca, atag, afid,
+                              cast[Ptr[uint8]](uname), a_uname_l,
+                              cast[Ptr[uint8]](aname), a_aname_l)
+    if na < 0:
+        _rpc_free(ra)
+        _free_fid(slot, afid)
+        _conn_release(slot)
+        return -1
+    rna: int32 = _rpc_exchange(slot, ra, na, 1)
+    if rna < 0:
+        _free_fid(slot, afid)
+        _conn_release(slot)
+        return -1
+    if abuf[4] != P9_RAUTH:
+        # Rerror or unexpected — server refused to authenticate.
+        _rpc_free(ra)
+        _free_fid(slot, afid)
+        _conn_release(slot)
+        return -1
+    a_tg: uint16 = 0
+    a_qt: uint8 = 0
+    a_qv: uint32 = 0
+    a_qp: uint64 = 0
+    a_consumed: int64 = p9_decode_rauth(
+        abuf, cast[uint64](rna),
+        &a_tg, &a_qt, &a_qv, &a_qp)
+    _rpc_free(ra)
+    if a_consumed < cast[int64](0):
+        _free_fid(slot, afid)
+        _conn_release(slot)
+        return -1
+
+    # --- Twrite(afid, 0, cred[..cred_len]) -------------------------
+    # We send a single Twrite (the cred fits in one msize). Servers
+    # MAY accept zero-length writes (no cred) or expect the principal
+    # name verbatim — both are honoured.
+    if cred_len > 0 and cred != cast[Ptr[uint8]](0):
+        wn: int64 = p9c_write(p9_conns[su].srvfd, cast[int32](afid),
+                              0, cred, cred_len)
+        if wn < cast[int64](cred_len):
+            # Short write or Rerror — refuse to proceed to Tattach
+            # against a server that did not accept the credential.
+            _free_fid(slot, afid)
+            _conn_release(slot)
+            return -1
+
+    # --- Tattach(root=0, afid, uname, aname) -----------------------
+    rt: int32 = _rpc_begin(slot, 0)
+    if rt < 0:
+        _free_fid(slot, afid)
+        _conn_release(slot)
+        return -1
+    rtu: uint64 = cast[uint64](rt)
+    tbuf: Ptr[uint8] = _rpc_buf(rtu)
+    ct: P9Cursor
+    p9_cursor_init(&ct, tbuf, _rpc_buf_len(rtu))
+    ttag: uint16 = p9c_rpc_tag[rtu]
+    t_uname_p: Ptr[uint8] = cast[Ptr[uint8]](uname)
+    t_aname_p: Ptr[uint8] = cast[Ptr[uint8]](aname)
+    t_uname_l: uint64 = 0
+    t_aname_l: uint64 = 0
+    if uname != cast[Ptr[char]](0):
+        t_uname_l = _cstrlen(uname)
+    if aname != cast[Ptr[char]](0):
+        t_aname_l = _cstrlen(aname)
+    nt: int32 = p9_emit_tattach(&ct, ttag, root, afid,
+                                t_uname_p, t_uname_l,
+                                t_aname_p, t_aname_l)
+    if nt < 0:
+        _rpc_free(rt)
+        _free_fid(slot, afid)
+        _conn_release(slot)
+        return -1
+    rnt: int32 = _rpc_exchange(slot, rt, nt, 1)
+    if rnt < 0:
+        _free_fid(slot, afid)
+        _conn_release(slot)
+        return -1
+    if tbuf[4] == P9_RERROR:
+        _rpc_free(rt)
+        _free_fid(slot, afid)
+        _conn_release(slot)
+        return -1
+    tg_out: uint16 = 0
+    qt: uint8 = 0
+    qv: uint32 = 0
+    qp: uint64 = 0
+    consumed_t: int64 = p9_decode_rattach(
+        tbuf, cast[uint64](rnt),
+        &tg_out, &qt, &qv, &qp)
+    _rpc_free(rt)
+    if consumed_t < cast[int64](0):
+        _free_fid(slot, afid)
+        _conn_release(slot)
+        return -1
+    p9_conns[su].root_fid = root
+
+    # Tattach succeeded — clunk the afid (its role is done). A clunk
+    # failure here is non-fatal: the connection is up and root_fid is
+    # bound, so we just leak the afid number rather than fail the
+    # mount.
+    _clunk_rc: int32 = p9c_clunk(p9_conns[su].srvfd, cast[int32](afid))
+
+    return cast[int32](root)
+
+
 # -- per-conn introspection helpers used by syschan + vfs ----------
 
 def p9c_conn_for_srvfd(srvfd: int32) -> int32:
