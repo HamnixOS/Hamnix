@@ -45,6 +45,10 @@ BOOT_WAIT="${BOOT_WAIT:-240}"
 GATE_WAIT="${GATE_WAIT:-60}"
 APP_WAIT="${APP_WAIT:-20}"
 FPS_MIN="${FPS_MIN:-5}"
+# Minimum changed pixels inside the central window region for an app to
+# count as "rendered". A real toolkit window paints thousands of pixels;
+# cursor/wallpaper jitter is a few dozen at most. 1500 is a safe floor.
+WINDOW_DIFF_MIN="${WINDOW_DIFF_MIN:-1500}"
 TS="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-build/de_visual_gate/$TS}"
 HANDOFF_MARKER="handing off to interactive shell"
@@ -161,12 +165,76 @@ snapshot() {
     # Small extra delay for file write to finish.
     sleep 0.3
     ppm_to_png "$ppm" "$png"
+    # Keep the raw PPM next to the PNG: the render check decodes the
+    # PPM directly (no PIL dependency) to count changed pixels in the
+    # expected window region — a byte-diff of the whole PNG false-passes
+    # when only the cursor/wallpaper moved and no app window appeared.
+    cp "$ppm" "$OUT_DIR/$label.ppm" 2>/dev/null || true
     rm -f "$ppm"
     if [ -s "$png" ]; then
         echo "[visual_gate]   wrote $png ($(wc -c < "$png") bytes)"
         return 0
     fi
     return 1
+}
+
+# region_window_diff PRE.ppm POST.ppm
+#   Decodes two binary P6 PPMs and counts pixels that differ by more
+#   than a small per-channel threshold inside the CENTRAL window region
+#   (the middle 70% of the frame, excluding the top panel and the screen
+#   edges where the cursor and wallpaper jitter live). Prints the changed
+#   pixel count on stdout. A real app window paints a large contiguous
+#   block of new pixels there; a cursor-only move changes a few dozen.
+region_window_diff() {
+    local pre="$1" post="$2"
+    python3 - "$pre" "$post" <<'PYEOF'
+import sys
+def load_ppm(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    if not data.startswith(b"P6"):
+        return None
+    # Parse the P6 header: magic, width, height, maxval — each token is
+    # whitespace-separated; comments (#...) may appear.
+    idx = 2
+    toks = []
+    while len(toks) < 3:
+        while idx < len(data) and data[idx:idx+1].isspace():
+            idx += 1
+        if idx < len(data) and data[idx:idx+1] == b'#':
+            while idx < len(data) and data[idx:idx+1] != b'\n':
+                idx += 1
+            continue
+        start = idx
+        while idx < len(data) and not data[idx:idx+1].isspace():
+            idx += 1
+        toks.append(int(data[start:idx]))
+    idx += 1  # single whitespace after maxval
+    w, h, mx = toks
+    return w, h, data[idx:idx + w*h*3]
+a = load_ppm(sys.argv[1])
+b = load_ppm(sys.argv[2])
+if a is None or b is None or a[0] != b[0] or a[1] != b[1]:
+    print(-1); sys.exit(0)
+w, h, pa = a; _, _, pb = b
+# Central window region: middle 70% horizontally, 15%..85% vertically
+# (skip the top panel band and the bottom edge).
+x0, x1 = int(w*0.15), int(w*0.85)
+y0, y1 = int(h*0.15), int(h*0.85)
+THRESH = 24  # per-channel delta to count as "changed"
+changed = 0
+n = min(len(pa), len(pb))
+for y in range(y0, y1):
+    base = y*w*3
+    for x in range(x0, x1):
+        i = base + x*3
+        if i+2 >= n:
+            continue
+        if (abs(pa[i]-pb[i]) > THRESH or abs(pa[i+1]-pb[i+1]) > THRESH
+                or abs(pa[i+2]-pb[i+2]) > THRESH):
+            changed += 1
+print(changed)
+PYEOF
 }
 
 # Mirror the user's exact ship command, headlessly + monitor socket.
@@ -230,6 +298,7 @@ wait_marker '\[visual_gate\] nudge_done' "$APP_WAIT" || true
 declare -A PRE_HASH
 declare -A POST_HASH
 declare -A APP_STATUS
+declare -A APP_DIFFPX
 
 idx=0
 for app in "${APPS[@]}"; do
@@ -259,11 +328,31 @@ for app in "${APPS[@]}"; do
         POST_HASH[$app]=$(sha256sum "$OUT_DIR/$label_post.png" | awk '{print $1}')
     fi
 
-    if [ -n "${PRE_HASH[$app]:-}" ] && [ -n "${POST_HASH[$app]:-}" ]; then
-        if [ "${PRE_HASH[$app]}" = "${POST_HASH[$app]}" ]; then
-            APP_STATUS[$app]="no-render (identical pre/post)"
+    # Meaningful render proof: count changed pixels in the central window
+    # region between the pre- and post-spawn frames. A byte-diff of the
+    # whole PNG false-passes (cursor/wallpaper jitter alone flips it), so
+    # require a substantial contiguous change where the window appears.
+    pre_ppm="$OUT_DIR/$label_pre.ppm"
+    post_ppm="$OUT_DIR/$label_post.ppm"
+    if [ -s "$pre_ppm" ] && [ -s "$post_ppm" ]; then
+        diffpx=$(region_window_diff "$pre_ppm" "$post_ppm" 2>/dev/null || echo -1)
+        diffpx=${diffpx:--1}
+        APP_DIFFPX[$app]="$diffpx"
+        if [ "$diffpx" -lt 0 ]; then
+            APP_STATUS[$app]="no-render (ppm decode failed)"
+        elif [ "$diffpx" -ge "$WINDOW_DIFF_MIN" ]; then
+            APP_STATUS[$app]="rendered ($diffpx px)"
         else
-            APP_STATUS[$app]="rendered"
+            APP_STATUS[$app]="no-render (only $diffpx px changed in window region)"
+        fi
+    elif [ -n "${PRE_HASH[$app]:-}" ] && [ -n "${POST_HASH[$app]:-}" ]; then
+        # PPM unavailable (converter kept none) — fall back to byte-diff
+        # but flag it as weak so a reviewer knows the strong check was
+        # skipped.
+        if [ "${PRE_HASH[$app]}" = "${POST_HASH[$app]}" ]; then
+            APP_STATUS[$app]="no-render (identical pre/post; weak check)"
+        else
+            APP_STATUS[$app]="rendered (weak byte-diff only)"
         fi
     else
         APP_STATUS[$app]="no-shot"
@@ -280,7 +369,13 @@ wait "$QEMU_PID" 2>/dev/null
 QEMU_PID=""
 
 # --- parse cursor_fps from the serial log ----------------------------
-FPS_LINE=$(grep -aE '^\[de_perf\] cursor_fps=' "$LOG" | tail -1 || true)
+# The kernel now stamps the [de_perf] line at EMERG level so it survives
+# console_set_interactive() suppression; EMERG printk still carries the
+# "[NNNNNN] " sequence prefix, so match the tag ANYWHERE on the line
+# (not anchored at ^). Pick the line with the highest consumed= (the
+# post-burst report, not the initial reset whose consumed is 0).
+FPS_LINE=$(grep -aE '\[de_perf\] cursor_fps=' "$LOG" \
+    | sort -t= -k3 -n | tail -1 || true)
 CURSOR_FPS=$(printf '%s' "$FPS_LINE" | sed -nE 's/.*cursor_fps=([0-9]+).*/\1/p')
 CURSOR_FPS=${CURSOR_FPS:-0}
 CONSUMED=$(printf '%s' "$FPS_LINE" | sed -nE 's/.*consumed=([0-9]+).*/\1/p')
@@ -320,7 +415,7 @@ fi
 no_render_apps=()
 for app in "${APPS[@]}"; do
     case "${APP_STATUS[$app]:-missing}" in
-        rendered) ;;
+        rendered*) ;;          # "rendered (NNNN px)" / "rendered (weak ...)"
         *)
             no_render_apps+=("$app(${APP_STATUS[$app]:-missing})")
             ;;
