@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# scripts/test_de_visual_gate.sh — THE VISUAL REGRESSION GATE.
+#
+# Boots the installer image under OVMF/KVM and produces, for every
+# graphical boot:
+#
+#   1. A real cursor-FPS number, captured from the in-guest `nudge` /
+#      `nudge_report` ctl verbs the rc.5 hook fires.
+#   2. A pre-spawn and post-spawn framebuffer PNG for each hamui app
+#      the rc.5 hook launches (hamclock hamcalc hamfm hamterm hammon
+#      hamctl hamshot hamnotify), captured live via the QEMU monitor
+#      `screendump` HMP command on `[visual_gate] launching/launched`
+#      markers in the serial log.
+#   3. A whole-DE composite PNG snapped just after the gate finishes
+#      sequencing apps.
+#
+# FAILS if cursor_fps is below the baseline (FPS_MIN, default 5) OR if
+# any app's post-spawn PNG is byte-identical to its pre-spawn PNG (the
+# app rendered no new pixels and "launched" without painting). All PNGs
+# land under build/de_visual_gate/<timestamp>/.
+#
+# This is the build-time visual-gate — there is no -kernel multiboot
+# fast-path: that route hits project_qemu_multiboot_vbe_limit on this
+# host so cannot produce real-framebuffer PNGs. The UEFI/OVMF live boot
+# is the only authoritative path, matching scripts/
+# test_installer_de_runlevel5.sh.
+#
+# Env overrides:
+#   INSTALLER_IMG      image path        (default: build/hamnix-installer.img)
+#   OVMF_FD            OVMF firmware     (default: auto-resolved)
+#   BOOT_WAIT          seconds to wait for the handoff marker (default: 240)
+#   GATE_WAIT          seconds to wait for `[visual_gate] start` (default: 60)
+#   APP_WAIT           seconds to wait between markers (default: 20)
+#   FPS_MIN            minimum cursor_fps to PASS (default: 5)
+#   OUT_DIR            output dir        (default: build/de_visual_gate/<ts>)
+#   HAMNIX_SKIP_BUILD  1 = require an existing image (no rebuild)
+
+set -uo pipefail
+
+PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJ_ROOT"
+
+INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer.img}"
+BOOT_WAIT="${BOOT_WAIT:-240}"
+GATE_WAIT="${GATE_WAIT:-60}"
+APP_WAIT="${APP_WAIT:-20}"
+FPS_MIN="${FPS_MIN:-5}"
+TS="$(date +%Y%m%d-%H%M%S)"
+OUT_DIR="${OUT_DIR:-build/de_visual_gate/$TS}"
+HANDOFF_MARKER="handing off to interactive shell"
+
+APPS=(hamclock hamcalc hamfm hamterm hammon hamctl hamshot hamnotify)
+
+# --- environment gates -----------------------------------------------
+if [ ! -e /dev/kvm ]; then
+    echo "[visual_gate] SKIP: /dev/kvm absent (KVM required)" >&2
+    exit 0
+fi
+
+OVMF_FD="${OVMF_FD:-}"
+if [ -z "$OVMF_FD" ]; then
+    for cand in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do
+        [ -f "$cand" ] && OVMF_FD="$cand" && break
+    done
+fi
+if [ -z "$OVMF_FD" ] || [ ! -f "$OVMF_FD" ]; then
+    echo "[visual_gate] SKIP: OVMF firmware not found (apt install ovmf)" >&2
+    exit 0
+fi
+
+CONVERTER=""
+if command -v convert >/dev/null 2>&1; then
+    CONVERTER="convert"
+elif command -v ffmpeg >/dev/null 2>&1; then
+    CONVERTER="ffmpeg"
+elif command -v pnmtopng >/dev/null 2>&1; then
+    CONVERTER="pnmtopng"
+else
+    echo "[visual_gate] SKIP: no PPM->PNG converter" >&2
+    exit 0
+fi
+
+MON_DRIVER=""
+if command -v socat >/dev/null 2>&1; then
+    MON_DRIVER="socat"
+elif command -v nc >/dev/null 2>&1; then
+    MON_DRIVER="nc"
+else
+    echo "[visual_gate] SKIP: no socat/nc to drive QEMU monitor" >&2
+    exit 0
+fi
+
+# --- ensure installer image -------------------------------------------
+if [ ! -f "$INSTALLER_IMG" ]; then
+    if [ "${HAMNIX_SKIP_BUILD:-0}" = "1" ]; then
+        echo "[visual_gate] SKIP: $INSTALLER_IMG absent and HAMNIX_SKIP_BUILD=1" >&2
+        exit 0
+    fi
+    echo "[visual_gate] building installer image (~6 min)"
+    bash "$PROJ_ROOT/scripts/build_installer_img.sh"
+fi
+if [ ! -f "$INSTALLER_IMG" ]; then
+    echo "[visual_gate] SKIP: $INSTALLER_IMG unavailable" >&2
+    exit 0
+fi
+
+mkdir -p "$OUT_DIR"
+echo "[visual_gate] output dir: $OUT_DIR"
+
+OVMF_RW=$(mktemp --tmpdir hamnix-vg.ovmf.XXXXXX.fd)
+IMG_RW=$(mktemp --tmpdir hamnix-vg.img.XXXXXX.raw)
+LOG="$OUT_DIR/serial.log"
+MON=$(mktemp --tmpdir -u hamnix-vg-mon.XXXXXX)
+cp "$OVMF_FD" "$OVMF_RW"
+cp "$INSTALLER_IMG" "$IMG_RW"
+
+QEMU_PID=""
+cleanup() {
+    [ -n "$QEMU_PID" ] && kill "$QEMU_PID" 2>/dev/null
+    rm -f "$OVMF_RW" "$IMG_RW" "$MON"
+}
+trap cleanup EXIT
+
+mon_cmd() {
+    if [ "$MON_DRIVER" = "socat" ]; then
+        printf '%s\n' "$1" | socat - "UNIX-CONNECT:$MON" >/dev/null 2>&1
+    else
+        printf '%s\n' "$1" | nc -U -q1 "$MON" >/dev/null 2>&1
+    fi
+}
+
+ppm_to_png() {
+    local ppm="$1" png="$2"
+    case "$CONVERTER" in
+        convert) convert "$ppm" "$png" 2>/dev/null ;;
+        ffmpeg)  ffmpeg -y -loglevel error -i "$ppm" "$png" </dev/null 2>/dev/null ;;
+        pnmtopng) pnmtopng "$ppm" > "$png" 2>/dev/null ;;
+    esac
+}
+
+# Capture one screendump PPM, convert to PNG. Returns 0 on success.
+snapshot() {
+    local label="$1"
+    local ppm=$(mktemp --tmpdir hamnix-vg.XXXXXX.ppm)
+    local png="$OUT_DIR/$label.png"
+    if ! mon_cmd "screendump $ppm"; then
+        rm -f "$ppm"; return 1
+    fi
+    # screendump is async; poll for the file to be non-empty + stable.
+    local i=0
+    while [ "$i" -lt 30 ]; do
+        if [ -s "$ppm" ]; then
+            break
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if [ ! -s "$ppm" ]; then
+        rm -f "$ppm"; return 1
+    fi
+    # Small extra delay for file write to finish.
+    sleep 0.3
+    ppm_to_png "$ppm" "$png"
+    rm -f "$ppm"
+    if [ -s "$png" ]; then
+        echo "[visual_gate]   wrote $png ($(wc -c < "$png") bytes)"
+        return 0
+    fi
+    return 1
+}
+
+# Mirror the user's exact ship command, headlessly + monitor socket.
+qemu-system-x86_64 \
+    -enable-kvm -cpu host \
+    -bios "$OVMF_RW" \
+    -drive file="$IMG_RW",format=raw,if=virtio \
+    -m 1G \
+    -vga std -display none -no-reboot \
+    -monitor "unix:$MON,server,nowait" \
+    -serial stdio \
+    > "$LOG" 2>&1 < /dev/null &
+QEMU_PID=$!
+
+echo "[visual_gate] waiting up to ${BOOT_WAIT}s for handoff marker..."
+booted=0
+for _ in $(seq 1 "$BOOT_WAIT"); do
+    if grep -a -q "$HANDOFF_MARKER" "$LOG"; then
+        booted=1
+        break
+    fi
+    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+        echo "[visual_gate] FAIL: qemu exited before handoff marker" >&2
+        tail -80 "$LOG" >&2
+        exit 1
+    fi
+    sleep 1
+done
+if [ "$booted" -ne 1 ]; then
+    echo "[visual_gate] FAIL: handoff marker not seen in ${BOOT_WAIT}s" >&2
+    tail -80 "$LOG" >&2
+    exit 1
+fi
+echo "[visual_gate] handoff reached; waiting up to ${GATE_WAIT}s for [visual_gate] start..."
+
+wait_marker() {
+    local pat="$1" timeout="$2"
+    local deadline=$(( SECONDS + timeout ))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        grep -aqE "$pat" "$LOG" && return 0
+        kill -0 "$QEMU_PID" 2>/dev/null || return 1
+        sleep 1
+    done
+    return 1
+}
+
+if ! wait_marker '\[visual_gate\] start' "$GATE_WAIT"; then
+    echo "[visual_gate] FAIL: rc.5 visual_gate did not start in ${GATE_WAIT}s" >&2
+    tail -120 "$LOG" >&2
+    exit 1
+fi
+
+# Composite "bare desktop" shot before any app launches.
+echo "[visual_gate] gate started; snapping desktop baseline..."
+snapshot "00-desktop-baseline" || true
+
+# Wait for the nudge phase to complete so cursor_fps lands.
+wait_marker '\[visual_gate\] nudge_done' "$APP_WAIT" || true
+
+# --- per-app capture loop --------------------------------------------
+declare -A PRE_HASH
+declare -A POST_HASH
+declare -A APP_STATUS
+
+idx=0
+for app in "${APPS[@]}"; do
+    idx=$((idx + 1))
+    label_pre=$(printf "%02d-%s-pre" "$idx" "$app")
+    label_post=$(printf "%02d-%s-post" "$idx" "$app")
+
+    if ! wait_marker "\[visual_gate\] launching $app" "$APP_WAIT"; then
+        echo "[visual_gate] WARN: launching-$app marker missed; continuing" >&2
+        APP_STATUS[$app]="no-launching-marker"
+        continue
+    fi
+    # The rc.5 hook sleeps 1s AFTER the launching marker, so we have a
+    # window to snap the pre-spawn frame.
+    snapshot "$label_pre" || true
+    if [ -s "$OUT_DIR/$label_pre.png" ]; then
+        PRE_HASH[$app]=$(sha256sum "$OUT_DIR/$label_pre.png" | awk '{print $1}')
+    fi
+
+    if ! wait_marker "\[visual_gate\] launched $app" "$APP_WAIT"; then
+        echo "[visual_gate] WARN: launched-$app marker missed; continuing" >&2
+        APP_STATUS[$app]="no-launched-marker"
+        continue
+    fi
+    snapshot "$label_post" || true
+    if [ -s "$OUT_DIR/$label_post.png" ]; then
+        POST_HASH[$app]=$(sha256sum "$OUT_DIR/$label_post.png" | awk '{print $1}')
+    fi
+
+    if [ -n "${PRE_HASH[$app]:-}" ] && [ -n "${POST_HASH[$app]:-}" ]; then
+        if [ "${PRE_HASH[$app]}" = "${POST_HASH[$app]}" ]; then
+            APP_STATUS[$app]="no-render (identical pre/post)"
+        else
+            APP_STATUS[$app]="rendered"
+        fi
+    else
+        APP_STATUS[$app]="no-shot"
+    fi
+done
+
+# Final composite shot after all apps spawned.
+wait_marker '\[visual_gate\] done' "$APP_WAIT" || true
+snapshot "99-composite-final" || true
+
+# Tear down QEMU.
+kill "$QEMU_PID" 2>/dev/null
+wait "$QEMU_PID" 2>/dev/null
+QEMU_PID=""
+
+# --- parse cursor_fps from the serial log ----------------------------
+FPS_LINE=$(grep -aE '^\[de_perf\] cursor_fps=' "$LOG" | tail -1 || true)
+CURSOR_FPS=$(printf '%s' "$FPS_LINE" | sed -nE 's/.*cursor_fps=([0-9]+).*/\1/p')
+CURSOR_FPS=${CURSOR_FPS:-0}
+CONSUMED=$(printf '%s' "$FPS_LINE" | sed -nE 's/.*consumed=([0-9]+).*/\1/p')
+CONSUMED=${CONSUMED:-0}
+
+# --- DE-marker grep --------------------------------------------------
+DE_MARKERS=$(grep -aE '\[de_ws\] active=|\[de_kbd\]|\[de_notify\] render|hamUI stack started|\[de_perf\] cursor_fps=' "$LOG" \
+                | sort -u | head -20 || true)
+
+# --- write summary ---------------------------------------------------
+SUMMARY="$OUT_DIR/SUMMARY.txt"
+{
+    echo "test_de_visual_gate summary ($TS)"
+    echo "================================"
+    echo "cursor_fps      = $CURSOR_FPS"
+    echo "consumed        = $CONSUMED"
+    echo "fps_baseline    = $FPS_MIN"
+    echo
+    echo "per-app render status"
+    echo "----------------------"
+    for app in "${APPS[@]}"; do
+        printf "  %-12s %s\n" "$app" "${APP_STATUS[$app]:-missing}"
+    done
+    echo
+    echo "DE markers seen"
+    echo "----------------"
+    printf '%s\n' "$DE_MARKERS"
+} > "$SUMMARY"
+cat "$SUMMARY"
+
+# --- pass/fail decision ----------------------------------------------
+fail=0
+if [ "$CURSOR_FPS" -lt "$FPS_MIN" ]; then
+    echo "[visual_gate] FAIL: cursor_fps=$CURSOR_FPS below baseline $FPS_MIN" >&2
+    fail=1
+fi
+no_render_apps=()
+for app in "${APPS[@]}"; do
+    case "${APP_STATUS[$app]:-missing}" in
+        rendered) ;;
+        *)
+            no_render_apps+=("$app(${APP_STATUS[$app]:-missing})")
+            ;;
+    esac
+done
+if [ "${#no_render_apps[@]}" -gt 0 ]; then
+    echo "[visual_gate] FAIL: apps did not render: ${no_render_apps[*]}" >&2
+    fail=1
+fi
+
+if [ "$fail" -eq 0 ]; then
+    echo "[visual_gate] PASS: cursor_fps=$CURSOR_FPS, ${#APPS[@]}/${#APPS[@]} apps rendered"
+    exit 0
+else
+    echo "[visual_gate] FAIL (artifacts: $OUT_DIR)" >&2
+    exit 1
+fi
