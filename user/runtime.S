@@ -257,6 +257,23 @@ sys_nice:
     .size sys_nice, .-sys_nice
 
 
+    /* --- sys_seccomp_native(op, bitmap_ptr) -> int64 -----------------
+     * F10-8 / #457. NATIVE seccomp-lite userland arming. op:
+     *   0 = ARM with 256-bit allow-list at bitmap_ptr (Ptr[uint64 x 4]).
+     *   1 = NARROW: AND the bitmap at bitmap_ptr into the existing
+     *       allow-list (further restrict; cannot widen).
+     *   2 = QUERY: returns 1 if armed, 0 if disarmed; bitmap_ptr ignored.
+     * Once armed, the filter is IRREVOCABLE and inherits across
+     * fork/rfork/clone. The body lives in arch/x86/kernel/syscall.ad. */
+    .globl sys_seccomp_native
+    .type sys_seccomp_native, @function
+sys_seccomp_native:
+    movq    $318, %rax              /* SYS_SECCOMP_NATIVE */
+    syscall
+    ret
+    .size sys_seccomp_native, .-sys_seccomp_native
+
+
     /* --- sys_open(path) -> int32 ------------------------------------- */
     .globl sys_open
     .type sys_open, @function
