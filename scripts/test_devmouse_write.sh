@@ -105,9 +105,24 @@ if ! grep -a -qF "[MOUSE_PUMP] PASS" "$LOG"; then
     fail=1
 fi
 
+# SCENE-DE FOCUS-OUT assertion (Bug 2a): the same boot:37 scene-DE input
+# self-test block runs wsys_focusout_selftest(), which asserts the
+# compositor delivers `f out` to the window LOSING focus — the mechanism
+# the in-panel Applications dropdown uses to self-dismiss on a click-away.
+# A FAIL is fatal; the PASS marker is required if the block ran at all.
+if grep -a -qF "[FOCUS_OUT] FAIL" "$LOG"; then
+    echo "[test_devmouse_write] FAIL: focus-out self-test reported a failure (Bug 2a)" >&2
+    grep -a -F "[FOCUS_OUT] FAIL" "$LOG" >&2 || true
+    fail=1
+fi
+if grep -a -qF "[boot:37.dein]" "$LOG" && ! grep -a -qF "[FOCUS_OUT] PASS" "$LOG"; then
+    echo "[test_devmouse_write] FAIL: scene-DE input block ran but '[FOCUS_OUT] PASS' is missing — Bug 2a focus-out delivery regressed." >&2
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "[test_devmouse_write] FAIL"
     exit 1
 fi
 
-echo "[test_devmouse_write] PASS — writable /dev/mouse injects synthetic events through the auxmouse ring"
+echo "[test_devmouse_write] PASS — writable /dev/mouse injects synthetic events through the auxmouse ring (+ scene-DE focus-out delivery)"
