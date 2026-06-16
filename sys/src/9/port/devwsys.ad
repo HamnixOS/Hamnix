@@ -125,6 +125,13 @@ from sys.src.port9.port.chan import (
     pgrp_current, CHAN_KIND_SRV,
 )
 from mm.slab import kmalloc, kfree
+# Per-window screen-sized framebuffers (layer fb + v2 backbuffer) are each
+# exactly 4 MiB. They are allocated lazily, one window at a time, from the
+# buddy allocator (order 10 = 1024 pages = 4 MiB) rather than living in a
+# 32-slot static BSS array — see the OOM regression note at the
+# wsys_layer_fb_page / wsys_backbuffer_page declarations below.
+from mm.page_alloc import alloc_pages, free_pages
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 # F2 #447: /dev/wsys/ctl `frame <wid> <n>` calls the kernel software
 # rasterizer the same way SYS_VK_WINDOW_FRAME does — vk_window_demo
 # is the in-tree native demo renderer that GPU track #181 ships.
@@ -361,6 +368,11 @@ def wsys_alloc_wid(pid: uint64) -> int32:
         if wsys_slot_in_use[w] == 0:
             wsys_slot_in_use[w] = 1
             wsys_slot_pid[w] = pid
+            # Drop any stale framebuffer blocks left by a previous tenant
+            # that was reclaimed without a clean free (defensive); they are
+            # re-allocated lazily on this window's first draw/blit.
+            _wsys_layer_fb_release(cast[int32](w))
+            _wsys_backbuffer_release(cast[int32](w))
             # Zero-fill that slot's rings so a recycled wid doesn't
             # leak the previous tenant's bytes.
             _wsys_reset_rings(cast[int32](w))
@@ -385,6 +397,10 @@ def wsys_free_wid(wid: int32) -> int32:
     wsys_slot_in_use[u] = 0
     wsys_slot_pid[u] = 0
     _wsys_reset_rings(wid)
+    # Release this wid's lazily-allocated 4 MiB framebuffer blocks back
+    # to the buddy allocator so a closed window costs ~0 again.
+    _wsys_layer_fb_release(wid)
+    _wsys_backbuffer_release(wid)
     return 0
 
 
@@ -1502,8 +1518,19 @@ wsys_layer_name: Array[16384, uint8]
 # Markup bodies: 32 * 16 * 8192 = 4194304 bytes.
 wsys_layer_markup: Array[4194304, uint8]
 
-# Framebuffer bytes: 32 * 16 * 262144 = 134217728 bytes.
-wsys_layer_fb: Array[134217728, uint8]
+# Framebuffer bytes: per window MAX_LAYERS * FB_CAP = 16 * 262144 =
+# 4194304 = exactly 4 MiB.
+#
+# OOM REGRESSION FIX (devwsys MAX_WINDOWS 9->32): this used to be a flat
+# static Array[134217728] (= 32 * 4 MiB = 128 MiB) of BSS. At 32 windows
+# that, plus the 125 MiB wsys_backbuffer below, OOMed a modest-RAM VM at
+# boot ([pf] COW resolution failed). It is now a 32-slot array of POINTERS
+# (8 bytes each, 0 = unallocated). The 4 MiB block for a window is
+# allocated lazily on first fb write and freed when the wid slot is
+# released. Idle slots cost 8 bytes, not 4 MiB.
+WSYS_LAYER_FB_BYTES_PER_WIN: uint64 = 4194304   # 16 * 262144 = 4 MiB
+WSYS_LAYER_FB_ORDER:         int32  = 10         # 1024 pages = 4 MiB
+wsys_layer_fb_page: Array[32, uint64]            # per-wid base addr, 0=none
 
 
 def _wsys_draw_base(wid: int32, slot: uint64) -> uint64:
@@ -1521,6 +1548,57 @@ def _wsys_draw_markup_base(wid: int32, slot: uint64) -> uint64:
 
 def _wsys_draw_fb_base(wid: int32, slot: uint64) -> uint64:
     return _wsys_draw_base(wid, slot) * WSYS_DRAW_FB_CAP
+
+
+def _wsys_layer_fb_off(slot: uint64) -> uint64:
+    # Intra-window byte offset of `slot`'s fb within this window's 4 MiB
+    # block. (The old _wsys_draw_fb_base packed wid into the offset too;
+    # with per-window allocation the wid selects the block pointer and
+    # only the slot contributes to the in-block offset.)
+    return slot * WSYS_DRAW_FB_CAP
+
+
+def _wsys_layer_fb_ensure(wid: int32) -> Ptr[uint8]:
+    # Return a pointer to wid's 4 MiB layer-fb block, allocating it from
+    # the buddy allocator on first use. Returns null if wid is out of
+    # range or the allocation fails (callers must no-op safely on null).
+    if wid <= 0:
+        return cast[Ptr[uint8]](0)
+    u: uint64 = cast[uint64](wid)
+    if u >= MAX_WINDOWS:
+        return cast[Ptr[uint8]](0)
+    if wsys_layer_fb_page[u] == 0:
+        p: uint64 = alloc_pages(WSYS_LAYER_FB_ORDER)
+        if p == 0:
+            return cast[Ptr[uint8]](0)
+        memset(cast[Ptr[uint8]](p), 0, WSYS_LAYER_FB_BYTES_PER_WIN)
+        wsys_layer_fb_page[u] = p
+    return cast[Ptr[uint8]](wsys_layer_fb_page[u])
+
+
+def _wsys_layer_fb_get(wid: int32) -> Ptr[uint8]:
+    # Pointer to wid's layer-fb block WITHOUT allocating — null if the
+    # window has never been drawn into. Read paths use this so a never-
+    # drawn window reads as empty rather than forcing a 4 MiB alloc.
+    if wid <= 0:
+        return cast[Ptr[uint8]](0)
+    u: uint64 = cast[uint64](wid)
+    if u >= MAX_WINDOWS:
+        return cast[Ptr[uint8]](0)
+    return cast[Ptr[uint8]](wsys_layer_fb_page[u])
+
+
+def _wsys_layer_fb_release(wid: int32):
+    # Free wid's layer-fb block back to the buddy allocator (on slot
+    # release / recycle). Null pointer is a no-op.
+    if wid <= 0:
+        return
+    u: uint64 = cast[uint64](wid)
+    if u >= MAX_WINDOWS:
+        return
+    if wsys_layer_fb_page[u] != 0:
+        free_pages(wsys_layer_fb_page[u], WSYS_LAYER_FB_ORDER)
+        wsys_layer_fb_page[u] = 0
 
 
 def _wsys_name_match(wid: int32, slot: uint64,
@@ -2205,8 +2283,11 @@ def devwsys_draw_fb_read(wid: int32, slot: int32, off: uint64,
     su: uint64 = cast[uint64](slot)
     b: uint64 = _wsys_draw_base(wid, su)
     n: uint64 = wsys_layer_fb_len[b]
-    base: uint64 = _wsys_draw_fb_base(wid, su)
-    return _wsys_copy_out(&wsys_layer_fb[base], n, off, buf, count)
+    fbp: Ptr[uint8] = _wsys_layer_fb_get(wid)
+    if cast[uint64](fbp) == 0:
+        return 0                                # never drawn -> empty
+    base: uint64 = _wsys_layer_fb_off(su)
+    return _wsys_copy_out(&fbp[base], n, off, buf, count)
 
 
 def devwsys_draw_fb_write(wid: int32, slot: int32, off: uint64,
@@ -2215,15 +2296,18 @@ def devwsys_draw_fb_write(wid: int32, slot: int32, off: uint64,
         return -2
     su: uint64 = cast[uint64](slot)
     b: uint64 = _wsys_draw_base(wid, su)
-    base: uint64 = _wsys_draw_fb_base(wid, su)
     if off >= WSYS_DRAW_FB_CAP:
         return 0
+    fbp: Ptr[uint8] = _wsys_layer_fb_ensure(wid)
+    if cast[uint64](fbp) == 0:
+        return -12                              # -ENOMEM: no backing block
+    base: uint64 = _wsys_layer_fb_off(su)
     take: uint64 = count
     if off + take > WSYS_DRAW_FB_CAP:
         take = WSYS_DRAW_FB_CAP - off
     i: uint64 = 0
     while i < take:
-        wsys_layer_fb[base + off + i] = buf[i]
+        fbp[base + off + i] = buf[i]
         i = i + 1
     end: uint64 = off + take
     if end > wsys_layer_fb_len[b]:
@@ -2339,13 +2423,16 @@ def wsys_draw_fb_store(wid: int32, slot: int32,
         return -2
     su: uint64 = cast[uint64](slot)
     b: uint64 = _wsys_draw_base(wid, su)
-    base: uint64 = _wsys_draw_fb_base(wid, su)
+    fbp: Ptr[uint8] = _wsys_layer_fb_ensure(wid)
+    if cast[uint64](fbp) == 0:
+        return -12                              # -ENOMEM: no backing block
+    base: uint64 = _wsys_layer_fb_off(su)
     take: uint64 = count
     if take > WSYS_DRAW_FB_CAP:
         take = WSYS_DRAW_FB_CAP
     i: uint64 = 0
     while i < take:
-        wsys_layer_fb[base + i] = src[i]
+        fbp[base + i] = src[i]
         i = i + 1
     wsys_layer_fb_len[b] = take
     # Content changed — bump the layer's generation counter (gen leaf).
@@ -5888,12 +5975,20 @@ WSYS_BB_BPP: uint64 = 4       # storage is always RGBA8888 internally
 WSYS_BB_STRIDE_BYTES: uint64 = 5120   # WSYS_BB_W * WSYS_BB_BPP
 WSYS_BB_BYTES_PER_WIN: uint64 = 4096000  # 1280 * 800 * 4
 
-# Flat per-window backbuffer storage: 32 * 4 096 000 = 131 072 000 bytes
-# (~125 MB). Slot 0 unused. Stored as RGBA8888 regardless of the
-# submitting blit's pixel format; the parser converts on ingestion so
-# the compositor never has to branch on fmt. Budget mirrors the
-# existing wsys_layer_fb (~36 MB) for screen-sized per-window storage.
-wsys_backbuffer: Array[131072000, uint8]
+# Per-window backbuffer storage: 4 096 000 bytes (1280*800*4 RGBA8888)
+# per window. Stored as RGBA8888 regardless of the submitting blit's
+# pixel format; the parser converts on ingestion so the compositor never
+# has to branch on fmt.
+#
+# OOM REGRESSION FIX (devwsys MAX_WINDOWS 9->32): this used to be a flat
+# static Array[131072000] (~125 MiB) of BSS. At 32 windows that, plus the
+# 128 MiB wsys_layer_fb above, OOMed a modest-RAM VM at boot. It is now a
+# 32-slot array of POINTERS (8 bytes each, 0 = unallocated). The ~4 MiB
+# block for a window is allocated lazily on first blit and freed when the
+# wid slot is released. A backbuffer fits in an order-10 buddy block
+# (4 MiB); the ~96 KiB of slack at the tail of the block is unused.
+WSYS_BB_ORDER: int32 = 10                     # 1024 pages = 4 MiB >= 4096000
+wsys_backbuffer_page: Array[32, uint64]       # per-wid base addr, 0=none
 
 # Per-window protocol version. 0/1 = legacy text/markup (current);
 # 2 = blit protocol. Default 0; flipped by wctl `version <n>`.
@@ -5938,17 +6033,48 @@ def wsys_win_version_get(wid: int32) -> int32:
     return wsys_win_version[u]
 
 
-def wsys_backbuffer_ptr(wid: int32) -> Ptr[uint8]:
-    # Public: pointer to wid's RGBA8888 backbuffer storage (stride
-    # WSYS_BB_STRIDE_BYTES bytes, dims WSYS_BB_W x WSYS_BB_H). Returns
-    # null on a bad wid so the compositor can fall back to its legacy
-    # path on a transient race.
+def _wsys_backbuffer_ensure(wid: int32) -> Ptr[uint8]:
+    # Pointer to wid's 4 MiB backbuffer block, allocating it from the
+    # buddy allocator on first use. Null on bad wid / alloc failure.
     if wid <= 0:
         return cast[Ptr[uint8]](0)
     u: uint64 = cast[uint64](wid)
     if u >= MAX_WINDOWS:
         return cast[Ptr[uint8]](0)
-    return &wsys_backbuffer[u * WSYS_BB_BYTES_PER_WIN]
+    if wsys_backbuffer_page[u] == 0:
+        p: uint64 = alloc_pages(WSYS_BB_ORDER)
+        if p == 0:
+            return cast[Ptr[uint8]](0)
+        memset(cast[Ptr[uint8]](p), 0, WSYS_BB_BYTES_PER_WIN)
+        wsys_backbuffer_page[u] = p
+    return cast[Ptr[uint8]](wsys_backbuffer_page[u])
+
+
+def _wsys_backbuffer_release(wid: int32):
+    # Free wid's backbuffer block back to the buddy allocator. No-op on
+    # an unallocated slot.
+    if wid <= 0:
+        return
+    u: uint64 = cast[uint64](wid)
+    if u >= MAX_WINDOWS:
+        return
+    if wsys_backbuffer_page[u] != 0:
+        free_pages(wsys_backbuffer_page[u], WSYS_BB_ORDER)
+        wsys_backbuffer_page[u] = 0
+
+
+def wsys_backbuffer_ptr(wid: int32) -> Ptr[uint8]:
+    # Public: pointer to wid's RGBA8888 backbuffer storage (stride
+    # WSYS_BB_STRIDE_BYTES bytes, dims WSYS_BB_W x WSYS_BB_H). Returns
+    # null on a bad wid OR a window that has never been blitted (lazy
+    # alloc) — the compositor already treats null as "nothing to draw"
+    # and falls back to its legacy path.
+    if wid <= 0:
+        return cast[Ptr[uint8]](0)
+    u: uint64 = cast[uint64](wid)
+    if u >= MAX_WINDOWS:
+        return cast[Ptr[uint8]](0)
+    return cast[Ptr[uint8]](wsys_backbuffer_page[u])
 
 
 def wsys_backbuffer_dims_w() -> uint64:
@@ -6114,7 +6240,10 @@ def _wsys_blit_store_rect(wid: int32, x0: int32, y0: int32,
     # silently clipped — the per-frame compositor only reads pixels
     # under the dirty rect, so a clipped write is correct.
     u: uint64 = cast[uint64](wid)
-    bb_base: uint64 = u * WSYS_BB_BYTES_PER_WIN
+    bbp: Ptr[uint8] = _wsys_backbuffer_ensure(wid)
+    if cast[uint64](bbp) == 0:
+        return                                  # no backing block — drop blit
+    bb_base: uint64 = 0
     bbw: int64 = cast[int64](WSYS_BB_W)
     bbh: int64 = cast[int64](WSYS_BB_H)
     sx0: int64 = cast[int64](x0)
@@ -6181,10 +6310,10 @@ def _wsys_blit_store_rect(wid: int32, x0: int32, y0: int32,
                     b = a8
                     a = 255
                     src_row_off = src_row_off + 1
-            wsys_backbuffer[dst_row_off]     = r
-            wsys_backbuffer[dst_row_off + 1] = g
-            wsys_backbuffer[dst_row_off + 2] = b
-            wsys_backbuffer[dst_row_off + 3] = a
+            bbp[dst_row_off]     = r
+            bbp[dst_row_off + 1] = g
+            bbp[dst_row_off + 2] = b
+            bbp[dst_row_off + 3] = a
             dst_row_off = dst_row_off + 4
             xx = xx + 1
         yy = yy + 1
@@ -6420,13 +6549,15 @@ def devwsys_backbuffer_read(wid: int32, off: uint64, buf: Ptr[uint8],
         return 0
     if off >= WSYS_BB_BYTES_PER_WIN:
         return 0
+    bbp: Ptr[uint8] = cast[Ptr[uint8]](wsys_backbuffer_page[u])
+    if cast[uint64](bbp) == 0:
+        return 0                                # never blitted -> empty
     avail: uint64 = WSYS_BB_BYTES_PER_WIN - off
     take: uint64 = count
     if take > avail:
         take = avail
-    base: uint64 = u * WSYS_BB_BYTES_PER_WIN + off
     i: uint64 = 0
     while i < take:
-        buf[i] = wsys_backbuffer[base + i]
+        buf[i] = bbp[off + i]
         i = i + 1
     return cast[int64](take)
