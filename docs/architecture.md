@@ -6,14 +6,14 @@ Linux internally** because that's where the porting work is bounded.
 Each layer has exactly one source of design influence. The
 translations between layers are explicit.
 
-> **Note: the window system is `hamUI`** (the Plan 9 `rio` model;
-> renamed 2026-05-27 to avoid the upstream name collision). Hamnix's
-> display layer is a userspace 9P file server — see
-> [`hamUI.md`](hamUI.md). Each window is a per-process namespace;
-> programs draw and read input by opening files under `/dev`. Phases
-> 1, 2, 4a, 4b, 4c have landed. An earlier serial/TCP byte-stream
-> design ("VTNext") was considered and retired before any of it
-> shipped; references to it in older docs are stale.
+> **Note: the window system is the scene-file DE** — a userspace display
+> server where each window publishes a human-readable display-list **file**
+> (`/dev/wsys/<wid>/scene`) that the compositor reads, z-orders, and
+> rasterizes. See [`de_scene_file_arch.md`](de_scene_file_arch.md). Each
+> window is a per-process namespace; programs draw by writing a scene file
+> and read input from an `event` file. This supersedes the legacy
+> pixel-pushing `hamUI` stack (per-window RGBA backbuffers committed by the
+> client), which is being gutted and rebuilt against the scene-file spec.
 
 ## Layered model
 
@@ -285,7 +285,7 @@ namespace recipe uses these primitives.
 | Kernel modules in Adder | `kernel-modules/*` (M1..M15) | 5 (running) → loaded by Linux .ko path → uses Layer 2 | Stays as regression baseline |
 | Linux modules (stock .ko) | `tests/linux-modules/*.ko` | 5 (running) → Layer 2 | Stays |
 | Linux ELF userland | `tests/u-binary/u_*` | 5 (running) → Layer 2 | Stays |
-| hamUI display server | shipped (Phases 1,2,4a,4b,4c) | 3 | Layer 3 service — file-based window system (see `hamUI.md`) |
+| Scene-file display server | rearchitecting (spec landed) | 3 | Layer 3 service — file-based window system (see `de_scene_file_arch.md`) |
 | ipd net daemon | not yet built | 3 | Owns the IP stack as a /net 9P server |
 | Compiler | `adder/compiler/*.py` (inlined in-tree; top-level `compiler/` is a symlink) | host tool | Not part of the OS — runs on the build host. The Adder compiler lives in-tree under `adder/` (the formerly-separate HamnixOS/adder repo was folded in 2026-05-30, so drift is impossible by construction). `scripts/test_adder_pin.sh` now just functionally checks the compiler still compiles a trivial program through the `python3 -m compiler.adder` path. |
 
@@ -299,7 +299,7 @@ end (and even then, only their internals).
 
 ### Phase A — Specs land (this pass)
 
-Three docs (`architecture.md`, `native-api.md`, `hamUI.md`) plus
+Three docs (`architecture.md`, `native-api.md`, `de_scene_file_arch.md`) plus
 a `sys/src/9/port/README.md` placeholder stake out the new
 directory. No code moves. **All L+U tests keep passing trivially.**
 
@@ -354,7 +354,7 @@ keep passing** because they're console-only.
 namespace, its own per-window FIFOs, its own srvfd. This proves the
 load-bearing invariant — events route to exactly one window's
 `/dev/mouse` at a time. **L+U tests keep passing** because they're
-console-only. See [`hamUI.md`](hamUI.md) for the full phase breakdown.
+console-only. See [`de_scene_file_arch.md`](de_scene_file_arch.md) for the window-system design.
 
 ### Phase F — Move the network stack to `/net/`
 
@@ -420,7 +420,7 @@ breaks either reverts before merge.
 - `sys/src/9/port/` — Plan 9-shape syscall bodies.
 - `sys/src/9/cdev/` — Plan 9-shape device-file backends (`devcons`,
   `devtime`, `devpid`, `devrandom`).
-- `sys/src/cmd/hamUI/` — display server (shipped; see `hamUI.md`).
+- `sys/src/cmd/hamUI/` — display server (rearchitecting; see `de_scene_file_arch.md`).
 - `sys/src/cmd/ipd/` — network daemon (Phase F).
 - `sys/src/cmd/plumb/` — plumber (deferred).
 - `sys/src/cmd/srvfs/` — `/srv/` registry server (Phase D/E
@@ -528,7 +528,7 @@ See `x86-backend.md` for the encoder, and task #154 for status.
 3. `security.md` — the Plan-9-shape security model
    (hostowner / namespace-as-authority / `#auth` cdev).
 4. `packages.md` — the `hpm` package format.
-5. `hamUI.md` — the file-based window system and its draw protocol.
+5. `de_scene_file_arch.md` — the scene-file window system and its draw protocol.
 6. `README.md` — current state of the implementation against this
    architecture.
 7. `linux_abi/TARGET_ABI.md` — the pinned Linux ABI we translate

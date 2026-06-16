@@ -2,7 +2,8 @@
 
 Read-only architecture audit at HEAD `6135ebaf`. Sister to the prior
 F10 audit (`audit_F10_report.md`, base `52812182`) and the graphical
-stack audit (`docs/graphical_stack_audit.md`). This pass asks the
+stack audit (since superseded by the DE rearchitecture —
+`docs/de_scene_file_arch.md`). This pass asks the
 question: *now that F10-1/2/3/4/5/6 (MVP)/8/9/10/11/12 have landed, is
 the codebase in the right shape, or have new shortcuts crept in?*
 

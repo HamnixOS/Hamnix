@@ -39,7 +39,7 @@ mounted into *its own* namespace. The directory path mirrors 9front's
 `devdiskstats.ad`, `devmounts.ad`, `devmountrpc.ad`, `devauth.ad`
 (see [../security.md](../security.md)), `devkeymap.ad`, `devnscap.ad`,
 `devvt.ad` (virtual terminals), `devwsys.ad` (window system, see
-[../hamUI.md](../hamUI.md)), `devblk.ad` (block-device file server),
+[../de_scene_file_arch.md](../de_scene_file_arch.md)), `devblk.ad` (block-device file server),
 `devfirewall.ad`, `devnet.ad` lives under `drivers/net/` (see
 [networking.md](networking.md)).
 

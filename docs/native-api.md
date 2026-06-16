@@ -392,9 +392,9 @@ shape.
 | `/dev/random` | r | CSPRNG bytes. |
 | `/dev/pid` | r | ASCII decimal: calling process's pid. |
 | `/dev/eth<n>` | r/w | Raw ethernet frames for NIC `n`. Owned by `ipd`. |
-| `/dev/mouse` | r/w | Per-window mouse events; write repositions cursor. Served by `hamUI` (see `hamUI.md`). |
-| `/dev/draw/new` | r/w | Allocate a draw context; read lists open ids. Served by `hamUI`. |
-| `/dev/draw/<id>/{data,ctl,refresh}` | r/w | Per-context draw protocol, control, and repaint wait. Served by `rio`. |
+| `/dev/mouse` | r/w | Per-window mouse events; write repositions cursor. Served by the DE compositor (see `de_scene_file_arch.md`). |
+| `/dev/wsys/ctl` | r/w | `newwindow` allocates a window; read lists open windows + stats. Served by the DE compositor. |
+| `/dev/wsys/<wid>/{scene,ctl,event}` | r/w | Per-window display-list file, control (geometry/z/decorate/commit), and focus-routed input. See `de_scene_file_arch.md`. |
 | `/dev/wctl` | r/w | Per-window control (resize/move/raise). Served by `rio`. |
 | `/dev/wsys` | r/w | System-wide window control; write spawns a window. Served by `rio`. |
 | `/net/tcp/clone` | r/w | Open then read to get a new TCP connection number N; further I/O on the per-conn `/net/tcp/<N>/{ctl,data,local,remote,status}`. Plan 9 idiom. Implemented by `drivers/net/devnet.ad`. |

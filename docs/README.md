@@ -26,7 +26,7 @@ The layered model (verify against [`architecture.md`](architecture.md)):
 | Layer | Shape | Lives in |
 |--|--|--|
 | 5 Apps | mixed | Debian packages + native binaries (`user/`) |
-| 4 Wire protocols | 9P, hamUI | [`9p.md`](9p.md), [`hamUI.md`](hamUI.md) |
+| 4 Wire protocols | 9P, DE scene files | [`9p.md`](9p.md), [`de_scene_file_arch.md`](de_scene_file_arch.md) |
 | 3 Userspace servers | Plan 9 | `user/` (distrofs, hamUId, sshd, ...) |
 | 2 Linux ABI shims | Linux | `linux_abi/` |
 | 1 Native syscalls | Plan 9 | `sys/src/9/port/` |
@@ -72,7 +72,7 @@ topics. They are linked from the subsystem docs above.
 | [architecture.md](architecture.md) | The layered Plan-9 / Linux model, boundary rules, migration phases |
 | [native-api.md](native-api.md) | Layer-1 Plan-9-shape syscall reference (per-call contracts) |
 | [9p.md](9p.md) | 9P2000 wire format |
-| [hamUI.md](hamUI.md) | File-server-per-window UI protocol (`/dev/wsys/`) |
+| [de_scene_file_arch.md](de_scene_file_arch.md) | DE scene-file display architecture (`/dev/wsys/`, scene files, SSD chrome) |
 | [HAMSH_SPEC.md](HAMSH_SPEC.md) | hamsh language + shell reference |
 | [distro-namespaces.md](distro-namespaces.md) | Distro-shape namespace for Linux binaries |
 | [rootfs_partition.md](rootfs_partition.md) | ext4 discovery, `.hamnix-roots` sentinel, named roots |

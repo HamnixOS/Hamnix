@@ -1,9 +1,17 @@
 # Userland & Desktop Environment
 
+> **⚠ DE rearchitecting (2026-06-15):** the desktop is being gutted and
+> rebuilt on the **scene-file** model — windows publish a human-readable
+> display-list file (`/dev/wsys/<wid>/scene`) that the compositor reads,
+> z-orders, and rasterizes; server-side window decorations. The design of
+> record is [../de_scene_file_arch.md](../de_scene_file_arch.md). The
+> pixel-pushing description below documents the *legacy* stack still in
+> the tree until the rewrite lands.
+>
 > **Source of truth:** `user/` (all `.ad`), `user/x11/`,
 > `sys/src/9/port/devwsys.ad`, `drivers/video/fb_cdev.ad`
 > **Last verified against source:** 2026-06-10
-> (the wsys protocol detail lives in [../hamUI.md](../hamUI.md);
+> (the new window-system design lives in [../de_scene_file_arch.md](../de_scene_file_arch.md);
 > the shell in [hamsh.md](hamsh.md))
 
 ## Purpose
@@ -61,7 +69,7 @@ the rest. Network clients share `user/http9.ad` (HTTP/9P client glue).
   renderer: it reads the per-window markup/framebuffer layers
   (`read_layer_markup`, `read_layer_fb`, `parse_color`, `raster_rect`,
   `raster_text`, `raster_glyph`, `raster_image_fb`) and composites them
-  into `/dev/fb`. Full protocol in [../hamUI.md](../hamUI.md).
+  into `/dev/fb`. (Legacy; the new protocol is in [../de_scene_file_arch.md](../de_scene_file_arch.md).)
 - **AI-debuggability**: because windows are files, an agent can
   `cat /dev/wsys/N/text` to read screen content and
   `echo cmd > /dev/wsys/N/cmd` to drive a window from a serial console.
@@ -92,7 +100,7 @@ family, `read_layer_markup`/`read_layer_fb`/`read_layer_opacity`,
 
 ## Related docs
 
-- [../hamUI.md](../hamUI.md) — the full `/dev/wsys` window protocol.
+- [../de_scene_file_arch.md](../de_scene_file_arch.md) — the scene-file `/dev/wsys` window architecture (current design of record).
 - [hamsh.md](hamsh.md) — the shell / PID-1 language.
 - [networking.md](networking.md) — `/net` that sshd/httpd/curl/ntpd use.
 - [../packages.md](../packages.md), [../distro-namespaces.md](../distro-namespaces.md).

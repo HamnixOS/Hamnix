@@ -35,7 +35,7 @@ docs/
   subsystems/          One doc per subsystem (the bulk of the content).
     <subsystem>.md
   <topic>.md           Long-form design / spec docs that predate this rework
-                       (9p.md, architecture.md, hamUI.md, HAMSH_SPEC.md, ...).
+                       (9p.md, architecture.md, de_scene_file_arch.md, HAMSH_SPEC.md, ...).
 ```
 
 Subsystem docs live in `docs/subsystems/`. Cross-cutting design specs

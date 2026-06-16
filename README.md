@@ -25,7 +25,7 @@ Plan 9 from scratch. Hamnix picks both, layered:
 | Layer | Shape | What lives there |
 |--|--|--|
 | **5** | Apps | Stock Debian packages (apt-installed) + Hamnix-native binaries |
-| **4** | Wire protocols | 9P (kernel↔userspace), [hamUI](docs/hamUI.md) (file-server-per-window UI; Phases 1+2+4a+4b+4c landed) |
+| **4** | Wire protocols | 9P (kernel↔userspace), [DE scene files](docs/de_scene_file_arch.md) (file-server-per-window UI; rearchitecting) |
 | **3** | Userspace services | 9P file servers (hamwd, distrofs, ...) — Hamnix programs |
 | **2** | Linux ABI shims | `linux_abi/` — translates Linux syscalls onto Layer 1 |
 | **1** | Native syscalls | **Plan 9-shape** — ~25 calls including `rfork`, `bind`, `mount`, `errstr`. See [`docs/native-api.md`](docs/native-api.md) |
@@ -131,7 +131,7 @@ loop through userspace-posted srvfds. See
   `echo cmd > /dev/wsys/N/cmd` to drive it. **X11 first slice**: native
   X11 server in `user/x11/` over `/net/tcp` (core-protocol subset).
   Phase 3 (per-window namespace elevation) and Phase 5 (full X11/Xvfb
-  bridge) remain open. See [`docs/hamUI.md`](docs/hamUI.md).
+  bridge) remain open. See [`docs/de_scene_file_arch.md`](docs/de_scene_file_arch.md).
 - **AI agents** — `/dev/wsys/N/*` + svc logs + persistent `man` pages
   at `/usr/share/man/` make Hamnix the OS an AI can fully debug from
   a serial console.
@@ -322,9 +322,9 @@ cross-cutting design specs; the subsystem docs live under
 - [`docs/security.md`](docs/security.md) — hostowner, `/dev/auth`,
   namespace-as-authority.
 - [`docs/packages.md`](docs/packages.md) — `hpm` v1 package format.
-- [`docs/hamUI.md`](docs/hamUI.md) — file-server-per-window UI spec
-  (Plan 9 rio + Hamnix overlay; AI-debug, elevation, X11/Xvfb,
-  drag-create, layered draw protocol H-§G).
+- [`docs/de_scene_file_arch.md`](docs/de_scene_file_arch.md) — scene-file
+  display architecture (per-window display-list files, compositor-diffed
+  damage, server-side decorations, evictable pixel caches, text-asserting gates).
 - [`docs/HAMSH_SPEC.md`](docs/HAMSH_SPEC.md) — hamsh language + shell
   reference.
 - [`docs/rootfs_partition.md`](docs/rootfs_partition.md) — ext4

@@ -56,8 +56,8 @@ for vendor-mess hardware (most NICs, wifi) — see
   READ(10); on some metal the Linux `xhci_hcd.ko` shim is used instead
   (see project memory + [kernel-modules.md](kernel-modules.md)).
 - **Display**: `fb_cdev.ad` exposes `/dev/fb` with write-combining and
-  dirty-rectangle present; the hamUId compositor draws into it (see
-  [../hamUI.md](../hamUI.md)).
+  dirty-rectangle present; the DE compositor draws into it (see
+  [../de_scene_file_arch.md](../de_scene_file_arch.md)).
 
 ## Entry points
 
