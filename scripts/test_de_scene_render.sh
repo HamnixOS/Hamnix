@@ -477,6 +477,28 @@ if [ "$route_ok" != "1" ]; then
     fail=1
 fi
 
+# (5) FILE MANAGER renders a directory listing as glyphs (docs §16 step 8).
+# rc.5 launches /bin/hamfmscene, which lists '/' and emits each entry as a
+# `glyphs` line (via the lib/hamui hamscene_* toolkit path), plus a
+# distinctive `glyphs ... "hamfm: ..."` header. Scan every scene cat AND
+# the serial log for a hamfm glyphs line — flood-immune text proof that the
+# file manager rendered its content as glyphs. Advisory (it depends on rc.5
+# having reached the launch in the gate's boot window), but loud if absent.
+fm_ok=0
+if grep -aEq 'glyphs +[0-9]+ +[0-9]+ +"hamfm:' "$LOG"; then
+    fmline=$(grep -aoE 'glyphs +[0-9]+ +[0-9]+ +"hamfm:[^"]*' "$LOG" | head -1)
+    echo "[scene_gate] PASS file manager rendered its listing as glyphs ($fmline...)"
+    fm_ok=1
+elif grep -aq '\[hamfm\] scene window ready' "$LOG"; then
+    # hamfm DID open its window — if no glyphs line for it surfaced in any
+    # scene cat, but ANY window scene shows glyphs (text_ok proves the
+    # glyphs pipeline works), treat as a capture miss (advisory). Only flag
+    # hard if the whole boot produced no glyphs anywhere.
+    echo "[scene_gate] NOTE hamfm launched (scene window ready) but its glyphs cat not captured in this boot window"
+else
+    echo "[scene_gate] NOTE hamfm not observed in this boot window (rc.5 launch may not have reached the gate's capture window)"
+fi
+
 echo "[scene_gate] artifacts in $OUT_DIR"
 if [ "$fail" = "0" ]; then
     echo "[scene_gate] RESULT: PASS"

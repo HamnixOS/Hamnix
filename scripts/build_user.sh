@@ -263,6 +263,7 @@ build_adder_user live_distro_up       # live medium: extract live-distro.ext4 fr
 build_adder_user scenetest            # scene-file DE gate driver: newwindow + scene/ctl + cursor (docs/de_scene_file_arch.md)
 build_adder_user hampanelscene        # scene-file DE top panel (Applications + clock) drawn as a scene display list
 build_adder_user hamtermscene         # scene-file DE terminal: glyphs content + window-local input routing proof
+build_adder_user hamfmscene           # scene-file DE file manager: directory listing as glyphs, click->descend (via lib/hamui hamscene_*)
 
 # --- X11 server + client (user/x11/ subdirectory) -------------------
 # The source lives in user/x11/<name>.ad but the ELF goes into
