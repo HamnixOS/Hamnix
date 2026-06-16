@@ -68,7 +68,7 @@ rc=$?
 set -e
 
 echo "[test_devmouse_write] --- devmouse-write self-test output ---"
-grep -a -E "\[DEVMOUSE_WRITE\]|\[boot:37.dmw\]" "$LOG" || true
+grep -a -E "\[DEVMOUSE_WRITE\]|\[MOUSE_PUMP\]|\[boot:37.dmw\]" "$LOG" || true
 echo "[test_devmouse_write] --- end ---"
 
 fail=0
@@ -89,6 +89,19 @@ fi
 
 if ! grep -a -qF "[DEVMOUSE_WRITE] PASS" "$LOG"; then
     echo "[test_devmouse_write] FAIL: '[DEVMOUSE_WRITE] PASS' not found in serial log." >&2
+    fail=1
+fi
+
+# LIVE-MOUSE PUMP assertion: the HW-mouse-ring -> mouse_pump_to_compositor
+# -> wsys_route path (the previously-DEAD live cursor path) must drain the
+# ring. A [MOUSE_PUMP] FAIL is fatal; the PASS marker is required.
+if grep -a -qF "[MOUSE_PUMP] FAIL" "$LOG"; then
+    echo "[test_devmouse_write] FAIL: mouse-pump self-test reported a failure" >&2
+    grep -a -F "[MOUSE_PUMP] FAIL" "$LOG" >&2 || true
+    fail=1
+fi
+if ! grep -a -qF "[MOUSE_PUMP] PASS" "$LOG"; then
+    echo "[test_devmouse_write] FAIL: '[MOUSE_PUMP] PASS' not found — the HW mouse-ring pump (live cursor path) is not wired." >&2
     fail=1
 fi
 

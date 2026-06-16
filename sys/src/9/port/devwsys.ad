@@ -124,6 +124,7 @@ from kernel.sched.core import (
     # which on SMP can race over the shared rasterizer scratch + scratch
     # row buffer. A spinlock serializes the whole present.
     spinlock_lock, spinlock_unlock,
+    local_irq_save, local_irq_restore,
 )
 from sys.src.port9.port.chan import (
     MountEntry, Pgrp, MNT_CAP,
@@ -155,7 +156,7 @@ from kernel.printk.printk import printk0
 # the 8x16 text/glyphs rasterizer (same font the console uses).
 from drivers.video.console.fb_text import (
     fb_get_initialized, fb_get_width, fb_get_height,
-    fb_present_rgba_row, fb_console_suspend,
+    fb_present_rgba_row, fb_present_rgba_row_keyed, fb_console_suspend,
 )
 extern def fb_font_glyph_addr() -> uint64
 
@@ -408,9 +409,25 @@ def wsys_free_wid(wid: int32) -> int32:
         return -1
     if wsys_slot_in_use[u] == 0:
         return -1
+    # FLICKER FIX: with the once-only backdrop, a closed window must have
+    # its on-screen footprint recomposed from the scene sources (backdrop
+    # + windows that were below it), else its pixels linger. Capture the
+    # extent BEFORE clearing the slot, recompose AFTER.
+    cvx: int64 = wsys_win_x[u]
+    cvy: int64 = wsys_win_y[u]
+    cvw: int64 = _wsys_win_def_w(u)
+    cvh: int64 = _wsys_win_def_h(u)
     wsys_slot_in_use[u] = 0
     wsys_slot_pid[u] = 0
     _wsys_reset_rings(wid)
+    if wsys_root_active != 0 and fb_get_initialized() != 0:
+        fl_fw: uint64 = local_irq_save()
+        spinlock_lock(&wsys_present_lock)
+        _wsys_recompose_rect(cvx, cvy - WSYS_TITLEBAR_H,
+                             cvw, cvh + WSYS_TITLEBAR_H)
+        _wsys_present_cursor_locked()
+        spinlock_unlock(&wsys_present_lock)
+        local_irq_restore(fl_fw)
     # Release this wid's lazily-allocated 4 MiB framebuffer blocks back
     # to the buddy allocator so a closed window costs ~0 again.
     _wsys_layer_fb_release(wid)
@@ -2649,12 +2666,29 @@ def devwsys_ctl_write(buf: Ptr[uint8], count: uint64) -> int64:
     # not hostowner — the rl5 flip is the DE claiming its own screen.
     if _wsys_ctl_word_eq(buf, vs0, ve0, "desktop") == 1:
         wsys_root_active = 1
+        # Force the one-shot backdrop paint on this (re)activation; the
+        # first present below clears the screen once, then never again.
+        wsys_bg_painted = 0
         # Suspend the kernel fb-text console so boot/printk text no longer
         # draws over the composited desktop (the scene compositor is the
         # sole fb owner now). fb_putc becomes a no-op; the shadow grid is
         # preserved so a later resume (logout) repaints the console.
         fb_console_suspend()
         _wsys_scene_init_if_needed()
+        # LIVE-MOUSE FIX: seed the cursor sprite at screen-center NOW so it
+        # is ALWAYS visible from the desktop flip — before any mouse event.
+        # On real QEMU (PS/2 relative mouse) the host hides its pointer on
+        # click-grab, so the GUEST must draw its own cursor from boot; if we
+        # waited for the first event the cursor would be invisible until the
+        # user moved, and on a relative device the first delta is tiny.
+        if fb_get_initialized() != 0:
+            csw: int64 = cast[int64](fb_get_width())
+            csh: int64 = cast[int64](fb_get_height())
+            if csw > 0 and csh > 0 and wsys_cursor_inited == 0:
+                wsys_cursor_x = csw / 2
+                wsys_cursor_y = csh / 2
+                wsys_cursor_inited = 1
+            _wsys_cursor_set_scene(wsys_cursor_x, wsys_cursor_y)
         wsys_scene_present()
         return cast[int64](count)
 
@@ -7003,6 +7037,16 @@ def devwsys_winctl_write(wid: int32, buf: Ptr[uint8],
             set_current_errstr("/dev/wsys/ctl: missing h")
             return -1
         if is_geo == 1:
+            # FLICKER FIX: once-only backdrop — a programmatic geometry
+            # move must recompose the OLD footprint so the window leaves no
+            # trail (the following commit re-blits it at the new position).
+            gvx: int64 = wsys_win_x[u]
+            gvy: int64 = wsys_win_y[u]
+            gvw: int64 = _wsys_win_def_w(u)
+            gvh: int64 = _wsys_win_def_h(u)
+            moved: int32 = 0
+            if gvx != gx or gvy != gy:
+                moved = 1
             wsys_win_x[u] = gx
             wsys_win_y[u] = gy
             if gw > 0:
@@ -7010,6 +7054,14 @@ def devwsys_winctl_write(wid: int32, buf: Ptr[uint8],
             if gh > 0:
                 wsys_win_h[u] = gh
             wsys_win_geo_init[u] = 1
+            if moved != 0 and wsys_root_active != 0 \
+                    and fb_get_initialized() != 0:
+                fl_geo: uint64 = local_irq_save()
+                spinlock_lock(&wsys_present_lock)
+                _wsys_recompose_rect(gvx, gvy - WSYS_TITLEBAR_H,
+                                     gvw, gvh + WSYS_TITLEBAR_H)
+                spinlock_unlock(&wsys_present_lock)
+                local_irq_restore(fl_geo)
         else:
             _wsys_mark_dirty(wid, gx, gy, gx + gw, gy + gh)
         return cast[int64](count)
@@ -7554,6 +7606,17 @@ def _wsys_present_titlebar(ox: int64, oy: int64, w: int64):
 WSYS_ROOT_ROW_MAX: uint64 = 4096         # max screen width we back-buffer
 wsys_root_row: Array[16384, uint8]       # 4096 px * 4 = 16 KiB scratch row
 wsys_root_active: int32 = 0
+# FLICKER FIX: the full-screen backdrop clear (_wsys_present_background)
+# must run ONCE — when the desktop first claims the screen — NOT on every
+# commit. A per-commit full clear is a visible whole-screen FLASH every
+# frame (the DE re-commits continuously: clock, focus, animation). After
+# the first paint, each window's own cache blit overwrites its rect and
+# the damage-scoped recompose (cursor save-behind, window move/close)
+# restores the backdrop only where it's exposed. Idle desktop = zero
+# framebuffer churn. Latched 0->1 by the first present after activation;
+# reset to 0 when the desktop is suspended (logout / fb_console_resume) so
+# a re-activation repaints the backdrop once more.
+wsys_bg_painted: int32 = 0
 wsys_root_r: uint8 = 32
 wsys_root_g: uint8 = 80
 wsys_root_b: uint8 = 96
@@ -7588,9 +7651,15 @@ def _wsys_present_background():
 def wsys_scene_present() -> int32:
     # Public present entry: serialize the whole pipeline so a committing
     # client and the /dev/mouse input router never interleave.
+    # IRQ-SAFE: the timer-tick mouse pump (IRQ context) routes through this
+    # same lock. Mask interrupts on the process-context holder so the timer
+    # can't fire on THIS CPU mid-present and self-deadlock spinning on the
+    # lock we already hold. (Cross-CPU contention still spins, as intended.)
+    fl: uint64 = local_irq_save()
     spinlock_lock(&wsys_present_lock)
     n: int32 = _wsys_scene_present_locked()
     spinlock_unlock(&wsys_present_lock)
+    local_irq_restore(fl)
     return n
 
 
@@ -7602,10 +7671,15 @@ def _wsys_scene_present_locked() -> int32:
     if fb_get_initialized() == 0:
         return 0
     _wsys_init_if_needed()
-    # rl5 flip: paint the desktop root backdrop first (only once the DE
-    # has claimed the screen via the `desktop` ctl verb).
-    if wsys_root_active != 0:
+    # rl5 flip: paint the desktop root backdrop ONCE, the first present
+    # after the DE claims the screen via the `desktop` ctl verb. NEVER on
+    # subsequent commits — a per-commit full clear is the whole-screen
+    # FLICKER the user reported. After this one paint, window cache blits
+    # and the damage-scoped recompose keep the backdrop correct without
+    # ever clearing the visible fb on a timer/commit.
+    if wsys_root_active != 0 and wsys_bg_painted == 0:
         _wsys_present_background()
+        wsys_bg_painted = 1
     # Rasterize all live windows that have a scene.
     w: uint64 = 1
     while w < WSYS_SCENE_SLOTS:
@@ -7654,9 +7728,12 @@ def _wsys_scene_present_locked() -> int32:
 def _wsys_present_cursor():
     # Standalone cursor present (cursor move with no window recomposite).
     # Takes the present lock so it can't race a concurrent full present.
+    # IRQ-SAFE (see wsys_scene_present): mask the timer on this CPU.
+    fl: uint64 = local_irq_save()
     spinlock_lock(&wsys_present_lock)
     _wsys_present_cursor_locked()
     spinlock_unlock(&wsys_present_lock)
+    local_irq_restore(fl)
 
 
 def _wsys_recompose_rect(rx: int64, ry: int64, rw: int64, rh: int64):
@@ -7879,9 +7956,14 @@ def _wsys_present_cursor_locked():
     oy: int64 = wsys_cursor_blit_y
     sy: uint64 = 0
     while cast[int64](sy) < ch2:
-        fb_present_rgba_row(sy, cast[uint64](ox),
-                            cast[uint64](oy) + sy, cast[uint64](cw),
-                            cur, cast[uint64](cw))
+        # ALPHA-KEYED: the 32x32 cursor cache is mostly transparent padding
+        # around the small sprite. fb_present_rgba_row is alpha-BLIND and
+        # would paint that padding as an opaque BLACK square (the black box
+        # trailing the cursor). The keyed blit skips alpha==0 pixels so only
+        # the sprite lands and the desktop shows through around it.
+        fb_present_rgba_row_keyed(sy, cast[uint64](ox),
+                                  cast[uint64](oy) + sy, cast[uint64](cw),
+                                  cur, cast[uint64](cw))
         sy = sy + 1
     # Remember this footprint so the NEXT move restores it.
     wsys_cursor_prev_x = ox
@@ -8240,6 +8322,38 @@ def wsys_route_mouse_rel(dx: int32, dy: int32, buttons: uint32, dz: int32):
     _wsys_route_common(sx, sy, buttons, cast[int64](dz))
 
 
+def wsys_cursor_get_x() -> int64:
+    # Test accessor: current tracked cursor X (screen px).
+    return wsys_cursor_x
+
+
+def wsys_cursor_get_y() -> int64:
+    # Test accessor: current tracked cursor Y (screen px).
+    return wsys_cursor_y
+
+
+def wsys_test_force_live(on: int32):
+    # Test-only: force the DE-live latch so a boot self-test can exercise
+    # the timer-tick mouse pump WITHOUT a real fb / rl5 flip. Sets/clears
+    # wsys_root_active; the pump still no-ops if there is no framebuffer,
+    # but the routing math (clamp + accumulate) runs and the cursor state
+    # advances, which is what the relative-pump self-test asserts.
+    wsys_root_active = on
+
+
+def wsys_de_is_live() -> int32:
+    # 1 iff the scene compositor owns the screen (the `desktop` rl5 flip
+    # has happened) AND there is a framebuffer. The timer-tick mouse pump
+    # uses this to decide whether to drain the HW mouse ring and route the
+    # events to the compositor: before the flip, /dev/mouse readers (or the
+    # boot console) own the ring; after it, the in-kernel compositor does.
+    if wsys_root_active == 0:
+        return 0
+    if fb_get_initialized() == 0:
+        return 0
+    return 1
+
+
 def _wsys_route_common(sx: int64, sy: int64, buttons: uint32, dz: int64):
     # Shared hit-test + focus + drag + event-forward logic.
     pressed: int32 = 0
@@ -8266,8 +8380,24 @@ def _wsys_route_common(sx: int64, sy: int64, buttons: uint32, dz: int64):
                 ny = WSYS_TITLEBAR_H
             if nx < 0:
                 nx = 0
+            # FLICKER FIX: the full-screen backdrop clear is now once-only,
+            # so a dragged window would leave a trail at its OLD footprint.
+            # Recompose just the VACATED rect (old window extent + its SSD
+            # titlebar) from the scene sources (backdrop + lower windows)
+            # before moving — damage-scoped, no full-screen clear, no flash.
+            ovx: int64 = wsys_win_x[du]
+            ovy: int64 = wsys_win_y[du]
+            ovw: int64 = _wsys_win_def_w(du)
+            ovh: int64 = _wsys_win_def_h(du)
             wsys_win_x[du] = nx
             wsys_win_y[du] = ny
+            if fb_get_initialized() != 0:
+                fl_drag: uint64 = local_irq_save()
+                spinlock_lock(&wsys_present_lock)
+                _wsys_recompose_rect(ovx, ovy - WSYS_TITLEBAR_H,
+                                     ovw, ovh + WSYS_TITLEBAR_H)
+                spinlock_unlock(&wsys_present_lock)
+                local_irq_restore(fl_drag)
             repaint = 1
         if repaint != 0:
             wsys_scene_present()
