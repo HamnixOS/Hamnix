@@ -479,6 +479,8 @@ from drivers.net.devnet import (
     devnet_clone, devnet_ctl, devnet_conn_unref, devnet_conn_ref,
     devnet_conn_stack_slot, devnet_accept_take,
     devnet_conn_state,
+    devnet_conn_remote_ip, devnet_conn_remote_port,
+    devnet_conn_local_ip, devnet_conn_local_port, devnet_host_ip,
     NET_PROTO_TCP, NET_PROTO_UDP,
     NET_CTL_OK, NET_CTL_EARP, NET_CTL_ETIMEOUT, NET_CTL_EREFUSED,
     NET_CTL_ENOSLOT, NET_CTL_EADDRINUSE, NET_CTL_ECONNECT,
@@ -4363,16 +4365,36 @@ def _u_accept(a0: uint64, a1: uint64, a2: uint64,
     # the in-kernel TCP stack's accept queue and, on success, allocates
     # a FRESH /net connection for the accepted peer; devnet_accept_take
     # hands that connection number over. The listener stays announced.
-    accept_cmd: Ptr[uint8] = "accept"
+    #
+    # O_NONBLOCK semantics: a non-blocking listener writes `accept nb`
+    # (a single poll) and returns -EAGAIN on an empty backlog. A blocking
+    # listener writes `accept` (one bounded NET_BLOCK_JIFFIES window) and,
+    # if that window expires with no peer, RE-ISSUES it — yielding between
+    # windows so the rest of the system runs — until a connection lands.
+    # (devnet_ctl's window already parks this task OFF the runqueue while
+    # it waits, so the loop is not a busy-spin.)
+    nb: int32 = _u_fd_is_nonblock(fd)
     acl: uint64 = 0
-    while accept_cmd[acl] != 0:
-        u_net_ctl_buf[acl] = accept_cmd[acl]
-        acl = acl + 1
+    if nb != 0:
+        acc_nb: Ptr[uint8] = "accept nb"
+        while acc_nb[acl] != 0:
+            u_net_ctl_buf[acl] = acc_nb[acl]
+            acl = acl + 1
+    else:
+        acc_cmd: Ptr[uint8] = "accept"
+        while acc_cmd[acl] != 0:
+            u_net_ctl_buf[acl] = acc_cmd[acl]
+            acl = acl + 1
     acrc: int32 = devnet_ctl(lconn, &u_net_ctl_buf[0], acl)
+    if nb == 0:
+        # Blocking accept: keep re-arming the bounded /net accept window
+        # until a peer completes the handshake.
+        while acrc != NET_CTL_OK:
+            yield_to_others()
+            acrc = devnet_ctl(lconn, &u_net_ctl_buf[0], acl)
     if acrc != NET_CTL_OK:
-        # No connection completed the handshake before the deadline.
-        # -EAGAIN is the would-block answer Linux gives a listening
-        # socket with an empty accept queue.
+        # Non-blocking listener with an empty accept queue — -EAGAIN is
+        # the would-block answer Linux gives here.
         set_current_errstr("accept: no connection pending")
         return ELINUX_AGAIN
     conn_net: int32 = devnet_accept_take(lconn)
@@ -4408,26 +4430,18 @@ def _u_accept(a0: uint64, a1: uint64, a2: uint64,
         vfs_close(nfd)
         set_current_errstr("accept: fd record bind failed")
         return ELINUX_BADF
-    # Fill the peer sockaddr_out if the caller asked for one. We have
-    # no per-connection peer-address table exposed from tcp.ad yet, so
-    # the family is reported faithfully (AF_INET) but ip/port come back
-    # zero — matching the getpeername stub. addrlen is set to 16.
-    if a1 != 0:
-        # #163: assemble the sockaddr_in in kernel space, copy_to_user.
-        pka: Array[16, uint8]
-        pka[0] = cast[uint8](USOCK_AF_INET & 0xFF)
-        pka[1] = cast[uint8]((USOCK_AF_INET >> 8) & 0xFF)
-        i: uint64 = 2
-        while i < 16:
-            pka[i] = 0
-            i = i + 1
-        if copy_to_user(a1, cast[uint64](&pka[0]), 16) != 0:
+    # Fill the peer sockaddr_out if the caller asked for one. The
+    # accepted /net conn now carries the real peer 4-tuple (the accept
+    # ctl handler mirrors the accepted TCB's remote ip/port onto it), so
+    # report the true (ip, port). _u_putaddr_in handles the NULL-addr,
+    # short-buffer truncation, and addrlen=16 write-back per Linux.
+    if a1 != 0 or a2 != 0:
+        pkrc: int64 = _u_putaddr_in(a1, a2,
+                                    devnet_conn_remote_ip(conn_net),
+                                    devnet_conn_remote_port(conn_net))
+        if pkrc != 0:
             vfs_close(nfd)
-            return ELINUX_EFAULT
-    if a2 != 0:
-        if put_user_32(16, a2) != 0:
-            vfs_close(nfd)
-            return ELINUX_EFAULT
+            return pkrc
     printk2("[u_socket] accept: /net listener conn=%d -> conn=%d\n",
             cast[uint64](lconn), cast[uint64](conn_net))
     printk1("[u_socket] accept: new fd=%d\n", cast[uint64](nfd))
@@ -4543,10 +4557,20 @@ def _u_bind(a0: uint64, a1: uint64, a2: uint64,
                       | (cast[uint32](addr[6]) << 8) \
                       | cast[uint32](addr[7])
     if bind_port == 0:
-        # Ephemeral-port bind (port 0) isn't supported — a server has
-        # to name its port so the host side knows where to connect.
-        set_current_errstr("bind: port 0 (ephemeral) not supported")
-        return ELINUX_INVAL
+        # Ephemeral-port bind (port 0): pick the first free port in the
+        # 49152..65535 dynamic/private range (IANA), scanning the
+        # backing-record table via usock_port_in_use. getsockname(2) then
+        # reports the chosen port. (A server that needs a fixed,
+        # host-known port still names it explicitly.)
+        cand: uint32 = 49152
+        while cand <= 65535:
+            if usock_port_in_use(cand) == 0:
+                bind_port = cand
+                break
+            cand = cand + 1
+        if bind_port == 0:
+            set_current_errstr("bind: no ephemeral port free")
+            return ELINUX_ADDRINUSE
     if usock_port_in_use(bind_port) != 0:
         set_current_errstr("bind: address already in use")
         return ELINUX_ADDRINUSE
@@ -4610,36 +4634,113 @@ def _u_listen(a0: uint64, a1: uint64, a2: uint64,
     return 0
 
 
+# --- sockaddr_in copy-out helper -------------------------------------
+# getsockname(2)/getpeername(2)/accept(2) all hand a 16-byte AF_INET
+# sockaddr back to userland with the same truncation rule: Linux copies
+# min(*addrlen, real_len) bytes into `addr`, then writes the UNtruncated
+# length (16) back into *addrlen. `ip`/`port` are host order.
+def _u_putaddr_in(addr_u: uint64, alen_u: uint64,
+                  ip: uint32, port: uint32) -> int64:
+    # Build the 16-byte sockaddr_in in kernel space (#163), then copy out.
+    sa: Array[16, uint8]
+    sa[0] = cast[uint8](USOCK_AF_INET & 0xFF)         # sin_family lo
+    sa[1] = cast[uint8]((USOCK_AF_INET >> 8) & 0xFF)  # sin_family hi
+    sa[2] = cast[uint8]((port >> 8) & 0xFF)           # sin_port  (BE)
+    sa[3] = cast[uint8](port & 0xFF)
+    sa[4] = cast[uint8]((ip >> 24) & 0xFF)            # sin_addr  (BE)
+    sa[5] = cast[uint8]((ip >> 16) & 0xFF)
+    sa[6] = cast[uint8]((ip >> 8) & 0xFF)
+    sa[7] = cast[uint8](ip & 0xFF)
+    i: uint64 = 8
+    while i < 16:
+        sa[i] = 0                                     # sin_zero
+        i = i + 1
+    # `addr` may be NULL (Linux permits it for accept; for get*name a
+    # NULL addr with a non-NULL addrlen still updates addrlen).
+    if addr_u != 0:
+        want: uint64 = 16
+        if alen_u != 0:
+            ulen: uint32 = 0
+            if get_user_32(alen_u, &ulen) != 0:
+                return ELINUX_EFAULT
+            if cast[uint64](ulen) < want:
+                want = cast[uint64](ulen)
+        if want != 0:
+            if copy_to_user(addr_u, cast[uint64](&sa[0]), want) != 0:
+                return ELINUX_EFAULT
+    if alen_u != 0:
+        # Always report the FULL length (16) so the caller can detect
+        # truncation — matches Linux semantics.
+        if put_user_32(16, alen_u) != 0:
+            return ELINUX_EFAULT
+    return 0
+
+
 def _u_getsockname(a0: uint64, a1: uint64, a2: uint64,
                    a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
-    # Zero out the returned addrlen so callers see "empty address". The
-    # addr buffer is left as-is — Linux only writes min(len, *addrlen)
-    # bytes, and our length is zero.
+    # Fill the LOCAL (ip, port) from the socket's bound/connected /net
+    # connection state. For a connected or accepted socket the local
+    # port is the /net conn's recorded local port and the local IP is the
+    # host IP; for a bound-but-not-yet-listening socket the port comes
+    # off the backing record's bound-port field.
     # AF_NETLINK: report the bound sockaddr_nl (nl_pid/nl_groups) so
     # libmnl's mnl_socket_get_portid sees the auto-assigned port id.
-    gsn_nlep: int32 = _u_netlink_ep(cast[int32](a0))
+    fd: int32 = cast[int32](a0)
+    gsn_nlep: int32 = _u_netlink_ep(fd)
     if gsn_nlep >= 0:
         return nl_getsockname(gsn_nlep, a1, a2)
-    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+    if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
-    if a2 != 0:
-        if put_user_32(0, a2) != 0:                     # #163
-            return ELINUX_EFAULT
-    return 0
+    rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
+    if usock_valid(rec) == 0:
+        return ELINUX_BADF
+    lip:   uint32 = 0
+    lport: uint32 = 0
+    nconn: int32 = usock_get_netconn(rec)
+    if nconn >= 0:
+        # Listener / connected / accepted socket — the /net conn carries
+        # the live local addr+port (the accept ctl handler + the connect
+        # handler both populate netc_lport).
+        lip   = devnet_conn_local_ip(nconn)
+        lport = devnet_conn_local_port(nconn)
+    if lport == 0:
+        # No /net conn yet (bound but not listen(2)'d), or a UDP socket:
+        # fall back to the record's bound port. Local IP is the host IP.
+        lport = usock_get_bound_port(rec)
+        if lport != 0:
+            lip = devnet_host_ip()
+    return _u_putaddr_in(a1, a2, lip, lport)
 
 
 def _u_getpeername(a0: uint64, a1: uint64, a2: uint64,
                    a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
-    # No peer ever attaches. Same shape as getsockname — zero out
-    # addrlen so callers don't read uninitialised bytes.
-    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+    # Fill the REMOTE (ip, port) of the connected peer. Only a CONNECTED
+    # socket (active connect, accepted server side, or a connected UDP
+    # socket) has a peer; anything else is -ENOTCONN, matching Linux.
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
-    if a2 != 0:
-        if put_user_32(0, a2) != 0:                     # #163
-            return ELINUX_EFAULT
-    return 0
+    rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
+    if usock_valid(rec) == 0:
+        return ELINUX_BADF
+    if usock_get_state(rec) != USOCK_CONNECTED:
+        set_current_errstr("getpeername: socket not connected")
+        return ELINUX_NOTCONN
+    rip:   uint32 = 0
+    rport: uint32 = 0
+    nconn: int32 = usock_get_netconn(rec)
+    if nconn >= 0:
+        # TCP: the /net conn records the peer 4-tuple (connect handler +
+        # accept ctl handler both fill netc_rip/netc_rport).
+        rip   = devnet_conn_remote_ip(nconn)
+        rport = devnet_conn_remote_port(nconn)
+    else:
+        # Connected UDP socket — the fixed peer lives on the record.
+        rip   = usock_get_peer_addr(rec)
+        rport = usock_get_peer_port(rec)
+    return _u_putaddr_in(a1, a2, rip, rport)
 
 
 def _u_setsockopt(a0: uint64, a1: uint64, a2: uint64,
