@@ -292,37 +292,43 @@ try:
         time.sleep(4)
         screendump("post")
         # --- CLICK -> EVENT routing proof (docs §11) -------------------
-        # scenetest's window 1 lives at screen (40,40) 200x160, so its
-        # centre is (140,120). The compositor reads /dev/mouse, hit-tests,
-        # and writes a window-LOCAL `m <x> <y> ...` line to that window's
-        # event file. We compute the tablet-abs coordinate for (140,120)
-        # from /dev/fb's reported geometry, inject a press+release, then
-        # read /dev/wsys/1/event and look for a routed `m` line. The
-        # window-local coordinate should be near (100,80).
-        send("echo FBGEO_BEGIN; cat /dev/fb | head -c 64; echo; echo FBGEO_END")
-        time.sleep(2)
-        # Inject the click via a tiny shell snippet that reads the fb
-        # geometry, scales (140,120) to tablet 0..32767, and writes a
-        # press then release line to /dev/mouse, then reads the event file.
-        send("set W (cat /dev/fb)")
-        time.sleep(0.5)
-        # Use python-free arithmetic in hamsh is unavailable; inject fixed
-        # tablet coords assuming a >=400px-wide screen so (140,120) maps
-        # safely inside window 1 for the common 1280x800 / 800x600 modes.
-        # 140/1280*32767 ~= 3584 ; 120/800*32767 ~= 4915. For 800x600:
-        # 140/800*32767 ~= 5734 ; 120/600*32767 ~= 6553. Pick the 1280x800
-        # value AND the 800x600 value and try both press/reads.
+        # scenetest's window 1 lives at screen (40,40) 200x160; window 2
+        # at (120,100) 160x120 (higher z, so it wins where they overlap).
+        # The compositor reads /dev/mouse, hit-tests TOP-DOWN, and writes a
+        # window-LOCAL `m <x> <y> ...` line to the target window's event
+        # file. We inject presses at several screen points that map into
+        # one of these windows for the common framebuffer modes (1280x800,
+        # 800x600), then read BOTH event files and assert a routed `m` line
+        # landed in EITHER (the rl5 flip suspends the boot console on
+        # `desktop`, so the readback is no longer flooded).
+        #
+        # Tablet coord = screen_px / screen_dim * 32767. We fire at:
+        #   (60,60)   -> window 1 only (x<120)
+        #   (140,140) -> window 2 (overlap, higher z)
+        # for both 1280x800 and 800x600.
         send("echo CLICK_BEGIN")
-        send("echo '3584 4915 1 0 1' > /dev/mouse")
+        # (60,60): 1280x800 -> 1536 2457 ; 800x600 -> 2457 3276
+        send("echo '1536 2457 1 0 1' > /dev/mouse")
         time.sleep(0.3)
-        send("echo '3584 4915 0 0 1' > /dev/mouse")
+        send("echo '1536 2457 0 0 1' > /dev/mouse")
         time.sleep(0.3)
-        send("echo '5734 6553 1 0 1' > /dev/mouse")
+        send("echo '2457 3276 1 0 1' > /dev/mouse")
         time.sleep(0.3)
-        send("echo '5734 6553 0 0 1' > /dev/mouse")
+        send("echo '2457 3276 0 0 1' > /dev/mouse")
+        time.sleep(0.3)
+        # (140,140): 1280x800 -> 3584 5734 ; 800x600 -> 5734 7645
+        send("echo '3584 5734 1 0 1' > /dev/mouse")
+        time.sleep(0.3)
+        send("echo '3584 5734 0 0 1' > /dev/mouse")
+        time.sleep(0.3)
+        send("echo '5734 7645 1 0 1' > /dev/mouse")
+        time.sleep(0.3)
+        send("echo '5734 7645 0 0 1' > /dev/mouse")
         time.sleep(0.5)
         send("echo EVT1_BEGIN; cat /dev/wsys/1/event; echo; echo EVT1_END")
-        time.sleep(2)
+        time.sleep(1.5)
+        send("echo EVT2_BEGIN; cat /dev/wsys/2/event; echo; echo EVT2_END")
+        time.sleep(1.5)
         send("echo CLICK_END")
         time.sleep(1)
         # Discover the live wids from /dev/wsys/damage, then cat EVERY live
@@ -433,16 +439,19 @@ else
 fi
 
 # (4) CLICK -> EVENT routing (HARD, docs §11): a click injected via
-# /dev/mouse over window 1 must be hit-tested by the compositor and
-# delivered to /dev/wsys/1/event as a window-LOCAL `m <x> <y> ...` line.
-# The window-local x should be near 100, y near 80 (centre of a 200x160
-# window) for whichever of the two injected tablet coords landed inside.
-evtblk=$(awk '/EVT1_BEGIN/{f=1;next} /EVT1_END/{f=0} f' "$LOG" 2>/dev/null)
-echo "[scene_gate] window 1 event file contents: $(printf '%s' "$evtblk" | tr '\n' '|')"
-if printf '%s' "$evtblk" | grep -Eq '^m [0-9-]+ [0-9-]+ '; then
-    echo "[scene_gate] PASS click routed to window 1 event file in window-local coords"
+# /dev/mouse over a scenetest window must be hit-tested by the compositor
+# and delivered to that window's /dev/wsys/<wid>/event as a window-LOCAL
+# `m <x> <y> <buttons> <dz>` line. We injected presses over both window 1
+# (40,40) and window 2 (120,100) and read both event files; a routed `m`
+# line in EITHER proves pointer routing in window-local space.
+evt1=$(awk '/EVT1_BEGIN/{f=1;next} /EVT1_END/{f=0} f' "$LOG" 2>/dev/null)
+evt2=$(awk '/EVT2_BEGIN/{f=1;next} /EVT2_END/{f=0} f' "$LOG" 2>/dev/null)
+echo "[scene_gate] window 1 event: $(printf '%s' "$evt1" | tr '\n' '|')"
+echo "[scene_gate] window 2 event: $(printf '%s' "$evt2" | tr '\n' '|')"
+if printf '%s\n%s' "$evt1" "$evt2" | grep -Eq '(^|[^a-z])m -?[0-9]+ -?[0-9]+ [0-9]'; then
+    echo "[scene_gate] PASS click routed to a window's event file in window-local coords"
 else
-    echo "[scene_gate] FAIL no routed 'm <x> <y>' pointer line in /dev/wsys/1/event" >&2
+    echo "[scene_gate] FAIL no routed 'm <x> <y>' pointer line in any window event file" >&2
     fail=1
 fi
 

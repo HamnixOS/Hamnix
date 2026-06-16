@@ -119,6 +119,11 @@ from kernel.sched.core import (
     # task's pgrp (task_pgrp) so the dump shows the WINDOW'S namespace,
     # not the reader's.
     task_uid_at, task_pgrp,
+    # Scene compositor present serialization: present is now driven from
+    # TWO contexts (a committing client AND the /dev/mouse input router),
+    # which on SMP can race over the shared rasterizer scratch + scratch
+    # row buffer. A spinlock serializes the whole present.
+    spinlock_lock, spinlock_unlock,
 )
 from sys.src.port9.port.chan import (
     MountEntry, Pgrp, MNT_CAP,
@@ -150,7 +155,7 @@ from kernel.printk.printk import printk0
 # the 8x16 text/glyphs rasterizer (same font the console uses).
 from drivers.video.console.fb_text import (
     fb_get_initialized, fb_get_width, fb_get_height,
-    fb_present_rgba_row,
+    fb_present_rgba_row, fb_console_suspend,
 )
 extern def fb_font_glyph_addr() -> uint64
 
@@ -2636,6 +2641,23 @@ def devwsys_ctl_write(buf: Ptr[uint8], count: uint64) -> int64:
         wsys_last_alloc_wid = nw
         return cast[int64](count)
 
+    # `desktop` — the rl5 flip: latch the scene compositor as the SOLE
+    # owner of /dev/fb (docs/de_scene_file_arch.md §16 step 5). The DE
+    # startup hook writes this once; thereafter every full present paints
+    # the desktop root backdrop first. Parsed BEFORE the hostowner gate
+    # (like newwindow) because the DE now runs as the default NOBODY uid,
+    # not hostowner — the rl5 flip is the DE claiming its own screen.
+    if _wsys_ctl_word_eq(buf, vs0, ve0, "desktop") == 1:
+        wsys_root_active = 1
+        # Suspend the kernel fb-text console so boot/printk text no longer
+        # draws over the composited desktop (the scene compositor is the
+        # sole fb owner now). fb_putc becomes a no-op; the shadow grid is
+        # preserved so a later resume (logout) repaints the console.
+        fb_console_suspend()
+        _wsys_scene_init_if_needed()
+        wsys_scene_present()
+        return cast[int64](count)
+
     if current_task_is_hostowner() == 0:
         set_current_errstr("/dev/wsys/ctl: permission denied (not hostowner)")
         return -1
@@ -2646,17 +2668,6 @@ def devwsys_ctl_write(buf: Ptr[uint8], count: uint64) -> int64:
     if vs == ve:
         set_current_errstr("/dev/wsys/ctl: missing verb")
         return -1
-
-    # `desktop` — the rl5 flip: latch the scene compositor as the SOLE
-    # owner of /dev/fb (docs/de_scene_file_arch.md §16 step 5). The DE
-    # startup hook writes this once; thereafter every full present paints
-    # the desktop root backdrop first. A fresh present is fired so the
-    # backdrop lands immediately even with no windows yet.
-    if _wsys_ctl_word_eq(buf, vs, ve, "desktop") == 1:
-        wsys_root_active = 1
-        _wsys_scene_init_if_needed()
-        wsys_scene_present()
-        return cast[int64](count)
 
     # `wallpaper <path>` — record the requested PPM path for the
     # compositor's image-backdrop loader. Stored in wsys_wallpaper_path;
@@ -7546,6 +7557,12 @@ wsys_root_active: int32 = 0
 wsys_root_r: uint8 = 32
 wsys_root_g: uint8 = 80
 wsys_root_b: uint8 = 96
+# Present serialization (SMP): the present pipeline (rasterizer scratch +
+# the shared scratch row + the cursor cache) is single-threaded by design,
+# but is now invoked from BOTH a committing client AND the /dev/mouse input
+# router. Take this lock around any full present / cursor present so the
+# two contexts never interleave and corrupt the shared scratch.
+wsys_present_lock: uint32 = 0
 
 
 def _wsys_present_background():
@@ -7569,9 +7586,19 @@ def _wsys_present_background():
 
 
 def wsys_scene_present() -> int32:
+    # Public present entry: serialize the whole pipeline so a committing
+    # client and the /dev/mouse input router never interleave.
+    spinlock_lock(&wsys_present_lock)
+    n: int32 = _wsys_scene_present_locked()
+    spinlock_unlock(&wsys_present_lock)
+    return n
+
+
+def _wsys_scene_present_locked() -> int32:
     # Rasterize every live window with a non-empty scene, then z-blit all
     # caches bottom-to-top, then the cursor. Returns the number of
     # windows presented. Safe to call when no fb (no-op, returns 0).
+    # CALLER HOLDS wsys_present_lock.
     if fb_get_initialized() == 0:
         return 0
     _wsys_init_if_needed()
@@ -7608,7 +7635,7 @@ def wsys_scene_present() -> int32:
         w2 = w2 + 1
     if have == 0:
         # still composite cursor
-        _wsys_present_cursor()
+        _wsys_present_cursor_locked()
         return 0
     zc: int64 = zmin
     while zc <= zmax:
@@ -7620,13 +7647,22 @@ def wsys_scene_present() -> int32:
                 presented = presented + 1
             w3 = w3 + 1
         zc = zc + 1
-    _wsys_present_cursor()
+    _wsys_present_cursor_locked()
     return presented
 
 
 def _wsys_present_cursor():
+    # Standalone cursor present (cursor move with no window recomposite).
+    # Takes the present lock so it can't race a concurrent full present.
+    spinlock_lock(&wsys_present_lock)
+    _wsys_present_cursor_locked()
+    spinlock_unlock(&wsys_present_lock)
+
+
+def _wsys_present_cursor_locked():
     # Composite the cursor scene (slot 0) LAST, always on top, at its own
     # window-local coords (the cursor scene's fill carries the position).
+    # CALLER HOLDS wsys_present_lock.
     if wsys_scene_len[0] == 0:
         return
     # Rasterize cursor scene into slot-0's cache (reuse the layer-fb
@@ -8062,6 +8098,12 @@ def _wsys_route_common(sx: int64, sy: int64, buttons: uint32, dz: int64):
             _wsys_evt_emit_pointer(target, lx2, ly2, buttons, dz)
             wq_wake_one(&wsys_ptr_wq[u4])
 
+    # Present. A press/drag/raise (repaint=1) does a full present
+    # (background + windows + cursor). Plain motion does the lighter
+    # cursor-only blit, decoupled from window recomposition (the §9 FPS
+    # invariant). The cursor's save-behind restore (so motion leaves no
+    # trail without a full recomposite) is a later refinement; for now a
+    # subsequent window commit / press repaints over any cursor trail.
     if repaint != 0:
         wsys_scene_present()
     else:
