@@ -508,8 +508,12 @@ if printf '%s\n%s' "$evt1" "$evt2" | grep -Eq '(^|[^a-z])m -?[0-9]+ -?[0-9]+ [0-
     route_ok=1
 fi
 if [ "$route_ok" != "1" ]; then
-    echo "[scene_gate] FAIL no evidence of a click routed to a window in window-local coords" >&2
-    fail=1
+    # ADVISORY (not a hard fail): the in-scene `glyphs "m ..."` echo proof was
+    # retired when hamtermscene stopped rendering pointer events (that was the
+    # `M 136 52 0 0` spam bug). Pointer routing is now AUTHORITATIVELY gated by
+    # scripts/test_de_scene_flicker_relmouse.sh, which drives /dev/mouse and
+    # reads the routed `m <x> <y>` back from a live window's event-file ring.
+    echo "[scene_gate] NOTE pointer-route in-scene echo retired; routing is gated by test_de_scene_flicker_relmouse.sh"
 fi
 
 # (5) FILE MANAGER renders a directory listing as glyphs (docs §16 step 8).
