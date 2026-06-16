@@ -368,6 +368,18 @@ pdpt_high:
     .align 16
     .globl boot_stack_bottom
 boot_stack_bottom:
-    .skip 16384                 /* 16 KiB boot stack */
+    /* 64 KiB boot stack. start_kernel() and the entire boot-time init
+     * chain (head_64.S `call start_kernel`, no stack switch) run on THIS
+     * stack until the scheduler hands control to a task on its own
+     * KSTACK_SIZE (64 KiB) kstack. The boot-time FS self-tests reach a
+     * deep nesting — start_kernel -> ext4_rename_smoke_test ->
+     * ext4_rmdir_smoke_test -> ext4_rename -> ext4_resolve_dir ->
+     * _resolve_with_symlinks -> ext4_dir_lookup -> ... — where each ext4
+     * frame carries one or more 256-byte on-stack inode/dirblock buffers.
+     * 16 KiB overflowed there (the cross-dir directory rename in the
+     * rmdir smoke test was the deepest path and faulted nondeterministi-
+     * cally). Match the per-task KSTACK_SIZE so the boot path has the same
+     * headroom the scheduler gives every other thread. */
+    .skip 65536                 /* 64 KiB boot stack */
     .globl boot_stack_top
 boot_stack_top:
