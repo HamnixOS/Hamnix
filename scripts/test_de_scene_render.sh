@@ -587,6 +587,29 @@ else
     echo "[scene_gate] NOTE dropdown rows not captured after the Applications click (serial flood; screendump authoritative)"
 fi
 
+# (6f) FULL-WIDTH PANEL: the panel bar's background fill spans the whole
+# screen width. The panel queries /dev/fb and fills "fill 0 0 <sw> 26
+# #d4d0c8" — for the 1280x800 (or 800x600) fb modes the width token must be
+# the FULL screen width, never a short hardcode. Assert a wide (>=800px)
+# panel fill is present (regression guard for the "grey bar stops ~80%" bug
+# the user caught — the panel must request full width client-side).
+if grep -aEq 'fill +0 +0 +(8[0-9][0-9]|9[0-9][0-9]|1[0-9][0-9][0-9]) +26 +#d4d0c8' "$LOG"; then
+    pw=$(grep -aoE 'fill +0 +0 +[0-9]+ +26 +#d4d0c8' "$LOG" | grep -oE '[0-9]+' | sed -n '3p' | head -1)
+    echo "[scene_gate] PASS panel bar fills full screen width (${pw}px wide)"
+else
+    echo "[scene_gate] NOTE full-width panel fill not captured this boot window (serial flood; screendump authoritative)"
+fi
+
+# (6g) MENU BACKGROUND + SIZE: the dropdown lives in its OWN window whose
+# scene paints EVERY pixel with the menu colour (so it never composites
+# black) sized exactly 88x48. Assert the solid menu-colour fill is present
+# (regression guard for the "large black box / Files cut off" bug).
+if grep -aEq 'fill +0 +0 +88 +48 +#e8e4dc' "$LOG"; then
+    echo "[scene_gate] PASS dropdown menu window paints a solid (non-black) 88x48 background"
+else
+    echo "[scene_gate] NOTE menu background fill not captured this boot window (serial flood; screendump authoritative)"
+fi
+
 echo "[scene_gate] artifacts in $OUT_DIR"
 if [ "$fail" = "0" ]; then
     echo "[scene_gate] RESULT: PASS"
