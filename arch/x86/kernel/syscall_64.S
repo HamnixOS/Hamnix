@@ -102,6 +102,32 @@ syscall_entry:
     pushq   %r11                      /* user RFLAGS */
     pushq   %rcx                      /* user RIP    */
 
+    /* fork(2) register inheritance: a forked child is a brand-new task
+     * whose initial kstack frame zeroes the 6 callee-saved registers
+     * (see _build_initial_kstack). For the child to resume the C/asm
+     * caller correctly it must inherit the PARENT's callee-saved set.
+     * %r12/%r13 are already parked on the USER stack above (and read by
+     * do_clone from kstack_top-8/-16). The remaining four — %rbx %rbp
+     * %r14 %r15 — are otherwise never spilled by the kernel (the SysV C
+     * ABI just preserves them in-register across do_syscall for the
+     * returning parent), so do_clone has no copy to give the child.
+     * Spill them here, at the user's values, into fixed kernel-stack
+     * slots BELOW the rcx/r11 pair so the kstack_top-8/-16/-24 offsets
+     * do_clone already reads stay valid. Layout (from kstack_top):
+     *   -8  user rsp (with r12 push)   [parked above]
+     *   -16 user RFLAGS (r11)
+     *   -24 user RIP (rcx)
+     *   -32 user %rbx     <-- new
+     *   -40 user %rbp     <-- new
+     *   -48 user %r14     <-- new
+     *   -56 user %r15     <-- new
+     * Popped symmetrically on the sysret path so the parent's own
+     * registers are unperturbed. */
+    pushq   %rbx                      /* user %rbx  (callee-saved) */
+    pushq   %rbp                      /* user %rbp  (callee-saved) */
+    pushq   %r14                      /* user %r14  (callee-saved) */
+    pushq   %r15                      /* user %r15  (callee-saved) */
+
     /* Save all 6 user-arg regs + nr. Linux's x86_64 syscall ABI says
      * %rdi/%rsi/%rdx/%r10/%r8/%r9 are preserved across SYSCALL.
      * Musl's __lockfile spin loop holds &f->lock in %rdi across
@@ -168,6 +194,17 @@ syscall_entry:
     popq    %r10
     popq    %r8
     popq    %r9
+
+    /* Pop the four callee-saved registers spilled at entry (see the
+     * fork-inheritance comment above). On the normal return-to-parent
+     * path these restore the user's own %rbx/%rbp/%r14/%r15 unchanged;
+     * the spill exists purely so do_clone can copy them into a forked
+     * child's fresh frame. Pop order is the reverse of the push order
+     * (r15 was pushed last / lowest, so it pops first). */
+    popq    %r15                      /* user %r15  (callee-saved) */
+    popq    %r14                      /* user %r14  (callee-saved) */
+    popq    %rbp                      /* user %rbp  (callee-saved) */
+    popq    %rbx                      /* user %rbx  (callee-saved) */
 
     /* Restore syscall-control regs and user RSP. We pop the
      * (per-task) stored user RSP straight into %rsp; the next pop
