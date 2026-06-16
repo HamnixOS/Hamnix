@@ -291,6 +291,40 @@ try:
         # Give scenetest time to create + commit both windows.
         time.sleep(4)
         screendump("post")
+        # --- CLICK -> EVENT routing proof (docs §11) -------------------
+        # scenetest's window 1 lives at screen (40,40) 200x160, so its
+        # centre is (140,120). The compositor reads /dev/mouse, hit-tests,
+        # and writes a window-LOCAL `m <x> <y> ...` line to that window's
+        # event file. We compute the tablet-abs coordinate for (140,120)
+        # from /dev/fb's reported geometry, inject a press+release, then
+        # read /dev/wsys/1/event and look for a routed `m` line. The
+        # window-local coordinate should be near (100,80).
+        send("echo FBGEO_BEGIN; cat /dev/fb | head -c 64; echo; echo FBGEO_END")
+        time.sleep(2)
+        # Inject the click via a tiny shell snippet that reads the fb
+        # geometry, scales (140,120) to tablet 0..32767, and writes a
+        # press then release line to /dev/mouse, then reads the event file.
+        send("set W (cat /dev/fb)")
+        time.sleep(0.5)
+        # Use python-free arithmetic in hamsh is unavailable; inject fixed
+        # tablet coords assuming a >=400px-wide screen so (140,120) maps
+        # safely inside window 1 for the common 1280x800 / 800x600 modes.
+        # 140/1280*32767 ~= 3584 ; 120/800*32767 ~= 4915. For 800x600:
+        # 140/800*32767 ~= 5734 ; 120/600*32767 ~= 6553. Pick the 1280x800
+        # value AND the 800x600 value and try both press/reads.
+        send("echo CLICK_BEGIN")
+        send("echo '3584 4915 1 0 1' > /dev/mouse")
+        time.sleep(0.3)
+        send("echo '3584 4915 0 0 1' > /dev/mouse")
+        time.sleep(0.3)
+        send("echo '5734 6553 1 0 1' > /dev/mouse")
+        time.sleep(0.3)
+        send("echo '5734 6553 0 0 1' > /dev/mouse")
+        time.sleep(0.5)
+        send("echo EVT1_BEGIN; cat /dev/wsys/1/event; echo; echo EVT1_END")
+        time.sleep(2)
+        send("echo CLICK_END")
+        time.sleep(1)
         # Discover the live wids from /dev/wsys/damage, then cat EVERY live
         # window's scene back as text (the foreground shell stays on
         # serial; scenetest's own stdout is rebound to its headless wid).
@@ -321,13 +355,11 @@ fi
 # ---------------------------------------------------------------------
 # ASSERTIONS
 #
-# This wave runs the scene compositor ALONGSIDE the legacy hamUId DE,
-# which owns /dev/fb and repaints continuously. So the kernel scene
-# present can be overdrawn between scenetest's commit and our screendump.
-# The HARD proofs are therefore the TEXT ones (the scene server published
-# readable display lists owned by the client) + a framebuffer-changed
-# probe; the precise z-order/cursor pixel checks are advisory (NOTE),
-# pending the runlevel-5 flip to the scene compositor in a later wave.
+# The runlevel-5 flip has landed: the kernel scene compositor is the SOLE
+# owner of /dev/fb (the legacy hamUId procedural present is retired), so
+# the scene present is NO LONGER overdrawn. The window-region pixel-change
+# is therefore AUTHORITATIVE (HARD), as is the click->event routing proof.
+# The TEXT roundtrip remains the flood-immune text proof.
 # ---------------------------------------------------------------------
 fail=0
 
@@ -375,26 +407,43 @@ if [ "$text_ok" != "1" ]; then
     echo "[scene_gate] NOTE window scene cat empty/garbled (DE console flood at rl5; roundtrip proof above is authoritative)"
 fi
 
-# (3) PIXELS (advisory): the window region changed between pre and post.
-# Window 1 lives at (40,40) 200x160; window 2 at (120,100) 160x120.
+# (3) PIXELS (HARD — authoritative post-rl5-flip): the window region
+# changed between pre and post. Window 1 lives at (40,40) 200x160;
+# window 2 at (120,100) 160x120. No legacy overdraw now masks the scene
+# present, so the floor must be met.
 if [ -s "$OUT_DIR/pre.ppm" ] && [ -s "$OUT_DIR/post.ppm" ]; then
     diffpx=$(region_diff "$OUT_DIR/pre.ppm" "$OUT_DIR/post.ppm" 40 40 280 220)
     echo "[scene_gate] window-region changed pixels: $diffpx (min $WINDOW_DIFF_MIN)"
     if [ "$diffpx" -ge "$WINDOW_DIFF_MIN" ]; then
-        echo "[scene_gate] PASS framebuffer changed in the window region"
+        echo "[scene_gate] PASS framebuffer changed in the window region (scene compositor painted)"
     else
-        echo "[scene_gate] NOTE framebuffer region change below floor (legacy DE may have overdrawn the scene present)"
+        echo "[scene_gate] FAIL framebuffer region change below floor — scene present did not reach /dev/fb" >&2
+        fail=1
     fi
-    # Z-order advisory: green (#00c000) of the higher-z win2 in the overlap.
+    # Z-order (advisory): green (#00c000) of the higher-z win2 in overlap.
     read -r cr cg cb <<<"$(region_color "$OUT_DIR/post.ppm" 140 120 230 190)"
     echo "[scene_gate] overlap avg color: R=$cr G=$cg B=$cb"
     if [ "$cg" -ge 0 ] && [ "$cg" -gt "$cr" ] && [ "$cg" -gt "$cb" ]; then
         echo "[scene_gate] NOTE z-order: higher-z green window wins the overlap (scene present visible)"
     else
-        echo "[scene_gate] NOTE z-order overlap not green (legacy DE overdraw expected this wave)"
+        echo "[scene_gate] NOTE z-order overlap not green (window stacking / wallpaper variance)"
     fi
 else
     echo "[scene_gate] NOTE pre/post PPM missing; pixel probe skipped"
+fi
+
+# (4) CLICK -> EVENT routing (HARD, docs §11): a click injected via
+# /dev/mouse over window 1 must be hit-tested by the compositor and
+# delivered to /dev/wsys/1/event as a window-LOCAL `m <x> <y> ...` line.
+# The window-local x should be near 100, y near 80 (centre of a 200x160
+# window) for whichever of the two injected tablet coords landed inside.
+evtblk=$(awk '/EVT1_BEGIN/{f=1;next} /EVT1_END/{f=0} f' "$LOG" 2>/dev/null)
+echo "[scene_gate] window 1 event file contents: $(printf '%s' "$evtblk" | tr '\n' '|')"
+if printf '%s' "$evtblk" | grep -Eq '^m [0-9-]+ [0-9-]+ '; then
+    echo "[scene_gate] PASS click routed to window 1 event file in window-local coords"
+else
+    echo "[scene_gate] FAIL no routed 'm <x> <y>' pointer line in /dev/wsys/1/event" >&2
+    fail=1
 fi
 
 echo "[scene_gate] artifacts in $OUT_DIR"

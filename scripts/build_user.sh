@@ -261,6 +261,8 @@ build_adder_user losetup              # attach/detach a file as a loop block dev
 build_adder_user sqfs_to_blk          # installer: stream a file from an in-RAM squashfs -> block dev (no media read)
 build_adder_user live_distro_up       # live medium: extract live-distro.ext4 from the in-RAM squashfs -> RAM blockdev, post #distro (#410)
 build_adder_user scenetest            # scene-file DE gate driver: newwindow + scene/ctl + cursor (docs/de_scene_file_arch.md)
+build_adder_user hampanelscene        # scene-file DE top panel (Applications + clock) drawn as a scene display list
+build_adder_user hamtermscene         # scene-file DE terminal: glyphs content + window-local input routing proof
 
 # --- X11 server + client (user/x11/ subdirectory) -------------------
 # The source lives in user/x11/<name>.ad but the ELF goes into
