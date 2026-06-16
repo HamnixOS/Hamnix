@@ -25,6 +25,21 @@
 # but that couples the kernel to the shell's path — the shim keeps the
 # kernel knowing only `/init`.)
 #
+# RESCUE PATH (do NOT die)
+# ------------------------
+# PID 1 must never just exit. If it does, the kernel scheduler has no
+# task to run and the box is a brick with zero diagnosis. Historically
+# this file wrote "FATAL" and `return 1` if `/bin/hamsh` was missing or
+# corrupt — one bad file bricked an install. Now, if the primary shell
+# cannot be exec'd, init walks a list of fallback shell paths, and if
+# every one fails it enters a tiny self-contained RESCUE LOOP that
+# reads /dev/cons (fd 0, pre-opened by the kernel) and supports a
+# minimal built-in set — `ls`, `cat`, `echo`, and exec of an absolute
+# path — so a human at the serial console can ALWAYS get a prompt,
+# inspect why boot failed, and re-launch a shell by hand. The rescue
+# loop deliberately uses ONLY raw syscalls (open/read/write/close/
+# execve) so it works precisely when the normal userland is broken.
+#
 # Build:
 #   python3 -m compiler.adder compile --target=x86_64-adder-user \
 #       user/init.ad -o build/user/init.elf
@@ -32,6 +47,9 @@
 # scripts/build_initramfs.py installs init.elf at /init.
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
 extern def sys_execve(path: Ptr[char], argv: Ptr[uint64]) -> int32
 extern def sys_exit(code: uint64)
 
@@ -47,11 +65,236 @@ def write_str(fd: int32, s: Ptr[uint8]):
     sys_write(fd, s, strlen(s))
 
 
+# --- string helpers (self-contained; the rescue path must not depend
+#     on any library the broken userland might also be missing) --------
+
+def streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+    return 0
+
+
 # argv for the hamsh exec. Top-level Array storage (Adder's nested-frame
 # Array rule). Slot 0 = the program path (argv[0] convention); slot 1 =
 # the boot rc script hamsh should source as PID 1; slot 2 = NUL
 # terminator that the kernel ABI's execve expects.
 hamsh_argv: Array[3, uint64]
+
+# argv for a generic single-arg exec of a fallback shell / rescue
+# `exec <path>` builtin. Slot 0 = program path, slot 1 = NUL.
+exec_argv: Array[2, uint64]
+
+# Fallback shell paths, tried in order after the primary /bin/hamsh
+# exec (with its boot rc) fails. These cover a broken /bin mount where
+# the binary is still reachable at an alternate path, plus future
+# alternate shells. Each is exec'd WITHOUT the boot rc (just an
+# interactive shell — the goal at this point is a human prompt, not a
+# full boot). NUL-terminated list.
+fallback_shells: Array[5, uint64]
+
+
+def try_exec_shell(path: Ptr[char]):
+    # Attempt to exec `path` as a bare interactive shell (argv = {path,
+    # NULL}). Returns only if execve FAILED — on success the image is
+    # replaced and we never come back.
+    write_str(1, "[init] trying fallback shell ")
+    write_str(1, cast[Ptr[uint8]](path))
+    write_str(1, "\n")
+    exec_argv[0] = cast[uint64](path)
+    exec_argv[1] = 0
+    sys_execve(path, &exec_argv[0])
+
+
+# --- rescue-shell built-ins -----------------------------------------
+
+RESCUE_BUF: uint64 = 1024
+
+
+def rescue_cat(path: Ptr[char]):
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        write_str(2, "cat: cannot open ")
+        write_str(2, cast[Ptr[uint8]](path))
+        write_str(2, "\n")
+        return
+    buf: Array[256, uint8]
+    while True:
+        n: int64 = sys_read(fd, &buf[0], 256)
+        if n <= 0:
+            break
+        sys_write(1, &buf[0], cast[uint64](n))
+    sys_close(fd)
+
+
+def rescue_ls(path: Ptr[char]):
+    # A directory opened via sys_open reads back as "NAME\n"-packed
+    # text (DEV_DIR_FILE / _dirfile_read), so `ls` is just cat of the
+    # directory fd. Same backing the real /ls binary uses.
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        write_str(2, "ls: cannot open ")
+        write_str(2, cast[Ptr[uint8]](path))
+        write_str(2, "\n")
+        return
+    buf: Array[256, uint8]
+    while True:
+        n: int64 = sys_read(fd, &buf[0], 256)
+        if n <= 0:
+            break
+        sys_write(1, &buf[0], cast[uint64](n))
+    sys_close(fd)
+
+
+# Parsed-token storage for one rescue command line. We split the line
+# in place into at most RESCUE_MAXTOK NUL-terminated tokens and keep
+# pointers to each token's first byte.
+RESCUE_MAXTOK: uint64 = 8
+rescue_line: Array[1024, uint8]
+rescue_tok: Array[8, uint64]
+
+
+def rescue_tokenize(line: Ptr[uint8], linelen: uint64) -> uint64:
+    # In-place whitespace tokenizer. Writes NULs over separators and
+    # records each token's start pointer in rescue_tok[]. Returns the
+    # token count (<= RESCUE_MAXTOK).
+    #
+    # Terminate the line FIRST: the LAST token is only NUL-terminated by
+    # the separator-overwrite loop below if a separator follows it. When
+    # the final token runs to end-of-line (the common case, e.g. the path
+    # in `ls /bin`), nothing writes its terminator — so it would run into
+    # whatever stale bytes the reused rescue_line buffer still holds from
+    # a previous, LONGER command. Planting a NUL at linelen fixes that.
+    # rescue_loop caps pos at RESCUE_BUF-1, so line[linelen] is in bounds.
+    line[linelen] = 0
+    ntok: uint64 = 0
+    i: uint64 = 0
+    while i < linelen and ntok < RESCUE_MAXTOK:
+        # skip leading whitespace
+        while i < linelen and (line[i] == 32 or line[i] == 9):
+            i = i + 1
+        if i >= linelen:
+            break
+        rescue_tok[ntok] = cast[uint64](&line[i])
+        ntok = ntok + 1
+        # advance to end of token
+        while i < linelen and line[i] != 32 and line[i] != 9:
+            i = i + 1
+        if i < linelen:
+            line[i] = 0                               # terminate token
+            i = i + 1
+    return ntok
+
+
+def rescue_run_line(line: Ptr[uint8], linelen: uint64) -> int32:
+    # Execute one rescue command. Returns 1 to request loop exit
+    # (`exit`/`quit`), 0 otherwise.
+    ntok: uint64 = rescue_tokenize(line, linelen)
+    if ntok == 0:
+        return 0
+    cmd: Ptr[uint8] = cast[Ptr[uint8]](rescue_tok[0])
+
+    if streq(cmd, "exit") == 1 or streq(cmd, "quit") == 1:
+        write_str(1, "[rescue] exit requested; PID 1 cannot exit — staying in rescue\n")
+        return 0
+
+    if streq(cmd, "help") == 1:
+        write_str(1, "rescue builtins: ls [dir], cat <file>, echo [args], <abs-path> [args], help\n")
+        return 0
+
+    if streq(cmd, "echo") == 1:
+        k: uint64 = 1
+        while k < ntok:
+            write_str(1, cast[Ptr[uint8]](rescue_tok[k]))
+            if k + 1 < ntok:
+                write_str(1, " ")
+            k = k + 1
+        write_str(1, "\n")
+        return 0
+
+    if streq(cmd, "ls") == 1:
+        if ntok >= 2:
+            rescue_ls(cast[Ptr[char]](rescue_tok[1]))
+        else:
+            rescue_ls(cast[Ptr[char]](cast[uint64](&"/"[0])))
+        return 0
+
+    if streq(cmd, "cat") == 1:
+        if ntok >= 2:
+            rescue_cat(cast[Ptr[char]](rescue_tok[1]))
+        else:
+            write_str(2, "cat: missing operand\n")
+        return 0
+
+    # Exec of an absolute path: the human's escape hatch to re-launch a
+    # shell or any binary once they've found a good one with `ls`. Only
+    # absolute paths (leading '/') are accepted — there is no PATH
+    # search in the rescue loop. argv passes through the command's own
+    # tokens (cmd + its args), NUL-terminated.
+    if cmd[0] == 47:                                  # '/'
+        argv: Array[8, uint64]
+        k: uint64 = 0
+        while k < ntok and k < 7:
+            argv[k] = rescue_tok[k]
+            k = k + 1
+        argv[k] = 0
+        sys_execve(cast[Ptr[char]](rescue_tok[0]), &argv[0])
+        # execve only returns on failure.
+        write_str(2, "[rescue] exec failed: ")
+        write_str(2, cmd)
+        write_str(2, "\n")
+        return 0
+
+    write_str(2, "[rescue] unknown command: ")
+    write_str(2, cmd)
+    write_str(2, " (try 'help')\n")
+    return 0
+
+
+def rescue_loop():
+    # Minimal interactive prompt reading /dev/cons (fd 0, pre-opened by
+    # the kernel's _init_fd_table). NEVER returns — PID 1 must not exit.
+    # Reads are accumulated until a newline, then the line is run.
+    write_str(2, "\n")
+    write_str(2, "========================================================\n")
+    write_str(2, "[init] RESCUE SHELL — the normal boot path FAILED.\n")
+    write_str(2, "[init] Every shell (/bin/hamsh + fallbacks) failed to\n")
+    write_str(2, "[init] exec. This is a minimal built-in prompt so you\n")
+    write_str(2, "[init] can inspect the system and re-launch a shell.\n")
+    write_str(2, "[init] Builtins: ls, cat, echo, help, <abs-path>.\n")
+    write_str(2, "[init] e.g.  ls /   then   /bin/hamsh\n")
+    write_str(2, "========================================================\n")
+    rbuf: Array[256, uint8]
+    pos: uint64 = 0
+    write_str(1, "rescue> ")
+    while True:
+        n: int64 = sys_read(0, &rbuf[0], 256)
+        if n <= 0:
+            # EOF / error on the console read. Do NOT exit — spin back
+            # and retry; on a real serial console a transient 0-read
+            # must not drop PID 1.
+            continue
+        j: uint64 = 0
+        while j < cast[uint64](n):
+            c: uint8 = rbuf[j]
+            j = j + 1
+            if c == 13:                               # swallow CR
+                continue
+            if c == 10:                               # newline → run
+                rescue_run_line(&rescue_line[0], pos)
+                pos = 0
+                write_str(1, "rescue> ")
+            else:
+                if pos < RESCUE_BUF - 1:
+                    rescue_line[pos] = c
+                    pos = pos + 1
+                # else: silently drop overflow bytes (line too long)
 
 
 def main() -> int32:
@@ -69,5 +312,35 @@ def main() -> int32:
     hamsh_argv[2] = 0
     sys_execve("/bin/hamsh", &hamsh_argv[0])
 
-    write_str(2, "[init] FATAL: exec /bin/hamsh failed\n")
-    return 1
+    # --- PRIMARY EXEC FAILED -------------------------------------------
+    # If we reach here, exec of the primary shell with the boot rc
+    # failed (missing/corrupt /bin/hamsh, or /etc/rc.boot unreadable in
+    # a way the kernel rejected at exec time). Do NOT `return 1` — that
+    # exits PID 1 and bricks the box. Walk the fallback shell list, each
+    # as a BARE interactive shell (no boot rc — the goal now is a human
+    # prompt, not a clean boot).
+    write_str(2, "[init] WARNING: exec /bin/hamsh (with boot rc) failed\n")
+    write_str(2, "[init] entering recovery: trying fallback shells...\n")
+
+    fallback_shells[0] = cast[uint64](&"/bin/hamsh"[0])    # retry bare (no rc)
+    fallback_shells[1] = cast[uint64](&"/hamsh"[0])
+    fallback_shells[2] = cast[uint64](&"/bin/rc"[0])
+    fallback_shells[3] = cast[uint64](&"/bin/sh"[0])
+    fallback_shells[4] = 0
+
+    i: uint64 = 0
+    while fallback_shells[i] != 0:
+        try_exec_shell(cast[Ptr[char]](fallback_shells[i]))
+        # only returns on failure
+        i = i + 1
+
+    # --- ALL SHELLS FAILED ---------------------------------------------
+    # Last resort: a self-contained rescue prompt that needs nothing but
+    # the kernel syscall ABI. Never returns.
+    rescue_loop()
+
+    # Unreachable: rescue_loop() never returns. Keep an explicit guard so
+    # PID 1 NEVER falls off the end into `sys_exit`.
+    while True:
+        rescue_loop()
+    return 0
