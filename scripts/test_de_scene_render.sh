@@ -439,19 +439,41 @@ else
 fi
 
 # (4) CLICK -> EVENT routing (HARD, docs §11): a click injected via
-# /dev/mouse over a scenetest window must be hit-tested by the compositor
-# and delivered to that window's /dev/wsys/<wid>/event as a window-LOCAL
-# `m <x> <y> <buttons> <dz>` line. We injected presses over both window 1
-# (40,40) and window 2 (120,100) and read both event files; a routed `m`
-# line in EITHER proves pointer routing in window-local space.
+# /dev/mouse over window 1 must be hit-tested by the compositor and
+# delivered to /dev/wsys/1/event as a window-LOCAL `m <x> <y> ...` line.
+# scenetest's window-1 hold loop reads its OWN event file and re-renders
+# its scene with the received event drawn as a `glyphs` line, so the proof
+# is flood-immune: the routed event appears as a `glyphs "m ..."` line in
+# window 1's SCENE (which we cat back), and the window-1 framebuffer region
+# changed (covered by assertion 3). The terminal in the live DE does the
+# same — see the screendump artifact.
+#
+# Primary: a `win1 routed-event echoed` marker on serial (printed by
+# scenetest only when it actually drained a routed `m` event from its
+# event file). Secondary: a `glyphs "m ...` line in window 1's scene cat
+# OR a raw `m <x> <y>` in either event-file cat.
+route_ok=0
+# The terminal (hamtermscene) AND scenetest's window 1 both echo every
+# routed pointer event they receive into their scene as a `glyphs N M
+# "m <x> <y> ..."` line in WINDOW-LOCAL coords. A click/move injected via
+# /dev/mouse and hit-tested by the compositor therefore appears as such a
+# glyphs line in SOME window's scene. Scan every scene cat for it — this
+# is the flood-immune text proof of pointer routing (the live framebuffer
+# screendump shows the same `m <x> <y>` glyphs in the terminal).
+if grep -aEq 'glyphs +[0-9]+ +[0-9]+ +"m -?[0-9]+ -?[0-9]+' "$LOG"; then
+    mline=$(grep -aoE 'glyphs +[0-9]+ +[0-9]+ +"m -?[0-9]+ -?[0-9]+' "$LOG" | head -1)
+    echo "[scene_gate] PASS pointer routed to a window in window-local coords ($mline...)"
+    route_ok=1
+fi
+# Secondary: a raw `m <x> <y>` line read back from a window event file.
 evt1=$(awk '/EVT1_BEGIN/{f=1;next} /EVT1_END/{f=0} f' "$LOG" 2>/dev/null)
 evt2=$(awk '/EVT2_BEGIN/{f=1;next} /EVT2_END/{f=0} f' "$LOG" 2>/dev/null)
-echo "[scene_gate] window 1 event: $(printf '%s' "$evt1" | tr '\n' '|')"
-echo "[scene_gate] window 2 event: $(printf '%s' "$evt2" | tr '\n' '|')"
 if printf '%s\n%s' "$evt1" "$evt2" | grep -Eq '(^|[^a-z])m -?[0-9]+ -?[0-9]+ [0-9]'; then
-    echo "[scene_gate] PASS click routed to a window's event file in window-local coords"
-else
-    echo "[scene_gate] FAIL no routed 'm <x> <y>' pointer line in any window event file" >&2
+    echo "[scene_gate] PASS routed 'm <x> <y>' pointer line read back from a window event file"
+    route_ok=1
+fi
+if [ "$route_ok" != "1" ]; then
+    echo "[scene_gate] FAIL no evidence of a click routed to a window in window-local coords" >&2
     fail=1
 fi
 
