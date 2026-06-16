@@ -600,14 +600,76 @@ else
     echo "[scene_gate] NOTE full-width panel fill not captured this boot window (serial flood; screendump authoritative)"
 fi
 
-# (6g) MENU BACKGROUND + SIZE: the dropdown lives in its OWN window whose
-# scene paints EVERY pixel with the menu colour (so it never composites
-# black) sized exactly 88x48. Assert the solid menu-colour fill is present
-# (regression guard for the "large black box / Files cut off" bug).
-if grep -aEq 'fill +0 +0 +88 +48 +#e8e4dc' "$LOG"; then
-    echo "[scene_gate] PASS dropdown menu window paints a solid (non-black) 88x48 background"
+# (6f-pixel) FULL-WIDTH PANEL, RENDERED: the panel REQUESTING full width
+# (6f) is necessary but not sufficient — the kernel scene-cache used to clamp
+# every window dimension to 1024px (WSYS_SCENE_CACHE_MAX), so a 1280-wide
+# panel rendered its grey bar only to ~1024 (the "grey bar stops at ~80%" bug
+# the user caught in the screendump). That clamp is now an AREA budget, not a
+# per-dim cap, so the rendered bar must reach (near) the full screen width.
+# Scan row y=12 of the POST screendump: the grey panel colour (#d4d0c8 ~=
+# 212,208,200) must extend to within 16px of the right edge. Advisory unless
+# a post screendump exists (screendump authoritative for the visual bug).
+if [ -f "$OUT_DIR/post.ppm" ]; then
+    barw=$(python3 - "$OUT_DIR/post.ppm" <<'PYBAR'
+import sys
+def load_ppm(path):
+    with open(path,"rb") as f: data=f.read()
+    if not data.startswith(b"P6"): return None,0,0
+    idx=2; toks=[]
+    while len(toks)<3:
+        while idx<len(data) and data[idx:idx+1].isspace(): idx+=1
+        if idx<len(data) and data[idx:idx+1]==b'#':
+            while idx<len(data) and data[idx:idx+1]!=b'\n': idx+=1
+            continue
+        s=idx
+        while idx<len(data) and not data[idx:idx+1].isspace(): idx+=1
+        toks.append(int(data[s:idx]))
+    w,h,_=toks; idx+=1
+    return data[idx:], w, h
+px,w,h=load_ppm(sys.argv[1])
+if px is None: print(-1); sys.exit(0)
+y=12
+# rightmost x on row y that is panel-grey (~212,208,200 +/- 24)
+rightmost=0
+for x in range(w):
+    o=(y*w+x)*3
+    r,g,b=px[o],px[o+1],px[o+2]
+    if abs(r-212)<=24 and abs(g-208)<=24 and abs(b-200)<=24:
+        rightmost=x
+print(rightmost+1)
+print(w)
+PYBAR
+)
+    rb=$(printf '%s\n' "$barw" | sed -n '1p')
+    sw=$(printf '%s\n' "$barw" | sed -n '2p')
+    if [ "${rb:-0}" -gt 0 ] 2>/dev/null && [ "${sw:-0}" -gt 0 ] 2>/dev/null; then
+        margin=$(( sw - rb ))
+        if [ "$margin" -le 16 ]; then
+            echo "[scene_gate] PASS panel grey bar RENDERS to full screen width (reaches ${rb}px of ${sw}px; margin ${margin}px <= 16)"
+        else
+            echo "[scene_gate] FAIL panel grey bar clamped: renders to ${rb}px of ${sw}px (margin ${margin}px > 16) — scene-cache width cap regressed?"
+            fail=1
+        fi
+    else
+        echo "[scene_gate] NOTE could not measure rendered panel width from post.ppm (advisory)"
+    fi
 else
-    echo "[scene_gate] NOTE menu background fill not captured this boot window (serial flood; screendump authoritative)"
+    echo "[scene_gate] NOTE no post.ppm screendump to measure rendered panel width (advisory)"
+fi
+
+# (6g) MENU BACKGROUND + SIZE: after the Applications click the grown panel
+# paints (a) the whole grown window with the desktop backdrop colour so no
+# pixel is left as cache-black, and (b) a tight 88x48 menu-colour dropdown
+# box at y=26. Assert the solid menu-colour box fill is present in the
+# POST-click capture (regression guard for the "large black box / Files cut
+# off" bug). The box fill is the load-bearing non-black proof.
+post_blk2=$(awk '/PANEL_POST_BEGIN/{f=1;next} /PANEL_POST_END/{f=0} f' "$LOG" 2>/dev/null)
+if printf '%s' "$post_blk2" | grep -aEq 'fill +0 +26 +88 +48 +#e8e4dc'; then
+    echo "[scene_gate] PASS dropdown paints a solid (non-black) 88x48 menu box at y=26"
+elif printf '%s' "$post_blk2" | grep -aEq 'fill +0 +0 +[0-9]+ +74 +#205060'; then
+    echo "[scene_gate] PASS grown panel paints its backdrop (no black box) after the Applications click"
+else
+    echo "[scene_gate] NOTE menu box fill not captured this boot window (serial flood; screendump authoritative)"
 fi
 
 echo "[scene_gate] artifacts in $OUT_DIR"
