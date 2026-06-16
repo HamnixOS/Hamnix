@@ -139,11 +139,88 @@ if $installer_medium > 0 {
     }
 } else {
     # --- normal boot: mount the sysroot subtree at / ----------------
+    # Try to graft the partition's `sysroot` subtree onto `/`. On
+    # success the FULL rc and the ~110 admin tools resolve off ext4; on
+    # failure we fall through to the read-only cpio tools embedded in
+    # the kernel. That cpio fallback is BENIGN on the `-kernel`
+    # developer test path (no rootfs partition was ever attached — the
+    # cpio IS the intended root), but it is a SILENT DISASTER on a real
+    # INSTALLED system: the operator would unknowingly run stale in-RAM
+    # tools and every file/edit/update would appear to vanish with no
+    # explanation.
+    sysroot_ok = 1
     try {
         bind '#sysroot' /
-        echo 'rc.boot: sysroot partition mounted at /'
     } except {
-        echo 'rc.boot: no sysroot partition (#sysroot absent) -- cpio fallback'
+        sysroot_ok = 0
+    }
+    if $sysroot_ok > 0 {
+        echo 'rc.boot: sysroot partition mounted at /'
+    } else {
+        # The bind failed. Decide loud-vs-quiet by the *sysroot device*
+        # signal: did the box actually have a real root DISK? A real
+        # block disk is present ONLY on a genuine installed/HW system;
+        # the `-kernel` developer test attaches NO block device at all,
+        # so /dev/blk is empty there and the cpio IS the intended root.
+        # We probe with the proven `try { cat … } except` exit-code
+        # idiom (NOT command substitution — `{ … }` capture deadlocks
+        # this early in the PID-1 bootstrap). `cat <disk>/size` reads a
+        # disk's capacity node: it SUCCEEDS only if that whole-disk node
+        # exists, and FAILS (lands in except) when no such device is
+        # registered. We try each whole-disk name the kernel/installer
+        # can use (virtio vda/vdb, AHCI/USB sd0, NVMe nvme0n1). Output is
+        # Each probe follows the SAME shape the installer-medium check
+        # above uses: the `cat` is the SOLE statement in its `try` (so
+        # try/except keys off ITS status), and the flag is set to 1
+        # up-front and cleared to 0 in the `except` when the device is
+        # absent. `installed` is the OR (sum) of the per-disk flags; it
+        # is > 0 only when at least one real disk exists.
+        vda_ok = 1
+        try {
+            cat /dev/blk/vda/size
+        } except {
+            vda_ok = 0
+        }
+        nvme_ok = 1
+        try {
+            cat /dev/blk/nvme0n1/size
+        } except {
+            nvme_ok = 0
+        }
+        sd0_ok = 1
+        try {
+            cat /dev/blk/sd0/size
+        } except {
+            sd0_ok = 0
+        }
+        vdb_ok = 1
+        try {
+            cat /dev/blk/vdb/size
+        } except {
+            vdb_ok = 0
+        }
+        installed = $vda_ok + $nvme_ok + $sd0_ok + $vdb_ok
+        if $installed > 0 {
+            # INSTALLED / real-HW system whose root failed to bind. Cry
+            # LOUD: the operator is now on throwaway in-RAM tools and
+            # NOTHING they do will persist. A quiet one-liner here is
+            # exactly the silent-failure class this guard exists to kill.
+            echo '################################################################'
+            echo 'rc.boot: ******* ROOT FILESYSTEM FAILED TO MOUNT *******'
+            echo 'rc.boot: a real root disk is present but its #sysroot subtree'
+            echo 'rc.boot:   could NOT be bound at / (corrupt or unenumerated'
+            echo 'rc.boot:   ext4 root).'
+            echo 'rc.boot: You are now running the FALLBACK in-RAM (cpio) tools.'
+            echo 'rc.boot: *** CHANGES WILL NOT PERSIST. Your installed files,'
+            echo 'rc.boot: *** edits and updates are NOT visible in this shell.'
+            echo 'rc.boot: Do NOT treat this as a normal boot. Investigate the'
+            echo 'rc.boot:   root disk before making any changes.'
+            echo '################################################################'
+        } else {
+            # Genuine live/dev path: no root disk present at all, so the
+            # cpio IS the intended root. Stay quiet — don't cry wolf.
+            echo 'rc.boot: no sysroot partition (#sysroot absent) -- cpio fallback (live/dev image)'
+        }
     }
     source /etc/rc.boot.full
 }
