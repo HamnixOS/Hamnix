@@ -2,25 +2,45 @@
 #
 # Scene-file DE terminal (docs/de_scene_file_arch.md §16 step 8).
 #
-# A minimal terminal drawn entirely as a scene display list. Its text
-# content is rendered with the `glyphs` primitive (monospace cell text, the
+# A REAL terminal drawn entirely as a scene display list. It spawns ONE
+# long-lived interactive `/bin/hamsh` over a pair of pipes (exactly the
+# bridge user/hamterm.ad / user/sshd.ad use) and renders the SHELL'S
+# OUTPUT as a scrolling monospace glyph grid (the `glyphs` primitive, the
 # terminal tier per §4). It is a decorated window (decorate 1) so the
-# compositor draws an SSD titlebar and the window is movable by dragging it.
+# compositor draws an SSD titlebar and the window is movable.
 #
-# It also proves INPUT ROUTING (§11): it reads its own
-# /dev/wsys/<wid>/event file and appends a line for every routed pointer /
-# key / focus event it receives in WINDOW-LOCAL coordinates, then re-emits
-# its scene. A click delivered via /dev/mouse therefore shows up as a new
-# "m <x> <y> ..." line inside the terminal — visible proof the compositor
-# routed the event to the right window in local space.
+# INPUT (§11)
+# -----------
+# The compositor's focus router delivers KEY events to the FOCUSED window
+# on /dev/wsys/<wid>/keys as ASCII "<type> <code>\n" lines (type 'd' =
+# press, 'u' = release; code is a raw ASCII byte) — the SAME stream
+# lib/hamui.ad and user/hamecho.ad consume. We read that file, accumulate
+# typed bytes into a command line, and on Enter ('\n' / '\r') feed the
+# line + '\n' to the shell's stdin. Backspace edits the line.
+#
+# POINTER events arrive on a SEPARATE file (/dev/wsys/<wid>/event, "m <x>
+# <y> ..." lines). A terminal does NOT type its mouse: we NEVER open or
+# render that file, so mousing over the window no longer fills it with
+# "m <x> <y> ..." glyph spam (the old echo-every-event bug). The click
+# that gives us focus is handled entirely by the compositor; we only need
+# keys after that.
+#
+# Each tick we non-blockingly drain the shell's stdout pipe into a bounded
+# scrollback ring, re-emit our scene (damage-scoped: one commit per change)
+# and commit. Type `ls`+Enter -> the shell's prompt + output stream into
+# the grid, not pointer noise.
 
 extern def sys_open(path: Ptr[char]) -> int32
 extern def sys_open_write(path: Ptr[char]) -> int32
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_close(fd: int32) -> int32
 extern def sys_get_jiffies() -> uint64
 extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
+extern def sys_pipe(fds: Ptr[int32]) -> int32
+
+from lib.p9 import spawn
 
 
 def _slen(s: Ptr[uint8]) -> uint64:
@@ -98,12 +118,35 @@ def _winpath(out: Ptr[uint8], wid: int32, leaf: Ptr[uint8]):
 
 TERM_W: int64 = 360
 TERM_H: int64 = 200
-TERM_ROWS: uint64 = 8
-TERM_COLS: uint64 = 42
+TERM_ROWS: uint64 = 9
+TERM_COLS: uint64 = 56
 
-# A small ring of text rows the terminal renders as glyphs.
-term_rows: Array[512, uint8]              # 8 rows * 64 cols
-term_row_len: Array[8, uint64]
+# A small ring of text rows the terminal renders as glyphs. The bottom row
+# is the LIVE edit line (prompt-relative input echo); rows above it are the
+# committed scrollback the shell produced.
+term_rows: Array[576, uint8]              # 9 rows * 64 cols
+term_row_len: Array[9, uint64]
+
+
+# Checksum of the VISIBLE grid (rows + lengths). We re-emit the scene only
+# when this changes, NOT merely when bytes were consumed. hamsh repaints its
+# prompt to stdout every ~3s (its idle heartbeat calls _ed_redraw), which our
+# ANSI filter collapses to the SAME visible glyphs — re-committing that
+# identical frame is exactly the periodic full-window repaint the flicker
+# gate forbids. Hashing the grid makes those no-op repaints free.
+def _grid_hash() -> uint64:
+    h: uint64 = 1469598103934665603              # FNV-1a offset basis
+    r: uint64 = 0
+    while r < TERM_ROWS:
+        ln: uint64 = term_row_len[r]
+        h = (h ^ ln) * 1099511628211
+        base: uint64 = r * 64
+        k: uint64 = 0
+        while k < ln:
+            h = (h ^ cast[uint64](term_rows[base + k])) * 1099511628211
+            k = k + 1
+        r = r + 1
+    return h
 
 
 def _term_clear():
@@ -122,8 +165,8 @@ def _term_set_row(r: uint64, s: Ptr[uint8]):
     term_row_len[r] = n
 
 
-def _term_push_line(s: Ptr[uint8], slen: uint64):
-    # Scroll up by one and append s as the bottom row.
+def _term_scroll():
+    # Scroll the grid up by one row (drop the top, shift the rest up).
     r: uint64 = 0
     while r + 1 < TERM_ROWS:
         sb: uint64 = (r + 1) * 64
@@ -135,19 +178,107 @@ def _term_push_line(s: Ptr[uint8], slen: uint64):
             k = k + 1
         term_row_len[r] = ln
         r = r + 1
+    term_row_len[TERM_ROWS - 1] = 0
+
+
+# Append one output byte from the shell into the grid, wrapping/scrolling.
+# The terminal cursor lives on the bottom row (TERM_ROWS-1) at column
+# term_col. A '\n' or column overflow scrolls up and resets the column.
+term_col: uint64 = 0
+
+
+def _term_putc(c: uint8):
     last: uint64 = (TERM_ROWS - 1) * 64
-    n: uint64 = 0
-    while n < slen and n < TERM_COLS:
-        term_rows[last + n] = s[n]
-        n = n + 1
-    term_row_len[TERM_ROWS - 1] = n
+    if c == 10:                             # newline -> scroll up one row
+        _term_scroll()
+        term_col = 0
+        return
+    if c == 13:                             # carriage-return -> col 0, no clear
+        # Move to column 0; subsequent writes OVERWRITE in place. A prompt
+        # repaint does CR + reprint + ESC[K; CR must NOT clear (that would
+        # erase what the reprint then rewrites and churn the grid). ESC[K
+        # (handled in the CSI filter) clears the stale tail instead.
+        term_col = 0
+        return
+    if c == 8 or c == 127:                  # backspace / DEL
+        if term_col > 0:
+            term_col = term_col - 1
+            term_rows[last + term_col] = 32
+            if term_row_len[TERM_ROWS - 1] > 0:
+                term_row_len[TERM_ROWS - 1] = term_col
+        return
+    if c == 9:                              # tab -> a couple of spaces
+        _term_putc(32)
+        _term_putc(32)
+        return
+    if c < 32:                              # drop other control bytes
+        return
+    if term_col >= TERM_COLS:
+        _term_scroll()
+        term_col = 0
+    term_rows[last + term_col] = c
+    term_col = term_col + 1
+    if term_col > term_row_len[TERM_ROWS - 1]:
+        term_row_len[TERM_ROWS - 1] = term_col
+
+
+# ANSI escape filter state. hamsh's prompt/readline emits VT100 control
+# sequences (cursor moves, "show cursor", colours). We are a glyph grid, not
+# a VT220, so we SWALLOW escape sequences rather than draw "[7C" / "[?25h" as
+# literal glyphs. States: 0 = ground, 1 = saw ESC, 2 = inside CSI (ESC [ ...),
+# 3 = inside OSC (ESC ] ... terminated by BEL or ST).
+esc_st: int32 = 0
+
+
+def _term_feed(c: uint8):
+    if esc_st == 0:
+        if c == 27:                         # ESC
+            esc_st = 1
+            return
+        _term_putc(c)
+        return
+    if esc_st == 1:                         # just saw ESC
+        if c == 91:                         # '[' -> CSI
+            esc_st = 2
+        else:
+            if c == 93:                     # ']' -> OSC
+                esc_st = 3
+            else:
+                # Two-byte escape (e.g. ESC c) — done.
+                esc_st = 0
+        return
+    if esc_st == 2:                         # CSI: params until a final byte
+        # Final byte is in 0x40..0x7E (@ A..Z [ \ ] ^ _ ` a..z { | } ~).
+        if c >= 64 and c <= 126:
+            if c == 75:                     # 'K' — erase to end of line
+                # Clear from the cursor column to the end of the bottom row
+                # (the prompt-repaint tail clear). This is what keeps a CR +
+                # reprint + ESC[K idempotent: identical content each repaint.
+                if term_row_len[TERM_ROWS - 1] > term_col:
+                    term_row_len[TERM_ROWS - 1] = term_col
+            esc_st = 0
+        return
+    if esc_st == 3:                         # OSC: until BEL (7) or ESC-\ (ST)
+        if c == 7:
+            esc_st = 0
+        else:
+            if c == 27:                     # ST begins with ESC; consume next
+                esc_st = 1
+        return
+
+
+def _term_puts_n(p: Ptr[uint8], n: uint64):
+    i: uint64 = 0
+    while i < n:
+        _term_feed(p[i])
+        i = i + 1
 
 
 def _emit_scene(scenepath: Ptr[char]):
     sfd: int32 = sys_open_write(scenepath)
     if sfd < 0:
         return
-    scene: Array[2048, uint8]
+    scene: Array[4096, uint8]
     sp: uint64 = 0
     # background dark panel
     head: Ptr[uint8] = cast[Ptr[uint8]]("# scene v1 term\nfill 0 0 360 200 #101418\n")
@@ -156,18 +287,23 @@ def _emit_scene(scenepath: Ptr[char]):
         scene[sp] = head[a]
         sp = sp + 1
         a = a + 1
-    # each text row as a glyphs line at y = 8 + r*18
+    # each text row as a glyphs line at y = 6 + r*20
     r: uint64 = 0
     while r < TERM_ROWS:
         ln: uint64 = term_row_len[r]
-        if ln > 0:
+        is_cursor_row: int32 = 0
+        if r == TERM_ROWS - 1:
+            is_cursor_row = 1
+        # Always emit the bottom (edit) row even when empty so a blinking-ish
+        # cursor marker is visible; skip blank scrollback rows.
+        if ln > 0 or is_cursor_row != 0:
             g: Ptr[uint8] = cast[Ptr[uint8]]("glyphs 6 ")
             b: uint64 = 0
             while g[b] != 0:
                 scene[sp] = g[b]
                 sp = sp + 1
                 b = b + 1
-            yy: uint64 = 8 + r * 18
+            yy: uint64 = 6 + r * 20
             sp = sp + _u64_to_dec(yy, &scene[sp])
             scene[sp] = 32
             scene[sp + 1] = 34                     # opening quote
@@ -181,6 +317,9 @@ def _emit_scene(scenepath: Ptr[char]):
                 scene[sp] = ch
                 sp = sp + 1
                 k = k + 1
+            if is_cursor_row != 0:
+                scene[sp] = 95                      # '_' text cursor
+                sp = sp + 1
             tail: Ptr[uint8] = cast[Ptr[uint8]]("\" #c0f0c0\n")
             c: uint64 = 0
             while tail[c] != 0:
@@ -192,6 +331,145 @@ def _emit_scene(scenepath: Ptr[char]):
     sys_close(sfd)
 
 
+# --- persistent shell wiring (mirrors user/hamterm.ad) ----------------
+spawn_argv: Array[2, uint64]
+to_sh:    Array[2, int32]      # hamtermscene -> hamsh (shell stdin)
+from_sh:  Array[2, int32]      # hamsh -> hamtermscene (shell stdout/err)
+sh_in_fd:  int32 = -1          # write end of to_sh   (feed commands)
+sh_out_fd: int32 = -1          # read end of from_sh  (drain output)
+sh_alive:  int32 = 0
+read_buf:  Array[512, uint8]
+
+
+def _start_shell() -> int32:
+    if sys_pipe(&to_sh[0]) != 0:
+        return -1
+    if sys_pipe(&from_sh[0]) != 0:
+        sys_close(to_sh[0])
+        sys_close(to_sh[1])
+        return -1
+    spawn_argv[0] = cast[uint64]("/bin/hamsh")
+    spawn_argv[1] = 0
+    # Child stdin = read end of to_sh; child stdout = write end of from_sh.
+    pid: int32 = spawn(cast[Ptr[char]]("/bin/hamsh"), &spawn_argv[0],
+                       to_sh[0], from_sh[1], cast[Ptr[uint64]](0))
+    # Drop our copies of the ends hamsh now owns so our EOF probe fires
+    # (sys_read_nb == -1 when the shell exits and no writers remain).
+    sys_close(to_sh[0])
+    sys_close(from_sh[1])
+    if pid < 0:
+        sys_close(to_sh[1])
+        sys_close(from_sh[0])
+        return -1
+    sh_in_fd = to_sh[1]
+    sh_out_fd = from_sh[0]
+    sh_alive = 1
+    return 0
+
+
+# Non-blocking drain of the shell's stdout into the glyph grid. Returns the
+# number of bytes consumed this call (0 = nothing). Sets sh_alive = 0 on EOF.
+def _drain_shell() -> uint64:
+    if sh_alive == 0 or sh_out_fd < 0:
+        return 0
+    got: uint64 = 0
+    passes: int32 = 0
+    while passes < 8:
+        n: int64 = sys_read_nb(sh_out_fd, &read_buf[0], 512)
+        if n > 0:
+            _term_puts_n(&read_buf[0], cast[uint64](n))
+            got = got + cast[uint64](n)
+            passes = passes + 1
+            continue
+        if n < 0:
+            sh_alive = 0
+        break
+    return got
+
+
+# Feed one command line (NUL-terminated, length ln) to the shell's stdin,
+# appending '\n'. Returns 0 on success, -1 if the shell is gone.
+line_buf: Array[576, uint8]
+
+
+def _send_line(buf: Ptr[uint8], ln: uint64) -> int32:
+    if sh_alive == 0 or sh_in_fd < 0:
+        return -1
+    j: uint64 = 0
+    while j < ln and j < 574:
+        line_buf[j] = buf[j]
+        j = j + 1
+    line_buf[j] = 10                        # '\n'
+    j = j + 1
+    w: int64 = sys_write(sh_in_fd, &line_buf[0], j)
+    if w < 0:
+        sh_alive = 0
+        return -1
+    return 0
+
+
+# --- key input from /dev/wsys/<wid>/keys ------------------------------
+kev_buf:  Array[256, uint8]
+keyout:   Array[256, uint8]              # forwarded bytes -> shell stdin
+
+
+# Forward one raw byte to the persistent shell's stdin. We feed keystrokes
+# straight through (no local line buffer): hamsh's interactive readline does
+# its OWN echo + line editing, and that echo streams back over the shell's
+# stdout into our glyph grid — exactly like a real terminal. Locally echoing
+# would double every character.
+def _key_to_shell(c: uint8):
+    if sh_alive == 0 or sh_in_fd < 0:
+        return
+    keyout[0] = c
+    w: int64 = sys_write(sh_in_fd, &keyout[0], 1)
+    if w < 0:
+        sh_alive = 0
+
+
+# Parse "<type> <code>\n" key lines out of a freshly-read chunk. For each
+# 'd' (press) line with a printable / Enter / Backspace code, forward the
+# byte to the shell. The shell's echo comes back over stdout (rendered by
+# _drain_shell). Returns 1 if any key was forwarded (so we re-poll output).
+def _drain_keys_chunk(n: uint64) -> int32:
+    i: uint64 = 0
+    changed: int32 = 0
+    while i < n:
+        t: uint8 = kev_buf[i]
+        i = i + 1
+        if i < n and kev_buf[i] == 32:
+            i = i + 1
+        # parse decimal code
+        code: int32 = 0
+        have: int32 = 0
+        neg: int32 = 0
+        if i < n and kev_buf[i] == 45:
+            neg = 1
+            i = i + 1
+        while i < n and kev_buf[i] >= 48 and kev_buf[i] <= 57:
+            code = code * 10 + cast[int32](kev_buf[i]) - 48
+            i = i + 1
+            have = 1
+        # skip to end of line
+        while i < n and kev_buf[i] != 10:
+            i = i + 1
+        if i < n:
+            i = i + 1                       # consume '\n'
+        if neg != 0:
+            code = 0 - code
+        # Only press events ('d') with a real code drive input.
+        if t != 100 or have == 0:
+            continue
+        if code == 13:                      # CR -> NL for the shell
+            code = 10
+        # Forward printable bytes, Enter and Backspace/DEL to the shell.
+        if code == 10 or code == 8 or code == 127 \
+                or (code >= 32 and code < 127):
+            _key_to_shell(cast[uint8](code))
+            changed = 1
+    return changed
+
+
 def main() -> int32:
     sys_bind(cast[Ptr[char]]("/dev"), cast[Ptr[char]]("#c"), 0)
     wid: int32 = _newwindow()
@@ -201,10 +479,10 @@ def main() -> int32:
 
     ctlp: Array[64, uint8]
     scenep: Array[64, uint8]
-    evp: Array[64, uint8]
+    keysp: Array[64, uint8]
     _winpath(&ctlp[0], wid, cast[Ptr[uint8]]("/ctl"))
     _winpath(&scenep[0], wid, cast[Ptr[uint8]]("/scene"))
-    _winpath(&evp[0], wid, cast[Ptr[uint8]]("/event"))
+    _winpath(&keysp[0], wid, cast[Ptr[uint8]]("/keys"))
 
     # geometry: a 360x200 box, decorated, mid-screen.
     cfd: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
@@ -227,7 +505,15 @@ def main() -> int32:
 
     _term_clear()
     _term_set_row(0, cast[Ptr[uint8]]("Hamnix scene terminal"))
-    _term_set_row(1, cast[Ptr[uint8]]("$ click me to route input"))
+    _term_set_row(1, cast[Ptr[uint8]]("type a command, press Enter"))
+
+    # Start the ONE persistent interactive hamsh.
+    if _start_shell() != 0:
+        _term_set_row(2, cast[Ptr[uint8]]("(shell failed to start)"))
+        _writeall(1, cast[Ptr[uint8]]("[term] shell spawn FAILED\n"))
+    else:
+        _writeall(1, cast[Ptr[uint8]]("[term] hamsh spawned\n"))
+
     _emit_scene(cast[Ptr[char]](&scenep[0]))
     cfd4: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
     if cfd4 >= 0:
@@ -236,41 +522,32 @@ def main() -> int32:
 
     _writeall(1, cast[Ptr[uint8]]("[term] scene window ready\n"))
 
-    # Event loop: poll the event file, append each routed event line to the
-    # terminal display, re-emit + commit. Proves window-local input routing.
-    evbuf: Array[256, uint8]
+    # Open the per-window KEY stream (focused-window keys, ASCII bytes).
+    # POINTER events live on a SEPARATE file we deliberately never open —
+    # a terminal types its keyboard, not its mouse.
+    kfd: int32 = sys_open(cast[Ptr[char]](&keysp[0]))
+
+    # Event loop: drain shell output + keystrokes, then re-emit ONLY when the
+    # visible grid content actually changed (not merely when bytes flowed) —
+    # so hamsh's periodic identical prompt-repaint never re-commits a frame
+    # and the desktop stays flicker-stable.
+    prev_hash: uint64 = _grid_hash()
     while True:
-        efd: int32 = sys_open(cast[Ptr[char]](&evp[0]))
-        got: int32 = 0
-        if efd >= 0:
-            r: int64 = sys_read(efd, &evbuf[0], 255)
-            sys_close(efd)
-            if r > 0:
-                # split on '\n' and push each line
-                ls: uint64 = 0
-                i: uint64 = 0
-                while i < cast[uint64](r):
-                    if evbuf[i] == 10:
-                        if i > ls:
-                            _term_push_line(&evbuf[ls], i - ls)
-                            got = 1
-                        ls = i + 1
-                    i = i + 1
-                if ls < cast[uint64](r):
-                    _term_push_line(&evbuf[ls], cast[uint64](r) - ls)
-                    got = 1
-                # echo to serial so a gate can see routing worked
-                _writeall(1, cast[Ptr[uint8]]("[term] event: "))
-                sys_write(1, &evbuf[0], cast[uint64](r))
-                _writeall(1, cast[Ptr[uint8]]("\n"))
-        if got != 0:
+        _drain_shell()
+        if kfd >= 0:
+            kn: int64 = sys_read_nb(kfd, &kev_buf[0], 255)
+            if kn > 0:
+                _drain_keys_chunk(cast[uint64](kn))
+        new_hash: uint64 = _grid_hash()
+        if new_hash != prev_hash:
+            prev_hash = new_hash
             _emit_scene(cast[Ptr[char]](&scenep[0]))
             cfd5: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
             if cfd5 >= 0:
                 _writeall(cfd5, cast[Ptr[uint8]]("commit\n"))
                 sys_close(cfd5)
-        # poll interval ~100ms
+        # poll interval ~50ms
         s2: uint64 = sys_get_jiffies()
-        while sys_get_jiffies() - s2 < 10:
+        while sys_get_jiffies() - s2 < 5:
             pass
     return 0
