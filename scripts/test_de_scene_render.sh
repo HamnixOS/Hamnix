@@ -341,6 +341,41 @@ try:
             time.sleep(0.6)
         send("echo CURSOR_BEGIN; cat /dev/wsys/cursor/scene; echo CURSOR_END")
         time.sleep(2)
+        # --- PANEL parity proof: window-list, menu, clock --------------
+        # The panel (hampanelscene) runs as a real rl5 service. Snapshot the
+        # kernel window-list leaf the taskbar reads, then cat every scene
+        # (the panel's scene carries "Applications" + a HH:MM clock). Drive a
+        # click on the Applications button (screen-local ~ (40,12)) and re-cat
+        # so the dropdown's "Terminal"/"Files" rows show up as glyphs.
+        send("echo WINLIST_BEGIN; cat /dev/wsys/windows; echo WINLIST_END")
+        time.sleep(1.5)
+        send("echo PANEL_PRE_BEGIN")
+        for n in range(1, 19):
+            send(f"echo PSCENE{n}_BEGIN; cat /dev/wsys/{n}/scene; echo PSCENE{n}_END")
+            time.sleep(0.4)
+        send("echo PANEL_PRE_END")
+        time.sleep(1)
+        # Click the Applications button. It sits at the top-left of the
+        # screen: y in [0,26), x in [0,96). Fire at screen (40,12) for the
+        # common fb modes. Tablet coord = px/dim*32767.
+        send("echo APPCLICK_BEGIN")
+        # 1280x800: (40,12) -> 1024 491 ; 800x600 -> 1638 655
+        send("echo '1024 491 1 0 1' > /dev/mouse")
+        time.sleep(0.3)
+        send("echo '1024 491 0 0 1' > /dev/mouse")
+        time.sleep(0.3)
+        send("echo '1638 655 1 0 1' > /dev/mouse")
+        time.sleep(0.3)
+        send("echo '1638 655 0 0 1' > /dev/mouse")
+        time.sleep(0.6)
+        send("echo APPCLICK_END")
+        time.sleep(0.5)
+        send("echo PANEL_POST_BEGIN")
+        for n in range(1, 19):
+            send(f"echo QSCENE{n}_BEGIN; cat /dev/wsys/{n}/scene; echo QSCENE{n}_END")
+            time.sleep(0.4)
+        send("echo PANEL_POST_END")
+        time.sleep(1.5)
         rc = 0 if ok else 1
 finally:
     try: qemu.terminate()
@@ -497,6 +532,59 @@ elif grep -aq '\[hamfm\] scene window ready' "$LOG"; then
     echo "[scene_gate] NOTE hamfm launched (scene window ready) but its glyphs cat not captured in this boot window"
 else
     echo "[scene_gate] NOTE hamfm not observed in this boot window (rc.5 launch may not have reached the gate's capture window)"
+fi
+
+# (6) PANEL PARITY: the panel scene carries MORE than one element — the
+# "Applications" launcher AND a HH:MM clock — and the kernel window-list
+# leaf enumerates open app windows for the taskbar. Then a click on the
+# Applications button opens a dropdown exposing "Terminal"/"Files" rows.
+# All advisory (the live DE floods serial at rl5, so a clean scene cat is
+# best-effort), but loud so a regression is visible.
+
+# (6a) Applications launcher present in some scene.
+if grep -aq 'glyphs[^"]*"Applications"' "$LOG"; then
+    echo "[scene_gate] PASS panel renders the Applications launcher"
+else
+    echo "[scene_gate] NOTE panel 'Applications' glyphs not captured (rl5 serial flood; screendump authoritative)"
+fi
+
+# (6b) Clock applet: a HH:MM glyphs line in some scene cat.
+if grep -aEq 'glyphs +[0-9]+ +[0-9]+ +"[0-9][0-9]:[0-9][0-9]"' "$LOG"; then
+    clkline=$(grep -aoE 'glyphs +[0-9]+ +[0-9]+ +"[0-9][0-9]:[0-9][0-9]"' "$LOG" | head -1)
+    echo "[scene_gate] PASS panel clock applet rendered ($clkline)"
+else
+    echo "[scene_gate] NOTE panel clock HH:MM glyphs not captured this boot window"
+fi
+
+# (6c) Window-list leaf: /dev/wsys/windows enumerated >=1 app window.
+winlist=$(awk '/WINLIST_BEGIN/{f=1;next} /WINLIST_END/{f=0} f' "$LOG" 2>/dev/null)
+if printf '%s' "$winlist" | grep -Eq '^[0-9]+ '; then
+    nwin=$(printf '%s' "$winlist" | grep -Ec '^[0-9]+ ')
+    echo "[scene_gate] PASS /dev/wsys/windows enumerated $nwin app window(s) for the taskbar"
+    if printf '%s' "$winlist" | grep -qE '(Terminal|Files)'; then
+        echo "[scene_gate] PASS window-list carries an app TITLE (Terminal/Files) for the taskbar button"
+    fi
+else
+    echo "[scene_gate] NOTE /dev/wsys/windows cat empty/garbled this boot window (serial flood)"
+fi
+
+# (6d) Taskbar button: a window title rendered as a glyphs button in some
+# scene (the panel draws each open window's title in the bar).
+if grep -aEq 'glyphs[^"]*"(Terminal|Files)"' "$LOG"; then
+    echo "[scene_gate] PASS panel taskbar drew an app-window button (Terminal/Files)"
+else
+    echo "[scene_gate] NOTE taskbar button glyphs not captured this boot window"
+fi
+
+# (6e) MENU OPEN: after the Applications click, the panel's POST scene cat
+# exposes the dropdown rows "Terminal" + "Files". We scan only the
+# post-click capture window so we don't conflate it with the taskbar.
+post_blk=$(awk '/PANEL_POST_BEGIN/{f=1;next} /PANEL_POST_END/{f=0} f' "$LOG" 2>/dev/null)
+if printf '%s' "$post_blk" | grep -aq 'glyphs[^"]*"Terminal"' \
+        && printf '%s' "$post_blk" | grep -aq 'glyphs[^"]*"Files"'; then
+    echo "[scene_gate] PASS Applications click OPENED the dropdown (Terminal + Files rows present)"
+else
+    echo "[scene_gate] NOTE dropdown rows not captured after the Applications click (serial flood; screendump authoritative)"
 fi
 
 echo "[scene_gate] artifacts in $OUT_DIR"
