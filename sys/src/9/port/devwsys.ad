@@ -144,6 +144,15 @@ from lib.vk.vk_window_demo import vk_window_render_frame
 # FPS accounting moved into the compositor (user/hamUId.ad `[de_perf]
 # cursor_fps=N`), so no auxmouse / jiffy / printk2 imports are needed here.
 from kernel.printk.printk import printk0
+# Scene-file DE (docs/de_scene_file_arch.md): the kernel-side compositor
+# z-blits each window's rasterized RGBA cache to the physical framebuffer
+# via the existing fb_text present primitives. fb_font_glyph_addr backs
+# the 8x16 text/glyphs rasterizer (same font the console uses).
+from drivers.video.console.fb_text import (
+    fb_get_initialized, fb_get_width, fb_get_height,
+    fb_present_rgba_row,
+)
+extern def fb_font_glyph_addr() -> uint64
 
 
 # --- per-wid table ---------------------------------------------------
@@ -2604,11 +2613,32 @@ def devwsys_ctl_write(buf: Ptr[uint8], count: uint64) -> int64:
     # F2 #447 system-wide wsys-ctl writer. Hostowner-only — non-uid-1
     # callers get -EPERM. Returns the count consumed on success or -1
     # with errstr on a parse/policy failure.
+    #
+    # Scene-file DE (docs/de_scene_file_arch.md): the `newwindow` verb is
+    # the EXCEPTION to the hostowner gate. A client creates its OWN window
+    # by writing "newwindow" with no argument; the wid is bound to the
+    # CALLER's pid (so the caller owns its <wid>/scene + ctl + event). The
+    # legacy hostowner-on-behalf `alloc <pid>` path is unchanged. Parsed
+    # FIRST, before the hostowner gate, so a NOBODY-uid app can self-serve
+    # a window.
+    if count == 0:
+        return 0
+    p0: uint64 = _wsys_ctl_skip_ws(buf, 0, count)
+    vs0: uint64 = p0
+    p0 = _wsys_ctl_token_end(buf, p0, count)
+    ve0: uint64 = p0
+    if _wsys_ctl_word_eq(buf, vs0, ve0, "newwindow") == 1:
+        mypid: uint64 = current_task_pid()
+        nw: int32 = wsys_alloc_wid(mypid)
+        if nw < 0:
+            set_current_errstr("/dev/wsys/ctl: newwindow: table full or already bound")
+            return -1
+        wsys_last_alloc_wid = nw
+        return cast[int64](count)
+
     if current_task_is_hostowner() == 0:
         set_current_errstr("/dev/wsys/ctl: permission denied (not hostowner)")
         return -1
-    if count == 0:
-        return 0
     p: uint64 = _wsys_ctl_skip_ws(buf, 0, count)
     vs: uint64 = p
     p = _wsys_ctl_token_end(buf, p, count)
@@ -6561,3 +6591,1073 @@ def devwsys_backbuffer_read(wid: int32, off: uint64, buf: Ptr[uint8],
         buf[i] = bbp[off + i]
         i = i + 1
     return cast[int64](take)
+
+
+# =====================================================================
+# SCENE-FILE DESKTOP ENVIRONMENT (docs/de_scene_file_arch.md)
+# =====================================================================
+#
+# A window publishes a line-oriented text display list as its `scene`
+# file. The compositor reads scene files on `commit`, rasterizes each
+# changed window's list into a per-window RGBA8888 pixel CACHE (carved
+# from the lazy 4 MiB layer-fb block), and z-blits the caches to the
+# physical framebuffer. The frame is text you can cat/grep/diff.
+#
+# This block is ADDITIVE: it lives alongside the legacy text-ring /
+# draw-layer / backbuffer paths (which the live rc.5 DE still uses) so
+# the box keeps booting. The runlevel-5 flip to the scene compositor is
+# a later wave.
+#
+# ADDER QUIRKS honoured exactly as the rest of this file: top-level flat
+# Array storage indexed buf[slot*SIZE+off]; no nested struct Arrays; no
+# sizeof; leading-underscore = module-private.
+#
+# SLOT MAP: scene storage is 32 slots, mirroring the wid table. Slot 0
+# (the otherwise-reserved wid) is the CURSOR's own scene — /dev/wsys/
+# cursor/scene routes here. Slots 1..31 are per-window scenes.
+
+WSYS_SCENE_SIZE: uint64 = 16384          # 16 KiB display list per window
+WSYS_SCENE_SLOTS: uint64 = 32
+
+# Display lists (current + previously-committed, for damage diffing).
+wsys_scene_buf:       Array[524288, uint8]    # 32 * 16384
+wsys_scene_len:       Array[32, uint64]       # bytes of valid scene text
+wsys_scene_prev_buf:  Array[524288, uint8]    # last COMMITTED scene
+wsys_scene_prev_len:  Array[32, uint64]
+# Commit generation: bumped on every `commit` ctl write. The compositor
+# compares against its last-composited value to know which windows
+# changed. Distinct from wsys_win_serial (which the legacy damage file
+# uses); a scene client only bumps this via commit.
+wsys_scene_gen:       Array[32, uint64]
+# Per-window write cursor: a write at off 0 RESETS the buffer; subsequent
+# writes append. This lets a client stream a multi-write scene then poke
+# commit. Reset to 0 whenever len is cleared.
+wsys_scene_wpos:      Array[32, uint64]
+
+# Per-window geometry / stacking / decoration, set via the window `ctl`
+# leaf (geometry/z/decorate). Defaults: a window starts at the origin
+# with a modest default size, z=0, decorate=0 (content-only).
+wsys_win_x:        Array[32, int64]
+wsys_win_y:        Array[32, int64]
+wsys_win_w:        Array[32, int64]
+wsys_win_h:        Array[32, int64]
+wsys_win_z:        Array[32, int64]
+wsys_win_decorate: Array[32, int32]
+wsys_win_geo_init: Array[32, int32]      # 1 once geometry has been set
+
+WSYS_SCENE_DEFAULT_W: int64 = 320
+WSYS_SCENE_DEFAULT_H: int64 = 240
+
+# Per-window event ring (step-5 input is a later wave; this is the
+# minimal readable/writable text ring the spec asks for now). 2 KiB.
+WSYS_EVT_SIZE: uint64 = 2048
+wsys_evt_buf:  Array[65536, uint8]       # 32 * 2048
+wsys_evt_head: Array[32, uint64]         # write cursor
+wsys_evt_tail: Array[32, uint64]         # read cursor
+
+# Compositor wake queue: a `commit` write wakes one waiter (the present
+# loop / a gate driver). Event-driven, no polling.
+wsys_commit_wq: WaitQueue
+wsys_commit_wq_inited: int32 = 0
+wsys_commit_seq: uint64 = 0              # bumped on every commit (any wid)
+
+
+def _wsys_scene_init_if_needed():
+    if wsys_commit_wq_inited == 0:
+        wq_init(&wsys_commit_wq)
+        wsys_commit_wq_inited = 1
+
+
+def _wsys_win_def_w(u: uint64) -> int64:
+    if wsys_win_geo_init[u] != 0 and wsys_win_w[u] > 0:
+        return wsys_win_w[u]
+    return WSYS_SCENE_DEFAULT_W
+
+
+def _wsys_win_def_h(u: uint64) -> int64:
+    if wsys_win_geo_init[u] != 0 and wsys_win_h[u] > 0:
+        return wsys_win_h[u]
+    return WSYS_SCENE_DEFAULT_H
+
+
+# --- scene file (per-window display list) ----------------------------
+
+def devwsys_scene_write(wid: int32, buf: Ptr[uint8],
+                        count: uint64) -> int64:
+    # Client WRITES its display list here. A write at the current write
+    # cursor 0 (the first write after a reset) starts a fresh buffer;
+    # subsequent writes append. The compositor only ever READS this on a
+    # `commit`, so a partially-written scene is never observed.
+    #
+    # Ownership: NO hostowner gate — a window's owner (creator pid or an
+    # ancestor) controls its OWN scene. The cursor scene (wid 0) is a
+    # compositor surface; allow hostowner OR any owner of nothing (the DE
+    # cursor driver). We gate wid>0 by ownership; wid 0 (cursor) is open
+    # to hostowner and to the cursor's writer (best-effort, no slot pid).
+    u: uint64 = cast[uint64](wid)
+    if u >= WSYS_SCENE_SLOTS:
+        set_current_errstr("/dev/wsys/scene: wid out of range")
+        return -1
+    if wid > 0:
+        if wsys_wid_in_use(wid) == 0:
+            set_current_errstr("/dev/wsys/scene: wid not in use")
+            return -1
+        if current_task_is_hostowner() == 0 \
+                and _wsys_caller_owns_wid(wid) == 0:
+            set_current_errstr("/dev/wsys/scene: permission denied (not window owner)")
+            return -1
+    if count == 0:
+        return 0
+    base: uint64 = u * WSYS_SCENE_SIZE
+    pos: uint64 = wsys_scene_wpos[u]
+    i: uint64 = 0
+    while i < count and pos < WSYS_SCENE_SIZE:
+        wsys_scene_buf[base + pos] = buf[i]
+        pos = pos + 1
+        i = i + 1
+    wsys_scene_wpos[u] = pos
+    wsys_scene_len[u] = pos
+    return cast[int64](i)
+
+
+def devwsys_scene_read(wid: int32, off: uint64, buf: Ptr[uint8],
+                       count: uint64) -> int64:
+    # The compositor (and gates) READ the current display list as text.
+    # Snapshot-once (honours off so `cat`/`grep` terminate). No side
+    # effects. A scene read of a reset/never-written window returns EOF.
+    if count == 0:
+        return 0
+    u: uint64 = cast[uint64](wid)
+    if u >= WSYS_SCENE_SLOTS:
+        return -2
+    if wid > 0 and wsys_wid_in_use(wid) == 0:
+        return -2
+    n: uint64 = wsys_scene_len[u]
+    if off >= n:
+        return 0
+    base: uint64 = u * WSYS_SCENE_SIZE
+    remaining: uint64 = n - off
+    take: uint64 = count
+    if take > remaining:
+        take = remaining
+    i: uint64 = 0
+    while i < take:
+        buf[i] = wsys_scene_buf[base + off + i]
+        i = i + 1
+    return cast[int64](take)
+
+
+# --- winid file (read-only) ------------------------------------------
+
+def devwsys_winid_read(wid: int32, off: uint64, buf: Ptr[uint8],
+                       count: uint64) -> int64:
+    # "<wid>\n"
+    if count == 0:
+        return 0
+    if wsys_wid_in_use(wid) == 0:
+        return -2
+    scratch: Array[32, uint8]
+    n: uint64 = _wsys_u64_to_dec(cast[uint64](wid), &scratch[0])
+    scratch[n] = 10
+    n = n + 1
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+# --- event ring (minimal stub; full routing is a later wave) ---------
+
+def _wsys_evt_push_byte(wid: int32, c: uint8):
+    u: uint64 = cast[uint64](wid)
+    base: uint64 = u * WSYS_EVT_SIZE
+    h: uint64 = wsys_evt_head[u]
+    nh: uint64 = (h + 1) % WSYS_EVT_SIZE
+    if nh == wsys_evt_tail[u]:
+        # ring full: drop the oldest byte
+        wsys_evt_tail[u] = (wsys_evt_tail[u] + 1) % WSYS_EVT_SIZE
+    wsys_evt_buf[base + h] = c
+    wsys_evt_head[u] = nh
+
+
+def devwsys_event_write(wid: int32, buf: Ptr[uint8],
+                        count: uint64) -> int64:
+    # The compositor enqueues window-local event lines here; the client
+    # reads them. Minimal: owner OR hostowner may write.
+    if wsys_wid_in_use(wid) == 0:
+        set_current_errstr("/dev/wsys/event: wid not in use")
+        return -1
+    if current_task_is_hostowner() == 0 and _wsys_caller_owns_wid(wid) == 0:
+        set_current_errstr("/dev/wsys/event: permission denied")
+        return -1
+    i: uint64 = 0
+    while i < count:
+        _wsys_evt_push_byte(wid, buf[i])
+        i = i + 1
+    return cast[int64](count)
+
+
+def devwsys_event_read(wid: int32, off: uint64, buf: Ptr[uint8],
+                       count: uint64) -> int64:
+    # Pop queued event bytes (oldest first). Returns 0 when the ring is
+    # empty. `off` is ignored — this is a consuming stream read.
+    if count == 0:
+        return 0
+    if wsys_wid_in_use(wid) == 0:
+        return -2
+    u: uint64 = cast[uint64](wid)
+    base: uint64 = u * WSYS_EVT_SIZE
+    n: uint64 = 0
+    while n < count and wsys_evt_tail[u] != wsys_evt_head[u]:
+        buf[n] = wsys_evt_buf[base + wsys_evt_tail[u]]
+        wsys_evt_tail[u] = (wsys_evt_tail[u] + 1) % WSYS_EVT_SIZE
+        n = n + 1
+    return cast[int64](n)
+
+
+# --- per-window ctl (geometry/z/decorate/commit/damage) --------------
+
+def devwsys_winctl_read(wid: int32, off: uint64, buf: Ptr[uint8],
+                        count: uint64) -> int64:
+    # Snapshot status line: "<x> <y> <w> <h> z=<z> decorate=<d> gen=<g>\n"
+    if count == 0:
+        return 0
+    if wsys_wid_in_use(wid) == 0:
+        return -2
+    u: uint64 = cast[uint64](wid)
+    scratch: Array[128, uint8]
+    pos: uint64 = 0
+    pos = _wsys_emit_i64(&scratch[0], pos, wsys_win_x[u])
+    scratch[pos] = 32
+    pos = pos + 1
+    pos = _wsys_emit_i64(&scratch[0], pos, wsys_win_y[u])
+    scratch[pos] = 32
+    pos = pos + 1
+    pos = _wsys_emit_i64(&scratch[0], pos, _wsys_win_def_w(u))
+    scratch[pos] = 32
+    pos = pos + 1
+    pos = _wsys_emit_i64(&scratch[0], pos, _wsys_win_def_h(u))
+    scratch[pos] = 32
+    pos = pos + 1
+    scratch[pos] = 122                            # 'z'
+    scratch[pos + 1] = 61                         # '='
+    pos = pos + 2
+    pos = _wsys_emit_i64(&scratch[0], pos, wsys_win_z[u])
+    scratch[pos] = 32
+    pos = pos + 1
+    # decorate=<d>
+    scratch[pos] = 100
+    scratch[pos + 1] = 101
+    scratch[pos + 2] = 99
+    scratch[pos + 3] = 61
+    pos = pos + 4
+    pos = _wsys_emit_i64(&scratch[0], pos, cast[int64](wsys_win_decorate[u]))
+    scratch[pos] = 32
+    pos = pos + 1
+    # gen=<g>
+    scratch[pos] = 103
+    scratch[pos + 1] = 101
+    scratch[pos + 2] = 110
+    scratch[pos + 3] = 61
+    pos = pos + 4
+    pos = pos + _wsys_u64_to_dec(wsys_scene_gen[u], &scratch[pos])
+    scratch[pos] = 10
+    pos = pos + 1
+    return _wsys_copy_out(&scratch[0], pos, off, buf, count)
+
+
+def devwsys_winctl_write(wid: int32, buf: Ptr[uint8],
+                         count: uint64) -> int64:
+    # Scene-era per-window control verbs:
+    #   commit                  -> bump scene gen, snapshot prev, wake compositor
+    #   geometry x y w h        -> set origin + content size
+    #   z <n>                   -> set stacking order
+    #   decorate <0|1>          -> server-side-decoration flag
+    #   damage x y w h          -> explicit damage hint (folded into dirty)
+    # Owner OR hostowner only.
+    if wsys_wid_in_use(wid) == 0:
+        set_current_errstr("/dev/wsys/ctl: wid not in use")
+        return -1
+    if current_task_is_hostowner() == 0 and _wsys_caller_owns_wid(wid) == 0:
+        set_current_errstr("/dev/wsys/ctl: permission denied (not window owner)")
+        return -1
+    if count == 0:
+        return 0
+    u: uint64 = cast[uint64](wid)
+    p: uint64 = _wsys_ctl_skip_ws(buf, 0, count)
+    vs: uint64 = p
+    p = _wsys_ctl_token_end(buf, p, count)
+    ve: uint64 = p
+    if vs == ve:
+        set_current_errstr("/dev/wsys/ctl: missing verb")
+        return -1
+
+    if _wsys_ctl_word_eq(buf, vs, ve, "commit") == 1:
+        _wsys_scene_init_if_needed()
+        # Snapshot current scene into prev (for next diff) AFTER bumping
+        # gen, so the compositor reads the just-committed list. We copy
+        # current->prev here; the rasterize step diffs new vs prev.
+        base: uint64 = u * WSYS_SCENE_SIZE
+        ln: uint64 = wsys_scene_len[u]
+        i: uint64 = 0
+        while i < ln:
+            wsys_scene_prev_buf[base + i] = wsys_scene_buf[base + i]
+            i = i + 1
+        wsys_scene_prev_len[u] = ln
+        wsys_scene_gen[u] = wsys_scene_gen[u] + 1
+        # Reset the write cursor so the next frame's first write starts a
+        # fresh list.
+        wsys_scene_wpos[u] = 0
+        # Also bump the legacy mutation serial so existing damage readers
+        # see the change, and mark the whole window dirty.
+        _wsys_mark_dirty(wid, 0, 0, 65535, 65535)
+        wsys_commit_seq = wsys_commit_seq + 1
+        wq_wake_one(&wsys_commit_wq)
+        # Option-A self-contained present: rasterize + z-blit the scene
+        # caches straight to /dev/fb on commit. This is the kernel-side
+        # compositor; it does NOT touch the legacy hamUId cascade. No-op
+        # when there is no framebuffer (returns 0).
+        wsys_scene_present()
+        return cast[int64](count)
+
+    if _wsys_ctl_word_eq(buf, vs, ve, "z") == 1:
+        p = _wsys_ctl_skip_ws(buf, p, count)
+        a1s: uint64 = p
+        p = _wsys_ctl_token_end(buf, p, count)
+        a1e: uint64 = p
+        zv: int64 = 0
+        if a1s == a1e or _wctl_parse_i64(buf, a1s, a1e, &zv) == 0:
+            set_current_errstr("/dev/wsys/ctl: z: bad arg")
+            return -1
+        wsys_win_z[u] = zv
+        return cast[int64](count)
+
+    if _wsys_ctl_word_eq(buf, vs, ve, "decorate") == 1:
+        p = _wsys_ctl_skip_ws(buf, p, count)
+        a1s2: uint64 = p
+        p = _wsys_ctl_token_end(buf, p, count)
+        a1e2: uint64 = p
+        dv: uint64 = 0
+        if a1s2 == a1e2 or _wsys_ctl_parse_u64(buf, a1s2, a1e2, &dv) == 0:
+            set_current_errstr("/dev/wsys/ctl: decorate: bad arg")
+            return -1
+        if dv == 0:
+            wsys_win_decorate[u] = 0
+        else:
+            wsys_win_decorate[u] = 1
+        return cast[int64](count)
+
+    # geometry x y w h  /  damage x y w h : four i64 args.
+    is_geo: int32 = _wsys_ctl_word_eq(buf, vs, ve, "geometry")
+    is_dmg: int32 = _wsys_ctl_word_eq(buf, vs, ve, "damage")
+    if is_geo == 1 or is_dmg == 1:
+        p = _wsys_ctl_skip_ws(buf, p, count)
+        gxs: uint64 = p
+        p = _wsys_ctl_token_end(buf, p, count)
+        gxe: uint64 = p
+        gx: int64 = 0
+        if gxs == gxe or _wctl_parse_i64(buf, gxs, gxe, &gx) == 0:
+            set_current_errstr("/dev/wsys/ctl: missing x")
+            return -1
+        p = _wsys_ctl_skip_ws(buf, p, count)
+        gys: uint64 = p
+        p = _wsys_ctl_token_end(buf, p, count)
+        gye: uint64 = p
+        gy: int64 = 0
+        if gys == gye or _wctl_parse_i64(buf, gys, gye, &gy) == 0:
+            set_current_errstr("/dev/wsys/ctl: missing y")
+            return -1
+        p = _wsys_ctl_skip_ws(buf, p, count)
+        gws: uint64 = p
+        p = _wsys_ctl_token_end(buf, p, count)
+        gwe: uint64 = p
+        gw: int64 = 0
+        if gws == gwe or _wctl_parse_i64(buf, gws, gwe, &gw) == 0:
+            set_current_errstr("/dev/wsys/ctl: missing w")
+            return -1
+        p = _wsys_ctl_skip_ws(buf, p, count)
+        ghs: uint64 = p
+        p = _wsys_ctl_token_end(buf, p, count)
+        ghe: uint64 = p
+        gh: int64 = 0
+        if ghs == ghe or _wctl_parse_i64(buf, ghs, ghe, &gh) == 0:
+            set_current_errstr("/dev/wsys/ctl: missing h")
+            return -1
+        if is_geo == 1:
+            wsys_win_x[u] = gx
+            wsys_win_y[u] = gy
+            if gw > 0:
+                wsys_win_w[u] = gw
+            if gh > 0:
+                wsys_win_h[u] = gh
+            wsys_win_geo_init[u] = 1
+        else:
+            _wsys_mark_dirty(wid, gx, gy, gx + gw, gy + gh)
+        return cast[int64](count)
+
+    set_current_errstr("/dev/wsys/ctl: bad verb")
+    return -1
+
+
+# --- cursor scene (slot 0) -------------------------------------------
+
+def devwsys_cursor_scene_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # The cursor's own always-on-top display list. Wid 0 slot. Hostowner
+    # OR any caller (the cursor is a system surface driven by the mouse
+    # path); we keep it permissive but writes are tiny.
+    if count == 0:
+        return 0
+    # Cursor scenes are tiny single writes; each write REPLACES the list.
+    pos: uint64 = 0
+    i: uint64 = 0
+    while i < count and pos < WSYS_SCENE_SIZE:
+        wsys_scene_buf[pos] = buf[i]
+        pos = pos + 1
+        i = i + 1
+    wsys_scene_wpos[0] = pos
+    wsys_scene_len[0] = pos
+    _wsys_scene_init_if_needed()
+    wsys_commit_seq = wsys_commit_seq + 1
+    wq_wake_one(&wsys_commit_wq)
+    # Cursor moves are decoupled from window recomposition: blit ONLY the
+    # cursor sprite (restore-behind would need a saved backdrop; for this
+    # wave we re-present the cursor sprite at its new origin without
+    # re-rasterizing any window cache).
+    if fb_get_initialized() != 0:
+        _wsys_present_cursor()
+    return cast[int64](i)
+
+
+def devwsys_cursor_scene_read(off: uint64, buf: Ptr[uint8],
+                              count: uint64) -> int64:
+    if count == 0:
+        return 0
+    n: uint64 = wsys_scene_len[0]
+    if off >= n:
+        return 0
+    remaining: uint64 = n - off
+    take: uint64 = count
+    if take > remaining:
+        take = remaining
+    i: uint64 = 0
+    while i < take:
+        buf[i] = wsys_scene_buf[off + i]
+        i = i + 1
+    return cast[int64](take)
+
+
+# =====================================================================
+# RASTERIZER (Floor + Widget tiers) — scene text -> per-window cache
+# =====================================================================
+#
+# Parses the §4 scene grammar into a window-local RGBA8888 pixel cache.
+# The cache backing is the lazy 4 MiB layer-fb block (_wsys_layer_fb_
+# ensure); we treat it as a tightly-packed RGBA frame of stride = window
+# width. A 4 MiB block holds up to 1024x1024 RGBA, so width/height are
+# capped at WSYS_SCENE_CACHE_MAX.
+#
+# Primitives: clip / fill / rect(=fill) / stroke / line / text / glyphs.
+# image is parsed-and-ignored (Bitmap tier, later). Colours are #RRGGBB
+# or #RRGGBBAA. Each primitive is stateless: it writes pixels into the
+# cache clipped to the active clip rect and the cache bounds.
+
+WSYS_SCENE_CACHE_MAX: int64 = 1024       # max cache w/h (4MiB RGBA cap)
+
+# Active clip rect during a rasterize pass (module-scope scratch; the
+# rasterizer is not re-entrant — the compositor calls it serially).
+_wsys_rast_clip_x0: int64 = 0
+_wsys_rast_clip_y0: int64 = 0
+_wsys_rast_clip_x1: int64 = 0
+_wsys_rast_clip_y1: int64 = 0
+_wsys_rast_w: int64 = 0
+_wsys_rast_h: int64 = 0
+
+
+def _wsys_hex_nibble(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return cast[int32](c) - 48
+    if c >= 97 and c <= 102:
+        return cast[int32](c) - 97 + 10
+    if c >= 65 and c <= 70:
+        return cast[int32](c) - 65 + 10
+    return -1
+
+
+def _wsys_parse_color(buf: Ptr[uint8], start: uint64, end: uint64,
+                      out_r: Ptr[uint8], out_g: Ptr[uint8],
+                      out_b: Ptr[uint8], out_a: Ptr[uint8]) -> int32:
+    # Parse #RRGGBB or #RRGGBBAA at buf[start..end). Returns 1 on success.
+    if start >= end:
+        return 0
+    if buf[start] != 35:                      # '#'
+        return 0
+    nlen: uint64 = end - start - 1
+    if nlen != 6 and nlen != 8:
+        return 0
+    p: uint64 = start + 1
+    hr: int32 = _wsys_hex_nibble(buf[p]) * 16 + _wsys_hex_nibble(buf[p + 1])
+    hg: int32 = _wsys_hex_nibble(buf[p + 2]) * 16 + _wsys_hex_nibble(buf[p + 3])
+    hb: int32 = _wsys_hex_nibble(buf[p + 4]) * 16 + _wsys_hex_nibble(buf[p + 5])
+    if hr < 0 or hg < 0 or hb < 0:
+        return 0
+    ha: int32 = 255
+    if nlen == 8:
+        ha = _wsys_hex_nibble(buf[p + 6]) * 16 + _wsys_hex_nibble(buf[p + 7])
+        if ha < 0:
+            return 0
+    out_r[0] = cast[uint8](hr)
+    out_g[0] = cast[uint8](hg)
+    out_b[0] = cast[uint8](hb)
+    out_a[0] = cast[uint8](ha)
+    return 1
+
+
+def _wsys_cache_putpixel(cache: Ptr[uint8], x: int64, y: int64,
+                         r: uint8, g: uint8, b: uint8, a: uint8):
+    # Store one RGBA pixel, clipped to the active clip rect and cache
+    # bounds. Alpha-over the existing pixel when a<255 (simple blend).
+    if x < _wsys_rast_clip_x0 or x >= _wsys_rast_clip_x1:
+        return
+    if y < _wsys_rast_clip_y0 or y >= _wsys_rast_clip_y1:
+        return
+    if x < 0 or y < 0 or x >= _wsys_rast_w or y >= _wsys_rast_h:
+        return
+    off: uint64 = (cast[uint64](y) * cast[uint64](_wsys_rast_w)
+                   + cast[uint64](x)) * 4
+    if a >= 255:
+        cache[off] = r
+        cache[off + 1] = g
+        cache[off + 2] = b
+        cache[off + 3] = 255
+        return
+    # alpha-over
+    ia: uint32 = 255 - cast[uint32](a)
+    dr: uint32 = cast[uint32](cache[off])
+    dg: uint32 = cast[uint32](cache[off + 1])
+    db: uint32 = cast[uint32](cache[off + 2])
+    cache[off] = cast[uint8]((cast[uint32](r) * cast[uint32](a) + dr * ia) / 255)
+    cache[off + 1] = cast[uint8]((cast[uint32](g) * cast[uint32](a) + dg * ia) / 255)
+    cache[off + 2] = cast[uint8]((cast[uint32](b) * cast[uint32](a) + db * ia) / 255)
+    cache[off + 3] = 255
+
+
+def _wsys_cache_fillrect(cache: Ptr[uint8], x: int64, y: int64,
+                         w: int64, h: int64,
+                         r: uint8, g: uint8, b: uint8, a: uint8):
+    yy: int64 = y
+    ylim: int64 = y + h
+    while yy < ylim:
+        xx: int64 = x
+        xlim: int64 = x + w
+        while xx < xlim:
+            _wsys_cache_putpixel(cache, xx, yy, r, g, b, a)
+            xx = xx + 1
+        yy = yy + 1
+
+
+def _wsys_cache_draw_char(cache: Ptr[uint8], ch: int32, px: int64,
+                          py: int64, r: uint8, g: uint8,
+                          b: uint8, a: uint8):
+    # 8x16 glyph at top-left (px,py) using the console font. Only set
+    # (foreground) pixels are written — the background shows through.
+    c: int32 = ch
+    if c < 0 or c >= 128:
+        c = 32
+    gbase: uint64 = fb_font_glyph_addr() + cast[uint64](c) * 16
+    row: uint64 = 0
+    while row < 16:
+        bits: uint8 = cast[Ptr[uint8]](gbase + row)[0]
+        col: uint64 = 0
+        while col < 8:
+            mask: uint8 = cast[uint8](0x80 >> col)
+            if (bits & mask) != 0:
+                _wsys_cache_putpixel(cache, px + cast[int64](col),
+                                     py + cast[int64](row), r, g, b, a)
+            col = col + 1
+        row = row + 1
+
+
+def _wsys_scene_next_int(buf: Ptr[uint8], pp: Ptr[uint64],
+                         count: uint64, out: Ptr[int64]) -> int32:
+    # Skip ws, parse a signed decimal token, advance *pp. Returns 1 ok.
+    p: uint64 = _wsys_ctl_skip_ws(buf, pp[0], count)
+    s: uint64 = p
+    p = _wsys_ctl_token_end(buf, p, count)
+    e: uint64 = p
+    pp[0] = p
+    if s == e:
+        return 0
+    v: int64 = 0
+    if _wctl_parse_i64(buf, s, e, &v) == 0:
+        return 0
+    out[0] = v
+    return 1
+
+
+def _wsys_rasterize_window(wid: int32):
+    # Rasterize wid's CURRENT scene text into its RGBA cache. Clears the
+    # cache to transparent black first (full redraw — damage-clipped
+    # incremental raster is a later refinement; correctness first).
+    u: uint64 = cast[uint64](wid)
+    if u >= WSYS_SCENE_SLOTS:
+        return
+    cache: Ptr[uint8] = _wsys_layer_fb_ensure(wid)
+    if cast[uint64](cache) == 0:
+        return
+    w: int64 = _wsys_win_def_w(u)
+    h: int64 = _wsys_win_def_h(u)
+    if w > WSYS_SCENE_CACHE_MAX:
+        w = WSYS_SCENE_CACHE_MAX
+    if h > WSYS_SCENE_CACHE_MAX:
+        h = WSYS_SCENE_CACHE_MAX
+    _wsys_rast_w = w
+    _wsys_rast_h = h
+    _wsys_rast_clip_x0 = 0
+    _wsys_rast_clip_y0 = 0
+    _wsys_rast_clip_x1 = w
+    _wsys_rast_clip_y1 = h
+    # Clear cache to opaque black.
+    memset(cache, 0, cast[uint64](w) * cast[uint64](h) * 4)
+    base: uint64 = u * WSYS_SCENE_SIZE
+    n: uint64 = wsys_scene_len[u]
+    i: uint64 = 0
+    while i < n:
+        # find end of line
+        ls: uint64 = i
+        while i < n and wsys_scene_buf[base + i] != 10:
+            i = i + 1
+        le: uint64 = i
+        if i < n:
+            i = i + 1                          # skip '\n'
+        _wsys_rast_line(cache, &wsys_scene_buf[base], ls, le)
+
+
+def _wsys_rast_line(cache: Ptr[uint8], buf: Ptr[uint8],
+                    ls: uint64, le: uint64):
+    # Rasterize one scene line buf[ls..le). Comments (#<space>) and blank
+    # lines are ignored.
+    p: uint64 = _wsys_ctl_skip_ws(buf, ls, le)
+    if p >= le:
+        return
+    vs: uint64 = p
+    p = _wsys_ctl_token_end(buf, p, le)
+    ve: uint64 = p
+    # Comment: a '#' verb token (the colour token is never first).
+    if ve - vs >= 1 and buf[vs] == 35:
+        return
+
+    if _wsys_ctl_word_eq(buf, vs, ve, "clip") == 1:
+        cx: int64 = 0
+        cy: int64 = 0
+        cw: int64 = 0
+        ch2: int64 = 0
+        if _wsys_scene_next_int(buf, &p, le, &cx) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &cy) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &cw) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &ch2) == 0:
+            return
+        _wsys_rast_clip_x0 = cx
+        _wsys_rast_clip_y0 = cy
+        _wsys_rast_clip_x1 = cx + cw
+        _wsys_rast_clip_y1 = cy + ch2
+        return
+
+    is_fill: int32 = _wsys_ctl_word_eq(buf, vs, ve, "fill")
+    is_rect: int32 = _wsys_ctl_word_eq(buf, vs, ve, "rect")
+    if is_fill == 1 or is_rect == 1:
+        fx: int64 = 0
+        fy: int64 = 0
+        fw: int64 = 0
+        fh: int64 = 0
+        if _wsys_scene_next_int(buf, &p, le, &fx) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &fy) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &fw) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &fh) == 0:
+            return
+        cp: uint64 = _wsys_ctl_skip_ws(buf, p, le)
+        ce: uint64 = _wsys_ctl_token_end(buf, cp, le)
+        rr: uint8 = 0
+        gg: uint8 = 0
+        bb: uint8 = 0
+        aa: uint8 = 255
+        if _wsys_parse_color(buf, cp, ce, &rr, &gg, &bb, &aa) == 0:
+            return
+        _wsys_cache_fillrect(cache, fx, fy, fw, fh, rr, gg, bb, aa)
+        return
+
+    if _wsys_ctl_word_eq(buf, vs, ve, "stroke") == 1:
+        sx: int64 = 0
+        sy: int64 = 0
+        sw: int64 = 0
+        sh: int64 = 0
+        st: int64 = 0
+        if _wsys_scene_next_int(buf, &p, le, &sx) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &sy) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &sw) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &sh) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &st) == 0:
+            return
+        cp2: uint64 = _wsys_ctl_skip_ws(buf, p, le)
+        ce2: uint64 = _wsys_ctl_token_end(buf, cp2, le)
+        sr: uint8 = 0
+        sg: uint8 = 0
+        sb: uint8 = 0
+        sa: uint8 = 255
+        if _wsys_parse_color(buf, cp2, ce2, &sr, &sg, &sb, &sa) == 0:
+            return
+        if st < 1:
+            st = 1
+        # four edges of thickness st
+        _wsys_cache_fillrect(cache, sx, sy, sw, st, sr, sg, sb, sa)
+        _wsys_cache_fillrect(cache, sx, sy + sh - st, sw, st, sr, sg, sb, sa)
+        _wsys_cache_fillrect(cache, sx, sy, st, sh, sr, sg, sb, sa)
+        _wsys_cache_fillrect(cache, sx + sw - st, sy, st, sh, sr, sg, sb, sa)
+        return
+
+    if _wsys_ctl_word_eq(buf, vs, ve, "line") == 1:
+        x1: int64 = 0
+        y1: int64 = 0
+        x2: int64 = 0
+        y2: int64 = 0
+        lt: int64 = 0
+        if _wsys_scene_next_int(buf, &p, le, &x1) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &y1) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &x2) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &y2) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &lt) == 0:
+            return
+        cp3: uint64 = _wsys_ctl_skip_ws(buf, p, le)
+        ce3: uint64 = _wsys_ctl_token_end(buf, cp3, le)
+        lr: uint8 = 0
+        lg: uint8 = 0
+        lb: uint8 = 0
+        la: uint8 = 255
+        if _wsys_parse_color(buf, cp3, ce3, &lr, &lg, &lb, &la) == 0:
+            return
+        _wsys_rast_drawline(cache, x1, y1, x2, y2, lr, lg, lb, la)
+        return
+
+    # text / glyphs: x y "string" #color
+    is_text: int32 = _wsys_ctl_word_eq(buf, vs, ve, "text")
+    is_glyphs: int32 = _wsys_ctl_word_eq(buf, vs, ve, "glyphs")
+    if is_text == 1 or is_glyphs == 1:
+        tx: int64 = 0
+        ty: int64 = 0
+        if _wsys_scene_next_int(buf, &p, le, &tx) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &ty) == 0:
+            return
+        # find opening quote
+        q: uint64 = _wsys_ctl_skip_ws(buf, p, le)
+        if q >= le or buf[q] != 34:            # '"'
+            return
+        q = q + 1
+        ss: uint64 = q
+        while q < le and buf[q] != 34:
+            q = q + 1
+        se: uint64 = q
+        if q >= le:
+            return
+        q = q + 1                              # skip closing quote
+        cp4: uint64 = _wsys_ctl_skip_ws(buf, q, le)
+        ce4: uint64 = _wsys_ctl_token_end(buf, cp4, le)
+        tr: uint8 = 255
+        tg: uint8 = 255
+        tb: uint8 = 255
+        ta: uint8 = 255
+        if _wsys_parse_color(buf, cp4, ce4, &tr, &tg, &tb, &ta) == 0:
+            return
+        # text is baseline-anchored: top = y - ascent(12). glyphs is
+        # cell-anchored: top = y.
+        top: int64 = ty
+        if is_text == 1:
+            top = ty - 12
+        cx2: int64 = tx
+        si: uint64 = ss
+        while si < se:
+            _wsys_cache_draw_char(cache, cast[int32](buf[si]), cx2, top,
+                                  tr, tg, tb, ta)
+            cx2 = cx2 + 8
+            si = si + 1
+        return
+
+    # image / tiles — Bitmap tier, parse-and-ignore gracefully.
+    if _wsys_ctl_word_eq(buf, vs, ve, "image") == 1:
+        return
+    if _wsys_ctl_word_eq(buf, vs, ve, "damage") == 1:
+        return
+    # unknown verb: ignore (forward-compatible)
+
+
+def _wsys_rast_drawline(cache: Ptr[uint8], x0: int64, y0: int64,
+                        x1: int64, y1: int64, r: uint8, g: uint8,
+                        b: uint8, a: uint8):
+    # Bresenham, thickness 1 (thick lines approximated as 1px for now).
+    dx: int64 = x1 - x0
+    if dx < 0:
+        dx = -dx
+    dy: int64 = y1 - y0
+    if dy < 0:
+        dy = -dy
+    sx: int64 = 1
+    if x0 > x1:
+        sx = -1
+    sy: int64 = 1
+    if y0 > y1:
+        sy = -1
+    err: int64 = dx - dy
+    cx: int64 = x0
+    cy: int64 = y0
+    guard: int64 = 0
+    while guard < 4096:
+        _wsys_cache_putpixel(cache, cx, cy, r, g, b, a)
+        if cx == x1 and cy == y1:
+            return
+        e2: int64 = err * 2
+        if e2 > -dy:
+            err = err - dy
+            cx = cx + sx
+        if e2 < dx:
+            err = err + dx
+            cy = cy + sy
+        guard = guard + 1
+
+
+# =====================================================================
+# COMPOSITOR — z-blit caches to the physical framebuffer (option A)
+# =====================================================================
+#
+# Kernel-side present. On `commit` (or cursor move) the compositor
+# rasterizes the changed windows and z-blits every live window's cache,
+# bottom-to-top by z, into /dev/fb via fb_present_rgba_row. The cursor
+# scene is composited LAST. Event-driven: a present is triggered by a
+# `commit` write (which wakes wsys_commit_wq); a userland present loop
+# (or the gate) reads /dev/wsys/present to drive a frame.
+#
+# This is the SELF-CONTAINED scene path; it does NOT touch the legacy
+# hamUId render cascade that rc.5 depends on.
+
+def _wsys_present_window(wid: int32):
+    # Blit wid's cache to the screen at (win_x, win_y). Caller has already
+    # rasterized. Rows are presented via fb_present_rgba_row (RGBA src).
+    u: uint64 = cast[uint64](wid)
+    cache: Ptr[uint8] = _wsys_layer_fb_get(wid)
+    if cast[uint64](cache) == 0:
+        return
+    w: int64 = _wsys_win_def_w(u)
+    h: int64 = _wsys_win_def_h(u)
+    if w > WSYS_SCENE_CACHE_MAX:
+        w = WSYS_SCENE_CACHE_MAX
+    if h > WSYS_SCENE_CACHE_MAX:
+        h = WSYS_SCENE_CACHE_MAX
+    ox: int64 = wsys_win_x[u]
+    oy: int64 = wsys_win_y[u]
+    if ox < 0:
+        ox = 0
+    if oy < 0:
+        oy = 0
+    sy: uint64 = 0
+    while cast[int64](sy) < h:
+        fb_present_rgba_row(sy, cast[uint64](ox),
+                            cast[uint64](oy) + sy, cast[uint64](w),
+                            cache, cast[uint64](w))
+        sy = sy + 1
+
+
+def wsys_scene_present() -> int32:
+    # Rasterize every live window with a non-empty scene, then z-blit all
+    # caches bottom-to-top, then the cursor. Returns the number of
+    # windows presented. Safe to call when no fb (no-op, returns 0).
+    if fb_get_initialized() == 0:
+        return 0
+    _wsys_init_if_needed()
+    # Rasterize all live windows that have a scene.
+    w: uint64 = 1
+    while w < WSYS_SCENE_SLOTS:
+        if wsys_slot_in_use[w] != 0 and wsys_scene_len[w] > 0:
+            _wsys_rasterize_window(cast[int32](w))
+        w = w + 1
+    # Z-blit bottom-to-top. z range is small; do a simple ordered sweep
+    # over a bounded set of z levels (-128..127 folded by repeated min).
+    presented: int32 = 0
+    # Find min and max z among live scene windows.
+    have: int32 = 0
+    zmin: int64 = 0
+    zmax: int64 = 0
+    w2: uint64 = 1
+    while w2 < WSYS_SCENE_SLOTS:
+        if wsys_slot_in_use[w2] != 0 and wsys_scene_len[w2] > 0:
+            zz: int64 = wsys_win_z[w2]
+            if have == 0:
+                zmin = zz
+                zmax = zz
+                have = 1
+            else:
+                if zz < zmin:
+                    zmin = zz
+                if zz > zmax:
+                    zmax = zz
+        w2 = w2 + 1
+    if have == 0:
+        # still composite cursor
+        _wsys_present_cursor()
+        return 0
+    zc: int64 = zmin
+    while zc <= zmax:
+        w3: uint64 = 1
+        while w3 < WSYS_SCENE_SLOTS:
+            if wsys_slot_in_use[w3] != 0 and wsys_scene_len[w3] > 0 \
+                    and wsys_win_z[w3] == zc:
+                _wsys_present_window(cast[int32](w3))
+                presented = presented + 1
+            w3 = w3 + 1
+        zc = zc + 1
+    _wsys_present_cursor()
+    return presented
+
+
+def _wsys_present_cursor():
+    # Composite the cursor scene (slot 0) LAST, always on top, at its own
+    # window-local coords (the cursor scene's fill carries the position).
+    if wsys_scene_len[0] == 0:
+        return
+    # Rasterize cursor scene into slot-0's cache (reuse the layer-fb
+    # block keyed at a dedicated high wid won't work — slot 0 has no
+    # layer block; carve a tiny fixed cursor cache instead).
+    _wsys_rasterize_cursor()
+    cur: Ptr[uint8] = cast[Ptr[uint8]](wsys_cursor_cache_page)
+    if cast[uint64](cur) == 0:
+        return
+    cw: int64 = WSYS_CURSOR_CACHE_DIM
+    ch2: int64 = WSYS_CURSOR_CACHE_DIM
+    ox: int64 = wsys_cursor_blit_x
+    oy: int64 = wsys_cursor_blit_y
+    sy: uint64 = 0
+    while cast[int64](sy) < ch2:
+        fb_present_rgba_row(sy, cast[uint64](ox),
+                            cast[uint64](oy) + sy, cast[uint64](cw),
+                            cur, cast[uint64](cw))
+        sy = sy + 1
+
+
+WSYS_CURSOR_CACHE_DIM: int64 = 32        # 32x32 cursor sprite
+wsys_cursor_cache_page: uint64 = 0       # lazily-allocated cursor cache
+wsys_cursor_blit_x: int64 = 0
+wsys_cursor_blit_y: int64 = 0
+
+
+def _wsys_rasterize_cursor():
+    # Rasterize the cursor scene (slot 0) into a small fixed 32x32 cache.
+    # The cursor scene's primitives are in cursor-local coords; the blit
+    # origin is read from a leading "# at X Y" comment OR defaults to the
+    # last set cursor position. We keep it simple: parse a `fill`/`rect`
+    # whose x,y are taken as the on-screen origin, and render the sprite
+    # at (0,0) locally so it blits at the parsed origin.
+    if wsys_cursor_cache_page == 0:
+        pg: uint64 = alloc_pages(0)            # one page = 4 KiB >= 32*32*4
+        if pg == 0:
+            return
+        wsys_cursor_cache_page = pg
+    cache: Ptr[uint8] = cast[Ptr[uint8]](wsys_cursor_cache_page)
+    memset(cache, 0, cast[uint64](WSYS_CURSOR_CACHE_DIM)
+           * cast[uint64](WSYS_CURSOR_CACHE_DIM) * 4)
+    _wsys_rast_w = WSYS_CURSOR_CACHE_DIM
+    _wsys_rast_h = WSYS_CURSOR_CACHE_DIM
+    _wsys_rast_clip_x0 = 0
+    _wsys_rast_clip_y0 = 0
+    _wsys_rast_clip_x1 = WSYS_CURSOR_CACHE_DIM
+    _wsys_rast_clip_y1 = WSYS_CURSOR_CACHE_DIM
+    # Parse the FIRST fill/rect line for the on-screen origin; render all
+    # primitives translated so origin maps to (0,0) in the sprite.
+    n: uint64 = wsys_scene_len[0]
+    got_origin: int32 = 0
+    ox: int64 = 0
+    oy: int64 = 0
+    i: uint64 = 0
+    while i < n:
+        ls: uint64 = i
+        while i < n and wsys_scene_buf[i] != 10:
+            i = i + 1
+        le: uint64 = i
+        if i < n:
+            i = i + 1
+        # peek verb + first two ints for origin
+        p: uint64 = _wsys_ctl_skip_ws(&wsys_scene_buf[0], ls, le)
+        vs: uint64 = p
+        p = _wsys_ctl_token_end(&wsys_scene_buf[0], p, le)
+        ve: uint64 = p
+        if ve - vs >= 1 and wsys_scene_buf[vs] == 35:
+            continue
+        if got_origin == 0:
+            px: int64 = 0
+            py: int64 = 0
+            pp: uint64 = p
+            if _wsys_scene_next_int(&wsys_scene_buf[0], &pp, le, &px) == 1 \
+                    and _wsys_scene_next_int(&wsys_scene_buf[0], &pp, le, &py) == 1:
+                ox = px
+                oy = py
+                got_origin = 1
+    if got_origin == 1:
+        wsys_cursor_blit_x = ox
+        wsys_cursor_blit_y = oy
+    # Re-walk and render each primitive translated by -origin.
+    i2: uint64 = 0
+    while i2 < n:
+        ls2: uint64 = i2
+        while i2 < n and wsys_scene_buf[i2] != 10:
+            i2 = i2 + 1
+        le2: uint64 = i2
+        if i2 < n:
+            i2 = i2 + 1
+        _wsys_rast_cursor_line(cache, ls2, le2, ox, oy)
+
+
+def _wsys_rast_cursor_line(cache: Ptr[uint8], ls: uint64, le: uint64,
+                           ox: int64, oy: int64):
+    # Like _wsys_rast_line but only honours fill/rect, translated by
+    # (-ox,-oy) so the sprite is local to the 32x32 cache.
+    buf: Ptr[uint8] = &wsys_scene_buf[0]
+    p: uint64 = _wsys_ctl_skip_ws(buf, ls, le)
+    if p >= le:
+        return
+    vs: uint64 = p
+    p = _wsys_ctl_token_end(buf, p, le)
+    ve: uint64 = p
+    if ve - vs >= 1 and buf[vs] == 35:
+        return
+    is_fill: int32 = _wsys_ctl_word_eq(buf, vs, ve, "fill")
+    is_rect: int32 = _wsys_ctl_word_eq(buf, vs, ve, "rect")
+    if is_fill == 0 and is_rect == 0:
+        return
+    fx: int64 = 0
+    fy: int64 = 0
+    fw: int64 = 0
+    fh: int64 = 0
+    if _wsys_scene_next_int(buf, &p, le, &fx) == 0:
+        return
+    if _wsys_scene_next_int(buf, &p, le, &fy) == 0:
+        return
+    if _wsys_scene_next_int(buf, &p, le, &fw) == 0:
+        return
+    if _wsys_scene_next_int(buf, &p, le, &fh) == 0:
+        return
+    cp: uint64 = _wsys_ctl_skip_ws(buf, p, le)
+    ce: uint64 = _wsys_ctl_token_end(buf, cp, le)
+    rr: uint8 = 0
+    gg: uint8 = 0
+    bb: uint8 = 0
+    aa: uint8 = 255
+    if _wsys_parse_color(buf, cp, ce, &rr, &gg, &bb, &aa) == 0:
+        return
+    _wsys_cache_fillrect(cache, fx - ox, fy - oy, fw, fh, rr, gg, bb, aa)
