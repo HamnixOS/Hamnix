@@ -558,6 +558,15 @@ if os.environ.get("ENABLE_SMP_SOAK") == "1":
 if os.environ.get("ENABLE_SCHED_FAIR") == "1":
     FILES.append(("/etc/sched-fair", b"1\n"))
 
+# NTASKS-ceiling concurrency proof. scripts/test_ntasks_ceiling.sh sets
+# ENABLE_NTASKS_TEST=1 to plant /etc/ntasks-test. init/main.ad at
+# boot:37.ntasks_test detects the marker and calls ntasks_ceiling_test_run()
+# (kernel/sched/core.ad): it holds >64 kthreads live SIMULTANEOUSLY to prove
+# the NTASKS=256 lift actually took effect, then drains them. Default boots
+# omit the marker.
+if os.environ.get("ENABLE_NTASKS_TEST") == "1":
+    FILES.append(("/etc/ntasks-test", b"1\n"))
+
 # Stage-A per-CPU TSS proof. scripts/test_smp_user.sh sets ENABLE_SMP_USER=1
 # to plant /etc/smp-user. init/main.ad at boot:37.smp_user detects the
 # marker and calls smp_user_ap_selftest() (kernel/sched/core.ad): it spawns
