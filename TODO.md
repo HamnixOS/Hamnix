@@ -95,36 +95,48 @@ backwards.
 
 ## Post-audit cleanup wave (current focus)
 
+> **RECONCILED 2026-06-17** (source-verified, not audit-snapshot). ~12 of
+> the 16 post-audit items below are DONE since the 2026-06-13 audit and
+> have been checked off. **Genuinely still open:** CPU-mitigations
+> (SMEP landed; **SMAP CR4-flip + KASLR + KPTI** open — the SMAP flip is
+> gated OFF because high-half kernel pages are US=1 and flipping would
+> triple-fault until they're re-stamped US=0); **suspend/resume** (S3
+> suspend path real; HW **wake-vector trampoline** in entry.S pending);
+> **F2 thin-shim** (delegation done, arm bodies physically remain);
+> **DE pivot dead-code removal** (functionally retired at runtime;
+> ~20K dead LOC still in `user/hamUId.ad`). The buddy double-free (#439)
+> is FIXED (boot-CR3 guard, `mm/page_alloc.ad:40-65`), not parked.
+
 Disjoint, parallelizable. Top items go through agents first.
 
 ### Capacity & Linux-ABI blockers (gap audit)
 
-- [ ] **Lift kernel capacity caps.** `NTASKS=16` → 256 (or grow
+- [x] **Lift kernel capacity caps.** (DONE: NTASKS=256, NR_FDS=64, TCP slots=256.) `NTASKS=16` → 256 (or grow
   dynamically); per-task `NR_FDS=16` → 256; TCP `MAX_SOCKETS=8` → 256.
   Audit other hardcoded small caps. Cite: `kernel/sched/core.ad:939,5553`,
   `drivers/net/tcp.ad:187`.
-- [ ] **Real `listen()`/`accept()`/`bind()` in Linux ABI.** Today only
+- [x] **Real `listen()`/`accept()`/`bind()` in Linux ABI.** (DONE: AF_INET via tcp_listen/tcp_accept + AF_UNIX + AF_NETLINK + UDP, all real.) Today only
   client-side `connect` works (`linux_abi/u_syscalls.ad:14421` header).
   Implement the server-side socket triple over native `/net` 9P so
   openssh-server, nginx, postgres start.
-- [ ] **Net-protocol honesty pass.** For each of sctp/mptcp/wireguard/
+- [x] **Net-protocol honesty pass.** (DONE: all 18 files carry honest "in-memory selftest only" / "real data paths wired" banners; STATUS framing accurate.) For each of sctp/mptcp/wireguard/
   ipsec/macsec/vxlan/geneve/gre/l2tp/ipip/sit/nat64/igmp/bond/bridge/
   vlan/ipvlan/macvlan: either wire to the NIC/`/net` data path OR add a
   prominent "in-memory selftest only" comment + remove from STATUS
   "real" framing.
-- [ ] **u_caps wiring.** Make capset/capget gate at least the obvious
+- [x] **u_caps wiring.** (DONE: CAP_SYS_ADMIN gates mount; CAP_NET_ADMIN gates devnet ctl.) Make capset/capget gate at least the obvious
   ops (CAP_NET_ADMIN, CAP_SYS_ADMIN). File's own header
   (`linux_abi/u_caps.ad:18-20`) admits it gates nothing.
 - [ ] **CPU-mitigations & kernel hardening.** Wire SMEP/SMAP (CR4
   bits + `clac/stac` at uaccess boundaries); KPTI; KASLR; STATUS line
   about kernel lockdown. `arch/x86/kernel/trap_diag.ad:382` literally
   says SMAP not enabled.
-- [ ] **cgroup v2 skeleton.** At least one real controller (cpu or
+- [x] **cgroup v2 skeleton.** (DONE: real cpu.max bandwidth controller, scheduler-enforced — kernel/sched/cgroup_cpu.ad.) At least one real controller (cpu or
   memory) gated by `/sys/fs/cgroup/<group>/cpu.max`. systemd refuses
   to boot without this.
 - [ ] **Suspend/resume.** S3 + S0ix on ACPI. Save/restore CPU state +
   device callbacks.
-- [ ] **Kernel oops capture.** `panic()` writes a structured record to
+- [x] **Kernel oops capture.** (DONE: panic()→_persist_oops writes OOPS.BIN+LOG.TXT to ESP; user/oopsread.ad reader.) `panic()` writes a structured record to
   the ESP `LOG.TXT` extent (already wired for boot log). Then `journalctl
   -k`-shape userland reader. Cite TODO.md:309.
 
@@ -134,17 +146,17 @@ Disjoint, parallelizable. Top items go through agents first.
   `SYS_NETCFG`/`SYS_RESOLVE`/`SYS_WSYS_*` syscall ARM BODIES with thin
   shims that delegate to the corresponding ctl file. The ctl files are
   the real implementation; the syscall arms must stop duplicating.
-- [ ] **Perm-body real-enforcement pass.** Replace world-r/w stubs in:
+- [x] **Perm-body real-enforcement pass.** (DONE: tmpfs per-inode mode; fat hostowner-write/world-read; devcons/devsrv real gates; devauth admit-all by design — gate is in the cdev.) Replace world-r/w stubs in:
   `fs/tmpfs.ad::tmpfs_perm_check` (give entries per-inode mode bits);
   `fs/fat.ad::fat_perm_check`; `sys/src/9/port/devcons.ad`; `devsrv.ad`;
   `devauth.ad`. tmpfs first (highest exploit surface).
-- [ ] **Hostowner-reach cleanup.** Route the 10 raw `current_task_uid()
+- [x] **Hostowner-reach cleanup.** (DONE: 0 raw `current_task_uid() != 1` left in syscall.ad; routed through `_syscall_require_hostowner`.) Route the 10 raw `current_task_uid()
   != 1` checks in `arch/x86/kernel/syscall.ad` through the F3 server
   boundary (`_perm_check_<X>` at the file open / write site), so policy
   lives in one place per resource.
-- [ ] **F10-9 followthrough.** Delete `is_ext_path` and its remaining
+- [x] **F10-9 followthrough.** (DONE: no live `is_ext_path` import/call site remains; only a retired-ladder comment.) Delete `is_ext_path` and its remaining
   call sites at `linux_abi/u_syscalls.ad:603,3338,7376`.
-- [ ] **Plan 9 `Dir` record full emission.** F10-6 MVP only emits from
+- [x] **Plan 9 `Dir` record full emission.** (DONE: devproc + devnet + devblk all emit Dir records; the devblk path was un-shadowed by fixing the SYS_SECCOMP_NATIVE=318 collision → 320, commit 6bea0bfd. Remaining F10-6 follow-on: real atime/mtime + per-task uid.) F10-6 MVP only emits from
   `/srv`. Extend to devproc / devnet / devblk dir listings so userland
   can `stat`-per-line without re-stat.
 - [ ] **DE pivot finish — substitution not addition.** Wave 1–6 added
@@ -152,10 +164,10 @@ Disjoint, parallelizable. Top items go through agents first.
   fallback paths. Now physically remove the dead render code and the
   no-op markers, replace the `daemon_pixel` framework with a thin
   router. Compositor target: drop `user/hamUId.ad` below ~10 KLOC.
-- [ ] **Runtime DE smoke test.** Boot the installer image in QEMU,
+- [x] **Runtime DE smoke test.** (DONE: test_installer_de_runlevel5.sh boots QEMU/OVMF + pmemsave framebuffer pixel-distinctness gate; plus test_de_scene_render/termfm/menu_input.) Boot the installer image in QEMU,
   open a terminal, screenshot. Compare to a baseline. This is the
   first non-grep DE test.
-- [ ] **#439 buddy DOUBLE FREE.** Genuine reclaim-path double-free;
+- [x] **#439 buddy DOUBLE FREE.** (DONE: root-caused to free-list links stored under a user CR3 landing in COW pages; fixed with boot-CR3 guard, mm/page_alloc.ad:40-65.) Genuine reclaim-path double-free;
   locks alone insufficient. Bisect against a reclaim disable.
 
 ---
