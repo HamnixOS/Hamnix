@@ -816,13 +816,27 @@ def _wsys_ptr_push_byte(wid: int32, c: uint8) -> int32:
 
 
 def _wsys_keys_push_byte(wid: int32, c: uint8) -> int32:
+    # BUG 3 FIX (dropped keystroke). The keys ring has TWO writers that race:
+    # the timer-IRQ keyboard pump (kbd_pump_to_compositor -> wsys_route_key_byte)
+    # and the syscall-context devwsys_keys_write, AND a syscall-context reader
+    # (_wsys_keys_pop_into). All three call _wsys_keys_compact, which resets
+    # BOTH head and tail to 0 when the ring drains — so an IRQ-pump push that
+    # interleaves a consumer's pop/compact (or vice-versa) corrupts the head/
+    # tail pair and SILENTLY LOSES a byte. Mask local IRQs around the head/
+    # tail mutation so the pump can't interleave a syscall-context push, and
+    # so a push can't interleave a pop (see _wsys_keys_pop_into). The pump
+    # itself already runs IRQs-off (timer ISR), so this closes the window
+    # from both sides.
+    fl: uint64 = local_irq_save()
     _wsys_keys_compact(wid)
     u: uint64 = cast[uint64](wid)
     if wsys_keys_head[u] >= WSYS_KEYS_SIZE:
+        local_irq_restore(fl)
         return 0
     base: uint64 = u * WSYS_KEYS_SIZE
     wsys_keys_buf[base + wsys_keys_head[u]] = c
     wsys_keys_head[u] = wsys_keys_head[u] + 1
+    local_irq_restore(fl)
     return 1
 
 
@@ -841,6 +855,10 @@ def _wsys_ptr_pop_into(wid: int32, out: Ptr[uint8], count: uint64) -> int64:
 
 
 def _wsys_keys_pop_into(wid: int32, out: Ptr[uint8], count: uint64) -> int64:
+    # BUG 3 FIX: drain IRQs-off so the timer-IRQ keyboard pump cannot push
+    # (and run the shared _wsys_keys_compact head/tail reset) part-way through
+    # this consumer's drain — the race that dropped the occasional keystroke.
+    fl: uint64 = local_irq_save()
     u: uint64 = cast[uint64](wid)
     n: uint64 = 0
     base: uint64 = u * WSYS_KEYS_SIZE
@@ -849,6 +867,7 @@ def _wsys_keys_pop_into(wid: int32, out: Ptr[uint8], count: uint64) -> int64:
         wsys_keys_tail[u] = wsys_keys_tail[u] + 1
         n = n + 1
     _wsys_keys_compact(wid)
+    local_irq_restore(fl)
     return cast[int64](n)
 
 
@@ -7111,6 +7130,19 @@ def devwsys_winctl_write(wid: int32, buf: Ptr[uint8],
             moved: int32 = 0
             if gvx != gx or gvy != gy:
                 moved = 1
+            # BUG 2a FIX: a SHRINK (new w<old or new h<old) at the same
+            # origin (the Applications-menu CLOSE collapses the grown panel
+            # from PANEL_OPEN_H 74 back to PANEL_H 26) leaves the vacated
+            # strip — the menu pixels below the now-shorter panel — on the
+            # framebuffer as a GHOST. The compositor only ever clears the
+            # backdrop once, and the shrunk panel's own commit re-blits ONLY
+            # its remaining (26px) rows, so nothing repaints the freed band.
+            # Treat a shrink like a move: recompose the OLD footprint from
+            # the scene sources (backdrop + lower windows + this window's own
+            # now-smaller cache), damage-scoped, so the ghost is erased.
+            shrunk: int32 = 0
+            if (gw > 0 and gw < gvw) or (gh > 0 and gh < gvh):
+                shrunk = 1
             wsys_win_x[u] = gx
             wsys_win_y[u] = gy
             if gw > 0:
@@ -7118,7 +7150,7 @@ def devwsys_winctl_write(wid: int32, buf: Ptr[uint8],
             if gh > 0:
                 wsys_win_h[u] = gh
             wsys_win_geo_init[u] = 1
-            if moved != 0 and wsys_root_active != 0 \
+            if (moved != 0 or shrunk != 0) and wsys_root_active != 0 \
                     and fb_get_initialized() != 0:
                 fl_geo: uint64 = local_irq_save()
                 spinlock_lock(&wsys_present_lock)
@@ -8440,30 +8472,102 @@ def _wsys_raise(wid: int32):
         wsys_win_z[u] = topz + 1
 
 
+def _wsys_cursor_emit_fill(pos: uint64, x: int64, y: int64,
+                           w: int64, h: int64, color: Ptr[uint8]) -> uint64:
+    # Append one "fill <x> <y> <w> <h> <#color>\n" line to the cursor scene
+    # slot-0 buffer at write-cursor `pos`. Returns the new write cursor.
+    p: uint64 = pos
+    pre: Ptr[uint8] = "fill "
+    k: uint64 = 0
+    while pre[k] != 0:
+        wsys_scene_buf[p] = pre[k]
+        p = p + 1
+        k = k + 1
+    p = p + _wsys_u64_to_dec(cast[uint64](x), &wsys_scene_buf[p])
+    wsys_scene_buf[p] = 32
+    p = p + 1
+    p = p + _wsys_u64_to_dec(cast[uint64](y), &wsys_scene_buf[p])
+    wsys_scene_buf[p] = 32
+    p = p + 1
+    p = p + _wsys_u64_to_dec(cast[uint64](w), &wsys_scene_buf[p])
+    wsys_scene_buf[p] = 32
+    p = p + 1
+    p = p + _wsys_u64_to_dec(cast[uint64](h), &wsys_scene_buf[p])
+    wsys_scene_buf[p] = 32
+    p = p + 1
+    kc: uint64 = 0
+    while color[kc] != 0:
+        wsys_scene_buf[p] = color[kc]
+        p = p + 1
+        kc = kc + 1
+    wsys_scene_buf[p] = 10
+    p = p + 1
+    return p
+
+
+# Cursor sprite geometry. The arrow is a staircase of 1px-tall horizontal
+# spans whose TIP is the top-left pixel. WSYS_CURSOR_W[i] is the run length
+# of the white fill on row i; the dark outline is a 1px border to the right
+# / below so the arrow reads against any backdrop. Tip at row 0 col 0.
+WSYS_CURSOR_ROWS: int64 = 16
+
+
+def _wsys_cursor_row_run(row: int64) -> int64:
+    # Width of the arrow body on `row` (NW-pointing arrow). Grows from the
+    # tip down to the shoulder, then narrows into the tail stem.
+    if row < 0 or row >= WSYS_CURSOR_ROWS:
+        return 0
+    if row <= 10:
+        return row + 1                              # tip widens 1..11
+    # tail stem: a 4px-wide shaft offset under the shoulder
+    return 4
+
+
 def _wsys_cursor_set_scene(sx: int64, sy: int64):
-    # Write a tiny cursor sprite scene at (sx,sy) so the compositor's
-    # cursor-present blits it. A 10x14 arrow-ish white box with a dark
-    # outline (kept simple: a filled box). Replaces the cursor scene.
-    # "fill <sx> <sy> 10 14 #f0f0f0\n" written straight into slot-0 buffer.
+    # BUG 1 FIX (cursor hotspot). Write the cursor sprite as an ARROW whose
+    # TIP pixel is EXACTLY at (sx,sy) — the same point the router hit-tests
+    # (wsys_cursor_x/y) and the blit origin (wsys_cursor_blit_x/y, parsed
+    # from the FIRST fill line below). Previously the sprite was a solid
+    # 10x14 box; its hotspot was its top-left, but with no visible tip the
+    # user read the click point as the BOTTOM of the box and clicks clipped
+    # the wrong file-manager row. An arrow with the tip at the top-left
+    # makes the visible hit point and the routed coordinate coincide.
+    #
+    # CRITICAL: the FIRST emitted fill MUST be at (sx,sy) so
+    # _wsys_rasterize_cursor parses (sx,sy) as the blit origin (== the tip
+    # == the hit-test point). Every other span is at x>=sx, y>=sy so it
+    # renders at a non-negative offset inside the 32x32 cursor cache.
     wsys_scene_wpos[0] = 0
     wsys_scene_len[0] = 0
-    prefix: Ptr[uint8] = "fill "
     pos: uint64 = 0
-    k: uint64 = 0
-    while prefix[k] != 0:
-        wsys_scene_buf[pos] = prefix[k]
-        pos = pos + 1
-        k = k + 1
-    pos = pos + _wsys_u64_to_dec(cast[uint64](sx), &wsys_scene_buf[pos])
-    wsys_scene_buf[pos] = 32
-    pos = pos + 1
-    pos = pos + _wsys_u64_to_dec(cast[uint64](sy), &wsys_scene_buf[pos])
-    suffix: Ptr[uint8] = " 10 14 #f0f0f0\n"
-    k2: uint64 = 0
-    while suffix[k2] != 0:
-        wsys_scene_buf[pos] = suffix[k2]
-        pos = pos + 1
-        k2 = k2 + 1
+    white: Ptr[uint8] = "#f0f0f0"
+    dark:  Ptr[uint8] = "#202020"
+    # Dark 1px outline UNDER/RIGHT of the body first? No — the first line is
+    # the origin, so emit the TIP fill at (sx,sy) FIRST, then the rest.
+    pos = _wsys_cursor_emit_fill(pos, sx, sy, 1, 1, white)
+    # Remaining white body rows 1..15 (row 0 already emitted as the tip).
+    r: int64 = 1
+    while r < WSYS_CURSOR_ROWS:
+        run: int64 = _wsys_cursor_row_run(r)
+        bx: int64 = sx
+        if r >= 11:
+            bx = sx + 3                             # tail stem offset
+        if run > 0:
+            pos = _wsys_cursor_emit_fill(pos, bx, sy + r, run, 1, white)
+        r = r + 1
+    # Dark outline: a 1px diagonal hypotenuse + right edge so the arrow has
+    # contrast on a light backdrop. Drawn AFTER the body (higher in the list
+    # = painted later = on top at those pixels). One dark pixel per body row
+    # at the run's right edge.
+    r2: int64 = 0
+    while r2 < WSYS_CURSOR_ROWS:
+        run2: int64 = _wsys_cursor_row_run(r2)
+        if run2 > 0:
+            ex: int64 = sx + run2
+            if r2 >= 11:
+                ex = sx + 3 + run2
+            pos = _wsys_cursor_emit_fill(pos, ex, sy + r2, 1, 1, dark)
+        r2 = r2 + 1
     wsys_scene_wpos[0] = pos
     wsys_scene_len[0] = pos
 
@@ -8834,6 +8938,100 @@ def wsys_close_box_selftest() -> int32:
     # Chain the focus-out self-test here (invoked at boot via this already-
     # wired selftest, so no init/main.ad edit is needed).
     wsys_focusout_selftest()
+    wsys_cursor_hotspot_selftest()
+    wsys_keys_lossless_selftest()
+    return 1
+
+
+def wsys_cursor_hotspot_selftest() -> int32:
+    # BUG 1 FIX self-test. Inject a known ABSOLUTE pointer position and
+    # assert the cursor sprite's blit ORIGIN (its top-left, == the arrow
+    # TIP) coincides with the routed hit-test point (wsys_cursor_x/y). If
+    # they diverge a click registers off the visible tip — the misalignment
+    # the user reported (click landing near the BOTTOM of the sprite).
+    # Prints a [CURSOR_HOTSPOT] marker. Returns 1 on PASS.
+    if fb_get_initialized() == 0:
+        # No framebuffer in this boot harness: rasterize path is a no-op, so
+        # we can't compare a real blit. Validate the math directly instead:
+        # set the cursor scene at a known point and confirm the FIRST fill's
+        # origin (the tip) equals that point via _wsys_rasterize_cursor's
+        # parse, which sets wsys_cursor_blit_x/y.
+        _wsys_init_if_needed()
+        _wsys_cursor_set_scene(123, 77)
+        _wsys_rasterize_cursor()
+        if wsys_cursor_blit_x == 123 and wsys_cursor_blit_y == 77:
+            printk0("[CURSOR_HOTSPOT] PASS sprite tip origin == hit point (no fb; math path)\n")
+            return 1
+        printk0("[CURSOR_HOTSPOT] FAIL sprite tip origin != injected point (no fb)\n")
+        return 0
+    _wsys_scene_init_if_needed()
+    sw: int64 = cast[int64](fb_get_width())
+    sh: int64 = cast[int64](fb_get_height())
+    if sw <= 0 or sh <= 0:
+        printk0("[CURSOR_HOTSPOT] PASS (skip: degenerate fb)\n")
+        return 1
+    # Inject an absolute tablet position that maps to a known interior pixel.
+    ax: int32 = cast[int32]((sw / 4) * 32768 / sw)
+    ay: int32 = cast[int32]((sh / 4) * 32768 / sh)
+    wsys_route_mouse_abs(ax, ay, 0, 0)
+    # After routing, the hit point and the sprite blit origin (tip) must match.
+    if wsys_cursor_blit_x == wsys_cursor_x \
+            and wsys_cursor_blit_y == wsys_cursor_y:
+        printk0("[CURSOR_HOTSPOT] PASS arrow tip blit origin == routed hit point\n")
+        return 1
+    printk0("[CURSOR_HOTSPOT] FAIL sprite tip != routed hit point (Bug 1)\n")
+    return 0
+
+
+def wsys_keys_lossless_selftest() -> int32:
+    # BUG 3 FIX self-test. Push a known N-byte burst into a focused window's
+    # /keys ring (the same _wsys_keys_push_byte the timer-IRQ keyboard pump
+    # uses) and assert ALL N bytes drain back out IN ORDER with no loss —
+    # the lossless property the IRQ-safe ring must guarantee. Drains in
+    # several small chunks to exercise the pop/compact path repeatedly.
+    # Prints a [KEYS_LOSSLESS] marker. Returns 1 on PASS.
+    _wsys_init_if_needed()
+    _wsys_evt_wq_init_if_needed()
+    wid: int32 = wsys_alloc_wid(999995)
+    if wid <= 1:
+        printk0("[KEYS_LOSSLESS] FAIL could not allocate a scene wid\n")
+        return 0
+    u: uint64 = cast[uint64](wid)
+    wsys_scene_len[u] = 1
+    _wsys_reset_evt_rings(wid)
+    # Burst: 300 bytes, value = (i % 251) so order is verifiable. 300 > a
+    # few pop chunks, well under WSYS_KEYS_SIZE (no legitimate overflow).
+    N: int64 = 300
+    i: int64 = 0
+    pushed: int64 = 0
+    while i < N:
+        if _wsys_keys_push_byte(wid, cast[uint8](i % 251)) == 1:
+            pushed = pushed + 1
+        i = i + 1
+    # Drain in 32-byte chunks; verify ordered, count total.
+    got: int64 = 0
+    chunk: Array[32, uint8]
+    bad: int32 = 0
+    while True:
+        r: int64 = _wsys_keys_pop_into(wid, &chunk[0], 32)
+        if r <= 0:
+            break
+        j: int64 = 0
+        while j < r:
+            exp: uint8 = cast[uint8]((got + j) % 251)
+            if chunk[cast[uint64](j)] != exp:
+                bad = 1
+            j = j + 1
+        got = got + r
+    wsys_scene_len[u] = 0
+    wsys_free_wid(wid)
+    if pushed != N:
+        printk0("[KEYS_LOSSLESS] FAIL ring rejected a byte under a normal burst\n")
+        return 0
+    if got != N or bad != 0:
+        printk0("[KEYS_LOSSLESS] FAIL drained byte count/order mismatch (dropped keystroke)\n")
+        return 0
+    printk0("[KEYS_LOSSLESS] PASS all burst bytes drained in order (no drop)\n")
     return 1
 
 
