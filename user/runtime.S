@@ -268,7 +268,7 @@ sys_nice:
     .globl sys_seccomp_native
     .type sys_seccomp_native, @function
 sys_seccomp_native:
-    movq    $318, %rax              /* SYS_SECCOMP_NATIVE */
+    movq    $320, %rax              /* SYS_SECCOMP_NATIVE (320; 318 is SYS_LISTDIR_RECORDS) */
     syscall
     ret
     .size sys_seccomp_native, .-sys_seccomp_native
