@@ -55,11 +55,20 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    # Direct kernel-level fixture covers the listdir contract.
+    # Freshly-booted hamsh drops the FIRST serial command line (it never
+    # echoes) — prime with a bare newline so the fixture line below is
+    # the SECOND command and actually runs.
+    printf '\n'
+    sleep 1
+    # Direct kernel-level fixture covers the listdir contract. Send it
+    # twice in case the prime didn't land — the fixture is idempotent.
+    printf '/bin/test_ls_paths\n'
+    sleep 2
     printf '/bin/test_ls_paths\n'
     sleep 2
     # Then drive /bin/ls through hamsh to confirm the user-visible
-    # behaviour (no "listdir failed" lines).
+    # behaviour (no "listdir failed" lines, and the per-Pgrp rc.boot
+    # binds /srv /net /proc /dev enumerate in `ls /`).
     printf 'ls /\n'
     sleep 1
     printf 'ls /etc\n'
@@ -71,8 +80,8 @@ set +e
     printf 'ls .\n'
     sleep 1
     printf 'exit\n'
-    sleep 1
-) | timeout 25s qemu-system-x86_64 \
+    sleep 2
+) | timeout 35s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -121,6 +130,22 @@ else
     echo "[test_ls_paths] MISS: ls / didn't list etc"
     fail=1
 fi
+
+# Plan-9 union enumeration: the per-Pgrp bind points installed by
+# /etc/rc.boot (`bind '#s' /srv`, `bind '#I' /net`, `bind '#p' /proc`,
+# `bind '#c' /dev`) live in the namespace mtab, not on any backing FS.
+# They MUST still enumerate as direct children of `/`. Before the
+# _open_dir_with synthesis fallback fix, `ls /` dropped every one of
+# them (only the cpio-backed names showed). Each name appears in the
+# log ONLY via `ls /`, so a plain grep is a sound presence check.
+for bm in srv net proc dev; do
+    if grep -F -q -x "$bm" "$LOG"; then
+        echo "[test_ls_paths] OK: ls / enumerates bind point '$bm'"
+    else
+        echo "[test_ls_paths] MISS: ls / missing bind point '$bm'"
+        fail=1
+    fi
+done
 
 # Negative check: no "listdir failed" should appear anywhere in the
 # user-driven section.

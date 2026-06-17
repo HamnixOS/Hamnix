@@ -130,6 +130,10 @@ check "MCREATE back-compat: no MCREATE -> create_target returns 0 (legacy fallba
     "[bind] phase6 OK: back-compat (no MCREATE) -> create_target returns 0 (legacy fallback)"
 check "MCACHE-flagged bind stored harmlessly (stub) and still resolves" \
     "[bind] phase7 OK: MCACHE-flagged bind still resolves (stub stored, harmless)"
+check "bind point enumerates in its parent directory listing (ls /)" \
+    "[bind] phase8 OK: bind point enumerates in parent dir (ls / lists 'bind_enum_dir')"
+check "only the immediate component enumerates (no grandchild leak)" \
+    "[bind] phase8 OK: only the immediate component enumerates (no grandchild leak)"
 check "bind self-test PASS banner" \
     "[bind] PASS"
 
