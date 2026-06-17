@@ -40,6 +40,7 @@ from arch.x86.kernel.time import pit_monotonic_us
 # kernel_cond_resched: cooperative preempt point inside kernel poll
 # loops. See drivers/net/tcp.ad and kernel/sched/core.ad.
 from kernel.sched.core import kernel_cond_resched
+from mm.slab import kzalloc, kfree
 
 
 # Reserved port numbers we care about. DHCP server speaks on 67,
@@ -92,33 +93,38 @@ udp_no_ports:      uint64 = 0          # datagrams with no listener
 # that overflows the ring is dropped (the most recent loss, RFC-legal
 # for UDP — datagrams are unreliable by definition).
 
-UDS_MAX:          uint64 = 32      # number of UDP socket slots
+UDS_MAX:          uint64 = 128     # number of UDP socket slots
 UDS_QUEUE_DEPTH:  uint64 = 16      # datagrams buffered per socket
 UDS_DGRAM_MAX:    uint64 = 1472    # max payload (1500 MTU - 20 IP - 8 UDP)
 
 # Socket-slot scalar state (parallel arrays, one entry per slot).
-uds_inuse:       Array[32, uint8]    # 1 if slot allocated
-uds_local_port:  Array[32, uint16]   # bound local port (host order), 0 unbound
-uds_peer_ip:     Array[32, uint32]   # connected peer IPv4 (host order), 0 none
-uds_peer_port:   Array[32, uint16]   # connected peer port (host order), 0 none
-uds_so_error:    Array[32, int32]    # pending SO_ERROR (0 = none)
-uds_broadcast:   Array[32, uint8]    # SO_BROADCAST allowed (1) — informational
+uds_inuse:       Array[128, uint8]    # 1 if slot allocated
+uds_local_port:  Array[128, uint16]   # bound local port (host order), 0 unbound
+uds_peer_ip:     Array[128, uint32]   # connected peer IPv4 (host order), 0 none
+uds_peer_port:   Array[128, uint16]   # connected peer port (host order), 0 none
+uds_so_error:    Array[128, int32]    # pending SO_ERROR (0 = none)
+uds_broadcast:   Array[128, uint8]    # SO_BROADCAST allowed (1) — informational
 
 # Per-socket receive ring. uds_q_head is the consumer index, uds_q_tail
 # the producer index, uds_q_count the number of queued datagrams.
-uds_q_head:      Array[32, uint64]
-uds_q_tail:      Array[32, uint64]
-uds_q_count:     Array[32, uint64]
+uds_q_head:      Array[128, uint64]
+uds_q_tail:      Array[128, uint64]
+uds_q_count:     Array[128, uint64]
 
 # Datagram metadata, indexed [slot * UDS_QUEUE_DEPTH + ring_index].
-uds_dg_src_ip:   Array[512, uint32]   # 32 slots * 16 depth
-uds_dg_src_port: Array[512, uint16]
-uds_dg_len:      Array[512, uint64]
+uds_dg_src_ip:   Array[2048, uint32]   # 128 slots * 16 depth
+uds_dg_src_port: Array[2048, uint16]
+uds_dg_len:      Array[2048, uint64]
 
-# Datagram payload bytes, indexed
-# [(slot*UDS_QUEUE_DEPTH + ring_index) * UDS_DGRAM_MAX + offset].
-# 32 slots * 16 depth * 1472 bytes = 753664 bytes of BSS.
-uds_dg_data:     Array[753664, uint8]
+# Datagram payload bytes. LAZY per-slot heap allocation: at UDS_MAX=128
+# a static Array would be 128*16*1472 = 2.9 MiB of BSS, so instead each
+# slot owns ONE heap buffer of UDS_QUEUE_DEPTH*UDS_DGRAM_MAX = 23552
+# bytes, kzalloc'd on udp_socket_open and kfree'd on udp_socket_close.
+# uds_dg_buf[slot] is the buffer base (0 == not allocated). Within a
+# slot's buffer a datagram is at [ring_index * UDS_DGRAM_MAX + offset].
+# Only this small pointer array (128*8 = 1 KiB) lives in BSS.
+UDS_SLOT_BUF_BYTES: uint64 = 23552   # UDS_QUEUE_DEPTH * UDS_DGRAM_MAX
+uds_dg_buf:      Array[128, uint64]  # per-slot heap buffer base, 0 = none
 
 # Ephemeral source-port allocator for an unbound socket that sends.
 # Linux auto-binds an ephemeral port on first sendto from an unbound
@@ -170,6 +176,16 @@ def udp_socket_open() -> int32:
     i: uint64 = 0
     while i < UDS_MAX:
         if uds_inuse[i] == 0:
+            # Lazy per-slot payload ring: allocate this slot's heap
+            # datagram buffer on first claim (kept until close). A failed
+            # alloc fails the open rather than handing back a slot whose
+            # _uds_enqueue would fault.
+            if uds_dg_buf[i] == 0:
+                p: uint64 = kzalloc(UDS_SLOT_BUF_BYTES)
+                if p == 0:
+                    printk1("[udp] open: out of memory for slot %d ring\n", i)
+                    return -1
+                uds_dg_buf[i] = p
             uds_inuse[i]      = 1
             uds_local_port[i] = 0
             uds_peer_ip[i]    = 0
@@ -181,6 +197,7 @@ def udp_socket_open() -> int32:
             uds_q_count[i]    = 0
             return cast[int32](i)
         i = i + 1
+    printk0("[udp] socket table full — open failed\n")
     return -1
 
 
@@ -201,6 +218,10 @@ def udp_socket_close(slot_signed: int32):
     uds_q_head[slot]     = 0
     uds_q_tail[slot]     = 0
     uds_q_count[slot]    = 0
+    # Release this slot's lazily-allocated heap datagram ring.
+    if uds_dg_buf[slot] != 0:
+        kfree(uds_dg_buf[slot])
+        uds_dg_buf[slot] = 0
 
 
 def _uds_port_in_use(port: uint16) -> int32:
@@ -328,10 +349,15 @@ def _uds_enqueue(slot: uint64, src_ip: uint32, src_port: uint16,
     uds_dg_src_ip[meta]   = src_ip
     uds_dg_src_port[meta] = src_port
     uds_dg_len[meta]      = keep
-    data_base: uint64 = meta * UDS_DGRAM_MAX
+    # Payload lands in the slot's lazily-allocated heap ring at the
+    # producer ring-index `tail`. The buffer is guaranteed allocated
+    # (udp_socket_open) for any in-use slot; bail defensively if not.
+    if uds_dg_buf[slot] == 0:
+        return
+    dst: Ptr[uint8] = cast[Ptr[uint8]](uds_dg_buf[slot] + tail * UDS_DGRAM_MAX)
     i: uint64 = 0
     while i < keep:
-        uds_dg_data[data_base + i] = payload[i]
+        dst[i] = payload[i]
         i = i + 1
     tail = tail + 1
     if tail >= UDS_QUEUE_DEPTH:
@@ -411,10 +437,11 @@ def udp_socket_recvfrom(slot_signed: int32, buf: Ptr[uint8],
             n: uint64 = dlen
             if n > max_len:
                 n = max_len
-            data_base: uint64 = meta * UDS_DGRAM_MAX
+            src: Ptr[uint8] = cast[Ptr[uint8]](
+                uds_dg_buf[slot] + head * UDS_DGRAM_MAX)
             i: uint64 = 0
             while i < n:
-                buf[i] = uds_dg_data[data_base + i]
+                buf[i] = src[i]
                 i = i + 1
             if out_src_ip != cast[Ptr[uint32]](0):
                 out_src_ip[0] = uds_dg_src_ip[meta]
@@ -810,8 +837,9 @@ def udp_netcap_dequeue_ok(slot_signed: int32, expect_byte0: uint8,
     head: uint64 = uds_q_head[slot]
     meta: uint64 = slot * UDS_QUEUE_DEPTH + head
     dlen: uint64 = uds_dg_len[meta]
-    data_base: uint64 = meta * UDS_DGRAM_MAX
-    b0: uint8 = uds_dg_data[data_base]
+    b0: uint8 = 0
+    if uds_dg_buf[slot] != 0:
+        b0 = cast[Ptr[uint8]](uds_dg_buf[slot] + head * UDS_DGRAM_MAX)[0]
     head = head + 1
     if head >= UDS_QUEUE_DEPTH:
         head = 0
