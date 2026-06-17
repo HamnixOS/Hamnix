@@ -10,8 +10,12 @@
 #   hamtermscene spawns hamsh with SPAWN_STDIO_NS + pipe CHANS bound at
 #   /fd/0,1 (DEVFD_PIPE_R/W), so children inherit real pipes. PROOF:
 #   hamtermscene feeds a one-shot `echo NS_OK; ls /` into the shell at
-#   startup; its output renders in the terminal scene. ASSERT: the
-#   terminal scene carries `NS_OK` AND real root entries (e.g. `bin`).
+#   startup, drains the `ls /` output back into its OWN glyph grid, scans
+#   the grid for a real root entry, and emits ONE serial marker
+#   "[hamterm] NS_PROBE: <entry>". ASSERT (occlusion-proof): that marker
+#   names a real root entry (proc/srv/net/bin/...). The file-manager window
+#   occludes the terminal in the framebuffer, so we read the terminal's own
+#   grid via the serial marker rather than a composited screendump.
 #
 #   BUG 2a — the Applications menu would not close on a click-away. The
 #   menu is an IN-PANEL dropdown (the panel grows its own window), so it
@@ -316,27 +320,34 @@ else
     echo "[menu_gate] NOTE [FOCUS_OUT] self-test not on the installer boot path (runs under -kernel boot:37)"
 fi
 
-# (B1) Terminal's shell sees a real namespace: NS_OK echoed AND real root
-# entries rendered in the terminal scene (the `ls /` output).
-if printf '%s' "$SCENES" | grep -aqE 'glyphs +[0-9]+ +[0-9]+ +"[^"]*NS_OK'; then
-    echo "[menu_gate] PASS terminal shell ran the probe (NS_OK rendered)"
+# (B1) Terminal's shell sees a real namespace. PRIMARY, OCCLUSION-PROOF
+# evidence: hamtermscene feeds a one-shot `echo NS_OK; ls /` into its OWN
+# hamsh at startup, drains the `ls /` output back into its private glyph
+# grid, scans the grid for a real root entry, and emits ONE serial marker
+# "[hamterm] NS_PROBE: <entry>" to the boot console. This is read straight
+# off the terminal's own grid — it does NOT depend on the framebuffer (the
+# file-manager window stacks ON TOP of the terminal and occludes its output
+# rows) nor on a late `cat /dev/wsys/3/scene` capture racing the serial
+# keystroke-echo flood. The OLD bug routed `ls` output to /fd/1=cons (empty
+# namespace symptom), so the grid stayed bare and NO entry would be found.
+if grep -aqE '^\[hamterm\] NS_PROBE: (proc|srv|net|sys|bin|etc|usr|mnt|ext|var|lib|tmp|dev)$' "$LOG"; then
+    nsent=$(grep -aoE '^\[hamterm\] NS_PROBE: [a-z]+' "$LOG" | head -1)
+    echo "[menu_gate] PASS terminal hamsh saw a real namespace ($nsent) — Bug 1 fixed"
 else
-    echo "[menu_gate] NOTE terminal NS_OK not captured this boot window (screendump authoritative)"
+    echo "[menu_gate] FAIL terminal hamsh saw NO root entry (no [hamterm] NS_PROBE marker) — Bug 1 (empty namespace) NOT fixed" >&2
+    fail=1
 fi
-# The terminal window is small (9 rows); `ls /` shows the first several
-# real root entries (proc/srv/net/sys/bin/etc/usr/mnt/ext/fd/...). ANY of
-# these in the TERMINAL scene (SCENE3, dark #101418 fill) proves the
-# shell's external `ls` ran in a populated namespace. We scan the terminal
-# scene specifically. The OLD bug rendered ZERO entries (output went to the
-# console because the child inherited /fd/1 = cons).
+# SECONDARY (informational only — may be occluded/raced, never fails):
+# NS_OK + a root entry in the captured terminal scene (SCENE3) corroborates
+# the marker when the late scene capture happens to land cleanly.
+if printf '%s' "$SCENES" | grep -aqE 'glyphs +[0-9]+ +[0-9]+ +"[^"]*NS_OK'; then
+    echo "[menu_gate] NOTE terminal NS_OK also visible in captured scene"
+fi
 TERM_SCENE=$(awk '/SCENE3_BEGIN/{f=1} /SCENE3_END/{f=0} f' "$LOG" 2>/dev/null)
 ROOT_RE='glyphs +[0-9]+ +[0-9]+ +"(proc|srv|net|sys|bin|etc|usr|mnt|ext|var|lib|tmp|dev|n)/?"'
 if printf '%s' "$TERM_SCENE" | grep -aqE "$ROOT_RE"; then
     ent=$(printf '%s' "$TERM_SCENE" | grep -aoE "$ROOT_RE" | head -3 | tr '\n' ' ')
-    echo "[menu_gate] PASS terminal 'ls /' rendered real root entries [$ent] — Bug 1 fixed"
-else
-    echo "[menu_gate] FAIL terminal 'ls /' rendered NO root entries — Bug 1 (empty namespace) NOT fixed" >&2
-    fail=1
+    echo "[menu_gate] NOTE terminal scene capture also shows root entries [$ent]"
 fi
 
 # (B2a) The menu OPENED then CLOSED. Compare the panel-dropdown region
