@@ -50,12 +50,19 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 
 set +e
 (
-    sleep 3
+    sleep 5
+    # Prime: freshly-booted hamsh drops the first serial command line
+    # (documented quirk). Send a throwaway newline, then resend the
+    # fixture launch so it reliably lands once the shell is ready.
+    printf '\n'
+    sleep 2
     printf '/bin/test_cd_validation\n'
     sleep 2
+    printf '/bin/test_cd_validation\n'
+    sleep 3
     printf 'exit\n'
     sleep 1
-) | timeout 20s qemu-system-x86_64 \
+) | timeout 45s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
