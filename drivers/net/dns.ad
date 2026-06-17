@@ -106,6 +106,13 @@ UDP_PORT_DNS_SERVER:     uint16 = 53
 
 # Header field positions and constants (RFC 1035 section 4.1.1).
 DNS_HDR_LEN:    uint64 = 12
+# RFC 1035 §2.3.4: a domain name is at most 255 octets on the wire and
+# each label at most 63. We bound the *input* hostname string length by
+# DNS_MAX_NAME up front (a string of N chars encodes to N+2 wire octets,
+# comfortably under 255 for any legal name) as a cheap front guard, then
+# bound-check every write inside the encode loop as defense-in-depth.
+DNS_MAX_NAME:   uint64 = 255
+DNS_MAX_LABEL:  uint8  = 63
 DNS_QCLASS_IN:  uint16 = 1
 DNS_FLAG_RD_HI: uint8  = 0x01      # high byte of 0x0100 (RD=1)
 DNS_FLAG_RD_LO: uint8  = 0x00
@@ -543,9 +550,40 @@ def _dns_encode_qname(hostname: Ptr[uint8], off: uint64) -> uint64:
     # Encode a hostname as length-prefixed labels in dns_tx_buf
     # starting at offset `off`. e.g. "deb.debian.org" becomes
     # [3]deb[6]debian[3]org[0]. Returns the offset just past the
-    # terminating 0x00 byte.
+    # terminating 0x00 byte, or 0 on error (name too long, a label
+    # over 63 octets, or the encoding would overflow dns_tx_buf). A 0
+    # return is an unambiguous error sentinel: a successful encode
+    # always returns at least off+1 (> DNS_HDR_LEN), so callers treat
+    # 0 as "drop the query" rather than ever sending a partial/
+    # overflowing write.
+    #
+    # CONFIRMED-bug fix: previously `pos` was incremented
+    # unconditionally with no in-loop bound, and the only guard
+    # (pos+4 > DNS_TX_BYTES) lived in the caller AFTER this function
+    # had already written past dns_tx_buf[512]. An attacker-influenced
+    # name (malicious CNAME target, crafted resolv/hosts search
+    # domain) over ~500 bytes corrupted adjacent globals. We now
+    # reject over-long names up front (RFC 1035 §2.3.4: 255 octets
+    # max, 63 per label) AND bound-check every single write.
+
+    # --- Up-front length reject (RFC 1035 §2.3.4) -------------------
+    # Refuse absurd hostnames before touching the buffer. A string of
+    # n chars cannot legally encode if n > DNS_MAX_NAME.
+    nlen: uint64 = 0
+    while hostname[nlen] != 0:
+        nlen = nlen + 1
+        if nlen > DNS_MAX_NAME:
+            printk0("[dns] qname rejected: hostname too long\n")
+            return 0
+
     pos: uint64 = off
+    # In-loop guard helper: the last byte we may write is at index
+    # DNS_TX_BYTES-1. Every write below is checked against this before
+    # committing, so we abort cleanly instead of overflowing.
     label_len_off: uint64 = pos      # placeholder for length byte
+    if label_len_off >= DNS_TX_BYTES:
+        printk0("[dns] qname rejected: no room for length byte\n")
+        return 0
     dns_tx_buf[label_len_off] = 0
     pos = pos + 1
     label_bytes: uint8 = 0
@@ -557,16 +595,31 @@ def _dns_encode_qname(hostname: Ptr[uint8], off: uint64) -> uint64:
             # start a new placeholder for the next one.
             dns_tx_buf[label_len_off] = label_bytes
             label_len_off = pos
+            if label_len_off >= DNS_TX_BYTES:
+                printk0("[dns] qname encode overflow (label start)\n")
+                return 0
             dns_tx_buf[label_len_off] = 0
             pos = pos + 1
             label_bytes = 0
         else:
+            # Reject labels longer than 63 octets (RFC 1035 §2.3.4):
+            # a length byte over 63 collides with the compression-
+            # pointer top bits and is malformed on the wire.
+            if label_bytes >= DNS_MAX_LABEL:
+                printk0("[dns] qname rejected: label > 63 octets\n")
+                return 0
+            if pos >= DNS_TX_BYTES:
+                printk0("[dns] qname encode overflow (label byte)\n")
+                return 0
             dns_tx_buf[pos] = c
             pos = pos + 1
             label_bytes = label_bytes + 1
         i = i + 1
     # Close the final label, then emit the root terminator.
     dns_tx_buf[label_len_off] = label_bytes
+    if pos >= DNS_TX_BYTES:
+        printk0("[dns] qname encode overflow (root terminator)\n")
+        return 0
     dns_tx_buf[pos] = 0
     pos = pos + 1
     return pos
@@ -681,6 +734,12 @@ def _dns_build_query(hostname: Ptr[uint8], qid: uint16,
     dns_tx_buf[5] = 1                # QDCOUNT = 1
     # 6..11 already zero (ANCOUNT, NSCOUNT, ARCOUNT all 0).
     pos: uint64 = _dns_encode_qname(hostname, DNS_HDR_LEN)
+    # _dns_encode_qname returns 0 on error (over-long name, label >63,
+    # or would overflow dns_tx_buf). A valid encode always returns at
+    # least DNS_HDR_LEN+1, so 0 unambiguously means "drop this query".
+    if pos == 0:
+        printk0("[dns] qname encode failed; dropping query\n")
+        return 0
     # Bounds check before we write QTYPE + QCLASS (4 more bytes).
     if pos + 4 > DNS_TX_BYTES:
         printk1("[dns] query too big for %d byte buffer\n", DNS_TX_BYTES)
@@ -1735,8 +1794,83 @@ def dns_selftest():
         printk1("[dns-selftest] %d FAILURE(S)\n",
                 cast[uint64](dns_st_fail))
 
+    # --- QNAME encoder bounds / hardening self-test -----------------
+    _dns_qname_bounds_selftest()
+
     # --- Fuzz / hardening self-tests --------------------------------
     net_parse_fuzz_selftest()
+
+
+def _dns_qname_bounds_selftest():
+    # Proof for the CONFIRMED dns_tx_buf overflow fix in
+    # _dns_encode_qname: over-long names / over-long labels must
+    # return the 0 error sentinel (no partial/overflowing write), and
+    # normal names must still encode correctly.
+    printk0("[dns-selftest] qname-bounds begin\n")
+
+    # (1) Normal name encodes: "example.com" -> [7]example[3]com[0],
+    #     i.e. 13 octets, so pos = DNS_HDR_LEN + 13.
+    good: Ptr[uint8] = "example.com"
+    gpos: uint64 = _dns_encode_qname(good, DNS_HDR_LEN)
+    good_ok: int32 = 0
+    if gpos == DNS_HDR_LEN + 13:
+        # Spot-check the wire bytes: first length byte == 7, 'e','x'...
+        if dns_tx_buf[DNS_HDR_LEN] == 7:
+            if dns_tx_buf[DNS_HDR_LEN + 1] == 101:   # 'e'
+                if dns_tx_buf[gpos - 1] == 0:        # root terminator
+                    good_ok = 1
+    _dns_st_check("qname-normal-encodes", good_ok)
+
+    # (2) A realistic FQDN with a search-style suffix still encodes.
+    fqdn: Ptr[uint8] = "host.sub.example.co.uk"
+    fpos: uint64 = _dns_encode_qname(fqdn, DNS_HDR_LEN)
+    fqdn_ok: int32 = 0
+    if fpos != 0:
+        if dns_tx_buf[DNS_HDR_LEN] == 4:             # "host"
+            if dns_tx_buf[fpos - 1] == 0:
+                fqdn_ok = 1
+    _dns_st_check("qname-fqdn-encodes", fqdn_ok)
+
+    # (3) Over-long name (> 255 chars) must return the 0 sentinel.
+    #     Build a 300-char label-free run of 'a's into a scratch
+    #     C-string and feed it in. The OLD code would have written
+    #     ~300 bytes past dns_tx_buf[12]; the fix returns 0.
+    over: Array[320, uint8]
+    oi: uint64 = 0
+    while oi < 300:
+        over[oi] = 97                                # 'a'
+        oi = oi + 1
+    over[300] = 0
+    over_ptr: Ptr[uint8] = cast[Ptr[uint8]](&over[0])
+    opos: uint64 = _dns_encode_qname(over_ptr, DNS_HDR_LEN)
+    over_ok: int32 = 0
+    if opos == 0:
+        over_ok = 1
+    _dns_st_check("qname-overlong-rejected", over_ok)
+
+    # (4) Over-long single label (> 63 octets) must return 0. Build
+    #     "aaaa...(70 a's)" with no dots so it's one 70-byte label.
+    lbl: Array[80, uint8]
+    li: uint64 = 0
+    while li < 70:
+        lbl[li] = 97
+        li = li + 1
+    lbl[70] = 0
+    lbl_ptr: Ptr[uint8] = cast[Ptr[uint8]](&lbl[0])
+    lpos: uint64 = _dns_encode_qname(lbl_ptr, DNS_HDR_LEN)
+    lbl_ok: int32 = 0
+    if lpos == 0:
+        lbl_ok = 1
+    _dns_st_check("qname-overlong-label-rejected", lbl_ok)
+
+    # (5) Defense-in-depth: encoding near the END of dns_tx_buf must
+    #     not overflow even for a name that is itself legal length.
+    #     Offset chosen so only a few bytes remain.
+    edge_ok: int32 = 0
+    epos: uint64 = _dns_encode_qname(good, DNS_TX_BYTES - 4)
+    if epos == 0:
+        edge_ok = 1                                  # aborted cleanly
+    _dns_st_check("qname-edge-offset-rejected", edge_ok)
 
 
 # ---------------------------------------------------------------------------
