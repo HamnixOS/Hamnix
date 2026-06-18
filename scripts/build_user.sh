@@ -261,6 +261,7 @@ build_adder_user losetup              # attach/detach a file as a loop block dev
 build_adder_user sqfs_to_blk          # installer: stream a file from an in-RAM squashfs -> block dev (no media read)
 build_adder_user live_distro_up       # live medium: extract live-distro.ext4 from the in-RAM squashfs -> RAM blockdev, post #distro (#410)
 build_adder_user scenetest            # scene-file DE gate driver: newwindow + scene/ctl + cursor (docs/de_scene_file_arch.md)
+build_adder_user multiwintest         # multi-window proof: ONE pid opens TWO windows (main + child popup), each renders + routes input independently
 build_adder_user hampanelscene        # scene-file DE top panel (Applications + clock) drawn as a scene display list
 build_adder_user hamtermscene         # scene-file DE terminal: glyphs content + window-local input routing proof
 build_adder_user hamfmscene           # scene-file DE file manager: directory listing as glyphs, click->descend (via lib/hamui hamscene_*)
