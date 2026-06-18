@@ -111,6 +111,55 @@ cp "$INSTALLER_IMG" "$IMG_RW"
 cleanup() { rm -f "$OVMF_RW" "$IMG_RW" "$MON"; }
 trap cleanup EXIT
 
+# idle_flicker_diff A.ppm B.ppm -> changed px over the frame EXCLUDING the
+# top-right panel CLOCK applet (a wall-clock HH:MM that legitimately re-paints
+# its own ~82x17 px digit box as time advances between the two idle frames —
+# NOT the whole-screen repaint this gate guards against). Excluding the clock
+# band keeps the probe focused on its intent: a periodic FULL-FRAME clear
+# (hundreds of thousands of px) still trips it; a ticking clock does not.
+# The clock sits in the top panel's right edge: x >= width-240, y < 32.
+idle_flicker_diff() {
+    python3 - "$@" <<'PYEOF'
+import sys
+def load_ppm(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    if not data.startswith(b"P6"):
+        return None
+    idx = 2; toks = []
+    while len(toks) < 3:
+        while idx < len(data) and data[idx:idx+1].isspace():
+            idx += 1
+        if idx < len(data) and data[idx:idx+1] == b'#':
+            while idx < len(data) and data[idx:idx+1] != b'\n':
+                idx += 1
+            continue
+        start = idx
+        while idx < len(data) and not data[idx:idx+1].isspace():
+            idx += 1
+        toks.append(int(data[start:idx]))
+    idx += 1
+    w, h, mx = toks
+    return w, h, data[idx:idx + w*h*3]
+a = load_ppm(sys.argv[1]); b = load_ppm(sys.argv[2])
+if a is None or b is None or a[0] != b[0] or a[1] != b[1]:
+    print(-1); sys.exit(0)
+w, h, pa = a; _, _, pb = b
+# Clock applet exclusion window (top-right of the panel).
+clk_x0 = max(0, w - 240); clk_y1 = 32
+THRESH = 24; changed = 0; n = min(len(pa), len(pb))
+i = 0
+while i + 2 < n:
+    pix = i // 3; px = pix % w; py = pix // w
+    if not (px >= clk_x0 and py < clk_y1):
+        if (abs(pa[i]-pb[i]) > THRESH or abs(pa[i+1]-pb[i+1]) > THRESH
+                or abs(pa[i+2]-pb[i+2]) > THRESH):
+            changed += 1
+    i += 3
+print(changed)
+PYEOF
+}
+
 # whole_frame_diff A.ppm B.ppm -> changed pixel count over the FULL frame.
 whole_frame_diff() {
     python3 - "$@" <<'PYEOF'
@@ -333,8 +382,10 @@ fi
 
 # --- A. FLICKER-STABILITY --------------------------------------------
 if [ -s "$OUT_DIR/idle_a.ppm" ] && [ -s "$OUT_DIR/idle_b.ppm" ]; then
-    fdiff=$(whole_frame_diff "$OUT_DIR/idle_a.ppm" "$OUT_DIR/idle_b.ppm")
-    echo "[flick_gate] idle-desktop whole-frame changed pixels: $fdiff (max $FLICKER_MAX)"
+    # Exclude the ticking top-right CLOCK applet (legit localized repaint);
+    # the probe still catches a full-screen repaint (100k+ px) outside it.
+    fdiff=$(idle_flicker_diff "$OUT_DIR/idle_a.ppm" "$OUT_DIR/idle_b.ppm")
+    echo "[flick_gate] idle-desktop whole-frame changed pixels (clock applet excluded): $fdiff (max $FLICKER_MAX)"
     if [ "$fdiff" = "-1" ]; then
         echo "[flick_gate] NOTE idle frames differ in size/format; flicker probe inconclusive"
     elif [ "$fdiff" -le "$FLICKER_MAX" ]; then

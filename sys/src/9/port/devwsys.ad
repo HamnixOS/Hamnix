@@ -7064,11 +7064,14 @@ def devwsys_winctl_write(wid: int32, buf: Ptr[uint8],
         _wsys_mark_dirty(wid, 0, 0, 65535, 65535)
         wsys_commit_seq = wsys_commit_seq + 1
         wq_wake_one(&wsys_commit_wq)
-        # Option-A self-contained present: rasterize + z-blit the scene
-        # caches straight to /dev/fb on commit. This is the kernel-side
-        # compositor; it does NOT touch the legacy hamUId cascade. No-op
-        # when there is no framebuffer (returns 0).
-        wsys_scene_present()
+        # DAMAGE-SCOPED present: a per-client commit changed exactly THIS
+        # window's content, so re-rasterize + recomposite ONLY this window's
+        # footprint (plus overlapping higher windows + cursor) — NOT a full
+        # re-rasterize-all + re-blit-all. The full present per commit was the
+        # whole-screen blank/flicker the user reported (worst on a full-screen
+        # hamdesktop commit from a desktop-icon click, and the per-commit
+        # storm of a launched app). No-op when there is no framebuffer.
+        _wsys_present_window_scoped(wid)
         return cast[int64](count)
 
     if _wsys_ctl_word_eq(buf, vs, ve, "z") == 1:
@@ -7119,8 +7122,10 @@ def devwsys_winctl_write(wid: int32, buf: Ptr[uint8],
         _wsys_scene_init_if_needed()
         wsys_commit_seq = wsys_commit_seq + 1
         wq_wake_one(&wsys_commit_wq)
-        if fb_get_initialized() != 0:
-            wsys_scene_present()
+        # DAMAGE-SCOPED raise (taskbar): recompose only the raised window's
+        # footprint — it comes to the front there over its peers — instead of
+        # a full re-rasterize-all + re-blit-all present.
+        _wsys_present_window_scoped(wid)
         return cast[int64](count)
 
     # focus : deliver an `f in` event to this window (so it can react)
@@ -8045,6 +8050,73 @@ def _wsys_scene_present_locked() -> int32:
     return presented
 
 
+def _wsys_win_screen_extent(u: uint64, rx: Ptr[int64], ry: Ptr[int64],
+                            rw: Ptr[int64], rh: Ptr[int64]):
+    # Compute wid u's on-screen damage extent (content rect plus its SSD
+    # titlebar band, if decorated). Used by the damage-scoped present so a
+    # single-window commit / drag only touches that window's footprint.
+    w: int64 = _wsys_win_def_w(u)
+    h: int64 = _wsys_win_def_h(u)
+    _wsys_clamp_cache_dims(&w, &h)
+    ox: int64 = wsys_win_x[u]
+    oy: int64 = wsys_win_y[u]
+    if ox < 0:
+        ox = 0
+    if oy < 0:
+        oy = 0
+    ty: int64 = oy
+    th: int64 = h
+    if wsys_win_decorate[u] != 0 and oy >= WSYS_TITLEBAR_H:
+        ty = oy - WSYS_TITLEBAR_H
+        th = h + WSYS_TITLEBAR_H
+    rx[0] = ox
+    ry[0] = ty
+    rw[0] = w
+    rh[0] = th
+
+
+def _wsys_present_window_scoped(wid: int32) -> int32:
+    # DAMAGE-SCOPED present for a SINGLE window whose CONTENT changed (a
+    # per-client `commit`). Re-rasterizes ONLY this window's cache, then
+    # recomposites ONLY this window's screen extent — backdrop + every
+    # window cache (this one and any overlapping higher-z window) clipped
+    # to that rect via _wsys_recompose_rect — then the cursor. This is the
+    # fix for the per-commit "re-rasterize-all + re-blit-all" present storm
+    # that blanked/flickered the whole screen (most visibly the full-screen
+    # hamdesktop committing on a desktop-icon click). Takes the present lock
+    # like wsys_scene_present. Returns 1 if it presented, 0 if no fb.
+    if fb_get_initialized() == 0:
+        return 0
+    u: uint64 = cast[uint64](wid)
+    if u == 0 or u >= WSYS_SCENE_SLOTS:
+        return 0
+    if wsys_slot_in_use[u] == 0:
+        return 0
+    fl: uint64 = local_irq_save()
+    spinlock_lock(&wsys_present_lock)
+    _wsys_init_if_needed()
+    # First present after the DE flip still needs the backdrop laid down.
+    if wsys_root_active != 0 and wsys_bg_painted == 0:
+        _wsys_present_background()
+        wsys_bg_painted = 1
+    # Re-rasterize just this window's cache from its committed scene.
+    if wsys_scene_len[u] > 0:
+        _wsys_rasterize_window(wid)
+    # Recompose only this window's footprint (backdrop + all caches clipped
+    # to the rect, bottom-to-top — so overlapping higher windows stay on top
+    # and transparent areas show the backdrop/lower windows correctly).
+    rx: int64 = 0
+    ry: int64 = 0
+    rw: int64 = 0
+    rh: int64 = 0
+    _wsys_win_screen_extent(u, &rx, &ry, &rw, &rh)
+    _wsys_recompose_rect(rx, ry, rw, rh)
+    _wsys_present_cursor_locked()
+    spinlock_unlock(&wsys_present_lock)
+    local_irq_restore(fl)
+    return 1
+
+
 def _wsys_present_cursor():
     # Standalone cursor present (cursor move with no window recomposite).
     # Takes the present lock so it can't race a concurrent full present.
@@ -8054,6 +8126,48 @@ def _wsys_present_cursor():
     _wsys_present_cursor_locked()
     spinlock_unlock(&wsys_present_lock)
     local_irq_restore(fl)
+
+
+def _wsys_rect_covered_by_bottom(rx: int64, ry: int64,
+                                 rw: int64, rh: int64) -> int32:
+    # Return 1 iff the LOWEST-z in-use scene window is undecorated and its
+    # content rect fully contains (rx,ry,rw,rh). Such a window (the
+    # full-screen desktop backdrop layer) is the opaque base under the rect,
+    # so the desktop-root backdrop pre-pass is redundant and only flickers.
+    # Conservative: any doubt (no window, decorated, partial cover) -> 0.
+    have: int32 = 0
+    zmin: int64 = 0
+    bw: uint64 = 0
+    w2: uint64 = 1
+    while w2 < WSYS_SCENE_SLOTS:
+        if wsys_slot_in_use[w2] != 0 and wsys_scene_len[w2] > 0:
+            zz: int64 = wsys_win_z[w2]
+            if have == 0 or zz < zmin:
+                zmin = zz
+                bw = w2
+                have = 1
+        w2 = w2 + 1
+    if have == 0:
+        return 0
+    # Decorated windows have a titlebar band the cache doesn't cover -> the
+    # backdrop can show through there, so don't skip it.
+    if wsys_win_decorate[bw] != 0:
+        return 0
+    w: int64 = _wsys_win_def_w(bw)
+    h: int64 = _wsys_win_def_h(bw)
+    _wsys_clamp_cache_dims(&w, &h)
+    ox: int64 = wsys_win_x[bw]
+    oy: int64 = wsys_win_y[bw]
+    if ox < 0:
+        ox = 0
+    if oy < 0:
+        oy = 0
+    # Content rect [ox,ox+w) x [oy,oy+h) must fully contain the damage rect.
+    if rx < ox or ry < oy:
+        return 0
+    if rx + rw > ox + w or ry + rh > oy + h:
+        return 0
+    return 1
 
 
 def _wsys_recompose_rect(rx: int64, ry: int64, rw: int64, rh: int64):
@@ -8083,9 +8197,21 @@ def _wsys_recompose_rect(rx: int64, ry: int64, rw: int64, rh: int64):
         rh = sh - ry
     if rw <= 0 or rh <= 0:
         return
+    # ANTI-BLANK: skip the full-rect backdrop pre-pass when an OPAQUE
+    # lowest-z window (the full-screen desktop backdrop layer) already
+    # covers the whole rect. Painting backdrop across the whole rect and
+    # THEN blitting the desktop cache over it is double work whose first
+    # pass is a visible whole-screen BLANK (the desktop-icon-click flicker
+    # the user reported, since a desktop commit recomposes the full screen).
+    # When the bottom window's content rect contains the rect, its cache
+    # blit IS the base layer, so the backdrop fill is pure flicker — drop it.
+    skip_bg: int32 = 0
+    bottom_covers: int32 = _wsys_rect_covered_by_bottom(rx, ry, rw, rh)
+    if bottom_covers != 0:
+        skip_bg = 1
     # 1) Desktop backdrop under the rect (only after the rl5 desktop flip;
     #    before that the additive path leaves whatever was there).
-    if wsys_root_active != 0:
+    if wsys_root_active != 0 and skip_bg == 0:
         bw: int64 = rw
         if cast[uint64](bw) > WSYS_ROOT_ROW_MAX:
             bw = cast[int64](WSYS_ROOT_ROW_MAX)
@@ -8842,12 +8968,17 @@ def _wsys_route_common(sx: int64, sy: int64, buttons: uint32, dz: int64):
     # Update the cursor sprite scene + blit it (decoupled from windows).
     _wsys_cursor_set_scene(sx, sy)
 
-    repaint: int32 = 0
+    # >0 = a press raised this window; recompose only its footprint (no full
+    # present). 0 = nothing to recompose beyond the cursor.
+    scoped_target: int32 = 0
 
     # Active titlebar drag: move the window with the cursor.
     if wsys_drag_wid > 0:
         if (buttons & 1) == 0:
             wsys_drag_wid = 0                       # drag ended
+            # Drag end: nothing moved this event; just refresh the cursor.
+            if fb_get_initialized() != 0:
+                _wsys_present_cursor()
         else:
             du: uint64 = cast[uint64](wsys_drag_wid)
             nx: int64 = sx - wsys_drag_dx
@@ -8856,11 +8987,20 @@ def _wsys_route_common(sx: int64, sy: int64, buttons: uint32, dz: int64):
                 ny = WSYS_TITLEBAR_H
             if nx < 0:
                 nx = 0
-            # FLICKER FIX: the full-screen backdrop clear is now once-only,
-            # so a dragged window would leave a trail at its OLD footprint.
-            # Recompose just the VACATED rect (old window extent + its SSD
-            # titlebar) from the scene sources (backdrop + lower windows)
-            # before moving — damage-scoped, no full-screen clear, no flash.
+            # DAMAGE-SCOPED DRAG (no full present): the dragged window's
+            # cache CONTENT is unchanged (only its position moved), and a
+            # full re-rasterize-all + sequential re-blit-all per motion event
+            # was the drag flicker + lag the user reported (intermediate
+            # all-window states visible between frames). Instead recompose
+            # ONLY two damage rects from the durable scene caches:
+            #   1) the VACATED (old) rect — restores backdrop + lower windows
+            #      where the window used to be (so it leaves no trail);
+            #   2) the NEW rect — re-blits backdrop + ALL caches (incl. this
+            #      window's, now at its new x/y) clipped to that rect, so the
+            #      moved window lands on top with lower windows correct under
+            #      its transparent areas.
+            # Neither path re-rasterizes any window or touches windows outside
+            # the two rects → smooth, flicker-free drag. Cursor composited last.
             ovx: int64 = wsys_win_x[du]
             ovy: int64 = wsys_win_y[du]
             ovw: int64 = _wsys_win_def_w(du)
@@ -8870,16 +9010,15 @@ def _wsys_route_common(sx: int64, sy: int64, buttons: uint32, dz: int64):
             if fb_get_initialized() != 0:
                 fl_drag: uint64 = local_irq_save()
                 spinlock_lock(&wsys_present_lock)
+                # 1) restore the vacated old footprint
                 _wsys_recompose_rect(ovx, ovy - WSYS_TITLEBAR_H,
                                      ovw, ovh + WSYS_TITLEBAR_H)
+                # 2) draw the moved window into its new footprint
+                _wsys_recompose_rect(nx, ny - WSYS_TITLEBAR_H,
+                                     ovw, ovh + WSYS_TITLEBAR_H)
+                _wsys_present_cursor_locked()
                 spinlock_unlock(&wsys_present_lock)
                 local_irq_restore(fl_drag)
-            repaint = 1
-        if repaint != 0:
-            wsys_scene_present()
-        else:
-            if fb_get_initialized() != 0:
-                _wsys_present_cursor()
         wsys_prev_buttons = buttons
         return
 
@@ -8904,7 +9043,10 @@ def _wsys_route_common(sx: int64, sy: int64, buttons: uint32, dz: int64):
             wsys_drag_wid = target
             wsys_drag_dx = sx - wsys_win_x[du2]
             wsys_drag_dy = sy - wsys_win_y[du2]
-            repaint = 1
+            # DAMAGE-SCOPED raise: re-blit only the raised window's footprint
+            # (recompose re-blits all caches there in the new z-order, so it
+            # comes to the front over its peers) — no full present.
+            scoped_target = target
         else:
             # Content press: raise + focus + forward a window-local event.
             _wsys_raise(target)
@@ -8914,7 +9056,8 @@ def _wsys_route_common(sx: int64, sy: int64, buttons: uint32, dz: int64):
             ly: int64 = sy - wsys_win_y[u3]
             _wsys_evt_emit_pointer(target, lx, ly, buttons, dz)
             wq_wake_one(&wsys_ptr_wq[u3])
-            repaint = 1
+            # DAMAGE-SCOPED raise (see above): only the raised window's rect.
+            scoped_target = target
     else:
         # BUG 2a FIX: a PRESS on the bare backdrop (no window under the
         # cursor) drops keyboard focus to "none". This makes the focused
@@ -8922,9 +9065,10 @@ def _wsys_route_common(sx: int64, sy: int64, buttons: uint32, dz: int64):
         # its own window to host the menu) receives an `f out` event on its
         # event file and self-dismisses. Without this a click-away on empty
         # desktop left the panel still focused and the menu stuck open.
+        # A focus-only change paints no compositor pixels itself (the panel
+        # reacts via its own — now damage-scoped — commit), so no present.
         if pressed == 1 and target == 0:
             _wsys_set_focus(0)
-            repaint = 1
         # Motion / release over a window: forward window-local pointer.
         if target > 0:
             u4: uint64 = cast[uint64](target)
@@ -8933,14 +9077,26 @@ def _wsys_route_common(sx: int64, sy: int64, buttons: uint32, dz: int64):
             _wsys_evt_emit_pointer(target, lx2, ly2, buttons, dz)
             wq_wake_one(&wsys_ptr_wq[u4])
 
-    # Present. A press/drag/raise (repaint=1) does a full present
-    # (background + windows + cursor). Plain motion does the lighter
+    # Present. A press that raised a window does a DAMAGE-SCOPED recompose of
+    # just that window's footprint (it lands on top of its peers there) — NOT
+    # a full re-rasterize-all + re-blit-all (that whole-screen storm was the
+    # flicker the user reported). Plain motion / focus-only does the lighter
     # cursor-only blit, decoupled from window recomposition (the §9 FPS
-    # invariant). The cursor's save-behind restore (so motion leaves no
-    # trail without a full recomposite) is a later refinement; for now a
-    # subsequent window commit / press repaints over any cursor trail.
-    if repaint != 0:
-        wsys_scene_present()
+    # invariant).
+    if scoped_target > 0:
+        if fb_get_initialized() != 0:
+            stu: uint64 = cast[uint64](scoped_target)
+            fl_sp: uint64 = local_irq_save()
+            spinlock_lock(&wsys_present_lock)
+            srx: int64 = 0
+            sry: int64 = 0
+            srw: int64 = 0
+            srh: int64 = 0
+            _wsys_win_screen_extent(stu, &srx, &sry, &srw, &srh)
+            _wsys_recompose_rect(srx, sry, srw, srh)
+            _wsys_present_cursor_locked()
+            spinlock_unlock(&wsys_present_lock)
+            local_irq_restore(fl_sp)
     else:
         if fb_get_initialized() != 0:
             _wsys_present_cursor()
