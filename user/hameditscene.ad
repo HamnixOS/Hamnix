@@ -1,0 +1,559 @@
+# user/hameditscene.ad
+#
+# Scene-file DE text editor — a minimal but real editor drawn entirely as a
+# scene display list (docs/de_scene_file_arch.md). It is the scene-DE port
+# of user/hamedit.ad: the on-box file I/O (open a path, read it into a
+# buffer; Ctrl-S writes it back) is carried over; the render + input layers
+# are scene-native.
+#
+# RENDER (§4 Widget/terminal tier): a title bar showing the filename, then a
+# scrollable text area that renders the editable buffer as one `glyphs` line
+# per visible row with a solid block CURSOR drawn at the caret cell.
+#
+# INPUT (§11): KEY events arrive on /dev/wsys/<wid>/keys as "<type> <code>\n"
+# lines ('d' = press). Printable bytes insert at the caret, Backspace
+# deletes, Enter inserts a newline, the arrow keys (ESC [ A/B/C/D, decoded
+# from the key stream) move the caret, and Ctrl-S (code 19) saves back to
+# the file. The editor BLOCKS on /keys (event-driven, like hamtermscene),
+# no busy-spin. POINTER events live on a separate /event file we never open.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield() -> int32
+extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
+
+from lib.hamui import hamscene_begin, hamscene_fill, hamscene_rect, \
+    hamscene_glyphs, hamscene_stroke, hamscene_commit
+
+
+def _slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _writeall(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _slen(s))
+
+
+def _u64_to_dec(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    x: uint64 = v
+    while x > 0:
+        digs[n] = cast[uint8](x % 10) + 48
+        x = x / 10
+        n = n + 1
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digs[n]
+        i = i + 1
+    return i
+
+
+def _newwindow() -> int32:
+    wfd: int32 = sys_open_write(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if wfd < 0:
+        return -1
+    sys_write(wfd, cast[Ptr[uint8]]("newwindow\n"), 10)
+    sys_close(wfd)
+    rfd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if rfd < 0:
+        return -1
+    rbuf: Array[32, uint8]
+    r: int64 = sys_read(rfd, &rbuf[0], 31)
+    sys_close(rfd)
+    if r <= 0:
+        return -1
+    wid: int32 = 0
+    i: uint64 = 0
+    while i < cast[uint64](r):
+        c: uint8 = rbuf[i]
+        if c >= 48 and c <= 57:
+            wid = wid * 10 + cast[int32](c) - 48
+        i = i + 1
+    return wid
+
+
+def _winpath(out: Ptr[uint8], wid: int32, leaf: Ptr[uint8]):
+    p: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("/dev/wsys/")
+    j: uint64 = 0
+    while pre[j] != 0:
+        out[p] = pre[j]
+        p = p + 1
+        j = j + 1
+    p = p + _u64_to_dec(cast[uint64](wid), &out[p])
+    k: uint64 = 0
+    while leaf[k] != 0:
+        out[p] = leaf[k]
+        p = p + 1
+        k = k + 1
+    out[p] = 0
+
+
+# ====================================================================
+# DOCUMENT MODEL — a flat byte buffer with a caret offset. Newlines in the
+# buffer split it into rendered lines. (Carried from user/hamedit.ad's flat
+# doc_buf; insert/delete/move are scene-native.)
+# ====================================================================
+DOC_CAP:  uint64 = 8192
+READ_CHUNK: uint64 = 512
+
+doc_buf:  Array[8192, uint8]
+doc_len:  uint64 = 0
+caret:    uint64 = 0            # byte offset of the insertion point [0..doc_len]
+read_buf: Array[512, uint8]
+
+fname_buf: Array[128, uint8]    # current filename (NUL-term), or empty
+has_file:  int32 = 0
+status_buf: Array[64, uint8]    # transient status (e.g. "saved 123 bytes")
+status_len: uint64 = 0
+top_line:  uint64 = 0          # first visible buffer line (vertical scroll)
+
+
+def _set_status(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and i < 63:
+        status_buf[i] = s[i]
+        i = i + 1
+    status_buf[i] = 0
+    status_len = i
+
+
+def _set_status_num(prefix: Ptr[uint8], v: uint64):
+    p: uint64 = 0
+    while prefix[p] != 0 and p < 50:
+        status_buf[p] = prefix[p]
+        p = p + 1
+    p = p + _u64_to_dec(v, &status_buf[p])
+    status_buf[p] = 0
+    status_len = p
+
+
+# Insert one byte at the caret (shifting the tail right).
+def _insert(c: uint8):
+    if doc_len >= DOC_CAP - 1:
+        return
+    j: uint64 = doc_len
+    while j > caret:
+        doc_buf[j] = doc_buf[j - 1]
+        j = j - 1
+    doc_buf[caret] = c
+    doc_len = doc_len + 1
+    caret = caret + 1
+
+
+# Delete the byte before the caret (Backspace).
+def _backspace():
+    if caret == 0:
+        return
+    j: uint64 = caret - 1
+    while j + 1 < doc_len:
+        doc_buf[j] = doc_buf[j + 1]
+        j = j + 1
+    doc_len = doc_len - 1
+    caret = caret - 1
+
+
+def _move_left():
+    if caret > 0:
+        caret = caret - 1
+
+
+def _move_right():
+    if caret < doc_len:
+        caret = caret + 1
+
+
+# Start-of-line offset for the byte offset `off` (scan back to prev '\n'+1).
+def _line_start(off: uint64) -> uint64:
+    i: uint64 = off
+    while i > 0 and doc_buf[i - 1] != 10:
+        i = i - 1
+    return i
+
+
+# End-of-line offset (the '\n' or doc_len) for offset `off`.
+def _line_end(off: uint64) -> uint64:
+    i: uint64 = off
+    while i < doc_len and doc_buf[i] != 10:
+        i = i + 1
+    return i
+
+
+def _move_up():
+    ls: uint64 = _line_start(caret)
+    if ls == 0:
+        caret = 0
+        return
+    col: uint64 = caret - ls
+    prev_end: uint64 = ls - 1                # the '\n' ending the prev line
+    prev_start: uint64 = _line_start(prev_end)
+    plen: uint64 = prev_end - prev_start
+    if col > plen:
+        col = plen
+    caret = prev_start + col
+
+
+def _move_down():
+    le: uint64 = _line_end(caret)
+    if le >= doc_len:
+        caret = doc_len
+        return
+    ls: uint64 = _line_start(caret)
+    col: uint64 = caret - ls
+    next_start: uint64 = le + 1              # past the '\n'
+    next_end: uint64 = _line_end(next_start)
+    nlen: uint64 = next_end - next_start
+    if col > nlen:
+        col = nlen
+    caret = next_start + col
+
+
+# ====================================================================
+# FILE I/O (carried from user/hamedit.ad)
+# ====================================================================
+def _do_open(path: Ptr[char]) -> int64:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    doc_len = 0
+    while doc_len < DOC_CAP - 1:
+        n: int64 = sys_read(fd, &read_buf[0], READ_CHUNK)
+        if n <= 0:
+            break
+        i: uint64 = 0
+        while i < cast[uint64](n) and doc_len < DOC_CAP - 1:
+            doc_buf[doc_len] = read_buf[i]
+            doc_len = doc_len + 1
+            i = i + 1
+    sys_close(fd)
+    caret = 0
+    return cast[int64](doc_len)
+
+
+def _do_save() -> int64:
+    if has_file == 0:
+        _set_status(cast[Ptr[uint8]]("no filename"))
+        return -1
+    fd: int32 = sys_open_write(cast[Ptr[char]](&fname_buf[0]))
+    if fd < 0:
+        _set_status(cast[Ptr[uint8]]("save failed"))
+        return -1
+    w: int64 = sys_write(fd, &doc_buf[0], doc_len)
+    sys_close(fd)
+    if w < 0:
+        _set_status(cast[Ptr[uint8]]("save failed"))
+        return -1
+    _set_status_num(cast[Ptr[uint8]]("saved "), doc_len)
+    return w
+
+
+# ====================================================================
+# LAYOUT + RENDER
+# ====================================================================
+ED_W: int32 = 400
+ED_H: int32 = 260
+TITLE_H: int32 = 18
+TEXT_X: int32 = 6
+TEXT_Y: int32 = 22
+LINE_H: int32 = 16
+CELL_W: int32 = 8
+VIS_ROWS: uint64 = 13         # visible text rows
+VIS_COLS: uint64 = 48         # visible columns
+
+
+# Ensure top_line keeps the caret's line visible (scroll follow).
+def _scroll_follow():
+    # Count which buffer line the caret is on.
+    cl: uint64 = 0
+    i: uint64 = 0
+    while i < caret:
+        if doc_buf[i] == 10:
+            cl = cl + 1
+        i = i + 1
+    if cl < top_line:
+        top_line = cl
+    if cl >= top_line + VIS_ROWS:
+        top_line = cl - VIS_ROWS + 1
+
+
+def emit_scene(wid: int32):
+    hamscene_begin()
+    # Editor canvas.
+    hamscene_fill(0, 0, ED_W, ED_H, cast[Ptr[uint8]]("#fbfbf7"))
+    # Title bar with filename.
+    hamscene_rect(0, 0, ED_W, TITLE_H, cast[Ptr[uint8]]("#3a6ea5"))
+    tbuf: Array[80, uint8]
+    tp: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("hamedit: ")
+    a: uint64 = 0
+    while pre[a] != 0:
+        tbuf[tp] = pre[a]
+        tp = tp + 1
+        a = a + 1
+    if has_file != 0:
+        b: uint64 = 0
+        while fname_buf[b] != 0 and tp < 70:
+            tbuf[tp] = fname_buf[b]
+            tp = tp + 1
+            b = b + 1
+    else:
+        nn: Ptr[uint8] = cast[Ptr[uint8]]("(unnamed)")
+        c: uint64 = 0
+        while nn[c] != 0:
+            tbuf[tp] = nn[c]
+            tp = tp + 1
+            c = c + 1
+    tbuf[tp] = 0
+    hamscene_glyphs(4, 4, &tbuf[0], cast[Ptr[uint8]]("#ffffff"))
+
+    # Render visible buffer lines. We walk the buffer line-by-line, skipping
+    # `top_line` lines, and emit up to VIS_ROWS rows. The caret's pixel cell
+    # gets a block drawn behind its glyph.
+    _scroll_follow()
+    line_no: uint64 = 0
+    off: uint64 = 0
+    row: uint64 = 0
+    rowbuf: Array[64, uint8]
+    # Skip to the first visible line.
+    while line_no < top_line and off < doc_len:
+        if doc_buf[off] == 10:
+            line_no = line_no + 1
+        off = off + 1
+    while row < VIS_ROWS and off <= doc_len:
+        # Collect this line into rowbuf (until '\n' or doc_len), tracking the
+        # caret column if the caret falls on this line.
+        rl: uint64 = 0
+        caret_col: int64 = -1
+        ls: uint64 = off
+        while off < doc_len and doc_buf[off] != 10:
+            if off == caret:
+                caret_col = cast[int64](rl)
+            if rl < VIS_COLS:
+                ch: uint8 = doc_buf[off]
+                if ch == 9:
+                    ch = 32                       # render tab as space
+                rowbuf[rl] = ch
+                rl = rl + 1
+            off = off + 1
+        if caret == off and caret >= ls and caret_col < 0:
+            # Caret at end-of-line (on the '\n' or doc_len for this row).
+            caret_col = cast[int64](caret - ls)
+            if caret_col > cast[int64](VIS_COLS):
+                caret_col = cast[int64](VIS_COLS)
+        rowbuf[rl] = 0
+        yy: int32 = TEXT_Y + cast[int32](row) * LINE_H
+        # Cursor block behind the caret cell (drawn first so glyph sits on it).
+        if caret_col >= 0:
+            cxp: int32 = TEXT_X + cast[int32](caret_col) * CELL_W
+            hamscene_fill(cxp, yy, CELL_W, LINE_H - 2,
+                          cast[Ptr[uint8]]("#2a64c8"))
+        if rl > 0:
+            hamscene_glyphs(TEXT_X, yy + 2, &rowbuf[0],
+                            cast[Ptr[uint8]]("#101010"))
+        # Advance past the '\n' if present.
+        if off < doc_len and doc_buf[off] == 10:
+            off = off + 1
+            line_no = line_no + 1
+            row = row + 1
+            continue
+        # Reached doc_len — last line; emit it then stop.
+        row = row + 1
+        if off >= doc_len:
+            off = doc_len + 1                    # break the outer while
+    # Status line along the bottom.
+    if status_len > 0:
+        hamscene_glyphs(6, ED_H - 14, &status_buf[0],
+                        cast[Ptr[uint8]]("#207020"))
+    hamscene_commit(wid)
+
+
+# ====================================================================
+# KEY INPUT — parse "<type> <code>\n" lines; decode ESC [ A/B/C/D arrows.
+# ====================================================================
+# Arrow-key decode state: 0 = ground, 1 = saw ESC(27), 2 = saw ESC '['.
+esc_st: int32 = 0
+
+
+# Handle one decoded key code. Returns 1 if the document/caret changed.
+def _handle_code(code: int32) -> int32:
+    # Arrow CSI decode.
+    if esc_st == 1:
+        if code == 91:                          # '['
+            esc_st = 2
+            return 0
+        esc_st = 0
+        # fallthrough: treat as a normal key below
+    elif esc_st == 2:
+        esc_st = 0
+        if code == 65:                          # 'A' up
+            _move_up()
+            return 1
+        if code == 66:                          # 'B' down
+            _move_down()
+            return 1
+        if code == 67:                          # 'C' right
+            _move_right()
+            return 1
+        if code == 68:                          # 'D' left
+            _move_left()
+            return 1
+        return 0
+    if code == 27:                              # ESC -> begin CSI
+        esc_st = 1
+        return 0
+    if code == 19:                              # Ctrl-S -> save
+        _do_save()
+        return 1
+    if code == 13 or code == 10:                # Enter -> newline
+        _insert(10)
+        status_len = 0
+        return 1
+    if code == 8 or code == 127:                # Backspace / DEL
+        _backspace()
+        status_len = 0
+        return 1
+    if code >= 32 and code < 127:               # printable -> insert
+        _insert(cast[uint8](code))
+        status_len = 0
+        return 1
+    return 0
+
+
+kev_buf: Array[512, uint8]
+kev_carry: uint64 = 0
+
+
+# Parse complete "<type> <code>\n" lines out of kev_buf[0..n). Returns bytes
+# consumed (offset past the last '\n'); any partial trailing line is carried.
+# Sets *changed_p to 1 if any key mutated the doc/caret.
+def _drain_keys_chunk(n: uint64, changed_p: Ptr[int32]) -> uint64:
+    i: uint64 = 0
+    consumed: uint64 = 0
+    while i < n:
+        t: uint8 = kev_buf[i]
+        i = i + 1
+        if i < n and kev_buf[i] == 32:
+            i = i + 1
+        code: int32 = 0
+        have: int32 = 0
+        neg: int32 = 0
+        if i < n and kev_buf[i] == 45:
+            neg = 1
+            i = i + 1
+        while i < n and kev_buf[i] >= 48 and kev_buf[i] <= 57:
+            code = code * 10 + cast[int32](kev_buf[i]) - 48
+            i = i + 1
+            have = 1
+        while i < n and kev_buf[i] != 10:
+            i = i + 1
+        if i >= n:
+            # incomplete line — carry it forward.
+            return consumed
+        i = i + 1                               # consume '\n'
+        consumed = i
+        if neg != 0:
+            code = 0 - code
+        # Only press events ('d', 100) with a real code drive editing.
+        if t != 100 or have == 0:
+            continue
+        if _handle_code(code) != 0:
+            changed_p[0] = 1
+    return consumed
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    sys_bind(cast[Ptr[char]]("/dev"), cast[Ptr[char]]("#c"), 0)
+    wid: int32 = _newwindow()
+    if wid < 0:
+        _writeall(1, cast[Ptr[uint8]]("[hamedit] FAIL newwindow\n"))
+        return 1
+
+    ctlp: Array[64, uint8]
+    keysp: Array[64, uint8]
+    _winpath(&ctlp[0], wid, cast[Ptr[uint8]]("/ctl"))
+    _winpath(&keysp[0], wid, cast[Ptr[uint8]]("/keys"))
+
+    cfd: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+    if cfd >= 0:
+        _writeall(cfd, cast[Ptr[uint8]]("geometry 180 120 400 260\n"))
+        sys_close(cfd)
+    cfd2: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+    if cfd2 >= 0:
+        _writeall(cfd2, cast[Ptr[uint8]]("decorate 1\n"))
+        sys_close(cfd2)
+    cfd3: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+    if cfd3 >= 0:
+        _writeall(cfd3, cast[Ptr[uint8]]("z 6\n"))
+        sys_close(cfd3)
+    cfdt: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+    if cfdt >= 0:
+        _writeall(cfdt, cast[Ptr[uint8]]("title Editor\n"))
+        sys_close(cfdt)
+
+    # Preload a file if a path was passed as argv[1].
+    doc_len = 0
+    caret = 0
+    has_file = 0
+    if argc >= 2 and argv != cast[Ptr[uint64]](0):
+        path: Ptr[char] = cast[Ptr[char]](argv[1])
+        # Record the filename.
+        pb: Ptr[uint8] = cast[Ptr[uint8]](path)
+        k: uint64 = 0
+        while pb[k] != 0 and k < 127:
+            fname_buf[k] = pb[k]
+            k = k + 1
+        fname_buf[k] = 0
+        has_file = 1
+        n: int64 = _do_open(path)
+        if n >= 0:
+            _set_status_num(cast[Ptr[uint8]]("opened "), cast[uint64](n))
+        else:
+            _set_status(cast[Ptr[uint8]]("new file"))
+    else:
+        _set_status(cast[Ptr[uint8]]("Ctrl-S saves; arrows move"))
+
+    emit_scene(wid)
+    _writeall(1, cast[Ptr[uint8]]("[hamedit] scene window ready\n"))
+
+    kfd: int32 = sys_open(cast[Ptr[char]](&keysp[0]))
+    if kfd < 0:
+        _writeall(1, cast[Ptr[uint8]]("[hamedit] FAIL open keys\n"))
+        # Still show the window; just idle.
+        while True:
+            sys_yield()
+        return 1
+
+    # EVENT-DRIVEN loop: BLOCK on /keys; on each wake parse keystrokes, apply
+    # them, and re-emit the scene if anything changed.
+    while True:
+        room: uint64 = 512 - kev_carry
+        if room == 0:
+            kev_carry = 0
+            room = 512
+        kn: int64 = sys_read(kfd, &kev_buf[kev_carry], room)
+        if kn <= 0:
+            sys_yield()
+            continue
+        total: uint64 = kev_carry + cast[uint64](kn)
+        changed: int32 = 0
+        done: uint64 = _drain_keys_chunk(total, &changed)
+        leftover: uint64 = total - done
+        m: uint64 = 0
+        while m < leftover:
+            kev_buf[m] = kev_buf[done + m]
+            m = m + 1
+        kev_carry = leftover
+        if changed != 0:
+            emit_scene(wid)
+    return 0

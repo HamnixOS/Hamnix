@@ -265,6 +265,8 @@ build_adder_user multiwintest         # multi-window proof: ONE pid opens TWO wi
 build_adder_user hampanelscene        # scene-file DE top panel (Applications + clock) drawn as a scene display list
 build_adder_user hamtermscene         # scene-file DE terminal: glyphs content + window-local input routing proof
 build_adder_user hamfmscene           # scene-file DE file manager: directory listing as glyphs, click->descend (via lib/hamui hamscene_*)
+build_adder_user hamcalcscene         # scene-file DE calculator: button grid + display, click->compute (via lib/hamui hamscene_*)
+build_adder_user hameditscene         # scene-file DE text editor: scrollable text area + cursor, /keys input, Ctrl-S saves
 
 # --- X11 server + client (user/x11/ subdirectory) -------------------
 # The source lives in user/x11/<name>.ad but the ELF goes into
