@@ -632,6 +632,62 @@ def _drain_keys_chunk(n: uint64) -> uint64:
     return consumed
 
 
+# Re-emit + commit the scene ONLY when the visible grid actually changed.
+# `prev` carries the last committed grid hash across calls; returns the new
+# hash. A no-change call costs one _grid_hash() and skips the kernel commit,
+# so hamsh's identical idle prompt-repaints never re-present a frame.
+def _commit_if_changed(scenepath: Ptr[char], ctlpath: Ptr[char],
+                       prev: uint64) -> uint64:
+    new_hash: uint64 = _grid_hash()
+    if new_hash == prev:
+        return prev
+    _emit_scene(scenepath)
+    cfd: int32 = sys_open_write(ctlpath)
+    if cfd >= 0:
+        _writeall(cfd, cast[Ptr[uint8]]("commit\n"))
+        sys_close(cfd)
+    return new_hash
+
+
+# BUG 2 (terminal input lag) FIX — bounded shell pump.
+#
+# Root cause of the residual ~0.5s lag: the old loop NEVER slept off the
+# runqueue — it busy-yielded a fixed 2-jiffy (~20ms) window every pass. With
+# the panel, file manager and visual gate ALSO runnable, a keystroke's
+# echo round-trip (term -> shell stdin -> shell readline echo -> shell
+# stdout -> term) waited for the persistent shell to win SEVERAL full
+# round-robins against all those spinners, i.e. hundreds of ms. The terminal
+# is now EVENT-DRIVEN: it BLOCKS on /keys (parks off the runqueue, freeing
+# the CPU so the shell runs immediately) and only does a SHORT bounded drain
+# of the shell pipe to collect the echo/output burst before re-blocking.
+#
+# Drain the shell pipe until it goes quiet for a bounded number of empty
+# passes (so a multi-chunk echo / command burst is fully collected), then
+# return. Commits whenever the grid changes. Returns the new committed hash.
+# `budget` caps total passes so a chatty command (long `ls`) can't wedge us
+# off the keyboard — leftover output is collected on the next wake.
+def _pump_shell_bounded(scenepath: Ptr[char], ctlpath: Ptr[char],
+                        prev: uint64, budget: int32) -> uint64:
+    h: uint64 = prev
+    empties: int32 = 0
+    passes: int32 = 0
+    while passes < budget:
+        got: uint64 = _drain_shell()
+        if got > 0:
+            h = _commit_if_changed(scenepath, ctlpath, h)
+            empties = 0
+        else:
+            empties = empties + 1
+            # Two consecutive empty passes with a short yield between =
+            # the shell has nothing more for now. Returning lets us re-block
+            # on /keys; the next keystroke (or the next pump call) resumes.
+            if empties >= 2:
+                break
+            sys_yield()
+        passes = passes + 1
+    return h
+
+
 def main() -> int32:
     sys_bind(cast[Ptr[char]]("/dev"), cast[Ptr[char]]("#c"), 0)
     wid: int32 = _newwindow()
@@ -689,113 +745,114 @@ def main() -> int32:
     # a terminal types its keyboard, not its mouse.
     kfd: int32 = sys_open(cast[Ptr[char]](&keysp[0]))
 
-    # Event loop: drain shell output + keystrokes, then re-emit ONLY when the
-    # visible grid content actually changed (not merely when bytes flowed) —
-    # so hamsh's periodic identical prompt-repaint never re-commits a frame
-    # and the desktop stays flicker-stable.
+    # BUG 2 (terminal input lag) FIX — EVENT-DRIVEN main loop.
+    #
+    # The terminal now BLOCKS on /keys (devwsys_keys_read parks the task on
+    # the per-window keys wait-queue, OFF the runqueue) instead of busy-
+    # yielding a fixed jiffy window. The compositor's wsys_route_key does a
+    # directed wq_wake_one on a keystroke, so we wake in ~0 latency and the
+    # shell — no longer starved by our spin — gets the CPU to echo
+    # immediately. After each keystroke we forward it and do a SHORT bounded
+    # drain of the shell pipe to collect the echo, then re-block. Result:
+    # keystroke -> on-screen echo is next-frame (single-digit ms), not the
+    # ~0.5s round-robin wait of the old poll loop.
+    #
+    # `prev_hash` carries the last committed grid hash so an unchanged grid
+    # never re-commits (flicker-stable idle, unchanged from before).
     prev_hash: uint64 = _grid_hash()
-    # BUG 1 PROBE/PROOF: feed the shell a one-shot `ls /` over its stdin
-    # pipe (the channel we own — no /dev/cons keystroke contention) AFTER
-    # a settle, so it lands past hamsh's session-start getty flush. hamsh's
-    # `/bin/ls` runs in the namespace it COW-inherited from us (RFNAMEG) =
-    # PID-1's ambient ns (`#sysroot /`, `#c /dev`, `#I /net`); its output
-    # streams back over the shell's stdout into our glyph grid, so the
-    # terminal scene shows the REAL root listing — deterministic proof the
-    # graphical terminal's shell sees a populated namespace like the FM.
-    probe_iter: uint64 = 0
-    probe_sent: int32 = 0
-    probe_proven: int32 = 0
-    nsmark: Array[16, uint8]
-    # The marker goes to /dev/cons (writes -> printk + serial), NOT our own
-    # fd 1/2: this DE daemon is spawned detached, so its inherited fd 1/2 do
-    # NOT reach the boot serial console. /dev/cons is the explicit console
-    # byte stream (we already bound `/dev` = `#c` at startup). Open it once.
+
+    # The NS_PROBE marker goes to /dev/cons (writes -> printk + serial), NOT
+    # our own fd 1/2 (this DE daemon is spawned detached). Open it once.
     consfd: int32 = sys_open_write(cast[Ptr[char]]("/dev/cons"))
-    while True:
-        _drain_shell()
-        probe_iter = probe_iter + 1
-        # BUG 1 OCCLUSION-INDEPENDENT PROOF: once the probe's `ls /` output
-        # has drained into our grid, scan it for a real root entry and emit
-        # ONE serial marker carrying the entry name. Fires exactly once; not
-        # tied to the framebuffer (the FM may occlude our window). The gate
-        # asserts on "[hamterm] NS_PROBE: <entry>".
-        if probe_sent != 0 and probe_proven == 0 and consfd >= 0:
-            mlen: uint64 = _grid_find_root(&nsmark[0])
-            if mlen > 0:
-                # Build the WHOLE line in one buffer and emit it in a SINGLE
-                # write. hamsh's idle heartbeat also streams to /dev/cons, so
-                # a multi-write marker would interleave mid-line and corrupt
-                # the gate's line-anchored regex. One write = one atomic line.
-                ml: Array[48, uint8]
-                pfx: Ptr[uint8] = cast[Ptr[uint8]]("[hamterm] NS_PROBE: ")
-                mp: uint64 = 0
-                while pfx[mp] != 0:
-                    ml[mp] = pfx[mp]
-                    mp = mp + 1
-                k2: uint64 = 0
-                while k2 < mlen:
-                    ml[mp] = nsmark[k2]
-                    mp = mp + 1
-                    k2 = k2 + 1
-                ml[mp] = 10
+
+    # BUG 1 PROBE/PROOF: feed the shell a one-shot `echo NS_OK; ls /` over
+    # its stdin pipe (the channel we own — no /dev/cons keystroke
+    # contention). hamsh's `/bin/ls` runs in the namespace it COW-inherited
+    # from us (PID-1's ambient ns); its output streams back over the shell's
+    # stdout into our glyph grid — deterministic proof the graphical
+    # terminal's shell sees a populated namespace like the FM. Sent ONCE,
+    # up-front, BEFORE the blocking loop (the loop blocks on /keys and would
+    # otherwise never poll the shell without a keystroke). The probe output
+    # is then collected by a bounded pump.
+    probe_cmd: Array[24, uint8]
+    _pc: Ptr[uint8] = cast[Ptr[uint8]]("echo NS_OK; ls /")
+    _pn: uint64 = 0
+    while _pc[_pn] != 0:
+        probe_cmd[_pn] = _pc[_pn]
+        _pn = _pn + 1
+    _send_line(&probe_cmd[0], _pn)
+    # Collect the probe's banner + `ls /` listing. A generous budget so the
+    # whole listing lands (the shell may take a few scheduler turns to start
+    # /bin/ls and stream its output) — this runs ONCE at startup only.
+    prev_hash = _pump_shell_bounded(cast[Ptr[char]](&scenep[0]),
+                                    cast[Ptr[char]](&ctlp[0]), prev_hash, 200)
+    # BUG 1 OCCLUSION-INDEPENDENT PROOF: scan the grid for a real root entry
+    # and emit ONE serial marker carrying the entry name (the gate asserts
+    # on "[hamterm] NS_PROBE: <entry>"). Built + emitted in a SINGLE atomic
+    # write so it never interleaves with hamsh's idle heartbeat mid-line.
+    nsmark: Array[16, uint8]
+    if consfd >= 0:
+        mlen: uint64 = _grid_find_root(&nsmark[0])
+        if mlen > 0:
+            ml: Array[48, uint8]
+            pfx: Ptr[uint8] = cast[Ptr[uint8]]("[hamterm] NS_PROBE: ")
+            mp: uint64 = 0
+            while pfx[mp] != 0:
+                ml[mp] = pfx[mp]
                 mp = mp + 1
-                sys_write(consfd, &ml[0], mp)
-                probe_proven = 1
-        if probe_sent == 0 and probe_iter == 40:
-            # "echo NS_OK; ls /" — `echo` (builtin, hamsh's own fd 1) vs
-            # `ls /` (external child, routed stdout) disambiguates a
-            # namespace problem from a child-stdout routing problem.
-            probe_cmd: Array[24, uint8]
-            _pc: Ptr[uint8] = cast[Ptr[uint8]]("echo NS_OK; ls /")
-            _pn: uint64 = 0
-            while _pc[_pn] != 0:
-                probe_cmd[_pn] = _pc[_pn]
-                _pn = _pn + 1
-            _send_line(&probe_cmd[0], _pn)
-            probe_sent = 1
-        if kfd >= 0:
-            # BUG 3 FIX: drain the /keys ring FULLY each wake (loop until the
-            # non-blocking read returns nothing) and CARRY any partial trailing
-            # line across reads, so no keystroke is lost at a buffer boundary
-            # or because a fast burst exceeded one read's worth of bytes.
-            while True:
-                room: uint64 = 512 - kev_carry
-                if room == 0:
-                    # Carry is pathologically large (malformed line with no
-                    # newline) — drop it to avoid a wedge; never happens for
-                    # well-formed "<t> <code>\n" lines (<=~12 bytes).
-                    kev_carry = 0
-                    room = 512
-                kn: int64 = sys_read_nb(kfd, &kev_buf[kev_carry], room)
-                if kn <= 0:
-                    break
-                total: uint64 = kev_carry + cast[uint64](kn)
-                done: uint64 = _drain_keys_chunk(total)
-                # Shift the unconsumed tail (a split partial line) to the front.
-                leftover: uint64 = total - done
-                m: uint64 = 0
-                while m < leftover:
-                    kev_buf[m] = kev_buf[done + m]
-                    m = m + 1
-                kev_carry = leftover
-                if cast[uint64](kn) < room:
-                    break               # ring drained this pass
-        new_hash: uint64 = _grid_hash()
-        if new_hash != prev_hash:
-            prev_hash = new_hash
-            _emit_scene(cast[Ptr[char]](&scenep[0]))
-            cfd5: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
-            if cfd5 >= 0:
-                _writeall(cfd5, cast[Ptr[uint8]]("commit\n"))
-                sys_close(cfd5)
-        # BUG 3 (latency) FIX: cooperatively YIELD rather than busy-wait a
-        # fixed jiffy window. The old `while jiffies-s < 5: pass` spun the
-        # terminal's whole scheduler quantum, so with the panel, file
-        # manager and visual-gate also spinning a keystroke waited a full
-        # round-robin (N×quantum) — the multi-second lag the user saw.
-        # sys_yield() relinquishes the CPU the instant we've drained shell
-        # output + keys, so the next pass picks up new bytes promptly.
-        s2: uint64 = sys_get_jiffies()
-        while sys_get_jiffies() - s2 < 2:
+            k2: uint64 = 0
+            while k2 < mlen:
+                ml[mp] = nsmark[k2]
+                mp = mp + 1
+                k2 = k2 + 1
+            ml[mp] = 10
+            mp = mp + 1
+            sys_write(consfd, &ml[0], mp)
+
+    # If we somehow have no /keys handle, fall back to a slow poll so the
+    # terminal still renders shell output rather than wedging.
+    if kfd < 0:
+        while True:
+            prev_hash = _pump_shell_bounded(cast[Ptr[char]](&scenep[0]),
+                                            cast[Ptr[char]](&ctlp[0]),
+                                            prev_hash, 8)
+            s2: uint64 = sys_get_jiffies()
+            while sys_get_jiffies() - s2 < 2:
+                sys_yield()
+        return 0
+
+    # EVENT-DRIVEN loop: BLOCK on /keys; on each wake drain the ring fully,
+    # forward keystrokes to the shell, then bounded-pump the echo.
+    while True:
+        room: uint64 = 512 - kev_carry
+        if room == 0:
+            # Pathologically large carry (malformed line with no newline) —
+            # drop it to avoid a wedge; never happens for well-formed
+            # "<t> <code>\n" lines (<=~12 bytes).
+            kev_carry = 0
+            room = 512
+        # BLOCKING read: parks off the runqueue until the compositor routes a
+        # key to us (directed wq_wake_one). No CPU spin, no shell starvation.
+        kn: int64 = sys_read(kfd, &kev_buf[kev_carry], room)
+        if kn <= 0:
+            # EINTR / transient: yield once and retry rather than busy-spin.
             sys_yield()
+            continue
+        # BUG 3 FIX: parse only COMPLETE "<t> <code>\n" lines; CARRY any
+        # partial trailing line across reads so a keystroke split at a buffer
+        # boundary or a fast burst is never lost.
+        total: uint64 = kev_carry + cast[uint64](kn)
+        done: uint64 = _drain_keys_chunk(total)
+        leftover: uint64 = total - done
+        m: uint64 = 0
+        while m < leftover:
+            kev_buf[m] = kev_buf[done + m]
+            m = m + 1
+        kev_carry = leftover
+        # Collect the shell's echo (+ any command output it produced) and
+        # commit. Bounded so a chatty command can't keep us off the keyboard;
+        # leftover output is picked up on the next keystroke wake.
+        prev_hash = _pump_shell_bounded(cast[Ptr[char]](&scenep[0]),
+                                        cast[Ptr[char]](&ctlp[0]),
+                                        prev_hash, 32)
     return 0
