@@ -48,18 +48,27 @@ if ! grep -q "desktop icon.*EXTRACTED" <<< "$daemon_pixel_body"; then
     fail_link "link 1 (hamUId.ad): the 'desktop icon ... EXTRACTED' breadcrumb is gone"
 fi
 
-# --- Link 2: hamdesktop binary is registered + sources -------------
+# --- Link 2: hamdesktop binary is registered + is a SCENE client ----
+# hamdesktop was rewritten onto the scene-file DE: it is now an ordinary
+# scene client (display list via lib/hamui hamscene_*), NOT the retired
+# hamui_v2 bitmap-blit client. The structural contract is: it is built, it
+# emits a scene via hamscene_commit, it draws icons with the scene icon
+# helpers, and it reads its launcher set from /etc/desktop.icons.
+RC5_SRC="etc/rc.d/rc.5"
 if ! grep -q "build_adder_user hamdesktop" "$BUILD_SRC"; then
     fail_link "link 2 (build_user.sh): hamdesktop is not built"
 fi
-if ! grep -q "hamui_set_protocol_v2" "$DESKTOP_SRC"; then
-    fail_link "link 2 (hamdesktop.ad): does NOT call hamui_set_protocol_v2"
+if ! grep -q "hamscene_commit" "$DESKTOP_SRC"; then
+    fail_link "link 2 (hamdesktop.ad): does NOT emit a scene via hamscene_commit"
 fi
-if ! grep -q '"/dev/wsys/desktop"' "$DESKTOP_SRC"; then
-    fail_link "link 2 (hamdesktop.ad): does NOT read /dev/wsys/desktop snapshot"
+if ! grep -qE "hamscene_icon_folder|hamscene_icon_file" "$DESKTOP_SRC"; then
+    fail_link "link 2 (hamdesktop.ad): does NOT draw scene icon glyphs"
 fi
-if ! grep -q "hamui_v2_commit_rect" "$DESKTOP_SRC"; then
-    fail_link "link 2 (hamdesktop.ad): does NOT call hamui_v2_commit_rect"
+if ! grep -q '"/etc/desktop.icons"' "$DESKTOP_SRC"; then
+    fail_link "link 2 (hamdesktop.ad): does NOT read /etc/desktop.icons config"
+fi
+if [ -f "$RC5_SRC" ] && ! grep -q "/bin/hamdesktop" "$RC5_SRC"; then
+    fail_link "link 2 (rc.5): hamdesktop is not launched at runlevel 5"
 fi
 
 # --- Link 3: kernel exposes /dev/wsys/desktop + show leaves --------

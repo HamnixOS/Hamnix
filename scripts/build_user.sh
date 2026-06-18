@@ -193,7 +193,7 @@ build_adder_user hamrband             # DE pivot wave 7: rubber-band drag-to-cre
 build_adder_user hamnotif             # DE pivot wave 7: transient notification toast banner (v2 client; reads /dev/wsys/notif, poked via /dev/wsys/notif/show)
 build_adder_user hamnotify            # libnotify-shape CLI sender: writes "<title>\t<body>\t<icon>\n" to /dev/wsys/post (inbox ring drained by hamUId)
 build_adder_user hamsessui            # DE pivot wave 8: modal End Session dialog (Lock/Log Out/Shut Down/Cancel) (v2 client; reads /dev/wsys/sessui, poked via /dev/wsys/sessui/show)
-build_adder_user hamdesktop           # DE pivot wave 1 (round 2): desktop icon badges on the root layer (v2 client; reads /dev/wsys/desktop, poked via /dev/wsys/desktop/show)
+build_adder_user hamdesktop           # scene-file DE desktop backdrop + clickable launcher icons (scene client; reads /etc/desktop.icons, double-click spawns via lib/p9 spawn)
 build_adder_user hamsysmon            # DE pivot wave 2 (round 2): desktop system-monitor applet (CPU/MEM bars) (v2 client; reads /dev/wsys/sysmon, poked via /dev/wsys/sysmon/show)
 build_adder_user hamctxmenu           # DE pivot wave 3 (round 2): right-click context menu (v2 client; reads /dev/wsys/ctxmenu, poked via /dev/wsys/ctxmenu/show)
 build_adder_user hamsnap              # DE pivot wave 4 (round 2): snap-zone preview during window move-drag (v2 client; reads /dev/wsys/snap, poked via /dev/wsys/snap/show)
