@@ -49,10 +49,18 @@ BOOT_WAIT="${BOOT_WAIT:-240}"
 # A periodic full-frame clear changes tens of thousands of pixels, so any
 # reasonable floor catches it. Default 400 px (< 0.05% of a 1280x800 frame).
 FLICKER_MAX="${FLICKER_MAX:-400}"
-# Relative-mouse: the cursor box must move by at least this many changed
-# pixels between the two cursor positions (a 10x14 sprite ~ 140 px, moved
-# far enough to not overlap, so two footprints ~ 280 changed px).
-CURSOR_MOVE_MIN="${CURSOR_MOVE_MIN:-120}"
+# Relative-mouse: the cursor must move by at least this many changed pixels
+# between the two cursor positions. The sprite is now a ~16px-tall outlined
+# left_ptr ARROW (~113 px: a white head triangle + slanted tail with a 1px
+# dark outline on every edge), NOT the old solid box. The measured move-diff
+# is dominated by WHERE the cursor lands: over a light window or near the
+# screen edge (clamped) the white interior barely clears the per-channel
+# diff threshold, so the count runs ~110-120 rather than the old box's
+# ~140-280. The floor is set well above the ~0 a non-moving cursor produces
+# in its footprint (a true regression — dead relative path — reads ~0), and
+# the routed 'm <x> <y>' read back from the moved position (asserted below)
+# is the authoritative proof the cursor actually moved.
+CURSOR_MOVE_MIN="${CURSOR_MOVE_MIN:-90}"
 TS="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-build/de_flicker_relmouse/$TS}"
 
