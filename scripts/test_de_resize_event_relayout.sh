@@ -66,6 +66,7 @@ declare -A CLIENT_FN=(
     [user/hamtermscene.ad]="_term_apply_resize"
     [user/hamfmscene.ad]="_fm_apply_resize"
     [user/hameditscene.ad]="_ed_apply_resize"
+    [user/hamcalcscene.ad]="_calc_apply_resize"
 )
 for src in "${!CLIENT_FN[@]}"; do
     fn="${CLIENT_FN[$src]}"
