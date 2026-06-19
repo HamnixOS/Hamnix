@@ -41,47 +41,48 @@ fail_link() {
     fail=1
 }
 
-# Extract the body of atkbd_poll() (from its def to the next top-level def).
-poll_body=$(awk '
-    /^def[[:space:]]+atkbd_poll[[:space:]]*\(/ { inside=1; print; next }
+# BUG 3 (refactor): the per-byte AUX filter now lives in the SINGLE serialized
+# _atkbd_drain(), which atkbd_poll() and atkbd_irq_handler() both route through.
+# Assert the filter on that drain body.
+drain_body=$(awk '
+    /^def[[:space:]]+_atkbd_drain[[:space:]]*\(/ { inside=1; print; next }
     /^def[[:space:]]/ { if (inside) { inside=0 } }
     inside { print }
 ' "$ATKBD_SRC")
 
-if [ -z "$poll_body" ]; then
-    fail_link "link 1: atkbd_poll() not found in $ATKBD_SRC"
+if [ -z "$drain_body" ]; then
+    fail_link "link 1: _atkbd_drain() not found in $ATKBD_SRC"
 else
-    # Link 1: the poll loop reads the STATUS port (0x64) inside the drain loop
-    # so it can inspect the AUX bit per byte (not just OBF once).
-    if ! printf '%s\n' "$poll_body" | grep -qE 'inb\(KBD_STATUS_PORT\)'; then
-        fail_link "link 1 (atkbd_poll): does not read KBD_STATUS_PORT to inspect AUX bit"
+    # Link 1: the drain loop reads the STATUS port (0x64) so it can inspect the
+    # AUX bit per byte (not just OBF once).
+    if ! printf '%s\n' "$drain_body" | grep -qE 'inb\(KBD_STATUS_PORT\)'; then
+        fail_link "link 1 (_atkbd_drain): does not read KBD_STATUS_PORT to inspect AUX bit"
     fi
     # Link 2: it tests the AUX bit (0x20) so mouse-sourced bytes are detected.
-    if ! printf '%s\n' "$poll_body" | grep -qE '&[[:space:]]*0x20'; then
-        fail_link "link 2 (atkbd_poll): does not test the AUX bit (0x20) — mouse bytes will leak to /keys"
+    if ! printf '%s\n' "$drain_body" | grep -qE '&[[:space:]]*0x20'; then
+        fail_link "link 2 (_atkbd_drain): does not test the AUX bit (0x20) — mouse bytes will leak to /keys"
     fi
     # Link 3: it still routes KEYBOARD bytes to atkbd_process_byte (the else arm).
-    if ! printf '%s\n' "$poll_body" | grep -qE 'atkbd_process_byte'; then
-        fail_link "link 3 (atkbd_poll): no longer routes keyboard bytes to atkbd_process_byte"
+    if ! printf '%s\n' "$drain_body" | grep -qE 'atkbd_process_byte'; then
+        fail_link "link 3 (_atkbd_drain): no longer routes keyboard bytes to atkbd_process_byte"
     fi
     # Link 4 (sanity): the AUX-set arm drains the data port WITHOUT processing.
-    # Confirm a bare 'inb(KBD_DATA_PORT)' (discard) appears in the body, i.e.
-    # an AUX byte is consumed but not translated.
-    if ! printf '%s\n' "$poll_body" | grep -qE '^[[:space:]]+inb\(KBD_DATA_PORT\)'; then
-        fail_link "link 4 (atkbd_poll): AUX-set branch does not discard the data byte (drop mouse byte)"
+    if ! printf '%s\n' "$drain_body" | grep -qE '^[[:space:]]+inb\(KBD_DATA_PORT\)'; then
+        fail_link "link 4 (_atkbd_drain): AUX-set branch does not discard the data byte (drop mouse byte)"
     fi
 fi
 
-# Corroborate that the IRQ handler still has the same guard (so the two paths
-# stay consistent — this is the reference the poll path mirrors).
-irq_body=$(awk '
-    /^def[[:space:]]+atkbd_irq_handler[[:space:]]*\(/ { inside=1; print; next }
-    /^def[[:space:]]/ { if (inside) { inside=0 } }
-    inside { print }
-' "$ATKBD_SRC")
-if ! printf '%s\n' "$irq_body" | grep -qE '&[[:space:]]*0x20'; then
-    fail_link "atkbd_irq_handler: lost its AUX-bit (0x20) guard"
-fi
+# Both entry points must route through the single serialized drain.
+for fn in atkbd_poll atkbd_irq_handler; do
+    body=$(awk -v name="$fn" '
+        $0 ~ "^def[[:space:]]+" name "[[:space:]]*\\(" { inside=1; print; next }
+        /^def[[:space:]]/ { if (inside) { inside=0 } }
+        inside { print }
+    ' "$ATKBD_SRC")
+    if ! printf '%s\n' "$body" | grep -qE '_atkbd_drain'; then
+        fail_link "$fn: does not route through the serialized _atkbd_drain()"
+    fi
+done
 
 if [ "$fail" = "0" ]; then
     echo "PASS: atkbd poll AUX filter intact"
