@@ -1,0 +1,840 @@
+# user/haminstallui.ad
+#
+# Scene-file DE visual installer — a GUI FRONT-END over the existing
+# /bin/haminstall on-target install machinery (docs/de_scene_file_arch.md).
+# It does NOT reinvent partitioning / format / rootfs lay-down: it collects
+# two parameters and shells out to the proven installer tool, exactly like
+# the unattended /etc/install_nvme.hamsh path does, but interactively.
+#
+# WHAT IT COLLECTS:
+#   (a) a system / host NAME       — a text-input field (typed via /keys).
+#   (b) the TARGET DRIVE           — a selectable list of detected disks
+#                                    with their capacity. Whole disks only
+#                                    (partitions filtered out); the live-root
+#                                    disk (/dev/blk/rootdev) is excluded so
+#                                    the installer can never target itself.
+#   then a CONFIRM button that:
+#       1. writes the host NAME to /etc/hostname (best-effort), and
+#       2. spawns /bin/haminstall <disk> with stdout redirected to a log,
+#          then streams that log into a PROGRESS pane until the child exits.
+#
+# haminstall itself does the real work — GPT partition (hamnix_partition),
+# mkfs the ESP (FAT) + root (ext4), dd the ESP boot files, and copy the
+# rootfs from the manifest — and refuses the live-root disk in the KERNEL
+# guard, so this GUI is a thin, safe driver.
+#
+# RENDER: a titled window with a NAME entry, a disk LIST, a Confirm button,
+# and a status/progress area. Drawn with the lib/hamui hamscene_* helpers
+# and committed to /dev/wsys/<wid>/scene. INPUT (§11): pointer on /event
+# (select a disk / hit Confirm), text on /keys (type the host name).
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_get_jiffies() -> uint64
+extern def sys_yield() -> int32
+extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
+extern def sys_waitpid(pid: int32) -> int64
+
+from lib.p9 import spawn, p9_listdir
+from lib.hamui import hamscene_begin, hamscene_fill, hamscene_rect, \
+    hamscene_stroke, hamscene_glyphs, hamscene_panel_button, hamscene_commit
+
+
+def _slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _writeall(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _slen(s))
+
+
+def _u64_to_dec(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    x: uint64 = v
+    while x > 0:
+        digs[n] = cast[uint8](x % 10) + 48
+        x = x / 10
+        n = n + 1
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digs[n]
+        i = i + 1
+    return i
+
+
+def _newwindow() -> int32:
+    wfd: int32 = sys_open_write(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if wfd < 0:
+        return -1
+    sys_write(wfd, cast[Ptr[uint8]]("newwindow\n"), 10)
+    sys_close(wfd)
+    rfd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if rfd < 0:
+        return -1
+    rbuf: Array[32, uint8]
+    r: int64 = sys_read(rfd, &rbuf[0], 31)
+    sys_close(rfd)
+    if r <= 0:
+        return -1
+    wid: int32 = 0
+    i: uint64 = 0
+    while i < cast[uint64](r):
+        c: uint8 = rbuf[i]
+        if c >= 48 and c <= 57:
+            wid = wid * 10 + cast[int32](c) - 48
+        i = i + 1
+    return wid
+
+
+def _winpath(out: Ptr[uint8], wid: int32, leaf: Ptr[uint8]):
+    p: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("/dev/wsys/")
+    j: uint64 = 0
+    while pre[j] != 0:
+        out[p] = pre[j]
+        p = p + 1
+        j = j + 1
+    p = p + _u64_to_dec(cast[uint64](wid), &out[p])
+    k: uint64 = 0
+    while leaf[k] != 0:
+        out[p] = leaf[k]
+        p = p + 1
+        k = k + 1
+    out[p] = 0
+
+
+# ====================================================================
+# DISK ENUMERATION
+# ====================================================================
+# Read /dev/blk: one "NAME\n" per node (whole disks AND partitions). Keep
+# only WHOLE disks (a name that is a strict prefix of another, or simply has
+# no trailing 'pN' partition suffix on a base name that also appears). We use
+# a simpler, robust rule matching lsblk/haminstall conventions: a partition
+# name contains 'p' followed only by digits to end (e.g. nvme0n1p2, vdap1);
+# everything else is a whole disk. Exclude the live-root disk via rootdev.
+
+MAX_DISKS: uint64 = 12
+disk_name: Array[384, uint8]          # MAX_DISKS * 32
+disk_namelen: Array[12, uint64]
+disk_sectors: Array[12, uint64]       # capacity in 512-byte sectors
+n_disks: uint64 = 0
+
+
+def disk_name_ptr(i: uint64) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](&disk_name[0]) + i * 32)
+
+
+# Is `name` (len nl) a partition node? Heuristic: it contains a 'p' that is
+# followed only by decimal digits up to the end (matching the GPT child
+# naming the installer tools use: <disk>p<num>).
+def _is_partition(name: Ptr[uint8], nl: uint64) -> int32:
+    # Scan for the LAST 'p' that has only digits after it.
+    i: uint64 = 0
+    while i < nl:
+        if name[i] == 0x70:                              # 'p'
+            j: uint64 = i + 1
+            alldig: int32 = 1
+            if j >= nl:
+                alldig = 0
+            while j < nl:
+                if name[j] < 48 or name[j] > 57:
+                    alldig = 0
+                j = j + 1
+            if alldig == 1:
+                return 1
+        i = i + 1
+    return 0
+
+
+root_disk: Array[32, uint8]
+root_disk_len: uint64 = 0
+def _read_rootdev():
+    root_disk_len = 0
+    fd: int32 = sys_open(cast[Ptr[char]]("/dev/blk/rootdev"))
+    if fd < 0:
+        return
+    buf: Array[32, uint8]
+    n: int64 = sys_read(fd, &buf[0], 31)
+    sys_close(fd)
+    if n <= 0:
+        return
+    ln: uint64 = cast[uint64](n)
+    while ln > 0 and (buf[ln - 1] == 10 or buf[ln - 1] == 13
+                      or buf[ln - 1] == 32):
+        ln = ln - 1
+    i: uint64 = 0
+    while i < ln and i < 31:
+        root_disk[i] = buf[i]
+        i = i + 1
+    root_disk_len = ln
+
+
+def _name_eq(a: Ptr[uint8], al: uint64, b: Ptr[uint8], bl: uint64) -> int32:
+    if al != bl:
+        return 0
+    i: uint64 = 0
+    while i < al:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Read /dev/blk/<name>/size -> capacity in 512-byte sectors (0 on failure).
+sizepath: Array[96, uint8]
+def _read_size(name: Ptr[uint8], nl: uint64) -> uint64:
+    p: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("/dev/blk/")
+    k: uint64 = 0
+    while pre[k] != 0:
+        sizepath[p] = pre[k]
+        p = p + 1
+        k = k + 1
+    k = 0
+    while k < nl:
+        sizepath[p] = name[k]
+        p = p + 1
+        k = k + 1
+    suf: Ptr[uint8] = cast[Ptr[uint8]]("/size")
+    k = 0
+    while suf[k] != 0:
+        sizepath[p] = suf[k]
+        p = p + 1
+        k = k + 1
+    sizepath[p] = 0
+    fd: int32 = sys_open(cast[Ptr[char]](&sizepath[0]))
+    if fd < 0:
+        return 0
+    sbuf: Array[32, uint8]
+    n: int64 = sys_read(fd, &sbuf[0], 31)
+    sys_close(fd)
+    if n <= 0:
+        return 0
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < cast[uint64](n) and sbuf[i] >= 48 and sbuf[i] <= 57:
+        v = v * 10 + cast[uint64](sbuf[i]) - 48
+        i = i + 1
+    return v
+
+
+lsbuf: Array[4096, uint8]
+def _enumerate_disks():
+    n_disks = 0
+    _read_rootdev()
+    n: int64 = p9_listdir(cast[Ptr[char]]("/dev/blk"), &lsbuf[0], 4096)
+    if n < 0:
+        return
+    nm: Array[32, uint8]
+    nl: uint64 = 0
+    i: uint64 = 0
+    total: uint64 = cast[uint64](n)
+    while i < total:
+        c: uint8 = lsbuf[i]
+        if c == 10:
+            if nl > 0:
+                # Skip the rootdev pseudo-file + partitions + the live root.
+                is_meta: int32 = 0
+                if _name_eq(&nm[0], nl, cast[Ptr[uint8]]("rootdev"), 7) != 0:
+                    is_meta = 1
+                if _name_eq(&nm[0], nl, cast[Ptr[uint8]]("ctl"), 3) != 0:
+                    is_meta = 1
+                if is_meta == 0 and _is_partition(&nm[0], nl) == 0:
+                    is_root: int32 = 0
+                    if root_disk_len > 0 and \
+                       _name_eq(&nm[0], nl, &root_disk[0], root_disk_len) != 0:
+                        is_root = 1
+                    if is_root == 0 and n_disks < MAX_DISKS:
+                        dp: Ptr[uint8] = disk_name_ptr(n_disks)
+                        k: uint64 = 0
+                        while k < nl:
+                            dp[k] = nm[k]
+                            k = k + 1
+                        dp[nl] = 0
+                        disk_namelen[n_disks] = nl
+                        disk_sectors[n_disks] = _read_size(&nm[0], nl)
+                        n_disks = n_disks + 1
+            nl = 0
+        else:
+            if nl < 31:
+                nm[nl] = c
+                nl = nl + 1
+        i = i + 1
+
+
+# Render a sector count as a human size string "<n> MiB" / "<n> GiB" into out
+# (NUL-terminated). 512 bytes/sector.
+def _fmt_size(sectors: uint64, out: Ptr[uint8]):
+    # bytes = sectors * 512.  MiB = bytes / 2^20 = sectors / 2048.
+    mib: uint64 = sectors / 2048
+    p: uint64 = 0
+    if mib >= 1024:
+        gib: uint64 = mib / 1024
+        frac: uint64 = ((mib % 1024) * 10) / 1024
+        p = p + _u64_to_dec(gib, &out[p])
+        out[p] = 46                                       # '.'
+        p = p + 1
+        p = p + _u64_to_dec(frac, &out[p])
+        out[p] = 32
+        out[p+1] = 71                                     # 'G'
+        out[p+2] = 105
+        out[p+3] = 66                                     # 'iB'
+        out[p+4] = 0
+    else:
+        p = p + _u64_to_dec(mib, &out[p])
+        out[p] = 32
+        out[p+1] = 77                                     # 'M'
+        out[p+2] = 105
+        out[p+3] = 66                                     # 'iB'
+        out[p+4] = 0
+
+
+# ====================================================================
+# HOST NAME ENTRY
+# ====================================================================
+HOSTNAME_CAP: uint64 = 30
+hostname_buf: Array[32, uint8]
+hostname_len: uint64 = 0
+
+
+def _hostname_default():
+    # Seed with "hamnix".
+    seed: Ptr[uint8] = cast[Ptr[uint8]]("hamnix")
+    i: uint64 = 0
+    while seed[i] != 0:
+        hostname_buf[i] = seed[i]
+        i = i + 1
+    hostname_buf[i] = 0
+    hostname_len = i
+
+
+# Accept a typed byte into the host-name field. Returns 1 if it changed.
+def _hostname_key(c: uint8) -> int32:
+    if c == 8 or c == 127:                                # Backspace / DEL
+        if hostname_len > 0:
+            hostname_len = hostname_len - 1
+            hostname_buf[hostname_len] = 0
+            return 1
+        return 0
+    # Allow letters, digits, '-' (valid hostname chars).
+    ok: int32 = 0
+    if c >= 48 and c <= 57:
+        ok = 1
+    if c >= 65 and c <= 90:
+        ok = 1
+    if c >= 97 and c <= 122:
+        ok = 1
+    if c == 45:                                           # '-'
+        ok = 1
+    if ok == 1 and hostname_len < HOSTNAME_CAP:
+        hostname_buf[hostname_len] = c
+        hostname_len = hostname_len + 1
+        hostname_buf[hostname_len] = 0
+        return 1
+    return 0
+
+
+def _write_hostname():
+    if hostname_len == 0:
+        return
+    fd: int32 = sys_open_write(cast[Ptr[char]]("/etc/hostname"))
+    if fd < 0:
+        return
+    sys_write(fd, &hostname_buf[0], hostname_len)
+    sys_write(fd, cast[Ptr[uint8]]("\n"), 1)
+    sys_close(fd)
+
+
+# ====================================================================
+# STATE + LAYOUT
+# ====================================================================
+WIN_W: int32 = 420
+WIN_H: int32 = 380
+
+sel_disk: int64 = -1            # selected disk index, or -1
+# UI phase: 0 = collecting inputs, 1 = installing, 2 = done, 3 = error.
+phase: int32 = 0
+
+# Disk-list geometry.
+LIST_X: int32 = 16
+LIST_Y: int32 = 116
+ROW_H: int32 = 26
+NAME_X: int32 = 16
+NAME_Y: int32 = 56
+NAME_W: int32 = 388
+NAME_H: int32 = 26
+CONFIRM_X: int32 = 16
+CONFIRM_W: int32 = 140
+CONFIRM_H: int32 = 30
+
+
+def _confirm_y() -> int32:
+    return LIST_Y + cast[int32](n_disks) * ROW_H + 16
+
+
+def _status_y() -> int32:
+    return _confirm_y() + CONFIRM_H + 14
+
+
+# Progress text (last ~6 lines streamed from the installer log).
+PROG_LINES: uint64 = 8
+PROG_W: uint64 = 50
+prog_text: Array[400, uint8]          # PROG_LINES * PROG_W
+prog_n: uint64 = 0                    # number of live lines
+
+
+def prog_line_ptr(i: uint64) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](&prog_text[0]) + i * PROG_W)
+
+
+def _prog_push(s: Ptr[uint8], n: uint64):
+    # Scroll up if full.
+    if prog_n >= PROG_LINES:
+        i: uint64 = 1
+        while i < PROG_LINES:
+            src: Ptr[uint8] = prog_line_ptr(i)
+            dst: Ptr[uint8] = prog_line_ptr(i - 1)
+            k: uint64 = 0
+            while k < PROG_W:
+                dst[k] = src[k]
+                k = k + 1
+            i = i + 1
+        prog_n = PROG_LINES - 1
+    dl: Ptr[uint8] = prog_line_ptr(prog_n)
+    cn: uint64 = n
+    if cn > PROG_W - 1:
+        cn = PROG_W - 1
+    k2: uint64 = 0
+    while k2 < cn:
+        dl[k2] = s[k2]
+        k2 = k2 + 1
+    dl[cn] = 0
+    prog_n = prog_n + 1
+
+
+# ====================================================================
+# RENDER
+# ====================================================================
+def emit_scene(wid: int32):
+    hamscene_begin()
+    hamscene_fill(0, 0, WIN_W, WIN_H, cast[Ptr[uint8]]("#d4d0c8"))
+    # Title banner.
+    hamscene_fill(0, 0, WIN_W, 28, cast[Ptr[uint8]]("#3a6ea5"))
+    hamscene_glyphs(12, 9, cast[Ptr[uint8]]("Install Hamnix"),
+                    cast[Ptr[uint8]]("#ffffff"))
+
+    # --- host NAME field ---
+    hamscene_glyphs(NAME_X, 40, cast[Ptr[uint8]]("System name:"),
+                    cast[Ptr[uint8]]("#202020"))
+    hamscene_fill(NAME_X, NAME_Y, NAME_W, NAME_H, cast[Ptr[uint8]]("#ffffff"))
+    hamscene_stroke(NAME_X, NAME_Y, NAME_W, NAME_H, 1,
+                    cast[Ptr[uint8]]("#808080"))
+    hamscene_glyphs(NAME_X + 6, NAME_Y + 9, &hostname_buf[0],
+                    cast[Ptr[uint8]]("#202020"))
+    # Caret after the text (only while collecting inputs).
+    if phase == 0:
+        cx: int32 = NAME_X + 6 + cast[int32](hostname_len) * 8
+        hamscene_fill(cx, NAME_Y + 6, 1, 14, cast[Ptr[uint8]]("#202020"))
+
+    # --- target DRIVE list ---
+    hamscene_glyphs(LIST_X, 98, cast[Ptr[uint8]]("Target drive:"),
+                    cast[Ptr[uint8]]("#202020"))
+    if n_disks == 0:
+        hamscene_glyphs(LIST_X + 8, LIST_Y + 6,
+                        cast[Ptr[uint8]]("(no installable disks found)"),
+                        cast[Ptr[uint8]]("#a02020"))
+    else:
+        i: uint64 = 0
+        while i < n_disks:
+            ry: int32 = LIST_Y + cast[int32](i) * ROW_H
+            face: Ptr[uint8] = cast[Ptr[uint8]]("#eceae4")
+            if sel_disk == cast[int64](i):
+                face = cast[Ptr[uint8]]("#3a6ea5")
+            hamscene_fill(LIST_X, ry, NAME_W, ROW_H - 2, face)
+            hamscene_stroke(LIST_X, ry, NAME_W, ROW_H - 2, 1,
+                            cast[Ptr[uint8]]("#a0a0a0"))
+            txtcol: Ptr[uint8] = cast[Ptr[uint8]]("#202020")
+            if sel_disk == cast[int64](i):
+                txtcol = cast[Ptr[uint8]]("#ffffff")
+            # "<name>   <size>"
+            row: Array[64, uint8]
+            p: uint64 = 0
+            dp: Ptr[uint8] = disk_name_ptr(i)
+            k: uint64 = 0
+            while dp[k] != 0 and p < 16:
+                row[p] = dp[k]
+                p = p + 1
+                k = k + 1
+            while p < 16:
+                row[p] = 32
+                p = p + 1
+            _fmt_size(disk_sectors[i], &row[p])
+            hamscene_glyphs(LIST_X + 8, ry + 6, &row[0], txtcol)
+            i = i + 1
+
+    # --- Confirm button ---
+    cy: int32 = _confirm_y()
+    ready: int32 = 0
+    if phase == 0 and sel_disk >= 0 and hostname_len > 0:
+        ready = 1
+    btnface: Ptr[uint8] = cast[Ptr[uint8]]("#c8c4bc")
+    if ready == 0:
+        btnface = cast[Ptr[uint8]]("#bdbab4")
+    hamscene_fill(CONFIRM_X, cy, CONFIRM_W, CONFIRM_H, btnface)
+    hamscene_stroke(CONFIRM_X, cy, CONFIRM_W, CONFIRM_H, 1,
+                    cast[Ptr[uint8]]("#606060"))
+    btnlbl: Ptr[uint8] = cast[Ptr[uint8]]("Install")
+    btncol: Ptr[uint8] = cast[Ptr[uint8]]("#202020")
+    if ready == 0 and phase == 0:
+        btncol = cast[Ptr[uint8]]("#808080")
+    if phase == 1:
+        btnlbl = cast[Ptr[uint8]]("Installing...")
+    hamscene_glyphs(CONFIRM_X + 14, cy + 9, btnlbl, btncol)
+
+    # --- status / progress area ---
+    sy: int32 = _status_y()
+    hamscene_fill(LIST_X, sy, NAME_W, WIN_H - sy - 12,
+                  cast[Ptr[uint8]]("#101418"))
+    hamscene_stroke(LIST_X, sy, NAME_W, WIN_H - sy - 12, 1,
+                    cast[Ptr[uint8]]("#404040"))
+    if phase == 0:
+        hamscene_glyphs(LIST_X + 6, sy + 6,
+                        cast[Ptr[uint8]]("Pick a disk + name, then Install."),
+                        cast[Ptr[uint8]]("#80c080"))
+    else:
+        li: uint64 = 0
+        while li < prog_n:
+            hamscene_glyphs(LIST_X + 6, sy + 6 + cast[int32](li) * 12,
+                            prog_line_ptr(li), cast[Ptr[uint8]]("#80d080"))
+            li = li + 1
+    if phase == 2:
+        hamscene_glyphs(LIST_X + 6, WIN_H - 26,
+                        cast[Ptr[uint8]]("Install complete - reboot to disk."),
+                        cast[Ptr[uint8]]("#a0e0a0"))
+    if phase == 3:
+        hamscene_glyphs(LIST_X + 6, WIN_H - 26,
+                        cast[Ptr[uint8]]("Install FAILED - see log above."),
+                        cast[Ptr[uint8]]("#e08080"))
+
+    hamscene_commit(wid)
+
+
+# ====================================================================
+# RUN THE REAL INSTALL (front-end over /bin/haminstall)
+# ====================================================================
+inst_argv: Array[4, uint64]
+inst_disk: Array[32, uint8]
+install_pid: int32 = -1
+log_off: uint64 = 0
+
+
+def _begin_install():
+    # Write the host name first (best-effort), then spawn the real installer
+    # with its stdout/stderr redirected to a log we stream into the progress
+    # pane. haminstall does GPT+mkfs+ESP+rootfs and enforces the live-root
+    # guard in the kernel, so we just hand it the target disk.
+    _write_hostname()
+    di: uint64 = cast[uint64](sel_disk)
+    dp: Ptr[uint8] = disk_name_ptr(di)
+    k: uint64 = 0
+    while dp[k] != 0:
+        inst_disk[k] = dp[k]
+        k = k + 1
+    inst_disk[k] = 0
+    inst_argv[0] = cast[uint64](cast[Ptr[uint8]]("/bin/haminstall"))
+    inst_argv[1] = cast[uint64](&inst_disk[0])
+    inst_argv[2] = 0
+    # Truncate/clear the log by opening it for write and closing.
+    tfd: int32 = sys_open_write(cast[Ptr[char]]("/tmp/haminstall.gui.log"))
+    logfd: int32 = tfd
+    if logfd < 0:
+        logfd = 1
+    pid: int32 = spawn(cast[Ptr[char]]("/bin/haminstall"), &inst_argv[0],
+                       -2, logfd, cast[Ptr[uint64]](0))
+    if tfd >= 0:
+        sys_close(tfd)
+    install_pid = pid
+    log_off = 0
+    prog_n = 0
+    if pid < 0:
+        _prog_push(cast[Ptr[uint8]]("spawn /bin/haminstall FAILED"), 28)
+        phase = 3
+        return
+    phase = 1
+    _prog_push(cast[Ptr[uint8]]("installing to disk..."), 21)
+
+
+# Poll the install log: push any new complete lines into the progress pane.
+# Returns 1 if the progress text changed (caller re-emits the scene).
+# Substring search: does s[0..n) contain the NUL-terminated needle?
+def _line_has(s: Ptr[uint8], n: uint64, needle: Ptr[uint8]) -> int32:
+    nl: uint64 = _slen(needle)
+    if nl == 0 or nl > n:
+        return 0
+    i: uint64 = 0
+    while i + nl <= n:
+        m: uint64 = 0
+        while m < nl and s[i + m] == needle[m]:
+            m = m + 1
+        if m == nl:
+            return 1
+        i = i + 1
+    return 0
+
+
+logbuf: Array[4096, uint8]
+def _poll_log() -> int32:
+    changed: int32 = 0
+    fd: int32 = sys_open(cast[Ptr[char]]("/tmp/haminstall.gui.log"))
+    if fd < 0:
+        return 0
+    # Skip to our running offset, then read new bytes.
+    skip: uint64 = 0
+    while skip < log_off:
+        want: uint64 = log_off - skip
+        if want > 4096:
+            want = 4096
+        r: int64 = sys_read(fd, &logbuf[0], want)
+        if r <= 0:
+            sys_close(fd)
+            return 0
+        skip = skip + cast[uint64](r)
+    while True:
+        r2: int64 = sys_read(fd, &logbuf[0], 4096)
+        if r2 <= 0:
+            break
+        # Emit each complete line; watch for the installer's terminal
+        # markers so we can move to the done/error phase WITHOUT a blocking
+        # waitpid (which would freeze the UI for the whole install).
+        ls: uint64 = 0
+        i: uint64 = 0
+        while i < cast[uint64](r2):
+            if logbuf[i] == 10:
+                if i > ls:
+                    _prog_push(&logbuf[ls], i - ls)
+                    if _line_has(&logbuf[ls], i - ls,
+                                 cast[Ptr[uint8]]("install complete")) != 0:
+                        phase = 2
+                    if _line_has(&logbuf[ls], i - ls,
+                                 cast[Ptr[uint8]]("FAIL")) != 0:
+                        phase = 3
+                    changed = 1
+                ls = i + 1
+            i = i + 1
+        log_off = log_off + cast[uint64](r2)
+    sys_close(fd)
+    return changed
+
+
+# ====================================================================
+# INPUT
+# ====================================================================
+def parse_pointer(s: Ptr[uint8], n: uint64, bx: Ptr[int64], by: Ptr[int64],
+                  bbtn: Ptr[int64]) -> int32:
+    if n < 1 or s[0] != 109:                             # 'm'
+        return 0
+    i: uint64 = 1
+    vals: Array[3, int64]
+    v: uint64 = 0
+    while v < 3:
+        while i < n and s[i] == 32:
+            i = i + 1
+        neg: int32 = 0
+        if i < n and s[i] == 45:
+            neg = 1
+            i = i + 1
+        acc: int64 = 0
+        got: int32 = 0
+        while i < n and s[i] >= 48 and s[i] <= 57:
+            acc = acc * 10 + cast[int64](s[i]) - 48
+            i = i + 1
+            got = 1
+        if got == 0:
+            return 0
+        if neg != 0:
+            acc = 0 - acc
+        vals[v] = acc
+        v = v + 1
+    bx[0] = vals[0]
+    by[0] = vals[1]
+    bbtn[0] = vals[2]
+    return 1
+
+
+btn_down: int32 = 0
+def _handle_click(x: int64, y: int64) -> int32:
+    if phase != 0:
+        return 0
+    # Disk row?
+    if x >= cast[int64](LIST_X) and x < cast[int64](LIST_X + NAME_W):
+        i: uint64 = 0
+        while i < n_disks:
+            ry: int64 = cast[int64](LIST_Y) + cast[int64](i) * cast[int64](ROW_H)
+            if y >= ry and y < ry + cast[int64](ROW_H - 2):
+                sel_disk = cast[int64](i)
+                return 1
+            i = i + 1
+    # Confirm button?
+    cy: int64 = cast[int64](_confirm_y())
+    if x >= cast[int64](CONFIRM_X) and x < cast[int64](CONFIRM_X + CONFIRM_W) \
+            and y >= cy and y < cy + cast[int64](CONFIRM_H):
+        if sel_disk >= 0 and hostname_len > 0:
+            _begin_install()
+            return 1
+    return 0
+
+
+# Parse one "<type> <code>" key line; on a press ('d') apply it to the host
+# name field. Returns 1 on change.
+def _key_line(s: Ptr[uint8], n: uint64) -> int32:
+    if phase != 0:
+        return 0
+    if n < 1 or s[0] != 100:                             # 'd' press only
+        return 0
+    i: uint64 = 1
+    while i < n and s[i] == 32:
+        i = i + 1
+    neg: int32 = 0
+    if i < n and s[i] == 45:
+        neg = 1
+        i = i + 1
+    code: int32 = 0
+    got: int32 = 0
+    while i < n and s[i] >= 48 and s[i] <= 57:
+        code = code * 10 + cast[int32](s[i]) - 48
+        i = i + 1
+        got = 1
+    if got == 0:
+        return 0
+    if neg != 0:
+        code = 0 - code
+    if code < 0 or code > 255:
+        return 0
+    return _hostname_key(cast[uint8](code))
+
+
+def main() -> int32:
+    sys_bind(cast[Ptr[char]]("/dev"), cast[Ptr[char]]("#c"), 0)
+    wid: int32 = _newwindow()
+    if wid < 0:
+        _writeall(1, cast[Ptr[uint8]]("[haminstallui] FAIL newwindow\n"))
+        return 1
+
+    ctlp: Array[64, uint8]
+    evp: Array[64, uint8]
+    keysp: Array[64, uint8]
+    _winpath(&ctlp[0], wid, cast[Ptr[uint8]]("/ctl"))
+    _winpath(&evp[0], wid, cast[Ptr[uint8]]("/event"))
+    _winpath(&keysp[0], wid, cast[Ptr[uint8]]("/keys"))
+
+    cfd: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+    if cfd >= 0:
+        geo: Array[64, uint8]
+        gp: uint64 = 0
+        pre: Ptr[uint8] = cast[Ptr[uint8]]("geometry 200 90 ")
+        a: uint64 = 0
+        while pre[a] != 0:
+            geo[gp] = pre[a]
+            gp = gp + 1
+            a = a + 1
+        gp = gp + _u64_to_dec(cast[uint64](WIN_W), &geo[gp])
+        geo[gp] = 32
+        gp = gp + 1
+        gp = gp + _u64_to_dec(cast[uint64](WIN_H), &geo[gp])
+        geo[gp] = 10
+        gp = gp + 1
+        sys_write(cfd, &geo[0], gp)
+        sys_close(cfd)
+    cfd2: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+    if cfd2 >= 0:
+        _writeall(cfd2, cast[Ptr[uint8]]("decorate 1\n"))
+        sys_close(cfd2)
+    cfd3: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+    if cfd3 >= 0:
+        _writeall(cfd3, cast[Ptr[uint8]]("title Install Hamnix\n"))
+        sys_close(cfd3)
+    cfd4: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+    if cfd4 >= 0:
+        _writeall(cfd4, cast[Ptr[uint8]]("z 7\n"))
+        sys_close(cfd4)
+
+    _hostname_default()
+    _enumerate_disks()
+    emit_scene(wid)
+    _writeall(1, cast[Ptr[uint8]]("[haminstallui] scene window ready\n"))
+
+    kfd: int32 = sys_open(cast[Ptr[char]](&keysp[0]))
+
+    evbuf: Array[256, uint8]
+    kbuf: Array[256, uint8]
+    while True:
+        changed: int32 = 0
+        # Keyboard (host name).
+        if kfd >= 0:
+            kr: int64 = sys_read_nb(kfd, &kbuf[0], 255)
+            if kr > 0:
+                kls: uint64 = 0
+                ki: uint64 = 0
+                while ki <= cast[uint64](kr):
+                    katend: int32 = 0
+                    if ki == cast[uint64](kr):
+                        katend = 1
+                    if katend == 1 or kbuf[ki] == 10:
+                        if ki > kls:
+                            if _key_line(&kbuf[kls], ki - kls) == 1:
+                                changed = 1
+                        kls = ki + 1
+                    ki = ki + 1
+        # Pointer.
+        efd: int32 = sys_open(cast[Ptr[char]](&evp[0]))
+        if efd >= 0:
+            r: int64 = sys_read(efd, &evbuf[0], 255)
+            sys_close(efd)
+            if r > 0:
+                ls: uint64 = 0
+                i: uint64 = 0
+                while i <= cast[uint64](r):
+                    atend: int32 = 0
+                    if i == cast[uint64](r):
+                        atend = 1
+                    if atend == 1 or evbuf[i] == 10:
+                        if i > ls:
+                            bx: int64 = 0
+                            by: int64 = 0
+                            bbtn: int64 = 0
+                            if parse_pointer(&evbuf[ls], i - ls, &bx, &by,
+                                             &bbtn) == 1:
+                                nd: int32 = 0
+                                if (bbtn & 1) != 0:
+                                    nd = 1
+                                if nd == 1 and btn_down == 0:
+                                    if _handle_click(bx, by) == 1:
+                                        changed = 1
+                                btn_down = nd
+                        ls = i + 1
+                    i = i + 1
+        # Poll install progress. We do NOT block on sys_waitpid (that would
+        # freeze the UI for the whole install); _poll_log streams the child's
+        # output and flips phase to 2/3 when it sees the installer's terminal
+        # "install complete" / "FAIL" markers.
+        if phase == 1:
+            if _poll_log() == 1:
+                changed = 1
+        if changed != 0:
+            emit_scene(wid)
+        s2: uint64 = sys_get_jiffies()
+        while sys_get_jiffies() - s2 < 3:
+            sys_yield()
+    return 0
