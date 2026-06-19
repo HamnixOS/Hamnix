@@ -266,7 +266,9 @@ def _files_init() -> list[tuple[Path, str]]:
     # /init shim (special: not under /bin).
     f.append((USER_DIR / "init.elf", "init"))
     # etc boot config + identity.
-    for name in ("rc.boot", "inittab", "fstab", "hostname",
+    # rc.boot.full is the full boot rc that enters runlevel 5 (graphical);
+    # it's a base boot file and was previously unpackaged (base drift).
+    for name in ("rc.boot", "rc.boot.full", "inittab", "fstab", "hostname",
                  "host.conf", "hosts", "issue", "issue.net",
                  "login.defs", "lsb-release", "networks",
                  "os-release", "passwd", "group", "shadow",
@@ -278,6 +280,12 @@ def _files_init() -> list[tuple[Path, str]]:
     # subscribe to `main` only (the free / first-party channel).
     # `hpm enable non-free-firmware` appends entries post-install.
     _add_etc_file(f, "channels", subdir="hpm")
+    # Runlevel operator hooks for the non-graphical base: rc.3 is
+    # multi-user (non-graphical), rc.0/rc.6 are halt/reboot. rc.5
+    # (graphical) ships in hamnix-desktop-config instead, since it's the
+    # DE entry point. These were previously unpackaged (base drift).
+    for rc in ("rc.0", "rc.3", "rc.6"):
+        _add_etc_file(f, rc, subdir="rc.d")
     return f
 
 
@@ -321,6 +329,19 @@ COREUTILS_BINS = (
     "tee", "test", "top", "touch", "tr", "true", "tsort", "uname", "uptime",
     "u_server", "u_tlstest", "vi", "watch", "wc", "whatis", "which",
     "whoami", "xargs", "yes",
+    # --- drift sweep (2026-06-19): real CLI tools that build into
+    # build/user/*.elf but were never in any package. The live rootfs
+    # globbed them in (build_rootfs_img.py) so the from-packages base
+    # silently lacked them. Net-facing tools (curl/wget/ssh/host/ntpd/
+    # httpd_worker) live in hamnix-net instead; pure demos/selftests
+    # (hello, *_demo, *_selftest, x11test, scenetest, ...) are
+    # intentionally NOT packaged. See test_package_de_coverage.sh.
+    "aplay", "cgi_echo", "chvt", "cksum", "column", "comm", "expand",
+    "factor", "fold", "gunzip", "gzip", "hdu", "help", "hfw", "hlog",
+    "hxd", "initctl", "join", "loadkeys", "losetup", "man", "mktemp",
+    "modprobe", "nl", "nproc", "oopsread", "paste", "printenv",
+    "realpath", "service", "shuf", "split", "stat", "tac", "tar",
+    "tree", "truncate", "tty", "unexpand", "uniq", "useradd",
 )
 
 
@@ -426,6 +447,16 @@ def _files_net() -> list[tuple[Path, str]]:
     _add_user_bin(f, "ping")
     _add_user_bin(f, "route")
     _add_user_bin(f, "httpd")
+    # Drift sweep (2026-06-19): network client/server tools that built
+    # but were never packaged. curl/wget = HTTP clients; ssh = the SSH-2
+    # client; host = DNS lookup; ntpd = SNTP time sync; httpd_worker =
+    # the per-connection CGI worker httpd spawns.
+    _add_user_bin(f, "curl")
+    _add_user_bin(f, "wget")
+    _add_user_bin(f, "ssh")
+    _add_user_bin(f, "host")
+    _add_user_bin(f, "ntpd")
+    _add_user_bin(f, "httpd_worker")
     return f
 
 
@@ -539,6 +570,59 @@ def _files_installer_tools() -> list[tuple[Path, str]]:
     _add_user_bin(f, "dd_blk")
     _add_user_bin(f, "sqfs_to_blk")
     _add_user_bin(f, "install")
+    return f
+
+
+# ---- hamnix-desktop-apps --------------------------------------------
+# The scene-file Desktop Environment app binaries. Single package
+# staging every DE app (the minimal lift — a per-app split would mirror
+# the COREUTILS_BINS pattern but the DE apps are useless individually:
+# you want the whole desktop or none of it). The hamnix-desktop
+# metapackage depends on this; hamnix-base reaches it transitively.
+#
+# Verified present in build/user/*.elf after scripts/build_user.sh on
+# 2026-06-19: all 31 binaries below build. None dropped.
+DESKTOP_APP_BINS = (
+    "hamUId", "hamde", "hamdesktop", "hampanelscene", "hamtermscene",
+    "hamterm", "hamfmscene", "hamfm", "hamcalcscene", "hamcalc",
+    "hameditscene", "hamedit", "haminstallui", "hamsettings",
+    "hammonscene", "hammon", "hamclock", "hamctl", "hamnotify",
+    "hamshot", "hamtray", "hamappmenu", "hamctxmenu", "hamosd",
+    "hamlock", "hamscreensaver", "hamsession", "hamsessui", "hamrband",
+    "hamresize", "hamview",
+)
+
+
+def _files_desktop_apps() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    for stem in DESKTOP_APP_BINS:
+        _add_user_bin(f, stem)
+    return f
+
+
+# ---- hamnix-desktop-config ------------------------------------------
+# The DE autostart + config files. WITHOUT these nothing launches the
+# DE even with the app binaries present: rc.5 (runlevel-5 graphical
+# hook) flips the kernel scene compositor and launches the panel/term;
+# services.d/hamuid.svc declaratively auto-starts hamUId at runlevel 5;
+# rc.de-user / rc.de-hostowner are the per-session DE rc bodies;
+# desktop.icons + panel.conf are the launcher layout. (There is NO
+# etc/wallpaper.ppm — the backdrop is generated at runtime.)
+
+def _files_desktop_config() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    # Runlevel-5 (graphical) operator hook — the DE entry point.
+    _add_etc_file(f, "rc.5", subdir="rc.d")
+    # Declarative service definitions discovered by PID-1's supervisor.
+    _add_etc_file(f, "hamde.svc", subdir="services.d")
+    _add_etc_file(f, "hamuid.svc", subdir="services.d")
+    _add_etc_file(f, "hamnotify-welcome.svc", subdir="services.d")
+    # Per-session DE rc bodies (user + hostowner-elevated).
+    _add_etc_file(f, "rc.de-user")
+    _add_etc_file(f, "rc.de-hostowner")
+    # Launcher layout.
+    _add_etc_file(f, "desktop.icons")
+    _add_etc_file(f, "panel.conf")
     return f
 
 
@@ -658,6 +742,39 @@ PACKAGE_SPECS: list[dict] = [
         "files_fn": _files_installer_tools,
         "depends": ["hamnix-fs-ext4>=1", "hamnix-fs-fat>=1"],
         "description": "Hamnix installer tools — partitioner + dd_blk",
+        "target": "#hamnix-system",
+    },
+    # ---- the scene-file Desktop Environment -------------------------
+    # hamnix-desktop-apps stages the 31 DE app binaries; hamnix-desktop-
+    # config stages the autostart/config files; hamnix-desktop is the
+    # metapackage that pulls both + the shell. Before this, `hpm install
+    # hamnix-base` yielded a booting CLI system with NO desktop at all.
+    {
+        "name": "hamnix-desktop-apps",
+        "files_fn": _files_desktop_apps,
+        "depends": ["hamnix-init>=1"],
+        "description": ("Hamnix scene-file Desktop Environment app "
+                        "binaries (hamUId/hamde/panel/term/fm/calc/"
+                        "edit/settings/mon/clock/notify/... — 31 apps)"),
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-desktop-config",
+        "files_fn": _files_desktop_config,
+        "depends": ["hamnix-init>=1"],
+        "description": ("Hamnix Desktop Environment autostart + config "
+                        "(rc.d/rc.5 + services.d/*.svc + rc.de-* + "
+                        "desktop.icons + panel.conf)"),
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-desktop",
+        "files_fn": lambda: [],
+        "depends": ["hamnix-hamsh>=1",
+                    f"hamnix-desktop-apps>={PKG_VERSION}",
+                    f"hamnix-desktop-config>={PKG_VERSION}"],
+        "description": ("Hamnix desktop metapackage — the scene-file DE "
+                        "(apps + autostart config + shell)"),
         "target": "#hamnix-system",
     },
 ]
