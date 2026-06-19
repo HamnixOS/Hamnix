@@ -177,6 +177,291 @@ def _screen_dims(wp: Ptr[int64], hp: Ptr[int64]):
         hp[0] = h
 
 
+# --- image wallpaper backdrop ----------------------------------------
+# The Settings app (user/hamsettings.ad) sets a desktop wallpaper by writing
+# a P6 PPM path to `/dev/wsys/ctl` via the `wallpaper <path>` verb. The kernel
+# records the path and bumps a generation counter, exposing both through the
+# readable status file /dev/wsys/wallpaper as a single ASCII line:
+#
+#     "<gen> <path>\n"            (gen=0 -> no wallpaper set, path empty)
+#
+# hamdesktop polls that file on its own redraw cadence and, on a gen bump,
+# loads the PPM and renders it as the backdrop. The scene-file DE has NO
+# bitmap/image tier (the kernel `image` scene verb is parse-and-ignore), so
+# we render the image as a DOWNSAMPLED GRID of `fill` rects, nearest-neighbour
+# SCALED (stretched) to fill the whole screen. A solid-colour swatch (the
+# Settings case) collapses to a single full-screen fill; a real image is
+# approximated by a WP_GRID_W x WP_GRID_H mosaic that fits the scene buffer
+# alongside the icons. When no wallpaper is set, or the file is missing /
+# unreadable / not a valid P6, we fall back to the existing solid teal fill
+# (no regression, no crash).
+#
+# This logic is PORTED from the retired procedural compositor (user/hamUId.ad
+# ppm_parse_p6 / wallpaper_poll_kernel), adapted to the scene-file emit model:
+# hamUId sampled WALLPAPER_RGB per-pixel into its own framebuffer; here we have
+# no pixel buffer, so we instead emit a coarse fill-rect mosaic in the scene.
+
+WP_MAX_W: uint64 = 256                 # decoded-image dimension cap
+WP_MAX_H: uint64 = 256
+WP_MAX_BYTES: uint64 = 196608          # 256 * 256 * 3
+WP_FILE_CAP: uint64 = 197120           # pixels + PPM header slack
+WP_PATH_CAP: uint64 = 256
+
+# Mosaic grid: the screen is divided into WP_GRID_W columns x WP_GRID_H rows;
+# each cell samples one source pixel (nearest-neighbour) and is emitted as one
+# `fill`. 24x18 = 432 fills (~13 KB of scene text) fits the 16384 scene buffer
+# with room for the icon layer above it.
+WP_GRID_W: int64 = 24
+WP_GRID_H: int64 = 18
+
+wp_rgb: Array[196608, uint8]           # decoded raw RGB scanlines
+wp_w: uint64 = 0
+wp_h: uint64 = 0
+wp_loaded: int32 = 0                   # 1 once a valid image is decoded
+wp_gen_seen: uint64 = 0               # last kernel gen we loaded for
+wp_read_buf: Array[197120, uint8]      # whole-file read scratch
+
+
+# Skip ASCII whitespace + '#'-to-EOL comments (PPM permits header comments).
+def _wp_skip_ws(buf: Ptr[uint8], pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end:
+        c: uint8 = buf[p]
+        if c == 32 or c == 9 or c == 10 or c == 13:
+            p = p + 1
+            continue
+        if c == 35:                                    # '#'
+            while p < end and buf[p] != 10:
+                p = p + 1
+            continue
+        break
+    return p
+
+
+# Parse one decimal token at buf[pos..end). Writes *out, returns the offset
+# after the token; returns `pos` unchanged on no digits.
+def _wp_parse_uint(buf: Ptr[uint8], pos: uint64, end: uint64,
+                   out: Ptr[uint64]) -> uint64:
+    p: uint64 = pos
+    v: uint64 = 0
+    seen: uint64 = 0
+    while p < end:
+        c: uint8 = buf[p]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[uint64](c) - 48
+        seen = seen + 1
+        p = p + 1
+    if seen == 0:
+        return pos
+    out[0] = v
+    return p
+
+
+# Parse the PPM in buf[0..count) into (wp_w, wp_h) + wp_rgb. Returns 0 on
+# success, negative on a format/size error. Accepts "P6\n<w> <h>\n255\n<RGB>".
+# Ported from hamUId.ad ppm_parse_p6.
+def _wp_ppm_parse_p6(buf: Ptr[uint8], count: uint64) -> int32:
+    if count < 11:
+        return -1
+    if buf[0] != 80 or buf[1] != 54:                   # "P6"
+        return -1
+    if buf[2] != 32 and buf[2] != 9 and buf[2] != 10 and buf[2] != 13:
+        return -1
+    p: uint64 = 3
+    p = _wp_skip_ws(buf, p, count)
+    w: uint64 = 0
+    np: uint64 = _wp_parse_uint(buf, p, count, &w)
+    if np == p:
+        return -2
+    p = np
+    p = _wp_skip_ws(buf, p, count)
+    h: uint64 = 0
+    np = _wp_parse_uint(buf, p, count, &h)
+    if np == p:
+        return -2
+    p = np
+    p = _wp_skip_ws(buf, p, count)
+    mx: uint64 = 0
+    np = _wp_parse_uint(buf, p, count, &mx)
+    if np == p:
+        return -2
+    p = np
+    if mx != 255:
+        return -3
+    if p >= count:
+        return -4
+    c0: uint8 = buf[p]
+    if c0 != 32 and c0 != 9 and c0 != 10 and c0 != 13:
+        return -4
+    p = p + 1                                          # single ws before pixels
+    if w == 0 or h == 0:
+        return -5
+    if w > WP_MAX_W or h > WP_MAX_H:
+        return -5
+    nbytes: uint64 = w * h * 3
+    if p + nbytes > count:
+        return -6
+    i: uint64 = 0
+    while i < nbytes:
+        wp_rgb[i] = buf[p + i]
+        i = i + 1
+    wp_w = w
+    wp_h = h
+    wp_loaded = 1
+    return 0
+
+
+# Load a PPM file by path into wp_rgb. Returns 0 on success, negative on any
+# failure (open/read/parse). On failure wp_loaded is cleared so the backdrop
+# falls back to the solid fill. Ported from hamUId.ad wallpaper_load_path.
+def _wp_load_path(path: Ptr[char]) -> int32:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while total < WP_FILE_CAP:
+        r: int64 = sys_read(fd, &wp_read_buf[total], WP_FILE_CAP - total)
+        if r <= 0:
+            break
+        total = total + cast[uint64](r)
+    sys_close(fd)
+    if total == 0:
+        return -1
+    rc: int32 = _wp_ppm_parse_p6(&wp_read_buf[0], total)
+    if rc != 0:
+        wp_loaded = 0
+        wp_w = 0
+        wp_h = 0
+        return rc
+    _writeall(1, cast[Ptr[uint8]]("[hamdesktop] wallpaper loaded\n"))
+    return 0
+
+
+# Poll /dev/wsys/wallpaper for "<gen> <path>\n". On a non-zero gen that differs
+# from the last loaded gen, load the named PPM. Returns 1 if the backdrop image
+# changed (caller re-emits the scene), else 0. Cheap: one open/read/close.
+# Ported from hamUId.ad wallpaper_poll_kernel, minus the every-Nth-tick gate
+# (the desktop only polls on its own slow redraw cadence already).
+wp_poll_buf: Array[320, uint8]
+wp_path_buf: Array[256, uint8]
+def _wp_poll_kernel() -> int32:
+    fd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/wallpaper"))
+    if fd < 0:
+        return 0
+    n: int64 = sys_read(fd, &wp_poll_buf[0], 319)
+    sys_close(fd)
+    if n <= 0:
+        return 0
+    total: uint64 = cast[uint64](n)
+    g: uint64 = 0
+    np: uint64 = _wp_parse_uint(&wp_poll_buf[0], 0, total, &g)
+    if np == 0:
+        return 0
+    # gen 0 = no wallpaper set. If one WAS loaded and the request reset to 0,
+    # drop the image so we fall back to the solid backdrop.
+    if g == 0:
+        if wp_loaded != 0:
+            wp_loaded = 0
+            wp_gen_seen = 0
+            return 1
+        return 0
+    if g == wp_gen_seen:
+        return 0
+    # Skip the single space, then take the rest of the line (minus '\n').
+    if np >= total or wp_poll_buf[np] != 32:
+        return 0
+    np = np + 1
+    pe: uint64 = total
+    if pe > np and wp_poll_buf[pe - 1] == 10:
+        pe = pe - 1
+    if pe == np:
+        return 0
+    plen: uint64 = pe - np
+    if plen >= WP_PATH_CAP:
+        return 0
+    i: uint64 = 0
+    while i < plen:
+        wp_path_buf[i] = wp_poll_buf[np + i]
+        i = i + 1
+    wp_path_buf[plen] = 0
+    if _wp_load_path(cast[Ptr[char]](&wp_path_buf[0])) == 0:
+        wp_gen_seen = g
+        return 1
+    # Load failed: record the gen so we don't retry a bad file every pass, and
+    # leave wp_loaded clear (solid-backdrop fallback). Signal a redraw so any
+    # stale image is replaced by the fallback fill.
+    wp_gen_seen = g
+    return 1
+
+
+# Build a "#RRGGBB" C-string for one source pixel into `out` (>=8 bytes).
+WP_HEX: Array[16, uint8]
+WP_HEX_INIT: int32 = 0
+def _wp_hex_init():
+    if WP_HEX_INIT != 0:
+        return
+    WP_HEX_INIT = 1
+    j: uint64 = 0
+    while j < 10:
+        WP_HEX[j] = cast[uint8](48 + j)                # '0'..'9'
+        j = j + 1
+    while j < 16:
+        WP_HEX[j] = cast[uint8](97 + (j - 10))         # 'a'..'f'
+        j = j + 1
+
+
+def _wp_color_str(r: uint8, g: uint8, b: uint8, out: Ptr[uint8]):
+    out[0] = 35                                        # '#'
+    out[1] = WP_HEX[(r >> 4) & 15]
+    out[2] = WP_HEX[r & 15]
+    out[3] = WP_HEX[(g >> 4) & 15]
+    out[4] = WP_HEX[g & 15]
+    out[5] = WP_HEX[(b >> 4) & 15]
+    out[6] = WP_HEX[b & 15]
+    out[7] = 0
+
+
+# Emit the image-wallpaper backdrop as a nearest-neighbour mosaic of fill
+# rects stretched to the full screen. Returns 1 if it painted (caller skips
+# the solid fill), 0 if no image is loaded. Each grid cell samples one source
+# pixel; a solid-colour image collapses to a uniform field of identical fills.
+wp_cell_color: Array[8, uint8]
+def emit_wallpaper() -> int32:
+    if wp_loaded == 0 or wp_w == 0 or wp_h == 0:
+        return 0
+    _wp_hex_init()
+    gx: int64 = 0
+    while gx < WP_GRID_W:
+        # Cell x-extent on screen (last cell soaks up the rounding remainder).
+        x0: int64 = gx * scr_w / WP_GRID_W
+        x1: int64 = (gx + 1) * scr_w / WP_GRID_W
+        if gx == WP_GRID_W - 1:
+            x1 = scr_w
+        # Source column (nearest-neighbour).
+        sxc: uint64 = cast[uint64](gx * cast[int64](wp_w) / WP_GRID_W)
+        if sxc >= wp_w:
+            sxc = wp_w - 1
+        gy: int64 = 0
+        while gy < WP_GRID_H:
+            y0: int64 = gy * scr_h / WP_GRID_H
+            y1: int64 = (gy + 1) * scr_h / WP_GRID_H
+            if gy == WP_GRID_H - 1:
+                y1 = scr_h
+            syr: uint64 = cast[uint64](gy * cast[int64](wp_h) / WP_GRID_H)
+            if syr >= wp_h:
+                syr = wp_h - 1
+            si: uint64 = (syr * wp_w + sxc) * 3
+            _wp_color_str(wp_rgb[si], wp_rgb[si + 1], wp_rgb[si + 2],
+                          &wp_cell_color[0])
+            hamscene_fill(cast[int32](x0), cast[int32](y0),
+                          cast[int32](x1 - x0), cast[int32](y1 - y0),
+                          &wp_cell_color[0])
+            gy = gy + 1
+        gx = gx + 1
+    return 1
+
+
 # --- icon model ------------------------------------------------------
 MAX_ICONS: uint64 = 16
 LABEL_CAP: uint64 = 24                # bytes stored per label (NUL-term)
@@ -421,10 +706,14 @@ def icon_cy(i: uint64) -> int32:
 # --- scene emit ------------------------------------------------------
 def emit_scene(wid: int32):
     hamscene_begin()
-    # Desktop backdrop: same teal the kernel root backdrop uses (#205060)
-    # so the desktop window blends with any uncovered compositor region.
-    hamscene_fill(0, 0, cast[int32](scr_w), cast[int32](scr_h),
-                  cast[Ptr[uint8]]("#205060"))
+    # Desktop backdrop. If a wallpaper image is loaded (Settings wrote a PPM
+    # and set it via /dev/wsys/ctl `wallpaper`), paint it as a nearest-neighbour
+    # mosaic stretched to the screen; the icons below render ON TOP of it.
+    # Otherwise fall back to the same teal the kernel root backdrop uses
+    # (#205060) so the desktop blends with any uncovered compositor region.
+    if emit_wallpaper() == 0:
+        hamscene_fill(0, 0, cast[int32](scr_w), cast[int32](scr_h),
+                      cast[Ptr[uint8]]("#205060"))
     i: uint64 = 0
     while i < n_icons:
         cx: int32 = icon_cx(i)
@@ -685,6 +974,11 @@ def main() -> int32:
     while True:
         efd: int32 = sys_open(cast[Ptr[char]](&evp[0]))
         changed: int32 = 0
+        # Poll the kernel wallpaper status file on the desktop's own redraw
+        # cadence: on a gen bump (Settings applied a new wallpaper) reload the
+        # PPM and force a backdrop re-emit. Cheap one-shot open/read/close.
+        if _wp_poll_kernel() == 1:
+            changed = 1
         if efd >= 0:
             r: int64 = sys_read(efd, &evbuf[0], 255)
             sys_close(efd)
