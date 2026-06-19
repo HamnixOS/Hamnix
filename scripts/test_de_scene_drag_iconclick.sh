@@ -423,6 +423,41 @@ try:
         send("echo ICONCLICK_END")
         time.sleep(0.5)
 
+        # ============ ICON DRAG = NO SPAWN STORM (BUG 1: the CRASH) ========
+        # The user dragged a desktop icon and the WHOLE SYSTEM CRASHED: a
+        # press-drag over an icon fired the icon's launch on EVERY pointer
+        # motion event (the button stays HELD across the drag), spawning the
+        # target app hundreds of times -> resource exhaustion -> VM exit. The
+        # fix makes hamdesktop activate ONLY on a clean press+release over the
+        # SAME cell (release edge), never on held motion. Here we reproduce the
+        # exact gesture: press ON the first icon cell, drag across MANY motion
+        # events with the button HELD (over and past the icon column), then
+        # release OFF the press cell (a drag-away — must launch NOTHING). We
+        # bracket the gesture with markers so the harness can count how many
+        # "[hamdesktop] launched" lines appear DURING the drag. A correct build
+        # prints ZERO launches for this drag-away; the old storm printed a
+        # flood (and then crashed). The guest must STILL be alive afterwards.
+        send("echo ICONDRAG_BEGIN")
+        absmove_px(55, 52, 0)           # hover the first icon cell
+        time.sleep(0.2)
+        absmove_px(55, 52, 1)           # PRESS on the icon (must NOT launch)
+        time.sleep(0.2)
+        dx, dy = 55, 52
+        for k in range(10):             # 10 held-motion events = storm bait
+            dx += 22
+            dy += 14
+            absmove_px(dx, dy, 1)       # drag, button HELD (must NOT launch)
+            time.sleep(0.12)
+        absmove_px(dx, dy, 0)           # RELEASE off the press cell (no launch)
+        time.sleep(0.4)
+        send("echo ICONDRAG_END")
+        # Prove the guest is ALIVE (not crashed/exited) after the drag storm
+        # bait: echo a unique liveness marker and confirm it comes back.
+        time.sleep(0.3)
+        send("echo ICONDRAG_ALIVE_PROBE_XYZ")
+        wait_for("ICONDRAG_ALIVE_PROBE_XYZ", 10)
+        time.sleep(0.5)
+
         # ================= BARE DESKTOP / BACKDROP CLICK (bug A) =========
         # The user's exact repro: "if you click on the desktop, ALL apps +
         # the top panel vanish." Root cause was the full-screen hamdesktop
@@ -577,6 +612,30 @@ for k in 0 1 2 3 4; do
     fi
     prev="$cur"
 done
+
+# --- BUG 1 (the CRASH): dragging an icon must NOT spawn a storm ---------
+# Count "[hamdesktop] launched" lines that appear BETWEEN the ICONDRAG_BEGIN
+# and ICONDRAG_END markers. A correct build (launch only on a clean
+# press+release over the same cell) prints ZERO for this drag-away gesture;
+# the old per-motion-launch bug printed a flood (and then crashed the VM).
+# We allow a tiny ceiling (a stray late click) but anything resembling a
+# storm fails. We also require the post-drag liveness probe to have echoed
+# back — proof the guest did NOT crash/exit under the drag.
+dragblk=$(awk '/ICONDRAG_BEGIN/{f=1} f{print} /ICONDRAG_END/{f=0}' "$LOG" 2>/dev/null | tr -d '\r')
+ndlaunch=$(printf '%s\n' "$dragblk" | grep -c '\[hamdesktop\] launched' || true)
+echo "[drag_gate] icon-drag launches between BEGIN/END: $ndlaunch (storm ceiling 2)"
+if [ "$ndlaunch" -le 2 ]; then
+    echo "[drag_gate] PASS icon drag did NOT spawn a storm ($ndlaunch launches) — the crash is gone"
+else
+    echo "[drag_gate] FAIL icon drag spawned $ndlaunch apps — per-motion launch storm (the crash signature)" >&2
+    fail=1
+fi
+if grep -q 'ICONDRAG_ALIVE_PROBE_XYZ' "$LOG" 2>/dev/null; then
+    echo "[drag_gate] PASS guest ALIVE after the icon-drag storm bait (liveness probe echoed)"
+else
+    echo "[drag_gate] FAIL guest did NOT echo the post-drag liveness probe — likely crashed/exited" >&2
+    fail=1
+fi
 
 echo "[drag_gate] artifacts (PPM frames) in $OUT_DIR"
 if [ "$fail" = "0" ]; then
