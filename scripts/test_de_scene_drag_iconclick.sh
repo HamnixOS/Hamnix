@@ -423,6 +423,28 @@ try:
         send("echo ICONCLICK_END")
         time.sleep(0.5)
 
+        # ================= BARE DESKTOP / BACKDROP CLICK (bug A) =========
+        # The user's exact repro: "if you click on the desktop, ALL apps +
+        # the top panel vanish." Root cause was the full-screen hamdesktop
+        # (lowest-z background) being RAISED above the panel + apps on a
+        # content press. With the pinned-background fix the backdrop is never
+        # raised, so a bare-desktop click must leave the panel + windows fully
+        # on screen. Click an EMPTY backdrop region near the bottom edge (well
+        # below the icon column at x~55,y<=80 and clear of the app windows that
+        # cluster upper-centre). Capture WHILE the press is held (the moment
+        # the bug raised the backdrop) and after release.
+        send("echo BACKDROPCLICK_BEGIN")
+        absmove_px(640, 760, 0)         # hover empty backdrop
+        time.sleep(0.3)
+        absmove_px(640, 760, 1)         # press on bare desktop
+        time.sleep(0.25)
+        screendump("backdrop_down")     # frame WHILE pressed (bug raised bg here)
+        absmove_px(640, 760, 0)         # release
+        time.sleep(0.4)
+        screendump("backdrop_after")    # settled frame after the backdrop click
+        send("echo BACKDROPCLICK_END")
+        time.sleep(0.5)
+
         # Final settled frame for reference.
         screendump("final")
         time.sleep(1)
@@ -507,6 +529,27 @@ if [ -s "$OUT_DIR/base.ppm" ] && [ -s "$OUT_DIR/click_after.ppm" ]; then
         echo "[drag_gate] PASS icon click changed only a small region ($cdiff px) — NO full-screen blank/repaint"
     else
         echo "[drag_gate] FAIL icon click changed $cdiff px — whole-screen repaint/blank signature" >&2
+        fail=1
+    fi
+fi
+
+# --- BUG A: a BARE-DESKTOP (backdrop) click does NOT blank the screen ---
+# This is the KEY proof for the user-reported "click the desktop -> all apps
+# + the top panel vanish" regression. Before the pinned-background fix, the
+# press raised the full-screen backdrop above everything, so these frames went
+# near-blank (only the cursor + desktop icons survived). After the fix the
+# panel + app windows must remain (non-backdrop pixel count stays high).
+assert_not_blank "backdrop_down"
+assert_not_blank "backdrop_after"
+if [ -s "$OUT_DIR/base.ppm" ] && [ -s "$OUT_DIR/backdrop_after.ppm" ]; then
+    bdiff=$(whole_frame_diff "$OUT_DIR/base.ppm" "$OUT_DIR/backdrop_after.ppm")
+    echo "[drag_gate] backdrop-click whole-frame diff (base vs after): $bdiff (max $CLICK_FRAME_MAX)"
+    if [ "$bdiff" = "-1" ]; then
+        echo "[drag_gate] NOTE backdrop frames differ in size/format; diff inconclusive"
+    elif [ "$bdiff" -le "$CLICK_FRAME_MAX" ]; then
+        echo "[drag_gate] PASS bare-desktop click changed only a small region ($bdiff px) — panel/apps NOT buried"
+    else
+        echo "[drag_gate] FAIL bare-desktop click changed $bdiff px — backdrop raised over panel/apps (the vanish bug)" >&2
         fail=1
     fi
 fi
