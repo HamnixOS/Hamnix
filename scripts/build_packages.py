@@ -570,6 +570,10 @@ def _files_installer_tools() -> list[tuple[Path, str]]:
     _add_user_bin(f, "dd_blk")
     _add_user_bin(f, "sqfs_to_blk")
     _add_user_bin(f, "install")
+    # haminstall = the headless on-target installer (lay down a fresh
+    # Hamnix from a running system); the GUI front-end haminstallui
+    # ships in hamnix-desktop-apps.
+    _add_user_bin(f, "haminstall")
     return f
 
 
