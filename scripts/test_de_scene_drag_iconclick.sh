@@ -234,11 +234,24 @@ def reader():
 
 t = threading.Thread(target=reader, daemon=True); t.start()
 
+import re as _re
+# hamsh's idle "[hamsh-alive] tick=N uptime=Ns" heartbeat and the line
+# editor's ANSI cursor controls (ESC[..K / ESC[..C) interleave the serial
+# echo of a typed command MID-WORD, so a contiguous marker may never appear
+# unbroken in the raw buffer even though the guest is fully alive and ran the
+# command. Strip that noise before matching so wait_for sees the marker.
+_HB_RE = _re.compile(rb'\[hamsh-alive\][^\n]*')
+_CSI_RE = _re.compile(rb'\x1b\[[0-9;?]*[A-Za-z]')
+def _denoise(b):
+    b = _HB_RE.sub(b'', b)
+    b = _CSI_RE.sub(b'', b)
+    return b
+
 def wait_for(marker, timeout):
     m = marker.encode(); deadline = time.time() + timeout
     while time.time() < deadline:
         with lock:
-            if m in buf:
+            if m in buf or m in _denoise(buf):
                 return True
         if qemu.poll() is not None:
             return False
@@ -630,7 +643,14 @@ else
     echo "[drag_gate] FAIL icon drag spawned $ndlaunch apps — per-motion launch storm (the crash signature)" >&2
     fail=1
 fi
-if grep -q 'ICONDRAG_ALIVE_PROBE_XYZ' "$LOG" 2>/dev/null; then
+# The hamsh idle heartbeat + line-editor ANSI controls interleave the serial
+# echo of the probe MID-WORD, so the contiguous marker may not survive in the
+# raw log even though the guest ran it. Strip the "[hamsh-alive]..." heartbeat
+# and ESC[...] CSI sequences before matching so a live-but-flooded guest still
+# passes. (The drag-storm / crash signatures above are the real assertions;
+# this is purely a did-not-crash liveness check.)
+alive_clean=$(sed -E 's/\[hamsh-alive\][^\r\n]*//g; s/\x1b\[[0-9;?]*[A-Za-z]//g' "$LOG" 2>/dev/null | tr -d '\r')
+if printf '%s' "$alive_clean" | grep -q 'ICONDRAG_ALIVE_PROBE_XYZ'; then
     echo "[drag_gate] PASS guest ALIVE after the icon-drag storm bait (liveness probe echoed)"
 else
     echo "[drag_gate] FAIL guest did NOT echo the post-drag liveness probe — likely crashed/exited" >&2
