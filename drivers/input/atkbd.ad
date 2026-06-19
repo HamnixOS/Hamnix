@@ -159,6 +159,24 @@ MOD_ALTGR: uint32 = 0x40
 kbd_state:      uint32 = 0
 in_e0_prefix:   int32  = 0
 
+# BUG 3 (dropped / one-keystroke-late under fast typing). THREE producers
+# read the i8042 output port (0x60) and feed the SHARED decode state machine
+# (in_e0_prefix, kbd_state) + FIFO:
+#   * atkbd_irq_handler()  — IRQ 1 (keyboard)
+#   * atkbd_poll()         — timer ISR fallback drain (every tick)
+#   * auxmouse_irq_handler — IRQ 12, routes a stray KBD byte here
+# With no mutual exclusion they race: a timer-tick poll mid-decode can be
+# preempted by IRQ 1 (or the two can interleave their 0x64/0x60 reads), so
+# one path drains a byte the other half-decoded and the e0-prefix/modifier
+# state corrupts — exactly the "a fast keystroke is lost or appears one key
+# late" symptom. _atkbd_drain() below masks local IRQs and takes a re-entrancy
+# guard so the port read + decode + FIFO push is ATOMIC across all three
+# producers. local_irq_save/restore are codegen intrinsics (extern, same as
+# devwsys.ad / kernel.sched.core).
+extern def local_irq_save() -> uint64
+extern def local_irq_restore(flags: uint64)
+atkbd_draining: int32 = 0
+
 
 # --- Scancode -> ASCII translation table -------------------------------
 #
@@ -1105,39 +1123,36 @@ def atkbd_process_byte(raw: int32):
     _kbd_push_both(cast[uint8](ascii & 0xFF))
 
 
-def atkbd_poll():
-    # Status bit 0 must be set before each read; reading 0x60 with OBF
-    # clear returns stale or undefined data on real hardware. We drain
-    # in a loop because QEMU (and real hardware under typing) will
-    # frequently have multiple bytes pending between calls — leaving
-    # them queued delays input arbitrarily.
+def _atkbd_drain():
+    # BUG 3 FIX: the SINGLE, SERIALIZED i8042 keyboard drain. Masks local IRQs
+    # and takes the atkbd_draining re-entrancy guard so the IRQ-1, timer-poll
+    # and stray-AUX producers can never interleave their 0x60 reads or the
+    # shared decode state machine. Drains every KBD byte currently in OBF.
     #
-    # atkbd_poll_calls is bumped unconditionally (even on an empty
-    # status register) — the diagnostic wants "is the timer tick
-    # reaching us at all", which is independent of whether a byte
-    # was pending.
-    atkbd_poll_calls = atkbd_poll_calls + 1
     # SINGLE-STATUS-READ invariant (keyboard lag/loss fix). The status
     # register's OBF (bit 0) and AUX (bit 5) bits BOTH describe the SAME byte
-    # currently latched in the output buffer (port 0x60). They MUST be sampled
-    # from ONE status read, and that read MUST gate the data read — otherwise a
-    # second `inb(0x64)` between the OBF check and the data read can observe a
-    # DIFFERENT byte's status (a fresh keystroke/mouse byte raced in) and
-    # mis-classify or drop a real key. The previous code read 0x64 twice (once
-    # in the while-condition, once for `st`); on a busy controller the AUX bit
-    # used to drop a byte could belong to the NEXT byte, not the one being
-    # consumed. Read status exactly once, branch on that snapshot, then read
-    # the data byte it describes.
+    # latched in the output buffer (port 0x60). They MUST be sampled from ONE
+    # status read that also gates the data read — a second inb(0x64) between
+    # the OBF check and the data read can observe a DIFFERENT byte's status (a
+    # fresh keystroke/mouse byte raced in) and mis-classify or drop a real key.
+    fl: uint64 = local_irq_save()
+    if atkbd_draining != 0:
+        # Already draining on this CPU (an IRQ fired while the timer poll held
+        # the section, or vice versa). The active drainer will consume every
+        # pending byte; bail so we don't double-read the port.
+        local_irq_restore(fl)
+        return
+    atkbd_draining = 1
+    n: int32 = 0
     st: int32 = inb(KBD_STATUS_PORT)
     while (st & KBD_STATUS_OBF) != 0:
         # I8042_STATUS_AUX is bit 5 (0x20). A SET AUX bit means the byte at
         # 0x60 came from the MOUSE, not the keyboard. The keyboard and mouse
         # share the i8042 output buffer; on QEMU a mouse drag fills OBF with
-        # AUX movement bytes. We MUST drop them here (the auxmouse IRQ 12 path
-        # is the canonical AUX consumer) — feeding them to atkbd_process_byte
+        # AUX movement bytes. We DROP them here (the auxmouse IRQ 12 path is
+        # the canonical AUX consumer) — feeding them to atkbd_process_byte
         # translates them as bogus scancodes -> ASCII -> the focused window's
-        # /keys stream, which is the "mouse drag injects random characters
-        # into hamedit" leak. Mirror atkbd_irq_handler's AUX check exactly.
+        # /keys stream, the "mouse drag injects random characters" leak.
         if (st & 0x20) != 0:
             inb(KBD_DATA_PORT)
             atkbd_bytes_0x60 = atkbd_bytes_0x60 + 1
@@ -1145,9 +1160,24 @@ def atkbd_poll():
             raw: int32 = inb(KBD_DATA_PORT) & 0xFF
             atkbd_bytes_0x60 = atkbd_bytes_0x60 + 1
             atkbd_process_byte(raw)
+        n = n + 1
+        # Hard cap to prevent an ISR storm if OBF ever sticks high.
+        if n > 32:
+            break
         # Re-sample status for the NEXT iteration AFTER consuming this byte, so
         # OBF + AUX again describe one coherent (next) byte.
         st = inb(KBD_STATUS_PORT)
+    atkbd_draining = 0
+    local_irq_restore(fl)
+
+
+def atkbd_poll():
+    # Timer-tick fallback drain. atkbd_poll_calls is bumped unconditionally
+    # (even on an empty status register) — the diagnostic wants "is the timer
+    # tick reaching us at all", independent of whether a byte was pending. The
+    # actual port read + decode is the serialized _atkbd_drain().
+    atkbd_poll_calls = atkbd_poll_calls + 1
+    _atkbd_drain()
 
 
 # --- IRQ 1 handler -----------------------------------------------------
@@ -1170,33 +1200,11 @@ kbd_irq_count: uint64 = 0
 
 def atkbd_irq_handler():
     kbd_irq_count = kbd_irq_count + 1
-    n: int32 = 0
-    # SINGLE-STATUS-READ invariant — see atkbd_poll() for the full rationale.
-    # OBF (bit 0) and AUX (bit 5) describe the SAME latched byte and must come
-    # from one status read that also gates the data read. Reading 0x64 twice
-    # (while-condition + `st`) let the AUX bit drift to the next byte and drop
-    # a real keystroke. Sample status once per iteration.
-    st: int32 = inb(KBD_STATUS_PORT)
-    while (st & KBD_STATUS_OBF) != 0:
-        # I8042_STATUS_AUX is bit 5 (0x20). A set AUX bit means the
-        # byte came from the mouse, not the keyboard — drop it; the
-        # auxmouse IRQ 12 path will pick up the next AUX byte through
-        # its own interrupt or we'll lose this one (acceptable: a stray
-        # mouse byte arriving on IRQ 1 is already a controller glitch).
-        if (st & 0x20) != 0:
-            inb(KBD_DATA_PORT)
-            atkbd_bytes_0x60 = atkbd_bytes_0x60 + 1
-        else:
-            raw: int32 = inb(KBD_DATA_PORT) & 0xFF
-            atkbd_bytes_0x60 = atkbd_bytes_0x60 + 1
-            atkbd_process_byte(raw)
-        n = n + 1
-        # Hard cap to prevent ISR storm if status bit ever sticks high.
-        if n > 16:
-            return
-        # Re-sample status AFTER consuming the byte so OBF + AUX again
-        # describe one coherent (next) byte.
-        st = inb(KBD_STATUS_PORT)
+    # BUG 3 FIX: route through the SERIALIZED drain so an IRQ that fires while
+    # the timer poll (or a stray-AUX route) is mid-decode cannot race the port
+    # reads or corrupt the shared e0-prefix / modifier state. _atkbd_drain
+    # masks IRQs + takes the re-entrancy guard and consumes every pending byte.
+    _atkbd_drain()
 
 
 # --- Periodic runtime diagnostic --------------------------------------
