@@ -383,6 +383,55 @@ def wsys_wid_for_current() -> int32:
     return _wsys_wid_for_current()
 
 
+def _wsys_pid_alive(pid: uint64) -> int32:
+    # 1 iff `pid` still names a live (non-reaped) task. A reaped pid is
+    # absent from the task table (task_lookup_by_pid scans state!=STATE_FREE),
+    # so a returned -1 means the process is fully gone. pid 0 = "no owner"
+    # (e.g. a system surface or a not-yet-stamped slot) — treated as alive so
+    # the reaper never collects an unowned/system slot.
+    if pid == 0:
+        return 1
+    if task_lookup_by_pid(pid) >= 0:
+        return 1
+    return 0
+
+
+def wsys_reap_dead_wids() -> int32:
+    # TASKBAR-STALE FIX: a window slot is freed by the close box
+    # (_wsys_close_window) or an explicit `free <wid>`, but a client that
+    # simply EXITS (a terminal whose shell `exit`s, an installer that
+    # finishes, an app that is SIGKILLed) leaves its slot marked in_use with
+    # a now-dead owner pid. Nothing reclaimed it, so after enough open/exit
+    # churn all of 2..MAX_WINDOWS-1 leak: wsys_alloc_wid returns -1, fresh
+    # apps get NO window, and the taskbar (which lists only in_use decorated
+    # slots) goes empty/stale even though live windows are on screen.
+    #
+    # Reap every in_use slot (2..MAX_WINDOWS-1) whose owner pid no longer
+    # names a live task. wid 1 (foreground/root) is never owner-reaped. The
+    # close path's bookkeeping (focus/drag/resize) is mirrored here so a
+    # reaped slot does not strand stale router state. Returns the count
+    # reaped. Cheap: a linear scan over <=30 slots plus a tiny task-table
+    # lookup each.
+    n: int32 = 0
+    w: uint64 = 2
+    while w < MAX_WINDOWS:
+        if wsys_slot_in_use[w] != 0:
+            if _wsys_pid_alive(wsys_slot_pid[w]) == 0:
+                wid: int32 = cast[int32](w)
+                if wsys_focus_wid == wid:
+                    wsys_focus_wid = 0
+                if wsys_drag_wid == wid:
+                    wsys_drag_wid = 0
+                    wsys_drag_snap_intent = WSYS_SNAP_NONE
+                if wsys_resize_wid == wid:
+                    wsys_resize_wid = 0
+                    wsys_resize_edge = 0
+                wsys_free_wid(wid)
+                n = n + 1
+        w = w + 1
+    return n
+
+
 def wsys_alloc_wid(pid: uint64) -> int32:
     # Public: claim the lowest free slot in 2..MAX_WINDOWS-1 and bind
     # it to `pid`. Returns the wid on success, -1 if the table is full.
@@ -403,6 +452,14 @@ def wsys_alloc_wid(pid: uint64) -> int32:
         if wsys_slot_in_use[w] == 0:
             wsys_slot_in_use[w] = 1
             wsys_slot_pid[w] = pid
+            # A recycled slot must NOT inherit the previous tenant's
+            # decorate/z (else a fresh app that lands on a slot last held by
+            # a popup (decorate 0) or chrome (z>=100) is silently dropped
+            # from /dev/wsys/windows — the taskbar would miss it until the
+            # client's own `decorate`/`z` writes land). Start as an
+            # undecorated top-level (z 0); the client sets its real chrome.
+            wsys_win_decorate[w] = 0
+            wsys_win_z[w] = 0
             # Drop any stale framebuffer blocks left by a previous tenant
             # that was reclaimed without a clean free (defensive); they are
             # re-allocated lazily on this window's first draw/blit.
@@ -421,6 +478,29 @@ def wsys_alloc_wid(pid: uint64) -> int32:
             wsys_win_anchor_dy[w] = 0
             return cast[int32](w)
         w = w + 1
+    # Table full: every slot 2..MAX_WINDOWS-1 is marked in_use. Some may be
+    # LEAKED by clients that exited without closing their window. Reap the
+    # dead-owner slots and retry once before giving up, so open/exit churn
+    # never permanently starves the allocator (the user-reported "fresh
+    # apps open but the taskbar is empty" failure).
+    if wsys_reap_dead_wids() > 0:
+        w = 2
+        while w < MAX_WINDOWS:
+            if wsys_slot_in_use[w] == 0:
+                wsys_slot_in_use[w] = 1
+                wsys_slot_pid[w] = pid
+                _wsys_layer_fb_release(cast[int32](w))
+                _wsys_backbuffer_release(cast[int32](w))
+                _wsys_reset_rings(cast[int32](w))
+                wsys_win_title_len[w] = 0
+                wsys_win_title[w * WSYS_WIN_TITLE_CAP] = 0
+                wsys_win_parent[w] = 0
+                wsys_win_anchor_dx[w] = 0
+                wsys_win_anchor_dy[w] = 0
+                wsys_win_decorate[w] = 0
+                wsys_win_z[w] = 0
+                return cast[int32](w)
+            w = w + 1
     return -1
 
 
@@ -7423,6 +7503,14 @@ def devwsys_windows_read(off: uint64, buf: Ptr[uint8],
                          count: uint64) -> int64:
     if count == 0:
         return 0
+    # TASKBAR-STALE FIX: reap slots whose owner process has exited before
+    # enumerating, so a window left in_use by a dead client (a terminal
+    # whose shell exited, a finished installer) is not reported as a live
+    # app — and, more importantly, so its leaked slot is reclaimed for the
+    # next launch. Only on offset 0 (the start of a fresh snapshot read);
+    # a continuation read must enumerate the SAME set it began with.
+    if off == 0:
+        wsys_reap_dead_wids()
     scratch: Array[2048, uint8]
     n: uint64 = 0
     w: uint64 = 1
@@ -9949,6 +10037,148 @@ def wsys_close_box_selftest() -> int32:
     wsys_keys_lossless_selftest()
     wsys_multiwindow_selftest()
     wsys_mate_wm_selftest()
+    wsys_taskbar_churn_selftest()
+    return 1
+
+
+def _wsys_windows_list_has(wid: int32) -> int32:
+    # 1 iff `wid` appears as a leading "<wid> " line in the live
+    # /dev/wsys/windows snapshot (the exact bytes the taskbar parses).
+    # Reads the whole snapshot via devwsys_windows_read and scans for the
+    # decimal wid at the start of a line. NOTE: devwsys_windows_read(0,..)
+    # reaps dead-owner slots as a side effect, matching the live read path.
+    rbuf: Array[2048, uint8]
+    rn: int64 = devwsys_windows_read(0, &rbuf[0], 2048)
+    if rn <= 0:
+        return 0
+    total: uint64 = cast[uint64](rn)
+    i: uint64 = 0
+    at_line_start: int32 = 1
+    while i < total:
+        if at_line_start != 0:
+            v: int32 = 0
+            got: int32 = 0
+            while i < total and rbuf[i] >= 48 and rbuf[i] <= 57:
+                v = v * 10 + cast[int32](rbuf[i]) - 48
+                got = 1
+                i = i + 1
+            if got != 0 and v == wid:
+                return 1
+            at_line_start = 0
+        if i < total and rbuf[i] == 10:
+            at_line_start = 1
+        i = i + 1
+    return 0
+
+
+def wsys_taskbar_churn_selftest() -> int32:
+    # TASKBAR-STALE FIX self-test (user-reported "open new apps, taskbar
+    # shows nothing"). Drives the REAL enumeration + alloc paths:
+    #
+    #   1) LEAK RECLAIM: mark EVERY app slot (2..MAX_WINDOWS-1) in_use bound
+    #      to a DEAD owner pid (the leak a client leaves when it exits without
+    #      closing its window). With the table apparently full, wsys_alloc_wid
+    #      must still succeed by reaping the dead-owner slots and retrying —
+    #      proving open/exit churn never permanently starves the allocator.
+    #
+    #   2) STALE DROP + LIVE KEEP: stand up a DEAD-owner decorated window and
+    #      a LIVE-owner decorated window, then read /dev/wsys/windows (the
+    #      taskbar's snapshot). The dead one must be reaped/absent; the live
+    #      one must be listed — so after churn the list reflects exactly the
+    #      currently-open windows, never empty/stale.
+    #
+    # Prints a [TASKBAR_CHURN] marker. Returns 1 on PASS, 0 on FAIL.
+    _wsys_init_if_needed()
+    dead_pid: uint64 = 888001        # never a live task in the selftest box
+    live_pid: uint64 = current_task_pid()
+
+    # --- Part 1: fill every app slot with a leaked (dead-owner) window. ---
+    w: uint64 = 2
+    while w < MAX_WINDOWS:
+        wsys_slot_in_use[w] = 1
+        wsys_slot_pid[w] = dead_pid
+        wsys_win_decorate[w] = 1
+        wsys_win_z[w] = 5
+        wsys_scene_len[w] = 0
+        w = w + 1
+    # Allocator sees a full table; it must reap the dead slots and hand one
+    # back. The pre-fix behaviour returned -1 here (fresh app gets no window).
+    nw: int32 = wsys_alloc_wid(live_pid)
+    if nw <= 1:
+        printk0("[TASKBAR_CHURN] FAIL allocator starved after open/exit churn (leaked slots not reclaimed)\n")
+        # Best-effort cleanup of the synthetic fill.
+        w = 2
+        while w < MAX_WINDOWS:
+            wsys_slot_in_use[w] = 0
+            wsys_slot_pid[w] = 0
+            w = w + 1
+        return 0
+    # The reclaimed wid is bound to the LIVE pid now.
+    if wsys_slot_pid[cast[uint64](nw)] != live_pid:
+        printk0("[TASKBAR_CHURN] FAIL reclaimed slot not rebound to the new owner\n")
+        wsys_free_wid(nw)
+        return 0
+    wsys_free_wid(nw)
+
+    # --- Part 2: dead-owner window is dropped; live-owner window is kept. ---
+    # Start from a clean app-slot table.
+    w = 2
+    while w < MAX_WINDOWS:
+        wsys_slot_in_use[w] = 0
+        wsys_slot_pid[w] = 0
+        wsys_win_decorate[w] = 0
+        wsys_win_z[w] = 0
+        wsys_scene_len[w] = 0
+        w = w + 1
+
+    # A live, decorated, app-z window — the kind the taskbar must always show.
+    wl: int32 = wsys_alloc_wid(live_pid)
+    if wl <= 1:
+        printk0("[TASKBAR_CHURN] FAIL could not allocate a live window\n")
+        return 0
+    ul: uint64 = cast[uint64](wl)
+    wsys_win_decorate[ul] = 1
+    wsys_win_z[ul] = 5
+    wsys_scene_len[ul] = 1
+    wsys_win_title_len[ul] = 0           # falls back to "win<wid>"
+
+    # A leaked, decorated window on a DIFFERENT slot bound to a dead pid.
+    wd: int32 = wsys_alloc_wid(dead_pid)
+    if wd <= 1:
+        printk0("[TASKBAR_CHURN] FAIL could not allocate the dead-owner window\n")
+        wsys_free_wid(wl)
+        return 0
+    ud: uint64 = cast[uint64](wd)
+    wsys_win_decorate[ud] = 1
+    wsys_win_z[ud] = 5
+    wsys_scene_len[ud] = 1
+
+    # Read the live snapshot (this reaps the dead-owner slot as a side effect).
+    live_listed: int32 = _wsys_windows_list_has(wl)
+    dead_listed: int32 = _wsys_windows_list_has(wd)
+
+    ok: int32 = 1
+    if live_listed == 0:
+        printk0("[TASKBAR_CHURN] FAIL live decorated window missing from the taskbar snapshot\n")
+        ok = 0
+    if dead_listed != 0:
+        printk0("[TASKBAR_CHURN] FAIL dead-owner window still listed (stale taskbar entry)\n")
+        ok = 0
+    # The dead slot must have been reclaimed by the reaping read.
+    if wsys_slot_in_use[ud] != 0:
+        printk0("[TASKBAR_CHURN] FAIL dead-owner slot was not reaped\n")
+        ok = 0
+
+    # Cleanup the live window (dead one is already reaped).
+    wsys_scene_len[ul] = 0
+    if wsys_wid_in_use(wl) != 0:
+        wsys_free_wid(wl)
+    if wsys_wid_in_use(wd) != 0:
+        wsys_free_wid(wd)
+
+    if ok == 0:
+        return 0
+    printk0("[TASKBAR_CHURN] PASS open/exit churn reclaims leaked slots; taskbar lists live windows only\n")
     return 1
 
 
