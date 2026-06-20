@@ -4,7 +4,7 @@
 # FAST regression guard for the DE features wave (no VM / KVM needed):
 #
 #   1. The three new scene apps COMPILE clean to user ELFs:
-#        haminstallui  — visual installer GUI front-end over /bin/haminstall
+#        haminstallui  — visual installer GUI front-end over /bin/install
 #        hamsettings   — wallpaper + panel settings
 #        hammonscene   — system monitor (uptime/mem/process list)
 #   2. hamdesktop COMPILES with the icon drag-rearrange + persist logic.
@@ -77,6 +77,37 @@ for prog in haminstallui hamsettings hammonscene; do
         failed "$prog NOT in /etc/desktop.icons"
     fi
 done
+
+# --- 3b. GUI installer drives the PACKAGE-based install path ----------
+# The GUI must spawn `/bin/install --auto` (Debian-style hpm package install)
+# NOT the legacy `/bin/haminstall` (dd ESP + manifest rootfs copy that pulled
+# bytes from /n/distros and failed with "skip missing source"). Guard both:
+# the right binary is spawned, AND the GUI never references /n/distros.
+if grep -q 'spawn(cast\[Ptr\[char\]\]("/bin/install")' user/haminstallui.ad \
+        && grep -q '"--auto"' user/haminstallui.ad; then
+    passed "haminstallui spawns /bin/install --auto (package-based install)"
+else
+    failed "haminstallui does NOT spawn /bin/install --auto (package path missing)"
+fi
+if grep -q 'spawn(cast\[Ptr\[char\]\]("/bin/haminstall")' user/haminstallui.ad; then
+    failed "haminstallui still spawns the legacy /bin/haminstall (dd/manifest path)"
+else
+    passed "haminstallui no longer spawns the legacy /bin/haminstall"
+fi
+# Check code lines only (strip '#' comments) — the header doc may mention
+# /n/distros to explain what it deliberately does NOT do.
+if grep -vE '^\s*#' user/haminstallui.ad | grep -q '/n/distros'; then
+    failed "haminstallui CODE references /n/distros (must source from the hpm repo only)"
+else
+    passed "haminstallui code never references /n/distros"
+fi
+# Online-repo option present + local fallback is the default.
+if grep -q 'use_online' user/haminstallui.ad \
+        && grep -q 'file:///iso-packages' user/haminstallui.ad; then
+    passed "haminstallui offers an online-repo toggle with local-repo fallback"
+else
+    failed "haminstallui missing the online-repo toggle / local fallback"
+fi
 
 # --- 4. Desktop-icon drag-persist wiring -----------------------------
 # hamdesktop must parse the optional position fields and write them back.

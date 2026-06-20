@@ -235,6 +235,17 @@ check_b '\[install\] Installing Hamnix .Debian-style package install.' \
 check_b 'hpm.*refresh|\[install\] .4/5. hpm refresh' "hpm refreshed the in-RAM package index"
 check_b '\[install\] .5/5. hpm install hamnix-base' "installer installed hamnix-base as packages"
 check_b 'hpm: installed hamnix-base' "hpm reported hamnix-base installed onto the target"
+# The native base install must source bytes ONLY from the local hpm repo —
+# NEVER the Debian distro tree (/n/distros). The legacy manifest path emitted
+# "skip missing source /n/distros/bin/*" when #distro was unbound; the
+# package path must never touch /n/distros. Assert its ABSENCE.
+if grep -aE -q 'skip missing source|/n/distros' "$STAGE_B_LOG"; then
+    echo "[test_installer_nvme_inram]   MISS (KEYSTONE): base install referenced /n/distros / skipped a missing source — it must source from the local hpm repo only:" >&2
+    grep -aE 'skip missing source|/n/distros' "$STAGE_B_LOG" >&2
+    stage_b_fail=1
+else
+    echo "[test_installer_nvme_inram]   OK (KEYSTONE): no '/n/distros' / 'skip missing source' — base populated purely from the local hpm repo."
+fi
 # KEYSTONE (in-RAM source): the ESP came from the in-RAM squashfs; the
 # root package repo is the in-RAM /iso-packages — neither is a media read.
 check_b 'file:///iso-packages' "installer used the in-RAM package repo (not a media read)"
