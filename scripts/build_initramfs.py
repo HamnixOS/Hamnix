@@ -3598,6 +3598,20 @@ def build_archive() -> bytes:
               f"`make -C tests/u-binary/src/musl_busybox install` to "
               f"stage the fixture.")
 
+    # PROVENANCE marker — a top-level file that exists ONLY in the
+    # distro tree, NEVER in the native cpio/sysroot root. This is the
+    # three-namespace isolation witness: `enter linux { /bin/ls / }`
+    # lists PROVENANCE, the native `ls /` does not. The gates
+    # (test_enter_linux_distro_root.sh / test_three_namespaces.sh) grep
+    # for exactly this string to prove the Debian root is a DISTINCT
+    # tree mounted over `/`, not the native namespace leaking through.
+    blob += cpio_entry(
+        "/var/lib/distros/default/PROVENANCE",
+        b"hamnix-distro-root: this file exists only inside the "
+        b"#distro tree served as / by `enter linux`\n")
+    print("  staged /var/lib/distros/default/PROVENANCE "
+          "(distro-root isolation witness)")
+
     # Distro-shape backing trees. Walk every subdirectory under
     # tests/distros/ and embed each file at
     # /var/lib/distros/<distro>/<rel-path>. Mirrors the etc/ glob's
