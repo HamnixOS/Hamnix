@@ -335,10 +335,12 @@ if grep -aq '\[MOUSE_PUMP\] PASS' "$LOG"; then
 fi
 
 # --- kernel routing diagnostic (TEMP_DEBUG_WHEEL) --------------------------
-# The kernel logs "[wsys-wheel] route dz=.. -> wid=.." when it forwards a wheel
-# notch to a window, or "no target" when the cursor was over no window. Surface
-# whichever fired so a failure is diagnosable (routing vs cursor placement).
-grep -aoE '\[wsys-wheel\][^\\]*' "$LOG" 2>/dev/null | sort | uniq -c | sed 's/^/[wheel_gate] kdiag: /' || true
+# devmouse_write logs "[devmouse-wr] rel dz=.." when it parses a wheel notch off
+# /dev/mouse; the router logs "[wsys-wheel] route dz=.. -> wid=.." when it
+# forwards it to a window (or "no target" when the cursor was over none).
+# Surface all three so a failure is diagnosable (parse vs route vs placement).
+tr -d '\000' < "$LOG" | grep -aoE '\[devmouse-wr\][^\]*' 2>/dev/null | sort | uniq -c | sed 's/^/[wheel_gate] kdiag: /' || true
+tr -d '\000' < "$LOG" | grep -aoE '\[wsys-wheel\][^\]*' 2>/dev/null | sort | uniq -c | sed 's/^/[wheel_gate] kdiag: /' || true
 
 # --- HARD: end-to-end wheel delivery to a scene app ------------------------
 # The terminal AND editor print "[ham*] WHEEL dz applied" the moment a wheel
