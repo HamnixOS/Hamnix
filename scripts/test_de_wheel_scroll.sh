@@ -187,6 +187,34 @@ def send(line):
 def screendump(label):
     subprocess.run([snap, label], timeout=20)
 
+def find_wid(title, timeout):
+    # cat /dev/wsys/windows ("<wid> <title>" lines) and return the wid of the
+    # window whose title contains `title`. Marker-framed so we can scrape it.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with lock:
+            del buf[:]                       # clear so we read a fresh dump
+        send("echo WINS_BEGIN; cat /dev/wsys/windows; echo WINS_END")
+        if wait_for("WINS_END", 6):
+            with lock:
+                txt = bytes(buf).decode("latin1", "replace")
+            seg = txt.split("WINS_BEGIN", 1)[-1].split("WINS_END", 1)[0]
+            for ln in seg.splitlines():
+                ln = ln.strip()
+                if title in ln:
+                    tok = ln.split()
+                    if tok and tok[0].isdigit():
+                        return int(tok[0])
+        time.sleep(1)
+    return -1
+
+def type_into(wid, s):
+    # Inject keystrokes directly onto the window's /keys ring as "d <code>"
+    # lines (bypasses focus). The terminal forwards each byte to its shell.
+    for ch in s:
+        send(f"printf 'd %d\\n' {ord(ch)} > /dev/wsys/{wid}/keys")
+        time.sleep(0.05)
+
 rc = 2
 try:
     if not wait_for("handing off to interactive shell", boot_wait):
@@ -197,12 +225,22 @@ try:
         # Settle: the auto-launched terminal runs its `echo NS_OK; ls /`
         # startup probe; let that stream into the grid so there is content.
         time.sleep(10)
-        # The DE terminal window geometry is "geometry 200 120 360 200":
-        # content origin (200,120), size 360x200, titlebar above. Drive the
-        # PS/2-relative cursor onto its middle (~380,220) from screen home.
+        twid = find_wid("Terminal", 40)
+        print(f"[wheel_gate] driver: terminal wid={twid}", file=sys.stderr)
         send("echo WHEEL_BEGIN")
+        # GENERATE DEEP SCROLLBACK so there is something to scroll back INTO:
+        # type a many-line command into the terminal's shell. `ls -la /usr/bin`
+        # prints far more than the ~13 visible rows, filling the scrollback
+        # ring. (If the wid lookup failed we fall back to the boot `ls /`
+        # content, which may or may not overflow — hence the lookup.)
+        if twid > 0:
+            type_into(twid, "ls -la /usr/bin /bin /sbin\n")
+            time.sleep(3)
+        # Drive the PS/2-relative cursor onto the terminal's middle. Use the
+        # default geometry (content origin ~200,120, size 360x200) — the
+        # accumulated deltas overshoot toward it then settle.
         for _ in range(12):
-            send("echo '40 30 0' > /dev/mouse")  # accumulate toward center
+            send("echo '40 30 0' > /dev/mouse")
             time.sleep(0.12)
         time.sleep(0.6)
         screendump("term_pre")
@@ -213,7 +251,7 @@ try:
             time.sleep(0.2)
         time.sleep(0.8)
         screendump("term_post")
-        # Read the terminal window's event file back for the routed dz line
+        # Read each window's event file back for the routed dz line
         # (best-effort: the terminal drains it, so this may race empty).
         for n in range(1, 13):
             send(f"echo EVT{n}_BEGIN; cat /dev/wsys/{n}/event; echo; echo EVT{n}_END")
