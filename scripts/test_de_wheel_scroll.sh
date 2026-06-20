@@ -267,28 +267,36 @@ try:
         send(f"echo TERM_RECT {gx} {gy} {gw} {gh}")
         send("echo WHEEL_BEGIN")
         if ewid > 0:
-            # Type ~40 short numbered lines so the document is far taller than
-            # the viewport — scrollable. type_into is slow/lossy over serial,
-            # so we send generously and tolerate some drops (we only need the
-            # doc to exceed the ~13 visible rows). Each line is a single 'a'.
-            doc = "a\n" * 40
+            # Fill the editor with many lines so it is taller than its ~16-row
+            # viewport (scrollable). type_into is one shell command per char
+            # over serial; pace it (0.18s) so the shell does not drop lines.
+            doc = "a\n" * 30
             type_into(ewid, doc)
             time.sleep(2)
-        # Place the cursor on the editor CONTENT center via an ABSOLUTE pointer
-        # write — "<ax> <ay> <buttons> <dz> 1" (5th field = abs flag) — which is
-        # DETERMINISTIC (no relative-delta accumulation / dropped-move flakiness
-        # the relative path suffered). ax,ay are 0..32767 tablet coords scaled
-        # to the 1280x800 screen. cx,cy = editor content center in px.
-        SCRW = 1280; SCRH = 800
-        ax = (cx * 32768) // SCRW; ay = (cy * 32768) // SCRH
-        # A pure positioning event (dz=0) parks the cursor over the editor.
-        send(f"echo '{ax} {ay} 0 0 1' > /dev/mouse")
-        time.sleep(0.5)
+        # Drive the PS/2-relative cursor onto the editor CONTENT center. The DE
+        # cursor is RELATIVE-only (wsys_route_mouse_rel); absolute writes do not
+        # move it, so we MUST use relative deltas. Pace them at 0.15s (the rate
+        # the flicker gate proved reliable — a faster cadence drops events).
+        # First anchor at the (0,0) corner with big negative deltas (clamped),
+        # then step DOWN-RIGHT to (cx,cy).
+        for _ in range(16):
+            send("echo '-200 -200 0' > /dev/mouse")    # anchor at (0,0)
+            time.sleep(0.15)
+        # ~30px steps so few events cover the distance (fewer = less drop risk).
+        nsx = cx // 30 + 1
+        for _ in range(nsx):
+            send("echo '30 0 0' > /dev/mouse")
+            time.sleep(0.15)
+        nsy = cy // 30 + 1
+        for _ in range(nsy):
+            send("echo '0 30 0' > /dev/mouse")
+            time.sleep(0.15)
+        time.sleep(0.6)
         screendump("term_pre")
-        # WHEEL-UP at that ABSOLUTE position: dz=+3, abs flag set. Repeat so the
-        # editor viewport (top_line) moves unambiguously.
-        for _ in range(6):
-            send(f"echo '{ax} {ay} 0 3 1' > /dev/mouse")
+        # WHEEL-UP over the editor: relative 4-field "0 0 0 3" (dz=+3). The
+        # cursor stays put (dx=dy=0); only the wheel notch routes. Repeat.
+        for _ in range(8):
+            send("echo '0 0 0 3' > /dev/mouse")
             time.sleep(0.2)
         time.sleep(0.8)
         screendump("term_post")
