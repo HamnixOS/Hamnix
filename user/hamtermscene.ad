@@ -38,6 +38,7 @@ extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_close(fd: int32) -> int32
 extern def sys_get_jiffies() -> uint64
 extern def sys_yield() -> int32
+extern def sys_nanosleep(req: Ptr[int64], rem: Ptr[int64]) -> int64
 extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
 extern def sys_pipe(fds: Ptr[int32]) -> int32
 extern def sys_pipechan() -> int32
@@ -506,6 +507,20 @@ def _start_shell() -> int32:
     # pipechan creator ref is consumed by the two fdbinds.)
     sh_alive = 1
     return 0
+
+
+# Cooperative short sleep (jiffy-granular, HZ=100 → 10 ms floor). Parks the
+# task off the runqueue (sti+hlt) so it does NOT busy-spin; other tasks (the
+# shell) get the CPU while we wait. Used by the main loop's bounded readiness
+# poll: every wake we drain BOTH /keys and the shell pipe, so shell output
+# (the new prompt) renders within ~one tick even when no key is pressed.
+term_sleep_ts: Array[2, int64]
+
+
+def _short_sleep_ns(ns: int64):
+    term_sleep_ts[0] = 0                       # tv_sec
+    term_sleep_ts[1] = ns                      # tv_nsec
+    sys_nanosleep(&term_sleep_ts[0], cast[Ptr[int64]](0))
 
 
 # Non-blocking drain of the shell's stdout into the glyph grid. Returns the
@@ -1032,8 +1047,25 @@ def main() -> int32:
                 sys_yield()
         return 0
 
-    # EVENT-DRIVEN loop: BLOCK on /keys; on each wake drain the ring fully,
-    # forward keystrokes to the shell, then bounded-pump the echo.
+    # READINESS-MULTIPLEXING loop (KEYSTONE BUG #1 FIX).
+    #
+    # The OLD loop did a BLOCKING sys_read on /keys. While parked there the
+    # shell's stdout pipe (sh_out_fd) was NOT serviced, so a command's output
+    # and the next prompt did not render until the user pressed a key (the only
+    # thing that woke the read). We must wait on BOTH /keys AND sh_out_fd.
+    #
+    # There is no epoll syscall exposed to userland in this tree (no
+    # epoll_create/ctl/wait, and /keys is not poll-registerable), so we use the
+    # documented FALLBACK: a NON-BLOCKING keys read + an UNCONDITIONAL
+    # _drain_shell() every iteration, sleeping cooperatively (sys_nanosleep,
+    # which parks off the runqueue — no busy-spin) ONLY when neither source had
+    # data. Result: shell output renders within ~one tick (10 ms floor) with no
+    # follow-up keystroke (#1), and a key's echo commits in the same frame
+    # (#2 — drain keys -> forward -> drain echo -> commit, all in one wake).
+    #
+    # Idle CPU cost is bounded: when both /keys and the shell are quiet we
+    # hlt-sleep one jiffy per loop, identical to a parked blocking read.
+    TERM_IDLE_SLEEP_NS: int64 = 10000000      # 10 ms (1 jiffy at HZ=100)
     while True:
         room: uint64 = 512 - kev_carry
         if room == 0:
@@ -1042,13 +1074,12 @@ def main() -> int32:
             # "<t> <code>\n" lines (<=~12 bytes).
             kev_carry = 0
             room = 512
-        # BLOCKING read: parks off the runqueue until the compositor routes a
-        # key to us (directed wq_wake_one). No CPU spin, no shell starvation.
-        kn: int64 = sys_read(kfd, &kev_buf[kev_carry], room)
-        # BUG 1b: a resize wakes the keys read (compositor wakes us) or arrives
-        # alongside keys — poll /event and re-layout. Force a scene re-emit on
-        # a size change (the grid hash alone wouldn't catch the fill-size /
-        # column-count change, only the row content).
+        # NON-BLOCKING keys read: 0 = no key this tick (we still drain the
+        # shell below), >0 = bytes, <0 = error/EOF (treated as no-data).
+        kn: int64 = sys_read_nb(kfd, &kev_buf[kev_carry], room)
+        # BUG 1b: a resize arrives on /event — poll it and re-layout. Force a
+        # scene re-emit on a size change (the grid hash alone wouldn't catch the
+        # fill-size / column-count change, only the row content).
         if _poll_events(efd) != 0:
             _emit_scene(cast[Ptr[char]](&scenep[0]))
             cfdr: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
@@ -1056,31 +1087,33 @@ def main() -> int32:
                 _writeall(cfdr, cast[Ptr[uint8]]("commit\n"))
                 sys_close(cfdr)
             prev_hash = _grid_hash()
-        if kn <= 0:
-            # EINTR / transient: yield once and retry rather than busy-spin.
-            sys_yield()
-            continue
-        # BUG 3 FIX: parse only COMPLETE "<t> <code>\n" lines; CARRY any
-        # partial trailing line across reads so a keystroke split at a buffer
-        # boundary or a fast burst is never lost.
-        total: uint64 = kev_carry + cast[uint64](kn)
         keys_forwarded = 0
-        done: uint64 = _drain_keys_chunk(total)
-        leftover: uint64 = total - done
-        m: uint64 = 0
-        while m < leftover:
-            kev_buf[m] = kev_buf[done + m]
-            m = m + 1
-        kev_carry = leftover
-        # Collect the shell's echo (+ any command output it produced) and
-        # commit. Bounded so a chatty command can't keep us off the keyboard;
-        # leftover output is picked up on the next keystroke wake. BUG 1 fix:
-        # if we forwarded any keystroke this wake, WAIT (bounded) for its echo
-        # so the typed char commits in THIS frame, not the next — no off-by-one.
+        if kn > 0:
+            # BUG 3 FIX: parse only COMPLETE "<t> <code>\n" lines; CARRY any
+            # partial trailing line across reads so a keystroke split at a
+            # buffer boundary or a fast burst is never lost.
+            total: uint64 = kev_carry + cast[uint64](kn)
+            done: uint64 = _drain_keys_chunk(total)
+            leftover: uint64 = total - done
+            m: uint64 = 0
+            while m < leftover:
+                kev_buf[m] = kev_buf[done + m]
+                m = m + 1
+            kev_carry = leftover
+        # ALWAYS drain the shell. This is the heart of the fix: shell output
+        # (the new prompt, command results) is serviced every iteration, not
+        # only on a keystroke. If we just forwarded a key, await_echo waits
+        # (bounded) for the echo so the typed char commits in THIS frame.
         awaite: int32 = 0
         if keys_forwarded > 0:
             awaite = 1
+        before: uint64 = prev_hash
         prev_hash = _pump_shell_ex(cast[Ptr[char]](&scenep[0]),
                                    cast[Ptr[char]](&ctlp[0]),
                                    prev_hash, 32, awaite)
+        # Sleep ONLY when this iteration was fully idle (no key, no shell
+        # output, no commit). Otherwise loop immediately so a chatty command
+        # streams at full speed. Cooperative hlt-sleep — no busy-spin.
+        if kn <= 0 and prev_hash == before:
+            _short_sleep_ns(TERM_IDLE_SLEEP_NS)
     return 0
