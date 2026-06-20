@@ -360,17 +360,23 @@ fi
 # the dead /pointer open is gone). This gate therefore PASSES when the marker
 # fires (a real end-to-end proof on a harness where injection works) and SKIPS
 # (exit 0) when it does not, rather than failing on the injection limitation.
+# PASS requires the app's "[ham*] WHEEL dz applied" marker — it fires ONLY when
+# a nonzero-dz 'm' line is parsed off /event AND the view actually moves
+# (term_view_off / top_line changes), so it is the sole trustworthy end-to-end
+# signal. The screendump pixel-diff is NOT used to PASS: residual typing/cursor
+# motion in the injected window changes pixels too, so it can false-positive
+# (it is reported below only as an informational NOTE).
 delivered=0
 if grep -aqE '\[hamterm\] WHEEL dz applied' "$LOG"; then
-    echo "[wheel_gate] PASS terminal received + parsed a wheel notch (dz) on /event end-to-end"
+    echo "[wheel_gate] PASS terminal received + parsed a wheel notch (dz) on /event and scrolled (end-to-end)"
     delivered=1
 fi
 if grep -aqE '\[hamedit\] WHEEL dz applied' "$LOG"; then
-    echo "[wheel_gate] PASS editor received + parsed a wheel notch (dz) on /event end-to-end"
+    echo "[wheel_gate] PASS editor received + parsed a wheel notch (dz) on /event and scrolled (end-to-end)"
     delivered=1
 fi
 
-# Secondary signal: the terminal/editor content region re-rendered (scrolled).
+# Informational only (NOT a PASS condition): target content-region pixel delta.
 RECT=$(grep -aoE 'TERM_RECT [0-9]+ [0-9]+ [0-9]+ [0-9]+' "$LOG" 2>/dev/null | tail -1)
 if [ -n "$RECT" ]; then
     read -r _ RX RY RW RH <<<"$RECT"
@@ -381,11 +387,7 @@ RX1=$((RX + RW)); RY1=$((RY + RH))
 if [ -s "$OUT_DIR/term_pre.ppm" ] && [ -s "$OUT_DIR/term_post.ppm" ]; then
     sdiff=$(region_diff "$OUT_DIR/term_pre.ppm" "$OUT_DIR/term_post.ppm" \
                         "$RX" "$RY" "$RX1" "$RY1")
-    echo "[wheel_gate] target-region changed pixels on wheel-up: $sdiff (min $SCROLL_MIN)"
-    if [ "$sdiff" != "-1" ] && [ "$sdiff" -ge "$SCROLL_MIN" ]; then
-        echo "[wheel_gate] PASS target VISIBLY SCROLLED under mouse-wheel input"
-        delivered=1
-    fi
+    echo "[wheel_gate] NOTE target-region pixel delta on wheel-up: $sdiff (informational; not a PASS signal — typing/cursor also changes pixels)"
 fi
 
 echo "[wheel_gate] artifacts in $OUT_DIR"
@@ -393,8 +395,8 @@ if [ "$delivered" = "1" ]; then
     echo "[wheel_gate] RESULT: PASS"
     exit 0
 fi
-echo "[wheel_gate] SKIP: could not inject a live-DE wheel via the serial /dev/mouse" \
-     "(known harness limitation — devmouse_write is unreachable from the serial" \
-     "shell when the DE is live); the wheel WIRING is guarded by" \
-     "test_de_term_editor_features.sh. See header." >&2
+echo "[wheel_gate] SKIP: no '[ham*] WHEEL dz applied' marker — could not inject a" \
+     "scroll-moving wheel into the live DE from the serial /dev/mouse harness" \
+     "(cursor placement / scrollback depth / injection reach). The wheel WIRING" \
+     "is guarded by the static test_de_term_editor_features.sh; see header." >&2
 exit 0
