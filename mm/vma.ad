@@ -73,7 +73,7 @@ from fs.elf import (
     vm_share_range, vm_protect_range, vm_pin_range,
     elf_prepare_demand_range, elf_map_one_page,
     elf_prepare_huge_demand_range, elf_map_one_huge_pde,
-    PT_FLAG_NX, PT_FLAG_RW,
+    PT_FLAG_NX, PT_FLAG_RW, PT_FLAG_COW,
 )
 # §file-mmap: identity-based kernel pread for file-backed VMA fault-in.
 # fs.elf already imports from fs.vfs, so fs.vfs's symbols are in the
@@ -2567,6 +2567,105 @@ def vma_swap_in_fault(slot: uint64, pml4_phys: uint64,
         printk1("vma: swap-in map failed at va=0x%x\n", fault_va)
         return -1
     return 1
+
+
+def vma_resolve_write_perm_fault(slot: uint64, pml4_phys: uint64,
+                                 fault_va: uint64) -> int32:
+    # Resolve a WRITE fault on a PRESENT, read-only USER page (P=1, W=1)
+    # by consulting the owning VMA's recorded prot. Two distinct faulters
+    # reach here:
+    #
+    #   * ld.so (CPL=3, U=1) writing a GOT/RELRO/.data relocation slot into
+    #     a writable data segment whose leaf PTE is stale-RO. glibc reserves
+    #     a whole DSO span PROT_READ then MAP_FIXED-overlays the writable
+    #     data/GOT segment inside it; if the overlay's RW re-stamp missed a
+    #     page (a not-present hole the eager re-stamp skipped, or a 2 MiB
+    #     boundary page the reservation installed RO), the first relocation
+    #     write faults.
+    #
+    #   * the KERNEL (CPL=0, U=0) filling that same overlay: _u_mmap's
+    #     vfs_read writes the file's data-segment bytes DIRECTLY to the user
+    #     VA, and the alias path's memset zero-fills a .bss overlay the same
+    #     way. Under CR0.WP a supervisor write to a read-only page faults
+    #     exactly like a CPL=3 one (#PF err U=0 instead of U=1). The real
+    #     Debian-glibc dpkg crash was this exact shape: cr2=0x49c00000
+    #     (the libc data segment), err=0x03 (P=1 W=1 U=0), rip in kernel
+    #     code (the mmap-fill vfs_read).
+    #
+    # In BOTH cases the page is GENUINELY writable per its VMA — the PTE is
+    # merely stale. Re-stamp the single faulting leaf RW (honoring the
+    # VMA's NX) so the write completes and the instruction re-runs. If the
+    # owning VMA does NOT grant PROT_WRITE this is a real permission
+    # violation (a true W^X .text/.rodata write): return 0 so the caller
+    # signals / halts as appropriate. A COW page is NOT touched here — the
+    # COW resolver already ran in do_page_fault and a still-RO COW leaf must
+    # take the copy path, never a force-writable.
+    va_al: uint64 = fault_va & ~(VMA_PAGE_SIZE - 1)
+    node: uint64 = vma_find(slot, va_al)
+    if node == 0:
+        return 0
+    prot: int32 = cast[Ptr[VmaNode]](node)[0].prot
+    if (prot & VMA_PROT_WRITE) == 0:
+        # The VMA is genuinely non-writable — a real protection fault.
+        return 0
+    pslot: uint64 = _vma_pte_slot_addr(pml4_phys, va_al)
+    if pslot == 0:
+        return 0
+    pte: uint64 = cast[Ptr[uint64]](pslot)[0]
+    if (pte & VMA_PT_FLAG_P) == 0:
+        # Not present after all — leave it to demand/swap.
+        return 0
+    if (pte & PT_FLAG_COW) != 0:
+        # A COW leaf: never force-writable here; the copy goes through
+        # cow_handle_write_fault (already tried by do_page_fault).
+        return 0
+    if (pte & PT_FLAG_RW) != 0:
+        # Already writable — the fault was transient (another CPU restamped
+        # it, or a TLB shootdown lag). Re-running the instruction succeeds.
+        invlpg_one(va_al)
+        return 1
+    # Stamp RW on the faulting leaf, keeping NX consistent with the VMA's
+    # prot (a writable data page is non-exec; a rare PROT_EXEC|PROT_WRITE
+    # page stays executable).
+    new_pte: uint64 = (pte | PT_FLAG_RW) & ~PT_FLAG_NX
+    if (prot & VMA_PROT_EXEC) == 0:
+        new_pte = new_pte | PT_FLAG_NX
+    cast[Ptr[uint64]](pslot)[0] = new_pte
+    invlpg_one(va_al)
+    return 1
+
+
+def vma_force_fill_writable(slot: uint64, addr: uint64, length: uint64):
+    # (a)-side source fix for the ld.so RELRO/GOT W^X halt: BEFORE the
+    # kernel fills a file-backed MAP_FIXED overlay by writing the file's
+    # bytes DIRECTLY to the user VA (linux_abi _u_mmap_fill_file's
+    # vfs_read), force every PRESENT leaf in [addr, addr+length) to RW.
+    # ld.so reserves a whole DSO span PROT_READ (all pages installed
+    # present-RO by _vma_alloc_large) then MAP_FIXED-overlays the writable
+    # data/GOT segment; vma_alloc's alias path already re-stamps the exact
+    # overlay sub-range, but rounding / a 2 MiB boundary page can leave a
+    # page in the FILL range still RO. A kernel CPL=0 store to a RO page
+    # faults under CR0.WP (the dpkg cr2=0x49c00000 halt). Re-stamping the
+    # fill range here makes the write land cleanly; the #PF resolver
+    # (vma_resolve_write_perm_fault) is the backstop for any page this
+    # misses. Pages that are NOT present are skipped — they materialize
+    # writable on first touch because the overlay VMA grants PROT_WRITE.
+    if length == 0:
+        return
+    node: uint64 = vma_find(slot, addr)
+    if node == 0:
+        return
+    prot: int32 = cast[Ptr[VmaNode]](node)[0].prot
+    if (prot & VMA_PROT_WRITE) == 0:
+        # A read-only overlay (e.g. a PROT_READ file map): leave its pages
+        # RO — the fill writes through the identity window for those, and
+        # forcing RW would silently break W^X.
+        return
+    pml4: uint64 = task_pml4(cast[int32](slot))
+    want_exec: int32 = 0
+    if (prot & VMA_PROT_EXEC) != 0:
+        want_exec = 1
+    vm_protect_range(pml4, addr, addr + length, 1, want_exec)
 
 
 # ---------------------------------------------------------------------
