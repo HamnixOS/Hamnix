@@ -125,13 +125,20 @@ run_live() {
     cp "$OVMF_FD" "$OVMF_RW"; cp "$INSTALLER_IMG" "$IMG_RW"
     trap 'rm -rf "$OUT_DIR" "$OVMF_RW" "$IMG_RW" "$MON"' RETURN
 
+    # Reliable QMP screendump: keep the monitor connection OPEN long enough
+    # for QEMU to finish writing the PPM before the socket closes (a fire-and-
+    # forget `printf | socat` races the write and captures a stale/empty
+    # frame — that race made an earlier version of this gate read delta=0 even
+    # though the panel HAD moved). socat holds the link for 2s post-send.
     SNAP="$OUT_DIR/.snap.sh"
     cat > "$SNAP" <<SNAPEOF
 #!/bin/bash
 label="\$1"
 ppm="$OUT_DIR/\$label.ppm"
-printf 'screendump %s\n' "\$ppm" | socat - "UNIX-CONNECT:$MON" >/dev/null 2>&1
-for i in \$(seq 1 30); do [ -s "\$ppm" ] && break; sleep 0.1; done
+rm -f "\$ppm"
+{ printf 'screendump %s\n' "\$ppm"; sleep 2; } | socat - "UNIX-CONNECT:$MON" >/dev/null 2>&1
+for i in \$(seq 1 40); do [ -s "\$ppm" ] && break; sleep 0.1; done
+sleep 0.3
 SNAPEOF
     chmod +x "$SNAP"
 
@@ -164,7 +171,29 @@ def wait_for(marker, timeout):
 def send(line):
     try: qemu.stdin.write((line + "\n").encode()); qemu.stdin.flush()
     except Exception: pass
-def screendump(label): subprocess.run([snap, label], timeout=20)
+import socket, os
+def screendump(label):
+    # In-process QMP screendump: connect, drain the greeting, send the verb,
+    # then HOLD the connection open while QEMU writes the PPM. A fire-and-
+    # forget `printf | socat` races the write and grabs a stale frame.
+    ppm = os.path.join(outdir, label + ".ppm")
+    try: os.remove(ppm)
+    except Exception: pass
+    try:
+        c = socket.socket(socket.AF_UNIX); c.connect(mon)
+        time.sleep(0.2)
+        try: c.recv(8192)
+        except Exception: pass
+        c.sendall(("screendump %s\n" % ppm).encode())
+        time.sleep(2.0)
+        try: c.recv(8192)
+        except Exception: pass
+        c.close()
+    except Exception as e:
+        print("[panel_config] screendump error:", e, file=sys.stderr)
+    for _ in range(40):
+        if os.path.exists(ppm) and os.path.getsize(ppm) > 0: break
+        time.sleep(0.1)
 rc = 2
 try:
     if not wait_for("handing off to interactive shell", boot_wait):
@@ -172,18 +201,18 @@ try:
     else:
         wait_for("scene windows ready", 60)
         time.sleep(8)
-        screendump("top")
+        screendump("top"); screendump("top")   # warm-up + real (QMP 1st dump can be stale)
         # LIVE: flip the panel to the BOTTOM edge by rewriting the writable
         # runtime override in tmpfs; the panel's _cfg_changed poll picks this
         # up within ~1s and moves the window (no restart).
         send("echo PANELCFG_BOTTOM")
         send("printf 'panel main\\n  edge bottom\\n  widget menu\\n  widget tasks\\n  widget clock\\nend\\n' > /tmp/hamnix-panel.conf")
-        time.sleep(4)
-        screendump("bottom")
+        time.sleep(5)
+        screendump("bottom"); screendump("bottom")
         # LIVE: a vertical LEFT panel + bold font — must parse + render.
         send("echo PANELCFG_LEFT")
         send("printf 'panel side\\n  edge left\\n  size 64\\n  font bold\\n  widget menu\\n  widget tasks\\nend\\n' > /tmp/hamnix-panel.conf")
-        time.sleep(4)
+        time.sleep(6)
         screendump("left")
         for _ in range(12):
             send("echo PANELCFGDONE")
