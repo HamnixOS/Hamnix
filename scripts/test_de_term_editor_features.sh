@@ -13,9 +13,14 @@
 #   2. Up/Down command history.   ed_readline keeps a ring of entered lines
 #      (hist_buf / hist_append) and Up/Down (ESC [ A / ESC [ B) recall it.
 #
-#   3. Mouse-wheel scrollback.   hamtermscene opens /dev/wsys/<wid>/pointer,
-#      parses the wheel-notch (dz) field, and drives a retained scrollback
-#      history ring (sb_rows) through a view offset (term_view_off).
+#   3. Mouse-wheel scrollback.   the in-kernel pointer router delivers the
+#      "m <x> <y> <buttons> <dz>" line on /dev/wsys/<wid>/event (NOT the
+#      separate /pointer file, which only the userland-compositor path uses).
+#      hamtermscene reads /event, mines the wheel-notch (dz) field, and drives
+#      a retained scrollback history ring (sb_rows) through a view offset
+#      (term_view_off). hameditscene mines the same /event dz to scroll
+#      top_line. (The earlier /pointer wiring was a dead path — the router
+#      never wrote it — which is why the wheel did nothing.)
 #
 # These are USERSPACE line-editor / glyph-grid behaviours with no clean
 # in-VM injection point that isn't itself flaky (key/mouse fixtures need a
@@ -36,6 +41,7 @@ cd "$PROJ_ROOT"
 
 HAMSH="user/hamsh.ad"
 HTS="user/hamtermscene.ad"
+HES="user/hameditscene.ad"
 fail=0
 
 note()  { echo "[term_editor] $*"; }
@@ -72,9 +78,12 @@ needre "$HAMSH" "c == 66" "Down arrow (ESC [ B) walks to newer history"
 # The completed line is pushed into history after Enter.
 needre "$HAMSH" "hist_append\(&ed_buf\[0\]" "entered line is pushed to history"
 
-note "--- (3) mouse-wheel scrollback ---"
-need   "$HTS" "/pointer" "hamtermscene opens the /pointer event stream"
-need   "$HTS" "_drain_pointer_chunk" "pointer lines are parsed for the wheel notch"
+note "--- (3) mouse-wheel scrollback (terminal) ---"
+# The wheel notch rides the "m ... <dz>" line on /event (the router pushes
+# pointer lines onto the EVENT ring); the term must read /event and mine dz.
+need   "$HTS" "/event" "hamtermscene opens the /event stream (carries the wheel dz)"
+need   "$HTS" "_evt_apply_wheel" "the /event 'm' line is parsed for the wheel notch (dz)"
+needre "$HTS" "if t == 109" "the /event drain handles the 'm' (109) pointer line"
 need   "$HTS" "term_view_off" "a scrollback view offset exists"
 need   "$HTS" "sb_rows" "a retained scrollback history ring exists"
 need   "$HTS" "_sb_push" "rows scrolled off the top are pushed into history"
@@ -82,12 +91,27 @@ needre "$HTS" "_grid_hash" "the view offset is folded into the grid hash (re-com
 # Wheel handling: dz>0 older, dz<0 toward tail, clamped; typing snaps back.
 need   "$HTS" "_scroll_by" "wheel notches adjust the scrollback view (clamped)"
 needre "$HTS" "term_view_off = 0" "typing snaps the view back to the live tail"
+# The dead /pointer wiring must NOT come back (that was the root-cause bug):
+# no _winpath(...,"/pointer") and no /pointer sys_open. (Comments may still
+# mention /pointer to explain WHY it is unused, so match the wiring, not text.)
+if grep -aqE '_winpath\([^)]*"/pointer"|sys_open\([^)]*pointer' "$HTS"; then
+    failf "hamtermscene must NOT open /pointer (dead path; wheel rides /event)"
+else
+    pass "hamtermscene no longer opens the dead /pointer file"
+fi
+
+note "--- (3b) mouse-wheel scroll (editor) ---"
+need   "$HES" "/event" "hameditscene opens the /event stream (carries the wheel dz)"
+need   "$HES" "_ed_scroll_by" "editor wheel notches scroll the text viewport (top_line)"
+needre "$HES" "ed_evbuf\[ls\] == 109" "the editor /event drain handles the 'm' (109) wheel line"
+need   "$HES" "top_line" "editor vertical scroll offset (top_line) exists"
 
 note "--- (4) clean standalone compile of both binaries ---"
 ADDER="python3 -m compiler.adder compile --target=x86_64-adder-user"
 TMP_HAMSH=$(mktemp --tmpdir te-hamsh.XXXXXX.elf)
 TMP_HTS=$(mktemp --tmpdir te-hts.XXXXXX.elf)
-cleanup() { rm -f "$TMP_HAMSH" "$TMP_HTS"; }
+TMP_HES=$(mktemp --tmpdir te-hes.XXXXXX.elf)
+cleanup() { rm -f "$TMP_HAMSH" "$TMP_HTS" "$TMP_HES"; }
 trap cleanup EXIT
 
 if $ADDER "$HAMSH" -o "$TMP_HAMSH" >/dev/null 2>&1; then
@@ -99,6 +123,11 @@ if $ADDER "$HTS" -o "$TMP_HTS" >/dev/null 2>&1; then
     pass "user/hamtermscene.ad compiles"
 else
     failf "user/hamtermscene.ad failed to compile"
+fi
+if $ADDER "$HES" -o "$TMP_HES" >/dev/null 2>&1; then
+    pass "user/hameditscene.ad compiles"
+else
+    failf "user/hameditscene.ad failed to compile"
 fi
 
 echo "[term_editor] --- result ---"
