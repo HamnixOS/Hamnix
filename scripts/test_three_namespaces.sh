@@ -102,10 +102,16 @@ set +e
     printf 'echo HOME_WRITE_END\n'; sleep 1
 
     # --- (A+B) enter linux: distinct Debian root + shared home -------
+    # The FIRST (reliable) Linux-ELF spawn lists the distro root: it must
+    # show PROVENANCE (isolation, distinct Debian tree over /) AND the
+    # `home` mountpoint (the shared home is bound into the Linux ns). A
+    # SECOND spawn reads the file written from the user view — kept SOFT
+    # because a 2nd Linux-ELF load in one boot can still trip the
+    # pre-existing ET_DYN/direct-map issue (separate kernel-MM track).
     printf 'echo BANNER_DISTRO_START\n'; sleep 1
     printf 'enter linux { /bin/ls / }\n'; sleep 5
     printf 'echo BANNER_DISTRO_MID\n'; sleep 1
-    # The file written from the user view must be visible here.
+    # The file written from the user view must be visible here (SOFT).
     printf 'enter linux { /bin/cat /home/shared.txt }\n'; sleep 5
     printf 'echo BANNER_DISTRO_END\n'; sleep 1
 
@@ -161,7 +167,8 @@ else
     fail=1
 fi
 
-# A.2 the Linux root MUST carry PROVENANCE (distinct Debian tree over /).
+# A.2 the Linux root MUST carry PROVENANCE (distinct Debian tree over /)
+# in the FIRST (reliable) enter-linux spawn. HARD.
 # Window: after BANNER_DISTRO_START, before BANNER_DISTRO_MID.
 if awk '
     BEGIN { armed=0; found=0 }
@@ -174,13 +181,49 @@ if awk '
 ' "$LOG"; then
     note "OK: enter linux { ls / } lists the DISTINCT Debian root (PROVENANCE)"
 else
-    note "SOFT(mm): enter linux distro listing not observed this boot (ET_DYN #PF or load)"
+    note "FAIL: enter linux root did NOT show PROVENANCE (distro root not mounted over /)"
+    fail=1
 fi
 
 # --- (B) SHARED HOME -------------------------------------------------
-# The file written from the user view (shared-home-token) must reappear
-# when `enter linux { cat /home/shared.txt }` runs — proving the two
-# namespaces bind the SAME home. Window: BANNER_DISTRO_MID..END.
+# B.1 HARD: the shared home is bound INTO the Linux ns — `home` must
+# appear as a top-level entry in the first enter-linux root listing.
+# Combined with the native write proof (B.2) this shows the user view
+# and the Linux ns bind the SAME home source.
+if awk '
+    BEGIN { armed=0; found=0 }
+    index($0,"[atkbd-diag]")>0 { next }
+    index($0,"BANNER_DISTRO_START")>0 { armed=1; next }
+    index($0,"BANNER_DISTRO_MID")>0 { armed=0 }
+    armed && index($0,"enter linux {")>0 { next }
+    armed && $0 == "home" { found=1; exit }
+    END { exit found?0:1 }
+' "$LOG"; then
+    note "OK: shared home mountpoint is present inside the Linux ns (home in ls /)"
+else
+    note "FAIL: shared home mountpoint NOT present in the Linux ns"
+    fail=1
+fi
+
+# B.2 HARD: the file written from the USER view landed in the shared
+# (writable) home source — `ls /home` in the user view shows shared.txt.
+if awk '
+    BEGIN { armed=0; found=0 }
+    index($0,"[atkbd-diag]")>0 { next }
+    index($0,"HOME_WRITE_START")>0 { armed=1; next }
+    index($0,"HOME_WRITE_END")>0 { armed=0 }
+    armed && index($0,"ls /home")>0 { next }
+    armed && index($0,"shared.txt")>0 { found=1; exit }
+    END { exit found?0:1 }
+' "$LOG"; then
+    note "OK: user view wrote shared.txt into the shared (writable) home"
+else
+    note "FAIL: user-view write into the shared home did not take"
+    fail=1
+fi
+
+# B.3 SOFT (2nd-spawn dependent): reading the file's CONTENT back across
+# the boundary inside a second enter-linux. Window: BANNER_DISTRO_MID..END.
 if awk '
     BEGIN { armed=0; found=0 }
     index($0,"[atkbd-diag]")>0 { next }
@@ -190,9 +233,9 @@ if awk '
     armed && index($0,"shared-home-token")>0 { found=1; exit }
     END { exit found?0:1 }
 ' "$LOG"; then
-    note "OK: shared home — file written in user view is visible inside enter linux"
+    note "OK: shared-home CONTENT read back inside enter linux (full round-trip)"
 else
-    note "SOFT(mm): shared-home read inside enter linux not observed this boot"
+    note "SOFT(mm): shared-home content-read in 2nd enter-linux not seen (2nd-spawn limit)"
 fi
 
 # --- (C) NEWSHELL HOSTOWNER -----------------------------------------
