@@ -233,11 +233,12 @@ def read_geom(wid, timeout):
 
 def type_into(wid, s):
     # Inject keystrokes directly onto the window's /keys ring as "d <code>"
-    # lines (bypasses focus). The terminal forwards each byte to its shell.
-    # hamsh has `echo` (no printf), so emit the literal "d <code>" line.
+    # lines (bypasses focus). hamsh has `echo` (no printf), so emit the literal
+    # "d <code>" line. Each char is a full shell command; pace it so the serial
+    # shell does NOT drop lines under load (a too-fast cadence lost most chars).
     for ch in s:
         send(f"echo 'd {ord(ch)}' > /dev/wsys/{wid}/keys")
-        time.sleep(0.05)
+        time.sleep(0.18)
 
 rc = 2
 try:
@@ -266,27 +267,28 @@ try:
         send(f"echo TERM_RECT {gx} {gy} {gw} {gh}")
         send("echo WHEEL_BEGIN")
         if ewid > 0:
-            # Type 30 short numbered lines (e.g. "L0\nL1\n...") so the document
-            # is far taller than the viewport — scrollable.
-            doc = "".join(f"L{i}\n" for i in range(30))
+            # Type ~40 short numbered lines so the document is far taller than
+            # the viewport — scrollable. type_into is slow/lossy over serial,
+            # so we send generously and tolerate some drops (we only need the
+            # doc to exceed the ~13 visible rows). Each line is a single 'a'.
+            doc = "a\n" * 40
             type_into(ewid, doc)
             time.sleep(2)
-        # Drive the PS/2-relative cursor onto the editor CONTENT center. Anchor
-        # at (0,0) (large negative deltas clamp), then step down-right.
-        for _ in range(24):
-            send("echo '-120 -120 0' > /dev/mouse")   # anchor at (0,0)
-            time.sleep(0.05)
-        steps = max(cx, cy) // 15 + 2
-        sx = max(1, cx // steps); sy = max(1, cy // steps)
-        for _ in range(steps):
-            send(f"echo '{sx} {sy} 0' > /dev/mouse")
-            time.sleep(0.08)
-        time.sleep(0.6)
+        # Place the cursor on the editor CONTENT center via an ABSOLUTE pointer
+        # write — "<ax> <ay> <buttons> <dz> 1" (5th field = abs flag) — which is
+        # DETERMINISTIC (no relative-delta accumulation / dropped-move flakiness
+        # the relative path suffered). ax,ay are 0..32767 tablet coords scaled
+        # to the 1280x800 screen. cx,cy = editor content center in px.
+        SCRW = 1280; SCRH = 800
+        ax = (cx * 32768) // SCRW; ay = (cy * 32768) // SCRH
+        # A pure positioning event (dz=0) parks the cursor over the editor.
+        send(f"echo '{ax} {ay} 0 0 1' > /dev/mouse")
+        time.sleep(0.5)
         screendump("term_pre")
-        # WHEEL-UP over the terminal: 4-field line, 4th field dz = +3 (older
-        # rows). Repeat so the scrollback view moves unambiguously.
+        # WHEEL-UP at that ABSOLUTE position: dz=+3, abs flag set. Repeat so the
+        # editor viewport (top_line) moves unambiguously.
         for _ in range(6):
-            send("echo '0 0 0 3' > /dev/mouse")
+            send(f"echo '{ax} {ay} 0 3 1' > /dev/mouse")
             time.sleep(0.2)
         time.sleep(0.8)
         screendump("term_post")
