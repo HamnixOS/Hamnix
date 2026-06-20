@@ -211,8 +211,9 @@ def find_wid(title, timeout):
 def type_into(wid, s):
     # Inject keystrokes directly onto the window's /keys ring as "d <code>"
     # lines (bypasses focus). The terminal forwards each byte to its shell.
+    # hamsh has `echo` (no printf), so emit the literal "d <code>" line.
     for ch in s:
-        send(f"printf 'd %d\\n' {ord(ch)} > /dev/wsys/{wid}/keys")
+        send(f"echo 'd {ord(ch)}' > /dev/wsys/{wid}/keys")
         time.sleep(0.05)
 
 rc = 2
