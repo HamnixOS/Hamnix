@@ -18,12 +18,13 @@
 # typed bytes into a command line, and on Enter ('\n' / '\r') feed the
 # line + '\n' to the shell's stdin. Backspace edits the line.
 #
-# POINTER events arrive on a SEPARATE file (/dev/wsys/<wid>/event, "m <x>
-# <y> ..." lines). A terminal does NOT type its mouse: we NEVER open or
-# render that file, so mousing over the window no longer fills it with
-# "m <x> <y> ..." glyph spam (the old echo-every-event bug). The click
-# that gives us focus is handled entirely by the compositor; we only need
-# keys after that.
+# POINTER events arrive on /dev/wsys/<wid>/event ("m <x> <y> <buttons>
+# <dz>" lines — the in-kernel router pushes pointer lines onto the EVENT
+# ring, NOT a separate /pointer file). A terminal does NOT type its mouse,
+# so x/y/buttons are ignored (no glyph spam) — but the wheel-notch dz (5th
+# field, signed) drives the scrollback view: dz>0 (wheel up) shows OLDER
+# rows, dz<0 walks back toward the live tail. The click that gives us focus
+# is handled entirely by the compositor.
 #
 # Each tick we non-blockingly drain the shell's stdout pipe into a bounded
 # scrollback ring, re-emit our scene (damage-scoped: one commit per change)
@@ -38,10 +39,11 @@ extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_close(fd: int32) -> int32
 extern def sys_get_jiffies() -> uint64
 extern def sys_yield() -> int32
-extern def sys_nanosleep(req: Ptr[int64], rem: Ptr[int64]) -> int64
 extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
 extern def sys_pipe(fds: Ptr[int32]) -> int32
 extern def sys_pipechan() -> int32
+extern def sys_waitfds(fds: Ptr[int32], nfds: uint64,
+                       timeout_ms: int64) -> int64
 extern def sys_fdbind(pid: int32, fdnum: int32, kind: int32,
                       arg: int32) -> int32
 
@@ -599,14 +601,6 @@ def _start_shell() -> int32:
 # shell) get the CPU while we wait. Used by the main loop's bounded readiness
 # poll: every wake we drain BOTH /keys and the shell pipe, so shell output
 # (the new prompt) renders within ~one tick even when no key is pressed.
-term_sleep_ts: Array[2, int64]
-
-
-def _short_sleep_ns(ns: int64):
-    term_sleep_ts[0] = 0                       # tv_sec
-    term_sleep_ts[1] = ns                      # tv_nsec
-    sys_nanosleep(&term_sleep_ts[0], cast[Ptr[int64]](0))
-
 
 # Non-blocking drain of the shell's stdout into the glyph grid. Returns the
 # number of bytes consumed this call (0 = nothing). Sets sh_alive = 0 on EOF.
@@ -861,6 +855,38 @@ evt_buf:   Array[512, uint8]
 evt_carry: uint64 = 0
 
 
+def _evt_apply_wheel(ls: uint64, le: uint64):
+    # Mine the dz (5th) field of an "m <x> <y> <buttons> <dz>" line that
+    # spans evt_buf[ls..le) and fold its wheel notch into the scrollback
+    # view (positive dz = wheel up = OLDER rows). x/y/buttons are ignored.
+    p: uint64 = ls
+    field: int32 = 0
+    while field < 4:                        # walk past type,x,y,buttons
+        while p < le and evt_buf[p] != 32:
+            p = p + 1
+        while p < le and evt_buf[p] == 32:
+            p = p + 1
+        field = field + 1
+    neg: int32 = 0
+    if p < le and evt_buf[p] == 45:         # '-'
+        neg = 1
+        p = p + 1
+    dz: int64 = 0
+    have: int32 = 0
+    while p < le and evt_buf[p] >= 48 and evt_buf[p] <= 57:
+        dz = dz * 10 + cast[int64](evt_buf[p]) - 48
+        p = p + 1
+        have = 1
+    if have != 0 and dz != 0:
+        if neg != 0:
+            dz = 0 - dz
+        _scroll_by(dz)
+        # End-to-end delivery proof (boot console): a wheel notch reached this
+        # window's /event ring and moved the scrollback view. Cheap, idempotent
+        # marker the wheel-scroll gate greps for; harmless in normal use.
+        _writeall(1, cast[Ptr[uint8]]("[hamterm] WHEEL dz applied\n"))
+
+
 def _drain_events_chunk(n: uint64) -> uint64:
     # Parse complete lines out of evt_buf[0..n). Apply 'r <w> <h>' resize.
     # Returns the number of bytes consumed (offset past the last '\n').
@@ -877,6 +903,14 @@ def _drain_events_chunk(n: uint64) -> uint64:
         le: uint64 = i
         i = i + 1                           # consume '\n'
         consumed = i
+        if t == 109:                        # 'm' pointer line: mine the dz
+            # The in-kernel pointer router (_wsys_evt_emit_pointer) delivers
+            # "m <x> <y> <buttons> <dz>" on the /event ring (same ring as the
+            # 'r' resize line), NOT on the separate /pointer file. We consume
+            # ONLY the dz (5th) field and fold its notch into the scrollback
+            # view; x/y/buttons are pointer noise a terminal does not type.
+            _evt_apply_wheel(ls, le)
+            continue
         if t != 114:                        # not 'r' (resize) — ignore
             continue
         # Parse "r <w> <h>".
@@ -906,6 +940,7 @@ def _poll_events(efd: int32) -> int32:
     changed: int32 = 0
     prev_rows: uint64 = term_rows_n
     prev_cols: uint64 = term_cols_n
+    prev_voff: uint64 = term_view_off
     passes: int32 = 0
     while passes < 4:
         room: uint64 = 512 - evt_carry
@@ -926,19 +961,16 @@ def _poll_events(efd: int32) -> int32:
         passes = passes + 1
     if term_rows_n != prev_rows or term_cols_n != prev_cols:
         changed = 1
+    if term_view_off != prev_voff:          # mouse-wheel scrolled the view
+        changed = 1
     return changed
 
 
-# --- mouse-wheel scrollback from /dev/wsys/<wid>/pointer --------------
-# Pointer events arrive as "<type> <x> <y> <buttons> <dz>\n" (devwsys.ad
-# §pointer). We do NOT type the mouse — motion/click lines are ignored —
-# but the wheel notch (dz, the 5th field, signed) drives the scrollback
-# view: dz>0 (wheel up) shows OLDER rows, dz<0 (wheel down) walks back
+# --- mouse-wheel scrollback ------------------------------------------
+# The wheel notch (dz) rides the "m <x> <y> <buttons> <dz>" pointer line on
+# the /event ring (see _evt_apply_wheel above, which _drain_events_chunk
+# calls). dz>0 (wheel up) shows OLDER rows; dz<0 (wheel down) walks back
 # toward the live tail. term_view_off is clamped to [0, sb_count].
-ptr_buf:   Array[512, uint8]
-ptr_carry: uint64 = 0
-
-
 def _scroll_by(notches: int64):
     # Adjust the scrollback view by `notches` rows (positive = older).
     if notches > 0:
@@ -953,79 +985,6 @@ def _scroll_by(notches: int64):
             term_view_off = 0
         else:
             term_view_off = term_view_off - sub
-
-
-def _drain_pointer_chunk(n: uint64) -> uint64:
-    # Parse complete "<t> <x> <y> <buttons> <dz>\n" lines out of ptr_buf.
-    # Only the dz (5th) field of each line matters — fold its notch into
-    # the scrollback view. Returns bytes consumed (offset past last '\n').
-    i: uint64 = 0
-    consumed: uint64 = 0
-    while i < n:
-        ls: uint64 = i
-        # Find end of this line first (so a partial trailing line carries).
-        while i < n and ptr_buf[i] != 10:
-            i = i + 1
-        if i >= n:
-            return ls                       # incomplete line; carry forward
-        le: uint64 = i
-        i = i + 1                           # consume '\n'
-        consumed = i
-        # Skip the type token, then x, y, buttons — the dz is field #5.
-        # Walk forward over exactly four space-separated tokens.
-        p: uint64 = ls
-        field: int32 = 0
-        while field < 4:
-            while p < le and ptr_buf[p] != 32:
-                p = p + 1
-            while p < le and ptr_buf[p] == 32:
-                p = p + 1
-            field = field + 1
-        # p now sits at the start of the dz field (or le if malformed).
-        neg: int32 = 0
-        if p < le and ptr_buf[p] == 45:     # '-'
-            neg = 1
-            p = p + 1
-        dz: int64 = 0
-        have: int32 = 0
-        while p < le and ptr_buf[p] >= 48 and ptr_buf[p] <= 57:
-            dz = dz * 10 + cast[int64](ptr_buf[p]) - 48
-            p = p + 1
-            have = 1
-        if have != 0 and dz != 0:
-            if neg != 0:
-                dz = 0 - dz
-            _scroll_by(dz)
-    return consumed
-
-
-def _poll_pointer(pfd: int32) -> int32:
-    # Non-blocking drain of the pointer ring; apply wheel notches to the
-    # scrollback view. Returns 1 if the view offset changed (caller re-emits).
-    if pfd < 0:
-        return 0
-    prev_off: uint64 = term_view_off
-    passes: int32 = 0
-    while passes < 4:
-        room: uint64 = 512 - ptr_carry
-        if room == 0:
-            ptr_carry = 0
-            room = 512
-        pn: int64 = sys_read_nb(pfd, &ptr_buf[ptr_carry], room)
-        if pn <= 0:
-            break
-        total: uint64 = ptr_carry + cast[uint64](pn)
-        done: uint64 = _drain_pointer_chunk(total)
-        leftover: uint64 = total - done
-        m: uint64 = 0
-        while m < leftover:
-            ptr_buf[m] = ptr_buf[done + m]
-            m = m + 1
-        ptr_carry = leftover
-        passes = passes + 1
-    if term_view_off != prev_off:
-        return 1
-    return 0
 
 
 # Re-emit + commit the scene ONLY when the visible grid actually changed.
@@ -1122,12 +1081,10 @@ def main() -> int32:
     scenep: Array[64, uint8]
     keysp: Array[64, uint8]
     evtp: Array[64, uint8]
-    ptrp: Array[64, uint8]
     _winpath(&ctlp[0], wid, cast[Ptr[uint8]]("/ctl"))
     _winpath(&scenep[0], wid, cast[Ptr[uint8]]("/scene"))
     _winpath(&keysp[0], wid, cast[Ptr[uint8]]("/keys"))
     _winpath(&evtp[0], wid, cast[Ptr[uint8]]("/event"))
-    _winpath(&ptrp[0], wid, cast[Ptr[uint8]]("/pointer"))
 
     # geometry: a 360x200 box, decorated, mid-screen.
     cfd: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
@@ -1168,17 +1125,15 @@ def main() -> int32:
     _writeall(1, cast[Ptr[uint8]]("[term] scene window ready\n"))
 
     # Open the per-window KEY stream (focused-window keys, ASCII bytes).
-    # POINTER events live on a SEPARATE file we deliberately never open —
-    # a terminal types its keyboard, not its mouse.
     kfd: int32 = sys_open(cast[Ptr[char]](&keysp[0]))
-    # BUG 1b: open /event (non-blocking polled) for resize notifications.
+    # BUG 1b + mouse-wheel scrollback: open /event (non-blocking polled).
+    # BOTH the "r <w> <h>" resize line AND the "m <x> <y> <buttons> <dz>"
+    # pointer/wheel line are delivered here by the in-kernel router (the
+    # separate /pointer file is only used by the userland-compositor path,
+    # which the live DE does not drive). We consume the wheel-notch dz field
+    # to scroll the scrollback; pointer x/y/buttons are noise a terminal does
+    # not type.
     efd: int32 = sys_open(cast[Ptr[char]](&evtp[0]))
-    # Mouse-wheel scrollback: open /pointer (non-blocking polled). We never
-    # render pointer motion as glyphs — we consume ONLY the wheel-notch (dz)
-    # field to drive the scrollback view. The compositor delivers a pointer
-    # line to us only when the cursor is over our window, so wheeling over
-    # the terminal scrolls its scrollback.
-    pfd: int32 = sys_open(cast[Ptr[char]](&ptrp[0]))
 
     # BUG 2 (terminal input lag) FIX — EVENT-DRIVEN main loop.
     #
@@ -1263,18 +1218,18 @@ def main() -> int32:
     # and the next prompt did not render until the user pressed a key (the only
     # thing that woke the read). We must wait on BOTH /keys AND sh_out_fd.
     #
-    # There is no epoll syscall exposed to userland in this tree (no
-    # epoll_create/ctl/wait, and /keys is not poll-registerable), so we use the
-    # documented FALLBACK: a NON-BLOCKING keys read + an UNCONDITIONAL
-    # _drain_shell() every iteration, sleeping cooperatively (sys_nanosleep,
-    # which parks off the runqueue — no busy-spin) ONLY when neither source had
-    # data. Result: shell output renders within ~one tick (10 ms floor) with no
-    # follow-up keystroke (#1), and a key's echo commits in the same frame
-    # (#2 — drain keys -> forward -> drain echo -> commit, all in one wake).
+    # A NON-BLOCKING keys read + an UNCONDITIONAL _drain_shell() every
+    # iteration; when BOTH /keys and the shell are idle we BLOCK in
+    # sys_waitfds([keys, shell-stdout]) (both wake-wired via waitfds_notify),
+    # which parks off the runqueue and wakes in ~0ms on a keystroke or shell
+    # byte — no busy-spin and no fixed wake-floor before an echo. Result: shell
+    # output renders within ~one tick with no follow-up keystroke (#1), and a
+    # key's echo commits in the same frame (#2 — drain keys -> forward -> drain
+    # echo -> commit, all in one wake).
     #
     # Idle CPU cost is bounded: when both /keys and the shell are quiet we
     # hlt-sleep one jiffy per loop, identical to a parked blocking read.
-    TERM_IDLE_SLEEP_NS: int64 = 10000000      # 10 ms (1 jiffy at HZ=100)
+    TERM_IDLE_SLEEP_MS: int64 = 10            # /event re-poll cap (1 jiffy)
     while True:
         room: uint64 = 512 - kev_carry
         if room == 0:
@@ -1286,24 +1241,22 @@ def main() -> int32:
         # NON-BLOCKING keys read: 0 = no key this tick (we still drain the
         # shell below), >0 = bytes, <0 = error/EOF (treated as no-data).
         kn: int64 = sys_read_nb(kfd, &kev_buf[kev_carry], room)
-        # BUG 1b: a resize arrives on /event — poll it and re-layout. Force a
-        # scene re-emit on a size change (the grid hash alone wouldn't catch the
-        # fill-size / column-count change, only the row content).
-        if _poll_events(efd) != 0:
+        # BUG 1b + mouse-wheel: BOTH the "r <w> <h>" resize line AND the
+        # "m <x> <y> <buttons> <dz>" pointer line arrive on /event (the
+        # in-kernel router _wsys_evt_emit_pointer pushes pointer lines onto
+        # the EVENT ring, not the separate /pointer file). _poll_events drains
+        # the ring, re-layouts on resize, and folds wheel notches (dz) into
+        # the scrollback view. It returns non-zero when EITHER the grid size
+        # OR the scroll-back view offset changed; force a re-emit + commit so
+        # wheeling is instant even at idle (the grid hash folds term_view_off).
+        evt_changed: int32 = _poll_events(efd)
+        if evt_changed != 0:
             _emit_scene(cast[Ptr[char]](&scenep[0]))
             cfdr: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
             if cfdr >= 0:
                 _writeall(cfdr, cast[Ptr[uint8]]("commit\n"))
                 sys_close(cfdr)
             prev_hash = _grid_hash()
-        # Mouse-wheel scrollback: poll /pointer for wheel notches. A change in
-        # the scroll-back view offset re-emits + commits the scene (the grid
-        # hash folds term_view_off, so _commit_if_changed below would catch it,
-        # but we commit eagerly here so wheeling is instant even at idle).
-        pscrolled: int32 = _poll_pointer(pfd)
-        if pscrolled != 0:
-            prev_hash = _commit_if_changed(cast[Ptr[char]](&scenep[0]),
-                                           cast[Ptr[char]](&ctlp[0]), prev_hash)
         keys_forwarded = 0
         if kn > 0:
             # BUG 3 FIX: parse only COMPLETE "<t> <code>\n" lines; CARRY any
@@ -1348,9 +1301,18 @@ def main() -> int32:
             latb[lp] = 10
             lp = lp + 1
             sys_write(consfd, &latb[0], lp)
-        # Sleep ONLY when this iteration was fully idle (no key, no shell
-        # output, no commit). Otherwise loop immediately so a chatty command
-        # streams at full speed. Cooperative hlt-sleep — no busy-spin.
-        if kn <= 0 and pscrolled == 0 and prev_hash == before:
-            _short_sleep_ns(TERM_IDLE_SLEEP_NS)
+        # Block ONLY when this iteration was fully idle (no key, no shell
+        # output, no commit). Instead of a blind timer sleep — which made a
+        # keystroke landing just after we dozed wait the full 10ms floor (the
+        # residual input lag the user saw) — we BLOCK on {keys, shell-stdout}
+        # via sys_waitfds. Both are wake-wired (wsys_route_key + pipe_write
+        # call waitfds_notify), so a keystroke or shell byte wakes us in ~0ms
+        # for an instant echo. The short timeout only bounds the re-poll of
+        # /event (wheel/resize has no waitfds wake hook), so wheeling at idle
+        # still scrolls within one tick. Off-the-runqueue — no busy-spin.
+        if kn <= 0 and evt_changed == 0 and prev_hash == before:
+            wfds: Array[2, int32]
+            wfds[0] = kfd
+            wfds[1] = sh_out_fd
+            sys_waitfds(&wfds[0], 2, TERM_IDLE_SLEEP_MS)
     return 0
