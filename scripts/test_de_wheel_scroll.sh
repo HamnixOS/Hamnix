@@ -255,7 +255,12 @@ try:
         if geom is None:
             geom = (200, 120, 360, 200)       # default if ctl read failed
         gx, gy, gw, gh = geom
-        cx = gx + gw // 2; cy = gy + gh // 2  # terminal content center
+        # Aim at the terminal's LEFT-center (25px in), not the geometric center:
+        # the editor window (default origin 260,150) overlaps the terminal's
+        # right half and, spawning later, sits on top there — so the right-half
+        # center would route the wheel to the EDITOR. The left strip x<260 is
+        # terminal-exposed. 25px clears the ~4px resize border.
+        cx = gx + 25; cy = gy + gh // 2
         # Emit the real rect so the host-side region-diff targets it exactly.
         print(f"[wheel_gate] TERM_RECT {gx} {gy} {gw} {gh}", file=sys.stderr)
         send(f"echo TERM_RECT {gx} {gy} {gw} {gh}")
@@ -321,16 +326,19 @@ if grep -aq '\[MOUSE_PUMP\] PASS' "$LOG"; then
     echo "[wheel_gate] PASS kernel mouse-pump self-test ([MOUSE_PUMP] PASS)"
 fi
 
-# --- HARD: end-to-end wheel delivery to the terminal app -------------------
-# The terminal prints "[hamterm] WHEEL dz applied" iff a wheel notch with a
-# NONZERO dz reached its /event ring and was parsed (independent of whether
-# there was scrollback to move into). This is the authoritative proof that the
-# router -> /event -> app wheel path works end to end — the bug this gate
-# guards (the wheel did NOTHING) leaves this marker absent.
-if grep -aq '\[hamterm\] WHEEL dz applied' "$LOG"; then
+# --- HARD: end-to-end wheel delivery to a scene app ------------------------
+# The terminal AND editor print "[ham*] WHEEL dz applied" the moment a wheel
+# notch with NONZERO dz reaches their /event ring and moves the view (term
+# scrollback / editor top_line). The notch routes to whichever scene window is
+# under the cursor, so EITHER marker proves the router -> /event -> app wheel
+# path end to end. The bug this gate guards (the wheel did NOTHING) leaves
+# BOTH markers absent.
+if grep -aqE '\[hamterm\] WHEEL dz applied' "$LOG"; then
     echo "[wheel_gate] PASS terminal received + parsed a wheel notch (dz) on /event end-to-end"
+elif grep -aqE '\[hamedit\] WHEEL dz applied' "$LOG"; then
+    echo "[wheel_gate] PASS editor received + parsed a wheel notch (dz) on /event end-to-end (editor was under the cursor)"
 else
-    echo "[wheel_gate] FAIL terminal never reported a wheel dz — the notch did not reach the app via /event (regression)" >&2
+    echo "[wheel_gate] FAIL no scene app reported a wheel dz — the notch did not reach any app via /event (regression)" >&2
     fail=1
 fi
 
