@@ -8,9 +8,13 @@
 # (the user-reported "Bottom does nothing" bug). This gate boots the real
 # image and PROVES the live behaviour from the framebuffer:
 #
-#   A. POSITION. Rewriting /etc/panel.conf to a BOTTOM edge moves the panel:
-#      the top band (y=0..26) loses its panel pixels and the bottom band
-#      (y=sh-26..sh) gains them, WITHOUT a panel restart (live reload).
+#   A. POSITION. Rewriting the runtime config (/tmp/hamnix-panel.conf — the
+#      WRITABLE tmpfs override the panel prefers over the read-only shipped
+#      /etc/panel.conf) to a BOTTOM edge moves the panel: the top band
+#      (y=0..26) loses its panel pixels and the bottom band (y=sh-26..sh)
+#      gains them, WITHOUT a panel restart (live reload). The sysroot /etc is
+#      NOT writable from the DE — writing there was the silent no-op that made
+#      "Bottom does nothing" while the (tmp-backed) wallpaper worked.
 #   B. SYSMON TOGGLE. Removing the sysmon widget changes the right side of
 #      the (top) panel band.
 #   C. MULTI-PANEL / EDGE / FONT config PARSES + renders (no crash, panel
@@ -169,16 +173,16 @@ try:
         wait_for("scene windows ready", 60)
         time.sleep(8)
         screendump("top")
-        # LIVE: flip the panel to the BOTTOM edge by rewriting the config.
-        # hamsh + the panel share the sysroot /etc, so the panel's
-        # _cfg_changed poll picks this up within ~1s and moves the window.
+        # LIVE: flip the panel to the BOTTOM edge by rewriting the writable
+        # runtime override in tmpfs; the panel's _cfg_changed poll picks this
+        # up within ~1s and moves the window (no restart).
         send("echo PANELCFG_BOTTOM")
-        send("printf 'panel main\\n  edge bottom\\n  widget menu\\n  widget tasks\\n  widget clock\\nend\\n' > /etc/panel.conf")
+        send("printf 'panel main\\n  edge bottom\\n  widget menu\\n  widget tasks\\n  widget clock\\nend\\n' > /tmp/hamnix-panel.conf")
         time.sleep(4)
         screendump("bottom")
         # LIVE: a vertical LEFT panel + bold font — must parse + render.
         send("echo PANELCFG_LEFT")
-        send("printf 'panel side\\n  edge left\\n  size 64\\n  font bold\\n  widget menu\\n  widget tasks\\nend\\n' > /etc/panel.conf")
+        send("printf 'panel side\\n  edge left\\n  size 64\\n  font bold\\n  widget menu\\n  widget tasks\\nend\\n' > /tmp/hamnix-panel.conf")
         time.sleep(4)
         screendump("left")
         for _ in range(12):
