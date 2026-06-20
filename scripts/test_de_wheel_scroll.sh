@@ -249,32 +249,30 @@ try:
         # Settle: the auto-launched terminal runs its `echo NS_OK; ls /`
         # startup probe; let that stream into the grid so there is content.
         time.sleep(10)
-        twid = find_wid("Terminal", 40)
-        print(f"[wheel_gate] driver: terminal wid={twid}", file=sys.stderr)
-        geom = read_geom(twid, 30) if twid > 0 else None
+        # Target the EDITOR window: it is the LAST scene app the DE launches,
+        # so it sits ON TOP (the terminal/fm/calc are behind it where they
+        # overlap), which makes the window under the cursor DETERMINISTIC. The
+        # editor opens "(unnamed)" empty, so we first inject many lines of text
+        # onto its /keys ring (each printable byte + Enter) — far more than its
+        # ~13 visible rows — so a wheel notch has somewhere to scroll top_line.
+        ewid = find_wid("Editor", 40)
+        print(f"[wheel_gate] driver: editor wid={ewid}", file=sys.stderr)
+        geom = read_geom(ewid, 30) if ewid > 0 else None
         if geom is None:
-            geom = (200, 120, 360, 200)       # default if ctl read failed
+            geom = (260, 150, 300, 240)       # default if ctl read failed
         gx, gy, gw, gh = geom
-        # Aim at the terminal's LEFT-center (25px in), not the geometric center:
-        # the editor window (default origin 260,150) overlaps the terminal's
-        # right half and, spawning later, sits on top there — so the right-half
-        # center would route the wheel to the EDITOR. The left strip x<260 is
-        # terminal-exposed. 25px clears the ~4px resize border.
-        cx = gx + 25; cy = gy + gh // 2
-        # Emit the real rect so the host-side region-diff targets it exactly.
+        cx = gx + gw // 2; cy = gy + gh // 2  # editor content center
         print(f"[wheel_gate] TERM_RECT {gx} {gy} {gw} {gh}", file=sys.stderr)
         send(f"echo TERM_RECT {gx} {gy} {gw} {gh}")
         send("echo WHEEL_BEGIN")
-        # GENERATE DEEP SCROLLBACK so there is something to scroll back INTO:
-        # type a many-line command into the terminal's shell. `ls -la /usr/bin`
-        # prints far more than the ~13 visible rows, filling the scrollback ring.
-        if twid > 0:
-            type_into(twid, "ls -la /usr/bin /bin /sbin\n")
-            time.sleep(3)
-        # Drive the PS/2-relative cursor onto the terminal CONTENT center. The
-        # live cursor may be anywhere (boot self-test moved it), so first ANCHOR
-        # it at the top-left screen corner (large negative deltas clamp to 0,0),
-        # then step DOWN-RIGHT to (cx,cy) in ~15px increments.
+        if ewid > 0:
+            # Type 30 short numbered lines (e.g. "L0\nL1\n...") so the document
+            # is far taller than the viewport — scrollable.
+            doc = "".join(f"L{i}\n" for i in range(30))
+            type_into(ewid, doc)
+            time.sleep(2)
+        # Drive the PS/2-relative cursor onto the editor CONTENT center. Anchor
+        # at (0,0) (large negative deltas clamp), then step down-right.
         for _ in range(24):
             send("echo '-120 -120 0' > /dev/mouse")   # anchor at (0,0)
             time.sleep(0.05)
@@ -325,6 +323,12 @@ fail=0
 if grep -aq '\[MOUSE_PUMP\] PASS' "$LOG"; then
     echo "[wheel_gate] PASS kernel mouse-pump self-test ([MOUSE_PUMP] PASS)"
 fi
+
+# --- kernel routing diagnostic (TEMP_DEBUG_WHEEL) --------------------------
+# The kernel logs "[wsys-wheel] route dz=.. -> wid=.." when it forwards a wheel
+# notch to a window, or "no target" when the cursor was over no window. Surface
+# whichever fired so a failure is diagnosable (routing vs cursor placement).
+grep -aoE '\[wsys-wheel\][^\\]*' "$LOG" 2>/dev/null | sort | uniq -c | sed 's/^/[wheel_gate] kdiag: /' || true
 
 # --- HARD: end-to-end wheel delivery to a scene app ------------------------
 # The terminal AND editor print "[ham*] WHEEL dz applied" the moment a wheel
