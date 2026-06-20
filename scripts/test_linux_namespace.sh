@@ -135,6 +135,14 @@ set +e
     printf 'enter debian { /bin/cat /etc/debian_version }\n'; sleep 3
     printf 'echo BANNER_ALIAS_END\n'; sleep 1
 
+    # 6. UNDEFINED template must LOUDLY refuse and NOT run the body in
+    #    the current namespace (the silent-no-op bug). The body prints a
+    #    sentinel; if it appears, the body ran (regression). The stderr
+    #    error string "enter: not a namespace:" MUST appear.
+    printf 'echo BANNER_UNDEF_START\n'; sleep 1
+    printf 'enter foobar { echo BODY_RAN_IN_CURRENT_NS }\n'; sleep 2
+    printf 'echo BANNER_UNDEF_END\n'; sleep 1
+
     printf 'echo BANNER_DONE\n'; sleep 1
     printf 'exit\n'; sleep 1
 ) | timeout 60s qemu-system-x86_64 \
@@ -273,6 +281,25 @@ check_banner_post_enter_value "BANNER_LS_DOT_START" "bin" \
 # 5. debian alias resolves the same backing tree.
 check_banner_value "BANNER_ALIAS_START" "12.4" \
                    "enter debian alias also reads distro"
+
+# 6. Undefined-template enter: LOUD error fires, body does NOT run.
+#    This is the silent-no-op root-cause fix (exec_enter refuses a
+#    non-VT_NS name instead of running the body in the current ns).
+check_banner_value "BANNER_UNDEF_START" "not a namespace" \
+                   "enter foobar { } prints loud 'not a namespace' error"
+check_banner_absent "BANNER_UNDEF_START" "BODY_RAN_IN_CURRENT_NS" \
+                   "enter foobar { } does NOT run the body in current ns"
+
+# 7. rc.de-user now exposes the linux/debian templates (DE terminal can
+#    enter the Linux ns from the desktop). Static grep — no boot needed.
+if grep -Eq "^linux = ns clean \{" etc/rc.de-user \
+   && grep -Eq "^debian = ns clean \{" etc/rc.de-user \
+   && grep -q "bind '#distro' /" etc/rc.de-user; then
+    echo "[test_linux_namespace] OK: rc.de-user defines linux+debian (#distro) templates"
+else
+    echo "[test_linux_namespace] FAIL: rc.de-user missing linux/debian #distro templates"
+    fail=1
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_linux_namespace] FAIL (qemu rc=$rc)"
