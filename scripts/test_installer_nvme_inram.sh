@@ -215,7 +215,10 @@ check_b() {
 check_b "$KERNEL_BANNER" "installer media: kernel banner (EFI stub -> kernel)"
 # rc.boot auto-detected the installer medium and started the installer
 # itself (no keyboard needed) — this is the keyboard-less auto-run gate.
-check_b 'installer medium detected -- auto-running' \
+# rc.boot emits "install target present -- auto-running /etc/install_nvme.hamsh"
+# when it auto-runs the installer on the keyboard-less target. (Older builds
+# printed "installer medium detected -- ..."; accept either.)
+check_b 'auto-running /etc/install_nvme.hamsh|installer medium detected -- auto-running' \
         "rc.boot auto-ran the installer (no keyboard)"
 # The installer medium marker made the kernel skip ALL media USB bring-up.
 check_b 'installer medium .in-RAM squashfs.: USB root bring-up SKIPPED entirely' \
