@@ -3598,6 +3598,28 @@ def build_archive() -> bytes:
               f"`make -C tests/u-binary/src/musl_busybox install` to "
               f"stage the fixture.")
 
+    # PROVENANCE marker for /var/lib/distros/default/ (the #distro
+    # backing the `enter linux { ... }` recipe freezes to in -kernel /
+    # test builds). This file exists ONLY in the distro tree, never at
+    # the native cpio root, so it is the deterministic needle the
+    # isolation gates (test_enter_linux_distro_root.sh,
+    # test_enter_linux_two_spawns.sh) grep for to prove `enter linux
+    # { ls / }` is a SEPARATE file server from the native `/`. Mirrors
+    # build_rootfs_img.py::_plant_distro_provenance for the live image.
+    # Skipped only in cpio_lean mode (the slice rides on rootfs.img,
+    # which already plants its own PROVENANCE).
+    if not cpio_lean:
+        prov = (b"hamnix-distro-namespace: Debian-shape root "
+                b"(/var/lib/distros/default, cpio fixture)\n"
+                b"This tree backs '#distro' / inside "
+                b"`enter linux { ... }`.\n"
+                b"It is a SEPARATE file server from the native "
+                b"Hamnix '/'.\n")
+        blob += cpio_entry("/var/lib/distros/default/PROVENANCE",
+                           prov, mode=0o100644)
+        print("  planted /var/lib/distros/default/PROVENANCE "
+              "(distro-only isolation needle)")
+
     # Distro-shape backing trees. Walk every subdirectory under
     # tests/distros/ and embed each file at
     # /var/lib/distros/<distro>/<rel-path>. Mirrors the etc/ glob's
