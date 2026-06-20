@@ -878,6 +878,29 @@ LINUX_BRK_CHUNK:   uint64 = 4194304        # 2^10 * 4096 = 4 MiB per chunk
 LINUX_BRK_CHUNKS:  uint64 = 8              # 8 × 4 MiB = 32 MiB total
 LINUX_BRK_RESERVE: uint64 = 33554432       # 8 × 4 MiB = 32 MiB
 
+# DIRECT-MAP ALIASING FIX (2026-06-19): the brk arena's USER virtual base.
+# The 32 MiB reservation's PHYSICAL backing comes from low alloc_pages RAM,
+# but its USER virtual address now lives HIGH — above the 4 GiB kernel
+# direct-map, alongside the ET_DYN load-bias (4 GiB) / interp (5 GiB) ASLR
+# windows (arch/x86/kernel/syscall.ad). Identity-mapping the brk at its low
+# physical address made the 32 MiB heap window alias the exact frames the
+# buddy/page allocator hands back to the kernel, which is the root of the
+# 2nd-Linux-spawn ET_DYN-vs-direct-map supervisor #PF (cr2 LOW, pte[0]=0).
+# Decoupling vaddr from phys (high VA -> low phys) restores the invariant
+# that no frame is reachable through BOTH a live user mapping and a free /
+# kernel-writable direct-map slot at the same translation.
+#
+# 6 GiB base: image=[4,5) GiB, interp=[5,6) GiB, brk=[6 GiB, 6 GiB+32 MiB).
+# The whole 32 MiB span sits inside ONE 1 GiB PDPT slot (PDPT[6] of PML4[0])
+# and never crosses a 1 GiB boundary, so elf_install_user_range lays it down
+# in a single per-task PD/PT subtree. The mmap window is [1 GiB, ~1.25 GiB)
+# (mm/vma.ad VMA_LARGE_BASE + slide), so brk is clear of it too. glibc-malloc
+# only cares that brk_base..brk_max is one virtually-contiguous arena; the
+# high VA satisfies that exactly as the old low identity VA did, and
+# copy_to/from_user (mm/uaccess.ad) PML4-walks the high VA to its low phys
+# so kernel-side derefs of brk pointers keep working.
+LINUX_BRK_VBASE:   uint64 = 0x180000000    # 6 GiB
+
 # SYS_set_tid_address state. Linux records the user pointer so that on
 # task exit the kernel can clear it (and futex-wake the parent waiting
 # on CLONE_CHILD_CLEARTID). We don't have per-task storage for it
@@ -6092,8 +6115,16 @@ def _u_unimpl_brk(a0: uint64, a1: uint64, a2: uint64,
         region: uint64 = alloc_pages(LINUX_BRK_ORDER)
         if region == 0:
             return 0                                  # OOM — return 0 brk
-        base = region
-        end_v: uint64 = base + LINUX_BRK_CHUNK
+        # DIRECT-MAP ALIASING FIX: `region` is the LOW physical base of
+        # the reservation; `base` is the HIGH user virtual base the heap
+        # is exposed at (decoupled from phys — see LINUX_BRK_VBASE). The
+        # contiguity check below stays on the PHYSICAL chunks (the buddy
+        # allocator returns physical addresses); the virtual range is
+        # contiguous by construction because we map a single linear span.
+        phys_base: uint64 = region
+        phys_end:  uint64 = region + LINUX_BRK_CHUNK
+        base = LINUX_BRK_VBASE
+        chunks_got: uint64 = 1
         n: uint64 = 1
         while n < LINUX_BRK_CHUNKS:
             nxt: uint64 = alloc_pages(LINUX_BRK_ORDER)
@@ -6101,31 +6132,33 @@ def _u_unimpl_brk(a0: uint64, a1: uint64, a2: uint64,
                 # OOM partway through — keep what we got, the heap will
                 # just be smaller. Better than failing the whole exec.
                 n = LINUX_BRK_CHUNKS                  # break
-            elif nxt != end_v:
-                # Non-contiguous landing. Free the orphan chunk so we
-                # don't leak it, then stop with the contiguous prefix.
-                # We don't try to retry: the page allocator's free
-                # lists are FIFO so a second attempt would likely land
-                # the same place.
+            elif nxt != phys_end:
+                # Non-contiguous PHYSICAL landing. Free the orphan chunk
+                # so we don't leak it, then stop with the contiguous
+                # prefix. We don't try to retry: the page allocator's
+                # free lists are FIFO so a second attempt would likely
+                # land the same place.
                 printk1("linux_u: brk non-contiguous after %d chunk(s); shorter heap\n", n)
                 free_pages(nxt, LINUX_BRK_ORDER)
                 n = LINUX_BRK_CHUNKS                  # break
             else:
-                end_v = end_v + LINUX_BRK_CHUNK
+                phys_end = phys_end + LINUX_BRK_CHUNK
+                chunks_got = chunks_got + 1
                 n = n + 1
+        # Virtual span = number of physically-contiguous chunks obtained.
+        end_v: uint64 = base + chunks_got * LINUX_BRK_CHUNK
         set_task_brk_base(cur, base)
         set_task_brk_end(cur, base)
         set_task_brk_max(cur, end_v)
-        # M16.36: install per-task PT entries for the entire reserved
-        # range [brk_base, brk_max). The reservation is identity-shape
-        # (vaddr == phys via alloc_pages), but each leaf PTE now lives
-        # in this task's OWN PD/PT instead of being aliased onto the
-        # BSP 1 GiB PS=1 stamp. After this, glibc-malloc's brk-grow
-        # path resolves through a 4 KiB PTE rather than the shared
-        # identity entry — matching the rest of the task's address
-        # space and surviving a future Plan-9 lower-half scrub.
+        # M16.36 + aliasing fix: install per-task PT entries mapping the
+        # HIGH virtual range [brk_base, brk_max) onto the LOW physical
+        # reservation [phys_base, phys_base + span). Each leaf PTE lives
+        # in this task's OWN PD/PT; the high VA keeps the brk window out
+        # of the kernel direct-map's low identity band so the heap can
+        # never alias an allocator frame the kernel later writes.
         brk_pml4: uint64 = task_pml4(cast[int32](cur))
-        if elf_install_user_heap(brk_pml4, base, end_v - base) < 0:
+        if elf_install_user_heap(brk_pml4, base, end_v - base,
+                                 phys_base) < 0:
             printk0("brk: heap PT-install failed; reservation kept but unmapped\n")
             # The caller will fault on the next dereference; better to
             # surface the OOM than to silently lie. Leave brk_end at
