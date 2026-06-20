@@ -213,6 +213,152 @@ def _stage_real_debian(staging: Path, src_root: Path) -> tuple[int, int]:
     return n_files, n_bytes
 
 
+# Subtrees pruned when mirroring the FULL debootstrap tree. Pure
+# runtime/scratch mounts (the linux ns binds #c,#p,#s etc. over them
+# anyway) or many MiB of locale/doc/man that burn live-boot RAM without
+# changing what `ls /` shows. Each entry is RELATIVE to the debootstrap
+# root. Pruning keeps the live RAM image practical while the tree stays
+# unmistakably Debian (real coreutils/bash/apt/dpkg + Debian layout).
+FULL_DEBIAN_PRUNE = {
+    "proc", "sys", "dev", "run", "tmp", "mnt", "media", "boot", "srv",
+    "usr/share/doc", "usr/share/man", "usr/share/locale",
+    "usr/share/info", "usr/share/zoneinfo", "usr/share/i18n",
+    "usr/share/common-licenses",
+    "var/cache", "var/log",
+    # apt's downloaded package-index lists (~55 MiB) are pure cache — an
+    # `apt update` re-fetches them. The installed-package DB (var/lib/
+    # dpkg) is KEPT: it is genuinely part of looking like Debian.
+    "var/lib/apt/lists",
+}
+
+# Debian usrmerge: these top-level names are DIRECTORY symlinks into
+# /usr (e.g. /bin -> usr/bin). The kernel's ext4/distrofs path does not
+# walk directory-component symlinks, so they are recreated as REAL
+# directories duplicating their /usr target (the only way a lookup of
+# /bin/ls or /lib64/ld-linux-x86-64.so.2 resolves with no symlink walk).
+#
+# /bin and /sbin alias every executable (cheap, all referenced by PATH).
+# /lib aliases ONLY the shared-object closure dir (x86_64-linux-gnu) +
+# the dynamic linker — the rest of /usr/lib (apt/, dpkg/, perl5/, ...)
+# is referenced exclusively via /usr/lib/... paths, never /lib/..., so
+# duplicating it would waste ~17 MiB of boot RAM for no resolution
+# benefit. A None value means "whole target"; a tuple means "only these
+# child subdirs of the target".
+USRMERGE_DIR_LINKS = {
+    "bin": None,
+    "sbin": None,
+    "lib": ("x86_64-linux-gnu",),
+    "lib64": None,
+}
+
+
+def _copy_tree_deref(src: Path, dst: Path, prune_abs: set) -> tuple[int, int]:
+    """Copy a directory subtree, NOT following directory symlinks (so no
+    usrmerge re-walk / cycles). Regular files are copied; file symlinks
+    are dereferenced to their target bytes when that target is a regular
+    file (the kernel can't follow them either); special files and
+    dangling links are skipped. Returns (files, bytes)."""
+    n_files = 0
+    n_bytes = 0
+    for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
+        d = Path(dirpath)
+        rel_dir = d.relative_to(src)
+        # Prune declared subtrees + any nested directory symlink (avoid
+        # re-walking /usr through an alias). Keep file symlinks (handled
+        # below); only directory symlinks are dropped from the descent.
+        kept = []
+        for dn in dirnames:
+            child = d / dn
+            if child.resolve() in prune_abs:
+                continue
+            if child.is_symlink():
+                continue          # don't descend a dir symlink
+            kept.append(dn)
+        dirnames[:] = kept
+        (dst / rel_dir).mkdir(parents=True, exist_ok=True)
+        for fn in filenames:
+            sp = d / fn
+            try:
+                st = sp.stat()    # follow a file symlink to its target
+            except OSError:
+                continue          # dangling / unreadable
+            if st.st_mode & 0o170000 != 0o100000:
+                continue          # not a regular file
+            try:
+                data = sp.read_bytes()
+            except (OSError, PermissionError):
+                continue
+            op = dst / rel_dir / fn
+            op.write_bytes(data)
+            op.chmod(0o755 if st.st_mode & 0o111 else 0o644)
+            n_files += 1
+            n_bytes += len(data)
+    return n_files, n_bytes
+
+
+def _stage_real_debian_full(staging: Path, src_root: Path) -> tuple[int, int]:
+    """Mirror the debootstrap tree into `staging` so `enter linux
+    { ls / }` shows a genuine Debian root (real /bin/ls, /bin/bash,
+    coreutils, apt, dpkg, /etc/debian_version, /var/lib/dpkg, the full
+    shared-object closure under /usr/lib, ...) that is materially
+    distinct from the native Hamnix root — not a one-marker stub.
+
+    Strategy (no symlink cycles, no double-count):
+      1. Copy every NON-symlink top-level subtree verbatim (usr, etc,
+         var, root, home, opt), pruning FULL_DEBIAN_PRUNE.
+      2. Recreate the four usrmerge directory symlinks (/bin,/sbin,/lib,
+         /lib64) as REAL directories mirroring their /usr targets, so the
+         kernel resolves /bin/ls and /lib64/ld-linux-x86-64.so.2 with no
+         directory-symlink walk.
+
+    Returns (entries_planted, bytes_planted).
+    """
+    prune_abs = {(src_root / p).resolve() for p in FULL_DEBIAN_PRUNE}
+    n_files = 0
+    n_bytes = 0
+    # 1. Top-level non-symlink subtrees (and top-level regular files).
+    for entry in sorted(src_root.iterdir()):
+        name = entry.name
+        if entry.resolve() in prune_abs:
+            continue
+        if entry.is_symlink():
+            continue              # usrmerge dir links handled in step 2
+        if entry.is_dir():
+            f, b = _copy_tree_deref(entry, staging / name, prune_abs)
+            n_files += f
+            n_bytes += b
+        elif entry.is_file():
+            data = entry.read_bytes()
+            (staging / name).write_bytes(data)
+            (staging / name).chmod(
+                0o755 if entry.stat().st_mode & 0o111 else 0o644)
+            n_files += 1
+            n_bytes += len(data)
+    # 2. usrmerge aliases -> real directories duplicating the /usr target
+    #    (whole target, or only the named child subdirs for /lib).
+    for link, only_children in USRMERGE_DIR_LINKS.items():
+        lp = src_root / link
+        if not lp.is_symlink():
+            continue
+        target = (src_root / os.readlink(lp))
+        if not target.is_dir():
+            continue
+        if only_children is None:
+            f, b = _copy_tree_deref(target, staging / link, prune_abs)
+            n_files += f
+            n_bytes += b
+        else:
+            (staging / link).mkdir(parents=True, exist_ok=True)
+            for child in only_children:
+                csrc = target / child
+                if csrc.is_dir():
+                    f, b = _copy_tree_deref(
+                        csrc, staging / link / child, prune_abs)
+                    n_files += f
+                    n_bytes += b
+    return n_files, n_bytes
+
+
 def _stage_busybox(staging: Path) -> bool:
     """Plant musl-static-PIE busybox + applet symlinks at the image root.
 
@@ -391,23 +537,71 @@ def _stage_sysroot_etc(sysroot: Path) -> int:
     return n
 
 
+def _plant_distro_provenance(distro: Path) -> None:
+    """Plant a PROVENANCE marker file at the distro root.
+
+    This file exists ONLY in the Debian distro tree, never in the native
+    Hamnix sysroot. It is the cheapest unambiguous proof that
+    `enter linux { ls / }` is bound to a DIFFERENT file server than the
+    user-mode `/` (the isolation gate asserts it appears in the linux ns
+    and is ABSENT from the native root). The bulk content differs too
+    (real Debian coreutils/apt/dpkg vs native Adder tools); this marker
+    is just the single deterministic needle the serial gates grep for.
+    """
+    (distro / "PROVENANCE").write_text(
+        "hamnix-distro-namespace: real Debian root (debootstrap minbase)\n"
+        "This tree backs '#distro' / inside `enter linux { ... }`.\n"
+        "It is a SEPARATE file server from the native Hamnix '/'.\n",
+        encoding="ascii")
+
+
 def _stage_distro(distro: Path) -> None:
-    """Stage the distro/ subtree: real Debian closure + busybox."""
+    """Stage the distro/ subtree: a genuine Debian root + busybox fallback.
+
+    Content selection (most-faithful first):
+      * HAMNIX_DEFAULT_REAL_DEBIAN in {0,off,no,""} -> busybox only.
+      * else, when the debootstrap tree (tests/distros/debian-minbase/
+        rootfs) is present:
+          - HAMNIX_DEBIAN_FULL!=0 (default): mirror the WHOLE tree (minus
+            bulky locale/doc/man + runtime mounts) so `ls /` is a real
+            Debian root. This is what the user asked for: a `/` that
+            looks like Debian and shares NOTHING with the native root.
+          - HAMNIX_DEBIAN_FULL=0: stage only the curated apt/dpkg closure
+            (the lean legacy slice) for size-constrained builds.
+      * else (no debootstrap tree on this host): busybox only, and the
+        Debian-shape skeleton dirs from _stage_busybox keep the tree
+        recognisably non-native.
+
+    A PROVENANCE marker is ALWAYS planted (even busybox-only) so the
+    isolation gates have a deterministic distro-only needle.
+    """
     minbase = HERE / "tests" / "distros" / "debian-minbase" / "rootfs"
     real_debian_raw = os.environ.get("HAMNIX_DEFAULT_REAL_DEBIAN", "1")
+    full_raw = os.environ.get("HAMNIX_DEBIAN_FULL", "1")
+    want_full = full_raw not in ("0", "", "off", "no")
     if real_debian_raw in ("0", "", "off", "no"):
         print(f"[build_rootfs_img] HAMNIX_DEFAULT_REAL_DEBIAN={real_debian_raw}: "
               f"skipping real Debian closure", flush=True)
     elif not minbase.is_dir():
         print(f"[build_rootfs_img] WARN: {minbase.relative_to(HERE)} "
-              f"absent — distro/ subtree will contain only busybox",
+              f"absent — distro/ subtree will contain only busybox "
+              f"(run tests/distros/debian-minbase/BUILD.sh for a real "
+              f"Debian root)", flush=True)
+    elif want_full:
+        n, b = _stage_real_debian_full(distro, minbase)
+        print(f"[build_rootfs_img] mirrored FULL Debian root: {n} files "
+              f"({b/(1<<20):.1f} MiB) into distro/ from "
+              f"{minbase.relative_to(HERE)} (real /bin/ls,/bin/bash,apt,"
+              f"dpkg; usrmerge dereferenced; locale/doc/man pruned)",
               flush=True)
     else:
         n, b = _stage_real_debian(distro, minbase)
-        print(f"[build_rootfs_img] staged {n} Debian apt/dpkg files "
+        print(f"[build_rootfs_img] staged {n} curated Debian apt/dpkg files "
               f"({b/(1<<20):.1f} MiB) into distro/ from "
-              f"{minbase.relative_to(HERE)}", flush=True)
+              f"{minbase.relative_to(HERE)} (HAMNIX_DEBIAN_FULL=0)",
+              flush=True)
     _stage_busybox(distro)
+    _plant_distro_provenance(distro)
 
 
 def _stage_directory(staging: Path):
