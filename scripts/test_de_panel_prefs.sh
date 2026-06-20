@@ -31,13 +31,16 @@ PANEL=user/hampanelscene.ad
 CORE=kernel/sched/core.ad
 SYSCALL=arch/x86/kernel/syscall.ad
 
-# --- 1a. The panel PARSES the position line (no longer ignores it) ----
-if grep -q 'panel_bottom' "$PANEL" \
+# --- 1a. The panel PARSES the position/edge line (no longer ignores it) ----
+# (The configurable-panels rewrite generalized panel_bottom into a per-panel
+# `edge` with EDGE_TOP/EDGE_BOTTOM; the legacy `position bottom` line still
+# parses for back-compat.)
+if grep -qE 'EDGE_BOTTOM|panel_bottom' "$PANEL" \
         && grep -q '"position"' "$PANEL" \
         && grep -q '"bottom"' "$PANEL"; then
-    passed "hampanelscene parses the panel position (top/bottom)"
+    passed "hampanelscene parses the panel position/edge (top/bottom)"
 else
-    failed "hampanelscene does not parse the position line"
+    failed "hampanelscene does not parse the position/edge line"
 fi
 
 # Guard against the old dead-ignore comment regressing back in.
