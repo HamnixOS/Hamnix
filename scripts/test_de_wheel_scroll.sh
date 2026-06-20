@@ -189,22 +189,24 @@ def screendump(label):
 
 def find_wid(title, timeout):
     # cat /dev/wsys/windows ("<wid> <title>" lines) and return the wid of the
-    # window whose title contains `title`. Marker-framed so we can scrape it.
+    # window whose title is `title`. The serial console echoes the typed
+    # command char-by-char (so the literal markers appear in the echo too) and
+    # the boot floods [aslr] lines; we therefore do NOT split on the markers —
+    # we regex the WHOLE captured buffer for a clean "<digits> <title>" line
+    # (the cat output) and take the LAST match.
+    import re
     deadline = time.time() + timeout
+    pat = re.compile(r'(?m)^\s*(\d+)\s+' + re.escape(title) + r'\s*$')
     while time.time() < deadline:
         with lock:
             del buf[:]                       # clear so we read a fresh dump
-        send("echo WINS_BEGIN; cat /dev/wsys/windows; echo WINS_END")
-        if wait_for("WINS_END", 6):
-            with lock:
-                txt = bytes(buf).decode("latin1", "replace")
-            seg = txt.split("WINS_BEGIN", 1)[-1].split("WINS_END", 1)[0]
-            for ln in seg.splitlines():
-                ln = ln.strip()
-                if title in ln:
-                    tok = ln.split()
-                    if tok and tok[0].isdigit():
-                        return int(tok[0])
+        send("cat /dev/wsys/windows")
+        time.sleep(2)
+        with lock:
+            txt = bytes(buf).decode("latin1", "replace")
+        m = list(pat.finditer(txt))
+        if m:
+            return int(m[-1].group(1))
         time.sleep(1)
     return -1
 
@@ -237,12 +239,18 @@ try:
         if twid > 0:
             type_into(twid, "ls -la /usr/bin /bin /sbin\n")
             time.sleep(3)
-        # Drive the PS/2-relative cursor onto the terminal's middle. Use the
-        # default geometry (content origin ~200,120, size 360x200) — the
-        # accumulated deltas overshoot toward it then settle.
-        for _ in range(12):
-            send("echo '40 30 0' > /dev/mouse")
-            time.sleep(0.12)
+        # Drive the PS/2-relative cursor onto the terminal's MIDDLE. The live
+        # cursor may be anywhere (boot self-test moved it), so first ANCHOR it
+        # at the top-left screen corner (large negative deltas clamp to 0,0),
+        # then step DOWN-RIGHT a known amount to the terminal center. The
+        # terminal sits at the DEFAULT geometry (content origin ~200,120, size
+        # 360x200, center ~380,220): +380,+220 from (0,0) lands inside it.
+        for _ in range(20):
+            send("echo '-120 -120 0' > /dev/mouse")  # anchor at (0,0)
+            time.sleep(0.06)
+        for _ in range(13):
+            send("echo '30 17 0' > /dev/mouse")       # -> ~(390,221)
+            time.sleep(0.1)
         time.sleep(0.6)
         screendump("term_pre")
         # WHEEL-UP over the terminal: 4-field line, 4th field dz = +3 (older
