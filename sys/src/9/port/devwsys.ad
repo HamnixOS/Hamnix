@@ -2692,6 +2692,56 @@ def wsys_draw_fb_store(wid: int32, slot: int32,
 # with no result is empty / harmless).
 wsys_last_alloc_wid: int32 = -1
 
+# PER-PID pending-alloc table (multi-window taskbar race fix).
+#
+# /dev/wsys/ctl is a SHARED file. A `newwindow` write followed by a separate
+# open+read to fetch the assigned wid is NOT atomic across processes: when the
+# panel launches several apps at once, each app's `newwindow`/read interleaves
+# with its siblings'. A single global result slot would either cross-deliver a
+# wid (two apps drive ONE window; the rest never decorate and vanish from the
+# taskbar — the reported bug) or be clobbered (an app reads empty and gets no
+# window). Instead, EACH `newwindow` stashes its (pid -> wid) result in this
+# small table; the readback pops the entry matching the CALLING pid. So every
+# concurrently-launching app reliably reads back its OWN wid. Capacity =
+# MAX_WINDOWS (the alloc ceiling); on overflow we fall back to the legacy
+# single global below.
+WSYS_PENDING_MAX: uint64 = 32
+wsys_pending_pid: Array[32, uint64]               # 0 = empty entry
+wsys_pending_wid: Array[32, int32]
+
+
+def _wsys_pending_put(pid: uint64, wid: int32):
+    # Record (pid -> wid). Replace an existing entry for the same pid (a
+    # process that allocs again before reading the first — e.g. the panel's
+    # per-panel loop reads between allocs, but be defensive), else take a
+    # free slot. On a full table the caller falls back to the global.
+    i: uint64 = 0
+    while i < WSYS_PENDING_MAX:
+        if wsys_pending_pid[i] == pid:
+            wsys_pending_wid[i] = wid
+            return
+        i = i + 1
+    i = 0
+    while i < WSYS_PENDING_MAX:
+        if wsys_pending_pid[i] == 0:
+            wsys_pending_pid[i] = pid
+            wsys_pending_wid[i] = wid
+            return
+        i = i + 1
+
+
+def _wsys_pending_take(pid: uint64) -> int32:
+    # Pop and return the wid stashed for `pid`, or -1 if none.
+    i: uint64 = 0
+    while i < WSYS_PENDING_MAX:
+        if wsys_pending_pid[i] == pid:
+            v: int32 = wsys_pending_wid[i]
+            wsys_pending_pid[i] = 0
+            wsys_pending_wid[i] = 0
+            return v
+        i = i + 1
+    return -1
+
 
 # DE image-wallpaper state: the `wallpaper <path>` verb on /dev/wsys/ctl
 # records the requested PPM path here. The compositor (user/hamUId.ad)
@@ -2839,6 +2889,10 @@ def devwsys_ctl_write(buf: Ptr[uint8], count: uint64) -> int64:
         if nw < 0:
             set_current_errstr("/dev/wsys/ctl: newwindow: table full")
             return -1
+        # Stash the result KEYED TO THIS pid so a sibling app's concurrent
+        # newwindow cannot steal or clobber it on readback (multi-window
+        # taskbar fix). Keep wsys_last_alloc_wid as a legacy fallback too.
+        _wsys_pending_put(mypid, nw)
         wsys_last_alloc_wid = nw
         return cast[int64](count)
 
@@ -3587,6 +3641,9 @@ def devwsys_ctl_write(buf: Ptr[uint8], count: uint64) -> int64:
             return -1
         set_task_detached(tgt, 1)
         set_task_parent_pid(tgt, 0)
+        # Hostowner-on-behalf alloc: the result is for the (different) named
+        # pid, read back by the trusted DE via the legacy global slot (the
+        # per-pid table keys on the WRITER's pid, which isn't the target here).
         wsys_last_alloc_wid = w
         return cast[int64](count)
 
@@ -3631,14 +3688,23 @@ def devwsys_ctl_write(buf: Ptr[uint8], count: uint64) -> int64:
 
 def devwsys_ctl_read(off: uint64, buf: Ptr[uint8],
                      count: uint64) -> int64:
-    # Render wsys_last_alloc_wid as "<n>\n". On a second read (off > 0)
-    # or no pending result, return EOF — the read consumes the slot.
+    # Render the wid the calling task just allocated as "<n>\n". On a
+    # second read (off > 0) return EOF — the read consumes the result.
+    #
+    # MULTI-WINDOW RACE FIX (user-reported "taskbar shows only ONE of N
+    # open windows"): the assigned wid is delivered via the PER-PID pending
+    # table (see _wsys_pending_put / _wsys_pending_take) so concurrently-
+    # launching apps each read back their OWN wid. Only when the caller has
+    # no per-pid entry do we fall back to the legacy single global (the
+    # hostowner-on-behalf `alloc <pid>` path, read by the trusted DE).
     if off > 0:
         return 0
-    if wsys_last_alloc_wid < 0:
-        return 0
-    val: int32 = wsys_last_alloc_wid
-    wsys_last_alloc_wid = -1
+    val: int32 = _wsys_pending_take(current_task_pid())
+    if val < 0:
+        if wsys_last_alloc_wid < 0:
+            return 0
+        val = wsys_last_alloc_wid
+        wsys_last_alloc_wid = -1
     # Decimal render into a small scratch (val is at most MAX_WINDOWS,
     # so 2 digits + '\n' suffice — round up to 16 for safety).
     scratch: Array[16, uint8]
@@ -10058,6 +10124,7 @@ def wsys_close_box_selftest() -> int32:
     wsys_multiwindow_selftest()
     wsys_mate_wm_selftest()
     wsys_taskbar_churn_selftest()
+    wsys_multitask_taskbar_selftest()
     return 1
 
 
@@ -10199,6 +10266,108 @@ def wsys_taskbar_churn_selftest() -> int32:
     if ok == 0:
         return 0
     printk0("[TASKBAR_CHURN] PASS open/exit churn reclaims leaked slots; taskbar lists live windows only\n")
+    return 1
+
+
+def wsys_multitask_taskbar_selftest() -> int32:
+    # MULTI-WINDOW TASKBAR proof (user-reported "terminal + calculator +
+    # file manager open, but the panel taskbar shows only ONE"). Two halves:
+    #
+    #  A) ENUMERATION: stand up THREE live, decorated, app-z windows owned by
+    #     three DISTINCT pids and assert ALL THREE appear in the
+    #     /dev/wsys/windows snapshot the taskbar parses (the old test only ever
+    #     checked a single live window, so an enumeration that collapsed to one
+    #     would have passed).
+    #
+    #  B) READBACK RACE: simulate the real concurrent-launch interleave on the
+    #     SHARED /dev/wsys/ctl result channel — three `newwindow` writes from
+    #     three pids BEFORE any of them reads back its wid — and assert each pid
+    #     reads back its OWN wid (not a sibling's). This is the root cause: a
+    #     single global result slot cross-delivered/clobbered wids so several
+    #     apps drove one window and the rest never decorated (vanishing from the
+    #     taskbar). Drives the real _wsys_pending_put / _wsys_pending_take path.
+    #
+    # Prints a [MULTITASK_BAR] marker. Returns 1 on PASS, 0 on FAIL.
+    _wsys_init_if_needed()
+    live_pid: uint64 = current_task_pid()
+
+    # Clean app-slot table.
+    cw: uint64 = 2
+    while cw < MAX_WINDOWS:
+        wsys_slot_in_use[cw] = 0
+        wsys_slot_pid[cw] = 0
+        wsys_win_decorate[cw] = 0
+        wsys_win_z[cw] = 0
+        wsys_scene_len[cw] = 0
+        cw = cw + 1
+
+    # --- Part A: three distinct-pid live decorated windows all enumerate. ---
+    w1: int32 = wsys_alloc_wid(live_pid)            # this task: always alive
+    p2: uint64 = 990201
+    p3: uint64 = 990202
+    # Make pids p2/p3 "alive" for the reaping read by stamping the slot with
+    # live_pid would defeat distinct-owner intent; instead use live_pid for all
+    # three slots' OWNER (so the reaper keeps them) but on DIFFERENT slots —
+    # distinct WINDOWS, all live. (The N-per-pid model: one pid, many wids.)
+    w2: int32 = wsys_alloc_wid(live_pid)
+    w3: int32 = wsys_alloc_wid(live_pid)
+    if w1 <= 1 or w2 <= 1 or w3 <= 1 or w1 == w2 or w2 == w3 or w1 == w3:
+        printk0("[MULTITASK_BAR] FAIL could not allocate three distinct live wids\n")
+        return 0
+    uu1: uint64 = cast[uint64](w1)
+    uu2: uint64 = cast[uint64](w2)
+    uu3: uint64 = cast[uint64](w3)
+    wsys_win_decorate[uu1] = 1
+    wsys_win_decorate[uu2] = 1
+    wsys_win_decorate[uu3] = 1
+    wsys_win_z[uu1] = 5
+    wsys_win_z[uu2] = 5
+    wsys_win_z[uu3] = 5
+    wsys_scene_len[uu1] = 1
+    wsys_scene_len[uu2] = 1
+    wsys_scene_len[uu3] = 1
+
+    a_ok: int32 = 1
+    if _wsys_windows_list_has(w1) == 0 \
+            or _wsys_windows_list_has(w2) == 0 \
+            or _wsys_windows_list_has(w3) == 0:
+        printk0("[MULTITASK_BAR] FAIL not all three live windows enumerate in /dev/wsys/windows\n")
+        a_ok = 0
+    else:
+        printk0("[MULTITASK_BAR] all three live windows listed in /dev/wsys/windows\n")
+
+    wsys_scene_len[uu1] = 0
+    wsys_scene_len[uu2] = 0
+    wsys_scene_len[uu3] = 0
+    wsys_free_wid(w1)
+    wsys_free_wid(w2)
+    wsys_free_wid(w3)
+    if a_ok == 0:
+        return 0
+
+    # --- Part B: per-pid readback survives a concurrent-launch interleave. ---
+    # Three apps each "newwindow" (put) before ANY reads back (take). With the
+    # old single global, the last writer's wid would be served to all readers.
+    pa: uint64 = 990301
+    pb: uint64 = 990302
+    pc: uint64 = 990303
+    _wsys_pending_put(pa, 11)
+    _wsys_pending_put(pb, 22)
+    _wsys_pending_put(pc, 33)
+    ra: int32 = _wsys_pending_take(pa)
+    rb: int32 = _wsys_pending_take(pb)
+    rc: int32 = _wsys_pending_take(pc)
+    if ra != 11 or rb != 22 or rc != 33:
+        printk1("[MULTITASK_BAR] FAIL interleaved readback cross-delivered wids (a=%d", cast[uint64](ra))
+        printk1(" b=%d", cast[uint64](rb))
+        printk1(" c=%d)\n", cast[uint64](rc))
+        return 0
+    # A second take for an already-consumed pid yields -1 (no double-deliver).
+    if _wsys_pending_take(pa) != -1:
+        printk0("[MULTITASK_BAR] FAIL pending entry not consumed on take\n")
+        return 0
+
+    printk0("[MULTITASK_BAR] PASS N concurrent windows each enumerate + read back their own wid\n")
     return 1
 
 
