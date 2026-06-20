@@ -59,6 +59,29 @@ FILES = [
     ("/version",    b"Hamnix bare-metal kernel, M16.30 - ELF /init loader\n"),
 ]
 
+# Classic per-user home subdirectories for the live/default user `live`
+# (/etc/passwd: live:1:1:/home/live:/bin/hamsh). The cpio is a FLAT name
+# table — directories are implicit, materialised by the files inside
+# them — so we plant a `.keep` placeholder in each standard home subdir
+# (Desktop/Documents/Downloads/Pictures). This gives the live user a
+# familiar home layout AND sensible default locations for the DE file
+# manager / hameditscene file-picker (which defaults to
+# /home/live/Documents). New ext4-backed users get the same subdirs from
+# useradd's make_home_skel() (`#<name>/Desktop` ...). KISS: an empty
+# `.keep` byte stream is enough to make the directory enumerable.
+for _home_sub in ("Desktop", "Documents", "Downloads", "Pictures"):
+    FILES.append((f"/home/live/{_home_sub}/.keep", b""))
+# A friendly starter note so /home/live/Documents isn't bare on the live
+# image (also gives the editor's Open picker something to load).
+FILES.append((
+    "/home/live/Documents/welcome.txt",
+    b"Welcome to Hamnix!\n\n"
+    b"This is your Documents folder. Try the text editor (hameditscene):\n"
+    b"  Ctrl-O  open a file via the folder browser\n"
+    b"  Ctrl-S  save (Save As opens the folder browser to pick a folder)\n"
+    b"  Ctrl-W  Save As to a different folder\n",
+))
+
 # Default DE wallpaper. user/hamUId.ad's startup path calls
 # wallpaper_load_path("/etc/wallpaper.ppm") best-effort; planting a real
 # PPM here is what stops the DE booting onto a flat grey backdrop. The
