@@ -136,6 +136,52 @@ backwards.
 
 ---
 
+## Kernel parity (Linux)
+
+Full ranked gap analysis + waves: [`docs/kernel_parity_roadmap.md`](docs/kernel_parity_roadmap.md).
+The Linux ABI shim (`linux_abi/`) is strong; the half-assed gaps are all
+in the Layer-1 CPU-side core. Four keystones everything leans on: RCU,
+the EEVDF scheduler, and the page-cache + rmap + reclaim triad.
+
+**Wave 1 — foundations (parallel; RCU unblocks the rest)**
+- [ ] **RCU core** — Tiny/Tree RCU, QS on ctx-switch + tick, `call_rcu`/
+  `synchronize_rcu`. Absent today (`kernel/sched/core.ad:627`). `kernel/rcu/`.
+- [ ] **EEVDF/CFS scheduler** — replace the O(NTASKS) min-vruntime linear
+  scan (`kernel/sched/core.ad:1050`) with an eligibility/deadline tree.
+- [ ] **rmap + struct page** — `anon_vma` + `page->mapping` (fully absent);
+  prerequisite for real reclaim AND the page cache. `mm/rmap.ad` (new).
+
+**Wave 2 — big subsystems (depend on Wave 1)**
+- [ ] **VFS page cache (`address_space`)** — block-only today
+  (`kernel/block/blk.ad:370`); file mmap snapshots backing (`fs/vfs.ad:6102`).
+  Unified per-inode page tree + dirty tracking. `fs/` + `mm/`.
+- [ ] **LRU reclaim + kswapd + watermarks** — replace the per-task O(tasks)
+  walk (`mm/reclaim.ad:69`) with active/inactive LRU + background kswapd.
+- [ ] **softirq + workqueue pool + tasklet + threaded IRQs** — softirq
+  absent (tick-poll), workqueue is a 4-slot manual-flush table
+  (`linux_abi/api_kthread.ad:232`), tasklet stubbed, thread_fn never spawns.
+
+**Wave 3 — scale & correctness (depend on Wave 2)**
+- [ ] **dcache + inode cache (+ rcu-walk)** — dcache/inode ops are no-op
+  stubs (`linux_abi/api_l58.ad:404`, `api_l57.ad:616`).
+- [ ] **dirty writeback throttling + per-bdi flushers** — none; `fsync` is
+  a device-cache barrier only (`fs/ext4.ad:7466`). After page cache.
+- [ ] **per-VMA locking + maple tree** — VMAs are a single sorted list
+  (`mm/vma.ad:29`), O(N) faults, one global lock.
+- [ ] **hrtimers (ns) + NO_HZ + clocksource registry** — hrtimers are
+  jiffies-quantized 16-slot (`linux_abi/api_hrtimer.ad:47`), no tickless.
+
+**Backlog (post-parity scaling / niche):** PELT + sched_domains +
+SCHED_DEADLINE; RT signals + tgid thread groups; remaining 5 namespaces +
+`setns`; cgroup memory/io/pids + nesting; page-allocator pcplists/zones/
+migratetypes; THP/NUMA/KSM; io_uring async + net opcodes; eBPF verifier/
+program-types/JIT; fair qspinlock + lockdep + kernel mutex/rwsem.
+
+**Plan 9 law:** native control stays ctl-file-shaped; Linux-ABI parity
+stays in `linux_abi/`. RCU/sched/MM/page-cache are shared Layer-1 core.
+
+---
+
 ## Track 1 — Adder Linux target (Tier 2: compute + file I/O)
 
 **Why:** run freestanding Adder on Linux at native speed (dev + fuzzing
