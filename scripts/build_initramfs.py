@@ -116,6 +116,14 @@ if _wp_bytes:
 if os.environ.get("ENABLE_TLS_SMOKE") == "1":
     FILES.append(("/etc/tls-test", b"1\n"))
 
+# ENABLE_SMAP_TEST=1 plants /etc/smap-test. init/main.ad gates
+# smap_enforced_test() on this marker — a positive SMAP-active proof that
+# does an un-stac'd CPL=0 read of a US=1 user page and asserts it #PF's
+# under CR4.SMAP=1. scripts/test_smap_enforced.sh sets it and boots under
+# KVM (TCG masks SMAP CPUID so the test would SKIP there).
+if os.environ.get("ENABLE_SMAP_TEST") == "1":
+    FILES.append(("/etc/smap-test", b"1\n"))
+
 # ENABLE_NVME_SELFTEST=1 plants /etc/nvme-selftest. init/main.ad's NVMe
 # bring-up (nvme_init) gates its DESTRUCTIVE self-test battery
 # (write-smoke/blk-smoke/PRP/multi-queue/health/AER — all WRITE to LBA
