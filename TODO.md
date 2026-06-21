@@ -234,8 +234,10 @@ RCU read-side for task/VFS traversal; LRU-ordered reclaim.
 gap is concentrated in a few classic passes, not anything LLVM-scale.
 
 **Goal:** rough C ballpark — **target ≤ ~2× of `-O2`** (from ~4.3×).
-Non-goal: `-O2` parity / auto-vectorization (the `lcg` chain is already
-1.9×; the `mmul`/`collatz` gaps at 6–8× are the prize).
+Non-goal: `-O2` parity / auto-vectorization. **Progress: 4.28× (`-O0`) →
+3.47× (`-O1`) → 3.03× (`-O2`)** geomean of `-O2`, all fuzz-clean. lcg is
+down to 1.51×; the remaining prize is `collatz`/`mmul` (5×, division- and
+array-address-bound) which want LICM/CSE on a real IR.
 
 - [x] **Increment 1 — `-O1` peephole optimizer (LANDED 2026-06-20).**
   `adder/compiler/peephole_x86.py`, gated behind `adder compile -O1` (default
@@ -247,14 +249,32 @@ Non-goal: `-O2` parity / auto-vectorization (the `lcg` chain is already
   fib 1.43×, mmul 1.38×, sieve 1.35×). 0 fuzzer miscompiles at `-O1`
   (`FUZZ_OPT=1 scripts/fuzz_adder.sh`). The IR-based steps below are the next
   increment (the peephole can't express LICM/strength-reduction/regalloc).
+- [x] **Increment 2 — `-O2` stack-slot register promotion (LANDED 2026-06-21).**
+  `adder/compiler/regalloc_x86.py`, gated behind `adder compile -O2` (runs
+  after the `-O1` peephole; default `-O0` image-build path unchanged).
+  A register allocator *over the stack slots*: the stack-machine backend keeps
+  every local in an `OFF(%rbp)` slot and round-trips it through memory on every
+  access; this pass promotes each function's hottest address-never-taken
+  full-width scalar locals into the five callee-saved registers `%rbx,%r12–%r15`
+  (never emitted by the backend, never scratched by `-O1`). Promotion is
+  proven-safe per slot: only when *every* `OFF(%rbp)` appearance is a plain
+  8-byte `movq` load/store (any sized/`movz*`/`movs*`/`lea`/indexed/canary use
+  disqualifies it). Saves/restores via a fresh enlarged-frame slot at the
+  prologue + before every `leave`. **Result: geomean 3.47× → 3.03× of `-O2`**
+  (1.14× over `-O1`, 1.41× over `-O0`; sieve 2.69→2.13×, lcg 1.89→1.51×,
+  collatz 5.92→5.26×, mmul 5.52→5.09×). **0 fuzzer miscompiles at `-O2`**
+  (`FUZZ_OPT=2 scripts/fuzz_adder.sh`; 2000-program CI batch + 8000 soak).
+  Implemented at the asm level (operates on emitted text per-function) rather
+  than as a from-AST SSA IR — the same proven-safe, incremental shape as the
+  `-O1` peephole, and it captures the single biggest win (memory round-trips)
+  the IR was wanted for. The from-AST IR + the remaining IR-level passes below
+  are still the next increment.
 - [ ] **Step 0 — introduce a minimal IR.** Today's backend is single-pass,
-  no IR (`adder/compiler/codegen_x86.py`); you can't do regalloc/LICM on
-  a straight AST→asm emitter. Add a basic-block + virtual-register IR
-  between AST and x86 emission. (Reusable if LLVM is ever adopted — see
+  no IR (`adder/compiler/codegen_x86.py`); the `-O1`/`-O2` passes work on
+  emitted asm text. A basic-block + virtual-register IR between AST and x86
+  emission would enable LICM/CSE (below) which the asm-level passes can't
+  express across control flow. (Reusable if LLVM is ever adopted — see
   Decision points.)
-- [ ] **Register allocation.** Stop spilling every local to the stack
-  (keep induction vars + accumulators in registers). Biggest structural
-  win; closes the cases >2× over `-O0` (collatz 3.1×, mmul 2.2×).
 - [ ] **Loop-invariant code motion + strength reduction.** Hoist
   invariant base addresses; strength-reduce index math like `i*DIM+k`.
   Directly attacks the largest `-O2` gaps (mmul 7.8×, collatz 6.8×).
