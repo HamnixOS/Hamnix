@@ -584,6 +584,46 @@ kernel→user writes were found and bracketed under enforcement:
 - `arch/x86/kernel/syscall.ad` `do_wait4` — `wstatus_ptr` status write
   (this one killed the cow-fork test's waiting parent until bracketed).
 
+**v3h exhaustive audit (2026-06-21):** v3g bracketed only the 3 sites it
+happened to hit; v3h is a full static sweep of EVERY kernel path that
+dereferences a user virtual address at CPL=0. The sanctioned patterns are
+(a) route through `mm/uaccess.ad` (`copy_*_user` / `get_user_*` /
+`put_user_*` / `strncpy_from_user` — user VA → phys via the US=0 identity
+window), or (b) wrap the raw deref in the gated `_ua_stac()` / `_ua_clac()`
+bracket (no-ops when `cpu_mitig_smap_active()==0`). No new bracket primitive
+was needed. Sites found unbracketed and FIXED:
+
+| File | Path / user access | Fix |
+|------|--------------------|-----|
+| `linux_abi/u_syscalls.ad` | `_u_poll_scan` pollfd[] fd/events read + revents write | `_ua_stac/_ua_clac` |
+| `linux_abi/u_syscalls.ad` | `_fdset_test/_clear_all/_add` select fd_set r/w | `_ua_stac/_ua_clac` |
+| `linux_abi/u_syscalls.ad` | sendfile `*offset` read + write-back | `get_user_64` / `put_user_64` |
+| `linux_abi/u_syscalls.ad` | copy_file_range + splice `*off_in/*off_out` r/w | `_ua_stac/_ua_clac` (read) / `_ua_*` (write) |
+| `linux_abi/u_syscalls.ad` | `_u_sigset_to_kernel` signalfd sigset read | `get_user_64` |
+| `linux_abi/u_syscalls.ad` | `_u_fill_statfs` struct statfs fill (statfs/fstatfs) | `_ua_stac/_ua_clac` (2 windows) |
+| `linux_abi/u_syscalls.ad` | `_u_ts_to_jiffies` / `_u_jiffies_to_ts` timerfd timespec r/w | `get_user_64` / `put_user_64` |
+| `linux_abi/u_syscalls.ad` | `_u_epoll_scan` epoll_event[] write | `_ua_stac/_ua_clac` |
+| `linux_abi/u_syscalls.ad` | `_u_clone3` clone_args read + pidfd write | `copy_from_user` / `put_user_32` |
+| `linux_abi/u_ptrace.ad` | PEEK/POKE (tracee VA), GET/SETREGS (tracer buf) | `_ua_stac/_ua_clac` |
+| `linux_abi/u_iouring.ad` | READV/WRITEV iovec read + data bounce | `get_user_64` + `copy_*_user` bounce |
+| `linux_abi/u_iouring.ad` | REGISTER_BUFFERS iovec read | `get_user_64` |
+| `linux_abi/u_iouring.ad` | OPENAT/STATX pathname (resolve_path) | `strncpy_from_user` copy-in |
+| `arch/x86/kernel/syscall.ad` | UMDF irq-fd read result write | `put_user_64` |
+
+Paths AUDITED and confirmed already-safe (so the sweep is provably
+exhaustive): rt_sigaction / rt_sigprocmask / sigaltstack / prlimit64 /
+getrlimit / setrlimit (all `get_user_*`/`put_user_*`, #163); getrusage /
+times / statx / getdents64 / recvfrom / nanosleep / sched_*affinity /
+gettimeofday / clock_gettime (kernel-scratch + `copy_*_user`); the AF_INET /
+AF_UNIX / AF_NETLINK socket bind/connect/recvmsg paths (`copy_from_user`
+into a bounce; the `_l_kernel_*` helpers take KERNEL pointers); futex /
+futexv (`get_user_32`/`copy_from_user`); process_vm_readv/writev
+(`copy_*_user` on the remote CR3); set_robust_list (no-op); userfaultfd
+(`copy_*_user` + physical-frame fill); signal delivery + sigreturn + ELF
+exec stack build + COW resolve (bracketed v3c–v3e, re-verified intact); the
+`copy_*_user` physical-frame fill paths (`_u_mmap_fill_file`, demand-fault,
+swap-in — all write the resolved PHYS frame, never the user VA).
+
 **Enforcement proof:** `scripts/test_smap_enforced.sh` (gated marker
 `/etc/smap-test`) does an UN-stac'd CPL=0 read of a genuinely-US=1 user
 page via `arch/x86/kernel/smap_probe_asm.S`; a one-entry SMAP-probe
@@ -593,6 +633,13 @@ under a hardware accelerator** — TCG masks the SMAP CPUID bit, so the
 test SKIPs cleanly there; verify under KVM (`-cpu host`). The qemu shim
 (`scripts/_kernel_iso.sh`) auto-injects `-accel kvm -cpu host` when
 `/dev/kvm` is usable.
+
+`scripts/test_smap_uaccess_paths.sh` is the companion v3h gate: it boots
+with SMAP on + the UABI_FILLS / SPLICE / IOURING / USERFAULTFD / STATX boot
+self-tests enabled (each drives the real Linux-ABI handlers for the audited
+paths, the SPLICE leg against a genuine `vaddr != phys` user page) and
+asserts every one PASSes with no #PF — i.e. the bracketed
+kernel-on-behalf-of-user accesses all complete under live enforcement.
 
 ### KASLR — **v1 scaffold only (offset=0); v2 documented, not landed**
 
