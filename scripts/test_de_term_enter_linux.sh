@@ -186,8 +186,18 @@ try:
     else:
         print("[entlnx_gate] driver: handoff reached", file=sys.stderr)
         wait_for("[scene_de] launching file manager", 60)
-        # Let the rl5 scene DE settle (compositor latch + clients newwindow).
-        time.sleep(10)
+        # Gate on the TERMINAL's own readiness rather than a fixed sleep: the
+        # scene terminal's persistent shell runs a startup `ls /` probe and
+        # emits "[hamterm] NS_PROBE" to /dev/cons once its grid has the
+        # listing. On a LOADED host the DE clients start late and create their
+        # windows slowly, so a fixed 10s settle raced wid-discovery (windows
+        # not yet published). Wait up to 180s for NS_PROBE; it proves the
+        # terminal window + shell are up so /dev/wsys/windows lists "Terminal".
+        if wait_for("[hamterm] NS_PROBE", 180):
+            print("[entlnx_gate] driver: terminal NS_PROBE seen", file=sys.stderr)
+        else:
+            print("[entlnx_gate] driver: NS_PROBE not seen (slow boot?)", file=sys.stderr)
+        time.sleep(6)
 
         # --- discover the terminal wid -------------------------------
         # /dev/wsys/windows lists "<wid> <title>" for each decorated window.
