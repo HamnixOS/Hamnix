@@ -40,6 +40,12 @@ from kernel.printk.printk import (
 )
 from mm.uaccess import (
     copy_from_user, copy_to_user,
+    # SMAP: io_uring reads iovec arrays + openat/statx pathnames out of
+    # user/SQE memory (US=1) at CPL=0. get_user_64 / strncpy_from_user
+    # route through the page tables; the READV/WRITEV data legs bounce
+    # through a kernel buffer (copy_to_user / copy_from_user) instead of
+    # handing the raw user pointer to vfs_read/vfs_write.
+    get_user_64, strncpy_from_user,
 )
 from mm.slab import (
     kzalloc, kfree,
@@ -133,6 +139,13 @@ IOU_EBUSY:  int64 = -16
 IOU_EINVAL: int64 = -22
 IOU_EMFILE: int64 = -24
 IOU_ENOMEM: int64 = -12
+
+# SMAP: READV/WRITEV bounce buffer. vfs_read/vfs_write touch their buffer at
+# CPL=0, so io_uring's vectored I/O stages each chunk here (a US=0 kernel
+# page) and copy_to_user/copy_from_user moves it to/from the user iovec
+# base — never handing the raw US=1 user pointer to the VFS leaf.
+IOU_RW_BOUNCE: uint64 = 4096
+_iou_rw_bounce: Array[4096, uint8]
 
 # Structure sizes (bytes). The SQE is a fixed 64-byte record; the CQE is
 # 16 bytes. These match the on-disk uapi layouts exactly so a real libc
@@ -603,16 +616,39 @@ def _iouring_do_readv(fd: int32, iov: uint64, cnt: uint64) -> int64:
     i: uint64 = 0
     while i < cnt:
         entry: uint64 = iov + i * 16
-        ibase: uint64 = cast[Ptr[uint64]](entry)[0]
-        ilen:  uint64 = cast[Ptr[uint64]](entry + 8)[0]
+        # SMAP: the iovec[] is user/SQE memory (US=1) — fetch base/len
+        # through the page tables.
+        ibase: uint64 = 0
+        ilen:  uint64 = 0
+        if get_user_64(entry, &ibase) != 0:
+            if total == 0:
+                return IOU_EFAULT
+            return total
+        if get_user_64(entry + 8, &ilen) != 0:
+            if total == 0:
+                return IOU_EFAULT
+            return total
         if ilen == 0:
             i = i + 1
             continue
-        nn: int64 = vfs_read(fd, cast[Ptr[uint8]](ibase), ilen)
+        # SMAP: vfs_read writes its buffer at CPL=0, so it must land in a
+        # kernel bounce (not the user ibase) — then copy_to_user out. A
+        # >4 KiB iovec legally short-reads at the bounce grain (read(2)
+        # returns as soon as any data is available).
+        rn: uint64 = ilen
+        if rn > IOU_RW_BOUNCE:
+            rn = IOU_RW_BOUNCE
+        nn: int64 = vfs_read(fd, cast[Ptr[uint8]](&_iou_rw_bounce[0]), rn)
         if nn < 0:
             if total == 0:
                 return nn
             return total
+        if nn > 0:
+            if copy_to_user(ibase, cast[uint64](&_iou_rw_bounce[0]),
+                            cast[uint64](nn)) != 0:
+                if total == 0:
+                    return IOU_EFAULT
+                return total
         total = total + nn
         if cast[uint64](nn) < ilen:
             return total
@@ -629,19 +665,46 @@ def _iouring_do_writev(fd: int32, iov: uint64, cnt: uint64) -> int64:
     i: uint64 = 0
     while i < cnt:
         entry: uint64 = iov + i * 16
-        ibase: uint64 = cast[Ptr[uint64]](entry)[0]
-        ilen:  uint64 = cast[Ptr[uint64]](entry + 8)[0]
+        # SMAP: fetch the iovec entry through the page tables.
+        ibase: uint64 = 0
+        ilen:  uint64 = 0
+        if get_user_64(entry, &ibase) != 0:
+            if total == 0:
+                return IOU_EFAULT
+            return total
+        if get_user_64(entry + 8, &ilen) != 0:
+            if total == 0:
+                return IOU_EFAULT
+            return total
         if ilen == 0:
             i = i + 1
             continue
-        nn: int64 = vfs_write(fd, cast[Ptr[uint8]](ibase), ilen)
-        if nn < 0:
-            if total == 0:
-                return nn
-            return total
-        total = total + nn
-        if cast[uint64](nn) < ilen:
-            return total
+        # SMAP: copy_from_user the payload into a kernel bounce, then
+        # vfs_write from there — vfs_write reads its buffer at CPL=0 and
+        # must not touch the raw user ibase. Chunk so a >4 KiB iovec
+        # transfers in full.
+        left: uint64 = ilen
+        u: uint64 = ibase
+        stop: int32 = 0
+        while left > 0 and stop == 0:
+            chunk: uint64 = left
+            if chunk > IOU_RW_BOUNCE:
+                chunk = IOU_RW_BOUNCE
+            if copy_from_user(cast[uint64](&_iou_rw_bounce[0]), u, chunk) != 0:
+                if total == 0:
+                    return IOU_EFAULT
+                return total
+            wn: int64 = vfs_write(fd, cast[Ptr[uint8]](&_iou_rw_bounce[0]),
+                                  chunk)
+            if wn < 0:
+                if total == 0:
+                    return wn
+                return total
+            total = total + wn
+            if cast[uint64](wn) < chunk:
+                return total                          # short write
+            left = left - chunk
+            u = u + chunk
         i = i + 1
     return total
 
@@ -669,8 +732,17 @@ def _iouring_do_openat(addr: uint64, open_flags: uint32) -> int64:
     # (>=0) or -errno.
     if addr == 0:
         return IOU_EFAULT
+    # SMAP: `addr` is a user pathname (US=1); resolve_path walks it byte by
+    # byte at CPL=0. Copy it into a kernel buffer via strncpy_from_user
+    # first, then resolve_path sees only the kernel pointer.
+    kpath: Array[256, uint8]
+    pn: int64 = strncpy_from_user(cast[uint64](&kpath[0]), addr, 256)
+    if pn < 0:
+        return IOU_EFAULT
+    if cast[uint64](pn) >= 255:
+        return IOU_EINVAL
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](addr), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&kpath[0]), &abs_path[0], 256)
     if rc != 0:
         return cast[int64](rc)
     accmode: uint64 = cast[uint64](open_flags) & IOU_O_ACCMODE
@@ -757,8 +829,15 @@ def _iouring_do_statx(dirfd: int32, path_addr: uint64,
     # is opened read-only, the statx buffer filled, then the fd closed.
     if path_addr == 0 or statxbuf == 0:
         return IOU_EINVAL
+    # SMAP: copy the user pathname into a kernel buffer before resolve_path.
+    kpath: Array[256, uint8]
+    pn: int64 = strncpy_from_user(cast[uint64](&kpath[0]), path_addr, 256)
+    if pn < 0:
+        return IOU_EFAULT
+    if cast[uint64](pn) >= 255:
+        return IOU_EINVAL
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](path_addr), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&kpath[0]), &abs_path[0], 256)
     if rc != 0:
         return cast[int64](rc)
     sfd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
@@ -1250,8 +1329,15 @@ def io_uring_register(a0: uint64, a1: uint64, a2: uint64,
         while bi < cast[uint64](nr_args):
             iv: uint64 = a2 + bi * 16
             slot: uint64 = _regbuf_slot(su, bi)
-            _ring_buf_base[slot] = cast[Ptr[uint64]](iv)[0]
-            _ring_buf_len[slot]  = cast[Ptr[uint64]](iv + 8)[0]
+            # SMAP: the iovec[] is user memory (US=1) — read via page tables.
+            rb: uint64 = 0
+            rl: uint64 = 0
+            if get_user_64(iv, &rb) != 0:
+                return IOU_EFAULT
+            if get_user_64(iv + 8, &rl) != 0:
+                return IOU_EFAULT
+            _ring_buf_base[slot] = rb
+            _ring_buf_len[slot]  = rl
             bi = bi + 1
         _ring_reg_nbuf[su] = nr_args
         return 0
