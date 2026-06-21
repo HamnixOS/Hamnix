@@ -365,14 +365,17 @@ def print_u64(val: uint64) -> int32:
 
 class Program:
     # subset=True restricts the generator to the SELF-HOSTED backend
-    # (codegen.ad) supported subset: it omits the 2-D array global + its
-    # traffic (codegen.ad does not support multi-dimensional array globals).
-    # Everything else codegen.ad handles (1-D/scalar globals of every width,
-    # casts, compares, div/mod, loops, if/else, helper calls). Used by the
-    # differential gate (tests/fuzz/ad_codegen_host.py + scripts/
-    # fuzz_adder_diff.sh) so codegen.ad ACCEPTS the program and its output can
-    # be compared against the predicted-output oracle. subset=False (default)
-    # is byte-identical to the historical generator — DO NOT regress.
+    # (codegen.ad) supported subset. As of the multi-dimensional-array-global
+    # parity work, codegen.ad ALSO handles the 2-D array global + its traffic
+    # (the outer index scales by the nested row stride, the inner by the
+    # scalar element), so subset mode now generates byte-identically to the
+    # default generator. The subset flag is retained for any FUTURE construct
+    # codegen.ad does not yet handle. codegen.ad covers: 1-D/2-D/scalar
+    # globals of every width, casts, compares, div/mod, loops, if/else,
+    # helper calls. Used by the differential gate (tests/fuzz/
+    # ad_codegen_host.py + scripts/fuzz_adder_diff.sh) so codegen.ad ACCEPTS
+    # the program and its output can be compared against the predicted-output
+    # oracle. subset=False (default) is byte-identical — DO NOT regress.
     def __init__(self, seed, subset=False):
         self.seed = seed
         self.subset = subset
@@ -392,11 +395,12 @@ class Program:
         # ----- globals: 2-D array + one array per store width ----------------
         rows = rng.randint(2, 4)
         cols = rng.randint(2, 4)
-        if not self.subset:
-            # codegen.ad has no 2-D array global support; omit it in subset
-            # mode. The rng draws above are kept identical in both modes so a
-            # given seed's downstream RNG stream stays comparable.
-            self.emit(f"g_grid: Array[{rows}, Array[{cols}, int64]]")
+        # codegen.ad now supports multi-dimensional array GLOBALS (the outer
+        # index scales by the nested row stride; the inner index by the
+        # scalar element), so the 2-D grid is emitted in BOTH modes and the
+        # differential gate exercises it. The rng draws above stay
+        # unconditional so a given seed's downstream stream is identical.
+        self.emit(f"g_grid: Array[{rows}, Array[{cols}, int64]]")
         self.store_arrays = {}        # type -> [name, length, py-shadow list]
         for t in STORE_TYPES:
             n = rng.randint(4, 8)
@@ -431,8 +435,7 @@ class Program:
             # bits per its declared type; get_expr_type sees its type.
             env.append(TV(name, _to_reg(e.val), t, gt=t))
 
-        if not self.subset:
-            self._gen_grid_traffic(env)   # 2-D array global: codegen.ad N/A
+        self._gen_grid_traffic(env)   # 2-D array global (now codegen.ad-OK)
         self._gen_store_traffic(env)
         self._gen_scalar_global_traffic(env)
         self._gen_loop(env)

@@ -77,6 +77,36 @@ Kernel codegen honors SysV AMD64, 16-byte stack alignment, `ENDBR64`
   kernel-side workaround when an idiom is awkward.
 - `compiler -> adder/compiler` is a symlink; edit under `adder/`.
 
+## Self-hosting parity gate (`codegen.ad` vs `codegen_x86.py`)
+
+The Python backend (`codegen_x86.py`) is the **bootstrap seed** (correct,
+optimizer frozen). The Adder backend (`codegen.ad`) is the **product** and
+must reach full parity to drive the build self-hosted. Two host-only gates
+(NO QEMU, NO image build) enforce this:
+
+- `scripts/fuzz_adder.sh` — the predicted-output oracle over the Python
+  backend; 0 miscompiles is the floor.
+- `scripts/fuzz_adder_diff.sh` (`--ad-codegen`) — runs the `codegen.ad`
+  pipeline ON THE HOST (a `--target=x86_64-linux` driver dumps its
+  machine-code + data bytes; `tests/fuzz/ad_codegen_host.py` wraps them in a
+  real ELF and runs it) and compares against the same oracle. Reports
+  accept-rate + correctness-rate; nonzero only on a genuine `codegen.ad`
+  miscompile.
+
+**Construct coverage in `codegen.ad`:** 1-D/2-D/scalar globals of every
+width (signed/unsigned, `.data`/`.bss`), casts (narrowing truncation +
+widening extension), compares, div/mod (signed/unsigned), while-loops,
+if/elif/else, break/continue, pointers, syscalls, helper calls.
+**Multi-dimensional array globals** (`Array[N, Array[M, T]]`) index
+level-by-level: each global carries its array type node (`glob_type_node`),
+the outer index scales by the nested row stride (`type_size_of(element)`)
+and the inner by the scalar element; the index-scale helper has an `imulq`
+fallback for non-power-of-2 strides. As of this work the differential
+generator emits identical traffic in subset and default mode (subset ==
+default), so the gate exercises every construct the product backend must
+handle. **Remaining for a default-build cutover:** classes/methods, free
+for-loops over arrays, structs/member access, do-while, floats.
+
 ## Related docs
 
 - [../x86-backend.md](../x86-backend.md) — why hand-written, codegen contract.

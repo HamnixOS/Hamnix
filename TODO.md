@@ -42,10 +42,22 @@ quality lives in the *passes*, so there's no perf reason to keep them in Python.
    miscompiles; 0 over 10k programs. The permanent correctness gate + the
    differential oracle (`--diff-target`).
 3. **Self-hosting cutover — NOW THE LEAD COMPILER TRACK.** Finish `codegen.ad` to
-   FULL parity with `codegen_x86.py` (multi-dim arrays, classes/methods, for-loops,
-   structs, floats — the ~2000-LOC gap), then build the `.ad` compiler as an
+   FULL parity with `codegen_x86.py`, then build the `.ad` compiler as an
    `x86_64-linux` host binary so it drives the build with Python as a one-time seed.
    This is the prerequisite for the real optimizer AND the credibility milestone.
+   - ✅ **Multi-dimensional array globals** (`Array[N, Array[M, T]]`) — DONE.
+     `codegen.ad` now lays out the full nested type into `.bss`, carries the
+     array type node per global, and indexes level-by-level (outer index scales
+     by the nested row stride, inner by the scalar element). Root fix: the
+     index-scale helper handled only power-of-2 widths; added an `imulq` fallback
+     for arbitrary row strides (e.g. 24). The differential fuzzer now generates
+     2-D grid traffic in BOTH modes; `scripts/fuzz_adder_diff.sh` accept-rate is
+     100% with 0 miscompiles. The differential gate now exercises EVERY construct
+     the default generator emits (subset==default).
+   - REMAINING for cutover: classes/methods, free-standing for-loops over arrays,
+     structs + member access, do-while, floats. (`codegen.ad` already covers
+     1-D/2-D/scalar globals of every width, casts, compares, div/mod, while-loops,
+     if/elif/else, break/continue, helper calls, pointers, syscalls.)
 4. **Userland-isolated drivers (UMDF)** — ✅ DONE (first slice: stock `.ko` in a
    restartable userland host, crash-isolated). Follow-ups: respawn supervisor, real
    BAR-backed driver, `exports.ad` parity.

@@ -346,6 +346,14 @@ glob_ptr_size: Array[1024, uint32]
 # wider (uint64/int64) use carries the correct two's-complement value. Set by
 # glob_set_signed() right after a scalar glob_define.
 glob_is_signed: Array[1024, uint32]
+# Per-global ARRAY TYPE NODE id (the ND_ARRAY_TYPE from the decl) for an
+# array global, else 0. Carries the FULL (possibly nested) array type so a
+# multi-dimensional global `Array[N, Array[M, T]]` can be indexed level by
+# level: the outer index scales by the row stride (M*sizeof(T)) and the
+# inner index scales by sizeof(T). Mirrors codegen_x86 carrying the whole
+# ArrayType and recursing through element_type. 0 for scalars/pointers/1-D
+# where the flat glob_elem_size already suffices (kept for back-compat).
+glob_type_node: Array[1024, uint32]
 glob_count: uint32 = 0
 
 # Data-section RIP-relative relocations. Each records the rel32 field's
@@ -841,6 +849,7 @@ def glob_define(name_off: uint32, name_len: uint32, data_off: uint32, elem_size:
     glob_ptr_size[glob_count] = 0
     glob_is_bss[glob_count] = 0
     glob_is_signed[glob_count] = 0
+    glob_type_node[glob_count] = 0
     glob_count = glob_count + 1
     return data_off
 
@@ -867,6 +876,15 @@ def glob_set_ptr_size(ptr_size: uint32):
 def glob_set_signed():
     if glob_count > 0:
         glob_is_signed[glob_count - 1] = 1
+
+
+# Record the FULL array type node for the most recently defined array
+# global, enabling multi-dimensional indexing (the outer index scales by the
+# nested row stride). 1-D arrays may also set this; it is consulted only
+# when a nested index is encountered, so it never changes 1-D behaviour.
+def glob_set_type_node(tnode: uint32):
+    if glob_count > 0:
+        glob_type_node[glob_count - 1] = tnode
 
 
 # Resolve a name to a global table index. Returns the index+1 (so a 0
@@ -1317,21 +1335,33 @@ def emit_lea_global_rax(data_off: uint32, is_bss: uint32):
 #   shlq $2, %rcx -> 48 C1 E1 02 (size 4)
 #   shlq $3, %rcx -> 48 C1 E1 03 (size 8)
 def emit_scale_rcx(elem_size: uint32):
+    if elem_size == 1:
+        return                         # identity, no shift.
     if elem_size == 2:
         emit_b(0x48)
         emit_b(0xD1)
         emit_b(0xE1)
-    elif elem_size == 4:
+        return
+    if elem_size == 4:
         emit_b(0x48)
         emit_b(0xC1)
         emit_b(0xE1)
         emit_b(0x02)
-    elif elem_size == 8:
+        return
+    if elem_size == 8:
         emit_b(0x48)
         emit_b(0xC1)
         emit_b(0xE1)
         emit_b(0x03)
-    # elem_size == 1: identity, no shift.
+        return
+    # Arbitrary (non-power-of-2) stride — the row stride of a multi-
+    # dimensional array global, e.g. Array[N, Array[3, int64]] has a 24-byte
+    # outer stride. Mirror codegen_x86's `imulq $elem_size, %rcx, %rcx`
+    # fallback: imul rcx, rcx, imm32 == 48 69 C9 <imm32>.
+    emit_b(0x48)
+    emit_b(0x69)
+    emit_b(0xC9)
+    emit_imm32(cast[uint64](elem_size))
 
 
 # Sized load from (%rax) into %rax (zero-extending), mirroring
@@ -1971,13 +2001,70 @@ def gen_addr_of(operand: uint32):
 # Only bare-identifier array bases are in this subset.
 # -----------------------------------------------------------------------
 
+# The ND_ARRAY_TYPE node that `expr` evaluates to as an aggregate, or 0 if
+# `expr` is scalar / not an indexable multi-dimensional global. Mirrors
+# codegen_x86.get_expr_type narrowed to the array-global case:
+#   * a bare global identifier with a recorded array type node -> that node
+#   * a nested index `g[i]` -> the element type of g's array type, but ONLY
+#     when that element is itself an ND_ARRAY_TYPE (i.e. another dimension).
+# A fully-indexed scalar element returns 0 (it is not an aggregate).
+# This is consulted ONLY for the multi-dimensional path; 1-D arrays (whose
+# element is a scalar) return 0 here and keep the flat glob_elem_size path.
+def expr_array_type(expr: uint32) -> uint32:
+    k: uint32 = nd_kind[expr]
+    if k == ND_IDENT:
+        gi: uint32 = glob_lookup(nd_name_off[expr], nd_name_len[expr])
+        if gi != 0 and glob_type_node[gi - 1] != 0:
+            tn: uint32 = glob_type_node[gi - 1]
+            if nd_kind[tn] == ND_ARRAY_TYPE:
+                return tn
+        return 0
+    if k == ND_INDEX:
+        bt: uint32 = expr_array_type(nd_a[expr])
+        if bt != 0:
+            elem: uint32 = nd_a[bt]            # element type of the base array
+            if nd_kind[elem] == ND_ARRAY_TYPE:
+                return elem
+        return 0
+    return 0
+
+
+# True if `node` is a nested index `base[i]` whose base is itself an indexed
+# multi-dimensional array global (so this level scales by the nested row
+# stride, not a scalar element). Only such nodes take the recursive path.
+def is_multidim_index(node: uint32) -> uint32:
+    if nd_kind[nd_a[node]] != ND_INDEX:
+        return 0
+    if expr_array_type(nd_a[node]) != 0:
+        return 1
+    return 0
+
+
 # Element size for an `arr[i]` node: the declared element width of the
 # array local OR array global named by nd_a. Returns 1 if unknown.
 def index_elem_size(node: uint32) -> uint32:
     base: uint32 = nd_a[node]
+    # Nested index into a multi-dimensional array global: the element width at
+    # THIS level is type_size(element_type), recursing into the base array's
+    # type. For `g_grid[r][c]` over Array[N, Array[M, int64]] the base array
+    # of this (inner) level is Array[M, int64], so the element is int64 -> 8.
+    # For the OUTER level `g_grid[r]` the base array is Array[N, Array[M,T]],
+    # element Array[M,T] -> M*sizeof(T) (the row stride).
+    if nd_kind[base] == ND_INDEX:
+        bt: uint32 = expr_array_type(base)
+        if bt != 0:
+            return type_size_of(nd_a[bt])
+        cg_fail(8, node)
+        return 1
     if nd_kind[base] != ND_IDENT:
         cg_fail(8, node)
         return 1
+    # A bare-identifier base into a multi-dimensional array global: the OUTER
+    # index scales by the row stride (element_type size), not the innermost
+    # scalar width that glob_elem_size records.
+    bt2: uint32 = expr_array_type(base)
+    if bt2 != 0 and nd_kind[nd_a[bt2]] == ND_ARRAY_TYPE:
+        return type_size_of(nd_a[bt2])
     es: uint32 = lookup_elem_size(nd_name_off[base], nd_name_len[base])
     if es != 0:
         return es
@@ -2002,8 +2089,42 @@ def index_elem_size(node: uint32) -> uint32:
 # index, exactly like codegen_x86.gen_index_address.
 def gen_index_addr(node: uint32):
     base: uint32 = nd_a[node]
+
+    # ---- Nested index into a multi-dimensional array global --------------
+    # `g_grid[r][c]`: the base is itself an index expression yielding a ROW
+    # address. Recursively compute that row's address, then add the scaled
+    # element index. The stride at THIS level is index_elem_size(node)
+    # (type_size of the element type — a scalar at the deepest level, a row
+    # at an intermediate level). This mirrors codegen_x86.gen_index_address
+    # recursing via gen_addr_of on an Array-typed (IndexExpr) base.
+    if nd_kind[base] == ND_INDEX:
+        es_n: uint32 = index_elem_size(node)
+        gen_expr(nd_b[node])              # index -> %rax
+        emit_push_rax()                   # spill index (recursion clobbers %rax)
+        gen_index_addr(base)              # row base address -> %rax
+        emit_pop_rcx()                    # index -> %rcx
+        emit_scale_rcx(es_n)
+        emit_add_rcx_rax()
+        return
+
     if nd_kind[base] != ND_IDENT:
         cg_fail(8, node)
+        return
+
+    # ---- Bare-identifier base that is a multi-dimensional array global ----
+    # The OUTER index of `g_grid[r]` scales by the row stride (the element
+    # type size), and the base address is the global symbol. Handle this
+    # before the flat classification so the row stride (not the innermost
+    # scalar width glob_elem_size records) is used.
+    bt_md: uint32 = expr_array_type(base)
+    if bt_md != 0 and nd_kind[nd_a[bt_md]] == ND_ARRAY_TYPE:
+        gi_md: uint32 = glob_lookup(nd_name_off[base], nd_name_len[base])
+        es_md: uint32 = type_size_of(nd_a[bt_md])
+        gen_expr(nd_b[node])
+        emit_mov_rax_rcx()
+        emit_scale_rcx(es_md)
+        emit_lea_global_rax(glob_offset[gi_md - 1], glob_is_bss[gi_md - 1])
+        emit_add_rcx_rax()
         return
 
     # Classify the base. There are four base flavours, all of which decay to
@@ -2189,6 +2310,24 @@ def prim_type_size(tnode: uint32) -> uint32:
     if code == 5 or code == 9 or code == 11:
         return 8
     return 8
+
+
+# Total byte size of a (possibly nested array) type node, mirroring
+# codegen_x86.get_type_size: an ND_ARRAY_TYPE is `count * type_size(elem)`
+# (recursing through nested arrays), a Ptr[T] is 8, anything else falls to
+# prim_type_size. Used to compute the per-level INDEX STRIDE for a
+# multi-dimensional array global: at the outer level of `Array[N, Array[M,
+# T]]` the stride is type_size(Array[M, T]) = M*sizeof(T) (the row); at the
+# inner level it is sizeof(T).
+def type_size_of(tnode: uint32) -> uint32:
+    if tnode == 0:
+        return 8
+    if nd_kind[tnode] == ND_ARRAY_TYPE:
+        count: uint32 = cast[uint32](nd_num[tnode])
+        return count * type_size_of(nd_a[tnode])
+    if nd_kind[tnode] == ND_PTR_TYPE:
+        return 8
+    return prim_type_size(tnode)
 
 
 # If `tnode` is a Ptr[T] type node, return the pointee width (the size of
@@ -2600,22 +2739,35 @@ def layout_global(decl: uint32):
     tnode: uint32 = nd_a[decl]
     val: uint32 = nd_b[decl]
     if tnode != 0 and nd_kind[tnode] == ND_ARRAY_TYPE:
-        es: uint32 = prim_type_size(nd_a[tnode])
+        # The INNERMOST scalar element width (the load/store size at the
+        # deepest index). For a 1-D array this is just the element type's
+        # size; for a nested array `Array[N, Array[M, T]]` we walk past every
+        # ND_ARRAY_TYPE level to T and size that. This is the width
+        # glob_elem_size carries (used by a fully-indexed access).
+        inner_t: uint32 = nd_a[tnode]
+        while nd_kind[inner_t] == ND_ARRAY_TYPE:
+            inner_t = nd_a[inner_t]
+        es: uint32 = prim_type_size(inner_t)
         # String-initialised byte array: place the literal's NUL-terminated
         # bytes and register the global at that data offset (mirrors
-        # codegen_x86's string-literal global path).
-        if val != 0 and nd_kind[val] == ND_STRING_LIT and es == 1:
+        # codegen_x86's string-literal global path). Only a 1-D uint8 array.
+        if val != 0 and nd_kind[val] == ND_STRING_LIT and es == 1 and nd_kind[nd_a[tnode]] != ND_ARRAY_TYPE:
             doff: uint32 = intern_string(nd_name_off[val], nd_name_len[val])
             glob_define(nd_name_off[decl], nd_name_len[decl], doff, es, 0)
+            glob_set_type_node(tnode)
             return
         # Zero-init array → .bss: reserve VIRTUAL space only (no file bytes,
         # no gdata[] writes). This is the crux of the BSS model: an array
         # global as big as GDATA_CAP itself no longer needs to be stored.
-        count: uint32 = cast[uint32](nd_num[tnode])
-        bytes_: uint32 = count * es
+        # Total bytes is the FULL (possibly nested) array size, so a 2-D
+        # global reserves N*M*sizeof(T) — exactly codegen_x86.get_type_size.
+        bytes_: uint32 = type_size_of(tnode)
         bbase: uint32 = bss_reserve(bytes_)
         glob_define(nd_name_off[decl], nd_name_len[decl], bbase, es, 0)
         glob_set_bss()
+        # Carry the full type so nested indexing can scale the outer index by
+        # the row stride (codegen_x86 keeps the whole ArrayType for this).
+        glob_set_type_node(tnode)
         return
     # Ptr[T] global: an 8-byte scalar slot that holds an address. A non-zero
     # constant int initialiser goes in .data (stored); `= 0` or no init is
