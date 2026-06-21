@@ -840,7 +840,7 @@ uaccess layer, and broad driver/filesystem maturity.
 
 | Item | What | Status |
 |------|------|--------|
-| **On-device Adder self-hosting** | The Adder-in-Adder compiler compiles itself on-box. (`#154`) | **Done** |
+| **On-device Adder self-hosting** | The Adder-in-Adder backend (`compiler/codegen.ad`, lex→parse→codegen→elf_emit) compiles real Adder source to x86_64 machine code on-device — proven by `test_selfhost_codegen`/`test_selfhost_elf`/`test_hamnix_ac`. (`#154`) | **Partial** — the SELF-HOSTED backend works and is now differentially fuzz-validated against the production backend (`scripts/fuzz_adder_diff.sh`: 100% accept + 100% correctness over 2400+ seeded programs on its supported subset, after fixing 5 sub-8-byte/signedness/immediate miscompiles). BUT the **default build is still driven by the Python backend** (`compiler/codegen_x86.py`, via `python3 -m compiler.adder`); `codegen.ad` does NOT yet drive any build path. Its subset still lacks multi-dimensional array globals (and the broader feature surface of `codegen_x86.py`), so it is not yet a drop-in. Not a cutover. |
 | **Source-based hpm** | Native packages go Gentoo-style: ship `.ad` source + recipe, compile on-box, optional binary cache. (`#186`) | **Done** |
 | **hpm rollback/transactions** | Snapshot install history + revert. (`#111`) | **Done** |
 
