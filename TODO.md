@@ -1,7 +1,8 @@
 # Hamnix TODO
 
 What's still open. **For what's shipped, read [`STATUS.md`](STATUS.md)** —
-it's append-only, dated, and the source of truth.
+it's append-only, dated, and the source of truth. Completed items live
+there, not here; this file stays lean.
 
 Pointers:
 - Design: [`docs/architecture.md`](docs/architecture.md),
@@ -15,58 +16,58 @@ Markers: `[ ]` open · `[~]` in flight.
 
 ---
 
-## ⚠ Direction (2026-06-13, post-audit)
+## ⚠ Direction (2026-06-20)
 
-Two fresh audits landed today. Both agree: Plan 9 spine is real and held;
-many subsystems claim "done" but are stubs or in-memory selftests. The
-next push is **post-audit cleanup wave**, not a new keystone. Pile-of-
-disjoint-fixes cadence, multiple parallel agents.
+**Goal sharpened:** Hamnix is a **good desktop _and_ server OS in the
+shape of Plan 9** — not a general "Linux competitor." That target makes
+several architectural calls for us (below). Plan 9 spine is real and
+held; the next push is foundational hardening, not new surface area.
 
-**Top blockers to "ship as a real Linux competitor" (gap audit):**
-1. Kernel capacity caps: `NTASKS=16` / `NR_FDS=16` / TCP `MAX_SOCKETS=8`
-   — no Debian server workload survives. Lift to 256+ each.
-2. `accept()`/`bind()`/`listen()` are stubs in the Linux ABI shim. Real
-   server binaries (openssh-server, nginx, postgres) cannot run as
-   advertised.
-3. Net-protocol selftest dishonesty: ~17 files in `drivers/net/*.ad`
-   (sctp, mptcp, wireguard, ipsec, macsec, vxlan, geneve, gre, l2tp,
-   ipip, sit, nat64, igmp, bond, bridge, vlan, ipvlan, macvlan) are
-   IN-MEMORY selftests per their own headers — NOT wired to any NIC
-   or `/net` path. README & STATUS frame them as real. Either wire or
-   relabel.
-4. `u_caps.ad` gates NOTHING — POSIX capabilities are paper.
-5. No KASLR, no KPTI, no SMEP/SMAP wiring. Security posture below
-   2008-era Linux.
-6. No cgroups at all (`u_syscalls.ad:7754` is comment-only). systemd
-   and containers cannot run.
-7. No suspend/resume. Laptops drain on lid close.
-8. No kernel oops capture — kernel panics vanish into the serial
-   console.
+Six strategic tracks, **ordered by dependency** (the compiler chain
+unlocks itself — do the Linux target first):
 
-**Top architectural shortcuts (arch audit):**
-9. **Compositor monolith still 28,152 LOC.** DE pivot waves 1–6
-   ADDED v2 client apps but did not SUBSTITUTE — `daemon_pixel` still
-   draws 613 lines of menu fallbacks. Finish substitution.
-10. **DE tests are 100% structural grep.** None boot QEMU and verify
-    render. The v2 waves are unprovable until a runtime DE test lands.
-11. **F2 syscall sprawl unchanged.** `SYS_NICE`/`SVC_CTL`/`NETCFG`/
-    `WSYS_*`/`RESOLVE_*` arms still carry FULL bodies in
-    `arch/x86/kernel/syscall.ad`; the new ctl files are a PARALLEL
-    implementation, not the implementation.
-12. **5 of 11 perm bodies are world-r/w stubs** (tmpfs, fat, devcons,
-    devsrv, devauth). Three (devblk/devproc/devnet) really enforce.
-    tmpfs is exploitable once multi-user lands.
-13. **10 hostowner gates** still raw `current_task_uid() != 1` in
-    `arch/x86/kernel/syscall.ad` — bypass the F3 server boundary.
-14. **F10-9 over-claim:** `is_ext_path` still imported in
-    `linux_abi/u_syscalls.ad:603,3338,7376`.
-15. **Plan 9 `Dir` records** emit only from `/srv` so far —
-    devproc/devnet/devblk listings still `NAME\n`. F10-6 MVP needs
-    followthrough.
-16. **#439 buddy DOUBLE FREE** still parked — genuine reclaim-path
-    double-free; locks alone insufficient.
+1. **Adder Linux target (Tier 2)** — the unlock: smallest and most
+   grounded task, and a precursor for tracks 2 & 3. Compile freestanding
+   Adder (compute + file I/O, NO GUI / no Plan 9 base) to native Linux
+   ELF. Enables host-speed dev + fuzzing.
+2. **Compiler fuzzer** — depends on track 1. The solo hand-rolled
+   single-pass x86 backend is the #1 structural risk; the fuzzer
+   measures and de-risks it.
+3. **Self-hosting on Linux + Hamnix** — depends on track 1, validated by
+   track 2. Finish the `.ad` compiler and run it on the host, closing
+   the bootstrap for real.
+4. **Userland-isolated drivers** — highest *leverage* (toy → server) but
+   independent of the compiler chain and the biggest lift. Move stock
+   `.ko` execution out of the kernel fault domain.
+5. **Kernel scaling rework** — independent. Kill the static-array
+   ceilings before they calcify; defer deep perf (NUMA/RCU) until a real
+   multicore workload can measure it.
+6. **Adder code optimizer** — independent. Get compiled Adder into rough
+   C territory. Baseline (`docs/bench_adder_host.md`): already ~1.6× of
+   `gcc -O0`, ~4.3× of `-O2`, ~24× faster than CPython. Classic passes
+   (not LLVM-scale) should reach ≤ ~2× of `-O2`.
 
-NUC: boots; USB mouse still dead on metal (filed, not blocking).
+Plus: **gate the two real boot paths in CI** (cheap, independent, high
+value — see the CI section).
+
+### Decision points (record, don't lose)
+
+- **LLVM as an optional _second_ backend — DEFERRED.** Gated on fuzzer
+  bug-density data (track 2). If adopted: keep the Adder frontend + keep
+  the hand-rolled x86 backend as the pure bootstrap; add an LLVM IR
+  emitter as a parallel backend. Payoff: optimization, ~free multi-arch
+  (ARM64), CPU mitigations (CFI/retpoline/CET), AND a differential-test
+  oracle (same program through both backends). Cost: giant C++
+  dependency, ethos hit. **Do not** attempt to rewrite/translate LLVM
+  into Adder — ~30M LOC, project-ending. Revisit once the fuzzer reports
+  real miscompile density on the hand backend.
+- **Optimizer vs LLVM for _performance_.** Track 6 (a homegrown
+  optimizer) is the keep-it-native path to "rough C ballpark" — the bench
+  data says classic passes get most of the way. LLVM still wins for
+  ARM64 + CPU mitigations + best-case perf. They are not mutually
+  exclusive: both need an IR (Track 6's prerequisite), so Track 6's IR is
+  reusable if LLVM is later adopted. Build Track 6 first; let it decide
+  whether LLVM's extra perf is even needed.
 
 ---
 
@@ -93,239 +94,287 @@ backwards.
 
 ---
 
-## Post-audit cleanup wave (current focus)
+## Track 1 — Adder Linux target (Tier 2: compute + file I/O)
 
-> **RECONCILED 2026-06-17** (source-verified, not audit-snapshot). ~12 of
-> the 16 post-audit items below are DONE since the 2026-06-13 audit and
-> have been checked off. **Genuinely still open:** CPU-mitigations
-> (SMEP landed; **SMAP CR4-flip + KASLR + KPTI** open — the SMAP flip is
-> gated OFF because high-half kernel pages are US=1 and flipping would
-> triple-fault until they're re-stamped US=0); **suspend/resume** (S3
-> suspend path real; HW **wake-vector trampoline** in entry.S pending);
-> **F2 thin-shim** (delegation done, arm bodies physically remain);
-> **DE pivot dead-code removal** (functionally retired at runtime;
-> ~20K dead LOC still in `user/hamUId.ad`). The buddy double-free (#439)
-> is FIXED (boot-CR3 guard, `mm/page_alloc.ad:40-65`), not parked.
+**Why:** run freestanding Adder on Linux at native speed (dev + fuzzing
++ host self-hosting). NOT for GUI/namespace apps — those need Plan 9
+emulation on Linux (plan9port-scale), explicitly out of scope. This is
+the unlock for tracks 2 and 3.
 
-Disjoint, parallelizable. Top items go through agents first.
+**Grounding:** `aarch64-linux` already exists and already emits Linux
+syscall numbers — mirror it for x86. Userland is freestanding (raw
+`syscall`, no glibc).
 
-### Capacity & Linux-ABI blockers (gap audit)
+- [ ] **Register `x86_64-linux` target** beside `aarch64-linux` in
+  `adder/compiler/adder.py:34` (`{codegen: x86, kbuild: False,
+  bare_metal: False}`). Revisit the `bare_metal` flag — it only gates
+  `.modinfo`, wrong proxy for "userspace"; consider a `userspace` flag.
+- [ ] **`user/linux-runtime.S`** — Linux x86_64 syscall numbers
+  (write=1, read=0, open=2, close=3, lseek=8, exit=60, …) + Linux
+  `_start` (argc/argv off the stack). Mirror `user/runtime.S`.
+- [ ] **`user/linux-init.lds`** — `elf64-x86-64`, `ENTRY(_start)`, drop
+  the `elf32-i386`/`.code64` wrapper trick.
+- [ ] **Link path** in `adder.py` (mirror `:527-571` aarch64-linux) —
+  `as --64`, `ld -m elf_x86_64 -nostdlib -static`.
+- [ ] **Centralize syscall numbers** (high-value cleanup) — today
+  scattered as `movq $N,%rax` across `user/runtime.S`; a per-target table
+  lets x86-adder-user / x86_64-linux / aarch64-* coexist without copy-paste.
+- [ ] **Smoke test** — compile a file-I/O Adder program to `x86_64-linux`,
+  run on host, verify read/write/exit reach the Linux kernel.
 
-- [x] **Lift kernel capacity caps.** (DONE: NTASKS=256, NR_FDS=64, TCP slots=256.) `NTASKS=16` → 256 (or grow
-  dynamically); per-task `NR_FDS=16` → 256; TCP `MAX_SOCKETS=8` → 256.
-  Audit other hardcoded small caps. Cite: `kernel/sched/core.ad:939,5553`,
-  `drivers/net/tcp.ad:187`.
-- [x] **Real `listen()`/`accept()`/`bind()` in Linux ABI.** (DONE: AF_INET via tcp_listen/tcp_accept + AF_UNIX + AF_NETLINK + UDP, all real.) Today only
-  client-side `connect` works (`linux_abi/u_syscalls.ad:14421` header).
-  Implement the server-side socket triple over native `/net` 9P so
-  openssh-server, nginx, postgres start.
-- [x] **Net-protocol honesty pass.** (DONE: all 18 files carry honest "in-memory selftest only" / "real data paths wired" banners; STATUS framing accurate.) For each of sctp/mptcp/wireguard/
-  ipsec/macsec/vxlan/geneve/gre/l2tp/ipip/sit/nat64/igmp/bond/bridge/
-  vlan/ipvlan/macvlan: either wire to the NIC/`/net` data path OR add a
-  prominent "in-memory selftest only" comment + remove from STATUS
-  "real" framing.
-- [x] **u_caps wiring.** (DONE: CAP_SYS_ADMIN gates mount; CAP_NET_ADMIN gates devnet ctl.) Make capset/capget gate at least the obvious
-  ops (CAP_NET_ADMIN, CAP_SYS_ADMIN). File's own header
-  (`linux_abi/u_caps.ad:18-20`) admits it gates nothing.
-- [ ] **CPU-mitigations & kernel hardening.** Wire SMEP/SMAP (CR4
-  bits + `clac/stac` at uaccess boundaries); KPTI; KASLR; STATUS line
-  about kernel lockdown. `arch/x86/kernel/trap_diag.ad:382` literally
-  says SMAP not enabled.
-- [x] **cgroup v2 skeleton.** (DONE: real cpu.max bandwidth controller, scheduler-enforced — kernel/sched/cgroup_cpu.ad.) At least one real controller (cpu or
-  memory) gated by `/sys/fs/cgroup/<group>/cpu.max`. systemd refuses
-  to boot without this.
-- [ ] **Suspend/resume.** S3 + S0ix on ACPI. Save/restore CPU state +
-  device callbacks.
-- [x] **Kernel oops capture.** (DONE: panic()→_persist_oops writes OOPS.BIN+LOG.TXT to ESP; user/oopsread.ad reader.) `panic()` writes a structured record to
-  the ESP `LOG.TXT` extent (already wired for boot log). Then `journalctl
-  -k`-shape userland reader. Cite TODO.md:309.
+## Track 2 — Compiler fuzzer
 
-### Architectural correctness (arch audit)
+**Why:** de-risk the solo single-pass hand backend. The May 2026 sweep
+fixed 5 silent miscompiles (signed/unsigned compare, sub-8-byte pointer
+writes, 2-D array addresses) — the surface is real.
 
-- [ ] **F2 thin-shim conversion.** Replace `SYS_NICE`/`SYS_SVC_CTL`/
-  `SYS_NETCFG`/`SYS_RESOLVE`/`SYS_WSYS_*` syscall ARM BODIES with thin
-  shims that delegate to the corresponding ctl file. The ctl files are
-  the real implementation; the syscall arms must stop duplicating.
-- [x] **Perm-body real-enforcement pass.** (DONE: tmpfs per-inode mode; fat hostowner-write/world-read; devcons/devsrv real gates; devauth admit-all by design — gate is in the cdev.) Replace world-r/w stubs in:
-  `fs/tmpfs.ad::tmpfs_perm_check` (give entries per-inode mode bits);
-  `fs/fat.ad::fat_perm_check`; `sys/src/9/port/devcons.ad`; `devsrv.ad`;
-  `devauth.ad`. tmpfs first (highest exploit surface).
-- [x] **Hostowner-reach cleanup.** (DONE: 0 raw `current_task_uid() != 1` left in syscall.ad; routed through `_syscall_require_hostowner`.) Route the 10 raw `current_task_uid()
-  != 1` checks in `arch/x86/kernel/syscall.ad` through the F3 server
-  boundary (`_perm_check_<X>` at the file open / write site), so policy
-  lives in one place per resource.
-- [x] **F10-9 followthrough.** (DONE: no live `is_ext_path` import/call site remains; only a retired-ladder comment.) Delete `is_ext_path` and its remaining
-  call sites at `linux_abi/u_syscalls.ad:603,3338,7376`.
-- [x] **Plan 9 `Dir` record full emission.** (DONE: devproc + devnet + devblk all emit Dir records; the devblk path was un-shadowed by fixing the SYS_SECCOMP_NATIVE=318 collision → 320, commit 6bea0bfd. Remaining F10-6 follow-on: real atime/mtime + per-task uid.) F10-6 MVP only emits from
-  `/srv`. Extend to devproc / devnet / devblk dir listings so userland
-  can `stat`-per-line without re-stat.
-- [ ] **DE pivot finish — substitution not addition.** Wave 1–6 added
-  v2 client apps without deleting the corresponding `daemon_pixel`
-  fallback paths. Now physically remove the dead render code and the
-  no-op markers, replace the `daemon_pixel` framework with a thin
-  router. Compositor target: drop `user/hamUId.ad` below ~10 KLOC.
-- [x] **Runtime DE smoke test.** (DONE: test_installer_de_runlevel5.sh boots QEMU/OVMF + pmemsave framebuffer pixel-distinctness gate; plus test_de_scene_render/termfm/menu_input.) Boot the installer image in QEMU,
-  open a terminal, screenshot. Compare to a baseline. This is the
-  first non-grep DE test.
-- [x] **#439 buddy DOUBLE FREE.** (DONE: root-caused to free-list links stored under a user CR3 landing in COW pages; fixed with boot-CR3 guard, mm/page_alloc.ad:40-65.) Genuine reclaim-path double-free;
-  locks alone insufficient. Bisect against a reclaim disable.
+- [ ] **Host-test compile target** (depends on Track 1's `x86_64-linux`).
+  Reuse computational codegen; only the output/exit primitive maps to
+  Linux. Generated programs run natively — millions/hr, no QEMU.
+- [ ] **Program generator + predicted-output oracle.** Generator emits a
+  random valid Adder program AND computes its expected result by
+  construction; compiled program prints actual; compare. Catches the
+  whole May bug class with no second implementation.
+- [ ] **Crash/assert mode** — fuzz for compiler exceptions /
+  `CodeGenError` on valid input.
+- [ ] **Batched in-VM pass** for the ABI/namespace surface the host
+  target can't cover (syscall numbering, `_start`, 9P semantics): boot
+  Hamnix once, feed thousands of programs over a channel — don't reboot
+  per program.
+- [ ] **Report bug density** — this number gates the LLVM decision.
+- [ ] (Later, if LLVM lands) **differential oracle** — same generated
+  programs through both backends, compare.
+
+## Track 3 — Self-hosting on Linux + Hamnix
+
+**Why:** close the bootstrap. The build is currently Python-locked
+(`python3 -m compiler.adder`); the `.ad` compiler is incomplete.
+
+- [ ] **Finish `compiler/codegen.ad` to parity** with `codegen_x86.py`
+  (~3700 LOC gap: strings/string ops, remaining feature coverage). Use
+  the fuzzer (Track 2) to validate against the Python compiler.
+- [ ] **Build the `.ad` compiler as an `x86_64-linux` binary** (via
+  Track 1) so `adder_cc` runs on the host, compiling Adder→Hamnix at
+  native speed — Python becomes a one-time seed.
+- [ ] **Run the `.ad` compiler in Hamnix too** (`x86_64-adder-user`) for
+  on-device source packages (#186).
+- [ ] **Correct the false claim** — STATUS.md says on-device self-hosting
+  is "Done"; it is not (no build path uses the `.ad` compiler). Fix the
+  wording until the above lands.
+
+## Track 4 — Userland-isolated drivers (.ko out of kernel)
+
+**Why:** stock `.ko` modules load into kernel memory today
+(`linux_abi/loader.ad`) and share the kernel fault domain — a buggy
+vendor driver panics the box. A Plan 9 _and_ server-correct OS runs
+drivers as restartable userland file servers.
+
+**Scope:** ONE build. `.ko` support stays in every image (server and
+desktop alike) and loads on demand based on the hardware present — no
+`.ko`-free profile, no separate server build. The goal is to change
+*where `.ko` executes* (a restartable userland host, not kernel space),
+not whether it's available. Native drivers stay first choice where the
+hardware is standardized; `.ko` remains the escape hatch for vendor-mess
+HW (consumer wifi, GPUs) — now crash-isolated.
+
+- [ ] **User-mode driver framework (UMDF-style).** A driver runs as a
+  process that posts a `#X` file server; kernel provides the privileged
+  primitives it needs (MMIO map, IRQ delivery as a readable file, DMA
+  buffer alloc) over a controlled channel. Crash → kernel restarts the
+  server, kernel survives.
+- [ ] **Port the `.ko` loader into a userland host process.** Today
+  `linux_abi/loader.ad` runs in-kernel: ET_REL load, symbol resolution
+  (`linux_abi/exports.ad`), relocations, `%gs`-relative per-CPU. Move
+  this into the UMDF host; the `.ko`'s `kmalloc`/IRQ/DMA shims bottom out
+  into the kernel-provided primitives instead of direct kernel calls.
+- [ ] **Restart/crash-isolation test** — kill a userland driver under
+  load, prove the kernel + other drivers survive and the server respawns.
+
+## Track 5 — Kernel scaling rework
+
+**Why:** static-array ceilings calcify the longer they bake. Lift the
+*structural* limits now; defer perf tuning until a workload measures it.
+
+**Fix now (structural — gets harder over time):**
+- [ ] **Dynamic CPUs** — `MAX_CPUS=16` static arrays → dynamic per-CPU
+  allocation indexed by `smp_processor_id()`. Cite: `arch/x86/kernel/smp.ad`.
+- [ ] **Dynamic / list-based tasks** — `NTASKS=256` is now a *static
+  array of 256*; the scheduler scans all slots O(NTASKS) to pick next
+  (`kernel/sched/core.ad`). Convert to intrusive per-CPU run-lists so
+  pick-next is O(active), and drop the hard task ceiling.
+
+**Defer until a contended multicore workload exists (well-trodden, not research):**
+- [ ] **Per-waitqueue locks** — replace the global `wq_lock` serializing
+  every WAIT↔READY transition.
+- [~] **SMP work-stealing + CPU affinity** — per-CPU runqueue + load
+  balancing landed (#139/#151/#397); work-stealing and affinity open.
+- [ ] **Softirq / threaded IRQs** — IRQ handlers run in hard context
+  today (`arch/x86/kernel/irq.ad`); add bottom-half deferral.
+- [ ] **Per-CPU slab cache** — single global free list contends under
+  fork storms (`mm/slab.ad`).
+- [ ] **Buddy merge-on-free** — no coalescing today; fragments over long
+  uptime (`mm/page_alloc.ad`).
+
+**Deep / punt until measured:** NUMA-node awareness + per-node pools;
+RCU read-side for task/VFS traversal; LRU-ordered reclaim.
+
+## Track 6 — Adder code optimizer (→ rough C territory)
+
+**Why:** compiled Adder is sound but unoptimized. Baseline
+(`docs/bench_adder_host.md`, `scripts/bench_adder_host.sh`): geomean
+~1.6× of `gcc -O0`, ~4.3× of `-O2`, ~24× faster than CPython. The `-O2`
+gap is concentrated in a few classic passes, not anything LLVM-scale.
+
+**Goal:** rough C ballpark — **target ≤ ~2× of `-O2`** (from ~4.3×).
+Non-goal: `-O2` parity / auto-vectorization (the `lcg` chain is already
+1.9×; the `mmul`/`collatz` gaps at 6–8× are the prize).
+
+- [ ] **Step 0 — introduce a minimal IR.** Today's backend is single-pass,
+  no IR (`adder/compiler/codegen_x86.py`); you can't do regalloc/LICM on
+  a straight AST→asm emitter. Add a basic-block + virtual-register IR
+  between AST and x86 emission. (Reusable if LLVM is ever adopted — see
+  Decision points.)
+- [ ] **Register allocation.** Stop spilling every local to the stack
+  (keep induction vars + accumulators in registers). Biggest structural
+  win; closes the cases >2× over `-O0` (collatz 3.1×, mmul 2.2×).
+- [ ] **Loop-invariant code motion + strength reduction.** Hoist
+  invariant base addresses; strength-reduce index math like `i*DIM+k`.
+  Directly attacks the largest `-O2` gaps (mmul 7.8×, collatz 6.8×).
+- [ ] **CSE + simple inlining** of small leaf functions (`putc`, leaf
+  recursion).
+- [ ] **Validate:** every pass must preserve results — gate on the fuzzer
+  (Track 2) + `scripts/bench_adder_host.sh` correctness check; track the
+  Adder/`-O2` ratio falling in `docs/bench_adder_host.md`.
+
+## CI / verification gap
+
+- [ ] **Gate the two real boot paths in CI.** Today `ci.yml` gates 14
+  tests, all `-kernel` multiboot (only `test_efi_gop` touches OVMF, and
+  only checks pixels). Add as gates: `test_installer_boot_heartbeat.sh`
+  (USB/installer image, real OVMF) and `test_installer_nvme_inram.sh`
+  (installed-disk, real OVMF). Verify both finish reliably under TCG
+  first; the lane the original `ci.yml` header promised never landed.
 
 ---
+
+## Kernel hardening & correctness
+
+- [ ] **CPU-mitigations.** SMEP landed; **SMAP CR4-flip + KASLR + KPTI**
+  open. SMAP flip is gated OFF because high-half kernel pages are US=1 —
+  flipping triple-faults until they're re-stamped US=0. Cite:
+  `arch/x86/kernel/trap_diag.ad:382`.
+- [ ] **Suspend/resume.** S3 path real; HW wake-vector trampoline in
+  `entry.S` pending. S0ix later.
+- [ ] **F2 thin-shim conversion.** `SYS_NICE`/`SVC_CTL`/`NETCFG`/
+  `RESOLVE`/`WSYS_*` syscall arm BODIES still duplicate the ctl-file
+  implementation in `arch/x86/kernel/syscall.ad`; replace with thin
+  delegations.
+- [~] **#439 post-exit wedge.** Boot-CR3 guard landed
+  (`mm/page_alloc.ad:40-65`); a probabilistic reclaim-path
+  double-free/cycle in `_try_remove_buddy` may remain — needs runtime
+  verification. WIP snapshots on `worktree-agent-ae2373654138b1014`
+  (`9944f32b`), `worktree-agent-a9c57d837298c09e7` (`a22bd04f`).
+- [~] `stat`/`fstat` per-backend hooks — `do_stat` migrated to hook
+  table (`47ab21c5`); `do_fstat` per-server migration deferred.
+- [~] Delete the global `/var` tmpfs — per-Pgrp bind `/var → #t/var` in
+  place; backend `vfs_mount` router entry removal needs FS-routing
+  migration.
+- [~] Plan 9 `note_group` + cross-task `/proc/<pid>/note` landed
+  (`660978bb`); runtime verification pending.
 
 ## P9-shape hammer — long tail
 
-**Closed (see STATUS rows for cites + gates):** F1 #446, F2 #447,
-F3 #448, F4 #449, F5 #445, F6 #450, F8 #451, F9 #452. F10 second-pass
-audit #453 closed; report at `audit_F10_report.md`. F10-1 #454, F10-2
-#455, F10-3 #456 closed.
-
-**Open:**
 - [~] **F7 #390** — FD-mark fold continuation. Pipes next (highest
-  leverage; `NR_FDS=16` cap will pinch Debian userland once lifted).
-- F10-4 through F10-12: nine more findings from F10 audit (afd Tauth,
-  init/main.ad split, Dir record, etc.).
-
----
+  leverage).
+- [ ] **F10-4 … F10-12** — remaining F10-audit findings (afd Tauth,
+  `init/main.ad` split, full Dir-record atime/mtime + per-task uid, etc.).
 
 ## hamUI / DE track
 
 - [~] **`lib/hamui.ad` MATE-class widget set** — menu/menubar,
-  scrolledwindow, dialog/modal, notebook/tabs, radio, slider/scale,
-  spinbutton, combobox, progressbar, separator, image, toolbar,
-  statusbar, treeview/grid, multi-line editable textview. Plus grid
-  layout container + per-widget align/expand/fill, dynamic editing
-  (insert/delete at caret, selection), widget destruction, damage/dirty
-  tracking. v1 + Inc 1/2/3 landed.
-- [~] **Rio-faithful reshape** — `#w` per-process namespace bind LANDED.
-  Image+dirty-rect wire format SPEC landed; impl across devwsys+hamUId+
-  lib/hamui in DE pivot waves 1-6. Substitution finish above.
+  scrolledwindow, dialog/modal, notebook/tabs, radio, slider, spinbutton,
+  combobox, progressbar, separator, image, toolbar, statusbar,
+  treeview/grid, multi-line textview; grid layout + per-widget
+  align/expand/fill, dynamic editing, destruction, damage tracking.
+  v1 + Inc 1/2/3 landed.
+- [~] **Rio-faithful reshape** — `#w` per-process bind landed; image+
+  dirty-rect wire format being implemented across devwsys+hamUId+hamui.
+- [ ] **DE pivot finish — substitution not addition.** Physically remove
+  the dead `daemon_pixel` render fallbacks (~20K dead LOC in
+  `user/hamUId.ad`); replace with a thin router. Target: `user/hamUId.ad`
+  below ~10 KLOC.
 - [ ] **hamsh `use hamui`** — bindings; may need hamsh closures + event
   loop + persistent state.
-- [ ] X11/Xvfb bridge in a kind=fb layer (path to Firefox/Chromium).
-- [~] BDF font store landed; runtime font file loading deferred
-  (compiled-in glyph tables for v1).
-
-> **ARM64 deprioritized below desktop work (user 2026-06-10).** Phase
-> 50 preserved on `worktree-agent-a48facf53ef25a377` (`6f217d09`), NOT
-> landed.
-
----
+- [ ] X11/Xvfb bridge in a `kind=fb` layer (path to Firefox/Chromium).
+- [~] BDF font store landed; runtime font-file loading deferred.
+- Known bugs: cursor hotspot (clicks at arrow bottom, not tip); terminal
+  ~0.5s input lag.
 
 ## GPU / graphics (#181–185, native-first)
 
-Target: glxgears + vkcube spinning in a hamUI window, on accelerated
-HW where present.
+Target: glxgears + vkcube spinning in a hamUI window, accelerated where
+present. **Laws:** (1) DE never requires the Linux *namespace* — baseline
+is native Vulkan + native software rasterizer (NOT lavapipe). (2) `.ko`
+modules via the L-shim ARE used (`i915.ko`); `.ko` ≠ namespace.
 
-**Two laws (do not conflate):** (1) The DE never requires the Linux
-*namespace*. Baseline is native Vulkan + native software rasterizer.
-NOT lavapipe. (2) Linux `.ko` kernel modules via the L-shim ARE used
-(`i915.ko` drives Intel silicon). `.ko` ≠ namespace.
+- [~] **#181 Phase 0** — native Vulkan spine + software rasterizer + WSI.
+- [~] **#182 Phase 1** — native virtio-gpu + native venus in a VM.
+- [~] **#183 Phase 2** — DE composites via native spine; Linux X11 apps
+  bridge in via venus-shaped ICD + Zink (optional).
+- [ ] **#184 Phase 3 (METAL)** — Intel i915 silicon via `i915.ko`.
+- [ ] **#185 Phase 4 (optional)** — native ANV-equivalent.
 
-- [~] **#181 Phase 0** — all-native Vulkan spine + software rasterizer
-  + present/WSI. Zero Linux. Always-works baseline.
-- [~] **#182 Phase 1** — native virtio-gpu + native venus (Vulkan
-  marshalling) in a VM.
-- [~] **#183 Phase 2** — DE composites via the native spine; Linux X11
-  apps bridge IN via venus-shaped shim ICD + Zink, optional.
-- [ ] **#184 Phase 3 (METAL-ONLY)** — Intel i915 silicon via `i915.ko`
-  through L-shim.
-- [ ] **#185 Phase 4 (long pole, optional)** — native ANV-equivalent.
+## Driver / storage / input maturity
 
----
-
-## Open kernel work — long tail
-
-### Latent crashes
-- [ ] **#439 probabilistic post-exit wedge** — buddy DOUBLE FREE then
-  CYCLE in `_try_remove_buddy` with IRQs masked. WIP fix on
-  `worktree-agent-ae2373654138b1014` (`9944f32b` snapshot) + backup on
-  `worktree-agent-a9c57d837298c09e7` (`a22bd04f` snapshot). Listed
-  under post-audit wave above.
-
-### Phase D follow-ups
-- [~] `stat`/`fstat` per-backend hooks — path-keyed `do_stat` migrated
-  to F10-2-shape hook table `47ab21c5`. `do_fstat` per-server hook
-  migration deferred.
-- [~] Delete the global `/var` tmpfs — per-Pgrp bind `/var → #t/var`
-  already in place (F1 substrate). Backend-internal `vfs_mount` router
-  entry remains; removal requires FS routing model migration.
-
-### §3 Signals
-- [~] Plan 9 `note_group` + cross-task `/proc/<pid>/note` structural
-  landed `660978bb`. Runtime verification pending.
-
-### §7 Entropy
-- [~] ChaCha20 CSPRNG landed.
-
-### §8 SMP
-- [~] Per-CPU runqueue + load balancing landed (#139, #151, #397).
-  Open: work stealing, CPU affinity.
-
-### §10 Networking
-- [~] Unicast ARP + gratuitous ARP + ICMP time-exceeded + ICMP redirect
-  helpers landed `056d4500`. Forwarding-path auto-wiring gated behind
-  `ip_forwarding_enabled` flag (default 0).
-
-### §12 FS write maturity
-- [ ] ext4 truncate on index-node files; growing a full ext4 dir block.
-  (Attempt `bc1cb9c8` reverted as `bb7ba653` — broke heartbeat boot.)
-
-### §17 stock-Linux `.ko` (lowest)
-- [ ] `MAX_EXPORTS` bumps; `usbcore`+`xhci_hcd`, `libphy`, `8021q`,
-  `nf_conntrack` core.
-
----
-
-## Metal bring-up (human-in-the-loop)
-
-- [ ] **xHCI hand-rolled v1 metal sub-skip** — HCH-clear MMIO poll
-  wedges on real Intel NUC silicon.
-- [ ] Asus i5-4210U boot crash; built-in keyboard never responded under
-  Legacy/BIOS (hypothesis EHCI-routed).
-- [ ] MMIO-stall class audit: ehci, ahci, nvme.
-- [ ] Real NIC silicon: e1000e EEPROM on physical Intel; r8169 RX on
-  RTL8168; Broadcom tg3; Intel igb.
-- [ ] Drop the FAT12 32 MiB ESP cap via GPT-ESP path.
-- [ ] NUC network silent on real I219 — needs HW time.
-- [ ] **#117/#118** — Verify >4GB fix kills real-HW #UD + persisted
-  logs (USB boot at `-m 8G`).
-
-## Storage driver maturity
-
-- [ ] AHCI NCQ (serialises on slot 0 today); hot-plug / COMRESET
-  retry; multi-port naming (`sd1`...).
+- [ ] AHCI NCQ (serialises on slot 0); hot-plug / COMRESET retry;
+  multi-port naming (`sd1`…).
 - [ ] NVMe multi-queue + multi-namespace.
-- [ ] Partition: extended-CHS chains, BSD disklabel, APM; GPT UTF-16
-  names; `mount /dev/sd0p1 /mnt` path-to-slot resolver.
-- [ ] ext4 mkfs multi-block-group layout; journal at mkfs time.
-
-## Input
-
-- [ ] Dead-key / compose / IME; blocking read on `/dev/mouse`; MADT
-  IRQ-override consumption.
+- [ ] Partition: extended-CHS, BSD disklabel, APM; GPT UTF-16 names;
+  `mount /dev/sd0p1 /mnt` path-to-slot resolver.
+- [ ] ext4 mkfs multi-block-group layout + journal at mkfs time; ext4
+  truncate on index-node files; growing a full dir block (prior attempt
+  `bc1cb9c8` reverted `bb7ba653` — broke heartbeat boot).
+- [~] Networking forwarding-path auto-wiring (gated behind
+  `ip_forwarding_enabled`, default 0).
+- [ ] Input: dead-key / compose / IME; blocking read on `/dev/mouse`;
+  MADT IRQ-override consumption.
+- [ ] stock-Linux `.ko` coverage: `MAX_EXPORTS` bumps; `usbcore`+
+  `xhci_hcd`, `libphy`, `8021q`, `nf_conntrack` core. (Reconcile with
+  Track 4 — `.ko` work should target the userland host, not the kernel.)
 
 ## Userspace polish
 
-- [ ] **#439 family** — `enter linux { /bin/sh }` interactive stdin
-  doesn't reach the Linux process. sshd-driven sessions have their own
-  pty.
+- [ ] `enter linux { /bin/sh }` interactive stdin doesn't reach the Linux
+  process (sshd sessions have their own pty).
 - [ ] Nested `` `{ } `` command substitution clobbers (hamsh).
-- [ ] TEMP_DEBUG cleanup pass when bring-up stabilises.
-- [ ] busybox `ls` enumeration XFAIL (musl DIR-fd round-trip);
-  busybox `sh -c "a|b"` internal-pipeline `#GP`.
+- [ ] busybox `ls` enumeration XFAIL (musl DIR-fd round-trip); busybox
+  `sh -c "a|b"` internal-pipeline `#GP`.
 - [ ] `/bin` tool audit for cwd-relative defaults.
 - [ ] CPython: trim frozen stdlib; PGO/LTO; C extensions once a U-track
   `ld.so` exists.
+- [ ] TEMP_DEBUG cleanup pass when bring-up stabilises.
+
+## Metal bring-up (human-in-the-loop)
+
+- [ ] **xHCI v1 metal** — HCH-clear MMIO poll wedges on real Intel NUC;
+  USB mouse dead on metal.
+- [ ] Asus i5-4210U boot crash; built-in keyboard never responded under
+  Legacy/BIOS (hypothesis EHCI-routed).
+- [ ] MMIO-stall class audit: ehci, ahci, nvme.
+- [ ] Real NIC silicon: e1000e EEPROM on Intel; r8169 RX on RTL8168;
+  Broadcom tg3; Intel igb; NUC I219 silent.
+- [ ] Drop the FAT12 32 MiB ESP cap via GPT-ESP path.
+- [ ] **#117/#118** — verify >4GB fix kills real-HW #UD + persisted logs
+  (USB boot at `-m 8G`).
 
 ## Bigger lifts — no immediate plan
 
 - [ ] iwlwifi / ath11k / mt76 — real radios. Firmware via the planned
-  `non-free-firmware` channel at `https://255.one/non-free-firmware/`.
+  `non-free-firmware` channel.
 - [ ] Browser in a hamUI window — gated on hamUI Phase 5 (X11 bridge).
-- [~] Multi-arch ARM64 (#175): aarch64 backend landed; full bare-metal
-  kernel port (Phase 3+) open.
-- [ ] **Arch convergence** — factor an arch-interface; link shared
-  portable core into ARM64. Gating: do once ARM64 bring-up is stable.
-- [~] **#186 Native packages source-based (Gentoo-style)** — landed
-  defaults compile-from-source.
+- [~] Multi-arch ARM64 (#175) — aarch64 backend landed; full bare-metal
+  kernel port (Phase 3+) open. **Note:** an LLVM second backend (see
+  Decision points) would subsume much of this.
+- [ ] **Arch convergence** — factor an arch-interface; link a shared
+  portable core into ARM64. Do once ARM64 bring-up is stable.
 - [ ] Signed package indexes (sha256 covers tarballs; index unsigned).
