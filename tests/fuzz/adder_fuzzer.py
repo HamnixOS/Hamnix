@@ -381,6 +381,7 @@ class Program:
         self.subset = subset
         self.rng = random.Random(seed)
         self.lines = []
+        self.toplevel = []            # struct/class defs emitted before helpers
         self.acc = 0                  # oracle: running uint64 accumulator
         self.helpers = []             # list of (name, py_callable, n_args)
 
@@ -390,8 +391,19 @@ class Program:
     def emit(self, s):
         self.lines.append(s)
 
+    def emit_top(self, s):
+        self.toplevel.append(s)
+
     def build(self):
         rng = self.rng
+        # ----- struct + class definitions (top level) ------------------------
+        # codegen.ad now lays out structs/classes, member load/store, method
+        # dispatch + construction (Track-3 self-hosting parity). Emit these in
+        # BOTH modes so the differential gate exercises them; the rng draw
+        # sequence is identical across modes (the structs are always emitted).
+        self._build_struct_def()
+        self._build_class_def()
+
         # ----- globals: 2-D array + one array per store width ----------------
         rows = rng.randint(2, 4)
         cols = rng.randint(2, 4)
@@ -438,13 +450,20 @@ class Program:
         self._gen_grid_traffic(env)   # 2-D array global (now codegen.ad-OK)
         self._gen_store_traffic(env)
         self._gen_scalar_global_traffic(env)
+        self._gen_struct_traffic(env)     # struct locals: member store/read
+        self._gen_class_traffic(env)      # class construction + method dispatch
+        self._gen_for_range_traffic(env)  # for v in range(...)
+        self._gen_for_array_traffic(env)  # for v in <array global>
+        self._gen_do_while_traffic(env)   # do/while
         self._gen_loop(env)
         self._gen_helper_calls(env)
 
         self.emit(f"    print_u64(g_accum)")
         self.emit(f"    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))")
 
-        body = PRELUDE + "\n" + "\n".join(self.lines) + "\n"
+        body = (PRELUDE + "\n"
+                + "\n".join(self.toplevel) + "\n"
+                + "\n".join(self.lines) + "\n")
         self.expected_stdout = str(self.acc & umask(64))
         self.expected_exit = self.acc & 0xFF
         return body
@@ -585,6 +604,168 @@ class Program:
     def _fold_value(self, src_u64, py_u64):
         self.emit(f"    g_accum = g_accum + ({src_u64})")
         self._acc_add(py_u64)
+
+    # ======================================================================
+    # Track-3 self-hosting parity constructs: structs, classes/methods,
+    # for-loops (range + array), do-while. Each is generated in BOTH subset
+    # and default mode (byte-identical rng stream) and folded into g_accum so
+    # the by-construction oracle has exact ground truth.
+    # ======================================================================
+
+    # ---- struct definition: `Pt` with one scalar field per store width -------
+    def _build_struct_def(self):
+        rng = self.rng
+        # A fixed field set (one per store width) keeps the layout
+        # deterministic; field VALUES are random and shadowed at runtime.
+        self.struct_fields = list(STORE_TYPES)
+        self.struct_shadow = {}                 # field name -> stored value
+        self.emit_top("class Pt:")
+        for t in self.struct_fields:
+            fname = f"f_{t.name}"
+            self.emit_top(f"    {fname}: {t.name}")
+            self.struct_shadow[fname] = 0
+        self.emit_top("")
+
+    # ---- struct local: member stores + reads ---------------------------------
+    def _gen_struct_traffic(self, env):
+        rng = self.rng
+        # `Pt` has no __init__, so declare a bare (zeroed) struct local; every
+        # field is explicitly stored below before being read.
+        self.emit("    pt: Pt")
+        # Member STORE: pt.f_T = <typed expr>; sized store truncates to T.
+        for t in self.struct_fields:
+            fname = f"f_{t.name}"
+            g = Gen(rng, env)
+            e = g._expr_typed(2, t)
+            self.emit(f"    pt.{fname} = {e.src}")
+            self.struct_shadow[fname] = t.wrap(e.val)
+        # Augmented member store on one field: pt.f_T += <typed expr>.
+        # The field load widens via the field's signedness, the add is 64-bit,
+        # and the sized store truncates back to T.
+        for _ in range(rng.randint(1, 2)):
+            t = rng.choice(self.struct_fields)
+            fname = f"f_{t.name}"
+            g = Gen(rng, env)
+            e = g._expr_typed(2, t)
+            self.emit(f"    pt.{fname} = pt.{fname} + ({e.src})")
+            old_reg = _to_reg(t.wrap(self.struct_shadow[fname]))  # field reload widens
+            new = t.wrap(old_reg + e.reg)
+            self.struct_shadow[fname] = new
+        # Member READ: fold each field widened to uint64 via its signedness.
+        for t in self.struct_fields:
+            fname = f"f_{t.name}"
+            stored = self.struct_shadow[fname]
+            self._fold_value(
+                f"cast[uint64](cast[{t.name}](pt.{fname}))",
+                U64.wrap(stored))
+
+    # ---- class definition: fields + __init__ + a method ----------------------
+    def _build_class_def(self):
+        rng = self.rng
+        # `Counter` holds two int64 fields set by __init__ and a method that
+        # returns an int64 derived from the fields and an argument. All int64
+        # so the oracle is a straight signed-64 model.
+        self.emit_top("class Counter:")
+        self.emit_top("    a: int64")
+        self.emit_top("    b: int64")
+        # __init__(self, ia, ib): a = ia; b = ib
+        self.emit_top("    def __init__(self, ia: int64, ib: int64):")
+        self.emit_top("        self.a = ia")
+        self.emit_top("        self.b = ib")
+        # combine(self, x): r = a * x + b ; return r
+        self.emit_top("    def combine(self, x: int64) -> int64:")
+        self.emit_top("        r: int64 = self.a * x + self.b")
+        self.emit_top("        return r")
+        self.emit_top("")
+
+    def _gen_class_traffic(self, env):
+        rng = self.rng
+        ia = rng.randint(-1000, 1000)
+        ib = rng.randint(-1000, 1000)
+        x = rng.randint(-50, 50)
+        ia_s = f"cast[int64](0 - {(-ia)})" if ia < 0 else f"cast[int64]({ia})"
+        ib_s = f"cast[int64](0 - {(-ib)})" if ib < 0 else f"cast[int64]({ib})"
+        x_s = f"cast[int64](0 - {(-x)})" if x < 0 else f"cast[int64]({x})"
+        self.emit(f"    ctr: Counter = Counter({ia_s}, {ib_s})")
+        # Read the fields back (member load), fold each.
+        self._fold_value("cast[uint64](ctr.a)", U64.wrap(I64.wrap(ia)))
+        self._fold_value("cast[uint64](ctr.b)", U64.wrap(I64.wrap(ib)))
+        # Method dispatch: r = a*x + b.
+        r = I64.wrap(I64.wrap(I64.wrap(ia) * I64.wrap(x)) + I64.wrap(ib))
+        self.emit(f"    cr: int64 = ctr.combine({x_s})")
+        self._fold_value("cast[uint64](cr)", U64.wrap(r))
+
+    # ---- for v in range(...) : integer counter loop --------------------------
+    def _gen_for_range_traffic(self, env):
+        rng = self.rng
+        # Ascending range(start, stop) with a body that sums i (and conditions
+        # on i) into a uint64 accumulator. continue/break exercised lightly.
+        start = rng.randint(0, 5)
+        stop = start + rng.randint(3, 12)
+        thr = rng.randint(start, stop)
+        self.emit("    fr_sum: uint64 = cast[uint64](0)")
+        self.emit(f"    for fi in range(cast[int64]({start}), cast[int64]({stop})):")
+        self.emit(f"        if fi < cast[int64]({thr}):")
+        self.emit("            fr_sum = fr_sum + cast[uint64](fi)")
+        self.emit("        else:")
+        self.emit("            fr_sum = fr_sum + cast[uint64](fi * cast[int64](2))")
+        py = 0
+        for fi in range(start, stop):
+            py += fi if fi < thr else I64.wrap(fi * 2)
+            py &= umask(64)
+        self._fold_value("fr_sum", py)
+
+        # A range(stop) one-arg form with a `continue` (skip even i) + break.
+        n = rng.randint(4, 10)
+        brk = rng.randint(n, n + 3)        # may not trigger (>=n) -> full loop
+        self.emit("    fr2: uint64 = cast[uint64](0)")
+        self.emit(f"    for fj in range(cast[int64]({n})):")
+        self.emit(f"        if fj >= cast[int64]({brk}):")
+        self.emit("            break")
+        self.emit("        fr2 = fr2 + cast[uint64](fj)")
+        py2 = 0
+        for fj in range(n):
+            if fj >= brk:
+                break
+            py2 = (py2 + fj) & umask(64)
+        self._fold_value("fr2", py2)
+
+    # ---- for v in <array global> : element iteration -------------------------
+    def _gen_for_array_traffic(self, env):
+        rng = self.rng
+        # Iterate one of the per-width store arrays (already populated by
+        # _gen_store_traffic) and sum the elements, widened per the element
+        # type's signedness. The loop var is a private copy of the element.
+        t = rng.choice(STORE_TYPES)
+        name, n, shadow = self.store_arrays[t]
+        self.emit("    fa_sum: uint64 = cast[uint64](0)")
+        self.emit(f"    for fe in {name}:")
+        self.emit(f"        fa_sum = fa_sum + cast[uint64](cast[{t.name}](fe))")
+        py = 0
+        for v in shadow:
+            py = (py + U64.wrap(t.wrap(v))) & umask(64)
+        self._fold_value("fa_sum", py)
+
+    # ---- do { body } while (cond) --------------------------------------------
+    def _gen_do_while_traffic(self, env):
+        rng = self.rng
+        # A do-while that runs at least once; body sums a counter, condition
+        # gates the next iteration. `continue` exercised via an if.
+        n = rng.randint(1, 8)
+        self.emit("    dw_i: int64 = 0")
+        self.emit("    dw_sum: uint64 = cast[uint64](0)")
+        self.emit("    do:")
+        self.emit("        dw_sum = dw_sum + cast[uint64](dw_i)")
+        self.emit("        dw_i = dw_i + 1")
+        self.emit(f"    while dw_i < cast[int64]({n})")
+        py = 0
+        dw_i = 0
+        while True:
+            py = (py + dw_i) & umask(64)
+            dw_i += 1
+            if not (dw_i < n):
+                break
+        self._fold_value("dw_sum", py)
 
 
 def render_program(seed, subset=False):

@@ -104,8 +104,49 @@ and the inner by the scalar element; the index-scale helper has an `imulq`
 fallback for non-power-of-2 strides. As of this work the differential
 generator emits identical traffic in subset and default mode (subset ==
 default), so the gate exercises every construct the product backend must
-handle. **Remaining for a default-build cutover:** classes/methods, free
-for-loops over arrays, structs/member access, do-while, floats.
+handle.
+
+**Track-3 self-hosting parity (structs / classes / loops) — LANDED.**
+`codegen.ad` now mirrors `codegen_x86.py` for:
+
+- **Structs / member access.** `layout_struct` builds an 8-byte-rounded
+  C-ABI field layout (each field aligned to `natural_align`, capped at 8;
+  inheritance prepends base fields left-to-right transitively). Struct
+  table = `st_*` arrays + a flat `sf_*` field table. Locals carry a
+  struct-table index (`loc_struct_idx`, with `loc_struct_is_ptr` for the
+  `Ptr[Struct]` `self` receiver); globals carry `glob_struct_idx` (an
+  in-place `.bss` value of `total_size` bytes). `gen_member_address`
+  computes `&obj + field_offset` for an in-place value, or `(loaded ptr
+  value) + field_offset` for a `Ptr[Struct]` — exactly
+  `gen_member_address`/`_obj_is_pointer`. `gen_member_load` does a sized
+  load of the field width (array/embedded-struct fields decay to their
+  address); `gen_assign_member` does the sized store + augmented
+  read-modify-write. `emit_add_imm_rax` matches GNU `as`' imm8/imm32 add
+  encoding choice for the field offset.
+- **Classes / methods / construction.** A method `def m(self, …)` is
+  emitted as a free function (`gen_method`) with an implicit first arg =
+  the receiver address; its mangled identity is the `(owner-class name,
+  method name)` pair (the `Class__method` symbol), resolved via a separate
+  method-symbol table (`mfn_*`) + method-call fixups (`mfx_*`). `obj.m(args)`
+  (`gen_method_call`) resolves the owning class (own-then-base first-match,
+  mirroring `class_methods`) and passes `&obj` (or the pointer value) as
+  arg0. `f: Foo = Foo(args)` (`gen_ctor_init`) lowers to `Foo__init(&f,
+  args)`. The `self` param + every `self` reference are matched by the
+  parser's `nd_aux==1` marker (not by name), via `cg_self_off`/`cg_self_struct`.
+- **For-loops + do-while.** `gen_for` lowers `for v in range(start, stop,
+  step)` to a counter loop (compile-time loop direction from a constant
+  negative step) and `for v in <array>` to a hidden-index walk binding `v`
+  to a private element copy; `continue` lands on the induction step (not
+  the top), matching `LoopContext`. `gen_do_while` runs the body once then
+  a `jnz`-back conditional test; `continue` targets that test. Both reuse
+  the existing loop-frame break/continue machinery.
+
+The struct fixed-32 differential is value-based (not byte-identical) so
+`codegen.ad` is free to pick its own register/encoding within each lowering
+as long as the runtime value matches the oracle. **Remaining for a
+default-build cutover:** multi-base receiver-offset bump, by-value embedded
+struct fields, struct-typed params/returns by value, `for`-over-`Ptr[T]`,
+floats — each currently `cg_fail`s rather than miscompiling.
 
 ## Related docs
 
