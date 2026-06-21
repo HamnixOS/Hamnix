@@ -62,8 +62,12 @@ set +e
 # No input piped in: a fully idle interactive shell MUST still emit
 # heartbeats. If it doesn't, a kernel busy-loop or a userland CPU hog
 # is starving the prompt.
+# -m 1G: the debug kernel ELF carries a large embedded initramfs (~200MB
+# .text). At -m 256M the BIOS GRUB ISO loader (via _kernel_iso.sh) #PFs
+# "error: out of memory" before it can hand control to the kernel. 1G
+# matches the installer/rl5 harness budget and leaves GRUB room to load.
 timeout "${HEARTBEAT_TIMEOUT}s" qemu-system-x86_64 \
-    -kernel "$ELF" -smp 2 -nographic -no-reboot -m 256M \
+    -kernel "$ELF" -smp 2 -nographic -no-reboot -m 1G \
     -monitor none -serial stdio < /dev/null > "$LOG" 2>&1
 rc=$?
 set -e
