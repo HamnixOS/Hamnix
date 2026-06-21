@@ -198,15 +198,16 @@ try:
             rc = 3
         else:
             keyfile = f"/dev/wsys/{term_wid}/keys"
-            # Focus the terminal: a /dev/mouse click inside it routes focus,
-            # but we ALSO write directly to its keys file (which the terminal
-            # reads regardless of focus). Click anyway so the compositor marks
-            # it focused/topmost for a clean screendump.
-            for cx, cy in (("6657","8191"), ("10649","10922")):
-                send(f"echo '{cx} {cy} 1 0 1' > /dev/mouse")
-                time.sleep(0.2)
-                send(f"echo '{cx} {cy} 0 0 1' > /dev/mouse")
-                time.sleep(0.2)
+            ctlfile = f"/dev/wsys/{term_wid}/ctl"
+            # RAISE the terminal above the other DE windows (editor / FM /
+            # calculator stack on top of it at rl5 launch and OCCLUDE its
+            # pane in a screendump). The `raise` ctl bumps it above all
+            # decorated windows so the PNG can actually show the pane. The
+            # scene-cat assertions below are occlusion-independent regardless.
+            send(f"echo raise > {ctlfile}")
+            time.sleep(0.5)
+            # We inject keys by writing directly to its keys file (the
+            # terminal reads them regardless of compositor focus).
             time.sleep(0.6)
             screendump("pre")
 
@@ -216,6 +217,7 @@ try:
             keypress(keyfile, 10)               # Enter
             send("echo SCN1_TYPE_END")
             time.sleep(6.0)                     # let Debian ls run + stream
+            send(f"echo raise > {ctlfile}"); time.sleep(0.5)
             screendump("scn1_enter_linux")
             send(f"echo SCN1_SCENE_BEGIN; cat /dev/wsys/{term_wid}/scene; echo SCN1_SCENE_END")
             time.sleep(2.0)
@@ -226,6 +228,7 @@ try:
             keypress(keyfile, 10)               # Enter
             send("echo SCN2_TYPE_END")
             time.sleep(3.0)
+            send(f"echo raise > {ctlfile}"); time.sleep(0.5)
             screendump("scn2_not_found")
             send(f"echo SCN2_SCENE_BEGIN; cat /dev/wsys/{term_wid}/scene; echo SCN2_SCENE_END")
             time.sleep(2.0)
@@ -235,6 +238,7 @@ try:
             type_str(keyfile, "echo hi")
             send("echo SCN3_TYPE_END")
             time.sleep(2.0)
+            send(f"echo raise > {ctlfile}"); time.sleep(0.5)
             screendump("scn3_echo")
             send(f"echo SCN3_SCENE_BEGIN; cat /dev/wsys/{term_wid}/scene; echo SCN3_SCENE_END")
             time.sleep(2.0)
