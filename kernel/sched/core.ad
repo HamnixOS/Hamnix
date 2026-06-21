@@ -826,6 +826,27 @@ class TaskStruct:
     # the END of TaskStruct so no earlier offset shifts.
     uaccess_kernel: uint64
 
+    # Track 5: intrusive per-CPU READY run-list links. When this task is
+    # STATE_READY it is a member of rq_head[rq_cpu]'s doubly-linked list;
+    # rq_next/rq_prev are slot indices (RQL_NIL at the ends). When the task
+    # is NOT STATE_READY both are RQL_NIL (off every run-list). These let
+    # _pick_next() walk ONLY the runnable set on the local CPU instead of
+    # scanning all NTASKS slots. Maintained exclusively by _rq_list_insert /
+    # _rq_list_remove, which are called at every transition into/out of
+    # STATE_READY. Placed at the END of TaskStruct so no earlier offset
+    # shifts; a fresh .bss slot has both == 0, which _rq_list_* treat as
+    # "not currently linked" via the parallel rq_on_list flag below.
+    rq_next:      uint64
+    rq_prev:      uint64
+    # Run-list membership tag: 0 = NOT on any run-list; otherwise it holds
+    # (listed_cpu + 1), i.e. which CPU's rq_head list this slot is currently
+    # linked into. Encoding the cpu (rather than a bare 0/1) lets
+    # _rq_list_remove fix the correct rq_head even when rq_cpu has already been
+    # re-stamped (affinity migration / work-steal change rq_cpu between the
+    # insert and the matching remove). Avoids ambiguity with the .bss-zero
+    # rq_next/rq_prev (slot 0 is a valid link target). Cleared on remove.
+    rq_on_list:   uint64
+
 
 # State constants (mirror Linux's task->state space at a tiny scope).
 STATE_FREE:    uint64 = 0
@@ -997,6 +1018,55 @@ RFLAGS_INITIAL: uint64 = 0x202           # bit 1 reserved | bit 9 IF=1
 NTASKS:      uint64 = 256
 task_table:  Array[256, TaskStruct]
 next_pid:    uint64 = 1
+
+# =====================================================================
+# O(1) acceleration structures (Track 5 — kill the O(NTASKS) scans)
+# =====================================================================
+# The slot-indexed task_table stays the backing store (slot == the stable
+# cross-subsystem task identity used by /proc, the satellite tables, and
+# every task_struct_at() caller). What CHANGES is that the three hot-path
+# linear scans over all NTASKS slots are replaced by O(1)/O(active) lookups:
+#
+#   1. _find_free_slot()   — O(NTASKS) scan for a STATE_FREE slot
+#                            → intrusive FREE-slot freelist (free_head + the
+#                              fl_next links below). Pop = O(1).
+#   2. task_lookup_by_pid()— O(NTASKS) scan matching .pid
+#                            → open-addressed pid->slot hash. Lookup = O(1)
+#                              amortised. A linear fallback is retained as a
+#                              correctness safety net (a missed insert never
+#                              corrupts, it just degrades to the old scan).
+#   3. _pick_next()        — O(NTASKS) scan for the min-vruntime READY slot
+#                            → per-CPU intrusive READY run-LIST (rq_head[] +
+#                              the rq_next/rq_prev TaskStruct links). The scan
+#                              now walks ONLY this CPU's runnable set.
+#
+# These are pure accelerators layered over the existing state machine; the
+# task_table[] semantics are unchanged.
+
+# --- (1) FREE-slot freelist -----------------------------------------
+# fl_next[s] = next free slot after s, or FL_NIL at the tail. free_head is
+# the list head (FL_NIL when no free slot). Built once in sched_init() over
+# every slot, popped on alloc, pushed on reap. Slot 0 is reserved for the
+# boot task and is NEVER on the freelist (claimed in sched_init()).
+FL_NIL:      uint64 = 0xFFFFFFFFFFFFFFFF
+fl_next:     Array[256, uint64]    # NTASKS-sized
+free_head:   uint64 = 0xFFFFFFFFFFFFFFFF   # FL_NIL until sched_init() builds it
+free_inited: uint64 = 0
+
+# --- (2) pid -> slot hash -------------------------------------------
+# Open-addressed (linear-probe) hash sized at 2*NTASKS so the load factor
+# stays <= 0.5 (cheap probes). Each bucket holds a pid (PIDH_EMPTY = vacant,
+# PIDH_DELE = tombstone) and the slot it maps to. Lifetime: inserted when a
+# task's pid is stamped (_task_set_pid), removed when its slot frees
+# (_task_clear_pid). task_lookup_by_pid probes here first; on any miss it
+# falls back to the legacy linear scan so a maintenance gap can never break
+# /proc / waitpid / signal delivery — it only loses the speed-up.
+PIDH_SIZE:   uint64 = 512                    # 2 * NTASKS
+PIDH_EMPTY:  uint64 = 0                       # pid 0 is never a real task pid
+PIDH_DELE:   uint64 = 0xFFFFFFFFFFFFFFFF      # tombstone sentinel
+pidh_pid:    Array[512, uint64]              # PIDH_SIZE
+pidh_slot:   Array[512, uint64]             # PIDH_SIZE
+pidh_inited: uint64 = 0
 # sched_setaffinity(2) default mask: every CPU permitted. A task whose
 # cpu_affinity == AFFINITY_ALL is fully unpinned, so placement / steal
 # behave exactly as they did before affinity enforcement existed. 64 bits
@@ -1057,6 +1127,19 @@ current_idx_pcpu: Percpu[uint64]
 NR_RQ: uint64 = 16
 rq_locks: Array[16, uint32]
 wq_lock: uint32 = 0
+
+# Track 5: per-CPU READY run-list heads. rq_head[c] is the slot index of the
+# first STATE_READY task owned by CPU c, or RQL_NIL when c's runqueue is
+# empty. The list is doubly-linked through TaskStruct.rq_next/rq_prev (slot
+# indices). Membership is mutated ONLY under rq_locks[c] (the same lock that
+# already guards CPU c's READY/RUNNING set), so the list and the state field
+# stay consistent. _pick_next() walks rq_head[my_cpu] instead of all NTASKS
+# slots. rq_inited gates the very early boot window before sched_init()
+# fills the heads with RQL_NIL (the .bss zero would otherwise read as
+# "slot 0 is the head").
+RQL_NIL: uint64 = 0xFFFFFFFFFFFFFFFF
+rq_head: Array[16, uint64]           # NR_RQ-sized
+rq_inited: uint64 = 0
 
 # DEPRECATED single global rq lock. Retained ONLY as the wq_lock alias name
 # was a bigger rename; all former rq_lock sites have been migrated to either
@@ -1217,6 +1300,10 @@ def sched_make_ready_on(slot: uint64, target_cpu: uint64):
     _rq_lock_cpu(tc)
     task_table[slot].rq_cpu = tc
     task_table[slot].state  = STATE_READY
+    # Track 5: enqueue onto tc's intrusive READY run-list under tc's rq lock
+    # (the same lock that guards tc's READY membership). _pick_next on tc
+    # walks this list.
+    _rq_list_insert(slot, tc)
     _rq_unlock_cpu(tc)
     # Kick the owning CPU (directed). No-op on a uniprocessor; if tc is the
     # caller's own CPU the IPI self-targets harmlessly (handler just EOIs).
@@ -1992,6 +2079,10 @@ def rtsched_selftest() -> int32:
         pass_all = 0
     task_table[ua].state = STATE_READY
     task_table[ub].state = STATE_READY      # sb stays SCHED_OTHER
+    # Track 5: _pick_next walks the per-CPU run-list now, so the fabricated
+    # fixtures must be LINKED onto CPU0's run-list to be visible to the probe.
+    _rq_list_insert(ua, 0)
+    _rq_list_insert(ub, 0)
     pick2: int32 = _pick_next()
     if pick2 != sa:
         printk_set_level(PRINTK_LEVEL_EMERG)
@@ -2023,6 +2114,8 @@ def rtsched_selftest() -> int32:
         pass_all = 0
     task_table[ua].state = STATE_READY
     task_table[ub].state = STATE_READY
+    _rq_list_insert(ua, 0)
+    _rq_list_insert(ub, 0)
     first: int32 = _pick_next()
     if first != sa:
         printk_set_level(PRINTK_LEVEL_EMERG)
@@ -2055,6 +2148,10 @@ def rtsched_selftest() -> int32:
     # so the live runqueue is exactly as we found it.
     sched_init_task_policy(ua)
     sched_init_task_policy(ub)
+    # Track 5: unlink the fixtures from CPU0's run-list before returning them
+    # to FREE so the live dispatcher never walks a torn-down scratch slot.
+    _rq_list_remove(ua)
+    _rq_list_remove(ub)
     task_table[ua].state = STATE_FREE
     task_table[ub].state = STATE_FREE
 
@@ -2539,13 +2636,218 @@ def _build_initial_kstack(kstack_top: uint64, iret_cs: uint64,
 
 # --- public: slot management ---------------------------------------
 
-def _find_free_slot() -> int32:
+# =====================================================================
+# Track 5 helpers: O(1) freelist, pid->slot hash, per-CPU run-lists
+# =====================================================================
+
+def _free_list_init():
+    # Build the FREE-slot freelist over every slot EXCEPT slot 0 (the boot
+    # task, claimed for life). Idempotent. Slots are pushed in descending
+    # order so the head ends up being slot 1 — matching the historical
+    # behaviour where _find_free_slot returned the LOWEST free slot first,
+    # which several callers (and tests reading /proc by ascending pid)
+    # implicitly relied on.
+    if free_inited != 0:
+        return
+    free_inited = 1
+    free_head = FL_NIL
+    s: uint64 = NTASKS
+    while s > 1:
+        s = s - 1
+        fl_next[s] = free_head
+        free_head = s
+
+
+def _free_list_push(slot: uint64):
+    # Return `slot` to the freelist. Slot 0 is never freed (boot task).
+    # PARKED idle-kthread slots are also never pushed here (they are not
+    # reaped). Guarded against double-push by the caller's state machine
+    # (a slot is pushed exactly once, on its FREE transition).
+    if slot == 0 or slot >= NTASKS:
+        return
+    fl_next[slot] = free_head
+    free_head = slot
+
+
+def _free_list_pop() -> int32:
+    # Pop the head free slot, or -1 if none. O(1).
+    if free_inited == 0:
+        _free_list_init()
+    if free_head == FL_NIL:
+        return -1
+    s: uint64 = free_head
+    free_head = fl_next[s]
+    fl_next[s] = FL_NIL
+    return cast[int32](s)
+
+
+# --- pid -> slot hash ------------------------------------------------
+
+def _pidh_init():
+    if pidh_inited != 0:
+        return
+    pidh_inited = 1
     i: uint64 = 0
-    while i < NTASKS:
-        if task_table[i].state == STATE_FREE:
-            return cast[int32](i)
+    while i < PIDH_SIZE:
+        pidh_pid[i]  = PIDH_EMPTY
+        pidh_slot[i] = 0
         i = i + 1
+
+
+def _pidh_insert(pid: uint64, slot: uint64):
+    # Insert (pid -> slot). Linear-probe over the first vacant-or-tombstone
+    # bucket. If `pid` is already present (a re-stamp of the same pid, or a
+    # pid wrap-around onto a stale tombstone) the existing bucket is updated.
+    # pid 0 is never inserted (it is PIDH_EMPTY). Load factor stays <= 0.5,
+    # so a free bucket always exists.
+    if pid == 0:
+        return
+    _pidh_init()
+    h: uint64 = (pid * 2654435761) % PIDH_SIZE
+    probes: uint64 = 0
+    first_free: uint64 = PIDH_SIZE          # remember a tombstone to reuse
+    while probes < PIDH_SIZE:
+        b: uint64 = (h + probes) % PIDH_SIZE
+        bp: uint64 = pidh_pid[b]
+        if bp == pid:
+            pidh_slot[b] = slot              # update in place
+            return
+        if bp == PIDH_EMPTY:
+            # End of probe chain: insert here, or at an earlier tombstone.
+            if first_free != PIDH_SIZE:
+                pidh_pid[first_free]  = pid
+                pidh_slot[first_free] = slot
+            else:
+                pidh_pid[b]  = pid
+                pidh_slot[b] = slot
+            return
+        if bp == PIDH_DELE and first_free == PIDH_SIZE:
+            first_free = b
+        probes = probes + 1
+    # Table full (should never happen at load <= 0.5): fall back to the
+    # tombstone slot if we found one. A miss here is non-fatal — lookup
+    # has a linear fallback.
+    if first_free != PIDH_SIZE:
+        pidh_pid[first_free]  = pid
+        pidh_slot[first_free] = slot
+
+
+def _pidh_remove(pid: uint64):
+    # Tombstone the bucket holding `pid` so probe chains past it survive.
+    if pid == 0 or pidh_inited == 0:
+        return
+    h: uint64 = (pid * 2654435761) % PIDH_SIZE
+    probes: uint64 = 0
+    while probes < PIDH_SIZE:
+        b: uint64 = (h + probes) % PIDH_SIZE
+        bp: uint64 = pidh_pid[b]
+        if bp == pid:
+            pidh_pid[b]  = PIDH_DELE
+            pidh_slot[b] = 0
+            return
+        if bp == PIDH_EMPTY:
+            return                            # not present
+        probes = probes + 1
+
+
+def _pidh_get(pid: uint64) -> int32:
+    # Return the slot for `pid`, or -1 on miss. O(1) amortised.
+    if pid == 0 or pidh_inited == 0:
+        return -1
+    h: uint64 = (pid * 2654435761) % PIDH_SIZE
+    probes: uint64 = 0
+    while probes < PIDH_SIZE:
+        b: uint64 = (h + probes) % PIDH_SIZE
+        bp: uint64 = pidh_pid[b]
+        if bp == pid:
+            return cast[int32](pidh_slot[b])
+        if bp == PIDH_EMPTY:
+            return -1                         # end of chain, not present
+        probes = probes + 1
     return -1
+
+
+# _task_set_pid / _task_clear_pid: the single chokepoints that keep the pid
+# hash in sync with the task_table[].pid field. Every site that stamps a
+# slot's pid goes through _task_set_pid; every FREE transition goes through
+# _task_clear_pid first.
+def _task_set_pid(slot: uint64, pid: uint64):
+    task_table[slot].pid = pid
+    _pidh_insert(pid, slot)
+
+
+def _task_clear_pid(slot: uint64):
+    old: uint64 = task_table[slot].pid
+    if old != 0:
+        _pidh_remove(old)
+
+
+# --- per-CPU READY run-lists ----------------------------------------
+
+def _rq_list_init():
+    if rq_inited != 0:
+        return
+    rq_inited = 1
+    c: uint64 = 0
+    while c < NR_RQ:
+        rq_head[c] = RQL_NIL
+        c = c + 1
+
+
+def _rq_list_insert(slot: uint64, cpu: uint64):
+    # Link `slot` at the HEAD of CPU `cpu`'s READY run-list. Caller holds
+    # rq_locks[cpu]. Idempotent: a slot already on a list is removed from it
+    # first (defensive — the state machine normally inserts a FREE/RUNNING/
+    # WAIT task exactly once on its READY transition). cpu is clamped to a
+    # valid index by the caller (sched_make_ready_on forces tc < NR_RQ).
+    if rq_inited == 0:
+        _rq_list_init()
+    if cpu >= NR_RQ:
+        return
+    # Defensive: if already linked (possibly on a DIFFERENT cpu), unlink from
+    # the list it is ACTUALLY on first. _rq_list_remove derives that list from
+    # rq_on_list (= listed_cpu + 1), NOT from rq_cpu, so a re-home that already
+    # changed rq_cpu still unlinks the correct head.
+    if task_table[slot].rq_on_list != 0:
+        _rq_list_remove(slot)
+    nh: uint64 = rq_head[cpu]
+    task_table[slot].rq_prev = RQL_NIL
+    task_table[slot].rq_next = nh
+    if nh != RQL_NIL:
+        task_table[nh].rq_prev = slot
+    rq_head[cpu] = slot
+    # rq_on_list encodes (listed_cpu + 1) so _rq_list_remove can fix the right
+    # head independent of rq_cpu (which may be re-stamped between insert and
+    # remove during affinity migration / work-steal).
+    task_table[slot].rq_on_list = cpu + 1
+
+
+def _rq_list_remove(slot: uint64):
+    # Unlink `slot` from whatever run-list it is on. Caller holds the rq lock
+    # of the CPU that OWNS the list (the cpu encoded in rq_on_list). No-op if
+    # not currently linked.
+    if task_table[slot].rq_on_list == 0:
+        return
+    listed_cpu: uint64 = task_table[slot].rq_on_list - 1
+    pv: uint64 = task_table[slot].rq_prev
+    nx: uint64 = task_table[slot].rq_next
+    if pv != RQL_NIL:
+        task_table[pv].rq_next = nx
+    else:
+        # slot was the head of listed_cpu's list.
+        if listed_cpu < NR_RQ:
+            rq_head[listed_cpu] = nx
+    if nx != RQL_NIL:
+        task_table[nx].rq_prev = pv
+    task_table[slot].rq_next = RQL_NIL
+    task_table[slot].rq_prev = RQL_NIL
+    task_table[slot].rq_on_list = 0
+
+
+def _find_free_slot() -> int32:
+    # Track 5: O(1) pop off the freelist (was an O(NTASKS) linear scan for a
+    # STATE_FREE slot). Returns the lowest-built free slot or -1 if exhausted.
+    return _free_list_pop()
 
 
 def sched_mark_boot_task_running():
@@ -2574,6 +2876,15 @@ def sched_mark_boot_task_running():
 def sched_init():
     next_pid    = 1
     current_idx_pcpu = 0
+    # Track 5: initialise the O(1) acceleration structures BEFORE the boot
+    # task is published and before any kthread_create can pop a free slot.
+    #   • run-list heads -> all empty (RQL_NIL)
+    #   • pid->slot hash -> all empty
+    #   • FREE-slot freelist -> every slot 1..NTASKS-1 (slot 0 reserved for
+    #     the boot task, claimed for life and never on the freelist)
+    _rq_list_init()
+    _pidh_init()
+    _free_list_init()
     # All slots already zero by .bss init -> state = STATE_FREE.
     # Re-assert the boot task as RUNNING (idempotent with the early
     # sched_mark_boot_task_running() call) so the create_user_task path
@@ -2618,7 +2929,7 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
 
     s: uint64 = cast[uint64](slot)
     task_table[s].sp          = sp
-    task_table[s].pid         = next_pid
+    _task_set_pid(s, next_pid)        # Track 5: stamp pid + pid->slot hash
     # Job control: a fresh task leads its own process group (job_pgid ==
     # pid) until SYS_SETPGID moves it. SYS_SPAWN's child-pgid plumbing
     # overrides this right after create returns when the shell asked for
@@ -2748,9 +3059,17 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     # migrates it to an idle core if one is starving. rq_cpu MUST be set
     # BEFORE the STATE_READY publish so any CPU that observes the READY store
     # also sees the correct owner (x86 stores retire in program order).
-    task_table[s].rq_cpu = get_cpu_id()
+    # Track 5: publish runnable under the creating CPU's rq lock so the
+    # STATE_READY flip and the run-list link are atomic w.r.t. that CPU's
+    # _pick_next. (sched_make_ready_on is the general entry; this create-local
+    # publish mirrors it inline because rq_cpu is pinned to the creator.)
+    _pub_cpu: uint64 = get_cpu_id()
+    _rq_lock_cpu(_pub_cpu)
+    task_table[s].rq_cpu = _pub_cpu
     # RACE FIX: publish as runnable only after full init (see note above).
     task_table[s].state = STATE_READY
+    _rq_list_insert(s, _pub_cpu)
+    _rq_unlock_cpu(_pub_cpu)
     return slot
 
 
@@ -2862,7 +3181,7 @@ def create_user_thread(entry: uint64, name0: uint64,
         local_irq_restore(_ks_irq)
     s: uint64 = cast[uint64](slot)
     task_table[s].sp          = sp
-    task_table[s].pid         = next_pid
+    _task_set_pid(s, next_pid)        # Track 5: stamp pid + pid->slot hash
     # Job control: a fresh task leads its own process group (job_pgid ==
     # pid) until SYS_SETPGID moves it. SYS_SPAWN's child-pgid plumbing
     # overrides this right after create returns when the shell asked for
@@ -3220,7 +3539,14 @@ def create_user_thread(entry: uint64, name0: uint64,
     if share_cr3 != 0:
         task_table[s].state = STATE_EMBRYO
     else:
+        # Track 5: non-thread publish — READY + run-list link under the
+        # creator's rq lock (rq_cpu pinned to the creator just above).
+        _tc_cpu: uint64 = get_cpu_id()
+        _rq_lock_cpu(_tc_cpu)
+        task_table[s].rq_cpu = _tc_cpu
         task_table[s].state = STATE_READY
+        _rq_list_insert(s, _tc_cpu)
+        _rq_unlock_cpu(_tc_cpu)
     return slot
 
 
@@ -3236,50 +3562,58 @@ def task_publish_thread_ready(slot: int32):
     if s >= NTASKS:
         return
     if task_table[s].state == STATE_EMBRYO:
+        # Track 5: EMBRYO -> READY publish under the owning CPU's rq lock so
+        # the run-list link is atomic with the READY flip.
+        _tp_cpu: uint64 = task_table[s].rq_cpu
+        if _tp_cpu >= NR_RQ:
+            _tp_cpu = 0
+        _rq_lock_cpu(_tp_cpu)
+        task_table[s].rq_cpu = _tp_cpu
         task_table[s].state = STATE_READY
+        _rq_list_insert(s, _tp_cpu)
+        _rq_unlock_cpu(_tp_cpu)
 
 
 # --- public: schedule / lifecycle ---------------------------------
 
 def _pick_next() -> int32:
     # #151: weighted-fair (CFS-lite) pick. Returns the eligible STATE_READY
-    # slot with the SMALLEST vruntime, or -1 if none. A linear min-scan
-    # over the <=16-slot task_table — no red-black tree needed at this
-    # scale; matches the existing array model.
+    # slot with the SMALLEST vruntime, or -1 if none.
     #
-    # PER-CPU RUNQUEUE (#6): this scan now considers ONLY tasks that this
-    # CPU's runqueue OWNS — i.e. rq_cpu == get_cpu_id(). The caller holds
-    # this CPU's rq lock (rq_locks[my_cpu]); no global lock is taken. Tasks
-    # owned by OTHER CPUs are invisible here (they are dispatched by their
-    # own CPU, or pulled over by the work-steal path which RE-ASSIGNS rq_cpu
-    # under the destination lock first). This is what removes the global
-    # lock from the dispatch hot path.
+    # TRACK 5 — O(active) walk: this used to be a linear min-scan over ALL
+    # NTASKS slots (filtering on state==READY && rq_cpu==my_cpu). It now walks
+    # ONLY this CPU's intrusive READY run-list (rq_head[my_cpu] threaded
+    # through rq_next), so its cost is the number of RUNNABLE tasks on THIS
+    # CPU — not the size of the (now much larger) task table. Every node on
+    # rq_head[my_cpu] is, by construction, STATE_READY and owned by my_cpu, so
+    # the old per-node state/rq_cpu predicates are guaranteed and dropped.
     #
-    # Eligibility:
-    #   • Only STATE_READY is considered — a STATE_RUNNING task is already
-    #     executing on some CPU and must not be double-dispatched.
-    #   • rq_cpu must equal this CPU (local-runqueue membership).
-    #   • User tasks are eligible on ANY CPU (Stage A: per-CPU TSS), so a
-    #     user task whose rq_cpu == my_cpu is picked here just like a kernel
-    #     task — the old "is_user==0 on APs" pin stays gone.
+    # PER-CPU RUNQUEUE (#6): the caller holds this CPU's rq lock
+    # (rq_locks[my_cpu]); no global lock is taken. Tasks owned by OTHER CPUs
+    # are on THEIR run-lists and invisible here (dispatched by their own CPU,
+    # or pulled over by work-steal which re-links them onto this list under
+    # the destination lock first).
+    #
+    # Eligibility (still applied per node):
     #   • Slot 0 is the BSP boot task: rq_cpu is forced to 0 for it, so it
-    #     only ever appears in the BSP's local scan. The explicit on_bsp
-    #     guard below is belt-and-braces.
+    #     only ever appears on the BSP's run-list. The explicit on_bsp guard
+    #     below is belt-and-braces.
+    #   • A cgroup cpu.max-throttled task is skipped (CFS tier only).
     #
     # Tie-break: among equal-vruntime eligibles we prefer a DIFFERENT slot
     # than current_idx_pcpu when one exists, so two CPU-bound tasks at the
     # same vruntime still alternate rather than one pinning the CPU.
     #
-    # REALTIME TIER (SCHED_FIFO / SCHED_RR): before the CFS-lite scan we
-    # look for any eligible runnable realtime task. ANY such task outranks
-    # ALL SCHED_OTHER tasks. Among realtime tasks the HIGHEST rt_priority
-    # wins; within a priority level the SMALLEST enqueue sequence (oldest
-    # arrival / least-recently-rotated) wins, which gives FIFO order and —
-    # because an RR task that exhausts its slice is re-stamped to the tail —
-    # round-robin rotation among equal-priority RR peers. The CFS-lite scan
-    # below is reached ONLY when no realtime task is runnable, so normal
-    # tasks behave EXACTLY as before whenever no RT task competes.
+    # REALTIME TIER (SCHED_FIFO / SCHED_RR): before the CFS-lite walk we look
+    # for any eligible runnable realtime task. ANY such task outranks ALL
+    # SCHED_OTHER tasks. Among realtime tasks the HIGHEST rt_priority wins;
+    # within a priority level the SMALLEST enqueue sequence (oldest arrival /
+    # least-recently-rotated) wins → FIFO order plus RR rotation (an RR task
+    # that drains its slice is re-stamped to the tail). The CFS-lite walk is
+    # reached ONLY when no realtime task is runnable.
     my_cpu: uint64 = get_cpu_id()
+    if rq_inited == 0:
+        _rq_list_init()
     on_bsp: uint64 = 0
     if my_cpu == 0:
         on_bsp = 1
@@ -3288,70 +3622,68 @@ def _pick_next() -> int32:
     rt_best:     int32  = -1
     rt_best_pri: uint64 = 0
     rt_best_seq: uint64 = 0
-    r: uint64 = 0
-    while r < NTASKS:
-        if task_table[r].state == STATE_READY and task_table[r].rq_cpu == my_cpu:
-            relig: uint64 = 0
-            # Slot 0 (BSP boot task) is BSP-only; everything else (incl.
-            # user tasks) is eligible on any CPU thanks to per-CPU TSS.
-            if on_bsp != 0 or r != 0:
-                relig = 1
-            if relig != 0 and sched_is_realtime(r) != 0:
-                rp:  uint64 = g_rt_priority[r]
-                rsq: uint64 = g_rt_enqueue_seq[r]
-                if rt_best < 0:
-                    rt_best = cast[int32](r)
-                    rt_best_pri = rp
-                    rt_best_seq = rsq
-                elif rp > rt_best_pri:
-                    rt_best = cast[int32](r)
-                    rt_best_pri = rp
-                    rt_best_seq = rsq
-                elif rp == rt_best_pri and rsq < rt_best_seq:
-                    # Same priority level: oldest arrival (smallest sequence)
-                    # is picked. RR rotation re-stamps the spent task to the
-                    # tail, so this implements both FIFO order and RR turn-
-                    # taking with one comparison.
-                    rt_best = cast[int32](r)
-                    rt_best_pri = rp
-                    rt_best_seq = rsq
-        r = r + 1
+    r: uint64 = rq_head[my_cpu]
+    while r != RQL_NIL:
+        relig: uint64 = 0
+        # Slot 0 (BSP boot task) is BSP-only; everything else (incl.
+        # user tasks) is eligible on any CPU thanks to per-CPU TSS.
+        if on_bsp != 0 or r != 0:
+            relig = 1
+        if relig != 0 and sched_is_realtime(r) != 0:
+            rp:  uint64 = g_rt_priority[r]
+            rsq: uint64 = g_rt_enqueue_seq[r]
+            if rt_best < 0:
+                rt_best = cast[int32](r)
+                rt_best_pri = rp
+                rt_best_seq = rsq
+            elif rp > rt_best_pri:
+                rt_best = cast[int32](r)
+                rt_best_pri = rp
+                rt_best_seq = rsq
+            elif rp == rt_best_pri and rsq < rt_best_seq:
+                # Same priority level: oldest arrival (smallest sequence)
+                # is picked. RR rotation re-stamps the spent task to the
+                # tail, so this implements both FIFO order and RR turn-
+                # taking with one comparison.
+                rt_best = cast[int32](r)
+                rt_best_pri = rp
+                rt_best_seq = rsq
+        r = task_table[r].rq_next
     if rt_best >= 0:
         return rt_best
 
     best: int32 = -1
     best_v: uint64 = 0
-    i: uint64 = 0
-    while i < NTASKS:
-        if task_table[i].state == STATE_READY and task_table[i].rq_cpu == my_cpu:
-            elig: uint64 = 0
-            # Slot 0 (BSP boot task) is BSP-only; everything else (incl.
-            # user tasks) is eligible on any CPU thanks to per-CPU TSS.
-            if on_bsp != 0 or i != 0:
-                elig = 1
-            # F11 cgroup v2 cpu.max: a quota-exhausted task is
-            # skipped here just like a STATE_WAIT task — the cgroup's
-            # period boundary refill (cgroup_cpu_tick_refill on the
-            # next tick) flips it back to eligible. Realtime tasks are
-            # NOT subject to cpu.max (Linux semantics) and so the RT
-            # loop above intentionally does not consult this predicate.
-            if elig != 0 and cgroup_cpu_should_throttle(i) != 0:
-                elig = 0
-            if elig != 0:
-                v: uint64 = task_table[i].vruntime
-                if best < 0:
+    i: uint64 = rq_head[my_cpu]
+    while i != RQL_NIL:
+        elig: uint64 = 0
+        # Slot 0 (BSP boot task) is BSP-only; everything else (incl.
+        # user tasks) is eligible on any CPU thanks to per-CPU TSS.
+        if on_bsp != 0 or i != 0:
+            elig = 1
+        # F11 cgroup v2 cpu.max: a quota-exhausted task is
+        # skipped here just like a STATE_WAIT task — the cgroup's
+        # period boundary refill (cgroup_cpu_tick_refill on the
+        # next tick) flips it back to eligible. Realtime tasks are
+        # NOT subject to cpu.max (Linux semantics) and so the RT
+        # loop above intentionally does not consult this predicate.
+        if elig != 0 and cgroup_cpu_should_throttle(i) != 0:
+            elig = 0
+        if elig != 0:
+            v: uint64 = task_table[i].vruntime
+            if best < 0:
+                best = cast[int32](i)
+                best_v = v
+            elif v < best_v:
+                best = cast[int32](i)
+                best_v = v
+            elif v == best_v:
+                # Equal vruntime: prefer a slot that is NOT the
+                # currently-running one so peers rotate.
+                if cast[uint64](best) == cur and i != cur:
                     best = cast[int32](i)
                     best_v = v
-                elif v < best_v:
-                    best = cast[int32](i)
-                    best_v = v
-                elif v == best_v:
-                    # Equal vruntime: prefer a slot that is NOT the
-                    # currently-running one so peers rotate.
-                    if cast[uint64](best) == cur and i != cur:
-                        best = cast[int32](i)
-                        best_v = v
-        i = i + 1
+        i = task_table[i].rq_next
     return best
 
 
@@ -3387,25 +3719,30 @@ def _sched_try_pull_locked(my_cpu: uint64) -> int32:
             if _rq_trylock_cpu(v) != 0:
                 steal: int32  = -1
                 steal_v: uint64 = 0
-                s: uint64 = 0
-                while s < NTASKS:
+                # Track 5: walk victim v's intrusive READY run-list (every
+                # node is STATE_READY && rq_cpu == v by construction) instead
+                # of scanning all NTASKS slots.
+                s: uint64 = rq_head[v]
+                while s != RQL_NIL:
                     # sched_setaffinity(2): never steal a task onto my_cpu if
                     # its affinity mask forbids my_cpu — a pinned task stays on
                     # its allowed CPU's runqueue even when this CPU is idle.
-                    if s != 0 and task_table[s].state == STATE_READY \
-                       and task_table[s].rq_cpu == v \
-                       and sched_cpu_allowed(s, my_cpu) != 0:
+                    if s != 0 and sched_cpu_allowed(s, my_cpu) != 0:
                         sv: uint64 = task_table[s].vruntime
                         if steal < 0 or sv < steal_v:
                             steal = cast[int32](s)
                             steal_v = sv
-                    s = s + 1
+                    s = task_table[s].rq_next
                 if steal >= 0:
                     su2: uint64 = cast[uint64](steal)
                     # Re-home onto my_cpu while BOTH rq locks are held, so
                     # neither CPU's _pick_next can observe the slot as
-                    # belonging to both at once.
+                    # belonging to both at once. Move both the rq_cpu stamp AND
+                    # the run-list membership (unlink from v's list, link onto
+                    # my_cpu's) under both locks.
+                    _rq_list_remove(su2)
                     task_table[su2].rq_cpu = my_cpu
+                    _rq_list_insert(su2, my_cpu)
                     _rq_unlock_cpu(v)
                     return steal
                 _rq_unlock_cpu(v)
@@ -3531,6 +3868,11 @@ def schedule():
         task_table[prev].state = STATE_READY
         # prev stays on THIS cpu's runqueue (it was running here)...
         task_table[prev].rq_cpu = my_cpu
+        # Track 5: a RUNNING task is OFF every run-list; now that prev is
+        # READY again, link it back onto my_cpu's run-list (re-homed below if
+        # affinity excludes my_cpu). Insert before any rq_cpu re-stamp so the
+        # link lands on the list whose lock we hold.
+        _rq_list_insert(prev, my_cpu)
         # ...UNLESS a sched_setaffinity(2) call (possibly on another CPU)
         # excluded my_cpu from prev's mask while prev was running here. This
         # is the Linux "deferred migration of a running task" case: rather
@@ -3541,7 +3883,20 @@ def schedule():
         # slot 0). The directed reschedule IPI is sent AFTER the rq lock is
         # dropped below — here we only re-stamp rq_cpu under the held lock.
         if prev != 0 and sched_cpu_allowed(prev, my_cpu) == 0:
-            task_table[prev].rq_cpu = sched_affinity_pick_cpu(prev, my_cpu)
+            new_cpu: uint64 = sched_affinity_pick_cpu(prev, my_cpu)
+            # Track 5: prev was just linked onto my_cpu's run-list above but is
+            # being re-homed to new_cpu. UNLINK it from my_cpu's list FIRST
+            # (while rq_cpu still == my_cpu, so _rq_list_remove fixes the right
+            # head), THEN re-stamp rq_cpu and re-link onto new_cpu. This touches
+            # new_cpu's list head under my_cpu's lock — the SAME cross-CPU
+            # window the rq_cpu re-stamp already accepts for deferred affinity
+            # migration (a directed IPI below makes new_cpu re-pick).
+            _rq_list_remove(prev)
+            task_table[prev].rq_cpu = new_cpu
+            _rq_list_insert(prev, new_cpu)
+    # Track 5: nxt is being dispatched (READY -> RUNNING) and a RUNNING task is
+    # OFF every run-list. Unlink it before flipping state.
+    _rq_list_remove(nxt)
     task_table[nxt].state = STATE_RUNNING
     task_table[nxt].rq_cpu = my_cpu
     # sched_setaffinity(2) deferred migration: if prev was re-homed off my_cpu
@@ -3643,15 +3998,18 @@ def _another_task_ready() -> uint64:
 
 
 def _any_task_runnable_global() -> uint64:
-    # Returns 1 if ANY slot on ANY cpu's runqueue is STATE_READY. Used only
-    # by the BSP halt decision in schedule(): the box must halt only when
-    # there is genuinely no runnable work ANYWHERE (and the current task is
-    # not runnable either). A per-CPU-local empty rq is NOT a halt condition.
-    i: uint64 = 0
-    while i < NTASKS:
-        if task_table[i].state == STATE_READY:
+    # Returns 1 if ANY cpu's runqueue holds a STATE_READY task. Used only by
+    # the BSP halt decision in schedule(): the box halts only when there is
+    # genuinely no runnable work ANYWHERE (and the current task is not runnable
+    # either). A per-CPU-local empty rq is NOT a halt condition.
+    # Track 5: a non-empty rq_head on ANY cpu means runnable work — O(NR_RQ).
+    if rq_inited == 0:
+        _rq_list_init()
+    c: uint64 = 0
+    while c < NR_RQ:
+        if rq_head[c] != RQL_NIL:
             return 1
-        i = i + 1
+        c = c + 1
     return 0
 
 
@@ -3908,7 +4266,13 @@ def task_exit_current(code: int64):
         printk2("task: pid %d exited detached (code=%d) — self-reaped\n",
                 task_table[current_idx_pcpu].pid, cast[uint64](code))
         nr_tasks_reaped = nr_tasks_reaped + 1
+        # Track 5: detached self-reap goes straight to FREE — drop the pid
+        # mapping and return the slot to the freelist. (The task is RUNNING,
+        # so it is already off every run-list; the defensive remove is cheap.)
+        _task_clear_pid(current_idx_pcpu)
+        _rq_list_remove(current_idx_pcpu)
         task_table[current_idx_pcpu].state = STATE_FREE
+        _free_list_push(current_idx_pcpu)
         schedule()
         return
     task_table[current_idx_pcpu].state = STATE_EXITED
@@ -3975,51 +4339,14 @@ def sched_ap_idle_loop():
         # (FIFO/RR) tier first (highest rt_priority, then oldest enqueue
         # sequence), else the smallest-vruntime CFS-lite task — mirroring
         # _pick_next exactly, but restricted to rq_cpu == my_cpu_id.
+        # Track 5: pick the best LOCAL dispatchable task via _pick_next(),
+        # which now walks this CPU's intrusive READY run-list (rq_head[my_cpu])
+        # applying the exact realtime-then-CFS ordering — O(active), no NTASKS
+        # scan. The idle slot itself is STATE_RUNNING here (off the run-list),
+        # so _pick_next never returns it.
         found_slot: int32 = -1
-        found_v: uint64 = 0
-        found_rt:  uint64 = 0
-        found_pri: uint64 = 0
-        found_seq: uint64 = 0
-        scan: uint64 = 0
-        while scan < NTASKS and sched_ap_steal_enabled != 0:
-            if scan != my_idle_slot:
-                # Slot 0 is the BSP boot task — never dispatch it on an AP.
-                # (rq_cpu==0 for slot 0 keeps it off our local scan anyway;
-                # the explicit guard is belt-and-braces.)
-                if scan != 0 and task_table[scan].rq_cpu == my_cpu_id:
-                    if task_table[scan].state == STATE_READY:
-                        # Per-CPU TSS now lets an AP run USER tasks too: it
-                        # has its own TSS.RSP0 (set below before the switch)
-                        # so a ring3->ring0 transition on this AP is safe.
-                        if True:
-                            sv: uint64 = task_table[scan].vruntime
-                            srt: uint64 = sched_is_realtime(scan)
-                            spri: uint64 = g_rt_priority[scan]
-                            sseq: uint64 = g_rt_enqueue_seq[scan]
-                            take: uint64 = 0
-                            if found_slot < 0:
-                                take = 1
-                            elif srt > found_rt:
-                                # A realtime candidate beats any CFS one.
-                                take = 1
-                            elif srt == found_rt:
-                                if srt != 0:
-                                    # Both realtime: higher prio, then oldest.
-                                    if spri > found_pri:
-                                        take = 1
-                                    elif spri == found_pri and sseq < found_seq:
-                                        take = 1
-                                else:
-                                    # Both CFS: smallest vruntime.
-                                    if sv < found_v:
-                                        take = 1
-                            if take != 0:
-                                found_slot = cast[int32](scan)
-                                found_v = sv
-                                found_rt = srt
-                                found_pri = spri
-                                found_seq = sseq
-            scan = scan + 1
+        if sched_ap_steal_enabled != 0:
+            found_slot = _pick_next()
 
         # Nothing on our LOCAL runqueue: try to PULL one runnable task from a
         # busier cpu (work-steal / load balance). _sched_try_pull_locked
@@ -4038,6 +4365,10 @@ def sched_ap_idle_loop():
             # so the task's own schedule() will re-pick the idle slot here.
             task_table[my_idle_slot].state  = STATE_READY
             task_table[my_idle_slot].rq_cpu = my_cpu_id
+            # Track 5: idle slot is now READY -> link it onto this CPU's
+            # run-list; nxt is being dispatched -> unlink it.
+            _rq_list_insert(my_idle_slot, my_cpu_id)
+            _rq_list_remove(nxt)
             task_table[nxt].state  = STATE_RUNNING
             task_table[nxt].rq_cpu = my_cpu_id
             current_idx_pcpu = nxt
@@ -4074,6 +4405,10 @@ def sched_ap_idle_loop():
 
             # Re-establish idle as STATE_RUNNING and current.
             _rq_lock_cpu(my_cpu_id)
+            # Track 5: the real task's schedule() normally removed idle from
+            # the run-list when it re-dispatched it; defensively unlink in case
+            # the switch-back arrived via a path that left idle linked.
+            _rq_list_remove(my_idle_slot)
             task_table[my_idle_slot].state  = STATE_RUNNING
             task_table[my_idle_slot].rq_cpu = my_cpu_id
             current_idx_pcpu = my_idle_slot
@@ -4109,14 +4444,19 @@ def sched_ap_idle_loop():
             # atomic sti;hlt). Slot 0 (BSP task) is excluded — an AP never
             # runs it.
             local_irq_disable()
-            rescan: uint64 = 0
             woke: uint64 = 0
-            while rescan < NTASKS and sched_ap_steal_enabled != 0:
-                if rescan != my_idle_slot and rescan != 0:
-                    if task_table[rescan].state == STATE_READY:
+            # Track 5: "is any READY task pending (here or stealable elsewhere)?"
+            # A non-empty run-list head on ANY CPU means dispatchable work
+            # exists, so skip hlt and loop back. Walking the NR_RQ(16) heads is
+            # O(NR_RQ), far cheaper than the old NTASKS scan. The idle slot is
+            # STATE_RUNNING (off every list) so it never falsely triggers woke.
+            if sched_ap_steal_enabled != 0:
+                rq_c: uint64 = 0
+                while rq_c < NR_RQ:
+                    if rq_head[rq_c] != RQL_NIL:
                         woke = 1
-                        rescan = NTASKS
-                rescan = rescan + 1
+                        rq_c = NR_RQ
+                    rq_c = rq_c + 1
             # One-time-per-CPU banner: this AP idles via hlt + reschedule IPI.
             bit: uint64 = cast[uint64](1) << my_cpu_id
             if (_ap_idle_mode_logged & bit) == 0:
@@ -5119,11 +5459,34 @@ def task_kstack_top(slot: int32) -> uint64:
 
 
 def task_lookup_by_pid(pid: uint64) -> int32:
-    # Linear scan — NTASKS is 4 so this is cheap; switches to a
-    # hashed pidmap when the runqueue grows. Returns -1 on miss.
+    # Track 5: O(1) lookup via the open-addressed pid->slot hash, with a
+    # linear-scan FALLBACK so a maintenance gap (a missed _task_set_pid /
+    # _task_clear_pid) can never break /proc, waitpid, note/signal delivery
+    # or reap parent-roll-up — it only loses the speed-up. The hash maps
+    # pid -> slot; we VALIDATE the hit (slot in range, .pid matches, not
+    # FREE) before trusting it, because a recycled slot or a tombstone race
+    # could otherwise return a stale mapping.
+    #
+    # pid 0 special case: the pid hash never stores pid 0 (it is the EMPTY
+    # sentinel), but the legacy linear scan matched `pid==0 && state!=FREE`
+    # and returned the boot task (slot 0, pid 0). Preserve that EXACT legacy
+    # behaviour — some orphan-reparent / roll-up paths look up parent_pid 0.
+    if pid == 0:
+        if task_table[0].state != STATE_FREE:
+            return 0
+        return -1
+    hs: int32 = _pidh_get(pid)
+    if hs >= 0:
+        hsu: uint64 = cast[uint64](hs)
+        if hsu < NTASKS and task_table[hsu].pid == pid \
+           and task_table[hsu].state != STATE_FREE:
+            return hs
+    # Fallback / self-heal: linear scan. Re-insert the correct mapping so the
+    # next lookup is O(1) again.
     i: uint64 = 0
     while i < NTASKS:
         if task_table[i].pid == pid and task_table[i].state != STATE_FREE:
+            _pidh_insert(pid, i)
             return cast[int32](i)
         i = i + 1
     return -1
@@ -5479,7 +5842,12 @@ def task_reap(slot: int32):
                         free_page(task_table[zu].ustack_base)
                         task_table[zu].ustack_base = 0
                     nr_tasks_reaped = nr_tasks_reaped + 1
+                    # Track 5: drop pid mapping, unlink from any run-list, and
+                    # return the slot to the freelist as it goes FREE.
+                    _task_clear_pid(zu)
+                    _rq_list_remove(zu)
                     task_table[zu].state = STATE_FREE
+                    _free_list_push(zu)
             zj = zj + 1
     mm_heir: int32 = -1
     mm_heir_live: int32 = 0
@@ -5632,7 +6000,13 @@ def task_reap(slot: int32):
         load_cr3(_rp_live_cr3)
     local_irq_restore(_rp_irq)
     nr_tasks_reaped = nr_tasks_reaped + 1
+    # Track 5: drop the pid->slot mapping, unlink from any run-list, and return
+    # the slot to the O(1) freelist as it goes FREE so a future create can
+    # claim it without an O(NTASKS) scan.
+    _task_clear_pid(su)
+    _rq_list_remove(su)
     task_table[su].state = STATE_FREE
+    _free_list_push(su)
 
 
 def _order_for_bytes(nbytes: uint64) -> int32:
@@ -6792,9 +7166,13 @@ def signal_post(slot: uint64, sig: uint64):
                           | (cast[uint64](1) << SIGTTOU)
         task_table[slot].sig_pending = task_table[slot].sig_pending & ~stop_mask
         if task_table[slot].state == STATE_STOPPED:
-            task_table[slot].state        = STATE_READY
+            # Track 5: STOPPED -> READY (SIGCONT resume). Re-home + run-list
+            # link via sched_make_ready_on so _pick_next on the owning CPU can
+            # dispatch it. sched_make_ready_on re-stamps state READY under the
+            # target rq lock (idempotent) and inserts onto the run-list.
             task_table[slot].stop_sig     = 0
             task_table[slot].cont_pending = 1
+            sched_make_ready(slot)
         # SIGCONT's default disposition is "continue + ignore" — there is
         # nothing more for signal_dispatch to do, so don't latch the bit
         # unless the task installed a real handler for it.
@@ -8296,7 +8674,8 @@ def notetest_set_slot_pid(slot: int32, pid: uint64):
     # task_lookup_by_pid. The slot is inert (STATE_STOPPED, off the
     # runqueue); only its pid field is rewritten. notetest_release_slot
     # returns it to STATE_FREE afterward, so the borrowed pid is dropped.
-    task_table[cast[uint64](slot)].pid = pid
+    # Track 5: route through _task_set_pid so the pid->slot hash resolves it.
+    _task_set_pid(cast[uint64](slot), pid)
 
 
 def notetest_release_slot(slot: int32):
@@ -8304,9 +8683,14 @@ def notetest_release_slot(slot: int32):
     # and clear its note state. The slot was never on the runqueue, so
     # this is a plain field reset — no reap, no pgrp drop.
     su: uint64 = cast[uint64](slot)
+    # Track 5: drop the borrowed pid from the hash and return the slot to the
+    # freelist (it was claimed via _find_free_slot / _free_list_pop).
+    _task_clear_pid(su)
+    _rq_list_remove(su)
     task_table[su].state      = STATE_FREE
     task_table[su].note_group = 0
     task_table[su].note_pending = 0
+    _free_list_push(su)
 
 
 # --- U42 VMA accessors ---------------------------------------------
