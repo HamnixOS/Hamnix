@@ -47,6 +47,12 @@
 #   BOOT_TIMEOUT deadline seconds for the heartbeat to appear (default 180).
 #                The boot is slow under TCG; the script polls and exits as
 #                soon as the marker is seen, so this is only an upper bound.
+#                Under pure TCG (CI, no KVM) the live-distro squashfs stream
+#                pushes the heartbeat to ~830s, so CI sets this to ~1200.
+#   QEMU_CPU     QEMU -cpu model (default: max). MUST expose SMAP, because
+#                syscall_entry uses stac/clac — the default TCG cpu (qemu64)
+#                #UDs on them and the first syscall triple-faults under TCG.
+#                `max` carries SMAP under both TCG and KVM.
 #   OVMF_FD      OVMF firmware path       (default: /usr/share/ovmf/OVMF.fd)
 #   SERIAL_LOG   pre-captured serial log to evaluate INSTEAD of booting
 #                (logic-only mode for CI/dev: feed a known-good or
@@ -64,6 +70,14 @@ cd "$PROJ_ROOT"
 IMG="${IMG:-build/hamnix-installer.img}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
 OVMF_FD="${OVMF_FD:-/usr/share/ovmf/OVMF.fd}"
+# CPU model. The kernel's syscall_entry uses SMAP (stac/clac, opcode
+# 0f 01 cb). QEMU's DEFAULT TCG cpu (qemu64) does NOT expose SMAP/SMEP,
+# so those instructions raise #UD and the first syscall triple-faults —
+# a #UD at syscall_entry that ONLY happens under TCG, never under
+# `-cpu host` (KVM). CI runs pure TCG (no /dev/kvm), so we must request a
+# cpu model that carries SMAP. `-cpu max` exposes the full feature set and
+# is valid under both TCG and KVM, so the same line works locally and in CI.
+QEMU_CPU="${QEMU_CPU:-max}"
 
 # The liveness marker we require, and the fatal-trap markers we reject.
 HEARTBEAT_RE='\[hamsh-alive\]'
@@ -188,6 +202,7 @@ say "  deadline   = ${BOOT_TIMEOUT}s (polled; exits early on first marker)"
 # poll the log and tear down the instant the heartbeat (or a fatal trap)
 # shows up rather than blocking for the full timeout.
 qemu-system-x86_64 \
+    -cpu "$QEMU_CPU" \
     -bios "$OVMF_RW" \
     -drive "file=$IMG,format=raw,if=virtio" \
     -m 1G \
