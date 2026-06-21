@@ -545,6 +545,67 @@ Test coverage (`scripts/test_security.sh`, covers Phases 1/4/5/6/7/8/9, expanded
   fails; rate-limited (1 attempt/second to thwart brute force).
 - Service running as uid 50 can't read another service's state dir.
 
+## CPU hardware mitigations (SMEP / SMAP / KASLR)
+
+Wired in `arch/x86/kernel/cpu_mitigations.ad` + `arch/x86/kernel/cpu_kaslr.ad`.
+
+### SMEP (Supervisor Mode Execution Prevention) — **ENABLED**
+
+CR4 bit 20. Blocks CPL=0 instruction fetches from user (US=1) pages.
+Enabled early in `start_kernel` (`setup_smep_smap`), after re-stamping the
+kernel high-half PML4[511] subtree and the low identity (PML4[0]) US=0.
+`[cpu-mitig] SMEP enabled` / `[mitig] CR4 SMEP=1` on the boot log.
+
+### SMAP (Supervisor Mode Access Prevention) — **ENABLED + ENFORCEMENT-PROVEN**
+
+CR4 bit 21. A CPL=0 load/store to a user (US=1) page #PFs unless
+RFLAGS.AC=1. Kernel↔user copies bracket their access with STAC/CLAC.
+
+`SMAP_RUNTIME_ENABLE = 1` (was gated off through v3a–v3f — see the
+cpu_mitigations.ad comment block for the full history).
+
+**v3g root cause + fix (2026-06-21):** the prior triple-fault was an
+*ordering clobber*. `setup_smep_smap` restamped the low identity US=0 and
+flipped CR4.SMAP=1 EARLY, then `mem_init()`→`pgtable_extend_from_e820()`
+force-stamped the low-identity PDPT back to US=1 (`0x87`) on the EFI path,
+clobbering the restamp; with SMAP on and low identity US=1, the next CPL=0
+access triple-faulted at `start_first_task`. Fix: split out
+`setup_smap_late()` (SMAP restamp + CR4.SMAP flip), called from
+`start_kernel` AFTER `mem_init()` so the US=0 restamp is the LAST writer to
+those leaves before the ring-3 hand-off.
+
+**STAC/CLAC audit (v3g):** all prior brackets (v3c–v3e) verified intact —
+`syscall_64.S` entry+SYSRET tails, `_build_user_argv[_linux]`,
+`deliver_signal_to_user`/`deliver_fault_sigsegv`, `_u_rt_sigreturn`,
+`trap_diag` user-RIP read, `cow_resolve_pte`. Three NEW unbracketed CPL=0
+kernel→user writes were found and bracketed under enforcement:
+- `kernel/core/coredump.ad` — direct user-page snapshot memcpy.
+- `kernel/sched/core.ad` — `clear_child_tid` zero-store on task exit.
+- `arch/x86/kernel/syscall.ad` `do_wait4` — `wstatus_ptr` status write
+  (this one killed the cow-fork test's waiting parent until bracketed).
+
+**Enforcement proof:** `scripts/test_smap_enforced.sh` (gated marker
+`/etc/smap-test`) does an UN-stac'd CPL=0 read of a genuinely-US=1 user
+page via `arch/x86/kernel/smap_probe_asm.S`; a one-entry SMAP-probe
+exception table in `arch/x86/kernel/trap_diag.ad` recovers the #PF; the
+test asserts the fault fired → `[smap-enforced] PASS`. **Only enforces
+under a hardware accelerator** — TCG masks the SMAP CPUID bit, so the
+test SKIPs cleanly there; verify under KVM (`-cpu host`). The qemu shim
+(`scripts/_kernel_iso.sh`) auto-injects `-accel kvm -cpu host` when
+`/dev/kvm` is usable.
+
+### KASLR — **v1 scaffold only (offset=0); v2 documented, not landed**
+
+`cpu_kaslr.ad` records a per-boot offset (currently hard-wired 0) and emits
+`[kaslr] offset=0x0`. Real runtime kernel-base relocation (v2) needs a PIE
+kernel image, an early relocation-table walker in `head_64.S` applying the
+offset to all 64-bit absolute relocations before paging, an RDRAND/TSC
+offset source at 16 MiB granularity over a 256 MiB range (Linux
+CONFIG_RANDOMIZE_BASE shape), and pairing with KPTI for full Meltdown
+mitigation. KASLR is intentionally secondary to SMAP and is left as a
+documented next-step (see the NEXT-STEP block in `cpu_kaslr.ad`); it does
+not block the boot.
+
 ## Cross-refs
 
 - [`docs/packages.md`](packages.md) — hpm; gates on uid==1
