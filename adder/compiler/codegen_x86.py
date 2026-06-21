@@ -465,6 +465,36 @@ class X86CodeGen:
         if not (hasattr(cast_to, "name")
                 and getattr(cast_to, "name", None) in self._INT_NAMES):
             return
+        dst_size = self.get_type_size(cast_to)
+
+        # --- NARROWING to a sub-8-byte integer type ------------------------
+        # This is keyed on the DESTINATION type ALONE: `cast[T](x)` for a
+        # sub-8-byte int T has value `x mod 2^width` (sign-adjusted), no
+        # matter what the source is. %rax holds the (possibly wider) source
+        # value; the bits above `dst_size` are NOT part of T's value and must
+        # be cleared (unsigned T) or sign-filled (signed T), else they leak
+        # into any later use that reads the full 64-bit register (store to a
+        # wider global, 64-bit compare, OR/AND fold, etc.). The old code
+        # treated narrowing as a no-op ("callers mask"), but callers
+        # frequently do NOT mask — so cast[uint8](cast[uint16](60396)) and
+        # cast[uint8](60396) both wrongly kept 60396 instead of 236. We apply
+        # this unconditionally for a sub-8-byte int dest because it is always
+        # the correct value of the cast and is idempotent when the source was
+        # already in range.
+        if dst_size < 8:
+            if self._is_unsigned_type(cast_to):
+                ext = {1: "movzbq %al, %rax",
+                       2: "movzwq %ax, %rax",
+                       4: "movl %eax, %eax"}.get(dst_size)
+            else:
+                ext = {1: "movsbq %al, %rax",
+                       2: "movswq %ax, %rax",
+                       4: "movslq %eax, %rax"}.get(dst_size)
+            if ext is not None:
+                self.emit(f"    {ext}")
+            return
+
+        # --- WIDENING a sub-8-byte source to a wider (8-byte) int ----------
         src_type = self.get_expr_type(inner)
         if src_type is None:
             # Unknown source type: keep the historical no-op. We can't tell
@@ -476,9 +506,8 @@ class X86CodeGen:
                 and getattr(src_type, "name", None) in self._INT_NAMES):
             return
         src_size = self.get_type_size(src_type)
-        dst_size = self.get_type_size(cast_to)
         if dst_size <= src_size or src_size >= 8:
-            # Narrowing or same-width: no high-bit fix needed.
+            # Same-width (both 8-byte): no high-bit fix needed.
             return
         if self._is_unsigned_type(src_type):
             # Unsigned widening = zero-extend. The inner loader already
@@ -2267,8 +2296,16 @@ class X86CodeGen:
                         f"(variable '{name}')"
                     )
             elif name in self.global_var_types:
-                # Scalar global: store the 64-bit value back to .data
-                self.emit(f"    movq %rax, {name}(%rip)")
+                # Scalar global: store back to .data, SIZED to the global's
+                # declared width. A blind `movq` wrote 8 bytes regardless of
+                # type, leaving the high bits of a sub-8-byte global (uint32
+                # etc.) un-truncated AND clobbering whatever .data global the
+                # layout placed in the next 4 bytes — a silent miscompile of
+                # exactly the May "sub-8-byte write" bug class.
+                t = self.global_var_types[name]
+                size = self.get_type_size(t)
+                self.emit(f"    leaq {name}(%rip), %rcx")
+                self.emit_store_sized(size, "%rcx", "%rax")
             else:
                 raise CodeGenError(f"x86: assignment to unknown identifier '{name}'")
             return
@@ -2810,9 +2847,16 @@ class X86CodeGen:
                 # member-access, or take addr of it.
                 self.emit(f"    leaq {name}(%rip), %rax")
             else:
-                # Scalar global: load address, then dereference.
+                # Scalar global: load address, then dereference SIZED to the
+                # global's declared width, sign-extending a signed sub-8-byte
+                # global and zero-extending an unsigned one. A blind `movq`
+                # read 8 bytes — pulling in the adjacent global's bytes for a
+                # uint32/uint16/uint8 global, and failing to sign-extend a
+                # negative int32 global (so `if g < 0:` silently misbehaved).
                 self.emit(f"    leaq {name}(%rip), %rax")
-                self.emit(f"    movq (%rax), %rax")
+                size = self.get_type_size(t)
+                signed = self._is_unsigned_type(t) is False
+                self.emit_load_sized_signed(size, signed, "%rax", "%rax")
         else:
             raise CodeGenError(f"x86: unknown identifier '{name}'")
 
