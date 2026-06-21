@@ -271,6 +271,35 @@ App code is just: mutate a widget, the toolkit handles the rest.
 btn7.on_click = fn() { model.push("7"); display.set_text(model.text) }
 ```
 
+## 12b. lib/hamfmcore.ad — the shared file-browse core
+
+The directory browser is written ONCE. `lib/hamfmcore.ad` owns the single
+icon-grid directory-browse implementation: the directory model (cur_path,
+names, is_dir, entry count, synthetic Up row), the dir-walk (Dir-record path
++ plain name-stream fallback), entry classification (open-probe `is_dir`),
+navigation (`fmc_go_into`/`fmc_go_parent`), geometry/reflow
+(`fmc_set_geometry`), wheel + key scroll, the pointer hit-test
+(`fmc_cell_at`), and the icon-grid PAINT body (`fmc_paint` — breadcrumb
+header + folder/file icons via `hamscene_icon_folder/file` + selection
+highlight + scrollbar).
+
+`fmc_paint` paints into the **current** scene and does NOT call
+`hamscene_begin`/`commit`, so each host brackets it at its own geometry:
+
+- **`user/hamfmscene.ad`** (the file manager app) is a thin host: it opens
+  its decorated window, brackets `fmc_paint` with its own begin/commit, runs
+  the `/event` pointer loop, and adds the app-specific double-click +
+  launch-the-editor behaviour.
+- **`lib/filepick.ad`** (the GtkFileChooser-style Open/Save picker) is the
+  SAME core rendered as an OVERLAY inside another app's window: the host owns
+  begin/commit, the picker calls `fmc_paint` (with a reserved bottom strip)
+  plus its own Name field + OK/Cancel row. It RESOLVES a path only — no file
+  I/O — and the host (e.g. `user/hameditscene.ad`) performs the open/save.
+
+So the file manager and every app's file picker share ONE browse + icon-grid
+implementation; there is no second copy to drift. `fmc_set_header` swaps the
+breadcrumb label (`hamfm:` / `Open:` / `Save in:`).
+
 ## 13. Efficiency invariants (the gate for committing to this)
 
 - **Idle = zero work.** No state change → no scene write → no compositor
