@@ -93,6 +93,39 @@ write_cr4:
     movq    %rdi, %cr4
     ret
 
+/* ---------- xsetbv_xcr0(value: uint64) --------------------------- *
+ *
+ * Write %rdi into XCR0 (extended control register 0) via XSETBV.
+ *
+ * AVX (and any VEX-encoded instruction glibc's ifunc resolvers pick on
+ * an AVX-advertising CPU) #UDs unless XCR0 enables the AVX state
+ * component. CR4.OSXSAVE only unlocks XSETBV/XGETBV; it does NOT enable
+ * any state — XCR0 starts at 0x1 (x87 only), so SSE-via-XSAVE and AVX
+ * are both disabled and a VEX op faults #UD. Real Debian coreutils
+ * (wc, sort) and glibc's AVX memcpy/decompression paths hit exactly
+ * that #UD and (with no userspace SIGILL recovery) halt the kernel.
+ *
+ * Setting XCR0 = 0x7 (bit0 x87 | bit1 SSE | bit2 AVX) enables the SSE
+ * and AVX state components so those instructions execute. Hamnix does
+ * not FXSAVE/XSAVE the FPU/vector file across context switches today
+ * (SSE state already isn't preserved), so enabling AVX adds no new
+ * save/restore obligation — it only stops the #UD.
+ *
+ * XSETBV takes the register index in %ecx and the 64-bit value in
+ * %edx:%eax. SysV ABI: %rdi = XCR0 value. No return; faults #GP if a
+ * reserved/unsupported bit is set, so the caller must gate bit2 on the
+ * AVX CPUID check.
+ */
+    .align 16
+    .globl xsetbv_xcr0
+xsetbv_xcr0:
+    movq    %rdi, %rax                 /* low 32 bits of XCR0 value */
+    movq    %rdi, %rdx
+    shrq    $32, %rdx                  /* high 32 bits -> %edx */
+    xorl    %ecx, %ecx                 /* XCR index 0 */
+    xsetbv
+    ret
+
 /* ---------- read_cr2() -> uint64 --------------------------------- *
  *
  * Copy-on-write #PF support. On a page fault the CPU latches the
