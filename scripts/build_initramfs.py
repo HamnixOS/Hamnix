@@ -617,6 +617,16 @@ if os.environ.get("ENABLE_SMP_USER") == "1":
 if os.environ.get("ENABLE_BCACHE_TEST") == "1":
     FILES.append(("/etc/bcache-test", b"1\n"))
 
+# Linux-parity fs caching layer self-test. scripts/test_fcache.sh sets
+# ENABLE_FCACHE_TEST=1 to plant /etc/fcache-test. init/main.ad at
+# boot:37.fcache detects the marker and calls fcache_selftest() (fs/fcache.ad):
+# it exercises the per-inode page cache (populate/hit/dirty/writeback +
+# coherent reread), the dcache (positive/negative + per-Pgrp namespace
+# isolation + generation invalidation) and the inode cache. Default boots
+# omit the marker.
+if os.environ.get("ENABLE_FCACHE_TEST") == "1":
+    FILES.append(("/etc/fcache-test", b"1\n"))
+
 # ENABLE_RFORK_COW_TEST=1 to plant /etc/rfork-cow-test. init/main.ad at
 # boot:37.rfcow detects the marker and calls elf32_wx_span_reset_selftest()
 # (fs/elf.ad): it plants a bogus non-zero W^X RO-span count (as if an

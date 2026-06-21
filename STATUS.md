@@ -816,6 +816,7 @@ uaccess layer, and broad driver/filesystem maturity.
 | **mkfs family** | Real FAT12/16/32 formatters + cross-cluster dir growth. (`#201`,`#207`,`#210`,`#211`) | **Done** |
 | **Block layer** | AHCI registered with the block layer + NCQ multi-slot queuing; MBR extended-partition (EBR) chains; diskstats. (`#188`,`#195`,`#191`,`#187`) | **Done** |
 | **On-target installer** | Lay down a fresh GPT disk from a running system. (`#172`) | **Done** |
+| **fs caching layer (Linux parity)** | `fs/fcache.ad`: per-inode **page cache** (`address_space`) fronts ext4 file reads (re-read of a page skips the extent walk + block I/O), writes write-through + drop cached pages for coherence, dirty-page writeback wired to fsync/sync + an fs-side reclaim hook for MM; **dcache** fronts `resolve_path` keyed by (Pgrp, path) + a global generation that every mount/bind/unmount/rename/unlink bumps (negative-dentry caching, no cross-namespace stale hits); **inode cache** keyed by (server, ino). Gated boot self-test `fcache_selftest` (`/etc/fcache-test`, `scripts/test_fcache.sh`) proves page coherence, dcache namespace isolation + gen invalidation, icache hit/invalidate. Sits beneath the block buffer cache (`#395`), not replacing it. | **Done** |
 
 ### Networking & crypto
 

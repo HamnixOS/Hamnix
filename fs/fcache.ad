@@ -1,0 +1,879 @@
+# fs/fcache.ad — Linux-shape filesystem caching layer.
+#
+# This module brings the Hamnix VFS toward real Linux parity by adding the
+# three kernel-side caches that sit BENEATH namec/Chan (this is NOT a path
+# table and it does NOT replace the Plan 9 namespace model — it is the
+# caching layer Linux keeps in mm/filemap.c + fs/dcache.c + the inode cache):
+#
+#   1. PAGE CACHE (address_space)   — per-inode index->page mapping so
+#      read()/write() go through cached pages. A read populates the page
+#      from the backing store (ext4/tmpfs/...); a write dirties the page;
+#      writeback flushes dirty pages back to the backing store on
+#      fsync/msync/sync and under memory pressure. Block/metadata I/O stays
+#      on the block buffer cache (kernel/block/blk.ad) — the page cache is
+#      the FILE-DATA layer above it.
+#
+#   2. DCACHE (dentry cache)        — hashed (Pgrp, path)->resolved-name
+#      lookup cache with NEGATIVE-dentry caching, so a repeated namec
+#      element-walk (resolve_path) is served from the cache instead of
+#      re-walking the per-Pgrp mount table every call. Keyed by the
+#      Pgrp pointer so a DIFFERENT namespace never gets a wrong hit; a
+#      global generation counter (bumped on every mount/bind/unmount/
+#      rename/unlink) invalidates the whole cache structurally.
+#
+#   3. INODE CACHE (icache)         — caches inode metadata keyed by
+#      (server, ino) so a stat-storm does not re-fetch the same inode.
+#
+# Coherence invariants:
+#   * The page cache is keyed by (server, ino, page_index). A write through
+#     vfs_pwrite_backing dirties the matching page; a writeback flushes it.
+#     fcache_invalidate_inode() drops every page + the icache entry for an
+#     inode on truncate/unlink/rename so a stale page can never be served.
+#   * The dcache is bumped wholesale by fcache_dcache_bump_gen() on any
+#     namespace mutation; per-Pgrp keying plus the generation stamp means a
+#     hit is only ever returned for the SAME namespace at the SAME gen.
+#
+# Adder layout note: like the block buffer cache, table data lives in flat
+# parallel .bss arrays (no struct-with-array field inside a big table — that
+# trips the known Adder struct-array miscompile). Page DATA is a separate
+# flat byte pool indexed by page slot.
+
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# ====================================================================
+#  PAGE CACHE (per-inode address_space)
+# ====================================================================
+#
+# Granularity is a 4 KiB page (Linux PAGE_SIZE). A page is identified by
+# (server, ino, index) where index = file_offset / PAGE_SIZE. The pool is a
+# fixed direct-hashed set of pages with CLOCK-ish LRU eviction; a dirty page
+# is NEVER evicted without writeback first (it is written back, then reused).
+
+PC_PAGE_SIZE:  uint64 = 4096
+PC_NPAGES:     uint64 = 256          # 256 pages = 1 MiB of file page cache
+PC_PROBE:      uint64 = 16           # linear-probe window on hash collision
+
+# Per-page metadata (parallel flat arrays — one entry per page slot).
+pc_valid:   Array[256, uint32]       # 0 = empty, 1 = holds a page
+pc_dirty:   Array[256, uint32]       # 1 = modified, needs writeback
+pc_server:  Array[256, int32]        # owning server id (see SRV_* below)
+pc_ino:     Array[256, uint64]       # inode number within that server
+pc_index:   Array[256, uint64]       # page index = offset / PC_PAGE_SIZE
+pc_len:     Array[256, uint64]       # valid bytes in the page (tail page < 4K)
+pc_lru:     Array[256, uint64]       # last-access clock stamp
+
+# Page data pool: page i lives at pc_data[i*4096 .. i*4096+4096).
+pc_data:    Array[1048576, uint8]    # 256 * 4096 = 1 MiB
+
+pc_clock_g:      uint64 = 0
+pc_hits_g:       uint64 = 0
+pc_misses_g:     uint64 = 0
+pc_evictions_g:  uint64 = 0
+pc_inserts_g:    uint64 = 0
+pc_writebacks_g: uint64 = 0
+
+# Server ids for cache keys (kept stable; mirror _path_owning_server's set).
+PC_SRV_NONE:  int32 = 0
+PC_SRV_EXT4:  int32 = 3
+PC_SRV_TMPFS: int32 = 2
+
+# Backing-store writeback hook. fs/vfs.ad registers a callback that flushes
+# one dirty page back to the real backing store (ext4_pwrite_inode etc.),
+# so this module stays free of a hard dependency on ext4/tmpfs internals.
+# Signature: (server, ino, byte_offset, src_ptr, len) -> 0 on success.
+pc_writeback_hook: Fn[int32, int32, uint64, uint64, uint64, uint64]
+
+
+def fcache_register_writeback_hook(
+        h: Fn[int32, int32, uint64, uint64, uint64, uint64]):
+    pc_writeback_hook = h
+
+
+def pc_hits() -> uint64:
+    return pc_hits_g
+
+
+def pc_misses() -> uint64:
+    return pc_misses_g
+
+
+def pc_writebacks() -> uint64:
+    return pc_writebacks_g
+
+
+def _pc_hash(server: int32, ino: uint64, index: uint64) -> uint64:
+    # Mix server, ino and page index into the table.
+    h: uint64 = cast[uint64](cast[int64](server)) * 2654435761
+    h = h ^ (ino * 40503)
+    h = h ^ (index * 2246822519)
+    return h % PC_NPAGES
+
+
+def _pc_lookup(server: int32, ino: uint64, index: uint64) -> int64:
+    # Returns the page slot holding (server, ino, index) or -1 on miss.
+    start: uint64 = _pc_hash(server, ino, index)
+    i: uint64 = 0
+    while i < PC_PROBE:
+        idx: uint64 = (start + i) % PC_NPAGES
+        if pc_valid[idx] != 0 \
+                and pc_server[idx] == server \
+                and pc_ino[idx] == ino \
+                and pc_index[idx] == index:
+            return cast[int64](idx)
+        i = i + 1
+    return -1
+
+
+def _pc_writeback_one(idx: uint64) -> int32:
+    # Flush dirty page slot `idx` to its backing store. Clears the dirty
+    # bit on success. Returns 0 on success (or if not dirty), -1 on error.
+    if pc_dirty[idx] == 0:
+        return 0
+    if pc_writeback_hook == cast[Fn[int32, int32, uint64,
+                                    uint64, uint64, uint64]](0):
+        # No backing hook (e.g. a pure in-RAM test page): treat as clean.
+        pc_dirty[idx] = 0
+        return 0
+    byte_off: uint64 = pc_index[idx] * PC_PAGE_SIZE
+    src: uint64 = cast[uint64](&pc_data[idx * PC_PAGE_SIZE])
+    rc: int32 = pc_writeback_hook(pc_server[idx], pc_ino[idx],
+                                  byte_off, src, pc_len[idx])
+    if rc != 0:
+        return -1
+    pc_dirty[idx] = 0
+    pc_writebacks_g = pc_writebacks_g + 1
+    return 0
+
+
+def _pc_pick_victim(server: int32, ino: uint64, index: uint64) -> uint64:
+    # Choose a slot for (server, ino, index): reuse an existing empty slot
+    # in the probe window, else evict the LRU slot (writing it back first
+    # if dirty so no dirty page is silently lost).
+    start: uint64 = _pc_hash(server, ino, index)
+    i: uint64 = 0
+    while i < PC_PROBE:
+        idx: uint64 = (start + i) % PC_NPAGES
+        if pc_valid[idx] == 0:
+            return idx
+        i = i + 1
+    # All slots in the window are full — evict the LRU one.
+    best: uint64 = start
+    best_lru: uint64 = pc_lru[start]
+    i = 1
+    while i < PC_PROBE:
+        idx: uint64 = (start + i) % PC_NPAGES
+        if pc_lru[idx] < best_lru:
+            best = idx
+            best_lru = pc_lru[idx]
+        i = i + 1
+    _pc_writeback_one(best)
+    pc_evictions_g = pc_evictions_g + 1
+    return best
+
+
+def _pc_touch(idx: uint64):
+    pc_clock_g = pc_clock_g + 1
+    pc_lru[idx] = pc_clock_g
+
+
+# --- public page-cache API -------------------------------------------
+
+def fcache_page_lookup(server: int32, ino: uint64,
+                       index: uint64) -> int64:
+    # Public lookup: page slot holding (server, ino, index), or -1. Bumps
+    # the per-op clock for LRU and the hit/miss counters.
+    s: int64 = _pc_lookup(server, ino, index)
+    if s >= 0:
+        pc_hits_g = pc_hits_g + 1
+        _pc_touch(cast[uint64](s))
+    else:
+        pc_misses_g = pc_misses_g + 1
+    return s
+
+
+def fcache_page_data(idx: uint64) -> uint64:
+    # Raw pointer to the 4 KiB data of page slot `idx`.
+    return cast[uint64](&pc_data[idx * PC_PAGE_SIZE])
+
+
+def fcache_page_len(idx: uint64) -> uint64:
+    return pc_len[idx]
+
+
+def fcache_page_install(server: int32, ino: uint64, index: uint64,
+                        src: Ptr[uint8], len: uint64, dirty: uint32) -> int64:
+    # Insert or refresh a page from `src` (len bytes; <= PC_PAGE_SIZE). If
+    # the page already resides it is overwritten in place. `dirty`=1 marks
+    # it pending-writeback. Returns the page slot, or -1 if len is bad.
+    if len > PC_PAGE_SIZE:
+        return -1
+    existing: int64 = _pc_lookup(server, ino, index)
+    idx: uint64 = 0
+    if existing >= 0:
+        idx = cast[uint64](existing)
+    else:
+        idx = _pc_pick_victim(server, ino, index)
+        pc_inserts_g = pc_inserts_g + 1
+    memcpy(&pc_data[idx * PC_PAGE_SIZE], src, len)
+    pc_valid[idx]  = 1
+    pc_server[idx] = server
+    pc_ino[idx]    = ino
+    pc_index[idx]  = index
+    pc_len[idx]    = len
+    if dirty != 0:
+        pc_dirty[idx] = 1
+    _pc_touch(idx)
+    return cast[int64](idx)
+
+
+def fcache_page_mark_dirty(idx: uint64):
+    pc_dirty[idx] = 1
+
+
+def fcache_inode_writeback(server: int32, ino: uint64) -> int32:
+    # Flush every dirty page of one inode (fsync/msync path). Returns 0 if
+    # all flushes succeeded, -1 otherwise.
+    rc: int32 = 0
+    i: uint64 = 0
+    while i < PC_NPAGES:
+        if pc_valid[i] != 0 and pc_dirty[i] != 0 \
+                and pc_server[i] == server and pc_ino[i] == ino:
+            if _pc_writeback_one(i) != 0:
+                rc = -1
+        i = i + 1
+    return rc
+
+
+def fcache_sync_all() -> int32:
+    # Global writeback (sync(2)): flush every dirty page in the cache.
+    rc: int32 = 0
+    i: uint64 = 0
+    while i < PC_NPAGES:
+        if pc_valid[i] != 0 and pc_dirty[i] != 0:
+            if _pc_writeback_one(i) != 0:
+                rc = -1
+        i = i + 1
+    return rc
+
+
+def fcache_invalidate_inode(server: int32, ino: uint64):
+    # Drop EVERY cached page of one inode (truncate/unlink/rename/overwrite
+    # by another path). Dirty pages are written back first so data is not
+    # lost when the inode is merely being re-sized, not deleted. Also drops
+    # the icache entry so a re-stat re-fetches fresh metadata.
+    i: uint64 = 0
+    while i < PC_NPAGES:
+        if pc_valid[i] != 0 and pc_server[i] == server and pc_ino[i] == ino:
+            _pc_writeback_one(i)
+            pc_valid[i] = 0
+            pc_dirty[i] = 0
+            pc_server[i] = PC_SRV_NONE
+            pc_ino[i] = 0
+            pc_index[i] = 0
+            pc_len[i] = 0
+        i = i + 1
+    _ic_drop(server, ino)
+
+
+def fcache_drop_inode_nowriteback(server: int32, ino: uint64):
+    # Drop pages WITHOUT writeback (unlink of a deleted file: writing back
+    # to a freed inode would corrupt the fs). Also drops the icache entry.
+    i: uint64 = 0
+    while i < PC_NPAGES:
+        if pc_valid[i] != 0 and pc_server[i] == server and pc_ino[i] == ino:
+            pc_valid[i] = 0
+            pc_dirty[i] = 0
+            pc_server[i] = PC_SRV_NONE
+            pc_ino[i] = 0
+            pc_index[i] = 0
+            pc_len[i] = 0
+        i = i + 1
+    _ic_drop(server, ino)
+
+
+def fcache_page_invalidate_all():
+    # Drop the ENTIRE page cache without writeback. Used by self-tests that
+    # must measure a guaranteed cold miss. Callers that need data preserved
+    # must fcache_sync_all() first.
+    i: uint64 = 0
+    while i < PC_NPAGES:
+        pc_valid[i]  = 0
+        pc_dirty[i]  = 0
+        pc_server[i] = PC_SRV_NONE
+        pc_ino[i]    = 0
+        pc_index[i]  = 0
+        pc_len[i]    = 0
+        i = i + 1
+
+
+# fs-side reclaim hook for the MM agent: free up to `want` CLEAN pages under
+# memory pressure (dirty pages are written back first, then freed). Returns
+# the number of pages reclaimed. mm/ calls this; it never reaches into mm/.
+def fcache_reclaim_pages(want: uint64) -> uint64:
+    freed: uint64 = 0
+    i: uint64 = 0
+    while i < PC_NPAGES and freed < want:
+        if pc_valid[i] != 0:
+            _pc_writeback_one(i)
+            pc_valid[i]  = 0
+            pc_dirty[i]  = 0
+            pc_server[i] = PC_SRV_NONE
+            pc_ino[i]    = 0
+            pc_index[i]  = 0
+            pc_len[i]    = 0
+            freed = freed + 1
+        i = i + 1
+    return freed
+
+
+# ====================================================================
+#  INODE CACHE (icache) — (server, ino) -> metadata
+# ====================================================================
+
+IC_NSLOTS: uint64 = 256
+IC_PROBE:  uint64 = 16
+
+ic_valid:  Array[256, uint32]
+ic_server: Array[256, int32]
+ic_ino:    Array[256, uint64]
+ic_size:   Array[256, uint64]
+ic_mode:   Array[256, uint32]
+ic_mtime:  Array[256, uint32]
+ic_lru:    Array[256, uint64]
+
+ic_clock_g:  uint64 = 0
+ic_hits_g:   uint64 = 0
+ic_misses_g: uint64 = 0
+
+
+def ic_hits() -> uint64:
+    return ic_hits_g
+
+
+def ic_misses() -> uint64:
+    return ic_misses_g
+
+
+def _ic_hash(server: int32, ino: uint64) -> uint64:
+    h: uint64 = cast[uint64](cast[int64](server)) * 2654435761
+    h = h ^ (ino * 40503)
+    return h % IC_NSLOTS
+
+
+def _ic_lookup_slot(server: int32, ino: uint64) -> int64:
+    start: uint64 = _ic_hash(server, ino)
+    i: uint64 = 0
+    while i < IC_PROBE:
+        idx: uint64 = (start + i) % IC_NSLOTS
+        if ic_valid[idx] != 0 and ic_server[idx] == server \
+                and ic_ino[idx] == ino:
+            return cast[int64](idx)
+        i = i + 1
+    return -1
+
+
+def _ic_pick(server: int32, ino: uint64) -> uint64:
+    start: uint64 = _ic_hash(server, ino)
+    i: uint64 = 0
+    while i < IC_PROBE:
+        idx: uint64 = (start + i) % IC_NSLOTS
+        if ic_valid[idx] == 0:
+            return idx
+        i = i + 1
+    best: uint64 = start
+    best_lru: uint64 = ic_lru[start]
+    i = 1
+    while i < IC_PROBE:
+        idx: uint64 = (start + i) % IC_NSLOTS
+        if ic_lru[idx] < best_lru:
+            best = idx
+            best_lru = ic_lru[idx]
+        i = i + 1
+    return best
+
+
+def _ic_drop(server: int32, ino: uint64):
+    s: int64 = _ic_lookup_slot(server, ino)
+    if s >= 0:
+        ic_valid[cast[uint64](s)] = 0
+
+
+def fcache_inode_lookup(server: int32, ino: uint64,
+                        out_size: Ptr[uint64], out_mode: Ptr[uint32],
+                        out_mtime: Ptr[uint32]) -> int32:
+    # Returns 1 on hit (fills outs), 0 on miss.
+    s: int64 = _ic_lookup_slot(server, ino)
+    if s < 0:
+        ic_misses_g = ic_misses_g + 1
+        return 0
+    idx: uint64 = cast[uint64](s)
+    out_size[0]  = ic_size[idx]
+    out_mode[0]  = ic_mode[idx]
+    out_mtime[0] = ic_mtime[idx]
+    ic_clock_g = ic_clock_g + 1
+    ic_lru[idx] = ic_clock_g
+    ic_hits_g = ic_hits_g + 1
+    return 1
+
+
+def fcache_inode_store(server: int32, ino: uint64, size: uint64,
+                       mode: uint32, mtime: uint32):
+    existing: int64 = _ic_lookup_slot(server, ino)
+    idx: uint64 = 0
+    if existing >= 0:
+        idx = cast[uint64](existing)
+    else:
+        idx = _ic_pick(server, ino)
+    ic_valid[idx]  = 1
+    ic_server[idx] = server
+    ic_ino[idx]    = ino
+    ic_size[idx]   = size
+    ic_mode[idx]   = mode
+    ic_mtime[idx]  = mtime
+    ic_clock_g = ic_clock_g + 1
+    ic_lru[idx] = ic_clock_g
+
+
+def fcache_icache_invalidate_all():
+    i: uint64 = 0
+    while i < IC_NSLOTS:
+        ic_valid[i] = 0
+        i = i + 1
+
+
+# ====================================================================
+#  DCACHE (dentry cache) — (Pgrp, path) -> resolved name
+# ====================================================================
+#
+# Caches the result of resolve_path: an input absolute path -> the
+# backend-addressable resolved name, plus the owning server. NEGATIVE
+# entries (neg=1, an ENOENT result) are cached too so repeated stats of a
+# missing file are fast. Keyed by the Pgrp pointer + a global generation
+# stamp: a namespace mutation (mount/bind/unmount/rename/unlink/mkdir/rmdir)
+# bumps the generation, instantly invalidating every entry without a sweep.
+#
+# Per-Pgrp keying guarantees a different namespace never gets a wrong hit
+# even at the same generation. Names are bounded at DC_PATH_MAX bytes; a
+# longer path simply isn't cached (correctness over coverage).
+
+DC_NSLOTS:   uint64 = 512
+DC_PROBE:    uint64 = 8
+DC_PATH_MAX: uint64 = 256
+
+dc_valid:   Array[512, uint32]       # 0 = empty, 1 = live
+dc_neg:     Array[512, uint32]       # 1 = negative (ENOENT) entry
+dc_pgrp:    Array[512, uint64]       # owning Pgrp pointer (namespace key)
+dc_gen:     Array[512, uint64]       # generation stamp at insert time
+dc_server:  Array[512, int32]        # resolved owning server
+dc_hash:    Array[512, uint64]       # input-path hash (fast reject)
+dc_lru:     Array[512, uint64]
+
+# Flat name pools (key = input path, val = resolved name). Entry i occupies
+# bytes [i*256 .. i*256+256) in each pool.
+dc_key:     Array[131072, uint8]     # 512 * 256 input-path bytes
+dc_val:     Array[131072, uint8]     # 512 * 256 resolved-name bytes
+
+dc_clock_g: uint64 = 0
+dc_gen_g:   uint64 = 1               # current namespace generation
+dc_hits_g:      uint64 = 0
+dc_misses_g:    uint64 = 0
+dc_neg_hits_g:  uint64 = 0
+dc_inserts_g:   uint64 = 0
+
+
+def dc_hits() -> uint64:
+    return dc_hits_g
+
+
+def dc_misses() -> uint64:
+    return dc_misses_g
+
+
+def dc_neg_hits() -> uint64:
+    return dc_neg_hits_g
+
+
+def fcache_dcache_gen() -> uint64:
+    return dc_gen_g
+
+
+def fcache_dcache_bump_gen():
+    # Called on EVERY namespace mutation: mount/bind/unmount/rename/unlink/
+    # mkdir/rmdir/symlink. Invalidates the whole dcache structurally by
+    # advancing the generation — no sweep, O(1). Also drops the page/inode
+    # caches' staleness window is handled separately by per-inode invalidate.
+    dc_gen_g = dc_gen_g + 1
+
+
+def _dc_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0 and n < DC_PATH_MAX:
+        n = n + 1
+    return n
+
+
+def _dc_strhash(s: Ptr[uint8], n: uint64) -> uint64:
+    h: uint64 = 1469598103934665603     # FNV-1a 64 offset basis
+    i: uint64 = 0
+    while i < n:
+        h = h ^ cast[uint64](s[i])
+        h = h * 1099511628211
+        i = i + 1
+    return h
+
+
+def _dc_streq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _dc_lookup(pgrp: uint64, key: Ptr[uint8], klen: uint64,
+               khash: uint64) -> int64:
+    start: uint64 = khash % DC_NSLOTS
+    i: uint64 = 0
+    while i < DC_PROBE:
+        idx: uint64 = (start + i) % DC_NSLOTS
+        if dc_valid[idx] != 0 \
+                and dc_pgrp[idx] == pgrp \
+                and dc_gen[idx] == dc_gen_g \
+                and dc_hash[idx] == khash:
+            # Confirm the key bytes match (hash is only a fast reject).
+            kp: Ptr[uint8] = &dc_key[idx * DC_PATH_MAX]
+            if _dc_strlen(kp) == klen and _dc_streq(kp, key, klen) != 0:
+                return cast[int64](idx)
+        i = i + 1
+    return -1
+
+
+def _dc_pick(khash: uint64) -> uint64:
+    start: uint64 = khash % DC_NSLOTS
+    i: uint64 = 0
+    while i < DC_PROBE:
+        idx: uint64 = (start + i) % DC_NSLOTS
+        if dc_valid[idx] == 0:
+            return idx
+        i = i + 1
+    best: uint64 = start
+    best_lru: uint64 = dc_lru[start]
+    i = 1
+    while i < DC_PROBE:
+        idx: uint64 = (start + i) % DC_NSLOTS
+        if dc_lru[idx] < best_lru:
+            best = idx
+            best_lru = dc_lru[idx]
+        i = i + 1
+    return best
+
+
+def fcache_dcache_lookup(pgrp: uint64, input: Ptr[uint8],
+                         out_val: Ptr[uint8], out_server: Ptr[int32],
+                         out_neg: Ptr[uint32]) -> int32:
+    # Returns 1 on hit (fills out_val with the resolved name, out_server,
+    # out_neg), 0 on miss. A negative-entry hit still returns 1 with
+    # out_neg=1 — the caller should treat it as a fast ENOENT.
+    klen: uint64 = _dc_strlen(input)
+    if klen == 0 or klen >= DC_PATH_MAX:
+        dc_misses_g = dc_misses_g + 1
+        return 0
+    khash: uint64 = _dc_strhash(input, klen)
+    s: int64 = _dc_lookup(pgrp, input, klen, khash)
+    if s < 0:
+        dc_misses_g = dc_misses_g + 1
+        return 0
+    idx: uint64 = cast[uint64](s)
+    out_server[0] = dc_server[idx]
+    out_neg[0]    = dc_neg[idx]
+    if dc_neg[idx] != 0:
+        dc_neg_hits_g = dc_neg_hits_g + 1
+        out_val[0] = 0
+    else:
+        vp: Ptr[uint8] = &dc_val[idx * DC_PATH_MAX]
+        vlen: uint64 = _dc_strlen(vp)
+        memcpy(out_val, vp, vlen)
+        out_val[vlen] = 0
+        dc_hits_g = dc_hits_g + 1
+    dc_clock_g = dc_clock_g + 1
+    dc_lru[idx] = dc_clock_g
+    return 1
+
+
+def fcache_dcache_store(pgrp: uint64, input: Ptr[uint8],
+                        val: Ptr[uint8], server: int32, neg: uint32):
+    # Cache a (Pgrp, input) -> (val, server) resolution. neg=1 caches an
+    # ENOENT result. Paths longer than DC_PATH_MAX-1 are silently not cached.
+    klen: uint64 = _dc_strlen(input)
+    if klen == 0 or klen >= DC_PATH_MAX:
+        return
+    vlen: uint64 = 0
+    if neg == 0:
+        vlen = _dc_strlen(val)
+        if vlen >= DC_PATH_MAX:
+            return
+    khash: uint64 = _dc_strhash(input, klen)
+    existing: int64 = _dc_lookup(pgrp, input, klen, khash)
+    idx: uint64 = 0
+    if existing >= 0:
+        idx = cast[uint64](existing)
+    else:
+        idx = _dc_pick(khash)
+        dc_inserts_g = dc_inserts_g + 1
+    kp: Ptr[uint8] = &dc_key[idx * DC_PATH_MAX]
+    memcpy(kp, input, klen)
+    kp[klen] = 0
+    if neg == 0:
+        vp: Ptr[uint8] = &dc_val[idx * DC_PATH_MAX]
+        memcpy(vp, val, vlen)
+        vp[vlen] = 0
+    dc_valid[idx]  = 1
+    dc_neg[idx]    = neg
+    dc_pgrp[idx]   = pgrp
+    dc_gen[idx]    = dc_gen_g
+    dc_server[idx] = server
+    dc_hash[idx]   = khash
+    dc_clock_g = dc_clock_g + 1
+    dc_lru[idx] = dc_clock_g
+
+
+def fcache_dcache_invalidate_all():
+    i: uint64 = 0
+    while i < DC_NSLOTS:
+        dc_valid[i] = 0
+        i = i + 1
+    dc_gen_g = dc_gen_g + 1
+
+
+# ====================================================================
+#  Boot self-test  — gated on /etc/fcache-test
+# ====================================================================
+#
+# Proves all three caches: page-cache populate/hit/dirty/writeback +
+# coherent reread, dcache positive/negative hit + per-Pgrp isolation +
+# generation invalidation, and the inode cache hit/invalidate. Pure in-RAM:
+# uses a stub writeback sink so no disk is required.
+
+_fc_sink_buf:   Array[4096, uint8]   # last-written-back page lands here
+_fc_sink_off:   uint64 = 0
+_fc_sink_len:   uint64 = 0
+_fc_sink_calls: uint64 = 0
+
+
+def _fc_test_writeback(server: int32, ino: uint64, off: uint64,
+                       src: uint64, len: uint64) -> int32:
+    # Stub backing store: record the writeback into _fc_sink_buf.
+    _fc_sink_off = off
+    _fc_sink_len = len
+    _fc_sink_calls = _fc_sink_calls + 1
+    if len <= 4096:
+        memcpy(&_fc_sink_buf[0], cast[Ptr[uint8]](src), len)
+    return 0
+
+
+_fc_pg_a: Array[4096, uint8]
+_fc_pg_b: Array[4096, uint8]
+
+
+def _fc_fill(buf: Ptr[uint8], n: uint64, seed: uint64):
+    i: uint64 = 0
+    while i < n:
+        buf[i] = cast[uint8]((seed + i) & 0xFF)
+        i = i + 1
+
+
+def _fc_cmp(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def fcache_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [fcache] marker lines.
+    printk0("[fcache] self-test start\n")
+    ok: int32 = 1
+
+    # Install the stub writeback sink, start from clean caches.
+    saved_hook: Fn[int32, int32, uint64, uint64, uint64, uint64] = \
+        pc_writeback_hook
+    fcache_register_writeback_hook(_fc_test_writeback)
+    fcache_page_invalidate_all()
+    fcache_icache_invalidate_all()
+    fcache_dcache_invalidate_all()
+
+    srv: int32 = PC_SRV_EXT4
+    ino: uint64 = 4242
+
+    # ---- PAGE CACHE: cold miss, populate, warm hit ----
+    _fc_fill(&_fc_pg_a[0], 4096, 0x10)
+    miss0: uint64 = pc_misses()
+    s0: int64 = fcache_page_lookup(srv, ino, 0)
+    if s0 >= 0:
+        printk0("[fcache] FAIL: page present before populate\n")
+        ok = 0
+    if pc_misses() != miss0 + 1:
+        printk0("[fcache] FAIL: cold lookup did not count a miss\n")
+        ok = 0
+    # Populate page 0 from backing data (clean).
+    fcache_page_install(srv, ino, 0, &_fc_pg_a[0], 4096, 0)
+    hit0: uint64 = pc_hits()
+    s1: int64 = fcache_page_lookup(srv, ino, 0)
+    if s1 < 0:
+        printk0("[fcache] FAIL: warm lookup missed after populate\n")
+        ok = 0
+    elif pc_hits() != hit0 + 1:
+        printk0("[fcache] FAIL: warm lookup did not count a hit\n")
+        ok = 0
+    elif _fc_cmp(cast[Ptr[uint8]](fcache_page_data(cast[uint64](s1))),
+                 &_fc_pg_a[0], 4096) == 0:
+        printk0("[fcache] FAIL: warm page returned wrong bytes\n")
+        ok = 0
+    else:
+        printk0("[fcache] PASS: page-cache warm read served from cache\n")
+
+    # ---- PAGE CACHE: write -> dirty -> writeback -> coherent reread ----
+    _fc_fill(&_fc_pg_b[0], 4096, 0xC3)
+    fcache_page_install(srv, ino, 0, &_fc_pg_b[0], 4096, 1)   # dirty
+    wb0: uint64 = pc_writebacks()
+    _fc_sink_calls = 0
+    if fcache_inode_writeback(srv, ino) != 0:
+        printk0("[fcache] FAIL: inode writeback returned error\n")
+        ok = 0
+    if pc_writebacks() != wb0 + 1:
+        printk0("[fcache] FAIL: writeback counter did not advance\n")
+        ok = 0
+    # The sink must have received the NEW bytes (no stale).
+    if _fc_cmp(&_fc_sink_buf[0], &_fc_pg_b[0], 4096) == 0:
+        printk0("[fcache] FAIL: writeback flushed wrong/stale bytes\n")
+        ok = 0
+    # A reread of the same page must now see the NEW bytes from cache.
+    s2: int64 = fcache_page_lookup(srv, ino, 0)
+    if s2 < 0 or _fc_cmp(cast[Ptr[uint8]](fcache_page_data(cast[uint64](s2))),
+                         &_fc_pg_b[0], 4096) == 0:
+        printk0("[fcache] FAIL: post-write reread returned stale bytes\n")
+        ok = 0
+    else:
+        printk0("[fcache] PASS: page-cache write+fsync coherent reread\n")
+    # After writeback the page is clean: a second writeback flushes nothing.
+    _fc_sink_calls = 0
+    fcache_inode_writeback(srv, ino)
+    if _fc_sink_calls != 0:
+        printk0("[fcache] FAIL: clean page re-flushed (dirty bit stuck)\n")
+        ok = 0
+
+    # ---- PAGE CACHE: invalidate drops the inode's pages ----
+    fcache_invalidate_inode(srv, ino)
+    if fcache_page_lookup(srv, ino, 0) >= 0:
+        printk0("[fcache] FAIL: page survived inode invalidate\n")
+        ok = 0
+    else:
+        printk0("[fcache] PASS: page-cache invalidate dropped inode pages\n")
+
+    # ---- INODE CACHE: miss, store, hit, invalidate ----
+    osize: uint64 = 0
+    omode: uint32 = 0
+    omtime: uint32 = 0
+    if fcache_inode_lookup(srv, ino, &osize, &omode, &omtime) != 0:
+        printk0("[fcache] FAIL: icache hit before store\n")
+        ok = 0
+    fcache_inode_store(srv, ino, 12345, 0x81A4, 99)
+    if fcache_inode_lookup(srv, ino, &osize, &omode, &omtime) != 1:
+        printk0("[fcache] FAIL: icache miss after store\n")
+        ok = 0
+    elif osize != 12345 or omode != 0x81A4 or omtime != 99:
+        printk0("[fcache] FAIL: icache returned wrong metadata\n")
+        ok = 0
+    else:
+        printk0("[fcache] PASS: inode-cache hit returns stored metadata\n")
+    _ic_drop(srv, ino)
+    if fcache_inode_lookup(srv, ino, &osize, &omode, &omtime) != 0:
+        printk0("[fcache] FAIL: icache hit after invalidate\n")
+        ok = 0
+    else:
+        printk0("[fcache] PASS: inode-cache invalidate forces re-fetch\n")
+
+    # ---- DCACHE: positive hit, per-Pgrp isolation, negative, gen bump ----
+    pgrp_a: uint64 = 0x1000
+    pgrp_b: uint64 = 0x2000
+    path:   Ptr[uint8] = "/usr/bin/foo"
+    resa:   Ptr[uint8] = "/ext/usr/bin/foo"
+    resb:   Ptr[uint8] = "/altroot/usr/bin/foo"
+    valbuf: Array[256, uint8]
+    osrv:   int32 = 0
+    oneg:   uint32 = 0
+
+    # Miss before any store.
+    if fcache_dcache_lookup(pgrp_a, path, &valbuf[0], &osrv, &oneg) != 0:
+        printk0("[fcache] FAIL: dcache hit before store\n")
+        ok = 0
+    # Store for pgrp_a, then a hit must return resa.
+    fcache_dcache_store(pgrp_a, path, resa, PC_SRV_EXT4, 0)
+    if fcache_dcache_lookup(pgrp_a, path, &valbuf[0], &osrv, &oneg) != 1 \
+            or oneg != 0 \
+            or _fc_cmp(&valbuf[0], resa, _dc_strlen(resa)) == 0 \
+            or osrv != PC_SRV_EXT4:
+        printk0("[fcache] FAIL: dcache positive hit wrong/missing\n")
+        ok = 0
+    else:
+        printk0("[fcache] PASS: dcache positive lookup cached\n")
+
+    # NAMESPACE ISOLATION: pgrp_b must NOT see pgrp_a's entry. Store a
+    # DIFFERENT resolution for the same path under pgrp_b and confirm each
+    # namespace gets its own answer (no cross-namespace stale hit).
+    if fcache_dcache_lookup(pgrp_b, path, &valbuf[0], &osrv, &oneg) != 0:
+        printk0("[fcache] FAIL: dcache leaked pgrp_a entry to pgrp_b\n")
+        ok = 0
+    else:
+        printk0("[fcache] PASS: dcache different namespace no stale hit\n")
+    fcache_dcache_store(pgrp_b, path, resb, PC_SRV_EXT4, 0)
+    if fcache_dcache_lookup(pgrp_b, path, &valbuf[0], &osrv, &oneg) != 1 \
+            or _fc_cmp(&valbuf[0], resb, _dc_strlen(resb)) == 0:
+        printk0("[fcache] FAIL: dcache pgrp_b got wrong resolution\n")
+        ok = 0
+    # And pgrp_a still resolves to resa (not clobbered by pgrp_b's store).
+    if fcache_dcache_lookup(pgrp_a, path, &valbuf[0], &osrv, &oneg) != 1 \
+            or _fc_cmp(&valbuf[0], resa, _dc_strlen(resa)) == 0:
+        printk0("[fcache] FAIL: dcache pgrp_a clobbered by pgrp_b store\n")
+        ok = 0
+
+    # NEGATIVE caching: cache an ENOENT, confirm a negative hit.
+    missing: Ptr[uint8] = "/no/such/file"
+    fcache_dcache_store(pgrp_a, missing, missing, PC_SRV_NONE, 1)
+    nh0: uint64 = dc_neg_hits()
+    if fcache_dcache_lookup(pgrp_a, missing, &valbuf[0], &osrv, &oneg) != 1 \
+            or oneg != 1:
+        printk0("[fcache] FAIL: negative dentry not cached\n")
+        ok = 0
+    elif dc_neg_hits() != nh0 + 1:
+        printk0("[fcache] FAIL: negative-hit counter did not advance\n")
+        ok = 0
+    else:
+        printk0("[fcache] PASS: dcache negative entry cached\n")
+
+    # GENERATION INVALIDATION: a namespace mutation must drop all hits.
+    fcache_dcache_bump_gen()
+    if fcache_dcache_lookup(pgrp_a, path, &valbuf[0], &osrv, &oneg) != 0:
+        printk0("[fcache] FAIL: dcache survived generation bump\n")
+        ok = 0
+    elif fcache_dcache_lookup(pgrp_b, path, &valbuf[0], &osrv, &oneg) != 0:
+        printk0("[fcache] FAIL: dcache pgrp_b survived generation bump\n")
+        ok = 0
+    else:
+        printk0("[fcache] PASS: dcache mount/rename gen bump invalidates\n")
+
+    # Restore the real (or null) writeback hook, leave caches clean.
+    fcache_page_invalidate_all()
+    fcache_register_writeback_hook(saved_hook)
+
+    if ok == 1:
+        printk0("[fcache] PASS\n")
+        return 1
+    printk0("[fcache] FAIL\n")
+    return 0

@@ -35,6 +35,15 @@ from kernel.block.blk import (
 from kernel.printk.printk import printk0, printk1, printk2
 from fs.vfs_mount import vfs_mount_ext4
 from drivers.rtc.cmos import rtc_read_unix_time
+# Linux-shape file page cache (fs/fcache.ad): regular ext4 file reads go
+# through a per-inode address_space so a re-read of the same page skips the
+# extent walk + block I/O, and writes dirty the cached page + write through.
+from fs.fcache import (
+    fcache_page_lookup, fcache_page_data, fcache_page_install,
+    fcache_invalidate_inode, fcache_inode_writeback,
+    fcache_drop_inode_nowriteback,
+    PC_SRV_EXT4, PC_PAGE_SIZE,
+)
 # docs/security.md Phase 6: stamp the creating task's uid/gid into
 # the new inode's i_uid/i_gid fields. Kernel-internal create paths
 # (mkfs root inode, blob_save) fall back to uid 1 (hostowner).
@@ -2708,6 +2717,12 @@ def ext4_read_file(inum: uint32, pos: uint64, count: uint64,
                    buf: Ptr[uint8]) -> int64:
     # Reads `count` bytes starting at file offset `pos` from the
     # file at inode `inum`. Returns bytes read; 0 on EOF.
+    #
+    # Linux-parity page cache: normal (non-inline/verity/crypt) extent reads
+    # are served PAGE-BY-PAGE through the per-inode address_space (fcache).
+    # A page resident in the cache skips the extent walk + block I/O
+    # entirely; a miss populates the page from the backing store via
+    # _ext4_read_file_raw and is then served from the cache on the next read.
     inode: Array[256, uint8]
     if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
         return -1
@@ -2719,7 +2734,83 @@ def ext4_read_file(inum: uint32, pos: uint64, count: uint64,
         count = remaining
 
     # inline_data inode: bytes live in the inode (i_block[] + system.data
-    # xattr), not in extents. Gated on the mount-time feature flag.
+    # xattr), not in extents. Gated on the mount-time feature flag. These
+    # do NOT go through the page cache (no stable backing pages).
+    if ext4_inode_is_inline(&inode[0]) != 0:
+        return _ext4_read_inline_data(&inode[0], pos, count, buf)
+
+    # verity / fscrypt inodes also bypass the page cache (the verified /
+    # decrypted bytes are produced by their own paths below).
+    flags_w: uint32 = ext4_inode_flags(&inode[0])
+    if (flags_w & EXT4_VERITY_FL) == 0 \
+            and (flags_w & EXT4_ENCRYPT_FL) == 0:
+        return _ext4_read_file_cached(cast[uint32](inum), pos, count,
+                                      size, buf)
+    return _ext4_read_file_raw(inum, pos, count, buf)
+
+
+def _ext4_read_file_cached(inum: uint32, pos: uint64, count: uint64,
+                           size: uint64, buf: Ptr[uint8]) -> int64:
+    # Page-cache front end for normal extent reads. `count` is already
+    # clamped to <= size-pos by the caller. Serves each touched page from
+    # the per-inode address_space, populating misses from the raw reader.
+    srv: int32 = PC_SRV_EXT4
+    ino:  uint64 = cast[uint64](inum)
+    total: uint64 = 0
+    pgtmp: Array[4096, uint8]
+    while total < count:
+        cur_off:   uint64 = pos + total
+        pg_index:  uint64 = cur_off / PC_PAGE_SIZE
+        off_in_pg: uint64 = cur_off % PC_PAGE_SIZE
+        chunk: uint64 = PC_PAGE_SIZE - off_in_pg
+        if chunk > count - total:
+            chunk = count - total
+        slot: int64 = fcache_page_lookup(srv, ino, pg_index)
+        if slot < 0:
+            # MISS: read the full page from backing (clamped to EOF) and
+            # install it, then serve from the freshly cached copy.
+            pg_base: uint64 = pg_index * PC_PAGE_SIZE
+            want: uint64 = PC_PAGE_SIZE
+            if pg_base + want > size:
+                want = size - pg_base
+            got: int64 = _ext4_read_file_raw(inum, pg_base, want, &pgtmp[0])
+            if got < 0:
+                if total > 0:
+                    return cast[int64](total)
+                return got
+            fcache_page_install(srv, ino, pg_index, &pgtmp[0],
+                                cast[uint64](got), 0)
+            slot = fcache_page_lookup(srv, ino, pg_index)
+            if slot < 0:
+                # Cache could not hold the page (shouldn't happen) — fall
+                # back to a direct backing read for this chunk.
+                got2: int64 = _ext4_read_file_raw(inum, cur_off, chunk,
+                    cast[Ptr[uint8]](cast[uint64](buf) + total))
+                if got2 <= 0:
+                    return cast[int64](total)
+                total = total + cast[uint64](got2)
+                continue
+        pdata: uint64 = fcache_page_data(cast[uint64](slot))
+        memcpy(cast[Ptr[uint8]](cast[uint64](buf) + total),
+               cast[Ptr[uint8]](pdata + off_in_pg), chunk)
+        total = total + chunk
+    return cast[int64](total)
+
+
+def _ext4_read_file_raw(inum: uint32, pos: uint64, count: uint64,
+                        buf: Ptr[uint8]) -> int64:
+    # The original extent-walk reader (no page cache). Used to populate the
+    # page cache and to serve inline/verity/fscrypt inodes directly.
+    inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
+        return -1
+    size: uint64 = cast[uint64](ext4_inode_size_lo(&inode[0]))
+    if pos >= size:
+        return 0
+    remaining: uint64 = size - pos
+    if count > remaining:
+        count = remaining
+
     if ext4_inode_is_inline(&inode[0]) != 0:
         return _ext4_read_inline_data(&inode[0], pos, count, buf)
 
@@ -5234,6 +5325,11 @@ def ext4_open_create_or_trunc(name: Ptr[char]) -> int32:
                            &old_inode_buf[0]) == 0:
             _ext4_extent_trim_to(&old_inode_buf[0], 0)
         ext4_free_inode(old_inum)
+        # Page-cache coherence: the old inode's blocks are freed and its
+        # inum may be REUSED by the fresh create below — drop its cached
+        # pages (no writeback; blocks are gone) so the new empty file is
+        # never shadowed by the old contents.
+        fcache_drop_inode_nowriteback(PC_SRV_EXT4, cast[uint64](old_inum))
     # Fresh-empty create against the resolved parent.
     empty: Array[1, uint8]
     new_inum: uint32 = ext4_create_file(
@@ -5342,6 +5438,9 @@ def ext4_write_open_file(slot: int32, src: Ptr[uint8],
     _ext4_stamp_mtime(&inode[0])
     if ext4_write_inode(cast[uint64](inum), &inode[0]) != 0:
         return -1
+    # Page-cache coherence (see ext4_pwrite_inode): drop this inode's cached
+    # pages so the next read re-populates from the just-written disk blocks.
+    fcache_invalidate_inode(PC_SRV_EXT4, cast[uint64](inum))
     if written == 0:
         return 0
     return cast[int64](written)
@@ -5415,6 +5514,9 @@ def ext4_pwrite_inode(inum: uint32, src: Ptr[uint8],
     _ext4_stamp_mtime(&inode[0])
     if ext4_write_inode(cast[uint64](inum), &inode[0]) != 0:
         return -1
+    # Page-cache coherence: this inode's data on disk changed under the
+    # cache; drop cached pages so the next read sees the new bytes.
+    fcache_invalidate_inode(PC_SRV_EXT4, cast[uint64](inum))
     if written == 0:
         return 0
     return cast[int64](written)
@@ -5514,6 +5616,9 @@ def ext4_unlink(name: Ptr[char]) -> int32:
     # metadata_csum: restamp the dir block's tail checksum before the
     # write so the tombstone keeps the block's crc32c valid.
     _ext4_dirblock_stamp_in_buf(2, root_gen)
+    # Page-cache coherence: the inode is gone — drop its cached pages WITHOUT
+    # writeback (the inode/blocks are freed; flushing would corrupt the fs).
+    fcache_drop_inode_nowriteback(PC_SRV_EXT4, cast[uint64](target_inum))
     return _ext4_journal_write_block(target_phys, &ext4_blk_buf[0])
 
 
@@ -7121,6 +7226,10 @@ def ext4_truncate_inode(inum: uint32, new_len: uint64) -> int32:
     _ext4_stamp_mtime(&inode[0])
     if ext4_write_inode(cast[uint64](inum), &inode[0]) != 0:
         return -1
+    # Page-cache coherence: the inode's extent map / data changed; drop
+    # every cached page so a post-truncate read never serves stale bytes
+    # past the new EOF nor pre-grow garbage.
+    fcache_invalidate_inode(PC_SRV_EXT4, cast[uint64](inum))
     return 0
 
 
@@ -7397,6 +7506,9 @@ def ext4_rename(old_path: Ptr[char], new_path: Ptr[char]) -> int32:
                     ext4_free_block(vphys)
                 vb = vb + 1
         ext4_free_inode(dst_inum)
+        # Page-cache coherence: the overwritten destination inode is freed
+        # (its inum may be reused) — drop its cached pages, no writeback.
+        fcache_drop_inode_nowriteback(PC_SRV_EXT4, cast[uint64](dst_inum))
         _ext4_dir_tombstone(cast[uint64](new_parent_inum),
                             cast[Ptr[char]](&ext4_rn_new_leaf[0]))
 
@@ -10054,6 +10166,9 @@ def ext4_blob_save(name: Ptr[char], src: Ptr[uint8],
                            &ext4_blob_inode[0]) == 0:
             _ext4_extent_trim_to(&ext4_blob_inode[0], 0)
         ext4_free_inode(old_inum)
+        # Page-cache coherence: old inum's blocks are freed and the inum
+        # may be reused; drop its cached pages (no writeback).
+        fcache_drop_inode_nowriteback(PC_SRV_EXT4, cast[uint64](old_inum))
     # Allocate a fresh inode for the new file.
     new_inum: uint32 = ext4_alloc_inode()
     if new_inum == 0:
@@ -10968,6 +11083,8 @@ def ext4_blob_save_at_path(path: Ptr[char], src: Ptr[uint8],
                            &ext4_blob_inode[0]) == 0:
             _ext4_extent_trim_to(&ext4_blob_inode[0], 0)
         ext4_free_inode(old_inum)
+        # Page-cache coherence: old inum freed + possibly reused; drop it.
+        fcache_drop_inode_nowriteback(PC_SRV_EXT4, cast[uint64](old_inum))
 
     # Allocate a new inode, build an empty leaf, grow block-by-block.
     new_inum: uint32 = ext4_alloc_inode()

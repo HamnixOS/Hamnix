@@ -206,7 +206,14 @@ from sys.src.port9.port.devsrv import (
 # table. task_struct_at hands us a Ptr[TaskStruct] for the poster's
 # slot; _alloc_fd + copy_fd_entry then do the dup, mirroring the
 # sys_srv_open syscall body in arch/x86/kernel/syscall.ad.
-from kernel.sched.core import task_struct_at
+from kernel.sched.core import task_struct_at, current_pgrp
+# Linux-parity dentry cache (fs/fcache.ad): resolve_path is fronted by a
+# per-namespace (Pgrp + generation) dcache so repeated path lookups skip the
+# mount-table walk. Namespace mutations bump the generation to invalidate.
+from fs.fcache import (
+    fcache_dcache_lookup, fcache_dcache_store, fcache_dcache_bump_gen,
+    fcache_sync_all,
+)
 # V1: in-kernel 9P client surface — vfs.ad dispatches FD_P9_MARK fds
 # through these. 9p_client.ad's FD_P9_MARK lives next to the dev*.ad
 # trio's marks (same pattern, see comment above the devstat import).
@@ -1841,7 +1848,12 @@ def vfs_open_write_kernel(name: Ptr[char]) -> int32:
     rrc: int32 = resolve_path(name, &resolved[0], 256)
     if rrc != 0:
         return rrc
-    return _vfs_open_write_post_perm(cast[Ptr[char]](&resolved[0]))
+    kfd: int32 = _vfs_open_write_post_perm(cast[Ptr[char]](&resolved[0]))
+    # dcache: a kernel write-open may create the file too — invalidate any
+    # stale negative dentry (see vfs_open_write).
+    if kfd >= 0:
+        fcache_dcache_bump_gen()
+    return kfd
 
 
 def vfs_open(name: Ptr[char]) -> int32:
@@ -3435,6 +3447,13 @@ def vfs_open_write(name: Ptr[char]) -> int32:
     if fd >= 0:
         task: Ptr[TaskStruct] = current_task()
         task_fd_set_opened_path(task, cast[uint64](fd), &resolved[0])
+        # dcache: a write-open may have CREATED the file (O_CREAT), which
+        # turns a previously-cached NEGATIVE dentry for `name` live. The
+        # create path is diffuse across backends, so bump the dcache
+        # generation here so a stale negative entry can never be served
+        # after a create. (Write-opens are far rarer than the read/stat/
+        # exec resolves the dcache accelerates, so this is cheap.)
+        fcache_dcache_bump_gen()
     return fd
 
 
@@ -3630,6 +3649,9 @@ def _vfs_open_write_post_perm(name: Ptr[char]) -> int32:
 
 
 def vfs_unlink(name: Ptr[char]) -> int32:
+    # dcache: a name is going away (and a negative dentry may turn live on a
+    # later create at the same path) — invalidate the dcache wholesale.
+    fcache_dcache_bump_gen()
     # Mirrors fs/namei.c::do_unlinkat() at the smallest meaningful
     # scope: route by path prefix to the backing FS.
     #   /tmp/*  →  tmpfs_unlink
@@ -3654,6 +3676,7 @@ def vfs_unlink(name: Ptr[char]) -> int32:
 
 
 def vfs_rmdir(name: Ptr[char]) -> int32:
+    fcache_dcache_bump_gen()                              # dcache: name gone
     # fs/namei.c::do_rmdirat() at the smallest meaningful scope: remove
     # an EMPTY directory, routed by path prefix to the backing FS.
     #   /tmp/*  →  tmpfs_unlink (already enforces empty-dir semantics,
@@ -3679,6 +3702,7 @@ def vfs_rmdir(name: Ptr[char]) -> int32:
 
 
 def vfs_mkdir(name: Ptr[char]) -> int32:
+    fcache_dcache_bump_gen()                # dcache: negative dentry may flip
     # fs/namei.c::do_mkdirat() at the smallest meaningful scope. The
     # caller passes an already-resolved absolute path.
     #   9P-mounted prefix  →  namec_mkdir (Tcreate DMDIR, mkdir -p)
@@ -3736,6 +3760,7 @@ def vfs_mkdir(name: Ptr[char]) -> int32:
 
 
 def vfs_rename(oldname: Ptr[char], newname: Ptr[char]) -> int32:
+    fcache_dcache_bump_gen()                  # dcache: both names change state
     # Plan 9 wstat(2)'s "change the name field" leg. tmpfs and ext4
     # are both wired; ext4 does the dirent remove + insert (with
     # overwrite of an existing destination) in fs/ext4.ad. Both names
@@ -3754,6 +3779,7 @@ def vfs_rename(oldname: Ptr[char], newname: Ptr[char]) -> int32:
 
 
 def vfs_symlink(target: Ptr[char], linkpath: Ptr[char]) -> int32:
+    fcache_dcache_bump_gen()                  # dcache: new name appears
     # Create a symlink at `linkpath` whose content (target) is `target`.
     # The existing resolver (_lookup_name / _resolve_with_symlinks) will
     # follow the link transparently when a process opens `linkpath`.
@@ -3833,6 +3859,7 @@ def _vfs_file_server_id(path: Ptr[uint8]) -> int32:
 
 
 def vfs_link(oldpath: Ptr[char], newpath: Ptr[char]) -> int32:
+    fcache_dcache_bump_gen()                  # dcache: new name appears
     # Create a hard link: `newpath` is a second name for the same
     # underlying file object as `oldpath`.  Both paths MUST resolve
     # within the SAME file server in the caller's namespace — this is
@@ -3958,6 +3985,13 @@ def vfs_fsync(fd: int32) -> int32:
     # the per-fd identity only matters as "is this an ext4 fd?".
     if file_idx == FD_CHAN_MARK:
         if namec_chan_dev_type(_fd_chan_id(task, fdu)) == DEV_EXT4_FILE:
+            # Page-cache writeback: flush any dirty page-cache pages to the
+            # backing store BEFORE the device-cache barrier so fsync's
+            # durability contract covers cached-but-unflushed file data.
+            # (ext4's own write path is write-through + page-invalidating, so
+            # today this is a no-op; it makes the contract explicit and
+            # covers any future buffered-write producer.)
+            fcache_sync_all()
             return ext4_fsync()
         return 0
     return 0
@@ -3969,6 +4003,7 @@ def vfs_fsync_all() -> int32:
     # this is ext4_fsync(). Returns 0 always (sync(2) cannot fail);
     # ext4_fsync's -1-when-unmounted is swallowed since "no ext4
     # mount" is not a sync failure.
+    fcache_sync_all()                        # flush dirty page-cache pages
     ext4_fsync()
     return 0
 
@@ -4642,6 +4677,44 @@ def resolve_path_canonical(input: Ptr[char], output: Ptr[uint8],
 
 def resolve_path(input: Ptr[char], output: Ptr[uint8],
                  count: uint64) -> int32:
+    # dcache front end (Linux-parity dentry cache). A repeated namec
+    # element-walk for the SAME absolute path in the SAME namespace is
+    # served from fs/fcache.ad's dcache instead of re-walking the per-Pgrp
+    # mount table. Keyed by (Pgrp pointer, input path) + a global namespace
+    # generation that every mount/bind/unmount/rename/unlink bumps — so a
+    # different namespace never gets a wrong hit and a structural change
+    # instantly invalidates the cache.
+    #
+    # Only ABSOLUTE, non-`#`-spec inputs are cacheable: a relative path
+    # resolves against the (per-task) cwd, which is not in the key, and a
+    # `#X` direct server spec bypasses the namespace walk entirely. Those
+    # fall straight through to the uncached resolver.
+    if input[0] == 47 and input[1] != 0:                  # '/...' absolute
+        pg: uint64 = current_pgrp()
+        dc_val: Array[256, uint8]
+        dc_srv: int32 = 0
+        dc_neg: uint32 = 0
+        if fcache_dcache_lookup(pg, cast[Ptr[uint8]](input),
+                                &dc_val[0], &dc_srv, &dc_neg) == 1:
+            if dc_neg != 0:
+                return ENOENT
+            return _rp_copy(output, &dc_val[0], count)
+        rc: int32 = _resolve_path_uncached(input, output, count)
+        # Cache the verdict. A success caches the resolved name; an ENOENT
+        # caches a negative dentry. ENAMETOOLONG / other errors are NOT
+        # cached (transient / buffer-shape dependent).
+        if rc == 0:
+            fcache_dcache_store(pg, cast[Ptr[uint8]](input),
+                                output, 0, 0)
+        elif rc == ENOENT:
+            fcache_dcache_store(pg, cast[Ptr[uint8]](input),
+                                cast[Ptr[uint8]](input), 0, 1)
+        return rc
+    return _resolve_path_uncached(input, output, count)
+
+
+def _resolve_path_uncached(input: Ptr[char], output: Ptr[uint8],
+                           count: uint64) -> int32:
     # Resolve `input` (absolute or relative, with or without "."/"..")
     # through the calling task's NAMESPACE into a backend-addressable
     # name in `output`. Returns 0 on success, -ENAMETOOLONG on
