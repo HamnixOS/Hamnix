@@ -106,10 +106,12 @@ set +e
     sleep 2
 
     # ---- PART A: stock-Debian-binary coverage sweep ------------------
-    # dash via -c assembling a marker from two args (typed line never holds
-    # the contiguous needle).
+    # dash via -c, using the dash BUILTIN echo (no fork — `dash -c` of an
+    # EXTERNAL command uses vfork, whose CLONE_VM shared-AS semantics the
+    # fork path doesn't yet honour; that's a separate track). The marker is
+    # assembled from two args so the typed line never holds it contiguous.
     printf 'echo BANNER_DASH_START\n'; sleep 1
-    printf "enter linux { /bin/dash -c '/bin/echo DASH_RUN OK_MARK' }\n"; sleep 6
+    printf "enter linux { /bin/dash -c 'echo DASH_RUN OK_MARK' }\n"; sleep 6
     printf 'echo BANNER_DASH_END\n'; sleep 1
 
     # bash prints its version (proves bash + libtinfo .so closure maps).

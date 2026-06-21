@@ -258,11 +258,34 @@ unmodified inside `enter linux { … }` and produce correct output:
 | `/usr/bin/apt`, `/usr/bin/apt-get` | `libapt-pkg`, `libapt-private`, `libstdc++`, `libsystemd`, `libcrypto`, … | run |
 | `/usr/bin/tar`, `/bin/gzip` | `libacl`, `libselinux`, `libc` | run (dpkg unpack forks them) |
 
-`dash` carries the same `libc`-only closure dpkg does, so it ran as soon
-as dpkg did; `bash` only additionally needs `libtinfo.so.6`, which the
-`lib*.so*` glob stages automatically. There was no remaining shared-object
-mmap gap to fix for the shells — the version-agnostic glob is what closed
-it. The sweep is gated by `scripts/test_linux_debian_coverage.sh` (Part A).
+`dash` carries the same `libc`-only closure dpkg does; `bash` only
+additionally needs `libtinfo.so.6`, which the `lib*.so*` glob stages
+automatically. The remaining gap was NOT shared-object mmap — it was two
+kernel-side enablers that broad binary coverage exposed:
+
+1. **fork(2) namespace inheritance.** A plain `fork()` (no `CLONE_NEWNS`)
+   left the child's Pgrp at the ROOT namespace, so a forked-then-exec'd
+   binary (`bash -c '/bin/echo …'`, `apt-get → dpkg → dpkg-deb → tar`)
+   resolved its paths in the root namespace, NOT the `enter linux`
+   namespace — `/bin/echo: No such file or directory` (exit 127). Fixed in
+   `arch/x86/kernel/syscall.ad::do_clone`: a plain fork now SHARES the
+   parent's Pgrp (Linux semantics), only `CLONE_NEWNS` gets a private one.
+
+2. **XCR0 / AVX enablement.** The boot set `CR4.OSXSAVE` but never
+   `XSETBV`'d, so `XCR0` stayed at `0x1` (x87 only) and any VEX-encoded
+   (AVX) instruction `#UD`'d. glibc's ifunc resolvers pick AVX memcpy /
+   string routines on an AVX-advertising CPU, so real coreutils (`wc`,
+   `sort`) and the apt-install decompression path `#UD`'d — and with no
+   userspace SIGILL recovery the `#UD` **halted the whole kernel**. Fixed
+   by `XSETBV XCR0 = 0x7` (x87 | SSE | AVX) on the BSP
+   (`start_first_task`) and every AP (`ap_main_hamnix`). Hamnix does not
+   FX/XSAVE the vector file across context switches, so this adds no
+   save/restore obligation — it only stops the `#UD`.
+
+The sweep is gated by `scripts/test_linux_debian_coverage.sh` (Part A).
+(One remaining quirk: `dash -c` of an EXTERNAL command uses `vfork`, whose
+`CLONE_VM` shared-address-space semantics the fork path does not yet
+honour — `bash -c` uses plain `fork` and works; tracked separately.)
 
 ## Offline package install (`apt-get install` / `dpkg -i`)
 
