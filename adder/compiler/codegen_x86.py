@@ -271,6 +271,10 @@ class X86CodeGen:
         self.output: list[str] = []
         self.string_literals: dict[str, str] = {}
         self.string_counter: int = 0
+        # FP constant pool: (width, ieee_bits) -> label. Emitted in .rodata
+        # as a .long (float32) / .quad (float64) of the raw bit pattern.
+        self.float_literals: dict[tuple, str] = {}
+        self.float_counter: int = 0
         self.extern_funcs: set[str] = set()
         self.defined_funcs: set[str] = set()
         # Map function name -> return Type, populated in pass 1. Used by
@@ -356,8 +360,8 @@ class X86CodeGen:
         sizes = {
             "int8": 1, "uint8": 1, "char": 1, "bool": 1,
             "int16": 2, "uint16": 2,
-            "int32": 4, "uint32": 4, "int": 4,
-            "int64": 8, "uint64": 8,
+            "int32": 4, "uint32": 4, "int": 4, "float32": 4,
+            "int64": 8, "uint64": 8, "float64": 8,
         }
         return sizes.get(name, 8)
 
@@ -372,6 +376,23 @@ class X86CodeGen:
     def get_expr_type(self, expr: Expr) -> Optional[Type]:
         """Best-effort type of an expression. Returns None when unknown
         (callers must have a safe default)."""
+        if isinstance(expr, FloatLiteral):
+            # A bare float literal models as float64 (Python double). A
+            # surrounding cast retypes it; this default lets FP arithmetic
+            # over literals pick the SSE double path.
+            return Type("float64")
+        if isinstance(expr, BinaryExpr):
+            # An arithmetic BinaryExpr over FP operands is itself FP (so a
+            # nested `(a + b) * c` of floats keeps using the SSE path). The
+            # result float width is the wider of the two operands. Integer
+            # BinaryExprs still report None (no integer case existed before).
+            lf = self._float_width(self.get_expr_type(expr.left))
+            rf = self._float_width(self.get_expr_type(expr.right))
+            if expr.op in (BinOp.ADD, BinOp.SUB, BinOp.MUL, BinOp.DIV,
+                           BinOp.IDIV) and (lf is not None or rf is not None):
+                w = max(lf or 0, rf or 0)
+                return Type("float64" if w == 8 else "float32")
+            return None
         if isinstance(expr, WalrusExpr):
             # The type of `(name := value)` is the type of `name` (the
             # already-declared local) — `:=` doesn't introduce a binding.
@@ -520,6 +541,30 @@ class X86CodeGen:
                 4: "movslq %eax, %rax"}.get(src_size)
         if sext is not None:
             self.emit(f"    {sext}")
+
+    def _emit_cast_widen_from_i64(self, cast_to: Optional[Type]) -> None:
+        """%rax holds a true signed 64-bit integer (e.g. the result of a
+        float->int cvtt). Narrow it to a sub-8-byte integer target the same
+        way _emit_cast_widen's narrowing branch does, keyed on the target
+        type alone. Used only on the float->int cast path."""
+        if cast_to is None:
+            return
+        if not (hasattr(cast_to, "name")
+                and getattr(cast_to, "name", None) in self._INT_NAMES):
+            return
+        dst_size = self.get_type_size(cast_to)
+        if dst_size >= 8:
+            return
+        if self._is_unsigned_type(cast_to):
+            ext = {1: "movzbq %al, %rax",
+                   2: "movzwq %ax, %rax",
+                   4: "movl %eax, %eax"}.get(dst_size)
+        else:
+            ext = {1: "movsbq %al, %rax",
+                   2: "movswq %ax, %rax",
+                   4: "movslq %eax, %rax"}.get(dst_size)
+        if ext is not None:
+            self.emit(f"    {ext}")
 
     def emit_load_sized(self, size: int, addr_reg: str = "%rax",
                         dst: str = "%rax") -> None:
@@ -1399,13 +1444,22 @@ class X86CodeGen:
             self.emit('__per_cpu_template_end:')
 
     def gen_rodata(self) -> None:
-        if not self.string_literals:
+        if not self.string_literals and not self.float_literals:
             return
         self.emit()
         self.emit('    .section .rodata')
         for s, label in self.string_literals.items():
             self.emit(f"{label}:")
             self.emit(f'    .asciz "{self._escape(s)}"')
+        # FP constants: emit the raw IEEE-754 bit pattern, aligned to its
+        # width, as .long (float32) / .quad (float64). Mirrored by codegen.ad.
+        for (width, bits), label in self.float_literals.items():
+            self.emit(f"    .align {width}")
+            self.emit(f"{label}:")
+            if width == 4:
+                self.emit(f"    .long {bits}")
+            else:
+                self.emit(f"    .quad {bits}")
 
     def gen_modinfo(self) -> None:
         # modpost appends its own .modinfo (vermagic, name, ...); the license
@@ -2642,6 +2696,12 @@ class X86CodeGen:
                 else:
                     self.emit(f"    movabsq ${v}, %rax")
 
+            case FloatLiteral(value=v):
+                # A bare float literal is a float64 (Python `float` = double);
+                # its bit pattern is loaded into %rax. An enclosing
+                # `cast[float32](...)` narrows via cvtsd2ss in the cast path.
+                self._emit_load_float_literal(float(v), 8)
+
             case BoolLiteral(value=v):
                 self.emit(f"    movq ${1 if v else 0}, %rax")
 
@@ -2686,7 +2746,18 @@ class X86CodeGen:
                 # as int64. (A compile-time constant already sign-extends in
                 # its loader, which is why only runtime values were bitten.)
                 self.gen_expr(inner)
-                self._emit_cast_widen(inner, cast_to)
+                # FP cast: if either the source or the target is a float
+                # type, route through the SSE convert path (int<->float,
+                # float<->float). A float->int cast leaves a 64-bit signed
+                # integer in %rax, which then needs the integer narrowing
+                # fix-up for sub-8-byte int targets.
+                src_t = self.get_expr_type(inner)
+                if self._is_float_type(src_t) or self._is_float_type(cast_to):
+                    self._emit_fp_convert(src_t, cast_to)
+                    if not self._is_float_type(cast_to):
+                        self._emit_cast_widen_from_i64(cast_to)
+                else:
+                    self._emit_cast_widen(inner, cast_to)
 
             case WalrusExpr(name=wname, value=wvalue):
                 # `(name := value)` — assignment expression.
@@ -3157,6 +3228,21 @@ class X86CodeGen:
             self.gen_short_circuit(op, left, right)
             return
 
+        # Floating-point binary op: if EITHER operand is float-typed, this is
+        # a scalar SSE op. The operand-eval order + spill is identical to the
+        # integer path (right->push, left->pop %rcx), so both backends share
+        # the exact same stack-machine prologue; only the post-pop work
+        # differs. Each operand is converted to the OP's float width (the
+        # wider of the two) before the op so e.g. `f64 + cast[float32](x)`
+        # promotes the float32 to double first.
+        lf = self._float_width(self.get_expr_type(left))
+        rf = self._float_width(self.get_expr_type(right))
+        if (lf is not None or rf is not None) and op in (
+                BinOp.ADD, BinOp.SUB, BinOp.MUL, BinOp.DIV, BinOp.IDIV,
+                BinOp.EQ, BinOp.NEQ, BinOp.LT, BinOp.LTE, BinOp.GT, BinOp.GTE):
+            self._gen_fp_binary(op, left, right, lf, rf)
+            return
+
         # Evaluate right first, push, then left. After pop, %rax = left,
         # %rcx = right. This mirrors codegen_arm's stack-machine style.
         self.gen_expr(right)
@@ -3282,6 +3368,237 @@ class X86CodeGen:
     # All scalar integer type names (signed + unsigned). Used to gate the
     # cast-widening sign/zero-extension fix-up to genuine integer casts.
     _INT_NAMES = _UNSIGNED_INT_NAMES | _SIGNED_INT_NAMES
+
+    # ===== Scalar SSE floating point ======================================
+    # FP TRANSIT MODEL: a float/double VALUE travels through the same
+    # single-accumulator path as every integer — it lives in %rax as its
+    # raw IEEE-754 BIT PATTERN (float32 in the low 32 bits, float64 in all
+    # 64). All the existing spill (`pushq %rax`), local store/load (sized
+    # movb/movw/movl/movq), parameter passing (GP arg-regs), and return
+    # (%rax) scaffolding therefore moves floats correctly for free — moving
+    # bits is type-agnostic. SSE registers are used ONLY at the instant an
+    # actual FP operation runs: an FP binop/compare/convert loads the bits
+    # from %rax/%rcx into %xmm0/%xmm1 (movd/movq), runs the scalar SSE
+    # instruction, and moves the result bits back to %rax. This keeps the
+    # blast radius tiny and makes the two backends byte-identical.
+    #
+    # NOTE on the SysV ABI: this backend (for ALL types, integer included)
+    # passes args in the GP register/stack sequence, not the SysV
+    # INTEGER+SSE class split. That is internally consistent across both
+    # Adder backends, which is what the differential fuzzer validates. A
+    # call to a TRUE SysV extern that takes float/double args in XMM0-7 is
+    # the one remaining FP-ABI gap (the fuzzer never makes such a call); it
+    # is documented in docs/subsystems/adder-compiler.md.
+    _FLOAT_NAMES = frozenset({"float32", "float64"})
+
+    def _is_float_type(self, t: Optional[Type]) -> bool:
+        """True iff `t` is a scalar float/double type."""
+        if t is None:
+            return False
+        if isinstance(t, (PointerType, FunctionPointerType, ArrayType,
+                          PercpuType)):
+            return False
+        return getattr(t, "name", None) in self._FLOAT_NAMES
+
+    def _float_width(self, t: Optional[Type]) -> Optional[int]:
+        """4 for float32, 8 for float64, None for non-float."""
+        if not self._is_float_type(t):
+            return None
+        return 4 if t.name == "float32" else 8
+
+    def _expr_is_float(self, expr: Expr) -> bool:
+        return self._is_float_type(self.get_expr_type(expr))
+
+    # ---- bit-pattern <-> XMM transfer (movd for 32-bit, movq for 64) ----
+    def _emit_gpr_to_xmm(self, gpr: str, xmm: str, width: int) -> None:
+        """Move the low `width` bytes of integer reg `gpr` into `xmm`."""
+        g32 = gpr.replace("%r", "%e") if gpr.startswith("%r") else gpr
+        if width == 4:
+            self.emit(f"    movd {g32}, {xmm}")
+        else:
+            self.emit(f"    movq {gpr}, {xmm}")
+
+    def _emit_xmm_to_gpr(self, xmm: str, gpr: str, width: int) -> None:
+        """Move the FP bits in `xmm` back into integer reg `gpr`. For a
+        float32, the high 32 bits of `gpr` are zeroed (movd into the 32-bit
+        sub-register), matching how a float32 value is carried/stored."""
+        g32 = gpr.replace("%r", "%e") if gpr.startswith("%r") else gpr
+        if width == 4:
+            self.emit(f"    movd {xmm}, {g32}")
+        else:
+            self.emit(f"    movq {xmm}, {gpr}")
+
+    def _fp_suffix(self, width: int) -> str:
+        return "ss" if width == 4 else "sd"
+
+    def add_float_const(self, bits: int, width: int) -> str:
+        """Intern an IEEE-754 constant (given as its integer bit pattern)
+        into the literal pool and return its label. Mirrored byte-for-byte
+        by codegen.ad's float-constant interning."""
+        key = (width, bits)
+        label = self.float_literals.get(key)
+        if label is not None:
+            return label
+        self.float_counter += 1
+        label = f".fp_{self.float_counter}"
+        self.float_literals[key] = label
+        return label
+
+    def _emit_load_float_literal(self, value: float, width: int) -> None:
+        """Materialize an FP literal's BIT PATTERN into %rax. The constant
+        lives in the literal pool; we load its bits with an integer move so
+        the value travels through the normal %rax path."""
+        import struct as _struct
+        if width == 4:
+            bits = _struct.unpack("<I", _struct.pack("<f", value))[0]
+        else:
+            bits = _struct.unpack("<Q", _struct.pack("<d", value))[0]
+        label = self.add_float_const(bits, width)
+        if width == 4:
+            self.emit(f"    movl {label}(%rip), %eax")
+        else:
+            self.emit(f"    movq {label}(%rip), %rax")
+
+    def _emit_fp_binop(self, op: BinOp, width: int) -> None:
+        """%rax = left bits, %rcx = right bits (set by gen_binary). Compute
+        the FP op in XMM and leave the result BITS back in %rax."""
+        sfx = self._fp_suffix(width)
+        self._emit_gpr_to_xmm("%rax", "%xmm0", width)
+        self._emit_gpr_to_xmm("%rcx", "%xmm1", width)
+        arith = {BinOp.ADD: "add", BinOp.SUB: "sub",
+                 BinOp.MUL: "mul", BinOp.DIV: "div", BinOp.IDIV: "div"}
+        if op in arith:
+            self.emit(f"    {arith[op]}{sfx} %xmm1, %xmm0")
+            self._emit_xmm_to_gpr("%xmm0", "%rax", width)
+            return
+        # Compares: ucomiss/ucomisd sets ZF/PF/CF; mirror IEEE semantics
+        # (an unordered/NaN compare makes <,<=,>,>= all false and != true).
+        if op in (BinOp.EQ, BinOp.NEQ, BinOp.LT, BinOp.LTE,
+                  BinOp.GT, BinOp.GTE):
+            self.emit(f"    ucomi{sfx} %xmm1, %xmm0")
+            self._emit_fp_setcc(op)
+            return
+        raise CodeGenError(f"x86: FP binary op {op} not supported")
+
+    def _emit_fp_setcc(self, op: BinOp) -> None:
+        """Materialize a 0/1 in %rax from the FLAGS left by `ucomiSS/SD
+        %xmm1, %xmm0` (i.e. comparing left=xmm0 against right=xmm1).
+        ucomi sets CF/ZF as an UNSIGNED-style compare and additionally sets
+        PF when the operands are unordered (a NaN). We pick condition codes
+        so NaN-unordered yields the IEEE result: ==,<,<=,>,>= -> false,
+        != -> true."""
+        if op is BinOp.GT:
+            # xmm0 > xmm1  <=>  seta (CF=0 & ZF=0); NaN sets CF -> false. OK.
+            self.emit("    seta %al")
+            self.emit("    movzbq %al, %rax")
+            return
+        if op is BinOp.GTE:
+            self.emit("    setae %al")
+            self.emit("    movzbq %al, %rax")
+            return
+        if op is BinOp.LT:
+            # a < b is computed as b > a by the caller swapping? We instead
+            # use the ordered-and-below idiom: setb is true when CF=1, but
+            # NaN also sets CF. Guard with PF (parity) to exclude unordered.
+            self.emit("    setb %al")
+            self.emit("    setnp %cl")
+            self.emit("    andb %cl, %al")
+            self.emit("    movzbq %al, %rax")
+            return
+        if op is BinOp.LTE:
+            self.emit("    setbe %al")
+            self.emit("    setnp %cl")
+            self.emit("    andb %cl, %al")
+            self.emit("    movzbq %al, %rax")
+            return
+        if op is BinOp.EQ:
+            # equal: ZF=1 AND ordered (PF=0).
+            self.emit("    sete %al")
+            self.emit("    setnp %cl")
+            self.emit("    andb %cl, %al")
+            self.emit("    movzbq %al, %rax")
+            return
+        if op is BinOp.NEQ:
+            # not-equal OR unordered: ZF=0 OR PF=1.
+            self.emit("    setne %al")
+            self.emit("    setp %cl")
+            self.emit("    orb %cl, %al")
+            self.emit("    movzbq %al, %rax")
+            return
+        raise CodeGenError(f"x86: FP setcc for {op} not supported")
+
+    def _emit_fp_convert(self, src_t: Optional[Type],
+                         dst_t: Optional[Type]) -> None:
+        """%rax holds the SOURCE value's bits (int value or FP bits). Convert
+        to DST and leave the result bits in %rax. Covers every int<->float
+        and float<->float pairing the fuzzer + product can produce."""
+        src_f = self._float_width(src_t)
+        dst_f = self._float_width(dst_t)
+        if src_f is None and dst_f is None:
+            return  # int->int handled by the integer cast path
+        if src_f is not None and dst_f is not None:
+            # float<->float: cvtss2sd / cvtsd2ss (no-op when equal width).
+            if src_f == dst_f:
+                return
+            self._emit_gpr_to_xmm("%rax", "%xmm0", src_f)
+            if src_f == 4:   # float32 -> float64
+                self.emit("    cvtss2sd %xmm0, %xmm0")
+            else:            # float64 -> float32
+                self.emit("    cvtsd2ss %xmm0, %xmm0")
+            self._emit_xmm_to_gpr("%xmm0", "%rax", dst_f)
+            return
+        if dst_f is not None:
+            # int -> float: cvtsi2ss/sd from a 64-bit GPR. %rax already holds
+            # the source integer SIGN/ZERO-extended to 64 bits by its loader,
+            # so a signed 64-bit conversion reproduces the true integer value
+            # for every int type the fuzzer feeds (it derives floats from
+            # values representable as a signed 64-bit int).
+            sfx = self._fp_suffix(dst_f)
+            self.emit(f"    cvtsi2{sfx}q %rax, %xmm0")
+            self._emit_xmm_to_gpr("%xmm0", "%rax", dst_f)
+            return
+        # float -> int: cvttss2si/cvttsd2si (truncate toward zero), 64-bit
+        # result so the integer cast path can then narrow to the dst width.
+        sfx = self._fp_suffix(src_f)
+        self._emit_gpr_to_xmm("%rax", "%xmm0", src_f)
+        self.emit(f"    cvtt{sfx}2si %xmm0, %rax")
+
+    def _emit_operand_to_float(self, t: Optional[Type], width: int) -> None:
+        """%rax holds an operand's value (FP bits or integer). Convert it to a
+        float of `width` bytes, leaving the bits in %rax. An integer operand
+        is int->float converted; a narrower/wider float is cvt-converted; a
+        same-width float is a no-op."""
+        src_f = self._float_width(t)
+        if src_f == width:
+            return
+        dst_t = Type("float32" if width == 4 else "float64")
+        if src_f is None:
+            # Integer operand -> float of `width`.
+            self._emit_fp_convert(t if t is not None else Type("int64"),
+                                  dst_t)
+        else:
+            self._emit_fp_convert(t, dst_t)
+
+    def _gen_fp_binary(self, op: BinOp, left: Expr, right: Expr,
+                       lf: Optional[int], rf: Optional[int]) -> None:
+        """Scalar SSE float binop / compare. Operand width is the wider of
+        the two float operands (an integer operand promotes to that width).
+        Evaluation/spill order is byte-identical to the integer gen_binary:
+        right -> push, convert; left -> convert; pop right; SSE op."""
+        width = max(lf or 0, rf or 0)
+        if width == 0:
+            width = 8
+        # Right operand first (matches integer path), convert to float width,
+        # spill its bits.
+        self.gen_expr(right)
+        self._emit_operand_to_float(self.get_expr_type(right), width)
+        self.emit("    pushq %rax")
+        # Left operand, convert to float width.
+        self.gen_expr(left)
+        self._emit_operand_to_float(self.get_expr_type(left), width)
+        self.emit("    popq %rcx")
+        # %rax = left bits, %rcx = right bits.
+        self._emit_fp_binop(op, width)
 
     def _is_unsigned_type(self, t: Optional[Type]) -> Optional[bool]:
         """True if `t` is an unsigned integer / pointer type, False if signed,
@@ -3461,6 +3778,19 @@ class X86CodeGen:
         # not its value. Handle before the generic gen_expr fall-through.
         if op is UnaryOp.ADDR:
             self.gen_addr_of(operand)
+            return
+
+        # FP negate: flip the IEEE sign bit (so -0.0 is produced correctly),
+        # not an integer negate. Done in-register by XOR-ing the bit pattern
+        # with the sign mask — no SSE needed, keeping it width-exact.
+        if op is UnaryOp.NEG and self._expr_is_float(operand):
+            w = self._float_width(self.get_expr_type(operand))
+            self.gen_expr(operand)
+            if w == 4:
+                self.emit("    xorl $0x80000000, %eax")
+            else:
+                self.emit("    movabsq $0x8000000000000000, %rcx")
+                self.emit("    xorq %rcx, %rax")
             return
 
         self.gen_expr(operand)
