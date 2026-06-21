@@ -50,6 +50,9 @@ HERE = Path(__file__).resolve().parent.parent
 # list in sync: if a file is added to the curated closure there, add
 # it here so it lands on the installed target.
 REAL_DEBIAN_FILES = [
+    # Genuine Debian shells (real /bin/sh -> dash, plus bash).
+    "usr/bin/dash",
+    "usr/bin/bash",
     # Package managers proper.
     "usr/bin/apt",
     "usr/bin/apt-get",
@@ -101,6 +104,8 @@ REAL_DEBIAN_FILES = [
     "usr/lib/x86_64-linux-gnu/libselinux.so.1",
     "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0",
     "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.14.0",
+    # bash's extra .so dep (terminal handling).
+    "usr/lib/x86_64-linux-gnu/libtinfo.so.6",
     # /etc essentials.
     "etc/debian_version",
     "etc/os-release",
