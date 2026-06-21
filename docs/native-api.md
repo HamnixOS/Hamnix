@@ -585,6 +585,7 @@ migrate to the ctl-file form.
 | 276 | `srv_open` (shipped: V4 — opener dups poster's srvfd into its own fd table) |
 | 287 | `fdslot_kind` (shipped: hamsh /fd-binding kernel-vs-userland coordination) |
 | 288 | `getuid` (shipped: Plan-9-shape uid accessor per `docs/security.md`) |
+| 324 | `fdslot_arg` (shipped: sibling of `fdslot_kind` — reads the pipe/file/dup slot arg so hamsh's `enter NS { }` re-applies the parent's stdio into a clean-namespace child) |
 | 289 | `getgid` (shipped: Plan-9-shape gid accessor per `docs/security.md`) |
 | 290 | `setuid` (shipped: hostowner-only — uid==1 caller may set its uid+gid to argument; used by `newshell` post-`/dev/auth` and by `svc` to drop privs before exec) |
 | 291 | `svc_publish` (shipped: hostowner-only — supervisor mirrors svc registry into `/proc/svc/<name>` for shell-grep inspection) |

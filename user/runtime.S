@@ -839,6 +839,21 @@ sys_fdslot_kind:
     .size sys_fdslot_kind, .-sys_fdslot_kind
 
 
+    /* --- sys_fdslot_arg(pid, fdnum) -> int32 ------------------------
+     * Sibling of sys_fdslot_kind: the int32 ARG (pipe/file/dup slot)
+     * bound at /fd/<fdnum> in pid's Pgrp (pid 0 = self). hamsh's
+     * `enter NS { }` captures the parent's (kind,arg) for fd 0/1/2 and
+     * re-applies them to a clean-namespace child so its stdio reaches
+     * the same pipe/pane instead of the console. */
+    .globl sys_fdslot_arg
+    .type sys_fdslot_arg, @function
+sys_fdslot_arg:
+    movq    $324, %rax              /* SYS_FDSLOT_ARG */
+    syscall
+    ret
+    .size sys_fdslot_arg, .-sys_fdslot_arg
+
+
     /* --- sys_getuid() -> uint32 --------------------------------------
      * docs/security.md: Plan-9-shape uid. Returns the current task's
      * uid widened to a 64-bit return (always fits in uint32). */
