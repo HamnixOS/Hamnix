@@ -168,6 +168,40 @@ else
     passed "haminstallui no longer uses the fragile /tmp log-file redirect"
 fi
 
+# The live install medium must be filtered out of the candidate target list
+# UP FRONT (at enumerate time), not just refused after Install is clicked.
+# haminstallui must carry the same FAT-volume-label ("HAMNIXINST") boot-medium
+# predicate install.ad uses, and apply it inside _enumerate_disks.
+if grep -q 'HAMNIXINST' user/haminstallui.ad \
+        && grep -q 'def _is_boot_medium' user/haminstallui.ad \
+        && grep -q '_is_boot_medium(&nm\[0\], nl)' user/haminstallui.ad; then
+    passed "haminstallui filters the live install medium from the target list"
+else
+    failed "haminstallui does NOT filter the live medium at enumerate time (dead-end refusal)"
+fi
+# RAM/loop/live pseudo-disks must also be excluded at list time.
+if grep -q 'def _is_ram_backed' user/haminstallui.ad \
+        && grep -q '_is_ram_backed(&nm\[0\])' user/haminstallui.ad; then
+    passed "haminstallui excludes ram/loop/live pseudo-disks from the target list"
+else
+    failed "haminstallui does not exclude ram/loop/live pseudo-disks"
+fi
+# When the filtered list is empty, the GUI must show clear guidance (attach a
+# blank disk) plus a Rescan affordance — not an empty picker / bare refusal.
+if grep -q 'No installable target disk detected' user/haminstallui.ad \
+        && grep -q 'Attach a blank disk' user/haminstallui.ad \
+        && grep -q '"Rescan"' user/haminstallui.ad; then
+    passed "haminstallui shows empty-target guidance + a Rescan button"
+else
+    failed "haminstallui missing the empty-target guidance / Rescan affordance"
+fi
+# The install-time REFUSING guard must remain as a belt-and-suspenders backstop.
+if grep -q 'REFUSING: target IS the live install medium' user/install.ad; then
+    passed "install.ad keeps the live-medium REFUSING backstop"
+else
+    failed "install.ad lost the live-medium REFUSING backstop"
+fi
+
 # --- 4. Desktop-icon drag-persist wiring -----------------------------
 # hamdesktop must parse the optional position fields and write them back.
 if grep -q '_save_config' user/hamdesktop.ad \
