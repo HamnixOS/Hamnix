@@ -44,7 +44,13 @@ redirects; **job control** (`&`, `jobs`/`fg`/`bg`, Ctrl-Z → SIGTSTP/
 SIGCONT); an in-init **service supervisor** (`svc start/status/restart`,
 restart-on-crash, logs at `/var/log/svc/<name>.log`); native **runlevels**;
 and `ns` / `enter` constructs that build and enter namespaces (the
-mechanism behind `enter linux { ... }`).
+mechanism behind `enter linux { ... }`). `enter linux { sh }` (bare
+shell, no args) is a genuine context switch: the body shell inherits
+the terminal's `stdin/stdout/stderr` and the launching hamsh BLOCKS in
+`waitpid` until it `exit`s. Command resolution (`spawn_resolved`) walks
+`$PATH` first, then falls back to the static `/bin /sbin /usr/bin
+/usr/sbin` prefixes, so a bare `sh`/`bash` resolves wherever the active
+namespace advertises it (see [../distro-namespaces.md](../distro-namespaces.md)).
 
 ## Entry points
 

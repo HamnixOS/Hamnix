@@ -174,6 +174,74 @@ binds re-expose the shared file servers inside the new namespace
 resolve to whatever the distro backing happens to ship for those
 paths — typically nothing useful).
 
+### Interactive shell — `enter linux { sh }`
+
+`enter linux { sh }` (bare `sh`, no `-c`) drops you into an
+**interactive** shell inside the Linux namespace: the shell's
+`stdin/stdout/stderr` are wired to the controlling terminal (the
+console line discipline cooks + echoes keystrokes, #164), and the
+hamsh that launched it BLOCKS in `waitpid` until the guest shell
+`exit`s — a genuine context switch into the Linux ns and back. You can
+run commands (`ls /`, `cat /etc/debian_version`, …) and `exit`
+returns to hamsh.
+
+For this to work `#distro` must actually CONTAIN a runnable `/bin/sh`.
+Two shells are staged into the distro tree
+(`/var/lib/distros/default/`) by `scripts/build_initramfs.py`
+(in-cpio) and `scripts/build_rootfs_img.py` (on the ext4 rootfs
+image):
+
+* **busybox** (`tests/u-binary/u_busybox_musl`, a musl static-PIE
+  ET_DYN with no `PT_INTERP`) — planted at `/bin/busybox` with applet
+  symlinks (`/bin/sh`, `/bin/ls`, `/bin/cat`, …). This is the
+  guaranteed-runnable shell: `enter linux { sh }` resolves `/bin/sh →
+  busybox` and runs it. The Hamnix ELF loader runs static-PIE images
+  directly.
+* **the genuine Debian dash (+ bash)** — `usr/bin/dash` (the real
+  Debian `/bin/sh`) is staged from
+  `tests/distros/debian-minbase/rootfs/` via the curated
+  `REAL_DEBIAN_FILES` list (with a `/bin/dash` usrmerge alias) into
+  BOTH the in-cpio slice and the ext4 rootfs image. `usr/bin/bash`
+  (plus `libtinfo.so.6`) is heavier (~1.2 MB) so it is staged ONLY into
+  the ext4 rootfs image (`build_rootfs_img.py`), keeping it off the
+  RAM-constrained in-cpio `-kernel` boot. These are DYNAMIC ELFs
+  (`PT_INTERP = /lib64/ld-linux-x86-64.so.2`); running them exercises
+  the dynamic loader / `ld.so` + glibc relocation path. Reach them
+  explicitly with `enter linux { /bin/dash }` / `enter linux {
+  /bin/bash }`.
+
+**Command resolution** (`spawn_resolved` in `user/hamsh.ad`). A body
+command without a `/` is resolved by (1) walking the active namespace's
+`$PATH` (colon-separated; the `enter` body inherits the launching
+shell's `PATH=/bin:/sbin:/usr/bin`), then (2) a static-prefix fallback
+(`/bin/`, `/sbin/`, `/usr/bin/`, `/usr/sbin/`) for a hermetic namespace
+that seeded no env. So `enter linux { sh }` finds `/bin/sh` and
+`enter linux { bash }` finds `/usr/bin/bash` (Debian usr-merge) without
+the call site spelling out a path. A command WITH a `/`
+(`enter linux { /bin/dash }`) is taken verbatim.
+
+**Verified (busybox):** `enter linux { sh }` against the busybox
+fixture drops into the `/ #` prompt, accepts typed commands over the
+terminal (`echo`, `cat /PROVENANCE`, `ls /` all run inside the
+`#distro` root), and `exit` returns to hamsh. Gated by
+`scripts/test_enter_linux_sh_interactive.sh`.
+
+**The two `code=127` failure modes** (the "`enter linux {sh}` exits
+127" symptom) are distinct:
+
+1. **Resolution miss** — if NO shell is staged at all,
+   `/var/lib/distros/default/bin/sh` does not exist, every resolution
+   candidate `-ENOENT`s, and `spawn()`'s child `sys_exit(127)`s. Cured
+   by always staging at least one runnable shell (busybox is the
+   guaranteed one).
+2. **Shared-library load failure** — the DYNAMIC Debian `/bin/sh`
+   (dash) and `/bin/bash` resolve and `sys_execve_env` maps `ld.so`
+   (you see the `[aslr] interp bias` line), but `ld.so`/glibc
+   relocation can still fail and the process exits 127 before printing
+   a prompt. That is the linux_abi `mmap` / shared-object track, NOT a
+   hamsh-resolution defect — busybox (static-PIE, no `PT_INTERP`)
+   sidesteps it, which is why busybox `sh` is the interactivity gate.
+
 ## Phase placement
 
 Depends on Phase C (rfork RFNAMEG + bind + mount syscalls). Lands as

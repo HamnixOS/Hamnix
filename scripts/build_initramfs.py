@@ -3789,6 +3789,17 @@ def build_archive() -> bytes:
             # Curated closure for `apt-get install hello` end-to-end.
             # All paths are RELATIVE to minbase_rootfs/.
             REAL_DEBIAN_FILES = [
+                # GENUINE Debian shell. `enter linux { /bin/dash }` (the
+                # real Debian /bin/sh -> dash) runs the actual Debian
+                # shell, not just the busybox fallback. dash is tiny
+                # (~125 KB) and its dynamic closure is only ld.so + libc
+                # (already staged below); the usrmerge expansion plants
+                # it at /bin/dash too. bash (1.2 MB + libtinfo) is staged
+                # ONLY into the ext4 rootfs image (build_rootfs_img.py),
+                # NOT this in-cpio slice — the `-kernel` boot loads the
+                # whole cpio into the 256 MB guest, so the heavy bash is
+                # kept off the RAM-constrained in-cpio path.
+                "usr/bin/dash",
                 # Package managers proper.
                 "usr/bin/apt",
                 "usr/bin/apt-get",

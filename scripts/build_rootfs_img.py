@@ -88,6 +88,13 @@ OUT_DEFAULT = HERE / "build" / "hamnix-rootfs.img"
 #
 # Keep this list short and targeted: every file is bytes on disk.
 REAL_DEBIAN_FILES = [
+    # GENUINE Debian shells. `enter linux { /bin/dash }` (real Debian
+    # /bin/sh -> dash) and `/bin/bash` run the actual Debian shell, not
+    # just the busybox fallback. dash needs only ld.so + libc (staged
+    # below); bash also needs libtinfo (added to the .so closure). The
+    # usrmerge alias plants each at /bin/<x> so `/bin/dash` resolves.
+    "usr/bin/dash",
+    "usr/bin/bash",
     # Package managers proper.
     "usr/bin/apt",
     "usr/bin/apt-get",
@@ -139,6 +146,8 @@ REAL_DEBIAN_FILES = [
     "usr/lib/x86_64-linux-gnu/libselinux.so.1",
     "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0",
     "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.14.0",
+    # bash's extra .so dep (terminal handling).
+    "usr/lib/x86_64-linux-gnu/libtinfo.so.6",
     # /etc essentials.
     "etc/debian_version",
     "etc/os-release",
