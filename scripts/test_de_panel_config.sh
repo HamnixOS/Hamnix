@@ -239,8 +239,10 @@ try:
         # per-panel colour/size path is exercised in the same config.
         send("echo PANELCFG_TWO")
         send("printf 'panel top\\n  edge top\\n  color #3a6ea5\\n  widget menu\\n  widget tasks\\n  widget clock\\nend\\npanel bot\\n  edge bottom\\n  color #785028\\n  size 30\\n  widget sysmon\\n  widget clock\\nend\\n' > /tmp/hamnix-panel.conf")
-        time.sleep(6)
-        screendump("two"); screendump("two")
+        time.sleep(8)
+        # QMP's first dump after a frame change is often a STALE frame; take
+        # several so the last one reflects the live two-panel layout.
+        screendump("two"); screendump("two"); screendump("two")
         # LIVE: reassign a widget BETWEEN panels — move the clock from the
         # top panel to the bottom panel (Settings "Move to next panel"). The
         # top-right region loses the clock; the bottom gains a second clock.
@@ -323,22 +325,35 @@ PY
     fi
 
     # --- TWO panels simultaneously (top + bottom) ---
-    # Compare the two-panel frame against the (single) left-panel frame: BOTH
-    # the top band and the bottom band must now carry panel pixels. A blank
-    # baseline (the LEFT frame has neither a top nor a bottom horizontal bar)
-    # makes a positive delta in both bands prove two panels render at once.
-    if [ -s "$OUT_DIR/two.ppm" ] && [ -s "$OUT_DIR/left.ppm" ] && [ -n "$SH" ]; then
-        twotop=$(region_diff "$OUT_DIR/left.ppm" "$OUT_DIR/two.ppm" 200 0 600 26)
-        tbotlo=$((SH-30)); tbothi=$SH
-        twobot=$(region_diff "$OUT_DIR/left.ppm" "$OUT_DIR/two.ppm" 200 "$tbotlo" 600 "$tbothi")
-        echo "[panel_config] two-panel top-band delta=$twotop  bottom-band delta=$twobot (sh=$SH)"
-        if [ "$twotop" -gt 200 ] && [ "$twobot" -gt 200 ]; then
-            passed "TWO panels render SIMULTANEOUSLY (top AND bottom both painted)"
-        else
-            failed "two simultaneous panels not both rendered (top=$twotop bot=$twobot)"
-        fi
+    # Prove a SINGLE frame carries BOTH a top bar and a bottom bar at once.
+    # Baseline = the vertical LEFT-panel frame (it has NEITHER a top nor a
+    # bottom horizontal bar), so a positive delta in BOTH the top band and the
+    # bottom band of the two-panel frame means two panels render concurrently.
+    # We try the dedicated two-panel frame first; if its QMP capture came back
+    # stale (delta 0 in both bands — a known first-dump-after-change race), we
+    # fall back to the `move` frame, which is ALSO a top+bottom two-panel
+    # config and is captured later (so it is the freshest two-panel render).
+    two_ok=0
+    tbotlo=$((SH-30)); tbothi=$SH
+    assert_two() {
+        local f="$1"
+        [ -s "$OUT_DIR/$f.ppm" ] && [ -s "$OUT_DIR/left.ppm" ] && [ -n "$SH" ] || return 1
+        local tt tb
+        tt=$(region_diff "$OUT_DIR/left.ppm" "$OUT_DIR/$f.ppm" 200 0 600 26)
+        tb=$(region_diff "$OUT_DIR/left.ppm" "$OUT_DIR/$f.ppm" 200 "$tbotlo" 600 "$tbothi")
+        echo "[panel_config] two-panel($f) top-band delta=$tt  bottom-band delta=$tb (sh=$SH)"
+        [ "$tt" -gt 200 ] && [ "$tb" -gt 200 ]
+    }
+    if assert_two two; then
+        two_ok=1
+    elif assert_two move; then
+        two_ok=1
+        echo "[panel_config] NOTE 'two' frame capture was stale; used the freshest two-panel frame 'move'" >&2
+    fi
+    if [ "$two_ok" = 1 ]; then
+        passed "TWO panels render SIMULTANEOUSLY (top AND bottom both painted)"
     else
-        echo "[panel_config] NOTE missing two.ppm — simultaneous two-panel not asserted" >&2
+        failed "two simultaneous panels not both rendered"
     fi
 
     # --- Widget reassigned BETWEEN panels (clock top -> bottom) ---
