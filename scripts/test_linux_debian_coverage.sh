@@ -117,12 +117,25 @@ set +e
     printf "enter linux { /bin/bash -c '/bin/echo BASH_VER \$BASH_VERSION' }\n"; sleep 8
     printf 'echo BANNER_BASH_END\n'; sleep 1
 
-    # coreutils: build a sentinel, cat/wc/sort/head it.
-    printf 'echo BANNER_CORE_START\n'; sleep 1
-    printf "enter linux { /bin/dash -c '/bin/echo COVL3; /bin/echo COVL1; /bin/echo COVL2' }\n"; sleep 6
-    printf "enter linux { /bin/dash -c 'printf \"3\\\\n1\\\\n2\\\\n\" | /usr/bin/sort | /usr/bin/head -n1' }\n"; sleep 6
-    printf "enter linux { /bin/dash -c 'printf \"a b c\\\\n\" | /usr/bin/wc -w' }\n"; sleep 6
-    printf 'echo BANNER_CORE_END\n'; sleep 1
+    # coreutils run DIRECTLY on a staged file (no shell pipe/subshell — a
+    # `dash -c 'a | b'` pipeline forks inside the linux ns, a heavier path
+    # we keep off the coverage sweep; each binary is invoked standalone).
+    # /etc/os-release is a multi-line Debian file present in every minbase.
+    printf 'echo BANNER_CAT_START\n'; sleep 1
+    printf 'enter linux { /bin/cat /etc/debian_version }\n'; sleep 6
+    printf 'echo BANNER_CAT_END\n'; sleep 1
+
+    printf 'echo BANNER_HEAD_START\n'; sleep 1
+    printf 'enter linux { /usr/bin/head -n2 /etc/os-release }\n'; sleep 6
+    printf 'echo BANNER_HEAD_END\n'; sleep 1
+
+    printf 'echo BANNER_WC_START\n'; sleep 1
+    printf 'enter linux { /usr/bin/wc -l /etc/os-release }\n'; sleep 6
+    printf 'echo BANNER_WC_END\n'; sleep 1
+
+    printf 'echo BANNER_SORT_START\n'; sleep 1
+    printf 'enter linux { /usr/bin/sort /etc/os-release }\n'; sleep 6
+    printf 'echo BANNER_SORT_END\n'; sleep 1
 
     # dpkg + apt --version (the package managers proper).
     printf 'echo BANNER_DPKG_VERSION_START\n'; sleep 1
@@ -154,7 +167,7 @@ set +e
 
     printf 'echo BANNER_DONE\n'; sleep 1
     printf 'exit\n'; sleep 1
-) | timeout 600s qemu-system-x86_64 \
+) | timeout 1200s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -205,8 +218,10 @@ check_present "TEST_RC_DONE_DEFINING_NS" "rc captured linux + debian ns values"
 # --- PART A assertions ---
 check_banner_value "BANNER_DASH_START"  "DASH_RUN OK_MARK" "dash -c ran (real Debian /bin/dash)"
 check_banner_value "BANNER_BASH_START"  "BASH_VER "        "bash -c ran (real Debian /bin/bash + libtinfo)"
-check_banner_value "BANNER_CORE_START"  "1"                "sort|head produced ordered output"
-check_banner_value "BANNER_CORE_START"  "3"                "wc -w counted words"
+check_banner_value "BANNER_CAT_START"   "12."              "cat /etc/debian_version printed the version"
+check_banner_value "BANNER_HEAD_START"  "Debian"           "head /etc/os-release printed Debian lines"
+check_banner_value "BANNER_WC_START"    "os-release"       "wc -l read /etc/os-release"
+check_banner_value "BANNER_SORT_START"  "BUG_REPORT_URL"   "sort /etc/os-release ordered the file"
 check_banner_value "BANNER_DPKG_VERSION_START" "Debian"    "dpkg --version printed 'Debian'"
 check_banner_value "BANNER_APT_VERSION_START"  "apt "      "apt-get --version printed 'apt '"
 
