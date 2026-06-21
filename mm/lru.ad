@@ -1,0 +1,215 @@
+# mm/lru.ad
+#
+# Active / inactive LRU lists + the page-reclaim scanning policy
+# (mm/vmscan.c's shrink_*_list, lru_*list maintenance, mark_page_accessed).
+#
+# Linux keeps reclaimable pages on two lists per node:
+#
+#   * ACTIVE   — recently / repeatedly accessed.  Not scanned for eviction
+#                directly; pages are demoted to inactive first.
+#   * INACTIVE — eviction candidates.  The reclaimer scans this list from
+#                its TAIL (the coldest end).
+#
+# Pages move between the lists by a second-chance / CLOCK rule:
+#
+#   * A newly-faulted anon page is put at the HEAD of the INACTIVE list
+#     (Linux: inactive-first for anon, so a one-shot allocation that is
+#     never touched again is reclaimed quickly).
+#   * mark_page_accessed (called from the #PF / swap-in path) sets
+#     PG_REFERENCED; a referenced inactive page that is scanned is PROMOTED
+#     to the active list instead of reclaimed (its second chance).
+#   * shrink_inactive scans the inactive tail: a clean, unreferenced,
+#     single-mapper page is reclaimed (evicted to swap by mm/reclaim.ad); a
+#     referenced one is promoted; a dirty one is queued for write-back and
+#     rotated.
+#   * shrink_active scans the active tail and demotes unreferenced pages
+#     back to the inactive head, keeping the active:inactive ratio balanced
+#     (Linux's active list is kept from growing past the inactive one).
+#
+# The lists are intrusive, threaded through PageDesc.lru_prev / lru_next
+# (mm/page.ad), addressed by PFN.  A single global LRU (not per-node /
+# per-memcg) is sufficient: Hamnix has one memory node and the namespace
+# memory caps (mm/nscap) are enforced separately at charge time.
+
+from mm.page import (
+    page_pfn, page_phys,
+    page_test_flag, page_set_flag, page_clear_flag,
+    page_lru_prev, page_lru_next, page_set_lru_prev, page_set_lru_next,
+    page_mapcount, page_desc_ready,
+    PG_LRU, PG_ACTIVE, PG_REFERENCED, PG_DIRTY, PG_WRITEBACK,
+)
+from kernel.printk.printk import printk0, printk1, printk2
+
+# List anchors (head + tail PFNs; 0 == empty list).  Two lists.
+lru_inactive_head: uint64 = 0
+lru_inactive_tail: uint64 = 0
+lru_active_head:   uint64 = 0
+lru_active_tail:   uint64 = 0
+
+# Counters (page counts on each list) — watermark + balance decisions.
+lru_nr_inactive: uint64 = 0
+lru_nr_active:   uint64 = 0
+
+
+# --- low-level list splice (by PFN) ---------------------------------
+#
+# Each list is its own chain through the SAME lru_prev/lru_next fields; a
+# page is only ever on ONE list at a time (PG_LRU + PG_ACTIVE say which).
+
+def _lru_unlink(pfn: uint64, is_active: int32):
+    # Remove `pfn` from whichever list it is on and fix the neighbours +
+    # anchors.  Caller guarantees the page is currently linked.
+    prev: uint64 = page_lru_prev(pfn)
+    next: uint64 = page_lru_next(pfn)
+    if prev != 0:
+        page_set_lru_next(prev, next)
+    if next != 0:
+        page_set_lru_prev(next, prev)
+    if is_active != 0:
+        if lru_active_head == pfn:
+            lru_active_head = next
+        if lru_active_tail == pfn:
+            lru_active_tail = prev
+        if lru_nr_active > 0:
+            lru_nr_active = lru_nr_active - 1
+    else:
+        if lru_inactive_head == pfn:
+            lru_inactive_head = next
+        if lru_inactive_tail == pfn:
+            lru_inactive_tail = prev
+        if lru_nr_inactive > 0:
+            lru_nr_inactive = lru_nr_inactive - 1
+    page_set_lru_prev(pfn, 0)
+    page_set_lru_next(pfn, 0)
+
+
+def _lru_push_head_inactive(pfn: uint64):
+    page_set_lru_prev(pfn, 0)
+    page_set_lru_next(pfn, lru_inactive_head)
+    if lru_inactive_head != 0:
+        page_set_lru_prev(lru_inactive_head, pfn)
+    lru_inactive_head = pfn
+    if lru_inactive_tail == 0:
+        lru_inactive_tail = pfn
+    lru_nr_inactive = lru_nr_inactive + 1
+
+
+def _lru_push_head_active(pfn: uint64):
+    page_set_lru_prev(pfn, 0)
+    page_set_lru_next(pfn, lru_active_head)
+    if lru_active_head != 0:
+        page_set_lru_prev(lru_active_head, pfn)
+    lru_active_head = pfn
+    if lru_active_tail == 0:
+        lru_active_tail = pfn
+    lru_nr_active = lru_nr_active + 1
+
+
+# --- public LRU maintenance -----------------------------------------
+
+def lru_add_anon(phys: uint64):
+    # Put a newly-faulted anonymous page onto the INACTIVE list head.
+    # Idempotent: a page already on an LRU list is left where it is (the
+    # swap-in path may re-add a page that a racing scan already linked).
+    if page_desc_ready() == 0:
+        return
+    if phys == 0:
+        return
+    pfn: uint64 = page_pfn(phys)
+    if page_test_flag(pfn, PG_LRU) != 0:
+        return
+    _lru_push_head_inactive(pfn)
+    page_set_flag(pfn, PG_LRU)
+    page_clear_flag(pfn, PG_ACTIVE)
+
+
+def lru_remove(phys: uint64):
+    # Pull a page off whatever LRU list it is on (called when the page is
+    # evicted or freed).  No-op if it isn't on a list.
+    if page_desc_ready() == 0:
+        return
+    if phys == 0:
+        return
+    pfn: uint64 = page_pfn(phys)
+    if page_test_flag(pfn, PG_LRU) == 0:
+        return
+    is_active: int32 = page_test_flag(pfn, PG_ACTIVE)
+    _lru_unlink(pfn, is_active)
+    page_clear_flag(pfn, PG_LRU)
+    page_clear_flag(pfn, PG_ACTIVE)
+
+
+def mark_page_accessed(phys: uint64):
+    # The page was just accessed (faulted in / swapped in).  Set
+    # PG_REFERENCED so the next inactive scan gives it a second chance
+    # (promote rather than evict).  Mirrors mark_page_accessed().
+    if page_desc_ready() == 0:
+        return
+    if phys == 0:
+        return
+    page_set_flag(page_pfn(phys), PG_REFERENCED)
+
+
+def _lru_promote(pfn: uint64):
+    # Move an inactive page to the active list head, clearing PG_REFERENCED
+    # (its second chance is spent; it must be re-referenced to stay hot).
+    _lru_unlink(pfn, 0)
+    _lru_push_head_active(pfn)
+    page_set_flag(pfn, PG_ACTIVE)
+    page_clear_flag(pfn, PG_REFERENCED)
+
+
+def _lru_demote(pfn: uint64):
+    # Move an active page back to the inactive list head.
+    _lru_unlink(pfn, 1)
+    _lru_push_head_inactive(pfn)
+    page_clear_flag(pfn, PG_ACTIVE)
+    page_clear_flag(pfn, PG_REFERENCED)
+
+
+# --- counters / introspection ---------------------------------------
+
+def lru_inactive_count() -> uint64:
+    return lru_nr_inactive
+
+
+def lru_active_count() -> uint64:
+    return lru_nr_active
+
+
+def lru_total() -> uint64:
+    return lru_nr_inactive + lru_nr_active
+
+
+def lru_inactive_tail_pfn() -> uint64:
+    return lru_inactive_tail
+
+
+def lru_active_tail_pfn() -> uint64:
+    return lru_active_tail
+
+
+# --- shrink_active: demote cold active pages to inactive ------------
+
+def shrink_active_list(nr_to_scan: uint64) -> uint64:
+    # Scan up to nr_to_scan pages from the ACTIVE tail.  An unreferenced
+    # page is demoted to inactive; a referenced one keeps its place but its
+    # reference bit is cleared (aging).  Returns the number demoted.  This
+    # refills the inactive list so shrink_inactive always has candidates,
+    # and keeps active from dominating (Linux's balance rule).
+    if page_desc_ready() == 0:
+        return 0
+    demoted: uint64 = 0
+    scanned: uint64 = 0
+    pfn: uint64 = lru_active_tail
+    while pfn != 0 and scanned < nr_to_scan:
+        prev: uint64 = page_lru_prev(pfn)
+        scanned = scanned + 1
+        if page_test_flag(pfn, PG_REFERENCED) != 0:
+            # Still hot — age it (clear the bit) but keep it active.
+            page_clear_flag(pfn, PG_REFERENCED)
+        else:
+            _lru_demote(pfn)
+            demoted = demoted + 1
+        pfn = prev
+    return demoted

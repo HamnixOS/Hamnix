@@ -41,9 +41,25 @@ from kernel.sched.core import (
 # top of.
 from sys.src.port9.port.chan import pgrp_for_task, pgrp_oom_score_adj_get
 from mm.vma import (
-    vma_task_anon_rss, vma_reclaim_anon_pages,
+    vma_task_anon_rss, vma_reclaim_anon_pages, vma_reclaim_one_page,
     vma_alloc_demand, vma_demand_fault, vma_swap_in_fault,
     _vma_pte_slot_addr,
+)
+# rmap / LRU / page-flag substrate (#mm-parity): the LRU-driven reclaim
+# scanner finds eviction candidates from the inactive list tail and uses
+# the reverse map to locate each page's single mapper, rather than walking
+# every task's page tables.
+from mm.page import (
+    page_pfn, page_phys, page_test_flag, page_clear_flag,
+    page_lru_prev,
+    PG_REFERENCED, PG_DIRTY, PG_WRITEBACK,
+)
+from mm.rmap import (
+    page_is_anon, rmap_get_mapper_slot, rmap_get_mapper_va,
+)
+from mm.lru import (
+    lru_inactive_tail_pfn, lru_inactive_count, lru_active_count,
+    shrink_active_list, _lru_promote,
 )
 from mm.swap import (
     swap_slots_used, swap_slots_total, swap_ready,
@@ -80,6 +96,19 @@ def reclaim_under_pressure(want_pages: uint64) -> uint64:
     if swap_ready() == 0:
         return 0
     freed: uint64 = 0
+
+    # PREFERRED PATH: the LRU-driven scanner.  It evicts the COLDEST pages
+    # system-wide (inactive list tail) using the reverse map, which is both
+    # more precise than a per-task RSS sweep and the path kswapd / direct
+    # reclaim use.  Anything it reclaims counts toward want_pages.
+    freed = reclaim_shrink_lru(want_pages)
+    if freed >= want_pages:
+        return freed
+
+    # FALLBACK PATH: if the LRU is empty / not yet populated (e.g. very
+    # early boot before any demand fault has put a page on the list), fall
+    # back to the original per-task RSS sweep so reclaim still makes
+    # progress.  This also covers pages that predate the rmap/LRU wiring.
     n: uint64 = task_table_size()
     slot: uint64 = 0
     while slot < n and freed < want_pages:
@@ -95,6 +124,89 @@ def reclaim_under_pressure(want_pages: uint64) -> uint64:
         printk2("[reclaim] evicted %d pages to swap (%d slots used)\n",
                 freed, swap_slots_used())
     return freed
+
+
+# Refill ratio: if the inactive list has fewer than 1/INACTIVE_REFILL_DIV
+# of the active list, age the active list first so the inactive scan always
+# has cold candidates (Linux keeps inactive >= active for anon).
+INACTIVE_REFILL_DIV: uint64 = 1
+
+
+def reclaim_shrink_lru(nr_to_reclaim: uint64) -> uint64:
+    # LRU-DRIVEN reclaim — the Linux-shape mechanism kswapd / direct reclaim
+    # call (mm/vmscan.c::shrink_inactive_list).  Scans the INACTIVE LRU tail
+    # (coldest first) and, for each reclaimable page, uses the REVERSE MAP to
+    # find its single mapper's (slot, va) and evict exactly that page to
+    # swap — no per-task page-table walk.  Second-chance / CLOCK rule:
+    #
+    #   * PG_REFERENCED page  → promote to the active list (its second
+    #     chance); do not evict.
+    #   * PG_WRITEBACK page   → I/O in flight; skip (leave on the list).
+    #   * PG_DIRTY page       → would need write-back first; skip for now
+    #     (anon dirty pages are written to swap by the eviction itself, so a
+    #     plain anon page is never left dirty here; this guards file pages).
+    #   * clean, unreferenced, single-mapper anon page → evict to swap.
+    #
+    # Returns the number of pages reclaimed.  Stops early if swap fills
+    # (vma_reclaim_one_page returns -1) so the caller escalates to OOM.
+    if nr_to_reclaim == 0:
+        return 0
+    if swap_ready() == 0:
+        return 0
+    # Keep the inactive list supplied: if it is shorter than the active
+    # list, age the active tail down first so there are cold candidates.
+    if lru_inactive_count() < lru_active_count() / INACTIVE_REFILL_DIV:
+        shrink_active_list(nr_to_reclaim)
+
+    reclaimed: uint64 = 0
+    # Bound the scan so a list full of referenced/dirty pages can't spin.
+    scan_budget: uint64 = nr_to_reclaim * 8 + 64
+    scanned: uint64 = 0
+    pfn: uint64 = lru_inactive_tail_pfn()
+    while pfn != 0 and reclaimed < nr_to_reclaim and scanned < scan_budget:
+        prev: uint64 = page_lru_prev(pfn)
+        scanned = scanned + 1
+
+        if page_test_flag(pfn, PG_REFERENCED) != 0:
+            # Second chance — promote and move on.
+            _lru_promote(pfn)
+            pfn = prev
+        elif page_test_flag(pfn, PG_WRITEBACK) != 0:
+            # I/O in flight — leave it on the list, skip.
+            pfn = prev
+        elif page_test_flag(pfn, PG_DIRTY) != 0:
+            # Dirty file page (anon pages are clean here — their bytes go
+            # straight to swap).  Skip; the writeback path cleans it.
+            pfn = prev
+        else:
+            phys: uint64 = page_phys(pfn)
+            if page_is_anon(phys) == 0:
+                # Not a single-mapper anon page (shared/COW or untracked) —
+                # not a candidate for swap eviction.  Skip.
+                pfn = prev
+            else:
+                m_slot64: int64 = rmap_get_mapper_slot(phys)
+                if m_slot64 < 0:
+                    pfn = prev
+                else:
+                    m_va: uint64 = rmap_get_mapper_va(phys)
+                    rc: int32 = vma_reclaim_one_page(
+                        cast[uint64](m_slot64), m_va)
+                    if rc == 1:
+                        reclaimed = reclaimed + 1
+                        # The page is now off the LRU + freed; advance.
+                        pfn = prev
+                    elif rc < 0:
+                        # Swap full — stop the whole scan.
+                        return reclaimed
+                    else:
+                        # PTE was gone (raced unmap / already swapped) — drop
+                        # it off the LRU defensively and continue.
+                        pfn = prev
+    if reclaimed > 0:
+        printk2("[reclaim] LRU-shrink evicted %d pages (%d slots used)\n",
+                reclaimed, swap_slots_used())
+    return reclaimed
 
 
 def oom_select_victim(protect_slot: uint64) -> int64:

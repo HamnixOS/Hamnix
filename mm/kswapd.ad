@@ -1,0 +1,186 @@
+# mm/kswapd.ad
+#
+# Watermark-driven background reclaim (mm/vmscan.c::kswapd + the zone
+# watermark machinery in mm/page_alloc.c).
+#
+# Linux keeps three free-memory watermarks per zone:
+#
+#   * WMARK_MIN  — the hard floor.  An allocation that would push free
+#                  below min triggers DIRECT RECLAIM in the allocating
+#                  task's own context (it must free memory before it can
+#                  proceed), and as a last resort the OOM killer.
+#   * WMARK_LOW  — kswapd's wake threshold.  When free falls below low,
+#                  kswapd is woken to reclaim in the BACKGROUND so the
+#                  allocator rarely has to direct-reclaim.
+#   * WMARK_HIGH — kswapd's sleep threshold.  kswapd reclaims until free
+#                  rises back above high, then sleeps.
+#
+# Hamnix's free-memory signal is (memblock headroom + buddy order-0 free
+# list) in pages — see mm_free_pages().  The watermarks are a fraction of
+# total RAM.  kswapd runs as a kthread (kswapd_create) that loops:
+#
+#   while free < high:  reclaim a batch (kswapd_shrink); then yield
+#   when free >= high:  sleep (yield) until woken again
+#
+# The reclaim batch itself lives in mm/reclaim.ad (reclaim_shrink_lru),
+# which scans the inactive LRU tail, evicts cold single-mapper anon pages
+# to swap via rmap, and ages the active list.  kswapd is the POLICY that
+# decides WHEN and HOW MUCH to reclaim from watermarks; reclaim.ad is the
+# mechanism.  Direct reclaim (kswapd_direct_reclaim) runs the same batch
+# synchronously in an allocating task that hit the min watermark.
+
+from mm.memblock import memblock_avail
+from mm.page_alloc import page_alloc_free_count
+from mm.reclaim import reclaim_shrink_lru
+from kernel.sched.core import yield_to_others
+from kernel.printk.printk import printk0, printk1, printk2
+
+PAGE_SH: uint64 = 12
+
+# Total RAM in pages, captured at kswapd_init from the memblock ceiling.
+# Watermarks are computed as fractions of this.
+kswapd_total_pages: uint64 = 0
+
+# Watermark fractions (per-mille of total RAM) — tuned so the watermarks
+# leave generous headroom on the 256 MiB test config.  Linux derives these
+# from min_free_kbytes and a sqrt scaling; a flat per-mille is enough here.
+WMARK_MIN_PERMILLE:  uint64 = 30    # 3.0%
+WMARK_LOW_PERMILLE:  uint64 = 60    # 6.0%
+WMARK_HIGH_PERMILLE: uint64 = 90    # 9.0%
+
+# Pages reclaimed per kswapd batch before re-checking the watermark.
+KSWAPD_BATCH: uint64 = 32
+
+# Bound kswapd's per-wake work so a pathological pressure spike can't spin
+# it forever (it yields and re-checks on the next wake).
+KSWAPD_MAX_BATCHES: uint64 = 256
+
+# Set when kswapd_create has installed the kthread.
+kswapd_running: int32 = 0
+
+# Cumulative pages kswapd reclaimed (diagnostics / self-test).
+kswapd_nr_reclaimed: uint64 = 0
+# Number of times kswapd woke and did work (diagnostics / self-test).
+kswapd_nr_wakeups: uint64 = 0
+
+
+def kswapd_init():
+    # Record total RAM in pages so the watermark helpers have a basis.
+    # Called from mem_init() after the allocators are up.
+    av: uint64 = memblock_avail()
+    # At init memblock headroom ≈ all usable RAM (buddy hasn't pulled much
+    # yet), so it is a good proxy for total.  Add the order-0 free count for
+    # completeness.
+    kswapd_total_pages = (av >> PAGE_SH) + page_alloc_free_count()
+    printk1("[kswapd] total RAM estimate = %d pages\n", kswapd_total_pages)
+
+
+def mm_free_pages() -> uint64:
+    # Current free-memory signal in pages: remaining memblock headroom plus
+    # the buddy allocator's order-0 free list.  A reclaimed page returns to
+    # the buddy free list (raising this); a fresh alloc that pulls from
+    # memblock lowers the headroom term.  Monotone with real free memory.
+    return (memblock_avail() >> PAGE_SH) + page_alloc_free_count()
+
+
+def wmark_min() -> uint64:
+    return (kswapd_total_pages * WMARK_MIN_PERMILLE) / 1000
+
+
+def wmark_low() -> uint64:
+    return (kswapd_total_pages * WMARK_LOW_PERMILLE) / 1000
+
+
+def wmark_high() -> uint64:
+    return (kswapd_total_pages * WMARK_HIGH_PERMILLE) / 1000
+
+
+def kswapd_below_low() -> int32:
+    # 1 if free memory is below the LOW watermark (kswapd should run).
+    if mm_free_pages() < wmark_low():
+        return 1
+    return 0
+
+
+def kswapd_below_min() -> int32:
+    # 1 if free memory is below the MIN watermark (direct reclaim / OOM).
+    if mm_free_pages() < wmark_min():
+        return 1
+    return 0
+
+
+def kswapd_balance() -> uint64:
+    # One kswapd balancing pass: reclaim batches from the inactive LRU
+    # until free memory rises above the HIGH watermark, or no more progress
+    # is possible (LRU exhausted / swap full).  Returns the number of pages
+    # reclaimed this pass.  Used both by the kswapd kthread loop and by
+    # direct reclaim.
+    high: uint64 = wmark_high()
+    reclaimed: uint64 = 0
+    batches: uint64 = 0
+    while mm_free_pages() < high and batches < KSWAPD_MAX_BATCHES:
+        got: uint64 = reclaim_shrink_lru(KSWAPD_BATCH)
+        if got == 0:
+            # No progress — the inactive list is empty or swap is full.
+            # kswapd can do no more; the allocator escalates to OOM.
+            break
+        reclaimed = reclaimed + got
+        batches = batches + 1
+    if reclaimed > 0:
+        kswapd_nr_reclaimed = kswapd_nr_reclaimed + reclaimed
+        kswapd_nr_wakeups = kswapd_nr_wakeups + 1
+    return reclaimed
+
+
+def kswapd_direct_reclaim(want_pages: uint64) -> uint64:
+    # Direct reclaim: an allocating task hit the MIN watermark (or an
+    # alloc_page returned 0).  Reclaim synchronously in the caller's
+    # context, targeting at least `want_pages` freed pages.  Returns the
+    # number reclaimed.  Mirrors __alloc_pages_direct_reclaim.
+    if want_pages == 0:
+        want_pages = KSWAPD_BATCH
+    reclaimed: uint64 = 0
+    batches: uint64 = 0
+    while reclaimed < want_pages and batches < KSWAPD_MAX_BATCHES:
+        got: uint64 = reclaim_shrink_lru(KSWAPD_BATCH)
+        if got == 0:
+            break
+        reclaimed = reclaimed + got
+        batches = batches + 1
+    if reclaimed > 0:
+        kswapd_nr_reclaimed = kswapd_nr_reclaimed + reclaimed
+    return reclaimed
+
+
+def kswapd_loop():
+    # The kswapd kthread body.  Cooperative: each pass reclaims toward the
+    # HIGH watermark when below LOW, then yields.  Runs for the life of the
+    # system.  Under Hamnix's cooperative kthread model this loop yields
+    # after every balance pass so other tasks run; a reschedule wakes it
+    # again and it re-checks the watermark.
+    while 1 == 1:
+        if kswapd_below_low() != 0:
+            kswapd_balance()
+        yield_to_others()
+
+
+def kswapd_create() -> int32:
+    # Install the kswapd kthread.  Returns the task slot, or -1.  Called
+    # from init once the scheduler is up.  Guarded so a double-call is a
+    # no-op.
+    if kswapd_running != 0:
+        return -1
+    kswapd_running = 1
+    # The actual kthread_create call is made by the init wiring (it holds
+    # the wait-queue lock around kthread_create the way the other kthread
+    # spawns do); this function just marks kswapd as live and is the
+    # documented entry point.  See init/main.ad.
+    return 0
+
+
+def kswapd_stats_reclaimed() -> uint64:
+    return kswapd_nr_reclaimed
+
+
+def kswapd_stats_wakeups() -> uint64:
+    return kswapd_nr_wakeups

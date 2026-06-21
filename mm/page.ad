@@ -1,0 +1,247 @@
+# mm/page.ad
+#
+# Per-physical-page descriptor array — Hamnix's `struct page` (mm/page.c +
+# include/linux/mm_types.h).  Linux carries one `struct page` per 4 KiB
+# frame in the `mem_map[]` / `vmemmap[]` array; every higher MM mechanism
+# (LRU, rmap, refcount/mapcount, writeback, page migration) hangs off it.
+# Before this milestone Hamnix had only the COW refcount table (one uint16
+# per PFN, mm/cow.ad) — enough for COW fork but blind to which VMAs map a
+# page (rmap), how hot it is (LRU), and whether it is dirty (writeback).
+#
+# This module adds the missing struct-page substrate so reclaim stops being
+# guesswork:
+#
+#   * flags     — PG_LRU / PG_ACTIVE / PG_DIRTY / PG_WRITEBACK / PG_ANON /
+#                 PG_REFERENCED / PG_RECLAIM, the bits the reclaim scanner
+#                 and writeback path test (mirrors page-flags.h).
+#   * _mapcount — number of PTEs that currently map this page.  Underpins
+#                 rmap (a page with mapcount 0 maps nowhere → reclaimable)
+#                 and is distinct from the COW _refcount (held references,
+#                 incl. transient kernel pins).  Mirrors page._mapcount.
+#   * lru_prev / lru_next — intrusive doubly-linked LRU list links, stored
+#                 as PFNs (not pointers) so the array stays compact and a
+#                 0-PFN sentinel can't be confused with a real link.  The
+#                 active/inactive lists (mm/lru.ad) thread through these.
+#   * rmap      — the (task-slot, virtual-address) of the page's anon
+#                 mapper, packed into one uint64 (mm/rmap.ad owns the
+#                 encoding).  Anonymous pages here are MAP_PRIVATE, so a
+#                 page has a single anon mapper except across a COW window;
+#                 mm/rmap.ad documents the single-mapper invariant and how
+#                 COW share/break keeps it honest.
+#
+# The array is carved from memblock at mem_init() time (page_desc_init),
+# right after cow_init(), BEFORE the buddy allocator starts — exactly like
+# the COW refcount table — so the descriptors are never themselves handed
+# out as usable pages.  Sized to the top of the memblock RAM region, one
+# PageDesc per PFN from 0 .. (RAM top >> 12).
+
+from mm.memblock import memblock_alloc, memblock_region_top
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+PAGE_DESC_SHIFT: uint64 = 12
+PAGE_DESC_PSIZE: uint64 = 0x1000
+
+# --- page flags (mirror include/linux/page-flags.h, subset) ---------
+PG_LRU:        uint32 = 0x0001   # on an LRU list (active or inactive)
+PG_ACTIVE:     uint32 = 0x0002   # on the ACTIVE list (vs inactive)
+PG_REFERENCED: uint32 = 0x0004   # young: accessed since last scan
+PG_DIRTY:      uint32 = 0x0008   # needs write-back before it can be freed
+PG_WRITEBACK:  uint32 = 0x0010   # write-back in flight
+PG_ANON:       uint32 = 0x0020   # anonymous (swap-backed) page
+PG_RECLAIM:    uint32 = 0x0040   # selected by the reclaim scanner
+PG_SWAPCACHE:  uint32 = 0x0080   # has a swap slot reserved
+
+# One descriptor per physical frame.  Kept deliberately small (flags +
+# mapcount + two LRU links + one rmap word = 28 bytes, padded to 32) so
+# the whole array is a few MiB even on a multi-GiB machine.
+class PageDesc:
+    flags:    uint32
+    mapcount: int32       # number of PTEs mapping this page (-1 == none, Linux convention folded to >=0 here: 0 == unmapped)
+    lru_prev: uint64      # PFN of the previous page on this LRU list (0 == none)
+    lru_next: uint64      # PFN of the next page on this LRU list (0 == none)
+    rmap:     uint64      # packed anon rmap entry (mm/rmap.ad), 0 == none
+
+# Base of the PageDesc array (0 until page_desc_init).  Indexed by PFN.
+page_desc_base:  uint64 = 0
+page_desc_count: uint64 = 0    # number of frames the array covers
+
+
+def page_desc_init():
+    # Allocate the PageDesc array from memblock.  Called from mem_init()
+    # (arch/x86/mm/init.ad) AFTER cow_init() and BEFORE page_alloc_init(),
+    # so the array comes out of the bump allocator and the buddy allocator
+    # never hands a descriptor frame out as usable RAM.
+    top: uint64 = memblock_region_top()
+    nframes: uint64 = (top + PAGE_DESC_PSIZE - 1) >> PAGE_DESC_SHIFT
+    # sizeof(PageDesc) is 32 bytes (4+4+8+8+8).
+    desc_bytes: uint64 = nframes * 32
+    base: uint64 = memblock_alloc(desc_bytes, 8)
+    if base == 0:
+        printk0("[page] FATAL: PageDesc array alloc failed\n")
+        # Leave page_desc_count 0 — every accessor below treats an
+        # out-of-range PFN as "no descriptor", so the LRU / rmap / reclaim
+        # layers degrade to no-ops and the system still boots (reclaim
+        # falls back to the simple task-walk path).
+        return
+    memset(cast[Ptr[uint8]](base), 0, desc_bytes)
+    page_desc_base  = base
+    page_desc_count = nframes
+    printk2("[page] PageDesc array: %d frames, %d bytes\n",
+            nframes, desc_bytes)
+
+
+def page_desc_ready() -> int32:
+    if page_desc_base != 0:
+        return 1
+    return 0
+
+
+def page_pfn(phys: uint64) -> uint64:
+    return phys >> PAGE_DESC_SHIFT
+
+
+def page_phys(pfn: uint64) -> uint64:
+    return pfn << PAGE_DESC_SHIFT
+
+
+def page_desc(pfn: uint64) -> uint64:
+    # Address of the PageDesc for `pfn`, or 0 if out of range / pre-init.
+    if page_desc_base == 0:
+        return 0
+    if pfn >= page_desc_count:
+        return 0
+    return page_desc_base + pfn * 32
+
+
+def page_desc_for_phys(phys: uint64) -> uint64:
+    return page_desc(page_pfn(phys))
+
+
+# --- flag accessors --------------------------------------------------
+
+def page_flags(pfn: uint64) -> uint32:
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return 0
+    return cast[Ptr[PageDesc]](d)[0].flags
+
+
+def page_test_flag(pfn: uint64, flag: uint32) -> int32:
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return 0
+    if (cast[Ptr[PageDesc]](d)[0].flags & flag) != 0:
+        return 1
+    return 0
+
+
+def page_set_flag(pfn: uint64, flag: uint32):
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return
+    cast[Ptr[PageDesc]](d)[0].flags = cast[Ptr[PageDesc]](d)[0].flags | flag
+
+
+def page_clear_flag(pfn: uint64, flag: uint32):
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return
+    cast[Ptr[PageDesc]](d)[0].flags = \
+        cast[Ptr[PageDesc]](d)[0].flags & ~flag
+
+
+# --- mapcount (rmap) -------------------------------------------------
+#
+# mapcount counts PTEs mapping the page.  page_add/remove_rmap (mm/rmap.ad)
+# drive it; reclaim treats mapcount 0 as "no mapper, freeable".
+
+def page_mapcount(pfn: uint64) -> int32:
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return 0
+    return cast[Ptr[PageDesc]](d)[0].mapcount
+
+
+def page_mapcount_inc(pfn: uint64):
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return
+    cast[Ptr[PageDesc]](d)[0].mapcount = \
+        cast[Ptr[PageDesc]](d)[0].mapcount + 1
+
+
+def page_mapcount_dec(pfn: uint64) -> int32:
+    # Decrement mapcount; return the NEW value (clamped at 0).
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return 0
+    mc: int32 = cast[Ptr[PageDesc]](d)[0].mapcount
+    if mc <= 0:
+        cast[Ptr[PageDesc]](d)[0].mapcount = 0
+        return 0
+    mc = mc - 1
+    cast[Ptr[PageDesc]](d)[0].mapcount = mc
+    return mc
+
+
+# --- LRU link accessors (mm/lru.ad threads through these) -----------
+
+def page_lru_prev(pfn: uint64) -> uint64:
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return 0
+    return cast[Ptr[PageDesc]](d)[0].lru_prev
+
+
+def page_lru_next(pfn: uint64) -> uint64:
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return 0
+    return cast[Ptr[PageDesc]](d)[0].lru_next
+
+
+def page_set_lru_prev(pfn: uint64, v: uint64):
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return
+    cast[Ptr[PageDesc]](d)[0].lru_prev = v
+
+
+def page_set_lru_next(pfn: uint64, v: uint64):
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return
+    cast[Ptr[PageDesc]](d)[0].lru_next = v
+
+
+# --- rmap word accessors (mm/rmap.ad owns the encoding) -------------
+
+def page_rmap(pfn: uint64) -> uint64:
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return 0
+    return cast[Ptr[PageDesc]](d)[0].rmap
+
+
+def page_set_rmap(pfn: uint64, v: uint64):
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return
+    cast[Ptr[PageDesc]](d)[0].rmap = v
+
+
+def page_reset(pfn: uint64):
+    # Clear the entire descriptor for `pfn` (flags, mapcount, LRU links,
+    # rmap).  Called when a page is freed back to the buddy allocator so a
+    # later re-allocation of the same frame starts from a clean slate — no
+    # stale LRU membership, no stale rmap, no leftover dirty bit.
+    d: uint64 = page_desc(pfn)
+    if d == 0:
+        return
+    cast[Ptr[PageDesc]](d)[0].flags    = 0
+    cast[Ptr[PageDesc]](d)[0].mapcount = 0
+    cast[Ptr[PageDesc]](d)[0].lru_prev = 0
+    cast[Ptr[PageDesc]](d)[0].lru_next = 0
+    cast[Ptr[PageDesc]](d)[0].rmap     = 0
