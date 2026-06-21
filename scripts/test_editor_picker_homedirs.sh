@@ -52,17 +52,28 @@ compile_one useradd
 
 ED=user/hameditscene.ad
 
-# --- 3. File-picker wiring -------------------------------------------
-grep -q "from lib.p9 import" "$ED" \
-    && passed "hameditscene imports lib.p9 dir-listing helpers" \
-    || failed "hameditscene missing lib.p9 import"
+# --- 3. File-picker wiring (now the shared lib/filepick.ad SERVICE) ---
+LIB=lib/filepick.ad
+grep -q "from lib.filepick import" "$ED" \
+    && passed "hameditscene imports the shared lib.filepick service" \
+    || failed "hameditscene missing lib.filepick import"
 
-for sym in "_pk_open" "_pk_emit" "_pk_handle_code" "_pk_load" "_pk_enter" \
-           "_pk_commit_save" "_pk_commit_open"; do
-    grep -q "def ${sym}\b" "$ED" \
-        && passed "picker entry ${sym} present" \
-        || failed "picker entry ${sym} MISSING"
+# The reusable picker SERVICE lives in lib/filepick.ad and exposes a stable
+# app-agnostic API (open / active / emit / handle_code / take_result).
+[ -f "$LIB" ] \
+    && passed "lib/filepick.ad shared picker service exists" \
+    || failed "lib/filepick.ad MISSING"
+for sym in "filepick_open" "filepick_active" "filepick_emit" \
+           "filepick_handle_code" "filepick_take_result" \
+           "filepick_result_path" "filepick_result_mode"; do
+    grep -q "def ${sym}\b" "$LIB" \
+        && passed "filepick service exports ${sym}" \
+        || failed "filepick service missing ${sym}"
 done
+# The lib must NOT do file I/O itself (it only RESOLVES a path).
+grep -q "sys_open_write" "$LIB" \
+    && failed "filepick service should not write files (open_write found)" \
+    || passed "filepick service does no file I/O (path-resolver only)"
 
 # Keys: Ctrl-O (15) Open, Ctrl-S (19) + Ctrl-W (23) Save-As route to picker.
 grep -q "code == 15" "$ED" \
@@ -71,12 +82,33 @@ grep -q "code == 15" "$ED" \
 grep -q "code == 23" "$ED" \
     && passed "Ctrl-W Save-As wired" \
     || failed "Ctrl-W (code 23) not wired"
-grep -q "_pk_handle_code(code)" "$ED" \
-    && passed "keys route to the picker while open" \
+grep -q "filepick_handle_code(code)" "$ED" \
+    && passed "keys route to the shared picker while open" \
     || failed "picker key routing missing"
-grep -q "/home/live/Documents" "$ED" \
+grep -q "filepick_take_result" "$ED" \
+    && passed "editor applies the committed pick (take_result wired)" \
+    || failed "editor does not consume the picker result"
+grep -q "/home/live/Documents" "$LIB" \
     && passed "picker defaults to \$HOME (/home/live/Documents)" \
     || failed "picker default dir not /home/live/Documents"
+
+# --- 3b. File manager → editor launch --------------------------------
+FM=user/hamfmscene.ad
+grep -Eq "(^|[ ,])spawn([ ,]|$)" "$FM" \
+    && passed "hamfmscene imports spawn() to launch apps" \
+    || failed "hamfmscene missing spawn import"
+grep -q "/bin/hameditscene" "$FM" \
+    && passed "hamfmscene launches /bin/hameditscene on a file" \
+    || failed "hamfmscene does not launch the editor"
+grep -q "def _open_in_editor" "$FM" \
+    && passed "hamfmscene has the _open_in_editor launcher" \
+    || failed "hamfmscene _open_in_editor missing"
+# A file click must call the launcher (not the old "not a directory" no-op).
+grep -q "_open_in_editor(u)" "$FM" \
+    && passed "a file click launches the editor (no 'not a directory' no-op)" \
+    || failed "file click not wired to _open_in_editor"
+# Compile the file manager too (the launch wiring must not break the build).
+compile_one hamfmscene
 
 # --- 4. Kate polish ---------------------------------------------------
 grep -q "GUTTER_W" "$ED" \
