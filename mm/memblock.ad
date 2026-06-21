@@ -2,28 +2,53 @@
 #
 # Mirrors mm/memblock.c in Linux. The earliest memory allocator — runs
 # before the page allocator, the slab, and kmalloc exist. Memblock owns
-# a single contiguous "region of physically usable RAM" that the rest of
-# the kernel carves chunks from during bring-up; once the buddy
-# allocator is up the unused remainder is handed off.
+# the set of physically-usable RAM regions the rest of the kernel carves
+# chunks from during bring-up; once the buddy allocator is up the unused
+# remainder is handed off.
 #
-# For M16.3 we implement only the bump-allocation subset of Linux's
-# memblock API — enough to satisfy mem_init() consumers in arch/x86/mm.
-# No regions list, no NUMA, no reservation tracking. The single region
-# is defined by:
+# Region model (M16.3 + multi-region widening):
+#   Historically memblock tracked ONE contiguous [start, end) window: the
+#   single largest free-RAM block the firmware advertised above the kernel
+#   image. On UEFI machines (and QEMU under OVMF) the firmware FRAGMENTS
+#   free RAM — the largest EfiConventionalMemory block is often only ~half
+#   of installed RAM, with the rest split across other CONV ranges and
+#   walled off by LoaderData (the in-RAM squashfs/ext4 live-root) and
+#   BootServices runs. Feeding only the largest block starved the
+#   runlevel-5 desktop: the ~378 MiB in-RAM live-root ramdisk plus the
+#   scene clients' ELF images + stacks exceeded the single ~462 MiB window
+#   and the last DE clients (panel / file-manager / shell) failed to
+#   ELF-load with "elf: OOM".
 #
-#   memblock_region_start: low water mark (== next allocation address)
-#   memblock_region_end:   high water mark, allocations past this fail
+# memblock now keeps an ORDERED LIST of free regions (sorted by base). A
+# per-region bump cursor advances through each region in turn; when a
+# region is full the allocator spills into the next. This recovers the
+# firmware's fragmented free RAM without needing a true free-list
+# (bring-up allocations are never individually freed — the buddy allocator
+# takes over the remainder once it is up, and it ALSO pulls fresh runs
+# through memblock_alloc, so it spills across regions transparently).
+# memblock_region_top() still returns the HIGHEST region top, which is what
+# cow_init()'s per-PFN refcount table and the himem probe need as the RAM
+# ceiling.
 #
-# Choice of physical range:
-#   start = 0x00200000 (2 MiB) — well above our kernel image, which
-#                                lives at 0x100000..~0x108000.
-#   end   = 0x0F000000 (240 MiB) — fits inside the 256 MiB QEMU runs
-#                                  with. Identity-mapped by header.S's
-#                                  1 GiB 2 MiB-page table, so no extra
-#                                  mapping work needed.
+# Constraints honoured:
+#   * Every fed region must lie inside the identity map header.S installs
+#     (the low 512 GiB via 1 GiB PS=1 pages). e820_init() only feeds
+#     sub-4-GiB regions on this path.
+#   * memblock_set_region(base, end) remains the single-region entry point
+#     (resets the list to ONE region) so the multiboot1 / EFI-fallback
+#     paths in e820.ad are unchanged. memblock_add_region(base, end)
+#     appends an additional region (used by the EFI walker to feed every
+#     additional EfiConventionalMemory block).
 
-memblock_region_start: uint64 = 0
-memblock_region_end:   uint64 = 0
+MEMBLOCK_MAX_REGIONS: uint64 = 16
+
+# Per-region state. region_start[i] is the BUMP CURSOR (== next allocation
+# address in region i); region_end[i] is that region's high-water mark.
+# The list is kept sorted by region_start so the bump walk and the
+# region_top scan are physically ascending.
+memblock_region_start: Array[16, uint64]
+memblock_region_end:   Array[16, uint64]
+memblock_nr_regions:   uint64 = 0
 memblock_total_alloc:  uint64 = 0
 
 MEMBLOCK_BASE: uint64 = 0x00200000
@@ -33,48 +58,102 @@ MEMBLOCK_TOP:  uint64 = 0x0F000000
 def memblock_init():
     # Default-fallback range, used if no e820 / multiboot parsing
     # supplies a better one. arch/x86/kernel/e820.ad:e820_init() may
-    # call memblock_set_region() AFTER this to widen / narrow to the
-    # firmware-reported usable RAM. Calling memblock_init() before
-    # e820_init() is intentional — it gives us a known-safe range so
-    # any allocations that happen during e820 parsing itself succeed.
-    memblock_region_start = MEMBLOCK_BASE
-    memblock_region_end   = MEMBLOCK_TOP
-    memblock_total_alloc  = 0
+    # call memblock_set_region() / memblock_add_region() AFTER this to
+    # widen to the firmware-reported usable RAM. Calling memblock_init()
+    # before e820_init() is intentional — it gives us a known-safe range
+    # so any allocations that happen during e820 parsing itself succeed.
+    memblock_region_start[0] = MEMBLOCK_BASE
+    memblock_region_end[0]   = MEMBLOCK_TOP
+    memblock_nr_regions      = 1
+    memblock_total_alloc     = 0
 
 
 def memblock_set_region(base: uint64, end: uint64):
-    # Replace the active region wholesale. Intended for use by
-    # arch/x86/kernel/e820.ad after walking the firmware memory map.
-    # Resets the allocation counter — callers must do this BEFORE
-    # any memblock_alloc() in the new region, or accounting drifts.
-    memblock_region_start = base
-    memblock_region_end   = end
-    memblock_total_alloc  = 0
+    # Replace the active region set wholesale with a SINGLE region.
+    # Used by arch/x86/kernel/e820.ad after walking the firmware memory
+    # map (the multiboot1 path and the EFI fallback both install one
+    # window this way; the EFI primary path installs the largest block
+    # here then appends the rest via memblock_add_region). Resets the
+    # allocation counter — callers must do this BEFORE any memblock_alloc()
+    # in the new region, or accounting drifts.
+    memblock_region_start[0] = base
+    memblock_region_end[0]   = end
+    memblock_nr_regions      = 1
+    memblock_total_alloc     = 0
+
+
+def memblock_add_region(base: uint64, end: uint64):
+    # Append an ADDITIONAL free region, keeping the list sorted by base.
+    # Used by the EFI walker to feed every additional EfiConventionalMemory
+    # block, not just the largest. Ignores degenerate / overflowing ranges
+    # and silently caps at MEMBLOCK_MAX_REGIONS.
+    if end <= base:
+        return
+    if memblock_nr_regions >= MEMBLOCK_MAX_REGIONS:
+        return
+    # Insertion point: first slot whose base exceeds ours (sorted ascending).
+    ins: uint64 = memblock_nr_regions
+    i: uint64 = 0
+    placed: int32 = 0
+    while i < memblock_nr_regions and placed == 0:
+        if base < memblock_region_start[i]:
+            ins = i
+            placed = 1
+        else:
+            i = i + 1
+    # Shift higher-based regions up by one to open the slot.
+    j: uint64 = memblock_nr_regions
+    while j > ins:
+        memblock_region_start[j] = memblock_region_start[j - 1]
+        memblock_region_end[j]   = memblock_region_end[j - 1]
+        j = j - 1
+    memblock_region_start[ins] = base
+    memblock_region_end[ins]   = end
+    memblock_nr_regions        = memblock_nr_regions + 1
 
 
 def memblock_region_base() -> uint64:
-    return memblock_region_start
+    # The live bump cursor of the FIRST (lowest) region — the next address
+    # the lowest region will hand out. p9_smoke / devmeminfo use this as
+    # the canonical "memblock base" diagnostic.
+    if memblock_nr_regions == 0:
+        return 0
+    return memblock_region_start[0]
 
 
 def memblock_region_top() -> uint64:
-    return memblock_region_end
+    # The HIGHEST region's high-water mark — the RAM ceiling. cow_init()'s
+    # per-PFN refcount table and the himem probe both need the top PFN any
+    # buddy-returned page can ever have. Scan for the max end (regions
+    # never overlap; with the list sorted by base the last region has the
+    # highest end, but a scan is robust to any future unsorted insert).
+    top: uint64 = 0
+    i: uint64 = 0
+    while i < memblock_nr_regions:
+        if memblock_region_end[i] > top:
+            top = memblock_region_end[i]
+        i = i + 1
+    return top
 
 
 def memblock_alloc(size: uint64, align: uint64) -> uint64:
-    # Bump allocator. Round the next free address up to `align`, carve
-    # `size` bytes, advance the cursor, return the chunk address.
-    # Returns 0 on OOM (zero is never a valid address in our layout
-    # since memblock_region_start >= 2 MiB).
+    # Bump allocator across the region list. Try each region low → high;
+    # the first that can satisfy an aligned `size` carve hands it out.
+    # Returns 0 only when NO region has room (true OOM). Zero is never a
+    # valid address in our layout since every region base >= 2 MiB.
     if align == 0:
         align = 8
     mask: uint64 = align - 1
-    base: uint64 = (memblock_region_start + mask) & ~mask
-    new_top: uint64 = base + size
-    if new_top > memblock_region_end:
-        return 0
-    memblock_region_start = new_top
-    memblock_total_alloc  = memblock_total_alloc + size
-    return base
+    i: uint64 = 0
+    while i < memblock_nr_regions:
+        base: uint64 = (memblock_region_start[i] + mask) & ~mask
+        new_top: uint64 = base + size
+        if new_top <= memblock_region_end[i]:
+            memblock_region_start[i] = new_top
+            memblock_total_alloc     = memblock_total_alloc + size
+            return base
+        i = i + 1
+    return 0
 
 
 def memblock_used() -> uint64:
@@ -82,4 +161,10 @@ def memblock_used() -> uint64:
 
 
 def memblock_avail() -> uint64:
-    return memblock_region_end - memblock_region_start
+    # Sum of remaining headroom across ALL regions.
+    avail: uint64 = 0
+    i: uint64 = 0
+    while i < memblock_nr_regions:
+        avail = avail + (memblock_region_end[i] - memblock_region_start[i])
+        i = i + 1
+    return avail
