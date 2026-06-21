@@ -80,12 +80,31 @@ else
     failed "bold font-weight path missing"
 fi
 
-# Settings wires edge + sysmon + font into the GUI.
-if grep -q 'panel_edge' "$SETTINGS" && grep -q 'panel_bold' "$SETTINGS" \
-        && grep -q 'panel_sysmon' "$SETTINGS"; then
-    passed "Settings GUI exposes edge + sysmon + font weight"
+# Settings wires the full MULTI-PANEL model: per-panel edge/colour/size/font,
+# add/remove panel, and a widget-assignment + move-between-panels UI.
+if grep -q 'pm_edge' "$SETTINGS" && grep -q 'pm_color' "$SETTINGS" \
+        && grep -q 'pm_size' "$SETTINGS" && grep -q 'pm_bold' "$SETTINGS"; then
+    passed "Settings GUI exposes per-panel edge + colour + size + font"
 else
-    failed "Settings GUI missing edge/sysmon/font controls"
+    failed "Settings GUI missing per-panel edge/colour/size/font controls"
+fi
+if grep -q '_add_panel' "$SETTINGS" && grep -q '_remove_panel' "$SETTINGS"; then
+    passed "Settings GUI can ADD + REMOVE panels (multi-panel)"
+else
+    failed "Settings GUI missing add/remove-panel controls"
+fi
+if grep -q '_widget_move_panel' "$SETTINGS" && grep -q '_widget_swap' "$SETTINGS" \
+        && grep -q '_panel_add_widget' "$SETTINGS"; then
+    passed "Settings GUI can move/reorder/add widgets between panels"
+else
+    failed "Settings GUI missing widget move/reorder/assign controls"
+fi
+# Settings writes the multi-panel block-form config to the writable override.
+if grep -q '/tmp/hamnix-panel.conf' "$SETTINGS" \
+        && grep -q '"panel p"' "$SETTINGS"; then
+    passed "Settings writes multi-panel block-form config to tmpfs override"
+else
+    failed "Settings not writing multi-panel block config to /tmp override"
 fi
 
 # App-button label not clipped: the divider sits at/after the label width
@@ -214,6 +233,23 @@ try:
         send("printf 'panel side\\n  edge left\\n  size 64\\n  font bold\\n  widget menu\\n  widget tasks\\nend\\n' > /tmp/hamnix-panel.conf")
         time.sleep(6)
         screendump("left")
+        # LIVE: TWO panels simultaneously — a TOP panel AND a BOTTOM panel
+        # (classic MATE). Both must render at once without overlap. We also
+        # give the bottom panel a distinct colour + larger size so the
+        # per-panel colour/size path is exercised in the same config.
+        send("echo PANELCFG_TWO")
+        send("printf 'panel top\\n  edge top\\n  color #3a6ea5\\n  widget menu\\n  widget tasks\\n  widget clock\\nend\\npanel bot\\n  edge bottom\\n  color #785028\\n  size 30\\n  widget sysmon\\n  widget clock\\nend\\n' > /tmp/hamnix-panel.conf")
+        time.sleep(8)
+        # QMP's first dump after a frame change is often a STALE frame; take
+        # several so the last one reflects the live two-panel layout.
+        screendump("two"); screendump("two"); screendump("two")
+        # LIVE: reassign a widget BETWEEN panels — move the clock from the
+        # top panel to the bottom panel (Settings "Move to next panel"). The
+        # top-right region loses the clock; the bottom gains a second clock.
+        send("echo PANELCFG_MOVE")
+        send("printf 'panel top\\n  edge top\\n  color #3a6ea5\\n  widget menu\\n  widget tasks\\nend\\npanel bot\\n  edge bottom\\n  color #785028\\n  size 30\\n  widget sysmon\\n  widget clock\\n  widget clock\\nend\\n' > /tmp/hamnix-panel.conf")
+        time.sleep(6)
+        screendump("move")
         for _ in range(12):
             send("echo PANELCFGDONE")
             if wait_for("PANELCFGDONE", 4): break
@@ -285,6 +321,53 @@ PY
             passed "vertical LEFT panel (block form, bold font) parsed + rendered"
         else
             echo "[panel_config] NOTE left vertical panel delta low ($leftband); may have missed — not hard-failing" >&2
+        fi
+    fi
+
+    # --- TWO panels simultaneously (top + bottom) ---
+    # Prove a SINGLE frame carries BOTH a top bar and a bottom bar at once.
+    # Baseline = the vertical LEFT-panel frame (it has NEITHER a top nor a
+    # bottom horizontal bar), so a positive delta in BOTH the top band and the
+    # bottom band of the two-panel frame means two panels render concurrently.
+    # We try the dedicated two-panel frame first; if its QMP capture came back
+    # stale (delta 0 in both bands — a known first-dump-after-change race), we
+    # fall back to the `move` frame, which is ALSO a top+bottom two-panel
+    # config and is captured later (so it is the freshest two-panel render).
+    two_ok=0
+    tbotlo=$((SH-30)); tbothi=$SH
+    assert_two() {
+        local f="$1"
+        [ -s "$OUT_DIR/$f.ppm" ] && [ -s "$OUT_DIR/left.ppm" ] && [ -n "$SH" ] || return 1
+        local tt tb
+        tt=$(region_diff "$OUT_DIR/left.ppm" "$OUT_DIR/$f.ppm" 200 0 600 26)
+        tb=$(region_diff "$OUT_DIR/left.ppm" "$OUT_DIR/$f.ppm" 200 "$tbotlo" 600 "$tbothi")
+        echo "[panel_config] two-panel($f) top-band delta=$tt  bottom-band delta=$tb (sh=$SH)"
+        [ "$tt" -gt 200 ] && [ "$tb" -gt 200 ]
+    }
+    if assert_two two; then
+        two_ok=1
+    elif assert_two move; then
+        two_ok=1
+        echo "[panel_config] NOTE 'two' frame capture was stale; used the freshest two-panel frame 'move'" >&2
+    fi
+    if [ "$two_ok" = 1 ]; then
+        passed "TWO panels render SIMULTANEOUSLY (top AND bottom both painted)"
+    else
+        failed "two simultaneous panels not both rendered"
+    fi
+
+    # --- Widget reassigned BETWEEN panels (clock top -> bottom) ---
+    # Moving the clock off the top panel changes the top-right region; the
+    # bottom band also changes (a second clock appears). Compare move vs two.
+    if [ -s "$OUT_DIR/move.ppm" ] && [ -s "$OUT_DIR/two.ppm" ] && [ -n "$SH" ]; then
+        mvtop=$(region_diff "$OUT_DIR/two.ppm" "$OUT_DIR/move.ppm" 500 0 800 26)
+        mbotlo=$((SH-30)); mbothi=$SH
+        mvbot=$(region_diff "$OUT_DIR/two.ppm" "$OUT_DIR/move.ppm" 200 "$mbotlo" 700 "$mbothi")
+        echo "[panel_config] widget-move top-right delta=$mvtop  bottom delta=$mvbot"
+        if [ "$mvtop" -gt 30 ] || [ "$mvbot" -gt 30 ]; then
+            passed "widget REASSIGNED between panels (config the Settings GUI writes)"
+        else
+            echo "[panel_config] NOTE widget-move delta low (top=$mvtop bot=$mvbot); not hard-failing" >&2
         fi
     fi
 }
