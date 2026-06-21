@@ -744,7 +744,12 @@ def main():
     print(f"miscompiles:         {len(fails['miscompile'])}")
     print(f"compiler crashes:    {len(fails['crash'])}")
     print(f"runtime failures:    {len(fails['runfail'])}")
-    for kind in ("miscompile", "crash", "runfail"):
+    # any extra kinds (e.g. differential) get reported too.
+    extra = [k for k in fails if k not in ("miscompile", "crash", "runfail")
+             and fails[k]]
+    for k in extra:
+        print(f"{k+':':<20} {len(fails[k])}")
+    for kind in ("miscompile", "crash", "runfail", *extra):
         for (s, detail) in fails[kind][:10]:
             print(f"  [{kind}] seed={s}: {detail[:160]}")
             print(f"           repro: python3 tests/fuzz/adder_fuzzer.py "
