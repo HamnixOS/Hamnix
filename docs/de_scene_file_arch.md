@@ -356,6 +356,73 @@ timestamped failure instead of a frozen image.
    golden replay; retire the heuristic PNG gate.
 10. **Bitmap tier** — `image`/`tiles` blob, when a bitmap app needs it.
 
+## 16b. The REAL visual gate (`scripts/test_de_visual.sh`)
+
+The heuristic gates that came before this were shipping **false greens**:
+
+- `scripts/test_installer_de_runlevel5.sh` asserts only that the
+  framebuffer screendump has `>= 2 distinct pixel values`. A **blank teal
+  backdrop + a movable cursor** has ~7 distinct triples, so that boot
+  PASSES rl5 while the user sees nothing but a green screen and a mouse.
+- `scripts/test_de_visual_gate.sh` drives its OWN app-launch sequence
+  through `/dev/wsys/run/launch` with `[visual_gate]` markers. It proves
+  the compositor *can* paint a window it spawned, but NOT that the
+  PRODUCTION rc.5 desktop (`hamdesktop` icons + `hampanelscene` panel +
+  the scene apps) renders on a vanilla boot.
+
+`scripts/test_de_visual.sh` is the authoritative gate. It boots
+`build/hamnix-installer.img` with the user's EXACT ship command (OVMF/GOP,
+`-vga std`), waits past runlevel 5 with NO test-only hooks, screendumps
+the live framebuffer, and runs a STRUCTURAL analysis
+(`scripts/lib/de_screendump_struct.py`, PIL). The frame PASSES only if it
+contains BOTH:
+
+1. a **panel bar** — a near-full-width horizontal band of a distinct
+   color at the top or bottom edge, AND
+2. at least one **app-window** — a contiguous central block of
+   non-backdrop, non-panel pixels spanning many rows.
+
+A blank-green(+cursor) frame has no panel and zero window content → FAIL.
+A panel-only frame → FAIL (it must show a real window too). The screendump
+PNG is saved to `build/de_visual/<ts>/de_visual.png` for human review. Set
+`XRES`/`YRES` to force a large GOP mode (e.g. `XRES=1920 YRES=1080`) and
+reproduce a real-HW-sized panel.
+
+### blank-green: VM vs real-HW divergence
+
+The scene DE renders CORRECTLY in QEMU/OVMF at every resolution tested
+(1280×800 and a forced 1920×1080 — populated panel, desktop icons, editor,
+file manager, calculator). The reported **blank-green-with-cursor** is a
+**real-hardware-only** divergence (the NUC's GOP framebuffer; not
+reproducible in a VM) and is therefore debugged by reasoning from code +
+shipping an instrumented image, per project policy.
+
+One structural fact surfaced: the offscreen double-buffer **present shadow**
+(`_wsys_shadow_init_if_needed`) is a single `alloc_pages(order=10)` = 4 MiB
+= 1,048,576 px contiguous buffer, capped by the buddy allocator's
+`MAX_ORDER=10`. Panels larger than ~1 Mpx (1920×1080 = 2.07 Mpx is typical
+on real laptops/NUCs) **skip the shadow** and fall back to direct scanout.
+Direct scanout still renders correctly in a VM, so this is a flicker/tearing
+concern on write-combining real fb, not the blank-green root cause — but it
+means real-HW large panels lose tear-free double-buffering (a future fix
+would back the shadow with a multi-chunk allocation like `mm/vma.ad`).
+
+To pinpoint the real-HW failure, the compositor now emits a throttled
+`[de_present]` diagnostic for the first few full presents after the rl5
+desktop flip:
+
+```
+[de_present] fb_w=<W> fb_h=<H>
+[de_present]   root_active=<0|1> shadow_ok=<0|1>
+[de_present]   live_windows=<N> presented=<M>
+```
+
+On the next instrumented real-HW boot (serial / ESP `LOG.TXT`) these lines
+localize the drop: `live_windows=0` everywhere ⇒ the scene clients never
+created/committed a window (namespace/`newwindow` path); `live_windows>0
+presented=0` ⇒ rasterized but not z-blitted; `presented>0` with a blank
+panel ⇒ the direct-scanout flush mis-handles the real GOP stride/format.
+
 ## 17. Open questions
 
 - **Resize semantics:** does the WM resize re-rasterize content at the new
