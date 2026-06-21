@@ -1304,6 +1304,40 @@ sys_munmap:
     .size sys_munmap, .-sys_munmap
 
 
+    /* --- Track 4 UMDF privileged primitives ----------------------------
+     * The user-mode driver host (user/umdf_host.ad) requests the three
+     * primitives a driver needs from the kernel over these wrappers.
+     * SysV arg regs align directly with the syscall ABI for 1/2-arg
+     * calls — no shuffle. Each returns its result / a negative errno. */
+
+    /* sys_umdf_mmio_map(phys, len) -> int64 (user VA / -errno) */
+    .globl sys_umdf_mmio_map
+    .type sys_umdf_mmio_map, @function
+sys_umdf_mmio_map:
+    movq    $321, %rax              /* SYS_UMDF_MMIO_MAP */
+    syscall
+    ret
+    .size sys_umdf_mmio_map, .-sys_umdf_mmio_map
+
+    /* sys_umdf_dma_alloc(len, out_phys) -> int64 (user VA / -errno) */
+    .globl sys_umdf_dma_alloc
+    .type sys_umdf_dma_alloc, @function
+sys_umdf_dma_alloc:
+    movq    $322, %rax              /* SYS_UMDF_DMA_ALLOC */
+    syscall
+    ret
+    .size sys_umdf_dma_alloc, .-sys_umdf_dma_alloc
+
+    /* sys_umdf_irq_open(vector) -> int32 (irq fd / -errno) */
+    .globl sys_umdf_irq_open
+    .type sys_umdf_irq_open, @function
+sys_umdf_irq_open:
+    movq    $323, %rax              /* SYS_UMDF_IRQ_OPEN */
+    syscall
+    ret
+    .size sys_umdf_irq_open, .-sys_umdf_irq_open
+
+
     /* --- sys_symlink(target, linkpath) -> int32 -----------------------
      * M16.x §links: create a symbolic link at `linkpath` whose content
      * is `target` (SYS_SYMLINK = 305). 2-arg call; SysV a0=target in

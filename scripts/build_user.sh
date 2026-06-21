@@ -270,6 +270,7 @@ build_adder_user hameditscene         # scene-file DE text editor: scrollable te
 build_adder_user haminstallui         # scene-file DE visual installer: GUI front-end over /bin/haminstall (host name + disk picker + progress)
 build_adder_user hamsettings          # scene-file DE settings: wallpaper swatches (ctl wallpaper verb) + panel position/applet prefs (/etc/panel.conf)
 build_adder_user hammonscene          # scene-file DE system monitor: uptime + memory bar + /proc/tasks process list (ported from hammon)
+build_adder_user umdf_host            # Track 4: user-mode driver host — loads a stock .ko in USERLAND via the UMDF kernel primitives
 
 # --- X11 server + client (user/x11/ subdirectory) -------------------
 # The source lives in user/x11/<name>.ad but the ELF goes into

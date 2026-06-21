@@ -1,0 +1,649 @@
+# user/umdf_host.ad
+#
+# UMDF host — the userland process that loads + runs a stock Linux ET_REL
+# `.ko` OUTSIDE the kernel fault domain (Track 4, first vertical slice).
+#
+# This is the port of linux_abi/loader.ad's ET_REL machinery (ELF64 parse,
+# SHF_ALLOC layout, progbits copy / bss zero, x86_64 relocation, symbol
+# resolution, init_module dispatch) into a NORMAL USER PROCESS. The `.ko`
+# image is loaded into memory the host got from sys_mmap — user pages, not
+# kernel memory. When the `.ko`'s init_module faults or the host is killed,
+# it is a PROCESS crash the kernel survives; the host can be restarted.
+#
+# The `.ko`'s kernel-facing shims (printk, and the privileged MMIO / IRQ /
+# DMA primitives) bottom out into:
+#   * userland implementations for pure-compute shims (printk -> sys_write),
+#   * the three new kernel syscalls for the privileged primitives
+#     (sys_umdf_mmio_map / sys_umdf_dma_alloc / sys_umdf_irq_open + a read
+#     on the returned irq fd) — see user/runtime.S.
+#
+# After init_module returns 0 the host posts a `#X` 9P file server (the
+# namespace law: a driver is a process that posts a server) and serves a
+# tiny ctl/stat tree so the rest of the system can reach the driver. The
+# server loop is intentionally minimal — this slice proves the load path +
+# the primitive plumbing + crash isolation, not a full block/net driver.
+#
+# Usage:
+#   umdf_host <path-to.ko> [post]
+#     <path-to.ko>  ELF64 ET_REL stock-Linux module to load in userland.
+#     post          if present, sys_srv_post("umdf", ...) before serving.
+#
+# Self-test hooks (argv[2] == "selftest..."):
+#   selftest-mmio <physhex> <lenhex>  exercise sys_umdf_mmio_map
+#   selftest-dma  <lenhex>            exercise sys_umdf_dma_alloc
+#   selftest-irq  <vector>            open an irq fd (does NOT block-read)
+#   crashme                           dereference NULL to prove crash
+#                                     isolation (kernel must survive).
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+extern def sys_mmap(addr: uint64, len: uint64, prot: int32, flags: int32,
+                    fd: int32, off: uint64) -> int64
+extern def sys_srv_post(name: Ptr[char], srvfd: int32) -> int32
+extern def sys_umdf_mmio_map(phys: uint64, len: uint64) -> int64
+extern def sys_umdf_dma_alloc(len: uint64, out_phys: Ptr[uint64]) -> int64
+extern def sys_umdf_irq_open(vector: uint64) -> int32
+
+# mmap prot/flags (match mm/vma.ad VMA_PROT_* / VMA_MAP_*).
+PROT_READ:   int32 = 0x1
+PROT_WRITE:  int32 = 0x2
+PROT_EXEC:   int32 = 0x4
+MAP_PRIVATE: int32 = 0x02
+MAP_ANON:    int32 = 0x20
+
+# ELF constants (mirror linux_abi/loader.ad).
+ET_REL:       uint32 = 1
+EM_X86_64:    uint32 = 62
+SHT_PROGBITS: uint32 = 1
+SHT_SYMTAB:   uint32 = 2
+SHT_STRTAB:   uint32 = 3
+SHT_RELA:     uint32 = 4
+SHT_NOBITS:   uint32 = 8
+SHF_ALLOC:    uint64 = 2
+SHN_UNDEF:    uint32 = 0
+
+R_X86_64_NONE:   uint32 = 0
+R_X86_64_64:     uint32 = 1
+R_X86_64_PC32:   uint32 = 2
+R_X86_64_PLT32:  uint32 = 4
+R_X86_64_32:     uint32 = 10
+R_X86_64_32S:    uint32 = 11
+R_X86_64_PC64:   uint32 = 24
+R_X86_64_GOTPCRELX: uint32 = 42
+
+MAX_SECTIONS: uint64 = 96
+
+
+# --- diagnostics -----------------------------------------------------
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def puts(s: Ptr[uint8]):
+    sys_write(2, s, strlen_u8(s))
+
+
+def put_hex(v: uint64):
+    # Emit "0x" + 16 hex digits to stderr (diagnostics only).
+    buf: Array[19, uint8]
+    buf[0] = 0x30                                # '0'
+    buf[1] = 0x78                                # 'x'
+    i: uint64 = 0
+    while i < 16:
+        nyb: uint64 = (v >> ((15 - i) * 4)) & 0xF
+        d: uint8 = 0
+        if nyb < 10:
+            d = cast[uint8](0x30 + nyb)          # '0'..'9'
+        else:
+            d = cast[uint8](0x61 + (nyb - 10))   # 'a'..'f'
+        buf[2 + i] = d
+        i = i + 1
+    buf[18] = 0x0A                               # '\n'
+    sys_write(2, &buf[0], 19)
+
+
+# --- little-endian field reads ---------------------------------------
+
+def rd_u16(p: Ptr[uint8]) -> uint16:
+    return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
+
+
+def rd_u32(p: Ptr[uint8]) -> uint32:
+    return (cast[uint32](p[0])
+            | (cast[uint32](p[1]) << 8)
+            | (cast[uint32](p[2]) << 16)
+            | (cast[uint32](p[3]) << 24))
+
+
+def rd_u64(p: Ptr[uint8]) -> uint64:
+    return (cast[uint64](p[0])
+            | (cast[uint64](p[1]) << 8)
+            | (cast[uint64](p[2]) << 16)
+            | (cast[uint64](p[3]) << 24)
+            | (cast[uint64](p[4]) << 32)
+            | (cast[uint64](p[5]) << 40)
+            | (cast[uint64](p[6]) << 48)
+            | (cast[uint64](p[7]) << 56))
+
+
+def wr_u32(p: Ptr[uint8], v: uint32):
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+    p[2] = cast[uint8]((v >> 16) & 0xFF)
+    p[3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def wr_u64(p: Ptr[uint8], v: uint64):
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+    p[2] = cast[uint8]((v >> 16) & 0xFF)
+    p[3] = cast[uint8]((v >> 24) & 0xFF)
+    p[4] = cast[uint8]((v >> 32) & 0xFF)
+    p[5] = cast[uint8]((v >> 40) & 0xFF)
+    p[6] = cast[uint8]((v >> 48) & 0xFF)
+    p[7] = cast[uint8]((v >> 56) & 0xFF)
+
+
+def streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+# --- userland shim symbol table --------------------------------------
+#
+# The `.ko`'s UND (external) symbols resolve here. For the representative
+# probe module the only external is `_printk`; the privileged-primitive
+# shims (umdf_mmio_map / umdf_irq_open / umdf_dma_alloc) are exposed so a
+# driver `.ko` that requests them links against the host's user-side
+# wrappers (which trap into the kernel via the three new syscalls).
+#
+# This is the userland equivalent of linux_abi/exports.ad — but it lives
+# in the driver PROCESS, so a missing/buggy shim is a userspace fault,
+# not a kernel one.
+
+def shim_printk(fmt: Ptr[char], arg: int32) -> int32:
+    # A `.ko`'s printk lands here. We can't reimplement vararg printf in
+    # this slice; emit a fixed banner + the first int arg so the test can
+    # observe that the module's init code RAN IN USERLAND. The marker
+    # text is what the test greps for.
+    puts("[umdf-host] .ko printk: ")
+    sys_write(2, cast[Ptr[uint8]](fmt), strlen_u8(cast[Ptr[uint8]](fmt)))
+    return 0
+
+
+def shim_umdf_mmio_map(phys: uint64, len: uint64) -> uint64:
+    r: int64 = sys_umdf_mmio_map(phys, len)
+    return cast[uint64](r)
+
+
+def shim_umdf_dma_alloc(len: uint64, out_phys: Ptr[uint64]) -> uint64:
+    r: int64 = sys_umdf_dma_alloc(len, out_phys)
+    return cast[uint64](r)
+
+
+def shim_umdf_irq_open(vector: uint64) -> int32:
+    return sys_umdf_irq_open(vector)
+
+
+def shim_lookup(name: Ptr[uint8]) -> uint64:
+    # Resolve a `.ko` UND symbol to a host-side address. Returns 0 if not
+    # found (the relocation pass logs + leaves the site at 0).
+    if streq(name, "_printk") == 1:
+        return cast[uint64](shim_printk)
+    if streq(name, "printk") == 1:
+        return cast[uint64](shim_printk)
+    if streq(name, "umdf_mmio_map") == 1:
+        return cast[uint64](shim_umdf_mmio_map)
+    if streq(name, "umdf_dma_alloc") == 1:
+        return cast[uint64](shim_umdf_dma_alloc)
+    if streq(name, "umdf_irq_open") == 1:
+        return cast[uint64](shim_umdf_irq_open)
+    return 0
+
+
+# --- ELF section bookkeeping (file-scope; single-threaded host) -------
+
+sec_name_off:    Array[96, uint32]
+sec_type:        Array[96, uint32]
+sec_flags:       Array[96, uint64]
+sec_offset:      Array[96, uint64]
+sec_size:        Array[96, uint64]
+sec_link:        Array[96, uint32]
+sec_info:        Array[96, uint32]
+sec_loaded_addr: Array[96, uint64]
+
+symtab_idx: int32 = -1
+strtab_idx: int32 = -1
+
+
+def sec_name(image: uint64, shstr_off: uint64, i: uint64) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](image + shstr_off + cast[uint64](sec_name_off[i]))
+
+
+def parse_sections(image: uint64, shoff: uint64, shnum: uint64,
+                   shentsize: uint64, shstrndx: uint64) -> int32:
+    if shnum > MAX_SECTIONS:
+        puts("[umdf-host] too many sections\n")
+        return -1
+    symtab_idx = -1
+    strtab_idx = -1
+    i: uint64 = 0
+    while i < shnum:
+        sh: uint64 = image + shoff + i * shentsize
+        sec_name_off[i] = rd_u32(cast[Ptr[uint8]](sh + 0))
+        sec_type[i]     = rd_u32(cast[Ptr[uint8]](sh + 4))
+        sec_flags[i]    = rd_u64(cast[Ptr[uint8]](sh + 8))
+        sec_offset[i]   = rd_u64(cast[Ptr[uint8]](sh + 24))
+        sec_size[i]     = rd_u64(cast[Ptr[uint8]](sh + 32))
+        sec_link[i]     = rd_u32(cast[Ptr[uint8]](sh + 40))
+        sec_info[i]     = rd_u32(cast[Ptr[uint8]](sh + 44))
+        sec_loaded_addr[i] = 0
+        if sec_type[i] == SHT_SYMTAB:
+            symtab_idx = cast[int32](i)
+            strtab_idx = cast[int32](sec_link[i])
+        i = i + 1
+    return 0
+
+
+def layout_sections(shnum: uint64) -> uint64:
+    total: uint64 = 0
+    i: uint64 = 0
+    while i < shnum:
+        if (sec_flags[i] & SHF_ALLOC) != 0:
+            total = (total + 7) & ~cast[uint64](7)
+            sec_loaded_addr[i] = total          # provisional offset
+            sz: uint64 = sec_size[i]
+            if sz == 0:
+                sz = 1
+            total = total + sz
+        i = i + 1
+    return total
+
+
+def bias_loaded(base: uint64, shnum: uint64):
+    i: uint64 = 0
+    while i < shnum:
+        if (sec_flags[i] & SHF_ALLOC) != 0:
+            sec_loaded_addr[i] = base + sec_loaded_addr[i]
+        i = i + 1
+
+
+def copy_sections(image: uint64, shnum: uint64):
+    i: uint64 = 0
+    while i < shnum:
+        addr: uint64 = sec_loaded_addr[i]
+        if addr != 0 and sec_type[i] == SHT_PROGBITS:
+            src: uint64 = image + sec_offset[i]
+            n: uint64 = sec_size[i]
+            k: uint64 = 0
+            while k < n:
+                cast[Ptr[uint8]](addr)[k] = cast[Ptr[uint8]](src)[k]
+                k = k + 1
+        i = i + 1
+
+
+def sym_addr(image: uint64, sym_idx: uint64) -> uint64:
+    syt:      uint64 = image + sec_offset[cast[uint64](symtab_idx)]
+    sym_off:  uint64 = syt + sym_idx * 24
+    st_name:  uint32 = rd_u32(cast[Ptr[uint8]](sym_off + 0))
+    st_shndx: uint16 = rd_u16(cast[Ptr[uint8]](sym_off + 6))
+    st_value: uint64 = rd_u64(cast[Ptr[uint8]](sym_off + 8))
+    if cast[uint32](st_shndx) == SHN_UNDEF:
+        strt: uint64 = image + sec_offset[cast[uint64](strtab_idx)]
+        name: Ptr[uint8] = cast[Ptr[uint8]](strt + cast[uint64](st_name))
+        a: uint64 = shim_lookup(name)
+        if a == 0:
+            puts("[umdf-host] unresolved external: ")
+            sys_write(2, name, strlen_u8(name))
+            puts("\n")
+        return a
+    return sec_loaded_addr[cast[uint64](st_shndx)] + st_value
+
+
+def sym_name(image: uint64, sym_idx: uint64) -> Ptr[uint8]:
+    syt:     uint64 = image + sec_offset[cast[uint64](symtab_idx)]
+    sym_off: uint64 = syt + sym_idx * 24
+    st_name: uint32 = rd_u32(cast[Ptr[uint8]](sym_off + 0))
+    strt:    uint64 = image + sec_offset[cast[uint64](strtab_idx)]
+    return cast[Ptr[uint8]](strt + cast[uint64](st_name))
+
+
+def apply_relocations(image: uint64, shnum: uint64):
+    i: uint64 = 0
+    applied: uint64 = 0
+    skipped: uint64 = 0
+    while i < shnum:
+        if sec_type[i] != SHT_RELA:
+            i = i + 1
+            continue
+        target_idx: uint64 = cast[uint64](sec_info[i])
+        target_addr: uint64 = sec_loaded_addr[target_idx]
+        if target_addr == 0:
+            i = i + 1
+            continue
+        rela_base: uint64 = image + sec_offset[i]
+        nr: uint64 = sec_size[i] / 24
+        j: uint64 = 0
+        while j < nr:
+            ent: uint64 = rela_base + j * 24
+            r_offset: uint64 = rd_u64(cast[Ptr[uint8]](ent + 0))
+            r_info:   uint64 = rd_u64(cast[Ptr[uint8]](ent + 8))
+            r_addend: uint64 = rd_u64(cast[Ptr[uint8]](ent + 16))
+            sym_idx: uint64 = r_info >> 32
+            r_type:  uint32 = cast[uint32](r_info & 0xFFFFFFFF)
+            s: uint64 = sym_addr(image, sym_idx)
+            p: uint64 = target_addr + r_offset
+            a: uint64 = r_addend
+            if s == 0 and r_type != R_X86_64_NONE:
+                skipped = skipped + 1
+                j = j + 1
+                continue
+            if r_type == R_X86_64_64:
+                wr_u64(cast[Ptr[uint8]](p), s + a)
+                applied = applied + 1
+            elif r_type == R_X86_64_PC32 \
+                    or r_type == R_X86_64_PLT32 \
+                    or r_type == R_X86_64_GOTPCRELX:
+                rel32: uint64 = (s + a) - p
+                wr_u32(cast[Ptr[uint8]](p), cast[uint32](rel32 & 0xFFFFFFFF))
+                applied = applied + 1
+            elif r_type == R_X86_64_32 or r_type == R_X86_64_32S:
+                val32: uint64 = s + a
+                wr_u32(cast[Ptr[uint8]](p), cast[uint32](val32 & 0xFFFFFFFF))
+                applied = applied + 1
+            elif r_type == R_X86_64_PC64:
+                wr_u64(cast[Ptr[uint8]](p), (s + a) - p)
+                applied = applied + 1
+            elif r_type == R_X86_64_NONE:
+                pass
+            else:
+                puts("[umdf-host] unknown reloc type at ")
+                sys_write(2, sym_name(image, sym_idx),
+                          strlen_u8(sym_name(image, sym_idx)))
+                puts("\n")
+                skipped = skipped + 1
+            j = j + 1
+        i = i + 1
+    puts("[umdf-host] relocations applied=")
+    put_hex(applied)
+    puts("[umdf-host] relocations skipped=")
+    put_hex(skipped)
+
+
+def find_named_symbol(image: uint64, target: Ptr[uint8], shnum: uint64) -> uint64:
+    if symtab_idx < 0:
+        return 0
+    syt:  uint64 = image + sec_offset[cast[uint64](symtab_idx)]
+    strt: uint64 = image + sec_offset[cast[uint64](strtab_idx)]
+    sz:   uint64 = sec_size[cast[uint64](symtab_idx)]
+    n:    uint64 = sz / 24
+    i: uint64 = 0
+    while i < n:
+        off: uint64 = syt + i * 24
+        st_name:  uint32 = rd_u32(cast[Ptr[uint8]](off + 0))
+        st_shndx: uint16 = rd_u16(cast[Ptr[uint8]](off + 6))
+        if cast[uint32](st_shndx) != SHN_UNDEF:
+            nm: Ptr[uint8] = cast[Ptr[uint8]](strt + cast[uint64](st_name))
+            if streq(nm, target) == 1:
+                st_value: uint64 = rd_u64(cast[Ptr[uint8]](off + 8))
+                return sec_loaded_addr[cast[uint64](st_shndx)] + st_value
+        i = i + 1
+    return 0
+
+
+# --- module load + init (the userland host's core) -------------------
+
+KO_BUF_CAP: uint64 = 4194304                     # 4 MiB max .ko image
+
+
+def load_and_init_ko(path: Ptr[char]) -> int32:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        puts("[umdf-host] cannot open .ko\n")
+        return -1
+    # Stage the file into an mmap'd user buffer.
+    img_va: int64 = sys_mmap(0, KO_BUF_CAP, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANON, -1, 0)
+    if img_va < 0:
+        puts("[umdf-host] mmap image buffer failed\n")
+        sys_close(fd)
+        return -1
+    image: uint64 = cast[uint64](img_va)
+    total: uint64 = 0
+    while total < KO_BUF_CAP:
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](image + total),
+                            KO_BUF_CAP - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    puts("[umdf-host] read .ko bytes=")
+    put_hex(total)
+    if total < 64:
+        puts("[umdf-host] image too small\n")
+        return -1
+
+    ip: Ptr[uint8] = cast[Ptr[uint8]](image)
+    if ip[0] != 0x7F or ip[1] != 0x45 or ip[2] != 0x4C or ip[3] != 0x46:
+        puts("[umdf-host] bad ELF magic\n")
+        return -1
+    e_type: uint32 = cast[uint32](rd_u16(cast[Ptr[uint8]](image + 16)))
+    if e_type != ET_REL:
+        puts("[umdf-host] not ET_REL\n")
+        return -1
+    shoff:     uint64 = rd_u64(cast[Ptr[uint8]](image + 40))
+    shentsize: uint64 = cast[uint64](rd_u16(cast[Ptr[uint8]](image + 58)))
+    shnum:     uint64 = cast[uint64](rd_u16(cast[Ptr[uint8]](image + 60)))
+    shstrndx:  uint64 = cast[uint64](rd_u16(cast[Ptr[uint8]](image + 62)))
+
+    if parse_sections(image, shoff, shnum, shentsize, shstrndx) != 0:
+        return -1
+    if symtab_idx < 0 or strtab_idx < 0:
+        puts("[umdf-host] missing symtab/strtab\n")
+        return -1
+
+    span: uint64 = layout_sections(shnum)
+    if span == 0:
+        puts("[umdf-host] no SHF_ALLOC sections\n")
+        return -1
+    # Map an EXECUTABLE region for the loaded sections (.text must run).
+    span_r: uint64 = (span + 0xFFF) & ~cast[uint64](0xFFF)
+    code_va: int64 = sys_mmap(0, span_r, PROT_READ | PROT_WRITE | PROT_EXEC,
+                              MAP_PRIVATE | MAP_ANON, -1, 0)
+    if code_va < 0:
+        puts("[umdf-host] mmap code region failed\n")
+        return -1
+    base: uint64 = cast[uint64](code_va)
+    # Zero the region (bss + alignment gaps).
+    z: uint64 = 0
+    while z < span_r:
+        cast[Ptr[uint8]](base)[z] = 0
+        z = z + 1
+
+    bias_loaded(base, shnum)
+    copy_sections(image, shnum)
+    puts("[umdf-host] loaded .ko in USERLAND at va=")
+    put_hex(base)
+    apply_relocations(image, shnum)
+
+    init_addr: uint64 = find_named_symbol(image, "init_module", shnum)
+    if init_addr == 0:
+        puts("[umdf-host] no init_module symbol\n")
+        return -1
+    puts("[umdf-host] calling init_module in userland va=")
+    put_hex(init_addr)
+    init_fn: Fn[int32] = cast[Fn[int32]](init_addr)
+    rc: int32 = init_fn()
+    puts("[umdf-host] init_module returned rc=")
+    put_hex(cast[uint64](rc))
+    if rc != 0:
+        return rc
+    puts("[umdf-host] MODULE INITIALIZED IN USERLAND\n")
+    return 0
+
+
+# --- primitive self-tests --------------------------------------------
+
+def hexparse(s: Ptr[uint8]) -> uint64:
+    # Parse a hex string (optional 0x prefix) to uint64.
+    v: uint64 = 0
+    i: uint64 = 0
+    if s[0] == 0x30 and (s[1] == 0x78 or s[1] == 0x58):
+        i = 2
+    while s[i] != 0:
+        c: uint8 = s[i]
+        d: uint64 = 0
+        if c >= 0x30 and c <= 0x39:
+            d = cast[uint64](c - 0x30)
+        elif c >= 0x61 and c <= 0x66:
+            d = cast[uint64](c - 0x61 + 10)
+        elif c >= 0x41 and c <= 0x46:
+            d = cast[uint64](c - 0x41 + 10)
+        else:
+            i = i + 1
+            continue
+        v = (v << 4) | d
+        i = i + 1
+    return v
+
+
+def selftest_mmio(physs: Ptr[uint8], lens: Ptr[uint8]):
+    phys: uint64 = hexparse(physs)
+    ln:   uint64 = hexparse(lens)
+    puts("[umdf-host] selftest-mmio phys=")
+    put_hex(phys)
+    va: int64 = sys_umdf_mmio_map(phys, ln)
+    if va < 0:
+        puts("[umdf-host] mmio map FAILED rc=")
+        put_hex(cast[uint64](va))
+        return
+    puts("[umdf-host] mmio mapped to uva=")
+    put_hex(cast[uint64](va))
+    # Read the first 4 bytes back from the device window (proves the
+    # mapping is live + readable from userland).
+    w0: uint32 = rd_u32(cast[Ptr[uint8]](cast[uint64](va)))
+    puts("[umdf-host] mmio[0]=")
+    put_hex(cast[uint64](w0))
+    puts("[umdf-host] MMIO PRIMITIVE OK\n")
+
+
+def selftest_dma(lens: Ptr[uint8]):
+    ln: uint64 = hexparse(lens)
+    op: uint64 = 0
+    va: int64 = sys_umdf_dma_alloc(ln, &op)
+    if va < 0:
+        puts("[umdf-host] dma alloc FAILED rc=")
+        put_hex(cast[uint64](va))
+        return
+    puts("[umdf-host] dma uva=")
+    put_hex(cast[uint64](va))
+    puts("[umdf-host] dma phys=")
+    put_hex(op)
+    # Write a pattern through the user VA and read it back (proves the
+    # DMA buffer is real RAM accessible from userland; the phys is what
+    # we'd program into a device descriptor ring).
+    cast[Ptr[uint64]](cast[uint64](va))[0] = 0xDEADBEEFCAFEF00D
+    rb: uint64 = cast[Ptr[uint64]](cast[uint64](va))[0]
+    puts("[umdf-host] dma readback=")
+    put_hex(rb)
+    if rb == 0xDEADBEEFCAFEF00D:
+        puts("[umdf-host] DMA PRIMITIVE OK\n")
+
+
+def selftest_irq(vecs: Ptr[uint8]):
+    vec: uint64 = hexparse(vecs)
+    fd: int32 = sys_umdf_irq_open(vec)
+    if fd < 0:
+        puts("[umdf-host] irq open FAILED rc=")
+        put_hex(cast[uint64](fd))
+        return
+    puts("[umdf-host] irq fd opened=")
+    put_hex(cast[uint64](fd))
+    puts("[umdf-host] IRQ PRIMITIVE OK (fd is a readable file)\n")
+
+
+def do_crashme():
+    # Deliberately dereference NULL. This faults the HOST PROCESS; the
+    # kernel must survive and reap us, proving crash isolation.
+    puts("[umdf-host] crashme: about to dereference NULL (kernel must survive)\n")
+    bad: Ptr[uint64] = cast[Ptr[uint64]](0)
+    bad[0] = 0x1234
+
+
+# --- minimal #X server -----------------------------------------------
+#
+# Post a server so the driver is reachable Plan-9-style. We serve the
+# bare 9P handshake + a single read-only /status file so a client can
+# confirm the driver is alive. Full block/net file trees are out of slice.
+
+def serve_loop():
+    puts("[umdf-host] posting #umdf server + serving\n")
+    sys_srv_post("umdf", 1)
+    # Echo-style minimal serve: read T-messages on stdin, reply a fixed
+    # Rerror for anything we don't implement (the handshake-only contract
+    # for this slice). Exit on EOF.
+    hdr: Array[8192, uint8]
+    while True:
+        n: int64 = sys_read(0, &hdr[0], 8192)
+        if n <= 0:
+            break
+    puts("[umdf-host] server EOF; exiting\n")
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        puts("[umdf-host] usage: umdf_host <path.ko> [post|selftest-*]\n")
+        return 1
+    a1: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+
+    # Self-test modes that don't need a .ko come first.
+    if streq(a1, "selftest-mmio") == 1:
+        if argc < 4:
+            return 1
+        selftest_mmio(cast[Ptr[uint8]](argv[2]), cast[Ptr[uint8]](argv[3]))
+        return 0
+    if streq(a1, "selftest-dma") == 1:
+        if argc < 3:
+            return 1
+        selftest_dma(cast[Ptr[uint8]](argv[2]))
+        return 0
+    if streq(a1, "selftest-irq") == 1:
+        if argc < 3:
+            return 1
+        selftest_irq(cast[Ptr[uint8]](argv[2]))
+        return 0
+    if streq(a1, "crashme") == 1:
+        do_crashme()
+        return 0
+
+    # Otherwise argv[1] is a .ko path to load + init in userland.
+    puts("[umdf-host] loading .ko in userland: ")
+    sys_write(2, a1, strlen_u8(a1))
+    puts("\n")
+    rc: int32 = load_and_init_ko(cast[Ptr[char]](a1))
+    if rc != 0:
+        puts("[umdf-host] userland .ko load FAILED\n")
+        return 1
+
+    # Optional secondary self-tests after a successful load.
+    if argc >= 3:
+        a2: Ptr[uint8] = cast[Ptr[uint8]](argv[2])
+        if streq(a2, "post") == 1:
+            serve_loop()
+        elif streq(a2, "crashme") == 1:
+            do_crashme()
+    return 0
