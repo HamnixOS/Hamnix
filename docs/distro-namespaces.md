@@ -246,6 +246,56 @@ The distinction matters: if you internalise schroot's framing,
 Plan 9's framing, it looks like a configuration choice. The latter
 is what Hamnix actually does.
 
+## Shared-object loading (ld.so mmap path)
+
+A real Debian binary like `apt(8)` is dynamically linked: `ld-linux`
+(the `PT_INTERP`) maps the binary's `DT_NEEDED` closure at exec time.
+For each DSO, glibc's `_dl_map_segments` issues a sequence of `mmap`
+calls that the Linux-ABI layer must service:
+
+1. A **whole-DSO reservation** — `mmap(NULL, total_vaddr_span,
+   PROT_NONE|PROT_READ, MAP_PRIVATE, fd, 0)` — reserving one contiguous
+   range covering every `PT_LOAD`. In Hamnix this routes through
+   `mm/vma.ad::vma_alloc` → `_vma_alloc_large`, which backs the span
+   with up-to-4-MiB buddy chunks stitched into one virtual window in
+   the per-task mmap arena `[1 GiB, ~4 GiB)`. Even a single-page map
+   takes this windowed path so the returned VA is a proper US=1
+   per-task mapping (never a raw US=0 low-identity address).
+2. Per-`PT_LOAD` **`MAP_FIXED` overlays** inside that reservation, each
+   with the segment's file offset and `prot`. A strict sub-region alias
+   re-stamps the leaf PTEs to the overlay's `prot` (so a writable
+   data/GOT segment is genuinely writable during relocation); an
+   anonymous `.bss`-tail overlay is zero-filled.
+3. File bytes are populated by `_u_mmap_fill_file`
+   (`linux_abi/u_syscalls.ad`), which reads the fd through a kernel
+   bounce buffer and writes each page via its **physical** frame in the
+   identity window — never through the user VA. This is the W^X
+   keystone: a `PROT_READ` `.text` page's read-only leaf PTE is never
+   written at CPL=0, so RELRO/GOT pages can stay read-only without the
+   fill itself faulting.
+
+"`apt: error while loading shared libraries: libapt-pkg.so.6.0: failed
+to map segment from shared object`" is glibc's message when one of
+those `mmap`/`mprotect` calls returns an error. The most common cause
+is **not** a kernel mmap limit but a **missing DSO**: the staged distro
+image didn't actually contain the file `ld.so` opened (the `DT_NEEDED`
+`SONAME` symlink resolved to a target that was never staged), so the
+open/`mmap` failed. The fix is in the staging scripts
+(`scripts/build_rootfs_img.py` for the live `#distro` ext4,
+`scripts/build_initramfs.py` for the embedded default root): the FULL
+debootstrap mirror (`HAMNIX_DEBIAN_FULL=1`, default) copies every
+`lib*.so*` and dereferences `SONAME` symlinks to their real bytes, and
+the curated fallback now **globs** `usr/lib/x86_64-linux-gnu/lib*.so*`
+version-agnostically rather than pinning specific minor versions
+(which drift across Debian point releases). The larger DSO closure apt
+pulls (`libapt-pkg`, `libapt-private`, `libstdc++`, `libcrypto`,
+`libsystemd`, …) is therefore staged whatever the fixture's minors.
+
+`MMAP_TRACE` in `linux_abi/u_syscalls.ad` (gate constant, default off
+in ship builds) logs every linux-ABI `mmap`/`mprotect` —
+`addr,len,prot,flags,fd,off → ret` — to pinpoint the first failing map
+when diagnosing a new binary's closure.
+
 ## Test discipline
 
 This phase lands green when all of the following pass:

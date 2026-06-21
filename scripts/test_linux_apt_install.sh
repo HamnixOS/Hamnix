@@ -116,8 +116,29 @@ python3 -m compiler.adder compile --target=x86_64-bare-metal \
 echo "[test_linux_apt_install] (5/5) Boot QEMU + drive dpkg/apt-get --version"
 set +e
 (
-    # Wait for hamsh to source /etc/hamsh.rc + reach interactive prompt.
-    sleep 8
+    # Wait for hamsh to source /etc/hamsh.rc + reach an interactive
+    # prompt BEFORE typing any command. A fixed `sleep N` regresses the
+    # moment the boot slows down — and this image's initramfs embeds the
+    # full ~214 MiB Debian tree, so the cpio unpack makes the boot
+    # genuinely slow under TCG. The rc's own "TEST_RC_DONE_DEFINING_NS"
+    # echo lands exactly when the shell becomes interactive, so gate the
+    # first keystroke on it appearing in the live qemu log (capped so a
+    # hung boot still terminates). (feedback_interactive_test_wait_for
+    # _prompt: gate on a boot-ready marker, never a fixed sleep.)
+    rc_ready=0
+    waited=0
+    while [ "$waited" -lt 200 ]; do
+        if grep -aq "TEST_RC_DONE_DEFINING_NS" "$LOG" 2>/dev/null; then
+            rc_ready=1
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    # Small settle so the prompt is drawn after the marker, then proceed
+    # even if the marker never arrived (the assertions below will FAIL
+    # loudly rather than hang).
+    sleep 2
 
     # PROBE 0: list the distro tree contents from inside the ns so we
     # can tell whether the bind grafted /var/lib/distros/default at /
@@ -145,7 +166,7 @@ set +e
 
     printf 'echo BANNER_DONE\n'; sleep 1
     printf 'exit\n'; sleep 1
-) | timeout 120s qemu-system-x86_64 \
+) | timeout 360s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
