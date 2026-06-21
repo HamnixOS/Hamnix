@@ -3789,6 +3789,15 @@ def build_archive() -> bytes:
             # Curated closure for `apt-get install hello` end-to-end.
             # All paths are RELATIVE to minbase_rootfs/.
             REAL_DEBIAN_FILES = [
+                # GENUINE Debian shells. `enter linux { /bin/dash }`
+                # (real Debian /bin/sh -> dash) and `/bin/bash` must run
+                # the actual Debian shell, not just the busybox fallback.
+                # dash's dynamic closure is only ld.so + libc (already
+                # staged below); bash also needs libtinfo (added to the
+                # .so closure). The usrmerge expansion below ALSO plants
+                # each at the /bin/<x> alias so `/bin/dash` resolves.
+                "usr/bin/dash",
+                "usr/bin/bash",
                 # Package managers proper.
                 "usr/bin/apt",
                 "usr/bin/apt-get",
@@ -3840,6 +3849,8 @@ def build_archive() -> bytes:
                 "usr/lib/x86_64-linux-gnu/libselinux.so.1",
                 "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0",
                 "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.14.0",
+                # bash's extra .so dep (terminal handling).
+                "usr/lib/x86_64-linux-gnu/libtinfo.so.6",
                 # /etc essentials — apt reads these at startup, dpkg
                 # reads admindir status / available.
                 "etc/debian_version",

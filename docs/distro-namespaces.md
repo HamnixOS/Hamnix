@@ -174,6 +174,44 @@ binds re-expose the shared file servers inside the new namespace
 resolve to whatever the distro backing happens to ship for those
 paths — typically nothing useful).
 
+### Interactive shell — `enter linux { sh }`
+
+`enter linux { sh }` (bare `sh`, no `-c`) drops you into an
+**interactive** shell inside the Linux namespace: the shell's
+`stdin/stdout/stderr` are wired to the controlling terminal (the
+console line discipline cooks + echoes keystrokes, #164), and the
+hamsh that launched it BLOCKS in `waitpid` until the guest shell
+`exit`s — a genuine context switch into the Linux ns and back. You can
+run commands (`ls /`, `cat /etc/debian_version`, …) and `exit`
+returns to hamsh.
+
+For this to work `#distro` must actually CONTAIN a runnable `/bin/sh`.
+Two shells are staged into the distro tree
+(`/var/lib/distros/default/`) by `scripts/build_initramfs.py`
+(in-cpio) and `scripts/build_rootfs_img.py` (on the ext4 rootfs
+image):
+
+* **busybox** (`tests/u-binary/u_busybox_musl`, a musl static-PIE
+  ET_DYN with no `PT_INTERP`) — planted at `/bin/busybox` with applet
+  symlinks (`/bin/sh`, `/bin/ls`, `/bin/cat`, …). This is the
+  guaranteed-runnable shell: `enter linux { sh }` resolves `/bin/sh →
+  busybox` and runs it. The Hamnix ELF loader runs static-PIE images
+  directly.
+* **the genuine Debian dash + bash** — `usr/bin/dash` (the real Debian
+  `/bin/sh`) and `usr/bin/bash`, staged from
+  `tests/distros/debian-minbase/rootfs/` via the curated
+  `REAL_DEBIAN_FILES` list (with `/bin/dash`, `/bin/bash` usrmerge
+  aliases). These are DYNAMIC ELFs (`PT_INTERP =
+  /lib64/ld-linux-x86-64.so.2`); running them exercises the dynamic
+  loader / `ld.so` + glibc relocation path. Reach them explicitly with
+  `enter linux { /bin/dash }` / `enter linux { /bin/bash }`.
+
+If the busybox fixture is absent at build time AND no Debian shell is
+staged, `/var/lib/distros/default/bin/sh` does not exist, so the exec
+of `sh` returns `-ENOENT` and the spawned task exits `code=127` (the
+"`enter linux {sh}` exits 127" symptom). Always staging at least one
+shell is what keeps `enter linux { sh }` working out of the box.
+
 ## Phase placement
 
 Depends on Phase C (rfork RFNAMEG + bind + mount syscalls). Lands as
