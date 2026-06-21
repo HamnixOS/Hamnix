@@ -9,7 +9,51 @@ no QEMU, no Hamnix image). Each benchmark lives in three languages under
 `tests/bench/<name>.{ad,c,py}` and computes an identical result; the
 script asserts all implementations AGREE before timing. Pass
 `BENCH_OPT=1 bash scripts/bench_adder_host.sh` to bench the **`-O1`
-peephole optimizer** (Track 6) instead of the default single-pass backend.
+peephole optimizer** (Track 6), or `BENCH_OPT=2` for the **`-O2`
+register-promotion** pipeline, instead of the default single-pass backend.
+
+## `-O2` register promotion landed (Track 6 increment 2, 2026-06-21)
+
+`-O2` adds a **stack-slot → callee-saved-register promotion pass**
+(`adder/compiler/regalloc_x86.py`) that runs after the `-O1` peephole.
+The single-pass backend is a stack machine: every local lives in an
+`OFF(%rbp)` slot and *every* read/write round-trips through memory, so a
+loop counter or accumulator is reloaded and re-stored on every iteration.
+The new pass is a small register allocator over those slots — it promotes
+each function's hottest address-never-taken full-width scalar locals into
+the five callee-saved registers `%rbx, %r12–%r15` (registers the backend
+never emits and the `-O1` peephole never scratches), eliminating the
+per-iteration memory traffic. A slot is promoted **only** when every
+textual `OFF(%rbp)` appearance is a plain 8-byte `movq` load/store; any
+sized mov, `movz*`/`movs*`, `lea` (address-taken), indexed base, or the
+canary slot disqualifies it, so a register provably holds the same value
+the slot would. Saves/restores go through a fresh enlarged-frame slot at
+the prologue and before every `leave`.
+
+Validated by the predicted-output fuzzer at `-O2`
+(`FUZZ_OPT=2 scripts/fuzz_adder.sh`, also `ADDER_FUZZ_OPT=2`) — **0
+miscompiles over 8000+ random programs** (2000-program CI batch + an 8000
+soak) — and by the cross-language AGREEMENT check at `-O2`.
+
+**Before → after (same machine, best-of-7, Python skipped):**
+
+| bench | C ‑O2 | Adder ‑O0 | `-O0`/‑O2 | Adder ‑O1 | `-O1`/‑O2 | Adder ‑O2 | `-O2`/‑O2 | O1→O2 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| collatz | 0.183s | 1.177s | 6.42× | 1.087s | 5.92× | 0.963s | 5.26× | 1.13× |
+| fib     | 0.030s | 0.130s | 4.28× | 0.091s | 3.03× | 0.091s | 2.98× | 1.02× |
+| sieve   | 0.013s | 0.046s | 3.55× | 0.034s | 2.69× | 0.028s | 2.13× | 1.26× |
+| mmul    | 0.017s | 0.136s | 7.80× | 0.096s | 5.52× | 0.089s | 5.09× | 1.09× |
+| lcg     | 0.048s | 0.091s | 1.89× | 0.092s | 1.89× | 0.072s | 1.51× | 1.25× |
+
+**Geometric means:** the pipeline now moves Adder from ≈**4.28×** (`-O0`)
+→ ≈**3.47×** (`-O1`) → ≈**3.03×** (`-O2`) of C `-O2`. Register promotion
+is a **1.14× speedup over `-O1`** (1.41× over the un-optimised backend),
+biggest on the memory-bound `sieve` (2.69→2.13×) and the ALU-chain `lcg`
+(1.89→1.51×) — where keeping the LCG state in a register breaks the
+load→multiply→store dependency through memory — and on `collatz`
+(5.92→5.26×). `fib` is recursion/call-bound (few hot loop-carried
+locals), so it barely moves. The default `-O0` path (the Hamnix image
+build) is **unchanged**.
 
 ## `-O1` optimizer landed (Track 6, 2026-06-20)
 

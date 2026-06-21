@@ -29,6 +29,7 @@ from .ast_nodes import Program, ImportDecl
 from .codegen_x86 import generate as generate_x86, CodeGenError
 from .codegen_arm64 import generate as generate_arm64
 from .peephole_x86 import optimize_text as peephole_x86
+from .regalloc_x86 import optimize_text as regalloc_x86
 
 
 # Compilation targets. `codegen` selects the backend; `kbuild` means the
@@ -100,7 +101,10 @@ def get_generator(target: str, opt_level: int = 0):
     trusted single-pass path — the only path the Hamnix image build uses.
     ``1`` runs the x86 peephole optimizer (Track 6) over the emitted assembly;
     it is gated behind ``-O1`` and validated by ``scripts/fuzz_adder.sh``.
-    The peephole only applies to the x86 backend; arm64 ignores it.
+    ``2`` additionally runs the stack-slot -> callee-saved-register promotion
+    pass (``regalloc_x86``) after the peephole, removing the stack machine's
+    per-iteration memory round-trips for hot locals. Both optimizers only
+    apply to the x86 backend; arm64 ignores them.
     """
     spec = TARGETS.get(target)
     if spec is None:
@@ -120,6 +124,8 @@ def get_generator(target: str, opt_level: int = 0):
             asm = generate_x86(program, bare_metal=no_modinfo)
             if opt_level >= 1:
                 asm = peephole_x86(asm)
+            if opt_level >= 2:
+                asm = regalloc_x86(asm)
             return asm
         return _gen_x86
     if spec["codegen"] == "arm64":
@@ -1135,10 +1141,11 @@ def main() -> int:
                                choices=list(TARGETS),
                                help=f"Compilation target (default: {DEFAULT_TARGET})")
     compile_parser.add_argument("-O", dest="opt_level", type=int, default=0,
-                               choices=[0, 1],
+                               choices=[0, 1, 2],
                                help="Optimization level: 0 = trusted "
                                     "single-pass (default), 1 = x86 peephole "
-                                    "optimizer (Track 6)")
+                                    "optimizer, 2 = + stack-slot register "
+                                    "promotion (Track 6)")
     compile_parser.set_defaults(func=cmd_compile)
 
     # Asm command
@@ -1149,9 +1156,10 @@ def main() -> int:
                            choices=list(TARGETS),
                            help=f"Compilation target (default: {DEFAULT_TARGET})")
     asm_parser.add_argument("-O", dest="opt_level", type=int, default=0,
-                           choices=[0, 1],
+                           choices=[0, 1, 2],
                            help="Optimization level: 0 = trusted single-pass "
-                                "(default), 1 = x86 peephole optimizer")
+                                "(default), 1 = x86 peephole optimizer, "
+                                "2 = + stack-slot register promotion")
     asm_parser.set_defaults(func=cmd_asm)
 
     args = parser.parse_args()

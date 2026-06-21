@@ -871,10 +871,11 @@ def main():
                          "--target= (e.g. a future 2nd backend) and report a "
                          "diff against it; the predicted-output oracle remains "
                          "the primary check. Default: off.")
-    ap.add_argument("--opt", type=int, default=None, choices=[0, 1],
+    ap.add_argument("--opt", type=int, default=None, choices=[0, 1, 2],
                     help="compile each program at this -O level (0 = trusted "
-                         "single-pass, 1 = peephole optimizer). The predicted-"
-                         "output oracle validates the chosen level directly. "
+                         "single-pass, 1 = peephole optimizer, 2 = + stack-slot "
+                         "register promotion). The predicted-output oracle "
+                         "validates the chosen level directly. "
                          "Default: ADDER_FUZZ_OPT or 0.")
     ap.add_argument("--ad-codegen", action="store_true",
                     default=(os.environ.get("ADDER_FUZZ_DIFF_TARGET")
