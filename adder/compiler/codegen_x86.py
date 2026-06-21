@@ -1633,10 +1633,54 @@ class X86CodeGen:
 
     # -- functions ----------------------------------------------------------
 
+    def _is_byvalue_struct_type(self, t) -> bool:
+        """True iff `t` names a class/struct passed/returned BY VALUE.
+
+        A bare `Type` whose name is a registered struct (class) is a
+        by-value aggregate. `Ptr[Foo]` is NOT — the pointer is a scalar.
+        Adder has no by-value aggregate ABI by design (LANGUAGE.md:
+        aggregates cross function boundaries via `Ptr[T]` out-parameters),
+        so such a type at a param/return position is rejected loudly here
+        rather than silently degenerating to an 8-byte slot (which copied
+        only one register's worth and read the rest as stack garbage).
+        codegen.ad refuses the same construct, keeping the two backends in
+        lockstep.
+        """
+        return (t is not None
+                and isinstance(t, Type)
+                and not isinstance(t, (PointerType, ArrayType, PercpuType,
+                                       FunctionPointerType))
+                and getattr(t, "name", None) in self.structs)
+
     def gen_function(self, func: FunctionDef) -> None:
         self.ctx = FunctionContext(name=func.name)
         self.ctx.needs_canary = self._function_needs_canary(func)
         self.ctx.epilogue_label = f".__epilogue_{func.name}"
+
+        # Reject by-value struct params / return (no by-value aggregate
+        # ABI — see _is_byvalue_struct_type). The implicit `self:
+        # Ptr[Class]` receiver of a method is a Ptr, so methods are
+        # unaffected. Skip the first param when this is a synthesised
+        # method body (its receiver is always a Ptr and already typed so).
+        for param in func.params:
+            if self._is_byvalue_struct_type(param.param_type):
+                span = getattr(param, "span", None) or getattr(func, "span", None)
+                raise CodeGenError(
+                    f"x86: by-value struct parameter '{param.name}: "
+                    f"{param.param_type.name}' in '{func.name}' is not "
+                    f"supported at {_span_location(span)}; pass "
+                    f"`Ptr[{param.param_type.name}]` (the caller takes "
+                    f"`&obj`) — Adder has no by-value aggregate ABI"
+                )
+        if self._is_byvalue_struct_type(func.return_type):
+            span = getattr(func, "span", None)
+            raise CodeGenError(
+                f"x86: by-value struct return "
+                f"`-> {func.return_type.name}` in '{func.name}' is not "
+                f"supported at {_span_location(span)}; return through a "
+                f"`Ptr[{func.return_type.name}]` out-parameter the caller "
+                f"supplies — Adder has no by-value aggregate ABI"
+            )
 
         # Stack-protector V0: when needs_canary is set, reserve the 8-byte
         # canary slot at the TOP of the frame (closest to saved %rbp / the

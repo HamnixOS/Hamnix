@@ -435,6 +435,7 @@ class Program:
         # sequence is identical across modes (the structs are always emitted).
         self._build_struct_def()
         self._build_class_def()
+        self._build_multibase_def()
 
         # ----- globals: 2-D array + one array per store width ----------------
         rows = rng.randint(2, 4)
@@ -484,6 +485,7 @@ class Program:
         self._gen_scalar_global_traffic(env)
         self._gen_struct_traffic(env)     # struct locals: member store/read
         self._gen_class_traffic(env)      # class construction + method dispatch
+        self._gen_multibase_traffic(env)  # multi-base inherited-method dispatch
         self._gen_for_range_traffic(env)  # for v in range(...)
         self._gen_for_array_traffic(env)  # for v in <array global>
         self._gen_do_while_traffic(env)   # do/while
@@ -711,6 +713,33 @@ class Program:
         self.emit_top("        return r")
         self.emit_top("")
 
+    # ---- multi-base class: method inherited from a NON-FIRST base ------------
+    # Track-3 multi-base receiver-offset parity. `MBase0` and `MBase1` each
+    # carry two int64 fields + a method; `MDerived(MBase0, MBase1)` flattens
+    # MBase0 (offset 0) then MBase1 (offset 16) then its own field. Calling
+    # `mfirst` (declared in MBase0) needs NO receiver bump; calling `msecond`
+    # (declared in MBase1, the SECOND base) requires the codegen to bump the
+    # receiver pointer by sizeof(MBase0)=16 so `self.field` lands on MBase1's
+    # bytes. A backend that omits the bump reads MBase0's fields instead, so
+    # the oracle (which models the correct fields) catches it. All int64 ->
+    # straight signed-64 oracle.
+    def _build_multibase_def(self):
+        self.emit_top("class MBase0:")
+        self.emit_top("    p: int64")
+        self.emit_top("    q: int64")
+        self.emit_top("    def mfirst(self, x: int64) -> int64:")
+        self.emit_top("        return self.p * x + self.q")
+        self.emit_top("")
+        self.emit_top("class MBase1:")
+        self.emit_top("    u: int64")
+        self.emit_top("    v: int64")
+        self.emit_top("    def msecond(self, x: int64) -> int64:")
+        self.emit_top("        return self.u - x + self.v")
+        self.emit_top("")
+        self.emit_top("class MDerived(MBase0, MBase1):")
+        self.emit_top("    w: int64")
+        self.emit_top("")
+
     def _gen_class_traffic(self, env):
         rng = self.rng
         ia = rng.randint(-1000, 1000)
@@ -727,6 +756,42 @@ class Program:
         r = I64.wrap(I64.wrap(I64.wrap(ia) * I64.wrap(x)) + I64.wrap(ib))
         self.emit(f"    cr: int64 = ctr.combine({x_s})")
         self._fold_value("cast[uint64](cr)", U64.wrap(r))
+
+    # ---- multi-base traffic: inherited method from a non-first base ----------
+    def _gen_multibase_traffic(self, env):
+        rng = self.rng
+        # Bare (zeroed) MDerived local; store all five flattened fields, then
+        # dispatch mfirst (MBase0, offset 0) and msecond (MBase1, offset 16).
+        pv = rng.randint(-1000, 1000)
+        qv = rng.randint(-1000, 1000)
+        uv = rng.randint(-1000, 1000)
+        vv = rng.randint(-1000, 1000)
+        wv = rng.randint(-1000, 1000)
+        xf = rng.randint(-50, 50)
+        xs = rng.randint(-50, 50)
+        def cs(n):
+            return f"cast[int64](0 - {(-n)})" if n < 0 else f"cast[int64]({n})"
+        self.emit("    md: MDerived")
+        self.emit(f"    md.p = {cs(pv)}")
+        self.emit(f"    md.q = {cs(qv)}")
+        self.emit(f"    md.u = {cs(uv)}")
+        self.emit(f"    md.v = {cs(vv)}")
+        self.emit(f"    md.w = {cs(wv)}")
+        # Read every field back (member load), folding each.
+        self._fold_value("cast[uint64](md.p)", U64.wrap(I64.wrap(pv)))
+        self._fold_value("cast[uint64](md.q)", U64.wrap(I64.wrap(qv)))
+        self._fold_value("cast[uint64](md.u)", U64.wrap(I64.wrap(uv)))
+        self._fold_value("cast[uint64](md.v)", U64.wrap(I64.wrap(vv)))
+        self._fold_value("cast[uint64](md.w)", U64.wrap(I64.wrap(wv)))
+        # mfirst (MBase0, receiver_offset 0): p*x + q.
+        rf = I64.wrap(I64.wrap(I64.wrap(pv) * I64.wrap(xf)) + I64.wrap(qv))
+        self.emit(f"    mrf: int64 = md.mfirst({cs(xf)})")
+        self._fold_value("cast[uint64](mrf)", U64.wrap(rf))
+        # msecond (MBase1, receiver_offset 16): u - x + v. A missing bump
+        # would read p,q instead of u,v and diverge here.
+        rsv = I64.wrap(I64.wrap(I64.wrap(uv) - I64.wrap(xs)) + I64.wrap(vv))
+        self.emit(f"    mrs: int64 = md.msecond({cs(xs)})")
+        self._fold_value("cast[uint64](mrs)", U64.wrap(rsv))
 
     # ---- for v in range(...) : integer counter loop --------------------------
     def _gen_for_range_traffic(self, env):
