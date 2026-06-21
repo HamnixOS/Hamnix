@@ -54,10 +54,11 @@ quality lives in the *passes*, so there's no perf reason to keep them in Python.
      2-D grid traffic in BOTH modes; `scripts/fuzz_adder_diff.sh` accept-rate is
      100% with 0 miscompiles. The differential gate now exercises EVERY construct
      the default generator emits (subset==default).
-   - REMAINING for cutover: classes/methods, free-standing for-loops over arrays,
-     structs + member access, do-while, floats. (`codegen.ad` already covers
-     1-D/2-D/scalar globals of every width, casts, compares, div/mod, while-loops,
-     if/elif/else, break/continue, helper calls, pointers, syscalls.)
+   - REMAINING for cutover: by-value struct params/returns, multi-base receiver
+     offset. (`codegen.ad` already covers 1-D/2-D/scalar globals of every width,
+     casts, compares, div/mod, while/for/do-while loops, if/elif/else,
+     break/continue, helper calls, pointers, syscalls, classes/methods, structs +
+     member access, and — as of 2026-06-21 — scalar SSE float32/float64.)
 4. **Userland-isolated drivers (UMDF)** — ✅ DONE (first slice: stock `.ko` in a
    restartable userland host, crash-isolated). Follow-ups: respawn supervisor, real
    BAR-backed driver, `exports.ad` parity.
@@ -179,17 +180,19 @@ the Adder compiler reaches parity and can host it. Progress so far: 6 real
   array globals, classes/methods, for-loops, structs/member access, do-while,
   floats, `.modinfo`. Validate EVERY addition with `scripts/fuzz_adder.sh` (0
   miscompiles) + the differential mode vs the Python backend.
-  - **FLOATS — BLOCKED on an architectural decision (2026-06-21).** The frozen
-    oracle `codegen_x86.py` has NO floating point (`FloatLiteral` raises
-    `CodeGenError`); ARM64 also rejects floats. Nothing to "mirror," and the
-    differential gate uses the Python backend as a co-reference, so a
-    codegen.ad-only float impl can't be fuzz-proven and would break parity.
-    To unblock: implement floats in BOTH `codegen_x86.py` and `codegen.ad` (plus
-    the fuzzer oracle/emitter) IN LOCKSTEP — this overrides the "seed is FROZEN"
-    rule for net-new FP ground. See docs/subsystems/adder-compiler.md
-    "Floating point — parity blocker." All OTHER cutover constructs (multi-dim
-    array globals, classes/methods, loops, structs, do-while) are LANDED + fuzz-
-    proven; floats + by-value-struct-params/returns + multi-base are what remain.
+  - [x] **FLOATS — DONE (2026-06-21), scalar SSE float32/float64 in LOCKSTEP.**
+    Implemented in BOTH `codegen_x86.py` (seed/oracle) AND `codegen.ad` plus the
+    fuzzer's bit-exact oracle. FP values transit `%rax` as their IEEE bit
+    pattern; SSE (`addss/subss/mulss/divss`+`sd`, `ucomi`+NaN-unordered setcc,
+    `cvtsi2`/`cvtt`/`cvtss2sd`/`cvtsd2ss`, sign-bit-xor negate) runs only at the
+    op site. Validated: differential gate 4 seeds × 400 = 1600 programs 100%
+    accepted/correct, 0 miscompiles; Python fuzzer 1500 clean; regress pin
+    unchanged. The "seed FROZEN" rule covers the OPTIMIZER ONLY (untouched);
+    adding the missing FP correctness feature to the seed was required + allowed.
+    See docs/subsystems/adder-compiler.md "Floating point — scalar SSE, LOCKSTEP."
+  - REMAINING for cutover: by-value struct params/returns, multi-base receiver
+    offset. All other constructs (multi-dim array globals, classes/methods,
+    loops, structs, do-while, FLOATS) are LANDED + fuzz-proven.
 - [ ] **Build the `.ad` compiler as an `x86_64-linux` host binary** (via Track 1) so
   `adder_cc` runs on the host, compiling Adder→Hamnix at native speed — Python
   becomes a one-time SEED (correct, not fast; freeze its optimizer per the redirect).

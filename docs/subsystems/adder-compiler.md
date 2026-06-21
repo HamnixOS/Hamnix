@@ -145,46 +145,67 @@ The struct fixed-32 differential is value-based (not byte-identical) so
 `codegen.ad` is free to pick its own register/encoding within each lowering
 as long as the runtime value matches the oracle. **Remaining for a
 default-build cutover:** multi-base receiver-offset bump, by-value embedded
-struct fields, struct-typed params/returns by value, `for`-over-`Ptr[T]`,
-floats — each currently `cg_fail`s rather than miscompiling.
+struct fields, struct-typed params/returns by value, `for`-over-`Ptr[T]`.
+Floats are now DONE (see below).
 
-### Floating point — parity blocker (2026-06-21 finding)
+### Floating point — scalar SSE, LOCKSTEP (DONE 2026-06-21)
 
-The "add floats to `codegen.ad`" cutover item has a prerequisite the
-self-hosting strategy must resolve first: **`codegen_x86.py` (the frozen
-bootstrap seed / differential oracle) implements NO floating point.**
-`FloatLiteral` is imported but never dispatched in `gen_expr`; any `float32`/
-`float64` program raises `CodeGenError("x86: expression FloatLiteral not yet
-supported")`. The ARM64 backend (`codegen_arm64.py`) likewise rejects
-`float32`/`float64` (`type '...' not yet supported (Phase 1)`). So today both
-backends are at trivial FP parity (both reject), and the fuzzer generates no
-float traffic.
+Floats are implemented in BOTH backends **in lockstep**, plus the fuzzer's
+bit-exact oracle, so the differential gate stays valid. (The earlier
+"parity blocker" finding — that the seed had ZERO FP and a `codegen.ad`-only
+impl couldn't be fuzz-proven — is resolved: the seed was extended with FP as
+a missing CORRECTNESS feature. The "FROZEN" rule covers only the OPTIMIZER,
+which is untouched.)
 
-There is therefore nothing to "mirror": no SSE/`movss`/`cvtsi2sd` instruction
-selection exists in the seed to copy. More importantly, the differential gate
-(`scripts/fuzz_adder_diff.sh --ad-codegen`) validates `codegen.ad` by running
-the SAME program through the Python backend as a co-reference (see
-`check_one_ad_codegen` -> `compile_and_run`). A `codegen.ad`-ONLY float
-implementation cannot be fuzz-proven: the Python backend would `crash` on every
-float program, so the gate can never reach the required "100% accepted, 100%
-correct." Adding floats to `codegen.ad` alone would also *break* the parity
-invariant (it would accept programs the seed rejects, with no oracle to check
-them).
+**Transit model (both backends).** A `float32`/`float64` VALUE travels through
+the same single-accumulator path as every integer — it lives in `%rax` as its
+raw IEEE-754 **bit pattern** (float32 in the low 32 bits). All existing spill
+(`pushq %rax`), sized local store/load, GP-register parameter passing, and
+`%rax` return scaffolding therefore moves floats correctly for free. SSE
+registers (`%xmm0`/`%xmm1`) are used ONLY at the instant an FP op runs: the op
+loads the bits from `%rax`/`%rcx` (`movd`/`movq`), runs the scalar SSE
+instruction, and moves the result bits back to `%rax`. Eval/spill order is
+byte-identical to the integer `gen_binary` path.
 
-The value model is amenable to FP validation once unblocked: the fuzzer folds
-everything into one `uint64 g_accum`, and float results can be folded
-bit-exactly (reinterpret float bits / integer-derived floats) to dodge
-NaN/precision noise.
+**Mechanisms (mirrored byte-for-byte):**
 
-**Resolution required (architectural, owner = self-hosting strategy):** floats
-must be implemented in BOTH `codegen_x86.py` AND `codegen.ad` IN LOCKSTEP (plus
-the oracle's IEEE-754 expected-value computation and the fuzzer's float-traffic
-emitter), so the differential oracle stays meaningful. The "`codegen_x86.py` is
-FROZEN" rule is about not perturbing behavior already used as the oracle;
-floats are net-new ground where there is no behavior to freeze. This is the
-only path that satisfies both "FULL parity with `codegen_x86.py`" and the
-fuzz-proven validation gate. Until that lockstep decision is taken, floats are
-intentionally left rejecting in both backends (parity preserved).
+- `FloatLiteral` -> constant in the `.rodata`/data literal pool, loaded as
+  bits. (`codegen.ad`'s frontend only preserves a float literal's integer
+  part, so it materializes the integer and `cvtsi2sd`s it; the fuzzer derives
+  all floats from integers, so fractional literals never reach either backend.)
+- `float32`=4 / `float64`=8 in the type-size tables; per-local `loc_is_float`
+  and per-global `glob_is_float` markers (mirroring `_float_width(
+  get_expr_type)`) distinguish a float32 from an int32 (both scalar_size 4).
+- Arithmetic: `addss/subss/mulss/divss` (+ `sd`). Operand promotion to the
+  wider float width in a mixed binop; an integer operand `cvtsi2`-promotes.
+- Compares: `ucomiss/ucomisd` -> `setcc`, with a parity guard
+  (`setnp`/`setp` + `andb`/`orb`) so a NaN-unordered compare yields the IEEE
+  result (`==,<,<=,>,>=` false; `!=` true).
+- Conversions: `cvtsi2ss/sd`, `cvttss/sd2si` (truncate toward zero),
+  `cvtss2sd`/`cvtsd2ss`. A float->int cast leaves a 64-bit signed int that the
+  integer narrowing fix-up then truncates for sub-8-byte int targets.
+- Unary negate: sign-bit XOR (`xorl $0x80000000,%eax` / `xorq` with the 64-bit
+  sign mask), so `-0.0` is produced correctly (not an integer `neg`).
+
+**Validation.** The fuzzer (`tests/fuzz/adder_fuzzer.py`, `_gen_float_traffic`)
+emits FP decls + arithmetic/compare/convert/negate traffic in BOTH subset and
+default mode (identical rng stream). FP results fold into the `uint64 g_accum`
+oracle BIT-EXACTLY: every float value is integer-derived (`cast[floatN](int)`)
+and every fold truncates back to `int64` then widens to `uint64`; float32 uses
+a `FloatType` model that rounds through IEEE single so the oracle equals the
+SSE register value, and divisions are chosen to yield exact quotients (no
+rounding ambiguity). `scripts/fuzz_adder_diff.sh --ad-codegen` over 4 seeds ×
+400 (1600 programs) = **100% accepted, 100% correct, 0 miscompiles, 0
+unsupported**, with float traffic flowing through both backends; the Python
+fuzzer over 1500 programs is clean; the `regress_codegen.ad` pin is unchanged.
+
+**ABI note (the one remaining FP gap).** This backend passes args in the GP
+register/stack sequence for ALL types (integer included), not the SysV
+INTEGER+SSE class split. That is internally consistent across both Adder
+backends — which is exactly what the differential fuzzer validates — but a
+call to a TRUE SysV extern taking `float`/`double` in `XMM0-7` is not yet
+wired (the fuzzer makes no such call). ARM64 FP is left as-is (not required
+for the x86 cutover).
 
 ## Related docs
 
