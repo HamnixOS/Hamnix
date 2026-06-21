@@ -339,6 +339,35 @@ Regenerate the repo on any host that has run `BUILD.sh`:
 bash scripts/build_local_apt_repo.sh   # idempotent; needs dpkg-deb + gzip
 ```
 
+### Where the install actually completes (writable backing required)
+
+A real install must WRITE — the package files, dpkg's admindir lock, and
+apt's lists. The two `#distro` backings differ:
+
+* **Installer-image live `#distro` (RAM ext4)** — fully writable. This is
+  where `apt-get install hamhello` (and `dpkg -i`) complete end to end and
+  the installed `/usr/bin/hamhello` runs. Gated by
+  `scripts/test_installer_live_debian.sh` (the real shipped artifact under
+  OVMF) — the AUTHORITATIVE install gate.
+* **`-kernel` cpio `#distro` (read-only)** — the cpio is read-only, so
+  dpkg/apt cannot lock/write under the real `/var`. The coverage test
+  (`test_linux_debian_coverage.sh`) instead unpacks into a writable
+  `/tmp/inst` alternate root (`dpkg --root=/tmp/inst`). **Known gap:**
+  creating a directory under the ns-bound writable `/tmp` (`bind '#t/tmp'
+  /tmp`) currently returns `ENOSYS` ("Function not implemented") — the
+  `mkdir(2)`/`mkdirat(2)` path resolves `/tmp/x` to the tmpfs server key
+  form `#t/tmp/x`, which `namec_mkdir` routes to a 9P `Tcreate(DMDIR)` the
+  in-kernel tmpfs server doesn't implement, and the `#t`→`/tmp` localizer
+  in `fs/tmpfs.ad` double-prefixes (`#t/tmp/x` → `/tmp/tmp/x`). FILE writes
+  and reads through the same `#t` bind work (they go through
+  `do_openchan` → `tmpfs_open_for_write`, which localizes correctly); only
+  the directory-create leg is unwired. Fix belongs in `fs/vfs.ad::vfs_mkdir`
+  (route a `#t`-localized path straight to `tmpfs_mkdir` after stripping the
+  `#t` prefix, bypassing the 9P `namec_mkdir` arm). Until then the cpio
+  coverage gate treats the dpkg-unpack completion as best-effort (the
+  forked real-Debian unpack binaries still RUN) and defers the hard
+  install→run assertion to the writable installer-live test.
+
 ## Phase placement
 
 Depends on Phase C (rfork RFNAMEG + bind + mount syscalls). Lands as
