@@ -107,7 +107,7 @@ set +e
 #   * `exit`                      — leave the guest, back to hamsh.
 #   * `exit`                      — leave hamsh.
 qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 600 \
-    -- '/uname' 12 \
+    -- 'uname' 12 \
        'enter linux { sh }' 6 \
        'echo ENTER_LINUX_SH_OK' 5 \
        'cat /etc/debian_version' 4 \
@@ -133,14 +133,33 @@ else
     fail=1
 fi
 
-# (2) No exec failure. The reported bug was two pids exiting code=127.
-if grep -a -F -q "code=127" "$LOG"; then
-    echo "[test_enter_linux_sh_interactive] FAIL: code=127 seen —" \
+# (2) No exec failure FROM THE ENTER-LINUX SHELL. The reported bug was
+#     the enter body's pids exiting code=127. We scope the check to the
+#     window AFTER `enter linux { sh }` is typed — a code=127 from an
+#     UNRELATED earlier task (e.g. a settle/probe command that resolves
+#     elsewhere) must not false-fail this gate. The ANSI/readline echo
+#     of the typed `enter linux { sh }` line is the window anchor.
+# LC_ALL=C — the serial log carries raw escape/NUL bytes; without it
+# awk warns "invalid multibyte" and (locale-dependent) may mis-handle
+# index() on those lines.
+ENTER_127=$(LC_ALL=C awk '
+    BEGIN { armed=0 }
+    index($0,"enter linux { sh }")>0 { armed=1 }
+    armed && index($0,"code=127")>0 { print; found=1 }
+    END { exit found?0:1 }
+' "$LOG")
+if [ -n "$ENTER_127" ]; then
+    echo "[test_enter_linux_sh_interactive] FAIL: code=127 after enter linux { sh } —" \
          "the shell failed to exec (the reported regression)"
-    grep -a -F "code=127" "$LOG" | head -4 || true
+    printf '%s\n' "$ENTER_127" | head -4
     fail=1
 else
-    echo "[test_enter_linux_sh_interactive] OK: no code=127 exec failure"
+    echo "[test_enter_linux_sh_interactive] OK: no code=127 from the enter-linux shell"
+    # Diagnostic-only: a 127 BEFORE the enter (unrelated probe) is noted,
+    # never fatal.
+    if grep -a -F -q "code=127" "$LOG"; then
+        echo "[test_enter_linux_sh_interactive] DIAG: an unrelated code=127 appeared before the enter (non-fatal)"
+    fi
 fi
 
 # (3) `cat /etc/debian_version` ran inside the ns (diagnostic — the
