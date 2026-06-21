@@ -43,8 +43,10 @@
 #                   The newline is appended automatically.
 #
 # Extra QEMU args may be supplied via the QEMU_EXTRA_ARGS env var
-# (space-separated). Default machine: -smp 2 -m 256M, -nographic,
-# -no-reboot, serial to the logfile.
+# (space-separated). Default machine: -smp 2 -m 1G, -nographic,
+# -no-reboot, serial to the logfile. (1G, not 256M: the debug kernel
+# ELF embeds a ~200MB initramfs and the BIOS GRUB ISO loader runs out
+# of memory loading it under a 256MB guest before reaching the kernel.)
 #
 # After the ready marker the driver performs a FEEDER_SYNC echo
 # handshake: it re-sends `echo FEEDER_SYNC` once a second until that
@@ -170,7 +172,7 @@ qemu_drive() {
         -smp 2 \
         -nographic \
         -no-reboot \
-        -m 256M \
+        -m 1G \
         -monitor none \
         -serial stdio \
         ${QEMU_EXTRA_ARGS:-} \
