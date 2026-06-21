@@ -70,25 +70,32 @@ bash scripts/build_modules.sh >/dev/null
 # test_linux_namespace.sh playbook).
 echo "[test_linux_apt_install] (2/5) Plant /etc/hamsh.rc"
 RC_TMP=$(mktemp /tmp/hamsh-rc-linuxapt.XXXXXX.rc)
+# IMPORTANT: every bind source in an `ns clean { }` template MUST be
+# SERVER-ANCHORED (`#...`). `ns clean` rfork's an EMPTY namespace
+# (RFCNAMEG) and only THEN replays the binds inside it, so a
+# `/`-anchored source (`bind /var/lib/distros/default /`) has nothing
+# to resolve against in the empty child and fails — surfacing as the
+# generic "bind failed: mount table full" (mnttab_bind returns -1 for
+# an UNBOUND source). The cpio boot file server is `#r`, so the
+# distro tree's server-anchored form is `#r/var/lib/distros/default`
+# (this matches the real /etc/rc.boot.full recipe, which uses
+# `#distro` / `#r/home` / `#t/tmp` — all `#`-anchored). /home and /tmp
+# aren't needed to run dpkg/apt, so they're dropped here.
 cat > "$RC_TMP" <<'EOF'
 echo TEST_RC_START
 linux = ns clean {
-    bind /var/lib/distros/default /
-    bind /home /home
+    bind '#r/var/lib/distros/default' /
     bind '#c' /dev
     bind '#p' /proc
     bind '#s' /srv
     bind '#/' /n
-    bind /tmp /tmp
 }
 debian = ns clean {
-    bind /var/lib/distros/default /
-    bind /home /home
+    bind '#r/var/lib/distros/default' /
     bind '#c' /dev
     bind '#p' /proc
     bind '#s' /srv
     bind '#/' /n
-    bind /tmp /tmp
 }
 echo TEST_RC_DONE_DEFINING_NS
 EOF
