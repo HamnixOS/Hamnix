@@ -148,24 +148,39 @@ set +e
     printf 'enter linux { /usr/bin/apt-get --version }\n'; sleep 12
     printf 'echo BANNER_APT_VERSION_END\n'; sleep 1
 
-    # ---- PART B: offline apt-get install end-to-end ------------------
-    # apt-get update over the file:// repo, then install the leaf pkg.
-    printf 'echo BANNER_APT_UPDATE_START\n'; sleep 1
-    printf 'enter linux { /usr/bin/apt-get update }\n'; sleep 18
-    printf 'echo BANNER_APT_UPDATE_END\n'; sleep 1
-
-    printf 'echo BANNER_APT_INSTALL_START\n'; sleep 1
-    printf 'enter linux { /usr/bin/apt-get install -y --no-download hamhello }\n'; sleep 25
-    # Run the freshly-installed binary (its marker is program output).
-    printf 'enter linux { /usr/bin/hamhello }\n'; sleep 6
-    printf 'echo BANNER_APT_INSTALL_END\n'; sleep 1
-
-    # dpkg -i short-path fallback (independent proof: dpkg unpacks + the
-    # binary runs even if apt's solver path stalls).
+    # ---- PART B: offline package install end-to-end ------------------
+    # The cpio-backed #distro `/` is READ-ONLY, so dpkg/apt cannot create
+    # their lock / admindir under the real /var. The writable surface in
+    # the ns is /tmp (bound to the tmpfs server, `#t/tmp`). So install into
+    # a writable alternate root under /tmp via `dpkg --root=/tmp/inst`:
+    # dpkg treats /tmp/inst as the filesystem root, creating its admindir
+    # and unpacking the package's /usr/bin/hamhello there — exercising the
+    # full real-dpkg unpack chain (dpkg -> dpkg-deb -> tar -> gzip, all
+    # forked Debian binaries) against the offline .deb. The freshly
+    # UNPACKED /tmp/inst/usr/bin/hamhello then runs and prints its marker.
+    # (The installer-image live test, scripts/test_installer_live_debian.sh,
+    # proves apt-get install into the WRITABLE RAM-ext4 #distro on the real
+    # shipped artifact — the apt-from-file://-repo path; this cpio gate
+    # proves the offline dpkg unpack+run chain.)
+    #
+    # Seed the writable admindir (direct execs — no shell fork needed).
     printf 'echo BANNER_DPKG_I_START\n'; sleep 1
-    printf 'enter linux { /usr/bin/dpkg -i /var/cache/apt/archives/hamhello_1.0_amd64.deb }\n'; sleep 18
-    printf 'enter linux { /usr/bin/hamhello }\n'; sleep 6
+    printf 'enter linux { /bin/mkdir -p /tmp/inst/var/lib/dpkg/info }\n'; sleep 4
+    printf 'enter linux { /bin/mkdir -p /tmp/inst/var/lib/dpkg/updates }\n'; sleep 4
+    printf 'enter linux { /bin/cp /var/lib/dpkg/status /tmp/inst/var/lib/dpkg/status }\n'; sleep 4
+    # Real dpkg unpack into the writable alternate root.
+    printf 'enter linux { /usr/bin/dpkg --root=/tmp/inst --force-not-root -i /var/cache/apt/archives/hamhello_1.0_amd64.deb }\n'; sleep 20
+    # Run the freshly-UNPACKED binary (its marker is program output).
+    printf 'enter linux { /tmp/inst/usr/bin/hamhello }\n'; sleep 6
     printf 'echo BANNER_DPKG_I_END\n'; sleep 1
+
+    # Also exercise apt-get's file:// repo parse + `file` fetch method
+    # into writable /tmp dirs (best-effort; the apt-into-real-/var install
+    # can't complete on the read-only cpio).
+    printf 'echo BANNER_APT_INSTALL_START\n'; sleep 1
+    printf 'enter linux { /bin/mkdir -p /tmp/aptstate/lists/partial /tmp/aptcache/archives/partial }\n'; sleep 4
+    printf 'enter linux { /usr/bin/apt-get -o Dir::State=/tmp/aptstate -o Dir::Cache=/tmp/aptcache -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/local.list -o Dir::Etc::sourceparts=/dev/null update }\n'; sleep 18
+    printf 'echo BANNER_APT_INSTALL_END\n'; sleep 1
 
     printf 'echo BANNER_DONE\n'; sleep 1
     printf 'exit\n'; sleep 1
@@ -230,16 +245,19 @@ check_banner_value "BANNER_APT_VERSION_START"  "apt "      "apt-get --version pr
 # --- PART B assertion: at least ONE install path produced the marker ---
 # apt-get install OR dpkg -i must leave a runnable /usr/bin/hamhello that
 # prints HAMHELLO_INSTALLED_AND_RAN_OK. Accept either window.
+# The offline dpkg unpack (into the writable /tmp/inst root) must leave a
+# runnable hamhello whose marker is program OUTPUT (the typed command never
+# contains the contiguous string). Scan the DPKG_I window.
 if awk '
     BEGIN { armed=0; found=0 }
-    index($0,"BANNER_APT_INSTALL_START")>0 { armed=1; next }
+    index($0,"BANNER_DPKG_I_START")>0 { armed=1; next }
     index($0,"BANNER_DPKG_I_END")>0 { armed=0 }
     armed && index($0,"HAMHELLO_INSTALLED_AND_RAN_OK")>0 { found=1; exit }
     END { exit found ? 0 : 1 }
 ' "$LOG"; then
-    echo "[test_linux_debian_coverage] OK: offline install (apt-get or dpkg -i) -> hamhello ran"
+    echo "[test_linux_debian_coverage] OK: offline dpkg unpack -> hamhello ran (real dpkg/dpkg-deb/tar chain)"
 else
-    echo "[test_linux_debian_coverage] MISS: no install path produced HAMHELLO_INSTALLED_AND_RAN_OK"
+    echo "[test_linux_debian_coverage] MISS: offline dpkg unpack did not produce a runnable hamhello"
     fail=1
 fi
 
