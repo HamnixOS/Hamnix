@@ -213,6 +213,35 @@ try:
         time.sleep(1.0)
         screendump("post")
 
+        # --- activate a FILE in the file manager -> launch the editor ---
+        # Clicking a NON-directory entry now LAUNCHES /bin/hameditscene on it
+        # (it used to no-op with "not a directory"). hamfmscene prints a
+        # "[hamedit] <path>" marker on the boot console BEFORE the spawn, so
+        # even though screen-pixel clicks are fb-mode-dependent, double-
+        # clicking several candidate rows and scanning the serial log for the
+        # marker is the e2e proof a file click reached the editor. We are back
+        # at '/' (the descends above may have moved us, but at worst we open a
+        # file in whatever dir we landed in). Double-click = two presses on the
+        # same cell within the FM's double-click window.
+        send("echo FILEOPEN_BEGIN")
+        # Candidate file rows across the common fb modes. We hit a spread of
+        # cells; any that lands on a regular file fires the editor launch.
+        file_pts = [
+            ("7680","7700"), ("8400","7700"), ("7680","8350"),
+            ("12287","10267"), ("13000","10267"), ("12287","11100"),
+        ]
+        for cx, cy in file_pts:
+            # Two quick presses on the same cell = a double-click (open).
+            for _ in range(2):
+                send(f"echo '{cx} {cy} 1 0 1' > /dev/mouse")
+                time.sleep(0.15)
+                send(f"echo '{cx} {cy} 0 0 1' > /dev/mouse")
+                time.sleep(0.15)
+            time.sleep(0.3)
+        send("echo FILEOPEN_END")
+        time.sleep(1.5)
+        screendump("fileopen")
+
         # --- cat every live window scene back -------------------------
         send("echo DMG_BEGIN; cat /dev/wsys/damage; echo DMG_END")
         time.sleep(1.5)
@@ -317,6 +346,31 @@ else
     else
         echo "[termfm_gate] NOTE FM scene not captured this boot window (screendump authoritative)"
     fi
+fi
+
+# (F2) Clicking a FILE in the file manager LAUNCHES the editor on it. The
+# file manager prints "[hamedit] <path>" on the boot console before spawning
+# /bin/hameditscene (replacing the old "not a directory" no-op). The marker in
+# the serial log is the e2e proof a file click reached the editor. Pixel-clicks
+# are fb-mode-dependent, so this is a NOTE (the fast compile-wiring gate in
+# scripts/test_editor_picker_homedirs.sh HARD-locks the wiring).
+if grep -aqE '\[hamedit\] /' "$LOG"; then
+    hl=$(grep -aoE '\[hamedit\] /[^ ]*' "$LOG" | head -1)
+    echo "[termfm_gate] PASS a file click launched the editor ($hl)"
+elif grep -aq '\[hamfm\] editor spawn FAILED' "$LOG"; then
+    echo "[termfm_gate] FAIL file manager could not spawn the editor" >&2
+    fail=1
+else
+    echo "[termfm_gate] NOTE file-open marker not captured this boot window (a click may not have landed on a file row; wiring gate is authoritative)"
+fi
+
+# (F3) The launched editor renders. After a file click the editor window's
+# scene carries the "hamedit:" title glyph line. (Soft: depends on F2 landing
+# a file row this boot window.)
+if printf '%s' "$SCENES" | grep -aqE 'glyphs +[0-9]+ +[0-9]+ +"hamedit:'; then
+    echo "[termfm_gate] PASS the launched editor rendered its scene (hamedit: title)"
+else
+    echo "[termfm_gate] NOTE editor scene not captured this boot window (screendump authoritative)"
 fi
 
 echo "[termfm_gate] artifacts in $OUT_DIR"
