@@ -179,6 +179,17 @@ the Adder compiler reaches parity and can host it. Progress so far: 6 real
   array globals, classes/methods, for-loops, structs/member access, do-while,
   floats, `.modinfo`. Validate EVERY addition with `scripts/fuzz_adder.sh` (0
   miscompiles) + the differential mode vs the Python backend.
+  - **FLOATS — BLOCKED on an architectural decision (2026-06-21).** The frozen
+    oracle `codegen_x86.py` has NO floating point (`FloatLiteral` raises
+    `CodeGenError`); ARM64 also rejects floats. Nothing to "mirror," and the
+    differential gate uses the Python backend as a co-reference, so a
+    codegen.ad-only float impl can't be fuzz-proven and would break parity.
+    To unblock: implement floats in BOTH `codegen_x86.py` and `codegen.ad` (plus
+    the fuzzer oracle/emitter) IN LOCKSTEP — this overrides the "seed is FROZEN"
+    rule for net-new FP ground. See docs/subsystems/adder-compiler.md
+    "Floating point — parity blocker." All OTHER cutover constructs (multi-dim
+    array globals, classes/methods, loops, structs, do-while) are LANDED + fuzz-
+    proven; floats + by-value-struct-params/returns + multi-base are what remain.
 - [ ] **Build the `.ad` compiler as an `x86_64-linux` host binary** (via Track 1) so
   `adder_cc` runs on the host, compiling Adder→Hamnix at native speed — Python
   becomes a one-time SEED (correct, not fast; freeze its optimizer per the redirect).

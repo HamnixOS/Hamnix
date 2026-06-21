@@ -148,6 +148,44 @@ default-build cutover:** multi-base receiver-offset bump, by-value embedded
 struct fields, struct-typed params/returns by value, `for`-over-`Ptr[T]`,
 floats — each currently `cg_fail`s rather than miscompiling.
 
+### Floating point — parity blocker (2026-06-21 finding)
+
+The "add floats to `codegen.ad`" cutover item has a prerequisite the
+self-hosting strategy must resolve first: **`codegen_x86.py` (the frozen
+bootstrap seed / differential oracle) implements NO floating point.**
+`FloatLiteral` is imported but never dispatched in `gen_expr`; any `float32`/
+`float64` program raises `CodeGenError("x86: expression FloatLiteral not yet
+supported")`. The ARM64 backend (`codegen_arm64.py`) likewise rejects
+`float32`/`float64` (`type '...' not yet supported (Phase 1)`). So today both
+backends are at trivial FP parity (both reject), and the fuzzer generates no
+float traffic.
+
+There is therefore nothing to "mirror": no SSE/`movss`/`cvtsi2sd` instruction
+selection exists in the seed to copy. More importantly, the differential gate
+(`scripts/fuzz_adder_diff.sh --ad-codegen`) validates `codegen.ad` by running
+the SAME program through the Python backend as a co-reference (see
+`check_one_ad_codegen` -> `compile_and_run`). A `codegen.ad`-ONLY float
+implementation cannot be fuzz-proven: the Python backend would `crash` on every
+float program, so the gate can never reach the required "100% accepted, 100%
+correct." Adding floats to `codegen.ad` alone would also *break* the parity
+invariant (it would accept programs the seed rejects, with no oracle to check
+them).
+
+The value model is amenable to FP validation once unblocked: the fuzzer folds
+everything into one `uint64 g_accum`, and float results can be folded
+bit-exactly (reinterpret float bits / integer-derived floats) to dodge
+NaN/precision noise.
+
+**Resolution required (architectural, owner = self-hosting strategy):** floats
+must be implemented in BOTH `codegen_x86.py` AND `codegen.ad` IN LOCKSTEP (plus
+the oracle's IEEE-754 expected-value computation and the fuzzer's float-traffic
+emitter), so the differential oracle stays meaningful. The "`codegen_x86.py` is
+FROZEN" rule is about not perturbing behavior already used as the oracle;
+floats are net-new ground where there is no behavior to freeze. This is the
+only path that satisfies both "FULL parity with `codegen_x86.py`" and the
+fuzz-proven validation gate. Until that lockstep decision is taken, floats are
+intentionally left rejecting in both backends (parity preserved).
+
 ## Related docs
 
 - [../x86-backend.md](../x86-backend.md) — why hand-written, codegen contract.
