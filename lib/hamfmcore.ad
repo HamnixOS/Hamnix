@@ -1,0 +1,629 @@
+# lib/hamfmcore.ad
+#
+# SHARED file-manager BROWSE CORE (docs/de_scene_file_arch.md).
+#
+# This is the ONE directory-browse + icon-grid-render implementation used by
+# BOTH the real file manager app (user/hamfmscene.ad) AND the GtkFileChooser-
+# style file picker (lib/filepick.ad). Previously each of those carried its
+# own copy of the dir-walk / classify / navigate / render / hit-test logic;
+# that duplication is gone — they now both instantiate this core.
+#
+# WHAT LIVES HERE
+#   * the directory MODEL state (cur_path, names, name_len, is_dir,
+#     num_entries, has_up)
+#   * the dir-walk (load_dir + the Dir-record / name-stream paths)
+#   * directory classification (_probe_is_dir / _classify_entries)
+#   * navigation primitives (go_into, go_parent, set_cur_path)
+#   * the icon-grid PAINT body (fmc_paint) — folder/file icons, breadcrumb
+#     header, selection highlight, scrollbar. It paints into the CURRENT
+#     scene; it does NOT call hamscene_begin/commit, so each host brackets it
+#     at its own geometry (hamfm owns begin/commit for its window; the picker
+#     paints between the editor's begin/commit as an overlay).
+#   * pointer hit-test (fmc_cell_at) + scroll helpers
+#   * geometry/reflow (fmc_set_geometry recomputes columns + visible rows)
+#
+# The core is INPUT-AGNOSTIC: it exposes the model + navigation + hit-test;
+# each host wires its own input source (hamfm reads /event pointer lines; the
+# picker is key-driven from the editor's /dev/keys, and may also forward
+# pointer clicks). The core does NO file I/O beyond directory enumeration —
+# it never opens a file for reading/writing.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+from lib.p9 import p9_listdir, p9_chan_dir_mode, p9_dir_decode_at, \
+    DIR_CUR_QTYPE, DIR_CUR_NAME, DIR_CUR_NAME_LEN, P9_QTDIR
+from lib.hamui import hamscene_fill, hamscene_rect, hamscene_glyphs, \
+    hamscene_line, hamscene_icon_folder, hamscene_icon_file
+
+
+# --- window geometry / layout ----------------------------------------
+# Icon-grid layout (MATE/GNOME-style): each entry is a CELL with a folder or
+# document icon above and a (truncated) filename label below. Cells reflow
+# across the content width into rows. The content w/h are runtime vars
+# (fmc_w/fmc_h) set by the host via fmc_set_geometry so a resized/overlay
+# host reflows its icon grid columns and recomputes its visible rows.
+FMC_W: int32 = 300
+FMC_H: int32 = 240
+fmc_w: int32 = 300              # current content width  (px)
+fmc_h: int32 = 240             # current content height (px)
+FMC_HDR_H: int32 = 18           # blue breadcrumb header strip
+FMC_GRID_TOP: int32 = 22       # y of the first cell row
+FMC_CELL_W: int32 = 72         # cell footprint width
+FMC_CELL_H: int32 = 66         # cell footprint height (icon + label)
+FMC_ICON_W: int32 = 40         # icon box width inside a cell
+FMC_ICON_H: int32 = 36         # icon box height inside a cell
+FMC_ICON_TOP: int32 = 6        # icon y-offset within the cell
+FMC_LABEL_TOP: int32 = 46      # label y-offset within the cell
+FMC_GLYPH_W: int32 = 8         # hamscene_glyphs advance, px/glyph
+FMC_LABEL_MARGIN: int32 = 4    # left & right intra-cell margin
+# (FMC_CELL_W - 2*FMC_LABEL_MARGIN) / FMC_GLYPH_W = (72 - 8) / 8 = 8 glyphs.
+FMC_LABEL_CHARS: uint64 = 8
+
+# The breadcrumb header label ("hamfm: ", "Open: ", "Save in: ") is set by
+# the host so the SAME paint body serves the file manager and the picker.
+fmc_hdr_label: Array[16, uint8]
+fmc_hdr_label_len: uint64 = 0
+# When non-zero the paint body reserves a strip at the BOTTOM of the content
+# for the host to draw its own field (the picker's Name:/hint row); the grid
+# viewport shrinks by this many px so cells never paint under it.
+fmc_bottom_reserve: int32 = 0
+
+# Columns that fit across the content width (computed by fmc_set_geometry).
+fmc_cols: int32 = 3
+
+# --- vertical scroll -------------------------------------------------
+# The grid is scrolled by whole ROWS: scroll_row is the index of the topmost
+# VISIBLE grid row (0 = top). Rendering offsets every cell up by
+# scroll_row * FMC_CELL_H and the click hit-test adds scroll_row back.
+fmc_scroll_row: int64 = 0
+FMC_SCROLL_ROWS_PER_NOTCH: int64 = 1
+
+
+# Effective grid height = content height minus header minus any reserved
+# bottom strip.
+def _fmc_grid_h() -> int32:
+    h: int32 = fmc_h - fmc_bottom_reserve
+    if h < FMC_GRID_TOP + FMC_CELL_H:
+        h = FMC_GRID_TOP + FMC_CELL_H
+    return h
+
+
+# Rows of cells that fully fit in the grid viewport.
+def fmc_grid_visible_rows() -> int64:
+    avail: int32 = _fmc_grid_h() - FMC_GRID_TOP
+    rows: int32 = avail / FMC_CELL_H
+    if rows < 1:
+        rows = 1
+    return cast[int64](rows)
+
+
+# Total grid rows the current listing occupies (ceil(num_entries/cols)).
+def fmc_grid_total_rows() -> int64:
+    if fmc_n == 0:
+        return 0
+    c: int64 = cast[int64](fmc_cols)
+    if c < 1:
+        c = 1
+    return (cast[int64](fmc_n) + c - 1) / c
+
+
+# Largest legal scroll_row: total rows minus a viewport, never < 0.
+def fmc_max_scroll_row() -> int64:
+    m: int64 = fmc_grid_total_rows() - fmc_grid_visible_rows()
+    if m < 0:
+        m = 0
+    return m
+
+
+def fmc_clamp_scroll():
+    mx: int64 = fmc_max_scroll_row()
+    if fmc_scroll_row > mx:
+        fmc_scroll_row = mx
+    if fmc_scroll_row < 0:
+        fmc_scroll_row = 0
+
+
+# Set the content geometry + optional bottom-reserve strip, recompute the
+# icon-grid column count and clamp the scroll. Hosts call this at startup and
+# on resize. Returns 1 if the geometry changed.
+def fmc_set_geometry(nw: int64, nh: int64, bottom_reserve: int32) -> int32:
+    if nw < FMC_CELL_W:
+        nw = FMC_CELL_W
+    if nh < FMC_GRID_TOP + FMC_CELL_H:
+        nh = FMC_GRID_TOP + FMC_CELL_H
+    changed: int32 = 0
+    if cast[int32](nw) != fmc_w or cast[int32](nh) != fmc_h:
+        changed = 1
+    if bottom_reserve != fmc_bottom_reserve:
+        changed = 1
+    fmc_w = cast[int32](nw)
+    fmc_h = cast[int32](nh)
+    fmc_bottom_reserve = bottom_reserve
+    nc: int32 = (fmc_w - 4) / FMC_CELL_W
+    if nc < 1:
+        nc = 1
+    fmc_cols = nc
+    fmc_clamp_scroll()
+    return changed
+
+
+# Set the breadcrumb header label (e.g. "hamfm: ", "Open: ", "Save in: ").
+def fmc_set_header(label: Ptr[uint8]):
+    i: uint64 = 0
+    while label[i] != 0 and i < 15:
+        fmc_hdr_label[i] = label[i]
+        i = i + 1
+    fmc_hdr_label[i] = 0
+    fmc_hdr_label_len = i
+
+
+# Scroll the grid by one wheel notch (dz > 0 = up/toward top, dz < 0 = down).
+# Returns 1 if the scroll position changed.
+def fmc_wheel(dz: int64) -> int32:
+    old: int64 = fmc_scroll_row
+    if dz > 0:
+        fmc_scroll_row = fmc_scroll_row - FMC_SCROLL_ROWS_PER_NOTCH
+    elif dz < 0:
+        fmc_scroll_row = fmc_scroll_row + FMC_SCROLL_ROWS_PER_NOTCH
+    fmc_clamp_scroll()
+    if fmc_scroll_row != old:
+        return 1
+    return 0
+
+
+# Ensure the selected cell is within the visible viewport (key-nav follow).
+def fmc_scroll_to(idx: int64):
+    if idx < 0:
+        return
+    c: int64 = cast[int64](fmc_cols)
+    if c < 1:
+        c = 1
+    row: int64 = idx / c
+    vis: int64 = fmc_grid_visible_rows()
+    if row < fmc_scroll_row:
+        fmc_scroll_row = row
+    if row >= fmc_scroll_row + vis:
+        fmc_scroll_row = row - vis + 1
+    fmc_clamp_scroll()
+
+
+# --- selection -------------------------------------------------------
+fmc_sel: int64 = -1            # selected cell index, or -1
+
+
+def fmc_select(idx: int64):
+    fmc_sel = idx
+
+
+# Live column count of the icon grid (for row-wise key navigation).
+def fmc_grid_cols() -> int64:
+    return cast[int64](fmc_cols)
+
+
+def fmc_selected() -> int64:
+    return fmc_sel
+
+
+# --- directory model -------------------------------------------------
+FMC_MAX_ENTRIES: uint64 = 256
+FMC_NAME_CAP: uint64 = 48
+FMC_LIST_CAP: uint64 = 32768
+FMC_PATH_CAP: uint64 = 512
+
+fmc_cur_path: Array[512, uint8]
+fmc_cur_path_len: uint64 = 0
+
+fmc_list_buf: Array[32768, uint8]
+fmc_names: Array[12288, uint8]           # FMC_MAX_ENTRIES * FMC_NAME_CAP
+fmc_name_len: Array[256, uint64]
+fmc_is_dir: Array[256, int32]
+fmc_n: uint64 = 0
+fmc_has_up: int32 = 0          # row 0 is a synthetic ".."
+
+fmc_full_path: Array[576, uint8]
+
+
+def fmc_name_ptr(i: uint64) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](&fmc_names[0]) + i * FMC_NAME_CAP)
+
+
+# --- accessors (hosts read the model through these) ------------------
+def fmc_num_entries() -> uint64:
+    return fmc_n
+
+
+def fmc_has_up_entry() -> int32:
+    return fmc_has_up
+
+
+def fmc_entry_is_dir(i: uint64) -> int32:
+    return fmc_is_dir[i]
+
+
+def fmc_cur_path_ptr() -> Ptr[uint8]:
+    return &fmc_cur_path[0]
+
+
+def fmc_entry_name_len(i: uint64) -> uint64:
+    return fmc_name_len[i]
+
+
+# Build the absolute path of entry i into fmc_full_path and return it.
+def fmc_full_path_ptr(i: uint64) -> Ptr[uint8]:
+    fmc_build_full_path(i)
+    return &fmc_full_path[0]
+
+
+def fmc_set_cur_path(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and i < FMC_PATH_CAP - 1:
+        fmc_cur_path[i] = s[i]
+        i = i + 1
+    if i == 0:
+        fmc_cur_path[0] = 47
+        i = 1
+    fmc_cur_path[i] = 0
+    fmc_cur_path_len = i
+
+
+def fmc_build_full_path(i: uint64):
+    j: uint64 = 0
+    while j < fmc_cur_path_len and j < FMC_PATH_CAP:
+        fmc_full_path[j] = fmc_cur_path[j]
+        j = j + 1
+    if j == 0 or fmc_full_path[j - 1] != 47:
+        fmc_full_path[j] = 47
+        j = j + 1
+    nl: uint64 = fmc_name_len[i]
+    p: Ptr[uint8] = fmc_name_ptr(i)
+    k: uint64 = 0
+    while k < nl and j < 575:
+        fmc_full_path[j] = p[k]
+        j = j + 1
+        k = k + 1
+    fmc_full_path[j] = 0
+
+
+def _fmc_store_entry(src: Ptr[uint8], nl: uint64, dir_flag: int32):
+    if fmc_n >= FMC_MAX_ENTRIES:
+        return
+    store: uint64 = nl
+    if store > FMC_NAME_CAP - 1:
+        store = FMC_NAME_CAP - 1
+    dst: Ptr[uint8] = fmc_name_ptr(fmc_n)
+    k: uint64 = 0
+    while k < store:
+        dst[k] = src[k]
+        k = k + 1
+    dst[store] = 0
+    fmc_name_len[fmc_n] = store
+    fmc_is_dir[fmc_n] = dir_flag
+    fmc_n = fmc_n + 1
+
+
+# Reliable directory test that needs NO kernel change: open the path and try
+# to flip its fd into Dir-record mode. p9_chan_dir_mode succeeds ONLY on a
+# DEV_DIR_FILE chan (a real directory).
+def _fmc_probe_is_dir(path: Ptr[char]) -> int32:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return 0
+    rc: int32 = p9_chan_dir_mode(fd, 1, path)
+    sys_close(fd)
+    if rc == 0:
+        return 1
+    return 0
+
+
+# Keep one entry unless it is the kernel's own "." / ".." record (we draw our
+# own synthetic Up). Returns 1 if it was stored.
+def _fmc_maybe_store(src: Ptr[uint8], nl: uint64, dir_flag: int32) -> int32:
+    if nl == 0:
+        return 0
+    if nl == 1 and src[0] == 46:                    # "."
+        return 0
+    if nl == 2 and src[0] == 46 and src[1] == 46:   # ".."
+        return 0
+    _fmc_store_entry(src, nl, dir_flag)
+    return 1
+
+
+# Fallback lister for backings without Dir-record mode: a plain "NAME\n"
+# stream (p9_listdir). Every entry is marked NON-directory (safe).
+def _fmc_load_namestream():
+    n: int64 = p9_listdir(cast[Ptr[char]](&fmc_cur_path[0]),
+                          &fmc_list_buf[0], FMC_LIST_CAP)
+    if n < 0:
+        return
+    nu: uint64 = cast[uint64](n)
+    i: uint64 = 0
+    while i < nu:
+        c: uint8 = fmc_list_buf[i]
+        if c == 10 or c == 0:
+            i = i + 1
+            continue
+        j: uint64 = i
+        while j < nu:
+            d: uint8 = fmc_list_buf[j]
+            if d == 10 or d == 0:
+                break
+            j = j + 1
+        _fmc_maybe_store(&fmc_list_buf[i], j - i, 0)
+        i = j + 1
+    _fmc_classify_entries()
+
+
+# List the current directory and classify each entry. Row 0 is a synthetic
+# ".." Up entry whenever we are not at the filesystem root.
+def fmc_load_dir():
+    fmc_n = 0
+    fmc_has_up = 0
+    fmc_sel = -1
+    if fmc_cur_path_len > 1:
+        _fmc_store_entry(cast[Ptr[uint8]](".."), 2, 1)
+        fmc_has_up = 1
+    fd: int32 = sys_open(cast[Ptr[char]](&fmc_cur_path[0]))
+    if fd < 0:
+        return
+    if p9_chan_dir_mode(fd, 1, cast[Ptr[char]](&fmc_cur_path[0])) != 0:
+        sys_close(fd)
+        _fmc_load_namestream()
+        return
+    total: uint64 = 0
+    while total < FMC_LIST_CAP:
+        slice_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&fmc_list_buf[0]) + total)
+        n: int64 = sys_read(fd, slice_ptr, FMC_LIST_CAP - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    off: uint64 = 0
+    while off < total:
+        rl: uint64 = p9_dir_decode_at(&fmc_list_buf[0], off, total)
+        if rl == 0:
+            break
+        dir_flag: int32 = 0
+        if (DIR_CUR_QTYPE & P9_QTDIR) != 0:
+            dir_flag = 1
+        _fmc_maybe_store(&DIR_CUR_NAME[0], DIR_CUR_NAME_LEN, dir_flag)
+        off = off + rl
+    _fmc_classify_entries()
+
+
+# Override each (non-Up) entry's is_dir with the reliable open-probe (the
+# cpio rootfs reports every entry as QTFILE).
+def _fmc_classify_entries():
+    r: uint64 = 0
+    if fmc_has_up != 0:
+        r = 1
+    while r < fmc_n:
+        fmc_build_full_path(r)
+        fmc_is_dir[r] = _fmc_probe_is_dir(cast[Ptr[char]](&fmc_full_path[0]))
+        r = r + 1
+
+
+# Descend into entry i (must be a directory). cur_path <- full_path.
+def fmc_go_into(i: uint64):
+    fmc_sel = -1
+    fmc_scroll_row = 0
+    fmc_build_full_path(i)
+    fmc_set_cur_path(cast[Ptr[uint8]](&fmc_full_path[0]))
+    fmc_load_dir()
+
+
+def fmc_go_parent():
+    fmc_sel = -1
+    fmc_scroll_row = 0
+    if fmc_cur_path_len <= 1:
+        return
+    n: uint64 = fmc_cur_path_len
+    if fmc_cur_path[n - 1] == 47:
+        n = n - 1
+    while n > 1 and fmc_cur_path[n - 1] != 47:
+        n = n - 1
+    if n > 1:
+        n = n - 1
+    if n == 0:
+        n = 1
+    fmc_cur_path[n] = 0
+    fmc_cur_path_len = n
+    fmc_load_dir()
+
+
+# --- cell geometry / labels ------------------------------------------
+def fmc_cell_x(i: uint64) -> int32:
+    col: int32 = cast[int32](i) % fmc_cols
+    return 4 + col * FMC_CELL_W
+
+
+def fmc_cell_y(i: uint64) -> int32:
+    row: int32 = cast[int32](i) / fmc_cols
+    row = row - cast[int32](fmc_scroll_row)
+    return FMC_GRID_TOP + row * FMC_CELL_H
+
+
+# Coarse file-class tint by filename extension.
+def _fmc_file_tint(i: uint64) -> Ptr[uint8]:
+    nl: uint64 = fmc_name_len[i]
+    p: Ptr[uint8] = fmc_name_ptr(i)
+    dot: int64 = -1
+    k: uint64 = 0
+    while k < nl:
+        if p[k] == 46:
+            dot = cast[int64](k)
+        k = k + 1
+    if dot < 0:
+        return cast[Ptr[uint8]]("#ffffff")
+    e: uint64 = cast[uint64](dot) + 1
+    ext: Array[6, uint8]
+    el: uint64 = 0
+    while e < nl and el < 5:
+        c: uint8 = p[e]
+        if c >= 65 and c <= 90:
+            c = c + 32
+        ext[el] = c
+        el = el + 1
+        e = e + 1
+    ext[el] = 0
+    if (ext[0] == 103 and ext[1] == 122) or \
+       (ext[0] == 122 and ext[1] == 105 and ext[2] == 112) or \
+       (ext[0] == 116 and ext[1] == 97 and ext[2] == 114) or \
+       (ext[0] == 120 and ext[1] == 122):
+        return cast[Ptr[uint8]]("#efe2c4")             # tan
+    if (ext[0] == 112 and ext[1] == 110 and ext[2] == 103) or \
+       (ext[0] == 106 and ext[1] == 112 and ext[2] == 103) or \
+       (ext[0] == 98 and ext[1] == 109 and ext[2] == 112) or \
+       (ext[0] == 103 and ext[1] == 105 and ext[2] == 102):
+        return cast[Ptr[uint8]]("#d6e6f2")             # bluish
+    if (ext[0] == 115 and ext[1] == 104) or \
+       (ext[0] == 97 and ext[1] == 100) or \
+       (ext[0] == 112 and ext[1] == 121) or \
+       (ext[0] == 107 and ext[1] == 111):
+        return cast[Ptr[uint8]]("#dcefd6")             # greenish
+    return cast[Ptr[uint8]]("#ffffff")                 # plain text/paper
+
+
+# Build the truncated label for cell `i` into `out` (NUL-terminated). The Up
+# cell ("..") gets the literal "../"; everything else is truncated with a
+# trailing ".." ellipsis.
+def _fmc_cell_label(i: uint64, out: Ptr[uint8]):
+    nl: uint64 = fmc_name_len[i]
+    src: Ptr[uint8] = fmc_name_ptr(i)
+    if fmc_has_up != 0 and i == 0:
+        out[0] = 46
+        out[1] = 46
+        out[2] = 47
+        out[3] = 0
+        return
+    rp: uint64 = 0
+    if nl <= FMC_LABEL_CHARS:
+        while rp < nl:
+            out[rp] = src[rp]
+            rp = rp + 1
+    else:
+        while rp < FMC_LABEL_CHARS - 2:
+            out[rp] = src[rp]
+            rp = rp + 1
+        out[rp] = 46
+        rp = rp + 1
+        out[rp] = 46
+        rp = rp + 1
+    out[rp] = 0
+
+
+# --- icon-grid PAINT body --------------------------------------------
+# Paint the breadcrumb header + icon grid + scrollbar into the CURRENT scene.
+# It does NOT call hamscene_begin/commit — each host brackets it. The header
+# text is "<fmc_hdr_label><cur_path>". The grid honours the bottom-reserve so
+# a host can draw its own field below.
+def fmc_paint():
+    fmc_clamp_scroll()
+    # Content background (light file-manager canvas).
+    hamscene_fill(0, 0, fmc_w, fmc_h, cast[Ptr[uint8]]("#f6f5f3"))
+    # Breadcrumb header strip showing the label + current path.
+    hamscene_rect(0, 0, fmc_w, FMC_HDR_H, cast[Ptr[uint8]]("#3a6ea5"))
+    hdr: Array[96, uint8]
+    hp: uint64 = 0
+    a: uint64 = 0
+    while a < fmc_hdr_label_len and hp < 80:
+        hdr[hp] = fmc_hdr_label[a]
+        hp = hp + 1
+        a = a + 1
+    pn: uint64 = fmc_cur_path_len
+    if pn > 70:
+        pn = 70
+    b: uint64 = 0
+    while b < pn and hp < 94:
+        hdr[hp] = fmc_cur_path[b]
+        hp = hp + 1
+        b = b + 1
+    hdr[hp] = 0
+    hamscene_glyphs(4, 4, &hdr[0], cast[Ptr[uint8]]("#ffffff"))
+    grid_bot: int32 = fmc_h - fmc_bottom_reserve
+    r: uint64 = 0
+    while r < fmc_n:
+        cx: int32 = fmc_cell_x(r)
+        cy: int32 = fmc_cell_y(r)
+        if cy + FMC_CELL_H <= FMC_GRID_TOP:
+            r = r + 1
+            continue
+        if cy >= grid_bot:
+            r = r + 1
+            continue
+        # Selection highlight rect behind the selected cell.
+        if fmc_sel >= 0 and cast[uint64](fmc_sel) == r:
+            hamscene_fill(cx, cy, FMC_CELL_W - 4, FMC_CELL_H - 2,
+                          cast[Ptr[uint8]]("#cfe0f4"))
+            hamscene_line(cx, cy, cx + FMC_CELL_W - 5, cy, 1,
+                          cast[Ptr[uint8]]("#5f86c4"))
+            hamscene_line(cx, cy + FMC_CELL_H - 3, cx + FMC_CELL_W - 5,
+                          cy + FMC_CELL_H - 3, 1, cast[Ptr[uint8]]("#5f86c4"))
+            hamscene_line(cx, cy, cx, cy + FMC_CELL_H - 3, 1,
+                          cast[Ptr[uint8]]("#5f86c4"))
+            hamscene_line(cx + FMC_CELL_W - 5, cy, cx + FMC_CELL_W - 5,
+                          cy + FMC_CELL_H - 3, 1, cast[Ptr[uint8]]("#5f86c4"))
+        ix: int32 = cx + (FMC_CELL_W - 4 - FMC_ICON_W) / 2
+        iy: int32 = cy + FMC_ICON_TOP
+        if fmc_is_dir[r] != 0:
+            hamscene_icon_folder(ix, iy, FMC_ICON_W, FMC_ICON_H)
+        else:
+            hamscene_icon_file(ix, iy, FMC_ICON_W, FMC_ICON_H,
+                               _fmc_file_tint(r))
+        lbl: Array[16, uint8]
+        _fmc_cell_label(r, &lbl[0])
+        lx: int32 = cx + 4
+        ly: int32 = cy + FMC_LABEL_TOP
+        lcol: Ptr[uint8] = cast[Ptr[uint8]]("#202020")
+        if fmc_is_dir[r] != 0:
+            lcol = cast[Ptr[uint8]]("#1a4a8a")
+        hamscene_glyphs(lx, ly, &lbl[0], lcol)
+        r = r + 1
+    # Scrollbar indicator.
+    total_rows: int64 = fmc_grid_total_rows()
+    vis_rows: int64 = fmc_grid_visible_rows()
+    if total_rows > vis_rows:
+        track_x: int32 = fmc_w - 5
+        track_y: int32 = FMC_GRID_TOP
+        track_h: int32 = grid_bot - FMC_GRID_TOP - 2
+        if track_h < 8:
+            track_h = 8
+        hamscene_rect(track_x, track_y, 3, track_h,
+                      cast[Ptr[uint8]]("#d8d6d2"))
+        thumb_h: int32 = cast[int32](
+            cast[int64](track_h) * vis_rows / total_rows)
+        if thumb_h < 8:
+            thumb_h = 8
+        if thumb_h > track_h:
+            thumb_h = track_h
+        span: int32 = track_h - thumb_h
+        mx_sr: int64 = fmc_max_scroll_row()
+        thumb_off: int32 = 0
+        if mx_sr > 0:
+            thumb_off = cast[int32](cast[int64](span) * fmc_scroll_row / mx_sr)
+        hamscene_rect(track_x, track_y + thumb_off, 3, thumb_h,
+                      cast[Ptr[uint8]]("#8a8884"))
+
+
+# Map a content-local click (lx,ly) to a grid cell index, or -1. Clicks below
+# the grid viewport (in the host's reserved strip) return -1.
+def fmc_cell_at(lx: int64, ly: int64) -> int64:
+    if ly < cast[int64](FMC_GRID_TOP):
+        return -1
+    if ly >= cast[int64](fmc_h - fmc_bottom_reserve):
+        return -1
+    if lx < 4:
+        return -1
+    col: int64 = (lx - 4) / cast[int64](FMC_CELL_W)
+    if col >= cast[int64](fmc_cols):
+        return -1
+    vrow: int64 = (ly - cast[int64](FMC_GRID_TOP)) / cast[int64](FMC_CELL_H)
+    row: int64 = vrow + fmc_scroll_row
+    idx: int64 = row * cast[int64](fmc_cols) + col
+    if idx < 0:
+        return -1
+    if idx >= cast[int64](fmc_n):
+        return -1
+    return idx

@@ -54,6 +54,7 @@ ED=user/hameditscene.ad
 
 # --- 3. File-picker wiring (now the shared lib/filepick.ad SERVICE) ---
 LIB=lib/filepick.ad
+FM_APP=user/hamfmscene.ad
 grep -q "from lib.filepick import" "$ED" \
     && passed "hameditscene imports the shared lib.filepick service" \
     || failed "hameditscene missing lib.filepick import"
@@ -63,6 +64,36 @@ grep -q "from lib.filepick import" "$ED" \
 [ -f "$LIB" ] \
     && passed "lib/filepick.ad shared picker service exists" \
     || failed "lib/filepick.ad MISSING"
+
+# --- 3a. UNIFIED browse core (lib/hamfmcore.ad) -----------------------
+# The directory-browse + icon-grid render is ONE implementation shared by
+# the file manager AND the picker. Neither file may re-roll its own dir-walk
+# or icon grid: both must drive lib/hamfmcore.ad.
+CORE=lib/hamfmcore.ad
+[ -f "$CORE" ] \
+    && passed "lib/hamfmcore.ad shared browse core exists" \
+    || failed "lib/hamfmcore.ad MISSING (core not factored out)"
+for sym in "fmc_load_dir" "fmc_paint" "fmc_cell_at" "fmc_go_into" \
+           "fmc_go_parent" "fmc_set_geometry"; do
+    grep -q "def ${sym}\b" "$CORE" \
+        && passed "browse core exports ${sym}" \
+        || failed "browse core missing ${sym}"
+done
+# The picker must REUSE the core's icon-grid paint, not its own list render.
+grep -q "from lib.hamfmcore import" "$LIB" \
+    && passed "picker drives the shared browse core" \
+    || failed "picker does NOT import lib.hamfmcore (still reimplemented)"
+grep -q "fmc_paint" "$LIB" \
+    && passed "picker renders the SHARED icon grid (fmc_paint)" \
+    || failed "picker not rendering the shared icon grid"
+# The file manager must ALSO drive the same core (no duplicated dir-walk).
+grep -q "from lib.hamfmcore import" "$FM_APP" \
+    && passed "file manager drives the shared browse core" \
+    || failed "file manager does NOT import lib.hamfmcore"
+# The OLD bespoke duplication must be GONE from the picker.
+grep -q "def _fp_load\b" "$LIB" \
+    && failed "picker still carries its OWN dir-walk (_fp_load not removed)" \
+    || passed "picker's duplicated dir-walk removed (uses the core)"
 for sym in "filepick_open" "filepick_active" "filepick_emit" \
            "filepick_handle_code" "filepick_take_result" \
            "filepick_result_path" "filepick_result_mode"; do
