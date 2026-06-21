@@ -51,6 +51,19 @@ else
     fail=1
 fi
 
+# (C4) EXISTENCE GATE: spawn_resolved must probe each candidate path with
+# _path_execable before spawning, so a MISSING binary resolves to -1 and the
+# not-found message actually fires. Without this the kernel spawn() returns a
+# pid for a missing path (exec fails only in the child), the not-found path is
+# skipped, and a bogus command runs silently — the exact "unknown commands are
+# silent" bug in the DE terminal.
+if grep -aq 'def _path_execable' "$SH" && grep -aq '_path_execable(' "$SH"; then
+    echo "[cnf_gate] PASS spawn existence-gate (_path_execable) present — missing binary -> not-found"
+else
+    echo "[cnf_gate] FAIL _path_execable existence-gate missing — bogus commands run silently" >&2
+    fail=1
+fi
+
 if [ "$fail" = "0" ]; then
     echo "[cnf_gate] RESULT: PASS"
     exit 0
