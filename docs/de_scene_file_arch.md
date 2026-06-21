@@ -423,6 +423,44 @@ created/committed a window (namespace/`newwindow` path); `live_windows>0
 presented=0` ⇒ rasterized but not z-blitted; `presented>0` with a blank
 panel ⇒ the direct-scanout flush mis-handles the real GOP stride/format.
 
+## 16b. Memory budget — why the DE needs ALL free RAM fed to memblock
+
+The runlevel-5 desktop is a swarm of native scene clients (hamdesktop,
+hampanelscene, hamfmscene, hamcalcscene, hamsh, the text editor, …), each
+an Adder ELF image (~10 MiB for the big hamUI-linked binaries) plus a user
+stack, page tables, and a brk reserve. Loaded back-to-back at the rl5 flip,
+**after** the ~378 MiB in-RAM live-root ramdisk has already been streamed
+into RAM, their combined demand can exceed a single firmware free-RAM
+block.
+
+The failure mode is NOT a page-fault permission bug — it is an OOM. When
+`region_alloc()` (the freeable large-region allocator backing ELF image
+loads) returns 0, `_load_elf64` logs `elf: OOM`, `do_execve` logs
+`execve: ELF load of '/bin/<client>' failed`, and that scene client never
+starts. Under `-enable-kvm -cpu host` this surfaced as a desktop with the
+text-editor + calculator but **no panel, no desktop icons, no file
+manager** — the trailing clients in the spawn order were exactly the ones
+that OOM'd.
+
+**Root cause + fix (mm/memblock.ad + arch/x86/kernel/e820.ad):** memblock
+was a single-region bump allocator fed only the *largest*
+EfiConventionalMemory block (~462 MiB usable above the kernel on a 1 GiB
+OVMF guest). UEFI/OVMF fragments installed RAM across several CONV blocks,
+walled off by the LoaderData live-root ramdisk and BootServices runs.
+memblock is now an ordered list of free regions (`memblock_add_region`);
+`memblock_alloc` bumps through each region and spills into the next, and
+the EFI walker (`_efi_mmap_feed_extra`) feeds every additional free-RAM
+block ≥ 1 MiB below the 4 GiB identity-map ceiling. This roughly doubled
+the free pool (462 → 860 MiB on the reference guest) and the full desktop
+renders. The fault-resolution contract below is unchanged — a write to a
+page under a PROT_WRITE VMA is resolved (COW / demand-fill / stale-RO
+re-stamp); only genuinely-illegal writes deliver SIGSEGV.
+
+**Gate:** `scripts/test_de_visual.sh` boots the shipped installer image
+under `-enable-kvm -cpu host` and asserts (via the structural screendump
+analyzer) that a panel bar **and** an app window render — a blank-green or
+panel-less frame FAILS. This is the regression guard for the OOM.
+
 ## 17. Open questions
 
 - **Resize semantics:** does the WM resize re-rasterize content at the new
