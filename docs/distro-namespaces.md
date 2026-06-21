@@ -242,6 +242,80 @@ terminal (`echo`, `cat /PROVENANCE`, `ls /` all run inside the
    hamsh-resolution defect — busybox (static-PIE, no `PT_INTERP`)
    sidesteps it, which is why busybox `sh` is the interactivity gate.
 
+## Stock-Debian binary coverage
+
+With version-agnostic lib staging (the `lib*.so*` glob, see
+[Shared-object loading](#shared-object-loading-ldso-mmap-path)) and the
+recursive `PT_INTERP` loader, a broad set of REAL Debian ELFs run
+unmodified inside `enter linux { … }` and produce correct output:
+
+| Binary | NEEDED closure | Status |
+| --- | --- | --- |
+| `/bin/dash` (`/bin/sh`) | `libc` | runs |
+| `/bin/bash` | `libtinfo`, `libc` | runs (`$BASH_VERSION` prints) |
+| `/bin/cat`, `/bin/ls`, `/usr/bin/wc`, `/usr/bin/sort`, `/usr/bin/head` | `libc` (+`libselinux`/`libpcre2`/`libacl` for some) | run |
+| `/usr/bin/dpkg`, `/usr/bin/dpkg-deb`, `/usr/bin/dpkg-query` | `libmd`, `libz`, `liblzma`, `libzstd`, `libbz2`, `libselinux`, `libc` | run |
+| `/usr/bin/apt`, `/usr/bin/apt-get` | `libapt-pkg`, `libapt-private`, `libstdc++`, `libsystemd`, `libcrypto`, … | run |
+| `/usr/bin/tar`, `/bin/gzip` | `libacl`, `libselinux`, `libc` | run (dpkg unpack forks them) |
+
+`dash` carries the same `libc`-only closure dpkg does, so it ran as soon
+as dpkg did; `bash` only additionally needs `libtinfo.so.6`, which the
+`lib*.so*` glob stages automatically. There was no remaining shared-object
+mmap gap to fix for the shells — the version-agnostic glob is what closed
+it. The sweep is gated by `scripts/test_linux_debian_coverage.sh` (Part A).
+
+## Offline package install (`apt-get install` / `dpkg -i`)
+
+The Linux namespace has **no routed network** to `deb.debian.org`, so real
+package installation is proven against a **local `file://` apt repo**
+staged inside the Debian root by `scripts/build_local_apt_repo.sh`:
+
+```
+/opt/localrepo/
+    pool/main/h/hamhello/hamhello_1.0_amd64.deb
+    dists/local/main/binary-amd64/Packages(.gz)
+    dists/local/Release
+/etc/apt/sources.list.d/local.list   ->  deb [trusted=yes] file:///opt/localrepo local main
+/var/cache/apt/archives/hamhello_1.0_amd64.deb   (copy for the dpkg -i short path)
+```
+
+`hamhello` is a dependency-free leaf whose installed program
+`/usr/bin/hamhello` prints the unique marker
+`HAMHELLO_INSTALLED_AND_RAN_OK`. Two install paths are exercised:
+
+```hamsh
+hamsh$ enter linux { /usr/bin/apt-get update }
+hamsh$ enter linux { /usr/bin/apt-get install -y --no-download hamhello }
+hamsh$ enter linux { /usr/bin/hamhello }            # -> HAMHELLO_INSTALLED_AND_RAN_OK
+```
+
+The `apt-get install` fork chain is `apt-get → /usr/lib/apt/methods/file`
+(fetch the `.deb` off the repo) `→ dpkg --unpack → dpkg-deb (→ tar →
+gzip) →` coreutils (`rm`/`mv`/`cp`/`mkdir`/`chmod`/…) for the filesystem
+install. The shorter `dpkg -i` path (`dpkg → dpkg-deb → tar → gzip`) is
+exercised as an independent fallback:
+
+```hamsh
+hamsh$ enter linux { /usr/bin/dpkg -i /var/cache/apt/archives/hamhello_1.0_amd64.deb }
+hamsh$ enter linux { /usr/bin/hamhello }            # -> HAMHELLO_INSTALLED_AND_RAN_OK
+```
+
+Both the install closure (apt `file`/`copy` methods, dpkg helpers,
+`tar`/`gzip`, the coreutils set, `bash`) and the localrepo subtree are
+staged into the `-kernel` cpio by `build_initramfs.py`'s
+`REAL_DEBIAN_FILES` slice; the installer-image live `#distro`
+FULL-mirrors the whole fixture (`build_rootfs_img.py`), so the repo rides
+into that path automatically (the `var/cache` copy is pruned there, but
+the pool `.deb` the apt path needs is kept). Per the **MINIMAL** mandate
+the base tree stays debootstrap-minbase — `apt-get install` from the local
+repo is the on-demand add path, not a fat golden image.
+
+Regenerate the repo on any host that has run `BUILD.sh`:
+
+```sh
+bash scripts/build_local_apt_repo.sh   # idempotent; needs dpkg-deb + gzip
+```
+
 ## Phase placement
 
 Depends on Phase C (rfork RFNAMEG + bind + mount syscalls). Lands as
@@ -373,6 +447,12 @@ This phase lands green when all of the following pass:
    smoke test.
 3. `bash scripts/test_linux_apt_install.sh` — real Debian apt/dpkg
    running inside `enter linux { ... }` against the rootfs partition.
+4. `bash scripts/test_linux_debian_coverage.sh` — the stock-Debian
+   binary coverage sweep (Part A: dash/bash/coreutils/dpkg/apt run
+   correctly) plus offline `apt-get install` / `dpkg -i` of `hamhello`
+   from the local `file://` repo, then running the installed binary
+   (Part B). Requires `scripts/build_local_apt_repo.sh` to have staged
+   the repo (it runs it automatically).
 
 ## References
 
