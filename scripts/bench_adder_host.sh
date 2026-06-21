@@ -24,6 +24,13 @@ SRC="tests/bench"
 WORK="build/bench_host"
 REPS="${BENCH_REPS:-3}"
 SKIP_PY="${BENCH_SKIP_PYTHON:-0}"
+# BENCH_OPT selects the Adder optimization level: 0 = trusted single-pass
+# (baseline), 1 = -O1 peephole optimizer (Track 6). The cross-language
+# AGREEMENT check runs at whichever level is selected, so a bad optimization
+# fails the bench before any timing is reported.
+BENCH_OPT="${BENCH_OPT:-0}"
+OPT_ARGS=""
+[ "$BENCH_OPT" != "0" ] && OPT_ARGS="-O $BENCH_OPT"
 
 fail() { echo "[bench] FAIL $*"; exit 1; }
 command -v as  >/dev/null 2>&1 || fail "as not found (apt install binutils)"
@@ -47,10 +54,10 @@ besttime() {
     echo "$best"
 }
 
-echo "[bench] compiling + correctness check"
+echo "[bench] compiling + correctness check (Adder -O$BENCH_OPT)"
 for n in $BENCHES; do
     [ -f "$SRC/$n.ad" ] || fail "missing $SRC/$n.ad"
-    python3 -m compiler.adder compile --target=x86_64-linux "$SRC/$n.ad" \
+    python3 -m compiler.adder compile --target=x86_64-linux $OPT_ARGS "$SRC/$n.ad" \
         -o "$WORK/${n}_adder" >/dev/null 2>"$WORK/$n.cerr" \
         || { cat "$WORK/$n.cerr"; fail "adder compile $n"; }
     gcc -O0 "$SRC/$n.c" -o "$WORK/${n}_c_O0" || fail "gcc -O0 $n"

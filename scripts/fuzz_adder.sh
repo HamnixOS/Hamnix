@@ -34,6 +34,13 @@ cd "$PROJ_ROOT"
 
 FUZZ_COUNT="${FUZZ_COUNT:-500}"
 FUZZ_SEED="${FUZZ_SEED:-1}"
+# FUZZ_OPT=1 compiles every program (regression + fuzz batch) through the -O1
+# peephole optimizer (Track 6) instead of the trusted single-pass backend.
+# The predicted-output oracle is identical, so any disagreement is an
+# OPTIMIZER-INTRODUCED miscompile. Default 0 keeps CI on the trusted path.
+FUZZ_OPT="${FUZZ_OPT:-0}"
+OPT_ARGS=""
+[ "$FUZZ_OPT" != "0" ] && OPT_ARGS="-O $FUZZ_OPT"
 WORK="$PROJ_ROOT/build/fuzz_adder"
 
 fail() { echo "[fuzz_adder] FAIL $*"; exit 1; }
@@ -47,9 +54,9 @@ command -v gcc >/dev/null 2>&1 || fail "gcc not found (preprocesses linux-runtim
 mkdir -p "$WORK"
 
 # ---- Phase 1: regression fixture ---------------------------------------
-echo "[fuzz_adder] regression: tests/fuzz/regress_codegen.ad"
+echo "[fuzz_adder] regression: tests/fuzz/regress_codegen.ad (opt=$FUZZ_OPT)"
 REG_ELF="$WORK/regress.elf"
-python3 -m compiler.adder compile --target=x86_64-linux \
+python3 -m compiler.adder compile --target=x86_64-linux $OPT_ARGS \
     tests/fuzz/regress_codegen.ad -o "$REG_ELF" >/dev/null 2>"$WORK/reg.cerr" \
     || { cat "$WORK/reg.cerr"; fail "regression fixture failed to compile"; }
 REG_OUT="$("$REG_ELF")"
@@ -62,9 +69,9 @@ REG_EXPECT="2021429896"
 echo "[fuzz_adder] regression OK (value=$REG_OUT exit=$REG_RC)"
 
 # ---- Phase 2: seeded fuzz batch ----------------------------------------
-echo "[fuzz_adder] fuzz: count=$FUZZ_COUNT seed=$FUZZ_SEED"
+echo "[fuzz_adder] fuzz: count=$FUZZ_COUNT seed=$FUZZ_SEED opt=$FUZZ_OPT"
 python3 tests/fuzz/adder_fuzzer.py --count "$FUZZ_COUNT" --seed "$FUZZ_SEED" \
-    --max-fail 25
+    --opt "$FUZZ_OPT" --max-fail 25
 RC=$?
 [ "$RC" -eq 0 ] || fail "fuzzer reported $RC failures (see report above; repro with --emit <seed>)"
 

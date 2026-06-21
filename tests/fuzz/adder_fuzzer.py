@@ -586,6 +586,15 @@ class RunResult:
         self.exit = exit
 
 
+# Optimization level the fuzzer compiles each program at. 0 (default) exercises
+# the trusted single-pass backend; set to 1 (via --opt 1 / ADDER_FUZZ_OPT=1) to
+# run the SAME predicted-output oracle against the -O1 peephole optimizer
+# (Track 6). Because the expected output is known by construction, a -O1 run
+# that disagrees is an optimizer-introduced miscompile — the strongest possible
+# correctness gate for the optimizer.
+OPT_LEVEL = int(os.environ.get("ADDER_FUZZ_OPT", "0"))
+
+
 def compile_and_run(seed, body, keep=False, target="x86_64-linux"):
     WORK.mkdir(parents=True, exist_ok=True)
     src = WORK / f"p_{seed}.ad"
@@ -593,10 +602,11 @@ def compile_and_run(seed, body, keep=False, target="x86_64-linux"):
     src.write_text(body)
     rel_src = src.relative_to(REPO_ROOT)
     rel_elf = elf.relative_to(REPO_ROOT)
-    cp = subprocess.run(
-        [sys.executable, "-m", "compiler.adder", "compile",
-         f"--target={target}", str(rel_src), "-o", str(rel_elf)],
-        cwd=str(REPO_ROOT), capture_output=True, text=True)
+    cmd = [sys.executable, "-m", "compiler.adder", "compile",
+           f"--target={target}", str(rel_src), "-o", str(rel_elf)]
+    if OPT_LEVEL:
+        cmd += ["-O", str(OPT_LEVEL)]
+    cp = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
     if cp.returncode != 0:
         if not keep:
             src.unlink(missing_ok=True)
@@ -695,10 +705,17 @@ def main():
                          "--target= (e.g. a future 2nd backend) and report a "
                          "diff against it; the predicted-output oracle remains "
                          "the primary check. Default: off.")
+    ap.add_argument("--opt", type=int, default=None, choices=[0, 1],
+                    help="compile each program at this -O level (0 = trusted "
+                         "single-pass, 1 = peephole optimizer). The predicted-"
+                         "output oracle validates the chosen level directly. "
+                         "Default: ADDER_FUZZ_OPT or 0.")
     args = ap.parse_args()
 
-    global DIFF_TARGET
+    global DIFF_TARGET, OPT_LEVEL
     DIFF_TARGET = args.diff_target
+    if args.opt is not None:
+        OPT_LEVEL = args.opt
 
     if args.emit is not None:
         p, body = render_program(args.emit)
