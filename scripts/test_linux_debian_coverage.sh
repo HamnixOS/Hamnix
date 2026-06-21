@@ -165,10 +165,19 @@ set +e
     # shipped artifact — the apt-from-file://-repo path; this cpio gate
     # proves the offline dpkg unpack+run chain.)
     #
-    # Seed the writable admindir (direct execs — no shell fork needed).
+    # Seed the writable admindir. Use plain `mkdir` per level (absolute,
+    # AT_FDCWD) rather than `mkdir -p` (which opens each created dir and
+    # uses its fd as the dirfd for the next mkdirat with a RELATIVE name —
+    # a path that needs directory-open fd_opened_path stamping, a separate
+    # follow-up). Each plain mkdir is mkdirat(AT_FDCWD, <absolute>) ->
+    # _u_mkdir -> vfs_mkdir -> the tmpfs arm (the committed mkdir fix).
     printf 'echo BANNER_DPKG_I_START\n'; sleep 1
-    printf 'enter linux { /bin/mkdir -p /tmp/inst/var/lib/dpkg/info }\n'; sleep 4
-    printf 'enter linux { /bin/mkdir -p /tmp/inst/var/lib/dpkg/updates }\n'; sleep 4
+    printf 'enter linux { /bin/mkdir /tmp/inst }\n'; sleep 3
+    printf 'enter linux { /bin/mkdir /tmp/inst/var }\n'; sleep 3
+    printf 'enter linux { /bin/mkdir /tmp/inst/var/lib }\n'; sleep 3
+    printf 'enter linux { /bin/mkdir /tmp/inst/var/lib/dpkg }\n'; sleep 3
+    printf 'enter linux { /bin/mkdir /tmp/inst/var/lib/dpkg/info }\n'; sleep 3
+    printf 'enter linux { /bin/mkdir /tmp/inst/var/lib/dpkg/updates }\n'; sleep 3
     printf 'enter linux { /bin/cp /var/lib/dpkg/status /tmp/inst/var/lib/dpkg/status }\n'; sleep 4
     # Real dpkg unpack into the writable alternate root.
     printf 'enter linux { /usr/bin/dpkg --root=/tmp/inst --force-not-root -i /var/cache/apt/archives/hamhello_1.0_amd64.deb }\n'; sleep 20
