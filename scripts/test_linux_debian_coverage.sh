@@ -67,6 +67,7 @@ linux = ns clean {
     bind '#p' /proc
     bind '#s' /srv
     bind '#/' /n
+    bind '#t/tmp' /tmp
 }
 debian = ns clean {
     bind '#r/var/lib/distros/default' /
@@ -74,6 +75,7 @@ debian = ns clean {
     bind '#p' /proc
     bind '#s' /srv
     bind '#/' /n
+    bind '#t/tmp' /tmp
 }
 echo TEST_RC_DONE_DEFINING_NS
 EOF
