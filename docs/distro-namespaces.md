@@ -197,14 +197,18 @@ image):
   guaranteed-runnable shell: `enter linux { sh }` resolves `/bin/sh →
   busybox` and runs it. The Hamnix ELF loader runs static-PIE images
   directly.
-* **the genuine Debian dash + bash** — `usr/bin/dash` (the real Debian
-  `/bin/sh`) and `usr/bin/bash`, staged from
+* **the genuine Debian dash (+ bash)** — `usr/bin/dash` (the real
+  Debian `/bin/sh`) is staged from
   `tests/distros/debian-minbase/rootfs/` via the curated
-  `REAL_DEBIAN_FILES` list (with `/bin/dash`, `/bin/bash` usrmerge
-  aliases). These are DYNAMIC ELFs (`PT_INTERP =
-  /lib64/ld-linux-x86-64.so.2`); running them exercises the dynamic
-  loader / `ld.so` + glibc relocation path. Reach them explicitly with
-  `enter linux { /bin/dash }` / `enter linux { /bin/bash }`.
+  `REAL_DEBIAN_FILES` list (with a `/bin/dash` usrmerge alias) into
+  BOTH the in-cpio slice and the ext4 rootfs image. `usr/bin/bash`
+  (plus `libtinfo.so.6`) is heavier (~1.2 MB) so it is staged ONLY into
+  the ext4 rootfs image (`build_rootfs_img.py`), keeping it off the
+  RAM-constrained in-cpio `-kernel` boot. These are DYNAMIC ELFs
+  (`PT_INTERP = /lib64/ld-linux-x86-64.so.2`); running them exercises
+  the dynamic loader / `ld.so` + glibc relocation path. Reach them
+  explicitly with `enter linux { /bin/dash }` / `enter linux {
+  /bin/bash }`.
 
 If the busybox fixture is absent at build time AND no Debian shell is
 staged, `/var/lib/distros/default/bin/sh` does not exist, so the exec

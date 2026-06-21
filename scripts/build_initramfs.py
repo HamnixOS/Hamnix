@@ -3789,15 +3789,17 @@ def build_archive() -> bytes:
             # Curated closure for `apt-get install hello` end-to-end.
             # All paths are RELATIVE to minbase_rootfs/.
             REAL_DEBIAN_FILES = [
-                # GENUINE Debian shells. `enter linux { /bin/dash }`
-                # (real Debian /bin/sh -> dash) and `/bin/bash` must run
-                # the actual Debian shell, not just the busybox fallback.
-                # dash's dynamic closure is only ld.so + libc (already
-                # staged below); bash also needs libtinfo (added to the
-                # .so closure). The usrmerge expansion below ALSO plants
-                # each at the /bin/<x> alias so `/bin/dash` resolves.
+                # GENUINE Debian shell. `enter linux { /bin/dash }` (the
+                # real Debian /bin/sh -> dash) runs the actual Debian
+                # shell, not just the busybox fallback. dash is tiny
+                # (~125 KB) and its dynamic closure is only ld.so + libc
+                # (already staged below); the usrmerge expansion plants
+                # it at /bin/dash too. bash (1.2 MB + libtinfo) is staged
+                # ONLY into the ext4 rootfs image (build_rootfs_img.py),
+                # NOT this in-cpio slice — the `-kernel` boot loads the
+                # whole cpio into the 256 MB guest, so the heavy bash is
+                # kept off the RAM-constrained in-cpio path.
                 "usr/bin/dash",
-                "usr/bin/bash",
                 # Package managers proper.
                 "usr/bin/apt",
                 "usr/bin/apt-get",
@@ -3849,8 +3851,6 @@ def build_archive() -> bytes:
                 "usr/lib/x86_64-linux-gnu/libselinux.so.1",
                 "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0",
                 "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.14.0",
-                # bash's extra .so dep (terminal handling).
-                "usr/lib/x86_64-linux-gnu/libtinfo.so.6",
                 # /etc essentials — apt reads these at startup, dpkg
                 # reads admindir status / available.
                 "etc/debian_version",

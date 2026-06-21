@@ -84,6 +84,14 @@ echo "[test_enter_linux_sh_interactive] (4/4) Boot QEMU + drive an INTERACTIVE e
 LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
 
+# The default qemu_drive machine is -m 256M. A full default boot
+# (runlevel 5: hamUId DE + VT gettys + net services) against the
+# real-Debian initramfs is tight at 256M and can OOM a COW write fault
+# during rc.boot under host memory pressure. Give the guest 512M (the
+# same headroom test_distro_debian.sh uses); qemu_drive appends
+# QEMU_EXTRA_ARGS after its own -m, and QEMU honours the later -m.
+export QEMU_EXTRA_ARGS="-m 512M"
+
 set +e
 # Sequence (mirrors a real user session):
 #   * /uname (native, one task slot) with a long settle so the boot's
