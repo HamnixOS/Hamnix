@@ -96,6 +96,10 @@ mkdir -p build
 echo "[build_installer_img] Stage 1: build userland + modules + ext4 rootfs payload."
 bash scripts/build_user.sh
 bash scripts/build_modules.sh
+# Stage the offline file:// apt repo into the Debian fixture so the live
+# #distro (which FULL-mirrors the fixture) can `apt-get install hamhello`
+# with no network. No-op SKIP when the debootstrap fixture is absent.
+bash scripts/build_local_apt_repo.sh || true
 HAMNIX_ROOTFS_OUT="$ROOTFS_IMG" python3 scripts/build_rootfs_img.py
 [ -f "$ROOTFS_IMG" ] || { echo "[build_installer_img] ERROR: $ROOTFS_IMG not built" >&2; exit 1; }
 # DEBIAN-STYLE INSTALL: build the native package repo. The interactive

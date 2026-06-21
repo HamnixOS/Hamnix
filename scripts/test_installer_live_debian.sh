@@ -307,6 +307,44 @@ if [ "$fail" -eq 0 ] && [ "$HAVE_APT" -eq 1 ]; then
     fi
 fi
 
+# --- OFFLINE apt-get install / dpkg -i sub-gate -----------------------
+# The live #distro FULL-mirrors the debian-minbase fixture, so the local
+# file:// repo staged by scripts/build_local_apt_repo.sh (opt/localrepo +
+# etc/apt/sources.list.d/local.list) rides into this shipped artifact.
+# Prove a REAL package install populates the live filesystem with no
+# network: apt-get install OR dpkg -i of the dependency-free `hamhello`
+# leaf, then run the installed /usr/bin/hamhello and assert its unique
+# marker (program output; the typed line never contains it). Only on the
+# real-Debian image (dpkg present); the FULL-mirror prunes var/cache, so
+# dpkg -i targets the pool path the apt repo keeps.
+if [ "$fail" -eq 0 ] && [ "$HAVE_DPKG" -eq 1 ]; then
+    echo "$TAG --- offline apt-get install / dpkg -i sub-gate ---"
+    send_until "enter linux { /usr/bin/apt-get update }" \
+               "hamnix\|local\|Reading\|Hit\|Get\|Ign" "$CMD_WAIT" || true
+    INSTALLED=0
+    if send_until "enter linux { /usr/bin/apt-get install -y --no-download hamhello }" \
+                  "HAMHELLO_INSTALLED_AND_RAN_OK" "$CMD_WAIT"; then
+        INSTALLED=1
+    else
+        # apt may have unpacked it; run the installed binary explicitly.
+        send_until "enter linux { /usr/bin/hamhello }" \
+                   "HAMHELLO_INSTALLED_AND_RAN_OK" "$CMD_WAIT" && INSTALLED=1
+    fi
+    if [ "$INSTALLED" -eq 0 ]; then
+        # dpkg -i short-path fallback off the pool .deb (var/cache pruned).
+        send_until "enter linux { /usr/bin/dpkg -i /opt/localrepo/pool/main/h/hamhello/hamhello_1.0_amd64.deb }" \
+                   "HAMHELLO_INSTALLED_AND_RAN_OK\|Unpacking\|Setting up" "$CMD_WAIT" || true
+        send_until "enter linux { /usr/bin/hamhello }" \
+                   "HAMHELLO_INSTALLED_AND_RAN_OK" "$CMD_WAIT" && INSTALLED=1
+    fi
+    if [ "$INSTALLED" -eq 1 ]; then
+        echo "$TAG PASS: offline install (apt-get/dpkg -i) -> hamhello ran in the live linux ns."
+    else
+        echo "$TAG FAIL: offline package install did not produce a runnable hamhello." >&2
+        fail=1
+    fi
+fi
+
 # --- ISOLATION GATE: the linux ns `/` is a SEPARATE Debian root -------
 # The user's hard requirement: `enter linux { ls / }` looks like Debian
 # AND is a COMPLETELY SEPARATE `/` from the native user-mode view, with
