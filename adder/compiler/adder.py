@@ -9,6 +9,8 @@ Targets:
     x86_64-bare-metal           Standalone kernel image (hamnix-kernel.elf)
     x86_64-linux-kernel-module  Emits .S for kbuild → .ko
     x86_64-adder-user           CPL-3 userspace ELF for the bare-metal kernel
+    x86_64-linux                Freestanding x86_64 ELF for the HOST Linux kernel
+    aarch64-linux               Freestanding aarch64 ELF (qemu-aarch64)
 
 The original ARM Cortex-M target lived in compiler/codegen_arm.py and was
 deleted in the legacy cleanup; only the x86_64 backend ships now.
@@ -31,28 +33,50 @@ from .codegen_arm64 import generate as generate_arm64
 # Compilation targets. `codegen` selects the backend; `kbuild` means the
 # Linux kernel build system owns assembly+link, so the CLI stops at emitting
 # a .S file rather than invoking an assembler/linker itself.
+#
+# Flags:
+#   kbuild     — the Linux kernel build system owns assembly+link.
+#   bare_metal — no OS underneath: there is no `_start`/exit syscall wrapper
+#                and (x86) no .modinfo license stamp. Drives the boot-stub
+#                link paths (arch/*/boot.S + a kernel .lds).
+#   userspace  — a freestanding userspace ELF: a `_start` + syscall wrappers
+#                are linked in and `main`'s return becomes the exit code.
+#                Like bare_metal it suppresses the x86 .modinfo stamp, but it
+#                is a DISTINCT concept — bare_metal is "no OS", userspace is
+#                "runs as a process on an OS". Keeping them separate avoids
+#                overloading bare_metal as a proxy for "no modinfo".
 TARGETS = {
     "x86_64-linux-kernel-module": {"codegen": "x86", "kbuild": True,
-                                   "bare_metal": False},
+                                   "bare_metal": False, "userspace": False},
     # Standalone x86_64 kernel ELF (hamnix-kernel.elf). The compiler owns
     # assembly + link itself (no kbuild), and the codegen skips the .modinfo
     # license stamp that's only meaningful for loadable modules.
     "x86_64-bare-metal": {"codegen": "x86", "kbuild": False,
-                          "bare_metal": True},
+                          "bare_metal": True, "userspace": False},
     # CPL-3 user-mode ELF the Adder kernel's fs/elf.py loader can run.
     # Same codegen as bare-metal (RIP-relative addressing, no .modinfo),
     # different link: we add user/runtime.S (the _start + syscall
     # wrappers) and use user/init.lds (single PT_LOAD, OUTPUT_FORMAT
     # elf32-i386 so the kernel's loader can parse it).
     "x86_64-adder-user": {"codegen": "x86", "kbuild": False,
-                          "bare_metal": True},
+                          "bare_metal": True, "userspace": False},
+    # FREESTANDING x86_64 Linux user-mode ELF, runnable on the HOST Linux
+    # kernel. Same x86 codegen as x86_64-adder-user (RIP-relative, no
+    # .modinfo — driven here by `userspace`, NOT bare_metal), but a real
+    # elf64-x86-64 link: user/linux-runtime.S supplies a Linux `_start`
+    # (reads argc/argv off the stack) and raw-`syscall` wrappers with
+    # standard Linux x86_64 numbers; user/linux-init.lds emits a static
+    # elf64 image. No libc, no Plan 9 base. This is the host-tooling unlock
+    # for the compiler fuzzer + host self-hosting.
+    "x86_64-linux": {"codegen": "x86", "kbuild": False,
+                     "bare_metal": False, "userspace": True},
     # PHASE 1 multi-arch: aarch64 (ARM64) Linux user-mode ELF, runnable
     # under qemu-aarch64. Hand-written aarch64 encoder in codegen_arm64.py;
     # assembled + statically linked with aarch64-linux-gnu binutils. This
     # is the foundational backend; the bare-metal ARM64 kernel port is a
     # later phase. The x86_64 paths above are untouched.
     "aarch64-linux": {"codegen": "arm64", "kbuild": False,
-                      "bare_metal": False},
+                      "bare_metal": False, "userspace": True},
     # PHASE 2 multi-arch: standalone aarch64 kernel image bootable on
     # QEMU's `virt` machine (qemu-system-aarch64 -M virt -kernel). Same
     # arm64 codegen, but bare_metal=True suppresses the Linux
@@ -63,7 +87,7 @@ TARGETS = {
     # link itself (no kbuild). The aarch64-linux + x86 paths above stay
     # byte-identical.
     "aarch64-bare-metal": {"codegen": "arm64", "kbuild": False,
-                           "bare_metal": True},
+                           "bare_metal": True, "userspace": False},
 }
 DEFAULT_TARGET = "x86_64-bare-metal"
 
@@ -77,9 +101,17 @@ def get_generator(target: str):
               file=sys.stderr)
         sys.exit(1)
     if spec["codegen"] == "x86":
-        bare = spec.get("bare_metal", False)
-        return lambda program: generate_x86(program, bare_metal=bare)
+        # The x86 codegen's `bare_metal` flag ONLY gates the .modinfo
+        # license stamp (meaningful for loadable .ko modules). A
+        # freestanding userspace ELF wants no .modinfo either, so suppress
+        # it for `userspace` targets too — without claiming bare_metal,
+        # which elsewhere means "no OS / boot-stub link".
+        no_modinfo = spec.get("bare_metal", False) or spec.get("userspace", False)
+        return lambda program: generate_x86(program, bare_metal=no_modinfo)
     if spec["codegen"] == "arm64":
+        # arm64's bare_metal gates the inline `_start`/exit wrapper, so a
+        # userspace target (aarch64-linux) must pass bare_metal=False to
+        # still get its `_start`. Pass the table value verbatim.
         bare = spec.get("bare_metal", False)
         return lambda program: generate_arm64(program, bare_metal=bare)
     raise AssertionError(f"unhandled codegen backend: {spec['codegen']}")
@@ -523,6 +555,90 @@ def compile_with_imports(main_file: Path, target: str = DEFAULT_TARGET) -> str:
         sys.exit(1)
 
 
+def assemble_and_link_x86_64_linux(asm_file: Path, output: Path,
+                                   project_root: Path) -> bool:
+    """Assemble + statically link an Adder FREESTANDING x86_64 Linux ELF.
+
+    The `x86_64-linux` target. Mirrors assemble_and_link_arm64_linux but
+    for the host x86_64 Linux kernel: the compiler-emitted .S (plain 64-bit
+    code — no `.code64`-in-elf32 wrapper, since a real Linux loader wants a
+    genuine elf64-x86-64 image) is combined with user/linux-runtime.S (the
+    Linux `_start` + raw-`syscall` wrappers) and linked static/-no-pie with
+    user/linux-init.lds, entry `_start`. No libc, no Plan 9 base — runs
+    directly on the developer's host Linux kernel.
+
+    linux-runtime.S is preprocessed (`gcc -c -DLINUX_ABI`) so the named
+    syscall constants in user/syscall_nums.h resolve; the compiler-emitted
+    main object is assembled with plain `as --64`.
+    """
+    as_cmd = "as"
+    ld_cmd = "ld"
+    cc_cmd = "gcc"
+
+    for tool in (as_cmd, ld_cmd):
+        try:
+            subprocess.run([tool, "--version"], capture_output=True,
+                           check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print(f"Error: {tool} not found (install binutils)",
+                  file=sys.stderr)
+            return False
+    try:
+        subprocess.run([cc_cmd, "--version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print(f"Error: {cc_cmd} not found (needed to preprocess "
+              f"user/linux-runtime.S)", file=sys.stderr)
+        return False
+
+    runtime_s = project_root / "user/linux-runtime.S"
+    lds       = project_root / "user/linux-init.lds"
+    for required in (runtime_s, lds):
+        if not required.exists():
+            print(f"Error: missing {required}", file=sys.stderr)
+            return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        runtime_o = tmpdir / "linux-runtime.o"
+        main_o    = tmpdir / "main.o"
+
+        # Runtime: preprocess + assemble (the .S uses #include / #define).
+        # -I the user/ dir so syscall_nums.h resolves.
+        result = subprocess.run(
+            [cc_cmd, "-c", "-x", "assembler-with-cpp",
+             "-I", str(project_root / "user"),
+             "-o", str(runtime_o), str(runtime_s)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"Error assembling linux-runtime.S:\n{result.stderr}",
+                  file=sys.stderr)
+            return False
+
+        # Main: the compiler-emitted .S is already 64-bit; assemble straight.
+        result = subprocess.run(
+            [as_cmd, "--64", "-o", str(main_o), str(asm_file)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"Error assembling (x86_64-linux):\n{result.stderr}",
+                  file=sys.stderr)
+            return False
+
+        link_cmd = [
+            ld_cmd, "-m", "elf_x86_64", "-nostdlib", "-static", "-no-pie",
+            "-z", "noexecstack", "-T", str(lds), "-e", "_start",
+            "-o", str(output), str(runtime_o), str(main_o),
+        ]
+        result = subprocess.run(link_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Error linking (x86_64-linux):\n{result.stderr}",
+                  file=sys.stderr)
+            return False
+
+    return True
+
+
 def assemble_and_link_arm64_linux(asm_file: Path, output: Path) -> bool:
     """Assemble + statically link a Adder aarch64 Linux user-mode ELF.
 
@@ -941,6 +1057,9 @@ def cmd_compile(args: argparse.Namespace) -> int:
                 asm_path, output, find_hamnix_root())
         elif args.target == "x86_64-bare-metal":
             ok = assemble_and_link_x86_bare(asm_path, output, find_hamnix_root())
+        elif args.target == "x86_64-linux":
+            ok = assemble_and_link_x86_64_linux(
+                asm_path, output, find_hamnix_root())
         elif args.target == "x86_64-adder-user":
             # TEMP_DEBUG_HAMSH_BRINGUP: pass the source-file stem as the
             # progname so runtime.S's _start marker is per-binary
@@ -951,9 +1070,9 @@ def cmd_compile(args: argparse.Namespace) -> int:
             )
         else:
             raise AssertionError(
-                f"x86_64-bare-metal / x86_64-adder-user / aarch64-linux / "
-                f"aarch64-bare-metal are the only non-kbuild link paths; "
-                f"got '{args.target}'"
+                f"x86_64-bare-metal / x86_64-linux / x86_64-adder-user / "
+                f"aarch64-linux / aarch64-bare-metal are the only non-kbuild "
+                f"link paths; got '{args.target}'"
             )
         if not ok:
             return 1
