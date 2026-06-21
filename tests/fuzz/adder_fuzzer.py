@@ -37,6 +37,7 @@
 import argparse
 import os
 import random
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -85,6 +86,37 @@ U64 = IntType("uint64", 64, False)
 
 ALL_TYPES   = [I8, U8, I16, U16, I32, U32, I64, U64]
 STORE_TYPES = [I8, U8, I16, U16, I32, U32, I64, U64]   # array element widths
+
+
+# --------------------------------------------------------------------------
+# Floating-point type model. Floats are folded into the SAME uint64 g_accum
+# oracle BIT-EXACTLY: every float VALUE the fuzzer materializes is derived
+# from an INTEGER (via cast[floatN](int)), every float result is consumed by
+# truncating back to int (cast[int64](float_expr)) — so the oracle predicts
+# the exact integer the compiled code reaches, with NO precision/NaN guessing.
+# `round` snaps a Python double to the type's representable value, matching
+# the SSE op's hardware rounding (round-to-nearest-even, the SSE default):
+#   float64 -> already a Python double (no-op)
+#   float32 -> pack/unpack through IEEE single
+# --------------------------------------------------------------------------
+class FloatType:
+    def __init__(self, name, bits):
+        self.name = name
+        self.bits = bits      # 32 or 64
+
+    def round(self, x):
+        """Snap double `x` to this type's representable value (SSE RNE)."""
+        if self.bits == 32:
+            return struct.unpack("<f", struct.pack("<f", x))[0]
+        return x  # Python float IS an IEEE double
+
+    def __repr__(self):
+        return self.name
+
+
+F32 = FloatType("float32", 32)
+F64 = FloatType("float64", 64)
+FLOAT_TYPES = [F32, F64]
 
 
 def umask(bits):
@@ -455,6 +487,7 @@ class Program:
         self._gen_for_range_traffic(env)  # for v in range(...)
         self._gen_for_array_traffic(env)  # for v in <array global>
         self._gen_do_while_traffic(env)   # do/while
+        self._gen_float_traffic(env)      # scalar SSE float32/float64
         self._gen_loop(env)
         self._gen_helper_calls(env)
 
@@ -766,6 +799,92 @@ class Program:
             if not (dw_i < n):
                 break
         self._fold_value("dw_sum", py)
+
+    # ======================================================================
+    # Floating-point traffic (scalar SSE float32/float64). Emitted in BOTH
+    # subset and default mode with an identical rng stream so the codegen.ad
+    # differential gate exercises floats too. BIT-EXACT oracle: every float
+    # value is integer-derived (cast[floatN](int)); every fold truncates the
+    # float result back to a signed int (cast[int64](...)) which is then
+    # widened to uint64 — so the predicted g_accum is the exact integer the
+    # compiled code reaches. Values are kept small so float32's 24-bit
+    # mantissa represents them exactly (no rounding divergence) and the
+    # truncate-toward-zero (cvtt) result is unambiguous.
+    # ======================================================================
+    def _fp_int_src(self, v, ft):
+        """Adder source for a float constant of value `v` (an int), as
+        cast[ftname](int). Negative via (0 - n)."""
+        if v < 0:
+            return f"cast[{ft.name}](0 - {(-v)})"
+        return f"cast[{ft.name}]({v})"
+
+    def _gen_float_traffic(self, env):
+        rng = self.rng
+        # Two FP locals per float type, from small integers. float32 keeps
+        # |v| < 2^23 so the value is mantissa-exact; products stay in range.
+        for ft in FLOAT_TYPES:
+            lim = 1000 if ft.bits == 32 else 100000
+            av = rng.randint(-lim, lim)
+            bv = rng.randint(1, lim)            # nonzero (used as divisor too)
+            an = f"flt_a_{ft.name}"
+            bn = f"flt_b_{ft.name}"
+            self.emit(f"    {an}: {ft.name} = {self._fp_int_src(av, ft)}")
+            self.emit(f"    {bn}: {ft.name} = {self._fp_int_src(bv, ft)}")
+            # Python doubles snapped to the type model = the SSE register value.
+            a = ft.round(float(av))
+            b = ft.round(float(bv))
+            # ---- arithmetic: +, -, * (all exact for these magnitudes) -------
+            for k, (opsym, pyf) in enumerate(
+                    (("+", a + b), ("-", a - b), ("*", a * b))):
+                r = ft.round(pyf)
+                ffn = f"flt_f_{ft.name}_{k}"
+                self.emit(
+                    f"    {ffn}: {ft.name} = {an} {opsym} {bn}")
+                # truncate toward zero, fold the int64 bits widened to uint64.
+                self._fold_value(
+                    f"cast[uint64](cast[int64]({ffn}))",
+                    U64.wrap(I64.wrap(int(r))))
+            # ---- division: choose dividend a multiple of b so the quotient
+            #      is an exact integer (no float32 rounding ambiguity) --------
+            q = rng.randint(-50, 50)
+            dividend = q * bv
+            dn = f"flt_d_{ft.name}"
+            qn = f"flt_q_{ft.name}"
+            self.emit(f"    {dn}: {ft.name} = {self._fp_int_src(dividend, ft)}")
+            self.emit(f"    {qn}: {ft.name} = {dn} / {bn}")
+            dq = ft.round(ft.round(float(dividend)) / b)
+            self._fold_value(f"cast[uint64](cast[int64]({qn}))",
+                             U64.wrap(I64.wrap(int(dq))))
+            # ---- negate (sign-bit flip) -------------------------------------
+            nn = f"flt_n_{ft.name}"
+            self.emit(f"    {nn}: {ft.name} = 0 - {an}")
+            self._fold_value(f"cast[uint64](cast[int64]({nn}))",
+                             U64.wrap(I64.wrap(int(ft.round(-a)))))
+            # ---- compares: <, <=, >, >=, ==, != (ordered, never NaN) --------
+            for opsym in ("<", "<=", ">", ">=", "==", "!="):
+                cmp = {
+                    "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b,
+                    "==": a == b, "!=": a != b,
+                }[opsym]
+                self._fold_value(
+                    f"cast[uint64](cast[int64]({an} {opsym} {bn}))",
+                    U64.wrap(I64.wrap(1 if cmp else 0)))
+        # ---- float32 <-> float64 conversion round trip ----------------------
+        cv = rng.randint(-1000, 1000)
+        self.emit(f"    flt_c32: float32 = {self._fp_int_src(cv, F32)}")
+        self.emit("    flt_c64: float64 = cast[float64](flt_c32)")
+        self._fold_value("cast[uint64](cast[int64](flt_c64))",
+                         U64.wrap(I64.wrap(cv)))
+        # int -> float -> int identity over a value exactly representable.
+        iv = rng.randint(-100000, 100000)
+        self.emit(f"    flt_i: float64 = cast[float64](cast[int64]({self._int_src(iv)}))")
+        self._fold_value("cast[uint64](cast[int64](flt_i))",
+                         U64.wrap(I64.wrap(iv)))
+
+    def _int_src(self, v):
+        if v < 0:
+            return f"cast[int64](0 - {(-v)})"
+        return f"cast[int64]({v})"
 
 
 def render_program(seed, subset=False):
