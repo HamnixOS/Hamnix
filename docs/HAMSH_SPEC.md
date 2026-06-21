@@ -207,6 +207,19 @@ there is one bind over channels.
 `/fd/N` named channels. This is Layer-2 translation work, consistent with the
 "route the Linux ABI through the chan layer" item — real shim work, not free.
 
+**`--no-echo` (front-end local echo).** A leading `--no-echo` argv flag turns
+off the interactive line editor's per-keystroke echo: the in-line repaint, the
+Enter CRLF, and the readline redraw are all suppressed, while the prompt and
+command OUTPUT still emit normally. This is for a front-end that does its own
+LOCAL line editing + echo over a pipe — the scene DE terminal
+(`user/hamtermscene.ad`, spawned as `/bin/hamsh --no-echo /etc/rc.de-user`)
+paints typed characters into its glyph grid immediately, so a shell echo
+coming back over stdout would double every character. The flag is consumed
+before rc dispatch and shifts the remaining argv (rc path, DE-prog) past it.
+The serial console and SSH clients never pass it, so they keep the default
+echoing editor (a remote terminal relies on the shell to echo). See
+`docs/de_scene_file_arch.md` §11a.
+
 ---
 
 ## 8. Command substitution

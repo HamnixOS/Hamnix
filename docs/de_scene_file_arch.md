@@ -254,6 +254,51 @@ Pinning pointer-vs-keyboard routing here is the fix for the legacy
 "input leaks to the serial shell" bug, which came from a shared
 `/dev/cons` + topmost-only focus.
 
+### 11a. The scene terminal's persistent shell (hamtermscene)
+
+`user/hamtermscene.ad` is the windowed terminal. It spawns ONE long-lived
+interactive `/bin/hamsh` over a pair of pipe Chans and renders the shell's
+stdout as a scrolling glyph grid. Three wiring rules make it behave like a
+real terminal rather than a near-empty pipe bridge:
+
+- **Namespace templates + binds.** The inner shell is spawned as
+  `/bin/hamsh --no-echo /etc/rc.de-user` (no third/DE-prog argument). It
+  SOURCES `/etc/rc.de-user` — the same rc the outer hamUId shell sourced —
+  which defines the `linux` / `debian` `ns clean { … }` namespace TEMPLATE
+  variables and re-asserts the device/proc/srv/net/home binds (idempotent
+  on the COW-inherited Pgrp). With `HAMNIX_DE_PROG` unset, rc.de-user falls
+  through to hamsh's interactive REPL, which reads the same `/fd/0,1,2`
+  pipes. Result: `enter linux { ls }` in the pane switches `/` to the
+  Debian root and streams the listing back — previously the inner shell had
+  no `linux` variable, so `enter linux {…}` hit `ns_not_a_template()` and
+  printed "not a namespace: linux" to the invisible serial console.
+- **stderr → the pane.** The inner shell's `/fd/2` is bound to the SAME
+  stdout-write pipe as `/fd/1` (not `/dev/cons`), so user-facing diagnostics
+  ("command not found", "not a namespace: …", a failed command's error)
+  render IN the pane instead of vanishing onto the serial log. Genuine
+  kernel/boot debug still goes to `/dev/cons`, which hamtermscene opens
+  separately for its own probe markers.
+- **Local echo (zero round-trip).** hamtermscene owns LOCAL line editing:
+  a printable key is appended to a local line buffer and rendered into the
+  grid + committed in the SAME wake (no shell round-trip), matching
+  hameditscene's in-process speed. The whole line + `\n` is fed to the
+  shell only on Enter. The inner shell runs `--no-echo` (which suppresses
+  its readline's per-keystroke echo — the in-line repaint, the Enter CRLF —
+  while still emitting the prompt and command OUTPUT) so the locally-echoed
+  characters are not doubled by a shell echo coming back over stdout. This
+  eliminates the ~0.5s per-character lag the old "forward raw byte, wait for
+  the shell's readline echo to round-trip back" model suffered. The
+  `--no-echo` flag is consumed only by this front-end; the serial console
+  and SSH clients keep the default echoing line editor (a remote terminal
+  relies on the shell to echo). Latency is reported on `/dev/cons` as
+  `[term-lat] j=<jiffies>` (1 jiffy = 10 ms).
+
+Keys are injected for testing by writing `<type> <code>\n` lines (e.g.
+`echo 'd 108' > /dev/wsys/<wid>/keys`, type `d`=press, code=ASCII) directly
+to the focused window's keys file — the exact byte stream the live keyboard
+router produces and `hamtermscene._drain_keys_chunk` parses. See
+`scripts/test_de_term_enter_linux.sh`.
+
 ## 12. lib/hamui.ad — the toolkit
 
 App authors never touch scene files. `lib/hamui.ad` is a retained-mode
