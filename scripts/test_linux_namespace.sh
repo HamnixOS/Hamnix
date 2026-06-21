@@ -64,20 +64,22 @@ RC_TMP=$(mktemp /tmp/hamsh-rc-linuxns.XXXXXX.rc)
 cat > "$RC_TMP" <<'EOF'
 echo TEST_RC_START
 linux = ns clean {
-    bind /var/lib/distros/default /
-    bind /home /home
+    bind '#distro' /
+    bind '#r/home' /home
     bind '#c' /dev
     bind '#p' /proc
     bind '#s' /srv
     bind '#/' /n
+    bind '#t/tmp' /tmp
 }
 debian = ns clean {
-    bind /var/lib/distros/default /
-    bind /home /home
+    bind '#distro' /
+    bind '#r/home' /home
     bind '#c' /dev
     bind '#p' /proc
     bind '#s' /srv
     bind '#/' /n
+    bind '#t/tmp' /tmp
 }
 echo TEST_RC_DONE_DEFINING_NS
 EOF
@@ -88,7 +90,7 @@ HAMNIX_HAMSH_RC="$RC_TMP" INIT_ELF="$HAMSH_ELF" \
 
 LOG=$(mktemp /tmp/test-linux-ns.XXXXXX.log)
 cleanup() {
-    rm -f "$LOG" "$RC_TMP"
+    rm -f "$LOG" "${LOG_RAW:-}" "$RC_TMP"
     # Restore the default initramfs (default /init shim + no rc override)
     # so subsequent tests boot the production path.
     INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py \
@@ -106,11 +108,26 @@ set +e
     # Wait for hamsh to source /etc/hamsh.rc and reach the interactive
     # prompt. With INIT_ELF=hamsh.elf and no rc.boot, this is fast
     # (~3-5 s of post-kernel bring-up; no boot services to spawn).
-    sleep 6
+    sleep 8
 
-    # 1. enter linux { /bin/ls / } — lists distro root (bin/, etc/, ...)
+    # Warm-up: a freshly-booted hamsh DROPS early serial command lines
+    # (never echoes them — see [[feedback-serial-test-first-cmd-dropped]]).
+    # Burn those drops on harmless echos, and RE-SEND until the warmup
+    # marker is confirmed in the output, so the FIRST real `enter` command
+    # below actually reaches the shell. Without this the `/bin/ls /` command
+    # (the first post-boot spawn) was silently swallowed and its distro-root
+    # listing never appeared, mis-flagging the working kernel as a MISS.
+    printf '\n'; sleep 1
+    printf 'echo BANNER_WARMUP\n'; sleep 1
+    printf 'echo BANNER_WARMUP\n'; sleep 1
+    printf 'echo BANNER_WARMUP\n'; sleep 2
+
+    # 1. enter linux { /bin/ls / } — lists distro root (bin/, etc/, ...).
+    #    Send twice: the first send may still be eaten by the early-boot
+    #    line-editor drop; the second is what the assertion keys on.
     printf 'echo BANNER_LS_ROOT_START\n'; sleep 1
-    printf 'enter linux { /bin/ls / }\n'; sleep 3
+    printf 'enter linux { /bin/ls / }\n'; sleep 4
+    printf 'enter linux { /bin/ls / }\n'; sleep 4
     printf 'echo BANNER_LS_ROOT_END\n'; sleep 1
 
     # 2. enter linux { /bin/echo hello world } — Linux ABI binary in ns
@@ -145,7 +162,7 @@ set +e
 
     printf 'echo BANNER_DONE\n'; sleep 1
     printf 'exit\n'; sleep 1
-) | timeout 60s qemu-system-x86_64 \
+) | timeout 90s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -159,6 +176,20 @@ set -e
 echo "[test_linux_namespace] --- captured output (tail) ---"
 tail -200 "$LOG" | strings
 echo "[test_linux_namespace] --- end output ---"
+
+# Normalise the serial capture before any banner assertion. busybox ls
+# colourises directory names with ANSI SGR escapes and the hamsh line
+# editor echoes typed input char-by-char with cursor-control codes
+# (ESC[K, ESC[<n>C) and carriage returns. Left raw, those control bytes
+# split the visible tokens (PROVENANCE / bin / etc) across rebuilt lines
+# and swallow whole banner-echo lines, so the byte-exact banner-window
+# awk would mis-flag working output as a MISS. Strip ESC-sequences and
+# CRs into a cleaned copy and run every assertion against it. The raw
+# capture stays in $LOG for the human-readable tail above.
+LOG_RAW="$LOG"
+LOG=$(mktemp /tmp/test-linux-ns-clean.XXXXXX.log)
+sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\x1b[()][AB0]//g' -e 's/\r//g' \
+    "$LOG_RAW" > "$LOG"
 
 fail=0
 
@@ -235,6 +266,13 @@ check_banner_absent() {
     if awk -v b="$banner" -v v="$value" '
         BEGIN { armed=0; win=0; found=0 }
         index($0, "[atkbd-diag]") > 0 { next }
+        # Skip hamsh command-ECHO lines: hamsh echoes the typed command
+        # back character-by-character on a "hamsh$ ..." prompt line, so a
+        # sentinel that appears only inside the COMMAND text (e.g. the
+        # body of `enter foobar { echo BODY_RAN... }`) is NOT execution
+        # output. Counting it would false-positive the "body did not run"
+        # gate. Real body output lands on its own line with no prompt.
+        index($0, "hamsh$") > 0 { next }
         index($0, b) > 0 { armed=1; win=0; next }
         armed { win++ ; if (index($0, v) > 0) { found=1; exit }
                 if (win > 30) armed=0 }
@@ -261,10 +299,33 @@ check_present "TEST_RC_DONE_DEFINING_NS" \
 # control bytes; the substring match still picks them up.
 check_banner_absent "BANNER_LS_ROOT_START" "ls: /: No such file" \
                     "enter linux { /bin/ls / } does NOT report ENOENT"
-check_banner_post_enter_value "BANNER_LS_ROOT_START" "bin" \
-                    "enter linux { /bin/ls / } shows bin/"
-check_banner_post_enter_value "BANNER_LS_ROOT_START" "etc" \
-                    "enter linux { /bin/ls / } shows etc/"
+# Distro-root proof: `/bin/ls /` over `#distro` enumerates the Debian
+# tree, whose top level carries the distro-ONLY PROVENANCE needle plus
+# bin/ and etc/. The banner-echo line for this FIRST post-boot command is
+# the one the hamsh line editor most often swallows, so anchor on the
+# command-echo line itself (`enter linux { /bin/ls / }`) — guaranteed
+# present — and scan the listing that follows it for each token.
+check_after_cmd() {
+    local cmd="$1"; local value="$2"; local label="$3"
+    if awk -v c="$cmd" -v v="$value" '
+        index($0,"[atkbd-diag]")>0 { next }
+        index($0,c)>0 && index($0,"hamsh$")>0 { seen=1; win=0; next }
+        seen { win++; if (index($0,v)>0) { found=1; exit }
+               if (win>40) seen=0 }
+        END { exit found?0:1 }
+    ' "$LOG"; then
+        echo "[test_linux_namespace] OK: $label"
+    else
+        echo "[test_linux_namespace] MISS: $label (cmd='$cmd' value='$value')"
+        fail=1
+    fi
+}
+check_after_cmd "enter linux { /bin/ls / }" "PROVENANCE" \
+                "enter linux { /bin/ls / } lists the distinct Debian root (PROVENANCE)"
+check_after_cmd "enter linux { /bin/ls / }" "bin" \
+                "enter linux { /bin/ls / } shows bin/"
+check_after_cmd "enter linux { /bin/ls / }" "etc" \
+                "enter linux { /bin/ls / } shows etc/"
 
 # 2. /bin/echo hello world runs and prints "hello world".
 check_banner_value "BANNER_ECHO_START" "hello world" \
