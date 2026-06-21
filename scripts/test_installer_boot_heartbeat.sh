@@ -85,7 +85,15 @@ HEARTBEAT_RE='\[hamsh-alive\]'
 # as a "TRAP: vector 0xNN" print from the trap handler and/or the firmware
 # resetting the CPU. Any of these means the boot died, even if a stale
 # heartbeat fragment somehow appeared.
-FATAL_RE='TRAP: vector|triple fault|double fault|cpu_reset|#DF'
+#
+# "[trap-diag] halting" is the one-shot fault diagnostic in
+# arch/x86/kernel/trap_diag.ad: an unrecoverable fault (e.g. an unresolved
+# user #PF whose SIGSEGV could not be delivered) does `cli; hlt` with NO
+# recovery — it wedges the WHOLE CPU, so the heartbeat can never follow.
+# Treat it as fatal so the poll loop below breaks out the instant it
+# appears instead of burning the full BOOT_TIMEOUT waiting for a heartbeat
+# that will never come.
+FATAL_RE='TRAP: vector|triple fault|double fault|cpu_reset|#DF|\[trap-diag\] halting'
 
 say() { echo "[test_installer_boot_heartbeat] $*"; }
 
