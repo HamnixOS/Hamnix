@@ -23,51 +23,57 @@ shape of Plan 9** — not a general "Linux competitor." That target makes
 several architectural calls for us (below). Plan 9 spine is real and
 held; the next push is foundational hardening, not new surface area.
 
-Six strategic tracks, **ordered by dependency** (the compiler chain
-unlocks itself — do the Linux target first):
+### ⚠ Compiler strategy REDIRECT (2026-06-21) — Python is the SEED; the optimizer lives in Adder
 
-1. **Adder Linux target (Tier 2)** — the unlock: smallest and most
-   grounded task, and a precursor for tracks 2 & 3. Compile freestanding
-   Adder (compute + file I/O, NO GUI / no Plan 9 base) to native Linux
-   ELF. Enables host-speed dev + fuzzing.
-2. **Compiler fuzzer** — depends on track 1. The solo hand-rolled
-   single-pass x86 backend is the #1 structural risk; the fuzzer
-   measures and de-risks it.
-3. **Self-hosting on Linux + Hamnix** — depends on track 1, validated by
-   track 2. Finish the `.ad` compiler and run it on the host, closing
-   the bootstrap for real.
-4. **Userland-isolated drivers** — highest *leverage* (toy → server) but
-   independent of the compiler chain and the biggest lift. Move stock
-   `.ko` execution out of the kernel fault domain.
-5. **Kernel scaling rework** — independent. Kill the static-array
-   ceilings before they calcify; defer deep perf (NUMA/RCU) until a real
-   multicore workload can measure it.
-6. **Adder code optimizer** — independent. Get compiled Adder into rough
-   C territory. Baseline (`docs/bench_adder_host.md`): already ~1.6× of
-   `gcc -O0`, ~4.3× of `-O2`, ~24× faster than CPython. Classic passes
-   (not LLVM-scale) should reach ≤ ~2× of `-O2`.
+The original plan put the optimizer in the Python compiler (`codegen_x86.py`).
+**Reversed.** The Python compiler is a **bootstrap seed: correct, not fast.** Its
+only job is to compile the real (Adder-written) compiler once. Pouring a permanent
+optimizer into it means (a) writing the whole IR + passes TWICE (Python now, Adder
+later), (b) two compilers that silently diverge — the fuzzer already caught **6
+miscompiles** in `codegen.ad` from exactly that drift, and (c) an optimizer that
+never runs on-device and proves nothing about the self-hosted toolchain (the
+credibility demo). Perf is orthogonal to compiler language — the generated-code
+quality lives in the *passes*, so there's no perf reason to keep them in Python.
 
-Plus: **gate the two real boot paths in CI** (cheap, independent, high
-value — see the CI section).
+**New ordering / state:**
+1. **Adder Linux target (Tier 2)** — ✅ DONE. `x86_64-linux` freestanding target;
+   host-run Adder does real syscalls.
+2. **Compiler fuzzer** — ✅ DONE. Predicted-output oracle; found+fixed 3 backend
+   miscompiles; 0 over 10k programs. The permanent correctness gate + the
+   differential oracle (`--diff-target`).
+3. **Self-hosting cutover — NOW THE LEAD COMPILER TRACK.** Finish `codegen.ad` to
+   FULL parity with `codegen_x86.py` (multi-dim arrays, classes/methods, for-loops,
+   structs, floats — the ~2000-LOC gap), then build the `.ad` compiler as an
+   `x86_64-linux` host binary so it drives the build with Python as a one-time seed.
+   This is the prerequisite for the real optimizer AND the credibility milestone.
+4. **Userland-isolated drivers (UMDF)** — ✅ DONE (first slice: stock `.ko` in a
+   restartable userland host, crash-isolated). Follow-ups: respawn supervisor, real
+   BAR-backed driver, `exports.ad` parity.
+5. **Kernel scaling rework** — ✅ DONE (O(active) scheduler, NTASKS→512, dynamic-CPU
+   guard). Deferred perf items (per-wq locks, softirqs, slab, NUMA/RCU) stay deferred.
+6. **Adder code optimizer — REFRAMED: build it IN ADDER, post-cutover.** The
+   permanent home of the IR + LICM/CSE/strength-reduction/regalloc is the
+   self-hosted Adder compiler (track 3), so it runs on-device and isn't written
+   twice. **FREEZE the Python optimizer** at the current `-O1` peephole + `-O2`
+   regalloc (Adder/-O2 ≈ 3.0× of C). Those stay ONLY as a baseline + differential
+   oracle. Do NOT invest more *permanent* optimizer work in Python. The in-flight
+   Python from-AST IR is a throwaway DESIGN PROTOTYPE to validate the pass shape
+   where iteration is cheap; its real implementation is Adder-native. Perf goal
+   (≤ ~2× of C, ideally parity) is met by the Adder-native passes.
+
+Plus: **gate the two real boot paths in CI** — ✅ DONE (installer-image OVMF
+heartbeat, non-blocking).
 
 ### Decision points (record, don't lose)
 
-- **LLVM as an optional _second_ backend — DEFERRED.** Gated on fuzzer
-  bug-density data (track 2). If adopted: keep the Adder frontend + keep
-  the hand-rolled x86 backend as the pure bootstrap; add an LLVM IR
-  emitter as a parallel backend. Payoff: optimization, ~free multi-arch
-  (ARM64), CPU mitigations (CFI/retpoline/CET), AND a differential-test
-  oracle (same program through both backends). Cost: giant C++
-  dependency, ethos hit. **Do not** attempt to rewrite/translate LLVM
-  into Adder — ~30M LOC, project-ending. Revisit once the fuzzer reports
-  real miscompile density on the hand backend.
-- **Optimizer vs LLVM for _performance_.** Track 6 (a homegrown
-  optimizer) is the keep-it-native path to "rough C ballpark" — the bench
-  data says classic passes get most of the way. LLVM still wins for
-  ARM64 + CPU mitigations + best-case perf. They are not mutually
-  exclusive: both need an IR (Track 6's prerequisite), so Track 6's IR is
-  reusable if LLVM is later adopted. Build Track 6 first; let it decide
-  whether LLVM's extra perf is even needed.
+- **Python compiler = seed, Adder compiler = product.** (See redirect above.) All
+  *permanent* optimization belongs in `codegen.ad` lineage, post-self-hosting-cutover.
+- **LLVM — PERMANENTLY REJECTED (2026-06-21, user decision).** Not the path. We do
+  NOT adopt LLVM as a second backend at any point. Perf (≤2×/parity), multi-arch
+  (ARM64 already has a native backend), and any CPU mitigations are pursued
+  natively in the Adder compiler / hand-rolled backends. Rationale: keep the whole
+  toolchain native + self-hosted (the ethos and credibility); a giant C++ dependency
+  is off the table. Don't reopen this.
 
 ---
 
@@ -145,22 +151,30 @@ writes, 2-D array addresses) — the surface is real.
 - [ ] (Later, if LLVM lands) **differential oracle** — same generated
   programs through both backends, compare.
 
-## Track 3 — Self-hosting on Linux + Hamnix
+## Track 3 — Self-hosting cutover ★ LEAD COMPILER TRACK (2026-06-21 redirect)
 
-**Why:** close the bootstrap. The build is currently Python-locked
-(`python3 -m compiler.adder`); the `.ad` compiler is incomplete.
+**Why:** close the bootstrap AND unlock the real optimizer. The build is still
+Python-locked (`python3 -m compiler.adder`); `codegen.ad` is a ~2317-LOC
+self-hosting SUBSET that emits raw machine bytes and drives NO build. This is now
+the LEAD compiler track: the Adder-native optimizer (track 6) cannot be built until
+the Adder compiler reaches parity and can host it. Progress so far: 6 real
+`codegen.ad` miscompiles fixed + a host differential fuzzer (`scripts/fuzz_adder_diff.sh`,
+`--ad-codegen`) added; 100% correct over 2400+ programs on the supported subset
+(STATUS corrected Done→Partial).
 
-- [ ] **Finish `compiler/codegen.ad` to parity** with `codegen_x86.py`
-  (~3700 LOC gap: strings/string ops, remaining feature coverage). Use
-  the fuzzer (Track 2) to validate against the Python compiler.
-- [ ] **Build the `.ad` compiler as an `x86_64-linux` binary** (via
-  Track 1) so `adder_cc` runs on the host, compiling Adder→Hamnix at
-  native speed — Python becomes a one-time seed.
-- [ ] **Run the `.ad` compiler in Hamnix too** (`x86_64-adder-user`) for
-  on-device source packages (#186).
-- [ ] **Correct the false claim** — STATUS.md says on-device self-hosting
-  is "Done"; it is not (no build path uses the `.ad` compiler). Fix the
-  wording until the above lands.
+- [ ] **Finish `compiler/codegen.ad` to FULL parity** with `codegen_x86.py` — the
+  remaining feature surface that's out of the current subset: multi-dimensional
+  array globals, classes/methods, for-loops, structs/member access, do-while,
+  floats, `.modinfo`. Validate EVERY addition with `scripts/fuzz_adder.sh` (0
+  miscompiles) + the differential mode vs the Python backend.
+- [ ] **Build the `.ad` compiler as an `x86_64-linux` host binary** (via Track 1) so
+  `adder_cc` runs on the host, compiling Adder→Hamnix at native speed — Python
+  becomes a one-time SEED (correct, not fast; freeze its optimizer per the redirect).
+- [ ] **Cutover:** make the default build use the `.ad` compiler once it's
+  fuzz-proven at parity (the Python compiler stays as the bootstrap seed only).
+- [ ] **Run the `.ad` compiler in Hamnix too** (`x86_64-adder-user`) for on-device
+  source packages (#186).
+- [~] STATUS "on-device self-hosting Done" corrected to Partial (Track 3 pass).
 
 ## Track 4 — Userland-isolated drivers (.ko out of kernel)
 
@@ -227,6 +241,15 @@ HW (consumer wifi, GPUs) — now crash-isolated.
 RCU read-side for task/VFS traversal; LRU-ordered reclaim.
 
 ## Track 6 — Adder code optimizer (→ rough C territory)
+
+> **★ REDIRECT (2026-06-21): the optimizer's permanent home is the ADDER compiler,
+> not Python.** The Python `-O1` peephole + `-O2` regalloc below are LANDED and stay
+> ONLY as a baseline + differential oracle — **the Python optimizer is FROZEN; do not
+> add more permanent passes to it.** The real IR + LICM/CSE/strength-reduction/regalloc
+> is built in `codegen.ad` AFTER the self-hosting cutover (Track 3, the lead track),
+> so the optimizer runs on-device and isn't written twice. LLVM is **permanently
+> rejected** (not the path) — the native Adder optimizer is THE route to ≤2×/parity.
+> An in-flight Python from-AST IR is a THROWAWAY design prototype only.
 
 **Why:** compiled Adder is sound but unoptimized. Baseline
 (`docs/bench_adder_host.md`, `scripts/bench_adder_host.sh`): geomean
