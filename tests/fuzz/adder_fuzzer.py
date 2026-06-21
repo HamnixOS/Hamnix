@@ -364,8 +364,18 @@ def print_u64(val: uint64) -> int32:
 
 
 class Program:
-    def __init__(self, seed):
+    # subset=True restricts the generator to the SELF-HOSTED backend
+    # (codegen.ad) supported subset: it omits the 2-D array global + its
+    # traffic (codegen.ad does not support multi-dimensional array globals).
+    # Everything else codegen.ad handles (1-D/scalar globals of every width,
+    # casts, compares, div/mod, loops, if/else, helper calls). Used by the
+    # differential gate (tests/fuzz/ad_codegen_host.py + scripts/
+    # fuzz_adder_diff.sh) so codegen.ad ACCEPTS the program and its output can
+    # be compared against the predicted-output oracle. subset=False (default)
+    # is byte-identical to the historical generator — DO NOT regress.
+    def __init__(self, seed, subset=False):
         self.seed = seed
+        self.subset = subset
         self.rng = random.Random(seed)
         self.lines = []
         self.acc = 0                  # oracle: running uint64 accumulator
@@ -382,7 +392,11 @@ class Program:
         # ----- globals: 2-D array + one array per store width ----------------
         rows = rng.randint(2, 4)
         cols = rng.randint(2, 4)
-        self.emit(f"g_grid: Array[{rows}, Array[{cols}, int64]]")
+        if not self.subset:
+            # codegen.ad has no 2-D array global support; omit it in subset
+            # mode. The rng draws above are kept identical in both modes so a
+            # given seed's downstream RNG stream stays comparable.
+            self.emit(f"g_grid: Array[{rows}, Array[{cols}, int64]]")
         self.store_arrays = {}        # type -> [name, length, py-shadow list]
         for t in STORE_TYPES:
             n = rng.randint(4, 8)
@@ -417,7 +431,8 @@ class Program:
             # bits per its declared type; get_expr_type sees its type.
             env.append(TV(name, _to_reg(e.val), t, gt=t))
 
-        self._gen_grid_traffic(env)
+        if not self.subset:
+            self._gen_grid_traffic(env)   # 2-D array global: codegen.ad N/A
         self._gen_store_traffic(env)
         self._gen_scalar_global_traffic(env)
         self._gen_loop(env)
@@ -569,8 +584,8 @@ class Program:
         self._acc_add(py_u64)
 
 
-def render_program(seed):
-    p = Program(seed)
+def render_program(seed, subset=False):
+    p = Program(seed, subset=subset)
     body = p.build()
     return p, body
 
@@ -645,6 +660,41 @@ def compile_and_run(seed, body, keep=False, target="x86_64-linux"):
 # --------------------------------------------------------------------------
 DIFF_TARGET = None   # set by main() from --diff-target / env, e.g. a 2nd backend
 
+# When True, each program is ALSO compiled + run through the self-hosted
+# codegen.ad backend on the host (NO QEMU) via tests/fuzz/ad_codegen_host.py
+# and its (stdout, exit) compared against the primary (Python-backend) result.
+# Set by --ad-codegen / ADDER_FUZZ_DIFF_TARGET=ad-codegen. Programs codegen.ad
+# cannot compile are classified "unsupported" (NOT a failure); only a program
+# codegen.ad accepted that produced the wrong answer is a "differential"
+# miscompile.
+AD_CODEGEN = False
+_AD_HOST = None          # lazily-imported ad_codegen_host module
+_AD_WORK = None          # work dir for the codegen.ad ELFs
+
+
+def _ad_host():
+    global _AD_HOST, _AD_WORK
+    if _AD_HOST is None:
+        import importlib
+        _AD_HOST = importlib.import_module("ad_codegen_host")
+        _AD_WORK = WORK / "ad_codegen"
+    return _AD_HOST
+
+
+def run_through_ad_codegen(seed, body):
+    """Compile+run `body` through codegen.ad on the host. Returns a tuple:
+      ("unsupported", detail)          codegen.ad rejected (out of subset)
+      ("ok", stdout, exit)             codegen.ad compiled + ran
+      ("__ad_error__", kind, detail)   driver/run error (not a miscompile)
+    """
+    host = _ad_host()
+    r = host.run_through_codegen_ad(seed, body, _AD_WORK)
+    if r.kind == "unsupported":
+        return ("unsupported", r.detail)
+    if r.kind == "ok":
+        return ("ok", r.stdout, r.exit)
+    return ("__ad_error__", r.kind, r.detail)
+
 
 def run_differential(seed, body):
     """If a second backend/target is configured, compile+run the same program
@@ -658,7 +708,50 @@ def run_differential(seed, body):
     return (res.stdout, res.exit)
 
 
+def check_one_ad_codegen(seed):
+    """Differential check against the self-hosted codegen.ad backend.
+
+    Generates a SUBSET program (no 2-D array global — codegen.ad's only
+    relevant gap), compiles+runs it through BOTH the trusted Python backend
+    (the oracle is by-construction) AND codegen.ad on the host, and compares.
+
+    Returns (kind, seed, detail, body) where kind is one of:
+      "ok"           : codegen.ad accepted and matched the oracle
+      "unsupported"  : codegen.ad rejected the program (out of subset)
+      "differential" : codegen.ad accepted but produced the WRONG output
+                       (a genuine codegen.ad miscompile) -- the only failure
+      "py-miscompile": the PYTHON backend itself disagreed with the oracle
+                       (should never happen; surfaces a primary-backend bug)
+      "crash"/"runfail"/"ad-error": tooling/run errors (not codegen.ad bugs)
+    """
+    p, body = render_program(seed, subset=True)
+    # Primary: the trusted Python backend must match the by-construction oracle.
+    res = compile_and_run(seed, body)
+    if res.kind == "crash":
+        return ("crash", seed, "python-backend " + res.detail, body)
+    if res.kind == "runfail":
+        return ("runfail", seed, "python-backend " + res.detail, body)
+    if res.stdout != p.expected_stdout or res.exit != p.expected_exit:
+        return ("py-miscompile", seed,
+                f"python actual=({res.stdout},{res.exit}) "
+                f"oracle=({p.expected_stdout},{p.expected_exit})", body)
+    # Secondary: codegen.ad.
+    ad = run_through_ad_codegen(seed, body)
+    if ad[0] == "unsupported":
+        return ("unsupported", seed, ad[1], body)
+    if ad[0] == "__ad_error__":
+        return ("ad-error", seed, f"{ad[1]}: {ad[2]}", body)
+    ad_stdout, ad_exit = ad[1], ad[2]
+    if (ad_stdout, ad_exit) != (p.expected_stdout, p.expected_exit):
+        return ("differential", seed,
+                f"codegen.ad=({ad_stdout},{ad_exit}) "
+                f"oracle/python=({p.expected_stdout},{p.expected_exit})", body)
+    return ("ok", seed, "", body)
+
+
 def check_one(seed):
+    if AD_CODEGEN:
+        return check_one_ad_codegen(seed)
     p, body = render_program(seed)
     res = compile_and_run(seed, body)
     if res.kind == "crash":
@@ -687,6 +780,79 @@ def check_one(seed):
 
 
 # --------------------------------------------------------------------------
+# Differential batch driver for the self-hosted codegen.ad backend.
+# --------------------------------------------------------------------------
+def _run_ad_codegen_batch(base, args):
+    """Run the codegen.ad differential gate over a seeded batch and report
+    accept-rate + correctness-rate. Exits NONZERO only on a genuine codegen.ad
+    miscompile (a program codegen.ad accepted but got wrong) or a primary
+    (python) backend miscompile."""
+    ran = 0
+    accepted = 0          # codegen.ad compiled it
+    correct = 0           # accepted AND matched the oracle
+    unsupported = 0       # codegen.ad rejected (out of subset)
+    mis = []              # genuine codegen.ad miscompiles
+    pymis = []            # python-backend disagreements with the oracle
+    errs = []             # tooling/run errors (crash/runfail/ad-error)
+    print(f"[fuzz-adcodegen] base_seed={args.seed} count={args.count} "
+          f"(self-hosted codegen.ad differential, host-only)")
+    for i in range(args.count):
+        seed = base + i
+        try:
+            kind, s, detail, body = check_one(seed)
+        except Exception as e:
+            print(f"[gentool-bug seed={seed}] {e!r}")
+            continue
+        ran += 1
+        if kind == "ok":
+            accepted += 1; correct += 1
+        elif kind == "unsupported":
+            unsupported += 1
+        elif kind == "differential":
+            accepted += 1
+            mis.append((s, detail))
+            print(f"[MISCOMPILE seed={s}] {detail}")
+            WORK.mkdir(parents=True, exist_ok=True)
+            (WORK / f"adcodegen_miscompile_{s}.ad").write_text(body)
+        elif kind == "py-miscompile":
+            pymis.append((s, detail))
+            print(f"[PY-MISCOMPILE seed={s}] {detail}")
+            WORK.mkdir(parents=True, exist_ok=True)
+            (WORK / f"py_miscompile_{s}.ad").write_text(body)
+        else:  # crash / runfail / ad-error
+            errs.append((kind, s, detail))
+            print(f"[{kind} seed={s}] {detail[:160]}")
+        if mis and len(mis) >= args.max_fail:
+            print(f"[fuzz-adcodegen] reached --max-fail={args.max_fail}")
+            break
+        if (i + 1) % 500 == 0:
+            ar = (accepted / ran * 100) if ran else 0.0
+            print(f"[fuzz-adcodegen] ...{i+1}/{args.count} run, "
+                  f"accepted={accepted} ({ar:.1f}%), miscompiles={len(mis)}")
+
+    acc_rate = (accepted / ran * 100) if ran else 0.0
+    corr_rate = (correct / accepted * 100) if accepted else 0.0
+    print("\n===== CODEGEN.AD DIFFERENTIAL REPORT =====")
+    print(f"programs run:                 {ran}")
+    print(f"codegen.ad accepted:          {accepted}  ({acc_rate:.1f}% of run)")
+    print(f"  of accepted, CORRECT:       {correct}  ({corr_rate:.1f}%)")
+    print(f"  of accepted, MISCOMPILED:   {len(mis)}")
+    print(f"codegen.ad unsupported:       {unsupported}  "
+          f"(out of codegen.ad subset -- NOT a failure)")
+    print(f"python-backend miscompiles:   {len(pymis)}  (primary-backend bug)")
+    print(f"tooling/run errors:           {len(errs)}")
+    for (s, detail) in mis[:10]:
+        print(f"  [miscompile] seed={s}: {detail[:160]}")
+        print(f"        repro: ADDER_FUZZ_DIFF_TARGET=ad-codegen "
+              f"python3 tests/fuzz/adder_fuzzer.py --repro {s}")
+    for (s, detail) in pymis[:10]:
+        print(f"  [py-miscompile] seed={s}: {detail[:160]}")
+    print("==========================================")
+    # Fail ONLY on a genuine miscompile (codegen.ad OR python).
+    return 1 if (mis or pymis) else 0
+
+
+# --------------------------------------------------------------------------
 # Main batch driver.
 # --------------------------------------------------------------------------
 def main():
@@ -710,15 +876,25 @@ def main():
                          "single-pass, 1 = peephole optimizer). The predicted-"
                          "output oracle validates the chosen level directly. "
                          "Default: ADDER_FUZZ_OPT or 0.")
+    ap.add_argument("--ad-codegen", action="store_true",
+                    default=(os.environ.get("ADDER_FUZZ_DIFF_TARGET")
+                             == "ad-codegen"),
+                    help="DIFFERENTIAL: also compile+run each program through "
+                         "the self-hosted codegen.ad backend ON THE HOST (no "
+                         "QEMU) and compare against the Python backend / oracle. "
+                         "Programs use the codegen.ad-supported subset (no 2-D "
+                         "array global). Reports accept-rate + correctness-rate; "
+                         "fails ONLY on a genuine codegen.ad miscompile.")
     args = ap.parse_args()
 
-    global DIFF_TARGET, OPT_LEVEL
+    global DIFF_TARGET, OPT_LEVEL, AD_CODEGEN
     DIFF_TARGET = args.diff_target
+    AD_CODEGEN = args.ad_codegen
     if args.opt is not None:
         OPT_LEVEL = args.opt
 
     if args.emit is not None:
-        p, body = render_program(args.emit)
+        p, body = render_program(args.emit, subset=AD_CODEGEN)
         sys.stdout.write(body)
         sys.stderr.write(f"\n# expected stdout={p.expected_stdout} "
                          f"exit={p.expected_exit}\n")
@@ -733,6 +909,10 @@ def main():
         return 0 if kind == "ok" else 1
 
     base = args.seed * 1_000_003
+
+    if AD_CODEGEN:
+        return _run_ad_codegen_batch(base, args)
+
     fails = {"miscompile": [], "crash": [], "runfail": []}
     ran = 0
     print(f"[fuzz] base_seed={args.seed} count={args.count}")
