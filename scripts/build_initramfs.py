@@ -3894,6 +3894,31 @@ def build_archive() -> bytes:
                 "usr/lib/":  "lib/",
                 "usr/lib64/": "lib64/",
             }
+            # Version-agnostic closure augmentation. The explicit list
+            # above pins SONAME + a specific minor (e.g. libstdc++.so.6
+            # AND libstdc++.so.6.0.33). But the debootstrap fixture's
+            # minor version drifts across Debian point releases (the
+            # checked-in 2023 minbase carries libapt-pkg.so.6.0.0 /
+            # libstdc++.so.6.0.30, a fresh debootstrap carries 7.0.0 /
+            # 6.0.33), so a hard-pinned minor SILENTLY skips apt's real
+            # libapt-pkg — and apt then dies in ld.so with "failed to
+            # map segment from shared object" because its DT_NEEDED
+            # SONAME resolves to a symlink whose target was never
+            # staged. Fix: for the apt/dpkg library directory, glob
+            # EVERY lib*.so* present and stage it whatever its minor
+            # version. This makes the staged closure track the actual
+            # fixture instead of a frozen filename list. (Symlinks are
+            # followed by read_bytes() so a SONAME symlink lands with
+            # its target's real bytes.)
+            libdir = minbase_rootfs / "usr" / "lib" / "x86_64-linux-gnu"
+            glob_libs: list[str] = []
+            if libdir.is_dir():
+                for p in sorted(libdir.glob("lib*.so*")):
+                    rel = str(p.relative_to(minbase_rootfs))
+                    if rel not in REAL_DEBIAN_FILES:
+                        glob_libs.append(rel)
+            REAL_DEBIAN_FILES = REAL_DEBIAN_FILES + glob_libs
+
             staged_files = 0
             staged_bytes = 0
             missing: list[str] = []

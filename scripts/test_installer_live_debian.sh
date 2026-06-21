@@ -114,12 +114,21 @@ fi
 # debugfs (e2fsprogs) lists the live ext4 without mounting. The live
 # image's #distro subtree is distro/ at the partition root.
 HAVE_DPKG=0
+HAVE_APT=0
 HAVE_BUSYBOX=0
 DEBUGFS="/sbin/debugfs"; [ -x "$DEBUGFS" ] || DEBUGFS="$(command -v debugfs || true)"
 if [ -f "$LIVE_DISTRO_IMG" ] && [ -n "$DEBUGFS" ]; then
     if "$DEBUGFS" -R "stat /distro/usr/bin/dpkg" "$LIVE_DISTRO_IMG" 2>/dev/null \
             | grep -q "Type: regular"; then
         HAVE_DPKG=1
+    fi
+    # apt pulls a LARGER shared-object closure than dpkg (libapt-pkg +
+    # libapt-private + libstdc++ + libgcc_s). Its presence lets us assert
+    # ld.so maps that whole closure — the "failed to map segment from
+    # shared object" regression gate.
+    if "$DEBUGFS" -R "stat /distro/usr/bin/apt" "$LIVE_DISTRO_IMG" 2>/dev/null \
+            | grep -q "Type: regular"; then
+        HAVE_APT=1
     fi
     if "$DEBUGFS" -R "stat /distro/bin/busybox" "$LIVE_DISTRO_IMG" 2>/dev/null \
             | grep -q "Type: regular"; then
@@ -136,7 +145,7 @@ if [ "$HAVE_DPKG" -eq 0 ] && [ "$HAVE_BUSYBOX" -eq 0 ]; then
         exit 0
     fi
 fi
-echo "$TAG live image probe: dpkg=$HAVE_DPKG busybox=$HAVE_BUSYBOX"
+echo "$TAG live image probe: dpkg=$HAVE_DPKG apt=$HAVE_APT busybox=$HAVE_BUSYBOX"
 
 OVMF_RW=$(mktemp --tmpdir hamnix-live-deb.ovmf.XXXXXX.fd)
 IMG_RW=$(mktemp --tmpdir hamnix-live-deb.img.XXXXXX.raw)
@@ -261,6 +270,38 @@ if [ "$fail" -eq 0 ]; then
             echo "$TAG PASS: busybox printf ran in the live linux ns (LIVE_DEBIAN_OK assembled)."
         else
             echo "$TAG FAIL: busybox marker not assembled — live linux ns did not execute." >&2
+            fail=1
+        fi
+    fi
+fi
+
+# --- apt: the LARGER shared-object closure loads in ld.so -------------
+# apt's DT_NEEDED set (libapt-pkg.so + libapt-private.so + libstdc++ +
+# libgcc_s) is a bigger DSO closure than dpkg's. The regression this
+# guards: ld.so's mmap of one of those .so PT_LOAD segments failing with
+# "failed to map segment from shared object" (either the DSO was never
+# staged into the live image, or the linux-ABI file-backed mmap path
+# choked on the larger map). Both the version banner AND the ABSENCE of
+# the shlib-error string are asserted.
+if [ "$fail" -eq 0 ] && [ "$HAVE_APT" -eq 1 ]; then
+    echo "$TAG --- apt shared-object-closure sub-gate ---"
+    if send_until "enter linux { /usr/bin/apt --version }" \
+                  "apt " "$CMD_WAIT"; then
+        if strings "$LOG" | grep -q "failed to map segment from shared object"; then
+            echo "$TAG FAIL: apt printed the ld.so 'failed to map segment' shlib error." >&2
+            fail=1
+        else
+            echo "$TAG PASS: apt --version ran — full DSO closure mapped (no shlib error)."
+        fi
+    else
+        # Fall back to apt-get, whose closure is identical, in case the
+        # apt(8) wrapper banner format drifts.
+        if send_until "enter linux { /usr/bin/apt-get --version }" \
+                      "apt " "$CMD_WAIT" \
+           && ! strings "$LOG" | grep -q "failed to map segment from shared object"; then
+            echo "$TAG PASS: apt-get --version ran — full DSO closure mapped."
+        else
+            echo "$TAG FAIL: apt did not load its shared-object closure." >&2
             fail=1
         fi
     fi
