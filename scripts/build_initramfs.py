@@ -3879,6 +3879,70 @@ def build_archive() -> bytes:
                 # Debian-shipped one is the canonical source).
                 "usr/share/keyrings/debian-archive-keyring.gpg",
                 "etc/apt/trusted.gpg.d/debian-archive-keyring.gpg",
+                # --- OFFLINE apt-get install / dpkg -i closure ---------
+                # Goal: `enter linux { apt-get install -y hamhello }` (and
+                # the shorter `dpkg -i .../hamhello.deb`) actually populate
+                # the live filesystem from a local file:// repo, with the
+                # installed binary running afterwards. That fork chain is
+                #   apt-get -> /usr/lib/apt/methods/file  (fetch the .deb)
+                #           -> dpkg --unpack -> dpkg-deb (-> tar -> gzip)
+                #           -> coreutils (rm/mv/cp/mkdir/chmod/...) for the
+                #              filesystem install + admindir bookkeeping.
+                # Each tool's .so closure is covered by the glob-libs
+                # augmentation below (every lib*.so* in the libdir).
+                #
+                # apt download "methods" — the file:// fetcher (and copy,
+                # apt's local-mirror cousin). Without these apt-get can
+                # parse the repo but cannot retrieve the .deb.
+                "usr/lib/apt/methods/file",
+                "usr/lib/apt/methods/copy",
+                # dpkg unpack/install helpers. dpkg forks dpkg-deb to
+                # extract data.tar; dpkg-split/-query round out the admin
+                # surface dpkg touches during an install.
+                "usr/bin/dpkg-deb",
+                "usr/bin/dpkg-query",
+                "usr/bin/dpkg-split",
+                # dpkg-deb forks tar, which forks the decompressor; the
+                # leaf hamhello .deb uses gzip (data.tar.gz).
+                "bin/tar",
+                "bin/gzip",
+                "usr/bin/xz",
+                "usr/bin/zstd",
+                # coreutils dpkg/apt fork during a real install + the
+                # `/bin/sh` maintainer-script shell (dash already staged).
+                "bin/cp",
+                "bin/mv",
+                "bin/rm",
+                "bin/mkdir",
+                "bin/rmdir",
+                "bin/chmod",
+                "bin/chown",
+                "bin/ln",
+                "bin/ls",
+                "bin/cat",
+                "usr/bin/wc",
+                "usr/bin/sort",
+                "usr/bin/head",
+                # GENUINE Debian bash (+ its libtinfo closure is globbed
+                # below). Proves the full Debian /bin/bash runs in the ns,
+                # not just dash. ~1.2 MB; acceptable for the curated slice.
+                "bin/bash",
+                # The local file:// apt repo (scripts/build_local_apt_repo
+                # .sh stages this whole subtree). apt's `file` method reads
+                # it directly off the Debian root.
+                "opt/localrepo/dists/local/Release",
+                "opt/localrepo/dists/local/main/binary-amd64/Packages",
+                "opt/localrepo/dists/local/main/binary-amd64/Packages.gz",
+                "opt/localrepo/pool/main/h/hamhello/hamhello_1.0_amd64.deb",
+                # apt sources fragment pointing at the local repo, plus a
+                # cached copy of the .deb for the `dpkg -i` short path.
+                "etc/apt/sources.list.d/local.list",
+                "var/cache/apt/archives/hamhello_1.0_amd64.deb",
+                # apt writes its package/index state under these; dpkg
+                # records installs in var/lib/dpkg. Pre-create the dirs by
+                # staging their (possibly empty) scaffold files so the
+                # tmpfs overlay has somewhere to land the install.
+                "var/lib/dpkg/info/format",
             ]
             # Usrmerge expansion: Debian binaries internally reference
             # `/lib64/ld-linux-x86-64.so.2`, `/lib/x86_64-linux-gnu/
