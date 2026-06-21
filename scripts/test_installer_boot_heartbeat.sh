@@ -286,8 +286,11 @@ attempt=1
 last_rc=2
 while [ "$attempt" -le "$RETRIES" ]; do
     say "--- boot attempt $attempt/$RETRIES ---"
-    boot_once
-    last_rc=$?
+    # `set -e` is active: a non-zero return from boot_once (rc 1/2 = a
+    # failed attempt we WANT to retry) must not abort the script, so
+    # capture it without letting -e fire.
+    last_rc=0
+    boot_once || last_rc=$?
     if [ "$last_rc" -eq 0 ]; then
         say "boot attempt $attempt: heartbeat observed."
         if evaluate "$LOG"; then
