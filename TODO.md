@@ -177,18 +177,26 @@ not whether it's available. Native drivers stay first choice where the
 hardware is standardized; `.ko` remains the escape hatch for vendor-mess
 HW (consumer wifi, GPUs) — now crash-isolated.
 
-- [ ] **User-mode driver framework (UMDF-style).** A driver runs as a
-  process that posts a `#X` file server; kernel provides the privileged
-  primitives it needs (MMIO map, IRQ delivery as a readable file, DMA
-  buffer alloc) over a controlled channel. Crash → kernel restarts the
-  server, kernel survives.
-- [ ] **Port the `.ko` loader into a userland host process.** Today
-  `linux_abi/loader.ad` runs in-kernel: ET_REL load, symbol resolution
-  (`linux_abi/exports.ad`), relocations, `%gs`-relative per-CPU. Move
-  this into the UMDF host; the `.ko`'s `kmalloc`/IRQ/DMA shims bottom out
-  into the kernel-provided primitives instead of direct kernel calls.
-- [ ] **Restart/crash-isolation test** — kill a userland driver under
-  load, prove the kernel + other drivers survive and the server respawns.
+- [~] **User-mode driver framework (UMDF-style).** First vertical slice
+  landed: `linux_abi/umdf_kernel.ad` exposes the three privileged
+  primitives over a narrow syscall channel — MMIO map (`SYS_UMDF_MMIO_MAP`
+  321, uncacheable phys→user VA), DMA alloc (`SYS_UMDF_DMA_ALLOC` 322,
+  phys-contiguous + phys exposed), IRQ file (`SYS_UMDF_IRQ_OPEN` 323 +
+  blocking read on the returned irq fd, per-vector WaitQueue). The driver
+  posts a `#X` server (existing namespace law). Remaining: respawn
+  supervisor (auto-restart on crash), real BAR-backed driver.
+- [~] **Port the `.ko` loader into a userland host process.** Landed:
+  `user/umdf_host.ad` runs the ET_REL load + reloc + symbol resolution +
+  `init_module` dispatch in a CPL3 process; the `.ko` lands in mmap'd
+  USER memory and `_printk`/MMIO/IRQ/DMA shims bottom out into the host's
+  userland shim / the new syscalls. Remaining: broaden the userland shim
+  table toward `linux_abi/exports.ad` parity for richer `.ko`s, and `%gs`
+  per-CPU handling in userland.
+- [x] **Restart/crash-isolation test** — `scripts/test_umdf_host.sh`:
+  crashes a userland driver host (NULL deref), proves the kernel + hamsh
+  survive, and a fresh host re-inits the `.ko` afterward. Per-task UMDF
+  cleanup hook (`register_umdf_task_exit_hook`) reclaims IRQ files + DMA
+  buffers on both clean exit and crash.
 
 ## Track 5 — Kernel scaling rework
 
