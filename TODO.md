@@ -54,11 +54,34 @@ quality lives in the *passes*, so there's no perf reason to keep them in Python.
      2-D grid traffic in BOTH modes; `scripts/fuzz_adder_diff.sh` accept-rate is
      100% with 0 miscompiles. The differential gate now exercises EVERY construct
      the default generator emits (subset==default).
-   - REMAINING for cutover: by-value struct params/returns, multi-base receiver
-     offset. (`codegen.ad` already covers 1-D/2-D/scalar globals of every width,
-     casts, compares, div/mod, while/for/do-while loops, if/elif/else,
-     break/continue, helper calls, pointers, syscalls, classes/methods, structs +
-     member access, and — as of 2026-06-21 — scalar SSE float32/float64.)
+   - ✅ **Parity gaps CLOSED (2026-06-21).** Multi-base receiver-offset bump
+     LANDED in `codegen.ad` (`class_end_of_fields`/`receiver_offset_for` +
+     `emit_add_imm_rax` bump in `gen_method_call`; fuzzer emits a
+     `MDerived(MBase0,MBase1)` inherited-from-second-base method every program).
+     By-value struct params/returns REJECTED in lockstep in BOTH backends
+     (Adder has no by-value aggregate ABI by design; the seed previously
+     SILENTLY miscompiled them — now `CodeGenError` / `cg_fail(9)`). SysV XMM
+     extern-FP path documented as intentionally GP-uniform/unused (no extern
+     float call exists). (`codegen.ad` already covers 1-D/2-D/scalar globals of
+     every width, casts, compares, div/mod, while/for/do-while loops,
+     if/elif/else, break/continue, helper calls, pointers, syscalls,
+     classes/methods + multi-base dispatch, structs + member access, and scalar
+     SSE float32/float64.)
+   - ✅ **CUTOVER DRY-RUN PROVEN (2026-06-21).** The full self-hosted compiler
+     (lexer+parser+codegen+elf_emit + a new Linux-syscall host driver
+     `fused_driver_host_main.ad`) builds as a single `x86_64-linux` host ELF via
+     the Python seed and runs. Differential self-compile over the fuzz corpus
+     (`.ad` host binary vs Python seed) = **300/300 = 100% behavioral match, 0
+     mismatch, 0 unsupported**. No self-hosting fixpoint blocker (the `.ad`
+     compiler's own source uses only the flat SoA subset both backends compile).
+     Gate: `scripts/test_selfhost_cutover_dryrun.sh`. Validation:
+     `fuzz_adder_diff.sh` 4 seeds×400 = 1600 progs 100%/0-miscompile,
+     `fuzz_adder.sh` 600 progs 0-miscompile, `test_adder_x86_64_linux.sh` +
+     `test_arm64_codegen.sh` PASS. NEXT (not done — deliberately): flip the
+     default build driver to the `.ad` binary per the runbook in
+     `docs/subsystems/adder-compiler.md` (config switch + CI guard via the
+     dry-run + on-device fixpoint gates; Python seed retained as bootstrap +
+     fallback).
 4. **Userland-isolated drivers (UMDF)** — ✅ DONE (first slice: stock `.ko` in a
    restartable userland host, crash-isolated). Follow-ups: respawn supervisor, real
    BAR-backed driver, `exports.ad` parity.

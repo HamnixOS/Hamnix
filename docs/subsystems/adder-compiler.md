@@ -143,10 +143,47 @@ handle.
 
 The struct fixed-32 differential is value-based (not byte-identical) so
 `codegen.ad` is free to pick its own register/encoding within each lowering
-as long as the runtime value matches the oracle. **Remaining for a
-default-build cutover:** multi-base receiver-offset bump, by-value embedded
-struct fields, struct-typed params/returns by value, `for`-over-`Ptr[T]`.
-Floats are now DONE (see below).
+as long as the runtime value matches the oracle.
+
+**Multi-base receiver-offset bump — LANDED (2026-06-21).** When a method is
+inherited from a NON-FIRST base (e.g. `class D(A, B)` calling `B`'s method on
+a `D`), the receiver pointer must be bumped by `sizeof(prior bases)` so the
+callee's `self.field` addressing (against the owner's layout, which starts at
+offset 0) lands on the right bytes. `codegen.ad` now computes this with
+`class_end_of_fields()` (a flattened field walk WITHOUT the trailing 8-byte
+`.bss` round-up — mirrors `_collect_class_methods.end_of_fields`) and
+`receiver_offset_for()` (the running offset where the owning base sits —
+mirrors `resolve`'s `running_offset`), then `gen_method_call` emits an
+`emit_add_imm_rax(recv_off)` bump. Single inheritance / own methods stay at
+offset 0 (no bump), bit-identical to before. The fuzzer emits a
+`MDerived(MBase0, MBase1)` class with a method inherited from the SECOND base
+(receiver_offset 16), folded bit-exactly into `g_accum`, so the gate exercises
+the bump on every program.
+
+**By-value struct params/returns — REJECTED IN LOCKSTEP (2026-06-21).** Adder
+has NO by-value aggregate ABI by design (see the table below: aggregates cross
+function boundaries via `Ptr[T]` out-parameters). The Python seed previously
+*silently miscompiled* a struct-typed param (it spilled one arg register and
+read the rest as stack garbage) and returned a dangling local address for a
+struct return. Fixed at the right layer: BOTH backends now REJECT a by-value
+struct parameter or return type LOUDLY — the seed with a `CodeGenError`
+("pass `Ptr[T]` … Adder has no by-value aggregate ABI"), `codegen.ad` with
+`cg_fail(9)` in `gen_function` (param loop + the `nd_b` return-type check).
+This closes the parity gap correctly (both refuse) and removes a latent
+silent-miscompile. The self-hosted toolchain (`lexer.ad`, `parser.ad`,
+`codegen.ad`, `elf_emit.ad`) uses ZERO by-value structs, so this is not a
+self-hosting fixpoint blocker.
+
+**SysV XMM FP-arg convention — intentionally GP-uniform (documented).** No
+`extern def` with a float param exists anywhere in the `.ad` tree, and the
+fuzzer passes every argument (including float-typed values, which travel as
+their IEEE-754 bit pattern in a GP register) through the GP arg sequence
+self-consistently. Both backends are therefore GP-uniform for calls and need
+NO XMM arg path. A true SysV extern taking a `float`/`double` would need the
+value class-routed into `%xmm0..7` (and the return read from `%xmm0`); the
+single place this would hook in is `codegen_x86.gen_call`'s arg-marshal loop
+(and the mirror in `codegen.ad`'s `gen_call`). Not wired because nothing
+exercises it. Floats within Adder code are DONE (see below).
 
 ### Floating point — scalar SSE, LOCKSTEP (DONE 2026-06-21)
 
@@ -206,6 +243,69 @@ backends — which is exactly what the differential fuzzer validates — but a
 call to a TRUE SysV extern taking `float`/`double` in `XMM0-7` is not yet
 wired (the fuzzer makes no such call). ARM64 FP is left as-is (not required
 for the x86 cutover).
+
+## Self-hosting cutover — PARITY-COMPLETE + dry-run PROVEN (2026-06-21)
+
+All `codegen.ad`-vs-seed correctness gaps that the differential fuzzer can
+reach are closed (multi-base offset LANDED; by-value struct ABI REJECTED in
+lockstep; XMM extern documented as GP-uniform/unused). The self-hosted `.ad`
+compiler is **cutover-ready**: it builds as a host binary and reproduces the
+seed across the corpus.
+
+**Dry-run result (host-only, no QEMU).** `scripts/test_selfhost_cutover_dryrun.sh`:
+
+1. Fuses `lexer.ad + parser.ad + codegen.ad + elf_emit.ad +
+   `fused_driver_host_main.ad`` (a Linux-syscall, argv-driven driver — the
+   host twin of `fused_driver_main.ad`) into one source via
+   `concat_compiler_source.py` and compiles it with the **Python seed** to a
+   single static `x86_64-linux` ELF (`build/cutover/host_ac.elf`, ~272 KB).
+   It links and runs; a smoke compile succeeds. (Its EMITTED ELF is a
+   Hamnix-format ELF32 image — `elf_emit.ad` deliberately writes
+   `ELFCLASS32`/`EM_386` for the Hamnix `fs/elf.ad` loader — so it is NOT run
+   on host Linux here; the on-device `test_selfhost_fixpoint.sh` runs it.)
+2. **Differential self-compile** (`tests/fuzz/cutover_dryrun.py`): over the
+   fuzz corpus, each program is compiled by BOTH the Python seed
+   (`codegen_x86.py` → `as`/`ld`) AND the self-hosted `.ad` host compiler
+   (the `ad_codegen` dump driver = `lexer.ad+parser.ad+codegen.ad` fused to
+   `x86_64-linux` by the seed), then run; the two are asserted
+   behaviorally-identical (same printed `g_accum` + exit). **300/300 = 100%
+   match, 0 mismatch, 0 unsupported.** (Not byte-identical by design: the
+   seed routes through GNU `as`, `codegen.ad` emits raw machine code —
+   different-but-equivalent encodings.)
+
+There is **no self-hosting fixpoint blocker**: the `.ad` compiler's own
+source uses only the flat SoA subset (parallel global arrays, `Ptr[T]`,
+`Array[N,T]`) that both the seed and `codegen.ad` already compile — zero
+classes, zero by-value structs.
+
+**Runbook — flipping the default build driver to the `.ad` binary** (NOT done
+in this dry-run; the seed stays as the bootstrap and the fallback):
+
+1. *Bootstrap order (unchanged):* the Python seed (`compiler/`,
+   `codegen_x86.py`) always builds FIRST and compiles the `.ad` compiler
+   source into a host binary (stage1). This is the trust root; it is never
+   removed.
+2. *Build stage1 once per build:* in the build entry (`scripts/build_user.sh`
+   already builds `codegen_ac_driver.elf`/`adder_cc.elf` from the `.ad`
+   sources via the seed — that IS stage1; reuse it), produce the host
+   `host_ac.elf` the same way (`concat_compiler_source.py --with-driver` with
+   the host driver + `--target=x86_64-linux`).
+3. *Route `.ad`-target compiles through stage1:* add a build-config switch
+   (e.g. `ADDER_CC=adder` env / a `--self-hosted` flag on the build driver)
+   that, when set, invokes `host_ac.elf <in.ad> <out>` instead of `python3 -m
+   compiler.adder`. Keep `ADDER_CC=python` (the current behavior) as the
+   default until the switch has soaked.
+4. *CI guard (must land WITH the flip):* run `test_selfhost_cutover_dryrun.sh`
+   (the 100%-match differential) plus the existing on-device
+   `test_selfhost_fixpoint.sh` (stage1==stage2 byte-identity) on every change
+   to `compiler/*.ad`. Any behavioral mismatch or fixpoint divergence fails
+   the build, so a `codegen.ad` regression can never silently reach the
+   default driver. Keep `fuzz_adder_diff.sh` (1600-program differential) as
+   the broad correctness net.
+5. *Fallback:* the Python seed remains in-tree and selectable; a program the
+   `.ad` compiler reports `unsupported` for (outside its subset) falls back to
+   the seed. Flip the default only after the dry-run + fixpoint gates have run
+   green across the full CI matrix for a soak window.
 
 ## Related docs
 
