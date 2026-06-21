@@ -3,13 +3,13 @@
 # fail-closed regression guard.
 #
 # BACKGROUND. kernel/sched/core.ad lifted the scheduler task cap NTASKS (and
-# NR_FDS) from 16 to 64 (and NTASKS again 64 -> 256). Seven satellite per-task policy tables were sized /
+# NR_FDS) from 16 to 64 (and NTASKS 64 -> 256 -> 512). Satellite per-task policy tables were sized /
 # bounded against an INDEPENDENT local "16" and several FAILED OPEN: a task
 # scheduled into slot 16-63 had its security policy silently voided —
 # seccomp let ALL syscalls through, landlock un-sandboxed the task, caps /
 # mempolicy / pidfd / perf / keyring dropped its per-task record.
 #
-# The fix: every per-task table is sized to NTASKS (== 256) and every bounds
+# The fix: every per-task table is sized to NTASKS (== 512) and every bounds
 # check / row stride references the scheduler's IMPORTED NTASKS / NR_FDS
 # DIRECTLY (Adder forbids initialising one global from another, so there is no
 # local alias constant to drift). The security-bearing out-of-range branches
@@ -20,7 +20,7 @@
 # (a future NTASKS lift that misses one table dim, or a fail-open branch creeping
 # back). It asserts:
 #   (A) NTASKS in core.ad is the single source of truth and the array dims in
-#       every owned file match it (256, or 256*NR_FDS = 16384 for flat task×fd).
+#       every owned file match it (512, or 512*NR_FDS = 32768 for flat task×fd).
 #   (B) No owned file re-introduces a per-task table sized 16 / 64, nor a
 #       local *_NTASKS / *_NRFDS = 16/64 literal.
 #   (C) The security-bearing out-of-range branches DENY (fail closed): seccomp's
@@ -43,10 +43,10 @@ SECCOMP="kernel/seccomp_bpf.ad"
 OWNED_ABI="linux_abi/u_landlock.ad linux_abi/u_caps.ad linux_abi/u_mempolicy.ad
            linux_abi/u_pidfd.ad linux_abi/u_perf.ad linux_abi/u_keyring.ad"
 
-# (A) NTASKS / NR_FDS single source of truth in core.ad. NTASKS == 256 (lifted
-# 64 -> 256 for graphical-session task fan-out); NR_FDS stays 64.
-if ! grep -Eq '^NTASKS:[[:space:]]+uint64[[:space:]]*=[[:space:]]*256\b' "$CORE"; then
-    bad "core.ad NTASKS is not the expected single-source literal 256"
+# (A) NTASKS / NR_FDS single source of truth in core.ad. NTASKS == 512 (lifted
+# 256 -> 512 by Track 5 now the dispatch path is O(active)); NR_FDS stays 64.
+if ! grep -Eq '^NTASKS:[[:space:]]+uint64[[:space:]]*=[[:space:]]*512\b' "$CORE"; then
+    bad "core.ad NTASKS is not the expected single-source literal 512"
 fi
 if ! grep -Eq '^NR_FDS:[[:space:]]+uint64[[:space:]]*=[[:space:]]*64\b' "$CORE"; then
     bad "core.ad NR_FDS is not the expected single-source literal 64"

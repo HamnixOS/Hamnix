@@ -3,8 +3,8 @@
 #
 # PURPOSE
 #
-#   Prove the scheduler task-cap lift NTASKS 64 -> 256 (kernel/sched/core.ad)
-#   ACTUALLY took effect — i.e. the kernel can hold MORE than the old 64-task
+#   Prove the scheduler task-cap lift NTASKS 256 -> 512 (kernel/sched/core.ad)
+#   ACTUALLY took effect — i.e. the kernel can hold MORE than the old 256-task
 #   ceiling LIVE SIMULTANEOUSLY in distinct task_table slots, not merely
 #   recycle a small slot pool sequentially (which the spawn-loop / spawn-stress
 #   tests already cover).
@@ -17,14 +17,14 @@
 #        cooperative BSP never dispatches it during the burst. They pile up as
 #        concurrently-LIVE slots.
 #     2. Counts the non-FREE task_table slots at the peak (the simultaneous
-#        live high-water mark) and asserts it EXCEEDS the old 64 ceiling.
+#        live high-water mark) and asserts it EXCEEDS the old 256 ceiling.
 #     3. Marks each detached and cooperatively schedule()s until all have
 #        self-reaped to STATE_FREE, leaving a clean table for the handoff.
 #
 # PASS markers (all must be present):
 #   (a) "[ntasks_test] starting NTASKS-ceiling concurrency proof"
 #       The proof was triggered by the /etc/ntasks-test marker.
-#   (b) "[ntasks_test] PASS: held N > 64 live tasks at once"  (N > 64)
+#   (b) "[ntasks_test] PASS: held N > 256 live tasks at once"  (N > 256)
 #       The kernel held more than the OLD ceiling concurrently.
 #   (c) "[ntasks_test] DONE"
 #       The kthreads all drained cleanly (no slot leak, no drain timeout).
@@ -94,18 +94,18 @@ check_marker() {
 check_marker "proof triggered by /etc/ntasks-test" \
     "[ntasks_test] starting NTASKS-ceiling concurrency proof"
 
-# (b) Held > 64 live tasks concurrently — extract N and re-assert > 64.
-PASS_LINE=$(grep -a -oE "\[ntasks_test\] PASS: held [0-9]+ > 64 live tasks at once" "$LOG" | head -1 || true)
+# (b) Held > 256 live tasks concurrently — extract N and re-assert > 256.
+PASS_LINE=$(grep -a -oE "\[ntasks_test\] PASS: held [0-9]+ > 256 live tasks at once" "$LOG" | head -1 || true)
 if [ -n "$PASS_LINE" ]; then
     N=$(echo "$PASS_LINE" | grep -oE "held [0-9]+" | grep -oE "[0-9]+")
-    if [ "${N:-0}" -gt 64 ]; then
-        echo "[ntasks_test] PASS: held ${N} live tasks simultaneously (> old 64 ceiling)"
+    if [ "${N:-0}" -gt 256 ]; then
+        echo "[ntasks_test] PASS: held ${N} live tasks simultaneously (> old 256 ceiling)"
     else
-        echo "[ntasks_test] FAIL: reported live count ${N} is not > 64" >&2
+        echo "[ntasks_test] FAIL: reported live count ${N} is not > 256" >&2
         fail=1
     fi
 else
-    echo "[ntasks_test] FAIL: ceiling-proof PASS line absent (did not exceed 64 live)" >&2
+    echo "[ntasks_test] FAIL: ceiling-proof PASS line absent (did not exceed 256 live)" >&2
     fail=1
 fi
 
@@ -142,4 +142,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[ntasks_test] PASS — NTASKS=256 ceiling proven: held > 64 live tasks at once, drained clean"
+echo "[ntasks_test] PASS — NTASKS=512 ceiling proven: held > 256 live tasks at once, drained clean"
