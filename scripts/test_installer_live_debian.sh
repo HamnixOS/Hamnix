@@ -331,10 +331,20 @@ if [ "$fail" -eq 0 ] && [ "$HAVE_DPKG" -eq 1 ]; then
     send_until "enter linux { /bin/sh -c '/bin/echo LXLS_FENCE_$$ ; /bin/ls /' }" \
                "LXLS_FENCE_$$" "$CMD_WAIT" || true
     sleep 2
-    if awk -v f="LXLS_FENCE_$$" '
-            index($0,f)>0 {armed=1; next}
-            armed && /(^|[[:space:]])version([[:space:]]|$)/ {found=1; exit}
-            END{exit found?1:0}' "$LOG"; then
+    # Robust scan: strip ANSI/CR (busybox ls colourises, the line editor
+    # echoes char-by-char with cursor codes) and SKIP "hamsh$" command-echo
+    # lines so the typed command text (which contains the fence token AND
+    # paths like /etc/debian_version) is never mistaken for `ls` OUTPUT.
+    # Arm on the fence token's OUTPUT line (the `/bin/echo` result, not the
+    # command echo) and scan only the bounded listing that follows it.
+    if sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r//g' "$LOG" \
+        | awk -v f="LXLS_FENCE_$$" '
+            index($0,"hamsh$")>0 {next}
+            index($0,f)>0 {armed=1; win=0; next}
+            armed { win++
+                    if ($0 ~ /(^|[[:space:]])version([[:space:]]|$)/) {found=1; exit}
+                    if (win>20) armed=0 }
+            END{exit found?1:0}'; then
         echo "$TAG FAIL: native-only /version appears in the linux-ns root — roots NOT isolated." >&2
         fail=1
     else
