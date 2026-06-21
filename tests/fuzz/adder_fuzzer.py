@@ -35,6 +35,7 @@
 # (--seed, program-index), so any failing program reproduces in isolation.
 
 import argparse
+import os
 import random
 import subprocess
 import sys
@@ -662,6 +663,16 @@ def check_one(seed):
         return ("miscompile", seed,
                 f"exit actual={res.exit} expected={p.expected_exit} "
                 f"(stdout matched={res.stdout})", body)
+    # Optional differential cross-check against a second backend/target. The
+    # oracle already passed; this catches a divergence where the second
+    # backend disagrees (primarily useful once an optimizer/2nd backend
+    # exists). No-op unless --diff-target / ADDER_FUZZ_DIFF_TARGET is set.
+    diff = run_differential(seed, body)
+    if diff is not None and diff[0] != "__diff_error__":
+        if diff != (res.stdout, res.exit):
+            return ("differential", seed,
+                    f"primary=({res.stdout},{res.exit}) "
+                    f"diff-target=({diff[0]},{diff[1]})", body)
     return ("ok", seed, "", body)
 
 
@@ -678,7 +689,16 @@ def main():
                     help="print the source of one program by its seed and exit")
     ap.add_argument("--max-fail", type=int, default=20,
                     help="stop after this many distinct failures")
+    ap.add_argument("--diff-target", default=os.environ.get(
+                        "ADDER_FUZZ_DIFF_TARGET"),
+                    help="SCAFFOLD: also run each program through this second "
+                         "--target= (e.g. a future 2nd backend) and report a "
+                         "diff against it; the predicted-output oracle remains "
+                         "the primary check. Default: off.")
     args = ap.parse_args()
+
+    global DIFF_TARGET
+    DIFF_TARGET = args.diff_target
 
     if args.emit is not None:
         p, body = render_program(args.emit)
