@@ -28,6 +28,7 @@ from .parser import Parser, ParseError, parse
 from .ast_nodes import Program, ImportDecl
 from .codegen_x86 import generate as generate_x86, CodeGenError
 from .codegen_arm64 import generate as generate_arm64
+from .peephole_x86 import optimize_text as peephole_x86
 
 
 # Compilation targets. `codegen` selects the backend; `kbuild` means the
@@ -92,8 +93,15 @@ TARGETS = {
 DEFAULT_TARGET = "x86_64-bare-metal"
 
 
-def get_generator(target: str):
-    """Return a callable program -> assembly string for the target."""
+def get_generator(target: str, opt_level: int = 0):
+    """Return a callable program -> assembly string for the target.
+
+    ``opt_level`` selects the optimization pipeline. ``0`` (default) is the
+    trusted single-pass path — the only path the Hamnix image build uses.
+    ``1`` runs the x86 peephole optimizer (Track 6) over the emitted assembly;
+    it is gated behind ``-O1`` and validated by ``scripts/fuzz_adder.sh``.
+    The peephole only applies to the x86 backend; arm64 ignores it.
+    """
     spec = TARGETS.get(target)
     if spec is None:
         known = ", ".join(TARGETS)
@@ -107,7 +115,13 @@ def get_generator(target: str):
         # it for `userspace` targets too — without claiming bare_metal,
         # which elsewhere means "no OS / boot-stub link".
         no_modinfo = spec.get("bare_metal", False) or spec.get("userspace", False)
-        return lambda program: generate_x86(program, bare_metal=no_modinfo)
+
+        def _gen_x86(program):
+            asm = generate_x86(program, bare_metal=no_modinfo)
+            if opt_level >= 1:
+                asm = peephole_x86(asm)
+            return asm
+        return _gen_x86
     if spec["codegen"] == "arm64":
         # arm64's bare_metal gates the inline `_start`/exit wrapper, so a
         # userspace target (aarch64-linux) must pass bare_metal=False to
@@ -521,9 +535,9 @@ def merge_programs(files: list[Path]) -> Program:
 
 
 def compile_source(source: str, filename: str = "<stdin>",
-                   target: str = DEFAULT_TARGET) -> str:
+                   target: str = DEFAULT_TARGET, opt_level: int = 0) -> str:
     """Compile Adder source to assembly (single file, no imports)."""
-    generate = get_generator(target)
+    generate = get_generator(target, opt_level)
     try:
         program = parse(source, filename)
         return generate(program)
@@ -532,9 +546,10 @@ def compile_source(source: str, filename: str = "<stdin>",
         sys.exit(1)
 
 
-def compile_with_imports(main_file: Path, target: str = DEFAULT_TARGET) -> str:
+def compile_with_imports(main_file: Path, target: str = DEFAULT_TARGET,
+                         opt_level: int = 0) -> str:
     """Compile Adder source with import resolution."""
-    generate = get_generator(target)
+    generate = get_generator(target, opt_level)
     project_root = find_hamnix_root()
 
     # Collect all imported files
@@ -1020,7 +1035,8 @@ def cmd_compile(args: argparse.Namespace) -> int:
         print(f"Error: {source_file} not found", file=sys.stderr)
         return 1
 
-    asm = compile_with_imports(source_file, target=args.target)
+    asm = compile_with_imports(source_file, target=args.target,
+                               opt_level=getattr(args, "opt_level", 0))
 
     # kbuild targets: the Linux kernel build system owns assembly + link, so
     # we stop at emitting a .S file for it to consume.
@@ -1091,7 +1107,8 @@ def cmd_asm(args: argparse.Namespace) -> int:
         return 1
 
     source = source_file.read_text()
-    asm = compile_source(source, str(source_file), target=args.target)
+    asm = compile_source(source, str(source_file), target=args.target,
+                         opt_level=getattr(args, "opt_level", 0))
 
     if args.output:
         Path(args.output).write_text(asm)
@@ -1117,6 +1134,11 @@ def main() -> int:
     compile_parser.add_argument("--target", default=DEFAULT_TARGET,
                                choices=list(TARGETS),
                                help=f"Compilation target (default: {DEFAULT_TARGET})")
+    compile_parser.add_argument("-O", dest="opt_level", type=int, default=0,
+                               choices=[0, 1],
+                               help="Optimization level: 0 = trusted "
+                                    "single-pass (default), 1 = x86 peephole "
+                                    "optimizer (Track 6)")
     compile_parser.set_defaults(func=cmd_compile)
 
     # Asm command
@@ -1126,6 +1148,10 @@ def main() -> int:
     asm_parser.add_argument("--target", default=DEFAULT_TARGET,
                            choices=list(TARGETS),
                            help=f"Compilation target (default: {DEFAULT_TARGET})")
+    asm_parser.add_argument("-O", dest="opt_level", type=int, default=0,
+                           choices=[0, 1],
+                           help="Optimization level: 0 = trusted single-pass "
+                                "(default), 1 = x86 peephole optimizer")
     asm_parser.set_defaults(func=cmd_asm)
 
     args = parser.parse_args()

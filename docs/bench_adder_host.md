@@ -7,9 +7,42 @@ baseline for the `x86_64-linux` Adder target measured against C
 Reproduce with **`bash scripts/bench_adder_host.sh`** (pure host tooling —
 no QEMU, no Hamnix image). Each benchmark lives in three languages under
 `tests/bench/<name>.{ad,c,py}` and computes an identical result; the
-script asserts all implementations AGREE before timing.
+script asserts all implementations AGREE before timing. Pass
+`BENCH_OPT=1 bash scripts/bench_adder_host.sh` to bench the **`-O1`
+peephole optimizer** (Track 6) instead of the default single-pass backend.
 
-## Baseline (2026-06-20)
+## `-O1` optimizer landed (Track 6, 2026-06-20)
+
+The single-pass backend now has an optional **`-O1` peephole optimizer**
+(`adder/compiler/peephole_x86.py`, gated behind `-O1`; the default `-O0`
+single-pass path — the one the Hamnix image build uses — is unchanged).
+It rewrites the emitted assembly with four strictly-local, provably-safe
+transforms (condition→branch fusion, dead store-reload elimination,
+immediate-push folding, and push/pop→scratch-register forwarding that
+unwinds the stack-machine's memory round-trips). Validated by the
+predicted-output fuzzer at `-O1` (`FUZZ_OPT=1 scripts/fuzz_adder.sh`,
+also `ADDER_FUZZ_OPT=1 tests/fuzz/adder_fuzzer.py`) — **0 miscompiles**
+over tens of thousands of random programs — and by the cross-language
+AGREEMENT check above running at `-O1`.
+
+**Before → after (same machine, best-of-7, Python skipped):**
+
+| bench | C ‑O2 | Adder ‑O0 | `-O0`/‑O2 | Adder ‑O1 | `-O1`/‑O2 | O0→O1 |
+|---|--:|--:|--:|--:|--:|--:|
+| collatz | 0.181s | 1.158s | 6.40× | 1.071s | 5.92× | 1.08× |
+| fib     | 0.030s | 0.127s | 4.23× | 0.089s | 2.97× | 1.43× |
+| sieve   | 0.013s | 0.046s | 3.54× | 0.034s | 2.62× | 1.35× |
+| mmul    | 0.017s | 0.131s | 7.71× | 0.095s | 5.59× | 1.38× |
+| lcg     | 0.048s | 0.089s | 1.85× | 0.091s | 1.90× | 0.98× |
+
+**Geometric means:** the optimizer moves Adder from ≈**4.24×** to
+≈**3.45×** of C `-O2` — a **1.23× overall speedup**, biggest on the
+call/loop-heavy `fib` (1.43×), `mmul` (1.38×) and `sieve` (1.35×).
+`lcg` is unchanged (within noise): its dependent multiply chain is
+latency-bound, so removing instructions doesn't help — exactly as the
+baseline analysis predicted.
+
+## Baseline (2026-06-20, single-pass `-O0`)
 
 Host: Intel Core i7-8086K @ 4.00 GHz · gcc 14.2.0 · CPython 3.11.10.
 Compiled times are best-of-3; Python best-of-1.
@@ -22,8 +55,9 @@ Compiled times are best-of-3; Python best-of-1.
 | mmul | 0.136s | 0.062s | 0.017s | 3.674s | 7.83× | array-address math |
 | lcg | 0.090s | 0.097s | 0.048s | 7.131s | 1.87× | pure ALU chain |
 
-**Geometric means:** Adder is ≈**1.6×** slower than `-O0`, ≈**4.3×**
-slower than `-O2`, and ≈**24×** *faster* than CPython.
+**Geometric means:** the un-optimized single-pass backend is ≈**1.6×**
+slower than `-O0`, ≈**4.3×** slower than `-O2`, and ≈**24×** *faster*
+than CPython.
 
 ## Reading the numbers
 
@@ -34,24 +68,31 @@ slower than `-O2`, and ≈**24×** *faster* than CPython.
 - **~24× faster than CPython** on average (up to ~79× on `lcg`, where
   CPython's arbitrary-precision int masking dominates). As a systems
   language it behaves as you'd want.
-- **The `-O2` gap is where an optimizer would pay off, and it's uneven:**
-  - Biggest gaps — **mmul (7.8×)** and **collatz (6.8×)**: redundant
-    address/index recomputation (`i*DIM+k` every iteration) and
-    loop-invariant work that `-O2` hoists and strength-reduces.
-  - Smallest gap — **lcg (1.9×)**: nothing to optimize; latency-bound.
+- **The `-O2` gap is where an optimizer pays off, and it's uneven:**
+  - Biggest gaps — **mmul** and **collatz**: redundant address/index
+    recomputation (`i*DIM+k` every iteration) and loop-invariant work
+    that `-O2` hoists and strength-reduces.
+  - Smallest gap — **lcg**: nothing to optimize; latency-bound.
 
-## Why this matters / next step
+## What `-O1` does, and what's next
 
-The gap to `-O2` is concentrated in a handful of classic optimizations
-(register allocation, loop-invariant code motion, strength reduction,
-CSE, simple inlining) — not in anything LLVM-scale. The current backend
-is single-pass with no IR, so the prerequisite is a minimal IR between
-AST and x86 emission; those passes then plug in.
+The `-O1` peephole pass attacks the single-pass backend's two structural
+inefficiencies directly: the **stack-machine memory traffic** (every
+binary op spills an operand through `push`/`pop`) and **redundantly
+materialised constants/booleans**. Forwarding push/pop pairs through the
+otherwise-unused caller-saved scratch registers (`%r8`–`%r11`) and fusing
+`setCC`→`testq`→`jz` into a single `jCC` removes a large fraction of the
+per-operation overhead — hence the wins on the call/branch/loop-heavy
+benchmarks.
 
-Goal: **rough C territory — target ≤ ~2× of `-O2`** (from today's ~4.3×),
-without chasing `-O2`'s auto-vectorization. Tracked as **Track 6** in
-[`TODO.md`](../TODO.md). Re-run this fixture as passes land and watch the
-Adder/`-O2` column fall.
+The remaining gap to `-O2` is the deeper, IR-requiring optimizations the
+peephole *cannot* express locally: **loop-invariant code motion**,
+**strength reduction** of index math (`i*DIM+k`), **CSE**, and real
+**register allocation** to keep loop variables out of memory entirely.
+Those still want a minimal IR between AST and x86 emission. The `-O1`
+peephole is the first, lowest-risk increment toward the **rough-C-territory
+(≤ ~2× of `-O2`)** goal tracked as **Track 6** in [`TODO.md`](../TODO.md);
+the IR-based passes are the next increment.
 
 > Caveats: microbenchmarks on one machine; integer-only (Adder has no
 > floats); Python best-of-1; `-O2` benefits from auto-vectorization a

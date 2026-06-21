@@ -229,6 +229,16 @@ gap is concentrated in a few classic passes, not anything LLVM-scale.
 Non-goal: `-O2` parity / auto-vectorization (the `lcg` chain is already
 1.9×; the `mmul`/`collatz` gaps at 6–8× are the prize).
 
+- [x] **Increment 1 — `-O1` peephole optimizer (LANDED 2026-06-20).**
+  `adder/compiler/peephole_x86.py`, gated behind `adder compile -O1` (default
+  `-O0` single-pass path, used by the Hamnix image build, is unchanged).
+  Four local provably-safe transforms over the emitted asm: condition→branch
+  fusion, dead store-reload elim, immediate-push folding, push/pop→scratch
+  forwarding (unwinds the stack-machine memory traffic via the unused
+  `%r8`–`%r11`). **Result: geomean 4.24× → 3.45× of `-O2`** (1.23× speedup;
+  fib 1.43×, mmul 1.38×, sieve 1.35×). 0 fuzzer miscompiles at `-O1`
+  (`FUZZ_OPT=1 scripts/fuzz_adder.sh`). The IR-based steps below are the next
+  increment (the peephole can't express LICM/strength-reduction/regalloc).
 - [ ] **Step 0 — introduce a minimal IR.** Today's backend is single-pass,
   no IR (`adder/compiler/codegen_x86.py`); you can't do regalloc/LICM on
   a straight AST→asm emitter. Add a basic-block + virtual-register IR
