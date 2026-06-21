@@ -1,3 +1,4 @@
+/model opus[1m]
 claude --resume 87369342-5631-4e0b-b8bd-c6f8925641a7
 ENABLE_LOG_SLOW=1
 ENABLE_LOG_SLOW=1 bash scripts/build_installer_img.sh

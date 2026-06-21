@@ -1,0 +1,511 @@
+# linux_abi/umdf_kernel.ad
+#
+# UMDF (User-Mode Driver Framework) — kernel-side privileged endpoints.
+#
+# Track 4 first vertical slice: move stock Linux `.ko` execution OUT of
+# the kernel fault domain into a restartable userland host process. A
+# vendor `.ko` crash must not panic the box.
+#
+# A user-mode driver runs as a normal userland process. It posts a `#X`
+# 9P file server (via SYS_SRV_POST — existing namespace law) and, over a
+# controlled syscall channel, asks the kernel for the three privileged
+# primitives a device driver needs that userspace cannot synthesize:
+#
+#   (a) MMIO map   — map a physical BAR region into the driver's own
+#                    user address space (uncacheable). The driver then
+#                    pokes device registers with plain loads/stores.
+#   (b) IRQ file   — register a CPU vector and hand back a readable
+#                    "irq fd". The driver blocks reading the fd; the
+#                    kernel's IRQ handler wakes it on each fire and the
+#                    read returns the accumulated fire count.
+#   (c) DMA buffer — allocate physically-contiguous pages, map them into
+#                    the driver's user VA, AND expose the physical
+#                    address so the device can be programmed to DMA
+#                    to/from it (no IOMMU: CPU phys == bus addr).
+#
+# These three are the irreducible kernel-trust surface. EVERYTHING else
+# the `.ko` needs — ELF load, relocation, %gs per-CPU, symbol resolution,
+# kmalloc — runs in the userland host (the loader logic ported into
+# user/umdf_host.ad), where a fault is a process crash the kernel
+# survives and can restart.
+#
+# Plan 9 shaping: the driver is a process that posts a file server; the
+# kernel privileges are requested over a narrow, audited syscall channel,
+# not ad-hoc global state. The IRQ primitive is literally a readable
+# file (an fd you block on), exactly Plan 9's "everything is a file".
+
+from kernel.printk.printk import printk0, printk1, printk2
+from mm.page_alloc import alloc_pages, free_pages, PAGE_SIZE
+from arch.x86.kernel.irq import register_irq_handler
+from kernel.sched.core import (
+    WaitQueue, wq_init, wq_wake_all,
+    wq_wait_prepare, wq_wait_cancel, wq_wait_commit,
+    current_idx_get, task_pml4,
+)
+from mm.vma import (
+    vma_alloc_demand, vma_mark_foreign,
+    VMA_PROT_READ, VMA_PROT_WRITE,
+    VMA_MAP_PRIVATE, VMA_MAP_ANONYMOUS,
+)
+from fs.elf import (
+    elf_install_user_mapping, PT_FLAG_RW, PT_FLAG_US, PT_FLAG_NX,
+    PAGE_SIZE_4K,
+)
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+# x86 page-cache-disable bit on a leaf PTE (uncacheable MMIO). Device
+# registers MUST NOT be cached or the CPU coalesces/reorders register
+# writes the device needs to see verbatim.
+PT_FLAG_PCD: uint64 = 0x10                # bit 4: cache-disable
+
+
+# ---------------------------------------------------------------------
+# IRQ-file registry
+# ---------------------------------------------------------------------
+#
+# One row per open driver IRQ file. The "fd" the driver gets back is an
+# opaque small integer (a registry index, biased by IRQFD_BASE so it is
+# distinct from real VFS fds). A read on it returns the number of times
+# the vector has fired since the previous read; if zero, it blocks on the
+# vector's WaitQueue until the next fire.
+#
+# A vector is shared by at most one driver in this slice (single-consumer,
+# mirroring register_irq_handler's one-handler-per-vector contract).
+
+MAX_UMDF_IRQ: uint64 = 32
+IRQFD_BASE:   int32  = 0x40000000          # bias so an irq "fd" is never
+                                           # confused with a VFS fd
+
+irqf_in_use:   Array[32, uint64]           # 1 = live
+irqf_vector:   Array[32, uint64]           # CPU vector this row owns
+irqf_owner:    Array[32, uint64]           # owning task slot (for cleanup)
+irqf_count:    Array[32, uint64]           # fires not yet consumed by read
+irqf_wq:       Array[32, WaitQueue]        # per-row waitqueue
+
+# Reverse map: vector -> registry row + 1 (0 = unclaimed), so the shared
+# IRQ trampoline can find the row to bump + wake in O(1).
+vec_to_irqf:   Array[256, uint64]
+
+_umdf_irq_inited: uint64 = 0
+
+
+def _umdf_irq_init():
+    if _umdf_irq_inited != 0:
+        return
+    i: uint64 = 0
+    while i < MAX_UMDF_IRQ:
+        irqf_in_use[i] = 0
+        irqf_vector[i] = 0
+        irqf_owner[i]  = 0
+        irqf_count[i]  = 0
+        wq_init(&irqf_wq[i])
+        i = i + 1
+    v: uint64 = 0
+    while v < 256:
+        vec_to_irqf[v] = 0
+        v = v + 1
+    _umdf_irq_inited = 1
+
+
+def _umdf_irq_fire(row: uint64):
+    # Called from IRQ context (IF=0). Bump the row's pending count and
+    # wake any blocked reader. wq_wake_all takes rq_lock internally; it
+    # is IRQ-safe (the wait path masks IRQs around the queue ops).
+    if row >= MAX_UMDF_IRQ:
+        return
+    if irqf_in_use[row] == 0:
+        return
+    irqf_count[row] = irqf_count[row] + 1
+    wq_wake_all(&irqf_wq[row])
+
+
+# Per-row trampolines. register_irq_handler wants an Fn[None]; Adder has
+# no closures, so we hand-roll one trampoline per row, each closing over
+# its row by literal. 32 rows = 32 one-liners.
+def _tramp_0():
+    _umdf_irq_fire(0)
+def _tramp_1():
+    _umdf_irq_fire(1)
+def _tramp_2():
+    _umdf_irq_fire(2)
+def _tramp_3():
+    _umdf_irq_fire(3)
+def _tramp_4():
+    _umdf_irq_fire(4)
+def _tramp_5():
+    _umdf_irq_fire(5)
+def _tramp_6():
+    _umdf_irq_fire(6)
+def _tramp_7():
+    _umdf_irq_fire(7)
+def _tramp_8():
+    _umdf_irq_fire(8)
+def _tramp_9():
+    _umdf_irq_fire(9)
+def _tramp_10():
+    _umdf_irq_fire(10)
+def _tramp_11():
+    _umdf_irq_fire(11)
+def _tramp_12():
+    _umdf_irq_fire(12)
+def _tramp_13():
+    _umdf_irq_fire(13)
+def _tramp_14():
+    _umdf_irq_fire(14)
+def _tramp_15():
+    _umdf_irq_fire(15)
+def _tramp_16():
+    _umdf_irq_fire(16)
+def _tramp_17():
+    _umdf_irq_fire(17)
+def _tramp_18():
+    _umdf_irq_fire(18)
+def _tramp_19():
+    _umdf_irq_fire(19)
+def _tramp_20():
+    _umdf_irq_fire(20)
+def _tramp_21():
+    _umdf_irq_fire(21)
+def _tramp_22():
+    _umdf_irq_fire(22)
+def _tramp_23():
+    _umdf_irq_fire(23)
+def _tramp_24():
+    _umdf_irq_fire(24)
+def _tramp_25():
+    _umdf_irq_fire(25)
+def _tramp_26():
+    _umdf_irq_fire(26)
+def _tramp_27():
+    _umdf_irq_fire(27)
+def _tramp_28():
+    _umdf_irq_fire(28)
+def _tramp_29():
+    _umdf_irq_fire(29)
+def _tramp_30():
+    _umdf_irq_fire(30)
+def _tramp_31():
+    _umdf_irq_fire(31)
+
+
+def _install_tramp_for_row(vector: uint64, row: uint64):
+    # Wire the per-row trampoline as the vector's IRQ handler.
+    if row == 0:
+        register_irq_handler(vector, _tramp_0)
+    elif row == 1:
+        register_irq_handler(vector, _tramp_1)
+    elif row == 2:
+        register_irq_handler(vector, _tramp_2)
+    elif row == 3:
+        register_irq_handler(vector, _tramp_3)
+    elif row == 4:
+        register_irq_handler(vector, _tramp_4)
+    elif row == 5:
+        register_irq_handler(vector, _tramp_5)
+    elif row == 6:
+        register_irq_handler(vector, _tramp_6)
+    elif row == 7:
+        register_irq_handler(vector, _tramp_7)
+    elif row == 8:
+        register_irq_handler(vector, _tramp_8)
+    elif row == 9:
+        register_irq_handler(vector, _tramp_9)
+    elif row == 10:
+        register_irq_handler(vector, _tramp_10)
+    elif row == 11:
+        register_irq_handler(vector, _tramp_11)
+    elif row == 12:
+        register_irq_handler(vector, _tramp_12)
+    elif row == 13:
+        register_irq_handler(vector, _tramp_13)
+    elif row == 14:
+        register_irq_handler(vector, _tramp_14)
+    elif row == 15:
+        register_irq_handler(vector, _tramp_15)
+    elif row == 16:
+        register_irq_handler(vector, _tramp_16)
+    elif row == 17:
+        register_irq_handler(vector, _tramp_17)
+    elif row == 18:
+        register_irq_handler(vector, _tramp_18)
+    elif row == 19:
+        register_irq_handler(vector, _tramp_19)
+    elif row == 20:
+        register_irq_handler(vector, _tramp_20)
+    elif row == 21:
+        register_irq_handler(vector, _tramp_21)
+    elif row == 22:
+        register_irq_handler(vector, _tramp_22)
+    elif row == 23:
+        register_irq_handler(vector, _tramp_23)
+    elif row == 24:
+        register_irq_handler(vector, _tramp_24)
+    elif row == 25:
+        register_irq_handler(vector, _tramp_25)
+    elif row == 26:
+        register_irq_handler(vector, _tramp_26)
+    elif row == 27:
+        register_irq_handler(vector, _tramp_27)
+    elif row == 28:
+        register_irq_handler(vector, _tramp_28)
+    elif row == 29:
+        register_irq_handler(vector, _tramp_29)
+    elif row == 30:
+        register_irq_handler(vector, _tramp_30)
+    elif row == 31:
+        register_irq_handler(vector, _tramp_31)
+
+
+# ---------------------------------------------------------------------
+# Privileged primitive: MMIO map
+# ---------------------------------------------------------------------
+
+def _umdf_map_phys_into_user(phys: uint64, len_in: uint64,
+                             uncacheable: int32, out_phys: Ptr[uint64]) -> uint64:
+    # Map [phys, phys+len) (page-rounded) into the CALLING task's user
+    # address space and return the user virtual address (or a negative
+    # errno cast to uint64). If `out_phys` is non-NULL, store the
+    # physical base there.
+    #
+    # Strategy: reserve a fresh demand-paged anonymous VMA to get a
+    # placed, fork-/exit-tracked user VA window, then OVERLAY the real
+    # physical pages over that window's PTEs via elf_install_user_mapping.
+    # The few anon backing pages the reservation would lazily fault are
+    # never touched (we overwrite the PTEs first), so the only cost is the
+    # VMA bookkeeping — which is exactly what lets exit()/teardown reclaim
+    # the window cleanly when the driver host dies.
+    if len_in == 0:
+        return cast[uint64](cast[int64](-22))      # -EINVAL
+
+    page_off: uint64 = phys & (PAGE_SIZE_4K - 1)
+    phys_base: uint64 = phys - page_off
+    span: uint64 = (len_in + page_off + PAGE_SIZE_4K - 1) & ~(PAGE_SIZE_4K - 1)
+
+    slot: uint64 = current_idx_get()
+
+    # Reserve the VA window (anonymous private). vma_alloc_demand returns
+    # the placed base VA or a negative errno.
+    prot: int32 = VMA_PROT_READ | VMA_PROT_WRITE
+    flags: int32 = VMA_MAP_PRIVATE | VMA_MAP_ANONYMOUS
+    base_i: int64 = vma_alloc_demand(slot, 0, span, prot, flags)
+    if base_i < 0:
+        printk0("umdf: mmio VA reserve failed\n")
+        return cast[uint64](base_i)
+    uva: uint64 = cast[uint64](base_i)
+
+    # Overlay the device physical pages onto the reserved window.
+    extra: uint64 = PT_FLAG_US | PT_FLAG_RW | PT_FLAG_NX
+    if uncacheable != 0:
+        extra = extra | PT_FLAG_PCD
+    pml4: uint64 = task_pml4(cast[int32](slot))
+    rc: int32 = elf_install_user_mapping(pml4, uva, uva + span,
+                                         phys_base, extra)
+    if rc != 0:
+        printk0("umdf: mmio overlay install failed\n")
+        return cast[uint64](cast[int64](-12))      # -ENOMEM
+
+    # Mark the reservation FOREIGN so task teardown clears the PTEs but
+    # never free_page()s the device/DMA frames (they are not VMA-owned).
+    vma_mark_foreign(slot, uva)
+
+    if cast[uint64](out_phys) != 0:
+        out_phys[0] = phys_base
+
+    printk2("umdf: MMIO map phys=%p -> uva=%p\n", phys_base, uva)
+    printk1("umdf:   span=%d bytes (uncacheable)\n", span)
+    # Return the user VA biased back to the in-page offset the caller asked
+    # for, so an unaligned BAR maps to the right register window.
+    return uva + page_off
+
+
+def umdf_mmio_map(phys: uint64, len_in: uint64) -> uint64:
+    # SYS_UMDF_MMIO_MAP body. Map a device BAR (uncacheable) into the
+    # caller's user VA. Returns user VA / -errno.
+    return _umdf_map_phys_into_user(phys, len_in, 1, cast[Ptr[uint64]](0))
+
+
+# ---------------------------------------------------------------------
+# Privileged primitive: DMA buffer alloc
+# ---------------------------------------------------------------------
+#
+# Hand out physically-contiguous pages mapped into the driver's user VA,
+# with the physical base written back so the device can be programmed.
+# No IOMMU: CPU phys == bus addr (matches linux_abi/api_dma.ad's model).
+
+MAX_UMDF_DMA: uint64 = 16
+dma_in_use:  Array[16, uint64]
+dma_phys:    Array[16, uint64]
+dma_order:   Array[16, uint64]
+dma_owner:   Array[16, uint64]
+_umdf_dma_inited: uint64 = 0
+
+
+def _umdf_dma_init():
+    if _umdf_dma_inited != 0:
+        return
+    i: uint64 = 0
+    while i < MAX_UMDF_DMA:
+        dma_in_use[i] = 0
+        i = i + 1
+    _umdf_dma_inited = 1
+
+
+def _order_for(size: uint64) -> int32:
+    o: int32 = 0
+    block: uint64 = PAGE_SIZE
+    while block < size:
+        if o >= 10:
+            return -1
+        o = o + 1
+        block = block << 1
+    return o
+
+
+def umdf_dma_alloc(len_in: uint64, out_phys: Ptr[uint64]) -> uint64:
+    # SYS_UMDF_DMA_ALLOC body. a0=len, a1=&out_phys. Returns user VA /
+    # -errno; writes the physical base to *out_phys (cacheable — a DMA
+    # buffer is normal RAM, not device registers).
+    _umdf_dma_init()
+    if len_in == 0:
+        return cast[uint64](cast[int64](-22))
+    order: int32 = _order_for(len_in)
+    if order < 0:
+        return cast[uint64](cast[int64](-12))      # too big
+    phys: uint64 = alloc_pages(order)
+    if phys == 0:
+        printk0("umdf: dma alloc_pages failed\n")
+        return cast[uint64](cast[int64](-12))
+    memset(cast[Ptr[uint8]](phys), 0, PAGE_SIZE << cast[uint64](order))
+
+    # Record for ownership/cleanup before mapping.
+    slot: uint64 = current_idx_get()
+    row: uint64 = 0
+    have: int32 = 0
+    while row < MAX_UMDF_DMA:
+        if dma_in_use[row] == 0:
+            have = 1
+            break
+        row = row + 1
+    if have == 0:
+        free_pages(phys, order)
+        return cast[uint64](cast[int64](-12))
+    dma_in_use[row] = 1
+    dma_phys[row]   = phys
+    dma_order[row]  = cast[uint64](order)
+    dma_owner[row]  = slot
+
+    # Map cacheable (uncacheable=0) into the caller's user VA.
+    op: uint64 = 0
+    uva: uint64 = _umdf_map_phys_into_user(phys, len_in, 0, &op)
+    if cast[int64](uva) < 0:
+        dma_in_use[row] = 0
+        free_pages(phys, order)
+        return uva
+    if cast[uint64](out_phys) != 0:
+        out_phys[0] = phys
+    printk2("umdf: DMA alloc phys=%p -> uva=%p\n", phys, uva)
+    return uva
+
+
+# ---------------------------------------------------------------------
+# Privileged primitive: IRQ file
+# ---------------------------------------------------------------------
+
+def umdf_irq_open(vector: uint64) -> int32:
+    # SYS_UMDF_IRQ_OPEN body. Register `vector` and return an irq "fd"
+    # (a small biased integer the driver reads to wait for fires).
+    _umdf_irq_init()
+    if vector >= 256:
+        return -22
+    if vec_to_irqf[vector] != 0:
+        # Already claimed — return the existing fd (idempotent reopen by
+        # the same restarted host is benign).
+        existing: uint64 = vec_to_irqf[vector] - 1
+        return IRQFD_BASE + cast[int32](existing)
+    row: uint64 = 0
+    have: int32 = 0
+    while row < MAX_UMDF_IRQ:
+        if irqf_in_use[row] == 0:
+            have = 1
+            break
+        row = row + 1
+    if have == 0:
+        return -24                                 # -EMFILE (too many)
+    irqf_in_use[row] = 1
+    irqf_vector[row] = vector
+    irqf_owner[row]  = current_idx_get()
+    irqf_count[row]  = 0
+    wq_init(&irqf_wq[row])
+    vec_to_irqf[vector] = row + 1
+    _install_tramp_for_row(vector, row)
+    printk2("umdf: IRQ file opened vector=0x%x row=%d\n", vector, row)
+    return IRQFD_BASE + cast[int32](row)
+
+
+def umdf_irq_is_fd(fd: int32) -> int32:
+    # True if `fd` is a UMDF irq fd (the read syscall dispatches on this).
+    if fd >= IRQFD_BASE and fd < (IRQFD_BASE + cast[int32](MAX_UMDF_IRQ)):
+        return 1
+    return 0
+
+
+def umdf_irq_read(fd: int32) -> uint64:
+    # Block until the vector has fired at least once since the previous
+    # read, then return (and clear) the accumulated fire count. Returns a
+    # negative errno on a bad fd or signal.
+    _umdf_irq_init()
+    if umdf_irq_is_fd(fd) == 0:
+        return cast[uint64](cast[int64](-9))       # -EBADF
+    row: uint64 = cast[uint64](fd - IRQFD_BASE)
+    if row >= MAX_UMDF_IRQ or irqf_in_use[row] == 0:
+        return cast[uint64](cast[int64](-9))
+
+    while True:
+        # Fast path: pending fires already accumulated.
+        n: uint64 = irqf_count[row]
+        if n != 0:
+            irqf_count[row] = 0
+            return n
+        # Two-phase wait: prepare, re-check, then commit (closes the SMP
+        # lost-wakeup window against the IRQ trampoline's wq_wake_all).
+        wq_wait_prepare(&irqf_wq[row])
+        if irqf_count[row] != 0:
+            wq_wait_cancel(&irqf_wq[row])
+            continue
+        rc: int32 = wq_wait_commit(&irqf_wq[row])
+        if rc < 0:
+            return cast[uint64](cast[int64](rc))   # -EINTR
+        # Woken — loop to consume the count.
+
+
+# ---------------------------------------------------------------------
+# Cleanup on driver-host death (crash isolation)
+# ---------------------------------------------------------------------
+
+def umdf_task_cleanup(slot: uint64):
+    # Called when a task exits/dies. Release every IRQ file + DMA buffer
+    # the task owned so a crashed (or killed) driver host leaves no kernel
+    # state wedged — the whole point of the framework. The MMIO/anon VA
+    # windows are torn down by the normal VMA exit path (vma_clear).
+    _umdf_irq_init()
+    _umdf_dma_init()
+    i: uint64 = 0
+    while i < MAX_UMDF_IRQ:
+        if irqf_in_use[i] != 0 and irqf_owner[i] == slot:
+            v: uint64 = irqf_vector[i]
+            if v < 256:
+                vec_to_irqf[v] = 0
+                # Leave the trampoline registered but the row freed: the
+                # trampoline checks irqf_in_use and becomes a no-op. A
+                # restarted host re-claims the row via umdf_irq_open.
+            irqf_in_use[i] = 0
+            printk1("umdf: released IRQ file row=%d on task exit\n", i)
+        i = i + 1
+    j: uint64 = 0
+    while j < MAX_UMDF_DMA:
+        if dma_in_use[j] != 0 and dma_owner[j] == slot:
+            free_pages(dma_phys[j], cast[int32](dma_order[j]))
+            dma_in_use[j] = 0
+            printk1("umdf: freed DMA buffer row=%d on task exit\n", j)
+        j = j + 1
