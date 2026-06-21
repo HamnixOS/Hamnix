@@ -56,10 +56,24 @@ if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
 fi
 echo "[test_smap_enforced] KVM usable: $KVM (SMAP only enforces under KVM)"
 
-echo "[test_smap_enforced] (3/3) Boot QEMU (shim injects KVM if available)"
+# SMAP CPUID bits are ONLY exposed under a hardware accelerator. This test
+# invokes qemu directly (not via the shim), so we must inject -accel kvm
+# -cpu host OURSELVES when /dev/kvm is usable. Without these flags, TCG
+# masks the SMAP CPUID bit, CR4.SMAP never latches, and the enforcement
+# proof cannot run. (A stale earlier rev relied on a shim that this raw
+# qemu line never invoked — hence the spurious "did not latch" FAIL.)
+ACCEL_ARGS=()
+if [ "$KVM" = "1" ]; then
+    ACCEL_ARGS=(-accel kvm -cpu host)
+else
+    ACCEL_ARGS=(-cpu qemu64)
+fi
+
+echo "[test_smap_enforced] (3/3) Boot QEMU (accel: ${ACCEL_ARGS[*]})"
 set +e
 timeout 180s qemu-system-x86_64 \
     -kernel "$ELF" \
+    "${ACCEL_ARGS[@]}" \
     -smp 1 \
     -nographic \
     -no-reboot \
