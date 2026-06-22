@@ -409,6 +409,22 @@ load-bearing capabilities are:
    `MAX_FUNCS`/`GLOBALS`/`METHODS`/`FLOAT` 1 K→16 K, `MAX_FIXUPS`/`METHOD_
    FIXUPS`/`DATA_FIXUPS` 8 K→128 K, `MAX_STRINGS` 2 K→32 K, `MAX_STRUCTS`
    256→4 K, `MAX_STRUCT_FIELDS` 4 K→64 K; `elf_emit` `ELF_BUF_CAP` 128 K→24 MiB.
+
+   **Buffer SCOPE — host-only (critical):** the shared compiler modules
+   (`lexer`/`parser`/`codegen`/`elf_emit.ad`) are imported by the ON-DEVICE
+   compiler binaries too (`codegen_elf_selftest.ad`, `adder_cc_driver.ad`,
+   `fused_driver_main.ad`), which boot in a **256 MiB QEMU guest** and only
+   ever compile TINY programs. Whole-tree buffers baked into those files
+   inflate their `.bss` to ~408 MB and **OOM the guest** (`test_selfhost_elf.sh`
+   PHASE A hangs). So the on-disk literals stay at on-device scale, and the
+   whole-tree scale-up lives in `scripts/concat_compiler_source.py` as
+   `HOST_BUFFER_OVERRIDES`, applied **only** when fusing the HOST driver
+   (`fused_driver_host_main.ad` — the single build that compiles the kernel and
+   runs on the host with ample RAM). Each override is line-anchored and
+   asserted exactly-once so on-disk drift fails the concat loudly. `host_ac.elf`
+   gets the whole-tree buffers (memsz ~433 MB); every on-device build stays
+   small (`codegen_elf_selftest.elf` `.bss` ~8.6 MB).
+
    The merge is no longer truncated (was stopping at 1 MiB / ~line 14990); it
    now produces the full ~10 MB stripped TU. A driver import-strip gap exposed
    by the kernel was also fixed: a **backslash line-continued** `from M import
