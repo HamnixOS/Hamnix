@@ -55,6 +55,148 @@ DRIVER_EXTRA_MODULES = ["elf_emit.ad"]
 # --with-driver: the driver `main` that drives the whole pipeline.
 DRIVER_MAIN = "fused_driver_main.ad"
 
+# The HOST self-hosting driver: same pipeline, Linux syscall numbers, runs on
+# the build host (NOT on-device). Only this driver compiles the WHOLE Hamnix
+# TREE (incl. the kernel's 346-module / ~13.9 MB import closure), so only it
+# needs whole-TREE-sized compiler buffers. The on-device drivers
+# (fused_driver_main.ad, codegen_elf_selftest.ad, adder_cc_driver.ad) compile
+# only TINY programs and MUST keep the small on-disk buffers — they boot in a
+# 256 MiB QEMU guest, where the whole-tree ~408 MB of zero-init .bss would OOM.
+HOST_DRIVER_MAIN = "fused_driver_host_main.ad"
+
+# Whole-TREE buffer overrides, applied ONLY when fusing the HOST driver
+# (HOST_DRIVER_MAIN). Each entry is an exact (small -> large) substring
+# replacement on a shared compiler module's source. The on-disk literals stay
+# at on-device scale; the host build is the only one scaled up (it runs on the
+# host with ample RAM). Keep these in lockstep with the kernel-closure scale
+# documented in docs/subsystems/adder-compiler.md (cap#3). Each pair MUST match
+# the on-disk text exactly or the substitution silently no-ops (asserted below).
+#
+#   kernel closure: ~13.9 MB merged / ~1.73 M tokens / 10,161 fns / 9,266
+#   globals / ~66 K data refs / ~42 K call fixups. All raised arrays are
+#   zero-init (.bss): host_ac.elf FILE size is unchanged; only memsz grows.
+HOST_BUFFER_OVERRIDES = {
+    "lexer.ad": [
+        ("MAX_TOKENS: uint32 = 65536", "MAX_TOKENS: uint32 = 4194304"),
+        ("STRBUF_SIZE: uint32 = 524288", "STRBUF_SIZE: uint32 = 16777216"),
+        ("tok_type: Array[65536, uint32]", "tok_type: Array[4194304, uint32]"),
+        ("tok_line: Array[65536, uint32]", "tok_line: Array[4194304, uint32]"),
+        ("tok_val_start: Array[65536, uint32]", "tok_val_start: Array[4194304, uint32]"),
+        ("tok_val_len: Array[65536, uint32]", "tok_val_len: Array[4194304, uint32]"),
+        ("tok_num_val: Array[65536, uint64]", "tok_num_val: Array[4194304, uint64]"),
+        ("strbuf: Array[524288, uint8]", "strbuf: Array[16777216, uint8]"),
+    ],
+    "parser.ad": [
+        ("MAX_NODES: uint32 = 65536", "MAX_NODES: uint32 = 4194304"),
+        ("nd_kind: Array[65536, uint32]", "nd_kind: Array[4194304, uint32]"),
+        ("nd_aux: Array[65536, uint32]", "nd_aux: Array[4194304, uint32]"),
+        ("nd_num: Array[65536, uint64]", "nd_num: Array[4194304, uint64]"),
+        ("nd_name_off: Array[65536, uint32]", "nd_name_off: Array[4194304, uint32]"),
+        ("nd_name_len: Array[65536, uint32]", "nd_name_len: Array[4194304, uint32]"),
+        ("nd_name2_off: Array[65536, uint32]", "nd_name2_off: Array[4194304, uint32]"),
+        ("nd_name2_len: Array[65536, uint32]", "nd_name2_len: Array[4194304, uint32]"),
+        ("nd_a: Array[65536, uint32]", "nd_a: Array[4194304, uint32]"),
+        ("nd_b: Array[65536, uint32]", "nd_b: Array[4194304, uint32]"),
+        ("nd_c: Array[65536, uint32]", "nd_c: Array[4194304, uint32]"),
+        ("nd_d: Array[65536, uint32]", "nd_d: Array[4194304, uint32]"),
+        ("nd_next: Array[65536, uint32]", "nd_next: Array[4194304, uint32]"),
+        ("nd_line: Array[65536, uint32]", "nd_line: Array[4194304, uint32]"),
+    ],
+    "codegen.ad": [
+        ("CODE_CAP: uint32 = 2097152", "CODE_CAP: uint32 = 16777216"),
+        ("code: Array[2097152, uint8]", "code: Array[16777216, uint8]"),
+        ("DATA_BASE: uint32 = 2097152", "DATA_BASE: uint32 = 16777216"),
+        ("GDATA_CAP: uint32 = 65536", "GDATA_CAP: uint32 = 4194304"),
+        ("gdata: Array[65536, uint8]", "gdata: Array[4194304, uint8]"),
+        ("MAX_FUNCS: uint32 = 1024", "MAX_FUNCS: uint32 = 16384"),
+        ("fn_name_off: Array[1024, uint32]", "fn_name_off: Array[16384, uint32]"),
+        ("fn_name_len: Array[1024, uint32]", "fn_name_len: Array[16384, uint32]"),
+        ("fn_offset: Array[1024, uint32]", "fn_offset: Array[16384, uint32]"),
+        ("MAX_FIXUPS: uint32 = 8192", "MAX_FIXUPS: uint32 = 131072"),
+        ("fx_at: Array[8192, uint32]", "fx_at: Array[131072, uint32]"),
+        ("fx_name_off: Array[8192, uint32]", "fx_name_off: Array[131072, uint32]"),
+        ("fx_name_len: Array[8192, uint32]", "fx_name_len: Array[131072, uint32]"),
+        ("MAX_METHODS: uint32 = 1024", "MAX_METHODS: uint32 = 16384"),
+        ("mfn_cls_off: Array[1024, uint32]", "mfn_cls_off: Array[16384, uint32]"),
+        ("mfn_cls_len: Array[1024, uint32]", "mfn_cls_len: Array[16384, uint32]"),
+        ("mfn_m_off: Array[1024, uint32]", "mfn_m_off: Array[16384, uint32]"),
+        ("mfn_m_len: Array[1024, uint32]", "mfn_m_len: Array[16384, uint32]"),
+        ("mfn_offset: Array[1024, uint32]", "mfn_offset: Array[16384, uint32]"),
+        ("MAX_METHOD_FIXUPS: uint32 = 8192", "MAX_METHOD_FIXUPS: uint32 = 131072"),
+        ("mfx_at: Array[8192, uint32]", "mfx_at: Array[131072, uint32]"),
+        ("mfx_cls_off: Array[8192, uint32]", "mfx_cls_off: Array[131072, uint32]"),
+        ("mfx_cls_len: Array[8192, uint32]", "mfx_cls_len: Array[131072, uint32]"),
+        ("mfx_m_off: Array[8192, uint32]", "mfx_m_off: Array[131072, uint32]"),
+        ("mfx_m_len: Array[8192, uint32]", "mfx_m_len: Array[131072, uint32]"),
+        ("MAX_GLOBALS: uint32 = 1024", "MAX_GLOBALS: uint32 = 16384"),
+        ("glob_name_off: Array[1024, uint32]", "glob_name_off: Array[16384, uint32]"),
+        ("glob_name_len: Array[1024, uint32]", "glob_name_len: Array[16384, uint32]"),
+        ("glob_offset: Array[1024, uint32]", "glob_offset: Array[16384, uint32]"),
+        ("glob_elem_size: Array[1024, uint32]", "glob_elem_size: Array[16384, uint32]"),
+        ("glob_scalar_size: Array[1024, uint32]", "glob_scalar_size: Array[16384, uint32]"),
+        ("glob_is_bss: Array[1024, uint32]", "glob_is_bss: Array[16384, uint32]"),
+        ("glob_ptr_size: Array[1024, uint32]", "glob_ptr_size: Array[16384, uint32]"),
+        ("glob_is_signed: Array[1024, uint32]", "glob_is_signed: Array[16384, uint32]"),
+        ("glob_type_node: Array[1024, uint32]", "glob_type_node: Array[16384, uint32]"),
+        ("glob_struct_idx: Array[1024, uint32]", "glob_struct_idx: Array[16384, uint32]"),
+        ("glob_is_float: Array[1024, uint32]", "glob_is_float: Array[16384, uint32]"),
+        ("MAX_DATA_FIXUPS: uint32 = 8192", "MAX_DATA_FIXUPS: uint32 = 131072"),
+        ("df_at: Array[8192, uint32]", "df_at: Array[131072, uint32]"),
+        ("df_data_off: Array[8192, uint32]", "df_data_off: Array[131072, uint32]"),
+        ("df_is_bss: Array[8192, uint32]", "df_is_bss: Array[131072, uint32]"),
+        ("MAX_STRINGS: uint32 = 2048", "MAX_STRINGS: uint32 = 32768"),
+        ("str_src_off: Array[2048, uint32]", "str_src_off: Array[32768, uint32]"),
+        ("str_src_len: Array[2048, uint32]", "str_src_len: Array[32768, uint32]"),
+        ("str_data_off: Array[2048, uint32]", "str_data_off: Array[32768, uint32]"),
+        ("MAX_FLOAT_CONSTS: uint32 = 1024", "MAX_FLOAT_CONSTS: uint32 = 16384"),
+        ("fc_bits: Array[1024, uint64]", "fc_bits: Array[16384, uint64]"),
+        ("fc_width: Array[1024, uint32]", "fc_width: Array[16384, uint32]"),
+        ("fc_data_off: Array[1024, uint32]", "fc_data_off: Array[16384, uint32]"),
+        ("MAX_STRUCTS: uint32 = 256", "MAX_STRUCTS: uint32 = 4096"),
+        ("st_name_off: Array[256, uint32]", "st_name_off: Array[4096, uint32]"),
+        ("st_name_len: Array[256, uint32]", "st_name_len: Array[4096, uint32]"),
+        ("st_total: Array[256, uint32]", "st_total: Array[4096, uint32]"),
+        ("st_field_base: Array[256, uint32]", "st_field_base: Array[4096, uint32]"),
+        ("st_nfields: Array[256, uint32]", "st_nfields: Array[4096, uint32]"),
+        ("st_decl: Array[256, uint32]", "st_decl: Array[4096, uint32]"),
+        ("MAX_STRUCT_FIELDS: uint32 = 4096", "MAX_STRUCT_FIELDS: uint32 = 65536"),
+        ("sf_name_off: Array[4096, uint32]", "sf_name_off: Array[65536, uint32]"),
+        ("sf_name_len: Array[4096, uint32]", "sf_name_len: Array[65536, uint32]"),
+        ("sf_offset: Array[4096, uint32]", "sf_offset: Array[65536, uint32]"),
+        ("sf_size: Array[4096, uint32]", "sf_size: Array[65536, uint32]"),
+        ("sf_is_signed: Array[4096, uint32]", "sf_is_signed: Array[65536, uint32]"),
+    ],
+    "elf_emit.ad": [
+        ("ELF_BUF_CAP: uint32 = 131072", "ELF_BUF_CAP: uint32 = 25165824"),
+        ("elf_buf: Array[131072, uint8]", "elf_buf: Array[25165824, uint8]"),
+    ],
+}
+
+
+def apply_host_buffer_overrides(mod, text):
+    """For the HOST driver build, scale a shared module's buffers up to
+    whole-TREE size. Each (small -> large) pair MUST appear exactly once in
+    the on-disk source; a missing pair means the on-disk literal drifted and
+    the host build would silently keep an on-device-sized buffer (which can't
+    hold the kernel). Assert exactly-once to catch that drift loudly.
+
+    Matches are LINE-ANCHORED (the def must start at column 0, preceded by a
+    newline) so a short name that is a SUFFIX of a longer one — e.g.
+    `fn_offset: Array[1024, uint32]` is a substring of
+    `mfn_offset: Array[1024, uint32]` — is not double-counted."""
+    for old, new in HOST_BUFFER_OVERRIDES.get(mod, []):
+        anchored_old = "\n" + old
+        anchored_new = "\n" + new
+        cnt = text.count(anchored_old)
+        if cnt != 1:
+            raise SystemExit(
+                "[concat] ERROR: host buffer override for %s expected exactly "
+                "one line '%s' but found %d — the on-disk literal drifted; "
+                "update HOST_BUFFER_OVERRIDES." % (mod, old, cnt)
+            )
+        text = text.replace(anchored_old, anchored_new)
+    return text
+
 
 def strip_compiler_imports(text):
     """Remove every `from compiler.X import (...)` block.
@@ -124,10 +266,17 @@ def main(argv):
         header += "# + appended driver main (" + DRIVER_MAIN + ").\n"
     chunks.append(header)
 
+    # Only the HOST self-hosting driver compiles the whole tree (incl. the
+    # kernel), so only it gets the whole-tree-scaled compiler buffers. The
+    # on-device drivers keep the small on-disk literals (256 MiB QEMU guest).
+    host_build = with_driver and DRIVER_MAIN == HOST_DRIVER_MAIN
+
     for mod in modules:
         src_path = os.path.join(COMPILER_DIR, mod)
         with open(src_path, "r") as f:
             text = f.read()
+        if host_build:
+            text = apply_host_buffer_overrides(mod, text)
         stripped = strip_compiler_imports(text)
         chunks.append("\n# ===== begin " + mod + " =====\n")
         chunks.append(stripped)
