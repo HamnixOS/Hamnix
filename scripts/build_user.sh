@@ -16,6 +16,13 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+# Track-3 self-hosting: the Adder-compiler backend selector. `adder_cc_compile`
+# is a drop-in for `python3 -m compiler.adder compile`, routed by $ADDER_CC
+# (default `python` = the frozen seed; `adder` = the self-hosted host_ac.elf).
+# See scripts/_adder_cc.sh + docs/subsystems/adder-compiler.md.
+# shellcheck source=_adder_cc.sh
+source "$PROJ_ROOT/scripts/_adder_cc.sh"
+
 mkdir -p build/user
 
 build_one() {
@@ -43,7 +50,7 @@ build_adder_user() {
         src="tests/${name}.ad"
     fi
     echo "[build_user] compiling ${src} -> build/user/${name}.elf"
-    python3 -m compiler.adder compile \
+    adder_cc_compile compile \
         --target=x86_64-adder-user \
         "$src" \
         -o "build/user/${name}.elf"
@@ -279,7 +286,7 @@ build_adder_user umdf_host            # Track 4: user-mode driver host — loads
 build_adder_x11() {
     local name="$1"
     echo "[build_user] compiling user/x11/${name}.ad -> build/user/${name}.elf"
-    python3 -m compiler.adder compile \
+    adder_cc_compile compile \
         --target=x86_64-adder-user \
         "user/x11/${name}.ad" \
         -o "build/user/${name}.elf"
@@ -294,7 +301,7 @@ build_adder_x11 x11apptest    # X11 app-in-desktop test: spawns x11srv + xclient
 
 # --- Self-hosting milestone: Adder-in-Adder lexer --------------------
 echo "[build_user] compiling adder/compiler/lex_selftest.ad -> build/user/lex_selftest.elf"
-python3 -m compiler.adder compile \
+adder_cc_compile compile \
     --target=x86_64-adder-user \
     adder/compiler/lex_selftest.ad \
     -o build/user/lex_selftest.elf
@@ -302,7 +309,7 @@ file build/user/lex_selftest.elf
 
 # --- Self-hosting milestone: Adder-in-Adder parser -------------------
 echo "[build_user] compiling adder/compiler/parse_selftest.ad -> build/user/parse_selftest.elf"
-python3 -m compiler.adder compile \
+adder_cc_compile compile \
     --target=x86_64-adder-user \
     adder/compiler/parse_selftest.ad \
     -o build/user/parse_selftest.elf
@@ -310,7 +317,7 @@ file build/user/parse_selftest.elf
 
 # --- Self-hosting milestone: Adder-in-Adder codegen ------------------
 echo "[build_user] compiling adder/compiler/codegen_selftest.ad -> build/user/codegen_selftest.elf"
-python3 -m compiler.adder compile \
+adder_cc_compile compile \
     --target=x86_64-adder-user \
     adder/compiler/codegen_selftest.ad \
     -o build/user/codegen_selftest.elf
@@ -321,7 +328,7 @@ file build/user/codegen_selftest.elf
 # elf_emit.ad and dumps a complete, loadable user ELF as hex (consumed by
 # scripts/test_selfhost_elf.sh, which then EXECs the emitted ELF natively).
 echo "[build_user] compiling adder/compiler/codegen_elf_selftest.ad -> build/user/codegen_elf_selftest.elf"
-python3 -m compiler.adder compile \
+adder_cc_compile compile \
     --target=x86_64-adder-user \
     adder/compiler/codegen_elf_selftest.ad \
     -o build/user/codegen_elf_selftest.elf
@@ -332,7 +339,7 @@ file build/user/codegen_elf_selftest.elf
 # scalar globals (.data). Consumed by scripts/test_selfhost_bss.sh, which
 # EXECs the emitted ELF natively to prove the BSS model works on the CPU.
 echo "[build_user] compiling adder/compiler/codegen_bss_selftest.ad -> build/user/codegen_bss_selftest.elf"
-python3 -m compiler.adder compile \
+adder_cc_compile compile \
     --target=x86_64-adder-user \
     adder/compiler/codegen_bss_selftest.ad \
     -o build/user/codegen_bss_selftest.elf
@@ -343,7 +350,7 @@ file build/user/codegen_bss_selftest.elf
 # from a host-injected file (/src/input.ad) instead of a baked snippet.
 # Consumed by scripts/hamnix-ac and scripts/test_hamnix_ac.sh.
 echo "[build_user] compiling adder/compiler/codegen_ac_driver.ad -> build/user/codegen_ac_driver.elf"
-python3 -m compiler.adder compile \
+adder_cc_compile compile \
     --target=x86_64-adder-user \
     adder/compiler/codegen_ac_driver.ad \
     -o build/user/codegen_ac_driver.elf
@@ -356,7 +363,7 @@ file build/user/codegen_ac_driver.elf
 # spawns to compile a SOURCE package on the box (#186). Staged at
 # /bin/adder_cc.
 echo "[build_user] compiling adder/compiler/adder_cc_driver.ad -> build/user/adder_cc.elf"
-python3 -m compiler.adder compile \
+adder_cc_compile compile \
     --target=x86_64-adder-user \
     adder/compiler/adder_cc_driver.ad \
     -o build/user/adder_cc.elf

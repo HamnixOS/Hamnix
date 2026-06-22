@@ -62,6 +62,13 @@ export HAMNIX_BUILD_DIR="$OUTDIR"
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
 
+# Track-3 self-hosting: Adder-compiler backend selector ($ADDER_CC; default
+# `python` = the frozen seed). `adder_cc_compile` is a drop-in for
+# `python3 -m compiler.adder compile`. See scripts/_adder_cc.sh +
+# docs/subsystems/adder-compiler.md.
+# shellcheck source=_adder_cc.sh
+source "$PROJ_ROOT/scripts/_adder_cc.sh"
+
 OUT="${HAMNIX_INSTALLER_IMG_OUT:-$OUTDIR/hamnix-installer.img}"
 INSTALLED_KERNEL="$OUTDIR/hamnix-installed-kernel.elf"
 INSTALLER_KERNEL="$OUTDIR/hamnix-installer-kernel.elf"
@@ -144,7 +151,7 @@ file "$EFI_STUB" | grep -q "PE32+ executable for EFI" \
 echo "[build_installer_img] Stage 3: compile INSTALLED kernel (empty cpio)."
 env HAMNIX_CPIO_EMPTY=1 INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
 rm -f "$INSTALLED_KERNEL"
-python3 -m compiler.adder compile --target=x86_64-bare-metal \
+adder_cc_compile compile --target=x86_64-bare-metal \
     init/main.ad -o "$INSTALLED_KERNEL"
 [ -f "$INSTALLED_KERNEL" ] || { echo "[build_installer_img] ERROR: installed kernel not built" >&2; exit 1; }
 echo "[build_installer_img]   installed kernel: $(file -b "$INSTALLED_KERNEL")"
@@ -245,7 +252,7 @@ if [ "${ENABLE_LOG_SLOW:-0}" = "1" ]; then
     echo "[build_installer_img]   page-pause log capture ENABLED (/etc/log-slow planted)."
 fi
 rm -f "$INSTALLER_KERNEL"
-python3 -m compiler.adder compile --target=x86_64-bare-metal \
+adder_cc_compile compile --target=x86_64-bare-metal \
     init/main.ad -o "$INSTALLER_KERNEL"
 [ -f "$INSTALLER_KERNEL" ] || { echo "[build_installer_img] ERROR: installer kernel not built" >&2; exit 1; }
 echo "[build_installer_img]   installer kernel: $(file -b "$INSTALLER_KERNEL")"

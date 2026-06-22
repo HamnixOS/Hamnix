@@ -278,8 +278,92 @@ source uses only the flat SoA subset (parallel global arrays, `Ptr[T]`,
 `Array[N,T]`) that both the seed and `codegen.ad` already compile — zero
 classes, zero by-value structs.
 
+### Self-hosting cutover — WHOLE-TREE blocker (2026-06-21)
+
+**The fuzz dry-run is NOT sufficient to flip the default build driver.** The
+fuzzer generates only a narrow language subset. The real question — *can
+`host_ac.elf` compile the actual production tree?* — is answered by the
+**whole-tree differential** gate, `scripts/test_selfhost_wholetree_diff.sh`,
+which compiles every real userland `.ad` unit with BOTH backends:
+
+```
+real userland .ad units:        211
+  single-TU (0 imports):        128
+  multi-TU (imports):            83
+Python seed (oracle) accepted:  128 / 128   (100%)
+.ad host compiler accepted:       2 / 128    (true, false only)
+  rejected — reason 7 (no extern link):  120
+  rejected — reason 8 (unsup construct):   6   (init, shuf, vi, useradd, getty, umdf_host)
+```
+
+So the self-hosted `.ad` compiler **cannot build the real tree today**, and
+the cutover is **BLOCKED**. The fuzz corpus passing 300/300 hid this because
+the fuzzer never emits the constructs the real tree depends on. The `.ad`
+compiler (`codegen.ad` + `elf_emit.ad` + the fused driver) is a
+**closed-world, single-translation-unit, extern-less subset compiler** —
+exactly enough to compile *its own* (closed-world) source for the
+fixpoint, and no more. Four distinct, load-bearing capabilities are missing:
+
+1. **Extern linkage (reason 7 — 120/126 failures, the dominant blocker).**
+   Real userland units declare `extern def sys_write(...)` etc.; the seed
+   satisfies those by assembling + linking `user/runtime.S` (and, for the
+   kernel, the boot stubs `arch/x86/boot/header.S`, `arch/x86/kernel/head_64.S`
+   under `arch/x86/kernel/kernel.lds`). `codegen.ad` has **no extern symbol
+   model** — every unresolved callee is `cg_fail(7)` — and `elf_emit.ad` has
+   **no link step**: it emits a single self-contained PT_LOAD with its own
+   `_start`, so it cannot incorporate `runtime.S`/boot-stub object code.
+   Closing this needs an extern symbol table + relocations AND a real
+   object-emission/link path (or an in-`.ad` assembler for `runtime.S`).
+
+2. **Import resolution + module-private mangling (the 83 multi-TU units +
+   the entire kernel `init/main.ad`).** The seed's `collect_all_imports` +
+   `merge_programs` + `resolve_module_scopes` transitively gather modules and
+   mangle leading-underscore privates per module. The `.ad` driver reads ONE
+   file with no import resolution and no mangling, so it can only ever see a
+   single translation unit. The kernel alone pulls in hundreds of modules.
+
+3. **ELF output format.** `elf_emit.ad` emits only the `x86_64-adder-user`-
+   shape self-contained ELF. It does **not** produce the bare-metal kernel
+   ELF (multiboot header + higher-half VMA/LMA split via `kernel.lds`) nor
+   the `runtime.S`-linked userland ELF the seed ships.
+
+4. **A handful of constructs (reason 8 — 6/126).** `init`, `shuf`, `vi`,
+   `useradd`, `getty`, `umdf_host` use expression/statement forms
+   `codegen.ad` rejects (root-cause each against the failing node when the
+   linkage work lands; they are behind the reason-7 wall today).
+
+**Backends differ by construction**, so a byte-identical-ELF differential is
+not even theoretically possible: the seed routes through GNU `as` (AT&T asm),
+`codegen.ad` emits raw machine code directly. The sound equivalence metric
+stays **behavioral** (the fuzz dry-run) plus **acceptance** (the whole-tree
+gate) — not byte diff.
+
+**Measured win (the reason to finish this track).** Per-compile wall-clock on
+the two units both backends accept: the Python seed averages **~126 ms/compile**
+(interpreter startup + interpreted codegen); `host_ac.elf` averages
+**~0.4 ms/compile** — a **~300×** per-invocation speedup. With ~250 real
+compilation units per image build, finishing the cutover turns the bulk of
+the compile phase from tens of seconds of interpreted Python into a fraction
+of a second of native execution. The win is real and large; it is gated
+entirely on the four capabilities above.
+
+**Build wiring (LANDED, default unchanged).** `scripts/_adder_cc.sh` provides
+`adder_cc_compile` (a drop-in for `python3 -m compiler.adder compile`,
+selected by `$ADDER_CC`: `python` default = the frozen seed/oracle; `adder` =
+route through `host_ac.elf`, bootstrapped once by the seed). `build_user.sh`
+and `build_installer_img.sh` now call `adder_cc_compile` for every kernel +
+userland compile, so flipping the default is a one-line change once the `.ad`
+compiler is capable — and `ADDER_CC=python` is the permanent escape hatch.
+`scripts/test_selfhost_wholetree_diff.sh` guards the `.ad`-accepted baseline
+against regression and asserts the seed still compiles 100% of the tree.
+
+**NEXT track** (do NOT start before this lands): the four capabilities above —
+extern linkage is the keystone. The native-in-Adder optimizer (IR/LICM/CSE/
+regalloc) is a SEPARATE downstream track that only matters AFTER the cutover.
+
 **Runbook — flipping the default build driver to the `.ad` binary** (NOT done
-in this dry-run; the seed stays as the bootstrap and the fallback):
+yet — BLOCKED on the four capabilities above; the seed stays as the bootstrap
+and the fallback):
 
 1. *Bootstrap order (unchanged):* the Python seed (`compiler/`,
    `codegen_x86.py`) always builds FIRST and compiles the `.ad` compiler
