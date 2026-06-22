@@ -403,7 +403,10 @@ load-bearing capabilities are:
    ~31 K tokens). Every source/output/parser/codegen fixed array was raised to
    whole-TREE scale (all are zero-init `.bss`, so `host_ac.elf`'s file size is
    unchanged — only its data-segment memsz grows, ~408 MB, well within host
-   RAM): `DRV_SRC_CAP` 1 MiB→24 MiB, `DRV_FILE_CAP` 384 K→1 MiB; lexer
+   RAM): `DRV_SRC_CAP` 1 MiB→24 MiB, `DRV_FILE_CAP` 384 K→4 MiB (the per-file read
+   scratch must hold the LARGEST single source file — `arch/arm64/kmain.ad`
+   ~1.3 MB / `user/hamUId.ad` ~1.2 MB exceed the interim 1 MiB and were
+   silently truncated); lexer
    `MAX_TOKENS` 64 K→4 M, `STRBUF` 512 K→16 MiB; parser `MAX_NODES` 64 K→4 M;
    codegen `CODE_CAP`/`DATA_BASE` 2 MiB→16 MiB, `GDATA_CAP` 64 K→4 MiB,
    `MAX_FUNCS`/`GLOBALS`/`METHODS`/`FLOAT` 1 K→16 K, `MAX_FIXUPS`/`METHOD_
@@ -492,18 +495,66 @@ load-bearing capabilities are:
    `shuf`); `cp`/`tar`/`useradd`/`umdf_host` advance PAST the index wall to
    their next distinct construct.
 
-   **Remaining kernel CAP#4 blockers (precise, from the merged closure,
-   non-comment lines):** the kernel's NOW-FIRST blocker is **inline asm with a
-   multi-line triple-quoted body** — the lexer doesn't lex `"""…"""`, so
-   `asm_volatile("""…""")` fails (`parse error at line 46132`, the first
-   multi-line asm stub; single-line `asm_volatile("cli")` already parses).
-   Counts: **61 `asm`/`asm_volatile` calls (20 multi-line `"""`)**, **40
-   triple-quoted strings**, **15 f-strings (`f"…"`)**, **4 `yield`**, 0 lambda,
-   0 list/gen-comprehension. The two highest-leverage next CAP#4 lifts are
-   (a) lex `"""` triple-quoted strings + lower `asm`/`asm_volatile` to inline
-   machine bytes (the IRQ/MSR/port stubs), then (b) f-strings. Once those land
-   the kernel reaches codegen end-to-end; CAP#3b (boot-stub bytes + per-section
-   streams) then makes the kernel ELF emittable — see capability #3 above.
+   **CAP#4b inline-asm + parse-completion LANDED (2026-06-22) — the kernel
+   now PARSES end-to-end.** Three fixes cleared every lexer/parser blocker so
+   `init/main.ad`'s full 233,769-line merged closure lexes + parses completely:
+
+   * **Inline `asm_volatile("…")` lowering** (`codegen.ad gen_asm_volatile`).
+     `gen_call` intercepts a call to `asm_volatile` with a single string-
+     literal arg and assembles each stripped line to the EXACT bytes GNU `as`
+     produces from the seed's emitted text (the seed routes asm text through
+     `as`; `codegen.ad` is a self-contained byte emitter so it carries a
+     bounded x86_64 assembler for the kernel's asm vocabulary). Two-pass over
+     the lines: pass 1 records each `.Lxxx:` local-label block offset via
+     deterministic per-instruction sizes; pass 2 emits bytes, resolving rel8
+     `jmp`/`jc`/`loop` against the label table. Supported (all byte-verified):
+     zero-operand `cli`/`sti`/`hlt`/`pause`/`mfence`/`int3`/`cpuid`/`pushfq`/
+     `rdrand %rax`/`rdseed %rax`/`pushq`/`popq %reg`; retpoline `jmpq *%reg` /
+     `call *%reg` (all 16 regs, REX.B for r8–r15); `movq $imm,%reg`; RIP-global
+     `movq %reg,sym(%rip)` / `movq sym(%rip),%reg` / `movq $imm,sym(%rip)` /
+     `mulq sym(%rip)` / `popq sym(%rip)` / `lidt sym(%rip)` (PC32 reloc via the
+     existing `add_data_fixup`, with `sym+DISP` and the imm-to-mem disp/imm
+     ordering handled). Unsupported lines fail `cg_fail(11)` rather than
+     emitting wrong bytes. Triple-quoted `"""…"""` lexing was ALREADY present
+     in `lexer.ad` — the prior "first blocker" diagnosis was wrong; the real
+     first blocker was below.
+
+   * **`ref`-as-keyword lexer bug.** `lexer.ad` lexed lowercase `ref` as
+     `TOK_REF`, but the frozen seed's ONLY REF spelling is the capitalised
+     `Ref` (`lexer.py` keyword dict). The kernel uses `ref` as an ordinary
+     identifier (e.g. `_l_rcuref_get_slowpath(ref: uint64)`), so every such
+     site was unparseable — surfacing as the spurious `parse error at line
+     46132`. Removed the erroneous lowercase entry; `ref` now lexes as IDENT,
+     matching the seed. (This — NOT triple-quotes — was the kernel's true first
+     parse blocker.)
+
+   * **`DRV_FILE_CAP` per-file read truncation.** The host driver's per-file
+     read scratch was 1 MiB, but `arch/arm64/kmain.ad` (~1.3 MB) and
+     `user/hamUId.ad` (~1.2 MB) exceed it; `read_file` silently truncated them,
+     corrupting any closure that pulled one in. Raised to 4 MiB.
+
+   *Correction to the earlier construct census:* a tree-wide scan of the
+   kernel's merged closure (excluding comments / format-strings) finds **ZERO
+   real f-string literals and ZERO real `yield` statements** — the earlier
+   "15 f-strings / 4 yield" counts were false positives (`#f"`, `%f"`, the word
+   "yield" in prose). So cap#4b's f-string and `yield` sub-tasks do **not**
+   block the native kernel build; both constructs already have lexer/parser
+   support (`TOK_FSTRING`/`ND_FSTRING_LIT`, `TOK_YIELD`) should a future
+   userland unit need them.
+
+   **The kernel's now-ONLY remaining compile blocker is codegen, not parse:**
+   `cast[Ptr[T]](e)[i].field` — an `ND_MEMBER` (`.field`) over a cast-pointer
+   `ND_INDEX` — hits `reason=8 kind=15` at the first `PageDesc` access
+   (`return cast[Ptr[PageDesc]](d)[0].flags`, merged line 3530). CAP#4 landed
+   the cast-ptr INDEXED load/store and the member-base INDEX (`obj.field[i]`),
+   but NOT member access ON a cast-ptr-indexed lvalue. That is the next
+   codegen lift; once it lands the kernel reaches codegen end-to-end, leaving
+   only CAP#3b (boot-stub bytes + per-section streams) to make the kernel ELF
+   emittable — see capability #3 above.
+
+   Regression-floored by `scripts/test_selfhost_asm_volatile.sh` (compiles the
+   full asm vocabulary through `host_ac.elf` and asserts the `as` ground-truth
+   bytes; also guards triple-quote + `ref`-identifier parsing).
 
 **Backends differ by construction**, so a byte-identical-ELF differential is
 not even theoretically possible: the seed routes through GNU `as` (AT&T asm),
