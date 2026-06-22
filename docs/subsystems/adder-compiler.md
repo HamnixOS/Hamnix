@@ -279,6 +279,71 @@ call to a TRUE SysV extern taking `float`/`double` in `XMM0-7` is not yet
 wired (the fuzzer makes no such call). ARM64 FP is left as-is (not required
 for the x86 cutover).
 
+## Self-hosting cutover — BINARY-DIFFERENTIAL SWEEP, real-userland miscompiles fixed (2026-06-22)
+
+The fuzz dry-run proved equivalence on a NARROW language subset; the real
+question — does `host_ac.elf` emit BEHAVIORALLY-equivalent code for the ACTUAL
+production userland? — is answered by a SYSTEMATIC native-vs-seed machine-code
+differential over EVERY accepted unit, not boot-debugging one at a time.
+
+**Harness — `scripts/test_native_vs_seed_objdiff.sh` + `scripts/objdiff_normalize.py`.**
+Compiles every `user/*.ad` unit with BOTH backends (seed = Python oracle via
+`as`/`ld`; native = `host_ac.elf`), disassembles each as raw x86-64 (the bytes
+ARE x86-64; the ELFCLASS32 is only for the Hamnix loader), aligns functions
+(global score-ordered histogram match — the seed's symtab order and native's
+emission order differ for merged multi-TU UI units), and flags REAL semantic
+divergences (wrong operand WIDTH, opcode class, register, missing/extra ops)
+while NORMALIZING the documented encoding freedoms: register-allocation /
+push-pop spills, load-folded sign-extends, the seed-only stack-protector,
+stack-arg marshalling (`mov %r,(%rsp)` vs `push`), power-of-2 index scaling
+(`imul $n` vs `shl`), immediate materialization (`movabs` vs sign-extending
+`movq $imm32`), and sub-8-byte frame reloads. **Result: ZERO semantic
+divergences across all 193 accepted userland units.**
+
+**The pid-7 boot-blocker — FIXED (the keystone).** `etc/rc.boot`'s first
+external command is `cat /etc/installer-medium` (rfork'd as pid 7). The native
+`_start` stub in `elf_emit.ad` (`elf_emit_image`) emitted `mov $entry_arg,%edi;
+call main` — hardcoding a constant as main's FIRST arg. But the Hamnix user ABI
+passes **argc in %rdi, argv in %rsi IN REGISTERS** (kernel pre-loads them before
+sysretq; see `user/runtime.S`'s `_start`). The stub CLOBBERED %rdi (argc) with
+0, so a real `cat FILE` ran `main(0, …)`, took the argc<2 branch, and hung
+reading stdin during boot — the immediate freeze on entry `0x57f`. Fix: the stub
+now leaves %rdi/%rsi untouched and forwards them to main, mirroring runtime.S
+exactly (`call main; movslq %eax,%rdi; mov $1,%rax; syscall; jmp .`).
+
+**Real-userland miscompile classes the sweep found + fixed in `codegen.ad`
+(each floored in `tests/fuzz/adder_fuzzer.py`):**
+
+- **Logical `and`/`or` NON-short-circuit.** `codegen.ad` lowered `BINOP_AND`/
+  `BINOP_OR` as a bitwise fold (bool-ify BOTH operands, then `and`/`or`) —
+  evaluating the RHS unconditionally. The frozen seed (`gen_binary` ->
+  `gen_short_circuit`) short-circuits (Python/Adder semantics). A non-short-
+  circuit `p != 0 and p[i] != 0` DEREFERENCES a null pointer; every `streq`'s
+  `while a[i] != 0 and b[i] != 0` over-read. Fixed with the exact
+  `gen_short_circuit` branch chain. (~63 units.)
+- **Compare/shift/div SIGNEDNESS for non-IDENT operands.** `expr_signedness`
+  resolved only `ND_CAST`/`ND_IDENT`, returning 0 (unknown -> SIGNED default)
+  for `ND_INDEX` (array/ptr element), `ND_MEMBER` (struct field), `ND_CALL`
+  (return type), and reported every **8-byte** global as unsigned. The seed's
+  `get_expr_type` resolves all of these. Result: unsigned arrays used signed
+  `setl`/`sar` (base64 `quad[i]>>n`, nproc/uptime `buf[j]>=48`), int64 globals
+  used `div`/`xor` instead of `idiv`/`cqto` (hamcalc `acc/operand`), a
+  `Ptr[uint8]` param used signed compare (join `a[i]<c[k]`), a uint64 call
+  result used signed compare (hdu `cursor+1 < total_rows()`). Fixed by extending
+  `expr_signedness` to `ND_INDEX` (`index_elem_signed`, + recording `loc_type_node`
+  for named `Ptr[T]` locals/params), `ND_MEMBER` (`member_scalar_signedness` via
+  a new `sf_signedness` field table), `ND_CALL` (`call_return_type`), and an
+  8-byte-global tristate (`glob_signedness`). (~100 units.)
+
+**Whole-tree + kernel still green:** the whole-tree gate keeps acceptance at
+194 units; `test_selfhost_kernel_elf.sh` PASSES (host_ac codegens the full
+326 K-line kernel closure and `ld`-links a bootable higher-half ELF). NOTE: the
+8-byte-global fix added `glob_signedness`, which MUST also be in
+`concat_compiler_source.py`'s `HOST_BUFFER_OVERRIDES` (scaled to 16384) — else
+the kernel's ~9,266 globals overflow the on-disk `Array[1024]` and corrupt
+codegen `.bss` (a regression caught only by the kernel-elf gate, NOT by
+userland objdiff). Every new whole-tree-sized `glob_*` array needs the override.
+
 ## Self-hosting cutover — PARITY-COMPLETE + dry-run PROVEN (2026-06-21)
 
 All `codegen.ad`-vs-seed correctness gaps that the differential fuzzer can
