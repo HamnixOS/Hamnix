@@ -108,6 +108,20 @@ HOST_BUFFER_OVERRIDES = {
         ("DATA_BASE: uint32 = 2097152", "DATA_BASE: uint32 = 16777216"),
         ("GDATA_CAP: uint32 = 65536", "GDATA_CAP: uint32 = 4194304"),
         ("gdata: Array[65536, uint8]", "gdata: Array[4194304, uint8]"),
+        # Per-function local/param table. 256 is too small for some large
+        # kernel dispatch functions; raised to 2048 for the host build.
+        ("MAX_LOCALS: uint32 = 256", "MAX_LOCALS: uint32 = 2048"),
+        ("loc_name_off: Array[256, uint32]", "loc_name_off: Array[2048, uint32]"),
+        ("loc_name_len: Array[256, uint32]", "loc_name_len: Array[2048, uint32]"),
+        ("loc_offset: Array[256, int32]", "loc_offset: Array[2048, int32]"),
+        ("loc_elem_size: Array[256, uint32]", "loc_elem_size: Array[2048, uint32]"),
+        ("loc_ptr_size: Array[256, uint32]", "loc_ptr_size: Array[2048, uint32]"),
+        ("loc_is_signed: Array[256, uint32]", "loc_is_signed: Array[2048, uint32]"),
+        ("loc_scalar_size: Array[256, uint32]", "loc_scalar_size: Array[2048, uint32]"),
+        ("loc_is_float: Array[256, uint32]", "loc_is_float: Array[2048, uint32]"),
+        ("loc_struct_idx: Array[256, uint32]", "loc_struct_idx: Array[2048, uint32]"),
+        ("loc_struct_is_ptr: Array[256, uint32]", "loc_struct_is_ptr: Array[2048, uint32]"),
+        ("loc_type_node: Array[256, uint32]", "loc_type_node: Array[2048, uint32]"),
         ("MAX_FUNCS: uint32 = 1024", "MAX_FUNCS: uint32 = 16384"),
         ("fn_name_off: Array[1024, uint32]", "fn_name_off: Array[16384, uint32]"),
         ("fn_name_len: Array[1024, uint32]", "fn_name_len: Array[16384, uint32]"),
@@ -170,6 +184,7 @@ HOST_BUFFER_OVERRIDES = {
         ("sf_struct_idx: Array[4096, uint32]", "sf_struct_idx: Array[65536, uint32]"),
         ("sf_struct_is_ptr: Array[4096, uint32]", "sf_struct_is_ptr: Array[65536, uint32]"),
         ("sf_elem_struct: Array[4096, uint32]", "sf_elem_struct: Array[65536, uint32]"),
+        ("sf_type_node: Array[4096, uint32]", "sf_type_node: Array[65536, uint32]"),
         # Kernel-target relocatable-object emission (CAP#3b).
         ("MAX_EXTERNS: uint32 = 1024", "MAX_EXTERNS: uint32 = 16384"),
         ("ext_name_off: Array[1024, uint32]", "ext_name_off: Array[16384, uint32]"),
