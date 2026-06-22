@@ -59,7 +59,7 @@ from mm.rmap import (
 )
 from mm.lru import (
     lru_inactive_tail_pfn, lru_inactive_count, lru_active_count,
-    shrink_active_list, _lru_promote,
+    lru_total, shrink_active_list, _lru_promote, mark_page_accessed,
 )
 from mm.swap import (
     swap_slots_used, swap_slots_total, swap_ready,
@@ -586,6 +586,117 @@ def mm_pressure_selftest() -> int32:
     # Clean up: reap the surviving small victim so the slot is reusable.
     oom_kill_task(ss)
     load_cr3(boot_cr3)
+
+    # ---- PART C: rmap + active/inactive LRU + LRU-driven reclaim -----
+    # Prove the NEW Linux-shape mechanisms end-to-end on the boot task's
+    # own address space:
+    #   * a freshly demand-faulted anon page lands on the INACTIVE LRU and
+    #     carries an rmap entry (mapper slot + va) → mapcount 1, page_is_anon;
+    #   * mark_page_accessed gives a page a SECOND CHANCE: the first
+    #     LRU-shrink PROMOTES referenced pages instead of evicting them;
+    #   * the next LRU-shrink, with references cleared, evicts the COLDEST
+    #     pages by following the reverse map to the exact PTE — rewriting it
+    #     to a swap entry without any per-task page-table walk;
+    #   * swap-in restores the exact bytes (checksum), re-establishing rmap.
+    C_PAGES: uint64 = 32
+    c_len: uint64 = C_PAGES * MM_PAGE
+    c_base64: int64 = vma_alloc_demand(boot_slot, 0, c_len,
+                                       MM_TEST_PROT,
+                                       MM_MAP_PRIVATE | MM_MAP_ANON)
+    if c_base64 < 0:
+        printk0("[mm] FAIL: vma_alloc_demand (part C) failed\n")
+        ok = 0
+        if ok == 1:
+            printk0("[mm] PASS: pressure self-test complete\n")
+        return ok
+    c_base: uint64 = cast[uint64](c_base64)
+    load_cr3(boot_cr3)
+    _mm_fault_in_range(boot_slot, boot_pml4, c_base, C_PAGES)
+    _mm_fill_pattern(c_base, c_len, 0xC3)
+    c_csum_before: uint64 = _mm_fnv_region(c_base, c_len)
+
+    # The demand-fault hook put every page on an LRU list with an rmap
+    # entry.  Assert a probe page is a single-mapper anon page (rmap +
+    # mapcount==1) and that the LRU now holds at least our working set.
+    c_probe_va: uint64 = c_base + 5 * MM_PAGE
+    c_probe_slot: uint64 = _vma_pte_slot_addr(boot_pml4, c_probe_va)
+    c_probe_phys: uint64 = 0
+    if c_probe_slot != 0:
+        c_probe_phys = cast[Ptr[uint64]](c_probe_slot)[0] & 0x000FFFFFFFFFF000
+    if c_probe_phys != 0 and page_is_anon(c_probe_phys) != 0 \
+            and rmap_get_mapper_slot(c_probe_phys) == cast[int64](boot_slot):
+        printk1("[mm] PASS: rmap records mapper for anon page (slot=%d)\n",
+                boot_slot)
+    else:
+        printk0("[mm] FAIL: rmap did not record the anon page's mapper\n")
+        ok = 0
+    if lru_total() >= C_PAGES:
+        printk1("[mm] PASS: %d pages on LRU after fault-in\n", lru_total())
+    else:
+        printk2("[mm] FAIL: LRU holds %d pages, want >= %d\n",
+                lru_total(), C_PAGES)
+        ok = 0
+
+    # SECOND-CHANCE: the fault-in path marked every page accessed
+    # (PG_REFERENCED).  Re-assert the reference on our working set, then
+    # the FIRST shrink must PROMOTE (evict 0) rather than reclaim.
+    pc: uint64 = 0
+    while pc < C_PAGES:
+        ppx: uint64 = _vma_pte_slot_addr(boot_pml4, c_base + pc * MM_PAGE)
+        if ppx != 0:
+            phx: uint64 = cast[Ptr[uint64]](ppx)[0] & 0x000FFFFFFFFFF000
+            mark_page_accessed(phx)
+        pc = pc + 1
+    pre_c_pageouts: uint64 = swap_pageouts()
+    promoted_evicted: uint64 = reclaim_shrink_lru(C_PAGES)
+    if promoted_evicted == 0 and lru_active_count() >= C_PAGES:
+        printk1("[mm] PASS: referenced pages promoted not evicted (active=%d)\n",
+                lru_active_count())
+    else:
+        printk2("[mm] FAIL: 2nd-chance broke (evicted=%d active=%d)\n",
+                promoted_evicted, lru_active_count())
+        ok = 0
+
+    # Now age the active list back to inactive (references already cleared
+    # by the promote), then the LRU scanner must EVICT via rmap.
+    shrink_active_list(C_PAGES)
+    c_evicted: uint64 = reclaim_shrink_lru(C_PAGES)
+    c_pageouts: uint64 = swap_pageouts() - pre_c_pageouts
+    if c_evicted == C_PAGES and c_pageouts == C_PAGES:
+        printk1("[mm] PASS: LRU-shrink evicted %d cold pages via rmap\n",
+                c_evicted)
+    else:
+        printk2("[mm] FAIL: LRU-shrink evicted %d (pageouts %d)\n",
+                c_evicted, c_pageouts)
+        ok = 0
+
+    # The rmap-targeted eviction must have rewritten EXACTLY our pages'
+    # PTEs to swap entries.
+    c_swap_ptes: uint64 = _mm_count_swap_ptes(boot_pml4, c_base, C_PAGES)
+    if c_swap_ptes == C_PAGES:
+        printk1("[mm] PASS: all %d part-C PTEs are swap entries\n",
+                c_swap_ptes)
+    else:
+        printk2("[mm] FAIL: only %d of %d part-C PTEs are swap entries\n",
+                c_swap_ptes, C_PAGES)
+        ok = 0
+
+    # Fault them all back in and re-checksum — exact bytes restored.
+    cin: uint64 = 0
+    c_swapin_ok: int32 = 1
+    while cin < C_PAGES:
+        crc: int32 = vma_swap_in_fault(boot_slot, boot_pml4,
+                                       c_base + cin * MM_PAGE)
+        if crc != 1:
+            c_swapin_ok = 0
+        cin = cin + 1
+    c_csum_after: uint64 = _mm_fnv_region(c_base, c_len)
+    if c_swapin_ok == 1 and c_csum_after == c_csum_before:
+        printk0("[mm] PASS: part-C swap-in restored exact bytes via LRU/rmap\n")
+    else:
+        printk2("[mm] FAIL: part-C checksum before=%p after=%p\n",
+                c_csum_before, c_csum_after)
+        ok = 0
 
     if ok == 1:
         printk0("[mm] PASS: pressure self-test complete\n")

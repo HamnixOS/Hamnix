@@ -333,7 +333,19 @@ HW (consumer wifi, GPUs) — now crash-isolated.
   uptime (`mm/page_alloc.ad`).
 
 **Deep / punt until measured:** NUMA-node awareness + per-node pools;
-RCU read-side for task/VFS traversal; LRU-ordered reclaim.
+RCU read-side for task/VFS traversal.
+
+- [x] **LRU-ordered reclaim + rmap + kswapd + writeback throttling** —
+  Linux-shape MM parity landed: per-PFN struct-page array (`mm/page.ad`:
+  flags/mapcount/LRU links/rmap word); anon reverse map (`mm/rmap.ad`) so
+  reclaim finds a page's mapper without walking every task's page tables;
+  active/inactive LRU with second-chance/CLOCK (`mm/lru.ad`); watermark-
+  driven kswapd + direct reclaim (`mm/kswapd.ad`, low/min/high over
+  memblock-headroom+buddy-free); dirty/writeback accounting +
+  balance_dirty_pages throttling (`mm/writeback.ad`); LRU-tail scanner
+  `reclaim_shrink_lru` evicts the coldest single-mapper anon pages via
+  rmap (`mm/reclaim.ad`). OOM killer kept as the last resort. Proven by
+  `scripts/test_mm_pressure.sh` PART C.
 
 ## Track 6 — Adder code optimizer (→ rough C territory)
 

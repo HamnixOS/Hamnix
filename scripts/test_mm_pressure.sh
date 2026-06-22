@@ -106,6 +106,19 @@ check "OOM killed largest-RSS victim" \
       "[mm] PASS: OOM killed largest-RSS victim"
 check "system survived OOM kill" \
       "[mm] PASS: system survived OOM kill"
+# PART C — rmap + active/inactive LRU + LRU-driven reclaim
+check "rmap records the anon page's mapper" \
+      "[mm] PASS: rmap records mapper for anon page"
+check "fault-in populates the LRU" \
+      "[mm] PASS: 32 pages on LRU after fault-in"
+check "second-chance promotes referenced pages" \
+      "[mm] PASS: referenced pages promoted not evicted"
+check "LRU-shrink evicts cold pages via rmap" \
+      "[mm] PASS: LRU-shrink evicted 32 cold pages via rmap"
+check "all part-C PTEs became swap entries" \
+      "[mm] PASS: all 32 part-C PTEs are swap entries"
+check "part-C swap-in restores exact bytes" \
+      "[mm] PASS: part-C swap-in restored exact bytes via LRU/rmap"
 check "self-test complete" \
       "[mm] PASS: pressure self-test complete"
 
