@@ -607,6 +607,15 @@ if os.environ.get("ENABLE_NTASKS_TEST") == "1":
 if os.environ.get("ENABLE_SMP_USER") == "1":
     FILES.append(("/etc/smp-user", b"1\n"))
 
+# Bottom-half stack proof. scripts/test_bh.sh sets ENABLE_BH_TEST=1 to plant
+# /etc/bh-test. init/main.ad at boot:37.bh detects the marker and calls
+# bh_selftest_run() (kernel/softirq.ad): proves softirq raise/run, tasklet
+# run-once-coalesced, queue_work on a worker kthread + flush_work wait,
+# delayed_work fires after its delay, and a threaded-IRQ thread_fn runs in
+# thread context. Default boots omit the marker.
+if os.environ.get("ENABLE_BH_TEST") == "1":
+    FILES.append(("/etc/bh-test", b"1\n"))
+
 # Write-through block buffer cache self-test. scripts/test_bcache.sh sets
 # ENABLE_BCACHE_TEST=1 to plant /etc/bcache-test. init/main.ad at
 # boot:37.bcache detects the marker and calls blk_bcache_selftest()

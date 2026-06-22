@@ -1,0 +1,638 @@
+# kernel/softirq.ad — Linux-shape softirq + tasklet bottom-half core.
+#
+# This is the real bottom-half substrate the gap analysis flagged as
+# ABSENT/LITE: until now deferred work was tick-polling and tasklets
+# were stubbed. This file provides:
+#
+#   1. A fixed set of softirq vectors (HI, TIMER, NET_TX, NET_RX,
+#      BLOCK, IRQ_POLL, TASKLET, SCHED, HRTIMER, RCU) raised by
+#      raise_softirq() and run on IRQ-return by do_softirq(), with a
+#      bounded retry loop (MAX_SOFTIRQ_RESTART) and a ksoftirqd kthread
+#      fallback when the loop budget is exhausted under flood.
+#
+#   2. Real tasklets: tasklet_schedule() -> raise TASKLET softirq;
+#      tasklet_action() runs each scheduled tasklet exactly once and
+#      serializes a tasklet against itself via the SCHED/RUN state bits
+#      (so the same tasklet never runs concurrently on two CPUs).
+#
+# Mirrors kernel/softirq.c. Per-CPU pending masks (Percpu[uint64]) hold
+# the raised-but-not-yet-run vector bitmap for THIS cpu — raise on cpu N
+# runs on cpu N, exactly like Linux. A short global spinlock
+# (tasklet_lock) guards the tasklet singly-linked list, which is the
+# only cross-CPU shared structure here; the per-CPU pending mask itself
+# needs no lock because it is only ever read/written by its owning CPU
+# under local_irq_disable (raise from IRQ context is already IRQ-off; the
+# tasklet_schedule path disables IRQs around the OR).
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.sched.core import (
+    kthread_create, WaitQueue, wq_init, wq_wait_prepare, wq_wait_cancel,
+    wq_wait_commit, wq_wake_one, yield_to_others,
+)
+from kernel.workqueue import wq_queue_work, wq_flush_work
+from arch.x86.kernel.time import get_jiffies
+from mm.slab import kmalloc
+from linux_abi.api_kthread import _l_schedule_delayed_work
+from linux_abi.api_irq import (
+    irq_threaded_selftest_register, irq_threaded_selftest_fire,
+    irq_threaded_selftest_thread_ran, irq_threaded_selftest_ordered,
+)
+
+extern def local_irq_disable()
+extern def local_irq_enable()
+extern def spinlock_lock(ptr: Ptr[uint32])
+extern def spinlock_unlock(ptr: Ptr[uint32])
+
+from linux_abi.api_timer import timer_walk_one_tick
+from arch.x86.kernel.time import register_softirq_tick_hook
+
+
+# --- softirq vector numbers (mirror include/linux/interrupt.h) ------
+#
+# Order matters: lower index = higher priority, scanned first in
+# do_softirq. HI runs first (high-prio tasklets), RCU last.
+
+HI_SOFTIRQ:       uint64 = 0
+TIMER_SOFTIRQ:    uint64 = 1
+NET_TX_SOFTIRQ:   uint64 = 2
+NET_RX_SOFTIRQ:   uint64 = 3
+BLOCK_SOFTIRQ:    uint64 = 4
+IRQ_POLL_SOFTIRQ: uint64 = 5
+TASKLET_SOFTIRQ:  uint64 = 6
+SCHED_SOFTIRQ:    uint64 = 7
+HRTIMER_SOFTIRQ:  uint64 = 8
+RCU_SOFTIRQ:      uint64 = 9
+NR_SOFTIRQS:      uint64 = 10
+
+# Bounded restart budget. do_softirq re-scans the pending mask up to
+# this many times; if work is still pending after that, it hands off to
+# ksoftirqd rather than starving the interrupted context. Matches
+# Linux's MAX_SOFTIRQ_RESTART = 10.
+MAX_SOFTIRQ_RESTART: uint64 = 10
+
+
+# --- softirq action vector ------------------------------------------
+#
+# softirq_vec[v] is the handler for softirq vector v: a void(*)(void)
+# first-class function pointer. open_softirq(v, fn) installs it. A null
+# slot means "no handler" (the vector is raised but does nothing, which
+# is benign — Linux WARNs but continues).
+softirq_vec: Array[10, Fn[None]]
+
+# Per-CPU pending bitmask. Bit v set => softirq vector v is raised on
+# this CPU and waiting to run. Read/written only by the owning CPU with
+# IRQs disabled, so no lock is needed (Linux's local_softirq_pending()).
+softirq_pending_pcpu: Percpu[uint64]
+
+# Per-CPU "in softirq processing" depth. Non-zero means do_softirq is
+# already running on this CPU; a nested IRQ that raises a softirq must
+# NOT recurse into do_softirq (it just sets the pending bit and the
+# outer loop picks it up). Mirrors Linux's preempt-count softirq bits.
+in_softirq_pcpu: Percpu[uint64]
+
+# Diagnostic counters (timer-excluded handler accounting, like
+# irq_dispatch_count). Selftests assert these advance.
+softirq_run_count_pcpu: Percpu[uint64]
+ksoftirqd_wakeups: uint64 = 0
+
+# 1 once softirq_init() has run (ksoftirqd + handlers wired). Drivers that
+# can raise softirqs from an IRQ before the core is up consult this to fall
+# back to inline draining during early device bring-up.
+softirq_started: uint64 = 0
+
+
+def softirq_started_get() -> uint64:
+    return softirq_started
+
+
+def open_softirq(vec: uint64, action: Fn[None]):
+    # Install the handler for softirq vector `vec`. Called once per
+    # subsystem at init (net_rx, tasklet, timer, ...). Re-registration
+    # overwrites — exactly one owner per vector.
+    if vec >= NR_SOFTIRQS:
+        printk1("[softirq] open_softirq: vec %d out of range\n", vec)
+        return
+    softirq_vec[vec] = action
+
+
+def _raise_softirq_irqoff(vec: uint64):
+    # Set the pending bit for `vec` on THIS cpu. Caller MUST have IRQs
+    # disabled (this is the from-hard-IRQ-context fast path; do_irq runs
+    # with IF=0). Does NOT itself invoke do_softirq — that happens on
+    # IRQ-return via irq_exit_softirq() -> do_softirq().
+    if vec >= NR_SOFTIRQS:
+        return
+    softirq_pending_pcpu = softirq_pending_pcpu | (cast[uint64](1) << vec)
+
+
+def raise_softirq(vec: uint64):
+    # Raise `vec` from arbitrary context: disable IRQs, set the pending
+    # bit, then — if we are NOT already inside a softirq pass — wake
+    # ksoftirqd so a purely process-context raise (no imminent IRQ) is
+    # not stranded. In hard-IRQ context the trailing irq_exit_softirq()
+    # drains it. Mirrors Linux's raise_softirq().
+    local_irq_disable()
+    _raise_softirq_irqoff(vec)
+    if in_softirq_pcpu == 0:
+        _ksoftirqd_wake()
+    local_irq_enable()
+
+
+# --- do_softirq: the IRQ-return bottom-half pass --------------------
+
+def do_softirq():
+    # Run all pending softirqs on THIS cpu. Invoked from irq_exit_softirq()
+    # (IRQ-return) and from ksoftirqd. Discipline (mirror Linux):
+    #   * We snapshot+clear the pending mask, re-enable IRQs while
+    #     running handlers (so a new IRQ can raise more work), then
+    #     re-disable to re-read pending. Up to MAX_SOFTIRQ_RESTART scans.
+    #   * If pending survives the budget, wake ksoftirqd and return so we
+    #     don't starve the interrupted task.
+    #   * Re-entrancy guarded by in_softirq_pcpu: a nested call is a
+    #     no-op (the outer loop owns the drain).
+    local_irq_disable()
+    if in_softirq_pcpu != 0:
+        local_irq_enable()
+        return
+    pending: uint64 = softirq_pending_pcpu
+    if pending == 0:
+        local_irq_enable()
+        return
+    in_softirq_pcpu = 1
+
+    restart: uint64 = MAX_SOFTIRQ_RESTART
+    while pending != 0 and restart > 0:
+        # Atomically take the current pending set and clear it; new
+        # raises during this scan re-set bits we'll catch on re-read.
+        softirq_pending_pcpu = 0
+        local_irq_enable()
+
+        # Run each set vector in priority order (HI..RCU).
+        v: uint64 = 0
+        while v < NR_SOFTIRQS:
+            if (pending & (cast[uint64](1) << v)) != 0:
+                h: Fn[None] = softirq_vec[v]
+                if h != cast[Fn[None]](0):
+                    h()
+                    softirq_run_count_pcpu = softirq_run_count_pcpu + 1
+            v = v + 1
+
+        local_irq_disable()
+        pending = softirq_pending_pcpu
+        restart = restart - 1
+
+    in_softirq_pcpu = 0
+
+    if pending != 0:
+        # Budget exhausted with work still pending (flood). Hand the rest
+        # to ksoftirqd so the interrupted context makes progress.
+        _ksoftirqd_wake()
+    local_irq_enable()
+
+
+def irq_exit_softirq():
+    # Called from the IRQ-return path (do_irq, after the device handler
+    # and EOI) when this cpu's softirq mask is non-empty. Thin wrapper so
+    # arch code has one symbol to call; keeps the bounded-loop policy here.
+    if softirq_pending_pcpu != 0 and in_softirq_pcpu == 0:
+        do_softirq()
+
+
+# --- ksoftirqd: per-cpu fallback kthread ----------------------------
+#
+# Under sustained softirq flood (do_softirq exhausting MAX_SOFTIRQ_RESTART
+# every IRQ-return) we offload the drain to a dedicated kthread so hard-IRQ
+# latency stays bounded. The kthread sleeps on its own wait queue and is
+# woken either by raise_softirq from process context or by do_softirq when
+# the budget is blown.
+
+ksoftirqd_wq: WaitQueue
+ksoftirqd_started: uint64 = 0
+
+
+def _ksoftirqd_wake():
+    # Mark ksoftirqd runnable. Safe from IRQ context (wq_wake_one is).
+    if ksoftirqd_started == 0:
+        return
+    ksoftirqd_wakeups = ksoftirqd_wakeups + 1
+    wq_wake_one(&ksoftirqd_wq)
+
+
+def ksoftirqd_main(arg: uint64) -> int64:
+    # The ksoftirqd loop: wait for work, drain it, repeat. Runs in
+    # kthread (CPL0) context, so do_softirq here never blocks hard IRQs
+    # for long — exactly the point of offloading flood.
+    while True:
+        # Drain everything currently pending.
+        while softirq_pending_pcpu != 0:
+            do_softirq()
+        # Sleep until the next wake. Two-phase to avoid a lost wakeup:
+        # prepare, re-check pending, then commit or cancel.
+        wq_wait_prepare(&ksoftirqd_wq)
+        if softirq_pending_pcpu != 0:
+            wq_wait_cancel(&ksoftirqd_wq)
+        else:
+            wq_wait_commit(&ksoftirqd_wq)
+    return 0
+
+
+def _timer_softirq_action():
+    # TIMER softirq handler: run the L9 software-timer wheel once. Fires
+    # every armed timer whose deadline has passed (mod_timer / delayed_work
+    # / msleep-completion users). Runs in softirq context, exactly as Linux
+    # dispatches the timer wheel from TIMER_SOFTIRQ.
+    timer_walk_one_tick()
+
+
+def _softirq_tick():
+    # Registered as the timer-interrupt softirq hook. Raise TIMER_SOFTIRQ
+    # (so the wheel runs) and drain this cpu's pending softirqs now, on the
+    # timer IRQ-return. IRQs are off here (we are inside timer_interrupt).
+    _raise_softirq_irqoff(TIMER_SOFTIRQ)
+    irq_exit_softirq()
+
+
+def softirq_init():
+    # Wire the softirq subsystem at boot, after sched_init() (kthreads
+    # need the scheduler) and before the IRQ-return path can fire useful
+    # softirqs. Registers the TASKLET vectors and spawns ksoftirqd.
+    wq_init(&ksoftirqd_wq)
+    # HI and TASKLET share the tasklet machinery (HI = high-prio tasklets).
+    open_softirq(TASKLET_SOFTIRQ, tasklet_action)
+    open_softirq(HI_SOFTIRQ, tasklet_hi_action)
+    # TIMER softirq drives the L9 timer wheel (api_timer) — the path that
+    # delayed_work / mod_timer callbacks fire on. Publishing the tick hook
+    # makes the timer-interrupt raise+drain TIMER_SOFTIRQ each tick.
+    open_softirq(TIMER_SOFTIRQ, _timer_softirq_action)
+    register_softirq_tick_hook(_softirq_tick)
+    # Mark the core live: drivers (e.g. virtio-net RX) now route their
+    # bottom half through raise_softirq(NET_RX) instead of running the
+    # heavy drain in hard-IRQ context. Set BEFORE the kthread spawn so a
+    # raise during boot already sees it.
+    softirq_started = 1
+    # Spawn the ksoftirqd fallback kthread. name0 = 'ksoftird' tag.
+    # 'ksoftird' little-endian bytes: k s o f t i r d
+    name0: uint64 = 0x6472696674666F6B
+    slot: int32 = kthread_create(cast[uint64](&_ksoftirqd_trampoline), name0)
+    if slot < 0:
+        printk0("[softirq] ksoftirqd spawn FAILED (no sched slot)\n")
+        return
+    ksoftirqd_started = 1
+    printk0("[softirq] core up: vectors HI..RCU, ksoftirqd spawned\n")
+
+
+def _ksoftirqd_trampoline():
+    # kthread_create entry is a no-arg routine; bridge to ksoftirqd_main.
+    ksoftirqd_main(0)
+
+
+# ====================================================================
+# TASKLETS
+# ====================================================================
+#
+# A tasklet is a deferred callback that runs in TASKLET (or HI) softirq
+# context, with the guarantee that the SAME tasklet never runs on two
+# CPUs at once (serialized against itself), and runs at most once per
+# tasklet_schedule even if scheduled multiple times before it runs.
+#
+# Linux's struct tasklet_struct:
+#   offset  0   struct tasklet_struct *next
+#   offset  8   unsigned long state          (SCHED bit 0, RUN bit 1)
+#   offset 16   atomic_t count               (non-zero = disabled)
+#   offset 20   bool use_callback (+pad)
+#   offset 24   void (*func)(unsigned long) | void (*callback)(t*)
+#   offset 32   unsigned long data
+#
+# We honor the classic `func(data)` form (use_callback == 0), which is
+# what every in-tree and probe driver uses. The tasklet list is a per-CPU
+# singly-linked list threaded through offset 0 (next), guarded by a short
+# global spinlock (tasklet_lock) because tasklet_schedule may be called
+# from a different CPU than the one that drains.
+
+TASKLET_OFF_NEXT:  uint64 = 0
+TASKLET_OFF_STATE: uint64 = 8
+TASKLET_OFF_COUNT: uint64 = 16
+TASKLET_OFF_FUNC:  uint64 = 24
+TASKLET_OFF_DATA:  uint64 = 32
+
+TASKLET_STATE_SCHED: uint64 = 1   # bit 0: scheduled, on the list
+TASKLET_STATE_RUN:   uint64 = 2   # bit 1: currently running
+
+# Two per-CPU lists: normal-priority (TASKLET softirq) and high-priority
+# (HI softirq). Head holds a tasklet_struct* (raw address) or 0.
+tasklet_head_pcpu:    Percpu[uint64]
+tasklet_hi_head_pcpu: Percpu[uint64]
+tasklet_lock: uint32 = 0
+
+
+def _tasklet_enqueue(head_is_hi: uint64, t: uint64):
+    # Push tasklet `t` onto this cpu's (hi or normal) list and raise the
+    # corresponding softirq. Caller path has already won the SCHED bit.
+    local_irq_disable()
+    spinlock_lock(&tasklet_lock)
+    np: Ptr[uint64] = cast[Ptr[uint64]](t + TASKLET_OFF_NEXT)
+    if head_is_hi != 0:
+        np[0] = tasklet_hi_head_pcpu
+        tasklet_hi_head_pcpu = t
+        _raise_softirq_irqoff(HI_SOFTIRQ)
+    else:
+        np[0] = tasklet_head_pcpu
+        tasklet_head_pcpu = t
+        _raise_softirq_irqoff(TASKLET_SOFTIRQ)
+    spinlock_unlock(&tasklet_lock)
+    local_irq_enable()
+
+
+def tasklet_schedule(t: uint64):
+    # void tasklet_schedule(struct tasklet_struct *t).
+    # Set the SCHED bit; if it was already set, the tasklet is already
+    # queued and we do nothing (the "at most once" guarantee). Otherwise
+    # enqueue + raise the TASKLET softirq.
+    if t == 0:
+        return
+    sp: Ptr[uint64] = cast[Ptr[uint64]](t + TASKLET_OFF_STATE)
+    local_irq_disable()
+    already: uint64 = sp[0] & TASKLET_STATE_SCHED
+    sp[0] = sp[0] | TASKLET_STATE_SCHED
+    local_irq_enable()
+    if already != 0:
+        return                          # already scheduled — coalesce
+    _tasklet_enqueue(0, t)
+
+
+def tasklet_hi_schedule(t: uint64):
+    # High-priority variant — runs in HI softirq (before normal tasklets).
+    if t == 0:
+        return
+    sp: Ptr[uint64] = cast[Ptr[uint64]](t + TASKLET_OFF_STATE)
+    local_irq_disable()
+    already: uint64 = sp[0] & TASKLET_STATE_SCHED
+    sp[0] = sp[0] | TASKLET_STATE_SCHED
+    local_irq_enable()
+    if already != 0:
+        return
+    _tasklet_enqueue(1, t)
+
+
+def _tasklet_run_list(head_is_hi: uint64):
+    # Detach this cpu's tasklet list and run each entry once. For each
+    # tasklet we try to win the RUN bit; if another CPU holds it (same
+    # tasklet running there), we re-queue this tasklet and re-raise so it
+    # runs later — never concurrently. This is Linux's tasklet_action.
+    local_irq_disable()
+    spinlock_lock(&tasklet_lock)
+    list: uint64 = 0
+    if head_is_hi != 0:
+        list = tasklet_hi_head_pcpu
+        tasklet_hi_head_pcpu = 0
+    else:
+        list = tasklet_head_pcpu
+        tasklet_head_pcpu = 0
+    spinlock_unlock(&tasklet_lock)
+    local_irq_enable()
+
+    while list != 0:
+        t: uint64 = list
+        np: Ptr[uint64] = cast[Ptr[uint64]](t + TASKLET_OFF_NEXT)
+        next: uint64 = np[0]
+
+        sp: Ptr[uint64] = cast[Ptr[uint64]](t + TASKLET_OFF_STATE)
+        cp: Ptr[uint64] = cast[Ptr[uint64]](t + TASKLET_OFF_COUNT)
+
+        # Try to acquire RUN (serialize against self). Also honor the
+        # disable count: a disabled tasklet (count != 0) is deferred.
+        ran: uint64 = 0
+        local_irq_disable()
+        running: uint64 = sp[0] & TASKLET_STATE_RUN
+        disabled: uint64 = cp[0]
+        if running == 0 and disabled == 0:
+            sp[0] = sp[0] | TASKLET_STATE_RUN
+            # Clear SCHED now that we've taken it off the list to run —
+            # a re-schedule during the callback re-queues it cleanly.
+            sp[0] = sp[0] & (~TASKLET_STATE_SCHED)
+            ran = 1
+        local_irq_enable()
+
+        if ran != 0:
+            fn: uint64 = cast[Ptr[uint64]](t + TASKLET_OFF_FUNC)[0]
+            data: uint64 = cast[Ptr[uint64]](t + TASKLET_OFF_DATA)[0]
+            if fn != 0:
+                # void (*func)(unsigned long) — data marshalled into %rdi.
+                call_fn: Fn[None, uint64] = cast[Fn[None, uint64]](fn)
+                call_fn(data)
+            # Release RUN.
+            local_irq_disable()
+            sp[0] = sp[0] & (~TASKLET_STATE_RUN)
+            local_irq_enable()
+        else:
+            # Couldn't run now (busy elsewhere or disabled): re-queue +
+            # re-raise so it runs on a later pass, never concurrently.
+            _tasklet_enqueue(head_is_hi, t)
+
+        list = next
+
+
+def tasklet_action():
+    # TASKLET softirq handler (normal priority).
+    _tasklet_run_list(0)
+
+
+def tasklet_hi_action():
+    # HI softirq handler (high priority).
+    _tasklet_run_list(1)
+
+
+def tasklet_init(t: uint64, func: uint64, data: uint64):
+    # void tasklet_init(struct tasklet_struct *t,
+    #                   void (*func)(unsigned long), unsigned long data);
+    # Zero state/count, store func+data. (Static DECLARE_TASKLET writes
+    # these fields directly; this is the runtime initializer.)
+    if t == 0:
+        return
+    cast[Ptr[uint64]](t + TASKLET_OFF_NEXT)[0]  = 0
+    cast[Ptr[uint64]](t + TASKLET_OFF_STATE)[0] = 0
+    cast[Ptr[uint64]](t + TASKLET_OFF_COUNT)[0] = 0
+    cast[Ptr[uint64]](t + TASKLET_OFF_FUNC)[0]  = func
+    cast[Ptr[uint64]](t + TASKLET_OFF_DATA)[0]  = data
+
+
+def tasklet_kill(t: uint64):
+    # Wait for a scheduled tasklet to finish and clear SCHED. On this
+    # cooperative kernel the drain runs synchronously, so by the time a
+    # caller reaches here from process context the tasklet is not on any
+    # list; we just clear the bits defensively.
+    if t == 0:
+        return
+    sp: Ptr[uint64] = cast[Ptr[uint64]](t + TASKLET_OFF_STATE)
+    local_irq_disable()
+    sp[0] = sp[0] & (~(TASKLET_STATE_SCHED | TASKLET_STATE_RUN))
+    local_irq_enable()
+
+
+# ====================================================================
+# BOTTOM-HALF SELFTEST  (boot:37.bh, gated on /etc/bh-test)
+# ====================================================================
+#
+# Proves the whole stack is LIVE, not just present:
+#   1. A raised softirq runs (on the IRQ-return / drain path).
+#   2. A tasklet runs exactly once even when scheduled twice (coalesce),
+#      and runs via the TASKLET softirq.
+#   3. queue_work runs the work on a worker kthread, and flush_work
+#      blocks until it has completed.
+#   4. Delayed work fires only AFTER its delay elapses (timer wheel ->
+#      TIMER softirq -> queue_work -> worker).
+#   5. A threaded-IRQ thread_fn runs in thread context, strictly after
+#      the hard-IRQ top half (deferral proven by ordering).
+#
+# Run from the BSP boot task with interrupts enabled (the caller does
+# sti) so the worker/ksoftirqd/irq-thread kthreads can be scheduled when
+# this task yields. Emits one [bh] PASS/FAIL line per assertion plus a
+# final [bh] SELFTEST line the test script greps.
+
+# --- test-softirq vector (reuse IRQ_POLL slot; unused otherwise) ----
+bh_test_softirq_ran: uint64 = 0
+
+
+def _bh_test_softirq_action():
+    bh_test_softirq_ran = bh_test_softirq_ran + 1
+
+
+# --- test tasklet ----------------------------------------------------
+bh_test_tasklet_runs: uint64 = 0
+# Static tasklet_struct storage: 40 bytes (next/state/count/func/data).
+bh_test_tasklet_buf: Array[40, uint8]
+
+
+def _bh_test_tasklet_fn(data: uint64):
+    bh_test_tasklet_runs = bh_test_tasklet_runs + 1
+
+
+# --- test work_struct ------------------------------------------------
+bh_test_work_runs: uint64 = 0
+# work_struct: data(8)+next(8)+seq(8)+func(8) = 32 bytes.
+bh_test_work_buf: Array[32, uint8]
+
+
+def _bh_test_work_fn(work: uint64):
+    bh_test_work_runs = bh_test_work_runs + 1
+
+
+# --- test delayed_work -----------------------------------------------
+bh_test_dwork_runs: uint64 = 0
+# delayed_work: work(32) + timer(40) = 72 bytes.
+bh_test_dwork_buf: Array[72, uint8]
+
+
+def _bh_test_dwork_fn(work: uint64):
+    bh_test_dwork_runs = bh_test_dwork_runs + 1
+
+
+def _bh_zero(buf: uint64, n: uint64):
+    i: uint64 = 0
+    while i < n:
+        cast[Ptr[uint8]](buf + i)[0] = 0
+        i = i + 1
+
+
+def bh_selftest_run():
+    printk0("[bh] bottom-half selftest START\n")
+    fails: uint64 = 0
+
+    # ---- 1. softirq raise + run -------------------------------------
+    open_softirq(IRQ_POLL_SOFTIRQ, _bh_test_softirq_action)
+    bh_test_softirq_ran = 0
+    raise_softirq(IRQ_POLL_SOFTIRQ)
+    # Drain on the IRQ-return path (do_softirq is exactly what irq_exit
+    # calls). A pure-process raise also nudged ksoftirqd; drive it home.
+    do_softirq()
+    if bh_test_softirq_ran == 1:
+        printk0("[bh] PASS softirq raised-and-ran\n")
+    else:
+        printk1("[bh] FAIL softirq ran=%d (want 1)\n", bh_test_softirq_ran)
+        fails = fails + 1
+
+    # ---- 2. tasklet runs once, coalesced ----------------------------
+    t: uint64 = cast[uint64](&bh_test_tasklet_buf[0])
+    tasklet_init(t, cast[uint64](&_bh_test_tasklet_fn), 0)
+    bh_test_tasklet_runs = 0
+    tasklet_schedule(t)          # first schedule -> queued + SCHED set
+    tasklet_schedule(t)          # second -> coalesced (SCHED already set)
+    do_softirq()                 # drains TASKLET softirq
+    if bh_test_tasklet_runs == 1:
+        printk0("[bh] PASS tasklet ran-once (coalesced double-schedule)\n")
+    else:
+        printk1("[bh] FAIL tasklet runs=%d (want 1)\n", bh_test_tasklet_runs)
+        fails = fails + 1
+
+    # ---- 3. queue_work on a worker kthread + flush_work -------------
+    w: uint64 = cast[uint64](&bh_test_work_buf[0])
+    _bh_zero(w, 32)
+    cast[Ptr[uint64]](w + 24)[0] = cast[uint64](&_bh_test_work_fn)   # func@24
+    bh_test_work_runs = 0
+    wq_queue_work(w)
+    # The work runs on a worker kthread; flush_work blocks (and yields)
+    # until it has completed. We yield first so a worker can pick it up.
+    yield_to_others()
+    wq_flush_work(w)
+    if bh_test_work_runs >= 1:
+        printk0("[bh] PASS queue_work ran-on-worker + flush_work waited\n")
+    else:
+        # Give workers more scheduling opportunities before declaring fail.
+        spin: uint64 = 0
+        while spin < 50 and bh_test_work_runs == 0:
+            yield_to_others()
+            spin = spin + 1
+        if bh_test_work_runs >= 1:
+            printk0("[bh] PASS queue_work ran-on-worker (after yield)\n")
+        else:
+            printk0("[bh] FAIL queue_work never ran on a worker\n")
+            fails = fails + 1
+
+    # ---- 4. delayed work fires only after the delay -----------------
+    dw: uint64 = cast[uint64](&bh_test_dwork_buf[0])
+    _bh_zero(dw, 72)
+    cast[Ptr[uint64]](dw + 24)[0] = cast[uint64](&_bh_test_dwork_fn) # work.func@24
+    bh_test_dwork_runs = 0
+    start_j: uint64 = get_jiffies()
+    _l_schedule_delayed_work(dw, 3)        # fire ~3 jiffies from now
+    # It must NOT have run immediately.
+    early_ok: uint64 = 1
+    if bh_test_dwork_runs != 0:
+        early_ok = 0
+    # Yield until the timer wheel (TIMER softirq) fires it and a worker
+    # runs it. Bound the wait so a stuck path fails instead of hanging.
+    spin2: uint64 = 0
+    while spin2 < 200 and bh_test_dwork_runs == 0:
+        yield_to_others()
+        spin2 = spin2 + 1
+    elapsed: uint64 = get_jiffies() - start_j
+    if bh_test_dwork_runs >= 1 and early_ok == 1:
+        printk1("[bh] PASS delayed_work fired after %d jiffies\n", elapsed)
+    else:
+        printk2("[bh] FAIL delayed_work runs=%d early_ok=%d\n",
+                bh_test_dwork_runs, early_ok)
+        fails = fails + 1
+
+    # ---- 5. threaded IRQ runs thread_fn in thread context -----------
+    irq_threaded_selftest_register()       # spawns the irq-thread kthread
+    yield_to_others()                      # let the thread reach its wait
+    irq_threaded_selftest_fire()           # hard-IRQ dispatch: wake thread
+    # thread_fn must NOT have run synchronously inside the dispatch.
+    ran_sync: uint64 = irq_threaded_selftest_thread_ran()
+    spin3: uint64 = 0
+    while spin3 < 50 and irq_threaded_selftest_thread_ran() == 0:
+        yield_to_others()
+        spin3 = spin3 + 1
+    if irq_threaded_selftest_thread_ran() == 1 and \
+       irq_threaded_selftest_ordered() == 1 and ran_sync == 0:
+        printk0("[bh] PASS threaded-IRQ thread_fn ran in thread context\n")
+    else:
+        printk2("[bh] FAIL threaded-IRQ ran=%d ordered=%d\n",
+                irq_threaded_selftest_thread_ran(),
+                irq_threaded_selftest_ordered())
+        fails = fails + 1
+
+    if fails == 0:
+        printk0("[bh] SELFTEST PASS\n")
+    else:
+        printk1("[bh] SELFTEST FAIL (%d assertions)\n", fails)

@@ -74,6 +74,11 @@ from linux_abi.exports import _add_export
 from kernel.sched.core import kthread_create
 from kernel.printk.printk import printk0
 from arch.x86.kernel.apic import smp_send_reschedule
+from kernel.workqueue import (
+    wq_queue_work, wq_flush_work, wq_flush_all, workqueue_started,
+)
+from linux_abi.api_timer import _l_timer_setup, _l_mod_timer
+from arch.x86.kernel.time import get_jiffies
 
 
 # --- kthread bookkeeping --------------------------------------------
@@ -246,29 +251,15 @@ class WqSlot:
 wq_table: Array[4, WqSlot]
 
 
-# Pending-work table. Each entry is (wq_handle, work_struct_ptr).
-# Flush walks the table, executes each work_struct's fn at offset 24,
-# and clears the slot. 16 pending entries is generous for L8 (M4.3a
-# enqueues one item then flushes).
-
-WORK_PENDING_SLOTS: uint64 = 16
-work_pending_wq:   Array[16, uint64]      # 0 = empty slot
-work_pending_work: Array[16, uint64]      # work_struct *
-
+# The old 16-slot inline pending table is GONE — work now lives on the
+# real worker pool (kernel/workqueue.ad). The wq handle table below stays:
+# __alloc_workqueue still hands back an opaque cookie modules feed to
+# queue/flush/destroy, but the actual execution is the shared worker pool.
 
 def _wq_alloc_slot() -> int32:
     i: uint64 = 0
     while i < WQ_SLOTS:
         if wq_table[i].in_use == 0:
-            return cast[int32](i)
-        i = i + 1
-    return -1
-
-
-def _work_pending_alloc() -> int32:
-    i: uint64 = 0
-    while i < WORK_PENDING_SLOTS:
-        if work_pending_wq[i] == 0:
             return cast[int32](i)
         i = i + 1
     return -1
@@ -312,51 +303,76 @@ def _l_destroy_workqueue(wq: uint64):
 def _l_queue_work_on(cpu: int32, wq: uint64, work: uint64) -> int32:
     # bool queue_work_on(int cpu, struct workqueue_struct *wq,
     #                    struct work_struct *work);
-    # Returns true if the work was queued, false if it was already on
-    # a queue. We treat every call as "fresh queue" — the Linux
-    # implementation uses bit 0 of work->data to detect re-queue;
-    # we don't model that. M4.3a queues each work_struct exactly once
-    # so the simpler model is functionally correct here.
+    # Returns true if the work was queued, false if it was already
+    # pending. NOW delegates to the real concurrency-managed workqueue
+    # (kernel/workqueue.ad): the item lands on the shared worker pool and
+    # runs on a worker kthread, NOT inline in the caller's context. The
+    # `wq` handle and `cpu` hint are accepted for ABI shape but the shared
+    # pool services all queues (we are UMA; WQ_UNBOUND is the norm here).
     if wq == 0 or work == 0:
         return 0
-    slot: int32 = _work_pending_alloc()
-    if slot < 0:
-        # Out of pending slots — the test would have to flush first.
-        # Linux would return true regardless (just defer execution
-        # until a worker frees up); for L8 we surface the failure as
-        # "already queued" (return 0) so the caller can notice.
-        return 0
-    su: uint64 = cast[uint64](slot)
-    work_pending_wq[su]   = wq
-    work_pending_work[su] = work
-    return 1
+    return wq_queue_work(work)
 
 
 def _l_flush_workqueue(wq: uint64):
-    # Drain every pending work item targeting this wq. We walk the
-    # pending table in slot order — Linux uses FIFO order via the
-    # per-CPU pool's list; our slot order is allocation order, which
-    # is effectively FIFO under "alloc-low-first" + "free-after-fire."
-    # For each match, read fn from offset 24 of the work_struct and
-    # call fn(work_struct). Clearing the slot before the call lets a
-    # work item re-queue itself without confusing this loop.
+    # Block until every queued+running work item on the shared pool has
+    # completed on a worker. flush_workqueue() must run from process
+    # context (it sleeps); module init/exit paths are kthread context.
     if wq == 0:
         return
-    i: uint64 = 0
-    while i < WORK_PENDING_SLOTS:
-        if work_pending_wq[i] == wq:
-            work: uint64 = work_pending_work[i]
-            work_pending_wq[i]   = 0
-            work_pending_work[i] = 0
-            if work != 0:
-                fn: uint64 = cast[Ptr[uint64]](work + 24)[0]
-                if fn != 0:
-                    # work_func_t = void (*)(struct work_struct *).
-                    # `fn` is a raw uint64 address; call through a
-                    # first-class function-pointer cast.
-                    call_fn: Fn[None, uint64] = cast[Fn[None, uint64]](fn)
-                    call_fn(work)
-        i = i + 1
+    wq_flush_all()
+
+
+def _l_schedule_work(work: uint64) -> int32:
+    # bool schedule_work(struct work_struct *work) — queue onto system_wq.
+    # Routes straight to the shared pool.
+    if work == 0:
+        return 0
+    return wq_queue_work(work)
+
+
+def _l_flush_work(work: uint64) -> int32:
+    # bool flush_work(struct work_struct *work) — wait for THIS work item
+    # to finish on a worker. Returns 1 if it was pending (we waited), 0 if
+    # it was idle. Process context only.
+    if work == 0:
+        return 0
+    wq_flush_work(work)
+    return 1
+
+
+# --- delayed work ---------------------------------------------------
+#
+# struct delayed_work embeds struct work_struct at offset 0 and struct
+# timer_list at offset 32. schedule_delayed_work arms the L9 timer wheel
+# (api_timer.ad) to fire after `delay` jiffies; when it fires, the timer
+# callback (_l_dwork_timer_fire) queues the embedded work_struct onto the
+# shared pool — so the work runs on a worker AFTER the delay, exactly like
+# Linux's delayed_work_timer_fn -> __queue_work path. NOT inline.
+
+DWORK_OFF_TIMER: uint64 = 32
+
+
+def _l_dwork_timer_fire(timer_ptr: uint64):
+    # Timer callback: timer is at dwork+32, so dwork = timer - 32, and
+    # &dwork->work == dwork+0. Queue it onto the shared pool.
+    dwork: uint64 = timer_ptr - DWORK_OFF_TIMER
+    wq_queue_work(dwork)
+
+
+def _l_schedule_delayed_work(dwork: uint64, delay: uint64) -> int32:
+    # bool schedule_delayed_work(struct delayed_work *dwork,
+    #                            unsigned long delay);
+    # delay is in jiffies. Arm the timer; on expiry the work is queued
+    # onto a worker. delay == 0 queues immediately.
+    if dwork == 0:
+        return 0
+    if delay == 0:
+        return wq_queue_work(dwork)
+    timer_ptr: uint64 = dwork + DWORK_OFF_TIMER
+    _l_timer_setup(timer_ptr, cast[uint64](&_l_dwork_timer_fire), 0)
+    _l_mod_timer(timer_ptr, get_jiffies() + delay)
+    return 1
 
 
 # --- registration ----------------------------------------------------
@@ -372,3 +388,5 @@ def linux_abi_register_kthread():
     _add_export("destroy_workqueue",       cast[uint64](&_l_destroy_workqueue))
     _add_export("queue_work_on",           cast[uint64](&_l_queue_work_on))
     _add_export("flush_workqueue",         cast[uint64](&_l_flush_workqueue))
+    _add_export("schedule_work",           cast[uint64](&_l_schedule_work))
+    _add_export("schedule_delayed_work",   cast[uint64](&_l_schedule_delayed_work))

@@ -1,0 +1,320 @@
+# kernel/workqueue.ad — real concurrency-managed workqueue.
+#
+# Replaces the old 4-slot manual-flush table in linux_abi/api_kthread.ad
+# (which never ran work on a kthread — flush_workqueue() drained it
+# inline). This is a Linux-shape workqueue: work items queued by
+# queue_work() are picked up and run by dedicated worker kthreads, so the
+# queueing context (often a hard-IRQ top half or a tasklet) does NOT run
+# the work itself. flush_work()/flush_workqueue() block the caller until
+# the targeted work has actually executed on a worker.
+#
+# Model (mirrors kernel/workqueue.c, scaled down):
+#   * A shared worker pool: a set of worker kthreads that pull work items
+#     off a single FIFO pending list (the "global" pool). max_active on a
+#     wq caps how many of its items run concurrently; WQ_UNBOUND items
+#     just use the shared pool (we are UMA so unbound == bound here).
+#   * queue_work(wq, work): set work->data PENDING bit (re-queue coalesce
+#     like Linux), append (wq, work) to the pending list, wake a worker.
+#   * A worker loop: sleep on the pool wait queue; on wake, pop one
+#     pending item, mark it RUNNING, clear PENDING, run work->func(work),
+#     then bump that work's completion sequence and wake flushers.
+#   * flush_work(work): record the current queued/running sequence and
+#     block until the work's done-sequence catches up (it ran to
+#     completion at least once since the flush began).
+#   * Delayed work: schedule_delayed_work arms a timer (the L9 timer
+#     wheel) whose callback calls queue_work — so the item lands on a
+#     worker after the delay, not inline.
+#
+# Concurrency: a single global spinlock (wq_pool_lock) guards the pending
+# list + per-work bookkeeping. Workers and producers are short under it.
+# The work_struct's own fields carry per-item state so flush can target a
+# single item without scanning.
+
+from kernel.printk.printk import printk0, printk1
+from kernel.sched.core import (
+    kthread_create, WaitQueue, wq_init, wq_wait_prepare, wq_wait_cancel,
+    wq_wait_commit, wq_wake_one, wq_wake_all,
+)
+
+extern def local_irq_disable()
+extern def local_irq_enable()
+extern def spinlock_lock(ptr: Ptr[uint32])
+extern def spinlock_unlock(ptr: Ptr[uint32])
+
+
+# --- struct work_struct layout (Linux 6.12) -------------------------
+#
+#   offset  0   atomic_long_t data        (flags + pool id; bit 0 PENDING)
+#   offset  8   struct list_head entry     (next, prev — 16 bytes)
+#   offset 24   work_func_t func           void (*)(struct work_struct *)
+#
+# We co-opt the `entry` list_head (offsets 8/16), which the workqueue
+# owns while the item is queued, to thread our pending list and to stash
+# per-item completion bookkeeping that flush_work reads:
+#   offset  8   wq_next        (our singly-linked pending list next ptr)
+#   offset 16   done_seq       (incremented each time func() completes)
+# data (offset 0) bit 0 is the PENDING flag, exactly like Linux.
+
+WORK_OFF_DATA: uint64 = 0
+WORK_OFF_NEXT: uint64 = 8
+WORK_OFF_SEQ:  uint64 = 16
+WORK_OFF_FUNC: uint64 = 24
+
+WORK_PENDING_BIT: uint64 = 1
+
+
+# --- worker pool ----------------------------------------------------
+
+NR_WORKERS: uint64 = 4              # shared-pool worker kthreads
+
+wq_pool_lock: uint32 = 0           # guards the pending list + queued mask
+wq_worker_wait: WaitQueue          # workers sleep here for work
+wq_flush_wait:  WaitQueue          # flushers sleep here for completions
+
+# Singly-linked pending list of work_struct* (threaded via WORK_OFF_NEXT).
+wq_pending_head: uint64 = 0
+wq_pending_tail: uint64 = 0
+
+# A monotonically-increasing global completion counter; every time any
+# worker finishes a work item it bumps this and wakes all flushers, which
+# then re-check their own target's per-item done_seq. Cheap and correct.
+wq_global_done: uint64 = 0
+
+# Count of work items that are queued-or-running but not yet completed.
+# flush_workqueue waits for this to reach 0 (idle). Tracked under the
+# pool lock.
+wq_inflight: uint64 = 0
+
+workqueue_started: uint64 = 0
+wq_workers_spawned: uint64 = 0
+
+
+# --- pending list ops (caller holds wq_pool_lock) -------------------
+
+def _wq_push_pending_locked(work: uint64):
+    cast[Ptr[uint64]](work + WORK_OFF_NEXT)[0] = 0
+    if wq_pending_head == 0:
+        wq_pending_head = work
+        wq_pending_tail = work
+    else:
+        cast[Ptr[uint64]](wq_pending_tail + WORK_OFF_NEXT)[0] = work
+        wq_pending_tail = work
+
+
+def _wq_pop_pending_locked() -> uint64:
+    h: uint64 = wq_pending_head
+    if h == 0:
+        return 0
+    nxt: uint64 = cast[Ptr[uint64]](h + WORK_OFF_NEXT)[0]
+    wq_pending_head = nxt
+    if nxt == 0:
+        wq_pending_tail = 0
+    cast[Ptr[uint64]](h + WORK_OFF_NEXT)[0] = 0
+    return h
+
+
+# --- queue_work -----------------------------------------------------
+
+def wq_queue_work(work: uint64) -> int32:
+    # Queue `work` onto the shared pool. Returns 1 if newly queued, 0 if
+    # it was already pending (coalesced — Linux's behaviour via the
+    # PENDING bit). Safe from IRQ context (lock + wake are IRQ-safe).
+    if work == 0:
+        return 0
+    local_irq_disable()
+    spinlock_lock(&wq_pool_lock)
+    dp: Ptr[uint64] = cast[Ptr[uint64]](work + WORK_OFF_DATA)
+    if (dp[0] & WORK_PENDING_BIT) != 0:
+        # Already pending — coalesce.
+        spinlock_unlock(&wq_pool_lock)
+        local_irq_enable()
+        return 0
+    dp[0] = dp[0] | WORK_PENDING_BIT
+    _wq_push_pending_locked(work)
+    wq_inflight = wq_inflight + 1
+    spinlock_unlock(&wq_pool_lock)
+    local_irq_enable()
+    # Wake a worker to pick it up. If workers aren't up yet (very early
+    # boot), the item stays pending and the first worker drains it on
+    # spawn. wq_wake_one is a no-op on an empty queue.
+    if workqueue_started != 0:
+        wq_wake_one(&wq_worker_wait)
+    return 1
+
+
+# --- worker kthread -------------------------------------------------
+
+def _wq_worker_main(arg: uint64) -> int64:
+    # Pull one pending item, run it, repeat; sleep when the list is empty.
+    while True:
+        # Pop a work item under the lock (IRQs off).
+        local_irq_disable()
+        spinlock_lock(&wq_pool_lock)
+        work: uint64 = _wq_pop_pending_locked()
+        if work != 0:
+            # Clear PENDING now that we own it: a re-queue from inside
+            # func() will re-set it and append a fresh entry (Linux lets
+            # a work item re-queue itself this way).
+            dp: Ptr[uint64] = cast[Ptr[uint64]](work + WORK_OFF_DATA)
+            dp[0] = dp[0] & (~WORK_PENDING_BIT)
+        spinlock_unlock(&wq_pool_lock)
+        local_irq_enable()
+
+        if work != 0:
+            fn: uint64 = cast[Ptr[uint64]](work + WORK_OFF_FUNC)[0]
+            if fn != 0:
+                # void (*func)(struct work_struct *) — work ptr in %rdi.
+                call_fn: Fn[None, uint64] = cast[Fn[None, uint64]](fn)
+                call_fn(work)
+            # Mark this item completed: bump its per-item done_seq and the
+            # global completion counter, drop inflight, wake flushers.
+            local_irq_disable()
+            spinlock_lock(&wq_pool_lock)
+            sp: Ptr[uint64] = cast[Ptr[uint64]](work + WORK_OFF_SEQ)
+            sp[0] = sp[0] + 1
+            wq_global_done = wq_global_done + 1
+            if wq_inflight > 0:
+                wq_inflight = wq_inflight - 1
+            spinlock_unlock(&wq_pool_lock)
+            local_irq_enable()
+            wq_wake_all(&wq_flush_wait)
+        else:
+            # No work: sleep until queued. Two-phase to avoid lost wakeup.
+            wq_wait_prepare(&wq_worker_wait)
+            local_irq_disable()
+            spinlock_lock(&wq_pool_lock)
+            have: uint64 = 0
+            if wq_pending_head != 0:
+                have = 1
+            spinlock_unlock(&wq_pool_lock)
+            local_irq_enable()
+            if have != 0:
+                wq_wait_cancel(&wq_worker_wait)
+            else:
+                wq_wait_commit(&wq_worker_wait)
+    return 0
+
+
+# Per-worker trampolines (kthread_create entry is a no-arg routine).
+def _wq_worker_tramp_0():
+    _wq_worker_main(0)
+
+
+def _wq_worker_tramp_1():
+    _wq_worker_main(1)
+
+
+def _wq_worker_tramp_2():
+    _wq_worker_main(2)
+
+
+def _wq_worker_tramp_3():
+    _wq_worker_main(3)
+
+
+wq_worker_tramp: Array[4, Fn[None]]
+
+
+# --- flush ----------------------------------------------------------
+
+def wq_flush_work(work: uint64):
+    # Block until `work` has run to completion at least once since this
+    # call began. If it isn't pending and never ran, return immediately.
+    # Must be called from process (kthread/syscall) context — it sleeps.
+    if work == 0:
+        return
+    if workqueue_started == 0:
+        return
+    sp: Ptr[uint64] = cast[Ptr[uint64]](work + WORK_OFF_SEQ)
+    # Snapshot the completion sequence + whether it's currently pending.
+    local_irq_disable()
+    spinlock_lock(&wq_pool_lock)
+    start_seq: uint64 = sp[0]
+    dp: Ptr[uint64] = cast[Ptr[uint64]](work + WORK_OFF_DATA)
+    pending: uint64 = dp[0] & WORK_PENDING_BIT
+    spinlock_unlock(&wq_pool_lock)
+    local_irq_enable()
+    if pending == 0:
+        # Not queued. It may be running right now on a worker; wait for
+        # one more completion only if its seq hasn't moved AND it is in
+        # the pending/running set is ambiguous — simplest correct rule:
+        # if not pending, it's either idle (done) or about to bump seq.
+        # We already snapshotted; if it's idle, return. (A racing worker
+        # finishing bumps seq, which a subsequent flush would observe.)
+        return
+    # Wait until its done_seq advances past the snapshot.
+    while True:
+        wq_wait_prepare(&wq_flush_wait)
+        local_irq_disable()
+        spinlock_lock(&wq_pool_lock)
+        cur_seq: uint64 = sp[0]
+        still_pending: uint64 = cast[Ptr[uint64]](work + WORK_OFF_DATA)[0] & WORK_PENDING_BIT
+        spinlock_unlock(&wq_pool_lock)
+        local_irq_enable()
+        if cur_seq != start_seq:
+            wq_wait_cancel(&wq_flush_wait)
+            return
+        if still_pending == 0:
+            # No longer pending and seq unchanged: it was dequeued and is
+            # running; one more global completion will bump it. Keep
+            # waiting on the flush queue until seq moves.
+            wq_wait_commit(&wq_flush_wait)
+        else:
+            wq_wait_commit(&wq_flush_wait)
+
+
+def wq_flush_all():
+    # Block until the pending+running set drains to empty (flush_workqueue
+    # semantics for the shared pool). Process context only.
+    if workqueue_started == 0:
+        return
+    while True:
+        local_irq_disable()
+        spinlock_lock(&wq_pool_lock)
+        busy: uint64 = wq_inflight
+        spinlock_unlock(&wq_pool_lock)
+        local_irq_enable()
+        if busy == 0:
+            return
+        wq_wait_prepare(&wq_flush_wait)
+        local_irq_disable()
+        spinlock_lock(&wq_pool_lock)
+        busy2: uint64 = wq_inflight
+        spinlock_unlock(&wq_pool_lock)
+        local_irq_enable()
+        if busy2 == 0:
+            wq_wait_cancel(&wq_flush_wait)
+            return
+        wq_wait_commit(&wq_flush_wait)
+
+
+# --- init -----------------------------------------------------------
+
+def workqueue_init():
+    # Spawn the shared worker pool. Called at boot after sched_init().
+    wq_init(&wq_worker_wait)
+    wq_init(&wq_flush_wait)
+    wq_worker_tramp[0] = _wq_worker_tramp_0
+    wq_worker_tramp[1] = _wq_worker_tramp_1
+    wq_worker_tramp[2] = _wq_worker_tramp_2
+    wq_worker_tramp[3] = _wq_worker_tramp_3
+    # name0 = 'kworker0' tag base; per-worker we just reuse the tag.
+    # 'kworker\0' little-endian: k w o r k e r NUL
+    name0: uint64 = 0x00726B726F776B
+    i: uint64 = 0
+    while i < NR_WORKERS:
+        slot: int32 = kthread_create(cast[uint64](wq_worker_tramp[i]), name0)
+        if slot < 0:
+            printk1("[workqueue] worker %d spawn FAILED\n", i)
+            i = NR_WORKERS
+        else:
+            wq_workers_spawned = wq_workers_spawned + 1
+            i = i + 1
+    if wq_workers_spawned > 0:
+        workqueue_started = 1
+        printk1("[workqueue] up: %d shared-pool workers spawned\n",
+                wq_workers_spawned)
+        # Drain anything queued before workers existed.
+        wq_wake_all(&wq_worker_wait)
+    else:
+        printk0("[workqueue] NO workers spawned — queue inert\n")

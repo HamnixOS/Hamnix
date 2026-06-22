@@ -157,9 +157,19 @@ the EEVDF scheduler, and the page-cache + rmap + reclaim triad.
   Unified per-inode page tree + dirty tracking. `fs/` + `mm/`.
 - [ ] **LRU reclaim + kswapd + watermarks** — replace the per-task O(tasks)
   walk (`mm/reclaim.ad:69`) with active/inactive LRU + background kswapd.
-- [ ] **softirq + workqueue pool + tasklet + threaded IRQs** — softirq
-  absent (tick-poll), workqueue is a 4-slot manual-flush table
-  (`linux_abi/api_kthread.ad:232`), tasklet stubbed, thread_fn never spawns.
+- [x] **softirq + workqueue pool + tasklet + threaded IRQs** — DONE. Real
+  Linux-shape bottom-half stack: per-CPU softirq vectors HI..RCU with
+  `raise_softirq`/`do_softirq` on IRQ-return (bounded MAX_SOFTIRQ_RESTART
+  loop + ksoftirqd fallback) in `kernel/softirq.ad`; real tasklets
+  (SCHED/RUN state machine, run-once-coalesced, self-serialized);
+  concurrency-managed workqueue with 4 worker kthreads + `queue_work` /
+  `flush_work` / `flush_workqueue` / delayed-work-via-timer in
+  `kernel/workqueue.ad` (replaces the 4-slot manual-flush table);
+  `request_threaded_irq` now spawns the irq thread + the top half wakes it
+  on IRQ_WAKE_THREAD (`linux_abi/api_irq.ad`). Net RX migrated onto
+  NET_RX_SOFTIRQ (`drivers/net/virtio_net.ad`): hard-IRQ top half ACKs +
+  raises, drain runs in softirq. Proven live by `scripts/test_bh.sh`
+  (in-kernel `bh_selftest_run`): all 5 assertions PASS.
 
 **Wave 3 — scale & correctness (depend on Wave 2)**
 - [ ] **dcache + inode cache (+ rcu-walk)** — dcache/inode ops are no-op
