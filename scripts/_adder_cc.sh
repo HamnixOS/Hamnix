@@ -107,10 +107,14 @@ adder_cc_compile() {
             # `as`+`ld` it together with the hand-written boot stubs under
             # arch/x86/kernel/kernel.lds, EXACTLY as the seed's
             # assemble_and_link_x86_bare does. <out_elf> is the final kernel ELF.
-            adder_cc_link_kernel "$root" "$in_ad" "$out_elf"
+            if adder_cc_link_kernel "$root" "$in_ad" "$out_elf"; then return 0; fi
+            echo "[adder_cc] native kernel compile failed -> Python seed fallback: $in_ad" >&2
+            python3 -m compiler.adder "$@"
             return $?
         fi
-        "$root/build/cutover/host_ac.elf" "${hc[@]}" "$in_ad" "$out_elf"
+        if "$root/build/cutover/host_ac.elf" "${hc[@]}" "$in_ad" "$out_elf"; then return 0; fi
+        echo "[adder_cc] native compile failed -> Python seed fallback: $in_ad" >&2
+        python3 -m compiler.adder "$@"
         return $?
     fi
     echo "[adder_cc] ERROR: unknown ADDER_CC='$backend' (want python|adder)" >&2
