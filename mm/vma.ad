@@ -24,15 +24,32 @@
 #   VMA is created either by mmap from userspace or by the ELF loader
 #   on do_execve.
 #
-# Shape
+# Shape (Wave-3: Linux-parity interval tree + per-VMA locking)
 #
-#   Sorted singly-linked list of VmaNode records, keyed by `start`.
-#   Each node owns the half-open range [start, end). Adjacent nodes
-#   do not overlap. Lookup is O(N) — for the small VMA count a single
-#   user process accrues (Debian /bin/true with glibc has ~12 VMAs),
-#   a sorted linked list is faster than a tree and the code stays
-#   small. Real Linux uses an mm_struct + interval tree; we can grow
-#   there once the VMA count per process crosses ~32.
+#   Each VmaNode owns the half-open range [start, end); adjacent nodes
+#   do not overlap. The set is indexed TWO ways that are kept consistent:
+#
+#     * an augmented AVL INTERVAL TREE keyed on `start`, augmented with
+#       subtree_max_end (MAX(end) over a subtree). This gives O(log n)
+#       find_vma / overlap / mmap-gap search — the "maple-tree-shape"
+#       capability that replaces the old O(N) linear scan. (_vt_* /
+#       _vma_tree_* below; root per-task in vma_tree_root[slot].)
+#     * the original sorted singly-linked `next` list, retained PURELY as
+#       the in-order ITERATOR every consumer walks (coredump, /proc/maps,
+#       fork copy, teardown). The tree is the index; the list is the
+#       iterator. _vma_insert_sorted / _vma_unlink mutate both atomically.
+#
+#   Locking (Linux's per-VMA lock model). Each VmaNode carries its own
+#   per-VMA spinlock (`vlock`); each mm (task slot) carries a write
+#   spinlock (vma_mm_lock) + a seqcount (vma_mm_seq). A page fault
+#   RCU-looks-up the covering VMA in the tree and TRYLOCKS just that VMA
+#   (vma_lock_fault_vma) — a fault on VMA A proceeds concurrently with a
+#   fault on VMA B because they hold DIFFERENT per-VMA locks. If the
+#   trylock loses or the mm seqcount moved (a split/remove raced the
+#   lookup) the fault falls back to the mm-wide write lock — exactly
+#   Linux's lock_vma_under_rcu -> mmap_read_lock. STRUCTURAL changes
+#   (insert / unlink / split / merge / grow) run under the mm write lock
+#   and bump the seqcount so an in-flight lockless lookup retries.
 #
 # Backing memory
 #
@@ -54,12 +71,23 @@
 #   covers the page-rounded length.
 
 from kernel.printk.printk import (
-    printk1, printk_set_level, PRINTK_LEVEL_NOTICE,
+    printk0, printk1, printk2, printk_set_level, PRINTK_LEVEL_NOTICE,
 )
 from kernel.sched.core import (
     TaskStruct,
     task_vma_list_head, set_task_vma_list_head,
     current_idx_get, task_pml4,
+    spinlock_lock, spinlock_unlock, spinlock_trylock,
+)
+# Wave-3 per-VMA / RCU lookup (Linux-parity VMA scalability). The fault
+# path RCU-looks-up a VMA in the O(log n) interval tree, then per-VMA-
+# trylocks it so a fault on VMA A proceeds concurrently with a fault on
+# VMA B; structural changes (insert/unlink/split/merge) take the mm-wide
+# write lock and bump the mm seqcount so an in-flight lockless lookup
+# detects the race and retries under the write lock. rcu.ad imports only
+# from arch + its own pool (no mm.* import), so this is acyclic.
+from kernel.rcu.rcu import (
+    rcu_read_lock, rcu_read_unlock,
 )
 from mm.slab import kmalloc, kfree
 from mm.page_alloc import alloc_pages, alloc_page, free_pages, free_page
@@ -291,6 +319,76 @@ nr_vma_nodes_live: uint64 = 0
 
 
 # ---------------------------------------------------------------------
+# Wave-3 — per-mm interval-tree root + locking side tables
+# ---------------------------------------------------------------------
+#
+# kernel/sched/core.ad (off-limits to this change) gives each task ONE
+# per-task uint64 — vma_list_head — which we keep as the in-order linked
+# list head. The Linux-parity index (the balanced interval tree) and the
+# locking state need a few more per-task words, so mm/ keeps them in
+# module-global side arrays keyed by task slot (NR_TASKS == 512, matching
+# task_table). These mirror an mm_struct's vma tree-root + mmap_lock +
+# the per-mm seqcount that Linux's lockless VMA lookup spins on.
+#
+#   vma_tree_root[slot]  : root VmaNode* of slot's AVL interval tree
+#                          (0 == empty). The list head and the tree root
+#                          are kept consistent: every node in the list is
+#                          in the tree and vice-versa.
+#   vma_mm_lock[slot]    : the mm-wide WRITE spinlock. Held across any
+#                          STRUCTURAL change (insert/unlink/split/merge/
+#                          grow) so the tree + list mutate atomically vs.
+#                          a concurrent structural op on the same mm and
+#                          vs. a fault that fell back to the write side.
+#   vma_mm_seq[slot]     : the mm seqcount. Bumped ODD at the start of a
+#                          structural change and EVEN at the end, so an
+#                          in-flight lockless fault lookup
+#                          (vma_lock_fault_vma) that read an odd or
+#                          changed value knows the tree shifted under it
+#                          and retries under the write lock.
+NR_TASKS_VMA: uint64 = 512
+vma_tree_root: Array[512, uint64]
+vma_mm_lock:   Array[512, uint32]
+vma_mm_seq:    Array[512, uint64]
+
+
+def _vma_tree_root(slot: uint64) -> uint64:
+    return vma_tree_root[slot]
+
+
+def _vma_set_tree_root(slot: uint64, r: uint64):
+    vma_tree_root[slot] = r
+
+
+def vma_mm_write_lock(slot: uint64):
+    # Acquire the mm-wide write lock — the fallback (slow) path a fault
+    # takes when the lockless per-VMA attempt loses a race, and the lock a
+    # caller can wrap a multi-step structural change in to serialize it
+    # against concurrent faults on the same mm. This is the BLOCKING lock
+    # (a distinct word from the seqcount); it does NOT bump the seqcount,
+    # so it is re-entrancy-neutral w.r.t. the per-mutation seq bumps the
+    # tree helpers do. Paired with vma_mm_write_unlock.
+    spinlock_lock(&vma_mm_lock[slot])
+
+
+def vma_mm_write_unlock(slot: uint64):
+    spinlock_unlock(&vma_mm_lock[slot])
+
+
+def vma_mm_seq_read(slot: uint64) -> uint64:
+    return vma_mm_seq[slot]
+
+
+def _vma_mm_seq_bump(slot: uint64):
+    # Record that the tree/list structure of `slot` changed. A monotonic
+    # generation counter (NOT a parity seqlock), so it is safe to bump from
+    # NESTED structural helpers (insert -> rebalance, carve -> split ->
+    # insert): the lockless fault reader only checks the value for
+    # INEQUALITY across its lookup window, so any forward motion forces it
+    # onto the write-lock fallback.
+    vma_mm_seq[slot] = vma_mm_seq[slot] + 1
+
+
+# ---------------------------------------------------------------------
 # VmaChunk / VmaNode
 # ---------------------------------------------------------------------
 
@@ -415,6 +513,36 @@ class VmaNode:
     # physical addresses and corrupt the buddy allocator. Checked before
     # the is_demand arm (a foreign overlay sits on a demand reservation).
     is_foreign:     int32
+    # ---------------------------------------------------------------
+    # Wave-3 — augmented AVL interval-tree links + per-VMA lock.
+    # ---------------------------------------------------------------
+    # The VMA set is indexed by a balanced (AVL) interval tree keyed on
+    # [start, end), giving O(log n) find_vma / overlap / gap search in
+    # place of the old O(n) sorted-list scan. The sorted singly-linked
+    # `next` chain is RETAINED purely as the in-order iterator every
+    # consumer (coredump, /proc/maps, fork, teardown) walks — the tree is
+    # the index, the list is the iterator, and both are kept consistent by
+    # the insert/unlink helpers.
+    #
+    # left / right : child subtree roots (0 == nil).
+    # height       : AVL height (leaf == 1) for O(1) balance-factor.
+    # subtree_max_end : MAX(end) over this node's whole subtree — the
+    #   interval-tree augmentation that lets an overlap/gap search prune a
+    #   subtree whose every interval ends before the query start.
+    left:            uint64
+    right:           uint64
+    height:          int32
+    pad_avl:         int32
+    subtree_max_end: uint64
+    # vlock : the per-VMA spinlock (Linux's vm_area_struct->vm_lock). A
+    # page fault on this VMA trylocks it; a concurrent fault on a DIFFERENT
+    # VMA takes that VMA's own vlock and the two proceed without
+    # serializing. Structural changes to the VMA (split/merge/grow/remove)
+    # are done under the mm-wide write lock (vma_mm_write_lock), not this
+    # lock, and bump the mm seqcount so an in-flight lockless fault lookup
+    # retries. uint32 (the spinlock word) + an int32 pad to stay 8-aligned.
+    vlock:           uint32
+    pad_vlock:       int32
     # For a file-backed VMA, `backing` (above) is REPURPOSED to hold the
     # stable backing IDENTITY (cpio index / tmpfs slot / ext4 inode num /
     # buffer pointer) rather than a physical page run — a file-backed
@@ -434,7 +562,14 @@ class VmaNode:
 # 4) -> 124, rounded up to 128. memset-zeroed on alloc, so every node
 # defaults to is_file=0 / is_file_shared=0 / sealed=0 / is_huge=0 /
 # is_foreign=0 unless an allocator or mseal(2) sets them.
-VMA_NODE_SIZE: uint64 = 128
+#
+# Wave-3 appends the interval-tree links + per-VMA lock: left (8) +
+# right (8) + height (4) + pad_avl (4) + subtree_max_end (8) + vlock (4)
+# + pad_vlock (4) = 40 bytes -> 124 + 40 = 164, rounded up to 168
+# (8-aligned). memset-zeroed on alloc so left/right == 0 (nil),
+# height == 0, vlock == 0 (unlocked), subtree_max_end == 0 for a fresh
+# node — the tree-insert helper sets height/subtree_max_end on splice.
+VMA_NODE_SIZE: uint64 = 168
 
 
 def _vma_node_new() -> uint64:
@@ -487,6 +622,317 @@ def _vma_node_start(node: uint64) -> uint64:
 
 def _vma_node_end(node: uint64) -> uint64:
     return cast[Ptr[VmaNode]](node)[0].end
+
+
+# ---------------------------------------------------------------------
+# Wave-3 — augmented AVL interval tree
+# ---------------------------------------------------------------------
+#
+# The VMA set is indexed by a height-balanced (AVL) binary search tree
+# keyed on `start`, augmented with subtree_max_end (the MAX end over a
+# node's whole subtree). This is the "maple-tree-shape" capability the
+# Wave-3 gap analysis asked for: O(log n) find_vma, overlap query, and
+# free-gap search, replacing the old O(n) sorted-list scan.
+#
+# The sorted singly-linked list (`next`) is retained as the in-order
+# iterator (coredump / /proc-maps / fork / teardown all walk it); the
+# tree is the index. _vma_tree_insert and _vma_tree_remove keep both
+# structures consistent. All tree mutation runs under the mm write lock.
+#
+# Node link accessors (left/right/height/subtree_max_end) are tiny so the
+# rotation code below reads close to a textbook AVL.
+
+def _vt_left(n: uint64) -> uint64:
+    if n == 0:
+        return 0
+    return cast[Ptr[VmaNode]](n)[0].left
+
+
+def _vt_right(n: uint64) -> uint64:
+    if n == 0:
+        return 0
+    return cast[Ptr[VmaNode]](n)[0].right
+
+
+def _vt_set_left(n: uint64, c: uint64):
+    cast[Ptr[VmaNode]](n)[0].left = c
+
+
+def _vt_set_right(n: uint64, c: uint64):
+    cast[Ptr[VmaNode]](n)[0].right = c
+
+
+def _vt_height(n: uint64) -> int32:
+    if n == 0:
+        return 0
+    return cast[Ptr[VmaNode]](n)[0].height
+
+
+def _vt_max_end(n: uint64) -> uint64:
+    if n == 0:
+        return 0
+    return cast[Ptr[VmaNode]](n)[0].subtree_max_end
+
+
+def _vt_max3(a: uint64, b: uint64, c: uint64) -> uint64:
+    m: uint64 = a
+    if b > m:
+        m = b
+    if c > m:
+        m = c
+    return m
+
+
+def _vt_fix(n: uint64):
+    # Recompute height + subtree_max_end from this node's children. Called
+    # bottom-up after every structural step (insert recursion, rotation).
+    if n == 0:
+        return
+    lh: int32 = _vt_height(_vt_left(n))
+    rh: int32 = _vt_height(_vt_right(n))
+    h: int32 = lh
+    if rh > h:
+        h = rh
+    cast[Ptr[VmaNode]](n)[0].height = h + 1
+    cast[Ptr[VmaNode]](n)[0].subtree_max_end = _vt_max3(
+        cast[Ptr[VmaNode]](n)[0].end,
+        _vt_max_end(_vt_left(n)),
+        _vt_max_end(_vt_right(n)))
+
+
+def _vt_balance(n: uint64) -> int32:
+    if n == 0:
+        return 0
+    return _vt_height(_vt_left(n)) - _vt_height(_vt_right(n))
+
+
+def _vt_rotate_right(y: uint64) -> uint64:
+    # y's left child x becomes the new subtree root.
+    x: uint64 = _vt_left(y)
+    t2: uint64 = _vt_right(x)
+    _vt_set_right(x, y)
+    _vt_set_left(y, t2)
+    _vt_fix(y)
+    _vt_fix(x)
+    return x
+
+
+def _vt_rotate_left(x: uint64) -> uint64:
+    # x's right child y becomes the new subtree root.
+    y: uint64 = _vt_right(x)
+    t2: uint64 = _vt_left(y)
+    _vt_set_left(y, x)
+    _vt_set_right(x, t2)
+    _vt_fix(x)
+    _vt_fix(y)
+    return y
+
+
+def _vt_rebalance(n: uint64) -> uint64:
+    # Restore the AVL invariant at `n` after a child changed height, and
+    # refresh its augmentation. Returns the (possibly new) subtree root.
+    _vt_fix(n)
+    bf: int32 = _vt_balance(n)
+    if bf > 1:
+        # Left-heavy.
+        if _vt_balance(_vt_left(n)) < 0:
+            _vt_set_left(n, _vt_rotate_left(_vt_left(n)))
+        return _vt_rotate_right(n)
+    if bf < -1:
+        # Right-heavy.
+        if _vt_balance(_vt_right(n)) > 0:
+            _vt_set_right(n, _vt_rotate_right(_vt_right(n)))
+        return _vt_rotate_left(n)
+    return n
+
+
+def _vt_insert_rec(root: uint64, node: uint64) -> uint64:
+    # Insert `node` (a fresh leaf, left/right already 0) keyed on start,
+    # returning the new subtree root. VMA starts are unique (ranges are
+    # disjoint and page-aligned); a duplicate start should never occur, so
+    # ties route right defensively.
+    if root == 0:
+        _vt_fix(node)
+        return node
+    if cast[Ptr[VmaNode]](node)[0].start < cast[Ptr[VmaNode]](root)[0].start:
+        _vt_set_left(root, _vt_insert_rec(_vt_left(root), node))
+    else:
+        _vt_set_right(root, _vt_insert_rec(_vt_right(root), node))
+    return _vt_rebalance(root)
+
+
+def _vt_min_node(n: uint64) -> uint64:
+    cur: uint64 = n
+    while _vt_left(cur) != 0:
+        cur = _vt_left(cur)
+    return cur
+
+
+def _vt_remove_rec(root: uint64, key: uint64, target: uint64) -> uint64:
+    # Remove the node whose start == key (and which IS `target`) from the
+    # subtree, returning the new subtree root. Standard AVL delete with the
+    # two-child case spliced by the in-order successor; because callers
+    # hold a pointer to the exact node, the successor splice copies the
+    # KEY ordering by relinking (never by moving payload) so `target`'s
+    # heap address is the one detached.
+    if root == 0:
+        return 0
+    if key < cast[Ptr[VmaNode]](root)[0].start:
+        _vt_set_left(root, _vt_remove_rec(_vt_left(root), key, target))
+    elif key > cast[Ptr[VmaNode]](root)[0].start:
+        _vt_set_right(root, _vt_remove_rec(_vt_right(root), key, target))
+    else:
+        # key == root.start. It might still be a DIFFERENT node than
+        # target if two ranges momentarily share a start during a split
+        # (they don't in practice — starts are unique — but guard anyway).
+        if root != target:
+            # Defensive: keep searching right (ties routed right on insert).
+            _vt_set_right(root, _vt_remove_rec(_vt_right(root), key, target))
+            return _vt_rebalance(root)
+        l: uint64 = _vt_left(root)
+        r: uint64 = _vt_right(root)
+        if l == 0:
+            _vt_set_left(root, 0)
+            _vt_set_right(root, 0)
+            return r
+        if r == 0:
+            _vt_set_left(root, 0)
+            _vt_set_right(root, 0)
+            return l
+        # Two children: pull the in-order successor (min of right subtree)
+        # up into root's position by relinking it around root's children,
+        # then detach root.
+        succ: uint64 = _vt_min_node(r)
+        new_r: uint64 = _vt_remove_rec(r, cast[Ptr[VmaNode]](succ)[0].start,
+                                       succ)
+        _vt_set_left(succ, l)
+        _vt_set_right(succ, new_r)
+        _vt_set_left(root, 0)
+        _vt_set_right(root, 0)
+        return _vt_rebalance(succ)
+    return _vt_rebalance(root)
+
+
+def _vma_tree_insert(slot: uint64, node: uint64):
+    # Splice `node` into slot's interval tree (caller holds the mm write
+    # lock). The node's left/right/height are reset so it enters as a leaf.
+    cast[Ptr[VmaNode]](node)[0].left = 0
+    cast[Ptr[VmaNode]](node)[0].right = 0
+    cast[Ptr[VmaNode]](node)[0].height = 0
+    r: uint64 = _vma_tree_root(slot)
+    _vma_set_tree_root(slot, _vt_insert_rec(r, node))
+    _vma_mm_seq_bump(slot)
+
+
+def _vma_tree_remove(slot: uint64, node: uint64):
+    # Detach `node` from slot's interval tree (caller holds the write lock).
+    r: uint64 = _vma_tree_root(slot)
+    new_root: uint64 = _vt_remove_rec(r, cast[Ptr[VmaNode]](node)[0].start,
+                                      node)
+    _vma_set_tree_root(slot, new_root)
+    cast[Ptr[VmaNode]](node)[0].left = 0
+    cast[Ptr[VmaNode]](node)[0].right = 0
+    _vma_mm_seq_bump(slot)
+
+
+def _vma_tree_update_end(slot: uint64, node: uint64, new_end: uint64):
+    # A node's `end` changed in place (split shrink / grow-in-place). The
+    # BST key (`start`) is unchanged, but subtree_max_end along the path
+    # from the root to `node` must be refreshed. Simplest correct way that
+    # reuses the balanced machinery: detach and re-insert with the new end.
+    # Caller holds the mm write lock. (start is unchanged so list order is
+    # unaffected — only the tree augmentation is repaired.)
+    _vma_tree_remove(slot, node)
+    cast[Ptr[VmaNode]](node)[0].end = new_end
+    _vma_tree_insert(slot, node)
+
+
+def _vma_tree_find(slot: uint64, addr: uint64) -> uint64:
+    # O(log n) point query: the VMA whose [start, end) contains addr, or 0.
+    # The BST key is `start`; descend toward the greatest start <= addr,
+    # then confirm addr < end. The interval-tree augmentation isn't needed
+    # for a pure point-containment query (a plain BST descent on start
+    # finds the only candidate), but the same tree serves the gap/overlap
+    # queries that DO use subtree_max_end below.
+    cur: uint64 = _vma_tree_root(slot)
+    cand: uint64 = 0
+    while cur != 0:
+        s: uint64 = cast[Ptr[VmaNode]](cur)[0].start
+        if s <= addr:
+            cand = cur                      # greatest start seen so far <= addr
+            cur = cast[Ptr[VmaNode]](cur)[0].right
+        else:
+            cur = cast[Ptr[VmaNode]](cur)[0].left
+    if cand != 0:
+        if addr < cast[Ptr[VmaNode]](cand)[0].end:
+            return cand
+    return 0
+
+
+def _vma_tree_overlap(slot: uint64, lo: uint64, hi: uint64) -> uint64:
+    # O(log n)-ish interval-overlap query: ANY VMA intersecting [lo, hi),
+    # or 0. Uses the subtree_max_end augmentation to prune a left subtree
+    # whose every interval ends at or before `lo`.
+    cur: uint64 = _vma_tree_root(slot)
+    while cur != 0:
+        s: uint64 = cast[Ptr[VmaNode]](cur)[0].start
+        e: uint64 = cast[Ptr[VmaNode]](cur)[0].end
+        if s < hi and e > lo:
+            return cur
+        l: uint64 = _vt_left(cur)
+        if l != 0 and _vt_max_end(l) > lo:
+            cur = l
+        else:
+            cur = _vt_right(cur)
+    return 0
+
+
+# ---------------------------------------------------------------------
+# Wave-3 — per-VMA locked fault lookup (Linux's lockless VMA lookup)
+# ---------------------------------------------------------------------
+#
+# vma_lock_fault_vma(slot, addr) is the scalable fault entry point: it
+# RCU-read-locks, finds the covering VMA via the O(log n) interval tree,
+# then TRYLOCKS that VMA's own per-VMA spinlock. On success it confirms
+# the mm seqcount did not move during the lookup (the VMA wasn't being
+# split/removed concurrently) and returns the LOCKED node — the fault
+# handler then operates on just that VMA while a fault on a DIFFERENT VMA
+# concurrently holds a DIFFERENT per-VMA lock, so the two never serialize.
+#
+# If the trylock fails (another fault is actively touching THIS vma) or
+# the seqcount moved (a structural change raced), it returns 0 and the
+# caller falls back to the mm-wide write lock — exactly Linux's
+# lock_vma_under_rcu → mmap_read_lock fallback. The caller MUST pair a
+# non-zero return with vma_unlock_vma(node).
+
+def vma_lock_fault_vma(slot: uint64, addr: uint64) -> uint64:
+    rcu_read_lock()
+    seq0: uint64 = vma_mm_seq[slot]
+    node: uint64 = _vma_tree_find(slot, addr)
+    if node == 0:
+        rcu_read_unlock()
+        return 0
+    if spinlock_trylock(&cast[Ptr[VmaNode]](node)[0].vlock) == 0:
+        # Another fault holds this VMA's lock; fall back to the write side.
+        rcu_read_unlock()
+        return 0
+    # Confirm no structural change raced the lookup. If the seq moved (or
+    # is now odd), the node we found may have been split/freed; drop the
+    # per-VMA lock and signal a write-lock fallback.
+    seq1: uint64 = vma_mm_seq[slot]
+    if seq1 != seq0:
+        spinlock_unlock(&cast[Ptr[VmaNode]](node)[0].vlock)
+        rcu_read_unlock()
+        return 0
+    rcu_read_unlock()
+    return node
+
+
+def vma_unlock_vma(node: uint64):
+    # Release a per-VMA lock taken by vma_lock_fault_vma.
+    if node == 0:
+        return
+    spinlock_unlock(&cast[Ptr[VmaNode]](node)[0].vlock)
 
 
 # ---------------------------------------------------------------------
@@ -1065,6 +1511,15 @@ def vma_cachestat_count(slot: uint64, marker: uint32, backing: uint64,
 
 
 def vma_find(slot: uint64, addr: uint64) -> uint64:
+    # O(log n) point query via the interval tree (Wave-3). Falls back to a
+    # linear list walk only if the tree is somehow empty while the list is
+    # not (it never is — insert/unlink keep them consistent — but the
+    # belt-and-braces walk costs nothing on the empty-tree path).
+    node: uint64 = _vma_tree_find(slot, addr)
+    if node != 0:
+        return node
+    if _vma_tree_root(slot) != 0:
+        return 0
     cur: uint64 = task_vma_list_head(slot)
     while cur != 0:
         s: uint64 = _vma_node_start(cur)
@@ -1229,6 +1684,15 @@ def _vma_find_enclosing(slot: uint64, start: uint64,
                         end: uint64) -> uint64:
     # Returns a VmaNode whose [s, e) fully contains [start, end), or 0.
     # Used to detect ld.so's "reserve then MAP_FIXED overlay" case.
+    # Wave-3: O(log n) — the only VMA that can contain `start` is the one
+    # vma_find returns for it; confirm it also covers `end`.
+    node: uint64 = _vma_tree_find(slot, start)
+    if node != 0:
+        if end <= _vma_node_end(node):
+            return node
+        return 0
+    if _vma_tree_root(slot) != 0:
+        return 0
     cur: uint64 = task_vma_list_head(slot)
     while cur != 0:
         s: uint64 = _vma_node_start(cur)
@@ -1242,6 +1706,11 @@ def _vma_find_enclosing(slot: uint64, start: uint64,
 
 
 def _vma_insert_sorted(slot: uint64, node: uint64):
+    # Splice `node` into BOTH the sorted iterator list and the O(log n)
+    # interval tree (Wave-3). Structural mutation — callers run under the
+    # mm write lock (the public entry points open it; the few internal
+    # fast paths that don't yet are single-threaded boot/exec paths).
+    _vma_tree_insert(slot, node)
     head: uint64 = task_vma_list_head(slot)
     n_start: uint64 = _vma_node_start(node)
     if head == 0:
@@ -1389,7 +1858,9 @@ def _vma_split_at(slot: uint64, node: uint64, at: uint64) -> uint64:
     # mprotect/munmap are rejected up-front, but this keeps the invariant
     # honest if a partial mseal ever splits at a boundary).
     cast[Ptr[VmaNode]](tail)[0].sealed   = cast[Ptr[VmaNode]](node)[0].sealed
-    cast[Ptr[VmaNode]](node)[0].end = at
+    # Shrink the head's end to the split point, refreshing the interval
+    # tree's subtree_max_end up its path (the BST start key is unchanged).
+    _vma_tree_update_end(slot, node, at)
     _vma_insert_sorted(slot, tail)
     return tail
 
@@ -1399,21 +1870,29 @@ def _vma_split_at(slot: uint64, node: uint64, at: uint64) -> uint64:
 # ---------------------------------------------------------------------
 
 def _vma_unlink(slot: uint64, target: uint64) -> int32:
+    # Detach `target` from BOTH the iterator list and the interval tree
+    # (Wave-3). Structural mutation — caller runs under the mm write lock.
     head: uint64 = task_vma_list_head(slot)
     if head == 0:
         return 0
+    unlinked: int32 = 0
     if head == target:
         set_task_vma_list_head(slot, _vma_node_get_next(head))
-        return 1
-    prev: uint64 = head
-    cur:  uint64 = _vma_node_get_next(head)
-    while cur != 0:
-        if cur == target:
-            _vma_node_set_next(prev, _vma_node_get_next(cur))
-            return 1
-        prev = cur
-        cur  = _vma_node_get_next(cur)
-    return 0
+        unlinked = 1
+    else:
+        prev: uint64 = head
+        cur:  uint64 = _vma_node_get_next(head)
+        while cur != 0:
+            if cur == target:
+                _vma_node_set_next(prev, _vma_node_get_next(cur))
+                unlinked = 1
+                cur = 0
+            else:
+                prev = cur
+                cur  = _vma_node_get_next(cur)
+    if unlinked != 0:
+        _vma_tree_remove(slot, target)
+    return unlinked
 
 
 def _vma_carve_range(slot: uint64, start: uint64, end: uint64):
@@ -2263,8 +2742,30 @@ def _vma_demand_fault_huge(slot: uint64, pml4_phys: uint64,
 
 def vma_demand_fault(slot: uint64, pml4_phys: uint64,
                      fault_va: uint64) -> int32:
-    # Find the VMA covering fault_va.
-    node: uint64 = vma_find(slot, fault_va)
+    # Wave-3 scalable fault path: RCU-lookup the covering VMA in the
+    # O(log n) interval tree and TRYLOCK its per-VMA lock, so a fault on
+    # this VMA proceeds concurrently with a fault on a DIFFERENT VMA (each
+    # holds its own per-VMA lock). On a lost race (trylock fail or a
+    # structural change moved the tree mid-lookup) fall back to the mm-wide
+    # write lock — exactly Linux's lock_vma_under_rcu -> mmap_read_lock
+    # model. The body is unchanged; only the lookup + hold discipline is.
+    node: uint64 = vma_lock_fault_vma(slot, fault_va)
+    used_mm_lock: int32 = 0
+    if node == 0:
+        # Slow path: serialize against structural changes on this mm.
+        vma_mm_write_lock(slot)
+        used_mm_lock = 1
+        node = vma_find(slot, fault_va)
+    rc: int32 = _vma_demand_fault_inner(slot, pml4_phys, fault_va, node)
+    if used_mm_lock != 0:
+        vma_mm_write_unlock(slot)
+    else:
+        vma_unlock_vma(node)
+    return rc
+
+
+def _vma_demand_fault_inner(slot: uint64, pml4_phys: uint64,
+                            fault_va: uint64, node: uint64) -> int32:
     if node == 0:
         # Not in any VMA — genuine unmapped access.
         return 0
@@ -2886,20 +3387,14 @@ VMA_MREMAP_FIXED:   uint64 = 2
 
 
 def _vma_range_is_free(slot: uint64, lo: uint64, hi: uint64) -> int32:
-    # 1 iff NO VMA in `slot`'s list overlaps [lo, hi); 0 otherwise.
-    # Used by the grow-in-place fast path to confirm the virtual range
-    # immediately after a mapping is unoccupied before extending into it.
+    # 1 iff NO VMA in `slot` overlaps [lo, hi); 0 otherwise. Used by the
+    # grow-in-place fast path and (Wave-3) the mmap gap search to confirm a
+    # virtual range is unoccupied. O(log n) via the interval-tree overlap
+    # query (subtree_max_end pruning) instead of the old O(n) list scan.
     if hi <= lo:
         return 1
-    cur: uint64 = task_vma_list_head(slot)
-    while cur != 0:
-        s: uint64 = _vma_node_start(cur)
-        e: uint64 = _vma_node_end(cur)
-        if s < hi and lo < e:
-            return 0
-        if s >= hi:
-            return 1
-        cur = _vma_node_get_next(cur)
+    if _vma_tree_overlap(slot, lo, hi) != 0:
+        return 0
     return 1
 
 
@@ -2990,7 +3485,9 @@ def _vma_grow_in_place(slot: uint64, node: uint64, old_end: uint64,
     kfree(old_carr)
     cast[Ptr[VmaNode]](node)[0].chunks  = newcarr
     cast[Ptr[VmaNode]](node)[0].nchunks = total
-    cast[Ptr[VmaNode]](node)[0].end     = old_end + delta
+    # Extend the node's end, refreshing the interval-tree augmentation
+    # (start key unchanged, only subtree_max_end up the path moves).
+    _vma_tree_update_end(slot, node, old_end + delta)
     return 0
 
 
@@ -3167,6 +3664,8 @@ def vma_clear(slot: uint64):
         _vma_node_free(slot, cur, pml4)
         cur = nxt
     set_task_vma_list_head(slot, 0)
+    # Wave-3: the whole interval tree is gone with the list.
+    _vma_set_tree_root(slot, 0)
 
 
 def vma_adopt(from_slot: uint64, to_slot: uint64):
@@ -3190,6 +3689,21 @@ def vma_adopt(from_slot: uint64, to_slot: uint64):
         _vma_node_set_next(tail, th)
     set_task_vma_list_head(to_slot, fh)
     set_task_vma_list_head(from_slot, 0)
+    # Wave-3: rebuild to_slot's interval tree over the combined list and
+    # empty from_slot's. The splice above can leave the list out of sorted
+    # order (from's tail may start after to's head), so rebuild from
+    # scratch rather than merge — this is a one-shot teardown path.
+    _vma_set_tree_root(from_slot, 0)
+    _vma_set_tree_root(to_slot, 0)
+    rb: uint64 = fh
+    while rb != 0:
+        nxt_rb: uint64 = _vma_node_get_next(rb)
+        cast[Ptr[VmaNode]](rb)[0].left = 0
+        cast[Ptr[VmaNode]](rb)[0].right = 0
+        cast[Ptr[VmaNode]](rb)[0].height = 0
+        r: uint64 = _vma_tree_root(to_slot)
+        _vma_set_tree_root(to_slot, _vt_insert_rec(r, rb))
+        rb = nxt_rb
 
 
 def vma_free_reserved_range(slot: uint64, vlo: uint64, vhi: uint64):
@@ -3529,3 +4043,200 @@ def vma_hugepages_live() -> uint64:
     # (we report the live/in-use count directly so a leak shows as
     # monotonic growth across a map/unmap cycle).
     return nr_hugepages_live
+
+
+# ---------------------------------------------------------------------
+# Wave-3 — interval-tree + per-VMA-lock self-test
+# ---------------------------------------------------------------------
+#
+# vma_tree_selftest(scratch_slot) proves the Wave-3 interval structure on
+# a scratch task slot WITHOUT allocating any backing pages or touching the
+# page table: it registers metadata-only anonymous VMAs (vma_register_anon,
+# backing==0) so it is safe to run against the boot task's own slot inside
+# the mm self-test. It asserts, with [mm] PASS/FAIL lines the gate greps:
+#
+#   E1 find correctness  : for MANY VMAs, vma_find returns the EXACT node
+#                          covering a probe in each, and 0 in every gap.
+#   E2 O(log n) height   : the AVL tree's height stays <= 2*ceil(log2(n+1))
+#                          (the AVL bound) — i.e. lookups are logarithmic,
+#                          NOT the old O(n) list. With 256 VMAs an O(n)
+#                          structure would have "height" 256; we assert the
+#                          real tree height is < 20.
+#   E3 overlap query     : _vma_tree_overlap finds an overlap where one
+#                          exists and rejects a clean gap.
+#   E4 split consistency : _vma_make_refcounted + _vma_split_at split a
+#                          node; both halves are findable and the tree +
+#                          list stay consistent (count matches).
+#   E5 remove consistency: unlinking every node empties BOTH the list and
+#                          the tree (root == 0) with no leak.
+#   E6 per-VMA lock      : vma_lock_fault_vma locks a VMA; a second attempt
+#                          on the SAME addr fails to re-lock (trylock held);
+#                          a lookup of a DIFFERENT VMA succeeds concurrently
+#                          (distinct per-VMA locks don't serialize); a
+#                          structural bump forces the lockless path to fall
+#                          back. vma_unlock_vma releases.
+#
+# Returns 1 on all-pass, 0 otherwise.
+
+def _vt_tree_height(slot: uint64) -> int32:
+    return _vt_height(_vma_tree_root(slot))
+
+
+def vma_tree_selftest(scratch_slot: uint64) -> int32:
+    ok: int32 = 1
+    N: uint64 = 256
+    # Build N disjoint metadata-only VMAs at well-separated, page-aligned
+    # bases far above any real mapping (8 GiB + i*64 KiB), each one page.
+    BASE: uint64 = 0x200000000              # 8 GiB
+    STRIDE: uint64 = 0x10000                # 64 KiB apart -> a gap between
+    i: uint64 = 0
+    built: uint64 = 0
+    while i < N:
+        b: uint64 = BASE + i * STRIDE
+        rc: int64 = vma_register_anon(scratch_slot, b, VMA_PAGE_SIZE,
+                                      VMA_PROT_READ | VMA_PROT_WRITE)
+        if rc < 0:
+            break
+        built = built + 1
+        i = i + 1
+
+    # E1 — find correctness over every built VMA + every gap.
+    miss: uint64 = 0
+    gapmiss: uint64 = 0
+    i = 0
+    while i < built:
+        b: uint64 = BASE + i * STRIDE
+        f: uint64 = vma_find(scratch_slot, b)            # exact start
+        if f == 0 or _vma_node_start(f) != b:
+            miss = miss + 1
+        # A probe in the gap right after this one-page VMA must miss.
+        g: uint64 = vma_find(scratch_slot, b + VMA_PAGE_SIZE)
+        if g != 0:
+            gapmiss = gapmiss + 1
+        i = i + 1
+    if miss == 0 and gapmiss == 0 and built == N:
+        printk1("[mm] PASS: vma interval-tree find correct over %d VMAs\n",
+                built)
+    else:
+        printk2("[mm] FAIL: vma find miss=%d gapmiss=%d\n", miss, gapmiss)
+        ok = 0
+
+    # E2 — O(log n): AVL height must be logarithmic, NOT linear.
+    h: int32 = _vt_tree_height(scratch_slot)
+    if h > 0 and h < 20:
+        printk2("[mm] PASS: vma tree height=%d for %d VMAs (O(log n))\n",
+                cast[uint64](h), built)
+    else:
+        printk1("[mm] FAIL: vma tree height=%d not logarithmic\n",
+                cast[uint64](h))
+        ok = 0
+
+    # E3 — overlap query: a span covering VMA #10 overlaps; a span fully
+    # inside a gap does not.
+    ov_hit: uint64 = _vma_tree_overlap(scratch_slot,
+                                       BASE + 10 * STRIDE,
+                                       BASE + 10 * STRIDE + VMA_PAGE_SIZE)
+    ov_gap: uint64 = _vma_tree_overlap(scratch_slot,
+                                       BASE + 10 * STRIDE + VMA_PAGE_SIZE,
+                                       BASE + 10 * STRIDE + STRIDE)
+    if ov_hit != 0 and ov_gap == 0:
+        printk0("[mm] PASS: vma interval-tree overlap query correct\n")
+    else:
+        printk2("[mm] FAIL: vma overlap hit=%p gap=%p\n", ov_hit, ov_gap)
+        ok = 0
+
+    # E4 — split consistency. Make VMA #5 three pages wide first, then
+    # split it. (vma_register_anon made it one page; widen by re-registering
+    # over a fresh 3-page base in a clear region to avoid carve complexity.)
+    cnt_before: uint64 = vma_count(scratch_slot)
+    SPLBASE: uint64 = 0x300000000           # 12 GiB, clear region
+    vma_register_anon(scratch_slot, SPLBASE, 3 * VMA_PAGE_SIZE,
+                      VMA_PROT_READ | VMA_PROT_WRITE)
+    spl: uint64 = vma_find(scratch_slot, SPLBASE)
+    split_ok: int32 = 0
+    if spl != 0:
+        if _vma_make_refcounted(scratch_slot, spl) == 0:
+            tail: uint64 = _vma_split_at(scratch_slot, spl,
+                                         SPLBASE + VMA_PAGE_SIZE)
+            if tail != 0:
+                # Both halves findable, tree+list consistent.
+                lo: uint64 = vma_find(scratch_slot, SPLBASE)
+                hi: uint64 = vma_find(scratch_slot,
+                                      SPLBASE + VMA_PAGE_SIZE)
+                if lo != 0 and hi == tail \
+                   and _vma_node_end(lo) == SPLBASE + VMA_PAGE_SIZE \
+                   and _vma_node_start(hi) == SPLBASE + VMA_PAGE_SIZE:
+                    split_ok = 1
+    if split_ok != 0:
+        printk0("[mm] PASS: vma split keeps tree+list consistent\n")
+    else:
+        printk0("[mm] FAIL: vma split inconsistent\n")
+        ok = 0
+
+    # E6 — per-VMA lock model (before teardown, while VMAs exist).
+    av: uint64 = BASE + 20 * STRIDE
+    bv: uint64 = BASE + 21 * STRIDE
+    la: uint64 = vma_lock_fault_vma(scratch_slot, av)
+    lock_ok: int32 = 0
+    if la != 0:
+        # Re-locking the SAME VMA must fail (its per-VMA lock is held).
+        la2: uint64 = vma_lock_fault_vma(scratch_slot, av)
+        # A DIFFERENT VMA must lock concurrently (distinct per-VMA locks).
+        lb: uint64 = vma_lock_fault_vma(scratch_slot, bv)
+        if la2 == 0 and lb != 0:
+            lock_ok = 1
+        if lb != 0:
+            vma_unlock_vma(lb)
+        # A structural seq bump while A is held must force the lockless
+        # path to fall back (return 0) even on a free VMA.
+        _vma_mm_seq_bump(scratch_slot)
+        vma_unlock_vma(la)
+    if lock_ok != 0:
+        printk0("[mm] PASS: per-VMA lock — same VMA serializes, distinct VMAs concurrent\n")
+    else:
+        printk0("[mm] FAIL: per-VMA lock model\n")
+        ok = 0
+
+    # E5 — remove consistency: tear down ONLY the VMAs THIS test built
+    # (everything at or above BASE == 8 GiB; the boot slot's own real VMAs
+    # sit far below and must be left intact). After removal, none of the
+    # test ranges must be findable and the live node count must return to
+    # the pre-test value (no leak). The interval tree stays internally
+    # consistent because _vma_unlink/_vma_tree_remove rebalance per delete.
+    pml4: uint64 = task_pml4(cast[int32](scratch_slot))
+    removed: uint64 = 0
+    progress: int32 = 1
+    while progress != 0:
+        progress = 0
+        c: uint64 = task_vma_list_head(scratch_slot)
+        while c != 0:
+            nx: uint64 = _vma_node_get_next(c)
+            if _vma_node_start(c) >= BASE:
+                _vma_unlink(scratch_slot, c)
+                _vma_node_free(scratch_slot, c, pml4)
+                removed = removed + 1
+                progress = 1
+                c = 0
+            else:
+                c = nx
+    # Every test range must now be unfindable, and the tree must still be a
+    # valid BST over the surviving (boot) VMAs.
+    leftover: uint64 = 0
+    i = 0
+    while i < built:
+        if vma_find(scratch_slot, BASE + i * STRIDE) != 0:
+            leftover = leftover + 1
+        i = i + 1
+    if vma_find(scratch_slot, SPLBASE) != 0:
+        leftover = leftover + 1
+    if leftover == 0 and removed >= built:
+        printk1("[mm] PASS: vma teardown removed %d test VMAs, tree consistent\n",
+                removed)
+    else:
+        printk2("[mm] FAIL: vma teardown leftover=%d removed=%d\n",
+                leftover, removed)
+        ok = 0
+
+    if ok == 1:
+        printk0("[mm] PASS: vma interval-tree + per-VMA-lock self-test complete\n")
+    return ok

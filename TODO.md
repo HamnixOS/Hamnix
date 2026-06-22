@@ -183,8 +183,12 @@ the EEVDF scheduler, and the page-cache + rmap + reclaim triad.
   by the RCU-walk cases in `fcache_selftest` (`scripts/test_fcache.sh`).
 - [ ] **dirty writeback throttling + per-bdi flushers** — none; `fsync` is
   a device-cache barrier only (`fs/ext4.ad:7466`). After page cache.
-- [ ] **per-VMA locking + maple tree** — VMAs are a single sorted list
-  (`mm/vma.ad:29`), O(N) faults, one global lock.
+- [x] **per-VMA locking + maple tree** — DONE (Wave-3): VMAs now indexed by
+  an augmented AVL interval tree (O(log n) find/overlap/gap; the sorted list
+  stays only as the iterator), each VMA has a per-VMA spinlock, and the
+  demand-fault path RCU-looks-up + trylocks the VMA with a per-mm seqcount
+  fallback to the mm-wide write lock (Linux `lock_vma_under_rcu` model).
+  `mm/vma.ad`; gated by `scripts/test_mm_vma_tree_logic.py` + test_mm_pressure PART E.
 - [ ] **hrtimers (ns) + NO_HZ + clocksource registry** — hrtimers are
   jiffies-quantized 16-slot (`linux_abi/api_hrtimer.ad:47`), no tickless.
 

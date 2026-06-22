@@ -126,6 +126,21 @@ check "balance_dirty_pages throttles over dirty_ratio" \
       "[mm] PASS: balance_dirty_pages throttles over dirty_ratio"
 check "clear_page_dirty drains the dirty count" \
       "[mm] PASS: clear_page_dirty drained the dirty count"
+# PART E — Wave-3 VMA interval tree (O(log n) find/overlap/gap) + per-VMA lock
+check "interval-tree find correct over many VMAs" \
+      "[mm] PASS: vma interval-tree find correct over"
+check "interval-tree height is logarithmic (O(log n), not O(n))" \
+      "[mm] PASS: vma tree height="
+check "interval-tree overlap query correct" \
+      "[mm] PASS: vma interval-tree overlap query correct"
+check "split keeps tree+list consistent" \
+      "[mm] PASS: vma split keeps tree+list consistent"
+check "per-VMA lock: same VMA serializes, distinct VMAs concurrent" \
+      "[mm] PASS: per-VMA lock"
+check "teardown removes test VMAs, tree stays consistent" \
+      "[mm] PASS: vma teardown removed"
+check "interval-tree/per-VMA-lock self-test complete" \
+      "[mm] PASS: vma interval-tree + per-VMA-lock self-test complete"
 check "self-test complete" \
       "[mm] PASS: pressure self-test complete"
 
