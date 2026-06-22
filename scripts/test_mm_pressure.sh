@@ -119,6 +119,13 @@ check "all part-C PTEs became swap entries" \
       "[mm] PASS: all 32 part-C PTEs are swap entries"
 check "part-C swap-in restores exact bytes" \
       "[mm] PASS: part-C swap-in restored exact bytes via LRU/rmap"
+# PART D — dirty-page accounting + balance_dirty_pages throttling
+check "dirty-page accounting counts dirty pages" \
+      "[mm] PASS: dirty accounting counted 32 dirty pages"
+check "balance_dirty_pages throttles over dirty_ratio" \
+      "[mm] PASS: balance_dirty_pages throttles over dirty_ratio"
+check "clear_page_dirty drains the dirty count" \
+      "[mm] PASS: clear_page_dirty drained the dirty count"
 check "self-test complete" \
       "[mm] PASS: pressure self-test complete"
 
