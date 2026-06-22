@@ -63,8 +63,12 @@ PY
 # adder_cc_compile <args...> — drop-in for `python3 -m compiler.adder compile`.
 # Accepts the same CLI shape (`--target=T <in.ad> -o <out>`). Routes to the
 # selected backend. For ADDER_CC=adder the args are translated to host_ac.elf's
-# positional <in> <out> form (the .ad host driver emits a single ELF format;
-# --target is accepted-and-ignored, mirroring elf_emit.ad's fixed output).
+# positional <in> <out> form. The seed `--target` is FORWARDED to host_ac so it
+# selects the output ELF format (x86_64-bare-metal -> the higher-half kernel
+# ELF; everything else -> the self-contained user ELF) — see elf_emit.ad
+# elf_emit_image_target(). The kernel format is not yet emittable (cap#3b/cap#4,
+# see docs/subsystems/adder-compiler.md); host_ac fails it with a precise
+# diagnostic rather than silently emitting a user-shaped ELF.
 adder_cc_compile() {
     local backend="${ADDER_CC:-python}"
     if [ "$backend" = "python" ]; then
@@ -75,14 +79,14 @@ adder_cc_compile() {
     if [ "$backend" = "adder" ]; then
         adder_cc_bootstrap || return 1
         local root="${PROJ_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-        # Parse the seed-style CLI to extract <in> and <out>.
-        local in_ad="" out_elf="" a
+        # Parse the seed-style CLI to extract <in>, <out>, and the --target.
+        local in_ad="" out_elf="" target="" a
         local -a rest=("$@")
         local i=0
         while [ $i -lt ${#rest[@]} ]; do
             a="${rest[$i]}"
             case "$a" in
-                --target=*) : ;;                       # accepted, ignored
+                --target=*) target="${a#--target=}" ;;  # forwarded below
                 -o) i=$((i+1)); out_elf="${rest[$i]}" ;;
                 -o*) out_elf="${a#-o}" ;;
                 compile) : ;;
@@ -95,7 +99,10 @@ adder_cc_compile() {
             echo "[adder_cc] ERROR: could not parse in/out from: $*" >&2
             return 2
         fi
-        "$root/build/cutover/host_ac.elf" "$in_ad" "$out_elf"
+        # Forward the format selector (host_ac accepts the flag anywhere).
+        local -a hc=()
+        [ -n "$target" ] && hc+=("--target=$target")
+        "$root/build/cutover/host_ac.elf" "${hc[@]}" "$in_ad" "$out_elf"
         return $?
     fi
     echo "[adder_cc] ERROR: unknown ADDER_CC='$backend' (want python|adder)" >&2
