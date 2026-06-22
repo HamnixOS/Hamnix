@@ -50,7 +50,8 @@ cd "$PROJ_ROOT"
 
 # Post CAP#2 (import resolution): 119 single-TU + 10 multi-TU = 129 accepted.
 # Post CAP#4 cast[Ptr[T]](expr)[i] indexed load/store: +2 multi-TU = 131.
-BASELINE_AD_OK="${WT_BASELINE_AD_OK:-131}"
+# Post CAP#4b inline asm_volatile(...) lowering: +3 = 134.
+BASELINE_AD_OK="${WT_BASELINE_AD_OK:-134}"
 
 fail() { echo "[wholetree] FAIL $*"; exit 1; }
 
