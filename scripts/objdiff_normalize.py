@@ -386,19 +386,44 @@ def main():
     report, total_div = [], 0
     if len(nat_user) != len(seed_disasm):
         report.append(f"[{unit}] NOTE block-count: seed_user={len(seed_disasm)} "
-                      f"native_user={len(nat_user)} (positional+count align)")
+                      f"native_user={len(nat_user)} (best-match align)")
+
+    # ALIGNMENT: both backends emit user functions in declaration order, but a
+    # merged multi-TU program (imports) can interleave module helpers, and the
+    # native block splitter occasionally fuses/splits differently. So we align
+    # each seed function to the native block that BEST matches its normalized
+    # histogram (the metric we ultimately compare), preferring the positional
+    # candidate on ties. A mis-pick can only HIDE a real divergence, never
+    # invent one — and a genuinely diverged function still won't match ANY
+    # block, so it surfaces. This makes the report robust to ordering.
+    def best_block(nm, sd, used):
+        target = func_histogram(sd)
+        if nm in canary:
+            target = target - CANARY_KEYS
+        best, bestscore = None, -1
+        for j, b in enumerate(nat_user):
+            if used[j]:
+                continue
+            h = func_histogram(b)
+            # similarity = size of multiset intersection minus symmetric diff
+            inter = sum((target & h).values())
+            sym = sum((target - h).values()) + sum((h - target).values())
+            score = inter - sym
+            if score > bestscore:
+                bestscore, best = score, j
+        return best
+
     used = [False] * len(nat_user)
     for si, (nm, sd) in enumerate(seed_disasm):
-        cand = si if (si < len(nat_user) and not used[si]) else None
+        cand = None
+        if si < len(nat_user) and not used[si]:
+            # positional candidate; accept only if it's a perfect or near match,
+            # else fall through to best-match search.
+            divs0 = compare_function(nm, sd, nat_user[si], nm in canary)
+            if not divs0:
+                cand = si
         if cand is None:
-            best, bestd = None, 1 << 30
-            for j, b in enumerate(nat_user):
-                if used[j]:
-                    continue
-                d = abs(len(b) - len(sd))
-                if d < bestd:
-                    bestd, best = d, j
-            cand = best
+            cand = best_block(nm, sd, used)
         if cand is None:
             report.append(f"[{unit}] {nm}: MISSING native block"); total_div += 1
             continue

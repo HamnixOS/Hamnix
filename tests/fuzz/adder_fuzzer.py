@@ -369,6 +369,19 @@ _ch:   Array[1, uint8]
 _digs: Array[32, uint8]
 g_accum: uint64
 
+# Short-circuit observer: sc_bump() has a SIDE EFFECT (it increments g_sc) and
+# returns its argument. Used as the RIGHT operand of a logical `and`/`or` so the
+# test can OBSERVE whether the backend short-circuited: a correct (Python/Adder)
+# short-circuit evaluation does NOT call sc_bump when the LEFT operand already
+# decides the result, so g_sc stays lower. A non-short-circuit (bitwise-fold)
+# backend evaluates both operands and over-increments g_sc — caught by folding
+# g_sc into g_accum.
+g_sc: uint64
+
+def sc_bump(ret: int64) -> int64:
+    g_sc = g_sc + cast[uint64](1)
+    return ret
+
 def _putc(c: uint8) -> int32:
     _ch[0] = c
     sys_write(cast[int32](1), &_ch[0], cast[uint64](1))
@@ -491,6 +504,7 @@ class Program:
         self._gen_do_while_traffic(env)   # do/while
         self._gen_float_traffic(env)      # scalar SSE float32/float64
         self._gen_loop(env)
+        self._gen_short_circuit_traffic(env)  # logical and/or short-circuit
         self._gen_helper_calls(env)
 
         self.emit(f"    print_u64(g_accum)")
@@ -638,6 +652,51 @@ class Program:
             lsum += I64.wrap(li * step) if li < thr else li
             lsum &= umask(64)
         self._fold_value("lsum", lsum)
+
+    # ---- short-circuit logical and/or traffic --------------------------------
+    def _gen_short_circuit_traffic(self, env):
+        """Emit logical `and`/`or` expressions whose RIGHT operand has an
+        observable SIDE EFFECT (sc_bump bumps g_sc), so the differential proves
+        the backend SHORT-CIRCUITS (Python/Adder semantics) — i.e. does NOT
+        evaluate the RHS when the LHS already decides the result. The earlier
+        codegen.ad bitwise-fold lowering evaluated BOTH operands and would
+        over-bump g_sc; the seed (gen_short_circuit) does not. We fold both the
+        boolean result AND the resulting g_sc into g_accum, so a non-short-
+        circuit regression diverges from the oracle. Both subset and default
+        mode emit byte-identically (same rng stream)."""
+        rng = self.rng
+        sc = 0  # oracle shadow of g_sc
+        for _ in range(rng.randint(4, 8)):
+            op = rng.choice(["and", "or"])
+            # LHS is a compile-time-known truthiness so the oracle knows whether
+            # the RHS runs; we encode it as `(L != 0)` over a literal L.
+            lhs_true = rng.randint(0, 1)
+            lhs = 1 if lhs_true else 0
+            rhs_true = rng.randint(0, 1)
+            rret = 1 if rhs_true else 0
+            # Whether the RHS (sc_bump) is evaluated under short-circuit rules:
+            #   and: RHS runs iff LHS is truthy
+            #   or : RHS runs iff LHS is falsy
+            rhs_runs = (lhs_true == 1) if op == "and" else (lhs_true == 0)
+            if rhs_runs:
+                sc += 1
+            # result value (0/1) under short-circuit semantics
+            if op == "and":
+                res = 1 if (lhs_true and rhs_true) else 0
+            else:
+                res = 1 if (lhs_true or rhs_true) else 0
+            # Emit: `b = (L != 0) <op> (sc_bump(R) != 0)` — the RHS deref/call
+            # only fires under correct short-circuiting.
+            self.emit(
+                f"    scb: int64 = cast[int64](0)")
+            self.emit(
+                f"    if (cast[int64]({lhs}) != cast[int64](0)) {op} "
+                f"(sc_bump(cast[int64]({rret})) != cast[int64](0)):")
+            self.emit(f"        scb = cast[int64](1)")
+            self._fold_value("cast[uint64](scb)", U64.wrap(res))
+        # Fold the OBSERVED side-effect count: this is the load-bearing check —
+        # it only matches the oracle if the backend short-circuited exactly.
+        self._fold_value("g_sc", U64.wrap(sc))
 
     # ---- helper-call traffic -------------------------------------------------
     def _gen_helper_calls(self, env):
