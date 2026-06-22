@@ -154,6 +154,7 @@ HOST_BUFFER_OVERRIDES = {
         ("glob_type_node: Array[1024, uint32]", "glob_type_node: Array[16384, uint32]"),
         ("glob_struct_idx: Array[1024, uint32]", "glob_struct_idx: Array[16384, uint32]"),
         ("glob_is_float: Array[1024, uint32]", "glob_is_float: Array[16384, uint32]"),
+        ("glob_is_percpu: Array[1024, uint32]", "glob_is_percpu: Array[16384, uint32]"),
         ("MAX_DATA_FIXUPS: uint32 = 8192", "MAX_DATA_FIXUPS: uint32 = 131072"),
         ("df_at: Array[8192, uint32]", "df_at: Array[131072, uint32]"),
         ("df_data_off: Array[8192, uint32]", "df_data_off: Array[131072, uint32]"),
@@ -201,6 +202,8 @@ HOST_BUFFER_OVERRIDES = {
         # table / string table for the kernel's ~10 K functions + ~3 K externs.
         ("KELF_MAX_EXTERNS: uint32 = 256", "KELF_MAX_EXTERNS: uint32 = 16384"),
         ("ext_sym: Array[256, uint32]", "ext_sym: Array[16384, uint32]"),
+        ("KELF_MAX_FNSYMS: uint32 = 256", "KELF_MAX_FNSYMS: uint32 = 16384"),
+        ("fn_sym: Array[256, uint32]", "fn_sym: Array[16384, uint32]"),
         ("KELF_STRTAB_CAP: uint32 = 4096", "KELF_STRTAB_CAP: uint32 = 4194304"),
         ("kelf_strtab: Array[4096, uint8]", "kelf_strtab: Array[4194304, uint8]"),
         ("KELF_MAX_SYMS: uint32 = 256", "KELF_MAX_SYMS: uint32 = 32768"),

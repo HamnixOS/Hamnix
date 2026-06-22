@@ -538,7 +538,19 @@ glob_struct_idx: Array[1024, uint32]
 # int32 one. Mirrors codegen_x86._float_width(get_expr_type(ident)) for a
 # global identifier.
 glob_is_float: Array[1024, uint32]
+# Per-global PERCPU marker (kernel target): 1 if the global was declared
+# `Percpu[T]`. A percpu global lives in a separate `.data..percpu` template
+# section (NOT .data/.bss) at glob_offset (a percpu-template byte offset), and
+# its access lowers to `%gs:offset` (CPU-relative), mirroring codegen_x86's
+# percpu_globals. cpu_id_pcpu is PINNED to percpu offset 0 (a hard ABI the
+# hand-written .S `movq %gs:0` reads depend on — regression #402).
+glob_is_percpu: Array[1024, uint32]
 glob_count: uint32 = 0
+
+# Per-CPU template byte size accumulated as Percpu[T] globals are laid out.
+# Becomes __per_cpu_template_end - __per_cpu_template_start. Each percpu global
+# reserves its scalar width here, at glob_offset = the running percpu offset.
+percpu_len: uint32 = 0
 
 # Data-section RIP-relative relocations. Each records the rel32 field's
 # byte offset in code[] plus the target's data offset; resolve writes
@@ -728,6 +740,7 @@ def cg_init():
     cg_self_struct = 0
     ext_count = 0
     er_count = 0
+    percpu_len = 0
     # NOTE: cg_target_kernel is set by the driver AFTER cg_init (target flag),
     # so it is deliberately NOT reset here.
 
@@ -1637,8 +1650,24 @@ def glob_define(name_off: uint32, name_len: uint32, data_off: uint32, elem_size:
     glob_type_node[glob_count] = 0
     glob_struct_idx[glob_count] = 0
     glob_is_float[glob_count] = 0
+    glob_is_percpu[glob_count] = 0
     glob_count = glob_count + 1
     return data_off
+
+
+# Mark the most recently defined global as a Percpu[T] (kernel target): its
+# glob_offset is a per-CPU TEMPLATE offset and its access lowers to %gs:offset.
+def glob_set_percpu():
+    if glob_count > 0:
+        glob_is_percpu[glob_count - 1] = 1
+
+
+# 1 if `tnode` is an ND_TYPE whose name equals the NUL-terminated literal.
+# Used to recognise the `Percpu[T]` pseudo-type (parse_type discards the [T]).
+def type_name_is(tnode: uint32, lit: Ptr[uint8]) -> uint32:
+    if tnode == 0 or nd_kind[tnode] != ND_TYPE:
+        return 0
+    return cast[uint32](name_eq_cstr(nd_name_off[tnode], nd_name_len[tnode], lit))
 
 
 # Mark the most recently defined global as living in .bss (zero-init): its
@@ -1867,6 +1896,29 @@ def emit_call_r11():
     emit_b(0x41)
     emit_b(0xFF)
     emit_b(0xD3)
+
+
+# movq %gs:disp32, %rax  -> 65 48 8B 04 25 disp32  (read a per-CPU global; the
+# disp32 is the global's byte offset within the per-CPU area, an ABSOLUTE
+# segment-relative address — NOT a reloc, the offset is a compile-time
+# constant the codegen pins). Mirrors codegen_x86's `movq %gs:off, %rax`.
+def emit_load_gs_rax(off: uint32):
+    emit_b(0x65)
+    emit_b(0x48)
+    emit_b(0x8B)
+    emit_b(0x04)
+    emit_b(0x25)
+    emit_imm32(cast[uint64](off))
+
+
+# movq %rax, %gs:disp32  -> 65 48 89 04 25 disp32  (write a per-CPU global).
+def emit_store_gs_rax(off: uint32):
+    emit_b(0x65)
+    emit_b(0x48)
+    emit_b(0x89)
+    emit_b(0x04)
+    emit_b(0x25)
+    emit_imm32(cast[uint64](off))
 
 
 # leave  -> C9
@@ -2991,11 +3043,16 @@ def gen_expr(node: uint32):
                 return
             emit_load_local_rax(off)
             return
+        # Percpu global read (kernel target): `movq %gs:offset, %rax`. The
+        # value lives per-CPU at %gs:offset, NOT at a linear RIP address.
+        gi: uint32 = glob_lookup(nd_name_off[node], nd_name_len[node])
+        if gi != 0 and glob_is_percpu[gi - 1] != 0:
+            emit_load_gs_rax(glob_offset[gi - 1])
+            return
         # Global? Scalar globals load their value (leaq + sized deref,
         # mirroring codegen_x86's `leaq name(%rip),%rax ; movq (%rax),%rax`).
         # Array globals decay to their address (just the leaq), so callers
         # that index or take their address get the base.
-        gi: uint32 = glob_lookup(nd_name_off[node], nd_name_len[node])
         if gi != 0:
             emit_lea_global_rax(glob_offset[gi - 1], glob_is_bss[gi - 1])
             if glob_elem_size[gi - 1] == 0:
@@ -5248,6 +5305,10 @@ def store_to_named(name_off: uint32, name_len: uint32):
         emit_store_local_rax(off)
         return
     gi: uint32 = glob_lookup(name_off, name_len)
+    # Percpu global store (kernel target): `movq %rax, %gs:offset`.
+    if gi != 0 and glob_is_percpu[gi - 1] != 0:
+        emit_store_gs_rax(glob_offset[gi - 1])
+        return
     if gi != 0 and glob_elem_size[gi - 1] == 0:
         # Scalar global store: value is in %rax. Move it to %rcx, leaq the
         # global address into %rax, then a sized store %rcx -> (%rax),
@@ -6561,6 +6622,25 @@ def gen_class_methods(prog: uint32):
 def layout_global(decl: uint32):
     tnode: uint32 = nd_a[decl]
     val: uint32 = nd_b[decl]
+    # PERCPU global (kernel target): `name: Percpu[T]`. Parsed as an ND_TYPE
+    # whose name is "Percpu" (the [T] args are discarded by parse_type). Lay it
+    # out into the separate per-CPU TEMPLATE (8 bytes each, T is always a
+    # uint64-width scalar in the kernel) at glob_offset = the running percpu
+    # offset, and mark it percpu so access lowers to %gs:offset and the ELF
+    # writer exports it as a .data..percpu symbol. cpu_id_pcpu is PINNED to
+    # percpu offset 0 (hard ABI — the .S `movq %gs:0` reads it; regression #402).
+    if cg_target_kernel != 0 and tnode != 0 and nd_kind[tnode] == ND_TYPE and type_name_is(tnode, "Percpu") != 0:
+        pcsz: uint32 = 8
+        # Pin cpu_id_pcpu to offset 0: it must be the FIRST percpu global. The
+        # kernel declares it first, so the running counter is already 0 here;
+        # assert by name to keep the invariant explicit.
+        pcoff: uint32 = percpu_len
+        if name_eq_cstr(nd_name_off[decl], nd_name_len[decl], "cpu_id_pcpu") != 0:
+            pcoff = 0
+        percpu_len = percpu_len + pcsz
+        glob_define(nd_name_off[decl], nd_name_len[decl], pcoff, 0, pcsz)
+        glob_set_percpu()
+        return
     if tnode != 0 and nd_kind[tnode] == ND_ARRAY_TYPE:
         # The INNERMOST scalar element width (the load/store size at the
         # deepest index). For a 1-D array this is just the element type's
