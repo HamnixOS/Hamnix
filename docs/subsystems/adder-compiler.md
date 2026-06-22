@@ -542,15 +542,39 @@ load-bearing capabilities are:
    support (`TOK_FSTRING`/`ND_FSTRING_LIT`, `TOK_YIELD`) should a future
    userland unit need them.
 
-   **The kernel's now-ONLY remaining compile blocker is codegen, not parse:**
+   **CAP#4c member-over-cast-index LANDED (2026-06-22).** The construct
    `cast[Ptr[T]](e)[i].field` — an `ND_MEMBER` (`.field`) over a cast-pointer
-   `ND_INDEX` — hits `reason=8 kind=15` at the first `PageDesc` access
-   (`return cast[Ptr[PageDesc]](d)[0].flags`, merged line 3530). CAP#4 landed
-   the cast-ptr INDEXED load/store and the member-base INDEX (`obj.field[i]`),
-   but NOT member access ON a cast-ptr-indexed lvalue. That is the next
-   codegen lift; once it lands the kernel reaches codegen end-to-end, leaving
-   only CAP#3b (boot-stub bytes + per-section streams) to make the kernel ELF
-   emittable — see capability #3 above.
+   `ND_INDEX` — previously hit `reason=8 kind=15` at the first `PageDesc`
+   access (`return cast[Ptr[PageDesc]](d)[0].flags`, merged line 3530). It now
+   compiles. `member_resolve` resolves the element STRUCT off the index base:
+   for a cast base via `ptr_struct_idx(cast's Ptr[T] target)`, and for an
+   `Array[N, Struct]` GLOBAL base via `struct_lookup_by_node(array element
+   type)` (a struct-array global takes the ND_ARRAY_TYPE layout branch so it
+   never sets `glob_struct_idx`; the element struct comes off the recorded
+   `glob_type_node`). The element is an in-place struct value, so
+   `gen_member_address` routes through `gen_addr_of -> gen_index_addr` (the
+   cap#4 cast-ptr / array path) to `&base[i]`, adds the field offset, and does
+   a sized (sign-extended for signed sub-8-byte) load/store — mirroring the
+   seed's `gen_member_address(IndexExpr-object) -> _resolve_struct(
+   get_expr_type = PointerType/ArrayType element) -> gen_index_address`. The
+   index STRIDE for an `Array[N, Struct]` global was also corrected from the
+   bogus 8 that `prim_type_size(Struct)` records to `type_size_of(Struct)` (in
+   both `index_elem_size` and `gen_index_addr`'s bare-ident global path),
+   matching the seed's `element_size_of`. Floored by
+   `scripts/test_selfhost_castptr_member.sh` (R+W, signed+unsigned field,
+   cast base + array-of-struct global; behavioral identity vs the seed).
+
+   **The kernel now advances to merged line 7843** — past every PageDesc and
+   `partition_table[base+i].field` access — and stops on a NEW, distinct
+   construct: **address-of an extern symbol** (`&irq_stub_240`,
+   `cast[uint64](&irq_stub_240)`, `reason=8 kind=8` ND_IDENT). The `.ad`
+   `gen_addr_of(ND_IDENT)` handles only frame locals and module globals; taking
+   the address of an `extern def` label (defined in `irq_asm.S`, undefined in
+   the TU) needs an EXTERNAL-symbol relocation in the emitted code — which is
+   squarely CAP#3b (kernel-ELF byte emission with extern/function symbol
+   relocs), not an address-composition lift. So the kernel's remaining codegen
+   work folds into CAP#3b: `&extern_label` (extern-symbol PC32 reloc) plus the
+   boot-stub bytes + per-section streams — see capability #3 above.
 
    Regression-floored by `scripts/test_selfhost_asm_volatile.sh` (compiles the
    full asm vocabulary through `host_ac.elf` and asserts the `as` ground-truth
@@ -583,14 +607,18 @@ compiler is capable — and `ADDER_CC=python` is the permanent escape hatch.
 against regression and asserts the seed still compiles 100% of the tree.
 
 **NEXT track**: capabilities #1 (extern linkage), #2 (import resolution +
-module merge), and CAP#4's cast-ptr-index + member-base-index lowering have
-LANDED. The `.ad` host compiler now accepts **131/211** real units (120
-single-TU + 11 multi-TU). `lib/p9.ad`'s `c[0].buf[i]=v` member-base indexed
-store now compiles (the member-base path). The remaining capabilities are the
-larger merged-source buffer + ELF output formats (#3 — the kernel's blocker
-once its 346-module closure is buffered) and the remaining reason-8 / parse
-constructs (#4 — inline `asm`/`asm_volatile` incl. multi-line `"""` bodies,
-f-strings, `yield`; precise kernel counts above). The native-in-Adder optimizer
+module merge), CAP#4's cast-ptr-index + member-base-index, CAP#4b inline-asm,
+and CAP#4c member-over-cast-index (+ array-of-struct global member, stride fix)
+have all LANDED. The `.ad` host compiler accepts **134/211** real userland
+units (123 single-TU + 11 multi-TU); the cast-ptr-member construct is a KERNEL
+idiom, so the userland count is unchanged by CAP#4c (the kernel itself, not in
+the 211 userland units, is the consumer). The kernel `init/main.ad` now LEXES
++ PARSES fully and CODEGENS up to merged line 7843, stopping ONLY on
+`&extern_label` (address-of an extern symbol — an extern-symbol reloc, folded
+into CAP#3b). The remaining capability is therefore #3 — the kernel-ELF
+emitter: extern/function-symbol PC32 relocs for `&extern_label`, the boot-stub
+bytes, and per-section streams. Once CAP#3b lands, the native kernel compiles +
+links end-to-end through the `.ad` compiler. The native-in-Adder optimizer
 (IR/LICM/CSE/regalloc) is a SEPARATE downstream track that only matters AFTER
 the cutover.
 
