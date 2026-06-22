@@ -33,8 +33,8 @@
 # constructs (reason 8) or inline `asm_volatile` (surfaces as reason 7). This
 # script is a TRACKING / REGRESSION gate: it asserts the seed still compiles
 # 100% of the tree, reports the `.ad` acceptance count + blocker breakdown,
-# and must NOT regress the `.ad`-accepted baseline (now 129/211: 119 single-TU
-# + 10 multi-TU).
+# and must NOT regress the `.ad`-accepted baseline (now 131/211: 120 single-TU
+# + 11 multi-TU, post CAP#4 cast[Ptr[T]](expr)[i] indexed load/store).
 #
 # Usage:  bash scripts/test_selfhost_wholetree_diff.sh
 #
@@ -49,7 +49,8 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 # Post CAP#2 (import resolution): 119 single-TU + 10 multi-TU = 129 accepted.
-BASELINE_AD_OK="${WT_BASELINE_AD_OK:-129}"
+# Post CAP#4 cast[Ptr[T]](expr)[i] indexed load/store: +2 multi-TU = 131.
+BASELINE_AD_OK="${WT_BASELINE_AD_OK:-131}"
 
 fail() { echo "[wholetree] FAIL $*"; exit 1; }
 

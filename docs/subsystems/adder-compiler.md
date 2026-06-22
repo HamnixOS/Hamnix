@@ -471,25 +471,39 @@ load-bearing capabilities are:
    inline `asm_volatile` (surfaces as an unresolved `asm_volatile` call —
    reason 7).
 
-   **Kernel (`init/main.ad`, post-buffers):** the merged TU now lexes+parses
-   and reaches codegen, where it stops at codegen `reason=8 kind=13`
-   (`ND_INDEX`) on the very first raw-memory write — `cast[Ptr[uint32]](
-   fb_base + off)[0] = color` (the framebuffer poke, merged line 646). This
-   `cast[Ptr[T]](expr)[i]` raw-pointer indexed-access idiom is **pervasive**
-   across the kernel closure: **915 STORE sites** (`cast[Ptr[T]](e)[i] = v`)
-   and **634 LOAD sites** (`… = cast[Ptr[T]](e)[i]`) — page tables, vdso,
-   framebuffer, mm, etc. `gen_index_addr`/`index_elem_size` handle a plain
-   ident/array/Ptr base but not an `ND_CAST` (or general expression) base as an
-   assignment/load target. This is the single highest-leverage CAP#4 fix —
-   landing it unblocks the bulk of the kernel; the remaining kernel CAP#4
-   surface is inline `asm`/`asm_volatile` (114 sites: the IRQ/MSR/port stubs),
-   f-strings (~74), `yield`/list-comp/`lambda` (a handful). (A secondary
-   full-file "parse error at line 46132" also appears, but every clean
-   prefix-cut of the merged TU parses fine and fails in codegen at the
-   cast-ptr construct, so the parse symptom is downstream of — and gated by —
-   the same CAP#4 work, not an independent parser blocker.) Once the kernel
-   compiles, CAP#3b (boot-stub bytes + per-section streams) makes the kernel
-   ELF emittable — see capability #3 above.
+   **Kernel (`init/main.ad`) — CAP#4 cast-ptr-index + member-base index
+   LANDED (2026-06-22).** `gen_index_addr` / `index_elem_size` /
+   `index_elem_signed` now lower an indexed load/store whose BASE is an
+   `ND_CAST` to a pointer (`cast[Ptr[T]](expr)[i]`) AND an `ND_MEMBER` array/
+   Ptr field (`obj.field[i]`), mirroring the seed's `gen_index_address`
+   (non-Array base → `gen_expr`(base) for the pointer value / `gen_addr_of` for
+   the field address, index scaled by `element_size_of` = `sizeof(T)` read off
+   the cast's `Ptr[T]` target or the struct field's recorded element width).
+   Both READ and WRITE paths, all element widths (uint8/16/32/64, struct), with
+   sign-extension on signed sub-8-byte element loads (`emit_load_mem_rax_signed`,
+   gated by `index_elem_signed`). New struct-field tables `sf_elem_size` /
+   `sf_elem_signed` carry the array/ptr field element width+signedness for the
+   member-base path. This idiom is **pervasive** across the kernel closure
+   (~915 STORE + ~634 LOAD sites — page tables, vdso, framebuffer, mm): the
+   first-hit `reason=8 kind=13` framebuffer poke `cast[Ptr[uint32]](fb_base +
+   off)[0] = color` now compiles. Regression-floored by `regress_codegen.ad`
+   Bug D (cast-ptr-index) + Bug E (member-base index), byte-verified through
+   `codegen.ad` (`fuzz_adder_diff.sh`). Userland acceptance +2 (`passwd`,
+   `shuf`); `cp`/`tar`/`useradd`/`umdf_host` advance PAST the index wall to
+   their next distinct construct.
+
+   **Remaining kernel CAP#4 blockers (precise, from the merged closure,
+   non-comment lines):** the kernel's NOW-FIRST blocker is **inline asm with a
+   multi-line triple-quoted body** — the lexer doesn't lex `"""…"""`, so
+   `asm_volatile("""…""")` fails (`parse error at line 46132`, the first
+   multi-line asm stub; single-line `asm_volatile("cli")` already parses).
+   Counts: **61 `asm`/`asm_volatile` calls (20 multi-line `"""`)**, **40
+   triple-quoted strings**, **15 f-strings (`f"…"`)**, **4 `yield`**, 0 lambda,
+   0 list/gen-comprehension. The two highest-leverage next CAP#4 lifts are
+   (a) lex `"""` triple-quoted strings + lower `asm`/`asm_volatile` to inline
+   machine bytes (the IRQ/MSR/port stubs), then (b) f-strings. Once those land
+   the kernel reaches codegen end-to-end; CAP#3b (boot-stub bytes + per-section
+   streams) then makes the kernel ELF emittable — see capability #3 above.
 
 **Backends differ by construction**, so a byte-identical-ELF differential is
 not even theoretically possible: the seed routes through GNU `as` (AT&T asm),
@@ -517,13 +531,15 @@ compiler is capable — and `ADDER_CC=python` is the permanent escape hatch.
 `scripts/test_selfhost_wholetree_diff.sh` guards the `.ad`-accepted baseline
 against regression and asserts the seed still compiles 100% of the tree.
 
-**NEXT track**: capabilities #1 (extern linkage) and #2 (import resolution +
-module merge) have LANDED. The `.ad` host compiler now accepts **129/211**
-real units (119 single-TU + 10 multi-TU). The remaining capabilities are the
+**NEXT track**: capabilities #1 (extern linkage), #2 (import resolution +
+module merge), and CAP#4's cast-ptr-index + member-base-index lowering have
+LANDED. The `.ad` host compiler now accepts **131/211** real units (120
+single-TU + 11 multi-TU). `lib/p9.ad`'s `c[0].buf[i]=v` member-base indexed
+store now compiles (the member-base path). The remaining capabilities are the
 larger merged-source buffer + ELF output formats (#3 — the kernel's blocker
-once its 346-module closure is buffered) and the reason-8 constructs (#4 — the
-73 still-rejected multi-TU units, gated next on `lib/p9.ad`'s `c[0].buf[i]=v`
-indexed-store-through-a-struct-field). The native-in-Adder optimizer
+once its 346-module closure is buffered) and the remaining reason-8 / parse
+constructs (#4 — inline `asm`/`asm_volatile` incl. multi-line `"""` bodies,
+f-strings, `yield`; precise kernel counts above). The native-in-Adder optimizer
 (IR/LICM/CSE/regalloc) is a SEPARATE downstream track that only matters AFTER
 the cutover.
 

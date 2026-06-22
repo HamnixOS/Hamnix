@@ -73,8 +73,8 @@ r = h.run_through_codegen_ad("regress", open("tests/fuzz/regress_codegen.ad").re
 print(f"{r.kind} {r.stdout} {r.exit}")
 PY
 )"
-echo "[fuzz_adder_diff] regression result: $REG_OUT (expect 'ok 2021429896 136')"
-[ "$REG_OUT" = "ok 2021429896 136" ] \
+echo "[fuzz_adder_diff] regression result: $REG_OUT (expect 'ok 2022430493 29')"
+[ "$REG_OUT" = "ok 2022430493 29" ] \
     || fail "codegen.ad miscompiled the regression fixture: $REG_OUT"
 
 # ---- Seeded differential batch -----------------------------------------
