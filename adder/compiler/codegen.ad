@@ -2725,6 +2725,67 @@ def emit_spill_arg(argidx: uint32, off: int32):
         emit_rbp_mem(0x4D, off)
 
 
+# Sized spill of a sub-8-byte scalar PARAMETER from its arg register into the
+# stack slot, mirroring codegen_x86.gen_function's per-param sized store
+# (`movl _ARG_REGS32[i]` / `movw _ARG_REGS16[i]` / `movb _ARG_REGS8[i]`). A
+# blind 8-byte movq (emit_spill_arg) leaves the slot's upper bytes holding the
+# arg register's high garbage; a later FULL-width read of the slot (e.g. a
+# `float32` param, whose identifier load is a plain movq because it is not
+# tagged signed, OR `&param` aliased wider) then sees that garbage. The seed
+# truncates the slot to the declared width at spill time, exactly like a
+# sub-8-byte LOCAL store. size 8 (or 0) -> plain movq (emit_spill_arg).
+#
+# Encoding: the source register is encoded in the modrm.reg field of the same
+# rbp-relative modrm byte emit_spill_arg uses (0x7D=rdi/edi/di/dil ...), with
+# the operand-size prefix/opcode selecting the width:
+#   movb  %r8b,off(%rbp)  -> [REX.R] 88 {modrm}      (size 1)
+#   movw  %r8w,off(%rbp)  -> 66 [REX.R] 89 {modrm}   (size 2)
+#   movl  %r8d,off(%rbp)  -> [REX.R] 89 {modrm}      (size 4)
+# r8/r9 (argidx 4/5) need REX.R (0x44); rdi..rcx (argidx 0..3) need no REX for
+# widths 2/4 (and a REX is required for movb of sil/dil but argidx 0/1 = di/si
+# DO need REX to address dil/sil — handled below).
+def emit_spill_arg_sized(argidx: uint32, off: int32, size: uint32):
+    if size == 0 or size == 8:
+        emit_spill_arg(argidx, off)
+        return
+    # rbp-relative modrm low byte (mod/rm = rbp + disp), reg field = source reg.
+    modrm: uint32 = 0x7D                  # default rdi/edi (reg=111)
+    rexr: uint32 = 0                      # 1 -> needs REX.R (r8/r9)
+    needs_rex8: uint32 = 0                # 1 -> movb needs REX to reach spl/dil/sil/bpl
+    if argidx == 0:
+        modrm = 0x7D                      # rdi  (reg 7)
+        needs_rex8 = 1
+    elif argidx == 1:
+        modrm = 0x75                      # rsi  (reg 6)
+        needs_rex8 = 1
+    elif argidx == 2:
+        modrm = 0x55                      # rdx  (reg 2)
+    elif argidx == 3:
+        modrm = 0x4D                      # rcx  (reg 1)
+    elif argidx == 4:
+        modrm = 0x45                      # r8   (reg 0) + REX.R
+        rexr = 1
+    else:
+        modrm = 0x4D                      # r9   (reg 1) + REX.R
+        rexr = 1
+    if size == 2:
+        emit_b(0x66)                      # operand-size override -> 16-bit
+    rex: uint32 = 0x40
+    use_rex: uint32 = 0
+    if rexr != 0:
+        rex = rex | 0x04                  # REX.R extends modrm.reg to r8/r9
+        use_rex = 1
+    if size == 1 and needs_rex8 != 0:
+        use_rex = 1                       # REX to address dil/sil (not ah/bh/...)
+    if use_rex != 0:
+        emit_b(rex)
+    if size == 1:
+        emit_b(0x88)                      # mov r/m8, r8
+    else:
+        emit_b(0x89)                      # mov r/m16/32, r16/32
+    emit_rbp_mem(modrm, off)
+
+
 # movq off(%rbp), %rax   load a local/param into %rax.
 #   -> 48 8B {45 disp8 | 85 disp32}
 def emit_load_local_rax(off: int32):
@@ -6452,6 +6513,32 @@ def prescan_block(head: uint32):
 # byte offset in code[] where this function's machine code begins.
 # -----------------------------------------------------------------------
 
+# Spill the parameter chain `params` (an ND_PARAM list) from the SysV arg
+# registers (args 0..5) and the stack (args 6+) into their frame slots,
+# mirroring codegen_x86.gen_function's spill pass. Each param's slot index
+# equals its ordinal (params are the FIRST locals allocated), so the sized
+# width is loc_scalar_size[ordinal] (0 -> full 8-byte movq). A sub-8-byte
+# scalar param is spilled SIZED (movl/movw/movb) so its slot's upper bytes are
+# not left holding the arg register's high garbage; a stack-passed arg (6+) is
+# loaded into %rax at 16+(i-6)*8(%rbp) and stored sized into its slot.
+def spill_params(params: uint32):
+    p: uint32 = params
+    idx: uint32 = 0
+    while p != 0:
+        sz: uint32 = loc_scalar_size[idx]
+        off: int32 = loc_offset[idx]
+        if idx < 6:
+            emit_spill_arg_sized(idx, off, sz)
+        else:
+            # Stack arg: arg 6 sits at +16(%rbp) (just above the return addr +
+            # saved %rbp), arg 7 at +24, ... in right-to-left push order.
+            stack_off: int32 = cast[int32](16 + (idx - 6) * 8)
+            emit_load_local_rax(stack_off)        # movq stack_off(%rbp),%rax
+            emit_store_local_rax_sized(off, sz)   # sized store into the slot
+        idx = idx + 1
+        p = nd_next[p]
+
+
 def gen_function(fn: uint32) -> uint32:
     start: uint32 = code_len
 
@@ -6502,8 +6589,18 @@ def gen_function(fn: uint32) -> uint32:
             alloc_local(nd_name_off[p], nd_name_len[p])
             loc_set_signedness(type_signedness(ptnode))
             psz_d: uint32 = prim_type_size(ptnode)
-            if type_signedness(ptnode) != 0 and psz_d < 8:
+            # Tag a sub-8-byte scalar param with its declared width so the spill
+            # truncates the slot and identifier loads extend from it — mirrors
+            # codegen_x86._scalar_local_size, which keys off the slot's byte size
+            # REGARDLESS of signedness. type_signedness returns 0 only for a
+            # float32 param (code 10), which is sub-8-byte (4) too; tagging it 4
+            # makes the spill a sized movl + the load a sized movl, instead of a
+            # blind 8-byte movq that would read the arg register's high garbage.
+            if psz_d < 8:
                 loc_set_scalar_size(psz_d)
+            pfw_d: uint32 = type_float_width(ptnode)
+            if pfw_d != 0:
+                loc_set_float(pfw_d)
         nparams = nparams + 1
         p = nd_next[p]
 
@@ -6526,13 +6623,9 @@ def gen_function(fn: uint32) -> uint32:
     if frame > 0:
         emit_sub_rsp(frame)
 
-    # Spill parameters from their arg registers into the stack slots.
-    p2: uint32 = nd_a[fn]
-    idx: uint32 = 0
-    while p2 != 0:
-        emit_spill_arg(idx, loc_offset[idx])
-        idx = idx + 1
-        p2 = nd_next[p2]
+    # Spill parameters from their arg registers (and the stack, for args 6+)
+    # into the stack slots.
+    spill_params(nd_a[fn])
 
     # Body (statement chain on nd_c).
     s: uint32 = nd_c[fn]
@@ -6593,8 +6686,13 @@ def gen_method(cls: uint32, m: uint32) -> uint32:
                 alloc_local(nd_name_off[p], nd_name_len[p])
                 loc_set_signedness(type_signedness(ptnode))
                 psz_d: uint32 = prim_type_size(ptnode)
-                if type_signedness(ptnode) != 0 and psz_d < 8:
+                # See gen_function: tag every sub-8-byte scalar param (incl.
+                # float32) so the spill + load are sized, mirroring the seed.
+                if psz_d < 8:
                     loc_set_scalar_size(psz_d)
+                pfw_d: uint32 = type_float_width(ptnode)
+                if pfw_d != 0:
+                    loc_set_float(pfw_d)
         first_param = 0
         nparams = nparams + 1
         p = nd_next[p]
@@ -6608,13 +6706,8 @@ def gen_method(cls: uint32, m: uint32) -> uint32:
     if frame > 0:
         emit_sub_rsp(frame)
 
-    # Spill parameters (self included) from arg registers into their slots.
-    p2: uint32 = nd_a[m]
-    idx: uint32 = 0
-    while p2 != 0:
-        emit_spill_arg(idx, loc_offset[idx])
-        idx = idx + 1
-        p2 = nd_next[p2]
+    # Spill parameters (self included) from arg registers / stack into slots.
+    spill_params(nd_a[m])
 
     s: uint32 = nd_c[m]
     last_was_return: uint32 = 0

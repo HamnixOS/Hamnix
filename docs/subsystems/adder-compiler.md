@@ -114,6 +114,24 @@ stores vs native `movq`). Behavioral + emission regression:
 `scripts/test_local_store_trunc.sh` (fixture
 `tests/fuzz/regress_local_store_trunc.ad`, seed-oracle exit 85; pre-fix
 native exits 0).
+**Sub-8-byte PARAMETER spills are SIZED + >6-arg STACK spills handled —
+cutover follow-on (2026-06-22).** The prior local-store fix covered only
+assignment into a named LOCAL; the parameter-SPILL path (`spill_params`, called
+from `gen_function`/`gen_method`) still emitted a blind 8-byte `movq` for EVERY
+param via `emit_spill_arg`. Now it mirrors `codegen_x86.gen_function`'s spill
+pass exactly: a sub-8-byte scalar param is tagged with its declared width
+(`loc_scalar_size`, sign-AGNOSTIC like the seed's `_scalar_local_size`, so a
+`float32` param — `type_signedness`==0, which the old gate skipped — is sized
+too) and spilled SIZED (`emit_spill_arg_sized` → movb/movw/movl, with r8d/r9d
+REX), so the slot does not keep the arg register's high garbage. A function with
+MORE THAN 6 params now loads args 7+ from the STACK (`16+(i-6)*8(%rbp)`) and
+stores them sized — the old `emit_spill_arg` `else` branch re-spilled r9 into
+every arg-index≥5 slot, so a >6-param callee read the 6th arg (or garbage) for
+params 7+. Byte-verified equal to the seed's spill region for mixed-width and
+>6-param functions. Floored by `scripts/test_param_spill_trunc.sh` (fixture
+`tests/fuzz/regress_param_spill_trunc.ad`, seed-oracle exit 214) + the
+fuzz/whole-tree gates (194 units unchanged, 0 miscompiles over 2000 programs).
+
 **Multi-dimensional array globals** (`Array[N, Array[M, T]]`) index
 level-by-level: each global carries its array type node (`glob_type_node`),
 the outer index scales by the nested row stride (`type_size_of(element)`)
