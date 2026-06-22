@@ -101,6 +101,18 @@ check_marker "dcache negative entry cached" \
 check_marker "dcache gen bump invalidates" \
     "[fcache] PASS: dcache mount/rename gen bump invalidates"
 
+# DCACHE RCU-WALK (lockless read path)
+check_marker "rcu-walk lockless positive hit" \
+    "[fcache] PASS: rcu-walk lockless positive hit"
+check_marker "rcu-walk torn read falls back to ref-walk" \
+    "[fcache] PASS: rcu-walk torn read falls back to ref-walk"
+check_marker "rcu-walk namespace isolation holds" \
+    "[fcache] PASS: rcu-walk namespace isolation holds"
+check_marker "rcu-walk deferred free past grace period" \
+    "[fcache] PASS: rcu-walk deferred free past grace period"
+check_marker "rcu-walk reclaim left other entries intact" \
+    "[fcache] PASS: rcu-walk reclaim left other entries intact"
+
 # Overall verdict.
 check_marker "overall self-test PASS" "[fcache] PASS: fs-cache self-test complete"
 
@@ -115,4 +127,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_fcache] PASS — page cache (warm hit + write/fsync coherent), dcache (positive/negative + per-namespace isolation + gen invalidation), inode cache all green"
+echo "[test_fcache] PASS — page cache (warm hit + write/fsync coherent), dcache (positive/negative + per-namespace isolation + gen invalidation), dcache RCU-walk (lockless hit + seqcount torn-read ref-walk fallback + call_rcu deferred free + namespace isolation), inode cache all green"

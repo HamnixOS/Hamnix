@@ -172,8 +172,15 @@ the EEVDF scheduler, and the page-cache + rmap + reclaim triad.
   (in-kernel `bh_selftest_run`): all 5 assertions PASS.
 
 **Wave 3 — scale & correctness (depend on Wave 2)**
-- [ ] **dcache + inode cache (+ rcu-walk)** — dcache/inode ops are no-op
-  stubs (`linux_abi/api_l58.ad:404`, `api_l57.ad:616`).
+- [x] **dcache + inode cache (+ rcu-walk)** — page/inode/dentry caches landed
+  in `fs/fcache.ad`; the dentry-cache hot read path is now Linux RCU-walk:
+  `fcache_dcache_lookup` runs lockless under `rcu_read_lock()` with a per-slot
+  seqcount + `rcu_dereference` on the publish point, validates the live
+  namespace generation + per-Pgrp key inside the stable read, and degrades to
+  a locked ref-walk (`_dcache_lookup_refwalk`) on a torn read. Inserts publish
+  `dc_valid` last via `rcu_assign_pointer`; evicted slots are RCU-retired and
+  their byte-pool reuse is deferred past a grace period via `call_rcu`. Proven
+  by the RCU-walk cases in `fcache_selftest` (`scripts/test_fcache.sh`).
 - [ ] **dirty writeback throttling + per-bdi flushers** — none; `fsync` is
   a device-cache barrier only (`fs/ext4.ad:7466`). After page cache.
 - [ ] **per-VMA locking + maple tree** — VMAs are a single sorted list
