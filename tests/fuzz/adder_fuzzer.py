@@ -495,6 +495,7 @@ class Program:
 
         self._gen_grid_traffic(env)   # 2-D array global (now codegen.ad-OK)
         self._gen_store_traffic(env)
+        self._gen_index_signedness_traffic(env)  # indexed compare/shift signedness
         self._gen_scalar_global_traffic(env)
         self._gen_struct_traffic(env)     # struct locals: member store/read
         self._gen_class_traffic(env)      # class construction + method dispatch
@@ -613,6 +614,58 @@ class Program:
             self._fold_value(
                 f"cast[uint64]({name}[{idx2}])",
                 U64.wrap(_to_reg(shadow[idx2])))
+
+    # ---- indexed-element compare / shift SIGNEDNESS traffic ------------------
+    def _gen_index_signedness_traffic(self, env):
+        """Compare and right-shift an ARRAY ELEMENT against a constant. The
+        machine compare (setcc family) and `>>` (sar vs shr) MUST use the
+        ELEMENT TYPE's signedness — the seed resolves it via
+        get_expr_type(IndexExpr)->element_type; codegen.ad must match via
+        expr_signedness(ND_INDEX). A SIGNED element near its sign boundary makes
+        a wrong unsigned compare/shift diverge, and an UNSIGNED element with the
+        high bit set makes a wrong signed compare/shift diverge. We fold the 0/1
+        compare result and the shifted value into g_accum so either error breaks
+        the by-construction oracle. Both subset and default mode identical."""
+        rng = self.rng
+        for ti, t in enumerate(STORE_TYPES):
+            name, n, shadow = self.store_arrays[t]
+            # Unique per-iteration local names — re-declaring one name (`ish`)
+            # with DIFFERENT widths across iterations is an ambiguous shadowing
+            # the two backends need not lower identically, and is not the
+            # construct under test. Distinct names keep the slot typing clean.
+            icbv = f"icb_{ti}"
+            ishv = f"ish_{ti}"
+            # Plant an element with the high bit set so signed/unsigned differ.
+            idx = rng.randrange(n)
+            hi = (1 << (t.bits - 1))
+            raw = hi | rng.randint(0, hi - 1)        # high bit set
+            self.emit(f"    {name}[{idx}] = cast[{t.name}]({raw})")
+            shadow[idx] = t.wrap(raw)
+            ev = _to_reg(shadow[idx])                 # 64-bit register view
+            # (1) compare `elem < K` — signedness-sensitive when high bit set.
+            K = rng.randint(0, (1 << t.bits) - 1)
+            # oracle: compare as the element type's signedness
+            if t.signed:
+                lhs = shadow[idx]
+                rhs = K - (1 << t.bits) if K >= hi else K
+                res = 1 if lhs < rhs else 0
+            else:
+                res = 1 if (ev & umask(64)) < K else 0
+            self.emit(f"    {icbv}: int64 = cast[int64](0)")
+            self.emit(f"    if {name}[{idx}] < cast[{t.name}]({K}):")
+            self.emit(f"        {icbv} = cast[int64](1)")
+            self._fold_value(f"cast[uint64]({icbv})", U64.wrap(res))
+            # (2) right-shift `elem >> s` — sar (signed) vs shr (unsigned).
+            s = rng.randint(1, t.bits - 1)
+            if t.signed:
+                # arithmetic shift of the type-view (sign-propagating) value
+                v = shadow[idx]
+                sh = v >> s
+            else:
+                sh = (ev & umask(t.bits)) >> s
+            self.emit(f"    {ishv}: {t.name} = {name}[{idx}] >> cast[{t.name}]({s})")
+            self._fold_value(f"cast[uint64](cast[{t.name}]({ishv}))",
+                             U64.wrap(t.wrap(sh)))
 
     # ---- scalar-global store/read traffic ------------------------------------
     def _gen_scalar_global_traffic(self, env):
