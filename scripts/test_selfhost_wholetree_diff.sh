@@ -23,29 +23,33 @@
 # `sys_*` syscall-wrapper bodies user/runtime.S provides (link_runtime_
 # externs), so every single-TU unit whose only blocker was extern linkage
 # now compiles + behaves identically to the seed (proven by
-# test_selfhost_extern_link.sh). The `.ad` compiler still has NO import
-# resolution (multi-TU = a NEXT capability) and a handful of single-TU
-# units still hit unsupported constructs (reason 8) or inline `asm_volatile`
-# (surfaces as reason 7 — the unresolved `asm_volatile` "callee"). This
+# test_selfhost_extern_link.sh). CAP#2 (IMPORT RESOLUTION) has ALSO LANDED:
+# the host driver (fused_driver_host_main.ad) now discovers a unit's `import`
+# closure, merges every module into one TU (import lines stripped), and
+# compiles it — so this gate ATTEMPTS the multi-TU units too, and for every
+# multi-TU unit host_ac accepts it PROVES the driver's merge is the same
+# program the seed's collect_all_imports+merge_programs closure produces
+# (identical function set). A handful of units still hit unsupported
+# constructs (reason 8) or inline `asm_volatile` (surfaces as reason 7). This
 # script is a TRACKING / REGRESSION gate: it asserts the seed still compiles
-# 100% of the tree, and reports the `.ad` acceptance count + the remaining
-# blocker breakdown (reason 7 = unknown callee / inline-asm; reason 8 =
-# unsupported construct). It must NOT regress the `.ad`-accepted baseline
-# (now 119/128 single-TU).
+# 100% of the tree, reports the `.ad` acceptance count + blocker breakdown,
+# and must NOT regress the `.ad`-accepted baseline (now 129/211: 119 single-TU
+# + 10 multi-TU).
 #
 # Usage:  bash scripts/test_selfhost_wholetree_diff.sh
 #
 # Env:
-#   WT_BASELINE_AD_OK  expected minimum .ad-accepted units (default 119,
-#                      post extern-linkage). Raise this as codegen.ad/
-#                      elf_emit.ad gain import resolution + missing
+#   WT_BASELINE_AD_OK  expected minimum .ad-accepted units (default 129, post
+#                      extern-linkage + import resolution). Raise this as
+#                      codegen.ad/elf_emit.ad gain the missing reason-8
 #                      constructs.
 
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-BASELINE_AD_OK="${WT_BASELINE_AD_OK:-119}"
+# Post CAP#2 (import resolution): 119 single-TU + 10 multi-TU = 129 accepted.
+BASELINE_AD_OK="${WT_BASELINE_AD_OK:-129}"
 
 fail() { echo "[wholetree] FAIL $*"; exit 1; }
 
@@ -80,7 +84,7 @@ units="$(grep 'build_adder_user ' scripts/build_user.sh | awk '{print $2}')"
 
 total=0; single_tu=0; multi_tu=0
 seed_ok=0; seed_fail=0
-ad_ok=0; ad_fail=0
+ad_ok=0; ad_fail=0; ad_ok_multi=0
 r7=0; r8=0; rparse=0; rother=0
 ad_ok_names=""
 
@@ -91,13 +95,17 @@ for f in $units; do
     total=$((total + 1))
 
     imp="$(grep -c '^from \|^import ' "$src")"
+    is_multi=0
     if [ "$imp" != "0" ]; then
         multi_tu=$((multi_tu + 1))
-        continue   # .ad compiler has no import resolution; skip (a known blocker)
+        is_multi=1
+    else
+        single_tu=$((single_tu + 1))
     fi
-    single_tu=$((single_tu + 1))
 
-    # Python seed (the oracle): MUST accept every real unit.
+    # Python seed (the oracle): MUST accept every real unit. The seed CLI
+    # resolves imports itself (compile_with_imports), so the same invocation
+    # works for single- AND multi-TU units.
     if python3 -m compiler.adder compile --target=x86_64-adder-user "$src" \
             -o "$WT/${f}.seed.elf" >/dev/null 2>"$WT/${f}.seed.err"; then
         seed_ok=$((seed_ok + 1))
@@ -106,11 +114,17 @@ for f in $units; do
         echo "[wholetree]   SEED REJECTED $src — oracle must accept the real tree"
     fi
 
-    # .ad host compiler.
-    if build/cutover/host_ac.elf "$src" "$WT/${f}.ad.elf" \
+    # .ad host compiler. CAP#2: host_ac.elf now resolves `import`s itself —
+    # it discovers the closure from the unit path, merges (imports stripped),
+    # and compiles the whole TU. A 4th arg dumps the merged source so the
+    # equivalence check below can prove the merge matches the seed's closure.
+    if build/cutover/host_ac.elf "$src" "$WT/${f}.ad.elf" "$WT/${f}.merged.ad" \
             >"$WT/${f}.ad.err" 2>&1; then
         ad_ok=$((ad_ok + 1))
         ad_ok_names="$ad_ok_names $f"
+        if [ "$is_multi" = "1" ]; then
+            ad_ok_multi=$((ad_ok_multi + 1))
+        fi
     else
         ad_fail=$((ad_fail + 1))
         err="$(cat "$WT/${f}.ad.err")"
@@ -123,38 +137,91 @@ for f in $units; do
     fi
 done
 
+# --- (3) EQUIVALENCE: for every multi-TU unit host_ac accepts, prove its
+# import merge is the SAME program the seed's collect_all_imports +
+# merge_programs produces (identical function set: orig-name, param count,
+# body length). Combined with the fuzz dry-run (codegen.ad == seed on a
+# single TU), this proves the merged multi-TU programs are behaviourally
+# equivalent to the seed's. Hamnix-syscall ELFs can't run on host Linux, so
+# the function-set identity is the soundest host-observable equivalence.
+equiv_ok=0
+equiv_fail=0
+for f in $units; do
+    src="user/$f.ad"
+    [ -f "$src" ] || src="tests/$f.ad"
+    [ -f "$src" ] || continue
+    [ "$(grep -c '^from \|^import ' "$src")" = "0" ] && continue   # multi-TU only
+    # ONLY the multi-TU units host_ac ACCEPTED (a `.merged.ad` dump is written
+    # for any unit host_ac parses, including ones it later rejects at codegen,
+    # whose partial/over-cap merge is irrelevant — equivalence is asserted only
+    # for the programs host_ac actually compiled).
+    case " $ad_ok_names " in *" $f "*) : ;; *) continue ;; esac
+    [ -f "$WT/${f}.merged.ad" ] || continue
+    if WT_F="$f" WT_SRC="$src" WT_MERGED="$WT/${f}.merged.ad" python3 - <<'PY'
+import os, sys
+from pathlib import Path
+from compiler.adder import collect_all_imports, find_hamnix_root, merge_programs
+from compiler.parser import parse
+from compiler.ast_nodes import FunctionDef
+root = find_hamnix_root()
+src = root / os.environ["WT_SRC"]
+merged = Path(os.environ["WT_MERGED"])
+def fnset(prog):
+    out = set()
+    for d in prog.declarations:
+        if isinstance(d, FunctionDef):
+            nm = getattr(d, "orig_name", None) or d.name
+            out.add((nm, len(d.params), len(d.body)))
+    return out
+seed = merge_programs(collect_all_imports(src, root))
+drv = parse(merged.read_text(), str(merged))
+sys.exit(0 if fnset(seed) == fnset(drv) else 1)
+PY
+    then
+        equiv_ok=$((equiv_ok + 1))
+    else
+        equiv_fail=$((equiv_fail + 1))
+        echo "[wholetree]   EQUIV FAIL $f — driver merge != seed closure"
+    fi
+done
+
 echo
 echo "===== WHOLE-TREE DIFFERENTIAL REPORT ====="
 echo "real userland .ad units:        $total"
 echo "  single-TU (0 imports):        $single_tu"
-echo "  multi-TU (imports; .ad skip): $multi_tu"
+echo "  multi-TU (imports):           $multi_tu"
 echo "Python seed (oracle):"
 echo "  accepted:                     $seed_ok"
 echo "  REJECTED:                     $seed_fail"
 echo ".ad host compiler (host_ac.elf):"
-echo "  accepted:                     $ad_ok    [$ad_ok_names ]"
+echo "  accepted (total):             $ad_ok    [$ad_ok_names ]"
+echo "    of which multi-TU:          $ad_ok_multi   (CAP#2 import resolution)"
 echo "  rejected:                     $ad_fail"
 echo "    reason 7 (no extern link):  $r7"
 echo "    reason 8 (unsup construct): $r8"
 echo "    parse error:                $rparse"
 echo "    other:                      $rother"
+echo "multi-TU import-merge equivalence (vs seed closure):"
+echo "  proven equivalent:            $equiv_ok"
+echo "  NOT equivalent:               $equiv_fail"
 echo "=========================================="
 
 # The Python seed is the oracle: it MUST compile 100% of the real tree.
 [ "$seed_fail" -eq 0 ] || fail "Python seed rejected $seed_fail real unit(s) — oracle broken"
 
 # Guard the .ad baseline against REGRESSION (it should only ever grow as
-# codegen.ad/elf_emit.ad gain extern linkage + import resolution).
+# codegen.ad/elf_emit.ad gain extern linkage + import resolution + constructs).
 if [ "$ad_ok" -lt "$BASELINE_AD_OK" ]; then
     fail ".ad accepted $ad_ok < baseline $BASELINE_AD_OK — codegen.ad regressed"
 fi
 
-if [ "$ad_ok" -lt "$single_tu" ]; then
-    echo "[wholetree] PASS (TRACKING) — seed compiles 100%; .ad compiles" \
-         "$ad_ok/$single_tu single-TU units. Cutover BLOCKED on extern" \
-         "linkage + import resolution (see docs/subsystems/adder-compiler.md)."
-    exit 0
-fi
+# Every multi-TU unit host_ac accepts MUST be import-merge-equivalent to the
+# seed's closure (no silently-divergent merge).
+[ "$equiv_fail" -eq 0 ] || fail "$equiv_fail multi-TU unit(s) merged differently from the seed closure"
 
-echo "[wholetree] PASS — .ad compiler accepts ALL single-TU real units."
+echo "[wholetree] PASS — seed compiles 100%; .ad host compiler accepts" \
+     "$ad_ok units ($ad_ok_multi multi-TU via CAP#2 import resolution), all" \
+     "multi-TU merges proven equivalent to the seed closure. Remaining .ad" \
+     "rejects are unsupported constructs (reason 8) — cap#4 (see" \
+     "docs/subsystems/adder-compiler.md)."
 exit 0

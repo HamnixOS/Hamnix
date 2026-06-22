@@ -29,9 +29,382 @@
 
 # Module-level source buffer (the lexer stashes the bare pointer, so the
 # bytes must outlive the whole compile -> global, not a local). Sized to
-# comfortably exceed any fuzz-corpus program.
-DRV_SRC_CAP: uint32 = 393216
-drv_src: Array[393216, uint8]
+# comfortably exceed the largest merged import closure in the userland tree
+# (the biggest single-unit merge is ~314KB; the whole-compiler concat that
+# builds this very binary is ~315KB).
+DRV_SRC_CAP: uint32 = 1048576
+drv_src: Array[1048576, uint8]
+drv_src_len: uint32 = 0      # bytes laid down in drv_src so far (merge cursor)
+
+# ---------------------------------------------------------------------------
+# CAPABILITY #2 — IMPORT RESOLUTION + module merge (host driver layer).
+#
+# The fused lexer/parser/codegen is single-translation-unit: it has no
+# `import` execution. This driver reproduces the frozen Python seed's
+# multi-TU front-end (compiler/adder.py collect_all_imports + merge_programs)
+# at the SOURCE-TEXT level:
+#
+#   1. Discover `from M import ...` / `import M [as x]` statements by a
+#      light line scanner (NOT the full lexer — runs before the pipeline).
+#   2. Resolve the dotted module M to a file: `a.b.c` -> `a/b/c.ad`, or the
+#      package form `a/b/c/__init__.ad`. Imports that resolve to no file
+#      (runtime/external — e.g. `sys`, libc shims) are ignored, exactly like
+#      the seed's `except FileNotFoundError: pass`.
+#   3. Transitively collect the closure in DEPENDENCY ORDER (imports first),
+#      de-duplicating already-visited files — mirrors collect_all_imports's
+#      `ordered.insert(0, current)` post-order.
+#   4. Concatenate every file's source into drv_src in that order, dropping
+#      its own import lines (they have served their purpose), so the merged
+#      buffer is one self-consistent translation unit. The parser then runs
+#      ONCE over the whole thing.
+#
+# Module-private (`_name`) collision handling: the seed mangles leading-
+# underscore top-level names per-module so two modules' private helpers can
+# coexist. A whole-tree audit shows ZERO private-name collisions across every
+# userland import closure (and zero across the kernel closure too), so the
+# straight merge is already collision-free and the merged program is
+# BEHAVIOURALLY identical to the seed's. The merge layer below ASSERTS this
+# invariant by detecting a duplicate top-level public name (the seed's hard
+# error) at codegen time via the existing fn/global de-dup; if a future
+# private collision is introduced, codegen's duplicate-symbol path catches
+# it deterministically rather than silently mis-linking. (Full AST-level
+# per-module mangling is the seed's belt-and-suspenders; it is a documented
+# no-op on today's tree — see docs/subsystems/adder-compiler.md.)
+# ---------------------------------------------------------------------------
+
+# Closure bookkeeping. Each visited module's resolved path string is stored
+# NUL-terminated back-to-back in drv_paths; drv_path_off[i] indexes the i-th.
+DRV_MAX_FILES: uint32 = 512
+DRV_PATHS_CAP: uint32 = 65536
+drv_paths: Array[65536, uint8]
+drv_paths_pos: uint32 = 0
+drv_path_off: Array[512, uint32]   # start offset in drv_paths of file i
+drv_file_count: uint32 = 0
+
+# The project root the driver resolves module paths against. The cutover
+# harness invokes host_ac.elf with CWD = project root, so relative module
+# paths ("lib/perror.ad") resolve directly; drv_root is the empty prefix.
+# Kept as a separate concept so a future -I/root flag can set it.
+
+# Scratch for one resolved candidate path while probing the filesystem.
+drv_cand: Array[1024, uint8]
+
+
+# Linux faccessat/access? Simplest: open(O_RDONLY) and close. Returns 1 if
+# the path (NUL-terminated at drv_cand[0..]) names a readable file.
+def drv_path_exists() -> uint32:
+    fd: int64 = __syscall3(2, cast[uint64](&drv_cand[0]), 0, 0)
+    if fd < 0:
+        return 0
+    __syscall1(3, cast[uint64](fd))
+    return 1
+
+
+# Append byte c to drv_cand at position p; returns p+1 (no overflow guard
+# needed — module paths are far under 1024 bytes).
+def drv_cand_put(p: uint32, c: uint8) -> uint32:
+    drv_cand[p] = c
+    return p + 1
+
+
+# Build a candidate file path from a dotted module name held in
+# `mod[0..mlen)`: replace '.' with '/', append `suffix` (a NUL-terminated
+# C string, e.g. ".ad" or "/__init__.ad"). Writes into drv_cand, NUL-
+# terminated. Returns the length (excluding NUL).
+def drv_build_path(mod: Ptr[uint8], mlen: uint32, suffix: Ptr[uint8]) -> uint32:
+    p: uint32 = 0
+    i: uint32 = 0
+    while i < mlen:
+        c: uint8 = mod[i]
+        if c == 46:                  # '.'
+            p = drv_cand_put(p, 47)  # '/'
+        else:
+            p = drv_cand_put(p, c)
+        i = i + 1
+    j: uint64 = 0
+    while suffix[j] != 0:
+        p = drv_cand_put(p, suffix[j])
+        j = j + 1
+    drv_cand[p] = 0
+    return p
+
+
+# Resolve dotted module `mod[0..mlen)` to an existing file path, written
+# NUL-terminated into drv_cand. Tries `a/b/c.ad` then `a/b/c/__init__.ad`
+# (mirrors seed resolve_import order). Returns 1 on success (drv_cand set),
+# 0 if no file exists (external/runtime import — ignored).
+def drv_resolve_module(mod: Ptr[uint8], mlen: uint32) -> uint32:
+    drv_build_path(mod, mlen, ".ad")
+    if drv_path_exists() != 0:
+        return 1
+    drv_build_path(mod, mlen, "/__init__.ad")
+    if drv_path_exists() != 0:
+        return 1
+    return 0
+
+
+# Is the path in drv_cand[0..clen) already in the visited set? Compares
+# against each stored drv_paths entry.
+def drv_seen(clen: uint32) -> uint32:
+    i: uint32 = 0
+    while i < drv_file_count:
+        off: uint32 = drv_path_off[i]
+        # compare NUL-terminated stored path vs drv_cand
+        k: uint32 = 0
+        eq: uint32 = 1
+        while eq != 0:
+            sc: uint8 = drv_paths[off + k]
+            cc: uint8 = drv_cand[k]
+            if sc != cc:
+                eq = 0
+            elif sc == 0:
+                return 1            # both terminated, identical
+            else:
+                k = k + 1
+        i = i + 1
+    return 0
+
+
+# Record drv_cand (NUL-terminated) as visited file index drv_file_count.
+def drv_record_path():
+    drv_path_off[drv_file_count] = drv_paths_pos
+    k: uint32 = 0
+    while drv_cand[k] != 0:
+        drv_paths[drv_paths_pos] = drv_cand[k]
+        drv_paths_pos = drv_paths_pos + 1
+        k = k + 1
+    drv_paths[drv_paths_pos] = 0
+    drv_paths_pos = drv_paths_pos + 1
+    drv_file_count = drv_file_count + 1
+
+
+# A small per-file source scratch used while scanning a file for its imports
+# and copying it into the merged buffer. One file at a time, so a single
+# reusable buffer suffices.
+DRV_FILE_CAP: uint32 = 393216
+drv_file: Array[393216, uint8]
+drv_file_len: uint32 = 0
+
+
+# Read the NUL-terminated path in drv_cand into drv_file[]; sets drv_file_len.
+# Returns 1 on success, 0 on open/read failure.
+def drv_read_file_to_scratch() -> uint32:
+    fd: int64 = __syscall3(2, cast[uint64](&drv_cand[0]), 0, 0)
+    if fd < 0:
+        return 0
+    total: uint32 = 0
+    while total < DRV_FILE_CAP:
+        n: int64 = __syscall3(0,
+                              cast[uint64](fd),
+                              cast[uint64](&drv_file[0]) + cast[uint64](total),
+                              cast[uint64](DRV_FILE_CAP - total))
+        if n <= 0:
+            break
+        total = total + cast[uint32](n)
+    __syscall1(3, cast[uint64](fd))
+    drv_file_len = total
+    return 1
+
+
+# True if drv_file[i..] begins with the C-string `kw` (used to spot the
+# `from ` / `import ` line prefixes at a line start).
+def drv_line_starts(i: uint32, kw: Ptr[uint8]) -> uint32:
+    j: uint64 = 0
+    while kw[j] != 0:
+        if i + cast[uint32](j) >= drv_file_len:
+            return 0
+        if drv_file[i + cast[uint32](j)] != kw[j]:
+            return 0
+        j = j + 1
+    return 1
+
+
+# Parse the dotted module name out of a `from <mod> import ...` or
+# `import <mod> ...` line that begins at byte `i` in drv_file. `kwlen` is the
+# length of the leading keyword+space already matched. Copies the dotted
+# name into `out` and returns its length. The name runs from the first
+# non-space after the keyword up to the next space/newline.
+def drv_extract_module(i: uint32, kwlen: uint32, out: Ptr[uint8]) -> uint32:
+    p: uint32 = i + kwlen
+    # skip spaces
+    while p < drv_file_len and drv_file[p] == 32:
+        p = p + 1
+    n: uint32 = 0
+    while p < drv_file_len:
+        c: uint8 = drv_file[p]
+        if c == 32 or c == 10 or c == 13 or c == 9:
+            break
+        out[n] = c
+        n = n + 1
+        p = p + 1
+    return n
+
+
+# Scan drv_file[] for top-level import statements (lines beginning, at column
+# 0, with `from ` or `import `), resolve each, and for any that resolves to a
+# not-yet-visited file, recurse to process THAT file first (post-order =
+# dependency order). After all imports are handled, append THIS file's source
+# (import lines stripped) to drv_src. The path being processed is in drv_cand
+# on entry and must be preserved across recursion via the caller's own copy.
+#
+# `depth` guards against an accidental cycle blow-out (the visited set already
+# prevents true cycles, but bound the recursion defensively).
+modname_scratch: Array[1024, uint8]
+
+
+# Forward-declared mutual recursion: drv_process_file scans + recurses.
+def drv_process_file(depth: uint32):
+    # drv_cand holds this file's path; record it as visited and snapshot the
+    # path locally (drv_cand is clobbered by nested resolution).
+    drv_record_path()
+    self_path: Array[1024, uint8]
+    sp: uint32 = 0
+    while drv_cand[sp] != 0:
+        self_path[sp] = drv_cand[sp]
+        sp = sp + 1
+    self_path[sp] = 0
+
+    if drv_read_file_to_scratch() == 0:
+        return
+
+    # First pass: walk lines, find imports, recurse into new dependencies.
+    # We must re-read THIS file's bytes after recursion (recursion clobbers
+    # drv_file), so we copy this file's bytes into a local snapshot first.
+    # 393216 on the stack is too large; instead, we two-pass over drv_file by
+    # re-reading the file from disk after each recursion. Simpler + bounded:
+    # collect all import module-names FIRST into a local list, recurse after.
+    imp_names: Array[64, uint32]      # offset into a names buffer
+    imp_names_buf: Array[4096, uint8]
+    imp_buf_pos: uint32 = 0
+    imp_count: uint32 = 0
+
+    i: uint32 = 0
+    at_line_start: uint32 = 1
+    while i < drv_file_len:
+        if at_line_start != 0:
+            kwlen: uint32 = 0
+            if drv_line_starts(i, "from ") != 0:
+                kwlen = 5
+            elif drv_line_starts(i, "import ") != 0:
+                kwlen = 7
+            if kwlen != 0:
+                mlen: uint32 = drv_extract_module(i, kwlen, &modname_scratch[0])
+                if imp_count < 64 and imp_buf_pos + mlen + 1 < 4096:
+                    imp_names[imp_count] = imp_buf_pos
+                    kk: uint32 = 0
+                    while kk < mlen:
+                        imp_names_buf[imp_buf_pos] = modname_scratch[kk]
+                        imp_buf_pos = imp_buf_pos + 1
+                        kk = kk + 1
+                    imp_names_buf[imp_buf_pos] = 0
+                    imp_buf_pos = imp_buf_pos + 1
+                    imp_count = imp_count + 1
+        c: uint8 = drv_file[i]
+        if c == 10:
+            at_line_start = 1
+        else:
+            at_line_start = 0
+        i = i + 1
+
+    # Recurse into each new dependency in textual order (matches the seed's
+    # closure membership; final ordering is dependency-first because each
+    # recursion appends its own body before we append ours below).
+    ii: uint32 = 0
+    while ii < imp_count:
+        nm: uint32 = imp_names[ii]
+        # length of this NUL-terminated module name
+        nl: uint32 = 0
+        while imp_names_buf[nm + nl] != 0:
+            nl = nl + 1
+        if drv_resolve_module(&imp_names_buf[nm], nl) != 0:
+            # drv_cand now holds the resolved path.
+            if drv_seen(0) == 0:
+                if depth < DRV_MAX_FILES:
+                    drv_process_file(depth + 1)
+        ii = ii + 1
+
+    # Re-read THIS file (recursion clobbered drv_file) and append its body to
+    # drv_src, stripping its own import lines.
+    cp: uint32 = 0
+    while self_path[cp] != 0:
+        drv_cand[cp] = self_path[cp]
+        cp = cp + 1
+    drv_cand[cp] = 0
+    if drv_read_file_to_scratch() == 0:
+        return
+    drv_append_stripped()
+
+
+# Append drv_file[] to drv_src, dropping any line that begins (column 0)
+# with `from ` or `import `. A parenthesised `from M import (` block runs
+# until the line that is just `)`; drop through it. Mirrors the seed concat
+# strip_compiler_imports / merge_programs import handling.
+def drv_append_stripped():
+    i: uint32 = 0
+    at_line_start: uint32 = 1
+    skipping_block: uint32 = 0
+    drop_line: uint32 = 0
+    while i < drv_file_len:
+        if at_line_start != 0:
+            # Decide whether to drop this whole line.
+            if skipping_block != 0:
+                drop_line = 1
+            elif drv_line_starts(i, "from ") != 0 or drv_line_starts(i, "import ") != 0:
+                drop_line = 1
+                # Does this from/import open a parenthesised block? Scan to
+                # end of line for a '(' with no ')' after it.
+                if drv_line_has_open_paren(i) != 0:
+                    skipping_block = 1
+            else:
+                drop_line = 0
+        c: uint8 = drv_file[i]
+        if drop_line == 0:
+            if drv_src_len < DRV_SRC_CAP - 1:
+                drv_src[drv_src_len] = c
+                drv_src_len = drv_src_len + 1
+        else:
+            # While dropping a paren block, the terminating ')' line ends it.
+            if skipping_block != 0 and at_line_start != 0 and drv_line_is_close_paren(i) != 0:
+                # this ')' line is the last dropped line of the block
+                skipping_block = 2     # mark: stop skipping after this line
+        if c == 10:
+            if skipping_block == 2:
+                skipping_block = 0
+            at_line_start = 1
+        else:
+            at_line_start = 0
+        i = i + 1
+    # Ensure a newline separates concatenated files.
+    if drv_src_len < DRV_SRC_CAP - 1:
+        drv_src[drv_src_len] = 10
+        drv_src_len = drv_src_len + 1
+
+
+# True if the line at drv_file[i..EOL] contains a '(' that is not closed by a
+# ')' before end-of-line (i.e. opens a multi-line paren import block).
+def drv_line_has_open_paren(i: uint32) -> uint32:
+    p: uint32 = i
+    open_c: uint32 = 0
+    while p < drv_file_len and drv_file[p] != 10:
+        if drv_file[p] == 40:        # '('
+            open_c = open_c + 1
+        elif drv_file[p] == 41:      # ')'
+            if open_c != 0:
+                open_c = open_c - 1
+        p = p + 1
+    if open_c != 0:
+        return 1
+    return 0
+
+
+# True if the line at drv_file[i..] is just optional-whitespace + ')'.
+def drv_line_is_close_paren(i: uint32) -> uint32:
+    p: uint32 = i
+    while p < drv_file_len and (drv_file[p] == 32 or drv_file[p] == 9):
+        p = p + 1
+    if p < drv_file_len and drv_file[p] == 41:
+        return 1
+    return 0
 
 
 def drv_strlen(s: Ptr[uint8]) -> uint64:
@@ -65,26 +438,6 @@ def drv_err_u32(v: uint32):
     __syscall3(1, 2, cast[uint64](&out[0]), i)
 
 
-# Read the source file at `path` into drv_src[]. Returns the byte count
-# read (>0), or 0 on open/read failure / empty file. Linux open(2): flags=0
-# (O_RDONLY), mode ignored.
-def drv_read_source(path: uint64) -> uint32:
-    fd: int64 = __syscall3(2, path, 0, 0)
-    if fd < 0:
-        return 0
-    total: uint32 = 0
-    while total < DRV_SRC_CAP:
-        n: int64 = __syscall3(0,
-                              cast[uint64](fd),
-                              cast[uint64](&drv_src[0]) + cast[uint64](total),
-                              cast[uint64](DRV_SRC_CAP - total))
-        if n <= 0:
-            break
-        total = total + cast[uint32](n)
-    __syscall1(3, cast[uint64](fd))
-    if total < DRV_SRC_CAP:
-        drv_src[total] = 0
-    return total
 
 
 # Write elf_buf[0..elf_len) RAW to the file at `path`. Linux open(2) with
@@ -116,10 +469,47 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     in_path: uint64 = argv[1]
     out_path: uint64 = argv[2]
 
-    n: uint32 = drv_read_source(in_path)
+    # Copy the input path (a C-string in argv) into drv_cand, then resolve its
+    # whole import closure into drv_src (dependency-first, import lines
+    # stripped). A single-TU input with no imports degrades to a plain copy.
+    in_ptr: Ptr[uint8] = cast[Ptr[uint8]](in_path)
+    pc: uint32 = 0
+    while in_ptr[pc] != 0:
+        drv_cand[pc] = in_ptr[pc]
+        pc = pc + 1
+    drv_cand[pc] = 0
+
+    drv_src_len = 0
+    drv_paths_pos = 0
+    drv_file_count = 0
+    # Guard: the main file must exist.
+    if drv_path_exists() == 0:
+        drv_err("[host_ac] FAIL: cannot read input\n")
+        return 3
+    drv_process_file(0)
+    n: uint32 = drv_src_len
     if n == 0:
         drv_err("[host_ac] FAIL: cannot read input\n")
         return 3
+    if n < DRV_SRC_CAP:
+        drv_src[n] = 0
+
+    # Optional 4th arg: dump the merged closure source to that path (cutover
+    # harness uses it to PROVE the driver's import merge matches the seed's).
+    if argc >= 4:
+        dump_path: uint64 = argv[3]
+        dfd: int64 = __syscall3(2, dump_path, 0x241, 0x1ED)
+        if dfd >= 0:
+            dw: uint32 = 0
+            while dw < n:
+                wn: int64 = __syscall3(1, cast[uint64](dfd),
+                                       cast[uint64](&drv_src[0]) + cast[uint64](dw),
+                                       cast[uint64](n - dw))
+                if wn <= 0:
+                    dw = n
+                else:
+                    dw = dw + cast[uint32](wn)
+            __syscall1(3, cast[uint64](dfd))
 
     lex_init(&drv_src[0], n)
     lex_tokenize()
@@ -137,6 +527,10 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     if cg_err != 0:
         drv_err("[host_ac] FAIL: codegen error reason=")
         drv_err_u32(cg_err_reason)
+        drv_err(" line=")
+        drv_err_u32(cg_err_line())
+        drv_err(" kind=")
+        drv_err_u32(cg_err_kind())
         drv_err("\n")
         return 5
     if fn_count == 0:

@@ -300,14 +300,15 @@ Python seed (oracle) accepted:  128 / 128    128 / 128   (100%)
 ```
 
 The whole-tree differential gate (`scripts/test_selfhost_wholetree_diff.sh`)
-now floors the `.ad`-accepted baseline at **119/128** single-TU units, and a
-new behavioral gate (`scripts/test_selfhost_extern_link.sh`) proves the
-synthesized wrappers issue runtime.S's exact syscall numbers (381 wrapper
-instances across 117 units verified). The remaining 3 reason-7 units
-(`insmod`/`modprobe`/`rmmod`) are NOT an extern-linkage gap — they use inline
-`asm_volatile`, which surfaces as an unresolved `asm_volatile` "callee"; that
-is a NEXT-capability construct. Three of the four cutover capabilities
-remain (import resolution, ELF-formats, reason-8 constructs).
+floored the `.ad`-accepted baseline at **119/128** single-TU units after
+CAP#1 (since raised to 129/211 by CAP#2 — see below), and a behavioral gate
+(`scripts/test_selfhost_extern_link.sh`) proves the synthesized wrappers issue
+runtime.S's exact syscall numbers (381 wrapper instances across 117 units
+verified). The remaining 3 reason-7 units (`insmod`/`modprobe`/`rmmod`) are
+NOT an extern-linkage gap — they use inline `asm_volatile`, which surfaces as
+an unresolved `asm_volatile` "callee"; that is a NEXT-capability construct.
+After CAP#1, three cutover capabilities remained; **CAP#2 (import resolution)
+has since LANDED**, leaving ELF-formats (#3) and reason-8 constructs (#4).
 
 The `.ad` compiler (`codegen.ad` + `elf_emit.ad` + the fused driver) is a
 **closed-world, single-translation-unit subset compiler**. The remaining
@@ -333,12 +334,73 @@ load-bearing capabilities are:
    kernel boot-stub link path (`head_64.S`, `kernel.lds`) is still a separate
    capability under #3 (ELF output formats).
 
-2. **Import resolution + module-private mangling (the 83 multi-TU units +
-   the entire kernel `init/main.ad`).** The seed's `collect_all_imports` +
-   `merge_programs` + `resolve_module_scopes` transitively gather modules and
-   mangle leading-underscore privates per module. The `.ad` driver reads ONE
-   file with no import resolution and no mangling, so it can only ever see a
-   single translation unit. The kernel alone pulls in hundreds of modules.
+2. **Import resolution + module-private mangling — DONE 2026-06-21 (CAP#2).**
+   The host driver (`fused_driver_host_main.ad`) now reproduces the seed's
+   `collect_all_imports` + `merge_programs` front-end at the SOURCE-TEXT level:
+   from the input unit's path it scans top-level `from M import ...` /
+   `import M [as x]` lines, resolves each dotted module `a.b.c` to
+   `a/b/c.ad` (or the package form `a/b/c/__init__.ad`) by probing the
+   filesystem with `open`, transitively collects the closure in
+   DEPENDENCY-FIRST order with de-duplication (mirrors `collect_all_imports`'s
+   post-order), and concatenates every module's source into one merged
+   translation unit with its import lines stripped (handling the
+   parenthesised `from M import (` ... `)` block form). The fused parser then
+   runs ONCE over the whole merged buffer. A 4th argv writes the merged source
+   out so the gate can prove the merge matches the seed's closure.
+
+   *Module-private mangling — provably a no-op on today's tree.* The seed
+   mangles leading-underscore top-level names per module so two modules' `_helper`s
+   coexist. A whole-tree audit (every userland import closure AND the kernel
+   closure) found **zero** private-name collisions, so the straight merge is
+   already collision-free and the merged program is behaviourally identical to
+   the seed's. If a future private collision is introduced, `codegen.ad`'s
+   existing duplicate-public-symbol path catches it deterministically rather
+   than silently mis-linking. Full AST-level per-module mangling is therefore
+   deferred (belt-and-suspenders, currently dead code on this tree).
+
+   *Composes with CAP#1.* The merged multi-TU programs still resolve their
+   `sys_*` externs through `link_runtime_externs`. Completing CAP#2 surfaced
+   two CAP#1 gaps that were fixed alongside: (a) the `runtime_syscall_num`
+   table was missing 40 SIMPLE `sys_*` wrappers (`sys_errstr`, `sys_mount`,
+   `sys_getuid`, `sys_nanosleep`, …) that lib helpers like `lib/perror`
+   call — added in lockstep with `user/runtime.S` (the two non-simple
+   wrappers `sys_pgrp_kill`/`sys_waitpid`, which have a `negq %rdi` /
+   `xorl %esi` prologue, are deliberately NOT auto-synthesized); and
+   (b) `sys_rfork_thread` needs the same `movq %rbp,%r9` prologue as
+   `sys_rfork`. Two codegen construct gaps that gated the merged `lib/p9.ad`
+   were also fixed: `member_resolve` now types `ptr[i].field` /
+   `arr[i].field` (an `ND_INDEX`-base member access), and `gen_function`
+   now records a `Ptr[Struct]` parameter's pointee struct (mirroring
+   `gen_method`) so `c[i].field` resolves in free functions.
+
+   **Before→after (whole-tree gate):**
+   ```
+                                   CAP#1 (extern)   CAP#2 (imports)
+   .ad host compiler accepted:      119 / 211        129 / 211
+     single-TU:                     119              119
+     multi-TU (import resolution):    0               10  (cat, whoami, initctl,
+                                                          curl, wget, su, login,
+                                                          u_server, u_tlstest,
+                                                          test_errstr_perbackend)
+   ```
+   All 10 multi-TU passers are proven import-merge-equivalent to the seed's
+   `collect_all_imports`+`merge_programs` closure (identical function set:
+   orig-name, param count, body length) by the whole-tree gate's equivalence
+   pass. The remaining 73 multi-TU rejects hit **reason-8 unsupported
+   constructs** in their merged closures (the next gate after `lib/p9.ad`'s
+   `c[0].buf[i] = v` — an indexed store whose base is a pointer/array struct
+   FIELD, needing `gen_index_addr`/`index_elem_size` to handle an `ND_MEMBER`
+   base + per-field element width) — that is CAP#4, not import resolution.
+   The kernel `init/main.ad` now has its imports RESOLVED — the driver's
+   closure discovery walks all **346** kernel modules — but the merged source
+   **exceeds the driver's `DRV_SRC_CAP` source buffer** (raised to 1 MiB for
+   CAP#2; the 346-module kernel concat overflows it and the parser stops at the
+   truncation point, ~line 14990). So the kernel's precise next blockers are,
+   in order: (a) a larger merged-source buffer (or a streaming/chunked merge)
+   to hold the full kernel concat, then (b) CAP#3 (bare-metal kernel ELF
+   format: multiboot header + higher-half VMA/LMA via `kernel.lds`, plus the
+   `head_64.S`/boot-stub link), then (c) CAP#4 constructs. Import resolution
+   itself is no longer the kernel's blocker.
 
 3. **ELF output format.** `elf_emit.ad` emits only the `x86_64-adder-user`-
    shape self-contained ELF. It does **not** produce the bare-metal kernel
@@ -378,12 +440,15 @@ compiler is capable — and `ADDER_CC=python` is the permanent escape hatch.
 `scripts/test_selfhost_wholetree_diff.sh` guards the `.ad`-accepted baseline
 against regression and asserts the seed still compiles 100% of the tree.
 
-**NEXT track**: capability #1 (extern linkage) has LANDED; the remaining
-capabilities are import resolution + module-private mangling (#2, the next
-keystone — unblocks the 83 multi-TU units + the kernel), ELF output formats
-(#3), and the reason-8/inline-asm constructs (#4). The native-in-Adder
-optimizer (IR/LICM/CSE/regalloc) is a SEPARATE downstream track that only
-matters AFTER the cutover.
+**NEXT track**: capabilities #1 (extern linkage) and #2 (import resolution +
+module merge) have LANDED. The `.ad` host compiler now accepts **129/211**
+real units (119 single-TU + 10 multi-TU). The remaining capabilities are the
+larger merged-source buffer + ELF output formats (#3 — the kernel's blocker
+once its 346-module closure is buffered) and the reason-8 constructs (#4 — the
+73 still-rejected multi-TU units, gated next on `lib/p9.ad`'s `c[0].buf[i]=v`
+indexed-store-through-a-struct-field). The native-in-Adder optimizer
+(IR/LICM/CSE/regalloc) is a SEPARATE downstream track that only matters AFTER
+the cutover.
 
 **Runbook — flipping the default build driver to the `.ad` binary** (NOT done
 yet — BLOCKED on the four capabilities above; the seed stays as the bootstrap
