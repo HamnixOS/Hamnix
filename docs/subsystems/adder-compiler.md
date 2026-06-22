@@ -286,34 +286,52 @@ fuzzer generates only a narrow language subset. The real question — *can
 **whole-tree differential** gate, `scripts/test_selfhost_wholetree_diff.sh`,
 which compiles every real userland `.ad` unit with BOTH backends:
 
+**Capability #1 (extern linkage) — LANDED 2026-06-21.** Before→after:
+
 ```
-real userland .ad units:        211
-  single-TU (0 imports):        128
-  multi-TU (imports):            83
-Python seed (oracle) accepted:  128 / 128   (100%)
-.ad host compiler accepted:       2 / 128    (true, false only)
-  rejected — reason 7 (no extern link):  120
-  rejected — reason 8 (unsup construct):   6   (init, shuf, vi, useradd, getty, umdf_host)
+                                         BEFORE       AFTER (extern linkage)
+real userland .ad units:        211          211
+  single-TU (0 imports):        128          128
+  multi-TU (imports):            83           83
+Python seed (oracle) accepted:  128 / 128    128 / 128   (100%)
+.ad host compiler accepted:       2 / 128    119 / 128
+  rejected — reason 7:           120            3   (insmod/modprobe/rmmod — inline asm_volatile)
+  rejected — reason 8:             6            6   (init, shuf, vi, useradd, getty, umdf_host)
 ```
 
-So the self-hosted `.ad` compiler **cannot build the real tree today**, and
-the cutover is **BLOCKED**. The fuzz corpus passing 300/300 hid this because
-the fuzzer never emits the constructs the real tree depends on. The `.ad`
-compiler (`codegen.ad` + `elf_emit.ad` + the fused driver) is a
-**closed-world, single-translation-unit, extern-less subset compiler** —
-exactly enough to compile *its own* (closed-world) source for the
-fixpoint, and no more. Four distinct, load-bearing capabilities are missing:
+The whole-tree differential gate (`scripts/test_selfhost_wholetree_diff.sh`)
+now floors the `.ad`-accepted baseline at **119/128** single-TU units, and a
+new behavioral gate (`scripts/test_selfhost_extern_link.sh`) proves the
+synthesized wrappers issue runtime.S's exact syscall numbers (381 wrapper
+instances across 117 units verified). The remaining 3 reason-7 units
+(`insmod`/`modprobe`/`rmmod`) are NOT an extern-linkage gap — they use inline
+`asm_volatile`, which surfaces as an unresolved `asm_volatile` "callee"; that
+is a NEXT-capability construct. Three of the four cutover capabilities
+remain (import resolution, ELF-formats, reason-8 constructs).
 
-1. **Extern linkage (reason 7 — 120/126 failures, the dominant blocker).**
+The `.ad` compiler (`codegen.ad` + `elf_emit.ad` + the fused driver) is a
+**closed-world, single-translation-unit subset compiler**. The remaining
+load-bearing capabilities are:
+
+1. **Extern linkage — DONE (was reason 7, the dominant blocker).**
    Real userland units declare `extern def sys_write(...)` etc.; the seed
    satisfies those by assembling + linking `user/runtime.S` (and, for the
    kernel, the boot stubs `arch/x86/boot/header.S`, `arch/x86/kernel/head_64.S`
-   under `arch/x86/kernel/kernel.lds`). `codegen.ad` has **no extern symbol
-   model** — every unresolved callee is `cg_fail(7)` — and `elf_emit.ad` has
-   **no link step**: it emits a single self-contained PT_LOAD with its own
-   `_start`, so it cannot incorporate `runtime.S`/boot-stub object code.
-   Closing this needs an extern symbol table + relocations AND a real
-   object-emission/link path (or an in-`.ad` assembler for `runtime.S`).
+   under `arch/x86/kernel/kernel.lds`). `codegen.ad` now carries an **in-`.ad`
+   runtime library**: `link_runtime_externs()` scans the unresolved call
+   fixups and, for every name that is a known `sys_*` runtime symbol
+   (`runtime_syscall_num` — a name→syscall-number table kept in lockstep with
+   `user/runtime.S`), synthesizes the SAME wrapper body
+   (`emit_runtime_wrapper`: `[mov %rbp,%r9 for rfork]; mov %rcx,%r10; mov
+   $N,%rax; syscall; ret`) as a real in-image function and defines its symbol,
+   so `resolve_calls()` patches the call against it exactly as `ld` would. No
+   external `ld` step: `elf_emit.ad` already emits all of `code[]` in its
+   self-contained PT_LOAD, so the wrappers ride along with zero ELF change.
+   This is the "resolve+link the known runtime symbols directly" option from
+   the runbook; it is behaviorally identical to the seed's ld-against-
+   runtime.S (NOT byte-identical — the seed routes through `as`/`ld`). The
+   kernel boot-stub link path (`head_64.S`, `kernel.lds`) is still a separate
+   capability under #3 (ELF output formats).
 
 2. **Import resolution + module-private mangling (the 83 multi-TU units +
    the entire kernel `init/main.ad`).** The seed's `collect_all_imports` +
@@ -327,15 +345,18 @@ fixpoint, and no more. Four distinct, load-bearing capabilities are missing:
    ELF (multiboot header + higher-half VMA/LMA split via `kernel.lds`) nor
    the `runtime.S`-linked userland ELF the seed ships.
 
-4. **A handful of constructs (reason 8 — 6/126).** `init`, `shuf`, `vi`,
-   `useradd`, `getty`, `umdf_host` use expression/statement forms
-   `codegen.ad` rejects (root-cause each against the failing node when the
-   linkage work lands; they are behind the reason-7 wall today).
+4. **A handful of constructs (reason 8 — 6/128, plus inline asm).** `init`,
+   `shuf`, `vi`, `useradd`, `getty`, `umdf_host` use expression/statement
+   forms `codegen.ad` rejects (root-cause each against the failing node).
+   Separately, `insmod`/`modprobe`/`rmmod` use inline `asm_volatile`, which
+   `codegen.ad` does not lower — it surfaces as an unresolved `asm_volatile`
+   call (reason 7). Both are NEXT-capability work.
 
 **Backends differ by construction**, so a byte-identical-ELF differential is
 not even theoretically possible: the seed routes through GNU `as` (AT&T asm),
 `codegen.ad` emits raw machine code directly. The sound equivalence metric
-stays **behavioral** (the fuzz dry-run) plus **acceptance** (the whole-tree
+stays **behavioral** (the fuzz dry-run + the extern-linkage syscall-number
+gate `test_selfhost_extern_link.sh`) plus **acceptance** (the whole-tree
 gate) — not byte diff.
 
 **Measured win (the reason to finish this track).** Per-compile wall-clock on
@@ -357,9 +378,12 @@ compiler is capable — and `ADDER_CC=python` is the permanent escape hatch.
 `scripts/test_selfhost_wholetree_diff.sh` guards the `.ad`-accepted baseline
 against regression and asserts the seed still compiles 100% of the tree.
 
-**NEXT track** (do NOT start before this lands): the four capabilities above —
-extern linkage is the keystone. The native-in-Adder optimizer (IR/LICM/CSE/
-regalloc) is a SEPARATE downstream track that only matters AFTER the cutover.
+**NEXT track**: capability #1 (extern linkage) has LANDED; the remaining
+capabilities are import resolution + module-private mangling (#2, the next
+keystone — unblocks the 83 multi-TU units + the kernel), ELF output formats
+(#3), and the reason-8/inline-asm constructs (#4). The native-in-Adder
+optimizer (IR/LICM/CSE/regalloc) is a SEPARATE downstream track that only
+matters AFTER the cutover.
 
 **Runbook — flipping the default build driver to the `.ad` binary** (NOT done
 yet — BLOCKED on the four capabilities above; the seed stays as the bootstrap

@@ -18,29 +18,34 @@
 #
 # IMPORTANT — current state (see docs/subsystems/adder-compiler.md
 # "Self-hosting cutover — WHOLE-TREE blocker"): the `.ad` compiler is a
-# CLOSED-WORLD, single-translation-unit, EXTERN-LESS subset compiler. It
-# has NO import resolution, NO module-private mangling, NO extern linkage,
-# and elf_emit.ad emits only a self-contained ELF (no runtime.S / boot-stub
-# link step). So today it can only compile the 2 trivial units that call
-# nothing extern (`true`, `false`). This script is therefore a TRACKING /
-# REGRESSION gate, not a pass/fail flip gate: it asserts the seed still
-# compiles 100% of the tree, and reports the `.ad` acceptance count + the
-# remaining blocker breakdown (reason 7 = unknown callee / no extern
-# linkage; reason 8 = unsupported construct). It must NOT regress the
-# `.ad`-accepted baseline.
+# CLOSED-WORLD, single-translation-unit subset compiler. Capability #1 of
+# the cutover (EXTERN LINKAGE) has LANDED: codegen.ad now synthesizes the
+# `sys_*` syscall-wrapper bodies user/runtime.S provides (link_runtime_
+# externs), so every single-TU unit whose only blocker was extern linkage
+# now compiles + behaves identically to the seed (proven by
+# test_selfhost_extern_link.sh). The `.ad` compiler still has NO import
+# resolution (multi-TU = a NEXT capability) and a handful of single-TU
+# units still hit unsupported constructs (reason 8) or inline `asm_volatile`
+# (surfaces as reason 7 — the unresolved `asm_volatile` "callee"). This
+# script is a TRACKING / REGRESSION gate: it asserts the seed still compiles
+# 100% of the tree, and reports the `.ad` acceptance count + the remaining
+# blocker breakdown (reason 7 = unknown callee / inline-asm; reason 8 =
+# unsupported construct). It must NOT regress the `.ad`-accepted baseline
+# (now 119/128 single-TU).
 #
 # Usage:  bash scripts/test_selfhost_wholetree_diff.sh
 #
 # Env:
-#   WT_BASELINE_AD_OK  expected minimum .ad-accepted units (default 2).
-#                      Raise this as codegen.ad/elf_emit.ad gain extern
-#                      linkage + import resolution + missing constructs.
+#   WT_BASELINE_AD_OK  expected minimum .ad-accepted units (default 119,
+#                      post extern-linkage). Raise this as codegen.ad/
+#                      elf_emit.ad gain import resolution + missing
+#                      constructs.
 
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-BASELINE_AD_OK="${WT_BASELINE_AD_OK:-2}"
+BASELINE_AD_OK="${WT_BASELINE_AD_OK:-119}"
 
 fail() { echo "[wholetree] FAIL $*"; exit 1; }
 
