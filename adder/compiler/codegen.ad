@@ -171,6 +171,8 @@ cg_entry_off: uint32 = 0
 #   7 = unresolved call (unknown callee) 8 = unknown name / type query
 #   9 = other / uncategorised           10 = disp8 frame overflow (a
 #       function's locals exceed the -128 disp8 reach)
+#   11 = unsupported inline asm (asm_volatile line/operand not in the
+#       bounded kernel instruction set this emitter assembles)
 cg_err_reason: uint32 = 0
 cg_err_node: uint32 = 0     # offending AST node id (for nd_line lookup)
 
@@ -467,6 +469,20 @@ MAX_BRK: uint32 = 64
 loop_brk_at: Array[2048, uint32]       # 32 * 64 rel32-field offsets
 loop_brk_n: Array[32, uint32]          # number of pending break fixups
 loop_depth: uint32 = 0
+
+# -----------------------------------------------------------------------
+# Inline-asm (asm_volatile) local-label table. A single asm_volatile block
+# may define `.Lxxx:` labels that its own jmp/jc/loop instructions target.
+# These are LOCAL to the block (resolved within it, never via globals). A
+# two-pass scheme records each label's byte offset (relative to the block's
+# starting code offset) in pass 1, then resolves rel8 jumps in pass 2.
+# Kernel asm blocks are tiny (rdrand/rdseed retry loops), so 32 labels and
+# 64 lines per block is ample.
+MAX_ASM_LABELS: uint32 = 32
+asm_lbl_off: Array[32, uint32]         # byte offset within the block
+asm_lbl_name_s: Array[32, uint32]      # strbuf start of the label name (incl ".L", excl ':')
+asm_lbl_name_e: Array[32, uint32]      # strbuf end (exclusive)
+asm_lbl_count: uint32 = 0
 
 # For-array hidden-index slots. A `for var in arr` loop needs a private
 # index counter; codegen_x86 names it `__for_idx_<n>` as a local. We reserve
@@ -3743,6 +3759,702 @@ def m_init_name(cls: uint32) -> uint32:
 
 
 # -----------------------------------------------------------------------
+# Inline-asm assembler: assemble the bounded set of x86_64 instructions the
+# kernel's asm_volatile("...") bodies use into the EXACT bytes GNU `as`
+# produces, emitting them into code[] at the current code_len and recording
+# RIP-relative data relocations for `sym(%rip)` operands via add_data_fixup.
+# The seed (codegen_x86.py, `elif name == "asm_volatile"`) emits each
+# stripped non-empty line as assembly text; this is the self-contained
+# byte-emitting equivalent.
+# -----------------------------------------------------------------------
+
+# Compare strbuf bytes [s,e) to the NUL-terminated literal `lit`.
+def asm_tok_eq(s: uint32, e: uint32, lit: Ptr[uint8]) -> int32:
+    i: uint32 = 0
+    while s + i < e:
+        c: uint32 = cast[uint32](lit[i])
+        if c == 0:
+            return 0                      # literal shorter than the token
+        if cast[uint32](strbuf[s + i]) != c:
+            return 0
+        i = i + 1
+    if cast[uint32](lit[i]) != 0:
+        return 0                          # literal longer than the token
+    return 1
+
+def asm_is_space(c: uint32) -> int32:
+    if c == 32:                           # ' '
+        return 1
+    if c == 9:                            # '\t'
+        return 1
+    if c == 13:                           # '\r'
+        return 1
+    return 0
+
+# Map a register name (strbuf [s,e), WITHOUT the leading '%') to a number
+# 0..15 (rax=0,rcx=1,rdx=2,rbx=3,rsp=4,rbp=5,rsi=6,rdi=7,r8..r15=8..15).
+# Returns the number, or 999 if unrecognised.
+def asm_reg_num(s: uint32, e: uint32) -> uint32:
+    if asm_tok_eq(s, e, "rax") != 0:
+        return 0
+    if asm_tok_eq(s, e, "rcx") != 0:
+        return 1
+    if asm_tok_eq(s, e, "rdx") != 0:
+        return 2
+    if asm_tok_eq(s, e, "rbx") != 0:
+        return 3
+    if asm_tok_eq(s, e, "rsp") != 0:
+        return 4
+    if asm_tok_eq(s, e, "rbp") != 0:
+        return 5
+    if asm_tok_eq(s, e, "rsi") != 0:
+        return 6
+    if asm_tok_eq(s, e, "rdi") != 0:
+        return 7
+    if asm_tok_eq(s, e, "r8") != 0:
+        return 8
+    if asm_tok_eq(s, e, "r9") != 0:
+        return 9
+    if asm_tok_eq(s, e, "r10") != 0:
+        return 10
+    if asm_tok_eq(s, e, "r11") != 0:
+        return 11
+    if asm_tok_eq(s, e, "r12") != 0:
+        return 12
+    if asm_tok_eq(s, e, "r13") != 0:
+        return 13
+    if asm_tok_eq(s, e, "r14") != 0:
+        return 14
+    if asm_tok_eq(s, e, "r15") != 0:
+        return 15
+    return 999
+
+# Skip leading whitespace in [s,e); return the new start.
+def asm_skip_ws(s: uint32, e: uint32) -> uint32:
+    p: uint32 = s
+    while p < e and asm_is_space(cast[uint32](strbuf[p])) != 0:
+        p = p + 1
+    return p
+
+# End of the first whitespace-delimited token starting at s (within [s,e)).
+def asm_tok_end(s: uint32, e: uint32) -> uint32:
+    p: uint32 = s
+    while p < e and asm_is_space(cast[uint32](strbuf[p])) == 0:
+        p = p + 1
+    return p
+
+# Parse a non-negative decimal integer from strbuf [s,e) (whole span).
+def asm_parse_dec(s: uint32, e: uint32) -> uint64:
+    v: uint64 = 0
+    p: uint32 = s
+    while p < e:
+        c: uint32 = cast[uint32](strbuf[p])
+        if c < 48 or c > 57:
+            return v
+        v = v * 10 + cast[uint64](c - 48)
+        p = p + 1
+    return v
+
+# Look up a local asm label by name [s,e); returns its block-relative byte
+# offset, or 0xFFFFFFFF if not found.
+def asm_lbl_lookup(s: uint32, e: uint32) -> uint32:
+    i: uint32 = 0
+    while i < asm_lbl_count:
+        ls: uint32 = asm_lbl_name_s[i]
+        le: uint32 = asm_lbl_name_e[i]
+        if le - ls == e - s:
+            if asm_span_eq(ls, le, s, e) != 0:
+                return asm_lbl_off[i]
+        i = i + 1
+    return 4294967295
+
+# Byte-equality of two strbuf spans of equal length.
+def asm_span_eq(as_: uint32, ae: uint32, bs: uint32, be: uint32) -> int32:
+    if ae - as_ != be - bs:
+        return 0
+    i: uint32 = 0
+    while as_ + i < ae:
+        if strbuf[as_ + i] != strbuf[bs + i]:
+            return 0
+        i = i + 1
+    return 1
+
+# A RIP memory operand parse result lives in these module globals (one
+# operand in flight at a time during single-threaded codegen).
+asm_rip_data_off: uint32 = 0
+asm_rip_is_bss: uint32 = 0
+asm_rip_ok: int32 = 0
+
+# Parse a `SYM(%rip)` or `SYM+DISP(%rip)` operand occupying strbuf [s,e).
+# On success sets asm_rip_data_off / asm_rip_is_bss / asm_rip_ok=1.
+# data_off = glob_offset(SYM) + DISP. cg_fail(11) on an unknown global.
+def asm_parse_rip(s: uint32, e: uint32):
+    asm_rip_ok = 0
+    # SYM = identifier chars up to '+' or '('.
+    p: uint32 = s
+    while p < e:
+        c: uint32 = cast[uint32](strbuf[p])
+        if c == 43 or c == 40:            # '+' or '('
+            break
+        p = p + 1
+    sym_s: uint32 = s
+    sym_e: uint32 = p
+    disp: uint64 = 0
+    if p < e and cast[uint32](strbuf[p]) == 43:    # '+DISP'
+        p = p + 1
+        d_s: uint32 = p
+        while p < e and cast[uint32](strbuf[p]) >= 48 and cast[uint32](strbuf[p]) <= 57:
+            p = p + 1
+        disp = asm_parse_dec(d_s, p)
+    # Expect "(%rip)".
+    if p >= e or cast[uint32](strbuf[p]) != 40:    # '('
+        return
+    gi: uint32 = glob_lookup(sym_s, sym_e - sym_s)
+    if gi == 0:
+        return
+    asm_rip_data_off = glob_offset[gi - 1] + cast[uint32](disp)
+    asm_rip_is_bss = glob_is_bss[gi - 1]
+    asm_rip_ok = 1
+
+# Fixed byte size of the instruction on stripped line [s,e). Mirrors
+# asm_emit_line exactly so the two-pass label offsets stay consistent.
+# Returns 0xFFFFFFFF on an unsupported line (the emit pass then cg_fails).
+def asm_line_size(s: uint32, e: uint32) -> uint32:
+    # Label definition `.Lxxx:` -> zero bytes.
+    if e - s >= 2 and strbuf[s] == 46 and cast[uint32](strbuf[e - 1]) == 58:
+        return 0
+    ms: uint32 = s
+    me: uint32 = asm_tok_end(s, e)
+    # Zero-operand / fixed-size mnemonics.
+    if asm_tok_eq(ms, me, "cli") != 0:
+        return 1
+    if asm_tok_eq(ms, me, "sti") != 0:
+        return 1
+    if asm_tok_eq(ms, me, "hlt") != 0:
+        return 1
+    if asm_tok_eq(ms, me, "int3") != 0:
+        return 1
+    if asm_tok_eq(ms, me, "pushfq") != 0:
+        return 1
+    if asm_tok_eq(ms, me, "pause") != 0:
+        return 2
+    if asm_tok_eq(ms, me, "mfence") != 0:
+        return 3
+    if asm_tok_eq(ms, me, "cpuid") != 0:
+        return 2
+    if asm_tok_eq(ms, me, "syscall") != 0:
+        return 2
+    if asm_tok_eq(ms, me, "rdrand") != 0:
+        return 4
+    if asm_tok_eq(ms, me, "rdseed") != 0:
+        return 4
+    if asm_tok_eq(ms, me, "pushq") != 0:
+        return asm_pushpop_size(ms, me, s, e)
+    if asm_tok_eq(ms, me, "popq") != 0:
+        return asm_pushpop_size(ms, me, s, e)
+    if asm_tok_eq(ms, me, "jmpq") != 0:
+        return asm_indirect_size(s, e)        # FF /4 (+REX.B)
+    if asm_tok_eq(ms, me, "call") != 0:
+        return asm_indirect_size(s, e)        # FF /2 (+REX.B)
+    if asm_tok_eq(ms, me, "jmp") != 0:
+        return 2                              # short rel8
+    if asm_tok_eq(ms, me, "jc") != 0:
+        return 2
+    if asm_tok_eq(ms, me, "loop") != 0:
+        return 2
+    if asm_tok_eq(ms, me, "lidt") != 0:
+        return 7                              # 0F 01 /3 + disp32
+    if asm_tok_eq(ms, me, "mulq") != 0:
+        return 7                              # 48 F7 /4 + disp32
+    if asm_tok_eq(ms, me, "lock") != 0:
+        return 3                              # lock incl (%rdi) -> F0 FF 07
+    if asm_tok_eq(ms, me, "movl") != 0:
+        return 8                              # movl %gs:sym+disp, %eax (32S)
+    if asm_tok_eq(ms, me, "movq") != 0:
+        return asm_movq_size(s, e)
+    return 4294967295
+
+# Size of a pushq/popq line: register form = 1 (or 2 with REX.B); the only
+# memory form used is `popq sym(%rip)` = 8F 05 + disp32 = 6 bytes.
+def asm_pushpop_size(ms: uint32, me: uint32, s: uint32, e: uint32) -> uint32:
+    o: uint32 = asm_skip_ws(me, e)
+    if o < e and cast[uint32](strbuf[o]) == 37:        # '%' register
+        rn: uint32 = asm_reg_num(o + 1, asm_tok_end(o, e))
+        if rn >= 8:
+            return 2
+        return 1
+    return 6                                            # popq sym(%rip)
+
+# Size of an indirect jmpq/call `*%reg`: 2 bytes, +1 REX.B for r8..r15.
+def asm_indirect_size(s: uint32, e: uint32) -> uint32:
+    o: uint32 = asm_skip_ws(asm_tok_end(s, e), e)
+    if o < e and cast[uint32](strbuf[o]) == 42:        # '*'
+        o = o + 1
+    if o < e and cast[uint32](strbuf[o]) == 37:        # '%'
+        rn: uint32 = asm_reg_num(o + 1, asm_tok_end(o, e))
+        if rn >= 8 and rn != 999:
+            return 3
+        return 2
+    return 4294967295
+
+# Size of a movq line by operand shape.
+def asm_movq_size(s: uint32, e: uint32) -> uint32:
+    o: uint32 = asm_skip_ws(asm_tok_end(s, e), e)
+    if o >= e:
+        return 4294967295
+    c0: uint32 = cast[uint32](strbuf[o])
+    if c0 == 36:                                        # '$imm, dst'
+        # movq $imm,%reg = 48 C7 /0 + imm32 = 7 bytes;
+        # movq $imm,sym(%rip) = 48 C7 05 + disp32 + imm32 = 11 bytes.
+        cp: uint32 = asm_find_comma(o, e)
+        d: uint32 = asm_skip_ws(cp + 1, e)
+        if d < e and cast[uint32](strbuf[d]) == 37:
+            return 7
+        return 11
+    if c0 == 37:                                        # '%gs:' or '%reg, ...'
+        # '%gs:sym, %rax' -> 65 48 8B 04 25 + disp32(32S) = 9 bytes.
+        if asm_is_gs(o, e) != 0:
+            return 9
+        # 'movq %reg, dst' : reg->reg = 3; reg->sym(%rip) = 7.
+        cp2: uint32 = asm_find_comma(o, e)
+        d2: uint32 = asm_skip_ws(cp2 + 1, e)
+        if d2 < e and cast[uint32](strbuf[d2]) == 37:
+            return 3
+        return 7
+    # 'movq sym(%rip), %reg' load -> 48 8B /r + disp32 = 7 bytes.
+    # 'movq DISP(%rbp), %reg'   -> 48 8B 4xreg + disp8 = 4 bytes.
+    if asm_is_dispbp(o, e) != 0:
+        return 4
+    return 7
+
+# True if operand at o is the %gs:... segment form.
+def asm_is_gs(o: uint32, e: uint32) -> int32:
+    if o + 3 < e and strbuf[o] == 37 and strbuf[o + 1] == 103 and strbuf[o + 2] == 115 and strbuf[o + 3] == 58:
+        return 1                                        # "%gs:"
+    return 0
+
+# True if operand at o is a DISP(%rbp) memory form (starts with '-' or digit
+# then '(').
+def asm_is_dispbp(o: uint32, e: uint32) -> int32:
+    c: uint32 = cast[uint32](strbuf[o])
+    if c == 45 or (c >= 48 and c <= 57):                # '-' or digit
+        p: uint32 = o
+        while p < e and cast[uint32](strbuf[p]) != 40:  # up to '('
+            p = p + 1
+        if p < e and p + 1 < e and strbuf[p + 1] == 37:
+            return 1
+    return 0
+
+# Offset of the first ',' in [o,e); returns e if none.
+def asm_find_comma(o: uint32, e: uint32) -> uint32:
+    p: uint32 = o
+    while p < e:
+        if cast[uint32](strbuf[p]) == 44:
+            return p
+        p = p + 1
+    return e
+
+# Emit a rel8 branch (opcode `op`) targeting local label name [ls,le). The
+# next instruction starts at code_len+2 (1 opcode + 1 rel8). rel8 = target -
+# (here + 2). cg_fail(11) if the label is unknown or the displacement
+# overflows a signed byte. block_start = code offset of the block's first
+# byte (label offsets are block-relative).
+def asm_emit_rel8(op: uint32, ls: uint32, le: uint32, block_start: uint32):
+    rel_off: uint32 = asm_lbl_lookup(ls, le)
+    if rel_off == 4294967295:
+        cg_fail(11, 0)
+        return
+    target: int32 = cast[int32](block_start + rel_off)
+    here_end: int32 = cast[int32](code_len + 2)
+    d: int32 = target - here_end
+    if d < cast[int32](0) - cast[int32](128) or d > 127:
+        cg_fail(11, 0)
+        return
+    emit_b(op)
+    emit_b(cast[uint32](cast[uint8](cast[int32](d & 255))))
+
+# Emit a `sym(%rip)`-style RIP-relative instruction tail: the disp32 field
+# starts at the CURRENT code_len; record a data fixup so it resolves to
+# (DATA_BASE + data_off) - (disp_field + 4). For the imm-to-mem movq form
+# (imm32 trails the disp32), pass data_off already adjusted by -4.
+def asm_emit_rip_disp32(data_off: uint32, is_bss: uint32):
+    at: uint32 = code_len
+    emit_imm32(cast[uint64](0))
+    add_data_fixup(at, data_off, is_bss)
+
+# Emit one assembled instruction for stripped line [s,e). block_start lets
+# rel8 jumps resolve against the block-relative label table.
+def asm_emit_line(s: uint32, e: uint32, block_start: uint32):
+    # Label definitions emit nothing.
+    if e - s >= 2 and strbuf[s] == 46 and cast[uint32](strbuf[e - 1]) == 58:
+        return
+    ms: uint32 = s
+    me: uint32 = asm_tok_end(s, e)
+    # --- zero-operand / fixed encodings ---
+    if asm_tok_eq(ms, me, "cli") != 0:
+        emit_b(0xFA)
+        return
+    if asm_tok_eq(ms, me, "sti") != 0:
+        emit_b(0xFB)
+        return
+    if asm_tok_eq(ms, me, "hlt") != 0:
+        emit_b(0xF4)
+        return
+    if asm_tok_eq(ms, me, "int3") != 0:
+        emit_b(0xCC)
+        return
+    if asm_tok_eq(ms, me, "pushfq") != 0:
+        emit_b(0x9C)
+        return
+    if asm_tok_eq(ms, me, "pause") != 0:
+        emit_b(0xF3)
+        emit_b(0x90)
+        return
+    if asm_tok_eq(ms, me, "mfence") != 0:
+        emit_b(0x0F)
+        emit_b(0xAE)
+        emit_b(0xF0)
+        return
+    if asm_tok_eq(ms, me, "cpuid") != 0:
+        emit_b(0x0F)
+        emit_b(0xA2)
+        return
+    if asm_tok_eq(ms, me, "syscall") != 0:
+        emit_b(0x0F)
+        emit_b(0x05)
+        return
+    if asm_tok_eq(ms, me, "rdrand") != 0:
+        # rdrand %rax -> 48 0F C7 F0 (/6, modrm 0xF0 = C0|6<<3 for rax)
+        emit_b(0x48)
+        emit_b(0x0F)
+        emit_b(0xC7)
+        emit_b(0xF0)
+        return
+    if asm_tok_eq(ms, me, "rdseed") != 0:
+        # rdseed %rax -> 48 0F C7 F8 (/7)
+        emit_b(0x48)
+        emit_b(0x0F)
+        emit_b(0xC7)
+        emit_b(0xF8)
+        return
+    # --- branches with local labels ---
+    if asm_tok_eq(ms, me, "jmp") != 0:
+        o: uint32 = asm_skip_ws(me, e)
+        asm_emit_rel8(0xEB, o, asm_tok_end(o, e), block_start)
+        return
+    if asm_tok_eq(ms, me, "jc") != 0:
+        o2: uint32 = asm_skip_ws(me, e)
+        asm_emit_rel8(0x72, o2, asm_tok_end(o2, e), block_start)
+        return
+    if asm_tok_eq(ms, me, "loop") != 0:
+        o3: uint32 = asm_skip_ws(me, e)
+        asm_emit_rel8(0xE2, o3, asm_tok_end(o3, e), block_start)
+        return
+    # --- indirect jmpq/call *%reg ---
+    if asm_tok_eq(ms, me, "jmpq") != 0:
+        asm_emit_indirect(s, e, 4)         # /4
+        return
+    if asm_tok_eq(ms, me, "call") != 0:
+        asm_emit_indirect(s, e, 2)         # /2
+        return
+    # --- pushq/popq ---
+    if asm_tok_eq(ms, me, "pushq") != 0:
+        asm_emit_pushpop(s, e, me, 1)
+        return
+    if asm_tok_eq(ms, me, "popq") != 0:
+        asm_emit_pushpop(s, e, me, 0)
+        return
+    # --- lidt sym(%rip) -> 0F 01 1D disp32 ---
+    if asm_tok_eq(ms, me, "lidt") != 0:
+        op: uint32 = asm_skip_ws(me, e)
+        asm_parse_rip(op, e)
+        if asm_rip_ok == 0:
+            cg_fail(11, 0)
+            return
+        emit_b(0x0F)
+        emit_b(0x01)
+        emit_b(0x1D)
+        asm_emit_rip_disp32(asm_rip_data_off, asm_rip_is_bss)
+        return
+    # --- mulq sym(%rip) -> 48 F7 25 disp32 ---
+    if asm_tok_eq(ms, me, "mulq") != 0:
+        op2: uint32 = asm_skip_ws(me, e)
+        asm_parse_rip(op2, e)
+        if asm_rip_ok == 0:
+            cg_fail(11, 0)
+            return
+        emit_b(0x48)
+        emit_b(0xF7)
+        emit_b(0x25)
+        asm_emit_rip_disp32(asm_rip_data_off, asm_rip_is_bss)
+        return
+    # --- lock incl (%rdi) -> F0 FF 07 ---
+    if asm_tok_eq(ms, me, "lock") != 0:
+        emit_b(0xF0)
+        emit_b(0xFF)
+        emit_b(0x07)
+        return
+    # --- movl %gs:sym+disp, %eax -> 65 8B 04 25 disp32(R_X86_64_32S) ---
+    if asm_tok_eq(ms, me, "movl") != 0:
+        asm_emit_movl_gs(s, e, me)
+        return
+    if asm_tok_eq(ms, me, "movq") != 0:
+        asm_emit_movq(s, e, me)
+        return
+    cg_fail(11, 0)
+
+# Emit jmpq/call `*%reg`. ext = 4 (jmpq /4) or 2 (call /2). FF (modrm
+# = 0xC0 | (ext<<3) | (reg&7)); r8..r15 get a REX.B (0x41) prefix.
+def asm_emit_indirect(s: uint32, e: uint32, ext: uint32):
+    o: uint32 = asm_skip_ws(asm_tok_end(s, e), e)
+    if o < e and cast[uint32](strbuf[o]) == 42:        # '*'
+        o = o + 1
+    if o >= e or cast[uint32](strbuf[o]) != 37:        # '%'
+        cg_fail(11, 0)
+        return
+    rn: uint32 = asm_reg_num(o + 1, asm_tok_end(o, e))
+    if rn == 999:
+        cg_fail(11, 0)
+        return
+    if rn >= 8:
+        emit_b(0x41)
+    emit_b(0xFF)
+    emit_b(0xC0 + (ext << 3) + (rn & 7))
+
+# Emit pushq/popq. push reg = 0x50+rn (push); pop reg = 0x58+rn. r8..r15
+# add REX.B (0x41). The only memory form used is `popq sym(%rip)` = 8F 05
+# disp32 (no REX).
+def asm_emit_pushpop(s: uint32, e: uint32, me: uint32, is_push: uint32):
+    o: uint32 = asm_skip_ws(me, e)
+    if o < e and cast[uint32](strbuf[o]) == 37:        # '%reg'
+        rn: uint32 = asm_reg_num(o + 1, asm_tok_end(o, e))
+        if rn == 999:
+            cg_fail(11, 0)
+            return
+        if rn >= 8:
+            emit_b(0x41)
+        base: uint32 = 0x58                            # pop
+        if is_push != 0:
+            base = 0x50
+        emit_b(base + (rn & 7))
+        return
+    # popq sym(%rip)
+    if is_push != 0:
+        cg_fail(11, 0)                                 # pushq mem unsupported
+        return
+    asm_parse_rip(o, e)
+    if asm_rip_ok == 0:
+        cg_fail(11, 0)
+        return
+    emit_b(0x8F)
+    emit_b(0x05)
+    asm_emit_rip_disp32(asm_rip_data_off, asm_rip_is_bss)
+
+# movl %gs:sym[+disp], %eax  ->  65 8B 04 25 <disp32 R_X86_64_32S>.
+# This uses an ABSOLUTE 32-bit-signed reloc, not RIP-relative. The native
+# fixup table only carries PC32 relocs, so an absolute %gs form can't be
+# resolved here; the kernel's %gs asm lives in standalone modules (not the
+# init/main.ad whole-program build), so flag it as unsupported with a clear
+# reason rather than emitting wrong bytes.
+def asm_emit_movl_gs(s: uint32, e: uint32, me: uint32):
+    cg_fail(11, 0)
+
+# movq forms.
+def asm_emit_movq(s: uint32, e: uint32, me: uint32):
+    o: uint32 = asm_skip_ws(me, e)
+    if o >= e:
+        cg_fail(11, 0)
+        return
+    c0: uint32 = cast[uint32](strbuf[o])
+    if c0 == 36:                                       # movq $imm, dst
+        asm_emit_movq_imm(o, e)
+        return
+    if c0 == 37:                                       # movq %src, dst  (or %gs:)
+        if asm_is_gs(o, e) != 0:
+            cg_fail(11, 0)                             # absolute %gs reloc
+            return
+        asm_emit_movq_reg_src(o, e)
+        return
+    # movq mem, %reg  (sym(%rip) load, or DISP(%rbp) load)
+    asm_emit_movq_mem_load(o, e)
+
+# movq $imm, %reg  -> 48 C7 /0 (modrm C0|reg) imm32
+# movq $imm, sym(%rip) -> 48 C7 05 disp32 imm32  (disp uses data_off-4 so
+# the PC32 addend lands relative to instruction END, past the imm32).
+def asm_emit_movq_imm(o: uint32, e: uint32):
+    cp: uint32 = asm_find_comma(o, e)
+    imm_s: uint32 = o + 1                              # skip '$'
+    imm: uint64 = asm_parse_dec(imm_s, cp)
+    d: uint32 = asm_skip_ws(cp + 1, e)
+    if d < e and cast[uint32](strbuf[d]) == 37:        # %reg dest
+        rn: uint32 = asm_reg_num(d + 1, asm_tok_end(d, e))
+        if rn == 999 or rn >= 8:
+            cg_fail(11, 0)                             # only low regs used
+            return
+        emit_b(0x48)
+        emit_b(0xC7)
+        emit_b(0xC0 + (rn & 7))
+        emit_imm32(imm)
+        return
+    # sym(%rip) dest
+    asm_parse_rip(d, e)
+    if asm_rip_ok == 0:
+        cg_fail(11, 0)
+        return
+    emit_b(0x48)
+    emit_b(0xC7)
+    emit_b(0x05)
+    asm_emit_rip_disp32(asm_rip_data_off - 4, asm_rip_is_bss)
+    emit_imm32(imm)
+
+# movq %src, dst : src->reg (89/r) or src->sym(%rip) store.
+def asm_emit_movq_reg_src(o: uint32, e: uint32):
+    src_e: uint32 = asm_find_comma(o, e)
+    rn: uint32 = asm_reg_num(o + 1, src_e)
+    if rn == 999:
+        cg_fail(11, 0)
+        return
+    d: uint32 = asm_skip_ws(src_e + 1, e)
+    if d < e and cast[uint32](strbuf[d]) == 37:        # %dst reg-to-reg
+        dn: uint32 = asm_reg_num(d + 1, asm_tok_end(d, e))
+        if dn == 999:
+            cg_fail(11, 0)
+            return
+        # REX.W + REX.R(if src r8+) + REX.B(if dst r8+); opcode 89;
+        # modrm = 0xC0 | ((src&7)<<3) | (dst&7).
+        rex: uint32 = 0x48
+        if rn >= 8:
+            rex = rex + 0x04
+        if dn >= 8:
+            rex = rex + 0x01
+        emit_b(rex)
+        emit_b(0x89)
+        emit_b(0xC0 + ((rn & 7) << 3) + (dn & 7))
+        return
+    # store to sym(%rip): REX.W [REX.R] 89 modrm(05|reg<<3) disp32.
+    asm_parse_rip(d, e)
+    if asm_rip_ok == 0:
+        cg_fail(11, 0)
+        return
+    rex2: uint32 = 0x48
+    if rn >= 8:
+        rex2 = rex2 + 0x04
+    emit_b(rex2)
+    emit_b(0x89)
+    emit_b(0x05 + ((rn & 7) << 3))
+    asm_emit_rip_disp32(asm_rip_data_off, asm_rip_is_bss)
+
+# movq mem, %reg : sym(%rip) load (48 8B /r disp32) or DISP(%rbp) load
+# (48 8B modrm(reg<<3|5) disp8).
+def asm_emit_movq_mem_load(o: uint32, e: uint32):
+    cp: uint32 = asm_find_comma(o, e)
+    d: uint32 = asm_skip_ws(cp + 1, e)
+    if d >= e or cast[uint32](strbuf[d]) != 37:
+        cg_fail(11, 0)
+        return
+    dn: uint32 = asm_reg_num(d + 1, asm_tok_end(d, e))
+    if dn == 999:
+        cg_fail(11, 0)
+        return
+    if asm_is_dispbp(o, e) != 0:
+        # DISP(%rbp): DISP is signed decimal, possibly negative.
+        neg: int32 = 0
+        ds: uint32 = o
+        if cast[uint32](strbuf[ds]) == 45:             # '-'
+            neg = 1
+            ds = ds + 1
+        de: uint32 = ds
+        while de < e and cast[uint32](strbuf[de]) >= 48 and cast[uint32](strbuf[de]) <= 57:
+            de = de + 1
+        dv: int32 = cast[int32](asm_parse_dec(ds, de))
+        if neg != 0:
+            dv = cast[int32](0) - dv
+        if dv < cast[int32](0) - cast[int32](128) or dv > 127:
+            cg_fail(11, 0)                             # only disp8 used
+            return
+        rex: uint32 = 0x48
+        if dn >= 8:
+            rex = rex + 0x04
+        emit_b(rex)
+        emit_b(0x8B)
+        emit_b(0x45 + ((dn & 7) << 3))                 # mod=01 rm=101(rbp)
+        emit_b(cast[uint32](cast[uint8](cast[int32](dv & 255))))
+        return
+    # sym(%rip) load.
+    asm_parse_rip(o, e)
+    if asm_rip_ok == 0:
+        cg_fail(11, 0)
+        return
+    rex2: uint32 = 0x48
+    if dn >= 8:
+        rex2 = rex2 + 0x04
+    emit_b(rex2)
+    emit_b(0x8B)
+    emit_b(0x05 + ((dn & 7) << 3))
+    asm_emit_rip_disp32(asm_rip_data_off, asm_rip_is_bss)
+
+# Lower asm_volatile(<string-literal arg>). Two passes over the literal's
+# lines: pass 1 records each `.Lxxx:` label's block-relative byte offset
+# (via deterministic per-line sizes); pass 2 emits the bytes, resolving
+# rel8 branches against the label table.
+def gen_asm_volatile(arg: uint32):
+    txt_s: uint32 = nd_name_off[arg]
+    txt_len: uint32 = nd_name_len[arg]
+    txt_e: uint32 = txt_s + txt_len
+    block_start: uint32 = code_len
+    asm_lbl_count = 0
+    # Pass 1: label offsets + size validation.
+    rel: uint32 = 0
+    ls: uint32 = txt_s
+    while ls <= txt_e:
+        le: uint32 = ls
+        while le < txt_e and cast[uint32](strbuf[le]) != 10:
+            le = le + 1
+        # Strip leading/trailing whitespace.
+        a: uint32 = asm_skip_ws(ls, le)
+        b: uint32 = le
+        while b > a and asm_is_space(cast[uint32](strbuf[b - 1])) != 0:
+            b = b - 1
+        if b > a:
+            if b - a >= 2 and strbuf[a] == 46 and cast[uint32](strbuf[b - 1]) == 58:
+                # Label def `.Lxxx:` — record name (excl trailing ':').
+                if asm_lbl_count >= MAX_ASM_LABELS:
+                    cg_fail(11, 0)
+                    return
+                asm_lbl_name_s[asm_lbl_count] = a
+                asm_lbl_name_e[asm_lbl_count] = b - 1
+                asm_lbl_off[asm_lbl_count] = rel
+                asm_lbl_count = asm_lbl_count + 1
+            else:
+                sz: uint32 = asm_line_size(a, b)
+                if sz == 4294967295:
+                    cg_fail(11, 0)
+                    return
+                rel = rel + sz
+        if le >= txt_e:
+            ls = txt_e + 1                             # past end -> stop
+        else:
+            ls = le + 1
+    # Pass 2: emit.
+    ls = txt_s
+    while ls <= txt_e:
+        le2: uint32 = ls
+        while le2 < txt_e and cast[uint32](strbuf[le2]) != 10:
+            le2 = le2 + 1
+        a2: uint32 = asm_skip_ws(ls, le2)
+        b2: uint32 = le2
+        while b2 > a2 and asm_is_space(cast[uint32](strbuf[b2 - 1])) != 0:
+            b2 = b2 - 1
+        if b2 > a2:
+            asm_emit_line(a2, b2, block_start)
+            if cg_err != 0:
+                return
+        if le2 >= txt_e:
+            ls = txt_e + 1
+        else:
+            ls = le2 + 1
+
+# -----------------------------------------------------------------------
 # Call codegen — direct call to a named function. Mirrors codegen_x86's
 # gen_call register-arg path (args 0..5 only): evaluate each argument into
 # %rax and push it, then pop them in reverse so arg 0 lands in %rdi, clear
@@ -3785,6 +4497,23 @@ def gen_call(node: uint32):
             si = si - 1
             emit_pop_syscallreg(si)
         emit_syscall_insn()
+        return
+
+    # --- inline asm path -------------------------------------------------
+    # `asm_volatile("...instructions...")` lowers to verbatim machine bytes
+    # for the bounded instruction set the kernel uses. The seed
+    # (codegen_x86.py) intercepts the call by NAME and emits each stripped
+    # line as assembly text for GNU `as`; this self-contained emitter must
+    # reproduce the exact bytes `as` produces.
+    if name_eq_cstr(nd_name_off[callee], nd_name_len[callee], "asm_volatile") != 0:
+        if argc != 1:
+            cg_fail(8, node)
+            return
+        asm_arg: uint32 = nd_b[node]
+        if nd_kind[asm_arg] != ND_STRING_LIT:
+            cg_fail(8, node)
+            return
+        gen_asm_volatile(asm_arg)
         return
 
     # Evaluate-and-push each argument, lowest index first.
