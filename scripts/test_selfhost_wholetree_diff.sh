@@ -51,7 +51,12 @@ cd "$PROJ_ROOT"
 # Post CAP#2 (import resolution): 119 single-TU + 10 multi-TU = 129 accepted.
 # Post CAP#4 cast[Ptr[T]](expr)[i] indexed load/store: +2 multi-TU = 131.
 # Post CAP#4b inline asm_volatile(...) lowering: +3 = 134.
-BASELINE_AD_OK="${WT_BASELINE_AD_OK:-134}"
+# Post CAP#3b (kernel-target codegen lifts that ALSO help userland: SysV >6-arg
+# calls, indirect calls through fn-ptr locals/globals, port-I/O + atomic
+# intrinsics, container_of/sizeof, nested member access, indexed
+# struct-array/Ptr member base, multi-dimensional array LOCALS,
+# uint64-as-pointer scalar index base): 194 accepted (69 multi-TU).
+BASELINE_AD_OK="${WT_BASELINE_AD_OK:-194}"
 
 fail() { echo "[wholetree] FAIL $*"; exit 1; }
 

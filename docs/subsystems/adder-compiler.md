@@ -438,7 +438,74 @@ load-bearing capabilities are:
    gap). The seed still parses the full merged TU (13,691 decls); host_ac now
    lexes+parses through to **codegen**.
 
-   **ELF format — SEAM landed, kernel emitter BLOCKED behind CAP#4.**
+   **ELF format — CAP#3b LANDED (2026-06-22): the native `.ad` compiler emits a
+   kernel object that `ld -T kernel.lds` links into a bootable kernel ELF.**
+   `host_ac.elf --target=x86_64-bare-metal init/main.ad <main.o>` now CODEGENS
+   the whole 326 K-line kernel closure to a **relocatable ELF64 object**
+   (`elf_emit_image_kernel`), and `scripts/_adder_cc.sh`'s `adder_cc_link_kernel`
+   assembles header.S/head_64.S + every extra `.S` and `ld`-links them WITH that
+   `.o` under `arch/x86/kernel/kernel.lds` — a byte-for-byte mirror of the seed's
+   `assemble_and_link_x86_bare` (flags `-m elf_x86_64 -nostdlib -static -z
+   noexecstack -z max-page-size=4096`, order `header.o head_64.o main.o
+   extras…`). `ld` resolves EVERY symbol; the output is a complete higher-half
+   `elf64-x86-64` ET_EXEC kernel. Pieces:
+
+   * **`&extern` / `call extern` relocations** (codegen.ad, gated on
+     `cg_target_kernel`). `gen_addr_of(ND_IDENT)` of an extern / in-unit-function
+     emits `leaq sym(%rip),%rax` + an R_X86_64_PC32 EXTERN reloc; an unresolved
+     call records an R_X86_64_PLT32 reloc instead of `cg_fail(7)`. A bare
+     function-name used as a value (`tab[i] = _fn`) decays to `leaq sym(%rip)`.
+     Intra-object data refs (`resolve_data_fixups`) become section-relative
+     R_X86_64_PC32 relocs vs the `.data`/`.bss` section symbol (addend
+     `off-4`) instead of baked absolute DATA_BASE disp32s, so `ld` patches them
+     at the kernel.lds VMA.
+   * **ET_REL emitter** (`elf_emit_image_kernel`, `eb64`/`patch64`). Writes an
+     ELF64 ET_REL object: sections `.text`(code[]) / `.data`(gdata[]) /
+     `.bss`(NOBITS) / `.data..percpu`(template) / `.symtab` / `.strtab` /
+     `.shstrtab` / `.rela.text`. Symtab: STN_UNDEF; `.text`/`.data`/`.bss`/
+     `.data..percpu` section syms; module-private (leading-`_`) functions as
+     **STB_LOCAL** STT_FUNC (so same-named `_align_up`/`_read_u32_le`/… across
+     modules don't collide at `ld`); public functions STB_GLOBAL STT_FUNC (so
+     head_64.S's `call start_kernel` resolves); STB_GLOBAL UNDEF per referenced
+     extern. `.rela.text`: one RELA per data fixup + per extern reloc.
+   * **Percpu** (codegen.ad + elf_emit). `Percpu[T]` globals lay out into a real
+     `.data..percpu` template (`cpu_id_pcpu` PINNED to offset 0 — the #402 ABI
+     the hand-written `%gs:0` reads depend on), accessed `%gs:offset`
+     (`movq %gs:off,%rax` / `movq %rax,%gs:off`), with
+     `__per_cpu_template_start`/`_end` + each percpu global exported as
+     STB_GLOBAL OBJECT in `.data..percpu` — satisfying setup_percpu_asm.S.
+   * **Codegen construct lifts the kernel needed** (these ALSO raised the
+     userland whole-tree acceptance from 134 → **194**): SysV **>6-argument
+     calls** (stack args 6+ in a 16-aligned block); **indirect calls** through a
+     function-pointer LOCAL or a `Fn[…]`-typed GLOBAL (`*_hook`/`*_fn`) →
+     `call *%r11`; **port-I/O + atomic intrinsics** (`inb`/`outb`/`inw`/`outw`/
+     `inl`/`outl`, `atomic_cas32/64`, `atomic_add32/64`) lowered inline;
+     `container_of(ptr,Type,field)` + `sizeof(T)` (parsed ND_CONTAINER_OF /
+     ND_SIZEOF, lowered to a field-offset subtract / compile-time fold); nested
+     member access `a.b.c`; indexed struct-array/Ptr member base `a.f[i].g`;
+     index over a Ptr[Struct]-returning call/cast `fn(...)[i].g`;
+     multi-dimensional array **LOCALS** (`loc_type_node`); uint64-as-pointer
+     scalar index base `p[i]`.
+   * **Host driver import-closure cap** raised 64 → 384: `init/main.ad` has 191
+     top-level imports, so `linux_abi.u_syscalls` (the 107th, defining
+     `CLONE_NEWNS` et al.) was silently dropped from the merged TU.
+   * **Structural match vs the seed** (both via `ld -T kernel.lds`): ELF header
+     identical except `e_shoff` (AC `.text` is smaller — backends differ by
+     construction); **entry `0x10004c` identical**; LOAD segment VMAs identical
+     (low `0x100000`, bss `0x101000`, high-text `0xffffffff80114000`,
+     AP-trampoline `0x8000`); **multiboot header bytes byte-identical** (same
+     header.S); `.data..percpu` `0x48` bytes (9 globals) in both with
+     `cpu_id_pcpu` pinned to its base; `__bss_start`/`__bss_end` present in both.
+     Gate: `scripts/test_selfhost_kernel_elf.sh`.
+
+   *Remaining caveat (NOT a link blocker).* `initramfs_cpio_base`/`size` are
+   provided by the build-generated `initramfs_blob.S` (build_initramfs.py), not
+   by codegen; the gate generates an empty blob so the standalone link
+   completes. Runtime boot of the AC-linked kernel under QEMU is NOT validated
+   here (host-only track); the structural + symbol-resolution match is the
+   acceptance bar at this layer.
+
+   **ELF format (USER) — SEAM landed.**
    `elf_emit.ad` emits the `x86_64-adder-user` self-contained ELF (the only
    one userland units need — behaviourally the seed's `ld`-against-runtime.S
    output via the cap#1 in-`.ad` runtime library). The output-FORMAT seam the
