@@ -1,0 +1,269 @@
+# kernel/time/clocksource.ad
+#
+# Linux-shape clocksource abstraction. Mirrors kernel/time/clocksource.c
+# and include/linux/clocksource.h. A clocksource is a monotonically
+# increasing free-running cycle counter (TSC, HPET, PIT) plus the
+# metadata needed to turn raw cycles into nanoseconds:
+#
+#   struct clocksource {
+#       u64  (*read)(struct clocksource *);   // raw cycle count
+#       u64  mask;                             // counter width mask
+#       u32  mult;                             // cycle->ns scaling numerator
+#       u32  shift;                            // cycle->ns scaling shift
+#       int  rating;                           // 1..499 quality score
+#       const char *name;
+#   };
+#
+# ns = ((cycles & mask) * mult) >> shift
+#
+# The registry keeps a small table of registered clocksources and
+# selects the highest-rated one as the "current" clocksource. The kernel
+# reads monotonic time THROUGH this selection (clocksource_read_ns())
+# rather than calling read_tsc() ad hoc, so a future HPET-only machine
+# (no constant TSC) transparently falls back to the next-best source.
+#
+# RATINGS (Linux convention):
+#   1..99    unfit unless nothing else (e.g. jiffies = 1)
+#   100..199 usable but not ideal
+#   200..299 good, precise (HPET = 250 in Linux)
+#   300..499 ideal, constant-rate, low-latency to read (TSC = 300)
+#
+# We register at boot:
+#   - "tsc"  rating 300 (when tsc_calibrated())  — read = read_tsc
+#   - "hpet" rating 250 (when hpet_available())  — read = hpet_read_counter
+#   - "jiffies" rating 1 (always)                — read = get_jiffies
+#
+# mult/shift are derived from each source's frequency by
+# clocks_calc_mult_shift(): pick the largest shift that keeps
+# (freq_hz * mult) inside 64 bits while mult fits in 32 bits, so the
+# cyc->ns multiply is exact to ~1 ppm and never overflows for a
+# multi-hour delta.
+
+from kernel.printk.printk import printk0, printk1, printk2
+
+# read_tsc() lives in arch/x86/kernel/syscall_64.S (LFENCE; RDTSC).
+extern def read_tsc() -> uint64
+
+
+# --- Registry table (parallel arrays; index 0..MAX-1) ----------------
+
+MAX_CLOCKSOURCES: uint64 = 8
+
+cs_name_id:  Array[8, uint64]   # small integer name id (see CS_NAME_*)
+cs_read_fn:  Array[8, uint64]   # u64 (*read)(void) raw cycle count
+cs_mask:     Array[8, uint64]   # counter-width mask (e.g. 2^64-1, 2^32-1)
+cs_mult:     Array[8, uint64]   # cyc->ns multiply numerator
+cs_shift:    Array[8, uint64]   # cyc->ns shift
+cs_rating:   Array[8, uint64]   # quality score
+cs_freq_hz:  Array[8, uint64]   # source frequency, Hz (for diagnostics)
+cs_used:     Array[8, uint64]   # 1 = slot occupied
+
+cs_count:    uint64 = 0         # registered count
+cs_current:  int64  = -1        # index of selected best source, -1 = none
+
+# Name ids — keep printable mapping in _cs_name_str().
+CS_NAME_JIFFIES: uint64 = 1
+CS_NAME_PIT:     uint64 = 2
+CS_NAME_HPET:    uint64 = 3
+CS_NAME_TSC:     uint64 = 4
+
+# Monotonic-ns base capture. clocksource_read_ns() reports nanoseconds
+# since the moment the current source was selected, so a source switch
+# (TSC -> HPET) does not make the monotonic clock jump. We record the
+# raw cycle value at selection and the ns accumulated up to that point.
+cs_base_cycles: uint64 = 0     # raw read() value at selection instant
+cs_base_ns:     uint64 = 0     # monotonic ns accumulated before selection
+
+
+def _cs_name_str(id: uint64) -> uint64:
+    # Returns a printable c-string pointer for the diagnostic banner.
+    # (printk1 with %s expects a uint64 pointer arg.)
+    if id == CS_NAME_TSC:
+        return cast[uint64]("tsc")
+    if id == CS_NAME_HPET:
+        return cast[uint64]("hpet")
+    if id == CS_NAME_PIT:
+        return cast[uint64]("pit")
+    return cast[uint64]("jiffies")
+
+
+# --- clocks_calc_mult_shift -----------------------------------------
+#
+# Linux's clocks_calc_mult_shift(from_hz, to_hz=1e9, maxsec). We compute
+# mult/shift such that
+#     ns ≈ (cycles * mult) >> shift
+# with mult in [2^31, 2^32) for maximum precision and the product
+# (max_cycles_per_maxsec * mult) staying inside 64 bits.
+#
+# Derivation: we want mult/2^shift ≈ 1e9 / freq_hz. Start from a high
+# shift and reduce it until mult = (1e9 << shift) / freq_hz fits in 32
+# bits AND (freq_hz * mult) doesn't overflow 64 bits across `maxsec`
+# seconds of cycles. We bound the per-conversion delta to MAXSEC seconds
+# so callers must re-base before that (the registry re-bases on every
+# read by carrying cs_base, so a single delta is tiny — but we keep the
+# Linux-correct bound for safety).
+
+CS_NS_PER_SEC: uint64 = 1000000000
+# Bound a single (cycles*mult) product to <= ~600 s of cycles before
+# overflow risk; the read path re-bases far more often than that.
+CS_MAXSEC: uint64 = 600
+
+
+def clocks_calc_mult_shift(freq_hz: uint64) -> uint64:
+    # Pack (mult, shift) into one uint64: (mult << 32) | shift. Adder has
+    # no multi-return; the caller unpacks. mult fits in 32 bits, shift in
+    # a small range, so the packing is lossless.
+    if freq_hz == 0:
+        # Degenerate; identity-ish (1 cycle == 1 ns). Avoids div-by-zero.
+        return (cast[uint64](1) << 32) | 0
+    # Largest shift such that mult fits in 32 bits and a maxsec-second
+    # cycle delta times mult stays in 64 bits. Walk shift down from 32.
+    sft: uint64 = 32
+    mult: uint64 = 0
+    while sft > 0:
+        # mult = round(1e9 * 2^sft / freq_hz). 1e9 < 2^30 so 1e9 << 32 is
+        # safe in 64 bits; sft starts at 32 and only decreases.
+        numer: uint64 = CS_NS_PER_SEC << sft
+        mult = numer / freq_hz
+        # Constraint 1: mult must fit in 32 bits (Linux keeps mult u32).
+        if mult >= (cast[uint64](1) << 32):
+            sft = sft - 1
+            continue
+        # Constraint 2: a maxsec-second cycle delta times mult must not
+        # overflow 64 bits. max cycles in maxsec = freq_hz * maxsec.
+        max_cycles: uint64 = freq_hz * CS_MAXSEC
+        if mult != 0:
+            limit: uint64 = 0xFFFFFFFFFFFFFFFF / mult
+            if max_cycles > limit:
+                sft = sft - 1
+                continue
+        break
+    return (mult << 32) | sft
+
+
+# --- registration ----------------------------------------------------
+
+def _cs_find_best() -> int64:
+    # Highest rating wins; ties keep the earlier registration.
+    best: int64 = -1
+    best_rating: uint64 = 0
+    i: uint64 = 0
+    while i < MAX_CLOCKSOURCES:
+        if cs_used[i] == 1:
+            if cs_rating[i] > best_rating:
+                best_rating = cs_rating[i]
+                best = cast[int64](i)
+        i = i + 1
+    return best
+
+
+def _cs_select_current():
+    # (Re)select the best registered source. If the winner changes, carry
+    # the monotonic-ns base across the switch so the clock stays
+    # continuous.
+    nb: int64 = _cs_find_best()
+    if nb < 0:
+        cs_current = -1
+        return
+    if nb == cs_current:
+        return
+    # Capture current monotonic ns from the OLD source (if any) so the new
+    # source continues from there.
+    carried_ns: uint64 = 0
+    if cs_current >= 0:
+        carried_ns = clocksource_read_ns()
+    cs_current = nb
+    idx: uint64 = cast[uint64](nb)
+    # Re-base: raw cycle snapshot + accumulated ns up to now.
+    read_fn: Fn[uint64] = cast[Fn[uint64]](cs_read_fn[idx])
+    cs_base_cycles = read_fn() & cs_mask[idx]
+    cs_base_ns = carried_ns
+
+
+def clocksource_register(name_id: uint64, read_fn_ptr: uint64,
+                         mask: uint64, freq_hz: uint64,
+                         rating: uint64) -> int32:
+    # Register a clocksource. Computes mult/shift from freq_hz, stores
+    # the row, then re-selects the best source. Returns the slot index,
+    # or -1 if the table is full.
+    if cs_count >= MAX_CLOCKSOURCES:
+        return -1
+    # Find a free slot.
+    i: uint64 = 0
+    slot: int64 = -1
+    while i < MAX_CLOCKSOURCES:
+        if cs_used[i] == 0:
+            slot = cast[int64](i)
+            break
+        i = i + 1
+    if slot < 0:
+        return -1
+    si: uint64 = cast[uint64](slot)
+    ms: uint64 = clocks_calc_mult_shift(freq_hz)
+    cs_name_id[si] = name_id
+    cs_read_fn[si] = read_fn_ptr
+    cs_mask[si]    = mask
+    cs_mult[si]    = ms >> 32
+    cs_shift[si]   = ms & 0xFFFFFFFF
+    cs_rating[si]  = rating
+    cs_freq_hz[si] = freq_hz
+    cs_used[si]    = 1
+    cs_count = cs_count + 1
+    printk1("clocksource: registered %s", _cs_name_str(name_id))
+    printk1(" rating=%d", rating)
+    printk1(" freq=%d Hz", freq_hz)
+    printk1(" mult=%d", cs_mult[si])
+    printk1(" shift=%d\n", cs_shift[si])
+    _cs_select_current()
+    return slot
+
+
+# --- read path -------------------------------------------------------
+
+def clocksource_read_cycles() -> uint64:
+    # Raw masked cycle count of the current best source.
+    if cs_current < 0:
+        return 0
+    idx: uint64 = cast[uint64](cs_current)
+    read_fn: Fn[uint64] = cast[Fn[uint64]](cs_read_fn[idx])
+    return read_fn() & cs_mask[idx]
+
+
+def cyc_to_ns(cycles: uint64, idx: uint64) -> uint64:
+    # (cycles * mult) >> shift, the canonical Linux conversion.
+    return (cycles * cs_mult[idx]) >> cs_shift[idx]
+
+
+def clocksource_read_ns() -> uint64:
+    # Monotonic nanoseconds since the current source was selected, plus
+    # any ns carried across a source switch. This is THE kernel monotonic
+    # clock read path. Returns 0 before any source is registered (the
+    # jiffies source is always registered, so cs_current is set early).
+    if cs_current < 0:
+        return 0
+    idx: uint64 = cast[uint64](cs_current)
+    read_fn: Fn[uint64] = cast[Fn[uint64]](cs_read_fn[idx])
+    now: uint64 = read_fn() & cs_mask[idx]
+    # Handle counter wrap within the mask (HPET 32-bit, etc.). For a
+    # 64-bit TSC the mask is all-ones and this subtraction is plain.
+    delta: uint64 = (now - cs_base_cycles) & cs_mask[idx]
+    return cs_base_ns + cyc_to_ns(delta, idx)
+
+
+def clocksource_current_name() -> uint64:
+    # Printable name of the selected source (for /proc and diagnostics).
+    if cs_current < 0:
+        return cast[uint64]("none")
+    return _cs_name_str(cs_name_id[cast[uint64](cs_current)])
+
+
+def clocksource_current_rating() -> uint64:
+    if cs_current < 0:
+        return 0
+    return cs_rating[cast[uint64](cs_current)]
+
+
+def clocksource_is_selected() -> int32:
+    if cs_current < 0:
+        return 0
+    return 1

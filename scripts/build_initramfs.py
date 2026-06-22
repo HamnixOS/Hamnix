@@ -1595,6 +1595,16 @@ if os.environ.get("ENABLE_USERFAULTFD_TEST"):
 # emitting the [adjtimex] PASS banner. Default boots omit the marker.
 if os.environ.get("ENABLE_ADJTIMEX_TEST"):
     FILES.append(("/etc/adjtimex-test", b"1\n"))
+# Hi-res timer subsystem self-test. scripts/test_hrtimer.sh sets
+# ENABLE_HRTIMER_TEST=1 to plant /etc/hrtimer-test. init/main.ad at
+# boot:16.time detects the marker and calls hrtimer_selftest()
+# (kernel/time/timer_selftest.ad): it proves a clocksource is selected +
+# monotonic, a hrtimer fires sub-tick (<10 ms, not jiffies-quantized), a
+# 1 ms sleep takes ~1 ms, NO_HZ stops the tick on idle + accounts skipped
+# jiffies on wake, and a POSIX CLOCK_PROCESS_CPUTIME_ID timer fires at its
+# CPU-time threshold. Default boots omit the marker.
+if os.environ.get("ENABLE_HRTIMER_TEST"):
+    FILES.append(("/etc/hrtimer-test", b"1\n"))
 # NUMA mempolicy round-trip self-test. scripts/test_mempolicy.sh sets
 # ENABLE_MEMPOLICY_TEST=1 to plant /etc/mempolicy-test. init/main.ad detects
 # the marker and calls mempolicy_selftest() (linux_abi/u_mempolicy.ad): it

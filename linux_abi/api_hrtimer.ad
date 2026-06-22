@@ -1,242 +1,174 @@
 # linux_abi/api_hrtimer.ad
 #
-# L10: Linux hrtimer + ktime ABI shims. High-resolution timers cover
-# the nanosecond-deadline use cases that timer_list (L9, jiffies-
-# resolution) can't reach: scheduler preemption ticks, audio stream
-# scheduling, network pacing. M6.2 in the regression .ko suite arms
-# a one-shot hrtimer and checks the callback fires.
+# L10: Linux hrtimer + ktime ABI shims. These are the export-table
+# entrypoints a loaded Linux .ko calls (hrtimer_init / hrtimer_start_
+# range_ns / hrtimer_cancel / hrtimer_forward / ktime_get).
+#
+# REWRITTEN (kernel/time/ hrtimer subsystem): this file used to carry its
+# OWN jiffies-quantized 16-slot wheel with 10 ms resolution. It now
+# delegates to the real ns-resolution, clockevent-backed hrtimer
+# subsystem in kernel/time/hrtimer.ad. A Linux `struct hrtimer *` is
+# keyed to a kernel hrtimer slot via a small association table; the
+# callback the module writes into t->function is invoked with the struct
+# pointer (Linux's `enum hrtimer_restart (*)(struct hrtimer *)`), so .ko
+# code sees the exact ABI it expects while the deadline is now honoured at
+# nanosecond resolution against the TSC clocksource.
 #
 # Linux signatures (include/linux/hrtimer.h, kernel/time/hrtimer.c):
 #   void hrtimer_init(struct hrtimer *t, clockid_t which_clock,
 #                     enum hrtimer_mode mode);
 #   int  hrtimer_start_range_ns(struct hrtimer *t, ktime_t tim,
-#                               u64 delta_ns,
-#                               const enum hrtimer_mode mode);
+#                               u64 delta_ns, const enum hrtimer_mode mode);
 #   int  hrtimer_cancel(struct hrtimer *t);
-#   u64  hrtimer_forward(struct hrtimer *t, ktime_t now,
-#                        ktime_t interval);
+#   u64  hrtimer_forward(struct hrtimer *t, ktime_t now, ktime_t interval);
 #   ktime_t ktime_get(void);
 #
-# Implementation strategy:
-#
-# A 16-slot static table mirrors the L9 timer_list layout — same
-# (timer_ptr, fn_addr, expires_ns, active) tuple, but the deadline
-# is in nanoseconds rather than jiffies, and the callback signature
-# is `enum hrtimer_restart (*)(struct hrtimer *)` (returns whether
-# the timer should re-arm; we treat any non-zero return as
-# "RESTART" but in practice the dispatcher doesn't re-arm
-# automatically — modules that want periodic behaviour call
-# hrtimer_forward + hrtimer_start_range_ns from inside their
-# callback, which is the canonical Linux pattern).
-#
-# Resolution: ktime_get() returns get_jiffies() * 10_000_000 ns, so
-# our effective hrtimer resolution is 10 ms — the same as the L9
-# timer wheel. The "high-resolution" label is aspirational until we
-# wire a TSC-deadline LAPIC timer (M16.future). For M6.2's needs
-# (arm a 50-ms hrtimer, observe it fire) the resolution gap is
-# invisible.
-#
-# Struct hrtimer in Linux 6.12 starts with a struct timerqueue_node
-# (16 bytes), then the function pointer at offset 16. Same layout
-# rule as struct timer_list — handy.
+# Struct hrtimer in Linux 6.12 starts with a struct timerqueue_node (16
+# bytes); `function` lands at byte 24 in the 6.12-default config. Module
+# code writes t->function directly between hrtimer_init() and the first
+# start (canonical kernel/sched/core.c::__hrtick_start pattern), so we
+# read it from the struct in hrtimer_start_range_ns.
 
 from linux_abi.exports import _add_export
-from arch.x86.kernel.time import get_jiffies
+from kernel.time.hrtimer import (
+    hrtimer_create, hrtimer_start_abs, hrtimer_cancel,
+    hrtimer_forward, hrtimer_get_time,
+    hrtimer_set_data, HRTIMER_NORESTART,
+)
+
+# struct hrtimer `function` field offset (Linux 6.12 default config).
+LABI_HRTIMER_FUNCTION_OFFSET: uint64 = 24
+
+# Association table: maps a Linux `struct hrtimer *` to a kernel hrtimer
+# slot id. Bounded; a .ko at our scale arms a handful of hrtimers.
+LABI_MAX_HRTIMERS: uint64 = 64
+labi_ht_ptr:  Array[64, uint64]   # struct hrtimer *  (0 = free)
+labi_ht_slot: Array[64, int64]    # kernel hrtimer slot id
 
 
-# --- 16-slot static hrtimer table ----------------------------------
-
-MAX_HRTIMERS: uint64 = 16
-
-# Parallel arrays — 0 in hrtimer_ptrs means "free slot".
-hrtimer_ptrs:    Array[16, uint64]   # struct hrtimer *  (0 = free)
-hrtimer_fns:     Array[16, uint64]   # enum hrtimer_restart (*)(struct hrtimer *)
-hrtimer_expires: Array[16, uint64]   # absolute ns deadline
-hrtimer_active:  Array[16, uint64]   # 1 = armed
-
-# struct hrtimer field offset (Linux 6.12):
-#   struct timerqueue_node node;  // offset 0, 16 bytes
-#   ktime_t _softexpires;         // offset 16 (skipped; we use slot)
-# Effective callback field offset varies between kernel configs;
-# 6.12-default puts `function` at byte 24. We don't actually read
-# back through it (dispatch uses the slot's own copy) but record
-# the offset for posterity.
-HRTIMER_FUNCTION_OFFSET: uint64 = 24
-
-
-# Conversion: get_jiffies() ticks at 100 Hz, so each jiffy is 10 ms =
-# 10_000_000 ns. Used by ktime_get() and the dispatcher's deadline
-# comparison.
-NS_PER_JIFFY: uint64 = 10000000
-
-
-def _hrtimer_find_slot(timer_ptr: uint64) -> uint64:
-    # +1-biased slot index, or 0 if not found. Same convention as
-    # api_timer.ad / api_proc.ad.
+def _labi_find(timer_ptr: uint64) -> int64:
     i: uint64 = 0
-    while i < MAX_HRTIMERS:
-        if hrtimer_ptrs[i] == timer_ptr:
-            return i + 1
+    while i < LABI_MAX_HRTIMERS:
+        if labi_ht_ptr[i] == timer_ptr:
+            return cast[int64](i)
         i = i + 1
-    return 0
+    return -1
 
 
-def _hrtimer_alloc_slot(timer_ptr: uint64) -> uint64:
-    found: uint64 = _hrtimer_find_slot(timer_ptr)
-    if found != 0:
+def _labi_alloc(timer_ptr: uint64) -> int64:
+    found: int64 = _labi_find(timer_ptr)
+    if found >= 0:
         return found
     i: uint64 = 0
-    while i < MAX_HRTIMERS:
-        if hrtimer_ptrs[i] == 0:
-            hrtimer_ptrs[i]    = timer_ptr
-            hrtimer_fns[i]     = 0
-            hrtimer_expires[i] = 0
-            hrtimer_active[i]  = 0
-            return i + 1
+    while i < LABI_MAX_HRTIMERS:
+        if labi_ht_ptr[i] == 0:
+            labi_ht_ptr[i]  = timer_ptr
+            labi_ht_slot[i] = -1
+            return cast[int64](i)
         i = i + 1
-    return 0
+    return -1
+
+
+# The kernel hrtimer callback we register is a single trampoline keyed on
+# the cookie (= the Linux struct-hrtimer pointer). It looks up the .ko's
+# t->function and calls it with the struct pointer, preserving the Linux
+# ABI. The .ko's return value (RESTART/NORESTART) is propagated so a
+# periodic .ko hrtimer re-arms exactly as on Linux.
+def _labi_hrtimer_trampoline(cookie: uint64) -> int64:
+    timer_ptr: uint64 = cookie
+    fn_slot: Ptr[uint64] = cast[Ptr[uint64]](
+        timer_ptr + LABI_HRTIMER_FUNCTION_OFFSET)
+    fn: uint64 = fn_slot[0]
+    if fn == 0:
+        return HRTIMER_NORESTART
+    call_fn: Fn[int64, uint64] = cast[Fn[int64, uint64]](fn)
+    return call_fn(timer_ptr)
 
 
 # --- L10 shims -------------------------------------------------------
 
-def _l_hrtimer_init(timer_ptr: uint64, which_clock: uint64,
-                     mode: uint64):
-    # Linux: hrtimer_init(t, clockid, mode). clockid distinguishes
-    # CLOCK_MONOTONIC / CLOCK_REALTIME / CLOCK_BOOTTIME — we only
-    # serve a monotonic clock (ktime_get is jiffies-based), so the
-    # clockid arg is dropped. mode covers HRTIMER_MODE_ABS / _REL /
-    # _PINNED — we treat hrtimer_start_range_ns's deadline as
-    # absolute regardless (the canonical caller pattern uses
-    # ktime_get() + delta, which produces an absolute value either
-    # way).
+def _l_hrtimer_init(timer_ptr: uint64, which_clock: uint64, mode: uint64):
+    # hrtimer_init(t, clockid, mode). We serve a single monotonic clock
+    # (the clocksource ns counter), so clockid is dropped; mode (ABS/REL)
+    # is handled at start time. Allocate the association + a kernel
+    # hrtimer whose callback is the trampoline and whose cookie is the
+    # struct pointer.
     if timer_ptr == 0:
         return
-    handle: uint64 = _hrtimer_alloc_slot(timer_ptr)
-    if handle == 0:
+    a: int64 = _labi_alloc(timer_ptr)
+    if a < 0:
         return
-    # Callback pointer is plumbed in via the next hrtimer_start_range_ns
-    # call's record path — Linux's hrtimer_init does NOT take the
-    # function pointer (module code writes t->function directly
-    # between init and start). We read it from the struct in
-    # hrtimer_start_range_ns.
+    ai: uint64 = cast[uint64](a)
+    if labi_ht_slot[ai] < 0:
+        slot: int64 = hrtimer_create(
+            cast[uint64](&_labi_hrtimer_trampoline), timer_ptr)
+        labi_ht_slot[ai] = slot
 
 
 def _l_hrtimer_start_range_ns(timer_ptr: uint64, tim: uint64,
-                               delta_ns: uint64,
-                               mode: uint64) -> int32:
-    # Linux: int hrtimer_start_range_ns(t, tim, delta_ns, mode).
-    # `tim` is the target time, `delta_ns` is slack (we ignore the
-    # slack — we'll fire at exactly `tim`). Returns 0 on success,
-    # 1 if the timer was already pending (re-arm).
+                              delta_ns: uint64, mode: uint64) -> int32:
+    # hrtimer_start_range_ns(t, tim, delta_ns, mode). `tim` is the target
+    # time; we treat it as an absolute monotonic-ns deadline (the
+    # canonical caller pattern is ktime_get()+delta, already absolute) and
+    # ignore the slack delta_ns (we fire at `tim`). Returns 0 on success.
     if timer_ptr == 0:
         return 0
-    handle: uint64 = _hrtimer_find_slot(timer_ptr)
-    if handle == 0:
-        handle = _hrtimer_alloc_slot(timer_ptr)
-        if handle == 0:
+    a: int64 = _labi_find(timer_ptr)
+    if a < 0:
+        _l_hrtimer_init(timer_ptr, 0, mode)
+        a = _labi_find(timer_ptr)
+        if a < 0:
             return 0
-    idx: uint64 = handle - 1
-    # Pick the callback up from the struct field — Linux modules
-    # write t->function between hrtimer_init() and the first start
-    # call (see canonical kernel/sched/core.c::__hrtick_start).
-    fn_slot: Ptr[uint64] = cast[Ptr[uint64]](
-        timer_ptr + HRTIMER_FUNCTION_OFFSET)
-    hrtimer_fns[idx] = fn_slot[0]
-    was_pending: int32 = 0
-    if hrtimer_active[idx] == 1:
-        was_pending = 1
-    hrtimer_expires[idx] = tim
-    hrtimer_active[idx]  = 1
-    return was_pending
+    ai: uint64 = cast[uint64](a)
+    slot: int64 = labi_ht_slot[ai]
+    if slot < 0:
+        return 0
+    # Refresh the cookie (struct addr stable) + arm at the absolute ns.
+    hrtimer_set_data(cast[uint64](slot), timer_ptr)
+    hrtimer_start_abs(cast[uint64](slot), tim)
+    return 0
 
 
 def _l_hrtimer_cancel(timer_ptr: uint64) -> int32:
-    # Linux: int hrtimer_cancel(t). Returns 1 if the timer was active
-    # at the time of the call, 0 otherwise. No "sync" variant
-    # distinction at this scale — the dispatcher can't race a cancel.
+    # hrtimer_cancel(t). Returns 1 if active at call time, else 0.
     if timer_ptr == 0:
         return 0
-    handle: uint64 = _hrtimer_find_slot(timer_ptr)
-    if handle == 0:
+    a: int64 = _labi_find(timer_ptr)
+    if a < 0:
         return 0
-    idx: uint64 = handle - 1
-    was_active: int32 = 0
-    if hrtimer_active[idx] == 1:
-        was_active = 1
-    hrtimer_active[idx]  = 0
-    hrtimer_expires[idx] = 0
-    return was_active
+    slot: int64 = labi_ht_slot[cast[uint64](a)]
+    if slot < 0:
+        return 0
+    return hrtimer_cancel(cast[uint64](slot))
 
 
 def _l_hrtimer_forward(timer_ptr: uint64, now: uint64,
-                        interval: uint64) -> uint64:
-    # Linux: u64 hrtimer_forward(t, now, interval). Advances the
-    # timer's expiry to the next interval boundary at or after `now`,
-    # returns the number of intervals skipped. Used in periodic
-    # hrtimer callbacks to compute the next deadline.
-    if timer_ptr == 0:
+                       interval: uint64) -> uint64:
+    # hrtimer_forward(t, now, interval): advance expiry to the next
+    # interval boundary at/after now; return intervals skipped.
+    if timer_ptr == 0 or interval == 0:
         return 0
-    if interval == 0:
+    a: int64 = _labi_find(timer_ptr)
+    if a < 0:
         return 0
-    handle: uint64 = _hrtimer_find_slot(timer_ptr)
-    if handle == 0:
+    slot: int64 = labi_ht_slot[cast[uint64](a)]
+    if slot < 0:
         return 0
-    idx: uint64 = handle - 1
-    expires: uint64 = hrtimer_expires[idx]
-    overruns: uint64 = 0
-    while expires <= now:
-        expires = expires + interval
-        overruns = overruns + 1
-    hrtimer_expires[idx] = expires
-    return overruns
+    return hrtimer_forward(cast[uint64](slot), now, interval)
 
 
 def _l_ktime_get() -> uint64:
-    # Linux: ktime_t ktime_get(void). ktime_t is a u64 nanoseconds
-    # value, monotonic since boot. We synthesise it from jiffies —
-    # one jiffy = NS_PER_JIFFY ns at 100 Hz.
-    return get_jiffies() * NS_PER_JIFFY
-
-
-# --- Dispatcher (called from arch/x86/kernel/time.ad on each tick) ---
-
-def hrtimer_walk_one_tick():
-    # Walk every active slot; fire those whose ns deadline has been
-    # crossed. The callback's return value (RESTART vs NORESTART) is
-    # accepted but we don't act on it — module code that wants
-    # periodic firing uses hrtimer_forward + hrtimer_start_range_ns
-    # from inside the callback (the canonical pattern).
-    now_ns: uint64 = get_jiffies() * NS_PER_JIFFY
-    i: uint64 = 0
-    while i < MAX_HRTIMERS:
-        if hrtimer_active[i] == 1:
-            if hrtimer_expires[i] <= now_ns:
-                fn: uint64        = hrtimer_fns[i]
-                timer_ptr: uint64 = hrtimer_ptrs[i]
-                hrtimer_active[i] = 0
-                if fn != 0:
-                    # enum hrtimer_restart (*)(struct hrtimer *) —
-                    # one ptr arg, int return. `fn` is a raw uint64
-                    # slot address; cast it to a first-class function-
-                    # pointer type and call through it.
-                    call_fn: Fn[int64, uint64] = cast[Fn[int64, uint64]](fn)
-                    call_fn(timer_ptr)
-        i = i + 1
+    # ktime_get(): monotonic nanoseconds since boot, now read from the
+    # TSC-backed clocksource (ns resolution) rather than jiffies*1e7.
+    return hrtimer_get_time()
 
 
 # --- Export-table registration --------------------------------------
 
 def linux_abi_register_hrtimer():
-    # Called from start_kernel after linux_abi_register_timer wires
-    # the L9 rows. Order doesn't matter (flat name-keyed table) but
-    # grouping by milestone keeps the boot log readable.
-    _add_export("hrtimer_init",
-                cast[uint64](&_l_hrtimer_init))
+    _add_export("hrtimer_init", cast[uint64](&_l_hrtimer_init))
     _add_export("hrtimer_start_range_ns",
                 cast[uint64](&_l_hrtimer_start_range_ns))
-    _add_export("hrtimer_cancel",
-                cast[uint64](&_l_hrtimer_cancel))
-    _add_export("hrtimer_forward",
-                cast[uint64](&_l_hrtimer_forward))
-    _add_export("ktime_get",
-                cast[uint64](&_l_ktime_get))
+    _add_export("hrtimer_cancel", cast[uint64](&_l_hrtimer_cancel))
+    _add_export("hrtimer_forward", cast[uint64](&_l_hrtimer_forward))
+    _add_export("ktime_get", cast[uint64](&_l_ktime_get))

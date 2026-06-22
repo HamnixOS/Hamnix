@@ -1,0 +1,373 @@
+# kernel/time/hrtimer.ad
+#
+# Real high-resolution timer subsystem. Mirrors kernel/time/hrtimer.c.
+# Replaces the jiffies-quantized 16-slot wheel (the old
+# linux_abi/api_hrtimer.ad table + the implicit "walk on every 100 Hz
+# tick" model) with:
+#
+#   * a per-base queue of hrtimers ordered by ABSOLUTE nanosecond expiry
+#     (a sorted array — the Linux timerqueue is an rbtree; a sorted array
+#     gives identical O(log n) lookup of the earliest deadline via the
+#     head element and is correct + simple at our timer counts);
+#   * nanosecond resolution read from the clocksource (clocksource_read_ns,
+#     TSC-backed), NOT jiffies;
+#   * backing by the clockevent one-shot: after every enqueue / expiry the
+#     subsystem reprograms the clockevent for the NEW earliest deadline
+#     (hrtimer_reprogram), so a timer set for T ns fires at ~T — bounded
+#     by interrupt latency, not rounded up to the next 10 ms tick.
+#
+# A hrtimer:
+#   struct hrtimer {
+#       ktime_t expires;                 // absolute ns deadline
+#       enum hrtimer_restart (*function)(struct hrtimer *);
+#       u64 data;                        // opaque (sleeper task id, etc.)
+#       int state;                       // INACTIVE / ENQUEUED
+#   };
+#
+# The callback returns HRTIMER_RESTART (re-arm at expires) or
+# HRTIMER_NORESTART (one-shot). Periodic callers use hrtimer_forward()
+# from inside the callback then return HRTIMER_RESTART — the canonical
+# Linux pattern.
+#
+# Integration with the tick (kernel/time/tick.ad): the timer ISR calls
+# hrtimer_interrupt(now_ns) which expires every due timer and reprograms
+# the clockevent for the next one. In NO_HZ idle the next hrtimer
+# deadline IS the next clockevent program — that is what makes the box
+# tickless.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.time.clocksource import clocksource_read_ns
+from kernel.time.clockevent import (
+    clockevent_set_next_event_ns, clockevent_available,
+    clockevent_record_deadline, CLOCKEVT_MIN_DELTA_NS,
+)
+
+# hrtimer_restart return values.
+HRTIMER_NORESTART: int64 = 0
+HRTIMER_RESTART:   int64 = 1
+
+# hrtimer states.
+HRTIMER_STATE_INACTIVE: uint64 = 0
+HRTIMER_STATE_ENQUEUED: uint64 = 1
+
+# Queue capacity. Linux is unbounded (rbtree); we size for the kernel's
+# concurrent timer population (sched timeouts, a handful of nanosleeps,
+# timerfds, posix timers) with generous headroom.
+MAX_HRTIMERS: uint64 = 256
+
+# Sorted-by-expiry queue. ht_q[] holds slot indices into the parallel
+# arrays, kept in ascending ht_expires order; ht_q[0] is the earliest
+# deadline. The parallel arrays are indexed by a stable slot id so a
+# hrtimer's identity survives reordering.
+ht_expires: Array[256, uint64]   # absolute ns deadline
+ht_fn:      Array[256, uint64]   # enum hrtimer_restart (*)(hrtimer*)
+ht_data:    Array[256, uint64]   # opaque cookie passed to the callback
+ht_state:   Array[256, uint64]   # INACTIVE / ENQUEUED
+ht_used:    Array[256, uint64]   # 1 = slot allocated
+
+# The ordered queue of ENQUEUED slot ids and its length.
+ht_q:       Array[256, uint64]
+ht_qlen:    uint64 = 0
+
+# Diagnostics.
+ht_fired_count:   uint64 = 0
+ht_enqueue_count: uint64 = 0
+
+
+def hrtimer_init_subsys():
+    # Reset the subsystem. Called once at boot after the clocksource +
+    # clockevent are up.
+    i: uint64 = 0
+    while i < MAX_HRTIMERS:
+        ht_used[i]    = 0
+        ht_state[i]   = HRTIMER_STATE_INACTIVE
+        ht_expires[i] = 0
+        ht_fn[i]      = 0
+        ht_data[i]    = 0
+        i = i + 1
+    ht_qlen = 0
+    ht_fired_count = 0
+    ht_enqueue_count = 0
+    printk0("hrtimer: subsystem online (ns-resolution, clockevent-backed)\n")
+
+
+def hrtimer_get_time() -> uint64:
+    # ktime_get(): current monotonic nanoseconds from the clocksource.
+    return clocksource_read_ns()
+
+
+# --- slot allocation -------------------------------------------------
+
+def _ht_alloc_slot() -> int64:
+    # Returns a free slot id, or -1 if the table is full.
+    i: uint64 = 0
+    while i < MAX_HRTIMERS:
+        if ht_used[i] == 0:
+            ht_used[i]  = 1
+            ht_state[i] = HRTIMER_STATE_INACTIVE
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _ht_free_slot(slot: uint64):
+    ht_used[slot]    = 0
+    ht_state[slot]   = HRTIMER_STATE_INACTIVE
+    ht_fn[slot]      = 0
+    ht_data[slot]    = 0
+    ht_expires[slot] = 0
+
+
+# --- ordered queue ops -----------------------------------------------
+
+def _ht_queue_find(slot: uint64) -> int64:
+    # Position of `slot` in ht_q, or -1 if not queued.
+    i: uint64 = 0
+    while i < ht_qlen:
+        if ht_q[i] == slot:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _ht_queue_insert(slot: uint64):
+    # Insert `slot` keeping ht_q sorted ascending by ht_expires. Shift
+    # the tail up by one to make room (insertion sort — O(n), fine at our
+    # scale and cache-friendly for the small head we touch most).
+    exp: uint64 = ht_expires[slot]
+    pos: uint64 = ht_qlen
+    # Find the first element with a strictly greater expiry.
+    i: uint64 = 0
+    while i < ht_qlen:
+        if ht_expires[ht_q[i]] > exp:
+            pos = i
+            break
+        i = i + 1
+    # Shift [pos .. qlen) up by one.
+    j: uint64 = ht_qlen
+    while j > pos:
+        ht_q[j] = ht_q[j - 1]
+        j = j - 1
+    ht_q[pos] = slot
+    ht_qlen = ht_qlen + 1
+
+
+def _ht_queue_remove_at(pos: uint64):
+    # Remove element at ht_q[pos], shifting the tail down.
+    i: uint64 = pos
+    while i + 1 < ht_qlen:
+        ht_q[i] = ht_q[i + 1]
+        i = i + 1
+    ht_qlen = ht_qlen - 1
+
+
+def _ht_queue_remove_slot(slot: uint64):
+    p: int64 = _ht_queue_find(slot)
+    if p >= 0:
+        _ht_queue_remove_at(cast[uint64](p))
+
+
+def hrtimer_next_expiry() -> uint64:
+    # Absolute ns deadline of the earliest enqueued hrtimer, or 0 if the
+    # queue is empty. ht_q[0] is the head by the sorted invariant.
+    if ht_qlen == 0:
+        return 0
+    return ht_expires[ht_q[0]]
+
+
+def hrtimer_pending_count() -> uint64:
+    return ht_qlen
+
+
+def hrtimer_next_expiry_excluding(skip_slot: int64) -> uint64:
+    # Earliest enqueued deadline IGNORING `skip_slot`. NO_HZ uses this to
+    # disregard the periodic scheduler-tick hrtimer (which would otherwise
+    # always keep a 10 ms deadline pending and defeat dynticks) when
+    # deciding how long the CPU may sleep. Returns 0 if no other timer is
+    # pending. The queue is sorted, so we walk from the head until we hit
+    # a slot that isn't the skipped one.
+    i: uint64 = 0
+    while i < ht_qlen:
+        if cast[int64](ht_q[i]) != skip_slot:
+            return ht_expires[ht_q[i]]
+        i = i + 1
+    return 0
+
+
+# --- reprogram the clockevent ----------------------------------------
+
+def hrtimer_reprogram():
+    # Program the clockevent one-shot for the earliest pending hrtimer.
+    # No-op if the queue is empty (the tick layer decides whether to stop
+    # the tick — NO_HZ) or the clockevent is unavailable (fall back to
+    # the legacy periodic tick walking the queue each 100 Hz tick).
+    if clockevent_available() == 0:
+        return
+    if ht_qlen == 0:
+        return
+    next_ns: uint64 = ht_expires[ht_q[0]]
+    now: uint64 = clocksource_read_ns()
+    delta: uint64 = 0
+    if next_ns > now:
+        delta = next_ns - now
+    else:
+        delta = CLOCKEVT_MIN_DELTA_NS        # already due: fire ASAP
+    clockevent_set_next_event_ns(delta)
+    clockevent_record_deadline(next_ns)
+
+
+# --- public hrtimer API ----------------------------------------------
+
+def hrtimer_create(fn_ptr: uint64, data: uint64) -> int64:
+    # Allocate a hrtimer (INACTIVE). fn_ptr is the
+    # enum hrtimer_restart (*)(hrtimer*) callback; data is an opaque
+    # cookie the caller gets back. Returns a slot id (handle) or -1.
+    slot: int64 = _ht_alloc_slot()
+    if slot < 0:
+        return -1
+    si: uint64 = cast[uint64](slot)
+    ht_fn[si]      = fn_ptr
+    ht_data[si]    = data
+    ht_expires[si] = 0
+    ht_state[si]   = HRTIMER_STATE_INACTIVE
+    return slot
+
+
+def hrtimer_start_abs(slot: uint64, expires_ns: uint64) -> int32:
+    # Arm hrtimer `slot` to fire at absolute monotonic time expires_ns.
+    # If already enqueued, re-positions it (hrtimer_start semantics).
+    # Reprograms the clockevent for the (possibly new) earliest deadline.
+    if slot >= MAX_HRTIMERS:
+        return -1
+    if ht_used[slot] == 0:
+        return -1
+    # Remove from the queue if currently enqueued (re-arm).
+    if ht_state[slot] == HRTIMER_STATE_ENQUEUED:
+        _ht_queue_remove_slot(slot)
+    ht_expires[slot] = expires_ns
+    ht_state[slot]   = HRTIMER_STATE_ENQUEUED
+    _ht_queue_insert(slot)
+    ht_enqueue_count = ht_enqueue_count + 1
+    hrtimer_reprogram()
+    return 0
+
+
+def hrtimer_start_rel(slot: uint64, delta_ns: uint64) -> int32:
+    # Relative arm: fire delta_ns from now.
+    now: uint64 = clocksource_read_ns()
+    return hrtimer_start_abs(slot, now + delta_ns)
+
+
+def hrtimer_cancel(slot: uint64) -> int32:
+    # Cancel hrtimer `slot`. Returns 1 if it was active, 0 otherwise.
+    if slot >= MAX_HRTIMERS:
+        return 0
+    if ht_used[slot] == 0:
+        return 0
+    was_active: int32 = 0
+    if ht_state[slot] == HRTIMER_STATE_ENQUEUED:
+        was_active = 1
+        _ht_queue_remove_slot(slot)
+        ht_state[slot] = HRTIMER_STATE_INACTIVE
+        hrtimer_reprogram()
+    return was_active
+
+
+def hrtimer_destroy(slot: uint64):
+    # Cancel + free the slot.
+    hrtimer_cancel(slot)
+    if slot < MAX_HRTIMERS:
+        _ht_free_slot(slot)
+
+
+def hrtimer_forward(slot: uint64, now_ns: uint64,
+                    interval_ns: uint64) -> uint64:
+    # Advance the timer's expiry to the next interval boundary at or
+    # after now_ns; return the number of intervals skipped. Used by
+    # periodic callers inside their callback before returning RESTART.
+    if slot >= MAX_HRTIMERS or interval_ns == 0:
+        return 0
+    if ht_used[slot] == 0:
+        return 0
+    exp: uint64 = ht_expires[slot]
+    overruns: uint64 = 0
+    while exp <= now_ns:
+        exp = exp + interval_ns
+        overruns = overruns + 1
+    ht_expires[slot] = exp
+    return overruns
+
+
+def hrtimer_is_queued(slot: uint64) -> int32:
+    if slot >= MAX_HRTIMERS:
+        return 0
+    if ht_state[slot] == HRTIMER_STATE_ENQUEUED:
+        return 1
+    return 0
+
+
+def hrtimer_get_expires(slot: uint64) -> uint64:
+    if slot >= MAX_HRTIMERS:
+        return 0
+    return ht_expires[slot]
+
+
+def hrtimer_set_data(slot: uint64, data: uint64):
+    # Update the opaque cookie passed to the callback. Used by the
+    # scheduler-tick hrtimer to set its cookie to its own slot id after
+    # create returned the id (the canonical self-referential timer).
+    if slot < MAX_HRTIMERS:
+        ht_data[slot] = data
+
+
+# --- the interrupt / expiry path -------------------------------------
+
+def hrtimer_interrupt(now_ns: uint64) -> uint64:
+    # Expire every hrtimer whose deadline has passed, invoking its
+    # callback, then reprogram the clockevent for the next pending one.
+    # Returns the count of timers fired this pass (diagnostics). Called
+    # from the timer ISR (kernel/time/tick.ad) on every tick / one-shot
+    # firing.
+    #
+    # A callback may re-arm itself (HRTIMER_RESTART + hrtimer_forward) or
+    # arm OTHER timers, mutating the queue mid-walk; we always re-read the
+    # head, so newly-due timers added by a callback fire in the same pass
+    # if they're already past `now_ns`.
+    fired: uint64 = 0
+    # Bound the loop so a pathological self-re-arming-to-the-past callback
+    # cannot spin forever in one interrupt.
+    guard: uint64 = 0
+    while ht_qlen > 0 and guard < (MAX_HRTIMERS * 2):
+        guard = guard + 1
+        head: uint64 = ht_q[0]
+        if ht_expires[head] > now_ns:
+            break                              # earliest not yet due
+        # Dequeue the head before calling the callback (Linux removes the
+        # timer from the queue while running its function).
+        _ht_queue_remove_at(0)
+        ht_state[head] = HRTIMER_STATE_INACTIVE
+        fn: uint64   = ht_fn[head]
+        data: uint64 = ht_data[head]
+        fired = fired + 1
+        ht_fired_count = ht_fired_count + 1
+        ret: int64 = HRTIMER_NORESTART
+        if fn != 0:
+            # enum hrtimer_restart (*)(hrtimer *). We pass the opaque
+            # cookie (sleeper task id / posix-timer id) as the single arg
+            # rather than a struct pointer — Hamnix callbacks key off the
+            # cookie. The callback may call hrtimer_forward(head, ...).
+            call_fn: Fn[int64, uint64] = cast[Fn[int64, uint64]](fn)
+            ret = call_fn(data)
+        # RESTART: the callback updated ht_expires[head] (via
+        # hrtimer_forward) and wants to be re-enqueued.
+        if ret == HRTIMER_RESTART and ht_used[head] == 1:
+            ht_state[head] = HRTIMER_STATE_ENQUEUED
+            _ht_queue_insert(head)
+    # Reprogram for whatever is now earliest (or leave to the tick layer
+    # if empty — NO_HZ decides there).
+    hrtimer_reprogram()
+    return fired
+
+
+def hrtimer_fired_total() -> uint64:
+    return ht_fired_count

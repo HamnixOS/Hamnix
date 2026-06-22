@@ -1,0 +1,293 @@
+# kernel/time/tick.ad
+#
+# Tick layer + NO_HZ dynticks. Mirrors kernel/time/tick-sched.c. Ties the
+# clocksource (time read), clockevent (next-event program), and hrtimer
+# (deadline queue) together and owns the policy that decides, on every
+# timer interrupt and every idle entry, WHEN the next timer interrupt
+# should fire.
+#
+# Three regimes:
+#
+#   PERIODIC (boot default)
+#       The LAPIC fires at a fixed 100 Hz. Every interrupt runs the
+#       hrtimer expiry pass against the current ns clock — so hrtimers
+#       still get sub-tick *deadline accuracy of the clock read*, but the
+#       *interrupt granularity* is 10 ms. This is the safe fallback when
+#       the clockevent one-shot is unavailable.
+#
+#   HIGHRES one-shot
+#       The clockevent is armed for the EXACT next hrtimer deadline. A
+#       timer set for T ns fires at ~T (interrupt-latency bounded), not
+#       rounded to the next 10 ms tick. After each firing the tick layer
+#       reprograms for the next earliest hrtimer (hrtimer_reprogram).
+#
+#   NO_HZ idle (dynticks)
+#       When a CPU goes idle and the next hrtimer is far away (or there is
+#       none), the periodic tick is a waste — it wakes the CPU 100x/s to
+#       do nothing. tick_nohz_idle_enter() instead programs the clockevent
+#       for the next real deadline (or a long backstop) and lets the CPU
+#       sleep through the ticks it would have taken. On wake,
+#       tick_nohz_idle_exit() reads the clock and ACCOUNTS the jiffies
+#       that elapsed while the tick was stopped, so timekeeping stays
+#       correct across the idle.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.time.clocksource import (
+    clocksource_read_ns, clocksource_register, clocksource_is_selected,
+    CS_NAME_TSC, CS_NAME_HPET, CS_NAME_JIFFIES,
+)
+from kernel.time.clockevent import (
+    clockevent_init, clockevent_available, clockevent_set_next_event_ns,
+    clockevent_set_periodic, clockevent_is_oneshot, clockevent_record_deadline,
+    clockevent_next_deadline_ns,
+)
+from kernel.time.hrtimer import (
+    hrtimer_init_subsys, hrtimer_interrupt, hrtimer_next_expiry,
+    hrtimer_pending_count, hrtimer_create, hrtimer_start_rel,
+    hrtimer_forward, hrtimer_set_data, hrtimer_next_expiry_excluding,
+    HRTIMER_RESTART,
+)
+
+extern def read_tsc() -> uint64
+
+# Clock-source read shims. The registry stores a raw function pointer; we
+# need plain `u64 (*)(void)` adapters for each source.
+from arch.x86.kernel.time import (
+    get_jiffies, tsc_calibrated, tsc_hz_get, register_hrtimer_tick_hook,
+)
+from drivers.clocksource.hpet import (
+    hpet_available, hpet_read_counter, hpet_frequency_hz,
+)
+
+# --- NO_HZ / tick state ---------------------------------------------
+
+# 1 once tick_init switched the box into high-res one-shot mode.
+tk_highres: uint8 = 0
+# 1 while a CPU has stopped the tick in NO_HZ idle.
+tk_nohz_active: uint8 = 0
+# Monotonic ns at the moment the tick was stopped (NO_HZ enter). Used to
+# account skipped jiffies on exit.
+tk_nohz_stopped_ns: uint64 = 0
+# Count of jiffies accounted as "skipped while tickless" — diagnostics
+# proving NO_HZ actually stopped the tick.
+tk_nohz_skipped_jiffies: uint64 = 0
+tk_nohz_enter_count:     uint64 = 0
+
+# NO_HZ backstop: even with no hrtimer pending we don't sleep forever —
+# program a long one-shot so timekeeping (jiffies accounting) re-syncs at
+# least this often. 1 s is plenty; a wake source (IRQ / reschedule IPI)
+# normally arrives far sooner.
+TK_NOHZ_BACKSTOP_NS: uint64 = 1000000000     # 1 s
+NS_PER_JIFFY: uint64 = 10000000              # 10 ms at HZ=100
+
+
+# --- clocksource read adapters --------------------------------------
+
+def _cs_read_tsc() -> uint64:
+    return read_tsc()
+
+
+def _cs_read_hpet() -> uint64:
+    return hpet_read_counter()
+
+
+def _cs_read_jiffies() -> uint64:
+    # The jiffies "cycle counter" ticks at HZ (100 Hz). Registered with
+    # freq=100 so cyc->ns yields 10 ms granularity — the always-available
+    # last-resort source.
+    return get_jiffies()
+
+
+# --- scheduler-tick hrtimer (tick_setup_sched_timer) ----------------
+#
+# In one-shot mode the legacy 100 Hz periodic LAPIC interrupt no longer
+# fires — yet the scheduler still needs a regular tick for preemption +
+# time accounting. Linux solves this with a self-rearming hrtimer (the
+# "tick_sched" timer) that fires every jiffy. We do the same: a hrtimer
+# armed for NS_PER_JIFFY that, in its callback, forwards itself one jiffy
+# and returns HRTIMER_RESTART. Because it's always the nearest deadline
+# while the system is busy, hrtimer_reprogram() never programs the
+# clockevent beyond 10 ms — so preemption keeps working — while a sooner
+# user hrtimer (a 1 ms nanosleep) still pre-empts it and fires on time.
+#
+# In NO_HZ idle the idle path cancels reliance on this (it programs the
+# clockevent for the next REAL deadline and accounts skipped jiffies on
+# wake), so the sched-tick hrtimer doesn't defeat dynticks.
+
+tk_sched_timer: int64 = -1
+
+
+def _tick_sched_timer_cb(cookie: uint64) -> int64:
+    # Re-arm one jiffy out and keep ticking. The actual scheduler work
+    # (preempt accounting) still rides the LAPIC ISR -> preempt_tick path;
+    # this timer's job is purely to GUARANTEE the clockevent keeps firing
+    # at >= HZ while busy, so one-shot mode never starves preemption.
+    # `cookie` is the timer's own slot id (set at create time).
+    now: uint64 = clocksource_read_ns()
+    hrtimer_forward(cookie, now, NS_PER_JIFFY)
+    return HRTIMER_RESTART
+
+
+# --- init ------------------------------------------------------------
+
+def tick_init() -> int32:
+    # Bring the whole time subsystem online. Order matters:
+    #   1. hrtimer subsystem reset
+    #   2. register clocksources (jiffies always; HPET / TSC if present),
+    #      best-rated is auto-selected
+    #   3. bring up the clockevent (LAPIC one-shot)
+    #   4. switch to high-res one-shot mode if the clockevent is usable
+    #
+    # Must run AFTER tsc_init + lapic_calibrate (boot:12/14) so the TSC
+    # frequency + LAPIC timer Hz are known.
+    hrtimer_init_subsys()
+
+    # jiffies: always available, rating 1 (last resort).
+    clocksource_register(CS_NAME_JIFFIES, cast[uint64](&_cs_read_jiffies),
+                         0xFFFFFFFFFFFFFFFF, 100, 1)
+    # HPET: rating 250 if the controller probed.
+    if hpet_available() != 0:
+        hz: uint64 = hpet_frequency_hz()
+        if hz != 0:
+            # HPET main counter is at least 32-bit (QEMU exposes 64-bit);
+            # use a 64-bit mask — _hpet_read64 returns the full counter.
+            clocksource_register(CS_NAME_HPET,
+                                 cast[uint64](&_cs_read_hpet),
+                                 0xFFFFFFFFFFFFFFFF, hz, 250)
+    # TSC: rating 300 (ideal) if calibrated.
+    if tsc_calibrated() != 0:
+        thz: uint64 = tsc_hz_get()
+        if thz != 0:
+            clocksource_register(CS_NAME_TSC, cast[uint64](&_cs_read_tsc),
+                                 0xFFFFFFFFFFFFFFFF, thz, 300)
+
+    if clocksource_is_selected() == 0:
+        printk0("tick: NO clocksource selected — staying on jiffies tick\n")
+        return -1
+
+    # Clockevent (LAPIC one-shot).
+    if clockevent_init() != 0:
+        printk0("tick: clockevent unavailable — PERIODIC tick only\n")
+        tk_highres = 0
+        return 0
+
+    # Switch into high-resolution one-shot mode. Arm for the first
+    # pending hrtimer (none yet -> the periodic tick keeps the box live
+    # until the first timer is queued, then hrtimer_reprogram takes over).
+    tk_highres = 1
+    printk0("tick: high-resolution mode enabled (clockevent one-shot)\n")
+    # Register the per-tick hrtimer expiry pass with the arch timer ISR.
+    # From here every LAPIC firing (periodic tick OR one-shot) runs
+    # tick_handle_interrupt() -> hrtimer_interrupt() at ns resolution.
+    register_hrtimer_tick_hook(cast[Fn[None]](&tick_handle_interrupt))
+    # Arm the self-rearming scheduler-tick hrtimer (Linux's tick_sched
+    # timer) so one-shot mode never starves preemption: it keeps a deadline
+    # at most one jiffy out while the system is busy. A sooner user hrtimer
+    # still pre-empts it. NO_HZ idle overrides by programming the next REAL
+    # deadline directly + accounting skipped jiffies on wake.
+    st: int64 = hrtimer_create(cast[uint64](&_tick_sched_timer_cb), 0)
+    if st >= 0:
+        tk_sched_timer = st
+        hrtimer_set_data(cast[uint64](st), cast[uint64](st))   # cookie = own slot
+        hrtimer_start_rel(cast[uint64](st), NS_PER_JIFFY)
+    return 0
+
+
+def tick_is_highres() -> int32:
+    return cast[int32](tk_highres)
+
+
+# --- the timer-interrupt entry --------------------------------------
+
+def tick_handle_interrupt():
+    # Called from arch/x86/kernel/time.ad::timer_interrupt() on EVERY
+    # timer firing (periodic tick OR clockevent one-shot). Runs the
+    # hrtimer expiry pass against the live ns clock and lets the hrtimer
+    # layer reprogram the clockevent for the next deadline.
+    #
+    # In one-shot mode this is the ONLY thing that re-arms the timer, so
+    # it must always run. In periodic mode the 100 Hz interrupt also
+    # lands here; hrtimer_interrupt() still fires any due timers (clock
+    # read is ns-accurate) and reprograms — harmless if the clockevent is
+    # periodic (the reprogram switches it to one-shot for the next
+    # deadline, giving high-res behaviour the moment a hrtimer exists).
+    if clocksource_is_selected() == 0:
+        return
+    now: uint64 = clocksource_read_ns()
+    hrtimer_interrupt(now)
+
+
+# --- NO_HZ dynticks --------------------------------------------------
+
+def tick_nohz_idle_enter() -> int32:
+    # Called by the idle loop when a CPU is about to halt with nothing to
+    # run. Stop the periodic tick: program the clockevent for the next
+    # real hrtimer deadline (or a 1 s backstop), so the CPU sleeps through
+    # the ticks it would otherwise take doing nothing.
+    #
+    # Returns 1 if the tick was stopped (caller may hlt and rely on the
+    # one-shot / an IRQ to wake it), 0 if NO_HZ is unavailable (caller
+    # keeps the periodic tick).
+    if tk_highres == 0 or clockevent_available() == 0:
+        return 0
+    if tk_nohz_active != 0:
+        return 1                               # already stopped
+    now: uint64 = clocksource_read_ns()
+    # Disregard the periodic scheduler-tick hrtimer when deciding how long
+    # to sleep — it always has a <=10 ms deadline pending and would defeat
+    # dynticks. NO_HZ stops the tick precisely to skip those. The real
+    # next deadline is the earliest USER/posix hrtimer (or the 1 s
+    # backstop). On wake, tick_nohz_idle_exit accounts the skipped jiffies
+    # the sched-tick would have taken.
+    next_hr: uint64 = hrtimer_next_expiry_excluding(tk_sched_timer)
+    delta: uint64 = TK_NOHZ_BACKSTOP_NS
+    if next_hr != 0:
+        if next_hr > now:
+            d: uint64 = next_hr - now
+            if d < delta:
+                delta = d
+        else:
+            # A hrtimer is already due — don't stop the tick; let the
+            # normal path expire it.
+            return 0
+    # Program the one-shot for the chosen deadline and record the stop.
+    clockevent_set_next_event_ns(delta)
+    clockevent_record_deadline(now + delta)
+    tk_nohz_stopped_ns = now
+    tk_nohz_active = 1
+    tk_nohz_enter_count = tk_nohz_enter_count + 1
+    return 1
+
+
+def tick_nohz_idle_exit():
+    # Called when a CPU wakes from NO_HZ idle (an IRQ, the one-shot, or a
+    # reschedule IPI fired). Account the jiffies that elapsed while the
+    # tick was stopped so timekeeping stays correct, then restore the
+    # normal tick handling. The clock itself (clocksource) never stopped —
+    # only the periodic *interrupt* did — so reading clocksource_read_ns()
+    # gives the true elapsed time; we convert it to skipped jiffies for
+    # the diagnostics + any jiffies-based accounting.
+    if tk_nohz_active == 0:
+        return
+    now: uint64 = clocksource_read_ns()
+    elapsed_ns: uint64 = 0
+    if now > tk_nohz_stopped_ns:
+        elapsed_ns = now - tk_nohz_stopped_ns
+    skipped: uint64 = elapsed_ns / NS_PER_JIFFY
+    tk_nohz_skipped_jiffies = tk_nohz_skipped_jiffies + skipped
+    tk_nohz_active = 0
+    # Expire any hrtimers that came due during the idle and reprogram for
+    # the next. (The clock never lied; we just hadn't run the expiry pass.)
+    hrtimer_interrupt(now)
+
+
+def tick_nohz_is_active() -> int32:
+    return cast[int32](tk_nohz_active)
+
+
+def tick_nohz_skipped_jiffies_total() -> uint64:
+    return tk_nohz_skipped_jiffies
+
+
+def tick_nohz_enter_total() -> uint64:
+    return tk_nohz_enter_count

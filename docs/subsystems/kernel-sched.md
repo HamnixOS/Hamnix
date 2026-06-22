@@ -98,8 +98,19 @@ new work is placed by `sched_pick_target_cpu`. Wait queues use
   the rq lock and marked `prev` READY before `__switch_to_asm` saved
   `prev->sp`; an AP could steal a not-yet-saved task. Touch the
   lock/READY/save ordering with care.
-- The tick is 100 Hz PIT-driven (`arch/x86/kernel/time.ad`); it is
-  tickful, not tickless (a known modernization gap).
+- The tick is 100 Hz LAPIC-periodic by default (`arch/x86/kernel/time.ad`),
+  but the **Linux-shape time subsystem** (`kernel/time/`) now sits on top
+  of it: a **clocksource registry** (TSC/HPET/jiffies, rating-based
+  selection, mult/shift cyc→ns), a **clockevent** LAPIC one-shot, a real
+  **ns-resolution hrtimer queue** (sorted by absolute ns expiry, backed by
+  the clockevent one-shot — replaces the old 16-slot jiffies wheel), and
+  **NO_HZ dynticks** that stop the periodic tick when a CPU idles with no
+  near deadline (skipped jiffies accounted on wake). A self-rearming
+  scheduler-tick hrtimer keeps preemption alive in one-shot mode. POSIX
+  per-process CPU timers (`CLOCK_PROCESS_CPUTIME_ID`) ride the same base.
+  Brought up at `boot:16.time` (`tick_init`); self-test
+  `scripts/test_hrtimer.sh`. Resolution before→after: 10 ms (jiffies wheel)
+  → sub-ms (TSC clocksource + clockevent one-shot).
 
 ## Related docs
 
