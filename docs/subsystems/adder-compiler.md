@@ -97,6 +97,23 @@ must reach full parity to drive the build self-hosted. Two host-only gates
 width (signed/unsigned, `.data`/`.bss`), casts (narrowing truncation +
 widening extension), compares, div/mod (signed/unsigned), while-loops,
 if/elif/else, break/continue, pointers, syscalls, helper calls.
+
+**Sub-8-byte LOCAL stores are SIZED (`movl`/`movw`/`movb`) — cutover
+keystone.** An assignment into a sub-8-byte scalar LOCAL must truncate to the
+slot's declared width, exactly like `codegen_x86._emit_local_store`.
+`store_to_named` now consults `lookup_local_scalar_size` and emits
+`emit_store_local_rax_sized(off, width)` (movl/movw/movb) instead of a blind
+8-byte `movq`. This was the LAST self-hosting-cutover miscompile: the whole
+image built with `ADDER_CC=adder` booted to PID-1 init but every
+`execve` failed with `kmalloc: request 67108864` — the native backend stored
+a uint32 file-size local with a non-truncating `movq`, so the misread size
+overflowed bit 31, got clamped to `_NS_BLOB_MAX` (67108864 = 64 MiB), and the
+64 MiB `kmalloc` exceeded `MAX_ORDER`. The divergence was localized by
+objdump-diffing `fs/vfs.ad`/`fs/tmpfs.ad` exec-path functions (seed `movl`
+stores vs native `movq`). Behavioral + emission regression:
+`scripts/test_local_store_trunc.sh` (fixture
+`tests/fuzz/regress_local_store_trunc.ad`, seed-oracle exit 85; pre-fix
+native exits 0).
 **Multi-dimensional array globals** (`Array[N, Array[M, T]]`) index
 level-by-level: each global carries its array type node (`glob_type_node`),
 the outer index scales by the nested row stride (`type_size_of(element)`)
