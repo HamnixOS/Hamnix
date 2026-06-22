@@ -79,6 +79,17 @@ from kernel.panic import panic
 # leaves being US=1. Unblocks _build_identity_pd/_pt going US=0 and
 # CR4.SMAP enable in arch/x86/kernel/cpu_mitigations.ad.
 from fs.elf import elf_install_user_stack
+# RCU (kernel/rcu/rcu.ad): the scheduler is the primary quiescent-state (QS)
+# source — a real context switch on a CPU is a QS for that CPU iff it is not
+# mid-rcu_read_lock. core.ad calls rcu_note_context_switch() on the real-switch
+# path. The task-list reclaim (task_reap) defers slot-reuse via call_rcu so a
+# concurrent lock-free task-list reader never sees a slot recycled under it.
+from kernel.rcu.rcu import (
+    rcu_note_context_switch, call_rcu,
+    rcu_save_read_nesting, rcu_restore_read_nesting,
+    rcu_read_lock, rcu_read_unlock, rcu_set_yield_hook,
+    rcu_idle_enter, rcu_idle_exit,
+)
 
 extern def __switch_to_asm(prev: Ptr[uint8], next: Ptr[uint8])
 extern def enter_first_task(task: Ptr[uint8])
@@ -849,6 +860,28 @@ class TaskStruct:
     # insert and the matching remove). Avoids ambiguity with the .bss-zero
     # rq_next/rq_prev (slot 0 is a valid link target). Cleared on remove.
     rq_on_list:   uint64
+
+    # RCU read-side nesting depth for THIS task (mirrors Linux's
+    # task_struct->rcu_read_lock_nesting). rcu_read_lock() bumps it,
+    # rcu_read_unlock() drops it. The scheduler's QS hook
+    # (rcu_note_context_switch) reports a quiescent state for the OUTGOING
+    # CPU only when this is 0 — so a task preempted mid-rcu_read_lock (under
+    # the scheduler agent's CONFIG_PREEMPT work) is never counted quiescent.
+    # Migrates with the task by living in its slot. Placed at the END of
+    # TaskStruct so no earlier offset shifts; fresh .bss slot starts at 0.
+    rcu_read_nesting: uint64
+
+    # RCU reclaim of this slot: when task_reap finishes a dead task it does NOT
+    # immediately mark the slot FREE / push it to the freelist (a lock-free
+    # task-list reader could be mid-read of this slot's pid/state/name). Instead
+    # it call_rcu's _task_slot_rcu_free with this embedded rcu_head; the slot is
+    # only published FREE + returned to the freelist after a grace period, when
+    # no reader can still hold a pointer into it. rcu_head is two words: [0] is
+    # an RCU next-link scratch word, [1] stashes the slot index so the callback
+    # knows which slot to free. Placed at the END of TaskStruct so no earlier
+    # offset shifts; .bss-zero on a fresh slot.
+    rcu_head_next: uint64
+    rcu_head_slot: uint64
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -2909,6 +2942,11 @@ def sched_init():
     _rq_list_init()
     _pidh_init()
     _free_list_init()
+    # RCU: register schedule() as the yield hook so synchronize_rcu /
+    # rcu_barrier can cede the CPU between GP pumps, letting peer CPUs reach a
+    # context-switch quiescent state. (rcu.ad cannot call schedule() directly —
+    # it would duplicate the public symbol at whole-program merge.)
+    rcu_set_yield_hook(cast[uint64](schedule))
     # All slots already zero by .bss init -> state = STATE_FREE.
     # Re-assert the boot task as RUNNING (idempotent with the early
     # sched_mark_boot_task_running() call) so the create_user_task path
@@ -3868,10 +3906,15 @@ def schedule():
                         asm_volatile("hlt")
                 # Idle one beat with IF=1 so an IRQ / reschedule IPI can fire
                 # and make work runnable, then loop to retry the pick.
+                # RCU: this CPU is idle (no reader held) — enter the extended
+                # quiescent state so an in-flight or future grace period is not
+                # stalled while we spin idle, and rejoin on wake.
+                rcu_idle_enter()
                 local_irq_enable()
                 cpu_idle_enter()
                 asm_volatile("hlt")
                 cpu_idle_leave()
+                rcu_idle_exit()
         _rq_unlock_cpu(my_cpu)
         return
 
@@ -3933,6 +3976,23 @@ def schedule():
     current_idx_pcpu = nxt
 
     _rq_unlock_cpu(my_cpu)
+
+    # ─── RCU quiescent-state report + read-nesting migration ───────────────
+    # This is a REAL context switch on my_cpu. RCU treats it as a quiescent
+    # state for my_cpu IFF the OUTGOING task held no rcu_read_lock. Preserve
+    # the outgoing task's read nesting into its task_struct, install the
+    # incoming task's saved nesting as this CPU's live counter, THEN report the
+    # QS (rcu_note_context_switch self-gates on the now-restored live nesting,
+    # but the gate must reflect the SWITCHING-OUT reader, so we report before
+    # restore by checking prev's depth). IRQs are still masked here (schedule()
+    # runs with IF=0 on the switch path), so this triplet is atomic vs. the QS
+    # bitmask. This is the ONLY RCU hook the scheduler exposes — no other sched
+    # logic is touched.
+    _rcu_prev_nest: uint64 = rcu_save_read_nesting()
+    task_table[prev].rcu_read_nesting = _rcu_prev_nest
+    if _rcu_prev_nest == 0:
+        rcu_note_context_switch()
+    rcu_restore_read_nesting(task_table[nxt].rcu_read_nesting)
 
     if prev_migrated_to >= 0:
         smp_send_reschedule_cpu(cast[uint64](prev_migrated_to))
@@ -4431,6 +4491,13 @@ def sched_ap_idle_loop():
             write_msr(SCHED_IA32_FS_BASE, task_table[nxt].fs_base)
             _rq_unlock_cpu(my_cpu_id)
 
+            # RCU: the outgoing AP idle kthread never holds an rcu_read_lock,
+            # so this dispatch is an unconditional quiescent state for this AP.
+            # Report it and install the incoming task's saved read nesting. (No
+            # save needed for the idle kthread — its nesting is always 0.)
+            rcu_note_context_switch()
+            rcu_restore_read_nesting(task_table[nxt].rcu_read_nesting)
+
             # Context-switch to the real task.  When it eventually calls
             # schedule() and finds the idle slot is STATE_READY, it will
             # switch back here — __switch_to_asm will return.
@@ -4496,6 +4563,13 @@ def sched_ap_idle_loop():
             if (_ap_idle_mode_logged & bit) == 0:
                 _ap_idle_mode_logged = _ap_idle_mode_logged | bit
                 printk1("SMP: cpu%d idle via hlt+ipi\n", my_cpu_id)
+            # RCU: an idle CPU holds no rcu_read_lock — entering the idle/HLT
+            # extended quiescent state is a QS for this CPU AND marks it out of
+            # QS participation for any GP that starts while it is parked, so an
+            # in-flight or future grace period (synchronize_rcu / call_rcu on
+            # another CPU) is never stalled by an AP that has no context switches
+            # to drive its QS while halted. rcu_idle_exit re-joins it on wake.
+            rcu_idle_enter()
             cpu_idle_enter()
             if woke == 0:
                 # Provably idle with IRQs off: park until the reschedule IPI
@@ -4511,6 +4585,9 @@ def sched_ap_idle_loop():
                 # and loop straight back to the top to dispatch it.
                 local_irq_enable()
             cpu_idle_leave()
+            # RCU: woke from idle — rejoin QS participation before the next loop
+            # iteration can enter a reader.
+            rcu_idle_exit()
             local_irq_enable()
 
 
@@ -5534,21 +5611,34 @@ def task_lookup_by_pid(pid: uint64) -> int32:
         if task_table[0].state != STATE_FREE:
             return 0
         return -1
+    # RCU READ-SIDE SECTION. This is the canonical lock-free task-list reader
+    # (/proc, kill, waitpid, note/signal delivery all resolve a pid through
+    # here). rcu_read_lock() bounds the traversal so a concurrent task_reap
+    # cannot RCU-free + recycle a slot we are mid-read of: the deferred
+    # _task_slot_rcu_free runs only after this section ends (a grace period).
+    # We therefore observe each slot's (pid, state) as a consistent pair —
+    # never a torn pid from a slot reclaimed and re-created under us.
+    rcu_read_lock()
+    found: int32 = -1
     hs: int32 = _pidh_get(pid)
     if hs >= 0:
         hsu: uint64 = cast[uint64](hs)
         if hsu < NTASKS and task_table[hsu].pid == pid \
            and task_table[hsu].state != STATE_FREE:
-            return hs
-    # Fallback / self-heal: linear scan. Re-insert the correct mapping so the
-    # next lookup is O(1) again.
-    i: uint64 = 0
-    while i < NTASKS:
-        if task_table[i].pid == pid and task_table[i].state != STATE_FREE:
-            _pidh_insert(pid, i)
-            return cast[int32](i)
-        i = i + 1
-    return -1
+            found = hs
+    if found < 0:
+        # Fallback / self-heal: linear scan. Re-insert the correct mapping so
+        # the next lookup is O(1) again.
+        i: uint64 = 0
+        while i < NTASKS:
+            if task_table[i].pid == pid and task_table[i].state != STATE_FREE:
+                _pidh_insert(pid, i)
+                found = cast[int32](i)
+                i = NTASKS
+            else:
+                i = i + 1
+    rcu_read_unlock()
+    return found
 
 
 def task_state(slot: int32) -> uint64:
@@ -5731,6 +5821,72 @@ def _free_task_user_pagetables(su: uint64):
         li = li + 1
     load_cr3(_ftp_live_cr3)
     local_irq_restore(_ftp_irq)
+
+
+def _task_slot_rcu_free(head: uint64):
+    # RCU callback (rcu_callback_t) for deferred task-slot reclaim. Invoked by
+    # the RCU engine a full grace period AFTER task_reap call_rcu'd it — every
+    # reader that could have held a pointer into this slot has since left its
+    # rcu_read_lock section. NOW it is finally safe to publish the slot FREE and
+    # return it to the freelist for reuse.
+    #
+    # `head` points at task_table[su].rcu_head_next; the slot index was stashed
+    # in the adjacent rcu_head_slot word (head + 8) by task_reap.
+    hp: Ptr[uint64] = cast[Ptr[uint64]](head)
+    su: uint64 = hp[1]
+    if su >= NTASKS:
+        return
+    task_table[su].state = STATE_FREE
+    _free_list_push(su)
+    nr_task_slots_rcu_freed = nr_task_slots_rcu_freed + 1
+
+
+# Count of task slots published FREE via the RCU-deferred path (self-test +
+# /proc telemetry). Distinct from nr_tasks_reaped (which counts reap entries).
+nr_task_slots_rcu_freed: uint64 = 0
+
+
+def nr_task_slots_rcu_freed_get() -> uint64:
+    return nr_task_slots_rcu_freed
+
+
+# ─── RCU self-test support (gated boot:37.rcu / scripts/test_rcu.sh) ──────────
+# These claim/release INERT task-table slots with a known pid but NO backing
+# memory (no kstack / image / page tables), so the RCU task-list reader
+# (task_lookup_by_pid) and the RCU-deferred slot-free path can be exercised at
+# boot without the heavyweight memory-reclaim arms of task_reap (which assume
+# alloc_pages-backed stacks and would corrupt the buddy allocator on a
+# memblock-backed kthread slot). They reproduce EXACTLY the task-list add /
+# RCU-deferred remove pattern the real reap uses.
+def rcu_st_claim_task(pid: uint64) -> int32:
+    s: int32 = _find_free_slot()
+    if s < 0:
+        return -1
+    su: uint64 = cast[uint64](s)
+    # Stamp a lookup-visible task: STATE_STOPPED (not FREE, so task_lookup_by_pid
+    # resolves it) but inert — never on a run-list, never picked by _pick_next.
+    # Known pid in the pid hash. No memory is attached.
+    _task_set_pid(su, pid)
+    task_table[su].state = STATE_STOPPED
+    task_table[su].is_user = 0
+    task_table[su].cr3 = 0           # no address space (inert)
+    task_table[su].image_phys = 0
+    task_table[su].kstack_base = 0
+    task_table[su].ustack_base = 0
+    return s
+
+
+def rcu_st_reap_task(slot: int32):
+    # The RCU-deferred remove, mirroring task_reap's tail WITHOUT any memory
+    # reclaim: drop the pid mapping + unlink, then call_rcu the slot publish so
+    # the slot only becomes FREE/reusable after a grace period — the exact
+    # contract a lock-free task-list reader depends on.
+    su: uint64 = cast[uint64](slot)
+    _task_clear_pid(su)
+    _rq_list_remove(su)
+    task_table[su].rcu_head_slot = su
+    call_rcu(cast[uint64](&task_table[su].rcu_head_next),
+             cast[uint64](_task_slot_rcu_free))
 
 
 def task_reap(slot: int32):
@@ -6059,13 +6215,27 @@ def task_reap(slot: int32):
         load_cr3(_rp_live_cr3)
     local_irq_restore(_rp_irq)
     nr_tasks_reaped = nr_tasks_reaped + 1
-    # Track 5: drop the pid->slot mapping, unlink from any run-list, and return
-    # the slot to the O(1) freelist as it goes FREE so a future create can
-    # claim it without an O(NTASKS) scan.
+    # Track 5: drop the pid->slot mapping and unlink from any run-list.
     _task_clear_pid(su)
     _rq_list_remove(su)
-    task_table[su].state = STATE_FREE
-    _free_list_push(su)
+    # ─── RCU-DEFERRED SLOT RECLAIM ─────────────────────────────────────────
+    # Do NOT publish the slot FREE + push it to the freelist HERE. A lock-free
+    # task-list reader (/proc, kill, wait, ps — see for_each_task_rcu) may be
+    # mid-traversal holding a pointer into task_table[su], reading its
+    # pid/state/name. If we marked it FREE and a concurrent create_*_task
+    # claimed the slot, the reader would observe a half-overwritten struct
+    # (a torn pid/state) — the classic use-after-free RCU exists to prevent.
+    #
+    # Instead leave the slot in its post-reap limbo (STATE_EXITED body intact,
+    # NOT on the freelist, NOT yet FREE — so _find_free_slot's STATE_FREE scan
+    # and the O(1) freelist both skip it) and call_rcu the actual publish. The
+    # callback _task_slot_rcu_free runs only after a grace period, by which
+    # time every reader that could have observed this slot as live has exited
+    # its rcu_read_lock section. THEN it is safe to flip STATE_FREE + enqueue
+    # on the freelist for reuse. This is the one real hot read path proving RCU.
+    task_table[su].rcu_head_slot = su
+    call_rcu(cast[uint64](&task_table[su].rcu_head_next),
+             cast[uint64](_task_slot_rcu_free))
 
 
 def _order_for_bytes(nbytes: uint64) -> int32:

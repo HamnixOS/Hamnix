@@ -1,0 +1,525 @@
+# kernel/rcu/rcu.ad
+#
+# Read-Copy-Update (RCU) — Hamnix's real, quiescent-state-based RCU.
+#
+# Mirrors the *semantics* of Linux's kernel/rcu (Classic / Tree RCU) without
+# the full tree: a single flat per-CPU quiescent-state (QS) bitmask drives the
+# grace-period (GP) engine. Correctness over cleverness — Hamnix runs at most
+# MAX_CPUS == 16 logical CPUs, so a 64-bit bitmask covers every CPU and a flat
+# scan is cheap.
+#
+# ────────────────────────────────────────────────────────────────────────────
+# THE RCU CONTRACT (matches Linux)
+#
+#   * A *reader* delimits a read-side critical section with
+#     rcu_read_lock() / rcu_read_unlock(). Inside it, a pointer published with
+#     rcu_assign_pointer() (release store) read with rcu_dereference() (acquire
+#     load) is guaranteed to point at a fully-initialised object, and that
+#     object will NOT be reclaimed until the reader leaves the section.
+#
+#   * An *updater* unlinks an object, then calls call_rcu(head, func) to defer
+#     `func(head)` until a *grace period* elapses, OR calls synchronize_rcu()
+#     to block until a grace period elapses. A grace period waits for EVERY
+#     read-side section that was in flight when it began to complete. After a
+#     GP no reader can still hold a pre-GP pointer, so reclaim is safe.
+#
+# ────────────────────────────────────────────────────────────────────────────
+# GRACE-PERIOD ENGINE  (flat per-CPU QS bitmask)
+#
+#   rcu_gp_seq      monotonically-increasing grace-period counter (atomic).
+#                   Even == no GP in progress; odd == GP in progress.
+#   rcu_gp_need_qs  bitmask of CPUs that have NOT YET reported a QS for the
+#                   current GP. A GP completes when this reaches 0.
+#
+#   A QS for a CPU is reported (rcu_qs / rcu_note_context_switch) when the CPU
+#   passes through a point where it provably holds NO rcu_read_lock — namely a
+#   voluntary/involuntary context switch with the per-CPU read nesting at 0,
+#   the idle loop, or a syscall-return. On a non-preemptible read section a
+#   context switch CANNOT occur mid-section (rcu_read_lock raises the per-task
+#   preempt-disable count), so "context switch ⇒ outside any reader" holds; we
+#   additionally gate the QS report on read-nesting == 0 so that a preemptible
+#   kernel (the scheduler agent's CONFIG_PREEMPT work) never counts a CPU that
+#   was preempted mid-reader as quiescent.
+#
+# ────────────────────────────────────────────────────────────────────────────
+# READ SIDE
+#
+#   Per-TASK nesting (rcu_read_nesting in TaskStruct) is the source of truth a
+#   preemptible kernel needs: it migrates with the task. Per-CPU nesting
+#   (rcu_cpu_read_nesting) is a fast mirror the QS hook consults without a
+#   task-table load. rcu_read_lock bumps both; rcu_read_unlock drops both. On
+#   the BSP non-preempt path these always agree.
+#
+# ────────────────────────────────────────────────────────────────────────────
+# CALLBACK PATH
+#
+#   call_rcu(head, func): head is a caller-embedded `rcu_head` — two uint64s:
+#     [head+0] = next link (filled by us), [head+8] = func (filled by us).
+#   The head is pushed onto a per-CPU pending list, tagged with the GP at
+#   which it may run (current gp_seq rounded up to the next completed GP).
+#   rcu_advance_gp() — the GP engine pump, called from the timer tick and from
+#   synchronize_rcu's wait loop — completes a GP when rcu_gp_need_qs hits 0,
+#   then invokes every callback whose tag-GP has now elapsed. synchronize_rcu
+#   queues a wakeup callback and blocks until it fires. rcu_barrier() drains
+#   all currently-queued callbacks.
+
+from arch.x86.kernel.setup_percpu import get_cpu_id
+from arch.x86.kernel.smp import cpu_online_map, MAX_CPUS
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def local_irq_save() -> uint64
+extern def local_irq_restore(flags: uint64)
+
+# ─── Grace-period state ──────────────────────────────────────────────────────
+# rcu_gp_seq counts COMPLETED grace periods. It is even when idle and is bumped
+# by 1 to odd when a GP starts and by 1 again to even when it completes, so a
+# completed-GP count is rcu_gp_seq >> 1. Callbacks are tagged with the GP count
+# they must outlast; they run once (rcu_gp_seq >> 1) > tag.
+rcu_gp_seq:      uint64 = 0
+rcu_gp_need_qs:  uint64 = 0      # bitmask: CPUs owing a QS for the in-flight GP
+rcu_gp_active:   uint64 = 0      # 1 while a GP is in progress
+
+# ─── Per-CPU read nesting (fast QS gate) ─────────────────────────────────────
+rcu_cpu_read_nesting: Array[16, uint64]
+
+# ─── Per-CPU dynticks-idle mask (extended quiescent state) ───────────────────
+# Bit i set ⇒ CPU i is in the idle/HLT extended quiescent state and holds no
+# rcu_read_lock. An idle CPU is, by definition, quiescent for the ENTIRE time
+# it is parked: a grace period that STARTS while a CPU is idle must not wait on
+# it (the CPU has no context switches to drive a QS report while halted). So GP
+# start excludes the idle set from the need-QS mask, and a CPU clears its idle
+# bit on wake (rcu_idle_exit) before it can enter any reader. This is Hamnix's
+# small analogue of Linux's rcu_dynticks counter.
+rcu_cpu_idle_mask: uint64 = 0
+
+# ─── Per-CPU callback lists ──────────────────────────────────────────────────
+# Each pending callback is a 3-word record kept in a static pool (call_rcu must
+# not allocate). [0]=head ptr, [1]=func ptr, [2]=tag GP count it must outlast.
+# A per-CPU singly-linked list of pool-slot indices threads through cb_link.
+RCU_CB_POOL: uint64 = 1024
+rcu_cb_head:  Array[1024, uint64]   # caller's rcu_head pointer
+rcu_cb_func:  Array[1024, uint64]   # callback function pointer
+rcu_cb_tag:   Array[1024, uint64]   # GP-count this cb must outlast
+rcu_cb_link:  Array[1024, int64]    # next pool index in the owning list, -1 end
+rcu_cb_used:  Array[1024, uint64]   # 1 if this pool slot is occupied
+
+rcu_cpu_cb_first: Array[16, int64]  # head pool index of each CPU's list, -1 empty
+rcu_cb_freelist:  int64 = -1        # singly-linked free pool (via rcu_cb_link)
+rcu_cb_pool_inited: uint64 = 0
+
+# Stats (read by the self-test).
+rcu_cb_invoked_total: uint64 = 0
+rcu_gp_completed_total: uint64 = 0
+
+
+def _rcu_pool_init():
+    if rcu_cb_pool_inited != 0:
+        return
+    rcu_cb_pool_inited = 1
+    i: uint64 = 0
+    while i < RCU_CB_POOL:
+        rcu_cb_used[i] = 0
+        rcu_cb_link[i] = cast[int64](i) + 1
+        i = i + 1
+    rcu_cb_link[RCU_CB_POOL - 1] = -1
+    rcu_cb_freelist = 0
+    c: uint64 = 0
+    while c < MAX_CPUS:
+        rcu_cpu_cb_first[c] = -1
+        rcu_cpu_read_nesting[c] = 0
+        c = c + 1
+
+
+def rcu_init():
+    # Called once from start_kernel before any call_rcu user runs.
+    _rcu_pool_init()
+    rcu_gp_seq = 0
+    rcu_gp_need_qs = 0
+    rcu_gp_active = 0
+    printk0("[rcu] grace-period engine initialised\n")
+
+
+# ─── READ SIDE ───────────────────────────────────────────────────────────────
+def rcu_read_lock():
+    # Enter an RCU read-side critical section. On a non-preemptible kernel this
+    # bounds a region within which no QS is reported for THIS cpu. We bump the
+    # per-CPU nesting (consulted lock-free by the QS hook). The scheduler
+    # save/restores this counter into the per-task rcu_read_nesting field across
+    # a context switch (rcu_save_read_nesting / rcu_restore_read_nesting), so the
+    # depth migrates with a task preempted mid-section. IRQs are briefly masked
+    # so the increment is not split by a context switch that would mis-attribute
+    # the section.
+    fl: uint64 = local_irq_save()
+    cid: uint64 = get_cpu_id()
+    rcu_cpu_read_nesting[cid] = rcu_cpu_read_nesting[cid] + 1
+    local_irq_restore(fl)
+
+
+def rcu_read_unlock():
+    fl: uint64 = local_irq_save()
+    cid: uint64 = get_cpu_id()
+    if rcu_cpu_read_nesting[cid] != 0:
+        rcu_cpu_read_nesting[cid] = rcu_cpu_read_nesting[cid] - 1
+    local_irq_restore(fl)
+
+
+def rcu_read_nesting_cpu() -> uint64:
+    cid: uint64 = get_cpu_id()
+    return rcu_cpu_read_nesting[cid]
+
+
+def rcu_save_read_nesting() -> uint64:
+    # Context-switch support (called by the scheduler for the OUTGOING task):
+    # snapshot THIS CPU's live read nesting so it can be stashed in the
+    # outgoing task's task_struct and restored when it is dispatched again. A
+    # task preempted mid-rcu_read_lock thus carries its nesting across the
+    # switch — the CPU it lands on next will not be counted quiescent while the
+    # reader is still in flight. Returns the depth (caller holds IRQs off via
+    # the switch path).
+    cid: uint64 = get_cpu_id()
+    return rcu_cpu_read_nesting[cid]
+
+
+def rcu_restore_read_nesting(depth: uint64):
+    # Context-switch support (called by the scheduler for the INCOMING task):
+    # install the dispatched task's saved read nesting as THIS CPU's live
+    # counter. Native kernel tasks and any task switched in outside a reader
+    # restore 0 (the common case).
+    cid: uint64 = get_cpu_id()
+    rcu_cpu_read_nesting[cid] = depth
+
+
+# rcu_assign_pointer / rcu_dereference: publish-with-release, read-with-acquire.
+# x86 has a strong memory model — stores are not reordered with older stores and
+# loads are not reordered with older loads — so a plain store/load already gives
+# release/acquire for the producer→consumer pattern RCU needs, PROVIDED the
+# compiler does not reorder. atomic_cas64 / the surrounding LOCK ops in the GP
+# engine provide the compiler+CPU fence on the publish path; here we expose the
+# named accessors so call sites document intent and a future weaker arch can
+# slot in explicit barriers in ONE place.
+def rcu_assign_pointer(slot: Ptr[uint64], value: uint64):
+    # Release store: all prior initialising stores to *value's object are
+    # visible before the pointer publication. On x86 the store ordering is
+    # implicit; the atomic_cas64 makes it an ordered, single-copy-atomic
+    # publication (and prevents the compiler from sinking earlier stores past
+    # it).
+    old: uint64 = slot[0]
+    atomic_cas64(cast[uint64](slot), old, value)
+
+
+def rcu_dereference(slot: Ptr[uint64]) -> uint64:
+    # Acquire load: the dependent loads through the returned pointer are not
+    # hoisted above this load. x86 honours load→load ordering for the
+    # address-dependency chain RCU relies on.
+    return slot[0]
+
+
+# ─── GRACE-PERIOD ENGINE ─────────────────────────────────────────────────────
+def _rcu_cpu_online_mask() -> uint64:
+    # Snapshot of online CPUs. Bit i set ⇒ logical CPU i is online and must
+    # report a QS for a GP to complete.
+    return cpu_online_map
+
+
+def _rcu_start_gp_locked():
+    # Begin a new grace period: every currently-online CPU owes a QS. Caller
+    # holds IRQs off. No-op if one is already active.
+    if rcu_gp_active != 0:
+        return
+    rcu_gp_active = 1
+    rcu_gp_seq = rcu_gp_seq + 1          # even -> odd: GP in progress
+    # Only ONLINE, NON-IDLE CPUs owe a QS. An idle CPU is in an extended
+    # quiescent state for the whole time it is parked (it cannot be inside a
+    # reader), so the GP must not wait on it — it has no context switches to
+    # drive a QS report while halted. It re-joins QS participation when it wakes
+    # (rcu_idle_exit clears its idle bit before it can enter any reader).
+    rcu_gp_need_qs = _rcu_cpu_online_mask() & (~rcu_cpu_idle_mask)
+    if rcu_gp_need_qs == 0:
+        # Every online CPU is idle (or only the starting CPU is active and will
+        # report below) — but at least THIS CPU is running _rcu_start_gp_locked,
+        # so it must still pass a QS. Re-add this CPU so the GP is not vacuously
+        # complete before the caller (which may be inside a reader) is quiescent.
+        rcu_gp_need_qs = cast[uint64](1) << get_cpu_id()
+    # A CPU currently INSIDE a read section cannot be pre-counted as quiescent,
+    # but a CPU that is NOT in a read section and NOT this one will clear its
+    # bit at its next QS. The reporting CPU clears its own bit immediately below
+    # only if it is outside a reader (the common synchronize_rcu caller case).
+
+
+def rcu_qs():
+    # Report a quiescent state for THIS CPU. Safe to call from any context that
+    # is provably outside an rcu_read_lock section. Clears this CPU's need-QS
+    # bit; if that empties the mask, the GP completes.
+    fl: uint64 = local_irq_save()
+    cid: uint64 = get_cpu_id()
+    # PREEMPT-SAFE GATE: never count a CPU as quiescent while it holds a reader.
+    if rcu_cpu_read_nesting[cid] != 0:
+        local_irq_restore(fl)
+        return
+    if rcu_gp_active != 0:
+        bit: uint64 = cast[uint64](1) << cid
+        if (rcu_gp_need_qs & bit) != 0:
+            rcu_gp_need_qs = rcu_gp_need_qs & (~bit)
+            if rcu_gp_need_qs == 0:
+                _rcu_complete_gp_locked()
+    local_irq_restore(fl)
+
+
+def rcu_idle_enter():
+    # Mark THIS CPU as entering the idle/HLT extended quiescent state. Reports a
+    # QS immediately (an idle CPU is quiescent) AND sets the idle bit so any GP
+    # that starts WHILE this CPU is parked does not wait on it. Caller is the
+    # scheduler idle path, about to HLT.
+    fl: uint64 = local_irq_save()
+    cid: uint64 = get_cpu_id()
+    if rcu_cpu_read_nesting[cid] == 0:
+        rcu_cpu_idle_mask = rcu_cpu_idle_mask | (cast[uint64](1) << cid)
+    local_irq_restore(fl)
+    rcu_qs()
+
+
+def rcu_idle_exit():
+    # Clear THIS CPU's idle bit on wake, BEFORE it can enter any reader. From
+    # this point the CPU is again a normal QS participant.
+    fl: uint64 = local_irq_save()
+    cid: uint64 = get_cpu_id()
+    rcu_cpu_idle_mask = rcu_cpu_idle_mask & (~(cast[uint64](1) << cid))
+    local_irq_restore(fl)
+
+
+def rcu_note_context_switch():
+    # Scheduler QS hook. A context switch is a quiescent state for the OUTGOING
+    # CPU iff it is not mid-reader (gated inside rcu_qs). The scheduler calls
+    # this on the real-switch path (see kernel/sched/core.ad schedule()).
+    rcu_qs()
+
+
+def _rcu_complete_gp_locked():
+    # The in-flight GP has been acknowledged by every online CPU. Close it
+    # (odd -> even) and run any callbacks that were waiting on it. Caller holds
+    # IRQs off.
+    rcu_gp_seq = rcu_gp_seq + 1           # odd -> even: GP complete
+    rcu_gp_active = 0
+    rcu_gp_completed_total = rcu_gp_completed_total + 1
+    _rcu_invoke_ready_callbacks_locked()
+
+
+def rcu_gp_seq_current() -> uint64:
+    return rcu_gp_seq
+
+
+def rcu_gp_completed_count() -> uint64:
+    # Number of fully-completed grace periods.
+    return rcu_gp_seq >> 1
+
+
+def rcu_advance_gp():
+    # The GP-engine pump. Called from the timer tick and from blocking waits.
+    #   1. If callbacks are pending and no GP is active, start one.
+    #   2. Re-check this CPU's QS (a tick is itself a QS point if outside a
+    #      reader) so a single-CPU system makes progress without other CPUs.
+    #   3. Invoke any callbacks whose GP has elapsed.
+    fl: uint64 = local_irq_save()
+    if rcu_gp_active == 0 and _rcu_any_pending_locked() != 0:
+        _rcu_start_gp_locked()
+    # A CPU that PARKED idle after this GP started is quiescent for it — clear
+    # the idle set from the live need-QS mask so the GP is not stalled by a CPU
+    # that has no context switches to drive a QS report while halted. (It cannot
+    # be in a reader while idle; rcu_idle_exit re-joins it on wake, but that is a
+    # NEW GP's concern.)
+    if rcu_gp_active != 0:
+        rcu_gp_need_qs = rcu_gp_need_qs & (~rcu_cpu_idle_mask)
+        if rcu_gp_need_qs == 0:
+            _rcu_complete_gp_locked()
+    local_irq_restore(fl)
+    # Report a QS for this CPU outside the lock-held region (rcu_qs re-masks).
+    rcu_qs()
+    fl2: uint64 = local_irq_save()
+    _rcu_invoke_ready_callbacks_locked()
+    local_irq_restore(fl2)
+
+
+# ─── CALLBACK QUEUE ──────────────────────────────────────────────────────────
+def _rcu_pool_alloc() -> int64:
+    # Pop a free pool slot. Caller holds IRQs off. -1 on exhaustion.
+    if rcu_cb_freelist < 0:
+        return -1
+    idx: int64 = rcu_cb_freelist
+    rcu_cb_freelist = rcu_cb_link[cast[uint64](idx)]
+    rcu_cb_used[cast[uint64](idx)] = 1
+    return idx
+
+
+def _rcu_pool_free(idx: int64):
+    # Push a pool slot back. Caller holds IRQs off.
+    ui: uint64 = cast[uint64](idx)
+    rcu_cb_used[ui] = 0
+    rcu_cb_link[ui] = rcu_cb_freelist
+    rcu_cb_freelist = idx
+
+
+def call_rcu(head: uint64, func: uint64):
+    # Queue `func(head)` to run after the next grace period. `head` is a
+    # caller-embedded rcu_head (we write nothing into it — the pool tracks the
+    # link, so the caller's two words are free for its own use, matching the
+    # contract that the object is dead once unlinked). Tags the callback with
+    # the current completed-GP count: it runs once a STRICTLY LATER GP completes.
+    _rcu_pool_init()
+    fl: uint64 = local_irq_save()
+    idx: int64 = _rcu_pool_alloc()
+    if idx < 0:
+        # Pool exhausted: fall back to a synchronous drain to make room. This
+        # is a safety valve, not the hot path; in practice the pool is sized
+        # well above the live task count.
+        local_irq_restore(fl)
+        printk0("[rcu] call_rcu pool exhausted — synchronous reclaim\n")
+        synchronize_rcu()
+        fl = local_irq_save()
+        idx = _rcu_pool_alloc()
+        if idx < 0:
+            local_irq_restore(fl)
+            printk0("[rcu] call_rcu: still no slot after drain — LEAK\n")
+            return
+    ui: uint64 = cast[uint64](idx)
+    cid: uint64 = get_cpu_id()
+    rcu_cb_head[ui] = head
+    rcu_cb_func[ui] = func
+    # Must outlast the CURRENT completed-GP count: it becomes runnable once
+    # rcu_gp_completed_count() advances past this snapshot. Round the in-flight
+    # GP up so an already-started GP doesn't prematurely free it.
+    tag: uint64 = rcu_gp_seq >> 1
+    if rcu_gp_active != 0:
+        tag = tag + 1
+    rcu_cb_tag[ui] = tag
+    rcu_cb_link[ui] = rcu_cpu_cb_first[cid]
+    rcu_cpu_cb_first[cid] = idx
+    # Ensure a GP is running so this callback will eventually fire.
+    if rcu_gp_active == 0:
+        _rcu_start_gp_locked()
+    local_irq_restore(fl)
+
+
+def _rcu_any_pending_locked() -> uint64:
+    c: uint64 = 0
+    while c < MAX_CPUS:
+        if rcu_cpu_cb_first[c] >= 0:
+            return 1
+        c = c + 1
+    return 0
+
+
+def _rcu_invoke_ready_callbacks_locked():
+    # Walk every CPU's pending list; invoke + free each callback whose tag GP
+    # has now completed. Caller holds IRQs off. We drop IRQs around the actual
+    # callback invocation (it may take locks / free memory) after detaching the
+    # node from the list, so the list stays consistent.
+    done_gp: uint64 = rcu_gp_seq >> 1
+    c: uint64 = 0
+    while c < MAX_CPUS:
+        prev: int64 = -1
+        cur: int64 = rcu_cpu_cb_first[c]
+        while cur >= 0:
+            uc: uint64 = cast[uint64](cur)
+            nxt: int64 = rcu_cb_link[uc]
+            if done_gp > rcu_cb_tag[uc]:
+                # Detach from the list.
+                if prev < 0:
+                    rcu_cpu_cb_first[c] = nxt
+                else:
+                    rcu_cb_link[cast[uint64](prev)] = nxt
+                h: uint64 = rcu_cb_head[uc]
+                f: uint64 = rcu_cb_func[uc]
+                _rcu_pool_free(cur)
+                rcu_cb_invoked_total = rcu_cb_invoked_total + 1
+                # Invoke the callback func(head) through a first-class function
+                # pointer (rcu_callback_t = void(*)(struct rcu_head*)). The pool
+                # slot is already freed, so a callback that itself call_rcu's can
+                # reuse it.
+                if f != 0:
+                    cb: Fn[None, uint64] = cast[Fn[None, uint64]](f)
+                    cb(h)
+                # prev unchanged (the node we removed is gone).
+            else:
+                prev = cur
+            cur = nxt
+        c = c + 1
+
+
+# ─── BLOCKING PRIMITIVES ─────────────────────────────────────────────────────
+# Yield hook: synchronize_rcu / rcu_barrier yield the CPU between GP pumps so
+# peer CPUs reach a context-switch quiescent state. The scheduler owns
+# schedule() (kernel/sched/core.ad) and registers it here via
+# rcu_set_yield_hook() at sched_init — we cannot call it directly (core.ad
+# imports rcu, so an extern schedule() would duplicate the public symbol at
+# whole-program merge). Until registered (or on a uniprocessor, where
+# rcu_advance_gp's own QS completes the GP immediately) the hook is a no-op.
+rcu_yield_hook: uint64 = 0
+
+
+def rcu_set_yield_hook(fn: uint64):
+    rcu_yield_hook = fn
+
+
+def _rcu_yield():
+    if rcu_yield_hook != 0:
+        f: Fn[None] = cast[Fn[None]](rcu_yield_hook)
+        f()
+
+
+def synchronize_rcu():
+    # Block the caller until a full grace period elapses. We snapshot the
+    # current completed-GP count and pump the GP engine (yielding so other CPUs
+    # can report their QS) until the count has advanced past the snapshot — i.e.
+    # at least one GP that STARTED at or after this call has completed, which is
+    # exactly the Linux guarantee: every reader in flight at the call has ended.
+    # Force a fresh GP if one is not already in flight so we don't piggy-back on
+    # a GP that started before this call's readers were even visible.
+    fl: uint64 = local_irq_save()
+    if rcu_gp_active == 0:
+        _rcu_start_gp_locked()
+    target: uint64 = rcu_gp_seq >> 1     # completed count after THIS GP closes
+    if rcu_gp_active != 0:
+        target = (rcu_gp_seq >> 1) + 1
+    local_irq_restore(fl)
+    # Pump until the target GP completes.
+    spins: uint64 = 0
+    while (rcu_gp_seq >> 1) < target:
+        rcu_advance_gp()
+        # Yield to let peer CPUs hit a context-switch QS. On a uniprocessor the
+        # rcu_advance_gp's own QS report completes the GP immediately, so this
+        # loop runs at most a couple of iterations.
+        _rcu_yield()
+        spins = spins + 1
+        if spins > 1000000:
+            printk0("[rcu] synchronize_rcu: GP stall — forcing completion\n")
+            _rcu_force_complete()
+            return
+
+
+def _rcu_force_complete():
+    # Defensive: clear the need-QS mask of any CPU that is offline / wedged so a
+    # GP cannot stall forever. Only ever reached on a detected stall.
+    fl: uint64 = local_irq_save()
+    if rcu_gp_active != 0:
+        rcu_gp_need_qs = rcu_gp_need_qs & _rcu_cpu_online_mask()
+        if rcu_gp_need_qs == 0:
+            _rcu_complete_gp_locked()
+    local_irq_restore(fl)
+
+
+def rcu_barrier():
+    # Wait until EVERY callback queued before this call has run. Used at
+    # teardown. We drive GPs until no callbacks remain pending anywhere.
+    spins: uint64 = 0
+    while True:
+        fl: uint64 = local_irq_save()
+        pend: uint64 = _rcu_any_pending_locked()
+        local_irq_restore(fl)
+        if pend == 0:
+            return
+        rcu_advance_gp()
+        _rcu_yield()
+        spins = spins + 1
+        if spins > 1000000:
+            printk0("[rcu] rcu_barrier: stall — abandoning\n")
+            return

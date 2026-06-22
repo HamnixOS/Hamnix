@@ -1,0 +1,218 @@
+# kernel/rcu/rcu_selftest.ad
+#
+# Gated boot self-test for the RCU engine (kernel/rcu/rcu.ad). Gated on the
+# /etc/rcu-test marker (planted only when ENABLE_RCU_TEST=1 via
+# scripts/test_rcu.sh) so normal boots never run it. Prints explicit
+# "[rcu] PASS:" / "[rcu] FAIL:" lines the harness greps for.
+#
+# It proves the four load-bearing RCU guarantees with NO disk and NO real SMP
+# concurrency (boot-time, single-threaded): we drive the read-side counter and
+# the GP pump by hand to construct the exact interleavings a real reader/updater
+# race would produce.
+#
+#   T1  A call_rcu callback does NOT run while a reader holds rcu_read_lock —
+#       even across an attempted GP — and DOES run once the reader unlocks and a
+#       grace period elapses.
+#   T2  synchronize_rcu's completed-GP count strictly advances across the call
+#       (a grace period really elapsed).
+#   T3  rcu_barrier drains all outstanding callbacks.
+#   T4  The task-list RCU traversal is correct under a concurrent add/remove
+#       stress loop: every live pid is found, every removed pid is not, and a
+#       slot RCU-freed mid-loop is never observed half-recycled.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.rcu.rcu import (
+    rcu_init, rcu_read_lock, rcu_read_unlock, call_rcu, synchronize_rcu,
+    rcu_barrier, rcu_advance_gp, rcu_qs, rcu_gp_completed_count,
+    rcu_read_nesting_cpu,
+)
+
+# ─── T1 callback bookkeeping ─────────────────────────────────────────────────
+# A standalone rcu_head (2 words) + a fired-flag the callback sets.
+rcu_st_head: Array[2, uint64]
+rcu_st_fired: uint64 = 0
+
+
+def _rcu_st_cb(head: uint64):
+    rcu_st_fired = 1
+
+
+def rcu_selftest() -> int32:
+    printk0("[rcu] self-test start\n")
+    rcu_init()
+    ok: int32 = 1
+
+    # ── T1: reader delays a call_rcu callback until unlock + a GP ────────────
+    rcu_st_fired = 0
+    # Enter a read-side section: this CPU is now non-quiescent.
+    rcu_read_lock()
+    if rcu_read_nesting_cpu() != 1:
+        printk0("[rcu] FAIL: read nesting not 1 inside rcu_read_lock\n")
+        ok = 0
+    # Queue a callback while the reader is held.
+    call_rcu(cast[uint64](&rcu_st_head[0]), cast[uint64](_rcu_st_cb))
+    # Pump the GP engine HARD while the reader is still in its section. Because
+    # this CPU owes a QS and is mid-reader (nesting != 0), rcu_qs must REFUSE to
+    # report — so no GP can complete and the callback must NOT fire.
+    p: uint64 = 0
+    while p < 50:
+        rcu_advance_gp()
+        p = p + 1
+    if rcu_st_fired != 0:
+        printk0("[rcu] FAIL: callback fired while reader held rcu_read_lock\n")
+        ok = 0
+    else:
+        printk0("[rcu] PASS: callback deferred while reader in critical section\n")
+    # Leave the read section: this CPU may now report a QS.
+    rcu_read_unlock()
+    if rcu_read_nesting_cpu() != 0:
+        printk0("[rcu] FAIL: read nesting not 0 after rcu_read_unlock\n")
+        ok = 0
+    # Now a grace period can elapse. Pump until the callback fires.
+    q: uint64 = 0
+    while q < 50 and rcu_st_fired == 0:
+        rcu_advance_gp()
+        rcu_qs()
+        q = q + 1
+    if rcu_st_fired == 1:
+        printk0("[rcu] PASS: callback ran after rcu_read_unlock + grace period\n")
+    else:
+        printk0("[rcu] FAIL: callback never ran after unlock + GP\n")
+        ok = 0
+
+    # ── T2: synchronize_rcu blocks across a real grace period ───────────────
+    gp_before: uint64 = rcu_gp_completed_count()
+    synchronize_rcu()
+    gp_after: uint64 = rcu_gp_completed_count()
+    if gp_after > gp_before:
+        printk2("[rcu] PASS: synchronize_rcu advanced GP %d -> %d\n",
+                gp_before, gp_after)
+    else:
+        printk2("[rcu] FAIL: synchronize_rcu did NOT advance GP (%d -> %d)\n",
+                gp_before, gp_after)
+        ok = 0
+
+    # ── T3: rcu_barrier drains queued callbacks ─────────────────────────────
+    rcu_st_fired = 0
+    call_rcu(cast[uint64](&rcu_st_head[0]), cast[uint64](_rcu_st_cb))
+    rcu_barrier()
+    if rcu_st_fired == 1:
+        printk0("[rcu] PASS: rcu_barrier drained outstanding callback\n")
+    else:
+        printk0("[rcu] FAIL: rcu_barrier left a callback un-run\n")
+        ok = 0
+
+    # ── T4: task-list RCU traversal under add/remove stress ─────────────────
+    if _rcu_tasklist_stress() != 1:
+        ok = 0
+
+    if ok == 1:
+        printk0("[rcu] PASS: RCU self-test complete\n")
+    else:
+        printk0("[rcu] FAIL: RCU self-test had failures\n")
+    return ok
+
+
+# ─── T4: task-list traversal stress ──────────────────────────────────────────
+# Exercises the REAL conversion: task_lookup_by_pid (the RCU read-side path)
+# resolving pids while tasks are added and RCU-removed (the deferred slot free).
+# We use rcu_st_claim_task / rcu_st_reap_task — inert task-table slots with a
+# known pid but no backing memory — so the lookup + RCU-deferred-free path is
+# driven faithfully without the heavyweight memory reclaim of task_reap (which
+# assumes alloc_pages-backed stacks). The asserts:
+#   * every live pid resolves under the RCU reader,
+#   * a removed slot is NOT published FREE before its grace period
+#     (deferred-free counter does not advance pre-GP),
+#   * the removed pids stop resolving immediately (pid hash dropped at remove),
+#   * after a grace period every removed slot IS published FREE (counter +N),
+#   * an interleaved add+remove stress loop never returns a stale slot.
+
+from kernel.sched.core import (
+    task_lookup_by_pid, nr_task_slots_rcu_freed_get,
+    rcu_st_claim_task, rcu_st_reap_task,
+)
+
+RCU_ST_BASE_PID: uint64 = 0x5C000000     # high, collision-free synthetic pids
+
+
+def _rcu_tasklist_stress() -> int32:
+    ok: int32 = 1
+    STRESS_N: uint64 = 8
+    slots: Array[8, int32]
+    pids:  Array[8, uint64]
+    # Add a batch of lookup-visible tasks.
+    i: uint64 = 0
+    n: uint64 = 0
+    while i < STRESS_N:
+        pid: uint64 = RCU_ST_BASE_PID + i
+        s: int32 = rcu_st_claim_task(pid)
+        if s < 0:
+            i = STRESS_N            # table full — test what we have
+        else:
+            slots[n] = s
+            pids[n] = pid
+            n = n + 1
+            i = i + 1
+    if n == 0:
+        printk0("[rcu] FAIL: tasklist stress could not claim any slot\n")
+        return 0
+    # Every live pid must resolve through the RCU reader.
+    j: uint64 = 0
+    while j < n:
+        if task_lookup_by_pid(pids[j]) < 0:
+            printk1("[rcu] FAIL: live pid %p not found by RCU lookup\n", pids[j])
+            ok = 0
+        j = j + 1
+    if ok == 1:
+        printk1("[rcu] PASS: all %d live pids resolve under RCU reader\n", n)
+    # RCU-remove every slot (call_rcu defers the slot publish).
+    freed_before: uint64 = nr_task_slots_rcu_freed_get()
+    k: uint64 = 0
+    while k < n:
+        rcu_st_reap_task(slots[k])
+        k = k + 1
+    # Pre-GP: removed pids must already be unresolvable (pid hash dropped at
+    # remove) BUT the slots must NOT yet be published FREE — the deferred
+    # callbacks have not run, proving readers are protected across the window.
+    m: uint64 = 0
+    while m < n:
+        if task_lookup_by_pid(pids[m]) >= 0:
+            printk1("[rcu] FAIL: removed pid %p still resolves\n", pids[m])
+            ok = 0
+        m = m + 1
+    freed_mid: uint64 = nr_task_slots_rcu_freed_get()
+    if freed_mid != freed_before:
+        printk0("[rcu] FAIL: task slot published FREE before grace period\n")
+        ok = 0
+    else:
+        printk0("[rcu] PASS: removed slots deferred (not FREE pre-GP)\n")
+    # Drive a grace period so the deferred slot frees run.
+    rcu_barrier()
+    freed_after: uint64 = nr_task_slots_rcu_freed_get()
+    if freed_after >= freed_before + n:
+        printk2("[rcu] PASS: %d slots RCU-freed after GP (counter now %d)\n",
+                n, freed_after)
+    else:
+        printk1("[rcu] FAIL: only %d slots freed after GP\n",
+                freed_after - freed_before)
+        ok = 0
+    # Interleaved add+remove stress: repeatedly claim+lookup+RCU-remove a slot,
+    # draining each generation with a barrier so the slot recycles. Asserts the
+    # lookup result is always consistent (live -> found, removed+GP -> not).
+    r: uint64 = 0
+    while r < 32:
+        pid2: uint64 = RCU_ST_BASE_PID + 0x100 + r
+        ss: int32 = rcu_st_claim_task(pid2)
+        if ss >= 0:
+            if task_lookup_by_pid(pid2) != ss:
+                printk1("[rcu] FAIL: stress live pid %p lookup mismatch\n", pid2)
+                ok = 0
+            rcu_st_reap_task(ss)
+            if task_lookup_by_pid(pid2) >= 0:
+                printk1("[rcu] FAIL: stress removed pid %p still resolves\n", pid2)
+                ok = 0
+            rcu_barrier()
+        r = r + 1
+    if ok == 1:
+        printk0("[rcu] PASS: interleaved add/remove stress consistent\n")
+    return ok

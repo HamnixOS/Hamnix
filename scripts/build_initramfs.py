@@ -627,6 +627,15 @@ if os.environ.get("ENABLE_BCACHE_TEST") == "1":
 if os.environ.get("ENABLE_FCACHE_TEST") == "1":
     FILES.append(("/etc/fcache-test", b"1\n"))
 
+# RCU grace-period engine self-test. scripts/test_rcu.sh sets ENABLE_RCU_TEST=1
+# to plant /etc/rcu-test. init/main.ad at boot:37.rcu detects the marker and
+# calls rcu_selftest() (kernel/rcu/rcu_selftest.ad): a reader defers a call_rcu
+# callback until unlock + a GP; synchronize_rcu advances a GP; rcu_barrier
+# drains callbacks; the task-list RCU traversal is correct under add/remove
+# stress. Pure in-RAM, no disk. Default boots omit the marker.
+if os.environ.get("ENABLE_RCU_TEST") == "1":
+    FILES.append(("/etc/rcu-test", b"1\n"))
+
 # ENABLE_RFORK_COW_TEST=1 to plant /etc/rfork-cow-test. init/main.ad at
 # boot:37.rfcow detects the marker and calls elf32_wx_span_reset_selftest()
 # (fs/elf.ad): it plants a bogus non-zero W^X RO-span count (as if an
