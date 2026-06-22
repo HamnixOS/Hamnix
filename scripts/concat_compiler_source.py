@@ -151,6 +151,7 @@ HOST_BUFFER_OVERRIDES = {
         ("glob_is_bss: Array[1024, uint32]", "glob_is_bss: Array[16384, uint32]"),
         ("glob_ptr_size: Array[1024, uint32]", "glob_ptr_size: Array[16384, uint32]"),
         ("glob_is_signed: Array[1024, uint32]", "glob_is_signed: Array[16384, uint32]"),
+        ("glob_signedness: Array[1024, uint32]", "glob_signedness: Array[16384, uint32]"),
         ("glob_type_node: Array[1024, uint32]", "glob_type_node: Array[16384, uint32]"),
         ("glob_struct_idx: Array[1024, uint32]", "glob_struct_idx: Array[16384, uint32]"),
         ("glob_is_float: Array[1024, uint32]", "glob_is_float: Array[16384, uint32]"),
