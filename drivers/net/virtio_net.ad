@@ -54,6 +54,10 @@ from arch.x86.kernel.irq import register_irq_handler
 from kernel.softirq import (
     raise_softirq, open_softirq, NET_RX_SOFTIRQ, softirq_started_get,
 )
+from net.core.napi import (
+    NapiStruct, napi_struct_init, napi_register, napi_schedule_irqoff,
+    net_rx_action,
+)
 from mm.page_alloc import alloc_pages
 from mm.slab import kmalloc
 from drivers.net.eth import eth_rx, nd_mac, eth_register_tx_hook
@@ -87,6 +91,15 @@ VIRTIO_NET_ERR:                   uint8 = 1
 # assume a 3-descriptor chain shape we don't share).
 VNET_DESC_F_NEXT:    uint16 = 1
 VNET_DESC_F_WRITE:   uint16 = 2
+
+# vring avail-ring flags (mirror of virtio_ring.h VRING_AVAIL_F_*).
+# The avail ring header is { u16 flags, u16 idx, ... }; bit 0 of flags is
+# VRING_AVAIL_F_NO_INTERRUPT — when set, the driver is telling the device
+# "do not raise an interrupt when you consume buffers from this queue".
+# This is exactly how NAPI masks RX interrupts on virtio: napi_schedule
+# sets it (device goes quiet while we poll in softirq context), and
+# napi_complete clears it (device may interrupt again).
+VRING_AVAIL_F_NO_INTERRUPT: uint16 = 1
 
 # Sizes used by the RX ring layout.
 #
@@ -182,6 +195,8 @@ class VirtioNet:
     rx_outstanding:  uint64                # RX descriptors currently posted
     mrg_frames:      uint64                # frames reassembled across >1 buffer
     refills:         uint64                # refill batches pushed back to device
+    napi:            NapiStruct            # NAPI poller for the RX queue
+    rx_irq_masked:   uint32                # 1 when RX IRQs are masked (in poll)
 
 
 vnet_state: VirtioNet
@@ -636,6 +651,19 @@ def virtio_net_init() -> int32:
     # IRQ-return softirq pass. This migrates net RX off the old "drain in
     # hard-IRQ context" model onto the new softirq stack. open_softirq is
     # safe to call before softirq_init() (it just sets a handler slot).
+    #
+    # NAPI: wire the RX queue's napi_struct (poll = budgeted drain,
+    # disable/enable_irq = avail-ring NO_INTERRUPT toggle) and add it to
+    # the NET_RX poll list. The hard-IRQ top halves below call
+    # napi_schedule_irqoff(&vnet_state.napi); the NET_RX softirq runs
+    # net_rx_action() which polls it for NAPI_POLL_WEIGHT frames per pass.
+    vnet_state.rx_irq_masked = 0
+    napi_struct_init(&vnet_state.napi, cast[uint64](&vnet_state),
+                     cast[Fn[uint64, uint64, uint64]](&_vnet_napi_poll),
+                     cast[Fn[None, uint64]](&_vnet_napi_disable_irq),
+                     cast[Fn[None, uint64]](&_vnet_napi_enable_irq),
+                     0)
+    napi_register(&vnet_state.napi)
     open_softirq(NET_RX_SOFTIRQ, virtio_net_rx_softirq)
     if vnet_state.msix_enabled != 0:
         # MSI-X path: each virtqueue has its own LAPIC vector, routed
@@ -703,12 +731,13 @@ def virtio_net_init() -> int32:
 
 
 def virtio_net_rx_softirq():
-    # NET_RX softirq handler (the bottom half). Drains the RX used ring +
-    # delivers frames into the network stack OUTSIDE hard-IRQ context.
-    # Registered at device init via open_softirq(NET_RX_SOFTIRQ, ...).
-    if vnet_state.iobase == 0:
-        return
-    virtio_net_poll()
+    # NET_RX softirq handler (the bottom half). Runs the NAPI poll list:
+    # net_rx_action() visits each scheduled napi and runs ONE budgeted poll
+    # pass (up to NAPI_POLL_WEIGHT=64 frames), re-raising NET_RX if any
+    # poller hit its budget so the drain continues in bounded chunks. This
+    # replaces the old unbudgeted full-ring drain — work is now capped per
+    # softirq pass, which is what prevents RX livelock under flood.
+    net_rx_action()
 
 
 def virtio_net_msix_rx_handler():
@@ -723,7 +752,9 @@ def virtio_net_msix_rx_handler():
         return
     vnet_state.irq_count = vnet_state.irq_count + 1
     if softirq_started_get() != 0:
-        raise_softirq(NET_RX_SOFTIRQ)
+        # NAPI: claim the poll, mask further RX IRQs, raise NET_RX. The
+        # budgeted poll runs in the NET_RX softirq on IRQ-return.
+        napi_schedule_irqoff(&vnet_state.napi)
     else:
         virtio_net_poll()
 
@@ -768,8 +799,9 @@ def virtio_net_irq_handler():
         # Queue interrupt — at least one virtqueue advanced. Defer the
         # heavy drain to the NET_RX softirq (bottom half); the device-ISR
         # read above already ACKed the wire interrupt in the top half.
+        # NAPI: claim the poll + mask further RX IRQs + raise NET_RX.
         if softirq_started_get() != 0:
-            raise_softirq(NET_RX_SOFTIRQ)
+            napi_schedule_irqoff(&vnet_state.napi)
         else:
             virtio_net_poll()
 
@@ -867,28 +899,74 @@ def _rx_deliver_merged(first_slot: uint16, first_len: uint32,
     eth_rx(cast[Ptr[uint8]](&vnet_reasm_buf[0]), total)
 
 
-def virtio_net_poll():
-    # Drain the RX used ring with mergeable-buffer reassembly + robust
-    # refill. Walks from `used_idx_seen` up to the current `used.idx`.
-    # Each used-ring entry is {u32 id, u32 len} starting at offset 4 of
-    # the used region; the header (offset 0..2) is u16 flags + u16 idx.
+def _vnet_rx_irq_mask():
+    # Set VRING_AVAIL_F_NO_INTERRUPT on the RX avail ring: the device
+    # stops raising RX interrupts while NAPI drains the ring in softirq
+    # context. The avail-ring flags word is the u16 at avail_addr + 0.
+    avail: uint64 = vnet_state.rx.avail_addr
+    fp: Ptr[uint16] = cast[Ptr[uint16]](avail + 0)
+    fp[0] = fp[0] | VRING_AVAIL_F_NO_INTERRUPT
+    vnet_state.rx_irq_masked = 1
+
+
+def _vnet_rx_irq_unmask():
+    # Clear VRING_AVAIL_F_NO_INTERRUPT: the device may interrupt us again
+    # on the next consumed RX buffer. Called from napi_complete once the
+    # ring drained under budget.
+    avail: uint64 = vnet_state.rx.avail_addr
+    fp: Ptr[uint16] = cast[Ptr[uint16]](avail + 0)
+    fp[0] = fp[0] & (~VRING_AVAIL_F_NO_INTERRUPT)
+    vnet_state.rx_irq_masked = 0
+
+
+# --- NAPI callback adapters -----------------------------------------
+# These wrap the driver state behind the generic napi_struct function
+# pointers. `dev` is &vnet_state, marshalled through unchanged. The poll
+# adapter is the budgeted RX drain; the mask/unmask adapters toggle the
+# avail-ring NO_INTERRUPT flag.
+
+def _vnet_napi_disable_irq(dev: uint64):
+    _vnet_rx_irq_mask()
+
+
+def _vnet_napi_enable_irq(dev: uint64):
+    _vnet_rx_irq_unmask()
+    # After re-enabling interrupts, kick + re-poll once: a frame may have
+    # arrived between the last under-budget drain and unmasking, and if it
+    # did the device already consumed the buffer WITHOUT interrupting (we
+    # had NO_INTERRUPT set), so no IRQ will come. Re-check the used ring to
+    # avoid that lost-wakeup window. Mirrors Linux's gro_normal / re-poll
+    # check in napi_complete_done.
+    used: uint64 = vnet_state.rx.used_addr
+    cur:  uint16 = cast[Ptr[uint16]](used + 2)[0]
+    seen: uint16 = vnet_state.rx.used_idx_seen
+    if cur != seen:
+        # Work raced in: re-schedule the poll so it drains promptly.
+        napi_schedule_irqoff(&vnet_state.napi)
+
+
+def _virtio_net_drain_budget(budget: uint64) -> uint64:
+    # Budgeted RX used-ring drain. Walks from `used_idx_seen` toward the
+    # current `used.idx`, delivering at most `budget` FRAMES this pass and
+    # returning the number actually delivered (work_done). When the budget
+    # is hit with the ring still non-empty, we stop and leave the rest for
+    # the next poll pass — this is the NAPI budget ceiling that bounds
+    # per-softirq work and prevents RX livelock under flood.
     #
-    # With F_MRG_RXBUF a single inbound frame may consume several RX
-    # buffers: the first buffer's 12-byte header carries num_buffers,
-    # and the next (num_buffers-1) used-ring entries belong to the SAME
-    # frame. We read num_buffers, reassemble across that many entries,
-    # and advance `seen` past all of them. Every consumed RX descriptor
-    # is reposted so the device always has buffers to land the next
-    # frame in — the ring never drains to empty and wedges.
+    # Mergeable-buffer reassembly + robust refill semantics are unchanged
+    # from the original unbudgeted drain: a frame may span num_buffers
+    # used-ring entries; we reassemble across them, count it as ONE frame
+    # against the budget, repost every consumed descriptor, and kick once.
     if vnet_state.iobase == 0:
-        return
+        return 0
     used: uint64 = vnet_state.rx.used_addr
     cur: uint16 = cast[Ptr[uint16]](used + 2)[0]
     seen: uint16 = vnet_state.rx.used_idx_seen
     if cur == seen:
-        return
+        return 0
     reposted: uint64 = 0
-    while seen != cur:
+    work_done: uint64 = 0
+    while seen != cur and work_done < budget:
         first_id:  uint32 = _used_entry_id(seen)
         first_len: uint32 = _used_entry_len(seen)
         first_slot: uint16 = cast[uint16](first_id & 0xFFFF)
@@ -928,13 +1006,39 @@ def virtio_net_poll():
             reposted = reposted + 1
             k = k + 1
         seen = seen + num_buffers
+        work_done = work_done + 1                # one delivered frame
     vnet_state.rx.used_idx_seen = seen
     if reposted > 0:
         vnet_state.refills = vnet_state.refills + 1
-    # Kick the device after re-queueing so it promptly picks up the
-    # refilled descriptors (otherwise it could sit idle if it had
-    # drained the avail ring while we were processing).
-    virtio_notify(vnet_state.iobase, VQ_RX)
+        # Kick the device after re-queueing so it promptly picks up the
+        # refilled descriptors (otherwise it could sit idle if it had
+        # drained the avail ring while we were processing).
+        virtio_notify(vnet_state.iobase, VQ_RX)
+    return work_done
+
+
+def _vnet_napi_poll(dev: uint64, budget: uint64) -> uint64:
+    # napi_struct.poll adapter: drain up to `budget` frames and return the
+    # count delivered. The NAPI core (_napi_poll_one) compares this against
+    # the budget to decide re-poll (== budget) vs complete (< budget).
+    return _virtio_net_drain_budget(budget)
+
+
+def virtio_net_poll():
+    # Legacy unbudgeted drain used by the on-demand boot smoke-test pollers
+    # (net_smoke_test busy-loops this before the softirq/IRQ path is live).
+    # Drains the WHOLE ring in a loop of budgeted passes so the boot-time
+    # callers see identical "drain everything now" behavior, while the
+    # steady-state IRQ path runs through the budgeted NAPI poll instead.
+    if vnet_state.iobase == 0:
+        return
+    b: uint64 = vnet_state.napi.weight
+    if b == 0:
+        b = 64                                   # NAPI_POLL_WEIGHT default
+    while True:
+        n: uint64 = _virtio_net_drain_budget(b)
+        if n < b:
+            break
 
 
 def virtio_net_rx_packets() -> uint64:

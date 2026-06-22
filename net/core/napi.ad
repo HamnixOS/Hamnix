@@ -1,0 +1,252 @@
+# net/core/napi.ad — Linux-parity NAPI (New API) budgeted receive core.
+#
+# Mirrors the net/core/dev.c NAPI machinery at minimum scope. NAPI is the
+# interrupt-mitigation + RX-livelock-prevention model every modern Linux
+# NIC driver uses: instead of draining the whole RX ring in hard-IRQ
+# context (or in an unbudgeted softirq), the hard-IRQ top half does almost
+# nothing — it DISABLES further RX interrupts and SCHEDULES a poller — and
+# the NET_RX softirq later runs that poller for at most `budget` packets
+# per pass. If the poller hits the budget it stays scheduled and is
+# re-polled (the device is busy: keep IRQs off, keep draining in softirq
+# context). If it drains UNDER budget it COMPLETES: re-enables RX
+# interrupts and unschedules. This bounds the work done per softirq pass
+# and prevents a packet flood from livelocking the CPU in interrupt
+# context (the classic receive-livelock failure mode NAPI was invented to
+# kill).
+#
+# struct napi_struct (Linux, trimmed to the fields we use):
+#     poll       int  (*poll)(struct napi_struct *, int budget)
+#     weight     int  default budget (NAPI_POLL_WEIGHT = 64)
+#     state      unsigned long  (SCHED / DISABLE bits)
+#
+# We keep the same contract: poll(napi, budget) processes up to `budget`
+# packets, calls into the stack (eth_rx) for each, and returns the number
+# actually processed (work_done). It MUST stop at `budget` and leave the
+# rest for the next pass — that budget ceiling is the whole point.
+#
+# Interrupt enable/disable is virtio-flavored at the driver (the avail-ring
+# NO_INTERRUPT flag), but the napi_struct holds them as generic function
+# pointers so any driver can plug its own mask/unmask in. This keeps the
+# core driver-agnostic, exactly like Linux's napi_struct.
+#
+# The core poll loop (_napi_poll_one) is deliberately free of kernel-only
+# dependencies — it touches only the napi_struct fields and the function
+# pointers — so the same state machine can be driven by a host logic gate
+# (tests/test_napi_logic.ad) without booting the kernel.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.softirq import raise_softirq, NET_RX_SOFTIRQ, softirq_started_get
+
+
+# --- napi_struct ----------------------------------------------------
+#
+# One per RX queue. `poll`/`disable_irq`/`enable_irq` are first-class
+# function pointers the driver installs at netif_napi_add time. `dev`
+# is an opaque driver-context cookie (e.g. &vnet_state) marshalled into
+# the poll/enable/disable callbacks as their first argument.
+
+class NapiStruct:
+    poll:        Fn[uint64, uint64, uint64]   # work_done = poll(dev, budget)
+    disable_irq: Fn[None, uint64]             # mask RX IRQs (dev)
+    enable_irq:  Fn[None, uint64]             # unmask RX IRQs (dev)
+    dev:         uint64                        # driver context cookie
+    weight:      uint64                        # default per-poll budget
+    state:       uint64                        # SCHED / DISABLE bits
+    poll_count:  uint64                        # diagnostic: poll passes run
+    sched_count: uint64                        # diagnostic: schedules
+    complete_count: uint64                     # diagnostic: completes
+
+
+# Linux's NAPI_POLL_WEIGHT — the default per-poll budget. 64 packets per
+# softirq pass is the canonical value (net/core/dev.c). Bounds per-pass
+# work so a flood can't monopolize the CPU; the remainder is handled on
+# the next re-poll / softirq pass.
+NAPI_POLL_WEIGHT: uint64 = 64
+
+# napi_struct.state bits (mirror include/linux/netdevice.h NAPI_STATE_*).
+NCORE_STATE_SCHED:   uint64 = 1    # bit 0: poll scheduled / owned
+NCORE_STATE_DISABLE: uint64 = 2    # bit 1: being disabled (teardown)
+
+
+def napi_struct_init(napi: Ptr[NapiStruct], dev: uint64,
+                     poll: Fn[uint64, uint64, uint64],
+                     disable_irq: Fn[None, uint64],
+                     enable_irq: Fn[None, uint64], weight: uint64):
+    # netif_napi_add(): wire a NAPI poller. Zero state, install the
+    # callbacks + context, set the budget weight (0 -> default).
+    napi[0].poll        = poll
+    napi[0].disable_irq = disable_irq
+    napi[0].enable_irq  = enable_irq
+    napi[0].dev         = dev
+    if weight == 0:
+        napi[0].weight = NAPI_POLL_WEIGHT
+    else:
+        napi[0].weight = weight
+    napi[0].state          = 0
+    napi[0].poll_count     = 0
+    napi[0].sched_count    = 0
+    napi[0].complete_count = 0
+
+
+def napi_schedule_prep(napi: Ptr[NapiStruct]) -> uint64:
+    # __napi_schedule_prep(): try to claim the SCHED bit. Returns 1 if we
+    # won it (caller must schedule the poll), 0 if it was already set
+    # (someone else owns the poll — coalesce, do nothing). Mirrors Linux:
+    # the SCHED bit is the single-owner token for the poll. Runs with IRQs
+    # disabled (the hard-IRQ top half is already IRQ-off).
+    already: uint64 = napi[0].state & NCORE_STATE_SCHED
+    napi[0].state = napi[0].state | NCORE_STATE_SCHED
+    if already != 0:
+        return 0
+    return 1
+
+
+def napi_schedule_irqoff(napi: Ptr[NapiStruct]):
+    # __napi_schedule(): called from the hard-IRQ top half (IRQs already
+    # off). Claim the poll; if won, DISABLE further RX IRQs (so the device
+    # stops interrupting while we drain in softirq context — the core of
+    # interrupt mitigation) and raise the NET_RX softirq so the poll runs
+    # on IRQ-return. If we didn't win, a poll is already pending/queued and
+    # will pick up the new work.
+    if napi_schedule_prep(napi) == 0:
+        return
+    napi[0].sched_count = napi[0].sched_count + 1
+    dis: Fn[None, uint64] = napi[0].disable_irq
+    if dis != cast[Fn[None, uint64]](0):
+        dis(napi[0].dev)
+    # Raise NET_RX so do_softirq runs the poll on the IRQ-return pass.
+    if softirq_started_get() != 0:
+        raise_softirq(NET_RX_SOFTIRQ)
+
+
+def napi_complete(napi: Ptr[NapiStruct]):
+    # napi_complete_done(): the poll drained UNDER budget — no more work.
+    # Clear the SCHED bit (release ownership) and RE-ENABLE RX IRQs so the
+    # device can interrupt us again for the next frame. Order matters: in
+    # Linux you clear SCHED then re-enable IRQs, and a frame that arrives
+    # in the gap re-fires the IRQ which re-schedules — no lost wakeup,
+    # because the device re-raises once interrupts are back on.
+    napi[0].complete_count = napi[0].complete_count + 1
+    napi[0].state = napi[0].state & (~NCORE_STATE_SCHED)
+    en: Fn[None, uint64] = napi[0].enable_irq
+    if en != cast[Fn[None, uint64]](0):
+        en(napi[0].dev)
+
+
+def _napi_poll_one(napi: Ptr[NapiStruct]) -> uint64:
+    # Run ONE poll pass: invoke the driver poll for up to `weight` packets,
+    # then decide schedule-vs-complete. Returns 1 if the napi stays
+    # scheduled (budget consumed -> must be re-polled), 0 if it completed
+    # (drained under budget -> IRQs re-enabled, unscheduled). This is the
+    # per-napi heart of net_rx_action and is intentionally dependency-free
+    # (only napi fields + the function pointers) so the host logic gate can
+    # drive it directly.
+    pf: Fn[uint64, uint64, uint64] = napi[0].poll
+    if pf == cast[Fn[uint64, uint64, uint64]](0):
+        napi_complete(napi)
+        return 0
+    budget: uint64 = napi[0].weight
+    napi[0].poll_count = napi[0].poll_count + 1
+    work_done: uint64 = pf(napi[0].dev, budget)
+    if work_done >= budget:
+        # Consumed the full budget: the device still has (or may have)
+        # more to give. Stay SCHEDULED, keep RX IRQs OFF, and signal the
+        # caller to re-poll on a later pass. This is the anti-livelock
+        # behavior: bounded work per pass, no return to IRQ context until
+        # the flood subsides under budget.
+        return 1
+    # Drained under budget -> we're caught up. Complete: re-enable IRQs +
+    # unschedule.
+    napi_complete(napi)
+    return 0
+
+
+# --- net_rx_action: the NET_RX softirq handler ----------------------
+#
+# Linux registers net_rx_action() as the NET_RX_SOFTIRQ action. It walks
+# the per-CPU poll_list and runs each scheduled napi for one budgeted
+# pass, with an overall time/work ceiling (netdev_budget). Any napi that
+# consumed its full budget is left on the list (re-polled next pass); the
+# softirq is re-raised so do_softirq comes back to it. We keep a small
+# fixed poll list (one entry per registered RX queue is plenty for the
+# bring-up NICs); a driver registers its napi with napi_register().
+
+NAPI_MAX_POLLERS: uint64 = 8
+
+# Overall softirq-pass work ceiling across ALL pollers (Linux's
+# netdev_budget = 300). Bounds total per-softirq RX work even with several
+# busy queues, so one softirq pass can't run unboundedly.
+NETDEV_BUDGET: uint64 = 300
+
+napi_poll_list: Array[8, uint64]    # NAPI_MAX_POLLERS napi_struct* slots
+napi_poll_n:    uint64 = 0
+
+
+def napi_register(napi: Ptr[NapiStruct]) -> int32:
+    # Add a napi to the poll list so net_rx_action visits it. Called once
+    # per RX queue at driver init (after napi_struct_init).
+    if napi_poll_n >= NAPI_MAX_POLLERS:
+        printk0("[napi] poll list full — cannot register\n")
+        return -1
+    napi_poll_list[napi_poll_n] = cast[uint64](napi)
+    napi_poll_n = napi_poll_n + 1
+    return 0
+
+
+def net_rx_action():
+    # NET_RX_SOFTIRQ handler. Walk every registered napi; run a budgeted
+    # poll pass for each that is SCHEDULED. If any napi stays scheduled (it
+    # hit its budget), re-raise NET_RX so do_softirq comes back for another
+    # pass — this is how a sustained flood is drained in bounded chunks
+    # instead of one unbounded sweep.
+    any_rescheduled: uint64 = 0
+    i: uint64 = 0
+    while i < napi_poll_n:
+        np: Ptr[NapiStruct] = cast[Ptr[NapiStruct]](napi_poll_list[i])
+        if np != cast[Ptr[NapiStruct]](0):
+            # Only poll a napi that is actually scheduled (SCHED set).
+            if (np[0].state & NCORE_STATE_SCHED) != 0:
+                stayed: uint64 = _napi_poll_one(np)
+                if stayed != 0:
+                    any_rescheduled = 1
+        i = i + 1
+    if any_rescheduled != 0:
+        # Work remains (a poller hit budget). Re-raise so we come back —
+        # bounded re-poll, never an unbounded inline drain.
+        if softirq_started_get() != 0:
+            raise_softirq(NET_RX_SOFTIRQ)
+
+
+# --- threaded NAPI: DEFERRED ----------------------------------------
+#
+# Linux can run napi->poll in a dedicated per-napi kthread (threaded NAPI,
+# `/sys/class/net/*/threaded`) so the budgeted poll loop runs in process
+# context under sustained load instead of softirq context, improving
+# fairness/latency on busy multi-queue NICs. We DEFER it here: the NET_RX
+# softirq already hands off to ksoftirqd when do_softirq blows
+# MAX_SOFTIRQ_RESTART (kernel/softirq.ad), so a flood that outruns the
+# softirq pass already drains in a kthread (ksoftirqd) — we get the
+# anti-livelock benefit without a separate per-napi thread. Promoting to
+# true per-napi threaded NAPI is a clean follow-up: add a kthread that
+# loops `while napi_is_scheduled(napi): _napi_poll_one(napi); yield`, and
+# have napi_schedule wake it instead of raising NET_RX when a
+# `threaded` flag is set. The napi_struct + poll contract above are
+# already shaped for it (the poll loop is dependency-free).
+
+
+# --- diagnostics ----------------------------------------------------
+
+def napi_poll_count(napi: Ptr[NapiStruct]) -> uint64:
+    return napi[0].poll_count
+
+
+def napi_sched_count(napi: Ptr[NapiStruct]) -> uint64:
+    return napi[0].sched_count
+
+
+def napi_complete_count(napi: Ptr[NapiStruct]) -> uint64:
+    return napi[0].complete_count
+
+
+def napi_is_scheduled(napi: Ptr[NapiStruct]) -> uint64:
+    return napi[0].state & NCORE_STATE_SCHED

@@ -1,0 +1,271 @@
+# tests/test_napi_logic.ad
+#
+# Host logic gate for the NAPI budgeted-receive state machine in
+# net/core/napi.ad. Compiled with --target=x86_64-linux and run on the
+# host kernel by scripts/test_napi.sh — no QEMU, no Hamnix image.
+#
+# It reproduces the EXACT NAPI poll decision the kernel runs
+# (_napi_poll_one + napi_complete + napi_schedule_irqoff in net/core/napi.ad)
+# against a synthetic RX "ring" of N pending frames and a fake driver
+# poll/mask/unmask, then asserts the load-bearing invariants:
+#
+#   1. BUDGET CEILING: a single poll pass delivers AT MOST `budget`
+#      frames (never more), even when the ring holds far more.
+#   2. RE-SCHEDULE ON FULL BUDGET: when a pass consumes the full budget
+#      (ring still non-empty), the napi stays SCHEDULED and IRQs stay
+#      MASKED — it must be re-polled, not completed.
+#   3. COMPLETE UNDER BUDGET: when a pass drains the ring under budget,
+#      the napi COMPLETES — SCHED cleared and RX IRQs RE-ENABLED.
+#   4. FLOOD DRAINS IN BOUNDED CHUNKS: a flood of F frames is fully
+#      delivered across ceil(F/budget) passes, in order, with exactly one
+#      mask (at schedule) and one unmask (at the final complete).
+#   5. ORDER PRESERVED: frames reach the "stack" in arrival order across
+#      all passes (no reordering, no drops, no duplicates).
+#
+# Exit code 0 = all assertions passed; non-zero = the (failing assertion
+# number). The harness greps the printed PASS/FAIL lines too.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+# --- NAPI constants (mirror net/core/napi.ad) -----------------------
+NAPI_POLL_WEIGHT:    uint64 = 64
+NCORE_STATE_SCHED:   uint64 = 1
+
+# --- synthetic device model -----------------------------------------
+#
+# A fake RX ring: `ring_total` frames are pending; `ring_consumed` is how
+# many the driver poll has delivered so far. `delivered[]` records the
+# order frames reached the stack (each entry = the frame's sequence id),
+# proving order preservation. The mask/unmask counters + irq_masked flag
+# stand in for the avail-ring NO_INTERRUPT toggle.
+
+ring_total:      uint64 = 0
+ring_consumed:   uint64 = 0
+mask_count:      uint64 = 0
+unmask_count:    uint64 = 0
+irq_masked:      uint64 = 0
+delivered:       Array[4096, uint64]
+delivered_n:     uint64 = 0
+
+# napi state (mirror NapiStruct fields we exercise).
+napi_state:      uint64 = 0
+napi_weight:     uint64 = 0
+poll_count:      uint64 = 0
+sched_count:     uint64 = 0
+complete_count:  uint64 = 0
+
+
+def fake_disable_irq():
+    mask_count = mask_count + 1
+    irq_masked = 1
+
+
+def fake_enable_irq():
+    unmask_count = unmask_count + 1
+    irq_masked = 0
+
+
+def fake_poll(budget: uint64) -> uint64:
+    # Driver poll: deliver up to `budget` frames from the ring, recording
+    # each in arrival order. Returns work_done (frames delivered this pass).
+    # This mirrors _virtio_net_drain_budget's loop shape: stop at budget OR
+    # when the ring is empty.
+    work: uint64 = 0
+    while ring_consumed < ring_total and work < budget:
+        delivered[delivered_n] = ring_consumed      # seq id == position
+        delivered_n = delivered_n + 1
+        ring_consumed = ring_consumed + 1
+        work = work + 1
+    return work
+
+
+# --- the NAPI state machine under test (mirror net/core/napi.ad) ----
+
+def napi_schedule_irqoff():
+    # __napi_schedule: claim SCHED (coalesce if already set), mask IRQs,
+    # would-raise NET_RX.
+    already: uint64 = napi_state & NCORE_STATE_SCHED
+    napi_state = napi_state | NCORE_STATE_SCHED
+    if already != 0:
+        return
+    sched_count = sched_count + 1
+    fake_disable_irq()
+
+
+def napi_complete():
+    # napi_complete_done: clear SCHED, re-enable IRQs.
+    complete_count = complete_count + 1
+    napi_state = napi_state & (~NCORE_STATE_SCHED)
+    fake_enable_irq()
+
+
+def napi_poll_one() -> uint64:
+    # _napi_poll_one: one budgeted pass; return 1 if it stays scheduled
+    # (hit budget), 0 if it completed (drained under budget).
+    budget: uint64 = napi_weight
+    poll_count = poll_count + 1
+    work_done: uint64 = fake_poll(budget)
+    if work_done >= budget:
+        return 1
+    napi_complete()
+    return 0
+
+
+# --- tiny output helpers (raw write to fd 1) ------------------------
+msgbuf: Array[64, uint8]
+
+def emit(s: Ptr[uint8], n: uint64):
+    sys_write(1, s, n)
+
+pass_str: Array[6, uint8]
+fail_str: Array[6, uint8]
+
+
+def reset_device(total: uint64):
+    ring_total    = total
+    ring_consumed = 0
+    delivered_n   = 0
+    mask_count    = 0
+    unmask_count  = 0
+    irq_masked    = 0
+    napi_state    = 0
+    poll_count    = 0
+    sched_count   = 0
+    complete_count = 0
+    napi_weight   = NAPI_POLL_WEIGHT
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # 'PASS\n' and 'FAIL\n' for the harness grep.
+    pass_str[0] = 80
+    pass_str[1] = 65
+    pass_str[2] = 83
+    pass_str[3] = 83
+    pass_str[4] = 10
+    fail_str[0] = 70
+    fail_str[1] = 65
+    fail_str[2] = 73
+    fail_str[3] = 76
+    fail_str[4] = 10
+
+    # ============================================================
+    # CASE A: ring holds exactly budget+1 frames (65). One pass must
+    # deliver exactly `budget` (64) and STAY SCHEDULED with IRQs MASKED
+    # (assertions 1 + 2). A second pass delivers the last 1 and COMPLETES
+    # (assertion 3).
+    # ============================================================
+    reset_device(NAPI_POLL_WEIGHT + 1)
+    # Hard-IRQ top half: schedule.
+    napi_schedule_irqoff()
+    if irq_masked != 1 or sched_count != 1:
+        emit(&fail_str[0], 5)
+        return 2                                   # mask-on-schedule failed
+    # Pass 1.
+    stayed: uint64 = napi_poll_one()
+    # Assertion 1: at most budget delivered.
+    if delivered_n != NAPI_POLL_WEIGHT:
+        emit(&fail_str[0], 5)
+        return 1                                   # budget ceiling violated
+    # Assertion 2: hit budget -> stays scheduled, IRQs still masked.
+    if stayed != 1:
+        emit(&fail_str[0], 5)
+        return 21
+    if (napi_state & NCORE_STATE_SCHED) == 0 or irq_masked != 1:
+        emit(&fail_str[0], 5)
+        return 22
+    if complete_count != 0 or unmask_count != 0:
+        emit(&fail_str[0], 5)
+        return 23
+    # Pass 2: drains the remaining 1 (< budget) -> completes.
+    stayed2: uint64 = napi_poll_one()
+    if stayed2 != 0:
+        emit(&fail_str[0], 5)
+        return 31
+    # Assertion 3: completed -> SCHED cleared, IRQs re-enabled exactly once.
+    if (napi_state & NCORE_STATE_SCHED) != 0:
+        emit(&fail_str[0], 5)
+        return 32
+    if irq_masked != 0 or unmask_count != 1 or complete_count != 1:
+        emit(&fail_str[0], 5)
+        return 33
+    if delivered_n != NAPI_POLL_WEIGHT + 1:
+        emit(&fail_str[0], 5)
+        return 34
+
+    # ============================================================
+    # CASE B: FLOOD. 1000 frames. Drive the softirq re-poll loop: keep
+    # polling while the napi stays scheduled. Assert it drains fully in
+    # exactly ceil(1000/64) passes, in order, with one mask + one unmask.
+    # (assertions 4 + 5)
+    # ============================================================
+    flood: uint64 = 1000
+    reset_device(flood)
+    napi_schedule_irqoff()
+    # softirq drain loop: re-poll while scheduled (mirrors net_rx_action
+    # re-raising NET_RX until a pass completes under budget).
+    guard: uint64 = 0
+    keep: uint64 = 1
+    while keep == 1 and guard < 100:
+        s: uint64 = napi_poll_one()
+        if s == 0:
+            keep = 0
+        guard = guard + 1
+    # Assertion 4a: every frame delivered, none dropped/duplicated.
+    if delivered_n != flood or ring_consumed != flood:
+        emit(&fail_str[0], 5)
+        return 41
+    # Assertion 4b: bounded chunks — exactly ceil(flood/budget) passes.
+    expect_passes: uint64 = (flood + NAPI_POLL_WEIGHT - 1) / NAPI_POLL_WEIGHT
+    if poll_count != expect_passes:
+        emit(&fail_str[0], 5)
+        return 42
+    # Assertion 4c: each pass except the last delivered EXACTLY budget.
+    # (poll_count-1 full passes * budget + remainder == flood)
+    full_passes: uint64 = poll_count - 1
+    if full_passes * NAPI_POLL_WEIGHT >= flood:
+        emit(&fail_str[0], 5)
+        return 43
+    # Assertion 4d: exactly one mask (schedule) + one unmask (final
+    # complete) for the whole flood — interrupt mitigation held across all
+    # passes, IRQs were OFF for the entire drain.
+    if mask_count != 1 or unmask_count != 1 or complete_count != 1:
+        emit(&fail_str[0], 5)
+        return 44
+    if irq_masked != 0:
+        emit(&fail_str[0], 5)
+        return 45
+    # Assertion 5: ORDER preserved across all passes (delivered[i] == i).
+    i: uint64 = 0
+    while i < flood:
+        if delivered[i] != i:
+            emit(&fail_str[0], 5)
+            return 51
+        i = i + 1
+
+    # ============================================================
+    # CASE C: ring drains UNDER budget on the very first pass (10 frames).
+    # One pass, completes immediately, IRQs re-enabled, no re-poll.
+    # ============================================================
+    reset_device(10)
+    napi_schedule_irqoff()
+    sc: uint64 = napi_poll_one()
+    if sc != 0 or poll_count != 1:
+        emit(&fail_str[0], 5)
+        return 61
+    if delivered_n != 10 or complete_count != 1 or irq_masked != 0:
+        emit(&fail_str[0], 5)
+        return 62
+
+    # ============================================================
+    # CASE D: COALESCE. A second schedule while already scheduled must NOT
+    # double-mask or bump sched_count (single-owner SCHED token).
+    # ============================================================
+    reset_device(NAPI_POLL_WEIGHT + 5)
+    napi_schedule_irqoff()
+    napi_schedule_irqoff()                          # coalesced
+    if sched_count != 1 or mask_count != 1:
+        emit(&fail_str[0], 5)
+        return 71
+
+    emit(&pass_str[0], 5)
+    return 0
