@@ -490,26 +490,49 @@ def main():
                 bestscore, best = score, j
         return best
 
+    # ALIGNMENT. The seed lists functions by symtab address; the native image
+    # is split into endbr64 blocks in emission order. For SINGLE-TU units these
+    # orders agree, but for MERGED multi-TU units (UI apps pulling many lib
+    # modules) the two emission orders genuinely DIFFER, so a positional 1:1 is
+    # wrong. We therefore do a GLOBAL greedy assignment by histogram similarity:
+    #   1. score every (seed-fn, native-block) pair,
+    #   2. assign in DESCENDING score order (most-confident match first),
+    # so a distinctive function claims its twin before ambiguous small helpers
+    # compete — avoiding the in-order greedy cascade that could orphan a real
+    # match. A seed function left with NO block (count/structure mismatch) is a
+    # genuine finding (MISSING). A clean assignment proves equivalence.
     used = [False] * len(nat_user)
+    nat_hists = [func_histogram(b) for b in nat_user]
+    seed_hists = []
+    for nm, sd in seed_disasm:
+        h = func_histogram(sd)
+        if nm in canary:
+            h = h - CANARY_KEYS
+        seed_hists.append(h)
+    pairs = []
+    for si in range(len(seed_disasm)):
+        th = seed_hists[si]
+        for j in range(len(nat_user)):
+            h = nat_hists[j]
+            score = sum((th & h).values()) - (sum((th - h).values())
+                                              + sum((h - th).values()))
+            pairs.append((score, si, j))
+    pairs.sort(key=lambda t: -t[0])
+    assign = [None] * len(seed_disasm)
+    for score, si, j in pairs:
+        if assign[si] is None and not used[j]:
+            assign[si] = j
+            used[j] = True
     for si, (nm, sd) in enumerate(seed_disasm):
-        cand = None
-        if si < len(nat_user) and not used[si]:
-            # positional candidate; accept only if it's a perfect or near match,
-            # else fall through to best-match search.
-            divs0 = compare_function(nm, sd, nat_user[si], nm in canary)
-            if not divs0:
-                cand = si
-        if cand is None:
-            cand = best_block(nm, sd, used)
+        cand = assign[si]
         if cand is None:
             report.append(f"[{unit}] {nm}: MISSING native block"); total_div += 1
             continue
-        used[cand] = True
         divs = compare_function(nm, sd, nat_user[cand], nm in canary)
         if divs:
             total_div += 1
             report.append(f"[{unit}] {nm}: histogram divergence")
-            report.extend(divs)
+            report.extend(divs[:8])
 
     if total_div:
         print("\n".join(report))
