@@ -2301,8 +2301,9 @@ class X86CodeGen:
                 self.gen_member_address(target.obj, target.member)
                 self.emit("    pushq %rax")   # save addr
                 size = self._field_size(target.obj, target.member)
+                fsigned = self._field_is_signed(target.obj, target.member)
                 self.emit("    movq %rax, %rcx")
-                self.emit_load_sized(size, "%rcx", "%rax")  # old value -> rax
+                self.emit_load_sized_signed(size, fsigned, "%rcx", "%rax")  # old -> rax
                 self.emit("    pushq %rax")   # old value on stack
                 self.gen_expr(value)          # rhs -> rax
                 self.emit("    movq %rax, %rcx")   # rhs -> rcx
@@ -4081,6 +4082,26 @@ class X86CodeGen:
                 return self.get_type_size(ftype)
         raise CodeGenError(f"x86: struct '{si.name}' has no field '{member}'")
 
+    def _field_is_signed(self, obj: Expr, member: str) -> bool:
+        """True if obj.member is a known SIGNED sub-8-byte integer, so its
+        member load must sign-extend (mirroring the index/global scalar load
+        sign-extension). Defaults to False (zero-extend) for unknown / unsigned
+        / aggregate / 8-byte fields, preserving the historical behaviour for
+        those. This closes the last sub-8-byte load path that zero-extended a
+        signed field: a negative int8/int16/int32 struct field must widen to a
+        negative 64-bit value (`if obj.f < 0:`), exactly like a signed index /
+        global / local load."""
+        si = self._resolve_struct(obj)
+        for fname, ftype, _ in si.fields:
+            if fname == member:
+                if not (hasattr(ftype, "name")
+                        and getattr(ftype, "name", None) in self._INT_NAMES):
+                    return False
+                if self.get_type_size(ftype) >= 8:
+                    return False
+                return self._is_unsigned_type(ftype) is False
+        raise CodeGenError(f"x86: struct '{si.name}' has no field '{member}'")
+
     def gen_member_address(self, obj: Expr, member: str) -> None:
         """Leave the address of obj.member in %rax.
 
@@ -4143,7 +4164,8 @@ class X86CodeGen:
                     # Address already in %rax — array decays to pointer.
                     return
                 size = self.get_type_size(ftype)
-                self.emit_load_sized(size, "%rax", "%rax")
+                signed = self._field_is_signed(expr.obj, expr.member)
+                self.emit_load_sized_signed(size, signed, "%rax", "%rax")
                 return
 
     def _gen_min_max_inline(self, which: str, a: Expr, b: Expr) -> None:

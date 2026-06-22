@@ -588,6 +588,17 @@ class Program:
             self._fold_value(
                 f"cast[uint64](cast[{t.name}]({name}[{idx}]))",
                 U64.wrap(stored))
+            # SIGN-FAITHFUL read (no inner cast[T]): the index LOAD itself must
+            # sign-extend a signed sub-8-byte element / zero-extend an unsigned
+            # one. The inner cast[T] above re-extends and so MASKS a wrong load
+            # extension; this fold observes the load's own extension directly.
+            # shadow[idx] is the type-view value (negative for a signed elem);
+            # _to_reg widens it into the 64-bit register exactly as the correct
+            # load would. A blind movq / wrong-signedness extend diverges here.
+            idx2 = rng.randrange(n)
+            self._fold_value(
+                f"cast[uint64]({name}[{idx2}])",
+                U64.wrap(_to_reg(shadow[idx2])))
 
     # ---- scalar-global store/read traffic ------------------------------------
     def _gen_scalar_global_traffic(self, env):
@@ -599,8 +610,14 @@ class Program:
             self.emit(f"    {name} = {e.src}")
             stored = t.wrap(e.val)         # sized store truncates to t
             self.scalar_globals[t][1] = stored
-            # read back widened to uint64 via the global's declared signedness
-            self._fold_value(f"cast[uint64]({name})", U64.wrap(stored))
+            # read back widened to uint64 via the global's declared signedness.
+            # NOTE: a bare `cast[uint64](name)` (no inner cast[T]) already
+            # observes the GLOBAL LOAD's own extension directly — there is no
+            # masking inner cast here — so this single fold exercises the
+            # scalar-global load sign/zero-extension faithfully. stored is the
+            # type-view value (negative for a signed global); _to_reg widens it
+            # into the register exactly as a correct sign/zero-extending load.
+            self._fold_value(f"cast[uint64]({name})", U64.wrap(_to_reg(stored)))
 
     # ---- counted loop with a conditional body --------------------------------
     def _gen_loop(self, env):
@@ -693,6 +710,19 @@ class Program:
             self._fold_value(
                 f"cast[uint64](cast[{t.name}](pt.{fname}))",
                 U64.wrap(stored))
+            # SIGN-FAITHFUL member read (no inner cast[T]): the MEMBER LOAD
+            # itself must sign-extend a signed sub-8-byte field / zero-extend an
+            # unsigned one. The inner cast[T] above re-extends and MASKS a wrong
+            # member-load extension (a signed int8 field of -1 reads the same
+            # low byte whether the load zero- or sign-extended); this fold
+            # observes the load's own extension. stored is the field's type-view
+            # value (negative for a signed field); _to_reg widens it into the
+            # 64-bit register exactly as a correct sign/zero-extending member
+            # load would. This is the path that previously zero-extended a
+            # signed field in BOTH backends and so escaped the differential.
+            self._fold_value(
+                f"cast[uint64](pt.{fname})",
+                U64.wrap(_to_reg(stored)))
 
     # ---- class definition: fields + __init__ + a method ----------------------
     def _build_class_def(self):
