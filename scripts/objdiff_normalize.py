@@ -241,6 +241,18 @@ def func_histogram(insns):
             continue
         if is_canary(mnem, ops):
             continue
+        # Stack-argument marshalling for a >6-arg call: the seed reserves
+        # `sub $N,%rsp` then writes each stack arg with `mov %reg,(%rsp)` /
+        # `mov %reg,N(%rsp)`; codegen.ad pushes them with `push` (already
+        # dropped as a spill). Both place the same value in the same stack slot
+        # — encoding-equivalent. Drop the seed's %rsp-relative arg stores and
+        # the matching `sub/add $imm,%rsp` frame adjust so the marshalling
+        # choice is not a divergence. (Frame-pointer-relative `(%rbp)` stores —
+        # real locals — are NOT dropped.)
+        if mnem == "mov" and ("(%rsp)" in ops):
+            continue
+        if mnem in ("sub", "add") and "%rsp" in ops and "IMM" in shape(ops):
+            continue
         sh = shape(ops)
         # register<->register movs are the spill carriers — drop (the data they
         # move is accounted at its memory/RIP touch points).
@@ -257,16 +269,51 @@ def func_histogram(insns):
                     "movswq", "movzbl", "movzwl", "movsbl", "movswl",
                     "cltq", "cdqe") and sh in ("R,R", "R", ""):
             continue
+        # Index/stride SCALING by a power-of-2 element size: one backend emits
+        # `imulq $stride,%reg,%reg` (multiply), the other `shlq $log2,%reg`
+        # (shift). Both compute reg*2^k mod 2^64 — provably equivalent. Canon-
+        # icalize both (with an IMM operand) to a single SCALE class so the
+        # encoding choice is not a divergence. (A NON-power-of-2 imul stride has
+        # no shl equivalent and is NOT collapsed — it keeps its own key.)
+        if mnem == "imul" and "IMM" in sh:
+            c[("scale", 8, "IMM")] += 1
+            continue
+        if mnem in ("shl", "sal") and "IMM" in sh:
+            c[("scale", 8, "IMM")] += 1
+            continue
         c[(mnem, width_of(mnem, ops), sh)] += 1
     return c
+
+
+def seed_fn_has_canary(sd):
+    """A seed function emits -fstack-protector iff it loads the guard global
+    via RIP and xors it: the signature `xorl/xorq <RIP-disp>(%rip),%reg` (the
+    epilogue compare) plus the prologue `mov <RIP-disp>(%rip),%reg`. We detect
+    it structurally: a function with BOTH a `mov RIP,R` (guard load) and an
+    `xor RIP,R` (epilogue compare) — codegen.ad emits NEITHER, so this pair is
+    canary-exclusive. Robust to objdump not resolving the guard symbol name."""
+    has_xor_rip = any(m == "xor" and "(%rip)" in o for (_a, _r, m, o) in sd)
+    has_mov_rip = any(m == "mov" and "(%rip)" in o for (_a, _r, m, o) in sd)
+    return has_xor_rip and has_mov_rip
 
 
 def compare_function(name, sd, nd, seed_canary):
     sh = func_histogram(sd)
     nh = func_histogram(nd)
+    if not seed_canary:
+        seed_canary = seed_fn_has_canary(sd)
     if seed_canary:
-        # remove the seed-only stack-protector contribution
-        sh = sh - CANARY_KEYS          # Counter subtraction clamps at 0
+        # Remove the seed-only stack-protector contribution, but ONLY the part
+        # that is genuinely seed-EXCESS (so a function that legitimately uses a
+        # global xor/load in BOTH backends is not over-subtracted into a false
+        # match). For each canary key, subtract at most the seed-minus-native
+        # surplus, capped at the canary's fixed contribution.
+        excess = Counter()
+        for key, cnt in CANARY_KEYS.items():
+            surplus = sh.get(key, 0) - nh.get(key, 0)
+            if surplus > 0:
+                excess[key] = min(cnt, surplus)
+        sh = sh - excess
     if sh == nh:
         return []
     divs = []
@@ -284,6 +331,46 @@ def split_native_by_prologue(insns):
     contiguous run AFTER the last user function, so they collect into the final
     block(s). We post-filter those out by signature (is_wrapper/is_entry_shim)
     rather than over-splitting on `ret` (user functions contain internal rets)."""
+    # FIRST strip the synthesized runtime appendage (sys_* wrappers + the _start
+    # shim) from the END of the stream. codegen.ad emits these AFTER the last
+    # user function, none with an `endbr64`, so everything from the first
+    # wrapper/shim instruction to EOF is appendage. We find that boundary: scan
+    # backward while the tail is composed only of wrapper/shim instructions.
+    # A wrapper = `[mov %rcx,%r10;] mov $imm,%rax; syscall; ret`; the shim =
+    # `call; movslq %eax,%rdi; mov $1,%rax; syscall; jmp .`. Both consist solely
+    # of {mov(imm/reg), movslq, syscall, ret, jmp, call} with no endbr64 and no
+    # memory traffic — so the boundary is the last `endbr64`-started user block's
+    # final `ret` IF everything after it is appendage. Simplest robust rule:
+    # drop the trailing run with NO endbr64 that ends in `syscall; jmp` (the
+    # shim) and any `syscall; ret` wrapper triples before it.
+    n = len(insns)
+    cut = n
+    # walk back over appendage instructions
+    i = n - 1
+    APPEND_MN = {"mov", "movslq", "syscall", "ret", "jmp", "call", "endbr64"}
+    seen_endbr_since = False
+    while i >= 0:
+        m = insns[i][2]
+        o = insns[i][3]
+        if m == "endbr64":
+            # a user function prologue: stop — appendage is above this only if
+            # this endbr64 belongs to a wrapper, but wrappers have none. So the
+            # appendage starts AFTER the last user `ret`. Stop here.
+            break
+        if m not in APPEND_MN:
+            break
+        # a `mov` in the appendage only touches imm/registers (no frame/mem)
+        if m == "mov" and ("(%rbp)" in o or "(%rip)" in o):
+            break
+        i -= 1
+        cut = i + 1
+    # only treat as appendage if the tail actually ends in the shim spin or a
+    # wrapper ret/syscall (avoid eating a real trailing function by accident)
+    if cut < n:
+        tail_mns = {insns[k][2] for k in range(cut, n)}
+        if "syscall" in tail_mns:
+            insns = insns[:cut]
+
     blocks, cur = [], []
     for ins in insns:
         if ins[2] == "endbr64" and cur:
@@ -292,43 +379,6 @@ def split_native_by_prologue(insns):
             cur.append(ins)
     if cur:
         blocks.append(cur)
-    # The trailing block accreted: [last-user-fn tail] + [wrapper run] + [_start].
-    # Peel wrapper/shim runs off the END of the final block so the last user
-    # function's histogram is clean. A wrapper/shim begins at `mov $N,%rax`
-    # (optionally preceded by `mov %rcx,%r10`) and ends at `syscall; ret` (or,
-    # for _start, `syscall; jmp .`). We split the last block at the first such
-    # boundary that is followed only by wrapper/shim instructions.
-    if blocks:
-        last = blocks[-1]
-        j = len(last)
-        while j > 0:
-            mn = last[j-1][2]
-            # peel the _start shim tail: ...; syscall; jmp .  (the `jmp self`)
-            if mn == "jmp" and j >= 2 and last[j-2][2] == "syscall":
-                # remove: jmp; syscall; mov $1,%rax; movslq; (call main belongs
-                # to the shim too) — walk back over the fixed shim body.
-                k = j - 2                       # at syscall
-                k -= 1                          # mov $1,%rax
-                if k > 0 and last[k][2] == "mov":
-                    k -= 1
-                if k > 0 and last[k][2] == "movslq":
-                    k -= 1
-                if k > 0 and last[k][2] == "call":
-                    k -= 1
-                j = k + 1
-                continue
-            # peel a trailing syscall wrapper: [mov %rcx,%r10;] mov $N,%rax;
-            # syscall; ret
-            if mn == "ret" and j >= 3 and last[j-2][2] == "syscall" \
-                    and last[j-3][2] == "mov" and "%rax" in last[j-3][3]:
-                k = j - 3
-                if k > 0 and last[k-1][2] == "mov" and "%r10" in last[k-1][3]:
-                    k -= 1
-                j = k
-                continue
-            break
-        if 0 < j < len(last):
-            blocks[-1] = last[:j]
     return blocks
 
 
