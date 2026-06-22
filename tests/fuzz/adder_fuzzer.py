@@ -666,6 +666,38 @@ class Program:
             self.emit(f"    {ishv}: {t.name} = {name}[{idx}] >> cast[{t.name}]({s})")
             self._fold_value(f"cast[uint64](cast[{t.name}]({ishv}))",
                              U64.wrap(t.wrap(sh)))
+        # 8-byte GLOBAL signed-vs-unsigned DIVISION + COMPARE. An int64 global
+        # divided/compared must use idiv/cqto + signed setcc; a uint64 global
+        # div/xor + unsigned setcc. expr_signedness for an 8-byte global must
+        # report its FULL declared signedness (glob_signedness), not the
+        # sub-8-byte load-extension flag. A wrong choice diverges from the
+        # oracle. (s_int64 / s_uint64 are declared scalar globals.)
+        for tn, signed in (("int64", True), ("uint64", False)):
+            gname = f"s_{tn}"
+            num = rng.randint(-(1 << 40), (1 << 40)) if signed \
+                else rng.randint(0, (1 << 41))
+            den = rng.choice([d for d in (3, 7, 13, -5) if signed or d > 0])
+            self.emit(f"    {gname} = cast[{tn}]({num})")
+            qn = f"q_{tn}"
+            self.emit(f"    {qn}: {tn} = {gname} / cast[{tn}]({den})")
+            if signed:
+                # Python // floors; Adder/C signed div truncates toward zero.
+                a, b = num, den
+                q = abs(a) // abs(b)
+                if (a < 0) != (b < 0):
+                    q = -q
+                self._fold_value(f"cast[uint64](cast[{tn}]({qn}))", U64.wrap(I64.wrap(q)))
+                cres = 1 if num < den else 0
+            else:
+                un = num & umask(64)
+                q = un // den
+                self._fold_value(f"cast[uint64]({qn})", U64.wrap(q))
+                cres = 1 if un < (den & umask(64)) else 0
+            cbn = f"cb_{tn}"
+            self.emit(f"    {cbn}: int64 = cast[int64](0)")
+            self.emit(f"    if {gname} < cast[{tn}]({den}):")
+            self.emit(f"        {cbn} = cast[int64](1)")
+            self._fold_value(f"cast[uint64]({cbn})", U64.wrap(cres))
 
     # ---- scalar-global store/read traffic ------------------------------------
     def _gen_scalar_global_traffic(self, env):
