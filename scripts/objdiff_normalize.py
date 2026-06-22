@@ -269,6 +269,21 @@ def func_histogram(insns):
                     "movswq", "movzbl", "movzwl", "movsbl", "movswl",
                     "cltq", "cdqe") and sh in ("R,R", "R", ""):
             continue
+        # FRAME-SLOT (%rbp-relative) ZERO/SIGN-EXTEND reload of a spilled
+        # sub-8-byte LOCAL: native may reload a uint8/uint16 local sized
+        # (`movzbq -off(%rbp),%reg`) where the seed reloads the full slot
+        # (`mov -off(%rbp),%reg`). The slot was sized-STORED, so both reloads
+        # yield the same value — the reload width is an encoding choice. Map a
+        # %rbp-relative movzx/movsx reload to the SAME key the seed's full `mov`
+        # frame reload uses (`('mov', 8, 'MEM,R')`), so the spill-reload width is
+        # not a divergence. We do NOT rewrite a plain `mov MEM,R` (so the canary
+        # reload bookkeeping in CANARY_KEYS still lines up), and we restrict to
+        # %rbp frames so real struct/heap/global sized loads keep their width.
+        if mnem in ("movzbq", "movzwq", "movzlq", "movsbq", "movswq",
+                    "movslq", "movzbl", "movzwl", "movsbl", "movswl") \
+                and "(%rbp)" in ops and sh == "MEM,R":
+            c[("mov", 8, "MEM,R")] += 1
+            continue
         # Index/stride SCALING by a power-of-2 element size: one backend emits
         # `imulq $stride,%reg,%reg` (multiply), the other `shlq $log2,%reg`
         # (shift). Both compute reg*2^k mod 2^64 — provably equivalent. Canon-
@@ -280,6 +295,18 @@ def func_histogram(insns):
             continue
         if mnem in ("shl", "sal") and "IMM" in sh:
             c[("scale", 8, "IMM")] += 1
+            continue
+        # Immediate-to-register MATERIALIZATION: `movabs $imm64,%reg` (seed, the
+        # explicit 64-bit form) vs `movq $imm32,%reg` (codegen.ad's compact
+        # 48 C7 C0 sign-extending-imm32 form, used when the value fits a signed
+        # 32-bit range OR is a sign-extension of one, e.g. 0xFFFF...FFFF == -1).
+        # Both materialize the same register value; the encoding choice is the
+        # seed's `as` movabs vs codegen.ad's size-minimizing pick. Collapse both
+        # mov/movabs imm->reg into a single LOADIMM class. (The immediate VALUE
+        # is already erased to IMM by shape(), as for every other instruction —
+        # the histogram metric is structural, not value-exact.)
+        if mnem in ("mov", "movabs") and sh == "IMM,R":
+            c[("loadimm", 8, "IMM,R")] += 1
             continue
         c[(mnem, width_of(mnem, ops), sh)] += 1
     return c
