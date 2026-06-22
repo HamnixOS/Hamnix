@@ -197,6 +197,17 @@ HOST_BUFFER_OVERRIDES = {
     "elf_emit.ad": [
         ("ELF_BUF_CAP: uint32 = 131072", "ELF_BUF_CAP: uint32 = 25165824"),
         ("elf_buf: Array[131072, uint8]", "elf_buf: Array[25165824, uint8]"),
+        # Kernel ET_REL emitter staging buffers (CAP#3b): whole-tree symbol
+        # table / string table for the kernel's ~10 K functions + ~3 K externs.
+        ("KELF_MAX_EXTERNS: uint32 = 256", "KELF_MAX_EXTERNS: uint32 = 16384"),
+        ("ext_sym: Array[256, uint32]", "ext_sym: Array[16384, uint32]"),
+        ("KELF_STRTAB_CAP: uint32 = 4096", "KELF_STRTAB_CAP: uint32 = 4194304"),
+        ("kelf_strtab: Array[4096, uint8]", "kelf_strtab: Array[4194304, uint8]"),
+        ("KELF_MAX_SYMS: uint32 = 256", "KELF_MAX_SYMS: uint32 = 32768"),
+        ("ksym_name: Array[256, uint32]", "ksym_name: Array[32768, uint32]"),
+        ("ksym_info: Array[256, uint32]", "ksym_info: Array[32768, uint32]"),
+        ("ksym_shndx: Array[256, uint32]", "ksym_shndx: Array[32768, uint32]"),
+        ("ksym_value: Array[256, uint64]", "ksym_value: Array[32768, uint64]"),
     ],
 }
 

@@ -47,6 +47,28 @@ from compiler.codegen import (
     bss_len,
     CODE_CAP,
     cg_entry_off,
+    fn_name_off,
+    fn_name_len,
+    fn_offset,
+    fn_count,
+    ext_name_off,
+    ext_name_len,
+    ext_count,
+    er_at,
+    er_sym_idx,
+    er_type,
+    er_count,
+    ER_PC32,
+    ER_PLT32,
+    df_at,
+    df_data_off,
+    df_is_bss,
+    df_count,
+    name_match,
+)
+
+from compiler.lexer import (
+    strbuf,
 )
 
 # -----------------------------------------------------------------------
@@ -112,6 +134,30 @@ def patch32(at: uint32, v: uint32):
     elf_buf[at + 1] = cast[uint8]((v >> 8) & 255)
     elf_buf[at + 2] = cast[uint8]((v >> 16) & 255)
     elf_buf[at + 3] = cast[uint8]((v >> 24) & 255)
+
+
+# Append a little-endian uint64 (ELF64 fields). For the ET_REL kernel object.
+def eb64(v: uint64):
+    eb(cast[uint32](v & 255))
+    eb(cast[uint32]((v >> 8) & 255))
+    eb(cast[uint32]((v >> 16) & 255))
+    eb(cast[uint32]((v >> 24) & 255))
+    eb(cast[uint32]((v >> 32) & 255))
+    eb(cast[uint32]((v >> 40) & 255))
+    eb(cast[uint32]((v >> 48) & 255))
+    eb(cast[uint32]((v >> 56) & 255))
+
+
+# Overwrite a little-endian uint32 at offset `at` (ELF64 patch helper alias).
+def patch64(at: uint32, v: uint64):
+    elf_buf[at] = cast[uint8](v & 255)
+    elf_buf[at + 1] = cast[uint8]((v >> 8) & 255)
+    elf_buf[at + 2] = cast[uint8]((v >> 16) & 255)
+    elf_buf[at + 3] = cast[uint8]((v >> 24) & 255)
+    elf_buf[at + 4] = cast[uint8]((v >> 32) & 255)
+    elf_buf[at + 5] = cast[uint8]((v >> 40) & 255)
+    elf_buf[at + 6] = cast[uint8]((v >> 48) & 255)
+    elf_buf[at + 7] = cast[uint8]((v >> 56) & 255)
 
 
 # -----------------------------------------------------------------------
@@ -198,10 +244,341 @@ def elf_emit_image_target(entry_arg: uint32, target: uint32) -> uint32:
 # (a latent mis-format bug). The multiboot/kernel.lds field layout above is
 # the spec the emitter must match field-for-field once (a)+(b) are in place.
 # -----------------------------------------------------------------------
+# Per-extern symtab-index map (filled by elf_emit_image_kernel): ext_sym[i] is
+# the .symtab index the i-th ext_* name resolves to (a DEFINED Adder function
+# symbol if the name matches one, else the shared UNDEF symbol for that name).
+# On-disk size is on-DEVICE scale (the on-device elf_emit only emits tiny user
+# images); the host driver scales these up via concat HOST_BUFFER_OVERRIDES so
+# baking whole-tree sizes here would not OOM the 256 MiB on-device guest.
+KELF_MAX_EXTERNS: uint32 = 256
+ext_sym: Array[256, uint32]
+
+# .strtab byte buffer (symbol name strings) + a running length. Built first so
+# symtab entries can carry name offsets, then appended to the image.
+KELF_STRTAB_CAP: uint32 = 4096
+kelf_strtab: Array[4096, uint8]
+kelf_strtab_len: uint32 = 0
+
+# .symtab entries staged in parallel arrays, then serialised (each Elf64_Sym is
+# 24 bytes). One entry per: NULL, 3 section syms, every Adder function, every
+# UNDEF extern. ksym_name = .strtab offset; ksym_info = st_info byte;
+# ksym_shndx = section index; ksym_value = st_value (function code offset).
+KELF_MAX_SYMS: uint32 = 256
+ksym_name: Array[256, uint32]
+ksym_info: Array[256, uint32]
+ksym_shndx: Array[256, uint32]
+ksym_value: Array[256, uint64]
+ksym_count: uint32 = 0
+
+
+def kelf_strtab_add(name_off: uint32, name_len: uint32) -> uint32:
+    # Append a strbuf name slice + NUL to .strtab, return its offset.
+    at: uint32 = kelf_strtab_len
+    i: uint32 = 0
+    while i < name_len:
+        if kelf_strtab_len < KELF_STRTAB_CAP - 1:
+            kelf_strtab[kelf_strtab_len] = strbuf[name_off + i]
+            kelf_strtab_len = kelf_strtab_len + 1
+        i = i + 1
+    kelf_strtab[kelf_strtab_len] = 0
+    kelf_strtab_len = kelf_strtab_len + 1
+    return at
+
+
+def ksym_add(name: uint32, info: uint32, shndx: uint32, value: uint64):
+    if ksym_count < KELF_MAX_SYMS:
+        ksym_name[ksym_count] = name
+        ksym_info[ksym_count] = info
+        ksym_shndx[ksym_count] = shndx
+        ksym_value[ksym_count] = value
+        ksym_count = ksym_count + 1
+
+
+# -----------------------------------------------------------------------
+# ET_REL relocatable-object emitter for the bare-metal kernel target.
+#
+# Emits the compiled-Adder kernel code as a relocatable ELF64 object whose
+# cross-object symbols (extern funcs in irq_asm.S / head_64.S, memset, memcpy,
+# read_cr3, …) are UNDEF and resolved by `ld -T arch/x86/kernel/kernel.lds`
+# against the hand-written .S objects — EXACTLY the seed's
+# assemble_and_link_x86_bare `ld` pipeline. The build script (scripts/
+# _adder_cc.sh) assembles header.S/head_64.S + extras and links them WITH this
+# .o into the final higher-half kernel ELF.
+#
+# Sections (in this file order):
+#   [0] NULL
+#   [1] .text     (PROGBITS AX)  = code[0..code_len)
+#   [2] .data     (PROGBITS WA)  = gdata[0..gdata_len)  (all initialised data)
+#   [3] .bss      (NOBITS   WA)  size bss_len
+#   [4] .symtab   (SYMTAB)       sh_link=.strtab, sh_info=first-global index
+#   [5] .strtab   (STRTAB)
+#   [6] .shstrtab (STRTAB)
+#   [7] .rela.text (RELA)        sh_link=.symtab, sh_info=.text
+# Symbols: index0 NULL; STT_SECTION for .text/.data/.bss; one STB_GLOBAL
+# STT_FUNC per Adder function (so head_64.S's `call start_kernel` resolves);
+# one STB_GLOBAL UNDEF per referenced extern not defined here.
+# Relocations (.rela.text): one per recorded data fixup (PC32 vs the .data or
+# .bss section symbol, addend = df_data_off-4) + one per extern reloc (PC32/
+# PLT32 vs the named symbol, addend = -4).
+# -----------------------------------------------------------------------
 def elf_emit_image_kernel() -> uint32:
     elf_reset()
-    elf_err = ELF_ERR_KERNEL_UNSUPPORTED
-    return 0
+    kelf_strtab_len = 0
+    ksym_count = 0
+
+    # --- Build .strtab + .symtab ---------------------------------------
+    # [0] NULL symbol.
+    kelf_strtab[0] = 0
+    kelf_strtab_len = 1
+    ksym_add(0, 0, 0, cast[uint64](0))           # STN_UNDEF
+
+    # Section symbols (STT_SECTION, st_info=3, local): .text/.data/.bss are
+    # sections 1/2/3. These are the relocation targets for intra-object data
+    # refs. st_name 0 (unnamed), st_value 0.
+    SYM_TEXT: uint32 = ksym_count
+    ksym_add(0, 3, 1, cast[uint64](0))           # .text  (STT_SECTION)
+    SYM_DATA: uint32 = ksym_count
+    ksym_add(0, 3, 2, cast[uint64](0))           # .data
+    SYM_BSS: uint32 = ksym_count
+    ksym_add(0, 3, 3, cast[uint64](0))           # .bss
+
+    # First-global index = first STB_GLOBAL symbol (sh_info of .symtab). All
+    # locals (NULL + section syms) precede the globals.
+    first_global: uint32 = ksym_count
+
+    # Adder functions: STB_GLOBAL STT_FUNC (st_info = (1<<4)|2 = 0x12),
+    # st_shndx = .text (1), st_value = fn_offset. These satisfy head_64.S's
+    # `call start_kernel` and any &func / call func against an in-unit function.
+    fi: uint32 = 0
+    while fi < fn_count:
+        no: uint32 = kelf_strtab_add(fn_name_off[fi], fn_name_len[fi])
+        ksym_add(no, 0x12, 1, cast[uint64](fn_offset[fi]))
+        fi = fi + 1
+
+    # Extern symbols: for each referenced ext_* name, if it matches an Adder
+    # function it is already a DEFINED symbol (reuse that index); otherwise add
+    # an UNDEF STB_GLOBAL STT_NOTYPE symbol (st_info=0x10, st_shndx=0) that `ld`
+    # resolves against the .S objects. ext_sym[i] records the resolved index.
+    ei: uint32 = 0
+    while ei < ext_count:
+        fmatch: uint32 = 0
+        fj: uint32 = 0
+        while fj < fn_count:
+            if name_match(fn_name_off[fj], fn_name_len[fj], ext_name_off[ei], ext_name_len[ei]) != 0:
+                ext_sym[ei] = first_global + fj
+                fmatch = 1
+                fj = fn_count
+            else:
+                fj = fj + 1
+        if fmatch == 0:
+            no2: uint32 = kelf_strtab_add(ext_name_off[ei], ext_name_len[ei])
+            ext_sym[ei] = ksym_count
+            ksym_add(no2, 0x10, 0, cast[uint64](0))   # UNDEF GLOBAL NOTYPE
+        ei = ei + 1
+
+    # --- .shstrtab (section-name string table) -------------------------
+    # Offsets are computed by appending names in section order. Index 0 is the
+    # empty name for the NULL section.
+    kshstr: Array[128, uint8]
+    ksh_len: uint32 = 0
+    kshstr[ksh_len] = 0
+    ksh_len = ksh_len + 1
+    # helper-inline name appends; record each name's offset.
+    SH_TEXT: uint32 = ksh_len
+    ksh_len = kelf_append_cstr(&kshstr[0], ksh_len, ".text")
+    SH_DATA: uint32 = ksh_len
+    ksh_len = kelf_append_cstr(&kshstr[0], ksh_len, ".data")
+    SH_BSS: uint32 = ksh_len
+    ksh_len = kelf_append_cstr(&kshstr[0], ksh_len, ".bss")
+    SH_SYMTAB: uint32 = ksh_len
+    ksh_len = kelf_append_cstr(&kshstr[0], ksh_len, ".symtab")
+    SH_STRTAB: uint32 = ksh_len
+    ksh_len = kelf_append_cstr(&kshstr[0], ksh_len, ".strtab")
+    SH_SHSTRTAB: uint32 = ksh_len
+    ksh_len = kelf_append_cstr(&kshstr[0], ksh_len, ".shstrtab")
+    SH_RELATEXT: uint32 = ksh_len
+    ksh_len = kelf_append_cstr(&kshstr[0], ksh_len, ".rela.text")
+
+    # --- File layout: header + section data + section header table -----
+    # ELF64 header = 64 bytes; then .text, .data bytes, then .symtab, .strtab,
+    # .shstrtab, .rela.text, then the 8-entry section header table (each 64).
+    nreloc: uint32 = df_count + er_count
+    symtab_bytes: uint32 = ksym_count * 24
+    rela_bytes: uint32 = nreloc * 24
+
+    off_text: uint32 = 64
+    off_data: uint32 = off_text + code_len
+    off_symtab: uint32 = off_data + gdata_len
+    off_strtab: uint32 = off_symtab + symtab_bytes
+    off_shstrtab: uint32 = off_strtab + kelf_strtab_len
+    off_rela: uint32 = off_shstrtab + ksh_len
+    off_shdr: uint32 = off_rela + rela_bytes
+
+    # Overflow guard: total file size must fit ELF_BUF_CAP.
+    if off_shdr + 8 * 64 > ELF_BUF_CAP:
+        elf_err = ELF_ERR_OVERFLOW
+        return 0
+
+    # --- ELF64 header (64 bytes) ---------------------------------------
+    eb(0x7F)
+    eb(69)            # 'E'
+    eb(76)            # 'L'
+    eb(70)            # 'F'
+    eb(2)             # EI_CLASS = ELFCLASS64
+    eb(1)             # EI_DATA  = ELFDATA2LSB
+    eb(1)             # EI_VERSION
+    eb(0)             # EI_OSABI = SYSV
+    eb(0)
+    eb(0)
+    eb(0)
+    eb(0)
+    eb(0)
+    eb(0)
+    eb(0)
+    eb(0)             # EI_PAD (16 bytes of e_ident total)
+    eb16(1)           # e_type = ET_REL
+    eb16(62)          # e_machine = EM_X86_64
+    eb32(1)           # e_version
+    eb64(cast[uint64](0))         # e_entry (none for ET_REL)
+    eb64(cast[uint64](0))         # e_phoff (no program headers)
+    eb64(cast[uint64](off_shdr))  # e_shoff
+    eb32(0)           # e_flags
+    eb16(64)          # e_ehsize
+    eb16(0)           # e_phentsize
+    eb16(0)           # e_phnum
+    eb16(64)          # e_shentsize
+    eb16(8)           # e_shnum (NULL,.text,.data,.bss,.symtab,.strtab,.shstrtab,.rela.text)
+    eb16(6)           # e_shstrndx = .shstrtab (section 6)
+
+    # --- Section bytes -------------------------------------------------
+    # .text
+    ci: uint32 = 0
+    while ci < code_len:
+        eb(cast[uint32](code[ci]))
+        ci = ci + 1
+    # .data
+    gi: uint32 = 0
+    while gi < gdata_len:
+        eb(cast[uint32](gdata[gi]))
+        gi = gi + 1
+    # .symtab (Elf64_Sym = 24 bytes: name(4) info(1) other(1) shndx(2)
+    #          value(8) size(8))
+    syi: uint32 = 0
+    while syi < ksym_count:
+        eb32(ksym_name[syi])
+        eb(ksym_info[syi] & 255)
+        eb(0)                          # st_other
+        eb16(ksym_shndx[syi] & 65535)
+        eb64(ksym_value[syi])
+        eb64(cast[uint64](0))          # st_size
+        syi = syi + 1
+    # .strtab
+    sti: uint32 = 0
+    while sti < kelf_strtab_len:
+        eb(cast[uint32](kelf_strtab[sti]))
+        sti = sti + 1
+    # .shstrtab
+    shi: uint32 = 0
+    while shi < ksh_len:
+        eb(cast[uint32](kshstr[shi]))
+        shi = shi + 1
+    # .rela.text (Elf64_Rela = 24 bytes: offset(8) info(8) addend(8)).
+    # Data fixups first, then extern relocs.
+    dfi: uint32 = 0
+    while dfi < df_count:
+        sym: uint32 = SYM_DATA
+        if df_is_bss[dfi] != 0:
+            sym = SYM_BSS
+        eb64(cast[uint64](df_at[dfi]))                          # r_offset
+        rinfo: uint64 = (cast[uint64](sym) << 32) | cast[uint64](2)   # R_X86_64_PC32
+        eb64(rinfo)
+        # addend = target_data_off - 4 (PC32 is from the instruction END, 4
+        # bytes past the disp32 field start at r_offset).
+        add: uint64 = cast[uint64](df_data_off[dfi]) - cast[uint64](4)
+        eb64(add)
+        dfi = dfi + 1
+    eri: uint32 = 0
+    while eri < er_count:
+        rt: uint64 = cast[uint64](2)                            # R_X86_64_PC32
+        if er_type[eri] == ER_PLT32:
+            rt = cast[uint64](4)                                # R_X86_64_PLT32
+        symx: uint32 = ext_sym[er_sym_idx[eri]]
+        eb64(cast[uint64](er_at[eri]))                          # r_offset
+        eb64((cast[uint64](symx) << 32) | rt)                  # r_info
+        eb64(cast[uint64](0) - cast[uint64](4))                # r_addend = -4
+        eri = eri + 1
+
+    # --- Section header table (8 entries, each Elf64_Shdr = 64 bytes) ---
+    # [0] NULL
+    kelf_shdr(0, 0, cast[uint64](0), cast[uint64](0), cast[uint64](0), 0, 0, cast[uint64](0), cast[uint64](0))
+    # [1] .text  : PROGBITS, AX (flags=6), addr 0, offset off_text, size code_len, align 16
+    kelf_shdr(SH_TEXT, 1, cast[uint64](6), cast[uint64](0), cast[uint64](off_text), 0, 0, cast[uint64](16), cast[uint64](0))
+    # [2] .data  : PROGBITS, WA (flags=3)
+    kelf_shdr(SH_DATA, 1, cast[uint64](3), cast[uint64](0), cast[uint64](off_data), 0, 0, cast[uint64](8), cast[uint64](0))
+    # [3] .bss   : NOBITS (type 8), WA (flags=3); size bss_len, no file bytes.
+    kelf_shdr(SH_BSS, 8, cast[uint64](3), cast[uint64](0), cast[uint64](off_symtab), 0, 0, cast[uint64](8), cast[uint64](0))
+    # [4] .symtab: SYMTAB (type 2); link=.strtab(5), info=first_global,
+    #     entsize 24, align 8.
+    kelf_shdr(SH_SYMTAB, 2, cast[uint64](0), cast[uint64](0), cast[uint64](off_symtab), 5, first_global, cast[uint64](8), cast[uint64](24))
+    # [5] .strtab: STRTAB (type 3)
+    kelf_shdr(SH_STRTAB, 3, cast[uint64](0), cast[uint64](0), cast[uint64](off_strtab), 0, 0, cast[uint64](1), cast[uint64](0))
+    # [6] .shstrtab: STRTAB
+    kelf_shdr(SH_SHSTRTAB, 3, cast[uint64](0), cast[uint64](0), cast[uint64](off_shstrtab), 0, 0, cast[uint64](1), cast[uint64](0))
+    # [7] .rela.text: RELA (type 4); link=.symtab(4), info=.text(1),
+    #     entsize 24, align 8.
+    kelf_shdr(SH_RELATEXT, 4, cast[uint64](0), cast[uint64](0), cast[uint64](off_rela), 4, 1, cast[uint64](8), cast[uint64](24))
+
+    # Patch the real section SIZES (sh_size at shdr_off + 32) now that the
+    # byte streams are placed. The kelf_shdr writer above wrote sh_size 0 for
+    # the variable-length sections; fix them here.
+    sh1: uint32 = off_shdr
+    kelf_patch_shsize(sh1 + 1 * 64, cast[uint64](code_len))         # .text
+    kelf_patch_shsize(sh1 + 2 * 64, cast[uint64](gdata_len))        # .data
+    kelf_patch_shsize(sh1 + 3 * 64, cast[uint64](bss_len))          # .bss (NOBITS size)
+    kelf_patch_shsize(sh1 + 4 * 64, cast[uint64](symtab_bytes))     # .symtab
+    kelf_patch_shsize(sh1 + 5 * 64, cast[uint64](kelf_strtab_len))  # .strtab
+    kelf_patch_shsize(sh1 + 6 * 64, cast[uint64](ksh_len))          # .shstrtab
+    kelf_patch_shsize(sh1 + 7 * 64, cast[uint64](rela_bytes))       # .rela.text
+
+    if elf_err != 0:
+        return 0
+    return elf_len
+
+
+# Append a NUL-terminated C-literal into a byte buffer at offset `at`, return
+# the new length. Used to build the small .shstrtab.
+def kelf_append_cstr(buf: Ptr[uint8], at: uint32, lit: Ptr[uint8]) -> uint32:
+    p: uint32 = at
+    i: uint32 = 0
+    while cast[uint32](lit[i]) != 0:
+        buf[p] = lit[i]
+        p = p + 1
+        i = i + 1
+    buf[p] = 0
+    p = p + 1
+    return p
+
+
+# Write one Elf64_Shdr (64 bytes) at the current elf_buf position. sh_size is
+# written as 0 here (patched afterwards via kelf_patch_shsize for the
+# variable-length sections). Fields: name, type, flags, addr, offset, link,
+# info, addralign, entsize.
+def kelf_shdr(name: uint32, stype: uint32, flags: uint64, addr: uint64, offset: uint64, link: uint32, info: uint32, align: uint64, entsize: uint64):
+    eb32(name)                 # sh_name
+    eb32(stype)                # sh_type
+    eb64(flags)                # sh_flags
+    eb64(addr)                 # sh_addr
+    eb64(offset)               # sh_offset
+    eb64(cast[uint64](0))      # sh_size (patched later)
+    eb32(link)                 # sh_link
+    eb32(info)                 # sh_info
+    eb64(align)                # sh_addralign
+    eb64(entsize)              # sh_entsize
+
+
+# Patch a section header's sh_size (8 bytes at shdr_off + 32).
+def kelf_patch_shsize(shdr_off: uint32, size: uint64):
+    patch64(shdr_off + 32, size)
 
 
 # -----------------------------------------------------------------------
