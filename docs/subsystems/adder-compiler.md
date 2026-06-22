@@ -392,27 +392,88 @@ load-bearing capabilities are:
    FIELD, needing `gen_index_addr`/`index_elem_size` to handle an `ND_MEMBER`
    base + per-field element width) — that is CAP#4, not import resolution.
    The kernel `init/main.ad` now has its imports RESOLVED — the driver's
-   closure discovery walks all **346** kernel modules — but the merged source
-   **exceeds the driver's `DRV_SRC_CAP` source buffer** (raised to 1 MiB for
-   CAP#2; the 346-module kernel concat overflows it and the parser stops at the
-   truncation point, ~line 14990). So the kernel's precise next blockers are,
-   in order: (a) a larger merged-source buffer (or a streaming/chunked merge)
-   to hold the full kernel concat, then (b) CAP#3 (bare-metal kernel ELF
-   format: multiboot header + higher-half VMA/LMA via `kernel.lds`, plus the
-   `head_64.S`/boot-stub link), then (c) CAP#4 constructs. Import resolution
-   itself is no longer the kernel's blocker.
+   closure discovery walks all **346** kernel modules.
 
-3. **ELF output format.** `elf_emit.ad` emits only the `x86_64-adder-user`-
-   shape self-contained ELF. It does **not** produce the bare-metal kernel
-   ELF (multiboot header + higher-half VMA/LMA split via `kernel.lds`) nor
-   the `runtime.S`-linked userland ELF the seed ships.
+3. **Whole-tree BUFFERS + ELF output format (CAP#3).**
 
-4. **A handful of constructs (reason 8 — 6/128, plus inline asm).** `init`,
-   `shuf`, `vi`, `useradd`, `getty`, `umdf_host` use expression/statement
-   forms `codegen.ad` rejects (root-cause each against the failing node).
-   Separately, `insmod`/`modprobe`/`rmmod` use inline `asm_volatile`, which
-   `codegen.ad` does not lower — it surfaces as an unresolved `asm_volatile`
-   call (reason 7). Both are NEXT-capability work.
+   **Buffers — DONE 2026-06-22.** The kernel's 346-module closure merges to
+   **~13.9 MB of stripped source / ~1.73 M tokens / 10,161 functions / 9,266
+   globals / ~66 K data refs / ~42 K call fixups** — two orders of magnitude
+   past the whole-COMPILER scale the fixed arrays were sized for (~315 KB,
+   ~31 K tokens). Every source/output/parser/codegen fixed array was raised to
+   whole-TREE scale (all are zero-init `.bss`, so `host_ac.elf`'s file size is
+   unchanged — only its data-segment memsz grows, ~408 MB, well within host
+   RAM): `DRV_SRC_CAP` 1 MiB→24 MiB, `DRV_FILE_CAP` 384 K→1 MiB; lexer
+   `MAX_TOKENS` 64 K→4 M, `STRBUF` 512 K→16 MiB; parser `MAX_NODES` 64 K→4 M;
+   codegen `CODE_CAP`/`DATA_BASE` 2 MiB→16 MiB, `GDATA_CAP` 64 K→4 MiB,
+   `MAX_FUNCS`/`GLOBALS`/`METHODS`/`FLOAT` 1 K→16 K, `MAX_FIXUPS`/`METHOD_
+   FIXUPS`/`DATA_FIXUPS` 8 K→128 K, `MAX_STRINGS` 2 K→32 K, `MAX_STRUCTS`
+   256→4 K, `MAX_STRUCT_FIELDS` 4 K→64 K; `elf_emit` `ELF_BUF_CAP` 128 K→24 MiB.
+   The merge is no longer truncated (was stopping at 1 MiB / ~line 14990); it
+   now produces the full ~10 MB stripped TU. A driver import-strip gap exposed
+   by the kernel was also fixed: a **backslash line-continued** `from M import
+   a, b, \` (no parens; e.g. `drivers/net/ipv6.ad`) only had its first line
+   dropped, orphaning the continuation tokens — `drv_line_ends_backslash` +
+   a `skipping_cont` state now strip the whole `\`-continued logical import
+   line (the userland units used only the paren form, so this was the kernel's
+   gap). The seed still parses the full merged TU (13,691 decls); host_ac now
+   lexes+parses through to **codegen**.
+
+   **ELF format — SEAM landed, kernel emitter BLOCKED behind CAP#4.**
+   `elf_emit.ad` emits the `x86_64-adder-user` self-contained ELF (the only
+   one userland units need — behaviourally the seed's `ld`-against-runtime.S
+   output via the cap#1 in-`.ad` runtime library). The output-FORMAT seam the
+   seed drives by `--target` is now wired end-to-end: `elf_emit_image_target(
+   entry_arg, target)` dispatches `ELF_FMT_USER` vs `ELF_FMT_KERNEL`; the
+   driver parses `--target=x86_64-bare-metal` / `--kernel` (anywhere in argv,
+   positionals unaffected) and `_adder_cc.sh` forwards `--target`.
+   `elf_emit_image_kernel()` documents the higher-half multiboot/`kernel.lds`
+   layout field-for-field and returns `ELF_ERR_KERNEL_UNSUPPORTED` with the
+   PRECISE remaining prerequisites, rather than silently writing a USER-shaped
+   ELF for a kernel target. Those prerequisites (cap#3b) are: **(a)** the
+   boot-stub MACHINE CODE — `arch/x86/boot/header.S` (multiboot header +
+   32-bit long-mode-transition stub + gdt64 + `.pgtables` + boot stack) and
+   `arch/x86/kernel/head_64.S` (`start_kernel_asm_entry`→`call start_kernel`,
+   `kernel_image_end`/`read_rbp`/text-bounds), which the seed routes through
+   `as`/`ld` and which `codegen.ad` emits NONE of, plus the cross-references
+   (head_64 `call start_kernel`; the Adder code's calls to `kernel_image_end`/
+   `read_rbp`; header.S's R_X86_64_64 `movabsq $start_kernel_asm_entry`); and
+   **(b)** `codegen.ad` per-SECTION streams — the user format flattens to one
+   `code[]`+`gdata[]` at vaddr 0 / `CODE_CAP`, but the kernel needs distinct
+   `.rodata`, `.data..percpu` (its own VMA, `%gs`-relative), the high-VMA
+   (0xffffffff80…)/low-LMA `AT()` split, the AP trampoline @0x8000, and the
+   `__bss_start`/`__bss_end` symbols `head_64.S`'s `rep stosq` reads. **These
+   are moot until CAP#4 below: the kernel does not yet COMPILE** (it blocks in
+   codegen on the pervasive `cast[Ptr[T]](e)[i]` raw-mem idiom), so neither
+   `code[]` nor `gdata[]` is ever produced for it — emitting a kernel ELF now
+   would be unvalidatable dead code.
+
+4. **Unsupported constructs (reason 8 + inline asm) — now the KERNEL's
+   dominant + first-hit blocker.** Userland: `init`, `shuf`, `vi`, `useradd`,
+   `getty`, `umdf_host` use expression/statement forms `codegen.ad` rejects
+   (root-cause each against the failing node); `insmod`/`modprobe`/`rmmod` use
+   inline `asm_volatile` (surfaces as an unresolved `asm_volatile` call —
+   reason 7).
+
+   **Kernel (`init/main.ad`, post-buffers):** the merged TU now lexes+parses
+   and reaches codegen, where it stops at codegen `reason=8 kind=13`
+   (`ND_INDEX`) on the very first raw-memory write — `cast[Ptr[uint32]](
+   fb_base + off)[0] = color` (the framebuffer poke, merged line 646). This
+   `cast[Ptr[T]](expr)[i]` raw-pointer indexed-access idiom is **pervasive**
+   across the kernel closure: **915 STORE sites** (`cast[Ptr[T]](e)[i] = v`)
+   and **634 LOAD sites** (`… = cast[Ptr[T]](e)[i]`) — page tables, vdso,
+   framebuffer, mm, etc. `gen_index_addr`/`index_elem_size` handle a plain
+   ident/array/Ptr base but not an `ND_CAST` (or general expression) base as an
+   assignment/load target. This is the single highest-leverage CAP#4 fix —
+   landing it unblocks the bulk of the kernel; the remaining kernel CAP#4
+   surface is inline `asm`/`asm_volatile` (114 sites: the IRQ/MSR/port stubs),
+   f-strings (~74), `yield`/list-comp/`lambda` (a handful). (A secondary
+   full-file "parse error at line 46132" also appears, but every clean
+   prefix-cut of the merged TU parses fine and fails in codegen at the
+   cast-ptr construct, so the parse symptom is downstream of — and gated by —
+   the same CAP#4 work, not an independent parser blocker.) Once the kernel
+   compiles, CAP#3b (boot-stub bytes + per-section streams) makes the kernel
+   ELF emittable — see capability #3 above.
 
 **Backends differ by construction**, so a byte-identical-ELF differential is
 not even theoretically possible: the seed routes through GNU `as` (AT&T asm),
