@@ -8,33 +8,37 @@
 #
 # Backend is chosen by the ADDER_CC env var:
 #
-#   ADDER_CC=python   (DEFAULT) — the frozen Python seed
-#                     (`python3 -m compiler.adder compile ...`). This is the
-#                     bootstrap/trust root and the equivalence oracle; it
-#                     ALWAYS compiles 100% of the tree.
+#   ADDER_CC=adder    (DEFAULT, 2026-06-22) — route the compile through the
+#                     self-hosted `.ad` host compiler (build/cutover/host_ac.elf),
+#                     bootstrapped once by the seed. ~300x faster per-compile
+#                     (126ms->0.4ms). The native compiler builds the whole
+#                     kernel + userland and produces an installer image that is
+#                     BEHAVIORALLY IDENTICAL to the seed's (all differentials
+#                     green; native rl5 boots to the desktop — VISUALLY verified).
 #
-#   ADDER_CC=adder    — route the compile through the self-hosted `.ad`
-#                     host compiler (build/cutover/host_ac.elf), built once
-#                     by the seed via adder_cc_bootstrap.
+#   ADDER_CC=python   — the frozen Python seed (`python3 -m compiler.adder
+#                     compile ...`). The bootstrap/trust root + equivalence
+#                     oracle; it ALWAYS compiles 100% of the tree. Used to
+#                     compile the compiler and as the differential oracle only.
 #
 # ====================================================================
-# CUTOVER STATUS (2026-06-21): ADDER_CC=adder is NOT yet a viable default.
-# The whole-tree differential (scripts/test_selfhost_wholetree_diff.sh)
-# shows host_ac.elf compiles only 2/128 single-TU userland units and 0
-# multi-TU units / the kernel, because codegen.ad/elf_emit.ad lack EXTERN
-# LINKAGE (runtime.S / boot stubs), IMPORT RESOLUTION + module mangling,
-# and a handful of constructs. See docs/subsystems/adder-compiler.md
-# "Self-hosting cutover — WHOLE-TREE blocker". Until those land, ADDER_CC=
-# adder will FAIL the build on any real unit; it is wired here so the flip
-# is a one-line default change once the .ad compiler is capable, and so the
-# escape hatch (fall back to python) exists from day one.
+# CUTOVER STATUS (2026-06-22): ADDER_CC=adder IS NOW THE DEFAULT. The native
+# `.ad` host compiler builds the WHOLE kernel + all userland and produces an
+# installer image behaviorally identical to the seed's: fuzzer 500/500 0
+# miscompiles; userland objdiff 193 clean; kernel objdiff (kobjdiff) 0
+# collisions + 0 histogram/branch divergences across 10162 funcs; native
+# installer rl5 PASS with `[live-root] DONE` + `entering runlevel 5`; the
+# native desktop was VISUALLY verified (hamedit + calculator painted). The
+# Python seed stays the FROZEN bootstrap + differential oracle (compile the
+# compiler only). Escape hatch: set ADDER_CC=python to build via the seed.
+# See docs/subsystems/adder-compiler.md + the kobjdiff/objdiff harnesses.
 # ====================================================================
 
 # Build build/cutover/host_ac.elf once (idempotent within a build) using
 # the Python seed. Safe to call even when ADDER_CC=python (it just no-ops
 # the bootstrap unless the .ad backend is actually selected).
 adder_cc_bootstrap() {
-    if [ "${ADDER_CC:-python}" != "adder" ]; then
+    if [ "${ADDER_CC:-adder}" != "adder" ]; then
         return 0
     fi
     if [ -n "${_ADDER_CC_BOOTSTRAPPED:-}" ]; then
@@ -70,7 +74,7 @@ PY
 # see docs/subsystems/adder-compiler.md); host_ac fails it with a precise
 # diagnostic rather than silently emitting a user-shaped ELF.
 adder_cc_compile() {
-    local backend="${ADDER_CC:-python}"
+    local backend="${ADDER_CC:-adder}"
     if [ "$backend" = "python" ]; then
         # Callers pass the full seed CLI verb (`compile ...`); forward as-is.
         python3 -m compiler.adder "$@"
