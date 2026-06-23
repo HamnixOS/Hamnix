@@ -1242,6 +1242,13 @@ _AD_CFG_INSTS = 0         # total CFG instructions
 _AD_CFG_SKIPPED = 0       # functions skipped on arena overflow (not a failure)
 _AD_CFG_PROGS = 0         # programs the CFG lane validated
 _AD_CFG_FAILS = []        # (seed, detail) of broken-invariant programs
+# Phase-4 PREREQ accumulators: value-level live ranges + alias/may-clobber.
+_AD_CFG_RANGES = 0        # total valid live intervals (one per live name)
+_AD_CFG_RANGE_LEN = 0     # sum of interval lengths (for avg)
+_AD_CFG_RANGE_MAX = 0     # max single interval length across the corpus
+_AD_CFG_LOCALS = 0        # total distinct interned names (locals/params)
+_AD_CFG_PROMOTABLE = 0    # names register-promotable (not clobberable)
+_AD_CFG_CLOBBERABLE = 0   # names clobberable (address-taken/stored-through)
 
 
 def _ad_host():
@@ -1259,6 +1266,8 @@ def run_cfg_lane(seed, body):
     batch driver reports the accumulated results + fails on any cfgfail."""
     global _AD_CFG_FUNCS, _AD_CFG_BLOCKS, _AD_CFG_EDGES, _AD_CFG_INSTS
     global _AD_CFG_SKIPPED, _AD_CFG_PROGS, _AD_CFG_FAILS
+    global _AD_CFG_RANGES, _AD_CFG_RANGE_LEN, _AD_CFG_RANGE_MAX
+    global _AD_CFG_LOCALS, _AD_CFG_PROMOTABLE, _AD_CFG_CLOBBERABLE
     host = _ad_host()
     try:
         r = host.run_cfg_over_body(seed, body, _AD_WORK)
@@ -1275,6 +1284,13 @@ def run_cfg_lane(seed, body):
     _AD_CFG_EDGES += r.edges
     _AD_CFG_INSTS += r.insts
     _AD_CFG_SKIPPED += r.skipped
+    _AD_CFG_RANGES += r.ranges
+    _AD_CFG_RANGE_LEN += r.range_len
+    if r.range_max > _AD_CFG_RANGE_MAX:
+        _AD_CFG_RANGE_MAX = r.range_max
+    _AD_CFG_LOCALS += r.locals
+    _AD_CFG_PROMOTABLE += r.promotable
+    _AD_CFG_CLOBBERABLE += r.clobberable
     if r.status == "cfgfail":
         _AD_CFG_FAILS.append((seed, r.detail))
 
@@ -1776,6 +1792,17 @@ def _run_ad_codegen_batch(base, args):
         print(f"  CFG edges:                  {_AD_CFG_EDGES}")
         print(f"  CFG instructions:           {_AD_CFG_INSTS}")
         print(f"  functions skipped (overflow): {_AD_CFG_SKIPPED}")
+        # Phase-4 PREREQ: value-level live ranges + alias/may-clobber analysis.
+        _avg_len = (_AD_CFG_RANGE_LEN / _AD_CFG_RANGES) if _AD_CFG_RANGES else 0.0
+        _pct_prom = (_AD_CFG_PROMOTABLE / _AD_CFG_LOCALS * 100) if _AD_CFG_LOCALS else 0.0
+        _pct_clob = (_AD_CFG_CLOBBERABLE / _AD_CFG_LOCALS * 100) if _AD_CFG_LOCALS else 0.0
+        print(f"  --- value-level live ranges + alias (Phase-4 PREREQ) ---")
+        print(f"  live ranges (total):        {_AD_CFG_RANGES}")
+        print(f"  avg interval length:        {_avg_len:.2f}")
+        print(f"  max interval length:        {_AD_CFG_RANGE_MAX}")
+        print(f"  distinct locals/params:     {_AD_CFG_LOCALS}")
+        print(f"  register-promotable:        {_AD_CFG_PROMOTABLE}  ({_pct_prom:.1f}%)")
+        print(f"  clobberable (escaped):      {_AD_CFG_CLOBBERABLE}  ({_pct_clob:.1f}%)")
         print(f"  broken-invariant programs:  {len(_AD_CFG_FAILS)}")
         # The lane proves something only if it actually built CFGs. An all-empty
         # run (no function processed) is itself a lane failure.

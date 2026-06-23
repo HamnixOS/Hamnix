@@ -1164,12 +1164,10 @@ nearest enclosing loop's continue target). Uses are extracted by scanning every
 calls, index, member, unary, and call-argument chains).
 
 **Documented SKIPS (the gaps before an allocator can flip on):**
-- **No alias / may-clobber modelling** for stores through `p[i]` / `a.b` / `*p`
-  or for writes through a call. Those are treated as plain *uses* of their ident
-  operands. Liveness is therefore sound for register candidates that are *never
-  address-taken* (the only ones a first allocator would color), but a real
-  allocator must add alias analysis before trusting liveness for address-taken
-  storage. The validator deliberately asserts nothing this gap could violate.
+- ~~No alias / may-clobber modelling~~ **— now closed by the Phase-4 PREREQ
+  alias analysis below.** Stores through `p[i]` / `a.b` / `*p` and address-taken
+  locals are now identified so an allocator knows which names are *not* safely
+  register-promotable.
 - **No SSA / φ-nodes** — classic non-SSA name dataflow. An allocator can color on
   this directly or build SSA on top.
 - **`match`/`try`/`with`/`defer`/`yield`/`raise`** are lowered as opaque
@@ -1205,6 +1203,74 @@ ADDER_CFG=1 ADDER_FUZZ_DIFF_TARGET=ad-codegen \
     python3 tests/fuzz/adder_fuzzer.py --ad-codegen --count 500 --seed 1
 ```
 
+## Native optimizer — Phase 4 PREREQ: value-level live ranges + alias analysis (analysis only)
+
+The two analyses a register allocator consumes *directly* — and the last
+prerequisites the CFG-groundwork handoff named — now exist in `cfg.ad`, still
+**pure analysis, byte-inert by construction** (built only via `--dump-cfg`,
+nothing on the AST→codegen path calls them). They sit on top of the already-
+solved CFG + block liveness.
+
+### (1) Value-level live ranges (`lr_*`)
+
+A linear-scan / graph-coloring allocator does not consume per-block live sets; it
+consumes a per-value **live INTERVAL** `[start,end)` over a stable linear
+instruction numbering, so "do A and B interfere?" reduces to interval overlap.
+
+- **Numbering axis.** The CFG instruction pool (`ci_*`) is filled in *block
+  order*, so the flat `ci` index is itself a stable linear program-point number
+  and each block maps to a contiguous `[bb_lo, bb_hi)` span. Program points run
+  `0..ci_count`.
+- **Interval construction.** `lr_build()` computes, per interned name, the
+  half-open `[lr_start, lr_end)` = (first point the name is defined / used /
+  live-in) → (last point it is used / live-out, **+1** so the last-use point is
+  included). It folds three sources per block: the block span if the name is
+  **live-in**, each instruction that **defs/uses** the name (its exact point),
+  and the block's bottom edge if the name is **live-out**. A value live across
+  several blocks therefore yields **one** interval spanning its whole linear
+  extent — exactly what linear-scan ingests.
+- **Conservatism / soundness direction.** The interval is a **superset** of true
+  liveness (it may cover a hole as live, never the reverse). That is the
+  safe direction for an allocator: two names that *truly* interfere always have
+  overlapping intervals, so no real interference is ever missed.
+
+### (2) Alias / may-clobber analysis (`cl_*`)
+
+An allocator may promote a local to a register only if **every** write to it is a
+visible name-level def (so liveness sees it). `cl_build(fn)` builds the
+conservative per-function set of **clobberable / escaped** locals — those a
+register cannot safely hold:
+
+- **Address-taken:** `&x`, and `&x[i]` / `&x.f` / `&*p` (the *base* ident of the
+  lvalue chain, via `cl_base_ident`) — the storage escapes and may be written
+  through the pointer.
+- **Stored-through a non-ident lvalue:** `x[i] = e`, `x.f = e`, `*x = e` — the
+  value reaches `x`'s storage with no name-level def of `x`.
+- **Across-call mutation is subsumed:** a local is only mutated by a callee if
+  its address escaped, which the address-taken rule already marks. Plain
+  by-value call arguments do **not** escape.
+
+The scan is a pure recursive AST walk (`cl_scan_stmts` / `cl_scan_expr`) that
+interns escaping names into the **same** `nm_*` table the CFG built, so name ids
+line up with the live ranges. **When unsure, a name is marked clobberable.** A
+name is **register-promotable** (`lr_is_promotable`) iff it has a live range AND
+is **not** clobberable; by construction `promotable ∩ clobberable = ∅`.
+
+### Validator (the safety proof, extended)
+
+After `cfg_validate()` solves liveness, `cfg_run_program` runs `lr_build` +
+`cl_build` and `lr_validate()` asserts:
+- every valid interval is **non-empty and in bounds** (`start < end ≤ ci_count`);
+- `promotable ∩ clobberable = ∅` (a name cannot be both);
+- the clobberable set ⊆ the interned-name set (alias set is a subset of locals).
+
+The `--dump-cfg` report adds `CFG_RANGES / CFG_RANGE_LEN / CFG_RANGE_MAX /
+CFG_LOCALS / CFG_PROMOTABLE / CFG_CLOBBERABLE`; the `ADDER_CFG=1` fuzzer lane
+accumulates them and prints avg/max interval length and the promotable-vs-
+clobberable split. **Corpus result (1000 programs / 5494 functions): 103,486
+live ranges, avg interval 46.1 / max 297, 0 broken invariants, 0 overflow skips;
+of 104,486 distinct locals, 86.6 % register-promotable, 12.4 % clobberable.**
+
 ### Verification (Phase 4 groundwork)
 
 - **DEFAULT (ADDER_OPT and ADDER_CFG unset)** is byte-inert: `cfg.ad` is imported
@@ -1221,24 +1287,33 @@ ADDER_CFG=1 ADDER_FUZZ_DIFF_TARGET=ad-codegen \
 
 ### What remains before a register allocator can be written + flipped on
 
-The CFG + liveness are the consumable analysis; an allocator still needs:
-1. **Value-level (not just name-level) liveness / live ranges.** This groundwork
-   tracks *names*; an SSA-or-value allocator wants per-value ranges. Either color
-   names directly (simplest first cut) or build value liveness on top of the CFG.
-2. **Alias / may-clobber analysis** so address-taken and through-pointer/through-
-   call stores are modelled — required before liveness can be trusted for any
-   storage that escapes (see SKIPS). A first allocator can sidestep this by
-   coloring only never-address-taken locals.
+The analysis a register allocator *reads* is now complete:
+1. ✅ **Value-level live ranges** — `lr_build` gives per-name `[start,end)`
+   intervals over a stable linear numbering, spanning multiple blocks (Phase-4
+   PREREQ above). This is what a linear-scan allocator consumes.
+2. ✅ **Alias / may-clobber analysis** — `cl_build` gives the conservative
+   escaped/clobberable set, and `lr_is_promotable` the register-promotable set
+   (disjoint by construction). The allocator now knows which names it may color
+   and which it must keep in memory.
+
+**The allocator can now be written.** Its remaining inputs are *construction*, not
+*analysis*:
 3. **An ABI / calling-convention model** (argument registers, caller/callee-saved
-   split) — the current push-everything codegen has none.
-4. **The allocator itself** (linear-scan first, graph-colouring later) assigning
-   live ranges to the register file with spill slots.
+   split) — the current push-everything codegen has none. This is a target-model
+   table, not an analysis pass.
+4. **The allocator itself** (linear-scan first, graph-colouring later): assign the
+   live ranges of the promotable names to the register file, spill the rest to
+   stack slots. It consumes (1)+(2) directly; no further analysis is blocking.
 5. **A codegen entry that consumes the IR/CFG instead of the AST** — the
    inflection point where `gen_expr`'s AST walk is replaced by IR → instruction
    selection. This lands behind `ADDER_OPT` as a *parallel* IR codegen path,
    proven byte-/behaviour-correct via the same lane before any cutover is
-   discussed. Until then, register allocation (the first pass that cannot be an
-   AST-to-AST rewrite) cannot turn on.
+   discussed.
+
+In short: items (1) and (2) — the analysis prerequisites the groundwork handoff
+named — are **done and corpus-validated**. The next phase (the allocator + an ABI
+model + an IR-consuming codegen entry) is engineering on top of complete analysis,
+no longer gated on missing information.
 
 ## Related docs
 

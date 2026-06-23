@@ -204,6 +204,13 @@ class CfgResult:
         self.blocks = kw.get("blocks", 0)
         self.edges = kw.get("edges", 0)
         self.insts = kw.get("insts", 0)
+        # Phase-4 PREREQ: value-level live ranges + alias/may-clobber stats.
+        self.ranges = kw.get("ranges", 0)
+        self.range_len = kw.get("range_len", 0)
+        self.range_max = kw.get("range_max", 0)
+        self.locals = kw.get("locals", 0)
+        self.promotable = kw.get("promotable", 0)
+        self.clobberable = kw.get("clobberable", 0)
         self.detail = kw.get("detail", "")
 
 
@@ -242,6 +249,12 @@ def run_cfg(src_path: Path, timeout=30) -> CfgResult:
                      blocks=meta.get("CFG_BLOCKS", 0),
                      edges=meta.get("CFG_EDGES", 0),
                      insts=meta.get("CFG_INSTS", 0),
+                     ranges=meta.get("CFG_RANGES", 0),
+                     range_len=meta.get("CFG_RANGE_LEN", 0),
+                     range_max=meta.get("CFG_RANGE_MAX", 0),
+                     locals=meta.get("CFG_LOCALS", 0),
+                     promotable=meta.get("CFG_PROMOTABLE", 0),
+                     clobberable=meta.get("CFG_CLOBBERABLE", 0),
                      detail=detail)
 
 

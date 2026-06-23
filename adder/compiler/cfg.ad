@@ -98,6 +98,11 @@ from compiler.parser import (
     ND_BINARY,
     ND_UNARY,
     ND_CALL,
+    ND_METHOD_CALL,
+    ND_INDEX,
+    ND_MEMBER,
+    UNOP_ADDR,
+    UNOP_DEREF,
     ND_VAR_DECL,
     ND_ASSIGN,
     ND_EXPR_STMT,
@@ -1006,6 +1011,358 @@ def cfg_validate() -> uint32:
 
 
 # =======================================================================
+# Phase-4 PREREQ (1): value-level live ranges.
+# =======================================================================
+#
+# WHAT THIS ADDS over block liveness
+# ----------------------------------
+# lv_solve gives per-BLOCK live-in/out bitsets. A linear-scan or graph-coloring
+# allocator instead consumes a per-NAME live INTERVAL [start,end) over a stable
+# linear instruction numbering: the contiguous span from a name's first def/use
+# to its last use, so the allocator can ask "do names A and B overlap?" by
+# interval intersection. We compute exactly that here, ON TOP of the already-
+# solved CFG + block liveness — still pure analysis, still byte-inert.
+#
+# INSTRUCTION NUMBERING (the [start,end) axis)
+#   The CFG instruction pool (ci_*) is filled in BLOCK order: block b owns the
+#   contiguous range [bb_first[b], bb_first[b]+bb_ninstr[b]). So the flat ci
+#   index IS a stable linear program-point number, and a block maps to a
+#   contiguous [lo,hi) instruction span. We number program points 0..ci_count;
+#   point p sits "at" instruction p. An interval [start,end) is half-open: the
+#   name is live from program point `start` up to (not including) `end`.
+#
+# HOW A NAME's INTERVAL IS BUILT (correct across blocks via the solved liveness)
+#   For each name id n we take the union, over every block b, of:
+#     * if n is live-in to b: the whole block span [bb_lo(b), bb_hi(b)) is
+#       covered (n is live on entry, so live across at least the block prefix
+#       until its first local def — conservatively the whole block for an
+#       interval lower bound; the precise last-use is refined below),
+#     * each instruction in b that DEFs or USEs n contributes its own point,
+#     * if n is live-OUT of b: the block's last point extends to bb_hi(b) (n
+#       crosses the block's bottom edge into a successor).
+#   The interval is [min covered point, max covered point + 1). A value that is
+#   live across multiple blocks therefore yields ONE interval spanning from its
+#   first def/live-in point to its last use/live-out point across the linear
+#   numbering — precisely what linear-scan consumes. This is a CONSERVATIVE
+#   (superset) interval: it never under-approximates liveness (sound for an
+#   allocator: two names that truly interfere always have overlapping
+#   intervals), at the cost of occasionally reporting a hole as live. A first
+#   allocator wants exactly this safety direction.
+#
+# WHY half-open + +1: an instruction that is the LAST use of n keeps n live
+#   THROUGH that instruction's read, so the interval must include that point;
+#   end = last_point + 1 makes [start,end) contain it. A def-only point with no
+#   later use still yields a 1-wide interval [p, p+1) (the value is defined; an
+#   allocator must still place it somewhere for that point).
+
+# Per-name interval, indexed by name id (0..nm_count). lr_valid[n]=1 if name n
+# has any def/use/live span in the function (else it never appears — no
+# interval). Bounds are program points over [0, ci_count].
+lr_start: Array[256, uint32]           # NM_MAX
+lr_end: Array[256, uint32]             # half-open: [lr_start, lr_end)
+lr_valid: Array[256, uint32]
+
+LR_INF: uint32 = 0xffffffff
+
+
+def lr_reset():
+    n: uint32 = 0
+    while n < NM_MAX:
+        lr_start[n] = LR_INF
+        lr_end[n] = 0
+        lr_valid[n] = 0
+        n = n + 1
+
+
+# Extend name n's interval to cover program point p (and p+1 as a use/def end).
+def lr_cover(n: uint32, p: uint32):
+    if n >= NM_MAX:
+        return
+    lr_valid[n] = 1
+    if p < lr_start[n]:
+        lr_start[n] = p
+    if p + 1 > lr_end[n]:
+        lr_end[n] = p + 1
+
+
+# Block instruction span helpers.
+def bb_lo(b: uint32) -> uint32:
+    return bb_first[b]
+
+
+def bb_hi(b: uint32) -> uint32:
+    return bb_first[b] + bb_ninstr[b]
+
+
+# Build value(name)-level live intervals from the solved CFG + block liveness.
+# Precondition: cfg_build_function returned 1 AND lv_solve() reached a fixpoint
+# (cfg_validate runs it; the corpus driver guarantees ordering). Pure reads.
+def lr_build():
+    lr_reset()
+    b: uint32 = 0
+    while b < bb_count:
+        lo: uint32 = bb_lo(b)
+        hi: uint32 = bb_hi(b)
+        # Names live-IN cover the block prefix; names live-OUT cover up to the
+        # block's bottom edge. Both pin the interval bounds across blocks so a
+        # value crossing several blocks gets ONE spanning interval.
+        nid: uint32 = 0
+        while nid < nm_count:
+            if lv_get(LVS_IN, b, nid) != 0:
+                lr_cover(nid, lo)
+                # live-in and the block has instructions => live at least to the
+                # first local point; if also live-out, to the bottom edge.
+                if hi > lo:
+                    lr_cover(nid, hi - 1)
+            if lv_get(LVS_OUT, b, nid) != 0:
+                if hi > lo:
+                    lr_cover(nid, hi - 1)
+                else:
+                    # empty block (no instrs, e.g. a pure-branch join): the
+                    # crossing point is the block's position lo.
+                    lr_cover(nid, lo)
+            nid = nid + 1
+        # Each instruction's own def/use pins its exact point.
+        i: uint32 = 0
+        while i < bb_ninstr[b]:
+            ins: uint32 = lo + i
+            d: uint32 = ci_def[ins]
+            if d != NM_NONE and d < NM_MAX:
+                lr_cover(d, ins)
+            u: uint32 = 0
+            nu: uint32 = ci_nuse[ins]
+            while u < nu:
+                lr_cover(ci_use[ins * CI_MAX_USE + u], ins)
+                u = u + 1
+            i = i + 1
+        b = b + 1
+
+
+# =======================================================================
+# Phase-4 PREREQ (2): alias / may-clobber analysis.
+# =======================================================================
+#
+# A register allocator may only promote a local to a register if EVERY write to
+# it is a visible name-level def (so liveness sees it). A local whose ADDRESS
+# escapes, or that is written through a non-ident lvalue, can be mutated without
+# a name-level def — liveness would be UNSOUND for it. This analysis builds the
+# conservative per-function set of such CLOBBERABLE locals. A name is
+# REGISTER-PROMOTABLE iff it is a known local AND NOT in the clobberable set.
+#
+# WHAT MARKS A LOCAL CLOBBERABLE (conservative — when unsure, mark it):
+#   * its address is taken: `&x`            (UNOP_ADDR over an ident)
+#                           `&x[i]`,`&x.f`  (UNOP_ADDR over an index/member whose
+#                                            base ident is x — x's storage escapes)
+#   * it is the BASE of a store through a non-ident lvalue:
+#                           `x[i] = e`, `x.f = e`, `*x = e`
+#     (the value reaches x's storage without a name-level def of x). NOTE the
+#     non-ident-lvalue STORE case is detected during CFG lowering's else-branch;
+#     here we re-derive it by a whole-AST scan so the alias set does not depend
+#     on lowering order.
+#   * (subsumed) a local mutated across a CALL only matters if its address
+#     escaped — already covered by the address-taken rule. Plain by-value call
+#     arguments do NOT escape the caller's storage.
+#
+# The scan is a pure recursive walk of the function body AST (params + body),
+# marking name ids in cl_set. It interns names into the SAME nm_* table the CFG
+# built (so name ids line up with live ranges). Names not present in nm_* (e.g.
+# globals/struct fields) are irrelevant — only locals/params are colorable.
+
+cl_set: Array[256, uint32]             # NM_MAX: 1 => clobberable/escaped
+cl_count: uint32 = 0                   # number of distinct clobberable names
+
+
+def cl_reset():
+    n: uint32 = 0
+    while n < NM_MAX:
+        cl_set[n] = 0
+        n = n + 1
+    cl_count = 0
+
+
+# Mark a name (by strbuf ref) clobberable. Interns into nm_* so the id matches
+# the live-range / liveness numbering. Overflow is folded into cfg_overflow.
+def cl_mark(off: uint32, len_: uint32):
+    nid: uint32 = nm_intern(off, len_)
+    if nid >= NM_MAX:
+        cfg_overflow = 1
+        return
+    if cl_set[nid] == 0:
+        cl_set[nid] = 1
+        cl_count = cl_count + 1
+
+
+# Return the base IDENT node of an lvalue chain (x, x[i], x.f, x[i].f[j], *x...),
+# or 0 if the base is not a simple ident (e.g. a call result, literal). Used to
+# attribute an address-of / through-pointer store to the escaping local.
+def cl_base_ident(node: uint32) -> uint32:
+    cur: uint32 = node
+    while cur != 0:
+        k: uint32 = nd_kind[cur]
+        if k == ND_IDENT:
+            return cur
+        if k == ND_INDEX or k == ND_MEMBER:
+            cur = nd_a[cur]
+        elif k == ND_UNARY and nd_aux[cur] == UNOP_DEREF:
+            # *p : the dereferenced pointer's base escapes through the store.
+            cur = nd_a[cur]
+        else:
+            return 0
+    return 0
+
+
+# Recursively scan an expression subtree, marking any local whose address is
+# taken via UNOP_ADDR. Descends all child slots + arg/element chains (mirrors
+# cfg_scan_uses' traversal so no operand is missed).
+def cl_scan_expr(node: uint32):
+    if node == 0:
+        return
+    k: uint32 = nd_kind[node]
+    if k == ND_INT_LIT or k == ND_IDENT:
+        return
+    if k == ND_UNARY and nd_aux[node] == UNOP_ADDR:
+        base: uint32 = cl_base_ident(nd_a[node])
+        if base != 0:
+            cl_mark(nd_name_off[base], nd_name_len[base])
+        # still descend into the operand (e.g. &a[b] uses b)
+    cl_scan_expr(nd_a[node])
+    cl_scan_expr(nd_b[node])
+    cl_scan_expr(nd_c[node])
+    cl_scan_expr(nd_d[node])
+    cl_scan_chain(nd_next[nd_a[node]])
+    cl_scan_chain(nd_next[nd_b[node]])
+
+
+def cl_scan_chain(head: uint32):
+    n: uint32 = head
+    while n != 0:
+        cl_scan_expr(n)
+        n = nd_next[n]
+
+
+# Scan a statement chain (a body), marking clobberable locals from both
+# address-of expressions anywhere AND non-ident-lvalue store targets.
+def cl_scan_stmts(head: uint32):
+    s: uint32 = head
+    while s != 0:
+        k: uint32 = nd_kind[s]
+        if k == ND_ASSIGN:
+            target: uint32 = nd_a[s]
+            if nd_kind[target] != ND_IDENT:
+                # store through index/member/deref lvalue: base local escapes.
+                base: uint32 = cl_base_ident(target)
+                if base != 0:
+                    cl_mark(nd_name_off[base], nd_name_len[base])
+                cl_scan_expr(target)
+            cl_scan_expr(nd_b[s])
+        elif k == ND_VAR_DECL:
+            cl_scan_expr(nd_b[s])
+        elif k == ND_EXPR_STMT:
+            cl_scan_expr(nd_a[s])
+        elif k == ND_RETURN:
+            cl_scan_expr(nd_a[s])
+        elif k == ND_IF:
+            cl_scan_expr(nd_a[s])
+            cl_scan_stmts(nd_b[s])
+            cl_scan_if_alts(nd_c[s], nd_d[s])
+        elif k == ND_WHILE:
+            cl_scan_expr(nd_a[s])
+            cl_scan_stmts(nd_b[s])
+        elif k == ND_DO_WHILE:
+            cl_scan_expr(nd_a[s])
+            cl_scan_stmts(nd_b[s])
+        elif k == ND_FOR:
+            cl_scan_expr(nd_a[s])
+            cl_scan_stmts(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            cl_scan_expr(nd_b[s])
+            cl_scan_stmts(nd_c[s])
+        else:
+            # opaque statement: scan all child slots conservatively.
+            cl_scan_expr(nd_a[s])
+            cl_scan_expr(nd_b[s])
+            cl_scan_expr(nd_c[s])
+            cl_scan_expr(nd_d[s])
+        s = nd_next[s]
+
+
+# elif chain + final else, mirroring cfg_lower_if_alts' shape.
+def cl_scan_if_alts(elif_head: uint32, else_head: uint32):
+    if elif_head != 0:
+        cl_scan_expr(nd_a[elif_head])
+        cl_scan_stmts(nd_b[elif_head])
+        cl_scan_if_alts(nd_next[elif_head], else_head)
+        return
+    if else_head != 0:
+        cl_scan_stmts(else_head)
+
+
+# Build the clobberable set for one function. Precondition: cfg_build_function
+# already ran (nm_* holds this function's interned names). Pure AST reads.
+def cl_build(fn: uint32):
+    cl_reset()
+    # Params themselves are by-value locals; they only escape if their address
+    # is taken in the body (caught by cl_scan_stmts). The iterable/type slots of
+    # a param node carry no escapes.
+    cl_scan_stmts(nd_c[fn])
+
+
+# =======================================================================
+# Phase-4 PREREQ validator: live ranges + alias invariants.
+# =======================================================================
+#
+# Asserts (over a built+liveness-solved+lr_built+cl_built function):
+#   LRV_EMPTY_INTERVAL : a valid name has start>=end (empty/inverted interval)
+#   LRV_OOB_INTERVAL   : an interval escapes [0, ci_count]
+#   LRV_PROMOTE_CLOBBER: a name is BOTH promotable and clobberable (the sets
+#                        must be disjoint by construction)
+#   LRV_CLOBBER_UNKNOWN: a clobberable name id is outside the interned name set
+#                        (alias set must be a subset of the function's locals)
+LRV_OK: uint32 = 0
+LRV_EMPTY_INTERVAL: uint32 = 10
+LRV_OOB_INTERVAL: uint32 = 11
+LRV_PROMOTE_CLOBBER: uint32 = 12
+LRV_CLOBBER_UNKNOWN: uint32 = 13
+
+
+# A name is register-promotable iff it has a live range (is a real local/param
+# value) AND is not in the clobberable set.
+def lr_is_promotable(n: uint32) -> uint32:
+    if n >= nm_count:
+        return 0
+    if lr_valid[n] == 0:
+        return 0
+    if cl_set[n] != 0:
+        return 0
+    return 1
+
+
+def lr_validate() -> uint32:
+    n: uint32 = 0
+    while n < nm_count:
+        if lr_valid[n] != 0:
+            if lr_start[n] >= lr_end[n]:
+                return LRV_EMPTY_INTERVAL
+            if lr_end[n] > ci_count:
+                return LRV_OOB_INTERVAL
+        # clobberable ids must be within the interned name set.
+        if cl_set[n] != 0:
+            # n < nm_count here by loop bound, so it is interned -> OK.
+            # promotable ∩ clobberable must be empty:
+            if lr_is_promotable(n) != 0:
+                return LRV_PROMOTE_CLOBBER
+        n = n + 1
+    # any clobberable id >= nm_count would be a subset violation (cl_mark
+    # interns, so this cannot happen, but assert it defensively).
+    n = nm_count
+    while n < NM_MAX:
+        if cl_set[n] != 0:
+            return LRV_CLOBBER_UNKNOWN
+        n = n + 1
+    return LRV_OK
+
+
+# =======================================================================
 # Corpus driver entry — build+validate every function in a program.
 # =======================================================================
 #
@@ -1020,6 +1377,14 @@ cfg_stat_insts: uint32 = 0            # total CFG instructions across funcs
 cfg_stat_fail: uint32 = 0             # first nonzero validator code (0 = all ok)
 cfg_stat_fail_fn: uint32 = 0          # function index of the first failure
 
+# Phase-4 PREREQ stats (live ranges + alias) accumulated across functions.
+cfg_stat_ranges: uint32 = 0           # total valid live intervals (one per live name)
+cfg_stat_range_len: uint32 = 0        # sum of interval lengths (for avg)
+cfg_stat_range_max: uint32 = 0        # max single interval length
+cfg_stat_locals: uint32 = 0           # total distinct interned names (locals/params)
+cfg_stat_promotable: uint32 = 0       # names register-promotable (not clobberable)
+cfg_stat_clobberable: uint32 = 0      # names clobberable (address-taken/stored-thru)
+
 
 def cfg_count_edges() -> uint32:
     e: uint32 = 0
@@ -1028,6 +1393,27 @@ def cfg_count_edges() -> uint32:
         e = e + bb_succ_n[b]
         b = b + 1
     return e
+
+
+# Accumulate the live-range + alias stats for the CURRENT function (after
+# lr_build/cl_build ran). Counts locals, promotable vs clobberable, and interval
+# length sum/max.
+def cfg_accum_lr_stats():
+    n: uint32 = 0
+    while n < nm_count:
+        cfg_stat_locals = cfg_stat_locals + 1
+        if cl_set[n] != 0:
+            cfg_stat_clobberable = cfg_stat_clobberable + 1
+        elif lr_valid[n] != 0:
+            # promotable = has a live range AND not clobberable
+            cfg_stat_promotable = cfg_stat_promotable + 1
+        if lr_valid[n] != 0:
+            cfg_stat_ranges = cfg_stat_ranges + 1
+            ln: uint32 = lr_end[n] - lr_start[n]
+            cfg_stat_range_len = cfg_stat_range_len + ln
+            if ln > cfg_stat_range_max:
+                cfg_stat_range_max = ln
+        n = n + 1
 
 
 # Build + validate the CFG for every ND_FUNCTION in the program (prog = ND_PROGRAM;
@@ -1041,6 +1427,12 @@ def cfg_run_program(prog: uint32):
     cfg_stat_insts = 0
     cfg_stat_fail = 0
     cfg_stat_fail_fn = 0
+    cfg_stat_ranges = 0
+    cfg_stat_range_len = 0
+    cfg_stat_range_max = 0
+    cfg_stat_locals = 0
+    cfg_stat_promotable = 0
+    cfg_stat_clobberable = 0
     if prog == 0:
         return
     fn_idx: uint32 = 0
@@ -1061,5 +1453,17 @@ def cfg_run_program(prog: uint32):
                 if rc != CFGV_OK and cfg_stat_fail == 0:
                     cfg_stat_fail = rc
                     cfg_stat_fail_fn = fn_idx
+                if rc == CFGV_OK:
+                    # Phase-4 PREREQ: value-level live ranges + alias/may-clobber.
+                    # cfg_validate already solved liveness to a fixpoint, so the
+                    # block live-in/out sets are valid for lr_build. cl_build does
+                    # a pure AST escape scan (interning into the same nm_* table).
+                    lr_build()
+                    cl_build(cur)
+                    lrc: uint32 = lr_validate()
+                    if lrc != LRV_OK and cfg_stat_fail == 0:
+                        cfg_stat_fail = lrc
+                        cfg_stat_fail_fn = fn_idx
+                    cfg_accum_lr_stats()
             fn_idx = fn_idx + 1
         cur = nd_next[cur]
