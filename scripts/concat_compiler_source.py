@@ -44,7 +44,14 @@ COMPILER_DIR = os.path.join(PROJ_ROOT, "adder", "compiler")
 # Dependency order: lexer defines tokens, parser consumes them, codegen
 # consumes the AST. codegen.ad references parser+lexer symbols, parser.ad
 # references lexer symbols — so lexer FIRST, codegen LAST.
-MODULES = ["lexer.ad", "parser.ad", "codegen.ad"]
+#
+# Phase-4: codegen.ad now references the register allocator (regalloc.ad), which
+# references the CFG/liveness/live-range analysis (cfg.ad), which references the
+# IR name helpers (ir.ad). All are PURE ANALYSIS that codegen only enters under
+# --opt (OFF by default), but their DEFINITIONS must precede codegen.ad in the
+# single concatenated host module. Order: lexer, parser, ir, cfg, regalloc,
+# codegen (each references only earlier modules).
+MODULES = ["lexer.ad", "parser.ad", "ir.ad", "cfg.ad", "regalloc.ad", "codegen.ad"]
 
 # Extra module fused in ONLY for --with-driver: the ELF image emitter the
 # driver `main` calls (elf_emit_image). It imports from compiler.codegen,

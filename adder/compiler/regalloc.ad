@@ -1,0 +1,430 @@
+# adder/compiler/regalloc.ad
+#
+# Native Adder optimizer — Phase 4: a FIRST WORKING linear-scan register
+# allocator (Poletto & Sarkar style), OPT-IN, OFF BY DEFAULT.
+#
+# WHAT THIS IS
+# ------------
+# cfg.ad already built EVERYTHING an allocator consumes (its "construction, not
+# analysis" handoff): a whole-function CFG, per-block liveness, value-level live
+# RANGES (lr_start/lr_end/lr_valid, half-open [start,end) over a stable linear
+# instruction numbering), and an alias/may-clobber set (cl_set). A name is
+# REGISTER-PROMOTABLE iff it has a live range AND is not clobberable
+# (lr_is_promotable). This module turns that into an ASSIGNMENT: a small physical
+# register per promoted value, with spills when register pressure exceeds the
+# pool.
+#
+# THE ALGORITHM (classic linear scan)
+#   1. Collect the promotable names, each with its [start,end) interval.
+#   2. Sort them by interval START (ascending).
+#   3. Walk in start order. Before assigning value V:
+#        EXPIRE: every active interval whose end <= V.start frees its register
+#                (its value is dead by the time V begins).
+#      Then if a register is free, assign it to V and make V active.
+#      Else SPILL: among {V} U active, the one with the FURTHEST end stays in
+#                  memory (keeps its existing rbp stack slot); the other keeps/
+#                  takes the register. So V steals a register only if some active
+#                  value ends later than V does.
+#   4. A value left in memory (never assigned, or chosen as a spill victim) just
+#      uses its existing stack slot — codegen already lays every local out at a
+#      %rbp offset, so "spill" is a no-op: do nothing and the default memory path
+#      is correct. Only ASSIGNED values change codegen.
+#
+# REGISTER POOL — ABI
+#   We allocate ONLY callee-saved registers: %rbx,%r12,%r13,%r14,%r15. Two wins:
+#     * call-crossing is FREE: a callee-saved register survives any `call` by the
+#       System-V ABI (the callee preserves it), so a value held in one of these
+#       stays valid across calls with NO save/restore around the call site. This
+#       is the simplest CORRECT call strategy the task allows ("just don't keep
+#       call-crossing values in caller-saved regs").
+#     * %rsp/%rbp and the arg/return/scratch regs (%rax,%rcx,%rdx,%rsi,%rdi,
+#       %r8-%r11) are NEVER touched, so the existing codegen's stack-machine
+#       lowering (which clobbers %rax/%rcx freely and uses %rdi.. for args) is
+#       undisturbed. The function prologue PUSHes exactly the pool registers it
+#       used and the epilogue POPs them (codegen owns that emission).
+#
+# WHY THE STACK SLOT STAYS AUTHORITATIVE (write-through)
+#   codegen consumes an assignment as: a READ of an assigned value reads the
+#   register; a WRITE stores to BOTH the register and the stack slot
+#   (write-through). The slot therefore is never stale, so ANY code path that
+#   still reads the slot (and a promoted value is never address-taken — the
+#   clobber set guarantees it — so the only such paths are the few non-scalar
+#   load sites codegen leaves on the memory path) observes the current value.
+#   Correctness is by construction: register and slot always agree.
+#
+# GATING — DEFAULT OUTPUT IS BYTE-IDENTICAL
+#   ra_enabled defaults 0. codegen only calls ra_build_for_function / queries
+#   ra_reg_for_name when ra_enabled != 0, which the dump driver sets ONLY under
+#   --opt (alongside opt_enable). With the flag off this module is never entered
+#   and codegen emits byte-for-byte the pre-regalloc output. The kernel/userland
+#   native compile never passes --opt, so objdiff/kobjdiff stay clean.
+
+from compiler.cfg import (
+    cfg_build_function,
+    cfg_validate,
+    lr_build,
+    cl_build,
+    lr_is_promotable,
+    lr_start,
+    lr_end,
+    lr_valid,
+    nm_off,
+    nm_len,
+    nm_count,
+    cfg_overflow,
+    CFGV_OK,
+)
+
+from compiler.lexer import (
+    strbuf,
+)
+
+from compiler.parser import (
+    nd_kind,
+    nd_b,
+    nd_next,
+    ND_FUNCTION,
+)
+
+# =======================================================================
+# Enable flag (OFF by default).
+# =======================================================================
+ra_enabled: uint32 = 0
+
+
+def ra_enable():
+    ra_enabled = 1
+
+
+def ra_is_enabled() -> uint32:
+    return ra_enabled
+
+
+# =======================================================================
+# Physical register pool — callee-saved only.
+# =======================================================================
+#
+# We identify a physical register by a small POOL INDEX 0..RA_NREGS-1 and map it
+# to an x86-64 register ENCODING (the 3-bit reg number) for codegen. Encodings:
+#   %rbx = 3,  %r12 = 12,  %r13 = 13,  %r14 = 14,  %r15 = 15.
+# codegen translates a pool reg encoding into the right REX + modrm.
+RA_NREGS: uint32 = 5
+RA_NONE: uint32 = 0xffffffff           # "no register" sentinel
+
+ra_pool_enc: Array[5, uint32]          # pool index -> x86 reg encoding
+
+
+def ra_pool_init():
+    ra_pool_enc[0] = 3                  # %rbx
+    ra_pool_enc[1] = 12                 # %r12
+    ra_pool_enc[2] = 13                 # %r13
+    ra_pool_enc[3] = 14                 # %r14
+    ra_pool_enc[4] = 15                 # %r15
+
+
+# Per-pool-index occupancy: the name id currently holding this register, or
+# RA_NONE if free. Rebuilt per function during the scan.
+ra_pool_owner: Array[5, uint32]
+
+
+# =======================================================================
+# Per-name assignment result (indexed by cfg name id, 0..nm_count).
+# =======================================================================
+#
+# ra_assigned_reg[n] = the x86 reg encoding assigned to name n, or RA_NONE if n
+# is spilled / not promotable. ra_used_mask bit p set => pool index p was used by
+# this function (so codegen knows which callee-saved regs to push/pop).
+RA_MAXNAMES: uint32 = 256              # == cfg NM_MAX
+ra_assigned_reg: Array[256, uint32]    # x86 encoding or RA_NONE
+ra_used_mask: uint32 = 0               # bitmask over pool indices 0..RA_NREGS-1
+
+ra_ok: uint32 = 0                      # 1 if a usable allocation was built
+
+# Per-function allocation statistics (read by the dump lane).
+ra_stat_promotable: uint32 = 0         # promotable names seen this function
+ra_stat_inreg: uint32 = 0              # names that got a register
+ra_stat_spilled: uint32 = 0            # promotable names left in memory (spilled)
+ra_stat_regs_used: uint32 = 0          # distinct pool regs used (popcount mask)
+
+
+# =======================================================================
+# Sort scratch — promotable names by interval start (insertion sort; counts
+# are tiny, <= nm_count <= 256).
+# =======================================================================
+ra_order: Array[256, uint32]           # name ids, sorted by lr_start ascending
+ra_order_n: uint32 = 0
+
+
+def ra_reset():
+    n: uint32 = 0
+    while n < RA_MAXNAMES:
+        ra_assigned_reg[n] = RA_NONE
+        n = n + 1
+    p: uint32 = 0
+    while p < RA_NREGS:
+        ra_pool_owner[p] = RA_NONE
+        p = p + 1
+    ra_used_mask = 0
+    ra_ok = 0
+    ra_order_n = 0
+    ra_stat_promotable = 0
+    ra_stat_inreg = 0
+    ra_stat_spilled = 0
+    ra_stat_regs_used = 0
+
+
+# Collect promotable name ids into ra_order, sorted by lr_start ascending
+# (insertion sort, stable enough — ties broken by name id ordering).
+def ra_collect_sorted():
+    ra_order_n = 0
+    n: uint32 = 0
+    while n < nm_count:
+        if lr_is_promotable(n) != 0:
+            # insert n into ra_order keeping lr_start ascending
+            key: uint32 = lr_start[n]
+            i: uint32 = ra_order_n
+            while i > 0:
+                prev: uint32 = ra_order[i - 1]
+                if lr_start[prev] <= key:
+                    break
+                ra_order[i] = prev
+                i = i - 1
+            ra_order[i] = n
+            ra_order_n = ra_order_n + 1
+        n = n + 1
+    ra_stat_promotable = ra_order_n
+
+
+# Find a free pool index, or RA_NONE if none free.
+def ra_find_free() -> uint32:
+    p: uint32 = 0
+    while p < RA_NREGS:
+        if ra_pool_owner[p] == RA_NONE:
+            return p
+        p = p + 1
+    return RA_NONE
+
+
+# Among the active intervals, return the pool index whose owner has the FURTHEST
+# (largest lr_end). Returns RA_NONE if no register is active.
+def ra_furthest_active() -> uint32:
+    best_p: uint32 = RA_NONE
+    best_end: uint32 = 0
+    p: uint32 = 0
+    while p < RA_NREGS:
+        owner: uint32 = ra_pool_owner[p]
+        if owner != RA_NONE:
+            if best_p == RA_NONE or lr_end[owner] > best_end:
+                best_p = p
+                best_end = lr_end[owner]
+        p = p + 1
+    return best_p
+
+
+# Expire every active interval that ends at or before `point` (its value is dead
+# by the time the current value starts): free its register.
+def ra_expire(point: uint32):
+    p: uint32 = 0
+    while p < RA_NREGS:
+        owner: uint32 = ra_pool_owner[p]
+        if owner != RA_NONE:
+            if lr_end[owner] <= point:
+                ra_pool_owner[p] = RA_NONE
+        p = p + 1
+
+
+# =======================================================================
+# The linear scan.
+# =======================================================================
+#
+# Precondition: ra_collect_sorted() filled ra_order (promotable names by start).
+# Assigns ra_assigned_reg[n] = pool encoding for every name that gets a register;
+# spilled names keep RA_NONE (their stack slot is used, a no-op for codegen).
+def ra_linear_scan():
+    i: uint32 = 0
+    while i < ra_order_n:
+        v: uint32 = ra_order[i]
+        vstart: uint32 = lr_start[v]
+        vend: uint32 = lr_end[v]
+
+        # EXPIRE intervals that ended before v begins.
+        ra_expire(vstart)
+
+        free_p: uint32 = ra_find_free()
+        if free_p != RA_NONE:
+            ra_pool_owner[free_p] = v
+            ra_assigned_reg[v] = ra_pool_enc[free_p]
+            ra_used_mask = ra_used_mask | (cast[uint32](1) << free_p)
+            ra_stat_inreg = ra_stat_inreg + 1
+        else:
+            # SPILL by furthest end: evict the active value that ends latest IF
+            # it ends after v (so v, which dies sooner, gets the register and the
+            # long-lived value falls back to memory). Otherwise spill v itself.
+            spill_p: uint32 = ra_furthest_active()
+            if spill_p != RA_NONE and lr_end[ra_pool_owner[spill_p]] > vend:
+                evicted: uint32 = ra_pool_owner[spill_p]
+                ra_assigned_reg[evicted] = RA_NONE
+                ra_stat_inreg = ra_stat_inreg - 1
+                ra_stat_spilled = ra_stat_spilled + 1
+                ra_pool_owner[spill_p] = v
+                ra_assigned_reg[v] = ra_pool_enc[spill_p]
+                # ra_used_mask already has this pool bit set.
+                ra_stat_inreg = ra_stat_inreg + 1
+            else:
+                ra_assigned_reg[v] = RA_NONE
+                ra_stat_spilled = ra_stat_spilled + 1
+        i = i + 1
+
+    # popcount the used mask for the regs-used stat.
+    ra_stat_regs_used = 0
+    p: uint32 = 0
+    while p < RA_NREGS:
+        if ((ra_used_mask >> p) & 1) != 0:
+            ra_stat_regs_used = ra_stat_regs_used + 1
+        p = p + 1
+
+
+# =======================================================================
+# Driver — build an allocation for ONE function (called from codegen under flag).
+# =======================================================================
+#
+# Runs the cfg.ad pipeline (build + validate + live ranges + alias) for `fn`,
+# then linear-scan. Returns 1 if a usable allocation was produced, 0 if the
+# function was too large / failed validation (in which case codegen falls back to
+# the all-memory default — always correct). NOTE this REBUILDS the cfg arenas, so
+# codegen must call ra_reg_for_name only between ra_build_for_function and the
+# next one (per-function lifetime); codegen does exactly that.
+def ra_build_for_function(fn: uint32) -> uint32:
+    ra_reset()
+    ra_pool_init()
+    ra_ok = 0
+
+    ok: uint32 = cfg_build_function(fn)
+    if ok == 0:
+        return 0                         # arena overflow: all-memory fallback
+    rc: uint32 = cfg_validate()
+    if rc != CFGV_OK:
+        return 0                         # validation failure: fallback
+    lr_build()
+    cl_build(fn)
+    if cfg_overflow != 0:
+        return 0
+
+    ra_collect_sorted()
+    ra_linear_scan()
+    ra_ok = 1
+    return 1
+
+
+# =======================================================================
+# Codegen-facing query: register for a name (by strbuf slice).
+# =======================================================================
+#
+# Returns the x86 register encoding assigned to the local named [off,len), or
+# RA_NONE if it is spilled / not promotable / no allocation built. codegen keys
+# its read/write-through decision off this. The name lookup matches against the
+# cfg name table (nm_off/nm_len) which holds THIS function's interned locals.
+def ra_reg_for_name(off: uint32, len_: uint32) -> uint32:
+    if ra_enabled == 0 or ra_ok == 0:
+        return RA_NONE
+    n: uint32 = 0
+    while n < nm_count:
+        if nm_len[n] == len_:
+            if ra_name_bytes_eq(nm_off[n], off, len_) != 0:
+                return ra_assigned_reg[n]
+        n = n + 1
+    return RA_NONE
+
+
+# strbuf byte compare of two equal-length name slices.
+def ra_name_bytes_eq(aoff: uint32, boff: uint32, len_: uint32) -> uint32:
+    i: uint32 = 0
+    while i < len_:
+        if strbuf[aoff + i] != strbuf[boff + i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Prologue/epilogue helpers for codegen: which pool regs were used, and the x86
+# encoding of a pool index.
+def ra_pool_encoding(p: uint32) -> uint32:
+    return ra_pool_enc[p]
+
+
+def ra_pool_used(p: uint32) -> uint32:
+    return (ra_used_mask >> p) & 1
+
+
+def ra_nregs() -> uint32:
+    return RA_NREGS
+
+
+# =======================================================================
+# Corpus driver — build an allocation for every function and accumulate stats.
+# =======================================================================
+#
+# Mirrors cfg_run_program: walks the ND_PROGRAM decl chain (on nd_b), builds a
+# linear-scan allocation per ND_FUNCTION, and sums the per-function stats. This
+# is the --dump-regalloc lane — PURE ANALYSIS, never emits code. Used by the
+# fuzzer to report allocation behaviour and assert the allocator is exercising
+# registers + spills over the corpus.
+ra_prog_funcs: uint32 = 0              # functions an allocation was built for
+ra_prog_skipped: uint32 = 0           # functions skipped (overflow / validate)
+ra_prog_promotable: uint32 = 0        # total promotable values
+ra_prog_inreg: uint32 = 0             # total values given a register
+ra_prog_spilled: uint32 = 0           # total promotable values spilled to memory
+ra_prog_regs_used: uint32 = 0         # sum of distinct regs used per function
+ra_prog_max_regs: uint32 = 0          # max distinct regs used by any one function
+ra_prog_callcross: uint32 = 0         # values kept in a (callee-saved) register
+                                      # whose interval spans >1 block (a proxy for
+                                      # call/branch-crossing residency)
+
+
+def ra_run_program(prog: uint32):
+    ra_prog_funcs = 0
+    ra_prog_skipped = 0
+    ra_prog_promotable = 0
+    ra_prog_inreg = 0
+    ra_prog_spilled = 0
+    ra_prog_regs_used = 0
+    ra_prog_max_regs = 0
+    ra_prog_callcross = 0
+    if prog == 0:
+        return
+    decls: uint32 = nd_b[prog]
+    cur: uint32 = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            if ra_build_for_function(cur) != 0:
+                ra_prog_funcs = ra_prog_funcs + 1
+                ra_prog_promotable = ra_prog_promotable + ra_stat_promotable
+                ra_prog_inreg = ra_prog_inreg + ra_stat_inreg
+                ra_prog_spilled = ra_prog_spilled + ra_stat_spilled
+                ra_prog_regs_used = ra_prog_regs_used + ra_stat_regs_used
+                if ra_stat_regs_used > ra_prog_max_regs:
+                    ra_prog_max_regs = ra_stat_regs_used
+                # Count register-resident values whose live interval is "long"
+                # (spans more than a handful of program points): a conservative
+                # proxy for a value held across a branch/call, which the
+                # callee-saved pool keeps safe for free.
+                ra_prog_callcross = ra_prog_callcross + ra_count_long_inreg()
+            else:
+                ra_prog_skipped = ra_prog_skipped + 1
+        cur = nd_next[cur]
+
+
+# Count register-resident names whose interval length > RA_LONG_SPAN. A long
+# interval crosses intervening instructions (often a branch or a call), which is
+# exactly what the callee-saved pool is chosen to make safe. This is a STAT
+# proxy, not a correctness assertion.
+RA_LONG_SPAN: uint32 = 4
+def ra_count_long_inreg() -> uint32:
+    c: uint32 = 0
+    n: uint32 = 0
+    while n < nm_count:
+        if ra_assigned_reg[n] != RA_NONE:
+            if (lr_end[n] - lr_start[n]) > RA_LONG_SPAN:
+                c = c + 1
+        n = n + 1
+    return c

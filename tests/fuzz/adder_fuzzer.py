@@ -1682,6 +1682,161 @@ def _run_licm_corpus():
 
 
 # --------------------------------------------------------------------------
+# Phase-4 REGISTER-PRESSURE corpus. Hand-written programs with MANY
+# simultaneously-live scalar locals — more than the 5-register callee-saved pool
+# — so the linear-scan allocator is FORCED to spill, plus call-crossing values
+# (locals live across a function call held in callee-saved regs). Each program
+# computes a deterministic checksum into g_accum that the Python oracle predicts
+# exactly, so correctness UNDER SPILLING is asserted against the seed oracle, and
+# the --dump-regalloc lane separately confirms the allocator actually put values
+# in registers AND spilled (pressure was real). All arithmetic is over the
+# signedness-invariant 64-bit op set so the oracle is a plain Python uint64.
+# --------------------------------------------------------------------------
+def _regpressure_corpus():
+    """Return a list of (name, body, expected_stdout, expected_exit)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, decls_and_main, val):
+        body = PRELUDE + "\n" + decls_and_main
+        progs.append((name, body, str(val & M), val & 0xFF))
+
+    # 1) Ten live locals summed simultaneously: all ten are live across the final
+    #    sum, far exceeding the 5-register pool => guaranteed spills. Pure
+    #    arithmetic, no calls.
+    vals = [3, 5, 7, 11, 13, 17, 19, 23, 29, 31]
+    decls = "".join(
+        f"    v{i}: uint64 = cast[uint64]({v})\n" for i, v in enumerate(vals))
+    summ = " + ".join(f"v{i}" for i in range(len(vals)))
+    total = sum(vals) & M
+    prog("ten_live_sum",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         + decls
+         + f"    g_accum = {summ}\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         total)
+
+    # 2) Eight live locals, each multiplied by the next, threaded so ALL stay
+    #    live to the end (a chain that references every earlier local again).
+    a = [2, 3, 4, 5, 6, 7, 8, 9]
+    decls = "".join(
+        f"    w{i}: uint64 = cast[uint64]({v})\n" for i, v in enumerate(a))
+    # acc = ((...((w0*w1)+w2)*w3+...)) then + sum of all wi (forces each wi live
+    # at the final reference).
+    expr = "w0"
+    acc = a[0]
+    for i in range(1, len(a)):
+        if i % 2 == 0:
+            expr = f"(({expr}) + w{i})"
+            acc = (acc + a[i]) & M
+        else:
+            expr = f"(({expr}) * w{i})"
+            acc = (acc * a[i]) & M
+    tail = " + ".join(f"w{i}" for i in range(len(a)))
+    acc = (acc + sum(a)) & M
+    prog("eight_chain_plus_sum",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         + decls
+         + f"    g_accum = ({expr}) + ({tail})\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         acc)
+
+    # 3) CALL-CROSSING pressure: seven locals defined, then a CALL (print_u64),
+    #    then all seven summed AFTER the call — every local is live across the
+    #    call, so the allocator must keep them in CALLEE-SAVED registers (or
+    #    spill). The call also prints an intermediate value (observable), and the
+    #    final checksum proves none of the seven was corrupted by the call.
+    cvals = [101, 202, 303, 404, 505, 606, 707]
+    decls = "".join(
+        f"    c{i}: uint64 = cast[uint64]({v})\n" for i, v in enumerate(cvals))
+    presum = cvals[0] & M
+    postsum = sum(cvals) & M
+    summ = " + ".join(f"c{i}" for i in range(len(cvals)))
+    # prints c0 first (presum), then the full sum.
+    prog("seven_callcross",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         + decls
+         + "    print_u64(c0)\n"
+         + f"    g_accum = {summ}\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         postsum)
+    # fix expected stdout: two lines (presum then postsum).
+    nm, bd, _, _ = progs[-1]
+    progs[-1] = (nm, bd, f"{presum}\n{postsum}", postsum & 0xFF)
+
+    # 4) Spills INSIDE a loop: 6 loop-carried accumulators updated each iteration
+    #    (all live across the back-edge), exceeding the pool by one => at least
+    #    one spilled accumulator that must round-trip correctly every iteration.
+    decls = "".join(f"    s{i}: uint64 = cast[uint64]({i + 1})\n" for i in range(6))
+    s = [i + 1 for i in range(6)]
+    n_iter = 5
+    for _ in range(n_iter):
+        s = [(s[i] + (i + 1)) & M for i in range(6)]
+    loopsum = sum(s) & M
+    upd = "".join(
+        f"        s{i} = s{i} + cast[uint64]({i + 1})\n" for i in range(6))
+    fin = " + ".join(f"s{i}" for i in range(6))
+    prog("six_loop_accum_spill",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         + decls
+         + "    lk: int64 = 0\n"
+         + f"    while lk < cast[int64]({n_iter}):\n"
+         + upd
+         + "        lk = lk + 1\n"
+         + f"    g_accum = {fin}\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         loopsum)
+
+    return progs
+
+
+def _run_regpressure_corpus():
+    """Run the register-pressure corpus through codegen.ad with --opt and assert
+    BOTH (a) the spilled/register-allocated output is correct vs the oracle AND
+    (b) the --dump-regalloc lane confirms the allocator put values in registers
+    and that real pressure (a spill, or full pool use) occurred across the corpus.
+    Returns (all_ok, total_inreg, total_spilled, max_regs)."""
+    host = _ad_host()
+    all_ok = True
+    total_inreg = 0
+    total_spilled = 0
+    max_regs = 0
+    for (name, body, exp_out, exp_exit) in _regpressure_corpus():
+        r = host.run_through_codegen_ad(f"rp_{name}", body, _AD_WORK, opt=True)
+        if r.kind != "ok":
+            all_ok = False
+            print(f"  [REGPRESSURE '{name}'] codegen.ad {r.kind}: {r.detail[:140]}")
+            continue
+        if r.stdout != exp_out or r.exit != exp_exit:
+            all_ok = False
+            print(f"  [REGPRESSURE '{name}'] MISCOMPILE opt=("
+                  f"{r.stdout!r},{r.exit}) oracle=({exp_out!r},{exp_exit})")
+            continue
+        # allocation stats from the --dump-regalloc lane (pure analysis).
+        ra = host.run_regalloc_over_body(f"rp_{name}", body, _AD_WORK)
+        if ra.status != "raok":
+            all_ok = False
+            print(f"  [REGPRESSURE '{name}'] regalloc lane {ra.status}: {ra.detail[:120]}")
+            continue
+        total_inreg += ra.inreg
+        total_spilled += ra.spilled
+        max_regs = max(max_regs, ra.max_regs)
+    # The corpus must (a) be all-correct, (b) demonstrably register-allocate, and
+    # (c) demonstrably hit pressure (a spill OR the full 5-reg pool somewhere).
+    if total_inreg == 0:
+        all_ok = False
+        print("  [REGPRESSURE FAIL] allocator never placed a value in a register")
+    if total_spilled == 0 and max_regs < 5:
+        all_ok = False
+        print("  [REGPRESSURE FAIL] no register pressure exercised (no spill, pool not full)")
+    return (all_ok, total_inreg, total_spilled, max_regs)
+
+
+# --------------------------------------------------------------------------
 # Differential batch driver for the self-hosted codegen.ad backend.
 # --------------------------------------------------------------------------
 def _run_ad_codegen_batch(base, args):
@@ -1783,6 +1938,20 @@ def _run_ad_codegen_batch(base, args):
         if not licm_ok:
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] LICM corpus miscompiled or never fired")
+        # Phase-4 register-pressure corpus: many simultaneously-live scalar
+        # locals (> the 5-reg callee-saved pool) + call-crossing + loop-carried
+        # spills. Asserts the allocated/spilled output is CORRECT vs the oracle
+        # AND that the linear-scan allocator demonstrably used registers and hit
+        # real pressure (a spill or full pool).
+        rp_ok, rp_inreg, rp_spill, rp_maxregs = _run_regpressure_corpus()
+        print(f"--- ADDER_OPT=1 register-pressure corpus (linear scan) ---")
+        print(f"  values kept in registers:   {rp_inreg}")
+        print(f"  values spilled to memory:   {rp_spill}")
+        print(f"  max regs used in a function:{rp_maxregs}  (pool size 5)")
+        if not rp_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] register-pressure corpus miscompiled or "
+                  "allocator inert")
     cfg_lane_fail = False
     if ADDER_CFG:
         print(f"--- ADDER_CFG=1 CFG/liveness GROUNDWORK lane (analysis-only) ---")

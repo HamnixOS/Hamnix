@@ -1315,6 +1315,126 @@ named — are **done and corpus-validated**. The next phase (the allocator + an 
 model + an IR-consuming codegen entry) is engineering on top of complete analysis,
 no longer gated on missing information.
 
+## Native optimizer — Phase 4: a FIRST WORKING linear-scan register allocator (OPT-IN, OFF BY DEFAULT)
+
+`adder/compiler/regalloc.ad` is a classic **Poletto & Sarkar linear-scan**
+allocator built directly on the Phase-4 analysis (`cfg.ad`'s live ranges +
+clobber set). It is opt-in behind `ADDER_OPT`/`--opt` and **OFF by default**, so
+default codegen stays byte-identical to the seed.
+
+### The allocator (`regalloc.ad`)
+
+- **Pool — callee-saved only:** `%rbx,%r12,%r13,%r14,%r15` (5 registers,
+  identified by pool index → x86 encoding). Choosing *only* callee-saved
+  registers makes **call-crossing free**: a value held in one survives any `call`
+  by the System-V ABI, so no save/restore is needed around call sites. `%rsp`,
+  `%rbp`, and the arg/return/scratch registers (`%rax,%rcx,%rdx,%rsi,%rdi,
+  %r8-%r11`) are **never** touched, so the existing stack-machine lowering (which
+  clobbers `%rax`/`%rcx` freely and stages args in `%rdi…`) is undisturbed.
+- **Scan:** collect register-promotable names (`lr_is_promotable`), sort by
+  interval `start`, walk in start order. Before each value: **expire** active
+  intervals whose `end ≤ start` (free their register). Assign a free register if
+  one exists; otherwise **spill by furthest end** — evict the active value whose
+  `end` is latest *iff* it ends after the current value (give the current value
+  the register, the long-lived value falls back to its stack slot); else spill
+  the current value itself.
+- **Spill = no-op for codegen:** every local already has a `%rbp` stack slot, so a
+  spilled value simply uses the default memory path (`ra_assigned_reg` stays
+  `RA_NONE`). Only *assigned* values change codegen.
+
+### Soundness fix for `cfg.ad` use-truncation
+
+A CFG instruction records at most `CI_MAX_USE` (6) uses; a use **dropped** past
+the cap is invisible to liveness, so the name's live range would be
+*under*-approximated — fatal for an allocator (it would reuse the register while
+the value is still live). `ci_add_use` now flags every such name in `nm_trunc`,
+and `lr_is_promotable` excludes it. The allocator therefore never trusts an
+unsound range; the name stays in memory. (Block liveness and the validator are
+unaffected — they were always conservative over the uses they *do* see.) This was
+caught by the register-pressure corpus (a 10-operand sum) and fixed at the
+analysis layer, not worked around.
+
+### How codegen consumes the allocation (the annotation form)
+
+This first slice keeps the AST-walking `codegen.ad` as the codegen engine and
+**annotates** it with register residency — it does **not** yet build an
+IR-consuming backend. Per function, under the flag, `gen_function` calls
+`ra_build_for_function(fn)` (which runs the `cfg.ad` pipeline + linear scan); then:
+
+- **Read** (`gen_ident`, plain full-width 8-byte scalar): if the local owns a
+  register, emit `mov %rNN,%rax` instead of `mov off(%rbp),%rax`.
+- **Write** (`store_to_named`, plain scalar): **write-through** — `mov %rax,%rNN`
+  *and* the slot store. The slot stays authoritative, so any residual memory path
+  (and a promoted value is never address-taken — the clobber set guarantees it)
+  always sees the current value. **Correctness is by construction: register and
+  slot always agree.**
+- **Prologue:** push the used callee-saved registers (before `push %rbp`, so
+  `leave` does not strand them); pad the frame by 8 when an odd number is pushed
+  to keep `%rsp` 16-byte aligned at inner calls. After `spill_params`, load each
+  register-resident **parameter** from its slot into its register (only params —
+  a non-param local's slot is garbage at entry and its register is established by
+  its first write-through). **Bug found + fixed during bring-up:** an earlier
+  version init-loaded *every* register-resident local, which read garbage and
+  clobbered registers shared (across disjoint intervals) with a param — caught by
+  the `print_u64` pattern and fixed to params-only.
+- **Epilogue** (`emit_function_epilogue`, used at *every* return point): `leave`,
+  then pop the callee-saved registers in reverse, then `ret`. With the flag off
+  this is exactly `leave; ret` — byte-identical default.
+- **Scope:** plain functions only for this slice (methods stay on the all-memory
+  default); only plain full-width 8-byte scalar locals are register-consumed
+  (sub-8-byte typed locals keep the always-correct sized memory path).
+
+### Gating + concat ordering
+
+`ra_enabled` defaults 0; only `--opt` (driver) arms it. `codegen.ad` imports
+`regalloc.ad` (→ `cfg.ad` → `ir.ad`), but with the flag off every hook is inert
+(`ra_reg_for_name` → `RA_NONE`) and no allocator code runs, so emitted bytes are
+unchanged. The kernel/userland native compile never passes `--opt`. The
+single-module **host compiler** concatenation (`concat_compiler_source.py`) now
+fuses `ir.ad, cfg.ad, regalloc.ad` ahead of `codegen.ad` (definitions before
+uses); no top-level symbol collisions.
+
+### Driver lanes + verification
+
+- **`--dump-regalloc`** (driver) / `run_regalloc` (host): runs linear scan over
+  every function and reports `RA_FUNCS/RA_PROMOTABLE/RA_INREG/RA_SPILLED/
+  RA_REGS_USED/RA_MAX_REGS/RA_CALLCROSS` — **pure analysis, no codegen emitted**.
+- **DEFAULT byte-inertness (flags unset):** `fuzz_adder_diff.sh` **500/500, 0
+  miscompiles**; `test_native_vs_seed_objdiff.sh` **0 diverged**;
+  `test_native_vs_seed_kobjdiff.sh` **0 divergences**.
+- **`ADDER_OPT=1` correctness lane:** the 500-program fuzzer batch is **500/500
+  behaviorally correct** with the allocator active (output == seed oracle); the
+  CSE and LICM corpora stay correct; a new **register-pressure corpus**
+  (10-live-value sum, 8-value chain, 7-value call-crossing, 6 loop-carried
+  accumulators) is correct **under spilling**, with the allocator demonstrably
+  using up to the full 5-register pool and spilling. Example single-function
+  stats (`--dump-regalloc`): 16/17 promotable values in registers, 1 spilled, 5
+  regs used, 5 call-crossing.
+
+### What remains for a full IR-consuming backend
+
+This is the **annotation form** (read-from-register + write-through over the
+existing AST walker), not yet a register-machine IR backend. To realise the full
+speedup a register allocator promises, the remaining work is:
+
+1. **An IR/instruction-selection backend** that consumes `cfg.ad`'s instruction
+   stream (or a lowered SSA) and emits register-machine code directly, so an
+   operand can stay in a register *without* the write-through-to-memory tax (the
+   slot store is currently still emitted on every write for coherence).
+2. **Widen residency** beyond plain 8-byte scalars (sub-8-byte typed locals,
+   pointers) and to methods, once the IR backend tracks types per value.
+3. **Caller-saved registers** in the pool with save/restore (or split-around-call
+   live-range splitting) for values that do *not* cross calls, expanding the
+   usable register count beyond the 5 callee-saved.
+4. **Move-coalescing + interval splitting** to cut spills under high pressure.
+
+The allocator algorithm, ABI model, spill strategy, and call handling above are
+the durable pieces; (1) is the inflection point where codegen stops being an AST
+walker. **Estimated proxy speedup:** the annotation form removes a memory *load*
+on every read of a promoted scalar, replacing a 4–7-byte `mov off(%rbp),%rax`
+with a 3-byte `mov %rNN,%rax`; the write-through tax means stores are unchanged,
+so the win is read-heavy code. A full IR backend removes the write tax too.
+
 ## Related docs
 
 - [../x86-backend.md](../x86-backend.md) — why hand-written, codegen contract.

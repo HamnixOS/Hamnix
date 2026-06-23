@@ -276,6 +276,80 @@ def run_cfg_over_body(seed, body, work_dir: Path, keep=False) -> CfgResult:
 
 
 # --------------------------------------------------------------------------
+# Phase-4 register-allocation lane: run the dump driver in --dump-regalloc mode
+# and parse its allocation report (linear scan over every function, pure
+# analysis, no codegen emitted). Reports register/spill stats.
+# --------------------------------------------------------------------------
+class RegallocResult:
+    def __init__(self, status, **kw):
+        self.status = status            # "raok" | "parsefail" | "drivererror"
+        self.funcs = kw.get("funcs", 0)
+        self.skipped = kw.get("skipped", 0)
+        self.promotable = kw.get("promotable", 0)
+        self.inreg = kw.get("inreg", 0)
+        self.spilled = kw.get("spilled", 0)
+        self.regs_used = kw.get("regs_used", 0)
+        self.max_regs = kw.get("max_regs", 0)
+        self.callcross = kw.get("callcross", 0)
+        self.detail = kw.get("detail", "")
+
+
+def run_regalloc(src_path: Path, timeout=30) -> RegallocResult:
+    """Run the dump driver with --dump-regalloc over `src_path` and parse the
+    allocation report."""
+    build_driver()
+    argv = [str(DRIVER_ELF), "--dump-regalloc", str(src_path)]
+    cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    out = cp.stdout
+    if "AC_DUMP_BEGIN" not in out:
+        return RegallocResult("drivererror",
+                              detail=f"rc={cp.returncode} no manifest: "
+                                     f"{(cp.stderr or out)[-400:]}")
+    meta = {}
+    status = None
+    detail = ""
+    for ln in out.splitlines():
+        if ln.startswith("STATUS "):
+            status = ln.split()[1]
+            detail = ln
+            continue
+        if " " in ln:
+            k, _, v = ln.partition(" ")
+            if v.strip().lstrip("-").isdigit():
+                meta[k] = int(v.strip())
+    if status in ("parsefail", "readfail"):
+        return RegallocResult(status, detail=detail)
+    if status != "raok":
+        return RegallocResult("drivererror", detail=detail or out[-400:])
+    return RegallocResult("raok",
+                          funcs=meta.get("RA_FUNCS", 0),
+                          skipped=meta.get("RA_SKIPPED", 0),
+                          promotable=meta.get("RA_PROMOTABLE", 0),
+                          inreg=meta.get("RA_INREG", 0),
+                          spilled=meta.get("RA_SPILLED", 0),
+                          regs_used=meta.get("RA_REGS_USED", 0),
+                          max_regs=meta.get("RA_MAX_REGS", 0),
+                          callcross=meta.get("RA_CALLCROSS", 0),
+                          detail=detail)
+
+
+def run_regalloc_over_body(seed, body, work_dir: Path, keep=False) -> RegallocResult:
+    """Write `body` (rewritten to codegen.ad's subset) and run the regalloc lane."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cg_body = codegen_compatible_source(body)
+    src = work_dir / f"ra_{seed}.ad"
+    src.write_text(cg_body)
+    try:
+        r = run_regalloc(src)
+    except subprocess.TimeoutExpired:
+        return RegallocResult("drivererror", detail="regalloc driver timeout")
+    finally:
+        if not keep:
+            src.unlink(missing_ok=True)
+    return r
+
+
+# --------------------------------------------------------------------------
 # Wrap raw codegen.ad bytes into a real x86_64-linux ELF (ELF64, EM_X86_64).
 # --------------------------------------------------------------------------
 def _start_stub(code_vbase, entry_off, stub_vaddr):

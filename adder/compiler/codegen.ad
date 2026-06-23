@@ -142,6 +142,20 @@ from compiler.lexer import (
     strbuf,
 )
 
+# Phase-4 register allocator (linear scan). OFF by default: ra_reg_for_name
+# returns RA_NONE unless ra_enable() was called (only the dump driver's --opt
+# path does that), so with the flag off every hook below is inert and codegen
+# output is byte-identical to the pre-regalloc path.
+from compiler.regalloc import (
+    ra_is_enabled,
+    ra_build_for_function,
+    ra_reg_for_name,
+    ra_pool_used,
+    ra_pool_encoding,
+    ra_nregs,
+    RA_NONE,
+)
+
 # -----------------------------------------------------------------------
 # Output buffer: flat machine-code bytes.
 # -----------------------------------------------------------------------
@@ -2021,6 +2035,176 @@ def emit_call_r11():
     emit_b(0xD3)
 
 
+# -----------------------------------------------------------------------
+# Phase-4 register-allocation helpers (emitted ONLY under --opt; see regalloc.ad
+# and gen_function's ra hook). All keyed by an x86 register ENCODING (rbx=3,
+# r12=12, r13=13, r14=14, r15=15) — the only registers the callee-saved pool
+# hands out. These touch NO scratch/arg register, so the default stack-machine
+# lowering is undisturbed; they appear in the stream only for register-resident
+# promoted locals when regalloc is enabled.
+# -----------------------------------------------------------------------
+
+# push %<enc>  : rbx -> 53 ; r12..r15 -> 41 5C..5F (REX.B).
+def emit_push_callee(enc: uint32):
+    if enc == 3:
+        emit_b(0x53)
+    else:
+        emit_b(0x41)
+        emit_b(0x50 + (enc - 8))
+
+
+# pop %<enc>   : rbx -> 5B ; r12..r15 -> 41 5C..5F (REX.B).
+def emit_pop_callee(enc: uint32):
+    if enc == 3:
+        emit_b(0x5B)
+    else:
+        emit_b(0x41)
+        emit_b(0x58 + (enc - 8))
+
+
+# movq %<enc>, %rax   read a register-resident local into %rax.
+#   rbx  -> 48 8B C3        (mov %rbx,%rax)
+#   r12..r15 -> 49 8B C4..C7 (REX.B selects r12-r15 as r/m)
+def emit_mov_callee_rax(enc: uint32):
+    if enc == 3:
+        emit_b(0x48)
+        emit_b(0x8B)
+        emit_b(0xC3)
+    else:
+        emit_b(0x49)
+        emit_b(0x8B)
+        emit_b(0xC0 + (enc - 8))
+
+
+# movq %rax, %<enc>   write %rax into a register-resident local (write-through
+# companion to the stack-slot store).
+#   rbx  -> 48 89 C3
+#   r12..r15 -> 49 89 C4..C7
+def emit_mov_rax_callee(enc: uint32):
+    if enc == 3:
+        emit_b(0x48)
+        emit_b(0x89)
+        emit_b(0xC3)
+    else:
+        emit_b(0x49)
+        emit_b(0x89)
+        emit_b(0xC0 + (enc - 8))
+
+
+# movq off(%rbp), %<enc>   initialize a register-resident local from its stack
+# slot (used once after spill_params so a param/initialized value is loaded into
+# its register before the body reads it).
+#   rbx  -> 48 8B {5D disp8 | 9D disp32}
+#   r12..r15 -> 4C 8B {modrm}    (REX.R extends dest reg field to r8..r15)
+def emit_load_local_callee(enc: uint32, off: int32):
+    if enc == 3:
+        emit_b(0x48)
+        emit_b(0x8B)
+        emit_rbp_mem(0x5D, off)          # reg field = rbx (011)
+    else:
+        emit_b(0x4C)                     # REX.WR
+        emit_b(0x8B)
+        # modrm reg field low 3 bits = (enc-8); base byte 0x45 has reg=000, so
+        # add (enc-8)<<3 to set the dest register field.
+        emit_rbp_mem(0x45 + ((enc - 8) << 3), off)
+
+
+# -----------------------------------------------------------------------
+# Per-function regalloc state + prologue/epilogue (callee-saved save/restore).
+# cg_ra_active is set by gen_function/gen_method when an allocation was built AND
+# the flag is on; 0 otherwise (the default path emits the original prologue/
+# epilogue verbatim, so default output is byte-identical).
+# -----------------------------------------------------------------------
+cg_ra_active: uint32 = 0
+cg_ra_pad: uint32 = 0                    # 1 => an odd # of callees pushed, frame
+                                         # padded by 8 to keep 16-byte alignment
+
+
+# Count the callee-saved pool regs the current allocation used.
+def ra_used_count() -> uint32:
+    c: uint32 = 0
+    p: uint32 = 0
+    while p < ra_nregs():
+        if ra_pool_used(p) != 0:
+            c = c + 1
+        p = p + 1
+    return c
+
+
+# Prologue saves: push every used callee-saved reg (pool order 0..N-1) BEFORE the
+# `push %rbp`, so `leave` does not strand them. Returns nothing; sets cg_ra_pad.
+def ra_emit_prologue_saves():
+    n: uint32 = ra_used_count()
+    cg_ra_pad = n & 1
+    p: uint32 = 0
+    while p < ra_nregs():
+        if ra_pool_used(p) != 0:
+            emit_push_callee(ra_pool_encoding(p))
+        p = p + 1
+
+
+# After spill_params: load each register-resident PARAMETER's incoming value
+# from its (just-spilled) slot into its assigned register, so the body's first
+# read of the param sees the argument. ONLY params are loaded here — a non-param
+# local's slot is GARBAGE at entry, and its assigned register is established by
+# its first write-through store (store_to_named). Loading a non-param local here
+# would (a) read garbage and (b) clobber a register legitimately shared with a
+# param or earlier local whose interval is disjoint from it. `pchain` is the
+# ND_FUNCTION/ND_METHOD parameter chain (nd_a); we walk it and load each named
+# param that owns a plain full-width scalar register.
+def ra_emit_init_regs(pchain: uint32):
+    pp: uint32 = pchain
+    while pp != 0:
+        # skip the implicit unnamed `self` param (name len 0); it is a Ptr slot,
+        # never register-promoted.
+        if nd_name_len[pp] != 0:
+            enc: uint32 = ra_reg_for_name(nd_name_off[pp], nd_name_len[pp])
+            if enc != RA_NONE:
+                # locate this param's slot + ensure it is a plain 8-byte scalar
+                # (matches the gen_ident/store_to_named register hook guard).
+                off2: int32 = 0
+                if lookup_local(nd_name_off[pp], nd_name_len[pp], &off2) != 0:
+                    if param_is_plain_scalar(nd_name_off[pp], nd_name_len[pp]) != 0:
+                        emit_load_local_callee(enc, off2)
+        pp = nd_next[pp]
+
+
+# True iff the named local is a plain full-width 8-byte scalar slot (scalar_size
+# 0, not an array, not a pointer) — the only locals codegen reads via a register.
+def param_is_plain_scalar(name_off: uint32, name_len: uint32) -> uint32:
+    i: uint32 = 0
+    while i < loc_count:
+        if name_match(loc_name_off[i], loc_name_len[i], name_off, name_len) != 0:
+            if loc_scalar_size[i] == 0 and loc_elem_size[i] == 0 and loc_ptr_size[i] == 0:
+                return 1
+            return 0
+        i = i + 1
+    return 0
+
+
+# Epilogue restores: pop the used callee-saved regs in REVERSE pool order (they
+# sit just above the saved %rbp after `leave; pop rbp`)... but `leave` already
+# pops rbp; we pop the callees AFTER restoring rsp/rbp. Layout (entry rsp=R):
+#   push callees (k) -> R-8k ; push rbp -> R-8k-8 ; mov rsp,rbp.
+#   epilogue: leave (rsp=rbp; pop rbp -> rsp=R-8k); pop callees reverse -> rsp=R.
+# So we emit `leave` first, then pop the callees in reverse order, then ret.
+def ra_emit_epilogue_restores():
+    p: uint32 = ra_nregs()
+    while p > 0:
+        p = p - 1
+        if ra_pool_used(p) != 0:
+            emit_pop_callee(ra_pool_encoding(p))
+
+
+# Unified function epilogue used at every return point. With regalloc inactive
+# this is exactly `leave; ret` (byte-identical default).
+def emit_function_epilogue():
+    emit_leave()
+    if cg_ra_active != 0:
+        ra_emit_epilogue_restores()
+    emit_ret()
+
+
 # movq %gs:disp32, %rax  -> 65 48 8B 04 25 disp32  (read a per-CPU global; the
 # disp32 is the global's byte offset within the per-CPU area, an ABSOLUTE
 # segment-relative address — NOT a reloc, the offset is a compile-time
@@ -3349,6 +3533,14 @@ def gen_expr(node: uint32):
                     emit_load_local_rax_signed(off, lsz)
                 else:
                     emit_load_local_rax_unsigned(off, lsz)
+                return
+            # Plain full-width 8-byte scalar. Under --opt, if regalloc promoted
+            # this local to a callee-saved register, READ the register instead of
+            # the memory slot (the write-through store kept both coherent).
+            # Inert by default: ra_reg_for_name returns RA_NONE with the flag off.
+            renc: uint32 = ra_reg_for_name(nd_name_off[node], nd_name_len[node])
+            if renc != RA_NONE:
+                emit_mov_callee_rax(renc)
                 return
             emit_load_local_rax(off)
             return
@@ -5757,6 +5949,13 @@ def store_to_named(name_off: uint32, name_len: uint32):
         if lsz != 0:
             emit_store_local_rax_sized(off, lsz)
         else:
+            # Plain full-width 8-byte scalar slot. WRITE-THROUGH under --opt: if
+            # regalloc gave this local a register, mirror %rax into it AND store
+            # to the slot, so reads (register) and any residual memory path stay
+            # coherent. Inert by default (ra_reg_for_name -> RA_NONE).
+            wenc: uint32 = ra_reg_for_name(name_off, name_len)
+            if wenc != RA_NONE:
+                emit_mov_rax_callee(wenc)
             emit_store_local_rax(off)
         return
     gi: uint32 = glob_lookup(name_off, name_len)
@@ -6299,8 +6498,7 @@ def gen_stmt(node: uint32):
 
     if k == ND_RETURN:
         gen_expr(nd_a[node])
-        emit_leave()
-        emit_ret()
+        emit_function_epilogue()
         return
 
     if k == ND_EXPR_STMT:
@@ -7052,20 +7250,41 @@ def gen_function(fn: uint32) -> uint32:
     # and corrupt the stack. (codegen_x86 does the same pre-scan pass.)
     prescan_block(nd_c[fn])
 
+    # Phase-4 regalloc (OFF by default). Build a linear-scan allocation for this
+    # function; cg_ra_active gates every emit hook so the default path is
+    # byte-identical. Falls back to all-memory (cg_ra_active=0) if the allocator
+    # could not build (overflow / validation), which is always correct.
+    cg_ra_active = 0
+    cg_ra_pad = 0
+    if ra_is_enabled() != 0:
+        if ra_build_for_function(fn) != 0:
+            cg_ra_active = 1
+
     # Prologue.
     emit_endbr64()
+    if cg_ra_active != 0:
+        ra_emit_prologue_saves()         # push used callee-saved regs first
     emit_push_rbp()
     emit_mov_rsp_rbp()
 
     # 16-byte-aligned frame reservation (matches codegen_x86's
-    # (stack_size + 15) & ~15). Skip the subq entirely when zero.
+    # (stack_size + 15) & ~15). Skip the subq entirely when zero. When an ODD
+    # number of callee regs was pushed, pad the frame by 8 to keep %rsp 16-byte
+    # aligned at inner calls.
     frame: uint32 = (cg_stack_size + 15) & cast[uint32](0xFFFFFFF0)
+    if cg_ra_active != 0 and cg_ra_pad != 0:
+        frame = frame + 8
     if frame > 0:
         emit_sub_rsp(frame)
 
     # Spill parameters from their arg registers (and the stack, for args 6+)
     # into the stack slots.
     spill_params(nd_a[fn])
+
+    # Load register-resident locals (incl. params) from their slots into their
+    # assigned registers, so the body's first read sees the right value.
+    if cg_ra_active != 0:
+        ra_emit_init_regs(nd_a[fn])
 
     # Body (statement chain on nd_c).
     s: uint32 = nd_c[fn]
@@ -7081,9 +7300,9 @@ def gen_function(fn: uint32) -> uint32:
     # Fallthrough epilogue when the body did not end in a return (mirrors
     # codegen_x86's `if not last_is_return: leave; ret`).
     if last_was_return == 0:
-        emit_leave()
-        emit_ret()
+        emit_function_epilogue()
 
+    cg_ra_active = 0                      # clear for the next function
     return start
 
 
@@ -7139,6 +7358,10 @@ def gen_method(cls: uint32, m: uint32) -> uint32:
 
     prescan_block(nd_c[m])
 
+    # Methods stay on the all-memory default for this first slice (cg_ra_active=0
+    # => the unified epilogue is byte-identical to the legacy leave; ret).
+    cg_ra_active = 0
+
     emit_endbr64()
     emit_push_rbp()
     emit_mov_rsp_rbp()
@@ -7159,8 +7382,7 @@ def gen_method(cls: uint32, m: uint32) -> uint32:
             last_was_return = 0
         s = nd_next[s]
     if last_was_return == 0:
-        emit_leave()
-        emit_ret()
+        emit_function_epilogue()
 
     cg_self_struct = 0
     return start
