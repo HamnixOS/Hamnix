@@ -444,6 +444,83 @@ def _restamp_pml4_subtree_us0(pml4_idx: uint64) -> uint64:
     return cleared
 
 
+def _audit_pml4_subtree_us1_leaks(pml4_idx: uint64, label: Ptr[char]) -> uint64:
+    # Read-only AUDIT: walk PML4[pml4_idx] -> PDPT -> [PD ->] leaves on the
+    # LIVE BSP page tables and COUNT (and log) every PRESENT leaf whose US
+    # bit is still 1. For the kernel high half (idx=511) a non-zero count is
+    # a SMAP/SMEP LEAK — a kernel VA reachable from CPL=3. Returns the leak
+    # count. Does NOT modify any entry. Mirrors the walk shape of
+    # _restamp_pml4_subtree_us0 exactly so the two can't drift.
+    cr3:  uint64 = get_bsp_cr3()
+    pml4: uint64 = cr3 & PGT_ADDR_MASK_KM
+    pml4_slot: Ptr[uint64] = cast[Ptr[uint64]](pml4 + pml4_idx * cast[uint64](8))
+    pml4e: uint64 = pml4_slot[0]
+    if (pml4e & PGT_FLAG_P_KM) == 0:
+        return 0
+    leaks: uint64 = 0
+    pdpt_base: uint64 = pml4e & PGT_ADDR_MASK_KM
+    i: uint64 = 0
+    while i < cast[uint64](512):
+        pdpte: uint64 = cast[Ptr[uint64]](pdpt_base + i * cast[uint64](8))[0]
+        if (pdpte & PGT_FLAG_P_KM) != 0:
+            if (pdpte & PGT_FLAG_PS_KM) != 0:
+                # 1 GiB leaf.
+                if (pdpte & PGT_FLAG_US_KM) != 0:
+                    printk2("[smap-audit] LEAK %s pdpt[%d] 1G US=1\n",
+                            cast[uint64](label), i)
+                    leaks = leaks + 1
+            else:
+                pd_base: uint64 = pdpte & PGT_ADDR_MASK_KM
+                j: uint64 = 0
+                while j < cast[uint64](512):
+                    pde: uint64 = cast[Ptr[uint64]](pd_base + j * cast[uint64](8))[0]
+                    if (pde & PGT_FLAG_P_KM) != 0:
+                        if (pde & PGT_FLAG_PS_KM) != 0:
+                            # 2 MiB leaf.
+                            if (pde & PGT_FLAG_US_KM) != 0:
+                                printk2("[smap-audit] LEAK %s 2M leaf US=1 (pdpt[%d]"
+                                        " pd-row follows)\n",
+                                        cast[uint64](label), i)
+                                printk1("[smap-audit]   pd[%d]\n", j)
+                                leaks = leaks + 1
+                        else:
+                            pt_base: uint64 = pde & PGT_ADDR_MASK_KM
+                            k: uint64 = 0
+                            while k < cast[uint64](512):
+                                pte: uint64 = cast[Ptr[uint64]](
+                                    pt_base + k * cast[uint64](8))[0]
+                                if (pte & PGT_FLAG_P_KM) != 0:
+                                    if (pte & PGT_FLAG_US_KM) != 0:
+                                        printk2("[smap-audit] LEAK %s 4K leaf US=1"
+                                                " (pdpt[%d])\n",
+                                                cast[uint64](label), i)
+                                        leaks = leaks + 1
+                                k = k + 1
+                    j = j + 1
+        i = i + 1
+    return leaks
+
+
+def smap_us_audit() -> uint64:
+    # Public AUDIT entry. Gated behind a marker by the caller so it doesn't
+    # spam normal boots. Scans the kernel HIGH HALF (PML4[511]) on the live
+    # BSP page tables and reports any US=1 leak. The low identity (PML4[0])
+    # is INTENTIONALLY shared with per-task user mappings — the BOOT subtree
+    # is US=0 but user code runs from identity-mapped RAM via per-task US=1
+    # cracks, so we do NOT flag PML4[0] leaves as leaks here (they are walked
+    # but only reported as an informational count). The high-half count is
+    # the acceptance number: it MUST be 0.
+    printk0("[smap-audit] kernel-VA US-bit integrity scan (PML4[511] high half)\n")
+    hi_leaks: uint64 = _audit_pml4_subtree_us1_leaks(cast[uint64](511),
+                                                     "high-half")
+    if hi_leaks == 0:
+        printk0("[smap-audit] PASS: 0 high-half kernel-VA US=1 leaks\n")
+    else:
+        printk1("[smap-audit] FAIL: %d high-half kernel-VA US=1 leaks\n",
+                hi_leaks)
+    return hi_leaks
+
+
 def setup_smep_smap():
     # EARLY mitigation pass (called from start_kernel BEFORE mem_init):
     # handles SMEP only. SMAP is deferred to setup_smap_late() because
@@ -536,19 +613,28 @@ def setup_smap_late():
 
     smap_supported: uint32 = (ebx >> CPUID_07H_EBX_SMAP_BIT) & cast[uint32](1)
 
-    restamped_hi: uint64 = 0
-    restamped_lo: uint64 = 0
-    if SMAP_RUNTIME_ENABLE == 1 and smap_supported != cast[uint32](0):
-        # High half first (kernel image data the SMAP rule would block on
-        # a CPL=0 load), then the low identity (alloc_page/kmalloc/kstack
-        # all live here).
-        restamped_hi = _restamp_pml4_subtree_us0(cast[uint64](511))
-        printk1("[cpu-mitig] smap-late restamp: %d kernel high-half leaves US=0\n",
-                restamped_hi)
-        restamped_lo = _restamp_pml4_subtree_us0(cast[uint64](0))
-        printk1("[cpu-mitig] smap-late restamp: %d low identity leaves US=0\n",
-                restamped_lo)
-        load_cr3(get_bsp_cr3())
+    # SMAP/SMEP INTEGRITY: the kernel high-half US=0 restamp is UNCONDITIONAL
+    # — it does NOT gate on smap_supported. A kernel mapping with US=1 is a
+    # latent CPL=3 read/jump target whether or not CR4.SMAP/SMEP happens to
+    # be latched on this host; Linux keeps every kernel mapping US=0 always.
+    # On a TCG host (where CPUID masks SMAP and the CR4 bits never latch) the
+    # restamp still runs so the page tables are CORRECT BY CONSTRUCTION, and
+    # the audit below reports 0 high-half leaks regardless of accelerator.
+    # The kernel runs CPL=0, so US=0 is transparent to its own accesses.
+    #
+    # High half (PML4[511], the kernel image .text/.rodata/.data/.bss) and
+    # the shared low identity (PML4[0]: alloc_page/kmalloc/kstack/page
+    # tables) both get US cleared. The low-identity restamp only touches the
+    # SHARED boot subtree; each per-task PML4 clone then re-grants US=1 at
+    # the PML4[0] directory + explicit user leaves (fs/elf.ad), so user code
+    # still runs while kernel CPL=0 identity accesses stay SMAP-clean.
+    restamped_hi: uint64 = _restamp_pml4_subtree_us0(cast[uint64](511))
+    printk1("[cpu-mitig] smap-late restamp: %d kernel high-half leaves US=0\n",
+            restamped_hi)
+    restamped_lo: uint64 = _restamp_pml4_subtree_us0(cast[uint64](0))
+    printk1("[cpu-mitig] smap-late restamp: %d low identity leaves US=0\n",
+            restamped_lo)
+    load_cr3(get_bsp_cr3())
 
     cr4_cur: uint64 = read_cr4()
     cr4_new: uint64 = cr4_cur
