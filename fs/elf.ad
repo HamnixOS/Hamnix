@@ -296,6 +296,20 @@ elf_last_interp_img_phys: uint64 = 0
 elf_last_interp_img_vlow: uint64 = 0
 elf_last_interp_img_vhigh:uint64 = 0
 
+# DEMAND-BSS (2026-06-23): the application image's BSS tail is no longer
+# eagerly allocated + mapped. The loader now eagerly backs only the
+# FILE-extent of the image (code+rodata+data file bytes, page-rounded up
+# = elf_last_app_img_vhigh) and registers the top BSS tail
+# [elf_last_app_bss_lo, elf_last_app_bss_hi) as a DEMAND-ZERO anon VMA so
+# the caller (do_execve) can lazily zero-on-fault it. This kills the
+# per-app ~8 MiB CONTIGUOUS physical region_alloc that OOM'd the DE after
+# a few hamui apps (each client links ~8.2 MiB of static BSS in
+# lib/hamui.ad). bss_lo/hi are in the USER vaddr space (dyn_vbase-relative
+# for ET_DYN), mirroring app_img_vlow/vhigh. Both 0 when the image has no
+# BSS tail above its highest file-backed page (mem_hi <= file_hi).
+elf_last_app_bss_lo:      uint64 = 0
+elf_last_app_bss_hi:      uint64 = 0
+
 # W^X Stage 1b: per-PT_LOAD-segment read-only enforcement on CODE pages.
 #
 # The whole image span [vlow, vhigh) is installed RW+executable first
@@ -467,6 +481,12 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     # sentinel compare is a true unsigned compare.
     lowest_v:    uint64 = 0xFFFFFFFFFFFFFFFF
     highest_v:   uint64 = 0
+    # DEMAND-BSS: highest_file_v spans the highest FILE-BACKED byte
+    # (p_vaddr + p_filesz) across all PT_LOADs. Everything above its
+    # page-rounded value (file_hi) is the BSS tail — eagerly zero-filled
+    # data the image declares but the file does not carry. We back only
+    # [lowest_v, lowest_v+file_hi) eagerly and demand-page the rest.
+    highest_file_v: uint64 = 0
     i: uint32 = 0
     while i < e_phnum:
         ph: uint64 = cast[uint64](blob) + e_phoff \
@@ -475,10 +495,13 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
         if p_type == PT_LOAD:
             p_vaddr: uint64 = _read_u64(cast[Ptr[uint8]](ph + 16))
             p_memsz: uint64 = _read_u64(cast[Ptr[uint8]](ph + 40))
+            p_filesz0: uint64 = _read_u64(cast[Ptr[uint8]](ph + 32))
             if p_vaddr < lowest_v:
                 lowest_v = p_vaddr
             if p_vaddr + p_memsz > highest_v:
                 highest_v = p_vaddr + p_memsz
+            if p_vaddr + p_filesz0 > highest_file_v:
+                highest_file_v = p_vaddr + p_filesz0
         i = i + 1
 
     if highest_v == 0:
@@ -487,17 +510,37 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
 
     span: uint64 = highest_v - lowest_v
     span = (span + 4095) & ~cast[uint64](4095)
+    # mem_hi_rel = full image span (incl. BSS), file_hi_rel = highest
+    # file-backed byte (page-rounded UP), both relative to lowest_v.
+    # The eager region + user mapping cover only [0, file_hi_rel); the
+    # tail [file_hi_rel, mem_hi_rel) is demand-zero BSS.
+    mem_hi_rel:  uint64 = span
+    file_hi_rel: uint64 = highest_file_v - lowest_v
+    file_hi_rel = (file_hi_rel + 4095) & ~cast[uint64](4095)
+    if file_hi_rel > mem_hi_rel:
+        file_hi_rel = mem_hi_rel
+    # The interpreter (ld.so) load keeps EAGER behaviour — it is small
+    # and has no huge BSS. Only the top-level APPLICATION image splits
+    # its BSS tail to demand. When loading as an interpreter the demand
+    # tail is suppressed (file_hi_rel forced to the full span).
+    if _in_interp_load != 0:
+        file_hi_rel = mem_hi_rel
     # region_alloc (not raw memblock_alloc): a freeable large-region
     # allocator. task_reap returns this chunk to the pool on exit, so
     # repeated spawns of the same binary recycle the SAME ~14.7 MiB
     # region instead of leaking it (the old bump-allocated region was
     # never reclaimed — ~6 hpm spawns exhausted RAM -> "command not
     # found"). Same physical-RAM source as before on a cold miss.
-    region: uint64 = region_alloc(span)
+    # DEMAND-BSS: eagerly allocate only the FILE-backed extent
+    # [0, file_hi_rel). The BSS tail above file_hi_rel is registered as
+    # a demand-zero VMA by the caller (do_execve) and never costs a
+    # contiguous physical region here. file_hi_rel == mem_hi_rel for the
+    # interpreter or any image with no BSS tail (eager == legacy).
+    region: uint64 = region_alloc(file_hi_rel)
     if region == 0:
         printk0("elf64: OOM\n")
         return 0
-    memset(cast[Ptr[uint8]](region), 0, span)
+    memset(cast[Ptr[uint8]](region), 0, file_hi_rel)
 
     i = 0
     while i < e_phnum:
@@ -559,6 +602,11 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     # copy. `span` is already 4 KiB-rounded above.
     app_img_lo: uint64 = 0
     app_img_hi: uint64 = 0
+    # DEMAND-BSS: the app's demand-zero BSS tail in USER vaddr space.
+    # [app_bss_lo, app_bss_hi) = [load_base+file_hi_rel, load_base+mem_hi_rel).
+    # Zero (lo == hi) when there is no tail above the file extent.
+    app_bss_lo: uint64 = 0
+    app_bss_hi: uint64 = 0
     # M16.36: per-task PT-entry installation regardless of e_type.
     # The PT_LOAD region must be wired into the user's PML4 explicitly
     # so the user task no longer depends on the BSP's inherited 1 GiB
@@ -569,15 +617,24 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     # the user binary to keep working).
     if e_type == cast[uint32](ELF_ET_EXEC):
         app_needs_map  = 1
+        # DEMAND-BSS: the eager user mapping + COW image span cover only
+        # the file-backed extent [lowest_v, lowest_v+file_hi_rel). The
+        # BSS tail [lowest_v+file_hi_rel, lowest_v+mem_hi_rel) is a
+        # demand-zero VMA the caller registers.
         app_user_vlow  = lowest_v
-        app_user_vhigh = lowest_v + span
+        app_user_vhigh = lowest_v + file_hi_rel
         app_user_phys  = region
         app_load_base  = lowest_v
         app_entry_user = e_entry
         app_img_lo     = lowest_v
-        app_img_hi     = lowest_v + span
+        app_img_hi     = lowest_v + file_hi_rel
+        if mem_hi_rel > file_hi_rel:
+            app_bss_lo = lowest_v + file_hi_rel
+            app_bss_hi = lowest_v + mem_hi_rel
         printk2("elf64: ET_EXEC user-map: [0x%x, 0x%x)\n",
-                lowest_v, lowest_v + span)
+                lowest_v, lowest_v + file_hi_rel)
+        printk2("elf64: ET_EXEC bss-demand: [0x%x, 0x%x)\n",
+                app_bss_lo, app_bss_hi)
     else:
         # U52 load-bias ASLR: an ET_DYN image runs at a randomized VIRTUAL
         # base (dyn_vbase) chosen per-exec by the caller, INDEPENDENT of its
@@ -596,18 +653,26 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
             dyn_vbase = region
         app_load_base  = dyn_vbase
         app_entry_user = dyn_vbase + (e_entry - lowest_v)
-        # ET_DYN occupies [dyn_vbase, dyn_vbase + span) in the user's
-        # address space, backed by physical [region, region + span).
+        # DEMAND-BSS: ET_DYN occupies [dyn_vbase, dyn_vbase + file_hi_rel)
+        # eagerly (file-backed), with the BSS tail
+        # [dyn_vbase+file_hi_rel, dyn_vbase+mem_hi_rel) demand-zero. Both
+        # ranges are in the user's vaddr space (dyn_vbase-relative); the
+        # eager extent is backed by physical [region, region+file_hi_rel).
         app_needs_map  = 1
         app_user_vlow  = dyn_vbase
-        app_user_vhigh = dyn_vbase + span
+        app_user_vhigh = dyn_vbase + file_hi_rel
         app_user_phys  = region
         app_img_lo     = dyn_vbase
-        app_img_hi     = dyn_vbase + span
+        app_img_hi     = dyn_vbase + file_hi_rel
+        if mem_hi_rel > file_hi_rel:
+            app_bss_lo = dyn_vbase + file_hi_rel
+            app_bss_hi = dyn_vbase + mem_hi_rel
         printk2("elf64: ET_DYN user-map: [0x%x, 0x%x)\n",
-                dyn_vbase, dyn_vbase + span)
+                dyn_vbase, dyn_vbase + file_hi_rel)
         printk2("elf64: ET_DYN phys backing: [0x%x, 0x%x)\n",
-                region, region + span)
+                region, region + file_hi_rel)
+        printk2("elf64: ET_DYN bss-demand: [0x%x, 0x%x)\n",
+                app_bss_lo, app_bss_hi)
     # W^X Stage 1b: record this image's non-writable (.text/.rodata)
     # PT_LOAD spans in elf_last_app_ro_* so the installer can flip them
     # READ-ONLY after the whole image is mapped RW. app_load_base is the
@@ -621,6 +686,13 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     app_phys_capture: uint64 = region
     app_vlow_capture: uint64 = app_user_vlow
     app_vhigh_capture: uint64 = app_user_vhigh
+    # DEMAND-BSS: capture the app's demand BSS tail so it survives the
+    # PT_INTERP recursion (which trashes the elf_last_* globals). The
+    # interpreter load never sets a BSS tail (file_hi_rel forced to span
+    # for _in_interp_load), so the recursion leaves these locals as the
+    # app's own values to publish at the same place app_img_* are.
+    app_bss_lo_capture: uint64 = app_bss_lo
+    app_bss_hi_capture: uint64 = app_bss_hi
     if e_type == cast[uint32](ELF_ET_EXEC):
         # ET_EXEC's PT_LOADs land at lowest_v..lowest_v+span; the
         # underlying physical pages are at `region` (the memblock chunk
@@ -717,6 +789,10 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
         elf_last_app_img_phys    = app_phys_capture
         elf_last_app_img_vlow    = app_vlow_capture
         elf_last_app_img_vhigh   = app_vhigh_capture
+        # DEMAND-BSS: publish the app's demand BSS tail (the interp
+        # recursion never set one — it forces file_hi_rel == span).
+        elf_last_app_bss_lo      = app_bss_lo_capture
+        elf_last_app_bss_hi      = app_bss_hi_capture
         elf_last_interp_img_phys = interp_phys_capture
         elf_last_interp_img_vlow = interp_vlow_capture
         elf_last_interp_img_vhigh = interp_vhigh_capture
@@ -750,6 +826,12 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     elf_last_app_img_phys   = app_phys_capture
     elf_last_app_img_vlow   = app_vlow_capture
     elf_last_app_img_vhigh  = app_vhigh_capture
+    # DEMAND-BSS: on the static path the app IS this load — publish its
+    # demand BSS tail. When _in_interp_load (we are the interpreter), the
+    # tail is always 0 (file_hi_rel forced to span); the OUTER call's
+    # PT_INTERP arm overwrites these with the real app's captured values.
+    elf_last_app_bss_lo     = app_bss_lo_capture
+    elf_last_app_bss_hi     = app_bss_hi_capture
     if _in_interp_load == 0:
         # Top-level static load: no interpreter to install.
         elf_last_interp_img_phys  = 0
@@ -914,6 +996,16 @@ def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     span: uint64 = cast[uint64](highest_v) - cast[uint64](lowest_v)
     # Round up to a page so the load region is page-aligned.
     span = (span + 4095) & ~cast[uint64](4095)
+    # NOTE (DEMAND-BSS 2026-06-23): the ELF32 native path is NOT split into
+    # an eager-file + demand-BSS tail like the ELF64 path. ELF32 native
+    # binaries run IDENTITY-MAPPED (vaddr == phys == region) at low RAM, so
+    # a demand-BSS range [region+file_hi, region+mem_hi) would ALIAS the
+    # kernel direct map: region_alloc later hands that same physical RAM to
+    # the next image, and the loader's identity-vaddr memset of it would
+    # fault NOT-PRESENT (the demand prep cracked those identity PTEs). This
+    # is the ET_DYN↔direct-map aliasing hazard. The ELF32 image keeps the
+    # eager full-span region; the DE-OOM fix lives in the ELF64 loader,
+    # which is enough (verified: panels + apps render under -m 1G).
     # Freeable region (see the ELF64 path): task_reap reclaims it so
     # native ELF32 spawns recycle their backing instead of leaking it.
     region: uint64 = region_alloc(span)
@@ -987,6 +1079,12 @@ def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     elf_last_app_img_phys   = region
     elf_last_app_img_vlow   = region
     elf_last_app_img_vhigh  = region + span
+    # DEMAND-BSS: the ELF32 path keeps its eager full-span region (see the
+    # NOTE above re: identity/direct-map aliasing). No demand BSS tail —
+    # clear the globals so a prior ELF64 load's tail can't leak into this
+    # image's do_execve bss-demand registration.
+    elf_last_app_bss_lo = 0
+    elf_last_app_bss_hi = 0
     # No PT_INTERP on ELF32 — clear the interpreter coords so a stale
     # ELF64 dynamic-load's interp span doesn't get reinstalled.
     elf_last_interp_img_phys  = 0
@@ -1999,6 +2097,21 @@ def elf_last_img_hi_get() -> uint64:
     # Accessor: page-aligned high vaddr of the most-recently-loaded ELF
     # image.
     return elf_last_img_hi
+
+
+def elf_last_app_bss_lo_get() -> uint64:
+    # DEMAND-BSS accessor: low USER vaddr of the most-recently-loaded
+    # application image's demand-zero BSS tail. do_execve passes this to
+    # vma_register_bss_demand after installing the eager file-backed
+    # image. 0 (== bss_hi) when the image has no BSS tail.
+    return elf_last_app_bss_lo
+
+
+def elf_last_app_bss_hi_get() -> uint64:
+    # DEMAND-BSS accessor: high USER vaddr (exclusive) of the demand-zero
+    # BSS tail. The range [lo, hi) is registered as an anon RW NX demand
+    # VMA so do_page_fault zero-fills it lazily, page by page.
+    return elf_last_app_bss_hi
 
 
 def elf32_wx_span_reset_selftest(blob: Ptr[uint8],

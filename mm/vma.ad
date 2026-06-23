@@ -1500,7 +1500,19 @@ def _vma_node_free(slot: uint64, node: uint64, pml4_phys: uint64):
         return
 
     is_demand: int32 = cast[Ptr[VmaNode]](node)[0].is_demand
-    if is_demand != 0:
+    # DEMAND-BSS (2026-06-23): a demand VMA that was COW-shared on fork
+    # (is_cow set — e.g. the BSS-demand tail whose parent-resident pages
+    # vma_fork_copy COW-shared) carries frames the COW refcount table
+    # owns. Freeing them with free_page() here would double-free a still-
+    # shared frame. Route such nodes through the is_cow arm below
+    # (cow_drop_page arbitrates by per-PFN refcount); the page is returned
+    # to the buddy allocator only when the last mapper drops it. A demand
+    # node with no COW share (the common case) keeps the fast free_page
+    # walk.
+    is_cow_demand: int32 = cast[Ptr[VmaNode]](node)[0].is_cow
+    if cast[Ptr[VmaNode]](node)[0].is_shared != 0:
+        is_cow_demand = 1
+    if is_demand != 0 and is_cow_demand == 0:
         # Demand-paged VMA (§142): pages were allocated individually on
         # first access and are NOT tracked in the COW refcount table.
         # Walk the PTE range page by page; any present 4 KiB PTE points
@@ -2770,6 +2782,74 @@ def vma_alloc_demand(slot: uint64, addr_in: uint64, len_in: uint64,
     cast[Ptr[VmaNode]](node)[0].is_demand = 1
     _vma_insert_sorted(slot, node)
     return cast[int64](base)
+
+
+# ---------------------------------------------------------------------
+# DEMAND-BSS (2026-06-23) — vma_register_bss_demand
+# ---------------------------------------------------------------------
+#
+# Registers an ELF image's BSS tail [lo, hi) as a FIXED demand-zero
+# anonymous VMA in the user's address space, mirroring vma_alloc_demand's
+# is_fixed body. The loader (fs/elf.ad::_load_elf64) now eagerly backs
+# only the file extent of an image and hands the BSS tail here so
+# do_page_fault → vma_demand_fault zero-fills it lazily, page by page —
+# instead of the old eager ~8 MiB CONTIGUOUS region_alloc that OOM'd the
+# DE after a few hamui apps (each links ~8.2 MiB static BSS).
+#
+# The range is BELOW 1 GiB (real app vaddrs), NOT the [1G,4G) mmap
+# window, so this carves nothing from vma_large_next — it lays the
+# demand reservation at the exact app vaddrs. prot is RW + NX (BSS is
+# writable DATA, never executed); vma_demand_fault stamps NX from prot
+# via _vma_nx_flag and RW from VMA_PROT_WRITE.
+#
+# do_execve calls this AFTER elf_apply_last_user_mapping installs the
+# eager file-backed image, with lo = elf_last_app_bss_lo_get() and
+# hi = elf_last_app_bss_hi_get(). When hi <= lo (no BSS tail) it is a
+# no-op (returns 0). Returns 0 on success, negative errno on OOM.
+
+def vma_register_bss_demand(slot: uint64, pml4_phys: uint64,
+                            lo: uint64, hi: uint64) -> int32:
+    if hi <= lo:
+        return 0
+    # Page-align (defensive; the loader already rounds both to a page).
+    base: uint64 = lo & ~(VMA_PAGE_SIZE - 1)
+    top:  uint64 = (hi + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
+    length: uint64 = top - base
+
+    # FIXED semantics: carve any existing mapping in the target range
+    # (fresh app BSS — nothing to carve, but mirrors vma_alloc_demand's
+    # is_fixed body and is harmless / defensive against a stale node).
+    _vma_carve_range(slot, base, top)
+
+    # Prepare the page tables for the demand range per-GiB (crack
+    # PDPT/PD/PT without installing any physical mappings), exactly like
+    # vma_alloc_demand. A user touch then fires a NOT-PRESENT #PF that
+    # do_page_fault routes to vma_demand_fault.
+    GIB: uint64 = 0x40000000
+    cur: uint64 = base
+    while cur < top:
+        gib_end: uint64 = (cur + GIB) & ~(GIB - 1)
+        chunk_end: uint64 = gib_end
+        if chunk_end > top:
+            chunk_end = top
+        if elf_prepare_demand_range(pml4_phys, cur, chunk_end) < 0:
+            printk1("vma: bss-demand PT prep OOM @ 0x%x\n", cur)
+            return -12
+        cur = chunk_end
+
+    load_cr3(pml4_phys)
+
+    node: uint64 = _vma_node_new()
+    if node == 0:
+        return -12
+    # Anon, private, RW+NX, no fd/backing. is_demand=1 → vma_demand_fault
+    # zero-fills on access.
+    bss_prot: int32 = VMA_PROT_READ | VMA_PROT_WRITE
+    _vma_node_set(node, base, top, bss_prot, 0, -1, 0, 0, 0)
+    cast[Ptr[VmaNode]](node)[0].is_demand = 1
+    _vma_insert_sorted(slot, node)
+    printk2("vma: bss-demand VMA [0x%x, 0x%x) registered\n", base, top)
+    return 0
 
 
 # ---------------------------------------------------------------------
@@ -4305,17 +4385,44 @@ def _vma_fork_copy_locked(child_slot: uint64, parent_slot: uint64,
                 _vma_insert_sorted(child_slot, node)
         else:
             # Alias VMA (MAP_FIXED slice in an enclosing region) or a
-            # demand VMA with no yet-populated pages: pure metadata copy.
-            # For alias VMAs, pages were COW-shared via the enclosing
-            # owner node's range. For demand VMAs (is_demand==1), the
-            # child gets a fresh is_demand copy; each process populates
-            # its own pages independently on fault (the child's demand
-            # range starts empty — no pages to share yet).
-            _vma_node_set(node, p_start, p_end, p_prot, p_flags,
-                          p_fd, p_off, 0, 0)
+            # demand VMA: pure metadata copy of the reservation. The
+            # child gets a fresh is_demand copy so it can fault its own
+            # not-yet-populated pages independently.
+            #
+            # DEMAND-BSS correctness (2026-06-23): a demand VMA may ALSO
+            # have pages the PARENT already faulted in (e.g. BSS the
+            # parent wrote before fork). Those are present anon PTEs in
+            # the parent but owns_pages==0 (a demand node records no
+            # backing/chunks — vma_demand_fault tracks pages via rmap).
+            # Without sharing them the child would wrongly read zeros for
+            # BSS the parent populated pre-fork. So COW-share every
+            # PRESENT page in [p_start, p_end): vm_cow_share_range marks
+            # the resident pages RO+COW in BOTH PML4s and SKIPS the
+            # not-present remainder (the child re-faults those zero pages
+            # through its own demand VMA). Flag both nodes is_cow so the
+            # shared frames free through the refcount.
             cast[Ptr[VmaNode]](node)[0].is_demand = \
                 cast[Ptr[VmaNode]](cur)[0].is_demand
-            _vma_insert_sorted(child_slot, node)
+            p_is_demand: int32 = cast[Ptr[VmaNode]](cur)[0].is_demand
+            if p_is_demand != 0:
+                _vma_node_set(node, p_start, p_end, p_prot, p_flags,
+                              p_fd, p_off, 0, 0)
+                cast[Ptr[VmaNode]](node)[0].is_demand = 1
+                if vm_cow_share_range(parent_pml4, child_pml4,
+                                      p_start, p_end) < 0:
+                    printk1("vma_fork: demand COW share OOM @ 0x%x\n",
+                            p_start)
+                    kfree(node)
+                    return -1
+                # Any frames the parent had resident are now COW-shared;
+                # both nodes must free through the refcount from here on.
+                cast[Ptr[VmaNode]](node)[0].is_cow = 1
+                cast[Ptr[VmaNode]](cur)[0].is_cow = 1
+                _vma_insert_sorted(child_slot, node)
+            else:
+                _vma_node_set(node, p_start, p_end, p_prot, p_flags,
+                              p_fd, p_off, 0, 0)
+                _vma_insert_sorted(child_slot, node)
         cur = cast[Ptr[VmaNode]](cur)[0].next
     # §1: vm_share_range may have CRACKED parent huge-page identity
     # entries down to 4 KiB PTs while adding the child's mappings. The

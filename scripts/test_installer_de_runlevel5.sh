@@ -198,6 +198,25 @@ else
     echo "[test_de_rl5] PASS: no kernel panic during boot."
 fi
 
+# DEMAND-BSS regression guard (2026-06-23): the ELF loader must NOT OOM
+# while spawning the DE's hamui client apps. Each client links ~8.2 MiB
+# of static BSS (lib/hamui.ad h_v2_bb/h_v2_msg); the loader used to
+# EAGERLY allocate one ~8 MiB CONTIGUOUS physical region per app and
+# zero-fill it, so after a few apps there was no contiguous hole left and
+# _load_elf64 printed "elf: OOM" / "elf64: OOM" — the panel app exited
+# code=1 and the desktop came up with only the 2 floating demo windows on
+# bare teal. The fix demand-pages the BSS tail (zero-on-fault), so its
+# ABSENCE from the boot serial is the assertion. Also guard the new
+# BSS-demand fault path's own OOM string.
+if grep -a -E "elf: OOM|elf64: OOM|demand-page OOM|bss-demand PT prep OOM" "$LOG" \
+        | grep -aq .; then
+    echo "[test_de_rl5] FAIL: ELF loader OOM during boot — BSS demand-page fix regressed (apps' ~8 MiB contiguous BSS alloc re-exhausted RAM)." >&2
+    grep -a -n -E "elf: OOM|elf64: OOM|demand-page OOM|bss-demand PT prep OOM" "$LOG" | head >&2
+    fail=1
+else
+    echo "[test_de_rl5] PASS: no ELF loader OOM (BSS tail demand-paged, not eagerly contiguous-allocated)."
+fi
+
 # (4) Framebuffer screendump must be non-blank: more than one distinct
 # pixel triple means the DE actually painted. Skipped (not failed) if no
 # socat/nc to drive the monitor.
