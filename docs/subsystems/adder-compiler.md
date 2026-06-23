@@ -895,19 +895,118 @@ non-literal context are never touched.
   fired across all 500 corpus programs (the lane fails if the optimizer never
   fires).
 
-### Phased plan — what Phase 2+ tackles
+## Native optimizer — Phase 2: local CSE via value numbering
 
-Phase 1 is the IR + pass-manager plumbing, not optimization depth. Next:
+Phase 2 extends the IR past constant leaves and adds a **local common-
+subexpression-elimination** pass driven by structural **value numbering**. Like
+Phase 1 it is purely additive in `adder/compiler/` + `tests/fuzz/`, gated behind
+`ADDER_OPT`/`--opt`, and **OFF by default** (the default path stays byte-
+identical to the seed — see the verification below).
 
-- **Phase 2 — CSE / value numbering** over the IR (requires extending the IR
-  beyond constant leaves to model `IR_BINOP`/loads/SSA values, already
-  reserved as `IR_BINOP` in ir.ad).
-- **Phase 3 — LICM**: hoist loop-invariant IR values out of `ND_WHILE`/`ND_FOR`
-  bodies; needs an IR CFG/loop-nest view layered over the AST.
+### IR extension (ir.ad)
+
+Phase 1 only ever built `IR_CONST` nodes. Phase 2 lights up the non-constant
+pure value nodes a CSE needs:
+
+- `IR_IDENT` — a register-width read of a named local/parameter/global. Its
+  value number IS its name identity (`ir_name_eq`, byte-compare of the strbuf
+  name, mirroring codegen's `name_match`).
+- `IR_BINOP` — a pure binary op over two IR values (the slot reserved but
+  unused in Phase 1).
+- `IR_CONST` — unchanged, shared with the fold path.
+
+`ir_lower_pure_expr(node)` lowers a **provably-pure** expression subtree to this
+IR, or returns 0 (the expression is left untouched). The CSE-safe set is
+deliberately narrow: integer-valued literals, **bare identifiers**, and
+`ND_BINARY` over the **signedness-invariant 64-bit op set**
+(`ADD/SUB/MUL/AND/OR/XOR/SHL` — the same set Phase-1 folding trusts) with both
+operands themselves CSE-safe. Everything else — loads/indexes `p[i]`, member
+access, **calls**, casts, compares, `DIV/IDIV/MOD/SHR`, unary — lowers to 0, so
+it is **never** eliminated and **ends the available-expression region**.
+
+`ir_value_eq(x, y)` is the value-number test: two IR values are equal iff they
+are structurally identical (same const value / same ident name / same op with
+recursively-equal operands). This is the hash-free structural VN used by the
+pass to recognise a redundant recomputation.
+
+### The CSE pass (opt.ad)
+
+CSE runs **after** Phase-1 const-folding (`opt_run` folds first, then
+`opt_cse_function` numbers the simplified graph). Scope is the
+**single-statement pure expression tree** (a maximal pure straight-line region):
+within one pure expression there are provably **no intervening clobbers** of any
+leaf identifier (a pure expression has no assignments/stores/calls), so an
+available expression stays valid across the whole tree. The pass:
+
+1. `cse_collect` lowers every `ND_BINARY` subtree of the statement's expression
+   into a **shared** per-statement IR arena (one `ir_reset()` per statement, so
+   all candidate value-ids stay mutually comparable).
+2. For each candidate (outermost-first, so the **maximal** redundant expression
+   wins), if a later live candidate is `ir_value_eq`, it is redundant.
+3. Materialise: mint a unique synthetic temp `__cse_<n>` (appended to strbuf),
+   emit an **untyped** `ND_VAR_DECL` `__cse_n = <expr>` (no type node → codegen
+   reserves a plain 8-byte scalar slot, full-register `movq` store/load — no
+   sub-width hazard), and rewrite **every** occurrence (incl. the first) into an
+   `ND_IDENT` reading the temp. The decl is spliced into the statement chain
+   immediately **before** the statement that uses it, so codegen's prescan
+   reserves the slot and the body computes the temp before the use.
+4. `cse_kill_descendants` invalidates any candidate nested inside a just-
+   collapsed subtree, so a sub-part is never double-CSE'd.
+
+`opt_cse_count` counts eliminations (one per recomputation replaced); the dump
+driver logs it (`CSE <n>`) and the fuzzer accumulates it.
+
+### Phase 2 safety argument
+
+The temp slot is an erased 8-byte scalar, so it holds the **exact %rax value**
+codegen would compute inline; the eliminated expressions are restricted to the
+signedness-invariant 64-bit op set over ident/const leaves, so the temp's value
+equals every occurrence's value bit-for-bit. The single-statement scope
+guarantees no operand is reassigned between the hoisted decl and any use
+(impure constructs don't lower, so a store/call/volatile-load can never sit
+inside a CSE region). The transform is therefore value-preserving →
+behaviorally correct, which the `ADDER_OPT=1` lane asserts against the seed
+oracle.
+
+### Verification (Phase 2)
+
+- **DEFAULT (ADDER_OPT unset)** is byte-inert: `fuzz_adder_diff.sh` 500/500,
+  0 miscompiles; `test_native_vs_seed_objdiff.sh` **193 clean (unchanged
+  baseline)**; `test_native_vs_seed_kobjdiff.sh` **0 divergences over 10167
+  functions**. `ir.ad`/`opt.ad` are imported **only** by the host dump driver,
+  never by the product compiler (`build/cutover/host_compiler.ad`'s import
+  closure excludes them), so the seed baseline is provably untouched.
+- **ADDER_OPT=1 lane**: 500/500 correct vs oracle (const-folds 9720). The
+  random batch rarely emits repeated non-constant subexpressions, so a dedicated
+  **CSE corpus** (`_cse_corpus` in the fuzzer: `(a*b)+(a*b)`, repeated XOR sums,
+  nested `((a*b)+c)` twice, repeated shift-or) runs through `codegen.ad --opt`
+  and asserts the optimized output matches a computed oracle **and** that CSE
+  demonstrably fires (**5 eliminations** across the corpus; the lane fails if it
+  never fires or miscompiles).
+
+```sh
+ADDER_OPT=1 ADDER_FUZZ_DIFF_TARGET=ad-codegen \
+    python3 tests/fuzz/adder_fuzzer.py --ad-codegen --count 500 --seed 1
+```
+
+### Phased plan — what Phase 3+ tackles
+
+- **Phase 3 — LICM** (loop-invariant code motion): hoist loop-invariant IR
+  values out of `ND_WHILE`/`ND_FOR` bodies. This is where the single-statement
+  scope must grow into a real **basic-block / loop-nest view** layered over the
+  AST: LICM needs (a) per-loop *clobber analysis* — which identifiers/memory the
+  loop body writes (via `ND_ASSIGN`/`ND_AUG_ASSIGN`/stores), so an expression is
+  invariant iff none of its leaves are clobbered in the loop; (b) a hoist point
+  (a pre-header before the loop) to place the computed temp; (c) reuse of the
+  Phase-2 value-numbering + temp-materialisation machinery (`cse_make_temp_decl`
+  / `cse_rewrite_to_ident` generalise directly — the only new work is the
+  invariance/clobber test and the pre-header splice). The conservative starting
+  point: hoist a pure `IR_BINOP` whose every leaf ident is **never** an
+  assignment target anywhere in the loop body.
 - **Phase 4 — register allocation**: replace codegen.ad's spill-everything-via-
-  `%rax`/`%rcx`-and-push model with a real allocator over IR values, the
+  `%rax`/`%rcx`-and-push model with a real allocator over IR values — the
   largest single ≤2×/parity-of-C win. This is where the IR earns its keep:
-  codegen.ad lowers IR → instruction selection instead of walking the AST.
+  codegen lowers IR → instruction selection instead of walking the AST.
 
 Each phase stays behind `ADDER_OPT` until its own correctness lane is green,
 and the seed remains the frozen oracle throughout.

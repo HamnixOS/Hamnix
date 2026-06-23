@@ -183,7 +183,8 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       gdata_len=meta["GDATA_LEN"],
                       bss_len=meta["BSS_LEN"],
                       fn_count=meta["FN_COUNT"],
-                      folds=meta.get("FOLDS", 0))
+                      folds=meta.get("FOLDS", 0),
+                      cse=meta.get("CSE", 0))
 
 
 # --------------------------------------------------------------------------
@@ -311,6 +312,7 @@ class CodegenRun:
         self.exit = kw.get("exit", None)
         self.detail = kw.get("detail", "")
         self.folds = kw.get("folds", 0)
+        self.cse = kw.get("cse", 0)
 
 
 def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
@@ -344,10 +346,12 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
         src.unlink(missing_ok=True)
         elf.unlink(missing_ok=True)
     folds = getattr(dump, "folds", 0)
+    cse = getattr(dump, "cse", 0)
     if rp.returncode < 0:
         return CodegenRun("runfail", detail=f"signal {-rp.returncode}",
-                          stdout=out, exit=rp.returncode, folds=folds)
-    return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF, folds=folds)
+                          stdout=out, exit=rp.returncode, folds=folds, cse=cse)
+    return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
+                      folds=folds, cse=cse)
 
 
 if __name__ == "__main__":

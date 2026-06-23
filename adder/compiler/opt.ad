@@ -31,20 +31,46 @@ from compiler.parser import (
     nd_kind,
     nd_aux,
     nd_num,
+    nd_name_off,
+    nd_name_len,
     nd_a,
     nd_b,
     nd_c,
     nd_d,
     nd_next,
+    node_new,
     ND_INT_LIT,
+    ND_IDENT,
     ND_BINARY,
+    ND_VAR_DECL,
+    ND_ASSIGN,
+    ND_EXPR_STMT,
+    ND_RETURN,
+    ND_IF,
+    ND_ELIF,
+    ND_WHILE,
+    ND_DO_WHILE,
+    ND_FOR,
     ND_FUNCTION,
 )
 
 from compiler.ir import (
     ir_reset,
     ir_lower_const_expr,
+    ir_lower_pure_expr,
+    ir_value_eq,
+    ir_uses_name,
     ir_const,
+    ir_kind,
+    ir_ast,
+    ir_name_off,
+    ir_name_len,
+    IR_BINOP,
+)
+
+from compiler.lexer import (
+    strbuf,
+    strbuf_pos,
 )
 
 # -----------------------------------------------------------------------
@@ -58,6 +84,13 @@ opt_enabled: uint32 = 0
 # the driver so the fuzzer can assert the pass demonstrably fires.
 opt_fold_count: uint32 = 0
 
+# Diagnostics: number of redundant pure subexpressions eliminated by CSE
+# (each elimination = one recomputation replaced by a load of a hoisted temp).
+opt_cse_count: uint32 = 0
+
+# Monotonic counter for minting unique synthetic temp names (__cse_<n>).
+opt_cse_tmp_seq: uint32 = 0
+
 
 def opt_enable():
     opt_enabled = 1
@@ -65,6 +98,8 @@ def opt_enable():
 
 def opt_reset_stats():
     opt_fold_count = 0
+    opt_cse_count = 0
+    opt_cse_tmp_seq = 0
 
 
 # Rewrite an AST ND_BINARY node IN PLACE into an ND_INT_LIT carrying `v`.
@@ -140,3 +175,381 @@ def opt_run(prog: uint32):
     while cur != 0:
         opt_walk(cur)
         cur = nd_next[cur]
+    # Phase 2 — local CSE over each function body (runs on the const-FOLDED
+    # graph: opt_walk above already collapsed constant subtrees, so CSE numbers
+    # the simplified expressions). Re-walk the decls and CSE every function.
+    cur = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            opt_cse_function(cur)
+        cur = nd_next[cur]
+
+
+# =======================================================================
+# Phase 2 — local common-subexpression elimination via value numbering.
+# =======================================================================
+#
+# STRATEGY (conservative + correct over fast)
+# -------------------------------------------
+# CSE eliminates a redundant PURE computation by computing it ONCE into a
+# synthetic temp local and reusing the temp at later occurrences. The temp is
+# an untyped 8-byte scalar slot (declare_local with type node 0 in codegen.ad
+# gives a full-register movq store/load — no sub-width hazard), so the temp
+# holds EXACTLY the %rax value codegen would have computed inline. Because the
+# eliminated expressions are restricted to the signedness-INVARIANT 64-bit op
+# set over ident/const leaves (see ir.ad ir_lower_pure_expr), the temp's value
+# equals every occurrence's value bit-for-bit: the transform is value-
+# preserving, hence behaviorally correct (the ADDER_OPT=1 fuzzer lane asserts
+# this against the oracle).
+#
+# SCOPE — a single STATEMENT's expression tree (a maximal pure straight-line
+# region). Within one pure expression there are provably NO intervening
+# clobbers of any leaf identifier (a pure expression has no assignments/
+# stores/calls), so an available expression stays valid across the whole tree.
+# Any impure node (call, index/load, member, cast, compare, DIV/MOD/SHR,
+# unary, assignment target) is NOT lowered into the value IR and thus ends the
+# available-expression region (ir_lower_pure_expr returns 0 for it). A store /
+# call / volatile-load that could clobber is therefore never inside a CSE
+# region. This is the textbook "local CSE within a basic block", at its safest.
+#
+# The repeated occurrence is rewritten IN PLACE into an ND_IDENT referencing
+# the temp; the temp's defining ND_VAR_DECL is spliced into the enclosing
+# statement chain immediately before the statement that uses it, so codegen's
+# prescan reserves the slot and the body walk computes it before the use.
+
+# Append "__cse_<seq>" to strbuf and return its starting offset; the length is
+# written through the two globals below (Adder has no multi-return here). The
+# name is unique per call (seq is monotonic) and cannot collide with a user
+# identifier (user names never contain the "__cse_" prefix in the fuzzer/seed
+# subset; the leading "__" marks it compiler-internal).
+opt_tmp_name_off: uint32 = 0
+opt_tmp_name_len: uint32 = 0
+
+
+def cse_emit_digits(v: uint32):
+    if v == 0:
+        strbuf[strbuf_pos] = 48        # '0'
+        strbuf_pos = strbuf_pos + 1
+        return
+    # Emit decimal digits (recurse for high-order first).
+    if v >= 10:
+        cse_emit_digits(v / 10)
+    strbuf[strbuf_pos] = cast[uint8]((v % 10) + 48)
+    strbuf_pos = strbuf_pos + 1
+
+
+def cse_mint_temp_name():
+    start: uint32 = strbuf_pos
+    # "__cse_"
+    strbuf[strbuf_pos] = 95          # '_'
+    strbuf_pos = strbuf_pos + 1
+    strbuf[strbuf_pos] = 95          # '_'
+    strbuf_pos = strbuf_pos + 1
+    strbuf[strbuf_pos] = 99          # 'c'
+    strbuf_pos = strbuf_pos + 1
+    strbuf[strbuf_pos] = 115         # 's'
+    strbuf_pos = strbuf_pos + 1
+    strbuf[strbuf_pos] = 101         # 'e'
+    strbuf_pos = strbuf_pos + 1
+    strbuf[strbuf_pos] = 95          # '_'
+    strbuf_pos = strbuf_pos + 1
+    opt_cse_tmp_seq = opt_cse_tmp_seq + 1
+    cse_emit_digits(opt_cse_tmp_seq)
+    opt_tmp_name_off = start
+    opt_tmp_name_len = strbuf_pos - start
+
+
+# Rewrite AST node `node` in place into an ND_IDENT referencing the temp name
+# (off,len). codegen.ad's ND_IDENT path reads only nd_name_off/len, so clearing
+# the operand/child slots is hygiene. The node id is preserved, so the parent
+# slot that referenced this subtree now references the temp read.
+def cse_rewrite_to_ident(node: uint32, off: uint32, len_: uint32):
+    nd_kind[node] = ND_IDENT
+    nd_name_off[node] = off
+    nd_name_len[node] = len_
+    nd_aux[node] = 0
+    nd_num[node] = 0
+    nd_a[node] = 0
+    nd_b[node] = 0
+    nd_c[node] = 0
+    nd_d[node] = 0
+
+
+# Build a fresh ND_VAR_DECL `<tmpname> = <init_ast>` with NO type annotation
+# (type node 0 -> codegen reserves a plain untyped 8-byte scalar slot). Returns
+# the new statement node, or 0 on arena exhaustion.
+def cse_make_temp_decl(off: uint32, len_: uint32, init_ast: uint32) -> uint32:
+    d: uint32 = node_new(ND_VAR_DECL)
+    if d == 0:
+        return 0
+    nd_name_off[d] = off
+    nd_name_len[d] = len_
+    nd_a[d] = 0                # no type node -> untyped 8-byte scalar
+    nd_b[d] = init_ast        # initialiser
+    return d
+
+
+# --- single-statement CSE -------------------------------------------------
+#
+# We scan the value-IR of ONE statement's expression for a pure ND_BINOP value
+# that occurs >=2 times. The FIRST such occurrence is materialized into a temp;
+# every occurrence (including the first) is rewritten to read the temp, and the
+# temp's defining decl is returned to the caller for splicing before the stmt.
+#
+# Per-statement scratch: the list of distinct AST roots we lowered, plus their
+# IR value ids, and a parallel "already eliminated" mark.
+CSE_MAX_CAND: uint32 = 4096
+cse_cand_ast: Array[4096, uint32]    # AST node of a pure-binop candidate
+cse_cand_ir: Array[4096, uint32]     # its value-IR id
+cse_cand_n: uint32 = 0
+
+# Pending temp decls minted while processing the current statement, to splice
+# in before it (in mint order).
+CSE_MAX_PEND: uint32 = 256
+cse_pend_decl: Array[256, uint32]
+cse_pend_n: uint32 = 0
+
+
+# Collect every pure ND_BINARY subtree of `node` into the candidate list, in
+# PRE-ORDER (outermost first), each paired with its lowered value IR. A subtree
+# that does not lower (impure / out-of-set) is skipped but we still descend its
+# AST children to find pure binops nested under an impure parent (e.g. inside a
+# cast or an index expression's operands).
+def cse_collect(node: uint32):
+    if node == 0:
+        return
+    if cse_cand_n >= CSE_MAX_CAND:
+        return
+    if nd_kind[node] == ND_BINARY:
+        # Lower into the SHARED per-statement IR arena (reset once by the
+        # caller, NOT per node) so every candidate's value id stays live and
+        # mutually comparable across the whole statement.
+        v: uint32 = ir_lower_pure_expr(node)
+        if v != 0:
+            cse_cand_ast[cse_cand_n] = node
+            cse_cand_ir[cse_cand_n] = v
+            cse_cand_n = cse_cand_n + 1
+    cse_descend(node)
+
+
+# Descend into the expression children of an AST node (the slots that can hold
+# sub-expressions). Statement-level nodes are handled by the per-statement
+# entry; here we only chase expression operands.
+def cse_descend(node: uint32):
+    k: uint32 = nd_kind[node]
+    # ND_IDENT / literals have no expression children.
+    if k == ND_IDENT or k == ND_INT_LIT:
+        return
+    cse_collect(nd_a[node])
+    cse_collect(nd_b[node])
+    cse_collect(nd_c[node])
+    cse_collect(nd_d[node])
+
+
+# Rewrite, within the AST subtree rooted at `root`, EVERY occurrence whose
+# value-IR equals `proto_ir` into an ND_IDENT(off,len). Returns the count of
+# occurrences rewritten. Each candidate's IR was built under its own ir_reset,
+# so we rebuild the subtree's IR here to compare; but since we only ever call
+# this for nodes already in the candidate list, we compare via the recorded
+# candidate IRs to avoid clobbering proto_ir's arena.
+def cse_apply(root: uint32, proto_ir: uint32, off: uint32, len_: uint32) -> uint32:
+    n: uint32 = 0
+    i: uint32 = 0
+    while i < cse_cand_n:
+        ast: uint32 = cse_cand_ast[i]
+        if ast != 0 and nd_kind[ast] == ND_BINARY:
+            if ir_value_eq(cse_cand_ir[i], proto_ir) != 0:
+                # Before clobbering this subtree into an ident, kill every
+                # candidate whose AST lies WITHIN it (its nodes are about to be
+                # orphaned) so we never double-rewrite a nested sub-part.
+                cse_kill_descendants(ast)
+                cse_rewrite_to_ident(ast, off, len_)
+                cse_cand_ast[i] = 0
+                n = n + 1
+        i = i + 1
+    return n
+
+
+# Null every candidate entry whose AST node is a descendant of `ast` (children
+# of an ND_BINARY are nd_a/nd_b). Called before `ast` is collapsed to an ident.
+def cse_kill_descendants(ast: uint32):
+    if ast == 0:
+        return
+    if nd_kind[ast] != ND_BINARY:
+        return
+    cse_kill_subtree(nd_a[ast])
+    cse_kill_subtree(nd_b[ast])
+
+
+def cse_kill_subtree(node: uint32):
+    if node == 0:
+        return
+    m: uint32 = 0
+    while m < cse_cand_n:
+        if cse_cand_ast[m] == node:
+            cse_cand_ast[m] = 0
+        m = m + 1
+    if nd_kind[node] == ND_BINARY:
+        cse_kill_subtree(nd_a[node])
+        cse_kill_subtree(nd_b[node])
+
+
+# Run CSE over a single statement's expression `expr_root`. Materializes the
+# FIRST repeated pure binop value into a temp, rewrites all its occurrences,
+# and records the temp decl in cse_pend_* for the caller to splice in. May fire
+# multiple times (one temp per distinct repeated value). Returns nothing; side
+# effects are the rewrites + pended decls + opt_cse_count bump.
+def cse_statement_expr(expr_root: uint32):
+    if expr_root == 0:
+        return
+    cse_cand_n = 0
+    ir_reset()                 # one shared arena for ALL candidates of this stmt
+    cse_collect(expr_root)
+    # For each candidate (outermost-first), if another LATER live candidate has
+    # an equal value, this is a repeated expression: materialize it. Outermost-
+    # first means we capture the largest redundant expression, and cse_apply's
+    # nested-invalidation prevents re-CSE of its sub-parts.
+    i: uint32 = 0
+    while i < cse_cand_n:
+        ast_i: uint32 = cse_cand_ast[i]
+        if ast_i != 0 and nd_kind[ast_i] == ND_BINARY:
+            # Is there a later live candidate value-equal to this one?
+            dup: uint32 = 0
+            j: uint32 = i + 1
+            while j < cse_cand_n:
+                aj: uint32 = cse_cand_ast[j]
+                if aj != 0 and nd_kind[aj] == ND_BINARY:
+                    if ir_value_eq(cse_cand_ir[j], cse_cand_ir[i]) != 0:
+                        dup = 1
+                        j = cse_cand_n
+                    else:
+                        j = j + 1
+                else:
+                    j = j + 1
+            if dup != 0:
+                # Materialize: mint a temp, build its decl with the ORIGINAL
+                # (pre-rewrite) expression as initialiser, then rewrite every
+                # occurrence (incl. this one) to read the temp.
+                cse_mint_temp_name()
+                toff: uint32 = opt_tmp_name_off
+                tlen: uint32 = opt_tmp_name_len
+                # Clone the defining expression for the temp init. We use the
+                # FIRST occurrence's AST node as the init by detaching it: build
+                # the decl pointing at a COPY is unnecessary because we rewrite
+                # the first occurrence to an ident AFTER capturing it as init.
+                # So: decl init = the first occurrence's current subtree.
+                init_node: uint32 = ast_i
+                # Rewrite all occurrences EXCEPT we must preserve init_node's
+                # subtree as the decl initialiser. cse_apply rewrites ast_i too,
+                # so first snapshot init by making the decl reference a shallow
+                # clone of ast_i.
+                clone: uint32 = cse_clone_expr(ast_i)
+                if clone == 0:
+                    return
+                d: uint32 = cse_make_temp_decl(toff, tlen, clone)
+                if d == 0:
+                    return
+                cnt: uint32 = cse_apply(expr_root, cse_cand_ir[i], toff, tlen)
+                if cnt >= 2:
+                    if cse_pend_n < CSE_MAX_PEND:
+                        cse_pend_decl[cse_pend_n] = d
+                        cse_pend_n = cse_pend_n + 1
+                    # Each of the cnt occurrences but the first is an eliminated
+                    # recomputation.
+                    opt_cse_count = opt_cse_count + (cnt - 1)
+        i = i + 1
+
+
+# Deep-clone a pure expression subtree (ND_BINARY over ident/const leaves) into
+# fresh AST nodes, so the temp's initialiser is independent of the in-place
+# rewrites applied to the original occurrences. Returns 0 on arena exhaustion.
+def cse_clone_expr(node: uint32) -> uint32:
+    if node == 0:
+        return 0
+    k: uint32 = nd_kind[node]
+    c: uint32 = node_new(k)
+    if c == 0:
+        return 0
+    nd_aux[c] = nd_aux[node]
+    nd_num[c] = nd_num[node]
+    nd_name_off[c] = nd_name_off[node]
+    nd_name_len[c] = nd_name_len[node]
+    if k == ND_BINARY:
+        nd_a[c] = cse_clone_expr(nd_a[node])
+        nd_b[c] = cse_clone_expr(nd_b[node])
+    return c
+
+
+# Expression roots of a statement: the slots that hold a top-level expression
+# whose value we may CSE. We deliberately handle only statements whose
+# expression is a self-contained pure region; assignment TARGETS and impure
+# constructs are left alone (their value IR won't lower anyway).
+def cse_stmt_expr_roots(stmt: uint32):
+    k: uint32 = nd_kind[stmt]
+    if k == ND_RETURN:
+        cse_statement_expr(nd_a[stmt])
+    elif k == ND_EXPR_STMT:
+        cse_statement_expr(nd_a[stmt])
+    elif k == ND_ASSIGN:
+        # Only the VALUE side (nd_b); the target (nd_a) is an lvalue.
+        cse_statement_expr(nd_b[stmt])
+    elif k == ND_VAR_DECL:
+        cse_statement_expr(nd_b[stmt])
+    elif k == ND_WHILE:
+        cse_statement_expr(nd_a[stmt])
+    elif k == ND_DO_WHILE:
+        cse_statement_expr(nd_a[stmt])
+    elif k == ND_IF:
+        cse_statement_expr(nd_a[stmt])
+
+
+# CSE one statement-chain (a block). Returns the (possibly new) head with any
+# temp decls spliced in immediately before the statements that use them. Also
+# recurses into nested block bodies (if/while/for/elif) AFTER processing the
+# statement itself.
+def cse_block(head: uint32) -> uint32:
+    new_head: uint32 = head
+    prev: uint32 = 0
+    s: uint32 = head
+    while s != 0:
+        nxt: uint32 = nd_next[s]
+        # Process this statement's expression for CSE; pended temp decls accrue
+        # in cse_pend_*.
+        cse_pend_n = 0
+        cse_stmt_expr_roots(s)
+        # Splice pended decls in BEFORE s (in mint order), so codegen computes
+        # the temp before the statement that reads it.
+        if cse_pend_n > 0:
+            pi: uint32 = 0
+            while pi < cse_pend_n:
+                d: uint32 = cse_pend_decl[pi]
+                if prev == 0:
+                    new_head = d
+                else:
+                    nd_next[prev] = d
+                nd_next[d] = s
+                prev = d
+                pi = pi + 1
+        # Recurse into nested blocks.
+        k: uint32 = nd_kind[s]
+        if k == ND_IF:
+            nd_b[s] = cse_block(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                nd_b[e] = cse_block(nd_b[e])
+                e = nd_next[e]
+            nd_d[s] = cse_block(nd_d[s])
+        elif k == ND_WHILE:
+            nd_b[s] = cse_block(nd_b[s])
+        elif k == ND_DO_WHILE:
+            nd_b[s] = cse_block(nd_b[s])
+        elif k == ND_FOR:
+            nd_b[s] = cse_block(nd_b[s])
+        prev = s
+        s = nxt
+    return new_head
+
+
+def opt_cse_function(fn: uint32):
+    # The function body chain hangs off nd_c (ND_FUNCTION: c = body chain head).
+    nd_c[fn] = cse_block(nd_c[fn])

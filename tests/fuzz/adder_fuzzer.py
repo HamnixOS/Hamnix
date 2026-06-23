@@ -1222,6 +1222,8 @@ _AD_WORK = None          # work dir for the codegen.ad ELFs
 ADDER_OPT = os.environ.get("ADDER_OPT", "0") not in ("", "0", "off", "false")
 _AD_OPT_FOLDS_TOTAL = 0   # running fold count across the ADDER_OPT=1 lane
 _AD_OPT_PROGS_FOLDED = 0  # programs in which >=1 fold fired
+_AD_OPT_CSE_TOTAL = 0     # running CSE-elimination count across the lane
+_AD_OPT_PROGS_CSE = 0     # programs in which >=1 CSE elimination fired
 
 
 def _ad_host():
@@ -1243,6 +1245,7 @@ def run_through_ad_codegen(seed, body):
     its fold count accumulated; the (stdout, exit) returned must still match
     the oracle (caller asserts correctness)."""
     global _AD_OPT_FOLDS_TOTAL, _AD_OPT_PROGS_FOLDED
+    global _AD_OPT_CSE_TOTAL, _AD_OPT_PROGS_CSE
     host = _ad_host()
     r = host.run_through_codegen_ad(seed, body, _AD_WORK, opt=ADDER_OPT)
     if r.kind == "unsupported":
@@ -1253,6 +1256,10 @@ def run_through_ad_codegen(seed, body):
             _AD_OPT_FOLDS_TOTAL += f
             if f > 0:
                 _AD_OPT_PROGS_FOLDED += 1
+            c = int(getattr(r, "cse", 0) or 0)
+            _AD_OPT_CSE_TOTAL += c
+            if c > 0:
+                _AD_OPT_PROGS_CSE += 1
         return ("ok", r.stdout, r.exit)
     return ("__ad_error__", r.kind, r.detail)
 
@@ -1341,6 +1348,109 @@ def check_one(seed):
 
 
 # --------------------------------------------------------------------------
+# Phase-2 CSE corpus. Hand-written programs with REPEATED non-constant pure
+# subexpressions (the kind local CSE/value-numbering targets), each computing a
+# known value. Run through codegen.ad WITH --opt; the optimized output must
+# match the Python-computed oracle AND the CSE pass must fire. The repeated
+# subexpressions are over the signedness-invariant 64-bit op set (ADD/SUB/MUL/
+# AND/OR/XOR/SHL) over parameters/locals — exactly the CSE-safe leaf set.
+# --------------------------------------------------------------------------
+def _cse_corpus():
+    """Return a list of (name, body, expected_stdout, expected_exit)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, decls_and_main, val):
+        # val = the uint64 g_accum the program prints; exit = val & 255.
+        body = PRELUDE + "\n" + decls_and_main
+        progs.append((name, body, str(val & M), (val & 255)))
+
+    # 1) Same product appears twice in one expression: (a*b) + (a*b).
+    a, b = 6, 7
+    v = (a * b) + (a * b)
+    prog("dup_mul_add",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: uint64 = cast[uint64]({a})\n"
+         f"    b: uint64 = cast[uint64]({b})\n"
+         "    g_accum = (a * b) + (a * b)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
+    # 2) Repeated sum subexpression three times: (a+b) ^ (a+b) ^ (a+b).
+    a, b = 0x1234, 0x9abc
+    s = (a + b) & M
+    v = (s ^ s ^ s) & M
+    prog("dup_add_xor3",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: uint64 = cast[uint64]({a})\n"
+         f"    b: uint64 = cast[uint64]({b})\n"
+         "    g_accum = ((a + b) ^ (a + b)) ^ (a + b)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
+    # 3) Nested repeated subexpression: ((a*b)+c) twice -> the inner (a*b) AND
+    #    the outer ((a*b)+c) both recur; CSE should pick the maximal one.
+    a, b, c = 3, 5, 9
+    t = ((a * b) + c) & M
+    v = (t + t) & M
+    prog("dup_nested",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: uint64 = cast[uint64]({a})\n"
+         f"    b: uint64 = cast[uint64]({b})\n"
+         f"    c: uint64 = cast[uint64]({c})\n"
+         "    g_accum = ((a * b) + c) + ((a * b) + c)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
+    # 4) Repeated shift-and-or in a return expression over parameters. Both the
+    #    shift amount and base are IDENT leaves (CSE-safe), so (x << s) recurs.
+    a, sft = 0xff, 3
+    sh = ((a << sft) | (a << sft)) & M
+    v = sh & M
+    prog("dup_shl_or",
+         "def compute(x: uint64, s: uint64) -> uint64:\n"
+         "    return (x << s) | (x << s)\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = compute(cast[uint64]({a}), cast[uint64]({sft}))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
+    return progs
+
+
+def _run_cse_corpus():
+    """Run the CSE corpus through codegen.ad with --opt. Returns
+    (all_correct_and_fired, total_cse_eliminations)."""
+    host = _ad_host()
+    total_cse = 0
+    all_ok = True
+    for (name, body, exp_out, exp_exit) in _cse_corpus():
+        r = host.run_through_codegen_ad(f"cse_{name}", body, _AD_WORK, opt=True)
+        if r.kind != "ok":
+            all_ok = False
+            print(f"  [CSE corpus '{name}'] codegen.ad {r.kind}: {r.detail[:120]}")
+            continue
+        c = int(getattr(r, "cse", 0) or 0)
+        total_cse += c
+        if r.stdout != exp_out or r.exit != exp_exit:
+            all_ok = False
+            print(f"  [CSE corpus '{name}'] MISCOMPILE opt=("
+                  f"{r.stdout},{r.exit}) oracle=({exp_out},{exp_exit}) cse={c}")
+        elif c == 0:
+            all_ok = False
+            print(f"  [CSE corpus '{name}'] correct but CSE NEVER FIRED")
+    # The corpus only passes if every program was correct AND the pass fired at
+    # least once across it.
+    if total_cse == 0:
+        all_ok = False
+    return (all_ok, total_cse)
+
+
+# --------------------------------------------------------------------------
 # Differential batch driver for the self-hosted codegen.ad backend.
 # --------------------------------------------------------------------------
 def _run_ad_codegen_batch(base, args):
@@ -1407,6 +1517,8 @@ def _run_ad_codegen_batch(base, args):
         print(f"--- ADDER_OPT=1 native-optimizer correctness lane ---")
         print(f"  const-folds fired (total):  {_AD_OPT_FOLDS_TOTAL}")
         print(f"  programs with >=1 fold:     {_AD_OPT_PROGS_FOLDED}")
+        print(f"  CSE eliminations (total):   {_AD_OPT_CSE_TOTAL}")
+        print(f"  programs with >=1 CSE:      {_AD_OPT_PROGS_CSE}")
         print(f"  (above CORRECT count already asserts opt output == oracle)")
         # The lane only proves anything if the pass DEMONSTRABLY fired. If the
         # whole batch produced zero folds the optimizer wasn't exercised, which
@@ -1414,6 +1526,17 @@ def _run_ad_codegen_batch(base, args):
         if accepted > 0 and _AD_OPT_FOLDS_TOTAL == 0:
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] optimizer never fired across the batch")
+        # Phase-2 dedicated CSE corpus: the random batch above rarely emits
+        # repeated NON-constant subexpressions, so we run a hand-written corpus
+        # of repeated-pure-binop programs through codegen.ad (--opt) and assert
+        # (a) the optimized output is correct vs a computed oracle AND (b) the
+        # CSE pass demonstrably fired (>=1 elimination across the corpus).
+        cse_ok, cse_elims = _run_cse_corpus()
+        print(f"--- ADDER_OPT=1 CSE corpus ---")
+        print(f"  corpus CSE eliminations:    {cse_elims}")
+        if not cse_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] CSE corpus miscompiled or never fired")
     for (s, detail) in mis[:10]:
         print(f"  [miscompile] seed={s}: {detail[:160]}")
         print(f"        repro: ADDER_FUZZ_DIFF_TARGET=ad-codegen "
