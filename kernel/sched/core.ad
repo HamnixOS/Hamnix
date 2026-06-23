@@ -86,7 +86,7 @@ from kernel.panic import panic
 # child's PML4 so the stack does not depend on the identity-backfill
 # leaves being US=1. Unblocks _build_identity_pd/_pt going US=0 and
 # CR4.SMAP enable in arch/x86/kernel/cpu_mitigations.ad.
-from fs.elf import elf_install_user_stack
+from fs.elf import elf_install_user_stack, elf_install_user_mapping
 from mm.vma import vma_restore_kernel_identity_range
 # RCU (kernel/rcu/rcu.ad): the scheduler is the primary quiescent-state (QS)
 # source — a real context switch on a CPU is a QS for that CPU iff it is not
@@ -121,6 +121,11 @@ extern def tss_set_rsp0(rsp0: uint64)
 # + SYS_EXIT) used by smp_user_ap_selftest() to prove a USER task runs on
 # a non-BSP CPU through that CPU's own per-CPU TSS. Body in syscall_64.S.
 extern def smp_user_probe_entry()
+# Marks the byte just past the probe's inline banner — the selftest copies
+# the [smp_user_probe_entry, smp_user_probe_end) span (code + inline banner)
+# into a US=1 user page so a CPL3 task can actually fetch it (kernel .text is
+# US=0). Defined in syscall_64.S right after the banner.
+extern def smp_user_probe_end()
 extern def local_irq_disable()
 extern def local_irq_enable()
 # Atomic sti;hlt — the idle CPU's race-free wait primitive (Linux's
@@ -203,7 +208,18 @@ SCHED_IA32_FS_BASE: uint32 = 0xC0000100
 
 class TaskStruct:
     sp:           uint64       # offset  0: saved %rsp on context switch
-    pid:          uint64       # offset  8: logical id
+    # offset 8: SMP context-switch handshake (Linux's rq->curr->on_cpu).
+    # schedule() sets on_cpu=1 on the OUTGOING task BEFORE it drops the rq
+    # lock, and __switch_to_asm clears it to 0 the instant AFTER it stores
+    # prev->sp (offset 0). _sched_try_pull_locked refuses to steal any task
+    # with on_cpu != 0. This closes the steal-window race: between schedule()
+    # marking prev STATE_READY + dropping the lock and __switch_to_asm
+    # actually saving prev->sp, prev's sp slot is STALE; without this flag an
+    # idle AP could steal prev and dispatch it on that stale sp (garbage
+    # resume rip -> silent wedge/triple-fault). on_cpu==1 fences that window.
+    # ASM CONTRACT: this MUST stay at byte offset 8 (sched_asm.S writes 8(%rdi)).
+    on_cpu:       uint64       # offset  8: 1 while prev may be mid-switch
+    pid:          uint64       # offset 16: logical id
     kstack_base:  uint64       # offset 16: bottom of this task's kstack
     kstack_top:   uint64       # offset 24: top (high addr); fed to TSS.RSP0
     ustack_base:  uint64       # offset 32: bottom of user stack (0 for kernel)
@@ -3011,6 +3027,9 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     task_table[s].kstack_base = kstack
     task_table[s].kstack_top  = kstack_top
     task_table[s].ustack_base = 0
+    # SMP steal-window: a freshly-built task is NOT mid-switch, so it must
+    # start with on_cpu=0 (a recycled STATE_FREE slot may hold a stale 1).
+    task_table[s].on_cpu      = 0
     # RACE FIX (mirrors create_user_thread): do NOT publish the slot as
     # STATE_READY until cr3 + all fd/signal fields are initialized at the
     # end of the function. The slot stays STATE_FREE (invisible to
@@ -3262,6 +3281,9 @@ def create_user_thread(entry: uint64, name0: uint64,
     task_table[s].cont_pending = 0
     task_table[s].kstack_base = kstack
     task_table[s].kstack_top  = kstack_top
+    # SMP steal-window: fresh task is not mid-switch; clear any stale on_cpu
+    # left in a recycled STATE_FREE slot before it can become stealable.
+    task_table[s].on_cpu      = 0
     task_table[s].ustack_base = ustack
     # NOTE: state is DELIBERATELY NOT set to STATE_READY here. The slot
     # stays STATE_FREE (as returned by _find_free_slot) until the very
@@ -3812,23 +3834,21 @@ def _sched_try_pull_locked(my_cpu: uint64) -> int32:
                 # of scanning all NTASKS slots.
                 s: uint64 = rq_head[v]
                 while s != RQL_NIL:
-                    # #413: an AP may work-steal only KERNEL tasks (is_user==0),
-                    # never USER (CPL3) tasks. Cross-CPU dispatch of a user task
-                    # onto an AP (its own per-CPU TSS.RSP0 + private CR3 + the
-                    # SYSRETQ/IRETQ-to-ring3 path) currently faults — the boot
-                    # silently triple-faults a couple of rc.boot commands in
-                    # once an AP picks up a forked user task (no #PF/#GP/#DF
-                    # banner; QEMU exits under -no-reboot). That path had NO
-                    # prior coverage: the PID-1 boot-steal race always crashed
-                    # the boot before any AP user-dispatch could occur, so it
-                    # was never exercised until that race was fixed. Until the
-                    # AP CPL3-dispatch path is repaired (tracked: see
-                    # test_smp_user.sh, which fails the same way), keep user
-                    # tasks BSP-only by refusing to steal them — restoring the
-                    # historical "_pick_next skipped user tasks on APs" safety.
-                    # Kernel-task work-stealing (the #151 sched_fair balance
-                    # path) is unaffected.
-                    if s != 0 and task_table[s].is_user == 0 \
+                    # Cross-CPU load balancing of USER (CPL3) tasks is ENABLED:
+                    # an AP dispatches a stolen user task through its OWN
+                    # per-CPU TSS.RSP0 + private CR3 + SYSCALL MSRs (all armed in
+                    # ap_main_hamnix) and the AP idle loop's dispatch prologue
+                    # (tss_set_rsp0 / load_cr3 / FS_BASE), exactly mirroring the
+                    # BSP. The historical "#413: APs may steal only is_user==0"
+                    # skip was a WORKAROUND for a probe whose entry lived in
+                    # US=0 kernel .text and #PF'd on the CPL3 instruction fetch
+                    # (err=0x15); that was never an AP per-CPU defect. Real user
+                    # tasks are ELF-loaded into US=1 pages, so they dispatch on
+                    # any CPU. Verified by test_smp_user.sh (USER task runs +
+                    # syscalls on cpu1). Only slot 0 (the BSP boot/PID-1 task)
+                    # stays pinned — it must never migrate off cpu 0.
+                    if s != 0 \
+                            and task_table[s].on_cpu == 0 \
                             and sched_cpu_allowed(s, my_cpu) != 0:
                         sv: uint64 = task_table[s].vruntime
                         if steal < 0 or sv < steal_v:
@@ -3850,6 +3870,52 @@ def _sched_try_pull_locked(my_cpu: uint64) -> int32:
                 _rq_unlock_cpu(v)
         v = v + 1
     return -1
+
+
+def _sched_switch_to_ap_idle(my_cpu: uint64, ap_idle: uint64):
+    # Switch the CURRENT (non-runnable) task on an AP onto that AP's idle
+    # slot. Used by schedule() when an AP's current task is EXITED (or asleep
+    # in STATE_WAIT/STOPPED) and there is no other runnable work to dispatch:
+    # we must NOT return into the non-runnable task, so we hand the CPU to its
+    # idle kthread which HLTs until a reschedule IPI / steal brings work.
+    #
+    # Mirrors the switch tail of schedule(): mark prev appropriately (it is
+    # ALREADY non-RUNNING — EXITED/WAIT/STOPPED — so we do NOT re-mark it
+    # READY or re-link it onto a run-list; a dead task must stay off, and a
+    # WAIT task is parked on its wait-queue), make idle RUNNING, set RSP0 /
+    # CR3 / FS_BASE for idle, raise the on_cpu steal fence on prev, then
+    # __switch_to_asm. Called with NO rq lock held.
+    prev: uint64 = current_idx_pcpu
+    _rq_lock_cpu(my_cpu)
+    # The idle slot may be sitting READY on this CPU's run-list (the idle loop
+    # links it before dispatching real work); pull it off and make it RUNNING.
+    _rq_list_remove(ap_idle)
+    task_table[ap_idle].state  = STATE_RUNNING
+    task_table[ap_idle].rq_cpu = my_cpu
+    current_idx_pcpu = ap_idle
+    # Steal-window fence on prev: its sp is saved by __switch_to_asm below.
+    # (A dead/parked task is not on a run-list so it is not actually
+    # stealable, but raise the fence for uniformity; __switch_to_asm clears
+    # it after the sp store.)
+    task_table[prev].on_cpu = 1
+    task_table[ap_idle].on_cpu = 0
+    _rq_unlock_cpu(my_cpu)
+
+    # RCU quiescent state: the outgoing (dead/parked) task holds no reader.
+    _rcu_prev_nest: uint64 = rcu_save_read_nesting()
+    task_table[prev].rcu_read_nesting = _rcu_prev_nest
+    if _rcu_prev_nest == 0:
+        rcu_note_context_switch()
+    rcu_restore_read_nesting(task_table[ap_idle].rcu_read_nesting)
+
+    # Switch tail: idle's kstack RSP0, idle's (kernel) CR3 if different, FS.
+    tss_set_rsp0(task_table[ap_idle].kstack_top)
+    if task_table[ap_idle].cr3 != task_table[prev].cr3:
+        load_cr3(task_table[ap_idle].cr3)
+    write_msr(SCHED_IA32_FS_BASE, task_table[ap_idle].fs_base)
+
+    __switch_to_asm(cast[Ptr[uint8]](&task_table[prev]),
+                    cast[Ptr[uint8]](&task_table[ap_idle]))
 
 
 def schedule():
@@ -3901,13 +3967,39 @@ def schedule():
         # task.
         if task_table[current_idx_pcpu].state != STATE_RUNNING and \
            task_table[current_idx_pcpu].state != STATE_READY:
-            _rq_unlock_cpu(my_cpu)
-            # An AP whose LOCAL runqueue drained is NOT a system-halt
-            # condition — it just returns to its idle loop and HLTs until a
-            # reschedule IPI brings (or it steals) work. Halting the box from
-            # an AP here would wrongly kill a system that still has runnable
-            # work on the BSP.
+            # An AP whose current task is no longer runnable (EXITED after
+            # SYS_EXIT, or asleep in STATE_WAIT/STOPPED) MUST NOT `return`
+            # here: the caller (task_exit_current / a blocking syscall) is
+            # relying on schedule() to switch the dead/sleeping task OFF the
+            # CPU and never resume it on this stack. Returning resumes the
+            # non-runnable task past its schedule() call — for an EXITED task
+            # that means executing with its fds closed / address space torn
+            # down, which silently wedges the box (observed: rc.boot user
+            # commands stolen onto the AP exiting -> hang right after the
+            # "task: pid N exited" printk). The historical `if my_cpu != 0:
+            # return` was safe ONLY while APs never ran user tasks (they ran
+            # the idle kthread, which is always STATE_RUNNING and legitimately
+            # returns to its own loop). Now that user tasks load-balance onto
+            # APs, we must SWITCH to this AP's idle slot (which HLTs until a
+            # reschedule IPI / steal brings work) instead of returning into a
+            # dead task. The idle slot is always present and runnable.
             if my_cpu != 0:
+                ap_idle: uint64 = ap_idle_slots[my_cpu]
+                # If we ARE the idle slot (idle kthread itself yielded with no
+                # work), the legacy return is correct — it loops back into
+                # sched_ap_idle_loop which HLTs.
+                if ap_idle == current_idx_pcpu:
+                    _rq_unlock_cpu(my_cpu)
+                    return
+                # Switch the non-runnable task OFF onto this AP's idle slot.
+                # _sched_switch_to_ap_idle does the full switch tail (RSP0 /
+                # CR3 / FS_BASE / on_cpu fence / __switch_to_asm) under no held
+                # lock, so release the rq lock first.
+                _rq_unlock_cpu(my_cpu)
+                _sched_switch_to_ap_idle(my_cpu, ap_idle)
+                # We only get here if the (now-idle) task is later switched
+                # BACK in — but a dead task never is, and a STATE_WAIT task
+                # resumes via its own wait-loop, not here. Return is safe.
                 return
             # On the BSP: the current task is no longer runnable (it exited /
             # was reaped / stopped) so we MUST switch away and never resume
@@ -4014,6 +4106,17 @@ def schedule():
     if task_table[prev].state == STATE_READY and task_table[prev].rq_cpu != my_cpu:
         prev_migrated_to = cast[int64](task_table[prev].rq_cpu)
     current_idx_pcpu = nxt
+
+    # SMP steal-window fence: prev is about to become observable as
+    # STATE_READY on a run-list once we drop the lock, but its sp slot is
+    # NOT updated until __switch_to_asm runs (below). Raise on_cpu so a
+    # concurrent _sched_try_pull_locked on another CPU refuses to steal prev
+    # until __switch_to_asm has saved prev->sp and cleared this flag. Set it
+    # UNDER the lock, before the unlock, so the fence is published before
+    # prev can be seen. (nxt is being dispatched here; clear its on_cpu so a
+    # later steal of nxt after IT yields isn't spuriously blocked.)
+    task_table[prev].on_cpu = 1
+    task_table[nxt].on_cpu = 0
 
     _rq_unlock_cpu(my_cpu)
 
@@ -4409,6 +4512,16 @@ def task_exit_current(code: int64):
         _free_list_push(current_idx_pcpu)
         schedule()
         return
+    # SMP reap fence: raise on_cpu=1 BEFORE publishing STATE_EXITED. A parent
+    # reaping this zombie (task_reap) MUST NOT free our kstack while we are
+    # still executing our final schedule() on it (we run on an AP; the parent
+    # waits/reaps on another CPU). on_cpu stays 1 across the schedule() switch
+    # tail until __switch_to_asm has saved our (now-dead) sp and switched to
+    # the next task — the instant we are irrevocably off this kstack. task_reap
+    # spins on on_cpu==0 before reclaiming the kstack. Set on_cpu BEFORE the
+    # STATE_EXITED store so the reaper, which gates on STATE_EXITED, can never
+    # observe EXITED with a stale on_cpu==0.
+    task_table[current_idx_pcpu].on_cpu = 1
     task_table[current_idx_pcpu].state = STATE_EXITED
     printk_set_level(PRINTK_LEVEL_NOTICE)
     printk2("task: pid %d exited (code=%d)\n",
@@ -4447,10 +4560,13 @@ def task_exit_current(code: int64):
 #            kernel task runnable; Linux's smp_send_reschedule model).
 #
 # Safety invariants:
-#   • APs NEVER pick user tasks (is_user != 0): those require per-AP TSS
-#     setup that is not yet in place.
-#   • APs NEVER call tss_set_rsp0: schedule() already gates that on
-#     get_cpu_id() == 0.
+#   • APs CAN pick user tasks (is_user != 0): each AP has its own per-CPU
+#     TSS (ltr'd in ap_main_hamnix) whose RSP0 the dispatch prologue below
+#     points at the task's kstack, plus its own SYSCALL MSRs, so a ring3->
+#     ring0 transition on the AP lands correctly. User tasks load-balance
+#     across CPUs; only slot 0 (BSP boot task) stays pinned.
+#   • The AP dispatch prologue below DOES call tss_set_rsp0 (it indexes the
+#     calling CPU's own per_cpu_tss via %gs:0), mirroring schedule()'s.
 #   • rq_lock hold time is bounded (microsecond-scale): only the scan +
 #     state updates are inside the critical section, not the switch itself.
 #   • BSP uniprocessor path is IDENTICAL to before this patch: the lock
@@ -4525,6 +4641,12 @@ def sched_ap_idle_loop():
             #     reloads the idle kthread's (kernel) CR3 via the same guard,
             #     so no CR3 fix-up is needed after __switch_to_asm returns.
             #   • FS_BASE -> this task's TLS base (0 for native/kernel tasks).
+            # SMP steal-window fence (same as schedule()): the idle slot is
+            # now READY on this CPU's run-list but its sp won't be saved until
+            # __switch_to_asm below. Raise on_cpu so no other AP steals the
+            # idle slot on a stale sp; __switch_to_asm clears it after the save.
+            task_table[my_idle_slot].on_cpu = 1
+            task_table[nxt].on_cpu = 0
             tss_set_rsp0(task_table[nxt].kstack_top)
             if task_table[nxt].cr3 != task_table[my_idle_slot].cr3:
                 load_cr3(task_table[nxt].cr3)
@@ -5979,6 +6101,19 @@ def task_reap(slot: int32):
     # never on the child's own stack — so freeing the child's stacks
     # here is safe.
     su: uint64 = cast[uint64](slot)
+    # SMP reap fence: with user tasks load-balanced across CPUs, the zombie
+    # we are about to reclaim may have run (and EXITED) on a DIFFERENT cpu
+    # than this reaping parent. task_exit_current raises the zombie's on_cpu
+    # to 1 before it publishes STATE_EXITED, and __switch_to_asm clears it the
+    # instant the zombie is switched OFF its kstack for the last time. We must
+    # NOT free that kstack while the zombie is still executing its final
+    # schedule() on it (observed: rc.boot user command exits on the AP, the
+    # BSP parent reaps it and frees the kstack out from under the AP -> buddy
+    # free-list corruption / silent wedge). Spin until on_cpu==0; this is a
+    # microsecond-scale wait (just the AP's switch tail). On UP / same-cpu
+    # reap on_cpu is already 0 so this falls straight through.
+    while task_table[su].on_cpu != 0:
+        cpu_relax()
     # Child-resource accounting (Linux RUSAGE_CHILDREN / wait()-time roll-up).
     # task_reap runs in the PARENT's context with the child fully STATE_EXITED,
     # so this is THE site to fold the dying child's CPU ticks + page-fault
@@ -9670,16 +9805,40 @@ def smp_user_ap_selftest():
     # create_user_task (CPL3 task with its own PML4 + user stack).
     sched_ap_steal_enabled = 0
     smp_user_probe_done = 0
+    # The probe body lives in kernel .text, which is US=0 (W^X/SMEP restamps
+    # every high-half leaf supervisor-only), so a CPL3 task cannot fetch it
+    # at its kernel VA — that is the #PF (err=0x15: P|U|I-fetch) the bare
+    # &smp_user_probe_entry entry hit. Copy the self-contained, PIC
+    # [smp_user_probe_entry, smp_user_probe_end) span (code + inline banner)
+    # into a fresh page and map it US=1 (read-only, executable: extra_flags=0)
+    # at a low user VA in the task's PML4, then start the task THERE.
+    pe: uint64 = cast[uint64](&smp_user_probe_entry)
+    pend: uint64 = cast[uint64](&smp_user_probe_end)
+    blob_len: uint64 = pend - pe
+    SMP_USER_PROBE_VA: uint64 = 0x600000          # low user VA, 4 KiB aligned
+    code_page: uint64 = alloc_page()
+    if code_page == 0:
+        printk0("[smp_user] FAIL: OOM allocating probe code page\n")
+        return
+    memcpy(cast[Ptr[uint8]](code_page), cast[Ptr[uint8]](pe), blob_len)
     _wq_lock_irq()
-    uslot: int32 = create_user_task(cast[uint64](&smp_user_probe_entry), 0)
+    uslot: int32 = create_user_task(SMP_USER_PROBE_VA, 0)
     if uslot >= 0:
         task_table[cast[uint64](uslot)].detached = 1
+        # Overlay the US=1 executable code page at SMP_USER_PROBE_VA in the
+        # probe task's private PML4. extra_flags=0 -> read-only + executable
+        # (no PT_FLAG_RW, no PT_FLAG_NX) US=1 leaf.
+        if elf_install_user_mapping(task_table[cast[uint64](uslot)].cr3,
+                                    SMP_USER_PROBE_VA,
+                                    SMP_USER_PROBE_VA + 4096,
+                                    code_page, 0) < 0:
+            printk0("[smp_user] FAIL: could not map probe code US=1\n")
     _wq_unlock_irq()
     if uslot < 0:
         printk0("[smp_user] FAIL: could not create user probe task\n")
         return
     us: uint64 = cast[uint64](uslot)
-    printk1("[smp_user] user probe task @ slot %d (is_user=%d)\n", us)
+    printk1("[smp_user] user probe task @ slot %d\n", us)
 
     # Phase 2: hand it to the AP. Enable steal, kick the AP out of HLT, and
     # spin-poll WITHOUT scheduling on the BSP so only the AP can run it.

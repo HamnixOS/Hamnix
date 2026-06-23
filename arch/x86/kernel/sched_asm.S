@@ -56,6 +56,13 @@ __switch_to_asm:
     pushq   %r15
 
     movq    %rsp, 0(%rdi)              /* prev->sp = current rsp     */
+    /* SMP steal-window handshake: prev->sp is now SAVED and consistent, so
+     * prev is safe for another CPU to steal + dispatch. Clear prev->on_cpu
+     * (byte offset 8) to release the fence schedule() raised before it
+     * dropped the rq lock. Ordering: this store FOLLOWS the sp store above,
+     * so any CPU that observes on_cpu==0 also observes the fresh sp (x86's
+     * TSO keeps these two stores in program order, visible in order). */
+    movq    $0, 8(%rdi)               /* prev->on_cpu = 0 (sp now valid) */
     movq    0(%rsi), %rsp              /* rsp = next->sp             */
 
     popq    %r15

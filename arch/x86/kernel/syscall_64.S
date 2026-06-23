@@ -463,6 +463,17 @@ user_demo_entry:
  * Kept deliberately syscall-light (no open/read of files) so the proof
  * exercises exactly the ring3->ring0 transition the per-CPU TSS enables,
  * with no dependency on a per-task fd table.                            */
+    /* This block is POSITION-INDEPENDENT and SELF-CONTAINED: the code,
+     * its inline banner string, and the end marker all live contiguously
+     * in .text. smp_user_ap_selftest() copies the whole
+     * [smp_user_probe_entry, smp_user_probe_end) span into a fresh page
+     * that it maps US=1 (CPL3-executable) at a low user VA, then starts
+     * the task there. Kernel .text is US=0 (W^X / SMEP hardening restamps
+     * every high-half leaf supervisor-only), so a CPL3 task can NOT fetch
+     * from the kernel VA of this symbol — it must run from the US=1 copy.
+     * Everything here is %rip-relative or immediate, so it executes
+     * correctly from ANY load address. The banner ref uses leaq(%rip), so
+     * once the block is relocated the banner address tracks the copy. */
     .align 16
     .globl smp_user_probe_entry
 smp_user_probe_entry:
@@ -476,7 +487,9 @@ smp_user_probe_entry:
     decq    %rcx
     jnz     .Lspin_probe
 
-    /* SYS_WRITE(2, banner, len) — stderr, via the AP's per-CPU TSS RSP0 */
+    /* SYS_WRITE(2, banner, len) — stderr, via the AP's per-CPU TSS RSP0.
+     * leaq(%rip) keeps the banner pointer correct after the block is
+     * relocated into the US=1 user copy. */
     movq    $2, %rdi
     leaq    smp_user_probe_banner(%rip), %rsi
     movq    $smp_user_probe_banner_end - smp_user_probe_banner, %rdx
@@ -490,6 +503,18 @@ smp_user_probe_entry:
 
 .smp_user_probe_hang:
     jmp     .smp_user_probe_hang
+
+    /* Inline banner — kept IN .text, contiguous with the code, so the
+     * single-page copy in smp_user_ap_selftest captures it too. */
+    .align 8
+    .globl smp_user_probe_banner
+smp_user_probe_banner:
+    .ascii "[smp_user] ring3 task ran a syscall on its CPU\n"
+    .globl smp_user_probe_banner_end
+smp_user_probe_banner_end:
+    .align 16
+    .globl smp_user_probe_end
+smp_user_probe_end:
 
 /* ---------- user-mode .data / .rodata ----------------------------
  * fname_motd is a string literal we point SYS_OPEN at. user_read_buf
@@ -507,9 +532,6 @@ user_seek_label_end:
 user_eot:
     .ascii "\n[user] (stderr) done.\n"
 user_eot_end:
-smp_user_probe_banner:
-    .ascii "[smp_user] ring3 task ran a syscall on its CPU\n"
-smp_user_probe_banner_end:
 
     .section .data
     .align 8
