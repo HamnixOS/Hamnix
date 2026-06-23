@@ -42,6 +42,7 @@ For agent-orchestrated development workflow, see [README.md§Agent-orchestrated 
 
 | Milestone | Description | Status |
 |-----------|-------------|--------|
+| T3 | **Self-hosting compiler cutover** — the native `.ad` host compiler (`build/cutover/host_ac.elf`) is now the **DEFAULT** build compiler (`scripts/_adder_cc.sh` ADDER_CC=adder). Builds the whole kernel + all userland; installer image behaviorally identical to the Python seed (fuzzer 500/500; userland objdiff 193 clean; new kernel objdiff 0 collisions/0 divergences across 10162 funcs; native rl5 PASS + desktop visually verified). ~300x faster per-compile. Python seed = frozen bootstrap + oracle only. | **Done** |
 | M1 | hello-world `.ko` — loads, `_printk`s, unloads | **Done** |
 | M2 | 16550A serial console — printk traffic routed through Hamnix `hamnix_console_write` (RIP-relative `outb`+LSR poll) | **Done** |
 | M3.1 | `/proc/hamnix/state` — procfs entry with Hamnix seq_file show callback | **Done** |
