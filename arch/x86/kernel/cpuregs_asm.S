@@ -245,3 +245,49 @@ _stac:
 _clac:
     clac
     ret
+
+/* ---------- arch_get_random_u64() -> uint64 --------------------- *
+ *
+ * Hardware entropy for KASLR v2 (arch/x86/kernel/cpu_kaslr.ad). Returns
+ * a 64-bit random value with no kernel-subsystem dependency, so it is
+ * callable VERY early in start_kernel (before mem_init / the CSPRNG).
+ *
+ * Primary source: RDRAND. The instruction draws from the on-die DRBG
+ * and sets CF=1 on a successful draw, CF=0 if the entropy buffer was
+ * momentarily underfed. The Intel SDM guidance is to retry up to ~10
+ * times; a persistent CF=0 means RDRAND is unavailable or wedged.
+ *
+ * Fallback: RDTSC. When RDRAND never succeeds (older silicon without
+ * the instruction would #UD, but we only reach the fallback when the
+ * retry loop exhausts on a CPU that DID decode RDRAND yet kept
+ * returning CF=0 — e.g. a throttled DRBG), fold the 64-bit timestamp
+ * counter (EDX:EAX) into the result. The TSC low bits vary boot-to-boot
+ * by the non-deterministic time the CPU reaches this point, giving a
+ * usable (if weaker) per-boot seed. This guarantees setup_kaslr() never
+ * stalls waiting for entropy and always yields a varying value.
+ *
+ * NOTE: callers that might run on pre-IvyBridge silicon (no RDRAND
+ * opcode at all) must gate via CPUID.01h:ECX bit 30 first; cpu_kaslr.ad
+ * does exactly that and only calls the RDRAND path when supported. This
+ * helper itself executes RDRAND unconditionally, so it is the caller's
+ * job not to invoke it on a CPU that would #UD. QEMU TCG and every
+ * Hamnix target CPU (NUC, Asus, Pinebook host) decode RDRAND.
+ *
+ * SysV ABI: no arguments, result in %rax. Clobbers caller-saved
+ * %rax/%rcx/%rdx only.
+ */
+    .align 16
+    .globl arch_get_random_u64
+arch_get_random_u64:
+    movl    $10, %ecx                  /* retry budget */
+1:
+    rdrand  %rax                       /* %rax <- random, CF=1 on success */
+    jc      2f                         /* CF set => good draw, return */
+    decl    %ecx
+    jnz     1b                         /* retry while budget remains */
+    /* Fallback: fold the timestamp counter into %rax. */
+    rdtsc                              /* EDX:EAX <- TSC */
+    shlq    $32, %rdx
+    orq     %rdx, %rax                 /* %rax = (EDX<<32)|EAX */
+2:
+    ret
