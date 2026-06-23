@@ -131,10 +131,16 @@ def _hex_to_bytes(lines):
     return bytes.fromhex("".join(lines))
 
 
-def run_dump(src_path: Path, timeout=30) -> DumpResult:
+def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
     build_driver()
     rel = src_path
-    cp = subprocess.run([str(DRIVER_ELF), str(rel)],
+    # opt=True passes the dump driver's opt-in --opt flag, enabling the native
+    # Adder optimizer (Phase 1 const-fold). Default (no flag) is byte-inert.
+    argv = [str(DRIVER_ELF)]
+    if opt:
+        argv.append("--opt")
+    argv.append(str(rel))
+    cp = subprocess.run(argv,
                         capture_output=True, text=True, timeout=timeout)
     out = cp.stdout
     if "AC_DUMP_BEGIN" not in out:
@@ -176,7 +182,8 @@ def run_dump(src_path: Path, timeout=30) -> DumpResult:
                       code_len=meta["CODE_LEN"],
                       gdata_len=meta["GDATA_LEN"],
                       bss_len=meta["BSS_LEN"],
-                      fn_count=meta["FN_COUNT"])
+                      fn_count=meta["FN_COUNT"],
+                      folds=meta.get("FOLDS", 0))
 
 
 # --------------------------------------------------------------------------
@@ -303,16 +310,17 @@ class CodegenRun:
         self.stdout = kw.get("stdout", "")
         self.exit = kw.get("exit", None)
         self.detail = kw.get("detail", "")
+        self.folds = kw.get("folds", 0)
 
 
-def run_through_codegen_ad(seed, body, work_dir: Path, keep=False):
+def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     work_dir.mkdir(parents=True, exist_ok=True)
     cg_body = codegen_compatible_source(body)
     src = work_dir / f"ad_{seed}.ad"
     elf = work_dir / f"ad_{seed}.elf"
     src.write_text(cg_body)
     try:
-        dump = run_dump(src)
+        dump = run_dump(src, opt=opt)
     except subprocess.TimeoutExpired:
         return CodegenRun("drivererror", detail="dump driver timeout")
     if dump.status in ("cgfail", "parsefail", "readfail"):
@@ -335,10 +343,11 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False):
     if not keep:
         src.unlink(missing_ok=True)
         elf.unlink(missing_ok=True)
+    folds = getattr(dump, "folds", 0)
     if rp.returncode < 0:
         return CodegenRun("runfail", detail=f"signal {-rp.returncode}",
-                          stdout=out, exit=rp.returncode)
-    return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF)
+                          stdout=out, exit=rp.returncode, folds=folds)
+    return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF, folds=folds)
 
 
 if __name__ == "__main__":

@@ -1213,6 +1213,16 @@ AD_CODEGEN = False
 _AD_HOST = None          # lazily-imported ad_codegen_host module
 _AD_WORK = None          # work dir for the codegen.ad ELFs
 
+# ADDER_OPT=1 enables a NATIVE-OPTIMIZER correctness lane: codegen.ad is run
+# with the Phase-1 optimizer (--opt) ON, and its output must still match the
+# by-construction oracle (this is a CORRECTNESS check, not byte-identity vs
+# the unoptimized output — the whole point of an optimizer is different bytes,
+# same behavior). Default OFF: codegen.ad runs on its exact pre-opt path and
+# the gate stays byte-exact against the seed.
+ADDER_OPT = os.environ.get("ADDER_OPT", "0") not in ("", "0", "off", "false")
+_AD_OPT_FOLDS_TOTAL = 0   # running fold count across the ADDER_OPT=1 lane
+_AD_OPT_PROGS_FOLDED = 0  # programs in which >=1 fold fired
+
 
 def _ad_host():
     global _AD_HOST, _AD_WORK
@@ -1228,12 +1238,21 @@ def run_through_ad_codegen(seed, body):
       ("unsupported", detail)          codegen.ad rejected (out of subset)
       ("ok", stdout, exit)             codegen.ad compiled + ran
       ("__ad_error__", kind, detail)   driver/run error (not a miscompile)
-    """
+
+    When ADDER_OPT is set, the native Phase-1 optimizer (--opt) is enabled and
+    its fold count accumulated; the (stdout, exit) returned must still match
+    the oracle (caller asserts correctness)."""
+    global _AD_OPT_FOLDS_TOTAL, _AD_OPT_PROGS_FOLDED
     host = _ad_host()
-    r = host.run_through_codegen_ad(seed, body, _AD_WORK)
+    r = host.run_through_codegen_ad(seed, body, _AD_WORK, opt=ADDER_OPT)
     if r.kind == "unsupported":
         return ("unsupported", r.detail)
     if r.kind == "ok":
+        if ADDER_OPT:
+            f = int(getattr(r, "folds", 0) or 0)
+            _AD_OPT_FOLDS_TOTAL += f
+            if f > 0:
+                _AD_OPT_PROGS_FOLDED += 1
         return ("ok", r.stdout, r.exit)
     return ("__ad_error__", r.kind, r.detail)
 
@@ -1383,6 +1402,18 @@ def _run_ad_codegen_batch(base, args):
           f"(out of codegen.ad subset -- NOT a failure)")
     print(f"python-backend miscompiles:   {len(pymis)}  (primary-backend bug)")
     print(f"tooling/run errors:           {len(errs)}")
+    opt_lane_fail = False
+    if ADDER_OPT:
+        print(f"--- ADDER_OPT=1 native-optimizer correctness lane ---")
+        print(f"  const-folds fired (total):  {_AD_OPT_FOLDS_TOTAL}")
+        print(f"  programs with >=1 fold:     {_AD_OPT_PROGS_FOLDED}")
+        print(f"  (above CORRECT count already asserts opt output == oracle)")
+        # The lane only proves anything if the pass DEMONSTRABLY fired. If the
+        # whole batch produced zero folds the optimizer wasn't exercised, which
+        # is itself a lane failure.
+        if accepted > 0 and _AD_OPT_FOLDS_TOTAL == 0:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] optimizer never fired across the batch")
     for (s, detail) in mis[:10]:
         print(f"  [miscompile] seed={s}: {detail[:160]}")
         print(f"        repro: ADDER_FUZZ_DIFF_TARGET=ad-codegen "
@@ -1390,8 +1421,10 @@ def _run_ad_codegen_batch(base, args):
     for (s, detail) in pymis[:10]:
         print(f"  [py-miscompile] seed={s}: {detail[:160]}")
     print("==========================================")
-    # Fail ONLY on a genuine miscompile (codegen.ad OR python).
-    return 1 if (mis or pymis) else 0
+    # Fail on a genuine miscompile (codegen.ad OR python). In the ADDER_OPT=1
+    # lane a miscompile means the OPTIMIZED output diverged from the oracle;
+    # also fail if the optimizer never fired (lane didn't actually exercise it).
+    return 1 if (mis or pymis or opt_lane_fail) else 0
 
 
 # --------------------------------------------------------------------------

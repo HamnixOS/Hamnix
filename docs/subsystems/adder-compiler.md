@@ -819,6 +819,99 @@ and the fallback):
    the seed. Flip the default only after the dry-run + fixpoint gates have run
    green across the full CI matrix for a soak window.
 
+## Native optimizer (post-cutover) — Phase 1: IR scaffold + const-fold
+
+After the native `.ad` compiler became the default build compiler, the real
+optimizer is being built NATIVE IN ADDER (LLVM permanently rejected; the
+Python seed's optimizer stays a frozen oracle only). It is **opt-in and OFF
+by default** so it can never perturb the cutover's byte-for-byte correctness
+contract against the seed.
+
+### Files
+
+- `adder/compiler/ir.ad` — a small, typed, linear IR scaffold living in fixed
+  global parallel arrays (`ir_kind`/`ir_op`/`ir_a`/`ir_b`/`ir_const`),
+  mirroring the parser's AST-arena style. Phase 1 only models the slice the
+  trivial pass needs: constant integer expression trees. `ir_lower_const_expr`
+  lowers a fully-constant, foldable AST subtree into one `IR_CONST` value (or
+  returns 0 = "not constant-foldable").
+- `adder/compiler/opt.ad` — the pass manager + the Phase-1 pass. `opt_run(prog)`
+  walks the whole program (generic descent over every `nd_a/nd_b/nd_c/nd_d`
+  child slot plus the `nd_next` sibling chain), attempts to fold each
+  `ND_BINARY`, and **rewrites the AST node in place into an `ND_INT_LIT`**
+  carrying the folded value. codegen.ad then emits the byte-identical
+  `movq $imm,%rax` it already emits for any literal — i.e. the const
+  computation collapses to its result. `opt_fold_count` is the diagnostic
+  fire-count.
+
+### How the flag gates it
+
+The entire IR path is behind an opt-in flag, default OFF:
+
+- `opt_enabled` (global in opt.ad) defaults to `0`; `opt_run` early-returns when
+  it is `0`, so with the flag off the optimizer module is **never entered** and
+  the compiler takes the exact pre-existing AST → codegen path.
+- The host dump driver (`tests/fuzz/ad_codegen_dump_driver.ad`) calls
+  `opt_enable()` **only** when invoked with the `--opt` argv flag; otherwise
+  `opt_run` is a no-op.
+- The fuzzer host wrapper (`tests/fuzz/ad_codegen_host.py`) passes `--opt` when
+  `ADDER_OPT=1` is set in the environment, and the fuzzer
+  (`tests/fuzz/adder_fuzzer.py`) exposes an **ADDER_OPT=1 correctness lane**:
+  it runs codegen.ad with `--opt` ON and asserts the OPTIMIZED output still
+  matches the by-construction oracle (correctness, NOT byte-identity vs the
+  unoptimized bytes — different bytes, same behavior is the whole point).
+
+Enable it:
+
+```
+# default (OFF) — byte-identical to the pre-opt path:
+bash scripts/fuzz_adder_diff.sh
+
+# native-optimizer correctness lane (ON):
+ADDER_OPT=1 ADDER_FUZZ_DIFF_TARGET=ad-codegen \
+    python3 tests/fuzz/adder_fuzzer.py --count 500 --seed 1
+```
+
+### Phase 1 safety argument
+
+Folding is restricted to **signedness-INVARIANT 64-bit** operations
+(`ADD/SUB/MUL/BIT_AND/BIT_OR/BIT_XOR/SHL`). For these, the folded 64-bit
+two's-complement constant is provably the exact value codegen.ad would have
+computed in `%rax` (it computes lhs in `%rax`, rhs in `%rcx`, then a single
+64-bit instruction). `SHL` masks its shift count to 6 bits, matching
+`shlq %cl`. Signedness- or trap-sensitive ops (compares, `DIV/IDIV/MOD`,
+`SHR`) are **intentionally excluded** in Phase 1. Folding only fires when both
+operands are themselves constant (recursively), so type nodes and any
+non-literal context are never touched.
+
+### Verification (Phase 1)
+
+- **DEFAULT (ADDER_OPT unset)** is byte-inert: `fuzz_adder_diff.sh` 500/500,
+  0 miscompiles; `test_native_vs_seed_objdiff.sh` 193 clean (unchanged
+  baseline); `test_native_vs_seed_kobjdiff.sh` 0 divergences over 10162
+  functions. The objdiff/kobjdiff harnesses do not consume ir.ad/opt.ad/the
+  dump driver at all, so the seed baseline is untouched.
+- **ADDER_OPT=1 lane**: 500/500 correct vs oracle, with **9720 const-folds**
+  fired across all 500 corpus programs (the lane fails if the optimizer never
+  fires).
+
+### Phased plan — what Phase 2+ tackles
+
+Phase 1 is the IR + pass-manager plumbing, not optimization depth. Next:
+
+- **Phase 2 — CSE / value numbering** over the IR (requires extending the IR
+  beyond constant leaves to model `IR_BINOP`/loads/SSA values, already
+  reserved as `IR_BINOP` in ir.ad).
+- **Phase 3 — LICM**: hoist loop-invariant IR values out of `ND_WHILE`/`ND_FOR`
+  bodies; needs an IR CFG/loop-nest view layered over the AST.
+- **Phase 4 — register allocation**: replace codegen.ad's spill-everything-via-
+  `%rax`/`%rcx`-and-push model with a real allocator over IR values, the
+  largest single ≤2×/parity-of-C win. This is where the IR earns its keep:
+  codegen.ad lowers IR → instruction selection instead of walking the AST.
+
+Each phase stays behind `ADDER_OPT` until its own correctness lane is green,
+and the seed remains the frozen oracle throughout.
+
 ## Related docs
 
 - [../x86-backend.md](../x86-backend.md) — why hand-written, codegen contract.
