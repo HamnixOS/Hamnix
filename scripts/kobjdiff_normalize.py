@@ -138,6 +138,33 @@ def text_section(sections):
     raise RuntimeError("no .text section")
 
 
+def func_name_counts(path):
+    """{name: number of distinct-address FUNC symbols with that name in .text}.
+
+    The native compiler does NOT module-prefix-mangle a module-PRIVATE
+    (leading-`_`) function name, so two modules' `_word_eq` (etc.) both emit a
+    LOCAL FUNC symbol with the SAME bare name. codegen.ad resolve_calls() then
+    patches a call to the FIRST same-named symbol — a cross-module CALL MIS-
+    RESOLUTION when the two functions differ (e.g. dev.ad `_word_eq(s,lit)` vs
+    devnet.ad `_word_eq(buf,pos,len,word)`). The seed has no such count (it
+    mangles), so count>1 in the native flags a real symbol collision the
+    .text-histogram cannot (the bytes are each individually fine; the LINK is
+    wrong)."""
+    data, sections, symbols = read_elf64(path)
+    text_idx, _to, _ts = text_section(sections)
+    from collections import Counter as _C
+    c = _C()
+    seen = set()
+    for name, value, size, info, shndx in symbols:
+        if (info & 0xF) != 2 or shndx != text_idx or not name:
+            continue
+        if (name, value) in seen:
+            continue
+        seen.add((name, value))
+        c[name] += 1
+    return c
+
+
 def func_bytes(path):
     """Return {name: bytes} for every FUNC symbol in .text.
 
@@ -243,6 +270,20 @@ def main():
             print(f"[kobjdiff] native FUNCs with NO seed twin: "
                   f"{len(unmatched_nat)} e.g. {unmatched_nat[:6]}")
 
+    # SYMBOL-COLLISION check: a native LOCAL FUNC name that appears MORE THAN
+    # ONCE is two (or more) different modules' private `_helper` colliding
+    # because the native driver does not module-mangle private names (the seed
+    # does). codegen.ad resolve_calls() patches a call to the FIRST same-named
+    # symbol, so a cross-module call to such a name MIS-LINKS when the two
+    # bodies differ (the dev.ad `_word_eq(s,lit)` vs devnet.ad
+    # `_word_eq(buf,pos,len,word)` live-root bug). This is invisible to the
+    # per-function histogram (each body is individually fine); we surface it
+    # here as a hard divergence so the gate catches the whole class.
+    nat_counts = func_name_counts(nat_o)
+    collisions = sorted(n for n, c in nat_counts.items() if c > 1)
+    if only:
+        collisions = [n for n in collisions if n in only]
+
     diverged = []
     compared = 0
     for name, nb, seed_cands in pairs:
@@ -292,6 +333,15 @@ def main():
 
     print("=" * 60)
     print(f"[kobjdiff] kernel FUNCs compared: {compared}")
+    if collisions:
+        print(f"[kobjdiff] PRIVATE-NAME SYMBOL COLLISIONS ({len(collisions)}): "
+              f"the native emits >1 LOCAL FUNC with these bare names because "
+              f"it does not module-mangle private (`_`) names like the seed; a "
+              f"cross-module call MIS-LINKS to the first one (resolve_calls "
+              f"first-match). Fix: per-module private mangling in "
+              f"adder/compiler/fused_driver_host_main.ad.")
+        for n in collisions:
+            print(f"    {n}: native×{nat_counts[n]}")
     if diverged:
         for name, divs in diverged:
             print(f"[kobjdiff] {name}: histogram divergence")
@@ -299,6 +349,7 @@ def main():
                 print(d)
         print(f"[kobjdiff] DIVERGED kernel functions ({len(diverged)}): "
               f"{[n for n, _ in diverged]}")
+    if diverged or collisions:
         sys.exit(1)
     print(f"[kobjdiff] PASS — zero semantic kernel divergences "
           f"across {compared} matched functions")
