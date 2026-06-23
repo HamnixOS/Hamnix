@@ -1224,6 +1224,8 @@ _AD_OPT_FOLDS_TOTAL = 0   # running fold count across the ADDER_OPT=1 lane
 _AD_OPT_PROGS_FOLDED = 0  # programs in which >=1 fold fired
 _AD_OPT_CSE_TOTAL = 0     # running CSE-elimination count across the lane
 _AD_OPT_PROGS_CSE = 0     # programs in which >=1 CSE elimination fired
+_AD_OPT_LICM_TOTAL = 0    # running LICM-hoist count across the lane
+_AD_OPT_PROGS_LICM = 0    # programs in which >=1 LICM hoist fired
 
 
 def _ad_host():
@@ -1246,6 +1248,7 @@ def run_through_ad_codegen(seed, body):
     the oracle (caller asserts correctness)."""
     global _AD_OPT_FOLDS_TOTAL, _AD_OPT_PROGS_FOLDED
     global _AD_OPT_CSE_TOTAL, _AD_OPT_PROGS_CSE
+    global _AD_OPT_LICM_TOTAL, _AD_OPT_PROGS_LICM
     host = _ad_host()
     r = host.run_through_codegen_ad(seed, body, _AD_WORK, opt=ADDER_OPT)
     if r.kind == "unsupported":
@@ -1260,6 +1263,10 @@ def run_through_ad_codegen(seed, body):
             _AD_OPT_CSE_TOTAL += c
             if c > 0:
                 _AD_OPT_PROGS_CSE += 1
+            lc = int(getattr(r, "licm", 0) or 0)
+            _AD_OPT_LICM_TOTAL += lc
+            if lc > 0:
+                _AD_OPT_PROGS_LICM += 1
         return ("ok", r.stdout, r.exit)
     return ("__ad_error__", r.kind, r.detail)
 
@@ -1451,6 +1458,172 @@ def _run_cse_corpus():
 
 
 # --------------------------------------------------------------------------
+# Phase-3 LICM corpus. Hand-written programs with LOOP-INVARIANT pure
+# subexpressions inside while/for loop bodies. Run through codegen.ad WITH --opt;
+# the optimized output must match the Python-computed oracle AND the LICM pass
+# must hoist (>=1 pre-header materialisation across the corpus). The invariant
+# subexpressions are over the signedness-invariant 64-bit op set (ADD/SUB/MUL/
+# AND/OR/XOR/SHL) over loop-EXTERNAL idents — exactly the hoistable leaf set.
+# Each program also includes a leaf whose value DOES change in the loop, so a
+# buggy "hoist everything" pass would miscompile and be caught by the oracle.
+# --------------------------------------------------------------------------
+def _licm_corpus():
+    """Return a list of (name, body, expected_stdout, expected_exit)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, decls_and_main, val):
+        body = PRELUDE + "\n" + decls_and_main
+        progs.append((name, body, str(val & M), (val & 255)))
+
+    # 1) while loop: (a*b) is invariant (a,b never written); accumulate it each
+    #    iteration. i is the induction var (written) so it is NOT hoisted.
+    a, b, n = 6, 7, 5
+    inv = (a * b) & M
+    v = 0
+    i = 0
+    while i < n:
+        v = (v + inv) & M
+        i += 1
+    prog("while_inv_mul",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: uint64 = cast[uint64]({a})\n"
+         f"    b: uint64 = cast[uint64]({b})\n"
+         f"    n: uint64 = cast[uint64]({n})\n"
+         "    i: uint64 = cast[uint64](0)\n"
+         "    while i < n:\n"
+         "        g_accum = g_accum + (a * b)\n"
+         "        i = i + cast[uint64](1)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
+    # 2) Invariant expr mixes invariant idents with the induction var: hoist the
+    #    invariant (k+m) part only; (i + (k+m)) is NOT invariant (i changes).
+    k, m, n = 100, 23, 4
+    invk = (k + m) & M
+    v = 0
+    i = 0
+    while i < n:
+        v = (v + (i + invk)) & M
+        i += 1
+    prog("while_partial_inv",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    k: uint64 = cast[uint64]({k})\n"
+         f"    m: uint64 = cast[uint64]({m})\n"
+         f"    n: uint64 = cast[uint64]({n})\n"
+         "    i: uint64 = cast[uint64](0)\n"
+         "    while i < n:\n"
+         "        g_accum = g_accum + (i + (k + m))\n"
+         "        i = i + cast[uint64](1)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
+    # 3) NESTED loops: (p*q) is invariant w.r.t. BOTH loops; (p*q)+j is invariant
+    #    w.r.t the inner loop only (j is the outer induction var, unchanged
+    #    inside the inner body) so it hoists to the INNER pre-header.
+    p, q, no, ni = 3, 9, 3, 4
+    invpq = (p * q) & M
+    v = 0
+    j = 0
+    while j < no:
+        ii = 0
+        while ii < ni:
+            v = (v + (invpq + j)) & M
+            ii += 1
+        j += 1
+    prog("nested_inner_inv",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    p: uint64 = cast[uint64]({p})\n"
+         f"    q: uint64 = cast[uint64]({q})\n"
+         f"    no: uint64 = cast[uint64]({no})\n"
+         f"    ni: uint64 = cast[uint64]({ni})\n"
+         "    j: uint64 = cast[uint64](0)\n"
+         "    while j < no:\n"
+         "        ii: uint64 = cast[uint64](0)\n"
+         "        while ii < ni:\n"
+         "            g_accum = g_accum + ((p * q) + j)\n"
+         "            ii = ii + cast[uint64](1)\n"
+         "        j = j + cast[uint64](1)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
+    # 4) ZERO-TRIP loop: the loop runs zero times, so the invariant (a*b) must
+    #    NOT be observable — but hoisting a pure non-faulting value above it is
+    #    safe (the temp is computed and unused). The accumulator stays 0; the
+    #    correctness check proves the hoist didn't introduce a spurious effect.
+    a, b = 11, 13
+    v = 0  # loop body never runs
+    prog("zero_trip_safe",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: uint64 = cast[uint64]({a})\n"
+         f"    b: uint64 = cast[uint64]({b})\n"
+         "    n: uint64 = cast[uint64](0)\n"
+         "    i: uint64 = cast[uint64](0)\n"
+         "    while i < n:\n"
+         "        g_accum = g_accum + (a * b)\n"
+         "        i = i + cast[uint64](1)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
+    # 5) Body REASSIGNS a leaf of an otherwise-pure expr: (a*b) where `a` is
+    #    rewritten in the loop is NOT invariant and must NOT be hoisted. The
+    #    oracle (a changes each iter) catches a wrongly-hoisted stale value.
+    a0, b, n = 2, 5, 4
+    v = 0
+    a = a0
+    i = 0
+    while i < n:
+        v = (v + (a * b)) & M
+        a = (a + 1) & M
+        i += 1
+    prog("clobbered_leaf_no_hoist",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: uint64 = cast[uint64]({a0})\n"
+         f"    b: uint64 = cast[uint64]({b})\n"
+         f"    n: uint64 = cast[uint64]({n})\n"
+         "    i: uint64 = cast[uint64](0)\n"
+         "    while i < n:\n"
+         "        g_accum = g_accum + (a * b)\n"
+         "        a = a + cast[uint64](1)\n"
+         "        i = i + cast[uint64](1)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
+    return progs
+
+
+def _run_licm_corpus():
+    """Run the LICM corpus through codegen.ad with --opt. Returns
+    (all_correct_and_fired, total_licm_hoists)."""
+    host = _ad_host()
+    total_licm = 0
+    all_ok = True
+    for (name, body, exp_out, exp_exit) in _licm_corpus():
+        r = host.run_through_codegen_ad(f"licm_{name}", body, _AD_WORK, opt=True)
+        if r.kind != "ok":
+            all_ok = False
+            print(f"  [LICM corpus '{name}'] codegen.ad {r.kind}: {r.detail[:120]}")
+            continue
+        lc = int(getattr(r, "licm", 0) or 0)
+        total_licm += lc
+        if r.stdout != exp_out or r.exit != exp_exit:
+            all_ok = False
+            print(f"  [LICM corpus '{name}'] MISCOMPILE opt=("
+                  f"{r.stdout},{r.exit}) oracle=({exp_out},{exp_exit}) licm={lc}")
+    # The corpus only passes if every program was correct AND the pass hoisted at
+    # least once across it (the clobbered/partial cases prove it DOESN'T over-
+    # hoist; the invariant cases prove it DOES fire).
+    if total_licm == 0:
+        all_ok = False
+    return (all_ok, total_licm)
+
+
+# --------------------------------------------------------------------------
 # Differential batch driver for the self-hosted codegen.ad backend.
 # --------------------------------------------------------------------------
 def _run_ad_codegen_batch(base, args):
@@ -1519,6 +1692,8 @@ def _run_ad_codegen_batch(base, args):
         print(f"  programs with >=1 fold:     {_AD_OPT_PROGS_FOLDED}")
         print(f"  CSE eliminations (total):   {_AD_OPT_CSE_TOTAL}")
         print(f"  programs with >=1 CSE:      {_AD_OPT_PROGS_CSE}")
+        print(f"  LICM hoists (total):        {_AD_OPT_LICM_TOTAL}")
+        print(f"  programs with >=1 LICM:     {_AD_OPT_PROGS_LICM}")
         print(f"  (above CORRECT count already asserts opt output == oracle)")
         # The lane only proves anything if the pass DEMONSTRABLY fired. If the
         # whole batch produced zero folds the optimizer wasn't exercised, which
@@ -1537,6 +1712,17 @@ def _run_ad_codegen_batch(base, args):
         if not cse_ok:
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] CSE corpus miscompiled or never fired")
+        # Phase-3 dedicated LICM corpus: hand-written loops with loop-invariant
+        # pure subexpressions. Assert (a) optimized output is correct vs a
+        # computed oracle (incl. a zero-trip loop and clobbered-leaf cases that
+        # would miscompile if the pass over-hoisted) AND (b) the LICM pass
+        # demonstrably hoisted (>=1 across the corpus).
+        licm_ok, licm_hoists = _run_licm_corpus()
+        print(f"--- ADDER_OPT=1 LICM corpus ---")
+        print(f"  corpus LICM hoists:         {licm_hoists}")
+        if not licm_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] LICM corpus miscompiled or never fired")
     for (s, detail) in mis[:10]:
         print(f"  [miscompile] seed={s}: {detail[:160]}")
         print(f"        repro: ADDER_FUZZ_DIFF_TARGET=ad-codegen "

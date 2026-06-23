@@ -51,7 +51,12 @@ from compiler.parser import (
     ND_WHILE,
     ND_DO_WHILE,
     ND_FOR,
+    ND_FOR_UNPACK,
     ND_FUNCTION,
+    ND_CALL,
+    ND_UNARY,
+    UNOP_ADDR,
+    AUGOP_NONE,
 )
 
 from compiler.ir import (
@@ -91,6 +96,10 @@ opt_cse_count: uint32 = 0
 # Monotonic counter for minting unique synthetic temp names (__cse_<n>).
 opt_cse_tmp_seq: uint32 = 0
 
+# Diagnostics: number of loop-invariant pure computations hoisted to a loop
+# pre-header by Phase-3 LICM (one per hoisted expression value).
+opt_licm_count: uint32 = 0
+
 
 def opt_enable():
     opt_enabled = 1
@@ -100,6 +109,7 @@ def opt_reset_stats():
     opt_fold_count = 0
     opt_cse_count = 0
     opt_cse_tmp_seq = 0
+    opt_licm_count = 0
 
 
 # Rewrite an AST ND_BINARY node IN PLACE into an ND_INT_LIT carrying `v`.
@@ -182,6 +192,14 @@ def opt_run(prog: uint32):
     while cur != 0:
         if nd_kind[cur] == ND_FUNCTION:
             opt_cse_function(cur)
+        cur = nd_next[cur]
+    # Phase 3 — loop-invariant code motion. Runs AFTER fold+CSE so it operates
+    # on the simplified graph (constants collapsed, in-statement redundancy
+    # already shared). Re-walk the decls and LICM every function body.
+    cur = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            opt_licm_function(cur)
         cur = nd_next[cur]
 
 
@@ -553,3 +571,382 @@ def cse_block(head: uint32) -> uint32:
 def opt_cse_function(fn: uint32):
     # The function body chain hangs off nd_c (ND_FUNCTION: c = body chain head).
     nd_c[fn] = cse_block(nd_c[fn])
+
+
+# =======================================================================
+# Phase 3 — Loop-Invariant Code Motion (LICM).
+# =======================================================================
+#
+# STRATEGY (conservative + correct over fast)
+# -------------------------------------------
+# LICM grows the analysis scope from a single statement (Phase 2's CSE region)
+# to a whole LOOP BODY. A pure expression is LOOP-INVARIANT if computing it once
+# before the loop yields the same value it would on every iteration — i.e. none
+# of its inputs change inside the loop. We hoist such an expression into a temp
+# in a synthetic PRE-HEADER spliced immediately before the loop, and rewrite the
+# in-loop occurrences to read the temp.
+#
+# INVARIANCE TEST (conservative)
+#   A candidate is a PURE expression in the exact Phase-2 value set: int/char/
+#   bool literals, bare idents, and IR_BINOP over the signedness-invariant 64-bit
+#   op set (ADD/SUB/MUL/AND/OR/XOR/SHL). It lowers via ir_lower_pure_expr, so by
+#   construction it contains NO loads/indexes, NO calls, NO DIV/MOD/SHR, NO
+#   compares/casts/unary — it cannot fault, divide, or have a side effect.
+#   It is loop-invariant iff NONE of its leaf idents is written anywhere in the
+#   loop body. "Written" = the ident is:
+#     * an ND_ASSIGN target (plain or augmented),
+#     * an ND_VAR_DECL name (re-declared / shadowed in the body),
+#     * the loop induction variable of an ND_FOR / ND_FOR_UNPACK in the body,
+#   AND, as a blanket conservative guard, if the loop body contains ANY call
+#   (ND_CALL) or ANY address-of (UNOP_ADDR), we treat EVERY ident as potentially
+#   clobbered and hoist NOTHING from that loop: a call may write through a
+#   pointer to any local/global, and once an address escapes the compiler can no
+#   longer prove the named storage is unmodified. (Phase 2's pure value set never
+#   lowers a call/addr-of into a candidate, but they can still sit ELSEWHERE in
+#   the body and clobber an otherwise-pure leaf, so the whole-body scan must see
+#   them.)
+#
+# ZERO-TRIP SAFETY
+#   Hoisting a computation above a loop that may run zero times is normally
+#   unsafe (it would execute work the original program might skip). It is safe
+#   HERE precisely because the value set is pure, side-effect-free and
+#   non-faulting: evaluating `a*b+c` (a,b,c unchanged in the loop) before a
+#   zero-trip loop produces an unused temp with no observable effect. DIV/MOD/
+#   loads are kept OUT of the set (ir_lower_pure_expr returns 0 for them) exactly
+#   so a possibly-trapping op is never hoisted above its guard.
+#
+# NESTED LOOPS
+#   licm_block recurses into a loop's body FIRST (innermost loops processed
+#   before their enclosing loop). An expression invariant w.r.t. the inner loop
+#   but not the outer is hoisted only to the INNER pre-header: the inner pass
+#   sees the outer induction var as a free (unwritten-by-the-inner-body) leaf and
+#   hoists it just above the inner loop, where it is still inside the outer loop.
+#   The outer pass then runs on a body that already contains that pre-header
+#   decl; the decl's RHS is invariant in the outer loop only if its leaves are
+#   outer-invariant too, in which case the outer pass hoists the pre-header decl
+#   further out as an ordinary in-body statement candidate is NOT re-formed
+#   (we hoist expressions, not statements), so the conservative result is: each
+#   level hoists what is invariant at that level. Correct, possibly not maximal.
+
+# --- per-loop clobber set ------------------------------------------------
+#
+# The set of identifier names written anywhere in the current loop body, stored
+# as (off,len) pairs into strbuf. A blanket "give up" flag is raised if the body
+# contains a call or an address-of (see the strategy note).
+LICM_MAX_CLOB: uint32 = 4096
+licm_clob_off: Array[4096, uint32]
+licm_clob_len: Array[4096, uint32]
+licm_clob_n: uint32 = 0
+licm_giveup: uint32 = 0          # 1 => body has a call / addr-of => hoist nothing
+
+
+def licm_clob_reset():
+    licm_clob_n = 0
+    licm_giveup = 0
+
+
+def licm_clob_add(off: uint32, len_: uint32):
+    if licm_clob_n >= LICM_MAX_CLOB:
+        # Overflow: be safe, refuse to hoist anything from this loop.
+        licm_giveup = 1
+        return
+    licm_clob_off[licm_clob_n] = off
+    licm_clob_len[licm_clob_n] = len_
+    licm_clob_n = licm_clob_n + 1
+
+
+# Is `name` (off,len) in the clobber set? (byte compare via ir_name_eq)
+def licm_is_clobbered(off: uint32, len_: uint32) -> uint32:
+    i: uint32 = 0
+    while i < licm_clob_n:
+        if ir_name_eq(licm_clob_off[i], licm_clob_len[i], off, len_) != 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+# Scan an EXPRESSION subtree for call / address-of anywhere (sets licm_giveup).
+# These are the operations that can clobber a named leaf without naming it.
+def licm_scan_expr(node: uint32):
+    if node == 0:
+        return
+    if licm_giveup != 0:
+        return
+    k: uint32 = nd_kind[node]
+    if k == ND_CALL:
+        licm_giveup = 1
+        return
+    if k == ND_UNARY:
+        if nd_aux[node] == UNOP_ADDR:
+            licm_giveup = 1
+            return
+    licm_scan_expr(nd_a[node])
+    licm_scan_expr(nd_b[node])
+    licm_scan_expr(nd_c[node])
+    licm_scan_expr(nd_d[node])
+
+
+# Record the lvalue target of an assignment as clobbered. We only understand a
+# bare-ident target precisely; ANY other lvalue shape (index p[i], member a.b,
+# deref *p) means a store we cannot pin to a name, so we give up on the whole
+# loop (conservative — those stores could alias a hoist candidate's leaf).
+def licm_record_assign_target(target: uint32):
+    if target == 0:
+        return
+    if nd_kind[target] == ND_IDENT:
+        licm_clob_add(nd_name_off[target], nd_name_len[target])
+        return
+    # Non-ident lvalue (store through index/member/deref) — can't prove it
+    # doesn't alias a candidate leaf; bail out of hoisting for this loop.
+    licm_giveup = 1
+
+
+# Walk ONE statement chain of a loop body, recording every write (assignment
+# target, var-decl name, for-loop induction var) into the clobber set and raising
+# licm_giveup on any call / addr-of / opaque store. Recurses into nested blocks
+# (if/elif/else, while, for, do-while) so the clobber set covers the ENTIRE loop
+# body transitively.
+def licm_collect_clobbers(head: uint32):
+    s: uint32 = head
+    while s != 0:
+        if licm_giveup != 0:
+            return
+        k: uint32 = nd_kind[s]
+        if k == ND_ASSIGN:
+            licm_record_assign_target(nd_a[s])
+            licm_scan_expr(nd_b[s])
+        elif k == ND_VAR_DECL:
+            licm_clob_add(nd_name_off[s], nd_name_len[s])
+            licm_scan_expr(nd_b[s])
+        elif k == ND_EXPR_STMT:
+            licm_scan_expr(nd_a[s])
+        elif k == ND_RETURN:
+            licm_scan_expr(nd_a[s])
+        elif k == ND_IF:
+            licm_scan_expr(nd_a[s])
+            licm_collect_clobbers(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                licm_scan_expr(nd_a[e])
+                licm_collect_clobbers(nd_b[e])
+                e = nd_next[e]
+            licm_collect_clobbers(nd_d[s])
+        elif k == ND_WHILE:
+            licm_scan_expr(nd_a[s])
+            licm_collect_clobbers(nd_b[s])
+        elif k == ND_DO_WHILE:
+            licm_scan_expr(nd_a[s])
+            licm_collect_clobbers(nd_b[s])
+        elif k == ND_FOR:
+            # Induction var is written each iteration.
+            licm_clob_add(nd_name_off[s], nd_name_len[s])
+            licm_scan_expr(nd_a[s])
+            licm_collect_clobbers(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            # Each unpack target ident is written; iterable (b) + body (c).
+            v: uint32 = nd_a[s]
+            while v != 0:
+                if nd_kind[v] == ND_IDENT:
+                    licm_clob_add(nd_name_off[v], nd_name_len[v])
+                v = nd_next[v]
+            licm_scan_expr(nd_b[s])
+            licm_collect_clobbers(nd_c[s])
+        s = nd_next[s]
+
+
+# --- invariance test over an IR value -----------------------------------
+#
+# An IR value (built by ir_lower_pure_expr) is loop-invariant iff every IR_IDENT
+# leaf names a variable NOT in the clobber set. IR_CONST leaves are always
+# invariant. (giveup is checked by the caller before this runs.)
+def licm_ir_invariant(v: uint32) -> uint32:
+    if v == 0:
+        return 0
+    k: uint32 = ir_kind[v]
+    if k == IR_CONST:
+        return 1
+    if k == IR_IDENT:
+        if licm_is_clobbered(ir_name_off[v], ir_name_len[v]) != 0:
+            return 0
+        return 1
+    if k == IR_BINOP:
+        if licm_ir_invariant(ir_a[v]) == 0:
+            return 0
+        return licm_ir_invariant(ir_b[v])
+    return 0
+
+
+# --- candidate collection + hoist ---------------------------------------
+#
+# We reuse the Phase-2 candidate machinery (cse_cand_*) over the WHOLE loop body
+# instead of one statement: every pure ND_BINARY subtree across the body is
+# lowered into one shared IR arena, so value-equal occurrences in different
+# statements share a value id and get hoisted to ONE temp. Outermost-first
+# pre-order means the maximal invariant expression wins.
+
+# Pending pre-header decls for the loop currently being hoisted (spliced before
+# the loop in mint order). Reuses CSE_MAX_PEND sizing semantics.
+LICM_MAX_PEND: uint32 = 256
+licm_pend_decl: Array[256, uint32]
+licm_pend_n: uint32 = 0
+
+
+# Collect every pure ND_BINARY subtree across a loop-body statement chain into
+# the shared cse_cand_* list (pre-order, outermost-first), each with its lowered
+# value IR (shared arena, NOT reset per node). Mirrors cse_collect but spans a
+# whole statement chain and descends into nested control flow, so a candidate may
+# appear in any statement of the body. Statement lvalue targets are NOT lowered
+# (they are not r-value expressions). The clobber scan ran first, so we know the
+# body is call/addr-free here (giveup == 0).
+def licm_collect_body(head: uint32):
+    s: uint32 = head
+    while s != 0:
+        if cse_cand_n >= CSE_MAX_CAND:
+            return
+        k: uint32 = nd_kind[s]
+        if k == ND_ASSIGN:
+            cse_collect(nd_b[s])
+        elif k == ND_VAR_DECL:
+            cse_collect(nd_b[s])
+        elif k == ND_EXPR_STMT:
+            cse_collect(nd_a[s])
+        elif k == ND_RETURN:
+            cse_collect(nd_a[s])
+        elif k == ND_IF:
+            cse_collect(nd_a[s])
+            licm_collect_body(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                cse_collect(nd_a[e])
+                licm_collect_body(nd_b[e])
+                e = nd_next[e]
+            licm_collect_body(nd_d[s])
+        elif k == ND_WHILE:
+            cse_collect(nd_a[s])
+            licm_collect_body(nd_b[s])
+        elif k == ND_DO_WHILE:
+            cse_collect(nd_a[s])
+            licm_collect_body(nd_b[s])
+        elif k == ND_FOR:
+            cse_collect(nd_a[s])
+            licm_collect_body(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            cse_collect(nd_b[s])
+            licm_collect_body(nd_c[s])
+        s = nd_next[s]
+
+
+# Rewrite EVERY occurrence in the whole body whose value-IR equals `proto_ir`
+# into an ND_IDENT(off,len). Same shape as cse_apply but the candidate list now
+# spans the whole loop body. Returns the rewritten count.
+def licm_apply(proto_ir: uint32, off: uint32, len_: uint32) -> uint32:
+    n: uint32 = 0
+    i: uint32 = 0
+    while i < cse_cand_n:
+        ast: uint32 = cse_cand_ast[i]
+        if ast != 0 and nd_kind[ast] == ND_BINARY:
+            if ir_value_eq(cse_cand_ir[i], proto_ir) != 0:
+                cse_kill_descendants(ast)
+                cse_rewrite_to_ident(ast, off, len_)
+                cse_cand_ast[i] = 0
+                n = n + 1
+        i = i + 1
+    return n
+
+
+# Hoist every loop-invariant pure expression that occurs in the body of the loop
+# node `loop`. The loop body chain is on nd_b for ND_WHILE/ND_DO_WHILE/ND_FOR.
+# Returns the list of pre-header decls via licm_pend_* (caller splices them
+# before the loop). The body's in-loop occurrences are rewritten to read temps.
+def licm_hoist_loop(loop: uint32):
+    body: uint32 = nd_b[loop]
+    if body == 0:
+        return
+    licm_pend_n = 0
+    # 1) Clobber analysis over the whole body.
+    licm_clob_reset()
+    licm_collect_clobbers(body)
+    if licm_giveup != 0:
+        return                 # call / addr-of / opaque store: hoist nothing
+    # 2) Collect pure-binop candidates across the whole body into a shared arena.
+    cse_cand_n = 0
+    ir_reset()
+    licm_collect_body(body)
+    # 3) For each candidate (outermost-first), if it is loop-invariant, hoist it
+    #    to a pre-header temp and rewrite all its occurrences. cse_apply's
+    #    nested-invalidation prevents re-hoisting a sub-part of a hoisted expr.
+    i: uint32 = 0
+    while i < cse_cand_n:
+        ast_i: uint32 = cse_cand_ast[i]
+        if ast_i != 0 and nd_kind[ast_i] == ND_BINARY:
+            vi: uint32 = cse_cand_ir[i]
+            if licm_ir_invariant(vi) != 0:
+                # Mint a temp, snapshot the defining expression as a clone so the
+                # in-place rewrite of occurrences doesn't disturb the decl init.
+                cse_mint_temp_name()
+                toff: uint32 = opt_tmp_name_off
+                tlen: uint32 = opt_tmp_name_len
+                clone: uint32 = cse_clone_expr(ast_i)
+                if clone == 0:
+                    return
+                d: uint32 = cse_make_temp_decl(toff, tlen, clone)
+                if d == 0:
+                    return
+                cnt: uint32 = licm_apply(vi, toff, tlen)
+                if cnt >= 1:
+                    if licm_pend_n < LICM_MAX_PEND:
+                        licm_pend_decl[licm_pend_n] = d
+                        licm_pend_n = licm_pend_n + 1
+                    opt_licm_count = opt_licm_count + 1
+        i = i + 1
+
+
+# Walk a statement chain; for each loop, recurse into its body FIRST (innermost-
+# first, so a nested loop gets its own pre-header), then hoist the loop's
+# invariant expressions into a pre-header decl chain spliced immediately BEFORE
+# the loop. Returns the (possibly new) chain head. Mirrors cse_block's splice
+# bookkeeping.
+def licm_block(head: uint32) -> uint32:
+    new_head: uint32 = head
+    prev: uint32 = 0
+    s: uint32 = head
+    while s != 0:
+        nxt: uint32 = nd_next[s]
+        k: uint32 = nd_kind[s]
+        # Recurse into nested blocks FIRST so inner loops are processed before
+        # the enclosing one (innermost pre-headers placed first).
+        if k == ND_IF:
+            nd_b[s] = licm_block(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                nd_b[e] = licm_block(nd_b[e])
+                e = nd_next[e]
+            nd_d[s] = licm_block(nd_d[s])
+        elif k == ND_WHILE:
+            nd_b[s] = licm_block(nd_b[s])
+        elif k == ND_DO_WHILE:
+            nd_b[s] = licm_block(nd_b[s])
+        elif k == ND_FOR:
+            nd_b[s] = licm_block(nd_b[s])
+        # Hoist this loop's invariants into a pre-header spliced before it.
+        if k == ND_WHILE or k == ND_DO_WHILE or k == ND_FOR:
+            licm_hoist_loop(s)
+            if licm_pend_n > 0:
+                pi: uint32 = 0
+                while pi < licm_pend_n:
+                    d: uint32 = licm_pend_decl[pi]
+                    if prev == 0:
+                        new_head = d
+                    else:
+                        nd_next[prev] = d
+                    nd_next[d] = s
+                    prev = d
+                    pi = pi + 1
+        prev = s
+        s = nxt
+    return new_head
+
+
+def opt_licm_function(fn: uint32):
+    # The function body chain hangs off nd_c (ND_FUNCTION: c = body chain head).
+    nd_c[fn] = licm_block(nd_c[fn])

@@ -989,24 +989,138 @@ ADDER_OPT=1 ADDER_FUZZ_DIFF_TARGET=ad-codegen \
     python3 tests/fuzz/adder_fuzzer.py --ad-codegen --count 500 --seed 1
 ```
 
-### Phased plan — what Phase 3+ tackles
+## Native optimizer — Phase 3: loop-invariant code motion (LICM)
 
-- **Phase 3 — LICM** (loop-invariant code motion): hoist loop-invariant IR
-  values out of `ND_WHILE`/`ND_FOR` bodies. This is where the single-statement
-  scope must grow into a real **basic-block / loop-nest view** layered over the
-  AST: LICM needs (a) per-loop *clobber analysis* — which identifiers/memory the
-  loop body writes (via `ND_ASSIGN`/`ND_AUG_ASSIGN`/stores), so an expression is
-  invariant iff none of its leaves are clobbered in the loop; (b) a hoist point
-  (a pre-header before the loop) to place the computed temp; (c) reuse of the
-  Phase-2 value-numbering + temp-materialisation machinery (`cse_make_temp_decl`
-  / `cse_rewrite_to_ident` generalise directly — the only new work is the
-  invariance/clobber test and the pre-header splice). The conservative starting
-  point: hoist a pure `IR_BINOP` whose every leaf ident is **never** an
-  assignment target anywhere in the loop body.
+Phase 3 grows the analysis scope from Phase-2's single statement to a whole
+**loop body** (`ND_WHILE` / `ND_DO_WHILE` / `ND_FOR`) and **hoists loop-
+invariant pure computations into a pre-header** inserted immediately before the
+loop. Like Phases 1–2 it is purely additive in `adder/compiler/` + `tests/fuzz/`,
+gated behind `ADDER_OPT`/`--opt`, and **OFF by default** (the default path stays
+byte-identical to the seed). It runs **after** fold + CSE (`opt_run` calls
+`opt_licm_function` last), so it operates on the already-simplified graph.
+
+### The LICM pass (opt.ad)
+
+`licm_block(head)` walks a statement chain; for each loop it recurses into the
+body **first** (innermost loops processed before their enclosing loop), then
+hoists the loop's invariant expressions via `licm_hoist_loop`:
+
+1. **Clobber analysis** (`licm_collect_clobbers`) scans the *entire* loop body
+   (transitively, through nested if/elif/else/while/for) and records every
+   identifier **written** in the loop — `ND_ASSIGN` targets (plain or
+   augmented), `ND_VAR_DECL` names, and `ND_FOR`/`ND_FOR_UNPACK` induction
+   variables — into a clobber set. As a blanket conservative guard, if the body
+   contains **any call** (`ND_CALL`), **any address-of** (`UNOP_ADDR`), or any
+   non-ident store target (index/member/deref lvalue), it raises `licm_giveup`
+   and **hoists nothing** from that loop: a call may write through a pointer to
+   any named storage, and once an address escapes the named storage can no
+   longer be proven unmodified.
+2. **Candidate collection** (`licm_collect_body`) lowers every pure `ND_BINARY`
+   subtree across the whole body — via the same `ir_lower_pure_expr` / shared
+   value-numbered IR arena as CSE — into the reused `cse_cand_*` list
+   (outermost-first, so the *maximal* invariant expression wins). Value-equal
+   occurrences in different statements share a value id and collapse to one temp.
+3. **Invariance test** (`licm_ir_invariant`): an IR value is loop-invariant iff
+   every `IR_IDENT` leaf names a variable **not** in the clobber set (`IR_CONST`
+   leaves are always invariant). The candidate set is exactly Phase-2's pure
+   value set — int/char/bool literals, bare idents, and `IR_BINOP` over the
+   signedness-invariant 64-bit op set (`ADD/SUB/MUL/AND/OR/XOR/SHL`).
+4. **Hoist**: for each invariant candidate, mint a unique `__cse_<n>` temp, build
+   an untyped `ND_VAR_DECL` initialised with a **clone** of the expression
+   (`cse_clone_expr`, so the in-place rewrite of occurrences can't disturb the
+   decl init), rewrite **every** in-loop occurrence to read the temp
+   (`licm_apply` + `cse_kill_descendants` to avoid re-hoisting a sub-part), and
+   splice the decl into the statement chain **immediately before the loop** — the
+   pre-header. `opt_licm_count` counts hoists; the dump driver logs `LICM <n>`.
+
+The pass reuses the Phase-2 machinery wholesale (`cse_make_temp_decl`,
+`cse_rewrite_to_ident`, `cse_collect`, `cse_clone_expr`, the value-numbered IR):
+the only genuinely new code is the invariance/clobber analysis and the
+pre-header splice, exactly as the Phase-2 handoff predicted.
+
+### Nested loops & zero-trip safety
+
+- **Nested loops**: because `licm_block` recurses innermost-first, an expression
+  invariant w.r.t. the inner loop but not the outer (e.g. `(p*q)+j` where `j` is
+  the outer induction var) is hoisted to the **inner** pre-header — still inside
+  the outer loop — while a fully-invariant `p*q` hoists out of the inner loop.
+  Each level hoists what is invariant at that level (correct, possibly not
+  maximal).
+- **Zero-trip loops**: hoisting work above a loop that may run zero times is
+  normally unsafe, but here it is safe **precisely because the value set is pure,
+  side-effect-free and non-faulting** — evaluating `a*b` before a never-executed
+  loop produces an unused temp with no observable effect. `DIV/MOD/SHR` and loads
+  are kept **out** of the value set (`ir_lower_pure_expr` returns 0 for them), so
+  a possibly-trapping op can never be hoisted above its guard. The LICM corpus
+  includes a `zero_trip_safe` case (accumulator stays 0, hoist still fires) and a
+  `clobbered_leaf_no_hoist` case (a written leaf → 0 hoists) to pin both edges.
+
+### Phase 3 safety argument
+
+The hoisted temp is the same erased 8-byte scalar as Phase-2's, holding the exact
+`%rax` value codegen would compute inline. Loop-invariance guarantees that value
+is identical on every iteration (no leaf is reassigned in the loop), so reading
+the temp inside the loop is value-preserving. The conservative give-up on
+calls / address-of / opaque stores ensures no aliased write is missed. The
+transform is therefore value-preserving → behaviorally correct, which the
+`ADDER_OPT=1` lane asserts against the seed oracle.
+
+### Verification (Phase 3)
+
+- **DEFAULT (ADDER_OPT unset)** is byte-inert: `fuzz_adder_diff.sh` 500/500,
+  0 miscompiles; `test_native_vs_seed_kobjdiff.sh` **PASS, 0 divergences over
+  10168 matched kernel functions**. `test_native_vs_seed_objdiff.sh` reports
+  **193 semantically-clean units** with the same 17 pre-existing divergent
+  userland units present **with and without** this change (verified by stashing
+  the four touched files and re-running — identical output); those units compile
+  via `codegen.ad`/`parser.ad`/`lexer.ad`, none of which Phase 3 touches, and
+  their import closure excludes `ir.ad`/`opt.ad`, so the divergence is unrelated
+  baseline drift, not a Phase-3 regression. `ir.ad`/`opt.ad`/the dump driver are
+  imported **only** by the host fuzz driver, never by the product compiler.
+- **ADDER_OPT=1 lane**: 500/500 correct vs oracle (const-folds 9720). The random
+  batch rarely emits loop-invariant *non-constant* subexpressions, so — as with
+  CSE — a dedicated **LICM corpus** (`_licm_corpus` in the fuzzer:
+  `while_inv_mul`, `while_partial_inv`, `nested_inner_inv`, `zero_trip_safe`,
+  `clobbered_leaf_no_hoist`) runs through `codegen.ad --opt` and asserts the
+  optimized output matches a computed oracle **and** that LICM demonstrably fires
+  (**5 hoists** across the corpus: invariant cases hoist, the partial/clobbered
+  cases prove it does **not** over-hoist, the zero-trip case proves hoisting is
+  side-effect-free). `opt_licm_count` is logged as `LICM <n>`.
+
+```sh
+ADDER_OPT=1 ADDER_FUZZ_DIFF_TARGET=ad-codegen \
+    python3 tests/fuzz/adder_fuzzer.py --ad-codegen --count 500 --seed 1
+```
+
+### Phased plan — what Phase 4 tackles
+
 - **Phase 4 — register allocation**: replace codegen.ad's spill-everything-via-
   `%rax`/`%rcx`-and-push model with a real allocator over IR values — the
   largest single ≤2×/parity-of-C win. This is where the IR earns its keep:
-  codegen lowers IR → instruction selection instead of walking the AST.
+  codegen lowers IR → instruction selection instead of walking the AST. Concrete
+  prerequisites the first three phases do **not** yet provide:
+  - **Whole-function IR, not per-expression snippets.** Phases 1–3 build IR for
+    individual pure subtrees (one `ir_reset()` per statement/loop body) and write
+    results back into the AST; codegen still walks the AST. Phase 4 needs the IR
+    to span a **whole function** with explicit control-flow (basic blocks +
+    successor edges) so values have a well-defined live range. This means lowering
+    *all* statements (assignments, calls, loads/stores, branches), not just the
+    pure CSE/LICM value set, into the IR.
+  - **Liveness analysis** over that CFG (def/use per IR value, backward
+    live-range computation), which the current straight-line value-numbering does
+    not compute.
+  - **An allocator** (linear-scan is the pragmatic first cut; graph-colouring
+    later) assigning IR values to the callee-saved/scratch register file with
+    spill slots, plus an **ABI/calling-convention model** (caller/callee-saved
+    split, argument registers) the current push-everything codegen sidesteps.
+  - **A codegen entry that consumes IR instead of the AST** — the inflection
+    point where `gen_expr`'s recursive AST walk is replaced by IR → instruction
+    selection. Until then the optimizer can only *rewrite the AST* (fold/CSE/LICM);
+    register allocation is the first pass that fundamentally cannot be expressed as
+    an AST-to-AST rewrite and forces the IR to become the real compilation unit.
+    Phase 4 should therefore land behind `ADDER_OPT` as a *parallel* IR codegen
+    path first (AST codegen stays the default), proven byte-/behaviour-correct via
+    the same lane before any cutover is even discussed.
 
 Each phase stays behind `ADDER_OPT` until its own correctness lane is green,
 and the seed remains the frozen oracle throughout.
