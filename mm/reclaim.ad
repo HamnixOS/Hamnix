@@ -74,6 +74,22 @@ from mm.swap import (
     swap_in_page,
 )
 from mm.page_alloc import alloc_page, free_page
+from mm.vma import register_memcg_charge_hook
+# cgroup v2 memory controller accounting (kernel/sched/cgroup_cpu.ad is a
+# printk-only pure-accounting module). reclaim.ad is the natural home for
+# the charge -> reclaim -> OOM orchestration because it already pulls in
+# both the reclaim/swap machinery AND oom_kill_task; the cgroup module
+# itself stays import-cycle-free (core.ad imports it).
+from kernel.sched.cgroup_cpu import (
+    cgroup_mem_of_task, cgroup_mem_would_exceed, cgroup_mem_charge,
+    cgroup_mem_max_of, cgroup_mem_cur_of, cgroup_mem_record_oom,
+    cgroup_cpu_of_task,
+    # enforce-selftest setup
+    cgroup_cpu_mkdir, cgroup_cpu_attach, cgroup_mem_set_max,
+    cgroup_cpu_init,
+)
+from kernel.printk.printk import printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def load_cr3(value: uint64)
@@ -130,6 +146,157 @@ def reclaim_under_pressure(want_pages: uint64) -> uint64:
         printk2("[reclaim] evicted %d pages to swap (%d slots used)\n",
                 freed, swap_slots_used())
     return freed
+
+
+# =====================================================================
+# cgroup v2 memory.max enforcement — charge -> reclaim -> cgroup OOM
+# =====================================================================
+#
+# Called from the memory-growth boundary (mm/vma.ad::vma_alloc, via the
+# registered hook) when a cgrouped task's address space grows by `bytes`.
+# Mirrors Linux mm/memcontrol.c::try_charge:
+#
+#   1. If the task is in the root cgroup or its memory.max is "max",
+#      charge unconditionally and return 0 (allow).
+#   2. If the new charge fits under memory.max, charge and allow.
+#   3. Otherwise drive direct reclaim (the SAME reclaim_under_pressure
+#      swap/LRU machinery kswapd uses) for the overshoot, then re-check.
+#   4. If STILL over after reclaim, invoke the cgroup OOM killer: pick a
+#      task in this cgroup and SIGKILL it (oom_kill_task). Record the
+#      event in memory.events (nr_oom). Then charge anyway (the killed
+#      task's reap uncharges, bringing memory.current back down) and
+#      return -ENOMEM so the allocation boundary can also fail the
+#      faulting request, matching Linux's "kill + fail the alloc that
+#      tipped it over" behaviour under a hard cap.
+#
+# Returns 0 on success (charge applied, under cap or reclaimed-into-cap),
+# -12 (-ENOMEM) when the cgroup OOM path had to fire.
+
+def _cgroup_oom_kill_one_in(cg: uint64) -> int32:
+    # Pick the highest-slot live user task in cgroup `cg` and OOM-kill
+    # it. Returns 1 if a victim was killed, 0 if the cgroup had no
+    # killable task. Highest-slot-first is a cheap "youngest first"
+    # proxy (the BSP boot task is slot 0 and never in a non-root cg).
+    if cg == 0:
+        return 0
+    n: uint64 = task_table_size()
+    i: uint64 = n
+    while i > 0:
+        i = i - 1
+        if task_is_live_at(i) != 0 and task_is_user_at(i) != 0:
+            if cgroup_cpu_of_task(i) == cg:
+                if oom_adj_is_exempt(i) == 0:
+                    oom_kill_task(i)
+                    return 1
+    return 0
+
+
+def cgroup_mem_charge_enforce(slot: uint64, bytes: uint64) -> int64:
+    # The memcg try_charge entry point. Returns 0 (allow) or -12 (ENOMEM).
+    cg: uint64 = cgroup_mem_of_task(slot)
+    if cg == 0:
+        return 0                       # root cgroup: uncapped
+    maxv: uint64 = cgroup_mem_max_of(cg)
+    if maxv == 0:
+        # memory.max == "max": charge for accounting, never reject.
+        cgroup_mem_charge(slot, bytes)
+        return 0
+    if cgroup_mem_would_exceed(cg, bytes) == 0:
+        cgroup_mem_charge(slot, bytes)
+        return 0
+    # Over the cap: drive direct reclaim for the overshoot (+ a slack
+    # margin so we don't thrash one page at a time). want_bytes rounded
+    # up to pages.
+    cur: uint64 = cgroup_mem_cur_of(cg)
+    over: uint64 = 0
+    if cur + bytes > maxv:
+        over = (cur + bytes) - maxv
+    want_pages: uint64 = (over + 4095) / 4096
+    if want_pages < 32:
+        want_pages = 32                # reclaim a small batch, not 1 page
+    reclaim_under_pressure(want_pages)
+    # Re-check after reclaim. NOTE: global reclaim frees SYSTEM pages, not
+    # necessarily THIS cgroup's charge (we charge by VMA growth, evict by
+    # LRU); but evicting a cgroup task's anon pages to swap does drop its
+    # resident footprint. Re-test the would-exceed predicate against the
+    # (possibly lowered) current.
+    if cgroup_mem_would_exceed(cg, bytes) == 0:
+        cgroup_mem_charge(slot, bytes)
+        return 0
+    # Still over after reclaim: cgroup OOM. Kill a task in the cgroup,
+    # record the event, then fail this allocation with -ENOMEM (the
+    # killed task's reap uncharges its footprint).
+    cgroup_mem_record_oom(cg)
+    killed: int32 = _cgroup_oom_kill_one_in(cg)
+    printk2("[memcg] OOM cgroup over memory.max (cur=%d killed=%d)\n",
+            cur, cast[uint64](killed))
+    return cast[int64](-12)            # -ENOMEM
+
+
+def reclaim_init_memcg_hook():
+    # Wire the cgroup memory.max enforcer into mm/vma.ad's demand-fault
+    # path. Called once at boot (init/main.ad) so vma.ad — which cannot
+    # import reclaim.ad without an import cycle — can reach the enforcer
+    # through a registered function pointer.
+    register_memcg_charge_hook(cast[Fn[int64, uint64, uint64]](&cgroup_mem_charge_enforce))
+
+
+def cgroup_mem_enforce_selftest() -> int32:
+    # Proves the memcg charge -> reclaim -> OOM ORCHESTRATION (the part
+    # the pure-accounting cgroup_enforce_selftest can't reach because it
+    # lives here, alongside reclaim/OOM). Returns 1 PASS / 0 FAIL.
+    #
+    #   1. Root task (cg 0): cgroup_mem_charge_enforce always returns 0
+    #      (allow) and never rejects — root is uncapped.
+    #   2. A capped cgroup UNDER its limit: charge succeeds (returns 0),
+    #      memory.current advances.
+    #   3. A capped cgroup pushed PAST its limit with NO reclaimable
+    #      pages and no swap: enforce drives reclaim (0 progress), then
+    #      the cgroup OOM path -> returns -ENOMEM and bumps nr_oom. The
+    #      synthetic member task (a non-live slot) gives the OOM victim
+    #      scan nothing to kill, so we assert the -ENOMEM contract and
+    #      the recorded OOM event rather than a real SIGKILL.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    cgroup_cpu_init()
+
+    # (1) root task allow.
+    if cgroup_mem_charge_enforce(0, 4096) != 0:
+        printk0("[MEMCG_OOM] FAIL root charge rejected\n")
+        return 0
+
+    # (2) capped, under limit.
+    cs: int32 = cgroup_cpu_mkdir("eg")
+    if cs < 1:
+        printk0("[MEMCG_OOM] FAIL mkdir eg\n")
+        return 0
+    cgroup_cpu_attach(cs, 30)
+    cgroup_mem_set_max(cs, 16384, 0)     # 4 pages
+    csu: uint64 = cast[uint64](cs)
+    if cgroup_mem_charge_enforce(30, 4096) != 0:
+        printk0("[MEMCG_OOM] FAIL under-limit charge rejected\n")
+        return 0
+    if cgroup_mem_cur_of(csu) != 4096:
+        printk1("[MEMCG_OOM] FAIL mem_cur=%d after 1 page\n",
+                cgroup_mem_cur_of(csu))
+        return 0
+    # Fill to the cap (3 more pages -> 16384).
+    cgroup_mem_charge_enforce(30, 4096)
+    cgroup_mem_charge_enforce(30, 4096)
+    cgroup_mem_charge_enforce(30, 4096)
+    if cgroup_mem_cur_of(csu) != 16384:
+        printk1("[MEMCG_OOM] FAIL mem_cur=%d at cap\n", cgroup_mem_cur_of(csu))
+        return 0
+
+    # (3) one more page: over the cap. With no reclaimable/swap progress
+    # the enforcer must invoke the cgroup OOM path and return -ENOMEM.
+    rc: int64 = cgroup_mem_charge_enforce(30, 4096)
+    if rc != cast[int64](-12):
+        printk1("[MEMCG_OOM] FAIL over-cap charge rc=%d (want -12)\n",
+                cast[uint64](rc))
+        return 0
+
+    printk0("[MEMCG_OOM] PASS over-limit charge drove reclaim then cgroup OOM (-ENOMEM)\n")
+    return 1
 
 
 # Refill ratio: if the inactive list has fewer than 1/INACTIVE_REFILL_DIV

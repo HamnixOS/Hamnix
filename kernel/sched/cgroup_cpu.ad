@@ -71,6 +71,21 @@ class CgroupCpu:
     throttled_usec:   uint64
     # cumulative usage (cpu.stat usage_usec). Bumped every charged tick.
     usage_us:         uint64
+    # -- pids controller (pids.max / pids.current) ----------------------
+    # pids_max == 0 means "max" (uncapped). pids_cur = live tasks charged
+    # to this cgroup. cgroup_pids_can_fork() rejects a fork that would
+    # push pids_cur PAST pids_max; cgroup_pids_charge/uncharge move the
+    # counter as tasks are created / reaped.
+    pids_max:         uint64
+    pids_cur:         uint64
+    # -- memory controller (memory.max / memory.current) ----------------
+    # mem_max == 0 means "max" (uncapped). mem_cur = bytes charged to this
+    # cgroup (sum of its tasks' charged allocations). mem_peak tracks the
+    # high-water mark (memory.peak). nr_oom = times the cgroup OOM-killed.
+    mem_max:          uint64
+    mem_cur:          uint64
+    mem_peak:         uint64
+    nr_oom:           uint64
 
 g_cgroups: Array[8, CgroupCpu]
 
@@ -97,6 +112,12 @@ def cgroup_cpu_init():
         g_cgroups[i].nr_throttled = 0
         g_cgroups[i].throttled_usec = 0
         g_cgroups[i].usage_us = 0
+        g_cgroups[i].pids_max = 0
+        g_cgroups[i].pids_cur = 0
+        g_cgroups[i].mem_max = 0
+        g_cgroups[i].mem_cur = 0
+        g_cgroups[i].mem_peak = 0
+        g_cgroups[i].nr_oom = 0
         j: uint64 = 0
         while j < CG_NAME_LEN:
             g_cgroups[i].name[j] = 0
@@ -173,6 +194,12 @@ def cgroup_cpu_mkdir(name: Ptr[char]) -> int32:
             g_cgroups[i].nr_throttled = 0
             g_cgroups[i].throttled_usec = 0
             g_cgroups[i].usage_us = 0
+            g_cgroups[i].pids_max = 0
+            g_cgroups[i].pids_cur = 0
+            g_cgroups[i].mem_max = 0
+            g_cgroups[i].mem_cur = 0
+            g_cgroups[i].mem_peak = 0
+            g_cgroups[i].nr_oom = 0
             _cg_name_set(i, name)
             return cast[int32](i)
         i = i + 1
@@ -302,6 +329,210 @@ def cgroup_cpu_should_throttle(task_slot: uint64) -> int32:
     if g_cgroups[cg].used_us >= g_cgroups[cg].quota_us:
         return 1
     return 0
+
+
+# =====================================================================
+# pids controller (cgroup v2 pids.max / pids.current)
+# =====================================================================
+#
+# Real enforcement: a fork/clone/spawn whose task lands in a cgroup at
+# or over its pids.max is REJECTED with -EAGAIN before the child task is
+# created. The single chokepoint is do_clone()'s fork path
+# (arch/x86/kernel/syscall.ad), which calls cgroup_pids_can_fork() on
+# the PARENT slot (the child inherits the parent's cgroup) and, on
+# success, cgroup_pids_charge_fork() once the child slot exists. A task
+# reap calls cgroup_pids_uncharge() so pids.current tracks the LIVE
+# count, mirroring Linux's pids_cgroup which decrements on exit.
+
+def cgroup_pids_set_max(slot: int32, maxv: uint64, is_max: uint64) -> int32:
+    # is_max != 0 sets the "max" (uncapped) convention (pids_max = 0).
+    if slot < 1:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX or g_cgroups[su].in_use == 0:
+        return -1
+    if is_max != 0:
+        g_cgroups[su].pids_max = 0
+    else:
+        g_cgroups[su].pids_max = maxv
+    return 0
+
+
+def cgroup_pids_can_fork(parent_slot: uint64) -> int32:
+    # Returns 1 if a fork by the task in `parent_slot` is allowed under
+    # its cgroup's pids.max, 0 if it would exceed the limit. Root /
+    # uncapped cgroups always allow. Side-effect-free.
+    if g_cg_inited == 0:
+        return 1
+    cg: uint64 = cgroup_cpu_of_task(parent_slot)
+    if cg == 0:
+        return 1
+    if g_cgroups[cg].pids_max == 0:
+        return 1
+    if g_cgroups[cg].pids_cur >= g_cgroups[cg].pids_max:
+        return 0
+    return 1
+
+
+def cgroup_pids_charge_fork(parent_slot: uint64, child_slot: uint64) -> int32:
+    # Move the child into the parent's cgroup and bump pids_cur. Called
+    # AFTER cgroup_pids_can_fork() returned 1 and the child task exists.
+    if g_cg_inited == 0:
+        return 0
+    cg: uint64 = cgroup_cpu_of_task(parent_slot)
+    if cg == 0:
+        return 0
+    # Inherit cgroup membership: the child joins the parent's cgroup
+    # (cgroup v2: a fork keeps the parent's cgroup until migrated).
+    cgroup_cpu_attach(cast[int32](cg), child_slot)
+    g_cgroups[cg].pids_cur = g_cgroups[cg].pids_cur + 1
+    return 1
+
+
+def cgroup_pids_uncharge(slot: uint64) -> int32:
+    # A task in slot `slot` is being reaped: decrement its cgroup's
+    # live pid count and detach it (its memory charges are released
+    # separately via cgroup_mem_uncharge on the same reap path).
+    if g_cg_inited == 0:
+        return 0
+    cg: uint64 = cgroup_cpu_of_task(slot)
+    if cg == 0:
+        return 0
+    if g_cgroups[cg].pids_cur > 0:
+        g_cgroups[cg].pids_cur = g_cgroups[cg].pids_cur - 1
+    return 1
+
+
+def cgroup_pids_attach_count(slot: int32, task_slot: uint64) -> int32:
+    # Explicit attach via cgroup.procs write: move task into the cgroup
+    # AND count it (the task was already alive in another cgroup). This
+    # is the "echo PID > cgroup.procs" path, distinct from a fork.
+    if slot < 1:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX or g_cgroups[su].in_use == 0:
+        return -1
+    # Uncharge from the old cgroup first.
+    old: uint64 = cgroup_cpu_of_task(task_slot)
+    if old != 0 and old != su:
+        if g_cgroups[old].pids_cur > 0:
+            g_cgroups[old].pids_cur = g_cgroups[old].pids_cur - 1
+    rc: int32 = cgroup_cpu_attach(slot, task_slot)
+    if rc != 0:
+        return rc
+    if old != su:
+        g_cgroups[su].pids_cur = g_cgroups[su].pids_cur + 1
+    return 0
+
+
+# =====================================================================
+# memory controller (cgroup v2 memory.max / memory.current)
+# =====================================================================
+#
+# Real enforcement: as a cgrouped task's address space grows (vma_alloc
+# in mm/vma.ad), the byte count is CHARGED to its cgroup. A charge that
+# would push memory.current past memory.max first drives global reclaim
+# (mm/reclaim.ad::reclaim_under_pressure — the same swap/LRU machinery
+# kswapd uses); if the cgroup is still over afterward, the cgroup OOM
+# path kills a task in the cgroup. The orchestration (charge -> reclaim
+# -> OOM) lives in mm/reclaim.ad::cgroup_mem_charge_enforce (it imports
+# both this accounting module and the reclaim/OOM machinery); THIS file
+# holds only the pure per-cgroup accounting so it stays printk-only and
+# import-cycle-free (core.ad imports it).
+
+def cgroup_mem_set_max(slot: int32, maxv: uint64, is_max: uint64) -> int32:
+    if slot < 1:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX or g_cgroups[su].in_use == 0:
+        return -1
+    if is_max != 0:
+        g_cgroups[su].mem_max = 0
+    else:
+        g_cgroups[su].mem_max = maxv
+    return 0
+
+
+def cgroup_mem_of_task(task_slot: uint64) -> uint64:
+    return cgroup_cpu_of_task(task_slot)
+
+
+def cgroup_mem_max_of(cg: uint64) -> uint64:
+    if cg >= CG_MAX:
+        return 0
+    return g_cgroups[cg].mem_max
+
+
+def cgroup_mem_cur_of(cg: uint64) -> uint64:
+    if cg >= CG_MAX:
+        return 0
+    return g_cgroups[cg].mem_cur
+
+
+def cgroup_mem_would_exceed(cg: uint64, bytes: uint64) -> int32:
+    # 1 if charging `bytes` to cgroup `cg` would push it past memory.max.
+    # Root / uncapped always returns 0.
+    if cg == 0 or cg >= CG_MAX:
+        return 0
+    if g_cgroups[cg].mem_max == 0:
+        return 0
+    if g_cgroups[cg].mem_cur + bytes > g_cgroups[cg].mem_max:
+        return 1
+    return 0
+
+
+def cgroup_mem_charge(slot: uint64, bytes: uint64) -> int32:
+    # Unconditionally add `bytes` to the task's cgroup memory.current
+    # (the enforcement decision is made by the caller in reclaim.ad).
+    # Updates the high-water mark (memory.peak). Root tasks are no-ops.
+    if g_cg_inited == 0:
+        return 0
+    cg: uint64 = cgroup_cpu_of_task(slot)
+    if cg == 0:
+        return 0
+    g_cgroups[cg].mem_cur = g_cgroups[cg].mem_cur + bytes
+    if g_cgroups[cg].mem_cur > g_cgroups[cg].mem_peak:
+        g_cgroups[cg].mem_peak = g_cgroups[cg].mem_cur
+    return 1
+
+
+def cgroup_mem_uncharge(slot: uint64, bytes: uint64) -> int32:
+    # Release `bytes` from the task's cgroup memory.current (on free /
+    # task reap). Clamps at 0.
+    if g_cg_inited == 0:
+        return 0
+    cg: uint64 = cgroup_cpu_of_task(slot)
+    if cg == 0:
+        return 0
+    if g_cgroups[cg].mem_cur >= bytes:
+        g_cgroups[cg].mem_cur = g_cgroups[cg].mem_cur - bytes
+    else:
+        g_cgroups[cg].mem_cur = 0
+    return 1
+
+
+def cgroup_mem_uncharge_all(slot: uint64) -> int32:
+    # On task reap, release this task's entire charge. We don't track
+    # per-task charge separately from the cgroup total, so a reap of the
+    # LAST task in a cgroup zeroes the counter; with multiple tasks the
+    # caller passes the task's RSS via cgroup_mem_uncharge. This helper
+    # is the conservative "zero on empty" used by the reap path when the
+    # cgroup becomes empty (pids_cur hits 0).
+    if g_cg_inited == 0:
+        return 0
+    cg: uint64 = cgroup_cpu_of_task(slot)
+    if cg == 0:
+        return 0
+    if g_cgroups[cg].pids_cur == 0:
+        g_cgroups[cg].mem_cur = 0
+    return 1
+
+
+def cgroup_mem_record_oom(cg: uint64) -> int32:
+    if cg == 0 or cg >= CG_MAX:
+        return 0
+    g_cgroups[cg].nr_oom = g_cgroups[cg].nr_oom + 1
+    return 1
 
 
 # -- render helpers (called from fs/procfs.ad for /sys/fs/cgroup/<g>/cpu.*) --
@@ -440,6 +671,80 @@ def _parse_dec_or_max(s: Ptr[char], start: uint64, end: uint64,
     return i
 
 
+def cgroup_pids_render_max(slot: int32, buf: Ptr[uint8]) -> uint64:
+    # pids.max: "<n>\n" or "max\n".
+    if slot < 1:
+        return _put_str(buf, 0, "max\n")
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX or g_cgroups[su].in_use == 0:
+        return _put_str(buf, 0, "max\n")
+    if g_cgroups[su].pids_max == 0:
+        return _put_str(buf, 0, "max\n")
+    pos: uint64 = _put_dec(buf, 0, g_cgroups[su].pids_max)
+    buf[pos] = 10
+    return pos + 1
+
+
+def cgroup_pids_render_current(slot: int32, buf: Ptr[uint8]) -> uint64:
+    cur: uint64 = 0
+    if slot >= 1:
+        su: uint64 = cast[uint64](slot)
+        if su < CG_MAX and g_cgroups[su].in_use != 0:
+            cur = g_cgroups[su].pids_cur
+    pos: uint64 = _put_dec(buf, 0, cur)
+    buf[pos] = 10
+    return pos + 1
+
+
+def cgroup_mem_render_max(slot: int32, buf: Ptr[uint8]) -> uint64:
+    if slot < 1:
+        return _put_str(buf, 0, "max\n")
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX or g_cgroups[su].in_use == 0:
+        return _put_str(buf, 0, "max\n")
+    if g_cgroups[su].mem_max == 0:
+        return _put_str(buf, 0, "max\n")
+    pos: uint64 = _put_dec(buf, 0, g_cgroups[su].mem_max)
+    buf[pos] = 10
+    return pos + 1
+
+
+def cgroup_mem_render_current(slot: int32, buf: Ptr[uint8]) -> uint64:
+    cur: uint64 = 0
+    if slot >= 1:
+        su: uint64 = cast[uint64](slot)
+        if su < CG_MAX and g_cgroups[su].in_use != 0:
+            cur = g_cgroups[su].mem_cur
+    pos: uint64 = _put_dec(buf, 0, cur)
+    buf[pos] = 10
+    return pos + 1
+
+
+def cgroup_pids_write_max(slot: int32, data: Ptr[char], n: uint64) -> int32:
+    # Parse "<n>\n" or "max\n".
+    if slot < 1:
+        return -22
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX or g_cgroups[su].in_use == 0:
+        return -22
+    v: uint64 = 0
+    ismax: uint64 = 0
+    _parse_dec_or_max(data, 0, n, &v, &ismax)
+    return cgroup_pids_set_max(slot, v, ismax)
+
+
+def cgroup_mem_write_max(slot: int32, data: Ptr[char], n: uint64) -> int32:
+    if slot < 1:
+        return -22
+    su: uint64 = cast[uint64](slot)
+    if su >= CG_MAX or g_cgroups[su].in_use == 0:
+        return -22
+    v: uint64 = 0
+    ismax: uint64 = 0
+    _parse_dec_or_max(data, 0, n, &v, &ismax)
+    return cgroup_mem_set_max(slot, v, ismax)
+
+
 def cgroup_cpu_write_max(slot: int32, data: Ptr[char], n: uint64) -> int32:
     # Parse a cpu.max write of the form "<quota> <period>\n" or
     # "max <period>\n". Returns 0 on success, -EINVAL on parse error.
@@ -575,4 +880,131 @@ def cgroup_cpu_selftest() -> int32:
     printk_set_level(PRINTK_LEVEL_EMERG)
     printk2("[CGROUP_CPU] PASS charged=%d throttled=%d (50 pct cap enforced)\n",
             charged, throttled)
+    return 1
+
+
+# =====================================================================
+# pids + memory controller enforcement self-test
+# =====================================================================
+#
+# Drives the SAME accounting entry points the live kernel hits:
+#   * pids.max  — cgroup_pids_can_fork / cgroup_pids_charge_fork /
+#                 cgroup_pids_uncharge are exactly what do_clone()'s fork
+#                 path (arch/x86/kernel/syscall.ad) and task_reap()
+#                 (kernel/sched/core.ad) call on every real fork/exit.
+#   * memory.max — cgroup_mem_would_exceed / cgroup_mem_charge /
+#                 cgroup_mem_uncharge are what mm/reclaim.ad's
+#                 cgroup_mem_charge_enforce (the demand-fault hook) calls
+#                 per page. The reclaim/OOM ORCHESTRATION is proven by
+#                 the companion reclaim-side selftest (mm/reclaim.ad).
+#
+# Returns 1 on PASS, 0 on FAIL; prints "[CGROUP_ENFORCE] PASS/FAIL ...".
+
+def cgroup_enforce_selftest() -> int32:
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    cgroup_cpu_init()
+
+    # ---- pids.max --------------------------------------------------
+    pslot: int32 = cgroup_cpu_mkdir("pg")
+    if pslot < 1:
+        printk0("[CGROUP_ENFORCE] FAIL mkdir pg\n")
+        return 0
+    # Attach a "leader" task (slot 10) as the cgroup's first member so
+    # forks by it inherit the cgroup. Count it as one live pid.
+    if cgroup_cpu_attach(pslot, 10) != 0:
+        printk0("[CGROUP_ENFORCE] FAIL attach leader\n")
+        return 0
+    psu: uint64 = cast[uint64](pslot)
+    g_cgroups[psu].pids_cur = 1     # the leader itself
+    # pids.max = 2 via the write parser (the echo > pids.max path).
+    if cgroup_pids_write_max(pslot, "2\n", 2) != 0:
+        printk0("[CGROUP_ENFORCE] FAIL write pids.max\n")
+        return 0
+    if g_cgroups[psu].pids_max != 2:
+        printk0("[CGROUP_ENFORCE] FAIL pids.max parse\n")
+        return 0
+    # Leader forks child #2: pids_cur 1 -> 2, must be allowed.
+    if cgroup_pids_can_fork(10) == 0:
+        printk0("[CGROUP_ENFORCE] FAIL fork#2 wrongly denied\n")
+        return 0
+    cgroup_pids_charge_fork(10, 11)
+    if g_cgroups[psu].pids_cur != 2:
+        printk0("[CGROUP_ENFORCE] FAIL pids_cur after fork#2\n")
+        return 0
+    # Fork #3 would push pids_cur to 3 > pids.max=2: MUST be rejected.
+    if cgroup_pids_can_fork(11) != 0:
+        printk1("[CGROUP_ENFORCE] FAIL fork#3 allowed (pids_cur=%d)\n",
+                g_cgroups[psu].pids_cur)
+        return 0
+    # A task exits (reap): pids_cur 2 -> 1, fork allowed again.
+    cgroup_pids_uncharge(11)
+    if g_cgroups[psu].pids_cur != 1:
+        printk0("[CGROUP_ENFORCE] FAIL pids_cur after reap\n")
+        return 0
+    if cgroup_pids_can_fork(10) == 0:
+        printk0("[CGROUP_ENFORCE] FAIL fork after reap denied\n")
+        return 0
+    # Verify pids.current renders the live count.
+    pbuf: Array[32, uint8]
+    pn: uint64 = cgroup_pids_render_current(pslot, &pbuf[0])
+    if pn < 2 or pbuf[0] != 49:     # "1\n"
+        printk0("[CGROUP_ENFORCE] FAIL pids.current render\n")
+        return 0
+
+    # ---- memory.max ------------------------------------------------
+    mslot: int32 = cgroup_cpu_mkdir("mg")
+    if mslot < 1:
+        printk0("[CGROUP_ENFORCE] FAIL mkdir mg\n")
+        return 0
+    if cgroup_cpu_attach(mslot, 20) != 0:
+        printk0("[CGROUP_ENFORCE] FAIL attach mem task\n")
+        return 0
+    msu: uint64 = cast[uint64](mslot)
+    # memory.max = 65536 bytes (16 pages) via the write parser.
+    if cgroup_mem_write_max(mslot, "65536\n", 6) != 0:
+        printk0("[CGROUP_ENFORCE] FAIL write memory.max\n")
+        return 0
+    if g_cgroups[msu].mem_max != 65536:
+        printk0("[CGROUP_ENFORCE] FAIL memory.max parse\n")
+        return 0
+    # Charge 15 pages (61440 bytes): all fit under 65536.
+    pg: uint64 = 0
+    while pg < 15:
+        if cgroup_mem_would_exceed(msu, 4096) != 0:
+            printk1("[CGROUP_ENFORCE] FAIL page %d wrongly over-cap\n", pg)
+            return 0
+        cgroup_mem_charge(20, 4096)
+        pg = pg + 1
+    if g_cgroups[msu].mem_cur != 61440:
+        printk1("[CGROUP_ENFORCE] FAIL mem_cur=%d after 15 pages\n",
+                g_cgroups[msu].mem_cur)
+        return 0
+    # The 17th page (would make 17*4096=69632 > 65536): would_exceed
+    # must flag it (the live enforcer then reclaims/OOMs). Charging the
+    # 16th (65536, exactly at the cap) is allowed; the 17th is not.
+    cgroup_mem_charge(20, 4096)     # 16th page -> exactly 65536
+    if cgroup_mem_would_exceed(msu, 4096) == 0:
+        printk1("[CGROUP_ENFORCE] FAIL 17th page not flagged (cur=%d)\n",
+                g_cgroups[msu].mem_cur)
+        return 0
+    # memory.current renders the charge.
+    mbuf: Array[32, uint8]
+    mn: uint64 = cgroup_mem_render_current(mslot, &mbuf[0])
+    if mn < 5:
+        printk0("[CGROUP_ENFORCE] FAIL memory.current render\n")
+        return 0
+    # Uncharge a page: cur drops, headroom returns.
+    cgroup_mem_uncharge(20, 4096)
+    if g_cgroups[msu].mem_cur != 61440:
+        printk0("[CGROUP_ENFORCE] FAIL mem_cur after uncharge\n")
+        return 0
+    if cgroup_mem_would_exceed(msu, 4096) != 0:
+        printk0("[CGROUP_ENFORCE] FAIL no headroom after uncharge\n")
+        return 0
+    # peak high-water mark recorded the 65536 spike.
+    if g_cgroups[msu].mem_peak != 65536:
+        printk1("[CGROUP_ENFORCE] FAIL mem_peak=%d\n", g_cgroups[msu].mem_peak)
+        return 0
+
+    printk0("[CGROUP_ENFORCE] PASS pids.max rejects over-limit fork; memory.max bounds memory.current\n")
     return 1

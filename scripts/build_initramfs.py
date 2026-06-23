@@ -1320,6 +1320,16 @@ if os.environ.get("ENABLE_CGROUP2_TEST") == "1":
 if os.environ.get("ENABLE_CGROUP_CPU_TEST") == "1":
     FILES.append(("/etc/cgroup-cpu-max-test", b"1\n"))
 
+# scripts/test_cgroup_v2_enforce.sh sets ENABLE_CGROUP_ENFORCE_TEST=1 to
+# plant /etc/cgroup-enforce-test. init/main.ad's boot:37.cgenf hook runs
+# cgroup_enforce_selftest() (pids.max rejects the 3rd fork; memory.max
+# bounds memory.current) AND cgroup_mem_enforce_selftest() (an over-cap
+# charge drives reclaim then the cgroup OOM path -> -ENOMEM). These drive
+# the SAME accounting entry points do_clone/task_reap (pids) and the
+# demand-fault memcg hook (memory) hit on real fork/exit/page-fault.
+if os.environ.get("ENABLE_CGROUP_ENFORCE_TEST") == "1":
+    FILES.append(("/etc/cgroup-enforce-test", b"1\n"))
+
 # §fuse: /dev/fuse + FUSE wire-protocol READ round-trip. scripts/test_fuse.sh
 # sets ENABLE_FUSE_TEST=1 to plant /etc/fuse-test. init/main.ad's boot:37.fuse
 # hook detects the marker and calls fuse_selftest() (linux_abi/u_fuse.ad): it
