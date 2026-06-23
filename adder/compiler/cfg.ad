@@ -1,0 +1,1065 @@
+# adder/compiler/cfg.ad
+#
+# Native Adder optimizer — Phase 4 GROUNDWORK: whole-function CFG / basic-block
+# IR + backward-dataflow liveness analysis + a structural self-validator.
+#
+# WHAT THIS IS (and is NOT)
+# -------------------------
+# Phases 1-3 (ir.ad/opt.ad) operate on PER-EXPRESSION / PER-STATEMENT IR
+# snippets: const-fold collapses a constant subtree, CSE numbers one statement's
+# pure expression, LICM scans one loop body. None of them have a WHOLE-FUNCTION
+# control-flow view, and none of them have liveness. A register allocator (the
+# big "parity-of-C" Phase-4 win) needs BOTH: a control-flow graph of basic
+# blocks and per-program-point live sets to know which values are simultaneously
+# live (so it can color them onto a finite register file).
+#
+# This file builds exactly that ANALYSIS INFRASTRUCTURE and NOTHING ELSE:
+#   1. ast->CFG lowering: a whole function body is lowered into a graph of basic
+#      blocks (straight-line instruction runs terminated by a branch/jump/ret),
+#      with successor/predecessor edges, covering if/elif/else, while, for,
+#      do-while, return, break, continue.
+#   2. liveness: standard backward dataflow (live-in/live-out per block from the
+#      use/def sets + successor fixpoint), the input a future allocator consumes.
+#   3. a self-validator: builds the CFG+liveness and asserts structural
+#      invariants (every block has a terminator; every edge endpoint exists;
+#      liveness reaches a fixpoint; no use-before-def of a non-live-in value
+#      within a block). The fuzzer runs this over the corpus as a NON-codegen-
+#      affecting lane.
+#
+# HARD INVARIANT — THIS CANNOT CHANGE CODEGEN OUTPUT
+#   This module is PURE ANALYSIS. It NEVER mutates the AST (unlike opt.ad's
+#   fold/CSE/LICM which rewrite nodes in place). It only READS nd_* arrays and
+#   writes its OWN private arena (bb_*, ci_*, live_*). Nothing on the default
+#   AST->codegen path calls anything here; it is reachable ONLY via the dump
+#   driver's --dump-cfg mode and the fuzzer's CFG lane. With that flag absent
+#   the module is never entered and codegen output is byte-for-byte unchanged.
+#
+# DESIGN — instruction model for liveness
+#   A future allocator needs def/use sets per program point. We do NOT need a
+#   full value-level IR for that (Phases 1-3 already model values); we need the
+#   NAME-level def/use of each statement, threaded through the CFG. So a CFG
+#   "instruction" (ci_*) is a thin record:
+#       ci_def      : the identifier name DEFINED here (0-len if none), and
+#       ci_use[0..]  : the identifier names USED (read) here.
+#   That is precisely the granularity liveness consumes: a variable is live at a
+#   point if it MAY be read before its next write. Modelling names (not SSA
+#   values) keeps the lowering total over the whole language subset and provably
+#   side-effect-free. Expression structure within a statement is irrelevant to
+#   block-level liveness, so we flatten an expression to the SET of identifier
+#   names it reads.
+#
+# WHAT THE LOWERING COVERS vs SKIPS (documented for the Phase-4 handoff)
+#   COVERS (structural control flow + name-level def/use):
+#     * straight-line statements: var-decl, assign (plain + augmented), expr-stmt
+#     * return (terminates the block; edge to the function EXIT block)
+#     * if / elif-chain / else  (cond block -> then/else successors -> join)
+#     * while            (header cond -> body / exit; body back-edge to header)
+#     * do-while         (body -> cond -> body back-edge / exit)
+#     * for / for-unpack (header -> body / exit; induction var def in header)
+#     * break            (edge to the nearest enclosing loop EXIT block)
+#     * continue         (edge to the nearest enclosing loop CONTINUE target)
+#   USE/DEF extraction:
+#     * an ND_IDENT read anywhere in an r-value expression  -> a USE
+#     * an assign/var-decl/for-induction target ident       -> a DEF
+#     * a CALL or address-of is recorded as a USE of its ident operands but does
+#       NOT (in this groundwork) model the may-clobber-through-pointer effect a
+#       real allocator's alias analysis would need (see SKIPS).
+#   SKIPS (documented limitations — these are the gaps before regalloc):
+#     * NO alias / may-clobber modelling for stores through index/member/deref
+#       or through a call; those are treated as plain uses of their ident
+#       operands. Liveness is therefore SOUND for register candidates that are
+#       never address-taken (the only ones a first allocator would color), but a
+#       real allocator must add this before trusting liveness for address-taken
+#       storage. The validator does NOT assert anything that this gap could
+#       violate.
+#     * NO SSA / phi nodes — liveness here is the classic non-SSA name dataflow.
+#       A future allocator can either color directly on this or build SSA on top.
+#     * match/try/with/defer/yield/raise statements are lowered as straight-line
+#       instructions in the current block (their nested bodies' control flow is
+#       NOT modelled). They are outside the fuzzer/seed subset codegen accepts,
+#       so they never appear in the corpus; the lowering stays total by treating
+#       them as opaque side-effecting instructions (use-scan their child slots).
+#     * nested expression evaluation ORDER is not modelled (irrelevant to
+#       block-level liveness); only the name SET matters.
+
+from compiler.parser import (
+    nd_kind,
+    nd_aux,
+    nd_num,
+    nd_name_off,
+    nd_name_len,
+    nd_a,
+    nd_b,
+    nd_c,
+    nd_d,
+    nd_next,
+    ND_IDENT,
+    ND_INT_LIT,
+    ND_BINARY,
+    ND_UNARY,
+    ND_CALL,
+    ND_VAR_DECL,
+    ND_ASSIGN,
+    ND_EXPR_STMT,
+    ND_RETURN,
+    ND_IF,
+    ND_ELIF,
+    ND_WHILE,
+    ND_DO_WHILE,
+    ND_FOR,
+    ND_FOR_UNPACK,
+    ND_BREAK,
+    ND_CONTINUE,
+    ND_FUNCTION,
+)
+
+from compiler.lexer import (
+    strbuf,
+)
+
+from compiler.ir import (
+    ir_name_eq,
+)
+
+# =======================================================================
+# Name table — interned identifier names referenced by CFG instructions.
+# =======================================================================
+#
+# Liveness operates over a finite set of variable names. We intern each distinct
+# (off,len) name into a dense small integer (a "name id") so block live sets can
+# be fixed-width bitsets indexed by name id. Interning is per-function (reset by
+# cfg_reset). The bitset width caps the distinct locals a function may have for
+# the analysis; overflow is reported (cfg_overflow) and the validator treats an
+# overflowed function as skipped, never as a failure.
+
+NM_MAX: uint32 = 256                  # max distinct names per function
+nm_off: Array[256, uint32]
+nm_len: Array[256, uint32]
+nm_count: uint32 = 0
+
+
+def nm_reset():
+    nm_count = 0
+
+
+# Intern a name; returns its id, or NM_MAX on overflow (caller checks).
+def nm_intern(off: uint32, len_: uint32) -> uint32:
+    i: uint32 = 0
+    while i < nm_count:
+        if ir_name_eq(nm_off[i], nm_len[i], off, len_) != 0:
+            return i
+        i = i + 1
+    if nm_count >= NM_MAX:
+        return NM_MAX
+    id: uint32 = nm_count
+    nm_off[id] = off
+    nm_len[id] = len_
+    nm_count = nm_count + 1
+    return id
+
+
+# =======================================================================
+# CFG instruction pool — flat array; each BB owns a contiguous [start,start+n).
+# =======================================================================
+#
+# An instruction records the name DEFINED (ci_def, NM_NONE if none) and a small
+# vector of name ids USED. Uses beyond CI_MAX_USE are dropped conservatively for
+# liveness soundness we OR all uses into the block use-set anyway, but the
+# per-instruction record caps the vector for the use-before-def validator scan.
+
+NM_NONE: uint32 = 0x7fffffff          # sentinel: no name id
+
+CI_MAX: uint32 = 16384
+CI_MAX_USE: uint32 = 6
+ci_def: Array[16384, uint32]          # name id defined (or NM_NONE)
+ci_use: Array[98304, uint32]          # CI_MAX * CI_MAX_USE, flattened
+ci_nuse: Array[16384, uint32]         # number of valid entries in ci_use row
+ci_count: uint32 = 0
+
+
+def ci_reset():
+    ci_count = 0
+
+
+# Allocate a fresh instruction with the given def name id; returns its index, or
+# CI_MAX on overflow.
+def ci_new(defid: uint32) -> uint32:
+    if ci_count >= CI_MAX:
+        return CI_MAX
+    id: uint32 = ci_count
+    ci_count = ci_count + 1
+    ci_def[id] = defid
+    ci_nuse[id] = 0
+    return id
+
+
+def ci_add_use(id: uint32, useid: uint32):
+    if useid == NM_NONE or useid >= NM_MAX:
+        return
+    n: uint32 = ci_nuse[id]
+    if n >= CI_MAX_USE:
+        return
+    ci_use[id * CI_MAX_USE + n] = useid
+    ci_nuse[id] = n + 1
+
+
+# =======================================================================
+# Basic blocks — straight-line instruction run + up to two successors.
+# =======================================================================
+#
+# Every block has a TERMINATOR (modeled implicitly: a block with bb_succ_n
+# successors and a terminator kind). The function has a synthetic ENTRY block
+# (bb 0 after reset's first alloc) and a synthetic EXIT block; every return / a
+# fallthrough off the last block targets EXIT. A block's instruction range is
+# [bb_first, bb_first+bb_ninstr).
+
+# Terminator kinds (documentation/validation only; structure is in bb_succ_*).
+BBT_NONE: uint32 = 0          # not yet terminated (invalid at validate time)
+BBT_FALL: uint32 = 1          # unconditional fallthrough/jump (1 succ)
+BBT_COND: uint32 = 2          # conditional branch (2 succ: taken, not-taken)
+BBT_RET: uint32 = 3           # return (1 succ: the EXIT block)
+BBT_EXIT: uint32 = 4          # the unique EXIT block (0 succ; valid terminator)
+
+BB_MAX: uint32 = 8192
+bb_first: Array[8192, uint32]         # first instruction index
+bb_ninstr: Array[8192, uint32]        # instruction count
+bb_term: Array[8192, uint32]          # BBT_*
+bb_succ0: Array[8192, uint32]         # successor block id (or BB_NONE)
+bb_succ1: Array[8192, uint32]
+bb_succ_n: Array[8192, uint32]        # 0/1/2
+bb_count: uint32 = 0
+
+BB_NONE: uint32 = 0xffffffff
+
+# The synthetic EXIT block id for the current function.
+cfg_exit_bb: uint32 = 0
+
+# Overflow flag: set if any arena (names/instrs/blocks) filled. An overflowed
+# function is reported and SKIPPED by the validator (never counted a failure).
+cfg_overflow: uint32 = 0
+
+
+def bb_new() -> uint32:
+    if bb_count >= BB_MAX:
+        cfg_overflow = 1
+        return BB_NONE
+    id: uint32 = bb_count
+    bb_count = bb_count + 1
+    bb_first[id] = ci_count
+    bb_ninstr[id] = 0
+    bb_term[id] = BBT_NONE
+    bb_succ0[id] = BB_NONE
+    bb_succ1[id] = BB_NONE
+    bb_succ_n[id] = 0
+    return id
+
+
+# Append the just-allocated instruction (the most recent ci_new) to block `bb`.
+# Instructions are emitted into the flat pool in block order, so a block's
+# instruction range stays contiguous as long as we finish a block before
+# starting the next. The lowering guarantees that ordering.
+def bb_note_instr(bb: uint32):
+    if bb == BB_NONE:
+        return
+    bb_ninstr[bb] = bb_ninstr[bb] + 1
+
+
+def bb_set_term1(bb: uint32, term: uint32, s0: uint32):
+    if bb == BB_NONE:
+        return
+    bb_term[bb] = term
+    bb_succ0[bb] = s0
+    bb_succ_n[bb] = 1
+
+
+def bb_set_term2(bb: uint32, term: uint32, s0: uint32, s1: uint32):
+    if bb == BB_NONE:
+        return
+    bb_term[bb] = term
+    bb_succ0[bb] = s0
+    bb_succ1[bb] = s1
+    bb_succ_n[bb] = 2
+
+
+def cfg_reset():
+    nm_reset()
+    ci_reset()
+    bb_count = 0
+    cfg_overflow = 0
+    cfg_exit_bb = 0
+
+
+# =======================================================================
+# Loop context stack — for break/continue edge targets.
+# =======================================================================
+#
+# break  targets the nearest enclosing loop's EXIT block.
+# continue targets the nearest enclosing loop's CONTINUE target (the header for
+#          while/for, the cond block for do-while).
+
+LOOP_MAX: uint32 = 256
+loop_break_bb: Array[256, uint32]
+loop_cont_bb: Array[256, uint32]
+cfg_loop_depth: uint32 = 0
+
+
+def loop_push(break_bb: uint32, cont_bb: uint32):
+    if cfg_loop_depth >= LOOP_MAX:
+        cfg_overflow = 1
+        return
+    loop_break_bb[cfg_loop_depth] = break_bb
+    loop_cont_bb[cfg_loop_depth] = cont_bb
+    cfg_loop_depth = cfg_loop_depth + 1
+
+
+def loop_pop():
+    if cfg_loop_depth > 0:
+        cfg_loop_depth = cfg_loop_depth - 1
+
+
+# =======================================================================
+# Use/def extraction from an expression subtree.
+# =======================================================================
+#
+# Scan an r-value expression and add every ND_IDENT read it contains as a USE of
+# the instruction `ci`. This is a conservative over-approximation: it visits ALL
+# child slots, so it catches idents nested under casts, calls, index, member,
+# unary, conditional, etc. Literals/types contribute no uses.
+def cfg_scan_uses(ci: uint32, node: uint32):
+    if node == 0:
+        return
+    k: uint32 = nd_kind[node]
+    if k == ND_INT_LIT:
+        return
+    if k == ND_IDENT:
+        nid: uint32 = nm_intern(nd_name_off[node], nd_name_len[node])
+        if nid >= NM_MAX:
+            cfg_overflow = 1
+            return
+        ci_add_use(ci, nid)
+        return
+    # Generic descent over expression child slots. (We do NOT follow nd_next
+    # here: nd_next chains are sibling STATEMENTS / arg-list elements; for an
+    # expression operand the relevant arguments hang off a/b/c/d, and an arg
+    # CHAIN root is reached via a/b then nd_next of its head — handled below.)
+    cfg_scan_uses(ci, nd_a[node])
+    cfg_scan_uses(ci, nd_b[node])
+    cfg_scan_uses(ci, nd_c[node])
+    cfg_scan_uses(ci, nd_d[node])
+    # Argument / element chains (calls, list/tuple literals, struct init) hang a
+    # CHAIN off a child slot and thread siblings via nd_next. Follow the chain
+    # from each child's siblings so call argument idents are counted as uses.
+    cfg_scan_use_chain(ci, nd_next[nd_a[node]])
+    cfg_scan_use_chain(ci, nd_next[nd_b[node]])
+
+
+# Follow a sibling chain of expressions, scanning each for uses.
+def cfg_scan_use_chain(ci: uint32, head: uint32):
+    n: uint32 = head
+    while n != 0:
+        cfg_scan_uses(ci, n)
+        n = nd_next[n]
+
+
+# =======================================================================
+# Statement -> instruction(s) lowering within the CURRENT block.
+# =======================================================================
+#
+# Returns the (possibly new) current block id after the statement. Control-flow
+# statements split the current block and create new ones; straight-line
+# statements append an instruction and return the same block.
+
+# Emit a straight-line instruction with an optional def name (def_off/def_len,
+# def_present) into block `bb`, scanning `use_expr` for uses.
+def cfg_emit_stmt(bb: uint32, def_present: uint32, def_off: uint32,
+                  def_len: uint32, use_expr: uint32):
+    defid: uint32 = NM_NONE
+    if def_present != 0:
+        d: uint32 = nm_intern(def_off, def_len)
+        if d >= NM_MAX:
+            cfg_overflow = 1
+            return
+        defid = d
+    ci: uint32 = ci_new(defid)
+    if ci >= CI_MAX:
+        cfg_overflow = 1
+        return
+    cfg_scan_uses(ci, use_expr)
+    bb_note_instr(bb)
+
+
+# Lower a single statement. `bb` is the current block. Returns the block control
+# falls through into after the statement (BB_NONE if control cannot fall through,
+# e.g. after return/break/continue — the caller starts an unreachable successor).
+def cfg_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
+    if bb == BB_NONE:
+        return BB_NONE
+    k: uint32 = nd_kind[stmt]
+
+    if k == ND_VAR_DECL:
+        # def = the declared name; uses = the initializer expression.
+        cfg_emit_stmt(bb, 1, nd_name_off[stmt], nd_name_len[stmt], nd_b[stmt])
+        return bb
+
+    if k == ND_ASSIGN:
+        # Plain `x = e`  : def x, uses(e).
+        # Augmented `x op= e` (aux != 0): x is BOTH used and defined.
+        # Non-ident target (index/member/deref): a STORE — no name def; the
+        # target's idents and the value's idents are uses. (Alias effect skipped
+        # — see header SKIPS.)
+        target: uint32 = nd_a[stmt]
+        if nd_kind[target] == ND_IDENT:
+            doff: uint32 = nd_name_off[target]
+            dlen: uint32 = nd_name_len[target]
+            tid: uint32 = nm_intern(doff, dlen)
+            if tid >= NM_MAX:
+                cfg_overflow = 1
+                return bb
+            aci: uint32 = ci_new(tid)
+            if aci >= CI_MAX:
+                cfg_overflow = 1
+                return bb
+            cfg_scan_uses(aci, nd_b[stmt])
+            if nd_aux[stmt] != 0:
+                # augmented: target is also read
+                ci_add_use(aci, tid)
+            bb_note_instr(bb)
+        else:
+            # store through a non-ident lvalue: an instruction with no def.
+            ci2: uint32 = ci_new(NM_NONE)
+            if ci2 >= CI_MAX:
+                cfg_overflow = 1
+                return bb
+            cfg_scan_uses(ci2, target)
+            cfg_scan_uses(ci2, nd_b[stmt])
+            bb_note_instr(bb)
+        return bb
+
+    if k == ND_EXPR_STMT:
+        cfg_emit_stmt(bb, 0, 0, 0, nd_a[stmt])
+        return bb
+
+    if k == ND_RETURN:
+        # uses = the returned expression; terminates with an edge to EXIT.
+        ci: uint32 = ci_new(NM_NONE)
+        if ci >= CI_MAX:
+            cfg_overflow = 1
+            return BB_NONE
+        cfg_scan_uses(ci, nd_a[stmt])
+        bb_note_instr(bb)
+        bb_set_term1(bb, BBT_RET, cfg_exit_bb)
+        return BB_NONE
+
+    if k == ND_BREAK:
+        if cfg_loop_depth > 0:
+            bb_set_term1(bb, BBT_FALL, loop_break_bb[cfg_loop_depth - 1])
+        else:
+            bb_set_term1(bb, BBT_FALL, cfg_exit_bb)
+        return BB_NONE
+
+    if k == ND_CONTINUE:
+        if cfg_loop_depth > 0:
+            bb_set_term1(bb, BBT_FALL, loop_cont_bb[cfg_loop_depth - 1])
+        else:
+            bb_set_term1(bb, BBT_FALL, cfg_exit_bb)
+        return BB_NONE
+
+    if k == ND_IF:
+        return cfg_lower_if(bb, stmt)
+
+    if k == ND_WHILE:
+        return cfg_lower_while(bb, stmt)
+
+    if k == ND_DO_WHILE:
+        return cfg_lower_do_while(bb, stmt)
+
+    if k == ND_FOR:
+        return cfg_lower_for(bb, stmt, 1)
+
+    if k == ND_FOR_UNPACK:
+        return cfg_lower_for(bb, stmt, 0)
+
+    # Opaque side-effecting statement (match/try/with/defer/yield/raise/pass/
+    # global/etc.). Treat as a straight-line instruction; scan its child slots
+    # for uses so liveness stays a conservative over-approximation. Its nested
+    # control flow is NOT modeled (documented SKIP; outside the codegen subset).
+    ci3: uint32 = ci_new(NM_NONE)
+    if ci3 >= CI_MAX:
+        cfg_overflow = 1
+        return bb
+    cfg_scan_uses(ci3, nd_a[stmt])
+    cfg_scan_uses(ci3, nd_b[stmt])
+    cfg_scan_uses(ci3, nd_c[stmt])
+    cfg_scan_uses(ci3, nd_d[stmt])
+    bb_note_instr(bb)
+    return bb
+
+
+# Lower a statement chain (a block body) into the CFG, threading the current
+# block. Returns the fallthrough block after the chain (BB_NONE if control
+# cannot fall through it).
+def cfg_lower_chain(bb: uint32, head: uint32) -> uint32:
+    cur: uint32 = bb
+    s: uint32 = head
+    while s != 0:
+        if cur == BB_NONE:
+            # Unreachable code after a return/break/continue. Start a fresh
+            # (unreachable but well-formed) block so the remaining statements
+            # still lower into a terminated block — keeps the invariant that
+            # every block has a terminator.
+            cur = bb_new()
+            if cur == BB_NONE:
+                return BB_NONE
+        cur = cfg_lower_stmt(cur, s)
+        s = nd_next[s]
+    return cur
+
+
+# --- if / elif / else ---------------------------------------------------
+#
+# cond block (the current bb) conditionally branches to the THEN entry and the
+# next alternative (elif cond / else / join). Each arm's tail falls through to a
+# shared JOIN block.
+def cfg_lower_if(bb: uint32, stmt: uint32) -> uint32:
+    # uses of the condition live in the current block as a cond instruction.
+    cci: uint32 = ci_new(NM_NONE)
+    if cci >= CI_MAX:
+        cfg_overflow = 1
+        return bb
+    cfg_scan_uses(cci, nd_a[stmt])
+    bb_note_instr(bb)
+
+    join: uint32 = bb_new()
+    if join == BB_NONE:
+        return BB_NONE
+
+    # THEN arm.
+    then_bb: uint32 = bb_new()
+    if then_bb == BB_NONE:
+        return BB_NONE
+    then_tail: uint32 = cfg_lower_chain(then_bb, nd_b[stmt])
+    if then_tail != BB_NONE:
+        bb_set_term1(then_tail, BBT_FALL, join)
+
+    # The "else" path of this cond: the first elif's cond block, or the else
+    # body, or the join directly.
+    else_entry: uint32 = cfg_lower_if_alts(nd_c[stmt], nd_d[stmt], join)
+    if else_entry == BB_NONE:
+        return BB_NONE
+
+    bb_set_term2(bb, BBT_COND, then_bb, else_entry)
+    return join
+
+
+# Lower the elif chain + final else into blocks that all converge on `join`.
+# Returns the entry block of the alternative path (a cond block for the first
+# elif, the else body's entry, or `join` if neither exists).
+def cfg_lower_if_alts(elif_head: uint32, else_head: uint32,
+                      join: uint32) -> uint32:
+    if elif_head != 0:
+        # This elif gets its own cond block.
+        cond_bb: uint32 = bb_new()
+        if cond_bb == BB_NONE:
+            return BB_NONE
+        cci: uint32 = ci_new(NM_NONE)
+        if cci >= CI_MAX:
+            cfg_overflow = 1
+            return cond_bb
+        cfg_scan_uses(cci, nd_a[elif_head])
+        bb_note_instr(cond_bb)
+
+        body_bb: uint32 = bb_new()
+        if body_bb == BB_NONE:
+            return BB_NONE
+        body_tail: uint32 = cfg_lower_chain(body_bb, nd_b[elif_head])
+        if body_tail != BB_NONE:
+            bb_set_term1(body_tail, BBT_FALL, join)
+
+        nxt_alt: uint32 = cfg_lower_if_alts(nd_next[elif_head], else_head, join)
+        if nxt_alt == BB_NONE:
+            return BB_NONE
+        bb_set_term2(cond_bb, BBT_COND, body_bb, nxt_alt)
+        return cond_bb
+
+    if else_head != 0:
+        else_bb: uint32 = bb_new()
+        if else_bb == BB_NONE:
+            return BB_NONE
+        else_tail: uint32 = cfg_lower_chain(else_bb, else_head)
+        if else_tail != BB_NONE:
+            bb_set_term1(else_tail, BBT_FALL, join)
+        return else_bb
+
+    # No elif, no else: the alternative path is the join itself.
+    return join
+
+
+# --- while --------------------------------------------------------------
+#
+# header(cond) --cond--> body / exit ; body tail --> back to header.
+def cfg_lower_while(bb: uint32, stmt: uint32) -> uint32:
+    header: uint32 = bb_new()
+    if header == BB_NONE:
+        return BB_NONE
+    bb_set_term1(bb, BBT_FALL, header)
+
+    cci: uint32 = ci_new(NM_NONE)
+    if cci >= CI_MAX:
+        cfg_overflow = 1
+        return BB_NONE
+    cfg_scan_uses(cci, nd_a[stmt])
+    bb_note_instr(header)
+
+    exit_bb: uint32 = bb_new()
+    if exit_bb == BB_NONE:
+        return BB_NONE
+    body_bb: uint32 = bb_new()
+    if body_bb == BB_NONE:
+        return BB_NONE
+
+    bb_set_term2(header, BBT_COND, body_bb, exit_bb)
+
+    loop_push(exit_bb, header)
+    body_tail: uint32 = cfg_lower_chain(body_bb, nd_b[stmt])
+    loop_pop()
+    if body_tail != BB_NONE:
+        bb_set_term1(body_tail, BBT_FALL, header)
+    return exit_bb
+
+
+# --- do-while -----------------------------------------------------------
+#
+# body --> cond ; cond --cond--> body(back-edge) / exit.
+def cfg_lower_do_while(bb: uint32, stmt: uint32) -> uint32:
+    body_bb: uint32 = bb_new()
+    if body_bb == BB_NONE:
+        return BB_NONE
+    bb_set_term1(bb, BBT_FALL, body_bb)
+
+    cond_bb: uint32 = bb_new()
+    if cond_bb == BB_NONE:
+        return BB_NONE
+    exit_bb: uint32 = bb_new()
+    if exit_bb == BB_NONE:
+        return BB_NONE
+
+    loop_push(exit_bb, cond_bb)
+    body_tail: uint32 = cfg_lower_chain(body_bb, nd_b[stmt])
+    loop_pop()
+    if body_tail != BB_NONE:
+        bb_set_term1(body_tail, BBT_FALL, cond_bb)
+
+    cci: uint32 = ci_new(NM_NONE)
+    if cci >= CI_MAX:
+        cfg_overflow = 1
+        return BB_NONE
+    cfg_scan_uses(cci, nd_a[stmt])
+    bb_note_instr(cond_bb)
+    bb_set_term2(cond_bb, BBT_COND, body_bb, exit_bb)
+    return exit_bb
+
+
+# --- for / for-unpack ---------------------------------------------------
+#
+# Modeled like a while with an induction-variable DEF in the header. The
+# iterable's uses also live in the header. `simple` distinguishes ND_FOR (single
+# name var) from ND_FOR_UNPACK (a chain of target idents on nd_a).
+def cfg_lower_for(bb: uint32, stmt: uint32, simple: uint32) -> uint32:
+    header: uint32 = bb_new()
+    if header == BB_NONE:
+        return BB_NONE
+    bb_set_term1(bb, BBT_FALL, header)
+
+    body_node: uint32 = 0
+    if simple != 0:
+        # ND_FOR: name = induction var (def), a = iterable (uses), b = body.
+        ci: uint32 = ci_new(nm_intern(nd_name_off[stmt], nd_name_len[stmt]))
+        if ci >= CI_MAX:
+            cfg_overflow = 1
+            return BB_NONE
+        cfg_scan_uses(ci, nd_a[stmt])
+        bb_note_instr(header)
+        body_node = nd_b[stmt]
+    else:
+        # ND_FOR_UNPACK: a = head var-ident chain (defs), b = iterable, c = body.
+        # Emit one def instruction per target ident, plus the iterable uses on
+        # the first.
+        ci2: uint32 = ci_new(NM_NONE)
+        if ci2 >= CI_MAX:
+            cfg_overflow = 1
+            return BB_NONE
+        cfg_scan_uses(ci2, nd_b[stmt])
+        bb_note_instr(header)
+        v: uint32 = nd_a[stmt]
+        while v != 0:
+            if nd_kind[v] == ND_IDENT:
+                dci: uint32 = ci_new(nm_intern(nd_name_off[v], nd_name_len[v]))
+                if dci >= CI_MAX:
+                    cfg_overflow = 1
+                    return BB_NONE
+                bb_note_instr(header)
+            v = nd_next[v]
+        body_node = nd_c[stmt]
+
+    exit_bb: uint32 = bb_new()
+    if exit_bb == BB_NONE:
+        return BB_NONE
+    body_bb: uint32 = bb_new()
+    if body_bb == BB_NONE:
+        return BB_NONE
+
+    bb_set_term2(header, BBT_COND, body_bb, exit_bb)
+
+    loop_push(exit_bb, header)
+    body_tail: uint32 = cfg_lower_chain(body_bb, body_node)
+    loop_pop()
+    if body_tail != BB_NONE:
+        bb_set_term1(body_tail, BBT_FALL, header)
+    return exit_bb
+
+
+# =======================================================================
+# Whole-function CFG build.
+# =======================================================================
+#
+# Builds the CFG for one ND_FUNCTION. Layout: ENTRY block (0) holds the function
+# parameters as DEFs, then the body lowers; a synthetic EXIT block (allocated
+# right after ENTRY) is the sink every return / final fallthrough targets.
+# Returns 1 on success, 0 on overflow (function too large for the fixed arenas;
+# reported, not a failure).
+def cfg_build_function(fn: uint32) -> uint32:
+    cfg_reset()
+    cfg_loop_depth = 0
+
+    entry: uint32 = bb_new()           # block 0
+    if entry == BB_NONE:
+        return 0
+    cfg_exit_bb = bb_new()             # block 1 = EXIT sink
+    if cfg_exit_bb == BB_NONE:
+        return 0
+    bb_term[cfg_exit_bb] = BBT_EXIT
+    bb_succ_n[cfg_exit_bb] = 0
+
+    # Parameters are defs in the entry block (ND_FUNCTION: a = head param chain).
+    p: uint32 = nd_a[fn]
+    while p != 0:
+        # ND_PARAM: name = param name.
+        pid: uint32 = nm_intern(nd_name_off[p], nd_name_len[p])
+        if pid >= NM_MAX:
+            cfg_overflow = 1
+        else:
+            ci: uint32 = ci_new(pid)
+            if ci >= CI_MAX:
+                cfg_overflow = 1
+            else:
+                bb_note_instr(entry)
+        p = nd_next[p]
+
+    # Lower the body (ND_FUNCTION: c = body chain head).
+    tail: uint32 = cfg_lower_chain(entry, nd_c[fn])
+    if tail != BB_NONE:
+        bb_set_term1(tail, BBT_FALL, cfg_exit_bb)
+
+    if cfg_overflow != 0:
+        return 0
+    return 1
+
+
+# =======================================================================
+# Liveness — backward dataflow over the CFG.
+# =======================================================================
+#
+# Per block we need use[B] (names read before any def in B) and def[B] (names
+# defined in B). Then:
+#   live_out[B] = union over succ S of live_in[S]
+#   live_in[B]  = use[B] U (live_out[B] - def[B])
+# iterated to a fixpoint (monotone, so it converges). Sets are bitsets of width
+# NM_MAX over name ids, stored as uint32 words (NM_MAX/32 = 8 words per block).
+
+LV_WORDS: uint32 = 8                   # NM_MAX(256)/32
+lv_use: Array[65536, uint32]           # BB_MAX * LV_WORDS  (8192*8)
+lv_def: Array[65536, uint32]
+lv_in: Array[65536, uint32]
+lv_out: Array[65536, uint32]
+
+
+# Bit accessors. Adder does not pass Array-typed parameters by reference, so we
+# select the target bitset array by a small selector code rather than passing
+# the array itself. The four per-block bitsets are: 0=use 1=def 2=in 3=out.
+LVS_USE: uint32 = 0
+LVS_DEF: uint32 = 1
+LVS_IN: uint32 = 2
+LVS_OUT: uint32 = 3
+
+
+def lv_get(sel: uint32, bb: uint32, nid: uint32) -> uint32:
+    w: uint32 = bb * LV_WORDS + (nid >> 5)
+    if sel == LVS_USE:
+        return (lv_use[w] >> (nid & 31)) & 1
+    if sel == LVS_DEF:
+        return (lv_def[w] >> (nid & 31)) & 1
+    if sel == LVS_IN:
+        return (lv_in[w] >> (nid & 31)) & 1
+    return (lv_out[w] >> (nid & 31)) & 1
+
+
+def lv_set(sel: uint32, bb: uint32, nid: uint32):
+    w: uint32 = bb * LV_WORDS + (nid >> 5)
+    bit: uint32 = cast[uint32](1) << (nid & 31)
+    if sel == LVS_USE:
+        lv_use[w] = lv_use[w] | bit
+    elif sel == LVS_DEF:
+        lv_def[w] = lv_def[w] | bit
+    elif sel == LVS_IN:
+        lv_in[w] = lv_in[w] | bit
+    else:
+        lv_out[w] = lv_out[w] | bit
+
+
+# Build use[B]/def[B] for every block from its instruction range. A name is in
+# use[B] if it is READ before being DEFINED within B (a local recompute of the
+# textbook upward-exposed-use set); def[B] is every name defined anywhere in B.
+def lv_build_local_sets():
+    b: uint32 = 0
+    while b < bb_count:
+        # zero this block's rows
+        w: uint32 = 0
+        while w < LV_WORDS:
+            idx: uint32 = b * LV_WORDS + w
+            lv_use[idx] = 0
+            lv_def[idx] = 0
+            lv_in[idx] = 0
+            lv_out[idx] = 0
+            w = w + 1
+        # Scan instructions in order. Track "already defined in B" via lv_def as
+        # we go: a use whose name is not yet defined in B is upward-exposed.
+        i: uint32 = 0
+        first: uint32 = bb_first[b]
+        n: uint32 = bb_ninstr[b]
+        while i < n:
+            ins: uint32 = first + i
+            # uses first (read happens before the def of the same instruction
+            # for plain assigns; augmented assigns already recorded the read as
+            # a use, so ordering within the instruction is captured by the use
+            # list — a use of a not-yet-defined name is upward-exposed).
+            u: uint32 = 0
+            nu: uint32 = ci_nuse[ins]
+            while u < nu:
+                nid: uint32 = ci_use[ins * CI_MAX_USE + u]
+                if lv_get(LVS_DEF, b, nid) == 0:
+                    lv_set(LVS_USE, b, nid)
+                u = u + 1
+            d: uint32 = ci_def[ins]
+            if d != NM_NONE and d < NM_MAX:
+                lv_set(LVS_DEF, b, d)
+            i = i + 1
+        b = b + 1
+
+
+# One backward pass: recompute live_out/live_in for every block; return 1 if any
+# bit changed (caller iterates until 0 = fixpoint).
+def lv_one_pass() -> uint32:
+    changed: uint32 = 0
+    # iterate blocks in reverse for faster convergence
+    bi: uint32 = bb_count
+    while bi > 0:
+        bi = bi - 1
+        b: uint32 = bi
+        # live_out[B] = U live_in[succ]
+        w: uint32 = 0
+        while w < LV_WORDS:
+            newout: uint32 = 0
+            if bb_succ_n[b] >= 1:
+                s0: uint32 = bb_succ0[b]
+                if s0 != BB_NONE:
+                    newout = newout | lv_in[s0 * LV_WORDS + w]
+            if bb_succ_n[b] >= 2:
+                s1: uint32 = bb_succ1[b]
+                if s1 != BB_NONE:
+                    newout = newout | lv_in[s1 * LV_WORDS + w]
+            outidx: uint32 = b * LV_WORDS + w
+            if lv_out[outidx] != newout:
+                lv_out[outidx] = newout
+                changed = 1
+            # live_in[B] = use[B] U (live_out[B] - def[B])
+            newin: uint32 = lv_use[outidx] | (newout & (~lv_def[outidx]))
+            if lv_in[outidx] != newin:
+                lv_in[outidx] = newin
+                changed = 1
+            w = w + 1
+    return changed
+
+
+# Run liveness to a fixpoint; returns the number of iterations (capped). 0 means
+# it did not converge within the cap (a validator failure).
+LV_ITER_CAP: uint32 = 100000
+def lv_solve() -> uint32:
+    lv_build_local_sets()
+    it: uint32 = 0
+    while it < LV_ITER_CAP:
+        it = it + 1
+        if lv_one_pass() == 0:
+            return it
+    return 0      # did not converge (cap hit) -> caller flags failure
+
+
+# =======================================================================
+# Structural validator.
+# =======================================================================
+#
+# Returns 0 on success, or a nonzero failure code identifying the first broken
+# invariant. The caller (dump driver / fuzzer lane) treats nonzero as a hard
+# failure. cfg_overflow functions are checked by the caller BEFORE validating
+# (an overflowed build is SKIPPED, not failed).
+
+# Failure codes.
+CFGV_OK: uint32 = 0
+CFGV_NO_TERM: uint32 = 1          # a block has no terminator
+CFGV_BAD_EDGE: uint32 = 2         # an edge points to a non-existent block
+CFGV_NO_FIXPOINT: uint32 = 3      # liveness did not converge
+CFGV_USE_BEFORE_DEF: uint32 = 4   # a non-live-in name is used before def in B
+CFGV_ENTRY_LIVEIN: uint32 = 5     # a name is live-in at ENTRY but never a param
+                                  # def there (use of an undefined value) — soft;
+                                  # reported but see note in cfg_validate.
+
+
+# Validate that every block has a real terminator and all edges are in range.
+def cfg_validate_structure() -> uint32:
+    b: uint32 = 0
+    while b < bb_count:
+        t: uint32 = bb_term[b]
+        if t == BBT_NONE:
+            return CFGV_NO_TERM
+        # edge endpoints must exist.
+        if bb_succ_n[b] >= 1:
+            s0: uint32 = bb_succ0[b]
+            if s0 == BB_NONE or s0 >= bb_count:
+                return CFGV_BAD_EDGE
+        if bb_succ_n[b] >= 2:
+            s1: uint32 = bb_succ1[b]
+            if s1 == BB_NONE or s1 >= bb_count:
+                return CFGV_BAD_EDGE
+        # EXIT block must have 0 successors; non-EXIT terminators must have >=1.
+        if t == BBT_EXIT:
+            if bb_succ_n[b] != 0:
+                return CFGV_BAD_EDGE
+        else:
+            if bb_succ_n[b] == 0:
+                return CFGV_NO_TERM
+        b = b + 1
+    return CFGV_OK
+
+
+# Validate, per block, that no instruction USES a name that is neither defined
+# earlier in the block NOR live-in to the block. (i.e. every read is either a
+# block-local prior def or an upward-exposed use that liveness propagated.) This
+# is the soundness self-check: liveness must "explain" every use.
+def cfg_validate_use_before_def() -> uint32:
+    b: uint32 = 0
+    while b < bb_count:
+        # locally-defined-so-far bitset, rebuilt per block in a scratch area.
+        sw: uint32 = 0
+        while sw < LV_WORDS:
+            cfgv_seen[sw] = 0
+            sw = sw + 1
+        i: uint32 = 0
+        first: uint32 = bb_first[b]
+        n: uint32 = bb_ninstr[b]
+        while i < n:
+            ins: uint32 = first + i
+            u: uint32 = 0
+            nu: uint32 = ci_nuse[ins]
+            while u < nu:
+                nid: uint32 = ci_use[ins * CI_MAX_USE + u]
+                # seen locally?
+                seen: uint32 = (cfgv_seen[nid >> 5] >> (nid & 31)) & 1
+                if seen == 0:
+                    # must be live-in to B (upward-exposed and explained).
+                    if lv_get(LVS_IN, b, nid) == 0:
+                        return CFGV_USE_BEFORE_DEF
+                u = u + 1
+            d: uint32 = ci_def[ins]
+            if d != NM_NONE and d < NM_MAX:
+                cfgv_seen[d >> 5] = cfgv_seen[d >> 5] | (cast[uint32](1) << (d & 31))
+            i = i + 1
+        b = b + 1
+    return CFGV_OK
+
+
+cfgv_seen: Array[8, uint32]            # LV_WORDS scratch for use-before-def
+
+
+# Top-level per-function validate: structure, liveness fixpoint, use-before-def.
+# Returns CFGV_OK or the first failure code. Assumes cfg_build_function already
+# ran and returned 1 (no overflow).
+def cfg_validate() -> uint32:
+    rc: uint32 = cfg_validate_structure()
+    if rc != CFGV_OK:
+        return rc
+    iters: uint32 = lv_solve()
+    if iters == 0:
+        return CFGV_NO_FIXPOINT
+    rc = cfg_validate_use_before_def()
+    if rc != CFGV_OK:
+        return rc
+    return CFGV_OK
+
+
+# =======================================================================
+# Corpus driver entry — build+validate every function in a program.
+# =======================================================================
+#
+# Returns a packed result via the globals below (Adder single-return). The dump
+# driver / fuzzer lane read these after calling cfg_run_program.
+
+cfg_stat_funcs: uint32 = 0             # functions processed (built OK)
+cfg_stat_skipped: uint32 = 0          # functions skipped (arena overflow)
+cfg_stat_blocks: uint32 = 0           # total basic blocks across funcs
+cfg_stat_edges: uint32 = 0            # total CFG edges across funcs
+cfg_stat_insts: uint32 = 0            # total CFG instructions across funcs
+cfg_stat_fail: uint32 = 0             # first nonzero validator code (0 = all ok)
+cfg_stat_fail_fn: uint32 = 0          # function index of the first failure
+
+
+def cfg_count_edges() -> uint32:
+    e: uint32 = 0
+    b: uint32 = 0
+    while b < bb_count:
+        e = e + bb_succ_n[b]
+        b = b + 1
+    return e
+
+
+# Build + validate the CFG for every ND_FUNCTION in the program (prog = ND_PROGRAM;
+# decl chain on nd_b). Accumulates stats; stops counting failures at the first
+# one (records it). Pure analysis: never mutates the AST.
+def cfg_run_program(prog: uint32):
+    cfg_stat_funcs = 0
+    cfg_stat_skipped = 0
+    cfg_stat_blocks = 0
+    cfg_stat_edges = 0
+    cfg_stat_insts = 0
+    cfg_stat_fail = 0
+    cfg_stat_fail_fn = 0
+    if prog == 0:
+        return
+    fn_idx: uint32 = 0
+    decls: uint32 = nd_b[prog]
+    cur: uint32 = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            ok: uint32 = cfg_build_function(cur)
+            if ok == 0:
+                # arena overflow -> skip (not a failure)
+                cfg_stat_skipped = cfg_stat_skipped + 1
+            else:
+                cfg_stat_funcs = cfg_stat_funcs + 1
+                cfg_stat_blocks = cfg_stat_blocks + bb_count
+                cfg_stat_edges = cfg_stat_edges + cfg_count_edges()
+                cfg_stat_insts = cfg_stat_insts + ci_count
+                rc: uint32 = cfg_validate()
+                if rc != CFGV_OK and cfg_stat_fail == 0:
+                    cfg_stat_fail = rc
+                    cfg_stat_fail_fn = fn_idx
+            fn_idx = fn_idx + 1
+        cur = nd_next[cur]

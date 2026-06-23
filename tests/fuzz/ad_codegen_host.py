@@ -189,6 +189,80 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
 
 
 # --------------------------------------------------------------------------
+# Phase-4 GROUNDWORK CFG lane: run the dump driver in --dump-cfg mode and parse
+# its CFG report. This builds the whole-function CFG + liveness + structural
+# validator over the program and asserts the invariants. It NEVER touches
+# codegen (the driver's --dump-cfg branch returns before opt_run/codegen), so it
+# is a pure-analysis lane that cannot perturb codegen output.
+# --------------------------------------------------------------------------
+class CfgResult:
+    def __init__(self, status, **kw):
+        # status: "cfgok" | "cfgfail" | "parsefail" | "readfail" | "drivererror"
+        self.status = status
+        self.funcs = kw.get("funcs", 0)
+        self.skipped = kw.get("skipped", 0)
+        self.blocks = kw.get("blocks", 0)
+        self.edges = kw.get("edges", 0)
+        self.insts = kw.get("insts", 0)
+        self.detail = kw.get("detail", "")
+
+
+def run_cfg(src_path: Path, timeout=30) -> CfgResult:
+    """Run the dump driver with --dump-cfg over `src_path` and parse the report.
+    Returns a CfgResult. A parse/cgfail program is reported as parsefail (the
+    CFG lane only validates programs codegen.ad's parser accepts)."""
+    build_driver()
+    argv = [str(DRIVER_ELF), "--dump-cfg", str(src_path)]
+    cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    out = cp.stdout
+    if "AC_DUMP_BEGIN" not in out:
+        return CfgResult("drivererror",
+                         detail=f"rc={cp.returncode} no manifest: "
+                                f"{(cp.stderr or out)[-400:]}")
+    meta = {}
+    status = None
+    detail = ""
+    for ln in out.splitlines():
+        if ln.startswith("STATUS "):
+            parts = ln.split()
+            status = parts[1]
+            detail = ln
+            continue
+        if " " in ln:
+            k, _, v = ln.partition(" ")
+            if v.strip().lstrip("-").isdigit():
+                meta[k] = int(v.strip())
+    if status in ("parsefail", "readfail"):
+        return CfgResult(status, detail=detail)
+    if status not in ("cfgok", "cfgfail"):
+        return CfgResult("drivererror", detail=detail or out[-400:])
+    return CfgResult(status,
+                     funcs=meta.get("CFG_FUNCS", 0),
+                     skipped=meta.get("CFG_SKIPPED", 0),
+                     blocks=meta.get("CFG_BLOCKS", 0),
+                     edges=meta.get("CFG_EDGES", 0),
+                     insts=meta.get("CFG_INSTS", 0),
+                     detail=detail)
+
+
+def run_cfg_over_body(seed, body, work_dir: Path, keep=False) -> CfgResult:
+    """Write `body` (rewritten to codegen.ad's subset) to a temp file and run the
+    CFG lane over it."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cg_body = codegen_compatible_source(body)
+    src = work_dir / f"cfg_{seed}.ad"
+    src.write_text(cg_body)
+    try:
+        r = run_cfg(src)
+    except subprocess.TimeoutExpired:
+        return CfgResult("drivererror", detail="cfg driver timeout")
+    finally:
+        if not keep:
+            src.unlink(missing_ok=True)
+    return r
+
+
+# --------------------------------------------------------------------------
 # Wrap raw codegen.ad bytes into a real x86_64-linux ELF (ELF64, EM_X86_64).
 # --------------------------------------------------------------------------
 def _start_stub(code_vbase, entry_off, stub_vaddr):

@@ -1125,6 +1125,121 @@ ADDER_OPT=1 ADDER_FUZZ_DIFF_TARGET=ad-codegen \
 Each phase stays behind `ADDER_OPT` until its own correctness lane is green,
 and the seed remains the frozen oracle throughout.
 
+## Native optimizer — Phase 4 GROUNDWORK: CFG + liveness (analysis only)
+
+Phase 4's register allocator needs two things Phases 1–3 do not provide: a
+**whole-function control-flow graph** and **liveness**. This groundwork builds
+exactly that analysis infrastructure — and *nothing that can change codegen
+output*. It is the analysis-only prerequisite; **no allocator is written and
+codegen does not consume the new IR.** It de-risks Phase 4 the same way Phases
+1–3 stayed byte-inert: everything is additive, gated, and off the default path.
+
+### `adder/compiler/cfg.ad` — what it builds
+
+- **Whole-function CFG / basic-block IR.** `cfg_build_function(fn)` lowers a
+  whole `ND_FUNCTION` body into a graph of basic blocks: straight-line
+  instruction runs terminated by a branch/jump/return, with successor edges
+  (predecessors are recoverable by reverse-scanning, not stored). Fixed global
+  arenas, no dynamic allocation, mirroring the AST-arena style (`bb_*` blocks,
+  `ci_*` instructions, `nm_*` interned names). A synthetic **ENTRY** block holds
+  the parameters as defs; a synthetic **EXIT** sink terminates every `return`
+  and the final fallthrough.
+- **Name-level def/use, not value-level SSA.** A CFG instruction (`ci_*`) records
+  the identifier name **defined** (`ci_def`) and the names **used** (`ci_use`).
+  That is exactly the granularity block-level liveness needs; expression
+  structure within a statement is irrelevant to it (Phases 1–3 already model
+  *values*). Names are interned to dense ids so live sets are fixed-width
+  bitsets.
+- **Liveness** (`lv_solve`): textbook backward dataflow —
+  `live_out[B] = ∪ live_in[succ]`, `live_in[B] = use[B] ∪ (live_out[B] − def[B])`
+  — iterated to a fixpoint over the per-block upward-exposed-use/def sets.
+  Reverse-block iteration speeds convergence. This is the input a future
+  allocator consumes (it tells you which names are simultaneously live).
+
+**AST constructs lowered:** var-decl, assign (plain + augmented), expr-stmt,
+return, `if`/`elif`-chain/`else`, `while`, `do-while`, `for`, `for-unpack`,
+`break` (edge to the nearest enclosing loop's exit), `continue` (edge to the
+nearest enclosing loop's continue target). Uses are extracted by scanning every
+`ND_IDENT` read in an r-value expression (including those nested under casts,
+calls, index, member, unary, and call-argument chains).
+
+**Documented SKIPS (the gaps before an allocator can flip on):**
+- **No alias / may-clobber modelling** for stores through `p[i]` / `a.b` / `*p`
+  or for writes through a call. Those are treated as plain *uses* of their ident
+  operands. Liveness is therefore sound for register candidates that are *never
+  address-taken* (the only ones a first allocator would color), but a real
+  allocator must add alias analysis before trusting liveness for address-taken
+  storage. The validator deliberately asserts nothing this gap could violate.
+- **No SSA / φ-nodes** — classic non-SSA name dataflow. An allocator can color on
+  this directly or build SSA on top.
+- **`match`/`try`/`with`/`defer`/`yield`/`raise`** are lowered as opaque
+  straight-line instructions (their nested control flow is not modelled). They
+  are outside the codegen subset, so they never appear in the corpus; the
+  lowering stays total by use-scanning their child slots.
+- Per-function arena caps (`NM_MAX`=256 names, `BB_MAX`, `CI_MAX`). A function
+  that overflows is **reported and skipped**, never failed.
+
+### The validator (the safety proof)
+
+`cfg_validate()` (per function) asserts the structural invariants:
+1. **every block has a terminator** (`BBT_NONE` is a failure);
+2. **every edge endpoint exists** (in `[0, bb_count)`; the EXIT block has 0
+   successors, every other terminator has ≥1);
+3. **liveness reaches a fixpoint** within the iteration cap;
+4. **no use-before-def of a non-live-in value within a block** — every read is
+   either defined earlier in the same block or is an upward-exposed use that
+   liveness propagated as `live_in[B]`. This is the soundness self-check:
+   liveness must "explain" every use.
+
+It is reached **only** via the dump driver's `--dump-cfg` mode
+(`ad_codegen_dump_driver.ad`), which builds + validates the CFG for every
+function and emits a `CFG_FUNCS/BLOCKS/EDGES/INSTS` report plus `STATUS
+cfgok|cfgfail`, then returns **before** `opt_run`/codegen — so it cannot perturb
+codegen output. The fuzzer wires this as the `ADDER_CFG=1` lane: for every
+parser-accepted program it builds+validates the CFG and fails on any broken
+invariant.
+
+```sh
+# CFG/liveness groundwork lane (analysis-only; default path unaffected):
+ADDER_CFG=1 ADDER_FUZZ_DIFF_TARGET=ad-codegen \
+    python3 tests/fuzz/adder_fuzzer.py --ad-codegen --count 500 --seed 1
+```
+
+### Verification (Phase 4 groundwork)
+
+- **DEFAULT (ADDER_OPT and ADDER_CFG unset)** is byte-inert: `cfg.ad` is imported
+  **only** by the host dump driver, never by the product compiler; nothing on the
+  AST→codegen path calls it; it never mutates the AST (pure reads of `nd_*` into
+  its own arenas). `fuzz_adder_diff.sh` 500/500 0 miscompiles;
+  `test_native_vs_seed_objdiff.sh` 193 clean (unchanged baseline);
+  `test_native_vs_seed_kobjdiff.sh` 0 divergences.
+- **ADDER_CFG=1 lane**: over a 1000-program corpus the builder processes
+  thousands of functions / tens of thousands of blocks + edges + instructions
+  with **all structural invariants holding** (0 broken-invariant programs, 0
+  overflow skips). Each program's CFG is validated for terminators, edge
+  endpoints, liveness fixpoint, and use-before-def soundness.
+
+### What remains before a register allocator can be written + flipped on
+
+The CFG + liveness are the consumable analysis; an allocator still needs:
+1. **Value-level (not just name-level) liveness / live ranges.** This groundwork
+   tracks *names*; an SSA-or-value allocator wants per-value ranges. Either color
+   names directly (simplest first cut) or build value liveness on top of the CFG.
+2. **Alias / may-clobber analysis** so address-taken and through-pointer/through-
+   call stores are modelled — required before liveness can be trusted for any
+   storage that escapes (see SKIPS). A first allocator can sidestep this by
+   coloring only never-address-taken locals.
+3. **An ABI / calling-convention model** (argument registers, caller/callee-saved
+   split) — the current push-everything codegen has none.
+4. **The allocator itself** (linear-scan first, graph-colouring later) assigning
+   live ranges to the register file with spill slots.
+5. **A codegen entry that consumes the IR/CFG instead of the AST** — the
+   inflection point where `gen_expr`'s AST walk is replaced by IR → instruction
+   selection. This lands behind `ADDER_OPT` as a *parallel* IR codegen path,
+   proven byte-/behaviour-correct via the same lane before any cutover is
+   discussed. Until then, register allocation (the first pass that cannot be an
+   AST-to-AST rewrite) cannot turn on.
+
 ## Related docs
 
 - [../x86-backend.md](../x86-backend.md) — why hand-written, codegen contract.

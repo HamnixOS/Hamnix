@@ -1227,6 +1227,22 @@ _AD_OPT_PROGS_CSE = 0     # programs in which >=1 CSE elimination fired
 _AD_OPT_LICM_TOTAL = 0    # running LICM-hoist count across the lane
 _AD_OPT_PROGS_LICM = 0    # programs in which >=1 LICM hoist fired
 
+# ADDER_CFG=1 enables the Phase-4 GROUNDWORK CFG/liveness lane: for every
+# program codegen.ad's PARSER accepts, build the whole-function CFG + backward-
+# dataflow liveness and assert the structural invariants (every block has a
+# terminator; every edge endpoint exists; liveness reaches a fixpoint; no use-
+# before-def of a non-live-in value within a block). This is PURE ANALYSIS — the
+# driver's --dump-cfg mode returns before opt_run/codegen, so it cannot perturb
+# codegen output. Default OFF. A `cfgfail` (broken invariant) fails the lane.
+ADDER_CFG = os.environ.get("ADDER_CFG", "0") not in ("", "0", "off", "false")
+_AD_CFG_FUNCS = 0         # functions the CFG builder processed
+_AD_CFG_BLOCKS = 0        # total basic blocks built
+_AD_CFG_EDGES = 0         # total CFG edges
+_AD_CFG_INSTS = 0         # total CFG instructions
+_AD_CFG_SKIPPED = 0       # functions skipped on arena overflow (not a failure)
+_AD_CFG_PROGS = 0         # programs the CFG lane validated
+_AD_CFG_FAILS = []        # (seed, detail) of broken-invariant programs
+
 
 def _ad_host():
     global _AD_HOST, _AD_WORK
@@ -1235,6 +1251,32 @@ def _ad_host():
         _AD_HOST = importlib.import_module("ad_codegen_host")
         _AD_WORK = WORK / "ad_codegen"
     return _AD_HOST
+
+
+def run_cfg_lane(seed, body):
+    """Phase-4 GROUNDWORK: build+validate the CFG/liveness for `body`. Accumulates
+    lane stats and records any broken-invariant program. Returns nothing; the
+    batch driver reports the accumulated results + fails on any cfgfail."""
+    global _AD_CFG_FUNCS, _AD_CFG_BLOCKS, _AD_CFG_EDGES, _AD_CFG_INSTS
+    global _AD_CFG_SKIPPED, _AD_CFG_PROGS, _AD_CFG_FAILS
+    host = _ad_host()
+    try:
+        r = host.run_cfg_over_body(seed, body, _AD_WORK)
+    except Exception as e:
+        _AD_CFG_FAILS.append((seed, f"cfg lane exception: {e!r}"))
+        return
+    if r.status in ("parsefail", "readfail", "drivererror"):
+        # Not a CFG failure: the parser rejected the program (or tooling error);
+        # the CFG lane only validates parser-accepted programs.
+        return
+    _AD_CFG_PROGS += 1
+    _AD_CFG_FUNCS += r.funcs
+    _AD_CFG_BLOCKS += r.blocks
+    _AD_CFG_EDGES += r.edges
+    _AD_CFG_INSTS += r.insts
+    _AD_CFG_SKIPPED += r.skipped
+    if r.status == "cfgfail":
+        _AD_CFG_FAILS.append((seed, r.detail))
 
 
 def run_through_ad_codegen(seed, body):
@@ -1648,6 +1690,8 @@ def _run_ad_codegen_batch(base, args):
             print(f"[gentool-bug seed={seed}] {e!r}")
             continue
         ran += 1
+        if ADDER_CFG:
+            run_cfg_lane(seed, body)
         if kind == "ok":
             accepted += 1; correct += 1
         elif kind == "unsupported":
@@ -1723,6 +1767,27 @@ def _run_ad_codegen_batch(base, args):
         if not licm_ok:
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] LICM corpus miscompiled or never fired")
+    cfg_lane_fail = False
+    if ADDER_CFG:
+        print(f"--- ADDER_CFG=1 CFG/liveness GROUNDWORK lane (analysis-only) ---")
+        print(f"  programs validated:         {_AD_CFG_PROGS}")
+        print(f"  functions processed:        {_AD_CFG_FUNCS}")
+        print(f"  basic blocks built:         {_AD_CFG_BLOCKS}")
+        print(f"  CFG edges:                  {_AD_CFG_EDGES}")
+        print(f"  CFG instructions:           {_AD_CFG_INSTS}")
+        print(f"  functions skipped (overflow): {_AD_CFG_SKIPPED}")
+        print(f"  broken-invariant programs:  {len(_AD_CFG_FAILS)}")
+        # The lane proves something only if it actually built CFGs. An all-empty
+        # run (no function processed) is itself a lane failure.
+        if _AD_CFG_PROGS > 0 and _AD_CFG_FUNCS == 0:
+            cfg_lane_fail = True
+            print("  [ADDER_CFG FAIL] CFG builder never processed a function")
+        if _AD_CFG_FAILS:
+            cfg_lane_fail = True
+            for (s, detail) in _AD_CFG_FAILS[:10]:
+                print(f"  [CFG INVARIANT BROKEN] seed={s}: {detail[:160]}")
+                print(f"        repro: ADDER_FUZZ_DIFF_TARGET=ad-codegen "
+                      f"ADDER_CFG=1 python3 tests/fuzz/adder_fuzzer.py --repro {s}")
     for (s, detail) in mis[:10]:
         print(f"  [miscompile] seed={s}: {detail[:160]}")
         print(f"        repro: ADDER_FUZZ_DIFF_TARGET=ad-codegen "
@@ -1733,7 +1798,7 @@ def _run_ad_codegen_batch(base, args):
     # Fail on a genuine miscompile (codegen.ad OR python). In the ADDER_OPT=1
     # lane a miscompile means the OPTIMIZED output diverged from the oracle;
     # also fail if the optimizer never fired (lane didn't actually exercise it).
-    return 1 if (mis or pymis or opt_lane_fail) else 0
+    return 1 if (mis or pymis or opt_lane_fail or cfg_lane_fail) else 0
 
 
 # --------------------------------------------------------------------------
