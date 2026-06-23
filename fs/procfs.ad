@@ -41,6 +41,12 @@ from kernel.sched.cgroup_cpu import (
     # cgroup v2 pids + memory controller renders (per-cgroup leaves).
     cgroup_pids_render_max, cgroup_pids_render_current,
     cgroup_mem_render_max, cgroup_mem_render_current,
+    # cgroup v2 WRITE/MKDIR surface — the fs ops below mutate the live
+    # object graph (mkdir/rmdir a cgroup; echo into pids.max/memory.max/
+    # cpu.max; echo a task slot into cgroup.procs).
+    cgroup_cpu_mkdir, cgroup_cpu_rmdir,
+    cgroup_pids_write_max, cgroup_mem_write_max, cgroup_cpu_write_max,
+    cgroup_pids_attach_count,
 )
 # /proc/oops: hand userland the raw 548-byte panic record off OOPS.BIN
 # so `oopsread` (and any future shim) can render it human-readable.
@@ -2058,10 +2064,66 @@ def render_cgroup_pids_current(buf: Ptr[uint8]) -> uint64:
     return pos
 
 
+# cgroup v2 paths reach the kernel in TWO spellings depending on the
+# caller's namespace:
+#   * "/sys/fs/cgroup/..."  — a kernel-context / unrewritten open.
+#   * "#r/fs/cgroup/..."    — a userland open after resolve_path: a
+#     default Linux task has `/sys` bound to the cpio server `#r`, and
+#     since cpio ships no /sys/fs/cgroup files, resolve_path's
+#     union-head fallback returns the LOCALIZED head spelling
+#     "#r/fs/cgroup/<...>". Every cgroup predicate/dispatcher below
+#     canonicalises BOTH spellings to the "/sys/fs/cgroup/..." form via
+#     _cg_canon before matching, so the live object graph is reachable
+#     from a shell exactly as it is from kernel context.
+def _cg_canon(name: Ptr[char], out: Ptr[char]) -> int32:
+    # If `name` is a cgroup path in either spelling, write its canonical
+    # "/sys/fs/cgroup<tail>" form into `out` (NUL-terminated, <=255) and
+    # return 1. Otherwise return 0 (out unspecified).
+    src: Ptr[char] = name
+    if _path_starts_with(name, "#r/fs/cgroup") != 0:
+        # Skip the "#r" (2 bytes); the remainder is "/fs/cgroup<tail>".
+        src = cast[Ptr[char]](cast[uint64](name) + 2)
+    elif _path_starts_with(name, "/sys/fs/cgroup") != 0:
+        src = cast[Ptr[char]](cast[uint64](name) + 4)  # skip "/sys"
+    elif _path_starts_with(name, "/fs/cgroup") != 0:
+        # The `#r` cpio server localizes onto the "/" root, so
+        # resolve_path's union-head fallback for "/sys/fs/cgroup/<...>"
+        # actually returns "/fs/cgroup/<...>" (the `#r`-relative tail
+        # under the cpio root). This is the spelling a SHELL open
+        # produces.
+        src = name                                    # already "/fs/cgroup<tail>"
+    else:
+        return 0
+    # `src` now points at "/fs/cgroup<tail>"; emit "/sys" + src.
+    pfx: Ptr[char] = "/sys"
+    o: uint64 = 0
+    i: uint64 = 0
+    while cast[uint8](pfx[i]) != 0:
+        out[o] = pfx[i]
+        o = o + 1
+        i = i + 1
+    j: uint64 = 0
+    while o < 255:
+        c: uint8 = cast[uint8](src[j])
+        out[o] = cast[char](c)
+        if c == 0:
+            return 1
+        o = o + 1
+        j = j + 1
+    out[255] = cast[char](0)
+    return 1
+
+
 def is_cgroup_path(name: Ptr[char]) -> int32:
-    # True if `name` starts with "/sys/fs/cgroup". Covers both the
-    # bare root and any interface file under it.
-    return _path_starts_with(name, "/sys/fs/cgroup")
+    # True if `name` is a cgroup v2 path in EITHER spelling (see
+    # _cg_canon): the localized "#r/fs/cgroup..." or "/sys/fs/cgroup...".
+    if _path_starts_with(name, "/sys/fs/cgroup") != 0:
+        return 1
+    if _path_starts_with(name, "#r/fs/cgroup") != 0:
+        return 1
+    if _path_starts_with(name, "/fs/cgroup") != 0:
+        return 1
+    return 0
 
 
 # F11 (2026-06-13): per-cgroup cpu.max / cpu.stat path arms. Sub-paths
@@ -2071,12 +2133,18 @@ def is_cgroup_path(name: Ptr[char]) -> int32:
 # Layer-2-only API: lives in procfs because the cgroup view is the
 # Linux-namespace pseudo-fs, and we already do all path-arm dispatch
 # here. The Layer-2 cgroup_cpu module owns the cgroup OBJECTS.
-def _cg_split(path: Ptr[char], name_out: Ptr[char], leaf_out: Ptr[char]) -> int32:
+def _cg_split(path_in: Ptr[char], name_out: Ptr[char], leaf_out: Ptr[char]) -> int32:
     # Parses "/sys/fs/cgroup/<name>/<leaf>" — copies <name> into
     # name_out (NUL-terminated, max 31 bytes) and <leaf> into leaf_out
     # (NUL-terminated, max 31 bytes). Returns 1 on a clean parse,
     # 0 otherwise.  Rejects empty <name> / empty <leaf> / paths with
-    # any further slash segments (single-level only).
+    # any further slash segments (single-level only). Accepts both the
+    # "/sys/fs/cgroup/..." and the localized "#r/fs/cgroup/..." spelling
+    # (canonicalised up front).
+    canon: Array[256, char]
+    if _cg_canon(path_in, &canon[0]) == 0:
+        return 0
+    path: Ptr[char] = &canon[0]
     prefix: Ptr[char] = "/sys/fs/cgroup/"
     p: uint64 = 0
     while cast[uint8](prefix[p]) != 0:
@@ -2119,10 +2187,16 @@ def _cg_split(path: Ptr[char], name_out: Ptr[char], leaf_out: Ptr[char]) -> int3
     return 1
 
 
-def cgroup_path_match(path: Ptr[char]) -> int32:
+def cgroup_path_match(path_in: Ptr[char]) -> int32:
     # 1 iff `path` is a known cgroup v2 interface file (the set
     # cgroup_render dispatches). Lets the open path check membership
-    # WITHOUT rendering into a buffer first.
+    # WITHOUT rendering into a buffer first. Accepts both spellings via
+    # _cg_canon (the "#r/fs/cgroup..." localized form a shell open
+    # produces and the "/sys/fs/cgroup..." kernel-context form).
+    cm: Array[256, char]
+    if _cg_canon(path_in, &cm[0]) == 0:
+        return 0
+    path: Ptr[char] = &cm[0]
     if _path_eq(path, "/sys/fs/cgroup/cgroup.controllers") != 0:
         return 1
     if _path_eq(path, "/sys/fs/cgroup/cgroup.subtree_control") != 0:
@@ -2166,10 +2240,15 @@ def cgroup_path_match(path: Ptr[char]) -> int32:
     return 0
 
 
-def cgroup_render(path: Ptr[char], buf: Ptr[uint8]) -> int64:
+def cgroup_render(path_in: Ptr[char], buf: Ptr[uint8]) -> int64:
     # Dispatch a /sys/fs/cgroup/<file> path to its renderer. Returns
     # bytes written, or -1 for an unknown path. Mirrors proc_render's
     # shape; the open path in fs/vfs.ad gates on is_cgroup_path() first.
+    # Accepts both spellings via _cg_canon (see cgroup_path_match).
+    cr: Array[256, char]
+    if _cg_canon(path_in, &cr[0]) == 0:
+        return cast[int64](-1)
+    path: Ptr[char] = &cr[0]
     if _path_eq(path, "/sys/fs/cgroup/cgroup.controllers") != 0:
         return cast[int64](render_cgroup_controllers(buf))
     if _path_eq(path, "/sys/fs/cgroup/cgroup.subtree_control") != 0:
@@ -2217,6 +2296,227 @@ def cgroup_render(path: Ptr[char], buf: Ptr[uint8]) -> int64:
         if _path_eq(&cg_leaf_buf[0], "memory.current") != 0:
             return cast[int64](cgroup_mem_render_current(slot, buf))
     return -1
+
+
+# =====================================================================
+# cgroup v2 WRITE / MKDIR surface — fs ops reach the live object graph
+# =====================================================================
+#
+# These are the filesystem-side dispatchers the cgroupfs server's
+# mkdir / rmdir / write handlers call so a shell can drive the live
+# controllers:
+#   mkdir /sys/fs/cgroup/<g>             -> cgroup_cpu_mkdir
+#   rmdir /sys/fs/cgroup/<g>             -> cgroup_cpu_rmdir
+#   echo N   > .../<g>/pids.max          -> cgroup_pids_write_max
+#   echo N   > .../<g>/memory.max        -> cgroup_mem_write_max
+#   echo Q P > .../<g>/cpu.max           -> cgroup_cpu_write_max
+#   echo SLOT> .../<g>/cgroup.procs      -> cgroup_pids_attach_count
+# The path-arm split (_cg_split) and the cgroup object lookup
+# (cgroup_cpu_lookup) already live in this file; the live-object
+# mutators live in kernel/sched/cgroup_cpu.ad. We keep cgroup.procs as
+# a SLOT write (matching cgroup_cpu_render_procs, which renders task
+# SLOT ids) so the write/read surface round-trips a single handle; the
+# vfs layer resolves a real pid -> slot before calling us.
+
+def is_cgroup_subgroup_path(path_in: Ptr[char]) -> int32:
+    # 1 iff `path` is exactly "/sys/fs/cgroup/<name>" (a one-level
+    # cgroup directory, no leaf). Used by vfs_mkdir / vfs_rmdir to
+    # decide a cgroup dir create/remove vs. an on-disk mkdir. Rejects the
+    # bare root and any leaf file (which contains a '.' or a second '/').
+    # Accepts both spellings via _cg_canon (a userland mkdir's resolved
+    # target arrives as "#r/fs/cgroup/<name>").
+    canon: Array[256, char]
+    if _cg_canon(path_in, &canon[0]) == 0:
+        return 0
+    path: Ptr[char] = &canon[0]
+    prefix: Ptr[char] = "/sys/fs/cgroup/"
+    p: uint64 = 0
+    while cast[uint8](prefix[p]) != 0:
+        if cast[uint8](path[p]) != cast[uint8](prefix[p]):
+            return 0
+        p = p + 1
+    # After the prefix: a non-empty run of name chars with NO '/' and NO
+    # '.' (an interface file like cgroup.procs / memory.max always has a
+    # '.'; a nested leaf has a '/'). Plain "<name>" -> a subgroup dir.
+    n: uint64 = 0
+    while True:
+        c: uint8 = cast[uint8](path[p + n])
+        if c == 0:
+            break
+        if c == 47:          # '/' -> deeper than one level (leaf path)
+            return 0
+        if c == 46:          # '.' -> a root interface file, not a dir
+            return 0
+        n = n + 1
+    if n == 0:
+        return 0             # bare "/sys/fs/cgroup/" root
+    return 1
+
+
+def _cg_subgroup_name(path_in: Ptr[char], out: Ptr[char]) -> int32:
+    # Copy the "<name>" of a "/sys/fs/cgroup/<name>" path into `out`
+    # (NUL-terminated, max 31 bytes). Caller has checked
+    # is_cgroup_subgroup_path. Returns 1 on success. Canonicalises both
+    # spellings (see _cg_canon).
+    canon: Array[256, char]
+    if _cg_canon(path_in, &canon[0]) == 0:
+        return 0
+    path: Ptr[char] = &canon[0]
+    prefix: Ptr[char] = "/sys/fs/cgroup/"
+    p: uint64 = 0
+    while cast[uint8](prefix[p]) != 0:
+        p = p + 1
+    n: uint64 = 0
+    while n < 31:
+        c: uint8 = cast[uint8](path[p + n])
+        if c == 0:
+            break
+        out[n] = cast[char](c)
+        n = n + 1
+    out[n] = cast[char](0)
+    if n == 0:
+        return 0
+    return 1
+
+
+def cgroup_fs_mkdir(path: Ptr[char]) -> int32:
+    # mkdir /sys/fs/cgroup/<name> -> create a live cgroup. Returns 0 on
+    # success, -17 (-EEXIST) / -28 (-ENOSPC) / -22 (-EINVAL) on failure.
+    if is_cgroup_subgroup_path(path) == 0:
+        return -22
+    nb: Array[64, char]
+    if _cg_subgroup_name(path, &nb[0]) == 0:
+        return -22
+    rc: int32 = cgroup_cpu_mkdir(&nb[0])
+    if rc < 1:
+        # mkdir returns -1 for already-exists OR no-room. Disambiguate:
+        # if the name already resolves, it's EEXIST; else ENOSPC.
+        if cgroup_cpu_lookup(&nb[0]) >= 1:
+            return -17                      # -EEXIST
+        return -28                          # -ENOSPC
+    return 0
+
+
+def cgroup_fs_rmdir(path: Ptr[char]) -> int32:
+    # rmdir /sys/fs/cgroup/<name> -> remove an empty live cgroup.
+    if is_cgroup_subgroup_path(path) == 0:
+        return -22
+    nb: Array[64, char]
+    if _cg_subgroup_name(path, &nb[0]) == 0:
+        return -22
+    return cgroup_cpu_rmdir(&nb[0])
+
+
+def cgroup_fs_is_writable_leaf(path: Ptr[char]) -> int32:
+    # 1 iff `path` is a per-cgroup leaf that accepts writes
+    # (pids.max / memory.max / cpu.max / cgroup.procs). Lets the open
+    # path admit an OWRITE only on a real control file.
+    cg_name_buf: Array[64, char]
+    cg_leaf_buf: Array[64, char]
+    if _cg_split(path, &cg_name_buf[0], &cg_leaf_buf[0]) == 0:
+        return 0
+    if cgroup_cpu_lookup(&cg_name_buf[0]) < 1:
+        return 0
+    if _path_eq(&cg_leaf_buf[0], "pids.max") != 0:
+        return 1
+    if _path_eq(&cg_leaf_buf[0], "memory.max") != 0:
+        return 1
+    if _path_eq(&cg_leaf_buf[0], "cpu.max") != 0:
+        return 1
+    if _path_eq(&cg_leaf_buf[0], "cgroup.procs") != 0:
+        return 1
+    return 0
+
+
+def cgroup_fs_parse_first_dec(data: Ptr[char], n: uint64,
+                              out: Ptr[int64]) -> int32:
+    # Parse the FIRST decimal integer in `data[0..n)`, skipping leading
+    # whitespace. Returns 1 on success (value in *out), 0 if no digit.
+    # Used by the cgroup.procs write to recover a pid.
+    i: uint64 = 0
+    while i < n:
+        c: uint8 = cast[uint8](data[i])
+        if c >= 48 and c <= 57:
+            break
+        if c != 32 and c != 9 and c != 10:
+            # A non-space, non-digit lead (e.g. 'max') => no pid.
+            return 0
+        i = i + 1
+    if i >= n:
+        return 0
+    v: int64 = 0
+    got: int32 = 0
+    while i < n:
+        c2: uint8 = cast[uint8](data[i])
+        if c2 < 48 or c2 > 57:
+            break
+        v = v * 10 + cast[int64](c2 - 48)
+        got = 1
+        i = i + 1
+    if got == 0:
+        return 0
+    out[0] = v
+    return 1
+
+
+def cgroup_fs_write(path: Ptr[char], data: Ptr[char], n: uint64) -> int64:
+    # Dispatch a write to a per-cgroup control file into the live object.
+    # Returns the byte count consumed (== n) on success, or a negative
+    # errno. The cgroup.procs arm is NOT handled here (it needs a real
+    # pid->task-slot resolution that lives in the scheduler, reachable
+    # from vfs.ad); vfs.ad routes cgroup.procs through cgroup_fs_attach
+    # after resolving the pid. pids.max/memory.max/cpu.max are pure
+    # parse+set and resolve entirely here.
+    cg_name_buf: Array[64, char]
+    cg_leaf_buf: Array[64, char]
+    if _cg_split(path, &cg_name_buf[0], &cg_leaf_buf[0]) == 0:
+        return cast[int64](-22)             # -EINVAL: not a leaf path
+    slot: int32 = cgroup_cpu_lookup(&cg_name_buf[0])
+    if slot < 1:
+        return cast[int64](-2)              # -ENOENT
+    rc: int32 = 0
+    if _path_eq(&cg_leaf_buf[0], "pids.max") != 0:
+        rc = cgroup_pids_write_max(slot, data, n)
+    elif _path_eq(&cg_leaf_buf[0], "memory.max") != 0:
+        rc = cgroup_mem_write_max(slot, data, n)
+    elif _path_eq(&cg_leaf_buf[0], "cpu.max") != 0:
+        rc = cgroup_cpu_write_max(slot, data, n)
+    else:
+        return cast[int64](-13)             # -EACCES: read-only leaf
+    if rc != 0:
+        return cast[int64](rc)
+    return cast[int64](n)
+
+
+def cgroup_fs_attach(path: Ptr[char], task_slot: uint64) -> int64:
+    # cgroup.procs write arm: move `task_slot` into the cgroup named by
+    # `path`. Caller (vfs.ad) has resolved the written pid -> task slot.
+    # Returns 0 on success, negative errno on failure.
+    cg_name_buf: Array[64, char]
+    cg_leaf_buf: Array[64, char]
+    if _cg_split(path, &cg_name_buf[0], &cg_leaf_buf[0]) == 0:
+        return cast[int64](-22)
+    if _path_eq(&cg_leaf_buf[0], "cgroup.procs") == 0:
+        return cast[int64](-22)
+    slot: int32 = cgroup_cpu_lookup(&cg_name_buf[0])
+    if slot < 1:
+        return cast[int64](-2)
+    rc: int32 = cgroup_pids_attach_count(slot, task_slot)
+    if rc != 0:
+        return cast[int64](rc)
+    return cast[int64](0)
+
+
+def cgroup_fs_path_is_procs(path: Ptr[char]) -> int32:
+    # 1 iff `path` is ".../<g>/cgroup.procs". Lets vfs.ad pick the
+    # pid-resolving attach arm vs. the plain parse arm.
+    cg_name_buf: Array[64, char]
+    cg_leaf_buf: Array[64, char]
+    if _cg_split(path, &cg_name_buf[0], &cg_leaf_buf[0]) == 0:
+        return 0
+    if _path_eq(&cg_leaf_buf[0], "cgroup.procs") != 0:
+        return 1
+    return 0
 
 
 # =====================================================================
