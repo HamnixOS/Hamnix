@@ -286,6 +286,24 @@ else
     fail=1
 fi
 
+# Regression guard (mm/vma.ad windowed-VA reclaim): apt's heavy .so
+# closure + malloc/dlopen churn used to exhaust the [1 GiB, 4 GiB) mmap
+# window, so ld.so failed to map libapt-pkg.so ("failed to map segment
+# from shared object") and the kernel printed a "window exhausted" line.
+# Both must be ABSENT now that freed windows are reclaimed per-task.
+if grep -a -F -q "failed to map segment from shared object" "$LOG"; then
+    echo "[test_linux_debian_coverage] FAIL-PRESENT: ld.so 'failed to map segment' (window exhaustion regressed)"
+    fail=1
+else
+    echo "[test_linux_debian_coverage] OK (absent): no ld.so 'failed to map segment'"
+fi
+if grep -a -F -q "window exhausted" "$LOG"; then
+    echo "[test_linux_debian_coverage] FAIL-PRESENT: kernel mmap-window-exhausted printk"
+    fail=1
+else
+    echo "[test_linux_debian_coverage] OK (absent): no mmap-window-exhausted printk"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "[test_linux_debian_coverage] FAIL (qemu rc=$rc; log: $LOG)"
     exit 1

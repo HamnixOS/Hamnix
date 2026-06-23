@@ -236,6 +236,26 @@ check_banner_value "BANNER_DPKG_VERSION_START" "dpkg" \
 check_banner_value "BANNER_APT_VERSION_START" "apt " \
                    "enter linux { /usr/bin/apt-get --version } printed 'apt '"
 
+# Regression guard for the windowed-mmap exhaustion bug (mm/vma.ad
+# windowed-VA reclaim): apt's heavy .so closure + malloc churn used to
+# march the [1 GiB, 4 GiB) mmap window to exhaustion, so ld.so's next
+# PT_LOAD segment mmap of libapt-pkg.so returned -ENOMEM and glibc
+# aborted with "failed to map segment from shared object". Assert that
+# string is ABSENT and the window-exhausted printk never fired.
+check_absent() {
+    local needle="$1" label="$2"
+    if grep -a -F -q "$needle" "$LOG"; then
+        echo "[test_linux_apt_install] FAIL-PRESENT: $label ('$needle')"
+        fail=1
+    else
+        echo "[test_linux_apt_install] OK (absent): $label"
+    fi
+}
+check_absent "failed to map segment from shared object" \
+             "no ld.so 'failed to map segment' (libapt-pkg maps)"
+check_absent "window exhausted" \
+             "no kernel mmap-window-exhausted printk"
+
 if [ "$fail" -ne 0 ]; then
     echo "[test_linux_apt_install] FAIL (qemu rc=$rc)"
     exit 1

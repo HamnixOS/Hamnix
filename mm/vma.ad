@@ -276,6 +276,202 @@ VMA_LARGE_LIMIT:  uint64 = 0xFFC00000           # just under 4 GiB
 vma_large_next:   uint64 = 0x40000000
 
 # ---------------------------------------------------------------------
+# Windowed-VA RECLAIM free-list (per-task) — apt shared-object exhaustion
+# ---------------------------------------------------------------------
+#
+# EVERY non-fixed mmap (file AND anonymous, ANY size) is routed through the
+# windowed installer (_vma_alloc_large / _vma_alloc_*_demand / _file_shared)
+# so it gets proper US=1 leaf PTEs in the [1 GiB, 4 GiB) window — see the
+# big comment at vma_alloc. Each request is rounded UP to a 4 MiB window
+# slice (the buddy MAX_ORDER chunk + the 1 GiB-PDPT alignment constraint),
+# and `vma_large_next` is a MONOTONIC bump pointer that historically never
+# reclaimed a freed window.
+#
+# That leaks ~4 MiB of window VA PER mmap and never gives it back. dpkg's
+# short run with a handful of DSO maps never noticed. apt is C++ and does
+# THOUSANDS of mmaps in one process — glibc malloc arenas + per-allocation
+# MMAP_THRESHOLD blocks + libstdc++ exception tables + each dlopen'd apt
+# method — so it marches `vma_large_next` toward VMA_LARGE_LIMIT and then
+# _vma_alloc_large returns -ENOMEM. ld.so's NEXT PT_LOAD-segment mmap of
+# libapt-pkg.so fails -> glibc prints "failed to map segment from shared
+# object" and apt aborts. (Same global counter is shared across the apt ->
+# method/dpkg fork tree, so it drains even faster.) This is the root cause
+# of the apt-vs-dpkg divergence — NOT a per-segment ELF-layout bug.
+#
+# Fix: a PER-TASK free-list of released 4-MiB-aligned window extents.
+# vma_unmap (and execve/teardown via vma_clear) push a freed windowed
+# extent back here AFTER confirming no VMA of the freeing task still
+# overlaps it (safety: a window slice that still holds a sibling split
+# piece — RELRO mprotect, partial munmap — is NOT recycled). The window
+# allocators try this list (first-fit, split-remainder-reinsert) BEFORE
+# bumping vma_large_next, so a process's steady-state working set of
+# windowed mappings is bounded by its LIVE footprint, not its lifetime
+# mmap COUNT. Per-task (not global) keeps the VA-reuse safety trivial:
+# each PML4 is independent, so a task only ever reuses its OWN freed VAs,
+# and _vma_tree_overlap(slot, ...) is exactly the right liveness check.
+VMA_WIN_FREE_PER_TASK: uint64 = 64
+# Parallel (base, size) extent arrays, NR_TASKS_VMA * VMA_WIN_FREE_PER_TASK.
+# base == 0 marks an empty slot.
+g_vma_win_free_base: Array[32768, uint64]    # 512 * 64
+g_vma_win_free_size: Array[32768, uint64]
+
+
+def _vma_win_free_reset(slot: uint64):
+    # Drop the whole free-list for `slot` (execve / teardown). The window
+    # VAs themselves are released by vma_clear's per-node free; this just
+    # forgets the cached extents so a re-exec'd task starts clean.
+    base_i: uint64 = slot * VMA_WIN_FREE_PER_TASK
+    i: uint64 = 0
+    while i < VMA_WIN_FREE_PER_TASK:
+        g_vma_win_free_base[base_i + i] = 0
+        g_vma_win_free_size[base_i + i] = 0
+        i = i + 1
+
+
+def _vma_win_free_push(slot: uint64, base: uint64, size: uint64):
+    # Return a 4-MiB-aligned windowed extent [base, base+size) to `slot`'s
+    # free-list. Coalesces with an adjacent existing extent when possible
+    # (keeps multi-window allocs satisfiable). On a full list the extent is
+    # simply dropped — correctness is preserved (it just isn't reclaimed),
+    # the monotonic bump pointer still backstops fresh allocations.
+    if base < VMA_LARGE_BASE or size == 0:
+        return
+    base_i: uint64 = slot * VMA_WIN_FREE_PER_TASK
+    end: uint64 = base + size
+    # Dedup pass: never record a window VA that already sits (wholly or
+    # partly) inside an existing free extent — a double-push (two munmaps
+    # in the same already-emptied window) would otherwise let _pop hand the
+    # same VA out twice and alias two live mappings.
+    d: uint64 = 0
+    while d < VMA_WIN_FREE_PER_TASK:
+        db: uint64 = g_vma_win_free_base[base_i + d]
+        if db != 0:
+            de: uint64 = db + g_vma_win_free_size[base_i + d]
+            if base < de and db < end:
+                return
+        d = d + 1
+    # Tail rollback: if this extent sits at the very top of the GLOBAL bump
+    # pointer, give it back to vma_large_next instead of caching it. The
+    # counter is monotonic and shared, so its tail == the highest VA ever
+    # handed out; this window was last handed to THIS task (we're freeing
+    # it), so rolling the global pointer back recovers the VA for ANY task's
+    # next allocation — bounding the cross-process global leak for the
+    # common LIFO unmap pattern (glibc maps then frees its top arena/DSO).
+    if end == vma_large_next:
+        vma_large_next = base
+        # The roll-back may now make the PREVIOUS free-list tail extent
+        # contiguous with the global pointer too; sweep once to pull any
+        # such cached extents back into the counter.
+        progress: int32 = 1
+        while progress != 0:
+            progress = 0
+            k: uint64 = 0
+            while k < VMA_WIN_FREE_PER_TASK:
+                kb: uint64 = g_vma_win_free_base[base_i + k]
+                if kb != 0:
+                    ke: uint64 = kb + g_vma_win_free_size[base_i + k]
+                    if ke == vma_large_next:
+                        vma_large_next = kb
+                        g_vma_win_free_base[base_i + k] = 0
+                        g_vma_win_free_size[base_i + k] = 0
+                        progress = 1
+                k = k + 1
+        return
+    # Coalesce pass: try to extend an existing adjacent extent.
+    i: uint64 = 0
+    while i < VMA_WIN_FREE_PER_TASK:
+        eb: uint64 = g_vma_win_free_base[base_i + i]
+        if eb != 0:
+            es: uint64 = g_vma_win_free_size[base_i + i]
+            ee: uint64 = eb + es
+            if ee == base:
+                g_vma_win_free_size[base_i + i] = es + size
+                return
+            if end == eb:
+                g_vma_win_free_base[base_i + i] = base
+                g_vma_win_free_size[base_i + i] = size + es
+                return
+        i = i + 1
+    # No coalesce: take the first empty slot.
+    j: uint64 = 0
+    while j < VMA_WIN_FREE_PER_TASK:
+        if g_vma_win_free_base[base_i + j] == 0:
+            g_vma_win_free_base[base_i + j] = base
+            g_vma_win_free_size[base_i + j] = size
+            return
+        j = j + 1
+    # List full: drop it (bump pointer backstops).
+    return
+
+
+def _vma_win_free_pop(slot: uint64, window: uint64) -> uint64:
+    # First-fit: find a free extent >= `window` (a 4-MiB-aligned size),
+    # carve `window` off its FRONT, reinsert the remainder, and return the
+    # carved base. Returns 0 if no extent is large enough (caller then
+    # bumps vma_large_next).
+    base_i: uint64 = slot * VMA_WIN_FREE_PER_TASK
+    i: uint64 = 0
+    while i < VMA_WIN_FREE_PER_TASK:
+        eb: uint64 = g_vma_win_free_base[base_i + i]
+        if eb != 0:
+            es: uint64 = g_vma_win_free_size[base_i + i]
+            if es >= window:
+                if es == window:
+                    g_vma_win_free_base[base_i + i] = 0
+                    g_vma_win_free_size[base_i + i] = 0
+                else:
+                    g_vma_win_free_base[base_i + i] = eb + window
+                    g_vma_win_free_size[base_i + i] = es - window
+                return eb
+        i = i + 1
+    return 0
+
+
+def _vma_win_alloc(slot: uint64, window: uint64) -> uint64:
+    # Acquire a 4-MiB-aligned, `window`-byte windowed VA range: reuse a
+    # freed extent if one fits, else bump vma_large_next. Returns the base
+    # or 0 on exhaustion. `window` MUST already be 4-MiB-rounded.
+    reuse: uint64 = _vma_win_free_pop(slot, window)
+    if reuse != 0:
+        return reuse
+    base: uint64 = vma_large_next
+    if base + window > VMA_LARGE_LIMIT:
+        return 0
+    vma_large_next = base + window
+    return base
+
+
+def _vma_win_release_unmap(slot: uint64, lo_in: uint64, hi_in: uint64):
+    # After a carve/unmap of [lo_in, hi_in), scan its 4-MiB-aligned windowed
+    # sub-extents and return to the free-list every WHOLE 4-MiB window the
+    # freeing task no longer overlaps. Only the windowed portion (>= 1 GiB)
+    # is considered; low identity mappings are never windowed.
+    lo: uint64 = lo_in
+    if lo < VMA_LARGE_BASE:
+        lo = VMA_LARGE_BASE
+    if hi_in <= lo:
+        return
+    # Snap to the enclosing whole 4-MiB windows: lo DOWN, hi UP. A windowed
+    # mmap reserves a 4-MiB-rounded slice but the user's munmap length is
+    # the UNROUNDED request (e.g. glibc maps then unmaps a 16 KiB region
+    # whose window is a full 4 MiB) — so the freed range rarely covers a
+    # whole window by length alone. Expanding to the enclosing windows and
+    # then gating EACH candidate on _vma_tree_overlap(slot, ...) == 0 makes
+    # reclaim fire for that common case while staying SAFE: a window is
+    # recycled only when NO live VMA of this task still touches it. Since
+    # every windowed alloc takes its OWN 4-MiB-rounded base (windows are
+    # never shared between two VMAs), overlap==0 is exact.
+    w_lo: uint64 = lo & ~(VMA_MAX_CHUNK - 1)
+    w_hi: uint64 = (hi_in + VMA_MAX_CHUNK - 1) & ~(VMA_MAX_CHUNK - 1)
+    cur: uint64 = w_lo
+    while cur + VMA_MAX_CHUNK <= w_hi:
+        if cur >= VMA_LARGE_BASE \
+                and _vma_tree_overlap(slot, cur, cur + VMA_MAX_CHUNK) == 0:
+            _vma_win_free_push(slot, cur, VMA_MAX_CHUNK)
+        cur = cur + VMA_MAX_CHUNK
+
+
+# ---------------------------------------------------------------------
 # U52 — mmap-base ASLR.
 #
 # Every windowed mmap (large eager anon, demand-paged anon, file-shared)
@@ -2100,8 +2296,8 @@ def _vma_alloc_large(slot: uint64, length: uint64, prot: int32,
     # every per-chunk install stays inside one 1 GiB PDPT entry.
     window: uint64 = (length + VMA_MAX_CHUNK - 1) \
                      & ~(VMA_MAX_CHUNK - 1)
-    base: uint64 = vma_large_next
-    if base + window > VMA_LARGE_LIMIT:
+    base: uint64 = _vma_win_alloc(slot, window)
+    if base == 0:
         printk1("vma: large window exhausted (need 0x%x)\n", window)
         return cast[int64](-12)
 
@@ -2192,9 +2388,8 @@ def _vma_alloc_large(slot: uint64, length: uint64, prot: int32,
     # value (drops every non-global entry).
     load_cr3(pml4)
 
-    # Commit the window: bump the allocator past it.
-    vma_large_next = base + window
-
+    # The window VA was already committed by _vma_win_alloc (free-list
+    # reuse or a vma_large_next bump). No second bump here.
     end_v: uint64 = base + length
     _vma_node_set(node, base, end_v, prot, flags, file_fd,
                   file_offset, 0, 0)
@@ -2446,6 +2641,10 @@ def vma_unmap(slot: uint64, addr: uint64, len_in: uint64) -> int64:
     length: uint64 = (len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
     end_v: uint64 = addr + length
     _vma_carve_range(slot, addr, end_v)
+    # Reclaim any whole 4-MiB windowed slice that this unmap fully cleared,
+    # so a long-lived process (apt's malloc/dlopen churn) reuses its own
+    # freed window VAs instead of marching vma_large_next to exhaustion.
+    _vma_win_release_unmap(slot, addr, end_v)
     return 0
 
 
@@ -2503,14 +2702,14 @@ def vma_alloc_demand(slot: uint64, addr_in: uint64, len_in: uint64,
         _vma_carve_range(slot, addr_in, addr_in + length)
         base = addr_in
     else:
-        # Allocate from the large-VMA virtual window.
+        # Allocate from the large-VMA virtual window (free-list reuse
+        # first, then bump — see _vma_win_alloc).
         window: uint64 = (length + VMA_MAX_CHUNK - 1) \
                          & ~(VMA_MAX_CHUNK - 1)
-        base = vma_large_next
-        if base + window > VMA_LARGE_LIMIT:
+        base = _vma_win_alloc(slot, window)
+        if base == 0:
             printk1("vma: demand window exhausted (need 0x%x)\n", window)
             return cast[int64](-12)
-        vma_large_next = base + window
 
     # Prepare page tables for the demand range (crack PDPT/PD/PT without
     # installing any physical mappings).
@@ -2592,11 +2791,10 @@ def vma_alloc_huge_demand(slot: uint64, addr_in: uint64, len_in: uint64,
         # 2 MiB-aligned and keeps each window inside one 1 GiB PDPT entry).
         window: uint64 = (length + VMA_MAX_CHUNK - 1) \
                          & ~(VMA_MAX_CHUNK - 1)
-        base = vma_large_next
-        if base + window > VMA_LARGE_LIMIT:
+        base = _vma_win_alloc(slot, window)
+        if base == 0:
             printk1("vma: huge window exhausted (need 0x%x)\n", window)
             return cast[int64](-12)
-        vma_large_next = base + window
 
     # Prepare the page tables at PMD granularity: PDPT + PD exist, every
     # covering 2 MiB PDE left not-present. Split into per-GiB chunks the
@@ -2693,12 +2891,11 @@ def _vma_alloc_file_core(slot: uint64, addr_in: uint64, len_in: uint64,
     else:
         window: uint64 = (length + VMA_MAX_CHUNK - 1) \
                          & ~(VMA_MAX_CHUNK - 1)
-        base = vma_large_next
-        if base + window > VMA_LARGE_LIMIT:
+        base = _vma_win_alloc(slot, window)
+        if base == 0:
             printk1("vma: file-mmap window exhausted (need 0x%x)\n",
                     window)
             return cast[int64](-12)
-        vma_large_next = base + window
 
     pml4: uint64 = task_pml4(cast[int32](slot))
     GIB: uint64 = 0x40000000
@@ -3742,6 +3939,10 @@ def vma_clear(slot: uint64):
     set_task_vma_list_head(slot, 0)
     # Wave-3: the whole interval tree is gone with the list.
     _vma_set_tree_root(slot, 0)
+    # execve/teardown: the cached windowed free-extents are stale (their VAs
+    # were just released with the page table); forget them so a re-exec'd
+    # task starts with a clean free-list.
+    _vma_win_free_reset(slot)
 
 
 def vma_adopt(from_slot: uint64, to_slot: uint64):
