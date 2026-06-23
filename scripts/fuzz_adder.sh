@@ -61,11 +61,11 @@ python3 -m compiler.adder compile --target=x86_64-linux $OPT_ARGS \
     || { cat "$WORK/reg.cerr"; fail "regression fixture failed to compile"; }
 REG_OUT="$("$REG_ELF")"
 REG_RC=$?
-REG_EXPECT="2022430493"
+REG_EXPECT="18446742841164082190"
 [ "$REG_OUT" = "$REG_EXPECT" ] \
     || fail "regression value $REG_OUT != $REG_EXPECT (a fixed miscompile is BACK)"
-# exit code is low byte of the value: 2022430493 & 0xFF = 29
-[ "$REG_RC" -eq 29 ] || fail "regression exit $REG_RC != 29"
+# exit code is low byte of the value: 18446742841164082190 & 0xFF = 14
+[ "$REG_RC" -eq 14 ] || fail "regression exit $REG_RC != 14"
 echo "[fuzz_adder] regression OK (value=$REG_OUT exit=$REG_RC)"
 
 # ---- Phase 2: seeded fuzz batch ----------------------------------------

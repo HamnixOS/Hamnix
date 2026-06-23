@@ -374,7 +374,13 @@ def split_native_by_prologue(insns):
     cut = n
     # walk back over appendage instructions
     i = n - 1
-    APPEND_MN = {"mov", "movslq", "syscall", "ret", "jmp", "call", "endbr64"}
+    # `xor`/`neg` appear in two synthesized wrappers (sys_waitpid's
+    # `xorl %esi,%esi` flags-clear; sys_pgrp_kill's `movl %edi,%edi; negq %rdi`
+    # a0=-pgid), so they are legitimate appendage instructions. The walk still
+    # stops at any `endbr64` (every real user function opens with one) and at a
+    # frame/RIP-touching mov, so admitting them can't swallow a user function.
+    APPEND_MN = {"mov", "movslq", "syscall", "ret", "jmp", "call",
+                 "endbr64", "xor", "neg"}
     seen_endbr_since = False
     while i >= 0:
         m = insns[i][2]
