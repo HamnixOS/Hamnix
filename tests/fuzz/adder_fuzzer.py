@@ -1805,6 +1805,27 @@ def _run_regpressure_corpus():
     total_inreg = 0
     total_spilled = 0
     max_regs = 0
+    total_regmove_progs = 0   # programs whose --opt MACHINE CODE shows reg moves
+    from pathlib import Path as _Path
+
+    # --- x86-64 opcode signatures emitted by the regalloc backend (codegen.ad
+    #     emit_push_callee / emit_mov_callee_rax / emit_mov_rax_callee). These
+    #     bytes are how a promoted local actually LIVES in a callee-saved
+    #     register, vs the default %rbp-slot load/store. The --dump-regalloc lane
+    #     is pure analysis; this asserts the EMITTED CODE genuinely changed.
+    #       push %rbx -> 53 ; push %r12..%r15 -> 41 54..41 57
+    #       mov %rbx,%rax -> 48 8b c3 ; mov %r12..%r15,%rax -> 49 8b c4..c7
+    #       mov %rax,%rbx -> 48 89 c3 ; mov %rax,%r12..%r15 -> 49 89 c4..c7
+    _CALLEE_PUSH = (bytes([0x53]), bytes([0x41, 0x54]), bytes([0x41, 0x55]),
+                    bytes([0x41, 0x56]), bytes([0x41, 0x57]))
+    _REG_READ = ([bytes([0x48, 0x8b, 0xc3])]
+                 + [bytes([0x49, 0x8b, c]) for c in (0xc4, 0xc5, 0xc6, 0xc7)])
+    _REG_WRITE = ([bytes([0x48, 0x89, 0xc3])]
+                  + [bytes([0x49, 0x89, c]) for c in (0xc4, 0xc5, 0xc6, 0xc7)])
+
+    def _contains_any(blob, pats):
+        return any(p in blob for p in pats)
+
     for (name, body, exp_out, exp_exit) in _regpressure_corpus():
         r = host.run_through_codegen_ad(f"rp_{name}", body, _AD_WORK, opt=True)
         if r.kind != "ok":
@@ -1825,6 +1846,42 @@ def _run_regpressure_corpus():
         total_inreg += ra.inreg
         total_spilled += ra.spilled
         max_regs = max(max_regs, ra.max_regs)
+
+        # MACHINE-CODE proof: dump the emitted bytes with --opt ON and OFF and
+        # assert the ON image actually uses callee-saved registers (push + a
+        # register read/write move) while the OFF image does NOT push any
+        # callee-saved reg (so the bytes genuinely differ — the registers are
+        # real instructions, not just an analysis annotation, and the OFF path
+        # is byte-inert).
+        src = _AD_WORK / f"rpmc_{name}.ad"
+        src.write_text(body)
+        d_on = host.run_dump(src, opt=True)
+        d_off = host.run_dump(src, opt=False)
+        if d_on.status != "ok" or d_off.status != "ok":
+            all_ok = False
+            print(f"  [REGPRESSURE '{name}'] dump status on={d_on.status} "
+                  f"off={d_off.status}")
+            continue
+        on_push = _contains_any(d_on.code, _CALLEE_PUSH)
+        on_read = _contains_any(d_on.code, _REG_READ)
+        on_write = _contains_any(d_on.code, _REG_WRITE)
+        off_push = _contains_any(d_off.code, _CALLEE_PUSH)
+        if not (on_push and (on_read or on_write)):
+            all_ok = False
+            print(f"  [REGPRESSURE '{name}'] EMITTED CODE shows no callee-saved "
+                  f"register move under --opt (push={on_push} read={on_read} "
+                  f"write={on_write})")
+            continue
+        if off_push:
+            all_ok = False
+            print(f"  [REGPRESSURE '{name}'] OFF path is NOT byte-inert: emitted a "
+                  f"callee-saved push with the flag off")
+            continue
+        if d_on.code == d_off.code:
+            all_ok = False
+            print(f"  [REGPRESSURE '{name}'] --opt did not change the emitted code")
+            continue
+        total_regmove_progs += 1
     # The corpus must (a) be all-correct, (b) demonstrably register-allocate, and
     # (c) demonstrably hit pressure (a spill OR the full 5-reg pool somewhere).
     if total_inreg == 0:
@@ -1833,7 +1890,11 @@ def _run_regpressure_corpus():
     if total_spilled == 0 and max_regs < 5:
         all_ok = False
         print("  [REGPRESSURE FAIL] no register pressure exercised (no spill, pool not full)")
-    return (all_ok, total_inreg, total_spilled, max_regs)
+    if total_regmove_progs == 0:
+        all_ok = False
+        print("  [REGPRESSURE FAIL] no program emitted a callee-saved register move "
+              "under --opt (the allocator's assignments never reached the machine code)")
+    return (all_ok, total_inreg, total_spilled, max_regs, total_regmove_progs)
 
 
 # --------------------------------------------------------------------------
@@ -1943,11 +2004,12 @@ def _run_ad_codegen_batch(base, args):
         # spills. Asserts the allocated/spilled output is CORRECT vs the oracle
         # AND that the linear-scan allocator demonstrably used registers and hit
         # real pressure (a spill or full pool).
-        rp_ok, rp_inreg, rp_spill, rp_maxregs = _run_regpressure_corpus()
+        rp_ok, rp_inreg, rp_spill, rp_maxregs, rp_regmove = _run_regpressure_corpus()
         print(f"--- ADDER_OPT=1 register-pressure corpus (linear scan) ---")
         print(f"  values kept in registers:   {rp_inreg}")
         print(f"  values spilled to memory:   {rp_spill}")
         print(f"  max regs used in a function:{rp_maxregs}  (pool size 5)")
+        print(f"  programs w/ reg-move in code:{rp_regmove}  (machine-code proof)")
         if not rp_ok:
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] register-pressure corpus miscompiled or "
