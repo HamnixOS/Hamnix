@@ -4036,6 +4036,11 @@ def build_archive() -> bytes:
                 "usr/bin/wc",
                 "usr/bin/sort",
                 "usr/bin/head",
+                # NSS diagnostic + admin tools. getent exercises the same
+                # glibc getpwnam/NSS path dpkg uses for its statoverride
+                # 'root' lookup, so staging it lets a probe prove
+                # getpwnam("root") resolves inside the namespace.
+                "usr/bin/getent",
                 # GENUINE Debian bash (+ its libtinfo closure is globbed
                 # below). Proves the full Debian /bin/bash runs in the ns,
                 # not just dash. ~1.2 MB; acceptable for the curated slice.
