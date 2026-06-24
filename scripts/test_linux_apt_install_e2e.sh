@@ -185,6 +185,7 @@ set +e
     printf 'echo BANNER_DONE\n'; sleep 1
     printf 'exit\n'; sleep 1
 ) | timeout 600s qemu-system-x86_64 \
+    -enable-kvm -cpu host \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
