@@ -395,6 +395,11 @@ sys_getpid:
     .type sys_execve, @function
 sys_execve:
     movq    $10, %rax               /* SYS_EXECVE */
+    xorq    %rdx, %rdx              /* a2=envp: 2-arg form has NO env — zero
+                                     * %rdx deterministically so the kernel's
+                                     * SYS_EXECVE handler never snapshots a
+                                     * stale caller register as an envp array
+                                     * (real HW saw garbage 0x35 -> -EFAULT). */
     syscall
     ret                             /* only reached on failure */
     .size sys_execve, .-sys_execve
