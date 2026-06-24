@@ -4004,6 +4004,14 @@ def build_archive() -> bytes:
                 "usr/bin/dpkg-deb",
                 "usr/bin/dpkg-query",
                 "usr/bin/dpkg-split",
+                # dpkg's maintainer-script + configure helpers. dpkg
+                # findprog()'s these by PATH during unpack/configure; if
+                # absent it warns "N expected programs not found in PATH"
+                # (ldconfig runs in the libc trigger, start-stop-daemon in
+                # many postinst scripts). Staged from the rootfs sbin tree
+                # (usrmerge alias plants them at /sbin too).
+                "usr/sbin/ldconfig",
+                "usr/sbin/start-stop-daemon",
                 # dpkg-deb forks tar, which forks the decompressor; the
                 # leaf hamhello .deb uses gzip (data.tar.gz).
                 "bin/tar",
