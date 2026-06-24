@@ -93,6 +93,7 @@ RC_TMP=$(mktemp /tmp/hamsh-rc-apte2e.XXXXXX.rc)
 # per-dir cpio rebind that would shadow a /bin -> /usr/bin symlink).
 cat > "$RC_TMP" <<'EOF'
 echo TEST_RC_START
+export 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 linux = ns clean {
     bind '#r/var/lib/distros/default' /
     bind -bc '#t' /
