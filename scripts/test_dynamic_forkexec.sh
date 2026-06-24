@@ -89,6 +89,18 @@ if [ ! -f "$UBIN" ]; then
 fi
 echo "[test_dynamic_forkexec]   $(file -b "$UBIN")"
 
+# The forkexec parent's child execve()s /bin/u_dynamic_hello. That
+# second-generation dynamic binary is the dynamic_hello fixture; it
+# MUST be built + embedded or the child's execve returns ENOENT and
+# the keystone fork->execve(dynamic) path is never exercised.
+CHILD_UBIN=tests/u-binary/u_dynamic_hello
+make -C tests/u-binary/src/dynamic_hello install >/dev/null 2>&1 || true
+if [ ! -f "$CHILD_UBIN" ]; then
+    echo "[test_dynamic_forkexec] SKIP: $CHILD_UBIN not built (no host gcc?)"
+    exit 0
+fi
+echo "[test_dynamic_forkexec]   child: $(file -b "$CHILD_UBIN")"
+
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
