@@ -83,7 +83,13 @@ EOF
 echo "[build_local_apt_repo] (2/5) dpkg-deb --build"
 DEB="$WORK/${PKG}_${VER}_${ARCH}.deb"
 # --root-owner-group keeps the tar members root:root without needing fakeroot.
-dpkg-deb --root-owner-group --build "$WORK" "$DEB" >/dev/null
+# -Zgzip: force GZIP compression of control.tar/data.tar. Modern dpkg-deb
+# defaults to xz (or zstd), but the Hamnix debian-minbase rootfs only stages
+# the `gzip` decompressor — an xz/zstd .deb makes dpkg's unpack fork a
+# decompressor that isn't present, so tar receives garbage ("This does not
+# look like a tar archive") and the install aborts. gzip is what this
+# test's dpkg -> dpkg-deb -> tar -> gzip chain is designed around.
+dpkg-deb -Zgzip --root-owner-group --build "$WORK" "$DEB" >/dev/null
 
 echo "[build_local_apt_repo] (3/5) Lay out pool/ + dists/"
 rm -rf "$REPO"
