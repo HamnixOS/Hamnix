@@ -156,6 +156,35 @@ from compiler.regalloc import (
     RA_NONE,
 )
 
+# Phase-5 IR-CONSUMING emit path. OFF by default: ir_emit_is_enabled() returns 0
+# unless the dump driver armed it under --opt. When armed, gen_expr lowers a pure
+# signedness-invariant arithmetic subtree to the value IR (ir_lower_pure_expr) and
+# emits machine code by walking the IR TREE (gen_expr_ir below) — with on-the-IR
+# constant folding — instead of the AST, falling back to the AST emitter for any
+# subtree it cannot lower. With the flag off this is never entered and codegen
+# output is byte-identical to the pre-IR path. See ir.ad Phase 5 header.
+from compiler.ir import (
+    ir_reset,
+    ir_lower_pure_expr,
+    ir_emit_is_enabled,
+    ir_emit_count,
+    ir_emit_fold_count,
+    ir_emit_fallback_count,
+    ir_tree_is_const,
+    ir_tree_const_val,
+    ir_add_const_sum,
+    ir_add_const_count,
+    ir_kind,
+    ir_op,
+    ir_a,
+    ir_b,
+    ir_const,
+    ir_ast,
+    IR_CONST,
+    IR_IDENT,
+    IR_BINOP,
+)
+
 # -----------------------------------------------------------------------
 # Output buffer: flat machine-code bytes.
 # -----------------------------------------------------------------------
@@ -3479,10 +3508,195 @@ def emit_syscall_insn():
 # Expression codegen — value left in %rax (mirrors gen_expr).
 # -----------------------------------------------------------------------
 
+# =======================================================================
+# Phase-5 IR-CONSUMING emitter.
+# =======================================================================
+#
+# gen_expr_ir(v) emits machine code for the value IR node `v` (built by
+# ir_lower_pure_expr), leaving the result in %rax — byte-for-byte the value the
+# AST emitter would have produced for the same expression, because:
+#
+#   * IR_CONST  -> `movq $value,%rax` (same as the AST ND_INT_LIT path).
+#   * IR_IDENT  -> delegate to gen_expr(ir_ast[v]): the AST ND_IDENT emitter
+#                  handles register-promoted locals, sized sub-8-byte loads,
+#                  globals, percpu, function-pointer decay — identically.
+#   * IR_BINOP  -> if the WHOLE subtree is constant, fold it to one immediate
+#                  (the IR optimization: a multi-instruction const chain collapses
+#                  to `movq $folded,%rax`). Otherwise emit the SAME schedule the
+#                  AST integer path uses: eval RIGHT, push, eval LEFT, pop %rcx,
+#                  then the single 64-bit op — so %rax/%rcx and the result match
+#                  the seed exactly. (The op set is the signedness-INVARIANT one,
+#                  so no signed/unsigned decision is needed: ADD/SUB/MUL/AND/OR/
+#                  XOR/SHL emit one fixed instruction, exactly as the AST path.)
+#
+# Emit the sum of the NON-CONSTANT leaves of the ADD chain rooted at `v` into
+# %rax (constant leaves contribute 0 here — they are summed separately into the
+# reassociated immediate by the caller). Precondition: `v` is an ADD-rooted IR
+# tree with at least one non-constant leaf (the caller checks ir_add_const_count
+# >= 2 and the whole tree is not const). The schedule mirrors the AST integer
+# add: right subtree pushed, left subtree, pop %rcx, add — so the non-const sum
+# in %rax is the same value those leaves would contribute on the AST path.
+def gen_expr_ir_add_nonconst(v: uint32):
+    # A constant leaf contributes nothing to the non-const remainder: emit 0 so a
+    # lone-constant operand of an ADD is a no-op addend (the caller folds the
+    # constant). (Reached only as a recursive operand; a fully-constant ADD tree
+    # never enters this path — the caller's ir_tree_is_const check handles it.)
+    if ir_tree_is_const(v) != 0:
+        emit_mov_imm_rax(cast[uint64](0))
+        return
+    k: uint32 = ir_kind[v]
+    if k == IR_BINOP and ir_op[v] == BINOP_ADD:
+        la: uint32 = ir_a[v]
+        rb: uint32 = ir_b[v]
+        l_const: uint32 = ir_tree_is_const(la)
+        r_const: uint32 = ir_tree_is_const(rb)
+        if l_const != 0 and r_const == 0:
+            # Only the right side has non-const leaves; left is a folded constant.
+            gen_expr_ir_add_nonconst(rb)
+            return
+        if r_const != 0 and l_const == 0:
+            gen_expr_ir_add_nonconst(la)
+            return
+        # Both sides carry non-const leaves: sum them (right pushed, then left,
+        # pop %rcx, add) — same schedule/value as the AST add of the two halves.
+        gen_expr_ir_add_nonconst(rb)
+        emit_push_rax()
+        gen_expr_ir_add_nonconst(la)
+        emit_pop_rcx()
+        emit_add_rcx_rax()
+        return
+    # A non-ADD, non-const leaf (an IR_IDENT, or a nested BINOP of another op):
+    # emit its value directly through the normal IR emitter.
+    gen_expr_ir(v)
+
+
+# This is the genuine AST -> IR -> (fold) -> emit pipeline for the lowered subset.
+def gen_expr_ir(v: uint32):
+    if v == 0:
+        return
+    k: uint32 = ir_kind[v]
+    if k == IR_CONST:
+        emit_mov_imm_rax(ir_const[v])
+        return
+    if k == IR_IDENT:
+        # Leaf read: defer to the AST emitter for the original identifier node,
+        # so every leaf detail (promoted register, sized load, global) is exactly
+        # what the seed emits. ir_ast[v] is the ND_IDENT this leaf lowered from.
+        gen_expr(ir_ast[v])
+        return
+    if k == IR_BINOP:
+        # Fold a fully-constant subtree into one immediate (the IR-level win:
+        # collapse the instruction chain to its statically-known result).
+        if ir_tree_is_const(v) != 0:
+            emit_mov_imm_rax(ir_tree_const_val(v))
+            ir_emit_fold_count = ir_emit_fold_count + 1
+            return
+        op: uint32 = ir_op[v]
+        # ADD CONSTANT REASSOCIATION (sound under modular two's-complement): if
+        # this ADD tree has >=2 constant contributions AND at least one non-const
+        # leaf, sum every constant into ONE immediate and emit the non-const
+        # remainder + that single immediate — collapsing an add-chain's constant
+        # tail (`(a+3)+4` -> `a+7`), a reduction the AST const-fold cannot make.
+        if op == BINOP_ADD:
+            ccount: uint32 = ir_add_const_count(v)
+            if ccount >= 2:
+                csum: uint64 = ir_add_const_sum(v)
+                # Emit the non-const remainder of the chain into %rax.
+                gen_expr_ir_add_nonconst(v)
+                # Add the single folded constant. When csum is the sign-extension
+                # of its low 32 bits, the compact `addq $imm32,%rax` (emit_add_
+                # imm_rax, which sign-extends the imm32 to 64) computes exactly
+                # %rax + csum (modular) — shorter than any other addend chain.
+                # Otherwise fall back to materializing the full 64-bit constant in
+                # %rcx and adding (push remainder / mov imm64 / pop / add).
+                lo: uint64 = csum & cast[uint64](0xFFFFFFFF)
+                sext: uint64 = lo
+                if (lo & cast[uint64](0x80000000)) != 0:
+                    sext = lo | cast[uint64](0xFFFFFFFF00000000)
+                if sext == csum:
+                    emit_add_imm_rax(cast[uint32](lo))
+                else:
+                    emit_push_rax()
+                    emit_mov_imm_rax(csum)
+                    emit_pop_rcx()
+                    emit_add_rcx_rax()
+                ir_emit_reassoc_count = ir_emit_reassoc_count + 1
+                return
+        # Same eval order as the AST integer path: RIGHT first (pushed), then
+        # LEFT, pop the right into %rcx, apply the op -> %rax.
+        gen_expr_ir(ir_b[v])
+        emit_push_rax()
+        gen_expr_ir(ir_a[v])
+        emit_pop_rcx()
+        if op == BINOP_ADD:
+            emit_add_rcx_rax()
+        elif op == BINOP_SUB:
+            emit_sub_rcx_rax()
+        elif op == BINOP_MUL:
+            emit_imul_rcx_rax()
+        elif op == BINOP_BIT_AND:
+            emit_and_rcx_rax()
+        elif op == BINOP_BIT_OR:
+            emit_or_rcx_rax()
+        elif op == BINOP_BIT_XOR:
+            emit_xor_rcx_rax()
+        elif op == BINOP_SHL:
+            emit_shl_cl_rax()
+        else:
+            # ir_op_is_foldable restricts the lowered set to exactly the ops
+            # above, so this is unreachable; fail loudly if the set ever drifts.
+            cg_fail(1, ir_ast[v])
+        return
+    # Unknown IR kind (cannot happen for ir_lower_pure_expr output).
+    cg_fail(1, 0)
+
+
+# Try the IR-consuming emit path for AST expression `node`. Returns 1 if it
+# emitted the node through the IR (caller is done), 0 if `node` is outside the
+# lowered subset and the caller must fall back to the AST emitter. OFF by
+# default (ir_emit_is_enabled() == 0) -> always returns 0, so the default path is
+# byte-identical. Only ND_BINARY roots are attempted: a bare ident/literal is
+# already a single seed instruction, so routing it through the IR would only add
+# a redundant ir_reset with no benefit and no marker value.
+def try_gen_expr_ir(node: uint32) -> uint32:
+    if ir_emit_is_enabled() == 0:
+        return 0
+    if node == 0:
+        return 0
+    if nd_kind[node] != ND_BINARY:
+        return 0
+    # FLOAT GUARD: ir_lower_pure_expr lowers an ADD/SUB/MUL/... over float-typed
+    # IDENT/literal leaves into the SAME integer IR shape as integer operands,
+    # but a float add/sub/mul must go through the SSE path (gen_fp_binary), not
+    # an integer `addq`. expr_float_width recurses the whole arithmetic subtree
+    # (wider of the operands), so a non-zero width anywhere means this subtree is
+    # float-typed — refuse the integer IR path and let the AST emitter route it
+    # to SSE. (The lowered op set is signedness-INVARIANT for INTEGERS only.)
+    if expr_float_width(node) != 0:
+        ir_emit_fallback_count = ir_emit_fallback_count + 1
+        return 0
+    ir_reset()
+    v: uint32 = ir_lower_pure_expr(node)
+    if v == 0:
+        # Outside the lowered subset (impure / signedness-sensitive / out-of-set):
+        # the AST emitter handles it.
+        ir_emit_fallback_count = ir_emit_fallback_count + 1
+        return 0
+    gen_expr_ir(v)
+    ir_emit_count = ir_emit_count + 1
+    return 1
+
+
 def gen_expr(node: uint32):
     if node == 0:
         return
     k: uint32 = nd_kind[node]
+
+    # Phase-5: under --opt, try emitting a pure signedness-invariant arithmetic
+    # subtree THROUGH the IR (AST -> IR -> fold -> emit). Inert by default.
+    if k == ND_BINARY:
+        if try_gen_expr_ir(node) != 0:
+            return
 
     if k == ND_INT_LIT:
         emit_mov_imm_rax(nd_num[node])

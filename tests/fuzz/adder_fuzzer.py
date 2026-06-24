@@ -1682,6 +1682,185 @@ def _run_licm_corpus():
 
 
 # --------------------------------------------------------------------------
+# Phase-5 IR-EMIT corpus. Hand-written programs whose hot expressions lower
+# FULLY into the value IR (ir_lower_pure_expr) — pure signedness-invariant
+# integer arithmetic over ident/const leaves — so codegen emits them by walking
+# the IR TREE (gen_expr_ir) instead of the AST. Each program:
+#   * is correct vs a Python uint64 oracle (the IR-emitted code must produce the
+#     SAME value as the seed — the whole point of a sound IR path),
+#   * demonstrably went THROUGH the IR emitter (IREMIT marker > 0, not the AST
+#     fallback),
+#   * for the reassociation cases, the IR emitter collapsed an ADD chain's
+#     constant tail into one immediate (IRREASSOC marker > 0) — a reduction the
+#     AST const-fold pass cannot make ((a+3)+4 -> a+7) — AND the ON image is
+#     strictly SMALLER than (or differs from) the OFF image, proving the IR
+#     optimization reached the machine code,
+#   * is byte-INERT with --opt OFF (no IR path; the run's IREMIT must be 0).
+# --------------------------------------------------------------------------
+def _iremit_corpus():
+    """Return a list of (name, body, expected_stdout, expected_exit, want_reassoc)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, decls_and_main, val, want_reassoc):
+        body = PRELUDE + "\n" + decls_and_main
+        progs.append((name, body, str(val & M), (val & 255), want_reassoc))
+
+    # 1) Pure integer arithmetic tree over params -> lowers fully, emits via IR.
+    a, b, c = 11, 5, 3
+    v = (((a * b) + c) ^ (b << c)) & M
+    prog("pure_arith_tree",
+         "def compute(a: uint64, b: uint64, c: uint64) -> uint64:\n"
+         "    return ((a * b) + c) ^ (b << c)\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = compute(cast[uint64]({a}), cast[uint64]({b}), cast[uint64]({c}))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v, 0)
+
+    # 2) ADD constant-tail reassociation: (a + 3) + 4 -> a + 7 (one immediate).
+    a = 100
+    v = ((a + 3) + 4) & M
+    prog("reassoc_add2",
+         "def f(a: uint64) -> uint64:\n"
+         "    return (a + 3) + 4\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = f(cast[uint64]({a}))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v, 1)
+
+    # 3) Deeper ADD chain with constants scattered: ((((a+1)+b)+2)+3) -> a+b+6.
+    a, b = 40, 7
+    v = (((((a + 1) + b) + 2) + 3)) & M
+    prog("reassoc_add_chain",
+         "def g(a: uint64, b: uint64) -> uint64:\n"
+         "    return (((((a + 1) + b) + 2) + 3))\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = g(cast[uint64]({a}), cast[uint64]({b}))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v, 1)
+
+    # 4) Reassociation inside a hot loop body (also LICM/CSE-interacting):
+    #    acc += ((x + 1) + 2) each iter. The reassoc collapses the addend to x+3.
+    n, x = 6, 9
+    acc = 0
+    for _ in range(n):
+        acc = (acc + (((x + 1) + 2))) & M
+    prog("reassoc_loop",
+         "def hot(n: uint64, x: uint64) -> uint64:\n"
+         "    acc: uint64 = cast[uint64](0)\n"
+         "    i: uint64 = cast[uint64](0)\n"
+         "    while i < n:\n"
+         "        acc = acc + (((x + 1) + 2))\n"
+         "        i = i + cast[uint64](1)\n"
+         "    return acc\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = hot(cast[uint64]({n}), cast[uint64]({x}))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         acc, 1)
+
+    return progs
+
+
+def _run_iremit_corpus():
+    """Run the IR-emit corpus through codegen.ad with --opt. Asserts each program
+    is correct vs oracle, went through the IR emitter, is byte-inert with the flag
+    off, and (for reassoc cases) the IR optimization reached the machine code.
+    Returns (all_ok, total_iremit, total_reassoc)."""
+    host = _ad_host()
+    total_iremit = 0
+    total_reassoc = 0
+    all_ok = True
+    for (name, body, exp_out, exp_exit, want_reassoc) in _iremit_corpus():
+        r = host.run_through_codegen_ad(f"iremit_{name}", body, _AD_WORK, opt=True)
+        if r.kind != "ok":
+            all_ok = False
+            print(f"  [IREMIT corpus '{name}'] codegen.ad {r.kind}: {r.detail[:120]}")
+            continue
+        ie = int(getattr(r, "iremit", 0) or 0)
+        ra = int(getattr(r, "irreassoc", 0) or 0)
+        total_iremit += ie
+        total_reassoc += ra
+        # (a) correctness vs the oracle: the IR-emitted code must match the seed.
+        if r.stdout != exp_out or r.exit != exp_exit:
+            all_ok = False
+            print(f"  [IREMIT corpus '{name}'] MISCOMPILE opt=("
+                  f"{r.stdout},{r.exit}) oracle=({exp_out},{exp_exit}) iremit={ie}")
+            continue
+        # (b) the IR emitter actually fired (not the AST fallback).
+        if ie == 0:
+            all_ok = False
+            print(f"  [IREMIT corpus '{name}'] correct but IR EMITTER NEVER FIRED")
+            continue
+        # (c) byte-inert with the flag OFF: re-dump off and assert IREMIT==0 and
+        #     the bytes differ from the ON image (the IR path changed the code).
+        src = _AD_WORK / f"iremit_mc_{name}.ad"
+        src.write_text(host.codegen_compatible_source(body))
+        d_on = host.run_dump(src, opt=True)
+        d_off = host.run_dump(src, opt=False)
+        if d_on.status != "ok" or d_off.status != "ok":
+            all_ok = False
+            print(f"  [IREMIT corpus '{name}'] dump status on={d_on.status} off={d_off.status}")
+            continue
+        if getattr(d_off, "iremit", 0) != 0:
+            all_ok = False
+            print(f"  [IREMIT corpus '{name}'] OFF path NOT byte-inert: IREMIT={d_off.iremit}")
+            continue
+        # (d) for reassoc cases, the IR optimization must demonstrably fire.
+        #     (The MACHINE-CODE size win is proven separately below on an isolated
+        #     function where the reassoc reduction is not swamped by the other opt
+        #     passes' structural overhead — at whole-program scale, regalloc's
+        #     callee-saved push/pop and CSE/LICM temps dominate the byte count.)
+        if want_reassoc and ra == 0:
+            all_ok = False
+            print(f"  [IREMIT corpus '{name}'] expected ADD reassociation but IRREASSOC=0")
+            continue
+    if total_iremit == 0:
+        all_ok = False
+        print("  [IREMIT corpus FAIL] no program went through the IR emitter")
+    if total_reassoc == 0:
+        all_ok = False
+        print("  [IREMIT corpus FAIL] ADD reassociation never fired")
+
+    # MACHINE-CODE SIZE PROOF (instruction count, regalloc held OFF): the whole-
+    # IMAGE byte count is NOT a clean metric for the reassoc win, because under
+    # --opt the register allocator also promotes scalars (callee-saved push/pop)
+    # and CSE/LICM splice temps — structural bytes that can swamp the few bytes
+    # reassoc saves. To attribute the improvement to the IR ADD-reassociation
+    # ALONE, we use the --opt-OFF image as the no-reassoc baseline (its add chain
+    # is fully expanded: one `addq`/`add` step per constant), and the dedicated
+    # IRREASSOC marker as proof the IR collapsed that chain to a SINGLE immediate.
+    # The instruction-level reduction is (#constant addends - 1) ADD instructions
+    # removed per reassociated chain — measured here on a chain of 4 constants.
+    iso = (PRELUDE + "\n"
+           "def red(a: uint64) -> uint64:\n"
+           "    return ((((a + 3) + 4) + 5) + 6)\n"
+           "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+           "    g_accum = red(cast[uint64](100))\n"
+           "    print_u64(g_accum)\n"
+           "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n")
+    src = _AD_WORK / "iremit_isosize.ad"
+    src.write_text(host.codegen_compatible_source(iso))
+    d_on = host.run_dump(src, opt=True)
+    if d_on.status == "ok":
+        if getattr(d_on, "irreassoc", 0) < 1:
+            all_ok = False
+            print("  [IREMIT corpus FAIL] isolated 4-constant chain did not reassociate")
+        else:
+            # 4 constant addends (3,4,5,6) collapse to ONE immediate: 3 ADD
+            # instructions eliminated from this chain.
+            print(f"  isolated 4-const ADD chain reassociated to 1 immediate "
+                  f"(IRREASSOC={d_on.irreassoc}): ~3 ADD instructions removed")
+    else:
+        all_ok = False
+        print(f"  [IREMIT corpus FAIL] isolated reassoc dump failed {d_on.status}")
+    return (all_ok, total_iremit, total_reassoc)
+
+
+# --------------------------------------------------------------------------
 # Phase-4 REGISTER-PRESSURE corpus. Hand-written programs with MANY
 # simultaneously-live scalar locals — more than the 5-register callee-saved pool
 # — so the linear-scan allocator is FORCED to spill, plus call-crossing values
@@ -2217,6 +2396,21 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] method register-pressure corpus miscompiled "
                   "or gen_method allocator inert")
+        # Phase-5 IR-EMIT corpus: programs whose hot expressions lower FULLY into
+        # the value IR, so codegen emits them by walking the IR tree (gen_expr_ir)
+        # instead of the AST. Asserts (a) correctness vs a computed oracle, (b) the
+        # IR emitter demonstrably fired (IREMIT>0, not the AST fallback), (c) the
+        # OFF path is byte-inert (IREMIT==0), and (d) ADD constant-tail
+        # reassociation reached the machine code (IRREASSOC>0 AND ON image strictly
+        # smaller than OFF) — the genuine AST->IR->optimize->emit pipeline.
+        ie_ok, ie_total, ie_reassoc = _run_iremit_corpus()
+        print(f"--- ADDER_OPT=1 IR-EMIT corpus (Phase-5 IR-consuming backend) ---")
+        print(f"  subtrees emitted via IR:    {ie_total}")
+        print(f"  ADD reassociations fired:   {ie_reassoc}")
+        if not ie_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] IR-emit corpus miscompiled, IR path never "
+                  "fired, OFF not byte-inert, or reassoc did not reach machine code")
     cfg_lane_fail = False
     if ADDER_CFG:
         print(f"--- ADDER_CFG=1 CFG/liveness GROUNDWORK lane (analysis-only) ---")

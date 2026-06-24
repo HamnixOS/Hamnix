@@ -185,7 +185,11 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       fn_count=meta["FN_COUNT"],
                       folds=meta.get("FOLDS", 0),
                       cse=meta.get("CSE", 0),
-                      licm=meta.get("LICM", 0))
+                      licm=meta.get("LICM", 0),
+                      iremit=meta.get("IREMIT", 0),
+                      irfold=meta.get("IRFOLD", 0),
+                      irfallback=meta.get("IRFALLBACK", 0),
+                      irreassoc=meta.get("IRREASSOC", 0))
 
 
 # --------------------------------------------------------------------------
@@ -476,6 +480,9 @@ class CodegenRun:
         self.folds = kw.get("folds", 0)
         self.cse = kw.get("cse", 0)
         self.licm = kw.get("licm", 0)
+        self.iremit = kw.get("iremit", 0)
+        self.irfold = kw.get("irfold", 0)
+        self.irreassoc = kw.get("irreassoc", 0)
 
 
 def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
@@ -511,12 +518,17 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     folds = getattr(dump, "folds", 0)
     cse = getattr(dump, "cse", 0)
     licm = getattr(dump, "licm", 0)
+    iremit = getattr(dump, "iremit", 0)
+    irfold = getattr(dump, "irfold", 0)
+    irreassoc = getattr(dump, "irreassoc", 0)
     if rp.returncode < 0:
         return CodegenRun("runfail", detail=f"signal {-rp.returncode}",
                           stdout=out, exit=rp.returncode, folds=folds, cse=cse,
-                          licm=licm)
+                          licm=licm, iremit=iremit, irfold=irfold,
+                          irreassoc=irreassoc)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
-                      folds=folds, cse=cse, licm=licm)
+                      folds=folds, cse=cse, licm=licm, iremit=iremit,
+                      irfold=irfold, irreassoc=irreassoc)
 
 
 if __name__ == "__main__":
