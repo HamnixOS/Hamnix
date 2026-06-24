@@ -2434,6 +2434,28 @@ if _CPIO_STRESS_RAW:
             _payload = b"x\n"
         FILES.append((f"/cpio-stress/file{_i}", _payload))
 
+# Generic single-file injection: HAMNIX_EXTRA_CPIO_FILE="<host_path>:<guest_path>[:mode]"
+# stages one host file into the cpio at <guest_path>. Used by
+# scripts/test_linux_apt_install_e2e.sh to drop an apt-driver wrapper
+# script under the distro root (avoids hamsh tokenizing apt's `Dir::Etc::`
+# option syntax on the `enter linux { ... }` command line). Mode is octal,
+# default 0755.
+_EXTRA_CPIO = os.environ.get("HAMNIX_EXTRA_CPIO_FILE", "")
+if _EXTRA_CPIO:
+    _parts = _EXTRA_CPIO.split(":")
+    if len(_parts) < 2:
+        raise SystemExit(
+            f"HAMNIX_EXTRA_CPIO_FILE={_EXTRA_CPIO!r}: expected "
+            f"host_path:guest_path[:octal_mode]")
+    _host_p = _parts[0]
+    _guest_p = _parts[1]
+    with open(_host_p, "rb") as _f:
+        _data = _f.read()
+    # FILES entries are (name, data) 2-tuples (default mode 0644); the
+    # wrapper is invoked via `dash <path>`, so no execute bit is needed.
+    FILES.append((_guest_p, _data))
+    print(f"[initramfs] staged extra cpio file {_host_p} -> {_guest_p}")
+
 # hamnix-ac source injection: scripts/hamnix-ac stages a host-side Adder
 # source FILE into the cpio at a known in-guest path so the on-device
 # self-hosted compiler (codegen_ac_driver) can open()+read() it, lex it,
