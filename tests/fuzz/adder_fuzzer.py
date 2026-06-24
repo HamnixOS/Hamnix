@@ -1762,6 +1762,101 @@ def _iremit_corpus():
          "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
          acc, 1)
 
+    # ---- Phase 6: broadened lowered set — compares + DIV/MOD/SHR. Each lowers
+    #      fully into the value IR and emits THROUGH gen_expr_ir (IREMIT>0).
+    #      These pin the signed-vs-unsigned + negative-dividend traps that are
+    #      the classic miscompiles for the cmp/setcc and cqo/idiv/sar paths. ----
+
+    # 5) UNSIGNED compare whose result FLIPS under a signed reading: (uint64)-1
+    #    > 1 is True unsigned, would be False signed. Asserts the IR path emits
+    #    the UNSIGNED setcc (seta) for uintN operands.
+    M64 = (1 << 64) - 1
+    v = 1 if (M64 & M) > (1 & M) else 0
+    prog("ucmp_wrap_gt",
+         "def f(a: uint64, b: uint64) -> uint64:\n"
+         "    return cast[uint64](a > b)\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = f(cast[uint64]({M64}), cast[uint64](1))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v, 0)
+
+    # 6) SIGNED compare: -1 < 1 is True signed (would be False unsigned).
+    prog("scmp_neg_lt",
+         "def f(a: int64, b: int64) -> uint64:\n"
+         "    return cast[uint64](a < b)\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    g_accum = f(cast[int64](0) - cast[int64](1), cast[int64](1))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         1, 0)
+
+    # 7) SIGNED div/mod with NEGATIVE dividend: -7/2 == -3 (trunc toward zero,
+    #    x86 idiv), -7%2 == -1 (remainder sign = dividend). A wrong div/xor here
+    #    would give the unsigned 0x7FFF.../... garbage.
+    def trunc_div(a, b):
+        q = abs(a) // abs(b)
+        return -q if (a < 0) != (b < 0) else q
+    sd = trunc_div(-7, 2)
+    sm = -7 - trunc_div(-7, 2) * 2
+    prog("sdiv_neg",
+         "def f(a: int64, b: int64) -> uint64:\n"
+         "    return cast[uint64](a / b)\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    g_accum = f(cast[int64](0) - cast[int64](7), cast[int64](2))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         sd, 0)
+    prog("smod_neg",
+         "def f(a: int64, b: int64) -> uint64:\n"
+         "    return cast[uint64](a % b)\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    g_accum = f(cast[int64](0) - cast[int64](7), cast[int64](2))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         sm, 0)
+
+    # 8) SAR vs SHR: signed -16 >> 2 == -4 (arithmetic), unsigned huge >> 4 is
+    #    logical. The IR path must pick sar for signed, shr for unsigned.
+    prog("sar_signed",
+         "def f(a: int64, n: int64) -> uint64:\n"
+         "    return cast[uint64](a >> n)\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    g_accum = f(cast[int64](0) - cast[int64](16), cast[int64](2))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         (-16) >> 2, 0)
+    prog("shr_logical",
+         "def f(a: uint64, n: uint64) -> uint64:\n"
+         "    return a >> n\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = f(cast[uint64]({M64}), cast[uint64](4))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         M64 >> 4, 0)
+
+    # 9) ARRAY-ELEMENT LEAF lowering: a whole expression over array reads —
+    #    `buf[0] + buf[1]` and `buf[0] < buf[1]` — lowers (index reads become IR
+    #    leaves), where pre-Phase-6 the first non-ident leaf forced AST fallback.
+    prog("index_add",
+         "gbuf: Array[4, uint64]\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    gbuf[0] = cast[uint64](40)\n"
+         "    gbuf[1] = cast[uint64](2)\n"
+         "    g_accum = gbuf[0] + gbuf[1]\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         42, 0)
+    prog("index_cmp",
+         "hbuf: Array[4, uint64]\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    hbuf[0] = cast[uint64](3)\n"
+         "    hbuf[1] = cast[uint64](9)\n"
+         "    g_accum = cast[uint64](hbuf[0] < hbuf[1])\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         1, 0)
+
     return progs
 
 
@@ -1857,6 +1952,37 @@ def _run_iremit_corpus():
     else:
         all_ok = False
         print(f"  [IREMIT corpus FAIL] isolated reassoc dump failed {d_on.status}")
+
+    # CSE-ON-BROADENED-IR PROOF (Phase 6): a single pure expression with a
+    # REPEATED divide `(a/b) + (a/b)` lowers BOTH occurrences into the value IR,
+    # and the CSE pass — now running over the broadened lowered set — value-numbers
+    # them equal and eliminates the second divide into a hoisted temp (CSE>=1).
+    # The result must still be correct vs the oracle (100/7 + 100/7 == 28). This
+    # demonstrates the IR optimizer passes FIRE on the newly-lowered constructs.
+    cse_div = (PRELUDE + "\n"
+               "def f(a: uint64, b: uint64) -> uint64:\n"
+               "    return (a / b) + (a / b)\n"
+               "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+               "    g_accum = f(cast[uint64](100), cast[uint64](7))\n"
+               "    print_u64(g_accum)\n"
+               "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n")
+    r = host.run_through_codegen_ad("iremit_cse_div", cse_div, _AD_WORK, opt=True)
+    if r.kind != "ok":
+        all_ok = False
+        print(f"  [IREMIT corpus FAIL] CSE-div program: codegen.ad {r.kind}")
+    else:
+        if r.stdout != "28" or r.exit != 28:
+            all_ok = False
+            print(f"  [IREMIT corpus FAIL] CSE-div MISCOMPILE out=({r.stdout},{r.exit}) oracle=(28,28)")
+        elif int(getattr(r, "cse", 0) or 0) < 1:
+            all_ok = False
+            print(f"  [IREMIT corpus FAIL] CSE did NOT fire on the broadened (divide) IR (cse={getattr(r,'cse',0)})")
+        elif int(getattr(r, "iremit", 0) or 0) < 1:
+            all_ok = False
+            print("  [IREMIT corpus FAIL] CSE-div: IR emitter never fired")
+        else:
+            print(f"  CSE eliminated a redundant DIVIDE on the broadened IR "
+                  f"(CSE={getattr(r,'cse',0)}, IREMIT={getattr(r,'iremit',0)}): result 28 correct")
     return (all_ok, total_iremit, total_reassoc)
 
 
