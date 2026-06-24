@@ -2229,6 +2229,7 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
 # Linux <linux/sched.h> values — kept local so the kernel surface
 # doesn't depend on the linux_abi headers just for a constant.
 CLONE_VM:                uint64 = 0x100
+CLONE_VFORK:             uint64 = 0x4000
 CLONE_FS:                uint64 = 0x200
 CLONE_FILES:             uint64 = 0x400
 CLONE_SIGHAND:           uint64 = 0x800
@@ -2281,7 +2282,21 @@ def seccomp_inherit_to_child(child_slot: uint64, parent_slot: uint64):
 def do_clone(flags: uint64, child_stack: uint64,
              ptid: uint64, ctid: uint64, tls: uint64,
              user_r9: uint64,
-             user_rdx: uint64, user_r8: uint64) -> int64:
+             user_rdx: uint64, user_r8: uint64,
+             user_rdi: uint64) -> int64:
+    # user_rdi: the parent's %rdi at the clone(2)/vfork(2) syscall entry.
+    # Only load-bearing on the CLONE_VFORK fork path: glibc's hand-written
+    # __vfork (sysdeps/unix/sysv/linux/x86_64/vfork.S) pops its return
+    # address OFF the shared stack INTO %rdi before the syscall, and pushes
+    # it back AFTER (`popq %rdi; syscall; pushq %rdi; ret`). The vfork
+    # contract shares the stack between parent and child (CLONE_VM), so the
+    # return address is parked in a register, not stack memory, to survive
+    # both control flows. A Hamnix vfork child gets a COW *copy* of the
+    # stack and resumes at the post-syscall `pushq %rdi` — so it MUST come
+    # back with the parent's %rdi, or it pushes a zero and `ret`s to NULL
+    # (the historic `[pf] NX exec-fault va=0` that killed every dpkg/apt
+    # fork-helper). SYS_SPAWN / clone(2)-with-stack / fork(2) pass 0 — they
+    # don't ride the vfork register-return trick.
     # Branches on CLONE_VM | CLONE_THREAD:
     #
     #   * Thread path  (CLONE_VM | CLONE_THREAD set): the caller is
@@ -2455,10 +2470,20 @@ def do_clone(flags: uint64, child_stack: uint64,
     # (empty) PML4 -> wild jump. The COW helpers' own boot-CR3 IRQ
     # save/restore nests safely under this mask (they save IF=0, restore
     # it, leaving IRQs masked).
+    # vfork resume-%rdi: on the CLONE_VFORK path the child must come back
+    # from the syscall with the parent's %rdi (glibc __vfork's saved return
+    # address — see the user_rdi contract at the top of do_clone). We plant
+    # it via the argc slot of create_user_task_argv, which _build_initial_-
+    # kstack writes into the child's iret-frame %rdi position. A plain
+    # fork(2) / clone(2)-with-stack child returns into glibc's fork epilogue
+    # (not _start) and never reads %rdi as argc, so 0 is correct there.
+    _child_rdi: uint64 = 0
+    if (flags & CLONE_VFORK) != 0:
+        _child_rdi = user_rdi
     _fork_irq: uint64 = local_irq_save()
     slot: int32 = create_user_task_argv(parent_user_rip,
                                         0x5f5f666f726b5f5f,        # "__fork__"
-                                        parent_user_rsp, 0, 0)
+                                        parent_user_rsp, _child_rdi, 0)
     if slot < 0:
         local_irq_restore(_fork_irq)
         set_current_errstr("fork: out of tasks")
@@ -2649,26 +2674,37 @@ def do_clone(flags: uint64, child_stack: uint64,
     fork_seed_callee_saved(slot, p_rbx, p_rbp, p_r12, p_r13, p_r14, p_r15)
 
     child_pid: uint64 = task_pid_at(slot)
-    # U38: parent returns immediately; parent + child run concurrently.
-    # Earlier U26..U37 code blocked here on task_vfork_done to approximate
-    # POSIX vfork — that worked for the simple system() / posix_spawn()
-    # pattern (fork → immediate exec) but breaks pipelines. A shell
-    # building `echo a | grep a` needs the read end of the pipe to have
-    # a live reader BEFORE the writer fills it; with vfork-style blocking,
-    # the parent shell can't fork the second stage until the first has
-    # exec'd, so the pipeline never gets both ends wired up concurrently
-    # and the first stage either deadlocks (pipe write to a not-yet-read
-    # reader) or its post-fork bookkeeping aborts (glibc fork-epilogue
-    # stack canary checks fail when the child wakes on a different RSP).
-    # With concurrent execution, both tasks are STATE_READY and the
-    # scheduler picks the next one on every timer tick / yield. The
-    # child now has a fully PRIVATE address space (image + heap +
-    # stack + VMAs were eager-copied above into its own physical
-    # pages, each remapped at the same virtual address in the child's
-    # PML4) — parent and child no longer share any writable memory, so
-    # both can run glibc fork-epilogue / atexit / _IO_cleanup
-    # concurrently without trampling each other. wait4 still uses the
-    # vfork_done / STATE_EXITED transition for waitpid bookkeeping.
+    # PLAIN fork(2): parent returns immediately; parent + child run
+    # concurrently. Earlier U26..U37 code blocked EVERY fork here on
+    # task_vfork_done to approximate POSIX vfork — that worked for the
+    # simple system() / posix_spawn() (fork → immediate exec) pattern but
+    # broke pipelines: a shell building `echo a | grep a` needs the read
+    # end of the pipe to have a live reader BEFORE the writer fills it, and
+    # blocking the parent until the first stage exec'd meant the second
+    # stage never got forked, so the pipeline deadlocked. So for a plain
+    # fork (NO CLONE_VFORK) we DON'T block — the child has a fully PRIVATE
+    # COW address space, so both can run glibc fork-epilogue / atexit /
+    # _IO_cleanup concurrently without trampling each other.
+    #
+    # TRUE vfork(2) (CLONE_VFORK): the Linux contract REQUIRES the parent
+    # to be SUSPENDED until the child execve's or _exit's. dash's simple-
+    # command exec (`dash -c "cat x"`) rides this: its vforkexec parent
+    # path assumes, on resume, that the child has ALREADY exec'd (it shares
+    # bookkeeping state across the vfork). With the parent running
+    # concurrently it raced the child's exec and aborted with exit 255
+    # (then orphaned the half-loaded child). Pipelines DON'T use vfork —
+    # they use plain fork — so gating the block on CLONE_VFORK restores the
+    # synchronous vfork semantics WITHOUT reintroducing the pipeline
+    # deadlock. The child sets vfork_done=1 in do_execve (just before its
+    # SYSRETQ into the new image) and in task_exit_current (the exec-less
+    # _exit path), so this loop wakes on either transition. We yield rather
+    # than spin so the child actually gets CPU to reach its execve/_exit.
+    if (flags & CLONE_VFORK) != 0:
+        do:
+            if task_vfork_done(slot) != 0:
+                return cast[int64](child_pid)
+            yield_to_others()
+        while 1
     return cast[int64](child_pid)
 
 
