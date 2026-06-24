@@ -3959,6 +3959,14 @@ def build_archive() -> bytes:
                 "etc/nsswitch.conf",
                 "usr/lib/x86_64-linux-gnu/libnss_files.so.2",
                 "usr/lib/x86_64-linux-gnu/libnss_compat.so.2",
+                # glibc resolves the NSS service module (libnss_files.so.2) at
+                # RUNTIME via dlopen of a bare soname, which consults the
+                # ld.so cache to locate it. Without the cache the dlopen can
+                # miss and getpwnam("root") returns NULL even with the lib
+                # staged. Stage the debootstrap-generated cache + ld.so.conf
+                # so the runtime NSS dlopen finds the module.
+                "etc/ld.so.cache",
+                "etc/ld.so.conf",
                 "etc/hostname",
                 "etc/apt/sources.list",
                 "etc/apt/apt.conf",
