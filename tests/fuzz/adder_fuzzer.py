@@ -1898,6 +1898,196 @@ def _run_regpressure_corpus():
 
 
 # --------------------------------------------------------------------------
+# Phase-4 METHOD register-pressure corpus. Class METHOD bodies (def m(self,...))
+# were previously kept entirely on the all-memory path (gen_method forced
+# cg_ra_active=0); only top-level functions were register-promoted. This corpus
+# proves the increment that wires gen_method through the SAME linear-scan
+# allocator: a class method with MORE simultaneously-live scalar locals than the
+# 5-register pool, where the surrounding free functions (main, _putc, helpers)
+# have NO register pressure. So:
+#   * correctness UNDER METHOD SPILLING is asserted vs a computed oracle, AND
+#   * a callee-saved push/move anywhere in the image can ONLY come from the
+#     METHOD body (the free functions never exhaust the pool) — a tight machine-
+#     code proof that promotion now reaches methods, while OFF stays byte-inert.
+# All arithmetic is over the signedness-invariant 64-bit op set.
+# --------------------------------------------------------------------------
+def _method_regpressure_corpus():
+    """Return a list of (name, body, expected_stdout, expected_exit). Each body
+    is self-contained (its own minimal PRELUDE-free I/O) so the ONLY function
+    that can hit register pressure is the method under test."""
+    M = (1 << 64) - 1
+    progs = []
+
+    # Minimal I/O helpers with at most a couple of locals — far under the 5-reg
+    # pool, so they NEVER push a callee-saved register. Any callee push in the
+    # emitted image therefore proves the METHOD body promoted.
+    IO = (
+        "extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64\n"
+        "_ch: Array[1, uint8]\n"
+        "def _putc(c: uint8) -> int32:\n"
+        "    _ch[0] = c\n"
+        "    sys_write(cast[int32](1), &_ch[0], cast[uint64](1))\n"
+        "    return 0\n"
+        "def emit3(v: uint64) -> int32:\n"
+        "    _putc(cast[uint8](v / cast[uint64](100) + cast[uint64](48)))\n"
+        "    _putc(cast[uint8]((v / cast[uint64](10)) - (v / cast[uint64](100)) * cast[uint64](10) + cast[uint64](48)))\n"
+        "    _putc(cast[uint8](v - (v / cast[uint64](10)) * cast[uint64](10) + cast[uint64](48)))\n"
+        "    _putc(cast[uint8](10))\n"
+        "    return 0\n"
+    )
+
+    # 1) Eight live locals inside ONE method, all summed at the end (8 > pool of
+    #    5 => the allocator must register-allocate AND spill inside the method).
+    #    x is the method param (also a promotable named scalar).
+    decls = "".join(
+        f"        m{i}: uint64 = x + cast[uint64]({i + 1})\n" for i in range(8))
+    summ = " + ".join(f"m{i}" for i in range(8))
+    x0 = 4
+    total = sum((x0 + (i + 1)) for i in range(8)) & M
+    body1 = (
+        IO
+        + "class Crunch:\n"
+        + "    tag: uint64\n"
+        + "    def __init__(self):\n"
+        + "        self.tag = cast[uint64](0)\n"
+        + "    def crunch(self, x: uint64) -> uint64:\n"
+        + decls
+        + f"        s: uint64 = {summ}\n"
+        + "        return s\n"
+        + "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+        + "    o: Crunch = Crunch()\n"
+        + f"    r: uint64 = o.crunch(cast[uint64]({x0}))\n"
+        + "    emit3(r)\n"
+        + "    return cast[int32](r & cast[uint64](255))\n"
+    )
+    progs.append(("method_eight_live", body1,
+                  f"{total % 1000:03d}", total & 0xFF))
+
+    # 2) METHOD loop-carried spill: six accumulators updated each iteration, all
+    #    live across the back-edge (6 > pool of 5 => at least one spilled
+    #    accumulator that must round-trip correctly every iteration), entirely
+    #    inside the method body.
+    n_iter = 4
+    s = [i + 1 for i in range(6)]
+    for _ in range(n_iter):
+        s = [(s[i] + (i + 1)) & M for i in range(6)]
+    loopsum = sum(s) & M
+    init = "".join(
+        f"        s{i}: uint64 = cast[uint64]({i + 1})\n" for i in range(6))
+    upd = "".join(
+        f"            s{i} = s{i} + cast[uint64]({i + 1})\n" for i in range(6))
+    fin = " + ".join(f"s{i}" for i in range(6))
+    body2 = (
+        IO
+        + "class Loopy:\n"
+        + "    tag: uint64\n"
+        + "    def __init__(self):\n"
+        + "        self.tag = cast[uint64](0)\n"
+        + "    def run(self, n: int64) -> uint64:\n"
+        + init
+        + "        lk: int64 = 0\n"
+        + "        while lk < n:\n"
+        + upd
+        + "            lk = lk + 1\n"
+        + f"        return {fin}\n"
+        + "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+        + "    o: Loopy = Loopy()\n"
+        + f"    r: uint64 = o.run(cast[int64]({n_iter}))\n"
+        + "    emit3(r)\n"
+        + "    return cast[int32](r & cast[uint64](255))\n"
+    )
+    progs.append(("method_loop_spill", body2,
+                  f"{loopsum % 1000:03d}", loopsum & 0xFF))
+
+    return progs
+
+
+def _run_method_regpressure_corpus():
+    """Run the method register-pressure corpus through codegen.ad with --opt and
+    assert (a) the method-spilled output is CORRECT vs the oracle, (b) the emitted
+    image uses a callee-saved register (which, since only the METHOD has pressure,
+    proves gen_method now register-promotes), (c) the OFF image is byte-inert (no
+    callee push) and differs from ON, and (d) the --dump-regalloc lane attributes
+    the in-register/spilled values to the extra (method) functions it now walks.
+    Returns (all_ok, total_inreg, total_spilled, method_regmove_progs)."""
+    host = _ad_host()
+    all_ok = True
+    total_inreg = 0
+    total_spilled = 0
+    method_regmove_progs = 0
+
+    _CALLEE_PUSH = (bytes([0x53]), bytes([0x41, 0x54]), bytes([0x41, 0x55]),
+                    bytes([0x41, 0x56]), bytes([0x41, 0x57]))
+
+    def _contains_any(blob, pats):
+        return any(p in blob for p in pats)
+
+    for (name, body, exp_out, exp_exit) in _method_regpressure_corpus():
+        r = host.run_through_codegen_ad(f"mrp_{name}", body, _AD_WORK, opt=True)
+        if r.kind != "ok":
+            all_ok = False
+            print(f"  [METHOD-REGPRESSURE '{name}'] codegen.ad {r.kind}: "
+                  f"{r.detail[:140]}")
+            continue
+        if r.stdout != exp_out or r.exit != exp_exit:
+            all_ok = False
+            print(f"  [METHOD-REGPRESSURE '{name}'] MISCOMPILE opt=("
+                  f"{r.stdout!r},{r.exit}) oracle=({exp_out!r},{exp_exit})")
+            continue
+        ra = host.run_regalloc_over_body(f"mrp_{name}", body, _AD_WORK)
+        if ra.status != "raok":
+            all_ok = False
+            print(f"  [METHOD-REGPRESSURE '{name}'] regalloc lane {ra.status}: "
+                  f"{ra.detail[:120]}")
+            continue
+        total_inreg += ra.inreg
+        total_spilled += ra.spilled
+
+        # MACHINE-CODE proof scoped to the METHOD: only the method exceeds the
+        # 5-reg pool (the free helpers have <=2 locals), so a callee-saved push
+        # in the ON image necessarily comes from gen_method's promotion. OFF must
+        # be byte-inert.
+        src = _AD_WORK / f"mrpmc_{name}.ad"
+        src.write_text(body)
+        d_on = host.run_dump(src, opt=True)
+        d_off = host.run_dump(src, opt=False)
+        if d_on.status != "ok" or d_off.status != "ok":
+            all_ok = False
+            print(f"  [METHOD-REGPRESSURE '{name}'] dump status on={d_on.status} "
+                  f"off={d_off.status}")
+            continue
+        on_push = _contains_any(d_on.code, _CALLEE_PUSH)
+        off_push = _contains_any(d_off.code, _CALLEE_PUSH)
+        if not on_push:
+            all_ok = False
+            print(f"  [METHOD-REGPRESSURE '{name}'] method body shows NO callee-"
+                  f"saved register move under --opt (gen_method not promoting)")
+            continue
+        if off_push:
+            all_ok = False
+            print(f"  [METHOD-REGPRESSURE '{name}'] OFF path NOT byte-inert: a "
+                  f"callee-saved push with the flag off")
+            continue
+        if d_on.code == d_off.code:
+            all_ok = False
+            print(f"  [METHOD-REGPRESSURE '{name}'] --opt did not change the code")
+            continue
+        method_regmove_progs += 1
+
+    if total_inreg == 0:
+        all_ok = False
+        print("  [METHOD-REGPRESSURE FAIL] no method value placed in a register")
+    if total_spilled == 0:
+        all_ok = False
+        print("  [METHOD-REGPRESSURE FAIL] no method register pressure (no spill)")
+    if method_regmove_progs == 0:
+        all_ok = False
+        print("  [METHOD-REGPRESSURE FAIL] no method emitted a callee-saved "
+              "register move under --opt")
+    return (all_ok, total_inreg, total_spilled, method_regmove_progs)
+
+
+# --------------------------------------------------------------------------
 # Differential batch driver for the self-hosted codegen.ad backend.
 # --------------------------------------------------------------------------
 def _run_ad_codegen_batch(base, args):
@@ -2014,6 +2204,19 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] register-pressure corpus miscompiled or "
                   "allocator inert")
+        # Phase-4 METHOD register-pressure corpus: class methods with more live
+        # locals than the 5-reg pool, surrounded by pressure-free free functions.
+        # Asserts gen_method now register-promotes (correct under method spilling,
+        # a callee-saved move in the emitted method body, OFF byte-inert).
+        mrp_ok, mrp_inreg, mrp_spill, mrp_regmove = _run_method_regpressure_corpus()
+        print(f"--- ADDER_OPT=1 METHOD register-pressure corpus (gen_method) ---")
+        print(f"  method values in registers: {mrp_inreg}")
+        print(f"  method values spilled:      {mrp_spill}")
+        print(f"  programs w/ method reg-move: {mrp_regmove}  (machine-code proof)")
+        if not mrp_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] method register-pressure corpus miscompiled "
+                  "or gen_method allocator inert")
     cfg_lane_fail = False
     if ADDER_CFG:
         print(f"--- ADDER_CFG=1 CFG/liveness GROUNDWORK lane (analysis-only) ---")
