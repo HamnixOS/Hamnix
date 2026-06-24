@@ -159,8 +159,10 @@ set +e
 
     # Sanity 2: writable overlay is live — create + read back a file
     # under a normally-read-only dir, using the installed dash directly.
+    # Read back with dash's `read` builtin (no fork+exec of cat) so the
+    # probe proves the overlay write WITHOUT depending on a sub-process.
     printf 'echo HAMHELLO_OVERLAY_START\n'; sleep 1
-    printf 'enter linux { /usr/bin/dash -c "echo OVL_OK > /usr/ovl_probe && cat /usr/ovl_probe" }\n'; sleep 6
+    printf 'enter linux { /usr/bin/dash -c "echo OVL_OK > /usr/ovl_probe; read L < /usr/ovl_probe; echo OVL_READBACK=$L" }\n'; sleep 6
     printf 'echo HAMHELLO_OVERLAY_END\n'; sleep 1
 
     # dpkg -i the pre-staged archive.
