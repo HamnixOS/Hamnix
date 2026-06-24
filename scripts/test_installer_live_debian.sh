@@ -103,7 +103,14 @@ if [ "${HAMNIX_SKIP_BUILD:-0}" = "1" ]; then
     fi
 else
     echo "$TAG rebuilding installer image via build_installer_img.sh (~6 min; HAMNIX_SKIP_BUILD=1 to reuse)"
-    bash "$PROJ_ROOT/scripts/build_installer_img.sh"
+    # This test exercises REAL Debian apt/dpkg inside the LIVE linux ns, so
+    # it opts INTO the full real-Debian closure for the live distro
+    # (HAMNIX_LIVE_MINIMAL=0). The DEFAULT installer image keeps the live
+    # distro MINIMAL (busybox-only) so it boots a full desktop under the
+    # `-m 1G` ship floor; that minimal default would otherwise drop this
+    # test to the busybox-printf sub-gate and lose apt/dpkg coverage.
+    # We boot at QEMU_MEM=2G (default) so the ~360 MiB live RAM image fits.
+    HAMNIX_LIVE_MINIMAL=0 bash "$PROJ_ROOT/scripts/build_installer_img.sh"
 fi
 if [ ! -f "$INSTALLER_IMG" ]; then
     echo "$TAG SKIP: $INSTALLER_IMG unavailable (build gated)." >&2

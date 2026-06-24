@@ -392,11 +392,27 @@ def _stage_busybox(staging: Path) -> bool:
         "true", "false", "env", "printf", "date",
         "sleep", "basename", "dirname",
     ]
+    # Plant each applet as a HARD link to the busybox binary, NOT a
+    # symlink. The kernel's distrofs/ext4 exec path does not traverse
+    # file-component symlinks (same reason the real-Debian closure
+    # dereferences /bin/sh -> dash to dash's bytes), so a symlinked
+    # /bin/printf would resolve to a 7-byte "busybox" string the kernel
+    # won't follow and `enter linux { /bin/printf ... }` would silently
+    # exec nothing. A hard link shares busybox's inode (zero extra data
+    # blocks) and is a real executable entry the kernel execs directly;
+    # busybox still multiplexes on argv[0] (the applet name). mkfs.ext4
+    # -d preserves hard links across the staging dir.
     for applet in bb_applets:
         link = bb_dir / applet
         if link.exists() or link.is_symlink():
             link.unlink()
-        link.symlink_to("busybox")
+        try:
+            os.link(bb_target, link)
+        except OSError:
+            # Fallback (e.g. cross-device staging): a real byte copy is
+            # still a directly-execable entry, unlike a symlink.
+            shutil.copy2(bb_target, link)
+            link.chmod(0o755)
     # Debian-shape skeleton dirs. When the curated REAL_DEBIAN closure is
     # present these get populated for real; when it is absent (host
     # without tests/distros/debian-minbase/rootfs/) they still give the
@@ -564,10 +580,25 @@ def _plant_distro_provenance(distro: Path) -> None:
         encoding="ascii")
 
 
-def _stage_distro(distro: Path) -> None:
+def _stage_distro(distro: Path, live: bool = False) -> None:
     """Stage the distro/ subtree: a genuine Debian root + busybox fallback.
 
+    LIVE-MINIMAL (size budget). The live in-RAM distro is extracted into a
+    CONTIGUOUS RAM block device at boot, so every staged MiB is boot RAM.
+    Under the user's `-m 1G` boot only ~316 MiB is free, but the FULL
+    debootstrap mirror is ~360 MiB — the contiguous live-root alloc fails
+    (`memblock_alloc(...) failed`), the rootfs half-loads, and DE app spawns
+    hit `elf: OOM`. So when `live` is true we DEFAULT to staging ONLY the
+    busybox minimal namespace (HAMNIX_LIVE_MINIMAL!=0): `enter linux` still
+    runs basic Debian-shape binaries (/bin/sh, cat, ls, ...) but the heavy
+    apt/dpkg/libapt-pkg closure and the full Debian tree are EXCLUDED from
+    the RAM image. The heavy closure belongs on the persistent INSTALLED
+    disk (not RAM-constrained) or in a dedicated apt-test image built with
+    HAMNIX_LIVE_MINIMAL=0. Set HAMNIX_LIVE_MINIMAL=0 to opt back into the
+    full real-Debian closure for the live distro (apt-install e2e image).
+
     Content selection (most-faithful first):
+      * live build with HAMNIX_LIVE_MINIMAL!=0 (default) -> busybox only.
       * HAMNIX_DEFAULT_REAL_DEBIAN in {0,off,no,""} -> busybox only.
       * else, when the debootstrap tree (tests/distros/debian-minbase/
         rootfs) is present:
@@ -588,7 +619,16 @@ def _stage_distro(distro: Path) -> None:
     real_debian_raw = os.environ.get("HAMNIX_DEFAULT_REAL_DEBIAN", "1")
     full_raw = os.environ.get("HAMNIX_DEBIAN_FULL", "1")
     want_full = full_raw not in ("0", "", "off", "no")
-    if real_debian_raw in ("0", "", "off", "no"):
+    live_minimal_raw = os.environ.get("HAMNIX_LIVE_MINIMAL", "1")
+    live_minimal = live and live_minimal_raw not in ("0", "", "off", "no")
+    if live_minimal:
+        print(f"[build_rootfs_img] LIVE-MINIMAL "
+              f"(HAMNIX_LIVE_MINIMAL={live_minimal_raw}): live distro = "
+              f"busybox namespace only; heavy real-Debian apt/dpkg closure "
+              f"EXCLUDED from the RAM image (set HAMNIX_LIVE_MINIMAL=0 for "
+              f"the full closure, e.g. the apt-install e2e image).",
+              flush=True)
+    elif real_debian_raw in ("0", "", "off", "no"):
         print(f"[build_rootfs_img] HAMNIX_DEFAULT_REAL_DEBIAN={real_debian_raw}: "
               f"skipping real Debian closure", flush=True)
     elif not minbase.is_dir():
@@ -661,7 +701,7 @@ def _stage_directory_live(staging: Path):
     """
     distro = staging / "distro"
     distro.mkdir(parents=True, exist_ok=True)
-    _stage_distro(distro)
+    _stage_distro(distro, live=True)
     sentinel = staging / ".hamnix-roots"
     sentinel.write_text("distro    distro\n", encoding="ascii")
     print("[build_rootfs_img] planted LIVE .hamnix-roots sentinel "
