@@ -3878,6 +3878,16 @@ def build_archive() -> bytes:
                 # whole cpio into the 256 MB guest, so the heavy bash is
                 # kept off the RAM-constrained in-cpio path.
                 "usr/bin/dash",
+                # /bin/sh — the POSIX shell name dpkg's maintainer-script and
+                # helper-program resolution searches for ("'sh' not found in
+                # PATH or not executable" otherwise). In the rootfs this is a
+                # symlink bin/sh -> dash; read_bytes() follows it, so staging
+                # the name plants dash's bytes (mode 0755) at /bin/sh — a real
+                # executable entry dpkg's PATH stat finds. (usr/bin/dash + the
+                # usrmerge alias already give /usr/bin/dash and /bin/dash; this
+                # adds the `sh` spelling dpkg looks for first.)
+                "bin/sh",
+                "usr/bin/sh",
                 # Package managers proper.
                 "usr/bin/apt",
                 "usr/bin/apt-get",
@@ -3935,6 +3945,20 @@ def build_archive() -> bytes:
                 "etc/os-release",
                 "etc/passwd",
                 "etc/group",
+                # BLOCKER 3 (NSS getpwnam): dpkg resolves system users
+                # (getpwnam("root")) through glibc NSS while reading its
+                # statoverride DB. Without /etc/nsswitch.conf glibc falls back
+                # to a compiled-in default whose service modules may not load
+                # in the curated namespace, and dpkg aborts:
+                #   "unknown system user 'root' in statoverride file".
+                # Stage the conf (its "passwd: files" line points NSS straight
+                # at /etc/passwd) plus the libnss_files / libnss_compat service
+                # modules (the libdir glob below also catches them; pinning
+                # makes the closure self-documenting). getpwnam("root") then
+                # reads /etc/passwd directly and resolves.
+                "etc/nsswitch.conf",
+                "usr/lib/x86_64-linux-gnu/libnss_files.so.2",
+                "usr/lib/x86_64-linux-gnu/libnss_compat.so.2",
                 "etc/hostname",
                 "etc/apt/sources.list",
                 "etc/apt/apt.conf",
