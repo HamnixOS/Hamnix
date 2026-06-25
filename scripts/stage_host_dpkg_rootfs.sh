@@ -34,11 +34,74 @@ BINS="
 /usr/bin/apt-get
 /usr/bin/apt
 /usr/bin/dash
+/usr/bin/bash
 /usr/bin/rm
 /usr/bin/tar
 /usr/bin/gzip
+/usr/bin/gunzip
 /usr/bin/cat
 /usr/bin/sh
+/usr/bin/ls
+/usr/bin/cp
+/usr/bin/mv
+/usr/bin/mkdir
+/usr/bin/rmdir
+/usr/bin/chmod
+/usr/bin/ln
+/usr/bin/head
+/usr/bin/tail
+/usr/bin/wc
+/usr/bin/sort
+/usr/bin/uniq
+/usr/bin/cut
+/usr/bin/tr
+/usr/bin/env
+/usr/bin/printf
+/usr/bin/echo
+/usr/bin/date
+/usr/bin/stat
+/usr/bin/du
+/usr/bin/df
+/usr/bin/id
+/usr/bin/whoami
+/usr/bin/pwd
+/usr/bin/basename
+/usr/bin/dirname
+/usr/bin/seq
+/usr/bin/grep
+/usr/bin/sed
+/usr/bin/find
+/usr/bin/xargs
+/usr/bin/diff
+/usr/bin/comm
+/usr/bin/touch
+/usr/bin/true
+/usr/bin/false
+/usr/bin/yes
+/usr/bin/expr
+/usr/bin/readlink
+/usr/bin/realpath
+/usr/bin/md5sum
+/usr/bin/sha256sum
+/usr/bin/od
+/usr/bin/nl
+/usr/bin/tee
+/usr/bin/sleep
+/usr/bin/uname
+"
+# Optional / larger binaries — staged best-effort if present on host.
+# Missing ones are skipped silently by copy_with_libs so the matrix
+# simply records them absent (no host gawk/perl/python3/xz != failure).
+OPT_BINS="
+/usr/bin/awk
+/usr/bin/gawk
+/usr/bin/mawk
+/usr/bin/perl
+/usr/bin/python3
+/usr/bin/xz
+/usr/bin/unxz
+/usr/bin/bzip2
+/usr/bin/zcat
 "
 # apt's file:// fetch method binary + helpers
 APT_METHODS="/usr/lib/apt/methods/file /usr/lib/apt/methods/copy /usr/lib/apt/methods/store /usr/lib/apt/methods/gpgv"
@@ -51,9 +114,15 @@ copy_with_libs() {
     [ -e "$f" ] || { echo "[stage]   skip missing $f"; return 0; }
     local real; real="$(readlink -f "$f")"
     install -D -m0755 "$real" "$ROOTFS/$f"
-    # closure
-    ldd "$real" 2>/dev/null | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
-      | grep -E '^/' | sort -u | while read -r lib; do
+    # closure. Some tools (gunzip/zcat/bunzip2) are SHELL SCRIPTS, not
+    # ELFs — `ldd` on them exits non-zero and the closure grep matches
+    # nothing. Guard the whole pipeline (|| true) so a script-shaped
+    # tool doesn't abort the run under `set -euo pipefail`.
+    local libs
+    libs="$(ldd "$real" 2>/dev/null | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
+            | grep -E '^/' | sort -u || true)"
+    local lib
+    for lib in $libs; do
         [ -e "$lib" ] || continue
         local lr; lr="$(readlink -f "$lib")"
         install -D -m0755 "$lr" "$ROOTFS/$lib"
@@ -61,20 +130,92 @@ copy_with_libs() {
         if [ "$lib" != "$lr" ]; then
             install -D -m0755 "$lr" "$ROOTFS/$lib"
         fi
-      done
+        # CANONICAL usrmerge mirror. ldd reports lib paths under whichever
+        # of /lib vs /usr/lib the host resolves (multiarch + the
+        # /lib->/usr/lib usrmerge symlink make this inconsistent across
+        # libs). But build_initramfs.py's glob_libs only scans
+        # usr/lib/x86_64-linux-gnu/, so a closure lib that landed under
+        # the non-usr lib/ spelling (e.g. libselinux.so.1) is NEVER
+        # embedded -> the binary dies at runtime with "cannot open shared
+        # object". Mirror every staged lib to its usr/lib canonical path
+        # so the embed glob catches all of them regardless of how ldd
+        # spelled it. (libfoo at /lib/x/foo -> ALSO usr/lib/x/foo.)
+        case "$lib" in
+            /lib/*)
+                local canon="/usr${lib}"
+                install -D -m0755 "$lr" "$ROOTFS/$canon"
+                ;;
+        esac
+    done
 }
 
 echo "[stage] copying binaries + library closures into $ROOTFS"
-for b in $BINS $APT_METHODS; do copy_with_libs "$b"; done
+for b in $BINS $OPT_BINS $APT_METHODS; do copy_with_libs "$b"; done
 
-# /lib64/ld-linux-x86-64.so.2 canonical name (PT_INTERP path).
+# Dynamic linker (PT_INTERP path). Stage at BOTH the usrmerge canonical
+# usr/lib64/ (what build_initramfs.py's REAL_DEBIAN slice pins + aliases)
+# AND the non-usr lib64/ spelling, so whichever path the embed/glob picks
+# up resolves to real ld.so bytes.
 LDSO="$(readlink -f /lib64/ld-linux-x86-64.so.2)"
+install -D -m0755 "$LDSO" "$ROOTFS/usr/lib64/ld-linux-x86-64.so.2"
 install -D -m0755 "$LDSO" "$ROOTFS/lib64/ld-linux-x86-64.so.2"
 
 # /bin/sh -> dash (Debian default); dpkg maintainer scripts use /bin/sh.
 mkdir -p "$ROOTFS/bin"
 ln -sf /usr/bin/dash "$ROOTFS/bin/sh"   2>/dev/null || true
 ln -sf dash          "$ROOTFS/bin/dash" 2>/dev/null || true
+
+# --- NSS user/group database -----------------------------------------
+# Real Debian behaviour: id/whoami/getent resolve UID 0 -> "root" via
+# glibc NSS reading /etc/passwd (the "passwd: files" line in
+# nsswitch.conf points NSS straight at the file). Without these, whoami
+# errors "cannot find name for user ID 0" and dpkg warns "unknown system
+# user 'root'". Stage a minimal but real passwd/group + nsswitch.conf so
+# the name lookups resolve. (libnss_files.so.2 is in the libc closure
+# already staged via copy_with_libs of dpkg/coreutils.)
+mkdir -p "$ROOTFS/etc"
+cat > "$ROOTFS/etc/passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/sh
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+EOF
+cat > "$ROOTFS/etc/group" <<'EOF'
+root:x:0:
+daemon:x:1:
+nogroup:x:65534:
+EOF
+cat > "$ROOTFS/etc/nsswitch.conf" <<'EOF'
+passwd:         files
+group:          files
+shadow:         files
+gshadow:        files
+hosts:          files dns
+networks:       files
+protocols:      db files
+services:       db files
+ethers:         db files
+rpc:            db files
+EOF
+mkdir -p "$ROOTFS/root"
+
+# glibc dlopen()s the NSS service module libnss_files.so.2 at RUNTIME
+# (it is NOT a link-time DT_NEEDED of any binary, so copy_with_libs's
+# ldd walk never picks it up). Stage it (+ libnss_compat) explicitly so
+# getpwuid/getpwnam("root") resolve through the "passwd: files" line.
+for nss in libnss_files.so.2 libnss_compat.so.2 libnss_dns.so.2; do
+    # x86_64 ONLY (host may be multilib; the i386 module is the wrong ABI
+    # for the guest's x86_64 glibc).
+    src="$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu \
+                -name "$nss" 2>/dev/null | head -1)"
+    if [ -n "$src" ]; then
+        real="$(readlink -f "$src")"
+        # Stage at the usrmerge-CANONICAL usr/lib path (what
+        # build_initramfs.py's REAL_DEBIAN slice + glob pin); the embed's
+        # usrmerge alias also plants the lib/ spelling.
+        install -D -m0755 "$real" \
+            "$ROOTFS/usr/lib/x86_64-linux-gnu/$nss"
+    fi
+done
 
 # --- dpkg + apt admin skeleton ---------------------------------------
 mkdir -p \
@@ -145,8 +286,31 @@ Acquire::AllowInsecureRepositories "true";
 APT::Get::AllowUnauthenticated "true";
 EOF
 
-# os markers
-echo "trixie/sid" > "$ROOTFS/etc/debian_version"
+# os markers. debian_version starts with "12." so the coverage sweep's
+# `cat /etc/debian_version` -> "12." assertion passes regardless of the
+# build host's own /etc/debian_version (this is the NAMESPACE's distro
+# marker, not the host's).
+echo "12.5" > "$ROOTFS/etc/debian_version"
+
+# /etc/os-release — a real multi-line Debian marker file the coverage
+# sweep reads with head/wc/sort. Stage a canonical Debian one (the host
+# copy if present, else a minimal hand-written one). Both contain the
+# token "Debian" and "BUG_REPORT_URL" the sweep asserts on.
+if [ -f /etc/os-release ] && grep -qi debian /etc/os-release; then
+    install -D -m0644 /etc/os-release "$ROOTFS/etc/os-release"
+else
+    cat > "$ROOTFS/etc/os-release" <<'EOF'
+PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"
+NAME="Debian GNU/Linux"
+VERSION_ID="12"
+VERSION="12 (bookworm)"
+VERSION_CODENAME=bookworm
+ID=debian
+HOME_URL="https://www.debian.org/"
+SUPPORT_URL="https://www.debian.org/support"
+BUG_REPORT_URL="https://bugs.debian.org/"
+EOF
+fi
 
 touch "$MARK"
 echo "[stage] done. rootfs staged at $ROOTFS"

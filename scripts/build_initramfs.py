@@ -4045,6 +4045,27 @@ def build_archive() -> bytes:
                 # below). Proves the full Debian /bin/bash runs in the ns,
                 # not just dash. ~1.2 MB; acceptable for the curated slice.
                 "bin/bash",
+                # BROAD coreutils coverage matrix (scripts/
+                # test_linux_debian_coverage.sh / _kvm_coreutils_repro.sh
+                # run each STANDALONE via `enter linux { /usr/bin/<x> ... }`).
+                # These exercise the Linux-ABI fork+execve+ld.so+stack path
+                # across a wide set of real Debian ELFs — the regression
+                # surface for the user-stack-vs-kernel-stack aliasing fix
+                # (decoupled high-VA user stack). Staged at usr/bin/ so the
+                # /usr/bin/<x> spelling the matrix uses resolves; the
+                # reverse usrmerge alias below also plants /bin/<x>.
+                "usr/bin/uname",
+                "usr/bin/id",
+                "usr/bin/ls",
+                "usr/bin/stat",
+                "usr/bin/tail",
+                "usr/bin/head",
+                "usr/bin/cut",
+                "usr/bin/sed",
+                "usr/bin/nl",
+                "usr/bin/date",
+                "usr/bin/md5sum",
+                "usr/bin/readlink",
                 # The local file:// apt repo (scripts/build_local_apt_repo
                 # .sh stages this whole subtree). apt's `file` method reads
                 # it directly off the Debian root.
@@ -4119,6 +4140,33 @@ def build_archive() -> bytes:
                     if rel not in REAL_DEBIAN_FILES:
                         glob_libs.append(rel)
             REAL_DEBIAN_FILES = REAL_DEBIAN_FILES + glob_libs
+
+            # BROAD-COVERAGE augmentation. The hand-pinned list above is
+            # the apt/dpkg-install closure. For the Debian-binary BREADTH
+            # sweep (test_linux_debian_coverage.sh) we ALSO want every
+            # stock coreutils/text/archive binary that
+            # stage_host_dpkg_rootfs.sh staged into usr/bin (ls/cp/grep/
+            # sed/awk/find/...). Rather than hand-list each one (which
+            # drifts and invites per-binary special-casing), glob the
+            # staged usr/bin + usr/sbin trees and embed whatever real
+            # Debian ELFs are present. The staged rootfs is intentionally
+            # a MINIMAL-but-broad slice (~120 files), well under
+            # NR_FILES=8192. Each entry's own .so closure is already
+            # covered by glob_libs.
+            binglob: list[str] = []
+            for bindir in ("usr/bin", "usr/sbin"):
+                d = minbase_rootfs / bindir
+                if not d.is_dir():
+                    continue
+                for p in sorted(d.iterdir()):
+                    # Regular files only (skip the bin/sh-style symlinks
+                    # the dedicated entries above already plant).
+                    if p.is_symlink() or not p.is_file():
+                        continue
+                    rel = str(p.relative_to(minbase_rootfs))
+                    if rel not in REAL_DEBIAN_FILES:
+                        binglob.append(rel)
+            REAL_DEBIAN_FILES = REAL_DEBIAN_FILES + binglob
 
             staged_files = 0
             staged_bytes = 0
