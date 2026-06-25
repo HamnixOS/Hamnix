@@ -4120,6 +4120,33 @@ def build_archive() -> bytes:
                         glob_libs.append(rel)
             REAL_DEBIAN_FILES = REAL_DEBIAN_FILES + glob_libs
 
+            # BROAD-COVERAGE augmentation. The hand-pinned list above is
+            # the apt/dpkg-install closure. For the Debian-binary BREADTH
+            # sweep (test_linux_debian_coverage.sh) we ALSO want every
+            # stock coreutils/text/archive binary that
+            # stage_host_dpkg_rootfs.sh staged into usr/bin (ls/cp/grep/
+            # sed/awk/find/...). Rather than hand-list each one (which
+            # drifts and invites per-binary special-casing), glob the
+            # staged usr/bin + usr/sbin trees and embed whatever real
+            # Debian ELFs are present. The staged rootfs is intentionally
+            # a MINIMAL-but-broad slice (~120 files), well under
+            # NR_FILES=8192. Each entry's own .so closure is already
+            # covered by glob_libs.
+            binglob: list[str] = []
+            for bindir in ("usr/bin", "usr/sbin"):
+                d = minbase_rootfs / bindir
+                if not d.is_dir():
+                    continue
+                for p in sorted(d.iterdir()):
+                    # Regular files only (skip the bin/sh-style symlinks
+                    # the dedicated entries above already plant).
+                    if p.is_symlink() or not p.is_file():
+                        continue
+                    rel = str(p.relative_to(minbase_rootfs))
+                    if rel not in REAL_DEBIAN_FILES:
+                        binglob.append(rel)
+            REAL_DEBIAN_FILES = REAL_DEBIAN_FILES + binglob
+
             staged_files = 0
             staged_bytes = 0
             missing: list[str] = []

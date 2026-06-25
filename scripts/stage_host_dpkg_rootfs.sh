@@ -34,11 +34,74 @@ BINS="
 /usr/bin/apt-get
 /usr/bin/apt
 /usr/bin/dash
+/usr/bin/bash
 /usr/bin/rm
 /usr/bin/tar
 /usr/bin/gzip
+/usr/bin/gunzip
 /usr/bin/cat
 /usr/bin/sh
+/usr/bin/ls
+/usr/bin/cp
+/usr/bin/mv
+/usr/bin/mkdir
+/usr/bin/rmdir
+/usr/bin/chmod
+/usr/bin/ln
+/usr/bin/head
+/usr/bin/tail
+/usr/bin/wc
+/usr/bin/sort
+/usr/bin/uniq
+/usr/bin/cut
+/usr/bin/tr
+/usr/bin/env
+/usr/bin/printf
+/usr/bin/echo
+/usr/bin/date
+/usr/bin/stat
+/usr/bin/du
+/usr/bin/df
+/usr/bin/id
+/usr/bin/whoami
+/usr/bin/pwd
+/usr/bin/basename
+/usr/bin/dirname
+/usr/bin/seq
+/usr/bin/grep
+/usr/bin/sed
+/usr/bin/find
+/usr/bin/xargs
+/usr/bin/diff
+/usr/bin/comm
+/usr/bin/touch
+/usr/bin/true
+/usr/bin/false
+/usr/bin/yes
+/usr/bin/expr
+/usr/bin/readlink
+/usr/bin/realpath
+/usr/bin/md5sum
+/usr/bin/sha256sum
+/usr/bin/od
+/usr/bin/nl
+/usr/bin/tee
+/usr/bin/sleep
+/usr/bin/uname
+"
+# Optional / larger binaries — staged best-effort if present on host.
+# Missing ones are skipped silently by copy_with_libs so the matrix
+# simply records them absent (no host gawk/perl/python3/xz != failure).
+OPT_BINS="
+/usr/bin/awk
+/usr/bin/gawk
+/usr/bin/mawk
+/usr/bin/perl
+/usr/bin/python3
+/usr/bin/xz
+/usr/bin/unxz
+/usr/bin/bzip2
+/usr/bin/zcat
 "
 # apt's file:// fetch method binary + helpers
 APT_METHODS="/usr/lib/apt/methods/file /usr/lib/apt/methods/copy /usr/lib/apt/methods/store /usr/lib/apt/methods/gpgv"
@@ -51,9 +114,15 @@ copy_with_libs() {
     [ -e "$f" ] || { echo "[stage]   skip missing $f"; return 0; }
     local real; real="$(readlink -f "$f")"
     install -D -m0755 "$real" "$ROOTFS/$f"
-    # closure
-    ldd "$real" 2>/dev/null | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
-      | grep -E '^/' | sort -u | while read -r lib; do
+    # closure. Some tools (gunzip/zcat/bunzip2) are SHELL SCRIPTS, not
+    # ELFs — `ldd` on them exits non-zero and the closure grep matches
+    # nothing. Guard the whole pipeline (|| true) so a script-shaped
+    # tool doesn't abort the run under `set -euo pipefail`.
+    local libs
+    libs="$(ldd "$real" 2>/dev/null | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
+            | grep -E '^/' | sort -u || true)"
+    local lib
+    for lib in $libs; do
         [ -e "$lib" ] || continue
         local lr; lr="$(readlink -f "$lib")"
         install -D -m0755 "$lr" "$ROOTFS/$lib"
@@ -61,11 +130,11 @@ copy_with_libs() {
         if [ "$lib" != "$lr" ]; then
             install -D -m0755 "$lr" "$ROOTFS/$lib"
         fi
-      done
+    done
 }
 
 echo "[stage] copying binaries + library closures into $ROOTFS"
-for b in $BINS $APT_METHODS; do copy_with_libs "$b"; done
+for b in $BINS $OPT_BINS $APT_METHODS; do copy_with_libs "$b"; done
 
 # /lib64/ld-linux-x86-64.so.2 canonical name (PT_INTERP path).
 LDSO="$(readlink -f /lib64/ld-linux-x86-64.so.2)"
@@ -145,8 +214,31 @@ Acquire::AllowInsecureRepositories "true";
 APT::Get::AllowUnauthenticated "true";
 EOF
 
-# os markers
-echo "trixie/sid" > "$ROOTFS/etc/debian_version"
+# os markers. debian_version starts with "12." so the coverage sweep's
+# `cat /etc/debian_version` -> "12." assertion passes regardless of the
+# build host's own /etc/debian_version (this is the NAMESPACE's distro
+# marker, not the host's).
+echo "12.5" > "$ROOTFS/etc/debian_version"
+
+# /etc/os-release — a real multi-line Debian marker file the coverage
+# sweep reads with head/wc/sort. Stage a canonical Debian one (the host
+# copy if present, else a minimal hand-written one). Both contain the
+# token "Debian" and "BUG_REPORT_URL" the sweep asserts on.
+if [ -f /etc/os-release ] && grep -qi debian /etc/os-release; then
+    install -D -m0644 /etc/os-release "$ROOTFS/etc/os-release"
+else
+    cat > "$ROOTFS/etc/os-release" <<'EOF'
+PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"
+NAME="Debian GNU/Linux"
+VERSION_ID="12"
+VERSION="12 (bookworm)"
+VERSION_CODENAME=bookworm
+ID=debian
+HOME_URL="https://www.debian.org/"
+SUPPORT_URL="https://www.debian.org/support"
+BUG_REPORT_URL="https://bugs.debian.org/"
+EOF
+fi
 
 touch "$MARK"
 echo "[stage] done. rootfs staged at $ROOTFS"
