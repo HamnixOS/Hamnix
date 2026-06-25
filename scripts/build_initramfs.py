@@ -4153,19 +4153,27 @@ def build_archive() -> bytes:
             # a MINIMAL-but-broad slice (~120 files), well under
             # NR_FILES=8192. Each entry's own .so closure is already
             # covered by glob_libs.
+            # GATED behind HAMNIX_DEBIAN_BREADTH=1 (set by the coverage
+            # test only). Embedding ~120 stock Debian ELFs into the DEFAULT
+            # cpio bloated the -m 1G installer image +83 MiB (214->297 MiB)
+            # → the in-RAM rootfs alloc failed and the DE OOM'd on app spawn
+            # (blank desktop, user-reported). The default image keeps only
+            # the hand-pinned apt/dpkg closure above; the broad breadth set
+            # is opt-in for test_linux_debian_coverage.sh.
             binglob: list[str] = []
-            for bindir in ("usr/bin", "usr/sbin"):
-                d = minbase_rootfs / bindir
-                if not d.is_dir():
-                    continue
-                for p in sorted(d.iterdir()):
-                    # Regular files only (skip the bin/sh-style symlinks
-                    # the dedicated entries above already plant).
-                    if p.is_symlink() or not p.is_file():
+            if os.environ.get("HAMNIX_DEBIAN_BREADTH", "0") == "1":
+                for bindir in ("usr/bin", "usr/sbin"):
+                    d = minbase_rootfs / bindir
+                    if not d.is_dir():
                         continue
-                    rel = str(p.relative_to(minbase_rootfs))
-                    if rel not in REAL_DEBIAN_FILES:
-                        binglob.append(rel)
+                    for p in sorted(d.iterdir()):
+                        # Regular files only (skip the bin/sh-style symlinks
+                        # the dedicated entries above already plant).
+                        if p.is_symlink() or not p.is_file():
+                            continue
+                        rel = str(p.relative_to(minbase_rootfs))
+                        if rel not in REAL_DEBIAN_FILES:
+                            binglob.append(rel)
             REAL_DEBIAN_FILES = REAL_DEBIAN_FILES + binglob
 
             staged_files = 0
