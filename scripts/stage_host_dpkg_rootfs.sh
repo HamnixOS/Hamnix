@@ -85,7 +85,9 @@ mkdir -p \
   "$ROOTFS/var/lib/apt/lists/partial" \
   "$ROOTFS/etc/apt/sources.list.d" \
   "$ROOTFS/etc/apt/preferences.d" \
+  "$ROOTFS/etc/apt/apt.conf.d" \
   "$ROOTFS/etc/dpkg/dpkg.cfg.d" \
+  "$ROOTFS/usr/share/dpkg" \
   "$ROOTFS/usr/bin" "$ROOTFS/usr/sbin" "$ROOTFS/sbin" \
   "$ROOTFS/tmp" "$ROOTFS/run"
 
@@ -100,6 +102,41 @@ echo "0" > "$ROOTFS/var/lib/dpkg/info/format" 2>/dev/null || true
 # arch so dpkg --print-architecture works.
 mkdir -p "$ROOTFS/var/lib/dpkg"
 echo "amd64" > "$ROOTFS/var/lib/dpkg/arch"
+
+# --- dpkg architecture tables (libapt reads these DIRECTLY) -----------
+# apt-get does NOT learn the arch only from `dpkg --print-architecture`;
+# libapt-pkg ALSO opens /usr/share/dpkg/{cputable,tupletable,
+# triplettable,...} itself to build its multiarch/CPU table. With those
+# absent, apt prints "Error reading the CPU table" and refuses to
+# resolve any package (the arch list comes out empty), so EVERY
+# `apt-get install` aborts before it ever fetches from the repo. Stage
+# the full set of *table data files from the host's dpkg-dev/dpkg data
+# dir. (triplettable is the legacy name; modern dpkg ships tupletable —
+# copy whichever exist so old + new libapt are both satisfied.)
+echo "[stage] copying /usr/share/dpkg/*table (apt CPU/arch tables)"
+for t in cputable tupletable triplettable ostable abitable; do
+    src="/usr/share/dpkg/$t"
+    [ -f "$src" ] && install -D -m0644 "$src" "$ROOTFS/usr/share/dpkg/$t"
+done
+# Some libapt versions look for triplettable specifically; if the host
+# only ships the newer tupletable, mirror it under the legacy name so
+# the triplettable->tupletable fallback can't miss either way.
+if [ ! -f "$ROOTFS/usr/share/dpkg/triplettable" ] \
+   && [ -f "$ROOTFS/usr/share/dpkg/tupletable" ]; then
+    cp "$ROOTFS/usr/share/dpkg/tupletable" \
+       "$ROOTFS/usr/share/dpkg/triplettable"
+fi
+
+# --- apt config dir --------------------------------------------------
+# apt opendir()s /etc/apt/apt.conf.d/ at startup and warns
+# "Unable to read /etc/apt/apt.conf.d/ ..." when the directory is
+# missing. The directory is created above; drop one inert .conf so the
+# dir is non-empty and to pin the namespace arch to amd64 (belt-and-
+# braces with the cputable + /var/lib/dpkg/arch above).
+cat > "$ROOTFS/etc/apt/apt.conf.d/00hamnix" <<'EOF'
+APT::Architecture "amd64";
+APT::Architectures "amd64";
+EOF
 
 # os markers
 echo "trixie/sid" > "$ROOTFS/etc/debian_version"

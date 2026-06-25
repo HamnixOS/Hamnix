@@ -130,6 +130,7 @@ Origin: Hamnix-Local
 Label: Hamnix-Local
 Suite: local
 Codename: local
+Date: $(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S UTC')
 Architectures: $ARCH
 Components: main
 Description: Hamnix offline local apt repository
