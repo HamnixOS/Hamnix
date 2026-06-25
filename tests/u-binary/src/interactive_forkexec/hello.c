@@ -35,22 +35,36 @@
 
 extern char **environ;
 
-/* The long-lived parent does NITERS independent fork+exec+reap cycles.
- * dash's interactive REPL is exactly this loop with an fgets(stdin) at
- * the top; the crash is in the fork+exec+reap machinery of a long-lived
- * parent, not the stdin read, so we drive it self-contained (no PTY
- * handoff needed: hamsh execs this fixture once and it loops internally).
- * 5 iterations is enough — the user's crash fires on iter 2. */
-#define NITERS 5
+/* The long-lived parent BLOCKS on a stdin read (fgets), then for each
+ * line fork+execve(/bin/u_dynamic_hello)+reaps, then loops back to the
+ * NEXT blocking read. This is EXACTLY dash's interactive REPL: the
+ * read(2) on the console between commands is load-bearing — a
+ * self-looping fork+exec (no stdin) does NOT reproduce the crash, but
+ * fork-after-a-console-read does. hamsh execs this fixture once and the
+ * test feeds it command lines over the serial console (the child
+ * inherits DEVFD_CONS as stdin). */
+#define MAXITERS 8
 
 int main(void) {
-    printf("ITFE: parent ready, looping fork+exec\n");
+    printf("ITFE: parent ready, reading commands\n");
     fflush(stdout);
 
+    char line[256];
     int iter = 0;
-    while (iter < NITERS) {
+    while (iter < MAXITERS && fgets(line, sizeof(line), stdin) != NULL) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) {
+            line[--n] = '\0';
+        }
+        if (n == 0) {
+            continue;                  /* blank line: loop, like a shell */
+        }
+        if (strcmp(line, "quit") == 0) {
+            break;
+        }
+
         iter++;
-        printf("ITFE: iter=%d forking\n", iter);
+        printf("ITFE: iter=%d forking for cmd '%s'\n", iter, line);
         fflush(stdout);
 
         pid_t pid = fork();

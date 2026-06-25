@@ -119,8 +119,18 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 export QEMU_EXTRA_ARGS="-enable-kvm -cpu host"
 
 set +e
-qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 40 \
-    -- "u_interactive_forkexec" 15 \
+# Drive: launch the long-lived fixture, then feed it several command
+# lines over the serial console (each triggers a fork+exec+reap), with
+# pauses between so each blocking fgets read completes BEFORE the next
+# line — exactly the interactive `enter linux {sh}` typing cadence. The
+# fixture's child inherits DEVFD_CONS as stdin, so these lines reach it.
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 60 \
+    -- "u_interactive_forkexec" 4 \
+       "ls" 4 \
+       "echo" 4 \
+       "cat" 4 \
+       "pwd" 4 \
+       "quit" 4 \
        "exit" 1
 rc="$QEMU_DRIVE_RC"
 set -e
