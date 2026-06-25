@@ -153,7 +153,17 @@ from compiler.regalloc import (
     ra_pool_used,
     ra_pool_encoding,
     ra_nregs,
+    ra_pool_all_dead_after,
     RA_NONE,
+)
+
+# cfg live-range queries for the IR-scratch BORROW path: lr_stmt_point maps the
+# in-flight statement node to its program point; lr_name_dead_after tells whether
+# a regalloc-promoted local is already past its last use there (so its callee-
+# saved register can be lent as a transient IR scratch). Pure reads of the
+# per-function ranges regalloc already built; only consulted under --opt.
+from compiler.cfg import (
+    lr_stmt_point,
 )
 
 # Phase-5 IR-CONSUMING emit path. OFF by default: ir_emit_is_enabled() returns 0
@@ -3726,6 +3736,24 @@ ir_scratch_hits: uint32 = 0
 # Stat: number of IR_BINOP nodes that fell back to the push/pop path because no
 # scratch register was free (pressure exceeded the pool).
 ir_scratch_misses: uint32 = 0
+# Stat: number of IR_BINOP scratches satisfied by BORROWING a callee-saved reg
+# regalloc had promoted a local into, where that local was DEAD at the current
+# program point (so lending its register lost no value). This is the register-
+# heavy win — capacity that the plain availability pool (regalloc used all regs)
+# could not provide.
+ir_scratch_borrows: uint32 = 0
+
+# The statement node codegen is currently emitting (set in gen_stmt). Used to map
+# to a cfg program point for the borrow disjointness check. 0 => unknown (treated
+# conservatively as "no borrow").
+cg_cur_stmt: uint32 = 0
+
+# Per-acquire bookkeeping for BORROWED registers: when ir_scratch_acquire lends a
+# regalloc-held reg, it records the borrowed encoding so ir_scratch_release knows
+# NOT to clear the (non-existent) busy slot but instead clear the borrow record.
+# A small stack mirrors the LIFO acquire/release discipline. Borrowed regs are
+# already saved by regalloc's prologue, so no extra save is needed.
+ir_scratch_borrowed: Array[5, uint32]    # encodings currently borrowed (or RA_NONE)
 
 
 def ir_scratch_pool_init():
@@ -3747,8 +3775,11 @@ def ir_scratch_build_avail():
     i: uint32 = 0
     while i < IR_SCRATCH_NREGS:
         ir_scratch_busy[i] = 0
+        ir_scratch_borrowed[i] = 0
         # Default: available. If regalloc is active AND used pool index i for a
-        # promoted local, mark it UNAVAILABLE (its encoding aliases a live local).
+        # promoted local, mark it UNAVAILABLE (its encoding aliases a local that is
+        # live SOMEWHERE). Such a register may still be BORROWED at a program point
+        # where its local is provably dead — handled in ir_scratch_acquire.
         avail: uint32 = 1
         if cg_ra_active != 0:
             if ra_pool_used(i) != 0:
@@ -3757,9 +3788,34 @@ def ir_scratch_build_avail():
         i = i + 1
 
 
+# True iff regalloc-used pool index i may be BORROWED as an IR scratch RIGHT NOW:
+# the promoted local it holds is provably DEAD at the current statement's program
+# point, so lending its callee-saved register loses no value. Sound by the
+# half-open live-range END test (lr_name_dead_after): the local has no use at or
+# after this point. Conservative when the point is unknown (cg_cur_stmt unmapped)
+# or no local owns the register — returns 0 (fall back to push/pop).
+def ir_scratch_can_borrow(i: uint32) -> uint32:
+    if cg_ra_active == 0:
+        return 0
+    if ra_pool_used(i) == 0:
+        return 0
+    pt: uint32 = lr_stmt_point(cg_cur_stmt)
+    # ALL promoted locals sharing pool index i's register must be dead at pt
+    # (linear scan reuses one register for several disjoint-interval locals). When
+    # pt is unknown (LR_INF), lr_name_dead_after yields 0 for every owner, so this
+    # conservatively returns 0 (no borrow).
+    return ra_pool_all_dead_after(i, pt)
+
+
 # Acquire a free scratch register; returns its x86 encoding, or RA_NONE if none
-# free. Marks it busy and records it in the used mask (so the prologue saves it).
+# free. First takes a register the allocator left free (ir_scratch_avail). If none
+# is free AND regalloc consumed the whole callee-saved pool, try to BORROW a
+# register whose promoted local is dead at the current program point — this is the
+# register-heavy win (>=5 promoted locals => empty plain pool). A borrowed reg is
+# already saved by the regalloc prologue, so no extra prologue work; we only mark
+# it busy + flag it as a borrow so release restores its busy state correctly.
 def ir_scratch_acquire() -> uint32:
+    # Pass 1: a register regalloc did not use this function (the existing pool).
     i: uint32 = 0
     while i < IR_SCRATCH_NREGS:
         if ir_scratch_avail[i] != 0 and ir_scratch_busy[i] == 0:
@@ -3767,15 +3823,29 @@ def ir_scratch_acquire() -> uint32:
             ir_scratch_used_mask = ir_scratch_used_mask | (cast[uint32](1) << i)
             return ir_scratch_enc[i]
         i = i + 1
+    # Pass 2: BORROW a regalloc-held register whose local is dead here.
+    j: uint32 = 0
+    while j < IR_SCRATCH_NREGS:
+        if ir_scratch_busy[j] == 0:
+            if ir_scratch_can_borrow(j) != 0:
+                ir_scratch_busy[j] = 1
+                ir_scratch_borrowed[j] = 1
+                ir_scratch_borrows = ir_scratch_borrows + 1
+                return ir_scratch_enc[j]
+        j = j + 1
     return RA_NONE
 
 
-# Release a scratch register by its encoding (LIFO with acquire).
+# Release a scratch register by its encoding (LIFO with acquire). Clears the busy
+# bit and any borrow flag; a borrowed reg's stack save/restore is owned by
+# regalloc, so there is nothing else to undo (the local it held is dead — its
+# value was never going to be read again).
 def ir_scratch_release(enc: uint32):
     i: uint32 = 0
     while i < IR_SCRATCH_NREGS:
         if ir_scratch_enc[i] == enc:
             ir_scratch_busy[i] = 0
+            ir_scratch_borrowed[i] = 0
             return
         i = i + 1
 
@@ -7377,6 +7447,12 @@ def declare_local(name_off: uint32, name_len: uint32, tnode: uint32):
 def gen_stmt(node: uint32):
     if node == 0:
         return
+    # Track the in-flight statement node so the IR-scratch BORROW path can map it
+    # to a program point (cfg's lr_stmt_point) and check whether a regalloc local
+    # is already dead there. An if/while condition is emitted with cg_cur_stmt set
+    # to the if/while node — matching cfg, which stamps the condition's ci with
+    # that same node. Nested body statements re-enter gen_stmt and re-stamp.
+    cg_cur_stmt = node
     k: uint32 = nd_kind[node]
 
     if k == ND_RETURN:

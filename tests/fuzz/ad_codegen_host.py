@@ -191,7 +191,8 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       irfallback=meta.get("IRFALLBACK", 0),
                       irreassoc=meta.get("IRREASSOC", 0),
                       irscratch=meta.get("IRSCRATCH", 0),
-                      irscratchmiss=meta.get("IRSCRATCHMISS", 0))
+                      irscratchmiss=meta.get("IRSCRATCHMISS", 0),
+                      irborrow=meta.get("IRBORROW", 0))
 
 
 # --------------------------------------------------------------------------

@@ -163,6 +163,84 @@ def corpus():
         f"f(cast[uint64](3),cast[uint64](5),cast[uint64](7),cast[uint64](11))",
         u64(int((3*5) < (7*11)))))
 
+    # ======================================================================
+    # REGISTER-HEAVY BORROW cases (>=5 promoted scalar locals/params, so
+    # regalloc consumes the whole callee-saved pool and the plain availability
+    # scratch pool is EMPTY -- every binop scratch must come from BORROWING a
+    # promoted local that is DEAD at the binop's program point). These are the
+    # high-risk correctness cases the borrow feature targets.
+    # ======================================================================
+
+    # ---- MAY-share: 6 params, each consumed into a running accumulator in a
+    #      strict sequence so that by the time the LAST binop runs most params
+    #      are past their last use (DEAD) -- their registers are borrowable. The
+    #      oracle is a plain modular sum-of-products. All-register pressure (6
+    #      params promoted) forces borrows. ----
+    p6 = [9, 8, 7, 6, 5, 4]
+    # r = a; r = r + b*c ; r = r + d*e ; r = r + f  (sequential, params die early)
+    may_val = u64(p6[0] + u64(p6[1]*p6[2]) + u64(p6[3]*p6[4]) + p6[5])
+    progs.append(("borrow_may_share_seq",
+        "def f(a: uint64, b: uint64, c: uint64, d: uint64,\n"
+        "      e: uint64, ff: uint64) -> uint64:\n"
+        "    r: uint64 = a\n"
+        "    r = r + (b * c)\n"
+        "    r = r + (d * e)\n"
+        "    r = r + ff\n"
+        "    return r\n",
+        "f(" + ",".join(f"cast[uint64]({v})" for v in p6) + ")",
+        may_val))
+
+    # ---- MUST-NOT-share: a local LIVE ACROSS the binop that needs scratch. `t`
+    #      is computed early and read AGAIN at the very end, so it is LIVE through
+    #      the whole body; the intermediate binops must NOT borrow t's register
+    #      (doing so clobbers t and miscompiles). Five more live params keep the
+    #      pool full. If the disjointness check is wrong, t is clobbered and the
+    #      result diverges from the oracle. ----
+    mp = [3, 5, 7, 11, 13]
+    a_, b_, c_, d_, e_ = mp
+    t_ = u64(a_ * b_)               # 15, kept live to the end
+    must_val = u64(u64(t_ + u64(c_ * d_)) * u64(e_ + a_) + t_)
+    progs.append(("borrow_must_not_share_live",
+        "def f(a: uint64, b: uint64, c: uint64, d: uint64,\n"
+        "      e: uint64) -> uint64:\n"
+        "    t: uint64 = a * b\n"
+        "    u: uint64 = (t + (c * d)) * (e + a)\n"
+        "    return u + t\n",
+        "f(" + ",".join(f"cast[uint64]({v})" for v in mp) + ")",
+        must_val))
+
+    # ---- CALL-CROSSING borrow: register-heavy (6 params) so a borrowed scratch
+    #      reg holds a live right operand ACROSS a call. The borrowed reg is
+    #      callee-saved (it is a regalloc pool reg, already saved in the prologue),
+    #      so the value must survive the call. ----
+    progs.append(("borrow_call_crossing",
+        "buf2: Array[4, uint64]\n"
+        "def idx2() -> uint64:\n"
+        "    return cast[uint64](3)\n"
+        "def f(a: uint64, b: uint64, c: uint64, d: uint64,\n"
+        "      e: uint64, ff: uint64) -> uint64:\n"
+        "    buf2[0] = cast[uint64](100)\n"
+        "    buf2[1] = cast[uint64](200)\n"
+        "    buf2[2] = cast[uint64](300)\n"
+        "    buf2[3] = cast[uint64](400)\n"
+        "    s: uint64 = a + b + c + d + e + ff\n"
+        "    return (buf2[idx2()] + s) * (a + b)\n",
+        "f(" + ",".join(f"cast[uint64]({v})" for v in [1,2,3,4,5,6]) + ")",
+        u64((400 + (1+2+3+4+5+6)) * (1+2))))
+
+    # ---- NESTED binops, register-heavy: a deep tree over 6 promoted params,
+    #      with several params dying mid-tree so borrows fire at multiple depths.
+    #      Oracle = the modular tree value. ----
+    n6 = [2, 3, 5, 7, 11, 13]
+    na, nb, nc, nd, ne, nf = n6
+    nested_val = u64(u64(u64(na + nb) * u64(nc + nd)) + u64(u64(ne * nf) + na) - nb)
+    progs.append(("borrow_nested",
+        "def f(a: uint64, b: uint64, c: uint64, d: uint64,\n"
+        "      e: uint64, ff: uint64) -> uint64:\n"
+        "    return ((a + b) * (c + d)) + ((e * ff) + a) - b\n",
+        "f(" + ",".join(f"cast[uint64]({v})" for v in n6) + ")",
+        nested_val))
+
     return progs
 
 
@@ -170,6 +248,8 @@ def run():
     ok = True
     total_scratch = 0
     total_miss = 0
+    total_borrow = 0
+    borrow_fired = False
     n_pass = 0
     n_total = 0
     for (name, decls, callexpr, expected) in corpus():
@@ -194,8 +274,12 @@ def run():
         d_on = host.run_dump(src, opt=True)
         scratch = int(getattr(d_on, "irscratch", 0) or 0)
         miss = int(getattr(d_on, "irscratchmiss", 0) or 0)
+        borrow = int(getattr(d_on, "irborrow", 0) or 0)
         total_scratch += scratch
         total_miss += miss
+        total_borrow += borrow
+        if borrow > 0:
+            borrow_fired = True
         # byte-inert OFF: the IR emitter (and thus scratch path) must not fire.
         d_off = host.run_dump(src, opt=False)
         if d_off.status != "ok" or getattr(d_off, "iremit", 0) != 0 \
@@ -207,12 +291,17 @@ def run():
             continue
         n_pass += 1
         print(f"  [{name}] OK out={r.stdout} scratch_hits={scratch} "
-              f"pushpop_fallback={miss}")
+              f"borrowed={borrow} pushpop_fallback={miss}")
     print(f"\n[ir_scratch] {n_pass}/{n_total} correct, "
           f"total scratch hits={total_scratch} (= push/pop PAIRS eliminated), "
-          f"push/pop fallbacks={total_miss}")
+          f"of which BORROWED={total_borrow} (dead-local registers lent in "
+          f"register-heavy fns), push/pop fallbacks={total_miss}")
     if total_scratch == 0:
         print("  FAIL: the scratch-register path never fired")
+        ok = False
+    if not borrow_fired:
+        print("  FAIL: the BORROW path never fired (no dead-local register was "
+              "lent as scratch -- the register-heavy win is not exercised)")
         ok = False
     return ok
 
