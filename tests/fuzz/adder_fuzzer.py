@@ -2537,6 +2537,21 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] IR-emit corpus miscompiled, IR path never "
                   "fired, OFF not byte-inert, or reassoc did not reach machine code")
+        # FLOAT IR-EMIT corpus: float arith/compares (f32/f64/mixed/nested/neg)
+        # lowered through the SSE float IR path. Asserts correctness vs an IEEE
+        # oracle, the float IR path fired (IREMITFLOAT>0), and the OFF path is
+        # byte-inert (IREMITFLOAT==0 and IREMIT==0).
+        print("--- ADDER_OPT=1 FLOAT IR-EMIT corpus (SSE float lowering) ---")
+        try:
+            import iremit_float_check as _flt
+            flt_ok = _flt.run()
+        except Exception as _e:                       # noqa: BLE001
+            flt_ok = False
+            print(f"  [ADDER_OPT FAIL] float IR-emit corpus errored: {_e}")
+        if not flt_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] float IR-emit corpus miscompiled, float IR "
+                  "path never fired, or OFF not byte-inert")
     cfg_lane_fail = False
     if ADDER_CFG:
         print(f"--- ADDER_CFG=1 CFG/liveness GROUNDWORK lane (analysis-only) ---")

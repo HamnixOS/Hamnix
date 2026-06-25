@@ -39,8 +39,10 @@ def main():
     tot_fallback = 0
     tot_fold = 0
     tot_reassoc = 0
+    tot_float = 0
     accepted = 0
     progs_with_ir = 0
+    progs_with_float = 0
     for i in range(n):
         try:
             src_text = gen_program(1000 + i)
@@ -63,16 +65,22 @@ def main():
         tot_fallback += fb
         tot_fold += int(getattr(d, "irfold", 0) or 0)
         tot_reassoc += int(getattr(d, "irreassoc", 0) or 0)
+        fl = int(getattr(d, "iremitfloat", 0) or 0)
+        tot_float += fl
         if ie > 0:
             progs_with_ir += 1
+        if fl > 0:
+            progs_with_float += 1
     roots = tot_iremit + tot_fallback
     cov = (100.0 * tot_iremit / roots) if roots else 0.0
     print(f"corpus: {accepted} programs accepted (of {n} generated)")
     print(f"ND_BINARY roots reached: {roots}")
     print(f"  emitted via IR (IREMIT):   {tot_iremit}")
+    print(f"    of which FLOAT roots:    {tot_float}")
     print(f"  fell back to AST:          {tot_fallback}")
     print(f"IR-EMIT COVERAGE: {cov:.1f}% of ND_BINARY roots")
-    print(f"programs with >=1 IR-emitted root: {progs_with_ir}/{accepted}")
+    print(f"programs with >=1 IR-emitted root:   {progs_with_ir}/{accepted}")
+    print(f"programs with >=1 FLOAT IR root:     {progs_with_float}/{accepted}")
     print(f"IR const-folds: {tot_fold}   ADD reassociations: {tot_reassoc}")
 
 
