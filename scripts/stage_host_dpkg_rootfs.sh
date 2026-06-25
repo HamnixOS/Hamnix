@@ -136,8 +136,12 @@ copy_with_libs() {
 echo "[stage] copying binaries + library closures into $ROOTFS"
 for b in $BINS $OPT_BINS $APT_METHODS; do copy_with_libs "$b"; done
 
-# /lib64/ld-linux-x86-64.so.2 canonical name (PT_INTERP path).
+# Dynamic linker (PT_INTERP path). Stage at BOTH the usrmerge canonical
+# usr/lib64/ (what build_initramfs.py's REAL_DEBIAN slice pins + aliases)
+# AND the non-usr lib64/ spelling, so whichever path the embed/glob picks
+# up resolves to real ld.so bytes.
 LDSO="$(readlink -f /lib64/ld-linux-x86-64.so.2)"
+install -D -m0755 "$LDSO" "$ROOTFS/usr/lib64/ld-linux-x86-64.so.2"
 install -D -m0755 "$LDSO" "$ROOTFS/lib64/ld-linux-x86-64.so.2"
 
 # /bin/sh -> dash (Debian default); dpkg maintainer scripts use /bin/sh.

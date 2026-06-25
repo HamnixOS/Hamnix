@@ -38,6 +38,17 @@ set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+# Boot under KVM when the host exposes /dev/kvm (the broad real-Debian
+# slice + the ld.so/libapt .so churn is painfully slow under pure TCG).
+# Falls back to TCG transparently on a KVM-less box.
+KVM_ARGS=""
+if [ -w /dev/kvm ]; then
+    KVM_ARGS="-enable-kvm -cpu host"
+    echo "[test_linux_debian_coverage] KVM available -> -enable-kvm -cpu host"
+else
+    echo "[test_linux_debian_coverage] no /dev/kvm -> TCG (slow)"
+fi
+
 ROOTFS=tests/distros/debian-minbase/rootfs
 if [ ! -f "$ROOTFS/usr/bin/dpkg" ] || [ ! -f "$ROOTFS/bin/bash" ]; then
     echo "[test_linux_debian_coverage] SKIP: $ROOTFS/{usr/bin/dpkg,bin/bash} not staged"
@@ -141,6 +152,71 @@ set +e
     printf 'enter linux { /usr/bin/sort /etc/os-release }\n'; sleep 9
     printf 'echo BANNER_SORT_END\n'; sleep 1
 
+    # ---- BROAD STANDALONE-BINARY SWEEP -------------------------------
+    # Each real Debian ELF is invoked STANDALONE (no shell pipe/fork) on
+    # a staged file or with a self-contained flag, and asserts a token in
+    # its own OUTPUT. Banner-windowed like the rest. This is the breadth
+    # matrix: coreutils + text tools exercised through the Linux-ABI shim.
+    # marker tokens are unique substrings the command necessarily prints.
+    sweep() {  # sweep <BANNER> <cmd...>
+        local b="$1"; shift
+        printf 'echo %s_START\n' "$b"; sleep 1
+        printf 'enter linux { %s }\n' "$*"; sleep "${SWEEP_SLEEP:-6}"
+        printf 'echo %s_END\n' "$b"; sleep 1
+    }
+    # uname -s -> "Linux" (the shim reports a Linux uname to the guest).
+    sweep BANNER_UNAME   "/usr/bin/uname -s"
+    # id -> contains "uid="
+    sweep BANNER_ID      "/usr/bin/id"
+    # whoami -> a username line
+    sweep BANNER_WHOAMI  "/usr/bin/whoami"
+    # ls -la / -> long listing of the Debian root (getdents + lstat)
+    sweep BANNER_LS      "/usr/bin/ls -la /"
+    # ls -la of /usr/bin -> bigger getdents directory
+    sweep BANNER_LSBIN   "/usr/bin/ls /usr/bin"
+    # stat /etc/os-release -> "Size:" / "Inode:" (fstatat detail)
+    sweep BANNER_STAT    "/usr/bin/stat /etc/os-release"
+    # tail -n1 -> last line of os-release
+    sweep BANNER_TAIL    "/usr/bin/tail -n1 /etc/os-release"
+    # cut a field -> ID=debian -> "debian"
+    sweep BANNER_CUT     "/usr/bin/cut -d= -f2 /etc/os-release"
+    # tr lowercasing a fixed file path content
+    sweep BANNER_TR      "/usr/bin/tr a-z A-Z < /etc/debian_version"
+    # printf with a format -> deterministic token
+    sweep BANNER_PRINTF  "/usr/bin/printf 'PRINTF_%s_OK\\n' TOKEN"
+    # seq -> 1..3 newline-separated
+    sweep BANNER_SEQ     "/usr/bin/seq 3"
+    # basename / dirname -> path component
+    sweep BANNER_BASENAME "/usr/bin/basename /a/b/cfile"
+    # env -> prints the environment (PATH= at least)
+    sweep BANNER_ENV     "/usr/bin/env"
+    # grep a fixed token in a staged file
+    sweep BANNER_GREP    "/usr/bin/grep BUG_REPORT_URL /etc/os-release"
+    # sed substitution on a staged file
+    sweep BANNER_SED     "/usr/bin/sed -n '1p' /etc/os-release"
+    # head -c byte count
+    sweep BANNER_HEADC   "/usr/bin/head -c5 /etc/debian_version"
+    # wc -c byte count
+    sweep BANNER_WCC     "/usr/bin/wc -c /etc/debian_version"
+    # md5sum of a staged file -> a 32-hex digest line
+    sweep BANNER_MD5     "/usr/bin/md5sum /etc/debian_version"
+    # readlink of /bin/sh -> dash (symlink readlink)
+    sweep BANNER_READLINK "/usr/bin/readlink /bin/sh"
+    # find a staged dir, depth-limited (getdents + recursion)
+    SWEEP_SLEEP=8 sweep BANNER_FIND "/usr/bin/find /etc/apt -maxdepth 2"
+    # date in a fixed-format (no args reads RTC; -u +%Y is deterministic-ish)
+    sweep BANNER_DATE    "/usr/bin/date -u +DATE_OK_%Y"
+    # nl numbers lines
+    sweep BANNER_NL      "/usr/bin/nl /etc/debian_version"
+    # od hex dump first bytes
+    sweep BANNER_OD      "/usr/bin/od -An -c -N3 /etc/debian_version"
+    # awk (gawk or mawk) field print -> requires the awk ELF + its closure
+    SWEEP_SLEEP=8 sweep BANNER_AWK "/usr/bin/awk 'BEGIN{print \"AWK_OK_MARK\"}'"
+    # perl one-liner (heavier dynamic closure)
+    SWEEP_SLEEP=10 sweep BANNER_PERL "/usr/bin/perl -e 'print \"PERL_OK_MARK\\n\"'"
+    # python3 version (heaviest dynamic closure; best-effort)
+    SWEEP_SLEEP=12 sweep BANNER_PY "/usr/bin/python3 --version"
+
     # dpkg + apt --version (the package managers proper).
     printf 'echo BANNER_DPKG_VERSION_START\n'; sleep 1
     printf 'enter linux { /usr/bin/dpkg --version }\n'; sleep 10
@@ -197,6 +273,7 @@ set +e
     printf 'exit\n'; sleep 1
 ) | timeout 1200s qemu-system-x86_64 \
     -kernel "$ELF" \
+    $KVM_ARGS \
     -smp 2 \
     -nographic \
     -no-reboot \
@@ -252,6 +329,82 @@ check_banner_value "BANNER_WC_START"    "os-release"       "wc -l read /etc/os-r
 check_banner_value "BANNER_SORT_START"  "BUG_REPORT_URL"   "sort /etc/os-release ordered the file"
 check_banner_value "BANNER_DPKG_VERSION_START" "Debian"    "dpkg --version printed 'Debian'"
 check_banner_value "BANNER_APT_VERSION_START"  "apt "      "apt-get --version printed 'apt '"
+
+# --- BROAD STANDALONE-BINARY SWEEP assertions ------------------------
+# Two tiers. CORE coreutils/text tools are HARD (regression on these = a
+# real ABI break). The HEAVY dynamic binaries (awk/perl/python3) and any
+# probe whose output is environment-dependent are REPORTED ONLY (counted
+# into a residual list, not fail=1) — this is a breadth probe and the
+# host may not even ship them. Every result is printed so the serial
+# evidence shows the full pass/fail matrix.
+sweep_core=0; sweep_soft_pass=0; sweep_soft_fail=0
+declare -a SOFT_RESIDUAL=()
+check_core() {  # banner value label
+    if awk -v b="$1" -v v="$2" '
+        BEGIN{armed=0;win=0;found=0}
+        index($0,"[atkbd-diag]")>0{next}
+        index($0,b)>0{armed=1;win=0;next}
+        armed{win++; if(index($0,v)>0){found=1;exit} if(win>40)armed=0}
+        END{exit found?0:1}' "$LOG"; then
+        echo "[test_linux_debian_coverage] OK (core): $3"
+        sweep_core=$((sweep_core+1))
+    else
+        echo "[test_linux_debian_coverage] MISS (core): $3 (banner='$1' value='$2')"
+        fail=1
+    fi
+}
+check_soft() {  # banner value label
+    if awk -v b="$1" -v v="$2" '
+        BEGIN{armed=0;win=0;found=0}
+        index($0,"[atkbd-diag]")>0{next}
+        index($0,b)>0{armed=1;win=0;next}
+        armed{win++; if(index($0,v)>0){found=1;exit} if(win>40)armed=0}
+        END{exit found?0:1}' "$LOG"; then
+        echo "[test_linux_debian_coverage] OK (probe): $3"
+        sweep_soft_pass=$((sweep_soft_pass+1))
+    else
+        echo "[test_linux_debian_coverage] PROBE-MISS: $3 (residual, not a hard fail)"
+        sweep_soft_fail=$((sweep_soft_fail+1))
+        SOFT_RESIDUAL+=("$3")
+    fi
+}
+
+# CORE — these must pass.
+check_core "BANNER_UNAME_START"    "Linux"          "uname -s -> Linux"
+check_core "BANNER_ID_START"       "uid="           "id -> uid="
+check_core "BANNER_LS_START"       "etc"            "ls -la / lists the Debian root (getdents)"
+check_core "BANNER_LSBIN_START"    "dpkg"           "ls /usr/bin lists staged binaries"
+check_core "BANNER_STAT_START"     "Size:"          "stat /etc/os-release -> Size:"
+check_core "BANNER_TAIL_START"     "URL"            "tail -n1 os-release -> last line"
+check_core "BANNER_CUT_START"      "debian"         "cut -d= -f2 -> debian"
+check_core "BANNER_TR_START"       "12"             "tr a-z A-Z piped debian_version"
+check_core "BANNER_PRINTF_START"   "PRINTF_TOKEN_OK" "printf format"
+check_core "BANNER_SEQ_START"      "3"              "seq 3"
+check_core "BANNER_BASENAME_START" "cfile"          "basename /a/b/cfile"
+check_core "BANNER_GREP_START"     "BUG_REPORT_URL" "grep token in os-release"
+check_core "BANNER_SED_START"      "PRETTY"         "sed -n 1p os-release"
+check_core "BANNER_HEADC_START"    "12"             "head -c5 debian_version"
+check_core "BANNER_WCC_START"      "debian_version" "wc -c debian_version"
+check_core "BANNER_MD5_START"      "debian_version" "md5sum debian_version (digest line)"
+check_core "BANNER_READLINK_START" "dash"           "readlink /bin/sh -> dash"
+check_core "BANNER_DATE_START"     "DATE_OK_20"     "date -u +DATE_OK_%Y"
+check_core "BANNER_NL_START"       "12"             "nl debian_version"
+
+# PROBE — reported, not hard-failed.
+check_soft "BANNER_WHOAMI_START"   "root"           "whoami -> root"
+check_soft "BANNER_ENV_START"      "PATH"           "env -> PATH= in environment"
+check_soft "BANNER_FIND_START"     "sources"        "find /etc/apt -maxdepth 2"
+check_soft "BANNER_OD_START"       "1"              "od -c debian_version"
+check_soft "BANNER_AWK_START"      "AWK_OK_MARK"    "awk BEGIN print"
+check_soft "BANNER_PERL_START"     "PERL_OK_MARK"   "perl -e print"
+check_soft "BANNER_PY_START"       "Python"         "python3 --version"
+
+echo "[test_linux_debian_coverage] sweep summary: core_ok=$sweep_core" \
+     "probe_pass=$sweep_soft_pass probe_residual=$sweep_soft_fail"
+if [ "${#SOFT_RESIDUAL[@]}" -gt 0 ]; then
+    echo "[test_linux_debian_coverage] residual probes (non-fatal):"
+    for r in "${SOFT_RESIDUAL[@]}"; do echo "    - $r"; done
+fi
 
 # --- PART B: offline dpkg unpack into a writable root -----------------
 # Authoritative offline apt-get-install-into-the-writable-#distro gate is
