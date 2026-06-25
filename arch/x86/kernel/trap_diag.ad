@@ -116,6 +116,14 @@ from kernel.sched.core import current_idx_get, task_pml4, \
     current_task_account_major_fault, task_kstack_top, \
     task_image_lo, task_image_hi, task_interp_lo, task_interp_hi
 from mm.cow import cow_boot_cr3
+# Diag-walk self-fault guard: the cr2 page-walk dereferences table pages
+# as raw physical pointers under the boot CR3's identity map. A corrupt /
+# garbage higher-level entry can point at a physical address that is NOT
+# backed by mapped RAM; dereferencing it #PF's INSIDE the diagnostic (the
+# secondary kernel #PF the user saw: a second [trap-diag] line, cs=0x08).
+# memblock_region_top() is the highest physical RAM address the boot CR3
+# identity-maps; the walk skips any table-page pointer at/above it.
+from mm.memblock import memblock_region_top
 
 # trap_asm.S — per-vector stubs + IST1 stack + tss_set_ist1 helper.
 extern def read_cr2() -> uint64
@@ -155,25 +163,54 @@ def trap_diag_pte_walk(cr3: uint64, va: uint64):
     i3: uint64 = (va >> 30) & 0x1FF
     i2: uint64 = (va >> 21) & 0x1FF
     i1: uint64 = (va >> 12) & 0x1FF
-    pml4: Ptr[uint64] = cast[Ptr[uint64]](cr3 & m)
+    # Self-fault guard: highest identity-mapped physical RAM address. Any
+    # table-page pointer at/above this is NOT backed by the boot CR3's
+    # identity map; dereferencing it would #PF inside the diagnostic (the
+    # secondary kernel #PF in the repro). Bail with a note instead.
+    ram_top: uint64 = memblock_region_top()
+    pml4_pa: uint64 = cr3 & m
+    if pml4_pa == 0 or (ram_top != 0 and pml4_pa >= ram_top):
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[trap-diag]   pml4 phys %p unmapped, walk skipped\n",
+                pml4_pa)
+        return
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_pa)
     e4: uint64 = pml4[i4]
     printk_set_level(PRINTK_LEVEL_EMERG)
     printk2("[trap-diag]   pml4e[%d]=%p\n", i4, e4)
     if (e4 & 0x1) == 0:
         return
-    pdpt: Ptr[uint64] = cast[Ptr[uint64]](e4 & m)
+    e4_pa: uint64 = e4 & m
+    if e4_pa == 0 or (ram_top != 0 and e4_pa >= ram_top):
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[trap-diag]   pdpt phys %p unmapped, walk skipped\n",
+                e4_pa)
+        return
+    pdpt: Ptr[uint64] = cast[Ptr[uint64]](e4_pa)
     e3: uint64 = pdpt[i3]
     printk_set_level(PRINTK_LEVEL_EMERG)
     printk2("[trap-diag]   pdpte[%d]=%p\n", i3, e3)
     if (e3 & 0x1) == 0 or (e3 & 0x80) != 0:
         return
-    pd: Ptr[uint64] = cast[Ptr[uint64]](e3 & m)
+    e3_pa: uint64 = e3 & m
+    if e3_pa == 0 or (ram_top != 0 and e3_pa >= ram_top):
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[trap-diag]   pd phys %p unmapped, walk skipped\n",
+                e3_pa)
+        return
+    pd: Ptr[uint64] = cast[Ptr[uint64]](e3_pa)
     e2: uint64 = pd[i2]
     printk_set_level(PRINTK_LEVEL_EMERG)
     printk2("[trap-diag]   pde[%d]=%p\n", i2, e2)
     if (e2 & 0x1) == 0 or (e2 & 0x80) != 0:
         return
-    pt: Ptr[uint64] = cast[Ptr[uint64]](e2 & m)
+    e2_pa: uint64 = e2 & m
+    if e2_pa == 0 or (ram_top != 0 and e2_pa >= ram_top):
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[trap-diag]   pt phys %p unmapped, walk skipped\n",
+                e2_pa)
+        return
+    pt: Ptr[uint64] = cast[Ptr[uint64]](e2_pa)
     e1: uint64 = pt[i1]
     printk_set_level(PRINTK_LEVEL_EMERG)
     printk2("[trap-diag]   pte[%d]=%p\n", i1, e1)
@@ -347,9 +384,29 @@ def do_page_fault(error_code: uint64, fault_va: uint64,
         return cast[int64](0)
 
     if (error_code & PF_ERR_W) == 0:
-        # Read fault on a PRESENT page — protection fault (e.g. write
-        # attempted on a PROT_READ page via mprotect). Not COW, not
-        # demand-page. Let the diagnostic halt fire.
+        # Read fault on a PRESENT page — a protection violation on a read
+        # (e.g. a CPL=3 read of a supervisor-only / kernel-half page via a
+        # garbage user pointer; the `ls | grep echo` repro: a corrupted
+        # user pointer reading cr2≈-8, a kernel address). Not COW, not
+        # demand-page, not recoverable by the MM path.
+        #
+        # If the fault came from USER mode (U=1) this is a genuine user
+        # segfault: deliver SIGSEGV to the FAULTING TASK (coredump + reap)
+        # and keep the kernel scheduling other tasks — a userland process
+        # touching a bad pointer must NEVER halt the whole OS. Previously
+        # this branch returned 0 unconditionally and a normal user read
+        # fault fell into the trap-diag print-and-halt, taking the box down.
+        if (error_code & PF_ERR_U) != 0:
+            printk_set_level(PRINTK_LEVEL_EMERG)
+            printk1("[pf] user read-prot fault va=%p -> SIGSEGV\n",
+                    fault_va)
+            rd_rc: int32 = deliver_fault_sigsegv(iret_frame)
+            if rd_rc == 1:
+                return cast[int64](1)
+            return cast[int64](0)
+        # U=0: a SUPERVISOR read protection fault. A genuine kernel bug
+        # (reading a not-present-via-protection kernel mapping) — let the
+        # diagnostic halt fire.
         return cast[int64](0)
 
     # P=1, W=1: potential COW write fault.
