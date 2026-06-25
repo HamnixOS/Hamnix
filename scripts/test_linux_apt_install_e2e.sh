@@ -106,76 +106,31 @@ linux = ns clean {
 echo TEST_RC_DONE_DEFINING_NS
 EOF
 
-# SINGLE in-guest driver script — runs ENTIRELY inside the guest's dash
-# so the whole dpkg/apt pipeline executes from ONE short typed hamsh
-# line (`enter linux { /usr/bin/dash /drive_all.sh }`). This is
-# deliberate: hamsh's line editor echoes one character per idle/readline
-# tick, so a long `enter linux { ... }` command line costs ~1 tick PER
-# CHARACTER. Typing the four separate multi-line install commands (each
-# ~50+ chars, plus apt's `Dir::Etc::` option syntax that hamsh would
-# also have to tokenize) blew past the QEMU wall-clock budget before the
-# install legs even ran. Collapsing all of it into one staged script
-# means the test types ~35 characters total to drive the whole install.
-#
-# apt is pointed at ONLY the local file:// list (sourceparts=/dev/null
-# drops the network sources.list so `update` can't hang on
-# deb.debian.org). set -x traces each command so the captured serial
-# shows exactly which leg ran.
-APT_WRAP=$(mktemp /tmp/drive_all.XXXXXX.sh)
-cat > "$APT_WRAP" <<'AEOF'
-#!/bin/sh
-set -x
-APTOPTS="-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/local.list -o Dir::Etc::sourceparts=/dev/null -o Acquire::AllowInsecureRepositories=true -o APT::Get::AllowUnauthenticated=true"
-
-# Sanity 1: real Debian dpkg still RUNS under the writable union overlay.
-echo HAMHELLO_VER_START
-/usr/bin/dpkg --version
-echo HAMHELLO_VER_END
-
-# Sanity 2: writable overlay is live (create + read back under a
-# normally read-only dir).
-echo HAMHELLO_OVERLAY_START
-echo OVL_OK > /usr/ovl_probe
-read L < /usr/ovl_probe
-echo "OVL_READBACK=$L"
-echo HAMHELLO_OVERLAY_END
-
-# Leg A: dpkg -i the pre-staged archive, then run the installed program.
-echo HAMHELLO_DPKG_INSTALL_START
-/usr/bin/dpkg --force-all -i /var/cache/apt/archives/hamhello_1.0_amd64.deb
-echo HAMHELLO_DPKG_INSTALL_END
-echo HAMHELLO_RUN_START
-/usr/bin/hamhello
-echo HAMHELLO_RUN_END
-
-# Leg B: the KEYSTONE — apt-get install from the local file:// repo.
-# Remove the dpkg-installed copy first so apt's own install is what
-# re-creates /usr/bin/hamhello (proves apt's whole pipeline: index
-# parse, file:// fetch via /usr/lib/apt/methods/file, dpkg unpack +
-# configure). If apt's CPU/arch table or apt.conf.d read were broken
-# this aborts with "Error reading the CPU table" before any fetch.
-echo HAMHELLO_APT_INSTALL_START
-/usr/bin/dpkg --force-all -r hamhello 2>/dev/null || true
-rm -f /usr/bin/hamhello
-/usr/bin/apt-get $APTOPTS update
-/usr/bin/apt-get $APTOPTS install -y --reinstall --allow-unauthenticated hamhello \
-  || /usr/bin/apt-get $APTOPTS install -y --allow-unauthenticated hamhello
-echo HAMHELLO_APT_RUN
-/usr/bin/hamhello
-echo APT_WRAPPER_DONE
-echo HAMHELLO_APT_INSTALL_END
-echo BANNER_DONE
-AEOF
+# The whole install pipeline is driven by SHORT, DIRECT
+# `enter linux { /usr/bin/<binary> ... }` lines (the proven exec path,
+# same as the dpkg-i keystone), NOT a `dash <script>` wrapper. Two
+# reasons:
+#   1. hamsh's line editor echoes ~1 char per readline tick, so typed
+#      command length is the wall-clock cost. apt's auth/insecure
+#      options are BAKED into the staged /etc/apt/apt.conf.d/00hamnix
+#      (see scripts/stage_host_dpkg_rootfs.sh), and the ONLY configured
+#      source is the local file:// list (no network sources.list is
+#      staged), so the driven apt commands are short:
+#         enter linux { /usr/bin/apt-get update }
+#         enter linux { /usr/bin/apt-get install -y hamhello }
+#      No `-o Dir::Etc:: ...` / `-o Acquire:: ...` flags to type.
+#   2. It does not depend on `dash <scriptfile>` working in the ns.
+# Nothing extra is embedded in the cpio here — the local repo + apt
+# config already live in the staged rootfs (built into the cpio).
 
 echo "[apt-e2e] (3/5) Build initramfs"
 HAMNIX_DEFAULT_REAL_DEBIAN=1 HAMNIX_HAMSH_RC="$RC_TMP" \
-    HAMNIX_EXTRA_CPIO_FILE="$APT_WRAP:/var/lib/distros/default/drive_all.sh" \
     INIT_ELF="$HAMSH_ELF" \
     python3 scripts/build_initramfs.py >/dev/null
 
 LOG=$(mktemp /tmp/test-apt-e2e.XXXXXX.log)
 cleanup() {
-    rm -f "$RC_TMP" "$APT_WRAP"
+    rm -f "$RC_TMP"
     INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py \
         >/dev/null
 }
@@ -198,24 +153,52 @@ set +e
     done
     sleep 2
 
-    # Drive the ENTIRE dpkg + apt-get install pipeline from ONE short
-    # typed hamsh line. hamsh's line editor echoes ~1 char per readline
-    # tick, so every typed character costs wall-clock; a handful of long
-    # `enter linux { ... }` lines (esp. apt's `Dir::Etc::` options) blew
-    # past the QEMU budget before the install ran. The staged
-    # /drive_all.sh runs all legs in-guest and prints every marker.
-    printf 'enter linux { /usr/bin/dash /drive_all.sh }\n'
-    # Generous settle: file:// fetch + dpkg unpack/configure + two
-    # apt-get invocations. The drive script ends by printing BANNER_DONE;
-    # we wait on that marker (bounded) rather than a blind fixed sleep.
-    waited=0
-    while [ "$waited" -lt 300 ]; do
-        if grep -aq "BANNER_DONE" "$LOG" 2>/dev/null; then break; fi
-        sleep 2
-        waited=$((waited + 2))
-    done
-    sleep 2
-    printf 'exit\n'; sleep 1
+    # Helper: type a command, then wait (bounded) for an expected marker
+    # in the captured serial before moving on — never a blind fixed
+    # sleep (hamsh echoes ~1 char/tick, so command timing varies). Each
+    # `enter linux { ... }` is a SHORT, DIRECT binary invocation.
+    drive() { printf '%s\n' "$1"; }
+    wait_for() {  # $1=marker  $2=max-seconds
+        local w=0
+        while [ "$w" -lt "$2" ]; do
+            grep -aq "$1" "$LOG" 2>/dev/null && return 0
+            sleep 2; w=$((w + 2))
+        done
+        return 1
+    }
+
+    # Sanity 1: real Debian dpkg still RUNS under the writable overlay.
+    drive 'echo HAMHELLO_VER_START'
+    drive 'enter linux { /usr/bin/dpkg --version }'
+    drive 'echo HAMHELLO_VER_END'; wait_for HAMHELLO_VER_END 60
+
+    # Leg A (dpkg -i keystone): install the pre-staged archive + run it.
+    drive 'echo HAMHELLO_DPKG_INSTALL_START'
+    drive 'enter linux { /usr/bin/dpkg --force-all -i /var/cache/apt/archives/hamhello_1.0_amd64.deb }'
+    drive 'echo HAMHELLO_DPKG_INSTALL_END'; wait_for HAMHELLO_DPKG_INSTALL_END 90
+    drive 'echo HAMHELLO_RUN_START'
+    drive 'enter linux { /usr/bin/hamhello }'
+    drive 'echo HAMHELLO_RUN_END'; wait_for HAMHELLO_RUN_END 30
+
+    # Leg B (KEYSTONE — apt-get install from the local file:// repo).
+    # First remove the dpkg-installed copy so apt's OWN pipeline (index
+    # parse -> file:// fetch via /usr/lib/apt/methods/file -> dpkg unpack
+    # + configure) is what re-creates /usr/bin/hamhello. apt's auth opts
+    # + the sole local source are baked into the staged rootfs, so these
+    # commands need NO `-o` flags. If apt's CPU/arch table or apt.conf.d
+    # read were broken, apt-get aborts with "Error reading the CPU
+    # table" before any fetch.
+    drive 'echo HAMHELLO_APT_INSTALL_START'
+    drive 'enter linux { /usr/bin/dpkg --force-all -P hamhello }'; sleep 8
+    drive 'enter linux { /usr/bin/apt-get update }'; wait_for "Reading package lists" 60
+    drive 'enter linux { /usr/bin/apt-get install -y hamhello }'
+    drive 'echo APT_WRAPPER_DONE'; wait_for APT_WRAPPER_DONE 180
+    drive 'echo HAMHELLO_APT_RUN'
+    drive 'enter linux { /usr/bin/hamhello }'
+    drive 'echo HAMHELLO_APT_INSTALL_END'; wait_for HAMHELLO_APT_INSTALL_END 40
+
+    drive 'echo BANNER_DONE'; wait_for BANNER_DONE 20
+    drive 'exit'; sleep 1
 ) | timeout 1200s qemu-system-x86_64 \
     -enable-kvm -cpu host \
     -kernel "$ELF" \

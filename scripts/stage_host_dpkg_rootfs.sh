@@ -136,6 +136,13 @@ fi
 cat > "$ROOTFS/etc/apt/apt.conf.d/00hamnix" <<'EOF'
 APT::Architecture "amd64";
 APT::Architectures "amd64";
+// Offline local repo: it is [trusted=yes] but has no signature, so let
+// apt-get install/update proceed unauthenticated WITHOUT needing the
+// long `-o Acquire::AllowInsecureRepositories=true ...` flags on the
+// command line (keeps the driven `enter linux { apt-get install ... }`
+// line SHORT — hamsh's line editor echoes ~1 char per readline tick).
+Acquire::AllowInsecureRepositories "true";
+APT::Get::AllowUnauthenticated "true";
 EOF
 
 # os markers
