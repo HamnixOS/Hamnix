@@ -64,12 +64,41 @@ echo "[test_interactive_forkexec] (2/5) Build userland (hamsh + helpers)"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
 
+# Plant an /etc/hamsh.rc that defines a CLEAN `linux`-shape namespace,
+# exactly like test_linux_apt_install_e2e.sh: bind the cpio root (#r/)
+# as the read base + a writable tmpfs overlay (#t) on top, plus the
+# device/proc servers. This makes the repro run the fixture INSIDE an
+# `enter linux { ... }` rfork'd namespace child — the real `enter linux
+# {sh}` path — rather than directly under hamsh's native root. The
+# grandchild fork (the fixture forking a child per command) then happens
+# from a task that is itself an rfork'd+execve'd namespace child, which
+# is the configuration the user's crash reproduces in.
+RC_TMP=$(mktemp /tmp/hamsh-rc-itfe.XXXXXX.rc)
+cat > "$RC_TMP" <<'EOF'
+echo TEST_RC_START
+linux = ns clean {
+    bind '#r/' /
+    bind -bc '#t' /
+    bind '#c' /dev
+    bind '#p' /proc
+    bind '#s' /srv
+    bind '#t/tmp' /tmp
+}
+echo TEST_RC_DONE_DEFINING_NS
+EOF
+
 echo "[test_interactive_forkexec] (3/5) Embed ld.so + libc + fixtures in initramfs"
-HAMNIX_EMBED_UBIN=1 INIT_ELF="$HAMSH_ELF" \
+HAMNIX_EMBED_UBIN=1 HAMNIX_HAMSH_RC="$RC_TMP" INIT_ELF="$HAMSH_ELF" \
     python3 scripts/build_initramfs.py >/dev/null
 
 LDSO_REAL=$(readlink -f "$LDSO")
 LIBC_REAL=$(readlink -f "$LIBC")
+# The splice below re-runs build_archive(), which must see the SAME
+# HAMNIX_HAMSH_RC / embed env so the re-emitted cpio still carries the
+# /etc/hamsh.rc namespace recipe and the embedded ubins.
+export HAMNIX_EMBED_UBIN=1
+export HAMNIX_HAMSH_RC="$RC_TMP"
+export INIT_ELF="$HAMSH_ELF"
 python3 - "$LDSO_REAL" "$LIBC_REAL" <<'PYEOF'
 import sys
 import importlib.util
@@ -113,7 +142,7 @@ python3 -m compiler.adder compile \
 
 echo "[test_interactive_forkexec] (5/5) Boot QEMU (KVM) + drive u_interactive_forkexec"
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+trap 'rm -f "$LOG" "$RC_TMP"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 # Boot under KVM, mirroring the user's repro environment.
 export QEMU_EXTRA_ARGS="-enable-kvm -cpu host"
@@ -124,8 +153,12 @@ set +e
 # pauses between so each blocking fgets read completes BEFORE the next
 # line — exactly the interactive `enter linux {sh}` typing cadence. The
 # fixture's child inherits DEVFD_CONS as stdin, so these lines reach it.
+# Launch the fixture INSIDE the clean `linux` namespace via `enter`,
+# then feed command lines over serial. This is the `enter linux {sh}`
+# shape: a long-lived dynamic binary in an rfork'd+namespace'd task,
+# reading the console and fork+exec'ing a child per command.
 qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 60 \
-    -- "u_interactive_forkexec" 4 \
+    -- "enter linux { /bin/u_interactive_forkexec }" 4 \
        "ls" 4 \
        "echo" 4 \
        "cat" 4 \
