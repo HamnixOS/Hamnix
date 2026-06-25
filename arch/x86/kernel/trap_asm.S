@@ -171,6 +171,10 @@ trap_diag_stub_0e:
      * user PML4; a kernel-mode fault arrives with CR3 already kernel
      * (harmless reload). The 15 pushes above are on the kernel stack
      * (PML4[0], mapped in both). %rax/%rcx are saved, use as scratch. */
+    leaq    kpti_enabled(%rip), %rax   /* KPTI master switch (skip when OFF */
+    movq    (%rax), %rax               /* — CR4.PGE=0, reload = TLB flush) */
+    testq   %rax, %rax
+    jz      8f
     movq    %gs:0, %rax
     leaq    kpti_kernel_cr3_slots(%rip), %rcx
     movq    (%rcx, %rax, 8), %rax
@@ -227,6 +231,10 @@ trap_diag_stub_0e:
      * frame are mapped in the user table, so the pops resolve post-swap;
      * the iretq fetch is from .kpti.text. A kernel-mode COW fault returns
      * to CPL0 and keeps the kernel table. %rax/%rcx restored by pops. */
+    leaq    kpti_enabled(%rip), %rax   /* KPTI master switch (skip when OFF) */
+    movq    (%rax), %rax
+    testq   %rax, %rax
+    jz      2f
     movq    136(%rsp), %rax            /* saved CS */
     andq    $3, %rax
     cmpq    $3, %rax
@@ -316,6 +324,10 @@ common_trap_diag:
      * + iret frame we snapshot below are on the kernel stack (PML4[0],
      * mapped in both). %rax/%rcx are free here (snapshot uses r12..r15 +
      * rbx/rbp). */
+    leaq    kpti_enabled(%rip), %rax   /* KPTI master switch (skip when OFF) */
+    movq    (%rax), %rax
+    testq   %rax, %rax
+    jz      9f
     movq    %gs:0, %rax
     leaq    kpti_kernel_cr3_slots(%rip), %rcx
     movq    (%rcx, %rax, 8), %rax

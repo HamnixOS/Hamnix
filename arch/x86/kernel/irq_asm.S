@@ -161,6 +161,10 @@ common_irq:
      * landed on the kernel stack (TSS.RSP0, PML4[0]) when coming from
      * CPL3, so they were safe pre-swap. %rax/%rcx are saved, use as
      * scratch. cpu_id @ %gs:0. */
+    leaq  kpti_enabled(%rip), %rax    /* KPTI master switch: CR4.PGE=0, so */
+    movq  (%rax), %rax                /* an unconditional reload would TLB- */
+    testq %rax, %rax                  /* flush every IRQ. Skip when OFF.    */
+    jz    9f
     movq  %gs:0, %rax
     leaq  kpti_kernel_cr3_slots(%rip), %rcx
     movq  (%rcx, %rax, 8), %rax
@@ -196,6 +200,10 @@ common_irq:
      * fetch is from .kpti.text. If returning to CPL0 (nested kernel IRQ),
      * leave the kernel table loaded. %rax/%rcx are restored by the pops
      * below, so clobbering them here is fine. */
+    leaq  kpti_enabled(%rip), %rax    /* KPTI master switch (skip when OFF) */
+    movq  (%rax), %rax
+    testq %rax, %rax
+    jz    1f
     movq  96(%rsp), %rax              /* saved CS */
     andq  $3, %rax
     cmpq  $3, %rax

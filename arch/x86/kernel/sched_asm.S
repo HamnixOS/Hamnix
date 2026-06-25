@@ -253,10 +253,15 @@ sysret_bootstrap:
      * mapped in both). %rcx/%r11/%rdi/%rsi/%rsp carry the user state; use
      * %r8/%r10 as scratch (dead here). When KPTI is disabled the slot
      * holds the full cr3, so this is a no-op reload. */
+    leaq    kpti_enabled(%rip), %r8    /* KPTI master switch (skip when OFF) */
+    movq    (%r8), %r8
+    testq   %r8, %r8
+    jz      4f
     movq    %gs:0, %r8
     leaq    kpti_user_cr3_slots(%rip), %r10
     movq    (%r10, %r8, 8), %r8
     movq    %r8, %cr3
+4:
 
     /* SYSRETQ in 64-bit mode:
      *   CS = (STAR[63:48] + 0x10) | 3      = 0x23

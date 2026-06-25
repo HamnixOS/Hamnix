@@ -64,8 +64,38 @@ kpti_scratch_slots:
 kpti_idt_table:
     .skip 4096
 
+/* ---------- kpti_enabled: runtime master switch ------------------- *
+ * Lives in .kpti.data (NOT .kpti.bss) so it is mapped in BOTH the kernel
+ * and every user PML4 AND carries a defined initial value of 0 (KPTI
+ * OFF) from the image — the entry/exit trampolines read it under the
+ * USER CR3, so it MUST be in the .kpti window. kpti_init() sets it to 1
+ * only when KPTI_RUNTIME_ENABLE==1.
+ *
+ * WHY a runtime gate and not just "load the same CR3": Hamnix runs with
+ * CR4.PGE=0 (no global pages) and no PCID, so EVERY `mov X,%cr3` is a
+ * FULL TLB flush even when X equals the current CR3. With KPTI staged
+ * OFF, an unconditional reload on every syscall/IRQ entry+exit flushes
+ * the TLB 2-4x per kernel transition and crawls the boot (the heartbeat
+ * never reaches steady idle). Gating on this flag makes the OFF path a
+ * single predicted-not-taken branch — zero TLB cost, baseline speed. */
+    .section .kpti.data, "aw"
+    .align 8
+    .globl kpti_enabled
+kpti_enabled:
+    .quad 0
+
     .section .text, "ax"
     .code64
+
+/* ---------- kpti_set_enabled(v) ----------------------------------- *
+ * Adder-side setter (kpti_init writes 1 when KPTI_RUNTIME_ENABLE==1).
+ * SysV: %rdi = value. Runs with the kernel CR3, so plain .text is fine. */
+    .align 16
+    .globl kpti_set_enabled
+kpti_set_enabled:
+    leaq    kpti_enabled(%rip), %rax
+    movq    %rdi, (%rax)
+    ret
 
 /* ---------- kpti_idt_table_addr() -> uint64 ----------------------- *
  * Return the high-half VMA of the .kpti-resident IDT buffer so idt.ad

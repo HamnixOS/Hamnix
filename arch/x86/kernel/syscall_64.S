@@ -50,11 +50,20 @@ syscall_entry:
     stac
     pushq   %rax                      /* save user nr (restored below)   */
     pushq   %rcx                      /* save user RIP (restored below)  */
+    /* KPTI master switch. CR4.PGE=0 means EVERY mov-to-cr3 is a full TLB
+     * flush even reloading the same value, so when KPTI is staged OFF we
+     * must SKIP the reload entirely (a single predicted branch), not load
+     * an identical table. kpti_enabled is in .kpti.data (mapped under the
+     * user CR3). */
+    leaq    kpti_enabled(%rip), %rax
+    movq    (%rax), %rax
+    testq   %rax, %rax
+    jz      8f
     movq    %gs:0, %rax               /* cpu_id (pinned per-CPU offset 0) */
     leaq    kpti_kernel_cr3_slots(%rip), %rcx
     movq    (%rcx, %rax, 8), %rax     /* kernel CR3 for this CPU's task   */
     movq    %rax, %cr3
-    popq    %rcx                      /* restore user RIP                */
+8:  popq    %rcx                      /* restore user RIP                */
     popq    %rax                      /* restore user nr                 */
     clac
     /* On entry from SYSCALL:
@@ -243,10 +252,15 @@ syscall_entry:
      * instructions are in .kpti.text, so the pops + sysretq fetch cleanly
      * under the user table. When KPTI is disabled this slot holds the
      * full cr3, so the load is a no-op reload. */
+    leaq    kpti_enabled(%rip), %r12
+    movq    (%r12), %r12
+    testq   %r12, %r12
+    jz      7f
     movq    %gs:0, %r12               /* cpu_id (pinned per-CPU offset 0) */
     leaq    kpti_user_cr3_slots(%rip), %r13
     movq    (%r13, %r12, 8), %r12     /* user CR3 for this CPU's task     */
     movq    %r12, %cr3
+7:
 
     /* SMAP v3b: the next two popq's read from the user stack at CPL=0,
      * so we re-arm AC just for that window. SYSRETQ then reloads RFLAGS
@@ -381,11 +395,15 @@ do_execve_finish:
      * Adder execve path updates kpti_user_cr3_slots[cpu] to this task's
      * (possibly just-rebuilt) user_cr3 before tail-calling here. r8/r9 are
      * dead at this point. */
+    leaq    kpti_enabled(%rip), %r8
+    movq    (%r8), %r8
+    testq   %r8, %r8
+    jz      6f
     movq    %gs:0, %r8
     leaq    kpti_user_cr3_slots(%rip), %r9
     movq    (%r9, %r8, 8), %r8
     movq    %r8, %cr3
-    sysretq
+6:  sysretq
 
 /* ---------- enter_user_mode(entry, stack) ------------------------ *
  * Build an iretq frame on the kernel stack with CPL=3 selectors and
@@ -416,11 +434,15 @@ enter_user_mode:
      * already built on the kernel stack (PML4[0], mapped in both); after
      * the swap the iretq fetch is still kernel-CR3 (current insn) and the
      * landing pad is user. r8/r9 are dead here. */
+    leaq    kpti_enabled(%rip), %r8
+    movq    (%r8), %r8
+    testq   %r8, %r8
+    jz      5f
     movq    %gs:0, %r8
     leaq    kpti_user_cr3_slots(%rip), %r9
     movq    (%r9, %r8, 8), %r8
     movq    %r8, %cr3
-    iretq
+5:  iretq
 
     /* Back to plain .text: the user-mode demo payloads below are copied
      * into US=1 user pages and executed there (position-independent), so
