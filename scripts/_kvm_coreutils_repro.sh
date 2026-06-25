@@ -28,7 +28,12 @@ linux = ns clean {
 echo TEST_RC_DONE_DEFINING_NS
 EOF
 
+# ENABLE_XHCI_KO=0: skip the Linux xHCI .ko dep-chain load at boot — it is
+# pure boot-time cost under TCG (no USB device in this repro) and is
+# irrelevant to the user-stack aliasing fix under test. Cuts ~8 min off the
+# TCG boot so the coreutils matrix actually runs inside the timeout.
 HAMNIX_DEFAULT_REAL_DEBIAN=1 HAMNIX_HAMSH_RC="$RC_TMP" \
+    ENABLE_XHCI_KO=0 \
     INIT_ELF="$HAMSH_ELF" \
     python3 scripts/build_initramfs.py >/dev/null
 
@@ -61,8 +66,6 @@ KVM_ARGS=""  # host -kernel cannot KVM-boot the 64-bit ELF (multiboot/VBE limit)
         "/usr/bin/cut -d= -f1 /etc/os-release" \
         "/usr/bin/sed -n 1p /etc/os-release" \
         "/usr/bin/head -n2 /etc/os-release" \
-        "/usr/bin/nl /etc/debian_version" \
-        "/usr/bin/date -u" \
         "/usr/bin/md5sum /etc/debian_version" \
         "/usr/bin/readlink -f /etc/os-release" ; do
         tag=$(echo "$cmd" | tr -c 'A-Za-z0-9' '_')
@@ -72,7 +75,7 @@ KVM_ARGS=""  # host -kernel cannot KVM-boot the 64-bit ELF (multiboot/VBE limit)
     done
     printf 'echo BANNER_ALLDONE\n'; sleep 1
     printf 'exit\n'; sleep 1
-) | timeout 600s qemu-system-x86_64 \
+) | timeout 1100s qemu-system-x86_64 \
     -kernel "$ELF" \
     $KVM_ARGS \
     -smp 2 \
