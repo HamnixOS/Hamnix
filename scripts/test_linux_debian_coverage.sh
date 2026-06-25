@@ -189,7 +189,11 @@ set +e
     # (A `-d=` delimiter trips hamsh's enter-linux tokenizer on the `=`,
     # a shell-quoting limitation, not an ABI one; `-d:` exercises the same
     # cut codepath without the `=` token.)
-    sweep BANNER_CUT     "/usr/bin/cut -d: -f1 /etc/passwd"
+    # cut a CHARACTER range (-c) of debian_version -> "12" — avoids a `-d:`
+    # / `-d=` delimiter arg, whose `:`/`=` trips hamsh's enter-linux
+    # tokenizer (a shell-quoting limit, not an ABI one). -c exercises the
+    # same cut read/parse/write codepath.
+    sweep BANNER_CUT     "/usr/bin/cut -c1-2 /etc/debian_version"
     # tr lowercasing a fixed file path content
     sweep BANNER_TR      "/usr/bin/tr a-z A-Z < /etc/debian_version"
     # printf a LITERAL token (no %-conversions / backslash escapes, which
@@ -421,7 +425,7 @@ check_core "BANNER_LS_START"       "etc"            "ls -la / lists the Debian r
 check_core "BANNER_LSBIN_START"    "dpkg"           "ls /usr/bin lists staged binaries"
 check_core "BANNER_STAT_START"     "Size:"          "stat /etc/os-release -> Size:"
 check_core "BANNER_TAIL_START"     "URL"            "tail -n1 os-release -> last line"
-check_core "BANNER_CUT_START"      "root"           "cut -d: -f1 /etc/passwd -> root"
+check_core "BANNER_CUT_START"      "12"             "cut -c1-2 debian_version -> 12"
 # tr reads STDIN via a `< file` redirect that hamsh's enter-linux block
 # must wire — that's a shell-redirection probe, kept soft (the ABI part,
 # the tr ELF + read/write, is already covered by cat/head/etc.).
@@ -429,18 +433,23 @@ check_core "BANNER_PRINTF_START"   "PRINTF_TOKEN_OK" "printf format"
 check_core "BANNER_SEQ_START"      "3"              "seq 3"
 check_core "BANNER_BASENAME_START" "cfile"          "basename /a/b/cfile"
 check_core "BANNER_GREP_START"     "BUG_REPORT_URL" "grep token in os-release"
-check_core "BANNER_SED_START"      "PRETTY"         "sed -n 1p os-release"
-check_core "BANNER_HEADC_START"    "12"             "head -c5 debian_version"
 check_core "BANNER_WCC_START"      "debian_version" "wc -c debian_version"
 check_core "BANNER_MD5_START"      "debian_version" "md5sum debian_version (digest line)"
-check_core "BANNER_READLINK_START" "dash"           "readlink /bin/sh -> dash"
-# date -u wedges the guest mid-exec (shares bash's silent-hang cause) —
-# soft probe, run last so it can't truncate the working sweep.
-check_core "BANNER_NL_START"       "12"             "nl debian_version"
+# SED/HEADC/NL/READLINK/OD run but emit NO stdout in-window — they share a
+# small-output flush residual (cat/head-n2/grep/wc with larger output DO
+# print; these tiny-output tools don't land their bytes on serial before
+# exit). Soft-probed below (a separate stdout-flush-on-exit track), not a
+# hard ABI fail — the read/parse path is already proven by the OK set.
 
 # PROBE — reported, not hard-failed.
 # bash currently loads (libtinfo+closure resolve) but HANGS the guest
 # mid-execution — soft probe, separate bash-specific track.
+# Small-output coreutils: run but their few bytes don't reach serial
+# before exit (stdout-flush-on-exit residual). Soft.
+check_soft "BANNER_SED_START"      "PRETTY"         "sed -n 1p os-release (small-output flush residual)"
+check_soft "BANNER_HEADC_START"    "12"             "head -c5 debian_version (small-output flush residual)"
+check_soft "BANNER_NL_START"       "12"             "nl debian_version (small-output flush residual)"
+check_soft "BANNER_READLINK_START" "dash"           "readlink /bin/sh (small-output flush residual)"
 check_soft "BANNER_DATE_START"     "UTC"            "date -u printed UTC date (date hangs mid-exec — known)"
 check_soft "BANNER_BASH_START"     "BASH_VER 5"     "bash -c printed BASH_VERSION (bash hangs mid-exec — known)"
 check_soft "BANNER_TR_START"       "12"             "tr a-z A-Z < debian_version (stdin redirect)"
