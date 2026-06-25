@@ -182,8 +182,11 @@ set +e
     sweep BANNER_STAT    "/usr/bin/stat /etc/os-release"
     # tail -n1 -> last line of os-release
     sweep BANNER_TAIL    "/usr/bin/tail -n1 /etc/os-release"
-    # cut a field -> ID=debian -> "debian"
-    sweep BANNER_CUT     "/usr/bin/cut -d= -f2 /etc/os-release"
+    # cut field 1 of a colon-delimited line -> "root" from /etc/passwd.
+    # (A `-d=` delimiter trips hamsh's enter-linux tokenizer on the `=`,
+    # a shell-quoting limitation, not an ABI one; `-d:` exercises the same
+    # cut codepath without the `=` token.)
+    sweep BANNER_CUT     "/usr/bin/cut -d: -f1 /etc/passwd"
     # tr lowercasing a fixed file path content
     sweep BANNER_TR      "/usr/bin/tr a-z A-Z < /etc/debian_version"
     # printf a LITERAL token (no %-conversions / backslash escapes, which
@@ -211,8 +214,12 @@ set +e
     sweep BANNER_READLINK "/usr/bin/readlink /bin/sh"
     # find a staged dir, depth-limited (getdents + recursion)
     SWEEP_SLEEP=8 sweep BANNER_FIND "/usr/bin/find /etc/apt -maxdepth 2"
-    # date in a fixed-format (no args reads RTC; -u +%Y is deterministic-ish)
-    sweep BANNER_DATE    "/usr/bin/date -u +DATE_OK_%Y"
+    # date -u with NO format string (a `+%Y` arg would be re-interpreted
+    # by hamsh's enter-linux tokenizer — shell quoting, not ABI). Plain
+    # `date -u` prints the full UTC date line, which contains "UTC" and a
+    # 4-digit year — proves the date ELF runs + reads the clock via the
+    # shim (clock_gettime / gettimeofday).
+    sweep BANNER_DATE    "/usr/bin/date -u"
     # nl numbers lines
     sweep BANNER_NL      "/usr/bin/nl /etc/debian_version"
     # od hex dump first bytes
@@ -278,7 +285,12 @@ set +e
 
     printf 'echo BANNER_DONE\n'; sleep 1
     printf 'exit\n'; sleep 1
-) | timeout 1200s qemu-system-x86_64 \
+# hamsh's `exit` on the init shell does NOT power off the machine, so
+# QEMU would otherwise idle until the outer timeout. Under KVM the whole
+# boot + scripted drive completes well inside 600s; cap the timeout there
+# so the post-BANNER_DONE idle (no useful output) doesn't burn ~10 extra
+# minutes. The `timeout -k` SIGKILL backstop fires 10s after the TERM.
+) | timeout -k 10s 600s qemu-system-x86_64 \
     -kernel "$ELF" \
     $KVM_ARGS \
     -smp 2 \
@@ -298,11 +310,21 @@ fail=0
 
 # Banner-window assertion: <value> must appear within 40 lines AFTER
 # <banner> and BEFORE the next banner.
+# Lines that are NOT genuine guest-command stdout and must be excluded
+# from the value match so an assertion can't pass on echoed input or a
+# kernel printk:
+#   - kernel printk:        starts with a "[NNNNNN]" tick timestamp
+#                           (e.g. "[001463] elf: Linux-ABI binary detected")
+#   - hamsh line-editor:    contains "hamsh$" (the per-keystroke echo of
+#                           the command being typed, incl. "enter linux")
+#   - atkbd diag noise
+_is_noise='($0 ~ /^\[[0-9]+\]/) || (index($0,"hamsh$")>0) || (index($0,"[atkbd-diag]")>0)'
+
 check_banner_value() {
     local banner="$1" value="$2" label="$3"
     if awk -v b="$banner" -v v="$value" '
         BEGIN { armed=0; win=0; found=0 }
-        index($0, "[atkbd-diag]") > 0 { next }
+        ('"$_is_noise"') { next }
         index($0, b) > 0 { armed=1; win=0; next }
         armed { win++ ; if (index($0, v) > 0) { found=1; exit }
                 if (win > 40) armed=0 }
@@ -349,7 +371,7 @@ declare -a SOFT_RESIDUAL=()
 check_core() {  # banner value label
     if awk -v b="$1" -v v="$2" '
         BEGIN{armed=0;win=0;found=0}
-        index($0,"[atkbd-diag]")>0{next}
+        ('"$_is_noise"'){next}
         index($0,b)>0{armed=1;win=0;next}
         armed{win++; if(index($0,v)>0){found=1;exit} if(win>40)armed=0}
         END{exit found?0:1}' "$LOG"; then
@@ -363,7 +385,7 @@ check_core() {  # banner value label
 check_soft() {  # banner value label
     if awk -v b="$1" -v v="$2" '
         BEGIN{armed=0;win=0;found=0}
-        index($0,"[atkbd-diag]")>0{next}
+        ('"$_is_noise"'){next}
         index($0,b)>0{armed=1;win=0;next}
         armed{win++; if(index($0,v)>0){found=1;exit} if(win>40)armed=0}
         END{exit found?0:1}' "$LOG"; then
@@ -383,7 +405,7 @@ check_core "BANNER_LS_START"       "etc"            "ls -la / lists the Debian r
 check_core "BANNER_LSBIN_START"    "dpkg"           "ls /usr/bin lists staged binaries"
 check_core "BANNER_STAT_START"     "Size:"          "stat /etc/os-release -> Size:"
 check_core "BANNER_TAIL_START"     "URL"            "tail -n1 os-release -> last line"
-check_core "BANNER_CUT_START"      "debian"         "cut -d= -f2 -> debian"
+check_core "BANNER_CUT_START"      "root"           "cut -d: -f1 /etc/passwd -> root"
 # tr reads STDIN via a `< file` redirect that hamsh's enter-linux block
 # must wire — that's a shell-redirection probe, kept soft (the ABI part,
 # the tr ELF + read/write, is already covered by cat/head/etc.).
@@ -396,7 +418,7 @@ check_core "BANNER_HEADC_START"    "12"             "head -c5 debian_version"
 check_core "BANNER_WCC_START"      "debian_version" "wc -c debian_version"
 check_core "BANNER_MD5_START"      "debian_version" "md5sum debian_version (digest line)"
 check_core "BANNER_READLINK_START" "dash"           "readlink /bin/sh -> dash"
-check_core "BANNER_DATE_START"     "DATE_OK_20"     "date -u +DATE_OK_%Y"
+check_core "BANNER_DATE_START"     "UTC"            "date -u (prints UTC date line)"
 check_core "BANNER_NL_START"       "12"             "nl debian_version"
 
 # PROBE — reported, not hard-failed.
