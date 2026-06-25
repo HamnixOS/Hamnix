@@ -124,8 +124,13 @@ set +e
 # enter the clean linux ns running real dash interactively, then type
 # commands that fork+exec a child — exactly the user's `enter linux {sh}`
 # then `ls` repro. Each /bin/u_dynamic_hello prints "U42 dynamic hello".
-qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 70 \
-    -- "enter linux { /bin/dash }" 5 \
+# Overall timeout 130s bounds the WHOLE QEMU run (boot + drive). Boot to
+# the hamsh ready marker can take ~40-60s under load + the GRUB-ISO shim;
+# the inter-command waits below sum to ~30s, so 70s was too tight and the
+# run was killed mid-drive before dash even started. 130s gives boot +
+# drive comfortable headroom.
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 130 \
+    -- "enter linux { /bin/dash }" 6 \
        "/bin/u_dynamic_hello" 5 \
        "/bin/u_dynamic_hello" 5 \
        "/bin/u_dynamic_hello" 5 \
