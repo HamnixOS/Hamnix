@@ -172,7 +172,7 @@ qemu_drive() {
         -smp 2 \
         -nographic \
         -no-reboot \
-        -m 1G \
+        -m "${HAMNIX_VM_MEM:-2G}" \
         -monitor none \
         -serial stdio \
         ${QEMU_EXTRA_ARGS:-} \

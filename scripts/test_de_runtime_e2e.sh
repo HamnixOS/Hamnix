@@ -178,7 +178,7 @@ type_cmd() {
 QEMU_ARGS=(
     -enable-kvm -cpu host
     -bios "$OVMF_RW"
-    -smp 2 -m 1G
+    -smp 2 -m "${HAMNIX_VM_MEM:-2G}"
     -vga std -display none -no-reboot
     -monitor "unix:$MON,server,nowait"
     -serial stdio

@@ -159,7 +159,7 @@ qemu-system-x86_64 \
     -enable-kvm -cpu host \
     -bios "$OVMF_RW" \
     -drive file="$IMG_RW",format=raw,if=virtio \
-    -m 1G \
+    -m "${HAMNIX_VM_MEM:-2G}" \
     "${VGA_ARGS[@]}" -display none -no-reboot \
     -monitor "unix:$MON,server,nowait" \
     -serial stdio \
