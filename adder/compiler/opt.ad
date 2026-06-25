@@ -187,6 +187,17 @@ def opt_run(prog: uint32):
     while cur != 0:
         opt_walk(cur)
         cur = nd_next[cur]
+    # Phase 7 — CROSS-STATEMENT CSE over each function body (extended basic
+    # block). Runs on the const-FOLDED graph and BEFORE the per-statement CSE and
+    # LICM, so a subexpression repeated across adjacent statements is shared into
+    # one temp first; the per-statement CSE then handles intra-statement repeats
+    # the cross-statement pass leaves, and LICM sees the shared temps as ordinary
+    # in-loop candidates.
+    cur = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            opt_xcse_function(cur)
+        cur = nd_next[cur]
     # Phase 2 — local CSE over each function body (runs on the const-FOLDED
     # graph: opt_walk above already collapsed constant subtrees, so CSE numbers
     # the simplified expressions). Re-walk the decls and CSE every function.
@@ -967,3 +978,405 @@ def licm_block(head: uint32) -> uint32:
 def opt_licm_function(fn: uint32):
     # The function body chain hangs off nd_c (ND_FUNCTION: c = body chain head).
     nd_c[fn] = licm_block(nd_c[fn])
+
+
+# =======================================================================
+# Phase 7 — CROSS-STATEMENT CSE over an extended (straight-line) basic block.
+# =======================================================================
+#
+# WHY THIS IS THE REAL WIN
+# ------------------------
+# Phase-2 CSE (cse_statement_expr) eliminates a redundant pure subexpression
+# only WITHIN a single statement's expression tree. A subexpression computed in
+# statement S1 and recomputed verbatim in S2 (with no intervening write to its
+# leaves) is MISSED — the most common redundancy in real straight-line code
+# (`x = a*b+c ; y = a*b+c + d`). Phase 7 closes that: it value-numbers pure
+# subexpressions across a MAXIMAL straight-line run of statements and rewrites a
+# later recomputation to read a temp materialized at the FIRST occurrence.
+#
+# SOUNDNESS — extended-basic-block local CSE, conservative
+# --------------------------------------------------------
+# Two occurrences of a pure value V (lowered by ir_lower_pure_expr -> the
+# signedness-INVARIANT 64-bit op set over ident/const leaves; NO loads, calls,
+# div/mod, compares — those never lower, so they are never candidates) compute
+# the SAME bits IFF no leaf of V is written between them. We process statements
+# in source order, maintaining an AVAILABLE-EXPRESSIONS set:
+#   * a statement's r-value subexpressions are matched against the available set
+#     FIRST (so a match shares the earlier statement's temp), THEN this
+#     statement's own new pure subexpressions are added to the available set;
+#   * AFTER a statement, its WRITES kill availability — every available
+#     expression whose IR tree uses a written name is removed (ir_uses_name).
+# A statement that we cannot model precisely is a HARD BARRIER that flushes the
+# WHOLE available set and ends the straight-line run: a call (ND_CALL anywhere),
+# an address-of (UNOP_ADDR), an opaque store (assign/var-decl whose effect we
+# can't pin to a name — non-ident assign target = store through index/member/
+# deref), or any control flow (if/while/for/do-while/break/continue/return-with-
+# nested-flow). After such a statement the available set is empty and we keep
+# scanning the rest of the chain as a fresh run. This is the textbook
+# "available expressions within an extended basic block", at its safest:
+# any operation that could alias or side-effect resets availability.
+#
+# RELATION TO LICM: LICM hoists loop-INVARIANT expressions to a pre-header
+# (whole-loop scope, invariance test). Phase-7 CSE shares a VARIANT expression
+# that merely repeats across adjacent statements in straight-line code — a
+# DIFFERENT, complementary redundancy. Both can fire on the same body.
+#
+# IMPLEMENTATION reuses the Phase-2 candidate/clone/splice/rewrite machinery
+# (cse_collect / cse_clone_expr / cse_make_temp_decl / cse_rewrite_to_ident).
+
+# An available expression: its prototype IR value, the temp name minted for it,
+# and the statement node it was (or will be) materialized before. avail_live[k]
+# is cleared when a write kills the expression.
+XCSE_MAX_AVAIL: uint32 = 1024
+xcse_av_ir: Array[1024, uint32]
+xcse_av_off: Array[1024, uint32]
+xcse_av_len: Array[1024, uint32]
+xcse_av_stmt: Array[1024, uint32]     # the statement BEFORE which the temp decl sits
+xcse_av_materialized: Array[1024, uint32]  # 1 once the temp decl has been spliced
+xcse_av_decl: Array[1024, uint32]     # the pending/created temp decl node
+xcse_av_live: Array[1024, uint32]
+xcse_av_n: uint32 = 0
+
+
+def xcse_avail_reset():
+    xcse_av_n = 0
+
+
+# Kill every available expression whose IR tree references the written name.
+def xcse_kill_name(off: uint32, len_: uint32):
+    k: uint32 = 0
+    while k < xcse_av_n:
+        if xcse_av_live[k] != 0:
+            if ir_uses_name(xcse_av_ir[k], off, len_) != 0:
+                xcse_av_live[k] = 0
+        k = k + 1
+
+
+# Hard barrier: nothing computed before this point is provably still valid.
+def xcse_avail_flush():
+    xcse_av_n = 0
+
+
+# Does the expression subtree contain a call or an address-of (anywhere)? Such a
+# statement is a hard barrier (may write through a pointer to any leaf). Reuses
+# the LICM scan, which sets licm_giveup on call/addr-of.
+def xcse_expr_has_barrier(node: uint32) -> uint32:
+    licm_giveup = 0
+    licm_scan_expr(node)
+    return licm_giveup
+
+
+# Record a statement's writes into the available-set kill, and return 1 if the
+# statement is a HARD BARRIER (flush everything + end the run), 0 if it is an
+# ordinary straight-line statement whose precise writes were applied.
+#
+# Straight-line statements we model: ND_VAR_DECL (writes its name), ND_ASSIGN to
+# a bare ident (writes that name), ND_EXPR_STMT / ND_RETURN (no write, but their
+# expr must be call/addr-free). Everything else (control flow, augmented/opaque
+# assign target, call/addr-of in any sub-expr) is a barrier.
+def xcse_apply_stmt_effects(s: uint32) -> uint32:
+    k: uint32 = nd_kind[s]
+    if k == ND_VAR_DECL:
+        if xcse_expr_has_barrier(nd_b[s]) != 0:
+            return 1
+        xcse_kill_name(nd_name_off[s], nd_name_len[s])
+        return 0
+    if k == ND_ASSIGN:
+        # Only a plain (AUGOP_NONE) assignment to a bare IDENT is modelled; an
+        # augmented assign reads+writes (still a single named write, but its RHS
+        # value-IR could share — keep it simple: treat the target as written and
+        # require the value side to be barrier-free). A non-ident target is an
+        # opaque store -> barrier.
+        tgt: uint32 = nd_a[s]
+        if nd_kind[tgt] != ND_IDENT:
+            return 1
+        if xcse_expr_has_barrier(nd_b[s]) != 0:
+            return 1
+        xcse_kill_name(nd_name_off[tgt], nd_name_len[tgt])
+        return 0
+    if k == ND_EXPR_STMT:
+        if xcse_expr_has_barrier(nd_a[s]) != 0:
+            return 1
+        return 0
+    if k == ND_RETURN:
+        if xcse_expr_has_barrier(nd_a[s]) != 0:
+            return 1
+        return 0
+    # Any control-flow / unknown statement: hard barrier.
+    return 1
+
+
+# The r-value expression a straight-line statement contributes to CSE (the side
+# whose pure subexpressions we may share). 0 if none.
+def xcse_stmt_rvalue(s: uint32) -> uint32:
+    k: uint32 = nd_kind[s]
+    if k == ND_VAR_DECL:
+        return nd_b[s]
+    if k == ND_ASSIGN:
+        return nd_b[s]
+    if k == ND_EXPR_STMT:
+        return nd_a[s]
+    if k == ND_RETURN:
+        return nd_a[s]
+    return 0
+
+
+# Pending splice list for the current run: (decl, stmt-to-precede) pairs, in the
+# order decls must appear. Reuses cse_pend_* sizing semantics but tracks the
+# anchor statement per decl (a cross-statement temp is spliced before its FIRST
+# user, which may not be the statement currently processed).
+XCSE_MAX_PEND: uint32 = 512
+xcse_pd_decl: Array[512, uint32]
+xcse_pd_before: Array[512, uint32]
+xcse_pd_n: uint32 = 0
+
+
+# Process ONE straight-line statement `s` for cross-statement CSE against the
+# live available set. For each pure ND_BINARY subexpression of s's r-value
+# (outermost-first), if it value-equals a LIVE available expression, rewrite it
+# to read that expression's temp (and materialize the temp before its first user
+# if not yet done). Otherwise add it to the available set keyed on this stmt.
+def xcse_process_stmt_rvalue(s: uint32):
+    rv: uint32 = xcse_stmt_rvalue(s)
+    if rv == 0:
+        return
+    # Lower every pure ND_BINARY subtree of rv into the shared arena. Candidates
+    # accumulate in cse_cand_* (we DON'T reset the arena across statements of one
+    # run, so available-set IR ids stay live and comparable).
+    base: uint32 = cse_cand_n
+    cse_collect(rv)
+    i: uint32 = base
+    while i < cse_cand_n:
+        ast_i: uint32 = cse_cand_ast[i]
+        if ast_i != 0 and nd_kind[ast_i] == ND_BINARY:
+            vi: uint32 = cse_cand_ir[i]
+            # Match against a LIVE available expression.
+            a: uint32 = 0
+            hit: uint32 = 0
+            while a < xcse_av_n:
+                if xcse_av_live[a] != 0:
+                    if ir_value_eq(xcse_av_ir[a], vi) != 0:
+                        hit = 1
+                        # Materialize the defining temp before its first user if
+                        # this is the FIRST reuse.
+                        if xcse_av_materialized[a] == 0:
+                            xcse_av_materialized[a] = 1
+                            if xcse_pd_n < XCSE_MAX_PEND:
+                                xcse_pd_decl[xcse_pd_n] = xcse_av_decl[a]
+                                xcse_pd_before[xcse_pd_n] = xcse_av_stmt[a]
+                                xcse_pd_n = xcse_pd_n + 1
+                        # Rewrite this occurrence to read the temp; kill its
+                        # descendants in the candidate list (they're orphaned).
+                        cse_kill_descendants(ast_i)
+                        cse_rewrite_to_ident(ast_i, xcse_av_off[a], xcse_av_len[a])
+                        cse_cand_ast[i] = 0
+                        opt_cse_count = opt_cse_count + 1
+                        a = xcse_av_n
+                    else:
+                        a = a + 1
+                else:
+                    a = a + 1
+            if hit == 0:
+                # New available expression: mint a temp, build its decl from a
+                # CLONE of this occurrence (so later in-place rewrites of the
+                # original occurrence don't disturb the decl init), record it as
+                # available keyed before THIS statement. The decl is only spliced
+                # if a later occurrence actually reuses it (lazy materialization).
+                if xcse_av_n < XCSE_MAX_AVAIL:
+                    cse_mint_temp_name()
+                    toff: uint32 = opt_tmp_name_off
+                    tlen: uint32 = opt_tmp_name_len
+                    clone: uint32 = cse_clone_expr(ast_i)
+                    if clone != 0:
+                        d: uint32 = cse_make_temp_decl(toff, tlen, clone)
+                        if d != 0:
+                            slot: uint32 = xcse_av_n
+                            xcse_av_ir[slot] = vi
+                            xcse_av_off[slot] = toff
+                            xcse_av_len[slot] = tlen
+                            xcse_av_stmt[slot] = s
+                            xcse_av_materialized[slot] = 0
+                            xcse_av_decl[slot] = d
+                            xcse_av_live[slot] = 1
+                            xcse_av_n = xcse_av_n + 1
+                            # LAZY MATERIALIZATION: record the FIRST occurrence's
+                            # AST but do NOT rewrite it or splice the decl yet. The
+                            # decl is spliced (and this occurrence rewritten to read
+                            # the temp) ONLY if a later occurrence actually reuses
+                            # the value (xcse_av_materialized flips in the match
+                            # branch above; xcse_materialize_run does the rewrite +
+                            # splice). A never-reused expression therefore leaves
+                            # the original code byte-for-byte untouched — the pass
+                            # only ever ADDS a temp when it removes >=1 recompute.
+                            xcse_first_ast[slot] = ast_i
+        i = i + 1
+
+
+# Parallel to xcse_av_*: the AST node of each available expression's FIRST
+# occurrence, rewritten to the temp ident only when the expression is actually
+# reused (so a never-reused expression leaves the original code untouched).
+xcse_first_ast: Array[1024, uint32]
+
+
+# Run cross-statement CSE over ONE straight-line statement run [head .. ), i.e.
+# starting at `head` and continuing through the sibling chain until a hard
+# barrier statement. Returns the FIRST statement AFTER the run (or 0). Splices
+# any reused temps before their first user (via xcse_materialize_run). A run
+# that hit a barrier publishes its new head, if any, through xcse_new_head.
+def xcse_run(head: uint32) -> uint32:
+    xcse_avail_reset()
+    xcse_pd_n = 0
+    cse_cand_n = 0
+    ir_reset()
+    s: uint32 = head
+    stop: uint32 = 0
+    # A run that BEGINS at a control-flow statement is empty: advance past it so
+    # the block walker recurses into it and continues from the next statement
+    # (otherwise xcse_block would re-enter the same seg_head forever).
+    if s != 0:
+        hk: uint32 = nd_kind[s]
+        if hk != ND_VAR_DECL and hk != ND_ASSIGN and hk != ND_EXPR_STMT and hk != ND_RETURN:
+            return nd_next[s]
+    while s != 0 and stop == 0:
+        k: uint32 = nd_kind[s]
+        # Control flow / barrier statement ENDS the run BEFORE processing it.
+        if k != ND_VAR_DECL and k != ND_ASSIGN and k != ND_EXPR_STMT and k != ND_RETURN:
+            stop = 1
+        else:
+            xcse_process_stmt_rvalue(s)
+            # Apply this statement's writes/barrier AFTER sharing into it.
+            if xcse_apply_stmt_effects(s) != 0:
+                # Barrier statement: it stays in the run (its sharing already
+                # happened) but nothing after it can share across it.
+                s = nd_next[s]
+                stop = 1
+                xcse_avail_flush()
+            else:
+                s = nd_next[s]
+    # Materialize the reused temps: splice each decl before its anchor stmt and
+    # rewrite the first occurrence to read the temp.
+    xcse_materialize_run(head)
+    if stop != 0:
+        return s
+    return 0
+
+
+# After a run is analysed, splice the decls of every REUSED available expression
+# before its anchor statement, and rewrite that expression's first occurrence to
+# read the temp. Returns nothing; mutates the chain via nd_next. `head` is the
+# run's first statement so we can find anchors by walking.
+def xcse_materialize_run(head: uint32):
+    # Rewrite each materialized expression's first occurrence to the temp.
+    a: uint32 = 0
+    while a < xcse_av_n:
+        if xcse_av_materialized[a] != 0:
+            fa: uint32 = xcse_first_ast[a]
+            if fa != 0 and nd_kind[fa] == ND_BINARY:
+                cse_rewrite_to_ident(fa, xcse_av_off[a], xcse_av_len[a])
+        a = a + 1
+    # Splice each pending decl before its anchor statement (in pending order).
+    # xcse_cur_head tracks the LIVE run head as splices may insert decls before
+    # the head itself; xcse_splice_before reads/updates it so a SECOND decl
+    # anchored before the same statement (or before the head) chains correctly
+    # after the first instead of orphaning it.
+    xcse_cur_head = head
+    pi: uint32 = 0
+    while pi < xcse_pd_n:
+        d: uint32 = xcse_pd_decl[pi]
+        before: uint32 = xcse_pd_before[pi]
+        xcse_splice_before(d, before)
+        pi = pi + 1
+    # The final live head (possibly moved by head-anchored splices) is published
+    # for the block walker via xcse_new_head.
+    if xcse_cur_head != head:
+        xcse_new_head = xcse_cur_head
+
+
+# The LIVE head of the run currently being materialized. Splicing a decl before
+# the head advances it; subsequent walks start here so anchors are always found.
+xcse_cur_head: uint32 = 0
+xcse_new_head: uint32 = 0
+
+
+# Splice decl `d` immediately before statement `before` in the run whose live
+# head is xcse_cur_head. Walks from the live head to find `before`'s predecessor;
+# if `before` IS the live head, prepends `d` and advances xcse_cur_head. Multiple
+# decls before the same anchor chain in call order (each new d becomes the
+# anchor's immediate predecessor). Total: a not-found anchor (impossible for a
+# well-formed run) leaves the chain unchanged.
+def xcse_splice_before(d: uint32, before: uint32):
+    if before == xcse_cur_head:
+        nd_next[d] = before
+        xcse_cur_head = d
+        return
+    p: uint32 = xcse_cur_head
+    while p != 0:
+        if nd_next[p] == before:
+            nd_next[d] = before
+            nd_next[p] = d
+            return
+        p = nd_next[p]
+
+
+# Cross-statement CSE over a statement chain (a block). Processes maximal
+# straight-line runs; recurses into nested block bodies. Returns the (possibly
+# new) chain head.
+def xcse_block(head: uint32) -> uint32:
+    if head == 0:
+        return 0
+    # Process the chain in straight-line runs. xcse_run analyses a run starting
+    # at the current segment head and returns the first statement after it. We
+    # track the PREDECESSOR of the current segment head so that when a run
+    # materializes a temp decl before its own head (xcse_new_head != 0), we
+    # relink the predecessor (or the block head) to the new first node — keeping
+    # the whole chain connected.
+    new_head: uint32 = head
+    seg_prev: uint32 = 0           # statement just before seg_head (0 if seg_head is the block head)
+    seg_head: uint32 = head
+    while seg_head != 0:
+        xcse_new_head = 0
+        after: uint32 = xcse_run(seg_head)
+        if xcse_new_head != 0:
+            # The run inserted one or more decls before seg_head; xcse_new_head is
+            # the new first node of that run. Connect the predecessor to it.
+            if seg_prev == 0:
+                new_head = xcse_new_head
+            else:
+                nd_next[seg_prev] = xcse_new_head
+        # Advance: seg_prev becomes the statement immediately before `after`. The
+        # last statement of the just-processed run is `after`'s predecessor; find
+        # it by walking from xcse_new_head-or-seg_head until nd_next == after.
+        start: uint32 = seg_head
+        if xcse_new_head != 0:
+            start = xcse_new_head
+        if after == 0:
+            seg_prev = 0
+        else:
+            p: uint32 = start
+            while p != 0 and nd_next[p] != after:
+                p = nd_next[p]
+            seg_prev = p
+        seg_head = after
+    # Recurse into nested control-flow bodies across the WHOLE (rebuilt) chain.
+    s: uint32 = new_head
+    while s != 0:
+        k: uint32 = nd_kind[s]
+        if k == ND_IF:
+            nd_b[s] = xcse_block(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                nd_b[e] = xcse_block(nd_b[e])
+                e = nd_next[e]
+            nd_d[s] = xcse_block(nd_d[s])
+        elif k == ND_WHILE:
+            nd_b[s] = xcse_block(nd_b[s])
+        elif k == ND_DO_WHILE:
+            nd_b[s] = xcse_block(nd_b[s])
+        elif k == ND_FOR:
+            nd_b[s] = xcse_block(nd_b[s])
+        s = nd_next[s]
+    return new_head
+
+
+def opt_xcse_function(fn: uint32):
+    nd_c[fn] = xcse_block(nd_c[fn])
