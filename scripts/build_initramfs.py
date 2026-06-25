@@ -4045,6 +4045,27 @@ def build_archive() -> bytes:
                 # below). Proves the full Debian /bin/bash runs in the ns,
                 # not just dash. ~1.2 MB; acceptable for the curated slice.
                 "bin/bash",
+                # BROAD coreutils coverage matrix (scripts/
+                # test_linux_debian_coverage.sh / _kvm_coreutils_repro.sh
+                # run each STANDALONE via `enter linux { /usr/bin/<x> ... }`).
+                # These exercise the Linux-ABI fork+execve+ld.so+stack path
+                # across a wide set of real Debian ELFs — the regression
+                # surface for the user-stack-vs-kernel-stack aliasing fix
+                # (decoupled high-VA user stack). Staged at usr/bin/ so the
+                # /usr/bin/<x> spelling the matrix uses resolves; the
+                # reverse usrmerge alias below also plants /bin/<x>.
+                "usr/bin/uname",
+                "usr/bin/id",
+                "usr/bin/ls",
+                "usr/bin/stat",
+                "usr/bin/tail",
+                "usr/bin/head",
+                "usr/bin/cut",
+                "usr/bin/sed",
+                "usr/bin/nl",
+                "usr/bin/date",
+                "usr/bin/md5sum",
+                "usr/bin/readlink",
                 # The local file:// apt repo (scripts/build_local_apt_repo
                 # .sh stages this whole subtree). apt's `file` method reads
                 # it directly off the Debian root.

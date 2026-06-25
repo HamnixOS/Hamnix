@@ -1093,6 +1093,43 @@ MAX_ENV_BYTES: uint64 = 256
 LINUX_USTACK_ORDER: int32  = 6
 LINUX_USTACK_SIZE:  uint64 = 262144      # 64 * 4096
 
+# DIRECT-MAP / KERNEL-STACK ALIASING FIX (2026-06-25): the Linux user
+# stack's USER virtual base now lives HIGH — above the 4 GiB kernel
+# direct-map, alongside the ET_DYN load-bias (4 GiB) / interp (5 GiB) /
+# brk (6 GiB) windows. It was the LAST user-data region still IDENTITY-
+# mapped (vaddr == phys) at low RAM (the brk arena was decoupled to 6 GiB
+# in 7224d2c2/d-m-aliasing-fix; the image/mmap were decoupled earlier).
+#
+# Identity-mapping the stack at its low alloc_pages() physical address made
+# the 256 KiB stack window ALIAS the exact low frames the buddy allocator
+# hands back for OTHER purposes — including a freshly-spawned task's KERNEL
+# STACK (kstack_top ~0x0ffe0000). On a broad Debian closure (larger
+# initramfs shifts the buddy free-list), a COW-shared user stack frame and
+# a live kernel stack frame land adjacent in the same low band; a CPL=3
+# stack push to the US=1 RO COW page resolves against a frame the kernel
+# also reaches as identity, and the unrecoverable supervisor #PF the brief
+# captured (cr2==rsp, pte phys inside the kstack region) fires.
+#
+# Decoupling vaddr (HIGH) from phys (LOW alloc_pages run) restores the
+# invariant that NO physical frame is simultaneously a live US=1 user
+# mapping AND a kernel-reachable identity / direct-map slot at the SAME
+# translation — exactly the brk fix, applied to the one region that still
+# ran identity. elf_install_user_range already supports phys_base != vlow
+# (it computes chunk_phys = phys_base + (vaddr - vlow) per page), and the
+# argv/envp/auxv builder writes through the just-installed high-VA US=1
+# leaves under STAC with cur_pml4 loaded, so no builder change is needed —
+# only the VA it starts from moves high. copy_to/from_user (mm/uaccess.ad)
+# PML4-walks the high VA to its low phys so kernel derefs of stack pointers
+# keep working.
+#
+# 7 GiB base: image=[4,5) GiB, interp=[5,6) GiB, brk=[6 GiB, 6 GiB+32 MiB),
+# stack=[7 GiB, 7 GiB+256 KiB). The whole 256 KiB span sits inside ONE
+# 1 GiB PDPT slot (PDPT[7] of PML4[0]) and never crosses a 1 GiB boundary,
+# so elf_install_user_range lays it down in a single per-task PD/PT subtree.
+# The mmap window is [1 GiB, 4 GiB) (mm/vma.ad VMA_LARGE_BASE), so the stack
+# is clear of every other Linux user region.
+LINUX_USTACK_VBASE: uint64 = 0x1C0000000     # 7 GiB
+
 
 # ===========================================================================
 # Stage 2 ASLR — initial-RSP (stack base) randomization.
@@ -2196,21 +2233,32 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
     # on its private stack. 256 KiB (64 pages, buddy order 6) gives
     # that call tower comfortable headroom and matches the floor the
     # mission set for the Linux user stack.
-    new_ustack_base: uint64 = alloc_pages(LINUX_USTACK_ORDER)
+    # The PHYSICAL backing of the user stack: one low alloc_pages() run.
+    new_ustack_phys: uint64 = alloc_pages(LINUX_USTACK_ORDER)
+    # The USER VIRTUAL base of the stack is DECOUPLED to a HIGH window
+    # (7 GiB, LINUX_USTACK_VBASE) so the stack is no longer identity-mapped
+    # at low RAM where its frames could alias a live kernel stack / direct-
+    # map slot — see the LINUX_USTACK_VBASE comment block. The user sees a
+    # virtually-contiguous [VBASE, VBASE+SIZE) stack; the kernel reaches its
+    # bytes through the low phys (uaccess PML4-walk) and through the high-VA
+    # US=1 leaves the builder writes under STAC.
+    new_ustack_vbase: uint64 = LINUX_USTACK_VBASE
     # Stage 2 ASLR (stack base): perturb the initial RSP DOWN by a random
-    # page multiple inside the identity-mapped stack allocation. vaddr ==
-    # phys is preserved (one alloc_pages identity region), so the direct
-    # user-stack stores in _build_user_argv* below remain valid.
-    new_ustack_top:  uint64 = new_ustack_base + LINUX_USTACK_SIZE \
+    # page multiple inside the stack VA window. The slide stays an INTRA-
+    # region virtual offset, so the high-VA top simply starts a few pages
+    # lower; the builder's stores (now high-VA, US=1) and the kernel's
+    # uaccess walks both honour it.
+    new_ustack_top:  uint64 = new_ustack_vbase + LINUX_USTACK_SIZE \
                               - aslr_stack_slide()
-    # M16.36: install per-task PT entries for the user stack so the
-    # stack pages are reached through this task's OWN PML4 rather
-    # than the BSP's shared 1 GiB identity stamp. Same shape as the
-    # ELF image install above. A < 0 return is an OOM cracking page
-    # tables (the underlying alloc_pages already succeeded), which we
-    # propagate as -ENOMEM.
-    if elf_install_user_stack(cur_pml4, new_ustack_base,
-                              LINUX_USTACK_SIZE) < 0:
+    # Install per-task PT entries mapping the HIGH user VA window onto the
+    # LOW physical run (phys_base = new_ustack_phys, decoupled from vlow).
+    # elf_install_user_range stamps US=1 | RW | NX leaves and supports
+    # phys_base != vlow. A < 0 return is an OOM cracking page tables (the
+    # underlying alloc_pages already succeeded) -> -ENOMEM.
+    if elf_install_user_range(cur_pml4, new_ustack_vbase,
+                              new_ustack_vbase + LINUX_USTACK_SIZE,
+                              new_ustack_phys, "stack",
+                              PT_FLAG_NX | PT_FLAG_RW) < 0:
         printk0("execve: user-stack install failed (OOM in page-table walk?)\n")
         set_current_errstr("execve: cannot map stack")
         return cast[int64](-12)             # -ENOMEM
@@ -2232,8 +2280,9 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
     set_task_interp_range(current_idx_get(),
                           elf_last_interp_img_vlow_get(),
                           elf_last_interp_img_vhigh_get())
+    # ustack RANGE is the HIGH user VA window (fork COW-shares by VA).
     set_task_ustack_range(current_idx_get(),
-                          new_ustack_base, LINUX_USTACK_SIZE)
+                          new_ustack_vbase, LINUX_USTACK_SIZE)
     # Leak 2 fix: free the task's PRE-execve OWNER-ONLY regions (old ELF
     # image, old interp, old user stack) BEFORE overwriting the owner
     # fields with the new image's coords. On the direct-spawn-then-execve
@@ -2252,8 +2301,9 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
     set_task_image_phys(current_idx_get(),
                         elf_last_img_phys_get(),
                         elf_last_img_hi_get() - elf_last_img_lo_get())
+    # ustack PHYS is the LOW alloc_pages() run (task_reap free_pages it).
     set_task_ustack_phys(current_idx_get(),
-                        new_ustack_base, LINUX_USTACK_SIZE)
+                        new_ustack_phys, LINUX_USTACK_SIZE)
     set_task_interp_phys(current_idx_get(),
                         elf_last_interp_img_phys_get(),
                         elf_last_interp_img_sz_get())
