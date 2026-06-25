@@ -174,7 +174,10 @@ trap_diag_stub_0e:
     movq    %gs:0, %rax
     leaq    kpti_kernel_cr3_slots(%rip), %rcx
     movq    (%rcx, %rax, 8), %rax
+    testq   %rax, %rax                 /* slot==0 (pre-init)? skip swap */
+    jz      8f
     movq    %rax, %cr3
+8:
 
     /* Stack now (low -> high):
      *    0..112: r15..rax  (15 quads)
@@ -316,7 +319,10 @@ common_trap_diag:
     movq    %gs:0, %rax
     leaq    kpti_kernel_cr3_slots(%rip), %rcx
     movq    (%rcx, %rax, 8), %rax
+    testq   %rax, %rax                 /* slot==0 (pre-init)? skip swap */
+    jz      9f
     movq    %rax, %cr3
+9:
 
     /* Snapshot the seven fields BEFORE we move %rsp. Park them in
      * callee-saved regs so the Adder call can't trash them. We have

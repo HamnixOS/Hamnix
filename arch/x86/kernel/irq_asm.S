@@ -164,7 +164,10 @@ common_irq:
     movq  %gs:0, %rax
     leaq  kpti_kernel_cr3_slots(%rip), %rcx
     movq  (%rcx, %rax, 8), %rax
+    testq %rax, %rax                  /* slot==0 (pre-init)? skip swap */
+    jz    9f
     movq  %rax, %cr3
+9:
 
     /* Stack layout right now (low -> high), 9 caller-saved quads
      * pushed above the stub's vec/ec and the CPU's iret frame:
