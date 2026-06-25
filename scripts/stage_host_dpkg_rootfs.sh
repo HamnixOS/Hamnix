@@ -149,6 +149,58 @@ mkdir -p "$ROOTFS/bin"
 ln -sf /usr/bin/dash "$ROOTFS/bin/sh"   2>/dev/null || true
 ln -sf dash          "$ROOTFS/bin/dash" 2>/dev/null || true
 
+# --- NSS user/group database -----------------------------------------
+# Real Debian behaviour: id/whoami/getent resolve UID 0 -> "root" via
+# glibc NSS reading /etc/passwd (the "passwd: files" line in
+# nsswitch.conf points NSS straight at the file). Without these, whoami
+# errors "cannot find name for user ID 0" and dpkg warns "unknown system
+# user 'root'". Stage a minimal but real passwd/group + nsswitch.conf so
+# the name lookups resolve. (libnss_files.so.2 is in the libc closure
+# already staged via copy_with_libs of dpkg/coreutils.)
+mkdir -p "$ROOTFS/etc"
+cat > "$ROOTFS/etc/passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/sh
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+EOF
+cat > "$ROOTFS/etc/group" <<'EOF'
+root:x:0:
+daemon:x:1:
+nogroup:x:65534:
+EOF
+cat > "$ROOTFS/etc/nsswitch.conf" <<'EOF'
+passwd:         files
+group:          files
+shadow:         files
+gshadow:        files
+hosts:          files dns
+networks:       files
+protocols:      db files
+services:       db files
+ethers:         db files
+rpc:            db files
+EOF
+mkdir -p "$ROOTFS/root"
+
+# glibc dlopen()s the NSS service module libnss_files.so.2 at RUNTIME
+# (it is NOT a link-time DT_NEEDED of any binary, so copy_with_libs's
+# ldd walk never picks it up). Stage it (+ libnss_compat) explicitly so
+# getpwuid/getpwnam("root") resolve through the "passwd: files" line.
+for nss in libnss_files.so.2 libnss_compat.so.2 libnss_dns.so.2; do
+    # x86_64 ONLY (host may be multilib; the i386 module is the wrong ABI
+    # for the guest's x86_64 glibc).
+    src="$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu \
+                -name "$nss" 2>/dev/null | head -1)"
+    if [ -n "$src" ]; then
+        real="$(readlink -f "$src")"
+        # Stage at the usrmerge-CANONICAL usr/lib path (what
+        # build_initramfs.py's REAL_DEBIAN slice + glob pin); the embed's
+        # usrmerge alias also plants the lib/ spelling.
+        install -D -m0755 "$real" \
+            "$ROOTFS/usr/lib/x86_64-linux-gnu/$nss"
+    fi
+done
+
 # --- dpkg + apt admin skeleton ---------------------------------------
 mkdir -p \
   "$ROOTFS/var/lib/dpkg/info" \

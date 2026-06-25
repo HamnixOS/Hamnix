@@ -50,9 +50,13 @@ else
 fi
 
 ROOTFS=tests/distros/debian-minbase/rootfs
-if [ ! -f "$ROOTFS/usr/bin/dpkg" ] || [ ! -f "$ROOTFS/bin/bash" ]; then
-    echo "[test_linux_debian_coverage] SKIP: $ROOTFS/{usr/bin/dpkg,bin/bash} not staged"
+# Accept either the debootstrap layout (bin/bash) or the host-staged
+# usrmerge layout (usr/bin/bash from stage_host_dpkg_rootfs.sh).
+if [ ! -f "$ROOTFS/usr/bin/dpkg" ] \
+   || { [ ! -f "$ROOTFS/usr/bin/bash" ] && [ ! -f "$ROOTFS/bin/bash" ]; }; then
+    echo "[test_linux_debian_coverage] SKIP: $ROOTFS/{usr/bin/dpkg,(usr/)bin/bash} not staged"
     echo "    Build with: bash tests/distros/debian-minbase/BUILD.sh"
+    echo "    or:         bash scripts/stage_host_dpkg_rootfs.sh"
     exit 0
 fi
 
