@@ -1438,6 +1438,81 @@ _exec_str_blob:  Array[24576, uint8]
 _exec_argv_ptrs: Array[17, uint64]            # MAX_ARGV + NULL terminator
 _exec_envp_ptrs: Array[65, uint64]            # MAX_ENVP + NULL terminator
 
+# binfmt_script (shebang) support. When do_execve's target begins with
+# "#!", the kernel must run the named interpreter with the script path as
+# an argument (Linux fs/binfmt_script.c). These hold the rewritten argv:
+# _shebang_interp holds the interpreter path (and optional single arg)
+# parsed from the "#!" line; _shebang_script holds the original script
+# path. The rebuilt argv becomes [interp, (optarg,) scriptpath, orig
+# argv[1:]...]. Kept in dedicated BSS so the rewrite does not collide with
+# the _exec_str_blob bump arena already holding the snapshotted argv/envp.
+_shebang_interp: Array[256, uint8]            # interp path
+_shebang_optarg: Array[256, uint8]            # optional single arg after interp
+_shebang_script: Array[256, uint8]            # the script path itself
+_shebang_argv_ptrs: Array[20, uint64]         # rebuilt argv (NULL-terminated)
+
+
+def _exec_parse_shebang(blob: uint64, sz: uint64,
+                        interp: Ptr[uint8], optarg: Ptr[uint8]) -> int32:
+    # Parse a "#!" interpreter line from the head of `blob`. On a match,
+    # fills `interp` with the interpreter path and `optarg` with the single
+    # optional argument (empty string if none) and returns 1. Returns 0 if
+    # the blob is not a shebang script. Mirrors Linux fs/binfmt_script.c:
+    # skip "#!", skip leading blanks, the interpreter is the first
+    # whitespace-delimited token, and EVERYTHING after the first blank that
+    # follows it (trimmed) is ONE argument (Linux does not split further).
+    interp[0] = 0
+    optarg[0] = 0
+    if sz < 2:
+        return 0
+    b: Ptr[uint8] = cast[Ptr[uint8]](blob)
+    if b[0] != 0x23 or b[1] != 0x21:              # '#' '!'
+        return 0
+    i: uint64 = 2
+    # Bound the scan to the first line and a sane length cap.
+    lim: uint64 = sz
+    if lim > 255:
+        lim = 255
+    # Skip blanks after "#!".
+    while i < lim and (b[i] == 0x20 or b[i] == 0x09):
+        i = i + 1
+    # Interpreter token: up to the next blank / newline / NUL.
+    o: uint64 = 0
+    while i < lim and b[i] != 0x20 and b[i] != 0x09 \
+            and b[i] != 0x0A and b[i] != 0:
+        if o < 255:
+            interp[o] = b[i]
+            o = o + 1
+        i = i + 1
+    interp[o] = 0
+    if o == 0:
+        return 0                                   # "#!" with no interpreter
+    # Skip blanks before the optional argument.
+    while i < lim and (b[i] == 0x20 or b[i] == 0x09):
+        i = i + 1
+    # The remainder of the line (to newline/NUL) is a SINGLE argument.
+    oa: uint64 = 0
+    while i < lim and b[i] != 0x0A and b[i] != 0:
+        if oa < 255:
+            optarg[oa] = b[i]
+            oa = oa + 1
+        i = i + 1
+    # Trim trailing blanks from the optional argument.
+    while oa > 0 and (optarg[oa - 1] == 0x20 or optarg[oa - 1] == 0x09):
+        oa = oa - 1
+    optarg[oa] = 0
+    return 1
+
+
+def _str_copy_z(dst: Ptr[uint8], src: Ptr[char]) -> uint64:
+    # Copy a NUL-terminated string; returns the length (excl. NUL).
+    n: uint64 = 0
+    while src[n] != 0 and n < 255:
+        dst[n] = cast[uint8](src[n])
+        n = n + 1
+    dst[n] = 0
+    return n
+
 
 def _exec_snapshot_one(arr_user: uint64, out_ptrs: Ptr[uint64],
                        max_entries: uint64, max_bytes: uint64,
@@ -1941,6 +2016,57 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
                 a1, a2)
         set_current_errstr("execve: bad argv/envp address")
         return cast[int64](-14)           # -EFAULT
+    # binfmt_script: if the target is a "#!" script, re-point this exec at
+    # the named interpreter and rewrite argv to [interp, (optarg,)
+    # scriptpath, orig argv[1:]...]. MUST run here — after the argv/envp
+    # snapshot but BEFORE any address-space teardown — so a missing /
+    # malformed interpreter fails cleanly with the caller still intact
+    # (the old behaviour fell into elf_load_blob with bad "#!" magic AFTER
+    # vma_clear, returning -ENOEXEC to a half-disassembled task = a hang).
+    # Without this, a freshly dpkg-installed shell script — /usr/bin/hamhello
+    # = "#!/bin/sh\necho ..." — could not be run by `enter linux { ... }`.
+    if _exec_parse_shebang(blob, sz, &_shebang_interp[0],
+                           &_shebang_optarg[0]) != 0:
+        # Stash the ORIGINAL script path before `path` is repointed.
+        _str_copy_z(&_shebang_script[0], path)
+        # Re-resolve the interpreter through the namespace.
+        ipath: Ptr[char] = cast[Ptr[char]](&_shebang_interp[0])
+        if vfs_perm_check_exec(ipath) != 0:
+            set_current_errstr("execve: shebang interp not executable")
+            return cast[int64](-1)         # -EPERM
+        iblob: uint64 = ns_blob_ptr(ipath)
+        if iblob == 0:
+            printk1("execve: shebang interp '%s' not found\n",
+                    cast[uint64](&_shebang_interp[0]))
+            set_current_errstr("execve: shebang interpreter not found")
+            return cast[int64](-2)         # -ENOENT
+        isz: uint64 = ns_blob_size(ipath)
+        # Rebuild argv: interp [optarg] scriptpath orig-argv[1:].
+        ai: uint64 = 0
+        _shebang_argv_ptrs[ai] = cast[uint64](&_shebang_interp[0])
+        ai = ai + 1
+        if _shebang_optarg[0] != 0:
+            _shebang_argv_ptrs[ai] = cast[uint64](&_shebang_optarg[0])
+            ai = ai + 1
+        _shebang_argv_ptrs[ai] = cast[uint64](&_shebang_script[0])
+        ai = ai + 1
+        # Append the original argv from index 1 onward (argv[0] = the
+        # script name is replaced by scriptpath above).
+        si: uint64 = 1
+        while _exec_argv_ptrs[si] != 0 and ai < 19:
+            _shebang_argv_ptrs[ai] = _exec_argv_ptrs[si]
+            ai = ai + 1
+            si = si + 1
+        _shebang_argv_ptrs[ai] = 0
+        # Adopt the rebuilt argv as THE snapshotted argv the init-stack
+        # builders consume, and re-point the exec at the interpreter image.
+        k: uint64 = 0
+        while k <= ai:
+            _exec_argv_ptrs[k] = _shebang_argv_ptrs[k]
+            k = k + 1
+        path = ipath
+        blob = iblob
+        sz = isz
     # U42 VMA: drop the outgoing image's mappings BEFORE we load the
     # new ELF. Without this, the new program would inherit the parent
     # image's stack/heap/mmap VMAs and a subsequent mprotect or munmap
