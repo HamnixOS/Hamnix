@@ -645,6 +645,13 @@ def _drain_shell() -> uint64:
         if n < 0:
             sh_alive = 0
         break
+    # Re-anchor the local edit base to wherever the shell's freshly-streamed
+    # output (the new prompt) left the cursor, but ONLY when the user has no
+    # half-typed line — otherwise streamed output would shift the edit text.
+    # After Enter the line is empty, so the next prompt re-anchors cleanly and
+    # subsequent local edits render right after the "$ " prompt.
+    if got > 0 and term_line_len == 0:
+        edit_base = term_col
     return got
 
 
@@ -775,29 +782,110 @@ kev_carry: uint64 = 0                     # leftover partial-line bytes at buf h
 keyout:   Array[256, uint8]              # forwarded bytes -> shell stdin
 
 
-# BUG 3 FIX — LOCAL LINE DISCIPLINE (classic line-buffered terminal).
+# BUG 3 FIX — LOCAL LINE DISCIPLINE with CURSOR MOTION + HISTORY.
 #
 # The OLD model forwarded each raw keystroke to the shell and WAITED for the
 # shell's readline to echo it back over the stdout pipe before committing the
 # frame (the `await_echo` pump). That term -> pipe -> cooperatively-scheduled
 # hamsh -> readline-echo -> pipe -> term round-trip was the ~0.5s per-char lag.
 #
-# Now hamterm owns line editing LOCALLY (matching hameditscene's in-process
-# render): a printable key is rendered into the grid + committed IMMEDIATELY,
-# in the same wake, ZERO round-trips. We accumulate the typed line in
-# `term_line` and only feed the WHOLE line + '\n' to the shell's stdin on
-# Enter. The inner shell runs with `--no-echo` (see _start_shell) so its
-# readline does NOT echo those bytes back — otherwise every char would appear
-# twice (local echo + the shell's echo). Backspace edits the local line +
-# grid. Special/control keys (Ctrl-C) are forwarded raw.
+# hamterm now owns line editing LOCALLY: a key edits the in-memory line and
+# re-renders the bottom (edit) grid row IMMEDIATELY, in the same wake, ZERO
+# round-trips. We accumulate the typed line in `term_line` with an INSERTION
+# CURSOR `term_line_cur`, and feed the WHOLE line + '\n' to the shell's stdin
+# on Enter. The inner shell runs with `--no-echo` (see _start_shell) so its
+# readline does NOT echo the bytes back.
+#
+# CURSOR + HISTORY (this fix). Previously every control byte (<32) was dropped,
+# so the arrow keys' ESC '[' A/B/C/D bytes leaked into the grid as the literal
+# glyphs "[A"/"[B"/... — the user-reported "arrows insert special characters".
+# Now:
+#   * ESC '[' A/B/C/D are DECODED (state machine over the per-byte key stream)
+#     and never reach the line as text;
+#   * Left/Right move `term_line_cur` within the line (inline editing);
+#   * Up/Down recall previous/next command from a local HISTORY ring;
+#   * Home/End (ESC '[' H / F, and Ctrl-A / Ctrl-E) jump to line start/end;
+#   * Backspace/DEL and printable inserts act AT the cursor (mid-line edits).
+# The bottom edit row is fully re-rendered from `term_line` on each edit
+# (`_redraw_edit_line`), with the text cursor drawn at `term_line_cur`.
 #
 # `keys_local_changed` is set whenever a key changed the grid locally, so the
 # main loop commits the echo this frame without any shell round-trip.
 TERM_LINE_MAX: uint64 = 512
 term_line:     Array[512, uint8]          # the line being edited (no '\n')
 term_line_len: uint64 = 0
+term_line_cur: uint64 = 0                  # insertion point within term_line
+edit_base:     uint64 = 0                  # bottom-row column where editing starts
 keys_local_changed: int32 = 0
 keys_forwarded: uint64 = 0                 # bytes sent to shell this wake
+
+# Arrow/escape decode for the KEY stream. The keyboard driver delivers arrow
+# keys as the byte run ESC(27) '['(91) <final>; we reassemble it here so the
+# bytes drive cursor/history instead of leaking into the line as glyphs.
+# 0 = ground, 1 = saw ESC, 2 = saw ESC '['  (also absorbs an optional numeric
+# parameter for Home/End "1~"/"4~" style sequences).
+key_esc_st: int32 = 0
+csi_param:  int32 = 0                       # last digit byte inside a CSI
+
+# --- command history ring (local, like a shell's readline history) ---------
+HIST_MAX:  uint64 = 32                     # remembered command count
+HIST_STRIDE: uint64 = 512                  # bytes per stored command (== TERM_LINE_MAX)
+hist_buf:  Array[16384, uint8]             # HIST_MAX * HIST_STRIDE
+hist_len:  Array[32, uint64]               # live length of each stored command
+hist_count: uint64 = 0                     # commands stored (<= HIST_MAX)
+hist_head:  uint64 = 0                     # next write slot (ring cursor)
+# Browse position: 0 = editing the live line; k>0 = showing the k-th most
+# recent command (1 == most recent). Reset to 0 whenever the line is edited
+# or submitted.
+hist_pos:   uint64 = 0
+
+
+def _hist_push(buf: Ptr[uint8], n: uint64):
+    # Append a submitted command to the history ring (skip empty lines and an
+    # exact repeat of the most recent entry, like a shell's HISTCONTROL).
+    if n == 0:
+        return
+    if hist_count > 0:
+        prev_slot: uint64 = (hist_head + HIST_MAX - 1) % HIST_MAX
+        if hist_len[prev_slot] == n:
+            same: int32 = 1
+            k: uint64 = 0
+            while k < n:
+                if hist_buf[prev_slot * HIST_STRIDE + k] != buf[k]:
+                    same = 0
+                    break
+                k = k + 1
+            if same != 0:
+                return
+    base: uint64 = hist_head * HIST_STRIDE
+    cn: uint64 = n
+    if cn > HIST_STRIDE:
+        cn = HIST_STRIDE
+    k2: uint64 = 0
+    while k2 < cn:
+        hist_buf[base + k2] = buf[k2]
+        k2 = k2 + 1
+    hist_len[hist_head] = cn
+    hist_head = (hist_head + 1) % HIST_MAX
+    if hist_count < HIST_MAX:
+        hist_count = hist_count + 1
+
+
+# Load the k-th most recent history entry (1 == most recent) into term_line.
+def _hist_load(k: uint64):
+    if k == 0 or k > hist_count:
+        return
+    slot: uint64 = (hist_head + HIST_MAX - k) % HIST_MAX
+    base: uint64 = slot * HIST_STRIDE
+    n: uint64 = hist_len[slot]
+    if n > TERM_LINE_MAX - 1:
+        n = TERM_LINE_MAX - 1
+    i: uint64 = 0
+    while i < n:
+        term_line[i] = hist_buf[base + i]
+        i = i + 1
+    term_line_len = n
+    term_line_cur = n
 
 
 # Forward one raw control byte (e.g. Ctrl-C) to the shell's stdin verbatim —
@@ -814,51 +902,196 @@ def _key_raw_to_shell(c: uint8):
     keys_forwarded = keys_forwarded + 1
 
 
+# Re-render the bottom (edit) grid row from the prompt prefix + term_line, with
+# the block text cursor at term_line_cur. The prompt prefix (drawn by the
+# shell's stdout) occupies columns [0, edit_base); we rewrite [edit_base, ...).
+def _redraw_edit_line():
+    last: uint64 = (term_rows_n - 1) * TERM_STRIDE
+    # If the edit text would overflow the visible columns, scroll the visible
+    # window leftward so the cursor stays on screen (simple horizontal pan).
+    avail: uint64 = 0
+    if term_cols_n > edit_base:
+        avail = term_cols_n - edit_base
+    start: uint64 = 0
+    if avail > 0 and term_line_cur >= avail:
+        start = term_line_cur - avail + 1
+    col: uint64 = edit_base
+    i: uint64 = start
+    while i < term_line_len and col < term_cols_n:
+        ch: uint8 = term_line[i]
+        if ch == 9:
+            ch = 32
+        term_rows[last + col] = ch
+        col = col + 1
+        i = i + 1
+    # Clear any stale tail (a shorter line after backspace / history recall).
+    c2: uint64 = col
+    while c2 < term_cols_n:
+        term_rows[last + c2] = 32
+        c2 = c2 + 1
+    # Trim the row length back to the last non-space-or-cursor column.
+    term_row_len[term_rows_n - 1] = col
+    # Park the streaming cursor (term_col) at the editing caret so a following
+    # shell write (rare mid-edit) and the cursor block line up.
+    term_col = edit_base + (term_line_cur - start)
+    if term_col > term_cols_n:
+        term_col = term_cols_n
+
+
+# Decode one arrow/escape final byte (after ESC '['). Returns 1 if it changed
+# the line/cursor (caller redraws + commits).
+def _key_csi_final(code: int32) -> int32:
+    if code == 65:                          # 'A' — Up: older history
+        if hist_count == 0:
+            return 0
+        if hist_pos < hist_count:
+            hist_pos = hist_pos + 1
+        _hist_load(hist_pos)
+        _redraw_edit_line()
+        return 1
+    if code == 66:                          # 'B' — Down: newer history
+        if hist_pos > 0:
+            hist_pos = hist_pos - 1
+        if hist_pos == 0:
+            term_line_len = 0
+            term_line_cur = 0
+        else:
+            _hist_load(hist_pos)
+        _redraw_edit_line()
+        return 1
+    if code == 67:                          # 'C' — Right
+        if term_line_cur < term_line_len:
+            term_line_cur = term_line_cur + 1
+            _redraw_edit_line()
+            return 1
+        return 0
+    if code == 68:                          # 'D' — Left
+        if term_line_cur > 0:
+            term_line_cur = term_line_cur - 1
+            _redraw_edit_line()
+            return 1
+        return 0
+    if code == 72:                          # 'H' — Home
+        if term_line_cur != 0:
+            term_line_cur = 0
+            _redraw_edit_line()
+            return 1
+        return 0
+    if code == 70:                          # 'F' — End
+        if term_line_cur != term_line_len:
+            term_line_cur = term_line_len
+            _redraw_edit_line()
+            return 1
+        return 0
+    return 0
+
+
 def _key_local(code: int32):
-    # Apply one decoded key press to the LOCAL line editor with immediate
-    # local echo into the grid. `code` is the ASCII byte (Enter already
-    # normalised to 10, CR folded to NL by the caller).
-    # Typing snaps the scrollback view back to the live tail.
+    # Apply one decoded key press to the LOCAL line editor, re-rendering the
+    # edit row immediately. `code` is the ASCII byte (Enter normalised to 10,
+    # CR folded to NL by the caller). Typing snaps the scrollback to the tail.
     term_view_off = 0
+    # --- arrow / escape-sequence decode (must run before the <32 drop) ---
+    if key_esc_st == 1:                     # saw ESC
+        if code == 91:                      # '['
+            key_esc_st = 2
+            return
+        # Bare ESC or ESC <other> — abandon the sequence, ignore.
+        key_esc_st = 0
+        return
+    if key_esc_st == 2:                     # inside CSI (ESC '[')
+        # Absorb an optional numeric parameter (e.g. "1~" Home / "4~" End).
+        if code >= 48 and code <= 57:
+            # Remember the digit for the '~' finals; we only special-case
+            # 1 (Home) and 4 (End) here, mapped via the final byte below.
+            csi_param = code
+            return
+        key_esc_st = 0
+        fin: int32 = code
+        if code == 126:                     # '~' final: 1~ Home, 4~ End
+            if csi_param == 49:             # '1'
+                fin = 72                    # treat as Home
+            elif csi_param == 52:           # '4'
+                fin = 70                    # treat as End
+            else:
+                csi_param = 0
+                return
+        csi_param = 0
+        if _key_csi_final(fin) != 0:
+            keys_local_changed = 1
+        return
+    if code == 27:                          # ESC -> begin a CSI sequence
+        key_esc_st = 1
+        return
     if code == 10:                          # Enter — submit the whole line
-        # Local echo: move to a fresh row in the grid.
-        _term_putc(10)
+        _hist_push(&term_line[0], term_line_len)
+        hist_pos = 0
+        _term_putc(10)                      # move to a fresh row in the grid
         keys_local_changed = 1
-        # Feed the accumulated line + '\n' to the shell.
         if sh_alive != 0 and sh_in_fd >= 0:
             _send_line(&term_line[0], term_line_len)
         term_line_len = 0
+        term_line_cur = 0
         return
-    if code == 8 or code == 127:            # Backspace / DEL — local edit
-        if term_line_len > 0:
+    if code == 8 or code == 127:            # Backspace / DEL — delete at cursor
+        if term_line_cur > 0:
+            j: uint64 = term_line_cur - 1
+            while j + 1 < term_line_len:
+                term_line[j] = term_line[j + 1]
+                j = j + 1
             term_line_len = term_line_len - 1
-            _term_putc(8)                   # local echo: erase one glyph
+            term_line_cur = term_line_cur - 1
+            hist_pos = 0
+            _redraw_edit_line()
+            keys_local_changed = 1
+        return
+    if code == 1:                           # Ctrl-A — Home
+        if term_line_cur != 0:
+            term_line_cur = 0
+            _redraw_edit_line()
+            keys_local_changed = 1
+        return
+    if code == 5:                           # Ctrl-E — End
+        if term_line_cur != term_line_len:
+            term_line_cur = term_line_len
+            _redraw_edit_line()
             keys_local_changed = 1
         return
     if code == 3:                           # Ctrl-C — abandon line, tell shell
         term_line_len = 0
+        term_line_cur = 0
+        hist_pos = 0
         _term_putc(10)
         keys_local_changed = 1
         _key_raw_to_shell(cast[uint8](3))
         return
-    if code == 9:                           # Tab — render locally (no completion)
+    if code == 9:                           # Tab — insert at cursor (no completion)
         if term_line_len < TERM_LINE_MAX - 1:
-            term_line[term_line_len] = 9
+            j2: uint64 = term_line_len
+            while j2 > term_line_cur:
+                term_line[j2] = term_line[j2 - 1]
+                j2 = j2 - 1
+            term_line[term_line_cur] = 9
             term_line_len = term_line_len + 1
-            _term_putc(9)
+            term_line_cur = term_line_cur + 1
+            hist_pos = 0
+            _redraw_edit_line()
             keys_local_changed = 1
         return
     if code < 32:
-        # Other control bytes (arrows arrive as ESC sequences, etc.) are not
-        # handled by the local line editor; drop them so they don't corrupt
-        # the line. (No history/cursor-motion in the local discipline — a
-        # classic line-buffered terminal.)
+        # Any other control byte (no in-line meaning) is dropped.
         return
-    # Printable byte: append to the local line + echo into the grid NOW.
+    # Printable byte: INSERT at the cursor (mid-line edits supported).
     if term_line_len < TERM_LINE_MAX - 1:
-        term_line[term_line_len] = cast[uint8](code)
+        j3: uint64 = term_line_len
+        while j3 > term_line_cur:
+            term_line[j3] = term_line[j3 - 1]
+            j3 = j3 - 1
+        term_line[term_line_cur] = cast[uint8](code)
         term_line_len = term_line_len + 1
-        _term_putc(cast[uint8](code))
+        term_line_cur = term_line_cur + 1
+        hist_pos = 0
+        _redraw_edit_line()
         keys_local_changed = 1
 
 
