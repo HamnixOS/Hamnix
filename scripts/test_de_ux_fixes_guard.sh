@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# scripts/test_de_ux_fixes_guard.sh — static guards for the four DE UX fixes so
+# they don't silently regress (the live proofs are the KVM drivers
+# scripts/verify_bug1_fmopen.py / verify_de_fixes.py / verify_bug4_settings.py,
+# captured as PNGs). Cheap grep/compile assertions only — no QEMU.
+#
+#   BUG 1  hamfmscene launches the editor with argv = [bin, path, NULL] so
+#          hameditscene sees argc>=2 and preloads the double-clicked file.
+#   BUG 2  devwsys auto-raises + focuses a window on its FIRST content commit
+#          (map-and-raise) so a freshly-opened window is topmost + focused.
+#   BUG 3  hamtermscene decodes ESC '[' A/B/C/D arrows into history (Up/Down)
+#          + an in-line cursor (Left/Right), instead of leaking "[A" glyphs.
+set -uo pipefail
+PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJ_ROOT"
+
+fail=0
+pass() { echo "[ux_guard] PASS $1"; }
+failf() { echo "[ux_guard] FAIL $1" >&2; fail=1; }
+need() { grep -q -- "$2" "$1" && pass "$3" || failf "$3"; }
+
+FM="user/hamfmscene.ad"; TS="user/hamtermscene.ad"; WS="sys/src/9/port/devwsys.ad"
+
+echo "[ux_guard] --- BUG 1: FM passes argv [bin, path, NULL] ---"
+# argv[0] = the binary, argv[1] = the path, argv[2] = 0 (terminator).
+need "$FM" "ed_argv\[0\] = cast\[uint64\](&ED_BIN\[0\])" "FM argv[0] is the editor binary path"
+need "$FM" "ed_argv\[1\] = cast\[uint64\](&ed_path\[0\])" "FM argv[1] is the file path"
+need "$FM" "ed_argv\[2\] = 0" "FM argv is NULL-terminated at [2]"
+if grep -q "ed_argv: Array\[2," "$FM"; then
+    failf "FM ed_argv still sized 2 (no room for [bin,path,NULL])"
+else
+    pass "FM ed_argv sized for [bin, path, NULL]"
+fi
+
+echo "[ux_guard] --- BUG 2: devwsys map-and-raise on first commit ---"
+need "$WS" "wsys_win_mapped" "devwsys has a per-window mapped flag"
+need "$WS" "if wsys_win_mapped\[u\] == 0 and wsys_scene_len\[u\] > 0" "first-commit map-and-raise gate"
+# the gate must raise + focus (skipping pinned backgrounds).
+if grep -Pzoq "wsys_win_mapped\[u\] = 1\n\s*if wsys_win_pinned\[u\] == 0:\n\s*_wsys_raise\(wid\)\n\s*_wsys_set_focus\(wid\)" "$WS"; then
+    pass "first commit raises + focuses the new window (non-pinned)"
+else
+    failf "first-commit raise+focus body missing/changed"
+fi
+
+echo "[ux_guard] --- BUG 3: hamtermscene arrow decode + history + cursor ---"
+need "$TS" "key_esc_st" "terminal has an ESC-CSI key decode state"
+need "$TS" "def _key_csi_final" "terminal decodes CSI final bytes (arrows)"
+need "$TS" "def _hist_push" "terminal has a command-history ring"
+need "$TS" "def _hist_load" "terminal recalls history entries"
+need "$TS" "term_line_cur" "terminal tracks an in-line insertion cursor"
+need "$TS" "def _redraw_edit_line" "terminal re-renders the edit row on cursor/history change"
+# Up=65 recalls older history; Left=68 moves the caret.
+need "$TS" "if code == 65:" "Up arrow handled (older history)"
+need "$TS" "if code == 68:" "Left arrow handled (caret left)"
+
+echo "[ux_guard] --- compile the touched user binaries ---"
+# shellcheck source=_adder_cc.sh
+source "$PROJ_ROOT/scripts/_adder_cc.sh"
+mkdir -p build/user
+for n in hamfmscene hamtermscene; do
+    if adder_cc_compile compile --target=x86_64-adder-user "user/${n}.ad" \
+            -o "build/user/${n}.elf" >/dev/null 2>&1; then
+        pass "user/${n}.ad compiles"
+    else
+        failf "user/${n}.ad failed to compile"
+    fi
+done
+
+echo "[ux_guard] --- result ---"
+if [ "$fail" = 0 ]; then echo "[ux_guard] RESULT: PASS"; exit 0
+else echo "[ux_guard] RESULT: FAIL"; exit 1; fi
