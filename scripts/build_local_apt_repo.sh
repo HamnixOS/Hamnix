@@ -81,7 +81,14 @@ Description: Hamnix offline apt-install proof package
 EOF
 
 echo "[build_local_apt_repo] (2/5) dpkg-deb --build"
-DEB="$WORK/${PKG}_${VER}_${ARCH}.deb"
+# The built .deb MUST live OUTSIDE $WORK: dpkg-deb --build packages the
+# ENTIRE $WORK tree into data.tar, so a .deb written inside $WORK would be
+# swept into the package's own payload (dpkg then tries to extract
+# /hamhello_1.0_amd64.deb at the read-only root -> "Operation not
+# permitted"). Stage it in a sibling temp dir cleaned by the same trap.
+DEBOUT="$(mktemp -d /tmp/hamhello-debout.XXXXXX)"
+trap 'rm -rf "$WORK" "$DEBOUT"' EXIT
+DEB="$DEBOUT/${PKG}_${VER}_${ARCH}.deb"
 # --root-owner-group keeps the tar members root:root without needing fakeroot.
 # -Zgzip: force GZIP compression of control.tar/data.tar. Modern dpkg-deb
 # defaults to xz (or zstd), but the Hamnix debian-minbase rootfs only stages
