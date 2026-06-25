@@ -189,7 +189,9 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       iremit=meta.get("IREMIT", 0),
                       irfold=meta.get("IRFOLD", 0),
                       irfallback=meta.get("IRFALLBACK", 0),
-                      irreassoc=meta.get("IRREASSOC", 0))
+                      irreassoc=meta.get("IRREASSOC", 0),
+                      irscratch=meta.get("IRSCRATCH", 0),
+                      irscratchmiss=meta.get("IRSCRATCHMISS", 0))
 
 
 # --------------------------------------------------------------------------
