@@ -1,0 +1,190 @@
+# arch/x86/kernel/cpu_kpti.ad — Kernel Page-Table Isolation (Meltdown).
+#
+# KPTI removes the kernel IMAGE from the page tables that CPL3's CR3 can
+# reference, so a Meltdown speculative side-channel from userspace cannot
+# probe kernel .text/.rodata/.data/.bss or the KASLR'd .ko module window.
+# It is defense-in-depth ON TOP of the existing SMEP/SMAP US=0 restamp
+# (cpu_mitigations.ad): SMEP/SMAP make a CPL3 access to a kernel VA FAULT;
+# KPTI makes the kernel VA ABSENT from the table entirely.
+#
+# THE USER PML4 (built by kpti_build_user_pml4, loaded into CR3 while the
+# task runs at CPL3):
+#   - PML4[0]   : copied VERBATIM from the kernel PML4 — the SHARED low
+#                 identity map. This is UNAVOIDABLE: Hamnix user pages
+#                 (ELF image / stack / brk / mmap) are all backed by
+#                 low-identity RAM with per-task US=1 cracks, and the
+#                 kernel data living in low RAM (per-CPU areas, kernel
+#                 stacks) is reached through it too. Documented constraint.
+#   - PML4[511] : a KPTI-PRIVATE high-half chain (fresh PDPT + PD) that
+#                 maps ONLY the 2 MiB PD leaves covering [__kpti_start,
+#                 __kpti_end) — the trampoline + entry stubs + IDT + TSS +
+#                 GDT + IST stacks + per-CPU CR3 slots. Every other
+#                 pdpt_high entry / PD leaf is left NOT-PRESENT, so the
+#                 kernel .text/.rodata/.data/.bss bulk AND the KASLR module
+#                 window (also under pdpt_high[510]/[511]) are HIDDEN.
+#   - all other PML4 slots : NOT-PRESENT.
+#
+# The trampoline VA is IDENTICAL in both tables (same high-half VA, just
+# additionally mapped in the user table), so the CR3-switch instruction
+# and the few that follow it do not fault across the swap.
+#
+# RUNTIME GATE: KPTI_RUNTIME_ENABLE. When 0, kpti_build_user_pml4 returns
+# the FULL kernel cr3, so user_cr3 == cr3 and every trampoline CR3 swap is
+# a harmless reload of the same table — the swap code path stays exercised
+# but isolation is inert. When 1, real isolation is in force. Default 1.
+
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def alloc_page() -> uint64
+extern def get_bsp_cr3() -> uint64
+extern def kpti_section_start() -> uint64
+extern def kpti_section_end() -> uint64
+
+# Default ON: the kernel boots with KPTI active (proven by the heartbeat
+# + installer boot). Flip to 0 for an A/B isolation-off comparison; the
+# swap trampolines become no-ops (user_cr3 == cr3) but still execute.
+KPTI_RUNTIME_ENABLE: uint64 = 1
+
+KPTI_VBASE:        uint64 = 0xffffffff80000000
+KPTI_ADDR_MASK:    uint64 = 0x000FFFFFFFFFF000
+KPTI_FLAG_P:       uint64 = 0x1
+KPTI_FLAG_RW:      uint64 = 0x2
+KPTI_FLAG_PS:      uint64 = 0x80
+# 2 MiB PD leaf, supervisor-only (US=0): the trampoline runs at CPL0 the
+# instant the CPU vectors to a stub / after SYSCALL entry, so CPL3 never
+# executes .kpti directly. US=0 keeps SMEP/SMAP semantics intact.
+KPTI_PD_LEAF_FLAGS: uint64 = 0x83        # PS | RW | P   (US=0)
+KPTI_TBL_FLAGS:     uint64 = 0x3         # RW | P  for non-leaf PDPT/PD
+KPTI_2MB:          uint64 = 0x200000
+
+# Recorded by kpti_init() for diagnostics / lazy use.
+_kpti_kernel_cr3: uint64 = 0
+_kpti_inited:     uint64 = 0
+
+
+def kpti_kernel_cr3() -> uint64:
+    # The FULL kernel PML4 phys recorded at init. The scheduler already
+    # carries this per task (task_table[].cr3); this accessor is for code
+    # that wants the canonical kernel table without a task handle.
+    return _kpti_kernel_cr3
+
+
+def _zero_page(pa: uint64):
+    # alloc_page() returns a low physical address == a valid VA via the
+    # low identity map, so we can write its 512 quads directly.
+    p: Ptr[uint64] = cast[Ptr[uint64]](pa)
+    i: uint64 = 0
+    while i < cast[uint64](512):
+        p[i] = 0
+        i = i + 1
+
+
+def kpti_build_user_pml4(kernel_pml4_phys: uint64) -> uint64:
+    # Build the per-task USER PML4 described in the file header. Returns
+    # the new PML4 physical address, or the kernel cr3 itself if KPTI is
+    # disabled / on allocation failure (so the caller always gets a usable
+    # table and the trampolines stay no-ops).
+    if KPTI_RUNTIME_ENABLE == 0:
+        return kernel_pml4_phys
+
+    user_pml4: uint64 = alloc_page()
+    if user_pml4 == 0:
+        printk0("[kpti] alloc user PML4 failed; falling back to full cr3\n")
+        return kernel_pml4_phys
+    _zero_page(user_pml4)
+
+    kpml4: Ptr[uint64] = cast[Ptr[uint64]](kernel_pml4_phys & KPTI_ADDR_MASK)
+    upml4: Ptr[uint64] = cast[Ptr[uint64]](user_pml4)
+
+    # PML4[0]: share the low identity map verbatim (user pages + the
+    # kernel data living in low RAM). Unavoidable; documented.
+    upml4[0] = kpml4[0]
+
+    # PML4[511]: build a KPTI-private high-half chain. Fresh PDPT.
+    user_pdpt: uint64 = alloc_page()
+    if user_pdpt == 0:
+        printk0("[kpti] alloc user PDPT failed; falling back to full cr3\n")
+        return kernel_pml4_phys
+    _zero_page(user_pdpt)
+    upml4[511] = (user_pdpt & KPTI_ADDR_MASK) | KPTI_TBL_FLAGS
+
+    # Walk [__kpti_start, __kpti_end) by 2 MiB, installing US=0 PS leaves
+    # that point at the SAME physical frames the kernel uses. The .kpti
+    # section is 2 MiB-aligned at both ends (kernel.lds), so this covers
+    # whole PD leaves with no partial-leaf aliasing. All kpti VAs fall in
+    # the first 1 GiB of the high half -> PDPT index 510.
+    ks: uint64 = kpti_section_start()
+    ke: uint64 = kpti_section_end()
+    pdpt: Ptr[uint64] = cast[Ptr[uint64]](user_pdpt)
+
+    va: uint64 = ks & ~(KPTI_2MB - cast[uint64](1))
+    leaves: uint64 = 0
+    while va < ke:
+        pdpt_idx: uint64 = (va >> cast[uint64](30)) & cast[uint64](0x1FF)
+        pd_idx:   uint64 = (va >> cast[uint64](21)) & cast[uint64](0x1FF)
+
+        # Find / create the PD for this PDPT slot in the user table.
+        pdpte: uint64 = pdpt[pdpt_idx]
+        pd_phys: uint64 = 0
+        if (pdpte & KPTI_FLAG_P) == 0:
+            pd_phys = alloc_page()
+            if pd_phys == 0:
+                printk0("[kpti] alloc user PD failed; partial table\n")
+                return kernel_pml4_phys
+            _zero_page(pd_phys)
+            pdpt[pdpt_idx] = (pd_phys & KPTI_ADDR_MASK) | KPTI_TBL_FLAGS
+        else:
+            pd_phys = pdpte & KPTI_ADDR_MASK
+
+        pd: Ptr[uint64] = cast[Ptr[uint64]](pd_phys)
+        # phys frame of this 2 MiB kernel VA = va - KERNEL_VBASE (pdpt_high
+        # [510] maps phys 0 -> 0xffffffff80000000). Install a US=0 PS leaf.
+        phys: uint64 = va - KPTI_VBASE
+        pd[pd_idx] = (phys & KPTI_ADDR_MASK) | KPTI_PD_LEAF_FLAGS
+        leaves = leaves + 1
+
+        va = va + KPTI_2MB
+
+    printk1("[kpti] user PML4 built: %d kpti 2MiB leaves mapped (kernel"
+            " image bulk + module window HIDDEN)\n", leaves)
+    return user_pml4
+
+
+def kpti_sync_user_pml4(kernel_cr3: uint64, user_cr3: uint64):
+    # Keep the USER PML4's PML4[0] entry IN LOCKSTEP with the kernel PML4's.
+    # CRITICAL: fs/elf.ad's _elf_install_user_mapping_locked (and the fork
+    # COW cracker) REWRITE the task's kernel-PML4 PML4[0] ENTRY to point at
+    # a fresh per-task PDPT when it cracks the shared boot PDPT. The user
+    # PML4 we built earlier copied the OLD PML4[0] entry, so without this
+    # re-sync the user table would still reference the boot PDPT and a CPL3
+    # task would NOT see its own execve'd user mappings -> instant #PF. We
+    # therefore copy the live PML4[0] entry kernel->user on every dispatch /
+    # exec, so the user table always reflects the current user address
+    # space. (The high half stays KPTI-private: we never touch PML4[511].)
+    # No-op when isolation is off (user_cr3 == kernel_cr3).
+    if KPTI_RUNTIME_ENABLE == 0:
+        return
+    if user_cr3 == 0:
+        return
+    if user_cr3 == kernel_cr3:
+        return
+    kpml4: Ptr[uint64] = cast[Ptr[uint64]](kernel_cr3 & KPTI_ADDR_MASK)
+    upml4: Ptr[uint64] = cast[Ptr[uint64]](user_cr3 & KPTI_ADDR_MASK)
+    upml4[0] = kpml4[0]
+
+
+def kpti_init():
+    # Called from start_kernel AFTER setup_smap_late() and mem_init(): the
+    # page tables are live and the .kpti PD leaves already resolve via the
+    # kernel's 1 GiB pdpt_high[510] huge page. Record the kernel PML4; the
+    # per-task user PML4s are built lazily at task creation
+    # (kpti_build_user_pml4, called from kernel/sched/core.ad).
+    _kpti_kernel_cr3 = get_bsp_cr3()
+    _kpti_inited = 1
+    if KPTI_RUNTIME_ENABLE == 1:
+        printk2("[kpti] init: KPTI ENABLED; kernel cr3=%p, .kpti window"
+                " [%p..)\n", _kpti_kernel_cr3, kpti_section_start())
+        printk1("[kpti]   .kpti end=%p\n", kpti_section_end())
+    else:
+        printk0("[kpti] init: KPTI staged OFF (user_cr3==cr3; swaps are"
+                " no-ops)\n")

@@ -143,6 +143,15 @@ extern def local_irq_restore(flags: uint64)
 extern def get_bsp_cr3() -> uint64
 extern def read_cr3() -> uint64
 extern def load_cr3(value: uint64)
+# KPTI (Meltdown mitigation): build a per-task USER PML4 that maps only the
+# user pages + the .kpti trampoline window (kernel image bulk + module
+# window hidden), and stash the dispatched task's full + user CR3 in this
+# CPU's KPTI slots so the entry/exit trampolines can swap CR3.
+extern def kpti_build_user_pml4(kernel_pml4_phys: uint64) -> uint64
+extern def kpti_set_cpu_cr3(cpu: uint64, kernel_cr3: uint64, user_cr3: uint64)
+# Re-sync the user PML4's PML4[0] entry from the (possibly just-cracked)
+# kernel PML4 — see cpu_kpti.ad. MUST run before every dispatch/exec swap.
+extern def kpti_sync_user_pml4(kernel_cr3: uint64, user_cr3: uint64)
 # Physical end of the loaded kernel image. The page allocator's memblock
 # floor is set at (or just above) this address by e820_init, so NO
 # kernel-owned page (table or frame) ever has a physical base below it.
@@ -3357,6 +3366,11 @@ def create_user_thread(entry: uint64, name0: uint64,
         # so its PML4 cannot be reaped out from under us before the
         # EMBRYO->READY publish.
         task_table[s].cr3 = share_cr3
+        # KPTI: build this thread's USER PML4 from the SHARED address space.
+        # It copies PML4[0] of share_cr3 (the shared low-identity/user map)
+        # + maps only the .kpti window; the kernel image bulk stays hidden.
+        # With KPTI disabled this returns share_cr3 (user_cr3 == cr3).
+        task_table[s].user_cr3 = kpti_build_user_pml4(share_cr3)
     else:
         new_pml4: uint64 = alloc_page()
         if new_pml4 == 0:
@@ -3395,6 +3409,11 @@ def create_user_thread(entry: uint64, name0: uint64,
             load_cr3(_clone_live_cr3)
             local_irq_restore(_clone_irq_flags)
         task_table[s].cr3 = new_pml4
+        # KPTI: build this task's USER PML4 (Meltdown isolation). Copies
+        # new_pml4's PML4[0] (low identity / user pages) + maps only the
+        # .kpti trampoline window; kernel image bulk + KASLR module window
+        # are ABSENT. With KPTI disabled this returns new_pml4 (no isolation).
+        task_table[s].user_cr3 = kpti_build_user_pml4(new_pml4)
     # SMAP-v3 step 2: install an EXPLICIT US=1 PTE for the freshly
     # alloc'd user stack into the child's PML4. Pre-SMAP-v3 the stack
     # was reachable from CPL=3 only via the identity-backfill leaves'
@@ -4224,6 +4243,16 @@ def schedule():
     if task_table[nxt].cr3 != task_table[prev].cr3:
         load_cr3(task_table[nxt].cr3)
 
+    # KPTI: stash this task's FULL kernel cr3 and its USER (isolated) cr3
+    # in THIS CPU's KPTI slots. The kernel keeps running on the FULL table
+    # (loaded above); the entry trampoline reloads cr3 from the kernel slot
+    # on the next ring0 entry, and the exit trampoline loads the user slot
+    # before returning to CPL3. When KPTI is disabled user_cr3 == cr3, so
+    # both slots hold the same table and the swaps are no-ops.
+    kpti_sync_user_pml4(task_table[nxt].cr3, task_table[nxt].user_cr3)
+    kpti_set_cpu_cr3(get_cpu_id(), task_table[nxt].cr3,
+                     task_table[nxt].user_cr3)
+
     # U27: per-task FS_BASE save/restore. Linux's __switch_to writes
     # the next task's TLS base via wrfsbase / wrmsr. Threads created by
     # clone(CLONE_SETTLS) each carry their own TLS, and the only way
@@ -4696,6 +4725,11 @@ def sched_ap_idle_loop():
             tss_set_rsp0(task_table[nxt].kstack_top)
             if task_table[nxt].cr3 != task_table[my_idle_slot].cr3:
                 load_cr3(task_table[nxt].cr3)
+            # KPTI: stash this CPU's incoming-task kernel + user cr3 so the
+            # AP's entry/exit trampolines can swap (see schedule()).
+            kpti_sync_user_pml4(task_table[nxt].cr3, task_table[nxt].user_cr3)
+            kpti_set_cpu_cr3(my_cpu_id, task_table[nxt].cr3,
+                             task_table[nxt].user_cr3)
             write_msr(SCHED_IA32_FS_BASE, task_table[nxt].fs_base)
             _rq_unlock_cpu(my_cpu_id)
 
@@ -5092,6 +5126,12 @@ def start_first_task(first_slot: uint64):
         printk1("[smap-v3f] kstack-24 read OK = %p\n", _probe_val)
     else:
         printk0("[smap-v3f] task.cr3==0 — SKIPPING load_cr3\n")
+    # KPTI: seed THIS (BSP) CPU's KPTI slots with the first task's full +
+    # user cr3 before enter_first_task_sysret swaps CR3 to the user table
+    # ahead of the SYSRETQ to CPL3. With KPTI disabled user_cr3 == cr3.
+    kpti_sync_user_pml4(task_table[fs0].cr3, task_table[fs0].user_cr3)
+    kpti_set_cpu_cr3(get_cpu_id(), task_table[fs0].cr3,
+                     task_table[fs0].user_cr3)
     # ---- M16.156: Asus real-hw triple-fault fix --------------------
     #
     # Three small mitigations applied before the SYSRETQ handoff. This
@@ -5794,6 +5834,22 @@ def current_task_nsignals() -> uint64:
     if t == cast[Ptr[TaskStruct]](0):
         return 0
     return t[0].nsignals
+
+
+def kpti_refresh_current_after_exec():
+    # KPTI: do_execve has replaced the CURRENT task's user address space
+    # (vma_clear + a fresh ELF crack rewrote cur cr3's PML4[0] entry to a
+    # new per-task PDPT). Re-sync the task's USER PML4 PML4[0] from the new
+    # kernel PML4[0] and refresh THIS CPU's KPTI user-cr3 slot, so the
+    # immediately-following do_execve_finish SYSRETQ lands under a user
+    # table that maps the new image. No schedule() runs between here and
+    # the SYSRETQ, so the per-CPU slot must be updated explicitly. No-op
+    # when KPTI is disabled (user_cr3 == cr3).
+    t: Ptr[TaskStruct] = current_task()
+    if t == cast[Ptr[TaskStruct]](0):
+        return
+    kpti_sync_user_pml4(t[0].cr3, t[0].user_cr3)
+    kpti_set_cpu_cr3(get_cpu_id(), t[0].cr3, t[0].user_cr3)
 
 
 def task_pml4(slot: int32) -> uint64:
