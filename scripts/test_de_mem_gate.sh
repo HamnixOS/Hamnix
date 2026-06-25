@@ -85,10 +85,10 @@ screendump() {
 screendump
 
 echo "=================== MEM GATE RESULTS ==================="
-echo "--- before_apps (base DE session) ---"
-awk '/\[mem_gate\] before_apps/{f=1;next} /\[mem_gate\] after_apps/{f=0} f && /:/' "$LOG" | grep -aE 'Mem|Pages|Vma|Tasks' | head -20
-echo "--- after_apps (full app set) ---"
-awk '/\[mem_gate\] after_apps/{f=1;next} /\[visual_gate\] done/{f=0} f && /:/' "$LOG" | grep -aE 'Mem|Pages|Vma|Tasks' | head -20
+echo "--- before_apps (base DE session: compositor+desktop+panel+term+fm+calc+editor) ---"
+awk '/\[mem_gate\] before_apps/{f=1;next} /\[mem_gate\] after_apps/{f=0} f' "$LOG" | grep -aE 'Mem:|total *free' | head -3
+echo "--- after_apps (full app set incl. visual-gate apps) ---"
+awk '/\[mem_gate\] after_apps/{f=1;next} /\[visual_gate\] done/{f=0} f' "$LOG" | grep -aE 'Mem:|total *free' | head -3
 echo "--- OOM / alloc-fail check ---"
 if grep -aiE 'elf: OOM|memblock_alloc.*fail|OOM|out of memory' "$LOG"; then
     echo "[mem_gate] *** OOM/alloc-fail markers present ***"
