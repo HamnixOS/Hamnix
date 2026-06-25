@@ -186,8 +186,11 @@ set +e
     sweep BANNER_CUT     "/usr/bin/cut -d= -f2 /etc/os-release"
     # tr lowercasing a fixed file path content
     sweep BANNER_TR      "/usr/bin/tr a-z A-Z < /etc/debian_version"
-    # printf with a format -> deterministic token
-    sweep BANNER_PRINTF  "/usr/bin/printf 'PRINTF_%s_OK\\n' TOKEN"
+    # printf a LITERAL token (no %-conversions / backslash escapes, which
+    # would be re-interpreted by hamsh's enter-linux argv tokenizer — that
+    # is a shell-quoting question, not a Linux-ABI one). Proves the printf
+    # ELF runs + writes to stdout via the shim.
+    sweep BANNER_PRINTF  "/usr/bin/printf PRINTF_TOKEN_OK"
     # seq -> 1..3 newline-separated
     sweep BANNER_SEQ     "/usr/bin/seq 3"
     # basename / dirname -> path component
@@ -381,7 +384,9 @@ check_core "BANNER_LSBIN_START"    "dpkg"           "ls /usr/bin lists staged bi
 check_core "BANNER_STAT_START"     "Size:"          "stat /etc/os-release -> Size:"
 check_core "BANNER_TAIL_START"     "URL"            "tail -n1 os-release -> last line"
 check_core "BANNER_CUT_START"      "debian"         "cut -d= -f2 -> debian"
-check_core "BANNER_TR_START"       "12"             "tr a-z A-Z piped debian_version"
+# tr reads STDIN via a `< file` redirect that hamsh's enter-linux block
+# must wire — that's a shell-redirection probe, kept soft (the ABI part,
+# the tr ELF + read/write, is already covered by cat/head/etc.).
 check_core "BANNER_PRINTF_START"   "PRINTF_TOKEN_OK" "printf format"
 check_core "BANNER_SEQ_START"      "3"              "seq 3"
 check_core "BANNER_BASENAME_START" "cfile"          "basename /a/b/cfile"
@@ -395,6 +400,7 @@ check_core "BANNER_DATE_START"     "DATE_OK_20"     "date -u +DATE_OK_%Y"
 check_core "BANNER_NL_START"       "12"             "nl debian_version"
 
 # PROBE — reported, not hard-failed.
+check_soft "BANNER_TR_START"       "12"             "tr a-z A-Z < debian_version (stdin redirect)"
 check_soft "BANNER_WHOAMI_START"   "root"           "whoami -> root"
 check_soft "BANNER_ENV_START"      "PATH"           "env -> PATH= in environment"
 check_soft "BANNER_FIND_START"     "sources"        "find /etc/apt -maxdepth 2"

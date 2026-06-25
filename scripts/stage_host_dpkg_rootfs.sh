@@ -130,6 +130,22 @@ copy_with_libs() {
         if [ "$lib" != "$lr" ]; then
             install -D -m0755 "$lr" "$ROOTFS/$lib"
         fi
+        # CANONICAL usrmerge mirror. ldd reports lib paths under whichever
+        # of /lib vs /usr/lib the host resolves (multiarch + the
+        # /lib->/usr/lib usrmerge symlink make this inconsistent across
+        # libs). But build_initramfs.py's glob_libs only scans
+        # usr/lib/x86_64-linux-gnu/, so a closure lib that landed under
+        # the non-usr lib/ spelling (e.g. libselinux.so.1) is NEVER
+        # embedded -> the binary dies at runtime with "cannot open shared
+        # object". Mirror every staged lib to its usr/lib canonical path
+        # so the embed glob catches all of them regardless of how ldd
+        # spelled it. (libfoo at /lib/x/foo -> ALSO usr/lib/x/foo.)
+        case "$lib" in
+            /lib/*)
+                local canon="/usr${lib}"
+                install -D -m0755 "$lr" "$ROOTFS/$canon"
+                ;;
+        esac
     done
 }
 
