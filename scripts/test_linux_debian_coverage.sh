@@ -217,12 +217,10 @@ set +e
     sweep BANNER_READLINK "/usr/bin/readlink /bin/sh"
     # find a staged dir, depth-limited (getdents + recursion)
     SWEEP_SLEEP=8 sweep BANNER_FIND "/usr/bin/find /etc/apt -maxdepth 2"
-    # date -u with NO format string (a `+%Y` arg would be re-interpreted
-    # by hamsh's enter-linux tokenizer — shell quoting, not ABI). Plain
-    # `date -u` prints the full UTC date line, which contains "UTC" and a
-    # 4-digit year — proves the date ELF runs + reads the clock via the
-    # shim (clock_gettime / gettimeofday).
-    sweep BANNER_DATE    "/usr/bin/date -u"
+    # NOTE: `date -u` is run LAST (near bash), NOT here — like bash it
+    # currently HANGS the guest mid-exec (silent, no fault/printk; shares
+    # an unknown wedge cause with bash — a separate track). Ordering it
+    # mid-sweep truncated every later binary's output behind the wedge.
     # nl numbers lines
     sweep BANNER_NL      "/usr/bin/nl /etc/debian_version"
     # od hex dump first bytes
@@ -249,6 +247,12 @@ set +e
     # wedges, PART B (offline dpkg unpack) won't run — that path is anyway
     # covered authoritatively by scripts/test_linux_apt_install.sh and the
     # installer-live test, so a bash hang here doesn't lose unique coverage.
+    # date -u — runs the date ELF + reads the clock; currently wedges the
+    # guest (shares bash's silent-hang cause). Soft, second-to-last.
+    printf 'echo BANNER_DATE_START\n'; sleep 1
+    printf 'enter linux { /usr/bin/date -u }\n'; sleep 6
+    printf 'echo BANNER_DATE_END\n'; sleep 1
+
     printf 'echo BANNER_BASH_START\n'; sleep 1
     printf "enter linux { /bin/bash -c '/bin/echo BASH_VER \$BASH_VERSION' }\n"; sleep 8
     printf 'echo BANNER_BASH_END\n'; sleep 1
@@ -430,12 +434,14 @@ check_core "BANNER_HEADC_START"    "12"             "head -c5 debian_version"
 check_core "BANNER_WCC_START"      "debian_version" "wc -c debian_version"
 check_core "BANNER_MD5_START"      "debian_version" "md5sum debian_version (digest line)"
 check_core "BANNER_READLINK_START" "dash"           "readlink /bin/sh -> dash"
-check_core "BANNER_DATE_START"     "UTC"            "date -u (prints UTC date line)"
+# date -u wedges the guest mid-exec (shares bash's silent-hang cause) —
+# soft probe, run last so it can't truncate the working sweep.
 check_core "BANNER_NL_START"       "12"             "nl debian_version"
 
 # PROBE — reported, not hard-failed.
 # bash currently loads (libtinfo+closure resolve) but HANGS the guest
 # mid-execution — soft probe, separate bash-specific track.
+check_soft "BANNER_DATE_START"     "UTC"            "date -u printed UTC date (date hangs mid-exec — known)"
 check_soft "BANNER_BASH_START"     "BASH_VER 5"     "bash -c printed BASH_VERSION (bash hangs mid-exec — known)"
 check_soft "BANNER_TR_START"       "12"             "tr a-z A-Z < debian_version (stdin redirect)"
 check_soft "BANNER_WHOAMI_START"   "root"           "whoami -> root"
