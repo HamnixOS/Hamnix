@@ -76,9 +76,10 @@ try:
         got=False
         for (sx,sy) in [(48,405),(48,415),(48,395),(40,408),(55,405)]:
             dblclick(sx,sy)
-            time.sleep(2.0)
+            time.sleep(3.5)
             if find_wids("Settings"):
                 got=True; print(f"Settings opened via icon at ({sx},{sy})", file=sys.stderr); break
+        time.sleep(2.0)
         sets=find_wids("Settings")
         print(f"Settings wids={sets}", file=sys.stderr)
         screendump("desk_after")
