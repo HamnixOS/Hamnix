@@ -157,6 +157,10 @@ enter_first_task:
  * task_struct, sp at offset 0. We keep BOTH helpers exported so
  * a one-line revert (call site swap in kernel/sched/core.ad) is
  * available if SYSRETQ turns out to have its own real-hw bug. */
+/* enter_first_task_sysret + sysret_bootstrap end in a CPL0->CPL3 SYSRETQ
+ * preceded by a KPTI swap to the USER PML4; the SYSRETQ instruction bytes
+ * must be fetched under the user table, so both live in .kpti.text. */
+    .section .kpti.text, "ax"
     .align 16
     .globl enter_first_task_sysret
 enter_first_task_sysret:
@@ -242,6 +246,17 @@ sysret_bootstrap:
     /* %rsp is now the user stack. Zero %r15 so the user task wakes
      * with r15 = 0 (matches the IRETQ path's contract). */
     xorq    %r15, %r15                 /* user wakes with r15 = 0 */
+
+    /* KPTI: install the USER PML4 before SYSRETQ. %rsp already points at
+     * the user stack (mapped in the user table via PML4[0]); after the
+     * swap the SYSRETQ fetch is the current insn (this code is .kpti.text,
+     * mapped in both). %rcx/%r11/%rdi/%rsi/%rsp carry the user state; use
+     * %r8/%r10 as scratch (dead here). When KPTI is disabled the slot
+     * holds the full cr3, so this is a no-op reload. */
+    movq    %gs:0, %r8
+    leaq    kpti_user_cr3_slots(%rip), %r10
+    movq    (%r10, %r8, 8), %r8
+    movq    %r8, %cr3
 
     /* SYSRETQ in 64-bit mode:
      *   CS = (STAR[63:48] + 0x10) | 3      = 0x23

@@ -27,13 +27,36 @@
  */
 
     .code64
-    .section .text, "ax"
+
+/* syscall_entry must be FETCHED under the user CR3 (on SYSCALL entry CR3
+ * is still the user PML4), so it lives in .kpti.text — the only high-half
+ * window the user PML4 maps. The CR3 swap to the kernel table is the
+ * first real action; after it the rest of the body runs fully-mapped. */
+    .section .kpti.text, "ax"
 
 /* ---------- syscall_entry: the SYSCALL handoff ------------------- */
 
     .align 16
     .globl syscall_entry
 syscall_entry:
+    /* KPTI: swap CR3 user -> kernel as the ABSOLUTE first action. On
+     * SYSCALL entry %rsp still points at the user stack (US=1, mapped in
+     * BOTH tables via PML4[0]), so we can spill two scratch regs there to
+     * compute the kernel CR3 from this CPU's kpti_kernel_cr3_slots[cpu].
+     * STAC: CPL=0 stores to a US=1 page need AC under CR4.SMAP. cpu_id is
+     * at %gs:0 (codegen-pinned). kpti_kernel_cr3_slots is in .kpti.bss
+     * (mapped in the user PML4). When KPTI is disabled this slot holds the
+     * FULL cr3 too, so the load is a harmless reload of the same table. */
+    stac
+    pushq   %rax                      /* save user nr (restored below)   */
+    pushq   %rcx                      /* save user RIP (restored below)  */
+    movq    %gs:0, %rax               /* cpu_id (pinned per-CPU offset 0) */
+    leaq    kpti_kernel_cr3_slots(%rip), %rcx
+    movq    (%rcx, %rax, 8), %rax     /* kernel CR3 for this CPU's task   */
+    movq    %rax, %cr3
+    popq    %rcx                      /* restore user RIP                */
+    popq    %rax                      /* restore user nr                 */
+    clac
     /* On entry from SYSCALL:
      *   %rax = syscall number
      *   %rdi, %rsi, %rdx, %r10, %r8, %r9 = syscall args
@@ -212,6 +235,19 @@ syscall_entry:
     popq    %rcx                      /* user RIP    */
     popq    %r11                      /* user RFLAGS */
     popq    %rsp                      /* user rsp (= user_rsp - 16) */
+
+    /* KPTI: swap CR3 kernel -> user before the trailing user-stack pops +
+     * sysretq. %r12/%r13 are dead here (immediately re-popped to their
+     * user values below), so use them as scratch. The user stack and
+     * kpti_user_cr3_slots are both mapped in the user PML4, and these
+     * instructions are in .kpti.text, so the pops + sysretq fetch cleanly
+     * under the user table. When KPTI is disabled this slot holds the
+     * full cr3, so the load is a no-op reload. */
+    movq    %gs:0, %r12               /* cpu_id (pinned per-CPU offset 0) */
+    leaq    kpti_user_cr3_slots(%rip), %r13
+    movq    (%r13, %r12, 8), %r12     /* user CR3 for this CPU's task     */
+    movq    %r12, %cr3
+
     /* SMAP v3b: the next two popq's read from the user stack at CPL=0,
      * so we re-arm AC just for that window. SYSRETQ then reloads RFLAGS
      * from %r11 (user's saved RFLAGS), which clears AC naturally — no
@@ -221,6 +257,15 @@ syscall_entry:
     popq    %r12                      /* user %r12 (parked 1st)     */
 
     sysretq                           /* CPL 0 -> 3, RIP=%rcx       */
+
+/* Back to plain .text for the helpers below — they all run with the
+ * kernel CR3 (called from kernel context), so they need not be in the
+ * .kpti window. EXCEPTION: do_execve_finish / enter_user_mode end in a
+ * CPL0->CPL3 transition and so carry their own user-CR3 swap below; the
+ * swap instructions there are still fetched under the kernel CR3 (we are
+ * in kernel context until the sysretq/iretq retires), so plain .text is
+ * correct for them. */
+    .section .text, "ax"
 
 /* ---------- write_msr(index, value) ------------------------------ */
 
@@ -293,6 +338,13 @@ set_efer_nxe:
     wrmsr
     ret
 
+/* do_execve_finish + enter_user_mode each END in a CPL0->CPL3 transition
+ * preceded by a KPTI CR3 swap to the USER table. After that swap the CPU
+ * still has to FETCH the following instructions (the sysretq / iretq)
+ * which are NOT mapped in the user PML4 if they live in plain .text — so
+ * both routines must reside in .kpti.text (mapped in BOTH tables). */
+    .section .kpti.text, "ax"
+
 /* ---------- do_execve_finish(new_rip, new_rsp, argc, argv) -------- *
  * Tail-call from the SYS_EXECVE handler when it has loaded a new ELF
  * and wants to "become" that program. We never return through the
@@ -323,6 +375,16 @@ do_execve_finish:
     movq    %rdx, %rdi                 /* user %rdi = argc            */
     movq    %r10, %rsi                 /* user %rsi = argv            */
     movq    $0x202, %r11               /* RFLAGS (IF=1, reserved bit) */
+    /* KPTI: install the user PML4 before returning to CPL3. We are still
+     * in kernel context (kernel CR3), so this swap's ifetch is from .text
+     * fine; the sysretq lands in user code under the user table. The
+     * Adder execve path updates kpti_user_cr3_slots[cpu] to this task's
+     * (possibly just-rebuilt) user_cr3 before tail-calling here. r8/r9 are
+     * dead at this point. */
+    movq    %gs:0, %r8
+    leaq    kpti_user_cr3_slots(%rip), %r9
+    movq    (%r9, %r8, 8), %r8
+    movq    %r8, %cr3
     sysretq
 
 /* ---------- enter_user_mode(entry, stack) ------------------------ *
@@ -350,7 +412,20 @@ enter_user_mode:
     pushq   $0x202                     /* RFLAGS (IF=1 - timer fires) */
     pushq   $0x23                      /* CS                          */
     pushq   %rdi                       /* RIP                         */
+    /* KPTI: install the user PML4 before iretq to CPL3. iret frame is
+     * already built on the kernel stack (PML4[0], mapped in both); after
+     * the swap the iretq fetch is still kernel-CR3 (current insn) and the
+     * landing pad is user. r8/r9 are dead here. */
+    movq    %gs:0, %r8
+    leaq    kpti_user_cr3_slots(%rip), %r9
+    movq    (%r9, %r8, 8), %r8
+    movq    %r8, %cr3
     iretq
+
+    /* Back to plain .text: the user-mode demo payloads below are copied
+     * into US=1 user pages and executed there (position-independent), so
+     * they need not be in the .kpti window. */
+    .section .text, "ax"
 
 /* ---------- user_demo_entry: ring-3 test payload ----------------- *
  * A tiny user program that issues a series of SYS_PUTC (nr=0) calls

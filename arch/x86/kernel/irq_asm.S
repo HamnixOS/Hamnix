@@ -18,7 +18,13 @@
  */
 
     .code64
-    .section .text, "ax"
+
+/* KPTI: an IRQ can fire while CPL3 (CR3 = the user PML4). The CPU fetches
+ * the per-vector stub bytes under WHATEVER CR3 was active, so every
+ * irq_stub_N AND common_irq must live in .kpti.text (the only high-half
+ * window the user PML4 maps). common_irq swaps CR3 to the kernel table on
+ * entry and back to the user table on a CPL3 return. */
+    .section .kpti.text, "ax"
 
 /* ---------- per-IRQ stubs ---------------------------------------- */
     .macro IRQ_STUB n
@@ -149,6 +155,17 @@ common_irq:
     pushq %r10
     pushq %r11
 
+    /* KPTI: swap CR3 to the kernel table before do_irq touches kernel
+     * data/code. If this IRQ nested on kernel context CR3 was already the
+     * kernel table — reloading it is a harmless no-op. The 9 pushes above
+     * landed on the kernel stack (TSS.RSP0, PML4[0]) when coming from
+     * CPL3, so they were safe pre-swap. %rax/%rcx are saved, use as
+     * scratch. cpu_id @ %gs:0. */
+    movq  %gs:0, %rax
+    leaq  kpti_kernel_cr3_slots(%rip), %rcx
+    movq  (%rcx, %rax, 8), %rax
+    movq  %rax, %cr3
+
     /* Stack layout right now (low -> high), 9 caller-saved quads
      * pushed above the stub's vec/ec and the CPU's iret frame:
      *    0..64  r11/r10/r9/r8/rdi/rsi/rdx/rcx/rax
@@ -169,6 +186,22 @@ common_irq:
     movq  96(%rsp), %rsi
     call  do_irq
 
+    /* KPTI exit: if we are returning to CPL3 (saved CS RPL == 3 at
+     * 96(%rsp)), swap CR3 to the USER table before the pops + iretq. The
+     * pops read the kernel stack (PML4[0], mapped in the user table) and
+     * the iretq frame is there too, so they resolve post-swap; the iretq
+     * fetch is from .kpti.text. If returning to CPL0 (nested kernel IRQ),
+     * leave the kernel table loaded. %rax/%rcx are restored by the pops
+     * below, so clobbering them here is fine. */
+    movq  96(%rsp), %rax              /* saved CS */
+    andq  $3, %rax
+    cmpq  $3, %rax
+    jne   1f
+    movq  %gs:0, %rax
+    leaq  kpti_user_cr3_slots(%rip), %rcx
+    movq  (%rcx, %rax, 8), %rax
+    movq  %rax, %cr3
+1:
     popq  %r11
     popq  %r10
     popq  %r9
@@ -183,6 +216,10 @@ common_irq:
     addq  $16, %rsp
 
     iretq
+
+    /* Back to plain .text/.rodata for the lookup table + IRQ-control
+     * wrappers below; these run only in kernel context (kernel CR3). */
+    .section .text, "ax"
 
 /* ---------- irq_stub_table --------------------------------------- *
  * Sixty-four entries, one per IRQ vector (32..95). Consumed by

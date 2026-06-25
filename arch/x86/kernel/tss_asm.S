@@ -64,7 +64,16 @@
     .equ DF_STK_SIZE, 4096
     .equ GDTR_STRIDE, 16          /* 10 used, padded to 16              */
 
-    .section .bss
+    /* KPTI: the CPU reads the TSS (TR-cached base) on every CPL3->0
+     * transition to load RSP0/IST, and reads the GDT (GDTR-cached) to
+     * reload kernel CS/SS via the IDT gate selector when an IRQ/trap
+     * vectors from CPL3 — both happen while CR3 = the user PML4. So
+     * per_cpu_tss / per_cpu_gdt / per_cpu_gdtr (and the #DF IST stacks)
+     * MUST be mapped in every user PML4: place them in .kpti.bss (the
+     * only high-half window the user table maps). .kpti.bss is zeroed by
+     * head_64.S. The high-half VMAs are unchanged, so all existing
+     * movabsq $per_cpu_tss / leaq references keep working. */
+    .section .kpti.bss, "aw", @nobits
     .align 16
     .globl per_cpu_tss
 per_cpu_tss:

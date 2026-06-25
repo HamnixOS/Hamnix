@@ -66,7 +66,14 @@
  */
 
     .code64
-    .section .text, "ax"
+
+/* KPTI: a CPU exception (#UD/#GP/#PF/...) can fire while CPL3 (CR3 = the
+ * user PML4); the CPU fetches the stub bytes under that table, so every
+ * trap_diag_stub_* AND common_trap_diag live in .kpti.text. The #PF stub
+ * (COW) returns to user via iretq and so swaps CR3 back to the user table
+ * on the resolved path; the halting diag path swaps to the kernel table
+ * on entry (so do_trap_diag can read kernel data) and never returns. */
+    .section .kpti.text, "ax"
 
 /* ---------- per-vector stubs ------------------------------------- *
  * Mirror the layout idt_asm.S uses so common_trap_diag can index the
@@ -159,6 +166,16 @@ trap_diag_stub_0e:
     pushq   %r14
     pushq   %r15
 
+    /* KPTI: swap CR3 to the kernel table before do_page_fault touches
+     * kernel data. A user write to a COW page faults at CPL3 with CR3 =
+     * user PML4; a kernel-mode fault arrives with CR3 already kernel
+     * (harmless reload). The 15 pushes above are on the kernel stack
+     * (PML4[0], mapped in both). %rax/%rcx are saved, use as scratch. */
+    movq    %gs:0, %rax
+    leaq    kpti_kernel_cr3_slots(%rip), %rcx
+    movq    (%rcx, %rax, 8), %rax
+    movq    %rax, %cr3
+
     /* Stack now (low -> high):
      *    0..112: r15..rax  (15 quads)
      *  120: error_code
@@ -200,6 +217,22 @@ trap_diag_stub_0e:
     cmpq    $1, %rax
     jne     1f
 
+    /* KPTI exit: the fault is resolved and we iretq back to the faulting
+     * context. If that context is CPL3 (saved CS RPL == 3 at 136(%rsp):
+     * 15 GPRs=120 + ec=8 + RIP=8 -> CS at 136), swap CR3 to the USER
+     * table before the pops + iretq. The kernel stack (PML4[0]) and iret
+     * frame are mapped in the user table, so the pops resolve post-swap;
+     * the iretq fetch is from .kpti.text. A kernel-mode COW fault returns
+     * to CPL0 and keeps the kernel table. %rax/%rcx restored by pops. */
+    movq    136(%rsp), %rax            /* saved CS */
+    andq    $3, %rax
+    cmpq    $3, %rax
+    jne     2f
+    movq    %gs:0, %rax
+    leaq    kpti_user_cr3_slots(%rip), %rcx
+    movq    (%rcx, %rax, 8), %rax
+    movq    %rax, %cr3
+2:
     /* Resolved: pop the 15 saved GPRs, drop the error code, iretq. */
     popq    %r15
     popq    %r14
@@ -273,6 +306,18 @@ trap_diag_stub_13:
     .align 16
     .globl common_trap_diag
 common_trap_diag:
+    /* KPTI: swap CR3 to the kernel table so do_trap_diag_* can read
+     * kernel .rodata / .data. We arrive here from a CPL3 fault with CR3 =
+     * user, or from a CPL0 fault with CR3 already kernel (harmless
+     * reload). This path HALTS (never iretq), so no exit swap. The vec/ec
+     * + iret frame we snapshot below are on the kernel stack (PML4[0],
+     * mapped in both). %rax/%rcx are free here (snapshot uses r12..r15 +
+     * rbx/rbp). */
+    movq    %gs:0, %rax
+    leaq    kpti_kernel_cr3_slots(%rip), %rcx
+    movq    (%rcx, %rax, 8), %rax
+    movq    %rax, %cr3
+
     /* Snapshot the seven fields BEFORE we move %rsp. Park them in
      * callee-saved regs so the Adder call can't trash them. We have
      * 5 callee-saved regs available (rbx, rbp, r12, r13, r14, r15
@@ -325,6 +370,10 @@ common_trap_diag:
     cli
 1:  hlt
     jmp     1b
+
+    /* Back to plain .text for the kernel-context helpers below (IDT
+     * install lookups + tss_set_ist1; all run with the kernel CR3). */
+    .section .text, "ax"
 
 /* ---------- get_trap_diag_stub: dispatch table for IDT install --- *
  * The Adder side calls get_trap_diag_stub(vector) to translate a
@@ -412,8 +461,14 @@ tss_set_ist1:
     movq    %rdi, 36(%rax)              /* TSS.IST1 = arg               */
     ret
 
-/* ---------- BSS storage ------------------------------------------ */
-    .section .bss
+/* ---------- BSS storage ------------------------------------------ *
+ * KPTI: the #DF IST1 stack is loaded by the CPU when a #DF vectors —
+ * which can happen at CPL3 with CR3 = user PML4 — so it MUST be mapped in
+ * the user table. Placing all of this file's NOBITS storage in .kpti.bss
+ * (mapped in every user PML4) covers that; the call stack + saved_ss are
+ * only touched after the kernel-CR3 swap but live here too for locality.
+ * .kpti.bss is zeroed by head_64.S. */
+    .section .kpti.bss, "aw", @nobits
     .align 16
     .globl _trap_diag_ist_stack_base
 _trap_diag_ist_stack_base:
