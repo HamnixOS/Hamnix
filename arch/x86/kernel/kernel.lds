@@ -146,6 +146,38 @@ SECTIONS
         *(.data.*)
     }
 
+    /* ---- KPTI trampoline section (.kpti) -------------------------------
+     * Kernel Page-Table Isolation (Meltdown mitigation). The per-task USER
+     * PML4 maps ONLY this section's 2 MiB PD leaves in the high half (plus
+     * the shared low-identity PML4[0]); the kernel .text/.rodata/.data/.bss
+     * bulk and the KASLR module window are ABSENT from it. So everything
+     * the CPU touches BEFORE the entry-trampoline swaps CR3 to the full
+     * kernel table — and AFTER the exit-trampoline swaps CR3 back to the
+     * user table — MUST live here:
+     *   - the CR3-swap trampoline asm + the SYSCALL/IRQ/trap ENTRY stubs
+     *     and their common-dispatch bodies (.kpti.text),
+     *   - the IDT (idt_table), per_cpu_tss/per_cpu_gdt/per_cpu_gdtr, the
+     *     trap-diag IST/call stacks, and the per-CPU KPTI cr3 slot array
+     *     (.kpti.data / .kpti.bss).
+     * 2 MiB-ALIGNED at both ends so it occupies whole 2 MiB PD leaves that
+     * kpti_build_user_pml4() can map independently of the rest of the 1 GiB
+     * kernel huge page. LMA stays contiguous via the same AT() rebase the
+     * other high-half sections use. */
+    . = ALIGN(0x200000);
+    .kpti : AT(kernel_lma + (ADDR(.kpti) - __high_vbase)) {
+        __kpti_start = .;
+        *(.kpti.text)
+        . = ALIGN(16);
+        *(.kpti.data)
+        . = ALIGN(16);
+        __kpti_bss_start = .;
+        *(.kpti.bss)
+        . = ALIGN(8);
+        __kpti_bss_end = .;
+    }
+    . = ALIGN(0x200000);
+    __kpti_end = .;
+
     /* AP boot trampoline. VMA = 0x8000 because SIPI delivers the AP to
      * physical 0x8000; the linker resolves intra-section references
      * against 0x8000. LMA rides inside the kernel image; the BSP

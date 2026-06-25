@@ -48,6 +48,20 @@ start_kernel_asm_entry:
     cld
     rep stosq
 
+    /* Zero the KPTI section's NOBITS .kpti.bss: [__kpti_bss_start,
+     * __kpti_bss_end). It lives in its own 2 MiB-aligned .kpti output
+     * section (kernel.lds), OUTSIDE [__bss_start,__bss_end), so the loop
+     * above does not cover it. per_cpu_tss / per_cpu_gdt / the per-CPU
+     * KPTI cr3 slots live here and MUST start zeroed (a stale cr3 slot
+     * would load garbage into CR3 on the first entry-trampoline). */
+    leaq    __kpti_bss_start(%rip), %rdi
+    leaq    __kpti_bss_end(%rip),   %rcx
+    subq    %rdi, %rcx
+    shrq    $3, %rcx
+    xorl    %eax, %eax
+    cld
+    rep stosq
+
     /* Fall through to the common post-loader path. */
 
     /* _x86_start_after_loader_high — the HIGH-half common post-loader
