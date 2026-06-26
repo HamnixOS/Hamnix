@@ -40,8 +40,13 @@ from compiler.parser import (
     nd_next,
     node_new,
     ND_INT_LIT,
+    ND_FLOAT_LIT,
     ND_IDENT,
     ND_BINARY,
+    ND_CAST,
+    ND_INDEX,
+    ND_TYPE,
+    ND_PARAM,
     ND_VAR_DECL,
     ND_ASSIGN,
     ND_EXPR_STMT,
@@ -57,6 +62,11 @@ from compiler.parser import (
     ND_UNARY,
     UNOP_ADDR,
     AUGOP_NONE,
+    BINOP_ADD,
+    BINOP_SUB,
+    BINOP_MUL,
+    BINOP_DIV,
+    BINOP_IDIV,
 )
 
 from compiler.ir import (
@@ -65,6 +75,7 @@ from compiler.ir import (
     ir_lower_pure_expr,
     ir_value_eq,
     ir_uses_name,
+    ir_name_eq,
     ir_tree_has_div,
     ir_tree_has_leaf,
     ir_const,
@@ -112,6 +123,381 @@ def opt_reset_stats():
     opt_cse_count = 0
     opt_cse_tmp_seq = 0
     opt_licm_count = 0
+    opt_ffold_count = 0
+
+
+# =======================================================================
+# FLOAT-TYPE ORACLE (opt-side mirror of codegen.ad expr_float_width).
+# =======================================================================
+#
+# WHY opt.ad needs its OWN oracle: opt_run executes BEFORE codegen
+# (gen_program_with_globals), so codegen's loc_is_float / glob_is_float tables
+# are NOT yet populated — opt.ad cannot call expr_float_width. The CSE/LICM
+# passes lower a float ND_BINARY through ir_lower_pure_expr into the SAME
+# integer IR shape as an int op (a float `a + b` becomes an integer IR_BINOP),
+# so a naive shared temp would be an UNTYPED 8-byte int slot and the reuse
+# ND_IDENT would resolve to float width 0 -> codegen emits an INTEGER add/cmp
+# for the reuse, miscompiling the float. To share a float value soundly the
+# temp decl must carry the FLOAT TYPE so codegen sets loc_is_float and the
+# reuse routes to the SSE path at the right width.
+#
+# This oracle reconstructs the per-expression float width from the AST alone by
+# scanning declared types into a per-function local table + a once-built global
+# table, exactly mirroring codegen.ad's type_float_width / expr_float_width:
+#   * a primitive ND_TYPE node carries its keyword code in nd_aux (10=float32,
+#     11=float64); width = 4 / 8 / 0,
+#   * ND_FLOAT_LIT -> 8 (a bare float literal is a float64),
+#   * ND_CAST -> the cast destination type's float width,
+#   * ND_IDENT -> the named local's (then global's) recorded float width,
+#   * ND_BINARY over ADD/SUB/MUL/DIV/IDIV -> wider of the two operand widths
+#     (an int operand under a float op promotes; result is float),
+#   * everything else -> 0 (NOT float; e.g. a COMPARE yields an int 0/1).
+# The result is the EXACT float width codegen will compute, so a temp typed with
+# it is value-identical to the inline float computation.
+
+# Float width (0/4/8) of a primitive ND_TYPE node, matching codegen.ad
+# type_float_width (codes 10->4, 11->8).
+def opt_type_float_width(tnode: uint32) -> uint32:
+    if tnode == 0:
+        return 0
+    if nd_kind[tnode] != ND_TYPE:
+        return 0
+    code: uint32 = nd_aux[tnode]
+    if code == 10:
+        return 4
+    if code == 11:
+        return 8
+    return 0
+
+
+# Per-function local/param float-width table (name bytes -> width). Rebuilt at
+# the start of each function's CSE / LICM / x-CSE pass. A name redeclared with a
+# different float-ness keeps the LAST scanned width (conservative; codegen
+# refreshes per VarDecl, but float locals never change width across redecls in
+# this subset). Globals live in a once-built parallel table.
+OPT_FW_MAX: uint32 = 4096
+opt_fw_off: Array[4096, uint32]
+opt_fw_len: Array[4096, uint32]
+opt_fw_w: Array[4096, uint32]
+opt_fw_n: uint32 = 0
+
+OPT_GFW_MAX: uint32 = 4096
+opt_gfw_off: Array[4096, uint32]
+opt_gfw_len: Array[4096, uint32]
+opt_gfw_w: Array[4096, uint32]
+opt_gfw_n: uint32 = 0
+
+# Diagnostics: number of fully-constant FLOAT subtrees const-folded.
+opt_ffold_count: uint32 = 0
+
+
+def opt_fw_reset():
+    opt_fw_n = 0
+
+
+def opt_fw_add(off: uint32, len_: uint32, w: uint32):
+    if opt_fw_n >= OPT_FW_MAX:
+        return
+    opt_fw_off[opt_fw_n] = off
+    opt_fw_len[opt_fw_n] = len_
+    opt_fw_w[opt_fw_n] = w
+    opt_fw_n = opt_fw_n + 1
+
+
+# Look up a local/param float width (0 if not found / not a float).
+def opt_fw_lookup(off: uint32, len_: uint32) -> uint32:
+    i: uint32 = 0
+    while i < opt_fw_n:
+        if ir_name_eq(opt_fw_off[i], opt_fw_len[i], off, len_) != 0:
+            return opt_fw_w[i]
+        i = i + 1
+    return 0
+
+
+def opt_gfw_add(off: uint32, len_: uint32, w: uint32):
+    if opt_gfw_n >= OPT_GFW_MAX:
+        return
+    opt_gfw_off[opt_gfw_n] = off
+    opt_gfw_len[opt_gfw_n] = len_
+    opt_gfw_w[opt_gfw_n] = w
+    opt_gfw_n = opt_gfw_n + 1
+
+
+def opt_gfw_lookup(off: uint32, len_: uint32) -> uint32:
+    i: uint32 = 0
+    while i < opt_gfw_n:
+        if ir_name_eq(opt_gfw_off[i], opt_gfw_len[i], off, len_) != 0:
+            return opt_gfw_w[i]
+        i = i + 1
+    return 0
+
+
+# Scan one statement chain for ND_VAR_DECL float locals, recording each into the
+# per-function table. Recurses into nested block bodies so a float declared in a
+# loop/if body is seen. (Codegen sees every VarDecl's type; so must we.)
+def opt_fw_scan_block(head: uint32):
+    s: uint32 = head
+    while s != 0:
+        k: uint32 = nd_kind[s]
+        if k == ND_VAR_DECL:
+            w: uint32 = opt_type_float_width(nd_a[s])
+            if w != 0:
+                opt_fw_add(nd_name_off[s], nd_name_len[s], w)
+        elif k == ND_IF:
+            opt_fw_scan_block(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                opt_fw_scan_block(nd_b[e])
+                e = nd_next[e]
+            opt_fw_scan_block(nd_d[s])
+        elif k == ND_WHILE:
+            opt_fw_scan_block(nd_b[s])
+        elif k == ND_DO_WHILE:
+            opt_fw_scan_block(nd_b[s])
+        elif k == ND_FOR:
+            opt_fw_scan_block(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            opt_fw_scan_block(nd_c[s])
+        s = nd_next[s]
+
+
+# Build the per-function float-local table from the function's params + body
+# var-decls. Called once before CSE / LICM / x-CSE of the function.
+def opt_fw_build(fn: uint32):
+    opt_fw_reset()
+    # Params: ND_PARAM chain on nd_a, each with its type on nd_a.
+    p: uint32 = nd_a[fn]
+    while p != 0:
+        if nd_kind[p] == ND_PARAM:
+            w: uint32 = opt_type_float_width(nd_a[p])
+            if w != 0:
+                opt_fw_add(nd_name_off[p], nd_name_len[p], w)
+        p = nd_next[p]
+    # Body var-decls.
+    opt_fw_scan_block(nd_c[fn])
+
+
+# Build the program-wide global float table from top-level ND_VAR_DECL globals.
+# Called once at opt_run start (globals are visible to every function).
+def opt_gfw_build(decls: uint32):
+    opt_gfw_n = 0
+    cur: uint32 = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_VAR_DECL:
+            w: uint32 = opt_type_float_width(nd_a[cur])
+            if w != 0:
+                opt_gfw_add(nd_name_off[cur], nd_name_len[cur], w)
+        cur = nd_next[cur]
+
+
+# Float width (0/4/8) of an EXPRESSION — the opt-side mirror of codegen.ad
+# expr_float_width. A non-float expression (incl. a float COMPARE, whose result
+# is an int 0/1) returns 0.
+def opt_expr_float_width(node: uint32) -> uint32:
+    if node == 0:
+        return 0
+    k: uint32 = nd_kind[node]
+    if k == ND_FLOAT_LIT:
+        return 8
+    if k == ND_CAST:
+        return opt_type_float_width(nd_a[node])
+    if k == ND_IDENT:
+        lf: uint32 = opt_fw_lookup(nd_name_off[node], nd_name_len[node])
+        if lf != 0:
+            return lf
+        return opt_gfw_lookup(nd_name_off[node], nd_name_len[node])
+    if k == ND_BINARY:
+        bop: uint32 = nd_aux[node]
+        if bop == BINOP_ADD or bop == BINOP_SUB or bop == BINOP_MUL or bop == BINOP_DIV or bop == BINOP_IDIV:
+            lw: uint32 = opt_expr_float_width(nd_a[node])
+            rw: uint32 = opt_expr_float_width(nd_b[node])
+            if lw == 0 and rw == 0:
+                return 0
+            if lw >= rw:
+                return lw
+            return rw
+        return 0
+    return 0
+
+
+# Does the AST subtree `node` contain ANY float-typed sub-expression anywhere?
+# A conservative deep scan: a float literal, a cast TO a float type, or a float
+# local/global ident at any depth flags the whole tree. Used by the const-fold
+# pass to REFUSE folding any tree that touches a float (the integer
+# ir_eval_binop has no IEEE-754 semantics — see opt_try_fold).
+def opt_subtree_has_float(node: uint32) -> uint32:
+    if node == 0:
+        return 0
+    if opt_expr_float_width(node) != 0:
+        return 1
+    k: uint32 = nd_kind[node]
+    if k == ND_FLOAT_LIT:
+        return 1
+    if k == ND_CAST:
+        if opt_type_float_width(nd_a[node]) != 0:
+            return 1
+        return opt_subtree_has_float(nd_b[node])
+    if k == ND_IDENT:
+        return 0
+    if opt_subtree_has_float(nd_a[node]) != 0:
+        return 1
+    if opt_subtree_has_float(nd_b[node]) != 0:
+        return 1
+    if opt_subtree_has_float(nd_c[node]) != 0:
+        return 1
+    return opt_subtree_has_float(nd_d[node])
+
+
+# Build a fresh primitive float ND_TYPE node (code 10=float32 for width 4,
+# 11=float64 for width 8) so a CSE/LICM temp decl is typed FLOAT and codegen
+# tags loc_is_float / loc scalar_size. Returns 0 on arena exhaustion or a
+# non-float width (caller then mints an untyped int temp as before).
+def opt_make_float_type(w: uint32) -> uint32:
+    code: uint32 = 0
+    if w == 4:
+        code = 10
+    elif w == 8:
+        code = 11
+    else:
+        return 0
+    t: uint32 = node_new(ND_TYPE)
+    if t == 0:
+        return 0
+    nd_aux[t] = code
+    return t
+
+
+# =======================================================================
+# FLOAT CONSTANT FOLDING (provably bit-identical, conservative).
+# =======================================================================
+#
+# A fully-constant FLOAT arithmetic tree can be folded to a single float literal
+# ONLY where the folded constant is PROVABLY the exact bit pattern the runtime
+# SSE op would produce. This backend materializes a float constant via cvtsi2sd
+# of an INTEGER (a bare ND_FLOAT_LIT carries an integer in nd_num; a
+# cast[floatW](int-literal) converts an integer) — there are no fractional
+# literals. So the sound foldable case is:
+#
+#   * LEAVES are exact-integer-valued floats: an ND_FLOAT_LIT (its nd_num
+#     integer), or cast[float32|float64](<int/char/bool literal>). Each
+#     materializes the exact integer as a float (cvtsi2sd/ss), no rounding when
+#     the integer fits the mantissa.
+#   * OPS are ADD/SUB/MUL only. Over exact integers these are EXACT in IEEE-754
+#     whenever the true integer result is representable (|result| < 2^53 for f64
+#     / < 2^24 for f32); SSE round-to-nearest is then the identity. DIV is
+#     EXCLUDED (a quotient is generally not an exact integer -> not bit-provable).
+#   * The WHOLE tree is float64-typed (opt_expr_float_width == 8). We fold ONLY
+#     f64 trees because the fold target is an ND_FLOAT_LIT, which codegen ALWAYS
+#     emits as a float64 (cvtsi2sd, emit_fp_convert(0,8)); folding an f32 tree to
+#     an ND_FLOAT_LIT would silently widen it to f64 and miscompile an f32
+#     consumer. An f32 constant tree therefore stays on the existing emit path
+#     (still correct, just unfolded — a conservative residual).
+#
+# The folded integer value is range-checked: |v| < 2^53 guarantees both the
+# IEEE op was exact AND the resulting ND_FLOAT_LIT's own cvtsi2sd reproduces it
+# bit-for-bit. If ANYTHING is outside this proven subset, ffold returns 0 and the
+# tree is emitted unchanged.
+
+# Range bound: 2^53 (exact-integer limit of an IEEE float64 mantissa).
+OPT_F64_EXACT: int64 = 9007199254740992       # 2^53
+
+
+# Is `node` an exact-integer-valued FLOAT leaf? Writes the integer value through
+# `*out` and returns 1 on success, 0 otherwise. An ND_FLOAT_LIT holds its integer
+# in nd_num. A cast[floatW](int/char/bool literal) holds the integer in the
+# operand literal's nd_num. (A cast of a non-literal is NOT a constant leaf.)
+def opt_ffold_leaf_value(node: uint32, out: Ptr[int64]) -> uint32:
+    if node == 0:
+        return 0
+    k: uint32 = nd_kind[node]
+    if k == ND_FLOAT_LIT:
+        out[0] = cast[int64](nd_num[node])
+        return 1
+    if k == ND_CAST:
+        # Cast destination must be a float type, operand a bare integer literal.
+        if opt_type_float_width(nd_a[node]) == 0:
+            return 0
+        op0: uint32 = nd_b[node]
+        if op0 == 0:
+            return 0
+        ok0: uint32 = nd_kind[op0]
+        if ok0 == ND_INT_LIT or ok0 == ND_CHAR_LIT or ok0 == ND_BOOL_LIT:
+            out[0] = cast[int64](nd_num[op0])
+            return 1
+    return 0
+
+
+# Evaluate a fully-constant exact-integer FLOAT arith subtree to its integer
+# value through `*out`. Returns 1 iff the WHOLE tree is foldable AND every
+# intermediate AND the final result stays within the |v| < 2^53 exact-integer
+# range (so each IEEE add/sub/mul was exact). ADD/SUB/MUL only. A leaf delegates
+# to opt_ffold_leaf_value. Recursion mirrors AST expression depth.
+def opt_ffold_eval(node: uint32, out: Ptr[int64]) -> uint32:
+    if node == 0:
+        return 0
+    if opt_ffold_leaf_value(node, out) != 0:
+        # Leaf integer must itself be exactly representable.
+        lv: int64 = out[0]
+        if lv >= OPT_F64_EXACT or lv <= (0 - OPT_F64_EXACT):
+            return 0
+        return 1
+    if nd_kind[node] != ND_BINARY:
+        return 0
+    op: uint32 = nd_aux[node]
+    if op != BINOP_ADD and op != BINOP_SUB and op != BINOP_MUL:
+        return 0
+    lo: int64 = 0
+    ro: int64 = 0
+    if opt_ffold_eval(nd_a[node], &lo) == 0:
+        return 0
+    if opt_ffold_eval(nd_b[node], &ro) == 0:
+        return 0
+    r: int64 = 0
+    if op == BINOP_ADD:
+        r = lo + ro
+    elif op == BINOP_SUB:
+        r = lo - ro
+    else:
+        # MUL: guard against int64 overflow BEFORE the 2^53 range test by
+        # bounding operands so the product cannot wrap (|lo|,|ro| < 2^53 each
+        # from the recursive checks; the product range test below catches any
+        # value that left the exact-integer window).
+        r = lo * ro
+    if r >= OPT_F64_EXACT or r <= (0 - OPT_F64_EXACT):
+        return 0
+    out[0] = r
+    return 1
+
+
+# Rewrite ND_BINARY `node` in place into an ND_FLOAT_LIT carrying integer `v`
+# (codegen emits cvtsi2sd of nd_num -> the exact float64 value). Child slots
+# cleared for hygiene; node id preserved so the parent slot now sees the folded
+# float literal.
+def fold_node_to_float_const(node: uint32, v: int64):
+    nd_kind[node] = ND_FLOAT_LIT
+    nd_num[node] = cast[uint64](v)
+    nd_aux[node] = 0
+    nd_a[node] = 0
+    nd_b[node] = 0
+    nd_c[node] = 0
+    nd_d[node] = 0
+
+
+# Try to FLOAT-const-fold an ND_BINARY root. Folds only a float64-typed,
+# fully-constant exact-integer ADD/SUB/MUL tree (see the soundness note above).
+# Returns 1 on a fold, 0 otherwise.
+def opt_try_ffold(node: uint32) -> uint32:
+    # Only fold a tree whose RESULT is a float64 (so the ND_FLOAT_LIT target's
+    # always-f64 emission matches the original type). An f32 / non-float tree is
+    # left to the other paths.
+    if opt_expr_float_width(node) != 8:
+        return 0
+    v: int64 = 0
+    if opt_ffold_eval(node, &v) == 0:
+        return 0
+    fold_node_to_float_const(node, v)
+    opt_ffold_count = opt_ffold_count + 1
+    return 1
 
 
 # Rewrite an AST ND_BINARY node IN PLACE into an ND_INT_LIT carrying `v`.
@@ -136,6 +522,20 @@ def opt_try_fold(node: uint32) -> uint32:
     if node == 0:
         return 0
     if nd_kind[node] != ND_BINARY:
+        return 0
+    # FLOAT fold FIRST: a provably-exact float64 ADD/SUB/MUL tree over integer-
+    # valued literal leaves collapses to one ND_FLOAT_LIT. (The integer fold
+    # below can't model IEEE-754 and its ir_lower_const_expr would not lower a
+    # float leaf anyway; this is the dedicated, bit-proven float path.)
+    if opt_try_ffold(node) != 0:
+        return 1
+    # INTEGER fold: refuse any tree touching a float — the modular ir_eval_binop
+    # has NO IEEE-754 semantics, so an integer fold of a float subtree would be a
+    # miscompile. ir_lower_const_expr already rejects float leaves (a float leaf
+    # is an ND_CAST/ND_FLOAT_LIT, not an int const leaf), but the explicit guard
+    # documents the invariant and is cheap insurance against future leaf-set
+    # broadening.
+    if opt_subtree_has_float(node) != 0:
         return 0
     ir_reset()
     iv: uint32 = ir_lower_const_expr(node)
@@ -183,6 +583,10 @@ def opt_run(prog: uint32):
     # Walk the decl chain (functions, globals, classes). Each function body
     # is reached through opt_walk's generic descent.
     decls: uint32 = nd_b[prog]
+    # Build the program-wide global float-type table once; every function's
+    # CSE/LICM consults it (plus its own per-function local table) to type a
+    # shared FLOAT temp correctly.
+    opt_gfw_build(decls)
     cur: uint32 = decls
     while cur != 0:
         opt_walk(cur)
@@ -306,16 +710,28 @@ def cse_rewrite_to_ident(node: uint32, off: uint32, len_: uint32):
     nd_d[node] = 0
 
 
-# Build a fresh ND_VAR_DECL `<tmpname> = <init_ast>` with NO type annotation
-# (type node 0 -> codegen reserves a plain untyped 8-byte scalar slot). Returns
-# the new statement node, or 0 on arena exhaustion.
+# Build a fresh ND_VAR_DECL `<tmpname> = <init_ast>`. An INTEGER-valued shared
+# expression gets NO type annotation (type node 0 -> codegen reserves a plain
+# untyped 8-byte scalar slot, a movq store/load that round-trips the %rax value
+# bit-for-bit). A FLOAT-typed shared expression (opt_expr_float_width(init_ast)
+# != 0) gets a synthesized float ND_TYPE so codegen tags the slot loc_is_float
+# (and scalar_size 4 for float32) and EVERY reuse ND_IDENT of the temp resolves
+# to the SSE float path at the right width — without the type the reuse would be
+# emitted as an INTEGER op (float miscompile). The float result bits transit
+# %rax exactly as for a user float local, so a typed float temp holds the same
+# bits the inline float computation produced: value-identical. Returns the new
+# statement node, or 0 on arena exhaustion.
 def cse_make_temp_decl(off: uint32, len_: uint32, init_ast: uint32) -> uint32:
     d: uint32 = node_new(ND_VAR_DECL)
     if d == 0:
         return 0
     nd_name_off[d] = off
     nd_name_len[d] = len_
-    nd_a[d] = 0                # no type node -> untyped 8-byte scalar
+    fw: uint32 = opt_expr_float_width(init_ast)
+    if fw != 0:
+        nd_a[d] = opt_make_float_type(fw)   # typed float slot -> SSE reuse
+    else:
+        nd_a[d] = 0                         # no type node -> untyped 8-byte scalar
     nd_b[d] = init_ast        # initialiser
     return d
 
@@ -491,9 +907,19 @@ def cse_statement_expr(expr_root: uint32):
         i = i + 1
 
 
-# Deep-clone a pure expression subtree (ND_BINARY over ident/const leaves) into
-# fresh AST nodes, so the temp's initialiser is independent of the in-place
-# rewrites applied to the original occurrences. Returns 0 on arena exhaustion.
+# Deep-clone a pure expression subtree into fresh AST nodes, so the temp's
+# initialiser is independent of the in-place rewrites applied to the original
+# occurrences. The pure value set (ir_lower_pure_expr) admits ND_BINARY over
+# ident/const leaves AND opaque READ leaves — an ND_CAST (nd_a=type node,
+# nd_b=operand) and an ND_INDEX (nd_a=base, nd_b=index). A float subexpression is
+# ALWAYS a cast/binary over casts, so the clone MUST recurse into the cast's
+# child slots: cloning only ND_BINARY's nd_a/nd_b dropped a cast's type+operand,
+# leaving a zeroed cast that emitted garbage (the float-mixed CSE miscompile, and
+# a latent integer cast-CSE bug). We therefore deep-clone EVERY expression child
+# slot (nd_a/nd_b for ND_BINARY/ND_CAST/ND_INDEX) by node kind. A leaf with no
+# expression children (ident / literal) just copies its scalar fields. The TYPE
+# node under a cast (nd_a) is an ND_TYPE carrying its code in nd_aux; cloning it
+# copies that code so the cast width/signedness is reproduced exactly.
 def cse_clone_expr(node: uint32) -> uint32:
     if node == 0:
         return 0
@@ -505,7 +931,7 @@ def cse_clone_expr(node: uint32) -> uint32:
     nd_num[c] = nd_num[node]
     nd_name_off[c] = nd_name_off[node]
     nd_name_len[c] = nd_name_len[node]
-    if k == ND_BINARY:
+    if k == ND_BINARY or k == ND_CAST or k == ND_INDEX:
         nd_a[c] = cse_clone_expr(nd_a[node])
         nd_b[c] = cse_clone_expr(nd_b[node])
     return c
@@ -582,6 +1008,9 @@ def cse_block(head: uint32) -> uint32:
 
 
 def opt_cse_function(fn: uint32):
+    # Build this function's float-local table so cse_make_temp_decl can type a
+    # shared float value (params + body var-decls; globals already built).
+    opt_fw_build(fn)
     # The function body chain hangs off nd_c (ND_FUNCTION: c = body chain head).
     nd_c[fn] = cse_block(nd_c[fn])
 
@@ -976,6 +1405,7 @@ def licm_block(head: uint32) -> uint32:
 
 
 def opt_licm_function(fn: uint32):
+    opt_fw_build(fn)
     # The function body chain hangs off nd_c (ND_FUNCTION: c = body chain head).
     nd_c[fn] = licm_block(nd_c[fn])
 
@@ -1379,4 +1809,5 @@ def xcse_block(head: uint32) -> uint32:
 
 
 def opt_xcse_function(fn: uint32):
+    opt_fw_build(fn)
     nd_c[fn] = xcse_block(nd_c[fn])

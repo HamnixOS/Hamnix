@@ -184,6 +184,7 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       bss_len=meta["BSS_LEN"],
                       fn_count=meta["FN_COUNT"],
                       folds=meta.get("FOLDS", 0),
+                      ffold=meta.get("FFOLD", 0),
                       cse=meta.get("CSE", 0),
                       licm=meta.get("LICM", 0),
                       iremit=meta.get("IREMIT", 0),
@@ -482,6 +483,7 @@ class CodegenRun:
         self.exit = kw.get("exit", None)
         self.detail = kw.get("detail", "")
         self.folds = kw.get("folds", 0)
+        self.ffold = kw.get("ffold", 0)
         self.cse = kw.get("cse", 0)
         self.licm = kw.get("licm", 0)
         self.iremit = kw.get("iremit", 0)
@@ -521,6 +523,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
         src.unlink(missing_ok=True)
         elf.unlink(missing_ok=True)
     folds = getattr(dump, "folds", 0)
+    ffold = getattr(dump, "ffold", 0)
     cse = getattr(dump, "cse", 0)
     licm = getattr(dump, "licm", 0)
     iremit = getattr(dump, "iremit", 0)
@@ -531,9 +534,9 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
         return CodegenRun("runfail", detail=f"signal {-rp.returncode}",
                           stdout=out, exit=rp.returncode, folds=folds, cse=cse,
                           licm=licm, iremit=iremit, irfold=irfold,
-                          irreassoc=irreassoc, iremitfloat=iremitfloat)
+                          irreassoc=irreassoc, iremitfloat=iremitfloat, ffold=ffold)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
-                      folds=folds, cse=cse, licm=licm, iremit=iremit,
+                      folds=folds, ffold=ffold, cse=cse, licm=licm, iremit=iremit,
                       irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat)
 
 
