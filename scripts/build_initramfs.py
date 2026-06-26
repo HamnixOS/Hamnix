@@ -3970,6 +3970,31 @@ def build_archive() -> bytes:
                 "etc/hostname",
                 "etc/apt/sources.list",
                 "etc/apt/apt.conf",
+                # apt.conf.d FRAGMENT files. libapt's ReadConfigDir()
+                # readdir()s /etc/apt/apt.conf.d/ at startup; with the
+                # directory empty (no fragment entries staged in the flat
+                # cpio name table) the readdir returns nothing and libapt
+                # logs "Unable to read /etc/apt/apt.conf.d/ -
+                # DirectoryExists" then aborts before any fetch. Staging
+                # the fragment FILES makes the cpio's synthesized readdir
+                # of that prefix enumerate them, satisfying ReadConfigDir.
+                # (The 00hamnix auth/insecure fragment, when present, is
+                # staged by scripts/stage_host_dpkg_rootfs.sh and globbed
+                # below; the two debootstrap-shipped fragments below are
+                # the minimum the directory needs to be non-empty.)
+                "etc/apt/apt.conf.d/01autoremove",
+                "etc/apt/apt.conf.d/70debconf",
+                # dpkg DATA TABLES. libapt's APT::Configuration architecture
+                # resolution reads /usr/share/dpkg/cputable + tupletable to
+                # map the dpkg CPU/arch names; without them apt-get aborts
+                # with "E: Error reading the CPU table" before parsing any
+                # index. dpkg itself (dpkg-architecture, dpkg-split) reads
+                # ostable/abitable too. Stage the whole small table set.
+                "usr/share/dpkg/cputable",
+                "usr/share/dpkg/tupletable",
+                "usr/share/dpkg/ostable",
+                "usr/share/dpkg/abitable",
+                "usr/share/dpkg/triplettable",
                 # dpkg's admindir scaffolding (status starts empty;
                 # available may be absent — both files are looked up
                 # by dpkg but missing-is-OK after a fresh debootstrap).
@@ -4140,6 +4165,25 @@ def build_archive() -> bytes:
                     if rel not in REAL_DEBIAN_FILES:
                         glob_libs.append(rel)
             REAL_DEBIAN_FILES = REAL_DEBIAN_FILES + glob_libs
+
+            # apt.conf.d FRAGMENT glob. libapt readdir()s the WHOLE
+            # /etc/apt/apt.conf.d/ directory; a fixture or
+            # stage_host_dpkg_rootfs.sh may drop additional fragments
+            # (e.g. 00hamnix auth/insecure opts, 99hamnix). Glob every
+            # regular fragment file so the synthesized cpio readdir of
+            # that prefix enumerates ALL of them, not just the two
+            # debootstrap defaults hand-listed above. (Without the auth
+            # fragment apt would refuse the unsigned local file:// repo.)
+            confdir = minbase_rootfs / "etc" / "apt" / "apt.conf.d"
+            glob_conf: list[str] = []
+            if confdir.is_dir():
+                for p in sorted(confdir.iterdir()):
+                    if not p.is_file():
+                        continue
+                    rel = str(p.relative_to(minbase_rootfs))
+                    if rel not in REAL_DEBIAN_FILES:
+                        glob_conf.append(rel)
+            REAL_DEBIAN_FILES = REAL_DEBIAN_FILES + glob_conf
 
             # BROAD-COVERAGE augmentation. The hand-pinned list above is
             # the apt/dpkg-install closure. For the Debian-binary BREADTH
