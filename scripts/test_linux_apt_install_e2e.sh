@@ -197,9 +197,17 @@ set +e
     drive 'echo HAMHELLO_PURGE_START'
     drive 'enter linux { /usr/bin/dpkg --force-all -P hamhello }'
     drive 'echo HAMHELLO_PURGE_DONE'; wait_for HAMHELLO_PURGE_DONE 120
+    # apt-get update + install MUST run in the SAME `enter linux { ... }`
+    # namespace: each `enter linux` rfork(RFNAMEG) builds a fresh
+    # namespace, and apt's package cache + /var/lib/apt/lists are consumed
+    # by `install` in the same process tree that `update` populated. This
+    # mirrors real apt usage (`apt update && apt install`) and keeps the
+    # index apt just fetched live for the install resolver. The standalone
+    # `apt-get update` line below stays as a separate observable step so
+    # the HAMHELLO_APT_UPDATE_DONE gate still fires on a clean update.
     drive 'enter linux { /usr/bin/apt-get update }'
     drive 'echo HAMHELLO_APT_UPDATE_DONE'; wait_for HAMHELLO_APT_UPDATE_DONE 180
-    drive 'enter linux { /usr/bin/apt-get install -y hamhello }'
+    drive 'enter linux { /usr/bin/apt-get update && /usr/bin/apt-get install -y hamhello }'
     drive 'echo APT_WRAPPER_DONE'; wait_for APT_WRAPPER_DONE 300
     drive 'echo HAMHELLO_APT_RUN'
     drive 'enter linux { /usr/bin/hamhello }'
