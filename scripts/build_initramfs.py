@@ -4023,6 +4023,22 @@ def build_archive() -> bytes:
                 # parse the repo but cannot retrieve the .deb.
                 "usr/lib/apt/methods/file",
                 "usr/lib/apt/methods/copy",
+                # apt's INDEX decompress/store worker. `apt-get update`
+                # hands the fetched Packages index to the `store:` method
+                # (apt's pkgAcqIndex routes the acquired index URI through
+                # store: to decompress + record it into /var/lib/apt/lists).
+                # libapt's pkgAcquire::Worker::Start() FileExists()-checks the
+                # method binary BEFORE forking; with store absent that check
+                # fails and apt aborts the whole update with
+                #   "E: The method driver /usr/lib/apt/methods/store could
+                #    not be found. N: Is the package apt-transport-store
+                #    installed?"
+                # — so the index never builds and the subsequent
+                # `apt-get install` reports "Unable to locate package".
+                # store's .so closure (libapt-pkg, libstdc++, libz/bz2/lzma/
+                # lz4/zstd, libseccomp) is already covered by the glob-libs
+                # augmentation below, so only the method binary needs pinning.
+                "usr/lib/apt/methods/store",
                 # dpkg unpack/install helpers. dpkg forks dpkg-deb to
                 # extract data.tar; dpkg-split/-query round out the admin
                 # surface dpkg touches during an install.
@@ -4264,6 +4280,27 @@ def build_archive() -> bytes:
                 print(f"  (skipped {len(missing)} optional files: "
                       f"{', '.join(missing[:5])}"
                       f"{'…' if len(missing) > 5 else ''})")
+            # apt MANDATORY working directories. The REAL_DEBIAN_FILES loop
+            # above only stages regular files, so apt's empty working dirs
+            # never appear in the flat cpio name table. apt-get update
+            # stat()s these at startup and, finding lists/ + lists/partial
+            # (and the archives equivalents) absent, takes a NULL-map path
+            # in its cache generator and SIGSEGVs at va=0 (observed: pid
+            # exited code=139 right after "Reading package lists... 0%").
+            # Plant a `.keep` empty-file in each so the cpio's synthesized
+            # readdir enumerates the directory (same trick as the /home/live
+            # subdir .keep placeholders at the top of this file). The
+            # writable tmpfs overlay then absorbs the index/cache files apt
+            # creates UNDER these now-existing directories.
+            for _apt_dir in (
+                "var/lib/apt/lists",
+                "var/lib/apt/lists/partial",
+                "var/cache/apt/archives",
+                "var/cache/apt/archives/partial",
+            ):
+                _keep = "/var/lib/distros/default/" + _apt_dir + "/.keep"
+                blob += cpio_entry(_keep, b"")
+            print("  planted apt lists/ + archives/ (+partial) .keep dirs")
 
     # Kernel modules: anything in build/mod/ gets embedded as /<stem>
     # so module_load() can fetch by path. Convention is to start the
