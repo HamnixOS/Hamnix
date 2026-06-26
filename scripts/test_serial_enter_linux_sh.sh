@@ -65,6 +65,26 @@ if [ ! -f "$INSTALLER_IMG" ]; then
     exit 0
 fi
 
+# PRECONDITION — the live #distro MUST contain a real /bin/sh, else
+# `enter linux { sh }` can NEVER work regardless of the console path. The
+# image's distro tree is built from the musl static-PIE busybox fixture
+# tests/u-binary/u_busybox_musl (planted at distro/bin/sh by
+# scripts/build_rootfs_img.py::_stage_busybox). When that fixture is absent
+# on the build host the distro/ subtree is just a PROVENANCE marker — no sh
+# exists — and this test would only ever observe `command not found`, which
+# is an IMAGE-CONTENT gap, NOT the serial-console bug this test targets.
+# SKIP loudly in that case (a fixture-less CI host keeps moving) rather than
+# report a spurious FAIL or, worse, a false PASS off hamsh's builtin echo.
+# (Build the fixture: cd tests/u-binary/src/musl_busybox && make install.)
+BB_FIXTURE="$PROJ_ROOT/tests/u-binary/u_busybox_musl"
+if [ ! -f "$BB_FIXTURE" ]; then
+    echo "[serial_entlnx] SKIP: $BB_FIXTURE absent — the live #distro has no" >&2
+    echo "[serial_entlnx]   /bin/sh, so 'enter linux { sh }' cannot resolve a shell" >&2
+    echo "[serial_entlnx]   (image-content gap, not the serial bug). Build it with:" >&2
+    echo "[serial_entlnx]   (cd tests/u-binary/src/musl_busybox && make install)" >&2
+    exit 0
+fi
+
 mkdir -p "$OUT_DIR"
 echo "[serial_entlnx] output dir: $OUT_DIR"
 
@@ -171,6 +191,22 @@ try:
         time.sleep(2.0)
         if snapshot().count(b"pipe_hi") >= 2:
             break
+    # KEYSTONE DISCRIMINATOR (anti-false-positive). The echo/pipe markers
+    # above can be faked by hamsh's OWN builtin echo + `|` if the entered
+    # `sh` never took over the serial line (the exact way the earlier rev
+    # of this test green-washed a broken `enter linux { sh }`: `sh` was
+    # `command not found`, the body fell back to hamsh, and hamsh's echo
+    # printed the markers). So additionally run a command that ONLY a real
+    # Linux busybox `sh` can answer and hamsh CANNOT: the `busybox` applet
+    # prints its version banner "BusyBox v1.36.1". hamsh has no `busybox`
+    # builtin and there is no native busybox on $PATH, so this line can
+    # appear ONLY if a real Linux shell inside the distro ns ran it. This
+    # is the assertion that actually proves the interactive sh attached.
+    for _ in range(6):
+        send("busybox 2>&1 | head -1")
+        time.sleep(2.0)
+        if b"BusyBox v" in snapshot():
+            break
     # ls the root — a real Linux binary, not a hamsh builtin.
     send("ls /")
     time.sleep(3)
@@ -193,7 +229,7 @@ sys.exit(0)
 PYDRV
 
 echo "[serial_entlnx] --- serial transcript (filtered) ---"
-tr -d '\0' < "$LOG" | grep -aE "SERIAL_SYNC|enter linux|ENTER_LINUX_SH_OK|pipe_hi|command not found|code=127" | tail -40 || true
+tr -d '\0' < "$LOG" | grep -aE "SERIAL_SYNC|enter linux|ENTER_LINUX_SH_OK|pipe_hi|BusyBox v|command not found|code=127" | tail -40 || true
 echo "[serial_entlnx] --- end ---"
 
 fail=0
@@ -216,17 +252,40 @@ else
     fail=1
 fi
 
-# (3) The bug signature: hamsh — NOT the linux sh — claiming the command.
-#     If we ever see hamsh reporting `ls`/`echo` as not-found AFTER the
-#     enter, the prompt stayed hamsh (the reported regression).
+# (2b) KEYSTONE anti-false-positive assertion. The BusyBox version banner
+#      can ONLY be produced by a real Linux busybox `sh` running the
+#      `busybox` applet inside the distro ns — hamsh has no such builtin and
+#      there is no native busybox on $PATH. If this is absent, the entered
+#      `sh` did NOT take over the serial line and any echo/pipe markers above
+#      were hamsh-builtin false-positives (the original bug signature).
+if tr -d '\0' < "$LOG" | grep -a -q 'BusyBox v'; then
+    echo "[serial_entlnx] OK: BusyBox banner seen — a REAL Linux sh owned the serial line (not hamsh)"
+else
+    echo "[serial_entlnx] FAIL: no BusyBox banner — the entered sh never became the interactive serial reader (echo/pipe markers were hamsh false-positives)"
+    fail=1
+fi
+
+# (3) The bug signature: hamsh — NOT the linux sh — claiming one of the
+#     commands WE typed at the entered shell (sh/echo/busybox/ls). If the
+#     entered sh never took over, the next typed line falls back to hamsh
+#     which reports it not-found (the reported regression: `command not
+#     found: sh`, then `command not found: ls`). We match ONLY those typed
+#     commands — NOT a bare "command not found" — because concurrent
+#     BACKGROUND services (a detached ntpd / sysmon running `sleep`/`free`,
+#     which hamsh does not implement) legitimately emit their own
+#     not-found chatter onto the shared serial console, and that is
+#     unrelated to whether the interactive sh attached.
 if LC_ALL=C awk '
     index($0,"enter linux { sh }")>0 {armed=1}
-    armed && index($0,"hamsh: command not found")>0 {print; f=1}
+    armed && (index($0,"hamsh: command not found: sh")>0 \
+           || index($0,"hamsh: command not found: echo")>0 \
+           || index($0,"hamsh: command not found: busybox")>0 \
+           || index($0,"hamsh: command not found: ls")>0) {print; f=1}
     END{exit f?0:1}' "$LOG" >/dev/null; then
-    echo "[serial_entlnx] FAIL: hamsh claimed a command after enter linux { sh } — prompt stayed hamsh (the bug)"
+    echo "[serial_entlnx] FAIL: hamsh claimed a TYPED command after enter linux { sh } — prompt stayed hamsh (the bug)"
     fail=1
 else
-    echo "[serial_entlnx] OK: no hamsh-command-not-found after the enter (prompt was the linux sh)"
+    echo "[serial_entlnx] OK: no hamsh-claimed typed command after the enter (the linux sh owned the line)"
 fi
 
 # (4) No exec failure / trap from the enter.
