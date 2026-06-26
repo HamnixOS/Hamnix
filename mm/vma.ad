@@ -89,6 +89,7 @@ from kernel.sched.core import (
 from kernel.rcu.rcu import (
     rcu_read_lock, rcu_read_unlock,
 )
+from arch.x86.kernel.setup_percpu import get_cpu_id
 from mm.slab import kmalloc, kfree
 from mm.page_alloc import alloc_pages, alloc_page, free_pages, free_page
 from mm.cow import cow_drop_page, cow_pte_bit, cow_boot_cr3
@@ -493,12 +494,17 @@ def _vma_win_release_unmap(slot: uint64, lo_in: uint64, hi_in: uint64):
     # never shared between two VMAs), overlap==0 is exact.
     w_lo: uint64 = lo & ~(VMA_MAX_CHUNK - 1)
     w_hi: uint64 = (hi_in + VMA_MAX_CHUNK - 1) & ~(VMA_MAX_CHUNK - 1)
+    # _vma_tree_overlap is a tree WALK; hold the mm write lock so it never
+    # races a concurrent structural mutation on this mm (same #DF hazard the
+    # fault reader faces).
+    vma_mm_write_lock(slot)
     cur: uint64 = w_lo
     while cur + VMA_MAX_CHUNK <= w_hi:
         if cur >= VMA_LARGE_BASE \
                 and _vma_tree_overlap(slot, cur, cur + VMA_MAX_CHUNK) == 0:
             _vma_win_free_push(slot, cur, VMA_MAX_CHUNK)
         cur = cur + VMA_MAX_CHUNK
+    vma_mm_write_unlock(slot)
 
 
 # ---------------------------------------------------------------------
@@ -575,6 +581,17 @@ NR_TASKS_VMA: uint64 = 512
 vma_tree_root: Array[512, uint64]
 vma_mm_lock:   Array[512, uint32]
 vma_mm_seq:    Array[512, uint64]
+# Recursive-lock bookkeeping for vma_mm_write_lock: the owning logical CPU
+# (+1, 0 == unowned) and the recursion depth. A structural mutator that
+# nests another mutator (vma_mremap -> vma_alloc/_vma_carve_range) re-takes
+# the SAME slot's lock; recording owner+depth lets the re-acquire by the
+# owning CPU pass through instead of self-deadlocking on the raw spinlock.
+vma_mm_owner:  Array[512, uint64]
+vma_mm_depth:  Array[512, uint64]
+# DBG-VTREE: live recursion depth of _vt_insert_rec — a cheap cycle tripwire
+# (a balanced AVL never exceeds ~1.44*log2(n) frames). Single-writer under
+# the mm write lock the tree mutators hold, so a plain global is fine.
+_vt_insert_depth: uint64
 
 
 def _vma_tree_root(slot: uint64) -> uint64:
@@ -586,17 +603,38 @@ def _vma_set_tree_root(slot: uint64, r: uint64):
 
 
 def vma_mm_write_lock(slot: uint64):
-    # Acquire the mm-wide write lock — the fallback (slow) path a fault
-    # takes when the lockless per-VMA attempt loses a race, and the lock a
-    # caller can wrap a multi-step structural change in to serialize it
-    # against concurrent faults on the same mm. This is the BLOCKING lock
-    # (a distinct word from the seqcount); it does NOT bump the seqcount,
-    # so it is re-entrancy-neutral w.r.t. the per-mutation seq bumps the
-    # tree helpers do. Paired with vma_mm_write_unlock.
+    # Acquire the mm-wide write lock. This serializes ALL structural tree
+    # mutations (insert/remove/split/rotate/carve) on `slot` against each
+    # other AND against the lockless fault reader's tree WALK
+    # (vma_lock_fault_vma takes it for the duration of _vma_tree_find +
+    # per-VMA trylock). Without this, a fault-time tree walk on one CPU
+    # could deref a child pointer that a concurrent mutator on another CPU
+    # is mid-rotation rewiring, or that points at a VmaNode just kfree'd
+    # (node frees are NOT RCU-deferred) — a #PF that re-faults into a #DF
+    # in _vt_right/_vt_left. (This was the apt-get #DF: apt's thousands of
+    # mmaps across its CLONE_VM/forked process tree opened the race window;
+    # dpkg's tiny mmap closure never did.)
+    #
+    # RECURSIVE: vma_mremap nests vma_alloc / _vma_carve_range, both of
+    # which now take this lock. Re-acquisition by the OWNING CPU just bumps
+    # a depth counter instead of self-deadlocking on the raw spinlock. It
+    # does NOT bump the seqcount, so it stays neutral w.r.t. the per-mutation
+    # seq bumps the tree helpers do. Paired with vma_mm_write_unlock.
+    cpu1: uint64 = get_cpu_id() + 1
+    if vma_mm_owner[slot] == cpu1 and vma_mm_depth[slot] > 0:
+        vma_mm_depth[slot] = vma_mm_depth[slot] + 1
+        return
     spinlock_lock(&vma_mm_lock[slot])
+    vma_mm_owner[slot] = cpu1
+    vma_mm_depth[slot] = 1
 
 
 def vma_mm_write_unlock(slot: uint64):
+    if vma_mm_depth[slot] > 1:
+        vma_mm_depth[slot] = vma_mm_depth[slot] - 1
+        return
+    vma_mm_depth[slot] = 0
+    vma_mm_owner[slot] = 0
     spinlock_unlock(&vma_mm_lock[slot])
 
 
@@ -868,14 +906,33 @@ def _vma_node_end(node: uint64) -> uint64:
 # Node link accessors (left/right/height/subtree_max_end) are tiny so the
 # rotation code below reads close to a textbook AVL.
 
+def _vt_node_bad(n: uint64) -> int32:
+    # DBG-VTREE: a live VmaNode is a kmalloc'd, 8-aligned, identity-mapped
+    # low-RAM pointer (< 1 GiB on these boots). Anything else is a dangling /
+    # garbage child link that would #PF->#DF on deref.
+    if (n & 0x7) != 0:
+        return 1
+    if n < 0x10000:
+        return 1
+    if n >= 0x40000000:
+        return 1
+    return 0
+
+
 def _vt_left(n: uint64) -> uint64:
     if n == 0:
+        return 0
+    if _vt_node_bad(n) != 0:
+        printk1("[dbg-vtree] _vt_left BAD n=0x%x\n", n)
         return 0
     return cast[Ptr[VmaNode]](n)[0].left
 
 
 def _vt_right(n: uint64) -> uint64:
     if n == 0:
+        return 0
+    if _vt_node_bad(n) != 0:
+        printk1("[dbg-vtree] _vt_right BAD n=0x%x\n", n)
         return 0
     return cast[Ptr[VmaNode]](n)[0].right
 
@@ -980,10 +1037,25 @@ def _vt_insert_rec(root: uint64, node: uint64) -> uint64:
     if root == 0:
         _vt_fix(node)
         return node
+    # DBG-VTREE / cycle-guard: if `node` is ALREADY this subtree's root, a
+    # double-insert is in progress. Re-inserting an already-linked node makes
+    # it its own descendant -> a cycle the recursive insert/remove walk then
+    # infinite-recurses on -> kernel-stack overflow -> #DF (err=0) in the
+    # deepest _vt_* frame. Refuse the re-link and report it.
+    if root == node:
+        printk1("[dbg-vtree] DOUBLE-INSERT node=0x%x already in tree\n", node)
+        return root
+    _vt_insert_depth = _vt_insert_depth + 1
+    if _vt_insert_depth > 64:
+        printk2("[dbg-vtree] INSERT DEPTH>64 root=0x%x node=0x%x (cycle?)\n",
+                root, node)
+        _vt_insert_depth = _vt_insert_depth - 1
+        return root
     if cast[Ptr[VmaNode]](node)[0].start < cast[Ptr[VmaNode]](root)[0].start:
         _vt_set_left(root, _vt_insert_rec(_vt_left(root), node))
     else:
         _vt_set_right(root, _vt_insert_rec(_vt_right(root), node))
+    _vt_insert_depth = _vt_insert_depth - 1
     return _vt_rebalance(root)
 
 
@@ -1003,10 +1075,19 @@ def _vt_remove_rec(root: uint64, key: uint64, target: uint64) -> uint64:
     # heap address is the one detached.
     if root == 0:
         return 0
+    _vt_insert_depth = _vt_insert_depth + 1
+    if _vt_insert_depth > 64:
+        printk2("[dbg-vtree] REMOVE DEPTH>64 root=0x%x key=0x%x (cycle?)\n",
+                root, key)
+        _vt_insert_depth = _vt_insert_depth - 1
+        return root
+    _rr_ret: uint64 = 0
     if key < cast[Ptr[VmaNode]](root)[0].start:
         _vt_set_left(root, _vt_remove_rec(_vt_left(root), key, target))
+        _rr_ret = _vt_rebalance(root)
     elif key > cast[Ptr[VmaNode]](root)[0].start:
         _vt_set_right(root, _vt_remove_rec(_vt_right(root), key, target))
+        _rr_ret = _vt_rebalance(root)
     else:
         # key == root.start. It might still be a DIFFERENT node than
         # target if two ranges momentarily share a start during a split
@@ -1014,44 +1095,54 @@ def _vt_remove_rec(root: uint64, key: uint64, target: uint64) -> uint64:
         if root != target:
             # Defensive: keep searching right (ties routed right on insert).
             _vt_set_right(root, _vt_remove_rec(_vt_right(root), key, target))
-            return _vt_rebalance(root)
-        l: uint64 = _vt_left(root)
-        r: uint64 = _vt_right(root)
-        if l == 0:
-            _vt_set_left(root, 0)
-            _vt_set_right(root, 0)
-            return r
-        if r == 0:
-            _vt_set_left(root, 0)
-            _vt_set_right(root, 0)
-            return l
-        # Two children: pull the in-order successor (min of right subtree)
-        # up into root's position by relinking it around root's children,
-        # then detach root.
-        succ: uint64 = _vt_min_node(r)
-        new_r: uint64 = _vt_remove_rec(r, cast[Ptr[VmaNode]](succ)[0].start,
-                                       succ)
-        _vt_set_left(succ, l)
-        _vt_set_right(succ, new_r)
-        _vt_set_left(root, 0)
-        _vt_set_right(root, 0)
-        return _vt_rebalance(succ)
-    return _vt_rebalance(root)
+            _rr_ret = _vt_rebalance(root)
+        else:
+            l: uint64 = _vt_left(root)
+            r: uint64 = _vt_right(root)
+            if l == 0:
+                _vt_set_left(root, 0)
+                _vt_set_right(root, 0)
+                _rr_ret = r
+            elif r == 0:
+                _vt_set_left(root, 0)
+                _vt_set_right(root, 0)
+                _rr_ret = l
+            else:
+                # Two children: pull the in-order successor (min of right
+                # subtree) up into root's position by relinking it around
+                # root's children, then detach root.
+                succ: uint64 = _vt_min_node(r)
+                new_r: uint64 = _vt_remove_rec(
+                    r, cast[Ptr[VmaNode]](succ)[0].start, succ)
+                _vt_set_left(succ, l)
+                _vt_set_right(succ, new_r)
+                _vt_set_left(root, 0)
+                _vt_set_right(root, 0)
+                _rr_ret = _vt_rebalance(succ)
+    _vt_insert_depth = _vt_insert_depth - 1
+    return _rr_ret
 
 
 def _vma_tree_insert(slot: uint64, node: uint64):
-    # Splice `node` into slot's interval tree (caller holds the mm write
-    # lock). The node's left/right/height are reset so it enters as a leaf.
+    # Splice `node` into slot's interval tree. Held under the mm write lock
+    # so the (rotation-rewiring) insert is atomic w.r.t. the lockless fault
+    # reader's tree walk — see vma_mm_write_lock. The node's left/right/
+    # height are reset so it enters as a leaf.
+    vma_mm_write_lock(slot)
     cast[Ptr[VmaNode]](node)[0].left = 0
     cast[Ptr[VmaNode]](node)[0].right = 0
     cast[Ptr[VmaNode]](node)[0].height = 0
     r: uint64 = _vma_tree_root(slot)
     _vma_set_tree_root(slot, _vt_insert_rec(r, node))
     _vma_mm_seq_bump(slot)
+    vma_mm_write_unlock(slot)
 
 
 def _vma_tree_remove(slot: uint64, node: uint64):
-    # Detach `node` from slot's interval tree (caller holds the write lock).
+    # Detach `node` from slot's interval tree. Held under the mm write lock
+    # so the remove (incl. successor-splice rotations) is atomic w.r.t. the
+    # lockless fault reader's tree walk — see vma_mm_write_lock.
+    vma_mm_write_lock(slot)
     r: uint64 = _vma_tree_root(slot)
     new_root: uint64 = _vt_remove_rec(r, cast[Ptr[VmaNode]](node)[0].start,
                                       node)
@@ -1059,6 +1150,7 @@ def _vma_tree_remove(slot: uint64, node: uint64):
     cast[Ptr[VmaNode]](node)[0].left = 0
     cast[Ptr[VmaNode]](node)[0].right = 0
     _vma_mm_seq_bump(slot)
+    vma_mm_write_unlock(slot)
 
 
 def _vma_tree_update_end(slot: uint64, node: uint64, new_end: uint64):
@@ -1066,11 +1158,15 @@ def _vma_tree_update_end(slot: uint64, node: uint64, new_end: uint64):
     # BST key (`start`) is unchanged, but subtree_max_end along the path
     # from the root to `node` must be refreshed. Simplest correct way that
     # reuses the balanced machinery: detach and re-insert with the new end.
-    # Caller holds the mm write lock. (start is unchanged so list order is
+    # Taken under the mm write lock (recursive — the nested remove/insert
+    # re-take it) so the node is never observed transiently absent from the
+    # tree by the lockless fault reader. (start is unchanged so list order is
     # unaffected — only the tree augmentation is repaired.)
+    vma_mm_write_lock(slot)
     _vma_tree_remove(slot, node)
     cast[Ptr[VmaNode]](node)[0].end = new_end
     _vma_tree_insert(slot, node)
+    vma_mm_write_unlock(slot)
 
 
 def _vma_tree_find(slot: uint64, addr: uint64) -> uint64:
@@ -1082,7 +1178,16 @@ def _vma_tree_find(slot: uint64, addr: uint64) -> uint64:
     # queries that DO use subtree_max_end below.
     cur: uint64 = _vma_tree_root(slot)
     cand: uint64 = 0
+    _ftf_steps: uint64 = 0
     while cur != 0:
+        # Cycle/garbage tripwire: a corrupt tree (dangling child or a cycle)
+        # would otherwise spin forever here or #PF on a wild child. Bound the
+        # descent (a balanced tree is O(log n) deep) and validate the pointer.
+        if _vt_node_bad(cur) != 0 or _ftf_steps > 256:
+            printk2("[dbg-vtree] find: BAD/looping cur=0x%x addr=0x%x\n",
+                    cur, addr)
+            return 0
+        _ftf_steps = _ftf_steps + 1
         s: uint64 = cast[Ptr[VmaNode]](cur)[0].start
         if s <= addr:
             cand = cur                      # greatest start seen so far <= addr
@@ -1100,7 +1205,13 @@ def _vma_tree_overlap(slot: uint64, lo: uint64, hi: uint64) -> uint64:
     # or 0. Uses the subtree_max_end augmentation to prune a left subtree
     # whose every interval ends at or before `lo`.
     cur: uint64 = _vma_tree_root(slot)
+    _ov_steps: uint64 = 0
     while cur != 0:
+        if _vt_node_bad(cur) != 0 or _ov_steps > 256:
+            printk2("[dbg-vtree] overlap: BAD/looping cur=0x%x lo=0x%x\n",
+                    cur, lo)
+            return 0
+        _ov_steps = _ov_steps + 1
         s: uint64 = cast[Ptr[VmaNode]](cur)[0].start
         e: uint64 = cast[Ptr[VmaNode]](cur)[0].end
         if s < hi and e > lo:
@@ -1132,25 +1243,34 @@ def _vma_tree_overlap(slot: uint64, lo: uint64, hi: uint64) -> uint64:
 # non-zero return with vma_unlock_vma(node).
 
 def vma_lock_fault_vma(slot: uint64, addr: uint64) -> uint64:
-    rcu_read_lock()
-    seq0: uint64 = vma_mm_seq[slot]
+    # CORRECTNESS (SMP #DF fix): the interval-tree WALK itself must never
+    # race a structural mutation. A concurrent mmap/munmap/split rotates
+    # nodes (rewiring left/right transiently) and FREES VmaNodes via plain
+    # kfree — which is NOT RCU-deferred — so a lockless walk could deref a
+    # half-rewired or already-freed child pointer (_vt_right) and take a
+    # #PF that re-faults into a #DF. (apt issues thousands of mmaps across a
+    # multi-threaded/CLONE_VM process tree, so the window is hit; dpkg's tiny
+    # closure never did.) rcu_read_lock + a post-hoc seqcount check cannot
+    # undo a fault that already happened mid-walk. So take the mm-wide write
+    # lock for the (short, O(log n)) walk + per-VMA trylock; every structural
+    # mutator takes the SAME lock, making the tree provably stable here. The
+    # per-VMA lock is still what guards the (slow) fault BODY, so two faults
+    # on DIFFERENT VMAs still run concurrently once this returns.
+    vma_mm_write_lock(slot)
     node: uint64 = _vma_tree_find(slot, addr)
     if node == 0:
-        rcu_read_unlock()
+        vma_mm_write_unlock(slot)
         return 0
     if spinlock_trylock(&cast[Ptr[VmaNode]](node)[0].vlock) == 0:
         # Another fault holds this VMA's lock; fall back to the write side.
-        rcu_read_unlock()
+        vma_mm_write_unlock(slot)
         return 0
-    # Confirm no structural change raced the lookup. If the seq moved (or
-    # is now odd), the node we found may have been split/freed; drop the
-    # per-VMA lock and signal a write-lock fallback.
-    seq1: uint64 = vma_mm_seq[slot]
-    if seq1 != seq0:
-        spinlock_unlock(&cast[Ptr[VmaNode]](node)[0].vlock)
-        rcu_read_unlock()
-        return 0
-    rcu_read_unlock()
+    # Hold the per-VMA lock across the mm-lock release: the node cannot be
+    # freed/split out from under us while its vlock is held (the mutators
+    # that would do so take the per-VMA lock too, or run under the mm lock
+    # we just held to find it). Drop the mm lock so the fault body races
+    # only on this VMA's own lock.
+    vma_mm_write_unlock(slot)
     return node
 
 
@@ -1829,20 +1949,29 @@ def vma_find(slot: uint64, addr: uint64) -> uint64:
     # linear list walk only if the tree is somehow empty while the list is
     # not (it never is — insert/unlink keep them consistent — but the
     # belt-and-braces walk costs nothing on the empty-tree path).
+    # Held under the mm write lock (recursive — the fault slow path already
+    # owns it when it calls here) so this tree WALK never races a concurrent
+    # structural mutation on the same mm.
+    vma_mm_write_lock(slot)
     node: uint64 = _vma_tree_find(slot, addr)
     if node != 0:
+        vma_mm_write_unlock(slot)
         return node
     if _vma_tree_root(slot) != 0:
+        vma_mm_write_unlock(slot)
         return 0
     cur: uint64 = task_vma_list_head(slot)
     while cur != 0:
         s: uint64 = _vma_node_start(cur)
         e: uint64 = _vma_node_end(cur)
         if s <= addr and addr < e:
+            vma_mm_write_unlock(slot)
             return cur
         if s > addr:
+            vma_mm_write_unlock(slot)
             return 0
         cur = _vma_node_get_next(cur)
+    vma_mm_write_unlock(slot)
     return 0
 
 
@@ -4053,14 +4182,22 @@ def vma_clear(slot: uint64):
     # page (mapped COW in a forked relative) is left for that holder
     # instead of being freed out from under it.
     pml4: uint64 = task_pml4(cast[int32](slot))
+    # Detach the whole tree + list FIRST under the mm write lock, BEFORE
+    # freeing any node, so a concurrent lockless fault reader (another live
+    # thread of this shared mm) can never reach a node that is about to be
+    # kfree'd via the (now-empty) tree root — a use-after-free that would
+    # surface as a #DF in _vt_right.
+    vma_mm_write_lock(slot)
     cur: uint64 = task_vma_list_head(slot)
+    set_task_vma_list_head(slot, 0)
+    # Wave-3: the whole interval tree is gone with the list.
+    _vma_set_tree_root(slot, 0)
+    _vma_mm_seq_bump(slot)
+    vma_mm_write_unlock(slot)
     while cur != 0:
         nxt: uint64 = _vma_node_get_next(cur)
         _vma_node_free(slot, cur, pml4)
         cur = nxt
-    set_task_vma_list_head(slot, 0)
-    # Wave-3: the whole interval tree is gone with the list.
-    _vma_set_tree_root(slot, 0)
     # execve/teardown: the cached windowed free-extents are stale (their VAs
     # were just released with the page table); forget them so a re-exec'd
     # task starts with a clean free-list.
@@ -4091,7 +4228,18 @@ def vma_adopt(from_slot: uint64, to_slot: uint64):
     # Wave-3: rebuild to_slot's interval tree over the combined list and
     # empty from_slot's. The splice above can leave the list out of sorted
     # order (from's tail may start after to's head), so rebuild from
-    # scratch rather than merge — this is a one-shot teardown path.
+    # scratch rather than merge — this is a one-shot teardown path. Held
+    # under both slots' mm write locks so a concurrent fault reader on
+    # either mm never walks a half-rebuilt tree.
+    # Lock both in a fixed (ascending-slot) order to avoid an A-B/B-A
+    # deadlock against another concurrent adopt.
+    _lo_slot: uint64 = from_slot
+    _hi_slot: uint64 = to_slot
+    if to_slot < from_slot:
+        _lo_slot = to_slot
+        _hi_slot = from_slot
+    vma_mm_write_lock(_lo_slot)
+    vma_mm_write_lock(_hi_slot)
     _vma_set_tree_root(from_slot, 0)
     _vma_set_tree_root(to_slot, 0)
     rb: uint64 = fh
@@ -4103,6 +4251,10 @@ def vma_adopt(from_slot: uint64, to_slot: uint64):
         r: uint64 = _vma_tree_root(to_slot)
         _vma_set_tree_root(to_slot, _vt_insert_rec(r, rb))
         rb = nxt_rb
+    _vma_mm_seq_bump(from_slot)
+    _vma_mm_seq_bump(to_slot)
+    vma_mm_write_unlock(_hi_slot)
+    vma_mm_write_unlock(_lo_slot)
 
 
 def vma_free_reserved_range(slot: uint64, vlo: uint64, vhi: uint64):
