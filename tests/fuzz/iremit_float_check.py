@@ -152,6 +152,132 @@ def corpus():
     return progs
 
 
+# ----------------------------------------------------------------------------
+# FLOAT optimization corpus: programs whose hot FLOAT subexpressions are
+# const-folded / CSE'd / LICM-hoisted by the native optimizer. Each asserts:
+#   * bit-exact result vs a Python IEEE oracle (so the float opt is value-
+#     preserving — a wrong bit = miscompile),
+#   * the EXPECTED opt counter fired (ffold / cse / licm >= 1) so the pass
+#     demonstrably reaches floats (NOT silently skipped),
+#   * byte-INERT with --opt OFF (no opt counter fires off).
+# This is the float analogue of the integer CSE/LICM corpora; the broad fuzzer
+# never repeats a float subexpression, so without this the float CSE/LICM paths
+# would be unexercised.
+#
+# Each entry: (name, body, expected_uint64, counter_name, min_count).
+def opt_corpus():
+    progs = []
+    P = PRELUDE + "\n"
+
+    def wrap(decls):
+        return (P + decls +
+                "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+                "    g_accum = f(7, 3)\n"
+                "    print_u64(g_accum)\n"
+                "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n")
+
+    # ---- FLOAT CONST-FOLD: exact-integer f64 ADD/SUB/MUL -> one literal ----
+    progs.append(("ffold_mul",
+        wrap("def f(a: int64, b: int64) -> uint64:\n"
+             "    x: float64 = cast[float64](6) * cast[float64](7)\n"
+             "    return cast[uint64](cast[int64](x))\n"),
+        u64(42), "ffold", 1))
+    progs.append(("ffold_nested",
+        wrap("def f(a: int64, b: int64) -> uint64:\n"
+             "    x: float64 = (cast[float64](2) + cast[float64](3)) * cast[float64](4)\n"
+             "    return cast[uint64](cast[int64](x))\n"),
+        u64(20), "ffold", 1))
+
+    # ---- FLOAT CSE: a repeated float subexpression shares one xmm result ----
+    # (fa+fb) appears twice -> CSE'd into a typed float64 temp. (7+3)^2 = 100.
+    progs.append(("fcse_f64",
+        wrap("def f(a: int64, b: int64) -> uint64:\n"
+             "    fa: float64 = cast[float64](a)\n"
+             "    fb: float64 = cast[float64](b)\n"
+             "    x: float64 = (fa + fb) * (fa + fb)\n"
+             "    return cast[uint64](cast[int64](x))\n"),
+        u64(100), "cse", 1))
+    # float32 CSE (4-byte typed temp). (7+3)*(7+3) = 100.
+    progs.append(("fcse_f32",
+        wrap("def f(a: int64, b: int64) -> uint64:\n"
+             "    fa: float32 = cast[float32](a)\n"
+             "    fb: float32 = cast[float32](b)\n"
+             "    x: float32 = (fa + fb) * (fa + fb)\n"
+             "    return cast[uint64](cast[int64](x))\n"),
+        u64(100), "cse", 1))
+    # mixed-width repeated subexpression (f32 + f64 -> f64 temp). (7+3)+(7+3)=20.
+    progs.append(("fxcse_mixed",
+        wrap("def f(a: int64, b: int64) -> uint64:\n"
+             "    x: float64 = (cast[float32](a) + cast[float64](b)) + (cast[float32](a) + cast[float64](b))\n"
+             "    return cast[uint64](cast[int64](x))\n"),
+        u64(20), "cse", 1))
+
+    # ---- FLOAT LICM: loop-invariant float subexpression hoisted ----
+    # fa*fb invariant -> hoisted to a float64 pre-header temp; loop adds it 3x.
+    # f(7,3): 7*3=21, *3 iterations = 63.
+    progs.append(("flicm_f64",
+        wrap("def f(a: int64, b: int64) -> uint64:\n"
+             "    fa: float64 = cast[float64](a)\n"
+             "    fb: float64 = cast[float64](b)\n"
+             "    acc: float64 = cast[float64](0)\n"
+             "    i: int64 = 0\n"
+             "    while i < 3:\n"
+             "        acc = acc + (fa * fb)\n"
+             "        i = i + 1\n"
+             "    return cast[uint64](cast[int64](acc))\n"),
+        u64(63), "licm", 1))
+    return progs
+
+
+def run_opt_corpus():
+    ok = True
+    totals = {"ffold": 0, "cse": 0, "licm": 0}
+    n_pass = 0
+    n_total = 0
+    for (name, body, expected, counter, mincount) in opt_corpus():
+        n_total += 1
+        r = host.run_through_codegen_ad(f"fopt_{name}", body, WORK, opt=True)
+        if r.kind != "ok":
+            ok = False
+            print(f"  [{name}] codegen.ad {r.kind}: {str(r.detail)[:160]}")
+            continue
+        got_count = int(getattr(r, counter, 0) or 0)
+        totals[counter] = totals.get(counter, 0) + got_count
+        if r.stdout != str(expected):
+            ok = False
+            print(f"  [{name}] MISCOMPILE got={r.stdout} oracle={expected} "
+                  f"{counter}={got_count}")
+            continue
+        if got_count < mincount:
+            ok = False
+            print(f"  [{name}] correct but {counter} pass NEVER FIRED "
+                  f"({counter}={got_count}, want >= {mincount})")
+            continue
+        # byte-inert OFF: no opt counter may fire with --opt off.
+        src = WORK / f"fopt_off_{name}.ad"
+        src.write_text(host.codegen_compatible_source(body))
+        d_off = host.run_dump(src, opt=False)
+        src.unlink(missing_ok=True)
+        off_bad = (d_off.status != "ok"
+                   or int(getattr(d_off, "FFOLD", getattr(d_off, "ffold", 0)) or 0) != 0
+                   or int(getattr(d_off, "CSE", getattr(d_off, "cse", 0)) or 0) != 0
+                   or int(getattr(d_off, "LICM", getattr(d_off, "licm", 0)) or 0) != 0)
+        if off_bad:
+            ok = False
+            print(f"  [{name}] OFF path NOT byte-inert: status={d_off.status}")
+            continue
+        n_pass += 1
+        print(f"  [{name}] OK  out={r.stdout} {counter}={got_count}")
+    print(f"\n[float_opt] {n_pass}/{n_total} correct+pass-fired  "
+          f"ffold={totals['ffold']} cse={totals['cse']} licm={totals['licm']}")
+    if totals["ffold"] == 0 or totals["cse"] == 0 or totals["licm"] == 0:
+        print("  FAIL: a float opt pass (fold/cse/licm) never fired on the corpus")
+        ok = False
+    if n_pass != n_total:
+        ok = False
+    return ok
+
+
 def run():
     ok = True
     total_iremitfloat = 0
@@ -205,4 +331,7 @@ def run():
 
 
 if __name__ == "__main__":
-    sys.exit(0 if run() else 1)
+    emit_ok = run()
+    print("\n--- FLOAT optimization corpus (const-fold / CSE / LICM) ---")
+    opt_ok = run_opt_corpus()
+    sys.exit(0 if (emit_ok and opt_ok) else 1)
