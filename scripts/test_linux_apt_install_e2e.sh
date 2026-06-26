@@ -189,17 +189,25 @@ set +e
     # read were broken, apt-get aborts with "Error reading the CPU
     # table" before any fetch.
     drive 'echo HAMHELLO_APT_INSTALL_START'
-    drive 'enter linux { /usr/bin/dpkg --force-all -P hamhello }'; sleep 8
-    drive 'enter linux { /usr/bin/apt-get update }'; wait_for "Reading package lists" 60
+    # Marker-gate the purge: a fixed `sleep` here regresses on a loaded
+    # host (the next command's keystrokes interleave with a still-running
+    # `enter linux` subprocess and the apt-get leg never gets its budget
+    # before the QEMU wall). Wait for the purge's own done-marker, with a
+    # generous bound, before typing the next command.
+    drive 'echo HAMHELLO_PURGE_START'
+    drive 'enter linux { /usr/bin/dpkg --force-all -P hamhello }'
+    drive 'echo HAMHELLO_PURGE_DONE'; wait_for HAMHELLO_PURGE_DONE 120
+    drive 'enter linux { /usr/bin/apt-get update }'
+    drive 'echo HAMHELLO_APT_UPDATE_DONE'; wait_for HAMHELLO_APT_UPDATE_DONE 180
     drive 'enter linux { /usr/bin/apt-get install -y hamhello }'
-    drive 'echo APT_WRAPPER_DONE'; wait_for APT_WRAPPER_DONE 180
+    drive 'echo APT_WRAPPER_DONE'; wait_for APT_WRAPPER_DONE 300
     drive 'echo HAMHELLO_APT_RUN'
     drive 'enter linux { /usr/bin/hamhello }'
     drive 'echo HAMHELLO_APT_INSTALL_END'; wait_for HAMHELLO_APT_INSTALL_END 40
 
     drive 'echo BANNER_DONE'; wait_for BANNER_DONE 20
     drive 'exit'; sleep 1
-) | timeout 1200s qemu-system-x86_64 \
+) | timeout 2100s qemu-system-x86_64 \
     -enable-kvm -cpu host \
     -kernel "$ELF" \
     -smp 2 \
@@ -267,10 +275,24 @@ else
     echo "[apt-e2e] MISS: apt-get install leg did not complete"
     fail=1
 fi
-if grep -a -E -q "newly installed|Unpacking hamhello|Setting up hamhello" "$LOG"; then
-    echo "[apt-e2e] OK: apt-get reported hamhello install (newly installed/unpack/setup)"
+# TIGHTENED: the install confirmation MUST come from apt-get's own
+# pipeline, i.e. AFTER the HAMHELLO_APT_INSTALL_START marker. Leg A
+# (dpkg -i) also prints "Unpacking/Setting up hamhello", so matching the
+# whole log would let an apt-get failure pass on Leg A's output alone.
+# Slice the captured serial from the apt marker onward and assert there.
+APT_SLICE=$(awk '/HAMHELLO_APT_INSTALL_START/{f=1} f' "$LOG")
+if printf '%s' "$APT_SLICE" | grep -a -E -q "Unpacking hamhello|Setting up hamhello|newly installed"; then
+    echo "[apt-e2e] OK: apt-get's OWN pipeline reported hamhello install (post-START unpack/setup)"
 else
-    echo "[apt-e2e] MISS: no apt-get install confirmation for hamhello"
+    echo "[apt-e2e] MISS: no apt-get install confirmation AFTER HAMHELLO_APT_INSTALL_START"
+    fail=1
+fi
+# The purge must have removed the dpkg copy, then apt re-created and the
+# apt-installed binary must RUN (its marker after the apt leg started).
+if printf '%s' "$APT_SLICE" | grep -a -F -q "HAMHELLO_INSTALLED_AND_RAN_OK"; then
+    echo "[apt-e2e] OK: apt-installed /usr/bin/hamhello ran (marker after apt leg)"
+else
+    echo "[apt-e2e] MISS: apt-installed hamhello did not run after the apt-get leg"
     fail=1
 fi
 
