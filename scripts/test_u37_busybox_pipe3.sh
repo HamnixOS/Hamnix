@@ -115,10 +115,18 @@ else
 fi
 
 # Required: all three busybox stages loaded as Linux-ABI binaries.
-# The elf64 loader logs the busybox entry on every load; a working
-# 3-stage pipeline produces >= 3 loads after BEFORE_PIPE3 (echo |
-# cat | grep) plus the AFTER_PIPE3 echo => >= 4 total in the window.
-bb_loads=$(echo "$LINES_BETWEEN" | grep -c "entry=0x332cc" || true)
+# The elf64 loader logs "Linux-ABI binary detected" on EVERY Linux-ABI
+# load; a working 3-stage pipeline produces >= 3 such lines in the
+# BEFORE_PIPE3..AFTER_PIPE3 window (echo | cat | grep).
+#
+# NOTE: this used to grep a HARDCODED `entry=0x332cc` busybox entry
+# address, which silently broke once stage-2 ASLR landed — the loader
+# now logs a per-boot-randomised load bias / entry, so the fixed
+# address never matches and the assertion FAILed even on a perfectly
+# working pipeline (the pipe machinery is proven by the 'hello' check
+# above + the clean per-stage exits). Match the ASLR-independent
+# detection marker instead.
+bb_loads=$(echo "$LINES_BETWEEN" | grep -c "Linux-ABI binary detected" || true)
 if [ "$bb_loads" -ge 3 ]; then
     echo "[test_u37_busybox_pipe3] OK   pipe3: $bb_loads busybox stages loaded (>=3)"
 else
