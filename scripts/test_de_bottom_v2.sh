@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # scripts/test_de_bottom_v2.sh — DE bottom-panel structural guard.
 #
-# Hamnix's MATE-mirror DE has a top panel (/bin/hampanel) and a BOTTOM
-# panel (/bin/hambottom): Show Desktop button + window-list strip +
-# 1..4 workspace switcher. Both are hamui v2 clients that paint via the
-# #442 (c) v2 blit protocol.
+# Hamnix's MATE-mirror DE ships a multi-panel layout: a TOP bar plus a BOTTOM
+# window-list panel. Both are now produced by the single config-driven
+# user/hampanelscene.ad (it creates one window per configured panel and pins
+# each to its own screen edge), SUPERSEDING the legacy standalone
+# user/hambottom.ad (source kept, no longer spawned). The shipped default
+# layout (etc/panel.conf) MUST include a bottom-edge panel so the window-list
+# strip is present out of the box.
 #
 # This guard pins the load-bearing links:
-#   1. user/hambottom.ad exists and negotiates the v2 protocol via
-#      hamui_set_protocol_v2() + ships pixels via hamui_v2_commit_rect().
-#   2. The bottom panel reads the live window list from /dev/wsys/session.
-#   3. The compositor spawns /bin/hambottom at startup.
-#   4. /bin/hambottom is registered in scripts/build_user.sh.
+#   1. hampanelscene supports a bottom-edge panel (per-edge placement).
+#   2. The window list is read from /dev/wsys/session (so it tracks live wins).
+#   3. The shipped etc/panel.conf declares a bottom-edge panel by default.
 #
 # Pass marker: PASS: DE bottom panel intact
 # Fail marker: FAIL: <which link broke>
@@ -21,9 +22,8 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-COMPOSITOR_SRC="user/hamUId.ad"
-BOTTOM_SRC="user/hambottom.ad"
-BUILD_SH="scripts/build_user.sh"
+PANEL_SRC="user/hampanelscene.ad"
+PANEL_CONF="etc/panel.conf"
 
 fail=0
 fail_link() {
@@ -31,47 +31,27 @@ fail_link() {
     fail=1
 }
 
-for f in "$COMPOSITOR_SRC" "$BOTTOM_SRC" "$BUILD_SH"; do
+for f in "$PANEL_SRC" "$PANEL_CONF"; do
     if [ ! -f "$f" ]; then
         echo "FAIL: $f missing" >&2
         exit 1
     fi
 done
 
-# --- Link 1: hambottom uses the v2 blit protocol ---------------------
-if ! grep -q "hamui_set_protocol_v2(" "$BOTTOM_SRC"; then
-    fail_link "link 1 (hambottom.ad): hamui_set_protocol_v2() not called — bottom panel never negotiates v2"
-fi
-if ! grep -q "hamui_v2_commit_rect(" "$BOTTOM_SRC"; then
-    fail_link "link 1 (hambottom.ad): hamui_v2_commit_rect() not called — bottom panel never ships a 'B'+'D' blit"
+# --- Link 1: hampanelscene supports a bottom-edge panel --------------
+if ! grep -qiE '\bbottom\b' "$PANEL_SRC"; then
+    fail_link "link 1 (hampanelscene.ad): bottom-edge placement is gone — no bottom panel can render"
 fi
 
-# --- Link 2: window list source -------------------------------------
-if ! grep -q "/dev/wsys/session" "$BOTTOM_SRC"; then
-    fail_link "link 2 (hambottom.ad): /dev/wsys/session is not read — window list won't track live windows"
+# --- Link 2: window-list source -------------------------------------
+if ! grep -q "/dev/wsys/windows" "$PANEL_SRC"; then
+    fail_link "link 2 (hampanelscene.ad): /dev/wsys/windows is not read — window list won't track live windows"
 fi
 
-# --- Link 3: MATE-shape elements (Show Desktop + workspace switcher) -
-# These keep us honest about WHAT the bottom panel is: not just an empty
-# strip. If somebody guts the file, the test breaks.
-if ! grep -qE "SD_BTN_W|_paint_show_desktop" "$BOTTOM_SRC"; then
-    fail_link "link 3 (hambottom.ad): Show Desktop button is gone"
-fi
-if ! grep -qE "WS_COUNT|_paint_workspaces" "$BOTTOM_SRC"; then
-    fail_link "link 3 (hambottom.ad): workspace switcher is gone"
-fi
-if ! grep -qE "_paint_winlist|WINLIST_X" "$BOTTOM_SRC"; then
-    fail_link "link 3 (hambottom.ad): window-list region is gone"
-fi
-
-# --- Link 4: compositor spawns /bin/hambottom ------------------------
-if ! grep -q '"/bin/hambottom"' "$COMPOSITOR_SRC"; then
-    fail_link "link 4 (hamUId.ad): /bin/hambottom is not spawned at startup — bottom panel never appears"
-fi
-
-# --- Link 5: hambottom is registered in the build --------------------
-if ! grep -q "build_adder_user hambottom" "$BUILD_SH"; then
-    fail_link "link 5 (build_user.sh): hambottom is not registered — binary will not be built/staged"
+# --- Link 3: shipped default declares a bottom-edge panel ------------
+# Accept either the block form (`edge bottom`) or legacy (`position bottom`).
+if ! grep -qiE '(^|[[:space:]])(edge|position)[[:space:]]+bottom([[:space:]]|$)' "$PANEL_CONF"; then
+    fail_link "link 3 (etc/panel.conf): no bottom-edge panel declared — the default layout ships without the window-list strip"
 fi
 
 if [ "$fail" -ne 0 ]; then
