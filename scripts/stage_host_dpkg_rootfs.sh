@@ -102,6 +102,8 @@ OPT_BINS="
 /usr/bin/unxz
 /usr/bin/bzip2
 /usr/bin/zcat
+/usr/bin/gpgv
+/usr/bin/sqv
 "
 # apt's file:// fetch method binary + helpers, PLUS the http method for
 # the LIVE network path (apt-get update/install from http://deb.debian.org).
