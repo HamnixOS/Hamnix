@@ -1200,7 +1200,33 @@ def _vma_tree_find(slot: uint64, addr: uint64) -> uint64:
     if cand != 0:
         if addr < cast[Ptr[VmaNode]](cand)[0].end:
             return cand
-    return 0
+    # DEFENSE-IN-DEPTH (apt NX exec-fault): the BST point query above
+    # descends on the `start` key and returns the greatest-start node <=
+    # addr. When two VMAs OVERLAP at `addr` (the ld.so reserve+overlay idiom
+    # legitimately nests an alias inside a reservation, and a straddling
+    # partial overlay can leave two siblings both covering `addr`), the
+    # greatest-start candidate may be a sibling whose [start,end) does NOT
+    # contain addr — so the BST returns 0 even though a covering VMA exists.
+    # A 0 here makes the fault handler treat a PRESENT (eagerly-installed)
+    # page as "NO covering VMA" and a later eager re-stamp can race NX onto
+    # an executable page (the apt 'Reading package lists' crash). Fall back
+    # to an exact linear scan so a covered address is NEVER reported unmapped
+    # (prefer an EXEC-permitting node when several overlap, so a refault maps
+    # the page executable). The list is short; this runs only on the rare
+    # BST-miss path.
+    best: uint64 = 0
+    scan: uint64 = task_vma_list_head(slot)
+    while scan != 0:
+        ss: uint64 = cast[Ptr[VmaNode]](scan)[0].start
+        se: uint64 = cast[Ptr[VmaNode]](scan)[0].end
+        if ss <= addr and addr < se:
+            if best == 0:
+                best = scan
+            elif (cast[Ptr[VmaNode]](scan)[0].prot & VMA_PROT_EXEC) != 0:
+                # Prefer an executable cover so the page faults in runnable.
+                best = scan
+        scan = cast[Ptr[VmaNode]](scan)[0].next
+    return best
 
 
 def _vma_tree_overlap(slot: uint64, lo: uint64, hi: uint64) -> uint64:
@@ -2752,6 +2778,71 @@ def _vma_alloc_fixed_at(slot: uint64, addr_in: uint64, length: uint64,
     return cast[int64](addr_in)
 
 
+def _vma_node_is_pure_alias(node: uint64) -> int32:
+    # 1 iff `node` is a PURE METADATA ALIAS: a VMA created by the MAP_FIXED
+    # reserve+overlay idiom that owns NO pages of its own (the enclosing
+    # reservation owns them). Such a node has backing==0, nchunks==0 and
+    # none of the page-owning flags (is_demand / is_cow / is_shared /
+    # is_pinned / is_file_shared / is_huge). Removing it frees ONLY the
+    # descriptor — never any frames — so it is safe to drop when a later
+    # MAP_FIXED replaces its range.
+    if cast[Ptr[VmaNode]](node)[0].backing != 0:
+        return 0
+    if cast[Ptr[VmaNode]](node)[0].nchunks != 0:
+        return 0
+    if cast[Ptr[VmaNode]](node)[0].is_demand != 0:
+        return 0
+    if cast[Ptr[VmaNode]](node)[0].is_cow != 0:
+        return 0
+    if cast[Ptr[VmaNode]](node)[0].is_shared != 0:
+        return 0
+    if cast[Ptr[VmaNode]](node)[0].is_pinned != 0:
+        return 0
+    if cast[Ptr[VmaNode]](node)[0].is_file_shared != 0:
+        return 0
+    if cast[Ptr[VmaNode]](node)[0].is_huge != 0:
+        return 0
+    return 1
+
+
+def _vma_drop_overlapping_aliases(slot: uint64, lo: uint64, hi: uint64,
+                                  keep: uint64):
+    # MAP_FIXED REPLACE semantics for the reserve+overlay idiom: before a
+    # new alias is inserted over [lo, hi), remove every PRIOR pure-alias
+    # node that overlaps [lo, hi) (except `keep`, the enclosing reservation
+    # we are aliasing INTO). Without this, a second MAP_FIXED over the same
+    # or an overlapping sub-range (ld.so re-overlaying .text then RELRO, or
+    # apt re-mmapping a segment) STACKS duplicate/overlapping alias nodes.
+    # Overlapping VMA nodes break the interval-tree point query
+    # (_vma_tree_find descends the BST on `start` and can return 0 for an
+    # address that two siblings both cover), so a later demand/exec fault
+    # finds "NO covering VMA" and the eager PTE re-stamp races NX onto an
+    # executable page -> the apt 'Reading package lists' NX exec-fault.
+    # Pure aliases own no frames, so unlinking them frees only the
+    # descriptor; the enclosing reservation's pages (and its PTEs, which
+    # the new overlay re-stamps) are untouched.
+    #
+    # Only drop an alias that lies ENTIRELY within [lo, hi): the new overlay
+    # fully covers it, so it is a genuine REPLACE with no coverage loss. A
+    # pure alias that merely STRADDLES the new range keeps a region the new
+    # overlay does not cover, so it is left in place (the common ld.so case
+    # is a re-overlay of the SAME [lo, hi), i.e. full containment — exactly
+    # the duplicate-stacking we must kill).
+    cur: uint64 = task_vma_list_head(slot)
+    while cur != 0:
+        nxt: uint64 = _vma_node_get_next(cur)
+        if cur != keep:
+            s: uint64 = _vma_node_start(cur)
+            e: uint64 = _vma_node_end(cur)
+            if s >= lo and e <= hi and s < hi and lo < e \
+                    and _vma_node_is_pure_alias(cur) != 0:
+                _vma_unlink(slot, cur)
+                if nr_vma_nodes_live > 0:
+                    nr_vma_nodes_live = nr_vma_nodes_live - 1
+                kfree(cur)
+        cur = nxt
+
+
 # ---------------------------------------------------------------------
 # vma_alloc
 # ---------------------------------------------------------------------
@@ -2797,6 +2888,13 @@ def vma_alloc(slot: uint64, addr_in: uint64, len_in: uint64,
             # fresh-overlay path unless the request is strictly
             # smaller than the region it lands in.
             if encl_s < addr_in or end_req < encl_e:
+                # MAP_FIXED REPLACE: drop any prior pure-alias node(s) this
+                # overlay overlaps so we never STACK duplicate/overlapping
+                # alias VMAs (which corrupt the interval tree and surface as
+                # the apt 'Reading package lists' NX exec-fault). The
+                # enclosing reservation (`encl`) is preserved — it owns the
+                # pages; the new overlay re-stamps the PTEs below.
+                _vma_drop_overlapping_aliases(slot, addr_in, end_req, encl)
                 alias: uint64 = _vma_node_new()
                 if alias == 0:
                     return cast[int64](-12)
