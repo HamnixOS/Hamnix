@@ -199,7 +199,9 @@ build_adder_user hamecho              # Increment-1 DE rewrite: first SEPARATE-P
 build_adder_user hamlock              # DE pivot wave 5: full-screen screen-lock overlay (v2 client; reads /dev/wsys/lock, poked via /dev/wsys/lock/show, verify posted to /dev/wsys/lock/verify)
 build_adder_user hamrband             # DE pivot wave 7: rubber-band drag-to-create overlay (v2 client; reads /dev/wsys/rband, poked via /dev/wsys/rband/set)
 build_adder_user hamnotif             # DE pivot wave 7: transient notification toast banner (v2 client; reads /dev/wsys/notif, poked via /dev/wsys/notif/show)
-build_adder_user hamnotify            # libnotify-shape CLI sender: writes "<title>\t<body>\t<icon>\n" to /dev/wsys/post (inbox ring drained by hamUId)
+build_adder_user hamnotify            # libnotify-shape CLI sender: writes "<title>\t<body>\t<icon>\n" to /dev/wsys/post (inbox ring drained by the panel broker)
+build_adder_user hamtoast             # scene-native transient notification toast (top-right, auto-dismiss); title/body via argv, spawned by the panel notification broker
+build_adder_user haminbox             # scene-native notification inbox/history (reads /tmp/hamnix-notif.log written by the panel broker); spawned from the tray bell
 build_adder_user hamsessui            # DE pivot wave 8: modal End Session dialog (Lock/Log Out/Shut Down/Cancel) (v2 client; reads /dev/wsys/sessui, poked via /dev/wsys/sessui/show)
 build_adder_user hamdesktop           # scene-file DE desktop backdrop + clickable launcher icons (scene client; reads /etc/desktop.icons, double-click spawns via lib/p9 spawn)
 build_adder_user hamsysmon            # DE pivot wave 2 (round 2): desktop system-monitor applet (CPU/MEM bars) (v2 client; reads /dev/wsys/sysmon, poked via /dev/wsys/sysmon/show)
