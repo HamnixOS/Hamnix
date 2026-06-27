@@ -289,6 +289,14 @@ APT::Architectures "amd64";
 // line SHORT — hamsh's line editor echoes ~1 char per readline tick).
 Acquire::AllowInsecureRepositories "true";
 APT::Get::AllowUnauthenticated "true";
+// Run apt's fetch methods (http/file/copy/gpgv) AS ROOT. By default apt
+// seteuid()s its method processes to the unprivileged '_apt' sandbox user;
+// that user does not exist in the minimal namespace passwd, so the
+// privilege-drop fails and every method "dies unexpectedly" mid-download
+// ("E: Method http has died unexpectedly!"). The namespace is already a
+// single-root capability sandbox (Plan 9 bindings), so dropping to _apt
+// buys nothing here. Pin the sandbox user to root so the methods run.
+APT::Sandbox::User "root";
 EOF
 
 # os markers. debian_version starts with "12." so the coverage sweep's
