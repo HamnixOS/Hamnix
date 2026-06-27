@@ -311,7 +311,7 @@ APT::Sandbox::User "root";
 // already-[trusted=yes] source (the brief's sanctioned allow-unauthenticated
 // fallback). The shim lives at the path below, staged + embedded alongside
 // the real method (which stays present for future real-verify work).
-Dir::Bin::Methods::gpgv "/var/lib/distros/default/usr/lib/apt/methods/hamnix-gpgv-noop";
+Dir::Bin::Methods::gpgv "/usr/lib/apt/methods/hamnix-gpgv-noop";
 EOF
 
 # --- no-op gpgv acquire-method shim (LIVE-net signature bypass) -------
