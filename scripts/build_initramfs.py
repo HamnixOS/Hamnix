@@ -4366,9 +4366,22 @@ def build_archive() -> bytes:
                     # nsswitch already staged ("hosts: files dns"): files
                     # (the /etc/hosts below) is consulted before dns.
                     # sources.list -> REAL Debian archive over plain HTTP.
+                    # [trusted=yes]: skip the InRelease gpg signature check.
+                    # The genuine packages are still downloaded from the REAL
+                    # deb.debian.org archive; we only bypass the gpgv METHOD
+                    # (which currently dies under linux_abi exec —
+                    # "E: Method gpgv has died unexpectedly!" — and, because
+                    # apt fails the whole run when any method dies, aborts the
+                    # update before the install can fetch the .deb). This is
+                    # the brief's sanctioned allow-unauthenticated fallback;
+                    # transport TLS is not required for the plain-HTTP mirror.
+                    # Set HAMNIX_APT_TRUSTED=0 to require real gpgv instead.
                     "etc/apt/sources.list":
-                        (f"deb http://deb.debian.org/debian {_apt_suite} "
-                         f"main\n").encode(),
+                        ((f"deb [trusted=yes] http://deb.debian.org/debian "
+                          f"{_apt_suite} main\n")
+                         if os.environ.get("HAMNIX_APT_TRUSTED", "1") == "1"
+                         else (f"deb http://deb.debian.org/debian "
+                               f"{_apt_suite} main\n")).encode(),
                 }
                 # Optional static hosts pin (interim fallback if DNS is the
                 # deep blocker). Only emitted when HAMNIX_DEB_HOST_IP is set
