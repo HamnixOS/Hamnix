@@ -227,41 +227,209 @@ def _switch_workspace(n0: int64):
 
 
 # ====================================================================
-# NOTIFICATION-AREA (tray) state
+# NOTIFICATION BUS / BROKER (scene-native)
 # ====================================================================
-# tray_active = there is a live toast / pending notification per the
-# compositor's /dev/wsys/notif snapshot ("<serial> <active> <alpha> <gen>...").
-# The tray applet draws an unread dot when this is set; a click spawns hamtray.
-tray_active: int32 = 0
+# The kernel inbox ring at /dev/wsys/post is the Plan 9-shaped notification
+# bus: any publisher (the welcome service, rc.5, a shell, hamnotify) writes a
+# "<title>\t<body>\t<icon>\n" record there. In the legacy DE hamUId drained
+# this ring; in the SCENE DE hamUId is dead, so THE PANEL is the broker. On
+# each tick the panel:
+#   1. reads the /dev/wsys/post snapshot
+#      ("<post_serial> <ack_serial> <count> <slot_serial> <title>\t<body>\t<icon>\n"),
+#   2. for each head record while count>0: spawns a scene TOAST
+#      (/bin/hamtoast "<title>" "<body>"), appends the record to the tmpfs
+#      history log /tmp/hamnix-notif.log, bumps the unread count, then ACKs
+#      the slot by writing "ack <slot_serial>\n" back to /dev/wsys/post so the
+#      kernel advances its head.
+# The tray applet draws a bell + the unread count badge; clicking it spawns
+# the scene INBOX (/bin/haminbox), which reads the history log, and clears the
+# unread count.
+notif_unread: int64 = 0                 # unread notifications since last inbox
+notif_last_ack: uint64 = 0             # highest slot serial we've acked
+
+# Parsed head record from the last _drain_notifications poll.
+_nb_count: int64 = 0
+_nb_slot: uint64 = 0
+_nb_title: Array[48, uint8]
+_nb_body:  Array[72, uint8]
 
 
-def _poll_notif():
-    fd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/notif"))
+# Append the current head record (_nb_title/_nb_body) to the tmpfs history log
+# as "<title>\t<body>\n". Capped to the newest ~16 records by rewriting the
+# file from a small in-RAM ring so it never grows unbounded.
+NLOG_MAX: uint64 = 16
+nlog_buf: Array[1920, uint8]           # 16 * 120
+nlog_len: Array[16, uint64]
+nlog_n: uint64 = 0
+
+
+def _nlog_append(title: Ptr[uint8], body: Ptr[uint8]):
+    # Build the "<title>\t<body>" record into the ring (drop oldest on full).
+    slot: uint64 = nlog_n
+    if nlog_n >= NLOG_MAX:
+        # shift down by one (drop oldest)
+        s: uint64 = 0
+        while s + 1 < NLOG_MAX:
+            base_d: uint64 = s * 120
+            base_s: uint64 = (s + 1) * 120
+            k: uint64 = 0
+            while k < nlog_len[s + 1]:
+                nlog_buf[base_d + k] = nlog_buf[base_s + k]
+                k = k + 1
+            nlog_len[s] = nlog_len[s + 1]
+            s = s + 1
+        slot = NLOG_MAX - 1
+    else:
+        nlog_n = nlog_n + 1
+    base: uint64 = slot * 120
+    p: uint64 = 0
+    ti: uint64 = 0
+    while title[ti] != 0 and p < 118:
+        nlog_buf[base + p] = title[ti]
+        p = p + 1
+        ti = ti + 1
+    if p < 118:
+        nlog_buf[base + p] = 9                       # '\t'
+        p = p + 1
+    bi: uint64 = 0
+    while body[bi] != 0 and p < 119:
+        nlog_buf[base + p] = body[bi]
+        p = p + 1
+        bi = bi + 1
+    nlog_len[slot] = p
+    # Rewrite /tmp/hamnix-notif.log from the ring (oldest-first).
+    fd: int32 = sys_open_write(cast[Ptr[char]]("/tmp/hamnix-notif.log"))
     if fd < 0:
-        tray_active = 0
         return
-    rb: Array[96, uint8]
-    n: int64 = sys_read(fd, &rb[0], 95)
+    out: Array[2048, uint8]
+    op: uint64 = 0
+    r: uint64 = 0
+    while r < nlog_n and op + 122 < 2048:
+        rb: uint64 = r * 120
+        kk: uint64 = 0
+        while kk < nlog_len[r]:
+            out[op] = nlog_buf[rb + kk]
+            op = op + 1
+            kk = kk + 1
+        out[op] = 10
+        op = op + 1
+        r = r + 1
+    sys_write(fd, &out[0], op)
+    sys_close(fd)
+
+
+# Spawn the scene toast with the head record's title + body as argv.
+_toast_argv: Array[4, uint64]
+def _spawn_toast():
+    _toast_argv[0] = cast[uint64](cast[Ptr[char]]("/bin/hamtoast"))
+    _toast_argv[1] = cast[uint64](&_nb_title[0])
+    _toast_argv[2] = cast[uint64](&_nb_body[0])
+    _toast_argv[3] = 0
+    spawn(cast[Ptr[char]]("/bin/hamtoast"), &_toast_argv[0],
+          -2, -2, cast[Ptr[uint64]](0))
+
+
+# Ack a drained slot so the kernel advances /dev/wsys/post's head.
+def _ack_slot(serial: uint64):
+    fd: int32 = sys_open_write(cast[Ptr[char]]("/dev/wsys/post"))
+    if fd < 0:
+        return
+    cmd: Array[40, uint8]
+    p: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("ack ")
+    while pre[p] != 0:
+        cmd[p] = pre[p]
+        p = p + 1
+    p = p + _u64_to_dec(serial, &cmd[p])
+    cmd[p] = 10
+    p = p + 1
+    sys_write(fd, &cmd[0], p)
+    sys_close(fd)
+
+
+# Read one /dev/wsys/post snapshot into _nb_*; returns count (>0 = head valid).
+_nb_rb: Array[256, uint8]
+def _read_post_head() -> int64:
+    _nb_count = 0
+    fd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/post"))
+    if fd < 0:
+        return 0
+    n: int64 = sys_read(fd, &_nb_rb[0], 255)
     sys_close(fd)
     if n <= 0:
-        tray_active = 0
-        return
-    # Field layout: "<show_serial> <active> <alpha> <gen> <title>...". Skip
-    # field 0, read field 1 (active flag).
-    i: uint64 = 0
+        return 0
     cap: uint64 = cast[uint64](n)
-    while i < cap and rb[i] != 32:
+    i: uint64 = 0
+    # field 0: post_serial (skip)
+    while i < cap and _nb_rb[i] != 32:
         i = i + 1
-    while i < cap and rb[i] == 32:
+    while i < cap and _nb_rb[i] == 32:
         i = i + 1
-    a: int64 = 0
-    while i < cap and rb[i] >= 48 and rb[i] <= 57:
-        a = a * 10 + cast[int64](rb[i]) - 48
+    # field 1: ack_serial (skip)
+    while i < cap and _nb_rb[i] != 32:
         i = i + 1
-    if a != 0:
-        tray_active = 1
-    else:
-        tray_active = 0
+    while i < cap and _nb_rb[i] == 32:
+        i = i + 1
+    # field 2: count
+    cnt: int64 = 0
+    while i < cap and _nb_rb[i] >= 48 and _nb_rb[i] <= 57:
+        cnt = cnt * 10 + cast[int64](_nb_rb[i]) - 48
+        i = i + 1
+    _nb_count = cnt
+    if cnt <= 0:
+        return 0
+    while i < cap and _nb_rb[i] == 32:
+        i = i + 1
+    # field 3: slot_serial
+    sl: uint64 = 0
+    while i < cap and _nb_rb[i] >= 48 and _nb_rb[i] <= 57:
+        sl = sl * 10 + cast[uint64](_nb_rb[i]) - 48
+        i = i + 1
+    _nb_slot = sl
+    while i < cap and _nb_rb[i] == 32:
+        i = i + 1
+    # title up to tab
+    tp: uint64 = 0
+    while i < cap and _nb_rb[i] != 9 and tp < 47:
+        _nb_title[tp] = _nb_rb[i]
+        tp = tp + 1
+        i = i + 1
+    _nb_title[tp] = 0
+    # skip to past the first tab
+    while i < cap and _nb_rb[i] != 9:
+        i = i + 1
+    if i < cap:
+        i = i + 1                                     # consume tab
+    # body up to next tab (icon) or newline
+    bp: uint64 = 0
+    while i < cap and _nb_rb[i] != 9 and _nb_rb[i] != 10 and bp < 71:
+        _nb_body[bp] = _nb_rb[i]
+        bp = bp + 1
+        i = i + 1
+    _nb_body[bp] = 0
+    return cnt
+
+
+# Drain every pending /dev/wsys/post record: toast it, log it, ack it. Returns
+# 1 if any notification was drained (so the panel repaints the unread badge).
+def _drain_notifications() -> int32:
+    drained: int32 = 0
+    guard: int32 = 0
+    while guard < 16:
+        guard = guard + 1
+        cnt: int64 = _read_post_head()
+        if cnt <= 0:
+            break
+        # Guard against re-processing the same head if an ack didn't land.
+        if _nb_slot == notif_last_ack and notif_last_ack != 0:
+            break
+        _spawn_toast()
+        _nlog_append(&_nb_title[0], &_nb_body[0])
+        notif_unread = notif_unread + 1
+        notif_last_ack = _nb_slot
+        _ack_slot(_nb_slot)
+        drained = 1
+    return drained
 
 
 # Read the framebuffer width from /dev/fb's "W H PITCH BPP FMT\n" header.
@@ -1369,9 +1537,9 @@ def _render_pager(lo: int64, bar: int64):
 
 
 # --- Notification-area / tray applet --------------------------------
-# A bell glyph in a flat cell. When the compositor reports an active toast
-# (tray_active) we paint a small red unread dot at the bell's top-right. A
-# click spawns /bin/hamtray (the message-history panel).
+# A bell glyph in a flat cell. When there are unread notifications we paint a
+# red badge with the unread COUNT at the bell's top-right. A click spawns
+# /bin/haminbox (the scene message-history inbox) and clears the unread count.
 def _render_tray(lo: int64, bar: int64):
     fg: Ptr[uint8] = cast[Ptr[uint8]]("#202020")
     bx: int32 = cast[int32](lo)
@@ -1381,8 +1549,17 @@ def _render_tray(lo: int64, bar: int64):
     hamscene_fill(bx + 5, by + 14, 12, 2, cast[Ptr[uint8]]("#404040"))
     hamscene_fill(bx + 9, by + 5, 4, 2, cast[Ptr[uint8]]("#404040"))
     hamscene_fill(bx + 10, by + 16, 2, 2, cast[Ptr[uint8]]("#404040"))
-    if tray_active != 0:
-        hamscene_fill(bx + 14, by + 4, 5, 5, cast[Ptr[uint8]]("#e03030"))
+    if notif_unread > 0:
+        # Red badge + count digit at the bell's top-right.
+        hamscene_fill(bx + 13, by + 2, 9, 9, cast[Ptr[uint8]]("#e03030"))
+        cnt: int64 = notif_unread
+        if cnt > 9:
+            cnt = 9
+        cbuf: Array[2, uint8]
+        _u64_to_dec(cast[uint64](cnt), &cbuf[0])
+        cbuf[1] = 0
+        _glyphs(cast[int64](bx) + 14, cast[int64](by) + 2, &cbuf[0],
+                cast[Ptr[uint8]]("#ffffff"), 0)
 
 
 # --- Session / power button applet ----------------------------------
@@ -1767,7 +1944,9 @@ def _handle_click(x: int64, y: int64, bar: int64) -> int32:
                             menu_open = 0
                         return 1
                     elif ak == WK_TRAY:
-                        _launch(cast[Ptr[char]]("/bin/hamtray"))
+                        # Open the scene notification inbox and mark all read.
+                        _launch(cast[Ptr[char]]("/bin/haminbox"))
+                        notif_unread = 0
                         if menu_open != 0:
                             menu_open = 0
                         return 1
@@ -2297,13 +2476,16 @@ def main() -> int32:
         if n_tasks != last_ntasks:
             any_redraw = 1
 
-        # Track the live workspace (pager lit cell) and notification state
-        # (tray unread dot). A change in either repaints the panels.
+        # Track the live workspace (pager lit cell) and drain the notification
+        # bus (/dev/wsys/post): each new record spawns a toast, is logged to
+        # the inbox history, and bumps the unread badge. A change in either
+        # repaints the panels.
         prev_ws: int64 = cur_ws
-        prev_tray: int32 = tray_active
+        prev_unread: int64 = notif_unread
         _poll_workspace()
-        _poll_notif()
-        if cur_ws != prev_ws or tray_active != prev_tray:
+        if _drain_notifications() != 0:
+            any_redraw = 1
+        if cur_ws != prev_ws or notif_unread != prev_unread:
             any_redraw = 1
 
         sod: uint64 = _now_secs_of_day(btime)
