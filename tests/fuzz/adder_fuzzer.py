@@ -519,6 +519,25 @@ class Program:
         return body
 
     # ---- helper: pure int function f(a,b[,c]) -> int64 -----------------------
+    #
+    # The helper is the fuzzer's only BARRIER-FREE function: it has NO call and
+    # NO addr-of, so the native optimizer's DCE pass (which bails for any
+    # function containing a call/addr-of — see opt.ad dce_scan_barrier) CAN run
+    # here. main() is full of calls (print_u64/_putc/helpers/methods/sc_bump)
+    # and &_ch[0], so DCE never fires there. To give the ADDER_OPT=1 lane real
+    # DCE + const-branch-fold coverage we inject, behind generator knobs, three
+    # optimizer-bait shapes into this pure helper, all provably observationally
+    # inert (they never feed `r` / the return value, so the by-construction
+    # oracle `pyfn` is UNCHANGED and the equivalence assertion stays green):
+    #   (1) DEAD LOCALS  — a local with a pure initializer, never read, at
+    #       varying block depth; sometimes a CHAIN (a dead local whose init
+    #       references an earlier dead local) so the fixpoint DCE has to iterate.
+    #   (2) CONST-CONDITION BRANCHES — `if <const>:` whose condition folds to a
+    #       known constant (const-fold bait) and whose body writes ONLY dead
+    #       locals (so the arm is observationally empty; a future const-branch-
+    #       folding pass has a dead arm to drop).
+    #   (3) DEAD PURE SUBEXPRESSIONS — a dead local whose initializer is a
+    #       computed pure binop tree (a value computed but never used).
     def _build_helper(self, idx):
         rng = self.rng
         name = f"helper{idx}"
@@ -529,9 +548,15 @@ class Program:
         recipe = self._helper_recipe(nargs, rng)
         expr_src = self._recipe_src(recipe, params)
         self.emit(f"    r: int64 = {expr_src}")
+        # Optimizer-bait dead code at TOP LEVEL of the helper (before the
+        # threshold if). Names are unique per-helper so re-decls never alias.
+        self._emit_dead_code(name, params, depth=0)
         thr = rng.randint(0, 50)
         self.emit(f"    if r > cast[int64]({thr}):")
         self.emit(f"        r = r - cast[int64]({thr})")
+        # Optimizer-bait dead code NESTED one level deep (inside a const-true
+        # branch), so DCE has to recurse into a nested block to find it.
+        self._emit_dead_code(name, params, depth=1)
         self.emit("    return r")
 
         def pyfn(args, recipe=recipe, thr=thr):
@@ -540,6 +565,73 @@ class Program:
                 r = I64.wrap(r - thr)
             return r
         self.helpers.append((name, pyfn, nargs))
+
+    # ---- inject observationally-inert optimizer bait into a pure function ----
+    def _emit_dead_code(self, scope, params, depth):
+        """Emit dead locals / const-condition branches / dead pure subexpressions
+        into the CURRENT helper body. `scope` makes local names unique; `params`
+        are the helper's int64 params (usable as pure-init leaves); `depth`=0 emits
+        at the helper's top level, depth=1 wraps the bait in a const-true `if` so
+        DCE must recurse a nested block. NONE of these locals is ever read by `r`
+        or the return — they are pure-initialized and dead by construction, so the
+        DCE pass removes them and the oracle (`pyfn`) is unaffected. The
+        const-condition feeds the const-fold pass a foldable `1 != 0` / `0 != 0`."""
+        rng = self.rng
+        ind = "    " if depth == 0 else "        "
+        # A monotonic per-program suffix keeps every injected name distinct
+        # across helpers and depths.
+        def dn():
+            self._dead_seq = getattr(self, "_dead_seq", 0) + 1
+            return f"dd_{scope}_{self._dead_seq}"
+
+        # Leaves available for pure dead initializers: the helper params plus any
+        # dead local already emitted in THIS call (for chaining). Constants too.
+        live_leaves = list(params)
+        dead_leaves = []
+
+        def pure_init():
+            # Build a small pure int64 expression from available leaves/consts.
+            # Mixing in a dead leaf (when available) makes a DCE CHAIN: the new
+            # dead local's init references an earlier dead local, so removing the
+            # consumer must precede removing the producer (fixpoint iteration).
+            def leaf():
+                pool = []
+                if live_leaves:
+                    pool.append("live")
+                if dead_leaves and rng.random() < 0.6:
+                    pool.append("dead")
+                pool.append("const")
+                pick = rng.choice(pool)
+                if pick == "live":
+                    return rng.choice(live_leaves)
+                if pick == "dead":
+                    return rng.choice(dead_leaves)
+                return f"cast[int64]({rng.randint(0, 9)})"
+            node = leaf()
+            for _ in range(rng.randint(0, 2)):
+                op = rng.choice(["+", "-", "*", "&", "|", "^"])
+                node = f"({node} {op} {leaf()})"
+            return node
+
+        if depth == 0:
+            # (1)+(3) one to three dead locals at top level; the chain emerges
+            # when a later init references an earlier dead leaf.
+            for _ in range(rng.randint(1, 3)):
+                nm = dn()
+                self.emit(f"{ind}{nm}: int64 = {pure_init()}")
+                dead_leaves.append(nm)
+        else:
+            # (2) const-condition branch: `if <const-true>:` whose body writes
+            # ONLY dead locals — the arm is observationally empty. The condition
+            # is a folded comparison so the const-fold pass has a target, and the
+            # dead locals inside give DCE a NESTED block to clean. We always pick
+            # a const-TRUE guard so the (empty) arm executes — still a no-op, but
+            # it keeps behavior identical whether or not the optimizer folds it.
+            self.emit(f"    if cast[int64](1) != cast[int64](0):")
+            for _ in range(rng.randint(1, 2)):
+                nm = dn()
+                self.emit(f"{ind}{nm}: int64 = {pure_init()}")
+                dead_leaves.append(nm)
 
     def _helper_recipe(self, nargs, rng):
         ops = ["+", "-", "*"]
