@@ -56,13 +56,14 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 UBIN=tests/u-binary/u_dynamic_forkexec
-LDSO=tests/distros/debian-minbase/rootfs/lib64/ld-linux-x86-64.so.2
+ROOTFS=tests/distros/debian-minbase/rootfs
+LDSO=$ROOTFS/lib64/ld-linux-x86-64.so.2
 # ld.so's default DT_NEEDED search path on x86_64 Debian/Ubuntu is
 # /lib/x86_64-linux-gnu/ + /usr/lib/x86_64-linux-gnu/ + /lib/ +
 # /usr/lib/. Embedding libc.so.6 at the first of these makes the
 # dynamic_hello fixture's DT_NEEDED=[libc.so.6] resolvable from
 # inside ld.so without any LD_LIBRARY_PATH plumbing.
-LIBC=tests/distros/debian-minbase/rootfs/usr/lib/x86_64-linux-gnu/libc.so.6
+LIBC=$ROOTFS/usr/lib/x86_64-linux-gnu/libc.so.6
 
 if [ ! -e "$LDSO" ]; then
     echo "[test_dynamic_forkexec] SKIP: $LDSO not staged"
@@ -80,6 +81,43 @@ if [ ! -e "$LIBC" ] || [ ! -f "$(readlink -f "$LIBC")" ]; then
     echo "[test_dynamic_forkexec] SKIP: $LIBC not staged or unresolved"
     exit 0
 fi
+
+# GLIBC SKEW GUARD (test-infra correctness, not a kernel feature):
+# $ROOTFS/lib64/ld-linux-x86-64.so.2 is frequently an ABSOLUTE-PATH
+# symlink baked by debootstrap (-> /lib/x86_64-linux-gnu/ld-linux-...).
+# On a host whose system glibc is NEWER than the rootfs's bundled
+# libc.so.6, that symlink resolves to the HOST ld.so, so we inject a
+# (host) ld.so of one glibc version paired with the rootfs libc.so.6 of
+# another. A version-mismatched ld.so relocates the PIE's GOT against the
+# wrong libc ABI and the first relocation write SIGSEGVs inside the image
+# (looks exactly like a kernel COW/W^X regression but is purely an
+# ld.so<->libc ABI skew). Prefer the ld.so that lives ALONGSIDE the
+# resolved libc inside the rootfs (guaranteed same debootstrap = same
+# glibc), and assert the two report the same glibc release before we boot.
+LIBC_REAL_EARLY=$(readlink -f "$LIBC")
+LIBC_DIR=$(dirname "$LIBC_REAL_EARLY")
+ROOTFS_LDSO="$LIBC_DIR/ld-linux-x86-64.so.2"
+if [ -f "$ROOTFS_LDSO" ]; then
+    # Use the rootfs-internal, libc-matched ld.so rather than whatever the
+    # /lib64 absolute symlink happens to resolve to on this host.
+    LDSO="$ROOTFS_LDSO"
+fi
+glibc_ver() {  # extract "2.NN" from a glibc DSO's version banner
+    strings "$1" 2>/dev/null \
+        | grep -oE 'GLIBC [0-9]+\.[0-9]+' | head -1 | awk '{print $2}'
+}
+LDSO_GV=$(glibc_ver "$(readlink -f "$LDSO")")
+LIBC_GV=$(glibc_ver "$LIBC_REAL_EARLY")
+if [ -n "$LDSO_GV" ] && [ -n "$LIBC_GV" ] && [ "$LDSO_GV" != "$LIBC_GV" ]; then
+    echo "[test_dynamic_forkexec] SKIP: ld.so glibc $LDSO_GV != libc.so.6 glibc $LIBC_GV"
+    echo "    (rootfs ld.so/libc ABI skew — the /lib64 ld.so symlink likely"
+    echo "     resolves to a newer HOST glibc than the bundled libc.so.6;"
+    echo "     re-run tests/distros/debian-minbase/BUILD.sh to re-stage a"
+    echo "     self-consistent rootfs, or point lib64/ld-linux-x86-64.so.2"
+    echo "     at the rootfs-internal ld.so.)"
+    exit 0
+fi
+echo "[test_dynamic_forkexec]   ld.so glibc=$LDSO_GV libc glibc=$LIBC_GV (matched)"
 
 echo "[test_dynamic_forkexec] (1/5) Build dynamic_hello fixture"
 make -C tests/u-binary/src/dynamic_forkexec install >/dev/null 2>&1 || true
