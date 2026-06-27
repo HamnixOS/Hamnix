@@ -1226,6 +1226,8 @@ _AD_OPT_CSE_TOTAL = 0     # running CSE-elimination count across the lane
 _AD_OPT_PROGS_CSE = 0     # programs in which >=1 CSE elimination fired
 _AD_OPT_LICM_TOTAL = 0    # running LICM-hoist count across the lane
 _AD_OPT_PROGS_LICM = 0    # programs in which >=1 LICM hoist fired
+_AD_OPT_DCE_TOTAL = 0     # running DCE dead-local-removal count across the lane
+_AD_OPT_PROGS_DCE = 0     # programs in which >=1 DCE removal fired
 
 # ADDER_CFG=1 enables the Phase-4 GROUNDWORK CFG/liveness lane: for every
 # program codegen.ad's PARSER accepts, build the whole-function CFG + backward-
@@ -1307,6 +1309,7 @@ def run_through_ad_codegen(seed, body):
     global _AD_OPT_FOLDS_TOTAL, _AD_OPT_PROGS_FOLDED
     global _AD_OPT_CSE_TOTAL, _AD_OPT_PROGS_CSE
     global _AD_OPT_LICM_TOTAL, _AD_OPT_PROGS_LICM
+    global _AD_OPT_DCE_TOTAL, _AD_OPT_PROGS_DCE
     host = _ad_host()
     r = host.run_through_codegen_ad(seed, body, _AD_WORK, opt=ADDER_OPT)
     if r.kind == "unsupported":
@@ -1325,6 +1328,10 @@ def run_through_ad_codegen(seed, body):
             _AD_OPT_LICM_TOTAL += lc
             if lc > 0:
                 _AD_OPT_PROGS_LICM += 1
+            dc = int(getattr(r, "dce", 0) or 0)
+            _AD_OPT_DCE_TOTAL += dc
+            if dc > 0:
+                _AD_OPT_PROGS_DCE += 1
         return ("ok", r.stdout, r.exit)
     return ("__ad_error__", r.kind, r.detail)
 
@@ -2465,6 +2472,8 @@ def _run_ad_codegen_batch(base, args):
         print(f"  programs with >=1 CSE:      {_AD_OPT_PROGS_CSE}")
         print(f"  LICM hoists (total):        {_AD_OPT_LICM_TOTAL}")
         print(f"  programs with >=1 LICM:     {_AD_OPT_PROGS_LICM}")
+        print(f"  DCE dead-local removals:    {_AD_OPT_DCE_TOTAL}")
+        print(f"  programs with >=1 DCE:      {_AD_OPT_PROGS_DCE}")
         print(f"  (above CORRECT count already asserts opt output == oracle)")
         # The lane only proves anything if the pass DEMONSTRABLY fired. If the
         # whole batch produced zero folds the optimizer wasn't exercised, which

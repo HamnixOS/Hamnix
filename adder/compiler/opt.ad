@@ -60,6 +60,9 @@ from compiler.parser import (
     ND_FUNCTION,
     ND_CALL,
     ND_UNARY,
+    ND_MEMBER,
+    ND_CHAR_LIT,
+    ND_BOOL_LIT,
     UNOP_ADDR,
     AUGOP_NONE,
     BINOP_ADD,
@@ -113,6 +116,12 @@ opt_cse_tmp_seq: uint32 = 0
 # pre-header by Phase-3 LICM (one per hoisted expression value).
 opt_licm_count: uint32 = 0
 
+# Diagnostics: number of fully-dead local variable declarations removed by DCE
+# (one per ND_VAR_DECL whose result is never read anywhere in the function and
+# whose initializer is pure / side-effect-free, so deleting it is observably a
+# no-op). See the Phase-8 DCE section at the bottom of this file.
+opt_dce_count: uint32 = 0
+
 
 def opt_enable():
     opt_enabled = 1
@@ -123,6 +132,7 @@ def opt_reset_stats():
     opt_cse_count = 0
     opt_cse_tmp_seq = 0
     opt_licm_count = 0
+    opt_dce_count = 0
     opt_ffold_count = 0
 
 
@@ -617,6 +627,18 @@ def opt_run(prog: uint32):
     while cur != 0:
         if nd_kind[cur] == ND_FUNCTION:
             opt_licm_function(cur)
+        cur = nd_next[cur]
+    # Phase 8 — DEAD CODE ELIMINATION. Runs LAST, on the fully fold+CSE+LICM
+    # simplified graph: those passes have minted synthetic temp locals (__cse_/
+    # __licm_), and a hoisted/shared temp whose every original use was itself
+    # rewritten away can end up fully dead — DCE reclaims exactly those, plus any
+    # user local whose result is never read. It deletes nothing with a side
+    # effect (see the Phase-8 strategy note); a conservative miss is fine, a
+    # wrong removal is not.
+    cur = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            opt_dce_function(cur)
         cur = nd_next[cur]
 
 
@@ -1811,3 +1833,298 @@ def xcse_block(head: uint32) -> uint32:
 def opt_xcse_function(fn: uint32):
     opt_fw_build(fn)
     nd_c[fn] = xcse_block(nd_c[fn])
+
+
+# =======================================================================
+# Phase 8 — Dead Code Elimination (fully-dead local variable removal).
+# =======================================================================
+#
+# STRATEGY (conservative + correct over fast)
+# -------------------------------------------
+# This AST-level optimizer has no SSA/CFG with explicit liveness, so DCE is
+# scoped to the one transform that is provably value-preserving without a
+# dataflow lattice: removing a LOCAL VARIABLE DECLARATION whose result is
+# NEVER read anywhere in the function and whose initializer has NO side
+# effect. Deleting such a decl deletes a computation whose value nothing
+# observes and whose evaluation changes nothing — an observable no-op.
+#
+# WHAT IS REMOVED
+#   A top-level ND_VAR_DECL `x = <init>` in a function body is removed iff ALL:
+#     (a) the name `x` appears NOWHERE else in the function — no read, no
+#         re-assignment, no re-declaration, not as a loop variable, not inside
+#         any nested block (the whole-function use scan walks every child slot
+#         AND every nd_next chain AND ND_FOR/ND_FOR_UNPACK loop-var names);
+#     (b) the initializer is side-effect-free: either absent (0), a bare
+#         literal/ident, or a PURE expression that lowers via
+#         ir_lower_pure_expr (the same signedness-invariant, non-faulting,
+#         no-call/no-load/no-store value set CSE & LICM use). A DIV/MOD that
+#         could trap, an index/member load that could fault, or a call is NOT
+#         pure here, so a decl whose init is one of those is KEPT;
+#     (c) the FUNCTION contains NO call (ND_CALL) and NO address-of
+#         (UNOP_ADDR) ANYWHERE — the blanket alias/escape guard LICM uses. If
+#         no address of any local is ever taken and no call runs, no local can
+#         be read or written indirectly, so "name `x` appears nowhere else"
+#         is a SOUND proof that `x` is genuinely dead (nothing aliases it).
+#         If the function has a call or addr-of, DCE removes NOTHING from it.
+#
+# WHY ONLY TOP-LEVEL DECLS, NOT NESTED-BLOCK / ASSIGN-CHAINS
+#   Removing a statement nested inside a loop or conditional, or a plain
+#   re-assignment that is dead only on some paths, needs per-path liveness this
+#   pass deliberately does not compute. Guard (a) — "the name appears NOWHERE
+#   else, at any depth" — sidesteps all of that: a name used nowhere else is
+#   dead on every path regardless of control flow, so the single defining decl
+#   (wherever it sits) is unconditionally dead. We only delete decls that sit
+#   at a chain level we can splice (top-level body + directly nested block
+#   chains, via the recursive walk), and only when the name is globally unused.
+#
+# DEAD-STORE ELIMINATION: DELIBERATELY OMITTED
+#   General dead-store elimination (a store overwritten before any read) is
+#   NOT implemented: this AST IR has no provable aliasing/escape model for
+#   partial liveness (a local can have its address taken via UNOP_ADDR and
+#   escape into a call, and there is no points-to analysis). Guessing risks a
+#   miscompile, which the brief forbids. The "fully-dead local" rule above is
+#   the safe subset and is all DCE does here.
+#
+# UNREACHABLE-BLOCK REMOVAL: DELIBERATELY OMITTED
+#   Constant-folded branch arms are not pruned: opt_try_fold folds constant
+#   BINARY subtrees into ND_INT_LIT but does NOT rewrite an ND_IF/ND_WHILE
+#   whose CONDITION became a constant into a straight-line block, so no block
+#   becomes structurally unreachable for DCE to find. Adding branch-condition
+#   folding + arm pruning is a separate transform; without it there is no
+#   unreachable block to remove, so this sub-part is a no-op and is left out.
+
+# --- whole-function alias/escape barrier ---------------------------------
+#
+# 1 once a call or address-of is seen anywhere in the scanned function: with
+# either present, a local could be read/written indirectly and "name unused
+# elsewhere" no longer proves deadness, so DCE bails out for the function.
+dce_barrier: uint32 = 0
+
+
+def dce_scan_barrier_expr(node: uint32):
+    if node == 0:
+        return
+    if dce_barrier != 0:
+        return
+    k: uint32 = nd_kind[node]
+    if k == ND_CALL:
+        dce_barrier = 1
+        return
+    if k == ND_UNARY:
+        if nd_aux[node] == UNOP_ADDR:
+            dce_barrier = 1
+            return
+    dce_scan_barrier_expr(nd_a[node])
+    dce_scan_barrier_expr(nd_b[node])
+    dce_scan_barrier_expr(nd_c[node])
+    dce_scan_barrier_expr(nd_d[node])
+
+
+# Walk an entire statement chain (and nested block chains) for a call/addr-of.
+def dce_scan_barrier_block(head: uint32):
+    s: uint32 = head
+    while s != 0:
+        if dce_barrier != 0:
+            return
+        k: uint32 = nd_kind[s]
+        # Scan this statement's expression slots generically. nd_a/b/c/d may be
+        # either expressions or nested block heads depending on kind; recursing
+        # into them as expressions catches every embedded call/addr-of, and the
+        # explicit block recursion below catches nested statement chains. (A
+        # node visited as both an expr and a block head is harmless — we only
+        # set a sticky flag.)
+        dce_scan_barrier_expr(nd_a[s])
+        dce_scan_barrier_expr(nd_b[s])
+        dce_scan_barrier_expr(nd_c[s])
+        dce_scan_barrier_expr(nd_d[s])
+        if k == ND_IF:
+            dce_scan_barrier_block(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                dce_scan_barrier_block(nd_b[e])
+                e = nd_next[e]
+            dce_scan_barrier_block(nd_d[s])
+        elif k == ND_WHILE:
+            dce_scan_barrier_block(nd_b[s])
+        elif k == ND_DO_WHILE:
+            dce_scan_barrier_block(nd_b[s])
+        elif k == ND_FOR:
+            dce_scan_barrier_block(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            dce_scan_barrier_block(nd_c[s])
+        s = nd_next[s]
+
+
+# --- whole-function use counter for one name -----------------------------
+#
+# Count every textual reference to (name_off,name_len) anywhere in a function
+# body, EXCEPT the single defining decl node `skip` itself (so its own name and
+# its own initializer are not counted as uses of itself — a self-referential
+# init like `x = x` WOULD count, because that ND_IDENT is in skip's nd_b which
+# we DO descend). Returns via the global dce_use_n; a name with 0 uses outside
+# its decl is dead.
+dce_use_n: uint32 = 0
+dce_use_off: uint32 = 0
+dce_use_len: uint32 = 0
+dce_use_skip: uint32 = 0
+
+
+# Count ident references to the target name inside an EXPRESSION subtree.
+def dce_count_expr(node: uint32):
+    if node == 0:
+        return
+    k: uint32 = nd_kind[node]
+    if k == ND_IDENT:
+        if ir_name_eq(nd_name_off[node], nd_name_len[node],
+                      dce_use_off, dce_use_len) != 0:
+            dce_use_n = dce_use_n + 1
+        return
+    if k == ND_INT_LIT or k == ND_CHAR_LIT or k == ND_BOOL_LIT or k == ND_FLOAT_LIT:
+        return
+    dce_count_expr(nd_a[node])
+    dce_count_expr(nd_b[node])
+    dce_count_expr(nd_c[node])
+    dce_count_expr(nd_d[node])
+
+
+# Count references in a STATEMENT chain (descends nested block chains too). The
+# defining decl node `dce_use_skip` is not skipped wholesale — we still descend
+# its initializer (nd_b) so a self-use counts — but its NAME slot is not an
+# ident node, so it never self-counts. A re-declaration / re-assignment of the
+# same name elsewhere counts as a use (its LHS ident or ND_VAR_DECL name), which
+# is exactly what we want: if the name is touched anywhere else, keep the decl.
+def dce_count_block(head: uint32):
+    s: uint32 = head
+    while s != 0:
+        k: uint32 = nd_kind[s]
+        # A ND_VAR_DECL / ND_FOR / ND_FOR_UNPACK introduces or writes a NAME that
+        # is not an ND_IDENT node; count those name slots as uses so a shadowing
+        # re-decl or a loop using the name keeps the original decl alive.
+        if s != dce_use_skip:
+            if k == ND_VAR_DECL:
+                if ir_name_eq(nd_name_off[s], nd_name_len[s],
+                              dce_use_off, dce_use_len) != 0:
+                    dce_use_n = dce_use_n + 1
+            elif k == ND_FOR:
+                if ir_name_eq(nd_name_off[s], nd_name_len[s],
+                              dce_use_off, dce_use_len) != 0:
+                    dce_use_n = dce_use_n + 1
+        # Count ident uses in this statement's expression slots. For the defining
+        # decl we still descend its initializer (nd_b) so `x = x` self-counts.
+        dce_count_expr(nd_a[s])
+        dce_count_expr(nd_b[s])
+        dce_count_expr(nd_c[s])
+        dce_count_expr(nd_d[s])
+        # Descend nested block chains.
+        if k == ND_IF:
+            dce_count_block(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                dce_count_block(nd_b[e])
+                e = nd_next[e]
+            dce_count_block(nd_d[s])
+        elif k == ND_WHILE:
+            dce_count_block(nd_b[s])
+        elif k == ND_DO_WHILE:
+            dce_count_block(nd_b[s])
+        elif k == ND_FOR:
+            dce_count_block(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            dce_count_block(nd_c[s])
+        s = nd_next[s]
+
+
+# Is the initializer of an ND_VAR_DECL side-effect-free (safe to delete)?
+# Absent init (0) is trivially safe. A bare literal/ident is safe. Otherwise it
+# must lower through ir_lower_pure_expr — the signedness-invariant, non-faulting,
+# no-call/no-load/no-store value set (no DIV/MOD trap, no index/member fault, no
+# call). Anything ir_lower_pure_expr rejects is treated as possibly-effectful
+# and the decl is KEPT.
+def dce_init_is_pure(init: uint32) -> uint32:
+    if init == 0:
+        return 1
+    k: uint32 = nd_kind[init]
+    if k == ND_INT_LIT or k == ND_CHAR_LIT or k == ND_BOOL_LIT:
+        return 1
+    if k == ND_IDENT:
+        return 1
+    ir_reset()
+    v: uint32 = ir_lower_pure_expr(init)
+    if v != 0:
+        return 1
+    return 0
+
+
+# DCE one statement-chain (a block). Returns the (possibly new) head with dead
+# ND_VAR_DECLs spliced out. Recurses into nested block bodies. `fnbody` is the
+# WHOLE function body chain head — the use count is always taken over the whole
+# function, never just the local block, so a name read in any other block keeps
+# its decl. Returns 1 via dce_removed_any if it removed anything (to drive the
+# outer fixpoint).
+dce_removed_any: uint32 = 0
+dce_fnbody: uint32 = 0
+
+
+def dce_block(head: uint32) -> uint32:
+    new_head: uint32 = head
+    prev: uint32 = 0
+    s: uint32 = head
+    while s != 0:
+        nxt: uint32 = nd_next[s]
+        k: uint32 = nd_kind[s]
+        removed: uint32 = 0
+        if k == ND_VAR_DECL:
+            if dce_init_is_pure(nd_b[s]) != 0:
+                # Count uses of this decl's name over the WHOLE function body.
+                dce_use_off = nd_name_off[s]
+                dce_use_len = nd_name_len[s]
+                dce_use_n = 0
+                dce_use_skip = s
+                dce_count_block(dce_fnbody)
+                if dce_use_n == 0:
+                    # Fully dead: splice this decl out of the chain.
+                    if prev == 0:
+                        new_head = nxt
+                    else:
+                        nd_next[prev] = nxt
+                    opt_dce_count = opt_dce_count + 1
+                    dce_removed_any = 1
+                    removed = 1
+        if removed == 0:
+            # Recurse into nested blocks of a kept statement.
+            if k == ND_IF:
+                nd_b[s] = dce_block(nd_b[s])
+                e: uint32 = nd_c[s]
+                while e != 0:
+                    nd_b[e] = dce_block(nd_b[e])
+                    e = nd_next[e]
+                nd_d[s] = dce_block(nd_d[s])
+            elif k == ND_WHILE:
+                nd_b[s] = dce_block(nd_b[s])
+            elif k == ND_DO_WHILE:
+                nd_b[s] = dce_block(nd_b[s])
+            elif k == ND_FOR:
+                nd_b[s] = dce_block(nd_b[s])
+            elif k == ND_FOR_UNPACK:
+                nd_c[s] = dce_block(nd_c[s])
+            prev = s
+        s = nxt
+    return new_head
+
+
+def opt_dce_function(fn: uint32):
+    # Blanket alias/escape guard: if the function takes any address or makes any
+    # call, a local could be touched indirectly and "unused elsewhere" no longer
+    # proves deadness — remove nothing.
+    dce_barrier = 0
+    dce_scan_barrier_block(nd_c[fn])
+    if dce_barrier != 0:
+        return
+    # Iterate to fixpoint: removing one dead decl can make an earlier decl (whose
+    # only remaining use was the removed one's initializer) dead in turn.
+    dce_fnbody = nd_c[fn]
+    dce_removed_any = 1
+    while dce_removed_any != 0:
+        dce_removed_any = 0
+        nd_c[fn] = dce_block(nd_c[fn])
+        dce_fnbody = nd_c[fn]
