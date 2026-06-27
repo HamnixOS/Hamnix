@@ -208,7 +208,14 @@ set +e
     drive 'enter linux { /usr/bin/apt-get update }'
     drive 'echo HAMHELLO_APT_UPDATE_DONE'; wait_for HAMHELLO_APT_UPDATE_DONE 180
     drive 'enter linux { /usr/bin/apt-get update && /usr/bin/apt-get install -y hamhello }'
-    drive 'echo APT_WRAPPER_DONE'; wait_for APT_WRAPPER_DONE 300
+    # This single leg does the most work of the whole test (a fresh
+    # apt-get update + full install: index parse, file:// fetch, dpkg
+    # unpack + configure, each across two `enter linux` namespace spawns).
+    # On a host under concurrent load (load avg 3-4) it legitimately runs
+    # several minutes; 300s was too tight and the harness SIGKILLed qemu
+    # (rc=137) mid-"Unpacking hamhello" even though apt was progressing
+    # correctly with no crash. Give it real head-room.
+    drive 'echo APT_WRAPPER_DONE'; wait_for APT_WRAPPER_DONE 600
     drive 'echo HAMHELLO_APT_RUN'
     drive 'enter linux { /usr/bin/hamhello }'
     drive 'echo HAMHELLO_APT_INSTALL_END'; wait_for HAMHELLO_APT_INSTALL_END 40
