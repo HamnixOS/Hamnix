@@ -148,15 +148,23 @@ set +e
     drive 'enter linux { /usr/bin/apt-get --version }'
     drive 'echo APT_NET_VER_END'; wait_for APT_NET_VER_END 60
 
-    # Leg 1: apt-get update — fetch the REAL indices from deb.debian.org.
+    # Standalone update first as an observable step (its own marker), so a
+    # clean update fires APT_NET_UPDATE_DONE and proves the real fetch.
     drive 'echo APT_NET_UPDATE_START'
     drive 'enter linux { /usr/bin/apt-get update }'
-    drive 'echo APT_NET_UPDATE_DONE'; wait_for APT_NET_UPDATE_DONE 300
+    drive 'echo APT_NET_UPDATE_DONE'; wait_for APT_NET_UPDATE_DONE 360
 
-    # Leg 2: apt-get install -y <pkg> — download the real .deb + configure.
+    # update + install MUST run in the SAME `enter linux { ... }`: each
+    # `enter linux` rfork(RFNAMEG) builds a FRESH namespace with its OWN
+    # writable tmpfs overlay (`bind -bc '#t' /`), so the package index that
+    # `update` wrote into /var/lib/apt/lists is GONE in a separate `enter
+    # linux` — `install` would then report "Unable to locate package". The
+    # install resolver needs the index live in the same process tree that
+    # fetched it (mirrors real `apt update && apt install`). Same lesson as
+    # the offline apt-e2e.
     drive 'echo APT_NET_INSTALL_START'
-    drive "enter linux { /usr/bin/apt-get install -y $PKG }"
-    drive 'echo APT_NET_INSTALL_DONE'; wait_for APT_NET_INSTALL_DONE 420
+    drive "enter linux { /usr/bin/apt-get update && /usr/bin/apt-get install -y $PKG }"
+    drive 'echo APT_NET_INSTALL_DONE'; wait_for APT_NET_INSTALL_DONE 600
 
     # Run the installed binary (hello prints "Hello, world!").
     drive 'echo APT_NET_RUN_START'
