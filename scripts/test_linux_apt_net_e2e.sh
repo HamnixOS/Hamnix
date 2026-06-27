@@ -165,10 +165,15 @@ set +e
 
     drive 'echo BANNER_DONE'; wait_for BANNER_DONE 20
     drive 'exit'; sleep 1
+# Boot SINGLE-CPU: the apt http method needs no SMP, and a uniprocessor
+# boot dodges the known per-CPU CR3/task-switch SMP fragility (a separate
+# kernel track) that can trap the heavier apt initramfs at load_cr3 right
+# after the namespace is defined. The proven native http egress smoke
+# (test_net_http.sh) likewise boots single-CPU.
 ) | timeout 2400s qemu-system-x86_64 \
     -enable-kvm -cpu host \
     -kernel "$ELF" \
-    -smp 2 \
+    -smp 1 \
     -nographic \
     -no-reboot \
     -m 768M \
