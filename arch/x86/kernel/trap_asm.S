@@ -95,10 +95,116 @@ trap_diag_stub_08:
     pushq   $8
     jmp     common_trap_diag
 
+/* ---------- trap_diag_stub_0d — productive #GP (user SIGSEGV) ----- *
+ *
+ * The #GP vector is no longer a pure diagnostic halt. A general-
+ * protection fault FROM CPL=3 (a userspace process — e.g. the forked
+ * apt-worker `jmp *r11` with a non-canonical GOT-resolved r11) must NOT
+ * take the box down: do_gp_fault() delivers SIGSEGV (+coredump+reap) and
+ * we iretq (either into the task's signal handler, or — on the default-
+ * terminate path — do_gp_fault never returns and the reaped task's
+ * successor runs). A #GP from CPL=0 (a genuine kernel bug: bad segment
+ * load / non-canonical kernel pointer / bad iretq selector) is NOT a
+ * user fault: do_gp_fault returns 0 and we fall through to the
+ * print-and-halt diagnostic, masking nothing.
+ *
+ * Stack on entry (CPU pushed, low -> high):
+ *    0: error_code   (selector index / TI / RPL, or 0 for non-segment)
+ *    8: RIP
+ *   16: CS           (low 2 bits = faulting CPL)
+ *   24: RFLAGS
+ *   32: RSP_user
+ *   40: SS
+ *
+ * Mirrors trap_diag_stub_0e: save the full GPR set so the SIGSEGV-handler
+ * resume path (deliver_fault_sigsegv rewrites RIP/RSP in the iret frame)
+ * iretq's with registers intact.
+ */
     .align 16
     .globl trap_diag_stub_0d
 trap_diag_stub_0d:
-    /* #GP: CPU pushes error code (selector + flags). */
+    cli
+
+    /* #GP: CPU has already pushed the error code at 0(%rsp). Save the
+     * full GPR set below it (15 GPRs, rsp excluded — in the iret frame). */
+    pushq   %rax
+    pushq   %rbx
+    pushq   %rcx
+    pushq   %rdx
+    pushq   %rsi
+    pushq   %rdi
+    pushq   %rbp
+    pushq   %r8
+    pushq   %r9
+    pushq   %r10
+    pushq   %r11
+    pushq   %r12
+    pushq   %r13
+    pushq   %r14
+    pushq   %r15
+
+    /* Stack now (low -> high):
+     *    0..112: r15..rax  (15 quads)
+     *  120: error_code
+     *  128: RIP ...                                                    */
+
+    /* do_gp_fault(error_code, iret_frame).
+     *   %rdi = error_code   (at 120(%rsp))
+     *   %rsi = &iret_frame  (128(%rsp): RIP / CS / RFLAGS / RSP_user / SS) */
+    movq    120(%rsp), %rdi
+    leaq    128(%rsp), %rsi
+
+    /* Park pre-call RSP in callee-saved %rbx (already saved above), then
+     * 16-align RSP for the SysV call. */
+    movq    %rsp, %rbx
+    andq    $-16, %rsp
+    call    do_gp_fault
+    movq    %rbx, %rsp
+
+    /* do_gp_fault returned in %rax:
+     *   1  -> user SIGSEGV handled (handler staged, or task terminated &
+     *         never returned here); restore GPRs and iretq.
+     *   else -> CPL=0 kernel #GP; fall through to the diagnostic halt. */
+    cmpq    $1, %rax
+    jne     2f
+
+    /* Handled: pop the 15 saved GPRs, drop the error code, iretq. */
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %r11
+    popq    %r10
+    popq    %r9
+    popq    %r8
+    popq    %rbp
+    popq    %rdi
+    popq    %rsi
+    popq    %rdx
+    popq    %rcx
+    popq    %rbx
+    popq    %rax
+    addq    $8, %rsp                    /* discard CPU error code      */
+    iretq
+
+2:  /* CPL=0 kernel #GP. Pop our saved GPRs so the stack is back to the
+     * post-CPU-push shape common_trap_diag expects (error_code at
+     * 0(%rsp)), then push the vector and take the diagnostic path. */
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %r11
+    popq    %r10
+    popq    %r9
+    popq    %r8
+    popq    %rbp
+    popq    %rdi
+    popq    %rsi
+    popq    %rdx
+    popq    %rcx
+    popq    %rbx
+    popq    %rax
     pushq   $13
     jmp     common_trap_diag
 
