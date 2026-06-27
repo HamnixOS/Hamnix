@@ -103,8 +103,11 @@ OPT_BINS="
 /usr/bin/bzip2
 /usr/bin/zcat
 "
-# apt's file:// fetch method binary + helpers
-APT_METHODS="/usr/lib/apt/methods/file /usr/lib/apt/methods/copy /usr/lib/apt/methods/store /usr/lib/apt/methods/gpgv"
+# apt's file:// fetch method binary + helpers, PLUS the http method for
+# the LIVE network path (apt-get update/install from http://deb.debian.org).
+# https is a symlink to http on Debian; stage the real http binary. The
+# http method's extra closure (libssl.so.3) is picked up by copy_with_libs.
+APT_METHODS="/usr/lib/apt/methods/file /usr/lib/apt/methods/copy /usr/lib/apt/methods/store /usr/lib/apt/methods/gpgv /usr/lib/apt/methods/http"
 
 copy_with_libs() {
     # Copy a binary plus its full shared-object closure into $ROOTFS,
@@ -311,6 +314,27 @@ SUPPORT_URL="https://www.debian.org/support"
 BUG_REPORT_URL="https://bugs.debian.org/"
 EOF
 fi
+
+# --- Debian archive keyring (LIVE-net apt signature verification) -----
+# `apt-get update` against the REAL deb.debian.org verifies the Release
+# file's detached InRelease/Release.gpg signature against the Debian
+# archive keyring. Stage it from the host. Modern Debian ships it as
+# debian-archive-keyring.pgp (a symlink .gpg -> .pgp may also exist);
+# stage whichever exists into BOTH the canonical keyrings dir AND the
+# trusted.gpg.d/ name apt's default config trusts, under the .gpg name
+# the initramfs embed list pins.
+for kr in /usr/share/keyrings/debian-archive-keyring.gpg \
+          /usr/share/keyrings/debian-archive-keyring.pgp; do
+    if [ -e "$kr" ]; then
+        krr="$(readlink -f "$kr")"
+        install -D -m0644 "$krr" \
+            "$ROOTFS/usr/share/keyrings/debian-archive-keyring.gpg"
+        install -D -m0644 "$krr" \
+            "$ROOTFS/etc/apt/trusted.gpg.d/debian-archive-keyring.gpg"
+        echo "[stage] staged Debian archive keyring from $kr"
+        break
+    fi
+done
 
 touch "$MARK"
 echo "[stage] done. rootfs staged at $ROOTFS"

@@ -4039,6 +4039,15 @@ def build_archive() -> bytes:
                 # lz4/zstd, libseccomp) is already covered by the glob-libs
                 # augmentation below, so only the method binary needs pinning.
                 "usr/lib/apt/methods/store",
+                # apt's HTTP fetch method — the LIVE network path. With
+                # HAMNIX_APT_NET=1 the staged sources.list points at
+                # http://deb.debian.org/debian, and `apt-get update`/
+                # `install` fork /usr/lib/apt/methods/http to fetch the
+                # Release/Packages indices + the .deb over TCP through the
+                # SLIRP gateway. Its extra .so closure (libssl.so.3) is
+                # covered by the libdir glob below. Harmless on the offline
+                # path (no http source configured -> method never forked).
+                "usr/lib/apt/methods/http",
                 # dpkg unpack/install helpers. dpkg forks dpkg-deb to
                 # extract data.tar; dpkg-split/-query round out the admin
                 # surface dpkg touches during an install.
@@ -4301,6 +4310,57 @@ def build_archive() -> bytes:
                 _keep = "/var/lib/distros/default/" + _apt_dir + "/.keep"
                 blob += cpio_entry(_keep, b"")
             print("  planted apt lists/ + archives/ (+partial) .keep dirs")
+
+            # --- LIVE NETWORK apt config (HAMNIX_APT_NET=1) ---------------
+            # The offline path above stages a file:// local repo. With
+            # HAMNIX_APT_NET=1 we ALSO plant the network resolver + a
+            # sources.list pointing at the REAL Debian archive over plain
+            # HTTP, so `enter linux { apt-get update }` fetches the genuine
+            # Release/Packages indices from deb.debian.org and
+            # `apt-get install <pkg>` downloads the real .deb from /pool.
+            #
+            # These are SYNTHESIZED here (not read from the rootfs) so the
+            # net path needs no extra rootfs staging beyond the http method
+            # + keyring (scripts/stage_host_dpkg_rootfs.sh). DNS goes to the
+            # SLIRP forwarder 10.0.2.3 (proven reachable by the native
+            # http_smoke_test); a static /etc/hosts entry is ALSO planted as
+            # an interim belt-and-braces fallback (deb.debian.org is a CDN,
+            # so the hosts IP can rotate — real DNS via 10.0.2.3 is primary).
+            if os.environ.get("HAMNIX_APT_NET", "0") == "1":
+                _apt_suite = os.environ.get("HAMNIX_APT_SUITE", "bookworm")
+                _deb_host_ip = os.environ.get(
+                    "HAMNIX_DEB_HOST_IP", "").strip()
+                _net_files: dict[str, bytes] = {
+                    # glibc getaddrinfo reads resolv.conf for the DNS server;
+                    # 10.0.2.3 is QEMU SLIRP's DNS forwarder.
+                    "etc/resolv.conf":
+                        b"nameserver 10.0.2.3\noptions timeout:2 attempts:3\n",
+                    # nsswitch already staged ("hosts: files dns"): files
+                    # (the /etc/hosts below) is consulted before dns.
+                    # sources.list -> REAL Debian archive over plain HTTP.
+                    "etc/apt/sources.list":
+                        (f"deb http://deb.debian.org/debian {_apt_suite} "
+                         f"main\n").encode(),
+                }
+                # Optional static hosts pin (interim fallback if DNS is the
+                # deep blocker). Only emitted when HAMNIX_DEB_HOST_IP is set
+                # (the test resolves deb.debian.org on the host and passes a
+                # current A record). Without it, glibc uses real DNS.
+                if _deb_host_ip:
+                    _net_files["etc/hosts"] = (
+                        f"127.0.0.1 localhost\n"
+                        f"{_deb_host_ip} deb.debian.org\n").encode()
+                # Shadow the offline file:// list so apt does not also try
+                # the (now possibly absent) local repo during the net run.
+                _net_files["etc/apt/sources.list.d/local.list"] = b""
+                for _rel, _data in _net_files.items():
+                    _mode = 0o100644
+                    _primary = "/var/lib/distros/default/" + _rel
+                    blob += cpio_entry(_primary, _data, mode=_mode)
+                print(f"  planted LIVE-net apt config (suite={_apt_suite}, "
+                      f"dns=10.0.2.3, hosts_pin="
+                      f"{'yes' if _deb_host_ip else 'no'}) "
+                      f"[HAMNIX_APT_NET=1]")
 
     # Kernel modules: anything in build/mod/ gets embedded as /<stem>
     # so module_load() can fetch by path. Convention is to start the
