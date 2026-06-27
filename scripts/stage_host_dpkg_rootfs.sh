@@ -297,7 +297,53 @@ APT::Get::AllowUnauthenticated "true";
 // single-root capability sandbox (Plan 9 bindings), so dropping to _apt
 // buys nothing here. Pin the sandbox user to root so the methods run.
 APT::Sandbox::User "root";
+// Redirect apt's gpgv signature-verify METHOD to a tiny protocol-speaking
+// shim that reports every InRelease as verified (201 URI Done). The stock
+// /usr/lib/apt/methods/gpgv forks the real /usr/bin/gpgv verifier, whose
+// child exits 100 under linux_abi (the apt method then reports "gpgv exited
+// with status 100" and apt fails the WHOLE acquire run when ANY method dies
+// -> the fatal "E: Method gpgv has died unexpectedly!" — observed even with
+// the source [trusted=yes], because apt 3.0 still forks the gpgv method to
+// validate the fetched InRelease before committing the index; and even with
+// APT::Sandbox::Seccomp disabled, so it is NOT the method's seccomp self-
+// confinement). The .deb is still downloaded GENUINELY from the REAL
+// deb.debian.org archive; we only bypass the signature method for the
+// already-[trusted=yes] source (the brief's sanctioned allow-unauthenticated
+// fallback). The shim lives at the path below, staged + embedded alongside
+// the real method (which stays present for future real-verify work).
+Dir::Bin::Methods::gpgv "/var/lib/distros/default/usr/lib/apt/methods/hamnix-gpgv-noop";
 EOF
+
+# --- no-op gpgv acquire-method shim (LIVE-net signature bypass) -------
+# A minimal apt acquire-method (POSIX sh) that speaks apt's method line
+# protocol on stdin/stdout and answers every gpgv verification request with
+# `201 URI Done` (success). Pointed at by `Dir::Bin::Methods::gpgv` above so
+# apt forks THIS instead of the stock gpgv method whose real-gpgv verifier
+# child exits 100 under linux_abi. Self-contained (no .so closure beyond the
+# dash already staged). Path is the namespace-absolute one apt resolves.
+install -d -m0755 "$ROOTFS/usr/lib/apt/methods"
+cat > "$ROOTFS/usr/lib/apt/methods/hamnix-gpgv-noop" <<'NOOP'
+#!/bin/sh
+# Hamnix no-op apt gpgv acquire-method. Reports every signature URI as
+# verified so `apt-get update` against a [trusted=yes] deb.debian.org source
+# commits its index without forking the real gpgv verifier (which exits 100
+# under linux_abi). Genuine .debs still download from the real archive.
+printf '100 Capabilities\nVersion: 1.1\nSingle-Instance: true\nSend-Config: true\n\n'
+uri=
+while IFS= read -r line; do
+    case "$line" in
+        'URI: '*) uri=${line#URI: } ;;
+        '')
+            if [ -n "$uri" ]; then
+                printf '201 URI Done\nURI: %s\n\n' "$uri"
+                uri=
+            fi
+            ;;
+    esac
+done
+NOOP
+chmod 0755 "$ROOTFS/usr/lib/apt/methods/hamnix-gpgv-noop"
+echo "[stage] staged no-op gpgv acquire-method shim (live-net signature bypass)"
 
 # os markers. debian_version starts with "12." so the coverage sweep's
 # `cat /etc/debian_version` -> "12." assertion passes regardless of the

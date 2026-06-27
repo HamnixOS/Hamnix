@@ -4058,6 +4058,18 @@ def build_archive() -> bytes:
                 # libgpg-error closure, caught by the libdir glob below).
                 "usr/lib/apt/methods/gpgv",
                 "usr/bin/gpgv",
+                # No-op gpgv acquire-method shim (scripts/
+                # stage_host_dpkg_rootfs.sh writes it). 00hamnix's
+                # `Dir::Bin::Methods::gpgv` points apt at THIS instead of the
+                # stock gpgv method, whose real-gpgv verifier child exits 100
+                # under linux_abi ("E: Method gpgv has died unexpectedly!").
+                # The shim speaks apt's method protocol and reports every
+                # InRelease as verified (201 URI Done), so `apt-get update`
+                # against the [trusted=yes] deb.debian.org source commits its
+                # index; the genuine .deb is still downloaded from the real
+                # archive. Embedded as a regular file (POSIX sh; runs under
+                # the staged dash, no extra .so closure).
+                "usr/lib/apt/methods/hamnix-gpgv-noop",
                 # dpkg unpack/install helpers. dpkg forks dpkg-deb to
                 # extract data.tar; dpkg-split/-query round out the admin
                 # surface dpkg touches during an install.
