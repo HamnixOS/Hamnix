@@ -4255,6 +4255,24 @@ def build_archive() -> bytes:
                             binglob.append(rel)
             REAL_DEBIAN_FILES = REAL_DEBIAN_FILES + binglob
 
+            # LIVE-net build: EXCLUDE the offline file:// local repo entirely.
+            # Otherwise both the deb.debian.org source AND the leftover
+            # `file:///opt/localrepo` source are configured; apt forks the
+            # `copy` method for the local source, which dies ("E: Method copy
+            # has died unexpectedly!") and — because apt fails the whole run
+            # if ANY method dies — aborts `apt-get update`, so the real
+            # install never proceeds. Drop the localrepo subtree + its
+            # sources fragment so the ONLY source is http://deb.debian.org
+            # (the net block below re-plants an empty local.list shadow too,
+            # but first-match-wins means we must remove the pinned entries
+            # here, before the embed loop). Offline builds keep them.
+            if os.environ.get("HAMNIX_APT_NET", "0") == "1":
+                REAL_DEBIAN_FILES = [
+                    r for r in REAL_DEBIAN_FILES
+                    if not r.startswith("opt/localrepo/")
+                    and r != "etc/apt/sources.list.d/local.list"
+                ]
+
             staged_files = 0
             staged_bytes = 0
             missing: list[str] = []
