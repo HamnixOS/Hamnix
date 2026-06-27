@@ -29,8 +29,12 @@
 # it never opens a file for reading/writing.
 
 extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_close(fd: int32) -> int32
+extern def sys_mkdir(path: Ptr[char]) -> int32
+extern def sys_unlink(path: Ptr[char]) -> int32
 
 from lib.p9 import p9_listdir, p9_chan_dir_mode, p9_dir_decode_at, \
     DIR_CUR_QTYPE, DIR_CUR_NAME, DIR_CUR_NAME_LEN, P9_QTDIR
@@ -250,6 +254,18 @@ def fmc_entry_name_len(i: uint64) -> uint64:
     return fmc_name_len[i]
 
 
+# Copy entry i's NUL-terminated name into out (cap-bounded). Returns length.
+def fmc_entry_name_copy(i: uint64, out: Ptr[uint8], cap: uint64) -> uint64:
+    nl: uint64 = fmc_name_len[i]
+    p: Ptr[uint8] = fmc_name_ptr(i)
+    k: uint64 = 0
+    while k < nl and k < cap - 1:
+        out[k] = p[k]
+        k = k + 1
+    out[k] = 0
+    return k
+
+
 # Build the absolute path of entry i into fmc_full_path and return it.
 def fmc_full_path_ptr(i: uint64) -> Ptr[uint8]:
     fmc_build_full_path(i)
@@ -381,6 +397,7 @@ def fmc_load_dir():
         total = total + cast[uint64](n)
     sys_close(fd)
     off: uint64 = 0
+    saw_dir_bit: int32 = 0
     while off < total:
         rl: uint64 = p9_dir_decode_at(&fmc_list_buf[0], off, total)
         if rl == 0:
@@ -388,18 +405,55 @@ def fmc_load_dir():
         dir_flag: int32 = 0
         if (DIR_CUR_QTYPE & P9_QTDIR) != 0:
             dir_flag = 1
+            saw_dir_bit = 1
         _fmc_maybe_store(&DIR_CUR_NAME[0], DIR_CUR_NAME_LEN, dir_flag)
         off = off + rl
-    _fmc_classify_entries()
+    # If the Dir-record listing carried REAL QTDIR bits (any directory was
+    # flagged), trust them — they are authoritative and need no re-probe. We
+    # ONLY fall back to the per-child open-probe when the backing reported
+    # every entry as QTFILE (the cpio rootfs case), and even then we skip
+    # server-backed mount names whose open/read can BLOCK indefinitely and
+    # wedge the whole file manager at startup.
+    if saw_dir_bit == 0:
+        _fmc_classify_entries()
 
 
-# Override each (non-Up) entry's is_dir with the reliable open-probe (the
-# cpio rootfs reports every entry as QTFILE).
+# A handful of top-level server-backed mount points whose open()/read() can
+# BLOCK (they are 9P file servers, not on-disk dirs). Re-probing them with a
+# blocking open at startup wedges the file manager — and they are ALWAYS
+# directories anyway, so flag them as such WITHOUT opening them.
+def _fmc_name_is_server_dir(p: Ptr[uint8], nl: uint64) -> int32:
+    # Only meaningful at the filesystem root.
+    if fmc_cur_path_len != 1:
+        return 0
+    if nl == 3 and p[0] == 110 and p[1] == 101 and p[2] == 116:   # net
+        return 1
+    if nl == 3 and p[0] == 115 and p[1] == 114 and p[2] == 118:   # srv
+        return 1
+    if nl == 4 and p[0] == 112 and p[1] == 114 and p[2] == 111 \
+       and p[3] == 99:                                            # proc
+        return 1
+    if nl == 3 and p[0] == 100 and p[1] == 101 and p[2] == 118:   # dev
+        return 1
+    if nl == 2 and p[0] == 102 and p[1] == 100:                   # fd
+        return 1
+    if nl == 3 and p[0] == 115 and p[1] == 121 and p[2] == 115:   # sys
+        return 1
+    return 0
+
+
+# Fallback classifier (QTFILE-only backings, e.g. cpio rootfs): override each
+# (non-Up) entry's is_dir with the reliable open-probe — but never block on a
+# known server-backed mount point (flag those as directories outright).
 def _fmc_classify_entries():
     r: uint64 = 0
     if fmc_has_up != 0:
         r = 1
     while r < fmc_n:
+        if _fmc_name_is_server_dir(fmc_name_ptr(r), fmc_name_len[r]) != 0:
+            fmc_is_dir[r] = 1
+            r = r + 1
+            continue
         fmc_build_full_path(r)
         fmc_is_dir[r] = _fmc_probe_is_dir(cast[Ptr[char]](&fmc_full_path[0]))
         r = r + 1
@@ -627,3 +681,217 @@ def fmc_cell_at(lx: int64, ly: int64) -> int64:
     if idx >= cast[int64](fmc_n):
         return -1
     return idx
+
+
+# =====================================================================
+# CAJA-STYLE FILE OPERATIONS (mkdir / delete / rename / copy / cut / paste)
+# =====================================================================
+#
+# These mutate the filesystem through the SAME native p9 file primitives the
+# CLI tools use (user/mkdir.ad, user/mv.ad, user/cp.ad): sys_mkdir / sys_unlink
+# / sys_open_write + read/write pump. There is no native rename(2); rename and
+# move are copy-then-unlink, exactly like user/mv.ad. The core owns the model
+# (path math, the FM-internal clipboard, the ops); the host (user/hamfmscene.ad)
+# owns the UI (context menu, confirm dialog, inline rename) and re-lists after
+# every op via fmc_load_dir.
+#
+# Every op returns 1 on success, 0 on failure, so the host can surface the
+# error (a capability gap shows up here as a failing open_write/mkdir/unlink).
+
+# Scratch path buffers for building op source/dest absolute paths.
+fmc_op_src: Array[640, uint8]
+fmc_op_dst: Array[640, uint8]
+fmc_copy_buf: Array[4096, uint8]
+
+# FM-internal clipboard: remembers a source absolute path + a mode flag.
+#   mode 0 = empty, 1 = copy, 2 = cut (move).
+FMC_CLIP_COPY: int32 = 1
+FMC_CLIP_CUT: int32 = 2
+fmc_clip_mode: int32 = 0
+fmc_clip_path: Array[640, uint8]
+fmc_clip_path_len: uint64 = 0
+fmc_clip_is_dir: int32 = 0
+
+
+def fmc_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+# Copy NUL-terminated src into dst (cap-bounded), return new length.
+def _fmc_strcpy(dst: Ptr[uint8], src: Ptr[uint8], cap: uint64) -> uint64:
+    i: uint64 = 0
+    while src[i] != 0 and i < cap - 1:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+    return i
+
+
+# Append leaf name onto a directory path with a single '/' separator, into out.
+# Returns the assembled length.
+def _fmc_join(out: Ptr[uint8], dir: Ptr[uint8], leaf: Ptr[uint8],
+              cap: uint64) -> uint64:
+    j: uint64 = _fmc_strcpy(out, dir, cap)
+    if j == 0 or out[j - 1] != 47:
+        if j < cap - 1:
+            out[j] = 47
+            j = j + 1
+    k: uint64 = 0
+    while leaf[k] != 0 and j < cap - 1:
+        out[j] = leaf[k]
+        j = j + 1
+        k = k + 1
+    out[j] = 0
+    return j
+
+
+# Return a basename pointer into an absolute path (last path component).
+def _fmc_basename(path: Ptr[uint8]) -> Ptr[uint8]:
+    n: uint64 = fmc_strlen(path)
+    if n == 0:
+        return path
+    # Ignore a single trailing slash.
+    e: uint64 = n
+    if e > 1 and path[e - 1] == 47:
+        e = e - 1
+    last: uint64 = 0
+    i: uint64 = 0
+    while i < e:
+        if path[i] == 47:
+            last = i + 1
+        i = i + 1
+    return cast[Ptr[uint8]](cast[uint64](path) + last)
+
+
+# --- mkdir -----------------------------------------------------------
+# Create a new directory `name` inside the CURRENT directory. Returns 1 on
+# success. The host then re-lists.
+def fmc_mkdir(name: Ptr[uint8]) -> int32:
+    _fmc_join(&fmc_op_dst[0], &fmc_cur_path[0], name, 640)
+    rc: int32 = sys_mkdir(cast[Ptr[char]](&fmc_op_dst[0]))
+    if rc == 0:
+        return 1
+    return 0
+
+
+# --- delete ----------------------------------------------------------
+# Unlink entry i (a file). Directories cannot be unlinked by the native
+# primitive, so directory delete is refused here (returns 0) — Caja would
+# recurse, but that needs a recursive walk + rmdir the kernel does not expose;
+# we keep delete safe and file-only. Returns 1 on success.
+def fmc_delete_entry(i: uint64) -> int32:
+    if fmc_has_up != 0 and i == 0:
+        return 0
+    if fmc_is_dir[i] != 0:
+        return 0
+    fmc_build_full_path(i)
+    _fmc_strcpy(&fmc_op_src[0], &fmc_full_path[0], 640)
+    rc: int32 = sys_unlink(cast[Ptr[char]](&fmc_op_src[0]))
+    if rc == 0:
+        return 1
+    return 0
+
+
+# --- byte copy a single file (src -> dst absolute paths) -------------
+# Returns 1 on success. Mirrors user/cp.ad's pump loop.
+def _fmc_copy_file(src: Ptr[uint8], dst: Ptr[uint8]) -> int32:
+    in_fd: int32 = sys_open(cast[Ptr[char]](src))
+    if in_fd < 0:
+        return 0
+    out_fd: int32 = sys_open_write(cast[Ptr[char]](dst))
+    if out_fd < 0:
+        sys_close(in_fd)
+        return 0
+    ok: int32 = 1
+    while True:
+        n: int64 = sys_read(in_fd, &fmc_copy_buf[0], 4096)
+        if n <= 0:
+            break
+        nu: uint64 = cast[uint64](n)
+        wrote: uint64 = 0
+        while wrote < nu:
+            wr: int64 = sys_write(out_fd,
+                cast[Ptr[uint8]](cast[uint64](&fmc_copy_buf[0]) + wrote),
+                nu - wrote)
+            if wr <= 0:
+                ok = 0
+                break
+            wrote = wrote + cast[uint64](wr)
+        if ok == 0:
+            break
+    sys_close(in_fd)
+    sys_close(out_fd)
+    return ok
+
+
+# --- rename ----------------------------------------------------------
+# Rename entry i to `newname` within the current directory. For a file this is
+# copy(old->new)+unlink(old) (no native rename, like user/mv.ad). Directory
+# rename needs recursive copy the kernel can't do, so it is refused (returns 0).
+# Returns 1 on success.
+def fmc_rename_entry(i: uint64, newname: Ptr[uint8]) -> int32:
+    if fmc_has_up != 0 and i == 0:
+        return 0
+    if newname[0] == 0:
+        return 0
+    if fmc_is_dir[i] != 0:
+        return 0
+    fmc_build_full_path(i)
+    _fmc_strcpy(&fmc_op_src[0], &fmc_full_path[0], 640)
+    _fmc_join(&fmc_op_dst[0], &fmc_cur_path[0], newname, 640)
+    if _fmc_copy_file(&fmc_op_src[0], &fmc_op_dst[0]) == 0:
+        return 0
+    sys_unlink(cast[Ptr[char]](&fmc_op_src[0]))
+    return 1
+
+
+# --- clipboard: copy / cut -------------------------------------------
+# Remember entry i's absolute path + mode for a later paste. Returns 1 if a
+# clipboard entry was set.
+def fmc_clip_set(i: uint64, mode: int32) -> int32:
+    if fmc_has_up != 0 and i == 0:
+        return 0
+    fmc_build_full_path(i)
+    fmc_clip_path_len = _fmc_strcpy(&fmc_clip_path[0], &fmc_full_path[0], 640)
+    fmc_clip_mode = mode
+    fmc_clip_is_dir = fmc_is_dir[i]
+    return 1
+
+
+def fmc_clip_mode_get() -> int32:
+    return fmc_clip_mode
+
+
+# --- paste -----------------------------------------------------------
+# Paste the clipboard entry into the CURRENT directory. copy = duplicate, cut =
+# move (copy + unlink source, clipboard then cleared). Directory paste is
+# refused (file-only, same constraint as delete/rename). Returns 1 on success.
+def fmc_paste() -> int32:
+    if fmc_clip_mode == 0 or fmc_clip_path_len == 0:
+        return 0
+    if fmc_clip_is_dir != 0:
+        return 0
+    leaf: Ptr[uint8] = _fmc_basename(&fmc_clip_path[0])
+    _fmc_join(&fmc_op_dst[0], &fmc_cur_path[0], leaf, 640)
+    # Refuse a no-op copy onto itself.
+    same: int32 = 1
+    a: uint64 = 0
+    while fmc_clip_path[a] != 0 or fmc_op_dst[a] != 0:
+        if fmc_clip_path[a] != fmc_op_dst[a]:
+            same = 0
+            break
+        a = a + 1
+    if same != 0 and fmc_clip_mode == FMC_CLIP_COPY:
+        return 0
+    if same != 0:
+        return 1
+    if _fmc_copy_file(&fmc_clip_path[0], &fmc_op_dst[0]) == 0:
+        return 0
+    if fmc_clip_mode == FMC_CLIP_CUT:
+        sys_unlink(cast[Ptr[char]](&fmc_clip_path[0]))
+        fmc_clip_mode = 0
+        fmc_clip_path_len = 0
+    return 1
