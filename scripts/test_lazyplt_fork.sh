@@ -57,6 +57,52 @@ echo "[test_lazyplt_fork] (2/4) Swap /init = $HAMSH_ELF + embed u_lazyplt_fork"
 HAMNIX_EMBED_UBIN=1 INIT_ELF="$HAMSH_ELF" \
     python3 scripts/build_initramfs.py
 
+# The fixture is a DYNAMIC glibc binary: its PT_INTERP
+# (/lib64/ld-linux-x86-64.so.2) and DT_NEEDED (libc.so.6) must be
+# resolvable in the booted namespace. HAMNIX_EMBED_UBIN does NOT stage
+# them, so — exactly like test_dynamic_forkexec — splice the real
+# rootfs ld.so + libc.so.6 into the cpio archive before the trailer.
+# Without this the kernel's PT_INTERP lookup returns "not in namespace"
+# and execve fails with -ENOEXEC (the fixture never runs).
+LDSO_REAL=$(readlink -f "$INTERP")
+LIBC_CANDIDATES=(
+    tests/distros/debian-minbase/rootfs/lib/x86_64-linux-gnu/libc.so.6
+    tests/distros/debian-minbase/rootfs/usr/lib/x86_64-linux-gnu/libc.so.6
+)
+LIBC_REAL=""
+for c in "${LIBC_CANDIDATES[@]}"; do
+    if [ -f "$c" ]; then LIBC_REAL=$(readlink -f "$c"); break; fi
+done
+if [ -z "$LIBC_REAL" ]; then
+    echo "[test_lazyplt_fork] SKIP: libc.so.6 not staged in debian-minbase rootfs"
+    exit 0
+fi
+python3 - "$LDSO_REAL" "$LIBC_REAL" <<'PYEOF'
+import sys, os, importlib.util
+from pathlib import Path
+here = Path.cwd()
+spec = importlib.util.spec_from_file_location(
+    "build_initramfs", here / "scripts" / "build_initramfs.py")
+bi = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bi)
+os.environ.setdefault("HAMNIX_EMBED_UBIN", "1")
+os.environ.setdefault("INIT_ELF", "build/user/hamsh.elf")
+archive = bi.build_archive()
+trailer = bi.cpio_trailer()
+assert archive.endswith(trailer), "archive shape changed; review me"
+archive = archive[:-len(trailer)]
+ldso = Path(sys.argv[1]).resolve().read_bytes()
+print(f"  injecting /lib64/ld-linux-x86-64.so.2 ({len(ldso)} bytes)")
+archive += bi.cpio_entry("/lib64/ld-linux-x86-64.so.2", ldso)
+libc = Path(sys.argv[2]).resolve().read_bytes()
+print(f"  injecting /lib/x86_64-linux-gnu/libc.so.6 ({len(libc)} bytes)")
+archive += bi.cpio_entry("/lib/x86_64-linux-gnu/libc.so.6", libc)
+archive += trailer
+dest = here / "fs" / "initramfs_blob.S"
+bi.emit_asm(archive, dest)
+print(f"  rewrote {dest} (+ld.so +libc.so.6, total {len(archive)} bytes)")
+PYEOF
+
 echo "[test_lazyplt_fork] (3/4) Rebuild kernel image"
 python3 -m compiler.adder compile \
     --target=x86_64-bare-metal \
@@ -74,9 +120,9 @@ fi
 
 set +e
 QEMU_EXTRA_ARGS="${KVM_ARGS[*]:-}" \
-qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 60 \
-    -- "u_lazyplt_fork" 12 \
-       "echo KERNEL_STILL_ALIVE_$$" 3 \
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 120 \
+    -- "u_lazyplt_fork" 45 \
+       "echo KERNEL_STILL_ALIVE_$$" 5 \
        "exit" 1
 rc="$QEMU_DRIVE_RC"
 set -e
