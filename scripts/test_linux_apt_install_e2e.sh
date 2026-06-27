@@ -271,6 +271,20 @@ check_absent() {
 check_absent "unable to open/create dpkg frontend lock" \
     "no read-only-root dpkg lock failure"
 
+# REGRESSION GUARD (the dpkg-deb -> tar unpack path). dpkg-deb forks
+# `tar` (execvp, PATH search) to extract control.tar/data.tar. If the
+# Debian GNU tar isn't embedded under /usr/bin/tar in the distro slice
+# (e.g. a future REAL_DEBIAN_FILES drift re-spelling it `bin/tar`, which
+# the host-staged rootfs only has at usr/bin/, so the embed silently
+# skips it), execvp falls through PATH to the NATIVE Adder /bin/tar,
+# which rejects GNU tar flags with "tar: unknown flag" and dpkg-deb
+# exits 1 BEFORE "Unpacking". Assert that native-tar tell-tale is absent
+# (and that the Debian tar wasn't simply unresolvable on PATH).
+check_absent "tar: unknown flag" \
+    "dpkg-deb forked the Debian GNU tar, not the native Adder /bin/tar"
+check_absent "command not found: /usr/bin/tar" \
+    "Debian /usr/bin/tar embedded + resolvable in the linux namespace"
+
 # The two reported apt-get blockers MUST be gone (staging gaps fixed by
 # scripts/stage_host_dpkg_rootfs.sh: /usr/share/dpkg/*table for libapt's
 # CPU/arch table + /etc/apt/apt.conf.d/).
