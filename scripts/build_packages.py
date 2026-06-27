@@ -593,7 +593,7 @@ DESKTOP_APP_BINS = (
     "hammonscene", "hammon", "hamclock", "hamctl", "hamnotify",
     "hamshot", "hamtray", "hamappmenu", "hamctxmenu", "hamosd",
     "hamlock", "hamscreensaver", "hamsession", "hamsessui", "hamrband",
-    "hamresize", "hamview",
+    "hamresize", "hamview", "hamabout",
 )
 
 

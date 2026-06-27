@@ -192,6 +192,7 @@ build_adder_user hamcalc              # integer calculator on the hamui toolkit 
 build_adder_user hamctl               # MATE-shape Control Center: 7 category tiles (Appearance/Display/Keyboard/Sound/Network/Power/About); writes wallpaper to /dev/wsys/ctl and master to /dev/audioctl, reads sys_netcfg + /proc + /sys/power/battery
 build_adder_user hamclock             # clock + stopwatch on the hamui toolkit (lib/hamui.ad)
 build_adder_user hamview              # image viewer (Eye-of-MATE equiv) on the hamui toolkit: decodes PPM(P6)/BMP, blits via an fb draw-layer
+build_adder_user hamabout             # About-this-system dialog (scene client): OS name + kernel + memory + uptime
 build_adder_user hamshot              # screenshot CLI (MATE-screenshot equiv): /dev/fb geometry + /dev/fbpix pixel stream -> P6 PPM (view with hamview)
 build_adder_user hammon               # live system monitor (uptime/mem/process list) on the hamui toolkit (lib/hamui.ad) — reads /proc/uptime,/proc/meminfo,/proc/tasks
 build_adder_user hamecho              # Increment-1 DE rewrite: first SEPARATE-PROCESS app; echoes routed keys (proves focus-gated input ownership)

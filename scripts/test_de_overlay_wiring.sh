@@ -106,9 +106,8 @@ sleep "$PAINT_WAIT"
 printf 'hamsessui &\n' >&3 ; sleep 5
 mon_cmd "screendump $SESS_PPM"; sleep 2
 
-# --- 2) Spawn the message-tray history panel --------------------------------
-printf 'hamnotify "Build done" "Overlay wiring landed" >/dev/null 2>&1\n' >&3 ; sleep 2
-printf 'hamtray &\n' >&3 ; sleep 4
+# --- 2) Spawn the About-this-system scene dialog ---------------------------
+printf 'hamabout &\n' >&3 ; sleep 5
 mon_cmd "screendump $TRAY_PPM"; sleep 2
 
 exec 3>&-
