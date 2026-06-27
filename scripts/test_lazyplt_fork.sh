@@ -33,6 +33,19 @@ cd "$PROJ_ROOT"
 UBIN=tests/u-binary/u_lazyplt_fork
 ensure_ubin_or_skip test_lazyplt_fork u_lazyplt_fork lazyplt_fork
 
+# The fixture is a DYNAMIC glibc binary: its PT_INTERP
+# /lib64/ld-linux-x86-64.so.2 must exist in the Linux-namespace root,
+# which is the debian-minbase rootfs. Without it ld.so can't load and
+# the binary wedges at interp resolution (same precondition as
+# test_dynamic_forkexec). SKIP cleanly rather than false-FAIL.
+INTERP=tests/distros/debian-minbase/rootfs/lib64/ld-linux-x86-64.so.2
+if [ ! -f "$INTERP" ]; then
+    echo "[test_lazyplt_fork] SKIP: $INTERP not staged"
+    echo "    Build with: bash tests/distros/debian-minbase/BUILD.sh"
+    echo "    (this fixture's dynamic interp needs the real Debian rootfs)"
+    exit 0
+fi
+
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
