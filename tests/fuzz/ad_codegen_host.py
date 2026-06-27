@@ -188,6 +188,7 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       cse=meta.get("CSE", 0),
                       licm=meta.get("LICM", 0),
                       dce=meta.get("DCE", 0),
+                      constbranch=meta.get("CONSTBRANCH", 0),
                       iremit=meta.get("IREMIT", 0),
                       irfold=meta.get("IRFOLD", 0),
                       irfallback=meta.get("IRFALLBACK", 0),
@@ -488,6 +489,7 @@ class CodegenRun:
         self.cse = kw.get("cse", 0)
         self.licm = kw.get("licm", 0)
         self.dce = kw.get("dce", 0)
+        self.constbranch = kw.get("constbranch", 0)
         self.iremit = kw.get("iremit", 0)
         self.irfold = kw.get("irfold", 0)
         self.irreassoc = kw.get("irreassoc", 0)
@@ -529,6 +531,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     cse = getattr(dump, "cse", 0)
     licm = getattr(dump, "licm", 0)
     dce = getattr(dump, "dce", 0)
+    constbranch = getattr(dump, "constbranch", 0)
     iremit = getattr(dump, "iremit", 0)
     irfold = getattr(dump, "irfold", 0)
     irreassoc = getattr(dump, "irreassoc", 0)
@@ -540,7 +543,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                           irreassoc=irreassoc, iremitfloat=iremitfloat, ffold=ffold)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
                       folds=folds, ffold=ffold, cse=cse, licm=licm, dce=dce,
-                      iremit=iremit,
+                      constbranch=constbranch, iremit=iremit,
                       irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat)
 
 
