@@ -4085,26 +4085,43 @@ def build_archive() -> bytes:
                 "usr/sbin/ldconfig",
                 "usr/sbin/start-stop-daemon",
                 # dpkg-deb forks tar, which forks the decompressor; the
-                # leaf hamhello .deb uses gzip (data.tar.gz).
-                "bin/tar",
-                "bin/gzip",
+                # leaf hamhello .deb uses gzip (data.tar.gz). These MUST be
+                # spelled `usr/bin/<x>` (NOT `bin/<x>`): the host-staged
+                # rootfs (scripts/stage_host_dpkg_rootfs.sh) puts the real
+                # binaries ONLY under usr/bin/ — its bin/ holds just the
+                # sh/dash symlinks. A `bin/tar` entry's
+                # `(minbase_rootfs / "bin/tar").is_file()` is False, so the
+                # embed loop SILENTLY SKIPS it (added to `missing`) and the
+                # Debian tar never lands in the cpio. dpkg-deb then
+                # execvp("tar")'s PATH walk misses /usr/bin/tar and falls
+                # through to the NATIVE Adder /bin/tar (user/tar.ad) baked
+                # into the global cpio, which rejects GNU tar's flags
+                # ("tar: unknown flag") -> dpkg-deb exits 1 mid-unpack and
+                # the install never reaches "Setting up". Spelling them
+                # usr/bin/<x> stages the real bytes; the USRMERGE_ALIASES
+                # expansion below ALSO plants /bin/<x> from the same bytes,
+                # so the native /bin/tar is shadowed by the Debian one
+                # inside the #distro-bound namespace.
+                "usr/bin/tar",
+                "usr/bin/gzip",
+                "usr/bin/gunzip",
                 "usr/bin/xz",
                 "usr/bin/zstd",
                 # coreutils dpkg/apt fork during a real install + the
                 # `/bin/sh` maintainer-script shell (dash already staged).
-                "bin/cp",
-                "bin/mv",
-                "bin/rm",
-                "bin/mkdir",
-                "bin/rmdir",
-                "bin/chmod",
-                "bin/chown",
-                "bin/ln",
-                "bin/ls",
-                "bin/cat",
-                "bin/echo",
-                "bin/sync",
-                "bin/sed",
+                "usr/bin/cp",
+                "usr/bin/mv",
+                "usr/bin/rm",
+                "usr/bin/mkdir",
+                "usr/bin/rmdir",
+                "usr/bin/chmod",
+                "usr/bin/chown",
+                "usr/bin/ln",
+                "usr/bin/ls",
+                "usr/bin/cat",
+                "usr/bin/echo",
+                "usr/bin/sync",
+                "usr/bin/sed",
                 "usr/bin/wc",
                 "usr/bin/sort",
                 "usr/bin/head",
@@ -4116,7 +4133,10 @@ def build_archive() -> bytes:
                 # GENUINE Debian bash (+ its libtinfo closure is globbed
                 # below). Proves the full Debian /bin/bash runs in the ns,
                 # not just dash. ~1.2 MB; acceptable for the curated slice.
-                "bin/bash",
+                # Spelled usr/bin/ (host stages it there; usrmerge alias
+                # plants /bin/bash too) — a `bin/bash` entry would miss
+                # is_file() and silently skip, like the tar/gzip case above.
+                "usr/bin/bash",
                 # BROAD coreutils coverage matrix (scripts/
                 # test_linux_debian_coverage.sh / _kvm_coreutils_repro.sh
                 # run each STANDALONE via `enter linux { /usr/bin/<x> ... }`).
