@@ -137,6 +137,12 @@ opt_dce_count: uint32 = 0
 # code the Phase-8 DCE reclaims. See the Phase-1.5 section below.
 opt_constbranch_count: uint32 = 0
 
+# Diagnostics: number of identifier USES forwarded by Phase-9 copy propagation
+# (one per `x` read rewritten to its copy source `y` for a pure copy `x = y`).
+# After forwarding, the now-unused copy dest `x` typically becomes dead and the
+# Phase-8 DCE removes its decl. See the Phase-9 COPY-PROP section at the bottom.
+opt_copyprop_count: uint32 = 0
+
 
 def opt_enable():
     opt_enabled = 1
@@ -150,6 +156,7 @@ def opt_reset_stats():
     opt_dce_count = 0
     opt_ffold_count = 0
     opt_constbranch_count = 0
+    opt_copyprop_count = 0
 
 
 # =======================================================================
@@ -1009,6 +1016,17 @@ def opt_run(prog: uint32):
     while cur != 0:
         if nd_kind[cur] == ND_FUNCTION:
             opt_licm_function(cur)
+        cur = nd_next[cur]
+    # Phase 9 — COPY PROPAGATION. Runs AFTER fold/CSE/LICM and immediately BEFORE
+    # DCE: it forwards each pure copy `x = y` to later reads of `x` (rewriting them
+    # to read `y`) within a straight-line run, when neither `x` nor `y` is mutated
+    # in the live range. The forwarded copy dest `x` then has no remaining reader,
+    # so the Phase-8 DCE that follows removes its now-dead decl. Conservative: any
+    # call / addr-of / control flow / opaque store flushes the active copy set.
+    cur = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            opt_copyprop_function(cur)
         cur = nd_next[cur]
     # Phase 8 — DEAD CODE ELIMINATION. Runs LAST, on the fully fold+CSE+LICM
     # simplified graph: those passes have minted synthetic temp locals (__cse_/
@@ -2510,3 +2528,297 @@ def opt_dce_function(fn: uint32):
         dce_removed_any = 0
         nd_c[fn] = dce_block(nd_c[fn])
         dce_fnbody = nd_c[fn]
+
+
+# =======================================================================
+# Phase 9 — COPY PROPAGATION (straight-line, conservative).
+# =======================================================================
+#
+# STRATEGY (conservative + correct over fast)
+# -------------------------------------------
+# A PURE COPY is a statement `x = y` whose right-hand side is a BARE variable
+# read (a single ND_IDENT, no side effect, no load/call) and whose left-hand
+# side is a BARE local name (an ND_VAR_DECL or a plain ND_ASSIGN to an ident).
+# Within a straight-line run, every later READ of `x` can be rewritten to read
+# `y` instead — PROVIDED that between the copy and the read NEITHER `x` NOR `y`
+# is reassigned / re-declared / written. Forwarding the read makes `x`'s decl
+# have no remaining reader, so the Phase-8 DCE that runs immediately after
+# removes the now-dead copy decl entirely (`x = y` vanishes, uses read `y`).
+#
+# WHY THIS IS ADDITIVE TO CSE (verified)
+#   CSE / x-CSE here value-number only PURE ND_BINARY subtrees (ir_lower_pure_expr
+#   returns 0 for a bare ND_IDENT, and cse_collect records a candidate ONLY when
+#   nd_kind == ND_BINARY). A bare copy `x = y` and a later bare read of `x` are
+#   NOT binary expressions, so CSE never forms a candidate for them and never
+#   forwards a variable's value to its uses. Copy-prop is therefore a DISTINCT,
+#   complementary transform — it forwards single-variable copies that CSE cannot
+#   see — not a no-op duplicate of CSE.
+#
+# SOUNDNESS — straight-line copy propagation, conservative
+# --------------------------------------------------------
+# We process statements in source order maintaining an ACTIVE COPY set: each
+# entry maps a dest name -> a source name, live until invalidated. For each
+# statement:
+#   1. REWRITE its r-value reads FIRST: any read of an active dest is rewritten
+#      to read its (root) source. We resolve transitively — if the source is
+#      itself an active dest, we chase to the chain root, which is sound because
+#      every link in the active set is currently unclobbered (a write to any
+#      intermediate name would have killed the whole link).
+#   2. APPLY this statement's WRITES: a write to name `w` (an ND_VAR_DECL name or
+#      a plain ND_ASSIGN to ident `w`) KILLS every active copy whose DEST is `w`
+#      (its old value is gone) AND every active copy whose SOURCE is `w` (the
+#      source changed, so forwarding it would now be wrong).
+#   3. If this statement is ITSELF a pure copy `x = y` (after step 2 killed any
+#      prior `x` entry), RECORD a new active copy x -> root(y).
+# A statement we cannot model precisely is a HARD BARRIER that flushes the WHOLE
+# active set and ends the run: a call (ND_CALL anywhere in an r-value), an
+# address-of (UNOP_ADDR — `x` or `y` could be aliased and written indirectly),
+# an opaque store (assign/var-decl whose target is not a bare ident, or whose
+# r-value is not call/addr-free), or any control flow. After a barrier the set
+# is empty and the rest of the chain is a fresh run. This is textbook local copy
+# propagation over an extended basic block, at its safest: anything that could
+# alias, call, or branch resets the active set.
+#
+# We do NOT propagate a copy whose source is a GLOBAL we cannot prove unwritten
+# across the run — handled uniformly: a write to the source name (by any
+# straight-line statement) kills the copy, and any unmodellable statement is a
+# barrier, so a global source surviving to a read was provably unwritten on the
+# straight-line path. (A call is already a barrier, covering indirect writes.)
+
+# Active copy set for the current straight-line run. Each slot: dest (off,len),
+# source root (off,len), and a live flag.
+CP_MAX: uint32 = 1024
+cp_dest_off: Array[1024, uint32]
+cp_dest_len: Array[1024, uint32]
+cp_src_off: Array[1024, uint32]
+cp_src_len: Array[1024, uint32]
+cp_live: Array[1024, uint32]
+cp_n: uint32 = 0
+
+
+def cp_reset():
+    cp_n = 0
+
+
+# Kill every active copy whose DEST or SOURCE name equals (off,len). Called when
+# `name` is written: its old copied value is stale (dest match) and any copy
+# forwarding it as a source is now wrong (source match).
+def cp_kill_name(off: uint32, len_: uint32):
+    i: uint32 = 0
+    while i < cp_n:
+        if cp_live[i] != 0:
+            if ir_name_eq(cp_dest_off[i], cp_dest_len[i], off, len_) != 0:
+                cp_live[i] = 0
+            elif ir_name_eq(cp_src_off[i], cp_src_len[i], off, len_) != 0:
+                cp_live[i] = 0
+        i = i + 1
+
+
+# Find a LIVE active copy whose dest equals (off,len); return its index+1, or 0
+# if none. (+1 so 0 means "not found" without an out-param.)
+def cp_find_dest(off: uint32, len_: uint32) -> uint32:
+    i: uint32 = 0
+    while i < cp_n:
+        if cp_live[i] != 0:
+            if ir_name_eq(cp_dest_off[i], cp_dest_len[i], off, len_) != 0:
+                return i + 1
+        i = i + 1
+    return 0
+
+
+# Record a new active copy `dest -> src_root`. The caller has already killed any
+# prior entry whose dest is `dest`. We chase `src` through the active set to its
+# root so a chain `a=b; b=c` forwarded reads of `a` straight to `c`. The chase is
+# bounded by cp_n (no cycle: each link was added with a then-distinct dest).
+cp_root_off: uint32 = 0
+cp_root_len: uint32 = 0
+
+
+def cp_resolve_root(off: uint32, len_: uint32):
+    # Walk dest->src links until the name is not itself an active dest.
+    coff: uint32 = off
+    clen: uint32 = len_
+    steps: uint32 = 0
+    while steps < cp_n:
+        idx: uint32 = cp_find_dest(coff, clen)
+        if idx == 0:
+            cp_root_off = coff
+            cp_root_len = clen
+            return
+        coff = cp_src_off[idx - 1]
+        clen = cp_src_len[idx - 1]
+        steps = steps + 1
+    cp_root_off = coff
+    cp_root_len = clen
+
+
+def cp_add(dest_off: uint32, dest_len: uint32, src_off: uint32, src_len: uint32):
+    if cp_n >= CP_MAX:
+        return
+    cp_resolve_root(src_off, src_len)
+    # Self-copy `x = x` after rooting (e.g. a=b; b=a) — do not record (would be a
+    # degenerate identity that cp_find could loop on); harmless to skip.
+    if ir_name_eq(dest_off, dest_len, cp_root_off, cp_root_len) != 0:
+        return
+    cp_dest_off[cp_n] = dest_off
+    cp_dest_len[cp_n] = dest_len
+    cp_src_off[cp_n] = cp_root_off
+    cp_src_len[cp_n] = cp_root_len
+    cp_live[cp_n] = 1
+    cp_n = cp_n + 1
+
+
+# Rewrite, in an r-value EXPRESSION subtree, every READ of an active copy dest to
+# read its source root. ND_IDENT leaves are the only reads we forward; we descend
+# operand slots of binary/cast/index/member/unary, and a call's argument list
+# (nd_a..nd_d) — but a call statement is a BARRIER so this only runs on call-free
+# r-values. Returns nothing; bumps opt_copyprop_count per rewritten read.
+def cp_rewrite_reads(node: uint32):
+    if node == 0:
+        return
+    k: uint32 = nd_kind[node]
+    if k == ND_IDENT:
+        idx: uint32 = cp_find_dest(nd_name_off[node], nd_name_len[node])
+        if idx != 0:
+            nd_name_off[node] = cp_src_off[idx - 1]
+            nd_name_len[node] = cp_src_len[idx - 1]
+            opt_copyprop_count = opt_copyprop_count + 1
+        return
+    if k == ND_INT_LIT or k == ND_CHAR_LIT or k == ND_BOOL_LIT or k == ND_FLOAT_LIT:
+        return
+    cp_rewrite_reads(nd_a[node])
+    cp_rewrite_reads(nd_b[node])
+    cp_rewrite_reads(nd_c[node])
+    cp_rewrite_reads(nd_d[node])
+
+
+# Is `node` a BARE variable read (a single ND_IDENT)? Such an r-value is the
+# pure-copy source shape we forward.
+def cp_is_bare_ident(node: uint32) -> uint32:
+    if node == 0:
+        return 0
+    if nd_kind[node] == ND_IDENT:
+        return 1
+    return 0
+
+
+# Does an r-value expression contain a call or address-of anywhere (a barrier)?
+# Reuses the LICM scanner, which sets licm_giveup on ND_CALL / UNOP_ADDR.
+def cp_expr_has_barrier(node: uint32) -> uint32:
+    licm_giveup = 0
+    licm_scan_expr(node)
+    return licm_giveup
+
+
+# The r-value expression of a straight-line statement (the side whose reads we
+# forward), or 0 if the statement has none.
+def cp_stmt_rvalue(s: uint32) -> uint32:
+    k: uint32 = nd_kind[s]
+    if k == ND_VAR_DECL:
+        return nd_b[s]
+    if k == ND_ASSIGN:
+        return nd_b[s]
+    if k == ND_EXPR_STMT:
+        return nd_a[s]
+    if k == ND_RETURN:
+        return nd_a[s]
+    return 0
+
+
+# Process ONE straight-line statement: forward reads, apply writes, record a new
+# copy. Returns 1 if the statement is a HARD BARRIER (flush + end run), 0 if it
+# was modelled precisely.
+def cp_process_stmt(s: uint32) -> uint32:
+    k: uint32 = nd_kind[s]
+    if k == ND_VAR_DECL:
+        rv: uint32 = nd_b[s]
+        # An augmented var-decl never occurs; a plain decl `name = <rv>`.
+        if rv != 0:
+            if cp_expr_has_barrier(rv) != 0:
+                return 1
+            cp_rewrite_reads(rv)
+        # The decl WRITES its name (kill prior copies of/with it) BEFORE we record
+        # a fresh copy from it.
+        cp_kill_name(nd_name_off[s], nd_name_len[s])
+        # Record a pure copy `name = <src-ident>` (after the rewrite above the rv
+        # may have been forwarded to a root ident — still a bare ident, so we
+        # forward the chain transitively).
+        if rv != 0 and cp_is_bare_ident(rv) != 0:
+            # Do not copy a name from ITSELF (`x = x` is a no-op; skip).
+            if ir_name_eq(nd_name_off[s], nd_name_len[s],
+                          nd_name_off[rv], nd_name_len[rv]) == 0:
+                cp_add(nd_name_off[s], nd_name_len[s],
+                       nd_name_off[rv], nd_name_len[rv])
+        return 0
+    if k == ND_ASSIGN:
+        # Only a plain assignment (AUGOP_NONE) to a BARE ident is modelled; an
+        # augmented assign or a non-ident (store-through-index/member/deref)
+        # target is an opaque store -> barrier.
+        if nd_aux[s] != AUGOP_NONE:
+            return 1
+        tgt: uint32 = nd_a[s]
+        if nd_kind[tgt] != ND_IDENT:
+            return 1
+        rv2: uint32 = nd_b[s]
+        if cp_expr_has_barrier(rv2) != 0:
+            return 1
+        cp_rewrite_reads(rv2)
+        cp_kill_name(nd_name_off[tgt], nd_name_len[tgt])
+        if cp_is_bare_ident(rv2) != 0:
+            if ir_name_eq(nd_name_off[tgt], nd_name_len[tgt],
+                          nd_name_off[rv2], nd_name_len[rv2]) == 0:
+                cp_add(nd_name_off[tgt], nd_name_len[tgt],
+                       nd_name_off[rv2], nd_name_len[rv2])
+        return 0
+    if k == ND_EXPR_STMT:
+        if cp_expr_has_barrier(nd_a[s]) != 0:
+            return 1
+        cp_rewrite_reads(nd_a[s])
+        return 0
+    if k == ND_RETURN:
+        if cp_expr_has_barrier(nd_a[s]) != 0:
+            return 1
+        cp_rewrite_reads(nd_a[s])
+        return 0
+    # Any control-flow / unknown statement: hard barrier.
+    return 1
+
+
+# Copy-propagate over a statement chain (a block). Walks maximal straight-line
+# runs, flushing the active set at each barrier, and recurses into nested block
+# bodies (where each nested block begins a FRESH run with an empty active set —
+# we never carry a copy across a control-flow boundary, conservatively correct).
+def cp_block(head: uint32):
+    cp_reset()
+    s: uint32 = head
+    while s != 0:
+        barrier: uint32 = cp_process_stmt(s)
+        if barrier != 0:
+            cp_reset()
+        # Recurse into nested control-flow bodies; each starts its own fresh run
+        # (cp_block resets), and on return we continue THIS run's active set as it
+        # stood — EXCEPT a control-flow statement is itself a barrier (handled
+        # above: cp_process_stmt returned 1 and we flushed), so the active set is
+        # already empty here for any node that has nested blocks. Recursing simply
+        # cleans the nested chains.
+        k: uint32 = nd_kind[s]
+        if k == ND_IF:
+            cp_block(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                cp_block(nd_b[e])
+                e = nd_next[e]
+            cp_block(nd_d[s])
+        elif k == ND_WHILE:
+            cp_block(nd_b[s])
+        elif k == ND_DO_WHILE:
+            cp_block(nd_b[s])
+        elif k == ND_FOR:
+            cp_block(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            cp_block(nd_c[s])
+        s = nd_next[s]
+
+
+def opt_copyprop_function(fn: uint32):
+    cp_block(nd_c[fn])

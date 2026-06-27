@@ -620,6 +620,26 @@ class Program:
                 nm = dn()
                 self.emit(f"{ind}{nm}: int64 = {pure_init()}")
                 dead_leaves.append(nm)
+            # (4) COPY-PROP bait: a dead pure copy `cpy = <leaf>` whose dest is
+            # then READ by a second dead local `use = cpy <op> <leaf>`. The read
+            # of `cpy` is a pure-copy forward target — Phase-9 copy-prop rewrites
+            # it to read the source directly, after which both dead locals are
+            # reclaimed by DCE. Everything here is pure-initialized and read
+            # nowhere by `r`/the return, so removing it (or not) is a no-op and
+            # the oracle (`pyfn`) is unaffected — behavior stays identical. The
+            # source is a LIVE leaf (a param or constant) so the copy is a clean
+            # `dest = src` straight-line copy with no intervening write.
+            src_leaf = (rng.choice(live_leaves) if live_leaves
+                        else f"cast[int64]({rng.randint(0, 9)})")
+            cpy = dn()
+            self.emit(f"{ind}{cpy}: int64 = {src_leaf}")
+            dead_leaves.append(cpy)
+            other = (rng.choice(live_leaves) if live_leaves
+                     else f"cast[int64]({rng.randint(0, 9)})")
+            op = rng.choice(["+", "-", "*", "&", "|", "^"])
+            use = dn()
+            self.emit(f"{ind}{use}: int64 = ({cpy} {op} {other})")
+            dead_leaves.append(use)
         else:
             # (2) const-condition branch: `if <const-true>:` whose body writes
             # ONLY dead locals — the arm is observationally empty. The condition
@@ -1322,6 +1342,8 @@ _AD_OPT_DCE_TOTAL = 0     # running DCE dead-local-removal count across the lane
 _AD_OPT_PROGS_DCE = 0     # programs in which >=1 DCE removal fired
 _AD_OPT_CONSTBRANCH_TOTAL = 0  # running const-branch-fold count across the lane
 _AD_OPT_PROGS_CONSTBRANCH = 0  # programs in which >=1 const-branch fold fired
+_AD_OPT_COPYPROP_TOTAL = 0     # running copy-propagation forward count across the lane
+_AD_OPT_PROGS_COPYPROP = 0     # programs in which >=1 copy forward fired
 
 # ADDER_CFG=1 enables the Phase-4 GROUNDWORK CFG/liveness lane: for every
 # program codegen.ad's PARSER accepts, build the whole-function CFG + backward-
@@ -1405,6 +1427,7 @@ def run_through_ad_codegen(seed, body):
     global _AD_OPT_LICM_TOTAL, _AD_OPT_PROGS_LICM
     global _AD_OPT_DCE_TOTAL, _AD_OPT_PROGS_DCE
     global _AD_OPT_CONSTBRANCH_TOTAL, _AD_OPT_PROGS_CONSTBRANCH
+    global _AD_OPT_COPYPROP_TOTAL, _AD_OPT_PROGS_COPYPROP
     host = _ad_host()
     r = host.run_through_codegen_ad(seed, body, _AD_WORK, opt=ADDER_OPT)
     if r.kind == "unsupported":
@@ -1431,6 +1454,10 @@ def run_through_ad_codegen(seed, body):
             _AD_OPT_CONSTBRANCH_TOTAL += cb
             if cb > 0:
                 _AD_OPT_PROGS_CONSTBRANCH += 1
+            cp = int(getattr(r, "copyprop", 0) or 0)
+            _AD_OPT_COPYPROP_TOTAL += cp
+            if cp > 0:
+                _AD_OPT_PROGS_COPYPROP += 1
         return ("ok", r.stdout, r.exit)
     return ("__ad_error__", r.kind, r.detail)
 
@@ -2575,6 +2602,8 @@ def _run_ad_codegen_batch(base, args):
         print(f"  programs with >=1 DCE:      {_AD_OPT_PROGS_DCE}")
         print(f"  const-branch folds (total): {_AD_OPT_CONSTBRANCH_TOTAL}")
         print(f"  programs with >=1 constbr:  {_AD_OPT_PROGS_CONSTBRANCH}")
+        print(f"  copy-prop forwards (total): {_AD_OPT_COPYPROP_TOTAL}")
+        print(f"  programs with >=1 copyprop: {_AD_OPT_PROGS_COPYPROP}")
         print(f"  (above CORRECT count already asserts opt output == oracle)")
         # The lane only proves anything if the pass DEMONSTRABLY fired. If the
         # whole batch produced zero folds the optimizer wasn't exercised, which
@@ -2588,6 +2617,13 @@ def _run_ad_codegen_batch(base, args):
         if accepted > 0 and _AD_OPT_CONSTBRANCH_TOTAL == 0:
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] const-branch folding never fired across the batch")
+        # The fuzz generator emits a dead pure copy `cpy = <leaf>` whose dest is
+        # then read into every pure helper (COPY-PROP bait, observationally inert),
+        # so the Phase-9 copy-propagation pass MUST fire across a non-trivial batch;
+        # a zero total means the pass regressed / was bypassed.
+        if accepted > 0 and _AD_OPT_COPYPROP_TOTAL == 0:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] copy propagation never fired across the batch")
         # Phase-2 dedicated CSE corpus: the random batch above rarely emits
         # repeated NON-constant subexpressions, so we run a hand-written corpus
         # of repeated-pure-binop programs through codegen.ad (--opt) and assert
