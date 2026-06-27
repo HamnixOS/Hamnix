@@ -4048,6 +4048,16 @@ def build_archive() -> bytes:
                 # covered by the libdir glob below. Harmless on the offline
                 # path (no http source configured -> method never forked).
                 "usr/lib/apt/methods/http",
+                # apt's GPG signature-verification method + the real gpgv
+                # verifier it execs. `apt-get update` over the LIVE
+                # deb.debian.org archive verifies the InRelease signature
+                # against the debian-archive-keyring; with the gpgv METHOD
+                # absent apt aborts "method driver /usr/lib/apt/methods/gpgv
+                # could not be found", and with the gpgv BINARY absent the
+                # method can't exec the verifier. Stage both (+ libgcrypt/
+                # libgpg-error closure, caught by the libdir glob below).
+                "usr/lib/apt/methods/gpgv",
+                "usr/bin/gpgv",
                 # dpkg unpack/install helpers. dpkg forks dpkg-deb to
                 # extract data.tar; dpkg-split/-query round out the admin
                 # surface dpkg touches during an install.
