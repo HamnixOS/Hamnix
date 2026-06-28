@@ -279,7 +279,8 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       isel=meta.get("ISEL", 0),
                       aluload=meta.get("ALULOAD", 0),
                       ivsr=meta.get("IVSR", 0),
-                      storeelim=meta.get("STOREELIM", 0))
+                      storeelim=meta.get("STOREELIM", 0),
+                      cmpjcc=meta.get("CMPJCC", 0))
 
 
 # --------------------------------------------------------------------------
@@ -584,6 +585,7 @@ class CodegenRun:
         self.aluload = kw.get("aluload", 0)
         self.ivsr = kw.get("ivsr", 0)
         self.storeelim = kw.get("storeelim", 0)
+        self.cmpjcc = kw.get("cmpjcc", 0)
 
 
 def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
@@ -633,20 +635,21 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     aluload = getattr(dump, "aluload", 0)
     ivsr = getattr(dump, "ivsr", 0)
     storeelim = getattr(dump, "storeelim", 0)
+    cmpjcc = getattr(dump, "cmpjcc", 0)
     if rp.returncode < 0:
         return CodegenRun("runfail", detail=f"signal {-rp.returncode}",
                           stdout=out, exit=rp.returncode, folds=folds, cse=cse,
                           licm=licm, iremit=iremit, irfold=irfold,
                           irreassoc=irreassoc, iremitfloat=iremitfloat, ffold=ffold,
                           strengthred=strengthred, isel=isel, aluload=aluload,
-                          ivsr=ivsr, storeelim=storeelim)
+                          ivsr=ivsr, storeelim=storeelim, cmpjcc=cmpjcc)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
                       folds=folds, ffold=ffold, cse=cse, loadcse=loadcse,
                       licm=licm, dce=dce,
                       constbranch=constbranch, copyprop=copyprop, iremit=iremit,
                       irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat,
                       strengthred=strengthred, isel=isel, aluload=aluload,
-                      ivsr=ivsr, storeelim=storeelim)
+                      ivsr=ivsr, storeelim=storeelim, cmpjcc=cmpjcc)
 
 
 if __name__ == "__main__":

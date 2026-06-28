@@ -580,6 +580,7 @@ class Program:
         self._gen_nested_loop_traffic(env)    # nested loops: reset-and-read +
                                               # break/continue/early-return/cross-level
         self._gen_short_circuit_traffic(env)  # logical and/or short-circuit
+        self._gen_cmpjcc_traffic(env)         # cmp; jcc branch-condition lever (--opt)
         self._gen_helper_calls(env)
         self._gen_regpressure_scratch_traffic(env)  # caller-saved IR scratch (--opt)
         self._gen_region_callsplit_traffic(env)  # per-region caller-saved regalloc (--opt)
@@ -2261,6 +2262,195 @@ class Program:
             if not (dw_i < n):
                 break
         self._fold_value("dw_sum", py)
+
+    # ======================================================================
+    # CMP+JCC branch-condition traffic (--opt cmp; jcc lever). A comparison
+    # that feeds a conditional branch (if/while/for/do-while condition, and the
+    # short-circuit &&/|| edges) is lowered to a direct `cmp; jcc` instead of
+    # materializing a 0/1 boolean and re-testing it. The CRUX bug class is the
+    # signed-vs-unsigned jcc (jb vs jl) and the branch-sense negation: a wrong
+    # jcc silently takes the wrong arm. This generator hammers it with:
+    #   * every comparison op (== != < <= > >=) as an if/while condition,
+    #   * SIGNED and UNSIGNED operands, including values that DIFFER in outcome
+    #     under signed vs unsigned interpretation (e.g. 0xFFFFFFFFFFFFFFFF which
+    #     is -1 signed but the maximum unsigned — `x < 0` signed is the inverse
+    #     of `x < 0` unsigned),
+    #   * branch-if-TRUE (the body runs) and branch-if-FALSE (an else / skip),
+    #   * negated conditions `if not (a < b):`,
+    #   * short-circuit `&&` / `||` chains of comparisons (internal edges become
+    #     cmp; jcc; the chain's own boolean VALUE is still materialized),
+    #   * comparisons whose boolean VALUE is ALSO used (assigned to a local and
+    #     folded) — these must STILL materialize correctly (the value-use case
+    #     the lever must NOT touch).
+    # Each construct's observable effect is shadowed in Python and folded into
+    # g_accum, so any wrong branch / wrong jcc diverges the differential oracle.
+    # Emitted in BOTH modes with an identical rng stream.
+    # ======================================================================
+    def _cmpjcc_eval(self, op, x, y, signed):
+        """Python truth value of `x op y` under signed/unsigned 64-bit semantics,
+        mirroring the backend's _rel_cc choice (eq/ne are bit-compares)."""
+        xr = x & umask(64)
+        yr = y & umask(64)
+        if op == "==":
+            return xr == yr
+        if op == "!=":
+            return xr != yr
+        if signed:
+            xv, yv = _signed64(xr), _signed64(yr)
+        else:
+            xv, yv = xr, yr
+        return {"<": xv < yv, "<=": xv <= yv, ">": xv > yv, ">=": xv >= yv}[op]
+
+    def _gen_cmpjcc_traffic(self, env):
+        rng = self.rng
+        OPS = ["<", "<=", ">", ">=", "==", "!="]
+        # Operand pairs that EXPOSE the signed-vs-unsigned distinction: the same
+        # bit pattern compares differently as signed vs unsigned. The first few
+        # are the classic miscompile trap (-1 vs 1: signed -1 < 1 but unsigned
+        # 0xFFF... > 1) — the jb-vs-jl divergence.
+        TRAP_PAIRS = [
+            (0xFFFFFFFFFFFFFFFF, 1),                 # -1 vs 1
+            (0x8000000000000000, 1),                 # INT64_MIN vs 1
+            (0x7FFFFFFFFFFFFFFF, 0x8000000000000000),# INT64_MAX vs INT64_MIN
+            (0xFFFFFFFFFFFFFFFF, 0),                 # -1 vs 0
+            (0, 0xFFFFFFFFFFFFFFFF),                 # 0 vs -1
+            (5, 5),                                  # equal
+            (3, 9),                                  # small ordered
+        ]
+        # A FIXED, SMALL set of reusable locals (declared ONCE) keeps this whole
+        # generator under the backend's MAX_LOCALS budget no matter how many
+        # cases the per-program budget draws — the operands/result are re-ASSIGNED
+        # per case, not re-declared. Two operand slots per signedness + one
+        # result slot. The `while`/`do`/`for` counters get their own reused slots.
+        self.emit("    cj_si: int64 = 0")
+        self.emit("    cj_sj: int64 = 0")
+        self.emit("    cj_ui: uint64 = cast[uint64](0)")
+        self.emit("    cj_uj: uint64 = cast[uint64](0)")
+        self.emit("    cj_r:  uint64 = cast[uint64](0)")
+        self.emit("    cj_ctr: int64 = 0")
+        self.emit("    cj_sum: uint64 = cast[uint64](0)")
+
+        def operands(signed):
+            return ("cj_si", "cj_sj") if signed else ("cj_ui", "cj_uj")
+
+        def load(signed, xv, yv):
+            ty = "int64" if signed else "uint64"
+            xn, yn = operands(signed)
+            self.emit(f"    {xn} = cast[{ty}]({xv})")
+            self.emit(f"    {yn} = cast[{ty}]({yv})")
+            return xn, yn
+
+        # Per-program budget: draw a handful of cases for each shape so coverage
+        # accumulates across the 700-seed corpus while each program stays small.
+        # ---- (1) if/else branch-if-true over a comparison, both signednesses.
+        for _ in range(rng.randint(2, 4)):
+            op = rng.choice(OPS)
+            signed = rng.random() < 0.5
+            xv, yv = rng.choice(TRAP_PAIRS)
+            xn, yn = load(signed, xv, yv)
+            self.emit(f"    if {xn} {op} {yn}:")
+            self.emit(f"        cj_r = cast[uint64](7)")
+            self.emit(f"    else:")
+            self.emit(f"        cj_r = cast[uint64](11)")
+            self._fold_value("cj_r", 7 if self._cmpjcc_eval(op, xv, yv, signed) else 11)
+
+        # ---- (2) NEGATED condition `if not (a op b):` — branch-sense flip ------
+        for _ in range(rng.randint(1, 3)):
+            op = rng.choice(OPS)
+            signed = rng.random() < 0.5
+            xv, yv = rng.choice(TRAP_PAIRS)
+            xn, yn = load(signed, xv, yv)
+            self.emit(f"    if not ({xn} {op} {yn}):")
+            self.emit(f"        cj_r = cast[uint64](13)")
+            self.emit(f"    else:")
+            self.emit(f"        cj_r = cast[uint64](17)")
+            res = 13 if (not self._cmpjcc_eval(op, xv, yv, signed)) else 17
+            self._fold_value("cj_r", res)
+
+        # ---- (3) while loop driven by a comparison condition (cmp; jcc exit) ---
+        for _ in range(rng.randint(1, 2)):
+            op = rng.choice(("<", "<=", "!="))
+            n = rng.randint(1, 9)
+            self.emit("    cj_ctr = 0")
+            self.emit("    cj_sum = cast[uint64](0)")
+            self.emit(f"    while cj_ctr {op} cast[int64]({n}):")
+            self.emit("        cj_sum = cj_sum + cast[uint64](cj_ctr)")
+            self.emit("        cj_ctr = cj_ctr + 1")
+            py = 0
+            iv = 0
+            # Guard against a degenerate infinite loop in the oracle (e.g. != with
+            # a count it skips past): cap iterations identically to the compiled
+            # ascending counter, which only ever runs while the condition holds.
+            while self._cmpjcc_eval(op, iv, n, True) and iv <= n + 2:
+                py = (py + iv) & umask(64)
+                iv += 1
+            self._fold_value("cj_sum", py)
+
+        # ---- (4) for-range loop (its < lowers to cmp; jge exit) ----------------
+        n = rng.randint(2, 10)
+        self.emit("    cj_sum = cast[uint64](0)")
+        self.emit(f"    for cj_fi in range({n}):")
+        self.emit("        cj_sum = cj_sum + cast[uint64](cj_fi)")
+        self._fold_value("cj_sum", (sum(range(n))) & umask(64))
+
+        # ---- (5) do-while with a comparison back-edge (cmp; jcc start) ---------
+        m = rng.randint(1, 7)
+        self.emit("    cj_ctr = 0")
+        self.emit("    cj_sum = cast[uint64](0)")
+        self.emit("    do:")
+        self.emit("        cj_sum = cj_sum + cast[uint64](cj_ctr)")
+        self.emit("        cj_ctr = cj_ctr + 1")
+        self.emit(f"    while cj_ctr <= cast[int64]({m})")
+        py = 0
+        dv = 0
+        while True:
+            py = (py + dv) & umask(64)
+            dv += 1
+            if not (dv <= m):
+                break
+        self._fold_value("cj_sum", py)
+
+        # ---- (6) short-circuit &&/|| chains of comparisons feeding a branch ----
+        #      Internal edges become cmp; jcc; the chain's boolean VALUE is still
+        #      materialized (used by the `if`, and ALSO assigned to a local).
+        for _ in range(rng.randint(1, 3)):
+            conn = rng.choice(("and", "or"))
+            signed = rng.random() < 0.5
+            ty = "int64" if signed else "uint64"
+            ax, ay = rng.choice(TRAP_PAIRS)
+            bx, by = rng.choice(TRAP_PAIRS)
+            op1, op2 = rng.choice(OPS), rng.choice(OPS)
+            # Use literal operands inline so no extra locals are consumed.
+            la = f"cast[{ty}]({ax})"
+            lb = f"cast[{ty}]({ay})"
+            lc = f"cast[{ty}]({bx})"
+            ld = f"cast[{ty}]({by})"
+            cond = f"({la} {op1} {lb}) {conn} ({lc} {op2} {ld})"
+            t1 = self._cmpjcc_eval(op1, ax, ay, signed)
+            t2 = self._cmpjcc_eval(op2, bx, by, signed)
+            chain = (t1 and t2) if conn == "and" else (t1 or t2)
+            self.emit(f"    if {cond}:")
+            self.emit(f"        cj_r = cast[uint64](19)")
+            self.emit(f"    else:")
+            self.emit(f"        cj_r = cast[uint64](23)")
+            self._fold_value("cj_r", 19 if chain else 23)
+            # value-use of the SAME chain boolean (must still materialize 0/1):
+            self.emit(f"    cj_r = cast[uint64]({cond})")
+            self._fold_value("cj_r", 1 if chain else 0)
+
+        # ---- (7) comparison VALUE used directly (NOT a pure branch) -----------
+        #      The value-use case the lever MUST leave materializing: a bare
+        #      compare assigned to a local, and a compare used in arithmetic.
+        for _ in range(rng.randint(1, 3)):
+            op = rng.choice(OPS)
+            signed = rng.random() < 0.5
+            xv, yv = rng.choice(TRAP_PAIRS)
+            xn, yn = load(signed, xv, yv)
+            b = 1 if self._cmpjcc_eval(op, xv, yv, signed) else 0
+            self.emit(f"    cj_r = cast[uint64]({xn} {op} {yn})")
+            self._fold_value("cj_r", b)
+            self.emit(f"    cj_r = cast[uint64]({xn} {op} {yn}) * cast[uint64](100)")
+            self._fold_value("cj_r", (b * 100) & umask(64))
 
     # ======================================================================
     # Floating-point traffic (scalar SSE float32/float64). Emitted in BOTH
