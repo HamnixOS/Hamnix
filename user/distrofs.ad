@@ -230,6 +230,26 @@ node_namelen:  Array[384, uint64]
 node_size:     Array[384, uint64]
 node_vers:     Array[384, uint32]
 
+# Per-file POSIX metadata (DAC). Until this landed distrofs reported a
+# constant 0777 owned by the literal string "hamnix" for every node, so
+# the kernel/Linux-ABI side had no real mode/owner to enforce against.
+# Now each node carries its low-9 rwx bits + numeric owner uid/gid:
+#   node_mode[i]  low-9 POSIX permission bits (rwxrwxrwx); the DM_DIR
+#                 type bit is added at emit time from node_kind, not
+#                 stored here.
+#   node_uid[i]   owner uid (numeric; emitted as a decimal STRING in the
+#                 9P Stat uid field so a numeric-aware reader gets the
+#                 real owner). Defaults to 0 (root) — distrofs is written
+#                 by the package tooling, which runs as Linux root.
+#   node_gid[i]   owner gid (numeric; same encoding).
+# A node with node_mode == 0 (e.g. a slot resurrected from a pre-DAC
+# on-disk snapshot, whose format does NOT carry these fields) is served
+# with a safe default at emit time: 0755 for a dir, 0644 for a file —
+# the exec bit is preserved for dirs so traversal/listing still works.
+node_mode:     Array[384, uint32]
+node_uid:      Array[384, uint32]
+node_gid:      Array[384, uint32]
+
 # V2 chunked file storage. Each file owns a chain of up to CHAIN_LEN
 # slot indices in node_slot_chain (flat NODE_CAP * CHAIN_LEN layout, -1
 # means "not yet allocated"). node_chain_len[i] tracks how many slots
@@ -796,6 +816,16 @@ def node_alloc(kind: uint8, parent: uint64,
             node_size[i]     = 0
             node_vers[i]     = 0
             node_chain_len[i] = 0
+            # Default POSIX metadata: root-owned (distrofs is populated by
+            # the package tooling, which runs as Linux root), dir 0755 /
+            # file 0644. A Tcreate carrying explicit perm bits overrides
+            # node_mode right after this returns.
+            if kind == KIND_DIR:
+                node_mode[i] = cast[uint32](0o755)
+            else:
+                node_mode[i] = cast[uint32](0o644)
+            node_uid[i]      = 0
+            node_gid[i]      = 0
             ci: uint64 = 0
             while ci < CHAIN_LEN:
                 node_slot_chain[i * CHAIN_LEN + ci] = cast[int32](-1)
@@ -886,6 +916,54 @@ def node_qtype(idx: uint64) -> uint8:
     if node_kind[idx] == KIND_DIR:
         return P9_QTDIR
     return P9_QTFILE
+
+
+def node_effective_mode(idx: uint64) -> uint32:
+    # The low-9 POSIX permission bits to serve for node `idx`, with the
+    # DM_DIR type bit OR'd in for directories. A stored mode of 0 (a slot
+    # rehydrated from a pre-DAC snapshot that didn't carry the field) is
+    # served as the safe default 0755 (dir) / 0644 (file) so traversal and
+    # reads keep working — never as 0000, which would lock everyone out.
+    m: uint32 = node_mode[idx] & cast[uint32](0o777)
+    if m == 0:
+        if node_kind[idx] == KIND_DIR:
+            m = cast[uint32](0o755)
+        else:
+            m = cast[uint32](0o644)
+    if node_kind[idx] == KIND_DIR:
+        m = m | DM_DIR
+    return m
+
+
+# Scratch buffers for the decimal owner uid/gid strings emitted in the 9P
+# Stat record. distrofs serves one Stat at a time (single-threaded request
+# loop), so module-level scratch is safe.
+uid_str_buf: Array[16, uint8]
+gid_str_buf: Array[16, uint8]
+
+
+def _dfs_uitoa(val: uint32, buf: Ptr[uint8]) -> uint64:
+    # Render `val` as decimal ASCII into `buf` (no NUL). Returns the byte
+    # length. The 9P2000 Stat uid/gid are STRINGS; distrofs emits the
+    # owner as a decimal numeric ("0", "1000") so the kernel-side DAC and
+    # any numeric-aware client get the real owner instead of the old
+    # opaque "hamnix" literal.
+    if val == 0:
+        buf[0] = 48                                   # '0'
+        return 1
+    # Render digits least-significant-first into a temp, then reverse.
+    tmp: Array[16, uint8]
+    n: uint64 = 0
+    v: uint32 = val
+    while v != 0:
+        tmp[n] = cast[uint8](48 + cast[uint8](v % 10))
+        v = v / 10
+        n = n + 1
+    i: uint64 = 0
+    while i < n:
+        buf[i] = tmp[n - 1 - i]
+        i = i + 1
+    return n
 
 
 # -- fid table ops -----------------------------------------------------
@@ -1303,6 +1381,13 @@ def _serve_tcreate(in_len: uint64) -> int32:
     if new_i < cast[int64](0):
         return _emit_rerror(tg, "distrofs: node table full")
     new_u: uint64 = cast[uint64](new_i)
+    # Honour the POSIX permission bits the client requested in `perm` (the
+    # 9P Tcreate perm word's low 9 bits). node_alloc seeded a default; the
+    # explicit request wins so e.g. a 0755 program or a 0600 secret keeps
+    # its mode. perm==0 (some minimal clients) keeps node_alloc's default.
+    perm9: uint32 = perm & cast[uint32](0o777)
+    if perm9 != 0:
+        node_mode[new_u] = perm9
     # Tcreate mutates fid: it now references the newly-created file and
     # leaves it open for I/O (docs/9p.md §3.8).
     fid_node[slot] = new_u
@@ -1349,17 +1434,17 @@ def _emit_dir_read(tg: uint16, dir_idx: uint64,
         if node_kind[i] != KIND_FREE and node_parent[i] == dir_idx and i != dir_idx:
             sc: P9Cursor
             p9_cursor_init(&sc, &srv_buf[cur_off], SRV_BUF_CAP - cur_off)
-            mode_bits: uint32 = 0x1FF
+            mode_bits: uint32 = node_effective_mode(i)
             qt: uint8 = node_qtype(i)
-            if node_kind[i] == KIND_DIR:
-                mode_bits = mode_bits | DM_DIR
+            uid_l: uint64 = _dfs_uitoa(node_uid[i], &uid_str_buf[0])
+            gid_l: uint64 = _dfs_uitoa(node_gid[i], &gid_str_buf[0])
             sb: int32 = p9_emit_stat(&sc, 0, 0,
                                      qt, node_vers[i], i + 1,
                                      mode_bits, 0, 0, node_size[i],
                                      &node_name[i * NAME_CAP], node_namelen[i],
-                                     &ident_buf[0], 6,
-                                     &ident_buf[0], 6,
-                                     &ident_buf[0], 6)
+                                     &uid_str_buf[0], uid_l,
+                                     &gid_str_buf[0], gid_l,
+                                     &uid_str_buf[0], uid_l)
             if sb < 0:
                 return -1
             cur_off = cur_off + cast[uint64](sb)
@@ -1543,22 +1628,22 @@ def _serve_tstat(in_len: uint64) -> int32:
     if src < cast[int64](0):
         return _emit_rerror(tg, "distrofs: unknown fid")
     node: uint64 = fid_node[cast[uint64](src)]
-    mode_bits: uint32 = 0x1FF
+    mode_bits: uint32 = node_effective_mode(node)
     qt: uint8 = node_qtype(node)
-    if node_kind[node] == KIND_DIR:
-        mode_bits = mode_bits | DM_DIR
     # Root has an empty name; everything else has its basename.
     name_ptr: Ptr[uint8] = &node_name[node * NAME_CAP]
     name_len: uint64 = node_namelen[node]
+    uid_l: uint64 = _dfs_uitoa(node_uid[node], &uid_str_buf[0])
+    gid_l: uint64 = _dfs_uitoa(node_gid[node], &gid_str_buf[0])
     c: P9Cursor
     p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
     n: int32 = p9_emit_rstat(&c, tg, 0, 0,
                              qt, node_vers[node], node + 1,
                              mode_bits, 0, 0, node_size[node],
                              name_ptr, name_len,
-                             &ident_buf[0], 6,
-                             &ident_buf[0], 6,
-                             &ident_buf[0], 6)
+                             &uid_str_buf[0], uid_l,
+                             &gid_str_buf[0], gid_l,
+                             &uid_str_buf[0], uid_l)
     if n < 0:
         return -1
     return _send_rmsg(n)

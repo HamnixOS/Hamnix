@@ -90,7 +90,7 @@ from fs.vfs import (
     # symlink(2)/link(2)/utimensat(2): the VFS backends for these were
     # implemented but never wired into the Linux-ABI dispatch.
     vfs_symlink, vfs_link, vfs_set_mtime,
-    vfs_fsync_all, vfs_fd_mtime, vfs_fd_mode,
+    vfs_fsync_all, vfs_fd_mtime, vfs_fd_mode, vfs_fd_owner,
     vfs_fd_is_dir, vfs_fd_dir_buf, vfs_fd_dir_buflen,
     vfs_fd_dir_pos, vfs_fd_dir_set_pos,
     vfs_alloc_socket_fd, vfs_fd_is_socket, vfs_fd_is_open,
@@ -1906,6 +1906,73 @@ def _u_open(a0: uint64, a1: uint64, a2: uint64,
     return _u_open_kpath(cast[Ptr[char]](&upath[0]), flags)
 
 
+# --- Linux-ABI per-file POSIX DAC (discretionary access control) ------
+#
+# The native Plan-9 server-boundary perm gate (fs/vfs.ad
+# chan_permission_check) classifies a file by its RESOLVED PATH STRING and
+# routes to that server's _perm_check. That works when the path string and
+# the real backend agree — but a per-file cross-server bind (e.g. the Linux
+# NS's `bind '#r/etc/shadow' /etc/shadow` overlaying a cpio file onto a
+# tmpfs/distro `/etc`) makes the string classify as the WRONG server, so
+# the wrong (permissive) policy runs and a root-owned 0600 file stays
+# readable to a non-root Linux user. That was the #497-flagged /etc/shadow
+# leak.
+#
+# This gate closes it at the Linux-ABI boundary, keyed off the MAPPED Linux
+# uid, using the OPENED fd's REAL backend mode + owner (vfs_fd_mode /
+# vfs_fd_owner) — authoritative regardless of how the path string
+# classified. Linux root (mapped uid 0 == native hostowner) BYPASSES every
+# check, so apt/dpkg (which run as root in the Linux NS) are completely
+# unaffected — the gate only ever executes its body for a non-root caller.
+# A backend whose mode/owner is unknown (mounted-9P distrofs, etc.) DEFERS
+# to the server-boundary policy that already ran in vfs_open (returns
+# "allow" here) rather than blanket-denying a non-root user the whole NS.
+DAC_WANT_R: int64 = 4
+DAC_WANT_W: int64 = 2
+DAC_WANT_X: int64 = 1
+
+
+def _u_dac_perm(mode: uint32, owner_uid: uint32, owner_gid: uint32,
+                want: int64) -> int64:
+    # Standard POSIX rwx triad selection against the CALLER's mapped Linux
+    # uid/gid. Returns 0 (grant) or ELINUX_ACCES (-13, deny). Root (mapped
+    # uid 0) bypasses.
+    caller_uid: int64 = _linux_uid_from_native(current_task_uid())
+    if caller_uid == 0:
+        return 0
+    caller_gid: int64 = _linux_uid_from_native(current_task_gid())
+    perm: uint32 = mode & cast[uint32](0o777)
+    bits: uint32 = 0
+    if caller_uid == cast[int64](owner_uid):
+        bits = (perm >> 6) & cast[uint32](7)          # owner triple
+    elif caller_gid == cast[int64](owner_gid):
+        bits = (perm >> 3) & cast[uint32](7)          # group triple
+    else:
+        bits = perm & cast[uint32](7)                 # other triple
+    w: uint32 = cast[uint32](want) & cast[uint32](7)
+    if (bits & w) == w:
+        return 0
+    return ELINUX_ACCES
+
+
+def _u_dac_check_fd(fd: int32, want: int64) -> int64:
+    # DAC-check an OPEN fd for `want` (DAC_WANT_R/W/X) against the caller's
+    # mapped Linux identity, using the fd's real backend mode + owner.
+    # 0 = grant; ELINUX_ACCES = deny. Root bypasses (cheap early return).
+    # Unknown mode/owner (-1) DEFERS (grant) — see the header note.
+    caller_uid: int64 = _linux_uid_from_native(current_task_uid())
+    if caller_uid == 0:
+        return 0
+    m: int32 = vfs_fd_mode(fd)
+    if m < 0:
+        return 0
+    o_uid: uint32 = 0
+    o_gid: uint32 = 0
+    if vfs_fd_owner(fd, &o_uid, &o_gid) != 0:
+        return 0
+    return _u_dac_perm(cast[uint32](m), o_uid, o_gid, want)
+
+
 def _u_open_kpath(upath: Ptr[char], flags: uint64) -> int64:
     # open(2) core operating on a KERNEL path buffer (`upath`), already
     # copied in / anchored by the caller. Shared by _u_open (user path) and
@@ -1961,6 +2028,27 @@ def _u_open_kpath(upath: Ptr[char], flags: uint64) -> int64:
         do_trunc: int32 = 0
         if (flags & 0x200) != 0:                        # O_TRUNC
             do_trunc = 1
+        # DAC (non-root only): a write-open of an EXISTING file must check
+        # the WRITE bit BEFORE vfs_open_write_t (which may O_TRUNC it). We
+        # probe-open the file read-only to obtain its real backend mode +
+        # owner; if it exists and the caller lacks write, deny with EACCES
+        # before any truncation. A genuinely-absent file (-ENOENT) is a
+        # create — allowed here (parent-directory write policy is enforced
+        # by the backend/server boundary). Root short-circuits inside
+        # _u_dac_check_fd, so this whole probe is skipped for apt/dpkg.
+        if _linux_uid_from_native(current_task_uid()) != 0:
+            wp: int32 = vfs_open(upath)
+            if wp >= 0:
+                wdac: int64 = _u_dac_check_fd(wp, DAC_WANT_W)
+                vfs_close(wp)
+                if wdac != 0:
+                    set_current_errstr("open: permission denied")
+                    return wdac
+            elif wp != -2:
+                # Existing-but-unreadable / other error on the probe: deny
+                # the write for a non-root caller rather than fall through.
+                set_current_errstr("open: permission denied")
+                return ELINUX_ACCES
         rc = vfs_open_write_t(upath, do_trunc)
         if rc == -2:
             set_current_errstr("file does not exist")
@@ -1970,8 +2058,17 @@ def _u_open_kpath(upath: Ptr[char], flags: uint64) -> int64:
     rc = vfs_open(upath)
     if rc == -2:
         set_current_errstr("file does not exist")
+        return cast[int64](rc)
     elif rc < 0:
         set_current_errstr("open: failed")
+        return cast[int64](rc)
+    # DAC (non-root only): enforce the READ bit against the fd's real
+    # backend mode + owner. Root bypasses inside _u_dac_check_fd.
+    rdac: int64 = _u_dac_check_fd(rc, DAC_WANT_R)
+    if rdac != 0:
+        vfs_close(rc)
+        set_current_errstr("open: permission denied")
+        return rdac
     return cast[int64](rc)
 
 
