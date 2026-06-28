@@ -232,6 +232,65 @@ def sr_reset_stats():
 
 
 # -----------------------------------------------------------------------
+# Instruction selection (--opt, Phase 3). OFF by default: isel_is_enabled()
+# returns 0 unless the dump driver armed it under --opt (isel_enable()). When
+# OFF, gen_index_addr emits the byte-identical pre-existing
+# scale-rcx + lea-base + add-rcx sequence. When ON, the scale-shift + separate
+# base-lea + add tail of an array/pointer element-address computation is folded
+# into a single `lea` using x86 scaled-index (SIB) addressing for the scales
+# the CPU supports natively (1/2/4/8):
+#   * local array   `a[i]`  -> lea disp(%rbp, %rcx, s), %rax   (3 insns -> 1)
+#   * global array  `g[i]`  -> lea (%rax, %rcx, s), %rax       (after the rip
+#                              base-lea; folds the shl+add into 1 lea)
+#   * pointer/scalar base    -> lea (%rax, %rcx, s), %rax       (after loading
+#                              the held pointer value into %rax)
+# The computed ELEMENT ADDRESS is bit-identical to the stack-machine form; only
+# the instruction selection changes. Correctness is differentially gated by the
+# ADDER_OPT=1 fuzzer lane (array/pointer/memory-ALU shapes) + scripts/
+# test_opt_isel.sh. Non-power-of-2 strides (multi-dim row blocks) keep the
+# imul+add path — SIB cannot express them.
+# -----------------------------------------------------------------------
+isel_enabled: uint32 = 0
+opt_isel_count: uint32 = 0
+
+
+def isel_enable():
+    isel_enabled = 1
+
+
+def isel_is_enabled() -> uint32:
+    return isel_enabled
+
+
+def isel_reset_stats():
+    opt_isel_count = 0
+
+
+# True for the element strides x86 SIB scale can express directly (1/2/4/8).
+def isel_scale_ok(es: uint32) -> uint32:
+    if es == 1:
+        return 1
+    if es == 2:
+        return 1
+    if es == 4:
+        return 1
+    if es == 8:
+        return 1
+    return 0
+
+
+# Map an element size 1/2/4/8 to the SIB scale field bits (00/01/10/11).
+def isel_scale_bits(es: uint32) -> uint32:
+    if es == 2:
+        return 1
+    if es == 4:
+        return 2
+    if es == 8:
+        return 3
+    return 0                              # es == 1
+
+
+# -----------------------------------------------------------------------
 # Output buffer: flat machine-code bytes.
 # -----------------------------------------------------------------------
 
@@ -3588,6 +3647,39 @@ def emit_lea_local_rax(off: int32):
     emit_rbp_mem(0x45, off)
 
 
+# leaq disp(%rbp, %rcx, scale), %rax  -> 48 8D <modrm> <SIB> <disp>
+# A scaled-index frame-array element address folded into ONE lea (isel).
+#   REX.W = 48; opcode 8D (lea); reg field = %rax (000).
+#   ModRM rm = 100 selects a SIB byte; mod = 01 (disp8) or 10 (disp32) because
+#   the %rbp base (SIB base = 101) cannot be encoded with mod=00.
+#   SIB = scale(2) << 6 | index(%rcx=001) << 3 | base(%rbp=101).
+# `sbits` is the SIB scale field (0/1/2/3 for *1/*2/*4/*8).
+def emit_lea_local_sib_rax(off: int32, sbits: uint32):
+    emit_b(0x48)
+    emit_b(0x8D)
+    sib: uint32 = (sbits << 6) + (1 << 3) + 5    # scale|index=rcx|base=rbp
+    if disp_fits8(off) != 0:
+        emit_b(0x44)                     # mod=01, reg=rax(000), rm=100(SIB)
+        emit_b(sib)
+        emit_b(cast[uint32](off) & 255)
+    else:
+        emit_b(0x84)                     # mod=10, reg=rax(000), rm=100(SIB)
+        emit_b(sib)
+        emit_disp32(off)
+
+
+# leaq (%rax, %rcx, scale), %rax  -> 48 8D 04 <SIB>
+# Fold a scale-shift + add of an index into a base address already held in %rax
+# (a rip-relative global base, or a loaded pointer value). No displacement.
+#   REX.W=48; opcode 8D; ModRM = mod=00, reg=%rax(000), rm=100(SIB) -> 0x04.
+#   SIB = scale(2) << 6 | index(%rcx=001) << 3 | base(%rax=000).
+def emit_lea_base_rax_index_rcx(sbits: uint32):
+    emit_b(0x48)
+    emit_b(0x8D)
+    emit_b(0x04)                         # mod=00, reg=rax, rm=SIB
+    emit_b((sbits << 6) + (1 << 3) + 0)  # scale|index=rcx|base=rax
+
+
 # leaq <data_off>(%rip), %rax  -> 48 8D 05 <rel32>   (address of a global /
 # string in the data section). The rel32 is a placeholder; a data fixup is
 # recorded against the global's data offset and patched after layout, so it
@@ -6014,6 +6106,42 @@ def gen_index_addr(node: uint32):
     # address. Result address ends up in %rax.
     gen_expr(nd_b[node])
     emit_mov_rax_rcx()
+
+    # ---- ISEL (--opt): fold scale-shift + base-lea/load + add into a single
+    # scaled-index `lea`. The index is already in %rcx; the SIB scale field
+    # expresses *1/*2/*4/*8 natively, so we only need to materialise the base
+    # and emit one lea. The computed element address is bit-identical to the
+    # scale/add form below. Non-power-of-2 strides fall through to that form.
+    if isel_is_enabled() != 0 and isel_scale_ok(es) != 0:
+        sb: uint32 = isel_scale_bits(es)
+        if arr_local != 0:
+            # lea disp(%rbp, %rcx, s), %rax  — fold base-lea + scale + add.
+            emit_lea_local_sib_rax(off, sb)
+            opt_isel_count = opt_isel_count + 1
+            return
+        if ptr_local != 0 or scalar_ptr == 1:
+            # Base = a pointer value held in a frame slot: load it to %rax,
+            # then lea (%rax, %rcx, s), %rax (fold scale + add).
+            emit_load_local_rax(off)
+            emit_lea_base_rax_index_rcx(sb)
+            opt_isel_count = opt_isel_count + 1
+            return
+        if arr_glob != 0:
+            # Base = rip-relative global array address: lea it to %rax, then
+            # lea (%rax, %rcx, s), %rax (rip form cannot carry a SIB index, so
+            # the base-lea stays; we still fold the scale-shift + add).
+            emit_lea_global_rax(gdoff, gbss)
+            emit_lea_base_rax_index_rcx(sb)
+            opt_isel_count = opt_isel_count + 1
+            return
+        # scalar_ptr == 2 or Ptr[T] global: load the held pointer value, then
+        # fold scale + add via the index lea.
+        emit_lea_global_rax(gdoff, gbss)
+        emit_load_mem_rax(8)
+        emit_lea_base_rax_index_rcx(sb)
+        opt_isel_count = opt_isel_count + 1
+        return
+
     emit_scale_rcx(es)
     if arr_local != 0:
         emit_lea_local_rax(off)
