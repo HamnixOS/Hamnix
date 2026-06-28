@@ -283,6 +283,133 @@ def isel_reset_stats():
     opt_storeelim_count = 0
 
 
+# -----------------------------------------------------------------------
+# CMP+JCC condition lowering (--opt, branch-condition lever). OFF by default:
+# cmpjcc_is_enabled() returns 0 unless armed under --opt (cmpjcc_enable()). When
+# OFF, every if/while/for/do-while condition and short-circuit &&/|| edge runs
+# the byte-identical materialize-a-0/1-boolean path (gen_expr -> cmp; setcc;
+# movzx then test; jz). When ON, a comparison (== != < <= > >=, signed AND
+# unsigned) that feeds DIRECTLY into a conditional branch is lowered to a
+# 2-instruction `cmp <a>,<b>; jcc <target>` with the correct condition code for
+# the operator + branch sense, instead of the ~8-instruction boolean. The
+# comparison's VALUE is NOT materialized in this case (it is only used to pick a
+# branch). When the comparison's value IS used (assigned/returned/stored/passed/
+# arithmetic), the boolean-materialization path is UNCHANGED. Correctness is
+# differentially gated by the ADDER_OPT=1 fuzzer lane + scripts/test_opt_cmpjcc.sh
+# (signed-vs-unsigned jcc, branch-if-true vs branch-if-false, value-use cases).
+# -----------------------------------------------------------------------
+cmpjcc_enabled: uint32 = 0
+opt_cmpjcc_count: uint32 = 0
+
+
+def cmpjcc_enable():
+    cmpjcc_enabled = 1
+
+
+def cmpjcc_is_enabled() -> uint32:
+    return cmpjcc_enabled
+
+
+def cmpjcc_reset_stats():
+    opt_cmpjcc_count = 0
+
+
+def cmpjcc_get_count() -> uint32:
+    return opt_cmpjcc_count
+
+
+# Map a relational BINOP to the SIGNED jcc opcode byte for `branch-if-TRUE`
+# (i.e. take the branch when `left OP right` holds), given the cmp computed
+# `left - right` (cmpq %rcx,%rax with rax=left, rcx=right). The returned byte
+# is the second opcode byte of `0F 8X rel32`:
+#   ==  je  84   !=  jne 85
+#   signed   <  jl 8C   <=  jle 8E   >  jg 8F   >=  jge 8D
+# Unsigned overrides (l_sgn or r_sgn known-unsigned) are applied by rel_jcc.
+# Returns 0 (an invalid jcc byte) for a non-relational op.
+def rel_jcc_signed(op: uint32) -> uint32:
+    if op == BINOP_EQ:
+        return 0x84
+    if op == BINOP_NEQ:
+        return 0x85
+    if op == BINOP_LT:
+        return 0x8C
+    if op == BINOP_LTE:
+        return 0x8E
+    if op == BINOP_GT:
+        return 0x8F
+    if op == BINOP_GTE:
+        return 0x8D
+    return 0
+
+
+# Apply the unsigned override to a signed jcc opcode byte. Mirrors rel_setcc:
+# when EITHER operand is known-unsigned (signedness tristate == 1) the ordered
+# compares switch to the unsigned family:
+#   jl 8C -> jb 82   jle 8E -> jbe 86   jg 8F -> ja 87   jge 8D -> jae 83
+# Equality (je 84 / jne 85) is signedness-agnostic and unchanged.
+def rel_jcc(op: uint32, l_sgn: uint32, r_sgn: uint32) -> uint32:
+    cc: uint32 = rel_jcc_signed(op)
+    if l_sgn == 1 or r_sgn == 1:
+        if cc == 0x8C:        # jl  -> jb
+            return 0x82
+        if cc == 0x8E:        # jle -> jbe
+            return 0x86
+        if cc == 0x8F:        # jg  -> ja
+            return 0x87
+        if cc == 0x8D:        # jge -> jae
+            return 0x83
+    return cc
+
+
+# Negate a jcc opcode byte (branch-if-TRUE -> branch-if-FALSE). On x86 the
+# inverse condition flips the low bit of the tttn field, which for the 0F 8X
+# encoding is exactly the low bit of the opcode byte:
+#   je 84 <-> jne 85   jl 8C <-> jge 8D   jle 8E <-> jg 8F
+#   jb 82 <-> jae 83   jbe 86 <-> ja 87
+def jcc_negate(cc: uint32) -> uint32:
+    return cc ^ 1
+
+
+# True iff `op` is one of the six relational comparison BINOPs that can be
+# lowered directly to a cmp+jcc when feeding a conditional branch.
+def is_rel_binop(op: uint32) -> uint32:
+    if op == BINOP_EQ:
+        return 1
+    if op == BINOP_NEQ:
+        return 1
+    if op == BINOP_LT:
+        return 1
+    if op == BINOP_LTE:
+        return 1
+    if op == BINOP_GT:
+        return 1
+    if op == BINOP_GTE:
+        return 1
+    return 0
+
+
+# True iff `node` is an INTEGER comparison ND_BINARY suitable for the cmp+jcc
+# direct-branch lowering: a relational BINOP whose operands are both NON-float
+# (the float compares route to the SSE _emit_fp_setcc path, which the cmp+jcc
+# integer form would miscompile — NaN-unordered semantics differ). The opt flag
+# must be armed. Used by gen_cond_branch to decide direct-branch vs materialize.
+def cmpjcc_node_ok(node: uint32) -> uint32:
+    if cmpjcc_is_enabled() == 0:
+        return 0
+    if node == 0:
+        return 0
+    if nd_kind[node] != ND_BINARY:
+        return 0
+    if is_rel_binop(nd_aux[node]) == 0:
+        return 0
+    # Float operands -> SSE compare path; not an integer cmp+jcc.
+    if expr_float_width(nd_a[node]) != 0:
+        return 0
+    if expr_float_width(nd_b[node]) != 0:
+        return 0
+    return 1
+
+
 # True for the element strides x86 SIB scale can express directly (1/2/4/8).
 def isel_scale_ok(es: uint32) -> uint32:
     if es == 1:
@@ -4206,6 +4333,27 @@ def emit_jnz_fwd() -> uint32:
     return at
 
 
+# Generic forward jcc -> 0F <cc> rel32 (placeholder). `cc` is the second opcode
+# byte (0x82..0x8F: jb/jae/je/jne/jbe/ja/jl/jge/jle/jg). Returns rel32-field
+# offset. Used by the cmp+jcc branch-condition lever (gen_cmp_branch_fwd).
+def emit_jcc_fwd(cc: uint32) -> uint32:
+    emit_b(0x0F)
+    emit_b(cc & 255)
+    at: uint32 = code_len
+    emit_imm32(cast[uint64](0))
+    return at
+
+
+# Generic jcc to a KNOWN (earlier) target -> 0F <cc> rel32 (resolved). Used by
+# the do-while back-edge under the cmp+jcc lever (jcc start when cond TRUE).
+def emit_jcc_back(cc: uint32, target: uint32):
+    emit_b(0x0F)
+    emit_b(cc & 255)
+    at: uint32 = code_len
+    emit_imm32(cast[uint64](0))
+    patch_rel32(at, target)
+
+
 # jmp rel32 to a KNOWN (earlier) target — emits the resolved displacement.
 def emit_jmp_back(target: uint32):
     emit_b(0xE9)
@@ -5562,14 +5710,14 @@ def gen_expr(node: uint32):
         # result. Result (0/1) lands in %rax, so callers that test it (if/while/
         # bool assignment) are unchanged.
         if op == BINOP_AND:
-            # <eval left>; testq; jz false; <eval right>; testq; jz false;
+            # <branch-if-false left -> false>; <branch-if-false right -> false>;
             # movq $1,%rax; jmp end; false: xorl %eax,%eax; end:
-            gen_expr(nd_a[node])
-            emit_test_rax_rax()
-            f1: uint32 = emit_jz_fwd()
-            gen_expr(nd_b[node])
-            emit_test_rax_rax()
-            f2: uint32 = emit_jz_fwd()
+            # The two internal control edges use cmp+jcc when their operand is a
+            # direct comparison (gen_branch_if_false); else materialize+test+jz.
+            # The &&'s own 0/1 RESULT is still materialized in %rax (the value is
+            # used), so off-flag output stays byte-identical.
+            f1: uint32 = gen_branch_if_false(nd_a[node])
+            f2: uint32 = gen_branch_if_false(nd_b[node])
             emit_mov_imm_rax(cast[uint64](1))
             e1: uint32 = emit_jmp_fwd()
             patch_rel32(f1, code_len)
@@ -5578,14 +5726,10 @@ def gen_expr(node: uint32):
             patch_rel32(e1, code_len)
             return
         if op == BINOP_OR:
-            # <eval left>; testq; jnz true; <eval right>; testq; jnz true;
+            # <branch-if-true left -> true>; <branch-if-true right -> true>;
             # xorl %eax,%eax; jmp end; true: movq $1,%rax; end:
-            gen_expr(nd_a[node])
-            emit_test_rax_rax()
-            t1: uint32 = emit_jnz_fwd()
-            gen_expr(nd_b[node])
-            emit_test_rax_rax()
-            t2: uint32 = emit_jnz_fwd()
+            t1: uint32 = gen_branch_if_true(nd_a[node])
+            t2: uint32 = gen_branch_if_true(nd_b[node])
             emit_xor_eax_eax()
             e2: uint32 = emit_jmp_fwd()
             patch_rel32(t1, code_len)
@@ -8765,6 +8909,75 @@ def gen_assign_index(node: uint32):
     emit_store_mem_rcx(es)
 
 
+# -----------------------------------------------------------------------
+# CMP+JCC direct-branch condition lowering (--opt). A comparison feeding a
+# conditional branch emits `cmp; jcc <target>` instead of materializing a 0/1
+# boolean (cmp; setcc; movzx) and then re-testing it (test; jz). The two
+# entry points below replace the gen_expr+test+jz / +jnz idiom in if/while/
+# for/do-while and the short-circuit &&/|| edges. They evaluate the comparison
+# operands with the SAME schedule as the gen_expr AST binary-compare path
+# (eval right -> push; eval left -> %rax; pop %rcx; cmpq %rcx,%rax — so %rax=
+# left, %rcx=right, flags reflect `left OP right`), then emit ONE jcc with the
+# operator's condition code (signed/unsigned per the operand types), negated
+# for branch-if-false. The comparison's VALUE is never written to %rax, so
+# these are ONLY safe when the value is unused (a pure branch).
+# -----------------------------------------------------------------------
+
+# Emit the operand evaluation + `cmpq %rcx,%rax` for the integer comparison
+# `node` and return the branch-if-TRUE jcc opcode byte (signed/unsigned aware).
+# Caller must have verified cmpjcc_node_ok(node) != 0. Bumps the fired counter.
+def gen_cmp_setup(node: uint32) -> uint32:
+    op: uint32 = nd_aux[node]
+    l_sgn: uint32 = expr_signedness(nd_a[node])
+    r_sgn: uint32 = expr_signedness(nd_b[node])
+    # Same eval order as the gen_expr ND_BINARY compare path.
+    gen_expr(nd_b[node])
+    emit_push_rax()
+    gen_expr(nd_a[node])
+    emit_pop_rcx()
+    emit_cmp_rcx_rax()
+    opt_cmpjcc_count = opt_cmpjcc_count + 1
+    return rel_jcc(op, l_sgn, r_sgn)
+
+
+# Emit a FORWARD branch taken when `cond` is FALSE, returning the rel32-field
+# fixup the caller backpatches to the skip/exit target. Under the cmp+jcc lever
+# (cond is a direct integer comparison) this is `cmp; jcc(negated)`; otherwise
+# it falls back to the byte-identical materialize path (gen_expr; testq; jz).
+def gen_branch_if_false(cond: uint32) -> uint32:
+    if cmpjcc_node_ok(cond) != 0:
+        cc: uint32 = gen_cmp_setup(cond)
+        return emit_jcc_fwd(jcc_negate(cc))
+    gen_expr(cond)
+    emit_test_rax_rax()
+    return emit_jz_fwd()
+
+
+# Emit a FORWARD branch taken when `cond` is TRUE, returning the rel32-field
+# fixup. cmp+jcc when `cond` is a direct comparison, else gen_expr; testq; jnz.
+# Used by the short-circuit &&/|| edges.
+def gen_branch_if_true(cond: uint32) -> uint32:
+    if cmpjcc_node_ok(cond) != 0:
+        cc: uint32 = gen_cmp_setup(cond)
+        return emit_jcc_fwd(cc)
+    gen_expr(cond)
+    emit_test_rax_rax()
+    return emit_jnz_fwd()
+
+
+# Emit a BACKWARD branch to a KNOWN target taken when `cond` is TRUE. cmp+jcc
+# when `cond` is a direct comparison, else gen_expr; testq; jnz target. Used by
+# the do-while back-edge (`loop while cond`).
+def gen_branch_if_true_back(cond: uint32, target: uint32):
+    if cmpjcc_node_ok(cond) != 0:
+        cc: uint32 = gen_cmp_setup(cond)
+        emit_jcc_back(cc, target)
+        return
+    gen_expr(cond)
+    emit_test_rax_rax()
+    emit_jnz_back(target)
+
+
 # if / elif* / else  (mirrors codegen_x86.gen_if). The parser stores the
 # condition on nd_a, then-body chain on nd_b, an ND_ELIF sibling-chain on
 # nd_c, and the else-body chain on nd_d.
@@ -8774,12 +8987,9 @@ def gen_if(node: uint32):
     end_fix: Array[64, uint32]
     end_n: uint32 = 0
 
-    # Primary condition.
-    gen_expr(nd_a[node])
-    emit_test_rax_rax()
-    # Jump over the then-body when false; patched to the next branch (or
-    # the end if there is none).
-    skip: uint32 = emit_jz_fwd()
+    # Primary condition. Jump over the then-body when false (cmp+jcc under the
+    # lever, else materialize+test+jz); patched to the next branch / else / end.
+    skip: uint32 = gen_branch_if_false(nd_a[node])
     gen_block(nd_b[node])
     end_fix[end_n] = emit_jmp_fwd()
     end_n = end_n + 1
@@ -8789,9 +8999,7 @@ def gen_if(node: uint32):
     # elif chain.
     e: uint32 = nd_c[node]
     while e != 0:
-        gen_expr(nd_a[e])
-        emit_test_rax_rax()
-        skip2: uint32 = emit_jz_fwd()
+        skip2: uint32 = gen_branch_if_false(nd_a[e])
         gen_block(nd_b[e])
         end_fix[end_n] = emit_jmp_fwd()
         end_n = end_n + 1
@@ -8823,9 +9031,7 @@ def gen_while(node: uint32):
     loop_brk_n[depth] = 0
     loop_depth = loop_depth + 1
 
-    gen_expr(nd_a[node])
-    emit_test_rax_rax()
-    exit_fix: uint32 = emit_jz_fwd()
+    exit_fix: uint32 = gen_branch_if_false(nd_a[node])
     gen_block(nd_b[node])
     emit_jmp_back(start)
     # Exit point: backpatch the condition-false jump AND every `break`.
@@ -8858,9 +9064,7 @@ def gen_do_while(node: uint32):
     # cont: the condition test is `continue`'s target.
     cont_at: uint32 = code_len
     loop_cont_target[depth] = cont_at
-    gen_expr(nd_a[node])
-    emit_test_rax_rax()
-    emit_jnz_back(start)
+    gen_branch_if_true_back(nd_a[node], start)
     # end: backpatch every `break` to here.
     i: uint32 = 0
     while i < loop_brk_n[depth]:
@@ -8975,13 +9179,25 @@ def gen_for_range(node: uint32):
     emit_load_for_var(node)               # i -> %rax (signed int64 load)
     emit_pop_rcx()                        # stop -> %rcx
     emit_cmp_rcx_rax()
-    if descending != 0:
-        emit_setcc_al(0x9F)               # setg (signed >)
+    exit_fix: uint32 = 0
+    if cmpjcc_is_enabled() != 0:
+        # cmp+jcc lever: branch to the exit when the loop condition is FALSE.
+        # ascending continues while i < stop -> exit on jge (signed);
+        # descending continues while i > stop -> exit on jle (signed).
+        # These are exactly jcc_negate(jl)/jcc_negate(jg).
+        opt_cmpjcc_count = opt_cmpjcc_count + 1
+        if descending != 0:
+            exit_fix = emit_jcc_fwd(0x8E)     # jle (signed): !(i > stop)
+        else:
+            exit_fix = emit_jcc_fwd(0x8D)     # jge (signed): !(i < stop)
     else:
-        emit_setcc_al(0x9C)               # setl (signed <)
-    emit_movzx_al_rax()
-    emit_test_rax_rax()
-    exit_fix: uint32 = emit_jz_fwd()
+        if descending != 0:
+            emit_setcc_al(0x9F)               # setg (signed >)
+        else:
+            emit_setcc_al(0x9C)               # setl (signed <)
+        emit_movzx_al_rax()
+        emit_test_rax_rax()
+        exit_fix = emit_jz_fwd()
 
     gen_block(nd_b[node])
 
@@ -9043,10 +9259,16 @@ def gen_for_array(node: uint32, n: uint32, idx_off: int32, elem_sz: uint32):
     emit_load_local_rax(idx_off)
     emit_pop_rcx()                        # n -> %rcx
     emit_cmp_rcx_rax()
-    emit_setcc_al(0x9C)                   # setl (idx < n, signed)
-    emit_movzx_al_rax()
-    emit_test_rax_rax()
-    exit_fix: uint32 = emit_jz_fwd()
+    exit_fix: uint32 = 0
+    if cmpjcc_is_enabled() != 0:
+        # cmp+jcc lever: continue while idx < n -> exit on jge (signed).
+        opt_cmpjcc_count = opt_cmpjcc_count + 1
+        exit_fix = emit_jcc_fwd(0x8D)     # jge (signed): !(idx < n)
+    else:
+        emit_setcc_al(0x9C)               # setl (idx < n, signed)
+        emit_movzx_al_rax()
+        emit_test_rax_rax()
+        exit_fix = emit_jz_fwd()
 
     # var = arr[idx]: &arr[idx] = base + idx*elem; load sized.
     # Compute idx scaled, add the array base. The array iterable is nd_a.
