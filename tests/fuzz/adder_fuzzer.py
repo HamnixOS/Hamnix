@@ -505,6 +505,8 @@ class Program:
         self._gen_do_while_traffic(env)   # do/while
         self._gen_float_traffic(env)      # scalar SSE float32/float64
         self._gen_loop(env)
+        self._gen_nested_loop_traffic(env)    # nested loops: reset-and-read +
+                                              # break/continue/early-return/cross-level
         self._gen_short_circuit_traffic(env)  # logical and/or short-circuit
         self._gen_helper_calls(env)
 
@@ -849,6 +851,237 @@ class Program:
             lsum += I64.wrap(li * step) if li < thr else li
             lsum &= umask(64)
         self._fold_value("lsum", lsum)
+
+    # ---- nested-loop traffic (reset-and-read + general nested control flow) ---
+    #
+    # Exercises the control-flow shape that the bench (docs/bench_opt_results.md)
+    # found MISCOMPILED under ADDER_OPT=1: an inner loop sitting BETWEEN a local's
+    # def and its read across outer-loop iterations. The earlier `_gen_loop` only
+    # emitted a SINGLE flat loop with a straight-line body, so the register
+    # allocator's program-point numbering bug (a block CREATED before it is FILLED
+    # — a while's exit/join block — getting a stale `bb_first` snapshot that placed
+    # its span INSIDE the loop body, truncating a live-through value's range) was
+    # never triggered. These shapes force nested loops, loops inside ifs,
+    # break/continue in nested loops, an early return guarded so it stays
+    # deterministic, and accumulators mutated across nesting levels. Every shape is
+    # simulated exactly in Python and folded into g_accum, so the by-construction
+    # oracle has ground truth and any miscompile DIVERGES.
+    #
+    # All locals get a per-call unique suffix so repeated invocations / other
+    # generators never collide on a name.
+    def _gen_nested_loop_traffic(self, env):
+        rng = self.rng
+        if not hasattr(self, "_nl_uid"):
+            self._nl_uid = 0
+        # Emit between 2 and 4 distinct nested-loop shapes. Each shape is a
+        # SELF-CONTAINED HELPER FUNCTION with FEW locals, then CALLED from main
+        # with the result folded into g_accum. Isolating each shape in its own
+        # low-pressure function is what makes the register-allocator bug FIRE
+        # DETERMINISTICALLY: the bug truncates a loop-spanning local's live range
+        # so a LATER value reuses its register; in a huge main() full of locals
+        # the truncated value may not collide / may be spilled, masking it. A
+        # tight helper guarantees the live-through accumulator and the loop
+        # counter want the same callee-saved register, so the collision shows.
+        for _ in range(rng.randint(2, 4)):
+            shape = rng.choice([
+                "reset_read",       # the exact bench-failing shape
+                "loop_in_if",       # loop nested inside an if inside a loop
+                "break_continue",   # break/continue inside the inner loop
+                "early_return_acc", # early return out of nested loops
+                "cross_level_acc",  # accumulator mutated across nesting levels
+            ])
+            self._nl_uid += 1
+            u = self._nl_uid
+            if shape == "reset_read":
+                self._nl_reset_read(u)
+            elif shape == "loop_in_if":
+                self._nl_loop_in_if(u)
+            elif shape == "break_continue":
+                self._nl_break_continue(u)
+            elif shape == "early_return_acc":
+                self._nl_early_return(u)
+            else:
+                self._nl_cross_level(u)
+
+    # Helper that emits a standalone int64 function `fn` (its body lines already
+    # built) and a call to it from main, folding the returned value (computed by
+    # the oracle `res`) into g_accum.
+    def _nl_emit_helper(self, fn, sig, body_lines, call_args, res):
+        self.emit_top(f"def {fn}({sig}) -> int64:")
+        for ln in body_lines:
+            self.emit_top("    " + ln)
+        self.emit_top("")
+        hc = f"{fn}_v"
+        self.emit(f"    {hc}: int64 = {fn}({call_args})")
+        self._fold_value(f"cast[uint64]({hc})", U64.wrap(res))
+
+    # Exact bench repro shape: outer loop; a LOCAL re-initialised each outer pass,
+    # an INNER loop that mutates it, then a READ after the inner loop.
+    def _nl_reset_read(self, u):
+        rng = self.rng
+        reps = rng.randint(2, 6); inner = rng.randint(1, 7)
+        base = rng.randint(0, 5); step = rng.randint(1, 4)
+        fn = f"nl_rr_{u}"
+        body = [
+            "acc: int64 = cast[int64](0)",
+            "r: int64 = cast[int64](0)",
+            "while r < reps:",
+            "    cnt: int64 = base",
+            "    i: int64 = cast[int64](0)",
+            "    while i < inner:",
+            "        cnt = cnt + step",
+            "        i = i + cast[int64](1)",
+            "    acc = acc + cnt",
+            "    r = r + cast[int64](1)",
+            "return acc",
+        ]
+        acc = 0
+        for _r in range(reps):
+            cnt = base
+            for _i in range(inner):
+                cnt += step
+            acc += cnt
+        self._nl_emit_helper(
+            fn, "reps: int64, inner: int64, base: int64, step: int64", body,
+            f"cast[int64]({reps}), cast[int64]({inner}), "
+            f"cast[int64]({base}), cast[int64]({step})", acc)
+
+    # Inner loop nested inside an `if` inside the outer loop.
+    def _nl_loop_in_if(self, u):
+        rng = self.rng
+        reps = rng.randint(3, 7); inner = rng.randint(1, 5)
+        thr = rng.randint(0, reps)
+        fn = f"nl_lif_{u}"
+        body = [
+            "acc: int64 = cast[int64](0)",
+            "r: int64 = cast[int64](0)",
+            "while r < reps:",
+            "    v: int64 = cast[int64](1)",
+            "    if r < thr:",
+            "        i: int64 = cast[int64](0)",
+            "        while i < inner:",
+            "            v = v + r",
+            "            i = i + cast[int64](1)",
+            "    acc = acc + v",
+            "    r = r + cast[int64](1)",
+            "return acc",
+        ]
+        acc = 0
+        for r in range(reps):
+            v = 1
+            if r < thr:
+                for _i in range(inner):
+                    v += r
+            acc += v
+        self._nl_emit_helper(
+            fn, "reps: int64, inner: int64, thr: int64", body,
+            f"cast[int64]({reps}), cast[int64]({inner}), cast[int64]({thr})", acc)
+
+    # break/continue inside the inner loop, accumulator read after it.
+    def _nl_break_continue(self, u):
+        rng = self.rng
+        reps = rng.randint(2, 5); inner = rng.randint(2, 8)
+        brk = rng.randint(1, inner); skip = rng.randint(0, inner)
+        fn = f"nl_bc_{u}"
+        body = [
+            "acc: int64 = cast[int64](0)",
+            "r: int64 = cast[int64](0)",
+            "while r < reps:",
+            "    cnt: int64 = cast[int64](0)",
+            "    i: int64 = cast[int64](0)",
+            "    while i < inner:",
+            "        i = i + cast[int64](1)",
+            "        if i == skip:",
+            "            continue",
+            "        if i == brk:",
+            "            break",
+            "        cnt = cnt + cast[int64](1)",
+            "    acc = acc + cnt",
+            "    r = r + cast[int64](1)",
+            "return acc",
+        ]
+        acc = 0
+        for _r in range(reps):
+            cnt = 0; i = 0
+            while i < inner:
+                i += 1
+                if i == skip:
+                    continue
+                if i == brk:
+                    break
+                cnt += 1
+            acc += cnt
+        self._nl_emit_helper(
+            fn, "reps: int64, inner: int64, brk: int64, skip: int64", body,
+            f"cast[int64]({reps}), cast[int64]({inner}), "
+            f"cast[int64]({brk}), cast[int64]({skip})", acc)
+
+    # Early `return` out of nested loops.
+    def _nl_early_return(self, u):
+        rng = self.rng
+        rows = rng.randint(2, 5); cols = rng.randint(2, 5)
+        limit = rng.randint(1, rows * cols)
+        fn = f"nl_er_{u}"
+        body = [
+            "s: int64 = cast[int64](0)",
+            "a: int64 = cast[int64](0)",
+            "while a < rr:",
+            "    b: int64 = cast[int64](0)",
+            "    while b < cc:",
+            "        s = s + cast[int64](1)",
+            "        if s >= lim:",
+            "            return s",
+            "        b = b + cast[int64](1)",
+            "    a = a + cast[int64](1)",
+            "return s",
+        ]
+        s = 0; done = False
+        for _a in range(rows):
+            for _b in range(cols):
+                s += 1
+                if s >= limit:
+                    done = True
+                    break
+            if done:
+                break
+        self._nl_emit_helper(
+            fn, "rr: int64, cc: int64, lim: int64", body,
+            f"cast[int64]({rows}), cast[int64]({cols}), cast[int64]({limit})", s)
+
+    # Accumulator mutated across three nesting levels, read at outer level.
+    def _nl_cross_level(self, u):
+        rng = self.rng
+        o = rng.randint(2, 4); m = rng.randint(1, 4); n = rng.randint(1, 4)
+        fn = f"nl_cl_{u}"
+        body = [
+            "acc: int64 = cast[int64](0)",
+            "oi: int64 = cast[int64](0)",
+            "while oi < oo:",
+            "    tot: int64 = cast[int64](0)",
+            "    mi: int64 = cast[int64](0)",
+            "    while mi < mm:",
+            "        ni: int64 = cast[int64](0)",
+            "        while ni < nn:",
+            "            tot = tot + cast[int64](1)",
+            "            ni = ni + cast[int64](1)",
+            "        tot = tot + mi",
+            "        mi = mi + cast[int64](1)",
+            "    acc = acc + tot",
+            "    oi = oi + cast[int64](1)",
+            "return acc",
+        ]
+        acc = 0
+        for _o in range(o):
+            tot = 0
+            for mm_ in range(m):
+                for _n in range(n):
+                    tot += 1
+                tot += mm_
+            acc += tot
+        self._nl_emit_helper(
+            fn, "oo: int64, mm: int64, nn: int64", body,
+            f"cast[int64]({o}), cast[int64]({m}), cast[int64]({n})", acc)
+
 
     # ---- short-circuit logical and/or traffic --------------------------------
     def _gen_short_circuit_traffic(self, env):
