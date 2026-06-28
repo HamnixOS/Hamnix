@@ -3886,6 +3886,338 @@ def _run_destsel_corpus():
 
 
 # --------------------------------------------------------------------------
+# P1 Phase-2 BASE-HOIST corpus. Programs whose hot loops index FLAT GLOBAL ARRAYS
+# (`g[idx]`), whose base address is a link-time constant the hoist materialises
+# ONCE into a held register (caller-saved across a call-free loop body) instead of
+# `lea g(%rip)` every iteration. Each computes a deterministic checksum the Python
+# oracle predicts exactly, so the per-access scaled-index lea off the hoisted base
+# is value-checked against the seed for ON and OFF. The corpus exercises the risk
+# classes docs/perf_p1_isel_design.md §2 Phase 2 names: multi-dimensional index
+# math, negative/zero indices, mixed element sizes 1/2/4/8, an IMPURE index
+# `g[f()]` (which puts a CALL in the loop body -> must NOT hoist into a caller-
+# saved reg the call would clobber -> falls back, still correct), and pointer-vs-
+# array bases (a pointer base's value is mutable -> never hoisted).
+# want_fire=True  => BASEHOIST must be > 0 on this program (the lever fired).
+# want_fire=False => correctness is asserted; the hoist may or may not fire.
+# --------------------------------------------------------------------------
+def _basehoist_corpus():
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, src, val, want_fire=True):
+        body = PRELUDE + "\n" + src
+        progs.append((name, body, str(val & M), val & 0xFF, want_fire))
+
+    # 1) saxpy-style array update `Y[i] = Y[i] + a*X[i]`: Y is accessed TWICE
+    #    (load + store) -> a MULTI-USE base, hoisted; X once. Reduction reads Y.
+    #    MUST fire (Y hoisted at the call-free reps loop).
+    n = 24
+    Y = [(i * 5 + 1) & M for i in range(n)]
+    X = [(i * 3 + 7) & M for i in range(n)]
+    a = 3
+    for rep in range(50):
+        for i in range(n):
+            Y[i] = (Y[i] + a * X[i]) & M
+    s = 0
+    for i in range(n):
+        s = (s + Y[i]) & M
+    prog("saxpy_update",
+         f"""Y: Array[64, int64]
+X: Array[64, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        Y[cast[int64](i)] = i * 5 + 1
+        X[cast[int64](i)] = i * 3 + 7
+        i = i + 1
+    a: int64 = 3
+    rep: int64 = 0
+    while rep < 50:
+        i = 0
+        while i < {n}:
+            Y[cast[int64](i)] = Y[cast[int64](i)] + a * X[cast[int64](i)]
+            i = i + 1
+        rep = rep + 1
+    s: int64 = 0
+    i = 0
+    while i < {n}:
+        s = s + Y[cast[int64](i)]
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s)
+
+    # 2) Two globals each accessed TWICE (`A[i]*A[i] + B[i]*B[i]`) -> both
+    #    multi-use -> both hoisted. MUST fire.
+    n = 20
+    acc = 0
+    for r in range(50):
+        for i in range(n):
+            ai = (i * 3 + 1) & M
+            bi = (i * 5 + 2) & M
+            acc = (acc + ai * ai + bi * bi) & M
+    prog("sumsq2_global",
+         f"""A: Array[64, int64]
+B: Array[64, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        A[cast[int64](i)] = i * 3 + 1
+        B[cast[int64](i)] = i * 5 + 2
+        i = i + 1
+    acc: int64 = 0
+    r: int64 = 0
+    while r < 50:
+        i = 0
+        while i < {n}:
+            acc = acc + A[cast[int64](i)] * A[cast[int64](i)] + B[cast[int64](i)] * B[cast[int64](i)]
+            i = i + 1
+        r = r + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+""", acc, want_fire=False)
+
+    # 3) NEGATIVE / ZERO index offsets into a MULTI-USE hoisted base
+    #    (`g[k+5] - g[k]` = 2 accesses/iter, plus `g[0]`). The index arithmetic
+    #    resolves through the per-access lea off the hoisted base. MUST fire.
+    n = 64
+    G = [(i - 20) & M for i in range(n)]
+    s = 0
+    for r in range(50):
+        s = (s + G[0]) & M
+        for k in range(32):
+            s = (s + G[k + 5] - G[k]) & M
+    prog("neg_zero_idx",
+         f"""G: Array[128, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        G[cast[int64](i)] = i - 20
+        i = i + 1
+    s: int64 = 0
+    r: int64 = 0
+    while r < 50:
+        s = s + G[cast[int64](0)]
+        k: int64 = 0
+        while k < 32:
+            s = s + G[cast[int64](k + 5)] - G[cast[int64](k)]
+            k = k + 1
+        r = r + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s)
+
+    # 4) MIXED ELEMENT SIZES 1/2/4/8 — the hoist is element-size agnostic (the SIB
+    #    scale carries 1/2/4/8). Each array accessed TWICE/iter so all are
+    #    multi-use and hoist regardless of width. MUST fire.
+    n = 32
+    s = 0
+    for r in range(40):
+        for k in range(n):
+            s = (s + 2 * k + 2 * k + 2 * k + 2 * k) & M
+    prog("mixed_sizes",
+         f"""A8: Array[64, int64]
+A4: Array[64, int32]
+A2: Array[64, int16]
+A1: Array[64, int8]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        A8[cast[int64](i)] = i
+        A4[cast[int64](i)] = cast[int32](i)
+        A2[cast[int64](i)] = cast[int16](i)
+        A1[cast[int64](i)] = cast[int8](i)
+        i = i + 1
+    s: int64 = 0
+    r: int64 = 0
+    while r < 40:
+        k: int64 = 0
+        while k < {n}:
+            s = s + A8[cast[int64](k)] + A8[cast[int64](k)] + cast[int64](A4[cast[int64](k)]) + cast[int64](A4[cast[int64](k)]) + cast[int64](A2[cast[int64](k)]) + cast[int64](A2[cast[int64](k)]) + cast[int64](A1[cast[int64](k)]) + cast[int64](A1[cast[int64](k)])
+            k = k + 1
+        r = r + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s, want_fire=False)
+
+    # 4b) SINGLE-USE NO-REGRESS probe: a global accessed exactly ONCE per iteration
+    #     must NOT be hoisted (the multi-use gate) — hoisting a single use trades
+    #     one lea for a possible arithmetic spill (measured net loss on sieve/
+    #     dcecopy). Correctness asserted; want_fire=False.
+    n = 64
+    G = [(i * 4 + 3) & M for i in range(n)]
+    s = 0
+    for r in range(50):
+        for k in range(n):
+            s = (s + G[k]) & M
+    prog("single_use_noregress",
+         f"""G: Array[128, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        G[cast[int64](i)] = i * 4 + 3
+        i = i + 1
+    s: int64 = 0
+    r: int64 = 0
+    while r < 50:
+        k: int64 = 0
+        while k < {n}:
+            s = s + G[cast[int64](k)]
+            k = k + 1
+        r = r + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s, want_fire=False)
+
+    # 4c) MULTI-DIMENSIONAL global `g[i][j]`: takes an earlier gen_index_addr
+    #     branch the cache never consults -> never hoisted via the flat path.
+    #     Correctness asserted; want_fire=False.
+    n = 8
+    s = 0
+    for r in range(40):
+        for i in range(n):
+            for j in range(n):
+                s = (s + (i * n + j)) & M
+    prog("multidim_fallback",
+         f"""G2: Array[8, Array[8, int64]]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        j: int64 = 0
+        while j < {n}:
+            G2[cast[int64](i)][cast[int64](j)] = i * {n} + j
+            j = j + 1
+        i = i + 1
+    s: int64 = 0
+    r: int64 = 0
+    while r < 40:
+        i = 0
+        while i < {n}:
+            j: int64 = 0
+            while j < {n}:
+                s = s + G2[cast[int64](i)][cast[int64](j)]
+                j = j + 1
+            i = i + 1
+        r = r + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s, want_fire=False)
+
+    # 5) IMPURE INDEX `g[helper(k)]`: the index expression CALLS a function, so the
+    #    loop body is NOT call-free — the hoist MUST refuse a caller-saved base
+    #    that the call would clobber (the call-free guard). Correctness asserted;
+    #    the per-iteration base lea stays. (Function-level callee hoist may still
+    #    fire if headroom exists, so want_fire=False — correctness is the point.)
+    n = 32
+    G = [(i * 9 + 4) & M for i in range(n)]
+    s = 0
+    for r in range(40):
+        for k in range(n):
+            s = (s + G[(k * 3) % n]) & M
+    prog("impure_index_fallback",
+         f"""G: Array[64, int64]
+def idxmap(k: int64) -> int64:
+    return (k * cast[int64](3)) % cast[int64]({n})
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        G[cast[int64](i)] = i * 9 + 4
+        i = i + 1
+    s: int64 = 0
+    r: int64 = 0
+    while r < 40:
+        k: int64 = 0
+        while k < {n}:
+            s = s + G[cast[int64](idxmap(k))]
+            k = k + 1
+        r = r + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s, want_fire=False)
+
+    # 6) POINTER vs ARRAY base: `p = cast[Ptr[int64]](&G[0])` then read `p[k]` —
+    #    a pointer base's VALUE is mutable, so it is NEVER hoisted (only the array
+    #    G in the init loop is). Reading through the pointer must match. Correctness
+    #    probe (want_fire=False).
+    n = 32
+    G = [(i * 2 + 1) & M for i in range(n)]
+    s = 0
+    for r in range(50):
+        for k in range(n):
+            s = (s + G[k]) & M
+    prog("ptr_vs_array",
+         f"""G: Array[64, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        G[cast[int64](i)] = i * 2 + 1
+        i = i + 1
+    p: Ptr[int64] = cast[Ptr[int64]](&G[cast[int64](0)])
+    s: int64 = 0
+    r: int64 = 0
+    while r < 50:
+        k: int64 = 0
+        while k < {n}:
+            s = s + p[cast[int64](k)]
+            k = k + 1
+        r = r + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s, want_fire=False)
+
+    return progs
+
+
+def _run_basehoist_corpus():
+    """Run the base-hoist corpus through codegen.ad. Returns (all_ok, total_hoists)."""
+    host = _ad_host()
+    total = 0
+    all_ok = True
+    fired_any = False
+    for (name, body, exp_out, exp_exit, want_fire) in _basehoist_corpus():
+        r_on = host.run_through_codegen_ad(f"bh_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"bh_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [BASEHOIST corpus '{name}'] codegen.ad on={r_on.kind}/off={r_off.kind}: "
+                  f"{(r_on.detail or r_off.detail)[:120]}")
+            continue
+        bh = int(getattr(r_on, "basehoist", 0) or 0)
+        total += bh
+        if bh > 0:
+            fired_any = True
+        # (a) correctness vs oracle for BOTH on and off.
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [BASEHOIST corpus '{name}'] MISCOMPILE on=({r_on.stdout},{r_on.exit}) "
+                  f"oracle=({exp_out},{exp_exit}) basehoist={bh}")
+            continue
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [BASEHOIST corpus '{name}'] OFF path wrong off=({r_off.stdout},{r_off.exit}) "
+                  f"oracle=({exp_out},{exp_exit})")
+            continue
+        # (b) a want_fire program MUST hoist at least one base (BASEHOIST>0).
+        if want_fire and bh == 0:
+            all_ok = False
+            print(f"  [BASEHOIST corpus '{name}'] correct but BASEHOIST NEVER FIRED "
+                  f"(want_fire=True)")
+            continue
+        # (c) OFF is byte-inert: re-dump off, assert BASEHOIST==0.
+        src = _AD_WORK / f"bh_mc_{name}.ad"
+        src.write_text(host.codegen_compatible_source(body))
+        d_off = host.run_dump(src, opt=False)
+        if d_off.status == "ok" and getattr(d_off, "basehoist", 0) != 0:
+            all_ok = False
+            print(f"  [BASEHOIST corpus '{name}'] OFF path NOT byte-inert: BASEHOIST={d_off.basehoist}")
+            continue
+    if not fired_any:
+        all_ok = False
+        print("  [BASEHOIST corpus FAIL] no program exercised the base-hoist lever")
+    return (all_ok, total)
+
+
+# --------------------------------------------------------------------------
 # Phase-4 REGISTER-PRESSURE corpus. Hand-written programs with MANY
 # simultaneously-live scalar locals — more than the 5-register callee-saved pool
 # — so the linear-scan allocator is FORCED to spill, plus call-crossing values
@@ -4891,6 +5223,19 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] destsel corpus miscompiled, dest-selector "
                   "never fired, a fallback shape routed, or OFF not byte-inert")
+        # P1 Phase-2 BASE-HOIST corpus: loop-invariant global-array bases hoisted
+        # into a held register (one scaled-index lea off the base per access, no
+        # per-iteration `lea g(%rip)`). Asserts (a) correctness vs oracle ON+OFF
+        # over multi-dim/negative/mixed-size/impure-index/pointer-base risk shapes,
+        # (b) the lever fired (BASEHOIST>0) on the want_fire programs and refused to
+        # hoist across a call, (c) byte-inert OFF (BASEHOIST==0).
+        bh_ok, bh_total = _run_basehoist_corpus()
+        print(f"--- ADDER_OPT=1 BASEHOIST corpus (P1 Phase-2 base residency) ---")
+        print(f"  global-array bases hoisted: {bh_total}")
+        if not bh_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] basehoist corpus miscompiled, lever never "
+                  "fired, hoisted across a call, or OFF not byte-inert")
         # FLOAT IR-EMIT corpus: float arith/compares (f32/f64/mixed/nested/neg)
         # lowered through the SSE float IR path. Asserts correctness vs an IEEE
         # oracle, the float IR path fired (IREMITFLOAT>0), and the OFF path is

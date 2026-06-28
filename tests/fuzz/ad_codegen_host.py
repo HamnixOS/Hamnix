@@ -279,6 +279,7 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       strengthred=meta.get("STRENGTHRED", 0),
                       isel=meta.get("ISEL", 0),
                       aluload=meta.get("ALULOAD", 0),
+                      basehoist=meta.get("BASEHOIST", 0),
                       ivsr=meta.get("IVSR", 0),
                       storeelim=meta.get("STOREELIM", 0),
                       cmpjcc=meta.get("CMPJCC", 0))
@@ -585,6 +586,7 @@ class CodegenRun:
         self.strengthred = kw.get("strengthred", 0)
         self.isel = kw.get("isel", 0)
         self.aluload = kw.get("aluload", 0)
+        self.basehoist = kw.get("basehoist", 0)
         self.ivsr = kw.get("ivsr", 0)
         self.storeelim = kw.get("storeelim", 0)
         self.cmpjcc = kw.get("cmpjcc", 0)
@@ -636,6 +638,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     strengthred = getattr(dump, "strengthred", 0)
     isel = getattr(dump, "isel", 0)
     aluload = getattr(dump, "aluload", 0)
+    basehoist = getattr(dump, "basehoist", 0)
     ivsr = getattr(dump, "ivsr", 0)
     storeelim = getattr(dump, "storeelim", 0)
     cmpjcc = getattr(dump, "cmpjcc", 0)
@@ -646,6 +649,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                           irreassoc=irreassoc, iremitfloat=iremitfloat, ffold=ffold,
                           destsel=destsel,
                           strengthred=strengthred, isel=isel, aluload=aluload,
+                          basehoist=basehoist,
                           ivsr=ivsr, storeelim=storeelim, cmpjcc=cmpjcc)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
                       folds=folds, ffold=ffold, cse=cse, loadcse=loadcse,
@@ -654,6 +658,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                       irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat,
                       destsel=destsel,
                       strengthred=strengthred, isel=isel, aluload=aluload,
+                      basehoist=basehoist,
                       ivsr=ivsr, storeelim=storeelim, cmpjcc=cmpjcc)
 
 
