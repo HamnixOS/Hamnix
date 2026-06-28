@@ -4599,6 +4599,92 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     return cast[int32](chk & cast[int64](255))
 """, chk)
 
+    # 12) SCRATCH-FREE COMBINE — IMMEDIATE step boundary. The accumulator combine
+    #     emits `op $imm,%home` for a constant step that fits a sign-extended imm32,
+    #     and computes a >imm32 step into %rax then `op %rax,%home`. Exercise both
+    #     0x83 (imm8 <128) and 0x81 (imm32) encodings + the >imm32 general path, via
+    #     +=, -= and *=. MUST fire.
+    acc = 0
+    for i in range(200):
+        acc = (acc + 1) & M               # imm8 (add $1)
+        acc = (acc + 127) & M             # imm8 boundary (add $127)
+        acc = (acc + 128) & M             # imm32 (add $128)
+        acc = (acc + 2147483647) & M      # imm32 max (add $0x7fffffff)
+        acc = (acc + 4294967296) & M      # > imm32 -> %rax combine (add %rax)
+        acc = (acc - 100000) & M          # sub imm32
+        acc = (acc * 3) & M               # MUL has no imm form -> general path
+    prog("imm_step_boundary",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    acc: int64 = 0
+    i: int64 = 0
+    while i < 200:
+        acc += 1
+        acc += 127
+        acc += 128
+        acc += 2147483647
+        acc += 4294967296
+        acc -= 100000
+        acc *= 3
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+""", acc)
+
+    # 13) SCRATCH-FREE COMBINE — AND/OR/XOR IMMEDIATE in a dest-driven root (`x =
+    #     (expr) & const`). These ops are not augmented-accumulator-routed but the
+    #     Phase-1 dest selector folds the constant right operand to `op $imm,%home`.
+    #     MUST fire (DESTSEL via try_sel_assign — counted as accsel? no — destsel).
+    msk = 0
+    for i in range(150):
+        v = (i * 2654435761) & M
+        msk = ((((v + 7) & 1048575) | (i & 4080)) ^ 255) & M
+    prog("bitop_imm_dest",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    msk: int64 = 0
+    i: int64 = 0
+    while i < 150:
+        v: int64 = i * 2654435761
+        msk = ((((v + 7) & 1048575) | (i & 4080)) ^ 255)
+        i = i + 1
+    print_u64(cast[uint64](msk))
+    return cast[int32](msk & cast[int64](255))
+""", msk, want_fire=False)
+
+    # 14) SCRATCH-FREE COMBINE — REGISTER-RESIDENT IDENT value (`s += m`, m a
+    #     loop-invariant promoted local) under HIGH REGISTER PRESSURE (many live
+    #     locals), so the combine takes the `op %srcreg,%home` form AND the pool is
+    #     exhausted enough to drive the no-scratch %rax path elsewhere. MUST fire.
+    m1, m2, m3, m4, m5, m6 = 11, 13, 17, 19, 23, 29
+    s = 0
+    t = 0
+    u = 0
+    for i in range(300):
+        s = (s + m1 + m2 * i) & M
+        t = (t + m3 - m4) & M
+        u = (u + m5 * m6 + i) & M
+        s = (s + t + u) & M
+    prog("regident_pressure_acc",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    m1: int64 = 11
+    m2: int64 = 13
+    m3: int64 = 17
+    m4: int64 = 19
+    m5: int64 = 23
+    m6: int64 = 29
+    s: int64 = 0
+    t: int64 = 0
+    u: int64 = 0
+    i: int64 = 0
+    while i < 300:
+        s = s + m1 + m2 * i
+        t = t + m3 - m4
+        u = u + m5 * m6 + i
+        s = s + t + u
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s)
+
     # (FLOAT accumulator/element fallback — `fs += a*b`, float arrays — is asserted
     #  by scripts/test_opt_isel_store.sh (ON==OFF, ACCSEL/IDXSTORE==0) and the
     #  dedicated iremit_float_check corpus; the cast[int64](float) value is not a

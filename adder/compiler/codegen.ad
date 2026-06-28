@@ -3432,6 +3432,44 @@ def emit_alu_reg_reg(op: uint32, src: uint32, dst: uint32):
         cg_fail(1, 0)                       # only ADD/SUB/MUL/AND/OR/XOR routed here
 
 
+# `op $imm, %<dst>` for the directional reg-dest ALU ops that have an immediate
+# form (ADD/SUB/AND/OR/XOR — the standard 0x83 /digit imm8 / 0x81 /digit imm32
+# group). `dst` is the modrm R/M field (REX.B extends it). The caller MUST pass
+# an `imm` that fits a SIGN-EXTENDED imm32 and equals its 64-bit value (the
+# destination-driven combine only takes this path for ir_const <= 0x7FFFFFFF, so
+# the imm is always a non-negative value that sign-extends to itself). MUL has no
+# matching one-operand-immediate form, so it never reaches here. Used ONLY under
+# the --opt selector; the default path never emits an immediate ALU into a
+# non-%rax register, so flag-off output is byte-identical.
+def emit_alu_imm_reg(op: uint32, imm: uint32, dst: uint32):
+    digit: uint32 = 0
+    if op == BINOP_ADD:
+        digit = 0
+    elif op == BINOP_BIT_OR:
+        digit = 1
+    elif op == BINOP_BIT_AND:
+        digit = 4
+    elif op == BINOP_SUB:
+        digit = 5
+    elif op == BINOP_BIT_XOR:
+        digit = 6
+    else:
+        cg_fail(1, 0)                       # MUL / shift have no imm /digit form
+        return
+    rex: uint32 = 0x48                      # REX.W
+    if dst >= 8:
+        rex = rex | 0x01                    # REX.B (extends R/M=dst)
+    emit_b(rex)
+    if imm < 128:
+        emit_b(0x83)                        # imm8 (sign-extended) form
+        emit_b(0xC0 + (digit << 3) + (dst & 7))
+        emit_b(imm & 255)
+        return
+    emit_b(0x81)                            # imm32 (sign-extended) form
+    emit_b(0xC0 + (digit << 3) + (dst & 7))
+    emit_imm32(cast[uint64](imm))
+
+
 # =======================================================================
 # MEMORY-SOURCE ALU folds (--opt, Phase 3 alu-load). `op (%rcx), %rax`:
 # combine the destination %rax with a memory source operand whose ADDRESS
@@ -5572,11 +5610,63 @@ def sel_binop_routable(v: uint32) -> uint32:
     return ir_op_scratch_ok(ir_op[v])
 
 
+# Combine the running value already in register `r` with IR value `v` via `bop`,
+# choosing the cheapest SCRATCH-FREE 2-operand x86 form — `r = r OP v`. This is
+# the in-expression / statement-glue PLUMBING lever: the seed (and the earlier
+# selector) parked every operand in a scratch register or on the stack and
+# round-tripped it through %rax; here a constant becomes an immediate and a
+# register-resident local becomes a register source, so the common IV-update and
+# accumulate combines need NO scratch register at all (the matmul/saxpy register-
+# pressure relief — under full pressure the previous code FELL BACK to the AST
+# push/pop path; this keeps the dest-driven 2-operand form regardless).
+#
+# CORRECTNESS: `r` already holds the LEFT value; this never clobbers `r` until the
+# final combine.
+#   * IR_CONST that fits a sign-extended imm32 (<= 0x7FFFFFFF) and a non-MUL op ->
+#     `op $imm, %r`. Value-identical (two's-complement modular op); MUL has no
+#     such imm /digit form so it takes the general path.
+#   * IR_IDENT bound to a FULL-WIDTH-8 register-promoted local -> `op %srcreg, %r`.
+#     The promoted register holds exactly the value the seed's leaf read would
+#     load (regalloc gives distinct live locals distinct registers, so %srcreg
+#     never aliases `r` unless `v` literally re-reads r's own local, which is the
+#     value-correct `s = s + s` self-combine). Restricted to non-sized (8-byte)
+#     locals so there is no truncation/extension mismatch with the slot.
+#   * Otherwise compute `v` into %rax via the legacy IR emitter (or a dest-driven
+#     scratch if one is free) and combine `op %rax, %r` / `op %s, %r`. %rax is
+#     always available; `r` is a promoted reg the scratch pool excludes, so it is
+#     never overwritten by the value's emit. Must run inside ir_emit_enter/leave.
+def sel_combine_into_home(bop: uint32, v: uint32, r: uint32):
+    k: uint32 = ir_kind[v]
+    # CONST -> op $imm, %r  (ADD/SUB/AND/OR/XOR; imm fits a sign-extended imm32).
+    if k == IR_CONST:
+        if bop != BINOP_MUL:
+            if ir_const[v] <= 2147483647:
+                emit_alu_imm_reg(bop, cast[uint32](ir_const[v]), r)
+                return
+    # Register-resident FULL-WIDTH-8 IDENT -> op %srcreg, %r.
+    if k == IR_IDENT:
+        sr: uint32 = ra_reg_for_name(ir_name_off[v], ir_name_len[v])
+        if sr != RA_NONE:
+            if lookup_local_scalar_size(ir_name_off[v], ir_name_len[v]) == 0:
+                emit_alu_reg_reg(bop, sr, r)
+                return
+    # General: a dest-driven scratch if one is free (keeps a deep right subtree's
+    # own accumulator off %rax), else compute into %rax and combine — no dedicated
+    # scratch required, so this never forces a fall-back under register pressure.
+    s: uint32 = ir_scratch_acquire()
+    if s != RA_NONE:
+        sel_expr_into_reg(v, s)
+        emit_alu_reg_reg(bop, s, r)
+        ir_scratch_release(s)
+        return
+    gen_expr_ir(v)                           # value -> %rax (legacy, byte-correct)
+    emit_alu_reg_reg(bop, 0, r)              # op %rax, r   (%rax enc = 0)
+
+
 # Compute IR value `v` DIRECTLY into register encoding `r`, no %rax round-trip
 # for the running accumulator. For a plain-arith IR_BINOP, the LEFT spine is
-# computed into `r` and each RIGHT operand combined in via `op <src>, r`; a
-# RIGHT operand or any non-routable node is emitted by the legacy gen_expr_ir
-# (-> %rax, byte-identical leaf bytes) into a temp, then combined / moved into r.
+# computed into `r` and the RIGHT operand combined in via sel_combine_into_home
+# (immediate / register-source / scratch / %rax — cheapest scratch-free form).
 def sel_expr_into_reg(v: uint32, r: uint32):
     if sel_binop_routable(v) == 0:
         # Leaf / const / ident / non-plain-arith binop: emit via the legacy IR
@@ -5587,20 +5677,8 @@ def sel_expr_into_reg(v: uint32, r: uint32):
     op: uint32 = ir_op[v]
     # LEFT spine computed directly into the destination register.
     sel_expr_into_reg(ir_a[v], r)
-    # RIGHT operand: prefer a scratch register so the combine is `op %s, r`. The
-    # scratch pool excludes r (it is a live promoted local marked unavailable), so
-    # %s never aliases r. If the pool is exhausted, fall back to materializing the
-    # right operand in %rax via the legacy path and combine `op %rax, r` — always
-    # correct (%rax/%rcx are free here; r is callee-saved and untouched by
-    # gen_expr_ir's leaf emit). Either way the running accumulator stays in r.
-    s: uint32 = ir_scratch_acquire()
-    if s != RA_NONE:
-        sel_expr_into_reg(ir_b[v], s)
-        emit_alu_reg_reg(op, s, r)
-        ir_scratch_release(s)
-    else:
-        gen_expr_ir(ir_b[v])                 # right -> %rax (legacy, byte-correct)
-        emit_alu_reg_reg(op, 0, r)           # op %rax, r   (%rax enc = 0)
+    # RIGHT operand combined in via the cheapest scratch-free 2-operand form.
+    sel_combine_into_home(op, ir_b[v], r)
 
 
 # Try the destination-driven Phase-1 class for a scalar assignment / var-decl
@@ -5765,15 +5843,13 @@ def try_sel_accum_into_reg(woff: uint32, wlen: uint32, bop: uint32, value: uint3
     else:
         ir_scratch_tree_callfree = 0
     ir_emit_enter()
-    xr: uint32 = ir_scratch_acquire()
-    if xr == RA_NONE:
-        # No scratch for the value temp; nothing emitted yet -> safe to fall back.
-        ir_emit_leave()
-        ir_scratch_tree_callfree = 0
-        return 0
-    sel_expr_into_reg(v, xr)                  # value -> %xr (dest-driven)
-    emit_alu_reg_reg(bop, xr, r)             # %home = %home OP %xr
-    ir_scratch_release(xr)
+    # Combine the value into the resident home register with the cheapest scratch-
+    # free 2-operand form (`op $imm,%home` for a constant step, `op %src,%home` for
+    # a register-resident value, else value->%rax then `op %rax,%home`). Unlike the
+    # previous code this NEVER abandons to the AST push/pop path when the scratch
+    # pool is exhausted — the matmul/saxpy register-pressure relief — so the
+    # accumulate stays a single 2-operand instruction even with every IV resident.
+    sel_combine_into_home(bop, v, r)         # %home = %home OP value
     ir_emit_leave()
     ir_scratch_tree_callfree = 0
     # WRITE-THROUGH when the home is not store-elim (a residual slot read exists).
