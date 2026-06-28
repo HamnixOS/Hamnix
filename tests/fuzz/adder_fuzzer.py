@@ -1376,6 +1376,11 @@ class Program:
                 "break_continue",   # break/continue inside the inner loop
                 "early_return_acc", # early return out of nested loops
                 "cross_level_acc",  # accumulator mutated across nesting levels
+                "loopcarry",        # matmul-shaped: multi-IV reduction whose
+                                    # carried scalar is named TWICE per statement
+                                    # (use-vector dedup) + a redeclared-per-
+                                    # iteration local seeded from a DISTINCT value
+                                    # (must NOT be wrongly coalesced)
             ])
             self._nl_uid += 1
             u = self._nl_uid
@@ -1387,6 +1392,8 @@ class Program:
                 self._nl_break_continue(u)
             elif shape == "early_return_acc":
                 self._nl_early_return(u)
+            elif shape == "loopcarry":
+                self._nl_loopcarry(u)
             else:
                 self._nl_cross_level(u)
 
@@ -1569,6 +1576,54 @@ class Program:
             fn, "oo: int64, mm: int64, nn: int64", body,
             f"cast[int64]({o}), cast[int64]({m}), cast[int64]({n})", acc)
 
+
+    # matmul-shaped loop-carried reduction. Targets the loop-carried register-
+    # promotion levers directly:
+    #   * The reduction update `s = s + p * q` and the IV update `acc = acc + s +
+    #     k` name the carried scalar s/acc, and the inner index expression names
+    #     the IVs k and n MULTIPLE times in ONE statement — the per-instruction
+    #     use-vector DEDUP target (an under-counted use used to poison k/n for
+    #     register promotion).
+    #   * MULTIPLE simultaneously-live IVs (k, n, and the two strength-reduced
+    #     index runs ka, kb) plus the carried accumulator s force register
+    #     pressure so the spill-cost eviction policy is exercised.
+    #   * A FRESH local `t` is redeclared EACH inner iteration and seeded from a
+    #     DISTINCT value (s + k*n), threaded into s. If liveness wrongly coalesced
+    #     t with another live value (or merged the redeclared t across iterations
+    #     with a different carried value), the answer DIVERGES. Bit-exact vs the
+    #     oracle proves the redeclared local was not wrongly coalesced.
+    # Everything is simulated exactly in Python and folded into g_accum.
+    def _nl_loopcarry(self, u):
+        rng = self.rng
+        rows = rng.randint(2, 5); cols = rng.randint(2, 6)
+        c1 = rng.randint(1, 4); c2 = rng.randint(1, 3)
+        fn = f"nl_lc_{u}"
+        body = [
+            "s: int64 = cast[int64](0)",
+            "k: int64 = cast[int64](0)",
+            "while k < rr:",
+            "    ka: int64 = k * cc",
+            "    n: int64 = cast[int64](0)",
+            "    while n < cc:",
+            # carried scalar s named twice; IVs k and n named twice in one stmt
+            "        t: int64 = s + (k * n + ka)",
+            "        t = t + (k * a1 + n * a2)",
+            "        s = s + t",
+            "        n = n + cast[int64](1)",
+            "    k = k + cast[int64](1)",
+            "return s",
+        ]
+        s = 0
+        for k in range(rows):
+            ka = I64.wrap(k * cols)
+            for n in range(cols):
+                t = I64.wrap(s + I64.wrap(k * n + ka))
+                t = I64.wrap(t + I64.wrap(k * c1 + n * c2))
+                s = I64.wrap(s + t)
+        self._nl_emit_helper(
+            fn, "rr: int64, cc: int64, a1: int64, a2: int64", body,
+            f"cast[int64]({rows}), cast[int64]({cols}), "
+            f"cast[int64]({c1}), cast[int64]({c2})", s)
 
     # ---- short-circuit logical and/or traffic --------------------------------
     def _gen_short_circuit_traffic(self, env):
