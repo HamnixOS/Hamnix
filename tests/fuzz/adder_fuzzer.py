@@ -581,6 +581,7 @@ class Program:
                                               # break/continue/early-return/cross-level
         self._gen_short_circuit_traffic(env)  # logical and/or short-circuit
         self._gen_helper_calls(env)
+        self._gen_regpressure_scratch_traffic(env)  # caller-saved IR scratch (--opt)
         self._gen_dce_keep_bait(env)      # DCE in main(): fire + must-KEEP probes
 
         # Fold the must-KEEP global LAST so its accumulated side effect is part of
@@ -1626,6 +1627,149 @@ class Program:
                 res = pyfn([I64.wrap(v) for v in argvals])
                 self.emit(f"    hc: int64 = {name}({argsrc})")
                 self._fold_value("cast[uint64](hc)", U64.wrap(res))
+
+    # ---- register-pressure / caller-saved-scratch traffic --------------------
+    def _gen_regpressure_scratch_traffic(self, env):
+        """Stress the --opt register-to-register binop lowering, specifically the
+        CALLER-SAVED IR scratch extension (codegen.ad: ir_scratch caller-saved
+        pool, indices 5..9 = rdi/r8/r9/r10/r11). That pool is used ONLY across a
+        CALL-FREE IR tree when the callee-saved scratch pool is exhausted (deep
+        nesting and/or regalloc consuming all 5 callee-saved registers). main()
+        ALWAYS makes calls (print_u64), so regalloc gets NO caller-saved pool
+        here; the caller-saved scratch must therefore come from the per-TREE
+        call-free gate — exactly the path this traffic exercises.
+
+        Three shapes, all folded into g_accum by construction so the differential
+        oracle (Python seed vs codegen.ad --opt) catches any miscompile:
+
+          (1) DEEP CALL-FREE BINOP TREES over many distinct int64 locals — a
+              balanced expression whose simultaneous scratch demand exceeds the 5
+              callee-saved registers, forcing caller-saved scratch. Value is
+              computed in the EXACT 64-bit two's-complement model and folded.
+          (2) REGISTER-PRESSURE under regalloc — the same trees referencing 6-10
+              live locals so the callee-saved pool is busy with promoted locals
+              and the scratch must spill to caller-saved.
+          (3) EVAL-ORDER / CLOBBER soundness — a binop whose operands are
+              side-effecting calls (sc_ord appends an id to g_ord). The seed
+              evaluates RIGHT before LEFT; the register lowering parks RIGHT in a
+              scratch reg across LEFT, so g_ord MUST record the identical order.
+              A function call mid-expression (one operand IS a call) ALSO forces
+              the tree NON-call-free, so the caller-saved gate must REFUSE it and
+              fall back — the differential proves both the used and the refused
+              path stay correct.
+        """
+        rng = self.rng
+        M = (1 << 64) - 1
+
+        def w64(v):
+            """Wrap to int64 (signed two's complement) — the register model."""
+            v &= M
+            if v >> 63:
+                v -= (1 << 64)
+            return v
+
+        # Eval-ORDER observer, emitted as PROGRAM top-level (NOT the shared
+        # PRELUDE, so the regpressure/isel corpora — which paste PRELUDE before a
+        # hand-written main and assert a push-free image — are unaffected). Each
+        # sc_ord call appends its decimal id to g_ord (g_ord = g_ord*10 + id) and
+        # returns `ret`, so the recorded order observes a binop's operand
+        # evaluation order. Emitted in BOTH subset and default mode.
+        self.emit_top("g_ord: uint64")
+        self.emit_top("")
+        self.emit_top("def sc_ord(id: int64, ret: int64) -> int64:")
+        self.emit_top("    g_ord = g_ord * cast[uint64](10) + cast[uint64](id)")
+        self.emit_top("    return ret")
+        self.emit_top("")
+
+        # ----- (1)+(2) deep call-free trees over many distinct locals ----------
+        # Declare 10 fresh locals with known values, then build several deep
+        # nested binop trees referencing them. 10 distinct simultaneously-live
+        # operands guarantee the scratch demand exceeds 5 callee-saved regs.
+        nvars = 10
+        vals = [w64(rng.randint(-(1 << 40), (1 << 40))) for _ in range(nvars)]
+        for i in range(nvars):
+            v = vals[i]
+            src = f"cast[int64](0 - {(-v)})" if v < 0 else f"cast[int64]({v})"
+            self.emit(f"    rp{i}: int64 = {src}")
+
+        def leaf(i):
+            return (f"rp{i}", vals[i])
+
+        def build_tree(depth):
+            """Random deep binop tree over the rp locals; returns (src, value)."""
+            if depth <= 0:
+                return leaf(rng.randrange(nvars))
+            op = rng.choice(["+", "-", "*", "&", "|", "^"])
+            ls, lv = build_tree(depth - 1)
+            rs, rv = build_tree(depth - 1)
+            if op == "+":
+                rv2 = lv + rv
+            elif op == "-":
+                rv2 = lv - rv
+            elif op == "*":
+                rv2 = lv * rv
+            elif op == "&":
+                rv2 = lv & rv
+            elif op == "|":
+                rv2 = lv | rv
+            else:
+                rv2 = lv ^ rv
+            return (f"({ls} {op} {rs})", w64(rv2))
+
+        for _ in range(rng.randint(3, 5)):
+            # depth 4 => up to 16 leaves, deeply nested: peak scratch demand
+            # comfortably exceeds 5, exercising caller-saved scratch acquisition.
+            s, val = build_tree(4)
+            self.emit(f"    rpt: int64 = {s}")
+            self._fold_value("cast[uint64](rpt)", U64.wrap(w64(val)))
+
+        # A compare tree feeding a branch (compares also use the scratch pool):
+        s1, v1 = build_tree(3)
+        s2, v2 = build_tree(3)
+        cmpres = 1 if w64(v1) < w64(v2) else 0
+        self.emit(f"    rpc: int64 = cast[int64](0)")
+        self.emit(f"    if ({s1}) < ({s2}):")
+        self.emit(f"        rpc = cast[int64](1)")
+        self._fold_value("cast[uint64](rpc)", U64.wrap(cmpres))
+
+        # ----- (3) eval-order + mid-expression call (clobber) soundness --------
+        # `sc_ord(L, lval) OP sc_ord(R, rval)` : the seed evaluates the RIGHT
+        # operand FIRST (id R appended to g_ord), then the LEFT (id L). The
+        # register lowering parks RIGHT in a scratch across LEFT — the recorded
+        # order MUST be identical. Each call makes the tree NON-call-free, so the
+        # caller-saved gate refuses it; this asserts the FALLBACK path is correct
+        # AND that operand order is preserved.
+        g_ord_shadow = 0
+        for _ in range(rng.randint(3, 6)):
+            lid = rng.randint(1, 9)
+            rid = rng.randint(1, 9)
+            lval = w64(rng.randint(-1000, 1000))
+            rval = w64(rng.randint(-1000, 1000))
+            op = rng.choice(["+", "-", "*", "&", "|", "^"])
+            lsrc = f"cast[int64](0 - {(-lval)})" if lval < 0 else f"cast[int64]({lval})"
+            rsrc = f"cast[int64](0 - {(-rval)})" if rval < 0 else f"cast[int64]({rval})"
+            # SEED EVAL ORDER: right then left.
+            g_ord_shadow = g_ord_shadow * 10 + rid
+            g_ord_shadow = g_ord_shadow * 10 + lid
+            g_ord_shadow &= M
+            if op == "+":
+                rv = lval + rval
+            elif op == "-":
+                rv = lval - rval
+            elif op == "*":
+                rv = lval * rval
+            elif op == "&":
+                rv = lval & rval
+            elif op == "|":
+                rv = lval | rval
+            else:
+                rv = lval ^ rval
+            self.emit(
+                f"    rpo: int64 = (sc_ord(cast[int64]({lid}), {lsrc}) "
+                f"{op} sc_ord(cast[int64]({rid}), {rsrc}))")
+            self._fold_value("cast[uint64](rpo)", U64.wrap(w64(rv)))
+        # Fold the observed evaluation order — the load-bearing eval-order check.
+        self._fold_value("g_ord", U64.wrap(g_ord_shadow))
 
     # ---- fold one known value into the printed accumulator -------------------
     def _fold_value(self, src_u64, py_u64):
