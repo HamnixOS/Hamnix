@@ -116,7 +116,7 @@ build_adder_user od                   # M16.66: -An -tx1 hex dump
 build_adder_user printf               # M16.66: %s/%d + \n/\t/\\ escapes
 build_adder_user cp                   # M16.66: SRC->DST file copy (<=8 KiB)
 build_adder_user whoami               # current uid -> name via /etc/passwd
-build_adder_user id                   # M16.67: hard-wired uid=0(root) line
+build_adder_user id                   # real uid/gid -> names via /etc/passwd + /etc/group
 build_adder_user clear                # M16.67: ANSI clear-screen + home
 build_adder_user hostname             # M16.67: /etc/hostname with fallback
 build_adder_user date                 # /proc/realtime — RTC + TSC delta
