@@ -273,6 +273,8 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       irreassoc=meta.get("IRREASSOC", 0),
                       iremitfloat=meta.get("IREMITFLOAT", 0),
                       destsel=meta.get("DESTSEL", 0),
+                      accsel=meta.get("ACCSEL", 0),
+                      idxstore=meta.get("IDXSTORE", 0),
                       irscratch=meta.get("IRSCRATCH", 0),
                       irscratchmiss=meta.get("IRSCRATCHMISS", 0),
                       irborrow=meta.get("IRBORROW", 0),
@@ -583,6 +585,8 @@ class CodegenRun:
         self.irreassoc = kw.get("irreassoc", 0)
         self.iremitfloat = kw.get("iremitfloat", 0)
         self.destsel = kw.get("destsel", 0)
+        self.accsel = kw.get("accsel", 0)
+        self.idxstore = kw.get("idxstore", 0)
         self.strengthred = kw.get("strengthred", 0)
         self.isel = kw.get("isel", 0)
         self.aluload = kw.get("aluload", 0)
@@ -635,6 +639,8 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     irreassoc = getattr(dump, "irreassoc", 0)
     iremitfloat = getattr(dump, "iremitfloat", 0)
     destsel = getattr(dump, "destsel", 0)
+    accsel = getattr(dump, "accsel", 0)
+    idxstore = getattr(dump, "idxstore", 0)
     strengthred = getattr(dump, "strengthred", 0)
     isel = getattr(dump, "isel", 0)
     aluload = getattr(dump, "aluload", 0)
@@ -647,7 +653,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                           stdout=out, exit=rp.returncode, folds=folds, cse=cse,
                           licm=licm, iremit=iremit, irfold=irfold,
                           irreassoc=irreassoc, iremitfloat=iremitfloat, ffold=ffold,
-                          destsel=destsel,
+                          destsel=destsel, accsel=accsel, idxstore=idxstore,
                           strengthred=strengthred, isel=isel, aluload=aluload,
                           basehoist=basehoist,
                           ivsr=ivsr, storeelim=storeelim, cmpjcc=cmpjcc)
@@ -656,7 +662,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                       licm=licm, dce=dce,
                       constbranch=constbranch, copyprop=copyprop, iremit=iremit,
                       irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat,
-                      destsel=destsel,
+                      destsel=destsel, accsel=accsel, idxstore=idxstore,
                       strengthred=strengthred, isel=isel, aluload=aluload,
                       basehoist=basehoist,
                       ivsr=ivsr, storeelim=storeelim, cmpjcc=cmpjcc)

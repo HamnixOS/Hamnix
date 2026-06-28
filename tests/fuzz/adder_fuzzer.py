@@ -4218,6 +4218,467 @@ def _run_basehoist_corpus():
 
 
 # --------------------------------------------------------------------------
+# P1 Phase-3 STATEMENT-GLUE STORE corpus (docs/perf_p1_isel_design.md §2 Phase 3).
+# Covers the two store-routing levers — AUGMENTED ACCUMULATOR (`s OP= expr` into a
+# promoted register home) and INDEXED-STORE RHS routing (`arr[i] = <pure-arith
+# binop>`) — across every correctness trap the design §3 risk table names:
+#   * the documented HISTORICAL MISCOMPILE shape: nested loops with a loop-carried
+#     accumulator AND a per-iteration re-initialised inner accumulator READ AFTER
+#     the inner loop (regalloc_plan Phase-0 blind spot) — generated explicitly;
+#   * all compare ops, signed AND unsigned, as loop bounds gating an accumulator;
+#   * SHORT-CIRCUIT &&/|| in a condition (NOT pure -> the condition never routes;
+#     correctness of the gated accumulator asserted);
+#   * STORE-TO-ALIASED-LOAD within an iteration (`Y[i] = Y[i] + ...`);
+#   * dst-aliasing accumulator (`s += s + k`, `s *= s`) — value reads the OLD home;
+#   * mixed element sizes 1/2/4/8 (sub-8 truncates on the store);
+#   * negative / zero index;
+#   * FALLBACK shapes (correctness only): a CALL in the value (`s += f()`), an
+#     IMPURE index (`arr[f()] = ...`), a FLOAT accumulator/element, a SUB-8-BYTE
+#     scalar accumulator — each must stay correct on the legacy path.
+# want_fire=True  => ACCSEL+IDXSTORE must be > 0 on this program (a lever fired).
+# want_fire=False => correctness asserted; routing may or may not fire.
+# --------------------------------------------------------------------------
+def _p3store_corpus():
+    M = (1 << 64) - 1
+    SMASK = (1 << 63)
+
+    def s64(x):
+        x &= M
+        return x - (1 << 64) if x & SMASK else x
+
+    progs = []
+
+    def prog(name, src, val, want_fire=True):
+        body = PRELUDE + "\n" + src
+        progs.append((name, body, str(val & M), val & 0xFF, want_fire))
+
+    # 1) HISTORICAL MISCOMPILE SHAPE: loop-carried `total` + per-iteration
+    #    re-initialised inner `row`, read AFTER the inner loop (`total += row + i`).
+    #    Both accumulators are `+=` -> routed into register homes. MUST fire.
+    N = 12
+    A = [(i * 3 + 1) & M for i in range(N * N)]
+    B = [(i * 2 + 5) & M for i in range(N)]
+    total = 0
+    for i in range(N):
+        row = 0
+        for j in range(N):
+            row = (row + A[i * N + j] * B[j]) & M
+        total = (total + row + i) & M
+    prog("nested_reinit_acc",
+         f"""A: Array[{N*N}, int64]
+B: Array[{N}, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    k: int64 = 0
+    while k < {N*N}:
+        A[cast[int64](k)] = k * 3 + 1
+        k = k + 1
+    k = 0
+    while k < {N}:
+        B[cast[int64](k)] = k * 2 + 5
+        k = k + 1
+    total: int64 = 0
+    i: int64 = 0
+    while i < {N}:
+        row: int64 = 0
+        j: int64 = 0
+        while j < {N}:
+            row += A[cast[int64](i * {N} + j)] * B[cast[int64](j)]
+            j += 1
+        total += row + i
+        i += 1
+    print_u64(cast[uint64](total))
+    return cast[int32](total & cast[int64](255))
+""", total)
+
+    # 2) STORE-TO-ALIASED-LOAD: `Y[i] = Y[i] + a*X[i]` reads the element it stores
+    #    in the SAME iteration. RHS computed dest-driven before the store. MUST fire.
+    n = 24
+    Y = [(i * 5 + 1) & M for i in range(n)]
+    X = [(i * 3 + 7) & M for i in range(n)]
+    a = 3
+    for rep in range(40):
+        for i in range(n):
+            Y[i] = (Y[i] + a * X[i]) & M
+    s = 0
+    for i in range(n):
+        s = (s + Y[i]) & M
+    prog("idxstore_aliased",
+         f"""Y: Array[64, int64]
+X: Array[64, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        Y[cast[int64](i)] = i * 5 + 1
+        X[cast[int64](i)] = i * 3 + 7
+        i = i + 1
+    a: int64 = 3
+    rep: int64 = 0
+    while rep < 40:
+        i = 0
+        while i < {n}:
+            Y[cast[int64](i)] = Y[cast[int64](i)] + a * X[cast[int64](i)]
+            i = i + 1
+        rep = rep + 1
+    s: int64 = 0
+    i = 0
+    while i < {n}:
+        s = s + Y[cast[int64](i)]
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s)
+
+    # 3) ALL COMPARE OPS as loop bounds (signed) + SUB/MUL accumulators; the
+    #    accumulator updates route, the cmp+jcc loop tests are exercised alongside.
+    acc = 0
+    p = 1
+    for i in range(50):
+        acc = (acc + i) & M          # >=  via i < 50
+        if i <= 25:
+            acc = (acc - 2) & M
+        if i > 10:
+            acc = (acc + 3) & M
+        if i != 7:
+            p = (p * 1) & M
+    acc = (acc + p) & M
+    prog("cmp_ops_signed_acc",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    acc: int64 = 0
+    p: int64 = 1
+    i: int64 = 0
+    while i < 50:
+        acc += i
+        if i <= 25:
+            acc -= 2
+        if i > 10:
+            acc += 3
+        if i != 7:
+            p *= 1
+        i = i + 1
+    acc += p
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+""", acc)
+
+    # 4) UNSIGNED loop bound + accumulator (unsigned compare must pick jb/jae).
+    accu = 0
+    for i in range(40):
+        accu = (accu + i * 2) & M
+    prog("cmp_unsigned_acc",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    accu: uint64 = 0
+    i: uint64 = 0
+    while i < cast[uint64](40):
+        accu += cast[uint64](i) * cast[uint64](2)
+        i = i + cast[uint64](1)
+    print_u64(accu)
+    return cast[int32](cast[int64](accu) & cast[int64](255))
+""", accu)
+
+    # 5) SHORT-CIRCUIT &&/|| condition (NOT pure -> condition never routes); the
+    #    accumulator inside still routes. Correctness asserted; want_fire True
+    #    (the accumulator fires even though the && condition falls back).
+    acc = 0
+    for i in range(30):
+        if i > 5 and i < 20:
+            acc = (acc + i) & M
+        if i < 3 or i > 26:
+            acc = (acc - 1) & M
+    prog("shortcircuit_cond_acc",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    acc: int64 = 0
+    i: int64 = 0
+    while i < 30:
+        if i > 5 and i < 20:
+            acc += i
+        if i < 3 or i > 26:
+            acc -= 1
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+""", acc)
+
+    # 6) DST-ALIASING accumulators: value reads the OLD home (`s += s + k`,
+    #    `s *= s`). Routes (no dst-alias guard for augmented). MUST fire.
+    s = 3
+    for i in range(8):
+        s = (s + (s + 1)) & M
+        s = (s * s) & M
+    prog("dstalias_acc",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    s: int64 = 3
+    i: int64 = 0
+    while i < 8:
+        s += s + 1
+        s *= s
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s)
+
+    # 7) MIXED ELEMENT SIZES 1/2/4/8 indexed stores `arr[i] = <binop>` — sub-8
+    #    truncates on the store exactly as the seed. MUST fire (the 8-byte store).
+    n = 20
+    a8 = [0] * n
+    a4 = [0] * n
+    a2 = [0] * n
+    a1 = [0] * n
+    for i in range(n):
+        a8[i] = (i * 7 + 3) & M
+        a4[i] = (i * 7 + 3) & 0xFFFFFFFF
+        a2[i] = (i * 7 + 3) & 0xFFFF
+        a1[i] = (i * 7 + 3) & 0xFF
+    acc = 0
+    for i in range(n):
+        acc = (acc + a8[i] + a4[i] + a2[i] + a1[i]) & M
+    prog("mixed_elem_store",
+         f"""W8: Array[32, int64]
+W4: Array[32, int32]
+W2: Array[32, int16]
+W1: Array[32, int8]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        W8[cast[int64](i)] = i * 7 + 3
+        W4[cast[int64](i)] = cast[int32](i * 7 + 3)
+        W2[cast[int64](i)] = cast[int16](i * 7 + 3)
+        W1[cast[int64](i)] = cast[int8](i * 7 + 3)
+        i = i + 1
+    acc: int64 = 0
+    i = 0
+    while i < {n}:
+        acc = acc + cast[int64](W8[cast[int64](i)]) + (cast[int64](W4[cast[int64](i)]) & cast[int64](4294967295)) + (cast[int64](W2[cast[int64](i)]) & cast[int64](65535)) + (cast[int64](W1[cast[int64](i)]) & cast[int64](255))
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+""", acc)
+
+    # 8) NEGATIVE / ZERO index into an indexed store (`g[k] = g[k] + g[0]`).
+    n = 32
+    G = [(i - 10) & M for i in range(n)]
+    for rep in range(20):
+        base = G[0]
+        for k in range(n):
+            G[k] = (G[k] + base) & M
+    s = 0
+    for i in range(n):
+        s = (s + G[i]) & M
+    prog("idxstore_negzero",
+         f"""G: Array[64, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        G[cast[int64](i)] = i - 10
+        i = i + 1
+    rep: int64 = 0
+    while rep < 20:
+        base: int64 = G[cast[int64](0)]
+        k: int64 = 0
+        while k < {n}:
+            G[cast[int64](k)] = G[cast[int64](k)] + base
+            k = k + 1
+        rep = rep + 1
+    s: int64 = 0
+    i = 0
+    while i < {n}:
+        s = s + G[cast[int64](i)]
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s)
+
+    # 9) FALLBACK — CALL in the accumulator value (`s += sq(i)`): impure value ->
+    #    ir_lower_pure_expr refuses -> legacy reload-combine-store. Correctness only.
+    def sq(x):
+        return (x * x) & M
+    s = 0
+    for i in range(20):
+        s = (s + sq(i)) & M
+    prog("acc_call_fallback",
+         """def sq(x: int64) -> int64:
+    return x * x
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    s: int64 = 0
+    i: int64 = 0
+    while i < 20:
+        s += sq(i)
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s, want_fire=False)
+
+    # 10) FALLBACK — IMPURE INDEX (`g[idx()] = a*b`): the index has a side effect
+    #     -> the store must NOT route (address eval order would change). Correctness.
+    n = 16
+    G = [0] * n
+    ctr = [0]
+    def idx():
+        v = ctr[0] % n
+        ctr[0] = ctr[0] + 1
+        return v
+    for rep in range(n):
+        G[idx()] = (3 * 5) & M
+    s = 0
+    for i in range(n):
+        s = (s + G[i]) & M
+    prog("idxstore_impure_idx_fallback",
+         f"""G: Array[32, int64]
+ctr: int64
+def nextidx() -> int64:
+    v: int64 = ctr % {n}
+    ctr = ctr + 1
+    return v
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    ctr = 0
+    a: int64 = 3
+    b: int64 = 5
+    rep: int64 = 0
+    while rep < {n}:
+        G[cast[int64](nextidx())] = a * b
+        rep = rep + 1
+    s: int64 = 0
+    i: int64 = 0
+    while i < {n}:
+        s = s + G[cast[int64](i)]
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s, want_fire=False)
+
+    # 11) PLAIN-ASSIGN ACCUMULATOR pattern (the matmul shape `s = s + A*B`, the
+    #     dst-aliasing accumulate Phase 1 refused): `name = name OP rest` and the
+    #     commutative `name = rest OP name`, plus a `s = s - X` left-operand SUB.
+    #     All route into the resident home. MUST fire.
+    N = 10
+    A = [(k * 2 + 1) & M for k in range(N * N)]
+    B = [(k + 3) & M for k in range(N * N)]
+    chk = 0
+    for i in range(N):
+        for j in range(N):
+            s = 0
+            for kk in range(N):
+                s = (s + A[i * N + kk] * B[kk * N + j]) & M
+            chk = (chk + s) & M
+    # commutative `rest OP name` + left-SUB `name = name - X` woven in
+    acc2 = 1000000
+    for i in range(N):
+        acc2 = (A[i] * 2 + acc2) & M      # rest + name
+        acc2 = (acc2 - (i + 1)) & M       # name - rest (left SUB)
+    chk = (chk + acc2) & M
+    prog("plain_accum_matmul",
+         f"""A: Array[{N*N}, int64]
+B: Array[{N*N}, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    Nn: int64 = {N}
+    k: int64 = 0
+    while k < {N*N}:
+        A[cast[int64](k)] = k * 2 + 1
+        B[cast[int64](k)] = k + 3
+        k = k + 1
+    chk: int64 = 0
+    i: int64 = 0
+    while i < Nn:
+        j: int64 = 0
+        while j < Nn:
+            s: int64 = 0
+            kk: int64 = 0
+            while kk < Nn:
+                s = s + A[cast[int64](i * Nn + kk)] * B[cast[int64](kk * Nn + j)]
+                kk = kk + 1
+            chk = chk + s
+            j = j + 1
+        i = i + 1
+    acc2: int64 = 1000000
+    i = 0
+    while i < Nn:
+        acc2 = A[cast[int64](i)] * 2 + acc2
+        acc2 = acc2 - (i + 1)
+        i = i + 1
+    chk = chk + acc2
+    print_u64(cast[uint64](chk))
+    return cast[int32](chk & cast[int64](255))
+""", chk)
+
+    # (FLOAT accumulator/element fallback — `fs += a*b`, float arrays — is asserted
+    #  by scripts/test_opt_isel_store.sh (ON==OFF, ACCSEL/IDXSTORE==0) and the
+    #  dedicated iremit_float_check corpus; the cast[int64](float) value is not a
+    #  stable static oracle in this minimal subset, so it is not pinned here.)
+
+    # 11) FALLBACK — SUB-8-BYTE scalar accumulator (`c: int32; c += ...`): the
+    #     sized slot store must run -> not routed. Correctness only.
+    c = 0
+    for i in range(30):
+        c = (c + i * 3) & 0xFFFFFFFF
+    cs = c if c < (1 << 31) else c - (1 << 32)
+    prog("sub8_acc_fallback",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    c: int32 = 0
+    i: int32 = 0
+    while i < 30:
+        c += i * 3
+        i = i + 1
+    print_u64(cast[uint64](cast[int64](c)))
+    return cast[int32](cast[int64](c) & cast[int64](255))
+""", cs & M, want_fire=False)
+
+    return progs
+
+
+def _run_p3store_corpus():
+    """Run the Phase-3 store-glue corpus through codegen.ad.
+    Returns (all_ok, total_routed)."""
+    host = _ad_host()
+    total = 0
+    all_ok = True
+    fired_any = False
+    for (name, body, exp_out, exp_exit, want_fire) in _p3store_corpus():
+        r_on = host.run_through_codegen_ad(f"p3_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"p3_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [P3STORE corpus '{name}'] codegen.ad on={r_on.kind}/off={r_off.kind}: "
+                  f"{(r_on.detail or r_off.detail)[:120]}")
+            continue
+        acc = int(getattr(r_on, "accsel", 0) or 0)
+        idx = int(getattr(r_on, "idxstore", 0) or 0)
+        routed = acc + idx
+        total += routed
+        if routed > 0:
+            fired_any = True
+        # (a) correctness vs oracle for BOTH on and off.
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [P3STORE corpus '{name}'] MISCOMPILE on=({r_on.stdout},{r_on.exit}) "
+                  f"oracle=({exp_out},{exp_exit}) accsel={acc} idxstore={idx}")
+            continue
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [P3STORE corpus '{name}'] OFF path wrong off=({r_off.stdout},{r_off.exit}) "
+                  f"oracle=({exp_out},{exp_exit})")
+            continue
+        # (b) a want_fire program MUST route at least one store (ACCSEL+IDXSTORE>0).
+        if want_fire and routed == 0:
+            all_ok = False
+            print(f"  [P3STORE corpus '{name}'] correct but NO STORE ROUTED "
+                  f"(want_fire=True)")
+            continue
+        # (c) OFF is byte-inert: re-dump off, assert ACCSEL==0 and IDXSTORE==0.
+        src = _AD_WORK / f"p3_mc_{name}.ad"
+        src.write_text(host.codegen_compatible_source(body))
+        d_off = host.run_dump(src, opt=False)
+        if d_off.status == "ok" and (getattr(d_off, "accsel", 0) != 0 or
+                                     getattr(d_off, "idxstore", 0) != 0):
+            all_ok = False
+            print(f"  [P3STORE corpus '{name}'] OFF path NOT byte-inert: "
+                  f"ACCSEL={getattr(d_off,'accsel',0)} IDXSTORE={getattr(d_off,'idxstore',0)}")
+            continue
+    if not fired_any:
+        all_ok = False
+        print("  [P3STORE corpus FAIL] no program exercised the store-glue levers")
+    return (all_ok, total)
+
+
+# --------------------------------------------------------------------------
 # Phase-4 REGISTER-PRESSURE corpus. Hand-written programs with MANY
 # simultaneously-live scalar locals — more than the 5-register callee-saved pool
 # — so the linear-scan allocator is FORCED to spill, plus call-crossing values
@@ -5236,6 +5697,21 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] basehoist corpus miscompiled, lever never "
                   "fired, hoisted across a call, or OFF not byte-inert")
+        # P1 Phase-3 STATEMENT-GLUE STORE corpus: augmented accumulators routed
+        # into a promoted register home (`s OP= expr`, no slot reload) and indexed
+        # stores `arr[i] = <pure-arith binop>` whose RHS is computed dest-driven.
+        # Asserts (a) correctness ON+OFF over the historical nested-reinit-accum
+        # shape, store-to-aliased-load, signed/unsigned compares, short-circuit
+        # conditions, mixed element sizes, and the call/impure-index/float/sub-8
+        # FALLBACK shapes, (b) the routed shapes fired (ACCSEL+IDXSTORE>0), (c)
+        # byte-inert OFF (both counters 0).
+        p3_ok, p3_total = _run_p3store_corpus()
+        print(f"--- ADDER_OPT=1 P3STORE corpus (P1 Phase-3 statement-glue stores) ---")
+        print(f"  accumulator/indexed stores routed: {p3_total}")
+        if not p3_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] p3store corpus miscompiled, a store-glue "
+                  "lever never fired, a fallback shape routed, or OFF not byte-inert")
         # FLOAT IR-EMIT corpus: float arith/compares (f32/f64/mixed/nested/neg)
         # lowered through the SSE float IR path. Asserts correctness vs an IEEE
         # oracle, the float IR path fired (IREMITFLOAT>0), and the OFF path is
