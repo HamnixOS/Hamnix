@@ -517,6 +517,16 @@ class Program:
             self.emit(f"{name}: {t.name}")
             self.scalar_globals[t] = [name, 0]
         self.grid = [rows, cols, [[0] * cols for _ in range(rows)]]
+        # ----- IVSR stress array: a fixed-size flat int64 array indexed by
+        # affine functions of counted-loop induction variables (1-D a[i*C+R],
+        # 2-D a[i*N+j], decreasing loops, multiple IVs, nested outer-invariant
+        # inner indexing). The Phase-3.6 induction-variable strength-reduction
+        # pass (--opt) rewrites these indices to running variables; the value
+        # MUST stay bit-exact, so the by-construction checksum is the differential
+        # net. Sized 16x16 = 256 so 2-D row*col addressing never overruns.
+        self.ivsr_dim = 16
+        self.emit(f"g_ivsr: Array[{self.ivsr_dim * self.ivsr_dim}, int64]")
+        self.ivsr_shadow = [0] * (self.ivsr_dim * self.ivsr_dim)
         self.emit("")
 
         # ----- helper functions ---------------------------------------------
@@ -541,6 +551,7 @@ class Program:
         self._gen_store_traffic(env)
         self._gen_index_signedness_traffic(env)  # indexed compare/shift signedness
         self._gen_aluload_traffic(env)            # memory-source ALU folds (--opt)
+        self._gen_ivsr_traffic(env)               # affine-index IV strength reduction (--opt)
         self._gen_scalar_global_traffic(env)
         self._gen_struct_traffic(env)     # struct locals: member store/read
         self._gen_class_traffic(env)      # class construction + method dispatch
@@ -965,6 +976,199 @@ class Program:
             self._fold_value(f"cast[uint64]({name})", U64.wrap(_to_reg(stored)))
 
     # ---- counted loop with a conditional body --------------------------------
+    # ---- IVSR-targeted affine-index loop traffic (--opt Phase 3.6) -----------
+    #
+    # Stresses induction-variable strength reduction: counted loops that index a
+    # flat int64 array global by an AFFINE function of the loop counter, the exact
+    # shape the pass rewrites into a pre-header-seeded running variable. Every
+    # shape is simulated bit-exactly in Python (int64 wraparound via I64.wrap) and
+    # the resulting array contents are folded into g_accum, so any divergence
+    # between the original index and the strength-reduced running variable BREAKS
+    # the by-construction oracle (the differential ADDER_OPT=1 lane catches it).
+    #
+    # Shapes (biased HARD toward loop+index forms per the IVSR risk profile):
+    #   * 1-D  a[i*C + R]      constant coefficient C, invariant remainder R
+    #   * 2-D  a[i*N + j]      runtime-invariant row coefficient N (the matmul win)
+    #   * step != 1 / decreasing loops (i -= s, i = i - s)
+    #   * nested loop where the OUTER iv is invariant in the inner (a[i*N + j])
+    #   * multiple independent affine indices over the SAME iv (grouped to one
+    #     running var when value-equal, separate when not)
+    #   * pointer ALIAS of the indexed array (cast to Ptr) read back to confirm
+    #     the running-variable store landed at the same address
+    #   * early-exit / break inside the counted loop
+    def _gen_ivsr_traffic(self, env):
+        rng = self.rng
+        if not hasattr(self, "_ivsr_uid"):
+            self._ivsr_uid = 0
+        D = self.ivsr_dim
+        NCELL = D * D
+        arr = "g_ivsr"
+        sh = self.ivsr_shadow
+
+        def store(idx, val):
+            idx &= (NCELL - 1) if (NCELL & (NCELL - 1)) == 0 else 0xFFFFFFFF
+            idx %= NCELL
+            v = I64.wrap(val)
+            sh[idx] = v
+            return idx, v
+
+        for _ in range(rng.randint(3, 5)):
+            self._ivsr_uid += 1
+            u = self._ivsr_uid
+            shape = rng.choice([
+                "lin1d", "lin1d_R", "twod", "dec", "stepk",
+                "nested_outer_inv", "multi_iv_index", "alias", "break_exit",
+            ])
+            if shape == "lin1d":
+                # a[i*C] = i*7 + C  for i in 0..n, C constant >= 2.
+                C = rng.randint(2, 5)
+                n = rng.randint(2, D // C if D // C >= 2 else 2)
+                self.emit(f"    iva_{u}: int64 = cast[int64](0)")
+                self.emit(f"    while iva_{u} < cast[int64]({n}):")
+                self.emit(f"        {arr}[cast[int64](iva_{u} * {C})] = "
+                          f"iva_{u} * cast[int64](7) + cast[int64]({C})")
+                self.emit(f"        iva_{u} = iva_{u} + cast[int64](1)")
+                for i in range(n):
+                    store(i * C, I64.wrap(i * 7 + C))
+            elif shape == "lin1d_R":
+                # a[i*C + R] = i - R   (R invariant local)
+                C = rng.randint(2, 4)
+                R = rng.randint(0, 3)
+                n = rng.randint(2, max(2, (D - R) // C))
+                self.emit(f"    ivr_{u}: int64 = cast[int64]({R})")
+                self.emit(f"    ivb_{u}: int64 = cast[int64](0)")
+                self.emit(f"    while ivb_{u} < cast[int64]({n}):")
+                self.emit(f"        {arr}[cast[int64](ivb_{u} * {C} + ivr_{u})] = "
+                          f"ivb_{u} - ivr_{u}")
+                self.emit(f"        ivb_{u} = ivb_{u} + cast[int64](1)")
+                for i in range(n):
+                    store(i * C + R, I64.wrap(i - R))
+            elif shape == "twod":
+                # 2-D: a[i*N + j] over a nested loop, N a runtime-invariant local.
+                N = D
+                ni = rng.randint(2, 4)
+                nj = rng.randint(2, 4)
+                self.emit(f"    ivN_{u}: int64 = cast[int64]({N})")
+                self.emit(f"    ivi_{u}: int64 = cast[int64](0)")
+                self.emit(f"    while ivi_{u} < cast[int64]({ni}):")
+                self.emit(f"        ivj_{u}: int64 = cast[int64](0)")
+                self.emit(f"        while ivj_{u} < cast[int64]({nj}):")
+                self.emit(f"            {arr}[cast[int64](ivi_{u} * ivN_{u} + ivj_{u})] = "
+                          f"ivi_{u} * cast[int64](3) + ivj_{u}")
+                self.emit(f"            ivj_{u} = ivj_{u} + cast[int64](1)")
+                self.emit(f"        ivi_{u} = ivi_{u} + cast[int64](1)")
+                for i in range(ni):
+                    for j in range(nj):
+                        store(i * N + j, I64.wrap(i * 3 + j))
+            elif shape == "dec":
+                # Decreasing loop: i goes n-1 .. 0, index i*C.
+                C = rng.randint(2, 4)
+                n = rng.randint(2, max(2, D // C))
+                self.emit(f"    ivd_{u}: int64 = cast[int64]({n - 1})")
+                self.emit(f"    while ivd_{u} >= cast[int64](0):")
+                self.emit(f"        {arr}[cast[int64](ivd_{u} * {C})] = "
+                          f"ivd_{u} + cast[int64](2)")
+                self.emit(f"        ivd_{u} = ivd_{u} - cast[int64](1)")
+                for i in range(n - 1, -1, -1):
+                    store(i * C, I64.wrap(i + 2))
+            elif shape == "stepk":
+                # Step != 1: i advances by s; index i*C. Running var advances C*s.
+                C = rng.randint(2, 3)
+                s = rng.randint(2, 3)
+                n = rng.randint(2, max(2, D // (C * s)))
+                self.emit(f"    ivs_{u}: int64 = cast[int64](0)")
+                self.emit(f"    ivc_{u}: int64 = cast[int64](0)")
+                self.emit(f"    while ivc_{u} < cast[int64]({n}):")
+                self.emit(f"        {arr}[cast[int64](ivs_{u} * {C})] = "
+                          f"ivs_{u} + cast[int64](5)")
+                self.emit(f"        ivs_{u} = ivs_{u} + cast[int64]({s})")
+                self.emit(f"        ivc_{u} = ivc_{u} + cast[int64](1)")
+                iv = 0
+                for _c in range(n):
+                    store(iv * C, I64.wrap(iv + 5))
+                    iv += s
+            elif shape == "nested_outer_inv":
+                # Inner loop where the OUTER iv contributes an invariant i*N base:
+                # a[i*N + j] with i fixed across the inner j-loop.
+                N = D
+                ni = rng.randint(2, 3)
+                nj = rng.randint(2, 4)
+                self.emit(f"    ivM_{u}: int64 = cast[int64]({N})")
+                self.emit(f"    ivoi_{u}: int64 = cast[int64](0)")
+                self.emit(f"    while ivoi_{u} < cast[int64]({ni}):")
+                self.emit(f"        ivij_{u}: int64 = cast[int64](0)")
+                self.emit(f"        while ivij_{u} < cast[int64]({nj}):")
+                self.emit(f"            {arr}[cast[int64](ivoi_{u} * ivM_{u} + ivij_{u} * 2)] = "
+                          f"ivoi_{u} + ivij_{u}")
+                self.emit(f"            ivij_{u} = ivij_{u} + cast[int64](1)")
+                self.emit(f"        ivoi_{u} = ivoi_{u} + cast[int64](1)")
+                for i in range(ni):
+                    for j in range(nj):
+                        if i * N + j * 2 < NCELL:
+                            store(i * N + j * 2, I64.wrap(i + j))
+            elif shape == "multi_iv_index":
+                # Two DISTINCT affine indices over the same iv in one body:
+                # a[i*2] and a[i*3 + 1] — separate running variables.
+                n = rng.randint(2, 4)
+                self.emit(f"    ivm_{u}: int64 = cast[int64](0)")
+                self.emit(f"    while ivm_{u} < cast[int64]({n}):")
+                self.emit(f"        {arr}[cast[int64](ivm_{u} * 2)] = "
+                          f"ivm_{u} + cast[int64](1)")
+                self.emit(f"        {arr}[cast[int64](ivm_{u} * 3 + 1)] = "
+                          f"ivm_{u} * cast[int64](4)")
+                self.emit(f"        ivm_{u} = ivm_{u} + cast[int64](1)")
+                for i in range(n):
+                    store(i * 2, I64.wrap(i + 1))
+                    store(i * 3 + 1, I64.wrap(i * 4))
+            elif shape == "alias":
+                # Write via a[i*C], then read back via a Ptr alias to confirm the
+                # running-variable store address matches the indexed one.
+                C = rng.randint(2, 4)
+                n = rng.randint(2, max(2, D // C))
+                self.emit(f"    ival_{u}: int64 = cast[int64](0)")
+                self.emit(f"    while ival_{u} < cast[int64]({n}):")
+                self.emit(f"        {arr}[cast[int64](ival_{u} * {C})] = "
+                          f"ival_{u} + cast[int64](9)")
+                self.emit(f"        ival_{u} = ival_{u} + cast[int64](1)")
+                self.emit(f"        ivalp_{u}: Ptr[int64] = cast[Ptr[int64]](&{arr}[0])")
+                # read back the LAST written cell through the alias and fold it
+                last = (n - 1) * C
+                self.emit(f"    ivalp2_{u}: Ptr[int64] = cast[Ptr[int64]](&{arr}[0])")
+                self.emit(f"    ivalrd_{u}: int64 = ivalp2_{u}[cast[int64]({last})]")
+                for i in range(n):
+                    store(i * C, I64.wrap(i + 9))
+                self._fold_value(f"cast[uint64](ivalrd_{u})", U64.wrap(sh[last % NCELL]))
+            else:  # break_exit
+                # Counted loop with an early break: a[i*C] until i==brk.
+                C = rng.randint(2, 4)
+                n = rng.randint(3, max(3, D // C))
+                brk = rng.randint(1, n - 1)
+                self.emit(f"    ivbk_{u}: int64 = cast[int64](0)")
+                self.emit(f"    while ivbk_{u} < cast[int64]({n}):")
+                self.emit(f"        if ivbk_{u} == cast[int64]({brk}):")
+                self.emit(f"            break")
+                self.emit(f"        {arr}[cast[int64](ivbk_{u} * {C})] = "
+                          f"ivbk_{u} + cast[int64](3)")
+                self.emit(f"        ivbk_{u} = ivbk_{u} + cast[int64](1)")
+                for i in range(n):
+                    if i == brk:
+                        break
+                    store(i * C, I64.wrap(i + 3))
+
+        # Fold the WHOLE array's contents into g_accum so every strength-reduced
+        # store is differentially checked. A position-weighted sum makes a
+        # mislanded store (wrong address from a bad running var) diverge.
+        self.emit(f"    ivsum_{u}: int64 = cast[int64](0)")
+        self.emit(f"    ivk_{u}: int64 = cast[int64](0)")
+        self.emit(f"    while ivk_{u} < cast[int64]({NCELL}):")
+        self.emit(f"        ivsum_{u} = ivsum_{u} + {arr}[cast[int64](ivk_{u})] * "
+                  f"(ivk_{u} + cast[int64](1))")
+        self.emit(f"        ivk_{u} = ivk_{u} + cast[int64](1)")
+        total = 0
+        for k in range(NCELL):
+            total = I64.wrap(total + I64.wrap(sh[k] * (k + 1)))
+        self._fold_value(f"cast[uint64](ivsum_{u})", U64.wrap(total))
+
     def _gen_loop(self, env):
         rng = self.rng
         n = rng.randint(3, 12)

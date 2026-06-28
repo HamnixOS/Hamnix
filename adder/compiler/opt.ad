@@ -69,6 +69,8 @@ from compiler.parser import (
     UNOP_ADDR,
     UNOP_NOT,
     AUGOP_NONE,
+    AUGOP_ADD,
+    AUGOP_SUB,
     BINOP_ADD,
     BINOP_SUB,
     BINOP_MUL,
@@ -143,6 +145,14 @@ opt_constbranch_count: uint32 = 0
 # Phase-8 DCE removes its decl. See the Phase-9 COPY-PROP section at the bottom.
 opt_copyprop_count: uint32 = 0
 
+# Diagnostics: number of affine array-index expressions strength-reduced to a
+# running induction variable by Phase-3.6 IVSR (one per distinct affine index
+# `arr[i*K + R]` over a counted loop whose IV `i` advances by a constant step,
+# replaced by a pre-header-initialised running local advanced by the constant
+# `K*step` each iteration — eliding the per-iteration multiply). See the IVSR
+# section below + scripts/test_opt_ivsr.sh.
+opt_ivsr_count: uint32 = 0
+
 
 def opt_enable():
     opt_enabled = 1
@@ -157,6 +167,7 @@ def opt_reset_stats():
     opt_ffold_count = 0
     opt_constbranch_count = 0
     opt_copyprop_count = 0
+    opt_ivsr_count = 0
 
 
 # =======================================================================
@@ -1017,6 +1028,18 @@ def opt_run(prog: uint32):
         if nd_kind[cur] == ND_FUNCTION:
             opt_licm_function(cur)
         cur = nd_next[cur]
+    # Phase 3.6 — INDUCTION-VARIABLE STRENGTH REDUCTION. Runs AFTER LICM (so any
+    # loop-invariant index sub-base like `i*N` was already hoisted where i is
+    # invariant) and BEFORE copyprop/DCE: it rewrites affine array indices over a
+    # counted loop's induction variable into a pre-header-seeded running variable
+    # advanced by a constant per iteration, eliminating the per-iteration index
+    # multiply. The minted running locals are ordinary promotable scalars the
+    # later passes/regalloc treat normally.
+    cur = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            opt_ivsr_function(cur)
+        cur = nd_next[cur]
     # Phase 9 — COPY PROPAGATION. Runs AFTER fold/CSE/LICM and immediately BEFORE
     # DCE: it forwards each pure copy `x = y` to later reads of `x` (rewriting them
     # to read `y`) within a straight-line run, when neither `x` nor `y` is mutated
@@ -1830,6 +1853,716 @@ def opt_licm_function(fn: uint32):
     opt_fw_build(fn)
     # The function body chain hangs off nd_c (ND_FUNCTION: c = body chain head).
     nd_c[fn] = licm_block(nd_c[fn])
+
+
+# =======================================================================
+# Phase 3.6 — INDUCTION-VARIABLE STRENGTH REDUCTION (IVSR).
+# =======================================================================
+#
+# WHAT IT DOES
+# ------------
+# For a COUNTED loop whose induction variable `i` advances by a single constant
+# step `S` (`i = i + S`, `i = i - S`, `i += S`, `i -= S`) at exactly one TOP-
+# LEVEL point in the body, every array access `arr[ E ]` whose (cast-peeled)
+# index `E` is an AFFINE function of `i` — `i*K + R`, `K*i + R`, `i*K`, `i + R`,
+# or `i` — with a constant integer coefficient `K` and a LOOP-INVARIANT remainder
+# `R` (no use of `i`, no clobbered leaf, no load/call/addr-of) is rewritten to
+# read a RUNNING induction variable `t`:
+#
+#     t = E            # pre-header: E evaluated at the loop-entry value of i
+#     ...  arr[t] ...  # body: index replaced by the running variable
+#     i = i + S        # the original IV step (unchanged)
+#     t = t + (K*S)    # appended: keep t == K*i + R by induction
+#
+# This elides the per-iteration `i*K` MULTIPLY (and the add of R) on every such
+# access, replacing it with a single constant add of `K*S` shared across all
+# accesses with the same affine index. The running variable is an ordinary
+# promotable integer local — regalloc may pin it in a callee-saved register.
+#
+# SOUNDNESS
+# ---------
+# The transform is pure integer algebra on 64-bit modular values. Initially
+# t == E == K*i + R at loop entry. After each iteration i becomes i+S and t
+# becomes t + K*S, so the invariant t == K*i + R is MAINTAINED (R is invariant).
+# Therefore at EVERY body point where the original index E was read, t holds the
+# identical 64-bit value E would have computed. Replacing arr[E] by arr[t] is
+# value-preserving. Conditions enforced before firing (any failure => no change):
+#   * the IV `i` is written EXACTLY ONCE in the whole body, and that single write
+#     is a recognised constant-step form at the TOP LEVEL of the body chain (not
+#     nested inside if/while/for) — so the appended `t += K*S` runs exactly as
+#     often as the IV step;
+#   * the remainder R is loop-invariant: no leaf of R is in the body clobber set
+#     and R does not use `i` (so t's update needs no R term);
+#   * the index expression E contains no load / call / addr-of (it is a pure
+#     arithmetic value over idents+consts), so cloning it for the pre-header is
+#     value-faithful and re-evaluable;
+#   * the body has no call / addr-of / opaque (non-ident-target) store anywhere
+#     (reusing the LICM clobber model) — guaranteeing the clobber set is a sound
+#     over-approximation of every name written in the loop.
+# Only runs under ADDER_OPT (Phase 3.6); flag-OFF output is byte-identical.
+
+# --- the recognised induction variable for the loop currently being processed
+ivsr_iv_off: uint32 = 0
+ivsr_iv_len: uint32 = 0
+ivsr_iv_step: int64 = 0          # signed constant step S
+ivsr_iv_step_stmt: uint32 = 0    # the top-level ND_ASSIGN that steps i
+ivsr_iv_writes: uint32 = 0       # total writes to i across the whole body
+ivsr_bad: uint32 = 0             # set if the body shape disqualifies IVSR
+
+
+# Is AST node `n` a compile-time integer constant? If so return 1 and store its
+# (signed 64-bit) value via out. Peels `cast[int64]/cast[uint64](lit)` wrappers
+# (8-byte int casts are value-preserving over the 64-bit index domain — the
+# common idiom `i + cast[int64](1)`), recursively. Does NOT peel narrowing casts
+# (int8/16/32 etc.) since those could change the literal's value.
+def ivsr_const_val(n: uint32, out: Ptr[int64]) -> uint32:
+    if n == 0:
+        return 0
+    if nd_kind[n] == ND_INT_LIT:
+        out[0] = cast[int64](nd_num[n])
+        return 1
+    if nd_kind[n] == ND_CAST:
+        tn: uint32 = nd_a[n]
+        if tn != 0 and nd_kind[tn] == ND_TYPE:
+            code: uint32 = nd_aux[tn]
+            if code == 5 or code == 9:        # int64 / uint64: non-narrowing
+                return ivsr_const_val(nd_b[n], out)
+        return 0
+    return 0
+
+
+# IVSR clobber collection. Unlike LICM (which BAILS on any non-ident store
+# target because it hoists whole expressions that could alias a memory cell), an
+# affine INDEX is pure arithmetic over NAMED locals + constants — an indexed
+# memory store `arr[E] = v` writes MEMORY, not a named local, so it cannot change
+# the value of any ident leaf of the coefficient/remainder. Therefore IVSR records
+# only IDENT-target writes into the clobber set and simply IGNORES indexed/member/
+# deref store targets (their VALUE side is still scanned for call/addr-of). We
+# still HARD-BAIL (licm_giveup) on a call or an address-of anywhere in the body:
+# those can write through an alias to a named local we track. This reuses the
+# licm_clob_* storage + licm_is_clobbered / licm_ir_invariant predicates.
+def ivsr_collect_clobbers(head: uint32):
+    s: uint32 = head
+    while s != 0:
+        if licm_giveup != 0:
+            return
+        k: uint32 = nd_kind[s]
+        if k == ND_ASSIGN:
+            tgt: uint32 = nd_a[s]
+            if nd_kind[tgt] == ND_IDENT:
+                licm_clob_add(nd_name_off[tgt], nd_name_len[tgt])
+            else:
+                # Indexed / member / deref store: writes memory, not a name.
+                # Scan the TARGET's index/base expressions for call/addr-of too.
+                licm_scan_expr(tgt)
+            licm_scan_expr(nd_b[s])
+        elif k == ND_VAR_DECL:
+            licm_clob_add(nd_name_off[s], nd_name_len[s])
+            licm_scan_expr(nd_b[s])
+        elif k == ND_EXPR_STMT:
+            licm_scan_expr(nd_a[s])
+        elif k == ND_RETURN:
+            licm_scan_expr(nd_a[s])
+        elif k == ND_IF:
+            licm_scan_expr(nd_a[s])
+            ivsr_collect_clobbers(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                licm_scan_expr(nd_a[e])
+                ivsr_collect_clobbers(nd_b[e])
+                e = nd_next[e]
+            ivsr_collect_clobbers(nd_d[s])
+        elif k == ND_WHILE:
+            licm_scan_expr(nd_a[s])
+            ivsr_collect_clobbers(nd_b[s])
+        elif k == ND_DO_WHILE:
+            licm_scan_expr(nd_a[s])
+            ivsr_collect_clobbers(nd_b[s])
+        elif k == ND_FOR:
+            licm_clob_add(nd_name_off[s], nd_name_len[s])
+            licm_scan_expr(nd_a[s])
+            ivsr_collect_clobbers(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            v: uint32 = nd_a[s]
+            while v != 0:
+                if nd_kind[v] == ND_IDENT:
+                    licm_clob_add(nd_name_off[v], nd_name_len[v])
+                v = nd_next[v]
+            licm_scan_expr(nd_b[s])
+            ivsr_collect_clobbers(nd_c[s])
+        s = nd_next[s]
+
+
+# Does AST subtree `n` reference the IV name (ivsr_iv_off/len) anywhere?
+def ivsr_uses_iv(n: uint32) -> uint32:
+    if n == 0:
+        return 0
+    if nd_kind[n] == ND_IDENT:
+        if ir_name_eq(nd_name_off[n], nd_name_len[n], ivsr_iv_off, ivsr_iv_len) != 0:
+            return 1
+        return 0
+    if ivsr_uses_iv(nd_a[n]) != 0:
+        return 1
+    if ivsr_uses_iv(nd_b[n]) != 0:
+        return 1
+    if ivsr_uses_iv(nd_c[n]) != 0:
+        return 1
+    return ivsr_uses_iv(nd_d[n])
+
+
+# Record every write to the IV across the loop body, and detect the single
+# constant-step form at the TOP LEVEL. `top` is 1 only for the body's own
+# statement chain (not nested control-flow bodies). Sets ivsr_bad on any IV
+# write we don't model as the recognised step (e.g. nested, augmented-mul,
+# non-constant step), so the caller refuses to transform.
+def ivsr_scan_iv(head: uint32, top: uint32):
+    s: uint32 = head
+    while s != 0:
+        k: uint32 = nd_kind[s]
+        if k == ND_ASSIGN:
+            tgt: uint32 = nd_a[s]
+            if nd_kind[tgt] == ND_IDENT and \
+               ir_name_eq(nd_name_off[tgt], nd_name_len[tgt],
+                          ivsr_iv_off, ivsr_iv_len) != 0:
+                ivsr_iv_writes = ivsr_iv_writes + 1
+                # Recognise the step form ONLY at the top level.
+                matched: uint32 = 0
+                if top != 0:
+                    aug: uint32 = nd_aux[s]
+                    rhs: uint32 = nd_b[s]
+                    cv: int64 = 0
+                    if aug == AUGOP_ADD and ivsr_const_val(rhs, &cv) != 0:
+                        ivsr_iv_step = cv
+                        ivsr_iv_step_stmt = s
+                        matched = 1
+                    elif aug == AUGOP_SUB and ivsr_const_val(rhs, &cv) != 0:
+                        ivsr_iv_step = 0 - cv
+                        ivsr_iv_step_stmt = s
+                        matched = 1
+                    elif aug == AUGOP_NONE and nd_kind[rhs] == ND_BINARY:
+                        op: uint32 = nd_aux[rhs]
+                        la: uint32 = nd_a[rhs]
+                        rb: uint32 = nd_b[rhs]
+                        # i = i + C  or  i = C + i  or  i = i - C
+                        if op == BINOP_ADD:
+                            if nd_kind[la] == ND_IDENT and \
+                               ir_name_eq(nd_name_off[la], nd_name_len[la],
+                                          ivsr_iv_off, ivsr_iv_len) != 0 and \
+                               ivsr_const_val(rb, &cv) != 0:
+                                ivsr_iv_step = cv
+                                ivsr_iv_step_stmt = s
+                                matched = 1
+                            elif nd_kind[rb] == ND_IDENT and \
+                                 ir_name_eq(nd_name_off[rb], nd_name_len[rb],
+                                            ivsr_iv_off, ivsr_iv_len) != 0 and \
+                                 ivsr_const_val(la, &cv) != 0:
+                                ivsr_iv_step = cv
+                                ivsr_iv_step_stmt = s
+                                matched = 1
+                        elif op == BINOP_SUB:
+                            if nd_kind[la] == ND_IDENT and \
+                               ir_name_eq(nd_name_off[la], nd_name_len[la],
+                                          ivsr_iv_off, ivsr_iv_len) != 0 and \
+                               ivsr_const_val(rb, &cv) != 0:
+                                ivsr_iv_step = 0 - cv
+                                ivsr_iv_step_stmt = s
+                                matched = 1
+                if matched == 0:
+                    ivsr_bad = 1
+        # Recurse into nested control-flow bodies (NOT top level).
+        if k == ND_IF:
+            ivsr_scan_iv(nd_b[s], 0)
+            e: uint32 = nd_c[s]
+            while e != 0:
+                ivsr_scan_iv(nd_b[e], 0)
+                e = nd_next[e]
+            ivsr_scan_iv(nd_d[s], 0)
+        elif k == ND_WHILE or k == ND_DO_WHILE or k == ND_FOR:
+            ivsr_scan_iv(nd_b[s], 0)
+        elif k == ND_FOR_UNPACK:
+            ivsr_scan_iv(nd_c[s], 0)
+        s = nd_next[s]
+
+
+# Peel a chain of integer casts off an index expression, returning the inner
+# arithmetic node. `cast[int64](k*N+j)` -> the `k*N+j` ND_BINARY. Only int casts
+# (ND_CAST with a non-float target) are peeled; the affine match runs on the
+# peeled node and the value is preserved because the surrounding index codegen
+# applies the same scaling regardless.
+def ivsr_peel_cast(n: uint32) -> uint32:
+    c: uint32 = n
+    while c != 0 and nd_kind[c] == ND_CAST:
+        if opt_expr_float_width(c) != 0:
+            return c
+        c = nd_b[c]
+    return c
+
+
+# Match `peeled` against an affine function of the IV: returns 1 and stores the
+# constant coefficient K via kout when peeled == one of:
+#   i              -> K = 1
+#   i + R / R + i  -> K = 1   (R loop-invariant, no IV use)
+#   i - R          -> K = 1
+#   i*K / K*i      -> coefficient K (constant)
+#   i*K + R / R + i*K / i*K - R  -> coefficient K, remainder R invariant
+# The remainder R must be loop-invariant and must NOT use the IV. The whole
+# affine expression must be pure (no load/call/addr) so it can be re-evaluated
+# in the pre-header. Returns 0 if not a recognised reducible affine form.
+def ivsr_is_invariant_expr(n: uint32) -> uint32:
+    # A subtree is loop-invariant for IVSR iff it lowers to a pure value (no
+    # load/call/addr leaf) AND none of its ident leaves is clobbered AND it does
+    # not use the IV. Reuse the LICM IR substrate.
+    if n == 0:
+        return 1
+    # A compile-time constant (incl. `cast[int64](lit)`) is trivially invariant —
+    # the LICM IR substrate treats a cast as an opaque LEAF and would reject it,
+    # so recognise the constant form directly.
+    cdummy: int64 = 0
+    if ivsr_const_val(n, &cdummy) != 0:
+        return 1
+    if ivsr_uses_iv(n) != 0:
+        return 0
+    v: uint32 = ir_lower_pure_expr(n)
+    if v == 0:
+        return 0
+    if ir_tree_has_leaf(v) != 0:
+        return 0
+    if ir_tree_has_div(v) != 0:
+        return 0
+    return licm_ir_invariant(v)
+
+
+# Is `n` exactly a read of the IV?
+def ivsr_is_iv_ref(n: uint32) -> uint32:
+    if n != 0 and nd_kind[n] == ND_IDENT and \
+       ir_name_eq(nd_name_off[n], nd_name_len[n], ivsr_iv_off, ivsr_iv_len) != 0:
+        return 1
+    return 0
+
+
+# Match `i*C` / `C*i` -> returns 1 and sets *coeffout to the COEFFICIENT AST node
+# (the non-IV multiplicand). The coefficient must be a LOOP-INVARIANT expression
+# (`ivsr_is_invariant_expr`) — a literal stride OR a runtime-invariant variable
+# like the row dimension `N` in `k*N`. The pre-header forms `K*S` from this node,
+# so a variable coefficient is fine (it is read once into a stride temp).
+def ivsr_match_mul(n: uint32, coeffout: Ptr[uint32]) -> uint32:
+    if n == 0 or nd_kind[n] != ND_BINARY or nd_aux[n] != BINOP_MUL:
+        return 0
+    la: uint32 = nd_a[n]
+    rb: uint32 = nd_b[n]
+    if ivsr_is_iv_ref(la) != 0 and ivsr_is_invariant_expr(rb) != 0:
+        coeffout[0] = rb
+        return 1
+    if ivsr_is_iv_ref(rb) != 0 and ivsr_is_invariant_expr(la) != 0:
+        coeffout[0] = la
+        return 1
+    return 0
+
+
+# Match the full affine index `peeled` against C*i + R; on success set *coeffout
+# to the coefficient AST node (0 == unit coefficient, i.e. K==1) and return 1.
+# C (the coefficient) and R (the remainder) must both be loop-invariant and must
+# NOT use the IV. The pre-header clones the WHOLE original index expression as the
+# running variable's seed, so R is captured there; coeffout is used only to form
+# the per-iteration delta `coeff*step`.
+def ivsr_match_affine(peeled: uint32, coeffout: Ptr[uint32]) -> uint32:
+    if peeled == 0:
+        return 0
+    # bare `i`  -> unit coefficient
+    if ivsr_is_iv_ref(peeled) != 0:
+        coeffout[0] = 0
+        return 1
+    # `i*C` / `C*i`
+    if ivsr_match_mul(peeled, coeffout) != 0:
+        return 1
+    if nd_kind[peeled] != ND_BINARY:
+        return 0
+    op: uint32 = nd_aux[peeled]
+    la: uint32 = nd_a[peeled]
+    rb: uint32 = nd_b[peeled]
+    if op == BINOP_ADD:
+        # (i*C | i) + R   |   R + (i*C | i)
+        if ivsr_match_mul(la, coeffout) != 0 and ivsr_is_invariant_expr(rb) != 0:
+            return 1
+        if ivsr_is_iv_ref(la) != 0 and ivsr_is_invariant_expr(rb) != 0:
+            coeffout[0] = 0
+            return 1
+        if ivsr_match_mul(rb, coeffout) != 0 and ivsr_is_invariant_expr(la) != 0:
+            return 1
+        if ivsr_is_iv_ref(rb) != 0 and ivsr_is_invariant_expr(la) != 0:
+            coeffout[0] = 0
+            return 1
+        return 0
+    if op == BINOP_SUB:
+        # (i*C | i) - R    (R - i*C is NOT a +C*i affine form; reject)
+        if ivsr_match_mul(la, coeffout) != 0 and ivsr_is_invariant_expr(rb) != 0:
+            return 1
+        if ivsr_is_iv_ref(la) != 0 and ivsr_is_invariant_expr(rb) != 0:
+            coeffout[0] = 0
+            return 1
+        return 0
+    return 0
+
+
+# --- affine-index candidate collection over the loop body ----------------
+IVSR_MAX_CAND: uint32 = 4096
+ivsr_cand_idx: Array[4096, uint32]   # the ND_INDEX node's index child (peeled)
+ivsr_cand_node: Array[4096, uint32]  # the ND_INDEX node itself
+ivsr_cand_ir: Array[4096, uint32]    # value-IR of the affine index (for grouping)
+ivsr_cand_coeff: Array[4096, uint32] # coefficient AST node (0 == unit)
+ivsr_cand_done: Array[4096, uint32]  # 1 once rewritten
+ivsr_cand_n: uint32 = 0
+
+
+# Collect every ND_INDEX in the body whose peeled index is a reducible affine
+# function of the IV. Records the index child, the owning ND_INDEX, the value-IR
+# (shared arena — NOT reset per node, so equal indices group), and K. Descends
+# into nested expressions and control flow. Index children are themselves scanned
+# (a nested arr[b[i]] inner index could also be affine, but the outer would then
+# not lower; we still try each ND_INDEX independently).
+# Profitability gate: IVSR only pays off when it eliminates a per-iteration
+# MULTIPLY, i.e. the affine index has a non-unit coefficient `i*C` (C a constant
+# >= 2 or a runtime-invariant variable). A unit coefficient (bare `i`, or `i+R`)
+# means the index is already the loop counter plus an invariant offset — running-
+# variable rewriting there adds a redundant per-iteration add + an extra register
+# with no multiply removed, which measured NET-NEGATIVE (sieve/clear loops). So
+# we conservatively decline unit-coefficient candidates.
+def ivsr_coeff_profitable(coeff: uint32) -> uint32:
+    if coeff == 0:
+        return 0                 # unit coefficient (bare i / i+R): no win
+    cv: int64 = 0
+    if ivsr_const_val(coeff, &cv) != 0:
+        if cv == 0 or cv == 1:
+            return 0             # i*0 / i*1: no multiply worth removing
+        return 1
+    return 1                     # variable invariant coefficient (e.g. i*N)
+
+
+def ivsr_collect(node: uint32):
+    if node == 0:
+        return
+    if ivsr_cand_n >= IVSR_MAX_CAND:
+        return
+    if nd_kind[node] == ND_INDEX:
+        peeled: uint32 = ivsr_peel_cast(nd_b[node])
+        coeff: uint32 = 0
+        if ivsr_match_affine(peeled, &coeff) != 0 and \
+           ivsr_coeff_profitable(coeff) != 0:
+            v: uint32 = ir_lower_pure_expr(peeled)
+            if v != 0:
+                ivsr_cand_idx[ivsr_cand_n] = peeled
+                ivsr_cand_node[ivsr_cand_n] = node
+                ivsr_cand_ir[ivsr_cand_n] = v
+                ivsr_cand_coeff[ivsr_cand_n] = coeff
+                ivsr_cand_done[ivsr_cand_n] = 0
+                ivsr_cand_n = ivsr_cand_n + 1
+    # Descend expression children + the index base.
+    ivsr_collect(nd_a[node])
+    ivsr_collect(nd_b[node])
+    ivsr_collect(nd_c[node])
+    ivsr_collect(nd_d[node])
+
+
+def ivsr_collect_body(head: uint32):
+    s: uint32 = head
+    while s != 0:
+        if ivsr_cand_n >= IVSR_MAX_CAND:
+            return
+        k: uint32 = nd_kind[s]
+        if k == ND_ASSIGN:
+            # Both the value side AND an indexed STORE target arr[E] = v.
+            ivsr_collect(nd_a[s])
+            ivsr_collect(nd_b[s])
+        elif k == ND_VAR_DECL:
+            ivsr_collect(nd_b[s])
+        elif k == ND_EXPR_STMT:
+            ivsr_collect(nd_a[s])
+        elif k == ND_RETURN:
+            ivsr_collect(nd_a[s])
+        elif k == ND_IF:
+            ivsr_collect(nd_a[s])
+            ivsr_collect_body(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                ivsr_collect(nd_a[e])
+                ivsr_collect_body(nd_b[e])
+                e = nd_next[e]
+            ivsr_collect_body(nd_d[s])
+        elif k == ND_WHILE:
+            ivsr_collect(nd_a[s])
+            ivsr_collect_body(nd_b[s])
+        elif k == ND_DO_WHILE:
+            ivsr_collect(nd_a[s])
+            ivsr_collect_body(nd_b[s])
+        elif k == ND_FOR:
+            ivsr_collect(nd_a[s])
+            ivsr_collect_body(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            ivsr_collect(nd_b[s])
+            ivsr_collect_body(nd_c[s])
+        s = nd_next[s]
+
+
+# Pending pre-header decls + post-step updates for the loop being processed.
+IVSR_MAX_PEND: uint32 = 256
+ivsr_pend_decl: Array[256, uint32]   # ND_VAR_DECL  t = E   (spliced before loop)
+ivsr_pend_n: uint32 = 0
+
+
+# Build a fresh ND_IDENT(off,len).
+def ivsr_make_ident(off: uint32, len_: uint32) -> uint32:
+    n: uint32 = node_new(ND_IDENT)
+    if n == 0:
+        return 0
+    nd_name_off[n] = off
+    nd_name_len[n] = len_
+    return n
+
+
+# Build a fresh ND_INT_LIT with value v.
+def ivsr_make_lit(v: int64) -> uint32:
+    n: uint32 = node_new(ND_INT_LIT)
+    if n == 0:
+        return 0
+    nd_num[n] = cast[uint64](v)
+    return n
+
+
+# Build `t OP= delta_node` (OP = AUGOP_ADD or AUGOP_SUB) as an ND_ASSIGN.
+def ivsr_make_step(off: uint32, len_: uint32, augop: uint32,
+                   delta_node: uint32) -> uint32:
+    a: uint32 = node_new(ND_ASSIGN)
+    if a == 0:
+        return 0
+    tgt: uint32 = ivsr_make_ident(off, len_)
+    if tgt == 0:
+        return 0
+    nd_a[a] = tgt
+    nd_b[a] = delta_node
+    nd_aux[a] = augop
+    return a
+
+
+# Build the per-iteration delta expression `coeff * step`:
+#   * coeff == 0 (unit): delta is the literal |step|.
+#   * coeff is a constant literal C: delta is the literal |C*step|.
+#   * coeff is an invariant expression: delta is `(clone of coeff) * |step|`,
+#     with `*1` folded away to just the coeff clone.
+# Returns the delta AST node and sets *negout to 1 if the running variable must
+# be DECREMENTED (negative step) — the sign is carried by AUGOP_SUB at the use
+# site so the delta node is always a non-negative magnitude expression. Returns
+# 0 on arena exhaustion.
+def ivsr_build_delta(coeff: uint32, step: int64, negout: Ptr[uint32]) -> uint32:
+    mag: int64 = step
+    neg: uint32 = 0
+    if step < 0:
+        mag = 0 - step
+        neg = 1
+    negout[0] = neg
+    if coeff == 0:
+        return ivsr_make_lit(mag)
+    cv: int64 = 0
+    if ivsr_const_val(coeff, &cv) != 0:
+        # Both constant -> fold to a single literal.
+        return ivsr_make_lit(cv * mag)
+    # Variable invariant coefficient. Clone it; multiply by mag unless mag==1.
+    cc: uint32 = cse_clone_expr(coeff)
+    if cc == 0:
+        return 0
+    if mag == 1:
+        return cc
+    m: uint32 = node_new(ND_BINARY)
+    if m == 0:
+        return 0
+    lit: uint32 = ivsr_make_lit(mag)
+    if lit == 0:
+        return 0
+    nd_aux[m] = BINOP_MUL
+    nd_a[m] = cc
+    nd_b[m] = lit
+    return m
+
+
+# Is the delta node a plain integer literal (so it can be inlined at the update
+# site without a stride temp)?
+def ivsr_delta_is_lit(n: uint32) -> uint32:
+    if n != 0 and nd_kind[n] == ND_INT_LIT:
+        return 1
+    return 0
+
+
+# Splice `stmt` immediately AFTER `after` in its sibling chain.
+def ivsr_splice_after(after: uint32, stmt: uint32):
+    nd_next[stmt] = nd_next[after]
+    nd_next[after] = stmt
+
+
+# Strength-reduce one loop. Returns via ivsr_pend_* the pre-header decls to
+# splice before the loop. The post-step `t += K*S` updates are spliced directly
+# after the IV step statement inside the body.
+def ivsr_transform_loop(loop: uint32):
+    ivsr_pend_n = 0
+    body: uint32 = nd_b[loop]
+    if body == 0:
+        return
+    # 1) Clobber analysis (IVSR model): record ident writes; ignore indexed/
+    #    member memory stores (they clobber no name); bail on call / addr-of.
+    licm_clob_reset()
+    ivsr_collect_clobbers(body)
+    if licm_giveup != 0:
+        return
+    # 2) Identify the loop's induction variable: the UNIQUE top-level ND_ASSIGN
+    #    of constant-step form whose target is an integer ident. We scan each
+    #    top-level assign target as a candidate IV, then verify it is the loop's
+    #    sole reducible IV. Simplest robust approach: try each top-level
+    #    `x = x ± C` / `x ±= C` statement; pick the FIRST that, when treated as
+    #    the IV, has exactly one write in the whole body.
+    s: uint32 = body
+    while s != 0:
+        if nd_kind[s] == ND_ASSIGN and nd_kind[nd_a[s]] == ND_IDENT:
+            cand_off: uint32 = nd_name_off[nd_a[s]]
+            cand_len: uint32 = nd_name_len[nd_a[s]]
+            ivsr_iv_off = cand_off
+            ivsr_iv_len = cand_len
+            ivsr_iv_step = 0
+            ivsr_iv_step_stmt = 0
+            ivsr_iv_writes = 0
+            ivsr_bad = 0
+            ivsr_scan_iv(body, 1)
+            if ivsr_bad == 0 and ivsr_iv_writes == 1 and ivsr_iv_step_stmt != 0:
+                # Found a clean single-step IV. Proceed with THIS one.
+                ivsr_reduce_with_iv(loop, body)
+                return
+        s = nd_next[s]
+
+
+# Given ivsr_iv_* already set to a validated single-step IV, collect affine
+# index candidates and rewrite them to running variables.
+def ivsr_reduce_with_iv(loop: uint32, body: uint32):
+    # Collect affine-index candidates across the whole body (shared IR arena).
+    ivsr_cand_n = 0
+    ir_reset()
+    ivsr_collect_body(body)
+    if ivsr_cand_n == 0:
+        return
+    step: int64 = ivsr_iv_step
+    # Group candidates by value-equal affine index; one running var per group.
+    i: uint32 = 0
+    while i < ivsr_cand_n:
+        if ivsr_cand_done[i] == 0:
+            proto: uint32 = ivsr_cand_ir[i]
+            coeff: uint32 = ivsr_cand_coeff[i]
+            # Build the per-iteration delta `coeff*step` (sign carried by augop).
+            neg: uint32 = 0
+            delta: uint32 = ivsr_build_delta(coeff, step, &neg)
+            if delta == 0:
+                return
+            augop: uint32 = AUGOP_ADD
+            if neg != 0:
+                augop = AUGOP_SUB
+            # Mint a running variable, pre-header decl `t = <clone of index>`.
+            cse_mint_temp_name()
+            toff: uint32 = opt_tmp_name_off
+            tlen: uint32 = opt_tmp_name_len
+            clone: uint32 = cse_clone_expr(ivsr_cand_idx[i])
+            if clone == 0:
+                return
+            d: uint32 = cse_make_temp_decl(toff, tlen, clone)
+            if d == 0:
+                return
+            # If the delta is a RUNTIME-INVARIANT expression (variable stride like
+            # `N`), hoist it once into a pre-header stride temp so the per-iteration
+            # update is a single `t ±= __stride` (no re-read/re-multiply of the
+            # invariant). A literal delta is inlined directly. The stride decl is
+            # spliced BEFORE the running-var decl (both go into the pre-header).
+            sdecl: uint32 = 0
+            step_rhs: uint32 = delta
+            if ivsr_delta_is_lit(delta) == 0:
+                cse_mint_temp_name()
+                soff: uint32 = opt_tmp_name_off
+                slen: uint32 = opt_tmp_name_len
+                sdecl = cse_make_temp_decl(soff, slen, delta)
+                if sdecl == 0:
+                    return
+                step_rhs = ivsr_make_ident(soff, slen)
+                if step_rhs == 0:
+                    return
+            # Rewrite EVERY value-equal occurrence's index child to read t.
+            cnt: uint32 = 0
+            j: uint32 = i
+            while j < ivsr_cand_n:
+                if ivsr_cand_done[j] == 0 and \
+                   ir_value_eq(ivsr_cand_ir[j], proto) != 0:
+                    cse_rewrite_to_ident(ivsr_cand_idx[j], toff, tlen)
+                    # ivsr_cand_idx[j] IS the index child node id (mutated in
+                    # place); the parent ND_INDEX referenced it by id, so the
+                    # parent now reads the running ident. If the index was cast-
+                    # peeled the cast node still wraps it (cast[int64](t)) — fine.
+                    ivsr_cand_done[j] = 1
+                    cnt = cnt + 1
+                j = j + 1
+            if cnt >= 1:
+                # Append `t ±= step_rhs` right after the IV step statement.
+                upd: uint32 = ivsr_make_step(toff, tlen, augop, step_rhs)
+                if upd == 0:
+                    return
+                ivsr_splice_after(ivsr_iv_step_stmt, upd)
+                # Record the pre-header decls (stride first, then running var).
+                if sdecl != 0:
+                    if ivsr_pend_n < IVSR_MAX_PEND:
+                        ivsr_pend_decl[ivsr_pend_n] = sdecl
+                        ivsr_pend_n = ivsr_pend_n + 1
+                if ivsr_pend_n < IVSR_MAX_PEND:
+                    ivsr_pend_decl[ivsr_pend_n] = d
+                    ivsr_pend_n = ivsr_pend_n + 1
+                opt_ivsr_count = opt_ivsr_count + 1
+        i = i + 1
+
+
+# Walk a statement chain; recurse into nested loops FIRST (innermost-first), then
+# strength-reduce this loop, splicing its pre-header decls immediately before it.
+# Mirrors licm_block's splice bookkeeping.
+def ivsr_block(head: uint32) -> uint32:
+    new_head: uint32 = head
+    prev: uint32 = 0
+    s: uint32 = head
+    while s != 0:
+        nxt: uint32 = nd_next[s]
+        k: uint32 = nd_kind[s]
+        if k == ND_IF:
+            nd_b[s] = ivsr_block(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                nd_b[e] = ivsr_block(nd_b[e])
+                e = nd_next[e]
+            nd_d[s] = ivsr_block(nd_d[s])
+        elif k == ND_WHILE:
+            nd_b[s] = ivsr_block(nd_b[s])
+        elif k == ND_DO_WHILE:
+            nd_b[s] = ivsr_block(nd_b[s])
+        elif k == ND_FOR:
+            nd_b[s] = ivsr_block(nd_b[s])
+        if k == ND_WHILE or k == ND_DO_WHILE:
+            ivsr_transform_loop(s)
+            if ivsr_pend_n > 0:
+                pi: uint32 = 0
+                while pi < ivsr_pend_n:
+                    d: uint32 = ivsr_pend_decl[pi]
+                    if prev == 0:
+                        new_head = d
+                    else:
+                        nd_next[prev] = d
+                    nd_next[d] = s
+                    prev = d
+                    pi = pi + 1
+        prev = s
+        s = nxt
+    return new_head
+
+
+def opt_ivsr_function(fn: uint32):
+    opt_fw_build(fn)
+    nd_c[fn] = ivsr_block(nd_c[fn])
 
 
 # =======================================================================
