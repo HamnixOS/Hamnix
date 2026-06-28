@@ -17,13 +17,13 @@ The native Adder compiler's `x86_64-linux` host path (`tests/fuzz/ad_codegen_hos
 
 **Correctness before speed.** Each kernel prints one decimal checksum; the harness asserts it is *identical* across all four builds before timing any of them. The Adder-OFF and both C builds must agree (that pins the reference answer); a kernel whose `ADDER_OPT=1` build disagrees is reported as a **miscompile finding** and excluded from the speed table — a fast wrong answer is not a benchmark.
 
-**Noise control.** Each binary is warmed up once (discarded), then timed **best-of-7** (minimum wall time). Iteration counts are sized so every kernel runs well over 100 ms even at C -O2, dwarfing process-spawn + timer overhead. The kernels that are pure ALU/closed-form (`licm`, `dcecopy`) write into a global ring buffer each step so gcc -O2 cannot delete the loop — the comparison stays about generated loop code, not gcc's loop-elimination.
+**Noise control.** Each binary is warmed up once (discarded), then timed **best-of-9** (minimum wall time). Iteration counts are sized so every kernel runs well over 100 ms even at C -O2, dwarfing process-spawn + timer overhead. The kernels that are pure ALU/closed-form (`licm`, `dcecopy`) write into a global ring buffer each step so gcc -O2 cannot delete the loop — the comparison stays about generated loop code, not gcc's loop-elimination.
 
 ## Environment
 
 - **CPU:** Intel(R) Core(TM) i7-8086K CPU @ 4.00GHz
 - **C compiler:** gcc (Debian 14.2.0-19) 14.2.0
-- **Reps:** best-of-7, after 1 warm-up
+- **Reps:** best-of-9, after 1 warm-up
 - **Adder compiler:** native `codegen.ad` via the `x86_64-linux` host wrapper (`tests/fuzz/ad_codegen_host.py`)
 
 ## Results
@@ -32,18 +32,18 @@ Timings in seconds (best-of-N, lower is better). `ON/OFF` > 1 means the optimize
 
 | kernel | Adder-OFF | Adder-ON | C-O0 | C-O2 | ON/OFF (speedup) | ON / C-O2 | ON / C-O0 | opt passes fired |
 |---|--:|--:|--:|--:|--:|--:|--:|---|
-| matmul | 0.1408s | 0.1137s | 0.0732s | 0.0181s | **1.24×** | 6.29× | 1.55× | licm=1, strengthred=2 |
-| sieve | 0.2104s | 0.1990s | 0.1904s | 0.0408s | **1.06×** | 4.88× | 1.05× | — |
-| licm | 0.2794s | 0.2403s | 0.1222s | 0.0324s | **1.16×** | 7.42× | 1.97× | cse=1 |
-| dcecopy | 0.5237s | 0.4146s | 0.3021s | 0.0556s | **1.26×** | 7.46× | 1.37× | constbranch=1, copyprop=2 |
-| fib | 0.5293s | 0.5823s | 0.3886s | 0.1120s | **0.91×** | 5.20× | 1.50× | — |
-| collatz | 1.3185s | 0.4835s | 0.3859s | 0.1403s | **2.73×** | 3.45× | 1.25× | strengthred=1 |
-| mandel | 0.1024s | 0.0958s | 0.0366s | 0.0207s | **1.07×** | 4.62× | 2.62× | — |
-| **geomean** | | | | | **1.26×** | 5.44× | 1.55× | |
+| matmul | 0.1395s | 0.1085s | 0.0739s | 0.0177s | **1.29×** | 6.13× | 1.47× | licm=1, strengthred=2 |
+| sieve | 0.2104s | 0.1995s | 0.1930s | 0.0418s | **1.05×** | 4.77× | 1.03× | — |
+| licm | 0.2827s | 0.2431s | 0.1240s | 0.0321s | **1.16×** | 7.57× | 1.96× | cse=1 |
+| dcecopy | 0.5242s | 0.4077s | 0.2941s | 0.0542s | **1.29×** | 7.52× | 1.39× | constbranch=1, copyprop=2 |
+| fib | 0.5165s | 0.5700s | 0.3847s | 0.1090s | **0.91×** | 5.23× | 1.48× | — |
+| collatz | 1.2892s | 0.4671s | 0.3741s | 0.1334s | **2.76×** | 3.50× | 1.25× | strengthred=1 |
+| mandel | 0.1003s | 0.0931s | 0.0356s | 0.0207s | **1.08×** | 4.50× | 2.62× | — |
+| **geomean** | | | | | **1.27×** | 5.42× | 1.53× | |
 
 ## Headline
 
-- **Optimizer ON vs OFF:** the `ADDER_OPT=1` 6-pass optimizer is **1.26× faster** than the baseline backend (geomean over the correct kernels).
-- **Adder-ON vs C -O2:** Adder-ON is **5.44× slower** than gcc -O2 (geomean).
-- **Adder-ON vs C -O0:** Adder-ON is **1.55× slower** than gcc -O0 (geomean).
+- **Optimizer ON vs OFF:** the `ADDER_OPT=1` 6-pass optimizer is **1.27× faster** than the baseline backend (geomean over the correct kernels).
+- **Adder-ON vs C -O2:** Adder-ON is **5.42× slower** than gcc -O2 (geomean).
+- **Adder-ON vs C -O0:** Adder-ON is **1.53× slower** than gcc -O0 (geomean).
 
