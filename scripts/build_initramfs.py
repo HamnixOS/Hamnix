@@ -1888,6 +1888,20 @@ if os.environ.get("ENABLE_DEVSTAT_SPLIT_TEST") == "1":
 if os.environ.get("ENABLE_ACCESS_MODE_TEST") == "1":
     FILES.append(("/etc/access-mode-test", b"1\n"))
 
+# Linux-NS per-file POSIX DAC self-test fixtures. scripts/
+# test_linux_ns_dac.sh sets ENABLE_DAC_TEST=1 to plant two cpio files
+# with KNOWN modes (root-owned by cpio convention, uid 0):
+#   /etc/dac-world.txt   0644 — world-readable: a non-root Linux user
+#                               (dave, uid 1000) CAN read it.
+#   /etc/dac-root600.txt 0600 — root-only: dave is DENIED (EACCES) read
+#                               AND write; hostowner (Linux root) reads OK.
+# These ride the same kernel cpio perm-check (_perm_check_cpio) that
+# /etc/shadow does, giving the test a deterministic positive (world)
+# and negative (root600) alongside the headline /etc/shadow case.
+if os.environ.get("ENABLE_DAC_TEST") == "1":
+    FILES.append(("/etc/dac-world.txt", b"WORLD-READABLE\n", 0o100644))
+    FILES.append(("/etc/dac-root600.txt", b"ROOT-SECRET\n", 0o100600))
+
 # readlink(2)/readlinkat(2)-on-tmpfs-symlink self-test. scripts/
 # test_tmpfs_readlink.sh sets ENABLE_TMPFS_READLINK_TEST=1 to plant
 # /etc/tmpfs-readlink-test. init/main.ad at boot:37.trl detects the marker
@@ -3181,6 +3195,17 @@ if os.environ.get("ENABLE_VOLRT_SELFTEST") == "1":
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
 
 
+# Per-file POSIX mode for sensitive /etc/* entries (full cpio mode incl.
+# the S_IFREG type nibble 0o100000). Everything not listed keeps the
+# default 0644. The credential stores are 0600 root-owned so a non-root
+# reader inside the Linux NS is denied by the kernel's cpio perm-check
+# (fs/vfs.ad:_perm_check_cpio) while hostowner/root reads through.
+_ETC_MODE_OVERRIDE = {
+    "shadow":  0o100600,
+    "gshadow": 0o100600,
+}
+
+
 def cpio_entry(name: str, data: bytes, mode: int = 0o100644) -> bytes:
     name_bytes = name.encode() + b"\0"
     header = (
@@ -3341,9 +3366,12 @@ def build_archive() -> bytes:
         # /etc/* marker FILES here while still carrying zero userland.
         marker_blob = b""
         n_markers = 0
-        for name, data in FILES:
+        for entry in FILES:
+            name = entry[0]
+            data = entry[1]
+            e_mode = entry[2] if len(entry) == 3 else 0o100644
             if name.startswith("/etc/"):
-                marker_blob += cpio_entry(name, data)
+                marker_blob += cpio_entry(name, data, mode=e_mode)
                 n_markers += 1
         print("[build_initramfs] HAMNIX_CPIO_EMPTY=1: emitting %d /etc boot "
               "markers + trailer (installed disk boots off ext4)." % n_markers)
@@ -3552,9 +3580,17 @@ def build_archive() -> bytes:
                     continue
                 data = ef.read_bytes()
                 name = "/etc/" + ef.name
-                blob += cpio_entry(name, data)
+                # Per-file POSIX mode override. The credential stores MUST
+                # ship 0600 root-owned so the kernel's cpio server-boundary
+                # perm-check (_perm_check_cpio in fs/vfs.ad) denies a
+                # non-root reader (e.g. `dave`, uid 1000) inside `enter
+                # linux` while hostowner (Linux root) bypasses. Without this
+                # they staged at the default 0644 and were world-readable —
+                # the leak the multi-user (#497) work flagged.
+                e_mode = _ETC_MODE_OVERRIDE.get(ef.name, 0o100644)
+                blob += cpio_entry(name, data, mode=e_mode)
                 print(f"  embedded {name} ({len(data)} bytes from "
-                      f"etc/{ef.name})")
+                      f"etc/{ef.name}, mode={e_mode & 0o7777:04o})")
             elif ef.is_dir():
                 # etc/man/ is staged at the conventional Unix manpage
                 # path /usr/share/man/<topic>.<N>.md. Source-of-truth
@@ -4876,8 +4912,16 @@ def build_archive() -> bytes:
               f"({n_bytes} bytes) under {py_target_prefix}/ "
               f"from {lib_root}")
 
-    for name, data in FILES:
-        blob += cpio_entry(name, data)
+    for entry in FILES:
+        # FILES entries are (name, data) 2-tuples (default mode 0644) or
+        # (name, data, mode) 3-tuples when a fixture needs a specific
+        # POSIX mode (e.g. the DAC test's root-owned 0600 file).
+        if len(entry) == 3:
+            name, data, e_mode = entry
+            blob += cpio_entry(name, data, mode=e_mode)
+        else:
+            name, data = entry
+            blob += cpio_entry(name, data)
     blob += cpio_trailer()
     return blob
 
