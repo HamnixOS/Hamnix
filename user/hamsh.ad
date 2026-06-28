@@ -121,6 +121,14 @@ extern def sys_yield() -> int32
 extern def sys_getuid() -> uint32
 extern def sys_getgid() -> uint32
 extern def sys_setuid(uid: uint32) -> int32
+# docs/security.md Phase 4: /dev/auth-mediated identity change. a0 = an
+# open /dev/auth fd that has SUCCESSFULLY verified a (user,pass) pair;
+# the kernel recovers the fd's verified-uid slot and sets THIS task's
+# uid/gid to it — the gate is the PASSWORD PROOF in the slot, NOT the
+# caller's prior uid. This is what lets `newshell <user>` (and su/login)
+# elevate a REGULAR user after authentication. Returns the new uid (>=0)
+# or -1.
+extern def sys_setuid_auth(authfd: int32) -> int32
 
 # /proc/svc Phase 6: publish one entry of the service registry into
 # the kernel-side mirror that backs `/proc/svc/<name>` reads. a0 =
@@ -3835,14 +3843,18 @@ def builtin_read(argc: int32) -> int32:
 #
 # Pipeline:
 #   1. Lookup target uid in /etc/passwd.
-#   2. Read /etc/shadow, find the target's hash triple.
-#   3. Prompt for password (`-s` silent read).
-#   4. sha512_crypt_verify against the stored triple.
-#   5. On match: rfork(RFPROC|RFNAMEG) — child gets a COW namespace.
-#      Child sys_setuid(target_uid) — kernel allows only if current
-#      uid IS 1 (hostowner). Then exec /bin/hamsh with the target's
-#      recipe at /etc/users/<name>.ns (or default.ns).
-#   6. Parent sys_waitpid for the child.
+#   2. Console-owner self-elevation fast path (uid 1 -> uid 1): skip the
+#      password entirely (identity-vouching, like `login -f`).
+#   3. Otherwise prompt for password (silent read) and authenticate via
+#      the kernel /dev/auth cdev, which reads /etc/shadow + SHA-512-crypt
+#      verifies in kernel context and stamps a verified-uid verdict on
+#      the fd.
+#   4. On match: rfork(RFPROC|RFNAMEG) — child gets a COW namespace.
+#      Child calls SYS_SETUID_AUTH(authfd) — the kernel honours the fd's
+#      verified-uid slot as proof of identity, so a REGULAR user can
+#      elevate too (mirrors su.ad / login.ad). Then exec /bin/hamsh with
+#      the target's recipe at /etc/users/<name>.ns (or default.ns).
+#   5. Parent sys_waitpid for the child, then closes the auth fd.
 #
 # v1 limitations (deferred per the spec's "Implementation surface"
 # phase ordering):
@@ -3946,34 +3958,41 @@ def _newshell_auth_via_cdev(target_user: Ptr[uint8],
                             password: Ptr[uint8]) -> int32:
     # docs/security.md Phase 4: authenticate via the kernel /dev/auth
     # cdev. The cdev reads /etc/shadow from kernel context, runs the
-    # SHA-512-crypt verify, and stamps a per-fd verdict. Returns 1 on
-    # successful authentication, 0 on failure (wrong password OR no
-    # such user OR open failed). We deliberately collapse the failure
-    # modes into a single bit — leaking "the user exists" before a
-    # successful auth would help an attacker enumerate accounts.
+    # SHA-512-crypt verify, and stamps a per-fd verdict on SUCCESS.
+    #
+    # Returns the STILL-OPEN /dev/auth fd (>= 0) on a successful auth, or
+    # -1 on any failure (wrong password OR no such user OR open failed) —
+    # we deliberately collapse the failure modes into a single value;
+    # leaking "the user exists" before a successful auth would help an
+    # attacker enumerate accounts. The fd is returned OPEN so the caller
+    # can hand it to SYS_SETUID_AUTH (the slot's verified-uid verdict
+    # lives on the fd and is lost once it is closed) — mirroring su.ad /
+    # login.ad, which authenticate then sys_setuid_auth(authfd) on the
+    # same fd. The caller owns closing it.
     fd: int32 = sys_open(cast[Ptr[char]]("/dev/auth"))
     if fd < 0:
         # /dev/auth not present (very early-boot path; the cdev should
         # always exist). Treat as auth failure.
-        return 0
+        return -1
     ul: uint64 = _newshell_cstr_len(target_user)
     pl: uint64 = _newshell_cstr_len(password)
     user_prefix: Ptr[uint8] = "user "
     pass_prefix: Ptr[uint8] = "pass "
     if _newshell_write_line(fd, user_prefix, 5, target_user, ul) < 0:
         sys_close(fd)
-        return 0
+        return -1
     if _newshell_write_line(fd, pass_prefix, 5, password, pl) < 0:
         sys_close(fd)
-        return 0
+        return -1
     n: int64 = sys_read(fd, &newshell_auth_resp[0], 64)
-    sys_close(fd)
     if n < 2:
-        return 0
+        sys_close(fd)
+        return -1
     # "ok" prefix == verified; anything else (notably "denied") fails.
     if newshell_auth_resp[0] == 111 and newshell_auth_resp[1] == 107:   # 'o','k'
-        return 1
-    return 0
+        return fd
+    sys_close(fd)
+    return -1
 
 
 def _newshell_name_is_hostowner(name: Ptr[uint8]) -> int32:
@@ -4002,13 +4021,25 @@ def _newshell_name_is_hostowner(name: Ptr[uint8]) -> int32:
 
 
 def _newshell_become(target_uid: uint32, target_user: Ptr[uint8],
-                     cmd_string: Ptr[uint8]) -> int32:
-    # rfork + setuid + exec the target user's shell session. Shared by
-    # the authenticated path AND the console-owner self-elevation
-    # fast-path (uid 1 → uid 1, no password). The kernel SYS_SETUID gate
-    # is "current uid must be 1" — hostowner downgrading to any uid is
-    # allowed; a regular user that reached here (target_uid != 1, post
-    # auth) still hits -EPERM and gets the documented gap message.
+                     cmd_string: Ptr[uint8], auth_fd: int32) -> int32:
+    # rfork + change identity + exec the target user's shell session.
+    # Shared by TWO callers, distinguished by `auth_fd`:
+    #
+    #   auth_fd >= 0  — AUTHENTICATED path. The fd is an open /dev/auth
+    #     fd that already verified (target_user, password). The child
+    #     calls SYS_SETUID_AUTH(auth_fd): the kernel honours the fd's
+    #     verified-uid slot as proof of identity, so the identity change
+    #     succeeds REGARDLESS of the caller's prior uid. This is exactly
+    #     how su.ad / login.ad elevate — a REGULAR user can now `newshell
+    #     hostowner` (or `newshell <other>`) after the password prompt,
+    #     closing the documented gap. The fd survives the rfork because
+    #     RFNAMEG COW-copies the /fd table (same fd number, same slot).
+    #
+    #   auth_fd <  0  — console-owner self-elevation fast-path (uid 1 →
+    #     uid 1, no password). The child calls SYS_SETUID(target_uid);
+    #     the kernel gate is "current uid must be 1", which the host
+    #     owner satisfies. (This branch is only ever reached for the
+    #     uid-1 → uid-1 transition; see builtin_newshell.)
     flags: int32 = RFPROC | RFNAMEG
     pid: int32 = sys_rfork(flags)
     if pid < 0:
@@ -4019,13 +4050,20 @@ def _newshell_become(target_uid: uint32, target_user: Ptr[uint8],
         # spawned /bin/hamsh knows it's a newshell-spawned interactive
         # shell (it'll load /etc/users/<target>.ns per Phase 9), then
         # exec.
-        rs: int32 = sys_setuid(target_uid)
+        rs: int32 = -1
+        if auth_fd >= 0:
+            # Password-proof elevation (mirrors su.ad). The fd carries
+            # the verified-uid verdict; the kernel sets uid+gid to it.
+            rs = sys_setuid_auth(auth_fd)
+        else:
+            # Console-owner self-elevation (uid 1 → uid 1, no password).
+            rs = sys_setuid(target_uid)
         if rs < 0:
-            # SETUID rejected — current uid wasn't 1 (hostowner). A
-            # regular user authenticated successfully but cannot
-            # elevate without the kernel honouring the /dev/auth slot
-            # as proof of identity. Documented gap.
-            write_str(2, "newshell: setuid denied (not hostowner; /dev/auth-mediated elevation not yet wired)\n")
+            # Identity change rejected. For the auth path this means the
+            # /dev/auth slot wasn't verified (should not happen — the
+            # caller only passes a verified fd); for the no-password
+            # path it means the caller wasn't uid 1.
+            write_str(2, "newshell: identity change denied\n")
             sys_exit(1)
         # Stamp HAMNIX_NEWSHELL_USER=<target> in env so the spawned
         # hamsh's main() recognises this as a newshell session and
@@ -4139,16 +4177,21 @@ def builtin_newshell(argc: int32) -> int32:
     #
     # This does NOT weaken multi-user auth:
     #   * A REGULAR user (uid != 1) running `newshell hostowner` does NOT
-    #     take this branch — they still hit the password prompt, and even a
-    #     correct password can't make sys_setuid(1) succeed (the kernel
-    #     gate is "current uid == 1"), so they cannot elevate. Unchanged.
+    #     take this branch — they still hit the password prompt below. The
+    #     difference from the old code: a CORRECT password now DOES elevate
+    #     them, because the authenticated path uses SYS_SETUID_AUTH (the
+    #     /dev/auth fd's verified-uid slot is the proof of identity, not the
+    #     caller's prior uid) exactly like su/login. A wrong/absent password
+    #     still cannot — the /dev/auth verify fails and no fd is returned.
     #   * `newshell <other-user>` to a DIFFERENT uid (target_uid != 1) does
-    #     NOT take this branch either — it still prompts + authenticates.
+    #     NOT take this branch either — it prompts + authenticates + (on
+    #     success) SYS_SETUID_AUTHs into that user.
     #   * `su` / `login` to other users are untouched (separate binaries).
     # Only the host owner confirming its OWN identity is password-free.
     cur_uid: uint32 = sys_getuid()
     if cur_uid == 1 and target_uid == 1:
-        return _newshell_become(target_uid, target_user, cmd_string)
+        # No-password fast path: auth_fd = -1 → child uses SYS_SETUID.
+        return _newshell_become(target_uid, target_user, cmd_string, -1)
     # Step 2: prompt password (silent — no local echo). We DO bring the
     # bytes through userland just to hand them to /dev/auth, but the
     # cdev does the actual /etc/shadow read and SHA-512-crypt verify
@@ -4171,19 +4214,78 @@ def builtin_newshell(argc: int32) -> int32:
     # Step 3: authenticate via /dev/auth. Plaintext lifetime here is
     # bounded by this function — the cdev's write zeroes its pass_buf
     # on success/failure, and we don't keep our own copy past this call.
-    ok: int32 = _newshell_auth_via_cdev(target_user, &read_buf[0])
+    # On success the fd is returned STILL OPEN, carrying the verified-uid
+    # slot — we hand it to _newshell_become's child for SYS_SETUID_AUTH.
+    auth_fd: int32 = _newshell_auth_via_cdev(target_user, &read_buf[0])
     # Wipe the local read_buf so plaintext doesn't linger in hamsh's
     # global scratch beyond the auth call.
     wz: uint64 = 0
     while wz < 256:
         read_buf[wz] = 0
         wz = wz + 1
-    if ok == 0:
+    if auth_fd < 0:
         # Print to stderr — auth failures are diagnostic, not data.
         write_str(2, "newshell: authentication failed\n")
         return 1
-    # Step 4: rfork + setuid + exec the target shell session.
-    return _newshell_become(target_uid, target_user, cmd_string)
+    # Step 4: rfork + SYS_SETUID_AUTH(auth_fd) + exec the target shell
+    # session. The /dev/auth fd's verified slot is the proof of identity,
+    # so this works whether the caller was the hostowner OR a regular
+    # user (mirrors su.ad / login.ad) — closing the documented gap.
+    rc_become: int32 = _newshell_become(target_uid, target_user,
+                                        cmd_string, auth_fd)
+    # Parent owns closing the auth fd now the child has consumed the slot.
+    sys_close(auth_fd)
+    return rc_become
+
+
+# `setuid [<uid>]` — IN-PLACE identity change for the CURRENT shell
+# process (no rfork, no new shell). Two uses:
+#
+#   setuid          — getter. Prints "uid <n>" for the current uid.
+#                     Used as a runtime probe (tests, scripts).
+#   setuid <uid>    — drop/keep identity. Calls SYS_SETUID(<uid>); the
+#                     kernel gate is "current uid must be 1 (hostowner)",
+#                     so this is a PRIVILEGE DROP primitive: the host
+#                     owner can step DOWN to any uid, but a non-hostowner
+#                     cannot use it to elevate (that needs the password
+#                     proof — see `newshell` / su / login). On success
+#                     prints "uid <n>"; on rejection prints an error and
+#                     returns 1.
+#
+# This is what rc.de-user uses to stamp the DE terminal to a NON-host-
+# owner uid (NOBODY, 65534): the compositor spawns the terminal's hamsh
+# as hostowner (inherited), the rc plants the namespace surface while it
+# still has the privilege to bind, then `setuid 65534` drops to NOBODY
+# right before exec'ing the user program — so the desktop shell, and
+# everything launched from it, runs unprivileged. Genuine elevation from
+# inside the terminal still works via `newshell hostowner` (password).
+def builtin_setuid(argc: int32) -> int32:
+    if argc < 2:
+        # Getter: report the current uid.
+        write_cstr1("uid ")
+        write_cstr1(render_int(cast[int64](cast[uint64](sys_getuid()))))
+        write_cstr1("\n")
+        return 0
+    a: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[1])
+    v: uint64 = 0
+    i: uint64 = 0
+    if a[0] == 0:
+        errstr_set("setuid: empty uid")
+        return 1
+    while a[i] != 0:
+        if a[i] < 48 or a[i] > 57:
+            errstr_set("setuid: non-numeric uid")
+            return 1
+        v = v * 10 + cast[uint64](a[i] - 48)
+        i = i + 1
+    rs: int32 = sys_setuid(cast[uint32](v & 0xFFFFFFFF))
+    if rs < 0:
+        errstr_set("setuid: permission denied (only hostowner may change uid)")
+        return 1
+    write_cstr1("uid ")
+    write_cstr1(render_int(cast[int64](cast[uint64](sys_getuid()))))
+    write_cstr1("\n")
+    return 0
 
 
 # Builtin dispatch — returns -1 if `cmd` is not a builtin, else exit
@@ -4240,6 +4342,8 @@ def _builtin_dispatch(cmd: Ptr[uint8], argc: int32) -> int32:
     # docs/security.md Phase 7.
     if cstr_eq(cmd, "newshell") != 0:
         return builtin_newshell(argc)
+    if cstr_eq(cmd, "setuid") != 0:
+        return builtin_setuid(argc)
     if cstr_eq(cmd, "source") != 0:
         return builtin_source(argc)
     return -1
@@ -4279,6 +4383,8 @@ def _builtin_dispatch_kind_check(cmd: Ptr[uint8]) -> int32:
     if cstr_eq(cmd, "read") != 0:
         return 1
     if cstr_eq(cmd, "newshell") != 0:
+        return 1
+    if cstr_eq(cmd, "setuid") != 0:
         return 1
     if cstr_eq(cmd, "source") != 0:
         return 1
