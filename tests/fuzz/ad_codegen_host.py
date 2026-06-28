@@ -272,6 +272,7 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       irfallback=meta.get("IRFALLBACK", 0),
                       irreassoc=meta.get("IRREASSOC", 0),
                       iremitfloat=meta.get("IREMITFLOAT", 0),
+                      destsel=meta.get("DESTSEL", 0),
                       irscratch=meta.get("IRSCRATCH", 0),
                       irscratchmiss=meta.get("IRSCRATCHMISS", 0),
                       irborrow=meta.get("IRBORROW", 0),
@@ -580,6 +581,7 @@ class CodegenRun:
         self.irfold = kw.get("irfold", 0)
         self.irreassoc = kw.get("irreassoc", 0)
         self.iremitfloat = kw.get("iremitfloat", 0)
+        self.destsel = kw.get("destsel", 0)
         self.strengthred = kw.get("strengthred", 0)
         self.isel = kw.get("isel", 0)
         self.aluload = kw.get("aluload", 0)
@@ -630,6 +632,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     irfold = getattr(dump, "irfold", 0)
     irreassoc = getattr(dump, "irreassoc", 0)
     iremitfloat = getattr(dump, "iremitfloat", 0)
+    destsel = getattr(dump, "destsel", 0)
     strengthred = getattr(dump, "strengthred", 0)
     isel = getattr(dump, "isel", 0)
     aluload = getattr(dump, "aluload", 0)
@@ -641,6 +644,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                           stdout=out, exit=rp.returncode, folds=folds, cse=cse,
                           licm=licm, iremit=iremit, irfold=irfold,
                           irreassoc=irreassoc, iremitfloat=iremitfloat, ffold=ffold,
+                          destsel=destsel,
                           strengthred=strengthred, isel=isel, aluload=aluload,
                           ivsr=ivsr, storeelim=storeelim, cmpjcc=cmpjcc)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
@@ -648,6 +652,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                       licm=licm, dce=dce,
                       constbranch=constbranch, copyprop=copyprop, iremit=iremit,
                       irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat,
+                      destsel=destsel,
                       strengthred=strengthred, isel=isel, aluload=aluload,
                       ivsr=ivsr, storeelim=storeelim, cmpjcc=cmpjcc)
 
