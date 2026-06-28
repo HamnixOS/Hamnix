@@ -101,6 +101,7 @@ def build_adder(name, opt):
         "fold": r.folds, "ffold": r.ffold, "cse": r.cse, "licm": r.licm,
         "dce": getattr(r, "dce", 0), "constbranch": getattr(r, "constbranch", 0),
         "copyprop": getattr(r, "copyprop", 0),
+        "strengthred": getattr(r, "strengthred", 0),
     }
     return elf, r.stdout.strip(), passes
 

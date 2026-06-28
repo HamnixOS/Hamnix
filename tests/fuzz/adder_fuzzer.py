@@ -275,10 +275,54 @@ class Gen:
     #      compiler's _binop_signed_op over the operands' get_expr_type().
     def _divmod(self, depth, typ):
         a = self.expr(depth - 1)
-        d = self.rng.randint(1, 9)            # nonzero divisor (avoid /0 fault)
         op = self.rng.choice(["/", "%"])
-        # The divisor is a typed literal cast[typ](d): its get_expr_type is typ.
-        b = TV(f"cast[{typ.name}]({d})", _to_reg(typ.wrap(d)), typ, gt=typ)
+        # Divisor selection. Two forms exercise DIFFERENT backend paths:
+        #   * BARE literal  `5` / `-7`  -> ND_INT_LIT / UNOP_NEG(ND_INT_LIT).
+        #     get_expr_type is UNKNOWN (gt=None), so the op's signedness is
+        #     governed solely by the dividend `a`. This is the form the native
+        #     div/mod-by-constant STRENGTH REDUCTION pass recognizes (it reads
+        #     nd_num directly), so we bias toward it to exercise the reduction.
+        #   * cast[T](d)  -> ND_CAST: gt=T. Keeps the original mixed-signedness
+        #     coverage (the cast form is NOT strength-reduced, so it also keeps
+        #     the plain idiv/div path under test).
+        # Constant variety: powers of two (incl. large), small odds, large
+        # odds/primes, and +-1, on both small and 64-bit-significant values, so
+        # the pow2-shift path, the unsigned magic path (incl. the "add" 65-bit
+        # multiplier case), and the signed magic path all fire.
+        pool = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 16, 17, 25, 32, 64, 100,
+            128, 125, 256, 1000, 1023, 1024, 65535, 65536, 7919, 1000000007,
+            (1 << 31), (1 << 32) + 1, (1 << 40) + 7, (1 << 62) + 3,
+        ]
+        d = self.rng.choice(pool)
+        neg = self.rng.random() < 0.35
+        bare = self.rng.random() < 0.75      # bias toward the SR-eligible form
+        if bare:
+            # Bare literal divisor; UNOP_NEG(lit) for negatives. gt=None.
+            if neg:
+                dsrc = f"(-{d})"
+                dbits = _to_reg(-d)
+            else:
+                dsrc = f"{d}"
+                dbits = _to_reg(d)
+            b = TV(dsrc, dbits, typ, gt=None)
+        else:
+            # cast[T](d) divisor: get_expr_type = typ. This form is NOT strength-
+            # reduced (it is an ND_CAST, not a bare literal); it keeps the plain
+            # idiv/div path under test with a TYPED operand (mixed signedness).
+            # The cast truncates to T's width at runtime, so the value MUST fit T
+            # nonzero (a wrap-to-0 would divide by zero). Use a small divisor that
+            # is safe for every T (including uint8/int8).
+            small = self.rng.choice([2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 25, 100])
+            sval = -small if (neg and typ.signed) else small
+            b = TV(f"cast[{typ.name}]({sval})", _to_reg(typ.wrap(sval)), typ, gt=typ)
+        # Guard the one x86 idiv-trapping combo: a SIGNED INT_MIN / -1 overflows
+        # idivq (SIGFPE) on the non-reduced lanes. Strength reduction computes
+        # the defined wrap, but to keep ALL lanes trap-free, never emit a -1
+        # divisor (1/-1 add nothing to coverage the pow2 path lacks).
+        if _signed64(b.reg) in (1, -1) and op == "/" and _gt_is_unsigned(a.gt) is not True:
+            # fall back to a safe small even divisor
+            b = TV("4", _to_reg(4), typ, gt=None)
         use_signed = divshift_is_signed(a, b)
         if use_signed:
             av = _signed64(a.reg)             # %rax as signed 64-bit (idivq)

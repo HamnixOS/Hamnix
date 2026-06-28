@@ -32,45 +32,18 @@ Timings in seconds (best-of-N, lower is better). `ON/OFF` > 1 means the optimize
 
 | kernel | Adder-OFF | Adder-ON | C-O0 | C-O2 | ON/OFF (speedup) | ON / C-O2 | ON / C-O0 | opt passes fired |
 |---|--:|--:|--:|--:|--:|--:|--:|---|
-| matmul | 0.1427s | 0.1223s | 0.0749s | 0.0180s | **1.17×** | 6.81× | 1.63× | licm=1 |
-| licm | 0.2800s | 0.2813s | 0.1229s | 0.0321s | **1.00×** | 8.75× | 2.29× | cse=1 |
-| dcecopy | 0.5248s | 0.4961s | 0.3044s | 0.0551s | **1.06×** | 9.01× | 1.63× | constbranch=1, copyprop=2 |
-| fib | 0.5375s | 0.5424s | 0.3910s | 0.1122s | **0.99×** | 4.83× | 1.39× | — |
-| **geomean** | | | | | **1.05×** | 7.14× | 1.70× | |
+| matmul | 0.1324s | 0.1136s | 0.0716s | 0.0176s | **1.17×** | 6.46× | 1.59× | licm=1, strengthred=2 |
+| sieve | 0.1969s | 0.1979s | 0.1915s | 0.0406s | **1.00×** | 4.87× | 1.03× | — |
+| licm | 0.2646s | 0.2935s | 0.1188s | 0.0312s | **0.90×** | 9.40× | 2.47× | cse=1 |
+| dcecopy | 0.5082s | 0.4084s | 0.2851s | 0.0544s | **1.24×** | 7.51× | 1.43× | constbranch=1, copyprop=2 |
+| fib | 0.5135s | 0.5584s | 0.3822s | 0.1040s | **0.92×** | 5.37× | 1.46× | — |
+| collatz | 1.2847s | 0.4881s | 0.3757s | 0.1364s | **2.63×** | 3.58× | 1.30× | strengthred=1 |
+| mandel | 0.0999s | 0.0933s | 0.0363s | 0.0203s | **1.07×** | 4.59× | 2.57× | — |
+| **geomean** | | | | | **1.19×** | 5.70× | 1.61× | |
 
 ## Headline
 
-- **Optimizer ON vs OFF:** the `ADDER_OPT=1` 6-pass optimizer is **1.05× faster** than the baseline backend (geomean over the correct kernels).
-- **Adder-ON vs C -O2:** Adder-ON is **7.14× slower** than gcc -O2 (geomean).
-- **Adder-ON vs C -O0:** Adder-ON is **1.70× slower** than gcc -O0 (geomean).
-
-## Correctness finding — `ADDER_OPT=1` miscompiles
-
-The following kernels produce the WRONG checksum under `ADDER_OPT=1` (optimizer ON) and are **excluded from the speed table**. The Adder-OFF baseline and both C builds all agree on the reference value, so this is an optimizer bug, not a bad kernel. Per the benchmark's rules the optimizer was **not** modified to hide this.
-
-| kernel | reference checksum | ADDER_OPT=1 got |
-|---|--:|--:|
-| sieve | 1787196 | 148934 |
-| collatz | 103275238 | 800000 |
-| mandel | 6712881 | 1407 |
-
-**Shape of the bug (minimal repro).** All three failing kernels share one control-flow shape: a `while` loop nested inside an outer loop, where a local accumulator is re-initialised at the top of each outer iteration and read *after* the inner loop. Minimal trigger:
-
-```
-def main(argc: int32, argv: Ptr[uint64]) -> int32:
-    acc: int64 = 0
-    reps: int64 = 0
-    while reps < 3:
-        count: int64 = 0          # re-init each outer pass
-        i: int64 = 0
-        while i < 5:
-            count = count + 1
-            i = i + 1
-        acc = acc + count         # read after inner loop
-        reps = reps + 1
-    print_u64(cast[uint64](acc))  # OFF: 15   ON: 6  (WRONG)
-    return cast[int32](0)
-```
-
-Expected `15` (3 × 5); `ADDER_OPT=1` emits `6`. The optimizer drops all but the last outer pass's contribution (the per-pass re-init of `count` is mishandled). None of the six pass counters fire on this unit, so the defect is in the IR-emit/lowering path the `--opt` mode enables, not in a high-level pass. This evades the predicted-output fuzzer (which reports 0 miscompiles) because the fuzzer's generated corpus does not exercise this nested-loop reset-and-read shape.
+- **Optimizer ON vs OFF:** the `ADDER_OPT=1` 6-pass optimizer is **1.19× faster** than the baseline backend (geomean over the correct kernels).
+- **Adder-ON vs C -O2:** Adder-ON is **5.70× slower** than gcc -O2 (geomean).
+- **Adder-ON vs C -O0:** Adder-ON is **1.61× slower** than gcc -O0 (geomean).
 

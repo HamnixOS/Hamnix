@@ -197,7 +197,8 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       iremitfloat=meta.get("IREMITFLOAT", 0),
                       irscratch=meta.get("IRSCRATCH", 0),
                       irscratchmiss=meta.get("IRSCRATCHMISS", 0),
-                      irborrow=meta.get("IRBORROW", 0))
+                      irborrow=meta.get("IRBORROW", 0),
+                      strengthred=meta.get("STRENGTHRED", 0))
 
 
 # --------------------------------------------------------------------------
@@ -496,6 +497,7 @@ class CodegenRun:
         self.irfold = kw.get("irfold", 0)
         self.irreassoc = kw.get("irreassoc", 0)
         self.iremitfloat = kw.get("iremitfloat", 0)
+        self.strengthred = kw.get("strengthred", 0)
 
 
 def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
@@ -539,15 +541,18 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     irfold = getattr(dump, "irfold", 0)
     irreassoc = getattr(dump, "irreassoc", 0)
     iremitfloat = getattr(dump, "iremitfloat", 0)
+    strengthred = getattr(dump, "strengthred", 0)
     if rp.returncode < 0:
         return CodegenRun("runfail", detail=f"signal {-rp.returncode}",
                           stdout=out, exit=rp.returncode, folds=folds, cse=cse,
                           licm=licm, iremit=iremit, irfold=irfold,
-                          irreassoc=irreassoc, iremitfloat=iremitfloat, ffold=ffold)
+                          irreassoc=irreassoc, iremitfloat=iremitfloat, ffold=ffold,
+                          strengthred=strengthred)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
                       folds=folds, ffold=ffold, cse=cse, licm=licm, dce=dce,
                       constbranch=constbranch, copyprop=copyprop, iremit=iremit,
-                      irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat)
+                      irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat,
+                      strengthred=strengthred)
 
 
 if __name__ == "__main__":

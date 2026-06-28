@@ -205,6 +205,33 @@ from compiler.ir import (
 )
 
 # -----------------------------------------------------------------------
+# Strength reduction (div/mod by a compile-time constant). OFF by default:
+# sr_is_enabled() returns 0 unless the dump driver armed it under --opt
+# (sr_enable()). When OFF, gen_div_const_try always returns 0, so the div/mod
+# code path is the byte-identical pre-existing cqo+idiv / div sequence. When ON,
+# a `/`, `//` or `%` whose RIGHT operand is a literal integer constant is
+# lowered to a reciprocal-multiply / shift sequence (Granlund-Montgomery,
+# "Division by Invariant Integers using Multiplication", PLDI'94; derivation per
+# Warren, Hacker's Delight 2nd ed. ch.10). Correctness is differentially gated by
+# the ADDER_OPT=1 fuzzer lane + scripts/test_opt_strengthred.sh.
+# -----------------------------------------------------------------------
+sr_enabled: uint32 = 0
+opt_strengthred_count: uint32 = 0
+
+
+def sr_enable():
+    sr_enabled = 1
+
+
+def sr_is_enabled() -> uint32:
+    return sr_enabled
+
+
+def sr_reset_stats():
+    opt_strengthred_count = 0
+
+
+# -----------------------------------------------------------------------
 # Output buffer: flat machine-code bytes.
 # -----------------------------------------------------------------------
 
@@ -2570,6 +2597,454 @@ def emit_neg_rax():
     emit_b(0xD8)
 
 
+# -----------------------------------------------------------------------
+# Strength-reduction emit helpers (used ONLY under --opt by the div/mod-by-
+# constant pass; see gen_div_const below). All operate on full 64-bit %rax.
+# -----------------------------------------------------------------------
+
+# mulq %rcx  -> 48 F7 E1   (UNSIGNED rax*rcx, 128-bit product in %rdx:%rax;
+# %rdx = high 64 bits). One-operand form.
+def emit_mul_rcx():
+    emit_b(0x48)
+    emit_b(0xF7)
+    emit_b(0xE1)
+
+
+# imulq %rcx -> 48 F7 E9   (SIGNED rax*rcx, 128-bit product in %rdx:%rax;
+# %rdx = high 64 bits). One-operand form (distinct from the two-operand
+# imulq %rcx,%rax = 48 0F AF C1).
+def emit_imul1_rcx():
+    emit_b(0x48)
+    emit_b(0xF7)
+    emit_b(0xE9)
+
+
+# shrq $imm8, %rax  -> 48 C1 E8 ib   (logical right shift by immediate)
+def emit_shr_imm_rax(k: uint32):
+    emit_b(0x48)
+    emit_b(0xC1)
+    emit_b(0xE8)
+    emit_b(k & 255)
+
+
+# sarq $imm8, %rax  -> 48 C1 F8 ib   (arithmetic right shift by immediate)
+def emit_sar_imm_rax(k: uint32):
+    emit_b(0x48)
+    emit_b(0xC1)
+    emit_b(0xF8)
+    emit_b(k & 255)
+
+
+# andq $imm32, %rax  -> 48 25 id   (sign-extended imm32; we only use it with a
+# mask whose top bit is clear, i.e. 2^k-1 for k<=30, see pow2-mod gating).
+def emit_and_imm_rax(v: uint64):
+    emit_b(0x48)
+    emit_b(0x25)
+    emit_imm32(v)
+
+
+# movq %rax, %rsi  -> 48 89 C6   (stash the dividend; %rsi is caller-saved and
+# never in the regalloc pool {rbx,r12-r15}, and the strength-reduction
+# sequence makes NO calls, so %rsi is a safe transient).
+def emit_mov_rax_rsi():
+    emit_b(0x48)
+    emit_b(0x89)
+    emit_b(0xC6)
+
+
+# movq %rsi, %rax  -> 48 89 F0
+def emit_mov_rsi_rax():
+    emit_b(0x48)
+    emit_b(0x89)
+    emit_b(0xF0)
+
+
+# subq %rdx, %rax  -> 48 29 D0
+def emit_sub_rdx_rax():
+    emit_b(0x48)
+    emit_b(0x29)
+    emit_b(0xD0)
+
+
+# addq %rdx, %rax  -> 48 01 D0
+def emit_add_rdx_rax():
+    emit_b(0x48)
+    emit_b(0x01)
+    emit_b(0xD0)
+
+
+# addq %rsi, %rax  -> 48 01 F0   (q += n, for the signed magic correction)
+def emit_add_rsi_rax():
+    emit_b(0x48)
+    emit_b(0x01)
+    emit_b(0xF0)
+
+
+# subq %rsi, %rax  -> 48 29 F0   (q -= n, for the signed magic correction)
+def emit_sub_rsi_rax():
+    emit_b(0x48)
+    emit_b(0x29)
+    emit_b(0xF0)
+
+
+# Load a 64-bit immediate into %rcx (the reciprocal multiplier / divisor).
+# Uses the sign-extended imm32 form when it fits, else movabsq, mirroring
+# emit_mov_imm_rax. movabsq $imm64,%rcx -> 48 B9 <imm64>;
+# movq $imm32(sx),%rcx -> 48 C7 C1 <imm32>.
+def emit_mov_imm_rax_to_rcx(v: uint64):
+    if v <= cast[uint64](0x7FFFFFFF) or v >= cast[uint64](0xFFFFFFFF80000000):
+        emit_b(0x48)
+        emit_b(0xC7)
+        emit_b(0xC1)
+        emit_imm32(v)
+        return
+    emit_b(0x48)
+    emit_b(0xB9)
+    emit_imm64(v)
+
+
+# -----------------------------------------------------------------------
+# Magic-number derivation (Granlund-Montgomery / Hacker's Delight ch.10).
+# Returns are passed through module globals (Adder has no multi-return).
+# All loops operate on non-negative quantities < 2^64 so uint64 comparisons
+# are well-defined. Validated exhaustively in scripts/test_opt_strengthred.sh
+# and the ADDER_OPT=1 fuzzer lane (tests/fuzz/adder_fuzzer.py div/mod cases).
+# -----------------------------------------------------------------------
+
+# Outputs of magicu()/magics():
+sr_magic_M: uint64 = 0       # the reciprocal multiplier
+sr_magic_add: uint32 = 0     # unsigned: 1 iff the true multiplier is M + 2^64
+sr_magic_sh: uint32 = 0      # post-multiply right-shift amount
+
+
+# True iff v is a power of two (v != 0 and only one bit set).
+def sr_is_pow2(v: uint64) -> uint32:
+    if v == cast[uint64](0):
+        return 0
+    if (v & (v - cast[uint64](1))) == cast[uint64](0):
+        return 1
+    return 0
+
+
+# log2 of a power-of-two value (count of trailing zeros).
+def sr_log2(v: uint64) -> uint32:
+    k: uint32 = 0
+    x: uint64 = v
+    while (x & cast[uint64](1)) == cast[uint64](0):
+        x = x >> 1
+        k = k + 1
+    return k
+
+
+# Unsigned magic for a 64-bit divisor d (d >= 3, not a power of two).
+# Writes sr_magic_M / sr_magic_add / sr_magic_sh. Algorithm = Hacker's
+# Delight Fig.10-1 (magicu), generalized to N=64.
+def sr_magicu(d: uint64):
+    one: uint64 = cast[uint64](1)
+    two_nm1: uint64 = one << 63                       # 2^(N-1)
+    # nc = ((2^N) // d) * d - 1, computed without 2^64 overflow:
+    #      (2^N - 1) - ((2^N - 1) % d)
+    allones: uint64 = cast[uint64](0) - one           # 2^64 - 1
+    nc: uint64 = allones - (allones % d)
+    p: uint32 = 63                                     # N-1
+    q1: uint64 = two_nm1 / nc
+    r1: uint64 = two_nm1 - q1 * nc
+    q2: uint64 = (two_nm1 - one) / d
+    r2: uint64 = (two_nm1 - one) - q2 * d
+    # q2 can legitimately need 65 bits during the loop (the "add" divisors).
+    # We track q2 MOD 2^64 (its natural uint64 wrap) and record the 65th-bit
+    # carry in `ovf`; the stored magic M is the low 64 bits and `add` = ovf.
+    # The emitted add-form sequence (n - q0 correction) uses exactly this
+    # low-64 M (validated instruction-faithfully in test_opt_strengthred.sh).
+    ovf: uint32 = 0
+    loop_again: uint32 = 1
+    while loop_again != 0:
+        p = p + 1
+        # q1,r1 := (2*q1[,+1]) with denominator nc
+        if r1 >= nc - r1:
+            q1 = q1 + q1 + one
+            r1 = r1 + r1 - nc
+        else:
+            q1 = q1 + q1
+            r1 = r1 + r1
+        # q2,r2 := (2*q2[,+1]) with denominator d, numerator carries +1.
+        # Detect q2's 65th-bit overflow BEFORE the uint64 wrap.
+        carry2: uint64 = cast[uint64](0)
+        if (r2 + one) >= (d - r2):
+            carry2 = one
+        # overflow iff doubling-with-carry passes 2^64-1: 2*q2(+carry) > 2^64-1
+        #   <=> q2 > (2^64-1 - carry)/2  <=> q2 >= 2^63 + carry (since values are
+        #   integers). Simplest exact test on uint64: top bit of q2 set, or
+        #   (q2 == 2^63-?). Use: if q2 has its high bit set, doubling overflows.
+        if (q2 >> 63) != cast[uint64](0):
+            ovf = 1
+        if carry2 != cast[uint64](0):
+            q2 = q2 + q2 + one
+            r2 = r2 + r2 + one - d
+        else:
+            q2 = q2 + q2
+            r2 = r2 + r2 + one
+        delta: uint64 = d - one - r2
+        # continue while p < 2N and (q1 < delta or (q1 == delta and r1 == 0))
+        cont: uint32 = 0
+        if p < 128:
+            if q1 < delta:
+                cont = 1
+            elif q1 == delta:
+                if r1 == cast[uint64](0):
+                    cont = 1
+        loop_again = cont
+    sr_magic_M = q2 + one                              # low 64 bits of the multiplier
+    sr_magic_add = ovf
+    sr_magic_sh = p - 64
+
+
+# Signed magic for a 64-bit divisor whose ABSOLUTE value is `ad` (ad >= 2, not a
+# power of two), with `neg` = 1 if the real divisor is negative. Writes
+# sr_magic_M (already sign-adjusted) and sr_magic_sh. Hacker's Delight Fig.10-1
+# (magic), N=64. anc/q/r stay < 2^63 so uint64 math is exact.
+def sr_magics(ad: uint64, neg: uint32):
+    one: uint64 = cast[uint64](1)
+    two_nm1: uint64 = one << 63                       # 2^(N-1) = |INT_MIN|
+    t: uint64 = two_nm1
+    if neg != 0:
+        t = two_nm1 + one
+    anc: uint64 = t - one - (t % ad)                  # t - 1 - t%ad
+    p: uint32 = 63
+    pw: uint64 = one << 63                             # 2^p, p starts at 63
+    q1: uint64 = pw / anc
+    r1: uint64 = pw - q1 * anc
+    q2: uint64 = pw / ad
+    r2: uint64 = pw - q2 * ad
+    loop_again: uint32 = 1
+    while loop_again != 0:
+        p = p + 1
+        q1 = q1 + q1
+        r1 = r1 + r1
+        if r1 >= anc:
+            q1 = q1 + one
+            r1 = r1 - anc
+        q2 = q2 + q2
+        r2 = r2 + r2
+        if r2 >= ad:
+            q2 = q2 + one
+            r2 = r2 - ad
+        delta: uint64 = ad - r2
+        cont: uint32 = 0
+        if q1 < delta:
+            cont = 1
+        elif q1 == delta:
+            if r1 == cast[uint64](0):
+                cont = 1
+        loop_again = cont
+    m: uint64 = q2 + one
+    if neg != 0:
+        m = cast[uint64](0) - m                        # negate (two's complement)
+    sr_magic_M = m
+    sr_magic_sh = p - 64
+
+
+# A compile-time integer constant detected as a divisor: its raw 64-bit bits.
+sr_const_val: uint64 = 0
+
+
+# 1 iff AST node `n` is a compile-time integer constant suitable as a divisor:
+# a plain ND_INT_LIT / ND_CHAR_LIT (value in nd_num), or UNOP_NEG of one (the
+# parser keeps `-3` as UNOP_NEG(INT_LIT 3); the const-fold pass does not collapse
+# it). Writes the constant's two's-complement 64-bit value to sr_const_val.
+# These node kinds are pure (no side effects, no faults), so the caller may emit
+# the dividend WITHOUT evaluating this operand.
+def sr_node_is_intlit(n: uint32) -> uint32:
+    k: uint32 = nd_kind[n]
+    if k == ND_INT_LIT or k == ND_CHAR_LIT:
+        sr_const_val = nd_num[n]
+        return 1
+    if k == ND_UNARY:
+        if nd_aux[n] == UNOP_NEG:
+            inner: uint32 = nd_a[n]
+            ik: uint32 = nd_kind[inner]
+            if ik == ND_INT_LIT or ik == ND_CHAR_LIT:
+                sr_const_val = cast[uint64](0) - nd_num[inner]
+                return 1
+    return 0
+
+
+# Emit the strength-reduced sequence for `(value in %rax) OP d`, where OP is
+# DIV/IDIV (-> want_mod==0) or MOD (-> want_mod==1), `d` is the literal divisor
+# (raw 64-bit bits as stored by the parser), and `signed_op` selects signed vs
+# unsigned semantics. Returns 1 if it emitted a reduced sequence, 0 if the
+# caller must fall back to the normal idiv/div path (d==0, or an unhandled case).
+# On entry %rax = dividend; on exit %rax = quotient (or remainder if want_mod).
+def gen_div_const(d_bits: uint64, signed_op: uint32, want_mod: uint32) -> uint32:
+    if d_bits == cast[uint64](0):
+        return 0                                       # div-by-zero: keep the trap
+    if signed_op == 0:
+        return gen_udiv_const(d_bits, want_mod)
+    return gen_sdiv_const(d_bits, want_mod)
+
+
+# Unsigned dividend / constant d (already known != 0).
+def gen_udiv_const(d: uint64, want_mod: uint32) -> uint32:
+    one: uint64 = cast[uint64](1)
+    if d == one:
+        # x/1 = x ; x%1 = 0
+        if want_mod != 0:
+            emit_mov_imm_rax(cast[uint64](0))
+        opt_strengthred_count = opt_strengthred_count + 1
+        return 1
+    if sr_is_pow2(d) != 0:
+        k: uint32 = sr_log2(d)
+        if want_mod != 0:
+            # x % 2^k = x & (2^k - 1). Use the imm32 AND only when the mask
+            # fits a positive sign-extended imm32 (k <= 30); else build the
+            # mask in %rcx and AND. Keep it simple+correct: k<=30 fast path,
+            # else fall through to magic-free shift pair.
+            if k <= 30:
+                emit_and_imm_rax(d - one)
+                opt_strengthred_count = opt_strengthred_count + 1
+                return 1
+            # large mask: shl k then shr k clears the low... no: we want low
+            # bits. mask = 2^k-1 in %rcx via mov; and. Use mov_imm to %rcx.
+            emit_mov_imm_rax_to_rcx(d - one)
+            emit_and_rcx_rax()
+            opt_strengthred_count = opt_strengthred_count + 1
+            return 1
+        emit_shr_imm_rax(k)
+        opt_strengthred_count = opt_strengthred_count + 1
+        return 1
+    if (d >> 63) != cast[uint64](0):
+        # d >= 2^63 (high bit set, non-power-of-two): the Granlund-Montgomery
+        # derivation's intermediates would need a 65th-bit reciprocal, which the
+        # uint64 magic loop cannot represent. But for such a large divisor the
+        # unsigned quotient of any 64-bit dividend is exactly 0 or 1
+        # (n < 2^64 <= 2*d), so emit the trivial compare:
+        #   q = (n >= d) ? 1 : 0   (unsigned)   ;   r = n - q*d
+        # (n is in %rax.) This is correct and branch-free.
+        emit_mov_rax_rsi()                             # %rsi = n
+        emit_mov_imm_rax_to_rcx(d)                     # %rcx = d
+        emit_cmp_rcx_rax()                             # flags for n - d
+        emit_setcc_al(0x93)                            # setae -> AL = (n >= d) ? 1 : 0
+        emit_movzx_al_rax()                            # %rax = q (0 or 1)
+        if want_mod != 0:
+            # r = n - q*d :  q in %rax ; d in %rcx ; imul ; n - (q*d)
+            emit_mov_imm_rax_to_rcx(d)
+            emit_imul_rcx_rax()                        # %rax = q*d
+            emit_mov_rax_rcx()                         # %rcx = q*d
+            emit_mov_rsi_rax()                         # %rax = n
+            emit_sub_rcx_rax()                         # %rax = n - q*d
+        opt_strengthred_count = opt_strengthred_count + 1
+        return 1
+    # General unsigned magic (d in [3, 2^63), not a power of two).
+    sr_magicu(d)
+    M: uint64 = sr_magic_M
+    add: uint32 = sr_magic_add
+    sh: uint32 = sr_magic_sh
+    # The add-path needs n preserved across the multiply; so does want_mod.
+    if want_mod != 0 or add != 0:
+        emit_mov_rax_rsi()                             # %rsi = n
+    if add == 0:
+        # q = mulhu(n, M); q >>= sh
+        emit_mov_imm_rax_to_rcx(M)
+        emit_mul_rcx()                                 # %rdx:%rax = n*M
+        emit_mov_rdx_rax()                             # %rax = high = q
+        if sh != 0:
+            emit_shr_imm_rax(sh)
+    else:
+        # true multiplier = M + 2^64. q0 = mulhu(n,M);
+        # q = (((n - q0) >> 1) + q0) >> (sh-1)
+        emit_mov_imm_rax_to_rcx(M)
+        emit_mul_rcx()                                 # %rdx = q0 (high), %rax = low
+        emit_mov_rsi_rax()                             # %rax = n
+        emit_sub_rdx_rax()                             # %rax = n - q0
+        emit_shr_imm_rax(1)                            # (n - q0) >> 1
+        emit_add_rdx_rax()                             # + q0
+        if sh >= 1:
+            emit_shr_imm_rax(sh - 1)
+    if want_mod != 0:
+        # remainder = n - q*d :  %rax = q ; rcx = d ; imul ; sub from n
+        emit_mov_imm_rax_to_rcx(d)
+        emit_imul_rcx_rax()                            # %rax = q*d (low 64 = exact)
+        emit_mov_rax_rcx()                             # %rcx = q*d
+        emit_mov_rsi_rax()                             # %rax = n
+        emit_sub_rcx_rax()                             # %rax = n - q*d
+    opt_strengthred_count = opt_strengthred_count + 1
+    return 1
+
+
+# Signed dividend / constant d (already known != 0). d_bits are the raw bits.
+def gen_sdiv_const(d_bits: uint64, want_mod: uint32) -> uint32:
+    one: uint64 = cast[uint64](1)
+    neg: uint32 = 0
+    d: uint64 = d_bits
+    if (d_bits >> 63) != cast[uint64](0):
+        neg = 1
+        d = cast[uint64](0) - d_bits                   # |d|
+    if d == one:
+        # x/1 = x ; x/-1 = -x ; x%(+-1) = 0
+        if want_mod != 0:
+            emit_mov_imm_rax(cast[uint64](0))
+        else:
+            if neg != 0:
+                emit_neg_rax()
+        opt_strengthred_count = opt_strengthred_count + 1
+        return 1
+    if sr_is_pow2(d) != 0:
+        k: uint32 = sr_log2(d)
+        # round-toward-zero correction for signed pow2:
+        #   t = (n >>s 63) >>u (64-k)   (= (2^k-1) if n<0 else 0)
+        #   q = (n + t) >>s k ;  negate if d<0
+        if want_mod != 0:
+            emit_mov_rax_rsi()                         # save n
+        emit_mov_rax_rcx()                             # %rcx = n (preserve)
+        emit_sar_imm_rax(63)                           # %rax = n>>s63 (all 1s if neg)
+        emit_shr_imm_rax(64 - k)                       # %rax = 2^k-1 if neg else 0
+        emit_add_rcx_rax()                             # %rax = n + t
+        emit_sar_imm_rax(k)                            # %rax = q (>>s k)
+        if neg != 0:
+            emit_neg_rax()
+        if want_mod != 0:
+            emit_mov_imm_rax_to_rcx(d_bits)
+            emit_imul_rcx_rax()                        # q*d
+            emit_mov_rax_rcx()
+            emit_mov_rsi_rax()
+            emit_sub_rcx_rax()                         # n - q*d
+        opt_strengthred_count = opt_strengthred_count + 1
+        return 1
+    # General signed magic.
+    sr_magics(d, neg)
+    M: uint64 = sr_magic_M
+    sh: uint32 = sr_magic_sh
+    # %rsi = n, preserved across the whole sequence (needed for the +/-n
+    # correction and, if want_mod, for n - q*d).
+    emit_mov_rax_rsi()
+    emit_mov_imm_rax_to_rcx(M)
+    emit_imul1_rcx()                                   # %rdx:%rax = n*M (signed)
+    emit_mov_rdx_rax()                                 # %rax = q0 = mulhs(n,M)
+    # Correction: d>0 and M<0 (high bit set) -> q += n ;
+    #             d<0 and M>0 (high bit clear) -> q -= n.
+    if neg == 0:
+        if (M >> 63) != cast[uint64](0):
+            emit_add_rsi_rax()                         # q += n
+    else:
+        if (M >> 63) == cast[uint64](0):
+            emit_sub_rsi_rax()                         # q -= n
+    if sh != 0:
+        emit_sar_imm_rax(sh)                           # %rax = q (arithmetic shift)
+    # Add the sign bit: q += (q < 0 ? 1 : 0) == q + ((unsigned)q >> 63).
+    #   %rcx = q ; %rax = (unsigned q)>>63 ; %rax = q + that.
+    emit_mov_rax_rcx()                                 # %rcx = q
+    emit_shr_imm_rax(63)                               # %rax = 0/1 (logical shift)
+    emit_add_rcx_rax()                                 # %rax = quotient
+    if want_mod != 0:
+        emit_mov_imm_rax_to_rcx(d_bits)
+        emit_imul_rcx_rax()                            # %rax = q*d (low 64 exact)
+        emit_mov_rax_rcx()                             # %rcx = q*d
+        emit_mov_rsi_rax()                             # %rax = n
+        emit_sub_rcx_rax()                             # %rax = n - q*d
+    opt_strengthred_count = opt_strengthred_count + 1
+    return 1
+
+
 # notq %rax  -> 48 F7 D0
 def emit_not_rax():
     emit_b(0x48)
@@ -4081,6 +4556,22 @@ def gen_expr_ir(v: uint32):
         if ir_op_is_emit_only(op) != 0:
             l_sgn = expr_signedness(ir_ast[ir_a[v]])
             r_sgn = expr_signedness(ir_ast[ir_b[v]])
+        # STRENGTH REDUCTION (--opt, IR path): a DIV/IDIV/MOD whose RIGHT operand
+        # is a compile-time integer literal lowers to reciprocal-multiply/shift.
+        # The divisor operand's original AST node is ir_ast[ir_b[v]]; it is a
+        # side-effect-free literal, so we emit ONLY the left (dividend) subtree.
+        if sr_is_enabled() != 0:
+            if op == BINOP_DIV or op == BINOP_IDIV or op == BINOP_MOD:
+                if sr_node_is_intlit(ir_ast[ir_b[v]]) != 0:
+                    sri_dbits: uint64 = sr_const_val
+                    if sri_dbits != cast[uint64](0):
+                        sri_signed: uint32 = binop_use_signed(l_sgn, r_sgn)
+                        sri_wantmod: uint32 = 0
+                        if op == BINOP_MOD:
+                            sri_wantmod = 1
+                        gen_expr_ir(ir_a[v])             # dividend -> %rax
+                        gen_div_const(sri_dbits, sri_signed, sri_wantmod)
+                        return
         # SCRATCH-REGISTER FAST PATH (Phase 7). For the register-to-register
         # combine ops (ADD/SUB/MUL/AND/OR/XOR + the 6 compares), try to hold the
         # RIGHT operand in a callee-saved scratch register across the LEFT-operand
@@ -4695,6 +5186,30 @@ def gen_expr(node: uint32):
             emit_mov_imm_rax(cast[uint64](1))
             patch_rel32(e2, code_len)
             return
+        # Strength reduction (--opt only): `<expr> / <intlit>`, `// <intlit>`,
+        # or `% <intlit>` lowers to a reciprocal-multiply/shift instead of
+        # cqo+idiv / xor+div. We evaluate ONLY the left operand (the divisor is
+        # a compile-time constant, so the right operand is NOT evaluated — it's
+        # a pure ND_INT_LIT/ND_CHAR_LIT with no side effects), then emit the
+        # reduced sequence into %rax. OFF by default (sr_is_enabled()==0) ->
+        # this whole block is skipped and the byte-identical idiv path runs.
+        if sr_is_enabled() != 0:
+            if op == BINOP_DIV or op == BINOP_IDIV or op == BINOP_MOD:
+                if sr_node_is_intlit(nd_b[node]) != 0:
+                    sr_signed: uint32 = binop_use_signed(l_sgn, r_sgn)
+                    sr_dbits: uint64 = sr_const_val
+                    sr_wantmod: uint32 = 0
+                    if op == BINOP_MOD:
+                        sr_wantmod = 1
+                    # Try the reduced emit; only if it fires do we skip the
+                    # general path. d==0 returns 0 (keeps the div-by-zero trap).
+                    # gen_div_const always succeeds for d!=0; the divisor is a
+                    # side-effect-free literal so evaluating only the left
+                    # operand is sound.
+                    if sr_dbits != cast[uint64](0):
+                        gen_expr(nd_a[node])           # dividend -> %rax
+                        gen_div_const(sr_dbits, sr_signed, sr_wantmod)
+                        return
         # Evaluate right first, push; then left; pop into %rcx. After this
         # %rax = left, %rcx = right — exactly codegen_x86.gen_binary.
         gen_expr(nd_b[node])
