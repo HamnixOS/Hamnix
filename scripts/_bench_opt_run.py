@@ -58,7 +58,11 @@ WORK = REPO_ROOT / "build" / "bench_opt"
 PRELUDE = (SRC / "_prelude.ad").read_text()
 
 # Kernel order = the suite. Each must have <name>.ad and <name>.c.
-KERNELS = ["matmul", "sieve", "licm", "dcecopy", "fib", "collatz", "mandel"]
+KERNELS = ["matmul", "sieve", "licm", "dcecopy", "fib", "collatz", "mandel",
+           "saxpy"]  # saxpy added 2026-06-28 (perf_2x_roadmap.md): honest
+                     # array-update reduction, NO hand-hoisted scalar accumulator
+                     # (matmul hand-hoists its dot-product accumulator into `s`,
+                     # masking the accumulator-regalloc lever; saxpy does not).
 
 
 def die(msg):
