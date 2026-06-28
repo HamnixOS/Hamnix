@@ -3618,6 +3618,245 @@ def _run_regpressure_corpus():
 
 
 # --------------------------------------------------------------------------
+# STORE-THROUGH-ELIMINATION corpus (the write-through store lever). A fully
+# register-promoted plain scalar with NO slot-bypass read loses its shadow stack
+# slot store: store_to_named writes ONLY the register. This corpus is the
+# soundness net for that elimination. It deliberately exercises EVERY codegen
+# read path that touches a NAMED scalar local, so a MISSED slot-read (a read
+# left on the stale stack slot after the store was dropped) becomes a wrong
+# answer the oracle catches:
+#   * a promoted accumulator updated in a loop then READ AFTER the loop,
+#   * a promoted scalar read as an ALU operand, a call ARG, RETURNED, COMPARED,
+#   * SOUNDNESS (must KEEP the store / NOT eliminate):
+#       - a scalar-as-pointer base `p[i]` (gen_index_address reads p's slot),
+#       - a for-loop INDUCTION variable (emit_load_for_var reads the slot),
+#       - a LOCAL function-pointer callee (gen_call reads the slot),
+#       - an ADDRESS-TAKEN local (`&x`; already non-promotable, slot mandatory),
+#     each updated AND read through the bypass path so a wrong elimination
+#     would diverge,
+#   * a value promoted in part of the function and spilled in another (heavy
+#     register pressure) — the elimination must only fire where it has a reg.
+# All arithmetic is over the signedness-invariant 64-bit op set so the oracle is
+# a plain Python uint64. The harness ALSO asserts STOREELIM>0 fired and is
+# byte-inert OFF (STOREELIM==0 with the flag off).
+# --------------------------------------------------------------------------
+def _storethrough_corpus():
+    """Return a list of (name, body, expected_stdout, expected_exit)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, decls_and_main, val):
+        body = PRELUDE + "\n" + decls_and_main
+        progs.append((name, body, str(val & M), val & 0xFF))
+
+    # 1) ELIMINABLE accumulator: a hot single-scalar reduction read AFTER the
+    #    loop. `s` is a plain scalar, never indexed/address-taken/for-IV, so its
+    #    per-iteration store should be DROPPED — yet the post-loop read must see
+    #    the final value (the register IS the value). Few locals -> `s` gets a
+    #    register; the elimination is the whole point.
+    acc = 0
+    for k in range(100):
+        acc = (acc + (k * 3 + 1)) & M
+    prog("hot_accum_readback",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    s: uint64 = cast[uint64](0)\n"
+         "    k: uint64 = cast[uint64](0)\n"
+         "    while k < cast[uint64](100):\n"
+         "        s = s + (k * cast[uint64](3) + cast[uint64](1))\n"
+         "        k = k + cast[uint64](1)\n"
+         "    g_accum = s\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         acc)
+
+    # 2) Promoted scalar read through MANY paths: ALU operand, compare, call ARG
+    #    (print_u64), and RETURNED. Each is a distinct codegen read that must
+    #    route to the register after the store is eliminated.
+    x = (7 * 11 + 5) & M          # x = 82
+    y = (x * 2) & M               # ALU operand
+    cmpres = 1 if x > 50 else 0   # compare
+    ret = (y + cmpres) & M
+    prog("read_many_paths",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    x: uint64 = cast[uint64](7) * cast[uint64](11) + cast[uint64](5)\n"
+         "    print_u64(x)\n"                       # call arg
+         "    y: uint64 = x * cast[uint64](2)\n"    # ALU operand
+         "    r: uint64 = y\n"
+         "    if x > cast[uint64](50):\n"           # compare
+         "        r = r + cast[uint64](1)\n"
+         "    g_accum = r\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](r) & cast[uint64](255))\n",
+         ret)
+    nm, bd, _, _ = progs[-1]
+    progs[-1] = (nm, bd, f"{x}\n{ret}", ret & 0xFF)
+
+    # 3) SOUNDNESS — scalar-as-pointer base `p[i]`. `p` holds the address of a
+    #    global array; it is UPDATED (p = p + 8 to walk) AND used as `p[0]`. The
+    #    index base read goes through the SLOT (gen_index_address), so `p` MUST
+    #    stay write-through even if promoted. A missed slot-read here reads a
+    #    stale base => wrong element => oracle divergence.
+    base_vals = [11, 22, 33, 44]
+    s3 = sum(base_vals) & M
+    decl3 = "g_arr3: Array[4, uint64]\n"
+    fill3 = "".join(
+        f"    g_arr3[cast[int64]({i})] = cast[uint64]({v})\n"
+        for i, v in enumerate(base_vals))
+    prog("scalar_ptr_base_walk",
+         decl3 +
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         + fill3 +
+         "    p: uint64 = cast[uint64](&g_arr3[cast[int64](0)])\n"
+         "    acc: uint64 = cast[uint64](0)\n"
+         "    n: uint64 = cast[uint64](0)\n"
+         "    while n < cast[uint64](4):\n"
+         "        acc = acc + p[cast[int64](0)]\n"   # reads p's SLOT as base
+         "        p = p + cast[uint64](8)\n"         # update p
+         "        n = n + cast[uint64](1)\n"
+         "    g_accum = acc\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         s3)
+
+    # 4) SOUNDNESS — for-loop INDUCTION variable. `i` is a range-loop IV read by
+    #    emit_load_for_var (loop test + step) from its slot, so it MUST stay
+    #    write-through; the body ALSO reads `i` as an ALU operand (register path).
+    s4 = 0
+    for i in range(20):
+        s4 = (s4 + i * i) & M
+    prog("for_iv_soundness",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    acc: uint64 = cast[uint64](0)\n"
+         "    for i in range(20):\n"
+         "        acc = acc + cast[uint64](i) * cast[uint64](i)\n"
+         "    g_accum = acc\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         s4)
+
+    # 5) SOUNDNESS — ADDRESS-TAKEN local. `t` has its address taken and is
+    #    written THROUGH the pointer, so it is non-promotable: its slot is the
+    #    only home and the store must stay. Read back after the through-store —
+    #    the through-store REPLACES t's value (37), so a wrong (eliminated) read
+    #    of a stale register/slot would diverge.
+    t_final = 37 & M
+    prog("addr_taken_keep_slot",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    t: uint64 = cast[uint64](5)\n"
+         "    q: Ptr[uint64] = &t\n"
+         "    q[cast[int64](0)] = cast[uint64](37)\n"   # store THROUGH ptr -> slot
+         "    g_accum = t\n"                            # must read the slot value
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         t_final)
+
+    # 6) PARTIAL promotion under pressure: 8 simultaneously-live accumulators
+    #    updated in a loop (exceeds the 5-reg pool, this fn is call-free so the
+    #    extension pool helps but pressure still forces a spill), each read after
+    #    the loop. Whichever get a register lose their store; the spilled ones
+    #    keep theirs. All must be correct.
+    n6 = 40
+    accs = [0] * 8
+    for it in range(n6):
+        for j in range(8):
+            accs[j] = (accs[j] + (it + j + 1)) & M
+    total6 = sum(accs) & M
+    decls6 = "".join(f"    a{j}: uint64 = cast[uint64](0)\n" for j in range(8))
+    upd6 = "".join(
+        f"        a{j} = a{j} + (it + cast[uint64]({j + 1}))\n" for j in range(8))
+    sum6 = " + ".join(f"a{j}" for j in range(8))
+    prog("partial_promote_pressure",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         + decls6 +
+         "    it: uint64 = cast[uint64](0)\n"
+         "    while it < cast[uint64](40):\n"
+         + upd6 +
+         "        it = it + cast[uint64](1)\n"
+         f"    g_accum = {sum6}\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         total6)
+
+    # (NOTE: a LOCAL function-pointer callee is ALSO sr_mark'd in cfg.ad so its
+    #  slot stays write-through, but the Fn[...] local-fnptr syntax is outside
+    #  the codegen.ad differential subset (parsefail), so it cannot be exercised
+    #  through this host harness; its soundness rests on the cfg sr_mark guard +
+    #  the flag-OFF objdiff/kobjdiff invariance.)
+
+    return progs
+
+
+def _run_storethrough_corpus():
+    """Run the store-through-elimination corpus through codegen.ad with --opt.
+    Asserts (a) correctness vs the oracle for EVERY program (catches a missed
+    slot-read on the eliminated-store path), (b) the elimination demonstrably
+    FIRED (STOREELIM>0 across the corpus), (c) it is byte-inert OFF
+    (STOREELIM==0 with --opt off) and ON!=OFF bytes somewhere, and (d) the
+    soundness programs (scalar-ptr base, for-IV, address-taken, fnptr callee)
+    are correct — i.e. the value still flows through the kept slot.
+    Returns (all_ok, total_storeelim)."""
+    host = _ad_host()
+    all_ok = True
+    total_storeelim = 0
+    fired_any = False
+    changed_any = False
+    for (name, body, exp_out, exp_exit) in _storethrough_corpus():
+        r_on = host.run_through_codegen_ad(f"st_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"st_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [STORETHROUGH '{name}'] codegen.ad on={r_on.kind}/off={r_off.kind}: "
+                  f"{(r_on.detail or r_off.detail or '')[:140]}")
+            continue
+        # (a) correctness vs oracle, ON AND OFF (a missed slot-read on the
+        #     eliminated path makes ON diverge; OFF is the unoptimized reference).
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [STORETHROUGH '{name}'] MISCOMPILE (--opt ON) on=("
+                  f"{r_on.stdout!r},{r_on.exit}) oracle=({exp_out!r},{exp_exit}) "
+                  f"storeelim={r_on.storeelim}")
+            continue
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [STORETHROUGH '{name}'] OFF path wrong off=("
+                  f"{r_off.stdout!r},{r_off.exit}) oracle=({exp_out!r},{exp_exit})")
+            continue
+        se_on = int(getattr(r_on, "storeelim", 0) or 0)
+        se_off = int(getattr(r_off, "storeelim", 0) or 0)
+        total_storeelim += se_on
+        if se_on > 0:
+            fired_any = True
+        # (c) byte-inert OFF: the store-elimination counter MUST be 0 with the
+        #     flag off (the whole register hook is inert).
+        if se_off != 0:
+            all_ok = False
+            print(f"  [STORETHROUGH '{name}'] OFF path NOT byte-inert: STOREELIM={se_off}")
+            continue
+        # MACHINE-CODE proof: when elimination fired, the ON image must differ
+        # from OFF (a real store dropped, not just an annotation).
+        src = _AD_WORK / f"stmc_{name}.ad"
+        src.write_text(host.codegen_compatible_source(body))
+        d_on = host.run_dump(src, opt=True)
+        d_off = host.run_dump(src, opt=False)
+        if d_on.status == "ok" and d_off.status == "ok":
+            if int(getattr(d_off, "storeelim", 0) or 0) != 0:
+                all_ok = False
+                print(f"  [STORETHROUGH '{name}'] OFF dump STOREELIM!=0")
+                continue
+            if se_on > 0 and d_on.code != d_off.code:
+                changed_any = True
+    if not fired_any:
+        all_ok = False
+        print("  [STORETHROUGH FAIL] no program eliminated a write-through store "
+              "(STOREELIM==0 across the corpus)")
+    if not changed_any:
+        all_ok = False
+        print("  [STORETHROUGH FAIL] store-elimination never changed the emitted "
+              "machine code (ON==OFF everywhere)")
+    return (all_ok, total_storeelim)
+
+
+# --------------------------------------------------------------------------
 # Phase-4 METHOD register-pressure corpus. Class METHOD bodies (def m(self,...))
 # were previously kept entirely on the all-memory path (gen_method forced
 # cg_ra_active=0); only top-level functions were register-promoted. This corpus
@@ -3955,6 +4194,18 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] register-pressure corpus miscompiled or "
                   "allocator inert")
+        # STORE-THROUGH-ELIMINATION corpus: fully register-promoted plain scalars
+        # drop their shadow stack store; soundness programs (scalar-ptr base,
+        # for-IV, address-taken, fnptr callee) keep theirs. Asserts correctness
+        # vs the oracle (catches a missed slot-read), the lever fired
+        # (STOREELIM>0), and is byte-inert OFF.
+        st_ok, st_total = _run_storethrough_corpus()
+        print(f"--- ADDER_OPT=1 store-through-elimination corpus ---")
+        print(f"  write-through stores eliminated: {st_total}")
+        if not st_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] store-through-elimination corpus miscompiled, "
+                  "lever never fired, or OFF not byte-inert")
         # Phase-4 METHOD register-pressure corpus: class methods with more live
         # locals than the 5-reg pool, surrounded by pressure-free free functions.
         # Asserts gen_method now register-promotes (correct under method spilling,
