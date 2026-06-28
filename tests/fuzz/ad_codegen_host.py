@@ -36,6 +36,7 @@
 # failure). Only a program codegen.ad COMPILED that produced the WRONG output
 # is a genuine miscompile.
 
+import hashlib
 import os
 import re
 import struct
@@ -47,6 +48,11 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
 DRIVER_SRC = HERE / "ad_codegen_dump_driver.ad"
 DRIVER_ELF = REPO_ROOT / "build" / "fuzz_ad_codegen" / "ad_codegen_dump"
+# Stamp file recording the inputs-hash the cached DRIVER_ELF was built from.
+# Lives next to the artifact under build/ (gitignored), so it is never
+# committed. The driver is rebuilt whenever this hash no longer matches the
+# current inputs (see build_driver / _driver_inputs_hash).
+DRIVER_STAMP = DRIVER_ELF.with_suffix(".inputs.sha256")
 
 # Host ELF layout. Code base is a page-aligned nonzero VA (avoid the null
 # page). Data sits DATA_BASE bytes above it so codegen's RIP-relative data
@@ -56,14 +62,80 @@ DRIVER_ELF = REPO_ROOT / "build" / "fuzz_ad_codegen" / "ad_codegen_dump"
 CODE_VBASE = 0x10000
 
 
+def _driver_input_files():
+    """Every real input whose change must invalidate the cached driver ELF.
+
+    The cached binary is the host (Python `compiler.adder`) compilation of the
+    `.ad` dump driver, which `from compiler.*` imports the WHOLE self-hosted
+    compiler (lexer/parser/codegen/opt/ir/cfg/regalloc/elf_emit). So the inputs
+    are:
+      * tests/fuzz/ad_codegen_dump_driver.ad   (the driver source itself),
+      * adder/compiler/*.ad                     (the self-hosted compiler the
+                                                 driver compiles+links — opt.ad,
+                                                 codegen.ad, ir.ad, etc.),
+      * adder/compiler/*.py                     (the HOST Adder compiler that
+                                                 emits the binary — adder.py,
+                                                 codegen_x86.py, parser.py, ...).
+    Editing ANY of these and re-running a guard must rebuild, or the guard
+    silently tests a stale compiler. Returned sorted for a stable hash.
+    """
+    files = [DRIVER_SRC]
+    compiler_dir = REPO_ROOT / "adder" / "compiler"
+    files += sorted(compiler_dir.glob("*.ad"))
+    files += sorted(compiler_dir.glob("*.py"))
+    return sorted(set(files))
+
+
+def _driver_inputs_hash():
+    """SHA256 over the (relative-path, content) of every real driver input.
+
+    Content-based (not mtime): robust against git checkouts / touch reordering
+    that perturb mtimes without changing bytes, and never reuses a stale binary
+    when bytes DID change. The path is folded in so adding/removing a compiler
+    source also changes the hash.
+    """
+    h = hashlib.sha256()
+    for f in _driver_input_files():
+        try:
+            data = f.read_bytes()
+        except FileNotFoundError:
+            # A removed input still changes the set -> changes the hash.
+            data = b""
+        rel = f.relative_to(REPO_ROOT).as_posix().encode()
+        h.update(struct.pack("<Q", len(rel)))
+        h.update(rel)
+        h.update(struct.pack("<Q", len(data)))
+        h.update(data)
+    return h.hexdigest()
+
+
 def build_driver(force=False):
-    """Compile the host dump driver to x86_64-linux if missing/stale."""
+    """Compile the host dump driver to x86_64-linux if missing/stale.
+
+    STALENESS: the driver is rebuilt when the cached ELF is missing OR when the
+    inputs-hash (over the dump driver + the whole self-hosted compiler .ad set +
+    the host Adder compiler .py set) differs from the stamp recorded at the last
+    build. This removes the old footgun where the cache only tracked the driver
+    .ad's mtime, so editing opt.ad/codegen.ad and re-running a guard silently
+    tested the STALE old compiler (the `rm -rf build/fuzz_ad_codegen`
+    workaround). No manual wipe is needed for correctness anymore.
+    """
+    want_hash = _driver_inputs_hash()
     if DRIVER_ELF.exists() and not force:
-        if DRIVER_ELF.stat().st_mtime >= DRIVER_SRC.stat().st_mtime:
+        try:
+            have_hash = DRIVER_STAMP.read_text().strip()
+        except FileNotFoundError:
+            have_hash = None
+        if have_hash == want_hash:
             return
     DRIVER_ELF.parent.mkdir(parents=True, exist_ok=True)
     rel_src = DRIVER_SRC.relative_to(REPO_ROOT)
     rel_elf = DRIVER_ELF.relative_to(REPO_ROOT)
+    # Stamp is removed first so an interrupted/failed build never leaves a stamp
+    # that falsely matches the new inputs against a half-written/old binary.
+    DRIVER_STAMP.unlink(missing_ok=True)
+    print(f"[ad_codegen_host] (re)building dump driver "
+          f"(inputs-hash {want_hash[:12]})", file=sys.stderr)
     cp = subprocess.run(
         [sys.executable, "-m", "compiler.adder", "compile",
          "--target=x86_64-linux", str(rel_src), "-o", str(rel_elf)],
@@ -72,6 +144,10 @@ def build_driver(force=False):
         raise RuntimeError(
             "failed to build ad_codegen_dump driver:\n"
             + (cp.stderr or cp.stdout))
+    # Record the inputs-hash the freshly-built binary corresponds to. Re-hash
+    # AFTER the build in case a source changed mid-build, so the stamp can never
+    # claim a binary is newer than it is.
+    DRIVER_STAMP.write_text(_driver_inputs_hash())
 
 
 # --------------------------------------------------------------------------

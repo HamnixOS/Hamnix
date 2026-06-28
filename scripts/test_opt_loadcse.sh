@@ -17,12 +17,13 @@
 #      int temp would mis-type the SSE value); value stays correct, LOADCSE quiet.
 #
 # HOST-ONLY: python3 + as/ld/gcc, x86_64. NO QEMU.
-# BUILD HYGIENE: wipe the cached dump driver so the CURRENT opt.ad runs.
+# BUILD HYGIENE: the cached dump driver under build/fuzz_ad_codegen now
+# AUTO-INVALIDATES via ad_codegen_host.build_driver()'s inputs-hash stamp, so it
+# rebuilds automatically when opt.ad / any compiler source changes. No manual
+# `rm -rf build/fuzz_ad_codegen` is needed for correctness.
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
-
-rm -rf build/fuzz_ad_codegen
 
 python3 - <<'PY'
 import sys
