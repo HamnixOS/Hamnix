@@ -21,27 +21,40 @@
 #        EXPIRE: every active interval whose end <= V.start frees its register
 #                (its value is dead by the time V begins).
 #      Then if a register is free, assign it to V and make V active.
-#      Else SPILL: among {V} U active, the one with the FURTHEST end stays in
-#                  memory (keeps its existing rbp stack slot); the other keeps/
-#                  takes the register. So V steals a register only if some active
-#                  value ends later than V does.
+#      Else SPILL by SPILL-COST (P3): the active value with the LOWEST
+#                  loop-depth-weighted use count (cfg.nm_usecost) is the cheapest
+#                  to leave in memory, so it is evicted in favor of V when V is
+#                  costlier (and the victim's range is no longer than V's — a
+#                  guard so a whole-loop induction variable is not traded for a
+#                  shorter high-cost temp). Otherwise V itself stays in memory.
+#                  This keeps a loop-carried reduction accumulator register-
+#                  resident across the hot loop instead of round-tripping it to a
+#                  stack slot every iteration (the old "furthest end" victim rule
+#                  spilled exactly those long-lived accumulators).
 #   4. A value left in memory (never assigned, or chosen as a spill victim) just
 #      uses its existing stack slot — codegen already lays every local out at a
 #      %rbp offset, so "spill" is a no-op: do nothing and the default memory path
 #      is correct. Only ASSIGNED values change codegen.
 #
 # REGISTER POOL — ABI
-#   We allocate ONLY callee-saved registers: %rbx,%r12,%r13,%r14,%r15. Two wins:
+#   BASE pool = callee-saved %rbx,%r12,%r13,%r14,%r15, always available:
 #     * call-crossing is FREE: a callee-saved register survives any `call` by the
 #       System-V ABI (the callee preserves it), so a value held in one of these
-#       stays valid across calls with NO save/restore around the call site. This
-#       is the simplest CORRECT call strategy the task allows ("just don't keep
-#       call-crossing values in caller-saved regs").
-#     * %rsp/%rbp and the arg/return/scratch regs (%rax,%rcx,%rdx,%rsi,%rdi,
-#       %r8-%r11) are NEVER touched, so the existing codegen's stack-machine
-#       lowering (which clobbers %rax/%rcx freely and uses %rdi.. for args) is
-#       undisturbed. The function prologue PUSHes exactly the pool registers it
-#       used and the epilogue POPs them (codegen owns that emission).
+#       stays valid across calls with NO save/restore around the call site.
+#     * %rsp/%rbp and %rax/%rcx/%rdx (the stack-machine scratch) are NEVER
+#       touched, so codegen's lowering is undisturbed. The prologue PUSHes
+#       exactly the BASE pool registers used; the epilogue POPs them.
+#   EXTENSION pool (P3) = caller-saved %rdi,%r8,%r9,%r10,%r11, available ONLY in
+#       a provably CALL-FREE function (cfg_fn_has_call == 0). codegen writes these
+#       only when marshalling CALL/SYSCALL arguments or staging an indirect-call
+#       pointer; in a function that makes no call NONE of those paths fire, so the
+#       five are never clobbered and are safe as durable homes WITHOUT save/
+#       restore (they are caller-saved, and a call-free leaf has no caller value
+#       to preserve and makes no call to clobber them). %rsi is EXCLUDED (the
+#       --opt idiv reciprocal sequence uses it transiently). Any call in scope (or
+#       any build-time uncertainty) keeps the pool BASE-only, so a value is NEVER
+#       left in a caller-saved register across a call. See ra_pool_is_callee_saved
+#       (gates prologue saves) and ra_build_for_function (gates the expansion).
 #
 # WHY THE STACK SLOT STAYS AUTHORITATIVE (write-through)
 #   codegen consumes an assignment as: a READ of an assigned value reads the
@@ -72,6 +85,8 @@ from compiler.cfg import (
     nm_off,
     nm_len,
     nm_count,
+    nm_usecost,
+    cfg_fn_has_call,
     cfg_overflow,
     CFGV_OK,
 )
@@ -103,30 +118,73 @@ def ra_is_enabled() -> uint32:
 
 
 # =======================================================================
-# Physical register pool — callee-saved only.
+# Physical register pool — callee-saved base + call-free caller-saved expansion.
 # =======================================================================
 #
-# We identify a physical register by a small POOL INDEX 0..RA_NREGS-1 and map it
-# to an x86-64 register ENCODING (the 3-bit reg number) for codegen. Encodings:
+# We identify a physical register by a small POOL INDEX and map it to an x86-64
+# register ENCODING (the 3-bit reg number) for codegen.
+#
+# BASE pool (indices 0..RA_NREGS_BASE-1) — CALLEE-SAVED, always available:
 #   %rbx = 3,  %r12 = 12,  %r13 = 13,  %r14 = 14,  %r15 = 15.
-# codegen translates a pool reg encoding into the right REX + modrm.
-RA_NREGS: uint32 = 5
+# These survive any `call` for free (System-V callee-saved), so a value held in
+# one stays valid across calls with no save/restore. The prologue PUSHes /
+# epilogue POPs exactly the base regs the function used.
+#
+# EXTENSION pool (indices RA_NREGS_BASE..RA_NREGS_MAX-1) — CALLER-SAVED, usable
+# ONLY in a provably CALL-FREE function (cfg_fn_has_call == 0):
+#   %rdi = 7,  %r8 = 8,  %r9 = 9,  %r10 = 10,  %r11 = 11.
+# AUDIT (codegen.ad): in normal straight-line expression/statement lowering the
+# stack machine clobbers %rax/%rcx/%rdx (operand scratch + idiv/imul) and, under
+# --opt div strength-reduction, %rsi. It writes %rdi/%r8/%r9/%r10/%r11 ONLY when
+# marshalling CALL or SYSCALL arguments (emit_pop_argreg/emit_pop_syscallreg) and
+# %r11 ONLY to stage an indirect-call pointer. In a function that makes NO calls
+# (and therefore no indirect calls), NONE of those argument/indirect-call paths
+# fire, so these five registers are never written by codegen — safe as durable
+# homes. %rsi is deliberately EXCLUDED (the --opt idiv reciprocal sequence uses
+# it as a transient). These regs are caller-saved, so they are NOT pushed/popped
+# in the prologue (a call-free leaf has no caller whose values they'd hold and
+# makes no call that could clobber them) — see ra_pool_is_callee_saved.
+#
+# The effective pool size per function is ra_nregs_eff: RA_NREGS_BASE when the
+# function makes any call (or allocation/validation was conservative), expanded
+# to RA_NREGS_MAX when call-free. CORRECTNESS FALLBACK: any uncertainty (call
+# present, build failure) keeps the pool callee-saved-only.
+RA_NREGS_BASE: uint32 = 5              # callee-saved count
+RA_NREGS_MAX: uint32 = 10             # callee-saved + caller-saved extension
 RA_NONE: uint32 = 0xffffffff           # "no register" sentinel
 
-ra_pool_enc: Array[5, uint32]          # pool index -> x86 reg encoding
+# Effective pool size for the function currently being allocated. Set by
+# ra_build_for_function from cfg_fn_has_call. ra_nregs() returns this.
+ra_nregs_eff: uint32 = 5
+
+ra_pool_enc: Array[10, uint32]         # pool index -> x86 reg encoding
 
 
 def ra_pool_init():
-    ra_pool_enc[0] = 3                  # %rbx
-    ra_pool_enc[1] = 12                 # %r12
-    ra_pool_enc[2] = 13                 # %r13
-    ra_pool_enc[3] = 14                 # %r14
-    ra_pool_enc[4] = 15                 # %r15
+    ra_pool_enc[0] = 3                  # %rbx   (callee-saved)
+    ra_pool_enc[1] = 12                 # %r12   (callee-saved)
+    ra_pool_enc[2] = 13                 # %r13   (callee-saved)
+    ra_pool_enc[3] = 14                 # %r14   (callee-saved)
+    ra_pool_enc[4] = 15                 # %r15   (callee-saved)
+    ra_pool_enc[5] = 7                  # %rdi   (caller-saved, call-free only)
+    ra_pool_enc[6] = 8                  # %r8    (caller-saved, call-free only)
+    ra_pool_enc[7] = 9                  # %r9    (caller-saved, call-free only)
+    ra_pool_enc[8] = 10                 # %r10   (caller-saved, call-free only)
+    ra_pool_enc[9] = 11                 # %r11   (caller-saved, call-free only)
+
+
+# True iff pool index p maps to a CALLEE-SAVED register (the base pool). Only
+# these are pushed/popped by the function prologue/epilogue; the caller-saved
+# extension regs (p >= RA_NREGS_BASE) are never saved (call-free use only).
+def ra_pool_is_callee_saved(p: uint32) -> uint32:
+    if p < RA_NREGS_BASE:
+        return 1
+    return 0
 
 
 # Per-pool-index occupancy: the name id currently holding this register, or
 # RA_NONE if free. Rebuilt per function during the scan.
-ra_pool_owner: Array[5, uint32]
+ra_pool_owner: Array[10, uint32]
 
 
 # =======================================================================
@@ -163,9 +221,10 @@ def ra_reset():
         ra_assigned_reg[n] = RA_NONE
         n = n + 1
     p: uint32 = 0
-    while p < RA_NREGS:
+    while p < RA_NREGS_MAX:
         ra_pool_owner[p] = RA_NONE
         p = p + 1
+    ra_nregs_eff = RA_NREGS_BASE
     ra_used_mask = 0
     ra_ok = 0
     ra_order_n = 0
@@ -200,25 +259,41 @@ def ra_collect_sorted():
 # Find a free pool index, or RA_NONE if none free.
 def ra_find_free() -> uint32:
     p: uint32 = 0
-    while p < RA_NREGS:
+    while p < ra_nregs_eff:
         if ra_pool_owner[p] == RA_NONE:
             return p
         p = p + 1
     return RA_NONE
 
 
-# Among the active intervals, return the pool index whose owner has the FURTHEST
-# (largest lr_end). Returns RA_NONE if no register is active.
-def ra_furthest_active() -> uint32:
+# Among the active intervals, return the pool index whose owner has the LOWEST
+# spill cost (loop-depth-weighted use count). This is the standard spill-cost
+# heuristic: the cheapest-to-recompute/reload value falls back to memory, so a
+# loop-carried accumulator (huge weighted use count) is KEPT in a register and a
+# short-lived straight-line temp is evicted instead. Ties broken by FURTHEST end
+# (longer live range is costlier to keep, so on equal cost prefer to evict it).
+# Returns RA_NONE if no register is active.
+def ra_cheapest_active() -> uint32:
     best_p: uint32 = RA_NONE
+    best_cost: uint32 = 0
     best_end: uint32 = 0
     p: uint32 = 0
-    while p < RA_NREGS:
+    while p < ra_nregs_eff:
         owner: uint32 = ra_pool_owner[p]
         if owner != RA_NONE:
-            if best_p == RA_NONE or lr_end[owner] > best_end:
+            c: uint32 = nm_usecost[owner]
+            e: uint32 = lr_end[owner]
+            take: uint32 = 0
+            if best_p == RA_NONE:
+                take = 1
+            elif c < best_cost:
+                take = 1
+            elif c == best_cost and e > best_end:
+                take = 1
+            if take != 0:
                 best_p = p
-                best_end = lr_end[owner]
+                best_cost = c
+                best_end = e
         p = p + 1
     return best_p
 
@@ -227,7 +302,7 @@ def ra_furthest_active() -> uint32:
 # by the time the current value starts): free its register.
 def ra_expire(point: uint32):
     p: uint32 = 0
-    while p < RA_NREGS:
+    while p < ra_nregs_eff:
         owner: uint32 = ra_pool_owner[p]
         if owner != RA_NONE:
             if lr_end[owner] <= point:
@@ -259,11 +334,29 @@ def ra_linear_scan():
             ra_used_mask = ra_used_mask | (cast[uint32](1) << free_p)
             ra_stat_inreg = ra_stat_inreg + 1
         else:
-            # SPILL by furthest end: evict the active value that ends latest IF
-            # it ends after v (so v, which dies sooner, gets the register and the
-            # long-lived value falls back to memory). Otherwise spill v itself.
-            spill_p: uint32 = ra_furthest_active()
-            if spill_p != RA_NONE and lr_end[ra_pool_owner[spill_p]] > vend:
+            # SPILL by spill-cost: evict the active value with the LOWEST
+            # loop-depth-weighted use count IF it is cheaper to keep in memory
+            # than v (so the costlier value — e.g. a loop-carried accumulator —
+            # gets the register and the cheap value falls back to memory).
+            # Otherwise spill v itself. This keeps whole-loop accumulators and
+            # loop-invariant bases register-resident instead of evicting them by
+            # the old "furthest end" rule (which spilled exactly those).
+            spill_p: uint32 = ra_cheapest_active()
+            do_evict: uint32 = 0
+            if spill_p != RA_NONE:
+                vict: uint32 = ra_pool_owner[spill_p]
+                # Evict the cheapest active value for v only when it is GENUINELY
+                # cheaper to keep in memory than v: strictly lower loop-weighted
+                # use count AND its remaining live range is no longer than v's.
+                # The length guard prevents trading away a longer-lived value (a
+                # whole-loop induction variable) for a shorter-lived higher-cost
+                # temp — that swap raised reload traffic on the longer value and
+                # is what the bench showed regressing. When costs are comparable
+                # we fall through to the original "spill v itself" behavior, which
+                # preserves the prior (furthest-end) allocation on the hot loop.
+                if nm_usecost[vict] < nm_usecost[v] and lr_end[vict] <= vend:
+                    do_evict = 1
+            if do_evict != 0:
                 evicted: uint32 = ra_pool_owner[spill_p]
                 ra_assigned_reg[evicted] = RA_NONE
                 ra_stat_inreg = ra_stat_inreg - 1
@@ -280,7 +373,7 @@ def ra_linear_scan():
     # popcount the used mask for the regs-used stat.
     ra_stat_regs_used = 0
     p: uint32 = 0
-    while p < RA_NREGS:
+    while p < ra_nregs_eff:
         if ((ra_used_mask >> p) & 1) != 0:
             ra_stat_regs_used = ra_stat_regs_used + 1
         p = p + 1
@@ -311,6 +404,15 @@ def ra_build_for_function(fn: uint32) -> uint32:
     cl_build(fn)
     if cfg_overflow != 0:
         return 0
+
+    # POOL SIZE: expand to the caller-saved extension ONLY when the function is
+    # provably CALL-FREE (no ND_CALL / ND_METHOD_CALL lowered). Any call (or the
+    # conservative default) keeps the pool callee-saved-only so no value is ever
+    # left in a caller-saved register across a call.
+    if cfg_fn_has_call == 0:
+        ra_nregs_eff = RA_NREGS_MAX
+    else:
+        ra_nregs_eff = RA_NREGS_BASE
 
     ra_collect_sorted()
     ra_linear_scan()
@@ -359,7 +461,7 @@ def ra_pool_used(p: uint32) -> uint32:
 
 
 def ra_nregs() -> uint32:
-    return RA_NREGS
+    return ra_nregs_eff
 
 
 # BORROW guard: 1 iff EVERY promoted local that linear scan assigned to pool
@@ -377,7 +479,7 @@ def ra_nregs() -> uint32:
 # bare END test is NOT. Returns 0 if no name owns p, any owner is still live (or
 # cross-block), or ra is not built — conservative.
 def ra_pool_all_dead_after(p: uint32, point: uint32) -> uint32:
-    if p >= RA_NREGS:
+    if p >= ra_nregs_eff:
         return 0
     if ra_ok == 0:
         return 0

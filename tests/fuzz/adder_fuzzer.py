@@ -3163,6 +3163,134 @@ def _regpressure_corpus():
          "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
          loopsum)
 
+    # 5) P3 SPILL-COST: a hot reduction accumulator vs many short-lived temps.
+    #    `acc` is updated EVERY iteration (huge loop-weighted use cost) while a
+    #    rotating set of straight-line temps t0..t7 are each live only briefly.
+    #    The spill-cost heuristic must KEEP acc register-resident (not evict it
+    #    by the old furthest-end rule). Correctness proves acc round-trips right
+    #    whatever the allocator chose; the value is the soundness gate.
+    n_iter2 = 9
+    acc = 0
+    for it in range(n_iter2):
+        t0 = (it * 3 + 1) & M
+        t1 = (t0 + 5) & M
+        t2 = (t1 * 2) & M
+        t3 = (t2 + it) & M
+        acc = (acc + t0 + t1 + t2 + t3) & M
+    prog("hot_accum_vs_temps",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    acc: uint64 = cast[uint64](0)\n"
+         "    it: int64 = cast[int64](0)\n"
+         + f"    while it < cast[int64]({n_iter2}):\n"
+         "        t0: uint64 = cast[uint64](it) * cast[uint64](3) + cast[uint64](1)\n"
+         "        t1: uint64 = t0 + cast[uint64](5)\n"
+         "        t2: uint64 = t1 * cast[uint64](2)\n"
+         "        t3: uint64 = t2 + cast[uint64](it)\n"
+         "        acc = acc + t0 + t1 + t2 + t3\n"
+         "        it = it + cast[int64](1)\n"
+         "    g_accum = acc\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         acc)
+
+    # 6) CALL-FREE deep loop nest with many simultaneously-live values: a 2-deep
+    #    nest where 8 accumulators are carried across BOTH back-edges. No call
+    #    anywhere => the caller-saved pool expansion (rdi/r8-r11) is eligible, so
+    #    the allocator can hold all 8 without spilling. Correctness under the
+    #    expanded pool is the gate (a mis-encoded caller-saved reg write would
+    #    corrupt the result — exactly the bug the general mov encoders fixed).
+    k = [1, 2, 3, 4, 5, 6, 7, 8]
+    OI, IJ = 4, 3
+    for _oi in range(OI):
+        for _ij in range(IJ):
+            # SEQUENTIAL in-place updates (mirror the emitted statement order):
+            # k{i} reads the CURRENT k{(i+1)%8}, which for i=7 is the already-
+            # updated k0.
+            for i in range(8):
+                k[i] = (k[i] + k[(i + 1) % 8] + (i + 1)) & M
+    nestsum = sum(k) & M
+    kdecls = "".join(f"    k{i}: uint64 = cast[uint64]({i + 1})\n" for i in range(8))
+    kupd = "".join(
+        f"            k{i} = k{i} + k{(i + 1) % 8} + cast[uint64]({i + 1})\n"
+        for i in range(8))
+    kfin = " + ".join(f"k{i}" for i in range(8))
+    # NOTE: this program makes NO call (no print_u64) — it returns only an exit
+    # code — so cfg_fn_has_call==0 and the allocator may use the caller-saved
+    # extension pool. The corpus runner asserts RA_MAX_REGS>5 is reached SOMEWHERE
+    # across the corpus, which this program provides.
+    prog("callfree_nest_8live",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         + kdecls
+         + "    oi: int64 = cast[int64](0)\n"
+         + f"    while oi < cast[int64]({OI}):\n"
+         + "        ij: int64 = cast[int64](0)\n"
+         + f"        while ij < cast[int64]({IJ}):\n"
+         + kupd
+         + "            ij = ij + cast[int64](1)\n"
+         + "        oi = oi + cast[int64](1)\n"
+         + f"    g_accum = {kfin}\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         nestsum)
+    # this program prints nothing: override expected stdout to empty.
+    nm, bd, _, _ = progs[-1]
+    progs[-1] = (nm, bd, "", nestsum & 0xFF)
+
+    # 7) MUST-NOT-CLOBBER: a loop with a CALL in the body, carrying a value
+    #    `carry` ACROSS the call every iteration. Because the function makes a
+    #    call, the allocator MUST stay callee-saved-only — a value left in a
+    #    caller-saved register would be destroyed by the call's clobbers. The
+    #    final checksum proves `carry` survived every call. The call prints an
+    #    observable intermediate so the stdout is also checked.
+    carry = 0
+    base7 = 7
+    n7 = 6
+    printed = []
+    for it in range(n7):
+        printed.append(str((base7 + it) & M))
+        carry = (carry + base7 + it) & M
+    prog("loop_call_carry",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    carry: uint64 = cast[uint64](0)\n"
+         + f"    base7: uint64 = cast[uint64]({base7})\n"
+         "    it: int64 = cast[int64](0)\n"
+         + f"    while it < cast[int64]({n7}):\n"
+         "        cur: uint64 = base7 + cast[uint64](it)\n"
+         "        print_u64(cur)\n"
+         "        carry = carry + cur\n"
+         "        it = it + cast[int64](1)\n"
+         "    g_accum = carry\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         carry)
+    nm, bd, _, _ = progs[-1]
+    progs[-1] = (nm, bd, "\n".join(printed + [str(carry & M)]), carry & 0xFF)
+
+    # 8) ALIASING WRITEBACK: a local whose ADDRESS is taken and written through a
+    #    pointer inside a loop. Such a local is NOT register-promotable (the alias
+    #    analysis marks it clobberable), so it MUST stay on the memory path even
+    #    under the expanded pool. The checksum proves the pointer writeback and
+    #    the surrounding register-resident accumulator stay coherent.
+    aw_acc = 0
+    aw_box = 0
+    n8 = 7
+    for it in range(n8):
+        aw_box = (it * 2 + 1) & M           # written through &box
+        aw_acc = (aw_acc + aw_box) & M
+    prog("alias_writeback_loop",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    box: uint64 = cast[uint64](0)\n"
+         "    aw_acc: uint64 = cast[uint64](0)\n"
+         "    p: Ptr[uint64] = &box\n"
+         "    it: int64 = cast[int64](0)\n"
+         + f"    while it < cast[int64]({n8}):\n"
+         "        p[cast[int64](0)] = cast[uint64](it) * cast[uint64](2) + cast[uint64](1)\n"
+         "        aw_acc = aw_acc + box\n"
+         "        it = it + cast[int64](1)\n"
+         "    g_accum = aw_acc\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         aw_acc)
+
     return progs
 
 
@@ -3190,10 +3318,19 @@ def _run_regpressure_corpus():
     #       mov %rax,%rbx -> 48 89 c3 ; mov %rax,%r12..%r15 -> 49 89 c4..c7
     _CALLEE_PUSH = (bytes([0x53]), bytes([0x41, 0x54]), bytes([0x41, 0x55]),
                     bytes([0x41, 0x56]), bytes([0x41, 0x57]))
-    _REG_READ = ([bytes([0x48, 0x8b, 0xc3])]
-                 + [bytes([0x49, 0x8b, c]) for c in (0xc4, 0xc5, 0xc6, 0xc7)])
-    _REG_WRITE = ([bytes([0x48, 0x89, 0xc3])]
-                  + [bytes([0x49, 0x89, c]) for c in (0xc4, 0xc5, 0xc6, 0xc7)])
+    # Register READ moves `mov %<enc>,%rax` and WRITE moves `mov %rax,%<enc>`,
+    # over BOTH the callee-saved pool (rbx=3, r12..r15) AND the call-free
+    # caller-saved extension (rdi=7, r8..r11). REX.W=0x48, +REX.B=0x49 when the
+    # r/m encoding is r8..r15; modrm = 0xC0 | (enc & 7).
+    _POOL_ENCS = (3, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+    def _rmove(op):
+        pats = []
+        for e in _POOL_ENCS:
+            rex = 0x48 | (0x01 if e >= 8 else 0)
+            pats.append(bytes([rex, op, 0xC0 | (e & 7)]))
+        return pats
+    _REG_READ = _rmove(0x8b)
+    _REG_WRITE = _rmove(0x89)
 
     def _contains_any(blob, pats):
         return any(p in blob for p in pats)
@@ -3238,22 +3375,28 @@ def _run_regpressure_corpus():
         on_read = _contains_any(d_on.code, _REG_READ)
         on_write = _contains_any(d_on.code, _REG_WRITE)
         off_push = _contains_any(d_off.code, _CALLEE_PUSH)
-        if not (on_push and (on_read or on_write)):
+        # A program that actually register-allocated (ra.inreg > 0) MUST show a
+        # pool register move under --opt (callee-saved OR the caller-saved
+        # extension). The push is required ONLY if a callee-saved reg was used:
+        # a purely caller-saved (call-free) allocation emits no callee-saved
+        # push, which is correct (those regs need no save/restore).
+        if ra.inreg > 0 and not (on_read or on_write):
             all_ok = False
-            print(f"  [REGPRESSURE '{name}'] EMITTED CODE shows no callee-saved "
-                  f"register move under --opt (push={on_push} read={on_read} "
-                  f"write={on_write})")
+            print(f"  [REGPRESSURE '{name}'] EMITTED CODE shows no pool register "
+                  f"move under --opt (read={on_read} write={on_write} "
+                  f"inreg={ra.inreg})")
             continue
         if off_push:
             all_ok = False
             print(f"  [REGPRESSURE '{name}'] OFF path is NOT byte-inert: emitted a "
                   f"callee-saved push with the flag off")
             continue
-        if d_on.code == d_off.code:
+        if ra.inreg > 0 and d_on.code == d_off.code:
             all_ok = False
             print(f"  [REGPRESSURE '{name}'] --opt did not change the emitted code")
             continue
-        total_regmove_progs += 1
+        if on_read or on_write:
+            total_regmove_progs += 1
     # The corpus must (a) be all-correct, (b) demonstrably register-allocate, and
     # (c) demonstrably hit pressure (a spill OR the full 5-reg pool somewhere).
     if total_inreg == 0:
@@ -3266,6 +3409,12 @@ def _run_regpressure_corpus():
         all_ok = False
         print("  [REGPRESSURE FAIL] no program emitted a callee-saved register move "
               "under --opt (the allocator's assignments never reached the machine code)")
+    # P3 caller-saved EXPANSION must fire somewhere: a call-free pressured
+    # function exceeds the 5-register callee-saved pool (RA_MAX_REGS > 5).
+    if max_regs <= 5:
+        all_ok = False
+        print("  [REGPRESSURE FAIL] caller-saved pool expansion never fired "
+              f"(max RA_MAX_REGS={max_regs} <= 5); call-free pressure unexercised")
     return (all_ok, total_inreg, total_spilled, max_regs, total_regmove_progs)
 
 
@@ -3308,14 +3457,17 @@ def _method_regpressure_corpus():
         "    return 0\n"
     )
 
-    # 1) Eight live locals inside ONE method, all summed at the end (8 > pool of
-    #    5 => the allocator must register-allocate AND spill inside the method).
-    #    x is the method param (also a promotable named scalar).
+    # 1) Eight live locals inside ONE method, all summed at the end. The method
+    #    is call-free, so the allocator register-allocates them; under the P3
+    #    caller-saved pool expansion a call-free method reaches >5 distinct regs
+    #    (RA_MAX_REGS > 5), the pressure proof. x is the method param (also a
+    #    promotable named scalar).
+    NLIVE = 8
     decls = "".join(
-        f"        m{i}: uint64 = x + cast[uint64]({i + 1})\n" for i in range(8))
-    summ = " + ".join(f"m{i}" for i in range(8))
+        f"        m{i}: uint64 = x + cast[uint64]({i + 1})\n" for i in range(NLIVE))
+    summ = " + ".join(f"m{i}" for i in range(NLIVE))
     x0 = 4
-    total = sum((x0 + (i + 1)) for i in range(8)) & M
+    total = sum((x0 + (i + 1)) for i in range(NLIVE)) & M
     body1 = (
         IO
         + "class Crunch:\n"
@@ -3340,15 +3492,16 @@ def _method_regpressure_corpus():
     #    accumulator that must round-trip correctly every iteration), entirely
     #    inside the method body.
     n_iter = 4
-    s = [i + 1 for i in range(6)]
+    NACC = 6
+    s = [i + 1 for i in range(NACC)]
     for _ in range(n_iter):
-        s = [(s[i] + (i + 1)) & M for i in range(6)]
+        s = [(s[i] + (i + 1)) & M for i in range(NACC)]
     loopsum = sum(s) & M
     init = "".join(
-        f"        s{i}: uint64 = cast[uint64]({i + 1})\n" for i in range(6))
+        f"        s{i}: uint64 = cast[uint64]({i + 1})\n" for i in range(NACC))
     upd = "".join(
-        f"            s{i} = s{i} + cast[uint64]({i + 1})\n" for i in range(6))
-    fin = " + ".join(f"s{i}" for i in range(6))
+        f"            s{i} = s{i} + cast[uint64]({i + 1})\n" for i in range(NACC))
+    fin = " + ".join(f"s{i}" for i in range(NACC))
     body2 = (
         IO
         + "class Loopy:\n"
@@ -3386,6 +3539,7 @@ def _run_method_regpressure_corpus():
     all_ok = True
     total_inreg = 0
     total_spilled = 0
+    method_max_regs = 0
     method_regmove_progs = 0
 
     _CALLEE_PUSH = (bytes([0x53]), bytes([0x41, 0x54]), bytes([0x41, 0x55]),
@@ -3414,6 +3568,7 @@ def _run_method_regpressure_corpus():
             continue
         total_inreg += ra.inreg
         total_spilled += ra.spilled
+        method_max_regs = max(method_max_regs, ra.max_regs)
 
         # MACHINE-CODE proof scoped to the METHOD: only the method exceeds the
         # 5-reg pool (the free helpers have <=2 locals), so a callee-saved push
@@ -3449,9 +3604,15 @@ def _run_method_regpressure_corpus():
     if total_inreg == 0:
         all_ok = False
         print("  [METHOD-REGPRESSURE FAIL] no method value placed in a register")
-    if total_spilled == 0:
+    # PRESSURE proof: a method must exceed the 5-register callee-saved pool —
+    # either by SPILLING (>10 live, exceeds even the expanded pool) OR by using
+    # the P3 caller-saved expansion (RA_MAX_REGS > 5 in a call-free method).
+    # Before P3 these methods spilled; now the larger pool absorbs the pressure
+    # into the caller-saved extension instead, which max_regs>5 demonstrates.
+    if total_spilled == 0 and method_max_regs <= 5:
         all_ok = False
-        print("  [METHOD-REGPRESSURE FAIL] no method register pressure (no spill)")
+        print("  [METHOD-REGPRESSURE FAIL] no method register pressure "
+              f"(no spill and RA_MAX_REGS={method_max_regs} <= 5)")
     if method_regmove_progs == 0:
         all_ok = False
         print("  [METHOD-REGPRESSURE FAIL] no method emitted a callee-saved "
