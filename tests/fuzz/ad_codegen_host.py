@@ -186,6 +186,7 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       folds=meta.get("FOLDS", 0),
                       ffold=meta.get("FFOLD", 0),
                       cse=meta.get("CSE", 0),
+                      loadcse=meta.get("LOADCSE", 0),
                       licm=meta.get("LICM", 0),
                       dce=meta.get("DCE", 0),
                       constbranch=meta.get("CONSTBRANCH", 0),
@@ -492,6 +493,7 @@ class CodegenRun:
         self.folds = kw.get("folds", 0)
         self.ffold = kw.get("ffold", 0)
         self.cse = kw.get("cse", 0)
+        self.loadcse = kw.get("loadcse", 0)
         self.licm = kw.get("licm", 0)
         self.dce = kw.get("dce", 0)
         self.constbranch = kw.get("constbranch", 0)
@@ -539,6 +541,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     folds = getattr(dump, "folds", 0)
     ffold = getattr(dump, "ffold", 0)
     cse = getattr(dump, "cse", 0)
+    loadcse = getattr(dump, "loadcse", 0)
     licm = getattr(dump, "licm", 0)
     dce = getattr(dump, "dce", 0)
     constbranch = getattr(dump, "constbranch", 0)
@@ -559,7 +562,8 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                           strengthred=strengthred, isel=isel, aluload=aluload,
                           ivsr=ivsr)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
-                      folds=folds, ffold=ffold, cse=cse, licm=licm, dce=dce,
+                      folds=folds, ffold=ffold, cse=cse, loadcse=loadcse,
+                      licm=licm, dce=dce,
                       constbranch=constbranch, copyprop=copyprop, iremit=iremit,
                       irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat,
                       strengthred=strengthred, isel=isel, aluload=aluload,

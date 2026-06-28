@@ -47,6 +47,8 @@ from compiler.parser import (
     ND_CAST,
     ND_INDEX,
     ND_TYPE,
+    ND_ARRAY_TYPE,
+    ND_PTR_TYPE,
     ND_PARAM,
     ND_VAR_DECL,
     ND_ASSIGN,
@@ -119,6 +121,11 @@ opt_fold_count: uint32 = 0
 # (each elimination = one recomputation replaced by a load of a hoisted temp).
 opt_cse_count: uint32 = 0
 
+# Diagnostics: number of redundant integer ARRAY-element LOADS eliminated by the
+# cross-statement load-CSE broadening (subset of opt_cse_count; counted
+# separately so the firing test can assert load-CSE specifically).
+opt_loadcse_count: uint32 = 0
+
 # Monotonic counter for minting unique synthetic temp names (__cse_<n>).
 opt_cse_tmp_seq: uint32 = 0
 
@@ -161,6 +168,7 @@ def opt_enable():
 def opt_reset_stats():
     opt_fold_count = 0
     opt_cse_count = 0
+    opt_loadcse_count = 0
     opt_cse_tmp_seq = 0
     opt_licm_count = 0
     opt_dce_count = 0
@@ -332,6 +340,196 @@ def opt_gfw_build(decls: uint32):
             if w != 0:
                 opt_gfw_add(nd_name_off[cur], nd_name_len[cur], w)
         cur = nd_next[cur]
+
+
+# =======================================================================
+# ELEMENT-FLOAT tables — soundness gate for LOAD-CSE (Phase 7 broadening).
+# =======================================================================
+#
+# Load-CSE shares a redundant array/pointer element load `base[idx]` across
+# straight-line statements by hoisting it into an UNTYPED 8-byte scalar temp.
+# That round-trips an INTEGER element bit-for-bit (a movq store + movq load),
+# but a FLOAT element value would be mis-typed: the reuse ND_IDENT resolves to
+# float width 0 -> codegen emits an integer move for an SSE value (a float
+# miscompile, the exact trap the CSE/LICM float-typing oracle exists to avoid).
+#
+# opt.ad has no element-type table (the scalar opt_fw_/opt_gfw_ tables only
+# record float SCALAR locals/globals). So we record, per local/global NAME, a
+# 1/0 flag: 1 = the name is an array/pointer whose ELEMENT is a primitive
+# SCALAR INTEGER (int8..uint64) — the ONLY shape whose `base[idx]` is a plain
+# scalar value load that round-trips an untyped 8-byte temp bit-for-bit. A
+# FLOAT element (would mis-type the SSE value), an AGGREGATE element (e.g.
+# `Array[r, Array[c, int]]` — `g[a]` is a ROW ADDRESS, not a scalar value, so
+# CSE-ing it into a scalar temp and re-indexing it dereferences garbage), a
+# pointer-to-nonint, a struct/bool/char/str element, or an unknown name all
+# record 0 -> the load gate DECLINES (the conservative default).
+OPT_EFW_MAX: uint32 = 4096
+opt_efw_off: Array[4096, uint32]
+opt_efw_len: Array[4096, uint32]
+opt_efw_ok: Array[4096, uint32]     # 1 = scalar-integer element (admit)
+opt_efw_n: uint32 = 0
+
+OPT_EGFW_MAX: uint32 = 4096
+opt_egfw_off: Array[4096, uint32]
+opt_egfw_len: Array[4096, uint32]
+opt_egfw_ok: Array[4096, uint32]
+opt_egfw_n: uint32 = 0
+
+
+# Is a primitive ND_TYPE node a SCALAR INTEGER (int8..uint64, codes 2..9)?
+# Floats (10/11), bool(12)/char(13)/str(14), and the None marker (1) are NOT
+# admitted: floats route to SSE, and bool/char/str have width/semantics we keep
+# off the integer-temp fast path conservatively.
+def opt_type_is_scalar_int(tnode: uint32) -> uint32:
+    if tnode == 0:
+        return 0
+    if nd_kind[tnode] != ND_TYPE:
+        return 0
+    code: uint32 = nd_aux[tnode]
+    if code >= 2 and code <= 9:
+        return 1
+    return 0
+
+
+# Does a var-decl/param TYPE node declare an array/pointer with a SCALAR INTEGER
+# element? returns 2 (recognized aggregate, scalar-int elem -> record ok=1),
+# 1 (recognized aggregate, NON-scalar-int elem -> record ok=0), 0 (NOT an
+# array/ptr decl -> don't record at all; the name resolves to "unknown" later,
+# which the gate declines anyway). Splitting 1 vs 0 lets us POSITIVELY record a
+# float/aggregate-element array as ok=0 so a same-named outer scope can't be
+# confused — though in practice "don't record" and "record 0" both decline.
+def opt_elem_class(tnode: uint32) -> uint32:
+    if tnode == 0:
+        return 0
+    k: uint32 = nd_kind[tnode]
+    if k == ND_ARRAY_TYPE or k == ND_PTR_TYPE:
+        if opt_type_is_scalar_int(nd_a[tnode]) != 0:
+            return 2
+        return 1
+    return 0
+
+
+def opt_efw_add(off: uint32, len_: uint32, ok: uint32):
+    if opt_efw_n >= OPT_EFW_MAX:
+        return
+    opt_efw_off[opt_efw_n] = off
+    opt_efw_len[opt_efw_n] = len_
+    opt_efw_ok[opt_efw_n] = ok
+    opt_efw_n = opt_efw_n + 1
+
+
+def opt_egfw_add(off: uint32, len_: uint32, ok: uint32):
+    if opt_egfw_n >= OPT_EGFW_MAX:
+        return
+    opt_egfw_off[opt_egfw_n] = off
+    opt_egfw_len[opt_egfw_n] = len_
+    opt_egfw_ok[opt_egfw_n] = ok
+    opt_egfw_n = opt_egfw_n + 1
+
+
+# Scan one statement chain for ARRAY/POINTER var-decls, recording each base
+# name's scalar-int-element flag. Recurses into nested blocks (mirrors
+# opt_fw_scan_block).
+def opt_efw_scan_block(head: uint32):
+    s: uint32 = head
+    while s != 0:
+        k: uint32 = nd_kind[s]
+        if k == ND_VAR_DECL:
+            c: uint32 = opt_elem_class(nd_a[s])
+            if c != 0:
+                ok: uint32 = 0
+                if c == 2:
+                    ok = 1
+                opt_efw_add(nd_name_off[s], nd_name_len[s], ok)
+        elif k == ND_IF:
+            opt_efw_scan_block(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                opt_efw_scan_block(nd_b[e])
+                e = nd_next[e]
+            opt_efw_scan_block(nd_d[s])
+        elif k == ND_WHILE:
+            opt_efw_scan_block(nd_b[s])
+        elif k == ND_DO_WHILE:
+            opt_efw_scan_block(nd_b[s])
+        elif k == ND_FOR:
+            opt_efw_scan_block(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            opt_efw_scan_block(nd_c[s])
+        s = nd_next[s]
+
+
+# Build the per-function element table from params + body var-decls.
+def opt_efw_build(fn: uint32):
+    opt_efw_n = 0
+    p: uint32 = nd_a[fn]
+    while p != 0:
+        if nd_kind[p] == ND_PARAM:
+            c: uint32 = opt_elem_class(nd_a[p])
+            if c != 0:
+                ok: uint32 = 0
+                if c == 2:
+                    ok = 1
+                opt_efw_add(nd_name_off[p], nd_name_len[p], ok)
+        p = nd_next[p]
+    opt_efw_scan_block(nd_c[fn])
+
+
+# Build the program-wide global element table from top-level array/ptr globals.
+def opt_egfw_build(decls: uint32):
+    opt_egfw_n = 0
+    cur: uint32 = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_VAR_DECL:
+            c: uint32 = opt_elem_class(nd_a[cur])
+            if c != 0:
+                ok: uint32 = 0
+                if c == 2:
+                    ok = 1
+                opt_egfw_add(nd_name_off[cur], nd_name_len[cur], ok)
+        cur = nd_next[cur]
+
+
+# Is the base ident a KNOWN scalar-integer-element array/pointer? (local shadows
+# global.) Returns 1 only when positively recorded ok=1; ANY unknown / non-int /
+# aggregate / float element returns 0 -> the gate declines.
+def opt_base_is_scalar_int_array(off: uint32, len_: uint32) -> uint32:
+    i: uint32 = 0
+    while i < opt_efw_n:
+        if ir_name_eq(opt_efw_off[i], opt_efw_len[i], off, len_) != 0:
+            return opt_efw_ok[i]
+        i = i + 1
+    j: uint32 = 0
+    while j < opt_egfw_n:
+        if ir_name_eq(opt_egfw_off[j], opt_egfw_len[j], off, len_) != 0:
+            return opt_egfw_ok[j]
+        j = j + 1
+    return 0
+
+
+# Is `node` an ND_INDEX load we may SOUNDLY load-CSE into an untyped int temp?
+# Requires ALL of:
+#   * node is ND_INDEX,
+#   * its base (nd_a) is a BARE IDENT (no nested index / cast / call / member
+#     base — a nested index base is a ROW ADDRESS of a multi-dim array, NOT a
+#     scalar value; CSE-ing it would dereference garbage),
+#   * that ident is a known array/pointer with a primitive SCALAR INTEGER element
+#     (opt_base_is_scalar_int_array — float / aggregate / unknown all decline),
+#   * the index subtree (nd_b) contains NO float anywhere (cheap insurance).
+# Returns 1 to admit, 0 to DECLINE (the conservative default).
+def opt_index_load_is_int(node: uint32) -> uint32:
+    if node == 0:
+        return 0
+    if nd_kind[node] != ND_INDEX:
+        return 0
+    base: uint32 = nd_a[node]
+    if base == 0 or nd_kind[base] != ND_IDENT:
+        return 0
+    if opt_base_is_scalar_int_array(nd_name_off[base], nd_name_len[base]) == 0:
+        return 0                       # unknown / non-int / aggregate -> decline
+    if opt_subtree_has_float(nd_b[node]) != 0:
+        return 0
+    return 1
 
 
 # Float width (0/4/8) of an EXPRESSION — the opt-side mirror of codegen.ad
@@ -985,6 +1183,8 @@ def opt_run(prog: uint32):
     # CSE/LICM consults it (plus its own per-function local table) to type a
     # shared FLOAT temp correctly.
     opt_gfw_build(decls)
+    # Program-wide ELEMENT-float table (array/ptr globals) for the load-CSE gate.
+    opt_egfw_build(decls)
     cur: uint32 = decls
     while cur != 0:
         opt_walk(cur)
@@ -1267,10 +1467,17 @@ def cse_apply(root: uint32, proto_ir: uint32, off: uint32, len_: uint32) -> uint
 def cse_kill_descendants(ast: uint32):
     if ast == 0:
         return
-    if nd_kind[ast] != ND_BINARY:
+    k: uint32 = nd_kind[ast]
+    if k == ND_BINARY:
+        cse_kill_subtree(nd_a[ast])
+        cse_kill_subtree(nd_b[ast])
         return
-    cse_kill_subtree(nd_a[ast])
-    cse_kill_subtree(nd_b[ast])
+    # An ND_INDEX load candidate (load-CSE): its base + index subtrees are about
+    # to be orphaned when the load collapses to an ident, so kill any candidate
+    # (e.g. a binop nested in the index expression) living inside them.
+    if k == ND_INDEX:
+        cse_kill_subtree(nd_a[ast])
+        cse_kill_subtree(nd_b[ast])
 
 
 def cse_kill_subtree(node: uint32):
@@ -1281,7 +1488,8 @@ def cse_kill_subtree(node: uint32):
         if cse_cand_ast[m] == node:
             cse_cand_ast[m] = 0
         m = m + 1
-    if nd_kind[node] == ND_BINARY:
+    k: uint32 = nd_kind[node]
+    if k == ND_BINARY or k == ND_INDEX:
         cse_kill_subtree(nd_a[node])
         cse_kill_subtree(nd_b[node])
 
@@ -2716,11 +2924,45 @@ xcse_pd_before: Array[512, uint32]
 xcse_pd_n: uint32 = 0
 
 
+# Collect every SOUNDLY-CSE-able integer ND_INDEX load in `node` (pre-order,
+# outermost-first) into the shared cse_cand_* list, each paired with its lowered
+# IR_LEAF value id. A load is admitted only by opt_index_load_is_int (bare-ident
+# integer-element base; float / unknown / non-ident bases declined). The load's
+# index subtree is also descended so a load nested in another load's index is
+# considered. Mirrors cse_collect's descent but adds ND_INDEX candidates that
+# cse_collect (ND_BINARY-only) skips. The arena is the SAME shared one
+# cse_collect uses (caller reset it once), so leaf value ids stay comparable.
+def xcse_collect_loads(node: uint32):
+    if node == 0:
+        return
+    if cse_cand_n >= CSE_MAX_CAND:
+        return
+    if nd_kind[node] == ND_INDEX:
+        if opt_index_load_is_int(node) != 0:
+            v: uint32 = ir_lower_pure_expr(node)
+            if v != 0:
+                cse_cand_ast[cse_cand_n] = node
+                cse_cand_ir[cse_cand_n] = v
+                cse_cand_n = cse_cand_n + 1
+    # Descend expression children (incl. an index's base + index subtrees) to
+    # find loads nested under binops / other loads.
+    k: uint32 = nd_kind[node]
+    if k == ND_IDENT or k == ND_INT_LIT:
+        return
+    xcse_collect_loads(nd_a[node])
+    xcse_collect_loads(nd_b[node])
+    xcse_collect_loads(nd_c[node])
+    xcse_collect_loads(nd_d[node])
+
+
 # Process ONE straight-line statement `s` for cross-statement CSE against the
 # live available set. For each pure ND_BINARY subexpression of s's r-value
 # (outermost-first), if it value-equals a LIVE available expression, rewrite it
 # to read that expression's temp (and materialize the temp before its first user
 # if not yet done). Otherwise add it to the available set keyed on this stmt.
+# Integer ND_INDEX LOADS are handled the same way (load-CSE): a redundant array
+# element read reuses the first load's temp, killed by any name-write its address
+# depends on or any hard barrier (opaque store / call / addr-of flushes the set).
 def xcse_process_stmt_rvalue(s: uint32):
     rv: uint32 = xcse_stmt_rvalue(s)
     if rv == 0:
@@ -2730,10 +2972,15 @@ def xcse_process_stmt_rvalue(s: uint32):
     # run, so available-set IR ids stay live and comparable).
     base: uint32 = cse_cand_n
     cse_collect(rv)
+    # Also collect integer array LOADS so a redundant `arr[idx]` read shares the
+    # first load's temp. Appended AFTER the binop candidates: a load nested in a
+    # binop appears later than its parent binop, and the binop branch's
+    # cse_kill_descendants nulls the inner load if the parent is rewritten first.
+    xcse_collect_loads(rv)
     i: uint32 = base
     while i < cse_cand_n:
         ast_i: uint32 = cse_cand_ast[i]
-        if ast_i != 0 and nd_kind[ast_i] == ND_BINARY:
+        if ast_i != 0 and (nd_kind[ast_i] == ND_BINARY or nd_kind[ast_i] == ND_INDEX):
             vi: uint32 = cse_cand_ir[i]
             # Match against a LIVE available expression.
             a: uint32 = 0
@@ -2753,6 +3000,8 @@ def xcse_process_stmt_rvalue(s: uint32):
                         # Rewrite this occurrence to read the temp; kill its
                         # descendants in the candidate list (they're orphaned).
                         cse_kill_descendants(ast_i)
+                        if nd_kind[ast_i] == ND_INDEX:
+                            opt_loadcse_count = opt_loadcse_count + 1
                         cse_rewrite_to_ident(ast_i, xcse_av_off[a], xcse_av_len[a])
                         cse_cand_ast[i] = 0
                         opt_cse_count = opt_cse_count + 1
@@ -2856,7 +3105,7 @@ def xcse_materialize_run(head: uint32):
     while a < xcse_av_n:
         if xcse_av_materialized[a] != 0:
             fa: uint32 = xcse_first_ast[a]
-            if fa != 0 and nd_kind[fa] == ND_BINARY:
+            if fa != 0 and (nd_kind[fa] == ND_BINARY or nd_kind[fa] == ND_INDEX):
                 cse_rewrite_to_ident(fa, xcse_av_off[a], xcse_av_len[a])
         a = a + 1
     # Splice each pending decl before its anchor statement (in pending order).
@@ -2965,6 +3214,7 @@ def xcse_block(head: uint32) -> uint32:
 
 def opt_xcse_function(fn: uint32):
     opt_fw_build(fn)
+    opt_efw_build(fn)              # per-function element-float table (load-CSE gate)
     nd_c[fn] = xcse_block(nd_c[fn])
 
 

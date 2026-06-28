@@ -551,6 +551,7 @@ class Program:
         self._gen_store_traffic(env)
         self._gen_index_signedness_traffic(env)  # indexed compare/shift signedness
         self._gen_aluload_traffic(env)            # memory-source ALU folds (--opt)
+        self._gen_loadcse_traffic(env)            # redundant-load elimination (--opt)
         self._gen_ivsr_traffic(env)               # affine-index IV strength reduction (--opt)
         self._gen_scalar_global_traffic(env)
         self._gen_struct_traffic(env)     # struct locals: member store/read
@@ -955,6 +956,81 @@ class Program:
             else:
                 cres = 1 if (lreg & umask(64)) < (ea & umask(64)) else 0
             self._fold_value(f"cast[uint64]({cbn})", U64.wrap(cres))
+
+    # ---- redundant-load (load-CSE) traffic -----------------------------------
+    def _gen_loadcse_traffic(self, env):
+        """Stress the cross-statement LOAD-CSE broadening (--opt): a redundant
+        integer array element load reuses an earlier identical load's value via a
+        hoisted temp — UNLESS an intervening store (to the same OR an aliasing
+        index) or a write to the index variable could change the location. The
+        oracle (Python shadow) is authoritative; under --opt a WRONG reuse returns
+        a STALE value and breaks g_accum, while the seed and the OFF path always
+        recompute. Every shape below is byte-identical in subset and default mode
+        (same rng stream), and the index variable `lc_i` is a real LOCAL so the
+        load address depends on a name the store-kill / name-kill paths exercise.
+
+        Shapes:
+          (A) Same element read 3x across adjacent decls, NO intervening store →
+              the 2nd and 3rd reads MUST be CSE'd. Value = element each time.
+          (B) read, then an ALIASING store to the SAME element, then re-read →
+              the re-read MUST NOT be CSE'd; it sees the NEW value (store-kill).
+          (C) read arr[i], then a store to a DIFFERENT, possibly-aliasing index
+              arr[j] (an opaque index store = hard barrier) then re-read arr[i] →
+              re-read MUST NOT reuse (the barrier flushed availability). Here j!=i
+              so arr[i] is unchanged, but the optimizer cannot prove j!=i, so it
+              must conservatively recompute — value is the ORIGINAL element.
+          (D) read arr[i], then REASSIGN i, then read arr[i] → different element,
+              MUST NOT reuse (name-kill on the index variable).
+        """
+        rng = self.rng
+        name, n, shadow = self.store_arrays[I64]
+        # Pick two distinct indices.
+        ia = rng.randrange(n)
+        ib = rng.randrange(n)
+        if ib == ia:
+            ib = (ib + 1) % n
+        va = rng.randint(-(1 << 40), (1 << 40))
+        vb = rng.randint(-(1 << 40), (1 << 40))
+        self.emit(f"    {name}[{ia}] = cast[int64]({va})")
+        self.emit(f"    {name}[{ib}] = cast[int64]({vb})")
+        shadow[ia] = I64.wrap(va)
+        shadow[ib] = I64.wrap(vb)
+        ea = _to_reg(shadow[ia])
+        eb = _to_reg(shadow[ib])
+        # Index variable as a real local so its read drives the load address.
+        self.emit(f"    lc_i: int64 = cast[int64]({ia})")
+
+        # (A) three redundant reads of arr[lc_i], no intervening store.
+        for r in range(3):
+            self.emit(f"    lcA_{r}: int64 = {name}[cast[int64](lc_i)] + cast[int64]({r})")
+            self._fold_value(f"cast[uint64](lcA_{r})", U64.wrap((ea + r)))
+
+        # (B) read, aliasing store to the SAME element, re-read (store-kill).
+        self.emit(f"    lcB0: int64 = {name}[cast[int64](lc_i)] + cast[int64](1)")
+        self._fold_value("cast[uint64](lcB0)", U64.wrap((ea + 1)))
+        vnew = rng.randint(-(1 << 40), (1 << 40))
+        self.emit(f"    {name}[cast[int64](lc_i)] = cast[int64]({vnew})")
+        shadow[ia] = I64.wrap(vnew)
+        ea = _to_reg(shadow[ia])
+        self.emit(f"    lcB1: int64 = {name}[cast[int64](lc_i)] + cast[int64](1)")
+        self._fold_value("cast[uint64](lcB1)", U64.wrap((ea + 1)))
+
+        # (C) read arr[ia], opaque store to arr[ib] (barrier), re-read arr[ia].
+        self.emit(f"    lcC0: int64 = {name}[cast[int64](lc_i)] + cast[int64](2)")
+        self._fold_value("cast[uint64](lcC0)", U64.wrap((ea + 2)))
+        vc = rng.randint(-(1 << 40), (1 << 40))
+        self.emit(f"    {name}[{ib}] = cast[int64]({vc})")
+        shadow[ib] = I64.wrap(vc)
+        eb = _to_reg(shadow[ib])
+        self.emit(f"    lcC1: int64 = {name}[cast[int64](lc_i)] + cast[int64](2)")
+        self._fold_value("cast[uint64](lcC1)", U64.wrap((ea + 2)))   # arr[ia] unchanged
+
+        # (D) read arr[lc_i], reassign lc_i to ib, read arr[lc_i] (name-kill).
+        self.emit(f"    lcD0: int64 = {name}[cast[int64](lc_i)] + cast[int64](3)")
+        self._fold_value("cast[uint64](lcD0)", U64.wrap((ea + 3)))
+        self.emit(f"    lc_i = cast[int64]({ib})")
+        self.emit(f"    lcD1: int64 = {name}[cast[int64](lc_i)] + cast[int64](3)")
+        self._fold_value("cast[uint64](lcD1)", U64.wrap((eb + 3)))
 
     # ---- scalar-global store/read traffic ------------------------------------
     def _gen_scalar_global_traffic(self, env):
