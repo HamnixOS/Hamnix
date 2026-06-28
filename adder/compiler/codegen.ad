@@ -198,6 +198,8 @@ from compiler.ir import (
     ir_uses_name,
     ir_destsel_count,
     ir_destsel_reset,
+    ir_accsel_count,
+    ir_idxstore_count,
     ir_kind,
     ir_op,
     ir_a,
@@ -5688,6 +5690,212 @@ def try_sel_assign(tgt: uint32, rhs: uint32) -> uint32:
     return try_sel_assign_name(nd_name_off[tgt], nd_name_len[tgt], rhs)
 
 
+# =======================================================================
+# P1 Phase 3 — statement-glue destination routing (accumulator + indexed store).
+# =======================================================================
+
+# Map an AUGOP (+=,-=,*=) to the matching BINOP for emit_alu_reg_reg. Returns a
+# sentinel 0xFFFFFFFF for an AUGOP this phase does not route.
+def aug_to_binop(aug: uint32) -> uint32:
+    if aug == AUGOP_ADD:
+        return BINOP_ADD
+    if aug == AUGOP_SUB:
+        return BINOP_SUB
+    if aug == AUGOP_MUL:
+        return BINOP_MUL
+    return 4294967295
+
+
+# P1 Phase 3 — ACCUMULATOR-into-register core. `name = name OP value` (the combine
+# `op %value, %home`) where `name` is a register-promoted full-width-8 scalar:
+# compute `value` into a scratch register, then combine into the home register so
+# the accumulator stays resident — no reload of `name` from its slot, no %rax
+# round-trip, and no shadow store (store-elim) / a write-through mirror otherwise.
+# Returns 1 if it emitted the whole assignment, 0 to fall back. OFF -> always 0.
+#
+# CORRECTNESS: the seed computes `name OP value` as `tmp=value(right-first); load
+# name; name OP tmp`. Here `value` is computed FIRST into the scratch (same order),
+# then combined into the home register, which already holds the live value of
+# `name`. Because an Adder expression cannot assign to a local, evaluating `value`
+# never changes `name`, so reading the home register for the combine is value-
+# identical to the seed's reload. A `value` that READS `name` (`s += s*2`,
+# `s = s + s*2`) is safe too: it reads the home's OLD value during `value`'s
+# evaluation, exactly as the seed reads name before the combine. Only PURE `value`
+# lowers (ir_lower_pure_expr -> 0 for any call/side-effect); a sub-8-byte / float /
+# non-promoted target falls back to the exact legacy sized path. `bop` is the
+# already-resolved BINOP (ADD/SUB/MUL) — for SUB the caller MUST guarantee `name`
+# is the LEFT operand (`name = name - value`), since `op %value,%home` computes
+# home - value.
+def try_sel_accum_into_reg(woff: uint32, wlen: uint32, bop: uint32, value: uint32) -> uint32:
+    if ir_emit_is_enabled() == 0:
+        return 0
+    if ir_emit_in_progress() != 0:
+        return 0
+    if value == 0:
+        return 0
+    if bop == 4294967295:
+        return 0
+    # Destination must be a register-promoted plain scalar (same gate as Phase 1).
+    r: uint32 = ra_reg_for_name(woff, wlen)
+    if r == RA_NONE:
+        return 0
+    sloff: int32 = 0
+    if lookup_local(woff, wlen, &sloff) == 0:
+        return 0
+    # Sub-8-byte scalars need the sized slot store (truncation); leave to legacy.
+    if lookup_local_scalar_size(woff, wlen) != 0:
+        return 0
+    # Float accumulator / float value -> SSE path. Check BOTH the value subtree
+    # AND the destination's own type: a float home is promoted to an SSE register,
+    # which the integer `op %src, %dst` combine would corrupt, and a float-typed
+    # value may not be caught by ir_subtree_has_float when its leaves are casts the
+    # leaf resolver does not classify. The destination float-width check closes
+    # that hole conservatively (an integer accumulator is never float-typed).
+    if lookup_local_float(woff, wlen) != 0:
+        return 0
+    if ir_subtree_has_float(value) != 0:
+        return 0
+    ir_reset()
+    v: uint32 = ir_lower_pure_expr(value)
+    if v == 0:                               # impure / out-of-set value -> legacy
+        return 0
+    # Caller-saved scratch may be held across this value tree only if call-free.
+    if ir_tree_has_call(v) == 0:
+        ir_scratch_tree_callfree = 1
+    else:
+        ir_scratch_tree_callfree = 0
+    ir_emit_enter()
+    xr: uint32 = ir_scratch_acquire()
+    if xr == RA_NONE:
+        # No scratch for the value temp; nothing emitted yet -> safe to fall back.
+        ir_emit_leave()
+        ir_scratch_tree_callfree = 0
+        return 0
+    sel_expr_into_reg(v, xr)                  # value -> %xr (dest-driven)
+    emit_alu_reg_reg(bop, xr, r)             # %home = %home OP %xr
+    ir_scratch_release(xr)
+    ir_emit_leave()
+    ir_scratch_tree_callfree = 0
+    # WRITE-THROUGH when the home is not store-elim (a residual slot read exists).
+    if ra_store_elim_for_name(woff, wlen) == 0:
+        emit_mov_callee_rax(r)               # mov %home -> %rax
+        emit_store_local_rax(sloff)          # mov %rax -> slot
+    ir_accsel_count = ir_accsel_count + 1
+    ir_emit_count = ir_emit_count + 1
+    return 1
+
+
+# AUGMENTED-assign wrapper: `name OP= value` (+=,-=,*=). Maps the AUGOP to its
+# BINOP and routes through the accumulator core (for SUB, `name -= value` is
+# exactly `name = name - value`, so `name` is the left operand as the core requires).
+def try_sel_aug_assign_name(woff: uint32, wlen: uint32, aug: uint32, value: uint32) -> uint32:
+    return try_sel_accum_into_reg(woff, wlen, aug_to_binop(aug), value)
+
+
+# PLAIN-assign ACCUMULATOR-pattern wrapper: a plain `name = <rhs>` whose RHS is a
+# top-level ACCUMULATE on `name` itself — `name = name OP rest` or (for the
+# commutative ADD/MUL) `name = rest OP name`. This is the dst-aliasing shape Phase 1
+# deliberately refused; it is SAFE and the matmul-accumulator win because it reduces
+# to the augmented combine `op %rest, %home` (rest computed first, then accumulated
+# into the resident home — value-identical to the seed, see try_sel_accum_into_reg).
+# Returns 1 if routed, 0 otherwise. For SUB only `name = name - rest` qualifies
+# (`name = rest - name` is NOT `home - rest`, so it is left to the legacy path).
+def try_sel_assign_accum(tgt: uint32, rhs: uint32) -> uint32:
+    if rhs == 0:
+        return 0
+    if nd_kind[rhs] != ND_BINARY:
+        return 0
+    op: uint32 = nd_aux[rhs]
+    if op != BINOP_ADD and op != BINOP_SUB and op != BINOP_MUL:
+        return 0
+    woff: uint32 = nd_name_off[tgt]
+    wlen: uint32 = nd_name_len[tgt]
+    la: uint32 = nd_a[rhs]
+    rb: uint32 = nd_b[rhs]
+    # `name` as the LEFT operand: `name = name OP rest` (any of ADD/SUB/MUL).
+    if nd_kind[la] == ND_IDENT and name_match(nd_name_off[la], nd_name_len[la], woff, wlen) != 0:
+        return try_sel_accum_into_reg(woff, wlen, op, rb)
+    # `name` as the RIGHT operand: `name = rest OP name` — only the COMMUTATIVE
+    # ADD/MUL accumulate this way (SUB would be `rest - name`, not `name - rest`).
+    if op != BINOP_SUB:
+        if nd_kind[rb] == ND_IDENT and name_match(nd_name_off[rb], nd_name_len[rb], woff, wlen) != 0:
+            return try_sel_accum_into_reg(woff, wlen, op, la)
+    return 0
+
+
+# P1 Phase 3 — INDEXED-STORE RHS routing. `arr[i] = <pure-arith ND_BINARY>`:
+# compute the RHS tree DIRECTLY into a held register (no value-at-a-time push/pop
+# plumbing), then compute the element address and store the held value. Returns 1
+# if it emitted the whole store, 0 to fall back to the legacy gen_expr + push +
+# gen_index_addr + pop + store path. OFF -> always 0.
+#
+# CORRECTNESS: the seed evaluates the RHS FIRST (parking it on the stack), then the
+# address, then stores. Here the RHS is computed FIRST into a scratch register
+# (same order — so a RHS load that ALIASES the stored element reads the OLD value
+# before the store, exactly as the seed does), then the address is computed by the
+# unchanged legacy gen_index_addr (which only touches %rax/%rcx and the per-loop
+# hoisted base regs — never the held scratch), then the held value is moved to
+# %rcx and stored at the seed's element width (a sub-8-byte element truncates on
+# the store exactly as the seed's emit_store_mem_rcx does, since the IR computes
+# the same full-width value). The held value register is CALLER-SAVED only across a
+# call-free tree, and the index must be CALL-FREE so no call clobbers it across the
+# address computation. Float elements / float RHS route to the SSE store path.
+def try_sel_assign_index(node: uint32) -> uint32:
+    if ir_emit_is_enabled() == 0:
+        return 0
+    if ir_emit_in_progress() != 0:
+        return 0
+    tgt: uint32 = nd_a[node]                 # ND_INDEX
+    rhs: uint32 = nd_b[node]
+    if rhs == 0:
+        return 0
+    if nd_kind[rhs] != ND_BINARY:
+        return 0
+    # Float element store -> SSE path (the integer store would miscompile the bits).
+    if index_elem_float(tgt) != 0:
+        return 0
+    if ir_subtree_has_float(rhs) != 0:
+        return 0
+    # The INDEX expression must be call-free: the RHS value is held in a register
+    # across the address computation, and a call in the index would clobber a
+    # caller-saved hold. (nd_b[tgt] is the index node.)
+    if subtree_has_call(nd_b[tgt]) != 0:
+        return 0
+    ir_reset()
+    v: uint32 = ir_lower_pure_expr(rhs)
+    if v == 0:                               # impure / out-of-set RHS -> legacy
+        return 0
+    # Only a plain-arith binop root gives a real plumbing win (a bare leaf store
+    # has nothing to fold); a compare/div/mod/shift root stays on the legacy path.
+    if sel_binop_routable(v) == 0:
+        return 0
+    # PRESERVE THE ADD-CONST-REASSOCIATION LEVER (same carve-out as Phase 1).
+    if ir_op[v] == BINOP_ADD:
+        if ir_add_const_count(v) >= 2:
+            return 0
+    es: uint32 = index_elem_size(tgt)
+    if ir_tree_has_call(v) == 0:
+        ir_scratch_tree_callfree = 1
+    else:
+        ir_scratch_tree_callfree = 0
+    ir_emit_enter()
+    xr: uint32 = ir_scratch_acquire()
+    if xr == RA_NONE:
+        ir_emit_leave()
+        ir_scratch_tree_callfree = 0
+        return 0
+    sel_expr_into_reg(v, xr)                  # RHS value -> %xr (dest-driven)
+    ir_emit_leave()                          # value done; address gen is legacy
+    ir_scratch_tree_callfree = 0
+    gen_index_addr(tgt)                       # &arr[i] -> %rax (legacy; %rax/%rcx)
+    emit_mov_reg_reg(xr, 1)                  # mov %xr -> %rcx (value to store)
+    ir_scratch_release(xr)
+    emit_store_mem_rcx(es)                    # store %rcx -> (%rax), sized
+    ir_idxstore_count = ir_idxstore_count + 1
+    ir_emit_count = ir_emit_count + 1
+    return 1
+
+
 # Try the IR-consuming emit path for AST expression `node`. Returns 1 if it
 # emitted the node through the IR (caller is done), 0 if `node` is outside the
 # lowered subset and the caller must fall back to the AST emitter. OFF by
@@ -9305,10 +9513,21 @@ def gen_stmt(node: uint32):
             # compute the RHS tree DIRECTLY into the home register with no %rax
             # round-trip and no shadow store. Falls back to the legacy
             # gen_expr + store_to_named path for any shape it does not handle.
+            # P1 Phase 3: route the ACCUMULATOR pattern `name = name OP rest`
+            # (the dst-aliasing accumulate Phase 1 refused) into the resident home
+            # FIRST — this is the matmul `s = s + A*B` win. Then the Phase-1
+            # non-aliasing dest selector, then the legacy path.
+            if try_sel_assign_accum(tgt, nd_b[node]) != 0:
+                return
             if try_sel_assign(tgt, nd_b[node]) != 0:
                 return
             gen_expr(nd_b[node])
             store_to_named(nd_name_off[tgt], nd_name_len[tgt])
+            return
+        # P1 Phase 3: route `name OP= value` (+=,-=,*=) into the promoted register
+        # home — `op <value>, %home` with the accumulator resident (no slot reload,
+        # no %rax round-trip). Falls back to the legacy reload-combine-store path.
+        if try_sel_aug_assign_name(nd_name_off[tgt], nd_name_len[tgt], aug, nd_b[node]) != 0:
             return
         # Augmented `tgt OP= value`: desugar to tgt = tgt OP value.
         # Evaluate value first (right), push; load tgt (left); pop %rcx;
@@ -9394,6 +9613,11 @@ def gen_assign_index(node: uint32):
     aug: uint32 = nd_aux[node]
 
     if aug == AUGOP_NONE:
+        # P1 Phase 3: route `arr[i] = <pure-arith binop>` through the dest-driven
+        # selector — RHS computed into a held register (no value push/pop), then
+        # addressed + stored. Falls back to the legacy value-at-a-time path.
+        if try_sel_assign_index(node) != 0:
+            return
         # Plain store. Evaluate value, push; compute address; pop value into
         # %rcx; store %rcx -> (%rax).
         gen_expr(nd_b[node])
