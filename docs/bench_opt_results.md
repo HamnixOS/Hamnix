@@ -32,18 +32,18 @@ Timings in seconds (best-of-N, lower is better). `ON/OFF` > 1 means the optimize
 
 | kernel | Adder-OFF | Adder-ON | C-O0 | C-O2 | ON/OFF (speedup) | ON / C-O2 | ON / C-O0 | opt passes fired |
 |---|--:|--:|--:|--:|--:|--:|--:|---|
-| matmul | 0.1436s | 0.1156s | 0.0756s | 0.0183s | **1.24×** | 6.33× | 1.53× | licm=1, strengthred=2 |
-| sieve | 0.2152s | 0.2034s | 0.1938s | 0.0410s | **1.06×** | 4.96× | 1.05× | — |
-| licm | 0.2850s | 0.2439s | 0.1245s | 0.0322s | **1.17×** | 7.57× | 1.96× | cse=1 |
-| dcecopy | 0.5393s | 0.4314s | 0.2999s | 0.0554s | **1.25×** | 7.78× | 1.44× | constbranch=1, copyprop=2 |
-| fib | 0.5375s | 0.5854s | 0.4010s | 0.1136s | **0.92×** | 5.15× | 1.46× | — |
-| collatz | 1.3570s | 0.4944s | 0.3955s | 0.1417s | **2.74×** | 3.49× | 1.25× | strengthred=1 |
-| mandel | 0.1035s | 0.0969s | 0.0368s | 0.0209s | **1.07×** | 4.64× | 2.63× | — |
-| **geomean** | | | | | **1.26×** | 5.51× | 1.55× | |
+| matmul | 0.1408s | 0.1137s | 0.0732s | 0.0181s | **1.24×** | 6.29× | 1.55× | licm=1, strengthred=2 |
+| sieve | 0.2104s | 0.1990s | 0.1904s | 0.0408s | **1.06×** | 4.88× | 1.05× | — |
+| licm | 0.2794s | 0.2403s | 0.1222s | 0.0324s | **1.16×** | 7.42× | 1.97× | cse=1 |
+| dcecopy | 0.5237s | 0.4146s | 0.3021s | 0.0556s | **1.26×** | 7.46× | 1.37× | constbranch=1, copyprop=2 |
+| fib | 0.5293s | 0.5823s | 0.3886s | 0.1120s | **0.91×** | 5.20× | 1.50× | — |
+| collatz | 1.3185s | 0.4835s | 0.3859s | 0.1403s | **2.73×** | 3.45× | 1.25× | strengthred=1 |
+| mandel | 0.1024s | 0.0958s | 0.0366s | 0.0207s | **1.07×** | 4.62× | 2.62× | — |
+| **geomean** | | | | | **1.26×** | 5.44× | 1.55× | |
 
 ## Headline
 
 - **Optimizer ON vs OFF:** the `ADDER_OPT=1` 6-pass optimizer is **1.26× faster** than the baseline backend (geomean over the correct kernels).
-- **Adder-ON vs C -O2:** Adder-ON is **5.51× slower** than gcc -O2 (geomean).
+- **Adder-ON vs C -O2:** Adder-ON is **5.44× slower** than gcc -O2 (geomean).
 - **Adder-ON vs C -O0:** Adder-ON is **1.55× slower** than gcc -O0 (geomean).
 
