@@ -270,6 +270,11 @@ opt_aluload_count: uint32 = 0
 # (the per-iteration store the matmul accumulator paid). 0 with --opt OFF (the
 # whole register hook is inert), so the OFF path stays byte-identical.
 opt_storeelim_count: uint32 = 0
+# LOOP-INVARIANT GLOBAL-ARRAY BASE HOISTS (--opt, P1 Phase 2): each global array
+# whose constant base address was materialised ONCE into a held callee-saved
+# register (instead of `lea g(%rip)` every iteration). Counts each hoisted base
+# so the corpus/bench can assert the residency lever fires. 0 with --opt OFF.
+opt_basehoist_count: uint32 = 0
 
 
 def isel_enable():
@@ -284,6 +289,7 @@ def isel_reset_stats():
     opt_isel_count = 0
     opt_aluload_count = 0
     opt_storeelim_count = 0
+    opt_basehoist_count = 0
 
 
 # -----------------------------------------------------------------------
@@ -3971,6 +3977,31 @@ def emit_lea_base_rax_index_rcx(sbits: uint32):
     emit_b((sbits << 6) + (1 << 3) + 0)  # scale|index=rcx|base=rax
 
 
+# leaq (%<base>, %rcx, scale), %rax  — like emit_lea_base_rax_index_rcx but with
+# an ARBITRARY base register (P1 Phase-2: a loop-invariant array base hoisted
+# into a held callee-saved register). Index is %rcx, dest %rax. This is the
+# strict generalization (base==%rax(0) reproduces emit_lea_base_rax_index_rcx).
+#   REX.W=48; REX.B if base>=8 (extends the SIB base field). Opcode 8D.
+#   ModRM reg=%rax(000), rm=100 (SIB). mod=00 normally, BUT a SIB base whose low
+#   3 bits == 101 (%rbp / %r13) cannot be encoded with mod=00 (that slot means
+#   "no base, disp32"), so use mod=01 with a zero disp8 for those.
+#   SIB = scale(2)<<6 | index(%rcx=001)<<3 | (base & 7).
+def emit_lea_base_index_rcx(base: uint32, sbits: uint32):
+    rex: uint32 = 0x48
+    if base >= 8:
+        rex = rex | 0x01                 # REX.B extends SIB base
+    emit_b(rex)
+    emit_b(0x8D)
+    sib: uint32 = (sbits << 6) + (1 << 3) + (base & 7)
+    if (base & 7) == 5:
+        emit_b(0x44)                     # mod=01, reg=rax(000), rm=100(SIB)
+        emit_b(sib)
+        emit_b(0)                        # disp8 = 0
+    else:
+        emit_b(0x04)                     # mod=00, reg=rax(000), rm=100(SIB)
+        emit_b(sib)
+
+
 # leaq <data_off>(%rip), %rax  -> 48 8D 05 <rel32>   (address of a global /
 # string in the data section). The rel32 is a placeholder; a data fixup is
 # recorded against the global's data offset and patched after layout, so it
@@ -6599,6 +6630,231 @@ def expr_leaf_float_width(node: uint32) -> uint32:
     return 0
 
 
+# =======================================================================
+# P1 Phase 2 — loop-invariant ARRAY-BASE hoisting (sel_addr base residency).
+# =======================================================================
+#
+# THE DEFECT (docs/perf_2x_roadmap.md point 4): every `g_A[idx]` access inside a
+# loop re-materialises the array base with `lea g_A(%rip),%rax` EACH ITERATION,
+# even though a global array's address is a link-time CONSTANT (loop-invariant by
+# construction). The hoist materialises each such base ONCE in the function
+# prologue into a held callee-saved register and rewrites the per-access address
+# computation to a single scaled-index `lea (%base,%rcx,s),%rax` off that
+# register — removing both the per-iteration base `lea` AND the separate
+# `lea (%rax,%rcx,s)` (folded into the one SIB lea).
+#
+# CORRECTNESS: only GLOBAL ARRAY bases are hoisted — their address is a constant
+# (`lea g(%rip)`), so the held value is invariant over the whole function (no
+# recompute is ever needed; no store can change it). The holding register is a
+# CALLEE-SAVED scratch index inside cg_scratch_reserved_mask, so the prologue
+# pushes / epilogue pops it (the function preserves it for its caller) and it
+# survives any call in the body. gen_index_addr re-derives the same global index
+# independently and only consults the cache for the EXACT flat-array isel branch,
+# so a spurious cache entry can never miscompile — at worst it wastes a register.
+# Entirely gated behind --opt (isel): with the flag off hb_count stays 0 and
+# gen_index_addr emits the original per-iteration base lea, byte-identical.
+
+HB_MAX: uint32 = 8                          # hoist cache capacity
+HB_HEADROOM: uint32 = 1                     # caller-saved regs kept free for the
+                                            # body's own IR scratch (so the hoist
+                                            # never starves arithmetic -> spill)
+hb_count: uint32 = 0                        # active hoisted bases (stack depth)
+hb_gi: Array[8, uint32]                     # global index (1-based) key
+hb_reg: Array[8, uint32]                    # x86 reg encoding holding the base
+# (opt_basehoist_count declared with the other --opt counters near the top.)
+
+
+# Clear the hoist cache (function entry/exit). Releases the held scratch regs'
+# busy bits so the next function's pool starts clean.
+def hb_reset():
+    i: uint32 = 0
+    while i < hb_count:
+        ir_scratch_release(hb_reg[i])
+        i = i + 1
+    hb_count = 0
+
+
+# The register holding global index `gi`'s hoisted base, or RA_NONE if not
+# hoisted. RA_NONE whenever the cache is empty (flag off), so the default path
+# stays byte-identical.
+def hb_lookup_global(gi: uint32) -> uint32:
+    if gi == 0:
+        return RA_NONE
+    i: uint32 = 0
+    while i < hb_count:
+        if hb_gi[i] == gi:
+            return hb_reg[i]
+        i = i + 1
+    return RA_NONE
+
+
+# Global index (1-based) of `node` iff it is a FLAT global-array index the hoist
+# can serve (bare-ident base, global, array elem of power-of-2 stride, NOT a
+# multi-dimensional or struct-element array — those take earlier gen_index_addr
+# branches the cache does not touch). Else 0. Mirrors the arr_glob isel-branch
+# classification so the plan only reserves regs for bases that will consult it.
+def hoist_index_gi(node: uint32) -> uint32:
+    if nd_kind[node] != ND_INDEX:
+        return 0
+    base: uint32 = nd_a[node]
+    if nd_kind[base] != ND_IDENT:
+        return 0
+    boff: int32 = 0
+    if lookup_local(nd_name_off[base], nd_name_len[base], &boff) != 0:
+        return 0                             # a LOCAL array's base is %rbp (no win)
+    gi: uint32 = glob_lookup(nd_name_off[base], nd_name_len[base])
+    if gi == 0:
+        return 0
+    if glob_elem_size[gi - 1] == 0:
+        return 0                             # not an array global (ptr/scalar)
+    if isel_scale_ok(glob_elem_size[gi - 1]) == 0:
+        return 0                             # non-pow2 stride: no SIB scale
+    bt: uint32 = expr_array_type(base)
+    if bt != 0 and nd_kind[nd_a[bt]] == ND_ARRAY_TYPE:
+        return 0                             # multi-dimensional global
+    if bt != 0 and struct_lookup_by_node(nd_a[bt]) != 0:
+        return 0                             # array-of-struct global
+    return gi
+
+
+# True iff the AST subtree rooted at `node` (following the SAME a/b/c/d + sibling
+# chain ir_scratch_prescan_node trusts to cover every child position) contains a
+# function CALL. SOUND for the call-free-loop guard below: a/b/c/d/next are the
+# ONLY node-reference fields, so every reachable node is visited — it can never
+# miss a call (a missed call would let a caller-saved hoist be clobbered). Errs
+# safe: any node it cannot otherwise classify is still descended.
+def subtree_has_call(node: uint32) -> uint32:
+    cur: uint32 = node
+    while cur != 0:
+        if nd_kind[cur] == ND_CALL:
+            return 1
+        if subtree_has_call(nd_a[cur]) != 0:
+            return 1
+        if subtree_has_call(nd_b[cur]) != 0:
+            return 1
+        if subtree_has_call(nd_c[cur]) != 0:
+            return 1
+        if subtree_has_call(nd_d[cur]) != 0:
+            return 1
+        cur = nd_next[cur]
+    return 0
+
+
+# Acquire a free CALLER-SAVED scratch register (pool indices 5..9: rdi/r8/r9/r10/
+# r11) for a per-loop hoist hold. Sound ONLY across a CALL-FREE span: caller-saved
+# regs are clobbered by any call, so the loop body must be call-free (the caller
+# checks subtree_has_call). No prologue save is needed (the function owes its
+# caller nothing in a caller-saved reg, and the hoisted value is dead after the
+# loop). ir_scratch_avail[i] is 1 only when regalloc did NOT promote a local into
+# the reg (regalloc uses caller-saved solely in call-free FUNCTIONS), so this
+# never aliases a live local. Marked busy so the body's IR scratch skips it.
+def hoist_acquire_caller() -> uint32:
+    # Keep HB_HEADROOM caller-saved regs free for the body's own IR scratch — a
+    # base hoist that consumed the last reg would push arithmetic onto the
+    # push/pop path (a net loss). Only acquire while >HB_HEADROOM remain free.
+    free: uint32 = 0
+    i: uint32 = IR_SCRATCH_NCALLEE
+    while i < IR_SCRATCH_NREGS:
+        if ir_scratch_avail[i] != 0 and ir_scratch_busy[i] == 0:
+            free = free + 1
+        i = i + 1
+    if free <= HB_HEADROOM:
+        return RA_NONE
+    j: uint32 = IR_SCRATCH_NCALLEE
+    while j < IR_SCRATCH_NREGS:
+        if ir_scratch_avail[j] != 0 and ir_scratch_busy[j] == 0:
+            ir_scratch_busy[j] = 1
+            return ir_scratch_enc[j]
+        j = j + 1
+    return RA_NONE
+
+
+# Count flat-global-array index accesses to global `gi` in the AST subtree
+# `node` (same a/b/c/d/next descent). Used to gate hoisting on MULTI-USE: a base
+# held in a register costs one scratch reg for the whole loop, so it only pays
+# when it removes >=2 per-iteration base leas. A single-use base would trade one
+# lea for the risk of an arithmetic spill (net loss — measured on sieve/dcecopy).
+def hoist_count_gi(node: uint32, gi: uint32) -> uint32:
+    cur: uint32 = node
+    c: uint32 = 0
+    while cur != 0:
+        if hoist_index_gi(cur) == gi:
+            c = c + 1
+        c = c + hoist_count_gi(nd_a[cur], gi)
+        c = c + hoist_count_gi(nd_b[cur], gi)
+        c = c + hoist_count_gi(nd_c[cur], gi)
+        c = c + hoist_count_gi(nd_d[cur], gi)
+        cur = nd_next[cur]
+    return c
+
+
+# Collect distinct hoistable (and not-yet-cached) global indices in `body` into
+# hbc_gi. Same a/b/c/d/next descent; deduped. Best-effort (over/under-collection
+# only affects which bases hoist, never correctness — gen_index_addr re-validates).
+HBC_MAX: uint32 = 8
+hbc_gi: Array[8, uint32]
+hbc_n: uint32 = 0
+
+
+def hoist_collect_cands(node: uint32):
+    cur: uint32 = node
+    while cur != 0:
+        gi: uint32 = hoist_index_gi(cur)
+        if gi != 0 and hb_lookup_global(gi) == RA_NONE and hbc_n < HBC_MAX:
+            seen: uint32 = 0
+            t: uint32 = 0
+            while t < hbc_n:
+                if hbc_gi[t] == gi:
+                    seen = 1
+                t = t + 1
+            if seen == 0:
+                hbc_gi[hbc_n] = gi
+                hbc_n = hbc_n + 1
+        hoist_collect_cands(nd_a[cur])
+        hoist_collect_cands(nd_b[cur])
+        hoist_collect_cands(nd_c[cur])
+        hoist_collect_cands(nd_d[cur])
+        cur = nd_next[cur]
+
+
+# Per-loop base hoist for `body` into the loop preheader (called by gen_while
+# BEFORE the loop-top label, so the leas run ONCE). No-op unless --opt (isel) is
+# on and the body is CALL-FREE (a caller-saved base must not cross a call).
+# Hoists only MULTI-USE bases (>=2 accesses), leaving HB_HEADROOM scratch regs
+# free — so the lever never regresses a register-pressured loop. Pushes hb
+# entries the caller releases after the loop. Descends nested loops, so a base is
+# hoisted at the OUTERMOST call-free loop containing its uses (inner loops then
+# find it cached).
+def hoist_loop_preheader(body: uint32):
+    if isel_is_enabled() == 0:
+        return
+    if subtree_has_call(body) != 0:
+        return
+    hbc_n = 0
+    hoist_collect_cands(body)
+    k: uint32 = 0
+    while k < hbc_n:
+        gi: uint32 = hbc_gi[k]
+        if hb_count < HB_MAX and hoist_count_gi(body, gi) >= 2:
+            r: uint32 = hoist_acquire_caller()
+            if r != RA_NONE:
+                emit_lea_global_rax(glob_offset[gi - 1], glob_is_bss[gi - 1])
+                emit_mov_reg_reg(0, r)           # mov %rax -> held caller reg
+                hb_gi[hb_count] = gi
+                hb_reg[hb_count] = r
+                hb_count = hb_count + 1
+                opt_basehoist_count = opt_basehoist_count + 1
+        k = k + 1
+
+
+# Release per-loop hoist entries down to `saved` (LIFO with the preheader push),
+# freeing the held caller-saved registers for code after the loop.
+def hoist_loop_release(saved: uint32):
+    while hb_count > saved:
+        hb_count = hb_count - 1
+        ir_scratch_release(hb_reg[hb_count])
+
+
 # Compute &arr[i] into %rax. Index in nd_b, array identifier in nd_a. The
 # base may be a local Array slot (leaq off(%rbp)) or a global Array
 # (leaq data_off(%rip)). Both decay to a base address then add a scaled
@@ -6775,10 +7031,12 @@ def gen_index_addr(node: uint32):
     scalar_ptr: uint32 = 0
     gdoff: uint32 = 0
     gbss: uint32 = 0
+    arr_glob_gi: uint32 = 0                # 1-based global index of an arr_glob base
     if arr_local == 0 and ptr_local == 0:
         gi: uint32 = glob_lookup(nd_name_off[base], nd_name_len[base])
         if gi != 0 and glob_elem_size[gi - 1] != 0:
             arr_glob = 1
+            arr_glob_gi = gi
             es = glob_elem_size[gi - 1]
             gdoff = glob_offset[gi - 1]
             gbss = glob_is_bss[gi - 1]
@@ -6838,6 +7096,15 @@ def gen_index_addr(node: uint32):
             opt_isel_count = opt_isel_count + 1
             return
         if arr_glob != 0:
+            # P1 Phase 2: if this global array's base was HOISTED into a held
+            # callee-saved register (loop-invariant base residency), the element
+            # address is ONE scaled-index lea off that register — no per-iteration
+            # `lea g(%rip)` recompute. The index is already in %rcx.
+            hbreg: uint32 = hb_lookup_global(arr_glob_gi)
+            if hbreg != RA_NONE:
+                emit_lea_base_index_rcx(hbreg, sb)   # lea (%hbreg,%rcx,s),%rax
+                opt_isel_count = opt_isel_count + 1
+                return
             # Base = rip-relative global array address: lea it to %rax, then
             # lea (%rax, %rcx, s), %rax (rip form cannot carry a SIB index, so
             # the base-lea stays; we still fold the scale-shift + add).
@@ -9274,11 +9541,19 @@ def gen_if(node: uint32):
 # while  (mirrors codegen_x86.gen_while): header label, condition test,
 # exit jump, body, back-jump to the header, exit label.
 def gen_while(node: uint32):
+    # P1 Phase 2: hoist loop-invariant global-array bases into held caller-saved
+    # registers in the PREHEADER (before the loop-top label, so they run once and
+    # the back-edge / `continue` skip them). Only for a call-free body. hb_saved
+    # marks the cache depth to release after the loop.
+    hb_saved: uint32 = hb_count
+    hoist_loop_preheader(nd_b[node])
+
     start: uint32 = code_len
     # Push a loop frame: `continue` targets `start` (re-test the condition);
     # `break` fixups accumulate in this frame's slot and patch to the exit.
     if loop_depth >= MAX_LOOPS:
         cg_fail(6, node)
+        hoist_loop_release(hb_saved)
         return
     depth: uint32 = loop_depth
     loop_cont_target[depth] = start
@@ -9295,6 +9570,7 @@ def gen_while(node: uint32):
         patch_rel32(loop_brk_at[depth * MAX_BRK + i], code_len)
         i = i + 1
     loop_depth = loop_depth - 1
+    hoist_loop_release(hb_saved)         # free per-loop hoisted base registers
 
 
 # do-while  (mirrors codegen_x86.gen_do_while): execute the body once
@@ -9837,6 +10113,8 @@ def gen_function(fn: uint32) -> uint32:
     # IR emit flag (no-op when --opt is off, so default output is unchanged).
     ir_scratch_build_avail()
     ir_scratch_prescan_function(fn)
+    hb_count = 0                          # P1 Phase 2: per-loop base hoist starts
+                                          # with an empty cache each function
     cg_build_scratch_reserved()
     if cg_ra_active != 0 or cg_scratch_reserved_mask != 0:
         cg_callee_active = 1
@@ -9883,6 +10161,7 @@ def gen_function(fn: uint32) -> uint32:
     if last_was_return == 0:
         emit_function_epilogue()
 
+    hb_reset()                            # release hoisted base regs for next fn
     cg_ra_active = 0                      # clear for the next function
     cg_callee_active = 0
     return start
@@ -9959,6 +10238,7 @@ def gen_method(cls: uint32, m: uint32) -> uint32:
     # deepest scratch demand and reserve that many callee regs to save.
     ir_scratch_build_avail()
     ir_scratch_prescan_function(m)
+    hb_count = 0                          # per-loop base hoist: fresh cache/method
     cg_build_scratch_reserved()
     if cg_ra_active != 0 or cg_scratch_reserved_mask != 0:
         cg_callee_active = 1
