@@ -540,6 +540,7 @@ class Program:
         self._gen_grid_traffic(env)   # 2-D array global (now codegen.ad-OK)
         self._gen_store_traffic(env)
         self._gen_index_signedness_traffic(env)  # indexed compare/shift signedness
+        self._gen_aluload_traffic(env)            # memory-source ALU folds (--opt)
         self._gen_scalar_global_traffic(env)
         self._gen_struct_traffic(env)     # struct locals: member store/read
         self._gen_class_traffic(env)      # class construction + method dispatch
@@ -855,6 +856,93 @@ class Program:
             self.emit(f"    {cbn}: int64 = cast[int64](0)")
             self.emit(f"    if {gname} < cast[{tn}]({den}):")
             self.emit(f"        {cbn} = cast[int64](1)")
+            self._fold_value(f"cast[uint64]({cbn})", U64.wrap(cres))
+
+    # ---- ALU memory-source operand traffic (--opt alu-load fold) -------------
+    def _gen_aluload_traffic(self, env):
+        """Feed an 8-byte INTEGER array element DIRECTLY into an ALU op as the
+        RIGHT operand: `local OP arr[i]`, `arr[i] OP arr[j]` (two memory
+        sources on a single op), and an element-vs-local compare. Under --opt
+        these source the element in-place via `op (%rcx),%rax` (the alu-load
+        fold); the seed loads-to-temp then combines. The VALUE must be bit-exact
+        either way. 8-byte int64/uint64 elements only: that is exactly the
+        foldable width (a full-width fetch with no extension hazard), so this is
+        the differential check for the fold. Each result folds into g_accum so a
+        wrong addressing mode / clobbered operand breaks the by-construction
+        oracle. Identical in subset and default mode (same rng stream)."""
+        rng = self.rng
+        # The 8-byte int store arrays (int64 / uint64) — the only foldable width.
+        for ti, t in enumerate((I64, U64)):
+            name, n, shadow = self.store_arrays[t]
+            # Plant two distinct element values (one near the type's sign
+            # boundary so signed/unsigned MUL/ADD wraparound is exercised).
+            ia = rng.randrange(n)
+            ib = rng.randrange(n)
+            if ib == ia:
+                ib = (ib + 1) % n
+            hi = (1 << (t.bits - 1))
+            va = (hi | rng.randint(0, hi - 1)) if rng.random() < 0.5 \
+                else rng.randint(0, hi - 1)
+            vb = rng.randint(0, (1 << t.bits) - 1)
+            self.emit(f"    {name}[{ia}] = cast[{t.name}]({va})")
+            self.emit(f"    {name}[{ib}] = cast[{t.name}]({vb})")
+            shadow[ia] = t.wrap(va)
+            shadow[ib] = t.wrap(vb)
+            ea = _to_reg(shadow[ia])          # 64-bit register view of element a
+            eb = _to_reg(shadow[ib])
+            # A scalar local operand value (the LEFT side of `local OP arr[i]`).
+            lv = rng.randint(0, (1 << 40))
+            lreg = _to_reg(t.wrap(lv))
+            # (1) local OP arr[ia] — RIGHT operand is the memory element.
+            #     ADD/SUB/MUL/AND/OR/XOR all source the element in-place. A
+            #     fresh per-op local holds the left value so each line is a
+            #     clean `local OP elem`.
+            opcnt = 0
+            for opn, pyf in (
+                ("+", lambda x, y: x + y),
+                ("-", lambda x, y: x - y),
+                ("*", lambda x, y: x * y),
+                ("&", lambda x, y: x & y),
+                ("|", lambda x, y: x | y),
+                ("^", lambda x, y: x ^ y),
+            ):
+                opl = f"al_{ti}_{opcnt}"
+                accl = f"alr_{ti}_{opcnt}"
+                opcnt = opcnt + 1
+                self.emit(f"    {opl}: {t.name} = cast[{t.name}]({lv})")
+                # Assign the BARE `local OP elem` binop to a SAME-TYPE local: with
+                # no inner cast wrapping the op, the binop is an IR root and the
+                # memory element sources in-place (the fold FIRES). Width is 64 so
+                # the store is value-preserving; read back with one outer cast.
+                self.emit(f"    {accl}: {t.name} = {opl} {opn} {name}[{ia}]")
+                # Adder computes in full 64-bit registers; the {t.name} store
+                # (width 64) then wraps to the type. Operate on raw register views.
+                res = t.wrap(pyf(lreg, ea))
+                self._fold_value(f"cast[uint64]({accl})", U64.wrap(res))
+            # (2) arr[ia] OP arr[ib] — BOTH operands are memory elements; the
+            #     RIGHT one is folded as the in-place memory source. MUL here
+            #     exercises imulq (%rcx),%rax with the left also memory-loaded.
+            mc = 0
+            for opn, pyf in (
+                ("+", lambda x, y: x + y),
+                ("*", lambda x, y: x * y),
+                ("^", lambda x, y: x ^ y),
+            ):
+                mcl = f"alm_{ti}_{mc}"
+                mc = mc + 1
+                self.emit(f"    {mcl}: {t.name} = {name}[{ia}] {opn} {name}[{ib}]")
+                res = t.wrap(pyf(ea, eb))
+                self._fold_value(f"cast[uint64]({mcl})", U64.wrap(res))
+            # (3) compare local < arr[ia] — directional, signedness from element
+            #     type. cmpq (%rcx),%rax + setcc must match the reg-reg compare.
+            cbn = f"alc_{ti}"
+            self.emit(f"    {cbn}: int64 = cast[int64](0)")
+            self.emit(f"    if cast[{t.name}]({lv}) < {name}[{ia}]:")
+            self.emit(f"        {cbn} = cast[int64](1)")
+            if t.signed:
+                cres = 1 if I64.wrap(lv) < shadow[ia] else 0
+            else:
+                cres = 1 if (lreg & umask(64)) < (ea & umask(64)) else 0
             self._fold_value(f"cast[uint64]({cbn})", U64.wrap(cres))
 
     # ---- scalar-global store/read traffic ------------------------------------

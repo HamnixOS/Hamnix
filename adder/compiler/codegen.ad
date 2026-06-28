@@ -252,6 +252,12 @@ def sr_reset_stats():
 # -----------------------------------------------------------------------
 isel_enabled: uint32 = 0
 opt_isel_count: uint32 = 0
+# ALU-LOAD memory-source operand folds (--opt, Phase-3 instruction selection):
+# `left OP arr[i]` where arr[i] is an 8-byte integer array element is emitted
+# as `op (%rcx),%rax` sourcing the element in-place, instead of a separate
+# load-to-temp + reg-reg combine. Armed by the same isel_enable() under --opt
+# (OFF by default -> byte-identical to the seed). Counts each fired fold.
+opt_aluload_count: uint32 = 0
 
 
 def isel_enable():
@@ -264,6 +270,7 @@ def isel_is_enabled() -> uint32:
 
 def isel_reset_stats():
     opt_isel_count = 0
+    opt_aluload_count = 0
 
 
 # True for the element strides x86 SIB scale can express directly (1/2/4/8).
@@ -3197,6 +3204,70 @@ def emit_imul_src_rax(src: uint32):
     emit_b(0xC0 + (src & 7))              # modrm: 11 rax(000) src(r/m)
 
 
+# =======================================================================
+# MEMORY-SOURCE ALU folds (--opt, Phase 3 alu-load). `op (%rcx), %rax`:
+# combine the destination %rax with a memory source operand whose ADDRESS
+# is held in %rcx, in one instruction — eliding the separate load-to-temp
+# + reg-reg op the AST/IR path would otherwise emit for `left OP arr[i]`.
+#
+# %rcx (encoding 001) is the address base: ModRM mod=00, reg=%rax(000),
+# r/m=001 (%rcx) is a plain register-indirect with NO SIB and NO RIP-relative
+# ambiguity (those only afflict r/m=100/101). The dest %rax stays the ModRM
+# REG field, so the computed VALUE equals `mov (%rcx),%rcx; op %rcx,%rax`
+# with one fewer instruction and no scratch round-trip. ONLY emitted for an
+# 8-byte (full-width) integer memory element, so the implicit 64-bit fetch
+# carries no truncation/sign-extension hazard — a sub-8-byte element must
+# still go through the sized (sign/zero-extending) load on the normal path.
+#   addq (%rcx),%rax -> 48 03 01
+def emit_add_mem_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x03)
+    emit_b(0x01)                          # mod=00 reg=rax(000) r/m=rcx(001)
+
+
+# subq (%rcx),%rax -> 48 2B 01
+def emit_sub_mem_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x2B)
+    emit_b(0x01)
+
+
+# andq (%rcx),%rax -> 48 23 01
+def emit_and_mem_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x23)
+    emit_b(0x01)
+
+
+# orq (%rcx),%rax  -> 48 0B 01
+def emit_or_mem_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x0B)
+    emit_b(0x01)
+
+
+# xorq (%rcx),%rax -> 48 33 01
+def emit_xor_mem_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x33)
+    emit_b(0x01)
+
+
+# cmpq (%rcx),%rax -> 48 3B 01  (computes %rax - (%rcx), sets flags; %rax kept)
+def emit_cmp_mem_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x3B)
+    emit_b(0x01)
+
+
+# imulq (%rcx),%rax -> 48 0F AF 01  (%rax <- %rax * (%rcx); dest=ModRM reg=rax)
+def emit_imul_mem_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x0F)
+    emit_b(0xAF)
+    emit_b(0x01)                          # mod=00 reg=rax(000) r/m=rcx(001)
+
+
 # setz %al  -> 0F 94 C0  (alias of sete; used by logical NOT)
 # setne %al -> 0F 95 C0
 # setne %cl -> 0F 95 C1
@@ -4444,6 +4515,129 @@ def emit_binop_src_rax(op: uint32, src: uint32):
         emit_cmp_src_rax(src)
 
 
+# ---- ALU-LOAD memory-source fold helpers (--opt) ----------------------
+# An IR_LEAF whose backing AST is `arr[i]` over an 8-byte INTEGER element is a
+# foldable memory source: its element address can be computed (gen_index_addr)
+# and the 64-bit element sourced in-place by `op (%rcx),%rax`. Restricting to
+# 8-byte non-float elements means the implicit movq-width fetch carries the
+# whole value with no sign/zero-extension or float-vs-int hazard. Returns the
+# wrapped ND_INDEX node id when foldable, else 0.
+def ir_leaf_foldable_mem8(v: uint32) -> uint32:
+    if ir_kind[v] != IR_LEAF:
+        return 0
+    a: uint32 = ir_ast[v]
+    if a == 0:
+        return 0
+    if nd_kind[a] != ND_INDEX:
+        return 0
+    # 8-byte element only (full-width fetch; no extension trap). index_elem_size
+    # may cg_fail on a malformed base, but such a node would fail on the normal
+    # path too — the result here is just "not foldable" and we fall through.
+    if index_elem_size(a) != 8:
+        return 0
+    # A float element routes through the SSE path, never an integer ALU op.
+    if index_elem_float(a) != 0:
+        return 0
+    return a
+
+
+# True iff `op` is COMMUTATIVE at 64-bit two's-complement width, so `a OP b`
+# and `b OP a` compute the identical value. This lets the alu-load fold source
+# EITHER operand as the memory operand. ADD/MUL/AND/OR/XOR and the symmetric
+# compares EQ/NEQ qualify; SUB and the DIRECTIONAL compares (LT/LTE/GT/GTE) are
+# order-sensitive and may only fold their RIGHT operand as memory.
+def ir_op_commutative(op: uint32) -> uint32:
+    if op == BINOP_ADD:
+        return 1
+    if op == BINOP_MUL:
+        return 1
+    if op == BINOP_BIT_AND:
+        return 1
+    if op == BINOP_BIT_OR:
+        return 1
+    if op == BINOP_BIT_XOR:
+        return 1
+    if op == BINOP_EQ:
+        return 1
+    if op == BINOP_NEQ:
+        return 1
+    return 0
+
+
+# True iff the integer combine op `op` has a "reg, r/m" memory-source form we
+# emit as `op (%rcx),%rax`. ADD/SUB/AND/OR/XOR/CMP/MUL qualify. (Compares fold
+# too: cmpq (%rcx),%rax then setcc.) Excludes shift/div/mod (no such form here).
+def ir_op_aluload_ok(op: uint32) -> uint32:
+    if op == BINOP_ADD:
+        return 1
+    if op == BINOP_SUB:
+        return 1
+    if op == BINOP_MUL:
+        return 1
+    if op == BINOP_BIT_AND:
+        return 1
+    if op == BINOP_BIT_OR:
+        return 1
+    if op == BINOP_BIT_XOR:
+        return 1
+    if op == BINOP_EQ:
+        return 1
+    if op == BINOP_NEQ:
+        return 1
+    if op == BINOP_LT:
+        return 1
+    if op == BINOP_LTE:
+        return 1
+    if op == BINOP_GT:
+        return 1
+    if op == BINOP_GTE:
+        return 1
+    return 0
+
+
+# Emit `op (%rcx),%rax` for the integer combine `op` (the memory source's
+# address is in %rcx, the other operand in %rax). For a compare, do the
+# cmp + setcc + movzx (l_sgn/r_sgn pick the signed/unsigned setcc) so the
+# boolean lands in %rax exactly like the reg-reg compare branches.
+def emit_aluload_op(op: uint32, l_sgn: uint32, r_sgn: uint32):
+    if op == BINOP_ADD:
+        emit_add_mem_rcx_rax()
+    elif op == BINOP_SUB:
+        emit_sub_mem_rcx_rax()
+    elif op == BINOP_MUL:
+        emit_imul_mem_rcx_rax()
+    elif op == BINOP_BIT_AND:
+        emit_and_mem_rcx_rax()
+    elif op == BINOP_BIT_OR:
+        emit_or_mem_rcx_rax()
+    elif op == BINOP_BIT_XOR:
+        emit_xor_mem_rcx_rax()
+    elif op == BINOP_EQ:
+        emit_cmp_mem_rcx_rax()
+        emit_setcc_al(0x94)
+        emit_movzx_al_rax()
+    elif op == BINOP_NEQ:
+        emit_cmp_mem_rcx_rax()
+        emit_setcc_al(0x95)
+        emit_movzx_al_rax()
+    elif op == BINOP_LT:
+        emit_cmp_mem_rcx_rax()
+        emit_setcc_al(rel_setcc(0x9C, l_sgn, r_sgn))
+        emit_movzx_al_rax()
+    elif op == BINOP_LTE:
+        emit_cmp_mem_rcx_rax()
+        emit_setcc_al(rel_setcc(0x9E, l_sgn, r_sgn))
+        emit_movzx_al_rax()
+    elif op == BINOP_GT:
+        emit_cmp_mem_rcx_rax()
+        emit_setcc_al(rel_setcc(0x9F, l_sgn, r_sgn))
+        emit_movzx_al_rax()
+    elif op == BINOP_GTE:
+        emit_cmp_mem_rcx_rax()
+        emit_setcc_al(rel_setcc(0x9D, l_sgn, r_sgn))
+        emit_movzx_al_rax()
+
+
 # True iff `op` is one of the register-to-register combine ops that can take a
 # CALLEE-SAVED scratch source (no %cl / %rdx requirement). Shift (SHL/SHR) needs
 # the count in %cl and DIV/IDIV/MOD need the divisor in %rcx + %rdx clobber, so
@@ -4664,6 +4858,52 @@ def gen_expr_ir(v: uint32):
                         gen_expr_ir(ir_a[v])             # dividend -> %rax
                         gen_div_const(sri_dbits, sri_signed, sri_wantmod)
                         return
+        # ALU-LOAD MEMORY-SOURCE FOLD (--opt, Phase-3 instruction selection).
+        # When the RIGHT operand is an 8-byte INTEGER array element `arr[i]`, the
+        # combine op sources it in-place via `op (%rcx),%rax` instead of loading
+        # the element to a temp and combining. This elides the separate sized
+        # load + a reg-reg op. IR_BINOP only lowers PURE (side-effect-free)
+        # expressions, so evaluating LEFT before the RIGHT element address is
+        # value-equivalent to the seed's right-then-left order. Schedule:
+        #   eval LEFT -> %rax; park LEFT in a scratch reg; compute &arr[i] -> %rax;
+        #   mov it to %rcx; restore LEFT to %rax; `op (%rcx),%rax`.
+        # SUB and the directional compares are non-commutative but stay correct:
+        # `op (%rcx),%rax` computes `%rax(left) OP (%rcx)(right)` — exactly
+        # left-OP-right with the SAME (l_sgn,r_sgn) setcc as the reg branch.
+        # Needs exactly ONE held scratch (LEFT), matching the scratch reservation
+        # the prescan already grants every scratch-ok binop. Gated on the --opt
+        # isel arm so the default path stays byte-identical to the seed.
+        if isel_is_enabled() != 0 and ir_op_aluload_ok(op) != 0:
+            # The element to fold as the memory source, and the OTHER operand that
+            # stays in a register. The RIGHT operand folds for any aluload op
+            # (`reg_left OP (%rcx)` matches left-OP-right directly). For a
+            # COMMUTATIVE op, if RIGHT is not a foldable element but LEFT is, fold
+            # LEFT instead and keep RIGHT in the register — `reg_right OP (%rcx)`
+            # == right-OP-left == left-OP-right. Directional compares / SUB never
+            # take this swap (they only fold their RIGHT operand).
+            mem_idx: uint32 = ir_leaf_foldable_mem8(ir_b[v])
+            reg_side: uint32 = ir_a[v]   # operand that stays in %rax
+            if mem_idx == 0 and ir_op_commutative(op) != 0:
+                mem_idx = ir_leaf_foldable_mem8(ir_a[v])
+                reg_side = ir_b[v]
+            if mem_idx != 0:
+                # Hold the register operand on the STACK across the element-address
+                # computation (gen_index_addr clobbers %rax). The stack is always
+                # available — no callee-saved scratch reg required — so the fold
+                # fires even when the scratch pool is exhausted by surrounding
+                # register pressure (a nested binop, many promoted locals). This
+                # still elides the SEPARATE sized element load + its reg-reg
+                # combine: the element is fetched in-place by `op (%rcx),%rax` and
+                # never materialises in a temp. gen_index_addr balances its own
+                # stack, so the push/pop pair around it is sound.
+                gen_expr_ir(reg_side)        # register operand -> %rax
+                emit_push_rax()              # hold it on the stack
+                gen_index_addr(mem_idx)      # &arr[i] -> %rax
+                emit_mov_rax_rcx()           # element address -> %rcx
+                emit_pop_rax()               # restore register operand -> %rax
+                emit_aluload_op(op, l_sgn, r_sgn)  # op (%rcx),%rax
+                opt_aluload_count = opt_aluload_count + 1
+                return
         # SCRATCH-REGISTER FAST PATH (Phase 7). For the register-to-register
         # combine ops (ADD/SUB/MUL/AND/OR/XOR + the 6 compares), try to hold the
         # RIGHT operand in a callee-saved scratch register across the LEFT-operand
