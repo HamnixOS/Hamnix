@@ -2397,6 +2397,221 @@ def _run_iremit_corpus():
 
 
 # --------------------------------------------------------------------------
+# Phase-3 INSTRUCTION-SELECTION corpus. Programs that index arrays / dereference
+# pointers / feed memory operands into ALU ops — the shapes whose ELEMENT-ADDRESS
+# computation codegen.ad lowers to a scaled-index `lea` under --opt (isel). Each
+# program is checked THREE ways: (a) optimized output == computed oracle, (b)
+# optimized output == --opt-OFF output (the scale/add path), (c) the isel pass
+# demonstrably FIRED (ISEL>0) under --opt and is byte-inert OFF (ISEL==0). A
+# wrong SIB scale/base/disp silently corrupts the access, so (a)+(b) together
+# pin the addressing mode; this is the differential safety net for the transform.
+#
+# Coverage: strides 1/2/4/8 (uint8/uint16/uint32/uint64/int64 elements), LOCAL
+# arrays (rbp+SIB), GLOBAL arrays (rip base + index lea), POINTER locals
+# (cast[Ptr[T]] value base), index by constant / ident / computed i*N+j, element
+# reads AND writes, and memory operands feeding +/-/*/&/|/^.
+# --------------------------------------------------------------------------
+_ISEL_ELEMS = [
+    # (type, byte_width, signed)
+    ("uint8", 1, False),
+    ("uint16", 2, False),
+    ("uint32", 4, False),
+    ("uint64", 8, False),
+    ("int64", 8, True),
+]
+
+
+def _isel_u(v, width):
+    return v & ((1 << (width * 8)) - 1)
+
+
+def _isel_corpus_programs():
+    """Yield (name, src, oracle_stdout, oracle_exit, want_signed_negzero).
+    Deterministic; no randomness so the oracle is exact."""
+    progs = []
+
+    # ---- local array, fill via write[i], sum via read[k]; all 5 strides ----
+    for tname, width, signed in _ISEL_ELEMS:
+        n = 50
+        body = (PRELUDE + "\n"
+                "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+                f"    a: Array[{n}, {tname}]\n"
+                "    i: int64 = 0\n"
+                f"    while i < {n}:\n"
+                f"        a[cast[int64](i)] = cast[{tname}](i * 9 + 4)\n"
+                "        i = i + 1\n"
+                "    s: uint64 = cast[uint64](0)\n"
+                "    k: int64 = 0\n"
+                f"    while k < {n}:\n"
+                "        s = s + cast[uint64](a[cast[int64](k)])\n"
+                "        k = k + 1\n"
+                "    print_u64(s)\n"
+                "    return cast[int32](cast[uint64](s) & cast[uint64](255))\n")
+        ref = 0
+        for i in range(n):
+            ref += _isel_u(i * 9 + 4, width)
+        ref &= (1 << 64) - 1
+        progs.append((f"local_{tname}", body, str(ref), ref & 0xFF))
+
+    # ---- global array, i*N+j flattened 2-D fill + sum (stride 8) -----------
+    N = 12
+    body = (PRELUDE + "\n"
+            f"g_mat: Array[{N*N}, int64]\n"
+            "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+            f"    N: int64 = {N}\n"
+            "    i: int64 = 0\n"
+            "    while i < N:\n"
+            "        j: int64 = 0\n"
+            "        while j < N:\n"
+            "            g_mat[cast[int64](i * N + j)] = i * 31 + j * 7 - 5\n"
+            "            j = j + 1\n"
+            "        i = i + 1\n"
+            "    s: int64 = 0\n"
+            "    p: int64 = 0\n"
+            "    while p < N * N:\n"
+            "        s = s + g_mat[cast[int64](p)]\n"
+            "        p = p + 1\n"
+            "    print_u64(cast[uint64](s))\n"
+            "    return cast[int32](cast[uint64](s) & cast[uint64](255))\n")
+    ref = 0
+    for i in range(N):
+        for j in range(N):
+            ref += i * 31 + j * 7 - 5
+    ref &= (1 << 64) - 1
+    progs.append(("global_flat2d", body, str(ref), ref & 0xFF))
+
+    # ---- global byte array (stride 1, rip base) ---------------------------
+    n = 200
+    body = (PRELUDE + "\n"
+            f"g_bytes: Array[{n}, uint8]\n"
+            "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+            "    i: int64 = 0\n"
+            f"    while i < {n}:\n"
+            "        g_bytes[cast[int64](i)] = cast[uint8](i * 13 + 1)\n"
+            "        i = i + 1\n"
+            "    s: uint64 = cast[uint64](0)\n"
+            "    k: int64 = 0\n"
+            f"    while k < {n}:\n"
+            "        s = s + cast[uint64](g_bytes[cast[int64](k)])\n"
+            "        k = k + 1\n"
+            "    print_u64(s)\n"
+            "    return cast[int32](cast[uint64](s) & cast[uint64](255))\n")
+    ref = sum((i * 13 + 1) & 0xFF for i in range(n)) & ((1 << 64) - 1)
+    progs.append(("global_u8", body, str(ref), ref & 0xFF))
+
+    # ---- pointer-local base: cast[Ptr[int64]](&buf[0])[i] ------------------
+    n = 48
+    body = (PRELUDE + "\n"
+            f"g_pbuf: Array[{n}, int64]\n"
+            "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+            "    p: Ptr[int64] = cast[Ptr[int64]](&g_pbuf[0])\n"
+            "    i: int64 = 0\n"
+            f"    while i < {n}:\n"
+            "        p[cast[int64](i)] = i * 17 - 3\n"
+            "        i = i + 1\n"
+            "    s: int64 = 0\n"
+            "    k: int64 = 0\n"
+            f"    while k < {n}:\n"
+            "        s = s + p[cast[int64](k)]\n"
+            "        k = k + 1\n"
+            "    print_u64(cast[uint64](s))\n"
+            "    return cast[int32](cast[uint64](s) & cast[uint64](255))\n")
+    ref = sum(i * 17 - 3 for i in range(n)) & ((1 << 64) - 1)
+    progs.append(("ptr_local_i64", body, str(ref), ref & 0xFF))
+
+    # ---- pointer-local stride 4: cast[Ptr[uint32]] ------------------------
+    n = 48
+    body = (PRELUDE + "\n"
+            f"g_pbuf32: Array[{n}, uint32]\n"
+            "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+            "    p: Ptr[uint32] = cast[Ptr[uint32]](&g_pbuf32[0])\n"
+            "    i: int64 = 0\n"
+            f"    while i < {n}:\n"
+            "        p[cast[int64](i)] = cast[uint32](i * 23 + 9)\n"
+            "        i = i + 1\n"
+            "    s: uint64 = cast[uint64](0)\n"
+            "    k: int64 = 0\n"
+            f"    while k < {n}:\n"
+            "        s = s + cast[uint64](p[cast[int64](k)])\n"
+            "        k = k + 1\n"
+            "    print_u64(s)\n"
+            "    return cast[int32](cast[uint64](s) & cast[uint64](255))\n")
+    ref = sum((i * 23 + 9) & 0xFFFFFFFF for i in range(n)) & ((1 << 64) - 1)
+    progs.append(("ptr_local_u32", body, str(ref), ref & 0xFF))
+
+    # ---- memory operands feeding ALU: a[k]*b[k] + a[k] & b[k] dot-shape ----
+    n = 40
+    body = (PRELUDE + "\n"
+            "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+            f"    a: Array[{n}, int64]\n"
+            f"    b: Array[{n}, int64]\n"
+            "    i: int64 = 0\n"
+            f"    while i < {n}:\n"
+            "        a[cast[int64](i)] = i + 2\n"
+            "        b[cast[int64](i)] = i * 3 + 1\n"
+            "        i = i + 1\n"
+            "    s: int64 = 0\n"
+            "    k: int64 = 0\n"
+            f"    while k < {n}:\n"
+            "        s = s + a[cast[int64](k)] * b[cast[int64](k)]\n"
+            "        k = k + 1\n"
+            "    print_u64(cast[uint64](s))\n"
+            "    return cast[int32](cast[uint64](s) & cast[uint64](255))\n")
+    ref = sum((i + 2) * (i * 3 + 1) for i in range(n)) & ((1 << 64) - 1)
+    progs.append(("mem_alu_dot", body, str(ref), ref & 0xFF))
+
+    return progs
+
+
+def _run_isel_corpus():
+    """Run the isel corpus through codegen.ad. Returns (all_ok, total_isel)."""
+    host = _ad_host()
+    total_isel = 0
+    all_ok = True
+    fired_any = False
+    for (name, body, exp_out, exp_exit) in _isel_corpus_programs():
+        r_on = host.run_through_codegen_ad(f"isel_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"isel_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [ISEL corpus '{name}'] codegen.ad on={r_on.kind}/off={r_off.kind}: "
+                  f"{(r_on.detail or r_off.detail)[:120]}")
+            continue
+        isel = int(getattr(r_on, "isel", 0) or 0)
+        total_isel += isel
+        if isel > 0:
+            fired_any = True
+        # (a) correctness vs oracle, (b) ON==OFF (the addressing mode is right).
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [ISEL corpus '{name}'] MISCOMPILE on=({r_on.stdout},{r_on.exit}) "
+                  f"oracle=({exp_out},{exp_exit}) isel={isel}")
+            continue
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [ISEL corpus '{name}'] OFF path wrong off=({r_off.stdout},{r_off.exit}) "
+                  f"oracle=({exp_out},{exp_exit})")
+            continue
+        # (c) the isel pass fired under --opt.
+        if isel == 0:
+            all_ok = False
+            print(f"  [ISEL corpus '{name}'] correct but ISEL NEVER FIRED")
+            continue
+        # (d) OFF is byte-inert: re-dump off, assert ISEL==0 and the bytes differ.
+        src = _AD_WORK / f"isel_mc_{name}.ad"
+        src.write_text(host.codegen_compatible_source(body))
+        d_off = host.run_dump(src, opt=False)
+        if d_off.status == "ok" and getattr(d_off, "isel", 0) != 0:
+            all_ok = False
+            print(f"  [ISEL corpus '{name}'] OFF path NOT byte-inert: ISEL={d_off.isel}")
+            continue
+    if not fired_any:
+        all_ok = False
+        print("  [ISEL corpus FAIL] no program exercised instruction selection")
+    return (all_ok, total_isel)
+
+
+# --------------------------------------------------------------------------
 # Phase-4 REGISTER-PRESSURE corpus. Hand-written programs with MANY
 # simultaneously-live scalar locals — more than the 5-register callee-saved pool
 # — so the linear-scan allocator is FORCED to spill, plus call-crossing values
@@ -2966,6 +3181,18 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] IR-emit corpus miscompiled, IR path never "
                   "fired, OFF not byte-inert, or reassoc did not reach machine code")
+        # Phase-3 INSTRUCTION-SELECTION corpus: array index / pointer arithmetic /
+        # memory-operand ALU programs whose element-address computation lowers to a
+        # scaled-index `lea` under --opt. Asserts (a) optimized output correct vs an
+        # oracle, (b) optimized == --opt-OFF (so the addressing mode is right), (c)
+        # the isel pass fired (ISEL>0) and is byte-inert OFF (ISEL==0).
+        isel_ok, isel_total = _run_isel_corpus()
+        print(f"--- ADDER_OPT=1 ISEL corpus (Phase-3 instruction selection) ---")
+        print(f"  scaled-index lea folds:     {isel_total}")
+        if not isel_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] isel corpus miscompiled, isel never fired, "
+                  "or OFF not byte-inert")
         # FLOAT IR-EMIT corpus: float arith/compares (f32/f64/mixed/nested/neg)
         # lowered through the SSE float IR path. Asserts correctness vs an IEEE
         # oracle, the float IR path fired (IREMITFLOAT>0), and the OFF path is
