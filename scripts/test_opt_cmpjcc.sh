@@ -185,7 +185,19 @@ else:
         eoff = getattr(d_on, "entry_off", 0)
         if eoff == 0:
             raise RuntimeError("entry_off unavailable from dump")
-        dis_full = disasm_code(WD / "ad_cmpjcc_uloop.elf")
+        # Disassemble the DUMP code bytes (d_on.code), whose offsets are
+        # CODE-RELATIVE and therefore align with entry_off. (The previous
+        # disasm_code(elf) path disassembled the ELF file from offset 0, i.e.
+        # INCLUDING the ~0xb0-byte ELF+program-header prefix, so its addresses
+        # were shifted by the header size relative to entry_off — the
+        # entry_off filter then sliced at the wrong place and false-positived
+        # on a PRELUDE helper's signed jcc whenever main's size shifted. This
+        # mirrors how test_opt_basehoist.sh / test_opt_combine.sh disassemble
+        # d_on.code directly.)
+        raw = WD / "ad_cmpjcc_uloop.code.bin"; raw.write_bytes(d_on.code)
+        dis_full = subprocess.run(
+            ["objdump", "-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel",
+             str(raw)], capture_output=True, text=True).stdout
         # objdump prints "  <hex>:\t..."; keep only lines at or past entry_off.
         main_lines = []
         for ln in dis_full.splitlines():
