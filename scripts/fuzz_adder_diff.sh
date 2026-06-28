@@ -53,11 +53,18 @@ command -v gcc >/dev/null 2>&1 || fail "gcc not found (preprocesses linux-runtim
 mkdir -p "$WORK"
 
 # ---- Build the host dump driver (codegen.ad pipeline -> raw bytes) ------
+# Routed through ad_codegen_host.build_driver() so the cached binary is
+# auto-invalidated whenever ANY real input changes (the dump driver .ad, the
+# self-hosted compiler .ad set incl. opt.ad/codegen.ad, or the host Adder
+# compiler .py set). No manual `rm -rf build/fuzz_ad_codegen` is needed for
+# correctness — editing the optimizer and re-running this gate rebuilds.
 echo "[fuzz_adder_diff] building host dump driver (codegen.ad -> x86_64-linux)"
-python3 -m compiler.adder compile --target=x86_64-linux \
-    tests/fuzz/ad_codegen_dump_driver.ad -o "$WORK/ad_codegen_dump" \
-    >/dev/null 2>"$WORK/driver.cerr" \
-    || { cat "$WORK/driver.cerr"; fail "host dump driver failed to compile"; }
+python3 - <<'PY' || fail "host dump driver failed to compile"
+import sys
+sys.path.insert(0, "tests/fuzz")
+import ad_codegen_host as h
+h.build_driver()
+PY
 
 # ---- Regression: the codegen.ad gate must reproduce the known-answer
 #      regression fixture (tests/fuzz/regress_codegen.ad) through codegen.ad.

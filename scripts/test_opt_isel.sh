@@ -20,14 +20,13 @@
 #
 # HOST-ONLY: python3 + as/ld/gcc (the fuzz host harness), x86_64. NO QEMU.
 #
-# IMPORTANT build hygiene: the dump driver binary is cached under
-# build/fuzz_ad_codegen and does NOT auto-rebuild on .ad change; we wipe it so
-# the test exercises the CURRENT codegen.ad.
+# BUILD HYGIENE: the cached dump driver under build/fuzz_ad_codegen now
+# AUTO-INVALIDATES via ad_codegen_host.build_driver()'s inputs-hash stamp, so it
+# rebuilds automatically when codegen.ad / any compiler source changes. No
+# manual `rm -rf build/fuzz_ad_codegen` is needed for correctness.
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
-
-rm -rf build/fuzz_ad_codegen
 
 python3 - <<'PY'
 import sys
