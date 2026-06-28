@@ -199,7 +199,8 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       irscratchmiss=meta.get("IRSCRATCHMISS", 0),
                       irborrow=meta.get("IRBORROW", 0),
                       strengthred=meta.get("STRENGTHRED", 0),
-                      isel=meta.get("ISEL", 0))
+                      isel=meta.get("ISEL", 0),
+                      aluload=meta.get("ALULOAD", 0))
 
 
 # --------------------------------------------------------------------------
@@ -500,6 +501,7 @@ class CodegenRun:
         self.iremitfloat = kw.get("iremitfloat", 0)
         self.strengthred = kw.get("strengthred", 0)
         self.isel = kw.get("isel", 0)
+        self.aluload = kw.get("aluload", 0)
 
 
 def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
@@ -545,17 +547,18 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     iremitfloat = getattr(dump, "iremitfloat", 0)
     strengthred = getattr(dump, "strengthred", 0)
     isel = getattr(dump, "isel", 0)
+    aluload = getattr(dump, "aluload", 0)
     if rp.returncode < 0:
         return CodegenRun("runfail", detail=f"signal {-rp.returncode}",
                           stdout=out, exit=rp.returncode, folds=folds, cse=cse,
                           licm=licm, iremit=iremit, irfold=irfold,
                           irreassoc=irreassoc, iremitfloat=iremitfloat, ffold=ffold,
-                          strengthred=strengthred, isel=isel)
+                          strengthred=strengthred, isel=isel, aluload=aluload)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
                       folds=folds, ffold=ffold, cse=cse, licm=licm, dce=dce,
                       constbranch=constbranch, copyprop=copyprop, iremit=iremit,
                       irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat,
-                      strengthred=strengthred, isel=isel)
+                      strengthred=strengthred, isel=isel, aluload=aluload)
 
 
 if __name__ == "__main__":
