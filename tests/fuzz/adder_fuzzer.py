@@ -582,6 +582,7 @@ class Program:
         self._gen_short_circuit_traffic(env)  # logical and/or short-circuit
         self._gen_helper_calls(env)
         self._gen_regpressure_scratch_traffic(env)  # caller-saved IR scratch (--opt)
+        self._gen_region_callsplit_traffic(env)  # per-region caller-saved regalloc (--opt)
         self._gen_dce_keep_bait(env)      # DCE in main(): fire + must-KEEP probes
 
         # Fold the must-KEEP global LAST so its accumulated side effect is part of
@@ -1624,6 +1625,198 @@ class Program:
             fn, "rr: int64, cc: int64, a1: int64, a2: int64", body,
             f"cast[int64]({rows}), cast[int64]({cols}), "
             f"cast[int64]({c1}), cast[int64]({c2})", s)
+
+    # ---- per-region caller-saved regalloc traffic (--opt P3-region) ----------
+    #
+    # Stresses the PER-REGION caller-saved register allocation (regalloc.ad:
+    # ra_pool_cap_for / cfg.lr_spans_call). Before this lever, the caller-saved
+    # extension pool {rdi,r8,r9,r10,r11} was unlocked ONLY in a WHOLE-FUNCTION
+    # call-free function. Now a value whose LIVE RANGE spans no call may use a
+    # caller-saved register EVEN inside a function that calls elsewhere — the
+    # matmul accumulator confined to a call-free inner loop is the motivating case.
+    #
+    # CORRECTNESS CRUX — a value live ACROSS a call must NEVER be left in a
+    # caller-saved register (the callee clobbers it => silent miscompile). Each
+    # shape below is built so the by-construction oracle (Python shadow folded into
+    # g_accum) is EXACT, so any wrong caller-saved promotion of a call-spanning
+    # value DIVERGES under ADDER_OPT=1. The shapes:
+    #
+    #   (1) CALL-FREE HOT LOOP + CALL ELSEWHERE — a function whose hot inner loop
+    #       (a reduction accumulator) is call-free, but which ALSO calls a helper
+    #       BEFORE/AFTER the loop (so cfg_fn_has_call==1). The accumulator is
+    #       caller-saved-ELIGIBLE; this is the lever's intended win. Correct iff the
+    #       reduction value matches.
+    #   (2) VALUE LIVE ACROSS A CALL — a local computed, then a helper call, then
+    #       the local READ (and folded). It MUST stay callee-saved/spilled; if it
+    #       lands in a caller-saved reg the helper clobbers it. The helper does real
+    #       work (its own loop) so it genuinely writes rdi/r8-r11. THE CLOBBER
+    #       CATCHER.
+    #   (3) NESTED CALL-FREE LOOPS inside a call-bearing function — multiple
+    #       loop-confined accumulators, with a call straddling the nest, so several
+    #       values are caller-saved-eligible while values around the call are not.
+    #   (4) VALUE LIVE-OUT OF A CALL-FREE LOOP INTO A CALL — a loop accumulator
+    #       (call-free WHILE live in the loop) whose range EXTENDS past the loop to
+    #       a point AT/AFTER a call that consumes it: lr_spans_call must see the
+    #       call inside its (extended) range and keep it OFF the caller-saved pool.
+    def _gen_region_callsplit_traffic(self, env):
+        rng = self.rng
+        if not hasattr(self, "_rc_uid"):
+            self._rc_uid = 0
+        # Emit the dedicated callee FIRST (once). It does real arithmetic work in
+        # a loop so the compiled body genuinely writes the caller-saved registers
+        # rdi/r8-r11 (argument marshalling + scratch), making any value wrongly
+        # left in one across a call to it OBSERVABLY corrupt.
+        if not hasattr(self, "_rc_callee_emitted"):
+            self._rc_callee_emitted = True
+            self.emit_top("def rc_work(x: int64, y: int64) -> int64:")
+            self.emit_top("    w: int64 = x")
+            self.emit_top("    j: int64 = cast[int64](0)")
+            self.emit_top("    while j < cast[int64](4):")
+            self.emit_top("        w = w + (x * cast[int64](3) + y)")
+            self.emit_top("        w = w - y")
+            self.emit_top("        j = j + cast[int64](1)")
+            self.emit_top("    return w")
+            self.emit_top("")
+
+        def rc_work(x, y):
+            w = x
+            for _ in range(4):
+                w = I64.wrap(w + I64.wrap(I64.wrap(x * 3) + y))
+                w = I64.wrap(w - y)
+            return w
+
+        for _ in range(rng.randint(2, 4)):
+            shape = rng.choice([
+                "callfree_loop_plus_call",   # (1)
+                "live_across_call",          # (2) clobber catcher
+                "nested_callfree_plus_call", # (3)
+                "loopval_liveout_to_call",   # (4)
+            ])
+            self._rc_uid += 1
+            u = self._rc_uid
+            if shape == "callfree_loop_plus_call":
+                self._rc_callfree_loop_plus_call(u, rc_work)
+            elif shape == "live_across_call":
+                self._rc_live_across_call(u, rc_work)
+            elif shape == "nested_callfree_plus_call":
+                self._rc_nested_callfree(u, rc_work)
+            else:
+                self._rc_loopval_liveout(u, rc_work)
+
+    # (1) Call-free hot loop accumulator + a call elsewhere in the same function.
+    def _rc_callfree_loop_plus_call(self, u, rc_work):
+        rng = self.rng
+        n = rng.randint(3, 9); a = rng.randint(1, 5); b = rng.randint(1, 5)
+        p = rng.randint(0, 7); q = rng.randint(0, 7)
+        fn = f"rc_clp_{u}"
+        body = [
+            # call BEFORE the loop; pre is NOT read after the loop, so it does not
+            # span the loop (its own short range may use caller-saved safely).
+            "pre: int64 = rc_work(cast[int64](pp), cast[int64](qq))",
+            # call-free hot loop: s (accumulator) and k (IV) are call-free for
+            # their whole life -> caller-saved-ELIGIBLE.
+            "s: int64 = pre",
+            "k: int64 = cast[int64](0)",
+            "while k < nn:",
+            "    s = s + (k * aa + bb)",
+            "    k = k + cast[int64](1)",
+            "return s",
+        ]
+        pre = rc_work(I64.wrap(p), I64.wrap(q))
+        s = pre
+        for k in range(n):
+            s = I64.wrap(s + I64.wrap(I64.wrap(k * a) + b))
+        self._nl_emit_helper(
+            fn, "nn: int64, aa: int64, bb: int64, pp: int64, qq: int64", body,
+            f"cast[int64]({n}), cast[int64]({a}), cast[int64]({b}), "
+            f"cast[int64]({p}), cast[int64]({q})", s)
+
+    # (2) THE CLOBBER CATCHER: a value computed, a call, then the value read.
+    # `keep` is live ACROSS the rc_work call -> MUST NOT be caller-saved.
+    def _rc_live_across_call(self, u, rc_work):
+        rng = self.rng
+        a = rng.randint(2, 9); b = rng.randint(1, 9)
+        p = rng.randint(0, 9); q = rng.randint(0, 9)
+        fn = f"rc_lac_{u}"
+        body = [
+            # keep is defined BEFORE the call and read AFTER it -> spans the call.
+            "keep: int64 = aa * bb + cast[int64](7)",
+            # also a SECOND value spanning the call, to stress >1 callee-saved hold.
+            "keep2: int64 = aa - bb",
+            "mid: int64 = rc_work(cast[int64](pp), cast[int64](qq))",
+            # both keep and keep2 read AFTER the call; if either was clobbered by
+            # rc_work's caller-saved writes the fold diverges.
+            "out: int64 = keep + mid + keep2",
+            "return out",
+        ]
+        keep = I64.wrap(I64.wrap(a * b) + 7)
+        keep2 = I64.wrap(a - b)
+        mid = rc_work(I64.wrap(p), I64.wrap(q))
+        out = I64.wrap(I64.wrap(keep + mid) + keep2)
+        self._nl_emit_helper(
+            fn, "aa: int64, bb: int64, pp: int64, qq: int64", body,
+            f"cast[int64]({a}), cast[int64]({b}), "
+            f"cast[int64]({p}), cast[int64]({q})", out)
+
+    # (3) Nested call-free loops inside a call-bearing function. Inner/outer
+    # accumulators are loop-confined (caller-saved-eligible); a call sits between
+    # the nest and the final read.
+    def _rc_nested_callfree(self, u, rc_work):
+        rng = self.rng
+        rows = rng.randint(2, 5); cols = rng.randint(2, 5)
+        a = rng.randint(1, 4); p = rng.randint(0, 6); q = rng.randint(0, 6)
+        fn = f"rc_ncf_{u}"
+        body = [
+            "s: int64 = cast[int64](0)",
+            "i: int64 = cast[int64](0)",
+            "while i < rr:",
+            "    j: int64 = cast[int64](0)",
+            "    while j < cc:",
+            "        s = s + (i * cc + j) * aa",
+            "        j = j + cast[int64](1)",
+            "    i = i + cast[int64](1)",
+            # call AFTER the nest; tail is live across it -> callee-saved/spilled.
+            "tail: int64 = rc_work(cast[int64](pp), cast[int64](qq))",
+            "return s + tail",
+        ]
+        s = 0
+        for i in range(rows):
+            for j in range(cols):
+                s = I64.wrap(s + I64.wrap(I64.wrap(i * cols + j) * a))
+        tail = rc_work(I64.wrap(p), I64.wrap(q))
+        res = I64.wrap(s + tail)
+        self._nl_emit_helper(
+            fn, "rr: int64, cc: int64, aa: int64, pp: int64, qq: int64", body,
+            f"cast[int64]({rows}), cast[int64]({cols}), cast[int64]({a}), "
+            f"cast[int64]({p}), cast[int64]({q})", res)
+
+    # (4) A loop accumulator that is live-OUT of a call-free loop INTO a call: its
+    # range extends to a point at/after a call, so lr_spans_call must keep it off
+    # the caller-saved pool even though the loop body itself is call-free.
+    def _rc_loopval_liveout(self, u, rc_work):
+        rng = self.rng
+        n = rng.randint(3, 8); a = rng.randint(1, 5)
+        q = rng.randint(0, 7)
+        fn = f"rc_lvo_{u}"
+        body = [
+            "acc: int64 = cast[int64](0)",
+            "k: int64 = cast[int64](0)",
+            "while k < nn:",
+            "    acc = acc + (k * aa + cast[int64](1))",
+            "    k = k + cast[int64](1)",
+            # acc is used as an ARGUMENT to the call: it is live AT the call point,
+            # so its range spans the call -> must not be caller-saved.
+            "z: int64 = rc_work(acc, cast[int64](qq))",
+            "return acc + z",
+        ]
+        acc = 0
+        for k in range(n):
+            acc = I64.wrap(acc + I64.wrap(I64.wrap(k * a) + 1))
+        z = rc_work(I64.wrap(acc), I64.wrap(q))
+        res = I64.wrap(acc + z)
+        self._nl_emit_helper(
+            fn, "nn: int64, aa: int64, qq: int64", body,
+            f"cast[int64]({n}), cast[int64]({a}), cast[int64]({q})", res)
 
     # ---- short-circuit logical and/or traffic --------------------------------
     def _gen_short_circuit_traffic(self, env):

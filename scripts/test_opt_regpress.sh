@@ -9,12 +9,15 @@
 #       weighted use count) is therefore KEPT in a register across the hot loop
 #       instead of round-tripping to a [rbp-NN] stack slot every iteration.
 #
-#   (2) CALL-FREE caller-saved POOL EXPANSION. In a function that makes NO call
-#       (cfg_fn_has_call == 0) the allocator may also use the caller-saved
+#   (2) PER-REGION caller-saved POOL allocation. The caller-saved
 #       %rdi/%r8/%r9/%r10/%r11 (codegen never writes these without a call/syscall
-#       arg-marshal), expanding the pool from 5 to 10. A function WITH a call (or
-#       any uncertainty) stays callee-saved-only, so no value is ever left in a
-#       caller-saved register across a call — the must-NOT-clobber soundness rule.
+#       arg-marshal) may be used for any value whose live range spans NO call
+#       (lr_spans_call==0), expanding the pool from 5 to 10 — EVEN inside a
+#       function that calls elsewhere. A value that DOES span a call stays
+#       callee-saved/spilled, so no value is ever left in a caller-saved register
+#       across a call — the must-NOT-clobber soundness rule. (This supersedes the
+#       former WHOLE-FUNCTION call-free gate; a fully call-free function is the
+#       special case where every value spans no call.)
 #
 # WHAT IT PROVES (no QEMU):
 #   A. CORRECTNESS: every kernel compiled WITH --opt produces EXACTLY the same
@@ -28,9 +31,12 @@
 #      MORE than 5 distinct registers (RA_MAX_REGS > 5) — the caller-saved
 #      extension is active.
 #   D. MUST-SAVE SOUNDNESS: a function with a call in a loop carrying a value
-#      across the call stays bit-exact (the value was NOT clobbered), and the
-#      call-bearing function uses at most 5 distinct registers (no caller-saved
-#      home) — RA_MAX_REGS <= 5 for the call case.
+#      across the call stays bit-exact (the value was NOT clobbered). Under the
+#      PER-REGION lever a call-bearing function MAY exceed 5 registers if it also
+#      has call-free-lifetime values, so the register COUNT is no longer a hard
+#      bound; the bit-exact value (the carried `acc` survived the call) is the
+#      soundness proof, and the per-range clobber gate is exercised end-to-end by
+#      scripts/test_opt_regionreg.sh.
 #
 # HOST-ONLY: python3 + as/ld + objdump, x86_64. NO QEMU. The cached dump driver
 # auto-invalidates on .ad change (#479) — no manual rm -rf needed.
