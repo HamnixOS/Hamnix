@@ -527,11 +527,26 @@ class Program:
         self.ivsr_dim = 16
         self.emit(f"g_ivsr: Array[{self.ivsr_dim * self.ivsr_dim}, int64]")
         self.ivsr_shadow = [0] * (self.ivsr_dim * self.ivsr_dim)
+        # DCE must-KEEP probe global: a side-effect sink the must-KEEP bait in
+        # main() writes via a CALL into a NEVER-READ local. If the new per-name
+        # DCE/dead-store pass wrongly deletes a call-initialized "dead-looking"
+        # local, this global stops updating and the by-construction g_accum fold
+        # diverges from the oracle -> the differential fuzzer flags a miscompile.
+        self.emit("g_dckeep: int64")
+        self.dckeep_shadow = 0
         self.emit("")
 
         # ----- helper functions ---------------------------------------------
         for h in range(rng.randint(1, 2)):
             self._build_helper(h)
+        # A SIDE-EFFECTING helper for the DCE must-KEEP probe: it bumps the
+        # g_dckeep global (an observable effect) and returns it. A local in main
+        # initialized by a call to this — even if NEVER read — must be KEPT,
+        # because the call's r-value is not pure (ir_lower_pure_expr rejects a
+        # call), so DCE must never treat such a decl as a removable dead def.
+        self.emit("def sc_dckeep_bump(v: int64) -> int64:")
+        self.emit("    g_dckeep = g_dckeep + v")
+        self.emit("    return g_dckeep")
         self.emit("")
 
         # ----- main ----------------------------------------------------------
@@ -566,6 +581,12 @@ class Program:
                                               # break/continue/early-return/cross-level
         self._gen_short_circuit_traffic(env)  # logical and/or short-circuit
         self._gen_helper_calls(env)
+        self._gen_dce_keep_bait(env)      # DCE in main(): fire + must-KEEP probes
+
+        # Fold the must-KEEP global LAST so its accumulated side effect is part of
+        # the checksum: any wrongly-deleted side-effecting / address-taken store
+        # makes this value (and thus g_accum) diverge from the oracle.
+        self._fold_value("cast[uint64](g_dckeep)", U64.wrap(I64.wrap(self.dckeep_shadow)))
 
         self.emit(f"    print_u64(g_accum)")
         self.emit(f"    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))")
@@ -579,13 +600,13 @@ class Program:
 
     # ---- helper: pure int function f(a,b[,c]) -> int64 -----------------------
     #
-    # The helper is the fuzzer's only BARRIER-FREE function: it has NO call and
-    # NO addr-of, so the native optimizer's DCE pass (which bails for any
-    # function containing a call/addr-of — see opt.ad dce_scan_barrier) CAN run
-    # here. main() is full of calls (print_u64/_putc/helpers/methods/sc_bump)
-    # and &_ch[0], so DCE never fires there. To give the ADDER_OPT=1 lane real
-    # DCE + const-branch-fold coverage we inject, behind generator knobs, three
-    # optimizer-bait shapes into this pure helper, all provably observationally
+    # The helper is a convenient DCE host: a pure function whose dead-bait locals
+    # exercise the fixpoint + nested-block recursion cleanly. (NOTE: DCE is no
+    # longer whole-function gated on call/addr-of — opt.ad now uses a PER-NAME
+    # escape check, so DCE/dead-store ALSO fires in main(); the main()-side fire +
+    # must-KEEP probes live in _gen_dce_keep_bait.) We inject, behind generator
+    # knobs, three optimizer-bait shapes into this pure helper, all provably
+    # observationally
     # inert (they never feed `r` / the return value, so the by-construction
     # oracle `pyfn` is UNCHANGED and the equivalence assertion stays green):
     #   (1) DEAD LOCALS  — a local with a pure initializer, never read, at
@@ -711,6 +732,59 @@ class Program:
                 nm = dn()
                 self.emit(f"{ind}{nm}: int64 = {pure_init()}")
                 dead_leaves.append(nm)
+
+    # ---- DCE in main(): fire + must-KEEP probes ------------------------------
+    #
+    # The per-name escape DCE/dead-store pass now runs in main() too (the old
+    # whole-function "any call/addr-of -> bail" guard is gone). This injector
+    # stresses BOTH directions in main(), which is FULL of calls and stores:
+    #   FIRE — a fully-dead pure local (and a dead copy chain) whose name is read
+    #          nowhere and whose address is never taken: DCE/copy-prop must be
+    #          able to delete it EVEN amid the surrounding calls. Inert: never
+    #          feeds g_accum, so removing it is a no-op the oracle ignores.
+    #   KEEP — three shapes that MUST survive, each made observable by folding its
+    #          effect into g_accum so a wrong deletion diverges from the oracle:
+    #            (a) call-init: `k = sc_dckeep_bump(K)` never read — the call's
+    #                side effect (g_dckeep += K) MUST run; a call r-value is not
+    #                pure, so the decl must be kept.
+    #            (b) address-taken local: `&m` escapes, then m is READ THROUGH the
+    #                pointer — never-read-by-name but observed; must be kept.
+    #            (c) later-read store: `n = A; n = B; <read n>` — the first store
+    #                is dead but partial liveness is not modelled and n IS read,
+    #                so the global-unused proof fails and nothing is removed.
+    def _gen_dce_keep_bait(self, env):
+        rng = self.rng
+        self._dckeep_seq = getattr(self, "_dckeep_seq", 0) + 1
+        u = self._dckeep_seq
+
+        # FIRE: a fully-dead pure local + a dead copy chain, all read nowhere and
+        # never address-taken — DCE/copy-prop should delete them amid main()'s
+        # calls. Pure init over a constant so there is no live dependency.
+        base = rng.randint(1, 99)
+        self.emit(f"    dkdead_{u}: int64 = cast[int64]({base}) * cast[int64](3)")
+        self.emit(f"    dkcpy_{u}: int64 = dkdead_{u}")          # dead copy
+        self.emit(f"    dkcpy2_{u}: int64 = dkcpy_{u}")          # forwarded chain
+        self.emit(f"    dkuse_{u}: int64 = dkcpy2_{u} + cast[int64](1)")  # dead consumer
+        # (inert: none of dkdead/dkcpy/dkcpy2/dkuse is read after here)
+
+        # KEEP (a): call-init never read -> side effect on g_dckeep must persist.
+        ka = rng.randint(1, 1000)
+        self.emit(f"    dkkeep_{u}: int64 = sc_dckeep_bump(cast[int64]({ka}))")
+        self.dckeep_shadow = I64.wrap(self.dckeep_shadow + ka)
+
+        # KEEP (b): address-taken local, read through the pointer. Folded so the
+        # observed value pins it; if DCE wrongly dropped `m`, p[0] reads garbage.
+        mv = rng.randint(1, 1000)
+        self.emit(f"    dkm_{u}: int64 = cast[int64]({mv})")
+        self.emit(f"    dkp_{u}: Ptr[int64] = &dkm_{u}")
+        self._fold_value(f"cast[uint64](dkp_{u}[0])", U64.wrap(I64.wrap(mv)))
+
+        # KEEP (c): later-read store. n = A (dead store) ; n = B ; read n == B.
+        a_val = rng.randint(1, 1000)
+        b_val = rng.randint(1, 1000)
+        self.emit(f"    dkn_{u}: int64 = cast[int64]({a_val})")
+        self.emit(f"    dkn_{u} = cast[int64]({b_val})")
+        self._fold_value(f"cast[uint64](dkn_{u})", U64.wrap(I64.wrap(b_val)))
 
     def _helper_recipe(self, nargs, rng):
         ops = ["+", "-", "*"]

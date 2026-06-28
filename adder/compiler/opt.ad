@@ -3338,6 +3338,106 @@ def dce_scan_barrier_block(head: uint32):
         s = nd_next[s]
 
 
+# --- per-name address-taken (escape) scanner -----------------------------
+#
+# The coarse whole-function dce_barrier (set on ANY call/addr-of) bails out of
+# DCE for any function that calls a helper or stores through a pointer — which
+# is nearly every real loop body (e.g. dcecopy's print_u64 + bucket[i] store).
+# That throws away the most common dead work. The SOUND refinement: a call or a
+# store-through-pointer can only touch a LOCAL whose ADDRESS has escaped. A
+# scalar local whose address is NEVER taken (`&x` appears nowhere) is invisible
+# to every callee and every indirect store, so "name read nowhere else" PROVES
+# it dead even amid calls/stores elsewhere. So we test address-taken PER NAME
+# instead of bailing for the whole function.
+#
+# dce_at_* : scan a function body for `&<target-name>` (UNOP_ADDR over an ident
+# whose name matches). Sets dce_at_found=1 if the address of the target name is
+# taken anywhere (directly `&x`, or as the base of `&x[i]` / `&x.f`, which also
+# makes x's storage escape). Conservative: a deref-store target `*p = ...` does
+# not name x, so it cannot make a non-address-taken x escape; only a prior `&x`
+# could have leaked the pointer, and that `&x` is exactly what we detect here.
+dce_at_off: uint32 = 0
+dce_at_len: uint32 = 0
+dce_at_found: uint32 = 0
+
+
+# Peel casts/index/member down to the base ident of an lvalue-ish expr (the
+# storage whose address &EXPR ultimately references). Returns the ident node or
+# 0. Mirrors cfg.ad's cl_base_ident intent.
+def dce_at_base_ident(node: uint32) -> uint32:
+    n: uint32 = node
+    while n != 0:
+        k: uint32 = nd_kind[n]
+        if k == ND_IDENT:
+            return n
+        if k == ND_INDEX or k == ND_MEMBER:
+            n = nd_a[n]
+        elif k == ND_CAST:
+            n = nd_a[n]
+        else:
+            return 0
+    return 0
+
+
+def dce_at_scan_expr(node: uint32):
+    if node == 0:
+        return
+    if dce_at_found != 0:
+        return
+    k: uint32 = nd_kind[node]
+    if k == ND_UNARY:
+        if nd_aux[node] == UNOP_ADDR:
+            base: uint32 = dce_at_base_ident(nd_a[node])
+            if base != 0:
+                if ir_name_eq(nd_name_off[base], nd_name_len[base],
+                              dce_at_off, dce_at_len) != 0:
+                    dce_at_found = 1
+                    return
+    dce_at_scan_expr(nd_a[node])
+    dce_at_scan_expr(nd_b[node])
+    dce_at_scan_expr(nd_c[node])
+    dce_at_scan_expr(nd_d[node])
+
+
+def dce_at_scan_block(head: uint32):
+    s: uint32 = head
+    while s != 0:
+        if dce_at_found != 0:
+            return
+        k: uint32 = nd_kind[s]
+        dce_at_scan_expr(nd_a[s])
+        dce_at_scan_expr(nd_b[s])
+        dce_at_scan_expr(nd_c[s])
+        dce_at_scan_expr(nd_d[s])
+        if k == ND_IF:
+            dce_at_scan_block(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                dce_at_scan_block(nd_b[e])
+                e = nd_next[e]
+            dce_at_scan_block(nd_d[s])
+        elif k == ND_WHILE:
+            dce_at_scan_block(nd_b[s])
+        elif k == ND_DO_WHILE:
+            dce_at_scan_block(nd_b[s])
+        elif k == ND_FOR:
+            dce_at_scan_block(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            dce_at_scan_block(nd_c[s])
+        s = nd_next[s]
+
+
+# Return 1 if the address of `name` is taken anywhere in dce_fnbody (escapes), 0
+# if it never is (DCE-safe to delete a never-read pure decl of it even amid
+# calls/stores elsewhere).
+def dce_name_addr_taken(off: uint32, len_: uint32) -> uint32:
+    dce_at_off = off
+    dce_at_len = len_
+    dce_at_found = 0
+    dce_at_scan_block(dce_fnbody)
+    return dce_at_found
+
+
 # --- whole-function use counter for one name -----------------------------
 #
 # Count every textual reference to (name_off,name_len) anywhere in a function
@@ -3394,10 +3494,18 @@ def dce_count_block(head: uint32):
                     dce_use_n = dce_use_n + 1
         # Count ident uses in this statement's expression slots. For the defining
         # decl we still descend its initializer (nd_b) so `x = x` self-counts.
-        dce_count_expr(nd_a[s])
-        dce_count_expr(nd_b[s])
-        dce_count_expr(nd_c[s])
-        dce_count_expr(nd_d[s])
+        # EXCEPTION: when the unit being tested is a plain ND_ASSIGN store
+        # (dce_use_skip), its TARGET (nd_a) is a WRITE, not a read — descending it
+        # would self-count the store as a use of itself and never let a dead store
+        # be removed. So for the skipped ASSIGN we skip nd_a and only descend the
+        # r-value (nd_b), which is where a self-read like `x = x` lives.
+        if s == dce_use_skip and k == ND_ASSIGN:
+            dce_count_expr(nd_b[s])
+        else:
+            dce_count_expr(nd_a[s])
+            dce_count_expr(nd_b[s])
+            dce_count_expr(nd_c[s])
+            dce_count_expr(nd_d[s])
         # Descend nested block chains.
         if k == ND_IF:
             dce_count_block(nd_b[s])
@@ -3464,7 +3572,11 @@ def dce_block(head: uint32) -> uint32:
                 dce_use_n = 0
                 dce_use_skip = s
                 dce_count_block(dce_fnbody)
-                if dce_use_n == 0:
+                # SOUND even amid calls/stores elsewhere: a never-read local
+                # whose ADDRESS is never taken cannot be observed by any callee
+                # or indirect store, so deleting its pure-init decl is a no-op.
+                addr_taken: uint32 = dce_name_addr_taken(nd_name_off[s], nd_name_len[s])
+                if dce_use_n == 0 and addr_taken == 0:
                     # Fully dead: splice this decl out of the chain.
                     if prev == 0:
                         new_head = nxt
@@ -3473,6 +3585,34 @@ def dce_block(head: uint32) -> uint32:
                     opt_dce_count = opt_dce_count + 1
                     dce_removed_any = 1
                     removed = 1
+        elif k == ND_ASSIGN:
+            # DEAD-STORE ELIMINATION (conservative): a plain `x = <pure>` store to
+            # a bare ident whose name is read NOWHERE in the whole function and
+            # whose address is never taken is a dead store — its value can never
+            # be observed, so deleting the store (and its pure computation) is a
+            # no-op. We require: AUGOP_NONE (an augmented `x op= y` READS x, so it
+            # is never dead), bare-ident target, PURE r-value (no call/load/trap to
+            # preserve), zero textual reads of the name (the counter skips THIS
+            # store's own target write), and the address never taken. This is the
+            # same global-unused proof the decl rule uses — robust on every path,
+            # no per-path liveness needed: a name read nowhere is dead everywhere.
+            if nd_aux[s] == AUGOP_NONE:
+                tgt: uint32 = nd_a[s]
+                if nd_kind[tgt] == ND_IDENT and dce_init_is_pure(nd_b[s]) != 0:
+                    dce_use_off = nd_name_off[tgt]
+                    dce_use_len = nd_name_len[tgt]
+                    dce_use_n = 0
+                    dce_use_skip = s
+                    dce_count_block(dce_fnbody)
+                    addr_taken2: uint32 = dce_name_addr_taken(nd_name_off[tgt], nd_name_len[tgt])
+                    if dce_use_n == 0 and addr_taken2 == 0:
+                        if prev == 0:
+                            new_head = nxt
+                        else:
+                            nd_next[prev] = nxt
+                        opt_dce_count = opt_dce_count + 1
+                        dce_removed_any = 1
+                        removed = 1
         if removed == 0:
             # Recurse into nested blocks of a kept statement.
             if k == ND_IF:
@@ -3496,13 +3636,12 @@ def dce_block(head: uint32) -> uint32:
 
 
 def opt_dce_function(fn: uint32):
-    # Blanket alias/escape guard: if the function takes any address or makes any
-    # call, a local could be touched indirectly and "unused elsewhere" no longer
-    # proves deadness — remove nothing.
-    dce_barrier = 0
-    dce_scan_barrier_block(nd_c[fn])
-    if dce_barrier != 0:
-        return
+    # NOTE: the OLD blanket alias/escape guard (bail if the function has ANY
+    # call or addr-of) is GONE — it discarded the dead work in nearly every real
+    # loop body (any body that calls a helper or stores through a pointer). It is
+    # replaced by a PER-NAME escape check in dce_block: a never-read local whose
+    # OWN address is never taken cannot be observed by a callee or indirect
+    # store, so deleting its pure-init decl is sound even amid calls/stores.
     # Iterate to fixpoint: removing one dead decl can make an earlier decl (whose
     # only remaining use was the removed one's initializer) dead in turn.
     dce_fnbody = nd_c[fn]

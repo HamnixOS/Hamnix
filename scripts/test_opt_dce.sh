@@ -37,7 +37,7 @@ def main() -> int:
     x: int = 5 + 3
     y: int = 41
     return y
-""", 41, True))
+""", 41, True, 1))
 
 # 2. Dead local whose init is itself pure arithmetic over other locals.
 CASES.append(("dead_arith", """
@@ -46,7 +46,7 @@ def main() -> int:
     b: int = 6
     dead: int = a * b + 2
     return a + b
-""", 13, True))
+""", 13, True, 1))
 
 # 3. Fixpoint: dead2's only use is in dead1's init; removing dead1 frees dead2.
 #    (dead1 is read nowhere; dead2 is read only by dead1.) Both must vanish.
@@ -56,7 +56,7 @@ def main() -> int:
     dead2: int = keep + 1
     dead1: int = dead2 * 2
     return keep
-""", 9, True))
+""", 9, True, 2))
 
 # 4. NOT dead: y is read in the return, so it must be kept (DCE may still fire on
 #    nothing here -> we only assert correctness, not firing).
@@ -64,22 +64,78 @@ CASES.append(("live_local", """
 def main() -> int:
     y: int = 20 + 2
     return y
-""", 22, False))
+""", 22, False, 0))
 
-# 5. Barrier: address-of a local disables DCE for the whole function. The
-#    "dead" local must be KEPT (DCE=0) and the result still correct.
-CASES.append(("barrier_addr", """
+# 5. Per-name escape, amid a kept addr-taken local: `dead` is never read and its
+#    address is never taken -> it IS removed even though `z`'s address escapes.
+#    `z` must be KEPT (address taken) and the result correct. This is the refined
+#    per-name escape rule replacing the old whole-function barrier bail.
+CASES.append(("escape_mixed", """
 def main() -> int:
     z: int = 4
     p: Ptr[int] = &z
     dead: int = 99
     return z
-""", 4, False))
+""", 4, True, 1))
+
+# 6. dcecopy-shape amid a CALL: a copy chain (b=a; c=b; d=c) fully forwarded, a
+#    dead arithmetic chain (dead1->dead2->dead3, none read), and a helper CALL
+#    present. The OLD whole-function barrier removed NOTHING here (a call in the
+#    fn killed DCE). The new per-name escape rule removes the dead chain + the
+#    forwarded copies even with the call. Result = the live value; seed-exact.
+CASES.append(("dcecopy_call", """
+def ident(v: int) -> int:
+    return v
+def main() -> int:
+    a: int = 7
+    b: int = a
+    c: int = b
+    d: int = c
+    dead1: int = a * 99 + 7
+    dead2: int = dead1 + a
+    dead3: int = dead2 * 3
+    live: int = ident(0)
+    return d + live
+""", 7, True, 1))
+
+# 7. MUST-KEEP — side-effecting "dead-looking" init: `s = f()` whose result is
+#    never read still must run f() (a call is NOT pure; ir_lower_pure_expr rejects
+#    it), so the decl is KEPT. We can't observe the side effect without globals,
+#    but ir-purity guarantees a call-init decl is never a DCE candidate; the
+#    correctness check (opt==off==expected) plus DCE-count assertion pin it.
+CASES.append(("keep_call_init", """
+def f() -> int:
+    return 5
+def main() -> int:
+    s: int = f()
+    return 9
+""", 9, False, 0))
+
+# 8. MUST-KEEP — store to a LATER-READ local: `x = 1` then `x = 2` then read x.
+#    The first store is dead but partial-liveness is not modelled; the name IS
+#    read (x in return), so the global-unused proof fails and NOTHING is removed.
+#    Correctness pinned: x == 2.
+CASES.append(("keep_later_read", """
+def main() -> int:
+    x: int = 1
+    x = 2
+    return x
+""", 2, False, 0))
+
+# 9. MUST-KEEP — address-taken local read through the pointer: w is address-taken
+#    (&w), so even though w is not named in the return, the pointer read p[0]
+#    observes it -> w must be KEPT. The per-name escape check sees &w and refuses.
+CASES.append(("keep_addr_taken", """
+def main() -> int:
+    w: int = 3
+    p: Ptr[int] = &w
+    return p[0]
+""", 3, False, 0))
 
 total_dce = 0
 fired_units = 0
 fails = 0
-for name, src, expected, expect_fire in CASES:
+for name, src, expected, expect_fire, exp_dce in CASES:
     # codegen.ad WITH --opt ON (DCE active); carries the per-run DCE count.
     r_opt = h.run_through_codegen_ad(name, src, WD, opt=True)
     # codegen.ad with --opt OFF (baseline behavior; objdiff-proven == seed).
@@ -100,15 +156,16 @@ for name, src, expected, expect_fire in CASES:
     if not (ok_kind and same_exit and agree):
         status = "FAIL"
         fails += 1
-    if expect_fire and dce <= 0:
-        status = "FAIL(no-fire)"
+    if expect_fire and dce < exp_dce:
+        status = "FAIL(under-fire)"
         fails += 1
-    if (not expect_fire) and name.startswith("barrier") and dce != 0:
-        status = "FAIL(barrier-leaked)"
+    # MUST-KEEP cases (expect_fire False with exp_dce 0): DCE must remove NOTHING.
+    if (not expect_fire) and exp_dce == 0 and dce != 0:
+        status = "FAIL(keep-leaked)"
         fails += 1
 
     print(f"[{name}] {status}  opt_exit={r_opt.exit} off_exit={r_off.exit} "
-          f"expected={expected} DCE={dce}")
+          f"expected={expected} DCE={dce} exp_dce>={exp_dce}")
 
 print("=" * 50)
 print(f"[opt_dce] units that fired DCE: {fired_units}   total DCE removals: {total_dce}")
