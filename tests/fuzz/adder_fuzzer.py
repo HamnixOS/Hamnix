@@ -3068,6 +3068,194 @@ def _run_dce_callarg_corpus():
 
 
 # --------------------------------------------------------------------------
+# nd_next SIBLING-CHAIN traversal corpus (whole-class guard).
+#
+# An expression OPERAND LIST — a call/method-call ARGUMENT list, an array/dict-
+# literal ELEMENT list — is an nd_next-linked sibling chain hanging off ONE child
+# slot of the parent node, NOT the fixed nd_a..nd_d slots. Several optimizer AST
+# walkers historically descended only nd_a..nd_d and so analysed ONLY the FIRST
+# operand, silently mis-analysing every LATER sibling. The first instance (#507)
+# was DCE use-counting (a local used only as a 2nd+ call arg counted ZERO uses ->
+# its decl was deleted -> cgfail/miscompile); the _dce_callarg_corpus guards that.
+#
+# This corpus guards the WHOLE class across the other passes by exercising values
+# that live ONLY in a later sibling position (2nd/3rd call args, nested calls in
+# arg position, names that shadow a param), feeding copy-prop / CSE / LICM. Each
+# program must compile + run correctly ON and OFF, with OFF == ON == oracle.
+#
+# It ALSO pins a SECOND, independent reachable --opt miscompile found in the same
+# audit: a METHOD CALL `obj.m(...)` (ND_METHOD_CALL) was NOT recognised as a
+# side-effect barrier by the optimizer's expression scanner (licm_scan_expr,
+# shared by load-CSE / copy-prop / LICM), which only short-circuited ND_CALL. A
+# load held across a mutating method call was therefore reused STALE — a silent
+# load-CSE miscompile. The `loadcse_across_method` shapes return WRONG under a
+# pre-fix build and CORRECT after; OFF is always correct (no opt).
+# --------------------------------------------------------------------------
+def _ndnext_corpus():
+    """Return a list of (name, full_body, expected_stdout, expected_exit)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, decls_and_main, val):
+        body = PRELUDE + "\n" + decls_and_main
+        progs.append((name, body, str(val & M), (val & 255)))
+
+    # Self-contained byte I/O for the class/method shapes (no PRELUDE; the only
+    # functions present are the I/O helpers + the class under test).
+    IO = (
+        "extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64\n"
+        "_ch: Array[1, uint8]\n"
+        "def _putc(c: uint8) -> int32:\n"
+        "    _ch[0] = c\n"
+        "    sys_write(cast[int32](1), &_ch[0], cast[uint64](1))\n"
+        "    return 0\n"
+    )
+
+    def prog_raw(name, body, out, ex):
+        progs.append((name, body, out, ex))
+
+    # 1) COPY-PROP forwarded into a 2nd + 3rd call argument (a copy chain whose
+    #    dests live ONLY in later arg positions). 1 + 11 + 11 = 23.
+    prog("cp_chain_args",
+         "def add3(a: int64, b: int64, c: int64) -> int64:\n"
+         "    return a + b + c\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    b: int64 = 11\n"
+         "    a: int64 = b\n"
+         "    c: int64 = a\n"
+         "    g_accum = cast[uint64](add3(1, a, c))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](g_accum & cast[uint64](255))\n",
+         23)
+
+    # 2) CSE: identical pure subexpression x*y in the 2nd AND 3rd args. 0+42+42.
+    prog("cse_dup_args",
+         "def add3(a: int64, b: int64, c: int64) -> int64:\n"
+         "    return a + b + c\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    x: int64 = 6\n"
+         "    y: int64 = 7\n"
+         "    g_accum = cast[uint64](add3(0, x * y, x * y))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](g_accum & cast[uint64](255))\n",
+         84)
+
+    # 3) NESTED call: the inner call is the OUTER call's 2nd argument, and the
+    #    inner call's own args are locals used nowhere else. 5 + (8+9) = 22.
+    prog("nested_call_2nd",
+         "def add2(a: int64, b: int64) -> int64:\n"
+         "    return a + b\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    m: int64 = 8\n"
+         "    n: int64 = 9\n"
+         "    g_accum = cast[uint64](add2(5, add2(m, n)))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](g_accum & cast[uint64](255))\n",
+         22)
+
+    # 4) LICM: a loop-invariant product p*q used ONLY as a call's 2nd argument
+    #    inside the loop. sum(i,0..4) + 5*(3*4) = 10 + 60 = 70.
+    prog("licm_inv_2nd_arg",
+         "def add2(a: int64, b: int64) -> int64:\n"
+         "    return a + b\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    p: int64 = 3\n"
+         "    q: int64 = 4\n"
+         "    acc: int64 = 0\n"
+         "    i: int64 = 0\n"
+         "    while i < 5:\n"
+         "        acc = acc + add2(i, p * q)\n"
+         "        i = i + 1\n"
+         "    g_accum = cast[uint64](acc)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](g_accum & cast[uint64](255))\n",
+         70)
+
+    # 5) SHADOW trigger: a parameter `b` and a local `b2` are each used ONLY in a
+    #    later arg position; the shadow case is the silent-miscompile path of the
+    #    DCE class. 0 + 20 + 21 = 41.
+    prog("shadow_param_later_arg",
+         "def add3(a: int64, b: int64, c: int64) -> int64:\n"
+         "    return a + b + c\n"
+         "def helper(b: int64) -> int64:\n"
+         "    b2: int64 = b + 1\n"
+         "    return add3(0, b, b2)\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    g_accum = cast[uint64](helper(20))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](g_accum & cast[uint64](255))\n",
+         41)
+
+    # 6) METHOD-CALL BARRIER (load-CSE): `garr[0]` is loaded, a mutating method
+    #    `o.bump()` is called, then `garr[0]` is reloaded. The optimizer must
+    #    treat the ND_METHOD_CALL as a side-effect barrier and FLUSH the held
+    #    load; a pre-fix build reused the stale (pre-call) value. The object is
+    #    constructed BEFORE the first load so ONLY the method call sits between
+    #    the two reads (the constructor call is itself an ND_CALL barrier).
+    #    a = garr[0]+7 = 12 (garr[0]==5), bump -> garr[0]=105, b = garr[0] = 105;
+    #    return (a+b)&255 = 117.
+    bumper = (
+        IO
+        + "garr: Array[8, int64]\n"
+        + "class Bumper:\n"
+        + "    tag: int64\n"
+        + "    def __init__(self):\n"
+        + "        self.tag = cast[int64](0)\n"
+        + "    def bump(self) -> int64:\n"
+        + "        garr[0] = garr[0] + 100\n"
+        + "        return garr[0]\n"
+        + "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+        + "    o: Bumper = Bumper()\n"
+        + "    garr[0] = cast[int64](5)\n"
+        + "    a: int64 = garr[0] + cast[int64](7)\n"
+        + "    junk: int64 = o.bump()\n"
+        + "    b: int64 = garr[0] + cast[int64](0)\n"
+        + "    return cast[int32]((a + b) & cast[int64](255))\n"
+    )
+    prog_raw("loadcse_across_method", bumper, "", 117)
+
+    # NOTE: a LOOP variant (a value live across a method call inside a loop) is
+    # deliberately NOT included here. It exposes a SEPARATE, pre-existing codegen
+    # bug — gen_method emits a prologue whose saved callee-saved set does not match
+    # the registers its body allocates (it clobbers e.g. %r13 without saving it),
+    # corrupting a caller value the allocator parked there across the call (only
+    # observable under --opt, when store-to-slot is elided). That belongs to the
+    # register-allocation/method-prologue subsystem, not the optimizer's AST
+    # sibling-chain / call-barrier traversal this corpus guards, and is escalated
+    # separately so this corpus stays a clean green guard for THIS class.
+
+    return progs
+
+
+def _run_ndnext_corpus():
+    """Run the nd_next sibling-chain corpus through codegen.ad ON and OFF. Every
+    program must compile + run correctly WITH --opt (the regression guard) AND
+    WITHOUT it, and ON must equal OFF must equal the oracle. Returns
+    (all_ok, n_programs)."""
+    host = _ad_host()
+    all_ok = True
+    n = 0
+    for (name, body, exp_out, exp_exit) in _ndnext_corpus():
+        n += 1
+        r = host.run_through_codegen_ad(f"ndnext_{name}", body, _AD_WORK, opt=True)
+        if r.kind != "ok":
+            all_ok = False
+            print(f"  [ndnext '{name}'] codegen.ad {r.kind}: {r.detail[:140]}")
+            continue
+        if r.stdout != exp_out or r.exit != exp_exit:
+            all_ok = False
+            print(f"  [ndnext '{name}'] --opt MISCOMPILE on=("
+                  f"{r.stdout!r},{r.exit}) oracle=({exp_out!r},{exp_exit}) "
+                  f"loadcse={r.loadcse} cse={r.cse} copyprop={r.copyprop} licm={r.licm}")
+        r0 = host.run_through_codegen_ad(f"ndnext_{name}_off", body, _AD_WORK, opt=False)
+        if r0.kind != "ok" or r0.stdout != exp_out or r0.exit != exp_exit:
+            all_ok = False
+            print(f"  [ndnext '{name}'] OFF path wrong: kind={r0.kind} "
+                  f"out=({r0.stdout!r},{r0.exit}) oracle=({exp_out!r},{exp_exit})")
+    return (all_ok, n)
+
+
+# --------------------------------------------------------------------------
 # Phase-3 LICM corpus. Hand-written programs with LOOP-INVARIANT pure
 # subexpressions inside while/for loop bodies. Run through codegen.ad WITH --opt;
 # the optimized output must match the Python-computed oracle AND the LICM pass
@@ -5900,6 +6088,18 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] DCE call-arg corpus cgfailed/miscompiled, "
                   "DCE never fired, or OFF not DCE-inert")
+        # nd_next SIBLING-CHAIN class guard: values living ONLY in a later operand
+        # position (2nd/3rd call args, nested calls in arg position, shadowing
+        # params) fed through copy-prop / CSE / LICM, plus the METHOD-CALL barrier
+        # load-CSE miscompile (ND_METHOD_CALL must flush a held load). Each must
+        # compile + run correctly ON and OFF, ON == OFF == oracle.
+        nn_ok, nn_total = _run_ndnext_corpus()
+        print(f"--- ADDER_OPT=1 nd_next sibling-chain corpus (whole-class guard) ---")
+        print(f"  programs checked ON+OFF:    {nn_total}")
+        if not nn_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] nd_next corpus miscompiled/cgfailed ON or "
+                  "OFF (sibling-chain analysis or method-call barrier regressed)")
         # P1 Phase-2 BASE-HOIST corpus: loop-invariant global-array bases hoisted
         # into a held register (one scaled-index lea off the base per access, no
         # per-iteration `lea g(%rip)`). Asserts (a) correctness vs oracle ON+OFF
