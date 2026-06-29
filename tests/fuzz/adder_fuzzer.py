@@ -2950,6 +2950,124 @@ def _run_cse_corpus():
 
 
 # --------------------------------------------------------------------------
+# DCE call-argument corpus (regression for the 2nd+-call-arg use-undercount).
+#
+# Phase-8 DCE counts the uses of a pure local before deleting its decl. The use
+# counter (dce_count_expr) walked only nd_a..nd_d and NOT the nd_next operand
+# chain, so a name used ONLY as the 2nd-or-later argument of a call (`f(a, x)`,
+# where x lives at the args-head's nd_next) was counted ZERO times — DCE deleted
+# its decl, and codegen then had no frame slot for it: a `STATUS cgfail` ABORT
+# under --opt for a program that compiled fine WITHOUT --opt (and, when the name
+# shadowed a global/param, a silent wrong-storage MISCOMPILE). These programs
+# pin the fix: each compiles + runs correctly ON and OFF, and a genuinely-dead
+# local keeps DCE firing so the corpus proves the pass is still exercised.
+# --------------------------------------------------------------------------
+def _dce_callarg_corpus():
+    """Return a list of (name, body, expected_stdout, expected_exit, want_dce)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, decls_and_main, val, want_dce):
+        body = PRELUDE + "\n" + decls_and_main
+        progs.append((name, body, str(val & M), (val & 255), want_dce))
+
+    # 1) THE REPRO: three locals passed as the 1st/2nd/3rd args of a call and
+    #    used NOWHERE else. Pre-fix: y and z (2nd/3rd args) counted 0 -> DCE
+    #    deleted their decls -> cgfail. Must compile + return 3+4+5 = 12.
+    prog("three_locals_args",
+         "def add3(a: int64, b: int64, c: int64) -> int64:\n"
+         "    return a + b + c\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    x: int64 = 3\n"
+         "    y: int64 = 4\n"
+         "    z: int64 = 5\n"
+         "    g_accum = cast[uint64](add3(x, y, z))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         12, 0)
+
+    # 2) A local used ONLY as the 2nd argument (1st arg is a literal), PLUS a
+    #    genuinely-dead pure local so DCE still fires (and the corpus proves it).
+    prog("second_arg_plus_dead",
+         "def use2(a: int64, b: int64) -> int64:\n"
+         "    return a * b\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    q: int64 = 7\n"
+         "    dead: int64 = 99\n"
+         "    g_accum = cast[uint64](use2(6, q))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         42, 1)
+
+    # 3) A local used ONLY as the 3rd argument behind two literals.
+    prog("third_arg_only",
+         "def add3(a: int64, b: int64, c: int64) -> int64:\n"
+         "    return a + b + c\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    k: int64 = 10\n"
+         "    g_accum = cast[uint64](add3(1, 2, k))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         13, 0)
+
+    # 4) NESTED call: the inner call's 1st/2nd args are locals used only there
+    #    (the inner call is itself the outer call's 1st argument, an nd_next
+    #    operand was missed at two levels). (8+9)+5 = 22.
+    prog("nested_call_args",
+         "def add2(a: int64, b: int64) -> int64:\n"
+         "    return a + b\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    m: int64 = 8\n"
+         "    n: int64 = 9\n"
+         "    g_accum = cast[uint64](add2(add2(m, n), 5))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         22, 0)
+
+    return progs
+
+
+def _run_dce_callarg_corpus():
+    """Run the DCE call-arg corpus through codegen.ad ON and OFF. Returns
+    (all_ok, total_dce_eliminations). Each program must compile + run correctly
+    WITH --opt (the regression) and WITHOUT it, the OFF path must be DCE-inert
+    (dce==0), and DCE must fire at least once across the corpus (a real dead
+    local was reclaimed) so the corpus proves the pass is still exercised."""
+    host = _ad_host()
+    total_dce = 0
+    all_ok = True
+    for (name, body, exp_out, exp_exit, want_dce) in _dce_callarg_corpus():
+        # WITH --opt: the regression. A pre-fix build returns kind=="unsupported"
+        # (STATUS cgfail) for the 2nd+-arg programs; the fix makes them compile.
+        r = host.run_through_codegen_ad(f"dcecallarg_{name}", body, _AD_WORK, opt=True)
+        if r.kind != "ok":
+            all_ok = False
+            print(f"  [DCE callarg '{name}'] codegen.ad {r.kind}: {r.detail[:120]}")
+            continue
+        d = int(getattr(r, "dce", 0) or 0)
+        total_dce += d
+        if r.stdout != exp_out or r.exit != exp_exit:
+            all_ok = False
+            print(f"  [DCE callarg '{name}'] MISCOMPILE opt=("
+                  f"{r.stdout},{r.exit}) oracle=({exp_out},{exp_exit}) dce={d}")
+        # WITHOUT --opt: must run correctly AND be DCE-inert.
+        r0 = host.run_through_codegen_ad(f"dcecallarg_{name}_off", body, _AD_WORK, opt=False)
+        if r0.kind != "ok" or r0.stdout != exp_out or r0.exit != exp_exit:
+            all_ok = False
+            print(f"  [DCE callarg '{name}'] OFF path wrong: kind={r0.kind} "
+                  f"out=({r0.stdout},{r0.exit}) oracle=({exp_out},{exp_exit})")
+        elif int(getattr(r0, "dce", 0) or 0) != 0:
+            all_ok = False
+            print(f"  [DCE callarg '{name}'] OFF not DCE-inert (dce="
+                  f"{getattr(r0, 'dce', 0)})")
+    # The pass must have fired somewhere (the genuinely-dead local in case 2).
+    if total_dce == 0:
+        all_ok = False
+        print("  [DCE callarg] DCE never fired across the corpus")
+    return (all_ok, total_dce)
+
+
+# --------------------------------------------------------------------------
 # Phase-3 LICM corpus. Hand-written programs with LOOP-INVARIANT pure
 # subexpressions inside while/for loop bodies. Run through codegen.ad WITH --opt;
 # the optimized output must match the Python-computed oracle AND the LICM pass
@@ -5770,6 +5888,18 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] destsel corpus miscompiled, dest-selector "
                   "never fired, a fallback shape routed, or OFF not byte-inert")
+        # DCE call-argument corpus: a local used ONLY as a 2nd+ call argument was
+        # under-counted by DCE (the nd_next operand chain was not walked), so its
+        # decl got deleted and codegen aborted (cgfail) under --opt. Asserts each
+        # such program compiles + runs correctly ON and OFF, OFF is DCE-inert, and
+        # DCE still fires on a genuinely-dead local.
+        dca_ok, dca_total = _run_dce_callarg_corpus()
+        print(f"--- ADDER_OPT=1 DCE call-arg corpus (2nd+ arg use-count fix) ---")
+        print(f"  dead locals reclaimed:      {dca_total}")
+        if not dca_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] DCE call-arg corpus cgfailed/miscompiled, "
+                  "DCE never fired, or OFF not DCE-inert")
         # P1 Phase-2 BASE-HOIST corpus: loop-invariant global-array bases hoisted
         # into a held register (one scaled-index lea off the base per access, no
         # per-iteration `lea g(%rip)`). Asserts (a) correctness vs oracle ON+OFF
