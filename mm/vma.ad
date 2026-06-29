@@ -1172,35 +1172,74 @@ def _vma_tree_update_end(slot: uint64, node: uint64, new_end: uint64):
     vma_mm_write_unlock(slot)
 
 
+def _vt_stab_max_start(node: uint64, addr: uint64, best: uint64,
+                       depth: uint64) -> uint64:
+    # Interval-stabbing search (#471 fix): among ALL VMAs whose [start, end)
+    # contains `addr`, return the one with the GREATEST start — the innermost
+    # MAP_FIXED overlay, which governs the leaf PTE's prot AND its backing /
+    # file_offset exactly as it did at install time. `best` is the best cover
+    # found so far (0 = none); `depth` bounds the recursion against a corrupt
+    # tree (cycle / dangling child).
+    #
+    # WHY this replaces the old greatest-start BST DESCENT. The VMA set is NOT
+    # a partition: ld.so's "reserve the whole DSO span (PROT_READ/NX) then
+    # MAP_FIXED-overlay each segment inside it" idiom installs OVERLAPPING
+    # nodes (an exec/.text or RW/.data overlay nested in the RO reservation),
+    # and apt re-overlays segments as it dlopen's libapt/libc. A plain
+    # descent that only tracks the single greatest-start node on ONE root->leaf
+    # path can:
+    #   (a) MISS entirely — return 0 for an address only the OUTER reservation
+    #       covers when an inner overlay with a larger start sits on the
+    #       descent path but does not itself cover addr (its sibling
+    #       reservation is then in an unexplored subtree); or
+    #   (b) return the WRONG covering node — the RO/NX reservation instead of
+    #       the inner exec/RW overlay — depending on the (ASLR-determined)
+    #       AVL tree shape.
+    # On a demand fault that drove the wrong node, the page is installed with
+    # the reservation's prot (NX) AND the reservation's file_offset/backing
+    # (WRONG BYTES) — the apt "Reading package lists" NX exec-fault (the NX
+    # case is recoverable by vma_resolve_exec_perm_fault; the wrong-content
+    # case executes garbage -> SIGSEGV / va=0 read-fault, the non-recoverable
+    # crash the apt-e2e re-roll was riding out). A correct stab that honours
+    # subtree_max_end visits EVERY covering interval, so the result is exact
+    # under any overlap/layout. Overlap depth is tiny (a reservation + a few
+    # overlays per page), so this stays O(log n + k).
+    if node == 0:
+        return best
+    if _vt_node_bad(node) != 0 or depth > 256:
+        printk2("[dbg-vtree] stab: BAD/looping node=0x%x addr=0x%x\n",
+                node, addr)
+        return best
+    l: uint64 = _vt_left(node)
+    r: uint64 = _vt_right(node)
+    # Left subtree holds SMALLER starts; explore it only if some interval
+    # there can still reach addr (its subtree max end exceeds addr). This is
+    # the augmentation that makes the outer-reservation cover reachable even
+    # when an inner overlay shadowed the plain descent.
+    if l != 0 and _vt_max_end(l) > addr:
+        best = _vt_stab_max_start(l, addr, best, depth + 1)
+    s: uint64 = cast[Ptr[VmaNode]](node)[0].start
+    if s <= addr:
+        e: uint64 = cast[Ptr[VmaNode]](node)[0].end
+        if e > addr:
+            if best == 0 or s > cast[Ptr[VmaNode]](best)[0].start:
+                best = node
+        # Right subtree holds LARGER starts, all still possibly <= addr — and
+        # a larger-start cover beats the current best, so explore it.
+        if r != 0 and _vt_max_end(r) > addr:
+            best = _vt_stab_max_start(r, addr, best, depth + 1)
+    # If s > addr the entire right subtree has even larger starts (> addr) and
+    # cannot cover addr, so it is correctly pruned (we only recursed left).
+    return best
+
+
 def _vma_tree_find(slot: uint64, addr: uint64) -> uint64:
-    # O(log n) point query: the VMA whose [start, end) contains addr, or 0.
-    # The BST key is `start`; descend toward the greatest start <= addr,
-    # then confirm addr < end. The interval-tree augmentation isn't needed
-    # for a pure point-containment query (a plain BST descent on start
-    # finds the only candidate), but the same tree serves the gap/overlap
-    # queries that DO use subtree_max_end below.
-    cur: uint64 = _vma_tree_root(slot)
-    cand: uint64 = 0
-    _ftf_steps: uint64 = 0
-    while cur != 0:
-        # Cycle/garbage tripwire: a corrupt tree (dangling child or a cycle)
-        # would otherwise spin forever here or #PF on a wild child. Bound the
-        # descent (a balanced tree is O(log n) deep) and validate the pointer.
-        if _vt_node_bad(cur) != 0 or _ftf_steps > 256:
-            printk2("[dbg-vtree] find: BAD/looping cur=0x%x addr=0x%x\n",
-                    cur, addr)
-            return 0
-        _ftf_steps = _ftf_steps + 1
-        s: uint64 = cast[Ptr[VmaNode]](cur)[0].start
-        if s <= addr:
-            cand = cur                      # greatest start seen so far <= addr
-            cur = cast[Ptr[VmaNode]](cur)[0].right
-        else:
-            cur = cast[Ptr[VmaNode]](cur)[0].left
-    if cand != 0:
-        if addr < cast[Ptr[VmaNode]](cand)[0].end:
-            return cand
-    return 0
+    # O(log n + k) point query: the VMA whose [start, end) contains addr, or
+    # 0. Returns the GREATEST-start cover (innermost overlay) and is correct
+    # under OVERLAPPING VMAs (the reserve+overlay idiom) — see
+    # _vt_stab_max_start for why a plain start-keyed BST descent is not. The
+    # same augmented tree serves the gap/overlap queries below.
+    return _vt_stab_max_start(_vma_tree_root(slot), addr, 0, 0)
 
 
 def _vma_tree_overlap(slot: uint64, lo: uint64, hi: uint64) -> uint64:
@@ -2008,20 +2047,17 @@ def vma_find(slot: uint64, addr: uint64) -> uint64:
     if node != 0:
         vma_mm_write_unlock(slot)
         return node
-    # DEFENSE-IN-DEPTH (apt NX exec-fault): the BST point query descends on
-    # the `start` key and returns the greatest-start node <= addr; when two
-    # VMAs OVERLAP at addr (the ld.so reserve+overlay idiom nests an alias
-    # inside a reservation; a straddling partial overlay can leave two
-    # siblings both covering addr) the greatest-start candidate may be a
-    # sibling whose [start,end) does NOT contain addr, so _vma_tree_find
-    # returns 0 even though a covering VMA exists. The fault handler then
-    # treats a PRESENT eagerly-installed page as "NO covering VMA" and a
-    # later eager re-stamp can race NX onto an executable page. So before
-    # giving up, do an EXACT linear scan of the (short) list — preferring an
-    # EXEC-permitting cover — so a covered address is NEVER reported
-    # unmapped. This stays inside vma_find (the fault lookup) only; the
-    # structural _vma_tree_find used by enclosing/overlap queries is
-    # unchanged so MAP_FIXED reserve-vs-replace decisions are unaffected.
+    # BELT-AND-BRACES (apt NX exec-fault). As of the #471 fix _vma_tree_find
+    # is a correct interval-stabbing query (it visits every covering interval
+    # via subtree_max_end, so it can no longer return 0 for an address an
+    # OUTER reservation covers while an inner overlay shadows the descent).
+    # This exhaustive linear scan is therefore now redundant in the common
+    # case, but it is kept as a cheap last-resort safety net (and as a
+    # cross-check oracle for the self-test): if the tree were ever corrupted,
+    # a covered address is still never reported unmapped. NOTE the subtle
+    # semantic difference: this scan prefers an EXEC-permitting cover, whereas
+    # _vma_tree_find returns the greatest-start (innermost) overlay; for a
+    # single overlay per page (the real ld.so layout) they pick the same node.
     best: uint64 = 0
     scan: uint64 = task_vma_list_head(slot)
     while scan != 0:
@@ -5385,6 +5421,75 @@ def vma_tree_selftest(scratch_slot: uint64) -> int32:
         printk0("[mm] PASS: per-VMA lock — same VMA serializes, distinct VMAs concurrent\n")
     else:
         printk0("[mm] FAIL: per-VMA lock model\n")
+        ok = 0
+
+    # E7 — OVERLAPPING-VMA point query (#471 regression). Reproduce ld.so's
+    # reserve+overlay layout DETERMINISTICALLY (no ASLR needed): an outer
+    # reservation R with TWO inner overlays A (exec) and B nested inside it,
+    # so the VMA set is NOT a partition. The historical bug: the old
+    # start-keyed BST DESCENT could return 0 for an address only the OUTER
+    # reservation covers (an inner overlay with a larger start shadows the
+    # descent, leaving R in an unexplored subtree) — which made a demand
+    # fault install the page with the wrong prot+backing and surfaced as the
+    # apt "Reading package lists" NX exec-fault / SIGSEGV. The fix
+    # (_vt_stab_max_start) must return the correct GREATEST-START cover for
+    # EVERY probe, including the reservation-only gap between the overlays.
+    OVB:   uint64 = 0x500000000              # 20 GiB, clear region (>= BASE)
+    R_HI:  uint64 = OVB + 0x10000            # reservation [OVB, OVB+64KiB)
+    vma_register_anon(scratch_slot, OVB, 0x10000, VMA_PROT_READ)
+    # Inner EXEC overlay A = [OVB+0x2000, OVB+0x4000).
+    vma_register_anon(scratch_slot, OVB + 0x2000, 0x2000,
+                      VMA_PROT_READ | VMA_PROT_EXEC)
+    # Inner READ overlay B = [OVB+0x8000, OVB+0xA000).
+    vma_register_anon(scratch_slot, OVB + 0x8000, 0x2000, VMA_PROT_READ)
+
+    ov_ok: int32 = 1
+    # (1) The BUG TRIGGER: OVB+0x5000 sits in the gap BETWEEN the overlays,
+    # covered ONLY by the outer reservation R. The old descent returned 0
+    # here; the stab must return R (start OVB) with NO exec.
+    f_gap: uint64 = _vma_tree_find(scratch_slot, OVB + 0x5000)
+    if f_gap == 0 or _vma_node_start(f_gap) != OVB:
+        ov_ok = 0
+    elif (cast[Ptr[VmaNode]](f_gap)[0].prot & VMA_PROT_EXEC) != 0:
+        ov_ok = 0
+    # (2) Innermost EXEC overlay wins: OVB+0x3000 is covered by R AND A; the
+    # greatest-start cover is A (exec). A demand fault here MUST see exec, or
+    # the page is installed NX and the fetch faults.
+    f_x: uint64 = _vma_tree_find(scratch_slot, OVB + 0x3000)
+    if f_x == 0 or _vma_node_start(f_x) != OVB + 0x2000:
+        ov_ok = 0
+    elif (cast[Ptr[VmaNode]](f_x)[0].prot & VMA_PROT_EXEC) == 0:
+        ov_ok = 0
+    # (3) Innermost overlay B wins at OVB+0x8800 (covered by R and B).
+    f_b: uint64 = _vma_tree_find(scratch_slot, OVB + 0x8800)
+    if f_b == 0 or _vma_node_start(f_b) != OVB + 0x8000:
+        ov_ok = 0
+    # (4) Reservation-only region BEFORE the first overlay -> R.
+    f_pre: uint64 = _vma_tree_find(scratch_slot, OVB + 0x1000)
+    if f_pre == 0 or _vma_node_start(f_pre) != OVB:
+        ov_ok = 0
+    # (5) Just past the reservation end -> genuinely uncovered (0).
+    f_out: uint64 = _vma_tree_find(scratch_slot, R_HI)
+    if f_out != 0:
+        ov_ok = 0
+    # (6) Cross-check the stab against the exhaustive list oracle (vma_find's
+    # belt-and-braces scan) for a sweep over the whole reservation: at every
+    # page the tree query must report cover EXACTLY when the list does. (The
+    # two may pick different nodes only where exec-preference vs greatest-
+    # start diverge — not the case in this single-overlay-per-page layout —
+    # so here they must agree node-for-node.)
+    sweep: uint64 = OVB
+    while sweep < R_HI:
+        t: uint64 = _vma_tree_find(scratch_slot, sweep)
+        o: uint64 = vma_find(scratch_slot, sweep)
+        if (t == 0) != (o == 0):
+            ov_ok = 0
+        sweep = sweep + VMA_PAGE_SIZE
+    if ov_ok != 0:
+        printk0("[mm] PASS: vma overlapping reserve+overlay point query (#471)\n")
+    else:
+        printk2("[mm] FAIL: vma overlap point query gap=%p exec=%p\n",
+                f_gap, f_x)
         ok = 0
 
     # E5 — remove consistency: tear down ONLY the VMAs THIS test built
