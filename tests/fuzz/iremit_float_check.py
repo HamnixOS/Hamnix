@@ -292,34 +292,43 @@ def run():
             print(f"  [{name}] codegen.ad {r.kind}: {str(r.detail)[:160]}")
             continue
         ief = int(getattr(r, "iremitfloat", 0) or 0)
+        fps = int(getattr(r, "fpsel", 0) or 0)
         total_iremitfloat += ief
         exp_out = str(expected)
         exp_exit = expected & 255
         if r.stdout != exp_out or r.exit != exp_exit:
             ok = False
             print(f"  [{name}] MISCOMPILE got=({r.stdout},{r.exit}) "
-                  f"oracle=({exp_out},{exp_exit}) iremitfloat={ief}")
+                  f"oracle=({exp_out},{exp_exit}) iremitfloat={ief} fpsel={fps}")
             continue
-        if ief == 0:
+        # A float ASSIGNMENT root (`x: floatN = <arith>`) now lowers through the
+        # FLOAT-SSE DEST-DRIVEN SELECTOR (fpsel) — a strict improvement over the
+        # older float IR emitter (iremitfloat) it supersedes for that shape; a
+        # float COMPARE value and a float32 tree still take the IR-emit path. So a
+        # "float lowering fired" demonstration is satisfied by EITHER counter.
+        if ief == 0 and fps == 0:
             ok = False
-            print(f"  [{name}] correct but FLOAT IR EMITTER NEVER FIRED "
-                  f"(AST fallback) iremit={getattr(r, 'iremit', 0)}")
+            print(f"  [{name}] correct but NO FLOAT LOWERING FIRED (AST fallback) "
+                  f"iremit={getattr(r, 'iremit', 0)}")
             continue
-        # byte-inert OFF: dump off must have IREMITFLOAT == 0 AND IREMIT == 0.
+        # byte-inert OFF: dump off must have IREMITFLOAT == 0, IREMIT == 0, and
+        # the float selector (FPSEL) == 0.
         src = WORK / f"flt_off_{name}.ad"
         src.write_text(host.codegen_compatible_source(body))
         d_off = host.run_dump(src, opt=False)
         src.unlink(missing_ok=True)
         if (d_off.status != "ok"
                 or getattr(d_off, "iremitfloat", 0) != 0
-                or getattr(d_off, "iremit", 0) != 0):
+                or getattr(d_off, "iremit", 0) != 0
+                or getattr(d_off, "fpsel", 0) != 0):
             ok = False
             print(f"  [{name}] OFF path NOT byte-inert: status={d_off.status} "
                   f"iremitfloat={getattr(d_off, 'iremitfloat', '?')} "
-                  f"iremit={getattr(d_off, 'iremit', '?')}")
+                  f"iremit={getattr(d_off, 'iremit', '?')} "
+                  f"fpsel={getattr(d_off, 'fpsel', '?')}")
             continue
         n_pass += 1
-        print(f"  [{name}] OK  out={r.stdout} iremitfloat={ief}")
+        print(f"  [{name}] OK  out={r.stdout} iremitfloat={ief} fpsel={fps}")
     print(f"\n[iremit_float] {n_pass}/{n_total} correct+float-IR-fired, "
           f"total IREMITFLOAT={total_iremitfloat}")
     if total_iremitfloat == 0:

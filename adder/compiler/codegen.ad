@@ -278,6 +278,11 @@ opt_storeelim_count: uint32 = 0
 # register (instead of `lea g(%rip)` every iteration). Counts each hoisted base
 # so the corpus/bench can assert the residency lever fires. 0 with --opt OFF.
 opt_basehoist_count: uint32 = 0
+# FLOAT DEST-DRIVEN SELECTOR firings (--opt, P1 float-SSE lever): each scalar
+# `name = <float-arith tree>` (float64) whose RHS was computed across live SSE
+# registers (xmm dest + xmm scratches) instead of round-tripping every operand
+# through %rax + push/pop. Byte-inert OFF (opt_fpsel_count==0 with --opt off).
+opt_fpsel_count: uint32 = 0
 
 
 def isel_enable():
@@ -293,6 +298,7 @@ def isel_reset_stats():
     opt_aluload_count = 0
     opt_storeelim_count = 0
     opt_basehoist_count = 0
+    opt_fpsel_count = 0
 
 
 # -----------------------------------------------------------------------
@@ -3816,6 +3822,55 @@ def emit_xor_rax_signbit64():
 
 
 # =======================================================================
+# Parameterized SSE register-to-register emitters (P1 float dest-driven
+# selector). These mirror the fixed-%xmm0/%xmm1 emitters above but take an
+# ARBITRARY xmm register encoding 0..7 so a float expression tree can be
+# computed across several live SSE registers instead of round-tripping every
+# operand through %rax + the stack. The selector restricts itself to xmm0..7
+# (3-bit modrm, no REX.R/REX.B needed) and to %rax (gpr 0) as the GPR transit
+# register, so only REX.W (width 8) ever appears — keeping the encoding exact.
+# Each is reachable ONLY under --opt via the float selector; the default path
+# never calls them, so flag-off output is byte-identical.
+# =======================================================================
+
+# movd/movq %eax/%rax, %xmm<xn>  (low `width` bytes of %rax -> xmm xn).
+#   movd: 66 0F 6E /r        movq: 66 48 0F 6E /r
+# modrm = 11 <xn> 000 (rax) = 0xC0 | (xn << 3).
+def emit_movq_rax_to_xmm(xn: uint32, width: uint32):
+    emit_b(0x66)
+    if width == 8:
+        emit_b(0x48)
+    emit_b(0x0F)
+    emit_b(0x6E)
+    emit_b(0xC0 | (xn << 3))
+
+
+# movd/movq %xmm<xn>, %eax/%rax  (xmm xn low `width` bytes -> %rax).
+#   movd: 66 0F 7E /r        movq: 66 48 0F 7E /r
+# modrm = 11 <xn> 000 (rax) = 0xC0 | (xn << 3).
+def emit_movq_xmm_to_rax(xn: uint32, width: uint32):
+    emit_b(0x66)
+    if width == 8:
+        emit_b(0x48)
+    emit_b(0x0F)
+    emit_b(0x7E)
+    emit_b(0xC0 | (xn << 3))
+
+
+# SSE scalar arith  OP %xmm<src>, %xmm<dst>  (dst = dst OP src).
+#   F3 (width 4, ss) / F2 (width 8, sd)  0F <op2> /r
+# op2: add=58 sub=5C mul=59 div=5E.  modrm = 11 <dst> <src> = 0xC0|(dst<<3)|src.
+def emit_sse_arith_xmm(op2: uint32, width: uint32, src: uint32, dst: uint32):
+    if width == 4:
+        emit_b(0xF3)
+    else:
+        emit_b(0xF2)
+    emit_b(0x0F)
+    emit_b(op2)
+    emit_b(0xC0 | (dst << 3) | src)
+
+
+# =======================================================================
 # Higher-level scalar-FP codegen (mirrors codegen_x86's _emit_fp_*).
 # =======================================================================
 
@@ -5646,6 +5701,204 @@ def try_gen_fp_expr_ir(node: uint32) -> uint32:
     ir_emit_leave()
     ir_emit_count = ir_emit_count + 1
     ir_emit_float_count = ir_emit_float_count + 1
+    return 1
+
+
+# =======================================================================
+# P1 FLOAT-SSE destination-driven selector (sel_fp_expr_into_xmm).
+# =======================================================================
+#
+# THE MECHANIC. The seed (and the float IR path above) keep every float value
+# in %rax/%rcx as raw IEEE bits and bring it into %xmm0/%xmm1 ONLY at the op
+# site, spilling the running value to the stack via push/pop between operands.
+# A single `mulsd` therefore costs ~8 instructions (mov bits->%rax; push; mov
+# bits->%rax; pop %rcx; movq %rax->xmm0; movq %rcx->xmm1; mulsd; movq xmm0->
+# %rax). This selector instead keeps the running value LIVE IN AN XMM REGISTER
+# across the whole tree: the left spine is computed into the destination xmm,
+# each right operand into a scratch xmm, and combined with a single 2-operand
+# `<op>sd %xs,%xdst` — no stack traffic and no per-op %rax round-trip. Only the
+# final result is moved back to %rax for the existing store path. Mirrors the
+# integer sel_expr/sel_combine_into_home design over the SSE register file.
+#
+# SCRATCH POOL = xmm2..xmm7 (FP_SCRATCH_BASE..). %xmm0/%xmm1 are deliberately
+# EXCLUDED: every leaf is emitted by the unchanged gen_expr (raw bits -> %rax)
+# and converted by emit_operand_to_float, both of which clobber %xmm0 (and a
+# float compare leaf clobbers %xmm0/%xmm1) — so the pool must avoid them.
+#
+# WIDTH. Restricted to the all-float64 case (every binop node width 8): every
+# arith op is the `sd` form and a leaf converts to width 8 in its leaf path
+# (int via cvtsi2sd, float32 via cvtss2sd, float64 a no-op). A width-4 (float32)
+# binop anywhere makes the tree fall back to the byte-correct AST/IR float path
+# — no xmm<->xmm float-width conversion is ever emitted here.
+#
+# CORRECTNESS. The selector evaluates RIGHT-then-LEFT at every node, exactly the
+# seed's gen_fp_binary order, so per-operand side-effect order is preserved; the
+# whole tree is also gated call-free (subtree_has_call==0) because every xmm is
+# caller-saved and a held scratch would not survive a call. Each binary op
+# computes `xdst = left OP right` with the SAME operands and the SAME per-op SSE
+# rounding as the seed, so the float result is bit-identical regardless of the
+# subtree evaluation interleaving. The destination is a fresh scratch xmm (NOT
+# the home), and the home is written only at the very end, so an RHS that reads
+# `name` itself reads its OLD value during evaluation — value-identical to the
+# seed. Gated entirely behind --opt; flag-off never reaches it.
+
+FP_SCRATCH_BASE: uint32 = 2            # xmm2
+FP_SCRATCH_N: uint32 = 6               # xmm2..xmm7
+fp_scratch_used: Array[8, uint32]      # index by xmm number; 1 = in use
+
+
+def fp_scratch_reset():
+    i: uint32 = 0
+    while i < 8:
+        fp_scratch_used[i] = 0
+        i = i + 1
+
+
+# Acquire a free scratch xmm (encoding 2..7), or RA_NONE if the pool is empty.
+def fp_scratch_acquire() -> uint32:
+    x: uint32 = FP_SCRATCH_BASE
+    while x < FP_SCRATCH_BASE + FP_SCRATCH_N:
+        if fp_scratch_used[x] == 0:
+            fp_scratch_used[x] = 1
+            return x
+        x = x + 1
+    return RA_NONE
+
+
+def fp_scratch_release(x: uint32):
+    fp_scratch_used[x] = 0
+
+
+# Simultaneous-scratch demand of float IR tree `v` under the right-first scheme
+# (peak xmm scratch held at once): a leaf needs 0; a binop holds 1 scratch for
+# its right operand while computing left, so need = 1 + max(need(left),
+# need(right)). The root destination is a separate xmm, so the tree is routable
+# iff this demand fits the pool. Bounds recursion + guarantees acquire never
+# returns RA_NONE mid-emit (so the selector never bails after emitting).
+def fp_tree_scratch_need(v: uint32) -> uint32:
+    if v == 0:
+        return 0
+    if ir_kind[v] != IR_BINOP:
+        return 0
+    nl: uint32 = fp_tree_scratch_need(ir_a[v])
+    nr: uint32 = fp_tree_scratch_need(ir_b[v])
+    m: uint32 = nl
+    if nr > m:
+        m = nr
+    return 1 + m
+
+
+# True iff EVERY IR_BINOP node in float tree `v` has node width 8 (float64). The
+# node width mirrors gen_fp_expr_ir: max of the two operands' arith float widths,
+# default 8. A float32 (width-4) op anywhere -> not all-w8 -> fall back.
+def fp_tree_all_w8(v: uint32) -> uint32:
+    if v == 0:
+        return 1
+    if ir_kind[v] != IR_BINOP:
+        return 1                         # a leaf converts to the parent width
+    node: uint32 = ir_ast[v]
+    lw: uint32 = expr_float_width(nd_a[node])
+    rw: uint32 = expr_float_width(nd_b[node])
+    w: uint32 = lw
+    if rw > w:
+        w = rw
+    if w == 0:
+        w = 8
+    if w != 8:
+        return 0
+    if fp_tree_all_w8(ir_a[v]) == 0:
+        return 0
+    return fp_tree_all_w8(ir_b[v])
+
+
+# Compute float IR value `v` into xmm register `xdst` (encoding 2..7), leaving
+# its float64 value there. A leaf is emitted by gen_expr (raw bits -> %rax),
+# converted to width 8, then moved into xdst. A binop computes its right operand
+# into a fresh scratch (right-first, seed order), its left spine into xdst, then
+# `xdst = xdst OP scratch`. Must run inside ir_emit_enter/leave.
+def sel_fp_expr_into_xmm(v: uint32, xdst: uint32):
+    if ir_kind[v] != IR_BINOP:
+        # Leaf: byte-identical to the seed's gen_expr for this AST node.
+        gen_expr(ir_ast[v])
+        emit_operand_to_float(expr_float_width(ir_ast[v]), 8)
+        emit_movq_rax_to_xmm(xdst, 8)
+        return
+    node: uint32 = ir_ast[v]
+    op: uint32 = ir_op[v]
+    op2: uint32 = 0x58                   # add
+    if op == BINOP_SUB:
+        op2 = 0x5C
+    elif op == BINOP_MUL:
+        op2 = 0x59
+    elif op == BINOP_DIV or op == BINOP_IDIV:
+        op2 = 0x5E
+    # RIGHT operand into a scratch xmm (seed evaluates right first).
+    xs: uint32 = fp_scratch_acquire()
+    sel_fp_expr_into_xmm(ir_b[v], xs)
+    # LEFT spine into the destination.
+    sel_fp_expr_into_xmm(ir_a[v], xdst)
+    # xdst = xdst OP xs  (single 2-operand SSE instruction).
+    emit_sse_arith_xmm(op2, 8, xs, xdst)
+    fp_scratch_release(xs)
+
+
+# Try the float-SSE dest-driven selector for a scalar assignment / var-decl
+# `name = <float-arith tree>` where `name` is a float local. Returns 1 if it
+# emitted the whole assignment (value computed in xmm, moved to %rax, then the
+# existing store_to_named writes the home/slot), 0 to fall back. OFF -> 0.
+def try_sel_fp_assign_name(woff: uint32, wlen: uint32, rhs: uint32) -> uint32:
+    if ir_emit_is_enabled() == 0:
+        return 0
+    if ir_emit_in_progress() != 0:
+        return 0
+    if rhs == 0:
+        return 0
+    if nd_kind[rhs] != ND_BINARY:
+        return 0
+    # The destination must be a FLOAT local (a float global/member is not in this
+    # phase's class — store_to_named's float-global path stays on the AST emit).
+    fw: uint32 = lookup_local_float(woff, wlen)
+    if fw == 0:
+        return 0
+    # The root op must be float ARITHMETIC (add/sub/mul/div) — a float COMPARE
+    # root yields an int 0/1, not a float value to store here.
+    op: uint32 = nd_aux[rhs]
+    if op != BINOP_ADD:
+        if op != BINOP_SUB:
+            if op != BINOP_MUL:
+                if op != BINOP_DIV:
+                    if op != BINOP_IDIV:
+                        return 0
+    # The seed routes this node to SSE IFF an IMMEDIATE operand is float-arith.
+    if expr_float_width(nd_a[rhs]) == 0:
+        if expr_float_width(nd_b[rhs]) == 0:
+            return 0
+    # CALL-FREE gate: every xmm is caller-saved, so a held scratch could not
+    # survive a call leaf — refuse any tree with a call (also keeps the right-
+    # then-left evaluation order side-effect-equivalent to the seed).
+    if subtree_has_call(rhs) != 0:
+        return 0
+    ir_reset()
+    v: uint32 = ir_lower_float_expr(rhs)
+    if v == 0:
+        return 0
+    if ir_kind[v] != IR_BINOP:
+        return 0
+    # All-float64 only (no xmm float-width conversion is emitted), and the scratch
+    # demand must fit the pool so acquire never fails mid-emit.
+    if fp_tree_all_w8(v) == 0:
+        return 0
+    if fp_tree_scratch_need(v) > FP_SCRATCH_N:
+        return 0
+    fp_scratch_reset()
+    xdst: uint32 = fp_scratch_acquire()  # xmm2: holds the running tree value
+    ir_emit_enter()
+    sel_fp_expr_into_xmm(v, xdst)
+    emit_movq_xmm_to_rax(xdst, 8)        # result bits -> %rax for the store
+    ir_emit_leave()
+    fp_scratch_release(xdst)
+    store_to_named(woff, wlen)           # writes GPR home / slot / write-through
+    opt_fpsel_count = opt_fpsel_count + 1
     return 1
 
 
@@ -10032,6 +10285,8 @@ def gen_stmt(node: uint32):
             # promoted register home directly (no %rax round-trip / store), same
             # routed class as a plain ND_ASSIGN. Falls back to gen_expr +
             # store_to_named for any shape it does not handle.
+            if try_sel_fp_assign_name(nd_name_off[node], nd_name_len[node], val) != 0:
+                return
             if try_sel_assign_name(nd_name_off[node], nd_name_len[node], val) != 0:
                 return
             gen_expr(val)
@@ -10063,6 +10318,8 @@ def gen_stmt(node: uint32):
             # (the dst-aliasing accumulate Phase 1 refused) into the resident home
             # FIRST — this is the matmul `s = s + A*B` win. Then the Phase-1
             # non-aliasing dest selector, then the legacy path.
+            if try_sel_fp_assign_name(nd_name_off[tgt], nd_name_len[tgt], nd_b[node]) != 0:
+                return
             if try_sel_assign_accum(tgt, nd_b[node]) != 0:
                 return
             if try_sel_assign(tgt, nd_b[node]) != 0:

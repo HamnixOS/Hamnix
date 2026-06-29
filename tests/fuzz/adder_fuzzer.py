@@ -2532,6 +2532,50 @@ class Program:
         self.emit(f"    flt_i: float64 = cast[float64](cast[int64]({self._int_src(iv)}))")
         self._fold_value("cast[uint64](cast[int64](flt_i))",
                          U64.wrap(I64.wrap(iv)))
+        # ---- NESTED float64 arith trees (exercise the float-SSE dest-driven
+        #      selector's xmm-scratch recursion + the all-float64 path). Kept
+        #      mantissa-exact: |a|,|b| <= 300 so products/sums stay << 2^53, so
+        #      cast[int64] truncation is the exact integer the oracle predicts.
+        #      These are DEPTH-2/3 trees the single-binop float traffic above does
+        #      not reach. float64 ONLY (the selector ignores float32). -----------
+        na = rng.randint(-300, 300)
+        nb = rng.randint(1, 300)
+        nc = rng.randint(-300, 300)
+        nd = rng.randint(-300, 300)
+        self.emit(f"    fn_a: float64 = cast[float64]({self._signed_lit(na)})")
+        self.emit(f"    fn_b: float64 = cast[float64]({self._signed_lit(nb)})")
+        self.emit(f"    fn_c: float64 = cast[float64]({self._signed_lit(nc)})")
+        self.emit(f"    fn_d: float64 = cast[float64]({self._signed_lit(nd)})")
+        fa = float(na); fb = float(nb); fc = float(nc); fd = float(nd)
+        # depth-2: a*b + c    (mul then add)
+        self.emit("    fn_g: float64 = fn_a * fn_b + fn_c")
+        self._fold_value("cast[uint64](cast[int64](fn_g))",
+                         U64.wrap(I64.wrap(int(fa * fb + fc))))
+        # depth-2: (a + b) * (c - d)
+        self.emit("    fn_h: float64 = (fn_a + fn_b) * (fn_c - fn_d)")
+        self._fold_value("cast[uint64](cast[int64](fn_h))",
+                         U64.wrap(I64.wrap(int((fa + fb) * (fc - fd)))))
+        # depth-3: a*b + c*d - b   (two products, multiple scratch live at once)
+        self.emit("    fn_k: float64 = fn_a * fn_b + fn_c * fn_d - fn_b")
+        self._fold_value("cast[uint64](cast[int64](fn_k))",
+                         U64.wrap(I64.wrap(int(fa * fb + fc * fd - fb))))
+        # SELF-REFERENTIAL assign: the RHS reads the destination's OLD value
+        # (the selector must read the home before the final store). fn_s = a, then
+        # fn_s = fn_s * fn_b + fn_c.
+        self.emit("    fn_s: float64 = fn_a")
+        self.emit("    fn_s = fn_s * fn_b + fn_c")
+        self._fold_value("cast[uint64](cast[int64](fn_s))",
+                         U64.wrap(I64.wrap(int(fa * fb + fc))))
+        # int-promotion leaf inside a float tree (cvtsi2sd operand).
+        self.emit("    fn_p: float64 = fn_a * fn_b + cast[float64](7)")
+        self._fold_value("cast[uint64](cast[int64](fn_p))",
+                         U64.wrap(I64.wrap(int(fa * fb + 7.0))))
+
+    def _signed_lit(self, v):
+        """A bare signed integer literal (no cast wrapper) for `cast[float64](...)`."""
+        if v < 0:
+            return f"0 - {(-v)}"
+        return f"{v}"
 
     def _int_src(self, v):
         if v < 0:
