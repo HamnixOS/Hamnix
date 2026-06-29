@@ -3470,6 +3470,55 @@ def emit_alu_imm_reg(op: uint32, imm: uint32, dst: uint32):
     emit_imm32(cast[uint64](imm))
 
 
+# `op (%<base>), %<dst>` — GENERAL memory-source ALU fold for the destination-
+# driven selector (P1 alu-load tile). Combines an 8-byte integer memory operand
+# whose ADDRESS is in register `base` directly into an ARBITRARY destination
+# register `dst`, in one instruction — the dest-driven generalization of the
+# %rax-anchored emit_*_mem_rcx_rax helpers. `dst` is the modrm REG field, `base`
+# the R/M field (register-indirect, mod=00). The CALLER MUST pass a base register
+# that is NOT %rsp(4)/%rbp(5)/r12(12)/r13(13) — those modrm R/M encodings select
+# SIB / RIP-relative, not plain (%base). The selector always uses %rcx(1) as the
+# address base, which is safe. Only ADD/SUB/MUL/AND/OR/XOR (ir_op_scratch_ok) are
+# routed here; compares stay on the legacy %rax path. Computes `dst = dst OP
+# [base]` — for SUB this is dst - [base], exactly left-OP-right when the memory
+# operand is the RIGHT (subtrahend) operand. Used ONLY under the --opt selector;
+# the default path never reaches it, so flag-off output is byte-identical.
+def emit_alu_mem_reg(op: uint32, base: uint32, dst: uint32):
+    rex: uint32 = 0x48                      # REX.W
+    if dst >= 8:
+        rex = rex | 0x04                    # REX.R (extends REG=dst)
+    if base >= 8:
+        rex = rex | 0x01                    # REX.B (extends R/M=base)
+    modrm: uint32 = ((dst & 7) << 3) + (base & 7)   # mod=00, reg=dst, r/m=base
+    if op == BINOP_ADD:
+        emit_b(rex)
+        emit_b(0x03)                        # ADD r64, r/m64
+        emit_b(modrm)
+    elif op == BINOP_SUB:
+        emit_b(rex)
+        emit_b(0x2B)                        # SUB r64, r/m64
+        emit_b(modrm)
+    elif op == BINOP_BIT_AND:
+        emit_b(rex)
+        emit_b(0x23)                        # AND r64, r/m64
+        emit_b(modrm)
+    elif op == BINOP_BIT_OR:
+        emit_b(rex)
+        emit_b(0x0B)                        # OR r64, r/m64
+        emit_b(modrm)
+    elif op == BINOP_BIT_XOR:
+        emit_b(rex)
+        emit_b(0x33)                        # XOR r64, r/m64
+        emit_b(modrm)
+    elif op == BINOP_MUL:
+        emit_b(rex)
+        emit_b(0x0F)
+        emit_b(0xAF)                        # IMUL r64, r/m64
+        emit_b(modrm)
+    else:
+        cg_fail(1, 0)                       # only ADD/SUB/MUL/AND/OR/XOR routed here
+
+
 # =======================================================================
 # MEMORY-SOURCE ALU folds (--opt, Phase 3 alu-load). `op (%rcx), %rax`:
 # combine the destination %rax with a memory source operand whose ADDRESS
@@ -5650,6 +5699,26 @@ def sel_combine_into_home(bop: uint32, v: uint32, r: uint32):
             if lookup_local_scalar_size(ir_name_off[v], ir_name_len[v]) == 0:
                 emit_alu_reg_reg(bop, sr, r)
                 return
+    # ALU-LOAD MEMORY-SOURCE FOLD (P1 alu-load tile). An 8-byte INTEGER array
+    # element `arr[i]` as the RIGHT operand is sourced in-place via `op (%rcx),%r`
+    # — eliding the separate sized load-to-temp + reg-reg combine the scratch/%rax
+    # path below would emit. `r` already holds the LEFT value; this computes
+    # `r = r OP [&arr[i]]` = left OP right (correct for SUB too, since the memory
+    # operand is the RIGHT/subtrahend operand). The element ADDRESS is computed by
+    # the unchanged gen_index_addr (touches only %rax/%rcx and hoisted base regs,
+    # never the promoted home `r` which the scratch pool excludes), moved to %rcx,
+    # then folded. Only the full-width 8-byte integer element folds (no truncation/
+    # extension hazard); sub-8-byte / float elements fall through to the load path.
+    # `bop` is always ir_op_scratch_ok (ADD/SUB/MUL/AND/OR/XOR), all of which
+    # emit_alu_mem_reg encodes. Mirrors the legacy gen_expr_ir alu-load fold on the
+    # dest-driven selector codepath, where the selector now intercepts the binop.
+    mem_node: uint32 = ir_leaf_foldable_mem8(v)
+    if mem_node != 0:
+        gen_index_addr(mem_node)             # &arr[i] -> %rax
+        emit_mov_rax_rcx()                   # element address -> %rcx
+        emit_alu_mem_reg(bop, 1, r)          # op (%rcx),%r  (%rcx enc = 1)
+        opt_aluload_count = opt_aluload_count + 1
+        return
     # General: a dest-driven scratch if one is free (keeps a deep right subtree's
     # own accumulator off %rax), else compute into %rax and combine — no dedicated
     # scratch required, so this never forces a fall-back under register pressure.
@@ -9921,6 +9990,30 @@ def gen_cmp_setup(node: uint32) -> uint32:
     op: uint32 = nd_aux[node]
     l_sgn: uint32 = expr_signedness(nd_a[node])
     r_sgn: uint32 = expr_signedness(nd_b[node])
+    rb: uint32 = nd_b[node]
+    la: uint32 = nd_a[node]
+    # ALU-LOAD MEMORY-SOURCE FOLD (P1 alu-load tile, branch arm). When the RIGHT
+    # operand is an 8-byte INTEGER array element `arr[i]`, source it in-place via
+    # `cmpq (%rcx),%rax` instead of evaluating it to a temp and pushing it — the
+    # cmp+jcc form of the legacy gen_expr_ir compare fold, which the cmp+jcc lever
+    # otherwise bypasses for branch conditions. The flags reflect `left - [&arr[i]]`
+    # = left OP right with the SAME (l_sgn,r_sgn) jcc as the reg-reg path. Eval
+    # order changes from right-then-left to left-then-right(address), so this is
+    # only safe when BOTH operands are call-free (an Adder expression has no other
+    # side effect, matching the IR-path's pure gate): left into %rax, hold it,
+    # compute the element address into %rcx, restore left, cmp.
+    if isel_is_enabled() != 0 and nd_kind[rb] == ND_INDEX:
+        if index_elem_size(rb) == 8 and index_elem_float(rb) == 0:
+            if subtree_has_call(la) == 0 and subtree_has_call(rb) == 0:
+                gen_expr(la)                 # left -> %rax
+                emit_push_rax()              # hold left across the address compute
+                gen_index_addr(rb)           # &arr[i] -> %rax
+                emit_mov_rax_rcx()           # element address -> %rcx
+                emit_pop_rax()               # restore left -> %rax
+                emit_cmp_mem_rcx_rax()       # cmpq (%rcx),%rax  (left - right)
+                opt_aluload_count = opt_aluload_count + 1
+                opt_cmpjcc_count = opt_cmpjcc_count + 1
+                return rel_jcc(op, l_sgn, r_sgn)
     # Same eval order as the gen_expr ND_BINARY compare path.
     gen_expr(nd_b[node])
     emit_push_rax()
