@@ -120,6 +120,35 @@ for name, decls, out_expr, want_fire in CASES:
         print(f"[{name}] ON==OFF={r_on.stdout} FPSEL={fp_on} inert-OFF OK")
 
 # ---------------------------------------------------------------------------
+# 1b) SSE SCRATCH-POOL BOUNDARY — the destination xmm is acquired from the SAME
+#     6-register scratch pool (xmm2..xmm7) as every per-node right-operand
+#     scratch, so a RIGHT-NESTED float64 chain of k operators needs k scratches
+#     PLUS the destination = k+1 registers. A 6-deep chain therefore needs 7
+#     registers, one MORE than the pool. The routability guard must reject
+#     need >= FP_SCRATCH_N (NOT the off-by-one `> FP_SCRATCH_N`, which admitted
+#     the 6-deep chain -> fp_scratch_acquire returned RA_NONE mid-emit -> a bad
+#     xmm encoding corrupted a live scratch -> a silent --opt wrong-value
+#     miscompile). Each depth 3..9 must give ON==OFF; shallow depths route,
+#     deep depths fall back to the byte-correct path, ALL correct.
+# ---------------------------------------------------------------------------
+for depth in range(3, 10):
+    decls = "".join(
+        f"    g{i}: float64 = cast[float64]({i + 1})\n" for i in range(depth + 1))
+    expr = f"g{depth}"
+    for i in range(depth - 1, -1, -1):
+        expr = f"(g{i} + {expr})"
+    decls += f"    rr: float64 = {expr}"
+    body = mk(f"fpdeep{depth}", decls, "cast[int64](rr)")
+    r_on = h.run_through_codegen_ad(f"fpdeep{depth}", body, WD, opt=True)
+    r_off = h.run_through_codegen_ad(f"fpdeep{depth}o", body, WD, opt=False)
+    if r_on.kind != "ok" or r_off.kind != "ok":
+        print(f"FAIL(compile) fpdeep{depth} on={r_on.kind} off={r_off.kind}"); fails += 1
+    elif r_on.stdout != r_off.stdout:
+        print(f"FAIL fpdeep{depth} ON({r_on.stdout}) != OFF({r_off.stdout})"); fails += 1
+    else:
+        print(f"[fpdeep{depth}] ON==OFF={r_on.stdout} OK")
+
+# ---------------------------------------------------------------------------
 # 3) PLUMBING REMOVED — a float64 arith chain emits a dest-driven SSE chain with
 #    ZERO push/pop in the routed region. The seed round-trips every operand via
 #    push/pop; the selector must not.

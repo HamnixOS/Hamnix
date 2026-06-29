@@ -2570,6 +2570,53 @@ class Program:
         self.emit("    fn_p: float64 = fn_a * fn_b + cast[float64](7)")
         self._fold_value("cast[uint64](cast[int64](fn_p))",
                          U64.wrap(I64.wrap(int(fa * fb + 7.0))))
+        # ---- DEEP float64 chains straddling the SSE scratch-pool boundary -------
+        # The float-SSE dest-driven selector (try_sel_fp_assign_name) holds the
+        # running tree value in an xmm acquired from the SAME 6-register scratch
+        # pool (xmm2..xmm7) as every per-node right-operand scratch. The peak
+        # simultaneous demand of a RIGHT-NESTED chain `a+(b+(c+...))` of k ops is k
+        # scratches (fp_tree_scratch_need) PLUS the one destination register, so a
+        # 6-deep right chain needs 7 registers — one MORE than the pool. A pre-fix
+        # build's routability guard was off-by-one (`> FP_SCRATCH_N` instead of
+        # `>= FP_SCRATCH_N`): it admitted the 6-deep chain, fp_scratch_acquire then
+        # returned RA_NONE mid-emit, and the bad xmm encoding silently corrupted a
+        # live scratch -> a --opt wrong-value miscompile. These chains exercise BOTH
+        # sides of the boundary (routed for shallow, fall-back for deep) so the
+        # selector must produce the oracle value at every depth. float64 only (the
+        # selector ignores float32); +/- only so the truncated value stays exact.
+        dleaf = [rng.randint(-40, 40) for _ in range(11)]
+        for di in range(11):
+            v = dleaf[di]
+            self.emit(f"    fd{di}: float64 = cast[float64]({self._signed_lit(v)})")
+        # depths 3..9 cover need=3..9 (pool boundary at need>=6 falls back).
+        for depth in range(3, 10):
+            ops = [rng.choice(["+", "-"]) for _ in range(depth)]
+            # RIGHT-nested: fd0 OP (fd1 OP (fd2 OP ... fd{depth}))
+            expr = f"fd{depth}"
+            acc = dleaf[depth]
+            for i in range(depth - 1, -1, -1):
+                if ops[i] == "+":
+                    acc = dleaf[i] + acc
+                else:
+                    acc = dleaf[i] - acc
+                expr = f"(fd{i} {ops[i]} {expr})"
+            self.emit(f"    fdr{depth}: float64 = {expr}")
+            self._fold_value(f"cast[uint64](cast[int64](fdr{depth}))",
+                             U64.wrap(I64.wrap(int(float(acc)))))
+            # LEFT-nested (need stays small, but exercises the left-spine recursion
+            # into the destination at every depth): (((fd0 OP fd1) OP fd2) ...).
+            lops = [rng.choice(["+", "-"]) for _ in range(depth)]
+            lexpr = f"fd0"
+            lacc = dleaf[0]
+            for i in range(1, depth + 1):
+                if lops[i - 1] == "+":
+                    lacc = lacc + dleaf[i]
+                else:
+                    lacc = lacc - dleaf[i]
+                lexpr = f"({lexpr} {lops[i - 1]} fd{i})"
+            self.emit(f"    fdl{depth}: float64 = {lexpr}")
+            self._fold_value(f"cast[uint64](cast[int64](fdl{depth}))",
+                             U64.wrap(I64.wrap(int(float(lacc)))))
 
     def _signed_lit(self, v):
         """A bare signed integer literal (no cast wrapper) for `cast[float64](...)`."""
