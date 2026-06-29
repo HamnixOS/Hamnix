@@ -297,6 +297,37 @@ APT::Get::AllowUnauthenticated "true";
 // single-root capability sandbox (Plan 9 bindings), so dropping to _apt
 // buys nothing here. Pin the sandbox user to root so the methods run.
 APT::Sandbox::User "root";
+// Pass --force-bad-path to every dpkg apt forks. dpkg's startup checkpath()
+// looks for the helper programs ldconfig + start-stop-daemon on PATH and,
+// when BOTH are absent (they are not in this minimal curated namespace),
+// FATALLY aborts "dpkg: error: 2 expected programs not found in PATH or not
+// executable" — but ONLY when the caller did not pass --force-bad-path.
+// `dpkg --force-all -i` (the dpkg-i keystone leg) implies it and survives;
+// apt-get's OWN dpkg invocation does NOT, so without this line apt-get
+// install dies right after resolving the package. --force-bad-path is the
+// dpkg force flag for exactly "PATH is missing important programs" and is
+// the established way to run dpkg in a minimal bootstrap environment (it is
+// what debootstrap's diverted-ldconfig phase relies on). A leaf package
+// like hamhello/hello ships no shared library (no ldconfig trigger) and no
+// daemon (no start-stop-daemon postinst), so the helpers are never actually
+// invoked — this only relaxes the upfront presence CHECK. Zero footprint:
+// no extra binaries embedded into the RAM-resident cpio.
+DPkg::Options { "--force-bad-path"; };
+// Drive dpkg over plain pipes, NOT a pseudo-terminal. By default apt
+// allocates a pty for dpkg (Dpkg::Use-Pty defaults true) so dpkg's progress
+// output looks interactive. Allocating that pty calls TIOCSCTTY on the
+// slave fd, which linux_abi does not implement —
+//   "E: Setting TIOCSCTTY for slave fd 10 failed! - ioctl (38: Function not
+//    implemented)"
+// — and the half-set-up pty then DEADLOCKS the apt<->dpkg status I/O during
+// the configure phase: apt-get install unpacks the package but HANGS at
+// "Setting up <pkg>" (the dpkg child blocks on the broken pty, apt blocks
+// reading its status-fd), so the install never returns. dpkg -i driven
+// DIRECTLY (the Leg-A keystone) has no pty and configures fine, which is
+// exactly why only the apt-driven path hung. Turning the pty off makes apt
+// use ordinary pipes (the standard non-interactive / CI setting), so dpkg
+// --configure runs to "Setting up <pkg>" and apt-get install completes.
+Dpkg::Use-Pty "false";
 // Redirect apt's gpgv signature-verify METHOD to a tiny protocol-speaking
 // shim that reports every InRelease as verified (201 URI Done). The stock
 // /usr/lib/apt/methods/gpgv forks the real /usr/bin/gpgv verifier, whose
