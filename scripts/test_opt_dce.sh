@@ -132,6 +132,23 @@ def main() -> int:
     return p[0]
 """, 3, False, 0))
 
+# 10. CALL-ARG UNDER-COUNT regression: x/y/z are locals used ONLY as the 1st/2nd/
+#     3rd arguments of a call (and nowhere else). DCE's use counter must follow
+#     the nd_next argument chain — pre-fix it counted only the 1st arg, deemed y
+#     and z dead, deleted their decls, and codegen ABORTED (cgfail) because the
+#     slots were gone. A genuinely-dead local (`gone`) keeps DCE firing. The call
+#     args must SURVIVE; add3(3,4,5) = 12.
+CASES.append(("callarg_chain", """
+def add3(a: int, b: int, c: int) -> int:
+    return a + b + c
+def main() -> int:
+    x: int = 3
+    y: int = 4
+    z: int = 5
+    gone: int = 77
+    return add3(x, y, z)
+""", 12, True, 1))
+
 total_dce = 0
 fired_units = 0
 fails = 0
