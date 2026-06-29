@@ -276,6 +276,7 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       accsel=meta.get("ACCSEL", 0),
                       idxstore=meta.get("IDXSTORE", 0),
                       idxsel=meta.get("IDXSEL", 0),
+                      callarg=meta.get("CALLARG", 0),
                       irscratch=meta.get("IRSCRATCH", 0),
                       irscratchmiss=meta.get("IRSCRATCHMISS", 0),
                       irborrow=meta.get("IRBORROW", 0),
@@ -589,6 +590,7 @@ class CodegenRun:
         self.accsel = kw.get("accsel", 0)
         self.idxstore = kw.get("idxstore", 0)
         self.idxsel = kw.get("idxsel", 0)
+        self.callarg = kw.get("callarg", 0)
         self.strengthred = kw.get("strengthred", 0)
         self.isel = kw.get("isel", 0)
         self.aluload = kw.get("aluload", 0)
