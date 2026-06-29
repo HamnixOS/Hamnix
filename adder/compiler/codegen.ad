@@ -5972,6 +5972,169 @@ def try_sel_assign_index(node: uint32) -> uint32:
     return 1
 
 
+# =======================================================================
+# P1 Phase 2 (index) — INDEX-ADDRESS arithmetic through the selector.
+# =======================================================================
+#
+# THE RESIDUAL (matmul, measured post-Phase-4): the consuming load/alu-fold of
+# `A[i*N+k]` computes the element ADDRESS via gen_index_addr, whose INDEX
+# expression (`i*N+k`, a pure binary of strength-reduced IVs) is emitted by
+# `gen_expr(index)`. When gen_index_addr runs INSIDE an outer IR emit (the
+# alu-load fold `imul (%rcx),%rax`, or the accumulator combine), the re-entrancy
+# guard in try_gen_expr_ir forces that nested binary onto the AST stack machine —
+# a value-at-a-time `mov;push;mov;pop;add` per index. This recurses the
+# destination-driven selector THROUGH the index subtree (retiring the guard for
+# index nodes), computing the index sum DIRECTLY into %rcx with scratch-free
+# 2-operand forms (`mov iv,%rcx; add k,%rcx`) — no push/pop, no %rax round-trip.
+#
+# SOUNDNESS — value-identical to the seed:
+#   * Only a PURE index lowers (ir_lower_pure_expr -> 0 for any call/side effect,
+#     so `arr[f()]` falls back to the legacy path, preserving eval order). For a
+#     pure index the selector's left-then-right schedule is value-equivalent to the
+#     seed's right-then-left (same operands, same modular two's-complement ops).
+#   * The routed op set is the signedness-INVARIANT plain-arith one
+#     (ADD/SUB/MUL/AND/OR/XOR via sel_binop_routable); compares/div/mod/shift are
+#     NOT routable, so a shift/div in the index falls back exactly.
+#   * SCRATCH-FREE GATE: every right-operand combine must be a cheap source
+#     (immediate or register-promoted full-width-8 ident), so sel_combine_into_home
+#     NEVER takes its scratch-ACQUIRING general path. This matters because the
+#     index sits inside an IR_LEAF the per-function scratch prescan models as
+#     live-0 (it never lowered the index for a scratch reservation), so an acquire
+#     here could grab a callee-saved reg the prologue did not save. Refusing any
+#     non-cheap combine keeps the emit within {%rax,%rcx} + already-resident
+#     promoted regs — zero pool registers — so it is sound under ANY pressure.
+#   * RE-ENTRANCY ARENA SCOPE: the index subtree is lowered into a SCOPED region
+#     above the saved ir_count (ir_new only ever APPENDS), so the outer in-progress
+#     tree's nodes (ids < saved_count) are untouched; ir_count/ir_overflow are
+#     restored after emit. ir_emit_active is forced on across the emit so any
+#     deeper binary reached through a leaf bounces to the AST path (no nested
+#     ir_reset), and the prior flag is restored.
+# Gated on isel_is_enabled(); OFF -> always 0, so the default path is byte-identical.
+
+# True iff IR value `w` is a CHEAP combine SOURCE the dest-driven selector folds
+# into the running index register with a single 2-operand instruction and NO
+# scratch register: an immediate (for a non-MUL op, fitting a sign-extended imm32)
+# or a register-promoted FULL-WIDTH-8 local read. Anything else (a memory leaf, a
+# sub-8-byte sized local, a nested binop, a non-promoted local) would force
+# sel_combine_into_home's scratch-acquiring path, which this phase forbids.
+def idx_combine_cheap(bop: uint32, w: uint32) -> uint32:
+    k: uint32 = ir_kind[w]
+    if k == IR_CONST:
+        if bop != BINOP_MUL:
+            if ir_const[w] <= 2147483647:
+                return 1
+        return 0
+    if k == IR_IDENT:
+        if ra_reg_for_name(ir_name_off[w], ir_name_len[w]) != RA_NONE:
+            if lookup_local_scalar_size(ir_name_off[w], ir_name_len[w]) == 0:
+                return 1
+    return 0
+
+
+# True iff the routable-binop index tree `v` can be computed entirely with the
+# scratch-free dest-driven schedule: every right operand down the left spine is a
+# cheap source, and the left-spine TERMINAL is a simple const/ident leaf (emitted
+# by sel_expr_into_reg's leaf path into %rcx with no scratch). `v` is known
+# sel_binop_routable on entry.
+def idx_spine_scratchfree(v: uint32) -> uint32:
+    if idx_combine_cheap(ir_op[v], ir_b[v]) == 0:
+        return 0
+    la: uint32 = ir_a[v]
+    if sel_binop_routable(la) != 0:
+        return idx_spine_scratchfree(la)
+    # Non-routable spine terminal: restrict to a bare const/ident leaf so the
+    # leaf emit (gen_expr_ir) needs no scratch and clobbers only %rax/%rcx.
+    kla: uint32 = ir_kind[la]
+    if kla == IR_CONST or kla == IR_IDENT:
+        return 1
+    return 0
+
+
+# Peel VALUE-IDENTITY casts off an index expression. An index is idiomatically
+# wrapped `cast[int64](i*N+k)`; for a NON-narrowing, non-float cast (destination an
+# 8-byte / pointer / non-primitive type) gen_expr emits the operand with NO
+# truncation or convert, so the cast contributes nothing to the value — peeling it
+# exposes the inner ND_BINARY to the selector while staying byte-/value-identical.
+# A NARROWING sub-8-byte cast (`cast[uint8](..)`) or a FLOAT cast DOES change the
+# value, so we stop at it (the selector then refuses the non-binary root).
+def idx_peel_cast(node: uint32) -> uint32:
+    cur: uint32 = node
+    while cur != 0 and nd_kind[cur] == ND_CAST:
+        tnode: uint32 = nd_a[cur]
+        if type_float_width(tnode) != 0:
+            return cur
+        if expr_float_width(nd_b[cur]) != 0:
+            return cur
+        if tnode != 0 and nd_kind[tnode] == ND_TYPE:
+            if prim_type_size(tnode) < 8:
+                return cur
+        cur = nd_b[cur]
+    return cur
+
+
+# Compute the array-INDEX expression `idx` DIRECTLY into %rcx via the destination-
+# driven selector, scratch-free. Returns 1 if it emitted the whole index into %rcx
+# (caller skips its own gen_expr+mov), 0 to fall back to `gen_expr(idx); mov`.
+def try_sel_index_into_rcx(idx_raw: uint32) -> uint32:
+    if isel_is_enabled() == 0:
+        return 0
+    if idx_raw == 0:
+        return 0
+    # Peel value-identity casts (the `cast[int64](i*N+k)` idiom) to reach the inner
+    # arithmetic; the caller's legacy fallback emits gen_expr(idx_raw) unchanged.
+    idx: uint32 = idx_peel_cast(idx_raw)
+    if idx == 0:
+        return 0
+    if nd_kind[idx] != ND_BINARY:
+        return 0
+    # A float index can never address memory, but guard defensively against a
+    # float arith subtree reaching the integer 2-operand path.
+    if ir_subtree_has_float(idx) != 0:
+        return 0
+    # SCOPED arena sub-region: snapshot the bump pointer so lowering APPENDS above
+    # any outer in-progress tree (re-entrancy safe); restore after emit.
+    saved_count: uint32 = ir_count
+    saved_overflow: uint32 = ir_overflow
+    v: uint32 = ir_lower_pure_expr(idx)
+    if v == 0 or ir_overflow != 0:
+        ir_count = saved_count
+        ir_overflow = saved_overflow
+        return 0
+    if sel_binop_routable(v) == 0:
+        ir_count = saved_count
+        ir_overflow = saved_overflow
+        return 0
+    # PRESERVE THE ADD-CONST-REASSOCIATION LEVER (same carve-out as Phase 1/3): an
+    # ADD root with >=2 constant contributions is collapsed to one immediate by the
+    # legacy gen_expr_ir path; leave it there so the lever still fires.
+    if ir_op[v] == BINOP_ADD:
+        if ir_add_const_count(v) >= 2:
+            ir_count = saved_count
+            ir_overflow = saved_overflow
+            return 0
+    if idx_spine_scratchfree(v) == 0:
+        ir_count = saved_count
+        ir_overflow = saved_overflow
+        return 0
+    # The emit may run inside an outer IR emit; force the re-entrancy flag on so a
+    # deeper leaf-borne binary bounces to AST, and restore the prior value after.
+    prev_active: uint32 = ir_emit_in_progress()
+    saved_cf: uint32 = ir_scratch_tree_callfree
+    if ir_tree_has_call(v) == 0:
+        ir_scratch_tree_callfree = 1
+    else:
+        ir_scratch_tree_callfree = 0
+    ir_emit_enter()
+    sel_expr_into_reg(v, 1)                   # index value -> %rcx (enc 1)
+    if prev_active == 0:
+        ir_emit_leave()
+    ir_scratch_tree_callfree = saved_cf
+    ir_count = saved_count
+    ir_overflow = saved_overflow
+    ir_idxsel_count = ir_idxsel_count + 1
+    return 1
+
+
 # Try the IR-consuming emit path for AST expression `node`. Returns 1 if it
 # emitted the node through the IR (caller is done), 0 if `node` is outside the
 # lowered subset and the caller must fall back to the AST emitter. OFF by
@@ -7355,10 +7518,17 @@ def gen_index_addr(node: uint32):
                 cg_fail(8, node)
                 return
 
-    # Evaluate the index into %rax, move to %rcx, scale, then add the base
-    # address. Result address ends up in %rax.
-    gen_expr(nd_b[node])
-    emit_mov_rax_rcx()
+    # Evaluate the index into %rcx, scale, then add the base address. Result
+    # address ends up in %rax. P1 Phase-2 (index): when --opt is on and the index
+    # is a pure plain-arith binary, compute it DIRECTLY into %rcx via the
+    # destination-driven selector (scratch-free, no value-at-a-time push/pop) —
+    # this retires the IR re-entrancy guard for the index subtree so the matmul-
+    # class `A[i*N+k]` index sum stops round-tripping through the stack. Any shape
+    # the selector does not route (impure index, non-cheap combine, shift/div root)
+    # falls back to the byte-correct legacy `gen_expr(index); mov %rax,%rcx`.
+    if try_sel_index_into_rcx(nd_b[node]) == 0:
+        gen_expr(nd_b[node])
+        emit_mov_rax_rcx()
 
     # ---- ISEL (--opt): fold scale-shift + base-lea/load + add into a single
     # scaled-index `lea`. The index is already in %rcx; the SIB scale field
