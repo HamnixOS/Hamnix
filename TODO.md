@@ -350,8 +350,10 @@ HW (consumer wifi, GPUs) — now crash-isolated.
   today (`arch/x86/kernel/irq.ad`); add bottom-half deferral.
 - [ ] **Per-CPU slab cache** — single global free list contends under
   fork storms (`mm/slab.ad`).
-- [ ] **Buddy merge-on-free** — no coalescing today; fragments over long
-  uptime (`mm/page_alloc.ad`).
+- [x] **Buddy merge-on-free** — DONE: `_free_pages_raw` coalesces XOR-buddies
+  up to `MAX_ORDER` (canonical `__free_one_page`) under the IRQ-safe buddy
+  spinlock (`mm/page_alloc.ad`). Asserting self-test
+  `page_alloc_coalesce_test` + `scripts/test_buddy_coalesce.sh`.
 
 **Deep / punt until measured:** NUMA-node awareness + per-node pools;
 RCU read-side for task/VFS traversal.
