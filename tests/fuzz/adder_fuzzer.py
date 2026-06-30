@@ -223,6 +223,22 @@ def cmp_is_unsigned(a, b):
     return (_gt_is_unsigned(a.gt) is True) or (_gt_is_unsigned(b.gt) is True)
 
 
+def eval_cmp(a, b, op):
+    """Evaluate ONE relational compare `a OP b` exactly as the backend lowers
+    it (and as Gen._compare's oracle does): ==/!= compare the full 64-bit
+    register bits; the ordered compares pick signed vs unsigned per cmp_is_
+    unsigned. Returns a Python bool. Shared by the chained-comparison oracle."""
+    if op == "==":
+        return a.reg == b.reg
+    if op == "!=":
+        return a.reg != b.reg
+    if cmp_is_unsigned(a, b):
+        x, y = a.reg, b.reg
+    else:
+        x, y = _signed64(a.reg), _signed64(b.reg)
+    return {"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[op]
+
+
 def divshift_is_signed(a, b):
     """Mirror codegen _binop_signed_op for / % >>: SIGNED iff some operand is
     known-signed AND none is known-unsigned; UNSIGNED otherwise (the default,
@@ -580,6 +596,7 @@ class Program:
         self._gen_nested_loop_traffic(env)    # nested loops: reset-and-read +
                                               # break/continue/early-return/cross-level
         self._gen_short_circuit_traffic(env)  # logical and/or short-circuit
+        self._gen_chained_compare_traffic(env)  # Python chained comparisons (a<b<c)
         self._gen_cmpjcc_traffic(env)         # cmp; jcc branch-condition lever (--opt)
         self._gen_helper_calls(env)
         self._gen_regpressure_scratch_traffic(env)  # caller-saved IR scratch (--opt)
@@ -1818,6 +1835,43 @@ class Program:
         self._nl_emit_helper(
             fn, "nn: int64, aa: int64, qq: int64", body,
             f"cast[int64]({n}), cast[int64]({a}), cast[int64]({q})", res)
+
+    # ---- chained comparison traffic ------------------------------------------
+    def _gen_chained_compare_traffic(self, env):
+        """Emit Python-style CHAINED comparisons `a OP0 b OP1 c [OP2 d ...]`,
+        which the backend lowers via codegen.ad gen_chained_compare (the seed's
+        gen_chained_compare): semantics `(a OP0 b) and (b OP1 c) and ...`, the
+        middle operand evaluated ONCE and short-circuiting to FALSE on the first
+        failing link. This path was kernel-only (vma_tree_selftest's
+        `(t==0) != (o==0)`) and slipped past the userland objdiff until the
+        native compiler grew the lowering; a regression that reverts to the
+        naive nested `(a OP0 b) OP1 c` (comparing a 0/1 boolean against `c`)
+        computes a different value for most inputs and breaks the oracle.
+
+        Each operand is a pure Gen.expr() (atomic or fully-parenthesized .src),
+        so `a OP0 b OP1 c` always parses left-associatively into the chain the
+        detector recognizes — no precedence surprises. The result is a 0/1
+        boolean folded (as uint64) into g_accum. Both subset and default mode
+        emit byte-identically (same rng stream)."""
+        rng = self.rng
+        OPS = ["<", "<=", ">", ">=", "==", "!="]
+        for _ in range(rng.randint(3, 6)):
+            g = Gen(rng, env)
+            nlinks = rng.randint(2, 4)                 # 2..4 ops => 3..5 operands
+            operands = [g.expr(2) for _ in range(nlinks + 1)]
+            ops = [rng.choice(OPS) for _ in range(nlinks)]
+            parts = [operands[0].src]
+            for i in range(nlinks):
+                parts.append(ops[i])
+                parts.append(operands[i + 1].src)
+            src = " ".join(parts)
+            # Python chained semantics: AND of every link; short-circuit FALSE.
+            res = 1
+            for i in range(nlinks):
+                if not eval_cmp(operands[i], operands[i + 1], ops[i]):
+                    res = 0
+                    break
+            self._fold_value(f"cast[uint64]({src})", U64.wrap(res))
 
     # ---- short-circuit logical and/or traffic --------------------------------
     def _gen_short_circuit_traffic(self, env):

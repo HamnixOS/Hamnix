@@ -2679,6 +2679,13 @@ def emit_pop_rcx():
     emit_b(0x59)
 
 
+# pushq %rcx  -> 51   (save the chained-comparison middle operand value, which
+# lives in %rcx across the next pair's right-operand eval; mirrors
+# codegen_x86.gen_chained_compare's `pushq %rcx`).
+def emit_push_rcx():
+    emit_b(0x51)
+
+
 # movq $imm32, %rax (sign-extended) -> 48 C7 C0 imm32
 # Materialize a 64-bit immediate into %rax. The compact `movq $imm32,%rax`
 # (48 C7 C0 <imm32>) SIGN-EXTENDS its 32-bit immediate to 64 bits, so it can
@@ -2814,6 +2821,37 @@ def emit_mov_rax_rcx():
     emit_b(0x48)
     emit_b(0x89)
     emit_b(0xC1)
+
+
+# movq %rax, %rdx  -> 48 89 C2   (preserve a freshly-evaluated chain right
+# operand while the saved middle value is popped back into %rcx).
+def emit_mov_rax_rdx():
+    emit_b(0x48)
+    emit_b(0x89)
+    emit_b(0xC2)
+
+
+# movq %rcx, %rax  -> 48 89 C8   (chain: restore the middle operand as the LHS).
+def emit_mov_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x89)
+    emit_b(0xC8)
+
+
+# movq %rdx, %rcx  -> 48 89 D1   (chain: place the right operand as the RHS).
+def emit_mov_rdx_rcx():
+    emit_b(0x48)
+    emit_b(0x89)
+    emit_b(0xD1)
+
+
+# xorq %rax, %rax  -> 48 31 C0   (the chained-comparison FALSE result; codegen_x86
+# .gen_chained_compare emits the 64-bit `xorq %rax,%rax` here, distinct from the
+# 32-bit `xorl %eax,%eax` the and/or short-circuit uses).
+def emit_xor_rax_rax():
+    emit_b(0x48)
+    emit_b(0x31)
+    emit_b(0xC0)
 
 
 # negq %rax  -> 48 F7 D8
@@ -6817,10 +6855,142 @@ def ir_scratch_prescan_function(fn: uint32):
     ir_scratch_prescan_node(nd_c[fn])
 
 
+# True iff `node` is a Python-style CHAINED comparison `a OP1 b OP2 c`, parsed
+# left-associatively as BinaryExpr(OP2, BinaryExpr(OP1, a, b), c). Mirrors the
+# "is a chain" predicate inside codegen_x86._unwrap_comparison_chain: the OUTER
+# op is relational AND the LEFT operand is itself a relational ND_BINARY. NOTE:
+# the seed does NOT look at parentheses (the AST cannot distinguish `(a==b)!=c`
+# from `a==b!=c`), so `(t==0) != (o==0)` IS treated as the chain
+# `(t==0) and (0 != (o==0))` — we mirror that exactly for byte-identity.
+def chain_is(node: uint32) -> uint32:
+    if nd_kind[node] != ND_BINARY:
+        return 0
+    if is_rel_binop(nd_aux[node]) == 0:
+        return 0
+    left: uint32 = nd_a[node]
+    if nd_kind[left] != ND_BINARY:
+        return 0
+    if is_rel_binop(nd_aux[left]) == 0:
+        return 0
+    return 1
+
+
+# Emit a single chain-link compare assuming %rax = LHS, %rcx = RHS; result
+# (0/1) lands in %rax. Mirrors codegen_x86._emit_compare_rax_rcx (cmpq %rcx,%rax;
+# setcc %al; movzbq %al,%rax) with the SAME signed/unsigned setcc selection the
+# standard ND_BINARY compare path uses (rel_setcc over the operand signedness).
+def emit_chain_cmp(left_node: uint32, op: uint32, right_node: uint32):
+    l_sgn: uint32 = expr_signedness(left_node)
+    r_sgn: uint32 = expr_signedness(right_node)
+    emit_cmp_rcx_rax()
+    if op == BINOP_EQ:
+        emit_setcc_al(0x94)
+    elif op == BINOP_NEQ:
+        emit_setcc_al(0x95)
+    elif op == BINOP_LT:
+        emit_setcc_al(rel_setcc(0x9C, l_sgn, r_sgn))
+    elif op == BINOP_LTE:
+        emit_setcc_al(rel_setcc(0x9E, l_sgn, r_sgn))
+    elif op == BINOP_GT:
+        emit_setcc_al(rel_setcc(0x9F, l_sgn, r_sgn))
+    elif op == BINOP_GTE:
+        emit_setcc_al(rel_setcc(0x9D, l_sgn, r_sgn))
+    else:
+        cg_fail(1, left_node)
+    emit_movzx_al_rax()
+
+
+# Lower a Python-style chained comparison to byte-identical x86_64, mirroring
+# codegen_x86.gen_chained_compare. The chain `(e0 op0 e1) op1 e2 op2 ...` has
+# semantics `(e0 op0 e1) and (e1 op1 e2) and ...`, evaluating each middle
+# operand ONCE (kept live in %rcx) and short-circuiting to FALSE on the first
+# failing link. Layout per the seed:
+#     <eval e1>; pushq %rax; <eval e0>; popq %rcx; cmp/setcc -> %rax
+#     testq %rax,%rax; jz false
+#     # per subsequent pair (LHS = previous RHS, already in %rcx):
+#     pushq %rcx; <eval right>; movq %rax,%rdx; popq %rcx
+#     movq %rcx,%rax; movq %rdx,%rcx; cmp/setcc -> %rax
+#     testq %rax,%rax; jz false
+#     movq $1,%rax; jmp end
+#   false: xorq %rax,%rax
+#   end:
+def gen_chained_compare(node: uint32):
+    # Collect the comparison spine outermost-first: spine[0]=node (=S_{D-1}),
+    # spine[depth-1]=the deepest (leftmost) relational ND_BINARY (=S_0).
+    spine: Array[64, uint32]
+    depth: uint32 = 0
+    cur: uint32 = node
+    while depth < cast[uint32](64):
+        spine[depth] = cur
+        depth = depth + 1
+        lf: uint32 = nd_a[cur]
+        if nd_kind[lf] == ND_BINARY and is_rel_binop(nd_aux[lf]) != 0:
+            cur = lf
+        else:
+            break
+
+    false_fix: Array[64, uint32]
+    nfalse: uint32 = 0
+
+    # Pair 0 = (nd_a[S_0], nd_aux[S_0], nd_b[S_0]); S_0 = spine[depth-1].
+    s0: uint32 = spine[depth - 1]
+    expr0: uint32 = nd_a[s0]
+    op0: uint32 = nd_aux[s0]
+    expr1: uint32 = nd_b[s0]
+    gen_expr(expr1)
+    emit_push_rax()
+    gen_expr(expr0)
+    emit_pop_rcx()
+    emit_chain_cmp(expr0, op0, expr1)
+    emit_test_rax_rax()
+    false_fix[nfalse] = emit_jz_fwd()
+    nfalse = nfalse + 1
+
+    # Pairs 1..depth-1. For pair j the LHS is the previous pair's RHS, already
+    # live in %rcx: left_j = nd_b[S_{j-1}] = nd_b[spine[depth-j]];
+    # right_j = nd_b[S_j] = nd_b[spine[depth-1-j]]; op_j = nd_aux[spine[depth-1-j]].
+    j: uint32 = 1
+    while j < depth:
+        sj: uint32 = spine[depth - 1 - j]
+        left_j: uint32 = nd_b[spine[depth - j]]
+        op_j: uint32 = nd_aux[sj]
+        right_j: uint32 = nd_b[sj]
+        emit_push_rcx()
+        gen_expr(right_j)
+        emit_mov_rax_rdx()
+        emit_pop_rcx()
+        emit_mov_rcx_rax()
+        emit_mov_rdx_rcx()
+        emit_chain_cmp(left_j, op_j, right_j)
+        emit_test_rax_rax()
+        false_fix[nfalse] = emit_jz_fwd()
+        nfalse = nfalse + 1
+        j = j + 1
+
+    emit_mov_imm_rax(cast[uint64](1))
+    e1: uint32 = emit_jmp_fwd()
+    # false_label: every failing link jumps here.
+    kf: uint32 = 0
+    while kf < nfalse:
+        patch_rel32(false_fix[kf], code_len)
+        kf = kf + 1
+    emit_xor_rax_rax()
+    # end_label.
+    patch_rel32(e1, code_len)
+
+
 def gen_expr(node: uint32):
     if node == 0:
         return
     k: uint32 = nd_kind[node]
+
+    # Chained comparison `a OP1 b OP2 c` (Python semantics: `(a OP1 b) and
+    # (b OP2 c)`) — detect and lower BEFORE the IR/arith paths, exactly as
+    # codegen_x86.gen_binary delegates to gen_chained_compare first.
+    if k == ND_BINARY:
+        if chain_is(node) != 0:
+            gen_chained_compare(node)
+            return
 
     # Phase-5: under --opt, try emitting a pure signedness-invariant arithmetic
     # subtree THROUGH the IR (AST -> IR -> fold -> emit). Inert by default.
