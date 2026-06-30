@@ -82,6 +82,18 @@ extern def sys_open(path: Ptr[char]) -> int32
 extern def sys_open_write(path: Ptr[char]) -> int32
 extern def sys_exit(code: uint64)
 extern def sys_pipe(fds: Ptr[int32]) -> int32
+# HAMSH §7 stdio-as-named-channels. sys_pipechan() allocates a kernel
+# pipe and returns its slot; sys_fdbind binds one end of that pipe at an
+# /fd/N NAME in pid's namespace (pid 0 = self). DEVFD_PIPE_R / _PIPE_W
+# pick the read / write end. This is the same primitive hamsh's own
+# pipelines and user/haminstallui.ad use to wire a child's stdio.
+extern def sys_pipechan() -> int32
+extern def sys_fdbind(pid: int32, fdnum: int32, kind: int32, slot: int32) -> int32
+# Bind the fd device `#d` at the name /fd so /fd/N resolves (HAMSH §7).
+# sshd's parent (the ssh selftest /init, or init's svc supervisor) does
+# not necessarily bind /fd, so sshd must ensure it itself before it can
+# sys_open the scratch /fd/N names it wires the session pipes through.
+extern def sys_bind(newp: Ptr[char], oldp: Ptr[char], flag: int32) -> int32
 extern def sys_get_jiffies() -> uint64
 extern def sys_getpid() -> int32
 extern def sys_yield() -> int32
@@ -89,6 +101,13 @@ extern def sys_yield() -> int32
 
 # Guest port the daemon listens on. SSH's well-known port.
 SSHD_PORT: uint64 = 22
+
+# spawn() stdio mode + fd-bind channel kinds (match lib/p9 + syscall.ad).
+# SPAWN_STDIO_NS routes the child's integer fd 0/1/2 through its /fd/0,1,2
+# NAMES so a parent sys_fdbind on the child's pid steers them.
+SPAWN_STDIO_NS: int32 = -2
+DEVFD_PIPE_R:   int32 = 2        # bind the READ end of a pipe slot
+DEVFD_PIPE_W:   int32 = 3        # bind the WRITE end of a pipe slot
 
 # SSH packet message-type codes (RFC 4253 / 4252 / 4254).
 SSH_MSG_DISCONNECT:       uint8 = 1
@@ -203,11 +222,29 @@ chan_remote_id: Array[1, uint32] # the client's channel number
 chan_remote_win: Array[1, uint64]    # bytes we may still send the client
 chan_local_win: Array[1, uint64]     # bytes the client may still send us
 
-# hamsh bridge: two pipes + the child pid.
-pipe_in: Array[2, int32]         # sshd writes [1], hamsh reads [0]
-pipe_out: Array[2, int32]        # hamsh writes [1], sshd reads [0]
+# hamsh bridge. Plan-9-shape stdio: hamsh routes its integer fd 0/1/2
+# through the /fd/0,1,2 NAMES (HAMSH §7), so we wire the channel pipes
+# at those NAMES via sys_fdbind on the just-rforked child pid — NOT via
+# legacy dup'd integer fds. The integer-fd path is broken for hamsh:
+# its startup getty-flush SKIP test queries the /fd/0 NAME (sys_fdslot_
+# kind), but its reads use integer fd 0 — so a dup2'd pipe whose /fd/0
+# name still reads "cons" is NOT recognised as a pipe and the flush
+# drains+discards the very `exec` command we wrote (the round-trip
+# silently never ran). Binding /fd/0 = PIPE_R makes the skip fire and
+# the command survive. See _spawn_shell.
+#   sh_in_fd  : sshd's WRITE end of hamsh's stdin pipe  (/fd/0 = PIPE_R)
+#   sh_out_fd : sshd's READ  end of hamsh's stdout pipe (/fd/1,2 = PIPE_W)
+sh_in_fd:  Array[1, int32]
+sh_out_fd: Array[1, int32]
 shell_pid: Array[1, int32]
 shell_argv: Array[2, uint64]
+
+# Scratch /fd/N NAME indices for sshd's OWN ends of the two pipes. These
+# are namespace names in sshd's namespace (NOT hamsh's); we bind a pipe
+# end at the name then sys_open it to get an ordinary integer fd. Chosen
+# clear of fd 0/1/2 and any low inherited fds.
+SSHD_STDIN_W_NAME:  int32 = 13   # /fd/13 — sshd's write end -> hamsh stdin
+SSHD_STDOUT_R_NAME: int32 = 14   # /fd/14 — sshd's read end  <- hamsh stdout
 
 # `exec` request command. When the client requests `exec "<cmd>"`
 # (the form `ssh host <cmd>` uses) the command lands here so the
@@ -224,6 +261,20 @@ enc_len_buf: Array[4, uint8]
 
 # Channel-data staging.
 chan_data: Array[2048, uint8]
+
+# Packet-framing scratch buffers. These are ~8 KiB each and MUST live at
+# module scope, NOT on the stack: the native user stack is only one 4 KiB
+# page (USTACK_SIZE), so an 8 KiB on-stack frame overflows it instantly
+# (a write-perm SIGSEGV on the guard page below the stack). Honouring the
+# file-header convention ("Every sizable buffer is a top-level-BSS Array")
+# keeps the recv/send packet helpers within the tiny user stack. sshd is
+# single-threaded with one connection in flight, so a shared module-global
+# scratch set is safe (send and recv are never concurrent; within a single
+# recv, ct/macbuf/plain hold distinct live data).
+fr_body:   Array[8200, uint8]      # _recv_packet_plain plaintext body
+enc_ct:    Array[8260, uint8]      # encrypted ciphertext on the wire
+enc_plain: Array[8260, uint8]      # decrypted / pre-encryption plaintext
+enc_macbuf: Array[8264, uint8]     # length||ct buffer for the Poly1305 MAC
 
 
 # === tiny helpers ========================================================
@@ -425,14 +476,13 @@ def _recv_packet_plain() -> int32:
     if pkt_len < 8 or pkt_len > 8192:
         _log("[sshd] bad packet length\n")
         return -1
-    body: Array[8200, uint8]
-    if _recv_exact(&body[0], cast[uint64](pkt_len)) != 0:
+    if _recv_exact(&fr_body[0], cast[uint64](pkt_len)) != 0:
         return -1
-    pad: uint64 = cast[uint64](body[0])
+    pad: uint64 = cast[uint64](fr_body[0])
     if pad + 1 > cast[uint64](pkt_len):
         return -1
     plen: uint64 = cast[uint64](pkt_len) - 1 - pad
-    _memcpy(&pkt_in[0], cast[Ptr[uint8]](&body[1]), plen)
+    _memcpy(&pkt_in[0], cast[Ptr[uint8]](&fr_body[1]), plen)
     pkt_in_len[0] = plen
     seq_in[0] = seq_in[0] + 1
     return 0
@@ -469,12 +519,11 @@ def _send_packet_enc(payload: Ptr[uint8], plen: uint64) -> int32:
         pad = pad + block
     pkt_len: uint64 = 1 + plen + pad
     # Plaintext packet body = padding_length || payload || padding.
-    plain: Array[8260, uint8]
-    plain[0] = cast[uint8](pad)
-    _memcpy(cast[Ptr[uint8]](&plain[1]), payload, plen)
+    enc_plain[0] = cast[uint8](pad)
+    _memcpy(cast[Ptr[uint8]](&enc_plain[1]), payload, plen)
     i: uint64 = 0
     while i < pad:
-        plain[1 + plen + i] = 0
+        enc_plain[1 + plen + i] = 0
         i = i + 1
     _seq_to_nonce(seq_out[0])
     # Encrypt the 4-byte length with K_1, counter 0.
@@ -490,7 +539,7 @@ def _send_packet_enc(payload: Ptr[uint8], plen: uint64) -> int32:
     ssh_chacha20_xor(cast[Ptr[uint8]](&key_s2c[0]), cast[uint64](1),
                      &seq_nonce[0],
                      cast[Ptr[uint8]](&frame_out[4]),
-                     &plain[0], pkt_len)
+                     &enc_plain[0], pkt_len)
     # MAC over encrypted_length || encrypted_payload.
     total_ct: uint64 = 4 + pkt_len
     ssh_poly1305(cast[Ptr[uint8]](&frame_out[total_ct]),
@@ -516,8 +565,7 @@ def _recv_packet_enc() -> int32:
         _log("[sshd] bad encrypted packet length\n")
         return -1
     # Read encrypted_payload + the 16-byte MAC.
-    ct: Array[8260, uint8]
-    if _recv_exact(&ct[0], cast[uint64](pkt_len)) != 0:
+    if _recv_exact(&enc_ct[0], cast[uint64](pkt_len)) != 0:
         return -1
     rxmac: Array[16, uint8]
     if _recv_exact(&rxmac[0], cast[uint64](16)) != 0:
@@ -525,24 +573,22 @@ def _recv_packet_enc() -> int32:
     # Recompute the Poly1305 key + MAC over encrypted_length||payload.
     ssh_chacha20_keystream(cast[Ptr[uint8]](&key_c2s[0]), cast[uint64](0),
                            &seq_nonce[0], &poly_key[0], cast[uint64](64))
-    macbuf: Array[8264, uint8]
-    _memcpy(&macbuf[0], &enc_len_buf[0], cast[uint64](4))
-    _memcpy(cast[Ptr[uint8]](&macbuf[4]), &ct[0], cast[uint64](pkt_len))
-    ssh_poly1305(&mac_calc[0], &poly_key[0], &macbuf[0],
+    _memcpy(&enc_macbuf[0], &enc_len_buf[0], cast[uint64](4))
+    _memcpy(cast[Ptr[uint8]](&enc_macbuf[4]), &enc_ct[0], cast[uint64](pkt_len))
+    ssh_poly1305(&mac_calc[0], &poly_key[0], &enc_macbuf[0],
                  4 + cast[uint64](pkt_len))
     if _memeq(&mac_calc[0], &rxmac[0], cast[uint64](16)) == 0:
         _log("[sshd] MAC verify failed\n")
         return -1
     # Decrypt the body with K_2, counter from 1.
-    plain: Array[8260, uint8]
     ssh_chacha20_xor(cast[Ptr[uint8]](&key_c2s[0]), cast[uint64](1),
-                     &seq_nonce[0], &plain[0], &ct[0],
+                     &seq_nonce[0], &enc_plain[0], &enc_ct[0],
                      cast[uint64](pkt_len))
-    pad: uint64 = cast[uint64](plain[0])
+    pad: uint64 = cast[uint64](enc_plain[0])
     if pad + 1 > cast[uint64](pkt_len):
         return -1
     plen: uint64 = cast[uint64](pkt_len) - 1 - pad
-    _memcpy(&pkt_in[0], cast[Ptr[uint8]](&plain[1]), plen)
+    _memcpy(&pkt_in[0], cast[Ptr[uint8]](&enc_plain[1]), plen)
     pkt_in_len[0] = plen
     seq_in[0] = seq_in[0] + 1
     return 0
@@ -1524,31 +1570,54 @@ def _send_window_adjust(amount: uint32) -> int32:
 
 
 def _spawn_shell() -> int32:
-    # Two pipes + spawn hamsh wired to them.
-    #   pipe_in : sshd writes [1]  ->  hamsh reads  [0] as stdin
-    #   pipe_out: hamsh writes [1] ->  sshd reads   [0]
-    if sys_pipe(&pipe_in[0]) != 0:
-        _log("[sshd] pipe (stdin) failed\n")
+    # Wire hamsh's stdio via the Plan-9 /fd-NAME path (HAMSH §7), the
+    # same primitive user/haminstallui.ad + hamsh's own pipelines use.
+    # Two kernel pipes:
+    #   pin  : sshd WRITE end  -> hamsh /fd/0 (PIPE_R)  = hamsh stdin
+    #   pout : hamsh /fd/1,2 (PIPE_W) -> sshd READ end  = hamsh stdout/err
+    # We MUST bind the child's /fd/0 = PIPE_R (not a dup'd integer fd):
+    # hamsh's getty-flush skip test reads the /fd/0 NAME kind, so an
+    # integer-only pipe is mis-seen as "cons" and the flush eats the
+    # exec command. See the bridge globals note above.
+    pin_slot: int32 = sys_pipechan()
+    if pin_slot < 0:
+        _log("[sshd] pipechan (stdin) failed\n")
         return -1
-    if sys_pipe(&pipe_out[0]) != 0:
-        _log("[sshd] pipe (stdout) failed\n")
+    pout_slot: int32 = sys_pipechan()
+    if pout_slot < 0:
+        _log("[sshd] pipechan (stdout) failed\n")
+        return -1
+    # sshd's own ends: bind at scratch /fd NAMES in OUR namespace, then
+    # open them to ordinary integer fds we read/write in the bridge.
+    sys_fdbind(0, SSHD_STDIN_W_NAME, DEVFD_PIPE_W, pin_slot)
+    sh_in_fd[0] = sys_open(cast[Ptr[char]]("/fd/13"))
+    if sh_in_fd[0] < 0:
+        _log("[sshd] open sshd stdin-write end failed\n")
+        return -1
+    sys_fdbind(0, SSHD_STDOUT_R_NAME, DEVFD_PIPE_R, pout_slot)
+    sh_out_fd[0] = sys_open(cast[Ptr[char]]("/fd/14"))
+    if sh_out_fd[0] < 0:
+        _log("[sshd] open sshd stdout-read end failed\n")
         return -1
     shell_argv[0] = cast[uint64](&"/bin/hamsh"[0])
     shell_argv[1] = 0
+    # SPAWN_STDIO_NS: the child routes integer 0/1/2 through /fd/0,1,2,
+    # which our post-spawn binds (below) retarget. The child is
+    # STATE_READY until we yield, so the binds land before it runs.
     pid: int32 = spawn(cast[Ptr[char]]("/bin/hamsh"),
                            &shell_argv[0],
-                           pipe_in[0], pipe_out[1],
+                           SPAWN_STDIO_NS, SPAWN_STDIO_NS,
                            cast[Ptr[uint64]](0))
     if pid < 0:
         _log("[sshd] spawn hamsh failed\n")
         return -1
     shell_pid[0] = pid
-    # Close our copies of the ends hamsh now owns. spawn dup'd
-    # pipe_in[0] into hamsh's fd 0 and pipe_out[1] into its fd 1; if we
-    # keep our own copies open, pipe_out still has a live writer (us)
-    # after hamsh exits, so the bridge's EOF probe would never fire.
-    sys_close(pipe_in[0])
-    sys_close(pipe_out[1])
+    # Bind the child's stdio NAMES: stdin = pin read end, stdout AND
+    # stderr = pout write end (so hamsh's diagnostics/heartbeat also
+    # reach the client rather than the kernel console).
+    sys_fdbind(pid, 0, DEVFD_PIPE_R, pin_slot)
+    sys_fdbind(pid, 1, DEVFD_PIPE_W, pout_slot)
+    sys_fdbind(pid, 2, DEVFD_PIPE_W, pout_slot)
     _log("[sshd] hamsh spawned for SSH session\n")
     return 0
 
@@ -1695,7 +1764,7 @@ def _handle_connection() -> int32:
                 # runs it and then terminates — that gives the client
                 # a clean channel close.
                 if has_exec_cmd[0] != 0:
-                    sys_write(pipe_in[1], &exec_cmd[0], exec_cmd_len[0])
+                    sys_write(sh_in_fd[0], &exec_cmd[0], exec_cmd_len[0])
                     nl: Array[6, uint8]
                     nl[0] = 10                       # '\n'
                     nl[1] = 101                      # 'e'
@@ -1703,7 +1772,7 @@ def _handle_connection() -> int32:
                     nl[3] = 105                      # 'i'
                     nl[4] = 116                      # 't'
                     nl[5] = 10                       # '\n'
-                    sys_write(pipe_in[1], &nl[0], cast[uint64](6))
+                    sys_write(sh_in_fd[0], &nl[0], cast[uint64](6))
                 return _bridge_session()
             # Any other channel request: refuse if a reply is wanted.
             if want_reply != 0:
@@ -1794,7 +1863,7 @@ def _bridge_session() -> int32:
                 dlen: uint32 = _get_u32(&pkt_in[0], 5)
                 # Write the channel data into hamsh's stdin.
                 wptr: Ptr[uint8] = cast[Ptr[uint8]](&pkt_in[9])
-                sys_write(pipe_in[1], wptr, cast[uint64](dlen))
+                sys_write(sh_in_fd[0], wptr, cast[uint64](dlen))
                 # Replenish the client's send window so it keeps
                 # talking (we consumed dlen of it).
                 chan_local_win[0] = chan_local_win[0] - cast[uint64](dlen)
@@ -1807,7 +1876,7 @@ def _bridge_session() -> int32:
             elif mt == SSH_MSG_CHANNEL_EOF:
                 # Client closed its input — close hamsh's stdin.
                 if eof_sent == 0:
-                    sys_close(pipe_in[1])
+                    sys_close(sh_in_fd[0])
                     eof_sent = 1
             elif mt == SSH_MSG_CHANNEL_CLOSE or mt == SSH_MSG_DISCONNECT:
                 if mt == SSH_MSG_DISCONNECT:
@@ -1826,7 +1895,7 @@ def _bridge_session() -> int32:
                 pass
 
         # --- 2. hamsh stdout -> SSH channel --------------------------
-        n: int64 = sys_read_nb(pipe_out[0], &chan_data[0],
+        n: int64 = sys_read_nb(sh_out_fd[0], &chan_data[0],
                                cast[uint64](2048))
         if n > 0:
             if _send_channel_data(cast[uint64](n)) != 0:
@@ -1857,16 +1926,16 @@ def _bridge_session() -> int32:
 
     # Close every pipe fd this bridge still owns, regardless of which
     # branch broke us out of the loop. Each SSH session allocates two
-    # pipes in _spawn_shell (pipe_in[1] = sshd's write to hamsh stdin,
-    # pipe_out[0] = sshd's read from hamsh stdout). Without an
+    # pipes in _spawn_shell (sh_in_fd = sshd's write to hamsh stdin,
+    # sh_out_fd = sshd's read from hamsh stdout). Without an
     # unconditional cleanup here, a session that ended via the normal
     # "hamsh exited" branch (or via the long-idle break) leaks both fds
     # — after a few sessions the kernel runs out of pipe slots and
-    # every new connection's sys_pipe() returns "out of slots".
+    # every new connection's pipe alloc returns "out of slots".
     if eof_sent == 0:
-        sys_close(pipe_in[1])
+        sys_close(sh_in_fd[0])
         eof_sent = 1
-    sys_close(pipe_out[0])
+    sys_close(sh_out_fd[0])
     return 0
 
 
@@ -1962,30 +2031,27 @@ def _recv_packet_enc_peek() -> int32:
     pkt_len: uint32 = _get_u32(&declen[0], 0)
     if pkt_len < 8 or pkt_len > 8192:
         return -1
-    ct: Array[8260, uint8]
-    if _recv_exact(&ct[0], cast[uint64](pkt_len)) != 0:
+    if _recv_exact(&enc_ct[0], cast[uint64](pkt_len)) != 0:
         return -1
     rxmac: Array[16, uint8]
     if _recv_exact(&rxmac[0], cast[uint64](16)) != 0:
         return -1
     ssh_chacha20_keystream(cast[Ptr[uint8]](&key_c2s[0]), cast[uint64](0),
                            &seq_nonce[0], &poly_key[0], cast[uint64](64))
-    macbuf: Array[8264, uint8]
-    _memcpy(&macbuf[0], &enc_len_buf[0], cast[uint64](4))
-    _memcpy(cast[Ptr[uint8]](&macbuf[4]), &ct[0], cast[uint64](pkt_len))
-    ssh_poly1305(&mac_calc[0], &poly_key[0], &macbuf[0],
+    _memcpy(&enc_macbuf[0], &enc_len_buf[0], cast[uint64](4))
+    _memcpy(cast[Ptr[uint8]](&enc_macbuf[4]), &enc_ct[0], cast[uint64](pkt_len))
+    ssh_poly1305(&mac_calc[0], &poly_key[0], &enc_macbuf[0],
                  4 + cast[uint64](pkt_len))
     if _memeq(&mac_calc[0], &rxmac[0], cast[uint64](16)) == 0:
         return -1
-    plain: Array[8260, uint8]
     ssh_chacha20_xor(cast[Ptr[uint8]](&key_c2s[0]), cast[uint64](1),
-                     &seq_nonce[0], &plain[0], &ct[0],
+                     &seq_nonce[0], &enc_plain[0], &enc_ct[0],
                      cast[uint64](pkt_len))
-    pad: uint64 = cast[uint64](plain[0])
+    pad: uint64 = cast[uint64](enc_plain[0])
     if pad + 1 > cast[uint64](pkt_len):
         return -1
     plen: uint64 = cast[uint64](pkt_len) - 1 - pad
-    _memcpy(&pkt_in[0], cast[Ptr[uint8]](&plain[1]), plen)
+    _memcpy(&pkt_in[0], cast[Ptr[uint8]](&enc_plain[1]), plen)
     pkt_in_len[0] = plen
     seq_in[0] = seq_in[0] + 1
     return 0
@@ -2035,6 +2101,9 @@ def main() -> int32:
     # Bring up the crypto constant tables.
     p256_init()
     ecdsa_init()
+    # HAMSH §7: ensure /fd resolves so we can wire each session's hamsh
+    # stdio through scratch /fd/N names (see _spawn_shell). MREPL flag = 0.
+    sys_bind(cast[Ptr[char]]("/fd"), cast[Ptr[char]]("#d"), 0)
     if _init_host_key() != 0:
         _log("[sshd] FATAL: no host key available\n")
         return 1
