@@ -995,6 +995,24 @@ STATE_WAIT: uint64 = 6
 # missing fds) could be dispatched mid-construction.
 STATE_EMBRYO: uint64 = 7
 
+# Reclaim done, slot awaiting its RCU grace-period free. task_reap has
+# already released ALL of the dead task's resources (address space, stacks,
+# pid mapping) and call_rcu'd the final STATE_FREE publish, but the slot
+# cannot be flipped FREE until a grace period elapses (a lock-free reader may
+# still hold a pointer into it — see the RCU-DEFERRED SLOT RECLAIM note in
+# task_reap). The OLD code left the slot STATE_EXITED across that window,
+# which let a SECOND reaper (reap_orphan_zombies runs on every fork; do_wait4;
+# the thread-group zombie sweep) re-match it as a fresh zombie and reap it
+# AGAIN — queuing a duplicate call_rcu whose callback PUSHED the same slot to
+# the freelist twice. A double-push cross-links the intrusive freelist into a
+# cycle; subsequent pops then collapse free_head to FL_NIL while hundreds of
+# slots are genuinely STATE_FREE, so create_*_task spuriously fails with "no
+# free task slot" (observed at DE boot: scene clients dying with
+# "command not found: /bin/hamX"). STATE_REAPING is non-FREE (readers still
+# see a stable body) and is NOT STATE_EXITED, so every zombie scan skips it —
+# a reaped task is reaped EXACTLY ONCE. The RCU callback flips it to FREE.
+STATE_REAPING: uint64 = 8
+
 # Per-task kernel stack. 64 KiB (16 pages, buddy order 4). The deepest
 # in-kernel call chain is NOT a single 4 KiB page — three distinct
 # chains have overrun smaller stacks:
@@ -1169,6 +1187,20 @@ FL_NIL:      uint64 = 0xFFFFFFFFFFFFFFFF
 fl_next:     Array[512, uint64]    # NTASKS-sized
 free_head:   uint64 = 0xFFFFFFFFFFFFFFFF   # FL_NIL until sched_init() builds it
 free_inited: uint64 = 0
+# SMP: the free-slot list (free_head + fl_next[]) is mutated from BOTH the
+# alloc path (_free_list_pop in create_*_task, syscall/process context) AND
+# the reclaim path (_free_list_push from task_reap / the RCU slot callback,
+# which fires off the timer-IRQ-driven rcu_advance_gp). On a multi-CPU box
+# those run concurrently on different CPUs with no other shared lock, and the
+# unlocked read-modify-write on free_head raced: a pop and a push interleaving
+# dropped slots out of the list. The freelist would shrink to FL_NIL while
+# HUNDREDS of slots were genuinely STATE_FREE — _find_free_slot then returned
+# -1 ("no free task slot") and the spawn failed (observed at DE boot: a
+# nondeterministic subset of scene clients died with "command not found:
+# /bin/hamX"). This lock makes every freelist mutation atomic; IRQs are
+# masked while it is held so the timer-IRQ RCU push can never deadlock against
+# a process-context pop on the same CPU.
+freelist_lock: uint32 = 0
 
 # --- (2) pid -> slot hash -------------------------------------------
 # Open-addressed (linear-probe) hash sized at 2*NTASKS so the load factor
@@ -2795,6 +2827,18 @@ def _free_list_init():
     # behaviour where _find_free_slot returned the LOWEST free slot first,
     # which several callers (and tests reading /proc by ascending pid)
     # implicitly relied on.
+    fl: uint64 = local_irq_save()
+    spinlock_lock(&freelist_lock)
+    _free_list_init_locked()
+    spinlock_unlock(&freelist_lock)
+    local_irq_restore(fl)
+
+
+def _free_list_init_locked():
+    # Unlocked freelist build — caller holds freelist_lock (or runs
+    # single-threaded at sched_init). Slots pushed in descending order so the
+    # head ends up being slot 1 (lowest-first alloc, which /proc-by-pid tests
+    # rely on). Slot 0 (boot task) is never on the list.
     if free_inited != 0:
         return
     free_inited = 1
@@ -2811,21 +2855,33 @@ def _free_list_push(slot: uint64):
     # PARKED idle-kthread slots are also never pushed here (they are not
     # reaped). Guarded against double-push by the caller's state machine
     # (a slot is pushed exactly once, on its FREE transition).
+    # SMP: serialise against concurrent pop/push (see freelist_lock).
     if slot == 0 or slot >= NTASKS:
         return
+    fl: uint64 = local_irq_save()
+    spinlock_lock(&freelist_lock)
     fl_next[slot] = free_head
     free_head = slot
+    spinlock_unlock(&freelist_lock)
+    local_irq_restore(fl)
 
 
 def _free_list_pop() -> int32:
     # Pop the head free slot, or -1 if none. O(1).
+    # SMP: serialise against concurrent pop/push (see freelist_lock).
+    fl: uint64 = local_irq_save()
+    spinlock_lock(&freelist_lock)
     if free_inited == 0:
-        _free_list_init()
+        _free_list_init_locked()
     if free_head == FL_NIL:
+        spinlock_unlock(&freelist_lock)
+        local_irq_restore(fl)
         return -1
     s: uint64 = free_head
     free_head = fl_next[s]
     fl_next[s] = FL_NIL
+    spinlock_unlock(&freelist_lock)
+    local_irq_restore(fl)
     return cast[int32](s)
 
 
@@ -6198,6 +6254,13 @@ def _task_slot_rcu_free(head: uint64):
     su: uint64 = hp[1]
     if su >= NTASKS:
         return
+    # Defence-in-depth against a double free of the slot: only a slot still in
+    # STATE_REAPING (set by task_reap right before it call_rcu'd this callback)
+    # is eligible to be published FREE + pushed. If it is anything else the
+    # callback already ran (or the slot was recycled) — skip, so the freelist
+    # is never double-pushed (the cycle-corruption root cause).
+    if task_table[su].state != STATE_REAPING:
+        return
     task_table[su].state = STATE_FREE
     _free_list_push(su)
     nr_task_slots_rcu_freed = nr_task_slots_rcu_freed + 1
@@ -6270,6 +6333,18 @@ def task_reap(slot: int32):
     # never on the child's own stack — so freeing the child's stacks
     # here is safe.
     su: uint64 = cast[uint64](slot)
+    # REAP-ONCE GUARD (root-cause fix for the freelist double-push / DE-boot
+    # "no free task slot" miscompile): only an EXITED zombie is reapable. A
+    # slot already in post-reap RCU limbo (STATE_REAPING) — or otherwise not a
+    # zombie (FREE/READY/RUNNING/...) — must NOT be reaped again: a second
+    # reap would free its (already-freed) resources and, fatally, queue a
+    # SECOND call_rcu whose callback pushes the SAME slot onto the freelist
+    # twice, cross-linking it into a cycle. reap_orphan_zombies runs on EVERY
+    # fork and rescans STATE_EXITED, so without this guard a detached zombie
+    # gets re-reaped on every fork during the window between task_reap and its
+    # RCU-grace-period free. Idempotent: a non-EXITED slot is a no-op.
+    if task_table[su].state != STATE_EXITED:
+        return
     # SMP reap fence: with user tasks load-balanced across CPUs, the zombie
     # we are about to reclaim may have run (and EXITED) on a DIFFERENT cpu
     # than this reaping parent. task_exit_current raises the zombie's on_cpu
@@ -6609,13 +6684,19 @@ def task_reap(slot: int32):
     # claimed the slot, the reader would observe a half-overwritten struct
     # (a torn pid/state) — the classic use-after-free RCU exists to prevent.
     #
-    # Instead leave the slot in its post-reap limbo (STATE_EXITED body intact,
-    # NOT on the freelist, NOT yet FREE — so _find_free_slot's STATE_FREE scan
-    # and the O(1) freelist both skip it) and call_rcu the actual publish. The
-    # callback _task_slot_rcu_free runs only after a grace period, by which
-    # time every reader that could have observed this slot as live has exited
-    # its rcu_read_lock section. THEN it is safe to flip STATE_FREE + enqueue
-    # on the freelist for reuse. This is the one real hot read path proving RCU.
+    # Instead move the slot to STATE_REAPING (post-reap limbo: body intact, NOT
+    # on the freelist, NOT yet FREE — so _find_free_slot's STATE_FREE scan and
+    # the O(1) freelist both skip it) and call_rcu the actual publish. Crucially
+    # STATE_REAPING is NOT STATE_EXITED, so the REAP-ONCE guard above makes any
+    # repeat reaper (reap_orphan_zombies on the next fork, a late do_wait4, the
+    # thread-group zombie sweep) skip this slot — it is reaped EXACTLY once, so
+    # call_rcu fires exactly once and the slot is pushed to the freelist exactly
+    # once. The callback _task_slot_rcu_free runs only after a grace period, by
+    # which time every reader that could have observed this slot as live has
+    # exited its rcu_read_lock section. THEN it is safe to flip STATE_FREE +
+    # enqueue on the freelist for reuse. This is the one real hot read path
+    # proving RCU.
+    task_table[su].state = STATE_REAPING
     task_table[su].rcu_head_slot = su
     call_rcu(cast[uint64](&task_table[su].rcu_head_next),
              cast[uint64](_task_slot_rcu_free))
