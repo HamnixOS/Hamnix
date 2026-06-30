@@ -149,13 +149,40 @@ try:
     if not synced:
         print("DRIVER: SERIAL_SYNC never echoed", file=sys.stderr)
 
-    send("enter linux { sh }")
-    time.sleep(5)
-    for _ in range(6):
-        send("echo ENTER_LINUX_SH_OK")
-        time.sleep(2.0)
-        if b"ENTER_LINUX_SH_OK" in snap():
+    # Enter the Linux-ns busybox shell. HARNESS HARDENING: the entry line
+    # itself can be dropped by a freshly-busy readline (the known
+    # first-command-drop), so don't fire it once and hope — re-send
+    # `enter linux { sh }` until the busybox shell is provably interactive,
+    # gating on a marker that ONLY a real busybox can produce. hamsh has a
+    # builtin `echo`, so an echoed ENTER_LINUX_SH_OK alone does NOT prove
+    # the linux shell owns the serial line (it can be faked by the outer
+    # hamsh if enter-linux silently fell back). hamsh has no `busybox`
+    # builtin and there is no native busybox on $PATH, so the BusyBox
+    # version banner is an un-fakeable keystone: it appears iff a real
+    # Linux sh is reading our input.
+    interactive = False
+    for _ in range(12):
+        send("enter linux { sh }")
+        time.sleep(4)
+        # Probe from INSIDE the entered shell. `busybox | head -1` prints
+        # the "BusyBox vX.Y.Z" banner — the keystone — and `echo` gives a
+        # fast positive for the retry loop.
+        for _ in range(6):
+            send("echo ENTER_LINUX_SH_OK")
+            send("busybox 2>&1 | head -1")
+            time.sleep(2.0)
+            s = snap()
+            if b"BusyBox v" in s:
+                interactive = True
+                break
+        if interactive:
             break
+    if not interactive:
+        # Fall back to the weaker ENTER_LINUX_SH_OK signal so the shell-side
+        # asserts still run and report, but the keystone grep below will
+        # decide PASS/FAIL.
+        print("DRIVER: BusyBox banner never seen — enter linux may have"
+              " fallen back to hamsh", file=sys.stderr)
 
     for i in range(reps):
         send("ls | grep cat")
@@ -165,11 +192,23 @@ try:
             print(f"DRIVER: EAGAIN at rep {i+1}", file=sys.stderr)
             break
 
-    for _ in range(4):
+    # The reps above are fired with fixed pacing, but a DE-live guest is
+    # busy (the compositor keeps spawning apps) and each pipeline does two
+    # ELF loads, so on a loaded host the pipelines BACKLOG behind the
+    # driver. Don't give up after a couple of tries — keep re-sending the
+    # final marker and wait generously for the queue to drain and the
+    # busybox shell to echo it back. The shell surviving long enough to run
+    # this final command is the "no resource leak" proof.
+    done_ok = False
+    for _ in range(60):
         send("echo PIPELINE_DONE_OK")
         time.sleep(2.0)
         if b"PIPELINE_DONE_OK" in snap():
+            done_ok = True
             break
+    if not done_ok:
+        print("DRIVER: PIPELINE_DONE_OK never echoed (backlog never drained?)",
+              file=sys.stderr)
     send("exit"); time.sleep(2)
     send("exit"); time.sleep(2)
 except Exception as e:
@@ -184,7 +223,7 @@ PYDRV
 
 echo "[test_fork_eagain_pipeline] full log saved at: $LOG"
 echo "[test_fork_eagain_pipeline] --- captured transcript (filtered) ---"
-tr -d '\0' < "$LOG" | grep -aE "SERIAL_SYNC|ENTER_LINUX_SH_OK|can't fork|Resource temporarily|PIPELINE_DONE_OK|TRAP: vector" | tail -40 || true
+tr -d '\0' < "$LOG" | grep -aE "SERIAL_SYNC|BusyBox v|ENTER_LINUX_SH_OK|can't fork|Resource temporarily|PIPELINE_DONE_OK|TRAP: vector" | tail -40 || true
 echo "[test_fork_eagain_pipeline] --- end ---"
 
 fail=0
@@ -197,10 +236,17 @@ else
     echo "[test_fork_eagain_pipeline] OK: no fork-EAGAIN across ${REPS} pipelines"
 fi
 
-if grep -a -F -q "ENTER_LINUX_SH_OK" "$LOG"; then
-    echo "[test_fork_eagain_pipeline] OK: interactive linux sh attached over serial"
+# Keystone: the BusyBox version banner can ONLY appear if a real Linux
+# busybox owns the serial line (hamsh has no `busybox` builtin and there
+# is no native busybox on $PATH). This defeats the false-positive where
+# hamsh's own builtin echo prints ENTER_LINUX_SH_OK while the body `sh`
+# was never found. A stray-byte input corruption (the `?ls`/`?echo`
+# regression this test now guards) ALSO trips here: a corrupted
+# `busybox` command never prints the banner.
+if grep -a -F -q "BusyBox v" "$LOG"; then
+    echo "[test_fork_eagain_pipeline] OK: real busybox interactive over serial (banner keystone)"
 else
-    echo "[test_fork_eagain_pipeline] FAIL: enter linux { sh } never became interactive"
+    echo "[test_fork_eagain_pipeline] FAIL: BusyBox banner never seen — enter linux { sh } not interactive (or serial input corrupted)"
     fail=1
 fi
 
