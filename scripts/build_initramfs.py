@@ -60,7 +60,7 @@ FILES = [
 ]
 
 # Classic per-user home subdirectories for the live/default user `live`
-# (/etc/passwd: live:1:1:/home/live:/bin/hamsh). The cpio is a FLAT name
+# (/etc/passwd: live:x:1:1::/home/live:/bin/hamsh). The cpio is a FLAT name
 # table — directories are implicit, materialised by the files inside
 # them — so we plant a `.keep` placeholder in each standard home subdir
 # (Desktop/Documents/Downloads/Pictures). This gives the live user a

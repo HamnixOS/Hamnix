@@ -27,7 +27,7 @@
 #     sourcing (uid 1 bypasses; hostowner keeps full namespace).
 #
 # What this test verifies end-to-end:
-#   - /etc/passwd reads with live:1:1:... format.
+#   - /etc/passwd reads with live:x:1:1:... format.
 #   - /etc/shadow reads with live:$6$... format (hostowner only —
 #     a regular user wouldn't even resolve /etc/shadow given the
 #     Phase 5 perm check).
@@ -98,11 +98,11 @@ if ! grep -q "M16.35 shell ready\|hamsh.*ready\|stage-07" "$LOG"; then
 fi
 
 # 2. /etc/passwd contains the live hostowner.
-if ! grep -q "live:1:1:" "$LOG"; then
-    echo "[test_security] FAIL: /etc/passwd missing live:1:1:..."
+if ! grep -q "live:x:1:1:" "$LOG"; then
+    echo "[test_security] FAIL: /etc/passwd missing live:x:1:1:..."
     fail=1
 else
-    echo "[test_security] OK: /etc/passwd has live:1:1:..."
+    echo "[test_security] OK: /etc/passwd has live:x:1:1:..."
 fi
 
 # 3. /etc/shadow contains the live hostowner's hash with $6$ prefix.

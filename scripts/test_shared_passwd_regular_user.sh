@@ -229,7 +229,7 @@ else
 fi
 
 # 5. shared passwd visible inside the Linux NS.
-if between "DAVE_PASSWD_BEGIN" "DAVE_PASSWD_END" "dave:1000:1000"; then
+if between "DAVE_PASSWD_BEGIN" "DAVE_PASSWD_END" "dave:x:1000:1000"; then
     echo "[test_shared_passwd] OK: enter linux { cat /etc/passwd } shows dave (shared account table)"
 else
     echo "[test_shared_passwd] DIAG: dave entry not seen inside enter linux /etc/passwd (non-fatal)"

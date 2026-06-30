@@ -55,11 +55,14 @@ they apply to different namespaces.
 A user is an entry in `/etc/passwd`:
 
 ```
-hostowner:1:1:/home/hostowner:/bin/hamsh
-alice:1000:1000:/home/alice:/bin/hamsh
+hostowner:x:1:1::/home/hostowner:/bin/hamsh
+alice:x:1000:1000::/home/alice:/bin/hamsh
 ```
 
-Format: `name:uid:gid:home:shell` (no GECOS field; KISS).
+Format: `name:passwd:uid:gid:gecos:home:shell` — standard 7-field
+passwd(5). The passwd field is always `x` (hashes live in
+`/etc/shadow`) and gecos is empty. This is the SAME file bound into the
+Linux namespace, so busybox/glibc/apt parse it without "bad record".
 
 - **`hostowner`** (uid 1) — the machine owner. Owns `/`, `/etc`,
   `/bin`, `/var/lib/hpm/`, the rootfs partition, all `#hamnix-system`
@@ -430,10 +433,10 @@ doesn't grant access to another's data.
 System uids 2..999 are baked in `/etc/passwd`:
 
 ```
-sshd:2:2:/var/empty:/bin/false
-hamsh-svc:3:3:/var/empty:/bin/false
-postgres:50:50:/var/lib/postgres:/bin/false
-nginx-svc:80:80:/var/empty:/bin/false
+sshd:x:2:2::/var/empty:/bin/false
+hamsh-svc:x:3:3::/var/empty:/bin/false
+postgres:x:50:50::/var/lib/postgres:/bin/false
+nginx-svc:x:80:80::/var/empty:/bin/false
 ```
 
 `/bin/false` shell means no interactive login.
@@ -444,7 +447,7 @@ The live ISO ships with hostowner `live` / password `hamnix`:
 
 ```
 # /etc/passwd
-live:1:1:/home/live:/bin/hamsh
+live:x:1:1::/home/live:/bin/hamsh
 
 # /etc/shadow
 live:$6$<salt>$<hash of 'hamnix'>:<days>
@@ -523,7 +526,7 @@ All phases below landed across the 2026-05-26..27 wave. The
 | Phase | Description | Shipped at |
 |------:|-------------|-----------|
 | 1 | `uid`/`gid` fields on TaskStruct; inherited on fork; passed through `rfork`. New `SYS_GETUID=288` / `SYS_GETGID=289` / `SYS_SETUID=290` (hostowner-only). | `cf041e5` |
-| 2 | `/etc/passwd` (`name:uid:gid:home:shell`) + `/etc/shadow` (`name:$6$<salt>$<hash>:<days>`) formats; parser library at `lib/passwd/{passwd,shadow}.ad`. | `75214c1` |
+| 2 | `/etc/passwd` (`name:passwd:uid:gid:gecos:home:shell`, std 7-field) + `/etc/shadow` (`name:$6$<salt>$<hash>:<days>`) formats; parser library at `lib/passwd/{passwd,shadow}.ad`. | `75214c1` |
 | 3 | SHA-512-crypt (`lib/crypt/sha512_crypt.ad`) — glibc-compatible `$6$` (5000-iteration Linux default); built on `lib/sha2/sha512.ad`. | `0bb5f3c` |
 | 4 | `#auth` cdev at `/dev/auth` (`sys/src/9/port/devauth.ad`) — kernel-side credential check via `/etc/shadow` + rate limit; userland never sees hashes. | `f5e9982` |
 | 5 | VFS permission check on `open`/`create`/`exec` (owner/group/other rwx). | `931bf0d` |
