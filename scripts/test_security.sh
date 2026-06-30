@@ -33,8 +33,11 @@
 #     Phase 5 perm check).
 #   - /dev/blk/vda/size opens for the live (hostowner) user.
 #   - `newshell <nosuchuser>` rejects with "no such user".
-#   - `newshell live` with the correct password (`hamnix`) is
-#     accepted by /dev/auth (printed verdict reaches userland).
+#   - After dropping to a regular user (`setuid 1000`), `newshell live`
+#     with a WRONG password is rejected by /dev/auth ("newshell:
+#     authentication failed"). (From the uid-1 console `newshell live`
+#     would take the password-free self-elevation fast path, so the
+#     credential check is exercised from a non-hostowner uid.)
 
 . "$(dirname "$0")/_build_lock.sh"
 . "$(dirname "$0")/_qemu_drive.sh"
@@ -63,12 +66,32 @@ set +e
 # `echo $?` after each idempotent command surfaces the kernel-side
 # uid-gate behavior at known marker points in the log.
 #
-# `newshell live` prompts for a password — the next command line we
-# feed is treated as the password and consumed by newshell's silent-
-# read loop (it reads until '\n'). The bad-password path uses a known
-# wrong string; the good-password path uses "hamnix" (the live ISO's
-# bundled credential).
-qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
+# WRONG-PASSWORD path — IMPORTANT subtlety:
+#   The serial/console shell already runs as uid 1 (the kernel upgrades
+#   /init to the hostowner before exec'ing hamsh). For the uid-1 -> uid-1
+#   transition `newshell <hostowner>` takes the PASSWORD-FREE self-
+#   elevation fast path (you don't prove a secret to become who you
+#   already are — see builtin_newshell Step 1.5 in user/hamsh.ad). So
+#   `newshell live` from the console would NEVER prompt and a "wrong
+#   password" would just be run as a command in the nested shell — it
+#   could never produce "authentication failed".
+#
+#   To actually exercise the credential check we first DROP to a regular
+#   user with `setuid 1000` (the hostowner can step down to any uid).
+#   From uid 1000, `newshell live` (target uid 1) is NOT the fast path:
+#   it prompts, and the next line we feed ("wrong-password") is consumed
+#   by newshell's silent read loop and handed to /dev/auth, which rejects
+#   it -> "newshell: authentication failed". This mirrors how
+#   scripts/test_newshell_auth_elevation.sh drives the same path.
+#
+#   The /etc/shadow read (hostowner-only, 0600) must therefore happen
+#   BEFORE the setuid-1000 drop, while the shell is still uid 1.
+#
+# Timeout: the FULL installer-image kernel is wrapped in a GRUB ISO and
+# boots the complete init/main.ad to runlevel 5 (network, ntp, linux/
+# debian ns templates) under TCG — that boot alone is ~2-3 min, so the
+# overall budget must comfortably exceed boot + the ~40s drive below.
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 420 \
     -- "echo SEC_STAGE_START"                                          2 \
        "cat /etc/passwd"                                               2 \
        "echo SEC_STAGE_PASSWD_READ"                                    1 \
@@ -78,7 +101,8 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
        "echo SEC_STAGE_BLK_READ"                                       1 \
        "newshell nosuchuser"                                           2 \
        "echo SEC_STAGE_BAD_USER"                                       1 \
-       "newshell live"                                                 1 \
+       "setuid 1000"                                                   3 \
+       "newshell live"                                                 2 \
        "wrong-password"                                                15 \
        "echo SEC_STAGE_BAD_PASS"                                       1 \
        "exit"                                                          1
