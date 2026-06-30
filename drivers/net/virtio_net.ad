@@ -63,10 +63,26 @@ from mm.slab import kmalloc
 from drivers.net.eth import eth_rx, nd_mac, eth_register_tx_hook
 # Higher-half kernel: device DMA targets must be physical addresses.
 from arch.x86.mm.pgtable import virt_to_phys
+from arch.x86.kernel.time import pit_monotonic_us
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def spinlock_trylock(ptr: Ptr[uint32]) -> uint32
 extern def spinlock_unlock(ptr: Ptr[uint32])
+extern def local_irq_save() -> uint64
+extern def local_irq_restore(flags: uint64)
+
+# TX serializer. The TX path reuses ONE shared buffer (vnet_tx_buf) and
+# descriptor slot 0 for every frame (no per-frame ring / reclaim), so
+# two callers MUST NOT build a frame concurrently. Without this lock two
+# CPUs — e.g. two httpd per-connection workers each writing their HTTP
+# response — race: one memcpy clobbers vnet_tx_buf mid-DMA of the other,
+# and both push descriptor 0 onto the avail ring, so a segment is
+# silently corrupted/dropped and the connection hangs. virtio_net_tx
+# takes this lock with LOCAL IRQs disabled (local_irq_save) so an RX
+# softirq that re-enters the TX path on the SAME CPU (tcp_rx -> send ACK
+# -> virtio_net_tx) cannot deadlock against a TX in progress; the
+# spinlock then serializes the OTHER CPUs.
+vnet_tx_lock: uint32 = 0
 
 # RX used-ring drain serializer. The used ring is consumed by THREE
 # kinds of caller that can run on different CPUs at the same time:
@@ -1167,6 +1183,12 @@ def virtio_net_tx(buf: Ptr[uint8], length: uint64) -> int32:
         return -1
     if length > 1514:
         return -1
+    # Serialize the whole build+publish+drain against other CPUs. Local
+    # IRQs off first so a same-CPU RX-softirq ACK TX can't deadlock; then
+    # spin-acquire the cross-CPU lock (each holder releases in ~µs).
+    tx_flags: uint64 = local_irq_save()
+    while spinlock_trylock(&vnet_tx_lock) == 0:
+        pass
     # Zero the virtio_net_hdr (no offload, no checksum req). The active
     # header length follows the negotiated feature set: 12 bytes when
     # F_MRG_RXBUF is on (the device expects the mergeable header on TX
@@ -1186,6 +1208,35 @@ def virtio_net_tx(buf: Ptr[uint8], length: uint64) -> int32:
     _vnet_desc_set(&vnet_state.tx, 0, addr, total, 0, 0)
     _avail_push(&vnet_state.tx, 0)
     virtio_notify(vnet_state.iobase, VQ_TX)
+    # TX-completion wait. The TX path reuses ONE shared buffer
+    # (vnet_tx_buf) and descriptor slot 0 for EVERY frame, with no
+    # used-ring reclaim. If we returned immediately, the next
+    # virtio_net_tx — e.g. an HTTP response's body segment fired right
+    # after its header — would memcpy a new frame over vnet_tx_buf while
+    # the device is still DMA-reading the previous one, silently
+    # corrupting/dropping a segment. That back-to-back race is exactly
+    # what wedged httpd's per-connection responses (header delivered,
+    # body lost, connection hung; masked by any added latency such as a
+    # debug printk). Block until the device publishes this descriptor in
+    # the TX used ring so the buffer is safe to reuse on return.
+    #
+    # Poll the used-ring index DIRECTLY (the device updates it via DMA
+    # regardless of EFLAGS.IF, so this works from IF-masked syscall
+    # context where `jiffies` is frozen). Bound the wait by the free-
+    # running PIT microsecond clock — pit_monotonic_us() keeps advancing
+    # with interrupts masked — so a wedged device can never hang the TX.
+    want:   uint16 = cast[Ptr[uint16]](vnet_state.tx.avail_addr + 2)[0]
+    used_p: uint64 = vnet_state.tx.used_addr + 2
+    tx_start_us: uint64 = pit_monotonic_us()
+    while True:
+        used_idx: uint16 = cast[Ptr[uint16]](used_p)[0]
+        gap: uint16 = want - used_idx
+        if gap == 0 or gap >= 0x8000:
+            break                              # device caught up (or ahead)
+        if pit_monotonic_us() - tx_start_us >= 200000:
+            break                              # 200 ms safety cap
+    spinlock_unlock(&vnet_tx_lock)
+    local_irq_restore(tx_flags)
     return 0
 
 
