@@ -3909,7 +3909,11 @@ def _pick_next() -> int32:
         relig: uint64 = 0
         # Slot 0 (BSP boot task) is BSP-only; everything else (incl.
         # user tasks) is eligible on any CPU thanks to per-CPU TSS.
-        if on_bsp != 0 or r != 0:
+        # SMP steal-window: skip any task still mid-switch on (or running
+        # on) another CPU — on_cpu==1 means its saved sp may be stale, so
+        # dispatching it here would put two CPUs on the same kstack. The
+        # fence clears in __switch_to_asm once prev->sp is committed.
+        if (on_bsp != 0 or r != 0) and task_table[r].on_cpu == 0:
             relig = 1
         if relig != 0 and sched_is_realtime(r) != 0:
             rp:  uint64 = g_rt_priority[r]
@@ -3941,7 +3945,10 @@ def _pick_next() -> int32:
         elig: uint64 = 0
         # Slot 0 (BSP boot task) is BSP-only; everything else (incl.
         # user tasks) is eligible on any CPU thanks to per-CPU TSS.
-        if on_bsp != 0 or i != 0:
+        # SMP steal-window: an on_cpu!=0 task is still running / mid-switch
+        # on another CPU and its saved sp may be stale — skip it (see the
+        # RT loop above and __switch_to_asm's on_cpu clear).
+        if (on_bsp != 0 or i != 0) and task_table[i].on_cpu == 0:
             elig = 1
         # F11 cgroup v2 cpu.max: a quota-exhausted task is
         # skipped here just like a STATE_WAIT task — the cgroup's
@@ -4069,8 +4076,11 @@ def _sched_switch_to_ap_idle(my_cpu: uint64, ap_idle: uint64):
     # (A dead/parked task is not on a run-list so it is not actually
     # stealable, but raise the fence for uniformity; __switch_to_asm clears
     # it after the sp store.)
+    # on_cpu invariant: ap_idle is dispatched here, so it stays fenced (==1)
+    # for the whole time it is this CPU's live task; __switch_to_asm clears
+    # prev's fence after saving prev->sp.
     task_table[prev].on_cpu = 1
-    task_table[ap_idle].on_cpu = 0
+    task_table[ap_idle].on_cpu = 1
     _rq_unlock_cpu(my_cpu)
 
     # RCU quiescent state: the outgoing (dead/parked) task holds no reader.
@@ -4279,16 +4289,21 @@ def schedule():
         prev_migrated_to = cast[int64](task_table[prev].rq_cpu)
     current_idx_pcpu = nxt
 
-    # SMP steal-window fence: prev is about to become observable as
-    # STATE_READY on a run-list once we drop the lock, but its sp slot is
-    # NOT updated until __switch_to_asm runs (below). Raise on_cpu so a
-    # concurrent _sched_try_pull_locked on another CPU refuses to steal prev
-    # until __switch_to_asm has saved prev->sp and cleared this flag. Set it
-    # UNDER the lock, before the unlock, so the fence is published before
-    # prev can be seen. (nxt is being dispatched here; clear its on_cpu so a
-    # later steal of nxt after IT yields isn't spuriously blocked.)
+    # SMP steal-window fence (Linux's rq->curr->on_cpu invariant): on_cpu==1
+    # for the ENTIRE time a task is the live task on a CPU — from dispatch
+    # here until __switch_to_asm saves its sp on the NEXT switch-away. prev
+    # keeps on_cpu=1 (it is mid-switch-out; its sp slot is stale until
+    # __switch_to_asm runs below). nxt is being dispatched NOW, so it gets
+    # on_cpu=1 too: this is the crucial bit — a task that later sets itself
+    # STATE_WAIT and calls schedule() must already be fenced when a wakeup on
+    # ANOTHER CPU flips it back to STATE_READY, or that CPU's _pick_next would
+    # dispatch it on a STALE sp while THIS CPU is still executing it (two CPUs
+    # on one kstack -> corrupted return / __stack_chk_fail / #UD, the inbound
+    # net_accept SMP crash). _pick_next + _sched_try_pull_locked both skip
+    # on_cpu!=0, so the woken task simply waits on its runqueue until
+    # __switch_to_asm here clears the fence and publishes the fresh sp.
     task_table[prev].on_cpu = 1
-    task_table[nxt].on_cpu = 0
+    task_table[nxt].on_cpu = 1
 
     _rq_unlock_cpu(my_cpu)
 
@@ -4850,8 +4865,10 @@ def sched_ap_idle_loop():
             # now READY on this CPU's run-list but its sp won't be saved until
             # __switch_to_asm below. Raise on_cpu so no other AP steals the
             # idle slot on a stale sp; __switch_to_asm clears it after the save.
+            # on_cpu invariant: nxt is dispatched here, so keep it fenced
+            # (==1) for its whole run; __switch_to_asm clears prev's fence.
             task_table[my_idle_slot].on_cpu = 1
-            task_table[nxt].on_cpu = 0
+            task_table[nxt].on_cpu = 1
             tss_set_rsp0(task_table[nxt].kstack_top)
             if task_table[nxt].cr3 != task_table[my_idle_slot].cr3:
                 load_cr3(task_table[nxt].cr3)
@@ -5037,6 +5054,9 @@ def sched_ap_launch(cpu_id: uint64):
     # (after spin-wait exits but before enter_first_task switches stacks).
     printk2("SMP: cpu%d launching idle kthread slot=%d\n", cpu_id, slot_u)
     task_table[slot_u].state = STATE_RUNNING
+    # on_cpu invariant: this AP's idle kthread becomes the live task here and
+    # enter_first_task never returns to raise the fence later; raise it now.
+    task_table[slot_u].on_cpu = 1
     current_idx_pcpu = slot_u
     # enter_first_task loads task->sp and tail-jumps into kthread_bootstrap
     # which iretqs into sched_ap_idle_loop.  Does not return.
@@ -5181,6 +5201,16 @@ def start_first_task(first_slot: uint64):
     _rq_list_remove(fs0)
     task_table[fs0].state = STATE_RUNNING
     task_table[fs0].rq_cpu = get_cpu_id()
+    # on_cpu invariant (Linux rq->curr->on_cpu): fs0 becomes the live task on
+    # this CPU NOW and runs via enter_first_task_sysret (which never returns
+    # here and so cannot raise the fence later). Raise it here so the FIRST
+    # time fs0 blocks (e.g. tcp_accept's wait) the sleep-window — from
+    # STATE_WAIT until __switch_to_asm saves fs0->sp — is fenced. Without
+    # this, fs0 runs its entire first life with on_cpu==0; a wakeup on another
+    # CPU then dispatches it on a STALE sp while this CPU is still executing
+    # it (two CPUs on one kstack -> the inbound-accept SMP crash). __switch_to_asm
+    # clears it on the first switch-away; every later dispatch re-raises it.
+    task_table[fs0].on_cpu = 1
     current_idx_pcpu = fs0
     _rq_unlock_cpu(get_cpu_id())
     # RETIRE THE PHANTOM BOOT TASK. sched_mark_boot_task_running()
@@ -7625,6 +7655,19 @@ def _wq_place_woken(slot: uint64):
     # sched_make_ready_on internally taking only the TARGET rq lock). The
     # state is already STATE_READY; sched_make_ready_on re-stamps it READY
     # under the target rq lock (idempotent) and sets rq_cpu atomically there.
+    #
+    # SMP wake fence note: the woken task may still be in its sleep-window
+    # (set STATE_WAIT + called schedule() but NOT yet reached __switch_to_asm,
+    # so on_cpu==1 and its saved sp is STALE). We do NOT spin on on_cpu here:
+    # the waker can be running on the SAME CPU as that task (a wake raised from
+    # within its own schedule()/softirq path before __switch runs), and __switch
+    # — the only thing that clears on_cpu — sits BELOW us on that CPU's stack,
+    # so a spin would self-deadlock. Instead the dispatch side is fenced:
+    # _pick_next and _sched_try_pull_locked both refuse a task with on_cpu!=0,
+    # so even though we home it on a runqueue now, no CPU dispatches it until
+    # __switch_to_asm has committed its sp and cleared on_cpu. Liveness: the
+    # owning CPU re-runs _pick_next on its next tick / reschedule-IPI / steal
+    # pass, by which point the fence has cleared.
     tc: uint64 = sched_pick_target_cpu(slot)
     sched_make_ready_on(slot, tc)
 
