@@ -76,16 +76,25 @@ python3 -m compiler.adder compile \
 trap 'INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
 
 # Drive one boot: wait for hamsh's banner, spawn u_cow_fork (one
-# SYS_SPAWN -> one [aslr] slide), then exit. The command is sent twice
-# (the 2nd is a harmless re-run if the 1st landed) so the [hamsh-alive]
-# heartbeat redraw can't eat the only delivery -- we just need at least
-# one spawn to reach the kernel.
+# SYS_SPAWN -> one [aslr] slide), then run `dmesg` and exit. The command
+# is sent twice (the 2nd is a harmless re-run if the 1st landed) so the
+# [hamsh-alive] heartbeat redraw can't eat the only delivery -- we just
+# need at least one spawn to reach the kernel.
+#
+# The [aslr] sentinels are emitted at INFO severity, which the console
+# log-level gate suppresses from the LIVE console once the shell is
+# interactive (so they no longer flood the user's prompt -- see
+# arch/x86/kernel/syscall.ad + drivers/tty/serial/early_8250.ad). Every
+# line is still pushed into the kernel printk ring buffer unconditionally,
+# so we run `dmesg` after the spawns to replay the ring (dmesg's stdout is
+# always console-visible) and grep the [aslr] slides out of that replay.
 run_boot() {
     local log="$1"
     set +e
     qemu_drive "$log" "$ELF" "[hamsh] M16.35 shell ready" 70 \
         -- "u_cow_fork" 8 \
            "u_cow_fork" 8 \
+           "dmesg" 5 \
            "exit" 1
     set -e
 }
