@@ -594,6 +594,7 @@ DESKTOP_APP_BINS = (
     "hamshot", "hamtray", "hamappmenu", "hamctxmenu", "hamosd",
     "hamlock", "hamscreensaver", "hamsession", "hamsessui", "hamrband",
     "hamresize", "hamview", "hamabout", "hamtoast", "haminbox",
+    "hambrowse",
 )
 
 

@@ -1,0 +1,1500 @@
+# user/hambrowse.ad
+#
+# hambrowse — a MINIMAL native graphical web browser / HTML renderer for the
+# scene-file DE (docs/de_scene_file_arch.md). It FETCHES a page over HTTP
+# (reusing the proven user/http9.ad client — the same path /bin/wget and
+# /bin/curl use), PARSES a tolerant subset of HTML, LAYS it out in block +
+# inline flow wrapped to the window width, and RENDERS it as a scene display
+# list in its own DE window (built on lib/hamui's hamscene_* helpers, exactly
+# like /bin/hameditscene).
+#
+# This closes the documented "rendering does not exist" gap: Hamnix could
+# serve HTTP (httpd, T72) and fetch it (wget/curl) but had no browser to
+# display a page graphically. hambrowse is that browser.
+#
+# USAGE
+#   hambrowse                 render the built-in demo page (no network)
+#   hambrowse --demo          same as above (explicit)
+#   hambrowse http://host/pg  GET the URL and render it
+#   hambrowse /path/file.html  read + render a local file
+#
+# HTML SUBSET (tolerant — unknown tags are ignored, text kept):
+#   headings  h1 h2 h3       (bold, with a heading rule under h1/h2)
+#   blocks    p div br       (paragraph / line breaks)
+#   inline    b strong       (bold)   i em (parsed, rendered plain)
+#   links     a href=".."    (blue + underline; CLICK navigates)
+#   lists     ul ol li       (indented, bulleted)
+#   pre       pre            (preformatted, whitespace preserved)
+#   entities  &amp; &lt; &gt; &quot; &apos; &nbsp; &#NN; &#xHH;
+#   ignored   script style head title  (content dropped, never rendered)
+# NOT handled: CSS, JavaScript, tables, images, forms (honest v1 scope).
+#
+# INPUT: arrow keys / j,k scroll one line; space / b page down/up; g / G
+# jump to top/bottom; the mouse wheel scrolls; a button-1 click on a link
+# navigates to it (relative + root-relative + absolute hrefs resolved).
+#
+# MEMORY DISCIPLINE (memory/feedback_compiler_quirks.md U9): every sizable
+# buffer is a top-level BSS Array, NEVER a stack local — the native user
+# stack is a single 4 KiB page (the bug that crashed SSH, T70). No malloc.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield() -> int32
+extern def sys_waitfds(fds: Ptr[int32], nfds: uint64, timeout_ms: int64) -> int64
+extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
+
+from lib.hamui import hamscene_begin, hamscene_fill, hamscene_rect, \
+    hamscene_glyphs, hamscene_glyphs_bold, hamscene_line, hamscene_commit
+from user.http9 import http_get
+
+
+# ====================================================================
+# Tiny libc-free helpers.
+# ====================================================================
+def _slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _writeall(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _slen(s))
+
+
+def _u64_to_dec(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    x: uint64 = v
+    while x > 0:
+        digs[n] = cast[uint8](x % 10) + 48
+        x = x / 10
+        n = n + 1
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digs[n]
+        i = i + 1
+    return i
+
+
+def _lower(c: uint8) -> uint8:
+    if c >= 65 and c <= 90:
+        return c + 32
+    return c
+
+
+# ====================================================================
+# WINDOW geometry (mutable — resize re-lays-out from the stored source).
+# ====================================================================
+TITLE_H:   int32 = 18
+CONTENT_X: int32 = 8
+CONTENT_Y: int32 = 22
+STATUS_H:  int32 = 16
+LINE_H:    int32 = 16
+CELL_W:    int32 = 8
+bw: int32 = 600                 # window content width  (px)
+bh: int32 = 440                 # window content height (px)
+
+
+def _content_right() -> int32:
+    return bw - CONTENT_X
+
+
+def _vis_rows() -> uint64:
+    r: int32 = (bh - CONTENT_Y - STATUS_H) / LINE_H
+    if r < 1:
+        r = 1
+    return cast[uint64](r)
+
+
+# ====================================================================
+# SOURCE buffers.  resp_buf holds an HTTP response; html_buf holds a local
+# file / the built-in demo / an error page.  src_ptr/src_len point at the
+# HTML to parse (either &resp_buf[body_off] or &html_buf[0]).
+# ====================================================================
+RESP_CAP: uint64 = 262144
+HTML_CAP: uint64 = 65536
+resp_buf: Array[262144, uint8]
+html_buf: Array[65536, uint8]
+html_len: uint64 = 0
+src_ptr:  Ptr[uint8] = cast[Ptr[uint8]](0)
+src_len:  uint64 = 0
+
+cur_url:  Array[1024, uint8]     # current URL / path (base for link resolve)
+status_buf: Array[160, uint8]
+status_len: uint64 = 0
+
+
+# ====================================================================
+# LAYOUT MODEL — the parsed page becomes a flat list of styled SEGMENTS.
+# A segment is a run of same-styled text on one visual ROW at a pixel X.
+# Rendering draws each segment whose row is in the scroll viewport.
+# ====================================================================
+MAX_SEGS:     uint64 = 6000
+SEG_TEXT_CAP: uint64 = 131072
+MAX_ROWS:     uint64 = 12000
+
+seg_text_buf: Array[131072, uint8]
+seg_text_len: uint64 = 0
+seg_x:    Array[6000, int32]
+seg_line: Array[6000, int32]
+seg_off:  Array[6000, int32]
+seg_len:  Array[6000, int32]
+seg_color: Array[6000, uint8]    # palette index
+seg_bold:  Array[6000, uint8]
+seg_uline: Array[6000, uint8]
+seg_link:  Array[6000, int32]    # link id or -1
+n_segs:   uint64 = 0
+
+row_rule: Array[12000, uint8]    # 0 none, 1 heading rule on this row
+total_rows: uint64 = 0
+top_line:   uint64 = 0
+
+# LINKS — href targets + the spans that point to them.
+MAX_LINKS:    uint64 = 1024
+LINK_HREF_CAP: uint64 = 32768
+link_off: Array[1024, int32]
+link_len: Array[1024, int32]
+link_href_buf: Array[32768, uint8]
+link_href_len: uint64 = 0
+n_links: uint64 = 0
+
+# parse-time "pen" + style state
+cur_row:  uint64 = 0
+pen_x:    int32 = 8
+indent_x: int32 = 8
+row_dirty: int32 = 0
+need_space: int32 = 0
+seg_open:  int32 = 0
+seg_curlen: uint64 = 0
+g_color: int32 = 0
+g_bold:  int32 = 0
+g_uline: int32 = 0
+g_link:  int32 = -1
+g_bold_n: int32 = 0          # nested <b>/<strong> depth
+g_heading: int32 = 0        # 0 none, else 1/2/3
+list_depth: int32 = 0
+pre_mode: int32 = 0
+skip_active: int32 = 0
+skip_name: Array[16, uint8]
+skip_nlen: uint64 = 0
+
+# inline word accumulator
+WORD_CAP: uint64 = 2048
+word_buf: Array[2048, uint8]
+word_len: uint64 = 0
+g_ent_char: uint8 = 0
+
+
+def _palette(idx: uint8) -> Ptr[uint8]:
+    if idx == 1:
+        return cast[Ptr[uint8]]("#1a4fd0")          # link blue
+    if idx == 2:
+        return cast[Ptr[uint8]]("#14306e")          # heading dark blue
+    if idx == 3:
+        return cast[Ptr[uint8]]("#0a6b5a")          # pre/code teal
+    return cast[Ptr[uint8]]("#101010")              # body text
+
+
+def _base_color() -> int32:
+    if g_heading != 0:
+        return 2
+    if pre_mode != 0:
+        return 3
+    return 0
+
+
+def _recompute_style():
+    if g_link >= 0:
+        g_color = 1
+        g_uline = 1
+    else:
+        g_color = _base_color()
+        g_uline = 0
+    if g_bold_n > 0 or g_heading != 0:
+        g_bold = 1
+    else:
+        g_bold = 0
+
+
+# ---- segment building -----------------------------------------------
+def _seg_ensure():
+    if seg_open != 0:
+        return
+    if n_segs >= MAX_SEGS:
+        return
+    seg_open = 1
+    seg_x[n_segs]    = pen_x
+    seg_line[n_segs] = cast[int32](cur_row)
+    seg_off[n_segs]  = cast[int32](seg_text_len)
+    seg_color[n_segs] = cast[uint8](g_color)
+    seg_bold[n_segs]  = cast[uint8](g_bold)
+    seg_uline[n_segs] = cast[uint8](g_uline)
+    seg_link[n_segs]  = g_link
+    seg_curlen = 0
+
+
+def _seg_putc(c: uint8):
+    _seg_ensure()
+    if seg_open == 0:
+        return
+    if seg_text_len < SEG_TEXT_CAP - 1:
+        seg_text_buf[seg_text_len] = c
+        seg_text_len = seg_text_len + 1
+        seg_curlen = seg_curlen + 1
+    row_dirty = 1
+
+
+def _close_seg():
+    if seg_open == 0:
+        return
+    if seg_curlen > 0 and n_segs < MAX_SEGS:
+        seg_len[n_segs] = cast[int32](seg_curlen)
+        n_segs = n_segs + 1
+    seg_open = 0
+    seg_curlen = 0
+
+
+# A style change closes the current segment so the next text opens a fresh
+# one carrying the new attributes.
+def _style_break():
+    _close_seg()
+    _recompute_style()
+
+
+# ---- line breaks ----------------------------------------------------
+def _bump_row():
+    cur_row = cur_row + 1
+    if cur_row >= MAX_ROWS:
+        cur_row = MAX_ROWS - 1
+
+
+def _soft_newline():
+    # Move to a fresh line ONLY if the current one has content.
+    _close_seg()
+    if row_dirty != 0:
+        _bump_row()
+    pen_x = indent_x
+    row_dirty = 0
+    need_space = 0
+
+
+def _newline():
+    # Unconditional line break (<br>, pre newline).
+    _close_seg()
+    _bump_row()
+    pen_x = indent_x
+    row_dirty = 0
+    need_space = 0
+
+
+def _para_break():
+    # End the current line + leave a single blank gap.
+    _soft_newline()
+    _bump_row()
+    pen_x = indent_x
+    need_space = 0
+
+
+# ---- word placement (block+inline flow with word wrap) --------------
+def _emit_word(wptr: Ptr[uint8], wlen: uint64):
+    if wlen == 0:
+        return
+    cw: int32 = CELL_W
+    right: int32 = _content_right()
+    wpx: int32 = cast[int32](wlen) * cw
+    avail: int32 = right - indent_x
+    # Decide a word-wrap (only when the word fits on a fresh line).
+    if pen_x > indent_x:
+        extra: int32 = wpx
+        if need_space != 0:
+            extra = extra + cw
+        if pen_x + extra > right and wpx <= avail:
+            _close_seg()
+            _bump_row()
+            pen_x = indent_x
+            need_space = 0
+            row_dirty = 0
+    # Inter-word space.
+    if need_space != 0 and pen_x > indent_x:
+        _seg_putc(32)
+        pen_x = pen_x + cw
+        need_space = 0
+    # A word longer than a whole line: hard char-break it.
+    if wpx > avail:
+        k: uint64 = 0
+        while k < wlen:
+            if pen_x + cw > right and pen_x > indent_x:
+                _close_seg()
+                _bump_row()
+                pen_x = indent_x
+                row_dirty = 0
+            _seg_putc(wptr[k])
+            pen_x = pen_x + cw
+            k = k + 1
+        need_space = 0
+        return
+    # Normal: whole word into the current segment.
+    k2: uint64 = 0
+    while k2 < wlen:
+        _seg_putc(wptr[k2])
+        pen_x = pen_x + cw
+        k2 = k2 + 1
+    need_space = 0
+
+
+def _word_push(c: uint8):
+    if word_len < WORD_CAP - 1:
+        word_buf[word_len] = c
+        word_len = word_len + 1
+
+
+def _word_flush():
+    if word_len > 0:
+        _emit_word(&word_buf[0], word_len)
+        word_len = 0
+
+
+# ====================================================================
+# ENTITY DECODE — &name; / &#NN; / &#xHH;.  Returns bytes consumed from
+# src starting at `&` (0 if not a recognised entity), and sets g_ent_char.
+# ====================================================================
+def _ent_named_is(start: uint64, lit: Ptr[uint8]) -> int32:
+    # `lit` already includes the trailing ';' — a full match consumes it.
+    i: uint64 = 0
+    while lit[i] != 0:
+        if start + i >= src_len:
+            return 0
+        if src_ptr[start + i] != lit[i]:
+            return 0
+        i = i + 1
+    return cast[int32](i)
+
+
+def _entity(at: uint64) -> uint64:
+    # at points at '&'. Look for a ';' within 10 bytes.
+    body: uint64 = at + 1
+    if body >= src_len:
+        return 0
+    if src_ptr[body] == 35:                          # '#': numeric
+        p: uint64 = body + 1
+        base: uint32 = 10
+        if p < src_len and (src_ptr[p] == 120 or src_ptr[p] == 88):   # x/X
+            base = 16
+            p = p + 1
+        val: uint32 = 0
+        digits: int32 = 0
+        while p < src_len and digits < 8:
+            c: uint8 = src_ptr[p]
+            d: int32 = -1
+            if c >= 48 and c <= 57:
+                d = cast[int32](c - 48)
+            elif base == 16 and c >= 97 and c <= 102:
+                d = cast[int32](c - 97) + 10
+            elif base == 16 and c >= 65 and c <= 70:
+                d = cast[int32](c - 65) + 10
+            else:
+                break
+            val = val * base + cast[uint32](d)
+            digits = digits + 1
+            p = p + 1
+        if digits == 0:
+            return 0
+        if p < src_len and src_ptr[p] == 59:
+            p = p + 1
+        ch: uint32 = val
+        if ch == 0 or ch > 126:
+            ch = 63                                   # '?' for non-ASCII
+        g_ent_char = cast[uint8](ch)
+        return p - at
+    # Named entities.
+    c0: uint8 = _lower(src_ptr[body])
+    if c0 == 97:                                       # a -> amp / apos
+        n: int32 = _ent_named_is(body, cast[Ptr[uint8]]("amp;"))
+        if n > 0:
+            g_ent_char = 38
+            return cast[uint64](1 + n)
+        n = _ent_named_is(body, cast[Ptr[uint8]]("apos;"))
+        if n > 0:
+            g_ent_char = 39
+            return cast[uint64](1 + n)
+    if c0 == 108:                                      # l -> lt
+        n2: int32 = _ent_named_is(body, cast[Ptr[uint8]]("lt;"))
+        if n2 > 0:
+            g_ent_char = 60
+            return cast[uint64](1 + n2)
+    if c0 == 103:                                      # g -> gt
+        n3: int32 = _ent_named_is(body, cast[Ptr[uint8]]("gt;"))
+        if n3 > 0:
+            g_ent_char = 62
+            return cast[uint64](1 + n3)
+    if c0 == 113:                                      # q -> quot
+        n4: int32 = _ent_named_is(body, cast[Ptr[uint8]]("quot;"))
+        if n4 > 0:
+            g_ent_char = 34
+            return cast[uint64](1 + n4)
+    if c0 == 110:                                      # n -> nbsp
+        n5: int32 = _ent_named_is(body, cast[Ptr[uint8]]("nbsp;"))
+        if n5 > 0:
+            g_ent_char = 32
+            return cast[uint64](1 + n5)
+    return 0
+
+
+# ====================================================================
+# TAG HANDLING.  tag content is src[ts .. te) (between '<' and '>').
+# ====================================================================
+def _name_eq(np: uint64, nlen: uint64, lit: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while lit[i] != 0:
+        if i >= nlen:
+            return 0
+        if _lower(src_ptr[np + i]) != lit[i]:
+            return 0
+        i = i + 1
+    if i != nlen:
+        return 0
+    return 1
+
+
+# Extract the href="..."/href='...' value from a tag body into link_href_buf;
+# returns the new link id, or -1 if no href / table full.
+def _capture_href(ts: uint64, te: uint64) -> int32:
+    if n_links >= MAX_LINKS:
+        return -1
+    # find "href" (case-insensitive) within [ts,te)
+    i: uint64 = ts
+    found: int32 = 0
+    while i + 4 <= te:
+        if _lower(src_ptr[i]) == 104 and _lower(src_ptr[i + 1]) == 114 \
+           and _lower(src_ptr[i + 2]) == 101 and _lower(src_ptr[i + 3]) == 102:
+            found = 1
+            i = i + 4
+            break
+        i = i + 1
+    if found == 0:
+        return -1
+    while i < te and (src_ptr[i] == 32 or src_ptr[i] == 9):
+        i = i + 1
+    if i >= te or src_ptr[i] != 61:                  # '='
+        return -1
+    i = i + 1
+    while i < te and (src_ptr[i] == 32 or src_ptr[i] == 9):
+        i = i + 1
+    quote: uint8 = 0
+    if i < te and (src_ptr[i] == 34 or src_ptr[i] == 39):
+        quote = src_ptr[i]
+        i = i + 1
+    start: uint64 = link_href_len
+    cnt: int32 = 0
+    while i < te:
+        c: uint8 = src_ptr[i]
+        if quote != 0:
+            if c == quote:
+                break
+        else:
+            if c == 32 or c == 9 or c == 62:
+                break
+        if link_href_len < LINK_HREF_CAP - 1:
+            link_href_buf[link_href_len] = c
+            link_href_len = link_href_len + 1
+            cnt = cnt + 1
+        i = i + 1
+    if cnt == 0:
+        return -1
+    lid: int32 = cast[int32](n_links)
+    link_off[n_links] = cast[int32](start)
+    link_len[n_links] = cnt
+    n_links = n_links + 1
+    return lid
+
+
+def _enter_skip(np: uint64, nlen: uint64):
+    skip_active = 1
+    skip_nlen = nlen
+    i: uint64 = 0
+    while i < nlen and i < 16:
+        skip_name[i] = _lower(src_ptr[np + i])
+        i = i + 1
+
+
+def _handle_tag(ts: uint64, te: uint64):
+    if ts >= te:
+        return
+    # comment / doctype / processing — ignore.
+    if src_ptr[ts] == 33 or src_ptr[ts] == 63:       # '!' or '?'
+        return
+    is_close: int32 = 0
+    np: uint64 = ts
+    if src_ptr[np] == 47:                            # '/'
+        is_close = 1
+        np = np + 1
+    # tag name end (letters/digits)
+    ne: uint64 = np
+    while ne < te:
+        c: uint8 = src_ptr[ne]
+        if (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or \
+           (c >= 48 and c <= 57):
+            ne = ne + 1
+        else:
+            break
+    nlen: uint64 = ne - np
+    if nlen == 0:
+        return
+
+    # script/style/head/title: drop their content entirely.
+    if is_close == 0:
+        if _name_eq(np, nlen, cast[Ptr[uint8]]("script")) != 0 or \
+           _name_eq(np, nlen, cast[Ptr[uint8]]("style")) != 0 or \
+           _name_eq(np, nlen, cast[Ptr[uint8]]("head")) != 0 or \
+           _name_eq(np, nlen, cast[Ptr[uint8]]("title")) != 0:
+            _word_flush()
+            _enter_skip(np, nlen)
+            return
+
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("br")) != 0:
+        _word_flush()
+        _newline()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("p")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("div")) != 0:
+        _word_flush()
+        if is_close == 0:
+            _soft_newline()
+        else:
+            _para_break()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("h1")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("h2")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("h3")) != 0:
+        _word_flush()
+        lvl: int32 = cast[int32](src_ptr[np + 1] - 48)
+        if is_close == 0:
+            _soft_newline()
+            g_heading = lvl
+            _style_break()
+        else:
+            # rule under the heading's last content row, then a gap
+            hr: uint64 = cur_row
+            if row_dirty != 0 and lvl <= 2 and hr < MAX_ROWS:
+                row_rule[hr] = 1
+            g_heading = 0
+            _style_break()
+            _para_break()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("b")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("strong")) != 0:
+        _word_flush()
+        if is_close == 0:
+            g_bold_n = g_bold_n + 1
+        else:
+            if g_bold_n > 0:
+                g_bold_n = g_bold_n - 1
+        _style_break()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("i")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("em")) != 0:
+        # parsed but rendered plain (no italic glyph set) — strip the tag.
+        _word_flush()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("a")) != 0:
+        _word_flush()
+        if is_close == 0:
+            lid: int32 = _capture_href(ne, te)
+            g_link = lid
+        else:
+            g_link = -1
+        _style_break()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("ul")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("ol")) != 0:
+        _word_flush()
+        if is_close == 0:
+            _soft_newline()
+            list_depth = list_depth + 1
+        else:
+            if list_depth > 0:
+                list_depth = list_depth - 1
+            _para_break()
+        indent_x = CONTENT_X + list_depth * 18
+        pen_x = indent_x
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("li")) != 0:
+        _word_flush()
+        if is_close == 0:
+            _soft_newline()
+            indent_x = CONTENT_X + list_depth * 18
+            pen_x = indent_x
+            # bullet marker
+            _seg_putc(42)                            # '*'
+            _seg_putc(32)
+            pen_x = pen_x + 2 * CELL_W
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("pre")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("code")) != 0:
+        is_pre: int32 = _name_eq(np, nlen, cast[Ptr[uint8]]("pre"))
+        _word_flush()
+        if is_pre != 0:
+            if is_close == 0:
+                _soft_newline()
+                pre_mode = 1
+            else:
+                pre_mode = 0
+                _para_break()
+        _style_break()
+        return
+    # Unknown tag: ignore it, keep surrounding text.
+    return
+
+
+# ====================================================================
+# LAYOUT — parse src_ptr/src_len into segments.
+# ====================================================================
+def _reset_layout():
+    n_segs = 0
+    seg_text_len = 0
+    n_links = 0
+    link_href_len = 0
+    cur_row = 0
+    pen_x = CONTENT_X
+    indent_x = CONTENT_X
+    row_dirty = 0
+    need_space = 0
+    seg_open = 0
+    seg_curlen = 0
+    g_color = 0
+    g_bold = 0
+    g_uline = 0
+    g_link = -1
+    g_bold_n = 0
+    g_heading = 0
+    list_depth = 0
+    pre_mode = 0
+    skip_active = 0
+    skip_nlen = 0
+    word_len = 0
+    top_line = 0
+    r: uint64 = 0
+    while r < MAX_ROWS:
+        row_rule[r] = 0
+        r = r + 1
+
+
+def _layout():
+    _reset_layout()
+    i: uint64 = 0
+    while i < src_len:
+        c: uint8 = src_ptr[i]
+        if skip_active != 0:
+            if c == 60:                              # '<'
+                if i + 1 < src_len and src_ptr[i + 1] == 47:     # '</'
+                    if _name_eq(i + 2, skip_nlen, &skip_name[0]) != 0:
+                        skip_active = 0
+                # advance past '>'
+                while i < src_len and src_ptr[i] != 62:
+                    i = i + 1
+                if i < src_len:
+                    i = i + 1
+                continue
+            i = i + 1
+            continue
+        if c == 60:                                  # '<'
+            ts: uint64 = i + 1
+            j: uint64 = ts
+            while j < src_len and src_ptr[j] != 62:
+                j = j + 1
+            _word_flush()
+            _handle_tag(ts, j)
+            if j < src_len:
+                i = j + 1
+            else:
+                i = j
+            continue
+        if c == 38:                                  # '&'
+            consumed: uint64 = _entity(i)
+            if consumed > 0:
+                _word_push(g_ent_char)
+                i = i + consumed
+                continue
+            _word_push(38)
+            i = i + 1
+            continue
+        if pre_mode == 0:
+            if c == 32 or c == 9 or c == 10 or c == 13:
+                _word_flush()
+                need_space = 1
+                i = i + 1
+                continue
+            _word_push(c)
+            i = i + 1
+            continue
+        # preformatted: preserve whitespace, honor newlines.
+        if c == 10:
+            _word_flush()
+            _newline()
+            i = i + 1
+            continue
+        if c == 13:
+            i = i + 1
+            continue
+        if c == 9:
+            _word_push(32)
+            _word_push(32)
+            i = i + 1
+            continue
+        _word_push(c)
+        i = i + 1
+    _word_flush()
+    _close_seg()
+    total_rows = cur_row + 1
+
+
+# ====================================================================
+# SCROLL helpers.
+# ====================================================================
+def _max_top() -> uint64:
+    vr: uint64 = _vis_rows()
+    if total_rows > vr:
+        return total_rows - vr
+    return 0
+
+
+def _scroll_to(t: int64):
+    mt: int64 = cast[int64](_max_top())
+    if t < 0:
+        t = 0
+    if t > mt:
+        t = mt
+    top_line = cast[uint64](t)
+
+
+def _scroll_by(delta: int64):
+    _scroll_to(cast[int64](top_line) + delta)
+
+
+# ====================================================================
+# RENDER.
+# ====================================================================
+render_tmp: Array[1024, uint8]
+
+
+def _set_status(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and i < 159:
+        status_buf[i] = s[i]
+        i = i + 1
+    status_buf[i] = 0
+    status_len = i
+
+
+def emit(wid: int32):
+    hamscene_begin()
+    hamscene_fill(0, 0, bw, bh, cast[Ptr[uint8]]("#ffffff"))
+    # Title / address bar.
+    hamscene_rect(0, 0, bw, TITLE_H, cast[Ptr[uint8]]("#3a6ea5"))
+    tbuf: Array[180, uint8]
+    tp: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("hambrowse  ")
+    a: uint64 = 0
+    while pre[a] != 0:
+        tbuf[tp] = pre[a]
+        tp = tp + 1
+        a = a + 1
+    maxch: uint64 = cast[uint64]((bw - 8) / CELL_W)
+    b: uint64 = 0
+    while cur_url[b] != 0 and tp < maxch and tp < 179:
+        tbuf[tp] = cur_url[b]
+        tp = tp + 1
+        b = b + 1
+    tbuf[tp] = 0
+    hamscene_glyphs(4, 3, &tbuf[0], cast[Ptr[uint8]]("#ffffff"))
+
+    vr: uint64 = _vis_rows()
+    bottom: uint64 = top_line + vr
+    si: uint64 = 0
+    while si < n_segs:
+        row: int32 = seg_line[si]
+        ru: uint64 = cast[uint64](row)
+        if ru >= top_line and ru < bottom:
+            y: int32 = CONTENT_Y + cast[int32](ru - top_line) * LINE_H
+            # copy seg text -> NUL-terminated render_tmp
+            off: uint64 = cast[uint64](seg_off[si])
+            ln: uint64 = cast[uint64](seg_len[si])
+            k: uint64 = 0
+            while k < ln and k < 1023:
+                render_tmp[k] = seg_text_buf[off + k]
+                k = k + 1
+            render_tmp[k] = 0
+            col: Ptr[uint8] = _palette(seg_color[si])
+            if seg_bold[si] != 0:
+                hamscene_glyphs_bold(seg_x[si], y + 2, &render_tmp[0], col)
+            else:
+                hamscene_glyphs(seg_x[si], y + 2, &render_tmp[0], col)
+            if seg_uline[si] != 0:
+                uw: int32 = cast[int32](ln) * CELL_W
+                hamscene_line(seg_x[si], y + LINE_H - 2,
+                              seg_x[si] + uw, y + LINE_H - 2, 1, col)
+        si = si + 1
+    # heading rules
+    rr: uint64 = top_line
+    while rr < bottom and rr < total_rows:
+        if row_rule[rr] != 0:
+            yy: int32 = CONTENT_Y + cast[int32](rr - top_line) * LINE_H
+            hamscene_line(CONTENT_X, yy + LINE_H - 2,
+                          _content_right(), yy + LINE_H - 2, 1,
+                          cast[Ptr[uint8]]("#14306e"))
+        rr = rr + 1
+    # scrollbar (thumb on the right) when content overflows
+    if total_rows > vr:
+        track_x: int32 = bw - 6
+        track_y: int32 = CONTENT_Y
+        track_h: int32 = bh - CONTENT_Y - STATUS_H
+        hamscene_fill(track_x, track_y, 5, track_h,
+                      cast[Ptr[uint8]]("#d8d8d8"))
+        thumb_h: int32 = cast[int32](vr * cast[uint64](track_h) / total_rows)
+        if thumb_h < 12:
+            thumb_h = 12
+        span: uint64 = total_rows - vr
+        thumb_y: int32 = track_y
+        if span > 0:
+            thumb_y = track_y + cast[int32](top_line *
+                      cast[uint64](track_h - thumb_h) / span)
+        hamscene_fill(track_x, thumb_y, 5, thumb_h,
+                      cast[Ptr[uint8]]("#7a8aa0"))
+    # status bar
+    hamscene_fill(0, bh - STATUS_H, bw, STATUS_H,
+                  cast[Ptr[uint8]]("#e8e8e8"))
+    if status_len > 0:
+        hamscene_glyphs(4, bh - STATUS_H + 2, &status_buf[0],
+                        cast[Ptr[uint8]]("#303030"))
+    hamscene_commit(wid)
+
+
+# ====================================================================
+# FETCH — HTTP via http9 (the wget/curl path) or a local file.
+# ====================================================================
+def _app(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and html_len < HTML_CAP - 1:
+        html_buf[html_len] = s[i]
+        html_len = html_len + 1
+        i = i + 1
+
+
+def _build_error(msg: Ptr[uint8], detail: Ptr[uint8]):
+    # Compose a tiny HTML error page in html_buf and point src at it.
+    html_len = 0
+    _app(cast[Ptr[uint8]]("<h1>"))
+    _app(msg)
+    _app(cast[Ptr[uint8]]("</h1><p>"))
+    _app(detail)
+    _app(cast[Ptr[uint8]]("</p>"))
+    src_ptr = &html_buf[0]
+    src_len = html_len
+
+
+def _starts(s: Ptr[uint8], pfx: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while pfx[i] != 0:
+        if s[i] != pfx[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _set_cur_url(u: Ptr[uint8]):
+    i: uint64 = 0
+    while u[i] != 0 and i < 1023:
+        cur_url[i] = u[i]
+        i = i + 1
+    cur_url[i] = 0
+
+
+# Fetch `url` into src_ptr/src_len. Sets the status line. cur_url must be set.
+def _fetch(url: Ptr[uint8]):
+    if _starts(url, cast[Ptr[uint8]]("http://")) != 0 or \
+       _starts(url, cast[Ptr[uint8]]("https://")) != 0:
+        st: Array[1, int64]
+        bo: Array[1, uint64]
+        bl: Array[1, uint64]
+        st[0] = 0
+        bo[0] = 0
+        bl[0] = 0
+        rc: int64 = http_get(url, &resp_buf[0], RESP_CAP,
+                             &st[0], &bo[0], &bl[0])
+        if rc < 0:
+            _build_error(cast[Ptr[uint8]]("Fetch failed"), url)
+            _set_status(cast[Ptr[uint8]]("transport error (DNS/connect/TLS)"))
+            return
+        src_ptr = cast[Ptr[uint8]](cast[uint64](&resp_buf[0]) + bo[0])
+        src_len = bl[0]
+        sb: Array[64, uint8]
+        sp: uint64 = 0
+        pf: Ptr[uint8] = cast[Ptr[uint8]]("HTTP ")
+        a: uint64 = 0
+        while pf[a] != 0:
+            sb[sp] = pf[a]
+            sp = sp + 1
+            a = a + 1
+        sp = sp + _u64_to_dec(cast[uint64](st[0]), &sb[sp])
+        pf2: Ptr[uint8] = cast[Ptr[uint8]]("  bytes ")
+        a = 0
+        while pf2[a] != 0:
+            sb[sp] = pf2[a]
+            sp = sp + 1
+            a = a + 1
+        sp = sp + _u64_to_dec(bl[0], &sb[sp])
+        sb[sp] = 0
+        _set_status(&sb[0])
+        return
+    # Local file path (strip a file:// prefix if present).
+    path: Ptr[uint8] = url
+    if _starts(url, cast[Ptr[uint8]]("file://")) != 0:
+        path = cast[Ptr[uint8]](cast[uint64](url) + 7)
+    fd: int32 = sys_open(cast[Ptr[char]](path))
+    if fd < 0:
+        _build_error(cast[Ptr[uint8]]("Cannot open file"), url)
+        _set_status(cast[Ptr[uint8]]("open failed"))
+        return
+    html_len = 0
+    while html_len < HTML_CAP - 1:
+        n: int64 = sys_read(fd, &html_buf[html_len], HTML_CAP - 1 - html_len)
+        if n <= 0:
+            break
+        html_len = html_len + cast[uint64](n)
+    sys_close(fd)
+    src_ptr = &html_buf[0]
+    src_len = html_len
+    sb2: Array[48, uint8]
+    sp2: uint64 = 0
+    pf3: Ptr[uint8] = cast[Ptr[uint8]]("file  ")
+    a2: uint64 = 0
+    while pf3[a2] != 0:
+        sb2[sp2] = pf3[a2]
+        sp2 = sp2 + 1
+        a2 = a2 + 1
+    sp2 = sp2 + _u64_to_dec(html_len, &sb2[sp2])
+    pf4: Ptr[uint8] = cast[Ptr[uint8]](" bytes")
+    a2 = 0
+    while pf4[a2] != 0:
+        sb2[sp2] = pf4[a2]
+        sp2 = sp2 + 1
+        a2 = a2 + 1
+    sb2[sp2] = 0
+    _set_status(&sb2[0])
+
+
+# Built-in demo page (no network) — exercises every supported feature.
+def _load_demo():
+    html_len = 0
+    _app(cast[Ptr[uint8]]("<html><head><title>ignored</title>"))
+    _app(cast[Ptr[uint8]]("<style>body{color:red}</style></head><body>"))
+    _app(cast[Ptr[uint8]]("<h1>Hamnix Web</h1>"))
+    _app(cast[Ptr[uint8]]("<p>Welcome to <b>hambrowse</b>, the native "))
+    _app(cast[Ptr[uint8]]("<i>scene-DE</i> web browser. It fetches a page "))
+    _app(cast[Ptr[uint8]]("over HTTP and renders a tolerant subset of HTML "))
+    _app(cast[Ptr[uint8]]("&mdash; no CSS, no JavaScript, just "))
+    _app(cast[Ptr[uint8]]("<b>structure &amp; text</b>.</p>"))
+    _app(cast[Ptr[uint8]]("<h2>Features</h2>"))
+    _app(cast[Ptr[uint8]]("<ul>"))
+    _app(cast[Ptr[uint8]]("<li>Headings h1&#45;h3, paragraphs and "))
+    _app(cast[Ptr[uint8]]("line<br>breaks</li>"))
+    _app(cast[Ptr[uint8]]("<li>Bold, lists, and <b>nested <i>inline</i> "))
+    _app(cast[Ptr[uint8]]("markup</b></li>"))
+    _app(cast[Ptr[uint8]]("<li>Hyperlinks that "))
+    _app(cast[Ptr[uint8]]("<a href=\"http://example.com/\">navigate</a> "))
+    _app(cast[Ptr[uint8]]("when clicked</li>"))
+    _app(cast[Ptr[uint8]]("<li>Word wrapping to the window width</li>"))
+    _app(cast[Ptr[uint8]]("</ul>"))
+    _app(cast[Ptr[uint8]]("<h3>Preformatted</h3>"))
+    _app(cast[Ptr[uint8]]("<pre>  fn main() {\n"))
+    _app(cast[Ptr[uint8]]("      print(\"hello, hamnix\");\n  }</pre>"))
+    _app(cast[Ptr[uint8]]("<p>Entities work too: 1 &lt; 2 &amp;&amp; 3 "))
+    _app(cast[Ptr[uint8]]("&gt; 2, &quot;quoted&quot;, and &#72;&#105;.</p>"))
+    _app(cast[Ptr[uint8]]("<p>Visit "))
+    _app(cast[Ptr[uint8]]("<a href=\"http://127.0.0.1/index.html\">the "))
+    _app(cast[Ptr[uint8]]("local server</a> or scroll for more. "))
+    _app(cast[Ptr[uint8]]("This paragraph is intentionally long so that "))
+    _app(cast[Ptr[uint8]]("the layout engine has to wrap it across several "))
+    _app(cast[Ptr[uint8]]("lines inside the content area, demonstrating "))
+    _app(cast[Ptr[uint8]]("the inline flow and right margin handling of "))
+    _app(cast[Ptr[uint8]]("the renderer in a real window.</p>"))
+    _app(cast[Ptr[uint8]]("</body></html>"))
+    src_ptr = &html_buf[0]
+    src_len = html_len
+    sb: Array[40, uint8]
+    sp: uint64 = 0
+    df: Ptr[uint8] = cast[Ptr[uint8]]("demo page  ")
+    a: uint64 = 0
+    while df[a] != 0:
+        sb[sp] = df[a]
+        sp = sp + 1
+        a = a + 1
+    sp = sp + _u64_to_dec(html_len, &sb[sp])
+    sb[sp] = 0
+    _set_status(&sb[0])
+
+
+# ====================================================================
+# LINK NAVIGATION.
+# ====================================================================
+nav_buf: Array[1024, uint8]
+
+
+def _href_starts(ho: uint64, hl: uint64, pfx: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while pfx[i] != 0:
+        if i >= hl:
+            return 0
+        if link_href_buf[ho + i] != pfx[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Length of "scheme://authority" in cur_url (up to the first '/' after "://").
+def _authority_len() -> uint64:
+    n: uint64 = _slen(&cur_url[0])
+    i: uint64 = 0
+    while i + 2 < n:
+        if cur_url[i] == 58 and cur_url[i + 1] == 47 and cur_url[i + 2] == 47:
+            j: uint64 = i + 3
+            while j < n and cur_url[j] != 47:
+                j = j + 1
+            return j
+        i = i + 1
+    return 0
+
+
+# Length of cur_url up to and including the last '/' (the "directory").
+def _dir_len() -> uint64:
+    n: uint64 = _slen(&cur_url[0])
+    last: int64 = -1
+    al: uint64 = _authority_len()
+    i: uint64 = al
+    while i < n:
+        if cur_url[i] == 47:
+            last = cast[int64](i)
+        i = i + 1
+    if last < 0:
+        return n                                      # no path slash: append
+    return cast[uint64](last) + 1
+
+
+# Resolve href (link id) against cur_url into nav_buf. Returns 1 if usable.
+def _resolve(lid: int32) -> int32:
+    if lid < 0 or cast[uint64](lid) >= n_links:
+        return 0
+    ho: uint64 = cast[uint64](link_off[lid])
+    hl: uint64 = cast[uint64](link_len[lid])
+    # in-page anchor: ignore
+    if hl > 0 and link_href_buf[ho] == 35:           # '#'
+        return 0
+    # absolute URL
+    if hl >= 7:
+        if _href_starts(ho, hl, cast[Ptr[uint8]]("http://")) != 0 or \
+           _href_starts(ho, hl, cast[Ptr[uint8]]("https://")) != 0:
+            k: uint64 = 0
+            while k < hl and k < 1023:
+                nav_buf[k] = link_href_buf[ho + k]
+                k = k + 1
+            nav_buf[k] = 0
+            return 1
+    # root-relative ("/path"): scheme://authority + href
+    if hl > 0 and link_href_buf[ho] == 47:
+        alen: uint64 = _authority_len()
+        if alen == 0:
+            return 0
+        p: uint64 = 0
+        while p < alen and p < 1023:
+            nav_buf[p] = cur_url[p]
+            p = p + 1
+        k2: uint64 = 0
+        while k2 < hl and p < 1023:
+            nav_buf[p] = link_href_buf[ho + k2]
+            p = p + 1
+            k2 = k2 + 1
+        nav_buf[p] = 0
+        return 1
+    # document-relative: cur_url up to last '/' + href
+    dlen: uint64 = _dir_len()
+    p2: uint64 = 0
+    while p2 < dlen and p2 < 1023:
+        nav_buf[p2] = cur_url[p2]
+        p2 = p2 + 1
+    k3: uint64 = 0
+    while k3 < hl and p2 < 1023:
+        nav_buf[p2] = link_href_buf[ho + k3]
+        p2 = p2 + 1
+        k3 = k3 + 1
+    nav_buf[p2] = 0
+    return 1
+
+
+def _navigate(lid: int32) -> int32:
+    if _resolve(lid) == 0:
+        return 0
+    _set_cur_url(&nav_buf[0])
+    _fetch(&nav_buf[0])
+    _layout()
+    top_line = 0
+    return 1
+
+
+# Map a window-local click to a link id (or -1).
+def _hit_link(x: int32, y: int32) -> int32:
+    if y < CONTENT_Y or y >= bh - STATUS_H:
+        return -1
+    row: uint64 = top_line + cast[uint64]((y - CONTENT_Y) / LINE_H)
+    si: uint64 = 0
+    while si < n_segs:
+        if cast[uint64](seg_line[si]) == row and seg_link[si] >= 0:
+            x0: int32 = seg_x[si]
+            x1: int32 = x0 + seg_len[si] * CELL_W
+            if x >= x0 and x < x1:
+                return seg_link[si]
+        si = si + 1
+    return -1
+
+
+# ====================================================================
+# WINDOW + EVENT plumbing.
+# ====================================================================
+def _newwindow() -> int32:
+    wfd: int32 = sys_open_write(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if wfd < 0:
+        return -1
+    sys_write(wfd, cast[Ptr[uint8]]("newwindow\n"), 10)
+    sys_close(wfd)
+    rfd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if rfd < 0:
+        return -1
+    rbuf: Array[32, uint8]
+    r: int64 = sys_read(rfd, &rbuf[0], 31)
+    sys_close(rfd)
+    if r <= 0:
+        return -1
+    wid: int32 = 0
+    i: uint64 = 0
+    while i < cast[uint64](r):
+        c: uint8 = rbuf[i]
+        if c >= 48 and c <= 57:
+            wid = wid * 10 + cast[int32](c) - 48
+        i = i + 1
+    return wid
+
+
+def _winpath(out: Ptr[uint8], wid: int32, leaf: Ptr[uint8]):
+    p: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("/dev/wsys/")
+    j: uint64 = 0
+    while pre[j] != 0:
+        out[p] = pre[j]
+        p = p + 1
+        j = j + 1
+    p = p + _u64_to_dec(cast[uint64](wid), &out[p])
+    k: uint64 = 0
+    while leaf[k] != 0:
+        out[p] = leaf[k]
+        p = p + 1
+        k = k + 1
+    out[p] = 0
+
+
+def _ctl_write(ctlp: Ptr[uint8], s: Ptr[uint8]):
+    fd: int32 = sys_open_write(cast[Ptr[char]](ctlp))
+    if fd >= 0:
+        _writeall(fd, s)
+        sys_close(fd)
+
+
+# ---- /keys decode: arrows + scroll keys -----------------------------
+kev_buf: Array[256, uint8]
+kev_carry: uint64 = 0
+esc_st: int32 = 0
+
+
+# Returns 1 if the view changed, 2 if a navigation happened (full redraw).
+def _handle_code(code: int32) -> int32:
+    if esc_st == 1:
+        if code == 91:                              # '['
+            esc_st = 2
+            return 0
+        esc_st = 0
+    elif esc_st == 2:
+        esc_st = 0
+        if code == 65:                              # up
+            _scroll_by(-1)
+            return 1
+        if code == 66:                              # down
+            _scroll_by(1)
+            return 1
+        return 0
+    if code == 27:
+        esc_st = 1
+        return 0
+    if code == 106:                                 # 'j'
+        _scroll_by(1)
+        return 1
+    if code == 107:                                 # 'k'
+        _scroll_by(-1)
+        return 1
+    if code == 32 or code == 102:                   # space / 'f' page down
+        _scroll_by(cast[int64](_vis_rows()) - 1)
+        return 1
+    if code == 98:                                  # 'b' page up
+        _scroll_by(1 - cast[int64](_vis_rows()))
+        return 1
+    if code == 103:                                 # 'g' top
+        _scroll_to(0)
+        return 1
+    if code == 71:                                  # 'G' bottom
+        _scroll_to(cast[int64](_max_top()))
+        return 1
+    return 0
+
+
+def _drain_keys(n: uint64, vp: Ptr[int32]) -> uint64:
+    i: uint64 = 0
+    consumed: uint64 = 0
+    while i < n:
+        t: uint8 = kev_buf[i]
+        i = i + 1
+        if i < n and kev_buf[i] == 32:
+            i = i + 1
+        code: int32 = 0
+        have: int32 = 0
+        neg: int32 = 0
+        if i < n and kev_buf[i] == 45:
+            neg = 1
+            i = i + 1
+        while i < n and kev_buf[i] >= 48 and kev_buf[i] <= 57:
+            code = code * 10 + cast[int32](kev_buf[i]) - 48
+            i = i + 1
+            have = 1
+        while i < n and kev_buf[i] != 10:
+            i = i + 1
+        if i >= n:
+            return consumed
+        i = i + 1
+        consumed = i
+        if neg != 0:
+            code = 0 - code
+        if t != 100 or have == 0:                    # only press ('d'=100)
+            continue
+        rc: int32 = _handle_code(code)
+        if rc != 0 and vp[0] < rc:
+            vp[0] = rc
+    return consumed
+
+
+# ---- /event poll: resize ('r w h'), wheel + click ('m x y btn dz') --
+ev_buf: Array[256, uint8]
+ev_carry: uint64 = 0
+
+
+def _parse_ints(ls: uint64, le: uint64, out: Ptr[int64], maxf: int32) -> int32:
+    # parse up to maxf signed ints from ev_buf[ls..le) skipping the leading
+    # type token; returns count parsed.
+    p: uint64 = ls
+    # skip first token (type char) + spaces
+    while p < le and ev_buf[p] != 32:
+        p = p + 1
+    cnt: int32 = 0
+    while cnt < maxf:
+        while p < le and ev_buf[p] == 32:
+            p = p + 1
+        if p >= le:
+            break
+        neg: int32 = 0
+        if ev_buf[p] == 45:
+            neg = 1
+            p = p + 1
+        v: int64 = 0
+        d: int32 = 0
+        while p < le and ev_buf[p] >= 48 and ev_buf[p] <= 57:
+            v = v * 10 + cast[int64](ev_buf[p]) - 48
+            p = p + 1
+            d = 1
+        if d == 0:
+            break
+        if neg != 0:
+            v = 0 - v
+        out[cnt] = v
+        cnt = cnt + 1
+    return cnt
+
+
+def _poll_events(efd: int32, vp: Ptr[int32]) -> int32:
+    if efd < 0:
+        return 0
+    changed: int32 = 0
+    passes: int32 = 0
+    while passes < 4:
+        room: uint64 = 256 - ev_carry
+        if room == 0:
+            ev_carry = 0
+            room = 256
+        en: int64 = sys_read_nb(efd, &ev_buf[ev_carry], room)
+        if en <= 0:
+            break
+        total: uint64 = ev_carry + cast[uint64](en)
+        i: uint64 = 0
+        ls: uint64 = 0
+        while i < total:
+            if ev_buf[i] == 10:
+                if i > ls and ev_buf[ls] == 114:     # 'r' resize
+                    f: Array[2, int64]
+                    if _parse_ints(ls, i, &f[0], 2) == 2:
+                        if f[0] > 80 and f[1] > 80:
+                            if cast[int32](f[0]) != bw or cast[int32](f[1]) != bh:
+                                bw = cast[int32](f[0])
+                                bh = cast[int32](f[1])
+                                _layout()
+                                _scroll_to(cast[int64](top_line))
+                                if vp[0] < 1:
+                                    vp[0] = 1
+                                changed = 1
+                elif i > ls and ev_buf[ls] == 109:   # 'm' pointer
+                    f2: Array[4, int64]
+                    nf: int32 = _parse_ints(ls, i, &f2[0], 4)
+                    if nf >= 4 and f2[3] != 0:        # wheel dz
+                        prev: uint64 = top_line
+                        _scroll_by(0 - f2[3])
+                        if top_line != prev:
+                            if vp[0] < 1:
+                                vp[0] = 1
+                            changed = 1
+                    elif nf >= 3 and (f2[2] & 1) != 0:   # button-1 click
+                        lid: int32 = _hit_link(cast[int32](f2[0]),
+                                               cast[int32](f2[1]))
+                        if lid >= 0:
+                            if _navigate(lid) != 0:
+                                if vp[0] < 2:
+                                    vp[0] = 2
+                                changed = 1
+                ls = i + 1
+            i = i + 1
+        leftover: uint64 = total - ls
+        m: uint64 = 0
+        while m < leftover:
+            ev_buf[m] = ev_buf[ls + m]
+            m = m + 1
+        ev_carry = leftover
+        passes = passes + 1
+    return changed
+
+
+# ====================================================================
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    sys_bind(cast[Ptr[char]]("/dev"), cast[Ptr[char]]("#c"), 0)
+
+    # Resolve the page to load.
+    is_demo: int32 = 0
+    target: Ptr[uint8] = cast[Ptr[uint8]](0)
+    if argc >= 2 and argv != cast[Ptr[uint64]](0):
+        a1: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        if _starts(a1, cast[Ptr[uint8]]("--demo")) != 0:
+            is_demo = 1
+        else:
+            target = a1
+    else:
+        is_demo = 1
+
+    # FETCH + PARSE + LAYOUT first, while stdout is still the serial console
+    # (a scene client's stdout is REBOUND away from serial by `newwindow`),
+    # so the render summary below reaches a host harness watching the log.
+    if is_demo != 0:
+        _set_cur_url(cast[Ptr[uint8]]("about:demo"))
+        _load_demo()
+    else:
+        _set_cur_url(target)
+        _fetch(target)
+    _layout()
+    top_line = 0
+
+    _writeall(1, cast[Ptr[uint8]]("[hambrowse] rendered segs="))
+    rep: Array[24, uint8]
+    rl: uint64 = _u64_to_dec(n_segs, &rep[0])
+    rep[rl] = 0
+    _writeall(1, &rep[0])
+    _writeall(1, cast[Ptr[uint8]](" rows="))
+    rl = _u64_to_dec(total_rows, &rep[0])
+    rep[rl] = 0
+    _writeall(1, &rep[0])
+    _writeall(1, cast[Ptr[uint8]](" links="))
+    rl = _u64_to_dec(n_links, &rep[0])
+    rep[rl] = 0
+    _writeall(1, &rep[0])
+    _writeall(1, cast[Ptr[uint8]]("\n"))
+    _writeall(1, cast[Ptr[uint8]]("[hambrowse] opening scene window\n"))
+
+    wid: int32 = _newwindow()
+    if wid < 0:
+        _writeall(1, cast[Ptr[uint8]]("[hambrowse] FAIL newwindow\n"))
+        return 1
+
+    # Publish wid for scripted key/pointer injection.
+    widf: int32 = sys_open_write(cast[Ptr[char]]("/tmp/.hambrowse_wid"))
+    if widf >= 0:
+        wt: Array[24, uint8]
+        wl: uint64 = _u64_to_dec(cast[uint64](wid), &wt[0])
+        wt[wl] = 10
+        sys_write(widf, &wt[0], wl + 1)
+        sys_close(widf)
+
+    ctlp: Array[64, uint8]
+    keysp: Array[64, uint8]
+    evtp: Array[64, uint8]
+    _winpath(&ctlp[0], wid, cast[Ptr[uint8]]("/ctl"))
+    _winpath(&keysp[0], wid, cast[Ptr[uint8]]("/keys"))
+    _winpath(&evtp[0], wid, cast[Ptr[uint8]]("/event"))
+
+    _ctl_write(&ctlp[0], cast[Ptr[uint8]]("geometry 90 60 600 440\n"))
+    _ctl_write(&ctlp[0], cast[Ptr[uint8]]("decorate 1\n"))
+    _ctl_write(&ctlp[0], cast[Ptr[uint8]]("z 6\n"))
+    _ctl_write(&ctlp[0], cast[Ptr[uint8]]("title Browser\n"))
+
+    emit(wid)
+
+    kfd: int32 = sys_open(cast[Ptr[char]](&keysp[0]))
+    efd: int32 = sys_open(cast[Ptr[char]](&evtp[0]))
+    if kfd < 0:
+        while True:
+            sys_yield()
+        return 1
+
+    IDLE_MS: int64 = 12
+    while True:
+        room: uint64 = 256 - kev_carry
+        if room == 0:
+            kev_carry = 0
+            room = 256
+        kn: int64 = sys_read_nb(kfd, &kev_buf[kev_carry], room)
+        vchg: Array[1, int32]
+        vchg[0] = 0
+        _poll_events(efd, &vchg[0])
+        if kn > 0:
+            total: uint64 = kev_carry + cast[uint64](kn)
+            done: uint64 = _drain_keys(total, &vchg[0])
+            leftover: uint64 = total - done
+            m: uint64 = 0
+            while m < leftover:
+                kev_buf[m] = kev_buf[done + m]
+                m = m + 1
+            kev_carry = leftover
+        if vchg[0] != 0:
+            emit(wid)
+        else:
+            wfds: Array[1, int32]
+            wfds[0] = kfd
+            sys_waitfds(&wfds[0], 1, IDLE_MS)
+    return 0
