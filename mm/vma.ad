@@ -304,10 +304,38 @@ VMA_PT_ADDR_MASK: uint64 = 0x000FFFFFFFFFF000    # bits [51:12]: phys base
 VMA_LARGE_BASE:   uint64 = 0x40000000           # 1 GiB
 VMA_LARGE_LIMIT:  uint64 = 0xFFC00000           # just under 4 GiB
 
-# Bump pointer for the next free multi-chunk virtual window. 4-MiB-
-# aligned so every 4-MiB chunk install stays within one 1 GiB PDPT
+# PER-TASK bump pointer for the next free multi-chunk virtual window.
+# 4-MiB-aligned so every 4-MiB chunk install stays within one 1 GiB PDPT
 # entry (elf_install_user_mapping refuses a range crossing 1 GiB).
-vma_large_next:   uint64 = 0x40000000
+#
+# WAS a single module-global. That was an SMP correctness bug: it is
+# RESET per-exec by vma_set_mmap_base() (do_execve) AND read-modify-
+# written by _vma_win_alloc(), with no lock. Under -smp 2, the
+# `ls | grep cat` pipeline forks two children that exec CONCURRENTLY on
+# both CPUs (a load only reachable now that T62/T64 fixed fork-EAGAIN);
+# one task's exec clobbered the global mid-sequence of another task's
+# windowed-mmap allocations, so a task could be handed two windows that
+# OVERLAP within its own address space (or a stale base), corrupting its
+# VMA interval tree / leaf PTEs and surfacing as an intermittent
+# not-present SIGSEGV at an mmap-window address (busybox fault at
+# mmap_base+0x400248, captured by test_fork_eagain_pipeline.sh).
+#
+# Each address space owns its own cursor now (Linux's mm->mmap_base
+# model), matching the already-per-task windowed free-list below. A task
+# runs on one CPU at a time, so per-task access needs no extra lock. A 0
+# entry means "never initialized" and reads back as VMA_LARGE_BASE; every
+# exec sets a real value via vma_set_mmap_base() before the first mmap,
+# and fork copies the parent's cursor (vma_fork_copy) so a fork-without-
+# exec child never hands out a window overlapping an inherited VMA.
+NR_TASKS_VLN:      uint64 = 512
+vma_large_next_arr: Array[512, uint64]
+
+
+def _vma_large_next(slot: uint64) -> uint64:
+    v: uint64 = vma_large_next_arr[slot]
+    if v == 0:
+        return VMA_LARGE_BASE
+    return v
 
 # ---------------------------------------------------------------------
 # Windowed-VA RECLAIM free-list (per-task) — apt shared-object exhaustion
@@ -384,15 +412,14 @@ def _vma_win_free_push(slot: uint64, base: uint64, size: uint64):
             if base < de and db < end:
                 return
         d = d + 1
-    # Tail rollback: if this extent sits at the very top of the GLOBAL bump
-    # pointer, give it back to vma_large_next instead of caching it. The
-    # counter is monotonic and shared, so its tail == the highest VA ever
-    # handed out; this window was last handed to THIS task (we're freeing
-    # it), so rolling the global pointer back recovers the VA for ANY task's
-    # next allocation — bounding the cross-process global leak for the
-    # common LIFO unmap pattern (glibc maps then frees its top arena/DSO).
-    if end == vma_large_next:
-        vma_large_next = base
+    # Tail rollback: if this extent sits at the very top of THIS TASK's bump
+    # pointer, give it back to the cursor instead of caching it. The cursor
+    # is monotonic per-task, so its tail == the highest VA this task ever
+    # handed out; rolling it back recovers the VA for this task's next
+    # allocation — the common LIFO unmap pattern (glibc maps then frees its
+    # top arena/DSO).
+    if end == _vma_large_next(slot):
+        vma_large_next_arr[slot] = base
         # The roll-back may now make the PREVIOUS free-list tail extent
         # contiguous with the global pointer too; sweep once to pull any
         # such cached extents back into the counter.
@@ -404,8 +431,8 @@ def _vma_win_free_push(slot: uint64, base: uint64, size: uint64):
                 kb: uint64 = g_vma_win_free_base[base_i + k]
                 if kb != 0:
                     ke: uint64 = kb + g_vma_win_free_size[base_i + k]
-                    if ke == vma_large_next:
-                        vma_large_next = kb
+                    if ke == _vma_large_next(slot):
+                        vma_large_next_arr[slot] = kb
                         g_vma_win_free_base[base_i + k] = 0
                         g_vma_win_free_size[base_i + k] = 0
                         progress = 1
@@ -468,10 +495,10 @@ def _vma_win_alloc(slot: uint64, window: uint64) -> uint64:
     reuse: uint64 = _vma_win_free_pop(slot, window)
     if reuse != 0:
         return reuse
-    base: uint64 = vma_large_next
+    base: uint64 = _vma_large_next(slot)
     if base + window > VMA_LARGE_LIMIT:
         return 0
-    vma_large_next = base + window
+    vma_large_next_arr[slot] = base + window
     return base
 
 
@@ -537,15 +564,17 @@ VMA_MMAP_ASLR_SLIDE_MAX: uint64 = 0x10000000     # 256 MiB
 VMA_MMAP_ALIGN:          uint64 = 0x400000        # 4 MiB
 
 
-def vma_set_mmap_base(slide: uint64):
-    # Set the mmap-window start to VMA_LARGE_BASE + (4-MiB-aligned slide),
-    # clamped so the window never starts above the reserved entropy band.
-    # Called by do_execve once per exec; slide == 0 restores the exact
-    # pre-ASLR base (deterministic / aslr_disabled boot).
+def vma_set_mmap_base(slot: uint64, slide: uint64):
+    # Set the EXEC'ing task's mmap-window start to VMA_LARGE_BASE +
+    # (4-MiB-aligned slide), clamped so the window never starts above the
+    # reserved entropy band. Called by do_execve once per exec; slide == 0
+    # restores the exact pre-ASLR base (deterministic / aslr_disabled boot).
+    # Per-task: clobbering one task's cursor here no longer corrupts a
+    # concurrently-exec'ing sibling's windowed-mmap layout on another CPU.
     s: uint64 = slide & ~(VMA_MMAP_ALIGN - 1)
     if s > VMA_MMAP_ASLR_SLIDE_MAX:
         s = VMA_MMAP_ASLR_SLIDE_MAX
-    vma_large_next = VMA_LARGE_BASE + s
+    vma_large_next_arr[slot] = VMA_LARGE_BASE + s
 
 # Memory-leak accounting: live VmaNode count. Incremented in
 # _vma_node_new, decremented in _vma_node_free. A spawn/reap cycle
@@ -5067,6 +5096,13 @@ def vma_fork_copy(child_slot: uint64, parent_slot: uint64,
 
 def _vma_fork_copy_locked(child_slot: uint64, parent_slot: uint64,
                   child_pml4: uint64) -> int32:
+    # Inherit the parent's windowed-mmap cursor so a fork-WITHOUT-exec child
+    # (which keeps the parent's COW address space + every inherited windowed
+    # VMA) never hands out a window VA that overlaps an inherited mapping.
+    # A child that execs immediately resets this via vma_set_mmap_base; this
+    # copy only matters for the fork-and-keep-running case. (When the cursor
+    # was a single global this inheritance was implicit.)
+    vma_large_next_arr[child_slot] = vma_large_next_arr[parent_slot]
     parent_pml4: uint64 = task_pml4(cast[int32](parent_slot))
     touched_parent: int32 = 0
     cur: uint64 = task_vma_list_head(parent_slot)
