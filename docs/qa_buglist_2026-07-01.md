@@ -50,7 +50,9 @@ spawns. Regression gate: `scripts/test_de_panel_widgets_ux.sh` (PASS on main).
   - NOTE: first pass punted this as "future work" with a test-only change;
     orchestrator reopened it with corrected scope → real fix.
   - Found a hamsh language quirk (task #8): `export VAR=value` is invalid; bare
-    `VAR=value` RHS parses as arithmetic. Worked around; fix in the parser.
+    `VAR=value` RHS parses as arithmetic. **FIXED c93919db** — lexer distinguishes
+    glued `=` (literal RHS) from spaced `=` (arithmetic); boot-verified via KVM DE
+    gate. rc.de-user's `HOME='/home/live'` workaround could now be plain `HOME=...`.
   - DEFERRED (quiet window): `test_de_terminal_nonhostowner.sh` one-way-deny
     assertions + a full visual DE boot (SIGKILL'd under load) — fold into #6.
 
