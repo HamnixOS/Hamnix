@@ -166,7 +166,7 @@ current main (all 10 fixes) and re-verified with the working input tooling:
   to MATE parity. Enhancement, not a bug.
 
 ## Interactive QA pass #4 (orchestrator, 2026-07-01) — browser regression found
-- [ ] **QA-N6** (regression, HIGH) — the native Web Browser doesn't open a
+- [x] **QA-N6** (regression) — RESOLVED. The native Web Browser doesn't open a
   window. `scripts/test_de_browser.sh` (deterministic, serial-launches
   `hambrowse --demo &`) FAILS on the fresh current-main image: no "opening scene
   window", no "rendered segs=" — but NO panic. STATUS T75 shows this test PASSED
@@ -189,6 +189,16 @@ current main (all 10 fixes) and re-verified with the working input tooling:
     segs" across 3 runs) — suspected SECOND gate on the per-window files
     (/dev/wsys/<wid>/{scene,event,pointer}) for uid 1001. Agent resumed to
     reconcile + fix the test's hidden-serial/rc=0-on-fail visibility gap.
+  - RESOLVED: NO second kernel gate — per-window scene files (/dev/wsys/<wid>/*)
+    are gated by OWNERSHIP (creator pid), not uid, so `live` passes. The ctl fix
+    (3be71289) was the complete kernel fix. GROUND TRUTH (orchestrator serial
+    capture, fresh main, uid 1001): `hambrowse --demo &` → `[hambrowse] rendered
+    segs=28 rows=28 links=2` + `opening scene window`. Browser WORKS. My earlier
+    test FAILs were harness-only: the test fires the timed launch without warming
+    up the shell (first-serial-command-drop ate it under load) AND its composite
+    gate false-positives on any DE window's blue title bar. Test hardening =
+    task #13 (product verified, test-quality follow-up). Test hardening commit
+    b19a45cc (retry + non-zero-on-fail + serial dump) landed but still flaky here.
 - [~] **QA-N3b caveat** — the HMP-mouse tooling is reliable for a SINGLE click
   (landed the Applications button in pass #3) but FLAKY across multi-step
   sequences (pass #4's menu→item click missed; cursor landed bottom-right). For
