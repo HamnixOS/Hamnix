@@ -562,6 +562,83 @@ def _stage_sysroot_etc(sysroot: Path) -> int:
     return n
 
 
+# Debian release the busybox-only fallback advertises. Kept in sync with
+# tests/distros/debian-minbase (bookworm). Only used when the real
+# debootstrap tree is absent (this host) or LIVE-MINIMAL trims it away.
+_MINIMAL_DEBIAN_VERSION = "12.9"
+
+
+def _stage_minimal_etc(distro: Path) -> int:
+    """Plant a minimal-but-REAL Debian /etc (+ /var/lib/dpkg/status).
+
+    The busybox-only staging paths (LIVE-MINIMAL, or a host with no
+    debootstrap tree) previously left the distro root with NO /etc at
+    all, so `enter linux { ls / }` showed no /etc and
+    `cat /etc/debian_version` failed — breaking apt / config / passwd /
+    login inside the Linux namespace. The full real-Debian closures do
+    stage /etc from tests/distros/debian-minbase, so this helper ONLY
+    writes files that are not already present: it never clobbers a
+    genuine staged /etc, and it makes the busybox-only namespace
+    Debian-shaped enough for basic config/identity tooling.
+
+    Returns the number of files planted.
+    """
+    files: dict[str, str] = {
+        "etc/debian_version": _MINIMAL_DEBIAN_VERSION + "\n",
+        "etc/os-release": (
+            'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n'
+            'NAME="Debian GNU/Linux"\n'
+            'VERSION_ID="12"\n'
+            'VERSION="12 (bookworm)"\n'
+            'VERSION_CODENAME=bookworm\n'
+            "ID=debian\n"
+            'HOME_URL="https://www.debian.org/"\n'
+            'SUPPORT_URL="https://www.debian.org/support"\n'
+            'BUG_REPORT_URL="https://bugs.debian.org/"\n'
+        ),
+        "etc/hostname": "hamnix\n",
+        "etc/passwd": (
+            "root:x:0:0:root:/root:/bin/sh\n"
+            "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+            "bin:x:2:2:bin:/bin:/usr/sbin/nologin\n"
+            "sys:x:3:3:sys:/dev:/usr/sbin/nologin\n"
+            "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+        ),
+        "etc/group": (
+            "root:x:0:\n"
+            "daemon:x:1:\n"
+            "bin:x:2:\n"
+            "sys:x:3:\n"
+            "adm:x:4:\n"
+            "sudo:x:27:\n"
+            "nogroup:x:65534:\n"
+        ),
+        "etc/apt/sources.list": (
+            "deb http://deb.debian.org/debian bookworm main\n"
+            "deb http://deb.debian.org/debian bookworm-updates main\n"
+            "deb http://security.debian.org/debian-security "
+            "bookworm-security main\n"
+        ),
+        "etc/apt/apt.conf": (
+            'APT::Architecture "amd64";\n'
+        ),
+        # dpkg admindir scaffolding — an empty status DB is a valid,
+        # queryable "no packages installed" state (dpkg -l works).
+        "var/lib/dpkg/status": "",
+        "var/lib/dpkg/available": "",
+    }
+    n = 0
+    for rel, content in files.items():
+        dst = distro / rel
+        if dst.exists():
+            continue                    # never clobber a real staged /etc
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(content, encoding="ascii")
+        dst.chmod(0o644)
+        n += 1
+    return n
+
+
 def _plant_distro_provenance(distro: Path) -> None:
     """Plant a PROVENANCE marker file at the distro root.
 
@@ -650,6 +727,16 @@ def _stage_distro(distro: Path, live: bool = False) -> None:
               f"{minbase.relative_to(HERE)} (HAMNIX_DEBIAN_FULL=0)",
               flush=True)
     _stage_busybox(distro)
+    # Guarantee a minimal-but-real Debian /etc (+ dpkg status) exists even
+    # on the busybox-only paths (LIVE-MINIMAL / no debootstrap tree). Runs
+    # AFTER the real-Debian staging above so it only fills in files that
+    # closure did not already provide — a full mirror keeps its own /etc.
+    en = _stage_minimal_etc(distro)
+    if en:
+        print(f"[build_rootfs_img] planted {en} minimal /etc + dpkg files "
+              f"(debian_version={_MINIMAL_DEBIAN_VERSION}) into distro/ "
+              f"(busybox-only fallback — real closure absent/trimmed)",
+              flush=True)
     _plant_distro_provenance(distro)
 
 
