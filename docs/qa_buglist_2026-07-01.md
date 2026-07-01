@@ -316,6 +316,22 @@ Confirmed the QA-N14 busybox applets FUNCTION (not just resolve): `hostname`→
   partial (dir enumeration without per-pid nodes). Real "run Debian" gap but a
   sizeable subsystem — tracked for a dedicated future effort, not a quick fix.
 
+## Interactive END-USER push #1 (orchestrator, 2026-07-01) — pushing limits
+On the 15:35 fresh image (all fixes). WORKS: native pipe `ls / | grep bin`→`bin`;
+native redirect `echo x > /tmp/f; cat /tmp/f`→`x`; **QA-N17 VERIFIED** `enter
+linux {ls /proc}`→pid dirs + meminfo/mounts/version/cpuinfo (zero errors),
+`enter linux {ps}`→`PID USER TIME COMMAND` process table; linux pipe `ps | grep
+hamsh`; linux redirect `sh -c "echo A > /tmp/lx; cat /tmp/lx"`→`A`. apt-get not
+found (expected, minimal root); `mount`→exit 1 (minor).
+- [ ] **QA-N18** (hamsh UX, LOW — needs syntax confirm) — `for x in a b c { echo
+  $x }` (POSIX word-list) → `parse error: expected {`. hamsh is Python-flavored:
+  `parse_for` takes `for VAR in <single expr> { body }` (spec ex: `for f in
+  $files {`), so a bare word-LIST isn't an iterable. Likely by-design, but the
+  common bash idiom failing with a confusing error is a UX gap. NEXT: confirm the
+  correct iterable form works; decide whether to accept a word-list. Not a bug yet.
+- [ ] **QA-N19** (cosmetic, LOW) — `enter linux {ps}` shows pid 1 COMM as
+  `koftfird` (looks like a garbled/obfuscated comm read). ps otherwise works.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
