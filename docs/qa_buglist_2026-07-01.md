@@ -206,15 +206,13 @@ current main (all 10 fixes) and re-verified with the working input tooling:
   (test_de_browser.sh etc.) over pointer-driving.
 
 ## Interactive QA pass #5 (orchestrator, 2026-07-01)
-- [ ] **QA-N7** (REGRESSION I introduced, HIGH) — the hamsh `VAR=value` fix
-  (c93919db) broke glued-`=` in ARGUMENT position. `echo ASSIGN_GOT=$ASSIGN`
-  (confirmed live via serial) → `hamsh: parse error: unexpected token after
-  command`. POSIX: only STATEMENT-LEADING `VAR=value` (or after `export`) is an
-  assignment; `cmd arg=value` (echo x=y, make FOO=bar) passes `arg=value` as a
-  literal argument (with $VAR expanded). The lexer emits OP_ASSIGN_LIT for any
-  glued `=` regardless of position; the parser must only treat it as an
-  assignment in leading position, else it's a normal command-word. Fix in
-  user/hamsh.ad + add a test case `echo a=b` / `cmd x=$Y`.
+- [x] **QA-N7** (REGRESSION I introduced) — FIXED 164079da. The `VAR=value` fix
+  (c93919db) broke glued-`=` in ARGUMENT position (`echo a=b` → parse error).
+  Fix: `parse_simple_command` now fuses a word arg followed by `OP_ASSIGN_LIT`
+  into ONE argv element (new `ND_ARGCAT` node — handles `a=b`, `a=$V`, chained
+  `a=b=c`, empty `a=`); statement-leading assignments still route through
+  `_looks_like_assignment` (unaffected). Verified: `echo a=b`→`a=b`, leading
+  `W=/x/y`→`/x/y`, 10 cases PASS; DE rl5 PASS (agent, fresh KVM image).
 - [ ] **QA-N8** (CONFIRMED, HIGH) — the whole `lib/hamui` toolkit doesn't render
   a window for regular user `live`. `hammon` (System Monitor) launched alone as
   `live` prints "HAMMON ready" (after `hamui_window()` returns) but NO window
