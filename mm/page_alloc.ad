@@ -71,6 +71,22 @@ extern def spinlock_lock(ptr: Ptr[uint32])
 extern def spinlock_unlock(ptr: Ptr[uint32])
 _pa_buddy_lock: uint32 = 0
 
+# SMP region-pool lock (root-cause fix for the concurrent-execve phys-region
+# reuse race). The large-region allocator below (region_alloc / region_free,
+# used by fs/elf.ad for every loaded ELF image + interp) keeps per-size
+# free-list buckets whose heads AND the intrusive next-link in each pooled
+# chunk are SHARED global state read-modify-written on every alloc/free. The
+# boot-CR3 guard masks IRQs LOCALLY but gives ZERO cross-CPU exclusion, so
+# two CPUs doing execve at once both popped the same bucket head (or both
+# cold-missed into memblock_alloc), handing the identical physical image
+# region to two address spaces (observed: both got phys 0x0a849000). A
+# single global spinlock around the bucket RMW — held INSIDE the existing
+# IRQ-off + boot-CR3 window, exactly like _pa_buddy_lock — closes it. Lock
+# ordering: region_lock is never held while taking buddy_lock and vice
+# versa; the memblock_alloc cold-miss taken under region_lock is a leaf
+# (memblock has its own inner lock), so there is no deadlock.
+_pa_region_lock: uint32 = 0
+
 PAGE_SIZE:  uint64 = 4096
 PAGE_SHIFT: int32  = 12
 MAX_ORDER:  int32  = 10            # 2^10 pages = 1024 = 4 MiB
@@ -392,26 +408,37 @@ def region_alloc(size: uint64) -> uint64:
     if size == 0:
         return 0
     rsize: uint64 = (size + 4095) & ~cast[uint64](4095)
+    # The bucket table + intrusive free-list link are shared RMW state. Run
+    # the WHOLE critical section (bucket claim, head pop, cold-miss carve)
+    # under IRQ-off + boot-CR3 (for the raw-physical link deref) + the SMP
+    # region lock so no two CPUs ever pop the same head or race the claim.
+    _ra_live: uint64 = read_cr3()
+    _ra_irq: uint64 = local_irq_save()
+    _ra_boot: uint64 = cow_boot_cr3()
+    _ra_sw: int32 = 0
+    if _ra_boot != 0 and (_ra_boot & _PA_CR3_MASK) != (_ra_live & _PA_CR3_MASK):
+        load_cr3(_ra_boot)
+        _ra_sw = 1
+    spinlock_lock(&_pa_region_lock)
+    ret: uint64 = 0
+    got: int32 = 0
     b: int32 = _region_bucket_for(rsize)
     if b >= 0:
         head: uint64 = region_bucket_head[cast[uint64](b)]
         if head != 0:
-            # Pop the pooled chunk; its first 8 bytes hold the next
-            # link — a raw physical access, so take the boot-CR3 guard.
-            _ra_live: uint64 = read_cr3()
-            _ra_irq: uint64 = local_irq_save()
-            _ra_boot: uint64 = cow_boot_cr3()
-            _ra_sw: int32 = 0
-            if _ra_boot != 0 and (_ra_boot & _PA_CR3_MASK) != (_ra_live & _PA_CR3_MASK):
-                load_cr3(_ra_boot)
-                _ra_sw = 1
+            # Pop the pooled chunk; its first 8 bytes hold the next link.
             region_bucket_head[cast[uint64](b)] = cast[Ptr[uint64]](head)[0]
-            if _ra_sw != 0:
-                load_cr3(_ra_live)
-            local_irq_restore(_ra_irq)
-            return head
-    # Cold miss (or unpoolable size): carve fresh from memblock.
-    return memblock_alloc(rsize, 4096)
+            ret = head
+            got = 1
+    if got == 0:
+        # Cold miss (or unpoolable size): carve fresh from memblock.
+        # memblock_alloc self-locks (leaf); safe to call holding region lock.
+        ret = memblock_alloc(rsize, 4096)
+    spinlock_unlock(&_pa_region_lock)
+    if _ra_sw != 0:
+        load_cr3(_ra_live)
+    local_irq_restore(_ra_irq)
+    return ret
 
 
 def region_free(addr: uint64, size: uint64):
@@ -436,12 +463,10 @@ def region_free(addr: uint64, size: uint64):
     if _rf_diag_n != 0:
         printk2("[rfdiag] region_free addr=%p has COW-live frames=%d\n",
                 addr, _rf_diag_n)
-    b: int32 = _region_bucket_for(rsize)
-    if b < 0:
-        return
     # Push onto this bucket's free list (intrusive next-link in the
     # chunk's first 8 bytes — the chunk is dead memory until reused).
-    # Raw physical store: take the boot-CR3 guard.
+    # Raw physical store: boot-CR3 guard; bucket claim + push under the SMP
+    # region lock so a concurrent region_alloc can't observe a torn head.
     _rf_live: uint64 = read_cr3()
     _rf_irq: uint64 = local_irq_save()
     _rf_boot: uint64 = cow_boot_cr3()
@@ -449,8 +474,12 @@ def region_free(addr: uint64, size: uint64):
     if _rf_boot != 0 and (_rf_boot & _PA_CR3_MASK) != (_rf_live & _PA_CR3_MASK):
         load_cr3(_rf_boot)
         _rf_sw = 1
-    cast[Ptr[uint64]](addr)[0] = region_bucket_head[cast[uint64](b)]
-    region_bucket_head[cast[uint64](b)] = addr
+    spinlock_lock(&_pa_region_lock)
+    b: int32 = _region_bucket_for(rsize)
+    if b >= 0:
+        cast[Ptr[uint64]](addr)[0] = region_bucket_head[cast[uint64](b)]
+        region_bucket_head[cast[uint64](b)] = addr
+    spinlock_unlock(&_pa_region_lock)
     if _rf_sw != 0:
         load_cr3(_rf_live)
     local_irq_restore(_rf_irq)
