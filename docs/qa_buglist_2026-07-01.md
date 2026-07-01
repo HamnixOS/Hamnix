@@ -233,6 +233,23 @@ buttons (Top/Bottom/Left/Right) present, Add-widget row (menu/task/clok/sysm/
 spcr) separate from Up/Down/Del (no overlap); **A1** the Settings window enumerates
 live in both panels.
 
+## Interactive QA pass #6 (orchestrator, 2026-07-01) — enter linux + newshell
+Serial-driven on fresh image. `newshell hostowner` (pw hamnix) → `whoami`=hostowner
+✓ and fast on -smp 1 (not 30-60s). `enter linux {ls /}` runs a real Linux-ABI
+binary. But two bugs:
+- [ ] **QA-N9** (HIGH) — the Linux namespace root is MISSING `/etc`. `enter linux
+  {ls /}` shows `PROVENANCE bin lib lib64 sbin usr var` — no `/etc` (nor /home,
+  /tmp, /proc, /dev). `enter linux {cat /etc/debian_version}` → "No such file or
+  directory". `scripts/build_rootfs_img.py` (lines 37,151-152) EXPECTS
+  `/etc/{apt,debian_version,passwd,group,os-release}` in the root, so this is a
+  regression in the live-distro build OR the enter-linux namespace binding.
+  Breaks apt/config/passwd in the Linux ns. Assigned.
+- [ ] **QA-N10** (MED) — Linux ABI `setuid`(nr 105)/`setgid`(nr 106) UNIMPLEMENTED
+  (`linux_u: unknown syscall nr=105/106 a0=0x3e9=1001`), hit when Debian binaries
+  run as uid 1001 (the default `live` user). Zero matches for setuid/setgid in
+  linux_abi/u_syscalls.ad. Implement them (real or safe no-op/EPERM per POSIX for
+  a non-privileged uid). Assigned.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
