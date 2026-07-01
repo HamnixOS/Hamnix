@@ -105,6 +105,14 @@ set +e
     #     the lexer must not mis-tokenize the run as OP_EQEQ + OP_ASSIGN.
     printf 'echo GOT_EQ3X ===x\n'
     sleep 2
+    # 15. QA-N16: a word ENDING in a glued '='-run (`abc===`) is one
+    #     literal word — the trailing run must NOT lex as OP_EQEQ +
+    #     OP_ASSIGN (which parse-errored before the fix).
+    printf 'echo GOT_ABC3 abc===\n'
+    sleep 2
+    # 16. QA-N16: a two-'=' trailing run (`foo==`) is literal too.
+    printf 'echo GOT_FOO2 foo==\n'
+    sleep 2
     # Re-send case 1 (a fresh hamsh drops its FIRST serial line, so the
     # opening bare `VAR=/path` case can be lost; re-send is idempotent).
     printf 'DIR=/home/live ; echo GOT_DIR $DIR\n'
@@ -152,6 +160,8 @@ check "GOT_XYZ x=y=z"               "arg-position chained glued '=' (x=y=z) is o
 check "GOT_PQR p:q=r"               "arg-position glued ':'+'=' (p:q=r) is one word"
 check "GOT_EQX =x"                  "leading '=' word (=x) is a literal arg (QA-N13)"
 check "GOT_EQ3X ===x"               "multiple leading '=' (===x) is a literal arg (QA-N13)"
+check "GOT_ABC3 abc==="             "trailing '='-run (abc===) is a literal arg (QA-N16)"
+check "GOT_FOO2 foo=="              "trailing '='-run (foo==) is a literal arg (QA-N16)"
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_hamsh_assign] FAIL"
