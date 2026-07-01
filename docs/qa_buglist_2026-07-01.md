@@ -299,6 +299,20 @@ Fresh image from HEAD 8c997087, serial-driven. ALL PASS:
 - NOTE: `echo N13a=[=x]` (glued `=` immediately followed by `[`) still parse-errors
   — a separate, much rarer edge than QA-N13; not chased (real code doesn't do `=[`).
 
+## Interactive QA pass #8 (orchestrator, 2026-07-01) — Debian tools + hamsh edge
+Confirmed the QA-N14 busybox applets FUNCTION (not just resolve): `hostname`→
+`hamnix`, `env`→PATH/HOME, `date`→`Wed Jul 1 …`, `grep root /etc/passwd`→match,
+`head -1 /etc/os-release`→`PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"`. Two finds:
+- [ ] **QA-N16** (hamsh, LOW — completes QA-N7/N13) — a word ENDING in a `=`-run
+  parse-errors: `echo abc===` → `parse error: unexpected token after command`.
+  QA-N13 fixed LEADING `=`-runs; the trailing case (`content===`) remains.
+  Fix in user/hamsh.ad so `abc===` is a literal argv word (`abc===`). Assigned.
+- [ ] **QA-N17** (Linux ns /proc, MED — LARGER) — under `enter linux`, `/proc`
+  lists PID entries (readdir works) but `/proc/<pid>` can't be stat'd/opened
+  ("No such file"), so `ps`/`top` fail. The procfs backing the linux-ns is
+  partial (dir enumeration without per-pid nodes). Real "run Debian" gap but a
+  sizeable subsystem — tracked for a dedicated future effort, not a quick fix.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
