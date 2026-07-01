@@ -266,6 +266,23 @@ KVM boot with serial + screendump. ALL PASS:
 - QA-N12: NOT reproduced — the serial-launched hammon DID enumerate in the taskbar
   (hamui owned-window fix resolved it). Closed.
 
+## Interactive QA pass #7 (orchestrator, 2026-07-01) — Debian binaries under enter linux
+Positives (QA-N9 further confirmed): `enter linux {cat /etc/os-release}` →
+`PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"` (full); `ls -la /etc` shows
+debian_version+os-release; `sh -c "echo X"` works. New:
+- [ ] **QA-N13** (hamsh, LOW — completes QA-N7) — a LEADING `=` (empty LHS) in an
+  argv word is mishandled: `echo =x` prints nothing (swallowed), `echo ===x` →
+  `parse error: unexpected token after command`. `echo a=b`/`x=y=z`/`p:q=r` all
+  work (non-empty LHS). Fix in user/hamsh.ad: a word beginning with `=` (no name
+  char before it) is a literal argument word, not an assignment/OP_ASSIGN_LIT.
+  Assigned.
+- [ ] **QA-N14** (Linux minimal root, LOW/policy) — `enter linux {uname -a}` /
+  `{id}` → `command not found`; `{dpkg --version}` → not found. dpkg absent is
+  expected (full-mirror-build only). uname/id are trivial busybox applets missing
+  their symlinks in the minimal busybox root (`_stage_busybox` in
+  build_rootfs_img.py). Add common applet symlinks (uname, id, env, whoami…) if
+  the minimal-root policy wants them. Deferred (policy call).
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
