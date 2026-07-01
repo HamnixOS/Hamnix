@@ -112,11 +112,27 @@ try:
         # Launch the browser on its built-in demo page (no network). The
         # render SUMMARY prints to serial BEFORE `newwindow` rebinds the
         # client's stdout away from the console, so the harness can read it.
-        send("")
+        #
+        # ROBUSTNESS: a freshly-booted hamsh drops its FIRST serial command
+        # line (known quirk — the first line is swallowed, never echoed), and
+        # under heavy host load the prompt may not be ready yet. So we RE-SEND
+        # `hambrowse --demo &` until its own render marker appears, rather than
+        # firing once and hoping. Each attempt waits a few seconds for the
+        # marker; if absent we send again. This turns a dropped-first-command
+        # (or slow-boot) miss into a retry instead of a false FAIL.
+        send("")           # wake the prompt / absorb the first-line drop
         time.sleep(0.5)
-        send("hambrowse --demo &")
-        # Give it time to parse/layout (summary) + open + commit the scene.
-        wait_for("[hambrowse] opening scene window", 30)
+        got_marker = False
+        for attempt in range(6):
+            print(f"[browser] driver: launch attempt {attempt+1}", file=sys.stderr)
+            send("hambrowse --demo &")
+            if wait_for("[hambrowse] opening scene window", 12):
+                got_marker = True
+                break
+        if not got_marker:
+            print("[browser] driver: marker never appeared after retries",
+                  file=sys.stderr)
+        # Let it commit the scene + let the compositor present it.
         time.sleep(5)
         screendump("browser")
         print("[browser] driver: captured browser frame", file=sys.stderr)
@@ -179,16 +195,62 @@ else
     echo "[browser] PASS no panic during boot/run"
 fi
 
-if [ -s "$OUT_DIR/browser.png" ]; then
-    echo "[browser] screendump: $OUT_DIR/browser.png (view: heading + body + blue links)"
+# NON-BLANK / actually-composited check. The serial "rendered segs=" line
+# only proves hambrowse laid out the page in memory BEFORE it wrote the
+# scene; it does NOT prove the window composited to the framebuffer. So we
+# inspect the captured frame for hambrowse's window chrome: its title bar is
+# a solid band of #3a6ea5 (58,110,165) ~600px wide. A desktop-only frame (no
+# browser window) has no such band. This closes the gap where the markers
+# print but the per-window scene write silently fails to composite.
+if [ -s "$OUT_DIR/browser.ppm" ]; then
+    BLUE=$(python3 - "$OUT_DIR/browser.ppm" <<'PYPX'
+import sys
+try:
+    f=open(sys.argv[1],'rb')
+    assert f.readline().strip()==b'P6'
+    W,H=[int(t) for t in f.readline().split()]
+    f.readline()  # maxval
+    d=f.read()
+    tgt=(58,110,165); tol=24
+    n=0
+    for y in range(0,H,4):
+        base=y*W*3
+        for x in range(0,W,4):
+            o=base+x*3
+            if abs(d[o]-tgt[0])<=tol and abs(d[o+1]-tgt[1])<=tol and abs(d[o+2]-tgt[2])<=tol:
+                n+=1
+    print(n)
+except Exception as e:
+    print(0)
+PYPX
+)
+    echo "[browser] screendump title-bar-blue pixels (sampled): ${BLUE:-0}"
+    if [ "${BLUE:-0}" -ge 150 ]; then
+        echo "[browser] PASS browser window composited to framebuffer (blue title bar present)"
+    else
+        echo "[browser] FAIL browser window NOT composited (no title bar in frame)"; fail=1
+    fi
+    echo "[browser] screendump: $OUT_DIR/browser.ppm (blue title bar + white body + links)"
 else
-    echo "[browser] WARN no screendump captured"
+    echo "[browser] FAIL no screendump captured"; fail=1
 fi
 
 echo "[browser] artifacts in $OUT_DIR"
+echo "[browser] serial log: $LOG"
 if [ "$fail" -eq 0 ]; then
     echo "[browser] RESULT: PASS"
+    exit 0
 else
     echo "[browser] RESULT: FAIL"
+    # VISIBILITY: on failure, surface what hambrowse (and the shell around
+    # it) actually printed on the serial console so the failure is never a
+    # green-looking mystery. Dump the hambrowse lines plus the tail of the
+    # raw log, and exit NON-ZERO so CI / the orchestrator sees red.
+    echo "[browser] --- hambrowse serial lines ---"
+    grep -an 'hambrowse\|wsys\|newwindow\|permission\|handing off' "$LOG" \
+        | tail -40 || echo "[browser]   (none — hambrowse produced no serial output)"
+    echo "[browser] --- last 40 lines of serial log ---"
+    tail -40 "$LOG" 2>/dev/null | tr -d '\r'
+    echo "[browser] --- end serial dump ---"
+    exit 1
 fi
-exit 0
