@@ -430,14 +430,26 @@ def seed_canary_funcs(seed_path, user_names):
         if m:
             cur = m.group(1)
         elif cur and "__stack_chk_fail" in line:
-            # attribute to the owning user function: the label contains its name
+            # Attribute to the owning user function: the label embeds its name
+            # (`.__epilogue_<funcname>` / `.<kind>_<funcname>_<n>`). MANY user
+            # names are PREFIXES of others (`spawn` vs `spawn_resolved`,
+            # `svc_spawn_into_ns`), so a label like `.__epilogue_spawn_resolved`
+            # matches BOTH `spawn` (via `_spawn_`) and `spawn_resolved` (via the
+            # `_spawn_resolved` suffix). Picking the FIRST match in set-iteration
+            # order is (a) wrong — the short prefix steals the canary flag from
+            # its true owner — and (b) NON-DETERMINISTIC (set order varies with
+            # PYTHONHASHSEED). A stolen flag then subtracts CANARY_KEYS from a
+            # canary-FREE function's histogram, colliding it with a real
+            # same-shape function and manufacturing a phantom, seed-dependent
+            # divergence in the greedy matcher. Fix: among ALL matching names,
+            # take the LONGEST (most-specific) one — deterministic and correct.
             owner = cur
             if owner not in user_names:
-                for un in user_names:
-                    if un and ("_" + un + "_" in cur or cur.endswith("_" + un)
-                               or cur == un):
-                        owner = un
-                        break
+                matches = [un for un in user_names
+                           if un and ("_" + un + "_" in cur
+                                      or cur.endswith("_" + un) or cur == un)]
+                if matches:
+                    owner = max(matches, key=len)
             canary.add(owner)
     return canary
 
@@ -448,9 +460,25 @@ def main():
     nat_vaddr, nat_entry, nat_bytes = native_text(nat_path)
     nat_blocks = split_native_by_prologue(disasm(nat_bytes, nat_vaddr))
 
+    # Drop the seed's runtime.S syscall wrappers so both sides compare only
+    # the actual user functions. The wrappers are the `sys_*` symbols the seed
+    # links from runtime.S; the NATIVE side drops the matching synthesized
+    # blocks by SHAPE (is_wrapper: contains a `syscall`, no `endbr64`). We must
+    # filter the seed side by the SAME shape, NOT by the `sys_` name prefix
+    # alone: a user function may legitimately be NAMED `sys_*` (e.g. hamsh's
+    # `sys_waitpid_nb`, a convenience wrapper that CALLS `sys_waitpid_nb_raw`
+    # rather than issuing a `syscall` itself). Such a function has a real
+    # `endbr64` prologue and no `syscall` instruction, so the native side keeps
+    # it — dropping it here on name alone would make the seed short one function,
+    # misalign the greedy matcher, and manufacture a phantom divergence in an
+    # unrelated function. So: drop a `sys_*` seed function ONLY if it actually
+    # issues a `syscall` (i.e. is a genuine runtime.S wrapper).
+    def _issues_syscall(by, va):
+        return any(m == "syscall" for (_a, _r, m, _o) in disasm(by, va))
     seed_user = [(nm, va, sz, by) for (nm, va, sz, by) in sfuncs
-                 if not nm.startswith("sys_") and nm not in
-                 ("__stack_chk_fail", "syscall6", "__runtime_start_mark_len")]
+                 if nm not in
+                 ("__stack_chk_fail", "syscall6", "__runtime_start_mark_len")
+                 and not (nm.startswith("sys_") and _issues_syscall(by, va))]
     seed_disasm = [(nm, disasm(by, va)) for (nm, va, sz, by) in seed_user]
     canary = seed_canary_funcs(seed_path, {nm for (nm, _v, _s, _b) in seed_user})
 
