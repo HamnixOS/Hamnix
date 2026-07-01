@@ -179,6 +179,16 @@ current main (all 10 fixes) and re-verified with the working input tooling:
   a uid gate), so GUI apps launched from serial silently fail. Assigned to an
   agent to root-cause (namespace vs perm; bisect vs T75 dcf6f6e8 if needed) + fix
   at the right layer, AND make hambrowse print a real error instead of silent -1.
+  - PARTIAL (3be71289): root cause was commit 10db26d2 dropping the console to
+    `live` uid 1001 + devcons.ad's coarse gate blanket-denying non-hostowner
+    write-opens of /dev/wsys/ctl. Fix un-blocks /dev/wsys/ctl (per-verb gate in
+    devwsys_ctl_write still enforces hostowner-only chrome). This means ANY
+    regular-user-launched GUI app (serial OR DE terminal) can now open a window,
+    not just hostowner/menu-launched ones. BUT on fresh main the browser still
+    FAILs at the RENDER stage (newwindow OK, no "opening scene window"/"rendered
+    segs" across 3 runs) — suspected SECOND gate on the per-window files
+    (/dev/wsys/<wid>/{scene,event,pointer}) for uid 1001. Agent resumed to
+    reconcile + fix the test's hidden-serial/rc=0-on-fail visibility gap.
 - [~] **QA-N3b caveat** — the HMP-mouse tooling is reliable for a SINGLE click
   (landed the Applications button in pass #3) but FLAKY across multi-step
   sequences (pass #4's menu→item click missed; cursor landed bottom-right). For
