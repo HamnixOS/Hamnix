@@ -282,6 +282,21 @@ debian_version+os-release; `sh -c "echo X"` works. New:
   env, printf, date, sleep, …). dpkg/apt stay absent (full-mirror-build only, by
   design). Verify: `enter linux {uname -a}`, `{id}`.
 
+## Consolidated verify #2 (orchestrator, 2026-07-01 14:29 image) — QA-N13/N14
+Fresh image from HEAD 8c997087, serial-driven. ALL PASS:
+- DE boots to interactive shell (all kernel changes = no regression).
+- QA-N13: `echo =x`→`=x`, `echo ===x`→`===x` (FIXED 8c997087).
+- QA-N14: `enter linux {uname -a}`→`Linux hamnix 6.12.0-hamnix ... x86_64
+  GNU/Linux`; `enter linux {id}`→`uid=1001(live) gid=1001` (FIXED 1fdcb10e).
+- QA-N7 regr: `echo N7=a=b`→`N7=a=b`. QA-N9 regr: debian_version→`12.9`.
+- [ ] **QA-N15** (LOW, new) — `getgroups`(nr 115) unimplemented in linux_abi
+  (`linux_u: unknown syscall nr=115`), so `id` prints `uid=/gid=` but then
+  `id: can't get groups`. Like the setuid/setgid gap (QA-N10). Implement
+  getgroups/setgroups in linux_abi/u_syscalls.ad (return the task's gid as the
+  sole supplementary group, or an empty set → 0). Completes `id`.
+- NOTE: `echo N13a=[=x]` (glued `=` immediately followed by `[`) still parse-errors
+  — a separate, much rarer edge than QA-N13; not chased (real code doesn't do `=[`).
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
