@@ -525,6 +525,10 @@ from drivers.net.tls import tls_init, tls_handshake
 from kernel.sched.core import (
     TaskStruct, current_task, current_task_uid, current_task_gid,
     current_task_is_hostowner, UID_HOSTOWNER, UID_NOBODY,
+    # QA-N10: setuid(2)/setgid(2) mutate the caller's native per-task
+    # credential in place; these are the privileged writers the getters
+    # (current_task_uid/current_task_gid) read back.
+    set_current_task_uid, set_current_task_gid,
     # *at(2) dirfd resolution: recover an open dirfd's recorded path so
     # mkdirat/unlinkat with a real (non-AT_FDCWD) dirfd + relative path
     # work — `mkdir -p` and dpkg open each created dir and pass its fd.
@@ -1153,6 +1157,12 @@ SYS_getuid:          uint64 = 102
 SYS_getgid:          uint64 = 104
 SYS_geteuid:         uint64 = 107
 SYS_getegid:         uint64 = 108
+# QA-N10: setuid(2)/setgid(2). Debian login/su/busybox/dpkg maintainer
+# scripts drop privilege by calling these on startup; the common case is
+# a process re-asserting its OWN id (uid 1001 -> setuid(1001)), which must
+# succeed with 0, not fall through to the -ENOSYS "unknown syscall" path.
+SYS_setuid:          uint64 = 105
+SYS_setgid:          uint64 = 106
 SYS_getppid:         uint64 = 110
 SYS_readlinkat:      uint64 = 267
 # U28: modern glibc (2.34+) prefers clone3 over the 5-arg clone.
@@ -1406,6 +1416,7 @@ ELINUX_EFAULT: int64 = -14
 # ELINUX_AGAIN (-11) is declared later alongside the futex stubs; we
 # reuse the same constant for accept(2)'s would-block answer below.
 ELINUX_INVAL:  int64 = -22
+ELINUX_PERM:   int64 = -1           # -EPERM (setuid/setgid privilege denial)
 ELINUX_NOTDIR: int64 = -20
 ELINUX_RANGE:  int64 = -34
 ELINUX_NAMETOOLONG: int64 = -36     # -ENAMETOOLONG (#163 path copy-in)
@@ -9519,6 +9530,61 @@ def _u_getegid(a0: uint64, a1: uint64, a2: uint64,
     return _linux_uid_from_native(current_task_gid())
 
 
+# QA-N10: the INVERSE of _linux_uid_from_native. setuid(2)/setgid(2) hand
+# us a target in POSIX space; we must fold it back into a native id so the
+# getters (which map native->POSIX) read the new value back consistently.
+#
+#   Linux 0 (root)  -> native UID_HOSTOWNER (the machine owner)
+#   any other id    -> same numeric native id
+#
+# Note the hostowner asymmetry: native UID_HOSTOWNER maps to Linux 0, so a
+# literal setuid(UID_HOSTOWNER) target would collide with the hostowner and
+# read back as 0. That numeric id is a native-only convention that never
+# appears as a Linux uid, so real Debian userland never targets it; we fold
+# it to itself and document the edge rather than special-casing a value that
+# cannot legitimately occur.
+def _native_uid_from_linux(linux_id: int64) -> uint32:
+    if linux_id == 0:
+        return UID_HOSTOWNER
+    return cast[uint32](linux_id)
+
+
+def _u_setuid(a0: uint64, a1: uint64, a2: uint64,
+              a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int setuid(uid_t uid). POSIX: a privileged caller may set any uid;
+    # an unprivileged caller may only set its uid to its own real/effective
+    # uid (there is no saved-set-uid on this path — effective == real —
+    # so real is the only reachable target). Anything else is -EPERM.
+    #
+    # Privilege on the Linux-ABI path == "am I root?", i.e. the caller's
+    # current uid maps to Linux 0 (the hostowner). We deliberately do NOT
+    # silently succeed a privilege escalation: an unprivileged 1001 asking
+    # for uid 0 gets -EPERM, matching Linux.
+    target: int64 = cast[int64](cast[uint32](a0))     # uid_t is 32-bit
+    cur: int64 = _linux_uid_from_native(current_task_uid())
+    if cur == 0 or target == cur:
+        set_current_task_uid(_native_uid_from_linux(target))
+        return 0
+    set_current_errstr("setuid: EPERM")
+    return ELINUX_PERM
+
+
+def _u_setgid(a0: uint64, a1: uint64, a2: uint64,
+              a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int setgid(gid_t gid). Analogous to setuid: root (Linux uid 0) may
+    # set any gid; everyone else may only re-assert their own current gid.
+    # Privilege is keyed on the UID (root), matching Linux — the group is
+    # not itself the privilege anchor.
+    target: int64 = cast[int64](cast[uint32](a0))     # gid_t is 32-bit
+    cur_uid: int64 = _linux_uid_from_native(current_task_uid())
+    cur_gid: int64 = _linux_uid_from_native(current_task_gid())
+    if cur_uid == 0 or target == cur_gid:
+        set_current_task_gid(_native_uid_from_linux(target))
+        return 0
+    set_current_errstr("setgid: EPERM")
+    return ELINUX_PERM
+
+
 def _u_getppid(a0: uint64, a1: uint64, a2: uint64,
                a3: uint64, a4: uint64, a5: uint64) -> int64:
     # pid_t getppid(void). Hamnix has no parent/child task lineage on
@@ -11698,6 +11764,61 @@ def uabi_fills_selftest() -> int32:
         return 1
     # Restore the real FS_BASE before any further glibc-style %fs deref.
     _uabi_test_dispatch(SYS_arch_prctl, ARCH_SET_FS, fs_saved[0], 0, 0)
+
+    # --- QA-N10: setuid(2)/setgid(2) semantics + getter consistency ---
+    # No fds are involved, so this arm runs early (right after arch_prctl)
+    # and is independent of the fd-table dance. The boot task runs as the
+    # hostowner (native UID_HOSTOWNER -> Linux 0, i.e. root). We snapshot
+    # its native uid/gid, exercise every arm through the real dispatch —
+    # proving nr=105/106 no longer hit the "unknown syscall" -ENOSYS path —
+    # and restore the identity before returning.
+    suid_save: uint32 = current_task_uid()
+    sgid_save: uint32 = current_task_gid()
+    # (a) root may drop to an arbitrary uid; getuid/geteuid must reflect it.
+    if _uabi_test_dispatch(SYS_setuid, 1001, 0, 0, 0) != 0:
+        printk0("[UABI_FILLS] FAIL setuid(1001) as root\n")
+        set_current_task_uid(suid_save)
+        set_current_task_gid(sgid_save)
+        return 1
+    if _uabi_test_dispatch(SYS_getuid, 0, 0, 0, 0) != 1001 \
+       or _uabi_test_dispatch(SYS_geteuid, 0, 0, 0, 0) != 1001:
+        printk0("[UABI_FILLS] FAIL getuid/geteuid != 1001 after setuid\n")
+        set_current_task_uid(suid_save)
+        set_current_task_gid(sgid_save)
+        return 1
+    # (b) the common failing case that motivated QA-N10: an unprivileged
+    # process re-asserting its OWN uid must succeed with 0 (1001 -> 1001).
+    if _uabi_test_dispatch(SYS_setuid, 1001, 0, 0, 0) != 0:
+        printk0("[UABI_FILLS] FAIL setuid(1001) self-reassert\n")
+        set_current_task_uid(suid_save)
+        set_current_task_gid(sgid_save)
+        return 1
+    # (c) an unprivileged escalation to uid 0 must be REFUSED with -EPERM
+    # and must NOT silently succeed (uid stays 1001).
+    if _uabi_test_dispatch(SYS_setuid, 0, 0, 0, 0) != ELINUX_PERM \
+       or _uabi_test_dispatch(SYS_getuid, 0, 0, 0, 0) != 1001:
+        printk0("[UABI_FILLS] FAIL setuid(0) escalation not refused\n")
+        set_current_task_uid(suid_save)
+        set_current_task_gid(sgid_save)
+        return 1
+    # (d) setgid mirror: as the (now unprivileged) uid 1001, setgid to the
+    # caller's own gid succeeds; setgid to a different gid is -EPERM.
+    cur_gid_now: int64 = _uabi_test_dispatch(SYS_getgid, 0, 0, 0, 0)
+    if _uabi_test_dispatch(SYS_setgid, cast[uint64](cur_gid_now), 0, 0, 0) != 0 \
+       or _uabi_test_dispatch(SYS_setgid, 4242, 0, 0, 0) != ELINUX_PERM:
+        printk0("[UABI_FILLS] FAIL setgid unpriv semantics\n")
+        set_current_task_uid(suid_save)
+        set_current_task_gid(sgid_save)
+        return 1
+    # Restore hostowner uid and confirm root can setgid arbitrarily.
+    set_current_task_uid(suid_save)
+    if _uabi_test_dispatch(SYS_setgid, 4242, 0, 0, 0) != 0:
+        printk0("[UABI_FILLS] FAIL setgid(4242) as root\n")
+        set_current_task_uid(suid_save)
+        set_current_task_gid(sgid_save)
+        return 1
+    set_current_task_gid(sgid_save)
+    printk0("[UABI_FILLS] setuid/setgid gate OK (drop/self/EPERM/consistency)\n")
 
     # --- uname --------------------------------------------------------
     # Already a real fill; assert it returns 0 and stamps nodename.
@@ -15592,6 +15713,13 @@ def _linux_u_syscall_dispatch_inner(nr: uint64,
         return _u_geteuid(a0, a1, a2, a3, a4, a5)
     if nr == SYS_getegid:
         return _u_getegid(a0, a1, a2, a3, a4, a5)
+    # QA-N10: setuid(2)/setgid(2) — mutate the caller's native credential
+    # (privileged) or re-assert its own id (unprivileged); no longer fall
+    # through to the "unknown syscall nr=105/106" -ENOSYS path.
+    if nr == SYS_setuid:
+        return _u_setuid(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_setgid:
+        return _u_setgid(a0, a1, a2, a3, a4, a5)
     if nr == SYS_getppid:
         return _u_getppid(a0, a1, a2, a3, a4, a5)
     if nr == SYS_readlinkat:
