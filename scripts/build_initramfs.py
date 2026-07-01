@@ -3698,6 +3698,9 @@ def build_archive() -> bytes:
             "pwd", "grep", "head", "tail", "wc",
             "true", "false", "env", "printf", "date",
             "sleep", "basename", "dirname",
+            # ps reads /proc/<pid>/{stat,cmdline} + stats each /proc/<pid>
+            # dir — the QA-N17 pid-dir-stat fix is what makes it print rows.
+            "ps",
         ]
         for applet in bb_applets:
             link = f"/var/lib/distros/default/bin/{applet}"
