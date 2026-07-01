@@ -353,6 +353,21 @@ execution all function.
 - [ ] **QA-N19** (cosmetic) — `enter linux {ps}` pid-1 COMM shows `koftfird`
   (garbled comm read); ps otherwise works.
 
+## Interactive END-USER push #3 (orchestrator, 2026-07-01) — hamsh advanced
+WORKS (verified): append `>>` (`echo x >> f`); `&&` (`true && echo OK`); `||`
+(`false || echo OK`); stderr `2>`; **expression interpolation `${ 6 * 7 }`→42**;
+**globbing** (`echo /d*`→`/dev` — `_word_has_glob`/`_argv_glob_expand` in
+hamsh.ad; unmatched patterns stay literal per POSIX, which is why `/bin/ha*`
+printed literal — NO bin/ha* match in that ns, NOT a bug). Command substitution
+is spec'd as `` `{ … }` `` (HAMSH_SPEC §8), NOT POSIX `$(…)`.
+- [ ] **QA-N21** (hamsh UX, LOW) — POSIX `$(cmd)` command-substitution syntax →
+  `parse error` (hamsh uses `` `{ cmd }` `` instead). Consider accepting `$(…)`
+  as an alias or emitting a clearer error pointing at `` `{ } ``. Minor.
+- NOTE: a clean test of the spec'd `` `{ … }` `` command-sub was inconclusive
+  (orchestrator's serial backtick-escaping mangled it) — NOT confirmed broken;
+  re-characterize via a script file, not serial-typed backticks.
+- RETRACTED: "globbing broken" — globbing works (`/d*`→`/dev`).
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
