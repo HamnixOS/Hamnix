@@ -77,7 +77,7 @@ rc=$?
 set -e
 
 echo "[test_ext4_mkdir] --- ext4-mkdir self-test output ---"
-grep -a -E "\[ext4-mkdir\]" "$LOG" || true
+grep -a -E "\[ext4-mkdir\]|\[vfs-named-mkdir\]" "$LOG" || true
 echo "[test_ext4_mkdir] --- end ---"
 
 fail=0
@@ -90,6 +90,20 @@ fi
 
 if ! grep -a -F -q "[ext4-mkdir] PASS" "$LOG"; then
     echo "[test_ext4_mkdir] MISS: self-test PASS banner (expected '[ext4-mkdir] PASS')" >&2
+    fail=1
+fi
+
+# `#t`-prefix collision regression (vfs_named_mkdir_selftest): a
+# multi-char `#t<word>` named root must mkdir onto ext4 via vfs_mkdir, not
+# be captured by the `#t` tmpfs fast-path. Armed by the same marker.
+if grep -a -F -q "[vfs-named-mkdir] FAIL" "$LOG"; then
+    echo "[test_ext4_mkdir] FAIL: \`#t<word>\` named-root mkdir mis-routed" >&2
+    grep -a -F "[vfs-named-mkdir] FAIL" "$LOG" >&2 || true
+    fail=1
+fi
+
+if ! grep -a -F -q "[vfs-named-mkdir] PASS" "$LOG"; then
+    echo "[test_ext4_mkdir] MISS: \`#t<word>\` regression PASS banner (expected '[vfs-named-mkdir] PASS')" >&2
     fail=1
 fi
 
