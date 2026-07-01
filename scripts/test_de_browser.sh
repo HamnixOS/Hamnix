@@ -146,6 +146,19 @@ else
     echo "[browser] FAIL no 'opening scene window' marker"; fail=1
 fi
 
+# The "opening scene window" line and the "rendered segs=" summary are
+# BOTH printed BEFORE hambrowse actually opens its window, so they are
+# NOT sufficient evidence the window opened. Assert the newwindow step
+# did not fail — this is the QA-N6 regression guard: when the live
+# console dropped to a regular user (uid 1001) the `newwindow` open of
+# /dev/wsys/ctl was refused, so `_newwindow` returned -1 and NO window
+# ever opened even though the pre-open markers printed fine.
+if grep -aq '\[hambrowse\] FAIL newwindow\|\[hambrowse\] cannot open /dev/wsys/ctl\|\[hambrowse\] cannot reopen /dev/wsys/ctl\|\[hambrowse\] /dev/wsys/ctl returned no wid' "$LOG"; then
+    echo "[browser] FAIL hambrowse could not create its window (newwindow rejected)"; fail=1
+else
+    echo "[browser] PASS newwindow succeeded (no window-open error)"
+fi
+
 # Pull the "rendered segs=N rows=M links=K" line and check N>0, K>=1.
 REND=$(grep -ao 'rendered segs=[0-9]* rows=[0-9]* links=[0-9]*' "$LOG" | tail -1)
 if [ -n "$REND" ]; then
