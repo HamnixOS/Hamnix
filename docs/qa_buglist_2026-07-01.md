@@ -98,10 +98,15 @@ VISUALLY CONFIRMED landed fixes:
   serial confirms the console runs as `live` (uid 1001).
 
 NEW bugs found this pass:
-- [ ] **QA-N1** (rendering) — stray single glyphs along the far-LEFT screen edge,
-  partially occluded by the terminal window. Looks like desktop-icon label text
-  compositing ABOVE windows (z-order) or not cleared on repaint. Investigate the
-  desktop-icon vs window z-order / damage-rect in the scene compositor.
+- [x] **QA-N1** — LANDED ef65b3ed. NOT a z-order bug (my hypothesis was wrong):
+  per-pixel analysis proved the compositor correctly occludes the desktop under
+  windows. Real cause: the terminal auto-opened at x=24, BISECTING the desktop
+  icon-label column (starts x=18), so the uncovered label slivers in the 6px
+  strip left of the window edge read as orphaned glyphs. Fix: terminal default
+  origin x=24 → x=150 (clears the icon strut; matches where all other default
+  apps already open). Guard added to `test_de_ux_fixes_guard.sh` (PASS).
+  - FUTURE (optional): a general "windows avoid the desktop-icon work-area strut"
+    WM feature would prevent any window (dragged or spawned) from bisecting icons.
 - [ ] **QA-N2** (low-confidence) — cursor position changed between two
   screendumps with NO input injected (center → bottom-right). Possible spurious
   cursor motion or non-deterministic rest position. Re-observe.
