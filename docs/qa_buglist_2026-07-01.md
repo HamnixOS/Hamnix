@@ -141,10 +141,29 @@ Drove the DE via HMP relative mouse. Two screendumps one click apart:
   only among `z<100` peers, clamped below 100). Regression: new
   `wsys_raise_enum_selftest` drives the REAL router click + asserts all windows
   still enumerate and z stayed `<100`. This is the definitive A1 fix.
-- [ ] **QA-N3b** (method) — HMP relative `mouse_move` is imprecise (PS/2 accel
-  swept the cursor to a corner instead of the target). Reliable input-driven QA
-  needs accel disabled or a deterministic positioning method. Refine before the
-  next pointer-driven pass.
+- [x] **QA-N3b** (method) — SOLVED. Reliable headless input needs (1) a SINGLE
+  persistent socat stream carrying all HMP commands (per-command reconnect drops
+  rapid commands), (2) slam the cursor to a corner with ~20× `mouse_move -80 -80`
+  (clamps to 0,0 regardless of accel), (3) step to the target in 1px moves
+  (`mouse_move 1 0` / `0 1`) so accel is ~1:1. Landed a precise click on the
+  Applications button. Script: scratchpad `qa_verify.sh`.
+
+## Interactive QA pass #3 (orchestrator, 2026-07-01) — verified on a FRESH image
+IMPORTANT: passes #1/#2 unknowingly booted a STALE 07:41 image (predating all
+fixes — see memory `project_stale_installer_img_qa_trap`). Rebuilt the image from
+current main (all 10 fixes) and re-verified with the working input tooling:
+- [x] **A1** re-verified on fresh image: clicking a window's titlebar to RAISE it
+  keeps it in BOTH the top panel and bottom taskbar (all 4 apps stay listed).
+  Fix 6bfdd12e genuinely works.
+- [x] **QA-N1** re-verified: terminal opens at x=150; the full desktop-icon column
+  (Files/Terminal/Calculator/Text Editor/Install Hamnix/Settings/System Monitor/
+  Home) renders cleanly, no bisected-label bleed.
+- [x] **A6** re-verified: Applications menu opens and lists **Web Browser** (+ the
+  other apps). Browser is discoverable.
+- [ ] **QA-N5** (low) — the scene-DE Applications menu is a FLAT list, not MATE's
+  cascading categories (Accessories/Internet/System/Settings) that the legacy
+  hamappmenu.ad describes. Acceptable for now; a categorized menu would be closer
+  to MATE parity. Enhancement, not a bug.
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
