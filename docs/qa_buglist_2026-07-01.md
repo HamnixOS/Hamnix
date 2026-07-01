@@ -52,9 +52,18 @@ spawns. Regression gate: `scripts/test_de_panel_widgets_ux.sh` (PASS on main).
   a hamsh builtin (no `/bin/pwd` cold-exec); `COLD_START` marker added. Gate:
   `test_de_first_term_prewarm_guard.sh` PASS. **DEFERRED live-timing validation**
   (quiet window): boot DE, read `COLD_START jiffies` before/after — tracked below.
-- [ ] **D2 Entering the Linux namespace still takes a couple seconds.**
-- [ ] **D3 `newshell hostowner` still takes ~30s–60s** (identity is *correct* —
-  `whoami` → `hostowner`; this is purely startup latency).
+- [~] **D2/D3 REFRAMED — not startup latency, an SMP wedge** (agent ad63d2b,
+  measured on the real live image). On `-smp 1` both are sub-second
+  (`newshell hostowner` +0.4s, `enter linux` +0.4s cold). On `-smp>1` the whole
+  system stalls/wedges during the runlevel-5 fork+exec app-launch storm →
+  presents as the user's 30–60s (D3) / ~2s (D2). Two factors: (1) LAPIC timer
+  miscalibration under KVM (PIT-anchored, jiffies ~18–30× too fast → IRQ storm);
+  (2) a scheduler/IPC deadlock exposed by the concurrent fork+exec storm.
+  `_execve_lock` (f404c73c) RULED OUT. **Fix tracked as task #7** (timer
+  re-anchor to TSC/HPET first; deadlock is a separate follow-up). CI gap: no
+  test boots the full DE image under `-smp>1` — add one.
+  - Incidental (confirmed): the live SERIAL console already runs as `live`
+    (uid 1001); only the DE terminal is `nobody` — see C1.
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
