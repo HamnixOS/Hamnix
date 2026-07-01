@@ -23,8 +23,17 @@
 #     (the producer emits one line per live app window, not just one);
 #   * an interleaved 3-pid newwindow/readback returns each pid its OWN wid.
 #
-# Pass marker:  [test_de_multiwin_taskbar] PASS
-# Fail marker:  [test_de_multiwin_taskbar] FAIL
+# QA-N4 regression (same chain, wsys_raise_enum_selftest): a LIVE on-screen
+# window used to DROP OUT of the panel window-list after a single click. Root
+# cause: the pointer-router raise (_wsys_raise) used _wsys_win_top_z() which
+# includes the panel/menu CHROME (z>=100), so raising a clicked app window put
+# its z >=101 — above the z<100 floor /dev/wsys/windows uses to distinguish
+# app windows from chrome — and it silently vanished from the enumerated list
+# while staying visible. The self-test drives the REAL router with a content
+# click and asserts every live window still enumerates.
+#
+# Pass markers:  [MULTITASK_BAR] PASS  +  [RAISE_ENUM] PASS
+# Fail marker:   [test_de_multiwin_taskbar] FAIL
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -63,7 +72,7 @@ rc=$?
 set -e
 
 echo "[test_de_multiwin_taskbar] --- self-test output ---"
-grep -a -E "\[MULTITASK_BAR\]|\[TASKBAR_CHURN\]|\[boot:37.dein\]" "$LOG" || true
+grep -a -E "\[MULTITASK_BAR\]|\[TASKBAR_CHURN\]|\[RAISE_ENUM\]|\[boot:37.dein\]" "$LOG" || true
 echo "[test_de_multiwin_taskbar] --- end ---"
 
 fail=0
@@ -83,6 +92,18 @@ fi
 
 if ! grep -a -qF "[MULTITASK_BAR] PASS" "$LOG"; then
     echo "[test_de_multiwin_taskbar] FAIL: '[MULTITASK_BAR] PASS' not found in serial log." >&2
+    fail=1
+fi
+
+# QA-N4: a click must not drop a live window from the enumerated list.
+if grep -a -qF "[RAISE_ENUM] FAIL" "$LOG"; then
+    echo "[test_de_multiwin_taskbar] FAIL: click-raise dropped a live window from the window-list" >&2
+    grep -a -F "[RAISE_ENUM] FAIL" "$LOG" >&2 || true
+    fail=1
+fi
+
+if ! grep -a -qF "[RAISE_ENUM] PASS" "$LOG"; then
+    echo "[test_de_multiwin_taskbar] FAIL: '[RAISE_ENUM] PASS' not found in serial log." >&2
     fail=1
 fi
 
