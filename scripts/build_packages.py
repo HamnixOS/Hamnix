@@ -273,9 +273,21 @@ def _files_init() -> list[tuple[Path, str]]:
                  "login.defs", "lsb-release", "networks",
                  "os-release", "passwd", "group", "shadow",
                  "shells", "profile", "protocols",
-                 "resolv.conf", "services", "timezone", "users",
+                 "resolv.conf", "services", "timezone",
                  "debian_version"):
         _add_etc_file(f, name)
+    # Per-user namespace recipes. etc/users/ is a DIRECTORY (not a single
+    # file), so it can't ride the flat list above (it was previously
+    # listed as "users" and silently skipped as a missing file — which
+    # meant /etc/users/ never landed on the installed disk, so the login
+    # path had no default.ns to source AND `useradd` could not write
+    # /etc/users/<name>.ns, leaving every new user's #<name> home unbound
+    # in their session). Ship every recipe so the directory exists and
+    # the regular-user restricted view + per-user home bind resolve.
+    users_dir = ETC_DIR / "users"
+    if users_dir.is_dir():
+        for ns in sorted(users_dir.glob("*.ns")):
+            f.append((ns, f"etc/users/{ns.name}"))
     # /etc/hpm/channels — channel-subscription file. Default contents
     # subscribe to `main` only (the free / first-party channel).
     # `hpm enable non-free-firmware` appends entries post-install.

@@ -123,8 +123,15 @@ type_cmd "$PW" 8
 type_cmd "echo $M_IDENT" 2
 type_cmd "setuid" 3
 
-# 4b. $HOME resolves to /home/alice.
-type_cmd "echo $M_HOME H=\$HOME" 3
+# 4b. $HOME resolves to /home/alice. Emit the fence marker and the value
+# on SEPARATE lines: the slice() awk skips the line that carries the
+# marker itself, so a combined `echo MARKER VALUE` would drop VALUE from
+# the captured slice. Also print $HOME as a space-separated field (NOT
+# `H=$HOME`): hamsh lexes a bare `=` inside a command argument as an
+# operator token, so `echo H=$HOME` is a parse error. `echo HOMEVAL
+# $HOME` sidesteps it — the convention scripts/test_user_home_lean.sh uses.
+type_cmd "echo $M_HOME" 2
+type_cmd "echo HOMEVAL \$HOME" 3
 
 # 4c. cd / (control) then cd with no args -> $HOME.
 type_cmd "echo $M_CDROOT" 2
@@ -134,8 +141,10 @@ type_cmd "echo $M_CDHOME" 2
 type_cmd "cd" 2
 type_cmd "pwd" 3
 
-# 4d. tilde expansion: bare ~ and ~/sub.
-type_cmd "echo $M_TILDE T ~ S ~/Documents" 3
+# 4d. tilde expansion: bare ~ and ~/sub. Marker + value on separate lines
+# (see the 4b note: slice() drops the marker-bearing line).
+type_cmd "echo $M_TILDE" 2
+type_cmd "echo T ~ S ~/Documents" 3
 
 # 4e. write a marker into the home and list it.
 type_cmd "echo $M_WRITE" 2
@@ -205,12 +214,25 @@ grep -a -q "$PROMPT_MARKER" "$LOG" || { echo "[test_user_home] FAIL: shell-ready
 ck A "$ADD" "useradd: created $USER"
 # B. passwd succeeded.
 ck B "$PWO" "password updated successfully"
-# C. su switched to uid 1000.
-ck C "$SU" "switched to uid 1000"
-# D. inside the session, setuid getter reports uid 1000 (non-root).
-ck D "$IDENT" "uid 1000"
+# useradd auto-allocates the LOWEST free uid >= 1000. On the golden disk
+# /etc/passwd already ships dave (1000) + live (1001), so alice lands on
+# the next free id (1002). Derive it from useradd's own report rather
+# than hard-coding, so the identity assertions track the real allocation
+# regardless of which regular users the installed passwd carries.
+ALLOC_UID=$(printf '%s\n' "$ADD" | grep -a -oE 'uid [0-9]+' | head -1 | awk '{print $2}')
+if [ -z "$ALLOC_UID" ]; then ALLOC_UID=1000; fi
+if [ "$ALLOC_UID" -ge 1000 ] 2>/dev/null; then
+    echo "[test_user_home] PASS (uid-alloc): useradd assigned a regular uid ($ALLOC_UID >= 1000)"
+else
+    echo "[test_user_home] FAIL (uid-alloc): useradd assigned a non-regular uid ($ALLOC_UID)" >&2
+    fail=1
+fi
+# C. su switched to the allocated uid.
+ck C "$SU" "switched to uid $ALLOC_UID"
+# D. inside the session, setuid getter reports the same uid (non-root).
+ck D "$IDENT" "uid $ALLOC_UID"
 # E. $HOME == /home/alice.
-ck E "$HOMEO" "H=/home/$USER"
+ck E "$HOMEO" "HOMEVAL /home/$USER"
 # F. cd with no args lands in /home/alice (control: cd / -> /).
 ck "F-root" "$CDROOT" "/"
 if printf '%s\n' "$CDHOME" | grep -a -q -F "/home/$USER"; then
