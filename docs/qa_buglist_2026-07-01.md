@@ -40,9 +40,19 @@ spawns. Regression gate: `scripts/test_de_panel_widgets_ux.sh` (PASS on main).
   - FOLLOW-UP: per-user home file server + `.ns` recipe made on first boot, not
     at install time (offline-target limit).
 
-## Cluster C — Identity
-- [ ] **C1 `whoami` on the elevated shell says "nobody"** — should say **`live`**
-  (the live image's username). Elevated-shell identity not propagated.
+## Cluster C — Identity — LANDED 487d58dc
+- [x] **C1 DE terminal `whoami` = `nobody` → now `live`.** Real cause: the DE
+  terminal did `setuid 65534` (nobody) by design (no session manager). On the
+  live image the provisioned default regular user is `live` (uid 1001,
+  /home/live). Fix: `etc/rc.de-user` now `setuid 1001` + `HOME='/home/live'`;
+  compositor stays hostowner; `newshell hostowner` still elevates to hostowner.
+  Guard: `test_de_terminal_live_user.sh`. (Serial console already ran as `live`.)
+  - NOTE: first pass punted this as "future work" with a test-only change;
+    orchestrator reopened it with corrected scope → real fix.
+  - Found a hamsh language quirk (task #8): `export VAR=value` is invalid; bare
+    `VAR=value` RHS parses as arithmetic. Worked around; fix in the parser.
+  - DEFERRED (quiet window): `test_de_terminal_nonhostowner.sh` one-way-deny
+    assertions + a full visual DE boot (SIGKILL'd under load) — fold into #6.
 
 ## Cluster D — Performance
 - [x] **D1 First-terminal input lag** — LANDED b9744841. Root cause traced:
