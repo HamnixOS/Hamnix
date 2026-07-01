@@ -69,9 +69,16 @@ spawns. Regression gate: `scripts/test_de_panel_widgets_ux.sh` (PASS on main).
   presents as the user's 30–60s (D3) / ~2s (D2). Two factors: (1) LAPIC timer
   miscalibration under KVM (PIT-anchored, jiffies ~18–30× too fast → IRQ storm);
   (2) a scheduler/IPC deadlock exposed by the concurrent fork+exec storm.
-  `_execve_lock` (f404c73c) RULED OUT. **Fix tracked as task #7** (timer
-  re-anchor to TSC/HPET first; deadlock is a separate follow-up). CI gap: no
-  test boots the full DE image under `-smp>1` — add one.
+  `_execve_lock` (f404c73c) RULED OUT.
+  - **UPDATE (146c357b): timer factor FIXED + the "wedge" reframed.** LAPIC
+    calibration is now TSC-anchored with a ±12.5% clamp (safe PIT fallback). On
+    a quiet KVM host the `-smp 2` DE image boots in ~4s — the 300s "wedge" was
+    **host-load/TCG starvation under concurrent agents**, not a kernel bug. New
+    ship-path gate `test_smp_de_runlevel5.sh` (KVM `-smp 2`) PASS on main.
+  - PARKED (task #9): factor-2 (possible sched/IPC deadlock) is unreproducible
+    on quiet KVM → needs a real repro before it can be fixed. If the user still
+    sees 30-60s after the clamp lands, capture host details + whether the clamp
+    fired. Also: `test_smp.sh` (TCG, 90s timeout) is too tight on slow hosts.
   - Incidental (confirmed): the live SERIAL console already runs as `live`
     (uid 1001); only the DE terminal is `nobody` — see C1.
 
