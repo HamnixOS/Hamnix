@@ -14,11 +14,11 @@ Orchestrator is primary bug-finder; this is the working list. Status markers:
 Fixed in the live scene panel (`hampanelscene.ad`) + `hamsettings.ad`; note the
 legacy `hampanel.ad`/`hamctxmenu.ad`/`hamappmenu.ad` are NOT what the scene DE
 spawns. Regression gate: `scripts/test_de_panel_widgets_ux.sh` (PASS on main).
-- [~] **A1 App/window list not live.** Wiring verified intact + kernel
-  self-test `test_de_multiwin_taskbar` passes; NOT reproducible in current code.
-  Hit-testing hardened. **NEEDS LIVE VERIFY** — if still seen, prime suspect is
-  the kernel workspace filter (`wsys_win_ws[w]==wsys_cur_ws`) hiding windows
-  after a pager switch (flagged, not blindly changed).
+- [x] **A1 App/window list not live** — ROOT-CAUSED + FIXED (see QA-N4 below,
+  merge 6bfdd12e). Pass #1 couldn't repro with default apps; QA pass #2 (driven
+  input) reproduced it, and the real cause was the `_wsys_raise` z-band leak, NOT
+  the workspace filter. Clicking a window raised it above the chrome floor
+  (z>=100) so it fell out of the `z<100` enumeration. Fixed + regression-tested.
 - [x] **A2 CPU widget** idle-100% — was load-avg*50 scaling; rewritten to
   /dev/uptime idle/total delta with first-sample guard → near-0% idle.
 - [x] **A3 Right-click blank panel** now opens Add-a-widget (elastic tasks/
@@ -130,15 +130,17 @@ Drove the DE via HMP relative mouse. Two screendumps one click apart:
   **Terminal**; workspace 1 selected; Terminal window open top-left.
 - **de_menu_open** (after a click): **Terminal is GONE from BOTH lists**, yet the
   Terminal window is still open + visible, still on workspace 1.
-- [ ] **QA-N4** (A1, HIGH) — a LIVE, on-screen window drops out of the panel
-  window-list + taskbar after pointer interaction (same workspace, window not
-  closed). This is the A1 bug the user reported, now reproduced on video. The
-  pass-#1 agent said A1 wasn't reproducible with default apps + flagged the
-  kernel workspace filter (`wsys_win_ws[w]==wsys_cur_ws`) — but here the
-  workspace did NOT change, so the suspect is the enumeration/refresh path:
-  `devwsys_windows_read` reaping / the panel's FNV-hash-triggered repaint /
-  an interaction (drag/rubber-band/click) perturbing the live window set.
-  Assigned to an agent.
+- [x] **QA-N4** (A1) — FIXED 6bfdd12e. ROOT CAUSE: `_wsys_raise` (called on
+  every pointer click) crossed the CHROME z-order floor. `/dev/wsys/windows`
+  only lists app windows (`z<100`); chrome (panels/menus) is `z>=100`. Clicking
+  an app window raised it to `top_z+1` computed over ALL windows incl. chrome →
+  `>=101`, above the enumeration floor → the still-live, still-visible window
+  vanished from both lists (workspace unchanged — matches the video exactly).
+  The ctl `raise` verb already clamped to the app band; the internal
+  `_wsys_raise` did not. FIX: made `_wsys_raise` band-aware (app windows raise
+  only among `z<100` peers, clamped below 100). Regression: new
+  `wsys_raise_enum_selftest` drives the REAL router click + asserts all windows
+  still enumerate and z stayed `<100`. This is the definitive A1 fix.
 - [ ] **QA-N3b** (method) — HMP relative `mouse_move` is imprecise (PS/2 accel
   swept the cursor to a corner instead of the target). Reliable input-driven QA
   needs accel disabled or a deterministic positioning method. Refine before the
