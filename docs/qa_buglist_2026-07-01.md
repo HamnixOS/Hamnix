@@ -237,13 +237,14 @@ live in both panels.
 Serial-driven on fresh image. `newshell hostowner` (pw hamnix) → `whoami`=hostowner
 ✓ and fast on -smp 1 (not 30-60s). `enter linux {ls /}` runs a real Linux-ABI
 binary. But two bugs:
-- [ ] **QA-N9** (HIGH) — the Linux namespace root is MISSING `/etc`. `enter linux
-  {ls /}` shows `PROVENANCE bin lib lib64 sbin usr var` — no `/etc` (nor /home,
-  /tmp, /proc, /dev). `enter linux {cat /etc/debian_version}` → "No such file or
-  directory". `scripts/build_rootfs_img.py` (lines 37,151-152) EXPECTS
-  `/etc/{apt,debian_version,passwd,group,os-release}` in the root, so this is a
-  regression in the live-distro build OR the enter-linux namespace binding.
-  Breaks apt/config/passwd in the Linux ns. Assigned.
+- [x] **QA-N9** (HIGH) — FIXED 0aef2ad0. Root cause = BUILD, not binding: the live
+  image builds with `HAMNIX_LIVE_MINIMAL=1` → busybox-only `_stage_distro` path
+  that created skeleton dirs but never `/etc`. Fix: `_stage_minimal_etc()` plants
+  a minimal-but-real `/etc` (debian_version=12.9, os-release, passwd, group,
+  hostname, apt/sources.list) + /var/lib/dpkg/status, non-clobbering for
+  full-mirror builds. Disk-verified via debugfs on live-distro.ext4 (/etc present,
+  debian_version=12.9). SERIAL CONFIRM PENDING a quiet-window image rebuild
+  (current 12:28 image predates the fix).
 - [ ] **QA-N10** (MED) — Linux ABI `setuid`(nr 105)/`setgid`(nr 106) UNIMPLEMENTED
   (`linux_u: unknown syscall nr=105/106 a0=0x3e9=1001`), hit when Debian binaries
   run as uid 1001 (the default `live` user). Zero matches for setuid/setgid in
