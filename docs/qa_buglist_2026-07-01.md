@@ -213,18 +213,16 @@ current main (all 10 fixes) and re-verified with the working input tooling:
   `a=b=c`, empty `a=`); statement-leading assignments still route through
   `_looks_like_assignment` (unaffected). Verified: `echo a=b`→`a=b`, leading
   `W=/x/y`→`/x/y`, 10 cases PASS; DE rl5 PASS (agent, fresh KVM image).
-- [ ] **QA-N8** (CONFIRMED, HIGH) — the whole `lib/hamui` toolkit doesn't render
-  a window for regular user `live`. `hammon` (System Monitor) launched alone as
-  `live` prints "HAMMON ready" (after `hamui_window()` returns) but NO window
-  appears + it's absent from the taskbar (confirmed via dedicated boot +
-  screendump + serial). Same for `hamctl` (Control Center). `hamsettings` works
-  because it uses the RAW /dev/wsys/<wid>/scene path; hammon/hamctl use
-  `hamui_window()` which opens the hamui DRAW-LAYER tree
-  (/dev/wsys/<wid>/draw/ctl, /draw/<layer>/markup — lib/hamui.ad:2178+). The
-  QA-N6 fix only un-blocked /dev/wsys/ctl; the draw-layer files are likely still
-  blocked/failing for uid 1001 (coarse devcons gate on /dev/wsys/<wid>/draw/*, or
-  hamui_window getting a bad wid). Affects EVERY hamui app for the default DE
-  user. Assigned to an agent.
+- [x] **QA-N8** (HIGH) — FIXED a953668f + FRESH-IMAGE VERIFIED. Two causes: (1)
+  the QA-N6 devcons `/dev/wsys/ctl` open-gate (already on main via 3be71289 —
+  the agent's redundant re-fix conflict was resolved to main's version), and (2)
+  **lib/hamui painted into the RETIRED `/draw/` markup layer that the scene
+  compositor never rasterizes** — repointed `_h_rect/_h_line/_h_border/_h_text`
+  at the SCENE display list + `hamscene_commit()`; `hamui_window()` now
+  self-allocates an OWNED, DECORATED top-level (was hard-bound to wid 1); failed
+  opens now print a diagnostic. Verified: `hammon &` renders a full System
+  Monitor window (titlebar, Refresh/Quit, live uptime/mem/process-table) AND
+  enumerates in both panels. Affected every hamui app for the regular DE user.
 
 VISUALLY CONFIRMED this pass (fresh image): **A5** Settings app — all four Edge
 buttons (Top/Bottom/Left/Right) present, Add-widget row (menu/task/clok/sysm/
@@ -255,6 +253,18 @@ binary. But two bugs:
   with `get_cpus_online()` (matching real Linux `cpus_mask & cpu_active_mask`);
   the syscall now calls it → bit 0 only under -smp 1. Verified: `[UABI_FILLS]
   PASS` + `[test_uabi_fills] PASS` (all checks green).
+
+## Consolidated fresh-image verify (orchestrator, 2026-07-01 14:04 image)
+Rebuilt build/hamnix-installer.img from current main (all wave fixes) and ran one
+KVM boot with serial + screendump. ALL PASS:
+- DE boots to interactive shell (kernel devcons/hamui/sched changes = no regression).
+- QA-N7: `echo QN7=a=b` → `QN7=a=b` (no parse error).
+- QA-N9: `enter linux {cat /etc/debian_version}` → `12.9`.
+- QA-N10: no `unknown syscall nr=105/106` (setuid/setgid live).
+- QA-N8: `hammon &` as `live` → full System Monitor window (titlebar/Refresh/Quit/
+  live uptime+mem+16-row process table) + enumerates in both panels.
+- QA-N12: NOT reproduced — the serial-launched hammon DID enumerate in the taskbar
+  (hamui owned-window fix resolved it). Closed.
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
