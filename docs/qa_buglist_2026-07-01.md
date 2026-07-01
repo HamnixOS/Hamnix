@@ -243,11 +243,16 @@ binary. But two bugs:
   full-mirror builds. Disk-verified via debugfs on live-distro.ext4 (/etc present,
   debian_version=12.9). SERIAL CONFIRM PENDING a quiet-window image rebuild
   (current 12:28 image predates the fix).
-- [ ] **QA-N10** (MED) — Linux ABI `setuid`(nr 105)/`setgid`(nr 106) UNIMPLEMENTED
-  (`linux_u: unknown syscall nr=105/106 a0=0x3e9=1001`), hit when Debian binaries
-  run as uid 1001 (the default `live` user). Zero matches for setuid/setgid in
-  linux_abi/u_syscalls.ad. Implement them (real or safe no-op/EPERM per POSIX for
-  a non-privileged uid). Assigned.
+- [x] **QA-N10** (MED) — FIXED c5aa68b6. Implemented `setuid`(105)/`setgid`(106)
+  in linux_abi/u_syscalls.ad. Semantics: privileged (uid maps to Linux 0 /
+  hostowner) sets any → 0; unprivileged may only re-assert its own id → 0;
+  escalation → -EPERM. getuid/geteuid reflect changes. Verified: boot self-test
+  `[UABI_FILLS] setuid/setgid gate OK` (drop/self/EPERM/consistency).
+- [ ] **QA-N11** (MED, pre-existing — found by the QA-N10 agent) — `test_uabi_fills.sh`
+  fails `[UABI_FILLS] FAIL sched_getaffinity mask`: the Linux-ABI
+  `sched_getaffinity` returns the wrong affinity mask under `-smp 1` (expects
+  CPU-0-only, doesn't get it). Confirmed NOT a regression (fails on baseline).
+  Red-flags the uabi_fills gate regardless. Task #18.
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
