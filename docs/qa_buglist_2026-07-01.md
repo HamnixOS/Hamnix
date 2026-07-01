@@ -45,9 +45,13 @@ spawns. Regression gate: `scripts/test_de_panel_widgets_ux.sh` (PASS on main).
   (the live image's username). Elevated-shell identity not propagated.
 
 ## Cluster D — Performance
-- [ ] **D1 First-terminal input lag.** On the *first* terminal: 1st char quick,
-  2nd char ~0.2s late, command (`pwd`) ~0.5s to run. **Closing and reopening a
-  terminal makes it fast** — cold-start warm-up issue, not steady state.
+- [x] **D1 First-terminal input lag** — LANDED b9744841. Root cause traced:
+  cross-process file-read caching (ext4 page cache + block buffer cache) cold on
+  the first `hamsh`/rc/`ls`/`pwd` reads; warm for terminal #2. Fix: rc.5
+  pre-warms the caches synchronously before the terminal launches; `pwd` is now
+  a hamsh builtin (no `/bin/pwd` cold-exec); `COLD_START` marker added. Gate:
+  `test_de_first_term_prewarm_guard.sh` PASS. **DEFERRED live-timing validation**
+  (quiet window): boot DE, read `COLD_START jiffies` before/after — tracked below.
 - [ ] **D2 Entering the Linux namespace still takes a couple seconds.**
 - [ ] **D3 `newshell hostowner` still takes ~30s–60s** (identity is *correct* —
   `whoami` → `hostowner`; this is purely startup latency).
