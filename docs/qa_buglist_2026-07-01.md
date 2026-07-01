@@ -332,6 +332,26 @@ found (expected, minimal root); `mount`→exit 1 (minor).
 - [ ] **QA-N19** (cosmetic, LOW) — `enter linux {ps}` shows pid 1 COMM as
   `koftfird` (looks like a garbled/obfuscated comm read). ps otherwise works.
 
+## Interactive END-USER push #2 (orchestrator, 2026-07-01) — hamsh scripting
+WORKS: `if 5 > 3 { echo BIG } else {…}`→BIG; `while $n < 3 {…}` + arithmetic
+`n = $n + 1`→LOOPN 0/1/2; `def greet(who){…}` + `greet(world)`→runs; script file
+`hamsh /tmp/s.hamsh`→FROM_SCRIPT. So if/else, while, def+call, and script
+execution all function.
+- [ ] **QA-N20** (hamsh, HIGH — common idiom, silent wrong result) — UNQUOTED
+  `text$var` does NOT concatenate; hamsh splits it into separate argv words.
+  Verified with `s=world`: `echo Kpre$s`→`Kpre world` (want `Kpreworld`);
+  `echo K$s.txt`→`K world .txt`; `echo K$s$s`→`K world world`. DOUBLE-QUOTED
+  works: `echo "Kq$s"`→`Kqworld`. Breaks `file$i`, `$dir/$name`, `$base.txt` —
+  every other shell concatenates unquoted. This is the `$`-adjacency analog of
+  the `=`-fusion QA-N7 (ND_ARGCAT) already solved; extend word-fusion so a
+  bareword adjacent to a `$var`/expansion (either side) is ONE argv word. Assigned.
+- [ ] **QA-N18** (hamsh for-loop, MED) — `for f in a b c {…}` (POSIX word-list) →
+  parse error (Python-flavored: single iterable expr only); AND `for f in solo
+  {…}` (single bareword) produced NO iteration/output. Needs: confirm the working
+  iterable form (list value / `$var`) and decide whether to accept a word-list.
+- [ ] **QA-N19** (cosmetic) — `enter linux {ps}` pid-1 COMM shows `koftfird`
+  (garbled comm read); ps otherwise works.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
