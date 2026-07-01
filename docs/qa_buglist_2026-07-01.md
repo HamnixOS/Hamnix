@@ -337,14 +337,13 @@ WORKS: `if 5 > 3 { echo BIG } else {…}`→BIG; `while $n < 3 {…}` + arithmet
 `n = $n + 1`→LOOPN 0/1/2; `def greet(who){…}` + `greet(world)`→runs; script file
 `hamsh /tmp/s.hamsh`→FROM_SCRIPT. So if/else, while, def+call, and script
 execution all function.
-- [ ] **QA-N20** (hamsh, HIGH — common idiom, silent wrong result) — UNQUOTED
-  `text$var` does NOT concatenate; hamsh splits it into separate argv words.
-  Verified with `s=world`: `echo Kpre$s`→`Kpre world` (want `Kpreworld`);
-  `echo K$s.txt`→`K world .txt`; `echo K$s$s`→`K world world`. DOUBLE-QUOTED
-  works: `echo "Kq$s"`→`Kqworld`. Breaks `file$i`, `$dir/$name`, `$base.txt` —
-  every other shell concatenates unquoted. This is the `$`-adjacency analog of
-  the `=`-fusion QA-N7 (ND_ARGCAT) already solved; extend word-fusion so a
-  bareword adjacent to a `$var`/expansion (either side) is ONE argv word. Assigned.
+- [x] **QA-N20** (hamsh, HIGH) — FIXED 0eaefdab + boot-verified. Token-adjacency
+  tracking (`tok_glued[]` + `_glue_adjacent`→`ND_ARGCAT`, the `$`-analog of
+  QA-N7): a bareword glued to a `$var`/expansion (either side, chained) fuses into
+  ONE argv word. `echo Kpre$s`→`Kpreworld`, `K$s.txt`→`Kworld.txt`, `$s$s`→
+  `worldworld`; `a $s b`→3 words (spaces preserved); `"Kq$s"`→`Kqworld`. New
+  test_hamsh_expand.sh 7/7 + test_hamsh_assign 16/16 + DE rl5 PASS. (Was: unquoted
+  `text$var` split into separate argv words — a silent-wrong-result idiom bug.)
 - [ ] **QA-N18** (hamsh for-loop, MED) — `for f in a b c {…}` (POSIX word-list) →
   parse error (Python-flavored: single iterable expr only); AND `for f in solo
   {…}` (single bareword) produced NO iteration/output. Needs: confirm the working
