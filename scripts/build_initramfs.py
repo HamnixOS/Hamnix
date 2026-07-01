@@ -723,6 +723,15 @@ if os.environ.get("ENABLE_PIDFD_TEST") == "1":
 if os.environ.get("ENABLE_MEMFD_TEST") == "1":
     FILES.append(("/etc/memfd-test", b"1\n"))
 
+# Wayland-passthrough Phase-0 de-risk spike. scripts/test_wlspike_scm.sh sets
+# ENABLE_WLSPIKE_TEST=1 to plant /etc/wlspike-test; init/main.ad at
+# boot:37.wlspike detects the marker and runs wlspike_scm_selftest()
+# (linux_abi/u_syscalls.ad), which passes a memfd fd over AF_UNIX SCM_RIGHTS
+# via the real sendmsg/recvmsg dispatch and proves both ends map the SAME
+# physical page (prints "[wlspike] SCM_RIGHTS memfd round-trip OK: WLSPIKE_OK").
+if os.environ.get("ENABLE_WLSPIKE_TEST") == "1":
+    FILES.append(("/etc/wlspike-test", b"1\n"))
+
 # io_uring_setup/enter/register self-test. scripts/test_iouring.sh sets
 # ENABLE_IOURING_TEST=1 to plant /etc/iouring-test; init/main.ad at
 # boot:37.iouring detects the marker and runs iouring_selftest()

@@ -129,6 +129,10 @@ from fs.vfs import (
     # vfs.ad calls our uino_post through a function pointer it knows
     # nothing about, registered here at bring-up).
     register_inotify_notify_hook,
+    # §SCM_RIGHTS (Wayland shm-fd passing): resolve a memfd/tmpfs fd to its
+    # backing slot (sendmsg side) and bind a fresh fd to an existing slot
+    # (recvmsg side) so both ends map the SAME physical pages.
+    vfs_open_memfd, vfs_fd_tmpfs_slot, vfs_install_tmpfs_slot_fd,
 )
 # #164: the Linux-ABI terminal line discipline. A console-backed read(2)
 # (an interactive `enter linux { /bin/sh }` guest's fd 0) routes through
@@ -447,6 +451,8 @@ from linux_abi.u_unixsock import (
     afunix_socketpair, afunix_close, afunix_get_type,
     afunix_fdbuf_for_ep, afunix_ep_for_fdbuf,
     AFU_AF_UNIX, AFU_SOCK_STREAM, AFU_SOCK_DGRAM, AFU_EAGAIN,
+    # §SCM_RIGHTS ancillary-fd conduit (sendmsg/recvmsg fd passing).
+    afunix_scm_send, afunix_scm_recv, afunix_scm_pending,
 )
 # AF_NETLINK / NETLINK_ROUTE (rtnetlink) — a Layer-2 framing window onto
 # the kernel's existing net state (drivers/net/ip.ad + eth.ad), letting
@@ -644,6 +650,10 @@ from fs.tmpfs import (
     # readlink(2): resolve a tmpfs symlink's stored target string.
     tmpfs_path_is_symlink, tmpfs_readlink_path, tmpfs_create_symlink,
     tmpfs_unlink,
+    # §SCM_RIGHTS memfd passing + the wlspike de-risk self-test: physical
+    # page identity check (tmpfs_page_phys), anon-slot dup refcount
+    # (tmpfs_anon_ref / tmpfs_release_anon), and memfd size prep.
+    tmpfs_page_phys, tmpfs_anon_ref, tmpfs_release_anon, tmpfs_ftruncate,
 )
 # statfs(2): the ext4 block/inode geometry the df numbers come from. The
 # total counts + block size are captured by ext4_init at mount; the free
@@ -2131,6 +2141,13 @@ def _u_close(a0: uint64, a1: uint64, a2: uint64,
     # heard of the AF_UNIX tag, so it cannot drop the endpoint.
     cl_uxep: int32 = _u_afunix_ep(cast[int32](a0))
     if cl_uxep >= 0:
+        # §SCM_RIGHTS: drop the anon-slot reference of any passed fd that
+        # was queued for this endpoint but never recvmsg'd, so closing a
+        # socket with in-flight fds does not leak the backing memfd.
+        cl_scm: int32 = afunix_scm_recv(cl_uxep)
+        while cl_scm >= 0:
+            tmpfs_release_anon(cl_scm)
+            cl_scm = afunix_scm_recv(cl_uxep)
         afunix_close(cl_uxep)
     # AF_NETLINK: release the in-kernel endpoint (its rx ring + port id).
     # vfs.ad has never heard of the NETLINK tag, so drop it here.
@@ -5523,6 +5540,307 @@ def _u_recvfrom(a0: uint64, a1: uint64, a2: uint64,
     # so the §5 O_NONBLOCK path applies (a non-blocking stream socket's
     # would-block recv must return -EAGAIN, not yield-block).
     return _u_read(a0, a1, a2, 0, 0, 0)
+
+
+# =====================================================================
+# sendmsg(2) / recvmsg(2) + SCM_RIGHTS fd passing
+# =====================================================================
+#
+# Declared long ago (SYS_sendmsg=46 / SYS_recvmsg=47) but never dispatched
+# → they hit -ENOSYS. The Wayland-passthrough track (docs/wayland_
+# passthrough_design.md §4) needs them to pass a wl_shm pool fd (a memfd)
+# from a Linux-ns client to the compositor over an AF_UNIX socket in an
+# SCM_RIGHTS ancillary message — so the SAME shared-memory pages are
+# visible on both ends.
+#
+# SCOPE (de-risk spike): AF_UNIX SOCK_STREAM carries the data iov(s) over
+# the byte ring AND, for a SOL_SOCKET/SCM_RIGHTS control message, conducts
+# each passed fd's tmpfs/memfd BACKING SLOT to the peer (afunix_scm_*). On
+# recvmsg the peer installs a FRESH fd bound to that same slot
+# (vfs_install_tmpfs_slot_fd) — both fds then map the same physical frames
+# (tmpfs MAP_SHARED coherence). A non-AF_UNIX socket degrades to a plain
+# gather-write / scatter-read of the data iovs (control ignored: only the
+# AF_UNIX conduit carries fds in this shim). LIMITATIONS: only memfd/tmpfs-
+# backed fds can be passed (a Wayland wl_shm pool always is); a single
+# leading cmsghdr is parsed; fds are associated with the message, not a
+# byte offset (fine for one message at a time).
+
+# struct msghdr x86_64 field offsets.
+MSGH_NAME:       uint64 = 0
+MSGH_NAMELEN:    uint64 = 8
+MSGH_IOV:        uint64 = 16
+MSGH_IOVLEN:     uint64 = 24
+MSGH_CONTROL:    uint64 = 32
+MSGH_CONTROLLEN: uint64 = 40
+MSGH_FLAGS:      uint64 = 48
+# struct cmsghdr: cmsg_len(u64)@0, cmsg_level(u32)@8, cmsg_type(u32)@12,
+# data (CMSG_ALIGN(sizeof(cmsghdr)) == 16) @16.
+CMSG_HDR_LEN:    uint64 = 16
+SCM_SOL_SOCKET:  uint32 = 1
+SCM_RIGHTS_TYPE: uint32 = 1
+
+
+def _u_scm_align8(n: uint64) -> uint64:
+    return (n + 7) & ~cast[uint64](7)
+
+
+def _u_afunix_send_all(uxep: int32, fd: int32, ubuf: uint64,
+                       ulen: uint64) -> int64:
+    # Send every byte of [ubuf, ubuf+ulen) into the AF_UNIX stream peer,
+    # blocking (cooperative yield) on a full peer ring unless the fd is
+    # non-blocking. Returns the byte count sent (>0), 0 for a zero-length
+    # buffer, or a negative errno (EPIPE on a dead peer). On a would-block
+    # with progress already made, returns the partial count.
+    done: uint64 = 0
+    while done < ulen:
+        n: int64 = afunix_send_stream(uxep, ubuf + done, ulen - done)
+        if n == AFU_EAGAIN:
+            if _u_fd_is_nonblock(fd) != 0:
+                if done > 0:
+                    return cast[int64](done)
+                return AFU_EAGAIN
+            yield_to_others()
+        elif n < 0:
+            if done > 0:
+                return cast[int64](done)
+            return n
+        else:
+            done = done + cast[uint64](n)
+    return cast[int64](done)
+
+
+def _u_sendmsg(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
+    fd: int32 = cast[int32](a0)
+    umsg: uint64 = a1
+    if umsg == 0:
+        return ELINUX_EFAULT
+    m_iov:     Array[1, uint64]
+    m_iovlen:  Array[1, uint64]
+    m_ctl:     Array[1, uint64]
+    m_ctllen:  Array[1, uint64]
+    if get_user_64(umsg + MSGH_IOV, &m_iov[0]) != 0:
+        return ELINUX_EFAULT
+    if get_user_64(umsg + MSGH_IOVLEN, &m_iovlen[0]) != 0:
+        return ELINUX_EFAULT
+    if get_user_64(umsg + MSGH_CONTROL, &m_ctl[0]) != 0:
+        return ELINUX_EFAULT
+    if get_user_64(umsg + MSGH_CONTROLLEN, &m_ctllen[0]) != 0:
+        return ELINUX_EFAULT
+    iovp:    uint64 = m_iov[0]
+    iovn:    uint64 = m_iovlen[0]
+    ctl:     uint64 = m_ctl[0]
+    ctllen:  uint64 = m_ctllen[0]
+
+    uxep: int32 = _u_afunix_ep(fd)
+    if uxep < 0 or afunix_get_type(uxep) != AFU_SOCK_STREAM:
+        # Not an AF_UNIX stream — degrade to a gather write of the data
+        # iovs (SCM control is dropped: only the AF_UNIX conduit passes
+        # fds here). A NULL data iov with only control is a no-op success.
+        gtotal: int64 = 0
+        gi: uint64 = 0
+        while gi < iovn:
+            ib: Array[1, uint64]
+            il: Array[1, uint64]
+            if get_user_64(iovp + gi * 16, &ib[0]) != 0:
+                return ELINUX_EFAULT
+            if get_user_64(iovp + gi * 16 + 8, &il[0]) != 0:
+                return ELINUX_EFAULT
+            if il[0] > 0:
+                gw: int64 = _u_write(cast[uint64](fd), ib[0], il[0], 0, 0, 0)
+                if gw < 0:
+                    if gtotal > 0:
+                        return gtotal
+                    return gw
+                gtotal = gtotal + gw
+            gi = gi + 1
+        return gtotal
+
+    # --- 1) SCM_RIGHTS control: conduct each passed fd's backing slot ---
+    if ctl != 0 and ctllen >= CMSG_HDR_LEN:
+        c_len:   Array[1, uint64]
+        c_level: Array[1, uint32]
+        c_type:  Array[1, uint32]
+        if get_user_64(ctl + 0, &c_len[0]) != 0:
+            return ELINUX_EFAULT
+        if get_user_32(ctl + 8, &c_level[0]) != 0:
+            return ELINUX_EFAULT
+        if get_user_32(ctl + 12, &c_type[0]) != 0:
+            return ELINUX_EFAULT
+        if c_level[0] == SCM_SOL_SOCKET and c_type[0] == SCM_RIGHTS_TYPE:
+            if c_len[0] < CMSG_HDR_LEN or c_len[0] > ctllen:
+                return ELINUX_INVAL
+            nfds: uint64 = (c_len[0] - CMSG_HDR_LEN) / 4
+            fi: uint64 = 0
+            while fi < nfds:
+                pfd: Array[1, uint32]
+                if get_user_32(ctl + CMSG_HDR_LEN + fi * 4, &pfd[0]) != 0:
+                    return ELINUX_EFAULT
+                pslot: int32 = vfs_fd_tmpfs_slot(cast[int32](pfd[0]))
+                if pslot < 0:
+                    # Only memfd / tmpfs-backed fds are passable in this
+                    # shim (a Wayland wl_shm pool always is).
+                    set_current_errstr("sendmsg: SCM_RIGHTS fd not a memfd/tmpfs object")
+                    return ELINUX_INVAL
+                # Take the extra anon reference BEFORE enqueue so the
+                # backing survives even if the sender closes its fd before
+                # the peer recvmsg's.
+                tmpfs_anon_ref(pslot)
+                sr: int64 = afunix_scm_send(uxep, pslot)
+                if sr != 0:
+                    tmpfs_release_anon(pslot)      # drop the ref we took
+                    return sr
+                fi = fi + 1
+
+    # --- 2) data: gather-send the iovs into the peer's byte ring --------
+    total: int64 = 0
+    di: uint64 = 0
+    while di < iovn:
+        ib2: Array[1, uint64]
+        il2: Array[1, uint64]
+        if get_user_64(iovp + di * 16, &ib2[0]) != 0:
+            return ELINUX_EFAULT
+        if get_user_64(iovp + di * 16 + 8, &il2[0]) != 0:
+            return ELINUX_EFAULT
+        if il2[0] > 0:
+            sn: int64 = _u_afunix_send_all(uxep, fd, ib2[0], il2[0])
+            if sn == ELINUX_PIPE:
+                signal_post(current_idx_get(), SIGPIPE)
+            if sn < 0:
+                if total > 0:
+                    return total
+                return sn
+            total = total + sn
+        di = di + 1
+    return total
+
+
+def _u_recvmsg(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # ssize_t recvmsg(int fd, struct msghdr *msg, int flags)
+    fd: int32 = cast[int32](a0)
+    umsg: uint64 = a1
+    if umsg == 0:
+        return ELINUX_EFAULT
+    m_iov:    Array[1, uint64]
+    m_iovlen: Array[1, uint64]
+    m_ctl:    Array[1, uint64]
+    m_ctllen: Array[1, uint64]
+    if get_user_64(umsg + MSGH_IOV, &m_iov[0]) != 0:
+        return ELINUX_EFAULT
+    if get_user_64(umsg + MSGH_IOVLEN, &m_iovlen[0]) != 0:
+        return ELINUX_EFAULT
+    if get_user_64(umsg + MSGH_CONTROL, &m_ctl[0]) != 0:
+        return ELINUX_EFAULT
+    if get_user_64(umsg + MSGH_CONTROLLEN, &m_ctllen[0]) != 0:
+        return ELINUX_EFAULT
+    iovp:   uint64 = m_iov[0]
+    iovn:   uint64 = m_iovlen[0]
+    ctl:    uint64 = m_ctl[0]
+    ctllen: uint64 = m_ctllen[0]
+
+    uxep: int32 = _u_afunix_ep(fd)
+    if uxep < 0 or afunix_get_type(uxep) != AFU_SOCK_STREAM:
+        # Not an AF_UNIX stream — degrade to a scatter read of the data
+        # iovs via read(2) (no ancillary fds delivered). Report an empty
+        # control buffer + zeroed flags.
+        rtotal: int64 = 0
+        ri2: uint64 = 0
+        while ri2 < iovn:
+            ib: Array[1, uint64]
+            il: Array[1, uint64]
+            if get_user_64(iovp + ri2 * 16, &ib[0]) != 0:
+                return ELINUX_EFAULT
+            if get_user_64(iovp + ri2 * 16 + 8, &il[0]) != 0:
+                return ELINUX_EFAULT
+            if il[0] > 0:
+                rr: int64 = _u_read(cast[uint64](fd), ib[0], il[0], 0, 0, 0)
+                if rr < 0:
+                    if rtotal > 0:
+                        break
+                    return rr
+                rtotal = rtotal + rr
+                if cast[uint64](rr) < il[0]:
+                    ri2 = iovn                      # short read — stop
+                else:
+                    ri2 = ri2 + 1
+            else:
+                ri2 = ri2 + 1
+        if ctl != 0:
+            put_user_64(0, umsg + MSGH_CONTROLLEN)
+        put_user_32(0, umsg + MSGH_FLAGS)
+        return rtotal
+
+    # Block until data is readable OR a passed fd is pending OR EOF,
+    # unless the fd is non-blocking.
+    nb: int32 = _u_fd_is_nonblock(fd)
+    while afunix_can_read(uxep) == 0:
+        if afunix_scm_pending(uxep) > 0:
+            break                                   # fds arrived without data
+        if nb != 0:
+            return ELINUX_AGAIN
+        yield_to_others()
+
+    # --- 1) scatter-read available data into the iovs -------------------
+    total: int64 = 0
+    di: uint64 = 0
+    while di < iovn:
+        ib2: Array[1, uint64]
+        il2: Array[1, uint64]
+        if get_user_64(iovp + di * 16, &ib2[0]) != 0:
+            return ELINUX_EFAULT
+        if get_user_64(iovp + di * 16 + 8, &il2[0]) != 0:
+            return ELINUX_EFAULT
+        if il2[0] == 0:
+            di = di + 1
+        else:
+            rn: int64 = afunix_recv_stream(uxep, ib2[0], il2[0])
+            if rn == AFU_EAGAIN:
+                di = iovn                           # ring drained for now
+            elif rn <= 0:
+                di = iovn                           # EOF / error
+            else:
+                total = total + rn
+                if cast[uint64](rn) < il2[0]:
+                    di = iovn                       # ring drained
+                else:
+                    di = di + 1
+
+    # --- 2) install any passed fds into a single SCM_RIGHTS cmsg --------
+    ctl_written: uint64 = 0
+    if ctl != 0 and ctllen >= CMSG_HDR_LEN and afunix_scm_pending(uxep) > 0:
+        maxfds: uint64 = (ctllen - CMSG_HDR_LEN) / 4
+        nfds: uint64 = 0
+        while nfds < maxfds:
+            slot: int32 = afunix_scm_recv(uxep)
+            if slot < 0:
+                nfds = maxfds                       # queue drained
+            else:
+                newfd: int32 = vfs_install_tmpfs_slot_fd(slot)
+                if newfd < 0:
+                    # Could not install — drop the sender's enqueue ref and
+                    # stop (leave remaining fds queued for a later recvmsg).
+                    tmpfs_release_anon(slot)
+                    nfds = maxfds
+                else:
+                    if put_user_32(cast[uint32](newfd),
+                                   ctl + CMSG_HDR_LEN + nfds * 4) != 0:
+                        return ELINUX_EFAULT
+                    nfds = nfds + 1
+        if nfds > 0:
+            cmsg_len: uint64 = CMSG_HDR_LEN + nfds * 4
+            if put_user_64(cmsg_len, ctl + 0) != 0:
+                return ELINUX_EFAULT
+            if put_user_32(SCM_SOL_SOCKET, ctl + 8) != 0:
+                return ELINUX_EFAULT
+            if put_user_32(SCM_RIGHTS_TYPE, ctl + 12) != 0:
+                return ELINUX_EFAULT
+            ctl_written = _u_scm_align8(cmsg_len)
+
+    put_user_64(ctl_written, umsg + MSGH_CONTROLLEN)
+    put_user_32(0, umsg + MSGH_FLAGS)
+    return total
 
 
 def _u_poll_fd_revents(fd: int32, events: uint32) -> uint32:
@@ -15294,6 +15612,274 @@ def _msync_restore_fds(boot_task: Ptr[TaskStruct], fd_save: Ptr[uint32]):
 
 
 # =====================================================================
+# [boot:37.wlspike] Wayland-passthrough Phase-0 de-risk self-test
+# =====================================================================
+#
+# THE make-or-break spike for docs/wayland_passthrough_design.md: prove a
+# shared-memory (memfd) buffer fd can cross the Linux-ns boundary via an
+# AF_UNIX SCM_RIGHTS ancillary message and that BOTH ends see the SAME
+# physical page. Drives the REAL sendmsg(46)/recvmsg(47) dispatch through
+# genuine user memory (a mapped msghdr + iovec + cmsg), exactly as a
+# libwayland client would:
+#
+#   1. create a memfd, mmap it MAP_SHARED, write the marker "WLSPIKE_OK"
+#      THROUGH the mapping (the "client" side);
+#   2. socketpair(AF_UNIX, SOCK_STREAM); sendmsg the memfd fd in an
+#      SCM_RIGHTS cmsg (plus an 8-byte data iov) on one end;
+#   3. recvmsg on the other end — get a NEW fd out of the cmsg + the data;
+#   4. PROVE physical-page identity: tmpfs_page_phys(send) ==
+#      tmpfs_page_phys(recv) (same frame, non-zero);
+#   5. mmap the RECEIVED fd MAP_SHARED in a FRESH mapping and read the
+#      marker back — it must match "WLSPIKE_OK".
+#
+# On full success prints the headline the gate greps for:
+#   [wlspike] SCM_RIGHTS memfd round-trip OK: WLSPIKE_OK
+# and "[wlspike] PASS". Any failed assertion prints "[wlspike] FAIL: ...".
+# Gated by init/main.ad on /etc/wlspike-test (build_initramfs.py plants it
+# when ENABLE_WLSPIKE_TEST=1).
+
+WLSPIKE_MSG_VADDR:  uint64 = 0x0000567800000000   # send msghdr page
+WLSPIKE_RMSG_VADDR: uint64 = 0x0000567800010000   # recv msghdr page
+
+
+def _wlspike_fail(msg: Ptr[uint8]):
+    printk0("[wlspike] FAIL: ")
+    printk0(msg)
+    printk0("\n")
+
+
+def wlspike_scm_selftest() -> int32:
+    PROT_READ:  int32 = 0x1
+    PROT_WRITE: int32 = 0x2
+    MAP_SHARED: int32 = 0x01
+    PG: uint64 = 4096
+    set_efer_nxe()
+
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = boot_task[0].fd_idx[fdi]
+        boot_task[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+
+    boot_slot: uint64 = current_idx_get()
+    boot_pml4: uint64 = task_pml4(cast[int32](boot_slot))
+
+    # The marker the client writes through its mmap. 11 bytes incl NUL.
+    marker: Array[11, uint8]
+    mstr: Ptr[uint8] = "WLSPIKE_OK"
+    mi: uint64 = 0
+    while mi < 11:
+        marker[mi] = mstr[mi]
+        mi = mi + 1
+
+    # ---- 1) client: memfd + mmap MAP_SHARED + write marker THROUGH map --
+    fd_send: int32 = vfs_open_memfd(cast[Ptr[char]]("wlspike-shm"), 0)
+    if fd_send < 0:
+        _wlspike_fail("memfd_create (send)")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    slot_send: int32 = vfs_fd_tmpfs_slot(fd_send)
+    if slot_send < 0:
+        _wlspike_fail("send fd is not a memfd/tmpfs object")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    base_s64: int64 = vma_alloc_file_shared(boot_slot, 0, PG,
+                                            PROT_READ | PROT_WRITE,
+                                            MAP_SHARED,
+                                            cast[int32](FD_TMPFS_MARK),
+                                            cast[uint64](cast[uint32](slot_send)),
+                                            PG, 0)
+    if base_s64 < 0:
+        _wlspike_fail("mmap send memfd MAP_SHARED")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    base_s: uint64 = cast[uint64](base_s64)
+    vma_demand_fault(boot_slot, boot_pml4, base_s)
+    ws: uint64 = 0
+    while ws < 11:
+        cast[Ptr[uint8]](base_s + ws)[0] = marker[ws]
+        ws = ws + 1
+
+    # ---- 2) AF_UNIX SOCK_STREAM socketpair -----------------------------
+    ea: int32 = 0
+    eb: int32 = 0
+    if afunix_socketpair(AFU_SOCK_STREAM, &ea, &eb) != 0:
+        _wlspike_fail("socketpair")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    fd_sa: int32 = vfs_alloc_socket_fd()
+    fd_sb: int32 = vfs_alloc_socket_fd()
+    if fd_sa < 0 or fd_sb < 0:
+        _wlspike_fail("socketpair fd alloc")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    vfs_socket_fd_set_record(fd_sa, afunix_fdbuf_for_ep(ea))
+    vfs_socket_fd_set_record(fd_sb, afunix_fdbuf_for_ep(eb))
+
+    # ---- 3) build the send msghdr in real USER memory + sendmsg --------
+    p: uint64 = alloc_page()
+    if p == 0:
+        _wlspike_fail("alloc send msg page")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    if vm_map_user_page(boot_pml4, WLSPIKE_MSG_VADDR, p, 1) < 0:
+        _wlspike_fail("map send msg page")
+        free_page(p)
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    V: uint64 = WLSPIKE_MSG_VADDR
+    # Layout within the page: msghdr@0, iovec@64, data@128, cmsg@256.
+    put_user_64(0, V + MSGH_NAME)
+    put_user_32(0, V + MSGH_NAMELEN)
+    put_user_64(V + 64, V + MSGH_IOV)
+    put_user_64(1, V + MSGH_IOVLEN)
+    put_user_64(V + 256, V + MSGH_CONTROL)
+    put_user_64(24, V + MSGH_CONTROLLEN)          # >= CMSG_LEN(4)=20
+    put_user_32(0, V + MSGH_FLAGS)
+    put_user_64(V + 128, V + 64)                  # iov_base
+    put_user_64(8, V + 64 + 8)                     # iov_len
+    payload: Array[8, uint8]
+    payload[0] = 87    # 'W'
+    payload[1] = 76    # 'L'
+    payload[2] = 68    # 'D'
+    payload[3] = 65    # 'A'
+    payload[4] = 84    # 'T'
+    payload[5] = 65    # 'A'
+    payload[6] = 49    # '1'
+    payload[7] = 50    # '2'
+    copy_to_user(V + 128, cast[uint64](&payload[0]), 8)
+    put_user_64(20, V + 256 + 0)                  # cmsg_len = 16 + 4
+    put_user_32(SCM_SOL_SOCKET, V + 256 + 8)
+    put_user_32(SCM_RIGHTS_TYPE, V + 256 + 12)
+    put_user_32(cast[uint32](fd_send), V + 256 + 16)
+
+    sn: int64 = linux_u_syscall_dispatch(SYS_sendmsg,
+                                         cast[uint64](fd_sa), V, 0, 0, 0, 0)
+    if sn != 8:
+        printk1("[wlspike] FAIL: sendmsg rc=%d (want 8)\n", cast[uint64](sn))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- 4) build the recv msghdr + recvmsg ----------------------------
+    rp: uint64 = alloc_page()
+    if rp == 0:
+        _wlspike_fail("alloc recv msg page")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    if vm_map_user_page(boot_pml4, WLSPIKE_RMSG_VADDR, rp, 1) < 0:
+        _wlspike_fail("map recv msg page")
+        free_page(rp)
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    RV: uint64 = WLSPIKE_RMSG_VADDR
+    put_user_64(0, RV + MSGH_NAME)
+    put_user_32(0, RV + MSGH_NAMELEN)
+    put_user_64(RV + 64, RV + MSGH_IOV)
+    put_user_64(1, RV + MSGH_IOVLEN)
+    put_user_64(RV + 256, RV + MSGH_CONTROL)
+    put_user_64(64, RV + MSGH_CONTROLLEN)
+    put_user_32(0, RV + MSGH_FLAGS)
+    put_user_64(RV + 128, RV + 64)                # iov_base
+    put_user_64(64, RV + 64 + 8)                   # iov_len
+    # zero the control area so a stale read can't masquerade as a cmsg.
+    put_user_64(0, RV + 256 + 0)
+    put_user_32(0, RV + 256 + 16)
+
+    rn: int64 = linux_u_syscall_dispatch(SYS_recvmsg,
+                                         cast[uint64](fd_sb), RV, 0, 0, 0, 0)
+    if rn != 8:
+        printk1("[wlspike] FAIL: recvmsg rc=%d (want 8)\n", cast[uint64](rn))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    # Data iov must carry the payload bytes.
+    rxd: Array[8, uint8]
+    copy_from_user(cast[uint64](&rxd[0]), RV + 128, 8)
+    rk: uint64 = 0
+    while rk < 8:
+        if rxd[rk] != payload[rk]:
+            _wlspike_fail("recvmsg data iov mismatch")
+            _msync_restore_fds(boot_task, &fd_save[0])
+            return 1
+        rk = rk + 1
+    # Control buffer must carry one SCM_RIGHTS fd.
+    outclen: Array[1, uint64]
+    get_user_64(RV + MSGH_CONTROLLEN, &outclen[0])
+    if outclen[0] < 20:
+        printk1("[wlspike] FAIL: recv controllen=%d (want >=20)\n",
+                outclen[0])
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    cl2: Array[1, uint32]
+    ct2: Array[1, uint32]
+    get_user_32(RV + 256 + 8, &cl2[0])
+    get_user_32(RV + 256 + 12, &ct2[0])
+    if cl2[0] != SCM_SOL_SOCKET or ct2[0] != SCM_RIGHTS_TYPE:
+        _wlspike_fail("recv cmsg level/type not SOL_SOCKET/SCM_RIGHTS")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    newfd_u: Array[1, uint32]
+    get_user_32(RV + 256 + 16, &newfd_u[0])
+    fd_recv: int32 = cast[int32](newfd_u[0])
+    if fd_recv < 0 or fd_recv == fd_send:
+        printk1("[wlspike] FAIL: bad received fd=%d\n",
+                cast[uint64](cast[int64](fd_recv)))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- 5) PROVE same physical frame ----------------------------------
+    slot_recv: int32 = vfs_fd_tmpfs_slot(fd_recv)
+    if slot_recv < 0:
+        _wlspike_fail("received fd is not a memfd/tmpfs object")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    phys_s: uint64 = tmpfs_page_phys(slot_send, 0)
+    phys_r: uint64 = tmpfs_page_phys(slot_recv, 0)
+    if phys_s == 0 or phys_r == 0 or phys_s != phys_r:
+        printk2("[wlspike] FAIL: phys frame differ send=%x recv=%x\n",
+                phys_s, phys_r)
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    printk1("[wlspike] passed fd -> SAME physical frame @ %x\n", phys_s)
+
+    # ---- 6) receiver mmaps the NEW fd and reads the marker back --------
+    base_r64: int64 = vma_alloc_file_shared(boot_slot, 0, PG,
+                                            PROT_READ | PROT_WRITE,
+                                            MAP_SHARED,
+                                            cast[int32](FD_TMPFS_MARK),
+                                            cast[uint64](cast[uint32](slot_recv)),
+                                            PG, 0)
+    if base_r64 < 0:
+        _wlspike_fail("mmap recv memfd MAP_SHARED")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    base_r: uint64 = cast[uint64](base_r64)
+    vma_demand_fault(boot_slot, boot_pml4, base_r)
+    rc_mism: uint64 = 0
+    rr: uint64 = 0
+    while rr < 11:
+        if cast[Ptr[uint8]](base_r + rr)[0] != marker[rr]:
+            rc_mism = rc_mism + 1
+        rr = rr + 1
+    if rc_mism != 0:
+        printk1("[wlspike] FAIL: receiver mmap marker mismatch (%d bytes)\n",
+                rc_mism)
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- cleanup + verdict ---------------------------------------------
+    vfs_close(fd_recv)
+    vfs_close(fd_send)
+    vfs_close(fd_sa)
+    vfs_close(fd_sb)
+    _msync_restore_fds(boot_task, &fd_save[0])
+    printk0("[wlspike] SCM_RIGHTS memfd round-trip OK: WLSPIKE_OK\n")
+    printk0("[wlspike] PASS\n")
+    return 0
+
+
+# =====================================================================
 # §fuse: mount(2) "fuse" type
 # =====================================================================
 #
@@ -15916,6 +16502,12 @@ def _linux_u_syscall_dispatch_inner(nr: uint64,
         return _u_sendto(a0, a1, a2, a3, a4, a5)
     if nr == SYS_recvfrom:
         return _u_recvfrom(a0, a1, a2, a3, a4, a5)
+    # sendmsg / recvmsg: data iov + SCM_RIGHTS ancillary fd passing over
+    # AF_UNIX (the Wayland wl_shm pool-fd conduit — §wayland_passthrough).
+    if nr == SYS_sendmsg:
+        return _u_sendmsg(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_recvmsg:
+        return _u_recvmsg(a0, a1, a2, a3, a4, a5)
     if nr == SYS_bind:
         return _u_bind(a0, a1, a2, a3, a4, a5)
     if nr == SYS_listen:

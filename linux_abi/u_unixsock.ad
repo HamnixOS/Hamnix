@@ -89,6 +89,17 @@ AFU_BACKLOG: uint64 = 8
 AFU_DGRAM_Q:   uint64 = 8
 AFU_DGRAM_MAX: uint64 = 1024
 
+# §SCM_RIGHTS ancillary-fd carrier (Wayland shm-fd passing / de-risk spike).
+# Alongside the byte ring, a connected STREAM endpoint carries a small queue
+# of "passed backing objects": each entry is an OPAQUE int32 payload that the
+# Layer-2 syscall shim (linux_abi/u_syscalls.ad) fills with the tmpfs/memfd
+# backing SLOT id resolved from the sender's fd. u_unixsock stays a leaf: it
+# does NOT interpret the value, it just conducts it from sender to receiver
+# in-order (SCM_RIGHTS fds arrive in the peer's recvmsg). The syscall shim
+# owns the tmpfs reference accounting (tmpfs_anon_ref / tmpfs_release_anon)
+# so this module keeps no fs/vfs.ad coupling.
+AFU_SCM_Q: uint64 = 16
+
 # fd_buf TAG marking an AF_UNIX socket fd. The low bits carry
 # (ep_slot + 1). 0x40000000 is far above fs/socket_state.ad's record-id
 # range (0..8) so the existing FD_SOCKET_MARK arms in fs/vfs.ad decode
@@ -157,6 +168,14 @@ afu_dgq_tail:  Array[32, uint64]
 afu_dgq_count: Array[32, uint64]
 afu_dgq_data:  Array[262144, uint8]    # 32 * 8 * 1024
 
+# Per-endpoint SCM_RIGHTS pending payload ring. A STREAM writer enqueues onto
+# its PEER's queue (mirroring the byte ring), a reader drains its OWN queue.
+# Flattened 32 * AFU_SCM_Q int32 values.
+afu_scm:       Array[512, int32]       # 32 * 16
+afu_scm_head:  Array[32, uint64]
+afu_scm_tail:  Array[32, uint64]
+afu_scm_count: Array[32, uint64]
+
 
 # --- Init ------------------------------------------------------------
 
@@ -182,6 +201,9 @@ def afunix_init():
         afu_dgq_head[i]    = 0
         afu_dgq_tail[i]    = 0
         afu_dgq_count[i]   = 0
+        afu_scm_head[i]    = 0
+        afu_scm_tail[i]    = 0
+        afu_scm_count[i]   = 0
         i = i + 1
     printk0("[afunix] AF_UNIX endpoint pool initialised\n")
 
@@ -211,6 +233,9 @@ def _afu_alloc(sock_type: uint32) -> int32:
             afu_dgq_head[i]    = 0
             afu_dgq_tail[i]    = 0
             afu_dgq_count[i]   = 0
+            afu_scm_head[i]    = 0
+            afu_scm_tail[i]    = 0
+            afu_scm_count[i]   = 0
             return cast[int32](i)
         i = i + 1
     return -1
@@ -257,6 +282,9 @@ def _afu_free(ep: int32):
     afu_dgq_head[eu]    = 0
     afu_dgq_tail[eu]    = 0
     afu_dgq_count[eu]   = 0
+    afu_scm_head[eu]    = 0
+    afu_scm_tail[eu]    = 0
+    afu_scm_count[eu]   = 0
 
 
 # --- fd_buf <-> endpoint encoding -----------------------------------
@@ -597,6 +625,66 @@ def _afu_dgq_pop(ep: int32, dst: Ptr[uint8], n: uint64) -> int64:
     afu_dgq_head[eu]  = head
     afu_dgq_count[eu] = afu_dgq_count[eu] - 1
     return cast[int64](take)
+
+
+# --- SCM_RIGHTS ancillary conduit -----------------------------------
+#
+# A STREAM sendmsg() with an SCM_RIGHTS cmsg enqueues one opaque payload
+# per passed fd onto the PEER endpoint's queue (the same peer whose byte
+# ring the data iov lands in), preserving the "fds arrive with the bytes"
+# ordering libwayland relies on. The receiver's recvmsg() drains its OWN
+# queue. The payload is an OPAQUE int32 (the syscall shim stores a tmpfs
+# backing-slot id); this module never dereferences it.
+
+def afunix_scm_send(ep: int32, payload: int32) -> int64:
+    # Enqueue one SCM payload onto the connected STREAM peer of `ep`.
+    # Returns 0, AFU_EPIPE if the peer is gone, or AFU_EAGAIN if the
+    # peer's SCM queue is full (caller retries / blocks like the byte ring).
+    if _afu_valid(ep) == 0:
+        return AFU_EBADF
+    eu: uint64 = cast[uint64](ep)
+    if afu_type[eu] != AFU_SOCK_STREAM:
+        return AFU_EOPNOTSUPP
+    peer: int32 = afu_peer[eu]
+    if peer < 0 or _afu_valid(peer) == 0:
+        return AFU_EPIPE
+    pu: uint64 = cast[uint64](peer)
+    if afu_scm_count[pu] >= AFU_SCM_Q:
+        return AFU_EAGAIN
+    base: uint64 = pu * AFU_SCM_Q
+    tail: uint64 = afu_scm_tail[pu]
+    afu_scm[base + tail] = payload
+    tail = tail + 1
+    if tail >= AFU_SCM_Q:
+        tail = 0
+    afu_scm_tail[pu]   = tail
+    afu_scm_count[pu]  = afu_scm_count[pu] + 1
+    return 0
+
+
+def afunix_scm_pending(ep: int32) -> int32:
+    # Count of SCM payloads queued for this endpoint's own recvmsg.
+    if _afu_valid(ep) == 0:
+        return 0
+    return cast[int32](afu_scm_count[cast[uint64](ep)])
+
+
+def afunix_scm_recv(ep: int32) -> int32:
+    # Dequeue the oldest SCM payload for this endpoint, or -1 if none.
+    if _afu_valid(ep) == 0:
+        return -1
+    eu: uint64 = cast[uint64](ep)
+    if afu_scm_count[eu] == 0:
+        return -1
+    base: uint64 = eu * AFU_SCM_Q
+    head: uint64 = afu_scm_head[eu]
+    val: int32 = afu_scm[base + head]
+    head = head + 1
+    if head >= AFU_SCM_Q:
+        head = 0
+    afu_scm_head[eu]  = head
+    afu_scm_count[eu] = afu_scm_count[eu] - 1
+    return val
 
 
 # =====================================================================
