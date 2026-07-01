@@ -110,12 +110,17 @@ NEW bugs found this pass:
 - [ ] **QA-N2** (low-confidence) — cursor position changed between two
   screendumps with NO input injected (center → bottom-right). Possible spurious
   cursor motion or non-deterministic rest position. Re-observe.
-- [ ] **QA-N3** (method) — input-driven QA (open Applications menu to eyeball A6
-  browser entry; close-all-then-open for the exact A1 repro; right-click for
-  A3/A4) needs a working abs-pointer path: adding `usb-tablet` broke OVMF boot
-  order (fell to PXE) and it's unverified whether tablet events reach the DE
-  cursor at all (DE may only read PS/2 aux). Pin `bootindex=0` + confirm the DE
-  HID input path before the next input-driven pass.
+- [~] **QA-N3** (method) — SOLVED in method (recon 2026-07-01). The DE reads a
+  RELATIVE mouse via `/dev/mouse` (PS/2 `drivers/input/auxmouse.ad`; USB path is
+  `usb-mouse`, also relative — there is NO absolute/tablet path, which is why the
+  `usb-tablet` attempt both broke OVMF boot order AND wouldn't have driven the
+  cursor). CORRECT approach for headless input-driven QA: use the plain `-vga std`
+  boot (PS/2 mouse already present, boots fine) + HMP `mouse_move dx dy` /
+  `mouse_button <mask>` over the monitor socket; slam the cursor to a corner with
+  a large negative `mouse_move`, then offset by known deltas to reach a target
+  (e.g. Applications button top-left), then click + screendump. Next: QA pass #2
+  drives the Applications menu (verify A6 browser entry live), close-all-then-open
+  (exact A1 repro), and right-click (A3/A4).
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
