@@ -53,6 +53,8 @@ from user.httpdconf import hcfg_load, hcfg_port_get
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_close(fd: int32) -> int32
 extern def sys_yield() -> int32
+extern def sys_waitpid(pid: int32) -> int64            # blocking reap
+extern def sys_waitpid_nb_raw(pid: int32, flags: int64) -> int64  # WNOHANG=1
 
 
 # argv staging for each spawned worker: argv[0]="/bin/httpd_worker",
@@ -62,6 +64,66 @@ conn_str:     Array[24, uint8]
 
 
 from lib.p9 import spawn
+
+# --- bounded worker pool (concurrency cap + memory reclamation) --------
+# Each worker is a full process (a ~74 KB ELF image plus a 256 KiB served-
+# body arena). Two failure modes must be bounded:
+#   * MEMORY — the master is a long-running service. If it never reaps its
+#     workers they pile up as un-reapable zombies (still holding their
+#     address space) and RAM is exhausted under a connection storm
+#     ("elf: OOM", execve -> 127). So every worker is a plain WAITABLE
+#     spawn() that the master explicitly reaps.
+#   * CONCURRENCY — letting an unbounded number of heavy workers run at
+#     once under a burst of simultaneous connections overwhelms the guest
+#     (many concurrent ELF loads + /net data channels). The accept loop
+#     therefore caps the number of LIVE workers at HTTPD_MAX_WORKERS and
+#     applies backpressure: at the cap it block-reaps the oldest worker
+#     before spawning a new one, so surplus connections wait harmlessly in
+#     the kernel's accept queue and are drained a wave at a time. All
+#     connections still complete — just never more than the cap in flight.
+# HTTPD_MAX_WORKERS keeps the server in the proven "2-at-a-time" regime;
+# raise it once the native TCP/scheduler path is happy with more.
+HTTPD_MAX_WORKERS: uint64 = 1
+WAITPID_WNOHANG:   int64  = 1
+
+w_pids: Array[16, int32]        # live worker pids (FIFO, [0..w_n))
+w_n:    uint64 = 0
+
+
+def _w_remove_at(i: uint64):
+    # Drop slot i, shifting the tail down (preserves FIFO order).
+    j: uint64 = i
+    while j + 1 < w_n:
+        w_pids[j] = w_pids[j + 1]
+        j = j + 1
+    w_n = w_n - 1
+
+
+def _w_reap_finished():
+    # Non-blocking sweep: reap every worker that has already exited so the
+    # live-count reflects reality before we decide on backpressure.
+    i: uint64 = 0
+    while i < w_n:
+        rc: int64 = sys_waitpid_nb_raw(w_pids[i], WAITPID_WNOHANG)
+        if rc == cast[int64](-11):                    # -EAGAIN: still alive
+            i = i + 1
+        else:
+            _w_remove_at(i)                           # reaped; recheck slot i
+
+
+def _w_make_room():
+    # Ensure there is room for one more worker. If still at the cap after
+    # the non-blocking sweep, BLOCK-reap the oldest (backpressure).
+    _w_reap_finished()
+    if w_n >= HTTPD_MAX_WORKERS and w_n > 0:
+        sys_waitpid(w_pids[0])
+        _w_remove_at(0)
+
+
+def _w_track(pid: int32):
+    if w_n < 16:
+        w_pids[w_n] = pid
+        w_n = w_n + 1
 
 def strlen_u8(s: Ptr[uint8]) -> uint64:
     n: uint64 = 0
@@ -107,16 +169,21 @@ def parse_port(s: Ptr[uint8]) -> uint64:
     return v
 
 
-# Spawn one worker for the accepted connection number `conn`. The worker
-# is fully detached — we do NOT waitpid it (the kernel reaps it on
-# exit), so the accept loop returns to accepting immediately and the
-# next connection is served by a SEPARATE concurrent worker.
+# Spawn one worker for the accepted connection number `conn`. Backpressure
+# + reclamation happen here: _w_make_room() reaps finished workers and, if
+# the live count is at HTTPD_MAX_WORKERS, block-reaps the oldest before we
+# add another. The worker is a plain WAITABLE spawn() so the master owns
+# its reap (no un-reapable zombie leak). The accept loop returns to
+# accepting immediately after this call; up to HTTPD_MAX_WORKERS workers
+# run concurrently and the rest wait in the kernel accept queue.
 def spawn_worker(conn: uint64) -> int32:
     end: uint64 = put_dec_at(&conn_str[0], 0, conn)
     conn_str[end] = 0
     worker_argv[0] = cast[uint64](&"/bin/httpd_worker"[0])
     worker_argv[1] = cast[uint64](&conn_str[0])
     worker_argv[2] = 0
+    # Bound live workers before adding another (reaps + backpressure).
+    _w_make_room()
     # The worker opens its own connection data fd by number, so it does
     # not need any inherited fd from us. We pass -1/-1 for stdin/stdout
     # (the worker writes diagnostics to fd 2 -> console) and let the
@@ -124,6 +191,8 @@ def spawn_worker(conn: uint64) -> int32:
     pid: int32 = spawn(cast[Ptr[char]]("/bin/httpd_worker"),
                            &worker_argv[0], -1, -1,
                            cast[Ptr[uint64]](0))
+    if pid > 0:
+        _w_track(pid)
     return pid
 
 
