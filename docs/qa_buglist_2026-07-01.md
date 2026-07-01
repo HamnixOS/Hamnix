@@ -124,6 +124,26 @@ NEW bugs found this pass:
   drives the Applications menu (verify A6 browser entry live), close-all-then-open
   (exact A1 repro), and right-click (A3/A4).
 
+## Interactive QA pass #2 (orchestrator, 2026-07-01) — A1 REPRODUCED
+Drove the DE via HMP relative mouse. Two screendumps one click apart:
+- **de_preclick**: top panel + bottom taskbar BOTH list Editor/Calculator/Files/
+  **Terminal**; workspace 1 selected; Terminal window open top-left.
+- **de_menu_open** (after a click): **Terminal is GONE from BOTH lists**, yet the
+  Terminal window is still open + visible, still on workspace 1.
+- [ ] **QA-N4** (A1, HIGH) — a LIVE, on-screen window drops out of the panel
+  window-list + taskbar after pointer interaction (same workspace, window not
+  closed). This is the A1 bug the user reported, now reproduced on video. The
+  pass-#1 agent said A1 wasn't reproducible with default apps + flagged the
+  kernel workspace filter (`wsys_win_ws[w]==wsys_cur_ws`) — but here the
+  workspace did NOT change, so the suspect is the enumeration/refresh path:
+  `devwsys_windows_read` reaping / the panel's FNV-hash-triggered repaint /
+  an interaction (drag/rubber-band/click) perturbing the live window set.
+  Assigned to an agent.
+- [ ] **QA-N3b** (method) — HMP relative `mouse_move` is imprecise (PS/2 accel
+  swept the cursor to a corner instead of the target). Reliable input-driven QA
+  needs accel disabled or a deterministic positioning method. Refine before the
+  next pointer-driven pass.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
