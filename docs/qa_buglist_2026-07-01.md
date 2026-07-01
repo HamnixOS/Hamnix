@@ -289,11 +289,13 @@ Fresh image from HEAD 8c997087, serial-driven. ALL PASS:
 - QA-N14: `enter linux {uname -a}`→`Linux hamnix 6.12.0-hamnix ... x86_64
   GNU/Linux`; `enter linux {id}`→`uid=1001(live) gid=1001` (FIXED 1fdcb10e).
 - QA-N7 regr: `echo N7=a=b`→`N7=a=b`. QA-N9 regr: debian_version→`12.9`.
-- [ ] **QA-N15** (LOW, new) — `getgroups`(nr 115) unimplemented in linux_abi
-  (`linux_u: unknown syscall nr=115`), so `id` prints `uid=/gid=` but then
-  `id: can't get groups`. Like the setuid/setgid gap (QA-N10). Implement
-  getgroups/setgroups in linux_abi/u_syscalls.ad (return the task's gid as the
-  sole supplementary group, or an empty set → 0). Completes `id`.
+- [x] **QA-N15** (LOW) — FIXED 8bb53441 + FRESH-IMAGE VERIFIED. Implemented
+  getgroups(115)/setgroups(116) in linux_abi/u_syscalls.ad (one supplementary
+  group == the task's mapped gid; setgroups privileged-or-EPERM like setuid).
+  Verified: `enter linux {id}` → `uid=1001(live) gid=1001 groups=1001` (was
+  `can't get groups` + unknown-syscall). Cherry-pick conflicted (agent's stale
+  base lacked QA-N10) — resolved by hand keeping both, normalized to ELINUX_PERM;
+  rebuild compiled clean.
 - NOTE: `echo N13a=[=x]` (glued `=` immediately followed by `[`) still parse-errors
   — a separate, much rarer edge than QA-N13; not chased (real code doesn't do `=[`).
 
