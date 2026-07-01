@@ -215,12 +215,18 @@ current main (all 10 fixes) and re-verified with the working input tooling:
   glued `=` regardless of position; the parser must only treat it as an
   assignment in leading position, else it's a normal command-word. Fix in
   user/hamsh.ad + add a test case `echo a=b` / `cmd x=$Y`.
-- [ ] **QA-N8** (SUSPECTED, needs confirm) — System Monitor (`hammon`) and
-  Control Center (`hamctl`) launched as `live` from serial print "HAMMON ready"/
-  "HAMCTL ready" but NO visible window appears and neither shows in the taskbar
-  (Settings, launched the same way, DID open + enumerate). Could be occlusion or
-  a real window-open failure. CONFIRM (launch hammon alone, longer wait,
-  screendump) before fixing.
+- [ ] **QA-N8** (CONFIRMED, HIGH) — the whole `lib/hamui` toolkit doesn't render
+  a window for regular user `live`. `hammon` (System Monitor) launched alone as
+  `live` prints "HAMMON ready" (after `hamui_window()` returns) but NO window
+  appears + it's absent from the taskbar (confirmed via dedicated boot +
+  screendump + serial). Same for `hamctl` (Control Center). `hamsettings` works
+  because it uses the RAW /dev/wsys/<wid>/scene path; hammon/hamctl use
+  `hamui_window()` which opens the hamui DRAW-LAYER tree
+  (/dev/wsys/<wid>/draw/ctl, /draw/<layer>/markup — lib/hamui.ad:2178+). The
+  QA-N6 fix only un-blocked /dev/wsys/ctl; the draw-layer files are likely still
+  blocked/failing for uid 1001 (coarse devcons gate on /dev/wsys/<wid>/draw/*, or
+  hamui_window getting a bad wid). Affects EVERY hamui app for the default DE
+  user. Assigned to an agent.
 
 VISUALLY CONFIRMED this pass (fresh image): **A5** Settings app — all four Edge
 buttons (Top/Bottom/Left/Right) present, Add-widget row (menu/task/clok/sysm/
