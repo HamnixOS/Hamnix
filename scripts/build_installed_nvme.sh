@@ -139,31 +139,41 @@ qemu-system-x86_64 \
     <&4 > "$STAGE_LOG" 2>&1 &
 QEMU_PID=$!
 
-echo "[build_installed_nvme] Stage B: waiting up to ${BOOT_TIMEOUT}s for installer shell..."
-booted=0
-for _ in $(seq 1 "$BOOT_TIMEOUT"); do
-    if grep -a -q "$PROMPT_MARKER" "$STAGE_LOG"; then booted=1; break; fi
-    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-        echo "[build_installed_nvme] FAIL Stage B: qemu exited before the installer shell." >&2
-        tail -80 "$STAGE_LOG" >&2
-        exit 1
-    fi
-    sleep 1
-done
-if [ "$booted" -ne 1 ]; then
-    echo "[build_installed_nvme] FAIL Stage B: installer shell not seen in ${BOOT_TIMEOUT}s." >&2
-    tail -80 "$STAGE_LOG" >&2
-    exit 1
-fi
-echo "[build_installed_nvme] Stage B: installer shell ready; driving the NVMe installer."
-sleep 6
-
+# Wait for the install to complete. rc.boot AUTO-RUNS /etc/install_nvme.hamsh
+# when it probes a real install target distinct from the boot medium and
+# prints "auto-running /etc/install_nvme.hamsh" — but that target probe is
+# timing-sensitive under KVM and does NOT always fire, in which case the
+# installer just sits at a bare interactive "[hamsh] ... shell ready"
+# prompt. So: wait for the shell to be READY (either the full-rc handoff
+# marker OR the bare hamsh-ready banner), then — unless the auto-run
+# already kicked off — drive /etc/install_nvme.hamsh MANUALLY. Both flows
+# converge on the same "install complete" marker.
+echo "[build_installed_nvme] Stage B: waiting for install to complete (auto-run or driven)..."
 type_b() { printf '%s\n' "$1" >&3; sleep "${2:-4}"; }
-type_b "hamsh /etc/install_nvme.hamsh" 2
+# Completion is signalled by install.ad ("[install] install complete on
+# /dev/blk/nvme0n1") and then install_nvme.hamsh ("[install-nvme] install
+# complete"). Match either — neither emits the old combined string the
+# harness used to grep for (which never matched, hanging the build).
+INSTALL_DONE_MARKER='\[install\] install complete on /dev/blk/nvme0n1|\[install-nvme\] install complete'
+READY_RE="$PROMPT_MARKER|\[hamsh\] M16.35 shell ready"
+AUTORUN_RE='auto-running /etc/install_nvme.hamsh'
+typed=0
 installed=0
-for _ in $(seq 1 "$INSTALL_WAIT"); do
-    if grep -a -q '\[install-nvme\] install complete on /dev/blk/nvme0n1' "$STAGE_LOG"; then
+for _ in $(seq 1 $((BOOT_TIMEOUT + INSTALL_WAIT))); do
+    if grep -a -E -q "$INSTALL_DONE_MARKER" "$STAGE_LOG"; then
         installed=1; break
+    fi
+    # Once the shell is ready, drive the installer manually — but only if
+    # rc.boot's auto-run path did NOT already start it (avoid a double run).
+    if [ "$typed" -eq 0 ] && grep -a -E -q "$READY_RE" "$STAGE_LOG"; then
+        if grep -a -E -q "$AUTORUN_RE" "$STAGE_LOG"; then
+            echo "[build_installed_nvme] Stage B: rc.boot auto-run detected; awaiting completion."
+        else
+            echo "[build_installed_nvme] Stage B: shell ready, no auto-run; driving the NVMe installer manually."
+            sleep 6
+            type_b "hamsh /etc/install_nvme.hamsh" 2
+        fi
+        typed=1
     fi
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
         echo "[build_installed_nvme] FAIL Stage B: qemu exited during install." >&2
@@ -173,7 +183,7 @@ for _ in $(seq 1 "$INSTALL_WAIT"); do
     sleep 1
 done
 if [ "$installed" -ne 1 ]; then
-    echo "[build_installed_nvme] FAIL Stage B: 'install complete' not seen in ${INSTALL_WAIT}s." >&2
+    echo "[build_installed_nvme] FAIL Stage B: 'install complete' not seen in $((BOOT_TIMEOUT + INSTALL_WAIT))s." >&2
     tail -100 "$STAGE_LOG" >&2
     exit 1
 fi

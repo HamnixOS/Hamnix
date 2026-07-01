@@ -21,7 +21,7 @@
 #       password (the no-password fast path is preserved).
 #   (1) As the REGULAR user dave, `newshell hostowner` with the CORRECT
 #       password elevates to uid 1 (`setuid` getter prints "uid 1",
-#       `whoami` resolves to the uid-1 user `live`).
+#       `whoami` resolves to the uid-1 user `hostowner`).
 #   (2) As dave, `newshell hostowner` with a WRONG password is DENIED
 #       ("newshell: authentication failed") and the shell stays uid 1000.
 #
@@ -29,7 +29,7 @@
 # /init under the lean `-kernel` TCG path, with a STRIPPED rc that plants
 # the device + passwd/shadow binds and does NOT enter runlevel 5 (so the
 # serial line stays the live interactive shell). dave's password is
-# `hamnix`; the uid-1 host owner `live`'s password is also `hamnix`
+# `hamnix`; the uid-1 `hostowner`'s password is also `hamnix`
 # (etc/shadow ships both as $6$ SHA-512-crypt).
 
 . "$(dirname "$0")/_build_lock.sh"
@@ -86,7 +86,7 @@ echo "[test_newshell_auth] (4/4) Boot QEMU + drive newshell elevation"
 # with `setuid 1000` (dave's uid). The host owner can drop to any uid, so
 # this lands us at uid 1000 in the SAME shell process — exactly the
 # non-hostowner caller whose `newshell hostowner` elevation is the gap
-# under test. The elevation TARGET resolves to the uid-1 user `live`
+# under test. The elevation TARGET resolves to the uid-1 user `hostowner`
 # (password hamnix) regardless of the caller, so this faithfully proves
 # "a uid-1000 regular user elevates to host owner via password proof".
 set +e
@@ -229,11 +229,11 @@ else
     echo "[test_newshell_auth] FAIL: dave + correct password did NOT elevate to uid 1"
     fail=1
 fi
-# whoami in the elevated shell resolves uid 1 to `live`.
-if between "RIGHT_BEGIN" "RIGHT_END" "live"; then
-    echo "[test_newshell_auth] OK: elevated shell whoami -> live (uid-1 host owner)"
+# whoami in the elevated shell resolves uid 1 to `hostowner`.
+if between "RIGHT_BEGIN" "RIGHT_END" "hostowner"; then
+    echo "[test_newshell_auth] OK: elevated shell whoami -> hostowner (uid-1 admin)"
 else
-    echo "[test_newshell_auth] DIAG: did not observe whoami=live in elevated shell (non-fatal)"
+    echo "[test_newshell_auth] DIAG: did not observe whoami=hostowner in elevated shell (non-fatal)"
 fi
 # The old documented gap message must NOT appear.
 if grep -a -F -q "setuid denied (not hostowner" "$LOG"; then

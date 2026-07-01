@@ -136,6 +136,20 @@ if $installer_medium > 0 {
             live_distro_up
         }
         source /etc/rc.boot.full
+        # Normal-distro identity: the LIVE session logs in as the default
+        # REGULAR user `live` (uid 1001), NOT the hostowner. All the
+        # privileged boot setup above ran as hostowner (uid 1); now that
+        # the desktop + services are up we DROP this interactive console
+        # to `live`. Admin work is an explicit `newshell hostowner`
+        # (password) elevation, exactly like sudo on a normal distro.
+        # setuid here is a privilege-DROP (uid 1 -> 1001), always allowed.
+        # After this returns to hamsh main(), _set_home_from_passwd() sets
+        # HOME=/home/live and _load_per_user_namespace() sources the
+        # regular-user recipe for uid 1001. The -kernel test path and the
+        # installed-system boot take the OTHER rc.boot branches and stay
+        # hostowner, so this drop is scoped to the live image only.
+        echo 'rc.boot: live session -- dropping console to regular user live (uid 1001)'
+        setuid 1001
     }
 } else {
     # --- normal boot: mount the sysroot subtree at / ----------------

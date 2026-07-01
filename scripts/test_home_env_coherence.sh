@@ -16,8 +16,8 @@
 #
 # This gate boots hamsh-as-init with a stripped rc (device + identity
 # binds, no DE/gettys so the serial stays a clean interactive shell),
-# then asserts the hostowner (uid 1, `live`) interactive shell reports
-# $HOME = /home/live, NOT the old "/".
+# then asserts the hostowner (uid 1) interactive shell reports
+# $HOME = /home/hostowner, NOT the old "/".
 #
 # rc=124/137/143 (host-load timeout/kill) is NOT a failure of the change;
 # the assert keys off the captured marker, not the qemu exit code.
@@ -92,13 +92,13 @@ else
     echo "[home_env] FAIL: stripped rc did not run"; fail=1
 fi
 
-# HARD: the hostowner interactive shell must report HOME = /home/live.
+# HARD: the hostowner interactive shell must report HOME = /home/hostowner.
 # Strip ANSI + CR so the line-editor redraw noise doesn't hide the value.
 if sed -r 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\r/\n/g' "$LOG" \
-     | grep -a -E -q '^HOSTHOME_PROBE /home/live$'; then
-    echo "[home_env] OK: hostowner \$HOME = /home/live (passwd-resolved)"
+     | grep -a -E -q '^HOSTHOME_PROBE /home/hostowner$'; then
+    echo "[home_env] OK: hostowner \$HOME = /home/hostowner (passwd-resolved)"
 else
-    echo "[home_env] FAIL: hostowner \$HOME was not /home/live"
+    echo "[home_env] FAIL: hostowner \$HOME was not /home/hostowner"
     fail=1
 fi
 
@@ -113,5 +113,5 @@ if [ "$fail" -ne 0 ]; then
     echo "[home_env] FAIL (qemu rc=$rc)"
     exit 1
 fi
-echo "[home_env] PASS — \$HOME is passwd-resolved (/home/live), not the / placeholder"
+echo "[home_env] PASS — \$HOME is passwd-resolved (/home/hostowner), not the / placeholder"
 exit 0

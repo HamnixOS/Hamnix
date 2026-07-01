@@ -27,15 +27,15 @@
 #     sourcing (uid 1 bypasses; hostowner keeps full namespace).
 #
 # What this test verifies end-to-end:
-#   - /etc/passwd reads with live:x:1:1:... format.
-#   - /etc/shadow reads with live:$6$... format (hostowner only —
+#   - /etc/passwd reads with hostowner:x:1:1:... format.
+#   - /etc/shadow reads with hostowner:$6$... format (hostowner only —
 #     a regular user wouldn't even resolve /etc/shadow given the
 #     Phase 5 perm check).
 #   - /dev/blk/vda/size opens for the live (hostowner) user.
 #   - `newshell <nosuchuser>` rejects with "no such user".
-#   - After dropping to a regular user (`setuid 1000`), `newshell live`
+#   - After dropping to a regular user (`setuid 1000`), `newshell hostowner`
 #     with a WRONG password is rejected by /dev/auth ("newshell:
-#     authentication failed"). (From the uid-1 console `newshell live`
+#     authentication failed"). (From the uid-1 console `newshell hostowner`
 #     would take the password-free self-elevation fast path, so the
 #     credential check is exercised from a non-hostowner uid.)
 
@@ -123,13 +123,13 @@ echo "[test_security] (4/4) Boot QEMU + drive security smoke"
 #   transition `newshell <hostowner>` takes the PASSWORD-FREE self-
 #   elevation fast path (you don't prove a secret to become who you
 #   already are — see builtin_newshell Step 1.5 in user/hamsh.ad). So
-#   `newshell live` from the console would NEVER prompt and a "wrong
+#   `newshell hostowner` from the console would NEVER prompt and a "wrong
 #   password" would just be run as a command — it could never produce
 #   "authentication failed".
 #
 #   To actually exercise the credential check we first DROP to a regular
 #   user with `setuid 1000` (the hostowner can step down to any uid).
-#   From uid 1000, `newshell live` (target uid 1) is NOT the fast path:
+#   From uid 1000, `newshell hostowner` (target uid 1) is NOT the fast path:
 #   it prompts, and the next line we feed ("wrong-password") is consumed
 #   by newshell's silent read loop and handed to /dev/auth, which rejects
 #   it -> "newshell: authentication failed". Because uid 1 would have
@@ -228,9 +228,9 @@ try:
         print("DRIVER: SEC_SERIAL_SYNC never echoed", file=sys.stderr)
 
     # 3. Idempotent reads — re-send each until its proof marker lands.
-    if not resend_until(["cat /etc/passwd"], "live:x:1:1:"):
+    if not resend_until(["cat /etc/passwd"], "hostowner:x:1:1:"):
         print("DRIVER: /etc/passwd read never captured", file=sys.stderr)
-    if not resend_until(["cat /etc/shadow"], "live:$6$"):
+    if not resend_until(["cat /etc/shadow"], "hostowner:$6$"):
         print("DRIVER: /etc/shadow read never captured", file=sys.stderr)
     # Block-size read: pair the cat with an echo marker so the gate can find
     # the digits just above SEC_STAGE_BLK_READ.
@@ -246,7 +246,7 @@ try:
     resend_until(["setuid 1000", "echo SEC_DROP_OK"], "SEC_DROP_OK",
                  attempts=20)
 
-    # 5. WRONG password from uid 1000. `newshell live` prompts; the next line
+    # 5. WRONG password from uid 1000. `newshell hostowner` prompts; the next line
     #    is consumed as the (wrong) password and /dev/auth rejects it. Re-send
     #    the prompt+password PAIR until the auth-failed marker lands — each
     #    denied attempt just returns to the uid-1000 prompt, so retries are
@@ -257,7 +257,7 @@ try:
         if have("newshell: authentication failed"):
             got_authfail = True
             break
-        send("newshell live")
+        send("newshell hostowner")
         time.sleep(3.0)
         send("wrong-password")
         time.sleep(4.0)
@@ -289,20 +289,20 @@ if ! grep -q "M16.35 shell ready\|hamsh.*ready\|stage-07" "$LOG"; then
     fail=1
 fi
 
-# 2. /etc/passwd contains the live hostowner.
-if ! grep -q "live:x:1:1:" "$LOG"; then
-    echo "[test_security] FAIL: /etc/passwd missing live:x:1:1:..."
+# 2. /etc/passwd contains the hostowner (uid 1).
+if ! grep -q "hostowner:x:1:1:" "$LOG"; then
+    echo "[test_security] FAIL: /etc/passwd missing hostowner:x:1:1:..."
     fail=1
 else
-    echo "[test_security] OK: /etc/passwd has live:x:1:1:..."
+    echo "[test_security] OK: /etc/passwd has hostowner:x:1:1:..."
 fi
 
-# 3. /etc/shadow contains the live hostowner's hash with $6$ prefix.
-if ! grep -q "live:\\\$6\\\$" "$LOG"; then
-    echo "[test_security] FAIL: /etc/shadow missing live:\$6\$..."
+# 3. /etc/shadow contains the hostowner's hash with $6$ prefix.
+if ! grep -q "hostowner:\\\$6\\\$" "$LOG"; then
+    echo "[test_security] FAIL: /etc/shadow missing hostowner:\$6\$..."
     fail=1
 else
-    echo "[test_security] OK: /etc/shadow has live:\$6\$..."
+    echo "[test_security] OK: /etc/shadow has hostowner:\$6\$..."
 fi
 
 # 4. newshell with a non-existent user produces the no-such-user diag.
@@ -335,7 +335,7 @@ else
     fi
 fi
 
-# 6. newshell live with a wrong password lands the auth-failed diag.
+# 6. newshell hostowner with a wrong password lands the auth-failed diag.
 #    The /dev/auth cdev (Phase 4) reads /etc/shadow in kernel context,
 #    runs SHA-512-crypt verify, and writes "denied\n" — newshell's
 #    response read picks that up and prints the auth-failed message.

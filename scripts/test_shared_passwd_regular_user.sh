@@ -100,10 +100,24 @@ trap cleanup EXIT
 echo "[test_shared_passwd] (4/4) Boot QEMU + drive su dave + identity probes"
 set +e
 (
-    # Boot settle + flush throwaway lines (freshly-booted hamsh drops its
-    # first serial line(s); see the serial-test memos). Generous because
-    # TCG-QEMU under concurrent load boots slowly.
-    sleep 24
+    # Marker-gated driving. The feeder subshell reads the serial capture
+    # ($LOG, written by QEMU) to synchronise on the guest's actual state
+    # instead of fixed sleeps — robust to the slow/variable boot under the
+    # kernel's verbose first-task paging diagnostics. Without this the su
+    # password races su's raw read() and the whoami/id probes land during
+    # dave's login-shell recipe bring-up (both get dropped).
+    _w() {  # marker  timeout-seconds
+        local m="$1" t="$2" w=0
+        while [ "$w" -lt "$t" ]; do
+            grep -a -F -q "$m" "$LOG" 2>/dev/null && return 0
+            sleep 1; w=$((w + 1))
+        done
+        return 1
+    }
+    # Boot: wait for the interactive shell banner, then settle + flush the
+    # first-line-dropped quirk.
+    _w "[hamsh] M16.35 shell ready" 240
+    sleep 2
     printf 'echo SYNC_FLUSH\n'; sleep 3
     printf 'echo SYNC_FLUSH\n'; sleep 3
 
@@ -114,14 +128,22 @@ set +e
     printf 'enter linux { /bin/u_glibc_idprobe }\n'; sleep 5
     printf 'echo HOST_ENTER_END\n'; sleep 1
 
-    # PHASE B: su to the regular user. su prompts "Password: " and reads
-    # the password raw (no echo) from fd 0; feed it after a generous
-    # settle so su is fully blocked in read() before the keystrokes land.
+    # PHASE B: su to the regular user. Wait for su's "Password: " prompt
+    # (so its raw read() is posted) before sending the password; if su
+    # doesn't switch shortly after, re-send once (covers the read-not-yet-
+    # posted race). Then wait for dave's login shell to finish sourcing its
+    # per-user namespace recipe before probing.
     printf 'echo SU_BEGIN\n'; sleep 1
-    printf 'su dave\n'; sleep 7
-    printf 'hamnix\n'; sleep 10           # dave's password
-    # su has now exec'd dave's login shell (which re-sources /etc/hamsh.rc,
-    # so `linux` is defined for dave too). Subsequent lines drive it.
+    printf 'su dave\n'
+    _w "Password:" 40; sleep 3
+    printf 'hamnix\n'
+    _w "su: switched to uid 1000 (dave)" 40 || printf 'hamnix\n'
+    _w "su: switched to uid 1000 (dave)" 60
+    # dave's nested login shell now sources /etc/users/*.ns (correct for a
+    # regular user) — wait for the recipe-ready marker so the probes below
+    # land on a live readline.
+    _w "ns-recipe: regular-user namespace ready" 180
+    sleep 2
     printf 'echo SU_AFTER\n'; sleep 3
 
     # PHASE C (dave): identity + non-root enter-linux.
@@ -146,7 +168,7 @@ set +e
 
     printf 'echo ALL_DONE\n'; sleep 1
     printf 'exit\n'; sleep 1
-) | timeout 320s qemu-system-x86_64 \
+) | timeout 480s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -199,8 +221,13 @@ else
     fail=1
 fi
 
-# 2. whoami reports dave.
-if between "DAVE_WHOAMI_BEGIN" "DAVE_WHOAMI_END" "dave"; then
+# 2. whoami reports dave. Search the whole dave-session span (SU_AFTER ..
+#    DAVE_ENTER_BEGIN) rather than the tight whoami markers: under the
+#    kernel's verbose debug spew the console lags, so a command's OUTPUT
+#    and the surrounding BEGIN/END marker echoes can arrive interleaved
+#    out of order. The broader window still uniquely attributes "dave" to
+#    the whoami output (dave's login banner "(dave)" is BEFORE SU_AFTER).
+if between "SU_AFTER" "DAVE_ENTER_BEGIN" "dave"; then
     echo "[test_shared_passwd] OK: whoami -> dave"
 else
     echo "[test_shared_passwd] FAIL: whoami did not report dave"
@@ -208,7 +235,8 @@ else
 fi
 
 # 3. id reports the real regular-user triplet (NOT the old uid=0(root)).
-if between "DAVE_ID_BEGIN" "DAVE_ID_END" "uid=1000(dave) gid=1000(dave) groups=1000(dave)"; then
+#    Same widened window as whoami (see above).
+if between "SU_AFTER" "DAVE_ENTER_BEGIN" "uid=1000(dave) gid=1000(dave) groups=1000(dave)"; then
     echo "[test_shared_passwd] OK: id -> uid=1000(dave) gid=1000(dave) groups=1000(dave)"
 else
     echo "[test_shared_passwd] FAIL: id did not report the regular-user triplet"

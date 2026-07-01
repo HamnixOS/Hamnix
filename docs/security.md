@@ -4,7 +4,8 @@
 > (2026-05-26..27). Every phase below has a "Shipped at" line citing
 > the landing commit. The Plan-9-shape model is the live model;
 > `/dev/auth`, `newshell`, the hpm uid==1 gate, the live ISO
-> `live:hamnix` credentials, and the installer credential prompts
+> credentials (hostowner password `hamnix`; the live session logs in
+> as the default regular user `live`), and the installer credential prompts
 > all work in `scripts/test_security.sh` (covers Phases 1/4/5/6/7/8/9
 > — the kernel-plumbing + /dev/auth + VFS perm + ext4 owner-stamp +
 > newshell + hpm gate + per-user .ns recipe boundary).
@@ -75,6 +76,29 @@ Linux namespace, so busybox/glibc/apt parse it without "bad record".
 uid 0 is **unused**. The "root" idiom doesn't exist. uid 1 is the
 hostowner because Plan 9 historically uses 1 for `glenda` / first
 user; we follow.
+
+### Live-image default login (normal-distro shape)
+
+Like a normal Linux live image, the live session **logs in as a regular
+user, not the admin**. The live ISO ships:
+
+- `hostowner` (uid 1) — the admin. Password `hamnix`.
+- `live` (uid 1001) — the default REGULAR login user. The live console
+  (and DE) boot in AS `live`; `whoami` reports `live`.
+- `dave` (uid 1000) — a second regular user used by the auth fixtures.
+
+`rc.boot` does all its privileged setup as the hostowner and then, on the
+live-image branch only, **drops the interactive console to `live` with
+`setuid 1001`** before handing off. To do admin work you elevate
+explicitly with `newshell hostowner` (password `hamnix`) — the
+factotum-shape re-login idiom, exactly like `sudo` on a normal distro.
+The `-kernel` developer boot and the installed system take the other
+`rc.boot` branches and stay hostowner (no login manager yet — the
+installed-system per-user auto-login is a follow-up).
+
+The **installer** lets you pick your own regular-user name (like
+Ubuntu's install-time user) and set the hostowner password; see
+`etc/install.hamsh`.
 
 ### Authentication
 
