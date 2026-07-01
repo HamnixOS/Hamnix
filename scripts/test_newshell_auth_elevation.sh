@@ -235,6 +235,21 @@ if between "RIGHT_BEGIN" "RIGHT_END" "hostowner"; then
 else
     echo "[test_newshell_auth] DIAG: did not observe whoami=hostowner in elevated shell (non-fatal)"
 fi
+# Hard NEGATIVE regression guard: the elevated shell must NEVER resolve
+# its identity to `nobody`. The historical bug (pre-identity-provisioning)
+# was that the elevated session inherited a uid with no /etc/passwd name
+# mapping, so `whoami` fell back through to the `nobody` entry. Now that
+# the uid-1 `hostowner` (and the regular `live`/`dave`) accounts are
+# provisioned in passwd/shadow/group, the elevated identity name-resolves
+# to `hostowner`. This guard is stdin-drop-safe: if the nested REPL never
+# received the `whoami` keystroke, no name is printed and the guard
+# passes; it only trips if the elevated shell actively prints `nobody`.
+if between "RIGHT_BEGIN" "RIGHT_END" "nobody"; then
+    echo "[test_newshell_auth] FAIL: elevated shell identity resolved to 'nobody' (uid not name-mapped)"
+    fail=1
+else
+    echo "[test_newshell_auth] OK: elevated shell identity never resolves to 'nobody'"
+fi
 # The old documented gap message must NOT appear.
 if grep -a -F -q "setuid denied (not hostowner" "$LOG"; then
     echo "[test_newshell_auth] FAIL: old 'setuid denied (not hostowner...)' gap message present"
