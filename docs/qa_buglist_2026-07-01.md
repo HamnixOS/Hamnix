@@ -303,10 +303,13 @@ Fresh image from HEAD 8c997087, serial-driven. ALL PASS:
 Confirmed the QA-N14 busybox applets FUNCTION (not just resolve): `hostname`→
 `hamnix`, `env`→PATH/HOME, `date`→`Wed Jul 1 …`, `grep root /etc/passwd`→match,
 `head -1 /etc/os-release`→`PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"`. Two finds:
-- [ ] **QA-N16** (hamsh, LOW — completes QA-N7/N13) — a word ENDING in a `=`-run
-  parse-errors: `echo abc===` → `parse error: unexpected token after command`.
-  QA-N13 fixed LEADING `=`-runs; the trailing case (`content===`) remains.
-  Fix in user/hamsh.ad so `abc===` is a literal argv word (`abc===`). Assigned.
+- [x] **QA-N16** (hamsh) — FIXED 573bfc53. A glued `=`-run AFTER word content is
+  absorbed into the word as literal text ONLY when followed by a terminator
+  (space/EOL/;/operator/EOF); if followed by a value-continuation char (word
+  char/`$`/quote/backtick) it stays OP_ASSIGN_LIT (preserving assignment + QA-N7
+  fusion). `echo abc===`→`abc===`, `echo foo==`→`foo==`. All 16 test_hamsh_assign
+  cases pass; DE rl5 boot-verified. **The hamsh `=` handling is now complete**
+  (leading N13 + trailing N16 + arg-position N7 + assignment).
 - [ ] **QA-N17** (Linux ns /proc, MED — LARGER) — under `enter linux`, `/proc`
   lists PID entries (readdir works) but `/proc/<pid>` can't be stat'd/opened
   ("No such file"), so `ps`/`top` fail. The procfs backing the linux-ns is
