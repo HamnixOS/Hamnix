@@ -91,6 +91,22 @@ if ! grep -q "build_adder_user hampanelscene" "$BUILD_SH"; then
     fail_link "link 4 (build_user.sh): hampanelscene is not registered — binary will not be built/staged"
 fi
 
+# --- Link 5: taskbar is LIVE via a window-set CONTENT hash -----------
+# The panel must re-render its taskbar whenever the window SET changes in ANY
+# way, not just when the window COUNT changes. Count-only detection missed the
+# common live case where an app `newwindow`s (enumerated as the "winN"
+# placeholder) and only writes its real `title` a moment later: same count, so
+# a freshly-opened app "never appeared" under its real name. The fix hashes the
+# raw /dev/wsys/windows snapshot (win_hash, FNV-1a over wids+titles+order) and
+# redraws on any change. Guard both the hash and that the loop no longer gates
+# the taskbar redraw on a bare count comparison.
+if ! grep -q 'win_hash' "$PANEL_SRC"; then
+    fail_link "link 5 (hampanelscene.ad): no win_hash — taskbar liveness regressed to count-only detection (title-set-after-map won't refresh)"
+fi
+if grep -qE '\bn_tasks[[:space:]]*!=[[:space:]]*last_ntasks\b' "$PANEL_SRC"; then
+    fail_link "link 5 (hampanelscene.ad): taskbar redraw still gated on count-only (n_tasks != last_ntasks) — same-count window-set changes go unrendered"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "FAIL: DE panel guard tripped (see link(s) above)" >&2
     exit 1
