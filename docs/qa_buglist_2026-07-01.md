@@ -205,6 +205,28 @@ current main (all 10 fixes) and re-verified with the working input tooling:
   app-render verification, prefer the deterministic serial-launched gates
   (test_de_browser.sh etc.) over pointer-driving.
 
+## Interactive QA pass #5 (orchestrator, 2026-07-01)
+- [ ] **QA-N7** (REGRESSION I introduced, HIGH) — the hamsh `VAR=value` fix
+  (c93919db) broke glued-`=` in ARGUMENT position. `echo ASSIGN_GOT=$ASSIGN`
+  (confirmed live via serial) → `hamsh: parse error: unexpected token after
+  command`. POSIX: only STATEMENT-LEADING `VAR=value` (or after `export`) is an
+  assignment; `cmd arg=value` (echo x=y, make FOO=bar) passes `arg=value` as a
+  literal argument (with $VAR expanded). The lexer emits OP_ASSIGN_LIT for any
+  glued `=` regardless of position; the parser must only treat it as an
+  assignment in leading position, else it's a normal command-word. Fix in
+  user/hamsh.ad + add a test case `echo a=b` / `cmd x=$Y`.
+- [ ] **QA-N8** (SUSPECTED, needs confirm) — System Monitor (`hammon`) and
+  Control Center (`hamctl`) launched as `live` from serial print "HAMMON ready"/
+  "HAMCTL ready" but NO visible window appears and neither shows in the taskbar
+  (Settings, launched the same way, DID open + enumerate). Could be occlusion or
+  a real window-open failure. CONFIRM (launch hammon alone, longer wait,
+  screendump) before fixing.
+
+VISUALLY CONFIRMED this pass (fresh image): **A5** Settings app — all four Edge
+buttons (Top/Bottom/Left/Right) present, Add-widget row (menu/task/clok/sysm/
+spcr) separate from Up/Down/Del (no overlap); **A1** the Settings window enumerates
+live in both panels.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
