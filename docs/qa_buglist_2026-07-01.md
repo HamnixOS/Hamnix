@@ -248,11 +248,13 @@ binary. But two bugs:
   hostowner) sets any → 0; unprivileged may only re-assert its own id → 0;
   escalation → -EPERM. getuid/geteuid reflect changes. Verified: boot self-test
   `[UABI_FILLS] setuid/setgid gate OK` (drop/self/EPERM/consistency).
-- [ ] **QA-N11** (MED, pre-existing — found by the QA-N10 agent) — `test_uabi_fills.sh`
-  fails `[UABI_FILLS] FAIL sched_getaffinity mask`: the Linux-ABI
-  `sched_getaffinity` returns the wrong affinity mask under `-smp 1` (expects
-  CPU-0-only, doesn't get it). Confirmed NOT a regression (fails on baseline).
-  Red-flags the uabi_fills gate regardless. Task #18.
+- [x] **QA-N11** (MED, pre-existing) — FIXED 1d6ffbd9. `_u_sched_getaffinity`
+  returned the raw stored `cpu_affinity` (defaults to `AFFINITY_ALL`=0xFF..),
+  never intersecting the online-CPU set → low byte 0xFF under -smp 1. Fix: new
+  `sched_get_affinity_online()` (kernel/sched/core.ad) intersects the task mask
+  with `get_cpus_online()` (matching real Linux `cpus_mask & cpu_active_mask`);
+  the syscall now calls it → bit 0 only under -smp 1. Verified: `[UABI_FILLS]
+  PASS` + `[test_uabi_fills] PASS` (all checks green).
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
