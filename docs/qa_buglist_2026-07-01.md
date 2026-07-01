@@ -165,6 +165,26 @@ current main (all 10 fixes) and re-verified with the working input tooling:
   hamappmenu.ad describes. Acceptable for now; a categorized menu would be closer
   to MATE parity. Enhancement, not a bug.
 
+## Interactive QA pass #4 (orchestrator, 2026-07-01) — browser regression found
+- [ ] **QA-N6** (regression, HIGH) — the native Web Browser doesn't open a
+  window. `scripts/test_de_browser.sh` (deterministic, serial-launches
+  `hambrowse --demo &`) FAILS on the fresh current-main image: no "opening scene
+  window", no "rendered segs=" — but NO panic. STATUS T75 shows this test PASSED
+  when hambrowse landed (`segs=28 rows=28 links=2`), so it's a REGRESSION.
+  hambrowse's `_newwindow` (user/hambrowse.ad:1171) returns -1 SILENTLY when
+  `sys_open_write("/dev/wsys/ctl")` fails. `rc.boot` binds `#c /dev`, `#b`, `#I`
+  but NOT `/dev/wsys`; and the identity rework this session moved the serial/DE
+  shells to `live` uid 1001 (487d58dc/10db26d2/7b0704bf). STRONG HYPOTHESIS: the
+  serial shell can't reach the window server (namespace missing /dev/wsys and/or
+  a uid gate), so GUI apps launched from serial silently fail. Assigned to an
+  agent to root-cause (namespace vs perm; bisect vs T75 dcf6f6e8 if needed) + fix
+  at the right layer, AND make hambrowse print a real error instead of silent -1.
+- [~] **QA-N3b caveat** — the HMP-mouse tooling is reliable for a SINGLE click
+  (landed the Applications button in pass #3) but FLAKY across multi-step
+  sequences (pass #4's menu→item click missed; cursor landed bottom-right). For
+  app-render verification, prefer the deterministic serial-launched gates
+  (test_de_browser.sh etc.) over pointer-driving.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
