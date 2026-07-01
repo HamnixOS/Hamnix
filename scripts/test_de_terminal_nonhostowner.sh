@@ -19,18 +19,22 @@
 #   etc/rc.de-user actually invokes it.
 #
 # WHAT THIS TEST PROVES
-#   (A) RUNTIME: the new hamsh `setuid` builtin is a real, ONE-WAY
+#   (A) RUNTIME: the hamsh `setuid` builtin is a real, ONE-WAY
 #       privilege-DROP primitive:
 #         - the boot console reports uid 1 (the host-owner identity the
 #           DE terminal inherits before the drop);
-#         - `setuid 65534` drops to NOBODY;
-#         - `setuid 1` from NOBODY is DENIED (cannot re-elevate without a
-#           password) and the uid stays 65534.
-#       This is exactly the transition etc/rc.de-user performs, and the
+#         - `setuid 1001` drops to the regular user `live`;
+#         - `setuid 1` from `live` is DENIED (cannot re-elevate without a
+#           password) and the uid stays 1001.
+#       This is exactly the transition etc/rc.de-user performs (LIVE-image
+#       auto-login as the default regular user `live`, uid 1001), and the
 #       deny proves a downgraded DE terminal cannot silently climb back to
 #       host owner — genuine elevation needs `newshell hostowner`.
-#   (B) STATIC GUARD: etc/rc.de-user runs `setuid 65534` BEFORE handing
-#       off to the DE program, so the terminal ends up as NOBODY.
+#   (B) STATIC GUARD: etc/rc.de-user runs `setuid 1001` (NEVER the old
+#       anonymous `setuid 65534`/nobody) BEFORE handing off to the DE
+#       program, so the terminal ends up as the regular user `live`.
+#       (Identity name resolution + whoami=live is covered end-to-end by
+#       scripts/test_de_terminal_live_user.sh.)
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -42,19 +46,24 @@ ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 # ---- (B) STATIC GUARD on etc/rc.de-user ----------------------------
-echo "[test_de_term] (static) Guard: rc.de-user drops to NOBODY before the prog hand-off"
+echo "[test_de_term] (static) Guard: rc.de-user drops to regular user live (uid 1001) before the prog hand-off"
 fail=0
 RCU=etc/rc.de-user
-if ! grep -qE '^[[:space:]]*setuid[[:space:]]+65534' "$RCU"; then
-    echo "[test_de_term] FAIL: $RCU does not run 'setuid 65534'"
+if ! grep -qE '^[[:space:]]*setuid[[:space:]]+1001' "$RCU"; then
+    echo "[test_de_term] FAIL: $RCU does not run 'setuid 1001'"
+    fail=1
+fi
+# Regression guard against reverting to the anonymous nobody drop.
+if grep -qE '^[[:space:]]*setuid[[:space:]]+65534' "$RCU"; then
+    echo "[test_de_term] FAIL: $RCU still drops the terminal to NOBODY (setuid 65534)"
     fail=1
 fi
 # The drop must come BEFORE the `if $HAMNIX_DE_PROG` hand-off so the
-# program (and the fall-through REPL) run as NOBODY.
-SETUID_LINE=$(grep -nE '^[[:space:]]*setuid[[:space:]]+65534' "$RCU" | head -1 | cut -d: -f1)
+# program (and the fall-through REPL) run as the regular user `live`.
+SETUID_LINE=$(grep -nE '^[[:space:]]*setuid[[:space:]]+1001' "$RCU" | head -1 | cut -d: -f1)
 HANDOFF_LINE=$(grep -nE '^[[:space:]]*if[[:space:]]+\$HAMNIX_DE_PROG' "$RCU" | head -1 | cut -d: -f1)
 if [ -n "$SETUID_LINE" ] && [ -n "$HANDOFF_LINE" ] && [ "$SETUID_LINE" -lt "$HANDOFF_LINE" ]; then
-    echo "[test_de_term] OK: rc.de-user 'setuid 65534' (line $SETUID_LINE) precedes the prog hand-off (line $HANDOFF_LINE)"
+    echo "[test_de_term] OK: rc.de-user 'setuid 1001' (line $SETUID_LINE) precedes the prog hand-off (line $HANDOFF_LINE)"
 else
     echo "[test_de_term] FAIL: rc.de-user setuid ordering wrong (setuid=$SETUID_LINE handoff=$HANDOFF_LINE)"
     fail=1
@@ -112,12 +121,12 @@ set +e
     printf 'setuid\n'; sleep 3
     printf 'echo BEFORE_END\n'; sleep 1
 
-    # DROP to NOBODY (the rc.de-user transition).
+    # DROP to the regular user `live` (uid 1001 — the rc.de-user transition).
     printf 'echo DROP_BEGIN\n'; sleep 1
-    printf 'setuid 65534\n'; sleep 3
+    printf 'setuid 1001\n'; sleep 3
     printf 'echo DROP_END\n'; sleep 1
 
-    # ONE-WAY: from NOBODY, re-elevation via plain setuid is DENIED.
+    # ONE-WAY: from `live`, re-elevation via plain setuid is DENIED.
     printf 'echo REELEV_BEGIN\n'; sleep 1
     printf 'setuid 1\n'; sleep 3
     printf 'setuid\n'; sleep 3
@@ -171,26 +180,26 @@ else
     rfail=1
 fi
 
-# DROP to NOBODY succeeds.
-if between "DROP_BEGIN" "DROP_END" "uid 65534"; then
-    echo "[test_de_term] OK: setuid 65534 dropped to NOBODY (the rc.de-user transition)"
+# DROP to the regular user `live` (uid 1001) succeeds.
+if between "DROP_BEGIN" "DROP_END" "uid 1001"; then
+    echo "[test_de_term] OK: setuid 1001 dropped to regular user live (the rc.de-user transition)"
 else
-    echo "[test_de_term] FAIL: setuid 65534 did not drop to NOBODY"
+    echo "[test_de_term] FAIL: setuid 1001 did not drop to uid 1001"
     rfail=1
 fi
 
-# ONE-WAY: re-elevation denied, uid stays 65534.
+# ONE-WAY: re-elevation denied, uid stays 1001.
 if between "REELEV_BEGIN" "REELEV_END" "setuid: permission denied"; then
-    echo "[test_de_term] OK: re-elevation from NOBODY denied (one-way drop)"
+    echo "[test_de_term] OK: re-elevation from live denied (one-way drop)"
 else
-    echo "[test_de_term] FAIL: setuid 1 from NOBODY was NOT denied"
+    echo "[test_de_term] FAIL: setuid 1 from live was NOT denied"
     rfail=1
 fi
-if between "REELEV_BEGIN" "REELEV_END" "uid 65534" \
+if between "REELEV_BEGIN" "REELEV_END" "uid 1001" \
         && ! between_re "REELEV_BEGIN" "REELEV_END" "(^| )uid 1( |$)"; then
-    echo "[test_de_term] OK: identity stayed NOBODY (65534) after the denied re-elevation"
+    echo "[test_de_term] OK: identity stayed live (uid 1001) after the denied re-elevation"
 else
-    echo "[test_de_term] FAIL: identity changed after a denied setuid (uid not pinned at 65534)"
+    echo "[test_de_term] FAIL: identity changed after a denied setuid (uid not pinned at 1001)"
     rfail=1
 fi
 
@@ -203,5 +212,5 @@ if [ "$rfail" -ne 0 ]; then
     echo "[test_de_term] FAIL (qemu rc=$rc)"
     exit 1
 fi
-echo "[test_de_term] PASS -- setuid privilege-drop is real + one-way; rc.de-user drops the DE terminal to NOBODY before hand-off"
+echo "[test_de_term] PASS -- setuid privilege-drop is real + one-way; rc.de-user drops the DE terminal to regular user live (uid 1001) before hand-off"
 exit 0
