@@ -276,12 +276,11 @@ debian_version+os-release; `sh -c "echo X"` works. New:
   work (non-empty LHS). Fix in user/hamsh.ad: a word beginning with `=` (no name
   char before it) is a literal argument word, not an assignment/OP_ASSIGN_LIT.
   Assigned.
-- [ ] **QA-N14** (Linux minimal root, LOW/policy) — `enter linux {uname -a}` /
-  `{id}` → `command not found`; `{dpkg --version}` → not found. dpkg absent is
-  expected (full-mirror-build only). uname/id are trivial busybox applets missing
-  their symlinks in the minimal busybox root (`_stage_busybox` in
-  build_rootfs_img.py). Add common applet symlinks (uname, id, env, whoami…) if
-  the minimal-root policy wants them. Deferred (policy call).
+- [x] **QA-N14** (Linux minimal root) — FIXED 1fdcb10e (pending consolidated
+  fresh-image verify). `_stage_busybox` now symlinks the common applets present
+  in the staged musl busybox (uname, id, whoami, hostname, groups, who, users,
+  env, printf, date, sleep, …). dpkg/apt stay absent (full-mirror-build only, by
+  design). Verify: `enter linux {uname -a}`, `{id}`.
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
