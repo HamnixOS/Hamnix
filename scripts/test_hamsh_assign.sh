@@ -91,6 +91,20 @@ set +e
     # 10. export + arg-position glued `=` read-back.
     printf 'export E=z ; echo GOT_E got=$E\n'
     sleep 2
+    # 11. arg-position chained glued `=` (x=y=z) is one literal word.
+    printf 'echo GOT_XYZ x=y=z\n'
+    sleep 2
+    # 12. arg-position glued ':' + '=' (p:q=r) is one literal word.
+    printf 'echo GOT_PQR p:q=r\n'
+    sleep 2
+    # 13. QA-N13: a word BEGINNING with '=' (empty LHS) is a LITERAL
+    #     word, NOT an assignment — `echo =x` must print `=x`.
+    printf 'echo GOT_EQX =x\n'
+    sleep 2
+    # 14. QA-N13: multiple leading '=' (`===x`) is one literal word too;
+    #     the lexer must not mis-tokenize the run as OP_EQEQ + OP_ASSIGN.
+    printf 'echo GOT_EQ3X ===x\n'
+    sleep 2
     # Re-send case 1 (a fresh hamsh drops its FIRST serial line, so the
     # opening bare `VAR=/path` case can be lost; re-send is idempotent).
     printf 'DIR=/home/live ; echo GOT_DIR $DIR\n'
@@ -134,6 +148,10 @@ check "GOT_AB a=b"                  "arg-position glued '=' is a literal word (e
 check "GOT_PV p=hello"              "arg-position glued '=' expands \$var in RHS"
 check "GOT_W /x/y"                  "leading VAR=value assignment still works"
 check "GOT_E got=z"                 "export VAR=value + arg-position got=\$E"
+check "GOT_XYZ x=y=z"               "arg-position chained glued '=' (x=y=z) is one word"
+check "GOT_PQR p:q=r"               "arg-position glued ':'+'=' (p:q=r) is one word"
+check "GOT_EQX =x"                  "leading '=' word (=x) is a literal arg (QA-N13)"
+check "GOT_EQ3X ===x"               "multiple leading '=' (===x) is a literal arg (QA-N13)"
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_hamsh_assign] FAIL"
