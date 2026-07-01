@@ -53,6 +53,22 @@ need "$TS" "def _redraw_edit_line" "terminal re-renders the edit row on cursor/h
 need "$TS" "if code == 65:" "Up arrow handled (older history)"
 need "$TS" "if code == 68:" "Left arrow handled (caret left)"
 
+echo "[ux_guard] --- QA-N1: default terminal opens clear of the desktop icon strut ---"
+# The MATE-style launcher column hamdesktop lays down the LEFT edge (icons +
+# labels, widest "System Monitor" ending ~x=130) is a fixed strut. The default
+# terminal used to open at x=24, bisecting that column: the leftmost ~6px of
+# each icon label's first glyph stayed exposed in the x=[18,24) sliver just
+# left of the window border — orphaned single-glyph fragments that read as
+# text "bleeding through" the terminal (the compositor z-order was correct;
+# the strip simply was not under any window). The terminal must now open at an
+# x origin clear of the strut, like every other default DE app.
+if grep -q 'geometry 24 40 ' "$TS"; then
+    failf "terminal still opens at x=24 (bisects the desktop icon column — QA-N1 regressed)"
+else
+    pass "terminal no longer opens at the bisecting x=24 origin"
+fi
+need "$TS" "geometry 150 40 " "terminal default origin clears the icon strut (x=150)"
+
 echo "[ux_guard] --- compile the touched user binaries ---"
 # shellcheck source=_adder_cc.sh
 source "$PROJ_ROOT/scripts/_adder_cc.sh"
