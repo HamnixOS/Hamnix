@@ -47,6 +47,10 @@ from arch.x86.kernel.smp import (
 
 extern def read_msr(index: uint32) -> uint64
 extern def write_msr(index: uint32, value: uint64)
+# LFENCE-ordered RDTSC (arch/x86/kernel/syscall_64.S). Used ONLY as a
+# reliable cross-check reference when clamping the PIT-gate LAPIC
+# calibration below (the PIT OUT-pin poll is unreliable under KVM).
+extern def read_tsc() -> uint64
 
 IA32_APIC_BASE_MSR: uint32 = 0x1B
 APIC_BASE_ENABLE:   uint64 = 0x800             # bit 11
@@ -201,14 +205,30 @@ PIT_10MS_DIVISOR: int32 = 0x2E9C
 #                                  the timer; do NOT poll this)
 #   bit 5  TIMER 2 OUT pin status (1 once channel 2 reaches 0)
 #
-# CALIBRATION BUG FIX: this used to be 0x10 (bit 4). Bit 4 is the DRAM
-# refresh-request toggle that flips roughly every ~15 µs, so the
+# CALIBRATION BUG FIX (v1): this used to be 0x10 (bit 4). Bit 4 is the
+# DRAM refresh-request toggle that flips roughly every ~15 µs, so the
 # "wait for the 10 ms one-shot to expire" poll loop below actually
 # exited after the first refresh toggle (~15..150 µs) instead of the
 # full 10 ms. The measured LAPIC tick count was therefore ~70x too
 # small, and the periodic initial count we derived from it was ~70x
 # too small — making the LAPIC timer fire ~70x faster than the target
 # 100 Hz. The channel-2 OUT pin is bit 5 (0x20); poll that instead.
+#
+# CALIBRATION BUG FIX (v2 — SMP boot wedge): even with the correct OUT
+# pin, the PIT channel-2 gate is STILL unreliable under KVM. Measured
+# on -cpu host: the "10 ms" OUT poll returns in a fraction of that, so
+# `elapsed` (LAPIC ticks) is ~18-30x too small and the derived periodic
+# count fires the LAPIC timer ~18-30x too fast. `jiffies` then advances
+# ~18-30x faster than wall-clock, and on -smp>1 the resulting per-CPU
+# timer-IRQ storm helps wedge the runlevel-5 app-launch on the DE image
+# (sub-second on -smp 1). The fix: the TSC is calibrated FIRST (boot
+# reordered so tsc_init precedes this call) and is reliable under KVM;
+# we snapshot RDTSC across the SAME PIT poll window and derive the LAPIC
+# frequency from the TSC-MEASURED window length rather than the ASSUMED
+# 10 ms. If the PIT-derived value disagrees with the TSC-derived value
+# by more than ~12.5% we trust the TSC value. When the TSC is
+# unavailable/uncalibrated we fall back to the pure PIT behavior — real
+# single-timer hardware (no usable TSC) is never bricked by this clamp.
 PIT_CTRL_GATE:  int32 = 0x01
 PIT_CTRL_SPEAK: int32 = 0x02
 PIT_CTRL_OUT:   int32 = 0x20
@@ -229,7 +249,19 @@ def _pit_gate_on():
     outb((cur & ~PIT_CTRL_SPEAK) | PIT_CTRL_GATE, PIT_CTRL)
 
 
-def lapic_calibrate_and_setup_timer():
+# Window the PIT one-shot nominally defines, expressed as a divisor of
+# one second: PIT_10MS_DIVISOR = 10 ms => 100 windows per second. Used to
+# scale `elapsed` LAPIC ticks to a per-second frequency on the PIT path.
+PIT_WINDOWS_PER_SEC: uint64 = 100
+
+# TSC cross-check plausibility band. If the PIT-derived LAPIC frequency
+# lands outside ±(value >> CLAMP_SHIFT) of the TSC-derived frequency, the
+# PIT poll window was not really 10 ms (KVM) and we trust the TSC value.
+# Shift 3 == ±12.5%.
+CALIB_CLAMP_SHIFT: uint64 = 3
+
+
+def lapic_calibrate_and_setup_timer(tsc_hz: uint64, tsc_ok: uint64):
     # Step 1: stop / mask everything first.
     _lapic_write(LAPIC_LVT_TIMER_REG, 0x10000)         # bit 16 = mask
     _pit_gate_off()
@@ -246,42 +278,72 @@ def lapic_calibrate_and_setup_timer():
 
     # Step 4: open the PIT gate to start counting. The LAPIC timer
     # has been counting all along but the reference point is "right
-    # now" — both counters are running synchronously.
+    # now" — both counters are running synchronously. Snapshot the TSC
+    # at the SAME instant the gate opens so we can later measure the TRUE
+    # window length (the PIT OUT poll is unreliable under KVM).
     _pit_gate_on()
+    tsc_t0: uint64 = read_tsc()
 
-    # Step 5: poll OUT pin until PIT expires (10 ms wall-clock).
+    # Step 5: poll OUT pin until PIT expires (nominally 10 ms wall-clock;
+    # under KVM this can return far sooner — hence the TSC clamp below).
     while (inb(PIT_CTRL) & PIT_CTRL_OUT) == 0:
         pass
 
-    # Step 6: snapshot LAPIC's current count; the delta from max is
-    # the number of LAPIC ticks (post-divide-by-16) that fit in 10 ms.
+    # Step 6: snapshot LAPIC's current count AND the TSC; the LAPIC delta
+    # from max is the number of ticks (post-divide-by-16) that fit in the
+    # window, and the TSC delta measures how long that window really was.
     cur: uint32 = _lapic_read(LAPIC_TIMER_CUR)
+    tsc_t1: uint64 = read_tsc()
     elapsed: uint32 = 0xFFFFFFFF - cur
 
     # Tidy up: stop the PIT so it doesn't keep gating.
     _pit_gate_off()
 
-    # Step 7: scale to ticks_per_second + program periodic initial
-    # count for the desired HZ. elapsed corresponds to 10 ms, so
-    # ticks_per_second = elapsed × 100, and the periodic count for
-    # HZ = 100 is exactly `elapsed`.
-    ticks_per_second: uint64 = cast[uint64](elapsed) * 100
-    periodic_count: uint32   = elapsed * cast[uint32](100) / cast[uint32](TIMER_HZ)
+    # Step 7a: PIT-derived frequency. `elapsed` is ASSUMED to span 10 ms,
+    # so the per-second LAPIC frequency is elapsed × 100.
+    lapic_hz_pit: uint64 = cast[uint64](elapsed) * PIT_WINDOWS_PER_SEC
+    lapic_hz: uint64 = lapic_hz_pit
 
-    printk1("LAPIC: calibration measured %d Hz (post-÷16)\n",
-            ticks_per_second)
+    printk1("LAPIC: PIT-derived %d Hz (post-÷16)\n", lapic_hz_pit)
 
-    # Guard: a near-zero `elapsed` (PIT poll exited early, or the LAPIC
-    # timer never counted) would yield periodic_count ≈ 0, which on most
-    # LAPICs disables the timer entirely — no ticks, no preemption, the
-    # box wedges. If the measurement is implausibly small (< 1000 ticks
-    # in 10 ms, i.e. < 100 kHz post-÷16 — far below any real or emulated
-    # LAPIC), fall back to a conservative hand-picked count rather than
-    # programming a dead timer.
+    # Step 7b: TSC cross-check clamp. The TSC was calibrated before this
+    # call (boot reordered) and is reliable under KVM. Convert the TSC
+    # delta over the SAME window into microseconds, then derive the LAPIC
+    # frequency from the true window length — independent of whether the
+    # PIT OUT poll returned early. If the two disagree beyond the ±12.5%
+    # band, the PIT window was bogus: trust the TSC-derived value.
+    #
+    # Overflow: elapsed <= 2^32, ×1e6 <= ~4.3e15; tsc_delta over ~10 ms at
+    # a few GHz is ~1e7-1e8, ×1e6 <= ~1e14 — both well inside uint64.
+    if tsc_ok != 0 and tsc_hz > 1000000 and tsc_t1 > tsc_t0:
+        tsc_delta: uint64 = tsc_t1 - tsc_t0
+        window_us: uint64 = tsc_delta * 1000000 / tsc_hz
+        if window_us > 0:
+            lapic_hz_tsc: uint64 = cast[uint64](elapsed) * 1000000 / window_us
+            printk1("LAPIC: TSC-measured window %d us, ", window_us)
+            printk1("TSC-derived %d Hz\n", lapic_hz_tsc)
+            band: uint64 = lapic_hz_tsc >> CALIB_CLAMP_SHIFT
+            lo: uint64 = lapic_hz_tsc - band
+            hi: uint64 = lapic_hz_tsc + band
+            if lapic_hz_pit < lo or lapic_hz_pit > hi:
+                printk1("LAPIC: PIT calibration implausible vs TSC — "
+                        "using TSC-derived %d Hz\n", lapic_hz_tsc)
+                lapic_hz = lapic_hz_tsc
+    else:
+        printk0("LAPIC: TSC uncalibrated — using PIT-derived frequency\n")
+
+    # Step 7c: program periodic initial count for the desired HZ.
+    periodic_count: uint32 = cast[uint32](lapic_hz / TIMER_HZ)
+
+    # Guard: a near-zero `periodic_count` (both clocks degenerate) would
+    # disable the timer on most LAPICs — no ticks, no preemption, wedge.
+    # If implausibly small (< 1000 ticks/period), fall back to a
+    # conservative hand-picked count and keep lapic_hz consistent with it.
     if periodic_count < 1000:
         printk1("LAPIC: calibration implausible (count=%d) — using fallback\n",
                 cast[uint64](periodic_count))
         periodic_count = 1000000
+        lapic_hz = cast[uint64](periodic_count) * TIMER_HZ
 
     printk1("LAPIC: programming periodic count = %d (target 100 Hz)\n",
             cast[uint64](periodic_count))
@@ -290,13 +352,12 @@ def lapic_calibrate_and_setup_timer():
     _lapic_write(LAPIC_TIMER_INIT,    periodic_count)
 
     # Record the calibrated post-divide LAPIC timer frequency so the
-    # clockevent layer (kernel/time/clockevent.ad) can convert an
-    # absolute ns deadline into a one-shot initial-count. ticks_per_second
-    # already holds elapsed*100 (elapsed = ticks in 10 ms). Guard a
-    # degenerate calibration so the conversion never divides by ~0.
-    if ticks_per_second < 100000:
-        ticks_per_second = 100000000          # 100 MHz fallback
-    lapic_timer_hz = ticks_per_second
+    # clockevent layer (kernel/time/clockevent.ad) can convert an absolute
+    # ns deadline into a one-shot initial-count. Guard a degenerate
+    # calibration so the conversion never divides by ~0.
+    if lapic_hz < 100000:
+        lapic_hz = 100000000                  # 100 MHz fallback
+    lapic_timer_hz = lapic_hz
 
 
 # --- One-shot LAPIC timer (clockevent backend) ---------------------
