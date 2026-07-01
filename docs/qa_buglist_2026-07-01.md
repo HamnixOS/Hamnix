@@ -82,6 +82,36 @@ spawns. Regression gate: `scripts/test_de_panel_widgets_ux.sh` (PASS on main).
   - Incidental (confirmed): the live SERIAL console already runs as `live`
     (uid 1001); only the DE terminal is `nobody` — see C1.
 
+## Interactive QA pass #1 (orchestrator, 2026-07-01, quiet KVM host)
+Booted `build/hamnix-installer.img` (KVM, `-vga std`, headless screendump) to
+runlevel 5 and captured the idle desktop. Screenshots in the session scratchpad.
+
+VISUALLY CONFIRMED landed fixes:
+- **A2** — CPU widget bar is partial (~40%) at idle and does NOT climb to 100%
+  over an 8s idle interval (two shots 8s apart). Fix holds.
+- **A1** — bottom taskbar live-lists the open windows (Editor/Calculator/Files/
+  Terminal); top panel mirrors them. Populates correctly with default apps.
+  (The user's exact repro — close ALL then open new — still needs input-driven
+  verification; see QA-N3.)
+- File manager (`hamfm: /` with real folder/file icons), terminal (`hamsh$`,
+  `ls /`), calculator all render; desktop icons (System Monitor, Home) present;
+  serial confirms the console runs as `live` (uid 1001).
+
+NEW bugs found this pass:
+- [ ] **QA-N1** (rendering) — stray single glyphs along the far-LEFT screen edge,
+  partially occluded by the terminal window. Looks like desktop-icon label text
+  compositing ABOVE windows (z-order) or not cleared on repaint. Investigate the
+  desktop-icon vs window z-order / damage-rect in the scene compositor.
+- [ ] **QA-N2** (low-confidence) — cursor position changed between two
+  screendumps with NO input injected (center → bottom-right). Possible spurious
+  cursor motion or non-deterministic rest position. Re-observe.
+- [ ] **QA-N3** (method) — input-driven QA (open Applications menu to eyeball A6
+  browser entry; close-all-then-open for the exact A1 repro; right-click for
+  A3/A4) needs a working abs-pointer path: adding `usb-tablet` broke OVMF boot
+  order (fell to PXE) and it's unverified whether tablet events reach the DE
+  cursor at all (DE may only read PS/2 aux). Pin `bootindex=0` + confirm the DE
+  HID input path before the next input-driven pass.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
