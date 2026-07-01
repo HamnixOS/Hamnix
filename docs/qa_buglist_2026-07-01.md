@@ -344,10 +344,12 @@ execution all function.
   `worldworld`; `a $s b`→3 words (spaces preserved); `"Kq$s"`→`Kqworld`. New
   test_hamsh_expand.sh 7/7 + test_hamsh_assign 16/16 + DE rl5 PASS. (Was: unquoted
   `text$var` split into separate argv words — a silent-wrong-result idiom bug.)
-- [ ] **QA-N18** (hamsh for-loop, MED) — `for f in a b c {…}` (POSIX word-list) →
-  parse error (Python-flavored: single iterable expr only); AND `for f in solo
-  {…}` (single bareword) produced NO iteration/output. Needs: confirm the working
-  iterable form (list value / `$var`) and decide whether to accept a word-list.
+- [x] **QA-N18** (hamsh for-loop) — FIXED e416f3e4 + boot-verified. `parse_for`
+  now collects one-or-more item words after `in` until `{` (same argv machinery:
+  `$var`/glob/`text$var` fusion); ND_FOR holds item-word kids; `exec_for`
+  expands+iterates the body once per item. Verified on main: `for x in a b c {
+  echo L_$x }`→L_a/L_b/L_c; `for f in solo {…}`→S_solo. Regressions clean. The
+  universal shell for-loop idiom + single-item + `$var`-list all work.
 - [ ] **QA-N19** (cosmetic) — `enter linux {ps}` pid-1 COMM shows `koftfird`
   (garbled comm read); ps otherwise works.
 
