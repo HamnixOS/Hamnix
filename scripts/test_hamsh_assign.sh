@@ -76,6 +76,21 @@ set +e
     # 6. spaced `=` still does arithmetic (regression guard).
     printf 'n = 10 * 4 + 2 ; echo GOT_N $n\n'
     sleep 2
+    # 7. ARGUMENT-position glued `=` is a LITERAL word, NOT an
+    #    assignment — `echo a=b` must print `a=b`, not parse-error.
+    #    (Regression guard for the c93919db OP_ASSIGN_LIT change, which
+    #    fired even when `word=rhs` appeared as a command argument.)
+    printf 'echo GOT_AB a=b\n'
+    sleep 2
+    # 8. arg-position glued `=` with $var expansion in the RHS.
+    printf 'V=hello ; echo GOT_PV p=$V\n'
+    sleep 2
+    # 9. leading assignment still works alongside an arg-position use.
+    printf 'W=/x/y ; echo GOT_W $W\n'
+    sleep 2
+    # 10. export + arg-position glued `=` read-back.
+    printf 'export E=z ; echo GOT_E got=$E\n'
+    sleep 2
     # Re-send case 1 (a fresh hamsh drops its FIRST serial line, so the
     # opening bare `VAR=/path` case can be lost; re-send is idempotent).
     printf 'DIR=/home/live ; echo GOT_DIR $DIR\n'
@@ -115,6 +130,10 @@ check "GOT_EV exported_val"         "export VAR=value assigns the value"
 check "GOT_Q dir is /home/live"     "double-quoted RHS interpolates \$vars"
 check "GOT_L raw dollar"            "single-quoted RHS is literal (no interp)"
 check "GOT_N 42"                    "spaced '=' still evaluates arithmetic"
+check "GOT_AB a=b"                  "arg-position glued '=' is a literal word (echo a=b)"
+check "GOT_PV p=hello"              "arg-position glued '=' expands \$var in RHS"
+check "GOT_W /x/y"                  "leading VAR=value assignment still works"
+check "GOT_E got=z"                 "export VAR=value + arg-position got=\$E"
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_hamsh_assign] FAIL"
