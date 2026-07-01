@@ -137,12 +137,23 @@ USRMERGE_ALIASES = {
 # symlinks yet. install_rootfs_from_manifest tolerates missing source
 # paths so a host without u_busybox_musl will skip these entries
 # without failing the install.
+# Kept in lockstep with _stage_busybox()'s bb_applets in
+# scripts/build_rootfs_img.py — the installer copies busybox bytes to
+# each of these applet paths off the source rootfs, so the installed
+# disk mirrors the live root's working set. Every name is confirmed
+# present in the staged musl busybox's applet table (busybox --list);
+# absent applets (mount/awk/sed/tar/vi/ip/ping ...) are omitted.
 BUSYBOX_APPLETS = [
     "sh", "ash",
-    "ls", "cat", "echo", "cp", "mv", "rm", "mkdir",
-    "pwd", "grep", "head", "tail", "wc",
-    "true", "false", "env", "printf", "date",
-    "sleep", "basename", "dirname",
+    "ls", "cat", "echo", "cp", "mv", "rm", "mkdir", "rmdir",
+    "ln", "touch", "chmod", "chown", "chgrp", "stat", "readlink",
+    "pwd", "grep", "head", "tail", "wc", "sort", "cut", "tr",
+    "uniq", "find", "which",
+    "du", "df", "sync",
+    "true", "false", "env", "printf", "date", "sleep", "usleep",
+    "basename", "dirname", "mktemp",
+    "uname", "id", "whoami", "hostname", "groups", "who", "users",
+    "ps", "kill", "free", "uptime",
 ]
 
 

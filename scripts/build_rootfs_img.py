@@ -385,12 +385,33 @@ def _stage_busybox(staging: Path) -> bool:
     bb_target = bb_dir / "busybox"
     shutil.copy2(bb_src, bb_target)
     bb_target.chmod(0o755)
+    # Minimal-but-usable working set. Every name here is confirmed
+    # present in the staged musl busybox's compiled-in applet table
+    # (busybox --list). The fixture is built from `make defconfig`
+    # (all sensible applets ON) minus a small DISABLE_APPLETS set
+    # (see tests/u-binary/src/musl_busybox/Makefile) — so e.g. `mount`,
+    # `awk`, `sed`, `tar`, `vi`, `ip`, `ping` are intentionally ABSENT
+    # from the binary and are NOT listed here (a link for a missing
+    # applet would just print "applet not found"). This is the small
+    # live root, not the full mirror; keep it lean.
     bb_applets = [
+        # shell
         "sh", "ash",
-        "ls", "cat", "echo", "cp", "mv", "rm", "mkdir",
-        "pwd", "grep", "head", "tail", "wc",
-        "true", "false", "env", "printf", "date",
-        "sleep", "basename", "dirname",
+        # file listing / IO
+        "ls", "cat", "echo", "cp", "mv", "rm", "mkdir", "rmdir",
+        "ln", "touch", "chmod", "chown", "chgrp", "stat", "readlink",
+        # text
+        "pwd", "grep", "head", "tail", "wc", "sort", "cut", "tr",
+        "uniq", "find", "which",
+        # disk / fs info
+        "du", "df", "sync",
+        # scripting primitives
+        "true", "false", "env", "printf", "date", "sleep", "usleep",
+        "basename", "dirname", "mktemp",
+        # system / identity
+        "uname", "id", "whoami", "hostname", "groups", "who", "users",
+        # process
+        "ps", "kill", "free", "uptime",
     ]
     # Plant each applet as a HARD link to the busybox binary, NOT a
     # symlink. The kernel's distrofs/ext4 exec path does not traverse
