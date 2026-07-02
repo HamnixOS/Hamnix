@@ -448,16 +448,21 @@ HMP 1px-step mouse. NO new bugs — solid:
   green; KVM DE rl5 PASS. (The original `enter linux {…;cmd}` symptom was the
   ld.so hang QA-N26, now fixed — not hamsh.)
 
-- [~] **QA-N28** (HIGH — Firefox gate + stability) — `enter linux { <bin> }`
-  system-wide WEDGES the kernel when the DE session is fully up (visual_gate ~8
-  apps + wayland server live): serial stops at `elf: Linux-ABI binary detected`,
-  `[hamsh-alive]` heartbeat STOPS (whole box, not just client), NOT OOM (~2 GiB
-  free). Launching EARLY (before visual_gate done) runs to exit. So exec-under-live-DE
-  deadlocks. Lead: the do_execve global `_execve_lock` (f404c73c) vs live compositor/
-  wayland-server locks. Found in Phase-4b (the ld.so blocker QA-N26 is now cleared —
-  real wayland-info reaches libwayland connect). Agent #40 root-causing. Unblocks
-  weston connect→render→XWayland→Firefox + fixes launching any Linux binary from a
-  running desktop.
+- [x] **QA-N28** (HIGH — Firefox gate + stability) — FIXED b0187c94 + boot-verified.
+  Root cause: the global `_execve_lock` (f404c73c) is a raw BUSY-WAIT spinlock, but
+  `_do_execve_inner` YIELDS while holding it — the image read for a 9P/distrofs-served
+  binary (every `enter linux { <debian bin> }`) calls `yield_to_others()`, violating
+  the "no yield with a spinlock held" invariant (core.ad:7298). On -smp 1, a second
+  task hitting do_execve busy-spins the only CPU with IF=0 while the holder is parked
+  on 9P → the holder/daemon/heartbeat never run → whole-box wedge (only after the DE
+  is up, since a populated session makes a colliding concurrent execve likely; cpio
+  applets don't 9P-read so never wedged). FIX: cooperative yielding mutex
+  (`while !trylock: yield_to_others()`) — preserves f404c73c's mutual exclusion
+  (trylock = 1 atomic XCHG) but waiters yield. Verified: `enter linux { echo }` under
+  live DE works (heartbeat survives); test_httpd_concurrent 4/4 (collision protection
+  intact); KVM DE rl5 PASS. **LIKELY also closes the parked #9 SMP factor-2** (its
+  suspected fork+exec-storm deadlock is exactly this). Unblocks the Phase-4b weston
+  connect retest → render → XWayland → Firefox.
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
