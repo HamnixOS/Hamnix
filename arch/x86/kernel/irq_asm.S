@@ -164,9 +164,18 @@ common_irq:
      * preemption gate in timer_interrupt() inspects CS's low two
      * bits: RPL 3 means the timer hit ring-3 (userland) code, which
      * is the only context safe to preempt. Passing CS here keeps the
-     * ring test in C-level Adder rather than smearing it across asm. */
+     * ring test in C-level Adder rather than smearing it across asm.
+     *
+     * arg3 (%rdx) = interrupted RIP, arg4 (%rcx) = interrupted RSP
+     * (both from the CPU-pushed iret frame). These feed the Linux-ABI
+     * no-syscall watchdog: when the timer catches a ring-3 task that
+     * has spun without a syscall for N seconds, timer_interrupt dumps
+     * this RIP (+ RSP) so the exact spinning userspace instruction can
+     * be pinned to a library+offset via the task's VMA map. */
     movq  72(%rsp), %rdi
     movq  96(%rsp), %rsi
+    movq  88(%rsp), %rdx
+    movq  112(%rsp), %rcx
     call  do_irq
 
     popq  %r11

@@ -71,14 +71,25 @@
 #   covers the page-rounded length.
 
 from kernel.printk.printk import (
-    printk0, printk1, printk2, printk_set_level, PRINTK_LEVEL_NOTICE,
+    printk0, printk1, printk2, printk3, printk_set_level,
+    PRINTK_LEVEL_NOTICE, PRINTK_LEVEL_WARN,
 )
 from kernel.sched.core import (
     TaskStruct,
     task_vma_list_head, set_task_vma_list_head,
     current_idx_get, task_pml4,
     spinlock_lock, spinlock_unlock, spinlock_trylock,
+    current_task, task_fd_opened_path_ptr,
+    task_is_linux_userspace_at, task_last_syscall_jiffies,
+    task_wd_last_dump_jiffies, set_task_wd_last_dump_jiffies,
 )
+# Linux-ABI no-syscall watchdog: jiffies clock + tick-hook registration.
+# arch.time imports only from core (no mm.* symbol), so this is acyclic.
+from arch.x86.kernel.time import get_jiffies, register_linux_nosyscall_wd_hook
+# Non-faulting user-address resolve: read a few userspace stack words at the
+# pinned RIP WITHOUT triggering a demand fault-in (we run in timer-IRQ
+# context and must not take the fault-path mm locks).
+from mm.uaccess import uaccess_resolve, uaccess_current_pml4
 # Wave-3 per-VMA / RCU lookup (Linux-parity VMA scalability). The fault
 # path RCU-looks-up a VMA in the O(log n) interval tree, then per-VMA-
 # trylocks it so a fault on VMA A proceeds concurrently with a fault on
@@ -2172,6 +2183,161 @@ def vma_dbg_dump_cover(slot: uint64, addr: uint64):
     if (pte & PT_FLAG_NX) != 0:
         nxset = 1
     printk2("[nxdiag] leaf PTE pte=%p NX=%d\n", pte, nxset)
+
+
+# ---------------------------------------------------------------------
+# Linux-ABI no-syscall watchdog (permanent debug aid)
+# ---------------------------------------------------------------------
+#
+# A Linux-ABI task that spins in USERSPACE issues no syscall, takes no
+# fault, and never traps into the kernel — the ONLY kernel entry left is
+# the periodic timer IRQ. This watchdog rides that tick: it compares the
+# running task's last-syscall stamp (kernel/sched/core.ad, refreshed on
+# every Linux syscall dispatch) against jiffies and, once the gap crosses
+# WD_THRESH, dumps the interrupted userspace RIP/RSP + a few stack words +
+# the VMA that CONTAINS the RIP (so RIP -> library base + module offset)
+# and a compact file-backed VMA map. That pins the EXACT spinning function
+# without qemu HMP. Built for the weston-terminal / cairo / pixman first-
+# frame render spin, but kept as a general aid for any userspace hang.
+#
+# HZ = 100, so 1 s == 100 jiffies.
+WD_THRESH_JIFFIES: uint64 = 500          # 5 s with no syscall -> spinning
+WD_REDUMP_JIFFIES: uint64 = 1000         # re-dump the same spin at most every 10 s
+
+
+def _wd_resolve_uword(pml4: uint64, uaddr: uint64, out: Ptr[uint64]) -> int32:
+    # Non-faulting read of one 8-byte userspace word. Returns 1 on success
+    # (word stored via `out`), 0 if the page is not currently present (we do
+    # NOT fault it in — that would take mm locks from IRQ context).
+    phys: uint64 = uaccess_resolve(pml4, uaddr, 0)
+    if phys == 0:
+        return 0
+    out[0] = cast[Ptr[uint64]](phys)[0]
+    return 1
+
+
+def _wd_dump_stack(ursp: uint64):
+    # Emit up to 8 words from the interrupted user stack. These often carry
+    # the caller's return address (pin the CALLER frame even when the RIP
+    # itself is in a leaf helper) and loop-local values.
+    if ursp == 0:
+        return
+    pml4: uint64 = uaccess_current_pml4()
+    i: uint64 = 0
+    while i < 8:
+        w: uint64 = 0
+        a: uint64 = ursp + i * 8
+        if _wd_resolve_uword(pml4, a, &w) != 0:
+            printk2("[nosys-wd]   stack[%d]=%p\n", i, w)
+        else:
+            printk1("[nosys-wd]   stack@%p not present\n", a)
+            i = 8
+        i = i + 1
+
+
+def _wd_dump_maps(slot: uint64):
+    # Compact dump of every FILE-backed VMA: base .. end, file_offset, fd, and
+    # the recorded open path if the fd is still live. Combined with the per-
+    # mmap [LMOD] trace this gives an authoritative RIP-base -> library table.
+    cur: uint64 = task_vma_list_head(slot)
+    n: uint64 = 0
+    while cur != 0 and n < 256:
+        isf: int32 = cast[Ptr[VmaNode]](cur)[0].is_file
+        if isf != 0:
+            s:   uint64 = _vma_node_start(cur)
+            e:   uint64 = _vma_node_end(cur)
+            fo:  uint64 = cast[Ptr[VmaNode]](cur)[0].file_offset
+            ffd: int32  = cast[Ptr[VmaNode]](cur)[0].file_fd
+            pr:  int32  = cast[Ptr[VmaNode]](cur)[0].prot
+            printk3("[nosys-wd]   map [%p,%p) off=0x%x", s, e, fo)
+            printk2(" fd=%d prot=%d", cast[uint64](ffd), cast[uint64](pr))
+            if ffd >= 0:
+                p: Ptr[uint8] = task_fd_opened_path_ptr(current_task(),
+                                                        cast[uint64](ffd))
+                if p[0] != 0:
+                    printk1(" %s", cast[uint64](p))
+            printk0("\n")
+        cur = _vma_node_get_next(cur)
+        n = n + 1
+
+
+def linux_nosyscall_watchdog_tick(user_ctx: uint64, urip: uint64,
+                                  ursp: uint64):
+    # Timer-tick hook. Fires from arch/x86/kernel/time.ad::timer_interrupt.
+    # user_ctx==1 means the timer froze ring-3 code, so `urip`/`ursp` are the
+    # genuine userspace RIP/RSP of the running task (from the iret frame).
+    if user_ctx == 0:
+        return
+    slot: uint64 = current_idx_get()
+    if task_is_linux_userspace_at(slot) == 0:
+        return
+    last: uint64 = task_last_syscall_jiffies(slot)
+    if last == 0:
+        return
+    now: uint64 = get_jiffies()
+    if now < last:
+        return
+    if (now - last) < WD_THRESH_JIFFIES:
+        return
+    # Rate-limit repeat dumps of the same spin episode.
+    lastdump: uint64 = task_wd_last_dump_jiffies(slot)
+    first: int32 = 1
+    if lastdump != 0:
+        first = 0
+        if now >= lastdump and (now - lastdump) < WD_REDUMP_JIFFIES:
+            return
+    set_task_wd_last_dump_jiffies(slot, now)
+
+    printk_set_level(PRINTK_LEVEL_WARN)
+    printk2("[nosys-wd] slot=%d spun %d ticks (10ms each) with NO syscall\n",
+            slot, now - last)
+    printk2("[nosys-wd]   RIP=%p RSP=%p\n", urip, ursp)
+
+    # Which VMA holds the spinning RIP? Lockless list walk — the task is
+    # spinning in its OWN userspace, so its VMA list is not being mutated
+    # concurrently. Prefer an EXEC-permitting cover (ld.so's reserve+overlay
+    # idiom stacks a PROT_NONE reservation under the code overlay).
+    best: uint64 = 0
+    cur: uint64 = task_vma_list_head(slot)
+    while cur != 0:
+        s: uint64 = _vma_node_start(cur)
+        e: uint64 = _vma_node_end(cur)
+        if s <= urip and urip < e:
+            if best == 0:
+                best = cur
+            elif (cast[Ptr[VmaNode]](cur)[0].prot & VMA_PROT_EXEC) != 0:
+                best = cur
+        cur = _vma_node_get_next(cur)
+    if best == 0:
+        printk1("[nosys-wd]   RIP not covered by any VMA (va=%p)\n", urip)
+    else:
+        bs:  uint64 = _vma_node_start(best)
+        fo:  uint64 = cast[Ptr[VmaNode]](best)[0].file_offset
+        ffd: int32  = cast[Ptr[VmaNode]](best)[0].file_fd
+        pr:  int32  = cast[Ptr[VmaNode]](best)[0].prot
+        isf: int32  = cast[Ptr[VmaNode]](best)[0].is_file
+        modoff: uint64 = urip - bs + fo
+        printk3("[nosys-wd]   in VMA base=%p prot=%d is_file=%d\n",
+                bs, cast[uint64](pr), cast[uint64](isf))
+        printk2("[nosys-wd]   module-off=0x%x (rip-base+file_off) fd=%d\n",
+                modoff, cast[uint64](ffd))
+        if isf != 0 and ffd >= 0:
+            p: Ptr[uint8] = task_fd_opened_path_ptr(current_task(),
+                                                    cast[uint64](ffd))
+            if p[0] != 0:
+                printk1("[nosys-wd]   file=%s\n", cast[uint64](p))
+
+    _wd_dump_stack(ursp)
+    # Full file-backed map only on the FIRST dump of an episode (it is slow
+    # over the serial line); repeats print just the RIP + stack.
+    if first != 0:
+        _wd_dump_maps(slot)
+
+
+def linux_nosyscall_watchdog_init():
+    # Register the tick hook. Called at boot after the timer + VMA subsystems
+    # are up. Idempotent.
+    register_linux_nosyscall_wd_hook(linux_nosyscall_watchdog_tick)
 
 
 # ---------------------------------------------------------------------
