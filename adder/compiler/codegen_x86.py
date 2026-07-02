@@ -774,6 +774,36 @@ class X86CodeGen:
             self.percpu_size = 8       # cpu_id_pcpu occupies [0, 8)
             self.percpu_globals.add('cpu_id_pcpu')
             self.percpu_offsets['cpu_id_pcpu'] = 0
+            # ABI INVARIANT (same rationale as cpu_id_pcpu@0): the SYSCALL
+            # entry stub (arch/x86/kernel/syscall_64.S) needs two scratch
+            # qwords it can spill user %r12/%r13 into via a LITERAL %gs:72 /
+            # %gs:80 BEFORE it has any free register to compute the kernel
+            # stack — it must NOT spill to the user stack (a thread's
+            # demand-paged user stack top may be absent, and a CPL=0 push
+            # there #PFs with RSP still on the user stack -> double/triple
+            # fault). We PIN the two scratch slots PAST the nine existing
+            # kernel per-CPU globals (cpu_id@0, softirq_*/tasklet_*/
+            # local_timer_ticks/linux_current_task/current_idx @8..64), at
+            # fixed offsets 72 and 80. We only RESERVE the offsets here (add
+            # to percpu_offsets so the Pass-1 walk skips them) and DO NOT bump
+            # percpu_size — so the nine dynamic globals still fill 8..64
+            # exactly as before, keeping seed and native kernel output
+            # byte-identical (test_native_vs_seed_kobjdiff.sh). The native
+            # codegen (compiler/codegen.ad) name-pins the same 72/80.
+            _pin_syscall_scratch = {
+                'syscall_scratch_r12': 72,
+                'syscall_scratch_r13': 80,
+            }
+            for _sname, _soff in _pin_syscall_scratch.items():
+                _has = any(
+                    isinstance(d, VarDecl)
+                    and d.name == _sname
+                    and isinstance(d.var_type, PercpuType)
+                    for d in program.declarations
+                )
+                if _has:
+                    self.percpu_globals.add(_sname)
+                    self.percpu_offsets[_sname] = _soff
 
         for decl in program.declarations:
             match decl:

@@ -55,23 +55,22 @@ syscall_entry:
      * as SYS_WAITPID started yielding mid-syscall — the child's own
      * later syscall_entry would overwrite the parent's saved slot.
      *
-     * We use %r12 as a transient scratch — park user %r12 on the
-     * user stack first so we can restore it on return.
-     *
-     * SMAP v3b: SYSCALL doesn't switch stacks — on entry %rsp still
-     * points at the user stack (US=1 page). The two pushq's below are
-     * CPL=0 stores to a US=1 page, which #PF under CR4.SMAP=1 unless
-     * RFLAGS.AC is set. STAC here; CLAC after we switch RSP to the
-     * kernel stack (TSS.RSP0) a few instructions down so SMAP protects
-     * the rest of kernel execution. STAC/CLAC are #UD on pre-Broadwell
-     * silicon, but cpu_mitigations.c only flips CR4.SMAP when CPUID
-     * reports SMAP — and the instructions themselves are legal whenever
-     * the CPU supports SMAP, regardless of CR4.SMAP state.
+     * KEYSTONE (weston-terminal / threaded clients): the entry MUST NOT
+     * touch the user stack at all. Earlier revs did `stac; pushq %r12;
+     * pushq %r13` onto the *user* stack to free up scratch. That #PFs the
+     * instant a caller's user RSP points at an absent page — exactly the
+     * case for a glibc/pthread worker thread whose demand-paged mmap stack
+     * top has not been faulted in yet (cairo/pixman render threads). A
+     * CPL=0 store to that absent user page #PFs while RSP is still the user
+     * stack, so the CPU re-pushes the #PF frame onto the same bad stack:
+     * double fault -> triple fault -> CPU reset. So we spill scratch into
+     * PER-CPU slots (fixed %gs:72 / %gs:80, pinned by the codegen — see
+     * setup_percpu.ad syscall_scratch_r12/_r13) and never write the user
+     * stack. No STAC/CLAC needed: the whole prologue/epilogue stays on the
+     * kernel stack, so SMAP protects it throughout.
      */
-    stac                              /* SMAP: allow CPL=0 user-stack writes */
-    pushq   %r12                      /* park user %r12 on user stack */
-    pushq   %r13                      /* park user %r13 (per-CPU scratch) */
-    clac                              /* SMAP back on for the kernel body */
+    movq    %r12, %gs:72              /* park user %r12 (per-CPU scratch) */
+    movq    %r13, %gs:80              /* park user %r13 (per-CPU scratch) */
 
     /* %r12 = current task's kernel stack top = THIS CPU's TSS.RSP0.
      * schedule() keeps per_cpu_tss[cpu_id].rsp0 pointed at
@@ -92,41 +91,47 @@ syscall_entry:
     addq    %r13, %r12                /* r12 = &per_cpu_tss[cpu_id]      */
     movq    4(%r12), %r12             /* r12 = TSS.RSP0 (kstack top)     */
 
-    /* Park user RSP at kstack_top - 8, then switch to that slot.
-     * After this, subsequent pushes land below the user-RSP slot,
-     * and the matching popq %rsp at the tail restores it directly. */
-    movq    %rsp, -8(%r12)            /* user rsp (with r12 push) -> kstack */
-    leaq    -8(%r12), %rsp            /* RSP -> kernel stack just below it  */
+    /* Grab the user RSP (natural, unmodified) then switch RSP to the
+     * kernel stack. user %r13 is safe in the per-CPU scratch slot. */
+    movq    %rsp, %r13                /* r13 = user rsp (natural)        */
+    movq    %r12, %rsp                /* RSP -> kernel stack (TSS.RSP0)  */
 
-    /* Save the SYSCALL hardware-saved regs for sysretq later. */
-    pushq   %r11                      /* user RFLAGS */
-    pushq   %rcx                      /* user RIP    */
+    /* Save the SYSCALL hardware-saved regs for sysretq later. These three
+     * slots (kstack_top-8/-16/-24) are the LOAD-BEARING ones read by
+     * saved_user_rsp/rflags/rip_ptr (signal delivery + ptrace) — keep them
+     * fixed. Everything is pushed on the KERNEL stack now, so no fault. */
+    pushq   %r13                      /* -8  user RSP (natural)     */
+    pushq   %r11                      /* -16 user RFLAGS            */
+    pushq   %rcx                      /* -24 user RIP               */
 
     /* fork(2) register inheritance: a forked child is a brand-new task
      * whose initial kstack frame zeroes the 6 callee-saved registers
      * (see _build_initial_kstack). For the child to resume the C/asm
      * caller correctly it must inherit the PARENT's callee-saved set.
-     * %r12/%r13 are already parked on the USER stack above (and read by
-     * do_clone from kstack_top-8/-16). The remaining four — %rbx %rbp
-     * %r14 %r15 — are otherwise never spilled by the kernel (the SysV C
-     * ABI just preserves them in-register across do_syscall for the
-     * returning parent), so do_clone has no copy to give the child.
-     * Spill them here, at the user's values, into fixed kernel-stack
-     * slots BELOW the rcx/r11 pair so the kstack_top-8/-16/-24 offsets
-     * do_clone already reads stay valid. Layout (from kstack_top):
-     *   -8  user rsp (with r12 push)   [parked above]
+     * do_clone reads them out of these fixed kernel-stack slots. %r12/%r13
+     * used to be parked on the USER stack; now they are spilled here (from
+     * the per-CPU scratch) just below the RIP slot. Layout (from kstack_top):
+     *   -8  user RSP (natural)
      *   -16 user RFLAGS (r11)
      *   -24 user RIP (rcx)
-     *   -32 user %rbx     <-- new
-     *   -40 user %rbp     <-- new
-     *   -48 user %r14     <-- new
-     *   -56 user %r15     <-- new
-     * Popped symmetrically on the sysret path so the parent's own
-     * registers are unperturbed. */
-    pushq   %rbx                      /* user %rbx  (callee-saved) */
-    pushq   %rbp                      /* user %rbp  (callee-saved) */
-    pushq   %r14                      /* user %r14  (callee-saved) */
-    pushq   %r15                      /* user %r15  (callee-saved) */
+     *   -32 user %r13
+     *   -40 user %r12
+     *   -48 user %rbx
+     *   -56 user %rbp
+     *   -64 user %r14
+     *   -72 user %r15
+     * Reloading %r12/%r13 from scratch here also leaves the user values in
+     * those registers, which the SysV C ABI then preserves across
+     * do_syscall for the returning parent. Popped symmetrically on the
+     * sysret path so the parent's own registers are unperturbed. */
+    movq    %gs:80, %r13              /* reload user %r13 from scratch */
+    movq    %gs:72, %r12              /* reload user %r12 from scratch */
+    pushq   %r13                      /* -32 user %r13              */
+    pushq   %r12                      /* -40 user %r12              */
+    pushq   %rbx                      /* -48 user %rbx (callee-saved) */
+    pushq   %rbp                      /* -56 user %rbp              */
+    pushq   %r14                      /* -64 user %r14              */
+    pushq   %r15                      /* -72 user %r15              */
 
     /* Save all 6 user-arg regs + nr. Linux's x86_64 syscall ABI says
      * %rdi/%rsi/%rdx/%r10/%r8/%r9 are preserved across SYSCALL.
@@ -195,30 +200,25 @@ syscall_entry:
     popq    %r8
     popq    %r9
 
-    /* Pop the four callee-saved registers spilled at entry (see the
-     * fork-inheritance comment above). On the normal return-to-parent
-     * path these restore the user's own %rbx/%rbp/%r14/%r15 unchanged;
-     * the spill exists purely so do_clone can copy them into a forked
-     * child's fresh frame. Pop order is the reverse of the push order
-     * (r15 was pushed last / lowest, so it pops first). */
-    popq    %r15                      /* user %r15  (callee-saved) */
-    popq    %r14                      /* user %r14  (callee-saved) */
-    popq    %rbp                      /* user %rbp  (callee-saved) */
-    popq    %rbx                      /* user %rbx  (callee-saved) */
+    /* Pop the spilled registers in reverse of the entry push order
+     * (r15 was pushed last / lowest, so it pops first). On the normal
+     * return-to-parent path these restore the user's own callee-saved
+     * set unchanged; the spill exists purely so do_clone can copy the
+     * parent's values into a forked child's fresh frame. */
+    popq    %r15                      /* -72 user %r15 */
+    popq    %r14                      /* -64 user %r14 */
+    popq    %rbp                      /* -56 user %rbp */
+    popq    %rbx                      /* -48 user %rbx */
+    popq    %r12                      /* -40 user %r12 */
+    popq    %r13                      /* -32 user %r13 */
 
-    /* Restore syscall-control regs and user RSP. We pop the
-     * (per-task) stored user RSP straight into %rsp; the next pop
-     * pulls user %r12 from the user stack and sysretq returns. */
-    popq    %rcx                      /* user RIP    */
-    popq    %r11                      /* user RFLAGS */
-    popq    %rsp                      /* user rsp (= user_rsp - 16) */
-    /* SMAP v3b: the next two popq's read from the user stack at CPL=0,
-     * so we re-arm AC just for that window. SYSRETQ then reloads RFLAGS
-     * from %r11 (user's saved RFLAGS), which clears AC naturally — no
-     * explicit CLAC needed before the sysretq. */
-    stac                              /* SMAP: allow CPL=0 user-stack reads */
-    popq    %r13                      /* user %r13 (parked 2nd, lowest) */
-    popq    %r12                      /* user %r12 (parked 1st)     */
+    /* Restore syscall-control regs and the (natural) user RSP. Everything
+     * here reads the KERNEL stack, so no user-stack access and no SMAP
+     * window is needed — the last popq loads the user RSP straight into
+     * %rsp and SYSRETQ returns to CPL=3. */
+    popq    %rcx                      /* -24 user RIP    */
+    popq    %r11                      /* -16 user RFLAGS */
+    popq    %rsp                      /* -8  user RSP (natural) */
 
     sysretq                           /* CPL 0 -> 3, RIP=%rcx       */
 
