@@ -430,13 +430,14 @@ HMP 1px-step mouse. NO new bugs — solid:
   context menus (need more click sequences; the tooling now supports it).
 
 ## Wayland Phase-4 findings (2026-07-01)
-- [~] **QA-N26** (HIGH — the Firefox gate) — modern glibc-2.41 Debian binaries hang
-  at ld.so entry under `enter linux` (0 syscalls before first libc call — loader
-  wedges in self-relocation/early-init). Packaging is PROVEN (debootstrap trimmed
-  closure); the Wayland protocol (Phases 1-3) is NOT the blocker. Suspect: auxv
-  (AT_RANDOM/HWCAP/vdso), IRELATIVE/GNU_IFUNC relocs, or an early CPUID trap in the
-  Linux-ABI exec/ELF-load path. Agent #37 root-causing. Unblocks connect→render→
-  XWayland→Firefox.
+- [x] **QA-N26** (HIGH — the Firefox gate) — FIXED 593d18d8 + verified. NOT a
+  loader/auxv issue — a KERNEL **SMAP livelock**: ld.so's `MAP_FIXED|ANON` overlay
+  to zero libc `.bss` made `vma_alloc` `memset` through the user VA at CPL=0 on a
+  US=1,RW=1 page → SMAP #PF → `vma_resolve_write_perm_fault` "resolves" (already
+  RW) → re-run → refault → infinite livelock (found via KVM+gdb single-step). Fix:
+  STAC-bracket the two direct user-VA memsets in mm/vma.ad. `test_u42_dynamic_elf`
+  PASS (glibc-2.41 dynamic binary runs, exit 0); KVM DE boot-safe. **Unblocks
+  weston/XWayland/Firefox** — same do_execve/VMA path serves all glibc-2.41 clients.
 - [~] **QA-N27** (hamsh) — a `;`-separated block drops its trailing command:
   `enter linux { export A ; export B ; cmd }` runs the exports but not `cmd`;
   single-command `{ cmd }` works. Agent #38 fixing.
