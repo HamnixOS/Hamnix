@@ -464,6 +464,17 @@ HMP 1px-step mouse. NO new bugs — solid:
   suspected fork+exec-storm deadlock is exactly this). Unblocks the Phase-4b weston
   connect retest → render → XWayland → Firefox.
 
+- [~] **QA-N29** (HIGH — weston-terminal render blocker + general) — a `forkpty()`
+  shell child takes an NX exec-fault SIGSEGV (code=139) on `execve`, landing on a
+  user-stack VA (~0x1c00fxxxx). Linux-ABI execve-in-forked-child entry-frame bug
+  (fork/rfork-child RSP-reconstruction lineage; see memory
+  project_kernel_vs_installer_heartbeat_divergence). Blocks any fork+execve /
+  forkpty program (shells, terminals). Agent #47. Preserve the do_execve
+  serialization + concurrent-execve protection (f404c73c) — a wrong do_execve change
+  wedged boot before.
+- [ ] **QA-N30** (distrofs) — creating a NEW file in the live distro ns returns
+  spurious ENOSPC despite ample free space (distrofs write path). Separate track.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
