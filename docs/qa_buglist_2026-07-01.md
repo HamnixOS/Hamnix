@@ -412,6 +412,23 @@ injection (DE-app FUNCTION, installer-wizard pages) — the QA-N3b tooling gap.
   KVM DE rl5 PASS on main. **The user's ~8.7min crash is now addressed.**
 - User confirmed: **terminal solid, no bugs found** (validates the hamsh QA sweep).
 
+## Interactive END-USER push #5 (orchestrator, 2026-07-01) — app render+function
+Used the OS (not self-tests): launched apps + drove the install wizard via
+HMP 1px-step mouse. NO new bugs — solid:
+- **Install wizard (B) FUNCTIONALLY VALIDATED** (first interactive test): renders
+  "Step 1 of 5: System name" (host-name field prefilled `hamnix`, Back disabled,
+  Next enabled); clicking Next ADVANCES to "Step 2 of 5: Create your user"
+  (username field, Back now ENABLED, Next now DISABLED = empty-field validation
+  gating). Multi-page nav + Back/Next enable/disable + _page_ready validation all
+  work end-to-end.
+- **Text editor (hamedit)** renders correctly (File/Edit menu, Open/Save, text
+  area, `FILE: (none) (0 bytes)` status bar).
+- **Mouse-driving refinement (QA-N3b)**: 1px-step slam-to-corner+step reliably
+  lands a button click (the Next button). Earlier multi-step flakiness was
+  coarse-step accel — 1px steps are deterministic. Precise single clicks now doable.
+- Untested-by-input still: calculator arithmetic, fm folder-navigation, right-click
+  context menus (need more click sequences; the tooling now supports it).
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
