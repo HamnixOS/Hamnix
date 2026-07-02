@@ -2035,16 +2035,55 @@ def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64,
 # at image phys=0x0a849000). T85 locked the region free-list RMW but left
 # this larger loader-global race open.
 #
-# Fix: a global spinlock serializes the entire do_execve body. execve is
-# not a hot path (Linux itself takes heavy locks here) and the connection
-# SERVING (tcp recv/send) still overlaps fully — only the brief image load
-# is serialized. Kernel-mode is non-preemptible (preempt_tick switches only
-# on a ring-3 tick and SYSCALL masks IF), so a plain spinlock can neither
-# self-deadlock on the same CPU nor be taken from an IRQ handler; the CPUs
-# simply take turns. do_execve is never called recursively.
+# Fix: serialize the entire do_execve body so only one task is inside the
+# loader-global critical section (elf_last_* + region record) at a time.
+# execve is not a hot path (Linux itself takes heavy locks here) and the
+# connection SERVING (tcp recv/send) still overlaps fully — only the brief
+# image load is serialized.
+#
+# QA-N28 — WHY THIS IS A COOPERATIVE (YIELDING) MUTEX, NOT A RAW SPINLOCK.
+# _do_execve_inner is NOT a straight-line non-yielding critical section: it
+# resolves + reads the image through the caller's namespace (ns_blob_ptr ->
+# vfs_read), and for a binary served by the userland distrofs 9P daemon
+# (every `enter linux { <debian binary> }`) that read — and the PT_INTERP
+# ld.so read nested inside elf_load_blob — issues a 9P RPC that parks on
+# yield_to_others() until the daemon task is scheduled to reply
+# (sys/src/9/port/9p_client.ad). So this lock IS held across reschedule
+# points. A raw busy-wait spinlock (spinlock_lock = LOCK XCHG + PAUSE loop,
+# no IRQ enable, no reschedule) held across a yield VIOLATES the core.ad
+# kernel_cond_resched contract ("MUST be called only when no kernel spinlock
+# is held"): once the holder yields, ANY second task that then reaches
+# do_execve busy-spins on the held word with EFLAGS.IF=0 inside its own
+# syscall (kernel mode is non-preemptible — preempt_tick only switches on a
+# ring-3 tick). On a UP guest that spinner pins the one CPU forever, so the
+# yielded holder (and the distrofs daemon it is waiting on, and the hamsh
+# heartbeat) can NEVER run again — the whole box wedges. This is exactly the
+# reported wedge: `enter linux { <debian binary> }` under a fully-populated
+# DE (many STATE_READY tasks -> a concurrent execve is likely) freezes the
+# guest, heartbeat included; a memory-resident cpio applet (no 9P RPC, no
+# yield) does NOT wedge because the lock is never held across a reschedule.
+#
+# The cure keeps the same mutual exclusion (spinlock_trylock is one atomic
+# XCHG) but makes a WAITER cooperatively yield_to_others() instead of
+# busy-spinning. A waiter that yields lets the lock holder — and the 9P
+# daemon it depends on — get scheduled and finish, so the section can be
+# safely held across the 9P yield on both UP and SMP. do_execve is never
+# called recursively, so the holder never waits on itself.
 extern def spinlock_lock(ptr: Ptr[uint32])
 extern def spinlock_unlock(ptr: Ptr[uint32])
+extern def spinlock_trylock(ptr: Ptr[uint32]) -> uint32
 _execve_lock: uint32 = 0
+
+
+def _execve_lock_acquire():
+    # Cooperative mutex acquire (see the QA-N28 note above). One atomic
+    # trylock attempt per turn; on contention yield_to_others() so the
+    # current holder (blocked on a 9P image read) can make progress rather
+    # than us pinning the CPU with a busy-spin. Safe to yield here: this
+    # runs at the very top of do_execve, before any of the caller's
+    # address space has been torn down.
+    while spinlock_trylock(&_execve_lock) == 0:
+        yield_to_others()
 
 
 def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
@@ -2053,7 +2092,7 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
     # before do_execve_finish() SYSRETQs (which never returns here), so this
     # wrapper's unlock runs ONLY on the error-return paths — which all
     # funnel back through this single call site. Exactly one unlock per path.
-    spinlock_lock(&_execve_lock)
+    _execve_lock_acquire()
     rc: int64 = _do_execve_inner(a0, a1, a2)
     spinlock_unlock(&_execve_lock)
     return rc
