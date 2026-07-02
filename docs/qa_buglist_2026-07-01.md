@@ -438,9 +438,15 @@ HMP 1px-step mouse. NO new bugs — solid:
   STAC-bracket the two direct user-VA memsets in mm/vma.ad. `test_u42_dynamic_elf`
   PASS (glibc-2.41 dynamic binary runs, exit 0); KVM DE boot-safe. **Unblocks
   weston/XWayland/Firefox** — same do_execve/VMA path serves all glibc-2.41 clients.
-- [~] **QA-N27** (hamsh) — a `;`-separated block drops its trailing command:
-  `enter linux { export A ; export B ; cmd }` runs the exports but not `cmd`;
-  single-command `{ cmd }` works. Agent #38 fixing.
+- [x] **QA-N27** (hamsh) — FIXED 7de408c6. Root cause differed from the report:
+  `;`-separated statement lists run fine (verified); the real bug was a
+  statement-leading `{` was NOT parsed as a block at all → `{ echo A ; echo B }`
+  gave "parse error: empty command" (bare compound blocks missing from
+  `_parse_statement_body` dispatch — only if/while/for/def + ns/enter/spawn bodies
+  had a block path). Fix: added a bare-block branch. `{ echo A ; echo B ; echo C }`
+  →A/B/C; new test_hamsh_block.sh 9/9; assign/expand/for/heartbeat regressions
+  green; KVM DE rl5 PASS. (The original `enter linux {…;cmd}` symptom was the
+  ld.so hang QA-N26, now fixed — not hamsh.)
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
