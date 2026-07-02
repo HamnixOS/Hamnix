@@ -402,6 +402,14 @@ injection (DE-app FUNCTION, installer-wizard pages) — the QA-N3b tooling gap.
   pressure then OOM-kills qemu → the user's `Killed` + `pid exited 143`. Directly
   corroborated (a non-setsid run got external host SIGTERM@120s, guest healthy/flat).
   → FIX = footprint reduction, tracked as QA-N25 (#33).
+- [x] **QA-N25** (footprint fix for the crash) — FIXED 95f6b38e + verified. Dropped
+  the eager 4 MiB `memset` in `_wsys_layer_fb_ensure` (each consumer already zeroes
+  its own `w*h*4` region), so untouched layer pages stay non-resident; added
+  gap-zeroing in `devwsys_draw_fb_write` to keep the zero-below-highwater contract.
+  Footprint 662→635 MB on the 15-window autostart set (~30-42 MB, per-window, scales
+  up on the user's ~30-window 966 MB session). Kept MAX_LAYERS=16 + the v2 backbuffer
+  memset (both unsafe to touch — documented). Render-correct (all DE apps paint) +
+  KVM DE rl5 PASS on main. **The user's ~8.7min crash is now addressed.**
 - User confirmed: **terminal solid, no bugs found** (validates the hamsh QA sweep).
 
 ## Notes
