@@ -298,36 +298,36 @@ if [ "$connected" -eq 1 ]; then
     echo "$TAG RESULT: PASS — a real Debian libwayland client connected to the native Hamnix Wayland server$([ "$enumerated" -eq 1 ] && echo ' + enumerated globals')$([ "$committed" -eq 1 ] && echo ' + committed an shm buffer')."
     exit 0
 fi
-# STATE (2026-07-02): two distinct findings.
+# STATE (2026-07-02): MILESTONE REACHED — a real Debian libwayland client
+# (wayland-info, glibc-2.41, UNMODIFIED) connects to the native in-kernel
+# Wayland server, which binds its listener ("$LISTENER_MARKER") on the
+# connect. The `connected` PASS arm above now fires on a clean build.
 #
-# (1) CLEARED — the ld.so-entry hang from the previous Phase-4 bring-up is
-#     fixed by the SMAP STAC-bracket in mm/vma.ad (593d18d8): the real
-#     Debian glibc-2.41 client now runs THROUGH ld.so into libwayland's own
-#     connect_to_socket() — PROVEN by libwayland's runtime diagnostic
-#     "error: XDG_RUNTIME_DIR is invalid or not set in the environment."
-#     emitted when the env is unset (that message originates inside
-#     libwayland, well past ld.so relocation). Exporting
-#     XDG_RUNTIME_DIR/WAYLAND_DISPLAY propagates into the `enter linux`
-#     child (the error then vanishes), so env is not the gap.
+# History (why the earlier bring-up thought this "wedged"):
+#   * The ld.so-entry hang was cleared by the SMAP STAC-bracket in
+#     mm/vma.ad (593d18d8): the glibc-2.41 client runs THROUGH ld.so into
+#     libwayland's connect_to_socket().
+#   * The "NEXT GATE = entering the client after the DE is up wedges the
+#     whole kernel before its first syscall" finding was a MISDIAGNOSIS.
+#     The client connected fine; the exec tail completed (SYSRETQ to
+#     ld.so) and the server bound its listener. The connect marker was
+#     simply INVISIBLE: linux_abi/wayland.ad printed it via printk0 at the
+#     DEFAULT INFO level, which early_8250's console_suppress_level gates
+#     OUT once userland is interactive. With no visible marker the wrapper
+#     kept re-sending and eventually killed qemu, and the absence of the
+#     (also-INFO) heartbeat during that window read as a "system-wide
+#     wedge." FIX: linux_abi/wayland.ad now stamps the listener-bound
+#     marker at WARN (printk_set_level), so a real-libwayland connect is
+#     observable at the interactive prompt and this test auto-PASSES.
 #
-# (2) NEXT GATE (new, reproducible on a clean build) — entering the real
-#     libwayland client AFTER the DE session is fully up (i.e. once the
-#     always-on visual_gate has brought up its ~8-app scene) HANGS THE WHOLE
-#     KERNEL before the client's first syscall: the last thing on the serial
-#     log is the ELF "Linux-ABI binary detected" line, and even the
-#     independent `[hamsh-alive]` heartbeat stops ticking — a system-wide
-#     wedge, not just the client. It is NOT OOM (~2 GiB free at
-#     `[mem_gate] after_apps`). Driving the client EARLY, concurrent with
-#     visual_gate (before the full DE scene is resident), does NOT wedge —
-#     the client runs to exit — but the DE-shared serial console then
-#     garbles the typed command, so a clean connect could not be captured
-#     that way either. Root-causing the enter/exec wedge under an active DE
-#     session is the next gate (likely the do_execve serialization / L-shim
-#     interp-load path interacting with live compositor/wayland-server
-#     state). Reported as SKIP (not FAIL) so CI stays green; flips to PASS
-#     automatically once the connect marker ("$LISTENER_MARKER") appears.
+# LADDER STILL ABOVE CONNECT: wayland-info's globals ENUMERATION and
+# weston-simple-shm's shm-buffer COMMIT/RENDER ride the linux child's
+# stdout / INFO-level server markers, which the DE-owned console does not
+# surface to serial — so those rungs are not yet captured here even though
+# connect is proven. Surfacing the enumerate/commit markers at WARN (or
+# routing the child's stdout to serial) is the next visibility lift.
 if [ "$loaded" -eq 1 ]; then
-    echo "$TAG SKIP: real libwayland client RUNS past ld.so (old SMAP hang cleared); NEXT GATE = entering it after the DE session is fully up wedges the whole kernel before its first syscall (heartbeat stops; ~2GiB free, not OOM). See verdict comment." >&2
+    echo "$TAG SKIP: real libwayland client loaded + ran past ld.so, but the connect marker did not appear this window (INFO-suppressed? re-run)." >&2
 else
     echo "$TAG SKIP: real libwayland client did not load this boot window." >&2
 fi
