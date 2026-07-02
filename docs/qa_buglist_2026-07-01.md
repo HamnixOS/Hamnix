@@ -368,6 +368,18 @@ is spec'd as `` `{ … }` `` (HAMSH_SPEC §8), NOT POSIX `$(…)`.
   re-characterize via a script file, not serial-typed backticks.
 - RETRACTED: "globbing broken" — globbing works (`/d*`→`/dev`).
 
+## Interactive END-USER push #4 (orchestrator, 2026-07-01) — hamsh control-flow
+NO BUGS — all verified working: `try {…} except {…}` catches errors (`nonexistcmd`
+→ CAUGHT); `break` (for-loop stops after first); `continue` (while skips the
+matched iter); numeric `if $n == 3`; **function return value in `${ }`**
+(`def dbl(k){return $k+$k}; echo DBL_${ dbl(21) }`→`DBL_42`).
+**hamsh QA surface is now EXHAUSTED and clean**: assignment, `=`/`$`/glued fusion,
+if/elif/else, while, for (word-list+single+`$var`), def+call+return, try/except,
+break/continue, pipes, `>`/`>>`/`2>`, `&&`/`||`, globbing, `${expr}`, `` `{}` ``
+command-sub (spec'd), script files. A genuinely complete shell. Residual gaps are
+only the minor QA-N21 (POSIX `$()` alias). Further QA needs reliable input
+injection (DE-app FUNCTION, installer-wizard pages) — the QA-N3b tooling gap.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
