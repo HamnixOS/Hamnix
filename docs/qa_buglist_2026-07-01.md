@@ -464,14 +464,17 @@ HMP 1px-step mouse. NO new bugs — solid:
   suspected fork+exec-storm deadlock is exactly this). Unblocks the Phase-4b weston
   connect retest → render → XWayland → Firefox.
 
-- [~] **QA-N29** (HIGH — weston-terminal render blocker + general) — a `forkpty()`
-  shell child takes an NX exec-fault SIGSEGV (code=139) on `execve`, landing on a
-  user-stack VA (~0x1c00fxxxx). Linux-ABI execve-in-forked-child entry-frame bug
-  (fork/rfork-child RSP-reconstruction lineage; see memory
-  project_kernel_vs_installer_heartbeat_divergence). Blocks any fork+execve /
-  forkpty program (shells, terminals). Agent #47. Preserve the do_execve
-  serialization + concurrent-execve protection (f404c73c) — a wrong do_execve change
-  wedged boot before.
+- [x] **QA-N29** (HIGH — weston-terminal render blocker + general) — FIXED 4dc4ef81 +
+  verified. Premise was WRONG (not an execve entry-frame bug — the execve machinery is
+  sound; code=139 was a misattribution). REAL cause: `_u_ioctl` returned `-ENOSYS` for
+  **TIOCSCTTY (0x540E)**. glibc's `login_tty()` — the heart of `forkpty(3)`/openpty
+  (every terminal emulator, `script`, sshd login, weston-terminal) — does `setsid()` +
+  `ioctl(slave, TIOCSCTTY)`; on ENOSYS it bails and the forkpty child `_exit(1)`s
+  BEFORE execve → shell never runs → weston-terminal gets no PTY → exits. Fix: accept
+  TIOCSCTTY + TIOCNOTTY as no-op `return 0` (matches Hamnix's single-session model —
+  setsid/setpgid/TIOCSPGRP already no-op). Surgical/additive; does NOT touch do_execve.
+  Verified: forkpty repro child now reaches execve + runs; test_httpd_concurrent -smp 2
+  4/4; test_smp_de_runlevel5 PASS; KVM DE rl5 PASS.
 - [x] **QA-N30** (ext4) — FIXED ac2ff3f1 + boot-verified. NOT the distrofs daemon —
   the live root is `#distro` ext4. `ext4_alloc_inode` scanned ONLY block group 0's
   inode bitmap → "no free inode in group 0" ENOSPC the instant group 0 filled (a
