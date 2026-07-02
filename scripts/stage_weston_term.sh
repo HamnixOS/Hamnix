@@ -181,6 +181,31 @@ cat > "$ROOTFS/etc/fonts/fonts.conf" <<'EOF'
 </fontconfig>
 EOF
 
+# PRE-BUILD the fontconfig cache into the rootfs. weston-terminal's FIRST
+# font use (cairo_select_font_face in terminal_create) triggers FcInit ->
+# a full font-dir SCAN (FcFreeTypeQuery on every TTF) + a cache WRITE guarded
+# by fontconfig's file-locking. Under the Linux-ABI that build-and-lock path
+# HANGS SILENTLY: the terminal maps its xdg_toplevel but never reaches the
+# forkpty/first-render, so no shm buffer is ever committed. Priming the cache
+# on the host (same libfontconfig version staged into the rootfs, so the
+# cache-format version matches) with --sysroot keys the cache to the GUEST-
+# absolute font paths and lets the in-guest fontconfig hit a ready cache
+# instead of scanning+writing. Best-effort: a missing host fc-cache just
+# falls back to the (hanging) runtime build, so warn loudly.
+if command -v fc-cache >/dev/null 2>&1; then
+    rm -f "$ROOTFS/var/cache/fontconfig"/*.cache-* 2>/dev/null || true
+    fc-cache --sysroot="$ROOTFS" -f >/dev/null 2>&1 || true
+    if ls "$ROOTFS/var/cache/fontconfig"/*.cache-* >/dev/null 2>&1; then
+        echo "[stage-weston] primed fontconfig cache ($(ls "$ROOTFS/var/cache/fontconfig"/*.cache-* | wc -l) files)"
+    else
+        echo "[stage-weston] WARNING: fc-cache produced no cache — runtime font"
+        echo "[stage-weston]   scan may HANG weston-terminal before it renders."
+    fi
+else
+    echo "[stage-weston] WARNING: host fc-cache absent — cannot prime fontconfig"
+    echo "[stage-weston]   cache; weston-terminal may HANG in font setup at runtime."
+fi
+
 # --- 3b. XKB keymap data ----------------------------------------------
 # libxkbcommon's xkb_context_new adds /usr/share/X11/xkb as its default
 # include path and FAILS (returns NULL) if it is absent — weston-terminal's
@@ -193,6 +218,34 @@ if [ -d "$WSROOT/usr/share/X11/xkb" ]; then
     echo "[stage-weston] staged xkb-data (/usr/share/X11/xkb)"
 else
     echo "[stage-weston] WARNING: xkb-data not found (weston-terminal XKB will fail)"
+fi
+
+# weston-terminal draws its OWN client-side window decorations (titlebar +
+# min/max/close buttons) via toytoolkit's frame_create(), which loads button
+# icon PNGs from $DATADIR/weston/ (compiled DATADIR=/usr/share) with
+# cairo_image_surface_create_from_png(). If those PNGs are absent,
+# frame_button_create() returns NULL -> frame_create() returns NULL ->
+# window_frame_create() returns NULL -> terminal->widget = NULL ->
+# widget_set_transparent(terminal->widget, 0) DEREFS NULL and the client
+# SIGSEGVs (write to NULL+0x138) in terminal_create(), BEFORE it ever maps a
+# window (display_run never runs, so the queued xdg_surface/toplevel/commit
+# requests are never flushed to the server). Stage the decoration icon set
+# (icon_window/sign_close/sign_maximize/sign_minimize + the rest of the small
+# UI PNGs) so the frame builds and the terminal maps + renders.
+if [ -d "$WSROOT/usr/share/weston" ]; then
+    mkdir -p "$ROOTFS/usr/share/weston"
+    # Copy only the small UI PNGs the decoration path needs; skip the large
+    # background/wallpaper assets (background.png ~132 KiB etc.) to keep the
+    # ESP FAT under its ceiling. The decoration icons are all < 4 KiB.
+    for p in icon_window sign_close sign_maximize sign_minimize \
+             icon_terminal terminal home; do
+        s="$WSROOT/usr/share/weston/$p.png"
+        [ -f "$s" ] && install -D -m0644 "$s" "$ROOTFS/usr/share/weston/$p.png"
+    done
+    echo "[stage-weston] staged weston decoration icons (/usr/share/weston/*.png)"
+else
+    echo "[stage-weston] WARNING: /usr/share/weston not found — client-side"
+    echo "[stage-weston]   decorations will fail and weston-terminal will SIGSEGV."
 fi
 
 echo "[stage-weston] DONE. rootfs now carries weston-terminal + closure + fonts."
