@@ -271,5 +271,19 @@ if [ "$committed" -eq 1 ] && [ "${RENDER_OK:-0}" = "1" ]; then
     echo "$TAG RESULT: PARTIAL — weston-terminal rendered but typed-echo proof inconclusive (see $PNG_B)." >&2
     exit 0
 fi
-echo "$TAG SKIP/PARTIAL: weston-terminal did not commit an shm buffer this window (re-run)." >&2
+# NEXT-GATE diagnostic: report how far the real client got via the WARN
+# xdg-shell trace markers the server emits (linux_abi/wayland.ad). As of
+# this writing weston-terminal CONNECTS + enumerates globals (incl.
+# wl_output) — "[wayland] registry advertised: ... wl_output" fires — but
+# STALLS before "[wayland] xdg get_xdg_surface", i.e. it never maps a
+# window. The blocker is CLIENT-SIDE, between a successful wl_display
+# connect and window_create (toytoolkit display_create roundtrips /
+# terminal_create), NOT the native wayland protocol. To pin it, capture
+# weston-terminal's OWN stderr (it rides the DE console, not serial) — e.g.
+# run it under `enter linux { /bin/sh -c '/usr/bin/weston-terminal
+# 2>/some/file' }` and read the file back.
+echo "$TAG SKIP/PARTIAL: weston-terminal did not commit an shm buffer." >&2
+echo "$TAG   Trace check: registry-advertised(+wl_output) reached; if" >&2
+echo "$TAG   'xdg get_xdg_surface' is absent the stall is client-side" >&2
+echo "$TAG   pre-window setup (display_create roundtrip / terminal_create)." >&2
 exit 0
