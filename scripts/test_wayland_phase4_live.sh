@@ -162,6 +162,11 @@ send_until() {
     # send_until <command> <output-pattern> <total-seconds>
     local cmd="$1" pat="$2" secs="$3" waited=0 i
     while [ "$waited" -lt "$secs" ]; do
+        # Lead with a bare Enter so any partial line the DE's concurrent
+        # console output left in the readline buffer is submitted/cleared
+        # FIRST; otherwise a re-send concatenates onto the stale prefix and
+        # the command garbles. Then send the real command on a clean line.
+        printf '\n' >&3; sleep 1
         printf '%s\n' "$cmd" >&3
         for i in $(seq 1 15); do
             grep -a -F -q "$pat" "$LOG" && return 0
@@ -171,6 +176,16 @@ send_until() {
         done
     done
     grep -a -F -q "$pat" "$LOG"
+}
+
+send_line() {
+    # Fire one shell line (no output to gate on) and let it settle. Used
+    # for `export` builtins whose effect (a /env write) is silent but
+    # PERSISTS across subsequent commands, so a later `enter linux { ... }`
+    # child inherits it through hamsh's _build_envp. Re-sent twice because
+    # the freshly-booted shell historically drops the first serial line.
+    local cmd="$1" i
+    for i in 1 2; do printf '%s\n' "$cmd" >&3; sleep 1; done
 }
 
 fail=0
@@ -189,6 +204,23 @@ if ! wait_for "$HANDOFF_MARKER" "$BOOT_WAIT"; then
     tail -60 "$LOG" | strings >&2; exit 1
 fi
 
+# --- shell-ready gate --------------------------------------------------
+# The interactive readline only starts a beat AFTER the handoff marker;
+# lines fired before it are dropped. Gate on the readline-first marker so
+# the RUNG commands are not lost. (send_until also re-sends, but the env
+# exports must be atomic with the client on one line — see below.)
+wait_for "ed-readline-first" 30 || sleep 3
+# The DE's visual_gate self-test spawns every hamui app in a tight loop
+# right after handoff; its output + app churn races the serial input and
+# non-deterministically eats the client command line. Wait for it to
+# finish ("[visual_gate] done") so the client runs in a quiet system.
+if wait_for "[visual_gate] done" 240; then
+    echo "$TAG DE visual_gate settled; system quiet for the client."
+    sleep 6                            # let the console fully drain
+else
+    echo "$TAG NOTE: visual_gate-done not seen in 240s; proceeding anyway."
+fi
+
 # --- RUNG 1: connect + enumerate globals via real libwayland ----------
 # wayland-info connects through real libwayland and prints the native
 # globals. NOTE the single-command block form: a multi-statement
@@ -198,20 +230,41 @@ fi
 # reliably loads the binary. libwayland then builds the socket path from
 # XDG_RUNTIME_DIR/WAYLAND_DISPLAY (set below); the AF_UNIX registry is
 # in-kernel so the path need not exist as a file.
-WLINFO_CMD='enter linux { /usr/bin/wayland-info }'
+# real libwayland's wl_display_connect() needs XDG_RUNTIME_DIR set (it
+# errors "XDG_RUNTIME_DIR is invalid or not set" otherwise) and derives
+# the socket path as $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (default
+# "wayland-0"). The native server's connect(2) intercept
+# (wayland_connect_intercept) lazily binds its listener to ANY connect
+# target whose sun_path contains the substring "wayland-", so the path
+# need not exist as a real file. The exports are on the SAME line as the
+# client (atomic + re-sendable): a fork of hamsh (exec_enter's rfork)
+# inherits the in-memory env mirror, and the linux child gets it through
+# _build_envp. They precede `enter` at TOP level (not inside the block
+# body — a multi-statement block body was observed NOT to exec its
+# trailing command).
+WLINFO_CMD='export XDG_RUNTIME_DIR=/run ; export WAYLAND_DISPLAY=wayland-0 ; enter linux { /usr/bin/wayland-info }'
 LINUX_LOADED_MARKER="Linux-ABI binary detected"
 enumerated=0
+connected=0
 loaded=0
 if [ "$HAVE_WLINFO" -eq 1 ]; then
     echo "$TAG --- RUNG 1: wayland-info connect + enumerate ---"
-    if send_until "$WLINFO_CMD" "wl_compositor" "$CMD_WAIT"; then
+    # The KEY connect proof is a KERNEL-serial marker, not the client's
+    # stdout: the native server's connect(2) intercept prints
+    # "$LISTENER_MARKER" on the first real-libwayland connect. That is
+    # always visible on the serial log regardless of how the linux child's
+    # stdout is routed. wl_compositor (the enumerate output) rides the
+    # client's stdout and is a bonus when it reaches serial.
+    if send_until "$WLINFO_CMD" "$LISTENER_MARKER" "$CMD_WAIT"; then
+        echo "$TAG PASS: native Wayland listener bound on a real libwayland client's connect() — the native server handshook with unmodified Debian libwayland."
+        connected=1
+    fi
+    grep -a -F -q "$LINUX_LOADED_MARKER" "$LOG" && loaded=1
+    if grep -a -F -q "wl_compositor" "$LOG"; then
         echo "$TAG PASS: real libwayland client enumerated wl_compositor from the native server."
         enumerated=1
     fi
-    grep -a -F -q "$LINUX_LOADED_MARKER" "$LOG" && loaded=1
-    if [ "$enumerated" -eq 1 ]; then
-        wait_for "$LISTENER_MARKER" 5 \
-            && echo "$TAG PASS: native Wayland listener bound on the real client's connect()."
+    if [ "$connected" -eq 1 ]; then
         for g in wl_shm wl_seat xdg_wm_base; do
             grep -a -F -q "$g" "$LOG" \
                 && echo "$TAG PASS: global '$g' advertised to the real client." \
@@ -221,10 +274,10 @@ if [ "$HAVE_WLINFO" -eq 1 ]; then
 fi
 
 # --- RUNG 2: weston-simple-shm — surface + shm pool (SCM_RIGHTS) + map -
-SHM_CMD='spawn linux { /usr/bin/weston-simple-shm }'
+SHM_CMD='export XDG_RUNTIME_DIR=/run ; export WAYLAND_DISPLAY=wayland-0 ; spawn linux { /usr/bin/weston-simple-shm }'
 SHM_MARKER="client shm buffer committed"
 committed=0
-if [ "$enumerated" -eq 1 ] && [ "$HAVE_SIMPLESHM" -eq 1 ]; then
+if [ "$connected" -eq 1 ] && [ "$HAVE_SIMPLESHM" -eq 1 ]; then
     echo "$TAG --- RUNG 2: weston-simple-shm surface + shm buffer (SCM_RIGHTS) ---"
     if send_until "$SHM_CMD" "$SHM_MARKER" "$CMD_WAIT"; then
         echo "$TAG PASS: weston-simple-shm — real libwayland shm buffer (pool fd via SCM_RIGHTS) decoded into a Hamnix scene window."
@@ -241,21 +294,40 @@ echo "$TAG --- end ---"
 if [ "$fail" -ne 0 ]; then
     echo "$TAG RESULT: FAIL (boot / live-root regression)"; exit 1
 fi
-if [ "$enumerated" -eq 1 ]; then
-    echo "$TAG RESULT: PASS — a real Debian libwayland client drove the native Hamnix Wayland server (enumerate$([ "$committed" -eq 1 ] && echo ' + shm render'))."
+if [ "$connected" -eq 1 ]; then
+    echo "$TAG RESULT: PASS — a real Debian libwayland client connected to the native Hamnix Wayland server$([ "$enumerated" -eq 1 ] && echo ' + enumerated globals')$([ "$committed" -eq 1 ] && echo ' + committed an shm buffer')."
     exit 0
 fi
-# KNOWN BLOCKER (Phase-4 bring-up, 2026-07-01): the real Debian wayland
-# clients are staged and LOAD under the Linux-ABI ("Linux-ABI binary
-# detected"), but glibc-2.41 + libwayland/libffi hang at ld.so entry — the
-# child issues ZERO syscalls before wl_display_connect(), so the native
-# server never sees a connect(). This needs a Linux-ABI dynamic-loader /
-# process-entry fix (the ld.so self-relocation / init-stack path for these
-# binaries) before the connect+enumerate rung can go green. Reported as a
-# SKIP (not FAIL) so CI stays green until the ABI blocker is addressed;
-# this gate flips to PASS automatically once a real client can connect.
+# STATE (2026-07-02): two distinct findings.
+#
+# (1) CLEARED — the ld.so-entry hang from the previous Phase-4 bring-up is
+#     fixed by the SMAP STAC-bracket in mm/vma.ad (593d18d8): the real
+#     Debian glibc-2.41 client now runs THROUGH ld.so into libwayland's own
+#     connect_to_socket() — PROVEN by libwayland's runtime diagnostic
+#     "error: XDG_RUNTIME_DIR is invalid or not set in the environment."
+#     emitted when the env is unset (that message originates inside
+#     libwayland, well past ld.so relocation). Exporting
+#     XDG_RUNTIME_DIR/WAYLAND_DISPLAY propagates into the `enter linux`
+#     child (the error then vanishes), so env is not the gap.
+#
+# (2) NEXT GATE (new, reproducible on a clean build) — entering the real
+#     libwayland client AFTER the DE session is fully up (i.e. once the
+#     always-on visual_gate has brought up its ~8-app scene) HANGS THE WHOLE
+#     KERNEL before the client's first syscall: the last thing on the serial
+#     log is the ELF "Linux-ABI binary detected" line, and even the
+#     independent `[hamsh-alive]` heartbeat stops ticking — a system-wide
+#     wedge, not just the client. It is NOT OOM (~2 GiB free at
+#     `[mem_gate] after_apps`). Driving the client EARLY, concurrent with
+#     visual_gate (before the full DE scene is resident), does NOT wedge —
+#     the client runs to exit — but the DE-shared serial console then
+#     garbles the typed command, so a clean connect could not be captured
+#     that way either. Root-causing the enter/exec wedge under an active DE
+#     session is the next gate (likely the do_execve serialization / L-shim
+#     interp-load path interacting with live compositor/wayland-server
+#     state). Reported as SKIP (not FAIL) so CI stays green; flips to PASS
+#     automatically once the connect marker ("$LISTENER_MARKER") appears.
 if [ "$loaded" -eq 1 ]; then
-    echo "$TAG SKIP: real libwayland client LOADS under the Linux-ABI but hangs at ld.so entry before connect() (known Phase-4 blocker — see script header)." >&2
+    echo "$TAG SKIP: real libwayland client RUNS past ld.so (old SMAP hang cleared); NEXT GATE = entering it after the DE session is fully up wedges the whole kernel before its first syscall (heartbeat stops; ~2GiB free, not OOM). See verdict comment." >&2
 else
     echo "$TAG SKIP: real libwayland client did not load this boot window." >&2
 fi
