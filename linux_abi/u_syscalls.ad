@@ -450,6 +450,7 @@ from linux_abi.u_unixsock import (
     afunix_sendto, afunix_recvfrom, afunix_dgram_can_read,
     afunix_socketpair, afunix_close, afunix_get_type,
     afunix_fdbuf_for_ep, afunix_ep_for_fdbuf,
+    afunix_ep_connected, afunix_rx_count,
     AFU_AF_UNIX, AFU_SOCK_STREAM, AFU_SOCK_DGRAM, AFU_EAGAIN,
     # §SCM_RIGHTS ancillary-fd conduit (sendmsg/recvmsg fd passing).
     afunix_scm_send, afunix_scm_recv, afunix_scm_pending,
@@ -1243,6 +1244,7 @@ SYS_madvise:         uint64 = 28
 SYS_getrusage:       uint64 = 98
 SYS_times:           uint64 = 100
 SYS_fadvise64:       uint64 = 221
+SYS_fallocate:       uint64 = 285
 SYS_pselect6:        uint64 = 270
 SYS_move_pages:      uint64 = 277
 SYS_statx:           uint64 = 332
@@ -3805,6 +3807,36 @@ def _u_ftruncate(a0: uint64, a1: uint64, a2: uint64,
     return cast[int64](rc)
 
 
+def _u_fallocate(a0: uint64, a1: uint64, a2: uint64,
+                 a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int fallocate(int fd, int mode, off_t offset, off_t len)
+    #
+    # Only the DEFAULT allocation mode (mode 0: reserve blocks + extend
+    # the file to offset+len if that grows it) is modelled — that is what
+    # glibc's posix_fallocate(3) issues, which real Wayland clients
+    # (weston-simple-shm's os_create_anonymous_file) use to size their
+    # wl_shm memfd pool. Without this the syscall fell through to -ENOSYS
+    # and the client aborted with "creating a buffer file failed:
+    # Function not implemented" right before its first commit.
+    #
+    # fallocate MUST NOT shrink: query the current size via SEEK_END and
+    # only grow. A memfd sealed F_SEAL_SHRINK still permits growth, so
+    # weston's freshly-created size-0 pool truncates up cleanly.
+    fd: int32 = cast[int32](a0)
+    offset: uint64 = a2
+    length: uint64 = a3
+    if length == 0:
+        return 0
+    newsize: uint64 = offset + length
+    cur: int64 = vfs_lseek(fd, 0, 2)          # SEEK_END
+    if cur >= 0 and cast[uint64](cur) >= newsize:
+        return 0                              # already big enough
+    rc: int32 = vfs_ftruncate(fd, newsize)
+    if rc < 0:
+        return cast[int64](rc)
+    return 0
+
+
 # --- extended attributes (xattr) ----------------------------------
 #
 # Linux's {l,f}{set,get,list,remove}xattr family routed to the ext4
@@ -5807,8 +5839,16 @@ def _u_recvmsg(a0: uint64, a1: uint64, a2: uint64,
     # without an intervening flush still sees pending events.
     wayland_pump()
     # Block until data is readable OR a passed fd is pending OR EOF,
-    # unless the fd is non-blocking.
+    # unless the fd is non-blocking. A recvmsg with MSG_DONTWAIT (0x40)
+    # in `flags` (a2) is per-CALL non-blocking even when the fd itself
+    # was never fcntl'd O_NONBLOCK — real libwayland's wl_connection_read
+    # relies on the MSG_DONTWAIT flag (NOT an O_NONBLOCK fd) to probe the
+    # socket, so ignoring it makes libwayland's post-read drain probe
+    # BLOCK forever and wedges every real Wayland client right after it
+    # reads the first roundtrip reply.
     nb: int32 = _u_fd_is_nonblock(fd)
+    if (a2 & 0x40) != 0:
+        nb = 1
     while afunix_can_read(uxep) == 0:
         if afunix_scm_pending(uxep) > 0:
             break                                   # fds arrived without data
@@ -5920,6 +5960,27 @@ def _u_poll_fd_revents(fd: int32, events: uint32) -> uint32:
         ready = POLLOUT_BIT
         if nl_can_read(pf_nlep) != 0:
             ready = ready | POLLIN_BIT
+    # AF_UNIX stream: readiness comes from the afunix endpoint's rx ring
+    # (u_unixsock.ad), NOT the TCP/usock record the DEV_SOCKET vfs arm
+    # decodes. An AF_UNIX fd_buf carries the AFU_FDBUF_TAG, so
+    # usock_record_for_fdbuf yields a bogus (non-negative) record and
+    # vfs_fd_poll's socket arm can NEVER report POLLIN for it — which
+    # wedges every real libwayland client: it polls its display fd for
+    # POLLIN after get_registry and blocks forever because the queued
+    # reply (globals + wl_callback.done) is invisible to poll. Answer
+    # AF_UNIX readiness here in the Layer-2 shim (where afunix is
+    # visible), mirroring the recvmsg model. Pump the in-kernel Wayland
+    # server first so a client polling for the next protocol event
+    # (registry globals, xdg configure, frame callback, routed input)
+    # sees bytes the server just produced.
+    pf_uxep: int32 = _u_afunix_ep(fd)
+    if pf_uxep >= 0:
+        wayland_pump()
+        ready = POLLOUT_BIT                  # afunix tx never blocks here
+        if afunix_can_read(pf_uxep) != 0:
+            ready = ready | POLLIN_BIT
+        if afunix_ep_connected(pf_uxep) == 0 and afunix_rx_count(pf_uxep) == 0:
+            ready = ready | POLLHUP_BIT
     # The bits the caller may request (POLLIN/PRI/OUT) are masked by
     # `events`; the error bits always pass through.
     requestable: uint32 = events | POLLERR_BIT | POLLHUP_BIT \
@@ -17075,6 +17136,8 @@ def _linux_u_syscall_dispatch_inner(nr: uint64,
         return _u_truncate(a0, a1, a2, a3, a4, a5)
     if nr == SYS_ftruncate:
         return _u_ftruncate(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_fallocate:
+        return _u_fallocate(a0, a1, a2, a3, a4, a5)
     if nr == SYS_setxattr:
         return _u_setxattr(a0, a1, a2, a3, a4, a5)
     if nr == SYS_lsetxattr:

@@ -275,7 +275,7 @@ fi
 
 # --- RUNG 2: weston-simple-shm — surface + shm pool (SCM_RIGHTS) + map -
 SHM_CMD='export XDG_RUNTIME_DIR=/run ; export WAYLAND_DISPLAY=wayland-0 ; spawn linux { /usr/bin/weston-simple-shm }'
-SHM_MARKER="client shm buffer committed"
+SHM_MARKER="shm buffer committed"
 committed=0
 if [ "$connected" -eq 1 ] && [ "$HAVE_SIMPLESHM" -eq 1 ]; then
     echo "$TAG --- RUNG 2: weston-simple-shm surface + shm buffer (SCM_RIGHTS) ---"
