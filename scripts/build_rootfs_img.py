@@ -810,6 +810,21 @@ def _stage_directory_live(staging: Path):
     distro = staging / "distro"
     distro.mkdir(parents=True, exist_ok=True)
     _stage_distro(distro, live=True)
+    # Re-plant the runtime/scratch mounts that FULL_DEBIAN_PRUNE strips, as
+    # EMPTY world-writable (mode 1777, sticky) dirs. On a normal Debian these
+    # are tmpfs mount points; here the live root is the only writable fs, so a
+    # regular-user client needs them present + writable: /run is
+    # XDG_RUNTIME_DIR (weston-terminal os_create_anonymous_file fallback, the
+    # wl socket dir), /tmp is scratch, /var/cache holds the fontconfig cache
+    # fallback. Without these, `mkdir -p /run/...` fails ENOENT and
+    # XDG_RUNTIME_DIR points at a non-existent dir.
+    for rel in ("run", "run/fontconfig", "tmp", "var/cache",
+                "var/cache/fontconfig"):
+        d = distro / rel
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o1777)
+    print("[build_rootfs_img] planted writable runtime dirs "
+          "(/run,/tmp,/var/cache; mode 1777) into live distro/", flush=True)
     sentinel = staging / ".hamnix-roots"
     sentinel.write_text("distro    distro\n", encoding="ascii")
     print("[build_rootfs_img] planted LIVE .hamnix-roots sentinel "
@@ -896,10 +911,22 @@ def _pick_size_mb(staging_bytes: int, live: bool = False) -> int:
                 f"HAMNIX_ROOTFS_SIZE_MB={raw!r}: must be an integer")
     staged_mib = (staging_bytes + (1 << 20) - 1) // (1 << 20)
     if live:
-        # Live image is extracted to a RAM block device at boot — every
-        # MiB here is boot RAM. Keep ext4-metadata + writable-scratch
-        # headroom tight: +16 MiB metadata, +16 MiB scratch, floor 48.
-        size_mib = staged_mib + 16 + 16
+        # Live image is extracted to a RAM block device at boot, so every
+        # MiB here is boot RAM — but the live root is the ONLY writable
+        # filesystem a live-session process sees, and REGULAR-user clients
+        # (the DE terminal + weston-terminal run as uid 1001) need real
+        # writable scratch: fontconfig cache refresh, ~/.config, per-app
+        # runtime state, XDG_RUNTIME_DIR, /tmp. The old +16 MiB scratch left
+        # only ~12 MiB free — BELOW the 5% reserved-block floor — so every
+        # regular-user write failed ENOSPC. Give a comfortable scratch
+        # margin (default 128 MiB; override via HAMNIX_LIVE_SCRATCH_MB) on
+        # top of +16 MiB ext4 metadata. Combined with mkfs `-m 0` (below)
+        # this makes the whole margin usable by non-root clients.
+        try:
+            scratch = int(os.environ.get("HAMNIX_LIVE_SCRATCH_MB", "128"))
+        except ValueError:
+            scratch = 128
+        size_mib = staged_mib + 16 + scratch
         return max(size_mib, 48)
     # Auto-size: staging bytes + 64 MiB ext4 metadata + 32 MiB future
     # apt-install scratch headroom. Floor at 96 MiB so an empty image
@@ -947,12 +974,22 @@ def build_image(out_path: Path) -> Path:
         # -O ^huge_file:    don't need >2 TiB files
         # -O ^metadata_csum:fs/ext4.ad doesn't validate CRCs (yet)
         # -E packed_meta_blocks=1: compact metadata at the front
+        # -m 0 (live only): the default 5% reserved-block pool is a root-
+        #   only reserve that would make the ENTIRE scratch margin invisible
+        #   to the regular-user live clients (weston-terminal/DE terminal run
+        #   as uid 1001) — every non-root write would ENOSPC. The live image
+        #   is a throwaway RAM root, so reserve nothing and hand the full
+        #   free margin to non-root writers.
         cmd = [
             mkfs,
             "-F",
             "-L", "hamnix-rootfs",
             "-O", "^has_journal,^huge_file,^metadata_csum",
             "-E", "packed_meta_blocks=1",
+        ]
+        if live:
+            cmd += ["-m", "0"]
+        cmd += [
             "-d", str(staging),
             str(out_path),
         ]

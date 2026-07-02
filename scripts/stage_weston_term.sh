@@ -167,12 +167,38 @@ fi
 
 # Minimal fontconfig: a <dir> for our TTF, a writable cache dir, and a
 # generic monospace alias so weston-terminal's default face resolves.
-mkdir -p "$ROOTFS/etc/fonts" "$ROOTFS/var/cache/fontconfig"
+#
+# CACHEDIR ORDER MATTERS. fontconfig walks <cachedir> entries in order and
+# needs at least ONE that (a) SHIPS a valid prebuilt cache so the first font
+# use does NOT trigger a full font-dir scan (which HANGS under the Linux-ABI,
+# see below), and (b) is WRITABLE at runtime, or FcInit warns "Fontconfig
+# error: No writable cache directories" and weston-terminal aborts (exit 1)
+# BEFORE it rasterizes a single glyph / attaches a render buffer. The earlier
+# config listed ONLY /var/cache/fontconfig (no prebuilt cache, no writable
+# dir) and had NO <cachedir prefix="xdg"> entry, so setting XDG_CACHE_HOME had
+# no effect — the error persisted.
+#
+# CRUCIAL: build_rootfs_img.py's FULL_DEBIAN_PRUNE strips /run, /tmp AND
+# /var/cache from the live image, so a prebuilt cache staged under either of
+# those is DROPPED and never reaches the guest, and /run does not even exist
+# at boot. Therefore the FIRST cachedir is /etc/fonts/cache — /etc is NOT
+# pruned, so the prebuilt cache SHIPS, and the live root is a RAM-backed ext4
+# so /etc/fonts/cache is also WRITABLE at runtime (fontconfig can refresh it).
+# /run/fontconfig follows (the launch wrapper mkdir's it — `/` is writable so
+# `mkdir -p /run/fontconfig` succeeds even though /run was pruned), then the
+# xdg-prefixed dir (honours XDG_CACHE_HOME=/run/fontconfig), then
+# /var/cache/fontconfig as a legacy fallback.
+mkdir -p "$ROOTFS/etc/fonts/cache" "$ROOTFS/var/cache/fontconfig" \
+         "$ROOTFS/run/fontconfig"
+chmod 0777 "$ROOTFS/etc/fonts/cache" "$ROOTFS/run/fontconfig" 2>/dev/null || true
 cat > "$ROOTFS/etc/fonts/fonts.conf" <<'EOF'
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
 <fontconfig>
   <dir>/usr/share/fonts</dir>
+  <cachedir>/etc/fonts/cache</cachedir>
+  <cachedir>/run/fontconfig</cachedir>
+  <cachedir prefix="xdg">fontconfig</cachedir>
   <cachedir>/var/cache/fontconfig</cachedir>
   <alias><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>
   <alias><family>sans-serif</family><prefer><family>DejaVu Sans</family></prefer></alias>
@@ -193,10 +219,27 @@ EOF
 # instead of scanning+writing. Best-effort: a missing host fc-cache just
 # falls back to the (hanging) runtime build, so warn loudly.
 if command -v fc-cache >/dev/null 2>&1; then
-    rm -f "$ROOTFS/var/cache/fontconfig"/*.cache-* 2>/dev/null || true
+    rm -f "$ROOTFS/etc/fonts/cache"/*.cache-* \
+          "$ROOTFS/run/fontconfig"/*.cache-* \
+          "$ROOTFS/var/cache/fontconfig"/*.cache-* 2>/dev/null || true
+    # fc-cache --sysroot writes to the FIRST writable <cachedir> in the
+    # staged fonts.conf = /etc/fonts/cache (which SHIPS; /run + /var/cache are
+    # pruned from the live image). The cache is keyed to the GUEST-absolute
+    # font paths (/usr/share/fonts/...).
     fc-cache --sysroot="$ROOTFS" -f >/dev/null 2>&1 || true
-    if ls "$ROOTFS/var/cache/fontconfig"/*.cache-* >/dev/null 2>&1; then
-        echo "[stage-weston] primed fontconfig cache ($(ls "$ROOTFS/var/cache/fontconfig"/*.cache-* | wc -l) files)"
+    # Belt + suspenders: mirror the primed cache into the other cachedirs too
+    # (harmless — /run + /var/cache are pruned at image-build, but keeping the
+    # copies makes a direct rootfs boot / a future un-pruned build work too).
+    PRIMED_DIR=""
+    for d in "$ROOTFS/etc/fonts/cache" "$ROOTFS/run/fontconfig" "$ROOTFS/var/cache/fontconfig"; do
+        if ls "$d"/*.cache-* >/dev/null 2>&1; then PRIMED_DIR="$d"; break; fi
+    done
+    if [ -n "$PRIMED_DIR" ]; then
+        for d in "$ROOTFS/etc/fonts/cache" "$ROOTFS/run/fontconfig" "$ROOTFS/var/cache/fontconfig"; do
+            [ "$d" = "$PRIMED_DIR" ] && continue
+            cp -f "$PRIMED_DIR"/*.cache-* "$d/" 2>/dev/null || true
+        done
+        echo "[stage-weston] primed fontconfig cache ($(ls "$PRIMED_DIR"/*.cache-* | wc -l) files from $PRIMED_DIR; mirrored to all cachedirs)"
     else
         echo "[stage-weston] WARNING: fc-cache produced no cache — runtime font"
         echo "[stage-weston]   scan may HANG weston-terminal before it renders."

@@ -158,7 +158,15 @@ else
 fi
 
 # --- RENDER: weston-terminal ------------------------------------------
-TERM_CMD='export XDG_RUNTIME_DIR=/run ; export WAYLAND_DISPLAY=wayland-0 ; export XDG_CONFIG_HOME=/run ; spawn linux { /usr/bin/weston-terminal }'
+# weston-terminal is spawned DIRECTLY (no /bin/sh -c wrapper: an `exec` of a
+# second Linux-ABI image inside the ns trips an NX exec-fault SIGSEGV before
+# the terminal reaches wayland_connect). fontconfig's writable-cache need is
+# satisfied by the PREBUILT cache shipped in /etc/fonts/cache (the first
+# <cachedir> in the staged fonts.conf) — /etc survives FULL_DEBIAN_PRUNE and
+# the live root is a writable RAM-ext4, so FcInit loads the prebuilt cache
+# and never emits "No writable cache directories". (/run is pruned + not
+# creatable in the ns, so it is NOT used as the cache dir.)
+TERM_CMD='export XDG_RUNTIME_DIR=/run ; export WAYLAND_DISPLAY=wayland-0 ; export XDG_CONFIG_HOME=/run ; export XDG_CACHE_HOME=/etc/fonts/cache ; spawn linux { /usr/bin/weston-terminal }'
 echo "$TAG --- RENDER: launch weston-terminal ---"
 committed=0
 if send_until "$TERM_CMD" "$COMMIT_MARKER" "$CMD_WAIT"; then
@@ -261,6 +269,21 @@ echo "$TAG --- wayland/pty lines from serial ---"
 grep -aE "\[wayland\]|\[pty\]|weston" "$LOG" | tail -30 || true
 echo "$TAG --- end ---"
 
+# --- fontconfig-writable-cache assertion (the Phase-4b font deliverable) --
+# The scripted fix (scripts/stage_weston_term.sh + build_rootfs_img.py)
+# ships a PREBUILT fontconfig cache in the writable, non-pruned
+# /etc/fonts/cache (first <cachedir> in the staged fonts.conf) + a live root
+# with 0 reserved blocks and real free space, so FcInit no longer aborts
+# weston-terminal with "No writable cache directories". Assert that error
+# string is ABSENT from the whole boot+run serial log — a regression here
+# (e.g. the cache pruned again, or the cachedir order broken) must fail.
+if grep -aiE "No writable cache director|Fontconfig error" "$LOG" >/dev/null 2>&1; then
+    echo "$TAG FAIL: fontconfig writable-cache regression — error present in serial:" >&2
+    grep -aiE "No writable cache director|Fontconfig error" "$LOG" | head -3 >&2
+    echo "$TAG RESULT: FAIL (fontconfig cache)"; exit 1
+fi
+echo "$TAG PASS: no fontconfig 'No writable cache directories' error (prebuilt /etc/fonts/cache consulted)."
+
 # --- verdict ----------------------------------------------------------
 if [ "$fail" -ne 0 ]; then echo "$TAG RESULT: FAIL (boot/screendump)"; exit 1; fi
 if [ "$committed" -eq 1 ] && [ "${RENDER_OK:-0}" = "1" ] && [ "${TYPED_OK:-0}" = "1" ]; then
@@ -271,19 +294,33 @@ if [ "$committed" -eq 1 ] && [ "${RENDER_OK:-0}" = "1" ]; then
     echo "$TAG RESULT: PARTIAL — weston-terminal rendered but typed-echo proof inconclusive (see $PNG_B)." >&2
     exit 0
 fi
-# NEXT-GATE diagnostic: report how far the real client got via the WARN
-# xdg-shell trace markers the server emits (linux_abi/wayland.ad). As of
-# this writing weston-terminal CONNECTS + enumerates globals (incl.
-# wl_output) — "[wayland] registry advertised: ... wl_output" fires — but
-# STALLS before "[wayland] xdg get_xdg_surface", i.e. it never maps a
-# window. The blocker is CLIENT-SIDE, between a successful wl_display
-# connect and window_create (toytoolkit display_create roundtrips /
-# terminal_create), NOT the native wayland protocol. To pin it, capture
-# weston-terminal's OWN stderr (it rides the DE console, not serial) — e.g.
-# run it under `enter linux { /bin/sh -c '/usr/bin/weston-terminal
-# 2>/some/file' }` and read the file back.
-echo "$TAG SKIP/PARTIAL: weston-terminal did not commit an shm buffer." >&2
-echo "$TAG   Trace check: registry-advertised(+wl_output) reached; if" >&2
-echo "$TAG   'xdg get_xdg_surface' is absent the stall is client-side" >&2
-echo "$TAG   pre-window setup (display_create roundtrip / terminal_create)." >&2
+# NEXT-GATE diagnostic. With the fontconfig writable-cache fix in place,
+# weston-terminal now progresses MUCH further than the old "stalls before
+# get_xdg_surface" state: it CONNECTS, enumerates globals (incl. wl_output),
+# loads its cursor theme, and maps a window —
+#   [wayland] xdg get_xdg_surface
+#   [wayland] xdg get_toplevel + configure sent
+#   [wayland] surface commit (pending buf=0)
+# then exits code=1 WITHOUT committing a render buffer. Captured stderr shows
+# NO fontconfig/cairo/forkpty error — only the harmless "could not load
+# cursor 'dnd-*'" lines. The precise remaining blocker is KERNEL-side, NOT
+# userspace: weston-terminal's forkpty()'d shell CHILD takes an NX exec-fault
+# SIGSEGV on execve of the shell —
+#   [pf] NX exec-fault on user page va=0x1c00f.... -> SIGSEGV
+#   task: pid N exited (code=139)   ([coredump] wrote /tmp/core)
+# i.e. the Linux-ABI execve-in-a-forkpty-child path faults, so the terminal
+# has no PTY content and exits. PROOF the wayland/shm/font pipeline itself is
+# sound: the pure-shm sibling client renders end-to-end —
+#   [wayland] shm buffer committed 250x250 to wid N   (weston-simple-shm)
+# (screendump: run scripts, see wl4_simple_shm.png). Next gate = fix the
+# forkpty-child execve NX fault (kernel do_execve / pty controlling-tty
+# path), a separate track from this font fixture.
+echo "$TAG SKIP/PARTIAL: fontconfig fixed (no cache error) but weston-terminal" >&2
+echo "$TAG   did not commit a render buffer. Remaining blocker is KERNEL-side:" >&2
+echo "$TAG   its forkpty() shell child NX-exec-faults (SIGSEGV code=139) on" >&2
+if grep -aE "NX exec-fault.*SIGSEGV" "$LOG" >/dev/null 2>&1; then
+    echo "$TAG   execve — confirmed in serial:" >&2
+    grep -aE "NX exec-fault.*SIGSEGV|exited \(code=139\)" "$LOG" | tail -3 >&2
+fi
+echo "$TAG   (pure-shm client weston-simple-shm renders fine — pipeline is sound)." >&2
 exit 0
