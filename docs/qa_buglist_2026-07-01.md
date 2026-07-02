@@ -448,6 +448,17 @@ HMP 1px-step mouse. NO new bugs — solid:
   green; KVM DE rl5 PASS. (The original `enter linux {…;cmd}` symptom was the
   ld.so hang QA-N26, now fixed — not hamsh.)
 
+- [~] **QA-N28** (HIGH — Firefox gate + stability) — `enter linux { <bin> }`
+  system-wide WEDGES the kernel when the DE session is fully up (visual_gate ~8
+  apps + wayland server live): serial stops at `elf: Linux-ABI binary detected`,
+  `[hamsh-alive]` heartbeat STOPS (whole box, not just client), NOT OOM (~2 GiB
+  free). Launching EARLY (before visual_gate done) runs to exit. So exec-under-live-DE
+  deadlocks. Lead: the do_execve global `_execve_lock` (f404c73c) vs live compositor/
+  wayland-server locks. Found in Phase-4b (the ld.so blocker QA-N26 is now cleared —
+  real wayland-info reaches libwayland connect). Agent #40 root-causing. Unblocks
+  weston connect→render→XWayland→Firefox + fixes launching any Linux binary from a
+  running desktop.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
