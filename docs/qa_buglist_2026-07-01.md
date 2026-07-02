@@ -380,6 +380,17 @@ command-sub (spec'd), script files. A genuinely complete shell. Residual gaps ar
 only the minor QA-N21 (POSIX `$()` alias). Further QA needs reliable input
 injection (DE-app FUNCTION, installer-wizard pages) — the QA-N3b tooling gap.
 
+## User hands-on findings (2026-07-01, live build) → fixes
+- [x] **QA-N23** (browser URL entry) — FIXED e99451b3. hambrowse now has an
+  editable URL/address bar (click to focus, type, Enter or "Go" button;
+  http/https/file/bare-host handled) + a `--url` launch arg. Keystrokes off
+  /dev/wsys/<wid>/keys (like hameditscene); feeds the existing fetch+render path;
+  address mirrors cur_url so link-click/--demo stay in sync; content shifted down
+  by the bar height. Verified KVM (`--url file:///tmp/t.html`→PASS, bar+page render).
+- [~] **QA-N22** (empty gray "Windows:" box) — agent #30 in flight.
+- [~] **QA-N24** (long-run ~8.7min crash/leak) — agent #32 in flight.
+- User confirmed: **terminal solid, no bugs found** (validates the hamsh QA sweep).
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
