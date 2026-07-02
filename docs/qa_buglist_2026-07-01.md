@@ -387,7 +387,12 @@ injection (DE-app FUNCTION, installer-wizard pages) — the QA-N3b tooling gap.
   /dev/wsys/<wid>/keys (like hameditscene); feeds the existing fetch+render path;
   address mirrors cur_url so link-click/--demo stay in sync; content shifted down
   by the bar height. Verified KVM (`--url file:///tmp/t.html`→PASS, bar+page render).
-- [~] **QA-N22** (empty gray "Windows:" box) — agent #30 in flight.
+- [x] **QA-N22** (empty gray "Windows:" box) — FIXED 2d39ba47 + screendump-verified.
+  Root cause: `etc/services.d/hamde.svc` (the LEGACY pre-scene-pivot hamui panel)
+  was still `enabled: yes` at runlevel 5, so the supervisor autostarted `/bin/hamde`
+  which bound wid 1 and painted a "Windows:" label + empty tasklist overlay. Fully
+  superseded by the scene DE (hamdesktop + hampanelscene's working taskbar). Fix:
+  disable hamde.svc. After: box gone, desktop icons clean, DE + bottom taskbar intact.
 - [~] **QA-N24** (long-run ~8.7min crash/leak) — agent #32 in flight.
 - User confirmed: **terminal solid, no bugs found** (validates the hamsh QA sweep).
 
