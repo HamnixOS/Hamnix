@@ -393,7 +393,15 @@ injection (DE-app FUNCTION, installer-wizard pages) — the QA-N3b tooling gap.
   which bound wid 1 and painted a "Windows:" label + empty tasklist overlay. Fully
   superseded by the scene DE (hamdesktop + hampanelscene's working taskbar). Fix:
   disable hamde.svc. After: box gone, desktop icons clean, DE + bottom taskbar intact.
-- [~] **QA-N24** (long-run ~8.7min crash/leak) — agent #32 in flight.
+- [x] **QA-N24** (long-run ~8.7min crash) — DIAGNOSED: NO leak. 10+min runs (idle/
+  mouse/process-churn/windowed-churn) show BOUNDED, flat guest memory; compositor
+  per-frame present does zero heap alloc; dead windows fully reclaimed
+  (wsys_reap_dead_wids). REAL cause: FOOTPRINT — a full window set hits ~966MB/1GB
+  with pages_free=0, dominated by a fixed 4 MiB layer-FB per window (devwsys.ad:1747)
+  memset in full even for 1-layer windows (~120MB, mostly wasted). Host memory
+  pressure then OOM-kills qemu → the user's `Killed` + `pid exited 143`. Directly
+  corroborated (a non-setsid run got external host SIGTERM@120s, guest healthy/flat).
+  → FIX = footprint reduction, tracked as QA-N25 (#33).
 - User confirmed: **terminal solid, no bugs found** (validates the hamsh QA sweep).
 
 ## Notes
