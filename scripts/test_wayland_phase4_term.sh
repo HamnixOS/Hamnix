@@ -294,33 +294,41 @@ if [ "$committed" -eq 1 ] && [ "${RENDER_OK:-0}" = "1" ]; then
     echo "$TAG RESULT: PARTIAL — weston-terminal rendered but typed-echo proof inconclusive (see $PNG_B)." >&2
     exit 0
 fi
-# NEXT-GATE diagnostic. With the fontconfig writable-cache fix in place,
-# weston-terminal now progresses MUCH further than the old "stalls before
-# get_xdg_surface" state: it CONNECTS, enumerates globals (incl. wl_output),
-# loads its cursor theme, and maps a window —
-#   [wayland] xdg get_xdg_surface
-#   [wayland] xdg get_toplevel + configure sent
+# NEXT-GATE diagnostic. The earlier gates are ALL cleared: fontconfig cache,
+# the forkpty-child execve NX fault (login_tty/TIOCSCTTY), AND — new here —
+# the epoll/AF_UNIX readiness bug. weston-terminal's toytoolkit main loop runs
+# on epoll_wait over its wayland display fd; the kernel epoll shim probed that
+# fd with raw vfs_fd_poll, which can NEVER report POLLIN for an AF_UNIX fd, so
+# the client mapped its xdg_toplevel then blocked forever without acking
+# configure. Fixed (linux_abi/u_syscalls.ad _u_epoll_scan now uses the same
+# _u_poll_fd_revents helper poll(2) uses): weston-terminal now CONNECTS, maps —
+#   [wayland] xdg get_xdg_surface / get_toplevel + configure sent
 #   [wayland] surface commit (pending buf=0)
-# then exits code=1 WITHOUT committing a render buffer. Captured stderr shows
-# NO fontconfig/cairo/forkpty error — only the harmless "could not load
-# cursor 'dnd-*'" lines. The precise remaining blocker is KERNEL-side, NOT
-# userspace: weston-terminal's forkpty()'d shell CHILD takes an NX exec-fault
-# SIGSEGV on execve of the shell —
-#   [pf] NX exec-fault on user page va=0x1c00f.... -> SIGSEGV
-#   task: pid N exited (code=139)   ([coredump] wrote /tmp/core)
-# i.e. the Linux-ABI execve-in-a-forkpty-child path faults, so the terminal
-# has no PTY content and exits. PROOF the wayland/shm/font pipeline itself is
-# sound: the pure-shm sibling client renders end-to-end —
-#   [wayland] shm buffer committed 250x250 to wid N   (weston-simple-shm)
-# (screendump: run scripts, see wl4_simple_shm.png). Next gate = fix the
-# forkpty-child execve NX fault (kernel do_execve / pty controlling-tty
-# path), a separate track from this font fixture.
-echo "$TAG SKIP/PARTIAL: fontconfig fixed (no cache error) but weston-terminal" >&2
-echo "$TAG   did not commit a render buffer. Remaining blocker is KERNEL-side:" >&2
-echo "$TAG   its forkpty() shell child NX-exec-faults (SIGSEGV code=139) on" >&2
-if grep -aE "NX exec-fault.*SIGSEGV" "$LOG" >/dev/null 2>&1; then
-    echo "$TAG   execve — confirmed in serial:" >&2
-    grep -aE "NX exec-fault.*SIGSEGV|exited \(code=139\)" "$LOG" | tail -3 >&2
-fi
+# — reads its configure via epoll, and forkpty's its shell.
+#
+# TWO remaining gates keep it from committing a render buffer:
+#   1. PTY-POLL READINESS. vfs_fd_poll has no DEV_PTMX arm, so a pty master/
+#      slave fd falls through to "always POLLIN|POLLOUT". weston-terminal's
+#      epoll is thus told the pty master is readable when empty; it issues a
+#      blocking read on the master (verified via a syscall trace: the client's
+#      last call is read() on the pty master fd) and hangs there, never
+#      flushing its queued xdg ack_configure. A vfs_fd_poll DEV_PTMX arm
+#      (pty_master_readable/pty_slave_readable) is the fix — but a naive
+#      version correlated with an intermittent hard scheduler wedge (see #2),
+#      so it needs care and is held back.
+#   2. INTERMITTENT clone3/forkpty + fontconfig CPU-burst WEDGE. On some boots
+#      the guest hard-wedges (cooperative scheduler starved — heartbeat frozen)
+#      either during weston-terminal's pre-forkpty cairo/fontconfig font scan
+#      or inside clone3 (the forkpty fork). No kernel fault is logged; the last
+#      traced syscall is nr=435 (clone3). This is a fork/clone concurrency
+#      hazard independent of the wayland path.
+# PROOF the wayland/shm/font pipeline is sound: the pure-shm sibling client
+# renders end-to-end ([wayland] shm buffer committed ... weston-simple-shm).
+echo "$TAG SKIP/PARTIAL: epoll/AF_UNIX + forkpty-execve + fontconfig gates cleared;" >&2
+echo "$TAG   weston-terminal now maps + reads its configure via epoll but does not" >&2
+echo "$TAG   yet commit a render buffer. Remaining gates: (1) vfs_fd_poll has no" >&2
+echo "$TAG   DEV_PTMX arm -> pty master reported always-readable -> client blocks in" >&2
+echo "$TAG   a read() on the pty master; (2) intermittent clone3/forkpty + fontconfig" >&2
+echo "$TAG   CPU-burst scheduler wedge (heartbeat freezes; last syscall nr=435 clone3)." >&2
 echo "$TAG   (pure-shm client weston-simple-shm renders fine — pipeline is sound)." >&2
 exit 0
