@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# scripts/stage_weston_term.sh — host-side, one-time: stage the UNMODIFIED
+# Debian `weston-terminal` (+ `weston-simple-shm`) and their REAL runtime
+# shared-object closure + a usable monospace font into the debian-minbase
+# fixture rootfs, so the full-mirror live image (HAMNIX_LIVE_MINIMAL=0)
+# carries a real INTERACTIVE libwayland client for the Phase-4b input rung.
+#
+# weston-terminal is a pure-SHM cairo/pango client (NO GL) — its ldd
+# closure is ~45 small libs (~6 MiB), NOT the ~900 MB mesa/LLVM/ffmpeg
+# stack that the `weston` package DEPENDS on (libweston/GL). We compute
+# weston-terminal's ACTUAL DT_NEEDED transitive closure and copy only
+# that, keeping the ESP FAT under its ceiling.
+#
+# Requirements (Debian/Ubuntu host): apt-get download access to the
+# Debian mirror + dpkg-deb + readelf. No sudo, no install into the host.
+#
+# Idempotent: safe to re-run; overwrites the staged files in place.
+#
+# Env:
+#   ROOTFS  target rootfs (default: tests/distros/debian-minbase/rootfs)
+#   WORK    scratch dir for .deb download/extract (default: mktemp)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOTFS="${ROOTFS:-$HERE/tests/distros/debian-minbase/rootfs}"
+WORK="${WORK:-$(mktemp -d --tmpdir hamnix-weston.XXXXXX)}"
+
+if [ ! -d "$ROOTFS" ]; then
+    echo "[stage-weston] ERROR: $ROOTFS absent."
+    echo "[stage-weston]   Run tests/distros/debian-minbase/BUILD.sh (or"
+    echo "[stage-weston]   scripts/stage_host_dpkg_rootfs.sh) to populate it first."
+    exit 1
+fi
+
+DEBS="$WORK/debs"; WSROOT="$WORK/wsroot"
+mkdir -p "$DEBS" "$WSROOT"
+
+# --- 1. download weston + weston-terminal's runtime closure packages ---
+# Curated to weston-terminal's ACTUAL closure (readelf-walked below) — NO
+# GL/EGL/mesa/gbm/drm/ffmpeg/pipewire (the heavy `weston` Depends set).
+PKGS=(
+  weston
+  libwayland-client0 libwayland-cursor0
+  libpixman-1-0 libxkbcommon0
+  libcairo2 libcairo-gobject2 libpng16-16t64
+  libpango-1.0-0 libpangocairo-1.0-0 libpangoft2-1.0-0
+  libglib2.0-0t64 libfontconfig1 libfreetype6
+  libjpeg62-turbo libwebp7 libffi8
+  libxcb1 libxcb-shm0 libxcb-render0
+  libx11-6 libx11-data libxrender1 libxext6 libxau6 libxdmcp6
+  libexpat1 libbrotli1 libbz2-1.0 libpcre2-8-0 zlib1g
+  libharfbuzz0b libfribidi0 libgraphite2-3 libthai0 libthai-data
+  libdatrie1 libsharpyuv0 libselinux1 libblkid1 libmount1 libuuid1
+  libatomic1
+  fontconfig-config fonts-dejavu-core fonts-dejavu-mono
+  xkb-data
+)
+echo "[stage-weston] downloading ${#PKGS[@]} packages into $DEBS ..."
+( cd "$DEBS" && apt-get download "${PKGS[@]}" >/dev/null 2>&1 ) || {
+    echo "[stage-weston] ERROR: apt-get download failed (need mirror access)."; exit 1; }
+
+echo "[stage-weston] extracting .debs into merged staging tree ..."
+for d in "$DEBS"/*.deb; do dpkg-deb -x "$d" "$WSROOT"; done
+
+# --- 2. walk weston-terminal's transitive DT_NEEDED closure ------------
+# Resolve each soname against the merged tree first, then the existing
+# rootfs (libc/ld.so/libm already staged there). Copy only what resolves
+# in the merged tree (host-fresh libs); rootfs-provided libs stay as-is.
+python3 - "$WSROOT" "$ROOTFS" <<'PY'
+import os, sys, subprocess, shutil
+WSROOT, ROOTFS = sys.argv[1], sys.argv[2]
+LIBDIRS = ["usr/lib/x86_64-linux-gnu","lib/x86_64-linux-gnu",
+           "usr/lib","lib","usr/lib64","lib64"]
+BINS = ["usr/bin/weston-terminal","usr/bin/weston-simple-shm"]
+
+def needed(p):
+    try: out=subprocess.check_output(["readelf","-d",p],stderr=subprocess.DEVNULL).decode()
+    except Exception: return []
+    return [l.split("[")[1].split("]")[0] for l in out.splitlines()
+            if "(NEEDED)" in l and "[" in l]
+
+def find(soname):
+    for tree in (WSROOT, ROOTFS):
+        for d in LIBDIRS:
+            c=os.path.join(tree,d,soname)
+            if os.path.exists(c): return os.path.realpath(c), tree
+    return None,None
+
+seen=set(); work=[]; copied=0; missing=set()
+for b in BINS:
+    bp=os.path.join(WSROOT,b)
+    if os.path.exists(bp): work += needed(bp)
+while work:
+    so=work.pop()
+    if so in seen: continue
+    seen.add(so)
+    rp,tree=find(so)
+    if rp is None: missing.add(so); continue
+    if tree==WSROOT:
+        # canonical usrmerge path so build_initramfs.py's glob catches it
+        dst=os.path.join(ROOTFS,"usr/lib/x86_64-linux-gnu",so)
+        os.makedirs(os.path.dirname(dst),exist_ok=True)
+        shutil.copy2(rp,dst); copied+=1
+        # mirror the /lib spelling too (belt + suspenders)
+        dst2=os.path.join(ROOTFS,"lib/x86_64-linux-gnu",so)
+        os.makedirs(os.path.dirname(dst2),exist_ok=True); shutil.copy2(rp,dst2)
+    work += needed(rp)
+# copy the two client binaries
+for b in BINS:
+    src=os.path.join(WSROOT,b)
+    if os.path.exists(src):
+        dst=os.path.join(ROOTFS,b)
+        os.makedirs(os.path.dirname(dst),exist_ok=True)
+        shutil.copy2(src,dst); os.chmod(dst,0o755)
+print(f"[stage-weston] staged {copied} closure libs + {len(BINS)} client binaries")
+if missing:
+    print("[stage-weston] WARNING unresolved sonames:", sorted(missing))
+    sys.exit(2)
+PY
+
+# --- 2b. glibc upgrade -------------------------------------------------
+# The debootstrap base rootfs ships an OLDER glibc (bookworm 2.36) than the
+# trixie weston-terminal closure requires (libX11/glib/harfbuzz/pango/expat
+# reference GLIBC_2.38+). glibc is backward-compatible (newer libc runs the
+# older apt/dpkg/bash binaries), and libc.so.6 + ld-linux must upgrade as a
+# matched pair, so stage the HOST's complete glibc runtime over the rootfs
+# copy. Covers libc/ld.so/libm/libpthread/libdl/librt/libresolv + the NSS
+# modules glibc dlopen's at runtime.
+echo "[stage-weston] upgrading rootfs glibc to host version (weston needs GLIBC_2.38+)"
+for so in libc.so.6 libm.so.6 libmvec.so.1 libpthread.so.0 libdl.so.2 \
+          librt.so.1 libresolv.so.2 libutil.so.1 libanl.so.1 \
+          libnss_files.so.2 libnss_compat.so.2 libnss_dns.so.2 \
+          libBrokenLocale.so.1; do
+    src="/lib/x86_64-linux-gnu/$so"
+    [ -e "$src" ] || src="/usr/lib/x86_64-linux-gnu/$so"
+    [ -e "$src" ] || continue
+    real="$(readlink -f "$src")"
+    install -D -m0755 "$real" "$ROOTFS/usr/lib/x86_64-linux-gnu/$so"
+    install -D -m0755 "$real" "$ROOTFS/lib/x86_64-linux-gnu/$so"
+done
+# Dynamic linker (PT_INTERP) — must match the upgraded libc exactly.
+LDSO="$(readlink -f /lib64/ld-linux-x86-64.so.2)"
+[ -e "$LDSO" ] || LDSO="$(readlink -f /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2)"
+install -D -m0755 "$LDSO" "$ROOTFS/usr/lib64/ld-linux-x86-64.so.2"
+install -D -m0755 "$LDSO" "$ROOTFS/lib64/ld-linux-x86-64.so.2"
+install -D -m0755 "$LDSO" "$ROOTFS/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+
+# --- 3. font + fontconfig ----------------------------------------------
+# DejaVu Sans Mono is weston-terminal's ideal monospace face. Stage the
+# TTF + a minimal fontconfig conf so libfontconfig resolves "monospace"
+# without the full doc/cache tooling. fonts under usr/share/fonts are NOT
+# pruned by FULL_DEBIAN_PRUNE.
+FONT_SRC="$WSROOT/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+if [ -f "$FONT_SRC" ]; then
+    install -D -m0644 "$FONT_SRC" \
+        "$ROOTFS/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+    # keep the sans face too (pango may fall back for the titlebar glyphs)
+    for f in DejaVuSans.ttf; do
+        s="$WSROOT/usr/share/fonts/truetype/dejavu/$f"
+        [ -f "$s" ] && install -D -m0644 "$s" \
+            "$ROOTFS/usr/share/fonts/truetype/dejavu/$f"
+    done
+    echo "[stage-weston] staged DejaVu TTF fonts"
+else
+    echo "[stage-weston] WARNING: DejaVuSansMono.ttf not found in fonts-dejavu-mono"
+fi
+
+# Minimal fontconfig: a <dir> for our TTF, a writable cache dir, and a
+# generic monospace alias so weston-terminal's default face resolves.
+mkdir -p "$ROOTFS/etc/fonts" "$ROOTFS/var/cache/fontconfig"
+cat > "$ROOTFS/etc/fonts/fonts.conf" <<'EOF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>/usr/share/fonts</dir>
+  <cachedir>/var/cache/fontconfig</cachedir>
+  <alias><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>
+  <alias><family>sans-serif</family><prefer><family>DejaVu Sans</family></prefer></alias>
+  <alias><family>serif</family><prefer><family>DejaVu Sans</family></prefer></alias>
+  <config></config>
+</fontconfig>
+EOF
+
+# --- 3b. XKB keymap data ----------------------------------------------
+# libxkbcommon's xkb_context_new adds /usr/share/X11/xkb as its default
+# include path and FAILS (returns NULL) if it is absent — weston-terminal's
+# display_create() then returns NULL and main() reports it (confusingly) as
+# "failed to create display: No such file or directory" (errno=ENOENT from
+# the missing include dir). The client compiles the SERVER-sent keymap fd
+# with this data, so keyboard input needs it. /usr/share/X11 is NOT pruned.
+if [ -d "$WSROOT/usr/share/X11/xkb" ]; then
+    cp -a "$WSROOT/usr/share/X11" "$ROOTFS/usr/share/"
+    echo "[stage-weston] staged xkb-data (/usr/share/X11/xkb)"
+else
+    echo "[stage-weston] WARNING: xkb-data not found (weston-terminal XKB will fail)"
+fi
+
+echo "[stage-weston] DONE. rootfs now carries weston-terminal + closure + fonts."
+echo "[stage-weston]   verify: readelf -d $ROOTFS/usr/bin/weston-terminal | grep NEEDED"
+echo "[stage-weston] Next: HAMNIX_LIVE_MINIMAL=0 bash scripts/build_installer_img.sh"
+[ -n "${KEEP_WORK:-}" ] || rm -rf "$WORK"
