@@ -429,6 +429,18 @@ HMP 1px-step mouse. NO new bugs — solid:
 - Untested-by-input still: calculator arithmetic, fm folder-navigation, right-click
   context menus (need more click sequences; the tooling now supports it).
 
+## Wayland Phase-4 findings (2026-07-01)
+- [~] **QA-N26** (HIGH — the Firefox gate) — modern glibc-2.41 Debian binaries hang
+  at ld.so entry under `enter linux` (0 syscalls before first libc call — loader
+  wedges in self-relocation/early-init). Packaging is PROVEN (debootstrap trimmed
+  closure); the Wayland protocol (Phases 1-3) is NOT the blocker. Suspect: auxv
+  (AT_RANDOM/HWCAP/vdso), IRELATIVE/GNU_IFUNC relocs, or an early CPUID trap in the
+  Linux-ABI exec/ELF-load path. Agent #37 root-causing. Unblocks connect→render→
+  XWayland→Firefox.
+- [~] **QA-N27** (hamsh) — a `;`-separated block drops its trailing command:
+  `enter linux { export A ; export B ; cmd }` runs the exports but not `cmd`;
+  single-command `{ cmd }` works. Agent #38 fixing.
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
