@@ -732,6 +732,17 @@ if os.environ.get("ENABLE_MEMFD_TEST") == "1":
 if os.environ.get("ENABLE_WLSPIKE_TEST") == "1":
     FILES.append(("/etc/wlspike-test", b"1\n"))
 
+# Wayland-passthrough Phase-1. scripts/test_wayland_phase1.sh sets
+# ENABLE_WAYLAND_TEST=1 to plant /etc/wayland-test; init/main.ad at
+# boot:38.wayland detects the marker and runs wayland_phase1_selftest()
+# (linux_abi/u_syscalls.ad), which drives a real Wayland client
+# (connect/sendmsg/recvmsg) against the native server, passes a wl_shm pool
+# fd via SCM_RIGHTS, and asserts the committed ARGB8888 buffer reaches a
+# window backbuffer + the compositor layer cache
+# (prints "[wayland] shm buffer on screen OK: WLPHASE1_OK").
+if os.environ.get("ENABLE_WAYLAND_TEST") == "1":
+    FILES.append(("/etc/wayland-test", b"1\n"))
+
 # io_uring_setup/enter/register self-test. scripts/test_iouring.sh sets
 # ENABLE_IOURING_TEST=1 to plant /etc/iouring-test; init/main.ad at
 # boot:37.iouring detects the marker and runs iouring_selftest()

@@ -1,0 +1,755 @@
+# =====================================================================
+# Native Wayland server front-end (docs/wayland_passthrough_design.md)
+# =====================================================================
+#
+# Phase 1: a Wayland CLIENT running in the Linux-ABI namespace connects to
+# an AF_UNIX socket named "*wayland-0" and gets a shared-memory buffer onto
+# the screen. We implement the Wayland wire protocol NATIVELY in-kernel and
+# drive devwsys' #442 v2 blit backbuffer path — the committed ARGB8888 shm
+# buffer is copied into a Hamnix scene window and z-blitted to /dev/fb.
+#
+# ARCHITECTURE — REACTIVE, no daemon thread. The server is a set of
+# in-kernel functions driven synchronously from the Linux-ns client's own
+# socket syscalls (hooks in linux_abi/u_syscalls.ad):
+#   * connect(2)  -> wayland_connect_intercept() lazily binds the listener
+#                    to the exact WAYLAND_DISPLAY pathname the client used,
+#                    then wayland_after_connect() accepts + registers the
+#                    new connection.
+#   * sendmsg(2)  -> wayland_pump() drains each connection's byte ring,
+#                    parses complete Wayland messages, and (for create_pool)
+#                    consumes the SCM_RIGHTS shm fd from the endpoint's SCM
+#                    conduit (afunix_scm_recv -> tmpfs backing slot).
+#   * recvmsg(2)  -> wayland_pump() (belt-and-suspenders flush).
+# Server replies are pushed straight into the client's rx ring, so by the
+# time the client's flush syscall returns / it poll()s, the events are ready.
+#
+# The wire transport (AF_UNIX byte ring + SCM_RIGHTS fd passing) is the
+# Phase-0-proven substrate (linux_abi/u_unixsock.ad, u_syscalls.ad).
+
+from kernel.printk.printk import printk0, printk1, printk2
+
+from mm.uaccess import copy_from_user
+
+from linux_abi.u_unixsock import (
+    afunix_socket, afunix_bind, afunix_listen,
+    afunix_accept_ready, afunix_accept_take, afunix_close,
+    afunix_peer_ep, afunix_ep_connected, afunix_rx_count,
+    afunix_krecv, afunix_ksend,
+    afunix_scm_pending, afunix_scm_recv,
+    AFU_SOCK_STREAM, AFU_BACKLOG,
+)
+
+from fs.tmpfs import tmpfs_page_phys, tmpfs_release_anon
+
+from sys.src.port9.port.devwsys import (
+    wsys_wl_alloc, wsys_wl_resize, wsys_wl_store_rect,
+    wsys_wl_present, wsys_wl_free, WSYS_BLIT_FMT_BGRA8888,
+)
+
+
+# --- protocol / object-model constants ------------------------------
+
+WL_MAX_CONN: uint64 = 8
+WL_MAX_OBJ:  uint64 = 128            # client ids stay dense + low
+WL_ACC:      uint64 = 8192           # per-conn message reassembly buffer
+
+# Object interface types (server-side tag per object id).
+WL_T_NONE:        int32 = 0
+WL_T_DISPLAY:     int32 = 1
+WL_T_REGISTRY:    int32 = 2
+WL_T_CALLBACK:    int32 = 3
+WL_T_COMPOSITOR:  int32 = 4
+WL_T_SHM:         int32 = 5
+WL_T_SHM_POOL:    int32 = 6
+WL_T_BUFFER:      int32 = 7
+WL_T_SURFACE:     int32 = 8
+WL_T_REGION:      int32 = 9
+WL_T_XDG_WM:      int32 = 10
+WL_T_XDG_SURF:    int32 = 11
+WL_T_XDG_TOP:     int32 = 12
+
+# Registry global "name" ids (server-assigned, stable).
+WL_G_COMPOSITOR:  uint32 = 1
+WL_G_SHM:         uint32 = 2
+WL_G_XDG:         uint32 = 3
+
+# wl_shm pixel format codes (wayland.xml).
+WL_SHM_ARGB8888:  uint32 = 0
+WL_SHM_XRGB8888:  uint32 = 1
+
+# wl_display is always object id 1 on every connection.
+WL_DISPLAY_ID:    uint32 = 1
+
+
+# --- module state (BSS) ---------------------------------------------
+
+# Single listening endpoint (one WAYLAND_DISPLAY). -1 / 0 until a client
+# connects to a "*wayland-0" name and lazily binds it.
+wl_listener_ep:    int32 = -1
+wl_listener_valid: int32 = 0
+wl_serial:         uint32 = 0
+
+# Per-connection.
+wl_conn_inuse:  Array[8, int32]
+wl_conn_ep:     Array[8, int32]
+wl_conn_reg:    Array[8, int32]        # bound wl_registry object id (0=none)
+wl_conn_acc:    Array[65536, uint8]    # 8 * 8192
+wl_conn_acclen: Array[8, uint64]
+
+# Per-object (indexed conn*WL_MAX_OBJ + id).
+wl_obj_type: Array[1024, int32]        # 8 * 128
+wl_obj_a:    Array[1024, int32]
+wl_obj_b:    Array[1024, int32]
+wl_obj_c:    Array[1024, int32]
+wl_obj_d:    Array[1024, int32]
+wl_obj_e:    Array[1024, int32]
+wl_obj_f:    Array[1024, int32]
+
+# Output-message assembly buffer (server is serial in syscall context).
+wl_out:     Array[4096, uint8]
+wl_out_pos: uint64 = 0
+
+# Pixel row scratch for shm -> backbuffer conversion (2048px * 4 max).
+wl_rowbuf:  Array[8192, uint8]
+
+# TEST HOOK: last window id allocated by the server (for the selftest to
+# find the surface's wid without walking the object table).
+wl_test_last_wid: int32 = 0
+
+
+# --- little-endian wire helpers -------------------------------------
+
+def wl_ru32(p: Ptr[uint8], off: uint64) -> uint32:
+    return cast[uint32](p[off]) \
+         | (cast[uint32](p[off + 1]) << 8) \
+         | (cast[uint32](p[off + 2]) << 16) \
+         | (cast[uint32](p[off + 3]) << 24)
+
+
+def wl_put32(idx: uint64, v: uint32):
+    wl_out[idx]     = cast[uint8](v & 0xff)
+    wl_out[idx + 1] = cast[uint8]((v >> 8) & 0xff)
+    wl_out[idx + 2] = cast[uint8]((v >> 16) & 0xff)
+    wl_out[idx + 3] = cast[uint8]((v >> 24) & 0xff)
+
+
+def wl_o_reset():
+    wl_out_pos = 0
+
+
+def wl_o_u32(v: uint32):
+    wl_put32(wl_out_pos, v)
+    wl_out_pos = wl_out_pos + 4
+
+
+def wl_o_cstr(s: Ptr[uint8]):
+    # Emit a Wayland string arg: u32 length (INCLUDING trailing NUL), the
+    # bytes, the NUL, then zero-pad to a 32-bit boundary.
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    wl_o_u32(cast[uint32](n + 1))
+    i: uint64 = 0
+    while i < n:
+        wl_out[wl_out_pos] = s[i]
+        wl_out_pos = wl_out_pos + 1
+        i = i + 1
+    wl_out[wl_out_pos] = 0                  # NUL
+    wl_out_pos = wl_out_pos + 1
+    while (wl_out_pos & 3) != 0:
+        wl_out[wl_out_pos] = 0
+        wl_out_pos = wl_out_pos + 1
+
+
+def wl_emit_begin(obj: uint32) -> uint64:
+    start: uint64 = wl_out_pos
+    wl_o_u32(obj)
+    wl_o_u32(0)                              # placeholder: size<<16 | opcode
+    return start
+
+
+def wl_emit_end(start: uint64, opcode: uint32):
+    size: uint64 = wl_out_pos - start
+    wl_put32(start + 4, (cast[uint32](size) << 16) | (opcode & 0xffff))
+
+
+def wl_flush(server_ep: int32):
+    if wl_out_pos == 0:
+        return
+    afunix_ksend(server_ep, &wl_out[0], wl_out_pos)
+    wl_out_pos = 0
+
+
+# --- object table helpers -------------------------------------------
+
+def wl_oidx(c: uint64, id: uint32) -> uint64:
+    return c * WL_MAX_OBJ + cast[uint64](id)
+
+
+def wl_obj_valid_id(id: uint32) -> int32:
+    if id == 0:
+        return 0
+    if cast[uint64](id) >= WL_MAX_OBJ:
+        return 0
+    return 1
+
+
+def wl_new_obj(c: uint64, id: uint32, otype: int32):
+    if wl_obj_valid_id(id) == 0:
+        return
+    oi: uint64 = wl_oidx(c, id)
+    wl_obj_type[oi] = otype
+    wl_obj_a[oi] = 0
+    wl_obj_b[oi] = 0
+    wl_obj_c[oi] = 0
+    wl_obj_d[oi] = 0
+    wl_obj_e[oi] = 0
+    wl_obj_f[oi] = 0
+
+
+def wl_obj_get_type(c: uint64, id: uint32) -> int32:
+    if wl_obj_valid_id(id) == 0:
+        return WL_T_NONE
+    return wl_obj_type[wl_oidx(c, id)]
+
+
+def wl_free_obj(c: uint64, id: uint32):
+    if wl_obj_valid_id(id) == 0:
+        return
+    wl_obj_type[wl_oidx(c, id)] = WL_T_NONE
+
+
+# --- outgoing events -------------------------------------------------
+
+def wl_send_delete_id(c: uint64, id: uint32):
+    # wl_display.delete_id(id) — opcode 1 on wl_display (object 1).
+    s: uint64 = wl_emit_begin(WL_DISPLAY_ID)
+    wl_o_u32(id)
+    wl_emit_end(s, 1)
+
+
+def wl_send_callback_done(cb: uint32, data: uint32):
+    # wl_callback.done(callback_data) — opcode 0.
+    s: uint64 = wl_emit_begin(cb)
+    wl_o_u32(data)
+    wl_emit_end(s, 0)
+
+
+def wl_send_global(reg: uint32, name: uint32, iface: Ptr[uint8],
+                   version: uint32):
+    # wl_registry.global(name, interface, version) — opcode 0.
+    s: uint64 = wl_emit_begin(reg)
+    wl_o_u32(name)
+    wl_o_cstr(iface)
+    wl_o_u32(version)
+    wl_emit_end(s, 0)
+
+
+def wl_send_shm_format(shm: uint32, fmt: uint32):
+    # wl_shm.format(format) — opcode 0.
+    s: uint64 = wl_emit_begin(shm)
+    wl_o_u32(fmt)
+    wl_emit_end(s, 0)
+
+
+def wl_send_buffer_release(buf: uint32):
+    # wl_buffer.release() — opcode 0.
+    s: uint64 = wl_emit_begin(buf)
+    wl_emit_end(s, 0)
+
+
+def wl_send_xdg_configure(xdg_surface: uint32, serial: uint32):
+    # xdg_surface.configure(serial) — opcode 0.
+    s: uint64 = wl_emit_begin(xdg_surface)
+    wl_o_u32(serial)
+    wl_emit_end(s, 0)
+
+
+def wl_send_toplevel_configure(top: uint32, w: uint32, h: uint32):
+    # xdg_toplevel.configure(width, height, states[]) — opcode 0.
+    # Empty states array (length 0).
+    s: uint64 = wl_emit_begin(top)
+    wl_o_u32(w)
+    wl_o_u32(h)
+    wl_o_u32(0)                              # states array length (bytes)
+    wl_emit_end(s, 0)
+
+
+# --- shm buffer -> window backbuffer --------------------------------
+
+def wl_shm_read(slot: int32, foff: uint64, dst: Ptr[uint8], n: uint64):
+    # Copy n bytes from tmpfs backing `slot` at file offset foff into the
+    # kernel buffer dst, walking the direct-mapped tmpfs pages via
+    # tmpfs_page_phys. This is size-bookkeeping-independent (a wl_shm pool
+    # memfd is written THROUGH a MAP_SHARED mmap, not via write()/ftruncate,
+    # so its recorded size may be 0 even though the pages hold real pixels);
+    # it reads the SAME physical frames the client mapped (Phase-0 coherence).
+    done: uint64 = 0
+    while done < n:
+        cur: uint64 = foff + done
+        pagebase: uint64 = tmpfs_page_phys(slot, cur)
+        if pagebase == 0:
+            while done < n:
+                dst[done] = 0
+                done = done + 1
+            return
+        inpage: uint64 = cur & 4095
+        room: uint64 = 4096 - inpage
+        take: uint64 = n - done
+        if take > room:
+            take = room
+        src: Ptr[uint8] = cast[Ptr[uint8]](pagebase + inpage)
+        i: uint64 = 0
+        while i < take:
+            dst[done + i] = src[i]
+            i = i + 1
+        done = done + take
+
+
+
+def wl_commit_buffer(c: uint64, surface_id: uint32, buf_id: uint32):
+    # Blit the committed wl_buffer's shm pixels into the surface's window
+    # backbuffer, then present. ARGB8888 in memory == B,G,R,A little-endian
+    # == WSYS_BLIT_FMT_BGRA8888 (direct). XRGB forces alpha opaque.
+    if wl_obj_get_type(c, buf_id) != WL_T_BUFFER:
+        return
+    bi: uint64 = wl_oidx(c, buf_id)
+    slot:   int32  = wl_obj_a[bi]
+    offset: int32  = wl_obj_b[bi]
+    width:  int32  = wl_obj_c[bi]
+    height: int32  = wl_obj_d[bi]
+    stride: int32  = wl_obj_e[bi]
+    fmt:    int32  = wl_obj_f[bi]
+    if width < 1 or height < 1 or slot < 0:
+        return
+    si: uint64 = wl_oidx(c, surface_id)
+    wid: int32 = wl_obj_a[si]
+    if wid <= 0:
+        wid = wsys_wl_alloc(width, height)
+        if wid < 0:
+            return
+        wl_obj_a[si] = wid
+        wl_test_last_wid = wid
+    else:
+        if wl_obj_c[si] != width or wl_obj_d[si] != height:
+            wsys_wl_resize(wid, width, height)
+    wl_obj_c[si] = width
+    wl_obj_d[si] = height
+
+    # Copy rows from the tmpfs shm slot into the v2 backbuffer.
+    rowbytes: int32 = width * 4
+    if rowbytes > 8192:
+        rowbytes = 8192
+    cols: int32 = rowbytes / 4
+    y: int32 = 0
+    while y < height:
+        pos: uint64 = cast[uint64](offset) \
+                    + cast[uint64](y) * cast[uint64](stride)
+        wl_shm_read(slot, pos, &wl_rowbuf[0], cast[uint64](rowbytes))
+        if fmt == cast[int32](WL_SHM_XRGB8888):
+            # Force the X byte opaque so the framebuffer shows the pixel.
+            k: int32 = 0
+            while k < cols:
+                wl_rowbuf[cast[uint64](k) * 4 + 3] = 255
+                k = k + 1
+        wsys_wl_store_rect(wid, 0, y, cols, y + 1,
+                           WSYS_BLIT_FMT_BGRA8888, &wl_rowbuf[0])
+        y = y + 1
+
+    wsys_wl_present(wid, cols, height)
+
+
+# --- per-object request dispatch ------------------------------------
+
+def wl_dispatch(c: uint64, obj: uint32, opcode: uint32,
+                args: Ptr[uint8], arglen: uint64):
+    otype: int32 = wl_obj_get_type(c, obj)
+    server_ep: int32 = wl_conn_ep[c]
+    wl_o_reset()
+
+    if obj == WL_DISPLAY_ID:
+        # wl_display
+        if opcode == 0:
+            # sync(callback) -> done + delete_id
+            if arglen >= 4:
+                cb: uint32 = wl_ru32(args, 0)
+                wl_new_obj(c, cb, WL_T_CALLBACK)
+                wl_serial = wl_serial + 1
+                wl_send_callback_done(cb, wl_serial)
+                wl_send_delete_id(c, cb)
+                wl_free_obj(c, cb)
+        elif opcode == 1:
+            # get_registry(registry)
+            if arglen >= 4:
+                reg: uint32 = wl_ru32(args, 0)
+                wl_new_obj(c, reg, WL_T_REGISTRY)
+                wl_conn_reg[c] = cast[int32](reg)
+                wl_send_global(reg, WL_G_COMPOSITOR,
+                               "wl_compositor", 4)
+                wl_send_global(reg, WL_G_SHM, "wl_shm", 1)
+                wl_send_global(reg, WL_G_XDG, "xdg_wm_base", 1)
+        wl_flush(server_ep)
+        return
+
+    if otype == WL_T_REGISTRY:
+        if opcode == 0:
+            # bind(name, interface(string), version, id)
+            if arglen >= 12:
+                name: uint32 = wl_ru32(args, 0)
+                ilen: uint32 = wl_ru32(args, 4)
+                str_span: uint64 = 4 + ((cast[uint64](ilen) + 3) & ~cast[uint64](3))
+                after: uint64 = 4 + str_span
+                if arglen >= after + 8:
+                    newid: uint32 = wl_ru32(args, after + 4)
+                    if name == WL_G_COMPOSITOR:
+                        wl_new_obj(c, newid, WL_T_COMPOSITOR)
+                    elif name == WL_G_SHM:
+                        wl_new_obj(c, newid, WL_T_SHM)
+                        wl_send_shm_format(newid, WL_SHM_ARGB8888)
+                        wl_send_shm_format(newid, WL_SHM_XRGB8888)
+                    elif name == WL_G_XDG:
+                        wl_new_obj(c, newid, WL_T_XDG_WM)
+        wl_flush(server_ep)
+        return
+
+    if otype == WL_T_COMPOSITOR:
+        if opcode == 0:
+            # create_surface(id)
+            if arglen >= 4:
+                wl_new_obj(c, wl_ru32(args, 0), WL_T_SURFACE)
+        elif opcode == 1:
+            # create_region(id)
+            if arglen >= 4:
+                wl_new_obj(c, wl_ru32(args, 0), WL_T_REGION)
+        wl_flush(server_ep)
+        return
+
+    if otype == WL_T_SHM:
+        if opcode == 0:
+            # create_pool(id, fd(ancillary), size)
+            if arglen >= 8:
+                poolid: uint32 = wl_ru32(args, 0)
+                size:   uint32 = wl_ru32(args, 4)
+                slot: int32 = -1
+                if afunix_scm_pending(server_ep) > 0:
+                    slot = afunix_scm_recv(server_ep)
+                wl_new_obj(c, poolid, WL_T_SHM_POOL)
+                if wl_obj_valid_id(poolid) != 0:
+                    pi: uint64 = wl_oidx(c, poolid)
+                    wl_obj_a[pi] = slot
+                    wl_obj_b[pi] = cast[int32](size)
+        wl_flush(server_ep)
+        return
+
+    if otype == WL_T_SHM_POOL:
+        pi: uint64 = wl_oidx(c, obj)
+        if opcode == 0:
+            # create_buffer(id, offset, width, height, stride, format)
+            if arglen >= 24:
+                bufid: uint32 = wl_ru32(args, 0)
+                wl_new_obj(c, bufid, WL_T_BUFFER)
+                if wl_obj_valid_id(bufid) != 0:
+                    bi: uint64 = wl_oidx(c, bufid)
+                    wl_obj_a[bi] = wl_obj_a[pi]              # tmpfs slot
+                    wl_obj_b[bi] = cast[int32](wl_ru32(args, 4))   # offset
+                    wl_obj_c[bi] = cast[int32](wl_ru32(args, 8))   # width
+                    wl_obj_d[bi] = cast[int32](wl_ru32(args, 12))  # height
+                    wl_obj_e[bi] = cast[int32](wl_ru32(args, 16))  # stride
+                    wl_obj_f[bi] = cast[int32](wl_ru32(args, 20))  # format
+        elif opcode == 1:
+            # destroy — release the shm backing reference.
+            if wl_obj_a[pi] >= 0:
+                tmpfs_release_anon(wl_obj_a[pi])
+                wl_obj_a[pi] = -1
+            wl_free_obj(c, obj)
+        elif opcode == 2:
+            # resize(size)
+            if arglen >= 4:
+                wl_obj_b[pi] = cast[int32](wl_ru32(args, 0))
+        wl_flush(server_ep)
+        return
+
+    if otype == WL_T_SURFACE:
+        si: uint64 = wl_oidx(c, obj)
+        if opcode == 1:
+            # attach(buffer, x, y)
+            if arglen >= 4:
+                wl_obj_b[si] = cast[int32](wl_ru32(args, 0))    # pending buf
+        elif opcode == 3:
+            # frame(callback)
+            if arglen >= 4:
+                fcb: uint32 = wl_ru32(args, 0)
+                wl_new_obj(c, fcb, WL_T_CALLBACK)
+                wl_obj_e[si] = cast[int32](fcb)                 # pending frame
+        elif opcode == 6:
+            # commit
+            pend: int32 = wl_obj_b[si]
+            if pend != 0:
+                wl_commit_buffer(c, obj, cast[uint32](pend))
+                wl_send_buffer_release(cast[uint32](pend))
+                wl_obj_b[si] = 0
+            fcb2: int32 = wl_obj_e[si]
+            if fcb2 != 0:
+                wl_serial = wl_serial + 1
+                wl_send_callback_done(cast[uint32](fcb2), wl_serial)
+                wl_send_delete_id(c, cast[uint32](fcb2))
+                wl_free_obj(c, cast[uint32](fcb2))
+                wl_obj_e[si] = 0
+        elif opcode == 0:
+            # destroy
+            if wl_obj_a[si] > 0:
+                wsys_wl_free(wl_obj_a[si])
+            wl_free_obj(c, obj)
+        # opcodes 2 (damage), 4/5 (region), 7/8 (transform/scale),
+        # 9 (damage_buffer), 10 (offset): whole-surface blit, ignore.
+        wl_flush(server_ep)
+        return
+
+    if otype == WL_T_XDG_WM:
+        if opcode == 2:
+            # get_xdg_surface(id, surface)
+            if arglen >= 8:
+                xid: uint32 = wl_ru32(args, 0)
+                surf: uint32 = wl_ru32(args, 4)
+                wl_new_obj(c, xid, WL_T_XDG_SURF)
+                if wl_obj_valid_id(xid) != 0:
+                    wl_obj_a[wl_oidx(c, xid)] = cast[int32](surf)
+        elif opcode == 1:
+            # create_positioner(id)
+            if arglen >= 4:
+                wl_new_obj(c, wl_ru32(args, 0), WL_T_REGION)
+        # opcode 0 destroy, 3 pong: ignore.
+        wl_flush(server_ep)
+        return
+
+    if otype == WL_T_XDG_SURF:
+        if opcode == 1:
+            # get_toplevel(id) -> configure handshake
+            if arglen >= 4:
+                tid: uint32 = wl_ru32(args, 0)
+                wl_new_obj(c, tid, WL_T_XDG_TOP)
+                if wl_obj_valid_id(tid) != 0:
+                    wl_obj_a[wl_oidx(c, tid)] = cast[int32](obj)
+                wl_send_toplevel_configure(tid, 0, 0)
+                wl_serial = wl_serial + 1
+                wl_send_xdg_configure(obj, wl_serial)
+        # opcode 0 destroy, 2 get_popup, 3 set_window_geometry,
+        # 4 ack_configure: ignore.
+        wl_flush(server_ep)
+        return
+
+    # XDG_TOPLEVEL, CALLBACK, REGION, BUFFER destroy, unknown: ignore
+    # gracefully (forward-compatible).
+    if otype == WL_T_BUFFER:
+        if opcode == 0:
+            wl_free_obj(c, obj)
+            wl_send_delete_id(c, obj)
+    wl_flush(server_ep)
+
+
+# --- connection lifecycle + pump ------------------------------------
+
+def wl_conn_reset(c: uint64):
+    wl_conn_acclen[c] = 0
+    wl_conn_reg[c] = 0
+    i: uint64 = 0
+    while i < WL_MAX_OBJ:
+        wl_obj_type[c * WL_MAX_OBJ + i] = WL_T_NONE
+        i = i + 1
+    # wl_display is always object 1.
+    wl_obj_type[c * WL_MAX_OBJ + 1] = WL_T_DISPLAY
+
+
+def wl_register_conn(server_ep: int32) -> int32:
+    c: uint64 = 0
+    while c < WL_MAX_CONN:
+        if wl_conn_inuse[c] == 0:
+            wl_conn_inuse[c] = 1
+            wl_conn_ep[c] = server_ep
+            wl_conn_reset(c)
+            printk1("[wayland] client connected (conn %d)\n", c)
+            return cast[int32](c)
+        c = c + 1
+    printk0("[wayland] connection table full — refusing client\n")
+    return -1
+
+
+def wl_free_conn(c: uint64):
+    if wl_conn_inuse[c] == 0:
+        return
+    server_ep: int32 = wl_conn_ep[c]
+    # Release shm-pool backing refs + destroy surface windows.
+    i: uint64 = 0
+    while i < WL_MAX_OBJ:
+        oi: uint64 = c * WL_MAX_OBJ + i
+        if wl_obj_type[oi] == WL_T_SHM_POOL:
+            if wl_obj_a[oi] >= 0:
+                tmpfs_release_anon(wl_obj_a[oi])
+                wl_obj_a[oi] = -1
+        elif wl_obj_type[oi] == WL_T_SURFACE:
+            if wl_obj_a[oi] > 0:
+                wsys_wl_free(wl_obj_a[oi])
+        wl_obj_type[oi] = WL_T_NONE
+        i = i + 1
+    # Drain any un-consumed SCM payloads (balance the sender's ref).
+    while afunix_scm_pending(server_ep) > 0:
+        slot: int32 = afunix_scm_recv(server_ep)
+        if slot >= 0:
+            tmpfs_release_anon(slot)
+    afunix_close(server_ep)
+    wl_conn_inuse[c] = 0
+    wl_conn_ep[c] = -1
+    printk1("[wayland] client disconnected (conn %d)\n", c)
+
+
+def wl_pump_conn(c: uint64):
+    server_ep: int32 = wl_conn_ep[c]
+    # Drain the byte ring into the reassembly buffer.
+    base: uint64 = c * WL_ACC
+    acclen: uint64 = wl_conn_acclen[c]
+    while acclen < WL_ACC:
+        room: uint64 = WL_ACC - acclen
+        got: uint64 = afunix_krecv(server_ep, &wl_conn_acc[base + acclen], room)
+        if got == 0:
+            acclen = acclen                      # no more data
+            break
+        acclen = acclen + got
+    # Parse complete messages.
+    pos: uint64 = 0
+    while acclen - pos >= 8:
+        obj:    uint32 = wl_ru32(&wl_conn_acc[base], pos)
+        w2:     uint32 = wl_ru32(&wl_conn_acc[base], pos + 4)
+        size:   uint64 = cast[uint64](w2 >> 16)
+        opcode: uint32 = w2 & 0xffff
+        if size < 8:
+            acclen = 0                           # corrupt stream — reset
+            pos = 0
+            break
+        if acclen - pos < size:
+            break                                # incomplete — wait for more
+        wl_dispatch(c, obj, opcode,
+                    &wl_conn_acc[base + pos + 8], size - 8)
+        pos = pos + size
+    # Shift the unparsed remainder to the front.
+    if pos > 0:
+        rem: uint64 = acclen - pos
+        k: uint64 = 0
+        while k < rem:
+            wl_conn_acc[base + k] = wl_conn_acc[base + pos + k]
+            k = k + 1
+        acclen = rem
+    wl_conn_acclen[c] = acclen
+    # Tear down a disconnected client (peer closed + ring drained).
+    if afunix_ep_connected(server_ep) == 0 and afunix_rx_count(server_ep) == 0:
+        wl_free_conn(c)
+
+
+def wayland_after_connect():
+    # Accept every pending connection on the listener and register it.
+    if wl_listener_valid == 0:
+        return
+    while afunix_accept_ready(wl_listener_ep) == 1:
+        srv: int32 = afunix_accept_take(wl_listener_ep)
+        if srv < 0:
+            break
+        if wl_register_conn(srv) < 0:
+            afunix_close(srv)
+
+
+def wayland_pump():
+    # Drive every live connection: parse client bytes + emit replies.
+    # Called from the sendmsg/recvmsg syscall hooks after the transport
+    # has delivered the client's bytes (and any SCM fd) to the server ep.
+    c: uint64 = 0
+    while c < WL_MAX_CONN:
+        if wl_conn_inuse[c] != 0:
+            wl_pump_conn(c)
+        c = c + 1
+
+
+# --- connect(2) interception: lazy listener bind --------------------
+
+def wl_name_is_wayland(name: Ptr[uint8], nlen: uint64) -> int32:
+    # 1 if the socket name contains the substring "wayland-" (matches
+    # $XDG_RUNTIME_DIR/wayland-0, /tmp/wayland-0, abstract names, ...).
+    target: Ptr[uint8] = "wayland-"
+    tlen: uint64 = 8
+    if nlen < tlen:
+        return 0
+    i: uint64 = 0
+    while i + tlen <= nlen:
+        j: uint64 = 0
+        matched: int32 = 1
+        while j < tlen:
+            if name[i + j] != target[j]:
+                matched = 0
+                j = tlen
+            else:
+                j = j + 1
+        if matched == 1:
+            return 1
+        i = i + 1
+    return 0
+
+
+def wayland_connect_intercept(addr: uint64, addrlen: int32) -> int32:
+    # Inspect a connect(2) sockaddr_un. If it targets a Wayland display
+    # socket, lazily bind + listen the server's AF_UNIX listener to that
+    # exact name so the subsequent afunix_connect rendezvous succeeds.
+    # Returns 1 if this is a Wayland target (caller runs wayland_after_
+    # connect after connect), 0 otherwise.
+    if addr == 0 or addrlen < 3:
+        return 0
+    hdr: Array[112, uint8]
+    n: uint64 = cast[uint64](addrlen)
+    if n > 110:
+        n = 110
+    if copy_from_user(cast[uint64](&hdr[0]), addr, n) != 0:
+        return 0
+    fam: uint32 = cast[uint32](hdr[0]) | (cast[uint32](hdr[1]) << 8)
+    if fam != 1:                                 # AF_UNIX
+        return 0
+    # sun_path starts at byte 2; abstract names have a leading NUL.
+    pstart: uint64 = 2
+    if hdr[2] == 0:
+        pstart = 3
+    # Measure the name length (up to a NUL or the copied span).
+    nlen: uint64 = 0
+    while pstart + nlen < n and hdr[pstart + nlen] != 0:
+        nlen = nlen + 1
+    if wl_name_is_wayland(&hdr[pstart], nlen) == 0:
+        return 0
+    if wl_listener_valid == 0:
+        ep: int32 = afunix_socket(AFU_SOCK_STREAM)
+        if ep < 0:
+            return 0
+        if afunix_bind(ep, addr, addrlen) != 0:
+            afunix_close(ep)
+            return 0
+        if afunix_listen(ep, cast[int32](AFU_BACKLOG)) != 0:
+            afunix_close(ep)
+            return 0
+        wl_listener_ep = ep
+        wl_listener_valid = 1
+        printk0("[wayland] display listener bound (WAYLAND_DISPLAY)\n")
+    return 1
+
+
+# --- test accessors --------------------------------------------------
+
+def wayland_test_last_wid() -> int32:
+    return wl_test_last_wid
+
+
+def wayland_reset_for_test():
+    # Clear all server state (used by the in-kernel client selftest so a
+    # prior run cannot taint it).
+    wl_listener_ep = -1
+    wl_listener_valid = 0
+    c: uint64 = 0
+    while c < WL_MAX_CONN:
+        wl_conn_inuse[c] = 0
+        wl_conn_ep[c] = -1
+        wl_conn_acclen[c] = 0
+        c = c + 1
+    wl_test_last_wid = 0

@@ -454,6 +454,19 @@ from linux_abi.u_unixsock import (
     # §SCM_RIGHTS ancillary-fd conduit (sendmsg/recvmsg fd passing).
     afunix_scm_send, afunix_scm_recv, afunix_scm_pending,
 )
+# Native Wayland server front-end (docs/wayland_passthrough_design.md).
+# The Linux-ns client's connect/sendmsg/recvmsg syscalls drive the
+# reactive in-kernel Wayland server; it consumes the wl_shm pool fd from
+# the AF_UNIX SCM conduit and blits committed surfaces to the DE.
+from linux_abi.wayland import (
+    wayland_connect_intercept, wayland_after_connect, wayland_pump,
+    wayland_test_last_wid, wayland_reset_for_test,
+)
+# devwsys Wayland test hooks — read back the composited buffer to prove the
+# Phase-1 shm-buffer-to-screen pipeline (linux_abi/wayland client selftest).
+from sys.src.port9.port.devwsys import (
+    wsys_wl_backbuffer_pixel, wsys_wl_cache_pixel, wsys_wl_rasterize_test,
+)
 # AF_NETLINK / NETLINK_ROUTE (rtnetlink) — a Layer-2 framing window onto
 # the kernel's existing net state (drivers/net/ip.ad + eth.ad), letting
 # Debian's `ip` / systemd / libmnl enumerate interfaces, addresses and
@@ -4443,7 +4456,14 @@ def _u_connect(a0: uint64, a1: uint64, a2: uint64,
     # record the default datagram peer (DGRAM).
     uxep: int32 = _u_afunix_ep(fd)
     if uxep >= 0:
-        return afunix_connect(uxep, a1, cast[int32](a2))
+        # Wayland: lazily bind the display listener to the exact name the
+        # client is connecting to, so the rendezvous below succeeds, then
+        # accept + register the new connection after connect returns.
+        wl_target: int32 = wayland_connect_intercept(a1, cast[int32](a2))
+        crc: int64 = afunix_connect(uxep, a1, cast[int32](a2))
+        if crc == 0 and wl_target != 0:
+            wayland_after_connect()
+        return crc
     if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
     rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
@@ -5713,6 +5733,10 @@ def _u_sendmsg(a0: uint64, a1: uint64, a2: uint64,
                 return sn
             total = total + sn
         di = di + 1
+    # Wayland reactive pump: the client just flushed protocol bytes (and
+    # any wl_shm pool fd via the SCM conduit) to the server endpoint —
+    # parse them and emit replies before the client's next read/poll.
+    wayland_pump()
     return total
 
 
@@ -5772,6 +5796,9 @@ def _u_recvmsg(a0: uint64, a1: uint64, a2: uint64,
         put_user_32(0, umsg + MSGH_FLAGS)
         return rtotal
 
+    # Wayland reactive pump: flush any server work so a client that reads
+    # without an intervening flush still sees pending events.
+    wayland_pump()
     # Block until data is readable OR a passed fd is pending OR EOF,
     # unless the fd is non-blocking.
     nb: int32 = _u_fd_is_nonblock(fd)
@@ -15876,6 +15903,341 @@ def wlspike_scm_selftest() -> int32:
     _msync_restore_fds(boot_task, &fd_save[0])
     printk0("[wlspike] SCM_RIGHTS memfd round-trip OK: WLSPIKE_OK\n")
     printk0("[wlspike] PASS\n")
+    return 0
+
+
+# =====================================================================
+# [boot:38.wayland] Wayland-passthrough Phase-1 client self-test
+# =====================================================================
+#
+# An in-kernel Wayland CLIENT drives the REAL socket syscalls
+# (connect/sendmsg/recvmsg via linux_u_syscall_dispatch, exactly as
+# libwayland would) against the native Wayland server (linux_abi/
+# wayland.ad). It:
+#   1. connect(2)s to a "wayland-0" AF_UNIX name  -> lazily binds the
+#      server's display listener + registers the connection;
+#   2. get_registry -> receives wl_compositor / wl_shm / xdg_wm_base;
+#   3. binds wl_compositor + wl_shm;
+#   4. memfd_create + mmap MAP_SHARED, paints a SOLID colour, and passes
+#      the pool fd via SCM_RIGHTS in create_pool (the Phase-0 shm path);
+#   5. create_buffer + create_surface + attach + commit;
+#   6. asserts the committed ARGB8888 pixels reached the window's v2
+#      backbuffer AND, after a rasterize, the compositor layer cache —
+#      i.e. the shm-buffer-to-screen pipeline is live end to end.
+#
+# On success prints "[wayland] shm buffer on screen OK: WLPHASE1_OK" and
+# "[wayland] PASS". Gated by init/main.ad on /etc/wayland-test (planted by
+# build_initramfs.py when ENABLE_WAYLAND_TEST=1).
+
+WL_T_SEND_VADDR: uint64 = 0x0000567900000000   # send msghdr + wire page
+WL_T_RECV_VADDR: uint64 = 0x0000567900010000   # recv msghdr page
+WL_PHASE1_COLOR: uint32 = 0xFFCC6633           # r=33 g=66 b=CC a=FF (RGBA)
+
+_wlt_wbuf: Array[512, uint8]
+_wlt_wp:   uint64 = 0
+
+
+def _wlt_w32(v: uint32):
+    _wlt_wbuf[_wlt_wp]     = cast[uint8](v & 0xff)
+    _wlt_wbuf[_wlt_wp + 1] = cast[uint8]((v >> 8) & 0xff)
+    _wlt_wbuf[_wlt_wp + 2] = cast[uint8]((v >> 16) & 0xff)
+    _wlt_wbuf[_wlt_wp + 3] = cast[uint8]((v >> 24) & 0xff)
+    _wlt_wp = _wlt_wp + 4
+
+
+def _wlt_begin(obj: uint32) -> uint64:
+    start: uint64 = _wlt_wp
+    _wlt_w32(obj)
+    _wlt_w32(0)
+    return start
+
+
+def _wlt_end(start: uint64, op: uint32):
+    size: uint64 = _wlt_wp - start
+    v: uint32 = (cast[uint32](size) << 16) | (op & 0xffff)
+    _wlt_wbuf[start + 4] = cast[uint8](v & 0xff)
+    _wlt_wbuf[start + 5] = cast[uint8]((v >> 8) & 0xff)
+    _wlt_wbuf[start + 6] = cast[uint8]((v >> 16) & 0xff)
+    _wlt_wbuf[start + 7] = cast[uint8]((v >> 24) & 0xff)
+
+
+def _wlt_wstr(s: Ptr[uint8]):
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    _wlt_w32(cast[uint32](n + 1))
+    i: uint64 = 0
+    while i < n:
+        _wlt_wbuf[_wlt_wp] = s[i]
+        _wlt_wp = _wlt_wp + 1
+        i = i + 1
+    _wlt_wbuf[_wlt_wp] = 0
+    _wlt_wp = _wlt_wp + 1
+    while (_wlt_wp & 3) != 0:
+        _wlt_wbuf[_wlt_wp] = 0
+        _wlt_wp = _wlt_wp + 1
+
+
+def _wlt_sendmsg(fd: int32, dlen: uint64, scmfd: int32) -> int64:
+    # Fill the send msghdr page and drive the real SYS_sendmsg dispatch.
+    V: uint64 = WL_T_SEND_VADDR
+    put_user_64(0, V + MSGH_NAME)
+    put_user_32(0, V + MSGH_NAMELEN)
+    put_user_64(V + 64, V + MSGH_IOV)
+    put_user_64(1, V + MSGH_IOVLEN)
+    if scmfd >= 0:
+        put_user_64(V + 512, V + MSGH_CONTROL)
+        put_user_64(20, V + MSGH_CONTROLLEN)
+        put_user_64(20, V + 512 + 0)               # cmsg_len = 16 + 4
+        put_user_32(SCM_SOL_SOCKET, V + 512 + 8)
+        put_user_32(SCM_RIGHTS_TYPE, V + 512 + 12)
+        put_user_32(cast[uint32](scmfd), V + 512 + 16)
+    else:
+        put_user_64(0, V + MSGH_CONTROL)
+        put_user_64(0, V + MSGH_CONTROLLEN)
+    put_user_32(0, V + MSGH_FLAGS)
+    put_user_64(V + 128, V + 64)                    # iov_base
+    put_user_64(dlen, V + 64 + 8)                   # iov_len
+    copy_to_user(V + 128, cast[uint64](&_wlt_wbuf[0]), dlen)
+    return linux_u_syscall_dispatch(SYS_sendmsg, cast[uint64](fd),
+                                    V, 0, 0, 0, 0)
+
+
+def _wlt_recvmsg(fd: int32) -> int64:
+    # Drain pending server events into the recv page (data at RV+128).
+    RV: uint64 = WL_T_RECV_VADDR
+    put_user_64(0, RV + MSGH_NAME)
+    put_user_32(0, RV + MSGH_NAMELEN)
+    put_user_64(RV + 64, RV + MSGH_IOV)
+    put_user_64(1, RV + MSGH_IOVLEN)
+    put_user_64(0, RV + MSGH_CONTROL)
+    put_user_64(0, RV + MSGH_CONTROLLEN)
+    put_user_32(0, RV + MSGH_FLAGS)
+    put_user_64(RV + 128, RV + 64)
+    put_user_64(256, RV + 64 + 8)
+    return linux_u_syscall_dispatch(SYS_recvmsg, cast[uint64](fd),
+                                    RV, 0, 0, 0, 0)
+
+
+def _wl_phase1_fail(msg: Ptr[uint8]):
+    printk0("[wayland] FAIL: ")
+    printk0(msg)
+    printk0("\n")
+
+
+def wayland_phase1_selftest() -> int32:
+    PROT_READ:  int32 = 0x1
+    PROT_WRITE: int32 = 0x2
+    MAP_SHARED: int32 = 0x01
+    PG: uint64 = 4096
+    set_efer_nxe()
+    wayland_reset_for_test()
+
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = boot_task[0].fd_idx[fdi]
+        boot_task[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+    boot_slot: uint64 = current_idx_get()
+    boot_pml4: uint64 = task_pml4(cast[int32](boot_slot))
+
+    # Map the two msghdr/wire pages into user space.
+    ps: uint64 = alloc_page()
+    pr: uint64 = alloc_page()
+    if ps == 0 or pr == 0:
+        _wl_phase1_fail("alloc msg pages")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    if vm_map_user_page(boot_pml4, WL_T_SEND_VADDR, ps, 1) < 0:
+        _wl_phase1_fail("map send page")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    if vm_map_user_page(boot_pml4, WL_T_RECV_VADDR, pr, 1) < 0:
+        _wl_phase1_fail("map recv page")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    V: uint64 = WL_T_SEND_VADDR
+
+    # ---- 1) client socket + connect to "wayland-0" ---------------------
+    cep: int32 = afunix_socket(AFU_SOCK_STREAM)
+    if cep < 0:
+        _wl_phase1_fail("afunix_socket")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    cfd: int32 = vfs_alloc_socket_fd()
+    if cfd < 0:
+        _wl_phase1_fail("client fd alloc")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    vfs_socket_fd_set_record(cfd, afunix_fdbuf_for_ep(cep))
+    # sockaddr_un { family=AF_UNIX(1); sun_path="wayland-0\0" } at V+1024.
+    sa: Array[16, uint8]
+    sa[0] = 1
+    sa[1] = 0
+    wpath: Ptr[uint8] = "wayland-0"
+    pi: uint64 = 0
+    while pi < 9:
+        sa[2 + pi] = wpath[pi]
+        pi = pi + 1
+    sa[11] = 0
+    copy_to_user(V + 1024, cast[uint64](&sa[0]), 12)
+    crc: int64 = linux_u_syscall_dispatch(SYS_connect, cast[uint64](cfd),
+                                          V + 1024, 12, 0, 0, 0)
+    if crc != 0:
+        printk1("[wayland] FAIL: connect rc=%d\n", cast[uint64](crc))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- 2) get_registry, drain the globals ----------------------------
+    _wlt_wp = 0
+    gs: uint64 = _wlt_begin(1)                       # wl_display
+    _wlt_w32(2)                                       # new_id registry=2
+    _wlt_end(gs, 1)                                   # opcode 1 = get_registry
+    if _wlt_sendmsg(cfd, _wlt_wp, -1) < 0:
+        _wl_phase1_fail("sendmsg get_registry")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    rn: int64 = _wlt_recvmsg(cfd)
+    if rn <= 0:
+        printk1("[wayland] FAIL: no registry globals (recv rc=%d)\n",
+                cast[uint64](rn))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    ro0: Array[1, uint32]
+    get_user_32(WL_T_RECV_VADDR + 128, &ro0[0])
+    if ro0[0] != 2:
+        _wl_phase1_fail("first event not on wl_registry")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    printk1("[wayland] registry advertised %d bytes of globals\n",
+            cast[uint64](rn))
+
+    # ---- 3) bind wl_compositor(id 3) + wl_shm(id 4) --------------------
+    _wlt_wp = 0
+    bs: uint64 = _wlt_begin(2)                       # wl_registry
+    _wlt_w32(1)                                       # name = compositor
+    _wlt_wstr("wl_compositor")
+    _wlt_w32(4)                                       # version
+    _wlt_w32(3)                                       # new_id = 3
+    _wlt_end(bs, 0)                                   # opcode 0 = bind
+    bs2: uint64 = _wlt_begin(2)
+    _wlt_w32(2)                                       # name = shm
+    _wlt_wstr("wl_shm")
+    _wlt_w32(1)                                       # version
+    _wlt_w32(4)                                       # new_id = 4
+    _wlt_end(bs2, 0)
+    if _wlt_sendmsg(cfd, _wlt_wp, -1) < 0:
+        _wl_phase1_fail("sendmsg bind")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    _wlt_recvmsg(cfd)                                # drain wl_shm.format
+
+    # ---- 4) memfd shm pool: paint a solid colour, pass the fd ----------
+    shmfd: int32 = vfs_open_memfd(cast[Ptr[char]]("wl-shm"), 0)
+    if shmfd < 0:
+        _wl_phase1_fail("memfd_create")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    slot: int32 = vfs_fd_tmpfs_slot(shmfd)
+    if slot < 0:
+        _wl_phase1_fail("shm fd not tmpfs-backed")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    sbase64: int64 = vma_alloc_file_shared(boot_slot, 0, PG,
+                                           PROT_READ | PROT_WRITE,
+                                           MAP_SHARED,
+                                           cast[int32](FD_TMPFS_MARK),
+                                           cast[uint64](cast[uint32](slot)),
+                                           PG, 0)
+    if sbase64 < 0:
+        _wl_phase1_fail("mmap shm pool")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    sbase: uint64 = cast[uint64](sbase64)
+    vma_demand_fault(boot_slot, boot_pml4, sbase)
+    # 16x16 ARGB8888: memory bytes B,G,R,A = CC,66,33,FF (little-endian).
+    npx: uint64 = 0
+    while npx < 256:
+        po: uint64 = sbase + npx * 4
+        cast[Ptr[uint8]](po)[0] = 0xCC               # B
+        cast[Ptr[uint8]](po + 1)[0] = 0x66           # G
+        cast[Ptr[uint8]](po + 2)[0] = 0x33           # R
+        cast[Ptr[uint8]](po + 3)[0] = 0xFF           # A
+        npx = npx + 1
+
+    # create_pool(id 5, fd, size 1024) — fd via SCM_RIGHTS.
+    _wlt_wp = 0
+    cps: uint64 = _wlt_begin(4)                      # wl_shm
+    _wlt_w32(5)                                       # new_id pool = 5
+    _wlt_w32(1024)                                    # size
+    _wlt_end(cps, 0)                                  # opcode 0 = create_pool
+    if _wlt_sendmsg(cfd, _wlt_wp, shmfd) < 0:
+        _wl_phase1_fail("sendmsg create_pool")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # create_buffer(id 6, offset 0, w 16, h 16, stride 64, ARGB8888)
+    _wlt_wp = 0
+    cbs: uint64 = _wlt_begin(5)                      # wl_shm_pool
+    _wlt_w32(6)                                       # new_id buffer = 6
+    _wlt_w32(0)                                       # offset
+    _wlt_w32(16)                                      # width
+    _wlt_w32(16)                                      # height
+    _wlt_w32(64)                                      # stride
+    _wlt_w32(0)                                       # format ARGB8888
+    _wlt_end(cbs, 0)                                  # opcode 0 = create_buffer
+    # create_surface(id 7) on wl_compositor(3)
+    css: uint64 = _wlt_begin(3)
+    _wlt_w32(7)                                       # new_id surface = 7
+    _wlt_end(css, 0)                                  # opcode 0 = create_surface
+    if _wlt_sendmsg(cfd, _wlt_wp, -1) < 0:
+        _wl_phase1_fail("sendmsg create_buffer/surface")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- 5) attach(buffer) + commit -> blit to the window --------------
+    _wlt_wp = 0
+    ats: uint64 = _wlt_begin(7)                      # wl_surface
+    _wlt_w32(6)                                       # buffer = 6
+    _wlt_w32(0)                                       # x
+    _wlt_w32(0)                                       # y
+    _wlt_end(ats, 1)                                  # opcode 1 = attach
+    cms: uint64 = _wlt_begin(7)
+    _wlt_end(cms, 6)                                  # opcode 6 = commit
+    if _wlt_sendmsg(cfd, _wlt_wp, -1) < 0:
+        _wl_phase1_fail("sendmsg attach/commit")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- 6) assert the pixels reached the window backbuffer + cache ----
+    wid: int32 = wayland_test_last_wid()
+    if wid <= 0:
+        _wl_phase1_fail("no window created for the surface commit")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    bpx: uint32 = wsys_wl_backbuffer_pixel(wid, 0, 0)
+    if bpx != WL_PHASE1_COLOR:
+        printk2("[wayland] FAIL: backbuffer pixel %x != %x\n",
+                cast[uint64](bpx), cast[uint64](WL_PHASE1_COLOR))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    printk1("[wayland] committed shm buffer decoded into wid %d backbuffer\n",
+            cast[uint64](cast[int64](wid)))
+    # Rasterize (buffer scene verb -> layer cache) and re-check: proves the
+    # v2 backbuffer is now on the in-kernel present pipeline (the §2 gap).
+    wsys_wl_rasterize_test(wid)
+    cpx: uint32 = wsys_wl_cache_pixel(wid, 0, 0)
+    if cpx != WL_PHASE1_COLOR:
+        printk2("[wayland] FAIL: layer-cache pixel %x != %x\n",
+                cast[uint64](cpx), cast[uint64](WL_PHASE1_COLOR))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    _msync_restore_fds(boot_task, &fd_save[0])
+    printk0("[wayland] shm buffer on screen OK: WLPHASE1_OK\n")
+    printk0("[wayland] PASS\n")
     return 0
 
 
