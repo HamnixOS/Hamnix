@@ -472,8 +472,15 @@ HMP 1px-step mouse. NO new bugs — solid:
   forkpty program (shells, terminals). Agent #47. Preserve the do_execve
   serialization + concurrent-execve protection (f404c73c) — a wrong do_execve change
   wedged boot before.
-- [ ] **QA-N30** (distrofs) — creating a NEW file in the live distro ns returns
-  spurious ENOSPC despite ample free space (distrofs write path). Separate track.
+- [x] **QA-N30** (ext4) — FIXED ac2ff3f1 + boot-verified. NOT the distrofs daemon —
+  the live root is `#distro` ext4. `ext4_alloc_inode` scanned ONLY block group 0's
+  inode bitmap → "no free inode in group 0" ENOSPC the instant group 0 filled (a
+  host-mke2fs live image packs the Debian payload into group 0, so the FIRST create
+  failed). Exact twin of `ext4_alloc_block` (already multi-group). Fix: walk ALL
+  groups, return absolute inode (group-aware read/write already handle it); common
+  case unchanged. New test_ext4_multigroup_inode.sh (host-validated: next inode lands
+  in group 1; the -kernel runtime gate can't run on this host). KVM DE rl5 boot-clean,
+  no ext4 errors.
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
