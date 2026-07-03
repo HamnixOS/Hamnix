@@ -818,8 +818,12 @@ def _stage_directory_live(staging: Path):
     # wl socket dir), /tmp is scratch, /var/cache holds the fontconfig cache
     # fallback. Without these, `mkdir -p /run/...` fails ENOENT and
     # XDG_RUNTIME_DIR points at a non-existent dir.
-    for rel in ("run", "run/fontconfig", "tmp", "var/cache",
-                "var/cache/fontconfig"):
+    # tmp/.X11-unix: Xwayland's X11 unix-socket + lock dir. The path
+    # AF_UNIX bind rendezvouses through the in-kernel registry (no VFS
+    # node), but Xwayland's transport mkdir()s /tmp/.X11-unix + writes
+    # /tmp/.X<n>-lock, so the dir must exist + be writable at runtime.
+    for rel in ("run", "run/fontconfig", "tmp", "tmp/.X11-unix",
+                "var/cache", "var/cache/fontconfig"):
         d = distro / rel
         d.mkdir(parents=True, exist_ok=True)
         os.chmod(d, 0o1777)
