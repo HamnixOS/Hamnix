@@ -491,13 +491,16 @@ HMP 1px-step mouse. NO new bugs — solid:
 - [~] **QA-N32** — split. **(a) FIXED** dc7312e7: clone3/exit `#PF` hard-wedge —
   `task_exit_current` CLONE_CHILD_CLEARTID raw CPL-0 store to a non-present user
   ctid page → kernel #PF → trap-diag hlt → wedge. Fixed via `put_user_32` (like Linux
-  `mm_release`); hardened do_clone PARENT_SETTID + do_wait4/ptrace stores. **(b) OPEN =
-  the parked #9**: NO_HZ tickless-idle + APs-arm-no-LAPIC-timer + GLOBAL `tk_nohz_active`
-  → periodic tick stops+never resumes → tick-dependent waiters hang (both vCPUs
-  idle-halted, jiffies frozen; DE still repaints on mouse IRQ). Trial fixes regressed
-  SMP → reverted. Rework: per-CPU `tk_nohz_active` (program only local LAPIC) + AP
-  idle bounded backstop + steal hysteresis. Tracked on #9. This is the LAST gate to
-  reliably-interactive weston-terminal.
+  `mm_release`); hardened do_clone PARENT_SETTID + do_wait4/ptrace stores. **(b) FIXED**
+  23828e0a (the parked #9, resolved): the hrtimer queue+clockevent is a single GLOBAL
+  UNLOCKED structure, but the NO_HZ idle AP ran the global hrtimer expiry/reprogram
+  concurrently with the BSP → dropped the self-rearming scheduler-tick hrtimer → BSP
+  LAPIC never re-armed → jiffies stop → tick-dependent waiters hang. Fix: hrtimer
+  BSP-exclusive; idle AP arms only its OWN LAPIC (4ms backstop); per-CPU tk_nohz_active;
+  steal hysteresis. Verified: UP+SMP boot, objdiff 0-divergence, fork-storm liveness
+  (heartbeat continuous across 121 fork+exec exits, 0 non-monotonic drops/1253 samples).
+  The wedge is GONE — reliably-interactive weston-terminal + general SMP fork-load
+  stability.
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
