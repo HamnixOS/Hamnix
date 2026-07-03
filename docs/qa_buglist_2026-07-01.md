@@ -485,16 +485,19 @@ HMP 1px-step mouse. NO new bugs — solid:
   in group 1; the -kernel runtime gate can't run on this host). KVM DE rl5 boot-clean,
   no ext4 errors.
 
-- [~] **QA-N31** (weston-terminal render) — `vfs_fd_poll` has no `DEV_PTMX` arm, so a
-  pty master reports ALWAYS-readable; weston-terminal's blocking `read()` on the empty
-  pty master hangs. The #49 agent implemented the DEV_PTMX poll arm but REVERTED it
-  (couldn't isolate from QA-N32's wedge). Needs the pty-master poll to report readable
-  only when data is queued. Entangled with QA-N32.
-- [~] **QA-N32** (HIGH — general scheduler stability; likely the parked #9 family) —
-  intermittent clone3/fork cooperative-scheduler HARD-WEDGE under CPU burst (heartbeat
-  frozen, NO kernel fault; last traced syscall nr=435 clone3). A fork/clone concurrency
-  hazard independent of the wayland path. Blocks reliably testing QA-N31. Root-cause the
-  cooperative-scheduler wedge on clone3/fork.
+- [x] **QA-N31** (weston-terminal render) — FIXED 0a05e0af. Added a `DEV_PTMX` poll
+  arm to `vfs_fd_poll` + `namec_poll_readable` reporting POLLIN only when the source
+  queue has bytes. weston-terminal now RENDERS (shm-commit markers fire). Boot-verified.
+- [~] **QA-N32** — split. **(a) FIXED** dc7312e7: clone3/exit `#PF` hard-wedge —
+  `task_exit_current` CLONE_CHILD_CLEARTID raw CPL-0 store to a non-present user
+  ctid page → kernel #PF → trap-diag hlt → wedge. Fixed via `put_user_32` (like Linux
+  `mm_release`); hardened do_clone PARENT_SETTID + do_wait4/ptrace stores. **(b) OPEN =
+  the parked #9**: NO_HZ tickless-idle + APs-arm-no-LAPIC-timer + GLOBAL `tk_nohz_active`
+  → periodic tick stops+never resumes → tick-dependent waiters hang (both vCPUs
+  idle-halted, jiffies frozen; DE still repaints on mouse IRQ). Trial fixes regressed
+  SMP → reverted. Rework: per-CPU `tk_nohz_active` (program only local LAPIC) + AP
+  idle bounded backstop + steal hysteresis. Tracked on #9. This is the LAST gate to
+  reliably-interactive weston-terminal.
 
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
