@@ -290,45 +290,28 @@ if [ "$committed" -eq 1 ] && [ "${RENDER_OK:-0}" = "1" ] && [ "${TYPED_OK:-0}" =
     echo "$TAG RESULT: PASS — weston-terminal RENDERED and echoed TYPED input (render: $PNG_A, typed: $PNG_B)."
     exit 0
 fi
+# MILESTONE COMPLETE (QA-N33, 2026-07-02). Every gate that once blocked an
+# interactive weston-terminal is fixed on main: fontconfig writable-cache, the
+# forkpty-child execve NX fault (login_tty/TIOCSCTTY), the epoll/AF_UNIX
+# readiness bug, the DEV_PTMX pty-poll arm (0a05e0af), and the #9 NO_HZ SMP
+# hard-wedge (23828e0a: per-CPU tick + BSP-only hrtimer + AP LAPIC backstop +
+# steal hysteresis — heartbeat stays live under fork+exec+render load). A real
+# Debian weston-terminal now RENDERS its SSD-chromed terminal UI on the native
+# in-kernel Wayland compositor AND echoes typed input ("ls" via the /keys ring
+# -> wl_keyboard.key -> XKB -> shell echo). Verified end-to-end with the two
+# screendumps above. Both proofs are therefore HARD gates now: a render or a
+# typed-echo failure past this point is a REGRESSION and must FAIL the test
+# (not degrade to PARTIAL/SKIP). Only the environment gates at the top of this
+# script (no /dev/kvm, OVMF, image, socat, weston-terminal) skip cleanly.
 if [ "$committed" -eq 1 ] && [ "${RENDER_OK:-0}" = "1" ]; then
-    echo "$TAG RESULT: PARTIAL — weston-terminal rendered but typed-echo proof inconclusive (see $PNG_B)." >&2
-    exit 0
+    echo "$TAG RESULT: FAIL — weston-terminal RENDERED but typed input did NOT echo" >&2
+    echo "$TAG   (interframe change below threshold; see $PNG_B). The keyboard/seat" >&2
+    echo "$TAG   path (/keys ring -> wl_keyboard.key -> XKB) regressed." >&2
+    exit 1
 fi
-# NEXT-GATE diagnostic. The earlier gates are ALL cleared: fontconfig cache,
-# the forkpty-child execve NX fault (login_tty/TIOCSCTTY), AND — new here —
-# the epoll/AF_UNIX readiness bug. weston-terminal's toytoolkit main loop runs
-# on epoll_wait over its wayland display fd; the kernel epoll shim probed that
-# fd with raw vfs_fd_poll, which can NEVER report POLLIN for an AF_UNIX fd, so
-# the client mapped its xdg_toplevel then blocked forever without acking
-# configure. Fixed (linux_abi/u_syscalls.ad _u_epoll_scan now uses the same
-# _u_poll_fd_revents helper poll(2) uses): weston-terminal now CONNECTS, maps —
-#   [wayland] xdg get_xdg_surface / get_toplevel + configure sent
-#   [wayland] surface commit (pending buf=0)
-# — reads its configure via epoll, and forkpty's its shell.
-#
-# TWO remaining gates keep it from committing a render buffer:
-#   1. PTY-POLL READINESS. vfs_fd_poll has no DEV_PTMX arm, so a pty master/
-#      slave fd falls through to "always POLLIN|POLLOUT". weston-terminal's
-#      epoll is thus told the pty master is readable when empty; it issues a
-#      blocking read on the master (verified via a syscall trace: the client's
-#      last call is read() on the pty master fd) and hangs there, never
-#      flushing its queued xdg ack_configure. A vfs_fd_poll DEV_PTMX arm
-#      (pty_master_readable/pty_slave_readable) is the fix — but a naive
-#      version correlated with an intermittent hard scheduler wedge (see #2),
-#      so it needs care and is held back.
-#   2. INTERMITTENT clone3/forkpty + fontconfig CPU-burst WEDGE. On some boots
-#      the guest hard-wedges (cooperative scheduler starved — heartbeat frozen)
-#      either during weston-terminal's pre-forkpty cairo/fontconfig font scan
-#      or inside clone3 (the forkpty fork). No kernel fault is logged; the last
-#      traced syscall is nr=435 (clone3). This is a fork/clone concurrency
-#      hazard independent of the wayland path.
-# PROOF the wayland/shm/font pipeline is sound: the pure-shm sibling client
-# renders end-to-end ([wayland] shm buffer committed ... weston-simple-shm).
-echo "$TAG SKIP/PARTIAL: epoll/AF_UNIX + forkpty-execve + fontconfig gates cleared;" >&2
-echo "$TAG   weston-terminal now maps + reads its configure via epoll but does not" >&2
-echo "$TAG   yet commit a render buffer. Remaining gates: (1) vfs_fd_poll has no" >&2
-echo "$TAG   DEV_PTMX arm -> pty master reported always-readable -> client blocks in" >&2
-echo "$TAG   a read() on the pty master; (2) intermittent clone3/forkpty + fontconfig" >&2
-echo "$TAG   CPU-burst scheduler wedge (heartbeat freezes; last syscall nr=435 clone3)." >&2
-echo "$TAG   (pure-shm client weston-simple-shm renders fine — pipeline is sound)." >&2
-exit 0
+echo "$TAG RESULT: FAIL — weston-terminal did NOT render a terminal buffer." >&2
+echo "$TAG   committed=$committed RENDER_OK=${RENDER_OK:-0} TYPED_OK=${TYPED_OK:-0}." >&2
+echo "$TAG   This milestone (interactive Debian weston-terminal on the native" >&2
+echo "$TAG   Wayland compositor) previously PASSED; a no-render here is a regression." >&2
+echo "$TAG   Check the wayland/pty serial lines above and the #9 NO_HZ SMP wedge fix." >&2
+exit 1
