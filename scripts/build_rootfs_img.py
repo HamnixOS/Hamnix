@@ -678,6 +678,172 @@ def _plant_distro_provenance(distro: Path) -> None:
         encoding="ascii")
 
 
+def _stage_weston_closure(distro: Path, minbase: Path) -> tuple[int, int]:
+    """Bundle weston-terminal's GL-free closure into the distro tree.
+
+    PRODUCT GOAL: make the Linux-namespace GRAPHICAL apps first-class in
+    the DEFAULT shipped (busybox-minimal) live image. weston-terminal is
+    a pure-SHM cairo/pango libwayland client (NO GL/mesa/LLVM), so its
+    ACTUAL DT_NEEDED closure is ~45 small libs (~6 MiB) + glibc + fonts +
+    the prebuilt fontconfig cache + xkb-data + decoration icons — the
+    exact set scripts/stage_weston_term.sh proved for the render+input
+    milestone. That is ~20 MiB, NOT the ~900 MB `weston` (libweston/GL)
+    stack that forced weston out of the default image — so it fits the
+    RAM-extracted live root and the ESP FAT budget.
+
+    SOURCE: the already-staged debian-minbase FIXTURE (populated by
+    scripts/stage_weston_term.sh, which resolved + placed every closure
+    file at its canonical guest path). We recompute weston-terminal's
+    transitive DT_NEEDED closure with readelf and copy ONLY those libs
+    (never the whole fixture lib dir — that would drag in the full
+    debootstrap tree), plus the binaries, the matched glibc/ld.so pair,
+    the DejaVu fonts, the fonts.conf + prebuilt cache, the xkb tree, and
+    the toytoolkit decoration PNGs.
+
+    Idempotent + graceful: a no-op (returns 0,0) when the fixture lacks
+    weston-terminal (host never ran stage_weston_term.sh) or when the
+    distro already carries it (the full-mirror HAMNIX_LIVE_MINIMAL=0
+    path copied the whole fixture, weston included). Structuring the
+    catalogue in user/hamappmenu.ad makes a future Wayland app (Firefox,
+    xterm) a one-line add; adding its closure here is likewise additive.
+    """
+    if (distro / "usr/bin/weston-terminal").is_file():
+        return 0, 0                      # already present (full-mirror path)
+    wt = minbase / "usr/bin/weston-terminal"
+    if not wt.is_file():
+        print("[build_rootfs_img] weston-terminal absent from the debian-"
+              "minbase fixture; NOT bundling the Wayland client (run "
+              "scripts/stage_weston_term.sh to enable it)", flush=True)
+        return 0, 0
+
+    LIBDIRS = ["usr/lib/x86_64-linux-gnu", "lib/x86_64-linux-gnu",
+               "usr/lib", "lib", "usr/lib64", "lib64"]
+    BINS = ["usr/bin/weston-terminal", "usr/bin/weston-simple-shm"]
+
+    def _needed(p: Path) -> list[str]:
+        try:
+            out = subprocess.check_output(
+                ["readelf", "-d", str(p)],
+                stderr=subprocess.DEVNULL).decode()
+        except Exception:
+            return []
+        return [l.split("[")[1].split("]")[0] for l in out.splitlines()
+                if "(NEEDED)" in l and "[" in l]
+
+    def _find(soname: str):
+        for d in LIBDIRS:
+            c = minbase / d / soname
+            if c.exists():
+                return c
+        return None
+
+    copied = 0
+    nbytes = 0
+
+    def _copy(src: Path, rel: str) -> None:
+        nonlocal copied, nbytes
+        dst = distro / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        real = src.resolve() if src.is_symlink() else src
+        shutil.copy2(real, dst)
+        copied += 1
+        nbytes += dst.stat().st_size
+
+    # --- transitive DT_NEEDED closure (libs only that resolve) --------
+    seen: set[str] = set()
+    work: list[str] = []
+    for b in BINS:
+        bp = minbase / b
+        if bp.exists():
+            work += _needed(bp)
+    while work:
+        so = work.pop()
+        if so in seen:
+            continue
+        seen.add(so)
+        rp = _find(so)
+        if rp is None:
+            continue
+        real = rp.resolve() if rp.is_symlink() else rp
+        # canonical usrmerge path + the /lib spelling (belt + suspenders,
+        # keeps PT_INTERP/DT_NEEDED resolution happy either way).
+        _copy(real, "usr/lib/x86_64-linux-gnu/" + so)
+        d2 = distro / "lib/x86_64-linux-gnu" / so
+        d2.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(real, d2)
+        work += _needed(real)
+
+    # --- the two client binaries --------------------------------------
+    for b in BINS:
+        src = minbase / b
+        if src.exists():
+            _copy(src, b)
+            os.chmod(distro / b, 0o755)
+
+    # --- glibc runtime + dynamic linker (matched pair) ----------------
+    # The fixture's glibc was upgraded to the host version by
+    # stage_weston_term.sh (weston needs GLIBC_2.38+); copy that matched
+    # set + the ld.so PT_INTERP so the closure resolves.
+    GLIBC = ["libc.so.6", "libm.so.6", "libmvec.so.1", "libpthread.so.0",
+             "libdl.so.2", "librt.so.1", "libresolv.so.2", "libutil.so.1",
+             "libanl.so.1", "libnss_files.so.2", "libnss_compat.so.2",
+             "libnss_dns.so.2", "libBrokenLocale.so.1"]
+    for so in GLIBC:
+        for d in ("usr/lib/x86_64-linux-gnu", "lib/x86_64-linux-gnu"):
+            src = minbase / d / so
+            if src.exists():
+                real = src.resolve() if src.is_symlink() else src
+                _copy(real, "usr/lib/x86_64-linux-gnu/" + so)
+                d2 = distro / "lib/x86_64-linux-gnu" / so
+                d2.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(real, d2)
+                break
+    for ld in ("usr/lib64/ld-linux-x86-64.so.2",
+               "lib64/ld-linux-x86-64.so.2",
+               "usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"):
+        src = minbase / ld
+        if src.exists():
+            _copy(src, ld)
+
+    # --- DejaVu fonts -------------------------------------------------
+    for f in ("usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+              "usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        src = minbase / f
+        if src.exists():
+            _copy(src, f)
+
+    # --- fontconfig conf + PREBUILT cache -----------------------------
+    fc = minbase / "etc/fonts/fonts.conf"
+    if fc.exists():
+        _copy(fc, "etc/fonts/fonts.conf")
+    cachedir = minbase / "etc/fonts/cache"
+    if cachedir.is_dir():
+        for c in sorted(cachedir.iterdir()):
+            if c.is_file():
+                _copy(c, "etc/fonts/cache/" + c.name)
+
+    # --- xkb keymap data (libxkbcommon default include path) ----------
+    xkb = minbase / "usr/share/X11"
+    dst_xkb = distro / "usr/share/X11"
+    if xkb.is_dir() and not dst_xkb.exists():
+        shutil.copytree(xkb, dst_xkb, symlinks=True)
+
+    # --- toytoolkit decoration icons (client-side window frame) -------
+    wshare = minbase / "usr/share/weston"
+    if wshare.is_dir():
+        for p in sorted(wshare.iterdir()):
+            if p.is_file() and p.suffix == ".png":
+                _copy(p, "usr/share/weston/" + p.name)
+
+    print(f"[build_rootfs_img] bundled weston-terminal Wayland client + "
+          f"GL-free closure into distro/: {copied} files "
+          f"({nbytes/(1<<20):.1f} MiB) from "
+          f"{minbase.relative_to(HERE) if minbase.is_relative_to(HERE) else minbase} "
+          f"(closure libs + glibc/ld.so + DejaVu fonts + fontconfig cache "
+          f"+ xkb + decoration icons; NO GL/mesa)", flush=True)
+    return copied, nbytes
+
+
 def _stage_distro(distro: Path, live: bool = False) -> None:
     """Stage the distro/ subtree: a genuine Debian root + busybox fallback.
 
@@ -759,6 +925,13 @@ def _stage_distro(distro: Path, live: bool = False) -> None:
               f"(busybox-only fallback — real closure absent/trimmed)",
               flush=True)
     _plant_distro_provenance(distro)
+    # Bundle the Linux-namespace Wayland client (weston-terminal + its
+    # GL-free closure) so the DEFAULT (busybox-minimal) live image ships a
+    # first-class graphical Linux-ns app — the DE Applications menu's
+    # "Linux Namespace" -> "Wayland Terminal" entry launches it. No-op on
+    # the full-mirror path (already present) or when the fixture lacks it.
+    if minbase.is_dir():
+        _stage_weston_closure(distro, minbase)
 
 
 def _stage_directory(staging: Path):

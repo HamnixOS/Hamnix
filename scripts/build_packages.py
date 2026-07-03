@@ -637,6 +637,10 @@ def _files_desktop_config() -> list[tuple[Path, str]]:
     # Per-session DE rc bodies (user + hostowner-elevated).
     _add_etc_file(f, "rc.de-user")
     _add_etc_file(f, "rc.de-hostowner")
+    # Linux-namespace Wayland-client launcher (Applications ->
+    # "Linux Namespace" -> "Wayland Terminal"). Sourced by
+    # /bin/hamsh from hamUId's daemon_launch_wayland_ns().
+    _add_etc_file(f, "rc.de-wayland")
     # Launcher layout.
     _add_etc_file(f, "desktop.icons")
     _add_etc_file(f, "panel.conf")
