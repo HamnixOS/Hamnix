@@ -64,6 +64,11 @@ PKGS=(
   libgl1 libglx0 libglvnd0 libgbm1 libepoxy0 libdrm2
   libxshmfence1 libxcvt0 libxfont2 libfontenc1
   libtirpc3t64 libgcrypt20 libgpg-error0 libdecor-0-0
+  # libtirpc pulls in GSS-API (RPC auth) -> Xwayland DT_NEEDED-links
+  # libgssapi_krb5.so.2 transitively; without its krb5 closure Xwayland's
+  # ld.so aborts "error while loading shared libraries: libgssapi_krb5.so.2"
+  # (exit 127) before it ever connects to the Wayland server.
+  libgssapi-krb5-2 libkrb5-3 libk5crypto3 libcom-err2 libkrb5support0 libkeyutils1
   libwayland-client0 libwayland-server0 libpixman-1-0
   # --- X protocol / toolkit libs (clients) --------------------------------
   libx11-6 libx11-xcb1 libxcb1 libxext6 libxtst6 libxi6 libxrender1
