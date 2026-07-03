@@ -75,14 +75,14 @@ from arch.x86.kernel.time import get_jiffies
 # runnable so they re-scan the shared runqueue (Linux's smp_send_reschedule).
 # No-op on a uniprocessor boot (gated on cpus_online > 1 inside the helper).
 from arch.x86.kernel.apic import smp_send_reschedule, smp_send_reschedule_cpu
-# NO_HZ dynticks (kernel/time/tick.ad): when a CPU halts in the idle loop
-# with no near hrtimer deadline, stop the periodic tick — program the
-# clockevent for the next REAL deadline (or a backstop) instead of waking
-# 100×/s to do nothing. tick_nohz_idle_exit() accounts the skipped jiffies
-# on wake so timekeeping stays correct. Both are no-ops until boot:16.time
-# enables high-res mode, so a pre-time-subsystem boot keeps the periodic
-# tick unchanged.
-from kernel.time.tick import tick_nohz_idle_enter, tick_nohz_idle_exit
+# QA-N32b AP idle backstop: APs arm NO periodic LAPIC tick (they wake via a
+# directed reschedule IPI). To make the idle AP self-healing — so it can
+# never wedge waiting on a tick that never resumes — it arms its OWN local
+# LAPIC one-shot for a short bounded deadline before halting, re-waking to
+# re-scan its runqueue. This is a purely LOCAL operation (programs only the
+# calling CPU's LAPIC); the AP never touches the global clockevent / hrtimer
+# queue (that stays BSP-exclusive — see arch/x86/kernel/time.ad).
+from arch.x86.kernel.apic import lapic_timer_set_oneshot_ns
 # Per-CPU runqueue (#6): how many CPUs are live, so the placement / steal
 # logic knows the valid logical-CPU id range to spread runnable work over.
 from arch.x86.kernel.smp import get_cpus_online
@@ -103,6 +103,22 @@ from kernel.rcu.rcu import (
     rcu_read_lock, rcu_read_unlock, rcu_set_yield_hook,
     rcu_idle_enter, rcu_idle_exit,
 )
+
+# QA-N32b AP idle self-healing backstop period. An idle AP arms its LOCAL
+# LAPIC one-shot for this long before halting so it always re-wakes to
+# re-scan its runqueue even absent a reschedule IPI, without relying on any
+# global tick. 4 ms is finer than the 10 ms scheduler tick (so a freshly
+# stealable task is picked up promptly) yet coarse enough that a fully idle
+# AP wakes only ~250×/s — negligible overhead, no timer storm.
+AP_IDLE_BACKSTOP_NS: uint64 = 4000000            # 4 ms
+
+# QA-N32b work-steal hysteresis window (jiffies). A task dispatched within
+# this many jiffies is NOT eligible to be stolen onto another CPU, so a
+# just-run task keeps cache affinity and cannot ping-pong between cores when
+# an idle AP re-scans on its short backstop. 2 jiffies (~20 ms at HZ=100) is
+# short enough that genuine load-balancing of a long-runnable task still
+# happens promptly.
+STEAL_HYSTERESIS_JIFFIES: uint64 = 2
 
 extern def __switch_to_asm(prev: Ptr[uint8], next: Ptr[uint8])
 extern def enter_first_task(task: Ptr[uint8])
@@ -965,6 +981,17 @@ class TaskStruct:
     # offset shifts; fresh .bss slots start at 0 (create paths re-stamp).
     last_syscall_jiffies: uint64
     wd_last_dump_jiffies:  uint64
+    # QA-N32b WORK-STEAL HYSTERESIS. Stamped with get_jiffies() by
+    # sched_note_dispatch every time this task is dispatched onto a CPU.
+    # _sched_try_pull_locked refuses to STEAL a task whose last dispatch was
+    # within STEAL_HYSTERESIS_JIFFIES so a just-run task is not immediately
+    # yanked onto the other CPU — which, once the idle AP wakes on a short
+    # local backstop and re-scans aggressively, could otherwise ping-pong a
+    # task between cores every few ms (the steal-livelock a naive tick change
+    # exposed). Appended at the END of TaskStruct so no earlier offset shifts;
+    # fresh .bss slots start at 0 (== "dispatched long ago" → freely
+    # stealable, which is correct for a brand-new/never-run task).
+    last_dispatch_jiffy: uint64
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -2586,6 +2613,9 @@ def sched_note_dispatch(slot: uint64):
     cid: uint64 = get_cpu_id()
     if cid < 16:
         task_table[slot].cpu_runs[cid] = task_table[slot].cpu_runs[cid] + 1
+    # QA-N32b: timestamp this dispatch so _sched_try_pull_locked can apply
+    # steal hysteresis (don't yank a just-run task onto another CPU).
+    task_table[slot].last_dispatch_jiffy = get_jiffies()
 
 
 def sched_cpu_runs(slot: uint64, cpu: uint64) -> uint64:
@@ -4058,8 +4088,16 @@ def _sched_try_pull_locked(my_cpu: uint64) -> int32:
                     # any CPU. Verified by test_smp_user.sh (USER task runs +
                     # syscalls on cpu1). Only slot 0 (the BSP boot/PID-1 task)
                     # stays pinned — it must never migrate off cpu 0.
+                    # QA-N32b steal hysteresis: skip a task dispatched within
+                    # the last STEAL_HYSTERESIS_JIFFIES so a just-run task is
+                    # not immediately yanked onto this CPU (prevents cross-CPU
+                    # ping-pong / steal-livelock). jiffies is monotonic; a
+                    # never-run slot (last_dispatch_jiffy == 0) yields a large
+                    # difference and stays freely stealable.
+                    recent: uint64 = get_jiffies() - task_table[s].last_dispatch_jiffy
                     if s != 0 \
                             and task_table[s].on_cpu == 0 \
+                            and recent >= STEAL_HYSTERESIS_JIFFIES \
                             and sched_cpu_allowed(s, my_cpu) != 0:
                         sv: uint64 = task_table[s].vruntime
                         if steal < 0 or sv < steal_v:
@@ -5001,27 +5039,30 @@ def sched_ap_idle_loop():
             rcu_idle_enter()
             cpu_idle_enter()
             if woke == 0:
-                # NO_HZ dynticks: provably idle with no runnable task, so
-                # stop the periodic tick — program the clockevent for the
-                # next real hrtimer deadline (or a 1 s backstop) instead of
-                # waking 100×/s. No-op (returns 0) until high-res mode is
-                # enabled; then the LAPIC fires only at the real deadline,
-                # the resched IPI, or any device IRQ. Done with IRQs off so
-                # the program + halt is atomic w.r.t. a wakeup.
-                nohz_stopped: int32 = tick_nohz_idle_enter()
-                # Provably idle with IRQs off: park until the reschedule IPI
-                # (or any other interrupt) fires. safe_halt() is an atomic
-                # `sti; hlt`, so a resched IPI raised after our re-scan but
-                # before the hlt is held pending and wakes us immediately —
-                # no lost wakeup. On return IRQs are enabled (iret restored
-                # IF=1); we re-disable below to balance cpu_idle_leave's view.
+                # QA-N32b SELF-HEALING BACKSTOP: an AP has no periodic LAPIC
+                # tick — it normally sleeps until a directed reschedule IPI.
+                # Arm THIS cpu's LAPIC one-shot for a short bounded deadline
+                # before halting so the AP ALWAYS re-wakes and re-scans its
+                # runqueue even if an IPI is somehow missed and even while the
+                # BSP tick is momentarily quiescent. This is a purely LOCAL
+                # LAPIC program (no global clockevent / hrtimer-queue mutation
+                # — that is BSP-exclusive; APs skip the hrtimer hook in
+                # arch/x86/kernel/time.ad), so it cannot corrupt shared timer
+                # state or wedge the box the way the old NO_HZ global tick-stop
+                # did (the long-parked #9 freeze). The backstop fire runs the
+                # timer ISR on the AP (jiffies++, preempt), then we re-loop and
+                # re-arm. Done with IRQs off so program + halt is atomic w.r.t.
+                # a wakeup. No-op if the LAPIC timer is uncalibrated.
+                lapic_timer_set_oneshot_ns(AP_IDLE_BACKSTOP_NS)
+                # Provably idle with IRQs off: park until the reschedule IPI,
+                # the local backstop one-shot, or any other interrupt fires.
+                # safe_halt() is an atomic `sti; hlt`, so a resched IPI raised
+                # after our re-scan but before the hlt is held pending and
+                # wakes us immediately — no lost wakeup. On return IRQs are
+                # enabled (iret restored IF=1); we re-disable below to balance
+                # cpu_idle_leave's view.
                 safe_halt()
                 local_irq_disable()
-                # Woke from idle: account the jiffies that elapsed while the
-                # tick was stopped + expire any hrtimers that came due, then
-                # restore normal tick handling. No-op if NO_HZ wasn't active.
-                if nohz_stopped != 0:
-                    tick_nohz_idle_exit()
             else:
                 # A task appeared in the re-scan — skip hlt, re-enable IRQs,
                 # and loop straight back to the top to dispatch it.
