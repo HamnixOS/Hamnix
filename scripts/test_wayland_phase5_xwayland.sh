@@ -184,7 +184,13 @@ XWL_ENV='export XDG_RUNTIME_DIR=/run ; export WAYLAND_DISPLAY=wayland-0 ; export
 # NOTE: hamsh lexes a non-glued ':' (space/'=' before it) as OP_COLON, so
 # the X display arg MUST be single-quoted (':0') to reach argv as a literal
 # word; likewise DISPLAY=':0' and the geometry '+x+y' below.
-XWL_CMD="$XWL_ENV ; spawn linux { /usr/bin/Xwayland ':0' -noreset -shm -geometry '800x600' }"
+# -ac DISABLES X access control: a standalone `Xwayland :0` still enforces
+# MIT-MAGIC-COOKIE auth and refuses cookie-less local clients ("Authorization
+# required, but no authorization protocol specified" -> xdpyinfo can't open
+# the display). A compositor-launched Xwayland gets `-auth <cookie>`; for the
+# local trusted single-user bridge we disable access control so any client on
+# the box connects. (The namespace model already gates who reaches the socket.)
+XWL_CMD="$XWL_ENV ; spawn linux { /usr/bin/Xwayland ':0' -ac -noreset -shm -geometry '800x600' }"
 echo "$TAG --- RUNG (a): launch Xwayland :0 (connect to native Wayland) ---"
 rung_a=0
 if send_until "$XWL_CMD" "$REGISTRY_MARKER" "$CMD_WAIT"; then
