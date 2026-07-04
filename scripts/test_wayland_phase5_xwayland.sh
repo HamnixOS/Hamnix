@@ -230,6 +230,18 @@ fi
 # =====================================================================
 # LADDER RUNG (c): an X11 app maps + renders — DISPLAY=:0 xeyes.
 # =====================================================================
+# KNOWN GATE (QA, this track): xeyes connects to the X server cleanly
+# (verified: [nxafu] connect + accept), but then SPINS on setitimer(2)
+# (x86_64 nr 38, ITIMER_REAL) which is unimplemented -> ENOSYS. xeyes drives
+# its eye redraw off the SIGALRM interval timer, so with setitimer ENOSYS it
+# never draws and Xwayland never re-commits the root surface (this rung
+# stays "no"; rungs a+b are green -> the test reports PARTIAL/exit 0). The
+# fix is a real ITIMER_REAL: per-task interval-timer state armed by
+# setitimer/getitimer and a timer-tick that posts SIGALRM on expiry (plus
+# clearing the per-slot state on task reap so a reused slot can't inherit a
+# stale timer). Bounded but a distinct timer/signal subsystem — tracked
+# separately. A GL-free X client that renders on Expose alone (no timer)
+# would flip this rung today.
 echo "$TAG --- RUNG (c): DISPLAY=:0 xeyes (X11 app renders) ---"
 # Screendump BEFORE the app maps, to diff for the new rendered content.
 PPM_PRE="$OUTDIR/wl5_xwl_pre.ppm"
