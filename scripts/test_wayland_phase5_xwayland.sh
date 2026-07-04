@@ -153,6 +153,25 @@ else
 fi
 
 # =====================================================================
+# PREREQ: the X11 UNIX-socket directory /tmp/.X11-unix must exist.
+# =====================================================================
+# Xwayland (via libxtrans) creates its X listening socket under
+# /tmp/.X11-unix. When euid != 0 (the live/DE session is non-root)
+# libxtrans REFUSES to mkdir that directory and then aborts the WHOLE X
+# listener (it binds the abstract AND filesystem X sockets in one call, so
+# a missing dir kills both) — xdpyinfo/xeyes then get "unable to open
+# display". /tmp is the BASE namespace directory: nsrun mounts only
+# /var,/usr,/etc from distrofs, so /tmp (like /run, which carries the
+# wayland-0 socket) comes from the base ns, NOT /distro/tmp. Create it
+# natively here — this is exactly tmpfiles.d/x11.conf's job on a real
+# system (dir /tmp/.X11-unix 1777 root root); the native session launcher
+# owns it. Native mkdir gives a world-usable dir; libxtrans only needs the
+# dir to be stat-able so it proceeds to bind() the socket by name.
+echo "$TAG PREREQ: seeding /tmp/.X11-unix in the base namespace"
+send "mkdir /tmp/.X11-unix"
+sleep 3
+
+# =====================================================================
 # LADDER RUNG (a): launch Xwayland; it connects to the native compositor.
 # =====================================================================
 # Rootful X screen (default, no -rootless): Xwayland creates ONE root
