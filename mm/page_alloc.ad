@@ -32,7 +32,7 @@
 # slab allocator (mm/slab.ad): slab uses order-0 single pages, the
 # large-kmalloc path in slab.ad uses order >0 for blocks > 2 KiB.
 
-from mm.memblock import memblock_alloc
+from mm.memblock import memblock_alloc, memblock_region_top
 from mm.cow import cow_boot_cr3, cow_refcount, cow_drop_page
 from kernel.printk.printk import printk1, printk2
 # #mm-parity: reset a frame's struct-page descriptor (LRU membership,
@@ -48,6 +48,13 @@ extern def local_irq_save() -> uint64
 extern def local_irq_restore(flags: uint64)
 extern def read_cr3() -> uint64
 extern def load_cr3(value: uint64)
+
+# Lower bound of allocator-managed RAM (the page allocator's floor set by
+# e820_init: kernel_image_end() rounded to the memblock start). Any masked
+# free-list link BELOW this is provably not an allocator-owned page. Used
+# by the free-list integrity guard below to reject a scribbled pointer
+# BEFORE it is dereferenced.
+extern def kernel_image_end() -> uint64
 
 # SMP buddy-allocator lock (root-cause fix for the intermittent whole-
 # system hard freeze after a spawn/reap-heavy operation — e.g. a 3-stage
@@ -136,6 +143,109 @@ nr_pages_free:    uint64 = 0
 nr_pages_freed_total: uint64 = 0
 
 
+# --- free-list integrity guard (QA-N37) ----------------------------
+#
+# ROOT-CAUSE CATCHER for the intermittent `#GP vec=0x0d` in
+# _alloc_pages_raw on `mov rax,[rax]` under heavy memory pressure. That
+# fault is a wild dereference of a CORRUPTED free-list pointer: a page
+# sitting on a buddy free list had its intrusive `next` link (its first 8
+# bytes) SCRIBBLED — by a use-after-free (a task still writes a page after
+# it was freed to the buddy allocator), a double-free (the same run pushed
+# onto a list twice, then handed out and overwritten while still linked),
+# or a stray wild kernel write landing on a free page. The corruption is
+# committed silently at free/UAF time and only detonates much later when
+# an unrelated allocation pops the poisoned head.
+#
+# The guard makes the corrupting event self-announcing and non-fatal:
+#
+#   * Every freed run carries, in ADDITION to its next-link at [0], a
+#     position-derived CANARY at [8] == addr ^ _PA_CANARY. The canary is a
+#     pure function of the run's own address, so legitimate unlink writes
+#     (which only rewrite [0]) never disturb it — but ANY foreign write
+#     into a still-free page (a UAF/double-free scribble that clobbers the
+#     first cache line) corrupts it. Checked on every pop/walk.
+#   * Every link is bounds-validated (_pa_link_ok) before being
+#     dereferenced: a valid link is NULL or a page-aligned physical address
+#     inside [floor, top). A scribbled non-canonical / sub-floor / user-VA
+#     pointer is caught HERE, before the faulting `mov rax,[rax]`.
+#   * On detection the guard LOGS the offending page + bad value + order
+#     and SELF-HEALS by truncating the list at the corruption point (or
+#     ignoring a detected double-free push), so the box survives with a
+#     diagnostic instead of hard-halting on the wild deref. Truncation can
+#     strand the tail of one list — a bounded leak, never a fault.
+#
+# This is a permanent guard: it stays on the hot path (two extra word
+# accesses + a cached-bounds check per link op) and converts a mysterious
+# one-shot halt into a precise, attributable report the moment a bad free
+# happens.
+_PA_CANARY: uint64 = 0x9A1EDEADF2EE1000
+
+# Cached allocator RAM bounds (populated lazily on first use; both are
+# fixed once early boot has enumerated memblock, so a one-shot cache
+# avoids re-scanning the region list on every hot-path link op).
+_pa_ram_floor_cache: uint64 = 0
+_pa_ram_top_cache:   uint64 = 0
+
+
+def _pa_ram_floor() -> uint64:
+    if _pa_ram_floor_cache == 0:
+        _pa_ram_floor_cache = kernel_image_end()
+    return _pa_ram_floor_cache
+
+
+def _pa_ram_top() -> uint64:
+    if _pa_ram_top_cache == 0:
+        _pa_ram_top_cache = memblock_region_top()
+    return _pa_ram_top_cache
+
+
+def _pa_link_ok(addr: uint64) -> int32:
+    # A valid intrusive free-list link is either NULL (end of list) or a
+    # page-aligned physical address inside allocator-managed RAM. Anything
+    # else is a scribbled pointer we must NOT dereference.
+    if addr == 0:
+        return 1
+    if (addr & 0xFFF) != 0:
+        return 0
+    floor: uint64 = _pa_ram_floor()
+    if floor != 0 and addr < floor:
+        return 0
+    top: uint64 = _pa_ram_top()
+    if top != 0 and addr >= top:
+        return 0
+    return 1
+
+
+def _pa_set_next(node: uint64, next_val: uint64):
+    # Push-side link store: the intrusive next-link at [0] plus the
+    # position-derived canary at [8]. Callers guarantee `node` is a real
+    # page-aligned run of at least one page (>= 16 bytes), so [8] is in
+    # bounds and is dead memory until the run is re-allocated.
+    cast[Ptr[uint64]](node)[0] = next_val
+    cast[Ptr[uint64]](node + 8)[0] = node ^ _PA_CANARY
+
+
+def _pa_get_next(node: uint64, order: int32) -> uint64:
+    # Pop/walk-side link load. Verifies the canary (catches a page written
+    # while free — UAF / double-free) and the link value (catches a
+    # scribbled pointer) BEFORE returning. On any failure, logs the
+    # corrupting event with full context and SELF-HEALS by returning 0
+    # (truncate the list here) so the kernel never faults on a wild deref.
+    canary: uint64 = cast[Ptr[uint64]](node + 8)[0]
+    if canary != (node ^ _PA_CANARY):
+        printk2("[pa-corrupt] page %p scribbled while free (UAF/double-free) order=%d\n",
+                node, cast[uint64](order))
+        printk2("[pa-corrupt]   canary=%p expected=%p — truncating free list\n",
+                canary, node ^ _PA_CANARY)
+        return 0
+    nxt: uint64 = cast[Ptr[uint64]](node)[0]
+    if _pa_link_ok(nxt) == 0:
+        printk2("[pa-corrupt] page %p has wild next-link %p — truncating free list\n",
+                node, nxt)
+        return 0
+    return nxt
+
+
 # --- order-N alloc / free ------------------------------------------
 
 def alloc_pages(order: int32) -> uint64:
@@ -179,10 +289,19 @@ def _alloc_pages_raw(order: int32) -> uint64:
     o: uint64 = cast[uint64](order)
     head: uint64 = free_pages_order[o]
     if head != 0:
-        free_pages_order[o] = cast[Ptr[uint64]](head)[0]
-        if order == 0:
-            nr_pages_free = nr_pages_free - 1
-        return head
+        # Integrity guard: a corrupted list head is the exact source of the
+        # QA-N37 `mov rax,[rax]` #GP. Validate it BEFORE dereferencing;
+        # if it is wild, log and drop the poisoned list rather than fault,
+        # then fall through to the split / memblock paths.
+        if _pa_link_ok(head) == 0:
+            printk2("[pa-corrupt] order-%d free-list head is wild: %p — dropping list\n",
+                    o, head)
+            free_pages_order[o] = 0
+        else:
+            free_pages_order[o] = _pa_get_next(head, order)
+            if order == 0:
+                nr_pages_free = nr_pages_free - 1
+            return head
 
     # Path 2: split a higher-order run into two halves of this order;
     # return one half, put the other half on this order's free list.
@@ -192,7 +311,7 @@ def _alloc_pages_raw(order: int32) -> uint64:
         if higher != 0:
             half: uint64 = PAGE_SIZE << o
             buddy: uint64 = higher + half
-            cast[Ptr[uint64]](buddy)[0] = free_pages_order[o]
+            _pa_set_next(buddy, free_pages_order[o])
             free_pages_order[o] = buddy
             if order == 0:
                 nr_pages_free = nr_pages_free + 1
@@ -219,17 +338,24 @@ def _try_remove_buddy(target: uint64, order: int32) -> int32:
     head: uint64 = free_pages_order[o]
     if head == 0:
         return 0
+    # Integrity guard: never walk from a wild head (QA-N37).
+    if _pa_link_ok(head) == 0:
+        printk2("[pa-corrupt] order-%d buddy-scan head wild: %p — dropping list\n",
+                o, head)
+        free_pages_order[o] = 0
+        return 0
     if head == target:
-        free_pages_order[o] = cast[Ptr[uint64]](head)[0]
+        free_pages_order[o] = _pa_get_next(head, order)
         return 1
     prev: uint64 = head
-    cur:  uint64 = cast[Ptr[uint64]](head)[0]
+    cur:  uint64 = _pa_get_next(head, order)
     while cur != 0:
         if cur == target:
-            cast[Ptr[uint64]](prev)[0] = cast[Ptr[uint64]](cur)[0]
+            # Unlink: prev.next = cur.next (validated read + canaried write).
+            _pa_set_next(prev, _pa_get_next(cur, order))
             return 1
         prev = cur
-        cur  = cast[Ptr[uint64]](cur)[0]
+        cur  = _pa_get_next(cur, order)
     return 0
 
 
@@ -307,7 +433,21 @@ def _free_pages_raw(addr: uint64, order: int32):
 
     # Push the (possibly merged) block onto its order's free list.
     o: uint64 = cast[uint64](cur_order)
-    cast[Ptr[uint64]](cur_addr)[0] = free_pages_order[o]
+    # Integrity guards (QA-N37) at the free SOURCE:
+    #   * a wild base address means a caller freed a bogus pointer — never
+    #     splice it onto a list (it would become the next wild head).
+    #   * cur_addr already at the head is an unambiguous double-free — the
+    #     canary would catch it later, but rejecting it here keeps the list
+    #     acyclic and names the event at the moment it happens.
+    if _pa_link_ok(cur_addr) == 0:
+        printk2("[pa-corrupt] free of wild addr %p order=%d — ignoring\n",
+                cur_addr, cast[uint64](cur_order))
+        return
+    if cur_addr == free_pages_order[o]:
+        printk2("[pa-corrupt] double-free of %p at order=%d — ignoring\n",
+                cur_addr, cast[uint64](cur_order))
+        return
+    _pa_set_next(cur_addr, free_pages_order[o])
     free_pages_order[o] = cur_addr
     if cur_order == 0:
         nr_pages_free = nr_pages_free + 1
@@ -330,8 +470,10 @@ def count_free_at_order(order: int32) -> uint64:
     n: uint64 = 0
     p: uint64 = free_pages_order[cast[uint64](order)]
     while p != 0:
+        if _pa_link_ok(p) == 0:
+            break
         n = n + 1
-        p = cast[Ptr[uint64]](p)[0]
+        p = _pa_get_next(p, order)
     if _cf_sw != 0:
         load_cr3(_cf_live)
     local_irq_restore(_cf_irq)
