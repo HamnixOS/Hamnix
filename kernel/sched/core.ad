@@ -8462,6 +8462,56 @@ def oom_kill_task(slot: uint64) -> int32:
     return 1
 
 
+# #75: thread-group fatal termination. On Linux a process-wide fatal event —
+# exit_group(2), OR any fatal-default signal (SIGSEGV / SIGABRT / SIGBUS /
+# SIGFPE / SIGILL / SIGKILL) delivered to ONE thread — terminates the ENTIRE
+# thread group: every CLONE_THREAD sibling dies. Hamnix historically killed
+# ONLY the faulting/exiting thread (exit_group == _exit; deliver_fault_sigsegv
+# / signal_dispatch task_exit_current'd just `cur`), so a multi-threaded
+# process (Firefox: 4-5 threads on one address space) that had one thread
+# wild-write-SIGSEGV — or call exit_group / abort() — left its siblings PARKED
+# FOREVER in poll/read/futex. No thread ever produced the event/lock the
+# survivors waited on, the process never exited, and the parked-watchdog fired
+# on the orphaned group (the non-deterministic "read(fd=N) never completes"
+# wedge — the stuck fd just being wherever a survivor happened to block).
+#
+# Fix: post an (uncatchable, unblockable) SIGKILL to every LIVE sibling that
+# shares `exclude`'s address space (same cr3 PML4 == same mm == same thread
+# group; separate fork()ed processes have distinct PML4s and are untouched).
+# signal_post force-wakes a wait-queue-blocked sibling (directed IPI) so it
+# leaves its blocking syscall and self-terminates at its next signal check —
+# NEVER a cross-CPU reap-from-under-a-running-thread (unsafe): each sibling
+# exits on its OWN context through task_exit_current, and task_reap's
+# shared-address-space guard tears the mm down EXACTLY ONCE (the last sharer).
+# EXITED/FREE slots are skipped, so the natural cascade (each dying sibling
+# re-runs this scan) is bounded and idempotent — it converges once every
+# member is exiting. The caller then terminates `exclude` itself as before.
+def linux_group_fatal_kill(exclude: uint64):
+    if exclude >= NTASKS:
+        return
+    # Confine this to the Linux ABI: only a Linux-userspace task's fatal exit
+    # is process-wide by these (glibc/CLONE_THREAD) rules. A NATIVE task —
+    # including an rfork-RFMEM shared-address-space group (rio/DE) — keeps its
+    # own Plan 9 lifetime semantics untouched, so the DE / weston-native paths
+    # never see this new group teardown.
+    if task_table[exclude].is_linux_userspace == 0:
+        return
+    my_mm: uint64 = task_table[exclude].cr3 & 0x000FFFFFFFFFF000
+    if my_mm == 0:
+        return
+    # Only meaningful for a real thread group: a single-threaded process has
+    # no other sharer of its mm, so the scan is a cheap no-op there.
+    i: uint64 = 0
+    while i < NTASKS:
+        if i != exclude and task_table[i].is_user != 0 \
+                and task_table[i].is_linux_userspace != 0:
+            st: uint64 = task_table[i].state
+            if st != STATE_FREE and st != STATE_EXITED:
+                if (task_table[i].cr3 & 0x000FFFFFFFFFF000) == my_mm:
+                    signal_post(i, SIGKILL)
+        i = i + 1
+
+
 # #167: OOM badness / liveness accessors used by mm/reclaim.ad's victim
 # scan. Kept here so reclaim never touches task_table directly.
 def task_is_user_at(slot: uint64) -> uint64:
@@ -9204,6 +9254,12 @@ def deliver_fault_sigsegv(iret_frame: Ptr[uint64]) -> int32:
         # and the fault iret frame are all still intact here.
         if task_table[cur].is_user != 0:
             coredump_write_current(SIGSEGV, iret_frame)
+        # #75: a fatal SIGSEGV is process-wide — take the whole thread group
+        # down, not just the faulting thread, so CLONE_THREAD siblings can't
+        # orphan-park forever (the Firefox wild-write wedge). No-op for a
+        # single-threaded process.
+        if task_table[cur].is_user != 0:
+            linux_group_fatal_kill(cur)
         task_exit_current(cast[int64](128) + cast[int64](SIGSEGV))
         return 0                                      # not reached
 
@@ -9410,6 +9466,17 @@ def signal_dispatch(syscall_rc: uint64, allow_handler: int32):
                     if task_table[cur].is_user != 0 \
                             and coredump_is_fatal_sig(s) != 0:
                         coredump_write_current(s, cast[Ptr[uint64]](0))
+                    # #75: a fatal-default signal (SIGKILL / SIGSEGV / SIGABRT /
+                    # SIGBUS / SIGFPE / SIGILL) is process-wide on Linux — every
+                    # CLONE_THREAD sibling dies too. Post SIGKILL to the group so
+                    # a thread that abort()s / is killed doesn't leave siblings
+                    # parked forever. The posted-SIGKILL cascade is idempotent
+                    # and bounded (EXITED sharers are skipped). Skip for the
+                    # non-fatal default-terminate signals (SIGTERM/SIGINT/…)?
+                    # No — those are ALSO process-wide when unhandled; only the
+                    # job-control STOP/CONT and SIG_IGN cases returned above.
+                    if task_table[cur].is_user != 0:
+                        linux_group_fatal_kill(cur)
                     task_exit_current(cast[int64](128) + cast[int64](s))
                     return                            # not reached
                 # Real user handler. A handler already in flight on this
@@ -10213,6 +10280,32 @@ def dump_linux_group_full():
                 printk3("[parked-wd] slot=%d sc_nr=%d arg0=%p\n",
                         i, task_table[i].last_syscall_nr,
                         task_table[i].last_syscall_arg0)
+                # #75: cr3 (thread-group id) + the saved user RIP the thread is
+                # parked at. kstack_top-24 holds the CPL=3 return RIP spilled by
+                # the syscall-entry stub — for a task blocked inside do_syscall's
+                # yield loop this is the instruction AFTER its libc syscall. A RIP
+                # in a sane DSO span == a genuine wait (kernel mis-serves the
+                # syscall); a garbage/zero RIP == corrupted thread state.
+                urip: uint64 = 0
+                kt: uint64 = task_table[i].kstack_top
+                if kt >= 24:
+                    urip = cast[Ptr[uint64]](kt - 24)[0]
+                # printk_set_level is a ONE-SHOT latch consumed by the next
+                # printk; re-stamp EMERG before EACH added line or it resets to
+                # INFO and the post-interactive console gate drops it.
+                printk_set_level(PRINTK_LEVEL_EMERG)
+                printk3("[parked-wd]   slot=%d cr3=%p urip=%p\n",
+                        i, task_table[i].cr3, urip)
+                # #75: for a task parked in read(2)/write(2) on an fd
+                # (sc_nr 0=read,1=write), print that fd's fd_idx MARK so
+                # eventfd (0xFFFFFFD6) vs pipe/chan (0xFFFFFFE0) is unambiguous.
+                scn: uint64 = task_table[i].last_syscall_nr
+                if scn == 0 or scn == 1:
+                    fdn: uint64 = task_table[i].last_syscall_arg0
+                    if fdn < 64:
+                        printk_set_level(PRINTK_LEVEL_EMERG)
+                        printk3("[parked-wd]   slot=%d fd=%d mark=%p\n",
+                                i, fdn, cast[uint64](task_table[i].fd_idx[fdn]))
         i = i + 1
 
 
