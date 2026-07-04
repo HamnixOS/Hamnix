@@ -471,3 +471,82 @@ sentinel and that a native write is seen by the Linux-ns side. If that round
 trips, §7.1 is retired and Route A is confirmed buildable. This is the one
 experiment that most cheaply converts the "feasible-but-blocked" verdict into
 "green to build."
+
+---
+
+## 9. Native-Wayland Firefox bring-up (2026-07-04)
+
+The XWayland X11 path is render-blocked in this GL-free environment
+(rootful X → glamor needs GL/Mesa we do not ship; the shm-pixman fallback
+paints black). Per the pivot, the real modern-browser path is **Firefox as
+a native Wayland client** via `MOZ_ENABLE_WAYLAND=1`, bypassing X entirely —
+the same transport `weston-terminal` already renders over.
+
+### 9.1 Fixture + image (DONE, verified)
+
+- `scripts/stage_firefox.sh` stages the unmodified Debian `firefox-esr`
+  (140.10.2esr) + its external GTK3 closure into the debian-minbase
+  fixture. Layered on `stage_weston_term.sh` (shared cairo/pango/freetype/
+  fontconfig/wayland base).
+- Firefox is SELF-CONTAINED under `/usr/lib/firefox-esr` (~261 MiB;
+  `libxul.so` alone 164 MiB; bundles NSS/sqlite/vpx/av-codec) — copied
+  wholesale (not DT_NEEDED-discoverable). It does NOT bundle NSPR
+  (`libnspr4/libplc4/libplds4`) — staged explicitly.
+- dlopen'd modules the readelf walk misses are handled: gdk-pixbuf loaders
+  (+ regenerated `loaders.cache`), gtk immodules, compiled GSettings
+  `gschemas.compiled`, `shared-mime-info`.
+- Full DT_NEEDED closure resolves (83 sonames; only optional
+  `libcloudproviders.so.0` lazy-absent). Rootfs grows to ~406 MiB → build
+  with `HAMNIX_ROOTFS_SIZE_MB=768`.
+- **Verified in-image**: `HAMNIX_LIVE_MINIMAL=0` full-mirror build carries
+  `/distro/usr/lib/firefox-esr/{firefox-esr,libxul.so}`, NSPR, GTK3, and
+  the pixbuf `loaders.cache` (debugfs stat on `hamnix-live-distro.img`).
+
+### 9.2 Launch harness
+
+`scripts/test_wayland_firefox.sh` boots the full-mirror live image, waits
+for the DE, and launches firefox-esr under the live session with
+`MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland`, software render everywhere
+(`LIBGL_ALWAYS_SOFTWARE=1 MOZ_ACCELERATED=0` + swgl WebRender forced in the
+staged profile), sandbox disabled, fresh throwaway profile, `-no-remote
+-new-instance about:blank`. Reports a 4-rung ladder: (a) Wayland registry
+advertised, (b) main window maps (wl_shm commit), (c) chrome renders
+(screendump non-flat), (d) about:blank loads.
+
+### 9.3 Ladder reached so far — GATED at launch on memory/load
+
+First boot + DE bringup succeed (RAM squashfs → 575 MiB RAM ext4 distro
+extracted, `[live-root] DONE`, handoff, `[visual_gate] done`). At the
+Firefox launch step the **guest dies with no clean fault dump** (serial log
+ends mid-command; Firefox never reaches `execve`; screendump fails →
+qemu gone). Two runs died at different points (6G: ~18 s into DE; 4G: at
+the launch command), i.e. instability under load, not a deterministic
+ABI ENOSYS.
+
+Two contributing factors, both known:
+1. **Memory pressure.** With `-m 4G` the guest only sees ~2.3 GiB total
+   (the in-RAM 575 MiB distro ext4 + squashfs reserve a large slice), and
+   ~1.3 GiB free when Firefox starts. libxul is 164 MiB mapped + Firefox's
+   heap/threads on top — this is exactly the heavy-allocation regime where
+   agent #69's page-allocator free-list `#GP`
+   (`mm/page_alloc.ad::mm_page_alloc__alloc_pages_raw`) bites. NOT fixed
+   here (owned by #69). Mitigation to retry: `QEMU_MEM=8G` in a quiet
+   window so the guest has real headroom above the RAM-disk reservation.
+2. **Host CPU starvation from concurrent TCG-QEMU** (see MEMORY
+   "Verification under load"): other sessions' qemu runs starve the host
+   and can crash a KVM guest's I/O spuriously. This run overlapped two
+   concurrent net-test qemus. **Re-verify Firefox in a genuinely quiet
+   host window** (single qemu) before drawing an ABI conclusion.
+
+### 9.4 Next gates
+
+- Re-run `scripts/test_wayland_firefox.sh` with `QEMU_MEM=8G` in a quiet
+  host window; capture the first real Firefox serial line (ld.so error /
+  GTK assert / registry bind / a `mm_page_alloc` `#GP`).
+- If it is #69's page-allocator `#GP`: blocked on that fix; retry after.
+- Once Firefox execs cleanly: expect the next gaps in the heavily-threaded
+  startup (clone thread flags, futex, memfd seals, eventfd/timerfd/epoll
+  edge cases, `getrandom`, dbus socket) — fix bounded ones in `linux_abi/`.
+- Consider shrinking guest memory pressure structurally: the live distro
+  need not hold the full 575 MiB in RAM if Firefox is demand-paged from the
+  virtio image instead of the RAM ext4 (separate track).
