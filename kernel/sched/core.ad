@@ -1022,6 +1022,26 @@ class TaskStruct:
     # on a fresh/kthread slot => readlinkat falls back to the synthetic
     # probe path. Placed at the END of TaskStruct so no earlier offset shifts.
     exe_path: Array[256, uint8]
+    # CLONE_FILES shared fd-table ownership (#71 — Firefox/threaded-GUI gate).
+    # A task that OWNS its own fd table (the common case: every fork child,
+    # every fresh process) has fd_owner_p1 == 0. A CLONE_FILES *thread* points
+    # at the slot OWNING the shared table (its group leader) via
+    # fd_owner_p1 == owner_slot + 1 (the +1 encoding makes a .bss-zero slot
+    # mean "self-owned" without an explicit init on every create path). Every
+    # fd-array access (fd_idx/fd_pos/fd_buf/fd_buflen/fd_opened_path) is routed
+    # through fd_owner_task()/fd_owner_slot_of() so a thread's open/close/dup is
+    # visible to all sharers — the whole point of clone(CLONE_FILES).
+    # fd_table_refcount (above) counts LIVE sharers of the owner's table (owner
+    # itself + every CLONE_FILES thread); the last sharer to exit closes the
+    # table, and task_reap defers freeing an owner slot whose refcount is still
+    # >0 so the inline arrays outlive any live sharer. Placed at the END of
+    # TaskStruct so no earlier offset shifts; fresh .bss slot => self-owned.
+    fd_owner_p1: int32
+    # Spinlock guarding concurrent fd alloc/close on a SHARED table so two
+    # CLONE_FILES threads opening fds at the same instant get DISTINCT numbers.
+    # Only ever taken on the OWNER slot (fd_owner_task(t)[0].fd_lock). 0 =
+    # unlocked (fresh .bss slot). Uncontended for self-owned tasks.
+    fd_lock: uint32
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -4720,7 +4740,12 @@ def task_exit_current(code: int64):
     # path yet — that's a slab + RCU follow-up). The exit_code is
     # consumed by a parent in SYS_WAITPID; with no parent the value
     # is simply unread.
-    task_close_all_fds(current_idx_pcpu)
+    # CLONE_FILES (#71): refcounted release of the (possibly SHARED) fd table.
+    # The LAST sharer to exit closes it; a self-owned task closes immediately
+    # (identical to the old unconditional task_close_all_fds). An fd-table owner
+    # that exits while threads are still live keeps its fds open + its slot
+    # un-reapable (task_reap defers) until the last sharer goes.
+    _release_fd_table_on_exit(cast[int32](current_idx_pcpu))
     # vfork(2) wake: a vfork CHILD that _exit's WITHOUT ever calling execve
     # (e.g. dash's child hit an error, or `vfork(); _exit(127)` on a failed
     # exec) must still release its blocked parent. do_clone's CLONE_VFORK
@@ -5504,6 +5529,16 @@ def start_first_task(first_slot: uint64):
 # Special fd_idx markers. Anything < these values is a real initramfs
 # file index; the markers reserve the high quarter of the uint32 space.
 FD_CLOSED_MARK: uint32 = 0xFFFFFFFF
+# CLONE_FILES (#71): transient reservation marker written by _alloc_fd under
+# the owner's fd_lock. A found-free slot is stamped RESERVED *before* the lock
+# is dropped, so a concurrent _alloc_fd on another thread sharing the table
+# skips it (RESERVED != FD_CLOSED_MARK) and returns a DISTINCT number. The
+# caller overwrites it with the real marker at install; if a caller bails
+# without installing, the reservation self-heals — close_fd_in_task rewrites
+# any non-CHAN marker back to FD_CLOSED_MARK, and task-exit close-all sweeps
+# it. Chosen from the unused low-marker gap (0xFFFFFF7F is not any live fd
+# marker). Invisible to userspace: the fd number is not returned until install.
+FD_RESERVED_MARK: uint32 = 0xFFFFFF7F
 FD_STDIN_MARK:  uint32 = 0xFFFFFFFC
 FD_STDOUT_MARK: uint32 = 0xFFFFFFFE
 FD_STDERR_MARK: uint32 = 0xFFFFFFFD
@@ -6496,6 +6531,16 @@ def task_reap(slot: int32):
     # RCU-grace-period free. Idempotent: a non-EXITED slot is a no-op.
     if task_table[su].state != STATE_EXITED:
         return
+    # CLONE_FILES (#71): do NOT free an fd-table OWNER slot while live threads
+    # still SHARE its inline arrays. An owner that exited first drops to a
+    # positive live-sharer refcount; reaping it here would recycle the slot and
+    # scribble the arrays a running thread is still reading. Defer — a later
+    # reap sweep (reap_orphan_zombies on the next fork / the parent's wait4)
+    # reclaims it once the last thread exits and drops the refcount to 0. A
+    # normal leaf zombie has refcount 0 post-exit and is reaped now; a thread
+    # SHARER owns no table (fd_owner_p1 != 0) and is always reapable.
+    if task_table[su].fd_owner_p1 == 0 and task_table[su].fd_table_refcount > 0:
+        return
     # SMP reap fence: with user tasks load-balanced across CPUs, the zombie
     # we are about to reclaim may have run (and EXITED) on a DIFFERENT cpu
     # than this reaping parent. task_exit_current raises the zombie's on_cpu
@@ -7232,6 +7277,75 @@ NR_FDS: uint64 = 64
 FD_OPENED_PATH_CAP: uint64 = 128
 
 
+# --- CLONE_FILES shared fd-table routing (#71) ----------------------
+# fd_owner_task/fd_owner_slot_of resolve a task to the task that OWNS its
+# (possibly shared) fd table. A self-owned task resolves to itself; a
+# CLONE_FILES thread resolves to its group leader. Every fd-array access site
+# (fd_idx/fd_pos/fd_buf/fd_buflen/fd_opened_path) routes through these so a
+# thread's fd operations land in the SHARED table. Idempotent: applying it to
+# an owner returns the owner (owner.fd_owner_p1 == 0).
+def fd_owner_task(task: Ptr[TaskStruct]) -> Ptr[TaskStruct]:
+    p1: int32 = task[0].fd_owner_p1
+    if p1 == 0:
+        return task
+    return &task_table[cast[uint64](p1 - 1)]
+
+
+def fd_owner_slot_of(slot: int32) -> int32:
+    p1: int32 = task_table[cast[uint64](slot)].fd_owner_p1
+    if p1 == 0:
+        return slot
+    return p1 - 1
+
+
+# Take/drop the per-owner fd lock. Callers pass ANY task in the sharing group;
+# the lock always lives on the owner slot, so two threads sharing a table
+# serialise on the same word.
+def fd_table_lock(task: Ptr[TaskStruct]):
+    owner: Ptr[TaskStruct] = fd_owner_task(task)
+    spinlock_lock(&owner[0].fd_lock)
+
+
+def fd_table_unlock(task: Ptr[TaskStruct]):
+    owner: Ptr[TaskStruct] = fd_owner_task(task)
+    spinlock_unlock(&owner[0].fd_lock)
+
+
+# CLONE_FILES thread creation: the child SHARES the parent's fd table instead
+# of snapshot-copying it. Point the child at the parent's OWNER slot and bump
+# the owner's live-sharer refcount under the fd lock. The child's own
+# fd_table_refcount is zeroed — it owns no table, so task_reap can free the
+# child slot freely while the owner (and its inline arrays) live on.
+def fd_table_share_to_thread(child_slot: int32, parent_slot: int32):
+    owner_slot: int32 = fd_owner_slot_of(parent_slot)
+    ou: uint64 = cast[uint64](owner_slot)
+    spinlock_lock(&task_table[ou].fd_lock)
+    task_table[ou].fd_table_refcount = task_table[ou].fd_table_refcount + 1
+    spinlock_unlock(&task_table[ou].fd_lock)
+    task_table[cast[uint64](child_slot)].fd_owner_p1 = owner_slot + 1
+    task_table[cast[uint64](child_slot)].fd_table_refcount = 0
+
+
+# Task-exit fd-table release. Decrements the OWNER's live-sharer refcount; the
+# LAST sharer to exit (refcount reaching 0) runs the real close-all on the
+# owner's table. A self-owned task with no threads decrements 1 -> 0 and closes
+# immediately (identical to the old task_close_all_fds call). An owner that
+# exits while threads are still live drops to a positive count and leaves its
+# fds open + its slot un-reapable (task_reap defers) until the last thread goes.
+def _release_fd_table_on_exit(slot: int32):
+    owner_slot: int32 = fd_owner_slot_of(slot)
+    ou: uint64 = cast[uint64](owner_slot)
+    spinlock_lock(&task_table[ou].fd_lock)
+    rc: int32 = task_table[ou].fd_table_refcount - 1
+    task_table[ou].fd_table_refcount = rc
+    spinlock_unlock(&task_table[ou].fd_lock)
+    # Detach an exiting SHARER from the table so nothing dereferences it again.
+    if fd_owner_slot_of(slot) != slot:
+        task_table[cast[uint64](slot)].fd_owner_p1 = 0
+    if rc <= 0:
+        task_close_all_fds(ou)
+
+
 def close_fd_in_task(task: Ptr[TaskStruct], fdu: uint64):
     # Single source of truth for tearing down an open fd. Used by
     # vfs_close (after fd-range / EBADF validation) and by
@@ -7252,6 +7366,9 @@ def close_fd_in_task(task: Ptr[TaskStruct], fdu: uint64):
     #
     # After release, the slot is rewritten to FD_CLOSED_MARK + zeros
     # so a subsequent open can claim it.
+    # CLONE_FILES: operate on the SHARED table (owner) so a thread's close is
+    # visible to all sharers. Idempotent for a self-owned task.
+    task = fd_owner_task(task)
     fi: uint32 = task[0].fd_idx[fdu]
     if fi == CHAN_MARK_VALUE:
         # fd→Chan unification: an FD_CHAN_MARK fd carries a namec Chan id
@@ -7341,6 +7458,11 @@ def copy_fd_entry(dst: Ptr[TaskStruct], dst_fdu: uint64,
     # different tasks (SYS_SPAWN's stdin/stdout inheritance). Caller
     # is responsible for closing any prior occupant of dst_fdu first
     # — copy_fd_entry just OVERWRITES.
+    # CLONE_FILES: resolve both ends to their table OWNERS so a dup within a
+    # thread hits the shared table, and a fork/spawn copy reads the parent's
+    # shared table + writes the fresh child's own. Idempotent for self-owned.
+    dst = fd_owner_task(dst)
+    src = fd_owner_task(src)
     fi: uint32 = src[0].fd_idx[src_fdu]
     if fi == FD_CLOSED_MARK:
         return -1
@@ -9473,6 +9595,15 @@ def task_fd_copy_opened_path(dst: Ptr[TaskStruct], dst_fdu: uint64,
 
 
 def _init_fd_table(slot: uint64):
+    # CLONE_FILES (#71): a fresh/RECYCLED slot must start SELF-OWNED with an
+    # UNLOCKED fd lock and a private-table refcount of 1. A recycled slot could
+    # otherwise carry a previous thread tenant's fd_owner_p1 (pointing at a
+    # long-dead owner) or a stale-held fd_lock (instant deadlock). fd_owner_p1
+    # is NOT re-zeroed anywhere else on the create path, so this is the single
+    # scrub point every task-create funnels through.
+    task_table[slot].fd_owner_p1       = 0
+    task_table[slot].fd_lock           = 0
+    task_table[slot].fd_table_refcount = 1
     # Pre-open stdin / stdout / stderr; the rest start CLOSED. Linux's
     # exec() does the same thing — the launched binary inherits the
     # parent's standard streams or gets them freshly attached.
@@ -9572,6 +9703,7 @@ def task_fd_idx_at(slot: int32, fd: uint64) -> uint32:
     su: uint64 = cast[uint64](slot)
     if slot < 0 or su >= NTASKS or fd >= TASK_NFDS:
         return FD_CLOSED_MARK
+    su = cast[uint64](fd_owner_slot_of(cast[int32](su)))
     return task_table[su].fd_idx[fd]
 
 
@@ -9583,6 +9715,7 @@ def task_fd_buf_at(slot: int32, fd: uint64) -> uint64:
     su: uint64 = cast[uint64](slot)
     if slot < 0 or su >= NTASKS or fd >= TASK_NFDS:
         return 0
+    su = cast[uint64](fd_owner_slot_of(cast[int32](su)))
     return task_table[su].fd_buf[fd]
 
 
@@ -9595,6 +9728,7 @@ def task_set_fd_idx_at(slot: int32, fd: uint64, val: uint32):
     su: uint64 = cast[uint64](slot)
     if slot < 0 or su >= NTASKS or fd >= TASK_NFDS:
         return
+    su = cast[uint64](fd_owner_slot_of(cast[int32](su)))
     task_table[su].fd_idx[fd] = val
 
 
@@ -9605,6 +9739,7 @@ def task_set_fd_buf_at(slot: int32, fd: uint64, val: uint64):
     su: uint64 = cast[uint64](slot)
     if slot < 0 or su >= NTASKS or fd >= TASK_NFDS:
         return
+    su = cast[uint64](fd_owner_slot_of(cast[int32](su)))
     task_table[su].fd_buf[fd] = val
 
 

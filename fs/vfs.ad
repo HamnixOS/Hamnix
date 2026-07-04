@@ -1012,7 +1012,7 @@ def _ns_blob_partition_load(resolved: Ptr[char]) -> uint64:
         return 0
     # Discover the size. ext4/cpio/tmpfs opens stash the file length in
     # the fd's fd_buflen; fall back to a bounded read loop if it's 0.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     size: uint64 = task[0].fd_buflen[fdu]
     if size == 0 or size > _NS_BLOB_MAX:
@@ -1213,11 +1213,20 @@ def _lookup_name(name: Ptr[char]) -> int32:
 
 
 def _alloc_fd(task: Ptr[TaskStruct]) -> int32:
+    # CLONE_FILES: allocate from the SHARED table (owner) under its fd lock and
+    # atomically RESERVE the found slot, so two threads racing to open fds get
+    # DISTINCT numbers. The caller overwrites the reservation with the real
+    # marker at install; an un-installed reservation self-heals at close/exit.
+    owner: Ptr[TaskStruct] = fd_owner_task(task)
+    spinlock_lock(&owner[0].fd_lock)
     i: uint64 = 0
     while i < cast[uint64](_VFS_NR_FDS):
-        if task[0].fd_idx[i] == FD_CLOSED_MARK:
+        if owner[0].fd_idx[i] == FD_CLOSED_MARK:
+            owner[0].fd_idx[i] = FD_RESERVED_MARK
+            spinlock_unlock(&owner[0].fd_lock)
             return cast[int32](i)
         i = i + 1
+    spinlock_unlock(&owner[0].fd_lock)
     return -1
 
 
@@ -1961,7 +1970,7 @@ def vfs_open(name: Ptr[char]) -> int32:
     # localized server form). Only on a successful install — a negative
     # rc means no slot was claimed in the caller's table.
     if fd >= 0:
-        task: Ptr[TaskStruct] = current_task()
+        task: Ptr[TaskStruct] = fd_owner_task(current_task())
         task_fd_set_opened_path(task, cast[uint64](fd), &resolved[0])
     return fd
 
@@ -2195,7 +2204,7 @@ def _vfs_open_post_perm(name: Ptr[char]) -> int32:
                 or _path_eq_const(rname, cast[Ptr[uint8]]("/mnt"), 4) != 0:
             return _open_empty_dir()
         return ENOENT
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
@@ -2254,7 +2263,7 @@ def _install_dir_fd(fd: int32, buf: uint64, n: int64) -> int32:
         kfree(buf)
         vfs_close(fd)
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     task[0].fd_idx[fdu]    = FD_CHAN_MARK
     task[0].fd_pos[fdu]    = 0
@@ -2283,7 +2292,7 @@ def _install_buf_fd(fd: int32, buf: uint64, n: int64) -> int32:
         kfree(buf)
         vfs_close(fd)
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     task[0].fd_idx[fdu]    = FD_CHAN_MARK
     task[0].fd_pos[fdu]    = 0
@@ -2320,12 +2329,13 @@ def _open_dir_with(name: Ptr[char], backend: int32) -> int32:
     # _vfs_open_orig_path before vfs_open ran). Keyed on the original
     # path (not the resolved one) because `/` itself can be a bind target
     # — see vfs_listdir_ns's comment for the full rationale.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
     buf: uint64 = kmalloc(DIR_BUF_SIZE)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)                       # -ENOMEM
     bufp: Ptr[uint8] = cast[Ptr[uint8]](buf)
     n: int64 = 0
@@ -2338,6 +2348,7 @@ def _open_dir_with(name: Ptr[char], backend: int32) -> int32:
     else:
         n = ext4_listdir(vfs_fs_rel(name), bufp, DIR_BUF_SIZE)
     if n < 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         kfree(buf)
         return ENOENT
     # #450 F6: append mtab children of the ORIGINAL path. Empty / `#`-
@@ -2658,15 +2669,17 @@ def _open_dir_srv() -> int32:
     # fd so getdents64 + the busybox `ls` path both see the names.
     # Empty table -> n=0, which getdents64 reports as EOF on the
     # first call.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
     buf: uint64 = kmalloc(DIR_BUF_SIZE)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)                       # -ENOMEM
     n: int64 = devsrv_list(cast[Ptr[uint8]](buf), DIR_BUF_SIZE)
     if n < 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         kfree(buf)
         return ENOENT
     return _install_dir_fd(fd, buf, n)
@@ -2678,15 +2691,17 @@ def _open_dir_blk() -> int32:
     # getdents64 + `ls`/`lsblk` see "nvme0n1", "nvme0n1p1", "vda", ...
     # The names come from blk_listdir (kernel/block/blk.ad), which walks
     # the registered blockdev table — NOT a literal string match here.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
     buf: uint64 = kmalloc(DIR_BUF_SIZE)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)                       # -ENOMEM
     n: int64 = blk_listdir(cast[Ptr[uint8]](buf), DIR_BUF_SIZE)
     if n < 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         kfree(buf)
         return ENOENT
     return _install_dir_fd(fd, buf, n)
@@ -2719,12 +2734,13 @@ def _open_dir_dev() -> int32:
     # directory) plus the always-present synthetic stdio cdevs (cons,
     # null, zero). The enumeration comes from this server through the
     # `bind '#c' /dev`, NOT a literal "/dev" string-match in vfs_listdir.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
     buf: uint64 = kmalloc(DIR_BUF_SIZE)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)                       # -ENOMEM
     bp: Ptr[uint8] = cast[Ptr[uint8]](buf)
     out: uint64 = 0
@@ -2767,12 +2783,13 @@ def _open_empty_dir() -> int32:
     # planted volume mountpoint (/ext, /mnt) whose backing volume is not
     # mounted — so `ls`/`cd` on it behave like an ordinary empty
     # directory instead of ENOENT (see _open_read_body's mountpoint arm).
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
     buf: uint64 = kmalloc(DIR_BUF_SIZE)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)                           # -ENOMEM
     return _install_dir_fd(fd, buf, 0)
 
@@ -2786,16 +2803,18 @@ def _open_dir_proc() -> int32:
     # synthesis binds #p at /proc) yet could not itself be listed —
     # a dangling entry. World-readable, exactly like /proc on Linux;
     # per-task write gating stays in devproc for the individual leaves.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
     buf: uint64 = kmalloc(DIR_BUF_SIZE)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)                           # -ENOMEM
     n: int64 = devproc_listdir(cast[Ptr[char]](""),
                                cast[Ptr[uint8]](buf), DIR_BUF_SIZE)
     if n < 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         kfree(buf)
         return ENOENT
     return _install_dir_fd(fd, buf, n)
@@ -2809,12 +2828,13 @@ def _open_dir_fd() -> int32:
     # bound (hamsh's _setup_fd_namespace does `bind '#d' /fd`) and thus
     # enumerated as an mtab child of /, yet unlistable. A freshly-set-up
     # shell lists at least 0/1/2 (stdin/stdout/stderr).
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
     buf: uint64 = kmalloc(DIR_BUF_SIZE)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)                           # -ENOMEM
     bp: Ptr[uint8] = cast[Ptr[uint8]](buf)
     out: uint64 = 0
@@ -2927,12 +2947,13 @@ def _open_dir_n() -> int32:
     # bound target). The slot itself has no synthetic children to
     # enumerate today. Same FD_DIR_MARK shape as the other dir-opens
     # so getdents64 / busybox ls don't need a special case.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
     buf: uint64 = kmalloc(DIR_BUF_SIZE)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)                       # -ENOMEM
     return _install_dir_fd(fd, buf, 0)
 
@@ -2956,12 +2977,14 @@ def _open_srv_name(name: Ptr[char]) -> int32:
     if cast[uint64](src_task) == 0:
         return ENOENT
     src_fdu: uint64 = cast[uint64](src_fd)
+    # Read the SOURCE task's shared table (owner) — the poster may be a thread.
+    src_task = fd_owner_task(src_task)
     if src_task[0].fd_idx[src_fdu] == FD_CLOSED_MARK:
         # Poster's fd has since been closed — entry is stale. The
         # next devsrv_post on the same name will overwrite it, but
         # in the meantime the lookup fails.
         return ENOENT
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     new_fd: int32 = _alloc_fd(task)
     if new_fd < 0:
         return EMFILE
@@ -3262,7 +3285,7 @@ def _create_named_subpath(dir_prefix: Ptr[uint8], name: Ptr[char],
     if e_cid < 0:
         ext4_close(eslot)
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(e_cid)
@@ -3576,7 +3599,7 @@ def _open_devfd_marked(fdnum: int32) -> int32:
     # the id is deterministic per N (stable fstat identity for free).
     if fdnum < 0 or fdnum > 255:
         return ENOENT                  # wid field is 8 bits
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
@@ -3636,7 +3659,7 @@ def _open_dir_proc_fd(path_ptr: Ptr[char]) -> int32:
     if slot < 0:
         set_current_errstr("no such pid")
         return ENOENT
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
@@ -3688,7 +3711,7 @@ def _open_dir_proc_pid(name: Ptr[char]) -> int32:
     # without ENOENT and getdents64 its leaf files. `name` is "#p/<rest>";
     # the server-relative sub devproc_listdir wants is "/<rest>", i.e.
     # &name[2] (name[2] is the leading '/').
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
@@ -3809,7 +3832,7 @@ def vfs_open_write(name: Ptr[char]) -> int32:
     # Phase D follow-up: stamp the per-fd opened-path slot — see
     # vfs_open above for the rationale.
     if fd >= 0:
-        task: Ptr[TaskStruct] = current_task()
+        task: Ptr[TaskStruct] = fd_owner_task(current_task())
         task_fd_set_opened_path(task, cast[uint64](fd), &resolved[0])
         # dcache: a write-open may have CREATED the file (O_CREAT), which
         # turns a previously-cached NEGATIVE dentry for `name` live. The
@@ -3958,7 +3981,7 @@ def _vfs_open_write_post_perm(name: Ptr[char]) -> int32:
         t_cid: int32 = namec_open_tmpfs_file(slot)
         if t_cid < 0:
             return EMFILE
-        task: Ptr[TaskStruct] = current_task()
+        task: Ptr[TaskStruct] = fd_owner_task(current_task())
         fd: int32 = _alloc_fd(task)
         if fd < 0:
             namec_close(t_cid)
@@ -3987,7 +4010,7 @@ def _vfs_open_write_post_perm(name: Ptr[char]) -> int32:
         if e_cid < 0:
             ext4_close(eslot)
             return EMFILE
-        task: Ptr[TaskStruct] = current_task()
+        task: Ptr[TaskStruct] = fd_owner_task(current_task())
         fd: int32 = _alloc_fd(task)
         if fd < 0:
             namec_close(e_cid)
@@ -4015,7 +4038,7 @@ def _vfs_open_write_post_perm(name: Ptr[char]) -> int32:
         if f_cid < 0:
             fat_close_write(wslot)
             return EMFILE
-        task: Ptr[TaskStruct] = current_task()
+        task: Ptr[TaskStruct] = fd_owner_task(current_task())
         fd: int32 = _alloc_fd(task)
         if fd < 0:
             namec_close(f_cid)
@@ -4527,7 +4550,7 @@ def vfs_fsync(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return rc
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     file_idx: uint32 = task[0].fd_idx[fdu]
     if file_idx == FD_CLOSED_MARK:
@@ -4571,7 +4594,7 @@ def vfs_ftruncate(fd: int32, length: uint64) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return rc
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     file_idx: uint32 = task[0].fd_idx[fdu]
     if file_idx == FD_CLOSED_MARK:
@@ -5556,7 +5579,7 @@ def vfs_pipe(out_fds: Ptr[int32]) -> int32:
     # end-references, released by namec_close's DEV_PIPE arms on the
     # LAST fd holder (fork/dup bumps the chan refcount, not the pipe
     # counters).
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     rfd: int32 = _alloc_fd(task)
     if rfd < 0:
         return EMFILE
@@ -5572,6 +5595,8 @@ def vfs_pipe(out_fds: Ptr[int32]) -> int32:
     slot: int32 = pipe_alloc()
     if slot < 0:
         task[0].fd_idx[cast[uint64](rfd)] = FD_CLOSED_MARK
+        # wfd is still a bare _alloc_fd RESERVED slot (never installed) — free it.
+        task[0].fd_idx[cast[uint64](wfd)] = FD_CLOSED_MARK
         return ENOSPC
 
     rch: int32 = namec_open_pipe_end(slot, 0)
@@ -5581,6 +5606,7 @@ def vfs_pipe(out_fds: Ptr[int32]) -> int32:
         pipe_close_reader(slot)
         pipe_close_writer(slot)
         task[0].fd_idx[cast[uint64](rfd)] = FD_CLOSED_MARK
+        task[0].fd_idx[cast[uint64](wfd)] = FD_CLOSED_MARK
         return ENOSPC
     wch: int32 = namec_open_pipe_end(slot, 1)
     if wch < 0:
@@ -5589,6 +5615,7 @@ def vfs_pipe(out_fds: Ptr[int32]) -> int32:
         namec_close(rch)
         pipe_close_writer(slot)
         task[0].fd_idx[cast[uint64](rfd)] = FD_CLOSED_MARK
+        task[0].fd_idx[cast[uint64](wfd)] = FD_CLOSED_MARK
         return ENOSPC
 
     rfdu: uint64 = cast[uint64](rfd)
@@ -5618,7 +5645,7 @@ def vfs_socketpair(out_fds: Ptr[int32]) -> int32:
     # syscall dispatcher. Phase 4c (socket fold): each end is an
     # FD_CHAN_MARK fd; fd_buf carries the chan id, the chan's
     # back_slot carries the packed (slot << 1 | dir).
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     afd: int32 = _alloc_fd(task)
     if afd < 0:
         return EMFILE
@@ -5631,6 +5658,8 @@ def vfs_socketpair(out_fds: Ptr[int32]) -> int32:
     slot: int32 = sockpair_alloc()
     if slot < 0:
         task[0].fd_idx[cast[uint64](afd)] = FD_CLOSED_MARK
+        # bfd is still a bare _alloc_fd RESERVED slot (never installed) — free it.
+        task[0].fd_idx[cast[uint64](bfd)] = FD_CLOSED_MARK
         return ENOSPC
 
     ach: int32 = namec_open_sockpair_end(slot, 0)
@@ -5640,6 +5669,7 @@ def vfs_socketpair(out_fds: Ptr[int32]) -> int32:
         sockpair_close(slot, 0)
         sockpair_close(slot, 1)
         task[0].fd_idx[cast[uint64](afd)] = FD_CLOSED_MARK
+        task[0].fd_idx[cast[uint64](bfd)] = FD_CLOSED_MARK
         return ENOSPC
     bch: int32 = namec_open_sockpair_end(slot, 1)
     if bch < 0:
@@ -5648,6 +5678,7 @@ def vfs_socketpair(out_fds: Ptr[int32]) -> int32:
         namec_close(ach)
         sockpair_close(slot, 1)
         task[0].fd_idx[cast[uint64](afd)] = FD_CLOSED_MARK
+        task[0].fd_idx[cast[uint64](bfd)] = FD_CLOSED_MARK
         return ENOSPC
 
     afdu: uint64 = cast[uint64](afd)
@@ -5673,7 +5704,7 @@ def vfs_fd_is_socketpair(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return 0
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     if task[0].fd_idx[cast[uint64](fd)] != FD_CHAN_MARK:
         return 0
     if namec_chan_sockpair_packed(
@@ -5696,7 +5727,7 @@ def vfs_srv_dup_into_current(src_task: Ptr[TaskStruct],
         return EBADF
     if src_task[0].fd_idx[src_fdu] == FD_CLOSED_MARK:
         return EBADF
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     new_fd: int32 = _alloc_fd(task)
     if new_fd < 0:
         return EMFILE
@@ -5711,7 +5742,7 @@ def vfs_alloc_socket_fd() -> int32:
     # DEV_SOCKET pool chan allocated with back_slot = 0 ("no record
     # yet" — reads return EOF, writes answer EPIPE) until socket(2)
     # late-binds the backing record via vfs_socket_fd_set_record.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
@@ -5736,7 +5767,7 @@ def vfs_fd_is_socket(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return 0
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     if task[0].fd_idx[cast[uint64](fd)] != FD_CHAN_MARK:
         return 0
     if namec_chan_socket_fdbuf(
@@ -5756,7 +5787,7 @@ def vfs_socket_fd_set_record(fd: int32, fdbuf: uint64) -> int32:
     # fd.
     if vfs_fd_is_socket(fd) == 0:
         return EBADF
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     if namec_socket_set_record(_fd_chan_id(task, cast[uint64](fd)),
                                cast[int32](cast[uint32](fdbuf))) != 0:
         return EBADF
@@ -5769,7 +5800,7 @@ def vfs_socket_fd_get_record(fd: int32) -> uint64:
     # the caller's usock_record_for_fdbuf decode yields -1.
     if vfs_fd_is_socket(fd) == 0:
         return 0
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     return cast[uint64](namec_chan_socket_fdbuf(
         _fd_chan_id(task, cast[uint64](fd))))
 
@@ -6304,7 +6335,7 @@ def vfs_fd_is_open(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return 0
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     if task[0].fd_idx[cast[uint64](fd)] == FD_CLOSED_MARK:
         return 0
     return 1
@@ -6328,7 +6359,7 @@ def vfs_alloc_l2_fd(mark: uint32) -> int32:
     # FD_SIGNALFD_MARK). fd_buf / fd_pos / fd_buflen start zero — the
     # caller fills fd_buf with the encoded object slot. Returns the fd
     # or -EMFILE when the table is full.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
@@ -6347,7 +6378,7 @@ def vfs_fd_marker(fd: int32) -> uint32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return FD_CLOSED_MARK
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     return task[0].fd_idx[cast[uint64](fd)]
 
 
@@ -6362,7 +6393,7 @@ def vfs_fd_pty_pack(fd: int32) -> int64:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return -1
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     if task[0].fd_idx[fdu] != FD_CHAN_MARK:
         return -1
@@ -6380,7 +6411,7 @@ def vfs_fd_pipe_slot(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return -1
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     if task[0].fd_idx[fdu] != FD_CHAN_MARK:
         return -1
@@ -6392,7 +6423,7 @@ def vfs_fd_is_pipe_read(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return 0
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     if task[0].fd_idx[fdu] != FD_CHAN_MARK:
         return 0
@@ -6407,7 +6438,7 @@ def vfs_fd_is_pipe_write(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return 0
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     if task[0].fd_idx[fdu] != FD_CHAN_MARK:
         return 0
@@ -6436,7 +6467,7 @@ def vfs_fd_is_console(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return 0
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     m: uint32 = task[0].fd_idx[cast[uint64](fd)]
     if m == FD_STDIN_MARK:
         return 1
@@ -6480,7 +6511,7 @@ def vfs_l2_fd_set_buf(fd: int32, val: uint64) -> int32:
             and m != FD_TIMERFD_MARK and m != FD_SIGNALFD_MARK \
             and m != FD_INOTIFY_MARK:
         return EBADF
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     task[0].fd_buf[cast[uint64](fd)] = val
     return 0
 
@@ -6493,7 +6524,7 @@ def vfs_l2_fd_get_buf(fd: int32) -> uint64:
             and m != FD_TIMERFD_MARK and m != FD_SIGNALFD_MARK \
             and m != FD_INOTIFY_MARK:
         return 0
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     return task[0].fd_buf[cast[uint64](fd)]
 
 
@@ -6523,7 +6554,7 @@ def vfs_fd_poll(fd: int32) -> uint32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return 0x0020                       # POLLNVAL
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     fi: uint32 = task[0].fd_idx[fdu]
     if fi == FD_CLOSED_MARK:
@@ -6692,7 +6723,7 @@ def vfs_waitfds_probe(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return 1            # bad fd: "ready" — the error surfaces on read
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     fi: uint32 = task[0].fd_idx[fdu]
     if fi == FD_CLOSED_MARK:
@@ -6820,7 +6851,7 @@ def vfs_fd_inode(fd: int32) -> uint64:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return 0
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     fi: uint32 = task[0].fd_idx[fdu]
     if fi == FD_CLOSED_MARK:
@@ -6926,7 +6957,7 @@ def vfs_fd_backing_info(fd: int32, out_marker: Ptr[uint32],
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return rc
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     fi: uint32 = task[0].fd_idx[fdu]
     if fi == FD_CLOSED_MARK:
@@ -6990,7 +7021,7 @@ def vfs_fd_statfs_kind(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return 3
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     fi: uint32 = task[0].fd_idx[fdu]
     if fi == FD_CHAN_MARK:
@@ -7177,16 +7208,18 @@ def _open_tmpfs_read(name: Ptr[char]) -> int32:
         cur = tgt_c
         sym_hops = sym_hops + 1
     if tmpfs_path_is_dir(cur) != 0:
-        task: Ptr[TaskStruct] = current_task()
+        task: Ptr[TaskStruct] = fd_owner_task(current_task())
         fd: int32 = _alloc_fd(task)
         if fd < 0:
             return EMFILE
         buf: uint64 = kmalloc(DIR_BUF_SIZE)
         if buf == 0:
+            task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
             return cast[int32](-12)                   # -ENOMEM
         n: int64 = tmpfs_listdir(cur, cast[Ptr[uint8]](buf),
                                  DIR_BUF_SIZE)
         if n < 0:
+            task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
             kfree(buf)
             return ENOENT
         return _install_dir_fd(fd, buf, n)
@@ -7202,7 +7235,7 @@ def _open_tmpfs_read(name: Ptr[char]) -> int32:
     cid: int32 = namec_open_tmpfs_file(slot)
     if cid < 0:
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -7235,7 +7268,7 @@ def vfs_open_memfd(name: Ptr[char], allow_sealing: int32) -> int32:
     if cid < 0:
         tmpfs_release_anon(slot)
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -7263,7 +7296,7 @@ def vfs_install_tmpfs_slot_fd(slot: int32) -> int32:
     cid: int32 = namec_open_tmpfs_file(slot)
     if cid < 0:
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -7290,7 +7323,7 @@ def vfs_fd_tmpfs_slot(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return -1
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     if task[0].fd_idx[fdu] != FD_CHAN_MARK:
         return -1
@@ -7318,7 +7351,7 @@ def _open_auth_marked() -> int32:
     if cid < 0:
         devauth_close(slot)
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -7354,7 +7387,7 @@ def _open_fuse_conn_marked() -> int32:
     if cid < 0:
         fuse_dev_close_hook(slot)
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -7388,7 +7421,7 @@ def _open_fuse_file_marked(name: Ptr[char]) -> int32:
     if cid < 0:
         fuse_vfs_close_hook(cast[int32](tok))
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -7409,7 +7442,7 @@ def vfs_fd_fuse_slot(fd: int32) -> int32:
     # DEV_FUSE_CONN chan carries the conn slot in back_slot.
     if fd < 0:
         return -1
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     if fdu >= cast[uint64](_VFS_NR_FDS):
         return -1
@@ -7431,7 +7464,7 @@ def vfs_fd_auth_slot(fd: int32) -> int32:
     # whose DEV_AUTH chan carries the AuthSlot index in back_slot.
     if fd < 0:
         return -1
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     if fdu >= cast[uint64](_VFS_NR_FDS):
         return -1
@@ -7514,7 +7547,7 @@ def _open_ptmx() -> int32:
     if slot < 0:
         set_current_errstr("ptmx: no free PTY pairs")
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         pty_master_unref_hook(slot)
@@ -7549,7 +7582,7 @@ def _open_pts(slot: int32) -> int32:
     if rc != 0:
         set_current_errstr("pts: slave locked or invalid")
         return EIO
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         pty_slave_unref_hook(slot)
@@ -7619,7 +7652,7 @@ def _open_blk_marked(pack: uint64) -> int32:
     cid: int32 = namec_open_blk_file(pack)
     if cid < 0:
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -7699,15 +7732,17 @@ def _open_net_dir(sub: Ptr[char]) -> int32:
     # "" for the server root, "/tcp" for a proto dir, "/tcp/<N>" for a
     # connection dir. Render the children into a kmalloc'd FD_DIR_MARK
     # buffer via devnet_listdir so getdents64 + `ls /net` see them.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
     buf: uint64 = kmalloc(DIR_BUF_SIZE)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)                        # -ENOMEM
     n: int64 = devnet_listdir(sub, cast[Ptr[uint8]](buf), DIR_BUF_SIZE)
     if n < 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         kfree(buf)
         set_current_errstr("net: no such directory")
         return ENOENT
@@ -7764,7 +7799,7 @@ def _open_net(name: Ptr[char]) -> int32:
     # ONE-PER-CHAN — the chan owns the ref the legacy fd held — so
     # fork/dup share via namec_chan_ref and the unref fires from
     # namec_close's DEV_NET arm on the LAST reference.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     if fkind == NET_FILE_CLONE:
         # clone: allocate the connection now.
         new_conn: int32 = devnet_clone(proto)
@@ -7892,7 +7927,7 @@ def _namec_open(name: Ptr[char], mode: int32) -> int32:
     # mounted-server open path is the universal namec/devtab path.
     if namec_chan_is_mounted(cid) != 0:
         printk0("[namec] mounted-9P chan opened via namec (DEV_MNT)\n")
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -7914,7 +7949,7 @@ def _namec_open_create(name: Ptr[char]) -> int32:
         return P9_NO_MOUNT
     if cid < 0:
         return ENOENT
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -7961,7 +7996,7 @@ def _install_proc_fd(encoded_mark: uint32) -> int32:
         cast[int32](encoded_mark & 0x00FFFFFF))
     if cid < 0:
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -7989,7 +8024,7 @@ def _open_fat_read(name: Ptr[char]) -> int32:
     if cid < 0:
         fat_close(fat_slot)
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -8017,7 +8052,7 @@ def _open_ext4_read(name: Ptr[char]) -> int32:
     if cid < 0:
         ext4_close(ext_slot)
         return EMFILE
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         namec_close(cid)
@@ -8034,7 +8069,7 @@ PROC_BUF_SIZE: uint64 = 4096
 
 
 def _open_proc(name: Ptr[char]) -> int32:
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
@@ -8045,9 +8080,11 @@ def _open_proc(name: Ptr[char]) -> int32:
     bufsz: uint64 = proc_buf_size(name)
     buf: uint64 = kmalloc(bufsz)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)              # -ENOMEM
     n: int64 = proc_render(name, cast[Ptr[uint8]](buf))
     if n < 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         kfree(buf)
         return ENOENT
     # Phase 4b (fd→Chan): the rendered snapshot moves INTO a ptr-backed
@@ -8068,16 +8105,18 @@ def _open_cgroup(name: Ptr[char]) -> int32:
         # Not a known cgroup2 interface file. Let the caller fall
         # through to the on-disk filesystem arms.
         return ENOENT
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
     # cgroup interface files all render well under one page.
     buf: uint64 = kmalloc(4096)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)              # -ENOMEM
     n: int64 = cgroup_render(name, cast[Ptr[uint8]](buf))
     if n < 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         kfree(buf)
         return ENOENT
     # Phase 4b: snapshot rides a DEV_BUF_FILE pool chan — see _open_proc.
@@ -8097,7 +8136,7 @@ def _open_cgroup_write(name: Ptr[char]) -> int32:
     # original, so any per-fd kmalloc would be freed out from under fd 1.
     if cgroup_fs_is_writable_leaf(name) == 0:
         return ENOENT
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
@@ -8116,16 +8155,18 @@ def _open_node(name: Ptr[char]) -> int32:
     # falls through to the on-disk arms) for an unknown node path.
     if node_path_match(name) == 0:
         return ENOENT
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fd: int32 = _alloc_fd(task)
     if fd < 0:
         return EMFILE
     # NUMA node interface files all render well under one page.
     buf: uint64 = kmalloc(4096)
     if buf == 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         return cast[int32](-12)              # -ENOMEM
     n: int64 = node_render(name, cast[Ptr[uint8]](buf))
     if n < 0:
+        task[0].fd_idx[cast[uint64](fd)] = FD_CLOSED_MARK   # free _alloc_fd reservation (#71)
         kfree(buf)
         return ENOENT
     # Phase 4b: snapshot rides a DEV_BUF_FILE pool chan — see _open_proc.
@@ -8149,7 +8190,7 @@ def vfs_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return cast[int64](rc)
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     file_idx: uint32 = task[0].fd_idx[fdu]
 
@@ -8243,7 +8284,7 @@ def vfs_write_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return cast[int64](rc)
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     file_idx: uint32 = task[0].fd_idx[fdu]
     if file_idx == FD_CLOSED_MARK:
@@ -8283,7 +8324,7 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return cast[int64](rc)
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     file_idx: uint32 = task[0].fd_idx[fdu]
 
@@ -8563,7 +8604,7 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return cast[int64](rc)
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     file_idx: uint32 = task[0].fd_idx[fdu]
 
@@ -8791,7 +8832,7 @@ def vfs_dup(oldfd: int32) -> int32:
     rc: int32 = _check_fd(oldfd)
     if rc != 0:
         return rc
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     oldu: uint64 = cast[uint64](oldfd)
     if task[0].fd_idx[oldu] == FD_CLOSED_MARK:
         return EBADF
@@ -8817,7 +8858,7 @@ def vfs_dup2(oldfd: int32, newfd: int32) -> int32:
     rc = _check_fd(newfd)
     if rc != 0:
         return rc
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     oldu: uint64 = cast[uint64](oldfd)
     newu: uint64 = cast[uint64](newfd)
     if task[0].fd_idx[oldu] == FD_CLOSED_MARK:
@@ -8839,7 +8880,7 @@ def vfs_close(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return rc
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     file_idx: uint32 = task[0].fd_idx[fdu]
     if file_idx == FD_CLOSED_MARK:
@@ -8973,7 +9014,7 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return cast[int64](rc)
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     file_idx: uint32 = task[0].fd_idx[fdu]
     if file_idx == FD_CLOSED_MARK:
@@ -9115,7 +9156,7 @@ def vfs_fd_is_dir(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return 0
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     # fd→Chan fold: a directory fd is now a unified FD_CHAN_MARK fd backed
     # by a DEV_DIR_FILE pool chan. The IFDIR keying (getdents64, _u_fill_
@@ -9139,7 +9180,7 @@ def vfs_fd_mtime(fd: int32) -> int64:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return -1
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     # fd→Chan fold: an ext4 file fd is an FD_CHAN_MARK fd backed by a
     # DEV_EXT4_FILE pool chan. Recover the ext4 slot via the chan; any
@@ -9187,7 +9228,7 @@ def vfs_fd_mode(fd: int32) -> int32:
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return -1
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     fi: uint32 = task[0].fd_idx[fdu]
     if fi == FD_CLOSED_MARK:
@@ -9239,7 +9280,7 @@ def vfs_fd_owner(fd: int32, uid_out: Ptr[uint32], gid_out: Ptr[uint32]) -> int32
     rc: int32 = _check_fd(fd)
     if rc != 0:
         return -1
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     fi: uint32 = task[0].fd_idx[fdu]
     if fi == FD_CLOSED_MARK:
@@ -9267,7 +9308,7 @@ def vfs_fd_dir_buf(fd: int32) -> uint64:
     # back_ptr (fd_buf holds the opaque chan id, NOT the buffer). Callers
     # gate on vfs_fd_is_dir() first, so a non-chan fd never reaches the
     # recovery; return 0 for anything else (Phase 4b: FD_DIR_MARK is gone).
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     if task[0].fd_idx[fdu] == FD_CHAN_MARK:
         return namec_chan_back_ptr(_fd_chan_id(task, fdu))
@@ -9279,7 +9320,7 @@ def vfs_fd_dir_buflen(fd: int32) -> uint64:
     # (fd_buflen is 0 for a folded fd). back_slot is stored as an int32
     # byte length; widen it through uint32 so it never sign-extends.
     # Phase 4b: FD_DIR_MARK is gone — non-chan fds report 0.
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     fdu: uint64 = cast[uint64](fd)
     if task[0].fd_idx[fdu] == FD_CHAN_MARK:
         return cast[uint64](cast[uint32](
@@ -9288,12 +9329,12 @@ def vfs_fd_dir_buflen(fd: int32) -> uint64:
 
 
 def vfs_fd_dir_pos(fd: int32) -> uint64:
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     return task[0].fd_pos[cast[uint64](fd)]
 
 
 def vfs_fd_dir_set_pos(fd: int32, pos: uint64):
-    task: Ptr[TaskStruct] = current_task()
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
     task[0].fd_pos[cast[uint64](fd)] = pos
 
 
@@ -9370,7 +9411,7 @@ def tmpfs_link_selftest() -> int32:
     # then restore. The selftest opens/closes its fds in matched pairs so
     # the table is clean by the time we restore anyway, but snapshot +
     # restore keeps the boot task's later use of stdio untouched.
-    seltask: Ptr[TaskStruct] = current_task()
+    seltask: Ptr[TaskStruct] = fd_owner_task(current_task())
     saved: Array[16, uint32]
     fclr: uint64 = 3
     while fclr < 16:
@@ -9575,7 +9616,7 @@ def cgroup2_vfs_selftest() -> int32:
     # kernel-init task's fd table is all-zero .bss, so slots read as
     # "cpio index 0" rather than FD_CLOSED_MARK and _alloc_fd would
     # EMFILE. Snapshot 3..15, run the body, restore.
-    seltask: Ptr[TaskStruct] = current_task()
+    seltask: Ptr[TaskStruct] = fd_owner_task(current_task())
     saved: Array[16, uint32]
     fclr: uint64 = 3
     while fclr < 16:
@@ -9664,7 +9705,7 @@ def node_sysfs_vfs_selftest() -> int32:
     # the kernel-init task's fd table is all-zero .bss, so slots read as "cpio
     # index 0" rather than FD_CLOSED_MARK and _alloc_fd would EMFILE. Snapshot
     # 3..15, run the body, restore.
-    seltask: Ptr[TaskStruct] = current_task()
+    seltask: Ptr[TaskStruct] = fd_owner_task(current_task())
     saved: Array[16, uint32]
     fclr: uint64 = 3
     while fclr < 16:
