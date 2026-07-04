@@ -992,6 +992,26 @@ class TaskStruct:
     # fresh .bss slots start at 0 (== "dispatched long ago" → freely
     # stealable, which is correct for a brand-new/never-run task).
     last_dispatch_jiffy: uint64
+    # setitimer(2) ITIMER_REAL (wall-clock) state. LAYER-2-ONLY — a Linux-ABI
+    # facility (the setitimer/getitimer/alarm handlers in u_syscalls.ad reach
+    # these through accessors), but the DECREMENT runs from the native timer
+    # tick (itimer_real_tick_all below, called BSP-only from timer_interrupt)
+    # because ITIMER_REAL is wall-clock: it counts down regardless of whether
+    # the owning task is currently scheduled. Granularity is one tick (HZ=100
+    # => 10 ms), the accuracy contract the brief allows.
+    #
+    #   itimer_real_ticks  — remaining ticks until SIGALRM fires. 0 == disarmed
+    #                        (the timer is stopped). Decremented once per tick.
+    #   itimer_real_reload — reload value in ticks, latched from it_interval.
+    #                        On expiry the timer reloads itimer_real_ticks from
+    #                        this; 0 == one-shot (fire once, then stop).
+    # Both 0 on a fresh slot; CLEARED on execve (setitimer timers do NOT survive
+    # exec — POSIX) and on task_reap (no stale misfire into a recycled slot).
+    # xeyes/xclock and most X/GTK apps drive their redraw off ITIMER_REAL ->
+    # SIGALRM, so this is the gate to X11 apps actually rendering under XWayland.
+    # Placed at the END of TaskStruct so no earlier offset shifts.
+    itimer_real_ticks:  uint64
+    itimer_real_reload: uint64
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -2436,6 +2456,11 @@ def sched_init_task_weight(slot: uint64):
     task_table[slot].wait_next     = 0
     task_table[slot].wait_on       = 0
     task_table[slot].wait_signaled = 0
+    # setitimer(2) ITIMER_REAL disarmed on a fresh/recycled slot so a new task
+    # never inherits a live countdown (belt-and-braces with clear_task_itimer on
+    # reap; a create that bypassed reap would still start clean here).
+    task_table[slot].itimer_real_ticks  = 0
+    task_table[slot].itimer_real_reload = 0
     # Per-CPU rq (#6): a fresh/recycled slot defaults to the BSP runqueue.
     # The real owning CPU is assigned when the task is first made runnable
     # (sched_make_ready / placement). Slot 0 (BSP boot task) stays 0.
@@ -6474,6 +6499,10 @@ def task_reap(slot: int32):
     # reap on_cpu is already 0 so this falls straight through.
     while task_table[su].on_cpu != 0:
         cpu_relax()
+    # setitimer(2): disarm this task's ITIMER_REAL before the slot is recycled,
+    # so the per-tick scan (itimer_real_tick_all) can never post SIGALRM into a
+    # freed/reused slot. Idempotent (a task that never armed one reads 0).
+    clear_task_itimer(su)
     # cgroup v2 accounting: drop the dying task off its cgroup's
     # pids.current, then (if it was the last task in the cgroup) release
     # the cgroup's memory.current. Order matters — uncharge_all keys off
@@ -8020,6 +8049,9 @@ SIGINT:  uint64 = 2
 SIGKILL: uint64 = 9
 SIGSEGV: uint64 = 11
 SIGPIPE: uint64 = 13
+# setitimer(2) ITIMER_REAL expiry / alarm(2). Default disposition (no handler)
+# is terminate; X/GTK apps install a handler and redraw off it.
+SIGALRM: uint64 = 14
 SIGTERM: uint64 = 15
 SIGCHLD: uint64 = 17
 # Job-control signals (x86_64 / asm-generic numbering). SIGCONT (18)
@@ -8103,6 +8135,72 @@ def signal_post(slot: uint64, sig: uint64):
 
 def signal_pending(slot: uint64) -> uint64:
     return task_table[slot].sig_pending
+
+
+# setitimer(2) ITIMER_REAL accessors. LAYER-2-ONLY: the Linux-ABI
+# setitimer/getitimer/alarm handlers (linux_abi/u_syscalls.ad) reach the
+# per-task itimer fields through these, keeping core.ad free of any static
+# dependency on the linux_abi layer (same one-directional rule as the
+# ptrace/seccomp blocks).
+def get_task_itimer_real_ticks(slot: uint64) -> uint64:
+    if slot >= NTASKS:
+        return 0
+    return task_table[slot].itimer_real_ticks
+
+
+def set_task_itimer_real_ticks(slot: uint64, v: uint64):
+    if slot >= NTASKS:
+        return
+    task_table[slot].itimer_real_ticks = v
+
+
+def get_task_itimer_real_reload(slot: uint64) -> uint64:
+    if slot >= NTASKS:
+        return 0
+    return task_table[slot].itimer_real_reload
+
+
+def set_task_itimer_real_reload(slot: uint64, v: uint64):
+    if slot >= NTASKS:
+        return
+    task_table[slot].itimer_real_reload = v
+
+
+def clear_task_itimer(slot: uint64):
+    # Disarm this task's ITIMER_REAL. Called on execve (POSIX: interval timers
+    # are NOT preserved across exec) and on task_reap (so a recycled slot never
+    # inherits a live countdown that would misfire SIGALRM into the new task).
+    if slot >= NTASKS:
+        return
+    task_table[slot].itimer_real_ticks  = 0
+    task_table[slot].itimer_real_reload = 0
+
+
+# Per-tick ITIMER_REAL driver. Called BSP-only from timer_interrupt (once per
+# tick, wall-clock). Scans every live task slot: for each armed ITIMER_REAL
+# (itimer_real_ticks > 0) decrement one tick; on reaching 0 post SIGALRM to the
+# owning task and reload from itimer_real_reload (0 => one-shot, stays disarmed).
+# The signal is delivered on the owning task's next return-to-user / wq wake —
+# signal_post already force-wakes a STATE_WAIT task (e.g. an X app blocked in
+# poll), so the SIGALRM interrupts the blocking syscall and the app redraws.
+def itimer_real_tick_all():
+    i: uint64 = 0
+    while i < NTASKS:
+        st: uint64 = task_table[i].state
+        # Only decrement live, non-zombie slots. A STATE_FREE/EXITED slot's
+        # itimer is already cleared (clear_task_itimer on reap), but guard
+        # anyway so a stale value can never fire into a dead slot.
+        if st != STATE_FREE and st != STATE_EXITED:
+            rem: uint64 = task_table[i].itimer_real_ticks
+            if rem != 0:
+                rem = rem - 1
+                if rem == 0:
+                    reload: uint64 = task_table[i].itimer_real_reload
+                    task_table[i].itimer_real_ticks = reload
+                    signal_post(i, SIGALRM)
+                else:
+                    task_table[i].itimer_real_ticks = rem
+        i = i + 1
 
 
 # §3: per-task signal-mask accessors. The Linux-ABI rt_sigprocmask
@@ -8520,6 +8618,10 @@ def exec_reset_signal_dispositions(slot: uint64):
     task_table[slot].alt_stack_sp    = 0
     task_table[slot].alt_stack_size  = 0
     task_table[slot].alt_stack_flags = 0
+    # setitimer(2): interval timers are NOT preserved across execve (POSIX) —
+    # disarm ITIMER_REAL so the new image starts with no pending SIGALRM.
+    task_table[slot].itimer_real_ticks  = 0
+    task_table[slot].itimer_real_reload = 0
 
 
 # U31: PR_SET_NAME / PR_GET_NAME storage backing.
