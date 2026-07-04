@@ -502,6 +502,20 @@ HMP 1px-step mouse. NO new bugs — solid:
   The wedge is GONE — reliably-interactive weston-terminal + general SMP fork-load
   stability.
 
+## Interactive END-USER push #6 (orchestrator, 2026-07-03) — keyboard text-input into a DE app
+Drove the install wizard on the DEFAULT image (post-~30 kernel changes this session).
+NO bugs — solid:
+- Clicked **Next** (page 1→2) via HMP 1px-step mouse → advanced to "Step 2 of 5:
+  Create your user".
+- **Typed "dave" via HMP `sendkey`** → routed through the DE keyboard into the
+  FOCUSED username field (shows `dave` + caret). First time text-input into a DE
+  widget was exercised — WORKS.
+- **Field validation live**: Next was DISABLED with the empty field, ENABLED once a
+  valid username ("dave") was typed. Back enabled.
+- Confirms keyboard→focused-DE-app routing + wizard multi-page nav + per-page
+  validation all intact after the session's kernel churn (SYSCALL-entry, #9 NO_HZ,
+  do_rfork COW, rt_sigreturn, signal, setitimer, afunix, ...).
+
 ## Notes
 - Perf theme continues the long-standing DE input-latency track (see memory
   `project_de_perf_pivot`, `project_de_interactive_broken_2026-06-15`).
