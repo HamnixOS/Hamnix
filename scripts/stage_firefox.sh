@@ -85,6 +85,10 @@ PKGS=(
   libnspr4
   libdbus-1-3 libdbus-glib-1-2
   libwayland-client0 libwayland-cursor0 libwayland-egl1
+  # libgtk-3.so.0 DT_NEEDED-links libcloudproviders.so.0; without it the
+  # dlopen of libmozgtk.so at Firefox's XPCOMGlueLoad fails and the
+  # launcher aborts with "Couldn't load XPCOM." before libxul even loads.
+  libcloudproviders0
   libevent-2.1-7t64 libvpx9 libasound2t64
   libx11-6 libx11-xcb1 libxcb1 libxcb-shm0 libxext6 libxfixes3
   libxcomposite1 libxdamage1 libxrandr2 libxi6 libxrender1 libxcursor1
