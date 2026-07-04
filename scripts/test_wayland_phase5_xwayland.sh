@@ -153,6 +153,30 @@ else
 fi
 
 # =====================================================================
+# SANITY: ITIMER_REAL / SIGALRM works in isolation (before the X stack).
+# =====================================================================
+# A tiny static glibc probe (tests/distros/debian-minbase/rootfs staged
+# /usr/bin/itimer_probe) arms setitimer(ITIMER_REAL, 100ms repeating),
+# installs a SIGALRM handler, and prints ITIMER_PROBE_OK once the handler
+# has fired >=3 times. This decouples the setitimer/SIGALRM kernel path
+# from xeyes' heavy redraw code: a PASS here proves the timer + signal
+# delivery work; a later xeyes failure is then a DISTINCT gate. Skips
+# cleanly if the probe binary isn't staged in this image.
+echo "$TAG --- SANITY: setitimer(ITIMER_REAL)+SIGALRM (itimer_probe) ---"
+sanity_itimer="skip"
+if send_until "spawn linux { /usr/bin/itimer_probe }" "ITIMER_PROBE_OK" 60; then
+    echo "$TAG PASS (sanity): SIGALRM handler fired — ITIMER_REAL works."
+    grep -aF "ITIMER_PROBE_" "$LOG" | tail -4
+    sanity_itimer="pass"
+elif grep -aqF "ITIMER_PROBE_START" "$LOG"; then
+    echo "$TAG WARN (sanity): probe started but SIGALRM did not fire in time." >&2
+    grep -aF "ITIMER_PROBE_" "$LOG" | tail -4
+    sanity_itimer="fail"
+else
+    echo "$TAG NOTE (sanity): itimer_probe not present in this image; skipping."
+fi
+
+# =====================================================================
 # PREREQ: the X11 UNIX-socket directory /tmp/.X11-unix must exist.
 # =====================================================================
 # Xwayland (via libxtrans) creates its X listening socket under
@@ -248,12 +272,27 @@ mon "screendump $PPM_PRE" >/dev/null; sleep 1
 
 APP_CMD="export DISPLAY=':0' ; spawn linux { /usr/bin/xeyes -geometry '300x200+20+20' }"
 rung_c=0
-# Count commits before; the app maps -> Xwayland recommits the root surface.
+# Count commits BEFORE launching xeyes. Xwayland already committed its root
+# surface at rung (a), so the "shm buffer committed" marker is ALREADY in the
+# log — we must detect a NEW commit (count INCREASE), not the marker's mere
+# presence (the old send_until matched the pre-existing commit and returned
+# instantly, screendumping before xeyes had even finished its dynamic-load
+# startup). In rootful mode xeyes' redraw re-commits the SAME root wid, so a
+# fresh commit == xeyes drew. xeyes drives that redraw off setitimer(ITIMER_-
+# REAL) -> SIGALRM (now implemented), so a commit increase here is the payoff.
 pre_commits=$(grep -acF "$COMMIT_MARKER" "$LOG" 2>/dev/null || echo 0)
-if send_until "$APP_CMD" "$COMMIT_MARKER" "$CMD_WAIT"; then
+# Launch xeyes once (a settle newline first so hamsh has a clean prompt).
+printf '\n' >&3; sleep 1; send "$APP_CMD"
+echo "$TAG (c) xeyes launched; waiting up to ${CMD_WAIT}s for a NEW root-surface commit (xeyes redraw)..."
+post_commits="$pre_commits"
+for _i in $(seq 1 "$CMD_WAIT"); do
+    kill -0 "$QEMU_PID" 2>/dev/null || break
     post_commits=$(grep -acF "$COMMIT_MARKER" "$LOG" 2>/dev/null || echo 0)
-    echo "$TAG NOTE (c): commits before=$pre_commits after=$post_commits"
-fi
+    [ "$post_commits" -gt "$pre_commits" ] && break
+    sleep 1
+done
+echo "$TAG NOTE (c): commits before=$pre_commits after=$post_commits"
+# Let a couple more redraw ticks land so the screendump captures a full frame.
 sleep 6
 WID="$(grep -aF "$COMMIT_MARKER" "$LOG" | tail -1 | grep -aoE 'wid [0-9]+' | awk '{print $2}')"
 echo "$TAG Xwayland surface window id: ${WID:-<unknown>}"
