@@ -85,6 +85,7 @@ from kernel.sched.core import (
     task_image_lo, task_image_hi, task_interp_lo, task_interp_hi,
     dump_linux_task_states, call_linux_futex_dump, task_last_syscall_nr,
     linux_group_status, dump_linux_group_full, linux_max_thread_group,
+    NTASKS,
 )
 # Linux-ABI no-syscall watchdog: jiffies clock + tick-hook registration.
 # arch.time imports only from core (no mm.* symbol), so this is acyclic.
@@ -2515,6 +2516,111 @@ def _wd_dump_stack(ursp: uint64):
             printk1("[nosys-wd]   stack@%p not present\n", a)
             i = 8
         i = i + 1
+
+
+def _vma_find_in_cr3(cr3: uint64, addr: uint64, out_slot: Ptr[uint64]) -> uint64:
+    # #76: a Linux `spawn` process scatters its VMAs across per-thread slots
+    # (each thread's own mmap()s land in ITS OWN vma_list_head; there is no
+    # single owner). To map a RIP/stack word to a library we must try EVERY
+    # slot in the same cr3 group, not just the leader. Returns the covering
+    # VmaNode (0 if none) and, via out_slot, the slot whose list held it.
+    s: uint64 = 0
+    while s < NTASKS:
+        if task_pml4(cast[int32](s)) == cr3 and task_vma_list_head(s) != 0:
+            n: uint64 = vma_find(s, addr)
+            if n != 0:
+                out_slot[0] = s
+                return n
+        s = s + 1
+    out_slot[0] = 0
+    return 0
+
+
+def _vma_print_addr_lib(cr3: uint64, addr: uint64) -> int32:
+    # Resolve one address against the cr3 group's scattered VMA lists. Only
+    # a word in an EXECUTABLE, file-backed VMA is a real return address; print
+    # base + file_offset + path (so offline readelf names the symbol) and
+    # return 1. Non-exec / anon / unmapped words are stack noise -> return 0.
+    hs: uint64 = 0
+    vn: uint64 = _vma_find_in_cr3(cr3, addr, &hs)
+    if vn == 0:
+        return 0
+    prot: int32 = cast[Ptr[VmaNode]](vn)[0].prot
+    # EXEC-only filter (Linux-ABI code VMAs may be is_file=0: W^X copies the
+    # ELF into an anon exec mapping, so requiring is_file would drop every
+    # real return frame). A word in any executable VMA is a candidate caller.
+    if (prot & VMA_PROT_EXEC) == 0:
+        return 0
+    isf:  int32 = cast[Ptr[VmaNode]](vn)[0].is_file
+    vbase: uint64 = _vma_node_start(vn)
+    vfo:   uint64 = cast[Ptr[VmaNode]](vn)[0].file_offset
+    vfd:   int32  = cast[Ptr[VmaNode]](vn)[0].file_fd
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk3("      %p base=%p foff=0x%x", addr, vbase, vfo)
+    printk1(" isf=%d", cast[uint64](isf))
+    if isf != 0 and vfd >= 0:
+        pp: Ptr[uint8] = task_fd_opened_path_ptr(&task_table[hs],
+                                                 cast[uint64](vfd))
+        if pp[0] != 0:
+            printk1(" %s", cast[uint64](pp))
+    printk0("\n")
+    return 1
+
+
+def vma_dump_rip_info(thread_slot: uint64, mm_slot: uint64, urip: uint64):
+    # #76 Firefox parked-wd RIP->library resolver. Lives here (not in
+    # core.ad) because it must dereference VmaNode, which core.ad cannot
+    # name without a core<->vma import cycle. Resolves `urip` against the
+    # VMA list owned by `mm_slot` (the same-cr3 leader) and prints the
+    # containing VMA's base + file_offset + open path, so an offline
+    # readelf/nm on the DSO turns (urip - base + file_offset) into a
+    # symbol. `thread_slot` is only for labelling the line.
+    # Search the WHOLE cr3 group (VMAs scatter across per-thread slots).
+    cr3: uint64 = task_pml4(cast[int32](thread_slot))
+    hs: uint64 = 0
+    vn: uint64 = _vma_find_in_cr3(cr3, urip, &hs)
+    if vn == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[parked-wd]   slot=%d urip=%p NO-VMA\n", thread_slot, urip)
+        return
+    vbase: uint64 = _vma_node_start(vn)
+    vfo:   uint64 = cast[Ptr[VmaNode]](vn)[0].file_offset
+    vfd:   int32  = cast[Ptr[VmaNode]](vn)[0].file_fd
+    isf:   int32  = cast[Ptr[VmaNode]](vn)[0].is_file
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk3("[parked-wd]   slot=%d ripvma_base=%p foff=0x%x", thread_slot,
+            vbase, vfo)
+    printk2(" isfile=%d fd=%d\n", cast[uint64](isf), cast[uint64](vfd))
+    if isf != 0 and vfd >= 0:
+        pp: Ptr[uint8] = task_fd_opened_path_ptr(&task_table[hs],
+                                                 cast[uint64](vfd))
+        if pp[0] != 0:
+            printk_set_level(PRINTK_LEVEL_EMERG)
+            printk1("[parked-wd]   ripvma_path=%s\n", cast[uint64](pp))
+
+
+def vma_dump_user_stack(thread_slot: uint64, cr3: uint64, ursp: uint64):
+    # #76 poor-man's user backtrace for a parked Linux thread. The saved
+    # user-RIP is the libc syscall-return trampoline; the real caller chain
+    # (glib / GTK / libxul) is spilled on the user stack. Non-faultingly
+    # read a window of stack words (via _wd_resolve_uword, which page-walks
+    # cr3 without taking mm locks — safe from IRQ context) and print every
+    # word that lands in the userspace shared-library code range
+    # [0x100000000, 0x300000000): these are candidate return addresses an
+    # offline readelf/nm on the staged libxul.so / libc.so resolves to the
+    # function that issued the blocking call. Print up to 12 hits from a
+    # 64-word (512-byte) scan.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2("[parked-wd]   slot=%d ursp=%p bt:\n", thread_slot, ursp)
+    hits: uint64 = 0
+    j: uint64 = 0
+    while j < 256 and hits < 16:
+        w: uint64 = 0
+        if _wd_resolve_uword(cr3, ursp + j * 8, &w) != 0:
+            if w >= 0x100000000 and w < 0x300000000:
+                if _vma_print_addr_lib(cr3, w) != 0:
+                    hits = hits + 1
+        j = j + 1
 
 
 def _wd_dump_maps(slot: uint64):
