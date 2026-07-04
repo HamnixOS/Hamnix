@@ -255,13 +255,22 @@ fi
 # LADDER RUNG (c): an X11 app maps + renders — DISPLAY=:0 xeyes.
 # =====================================================================
 # xeyes connects to the X server (verified: [nxafu] connect + accept) and
-# drives its eye redraw off setitimer(ITIMER_REAL) -> SIGALRM. That interval
-# timer is now IMPLEMENTED (linux_abi setitimer/getitimer/alarm nr 36/37/38 +
-# per-task itimer_real_ticks decremented from the timer tick, posting SIGALRM
-# on expiry; cleared on execve + task_reap so a reused slot never inherits a
-# stale timer). With SIGALRM firing, xeyes redraws, Xwayland re-commits the
-# root surface, and the window composites into a Hamnix DE window — this rung
-# flips to a real PASS below when the render + interframe-change checks pass.
+# drives its eye redraw off setitimer(ITIMER_REAL) -> SIGALRM (implemented:
+# linux_abi setitimer/getitimer/alarm nr 36/37/38). xeyes then redraws,
+# Xwayland re-commits the root surface, and the window composites into a
+# Hamnix DE window — this rung flips to a real PASS below when the render +
+# interframe-change checks pass.
+#
+# GATE HISTORY: the earlier "428507 #GP storm" was decoded as glibc abort()'s
+# `hlt` "unreachable" trap (libc.so.6+0x28507) — reached because a fatal
+# default signal (SIGABRT) raised from INSIDE the SIGALRM redraw handler was
+# never delivered (signal_dispatch bailed on sig_in_handler), and a re-faulting
+# SIGSEGV looped instead of terminating. Both are now fixed (signal_dispatch
+# fires fatal-defaults mid-handler; deliver_fault_sigsegv force-terminates a
+# blocked/re-faulting SIGSEGV) — see the STORM GUARD below. A remaining
+# intermittent poisoned-PTE write fault (all-ones leaf PTE) can still make
+# xeyes abort on some ASLR layouts; when it does it now dies cleanly (exit
+# 134) instead of storming, and a later boot with a clean layout renders.
 echo "$TAG --- RUNG (c): DISPLAY=:0 xeyes (X11 app renders) ---"
 # Screendump BEFORE the app maps, to diff for the new rendered content.
 PPM_PRE="$OUTDIR/wl5_xwl_pre.ppm"
@@ -349,6 +358,37 @@ else
 fi
 
 # =====================================================================
+# STORM GUARD — a faulting X client must DIE cleanly, never fault-loop.
+# =====================================================================
+# Regression guard for the SIGSEGV/#GP fault-storm fix (deliver_fault_sigsegv
+# force-terminate-when-SIGSEGV-blocked + signal_dispatch fatal-default fires
+# mid-handler). If an X client ever hits a fatal fault (e.g. the intermittent
+# poisoned-PTE write fault that drove xeyes into glibc abort()), it must take
+# a BOUNDED number of fault dumps and then the task must be reaped — NOT
+# re-fault 1000+ times into stack exhaustion. We assert no single faulting RIP
+# repeats more than STORM_MAX times in the serial log.
+STORM_MAX="${STORM_MAX:-40}"
+storm_worst=0
+storm_rip=""
+while read -r cnt rip; do
+    [ -z "$cnt" ] && continue
+    if [ "$cnt" -gt "$storm_worst" ]; then storm_worst="$cnt"; storm_rip="$rip"; fi
+done < <(grep -aoE '\[(gp|pf)\] user #(GP|PF)?[^r]*rip=0x[0-9a-fA-F]+' "$LOG" 2>/dev/null \
+            | grep -aoE 'rip=0x[0-9a-fA-F]+' | sort | uniq -c | sort -rn)
+# Also count the classic hlt-in-abort #GP rip repeats (rip printed on the
+# '[gp] user #GP rip=' line, which the pattern above may format differently).
+gp_worst=$(grep -aoE '\[gp\] user #GP rip=0x[0-9a-fA-F]+' "$LOG" 2>/dev/null \
+            | sort | uniq -c | sort -rn | head -1 | awk '{print $1+0}')
+[ -n "$gp_worst" ] && [ "$gp_worst" -gt "$storm_worst" ] && storm_worst="$gp_worst"
+echo "$TAG STORM GUARD: worst single-RIP fault repeat = ${storm_worst} (limit ${STORM_MAX}) ${storm_rip}"
+storm_ok=1
+if [ "${storm_worst:-0}" -gt "$STORM_MAX" ]; then
+    echo "$TAG FAIL (storm): a fault re-fired ${storm_worst}x at ${storm_rip} — SIGSEGV/#GP" >&2
+    echo "$TAG   is looping instead of terminating the task (regression)." >&2
+    storm_ok=0
+fi
+
+# =====================================================================
 # VERDICT — report how far up the ladder.
 # =====================================================================
 echo "$TAG ============================================================"
@@ -356,8 +396,15 @@ echo "$TAG XWAYLAND LADDER:"
 echo "$TAG   (a) Xwayland connects to native Wayland : $([ "$rung_a" = 1 ] && echo YES || echo no)"
 echo "$TAG   (b) X display up (xdpyinfo)             : $([ "$rung_b" = 1 ] && echo YES || echo no)"
 echo "$TAG   (c) X11 app renders (xeyes)             : $([ "$rung_c" = 1 ] && echo YES || echo no)"
+echo "$TAG   no fault-storm (SIGSEGV terminates)     : $([ "$storm_ok" = 1 ] && echo YES || echo no)"
 echo "$TAG   screendump: $PNG_APP"
 echo "$TAG ============================================================"
+
+# A fault STORM is a hard regression regardless of how far the ladder climbed.
+if [ "$storm_ok" != 1 ]; then
+    echo "$TAG RESULT: FAIL — a userspace fault looped instead of terminating the task." >&2
+    exit 1
+fi
 
 if [ "$rung_a" = 1 ] && [ "$rung_b" = 1 ] && [ "$rung_c" = 1 ]; then
     echo "$TAG RESULT: PASS — XWayland runs X11 apps on the native Wayland server."
