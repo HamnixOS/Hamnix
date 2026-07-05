@@ -280,6 +280,18 @@ opt_aluload_count: uint32 = 0
 # (the per-iteration store the matmul accumulator paid). 0 with --opt OFF (the
 # whole register hook is inert), so the OFF path stays byte-identical.
 opt_storeelim_count: uint32 = 0
+# DEAD PARAM-HOME SPILL ELISION (--opt, prologue spill-elim lever): a
+# register-promoted, store-eliminable, plain full-width-8 scalar PARAMETER passed
+# in a register is spilled to its home slot then immediately reloaded into its
+# promoted register at function entry (`mov %argreg,slot` + `mov slot,%reg`). When
+# the param is store-eliminable (lr_is_store_elim: promoted, address never taken,
+# NO slot-bypass read) the init load is the ONLY reader of the slot, so replacing
+# it with a direct `mov %argreg,%reg` makes the spill store fully DEAD and drops it
+# — collapsing two memory ops (a store + a load) into one reg-reg move. Restricted
+# to promotion into a CALLEE-SAVED register (never a SysV arg reg), so the direct
+# move can never clobber another param's still-live incoming arg register. Counts
+# each elided param home. 0 with --opt OFF (cg_ra_active gates it), byte-inert.
+opt_paramhome_count: uint32 = 0
 # LOOP-INVARIANT GLOBAL-ARRAY BASE HOISTS (--opt, P1 Phase 2): each global array
 # whose constant base address was materialised ONCE into a held callee-saved
 # register (instead of `lea g(%rip)` every iteration). Counts each hoisted base
@@ -316,6 +328,7 @@ def isel_reset_stats():
     opt_isel_count = 0
     opt_aluload_count = 0
     opt_storeelim_count = 0
+    opt_paramhome_count = 0
     opt_basehoist_count = 0
     opt_fpsel_count = 0
     opt_fpmov_count = 0
@@ -2521,6 +2534,64 @@ def ra_emit_prologue_saves():
         p = p + 1
 
 
+# SysV integer-argument register x86 ENCODING for parameter ordinal 0..5:
+# rdi, rsi, rdx, rcx, r8, r9. Ordinals >= 6 are stack-passed (no arg register),
+# handled only on the spill path — this is queried solely for elidable ordinals
+# (< 6, guarded by param_home_elidable).
+def sysv_arg_reg_enc(argidx: uint32) -> uint32:
+    if argidx == 0:
+        return 7                             # rdi
+    if argidx == 1:
+        return 6                             # rsi
+    if argidx == 2:
+        return 2                             # rdx
+    if argidx == 3:
+        return 1                             # rcx
+    if argidx == 4:
+        return 8                             # r8
+    return 9                                 # r9  (argidx == 5)
+
+
+# True iff x86 encoding `enc` is a CALLEE-SAVED pool register: %rbx (3) or
+# %r12..%r15 (12..15). None of these is a SysV integer arg register (rdi/rsi/
+# rdx/rcx/r8/r9), so moving an incoming arg into one can never clobber a later
+# param's still-live incoming arg register.
+def is_callee_saved_enc(enc: uint32) -> uint32:
+    if enc == 3:
+        return 1
+    if enc >= 12 and enc <= 15:
+        return 1
+    return 0
+
+
+# True iff parameter node `pnode` at SysV ordinal `argidx` is DEAD-PARAM-HOME
+# ELIDABLE: it is a register-passed (argidx < 6), plain full-width-8 scalar that
+# regalloc promoted into a CALLEE-SAVED register AND is store-eliminable
+# (lr_is_store_elim -> ra_store_elim: address never taken, NO slot-bypass read).
+# For such a param the entry spill `mov %argreg,slot` is DEAD — store_elim proves
+# the slot has no bypass reader, and the init load (the only slot reader) is
+# replaced by a direct `mov %argreg,%reg` — so both the spill AND the reload
+# collapse to one reg-reg move. Requires cg_ra_active (the --opt regalloc path);
+# returns 0 with --opt OFF, keeping the prologue byte-identical to the seed.
+def param_home_elidable(pnode: uint32, argidx: uint32) -> uint32:
+    if cg_ra_active == 0:
+        return 0
+    if argidx >= 6:
+        return 0
+    if nd_name_len[pnode] == 0:
+        return 0
+    if param_is_plain_scalar(nd_name_off[pnode], nd_name_len[pnode]) == 0:
+        return 0
+    enc: uint32 = ra_reg_for_name(nd_name_off[pnode], nd_name_len[pnode])
+    if enc == RA_NONE:
+        return 0
+    if is_callee_saved_enc(enc) == 0:
+        return 0
+    if ra_store_elim_for_name(nd_name_off[pnode], nd_name_len[pnode]) == 0:
+        return 0
+    return 1
+
+
 # After spill_params: load each register-resident PARAMETER's incoming value
 # from its (just-spilled) slot into its assigned register, so the body's first
 # read of the param sees the argument. ONLY params are loaded here — a non-param
@@ -2530,8 +2601,17 @@ def ra_emit_prologue_saves():
 # param or earlier local whose interval is disjoint from it. `pchain` is the
 # ND_FUNCTION/ND_METHOD parameter chain (nd_a); we walk it and load each named
 # param that owns a plain full-width scalar register.
+#
+# For a DEAD-PARAM-HOME-ELIDABLE param (param_home_elidable) the slot was NOT
+# spilled by spill_params (the store is dead); we materialise its register with a
+# direct `mov %argreg,%reg` from the incoming SysV arg register (still intact —
+# spill_params only reads arg regs and promotions target callee-saved regs) rather
+# than the slot load. `idx` tracks the SysV ordinal in LOCKSTEP with spill_params
+# (both increment for EVERY param node, self included), so the arg-register lookup
+# matches the incoming ABI position.
 def ra_emit_init_regs(pchain: uint32):
     pp: uint32 = pchain
+    idx: uint32 = 0
     while pp != 0:
         # skip the implicit unnamed `self` param (name len 0); it is a Ptr slot,
         # never register-promoted.
@@ -2543,7 +2623,12 @@ def ra_emit_init_regs(pchain: uint32):
                 off2: int32 = 0
                 if lookup_local(nd_name_off[pp], nd_name_len[pp], &off2) != 0:
                     if param_is_plain_scalar(nd_name_off[pp], nd_name_len[pp]) != 0:
-                        emit_load_local_callee(enc, off2)
+                        if param_home_elidable(pp, idx) != 0:
+                            emit_mov_reg_reg(sysv_arg_reg_enc(idx), enc)
+                            opt_paramhome_count = opt_paramhome_count + 1
+                        else:
+                            emit_load_local_callee(enc, off2)
+        idx = idx + 1
         pp = nd_next[pp]
 
 
@@ -11667,6 +11752,15 @@ def spill_params(params: uint32):
     p: uint32 = params
     idx: uint32 = 0
     while p != 0:
+        # DEAD PARAM-HOME ELISION (--opt): a register-promoted, store-eliminable,
+        # plain-scalar param's home slot has no reader (the init reload is replaced
+        # by a direct arg-reg move in ra_emit_init_regs), so its spill store is
+        # DEAD — skip it. param_home_elidable returns 0 with --opt OFF, so the
+        # default spill path is byte-identical to the seed.
+        if param_home_elidable(p, idx) != 0:
+            idx = idx + 1
+            p = nd_next[p]
+            continue
         sz: uint32 = loc_scalar_size[idx]
         off: int32 = loc_offset[idx]
         if idx < 6:

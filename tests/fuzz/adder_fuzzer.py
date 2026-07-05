@@ -600,6 +600,7 @@ class Program:
         self._gen_cmpjcc_traffic(env)         # cmp; jcc branch-condition lever (--opt)
         self._gen_helper_calls(env)
         self._gen_saveset_probe(env)          # callee-saved save-set tightening (--opt)
+        self._gen_paramhome_traffic(env)      # dead param-home spill elision (--opt)
         self._gen_regpressure_scratch_traffic(env)  # caller-saved IR scratch (--opt)
         self._gen_region_callsplit_traffic(env)  # per-region caller-saved regalloc (--opt)
         self._gen_dce_keep_bait(env)      # DCE in main(): fire + must-KEEP probes
@@ -1918,6 +1919,91 @@ class Program:
         # Fold the OBSERVED side-effect count: this is the load-bearing check —
         # it only matches the oracle if the backend short-circuited exactly.
         self._fold_value("g_sc", U64.wrap(sc))
+
+    # ---- dead param-home spill-elision probe (--opt) -------------------------
+    def _gen_paramhome_traffic(self, env):
+        """Stress the DEAD PARAM-HOME SPILL ELISION lever (--opt): a register-
+        promoted, store-eliminable, plain full-width-8 scalar PARAMETER passed in
+        a register has its entry home spill (`mov %argreg,slot`) DROPPED and its
+        init reload replaced by a direct `mov %argreg,%reg`. A wrong register, a
+        wrong evaluation order across the multi-param moves, or eliding a spill
+        whose slot is actually still read would land a WRONG value that the
+        by-construction oracle catches. Shapes (all folded into g_accum):
+
+          (1) SIX-PARAM SUM — ph_sum6(a..f): all six SysV arg registers filled.
+              A call-free leaf, so regalloc can promote some params into the
+              CALLER-SAVED extension pool (rdi/r8/r9/r10/r11); the lever must
+              elide ONLY the callee-saved promotions (never a caller-saved reg
+              that is also a later param's incoming arg reg — the clobber hazard
+              the callee-saved restriction closes). Guards the restriction.
+          (2) CALL-CROSSING PARAM — ph_chain(a,b): `b` is live across an inner
+              call to ph_id(a), so it must sit in a callee-saved register that
+              survives the call; the elided direct move must feed that register.
+          (3) REASSIGNED PARAMS — ph_mut(a,b): both params are WRITTEN in the
+              body, so eliding the entry spill must not disturb the promoted
+              register's later redefinition.
+          (4) RECURSIVE — ph_rfib(n): the fib shape whose `n` (promoted to a
+              callee-saved reg, store-eliminable) is the canonical elision, run
+              on every recursive activation.
+        """
+        rng = self.rng
+
+        def argsrc(v):
+            return f"cast[int64](0 - {(-v)})" if v < 0 else f"cast[int64]({v})"
+
+        # One-time top-level defs (unconditional -> identical rng stream in both
+        # subset and default generation modes).
+        self.emit_top("def ph_sum6(a: int64, b: int64, c: int64, d: int64, "
+                      "e: int64, f: int64) -> int64:")
+        self.emit_top("    return a + b + c + d + e + f")
+        self.emit_top("")
+        self.emit_top("def ph_id(x: int64) -> int64:")
+        self.emit_top("    return x")
+        self.emit_top("")
+        self.emit_top("def ph_chain(a: int64, b: int64) -> int64:")
+        self.emit_top("    t: int64 = ph_id(a)")
+        self.emit_top("    return t + b")
+        self.emit_top("")
+        self.emit_top("def ph_mut(a: int64, b: int64) -> int64:")
+        self.emit_top("    a = a + b")
+        self.emit_top("    b = a * cast[int64](2)")
+        self.emit_top("    return a + b")
+        self.emit_top("")
+        self.emit_top("def ph_rfib(n: int64) -> int64:")
+        self.emit_top("    if n < cast[int64](2):")
+        self.emit_top("        return n")
+        self.emit_top("    return ph_rfib(n - cast[int64](1)) + "
+                      "ph_rfib(n - cast[int64](2))")
+        self.emit_top("")
+
+        # (1) six-param sum
+        for _ in range(rng.randint(2, 3)):
+            vs = [rng.randint(-1000, 1000) for _ in range(6)]
+            args = ", ".join(argsrc(v) for v in vs)
+            self.emit(f"    phs: int64 = ph_sum6({args})")
+            self._fold_value("cast[uint64](phs)", U64.wrap(sum(I64.wrap(v) for v in vs)))
+        # (2) call-crossing param
+        for _ in range(rng.randint(1, 2)):
+            a = rng.randint(-1000, 1000); b = rng.randint(-1000, 1000)
+            self.emit(f"    phc: int64 = ph_chain({argsrc(a)}, {argsrc(b)})")
+            self._fold_value("cast[uint64](phc)", U64.wrap(I64.wrap(a) + I64.wrap(b)))
+        # (3) reassigned params
+        for _ in range(rng.randint(1, 2)):
+            a = rng.randint(-1000, 1000); b = rng.randint(-1000, 1000)
+            aa = I64.wrap(I64.wrap(a) + I64.wrap(b))
+            bb = I64.wrap(aa * 2)
+            self.emit(f"    phm: int64 = ph_mut({argsrc(a)}, {argsrc(b)})")
+            self._fold_value("cast[uint64](phm)", U64.wrap(aa + bb))
+        # (4) recursive fib
+        def pf(n):
+            x, y = 0, 1
+            for _ in range(n):
+                x, y = y, x + y
+            return x
+        for _ in range(rng.randint(2, 3)):
+            k = rng.randint(4, 18)
+            self.emit(f"    phf: int64 = ph_rfib(cast[int64]({k}))")
+            self._fold_value("cast[uint64](phf)", U64.wrap(pf(k)))
 
     # ---- helper-call traffic -------------------------------------------------
     def _gen_helper_calls(self, env):
