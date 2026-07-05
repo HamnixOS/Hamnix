@@ -4064,6 +4064,177 @@ def _run_coalesce_corpus():
 
 
 # --------------------------------------------------------------------------
+# IMUL-CONST-MATERIALIZE corpus (the 3-operand imul-by-constant lever). A
+# `x * C` with a non-negative imm32 constant C lowers to the single x86
+# 3-operand `imul %dst,%src,$C` (imm8 form for C<=127, else imm32) instead of
+# materializing C into a scratch register and doing a 2-operand imul. The gate
+# is C <= 0x7FFFFFFF (a non-negative value that sign-extends to itself), so the
+# low 64 bits of the product are identical whether the multiply is read as
+# signed or unsigned — exactly what the 2-operand imul it replaces computed.
+# This corpus is the SAFETY net: it pins the exact emitted immediate + operand
+# across the value-sensitive shapes (dst-alias, imm8/imm32 boundary, imm32-max,
+# signed/unsigned operand) so a wrong immediate or a wrong source operand is
+# caught as a value mismatch by the oracle, AND asserts the lever fires on the
+# multiply shapes and is byte-inert OFF (IMULIMM==0 with --opt off). A `x * y`
+# (both variable) case proves the fallback (non-const multiply) stays correct
+# and does NOT fire the lever.
+# --------------------------------------------------------------------------
+def _imulimm_corpus():
+    """Return a list of (name, body, expected_stdout, expected_exit, want_fire)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, decls_and_main, val, want_fire):
+        body = PRELUDE + "\n" + decls_and_main
+        progs.append((name, body, str(val & M), (val & 255), want_fire))
+
+    # 1) const on the RIGHT, imm8 form: x * 7.
+    x = 123456789
+    prog("mul_c_right",
+         "def f(x: int64) -> int64:\n"
+         "    return x * 7\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = cast[uint64](f(cast[int64]({x})))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         (x * 7) & M, 1)
+
+    # 2) const on the LEFT (commutative): 9 * x.
+    x = 98765
+    prog("mul_c_left",
+         "def f(x: int64) -> int64:\n"
+         "    return 9 * x\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = cast[uint64](f(cast[int64]({x})))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         (9 * x) & M, 1)
+
+    # 3) dst-ALIAS accumulator in a loop: s = s * 3 (the register the product
+    #    lands in is also the source). A wrong operand order clobbers s.
+    n = 20
+    s = 1
+    for _ in range(n):
+        s = (s * 3 + 1) & M
+    prog("mul_dst_alias_loop",
+         "def hot(n: int64) -> int64:\n"
+         "    s: int64 = 1\n"
+         "    i: int64 = 0\n"
+         "    while i < n:\n"
+         "        s = s * 3 + 1\n"
+         "        i = i + 1\n"
+         "    return s\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = cast[uint64](hot(cast[int64]({n})))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         s, 1)
+
+    # 4) imm8 boundary: x * 127 (last imm8) and x * 128 (first imm32 form).
+    x = 777
+    prog("mul_imm8_max",
+         "def f(x: int64) -> int64:\n"
+         "    return x * 127\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = cast[uint64](f(cast[int64]({x})))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         (x * 127) & M, 1)
+    prog("mul_imm32_first",
+         "def f(x: int64) -> int64:\n"
+         "    return x * 128\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = cast[uint64](f(cast[int64]({x})))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         (x * 128) & M, 1)
+
+    # 5) imm32-MAX: x * 2147483647 (0x7FFFFFFF, the gate boundary — the largest
+    #    C that sign-extends to itself).
+    x = 3
+    prog("mul_imm32_max",
+         "def f(x: int64) -> int64:\n"
+         "    return x * 2147483647\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = cast[uint64](f(cast[int64]({x})))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         (x * 2147483647) & M, 1)
+
+    # 6) UNSIGNED operand: (uint64)x * 5. The low-64 product is identical for
+    #    signed/unsigned, so the same 3-op imul is emitted; value must match the
+    #    unsigned oracle even when x is large.
+    x = (1 << 40) + 12345
+    prog("mul_unsigned",
+         "def f(x: uint64) -> uint64:\n"
+         "    return x * 5\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = f(cast[uint64]({x}))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         (x * 5) & M, 1)
+
+    # 7) FALLBACK: x * y (both variable) — the lever must NOT fire (no constant),
+    #    and the plain 2-operand multiply must stay correct.
+    x, y = 6001, 7
+    prog("mul_var_var_fallback",
+         "def f(x: int64, y: int64) -> int64:\n"
+         "    return x * y\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    g_accum = cast[uint64](f(cast[int64]({x}), cast[int64]({y})))\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         (x * y) & M, 0)
+
+    return progs
+
+
+def _run_imulimm_corpus():
+    """Run the imul-const corpus through codegen.ad --opt. Returns
+    (all_correct_and_fired, total_imulimm). Asserts ON==OFF==oracle for every
+    program (a wrong immediate / wrong source operand = a value mismatch the
+    oracle catches), the lever FIRED on the const-multiply shapes and stayed
+    byte-inert OFF (IMULIMM_off == 0), and did NOT fire on the var*var
+    fallback."""
+    host = _ad_host()
+    total = 0
+    all_ok = True
+    for (name, body, exp_out, exp_exit, want_fire) in _imulimm_corpus():
+        r_on = host.run_through_codegen_ad(f"imm_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"imm_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [imulimm corpus '{name}'] codegen.ad on={r_on.kind}/"
+                  f"off={r_off.kind}: {(r_on.detail or r_off.detail)[:120]}")
+            continue
+        im_on = int(getattr(r_on, "imulimm", 0) or 0)
+        im_off = int(getattr(r_off, "imulimm", 0) or 0)
+        total += im_on
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [imulimm corpus '{name}'] MISCOMPILE opt=("
+                  f"{r_on.stdout},{r_on.exit}) oracle=({exp_out},{exp_exit})")
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [imulimm corpus '{name}'] OFF wrong=("
+                  f"{r_off.stdout},{r_off.exit}) oracle=({exp_out},{exp_exit})")
+        if im_off != 0:
+            all_ok = False
+            print(f"  [imulimm corpus '{name}'] NOT byte-inert OFF "
+                  f"(imulimm={im_off})")
+        if want_fire and im_on == 0:
+            all_ok = False
+            print(f"  [imulimm corpus '{name}'] lever never fired (imulimm_on=0)")
+        if (not want_fire) and im_on != 0:
+            all_ok = False
+            print(f"  [imulimm corpus '{name}'] lever fired on a non-const "
+                  f"multiply (imulimm_on={im_on})")
+    if total == 0:
+        all_ok = False
+    return (all_ok, total)
+
+
+# --------------------------------------------------------------------------
 # Phase-5 IR-EMIT corpus. Hand-written programs whose hot expressions lower
 # FULLY into the value IR (ir_lower_pure_expr) — pure signedness-invariant
 # integer arithmetic over ident/const leaves — so codegen emits them by walking
@@ -7405,6 +7576,18 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] copy-coalesce corpus miscompiled, forward "
                   "never fired, or OFF not byte-inert")
+        # IMUL-CONST-MATERIALIZE corpus: `x * C` -> 3-operand `imul dst,src,$C`.
+        # Pins the emitted immediate + source operand across dst-alias, imm8/imm32
+        # boundary, imm32-max and signed/unsigned shapes (a wrong imm/operand is a
+        # value mismatch), asserts the lever fires and is byte-inert OFF, and that
+        # a var*var multiply does NOT fire it.
+        imm_ok, imm_fires = _run_imulimm_corpus()
+        print(f"--- ADDER_OPT=1 IMUL-CONST corpus (3-operand imul-by-const) ---")
+        print(f"  corpus imul-imm fires:      {imm_fires}")
+        if not imm_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] imul-const corpus miscompiled, never fired, "
+                  "OFF not byte-inert, or fired on a non-const multiply")
         # Phase-4 register-pressure corpus: many simultaneously-live scalar
         # locals (> the 5-reg callee-saved pool) + call-crossing + loop-carried
         # spills. Asserts the allocated/spilled output is CORRECT vs the oracle
