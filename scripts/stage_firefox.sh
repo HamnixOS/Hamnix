@@ -402,10 +402,21 @@ export MOZ_DISABLE_DMABUF=1
 export MOZ_ALLOW_SOFTWARE_GL=1
 export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_LAYOUT_FRAME_RATE=10
-# gfx-path diagnostics: surface which RenderCompositor Firefox selects +
-# any DMABuf/EGL probe on the [FF] serial stream (bounded — one subsystem).
-export MOZ_LOG='WebRender:4,Dmabuf:4'
-export MOZ_LOG_FILE=/dev/stderr
+# Diagnostics: the CURRENT fresh-boot blocker is NOT a client crash and NOT a
+# missing wl_surface op — it is the parent<->child process IPC handshake. On a
+# clean 3G boot the parent firefox-esr builds full GTK chrome, spawns the
+# content + GPU child processes, then EXITS code=255 WITHOUT creating a
+# wl_surface, leaving the children parked forever in futex / poll / ppoll /
+# epoll_wait (waiting on IPC messages the parent never delivers). So the
+# instructive modules are the IPC channel + widget/window bring-up, NOT gfx.
+#   NB: MOZ_LOG_FILE=/dev/stderr rode the DE-owned console for the child
+#   processes and produced NOTHING capturable on the serial [FF] stream; point
+#   it at a writable file under $HOME (the live root's /root is writable) so a
+#   follow-up run can `cat /root/moz.log*` over the serial shell and read the
+#   parent's exact IPC-launch / handshake-timeout decision. `sync` flushes each
+#   line so a 255 exit does not lose the tail.
+export MOZ_LOG='ipc:5,IPDL:5,MessageChannel:5,widget:5,WidgetWayland:5,nsWindow:5,sync'
+export MOZ_LOG_FILE=/root/moz.log
 export HOME=/root
 export XDG_CONFIG_HOME=/run
 export XDG_CACHE_HOME=/root/.cache
