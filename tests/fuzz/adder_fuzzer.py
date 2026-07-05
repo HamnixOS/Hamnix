@@ -4610,6 +4610,267 @@ def _run_destsel_corpus():
 
 
 # --------------------------------------------------------------------------
+# CONSTANT-CONDITION IF FOLD corpus (dcecopy const-branch lever). The lever:
+# codegen's gen_if, under --opt, folds an ND_IF whose PRIMARY condition is a
+# provably-true constant literal (an `if 1:` — what the opt const-branch pass
+# leaves after rewriting `if 1==1:` via opt_if_keep_arm, or a literal truthy
+# constant) into the then-body ALONE, with NO condition materialize, NO `test`,
+# NO conditional branch. cg_const_cond_truth gates it on simple int/bool/char
+# literals only, so a runtime condition is NEVER folded.
+#
+# The corpus is a DIFFERENTIAL correctness net (each program oracle-checked ON and
+# OFF, ON==OFF==oracle) plus a firing assertion (CONSTIF>0 on the want_fire
+# shapes) and a byte-inert-OFF assertion. It deliberately includes:
+#   * `if 1==1:` with/without else, `if 1:`, a non-1 truthy `if 7:` (all fold);
+#   * a true primary with a live elif/else (the elif/else are unreachable and
+#     dropped — a mis-fold that ran them would change the result);
+#   * the exact dcecopy shape: a const-if with a memory (bucket) write nested in
+#     a counted loop, both then/else arms present;
+#   * a const-FALSE primary WITH else (the opt pass promotes the else; folds);
+#   * DELIBERATE-BREAK probes that FALL BACK and must stay correct: a runtime
+#     `if x > 0`, a non-literal `if x == x`, and a const-FALSE `if 0:` bodyless
+#     (its body writes an observable value — a mis-fold that emitted the body
+#     would flip the oracle, catching it).
+# --------------------------------------------------------------------------
+def _constif_corpus():
+    """Return [(name, body, expected_stdout, expected_exit, want_fire)].
+    want_fire=True => the const-if fold MUST fire (CONSTIF>0);
+    want_fire=False => this shape must FALL BACK / be a no-op (correctness only)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, mainbody, val, want_fire=True):
+        body = PRELUDE + "\n" + mainbody
+        progs.append((name, body, str(val & M), val & 0xFF, want_fire))
+
+    # 1) if 1==1 with else -> primary true, else dropped.
+    prog("eq_lit_else",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    r: int64 = 3
+    if 1 == 1:
+        r = 7
+    else:
+        r = 9
+    print_u64(cast[uint64](r))
+    return cast[int32](r & 255)
+""", 7)
+
+    # 2) bare literal if 1 (no else).
+    prog("lit1",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    r: int64 = 3
+    if 1:
+        r = 42
+    print_u64(cast[uint64](r))
+    return cast[int32](r & 255)
+""", 42)
+
+    # 3) non-1 truthy literal if 7.
+    prog("lit7",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    r: int64 = 0
+    if 7:
+        r = 5
+    print_u64(cast[uint64](r))
+    return cast[int32](r & 255)
+""", 5)
+
+    # 4) true primary with a live elif AND else: only the primary body runs.
+    prog("true_primary_elif",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    r: int64 = 0
+    x: int64 = 100
+    if 1 == 1:
+        r = 11
+    elif x > 0:
+        r = 22
+    else:
+        r = 33
+    print_u64(cast[uint64](r))
+    return cast[int32](r & 255)
+""", 11)
+
+    # 5) the dcecopy hot shape: const-if with a memory write nested in a loop.
+    n = 50
+    acc = 0
+    for i in range(n):
+        d = (i * 2 + 1) & M
+        acc = (acc + d) & M     # `if 1==1` branch is always taken
+    prog("loop_bucket",
+         f"""bucket: Array[64, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        d: int64 = i * 2 + 1
+        slot: int64 = i & 63
+        if 1 == 1:
+            bucket[cast[int64](slot)] = bucket[cast[int64](slot)] + d
+        else:
+            bucket[cast[int64](slot)] = bucket[cast[int64](slot)] - d
+        i = i + 1
+    acc: int64 = 0
+    k: int64 = 0
+    while k < 64:
+        acc = acc + bucket[cast[int64](k)]
+        k = k + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & 255)
+""", acc)
+
+    # 6) const-AND / const-OR conditions the truth-folder proves.
+    prog("and_or_const",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    r: int64 = 0
+    if 1 == 1 and 2 == 2:
+        r = r + 8
+    if 0 == 1 or 3 == 3:
+        r = r + 4
+    print_u64(cast[uint64](r))
+    return cast[int32](r & 255)
+""", 12)
+
+    # 7) const-FALSE primary WITH else -> the opt pass promotes the else; folds.
+    prog("false_primary_else",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    r: int64 = 0
+    if 0:
+        r = 5
+    else:
+        r = 6
+    print_u64(cast[uint64](r))
+    return cast[int32](r & 255)
+""", 6)
+
+    # ---- DELIBERATE-BREAK / fallback probes (want_fire=False) ----
+    # 8) runtime condition: NOT constant (x is loop-derived = 10), must not fold,
+    #    still correct. cg_const_cond_truth sees an ND_IDENT compare -> UNKNOWN.
+    prog("runtime_cmp",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    r: int64 = 3
+    x: int64 = 0
+    i: int64 = 0
+    while i < 5:
+        x = x + i
+        i = i + 1
+    if x > 0:
+        r = 7
+    else:
+        r = 9
+    print_u64(cast[uint64](r))
+    return cast[int32](r & 255)
+""", 7, want_fire=False)
+
+    # 9) non-literal `x == x` (x loop-derived): not const-folded (operands not
+    #    literals), CONSTIF 0, still correct.
+    prog("selfcmp_runtime",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    r: int64 = 1
+    x: int64 = 0
+    i: int64 = 0
+    while i < 5:
+        x = x + i + 1
+        i = i + 1
+    if x == x:
+        r = 2
+    print_u64(cast[uint64](r))
+    return cast[int32](r & 255)
+""", 2, want_fire=False)
+
+    # 10) const-FALSE `if 0:` bodyless: body writes r; must NOT run (no-op). A
+    #     mis-fold emitting the body would set r=99 -> oracle 0 catches it.
+    prog("false_lit_noelse",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    r: int64 = 0
+    if 0:
+        r = 99
+    print_u64(cast[uint64](r))
+    return cast[int32](r & 255)
+""", 0, want_fire=False)
+
+    # 11) DELIBERATE-BREAK anchor: a RUNTIME-FALSE condition (x=10; `if x < 0`)
+    #     whose body writes r=99. The compare is a non-literal ND_BINARY, so the
+    #     opt const-branch pass leaves it and codegen must NOT fold it. If gen_if's
+    #     fold gate mis-classifies a non-literal condition as constant-true it
+    #     would emit the body -> r=99 != oracle 0, catching the break. This is the
+    #     faithful sensitivity check for THIS lever's hazard (over-folding a
+    #     non-constant primary), since a const-FALSE literal never reaches codegen
+    #     (the opt pass removes it first).
+    prog("runtime_false_break",
+         """def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    r: int64 = 0
+    x: int64 = 0
+    i: int64 = 0
+    while i < 5:
+        x = x + i
+        i = i + 1
+    if x < 0:
+        r = 99
+    print_u64(cast[uint64](r))
+    return cast[int32](r & 255)
+""", 0, want_fire=False)
+
+    return progs
+
+
+def _run_constif_corpus():
+    """Run the const-if corpus through codegen.ad with --opt. Returns
+    (all_ok, total_constif). Each program is oracle-checked ON and OFF; want_fire
+    programs must route CONSTIF>0; OFF is asserted byte-inert (CONSTIF==0)."""
+    host = _ad_host()
+    total_constif = 0
+    all_ok = True
+    fired_any = False
+    for (name, body, exp_out, exp_exit, want_fire) in _constif_corpus():
+        r_on = host.run_through_codegen_ad(f"ci_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"ci_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [CONSTIF corpus '{name}'] codegen.ad on={r_on.kind}/off={r_off.kind}: "
+                  f"{(r_on.detail or r_off.detail)[:120]}")
+            continue
+        ci = int(getattr(r_on, "constif", 0) or 0)
+        total_constif += ci
+        if ci > 0:
+            fired_any = True
+        # (a) correctness vs oracle for BOTH on and off.
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [CONSTIF corpus '{name}'] MISCOMPILE on=({r_on.stdout},{r_on.exit}) "
+                  f"oracle=({exp_out},{exp_exit}) constif={ci}")
+            continue
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [CONSTIF corpus '{name}'] OFF path wrong off=({r_off.stdout},{r_off.exit}) "
+                  f"oracle=({exp_out},{exp_exit})")
+            continue
+        # (b) a want_fire program MUST fold at least one const-if (CONSTIF>0).
+        if want_fire and ci == 0:
+            all_ok = False
+            print(f"  [CONSTIF corpus '{name}'] correct but CONSTIF NEVER FIRED "
+                  f"(want_fire=True)")
+            continue
+        # A want_fire=False program must NOT fold a const-if (its condition is
+        # runtime / false-bodyless). A spurious fold is a correctness hazard.
+        if (not want_fire) and ci != 0:
+            all_ok = False
+            print(f"  [CONSTIF corpus '{name}'] CONSTIF fired ({ci}) on a "
+                  f"non-constant/fallback shape")
+            continue
+        # (c) OFF is byte-inert: re-dump off, assert CONSTIF==0.
+        src = _AD_WORK / f"ci_mc_{name}.ad"
+        src.write_text(host.codegen_compatible_source(body))
+        d_off = host.run_dump(src, opt=False)
+        if d_off.status == "ok" and getattr(d_off, "constif", 0) != 0:
+            all_ok = False
+            print(f"  [CONSTIF corpus '{name}'] OFF path NOT byte-inert: CONSTIF={d_off.constif}")
+            continue
+    if not fired_any:
+        all_ok = False
+        print("  [CONSTIF corpus FAIL] no program exercised the const-if fold")
+    return (all_ok, total_constif)
+
+
+# --------------------------------------------------------------------------
 # P1 SPINE-LEAF register-source corpus. The lever: when the LEFTMOST leaf of a
 # destination-routed pure-arith tree is a FULL-WIDTH-8 register-promoted local,
 # sel_expr_into_reg moves it STRAIGHT into the destination register
@@ -6683,6 +6944,20 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] method register-pressure corpus miscompiled "
                   "or gen_method allocator inert")
+        # CONSTANT-CONDITION IF FOLD corpus (dcecopy const-branch lever): codegen's
+        # gen_if folds an `if 1:` (the shape the const-branch pass leaves) into the
+        # then-body alone with NO test/branch. Asserts (a) correctness vs oracle ON
+        # and OFF over `if 1==1`/`if 1`/`if 7`/true-primary-elif/loop-bucket/const-
+        # AND-OR/false-primary-else shapes, (b) the fold fired (CONSTIF>0) on the
+        # want_fire shapes and did NOT fire on runtime / false-bodyless fallbacks,
+        # (c) byte-inert OFF (CONSTIF==0).
+        ci_ok, ci_total = _run_constif_corpus()
+        print(f"--- ADDER_OPT=1 CONSTIF corpus (constant-condition if fold) ---")
+        print(f"  const-if branches folded:   {ci_total}")
+        if not ci_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] constif corpus miscompiled, fold never fired, "
+                  "folded a runtime/false shape, or OFF not byte-inert")
         # Phase-5 IR-EMIT corpus: programs whose hot expressions lower FULLY into
         # the value IR, so codegen emits them by walking the IR tree (gen_expr_ir)
         # instead of the AST. Asserts (a) correctness vs a computed oracle, (b) the
