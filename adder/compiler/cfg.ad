@@ -262,6 +262,16 @@ cfg_fn_has_call: uint32 = 0
 # call node; reset to 0 by ci_new. See lr_spans_call.
 ci_has_call: Array[16384, uint32]     # CI_MAX: 1 => this instruction is/contains a call
 
+# Per-instruction loop NESTING DEPTH (LIVE-RANGE-HOLE track). ci_loopdepth[ci] ==
+# the cfg_loop_depth in effect when program point `ci` was lowered (0 = function
+# top level, 1 = one enclosing loop, ...). This is the exec-frequency proxy the
+# idle-gap ("live-range hole") analysis needs: a value whose live interval SPANS a
+# stretch of instructions at a HIGHER loop depth than the value's own accesses is
+# occupying a register uselessly across a hotter inner loop — the split candidate
+# whose register a loop-invariant hoist (e.g. matmul's `lea [rip+&A]`) wants. Set
+# by ci_new from cfg_loop_depth; reset to 0 there. Read only under --opt/regalloc.
+ci_loopdepth: Array[16384, uint32]    # CI_MAX: cfg_loop_depth at this point
+
 
 def nm_cost_reset():
     n: uint32 = 0
@@ -318,6 +328,7 @@ def ci_new(defid: uint32) -> uint32:
     ci_nuse[id] = 0
     ci_node[id] = cfg_cur_stmt_node
     ci_has_call[id] = 0
+    ci_loopdepth[id] = cfg_loop_depth
     return id
 
 
@@ -1317,6 +1328,232 @@ def lr_build():
 
 
 # =======================================================================
+# LIVE-RANGE HOLES (idle-gaps) — the keystone for live-range splitting.
+# =======================================================================
+#
+# WHAT THIS ADDS over the single [lr_start,lr_end) interval
+# --------------------------------------------------------
+# The single-interval model says a value occupies its register from its first
+# def/use to its last, CONTINUOUSLY. That over-states register OCCUPANCY: a value
+# can be LIVE across a stretch (its value is carried, needed later) yet NEVER
+# ACCESSED there — its register sits idle across that stretch. matmul's checksum
+# accumulator `acc` is the canonical case: it is written (`acc=0`) at the top of
+# the reps loop and read (`acc += C[p]`) in the later p-loop, so its interval
+# spans the ENTIRE i/j/k triple loop — but inside the 39M-iteration k-loop `acc`
+# is neither read nor written. Its register (%r15) is pinned-but-idle across the
+# hottest loop in the program, unavailable to hold the loop-invariant `lea
+# [rip+&A]`/`[rip+&B]` bases that are recomputed every iteration.
+#
+# An IDLE-GAP ("live-range hole") of a name n is a maximal run of program points
+# [glo, ghi] that is:
+#   * STRICTLY INTERIOR to n's interval (lr_start[n] < glo, ghi < lr_end[n]): so
+#     n is defined before glo and used after ghi — its value is LIVE-THROUGH the
+#     gap (splitting it therefore needs a spill BEFORE / reload AFTER the gap;
+#     this is honest — acc really is live across the k-loop, it is just unused
+#     there), AND
+#   * ACCESS-FREE: no point p in [glo, ghi] defines or uses n.
+#
+# Each gap is annotated with `hole_depth` (max loop nesting over the gap, an
+# exec-frequency proxy from ci_loopdepth) and `hole_brdepth` (the loop depth at
+# the two ACCESSES bracketing the gap). A gap whose hole_depth > hole_brdepth is
+# a SPLIT CANDIDATE: n's register is idle across a loop HOTTER than n's own
+# accesses, so splitting (spill n around the gap, once per outer iteration) frees
+# a register for that hot loop at negligible cost. This is exactly the info the
+# single-interval allocator cannot see, and the input a future codegen live-range
+# splitter + loop-invariant base-hoist pass consumes. PURE ANALYSIS: this module
+# never changes an assignment, so codegen output stays byte-identical; it is the
+# foundation that makes splitting decidable.
+#
+# SOUNDNESS: liveness (lr_start/lr_end) is a conservative OVER-approximation, so
+# an idle-gap (interior + access-free) is an UNDER-approximation of "register
+# idle" — it never claims idle where n is actually accessed. The access test
+# reads ci_def/ci_use directly (ground truth), so a recorded gap provably
+# contains no access of n. lr_validate_holes asserts this per function.
+
+LR_MAX_HOLES: uint32 = 4                # idle-gaps tracked per name (capped)
+lr_nhole: Array[256, uint32]           # NM_MAX: number of gaps recorded for n
+lr_hole_lo: Array[1024, uint32]        # NM_MAX*LR_MAX_HOLES: gap first idle point
+lr_hole_hi: Array[1024, uint32]        # gap last idle point (inclusive)
+lr_hole_depth: Array[1024, uint32]     # max ci_loopdepth over the gap (hotness)
+lr_hole_brdepth: Array[1024, uint32]   # max loop depth of the bracketing accesses
+
+# Deliberate-break switch (fuzzer / guard only): when 1, lr_build_holes widens the
+# FIRST recorded gap by one point to INCLUDE its right-bracket access, producing a
+# gap that violates the access-free invariant. lr_validate_holes MUST catch it
+# (returns LRV_HOLE_HAS_ACCESS). Proves the validator actually guards soundness.
+# Default 0 -> gaps are computed correctly. Never set on any real compile.
+lr_holes_break: uint32 = 0
+
+
+def lr_set_holes_break(v: uint32):
+    lr_holes_break = v
+
+
+def lr_holes_reset():
+    n: uint32 = 0
+    while n < NM_MAX:
+        lr_nhole[n] = 0
+        n = n + 1
+
+
+# 1 iff program point p accesses (defines or uses) name n. Ground-truth from the
+# instruction's def/use records (NOT the over-approximating interval).
+def lr_point_accesses(n: uint32, p: uint32) -> uint32:
+    if p >= ci_count:
+        return 0
+    if ci_def[p] == n:
+        return 1
+    u: uint32 = 0
+    nu: uint32 = ci_nuse[p]
+    while u < nu:
+        if ci_use[p * CI_MAX_USE + u] == n:
+            return 1
+        u = u + 1
+    return 0
+
+
+# Record one idle-gap [glo,ghi] for name n with the given gap-hotness and
+# bracketing-access depth. Capped at LR_MAX_HOLES per name (excess gaps dropped —
+# a dropped gap only means a MISSED split opportunity, never an unsound one).
+def lr_hole_add(n: uint32, glo: uint32, ghi: uint32, depth: uint32, brdepth: uint32):
+    k: uint32 = lr_nhole[n]
+    if k >= LR_MAX_HOLES:
+        return
+    idx: uint32 = n * LR_MAX_HOLES + k
+    lr_hole_lo[idx] = glo
+    lr_hole_hi[idx] = ghi
+    lr_hole_depth[idx] = depth
+    lr_hole_brdepth[idx] = brdepth
+    lr_nhole[n] = k + 1
+
+
+# Build idle-gaps for every promotable name. Precondition: lr_build() has run
+# (intervals valid). Pure reads of ci_def/ci_use/ci_loopdepth + the intervals.
+def lr_build_holes():
+    lr_holes_reset()
+    n: uint32 = 0
+    while n < nm_count:
+        if lr_is_promotable(n) != 0:
+            s: uint32 = lr_start[n]
+            e: uint32 = lr_end[n]              # half-open
+            # Walk the interval, tracking runs of access-free points that follow a
+            # real access (so the run is interior + live-through by construction).
+            prev_access: uint32 = LR_INF       # last access point seen
+            run_open: uint32 = 0
+            run_lo: uint32 = 0
+            run_depth: uint32 = 0
+            p: uint32 = s
+            while p < e:
+                acc: uint32 = lr_point_accesses(n, p)
+                if acc != 0:
+                    if run_open != 0:
+                        # close [run_lo, p-1]: bracketed by prev_access and p.
+                        brd: uint32 = ci_loopdepth[prev_access]
+                        if ci_loopdepth[p] > brd:
+                            brd = ci_loopdepth[p]
+                        lr_hole_add(n, run_lo, p - 1, run_depth, brd)
+                        run_open = 0
+                    prev_access = p
+                else:
+                    if prev_access != LR_INF:
+                        if run_open == 0:
+                            run_open = 1
+                            run_lo = p
+                            run_depth = ci_loopdepth[p]
+                        else:
+                            if ci_loopdepth[p] > run_depth:
+                                run_depth = ci_loopdepth[p]
+                p = p + 1
+            # A trailing run cannot occur: e = last_access+1, so p = e-1 is an
+            # access and closes any open run. (Liveness-only coverage past the last
+            # access does not extend e — lr_cover pins e to last def/use.)
+        n = n + 1
+    if lr_holes_break != 0:
+        lr_holes_break_apply()
+
+
+# Deliberate-break: corrupt the first gap to swallow its right-bracket access.
+def lr_holes_break_apply():
+    n: uint32 = 0
+    while n < nm_count:
+        if lr_nhole[n] > 0:
+            idx: uint32 = n * LR_MAX_HOLES + 0
+            hi: uint32 = lr_hole_hi[idx]
+            # widen to include hi+1, which (by construction) is an access of n.
+            if hi + 1 < lr_end[n]:
+                lr_hole_hi[idx] = hi + 1
+                return
+        n = n + 1
+
+
+# Queries (codegen / regalloc / dump facing).
+def lr_num_holes(n: uint32) -> uint32:
+    if n >= NM_MAX:
+        return 0
+    return lr_nhole[n]
+
+
+def lr_hole_start(n: uint32, i: uint32) -> uint32:
+    return lr_hole_lo[n * LR_MAX_HOLES + i]
+
+
+def lr_hole_end(n: uint32, i: uint32) -> uint32:
+    return lr_hole_hi[n * LR_MAX_HOLES + i]
+
+
+def lr_hole_hotness(n: uint32, i: uint32) -> uint32:
+    return lr_hole_depth[n * LR_MAX_HOLES + i]
+
+
+def lr_hole_bracket_depth(n: uint32, i: uint32) -> uint32:
+    return lr_hole_brdepth[n * LR_MAX_HOLES + i]
+
+
+# 1 iff name n has an idle-gap that is HOTTER than n's own accesses bracketing it
+# (hole_depth > hole_brdepth) — a live-range SPLIT CANDIDATE: n's register sits
+# idle across a loop executed more often than n is accessed, so evicting n around
+# the gap (spill/reload once per outer iteration) frees the register for that hot
+# loop's loop-invariant values at negligible cost. This is the query the future
+# codegen splitter keys on; it changes NO allocation today.
+def lr_is_split_candidate(n: uint32) -> uint32:
+    if n >= NM_MAX:
+        return 0
+    k: uint32 = lr_nhole[n]
+    i: uint32 = 0
+    while i < k:
+        idx: uint32 = n * LR_MAX_HOLES + i
+        if lr_hole_depth[idx] > lr_hole_brdepth[idx]:
+            if lr_hole_depth[idx] >= 2:
+                return 1
+        i = i + 1
+    return 0
+
+
+# hole-aware NON-interference: 1 iff name `host`'s register is provably IDLE
+# across the WHOLE live interval [as,ae) of `guest` — i.e. [as,ae) lies inside one
+# of host's idle-gaps. When true, `guest` may reuse `host`'s register across
+# guest's life with a single spill-of-host before the gap + reload-of-host after
+# (the split the future codegen pass performs). This is the interference query the
+# single-interval model cannot express (there, host trivially interferes with any
+# guest inside its span). PURE PREDICATE — no allocation consumes it yet.
+def lr_hole_covers(host: uint32, as_: uint32, ae: uint32) -> uint32:
+    if host >= NM_MAX:
+        return 0
+    if ae == 0:
+        return 0
+    ghi_last: uint32 = ae - 1                 # guest's last live point (half-open)
+    k: uint32 = lr_nhole[host]
+    i: uint32 = 0
+    while i < k:
+        idx: uint32 = host * LR_MAX_HOLES + i
+        if as_ >= lr_hole_lo[idx]:
+            if ghi_last <= lr_hole_hi[idx]:
+                return 1
+        i = i + 1
+    return 0
+
+
+# =======================================================================
 # PER-RANGE call-span test (P3-region caller-saved track).
 # =======================================================================
 #
@@ -1574,6 +1811,11 @@ LRV_EMPTY_INTERVAL: uint32 = 10
 LRV_OOB_INTERVAL: uint32 = 11
 LRV_PROMOTE_CLOBBER: uint32 = 12
 LRV_CLOBBER_UNKNOWN: uint32 = 13
+# Idle-gap (live-range-hole) invariants:
+LRV_HOLE_OOB: uint32 = 14         # a gap escapes (lr_start, lr_end) strictly
+LRV_HOLE_INVERTED: uint32 = 15    # a gap has lo > hi
+LRV_HOLE_UNSORTED: uint32 = 16    # gaps of one name not strictly ascending/disjoint
+LRV_HOLE_HAS_ACCESS: uint32 = 17  # a gap contains a def/use of its own name (unsound)
 
 
 # A name is register-promotable iff it has a live range (is a real local/param
@@ -1702,6 +1944,41 @@ def lr_name_dead_after_sameblock(n: uint32, point: uint32) -> uint32:
     return 1
 
 
+# Validate the idle-gap sets built by lr_build_holes. For every name's gaps:
+#   * lo <= hi                                (LRV_HOLE_INVERTED)
+#   * lr_start[n] < lo AND hi < lr_end[n]     (LRV_HOLE_OOB — strictly interior)
+#   * gaps strictly ascending + disjoint      (LRV_HOLE_UNSORTED)
+#   * NO point in [lo,hi] accesses n           (LRV_HOLE_HAS_ACCESS — soundness)
+# Precondition: lr_build + lr_build_holes ran. Returns LRV_OK or the first break.
+def lr_validate_holes() -> uint32:
+    n: uint32 = 0
+    while n < nm_count:
+        k: uint32 = lr_nhole[n]
+        prev_hi: uint32 = LR_INF               # sentinel: no previous gap
+        i: uint32 = 0
+        while i < k:
+            idx: uint32 = n * LR_MAX_HOLES + i
+            lo: uint32 = lr_hole_lo[idx]
+            hi: uint32 = lr_hole_hi[idx]
+            if lo > hi:
+                return LRV_HOLE_INVERTED
+            if lo <= lr_start[n] or hi >= lr_end[n]:
+                return LRV_HOLE_OOB
+            if prev_hi != LR_INF:
+                if lo <= prev_hi:
+                    return LRV_HOLE_UNSORTED
+            # access-free: the soundness invariant.
+            p: uint32 = lo
+            while p <= hi:
+                if lr_point_accesses(n, p) != 0:
+                    return LRV_HOLE_HAS_ACCESS
+                p = p + 1
+            prev_hi = hi
+            i = i + 1
+        n = n + 1
+    return LRV_OK
+
+
 def lr_validate() -> uint32:
     n: uint32 = 0
     while n < nm_count:
@@ -1749,6 +2026,10 @@ cfg_stat_range_max: uint32 = 0        # max single interval length
 cfg_stat_locals: uint32 = 0           # total distinct interned names (locals/params)
 cfg_stat_promotable: uint32 = 0       # names register-promotable (not clobberable)
 cfg_stat_clobberable: uint32 = 0      # names clobberable (address-taken/stored-thru)
+# Live-range-hole (idle-gap) stats accumulated across functions.
+cfg_stat_holes: uint32 = 0            # total idle-gaps recorded
+cfg_stat_split_cands: uint32 = 0      # names that are live-range SPLIT candidates
+cfg_stat_hole_maxdepth: uint32 = 0    # deepest gap-hotness seen (loop nesting)
 
 
 def cfg_count_edges() -> uint32:
@@ -1778,6 +2059,17 @@ def cfg_accum_lr_stats():
             cfg_stat_range_len = cfg_stat_range_len + ln
             if ln > cfg_stat_range_max:
                 cfg_stat_range_max = ln
+        # idle-gap (live-range-hole) stats
+        h: uint32 = lr_nhole[n]
+        cfg_stat_holes = cfg_stat_holes + h
+        if lr_is_split_candidate(n) != 0:
+            cfg_stat_split_cands = cfg_stat_split_cands + 1
+        j: uint32 = 0
+        while j < h:
+            hd: uint32 = lr_hole_depth[n * LR_MAX_HOLES + j]
+            if hd > cfg_stat_hole_maxdepth:
+                cfg_stat_hole_maxdepth = hd
+            j = j + 1
         n = n + 1
 
 
@@ -1798,6 +2090,9 @@ def cfg_run_program(prog: uint32):
     cfg_stat_locals = 0
     cfg_stat_promotable = 0
     cfg_stat_clobberable = 0
+    cfg_stat_holes = 0
+    cfg_stat_split_cands = 0
+    cfg_stat_hole_maxdepth = 0
     if prog == 0:
         return
     fn_idx: uint32 = 0
@@ -1825,9 +2120,14 @@ def cfg_run_program(prog: uint32):
                     # a pure AST escape scan (interning into the same nm_* table).
                     lr_build()
                     cl_build(cur)
+                    lr_build_holes()
                     lrc: uint32 = lr_validate()
                     if lrc != LRV_OK and cfg_stat_fail == 0:
                         cfg_stat_fail = lrc
+                        cfg_stat_fail_fn = fn_idx
+                    hrc: uint32 = lr_validate_holes()
+                    if hrc != LRV_OK and cfg_stat_fail == 0:
+                        cfg_stat_fail = hrc
                         cfg_stat_fail_fn = fn_idx
                     cfg_accum_lr_stats()
             fn_idx = fn_idx + 1

@@ -595,6 +595,8 @@ class Program:
         self._gen_loop(env)
         self._gen_nested_loop_traffic(env)    # nested loops: reset-and-read +
                                               # break/continue/early-return/cross-level
+        self._gen_liverange_hole_traffic(env) # live-range-hole (idle-gap) shapes:
+                                              # deep-idle/two-gap/call-gap/used-in-loop
         self._gen_short_circuit_traffic(env)  # logical and/or short-circuit
         self._gen_chained_compare_traffic(env)  # Python chained comparisons (a<b<c)
         self._gen_cmpjcc_traffic(env)         # cmp; jcc branch-condition lever (--opt)
@@ -1417,6 +1419,158 @@ class Program:
                 self._nl_loopcarry(u)
             else:
                 self._nl_cross_level(u)
+
+    # LIVE-RANGE-HOLE (idle-gap) traffic — the split-analysis stress corpus. Each
+    # shape is a helper whose accumulator is LIVE across a hotter inner loop but
+    # UNACCESSED there (an idle-gap / matmul-shape), or ACCESSED there (a value the
+    # analysis must NOT flag), folded into g_accum so the differential oracle
+    # (Python seed vs codegen.ad --opt) catches ANY miscompile the hole analysis or
+    # ci_loopdepth bookkeeping could introduce. The CFG lane (ADDER_CFG) also runs
+    # lr_build_holes + lr_validate_holes over these, exercising the structural
+    # invariants (interior/disjoint/access-free gaps) on deep nests + call-crossing.
+    def _gen_liverange_hole_traffic(self, env):
+        rng = self.rng
+        if not hasattr(self, "_lrh_uid"):
+            self._lrh_uid = 0
+        for _ in range(rng.randint(2, 3)):
+            self._lrh_uid += 1
+            u = self._lrh_uid
+            shape = rng.choice(["deep_idle", "twogap", "callgap", "used_in_loop"])
+            if shape == "deep_idle":
+                self._lrh_deep_idle(u)
+            elif shape == "twogap":
+                self._lrh_twogap(u)
+            elif shape == "callgap":
+                self._lrh_callgap(u)
+            else:
+                self._lrh_used_in_loop(u)
+
+    # matmul-shape: acc + reps idle across a DOUBLY-nested inner loop (depth-3 gap).
+    def _lrh_deep_idle(self, u):
+        rng = self.rng
+        reps = rng.randint(2, 4); nj = rng.randint(2, 4); nk = rng.randint(2, 5)
+        base = rng.randint(1, 4)
+        fn = f"lrh_di_{u}"
+        body = [
+            "acc: int64 = cast[int64](0)",
+            "r: int64 = cast[int64](0)",
+            "while r < reps:",
+            "    j: int64 = cast[int64](0)",
+            "    s: int64 = cast[int64](0)",
+            "    while j < nj:",
+            "        k: int64 = cast[int64](0)",
+            "        while k < nk:",
+            "            s = s + base",
+            "            k = k + cast[int64](1)",
+            "        j = j + cast[int64](1)",
+            "    acc = acc + s",
+            "    r = r + cast[int64](1)",
+            "return acc",
+        ]
+        acc = 0
+        for _r in range(reps):
+            s = 0
+            for _j in range(nj):
+                for _k in range(nk):
+                    s += base
+            acc += s
+        self._nl_emit_helper(
+            fn, "reps: int64, nj: int64, nk: int64, base: int64", body,
+            f"cast[int64]({reps}), cast[int64]({nj}), "
+            f"cast[int64]({nk}), cast[int64]({base})", acc)
+
+    # a value with TWO idle-gaps (two inner loops between its accesses).
+    def _lrh_twogap(self, u):
+        rng = self.rng
+        n1 = rng.randint(2, 5); n2 = rng.randint(2, 5); seed = rng.randint(1, 6)
+        fn = f"lrh_tg_{u}"
+        body = [
+            "acc: int64 = cast[int64](seed)",
+            "a: int64 = cast[int64](0)",
+            "i: int64 = cast[int64](0)",
+            "while i < n1:",
+            "    a = a + cast[int64](1)",
+            "    i = i + cast[int64](1)",
+            "acc = acc + a",
+            "b: int64 = cast[int64](0)",
+            "j: int64 = cast[int64](0)",
+            "while j < n2:",
+            "    b = b + cast[int64](2)",
+            "    j = j + cast[int64](1)",
+            "acc = acc + b",
+            "return acc",
+        ]
+        acc = seed
+        a = 0
+        for _ in range(n1):
+            a += 1
+        acc += a
+        b = 0
+        for _ in range(n2):
+            b += 2
+        acc += b
+        self._nl_emit_helper(
+            fn, "seed: int64, n1: int64, n2: int64", body,
+            f"cast[int64]({seed}), cast[int64]({n1}), cast[int64]({n2})", acc)
+
+    # accumulator idle across an inner loop, then consumed by a CALL (spans a call).
+    def _lrh_callgap(self, u):
+        rng = self.rng
+        reps = rng.randint(2, 5); inner = rng.randint(2, 6); step = rng.randint(1, 3)
+        fn = f"lrh_cg_{u}"
+        # reuse the module-level helper sc_dckeep_bump? no — emit a local pure helper.
+        hp = f"lrh_cgp_{u}"
+        self.emit_top(f"def {hp}(x: int64) -> int64:")
+        self.emit_top("    return x + cast[int64](1)")
+        self.emit_top("")
+        body = [
+            "acc: int64 = cast[int64](0)",
+            "r: int64 = cast[int64](0)",
+            "while r < reps:",
+            "    c: int64 = cast[int64](0)",
+            "    i: int64 = cast[int64](0)",
+            "    while i < inner:",
+            "        c = c + step",
+            "        i = i + cast[int64](1)",
+            f"    acc = acc + {hp}(c)",
+            "    r = r + cast[int64](1)",
+            "return acc",
+        ]
+        acc = 0
+        for _r in range(reps):
+            c = 0
+            for _i in range(inner):
+                c += step
+            acc += c + 1
+        self._nl_emit_helper(
+            fn, "reps: int64, inner: int64, step: int64", body,
+            f"cast[int64]({reps}), cast[int64]({inner}), cast[int64]({step})", acc)
+
+    # CONTROL: the accumulator is ACCESSED inside the inner loop (NOT idle) — the
+    # analysis must never flag it a split candidate. Correctness is the assertion
+    # here (the CFG lane separately confirms it produces no unsound gap).
+    def _lrh_used_in_loop(self, u):
+        rng = self.rng
+        reps = rng.randint(2, 5); inner = rng.randint(2, 6); step = rng.randint(1, 3)
+        fn = f"lrh_ul_{u}"
+        body = [
+            "acc: int64 = cast[int64](0)",
+            "r: int64 = cast[int64](0)",
+            "while r < reps:",
+            "    i: int64 = cast[int64](0)",
+            "    while i < inner:",
+            "        acc = acc + step",
+            "        i = i + cast[int64](1)",
+            "    r = r + cast[int64](1)",
+            "return acc",
+        ]
+        acc = 0
+        for _r in range(reps):
+            for _i in range(inner):
+                acc += step
+        self._nl_emit_helper(
+            fn, "reps: int64, inner: int64, step: int64", body,
+            f"cast[int64]({reps}), cast[int64]({inner}), cast[int64]({step})", acc)
 
     # Helper that emits a standalone int64 function `fn` (its body lines already
     # built) and a call to it from main, folding the returned value (computed by
@@ -2969,6 +3123,12 @@ _AD_CFG_RANGE_MAX = 0     # max single interval length across the corpus
 _AD_CFG_LOCALS = 0        # total distinct interned names (locals/params)
 _AD_CFG_PROMOTABLE = 0    # names register-promotable (not clobberable)
 _AD_CFG_CLOBBERABLE = 0   # names clobberable (address-taken/stored-through)
+# Live-range-hole (idle-gap) lane accumulators. cfg_run_program now also builds
+# lr_build_holes() + validates them (lr_validate_holes, a cfgfail on any broken
+# invariant), so every parser-accepted corpus program exercises the analysis.
+_AD_CFG_HOLES = 0         # total idle-gaps recorded across the corpus
+_AD_CFG_SPLIT_CANDS = 0   # total live-range SPLIT candidates
+_AD_CFG_HOLE_MAXDEPTH = 0 # deepest gap-hotness (loop nesting) seen
 
 
 def _ad_host():
@@ -2988,6 +3148,7 @@ def run_cfg_lane(seed, body):
     global _AD_CFG_SKIPPED, _AD_CFG_PROGS, _AD_CFG_FAILS
     global _AD_CFG_RANGES, _AD_CFG_RANGE_LEN, _AD_CFG_RANGE_MAX
     global _AD_CFG_LOCALS, _AD_CFG_PROMOTABLE, _AD_CFG_CLOBBERABLE
+    global _AD_CFG_HOLES, _AD_CFG_SPLIT_CANDS, _AD_CFG_HOLE_MAXDEPTH
     host = _ad_host()
     try:
         r = host.run_cfg_over_body(seed, body, _AD_WORK)
@@ -3011,6 +3172,10 @@ def run_cfg_lane(seed, body):
     _AD_CFG_LOCALS += r.locals
     _AD_CFG_PROMOTABLE += r.promotable
     _AD_CFG_CLOBBERABLE += r.clobberable
+    _AD_CFG_HOLES += r.holes
+    _AD_CFG_SPLIT_CANDS += r.split_cands
+    if r.hole_maxdepth > _AD_CFG_HOLE_MAXDEPTH:
+        _AD_CFG_HOLE_MAXDEPTH = r.hole_maxdepth
     if r.status == "cfgfail":
         _AD_CFG_FAILS.append((seed, r.detail))
 
@@ -7795,6 +7960,10 @@ def _run_ad_codegen_batch(base, args):
         print(f"  distinct locals/params:     {_AD_CFG_LOCALS}")
         print(f"  register-promotable:        {_AD_CFG_PROMOTABLE}  ({_pct_prom:.1f}%)")
         print(f"  clobberable (escaped):      {_AD_CFG_CLOBBERABLE}  ({_pct_clob:.1f}%)")
+        print(f"  --- live-range holes (idle-gaps, split foundation) ---")
+        print(f"  idle-gaps (total):          {_AD_CFG_HOLES}")
+        print(f"  live-range split candidates:{_AD_CFG_SPLIT_CANDS}")
+        print(f"  deepest gap hotness (depth):{_AD_CFG_HOLE_MAXDEPTH}")
         print(f"  broken-invariant programs:  {len(_AD_CFG_FAILS)}")
         # The lane proves something only if it actually built CFGs. An all-empty
         # run (no function processed) is itself a lane failure.

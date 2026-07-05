@@ -320,15 +320,23 @@ class CfgResult:
         self.locals = kw.get("locals", 0)
         self.promotable = kw.get("promotable", 0)
         self.clobberable = kw.get("clobberable", 0)
+        # Live-range-hole (idle-gap) stats.
+        self.holes = kw.get("holes", 0)
+        self.split_cands = kw.get("split_cands", 0)
+        self.hole_maxdepth = kw.get("hole_maxdepth", 0)
         self.detail = kw.get("detail", "")
 
 
-def run_cfg(src_path: Path, timeout=30) -> CfgResult:
+def run_cfg(src_path: Path, timeout=30, holes_break=False) -> CfgResult:
     """Run the dump driver with --dump-cfg over `src_path` and parse the report.
     Returns a CfgResult. A parse/cgfail program is reported as parsefail (the
-    CFG lane only validates programs codegen.ad's parser accepts)."""
+    CFG lane only validates programs codegen.ad's parser accepts). When
+    holes_break=True the driver arms the idle-gap deliberate-break (corrupts a
+    gap to swallow an access): the hole validator MUST catch it -> cfgfail."""
     build_driver()
     argv = [str(DRIVER_ELF), "--dump-cfg", str(src_path)]
+    if holes_break:
+        argv.append("--holes-break")
     cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     out = cp.stdout
     if "AC_DUMP_BEGIN" not in out:
@@ -364,24 +372,66 @@ def run_cfg(src_path: Path, timeout=30) -> CfgResult:
                      locals=meta.get("CFG_LOCALS", 0),
                      promotable=meta.get("CFG_PROMOTABLE", 0),
                      clobberable=meta.get("CFG_CLOBBERABLE", 0),
+                     holes=meta.get("CFG_HOLES", 0),
+                     split_cands=meta.get("CFG_SPLIT_CANDS", 0),
+                     hole_maxdepth=meta.get("CFG_HOLE_MAXDEPTH", 0),
                      detail=detail)
 
 
-def run_cfg_over_body(seed, body, work_dir: Path, keep=False) -> CfgResult:
+def run_cfg_over_body(seed, body, work_dir: Path, keep=False,
+                      holes_break=False) -> CfgResult:
     """Write `body` (rewritten to codegen.ad's subset) to a temp file and run the
-    CFG lane over it."""
+    CFG lane over it. holes_break arms the idle-gap deliberate-break."""
     work_dir.mkdir(parents=True, exist_ok=True)
     cg_body = codegen_compatible_source(body)
     src = work_dir / f"cfg_{seed}.ad"
     src.write_text(cg_body)
     try:
-        r = run_cfg(src)
+        r = run_cfg(src, holes_break=holes_break)
     except subprocess.TimeoutExpired:
         return CfgResult("drivererror", detail="cfg driver timeout")
     finally:
         if not keep:
             src.unlink(missing_ok=True)
     return r
+
+
+def run_holes(src_path: Path, timeout=30):
+    """Run the dump driver with --dump-holes over `src_path`. Returns a dict of
+    {name -> [ (glo,ghi,depth,brdepth), ... ]} for every live-range SPLIT
+    candidate the idle-gap analysis reports (pure analysis; no code emitted)."""
+    build_driver()
+    argv = [str(DRIVER_ELF), "--dump-holes", str(src_path)]
+    cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    out = cp.stdout
+    cands = {}
+    for ln in out.splitlines():
+        if not ln.startswith("HOLE_CAND "):
+            continue
+        m = re.search(r"name=(\S+)", ln)
+        if not m:
+            continue
+        name = m.group(1)
+        gaps = []
+        for g in re.finditer(r"gap=\[(\d+),(\d+)\]@d(\d+)/br(\d+)", ln):
+            gaps.append((int(g.group(1)), int(g.group(2)),
+                         int(g.group(3)), int(g.group(4))))
+        cands[name] = gaps
+    return cands
+
+
+def run_holes_over_body(seed, body, work_dir: Path, keep=False):
+    """Write `body` (subset-rewritten) and run the --dump-holes lane; returns the
+    candidate->gaps dict from run_holes."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cg_body = codegen_compatible_source(body)
+    src = work_dir / f"holes_{seed}.ad"
+    src.write_text(cg_body)
+    try:
+        return run_holes(src)
+    finally:
+        if not keep:
+            src.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------
