@@ -105,6 +105,7 @@ from compiler.parser import (
     ND_MEMBER,
     ND_METHOD_CALL,
     ND_FOR,
+    ND_FOR_UNPACK,
     ND_DO_WHILE,
     ND_CONTAINER_OF,
     ND_SIZEOF,
@@ -11426,22 +11427,87 @@ def gen_if(node: uint32):
         i = i + 1
 
 
-# 16-byte align the UPCOMING loop-top (the backward-branch target) with one-byte
-# NOPs — Adder's analogue of gcc -O2's -falign-loops=16. EMPIRICAL FINDING
-# (docs/bench_opt_results notes): on the bench CPU (Skylake i7-8086K) the small
-# hot loops are gated by the 16-byte alignment of the loop-top, NOT by the
-# instruction count — a loop whose top straddles a 16-byte fetch window / falls
-# out of the DSB runs ~15-20% slower even with FEWER instructions. gcc aligns its
-# hot loop tops to 16; Adder did not, so any instruction-selection change that
-# shifted a loop top off a 16-byte boundary was an alignment lottery. Padding the
-# loop top to 16 removes that lottery and lets the scalar codegen wins land. The
-# pad bytes sit BEFORE the back-edge target, so they execute at most once on
-# loop entry (the hot back-edge jumps past them). --opt only (the NOPs are
-# semantically inert; gated on isel_is_enabled so the default build is unchanged).
-def emit_loop_align():
+# True iff an expression subtree contains an indexed / member LOAD (`arr[i]` or
+# `obj.f`). Bounded recursion over the expression operand slots (a/b/c/d); type
+# nodes and leaves have no ND_INDEX/ND_MEMBER children so they early-out at 0.
+def expr_reads_index(node: uint32) -> uint32:
+    if node == 0:
+        return 0
+    k: uint32 = nd_kind[node]
+    if k == ND_INDEX:
+        return 1
+    if k == ND_MEMBER:
+        return 1
+    if expr_reads_index(nd_a[node]) != 0:
+        return 1
+    if expr_reads_index(nd_b[node]) != 0:
+        return 1
+    if expr_reads_index(nd_c[node]) != 0:
+        return 1
+    if expr_reads_index(nd_d[node]) != 0:
+        return 1
+    return 0
+
+
+# True iff the loop body performs a SELF-REFERENTIAL INDEXED STORE — an
+# `arr[idx] = <expr that reads an array element>` (in-place array-element
+# reduction, e.g. `bucket[slot] = bucket[slot] + t` / `ys[i] = ys[i] + a*xs[i]`).
+# Recurses through nested if/loop bodies. This is the static signal for the
+# per-loop 32B offset heuristic (see emit_loop_align): such load-modify-store
+# streaming-accumulate loops (dcecopy/licm/saxpy) run fastest at 32B offset 0,
+# whereas register-accumulate (matmul `s=s+..`), branchy (collatz), and plain
+# indexed-store (sieve `flags[j]=1`) loops prefer offset 16.
+def body_has_selfref_indexed_store(head: uint32) -> uint32:
+    cur: uint32 = head
+    while cur != 0:
+        k: uint32 = nd_kind[cur]
+        if k == ND_ASSIGN:
+            tk: uint32 = nd_kind[nd_a[cur]]
+            if tk == ND_INDEX or tk == ND_MEMBER:
+                if expr_reads_index(nd_b[cur]) != 0:
+                    return 1
+        elif k == ND_IF:
+            if body_has_selfref_indexed_store(nd_b[cur]) != 0:
+                return 1
+            if body_has_selfref_indexed_store(nd_d[cur]) != 0:
+                return 1
+        elif k == ND_WHILE:
+            if body_has_selfref_indexed_store(nd_b[cur]) != 0:
+                return 1
+        elif k == ND_DO_WHILE:
+            if body_has_selfref_indexed_store(nd_b[cur]) != 0:
+                return 1
+        elif k == ND_FOR:
+            if body_has_selfref_indexed_store(nd_b[cur]) != 0:
+                return 1
+        elif k == ND_FOR_UNPACK:
+            if body_has_selfref_indexed_store(nd_c[cur]) != 0:
+                return 1
+        cur = nd_next[cur]
+    return 0
+
+
+# 32-byte align the UPCOMING loop-top (the backward-branch target) to a
+# STATICALLY-CHOSEN 32B offset with one-byte NOPs. DETERMINISM BASE (#98): with
+# code[0] 32-aligned by the ELF wrapper (ad_codegen_host.wrap_elf code_pad), the
+# loop-top's `code_len & 31` IS its runtime 32-byte DSB-window offset, so this
+# pins it DETERMINISTICALLY across builds (kills the cross-build alignment lottery
+# that made every instruction-count change a coin-flip). EMPIRICAL (Skylake
+# i7-8086K, docs perf_2x): no single global 32B offset is optimal per loop — a
+# self-referential indexed-store (in-place array reduction: dcecopy/licm/saxpy)
+# inner loop runs fastest with its top at 32B offset 0, while register-accumulate
+# (matmul k-loop), branchy (collatz), and plain-store (sieve) loops prefer offset
+# 16. We choose STATICALLY from body structure (body_has_selfref_indexed_store).
+# Pad bytes sit BEFORE the back-edge target, so they execute at most once on loop
+# entry (the hot back-edge jumps past them). --opt only (NOPs are inert; gated on
+# isel_is_enabled so the default build stays byte-identical to the seed).
+def emit_loop_align(body_head: uint32):
     if isel_is_enabled() == 0:
         return
-    pad: uint32 = (16 - (code_len & 15)) & 15
+    off: uint32 = 16
+    if body_has_selfref_indexed_store(body_head) != 0:
+        off = 0
+    pad: uint32 = (off - code_len) & 31
     while pad > 0:
         emit_b(0x90)
         pad = pad - 1
@@ -11457,7 +11523,7 @@ def gen_while(node: uint32):
     hb_saved: uint32 = hb_count
     hoist_loop_preheader(nd_b[node])
 
-    emit_loop_align()                    # 16-byte align the loop-top (gcc-style)
+    emit_loop_align(nd_b[node])          # 32B loop-top align, per-loop offset
     start: uint32 = code_len
     # Push a loop frame: `continue` targets `start` (re-test the condition);
     # `break` fixups accumulate in this frame's slot and patch to the exit.
@@ -11495,7 +11561,7 @@ def gen_do_while(node: uint32):
     if loop_depth >= MAX_LOOPS:
         cg_fail(6, node)
         return
-    emit_loop_align()                    # 16-byte align the loop-top (gcc-style)
+    emit_loop_align(nd_b[node])          # 32B loop-top align, per-loop offset
     start: uint32 = code_len
     depth: uint32 = loop_depth
     loop_brk_n[depth] = 0
@@ -11607,7 +11673,7 @@ def gen_for_range(node: uint32):
         emit_mov_imm_rax(cast[uint64](0))
     store_to_named(nd_name_off[node], nd_name_len[node])
 
-    emit_loop_align()                     # 16-byte align the loop-top (gcc-style)
+    emit_loop_align(nd_b[node])           # 32B loop-top align, per-loop offset
     start_lbl: uint32 = code_len
     depth: uint32 = loop_depth
     loop_brk_n[depth] = 0

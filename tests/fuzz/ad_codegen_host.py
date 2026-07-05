@@ -503,14 +503,25 @@ def wrap_elf(dump: DumpResult, out_path: Path):
     # headers_len so codegen's RIP-relative data delta (== data_base) is
     # preserved (it is a code<->data DELTA, unaffected by the shared shift).
     code_vbase = CODE_VBASE                     # page-aligned, code[0] base
-    code_start_vaddr = code_vbase + headers_len # where code[0] actually lands
+    # DETERMINISM BASE (perf_2x collatz-recovery, #98): pad the headers so
+    # code[0] lands on a 32-byte-aligned VMA. codegen's per-loop alignment
+    # (emit_loop_align) pads each loop-top to a chosen 32-byte offset in code_len
+    # (its position-0 model); for that to be the RUNTIME 32-byte DSB boundary the
+    # Skylake uop-cache actually fetches on, code[0] itself must be 32-aligned.
+    # headers_len (176) is 16 mod 32, so without this pad every loop top landed at
+    # VMA offset 16 mod 32 — leaving the true 32-byte-window position a cross-build
+    # lottery even after loop-top alignment. code_vbase is page-aligned (⇒
+    # 32-aligned), so a 16-byte pad here 32-aligns code[0]. Layout-only: the
+    # code<->data RIP delta (data_base) is preserved (both shift by code_pad).
+    code_pad = (32 - (headers_len % 32)) % 32
+    code_start_vaddr = code_vbase + headers_len + code_pad  # 32-aligned code[0]
     stub_vaddr = code_start_vaddr + len(code)
     stub = _start_stub(code_start_vaddr, entry_off, stub_vaddr)
     entry_vaddr = stub_vaddr                    # e_entry == _start stub
 
     code_seg = code + stub
-    # code PT_LOAD file image = headers + code + stub, mapped from offset 0.
-    code_filesz = headers_len + len(code_seg)
+    # code PT_LOAD file image = headers + pad + code + stub, mapped from offset 0.
+    code_filesz = headers_len + code_pad + len(code_seg)
     # Data sits data_base bytes above code[0] (== code_start_vaddr), preserving
     # the RIP-relative delta codegen baked in.
     data_vbase = code_start_vaddr + data_base
@@ -561,6 +572,7 @@ def wrap_elf(dump: DumpResult, out_path: Path):
     img += ph_code
     img += ph_data
     assert len(img) == headers_len, (len(img), headers_len)
+    img += b"\x00" * code_pad          # 32-align code[0] (see code_pad above)
     img += code_seg
     # pad to data_file_off
     if len(img) < data_file_off:
