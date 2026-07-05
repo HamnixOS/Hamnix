@@ -550,6 +550,13 @@ class Program:
         # diverges from the oracle -> the differential fuzzer flags a miscompile.
         self.emit("g_dckeep: int64")
         self.dckeep_shadow = 0
+        # LIVE-RANGE SPLITTER probe array: a DEDICATED flat int64 global (its own
+        # shadow-free array so a helper may fill+read it without desyncing g_ivsr).
+        # The splitter (codegen hole-borrow base hoist) only fires for a GLOBAL
+        # array indexed in a hot inner loop across a split-candidate's idle gap —
+        # exactly the matmul `A[i*N+k]` shape _lrh_split_global builds on this.
+        self.emit("g_lrh: Array[64, int64]")
+        self.emit("g_lrh2: Array[64, int64]")
         self.emit("")
 
         # ----- helper functions ---------------------------------------------
@@ -1435,15 +1442,75 @@ class Program:
         for _ in range(rng.randint(2, 3)):
             self._lrh_uid += 1
             u = self._lrh_uid
-            shape = rng.choice(["deep_idle", "twogap", "callgap", "used_in_loop"])
+            shape = rng.choice(["deep_idle", "twogap", "callgap", "used_in_loop",
+                                "split_global", "split_global"])
             if shape == "deep_idle":
                 self._lrh_deep_idle(u)
             elif shape == "twogap":
                 self._lrh_twogap(u)
             elif shape == "callgap":
                 self._lrh_callgap(u)
+            elif shape == "split_global":
+                self._lrh_split_global(u)
             else:
                 self._lrh_used_in_loop(u)
+
+    # SPLITTER-FIRING matmul shape: a GLOBAL array read in a doubly-nested inner
+    # loop while `acc` is idle across it (acc written/read only at the outer reps
+    # level). This is the shape the codegen live-range SPLITTER acts on — it spills
+    # `acc` before the inner nest, BORROWS its freed callee-saved register to hold
+    # g_lrh's loop-invariant base (removing the per-inner-iteration `lea g(%rip)`),
+    # then reloads acc after. A spill/reload bug, a wrong reload point, or borrowing
+    # a still-live register all corrupt the returned acc, which the differential
+    # oracle (native --opt vs Python seed) catches. Uses the dedicated g_lrh global
+    # (fill + read self-contained, no cross-traffic shadow to desync).
+    def _lrh_split_global(self, u):
+        rng = self.rng
+        reps = rng.randint(2, 4); nn = rng.randint(2, 6)
+        mul = rng.randint(1, 4); addend = rng.randint(0, 3)
+        fn = f"lrh_sg_{u}"
+        # Mirrors matmul EXACTLY: the checksum `acc` is folded in a SEPARATE
+        # reduction loop at the reps level (over g_lrh2), so acc is idle across the
+        # whole i/k nest (not just the k-loop) — the register a splitter frees to
+        # hold g_lrh's base in the k-loop. The result s is stored to g_lrh2[i].
+        body = [
+            "f: int64 = cast[int64](0)",
+            "while f < nn:",
+            f"    g_lrh[cast[int64](f)] = f * cast[int64]({mul}) + cast[int64]({addend})",
+            "    f = f + cast[int64](1)",
+            "acc: int64 = cast[int64](0)",
+            "r: int64 = cast[int64](0)",
+            "while r < reps:",
+            "    i: int64 = cast[int64](0)",
+            "    while i < nn:",
+            "        s: int64 = cast[int64](0)",
+            "        k: int64 = cast[int64](0)",
+            "        while k < nn:",
+            "            s = s + g_lrh[cast[int64](k)]",
+            "            k = k + cast[int64](1)",
+            "        g_lrh2[cast[int64](i)] = s",
+            "        i = i + cast[int64](1)",
+            "    p: int64 = cast[int64](0)",
+            "    while p < nn:",
+            "        acc = acc + g_lrh2[cast[int64](p)]",
+            "        p = p + cast[int64](1)",
+            "    r = r + cast[int64](1)",
+            "return acc",
+        ]
+        arr = [(f * mul + addend) for f in range(nn)]
+        res = [0] * nn
+        acc = 0
+        for _r in range(reps):
+            for _i in range(nn):
+                s = 0
+                for _k in range(nn):
+                    s += arr[_k]
+                res[_i] = s
+            for _p in range(nn):
+                acc += res[_p]
+        self._nl_emit_helper(
+            fn, "reps: int64, nn: int64", body,
+            f"cast[int64]({reps}), cast[int64]({nn})", acc)
 
     # matmul-shape: acc + reps idle across a DOUBLY-nested inner loop (depth-3 gap).
     def _lrh_deep_idle(self, u):

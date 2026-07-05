@@ -170,6 +170,10 @@ from compiler.regalloc import (
 # per-function ranges regalloc already built; only consulted under --opt.
 from compiler.cfg import (
     lr_stmt_point,
+    lr_is_split_candidate,
+    lr_hole_covers,
+    ci_node,
+    ci_count,
     nm_count,
     nm_off,
     nm_len,
@@ -334,6 +338,13 @@ opt_constif_count: uint32 = 0
 # the `mov %ireg,%rax; mov %rax,%rcx` copy pair the legacy index-into-%rcx path
 # emits. 0 with --opt OFF (isel-gated) -> the default build stays byte-identical.
 opt_idxreg_count: uint32 = 0
+# LIVE-RANGE SPLIT hole-borrow hoists (--opt, splitter lever): each loop-invariant
+# global-array base held in a register BORROWED from a split-candidate local whose
+# live-range hole covers the loop (the candidate spilled before / reloaded after).
+# This is the matmul k-loop `&A`/`&B` base-recompute win that the >=2-use caller-
+# saved hoist could not reach (single-use base, register-pressure-saturated loop).
+# 0 with --opt OFF (isel-gated) -> the default build stays byte-identical.
+opt_splithoist_count: uint32 = 0
 
 
 def isel_enable():
@@ -356,6 +367,7 @@ def isel_reset_stats():
     opt_fpcmp_count = 0
     opt_constif_count = 0
     opt_idxreg_count = 0
+    opt_splithoist_count = 0
 
 
 # -----------------------------------------------------------------------
@@ -2458,6 +2470,22 @@ def emit_load_local_callee(enc: uint32, off: int32):
         rex = rex | 0x04                 # REX.R extends the modrm reg field
     emit_b(rex)
     emit_b(0x8B)
+    emit_rbp_mem(0x45 + ((enc & 7) << 3), off)
+
+
+# movq %<enc>, off(%rbp)   store a register-resident value into its stack slot.
+# The STORE companion of emit_load_local_callee (0x89 vs 0x8B); %<enc> is the
+# modrm REG field (src), %rbp the r/m base. Used by the live-range SPLITTER to
+# SPILL a split-candidate local (whose register is idle across a hotter inner
+# loop) to its home slot before the loop, so the freed register can hold a
+# loop-invariant base; hoist_loop_release reloads it (emit_load_local_callee)
+# after the loop.
+def emit_store_local_callee(enc: uint32, off: int32):
+    rex: uint32 = 0x48
+    if enc >= 8:
+        rex = rex | 0x04                 # REX.R extends the modrm reg field
+    emit_b(rex)
+    emit_b(0x89)
     emit_rbp_mem(0x45 + ((enc & 7) << 3), off)
 
 
@@ -8357,15 +8385,42 @@ HB_HEADROOM: uint32 = 1                     # caller-saved regs kept free for th
 hb_count: uint32 = 0                        # active hoisted bases (stack depth)
 hb_gi: Array[8, uint32]                     # global index (1-based) key
 hb_reg: Array[8, uint32]                    # x86 reg encoding holding the base
-# (opt_basehoist_count declared with the other --opt counters near the top.)
+# LIVE-RANGE SPLITTER bookkeeping (per hb entry). hb_is_hole[i]=1 => the register
+# hb_reg[i] was BORROWED from a split-candidate local whose live-range HOLE covers
+# this loop (its register is idle across the loop, spilled to hb_holeslot[i]
+# before the loop). Such an entry's release must RELOAD the register from the slot
+# (mov slot,%reg) so the candidate is restored for its post-loop use — NOT
+# ir_scratch_release (the register is regalloc-owned, not an IR scratch). For a
+# normal caller-saved hoist hb_is_hole[i]=0 (ir_scratch_release on release).
+hb_is_hole: Array[8, uint32]                # 1 => borrowed via a live-range hole
+hb_holeslot: Array[8, int32]               # spill slot (%rbp off) to reload from
+# (opt_basehoist_count / opt_splithoist_count declared with the other --opt
+# counters near the top of the file.)
+
+# DELIBERATE-BREAK switch (fuzzer / guard ONLY): when 1, hole_acquire_reg SKIPS the
+# lr_hole_covers soundness gate — it borrows a split candidate's register for a loop
+# NOT proven to lie in the candidate's idle gap (e.g. an earlier loop where the same
+# physical register holds an unrelated temp). That reuses a still-live register ->
+# a MISCOMPILE the differential/checksum MUST catch. Default 0 (sound). NEVER set on
+# a real compile — proves the coverage gate is what makes the splitter safe.
+cg_split_break: uint32 = 0
+
+
+def cg_set_split_break(v: uint32):
+    cg_split_break = v
 
 
 # Clear the hoist cache (function entry/exit). Releases the held scratch regs'
-# busy bits so the next function's pool starts clean.
+# busy bits so the next function's pool starts clean. A hole-borrow entry holds a
+# regalloc-owned register (not an IR scratch), so it is NOT ir_scratch_released
+# here; hb_reset only runs at function boundaries where no loop is live, so a
+# hole-borrow (always released by hoist_loop_release at its loop's exit) is never
+# outstanding here — but guard anyway (skip ir_scratch_release for hole entries).
 def hb_reset():
     i: uint32 = 0
     while i < hb_count:
-        ir_scratch_release(hb_reg[i])
+        if hb_is_hole[i] == 0:
+            ir_scratch_release(hb_reg[i])
         i = i + 1
     hb_count = 0
 
@@ -8519,42 +8574,237 @@ def hoist_collect_cands(node: uint32):
         cur = nd_next[cur]
 
 
+# =======================================================================
+# LIVE-RANGE SPLITTER helpers — free an idle register across a hot inner loop.
+# =======================================================================
+#
+# 1 iff the subtree `node` contains a nested loop (while/for). The split-hoist only
+# fires when the loop body has an inner loop, so the ONE hoisted base removes a
+# per-inner-iteration `lea` — a genuine uop reduction that pays for the once-per-
+# outer-iteration spill/reload. A base used once at the current (non-nested) depth
+# would only trade a lea for a spill/reload (net loss), so this gates it out.
+def subtree_has_nested_loop(node: uint32) -> uint32:
+    cur: uint32 = node
+    while cur != 0:
+        if nd_kind[cur] == ND_WHILE or nd_kind[cur] == ND_FOR or \
+           nd_kind[cur] == ND_FOR_UNPACK:
+            return 1
+        if subtree_has_nested_loop(nd_a[cur]) != 0:
+            return 1
+        if subtree_has_nested_loop(nd_b[cur]) != 0:
+            return 1
+        if subtree_has_nested_loop(nd_c[cur]) != 0:
+            return 1
+        if subtree_has_nested_loop(nd_d[cur]) != 0:
+            return 1
+        cur = nd_next[cur]
+    return 0
+
+
+# 1 iff x86 encoding `enc` is a CALLEE-SAVED register (rbx/r12/r13/r14/r15) — the
+# only pool a split candidate is register-promoted into (a value live across the
+# whole triple loop spans no single call-free region a caller-saved reg needs, so
+# regalloc places it callee-saved). We only borrow callee-saved regs: they are
+# already pushed by the prologue (no extra save) and survive any body code.
+def enc_is_callee_saved(enc: uint32) -> uint32:
+    if enc == 3:
+        return 1
+    if enc >= 12 and enc <= 15:
+        return 1
+    return 0
+
+
+# 1 iff `enc` is currently held by an ACTIVE hole-borrow hb entry (so a second
+# base in the same preheader does not borrow the same register twice).
+def hb_reg_is_hole_borrowed(enc: uint32) -> uint32:
+    i: uint32 = 0
+    while i < hb_count:
+        if hb_is_hole[i] != 0 and hb_reg[i] == enc:
+            return 1
+        i = i + 1
+    return 0
+
+
+# 1 iff AST node `t` lies in `root`'s subtree — `root` itself, or inside one of its
+# CHILD reference fields (a/b/c/d), following nd_next ONLY within those child chains
+# (a body block is an nd_next chain of statements). CRUCIALLY it does NOT follow
+# `root`'s OWN nd_next: a loop while-node's nd_next is its SIBLING statement (e.g.
+# the reduction loop AFTER the inner nest), which is NOT part of the loop. Following
+# it would wrongly enlarge the loop's point span past the split candidate's gap and
+# defeat the coverage test. Used to map program points back to the loop.
+def node_in_subtree(root: uint32, t: uint32) -> uint32:
+    if root == 0:
+        return 0
+    if root == t:
+        return 1
+    if node_chain_has(nd_a[root], t) != 0:
+        return 1
+    if node_chain_has(nd_b[root], t) != 0:
+        return 1
+    if node_chain_has(nd_c[root], t) != 0:
+        return 1
+    if node_chain_has(nd_d[root], t) != 0:
+        return 1
+    return 0
+
+
+# 1 iff `t` is in the subtree of any node on the nd_next CHAIN starting at `node`
+# (a statement block). Follows nd_next here — correct for a body/condition chain —
+# and recurses into each node's children via node_in_subtree (which does not follow
+# the chained node's OWN nd_next, so the caller controls sibling scope).
+def node_chain_has(node: uint32, t: uint32) -> uint32:
+    cur: uint32 = node
+    while cur != 0:
+        if node_in_subtree(cur, t) != 0:
+            return 1
+        cur = nd_next[cur]
+    return 0
+
+
+# Compute the program-point span [*out_lo, *out_hi] that loop node `wnode`
+# (condition + body) executes: the min and max ci index whose owning statement
+# node lies in wnode's subtree. Every point the loop touches is stamped (ci_node)
+# with a statement in its subtree, so [lo,hi] is a guaranteed SUPERSET of the
+# loop's points — sound for the hole-coverage test (over-approximating the span
+# only ever makes coverage HARDER to satisfy, never wrongly satisfied). Returns 1
+# if any point was found, 0 (no ci) otherwise.
+def loop_point_span(wnode: uint32, out_lo: Ptr[uint32], out_hi: Ptr[uint32]) -> uint32:
+    lo: uint32 = 0xffffffff
+    hi: uint32 = 0
+    found: uint32 = 0
+    i: uint32 = 0
+    while i < ci_count:
+        if node_in_subtree(wnode, ci_node[i]) != 0:
+            if i < lo:
+                lo = i
+            if i > hi:
+                hi = i
+            found = 1
+        i = i + 1
+    out_lo[0] = lo
+    out_hi[0] = hi
+    return found
+
+
+# Acquire a callee-saved register that a LIVE-RANGE SPLIT CANDIDATE holds but which
+# is IDLE across loop node `wnode` (its live-range hole COVERS the loop's whole
+# program-point span). Emits the SPILL of the candidate to its home slot (so its
+# value survives the loop) and returns the freed encoding, writing the slot offset
+# through out_slot for the reload. Returns RA_NONE if none qualifies.
+#
+# SOUNDNESS (why the register is truly free across the loop):
+#   * lr_hole_covers(n, lo, hi+1) requires the loop's ENTIRE point span [lo,hi] to
+#     lie inside ONE of n's idle gaps. A gap is INTERIOR to n's live interval, so
+#     across [lo,hi] the register is EXCLUSIVELY n's (linear scan gives one
+#     register to non-overlapping intervals; no other local can hold n's register
+#     inside n's own interval) AND n is provably UNACCESSED there (the gap is
+#     access-free by construction). Hence the register holds no live value across
+#     the loop — spilling n and reusing it is sound; the reload after the loop
+#     restores n before its next (post-gap) access.
+#   * This is STRICTLY stronger than a name scan: it also rejects a loop OUTSIDE
+#     n's interval, where n's register is reused by an unrelated temp (e.g. an
+#     earlier fill loop) — a name scan would wrongly pass that case.
+# Only under --opt with an allocation built (cg_ra_active).
+def hole_acquire_reg(wnode: uint32, out_slot: Ptr[int32]) -> uint32:
+    if cg_ra_active == 0:
+        return RA_NONE
+    lo: uint32 = 0
+    hi: uint32 = 0
+    if loop_point_span(wnode, &lo, &hi) == 0:
+        return RA_NONE
+    n: uint32 = 0
+    while n < nm_count:
+        if lr_is_split_candidate(n) != 0:
+            enc: uint32 = ra_reg_for_name(nm_off[n], nm_len[n])
+            # SOUNDNESS gate: the loop's whole point span must lie in one of n's
+            # idle gaps (lr_hole_covers). The deliberate-break switch bypasses it to
+            # prove that gate is what prevents an unsound reuse (a MISCOMPILE).
+            covered: uint32 = lr_hole_covers(n, lo, hi + 1)
+            if cg_split_break != 0:
+                covered = 1
+            if enc != RA_NONE and enc_is_callee_saved(enc) != 0 and \
+               hb_reg_is_hole_borrowed(enc) == 0 and covered != 0:
+                slot: int32 = 0
+                if lookup_local(nm_off[n], nm_len[n], &slot) != 0:
+                    # SPILL the candidate's live-but-idle register to its slot; the
+                    # freed register now holds a loop-invariant base for the loop.
+                    emit_store_local_callee(enc, slot)
+                    out_slot[0] = slot
+                    return enc
+        n = n + 1
+    return RA_NONE
+
+
 # Per-loop base hoist for `body` into the loop preheader (called by gen_while
 # BEFORE the loop-top label, so the leas run ONCE). No-op unless --opt (isel) is
 # on and the body is CALL-FREE (a caller-saved base must not cross a call).
-# Hoists only MULTI-USE bases (>=2 accesses), leaving HB_HEADROOM scratch regs
-# free — so the lever never regresses a register-pressured loop. Pushes hb
-# entries the caller releases after the loop. Descends nested loops, so a base is
-# hoisted at the OUTERMOST call-free loop containing its uses (inner loops then
-# find it cached).
-def hoist_loop_preheader(body: uint32):
+# Normally hoists only MULTI-USE bases (>=2 accesses) into a FREE caller-saved reg,
+# leaving HB_HEADROOM scratch regs free — so the lever never regresses a register-
+# pressured loop. LIVE-RANGE SPLIT extension: when no caller-saved reg is free but
+# the loop body has a nested loop AND a split-candidate local's register is idle
+# across the body, BORROW that register (spill the candidate before the loop,
+# reload after) to hold a single-use base whose per-inner-iteration `lea` this
+# removes — the matmul k-loop `&A`/`&B` base-recompute win. Pushes hb entries the
+# caller releases after the loop. Descends nested loops, so a base is hoisted at
+# the OUTERMOST call-free loop containing its uses (inner loops then find it
+# cached).
+def hoist_loop_preheader(node: uint32):
     if isel_is_enabled() == 0:
         return
+    body: uint32 = nd_b[node]
     if subtree_has_call(body) != 0:
         return
     hbc_n = 0
     hoist_collect_cands(body)
+    nested: uint32 = subtree_has_nested_loop(body)
     k: uint32 = 0
     while k < hbc_n:
         gi: uint32 = hbc_gi[k]
-        if hb_count < HB_MAX and hoist_count_gi(body, gi) >= 2:
-            r: uint32 = hoist_acquire_caller()
-            if r != RA_NONE:
-                emit_lea_global_rax(glob_offset[gi - 1], glob_is_bss[gi - 1])
-                emit_mov_reg_reg(0, r)           # mov %rax -> held caller reg
-                hb_gi[hb_count] = gi
-                hb_reg[hb_count] = r
-                hb_count = hb_count + 1
-                opt_basehoist_count = opt_basehoist_count + 1
+        if hb_count < HB_MAX:
+            cnt: uint32 = hoist_count_gi(body, gi)
+            done: uint32 = 0
+            if cnt >= 2:
+                r: uint32 = hoist_acquire_caller()
+                if r != RA_NONE:
+                    emit_lea_global_rax(glob_offset[gi - 1], glob_is_bss[gi - 1])
+                    emit_mov_reg_reg(0, r)       # mov %rax -> held caller reg
+                    hb_gi[hb_count] = gi
+                    hb_reg[hb_count] = r
+                    hb_is_hole[hb_count] = 0
+                    hb_holeslot[hb_count] = 0
+                    hb_count = hb_count + 1
+                    opt_basehoist_count = opt_basehoist_count + 1
+                    done = 1
+            if done == 0 and nested != 0 and cnt >= 1:
+                # LIVE-RANGE SPLIT: no free caller-saved reg, but a split-candidate
+                # local's register is idle across this loop — borrow it (spill
+                # before / reload after). Pass the WHOLE while node so the hole-
+                # coverage test spans the condition + body.
+                hs: int32 = 0
+                hr: uint32 = hole_acquire_reg(node, &hs)
+                if hr != RA_NONE:
+                    emit_lea_global_rax(glob_offset[gi - 1], glob_is_bss[gi - 1])
+                    emit_mov_reg_reg(0, hr)      # mov %rax -> borrowed callee reg
+                    hb_gi[hb_count] = gi
+                    hb_reg[hb_count] = hr
+                    hb_is_hole[hb_count] = 1
+                    hb_holeslot[hb_count] = hs
+                    hb_count = hb_count + 1
+                    opt_splithoist_count = opt_splithoist_count + 1
         k = k + 1
 
 
-# Release per-loop hoist entries down to `saved` (LIFO with the preheader push),
-# freeing the held caller-saved registers for code after the loop.
+# Release per-loop hoist entries down to `saved` (LIFO with the preheader push).
+# A normal caller-saved hoist frees its IR scratch; a LIVE-RANGE SPLIT hole-borrow
+# instead RELOADS the split candidate into its register from the spill slot (mov
+# slot,%reg), restoring it for its post-loop use — runs once per OUTER iteration.
 def hoist_loop_release(saved: uint32):
     while hb_count > saved:
         hb_count = hb_count - 1
-        ir_scratch_release(hb_reg[hb_count])
+        if hb_is_hole[hb_count] != 0:
+            emit_load_local_callee(hb_reg[hb_count], hb_holeslot[hb_count])
+        else:
+            ir_scratch_release(hb_reg[hb_count])
 
 
 # Compute &arr[i] into %rax. Index in nd_b, array identifier in nd_a. The
@@ -11591,7 +11841,7 @@ def gen_while(node: uint32):
     # the back-edge / `continue` skip them). Only for a call-free body. hb_saved
     # marks the cache depth to release after the loop.
     hb_saved: uint32 = hb_count
-    hoist_loop_preheader(nd_b[node])
+    hoist_loop_preheader(node)
 
     emit_loop_align(nd_b[node])          # 32B loop-top align, per-loop offset
     start: uint32 = code_len

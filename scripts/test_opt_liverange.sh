@@ -225,6 +225,87 @@ else:
     else:
         print(f"  OK  matmul acc={cmm['acc']} reps={cmm['reps']} (k-loop depth 4)")
 
+# ===========================================================================
+# THE SPLITTER (codegen consumes lr_is_split_candidate) — the measured win.
+# ===========================================================================
+# A matmul-shape kernel over a GLOBAL array: `acc` is idle across the doubly-nested
+# i/k loop that reads Gx (its register sits idle over the hottest loop). The codegen
+# splitter SPILLS acc before the nest, BORROWS its freed callee-saved register to
+# hold Gx's loop-invariant base (removing the per-inner-iteration `lea Gx(%rip)`),
+# and RELOADS acc after. A leading FILL loop (also a nested-loop + global-array
+# shape, but OUTSIDE acc's live interval, where acc's register is reused by a fill
+# temp) is the exact case the hole-COVERAGE gate must reject — the deliberate break
+# removes that gate and MUST miscompile.
+SPLIT = """Gx: Array[64, int64]
+Cx: Array[64, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    f: int64 = 0
+    while f < 8:
+        g: int64 = 0
+        while g < 8:
+            Gx[cast[int64](f * 8 + g)] = (f * 7 + g * 3)
+            g = g + 1
+        f = f + 1
+    acc: int64 = 0
+    reps: int64 = 0
+    while reps < 5:
+        i: int64 = 0
+        while i < 8:
+            s: int64 = 0
+            k: int64 = 0
+            while k < 8:
+                s = s + Gx[cast[int64](k)]
+                k = k + 1
+            Cx[cast[int64](i)] = s
+            i = i + 1
+        p: int64 = 0
+        while p < 8:
+            acc = acc + Cx[cast[int64](p)]
+            p = p + 1
+        reps = reps + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & 255)
+"""
+_arr = [0]*64
+for f in range(8):
+    for g in range(8):
+        _arr[f*8+g] = f*7+g*3
+_cx = [0]*8
+_acc = 0
+for _r in range(5):
+    for _i in range(8):
+        _cx[_i] = sum(_arr[k] for k in range(8))
+    for _p in range(8):
+        _acc += _cx[_p]
+EXP_SPLIT = _acc & U64
+build("lrh_split", SPLIT)
+# F. SPLITTER FIRES + is CORRECT. run opt ON and read SPLITHOIST; also ON==OFF==oracle.
+r_off = h.run_through_codegen_ad("lrh_split_off", (WD/"lrh_split.ad").read_text(), WD, opt=False)
+r_on  = h.run_through_codegen_ad("lrh_split_on",  (WD/"lrh_split.ad").read_text(), WD, opt=True)
+if r_off.kind != "ok" or r_on.kind != "ok":
+    fail(f"split: codegen kind off={r_off.kind} on={r_on.kind}")
+else:
+    if r_off.stdout.strip() != str(EXP_SPLIT) or r_on.stdout.strip() != str(EXP_SPLIT):
+        fail(f"split: value off={r_off.stdout.strip()} on={r_on.stdout.strip()} exp={EXP_SPLIT}")
+    elif getattr(r_on, "splithoist", 0) < 1:
+        fail(f"split: SPLITTER DID NOT FIRE (splithoist={getattr(r_on,'splithoist',0)})")
+    else:
+        print(f"  OK  splitter fires (splithoist={r_on.splithoist}) + correct "
+              f"ON==OFF==oracle=={EXP_SPLIT}")
+
+# G. DELIBERATE BREAK — arm --split-break so the splitter SKIPS the hole-coverage
+# soundness gate: it borrows acc's register for the FILL loop (outside acc's gap,
+# where the register holds a live fill temp) -> the value is clobbered -> the result
+# MUST diverge (wrong checksum or a crash). Proves the coverage gate is what makes
+# the splitter sound (mirrors the analysis's --holes-break above, at codegen level).
+r_brk = h.run_through_codegen_ad("lrh_split_brk", (WD/"lrh_split.ad").read_text(),
+                                 WD, opt=True, split_break=True)
+if r_brk.kind == "ok" and r_brk.stdout.strip() == str(EXP_SPLIT):
+    fail(f"split: DELIBERATE BREAK NOT caught — still correct ({r_brk.stdout.strip()})")
+else:
+    detail = r_brk.stdout.strip() if r_brk.kind == "ok" else f"kind={r_brk.kind}"
+    print(f"  OK  deliberate split-break CAUGHT (diverged: {detail} != {EXP_SPLIT})")
+
 print()
 if fails:
     print(f"test_opt_liverange: FAIL ({fails} failure(s))")

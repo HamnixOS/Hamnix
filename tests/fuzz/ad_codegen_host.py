@@ -207,14 +207,18 @@ def _hex_to_bytes(lines):
     return bytes.fromhex("".join(lines))
 
 
-def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
+def run_dump(src_path: Path, timeout=30, opt=False, split_break=False) -> DumpResult:
     build_driver()
     rel = src_path
     # opt=True passes the dump driver's opt-in --opt flag, enabling the native
     # Adder optimizer (Phase 1 const-fold). Default (no flag) is byte-inert.
+    # split_break arms the live-range splitter's deliberate-break (skip the hole-
+    # coverage soundness gate) so a guard can prove that gate prevents a miscompile.
     argv = [str(DRIVER_ELF)]
     if opt:
         argv.append("--opt")
+    if split_break:
+        argv.append("--split-break")
     argv.append(str(rel))
     cp = subprocess.run(argv,
                         capture_output=True, text=True, timeout=timeout)
@@ -285,6 +289,7 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       isel=meta.get("ISEL", 0),
                       aluload=meta.get("ALULOAD", 0),
                       basehoist=meta.get("BASEHOIST", 0),
+                      splithoist=meta.get("SPLITHOIST", 0),
                       ivsr=meta.get("IVSR", 0),
                       storeelim=meta.get("STOREELIM", 0),
                       paramhome=meta.get("PARAMHOME", 0),
@@ -666,6 +671,7 @@ class CodegenRun:
         self.isel = kw.get("isel", 0)
         self.aluload = kw.get("aluload", 0)
         self.basehoist = kw.get("basehoist", 0)
+        self.splithoist = kw.get("splithoist", 0)
         self.ivsr = kw.get("ivsr", 0)
         self.storeelim = kw.get("storeelim", 0)
         self.paramhome = kw.get("paramhome", 0)
@@ -678,14 +684,15 @@ class CodegenRun:
         self.cmpjcc = kw.get("cmpjcc", 0)
 
 
-def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
+def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
+                           split_break=False):
     work_dir.mkdir(parents=True, exist_ok=True)
     cg_body = codegen_compatible_source(body)
     src = work_dir / f"ad_{seed}.ad"
     elf = work_dir / f"ad_{seed}.elf"
     src.write_text(cg_body)
     try:
-        dump = run_dump(src, opt=opt)
+        dump = run_dump(src, opt=opt, split_break=split_break)
     except subprocess.TimeoutExpired:
         return CodegenRun("drivererror", detail="dump driver timeout")
     if dump.status in ("cgfail", "parsefail", "readfail"):
@@ -729,6 +736,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     isel = getattr(dump, "isel", 0)
     aluload = getattr(dump, "aluload", 0)
     basehoist = getattr(dump, "basehoist", 0)
+    splithoist = getattr(dump, "splithoist", 0)
     ivsr = getattr(dump, "ivsr", 0)
     storeelim = getattr(dump, "storeelim", 0)
     paramhome = getattr(dump, "paramhome", 0)
@@ -757,7 +765,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                       destsel=destsel, accsel=accsel, idxstore=idxstore,
                       idxsel=idxsel, spineleaf=spineleaf,
                       strengthred=strengthred, isel=isel, aluload=aluload,
-                      basehoist=basehoist,
+                      basehoist=basehoist, splithoist=splithoist,
                       ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, imulimm=imulimm, cmpjcc=cmpjcc)
 
 
