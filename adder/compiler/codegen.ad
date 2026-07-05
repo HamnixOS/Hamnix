@@ -322,6 +322,12 @@ opt_fpcmp_count: uint32 = 0
 # 0 with --opt OFF (isel_is_enabled gates it) -> the default build stays byte-
 # identical to the seed (which always emits the full materialize+test+jcc).
 opt_constif_count: uint32 = 0
+# DIRECT-SIB-INDEX-REGISTER coalesce (--opt, Phase-2 continuation): each `arr[i]`
+# element-address lea whose index is a bare register-promoted full-width-8 local
+# routed STRAIGHT into the SIB index slot (`lea (base,%ireg,s),%rax`), eliminating
+# the `mov %ireg,%rax; mov %rax,%rcx` copy pair the legacy index-into-%rcx path
+# emits. 0 with --opt OFF (isel-gated) -> the default build stays byte-identical.
+opt_idxreg_count: uint32 = 0
 
 
 def isel_enable():
@@ -342,6 +348,7 @@ def isel_reset_stats():
     opt_fpmov_count = 0
     opt_fpcmp_count = 0
     opt_constif_count = 0
+    opt_idxreg_count = 0
 
 
 # -----------------------------------------------------------------------
@@ -4417,6 +4424,56 @@ def emit_lea_base_index_rcx(base: uint32, sbits: uint32):
         emit_b(sib)
 
 
+# leaq (%<base>, %<idx>, scale), %rax  — the full generalization of
+# emit_lea_base_index_rcx: BOTH the base and the index are arbitrary registers.
+# Used by the "bare register-promoted index -> direct SIB register" coalesce
+# (P1 Phase-2 continuation): when `arr[i]` indexes with a register-resident local
+# `i`, that promoted register goes STRAIGHT into the SIB index slot, eliminating
+# the `mov i,%rax; mov %rax,%rcx` copy pair the legacy index-into-%rcx path emits.
+# With idx==%rcx(1) this is byte-identical to emit_lea_base_index_rcx, so the
+# unchanged index paths keep their exact encoding.
+#   REX.W=48; REX.B if base>=8 (SIB base field); REX.X if idx>=8 (SIB index field).
+#   Opcode 8D; ModRM reg=%rax(000), rm=100(SIB). mod=00 normally; a SIB base whose
+#   low 3 bits == 101 (%rbp/%r13) needs mod=01 + disp8=0. The index must not be
+#   %rsp(4) — SIB index=100 means "no index"; promoted locals are never %rsp.
+def emit_lea_base_index_reg(base: uint32, idx: uint32, sbits: uint32):
+    rex: uint32 = 0x48
+    if base >= 8:
+        rex = rex | 0x01                 # REX.B extends SIB base
+    if idx >= 8:
+        rex = rex | 0x02                 # REX.X extends SIB index
+    emit_b(rex)
+    emit_b(0x8D)
+    sib: uint32 = (sbits << 6) + ((idx & 7) << 3) + (base & 7)
+    if (base & 7) == 5:
+        emit_b(0x44)                     # mod=01, reg=rax(000), rm=100(SIB)
+        emit_b(sib)
+        emit_b(0)                        # disp8 = 0
+    else:
+        emit_b(0x04)                     # mod=00, reg=rax(000), rm=100(SIB)
+        emit_b(sib)
+
+
+# leaq off(%rbp, %<idx>, scale), %rax  — like emit_lea_local_sib_rax but with an
+# ARBITRARY index register (the direct-SIB coalesce for an Array-local base). With
+# idx==%rcx(1) this reproduces emit_lea_local_sib_rax byte-for-byte.
+def emit_lea_local_sib_reg(off: int32, idx: uint32, sbits: uint32):
+    rex: uint32 = 0x48
+    if idx >= 8:
+        rex = rex | 0x02                 # REX.X extends SIB index
+    emit_b(rex)
+    emit_b(0x8D)
+    sib: uint32 = (sbits << 6) + ((idx & 7) << 3) + 5    # scale|index|base=rbp
+    if disp_fits8(off) != 0:
+        emit_b(0x44)                     # mod=01, reg=rax(000), rm=100(SIB)
+        emit_b(sib)
+        emit_b(cast[uint32](off) & 255)
+    else:
+        emit_b(0x84)                     # mod=10, reg=rax(000), rm=100(SIB)
+        emit_b(sib)
+        emit_disp32(off)
+
+
 # leaq <data_off>(%rip), %rax  -> 48 8D 05 <rel32>   (address of a global /
 # string in the data section). The rel32 is a placeholder; a data fixup is
 # recorded against the global's data offset and patched after layout, so it
@@ -7002,6 +7059,43 @@ def try_sel_index_into_rcx(idx_raw: uint32) -> uint32:
     return 1
 
 
+# The x86 register encoding of a BARE register-promoted local used directly as an
+# array index, or RA_NONE. This is the "direct SIB register" coalesce: `arr[i]`
+# where the (cast-peeled) index is a single register-resident full-width-8 integer
+# local. Rather than `mov %i,%rax; mov %rax,%rcx` (gen_expr(ident) + the
+# index-into-%rcx move), the promoted register goes STRAIGHT into the SIB index
+# slot of the element-address lea. Value-identical to the legacy path: the SIB
+# index uses the full 64-bit register content, exactly the value gen_expr(ident)
+# would leave in %rcx. Gated isel(--opt)-only via the caller; RA_NONE otherwise.
+#
+# SOUNDNESS conditions (all required):
+#   * The peeled index is a bare ND_IDENT (NOT a binary — a binary index is the
+#     try_sel_index_into_rcx path; a narrowing/float cast stops idx_peel_cast, so
+#     it stays a cast node here and is refused).
+#   * The local is register-PROMOTED (ra_reg_for_name != RA_NONE); a stack-homed
+#     local has no register to route, so it falls back.
+#   * The local is FULL-WIDTH-8 (lookup_local_scalar_size == 0): a sub-8-byte
+#     local read sign/zero-extends in gen_expr, which a raw SIB index would skip.
+#   * NON-float: a float local would be materialised differently by gen_expr; a
+#     float value can never be a valid array index, but guard defensively.
+def index_reg_direct(idx_raw: uint32) -> uint32:
+    if idx_raw == 0:
+        return RA_NONE
+    idx: uint32 = idx_peel_cast(idx_raw)
+    if idx == 0:
+        return RA_NONE
+    if nd_kind[idx] != ND_IDENT:
+        return RA_NONE
+    if expr_float_width(idx) != 0:
+        return RA_NONE
+    r: uint32 = ra_reg_for_name(nd_name_off[idx], nd_name_len[idx])
+    if r == RA_NONE:
+        return RA_NONE
+    if lookup_local_scalar_size(nd_name_off[idx], nd_name_len[idx]) != 0:
+        return RA_NONE
+    return r
+
+
 # Try the IR-consuming emit path for AST expression `node`. Returns 1 if it
 # emitted the node through the IR (caller is done), 0 if `node` is outside the
 # lowered subset and the caller must fall back to the AST emitter. OFF by
@@ -8616,51 +8710,68 @@ def gen_index_addr(node: uint32):
     # class `A[i*N+k]` index sum stops round-tripping through the stack. Any shape
     # the selector does not route (impure index, non-cheap combine, shift/div root)
     # falls back to the byte-correct legacy `gen_expr(index); mov %rax,%rcx`.
-    if try_sel_index_into_rcx(nd_b[node]) == 0:
-        gen_expr(nd_b[node])
-        emit_mov_rax_rcx()
+    #
+    # DIRECT-SIB-INDEX-REGISTER coalesce: when the ISEL SIB path below will fire
+    # (isel on + pow2 stride) AND the index is a bare register-promoted local, put
+    # that register STRAIGHT into the SIB index slot — no index materialize at all.
+    # This eliminates the `mov %ireg,%rax; mov %rax,%rcx` copy pair (2 movs/iter)
+    # for the `arr[i]` idiom (sieve's clear/mark/count loops, matmul's C[p] fold).
+    # `idxreg` defaults to %rcx(1) so every non-direct path is byte-identical to the
+    # legacy index-into-%rcx encoding.
+    idxreg: uint32 = 1                            # %rcx
+    use_direct: uint32 = 0
+    if isel_is_enabled() != 0 and isel_scale_ok(es) != 0:
+        dr: uint32 = index_reg_direct(nd_b[node])
+        if dr != RA_NONE:
+            idxreg = dr
+            use_direct = 1
+            opt_idxreg_count = opt_idxreg_count + 1
+    if use_direct == 0:
+        if try_sel_index_into_rcx(nd_b[node]) == 0:
+            gen_expr(nd_b[node])
+            emit_mov_rax_rcx()
 
     # ---- ISEL (--opt): fold scale-shift + base-lea/load + add into a single
-    # scaled-index `lea`. The index is already in %rcx; the SIB scale field
+    # scaled-index `lea`. The index is already in %idxreg; the SIB scale field
     # expresses *1/*2/*4/*8 natively, so we only need to materialise the base
     # and emit one lea. The computed element address is bit-identical to the
     # scale/add form below. Non-power-of-2 strides fall through to that form.
     if isel_is_enabled() != 0 and isel_scale_ok(es) != 0:
         sb: uint32 = isel_scale_bits(es)
         if arr_local != 0:
-            # lea disp(%rbp, %rcx, s), %rax  — fold base-lea + scale + add.
-            emit_lea_local_sib_rax(off, sb)
+            # lea disp(%rbp, %idxreg, s), %rax  — fold base-lea + scale + add.
+            emit_lea_local_sib_reg(off, idxreg, sb)
             opt_isel_count = opt_isel_count + 1
             return
         if ptr_local != 0 or scalar_ptr == 1:
             # Base = a pointer value held in a frame slot: load it to %rax,
-            # then lea (%rax, %rcx, s), %rax (fold scale + add).
+            # then lea (%rax, %idxreg, s), %rax (fold scale + add).
             emit_load_local_rax(off)
-            emit_lea_base_rax_index_rcx(sb)
+            emit_lea_base_index_reg(0, idxreg, sb)
             opt_isel_count = opt_isel_count + 1
             return
         if arr_glob != 0:
             # P1 Phase 2: if this global array's base was HOISTED into a held
             # callee-saved register (loop-invariant base residency), the element
             # address is ONE scaled-index lea off that register — no per-iteration
-            # `lea g(%rip)` recompute. The index is already in %rcx.
+            # `lea g(%rip)` recompute. The index is already in %idxreg.
             hbreg: uint32 = hb_lookup_global(arr_glob_gi)
             if hbreg != RA_NONE:
-                emit_lea_base_index_rcx(hbreg, sb)   # lea (%hbreg,%rcx,s),%rax
+                emit_lea_base_index_reg(hbreg, idxreg, sb)  # lea (%hbreg,%idxreg,s),%rax
                 opt_isel_count = opt_isel_count + 1
                 return
             # Base = rip-relative global array address: lea it to %rax, then
-            # lea (%rax, %rcx, s), %rax (rip form cannot carry a SIB index, so
+            # lea (%rax, %idxreg, s), %rax (rip form cannot carry a SIB index, so
             # the base-lea stays; we still fold the scale-shift + add).
             emit_lea_global_rax(gdoff, gbss)
-            emit_lea_base_rax_index_rcx(sb)
+            emit_lea_base_index_reg(0, idxreg, sb)
             opt_isel_count = opt_isel_count + 1
             return
         # scalar_ptr == 2 or Ptr[T] global: load the held pointer value, then
         # fold scale + add via the index lea.
         emit_lea_global_rax(gdoff, gbss)
         emit_load_mem_rax(8)
-        emit_lea_base_rax_index_rcx(sb)
+        emit_lea_base_index_reg(0, idxreg, sb)
         opt_isel_count = opt_isel_count + 1
         return
 

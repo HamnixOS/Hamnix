@@ -5655,6 +5655,270 @@ def _run_basehoist_corpus():
 
 
 # --------------------------------------------------------------------------
+# DIRECT-SIB-INDEX-REGISTER coalesce corpus. Covers the `arr[i]` element-address
+# lever — a bare register-promoted full-width-8 local index routed STRAIGHT into
+# the SIB index slot (`lea (base,%ireg,s),%rax`), eliminating the legacy
+# `mov %ireg,%rax; mov %rax,%rcx` copy pair — across every base flavour and the
+# correctness traps the risk table names:
+#   * global array (uint8/int64), local Array, pointer/scalar-ptr base;
+#   * mixed element sizes 1/2/4/8 (the SIB scale carries the stride);
+#   * a store target AND a load source both using a bare promoted index;
+#   * negative/large index values held in the routed register (SIB uses the full
+#     64-bit register content, identical to gen_expr(ident)->%rcx);
+#   * FALLBACK shapes that MUST stay correct (want_fire=False): a NARROWING cast
+#     index `g[cast[uint8](j)]` with j>255 (the truncation MUST run — idx_peel_cast
+#     stops at the narrowing cast so the direct path is refused; peeling it wrongly
+#     miscompiles, the deliberate-break the guard demonstrates), an IMPURE index
+#     `g[f()]` (a side effect must not be reordered), and a BINARY index `g[i+1]`
+#     (routed by try_sel_index_into_rcx, not this lever).
+# want_fire=True  => IDXREG must be > 0 on this program.
+# want_fire=False => correctness asserted; the specific shape falls back (though a
+#                    fill loop in the same program may still fire IDXREG).
+# --------------------------------------------------------------------------
+def _idxreg_corpus():
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, src, val, want_fire=True):
+        body = PRELUDE + "\n" + src
+        progs.append((name, body, str(val & M), val & 0xFF, want_fire))
+
+    # 1) sieve-like: global uint8 array, bare int64 index — a STORE loop (clear)
+    #    then a LOAD loop (count). Both indices are bare promoted locals. FIRE.
+    n = 300
+    flg = [0] * n
+    for z in range(n):
+        flg[z] = (z * 7 + 1) & 0xFF
+    acc = 0
+    for i in range(n):
+        acc = (acc + flg[i]) & M
+    prog("u8_global_store_load",
+         f"""flags: Array[512, uint8]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    z: int64 = 0
+    while z < {n}:
+        flags[cast[int64](z)] = cast[uint8](z * 7 + 1)
+        z = z + 1
+    acc: int64 = 0
+    i: int64 = 0
+    while i < {n}:
+        acc = acc + cast[int64](flags[cast[int64](i)])
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+""", acc)
+
+    # 2) global int64 array, bare index, read + write. FIRE.
+    n = 200
+    g = [0] * n
+    for i in range(n):
+        g[i] = (i * i - 3 * i + 5) & M
+    s = 0
+    for i in range(n):
+        s = (s + g[i]) & M
+    prog("i64_global",
+         f"""dat: Array[256, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        dat[cast[int64](i)] = i * i - 3 * i + 5
+        i = i + 1
+    s: int64 = 0
+    i = 0
+    while i < {n}:
+        s = s + dat[cast[int64](i)]
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s)
+
+    # 3) LOCAL Array (base = %rbp): bare index into a stack-homed array. FIRE.
+    n = 64
+    a = [0] * n
+    for i in range(n):
+        a[i] = (i * 11 + 2) & M
+    s = 0
+    for i in range(n):
+        s = (s + a[i]) & M
+    prog("i64_local_array",
+         f"""def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    a: Array[{n}, int64]
+    i: int64 = 0
+    while i < {n}:
+        a[cast[int64](i)] = i * 11 + 2
+        i = i + 1
+    s: int64 = 0
+    i = 0
+    while i < {n}:
+        s = s + a[cast[int64](i)]
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s)
+
+    # 4) MIXED ELEMENT SIZES 1/2/4/8 — the SIB scale carries the stride; the
+    #    bare index routes for every width. FIRE.
+    n = 40
+    s = 0
+    for i in range(n):
+        s = (s + (i & 0xFF) + (i * 3) + (i * 5) + (i * 7)) & M
+    prog("mixed_sizes",
+         f"""A8: Array[64, int64]
+A4: Array[64, int32]
+A2: Array[64, int16]
+A1: Array[64, uint8]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        A1[cast[int64](i)] = cast[uint8](i)
+        A2[cast[int64](i)] = cast[int16](i * 3)
+        A4[cast[int64](i)] = cast[int32](i * 5)
+        A8[cast[int64](i)] = i * 7
+        i = i + 1
+    s: int64 = 0
+    i = 0
+    while i < {n}:
+        s = s + cast[int64](A1[cast[int64](i)]) + cast[int64](A2[cast[int64](i)]) + cast[int64](A4[cast[int64](i)]) + A8[cast[int64](i)]
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s)
+
+    # 5) FALLBACK — NARROWING CAST index `g[cast[uint8](j)]` with j sweeping past
+    #    255: the truncation MUST run (index = j & 255). The direct path is
+    #    refused (idx_peel_cast stops at the narrowing cast). This is the
+    #    DELIBERATE-BREAK anchor: a broken peel-through-narrowing routes j's full
+    #    register and reads the WRONG element. want_fire=False (the fill loop
+    #    still fires, but this access must stay on the byte-correct fallback).
+    n = 256
+    g = list(range(n))
+    acc = 0
+    for j in range(250, 400):
+        acc = (acc + g[j & 255]) & M
+    prog("narrowing_cast_fallback",
+         f"""gg: Array[256, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        gg[cast[int64](i)] = i
+        i = i + 1
+    acc: int64 = 0
+    j: int64 = 250
+    while j < 400:
+        acc = acc + gg[cast[int64](cast[uint8](j))]
+        j = j + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+""", acc, want_fire=False)
+
+    # 6) FALLBACK — IMPURE index `g[side()]`: the index has a side effect, so the
+    #    direct path (and try_sel_index_into_rcx) must refuse it; correctness only.
+    ctr = [0]
+    def side():
+        ctr[0] = (ctr[0] + 3) % 50
+        return ctr[0]
+    g = [(i * 2) & M for i in range(64)]
+    acc = 0
+    for _ in range(30):
+        acc = (acc + g[side()]) & M
+    prog("impure_index_fallback",
+         f"""gv: Array[64, int64]
+_ctr: int64 = 0
+def side() -> int64:
+    _ctr = (_ctr + 3) % 50
+    return _ctr
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < 64:
+        gv[cast[int64](i)] = i * 2
+        i = i + 1
+    acc: int64 = 0
+    r: int64 = 0
+    while r < 30:
+        acc = acc + gv[cast[int64](side())]
+        r = r + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+""", acc, want_fire=False)
+
+    # 7) FALLBACK — BINARY index `g[i+1]`: routed by try_sel_index_into_rcx, not
+    #    this lever; correctness only (the direct path only handles a BARE ident).
+    n = 100
+    g = [(i * 4 + 1) & M for i in range(n + 2)]
+    s = 0
+    for i in range(n):
+        s = (s + g[i + 1]) & M
+    prog("binary_index_fallback",
+         f"""gb: Array[128, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n + 2}:
+        gb[cast[int64](i)] = i * 4 + 1
+        i = i + 1
+    s: int64 = 0
+    i = 0
+    while i < {n}:
+        s = s + gb[cast[int64](i + 1)]
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](s & cast[int64](255))
+""", s, want_fire=False)
+
+    return progs
+
+
+def _run_idxreg_corpus():
+    """Run the direct-SIB-index-register coalesce corpus through codegen.ad --opt.
+    Returns (all_correct_and_fired, total_idxreg). Asserts ON==OFF==oracle for
+    every program (a wrong route = a miscompile the oracle catches), that the
+    coalesce fired (IDXREG>0) on the want_fire shapes, and that it is byte-inert
+    OFF (IDXREG==0 with --opt off)."""
+    host = _ad_host()
+    total = 0
+    all_ok = True
+    fired_any = False
+    for (name, body, exp_out, exp_exit, want_fire) in _idxreg_corpus():
+        r_on = host.run_through_codegen_ad(f"ix_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"ix_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [IDXREG corpus '{name}'] codegen.ad on={r_on.kind}/"
+                  f"off={r_off.kind}: {(r_on.detail or r_off.detail)[:120]}")
+            continue
+        ix = int(getattr(r_on, "idxreg", 0) or 0)
+        ix_off = int(getattr(r_off, "idxreg", 0) or 0)
+        total += ix
+        if ix > 0:
+            fired_any = True
+        # (a) correctness vs oracle for BOTH on and off.
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [IDXREG corpus '{name}'] MISCOMPILE on=({r_on.stdout},"
+                  f"{r_on.exit}) oracle=({exp_out},{exp_exit}) idxreg={ix}")
+            continue
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [IDXREG corpus '{name}'] OFF wrong=({r_off.stdout},"
+                  f"{r_off.exit}) oracle=({exp_out},{exp_exit})")
+            continue
+        # (b) byte-inert OFF.
+        if ix_off != 0:
+            all_ok = False
+            print(f"  [IDXREG corpus '{name}'] NOT byte-inert OFF (idxreg={ix_off})")
+            continue
+        # (c) a want_fire program MUST route at least one index (IDXREG>0).
+        if want_fire and ix == 0:
+            all_ok = False
+            print(f"  [IDXREG corpus '{name}'] correct but IDXREG NEVER FIRED "
+                  f"(want_fire=True)")
+            continue
+    if not fired_any:
+        all_ok = False
+        print("  [IDXREG corpus FAIL] no program exercised the index-register coalesce")
+    return (all_ok, total)
+
+
+# --------------------------------------------------------------------------
 # P1 Phase-3 STATEMENT-GLUE STORE corpus (docs/perf_p1_isel_design.md §2 Phase 3).
 # Covers the two store-routing levers — AUGMENTED ACCUMULATOR (`s OP= expr` into a
 # promoted register home) and INDEXED-STORE RHS routing (`arr[i] = <pure-arith
@@ -7285,6 +7549,19 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] basehoist corpus miscompiled, lever never "
                   "fired, hoisted across a call, or OFF not byte-inert")
+        # DIRECT-SIB-INDEX-REGISTER coalesce corpus: `arr[i]` with a bare
+        # register-promoted full-width-8 index routed straight into the SIB index
+        # slot (eliminating the `mov %ireg,%rax; mov %rax,%rcx` copy pair). Asserts
+        # correctness ON+OFF across all base flavours + element sizes, the narrowing-
+        # cast / impure-index / binary-index FALLBACK shapes stay byte-correct, the
+        # coalesce fired (IDXREG>0), and byte-inert OFF (IDXREG==0).
+        ix_ok, ix_total = _run_idxreg_corpus()
+        print(f"--- ADDER_OPT=1 IDXREG corpus (direct-SIB index register) ---")
+        print(f"  bare-ident index accesses coalesced into SIB: {ix_total}")
+        if not ix_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] idxreg corpus miscompiled, coalesce never "
+                  "fired, a fallback shape mis-routed, or OFF not byte-inert")
         # P1 Phase-3 STATEMENT-GLUE STORE corpus: augmented accumulators routed
         # into a promoted register home (`s OP= expr`, no slot reload) and indexed
         # stores `arr[i] = <pure-arith binop>` whose RHS is computed dest-driven.
