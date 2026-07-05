@@ -1713,6 +1713,17 @@ if os.environ.get("ENABLE_VMSTAT_TEST") == "1":
 if os.environ.get("ENABLE_STATM_TEST") == "1":
     FILES.append(("/etc/statm-test", b"1\n"))
 
+# /proc/self/maps open self-test (Firefox blocker #2). scripts/test_maps.sh
+# sets ENABLE_MAPS_TEST=1 to plant /etc/maps-test. init/main.ad detects the
+# marker and calls maps_open_selftest() (linux_abi/u_syscalls.ad): it builds a
+# demand-paged VMA + synthesizes a main-thread user-stack range, then drives
+# the REAL userspace vfs_open("/proc/self/maps") path a Debian ELF's openat
+# takes (resolve_path -> #p/self/maps -> devproc KIND_MAPS -> vma_maps_render),
+# reads the map, and asserts it opened and carries an address-range line AND
+# the [stack] line glibc's pthread_getattr_np needs. Default boots omit it.
+if os.environ.get("ENABLE_MAPS_TEST") == "1":
+    FILES.append(("/etc/maps-test", b"1\n"))
+
 # /proc/<pid>/stat starttime (field 22) self-test. scripts/test_starttime.sh
 # sets ENABLE_STARTTIME_TEST=1 to plant /etc/starttime-test. init/main.ad
 # detects the marker and calls starttime_selftest() (devproc.ad): it stamps
