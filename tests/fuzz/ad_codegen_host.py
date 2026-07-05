@@ -277,6 +277,7 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       idxstore=meta.get("IDXSTORE", 0),
                       idxsel=meta.get("IDXSEL", 0),
                       callarg=meta.get("CALLARG", 0),
+                      spineleaf=meta.get("SPINELEAF", 0),
                       irscratch=meta.get("IRSCRATCH", 0),
                       irscratchmiss=meta.get("IRSCRATCHMISS", 0),
                       irborrow=meta.get("IRBORROW", 0),
@@ -594,6 +595,7 @@ class CodegenRun:
         self.idxstore = kw.get("idxstore", 0)
         self.idxsel = kw.get("idxsel", 0)
         self.callarg = kw.get("callarg", 0)
+        self.spineleaf = kw.get("spineleaf", 0)
         self.strengthred = kw.get("strengthred", 0)
         self.isel = kw.get("isel", 0)
         self.aluload = kw.get("aluload", 0)
@@ -652,6 +654,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     accsel = getattr(dump, "accsel", 0)
     idxstore = getattr(dump, "idxstore", 0)
     idxsel = getattr(dump, "idxsel", 0)
+    spineleaf = getattr(dump, "spineleaf", 0)
     strengthred = getattr(dump, "strengthred", 0)
     isel = getattr(dump, "isel", 0)
     aluload = getattr(dump, "aluload", 0)
@@ -678,7 +681,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                       constbranch=constbranch, copyprop=copyprop, iremit=iremit,
                       irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat,
                       destsel=destsel, accsel=accsel, idxstore=idxstore,
-                      idxsel=idxsel,
+                      idxsel=idxsel, spineleaf=spineleaf,
                       strengthred=strengthred, isel=isel, aluload=aluload,
                       basehoist=basehoist,
                       ivsr=ivsr, storeelim=storeelim, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, cmpjcc=cmpjcc)

@@ -4337,6 +4337,234 @@ def _run_destsel_corpus():
 
 
 # --------------------------------------------------------------------------
+# P1 SPINE-LEAF register-source corpus. The lever: when the LEFTMOST leaf of a
+# destination-routed pure-arith tree is a FULL-WIDTH-8 register-promoted local,
+# sel_expr_into_reg moves it STRAIGHT into the destination register
+# (`mov %src,%dst`) instead of the legacy `mov %src,%rax; mov %rax,%dst` %rax hop.
+# This is the fib recursion-arg residual (`fib(n-K)`: `mov %n,%rdi; sub $K,%rdi`).
+#
+# The corpus drives the lever through BOTH routed callers of sel_expr_into_reg:
+#   * CALL-ARGUMENT routing — a recursive `fib(n-1)+fib(n-2)`, multi-arg calls,
+#     and commutative arg spines, each whose arg register is filled by a leftmost
+#     promoted-local leaf.
+#   * ASSIGNMENT / accumulator routing — `t = <promoted local> OP ...` where the
+#     leftmost leaf is a promoted local (deep/mixed/commutative/signed spines).
+# Adversarial + fallback probes: a self-referencing spine (`x = x OP a`, which the
+# assign selector refuses via ir_uses_name so no direct leaf move of the dest
+# happens), a DISTINCT-promoted-leaf-with-later-reuse spine (the leaf's register
+# must survive the combine), a MEMORY-homed leftmost leaf and a SUB-8-BYTE leaf
+# (both must stay on the %rax path — no direct move, but still bit-exact). Every
+# program is oracle-checked ON and OFF and asserted byte-inert OFF (SPINELEAF==0).
+# --------------------------------------------------------------------------
+def _spineleaf_corpus():
+    """Return [(name, body, expected_stdout, expected_exit, want_fire)].
+    want_fire=True => the leaf lever MUST fire (SPINELEAF>0) on this program;
+    want_fire=False => a fallback shape (correctness still asserted; the program
+    may route OTHER promoted leaves, so firing is not required)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, decls_and_main, val, want_fire=True):
+        body = PRELUDE + "\n" + decls_and_main
+        progs.append((name, body, str(val & M), val & 0xFF, want_fire))
+
+    # 1) THE FLAGSHIP: recursive fib summed over a range. `fib(n-1)`/`fib(n-2)`
+    #    each route a leftmost promoted `n` straight into %rdi (mov %n,%rdi; sub).
+    def pyfib(n):
+        return n if n < 2 else pyfib(n - 1) + pyfib(n - 2)
+    val = 0
+    for n in range(24):
+        val = (val + pyfib(n)) & M
+    prog("fib_recursive",
+         """def fib(n: int64) -> int64:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    acc: int64 = 0
+    n: int64 = 0
+    while n < 24:
+        acc = acc + fib(n)
+        n = n + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+""", val)
+
+    # 2) MULTI-ARG call — each of three arg registers filled by a leftmost
+    #    promoted-local leaf (%rdi/%rsi/%rdx). Sources share `a` (a pre-existing
+    #    --opt limitation on 3 distinct promoted sources in one call), but each arg
+    #    spine still starts at a promoted leaf.
+    a0 = 7
+    val = 0
+    for i in range(50):
+        a = (a0 + i) & M
+        r = ((((a + 1) - (a - 2) + (a * 3)) & M) + a) & M
+        val = (val + r) & M
+    prog("multiarg_leaf",
+         """def f3(x: int64, y: int64, z: int64) -> int64:
+    return x - y + z
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    acc: int64 = 0
+    i: int64 = 0
+    while i < 50:
+        a: int64 = 7 + i
+        acc = acc + (f3(a + 1, a - 2, a * 3) + a)
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+""", val)
+
+    # 3) COMMUTATIVE / mixed-op spine into a promoted accumulator term `t`, whose
+    #    LEFTMOST leaf is the promoted local `a`. Drives ADD/OR/XOR/AND/MUL leaf
+    #    starts across the assignment-routing caller.
+    n = 300
+    val = 0
+    for i in range(n):
+        a = i & M
+        b = (i * 3 + 1) & M
+        t = (((((a * b) & M) + a) & M | (a ^ 7)) & M) & M
+        val = (val + t) & M
+    prog("commutative_leaf",
+         f"""def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    s: uint64 = cast[uint64](0)
+    i: uint64 = cast[uint64](0)
+    while i < cast[uint64]({n}):
+        a: uint64 = i
+        b: uint64 = i * cast[uint64](3) + cast[uint64](1)
+        t: uint64 = a * b + a | (a ^ cast[uint64](7))
+        s = s + t
+        i = i + cast[uint64](1)
+    print_u64(s)
+    return cast[int32](cast[uint64](s) & cast[uint64](255))
+""", val)
+
+    # 4) DISTINCT-PROMOTED-LEAF-WITH-REUSE: the leftmost leaf `a` is ALSO read
+    #    again as a right operand deeper in the same spine. The direct leaf move
+    #    `mov %a,%t` must NOT clobber %a (t's home is a distinct register), so the
+    #    later `+ a*...` reads the intact value. Signed operands (spans negative).
+    n = 250
+    val = 0
+    for i in range(n):
+        a = (i - 120)
+        t = (a + a * (a - 3)) & M
+        val = (val + t) & M
+    prog("leaf_reuse_signed",
+         f"""def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    s: int64 = 0
+    i: int64 = 0
+    while i < {n}:
+        a: int64 = i - 120
+        t: int64 = a + a * (a - 3)
+        s = s + t
+        i = i + 1
+    print_u64(cast[uint64](s))
+    return cast[int32](cast[uint64](s) & cast[uint64](255))
+""", val)
+
+    # 5) SELF-REF fallback: `x = x + a` reads the destination `x` in the spine. The
+    #    assign selector refuses (ir_uses_name) so x is NOT direct-moved as a leaf;
+    #    correctness must hold. Other decls (`a`) may still route their own leaves,
+    #    so want_fire stays True but the SELF-REF statement itself falls back.
+    n = 200
+    val = 0
+    x = 1
+    for i in range(n):
+        a = (i * 2 + 1) & M
+        x = (x + a) & M
+        val = (val ^ x) & M
+    prog("selfref_fallback",
+         f"""def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    s: uint64 = cast[uint64](0)
+    x: uint64 = cast[uint64](1)
+    i: uint64 = cast[uint64](0)
+    while i < cast[uint64]({n}):
+        a: uint64 = i * cast[uint64](2) + cast[uint64](1)
+        x = x + a
+        s = s ^ x
+        i = i + cast[uint64](1)
+    print_u64(s)
+    return cast[int32](cast[uint64](s) & cast[uint64](255))
+""", val, want_fire=True)
+
+    # 6) SUB-8-BYTE leaf fallback: the leftmost leaf is an int32 local. sized
+    #    scalars are excluded (lookup_local_scalar_size != 0) so the leaf stays on
+    #    the %rax path — no direct move — yet the value must be bit-exact. The
+    #    32-bit term is widened into a 64-bit accumulator.
+    n = 200
+    val = 0
+    for i in range(n):
+        w = (i * 7 + 3) & 0xFFFFFFFF
+        t = ((w + 5) & 0xFFFFFFFF)
+        val = (val + t) & M
+    prog("sub8_leaf_fallback",
+         f"""def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    s: uint64 = cast[uint64](0)
+    i: int32 = 0
+    while i < {n}:
+        w: int32 = i * 7 + 3
+        t: int32 = w + 5
+        s = s + cast[uint64](cast[uint32](t))
+        i = i + 1
+    print_u64(s)
+    return cast[int32](cast[uint64](s) & cast[uint64](255))
+""", val, want_fire=False)
+
+    return progs
+
+
+def _run_spineleaf_corpus():
+    """Run the spine-leaf corpus through codegen.ad ON+OFF. Returns
+    (all_ok, total_spineleaf). Each program must (a) match the oracle ON and OFF,
+    (b) fire SPINELEAF>0 when want_fire, (c) be byte-inert OFF (SPINELEAF==0)."""
+    host = _ad_host()
+    total = 0
+    all_ok = True
+    fired_any = False
+    for (name, body, exp_out, exp_exit, want_fire) in _spineleaf_corpus():
+        r_on = host.run_through_codegen_ad(f"sl_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"sl_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [SPINELEAF corpus '{name}'] codegen.ad on={r_on.kind}/off={r_off.kind}: "
+                  f"{(r_on.detail or r_off.detail)[:120]}")
+            continue
+        sl = int(getattr(r_on, "spineleaf", 0) or 0)
+        total += sl
+        if sl > 0:
+            fired_any = True
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [SPINELEAF corpus '{name}'] MISCOMPILE on=({r_on.stdout},{r_on.exit}) "
+                  f"oracle=({exp_out},{exp_exit}) spineleaf={sl}")
+            continue
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [SPINELEAF corpus '{name}'] OFF path wrong off=({r_off.stdout},{r_off.exit}) "
+                  f"oracle=({exp_out},{exp_exit})")
+            continue
+        if want_fire and sl == 0:
+            all_ok = False
+            print(f"  [SPINELEAF corpus '{name}'] correct but SPINELEAF NEVER FIRED "
+                  f"(want_fire=True)")
+            continue
+        # byte-inert OFF: re-dump off, assert SPINELEAF==0.
+        src = _AD_WORK / f"sl_mc_{name}.ad"
+        src.write_text(host.codegen_compatible_source(body))
+        d_off = host.run_dump(src, opt=False)
+        if d_off.status == "ok" and getattr(d_off, "spineleaf", 0) != 0:
+            all_ok = False
+            print(f"  [SPINELEAF corpus '{name}'] OFF path NOT byte-inert: "
+                  f"SPINELEAF={d_off.spineleaf}")
+            continue
+    if not fired_any:
+        all_ok = False
+        print("  [SPINELEAF corpus FAIL] no program exercised the spine-leaf lever")
+    return (all_ok, total)
+
+
+# --------------------------------------------------------------------------
 # P1 Phase-2 BASE-HOIST corpus. Programs whose hot loops index FLAT GLOBAL ARRAYS
 # (`g[idx]`), whose base address is a link-time constant the hoist materialises
 # ONCE into a held register (caller-saved across a call-free loop body) instead of
@@ -6221,6 +6449,20 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] destsel corpus miscompiled, dest-selector "
                   "never fired, a fallback shape routed, or OFF not byte-inert")
+        # P1 SPINE-LEAF register-source corpus: the leftmost leaf of a dest-routed
+        # pure-arith tree, when a register-promoted full-width-8 local, is moved
+        # STRAIGHT into the destination register (no %rax hop) — the fib
+        # recursion-arg residual. Asserts (a) correctness vs oracle ON+OFF over the
+        # recursive-call / multi-arg / commutative / leaf-reuse / self-ref-fallback
+        # / sub-8-fallback shapes, (b) the lever fired (SPINELEAF>0) on the
+        # want_fire programs, (c) byte-inert OFF (SPINELEAF==0).
+        sl_ok, sl_total = _run_spineleaf_corpus()
+        print(f"--- ADDER_OPT=1 SPINELEAF corpus (P1 spine-leaf register source) ---")
+        print(f"  spine leaves routed direct: {sl_total}")
+        if not sl_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] spineleaf corpus miscompiled, lever never "
+                  "fired, or OFF not byte-inert")
         # DCE call-argument corpus: a local used ONLY as a 2nd+ call argument was
         # under-counted by DCE (the nd_next operand chain was not walked), so its
         # decl got deleted and codegen aborted (cgfail) under --opt. Asserts each
