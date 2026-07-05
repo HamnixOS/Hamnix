@@ -343,6 +343,32 @@ printf '%s\n' "$FF_PREFS" > "$PROFILE/prefs.js"
 printf '%s\n' "$FF_PREFS" > "$PROFILE/user.js"
 echo "[stage-ff] seeded throwaway profile ($PROFILE, prefs.js+user.js) + /run + /tmp"
 
+# --- 8a. force the pure wl_shm software path: REMOVE the GL/GBM libs -----
+# The Hamnix compositor speaks wl_shm ONLY. There is no mesa EGL, no dri
+# driver, and no DRM render node in the namespace. Firefox, however, probes
+# for DMABuf/GBM at gfx init: as long as `libgbm.so.1` is dlopen-able it runs
+# DMABufDevice::Configure -> DMABufFormats::EnsureBasicFormats and then
+# NULL-derefs on the absent DRM/GBM device (write-perm fault va=0, rip in
+# libxul's DMABuf path — the render-thread window-blocking crash). PREFS
+# alone (widget.dmabuf.force-enabled=false etc.) do NOT stop the probe.
+#
+# libxul only *dlopens* these by soname (they are NOT DT_NEEDED — verified
+# with readelf -d), so DELETING them makes the dlopen fail cleanly and
+# Firefox falls back to its pure-software wl_shm present path. weston-terminal
+# / weston-simple-shm / libgtk-3 do not link them either, so the wl_shm
+# clients are unaffected. (Only Xwayland — unused, GL-blocked here — needs
+# libgbm, so its loss is a no-op for the native-Wayland path.)
+echo "[stage-ff] removing GL/GBM libs to force Firefox onto the wl_shm path ..."
+# -L so a symlinked ROOTFS start point is descended (find does not descend a
+# symlink-to-dir start point by default).
+for gl in libgbm.so libGL.so libGLX.so libGLX_mesa.so libEGL.so libEGL_mesa.so \
+          libGLdispatch.so libgallium libvulkan_lvp.so; do
+    find -L "$ROOTFS" -name "${gl}*" -print -delete 2>/dev/null || true
+done
+# dri driver blobs (swrast_dri.so etc.), if any slipped in
+find -L "$ROOTFS" -path "*/dri/*_dri.so" -print -delete 2>/dev/null || true
+echo "[stage-ff]   GL/GBM libs removed (Firefox -> wl_shm software present)."
+
 # --- 8b. baked-in native-Wayland launcher (/ff-launch.sh) --------------
 # One short serial line launches Firefox as a native wl client once the
 # live-root is up:  spawn linux { /bin/sh /ff-launch.sh }
