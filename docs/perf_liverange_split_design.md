@@ -87,6 +87,49 @@ plus a genuine UOP reduction (base-hoist eliminates 2 `lea`/iter) is required fo
 the split to bank monotonically — the pattern proven by #94/#100 (uop reductions
 convert; instruction-repositioning does not).
 
+## 3a. Exact codegen consumption recipe (function-level, for the follow-up)
+
+The analysis exposes (per cfg name id `n`, valid only between
+`ra_build_cfg`/`ra_build_scan` and the next function): `lr_is_split_candidate(n)`,
+`lr_num_holes(n)`, `lr_hole_start/end(n,i)` (the gap's program-point range),
+`lr_hole_hotness/bracket_depth(n,i)`, `lr_hole_covers(host, as, ae)`. The blocker
+the follow-up must add is a **per-region value-location model**: today
+`ra_reg_for_name(off,len)` (regalloc.ad) is POINT-INDEPENDENT — it returns the
+same register for every read/write of a name. The splitter needs it to answer
+"where does `n` live AT program point p", returning IN-SLOT inside `n`'s chosen
+split gap and IN-REGISTER elsewhere. Concretely:
+
+1. **Choose the split** (regalloc.ad, after `ra_linear_scan`): for each
+   `lr_is_split_candidate(n)` whose gap `g` is the hottest and whose register is
+   assigned, mark `n` SPLIT over `[lr_hole_start(n,g), lr_hole_end(n,g)]` and pick
+   a GUEST to receive the freed register in the gap — either a hoisted base
+   (below) or another value whose whole interval `lr_hole_covers(n, ., .)`.
+2. **Force a stack home + write-through** (codegen.ad `store_to_named`:10398 and
+   `lr_is_store_elim`): a split candidate must NOT be store-eliminated — its slot
+   must stay authoritative so the gap-exit reload is valid. Gate: a split name
+   returns `ra_store_elim_for_name==0` (keep the `emit_store_local_rax` mirror).
+3. **Point-aware read/write** (`gen_ident` register read ~:2674 region;
+   `store_to_named`:10418): thread the current program point (available via
+   `ci_node`→`lr_stmt_point`, already used by the IR-scratch borrow
+   `ra_pool_all_dead_after`) so that inside `[gstart,gend]` a read/write of `n`
+   uses the SLOT, not the register (the register now holds the guest).
+4. **Gap-exit reload** (codegen.ad `gen_while`:11588 — emit after the gap's loop
+   body / at the successor block header): one `mov slot(%rbp), %reg` to restore
+   `n` into its register. Executes once per OUTER iteration (150× for matmul, not
+   39M×) — negligible. NO gap-entry code (write-through already left the slot
+   current).
+5. **The base-hoist CONSUMER** (codegen.ad `gen_index_addr`:8564): matmul's
+   per-iter `lea [rip+&A]`/`[rip+&B]` must be lifted to the freed register once
+   before the k-loop (a LICM-of-address over the innermost loop), and the k-loop
+   body rewritten to `lea (%base,%idx,8)`. Without this consumer, freeing the
+   register is a pure regression — 4+5 land together.
+
+**Exact matmul target:** free `acc`'s %r15 across gap `[13,27]` (the k-loop) for
+`&B`'s base; dedup `r11=N` (IVSR stride temp, a copy of `rbx`) for `&A`'s base.
+Result: k-loop `lea [rip+..]`×2 removed → ~15→~11-12 instr/iter; the two removed
+`lea`/iter are a genuine UOP reduction (converts monotonically on the #98
+determinism base, per #94/#100 — unlike instruction-repositioning).
+
 ## 4. Safety
 
 * Flag-OFF BYTE-IDENTICAL: objdiff 213/213, kobjdiff 0 — the analysis runs only
