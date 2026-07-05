@@ -318,6 +318,48 @@ user_pref("browser.startup.page", 0);
 PREFS
 echo "[stage-ff] seeded throwaway profile ($PROFILE) + /run + /tmp"
 
+# --- 8b. baked-in native-Wayland launcher (/ff-launch.sh) --------------
+# One short serial line launches Firefox as a native wl client once the
+# live-root is up:  spawn linux { /bin/sh /ff-launch.sh }
+# All env is baked here (no 900-char inline string — hamsh's line editor
+# caps command length). A spawn-linux child's stdout reaches the serial
+# console, so we merge Firefox stderr (2>&1) through a line-buffered read
+# loop that prefixes [FF]: GDK/GLib warnings + assertions then land on the
+# serial log (Firefox's own stderr otherwise rides the DE-owned console).
+cat > "$ROOTFS/ff-launch.sh" <<'FFLAUNCH'
+#!/bin/sh
+# /ff-launch.sh — Firefox-as-native-Wayland-client launcher (see stage_firefox.sh).
+export XDG_RUNTIME_DIR=/run
+export WAYLAND_DISPLAY=wayland-0
+export MOZ_ENABLE_WAYLAND=1
+export MOZ_DISABLE_WAYLAND_PROXY=1
+export GDK_BACKEND=wayland
+export MOZ_DISABLE_CONTENT_SANDBOX=1
+export MOZ_DISABLE_GMP_SANDBOX=1
+export MOZ_DISABLE_RDD_SANDBOX=1
+export MOZ_SANDBOX=0
+export LIBGL_ALWAYS_SOFTWARE=1
+export MOZ_ACCELERATED=0
+export MOZ_WEBRENDER=1
+export MOZ_CRASHREPORTER_DISABLE=1
+export MOZ_LAYOUT_FRAME_RATE=10
+export HOME=/root
+export XDG_CONFIG_HOME=/run
+export XDG_CACHE_HOME=/root/.cache
+export G_SLICE=always-malloc
+export G_MESSAGES_DEBUG=all
+mkdir -p /root/.cache /root/.mozilla /run
+# drop any stale profile lock from a prior crashed run
+rm -f /root/.ff-profile/lock /root/.ff-profile/.parentlock 2>/dev/null
+echo "[FF] launching firefox-esr (native wayland)"
+/usr/lib/firefox-esr/firefox-esr \
+    -profile /root/.ff-profile -no-remote -new-instance 'about:blank' 2>&1 \
+    | while IFS= read -r line; do echo "[FF] $line"; done
+echo "[FF] firefox pipeline ended"
+FFLAUNCH
+chmod +x "$ROOTFS/ff-launch.sh"
+echo "[stage-ff] baked native-wayland launcher: /ff-launch.sh"
+
 echo "[stage-ff] DONE. rootfs now carries firefox-esr + GTK3 closure."
 echo "[stage-ff]   payload: $FF_DU under /usr/lib/firefox-esr"
 echo "[stage-ff]   verify:  readelf -d $ROOTFS/usr/lib/firefox-esr/libxul.so | grep NEEDED"
