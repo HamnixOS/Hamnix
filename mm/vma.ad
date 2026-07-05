@@ -77,6 +77,7 @@ from kernel.printk.printk import (
 from kernel.sched.core import (
     TaskStruct,
     task_vma_list_head, set_task_vma_list_head,
+    task_vma_list_head_raw, set_task_vma_list_head_raw,
     current_idx_get, task_pml4,
     spinlock_lock, spinlock_unlock, spinlock_trylock,
     current_task, task_fd_opened_path_ptr,
@@ -356,6 +357,7 @@ VMA_PT_ADDR_MASK: uint64 = 0x000FFFFFFFFFF000    # bits [51:12]: phys base
 VMA_LARGE_BASE:   uint64 = 0x200000000          # 8 GiB (above RAM + all user regions)
 VMA_LARGE_LIMIT:  uint64 = 0x3FFC00000          # just under 16 GiB (~8 GiB window)
 
+
 # PER-TASK bump pointer for the next free multi-chunk virtual window.
 # 4-MiB-aligned so every 4-MiB chunk install stays within one 1 GiB PDPT
 # entry (elf_install_user_mapping refuses a range crossing 1 GiB).
@@ -382,12 +384,71 @@ VMA_LARGE_LIMIT:  uint64 = 0x3FFC00000          # just under 16 GiB (~8 GiB wind
 NR_TASKS_VLN:      uint64 = 512
 vma_large_next_arr: Array[512, uint64]
 
+# ---------------------------------------------------------------------
+# Thread address-space sharing (CLONE_VM / rfork RFMEM) — mm ownership.
+# ---------------------------------------------------------------------
+#
+# A THREAD shares its creator's PML4 (page tables) but is a SEPARATE task
+# slot. Historically each slot carried its OWN VMA list, window cursor
+# (vma_large_next_arr), window free-list, interval tree and mm lock — so
+# two threads mmap()ing concurrently BOTH bumped their own cursor from
+# VMA_LARGE_BASE and installed OVERLAPPING windows into the shared PML4;
+# tearing one down then zapped the other's live leaf PTEs -> the
+# non-deterministic Firefox `is_demand=0 nchunks=1 leaf PTE=0` SIGSEGV in
+# ld.so (a thread reading a sibling-thread arena whose window a third
+# thread's munmap had just cleared). The reap-time vma_adopt merge only
+# fixed it AFTER a thread died, never during concurrent life.
+#
+# Fix: all VMA bookkeeping is keyed by the mm OWNER slot, shared across a
+# thread group. `vma_mm_group[slot]` holds (owner_slot + 1); 0 means "no
+# owner set -> self". A thread records its creator's owner at creation
+# (vma_set_mm_owner); every per-slot VMA accessor routes slot -> owner via
+# _vma_owner, so a whole thread group allocates from ONE cursor + ONE list
+# + ONE tree under ONE lock and can never collide. On owner death with a
+# live sibling, vma_adopt MIGRATES the raw owner-slot state to the heir and
+# repoints the group (see vma_adopt).
+vma_mm_group: Array[512, uint64]
+
+
+def _vma_owner(slot: uint64) -> uint64:
+    # Resolve `slot` to the slot that owns its mm side-state. 0 == unset
+    # (a process / non-thread) -> the slot owns its own mm.
+    o: uint64 = vma_mm_group[slot]
+    if o == 0:
+        return slot
+    return o - 1
+
+
+def vma_group_owner(slot: uint64) -> uint64:
+    # PUBLIC wrapper around _vma_owner (module-private) so kernel/sched/
+    # core.ad's task_vma_list_head accessor can route a thread slot to its
+    # mm-group owner. Same resolution: 0-link -> self.
+    return _vma_owner(slot)
+
+
+def vma_set_mm_owner(slot: uint64, creator: uint64):
+    # Record that `slot` (a freshly created thread) shares `creator`'s mm.
+    # Collapse the chain to the real owner so a thread-of-a-thread still
+    # points at the single group owner.
+    vma_mm_group[slot] = _vma_owner(creator) + 1
+
+
+def vma_reset_mm_owner(slot: uint64):
+    # Clear `slot`'s mm-owner link (task reap / slot reuse) so a recycled
+    # slot starts as its own owner again.
+    vma_mm_group[slot] = 0
+
 
 def _vma_large_next(slot: uint64) -> uint64:
-    v: uint64 = vma_large_next_arr[slot]
+    o: uint64 = _vma_owner(slot)
+    v: uint64 = vma_large_next_arr[o]
     if v == 0:
         return VMA_LARGE_BASE
     return v
+
+
+def _vma_ln_set(slot: uint64, v: uint64):
+    vma_large_next_arr[_vma_owner(slot)] = v
 
 # ---------------------------------------------------------------------
 # Windowed-VA RECLAIM free-list (per-task) — apt shared-object exhaustion
@@ -434,7 +495,7 @@ def _vma_win_free_reset(slot: uint64):
     # Drop the whole free-list for `slot` (execve / teardown). The window
     # VAs themselves are released by vma_clear's per-node free; this just
     # forgets the cached extents so a re-exec'd task starts clean.
-    base_i: uint64 = slot * VMA_WIN_FREE_PER_TASK
+    base_i: uint64 = _vma_owner(slot) * VMA_WIN_FREE_PER_TASK
     i: uint64 = 0
     while i < VMA_WIN_FREE_PER_TASK:
         g_vma_win_free_base[base_i + i] = 0
@@ -450,7 +511,7 @@ def _vma_win_free_push(slot: uint64, base: uint64, size: uint64):
     # the monotonic bump pointer still backstops fresh allocations.
     if base < VMA_LARGE_BASE or size == 0:
         return
-    base_i: uint64 = slot * VMA_WIN_FREE_PER_TASK
+    base_i: uint64 = _vma_owner(slot) * VMA_WIN_FREE_PER_TASK
     end: uint64 = base + size
     # Dedup pass: never record a window VA that already sits (wholly or
     # partly) inside an existing free extent — a double-push (two munmaps
@@ -471,7 +532,7 @@ def _vma_win_free_push(slot: uint64, base: uint64, size: uint64):
     # allocation — the common LIFO unmap pattern (glibc maps then frees its
     # top arena/DSO).
     if end == _vma_large_next(slot):
-        vma_large_next_arr[slot] = base
+        _vma_ln_set(slot, base)
         # The roll-back may now make the PREVIOUS free-list tail extent
         # contiguous with the global pointer too; sweep once to pull any
         # such cached extents back into the counter.
@@ -484,7 +545,7 @@ def _vma_win_free_push(slot: uint64, base: uint64, size: uint64):
                 if kb != 0:
                     ke: uint64 = kb + g_vma_win_free_size[base_i + k]
                     if ke == _vma_large_next(slot):
-                        vma_large_next_arr[slot] = kb
+                        _vma_ln_set(slot, kb)
                         g_vma_win_free_base[base_i + k] = 0
                         g_vma_win_free_size[base_i + k] = 0
                         progress = 1
@@ -522,7 +583,7 @@ def _vma_win_free_pop(slot: uint64, window: uint64) -> uint64:
     # carve `window` off its FRONT, reinsert the remainder, and return the
     # carved base. Returns 0 if no extent is large enough (caller then
     # bumps vma_large_next).
-    base_i: uint64 = slot * VMA_WIN_FREE_PER_TASK
+    base_i: uint64 = _vma_owner(slot) * VMA_WIN_FREE_PER_TASK
     i: uint64 = 0
     while i < VMA_WIN_FREE_PER_TASK:
         eb: uint64 = g_vma_win_free_base[base_i + i]
@@ -550,7 +611,7 @@ def _vma_win_alloc(slot: uint64, window: uint64) -> uint64:
     base: uint64 = _vma_large_next(slot)
     if base + window > VMA_LARGE_LIMIT:
         return 0
-    vma_large_next_arr[slot] = base + window
+    _vma_ln_set(slot, base + window)
     return base
 
 
@@ -626,7 +687,7 @@ def vma_set_mmap_base(slot: uint64, slide: uint64):
     s: uint64 = slide & ~(VMA_MMAP_ALIGN - 1)
     if s > VMA_MMAP_ASLR_SLIDE_MAX:
         s = VMA_MMAP_ASLR_SLIDE_MAX
-    vma_large_next_arr[slot] = VMA_LARGE_BASE + s
+    _vma_ln_set(slot, VMA_LARGE_BASE + s)
 
 # Memory-leak accounting: live VmaNode count. Incremented in
 # _vma_node_new, decremented in _vma_node_free. A spawn/reap cycle
@@ -679,11 +740,11 @@ _vt_insert_depth: uint64
 
 
 def _vma_tree_root(slot: uint64) -> uint64:
-    return vma_tree_root[slot]
+    return vma_tree_root[_vma_owner(slot)]
 
 
 def _vma_set_tree_root(slot: uint64, r: uint64):
-    vma_tree_root[slot] = r
+    vma_tree_root[_vma_owner(slot)] = r
 
 
 def vma_mm_write_lock(slot: uint64):
@@ -700,30 +761,41 @@ def vma_mm_write_lock(slot: uint64):
     # dpkg's tiny mmap closure never did.)
     #
     # RECURSIVE: vma_mremap nests vma_alloc / _vma_carve_range, both of
-    # which now take this lock. Re-acquisition by the OWNING CPU just bumps
+    # which now take this lock. Re-acquisition by the OWNING TASK just bumps
     # a depth counter instead of self-deadlocking on the raw spinlock. It
     # does NOT bump the seqcount, so it stays neutral w.r.t. the per-mutation
     # seq bumps the tree helpers do. Paired with vma_mm_write_unlock.
-    cpu1: uint64 = get_cpu_id() + 1
-    if vma_mm_owner[slot] == cpu1 and vma_mm_depth[slot] > 0:
-        vma_mm_depth[slot] = vma_mm_depth[slot] + 1
+    #
+    # The re-entrancy token is the CURRENT TASK slot, NOT the CPU id. Two
+    # THREADS of one shared mm can run on the SAME CPU (one preempting the
+    # other mid-critical-section); a CPU-keyed token would let the preemptor
+    # FALSELY re-enter the held lock and mutate the shared cursor/tree
+    # concurrently -> the Firefox windowed-mmap corruption. A task-keyed
+    # token also survives the holder migrating to another CPU mid-section
+    # (its own nested re-acquire still matches). A DIFFERENT task on the same
+    # CPU never matches and correctly spins on the raw spinlock.
+    o: uint64 = _vma_owner(slot)
+    tok: uint64 = current_idx_get() + 1
+    if vma_mm_owner[o] == tok and vma_mm_depth[o] > 0:
+        vma_mm_depth[o] = vma_mm_depth[o] + 1
         return
-    spinlock_lock(&vma_mm_lock[slot])
-    vma_mm_owner[slot] = cpu1
-    vma_mm_depth[slot] = 1
+    spinlock_lock(&vma_mm_lock[o])
+    vma_mm_owner[o] = tok
+    vma_mm_depth[o] = 1
 
 
 def vma_mm_write_unlock(slot: uint64):
-    if vma_mm_depth[slot] > 1:
-        vma_mm_depth[slot] = vma_mm_depth[slot] - 1
+    o: uint64 = _vma_owner(slot)
+    if vma_mm_depth[o] > 1:
+        vma_mm_depth[o] = vma_mm_depth[o] - 1
         return
-    vma_mm_depth[slot] = 0
-    vma_mm_owner[slot] = 0
-    spinlock_unlock(&vma_mm_lock[slot])
+    vma_mm_depth[o] = 0
+    vma_mm_owner[o] = 0
+    spinlock_unlock(&vma_mm_lock[o])
 
 
 def vma_mm_seq_read(slot: uint64) -> uint64:
-    return vma_mm_seq[slot]
+    return vma_mm_seq[_vma_owner(slot)]
 
 
 def _vma_mm_seq_bump(slot: uint64):
@@ -733,7 +805,8 @@ def _vma_mm_seq_bump(slot: uint64):
     # insert): the lockless fault reader only checks the value for
     # INEQUALITY across its lookup window, so any forward motion forces it
     # onto the write-lock fallback.
-    vma_mm_seq[slot] = vma_mm_seq[slot] + 1
+    o: uint64 = _vma_owner(slot)
+    vma_mm_seq[o] = vma_mm_seq[o] + 1
 
 
 # ---------------------------------------------------------------------
@@ -3651,6 +3724,23 @@ def _vma_drop_overlapping_aliases(slot: uint64, lo: uint64, hi: uint64,
 def vma_alloc(slot: uint64, addr_in: uint64, len_in: uint64,
               prot: int32, flags: int32, file_fd: int32,
               file_offset: uint64) -> int64:
+    # Thread address-space serialization: hold the mm-group WRITE lock
+    # across the WHOLE reserve->install->insert (or carve->release)
+    # mutation so two threads of one CLONE_VM address space can never race
+    # the shared window cursor / free-list / interval tree and hand out
+    # OVERLAPPING window VAs into the shared PML4 (the Firefox eager
+    # PTE=0 SIGSEGV). Recursive: inner tree/carve helpers re-acquire on the
+    # same logical CPU. A process (no thread group) still takes its own
+    # per-mm lock cheaply.
+    vma_mm_write_lock(slot)
+    _lr: int64 = _vma_alloc_locked(slot, addr_in, len_in, prot, flags, file_fd, file_offset)
+    vma_mm_write_unlock(slot)
+    return _lr
+
+
+def _vma_alloc_locked(slot: uint64, addr_in: uint64, len_in: uint64,
+              prot: int32, flags: int32, file_fd: int32,
+              file_offset: uint64) -> int64:
     # Allocate a fresh VMA + its backing pages, splice it into the
     # task's vma_list, and return the resolved start address (cast
     # to int64 so the caller can return it through the syscall ABI).
@@ -3787,6 +3877,21 @@ def vma_alloc(slot: uint64, addr_in: uint64, len_in: uint64,
 
 
 def vma_unmap(slot: uint64, addr: uint64, len_in: uint64) -> int64:
+    # Thread address-space serialization: hold the mm-group WRITE lock
+    # across the WHOLE reserve->install->insert (or carve->release)
+    # mutation so two threads of one CLONE_VM address space can never race
+    # the shared window cursor / free-list / interval tree and hand out
+    # OVERLAPPING window VAs into the shared PML4 (the Firefox eager
+    # PTE=0 SIGSEGV). Recursive: inner tree/carve helpers re-acquire on the
+    # same logical CPU. A process (no thread group) still takes its own
+    # per-mm lock cheaply.
+    vma_mm_write_lock(slot)
+    _lr: int64 = _vma_unmap_locked(slot, addr, len_in)
+    vma_mm_write_unlock(slot)
+    return _lr
+
+
+def _vma_unmap_locked(slot: uint64, addr: uint64, len_in: uint64) -> int64:
     if len_in == 0:
         return cast[int64](-22)
     # §mseal: munmap of a sealed range is rejected -EPERM (the mapping must
@@ -3841,6 +3946,22 @@ def vma_mark_foreign(slot: uint64, vaddr: uint64) -> int32:
 # eager allocation via vma_alloc.
 
 def vma_alloc_demand(slot: uint64, addr_in: uint64, len_in: uint64,
+                     prot: int32, flags: int32) -> int64:
+    # Thread address-space serialization: hold the mm-group WRITE lock
+    # across the WHOLE reserve->install->insert (or carve->release)
+    # mutation so two threads of one CLONE_VM address space can never race
+    # the shared window cursor / free-list / interval tree and hand out
+    # OVERLAPPING window VAs into the shared PML4 (the Firefox eager
+    # PTE=0 SIGSEGV). Recursive: inner tree/carve helpers re-acquire on the
+    # same logical CPU. A process (no thread group) still takes its own
+    # per-mm lock cheaply.
+    vma_mm_write_lock(slot)
+    _lr: int64 = _vma_alloc_demand_locked(slot, addr_in, len_in, prot, flags)
+    vma_mm_write_unlock(slot)
+    return _lr
+
+
+def _vma_alloc_demand_locked(slot: uint64, addr_in: uint64, len_in: uint64,
                      prot: int32, flags: int32) -> int64:
     if len_in == 0:
         return cast[int64](-22)
@@ -3989,6 +4110,22 @@ def vma_register_bss_demand(slot: uint64, pml4_phys: uint64,
 # Returns the resolved base (>= 0) on success, or a negative Linux errno.
 
 def vma_alloc_huge_demand(slot: uint64, addr_in: uint64, len_in: uint64,
+                          prot: int32, flags: int32) -> int64:
+    # Thread address-space serialization: hold the mm-group WRITE lock
+    # across the WHOLE reserve->install->insert (or carve->release)
+    # mutation so two threads of one CLONE_VM address space can never race
+    # the shared window cursor / free-list / interval tree and hand out
+    # OVERLAPPING window VAs into the shared PML4 (the Firefox eager
+    # PTE=0 SIGSEGV). Recursive: inner tree/carve helpers re-acquire on the
+    # same logical CPU. A process (no thread group) still takes its own
+    # per-mm lock cheaply.
+    vma_mm_write_lock(slot)
+    _lr: int64 = _vma_alloc_huge_demand_locked(slot, addr_in, len_in, prot, flags)
+    vma_mm_write_unlock(slot)
+    return _lr
+
+
+def _vma_alloc_huge_demand_locked(slot: uint64, addr_in: uint64, len_in: uint64,
                           prot: int32, flags: int32) -> int64:
     if len_in == 0:
         return cast[int64](-22)
@@ -4336,6 +4473,25 @@ def vma_alloc_file_demand(slot: uint64, addr_in: uint64, len_in: uint64,
                           file_marker: int32, file_backing: uint64,
                           file_size: uint64,
                           file_offset: uint64) -> int64:
+    # Thread address-space serialization: hold the mm-group WRITE lock
+    # across the WHOLE reserve->install->insert (or carve->release)
+    # mutation so two threads of one CLONE_VM address space can never race
+    # the shared window cursor / free-list / interval tree and hand out
+    # OVERLAPPING window VAs into the shared PML4 (the Firefox eager
+    # PTE=0 SIGSEGV). Recursive: inner tree/carve helpers re-acquire on the
+    # same logical CPU. A process (no thread group) still takes its own
+    # per-mm lock cheaply.
+    vma_mm_write_lock(slot)
+    _lr: int64 = _vma_alloc_file_demand_locked(slot, addr_in, len_in, prot, flags, file_marker, file_backing, file_size, file_offset)
+    vma_mm_write_unlock(slot)
+    return _lr
+
+
+def _vma_alloc_file_demand_locked(slot: uint64, addr_in: uint64, len_in: uint64,
+                          prot: int32, flags: int32,
+                          file_marker: int32, file_backing: uint64,
+                          file_size: uint64,
+                          file_offset: uint64) -> int64:
     # Read-only / MAP_PRIVATE file-backed mapping (the default). Delegates
     # to the shared-aware core with is_shared=0 so faulted pages stay
     # private copies and nothing is ever written back.
@@ -4345,6 +4501,25 @@ def vma_alloc_file_demand(slot: uint64, addr_in: uint64, len_in: uint64,
 
 
 def vma_alloc_file_shared(slot: uint64, addr_in: uint64, len_in: uint64,
+                          prot: int32, flags: int32,
+                          file_marker: int32, file_backing: uint64,
+                          file_size: uint64,
+                          file_offset: uint64) -> int64:
+    # Thread address-space serialization: hold the mm-group WRITE lock
+    # across the WHOLE reserve->install->insert (or carve->release)
+    # mutation so two threads of one CLONE_VM address space can never race
+    # the shared window cursor / free-list / interval tree and hand out
+    # OVERLAPPING window VAs into the shared PML4 (the Firefox eager
+    # PTE=0 SIGSEGV). Recursive: inner tree/carve helpers re-acquire on the
+    # same logical CPU. A process (no thread group) still takes its own
+    # per-mm lock cheaply.
+    vma_mm_write_lock(slot)
+    _lr: int64 = _vma_alloc_file_shared_locked(slot, addr_in, len_in, prot, flags, file_marker, file_backing, file_size, file_offset)
+    vma_mm_write_unlock(slot)
+    return _lr
+
+
+def _vma_alloc_file_shared_locked(slot: uint64, addr_in: uint64, len_in: uint64,
                           prot: int32, flags: int32,
                           file_marker: int32, file_backing: uint64,
                           file_size: uint64,
@@ -5189,6 +5364,22 @@ VMA_PROT_W: int32 = 0x2          # PROT_WRITE — mirror linux PROT_*
 
 def vma_protect(slot: uint64, addr: uint64, len_in: uint64,
                 prot: int32) -> int64:
+    # Thread address-space serialization: hold the mm-group WRITE lock
+    # across the WHOLE reserve->install->insert (or carve->release)
+    # mutation so two threads of one CLONE_VM address space can never race
+    # the shared window cursor / free-list / interval tree and hand out
+    # OVERLAPPING window VAs into the shared PML4 (the Firefox eager
+    # PTE=0 SIGSEGV). Recursive: inner tree/carve helpers re-acquire on the
+    # same logical CPU. A process (no thread group) still takes its own
+    # per-mm lock cheaply.
+    vma_mm_write_lock(slot)
+    _lr: int64 = _vma_protect_locked(slot, addr, len_in, prot)
+    vma_mm_write_unlock(slot)
+    return _lr
+
+
+def _vma_protect_locked(slot: uint64, addr: uint64, len_in: uint64,
+                prot: int32) -> int64:
     # §1: honest mprotect over an ARBITRARY range.
     #
     #   1. Re-walk the page table over [addr, addr+len) and update
@@ -5380,6 +5571,23 @@ def _vma_grow_in_place(slot: uint64, node: uint64, old_end: uint64,
 def vma_mremap(slot: uint64, old_addr: uint64, old_len_in: uint64,
                new_len_in: uint64, flags: uint64,
                new_addr: uint64) -> int64:
+    # Thread address-space serialization: hold the mm-group WRITE lock
+    # across the WHOLE reserve->install->insert (or carve->release)
+    # mutation so two threads of one CLONE_VM address space can never race
+    # the shared window cursor / free-list / interval tree and hand out
+    # OVERLAPPING window VAs into the shared PML4 (the Firefox eager
+    # PTE=0 SIGSEGV). Recursive: inner tree/carve helpers re-acquire on the
+    # same logical CPU. A process (no thread group) still takes its own
+    # per-mm lock cheaply.
+    vma_mm_write_lock(slot)
+    _lr: int64 = _vma_mremap_locked(slot, old_addr, old_len_in, new_len_in, flags, new_addr)
+    vma_mm_write_unlock(slot)
+    return _lr
+
+
+def _vma_mremap_locked(slot: uint64, old_addr: uint64, old_len_in: uint64,
+               new_len_in: uint64, flags: uint64,
+               new_addr: uint64) -> int64:
     # Linux mremap(2). Returns the resolved base address on success
     # (cast to int64 so the ABI shim can return it directly), or a
     # negative Linux errno.
@@ -5527,6 +5735,22 @@ MADV_REMOVE:   int32 = 9
 
 def vma_madvise(slot: uint64, addr: uint64, len_in: uint64,
                 advice: int32) -> int64:
+    # Thread address-space serialization: hold the mm-group WRITE lock
+    # across the WHOLE reserve->install->insert (or carve->release)
+    # mutation so two threads of one CLONE_VM address space can never race
+    # the shared window cursor / free-list / interval tree and hand out
+    # OVERLAPPING window VAs into the shared PML4 (the Firefox eager
+    # PTE=0 SIGSEGV). Recursive: inner tree/carve helpers re-acquire on the
+    # same logical CPU. A process (no thread group) still takes its own
+    # per-mm lock cheaply.
+    vma_mm_write_lock(slot)
+    _lr: int64 = _vma_madvise_locked(slot, addr, len_in, advice)
+    vma_mm_write_unlock(slot)
+    return _lr
+
+
+def _vma_madvise_locked(slot: uint64, addr: uint64, len_in: uint64,
+                advice: int32) -> int64:
     # §1: madvise. Most advice values are hints with no backing
     # readahead / swap state for Hamnix to act on — accepted as a
     # no-op (return 0, never -EINVAL, so glibc's malloc-trim path
@@ -5591,6 +5815,16 @@ def vma_clear(slot: uint64):
     # is handed the task's PML4 to walk its page table — a still-shared
     # page (mapped COW in a forked relative) is left for that holder
     # instead of being freed out from under it.
+    #
+    # Thread address-space sharing guard: a NON-owner thread (mm-group link
+    # set) shares the mm with a still-live owner. Its VMAs live in the
+    # OWNER's shared list, torn down when the OWNER (or the last surviving
+    # heir) reaps. Clearing here would translate to the owner's list and
+    # free the WHOLE live address space out from under the running process.
+    # do_execve resets the group to self BEFORE calling vma_clear, so a
+    # genuine address-space replacement is never blocked by this guard.
+    if vma_mm_group[slot] != 0:
+        return
     pml4: uint64 = task_pml4(cast[int32](slot))
     # Detach the whole tree + list FIRST under the mm write lock, BEFORE
     # freeing any node, so a concurrent lockless fault reader (another live
@@ -5615,56 +5849,102 @@ def vma_clear(slot: uint64):
 
 
 def vma_adopt(from_slot: uint64, to_slot: uint64):
-    # Shared-address-space reap support (task_reap's CLONE_VM / rfork-
-    # RFMEM thread-group guard): re-home every VMA node `from_slot`
-    # holds onto `to_slot`'s list, so the LAST member of a thread group
-    # to be reaped tears the shared mappings down exactly once. The
-    # nodes describe ranges in the SHARED PML4 both slots point at, so
-    # this is pure bookkeeping — no page-table or frame writes.
-    fh: uint64 = task_vma_list_head(from_slot)
-    if fh == 0:
+    # Shared-address-space reap support (task_reap's CLONE_VM / rfork-RFMEM
+    # thread-group guard). With mm-group ownership (see _vma_owner) the
+    # WHOLE thread group already shares ONE VMA list/tree/cursor/free-list
+    # keyed by the OWNER slot, so:
+    #
+    #   * `from_slot` is a NON-owner thread being reaped -> its RAW slot
+    #     owns nothing (all its mmaps went to the shared owner's state via
+    #     the _vma_owner funnels). Every raw array below is empty -> this is
+    #     a pure no-op. The shared mm lives on in the owner slot.
+    #
+    #   * `from_slot` IS the mm owner dying while a sibling `to_slot` still
+    #     runs -> MIGRATE the raw owner-slot state (list head, interval
+    #     tree, window cursor, window free-list) to `to_slot`, then REPOINT
+    #     every group member (including to_slot) at the new owner so their
+    #     _vma_owner funnels follow. Nodes describe ranges in the SHARED
+    #     PML4 both slots point at — pure bookkeeping, no PT/frame writes.
+    #
+    # Uses the RAW list-head accessors: it must move state between LITERAL
+    # slots, not follow the owner indirection it is re-homing.
+    # A NON-owner thread (group link set) owns no raw state — every mmap it
+    # made went to the shared owner slot. Nothing to migrate; the real owner
+    # lives on (or migrates when IT reaps). Pure no-op.
+    if vma_mm_group[from_slot] != 0:
         return
-    th: uint64 = task_vma_list_head(to_slot)
-    if th != 0:
-        # Splice: walk from_slot's chain to its tail and hang
-        # to_slot's existing chain off it, then serve the combined
-        # list from from_slot's head.
+    fh: uint64 = task_vma_list_head_raw(from_slot)
+    fcur: uint64 = vma_large_next_arr[from_slot]
+    # Lock the FROM (current owner) mm across the migration so a concurrent
+    # fault reader on a sibling CPU retries via the seqcount rather than
+    # walking a half-moved tree.
+    vma_mm_write_lock(from_slot)
+    th: uint64 = task_vma_list_head_raw(to_slot)
+    if fh != 0 and th != 0:
         tail: uint64 = fh
         while _vma_node_get_next(tail) != 0:
             tail = _vma_node_get_next(tail)
         _vma_node_set_next(tail, th)
-    set_task_vma_list_head(to_slot, fh)
-    set_task_vma_list_head(from_slot, 0)
-    # Wave-3: rebuild to_slot's interval tree over the combined list and
-    # empty from_slot's. The splice above can leave the list out of sorted
-    # order (from's tail may start after to's head), so rebuild from
-    # scratch rather than merge — this is a one-shot teardown path. Held
-    # under both slots' mm write locks so a concurrent fault reader on
-    # either mm never walks a half-rebuilt tree.
-    # Lock both in a fixed (ascending-slot) order to avoid an A-B/B-A
-    # deadlock against another concurrent adopt.
-    _lo_slot: uint64 = from_slot
-    _hi_slot: uint64 = to_slot
-    if to_slot < from_slot:
-        _lo_slot = to_slot
-        _hi_slot = from_slot
-    vma_mm_write_lock(_lo_slot)
-    vma_mm_write_lock(_hi_slot)
-    _vma_set_tree_root(from_slot, 0)
-    _vma_set_tree_root(to_slot, 0)
-    rb: uint64 = fh
+    combined: uint64 = fh
+    if combined == 0:
+        combined = th
+    # Move the raw list head onto to_slot; empty from_slot.
+    set_task_vma_list_head_raw(to_slot, combined)
+    set_task_vma_list_head_raw(from_slot, 0)
+    # Move the window cursor (take the higher of the two so no VA is ever
+    # re-handed) and the window free-list from -> to.
+    if vma_large_next_arr[to_slot] < fcur:
+        vma_large_next_arr[to_slot] = fcur
+    vma_large_next_arr[from_slot] = 0
+    fbi: uint64 = from_slot * VMA_WIN_FREE_PER_TASK
+    tbi: uint64 = to_slot   * VMA_WIN_FREE_PER_TASK
+    fk: uint64 = 0
+    while fk < VMA_WIN_FREE_PER_TASK:
+        fb: uint64 = g_vma_win_free_base[fbi + fk]
+        if fb != 0:
+            # first-fit into an empty to_slot slot
+            tk: uint64 = 0
+            while tk < VMA_WIN_FREE_PER_TASK:
+                if g_vma_win_free_base[tbi + tk] == 0:
+                    g_vma_win_free_base[tbi + tk] = fb
+                    g_vma_win_free_size[tbi + tk] = g_vma_win_free_size[fbi + fk]
+                    tk = VMA_WIN_FREE_PER_TASK
+                else:
+                    tk = tk + 1
+            g_vma_win_free_base[fbi + fk] = 0
+            g_vma_win_free_size[fbi + fk] = 0
+        fk = fk + 1
+    # Rebuild to_slot's interval tree over the combined RAW list; empty
+    # from_slot's. Direct array access (not the _vma_owner funnel) — we are
+    # in the middle of moving ownership.
+    vma_tree_root[to_slot]   = 0
+    vma_tree_root[from_slot] = 0
+    rb: uint64 = combined
     while rb != 0:
         nxt_rb: uint64 = _vma_node_get_next(rb)
         cast[Ptr[VmaNode]](rb)[0].left = 0
         cast[Ptr[VmaNode]](rb)[0].right = 0
         cast[Ptr[VmaNode]](rb)[0].height = 0
-        r: uint64 = _vma_tree_root(to_slot)
-        _vma_set_tree_root(to_slot, _vt_insert_rec(r, rb))
+        vma_tree_root[to_slot] = _vt_insert_rec(vma_tree_root[to_slot], rb)
         rb = nxt_rb
-    _vma_mm_seq_bump(from_slot)
-    _vma_mm_seq_bump(to_slot)
-    vma_mm_write_unlock(_hi_slot)
-    vma_mm_write_unlock(_lo_slot)
+    vma_mm_seq[to_slot]   = vma_mm_seq[to_slot] + 1
+    vma_mm_seq[from_slot] = vma_mm_seq[from_slot] + 1
+    # REPOINT the thread group: every member whose owner resolved to
+    # from_slot (including from_slot itself and to_slot) now owns via
+    # to_slot. to_slot becomes a self-owner; from_slot is being reaped.
+    gk: uint64 = 0
+    while gk < 512:
+        if _vma_owner(gk) == from_slot:
+            vma_mm_group[gk] = to_slot + 1
+        gk = gk + 1
+    vma_mm_group[to_slot]   = 0
+    vma_mm_group[from_slot] = 0
+    # Release the lock we took on the OLD owner slot. After the repoint,
+    # vma_mm_write_unlock(from_slot) would resolve to to_slot — so unlock
+    # the raw from_slot lock state directly to avoid unlocking the wrong mm.
+    vma_mm_depth[from_slot] = 0
+    vma_mm_owner[from_slot] = 0
+    spinlock_unlock(&vma_mm_lock[from_slot])
 
 
 def vma_free_reserved_range(slot: uint64, vlo: uint64, vhi: uint64):
