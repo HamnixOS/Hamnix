@@ -283,6 +283,18 @@ opt_basehoist_count: uint32 = 0
 # registers (xmm dest + xmm scratches) instead of round-tripping every operand
 # through %rax + push/pop. Byte-inert OFF (opt_fpsel_count==0 with --opt off).
 opt_fpsel_count: uint32 = 0
+# FLOAT DIRECT-MOVSD firings (--opt, mandel float-consumer lever): each float64
+# leaf read and each float64 result store the float selector routes DIRECTLY
+# through movsd xmm<->frame-slot instead of the `mov %rax,slot`/`movq xmm,%rax`
+# GPR round-trip (which shares ports 0/5 with mulsd/addsd/ucomisd — the naive
+# xmm-promote regressed mandel this way). 0 with --opt OFF (byte-inert).
+opt_fpmov_count: uint32 = 0
+# FLOAT COMPARE->BRANCH firings (--opt, mandel float-consumer lever): each
+# float64 GT/GTE compare feeding a conditional branch whose two operands are
+# computed DIRECTLY into scratch xmm + `ucomisd` + a single NaN-correct `jcc`,
+# replacing the seed's boolean-materialize (ucomisd->seta->movzx->test->jz) with
+# its operand %rax/xmm0 round-trips. 0 with --opt OFF (byte-inert).
+opt_fpcmp_count: uint32 = 0
 
 
 def isel_enable():
@@ -299,6 +311,8 @@ def isel_reset_stats():
     opt_storeelim_count = 0
     opt_basehoist_count = 0
     opt_fpsel_count = 0
+    opt_fpmov_count = 0
+    opt_fpcmp_count = 0
 
 
 # -----------------------------------------------------------------------
@@ -3783,6 +3797,17 @@ def emit_ucomi(width: uint32):
     emit_b(0xC1)
 
 
+# ucomiss/ucomisd %xmm<rhs>, %xmm<lhs>  ([66] 0F 2E /r), flags = lhs vs rhs
+# (unsigned-style CF/ZF + PF-on-unordered). GENERAL over xmm0..7 encodings for
+# the float compare->branch selector. reg=lhs, rm=rhs. --opt-only.
+def emit_ucomi_xmm(width: uint32, lhs: uint32, rhs: uint32):
+    if width == 8:
+        emit_b(0x66)
+    emit_b(0x0F)
+    emit_b(0x2E)
+    emit_b(0xC0 | (lhs << 3) | rhs)
+
+
 # cvtsi2ss/sd %rax, %xmm0 -> F3/F2 48 0F 2A C0  (signed 64-bit int -> float).
 def emit_cvtsi2f(width: uint32):
     if width == 4:
@@ -3906,6 +3931,56 @@ def emit_sse_arith_xmm(op2: uint32, width: uint32, src: uint32, dst: uint32):
     emit_b(0x0F)
     emit_b(op2)
     emit_b(0xC0 | (dst << 3) | src)
+
+
+# movsd off(%rbp), %xmm<xn>   (load a float64 frame slot DIRECTLY into an xmm,
+# no %rax transit).  F2 0F 10 /r  with reg=xn, rm=%rbp+disp.  The rbp-mem modrm
+# base for reg=xn is 0x45 | (xn<<3) (mod=01 disp8; emit_rbp_mem promotes to
+# mod=10 disp32 as needed). Reachable ONLY under --opt via the float selector's
+# leaf tile; the default path never calls it (flag-off byte-identical).
+def emit_movsd_local_to_xmm(xn: uint32, off: int32):
+    emit_b(0xF2)
+    emit_b(0x0F)
+    emit_b(0x10)
+    emit_rbp_mem(0x45 | (xn << 3), off)
+
+
+# movsd %xmm<xn>, off(%rbp)   (store an xmm float64 DIRECTLY to a frame slot,
+# no %rax transit).  F2 0F 11 /r  with reg=xn, rm=%rbp+disp.  Same modrm scheme
+# as the load. --opt-only (float selector store tile); flag-off never emits it.
+def emit_movsd_xmm_to_local(xn: uint32, off: int32):
+    emit_b(0xF2)
+    emit_b(0x0F)
+    emit_b(0x11)
+    emit_rbp_mem(0x45 | (xn << 3), off)
+
+
+# movq %<gpr enc>, %xmm<xn>   (a GPR-promoted float64 local's bits DIRECTLY into
+# an xmm, no %rax hop).  66 [REX.W|.B] 0F 6E /r  reg=xn(0..7), rm=enc&7. REX.B
+# when enc>=8 extends r/m to r8..r15. --opt-only (float selector reg-home leaf).
+def emit_movq_gpr_to_xmm(xn: uint32, enc: uint32):
+    emit_b(0x66)
+    rex: uint32 = 0x48
+    if enc >= 8:
+        rex = rex | 0x01
+    emit_b(rex)
+    emit_b(0x0F)
+    emit_b(0x6E)
+    emit_b(0xC0 | (xn << 3) | (enc & 7))
+
+
+# movq %xmm<xn>, %<gpr enc>   (an xmm float64 result DIRECTLY into a GPR-promoted
+# local's register home, no %rax hop).  66 [REX.W|.B] 0F 7E /r  reg=xn, rm=enc&7.
+# --opt-only (float selector reg-home store tile); flag-off never emits it.
+def emit_movq_xmm_to_gpr(xn: uint32, enc: uint32):
+    emit_b(0x66)
+    rex: uint32 = 0x48
+    if enc >= 8:
+        rex = rex | 0x01
+    emit_b(rex)
+    emit_b(0x0F)
+    emit_b(0x7E)
+    emit_b(0xC0 | (xn << 3) | (enc & 7))
 
 
 # =======================================================================
@@ -5849,6 +5924,31 @@ def fp_tree_all_w8(v: uint32) -> uint32:
     return fp_tree_all_w8(ir_b[v])
 
 
+# If AST `node` is a DIRECT read of a plain float64 local, return 1 and write
+# its %rbp slot offset to out_off; else 0. This is the leaf class the float
+# selector can read straight into an xmm without the seed's `... -> %rax ; movq
+# %rax,%xmm` GPR transit: a slot-home local via `movsd off(%rbp),%xmm`, a GPR-
+# promoted local via `movq %gpr,%xmm`. A float64 leaf's seed conversion
+# (emit_operand_to_float(8,8)) is a no-op, so both are value-identical. Excludes:
+# `self`, float32 (needs cvtss2sd), non-locals, sub-8 sizes. The GPR/slot choice
+# is made by the caller via ra_reg_for_name (returns the reg, or RA_NONE=slot).
+def fp_leaf_f64_local_off(node: uint32, out_off: Ptr[int32]) -> int32:
+    if nd_kind[node] != ND_IDENT:
+        return 0
+    if is_self_ident(node) != 0:
+        return 0
+    if lookup_local_float(nd_name_off[node], nd_name_len[node]) != 8:
+        return 0
+    lsz: uint32 = lookup_local_scalar_size(nd_name_off[node], nd_name_len[node])
+    if lsz != 0 and lsz != 8:
+        return 0
+    off: int32 = 0
+    if lookup_local(nd_name_off[node], nd_name_len[node], &off) == 0:
+        return 0
+    out_off[0] = off
+    return 1
+
+
 # Compute float IR value `v` into xmm register `xdst` (encoding 2..7), leaving
 # its float64 value there. A leaf is emitted by gen_expr (raw bits -> %rax),
 # converted to width 8, then moved into xdst. A binop computes its right operand
@@ -5856,6 +5956,18 @@ def fp_tree_all_w8(v: uint32) -> uint32:
 # `xdst = xdst OP scratch`. Must run inside ir_emit_enter/leave.
 def sel_fp_expr_into_xmm(v: uint32, xdst: uint32):
     if ir_kind[v] != IR_BINOP:
+        # Leaf-read tile: a direct float64-local read lands straight in xdst
+        # (no `... -> %rax ; movq %rax,%xmm` GPR round-trip). A GPR-promoted
+        # local reads `movq %gpr,%xmm`; a slot-home local reads `movsd slot,%xmm`.
+        loff: int32 = 0
+        if fp_leaf_f64_local_off(ir_ast[v], &loff) != 0:
+            lrenc: uint32 = ra_reg_for_name(nd_name_off[ir_ast[v]], nd_name_len[ir_ast[v]])
+            if lrenc != RA_NONE:
+                emit_movq_gpr_to_xmm(xdst, lrenc)
+            else:
+                emit_movsd_local_to_xmm(xdst, loff)
+            opt_fpmov_count = opt_fpmov_count + 1
+            return
         # Leaf: byte-identical to the seed's gen_expr for this AST node.
         gen_expr(ir_ast[v])
         emit_operand_to_float(expr_float_width(ir_ast[v]), 8)
@@ -5939,6 +6051,32 @@ def try_sel_fp_assign_name(woff: uint32, wlen: uint32, rhs: uint32) -> uint32:
     xdst: uint32 = fp_scratch_acquire()  # xmm2: holds the running tree value
     ir_emit_enter()
     sel_fp_expr_into_xmm(v, xdst)
+    # Store tile: the destination is a float64 local (fw==8) — write the result
+    # STRAIGHT from xdst, no `movq %xmm,%rax` + slot/reg store GPR round-trip.
+    # Mirrors store_to_named's lsz==0 path exactly (float64 locals carry
+    # scalar_size 0): GPR-promoted -> `movq %xmm,%gpr` register write-through,
+    # dropping the shadow slot store iff store-elim; slot-home -> `movsd
+    # %xmm,slot`. Same value/home writes as store_to_named, GPR-transit-free.
+    # A float64 whose slot carries a non-zero scalar_size (e.g. a param variant)
+    # is excluded so the fallback stays exactly store_to_named's other branch.
+    soff: int32 = 0
+    if fw == 8 and lookup_local_scalar_size(woff, wlen) == 0 and lookup_local(woff, wlen, &soff) != 0:
+        wenc: uint32 = ra_reg_for_name(woff, wlen)
+        if wenc != RA_NONE:
+            emit_movq_xmm_to_gpr(xdst, wenc)     # register write-through
+            if ra_store_elim_for_name(woff, wlen) != 0:
+                opt_storeelim_count = opt_storeelim_count + 1
+                opt_fpmov_count = opt_fpmov_count + 1
+                ir_emit_leave()
+                fp_scratch_release(xdst)
+                opt_fpsel_count = opt_fpsel_count + 1
+                return 1
+        emit_movsd_xmm_to_local(xdst, soff)      # shadow / sole slot store
+        opt_fpmov_count = opt_fpmov_count + 1
+        ir_emit_leave()
+        fp_scratch_release(xdst)
+        opt_fpsel_count = opt_fpsel_count + 1
+        return 1
     emit_movq_xmm_to_rax(xdst, 8)        # result bits -> %rax for the store
     ir_emit_leave()
     fp_scratch_release(xdst)
@@ -10745,6 +10883,86 @@ def gen_cmp_setup(node: uint32) -> uint32:
     return rel_jcc(op, l_sgn, r_sgn)
 
 
+# FLOAT COMPARE -> BRANCH selector (--opt float-consumer lever). For a float64
+# `a > b` / `a >= b` compare feeding a conditional branch, compute both operands
+# DIRECTLY into scratch xmm (leaf reads via movsd/movq, arith across xmm — the
+# float selector), then `ucomisd %rhs,%lhs` and let the caller emit a SINGLE
+# NaN-correct jcc. Returns the branch-if-TRUE jcc opcode (ja=0x87 / jae=0x83), or
+# 0 if not routable (caller falls back to the byte-identical boolean+test path).
+#
+# WHY ONLY GT/GTE: after ucomisd, an ordered `a>b` is `seta` (CF=0,ZF=0) and
+# `a>=b` is `setae` (CF=0); a NaN sets CF=1 so both correctly read FALSE with a
+# SINGLE `ja`/`jae` — no parity guard. LT/LTE/EQ/NEQ need the seed's setnp/setp
+# guard (two conditions), so they stay on the fallback path. The operand FLOAT
+# VALUES are bit-identical to the seed's gen_fp_binary (same ops, same SSE
+# rounding, same leaf bits), so ucomisd sees identical inputs -> identical flags
+# -> identical branch. Gated call-free (xmm scratch is caller-saved) + float64.
+def gen_fp_branch_cc(cond: uint32) -> uint32:
+    if ir_emit_is_enabled() == 0:
+        return 0
+    if ir_emit_in_progress() != 0:
+        return 0
+    if cond == 0:
+        return 0
+    if nd_kind[cond] != ND_BINARY:
+        return 0
+    op: uint32 = nd_aux[cond]
+    if op != BINOP_GT and op != BINOP_GTE:
+        return 0
+    la: uint32 = nd_a[cond]
+    rb: uint32 = nd_b[cond]
+    # Must be a FLOAT compare (the seed routes to SSE iff an operand is float),
+    # and the compare WIDTH must be float64 (ucomisd) — a float32 op falls back.
+    lw: uint32 = expr_float_width(la)
+    rw: uint32 = expr_float_width(rb)
+    if lw == 0 and rw == 0:
+        return 0
+    w: uint32 = lw
+    if rw > w:
+        w = rw
+    if w != 8:
+        return 0
+    # Call-free: every xmm is caller-saved, so a held operand could not survive a
+    # call; this also makes the right-then-left operand order side-effect-inert.
+    if subtree_has_call(la) != 0:
+        return 0
+    if subtree_has_call(rb) != 0:
+        return 0
+    ir_reset()
+    vr: uint32 = ir_lower_float_operand(rb)
+    if vr == 0:
+        return 0
+    vl: uint32 = ir_lower_float_operand(la)
+    if vl == 0:
+        return 0
+    # All-float64 arith (no xmm float-width conversion emitted).
+    if fp_tree_all_w8(vr) == 0:
+        return 0
+    if fp_tree_all_w8(vl) == 0:
+        return 0
+    # Scratch budget: hold the right value in one xmm while computing the left
+    # (its dest + its internal scratch). Peak = max(1+need(vr), 2+need(vl)) must
+    # fit the pool so fp_scratch_acquire never returns RA_NONE mid-emit.
+    if 1 + fp_tree_scratch_need(vr) > FP_SCRATCH_N:
+        return 0
+    if 2 + fp_tree_scratch_need(vl) > FP_SCRATCH_N:
+        return 0
+    fp_scratch_reset()
+    ir_emit_enter()
+    xr: uint32 = fp_scratch_acquire()    # right operand value (seed evals right first)
+    sel_fp_expr_into_xmm(vr, xr)
+    xl: uint32 = fp_scratch_acquire()    # left operand value
+    sel_fp_expr_into_xmm(vl, xl)
+    emit_ucomi_xmm(8, xl, xr)            # flags = left vs right (unsigned-style)
+    ir_emit_leave()
+    fp_scratch_release(xl)
+    fp_scratch_release(xr)
+    opt_fpcmp_count = opt_fpcmp_count + 1
+    if op == BINOP_GT:
+        return 0x87                       # ja  (above)  = ordered a > b
+    return 0x83                           # jae (above-or-equal) = ordered a >= b
+
+
 # Emit a FORWARD branch taken when `cond` is FALSE, returning the rel32-field
 # fixup the caller backpatches to the skip/exit target. Under the cmp+jcc lever
 # (cond is a direct integer comparison) this is `cmp; jcc(negated)`; otherwise
@@ -10753,6 +10971,9 @@ def gen_branch_if_false(cond: uint32) -> uint32:
     if cmpjcc_node_ok(cond) != 0:
         cc: uint32 = gen_cmp_setup(cond)
         return emit_jcc_fwd(jcc_negate(cc))
+    fcc: uint32 = gen_fp_branch_cc(cond)
+    if fcc != 0:
+        return emit_jcc_fwd(jcc_negate(fcc))
     gen_expr(cond)
     emit_test_rax_rax()
     return emit_jz_fwd()
@@ -10765,6 +10986,9 @@ def gen_branch_if_true(cond: uint32) -> uint32:
     if cmpjcc_node_ok(cond) != 0:
         cc: uint32 = gen_cmp_setup(cond)
         return emit_jcc_fwd(cc)
+    fcc: uint32 = gen_fp_branch_cc(cond)
+    if fcc != 0:
+        return emit_jcc_fwd(fcc)
     gen_expr(cond)
     emit_test_rax_rax()
     return emit_jnz_fwd()
@@ -10777,6 +11001,10 @@ def gen_branch_if_true_back(cond: uint32, target: uint32):
     if cmpjcc_node_ok(cond) != 0:
         cc: uint32 = gen_cmp_setup(cond)
         emit_jcc_back(cc, target)
+        return
+    fcc: uint32 = gen_fp_branch_cc(cond)
+    if fcc != 0:
+        emit_jcc_back(fcc, target)
         return
     gen_expr(cond)
     emit_test_rax_rax()

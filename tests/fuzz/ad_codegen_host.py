@@ -287,6 +287,8 @@ def run_dump(src_path: Path, timeout=30, opt=False) -> DumpResult:
                       ivsr=meta.get("IVSR", 0),
                       storeelim=meta.get("STOREELIM", 0),
                       fpsel=meta.get("FPSEL", 0),
+                      fpmov=meta.get("FPMOV", 0),
+                      fpcmp=meta.get("FPCMP", 0),
                       cmpjcc=meta.get("CMPJCC", 0))
 
 
@@ -599,6 +601,8 @@ class CodegenRun:
         self.ivsr = kw.get("ivsr", 0)
         self.storeelim = kw.get("storeelim", 0)
         self.fpsel = kw.get("fpsel", 0)
+        self.fpmov = kw.get("fpmov", 0)
+        self.fpcmp = kw.get("fpcmp", 0)
         self.cmpjcc = kw.get("cmpjcc", 0)
 
 
@@ -655,6 +659,8 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
     ivsr = getattr(dump, "ivsr", 0)
     storeelim = getattr(dump, "storeelim", 0)
     fpsel = getattr(dump, "fpsel", 0)
+    fpmov = getattr(dump, "fpmov", 0)
+    fpcmp = getattr(dump, "fpcmp", 0)
     cmpjcc = getattr(dump, "cmpjcc", 0)
     if rp.returncode < 0:
         return CodegenRun("runfail", detail=f"signal {-rp.returncode}",
@@ -665,7 +671,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                           idxsel=idxsel,
                           strengthred=strengthred, isel=isel, aluload=aluload,
                           basehoist=basehoist,
-                          ivsr=ivsr, storeelim=storeelim, fpsel=fpsel, cmpjcc=cmpjcc)
+                          ivsr=ivsr, storeelim=storeelim, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, cmpjcc=cmpjcc)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
                       folds=folds, ffold=ffold, cse=cse, loadcse=loadcse,
                       licm=licm, dce=dce,
@@ -675,7 +681,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False):
                       idxsel=idxsel,
                       strengthred=strengthred, isel=isel, aluload=aluload,
                       basehoist=basehoist,
-                      ivsr=ivsr, storeelim=storeelim, fpsel=fpsel, cmpjcc=cmpjcc)
+                      ivsr=ivsr, storeelim=storeelim, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, cmpjcc=cmpjcc)
 
 
 if __name__ == "__main__":
