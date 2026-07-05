@@ -172,17 +172,19 @@ send "mkdir /root/.mozilla"; sleep 1
 # =====================================================================
 # LAUNCH: firefox-esr as a native Wayland client.
 # =====================================================================
-# Env: MOZ_ENABLE_WAYLAND=1 forces the GTK Wayland backend (no Xwayland).
-# GDK_BACKEND=wayland belt-and-suspenders. Software render everywhere.
-# Sandbox OFF (needs unavailable seccomp/user-ns syscalls). Fresh throwaway
-# profile (staged prefs.js forces swgl software WebRender). -no-remote
-# -new-instance so it never tries to talk to a running instance. Single
-# 'about:blank' arg (single-quoted: hamsh lexes a glued ':' as part of the
-# word, but quote defensively). HOME=/root for the profile + caches.
-FF_ENV='export XDG_RUNTIME_DIR=/run ; export WAYLAND_DISPLAY=wayland-0 ; export MOZ_ENABLE_WAYLAND=1 ; export GDK_BACKEND=wayland ; export MOZ_DISABLE_CONTENT_SANDBOX=1 ; export MOZ_DISABLE_GMP_SANDBOX=1 ; export MOZ_SANDBOX=0 ; export MOZ_DISABLE_RDD_SANDBOX=1 ; export LIBGL_ALWAYS_SOFTWARE=1 ; export MOZ_ACCELERATED=0 ; export MOZ_WEBRENDER=1 ; export MOZ_CRASHREPORTER_DISABLE=1 ; export MOZ_LAYOUT_FRAME_RATE=10 ; export HOME=/root ; export XDG_CONFIG_HOME=/run ; export XDG_CACHE_HOME=/root/.cache ; export G_SLICE=always-malloc'
-FF_BIN='/usr/lib/firefox-esr/firefox-esr'
-FF_ARGS="-profile /root/.ff-profile -no-remote -new-instance 'about:blank'"
-FF_CMD="$FF_ENV ; spawn linux { $FF_BIN $FF_ARGS }"
+# LAUNCH VIA /ff-launch.sh (env baked into the script by stage_firefox.sh).
+#
+# HISTORY / WHY NOT INLINE ENV: a prior form set ~18 `export VAR=... ;` clauses
+# then `spawn linux { firefox-esr ... }` on ONE command line. That line exceeds
+# hamsh's interactive line-editor width; the readline buffer truncated it at the
+# terminal wrap column (~262) BEFORE the `spawn linux { ... }` clause, so
+# firefox NEVER launched — the harness then spun waiting for a registry marker
+# that could not appear. stage_firefox.sh bakes the identical MOZ_ENABLE_WAYLAND
+# / software-render / sandbox-off environment INTO /ff-launch.sh (which also
+# prefixes firefox's stderr with "[FF] " on the serial), so a SHORT command line
+# both fits the editor and carries the full environment. This is the launch the
+# repro brief specifies.
+FF_CMD="spawn linux { /bin/sh /ff-launch.sh }"
 
 # =====================================================================
 # LADDER RUNG (a): Firefox connects to the native Wayland server.
