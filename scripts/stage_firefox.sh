@@ -300,13 +300,36 @@ mkdir -p "$ROOTFS/run" "$ROOTFS/tmp"
 chmod 1777 "$ROOTFS/tmp" 2>/dev/null || true
 PROFILE="$ROOTFS/root/.ff-profile"
 mkdir -p "$PROFILE"
-cat > "$PROFILE/prefs.js" <<'PREFS'
-// Throwaway Firefox profile — software render, no accel, no first-run UI.
+# Both prefs.js (initial) AND user.js (durable — Firefox re-applies user.js
+# into prefs on every start, so it wins even after Firefox rewrites prefs.js).
+# The KEY prefs for the Hamnix wl_shm-only compositor (no EGL/GL/DMABuf/DRM):
+#   gfx.webrender.software              = true   -> SWGL CPU rasteriser
+#   gfx.webrender.software.opengl       = false  -> the SW-WR render thread
+#       PRESENTS its composited frame straight into a wl_shm buffer instead
+#       of creating an OpenGL/EGL RenderCompositor. WITHOUT this, software
+#       WebRender still opens a 2nd wl connection + an EGL GL context for the
+#       final present — and mesa/EGL is ABSENT here (no libEGL, no dri driver,
+#       only a dead libgbm), so that GL-present init NULL-derefs on the render
+#       thread (the window-blocking crash). false == pure shm path.
+#   gfx.webrender.compositor            = false  -> no native/EGL compositor
+#   gfx.x11-egl.force-disabled          = true   -> never probe EGL
+#   widget.dmabuf.force-enabled         = false  -> no DMABuf (needs DRM/GBM)
+#   media.ffmpeg.vaapi.enabled          = false  -> no VA-API dmabuf
+read -r -d '' FF_PREFS <<'PREFS' || true
+// Throwaway Firefox profile — PURE wl_shm software render (no EGL/GL/DMABuf).
 user_pref("gfx.webrender.software", true);
+user_pref("gfx.webrender.software.opengl", false);
 user_pref("gfx.webrender.force-disabled", false);
-user_pref("layers.acceleration.disabled", true);
-user_pref("webgl.disabled", true);
+user_pref("gfx.webrender.compositor", false);
+user_pref("gfx.webrender.compositor.force-enabled", false);
+user_pref("gfx.x11-egl.force-disabled", true);
+user_pref("widget.dmabuf.force-enabled", false);
+user_pref("widget.wayland.use-dmabuf", false);
+user_pref("media.ffmpeg.vaapi.enabled", false);
 user_pref("media.hardware-video-decoding.enabled", false);
+user_pref("layers.acceleration.disabled", true);
+user_pref("layers.gpu-process.enabled", false);
+user_pref("webgl.disabled", true);
 user_pref("browser.startup.homepage_override.mstone", "ignore");
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
@@ -316,7 +339,9 @@ user_pref("browser.tabs.remote.autostart", false);
 user_pref("dom.ipc.processCount", 1);
 user_pref("browser.startup.page", 0);
 PREFS
-echo "[stage-ff] seeded throwaway profile ($PROFILE) + /run + /tmp"
+printf '%s\n' "$FF_PREFS" > "$PROFILE/prefs.js"
+printf '%s\n' "$FF_PREFS" > "$PROFILE/user.js"
+echo "[stage-ff] seeded throwaway profile ($PROFILE, prefs.js+user.js) + /run + /tmp"
 
 # --- 8b. baked-in native-Wayland launcher (/ff-launch.sh) --------------
 # One short serial line launches Firefox as a native wl client once the
@@ -341,8 +366,20 @@ export MOZ_SANDBOX=0
 export LIBGL_ALWAYS_SOFTWARE=1
 export MOZ_ACCELERATED=0
 export MOZ_WEBRENDER=1
+# Force pure-software WebRender + present via wl_shm (NO EGL/GL/DMABuf). Our
+# compositor speaks wl_shm only (no libEGL/dri/DRM in the ns), so the SW-WR
+# render thread must NOT open an OpenGL RenderCompositor — env belt to the
+# user.js prefs (gfx.webrender.software.opengl=false).
+export MOZ_WEBRENDER_SOFTWARE=1
+export MOZ_X11_EGL=0
+export MOZ_DISABLE_DMABUF=1
+export MOZ_ALLOW_SOFTWARE_GL=1
 export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_LAYOUT_FRAME_RATE=10
+# gfx-path diagnostics: surface which RenderCompositor Firefox selects +
+# any DMABuf/EGL probe on the [FF] serial stream (bounded — one subsystem).
+export MOZ_LOG='WebRender:4,Dmabuf:4'
+export MOZ_LOG_FILE=/dev/stderr
 export HOME=/root
 export XDG_CONFIG_HOME=/run
 export XDG_CACHE_HOME=/root/.cache
