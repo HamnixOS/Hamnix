@@ -409,6 +409,15 @@ export MOZ_LOG_FILE=/dev/stderr
 export HOME=/root
 export XDG_CONFIG_HOME=/run
 export XDG_CACHE_HOME=/root/.cache
+# Fontconfig: point libfontconfig explicitly at the staged /etc/fonts config.
+# Without this, firefox's fontconfig cannot locate a default config file
+# ("Cannot load default config file: No such file: (null)") because its
+# compiled-in default path does not match the Hamnix distro layout and no
+# FONTCONFIG_* env is set -> font init fails and firefox exits before it
+# commits its first wl_shm frame. FONTCONFIG_FILE names the config directly;
+# FONTCONFIG_PATH is the dir fallback. Both are standard fontconfig overrides.
+export FONTCONFIG_FILE=/etc/fonts/fonts.conf
+export FONTCONFIG_PATH=/etc/fonts
 export G_SLICE=always-malloc
 export G_MESSAGES_DEBUG=all
 mkdir -p /root/.cache /root/.mozilla /run
