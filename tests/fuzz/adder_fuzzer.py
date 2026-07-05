@@ -3693,6 +3693,123 @@ def _licm_corpus():
          "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
          v)
 
+    # 6) STORE-CROSSING HOIST (the indexed-store LICM relaxation): an invariant
+    #    (a*b) accumulated into g_accum in a loop that ALSO does an indexed store
+    #    to a GLOBAL array. The store writes array memory, disjoint from the
+    #    scalar leaves a,b, and the function takes NO address, so (a*b) MUST still
+    #    hoist. Before the relaxation this loop's store forced a blanket giveup and
+    #    (a*b) was recomputed every iteration. Oracle ignores the array writes.
+    a, b, n = 6, 7, 9
+    v = 0
+    i = 0
+    while i < n:
+        v = (v + a * b) & M
+        i += 1
+    prog("store_crossing_hoist",
+         "lg_sc: Array[8, int64]\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: uint64 = cast[uint64]({a})\n"
+         f"    b: uint64 = cast[uint64]({b})\n"
+         f"    n: uint64 = cast[uint64]({n})\n"
+         "    i: uint64 = cast[uint64](0)\n"
+         "    while i < n:\n"
+         "        g_accum = g_accum + (a * b)\n"
+         "        lg_sc[cast[int64](i & cast[uint64](7))] = cast[int64](i)\n"
+         "        i = i + cast[uint64](1)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
+    # 7) NESTED STORE-CROSSING HOIST: mirrors the licm.ad benchmark. (a*b) is
+    #    invariant w.r.t. the INNER loop, which stores to a global array each
+    #    iteration. It must hoist to the inner pre-header (once per outer step),
+    #    not be recomputed on every inner step. Read-back of the array folds into
+    #    g_accum so a wrong store value would also diverge.
+    a, b, no, ni = 4, 5, 6, 5
+    gb = [0] * 8
+    for jo in range(no):
+        for ji in range(ni):
+            gb[ji & 7] = (a * b + ji) & M
+    v = 0
+    for kk in range(8):
+        v = (v + gb[kk]) & M
+    prog("nested_store_inner_hoist",
+         "lg_ns: Array[8, int64]\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: int64 = {a}\n"
+         f"    b: int64 = {b}\n"
+         "    jo: int64 = 0\n"
+         f"    while jo < {no}:\n"
+         "        ji: int64 = 0\n"
+         f"        while ji < {ni}:\n"
+         "            lg_ns[cast[int64](ji & 7)] = a * b + ji\n"
+         "            ji = ji + 1\n"
+         "        jo = jo + 1\n"
+         "    acc: int64 = 0\n"
+         "    k: int64 = 0\n"
+         "    while k < 8:\n"
+         "        acc = acc + lg_ns[cast[int64](k)]\n"
+         "        k = k + 1\n"
+         "    print_u64(cast[uint64](acc))\n"
+         "    return cast[int32](acc & 255)\n",
+         v)
+
+    # 8) CALL-CROSSING: a call inside the loop is an opaque side effect that keeps
+    #    the blanket giveup (the relaxation is ONLY for index/member/deref stores,
+    #    never for calls). (a*b) must NOT hoist here; the result must still be
+    #    correct. Adds 0 to the corpus hoist count.
+    a, b, n = 3, 11, 5
+    v = 0
+    i = 0
+    while i < n:
+        v = (v + (a * b + 1)) & M
+        i += 1
+    prog("call_crossing_no_hoist",
+         "def hlp_cc(x: uint64) -> uint64:\n"
+         "    return x + cast[uint64](1)\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: uint64 = cast[uint64]({a})\n"
+         f"    b: uint64 = cast[uint64]({b})\n"
+         f"    n: uint64 = cast[uint64]({n})\n"
+         "    i: uint64 = cast[uint64](0)\n"
+         "    while i < n:\n"
+         "        g_accum = g_accum + hlp_cc(a * b)\n"
+         "        i = i + cast[uint64](1)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
+    # 9) ADDRESS-TAKEN ALIAS (the soundness guard for the relaxation): x's address
+    #    is taken (p = &x) and the loop stores THROUGH p (an indexed store that
+    #    ALIASES the scalar x). (x*three) reads x. Because the function takes an
+    #    address, licm_fn_has_addr==1 keeps the conservative giveup, so (x*three)
+    #    is NOT hoisted and is recomputed each iteration reading the value the
+    #    store just wrote — CORRECT. If the relaxation were applied unconditionally
+    #    (dropping the address-of gate), (x*three) would be wrongly hoisted above
+    #    the aliasing store and read the stale initial x every iteration -> this
+    #    program's oracle catches that miscompile (the deliberate-break check).
+    x0, three, n = 5, 3, 4
+    v = 0
+    x = x0
+    i = 0
+    while i < n:
+        v = (v + x * three) & M
+        x = i                       # p[0] = i writes x (p aliases x)
+        i += 1
+    prog("addr_taken_alias_no_hoist",
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    x: uint64 = cast[uint64]({x0})\n"
+         f"    three: uint64 = cast[uint64]({three})\n"
+         "    p: Ptr[uint64] = &x\n"
+         "    i: uint64 = cast[uint64](0)\n"
+         f"    while i < cast[uint64]({n}):\n"
+         "        g_accum = g_accum + (x * three)\n"
+         "        p[cast[int64](0)] = i\n"
+         "        i = i + cast[uint64](1)\n"
+         "    print_u64(g_accum)\n"
+         "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
+         v)
+
     return progs
 
 
