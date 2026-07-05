@@ -3840,6 +3840,230 @@ def _run_licm_corpus():
 
 
 # --------------------------------------------------------------------------
+# COPY-COALESCE corpus (the LICM-boundary copy elimination). LICM leaves a
+# residual copy `t = __licm_tmp` in a loop body whose ONLY consumer is an
+# INDEXED/MEMBER store (`bucket[i] = bucket[i] + t + ...`). Phase-9 copy
+# propagation now forwards reads inside a call/addr-free indexed-store rvalue +
+# address BEFORE flushing, so `t` is forwarded to its unclobbered copy root and
+# the following DCE deletes the dead copy decl — the consumer then reads the
+# hoisted register DIRECTLY (0 per-iteration copies, lower register pressure).
+# This corpus is the SAFETY net for that forward: it must forward where legal
+# (want_fwd) and MUST NOT forward across a clobbered source / a call / an
+# aliasing pointer store (the "interfering coalesce = miscompile" cases whose
+# oracle catches a wrong forward).
+# --------------------------------------------------------------------------
+def _coalesce_corpus():
+    """Return a list of (name, body, expected_stdout, expected_exit, want_fwd)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, decls_and_main, val, want_fwd):
+        body = PRELUDE + "\n" + decls_and_main
+        progs.append((name, body, str(val & M), (val & 255), want_fwd))
+
+    # 1) THE LICM PATTERN (mirrors tests/bench/opt/licm.ad, small trip counts):
+    #    three inner-loop-invariant temps (a*a+b, a*3-7, a*a) whose ONLY consumer
+    #    is the indexed store into bucket[slot]. All three copies must forward and
+    #    the dead decls fall to DCE -> the accumulation reads the hoisted regs.
+    NB = 8
+    A, J = 6, 5
+    bucket = [0] * NB
+    for a in range(1, A + 1):
+        b = a + 13
+        for j in range(J):
+            t1 = (a * a + b) & M
+            t2 = (a * 3 - 7) & M
+            t3 = (a * a) & M
+            slot = j & (NB - 1)
+            bucket[slot] = (bucket[slot] + t1 + t2 + t3 + j) & M
+    v = 0
+    for kk in range(NB):
+        v = (v + bucket[kk]) & M
+    prog("licm_store_consumer",
+         f"cb1: Array[{NB}, int64]\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: int64 = 1\n"
+         f"    while a < {A + 1}:\n"
+         "        b: int64 = a + 13\n"
+         "        j: int64 = 0\n"
+         f"        while j < {J}:\n"
+         "            t1: int64 = a * a + b\n"
+         "            t2: int64 = a * 3 - 7\n"
+         "            t3: int64 = a * a\n"
+         f"            slot: int64 = j & {NB - 1}\n"
+         "            cb1[cast[int64](slot)] = (cb1[cast[int64](slot)] + t1 + t2 + t3 + j)\n"
+         "            j = j + 1\n"
+         "        a = a + 1\n"
+         "    acc: int64 = 0\n"
+         "    k: int64 = 0\n"
+         f"    while k < {NB}:\n"
+         "        acc = acc + cb1[cast[int64](k)]\n"
+         "        k = k + 1\n"
+         "    print_u64(cast[uint64](acc))\n"
+         "    return cast[int32](acc & 255)\n",
+         v, True)
+
+    # 2) HOISTED TEMP REUSED across TWO indexed stores in the same body: the copy
+    #    must forward into BOTH store rvalues.
+    NB = 8
+    A, J = 5, 4
+    ca = [0] * NB
+    cbb = [0] * NB
+    for a in range(1, A + 1):
+        for j in range(J):
+            inv = (a * a + 3) & M
+            s = j & (NB - 1)
+            ca[s] = (ca[s] + inv + j) & M
+            cbb[s] = (cbb[s] + inv) & M
+    v = 0
+    for kk in range(NB):
+        v = (v + ca[kk] + cbb[kk]) & M
+    prog("hoisted_reused_multistore",
+         f"c2a: Array[{NB}, int64]\n"
+         f"c2b: Array[{NB}, int64]\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: int64 = 1\n"
+         f"    while a < {A + 1}:\n"
+         "        j: int64 = 0\n"
+         f"        while j < {J}:\n"
+         "            inv: int64 = a * a + 3\n"
+         f"            s: int64 = j & {NB - 1}\n"
+         "            c2a[cast[int64](s)] = (c2a[cast[int64](s)] + inv + j)\n"
+         "            c2b[cast[int64](s)] = (c2b[cast[int64](s)] + inv)\n"
+         "            j = j + 1\n"
+         "        a = a + 1\n"
+         "    acc: int64 = 0\n"
+         "    k: int64 = 0\n"
+         f"    while k < {NB}:\n"
+         "        acc = acc + c2a[cast[int64](k)] + c2b[cast[int64](k)]\n"
+         "        k = k + 1\n"
+         "    print_u64(cast[uint64](acc))\n"
+         "    return cast[int32](acc & 255)\n",
+         v, True)
+
+    # 3) SOURCE CLOBBERED before the store (the interfering-coalesce guard): the
+    #    copy `t = s` is followed by a REASSIGNMENT of `s`, THEN an indexed store
+    #    reads `t`. A correct copy set KILLS the copy at the write to `s`, so `t`
+    #    is NOT forwarded and the store reads t's OLD value. If the forward wrongly
+    #    fired (source-write not killed), it would read the NEW `s` -> this oracle
+    #    (computed with the OLD value) catches the miscompile. want_fwd=False:
+    #    the FORWARD of THIS copy must not happen (it stays correct regardless).
+    NB = 8
+    A, J = 5, 4
+    cc = [0] * NB
+    for a in range(1, A + 1):
+        s = a * 2
+        for j in range(J):
+            t = s              # copy
+            s = s + j          # SOURCE clobbered after the copy
+            slot = j & (NB - 1)
+            cc[slot] = (cc[slot] + t) & M   # reads the OLD s (via t)
+    v = 0
+    for kk in range(NB):
+        v = (v + cc[kk]) & M
+    prog("src_clobber_no_forward",
+         f"c3: Array[{NB}, int64]\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: int64 = 1\n"
+         f"    while a < {A + 1}:\n"
+         "        s: int64 = a * 2\n"
+         "        j: int64 = 0\n"
+         f"        while j < {J}:\n"
+         "            t: int64 = s\n"
+         "            s = s + j\n"
+         f"            slot: int64 = j & {NB - 1}\n"
+         "            c3[cast[int64](slot)] = (c3[cast[int64](slot)] + t)\n"
+         "            j = j + 1\n"
+         "        a = a + 1\n"
+         "    acc: int64 = 0\n"
+         "    k: int64 = 0\n"
+         f"    while k < {NB}:\n"
+         "        acc = acc + c3[cast[int64](k)]\n"
+         "        k = k + 1\n"
+         "    print_u64(cast[uint64](acc))\n"
+         "    return cast[int32](acc & 255)\n",
+         v, False)
+
+    # 4) CALL inside the store rvalue: a barrier — the reads must NOT be forwarded
+    #    (a call could alias/clobber the source), and the result stays correct.
+    NB = 8
+    A, J = 5, 4
+    cd = [0] * NB
+    for a in range(1, A + 1):
+        for j in range(J):
+            inv = (a * a + 1) & M
+            slot = j & (NB - 1)
+            # helper hlp_id(x) = x + 1
+            cd[slot] = (cd[slot] + (inv + 1) + j) & M
+    v = 0
+    for kk in range(NB):
+        v = (v + cd[kk]) & M
+    prog("call_in_store_rhs_no_forward",
+         f"c4: Array[{NB}, int64]\n"
+         "def hlp_id(x: int64) -> int64:\n"
+         "    return x + 1\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    a: int64 = 1\n"
+         f"    while a < {A + 1}:\n"
+         "        j: int64 = 0\n"
+         f"        while j < {J}:\n"
+         "            inv: int64 = a * a + 1\n"
+         f"            slot: int64 = j & {NB - 1}\n"
+         "            c4[cast[int64](slot)] = (c4[cast[int64](slot)] + hlp_id(inv) + j)\n"
+         "            j = j + 1\n"
+         "        a = a + 1\n"
+         "    acc: int64 = 0\n"
+         "    k: int64 = 0\n"
+         f"    while k < {NB}:\n"
+         "        acc = acc + c4[cast[int64](k)]\n"
+         "        k = k + 1\n"
+         "    print_u64(cast[uint64](acc))\n"
+         "    return cast[int32](acc & 255)\n",
+         v, False)
+
+    return progs
+
+
+def _run_coalesce_corpus():
+    """Run the copy-coalesce corpus through codegen.ad --opt. Returns
+    (all_correct_and_fired, total_forwards). Asserts ON==OFF==oracle for every
+    program (a wrong forward = a miscompile the oracle catches) and that the
+    forward fired on the want_fwd shapes (copyprop increased + dead copies gone
+    via DCE), byte-inert OFF (copyprop_off == 0)."""
+    host = _ad_host()
+    total_fwd = 0
+    all_ok = True
+    for (name, body, exp_out, exp_exit, want_fwd) in _coalesce_corpus():
+        r_on = host.run_through_codegen_ad(f"coal_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"coal_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [coalesce corpus '{name}'] codegen.ad on={r_on.kind}/"
+                  f"off={r_off.kind}: {(r_on.detail or r_off.detail)[:120]}")
+            continue
+        cp_on = int(getattr(r_on, "copyprop", 0) or 0)
+        cp_off = int(getattr(r_off, "copyprop", 0) or 0)
+        total_fwd += cp_on
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [coalesce corpus '{name}'] MISCOMPILE opt=("
+                  f"{r_on.stdout},{r_on.exit}) oracle=({exp_out},{exp_exit})")
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [coalesce corpus '{name}'] OFF wrong=("
+                  f"{r_off.stdout},{r_off.exit}) oracle=({exp_out},{exp_exit})")
+        if cp_off != 0:
+            all_ok = False
+            print(f"  [coalesce corpus '{name}'] NOT byte-inert OFF "
+                  f"(copyprop={cp_off})")
+        if want_fwd and cp_on == 0:
+            all_ok = False
+            print(f"  [coalesce corpus '{name}'] forward never fired "
+                  f"(copyprop_on=0)")
+    return (all_ok, total_fwd)
+
+
+# --------------------------------------------------------------------------
 # Phase-5 IR-EMIT corpus. Hand-written programs whose hot expressions lower
 # FULLY into the value IR (ir_lower_pure_expr) — pure signedness-invariant
 # integer arithmetic over ident/const leaves — so codegen emits them by walking
@@ -6904,6 +7128,19 @@ def _run_ad_codegen_batch(base, args):
         if not licm_ok:
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] LICM corpus miscompiled or never fired")
+        # COPY-COALESCE corpus: the LICM-boundary copy elimination. Hand-written
+        # loops whose hoisted invariants are consumed ONLY by an indexed store;
+        # Phase-9 copy-prop forwards them into the store rvalue so DCE deletes the
+        # dead copy decls (0 per-iteration copies). Asserts correctness ON==OFF==
+        # oracle (a wrong forward across a clobbered source / call / aliasing
+        # store is caught), the forward fired on the legal shapes, byte-inert OFF.
+        coal_ok, coal_fwd = _run_coalesce_corpus()
+        print(f"--- ADDER_OPT=1 COPY-COALESCE corpus (LICM-boundary copy elim) ---")
+        print(f"  corpus copy-prop forwards:  {coal_fwd}")
+        if not coal_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] copy-coalesce corpus miscompiled, forward "
+                  "never fired, or OFF not byte-inert")
         # Phase-4 register-pressure corpus: many simultaneously-live scalar
         # locals (> the 5-reg callee-saved pool) + call-crossing + loop-carried
         # spills. Asserts the allocated/spilled output is CORRECT vs the oracle
