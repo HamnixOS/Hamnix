@@ -599,6 +599,7 @@ class Program:
         self._gen_chained_compare_traffic(env)  # Python chained comparisons (a<b<c)
         self._gen_cmpjcc_traffic(env)         # cmp; jcc branch-condition lever (--opt)
         self._gen_helper_calls(env)
+        self._gen_saveset_probe(env)          # callee-saved save-set tightening (--opt)
         self._gen_regpressure_scratch_traffic(env)  # caller-saved IR scratch (--opt)
         self._gen_region_callsplit_traffic(env)  # per-region caller-saved regalloc (--opt)
         self._gen_dce_keep_bait(env)      # DCE in main(): fire + must-KEEP probes
@@ -1930,6 +1931,75 @@ class Program:
                 res = pyfn([I64.wrap(v) for v in argvals])
                 self.emit(f"    hc: int64 = {name}({argsrc})")
                 self._fold_value("cast[uint64](hc)", U64.wrap(res))
+
+    # ---- save-set / phantom-promotion probe (--opt) --------------------------
+    def _gen_saveset_probe(self, env):
+        """Exercise the callee-saved PROLOGUE SAVE-SET tightening (regalloc
+        promotion veto + IR-scratch reservation, --opt) and the latent miscompile
+        it exposed. Three folded-into-checksum shapes so the by-construction oracle
+        catches any divergence:
+
+          (1) EXACT FIB SHAPE — a recursive ss_fib(n) (if-compare condition + two
+              recursion-arg calls) of VARYING depth. Its prologue must save ONLY
+              the callee-saved register holding `n` — never a phantom push for the
+              callee NAME `ss_fib` (a direct call, `call <sym>`, never loaded into a
+              register) and never a dead scratch reserve for the branch compare /
+              recursion args (both routed scratch-free). If a genuinely-needed save
+              were DROPPED (under-push), the recursion's carried value would be
+              clobbered and the summed result diverges.
+          (2) GLOBAL-INTO-PRESSURED-ARITH — a module global (g_ssacc) read into an
+              expression alongside several call-crossing locals. A global is loaded
+              RIP-relative from memory; if regalloc PHANTOM-PROMOTES it to a
+              callee-saved register the body never writes (the bug the veto closes,
+              which only surfaces once register pressure is low enough for the
+              global to win a register), the read returns an UNINITIALISED register
+              and the value diverges.
+          (3) VARYING CALLEE-SAVED COUNT — ss_fib is called at several depths so the
+              differential exercises functions whose genuine callee-saved save-set
+              varies, confirming a function that truly needs its saves keeps them.
+        """
+        rng = self.rng
+        M = (1 << 64) - 1
+
+        def w64(v):
+            v &= M
+            return v - (1 << 64) if (v >> 63) else v
+
+        # One-time top-level defs (emitted in BOTH subset and default mode; the rng
+        # draw sequence is identical across modes because they are unconditional).
+        self.emit_top("g_ssacc: int64")
+        self.emit_top("")
+        self.emit_top("def ss_fib(n: int64) -> int64:")
+        self.emit_top("    if n < cast[int64](2):")
+        self.emit_top("        return n")
+        self.emit_top("    return ss_fib(n - cast[int64](1)) + ss_fib(n - cast[int64](2))")
+        self.emit_top("")
+        self.emit_top("def ss_bump(x: int64) -> int64:")
+        self.emit_top("    g_ssacc = g_ssacc + x")
+        self.emit_top("    return x")
+        self.emit_top("")
+
+        def pyfib(n):
+            a, b = 0, 1
+            for _ in range(n):
+                a, b = b, a + b
+            return a
+
+        # (1)+(3) recursion at varying depths -> varying callee-saved prologue.
+        for _ in range(rng.randint(2, 4)):
+            k = rng.randint(4, 20)
+            self.emit(f"    ssf: int64 = ss_fib(cast[int64]({k}))")
+            self._fold_value("cast[uint64](ssf)", w64(pyfib(k)) & M)
+
+        # (2) GLOBAL read into a pressured expression with call-crossing locals.
+        vals = [rng.randint(1, 60) for _ in range(4)]
+        running = 0
+        for i, v in enumerate(vals):
+            self.emit(f"    sb{i}: int64 = ss_bump(cast[int64]({v}))")
+            running += v
+        # g_ssacc == running now; read it (twice) alongside the 4 live locals.
+        self.emit("    sse: int64 = g_ssacc + sb0 + sb1 + sb2 + sb3 + g_ssacc")
+        self._fold_value("cast[uint64](sse)", w64(running + sum(vals) + running) & M)
 
     # ---- register-pressure / caller-saved-scratch traffic --------------------
     def _gen_regpressure_scratch_traffic(self, env):
