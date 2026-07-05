@@ -70,6 +70,24 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def get_bsp_cr3() -> uint64
 
+# Boot-CR3 identity guard (>4 GiB-RAM aliasing fix). This whole layer
+# reaches user pages — and the task's own page-table pages during the walk
+# — through the LOW-MEM PHYSICAL IDENTITY window (phys addr used as a kernel
+# pointer). That window is COMPLETE and UN-ALIASED only under the boot/BSP
+# CR3, whose 1 GiB-huge identity covers ALL physical RAM. Under the LIVE
+# task CR3 the low half is the task's user address space, so a high user VA
+# (~4-5 GiB, e.g. Firefox's libxul) OVERWRITES the identity of the equal-
+# numbered >4 GiB physical frame — and any raw deref of a PT page or user
+# frame living in that high RAM then #PFs (cr2==frame, present under boot
+# cr3, absent under live cr3). We bracket every raw physical deref (the
+# resolve walk + each memcpy/memset to a resolved user frame) under the boot
+# CR3. Fault-in (which allocates/sleeps) stays OUTSIDE the bracket on the
+# live CR3 with IRQs enabled.
+extern def read_cr3() -> uint64
+extern def load_cr3(value: uint64)
+extern def local_irq_save() -> uint64
+extern def local_irq_restore(flags: uint64)
+
 # SMAP bracket primitives. _stac() sets RFLAGS.AC so the next CPL=0
 # access to a user (US=1) page is allowed under CR4.SMAP=1; _clac()
 # clears it. Both #UD on pre-Broadwell silicon; cpu_mitig_smap_active()
@@ -104,6 +122,58 @@ def _ua_stac():
 def _ua_clac():
     if cpu_mitig_smap_active() == 1:
         _clac()
+
+
+# --- boot-CR3 + SMAP bracketed physical accessors ------------------
+# A resolved user-frame physical address is reached through the low-mem
+# identity window, which is complete + un-aliased ONLY under the boot CR3
+# (see the boot-CR3 guard note above). These wrap the raw memcpy/memset of
+# a resolved frame in { load boot CR3 (IRQs off) ; STAC ; access ; CLAC ;
+# restore CR3 } so a >4 GiB user frame that aliases a live user mapping is
+# reached safely. IRQs are off only for the bounded (<=4 KiB) access.
+def _ua_copy_from_phys(kdst: uint64, phys: uint64, n: uint64):
+    _s: uint64 = read_cr3()
+    _b: uint64 = get_bsp_cr3()
+    _f: uint64 = 0
+    if _b != 0:
+        _f = local_irq_save()
+        load_cr3(_b)
+    _ua_stac()
+    memcpy(cast[Ptr[uint8]](kdst), cast[Ptr[uint8]](phys), n)
+    _ua_clac()
+    if _b != 0:
+        load_cr3(_s)
+        local_irq_restore(_f)
+
+
+def _ua_copy_to_phys(phys: uint64, ksrc: uint64, n: uint64):
+    _s: uint64 = read_cr3()
+    _b: uint64 = get_bsp_cr3()
+    _f: uint64 = 0
+    if _b != 0:
+        _f = local_irq_save()
+        load_cr3(_b)
+    _ua_stac()
+    memcpy(cast[Ptr[uint8]](phys), cast[Ptr[uint8]](ksrc), n)
+    _ua_clac()
+    if _b != 0:
+        load_cr3(_s)
+        local_irq_restore(_f)
+
+
+def _ua_zero_phys(phys: uint64, n: uint64):
+    _s: uint64 = read_cr3()
+    _b: uint64 = get_bsp_cr3()
+    _f: uint64 = 0
+    if _b != 0:
+        _f = local_irq_save()
+        load_cr3(_b)
+    _ua_stac()
+    memset(cast[Ptr[uint8]](phys), 0, n)
+    _ua_clac()
+    if _b != 0:
+        load_cr3(_s)
+        local_irq_restore(_f)
 
 # --- PTE / page-table layout constants (mirror fs/elf.ad) ----------
 UA_PT_FLAG_P:   uint64 = 0x1                 # Present
@@ -151,6 +221,27 @@ def uaccess_current_pml4() -> uint64:
 # guard is below the lowest user mapping), so a 0 sentinel is
 # unambiguous.
 def uaccess_resolve(pml4_phys: uint64, uvaddr: uint64,
+                    need_write: int32) -> uint64:
+    # Boot-CR3 guard: the walk dereferences the task's PT pages by bare
+    # physical address; on a >4 GiB-RAM box a PT page in high RAM aliases a
+    # live user mapping under the live CR3 and #PFs. Read it under the boot
+    # CR3's complete, un-aliased identity. The walk only READS physical
+    # memory (PT entries are the same bytes regardless of the active CR3),
+    # so switching CR3 does not change the result — only its safety.
+    _saved_cr3: uint64 = read_cr3()
+    _boot_cr3: uint64 = get_bsp_cr3()
+    _irq_flags: uint64 = 0
+    if _boot_cr3 != 0:
+        _irq_flags = local_irq_save()
+        load_cr3(_boot_cr3)
+    _rc: uint64 = _uaccess_resolve_locked(pml4_phys, uvaddr, need_write)
+    if _boot_cr3 != 0:
+        load_cr3(_saved_cr3)
+        local_irq_restore(_irq_flags)
+    return _rc
+
+
+def _uaccess_resolve_locked(pml4_phys: uint64, uvaddr: uint64,
                     need_write: int32) -> uint64:
     pml4_idx: uint64 = (uvaddr >> 39) & 0x1FF
     pdpt_idx: uint64 = (uvaddr >> 30) & 0x1FF
@@ -296,12 +387,10 @@ def copy_from_user(kdst: uint64, usrc: uint64, n: uint64) -> uint64:
         chunk: uint64 = _ua_bytes_to_page_end(cur_u)
         if chunk > remaining:
             chunk = remaining
-        # SMAP bracket: the memcpy source IS a user page (US=1) reached
-        # via the low-mem identity window. Without STAC the CPL=0 load
-        # would #PF under CR4.SMAP=1. No-op on pre-SMAP silicon.
-        _ua_stac()
-        memcpy(cast[Ptr[uint8]](cur_k), cast[Ptr[uint8]](phys), chunk)
-        _ua_clac()
+        # boot-CR3 + SMAP bracketed read from the user frame's physical
+        # identity address (the source IS a user US=1 page reached via the
+        # low-mem identity window, which is un-aliased only under boot CR3).
+        _ua_copy_from_phys(cur_k, phys, chunk)
         cur_u = cur_u + chunk
         cur_k = cur_k + chunk
         remaining = remaining - chunk
@@ -327,13 +416,10 @@ def copy_to_user(udst: uint64, ksrc: uint64, n: uint64) -> uint64:
         chunk: uint64 = _ua_bytes_to_page_end(cur_u)
         if chunk > remaining:
             chunk = remaining
-        # SMAP bracket: the memcpy destination IS a user page (US=1)
-        # reached via the low-mem identity window. Without STAC the
-        # CPL=0 store would #PF under CR4.SMAP=1. No-op on pre-SMAP
-        # silicon.
-        _ua_stac()
-        memcpy(cast[Ptr[uint8]](phys), cast[Ptr[uint8]](cur_k), chunk)
-        _ua_clac()
+        # boot-CR3 + SMAP bracketed write to the user frame's physical
+        # identity address (destination IS a user US=1 page via the low-mem
+        # identity window, un-aliased only under boot CR3).
+        _ua_copy_to_phys(phys, cur_k, chunk)
         cur_u = cur_u + chunk
         cur_k = cur_k + chunk
         remaining = remaining - chunk
@@ -431,7 +517,15 @@ def strncpy_from_user(kdst: uint64, usrc: uint64, maxlen: uint64) -> int64:
         # Bytes available in this frame before the next page boundary.
         page_left: uint64 = _ua_bytes_to_page_end(cur_u)
         srcp: Ptr[uint8] = cast[Ptr[uint8]](phys)
-        # SMAP bracket: srcp points into a user (US=1) frame.
+        # boot-CR3 + SMAP bracket: srcp points into a user (US=1) frame via
+        # the low-mem identity window, un-aliased only under boot CR3. IRQs
+        # off only for this bounded (<=4 KiB) scan.
+        _sn_saved: uint64 = read_cr3()
+        _sn_boot: uint64 = get_bsp_cr3()
+        _sn_irq: uint64 = 0
+        if _sn_boot != 0:
+            _sn_irq = local_irq_save()
+            load_cr3(_sn_boot)
         _ua_stac()
         i: uint64 = 0
         hit_nul: int32 = 0
@@ -444,6 +538,9 @@ def strncpy_from_user(kdst: uint64, usrc: uint64, maxlen: uint64) -> int64:
             copied = copied + 1
             i = i + 1
         _ua_clac()
+        if _sn_boot != 0:
+            load_cr3(_sn_saved)
+            local_irq_restore(_sn_irq)
         if hit_nul == 1:
             # Hit the terminator — string fully copied. `copied` counts
             # characters before the NUL.
@@ -472,10 +569,9 @@ def clear_user(uvaddr: uint64, n: uint64) -> uint64:
         chunk: uint64 = _ua_bytes_to_page_end(cur_u)
         if chunk > remaining:
             chunk = remaining
-        # SMAP bracket: the memset target IS a user page (US=1).
-        _ua_stac()
-        memset(cast[Ptr[uint8]](phys), 0, chunk)
-        _ua_clac()
+        # boot-CR3 + SMAP bracketed zero of the user frame's physical
+        # identity address (un-aliased only under boot CR3).
+        _ua_zero_phys(phys, chunk)
         cur_u = cur_u + chunk
         remaining = remaining - chunk
     return 0
