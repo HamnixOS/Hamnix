@@ -5096,6 +5096,58 @@ def _vma_pte_slot_addr(pml4_phys: uint64, vaddr: uint64) -> uint64:
     return cast[uint64](pt) + pt_idx * 8
 
 
+def _vma_pte_raw_read(pml4_phys: uint64, va: uint64) -> uint64:
+    # Boot-CR3-bracketed raw read of the 4 KiB leaf PTE at `va` (present,
+    # SWAP, or zero). Both the walk (_vma_pte_slot_addr dereferences the
+    # task's PDPT/PD/PT pages by bare physical address) AND the final leaf
+    # deref reach physical RAM through the low-mem identity window, which is
+    # complete + un-aliased ONLY under the boot CR3. On a >4 GiB-RAM box a PT
+    # page (or the frame) living in high RAM aliases a live user mapping under
+    # the LIVE task CR3 and a raw deref #PFs (the Firefox/6 GiB swap-in crash:
+    # vma_swap_in_fault reading a swap PTE whose PT page sat at ~4.5 GiB).
+    # Unlike _vma_pte_lookup this does NOT drop a not-present entry — the
+    # swap-in / reclaim callers MUST see a not-present SWAP PTE. Returns 0
+    # when the slot is unresolvable (missing upper level / huge leaf), which
+    # every caller treats as "nothing to fault or evict".
+    _saved: uint64 = read_cr3()
+    _boot: uint64 = cow_boot_cr3()
+    _f: uint64 = 0
+    if _boot != 0:
+        _f = local_irq_save()
+        load_cr3(_boot)
+    _slot: uint64 = _vma_pte_slot_addr(pml4_phys, va)
+    _val: uint64 = 0
+    if _slot != 0:
+        _val = cast[Ptr[uint64]](_slot)[0]
+    if _boot != 0:
+        load_cr3(_saved)
+        local_irq_restore(_f)
+    return _val
+
+
+def _vma_pte_raw_write(pml4_phys: uint64, va: uint64, val: uint64) -> int32:
+    # Boot-CR3-bracketed raw WRITE of the 4 KiB leaf PTE at `va` (the reclaim
+    # path rewriting a present PTE into a not-present swap entry). Same >4 GiB
+    # aliasing rationale as _vma_pte_raw_read — the PT page holding the leaf
+    # may live in high RAM. Returns 1 if the slot existed and was written, 0
+    # if unresolvable. The caller flushes the TLB (invlpg_one) itself.
+    _saved: uint64 = read_cr3()
+    _boot: uint64 = cow_boot_cr3()
+    _f: uint64 = 0
+    if _boot != 0:
+        _f = local_irq_save()
+        load_cr3(_boot)
+    _slot: uint64 = _vma_pte_slot_addr(pml4_phys, va)
+    _ok: int32 = 0
+    if _slot != 0:
+        cast[Ptr[uint64]](_slot)[0] = val
+        _ok = 1
+    if _boot != 0:
+        load_cr3(_saved)
+        local_irq_restore(_f)
+    return _ok
+
+
 def vma_task_anon_rss(slot: uint64) -> uint64:
     # Count PRESENT 4 KiB pages backing this task's demand-paged anon
     # VMAs — the resident anonymous working set. Used by the OOM killer's
@@ -5141,28 +5193,28 @@ def vma_reclaim_anon_pages(slot: uint64, want: uint64) -> uint64:
             e: uint64 = cast[Ptr[VmaNode]](cur)[0].end
             va: uint64 = s
             while va < e and reclaimed < want:
-                pslot: uint64 = _vma_pte_slot_addr(pml4, va)
-                if pslot != 0:
-                    pte: uint64 = cast[Ptr[uint64]](pslot)[0]
-                    if (pte & VMA_PT_FLAG_P) != 0:
-                        phys: uint64 = pte & VMA_PT_ADDR_MASK
-                        if phys != 0:
-                            sw: int64 = swap_out_page(phys)
-                            if sw < 0:
-                                # Swap full — stop; the OOM killer takes
-                                # over from here.
-                                return reclaimed
-                            # Rewrite the PTE to a not-present swap entry,
-                            # flush the TLB, tear down the rmap + LRU
-                            # bookkeeping for the frame, and free the
-                            # physical page.
-                            cast[Ptr[uint64]](pslot)[0] = \
-                                swap_make_pte(cast[uint64](sw))
-                            invlpg_one(va)
-                            lru_remove(phys)
-                            page_remove_rmap(phys)
-                            free_page(phys)
-                            reclaimed = reclaimed + 1
+                # Boot-CR3-bracketed read/write (>4 GiB aliasing): a PT page
+                # in high RAM aliases a live user mapping under the task CR3.
+                pte: uint64 = _vma_pte_raw_read(pml4, va)
+                if (pte & VMA_PT_FLAG_P) != 0:
+                    phys: uint64 = pte & VMA_PT_ADDR_MASK
+                    if phys != 0:
+                        sw: int64 = swap_out_page(phys)
+                        if sw < 0:
+                            # Swap full — stop; the OOM killer takes
+                            # over from here.
+                            return reclaimed
+                        # Rewrite the PTE to a not-present swap entry,
+                        # flush the TLB, tear down the rmap + LRU
+                        # bookkeeping for the frame, and free the
+                        # physical page.
+                        _vma_pte_raw_write(pml4, va,
+                            swap_make_pte(cast[uint64](sw)))
+                        invlpg_one(va)
+                        lru_remove(phys)
+                        page_remove_rmap(phys)
+                        free_page(phys)
+                        reclaimed = reclaimed + 1
                 va = va + VMA_PAGE_SIZE
         cur = _vma_node_get_next(cur)
     return reclaimed
@@ -5183,10 +5235,10 @@ def vma_reclaim_one_page(slot: uint64, va: uint64) -> int32:
     if pml4 == 0:
         return 0
     va_al: uint64 = va & ~(VMA_PAGE_SIZE - 1)
-    pslot: uint64 = _vma_pte_slot_addr(pml4, va_al)
-    if pslot == 0:
-        return 0
-    pte: uint64 = cast[Ptr[uint64]](pslot)[0]
+    # Boot-CR3-bracketed read/write (>4 GiB aliasing): the PT page holding
+    # this leaf may live in high RAM the live task CR3 aliases with a user
+    # mapping, so a bare deref would #PF.
+    pte: uint64 = _vma_pte_raw_read(pml4, va_al)
     if (pte & VMA_PT_FLAG_P) == 0:
         return 0
     # Never evict a COW-shared frame: it has >1 mapper and the rmap word
@@ -5201,7 +5253,7 @@ def vma_reclaim_one_page(slot: uint64, va: uint64) -> int32:
     sw: int64 = swap_out_page(phys)
     if sw < 0:
         return -1
-    cast[Ptr[uint64]](pslot)[0] = swap_make_pte(cast[uint64](sw))
+    _vma_pte_raw_write(pml4, va_al, swap_make_pte(cast[uint64](sw)))
     invlpg_one(va_al)
     lru_remove(phys)
     page_remove_rmap(phys)
@@ -5230,10 +5282,12 @@ def vma_reclaim_one_page(slot: uint64, va: uint64) -> int32:
 def vma_swap_in_fault(slot: uint64, pml4_phys: uint64,
                       fault_va: uint64) -> int32:
     va_al: uint64 = fault_va & ~(VMA_PAGE_SIZE - 1)
-    pte_slot: uint64 = _vma_pte_slot_addr(pml4_phys, va_al)
-    if pte_slot == 0:
-        return 0
-    pte: uint64 = cast[Ptr[uint64]](pte_slot)[0]
+    # Boot-CR3-bracketed read: on a >4 GiB box the PT page holding this leaf
+    # can live in high RAM whose identity is aliased by a live user mapping
+    # under the task CR3, so a bare deref #PFs (the Firefox 6 GiB swap-in
+    # crash). _vma_pte_raw_read reads the raw (possibly not-present SWAP) PTE
+    # under the boot CR3's un-aliased identity.
+    pte: uint64 = _vma_pte_raw_read(pml4_phys, va_al)
     if swap_pte_is_swap(pte) == 0:
         return 0
     # It IS a swap entry. Decode the slot, allocate a restore page.
