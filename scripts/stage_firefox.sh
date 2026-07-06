@@ -330,6 +330,21 @@ user_pref("media.hardware-video-decoding.enabled", false);
 user_pref("layers.acceleration.disabled", true);
 user_pref("layers.gpu-process.enabled", false);
 user_pref("webgl.disabled", true);
+// ---- suppress the startup GPU-probe CHILD (glxtest / vaapitest). Firefox
+// launches these as separate helper binaries via g_spawn (fork+exec) to
+// learn GL/VAAPI capabilities. In this GL-free namespace the probe child
+// deadlocks in a parent<->child pipe wait (the #119 window blocker). These
+// prefs stop libxul from ever WANTING the GL/VAAPI info, so the probe is
+// never fired (the binaries are also physically removed from the rootfs by
+// stage_firefox.sh section 8a as a definitive belt).
+user_pref("gfx.x11-glx.disabled", true);        // never probe/desire GLX
+user_pref("gfx.canvas.accelerated", false);     // no GPU canvas -> no GL want
+user_pref("media.ffmpeg.vaapi-drm-display.enabled", false);
+user_pref("media.rdd-vpx.enabled", false);
+user_pref("media.rdd-ffmpeg.enabled", false);
+user_pref("media.rdd-ffvpx.enabled", false);
+user_pref("media.utility-process.enabled", false); // no utility child
+user_pref("media.gpu-process-decoder", false);
 user_pref("browser.startup.homepage_override.mstone", "ignore");
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
@@ -389,6 +404,25 @@ done
 find -L "$ROOTFS" -path "*/dri/*_dri.so" -print -delete 2>/dev/null || true
 echo "[stage-ff]   GL/GBM libs removed (Firefox -> wl_shm software present)."
 
+# --- 8a2. DELETE the GPU-probe helper binaries (glxtest / vaapitest) ------
+# Firefox 140 launches these two SEPARATE helper binaries at startup via
+# g_spawn_async_with_pipes (fork+exec) to probe GL (glxtest) and VA-API
+# (vaapitest) and reads the result back over a pipe. In this GL-free
+# namespace the forked probe child DEADLOCKS in a parent<->child pipe wait
+# (the #119 window blocker: parent futex-parks forever while the child
+# blocks reading its IPC pipe). The prefs above (gfx.x11-glx.disabled,
+# gfx.canvas.accelerated=false, layers.acceleration.disabled, webgl.disabled,
+# gfx.webrender.software) stop libxul from wanting the probe result, but as a
+# DEFINITIVE belt we also remove the binaries: g_spawn then fails cleanly
+# (pid=0, gfxCriticalNote) and Firefox proceeds with software render — it is
+# non-fatal (verified: FireTestProcess returns false on spawn failure and the
+# GL/VAAPI data is simply left unavailable). weston-terminal / the DE do not
+# use these binaries, so nothing else regresses.
+echo "[stage-ff] removing GPU-probe helpers (glxtest/vaapitest) to kill the fork-probe child ..."
+for probe in glxtest vaapitest; do
+    rm -f "$ROOTFS/usr/lib/firefox-esr/$probe" && echo "[stage-ff]   removed /usr/lib/firefox-esr/$probe" || true
+done
+
 # --- 8b. baked-in native-Wayland launcher (/ff-launch.sh) --------------
 # One short serial line launches Firefox as a native wl client once the
 # live-root is up:  spawn linux { /bin/sh /ff-launch.sh }
@@ -420,6 +454,22 @@ export MOZ_WEBRENDER_SOFTWARE=1
 export MOZ_X11_EGL=0
 export MOZ_DISABLE_DMABUF=1
 export MOZ_ALLOW_SOFTWARE_GL=1
+# ---- suppress the startup GPU-probe CHILD (glxtest/vaapitest) -----------
+# Firefox forks+execs a `glxtest` helper (and `vaapitest`) at startup to
+# learn GL/VAAPI capability and reads the result over a pipe. In this GL-free
+# namespace that forked probe child DEADLOCKS in a parent<->child pipe wait
+# (the #119 window blocker). We remove the two helper binaries in
+# stage_firefox.sh (g_spawn then fails cleanly), and additionally PRE-SEED
+# the GL info via MOZ_GFX_SPOOF_* so GfxInfo already has vendor/renderer/
+# version/OS and never needs the probe result. MOZ_AVOID_OPENGL_ALTOGETHER
+# is glxtest's own belt (a no-op once the binary is gone). Net effect: no GL
+# probe fork -> no deadlock -> the parent proceeds straight to chrome map.
+export MOZ_GFX_SPOOF_GL_VENDOR="Mesa"
+export MOZ_GFX_SPOOF_GL_RENDERER="llvmpipe (Hamnix wl_shm software)"
+export MOZ_GFX_SPOOF_GL_VERSION="3.3 (Core Profile) Mesa"
+export MOZ_GFX_SPOOF_OS="Linux"
+export MOZ_GFX_SPOOF_OS_RELEASE="6.0.0"
+export MOZ_AVOID_OPENGL_ALTOGETHER=1
 export MOZ_CRASHREPORTER_DISABLE=1
 export MOZ_LAYOUT_FRAME_RATE=10
 # Diagnostics: the CURRENT fresh-boot blocker is NOT a client crash and NOT a
