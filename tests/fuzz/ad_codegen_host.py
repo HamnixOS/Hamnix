@@ -207,18 +207,24 @@ def _hex_to_bytes(lines):
     return bytes.fromhex("".join(lines))
 
 
-def run_dump(src_path: Path, timeout=30, opt=False, split_break=False) -> DumpResult:
+def run_dump(src_path: Path, timeout=30, opt=False, split_break=False,
+             alelide_break=False) -> DumpResult:
     build_driver()
     rel = src_path
     # opt=True passes the dump driver's opt-in --opt flag, enabling the native
     # Adder optimizer (Phase 1 const-fold). Default (no flag) is byte-inert.
     # split_break arms the live-range splitter's deliberate-break (skip the hole-
     # coverage soundness gate) so a guard can prove that gate prevents a miscompile.
+    # alelide_break arms the variadic AL-zeroing elision to fire even on the
+    # default build (breaking OFF byte-inertness) so a guard can prove the --opt
+    # gate is what preserves it.
     argv = [str(DRIVER_ELF)]
     if opt:
         argv.append("--opt")
     if split_break:
         argv.append("--split-break")
+    if alelide_break:
+        argv.append("--alelide-break")
     argv.append(str(rel))
     cp = subprocess.run(argv,
                         capture_output=True, text=True, timeout=timeout)
@@ -293,6 +299,7 @@ def run_dump(src_path: Path, timeout=30, opt=False, split_break=False) -> DumpRe
                       ivsr=meta.get("IVSR", 0),
                       storeelim=meta.get("STOREELIM", 0),
                       paramhome=meta.get("PARAMHOME", 0),
+                      alelide=meta.get("ALELIDE", 0),
                       fpsel=meta.get("FPSEL", 0),
                       fpmov=meta.get("FPMOV", 0),
                       fpcmp=meta.get("FPCMP", 0),
@@ -675,6 +682,7 @@ class CodegenRun:
         self.ivsr = kw.get("ivsr", 0)
         self.storeelim = kw.get("storeelim", 0)
         self.paramhome = kw.get("paramhome", 0)
+        self.alelide = kw.get("alelide", 0)
         self.fpsel = kw.get("fpsel", 0)
         self.fpmov = kw.get("fpmov", 0)
         self.fpcmp = kw.get("fpcmp", 0)
@@ -740,6 +748,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
     ivsr = getattr(dump, "ivsr", 0)
     storeelim = getattr(dump, "storeelim", 0)
     paramhome = getattr(dump, "paramhome", 0)
+    alelide = getattr(dump, "alelide", 0)
     fpsel = getattr(dump, "fpsel", 0)
     fpmov = getattr(dump, "fpmov", 0)
     fpcmp = getattr(dump, "fpcmp", 0)
@@ -756,7 +765,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
                           idxsel=idxsel,
                           strengthred=strengthred, isel=isel, aluload=aluload,
                           basehoist=basehoist,
-                          ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, imulimm=imulimm, cmpjcc=cmpjcc)
+                          ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, alelide=alelide, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, imulimm=imulimm, cmpjcc=cmpjcc)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
                       folds=folds, ffold=ffold, cse=cse, loadcse=loadcse,
                       licm=licm, dce=dce,
@@ -766,7 +775,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
                       idxsel=idxsel, spineleaf=spineleaf,
                       strengthred=strengthred, isel=isel, aluload=aluload,
                       basehoist=basehoist, splithoist=splithoist,
-                      ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, imulimm=imulimm, cmpjcc=cmpjcc)
+                      ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, alelide=alelide, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, imulimm=imulimm, cmpjcc=cmpjcc)
 
 
 if __name__ == "__main__":

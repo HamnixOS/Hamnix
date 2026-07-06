@@ -4502,6 +4502,172 @@ def _run_imulimm_corpus():
 
 
 # --------------------------------------------------------------------------
+# VARIADIC AL-ZEROING ELISION corpus. The lever drops the `xor eax,eax` codegen
+# emits before a DIRECT call to an in-unit (never-variadic) Adder function — a
+# dead SysV-vararg-AL uop the callee never reads. It is VALUE-NEUTRAL by
+# construction (a non-variadic callee ignores AL), so the corpus's core proof is
+# (a) ON == OFF == oracle across recursion / call-crossing / many-arg / mutual-
+# recursion shapes (catching any accidental disturbance of arg marshalling from a
+# mis-edit), (b) the lever FIRES (ALELIDE>0) on direct-call shapes, and (c) it is
+# byte-inert OFF (ALELIDE_off == 0). The runner ALSO arms the deliberate break
+# (--alelide-break) to prove the --opt gate is load-bearing for byte-inertness.
+# --------------------------------------------------------------------------
+def _alelide_corpus():
+    """Return a list of (name, body, expected_stdout, expected_exit, want_fire)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, decls_and_main, val, want_fire):
+        body = PRELUDE + "\n" + decls_and_main
+        progs.append((name, body, str(val & M), (val & 255), want_fire))
+
+    def i64(v): return v - (1 << 64) if (v & M) >> 63 else (v & M)
+    def a64(v): return f"cast[int64](0 - {(-v)})" if v < 0 else f"cast[int64]({v})"
+
+    # 1) RECURSION with a call-crossing intermediate (the fib shape): fib(n-1)'s
+    #    result is held across the fib(n-2) call. Two direct call sites per body.
+    def pyfib(n): return n if n < 2 else pyfib(n - 1) + pyfib(n - 2)
+    r = 0
+    for n in range(23):
+        r = (r + pyfib(n)) & M
+    prog("fib",
+         "def fib(n: int64) -> int64:\n"
+         "    if n < 2:\n"
+         "        return n\n"
+         "    return fib(n - 1) + fib(n - 2)\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    acc: int64 = 0\n"
+         "    n: int64 = 0\n"
+         "    while n < 23:\n"
+         "        acc = acc + fib(n)\n"
+         "        n = n + 1\n"
+         "    print_u64(cast[uint64](acc))\n"
+         "    return cast[int32](acc & cast[int64](255))\n",
+         r, 1)
+
+    # 2) MUTUAL RECURSION: is_even/is_odd call each other (direct calls to a
+    #    DIFFERENT in-unit function, not self) — both sites elidable.
+    def pyeven(n): return 1 if n == 0 else pyodd(n - 1)
+    def pyodd(n): return 0 if n == 0 else pyeven(n - 1)
+    tot = 0
+    for k in range(60):
+        tot = (tot + pyeven(k)) & M
+    prog("mutual",
+         "def is_even(n: int64) -> int64:\n"
+         "    if n == 0:\n"
+         "        return cast[int64](1)\n"
+         "    return is_odd(n - 1)\n"
+         "def is_odd(n: int64) -> int64:\n"
+         "    if n == 0:\n"
+         "        return cast[int64](0)\n"
+         "    return is_even(n - 1)\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    s: int64 = 0\n"
+         "    k: int64 = 0\n"
+         "    while k < 60:\n"
+         "        s = s + is_even(k)\n"
+         "        k = k + 1\n"
+         "    print_u64(cast[uint64](s))\n"
+         "    return cast[int32](s & cast[int64](255))\n",
+         tot, 1)
+
+    # 3) SIX-ARG call (all SysV integer arg registers) — eliding the xor must not
+    #    disturb the arg-register marshalling that runs just before the call.
+    va = [101, -202, 303, -404, 505, -606]
+    s6 = i64(sum(va))
+    prog("sixarg",
+         "def sum6(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64) -> int64:\n"
+         "    return a + b + c + d + e + f\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         f"    s: int64 = sum6({a64(va[0])}, {a64(va[1])}, {a64(va[2])}, "
+         f"{a64(va[3])}, {a64(va[4])}, {a64(va[5])})\n"
+         "    print_u64(cast[uint64](s))\n"
+         "    return cast[int32](s & cast[int64](255))\n",
+         s6 & M, 1)
+
+    # 4) DEEP CALL CHAIN with call-crossing accumulation: g(x) = x + h(x*2),
+    #    h(x) = x + k(x+1) — nested direct calls, each value crossing the next.
+    def pyk(x): return (x + 3) & M
+    def pyh(x): return (x + pyk(x + 1)) & M
+    def pyg(x): return (x + pyh((x * 2) & M)) & M
+    acc = 0
+    for x in range(40):
+        acc = (acc + pyg(x)) & M
+    prog("chain",
+         "def k(x: int64) -> int64:\n"
+         "    return x + cast[int64](3)\n"
+         "def h(x: int64) -> int64:\n"
+         "    return x + k(x + cast[int64](1))\n"
+         "def g(x: int64) -> int64:\n"
+         "    return x + h(x * cast[int64](2))\n"
+         "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+         "    acc: int64 = 0\n"
+         "    x: int64 = 0\n"
+         "    while x < 40:\n"
+         "        acc = acc + g(x)\n"
+         "        x = x + 1\n"
+         "    print_u64(cast[uint64](acc))\n"
+         "    return cast[int32](acc & cast[int64](255))\n",
+         acc, 1)
+
+    return progs
+
+
+def _run_alelide_corpus():
+    """Run the AL-zeroing-elision corpus through codegen.ad --opt. Returns
+    (all_correct_and_fired_and_break_caught, total_alelide). Asserts, for every
+    program: ON == OFF == oracle (value-neutral elision must not perturb the
+    result), the lever FIRED (ALELIDE_on>0) and is byte-inert OFF (ALELIDE_off==0).
+    Then arms the deliberate break on the fib program and asserts it defeats the
+    --opt gate (ALELIDE_off>0 with --alelide-break) — proving the gate is what
+    preserves the seed byte-identity."""
+    host = _ad_host()
+    from pathlib import Path as _P
+    total = 0
+    all_ok = True
+    corpus = _alelide_corpus()
+    for (name, body, exp_out, exp_exit, want_fire) in corpus:
+        r_on = host.run_through_codegen_ad(f"al_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"al_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [alelide corpus '{name}'] codegen.ad on={r_on.kind}/"
+                  f"off={r_off.kind}: {(r_on.detail or r_off.detail)[:120]}")
+            continue
+        al_on = int(getattr(r_on, "alelide", 0) or 0)
+        al_off = int(getattr(r_off, "alelide", 0) or 0)
+        total += al_on
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [alelide corpus '{name}'] MISCOMPILE opt=("
+                  f"{r_on.stdout},{r_on.exit}) oracle=({exp_out},{exp_exit})")
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [alelide corpus '{name}'] OFF wrong=("
+                  f"{r_off.stdout},{r_off.exit}) oracle=({exp_out},{exp_exit})")
+        if al_off != 0:
+            all_ok = False
+            print(f"  [alelide corpus '{name}'] NOT byte-inert OFF (alelide={al_off})")
+        if want_fire and al_on == 0:
+            all_ok = False
+            print(f"  [alelide corpus '{name}'] lever never fired (alelide_on=0)")
+    # DELIBERATE BREAK: --alelide-break makes the elision fire on the OFF build,
+    # breaking byte-inertness. The guard must see ALELIDE_off>0 (caught).
+    name, body, _, _, _ = corpus[0]
+    src_p = _AD_WORK / "al_break.ad"
+    src_p.write_text(host.codegen_compatible_source(body))
+    du_brk = host.run_dump(src_p, opt=False, alelide_break=True)
+    al_brk = int(getattr(du_brk, "alelide", 0) or 0)
+    if al_brk == 0:
+        all_ok = False
+        print("  [alelide corpus] deliberate break (--alelide-break) INERT on OFF "
+              "(alelide=0) — the cg_ra_active gate was not proven load-bearing")
+    if total == 0:
+        all_ok = False
+    return (all_ok, total, al_brk)
+
+
+# --------------------------------------------------------------------------
 # Phase-5 IR-EMIT corpus. Hand-written programs whose hot expressions lower
 # FULLY into the value IR (ir_lower_pure_expr) — pure signedness-invariant
 # integer arithmetic over ident/const leaves — so codegen emits them by walking
@@ -7855,6 +8021,19 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] imul-const corpus miscompiled, never fired, "
                   "OFF not byte-inert, or fired on a non-const multiply")
+        # VARIADIC AL-ZEROING ELISION corpus: drops the dead `xor eax,eax` before
+        # a direct call to an in-unit (non-variadic) Adder function. Value-neutral,
+        # so this asserts ON==OFF==oracle across recursion/mutual-recursion/6-arg/
+        # deep-chain shapes, the lever fires + is byte-inert OFF, and the
+        # deliberate break (--alelide-break) defeats the --opt gate (caught).
+        al_ok, al_fires, al_brk = _run_alelide_corpus()
+        print(f"--- ADDER_OPT=1 AL-ZEROING-ELISION corpus (direct-call xor drop) ---")
+        print(f"  corpus xor-elisions:        {al_fires}")
+        print(f"  deliberate-break OFF fires: {al_brk}  (must be >0: gate proven)")
+        if not al_ok:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] al-elision corpus miscompiled, never fired, "
+                  "OFF not byte-inert, or the deliberate break was inert")
         # Phase-4 register-pressure corpus: many simultaneously-live scalar
         # locals (> the 5-reg callee-saved pool) + call-crossing + loop-carried
         # spills. Asserts the allocated/spilled output is CORRECT vs the oracle
