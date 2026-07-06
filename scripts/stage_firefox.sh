@@ -600,15 +600,18 @@ mkdir -p "$FFHOME/.ff-profile" "$FFHOME/.cache" "$FFHOME/.config" "$FFHOME/.mozi
 cp /usr/lib/firefox-esr/ff-profile-seed/prefs.js "$FFHOME/.ff-profile/prefs.js" 2>/dev/null || true
 cp /usr/lib/firefox-esr/ff-profile-seed/user.js  "$FFHOME/.ff-profile/user.js"  2>/dev/null || true
 chmod -R 0777 "$FFHOME" 2>/dev/null || true
-# DIAGNOSTICS: route MOZ_LOG to the PARENT's stderr (NOT a file). The
-# MOZ_LOG_FILE=$FFHOME/moz.log form NEVER materialised (confirmed: "cannot open
-# /tmp/ffhome/moz.log: No such file" — Firefox exits before/without flushing the
-# NSPR log to a file). But the PARENT firefox-esr's stderr DOES reach the serial
-# console through the [FF] read-loop below (its GTK/GLib debug prints there), so
-# unsetting MOZ_LOG_FILE makes MOZ_LOG stream to stderr -> [FF] serial, giving us
-# the parent's EXACT window-bring-up / IPC-launch / shutdown decision live.
-export MOZ_LOG='nsWindow:5,WidgetWayland:5,Widget:5,Compositor:4,WebRender:4,ipc:4,sync,timestamp'
-unset MOZ_LOG_FILE 2>/dev/null || true
+# DIAGNOSTICS: the process our launch pipe reads is a SHORT-LIVED launcher fork
+# that returns 255; the REAL firefox forks off (observed pid), REDIRECTS its own
+# stdio (so no more [FF] serial output) and then DEADLOCKS with all ~13 threads
+# parked in the Gecko child-process IPC handshake (threads seen blocked in
+# read() on pipes fd7/fd0, futex, and socket(41)/sendmsg(46)/recvmsg(47) on an
+# AF_UNIX socketpair — the parent<->content/GPU channel). Because that process
+# closes stdio, MOZ_LOG must go to a FILE, and we DUMP it AFTER a settle delay so
+# the still-running deadlocked process's log (which pinpoints the IPC gap) is
+# captured. Write per-process logs: MOZ_LOG_FILE gets a .child-N suffix per
+# child, so we dump EVERY moz.log* file, not just the parent's.
+export MOZ_LOG='nsWindow:5,WidgetWayland:5,Widget:5,Compositor:4,WebRender:4,ipc:5,IPDL:5,MessageChannel:5,ProcessHangMon:5,sync,timestamp'
+export MOZ_LOG_FILE="$FFHOME/moz.log"
 export HOME="$FFHOME"
 export XDG_CONFIG_HOME="$FFHOME/.config"
 export XDG_CACHE_HOME="$FFHOME/.cache"
@@ -642,15 +645,24 @@ echo "[FF-DIAG] uid=$(id -u 2>/dev/null) HOME=$HOME FFHOME=$FFHOME"
 if ( : > "$FFHOME/.ff-profile/.wtest" ) 2>/dev/null; then echo "[FF-DIAG] profile dir IS writable"; rm -f "$FFHOME/.ff-profile/.wtest"; else echo "[FF-DIAG] profile dir NOT writable"; fi
 ls -ld "$FFHOME" "$FFHOME/.ff-profile" 2>&1 | while IFS= read -r l; do echo "[FF-DIAG] home: $l"; done
 echo "[FF] launching firefox-esr (native wayland)"
-# Capture the PARENT's exit code THROUGH the pipe (dash has no PIPESTATUS): the
-# `echo FFEXIT=$?` runs in the same subshell immediately after firefox exits, so
-# its exit code streams to serial as "[FF] FFEXIT=<code>". This tells us whether
-# the parent exits 0 (clean, gave up), 255 (startup failure), or a signal code.
+# Capture the launcher fork's exit code THROUGH the pipe (dash has no
+# PIPESTATUS): the `echo FFEXIT=$?` streams to serial as "[FF] FFEXIT=<code>".
 { /usr/lib/firefox-esr/firefox-esr \
     -profile "$FFHOME/.ff-profile" -no-remote -new-instance 'about:blank' 2>&1
   echo "FFEXIT=$?"
 } | while IFS= read -r line; do echo "[FF] $line"; done
 echo "[FF] firefox pipeline ended"
+# The REAL forked firefox keeps running (deadlocked). Let it settle, then dump
+# EVERY moz.log* (parent + per-child) so the IPC-handshake stall is captured.
+echo "[FF-POST] settling 45s to let the forked firefox write its MOZ_LOG ..."
+i=0; while [ "$i" -lt 45 ]; do sleep 1; i=$((i+1)); done
+echo "[FF-POST] === /tmp/ffhome listing ==="
+ls -la "$FFHOME" 2>&1 | while IFS= read -r l; do echo "[FF-POST] $l"; done
+for f in "$FFHOME"/moz.log*; do
+    [ -e "$f" ] || continue
+    echo "[FF-POST] === $f ($(wc -l < "$f" 2>/dev/null) lines) ==="
+    tail -n 80 "$f" 2>/dev/null | while IFS= read -r l; do echo "[FF-LOG] $l"; done
+done
 FFLAUNCH
 chmod +x "$ROOTFS/ff-launch.sh"
 echo "[stage-ff] baked native-wayland launcher: /ff-launch.sh"
