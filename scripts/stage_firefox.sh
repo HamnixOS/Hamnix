@@ -394,7 +394,17 @@ user_pref("extensions.pocket.enabled", false);
 PREFS
 printf '%s\n' "$FF_PREFS" > "$PROFILE/prefs.js"
 printf '%s\n' "$FF_PREFS" > "$PROFILE/user.js"
-echo "[stage-ff] seeded throwaway profile ($PROFILE, prefs.js+user.js) + /run + /tmp"
+# WORLD-READABLE seed copy: `spawn linux` runs Firefox as a non-hostowner uid
+# (1001) which may not traverse root-owned /root (0700). ff-launch.sh copies
+# the prefs from THIS world-readable path (under /usr) into its writable /tmp
+# profile so the critical software-render prefs survive even when /root is
+# unreadable to uid 1001.
+SEED_DIR="$ROOTFS/usr/lib/firefox-esr/ff-profile-seed"
+mkdir -p "$SEED_DIR"
+printf '%s\n' "$FF_PREFS" > "$SEED_DIR/prefs.js"
+printf '%s\n' "$FF_PREFS" > "$SEED_DIR/user.js"
+chmod -R a+rX "$SEED_DIR" 2>/dev/null || true
+echo "[stage-ff] seeded throwaway profile ($PROFILE + world-readable $SEED_DIR) + /run + /tmp"
 
 # --- 8a. force the pure wl_shm software path: REMOVE the GL/GBM libs -----
 # The Hamnix compositor speaks wl_shm ONLY. There is no mesa EGL, no dri
@@ -503,11 +513,32 @@ export MOZ_LAYOUT_FRAME_RATE=10
 #   follow-up run can `cat /root/moz.log*` over the serial shell and read the
 #   parent's exact IPC-launch / handshake-timeout decision. `sync` flushes each
 #   line so a 255 exit does not lose the tail.
+# ---- WRITABLE HOME/PROFILE UNDER /tmp (THE uid-1001 spawn fix) ----------
+# `spawn linux { ... }` runs Firefox as a NON-hostowner uid (observed uid=1001),
+# but HOME=/root and the seeded profile /root/.ff-profile are owned by root
+# (uid 0). Firefox as uid 1001 then CANNOT write its profile (the async
+# storage / places-SQLite / profile-lock worker fails), and MOZ_LOG_FILE=
+# /root/moz.log is never even created (confirmed: `cat /root/moz.log` ->
+# "No such file"). The main thread g_cond_wait's for that storage worker's
+# completion signal which never comes -> the all-threads-parked startup hang
+# (no xdg_toplevel, no wl_shm commit). FIX: relocate EVERY writable path to
+# world-writable /tmp (1777, writable by uid 1001) and COPY the seeded prefs
+# there at launch so Firefox owns a fully-writable profile.
+FFHOME=/tmp/ffhome
+rm -rf "$FFHOME" 2>/dev/null
+mkdir -p "$FFHOME/.ff-profile" "$FFHOME/.cache" "$FFHOME/.config" "$FFHOME/.mozilla"
+# seed prefs from the WORLD-READABLE seed under /usr (uid 1001 may not
+# traverse root-owned /root) into the writable /tmp profile.
+cp /usr/lib/firefox-esr/ff-profile-seed/prefs.js "$FFHOME/.ff-profile/prefs.js" 2>/dev/null || true
+cp /usr/lib/firefox-esr/ff-profile-seed/user.js  "$FFHOME/.ff-profile/user.js"  2>/dev/null || true
+chmod -R 0777 "$FFHOME" 2>/dev/null || true
 export MOZ_LOG='ipc:5,IPDL:5,MessageChannel:5,widget:5,WidgetWayland:5,nsWindow:5,sync'
-export MOZ_LOG_FILE=/root/moz.log
-export HOME=/root
-export XDG_CONFIG_HOME=/run
-export XDG_CACHE_HOME=/root/.cache
+export MOZ_LOG_FILE="$FFHOME/moz.log"
+export HOME="$FFHOME"
+export XDG_CONFIG_HOME="$FFHOME/.config"
+export XDG_CACHE_HOME="$FFHOME/.cache"
+export XDG_DATA_HOME="$FFHOME/.local/share"
+export TMPDIR=/tmp
 # Fontconfig: libfontconfig must locate its config, else gfxPlatformGtk font
 # -list init (FcInitLoadConfigAndFonts) fails and — critically — its font-init
 # WORKER thread aborts without signalling the main thread's join-futex, so the
@@ -523,24 +554,25 @@ export FONTCONFIG_PATH=/etc/fonts
 export FONTCONFIG_SYSROOT=/
 export G_SLICE=always-malloc
 export G_MESSAGES_DEBUG=all
-mkdir -p /root/.cache /root/.mozilla /run
+mkdir -p "$FFHOME/.cache" "$FFHOME/.mozilla" /run
 # drop any stale profile lock from a prior crashed run
-rm -f /root/.ff-profile/lock /root/.ff-profile/.parentlock 2>/dev/null
+rm -f "$FFHOME/.ff-profile/lock" "$FFHOME/.ff-profile/.parentlock" 2>/dev/null
 # ---- FONT DIAGNOSTICS (serial): prove whether the namespace can SEE + READ
 # the fontconfig config, and echo the resolved env. This pinpoints whether the
 # "(null)" config failure is an env-propagation gap, a namespace file-access
 # gap, or a fontconfig path-resolution quirk. Cheap; prints a few [FF-DIAG]
 # lines then continues to launch. ----
-echo "[FF-DIAG] uid=$(id -u 2>/dev/null) FONTCONFIG_FILE=$FONTCONFIG_FILE FONTCONFIG_PATH=$FONTCONFIG_PATH"
-ls -l /etc/fonts/fonts.conf 2>&1 | while IFS= read -r l; do echo "[FF-DIAG] ls: $l"; done
-if [ -r /etc/fonts/fonts.conf ]; then echo "[FF-DIAG] fonts.conf IS readable (test -r)"; else echo "[FF-DIAG] fonts.conf NOT readable (test -r)"; fi
-head -1 /etc/fonts/fonts.conf 2>&1 | while IFS= read -r l; do echo "[FF-DIAG] head: $l"; done
-ls /usr/share/fonts/truetype/dejavu 2>&1 | while IFS= read -r l; do echo "[FF-DIAG] fonts: $l"; done
+echo "[FF-DIAG] uid=$(id -u 2>/dev/null) HOME=$HOME FFHOME=$FFHOME"
+# prove the writable profile dir really IS writable by this uid
+if ( : > "$FFHOME/.ff-profile/.wtest" ) 2>/dev/null; then echo "[FF-DIAG] profile dir IS writable"; rm -f "$FFHOME/.ff-profile/.wtest"; else echo "[FF-DIAG] profile dir NOT writable"; fi
+ls -ld "$FFHOME" "$FFHOME/.ff-profile" 2>&1 | while IFS= read -r l; do echo "[FF-DIAG] home: $l"; done
 echo "[FF] launching firefox-esr (native wayland)"
 /usr/lib/firefox-esr/firefox-esr \
-    -profile /root/.ff-profile -no-remote -new-instance 'about:blank' 2>&1 \
+    -profile "$FFHOME/.ff-profile" -no-remote -new-instance 'about:blank' 2>&1 \
     | while IFS= read -r line; do echo "[FF] $line"; done
 echo "[FF] firefox pipeline ended"
+echo "[FF-POST] moz.log lines: $(wc -l < "$FFHOME/moz.log" 2>/dev/null || echo MISSING)"
+tail -n 40 "$FFHOME/moz.log" 2>/dev/null | while IFS= read -r l; do echo "[FF-LOG] $l"; done
 FFLAUNCH
 chmod +x "$ROOTFS/ff-launch.sh"
 echo "[stage-ff] baked native-wayland launcher: /ff-launch.sh"
