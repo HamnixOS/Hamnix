@@ -432,24 +432,92 @@ done
 find -L "$ROOTFS" -path "*/dri/*_dri.so" -print -delete 2>/dev/null || true
 echo "[stage-ff]   GL/GBM libs removed (Firefox -> wl_shm software present)."
 
-# --- 8a2. DELETE the GPU-probe helper binaries (glxtest / vaapitest) ------
+# --- 8a2. STUB the GPU-probe helpers (glxtest / vaapitest) ----------------
 # Firefox 140 launches these two SEPARATE helper binaries at startup via
-# g_spawn_async_with_pipes (fork+exec) to probe GL (glxtest) and VA-API
-# (vaapitest) and reads the result back over a pipe. In this GL-free
-# namespace the forked probe child DEADLOCKS in a parent<->child pipe wait
-# (the #119 window blocker: parent futex-parks forever while the child
-# blocks reading its IPC pipe). The prefs above (gfx.x11-glx.disabled,
-# gfx.canvas.accelerated=false, layers.acceleration.disabled, webgl.disabled,
-# gfx.webrender.software) stop libxul from wanting the probe result, but as a
-# DEFINITIVE belt we also remove the binaries: g_spawn then fails cleanly
-# (pid=0, gfxCriticalNote) and Firefox proceeds with software render — it is
-# non-fatal (verified: FireTestProcess returns false on spawn failure and the
-# GL/VAAPI data is simply left unavailable). weston-terminal / the DE do not
-# use these binaries, so nothing else regresses.
-echo "[stage-ff] removing GPU-probe helpers (glxtest/vaapitest) to kill the fork-probe child ..."
-for probe in glxtest vaapitest; do
-    rm -f "$ROOTFS/usr/lib/firefox-esr/$probe" && echo "[stage-ff]   removed /usr/lib/firefox-esr/$probe" || true
-done
+# base::LaunchApp/posix_spawn (fork+exec) to probe GL (glxtest) and VA-API
+# (vaapitest); each writes its result to the fd given by `-f <n>` (a pipe back
+# to the parent) and the parent reads it in GfxInfo::GetData()/GetDataVAAPI().
+#
+# HISTORY: #120 DELETED these binaries. But a MISSING binary is the WRONG cure:
+# the posix_spawn still succeeds-then-exec-fails, and on Hamnix's Linux ABI the
+# failed exec surfaces as a child that exits 127 (not a clean g_spawn pid=0),
+# which GfxInfo can treat as a hard graphics-init failure — leaving the GPU
+# probe in an indeterminate state instead of a definite "no GL". With the
+# CLONE_THREAD pgrp-namespace fix (#123/d6567770) the probe CHILD now runs in
+# the correct namespace and no longer deadlocks, so the right fix is a probe
+# that RUNS and writes the canonical "no GL / software only" answer the parent
+# accepts, then exits 0.
+#
+# THE STUB emits exactly the response Firefox's OWN glxtest produces when
+# MOZ_AVOID_OPENGL_ALTOGETHER is set (ff-launch.sh exports it):
+#     ERROR\nMOZ_AVOID_OPENGL_ALTOGETHER envvar set\n
+# GfxInfo reads that as "GL unavailable" — a SUPPORTED, non-fatal no-GL mode
+# (that env var exists precisely to force it) — so Firefox blocklists GL/EGL
+# acceleration and falls back to pure-software WebRender (swgl), which presents
+# into a wl_shm buffer (no libGL/EGL/GBM needed — those stay removed, §8a).
+# The stub parses `-f <n>`/`--fd <n>` (writes there; default stdout) and
+# ignores `-w`. It links only libc — no libgdk-3/X11/GL — so it always loads
+# and never touches a display. vaapitest gets the same ERROR no-op.
+#
+# Compiled from C on the host (gcc/cc, static so no runtime lib dep at all).
+# If no C compiler is present we fall back to KEEPING the real glxtest binary
+# (which, via MOZ_AVOID_OPENGL_ALTOGETHER=1, self-emits the identical ERROR and
+# exits before any GL dlopen — verified: its DT_NEEDED closure is GL-free).
+echo "[stage-ff] installing no-GL stub for GPU-probe helpers (glxtest/vaapitest) ..."
+STUB_SRC="$WORK/glxtest_stub.c"
+cat > "$STUB_SRC" <<'STUBC'
+/* no-GL glxtest/vaapitest stub: writes the canonical "no GL" response Firefox
+ * accepts (same bytes as the real glxtest with MOZ_AVOID_OPENGL_ALTOGETHER),
+ * to the fd named by -f/--fd (default stdout), then exits 0. libc-only. */
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    int fd = 1; /* default stdout */
+    for (int i = 1; i < argc; i++) {
+        if ((!strcmp(argv[i], "-f") || !strcmp(argv[i], "--fd")) && i + 1 < argc)
+            fd = atoi(argv[++i]);
+    }
+    /* exact bytes the real glxtest writes with MOZ_AVOID_OPENGL_ALTOGETHER
+     * (no trailing newline — GfxInfo splits on '\n'). */
+    static const char resp[] = "ERROR\nMOZ_AVOID_OPENGL_ALTOGETHER envvar set";
+    size_t off = 0, n = sizeof(resp) - 1;
+    while (off < n) {
+        ssize_t w = write(fd, resp + off, n - off);
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    return 0;
+}
+STUBC
+CC_BIN="$(command -v gcc || command -v cc || true)"
+STUB_OK=0
+if [ -n "$CC_BIN" ]; then
+    if "$CC_BIN" -static -O2 -o "$WORK/glxtest_stub" "$STUB_SRC" 2>/dev/null \
+       || "$CC_BIN" -O2 -o "$WORK/glxtest_stub" "$STUB_SRC" 2>/dev/null; then
+        for probe in glxtest vaapitest; do
+            cp -f "$WORK/glxtest_stub" "$ROOTFS/usr/lib/firefox-esr/$probe"
+            chmod 0755 "$ROOTFS/usr/lib/firefox-esr/$probe"
+            echo "[stage-ff]   installed no-GL stub -> /usr/lib/firefox-esr/$probe"
+        done
+        STUB_OK=1
+    fi
+fi
+if [ "$STUB_OK" -eq 0 ]; then
+    echo "[stage-ff]   no C compiler / build failed; KEEPING real glxtest+vaapitest"
+    echo "[stage-ff]   (MOZ_AVOID_OPENGL_ALTOGETHER=1 makes them self-emit the no-GL ERROR)."
+    # Ensure the real probe binaries' GL-free DT_NEEDED closure is staged so
+    # they load: seed the closure walker (below re-run) with them.
+    for probe in glxtest vaapitest; do
+        if [ ! -e "$ROOTFS/usr/lib/firefox-esr/$probe" ]; then
+            if [ "$FF_SRC" = "deb" ] && [ -e "$FFROOT/usr/lib/firefox-esr/$probe" ]; then
+                cp -a "$FFROOT/usr/lib/firefox-esr/$probe" "$ROOTFS/usr/lib/firefox-esr/$probe"
+            elif [ -e "/usr/lib/firefox-esr/$probe" ]; then
+                cp -a "/usr/lib/firefox-esr/$probe" "$ROOTFS/usr/lib/firefox-esr/$probe"
+            fi
+        fi
+    done
+fi
 
 # --- 8b. baked-in native-Wayland launcher (/ff-launch.sh) --------------
 # One short serial line launches Firefox as a native wl client once the
