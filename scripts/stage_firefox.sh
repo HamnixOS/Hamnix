@@ -291,6 +291,24 @@ if [ -d "$FFROOT/usr/share/mime" ]; then
     cp -a "$FFROOT/usr/share/mime/." "$ROOTFS/usr/share/mime/" 2>/dev/null || true
 fi
 
+# --- 7b. fontconfig DTD (belt) -----------------------------------------
+# The staged /etc/fonts/fonts.conf carries `<!DOCTYPE fontconfig SYSTEM
+# "fonts.dtd">`. fontconfig's non-validating expat parse normally does NOT
+# fetch the DTD, but stage it next to the config anyway so a validating build
+# cannot trip on a missing SYSTEM entity. Sourced from the host fontconfig pkg
+# or the staging tree; harmless if absent.
+for dtd_src in "$FFROOT/usr/share/xml/fontconfig/fonts.dtd" \
+               /usr/share/xml/fontconfig/fonts.dtd \
+               /usr/share/fontconfig/fonts.dtd; do
+    if [ -f "$dtd_src" ]; then
+        mkdir -p "$ROOTFS/etc/fonts" "$ROOTFS/usr/share/xml/fontconfig"
+        cp -a "$dtd_src" "$ROOTFS/etc/fonts/fonts.dtd"
+        cp -a "$dtd_src" "$ROOTFS/usr/share/xml/fontconfig/fonts.dtd"
+        echo "[stage-ff] staged fontconfig fonts.dtd (belt) from $dtd_src"
+        break
+    fi
+done
+
 # --- 8. runtime dirs + a throwaway profile ----------------------------
 # XDG_RUNTIME_DIR=/run carries the wayland-0 socket (created by the DE).
 # Firefox writes a profile; give it a fixed throwaway dir + prefs that
@@ -490,20 +508,34 @@ export MOZ_LOG_FILE=/root/moz.log
 export HOME=/root
 export XDG_CONFIG_HOME=/run
 export XDG_CACHE_HOME=/root/.cache
-# Fontconfig: point libfontconfig explicitly at the staged /etc/fonts config.
-# Without this, firefox's fontconfig cannot locate a default config file
-# ("Cannot load default config file: No such file: (null)") because its
-# compiled-in default path does not match the Hamnix distro layout and no
-# FONTCONFIG_* env is set -> font init fails and firefox exits before it
-# commits its first wl_shm frame. FONTCONFIG_FILE names the config directly;
-# FONTCONFIG_PATH is the dir fallback. Both are standard fontconfig overrides.
-export FONTCONFIG_FILE=/etc/fonts/fonts.conf
+# Fontconfig: libfontconfig must locate its config, else gfxPlatformGtk font
+# -list init (FcInitLoadConfigAndFonts) fails and — critically — its font-init
+# WORKER thread aborts without signalling the main thread's join-futex, so the
+# main thread parks FOREVER (the observed task-35 futex-wait deadlock, uaddr
+# ~0x20b8ea650). PRIOR form set FONTCONFIG_FILE to the ABSOLUTE path
+# /etc/fonts/fonts.conf; fontconfig's FcConfigFileExists then reported "Cannot
+# load default config file: No such file: (null)" — it rejects the absolute
+# value. The CANONICAL fontconfig override is a BASENAME resolved through
+# FONTCONFIG_PATH: FONTCONFIG_FILE=fonts.conf + FONTCONFIG_PATH=/etc/fonts.
+# That is what fontconfig's own FcConfigGetFilename search expects.
+export FONTCONFIG_FILE=fonts.conf
 export FONTCONFIG_PATH=/etc/fonts
+export FONTCONFIG_SYSROOT=/
 export G_SLICE=always-malloc
 export G_MESSAGES_DEBUG=all
 mkdir -p /root/.cache /root/.mozilla /run
 # drop any stale profile lock from a prior crashed run
 rm -f /root/.ff-profile/lock /root/.ff-profile/.parentlock 2>/dev/null
+# ---- FONT DIAGNOSTICS (serial): prove whether the namespace can SEE + READ
+# the fontconfig config, and echo the resolved env. This pinpoints whether the
+# "(null)" config failure is an env-propagation gap, a namespace file-access
+# gap, or a fontconfig path-resolution quirk. Cheap; prints a few [FF-DIAG]
+# lines then continues to launch. ----
+echo "[FF-DIAG] uid=$(id -u 2>/dev/null) FONTCONFIG_FILE=$FONTCONFIG_FILE FONTCONFIG_PATH=$FONTCONFIG_PATH"
+ls -l /etc/fonts/fonts.conf 2>&1 | while IFS= read -r l; do echo "[FF-DIAG] ls: $l"; done
+if [ -r /etc/fonts/fonts.conf ]; then echo "[FF-DIAG] fonts.conf IS readable (test -r)"; else echo "[FF-DIAG] fonts.conf NOT readable (test -r)"; fi
+head -1 /etc/fonts/fonts.conf 2>&1 | while IFS= read -r l; do echo "[FF-DIAG] head: $l"; done
+ls /usr/share/fonts/truetype/dejavu 2>&1 | while IFS= read -r l; do echo "[FF-DIAG] fonts: $l"; done
 echo "[FF] launching firefox-esr (native wayland)"
 /usr/lib/firefox-esr/firefox-esr \
     -profile /root/.ff-profile -no-remote -new-instance 'about:blank' 2>&1 \
