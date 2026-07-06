@@ -600,8 +600,15 @@ mkdir -p "$FFHOME/.ff-profile" "$FFHOME/.cache" "$FFHOME/.config" "$FFHOME/.mozi
 cp /usr/lib/firefox-esr/ff-profile-seed/prefs.js "$FFHOME/.ff-profile/prefs.js" 2>/dev/null || true
 cp /usr/lib/firefox-esr/ff-profile-seed/user.js  "$FFHOME/.ff-profile/user.js"  2>/dev/null || true
 chmod -R 0777 "$FFHOME" 2>/dev/null || true
-export MOZ_LOG='ipc:5,IPDL:5,MessageChannel:5,widget:5,WidgetWayland:5,nsWindow:5,sync'
-export MOZ_LOG_FILE="$FFHOME/moz.log"
+# DIAGNOSTICS: route MOZ_LOG to the PARENT's stderr (NOT a file). The
+# MOZ_LOG_FILE=$FFHOME/moz.log form NEVER materialised (confirmed: "cannot open
+# /tmp/ffhome/moz.log: No such file" — Firefox exits before/without flushing the
+# NSPR log to a file). But the PARENT firefox-esr's stderr DOES reach the serial
+# console through the [FF] read-loop below (its GTK/GLib debug prints there), so
+# unsetting MOZ_LOG_FILE makes MOZ_LOG stream to stderr -> [FF] serial, giving us
+# the parent's EXACT window-bring-up / IPC-launch / shutdown decision live.
+export MOZ_LOG='nsWindow:5,WidgetWayland:5,Widget:5,Compositor:4,WebRender:4,ipc:4,sync,timestamp'
+unset MOZ_LOG_FILE 2>/dev/null || true
 export HOME="$FFHOME"
 export XDG_CONFIG_HOME="$FFHOME/.config"
 export XDG_CACHE_HOME="$FFHOME/.cache"
@@ -635,12 +642,15 @@ echo "[FF-DIAG] uid=$(id -u 2>/dev/null) HOME=$HOME FFHOME=$FFHOME"
 if ( : > "$FFHOME/.ff-profile/.wtest" ) 2>/dev/null; then echo "[FF-DIAG] profile dir IS writable"; rm -f "$FFHOME/.ff-profile/.wtest"; else echo "[FF-DIAG] profile dir NOT writable"; fi
 ls -ld "$FFHOME" "$FFHOME/.ff-profile" 2>&1 | while IFS= read -r l; do echo "[FF-DIAG] home: $l"; done
 echo "[FF] launching firefox-esr (native wayland)"
-/usr/lib/firefox-esr/firefox-esr \
-    -profile "$FFHOME/.ff-profile" -no-remote -new-instance 'about:blank' 2>&1 \
-    | while IFS= read -r line; do echo "[FF] $line"; done
+# Capture the PARENT's exit code THROUGH the pipe (dash has no PIPESTATUS): the
+# `echo FFEXIT=$?` runs in the same subshell immediately after firefox exits, so
+# its exit code streams to serial as "[FF] FFEXIT=<code>". This tells us whether
+# the parent exits 0 (clean, gave up), 255 (startup failure), or a signal code.
+{ /usr/lib/firefox-esr/firefox-esr \
+    -profile "$FFHOME/.ff-profile" -no-remote -new-instance 'about:blank' 2>&1
+  echo "FFEXIT=$?"
+} | while IFS= read -r line; do echo "[FF] $line"; done
 echo "[FF] firefox pipeline ended"
-echo "[FF-POST] moz.log lines: $(wc -l < "$FFHOME/moz.log" 2>/dev/null || echo MISSING)"
-tail -n 40 "$FFHOME/moz.log" 2>/dev/null | while IFS= read -r l; do echo "[FF-LOG] $l"; done
 FFLAUNCH
 chmod +x "$ROOTFS/ff-launch.sh"
 echo "[stage-ff] baked native-wayland launcher: /ff-launch.sh"
