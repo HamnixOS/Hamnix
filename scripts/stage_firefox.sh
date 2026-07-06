@@ -592,14 +592,29 @@ export MOZ_LAYOUT_FRAME_RATE=10
 # (no xdg_toplevel, no wl_shm commit). FIX: relocate EVERY writable path to
 # world-writable /tmp (1777, writable by uid 1001) and COPY the seeded prefs
 # there at launch so Firefox owns a fully-writable profile.
-FFHOME=/tmp/ffhome
+# THE PREFS-DELIVERY FIX. `spawn linux { ... }` runs Firefox as a NON-hostowner
+# uid (observed uid=1001), but Hamnix tmpfs assigns NEW files/dirs owner uid 0
+# (it does not honour the caller's fsuid), so a plain `mkdir "$FFHOME/.ff-profile"`
+# yields a ROOT-owned 0755 dir that uid 1001 then CANNOT write prefs.js into — the
+# seed copy silently fails and Firefox launches with DEFAULT prefs (no
+# gfx.webrender.software / no software-render forcing), taking a GL/compositor
+# path that cannot work here. Confirmed by "[openat-enoent]
+# /tmp/ffhome/.ff-profile/prefs.js" on the serial. FIX: `umask 000` so mkdir -p
+# creates every profile dir mode 0777 REGARDLESS of the tmpfs-assigned owner, so
+# the uid-1001 process can write prefs.js/user.js into them. Also make FFHOME
+# pid-unique so a stale root-owned /tmp/ffhome from any earlier spawn can never
+# shadow it. (chmod -R is kept as a belt but is a no-op on root-owned nodes.)
+umask 000
+FFHOME="/tmp/ffhome.$$"
 rm -rf "$FFHOME" 2>/dev/null
 mkdir -p "$FFHOME/.ff-profile" "$FFHOME/.cache" "$FFHOME/.config" "$FFHOME/.mozilla"
 # seed prefs from the WORLD-READABLE seed under /usr (uid 1001 may not
-# traverse root-owned /root) into the writable /tmp profile.
+# traverse root-owned /root) into the now-world-writable /tmp profile.
 cp /usr/lib/firefox-esr/ff-profile-seed/prefs.js "$FFHOME/.ff-profile/prefs.js" 2>/dev/null || true
 cp /usr/lib/firefox-esr/ff-profile-seed/user.js  "$FFHOME/.ff-profile/user.js"  2>/dev/null || true
 chmod -R 0777 "$FFHOME" 2>/dev/null || true
+# PROVE the prefs landed (else Firefox silently runs GL-path defaults).
+if [ -s "$FFHOME/.ff-profile/prefs.js" ]; then echo "[FF-DIAG] prefs.js delivered ($(wc -l < "$FFHOME/.ff-profile/prefs.js") lines)"; else echo "[FF-DIAG] prefs.js MISSING — Firefox will use GL-path defaults!"; fi
 # DIAGNOSTICS: the process our launch pipe reads is a SHORT-LIVED launcher fork
 # that returns 255; the REAL firefox forks off (observed pid), REDIRECTS its own
 # stdio (so no more [FF] serial output) and then DEADLOCKS with all ~13 threads
