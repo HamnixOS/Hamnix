@@ -572,14 +572,7 @@ from kernel.sched.core import (
     # /proc/<pid>/io: charge rchar/syscr at read() and wchar/syscw at write().
     current_task_charge_read, current_task_charge_write,
     set_task_fs_base, task_fs_base, set_task_clear_child_tid,
-    yield_to_others, kernel_cond_resched,
-    # U27 futex blocking rework: a real park (blocking wait queue) instead
-    # of a poll-yield spin. WaitQueue + wq_wait_prepare/commit/cancel park
-    # the caller OFF the runqueue; wq_wake_slot directed-wakes a specific
-    # waiter task by slot; linux_mm_peer_exists gates the park (any live
-    # same-mm peer, INCLUDING blocked ones, could later wake us).
-    WaitQueue, wq_init, wq_wait_prepare, wq_wait_commit, wq_wait_cancel,
-    wq_wake_slot, linux_mm_peer_exists, WQ_EINTR,
+    count_live_linux_peers, yield_to_others, kernel_cond_resched,
     get_task_sig_handler, set_task_sig_handler,
     get_task_sig_mask, set_task_sig_mask,
     get_task_sig_flags, set_task_sig_flags,
@@ -851,14 +844,6 @@ extern def load_cr3(value: uint64)
 extern def local_irq_enable()
 extern def local_irq_disable()
 extern def cpu_relax()
-# U27 futex table lock. Serialises "register-my-slot + prepare-to-wait +
-# recheck *uaddr" on the WAIT side against "clear-slot + wake" on the WAKE
-# side, closing the classic futex lost-wakeup window. Taken only from
-# syscall (ring-0) context — futex is never poked from an IRQ handler — so
-# a plain spinlock is sufficient (ring-0 ticks never preempt, per
-# time.ad's preempt_tick gate).
-extern def spinlock_lock(ptr: Ptr[uint32])
-extern def spinlock_unlock(ptr: Ptr[uint32])
 # msync_selftest runs at boot:37.msy, BEFORE syscall_init (boot:39) arms
 # IA32_EFER.NXE. Shared-writable file pages are WRITABLE NX DATA, so a
 # data access would otherwise take a reserved-bit #PF. Arm NXE first
@@ -1508,9 +1493,6 @@ ELINUX_RANGE:  int64 = -34
 ELINUX_NAMETOOLONG: int64 = -36     # -ENAMETOOLONG (#163 path copy-in)
 ELINUX_NOSYS:  int64 = -38
 ELINUX_NOTTY:  int64 = -25
-# -EINTR: a blocking FUTEX_WAIT park interrupted by signal delivery
-# reports this so glibc/musl re-issue the futex per their restart logic.
-ELINUX_INTR:   int64 = -4
 ELINUX_CONNREFUSED: int64 = -111
 # U-socket: extra errnos the connect(2) bridge maps tcp_connect's
 # failure codes onto. Numeric values from <asm-generic/errno.h>.
@@ -11451,26 +11433,6 @@ futex_slot:   Array[512, int32]   # task slot index of the waiter
 # is meaningless and left 0; it is never consulted on that path.
 futex_tag:    Array[512, int32]
 
-# U27 blocking rework. One GLOBAL wait queue backs every parked FUTEX_WAIT
-# sleeper. A waiter is identified for wakeup by its (uaddr -> task slot)
-# entry in the futex_addr table above, NOT by wait-queue position, so a
-# single shared queue is enough: FUTEX_WAKE clears the matching table
-# slot(s) and directed-wakes each cleared task by slot (wq_wake_slot). The
-# queue membership is used only for the halt-hazard / signal-interrupt /
-# SMP-fencing plumbing inside wq_wait_prepare/commit and for the woken
-# task's self-unlink on return. Initialised in u_syscalls_init.
-#
-# _futex_lock serialises the WAIT side's "register slot + prepare-to-wait +
-# recheck *uaddr" against the WAKE side's "clear slot + wake". Because both
-# critical sections take _futex_lock, a wake cannot slip between a waiter's
-# *uaddr recheck and its going-to-sleep: either the wake ran first (waiter's
-# locked recheck sees *uaddr moved and bails without sleeping) or it runs
-# after (finds the waiter registered + STATE_WAIT and wakes it). No lost
-# wakeup. _futex_lock is ALWAYS released before wq_wait_commit sleeps — a
-# sleeper must never hold it or the waker would deadlock taking it.
-futex_wq:    WaitQueue
-_futex_lock: uint32 = 0
-
 
 def futexv_claim_slot(uaddr: uint64, vec_idx: int32) -> int32:
     # Surgical park-on-multiple primitive for futex_waitv. Register the
@@ -11525,28 +11487,17 @@ def futex_wake_all(uaddr: uint64) -> int32:
     # we cleared. Invoked from task_exit_current's CLEARTID handshake
     # (indirectly, through the cleartid_wake_hook function pointer this
     # module registers in u_syscalls_init) and directly from FUTEX_WAKE.
-    # U27 blocking rework: a parked FUTEX_WAIT waiter now SLEEPS on futex_wq
-    # (STATE_WAIT, off the runqueue) rather than poll-yielding, so clearing
-    # its table slot is no longer enough — we must DIRECTED-wake the exact
-    # waiter task by slot (wq_wake_slot) so the scheduler re-dispatches it.
-    # (A futex_waitv poller that is still in a yield loop is simply not
-    # STATE_WAIT, so wq_wake_slot is a harmless no-op for it and it observes
-    # the cleared slot on its next poll iteration — both models coexist.)
-    # Runs under _futex_lock so the clear+wake is atomic vs a concurrent
-    # WAIT-side register+prepare.
-    spinlock_lock(&_futex_lock)
+    # The woken task itself doesn't need to be state-poked here —
+    # _u_futex's WAIT loop polls futex_addr[my_slot] after each
+    # yield_to_others, so clearing the slot is enough.
     i: uint64 = 0
     woke: int32 = 0
     while i < FUTEX_NSLOTS:
         if futex_addr[i] == uaddr:
-            wslot: int32 = futex_slot[i]
             futex_addr[i] = 0
             futex_slot[i] = -1
-            if wslot >= 0:
-                wq_wake_slot(cast[uint64](wslot))
             woke = woke + 1
         i = i + 1
-    spinlock_unlock(&_futex_lock)
     return woke
 
 
@@ -11578,8 +11529,6 @@ def u_syscalls_init():
     # WITHOUT the scheduler statically depending on this Layer-2 file.
     register_cleartid_wake_hook(futex_wake_all)
     printk0("[u_syscalls] CLEARTID futex-wake hook registered\n")
-    # U27: initialise the global futex sleeper wait queue (empty head).
-    wq_init(&futex_wq)
     # #73: register the futex-table stall dumper so the no-syscall watchdog
     # can name every parked FUTEX_WAIT uaddr when a multi-thread stall fires.
     register_linux_futex_dump_hook(futex_table_dump)
@@ -11672,141 +11621,69 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
         # fails, it re-enters wait. Threads created via clone(CLONE_THREAD)
         # bump the peer count, at which point the park path below
         # (real wait on the futex queue) is the right answer.
-        # U27 blocking rework: the guard is linux_mm_peer_exists (a live
-        # SAME-MM peer in ANY state, incl. blocked) rather than the old
-        # READY/RUNNING-only count_live_linux_peers. Once a real park sleeps
-        # OFF the runqueue, a whole thread group can be simultaneously
-        # blocked yet live — requiring a runnable peer would refuse the park
-        # and busy-EAGAIN-spin, reintroducing the O(n^2) poll-yield collapse
-        # this rework exists to eliminate. A genuinely single-threaded
-        # process still has zero same-mm peers and takes the bounded-yield +
-        # EAGAIN fallback (glibc re-tries the cmpxchg) so it never parks
-        # forever on its first contended arena mutex.
-        if linux_mm_peer_exists() == 0:
+        if count_live_linux_peers() == 0:
             budget: int32 = 0
             while budget < 8:
                 yield_to_others()
-                if linux_mm_peer_exists() != 0:
+                if count_live_linux_peers() != 0:
                     break
                 if get_user_32(a0, &cur) != 0:          # #163
                     return ELINUX_EFAULT
                 if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
                     return 0
                 budget = budget + 1
-            if linux_mm_peer_exists() == 0:
+            if count_live_linux_peers() == 0:
                 return ELINUX_AGAIN
-        # A live same-mm peer exists -> PARK FOR REAL on futex_wq: the caller
-        # BLOCKS (STATE_WAIT, removed from the runqueue) instead of the old
-        # busy poll-yield loop. FUTEX_WAKE clears our table slot and directed-
-        # wakes us by slot (wq_wake_slot). This is the general many-threaded
-        # scalability win — 42 blocked Firefox threads now consume ZERO
-        # scheduler rotations, killing the O(n^2) yield-to-all collapse.
-        #
-        # Race-freedom (no lost wakeup): the register-slot + prepare-to-wait
-        # + recheck-*uaddr sequence runs under _futex_lock, the SAME lock
-        # FUTEX_WAKE takes to clear+wake. Either the wake ran before we
-        # registered (our locked recheck sees *uaddr moved and we bail
-        # without sleeping) or it runs after (it finds us registered +
-        # STATE_WAIT and wakes us). _futex_lock is released BEFORE
-        # wq_wait_commit sleeps — a sleeper never holds it.
+        # Park in a free slot. Linear scan is fine — 16 slots, called
+        # rarely on the bring-up workload.
         my_slot: int32 = cast[int32](current_idx_get())
-        while True:
-            spinlock_lock(&_futex_lock)
-            # Recheck *uaddr under the lock: a wake that landed before we
-            # registered wrote the new value first, so a mismatch here means
-            # "already woken" — return without sleeping.
-            if get_user_32(a0, &cur) != 0:              # #163
-                spinlock_unlock(&_futex_lock)
-                return ELINUX_EFAULT
-            if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
-                spinlock_unlock(&_futex_lock)
-                return 0
-            # Claim a table slot — the WAKE side matches waiters on it.
-            spot: int32 = -1
-            i: uint64 = 0
-            while i < FUTEX_NSLOTS:
-                if futex_addr[i] == 0:
-                    spot = cast[int32](i)
-                    i = FUTEX_NSLOTS
-                else:
-                    i = i + 1
-            if spot < 0:
-                # Table full (extreme vector-wait fan-out) — degrade to
-                # EAGAIN; glibc/musl re-try the cmpxchg in userspace.
-                spinlock_unlock(&_futex_lock)
-                return ELINUX_AGAIN
-            su: uint64 = cast[uint64](spot)
-            futex_addr[su] = a0
-            futex_slot[su] = my_slot
-            # Prepare-to-wait: link onto futex_wq + STATE_WAIT, still under
-            # _futex_lock so no wake can slip in before we commit to sleep.
-            wq_wait_prepare(&futex_wq)
-            # Final recheck under the lock (closes the window between the
-            # first recheck and prepare): a wake OR a value-move here means
-            # cancel the prepared wait and return without sleeping.
-            if get_user_32(a0, &cur) != 0:              # #163
-                futex_addr[su] = 0
-                futex_slot[su] = -1
-                wq_wait_cancel(&futex_wq)
-                spinlock_unlock(&_futex_lock)
-                return ELINUX_EFAULT
-            if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
-                futex_addr[su] = 0
-                futex_slot[su] = -1
-                wq_wait_cancel(&futex_wq)
-                spinlock_unlock(&_futex_lock)
-                return 0
-            # Release _futex_lock BEFORE sleeping — we are already registered
-            # + STATE_WAIT, so any wake after this unlock finds and wakes us.
-            spinlock_unlock(&_futex_lock)
-            rc: int32 = wq_wait_commit(&futex_wq)
-            # Woken (FUTEX_WAKE data-wake, a signal force-wake, or a spurious
-            # wake on the shared queue). Vacate our slot under the lock and
-            # learn whether a real futex wake cleared it.
-            spinlock_lock(&_futex_lock)
-            cleared: int32 = 0
+        i: uint64 = 0
+        spot: int32 = -1
+        while i < FUTEX_NSLOTS:
+            if futex_addr[i] == 0:
+                spot = cast[int32](i)
+                i = FUTEX_NSLOTS
+            else:
+                i = i + 1
+        if spot < 0:
+            return ELINUX_AGAIN
+        su: uint64 = cast[uint64](spot)
+        futex_addr[su] = a0
+        futex_slot[su] = my_slot
+        # Yield until our slot is cleared (futex_wake_all) OR the user
+        # value moves off `val` (mutex unlock wrote the new word; a
+        # racing wake would race us here, which is fine — we re-check
+        # *uaddr each iteration so a missed wake is a one-yield delay).
+        do:
+            yield_to_others()
             if futex_addr[su] == 0:
-                cleared = 1
-            futex_addr[su] = 0
-            futex_slot[su] = -1
-            spinlock_unlock(&_futex_lock)
-            if cleared != 0:
-                return 0                                # real FUTEX_WAKE
-            if rc == WQ_EINTR:
-                return ELINUX_INTR                      # signal interrupted
-            # Spurious / different-uaddr sharer woke the shared queue:
-            # recheck *uaddr. If it moved we are effectively woken; else
-            # loop and re-register + re-sleep.
+                break
             if get_user_32(a0, &cur) != 0:              # #163
+                futex_addr[su] = 0
+                futex_slot[su] = -1
                 return ELINUX_EFAULT
             if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
-                return 0
-        return 0                                        # unreachable
+                # Value moved — pretend we were woken. Clear our slot
+                # ourselves so a stale entry doesn't haunt the table.
+                futex_addr[su] = 0
+                futex_slot[su] = -1
+                break
+        while 1
+        return 0
     if op == FUTEX_WAKE:
         if a0 == 0:
             return ELINUX_INVAL
         # a2 is the maximum number of waiters to wake. glibc passes
         # 1 for mutexes, INT_MAX for cv-broadcast. We honour the cap.
-        # Under _futex_lock (atomic vs a concurrent WAIT-side register +
-        # prepare) clear each matching table slot AND directed-wake its
-        # task by slot — a blocking waiter is STATE_WAIT off the runqueue
-        # and must be re-dispatched (wq_wake_slot); a still-yielding
-        # futex_waitv poller is simply not STATE_WAIT so the wake is a
-        # harmless no-op and it sees the cleared slot on its next poll.
         max_wake: uint64 = a2 & 0xFFFFFFFF
         woke: int64 = 0
-        spinlock_lock(&_futex_lock)
         i: uint64 = 0
         while i < FUTEX_NSLOTS:
             if futex_addr[i] == a0 and cast[uint64](woke) < max_wake:
-                wslot: int32 = futex_slot[i]
                 futex_addr[i] = 0
                 futex_slot[i] = -1
-                if wslot >= 0:
-                    wq_wake_slot(cast[uint64](wslot))
                 woke = woke + 1
             i = i + 1
-        spinlock_unlock(&_futex_lock)
         return woke
     return ELINUX_NOSYS
 
