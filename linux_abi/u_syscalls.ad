@@ -11459,7 +11459,13 @@ ELINUX_AGAIN:          int64  = -11
 # task, so it may still overflow under extreme vector-wait fan-out, but the
 # single-wait common path is now exhaustion-proof.) Cost is ~10 KiB of BSS.
 FUTEX_NSLOTS: uint64 = 512
-futex_addr:   Array[512, uint64]  # 0 means "free slot"
+# NB: futex_addr stores a computed KEY (see _futex_key), NOT the raw user
+# VA. A PRIVATE futex keys on (address space, VA); a SHARED (process-shared,
+# no FUTEX_PRIVATE_FLAG) futex keys on the PHYSICAL address of the word. That
+# makes the table correct ACROSS processes: two processes' private futexes at
+# the same VA no longer collide, and a cross-process FUTEX_WAKE on a shared
+# memfd/MAP_SHARED page (mapped at different VAs) reaches the parked waiter.
+futex_addr:   Array[512, uint64]  # 0 means "free slot" (holds a _futex_key)
 futex_slot:   Array[512, int32]   # task slot index of the waiter
 # Parallel "vector-index tag" array used ONLY by the futex_waitv path
 # (linux_abi/u_futexv.ad). When a task parks on a VECTOR of futexes it
@@ -11520,18 +11526,55 @@ FUTEX_PARK_TICKS: uint64 = 3
 FUTEX_BLOCK_THRESH: int32 = 6
 
 
-def futexv_claim_slot(uaddr: uint64, vec_idx: int32) -> int32:
+# _futex_key — map a futex word (user VA + private/shared discriminator) to
+# the wait-table match key. THE cross-process-correctness keystone.
+#
+# PRIVATE futex (op carries FUTEX_PRIVATE_FLAG — every glibc/musl pthread
+# mutex/cond/join by default): key on (current address space, VA). Within one
+# process cr3 is constant, so the key is a BIJECTION with the VA — identical
+# matching to the old raw-VA key, so the proven single-process render path
+# (weston-terminal) and the pthread_join/thread_many tests are byte-for-byte
+# unchanged. ACROSS processes the cr3 differs, so process A's private-futex
+# wake can no longer steal (or be stolen by) process B's waiter at the same
+# VA — the multiprocess correctness fix. Bit 63 tags PRIVATE so a private key
+# can never equal a SHARED key.
+#
+# SHARED futex (no FUTEX_PRIVATE_FLAG — glibc PTHREAD_PROCESS_SHARED mutex/
+# sem, e.g. Gecko's CrossProcessMutex/Semaphore over a memfd): key on the
+# PHYSICAL address of the word. Two processes mapping the same physical page
+# at DIFFERENT VAs resolve to the SAME key, so a FUTEX_WAKE in one reaches the
+# FUTEX_WAIT parked in the other — the shared-memory cross-process handshake
+# that Firefox's content/GPU child<->parent bring-up deadlocks on without it.
+# If the page can't be resolved (not yet faulted in) fall back to a distinctly
+# tagged VA key (bit 62): a possibly-missed cross-map match is preferable to a
+# wrong-page one, and the WAIT path has already fetched the word so the common
+# case resolves.
+def _futex_key(uaddr: uint64, private: int32) -> uint64:
+    if private != 0:
+        pml4: uint64 = uaccess_current_pml4()
+        return 0x8000000000000000 \
+             | ((uaddr & 0x7FFFFFFFFFFF) ^ (((pml4 >> 12) & 0x1FFFF) << 30))
+    ph: uint64 = uaccess_resolve(uaccess_current_pml4(), uaddr, 0)
+    if ph == 0:
+        return 0x4000000000000000 | (uaddr & 0x3FFFFFFFFFFF)
+    return ph & 0x3FFFFFFFFFFFFFFF
+
+
+def futexv_claim_slot(uaddr: uint64, vec_idx: int32, private: int32) -> int32:
     # Surgical park-on-multiple primitive for futex_waitv. Register the
     # CURRENT task as a waiter against `uaddr`, tagging the slot with the
     # caller-supplied vector index. Returns the claimed table-slot index,
     # or -1 if the futex table is full. Reuses the exact same wait table
     # that FUTEX_WAKE / futex_wake_all walk, so a wake on any registered
-    # uaddr clears the matching slot just like a single-uaddr waiter.
+    # uaddr clears the matching slot just like a single-uaddr waiter. The
+    # slot is keyed via _futex_key (private -> (mm,VA); shared -> phys) so a
+    # cross-process FUTEX_WAKE matches exactly as a single-uaddr waiter does.
+    key: uint64 = _futex_key(uaddr, private)
     my_slot: int32 = cast[int32](current_idx_get())
     i: uint64 = 0
     while i < FUTEX_NSLOTS:
         if futex_addr[i] == 0:
-            futex_addr[i] = uaddr
+            futex_addr[i] = key
             futex_slot[i] = my_slot
             futex_tag[i] = vec_idx
             return cast[int32](i)
@@ -11583,11 +11626,16 @@ def futex_wake_all(uaddr: uint64) -> int32:
     # Runs under _futex_lock so the clear+wake is atomic vs a concurrent
     # WAIT-side register+prepare, closing the lost-wakeup window; the bounded
     # timeout recheck is only a SELF-HEAL backstop, not the primary path.
+    # The CLEARTID / pthread_join futex is PRIVATE (glibc waits on the tid
+    # word with FUTEX_WAIT_PRIVATE) and the exiting thread shares the joiner's
+    # address space, so key it PRIVATE against the current (exiting) task's mm
+    # — the same key the joiner's FUTEX_WAIT registered.
+    key: uint64 = _futex_key(uaddr, 1)
     spinlock_lock(&_futex_lock)
     i: uint64 = 0
     woke: int32 = 0
     while i < FUTEX_NSLOTS:
-        if futex_addr[i] == uaddr:
+        if futex_addr[i] == key:
             wslot: int32 = futex_slot[i]
             futex_addr[i] = 0
             futex_slot[i] = -1
@@ -11611,7 +11659,7 @@ def futex_table_dump():
     any: int32 = 0
     while i < FUTEX_NSLOTS:
         if futex_addr[i] != 0:
-            printk3("[nosys-wd]   futex slot=%d uaddr=%p waiter_task=%d\n",
+            printk3("[nosys-wd]   futex slot=%d key=%p waiter_task=%d\n",
                     i, futex_addr[i], cast[uint64](futex_slot[i]))
             any = 1
         i = i + 1
@@ -11699,6 +11747,12 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
     # workload (mutexes + join, no condition variables).
     if op == FUTEX_REQUEUE or op == FUTEX_CMP_REQUEUE:
         op = FUTEX_WAKE
+    # PRIVATE vs SHARED discriminator (read from the RAW op before masking):
+    # selects _futex_key's (mm,VA) vs physical-page keying. WAIT and WAKE on
+    # the same logical futex always pass the same flag, so their keys match.
+    priv: int32 = 0
+    if (a1 & FUTEX_PRIVATE_FLAG) != 0:
+        priv = 1
     if op == FUTEX_WAIT:
         if a0 == 0:
             return ELINUX_INVAL
@@ -11764,7 +11818,7 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
             if py_spot < 0:
                 return ELINUX_AGAIN
             py_su: uint64 = cast[uint64](py_spot)
-            futex_addr[py_su] = a0
+            futex_addr[py_su] = _futex_key(a0, priv)
             futex_slot[py_su] = py_slot
             do:
                 yield_to_others()
@@ -11822,6 +11876,7 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
         # STATE_WAIT and wakes us). _futex_lock is released BEFORE
         # wq_wait_commit_timeout sleeps — a sleeper never holds it.
         my_slot: int32 = cast[int32](current_idx_get())
+        wait_key: uint64 = _futex_key(a0, priv)
         while True:
             spinlock_lock(&_futex_lock)
             # Recheck *uaddr under the lock: a wake that landed before we
@@ -11848,7 +11903,7 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
                 spinlock_unlock(&_futex_lock)
                 return ELINUX_AGAIN
             su: uint64 = cast[uint64](spot)
-            futex_addr[su] = a0
+            futex_addr[su] = wait_key
             futex_slot[su] = my_slot
             # Prepare-to-wait: link onto futex_wq + STATE_WAIT, still under
             # _futex_lock so no wake can slip in before we commit to sleep.
@@ -11909,10 +11964,11 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
         # the cleared slot on its next poll.
         max_wake: uint64 = a2 & 0xFFFFFFFF
         woke: int64 = 0
+        wake_key: uint64 = _futex_key(a0, priv)
         spinlock_lock(&_futex_lock)
         i: uint64 = 0
         while i < FUTEX_NSLOTS:
-            if futex_addr[i] == a0 and cast[uint64](woke) < max_wake:
+            if futex_addr[i] == wake_key and cast[uint64](woke) < max_wake:
                 wslot: int32 = futex_slot[i]
                 futex_addr[i] = 0
                 futex_slot[i] = -1
