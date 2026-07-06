@@ -1199,6 +1199,7 @@ class Program:
             shape = rng.choice([
                 "lin1d", "lin1d_R", "twod", "dec", "stepk",
                 "nested_outer_inv", "multi_iv_index", "alias", "break_exit",
+                "varstride", "varstride_R",
             ])
             if shape == "lin1d":
                 # a[i*C] = i*7 + C  for i in 0..n, C constant >= 2.
@@ -1319,6 +1320,40 @@ class Program:
                 for i in range(n):
                     store(i * C, I64.wrap(i + 9))
                 self._fold_value(f"cast[uint64](ivalrd_{u})", U64.wrap(sh[last % NCELL]))
+            elif shape == "varstride":
+                # The reduced loop's OWN iv times a VARIABLE loop-invariant local:
+                # a[k*N] for k in 0..n, N a runtime-invariant local. coeff==N (a bare
+                # invariant IDENT), step==1 => the IVSR delta is a bare ident. This is
+                # exactly matmul's k-loop `B[k*N+j]` stride shape that mints the r11=N
+                # duplicate; the dedup INLINES N directly into `t += N` (reads N's home
+                # each iter). The position-weighted fold below diverges if inlining a
+                # re-read of N ever lands a store at the wrong address (i.e. if N were
+                # not truly invariant / the re-read gave a different value).
+                Cn = rng.randint(2, 5)
+                n = rng.randint(2, max(2, D // Cn))
+                self.emit(f"    ivvN_{u}: int64 = cast[int64]({Cn})")
+                self.emit(f"    ivvk_{u}: int64 = cast[int64](0)")
+                self.emit(f"    while ivvk_{u} < cast[int64]({n}):")
+                self.emit(f"        {arr}[cast[int64](ivvk_{u} * ivvN_{u})] = "
+                          f"ivvk_{u} + cast[int64](7)")
+                self.emit(f"        ivvk_{u} = ivvk_{u} + cast[int64](1)")
+                for k in range(n):
+                    store(k * Cn, I64.wrap(k + 7))
+            elif shape == "varstride_R":
+                # Same bare-ident stride but with an invariant-local remainder:
+                # a[k*N + R], R an invariant local. delta is still a bare ident (N).
+                Cn = rng.randint(2, 4)
+                R = rng.randint(0, 3)
+                n = rng.randint(2, max(2, (D - R) // Cn))
+                self.emit(f"    ivwN_{u}: int64 = cast[int64]({Cn})")
+                self.emit(f"    ivwR_{u}: int64 = cast[int64]({R})")
+                self.emit(f"    ivwk_{u}: int64 = cast[int64](0)")
+                self.emit(f"    while ivwk_{u} < cast[int64]({n}):")
+                self.emit(f"        {arr}[cast[int64](ivwk_{u} * ivwN_{u} + ivwR_{u})] = "
+                          f"ivwk_{u} * cast[int64](4) + ivwR_{u}")
+                self.emit(f"        ivwk_{u} = ivwk_{u} + cast[int64](1)")
+                for k in range(n):
+                    store(k * Cn + R, I64.wrap(k * 4 + R))
             else:  # break_exit
                 # Counted loop with an early break: a[i*C] until i==brk.
                 C = rng.randint(2, 4)

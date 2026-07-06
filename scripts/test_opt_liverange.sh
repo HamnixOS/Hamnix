@@ -225,6 +225,26 @@ else:
     else:
         print(f"  OK  matmul acc={cmm['acc']} reps={cmm['reps']} (k-loop depth 4)")
 
+# A(real, TWO splits): with the IVSR bare-ident stride-temp dedup (`k*N+j` no
+# longer mints a duplicate `r11=N` register), `reps` becomes register-resident
+# alongside `acc` — so BOTH are split candidates whose k-loop-covering holes the
+# splitter borrows, hoisting BOTH the `&A` AND the `&B` base out of the 39M-iter
+# k-loop. Lock in splithoist>=2 (a regression to 1 = the 2nd base recompute
+# returned). Correctness (ON==OFF==oracle) is asserted by the bench + fuzzer.
+mm_body = (WD / "lrh_matmul.ad").read_text()
+r_mm_on = h.run_through_codegen_ad("lrh_matmul_on", mm_body, WD, opt=True)
+r_mm_off = h.run_through_codegen_ad("lrh_matmul_off", mm_body, WD, opt=False)
+if r_mm_on.kind != "ok" or r_mm_off.kind != "ok":
+    fail(f"matmul: codegen kind on={r_mm_on.kind} off={r_mm_off.kind}")
+elif r_mm_on.stdout.strip() != r_mm_off.stdout.strip():
+    fail(f"matmul: ON={r_mm_on.stdout.strip()} != OFF={r_mm_off.stdout.strip()}")
+elif getattr(r_mm_on, "splithoist", 0) < 2:
+    fail(f"matmul: expected splithoist>=2 (both &A+&B), got "
+         f"{getattr(r_mm_on,'splithoist',0)} — r11=N dedup / 2nd split regressed")
+else:
+    print(f"  OK  matmul TWO-base split (splithoist={r_mm_on.splithoist}) "
+          f"ON==OFF=={r_mm_on.stdout.strip()}")
+
 # ===========================================================================
 # THE SPLITTER (codegen consumes lr_is_split_candidate) — the measured win.
 # ===========================================================================
