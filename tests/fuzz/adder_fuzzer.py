@@ -7351,6 +7351,203 @@ def _run_rcxclean_corpus():
 
 
 # --------------------------------------------------------------------------
+# CAST-CALL corpus — ir_ast_has_call cast conservatism fix (--opt).
+#
+# THE FIX: ir_ast_has_call recursed a cast's nd_a (a TYPE node), hit the
+# conservative "unknown kind -> has-call" branch, and wrongly flagged EVERY
+# `cast[T](e)`-containing pure tree as call-bearing — which denied the CALLER-
+# SAVED IR scratch pool to cast-indexed store RHS trees under callee-saved
+# exhaustion (saxpy's `ys[i]=(ys[i]+a*xs[i])&mask` with `cast[int64](i)` indices),
+# forcing the whole RHS onto the AST stack machine. The fix skips the type operand
+# (only nd_b, the value operand, can hold a call).
+#
+# SOUNDNESS CRUX: a cast's VALUE operand CAN contain a call (`cast[int64](f())`),
+# and that must STILL be flagged has-call — otherwise a caller-saved IR scratch is
+# held across the call and clobbered. The --castcall-break deliberate break skips
+# nd_b too, and the corpus proves the differential catches the resulting
+# miscompile (so the value-operand recursion is load-bearing).
+# --------------------------------------------------------------------------
+def _castcall_corpus():
+    """(name, body, expected_stdout, expected_exit, want_idxstore_fire)."""
+    M = (1 << 64) - 1
+    progs = []
+
+    # 1) SAXPY-SHAPE, cast index, NO call — the lever-firing case. Register
+    #    pressure (mask/n/a/reps live) exhausts callee-saved so the store RHS must
+    #    use CALLER-SAVED scratch; the fix makes that reachable (idxstore fires).
+    n = 256
+    ys = [(i * 5 + 1) % 97 for i in range(n)]
+    xs = [(i * 3 + 7) % 101 for i in range(n)]
+    a = 3
+    for _ in range(6):
+        for i in range(n):
+            ys[i] = (ys[i] + a * xs[i]) & M
+    exp = 0
+    for i in range(n):
+        exp = (exp + ys[i]) & M
+    saxpy_src = PRELUDE + f"""
+ysA: Array[{n}, int64]
+xsA: Array[{n}, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    mask: int64 = 18446744073709551615
+    n: int64 = {n}
+    i: int64 = 0
+    while i < n:
+        ysA[cast[int64](i)] = (i * 5 + 1) % 97
+        xsA[cast[int64](i)] = (i * 3 + 7) % 101
+        i = i + 1
+    a: int64 = 3
+    reps: int64 = 0
+    while reps < 6:
+        i = 0
+        while i < n:
+            ysA[cast[int64](i)] = (ysA[cast[int64](i)] + a * xsA[cast[int64](i)]) & mask
+            i = i + 1
+        reps = reps + 1
+    acc: int64 = 0
+    i = 0
+    while i < n:
+        acc = (acc + ysA[cast[int64](i)]) & mask
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+"""
+    progs.append(("saxpy_castidx", saxpy_src, str(exp), exp & 0xFF, True))
+
+    # 2) CAST-WRAPPED SIDE-EFFECTING CALL in a pressured self-ref store RHS — the
+    #    SOUNDNESS case. sc_bump(x) returns x and increments g_sc. Correct code
+    #    holds no caller-saved value across the call; the fix keeps this correct
+    #    (has-call still flagged), the break clobbers it. Oracle folds g_sc too.
+    ys2 = [(i * 5 + 1) % 97 for i in range(n)]
+    xs2 = [(i * 3 + 7) % 101 for i in range(n)]
+    sc = [0]
+
+    def bump(k):
+        sc[0] += 1
+        return k
+    b = 5
+    c = 7
+    d = 11
+    for _ in range(8):
+        for i in range(n):
+            ys2[i] = (ys2[i] + a * bump(xs2[i]) + b + c + d) & M
+    exp2 = 0
+    for i in range(n):
+        exp2 = (exp2 + ys2[i]) & M
+    exp2 = (exp2 + sc[0]) & M
+    callsrc = PRELUDE + f"""
+ysB: Array[{n}, int64]
+xsB: Array[{n}, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    mask: int64 = 18446744073709551615
+    n: int64 = {n}
+    i: int64 = 0
+    while i < n:
+        ysB[cast[int64](i)] = (i * 5 + 1) % 97
+        xsB[cast[int64](i)] = (i * 3 + 7) % 101
+        i = i + 1
+    a: int64 = 3
+    b: int64 = 5
+    c: int64 = 7
+    d: int64 = 11
+    reps: int64 = 0
+    while reps < 8:
+        i = 0
+        while i < n:
+            ysB[cast[int64](i)] = (ysB[cast[int64](i)] + a * cast[int64](sc_bump(xsB[cast[int64](i)])) + b + c + d) & mask
+            i = i + 1
+        reps = reps + 1
+    acc: int64 = 0
+    i = 0
+    while i < n:
+        acc = (acc + ysB[cast[int64](i)]) & mask
+        i = i + 1
+    acc = (acc + cast[int64](g_sc)) & mask
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
+"""
+    progs.append(("castcall_sidefx", callsrc, str(exp2), exp2 & 0xFF, False))
+    return progs
+
+
+# Source of the deliberate-break program (item 2 above) — the cast-wrapped
+# side-effecting call in a pressured self-ref store. Under --castcall-break the
+# caller-saved scratch held across sc_bump() is clobbered -> wrong sum.
+def _run_castcall_corpus():
+    """Run the cast-call corpus through codegen.ad --opt.
+    Returns (all_ok, total_idxstore, break_caught)."""
+    host = _ad_host()
+    total = 0
+    all_ok = True
+    fired_any = False
+    break_src = None
+    break_exp = None
+    for (name, body, exp_out, exp_exit, want_fire) in _castcall_corpus():
+        r_on = host.run_through_codegen_ad(f"cc_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"cc_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [CASTCALL corpus '{name}'] codegen.ad on={r_on.kind}/"
+                  f"off={r_off.kind}: {(r_on.detail or r_off.detail)[:120]}")
+            continue
+        ix = int(getattr(r_on, "idxstore", 0) or 0)
+        ix_off = int(getattr(r_off, "idxstore", 0) or 0)
+        total += ix
+        if ix > 0:
+            fired_any = True
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [CASTCALL corpus '{name}'] MISCOMPILE on=({r_on.stdout},"
+                  f"{r_on.exit}) oracle=({exp_out},{exp_exit}) idxstore={ix}")
+            continue
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [CASTCALL corpus '{name}'] OFF wrong=({r_off.stdout},"
+                  f"{r_off.exit}) oracle=({exp_out},{exp_exit})")
+            continue
+        if ix_off != 0:
+            all_ok = False
+            print(f"  [CASTCALL corpus '{name}'] NOT byte-inert OFF (idxstore={ix_off})")
+            continue
+        if want_fire and ix == 0:
+            all_ok = False
+            print(f"  [CASTCALL corpus '{name}'] correct but IDXSTORE NEVER FIRED "
+                  f"(the cast-indexed store RHS did not route dest-driven)")
+            continue
+        if name == "castcall_sidefx":
+            break_src = body
+            break_exp = exp_out
+    if not fired_any:
+        all_ok = False
+        print("  [CASTCALL corpus FAIL] no program routed the cast-indexed store")
+
+    # DELIBERATE BREAK: --castcall-break skips the cast VALUE operand, wrongly
+    # reporting `cast[int64](sc_bump(x))` as call-free, so a caller-saved scratch
+    # held across the call is clobbered -> wrong sum. The differential MUST catch
+    # it (broken != oracle).
+    break_caught = False
+    if break_src is not None:
+        r_brk = host.run_through_codegen_ad("cc_break", break_src, _AD_WORK,
+                                            opt=True, castcall_break=True)
+        if r_brk.kind != "ok":
+            print(f"  [CASTCALL break] compile failed: {r_brk.kind} "
+                  f"{(r_brk.detail or '')[:120]}")
+            all_ok = False
+        elif r_brk.stdout != break_exp:
+            break_caught = True
+        else:
+            print(f"  [CASTCALL break] --castcall-break did NOT miscompile the "
+                  f"cast-wrapped call store (got {r_brk.stdout}=={break_exp}) — the "
+                  f"cast value-operand recursion is NOT proven load-bearing")
+            all_ok = False
+    else:
+        all_ok = False
+        print("  [CASTCALL break] the side-effecting-call program was not correct "
+              "under --opt, so the break could not be evaluated")
+    return (all_ok, total, break_caught)
+
+
+# --------------------------------------------------------------------------
 # Phase-4 REGISTER-PRESSURE corpus. Hand-written programs with MANY
 # simultaneously-live scalar locals — more than the 5-register callee-saved pool
 # — so the linear-scan allocator is FORCED to spill, plus call-crossing values
