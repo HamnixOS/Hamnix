@@ -349,6 +349,13 @@ opt_idxreg_count: uint32 = 0
 # saved hoist could not reach (single-use base, register-pressure-saturated loop).
 # 0 with --opt OFF (isel-gated) -> the default build stays byte-identical.
 opt_splithoist_count: uint32 = 0
+# STORE-VALUE ROUND-TRIP ELISION (--opt, indexed-store lever): each `arr[i] = expr`
+# whose element address is a direct-SIB lea (%rcx-clean), so the store value is held
+# in %rcx via a reg-reg `mov %rax,%rcx` instead of a stack `push %rax`/`pop %rcx`
+# round-trip (one fewer instruction + zero stack traffic per iteration; the
+# in-place-reduction hot loops licm bucket[slot]=… / saxpy ys[i]=…). 0 with --opt
+# OFF (isel-gated) -> the default build stays byte-identical.
+opt_rcxclean_count: uint32 = 0
 
 
 def isel_enable():
@@ -373,6 +380,7 @@ def isel_reset_stats():
     opt_constif_count = 0
     opt_idxreg_count = 0
     opt_splithoist_count = 0
+    opt_rcxclean_count = 0
 
 
 # -----------------------------------------------------------------------
@@ -6773,6 +6781,52 @@ def try_sel_assign_accum(tgt: uint32, rhs: uint32) -> uint32:
     return 0
 
 
+# P1 Phase 3 — STORE-ADDRESS-in-%rcx predicate. True iff gen_index_addr(tgt) will
+# take the DIRECT-SIB single-lea path — which materialises the element address into
+# %rax touching ONLY %rax + the per-loop hoisted-base regs, and NEVER %rcx/%rdx.
+# When true, the store VALUE (already in %rax) can be parked in %rcx with a cheap
+# reg-reg `mov %rax,%rcx` instead of a stack `push %rax` / `pop %rcx` round-trip:
+#     mov %rax,%rcx ; gen_index_addr -> %rax ; mov %rcx,(%rax)
+# replaces  push %rax ; gen_index_addr -> %rax ; pop %rcx ; mov %rcx,(%rax)
+# — one fewer instruction and, more importantly, ZERO stack memory traffic per
+# iteration (the self-referential in-place reduction hot loops: licm's
+# bucket[slot]=…, saxpy's ys[i]=…). It mirrors the EXACT gates gen_index_addr uses
+# to set use_direct: isel on, a bare-ident FLAT array/ptr base (multi-dim / struct-
+# array bases return through the earlier %rcx-using branches, so they are excluded),
+# a scale-ok element size, and a register-promoted bare (peeled-cast) index. Because
+# the SIB path is chosen from the same predicates, the address emit is byte-identical
+# to the legacy path — only the value plumbing around it changes. OFF -> always 0
+# (isel_is_enabled gates it), so the default build is byte-identical.
+def index_store_addr_rcx_clean(tgt: uint32) -> uint32:
+    # Deliberate-break (guard only): claim EVERY address is rcx-clean, so the value
+    # hold fires on rcx-clobbering address shapes → wrong stored value (caught).
+    if cg_rcxclean_break != 0:
+        return 1
+    if isel_is_enabled() == 0:
+        return 0
+    base: uint32 = nd_a[tgt]
+    # Only a bare-identifier base reaches gen_index_addr's use_direct code; every
+    # other base flavour (cast/call/string/member/nested-index) uses %rcx.
+    if nd_kind[base] != ND_IDENT:
+        return 0
+    # Multi-dimensional array and Array[N,Struct] bases return through the earlier
+    # scale/add branches of gen_index_addr (which clobber %rcx) BEFORE use_direct.
+    bt: uint32 = expr_array_type(base)
+    if bt != 0 and nd_kind[nd_a[bt]] == ND_ARRAY_TYPE:
+        return 0
+    if bt != 0 and struct_lookup_by_node(nd_a[bt]) != 0:
+        return 0
+    # The element size gen_index_addr's use_direct check reads (lookup_elem_size /
+    # glob_elem_size / lookup_ptr_size / 8) equals index_elem_size for a flat ident.
+    es: uint32 = index_elem_size(tgt)
+    if isel_scale_ok(es) == 0:
+        return 0
+    # A register-promoted bare (peeled-cast) index — the use_direct trigger.
+    if index_reg_direct(nd_b[tgt]) == RA_NONE:
+        return 0
+    return 1
+
+
 # P1 Phase 3 — INDEXED-STORE RHS routing. `arr[i] = <pure-arith ND_BINARY>`:
 # compute the RHS tree DIRECTLY into a held register (no value-at-a-time push/pop
 # plumbing), then compute the element address and store the held value. Returns 1
@@ -6846,6 +6900,17 @@ def try_sel_assign_index(node: uint32) -> uint32:
             sel_expr_into_reg(v, 0)          # RHS sum -> %rax (dest-driven)
             ir_emit_leave()
             ir_scratch_tree_callfree = 0
+            # NOTE: the store-value round-trip elision (index_store_addr_rcx_clean)
+            # is deliberately NOT applied on THIS rax-safe MULTI-TERM-SUM path. It is
+            # a valid %rcx-clean elision (verified correct), but the multi-term licm
+            # inner loop it targets sits on a 32B-DSB-window knife-edge: shrinking the
+            # body by the eliminated push/pop shifts its uop packing and REGRESSES it
+            # (~1.49x -> ~1.74x of gcc-O2) DESPITE the genuine uop cut — the
+            # size-changing alignment lottery the determinism base only reduces, not
+            # eliminates (#108). The PLAIN-STORE legacy path (gen_assign_index) banks
+            # the robust wins (sieve 2.66->1.89, saxpy 1.87->1.75) where the same
+            # elision converts monotonically; this multi-term arm keeps the seed's
+            # one-slot push/pop. Revisit once loop-BODY alignment normalization lands.
             emit_push_rax()                  # park RHS (one slot, the seed's form)
             gen_index_addr(tgt)              # &arr[i] -> %rax (legacy; %rax/%rcx)
             emit_pop_rcx()                   # RHS value -> %rcx
@@ -8456,6 +8521,21 @@ cg_alelide_break: uint32 = 0
 
 def cg_set_alelide_break(v: uint32):
     cg_alelide_break = v
+
+
+# Deliberate-break switch for the store-value round-trip elision guard: when armed,
+# index_store_addr_rcx_clean returns 1 UNCONDITIONALLY, so the `mov %rax,%rcx` value
+# hold fires even when gen_index_addr's address computation goes through %rcx (a
+# binary/impure index, a multi-dim/struct-array base). That address emit then
+# clobbers %rcx — which holds the store value — so the wrong value is stored: a
+# --opt VALUE miscompile the differential catches (ON != OFF/oracle), plus an
+# OFF byte-inertness break. Default 0 (sound); NEVER set on a real compile — proves
+# the rcx-clean gate is load-bearing.
+cg_rcxclean_break: uint32 = 0
+
+
+def cg_set_rcxclean_break(v: uint32):
+    cg_rcxclean_break = v
 
 
 # Clear the hoist cache (function entry/exit). Releases the held scratch regs'
@@ -11453,6 +11533,17 @@ def gen_assign_index(node: uint32):
         # Plain store. Evaluate value, push; compute address; pop value into
         # %rcx; store %rcx -> (%rax).
         gen_expr(nd_b[node])
+        # STORE-VALUE ROUND-TRIP ELISION (--opt): when the address is a direct-SIB
+        # lea (%rcx-clean), hold the value in %rcx via a reg-reg mov instead of a
+        # stack push/pop round-trip — one fewer instruction and no stack traffic
+        # (saxpy's ys[i]=(ys[i]+a*xs[i])&mask, which reg-pressure keeps on this
+        # legacy path). OFF -> index_store_addr_rcx_clean is 0, byte-identical.
+        if index_store_addr_rcx_clean(tgt) != 0:
+            emit_mov_rax_rcx()         # value -> %rcx
+            gen_index_addr(tgt)        # &arr[i] -> %rax (direct SIB; %rcx kept)
+            emit_store_mem_rcx(es)
+            opt_rcxclean_count = opt_rcxclean_count + 1
+            return
         emit_push_rax()
         gen_index_addr(tgt)            # &arr[i] -> %rax
         emit_pop_rcx()                 # value -> %rcx

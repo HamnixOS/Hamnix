@@ -208,7 +208,7 @@ def _hex_to_bytes(lines):
 
 
 def run_dump(src_path: Path, timeout=30, opt=False, split_break=False,
-             alelide_break=False) -> DumpResult:
+             alelide_break=False, rcxclean_break=False) -> DumpResult:
     build_driver()
     rel = src_path
     # opt=True passes the dump driver's opt-in --opt flag, enabling the native
@@ -225,6 +225,8 @@ def run_dump(src_path: Path, timeout=30, opt=False, split_break=False,
         argv.append("--split-break")
     if alelide_break:
         argv.append("--alelide-break")
+    if rcxclean_break:
+        argv.append("--rcxclean-break")
     argv.append(str(rel))
     cp = subprocess.run(argv,
                         capture_output=True, text=True, timeout=timeout)
@@ -305,6 +307,7 @@ def run_dump(src_path: Path, timeout=30, opt=False, split_break=False,
                       fpcmp=meta.get("FPCMP", 0),
                       constif=meta.get("CONSTIF", 0),
                       idxreg=meta.get("IDXREG", 0),
+                      rcxclean=meta.get("RCXCLEAN", 0),
                       imulimm=meta.get("IMULIMM", 0),
                       cmpjcc=meta.get("CMPJCC", 0))
 
@@ -688,19 +691,21 @@ class CodegenRun:
         self.fpcmp = kw.get("fpcmp", 0)
         self.constif = kw.get("constif", 0)
         self.idxreg = kw.get("idxreg", 0)
+        self.rcxclean = kw.get("rcxclean", 0)
         self.imulimm = kw.get("imulimm", 0)
         self.cmpjcc = kw.get("cmpjcc", 0)
 
 
 def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
-                           split_break=False):
+                           split_break=False, rcxclean_break=False):
     work_dir.mkdir(parents=True, exist_ok=True)
     cg_body = codegen_compatible_source(body)
     src = work_dir / f"ad_{seed}.ad"
     elf = work_dir / f"ad_{seed}.elf"
     src.write_text(cg_body)
     try:
-        dump = run_dump(src, opt=opt, split_break=split_break)
+        dump = run_dump(src, opt=opt, split_break=split_break,
+                        rcxclean_break=rcxclean_break)
     except subprocess.TimeoutExpired:
         return CodegenRun("drivererror", detail="dump driver timeout")
     if dump.status in ("cgfail", "parsefail", "readfail"):
@@ -754,6 +759,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
     fpcmp = getattr(dump, "fpcmp", 0)
     constif = getattr(dump, "constif", 0)
     idxreg = getattr(dump, "idxreg", 0)
+    rcxclean = getattr(dump, "rcxclean", 0)
     imulimm = getattr(dump, "imulimm", 0)
     cmpjcc = getattr(dump, "cmpjcc", 0)
     if rp.returncode < 0:
@@ -765,7 +771,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
                           idxsel=idxsel,
                           strengthred=strengthred, isel=isel, aluload=aluload,
                           basehoist=basehoist,
-                          ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, alelide=alelide, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, imulimm=imulimm, cmpjcc=cmpjcc)
+                          ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, alelide=alelide, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, rcxclean=rcxclean, imulimm=imulimm, cmpjcc=cmpjcc)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
                       folds=folds, ffold=ffold, cse=cse, loadcse=loadcse,
                       licm=licm, dce=dce,
@@ -775,7 +781,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
                       idxsel=idxsel, spineleaf=spineleaf,
                       strengthred=strengthred, isel=isel, aluload=aluload,
                       basehoist=basehoist, splithoist=splithoist,
-                      ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, alelide=alelide, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, imulimm=imulimm, cmpjcc=cmpjcc)
+                      ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, alelide=alelide, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, rcxclean=rcxclean, imulimm=imulimm, cmpjcc=cmpjcc)
 
 
 if __name__ == "__main__":

@@ -7070,6 +7070,287 @@ def _run_p3store_corpus():
 
 
 # --------------------------------------------------------------------------
+# STORE-VALUE ROUND-TRIP ELISION corpus (RCXCLEAN lever). `arr[i] = <expr>` whose
+# element address is a direct-SIB lea (%rcx-clean) holds the store value in %rcx via
+# a reg-reg `mov %rax,%rcx` instead of a stack `push %rax`/`pop %rcx` round-trip.
+# The correctness hazard is a MIS-PREDICTED address: if the value is parked in %rcx
+# but gen_index_addr actually goes THROUGH %rcx (a binary/impure index, a member/
+# nested-index base), the address computation clobbers the value → wrong store. The
+# corpus asserts:
+#   * want_fire=True: the saxpy-shape self-referential in-place reduction + a plain
+#     non-binop store + a sub-8-byte self-ref store (all on the LEGACY plain-store
+#     path) produce ON==OFF==oracle and RCXCLEAN fires (>0), byte-inert OFF;
+#   * want_fire=False: the licm-shape MULTI-TERM-SUM store takes the rax-safe path
+#     where the elision is deliberately NOT applied (alignment-shadowed) — asserted
+#     correct only;
+#   * FALLBACK shapes the predicate refuses — a BINARY index (`arr[i+1]`), an IMPURE
+#     index (`arr[f()]`) — stay correct on the legacy push/pop path;
+#   * SUB-8-BYTE element self-ref store (es=1) fires AND truncates correctly.
+# The deliberate BREAK (--rcxclean-break) claims EVERY address is rcx-clean, so a
+# BINARY-index store parks the value in %rcx and then lets the index computation
+# clobber it → a VALUE miscompile the differential catches (ON != oracle).
+# --------------------------------------------------------------------------
+def _rcxclean_corpus():
+    M = (1 << 64) - 1
+    progs = []
+
+    def prog(name, src, val, want_fire):
+        body = PRELUDE + "\n" + src
+        progs.append((name, body, str(val & M), val & 0xFF, want_fire))
+
+    # 1) saxpy-shape self-referential in-place reduction over int64 (bare index i).
+    n = 300
+    a = 3
+    mask = M
+    ys = [(i * 5 + 1) % 97 for i in range(n)]
+    xs = [(i * 3 + 7) % 101 for i in range(n)]
+    for _ in range(8):
+        for i in range(n):
+            ys[i] = (ys[i] + a * xs[i]) & mask
+    v1 = 0
+    for i in range(n):
+        v1 = (v1 + ys[i]) & M
+    prog("saxpy_selfref",
+         f"""xs: Array[{n}, int64]
+ys: Array[{n}, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < {n}:
+        xs[cast[int64](i)] = (i * 3 + 7) % 101
+        ys[cast[int64](i)] = (i * 5 + 1) % 97
+        i = i + 1
+    a: int64 = 3
+    reps: int64 = 0
+    while reps < 8:
+        i = 0
+        while i < {n}:
+            ys[cast[int64](i)] = ys[cast[int64](i)] + a * xs[cast[int64](i)]
+            i = i + 1
+        reps = reps + 1
+    acc: int64 = 0
+    i = 0
+    while i < {n}:
+        acc = acc + ys[cast[int64](i)]
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & 255)
+""", v1, True)
+
+    # 2) licm-shape ring-buffer in-place reduction (bare index slot, masked).
+    lm = (1 << 40) - 1
+    bucket = [0] * 64
+    for aa in range(1, 400):
+        b = aa + 13
+        for j in range(400):
+            slot = j & 63
+            bucket[slot] = (bucket[slot] + aa * aa + b + j) & lm
+    v2 = 0
+    for k in range(64):
+        v2 = (v2 + bucket[k]) & M
+    prog("licm_selfref",
+         f"""bucket: Array[64, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    mask: int64 = {lm}
+    a: int64 = 1
+    while a < 400:
+        b: int64 = a + 13
+        j: int64 = 0
+        while j < 400:
+            slot: int64 = j & 63
+            bucket[cast[int64](slot)] = (bucket[cast[int64](slot)] + a * a + b + j) & mask
+            j = j + 1
+        a = a + 1
+    acc: int64 = 0
+    k: int64 = 0
+    while k < 64:
+        acc = acc + bucket[cast[int64](k)]
+        k = k + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & 255)
+""", v2, False)   # multi-term-sum store takes the rax-safe path (NOT elided —
+                  # deliberately, alignment-shadowed); correctness still asserted.
+
+    # 3) PLAIN non-binop store over a bare index (the legacy-path arm of the lever).
+    out3 = [0] * 128
+    for i in range(100):
+        w = (i * 7 + 3) & M
+        out3[i] = w
+    v3 = 0
+    for i in range(128):
+        v3 = (v3 + out3[i]) & M
+    prog("plain_store",
+         """out: Array[128, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < 100:
+        w: int64 = i * 7 + 3
+        out[cast[int64](i)] = w
+        i = i + 1
+    acc: int64 = 0
+    i = 0
+    while i < 128:
+        acc = acc + out[cast[int64](i)]
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & 255)
+""", v3, True)
+
+    # 4) SUB-8-BYTE element self-ref store (es=1: fires + must truncate on store).
+    b4 = [0] * 256
+    for i in range(200):
+        b4[i] = (i * 13 + 7) & 0xFF
+    for _ in range(3):
+        for i in range(200):
+            b4[i] = (b4[i] + 1) & 0xFF
+    v4 = 0
+    for i in range(256):
+        v4 = (v4 + b4[i]) & M
+    prog("sub8_selfref",
+         """bytes8: Array[256, uint8]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < 200:
+        bytes8[cast[int64](i)] = cast[uint8](i * 13 + 7)
+        i = i + 1
+    reps: int64 = 0
+    while reps < 3:
+        i = 0
+        while i < 200:
+            bytes8[cast[int64](i)] = cast[uint8](cast[int64](bytes8[cast[int64](i)]) + 1)
+            i = i + 1
+        reps = reps + 1
+    acc: int64 = 0
+    i = 0
+    while i < 256:
+        acc = acc + cast[int64](bytes8[cast[int64](i)])
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & 255)
+""", v4, True)
+
+    # 5) FALLBACK: BINARY index `arr[i+1]` (predicate refuses; legacy push/pop) — the
+    #    exact shape the deliberate break miscompiles. Value is a bare ident.
+    out5 = [0] * 128
+    for i in range(100):
+        w = (i * 3 + 5) & M
+        out5[i + 1] = w
+    v5 = 0
+    for i in range(128):
+        v5 = (v5 + out5[i]) & M
+    prog("binidx_fallback",
+         """out: Array[128, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < 100:
+        w: int64 = i * 3 + 5
+        out[cast[int64](i + 1)] = w
+        i = i + 1
+    acc: int64 = 0
+    i = 0
+    while i < 128:
+        acc = acc + out[cast[int64](i)]
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & 255)
+""", v5, False)
+
+    return progs
+
+
+# The single BINARY-index break program (must be one whose store takes the legacy
+# plain path AND whose address goes through %rcx): the break parks the value in
+# %rcx, the index computation clobbers it → wrong store.
+_RCXCLEAN_BREAK_SRC = """out: Array[128, int64]
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    i: int64 = 0
+    while i < 100:
+        w: int64 = i * 3 + 5
+        out[cast[int64](i + 1)] = w
+        i = i + 1
+    acc: int64 = 0
+    i = 0
+    while i < 128:
+        acc = acc + out[cast[int64](i)]
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & 255)
+"""
+
+
+def _run_rcxclean_corpus():
+    """Run the store-value round-trip elision corpus through codegen.ad --opt.
+    Returns (all_ok, total_rcxclean, break_caught)."""
+    host = _ad_host()
+    M = (1 << 64) - 1
+    total = 0
+    all_ok = True
+    fired_any = False
+    for (name, body, exp_out, exp_exit, want_fire) in _rcxclean_corpus():
+        r_on = host.run_through_codegen_ad(f"rc_{name}", body, _AD_WORK, opt=True)
+        r_off = host.run_through_codegen_ad(f"rc_{name}o", body, _AD_WORK, opt=False)
+        if r_on.kind != "ok" or r_off.kind != "ok":
+            all_ok = False
+            print(f"  [RCXCLEAN corpus '{name}'] codegen.ad on={r_on.kind}/"
+                  f"off={r_off.kind}: {(r_on.detail or r_off.detail)[:120]}")
+            continue
+        rc = int(getattr(r_on, "rcxclean", 0) or 0)
+        rc_off = int(getattr(r_off, "rcxclean", 0) or 0)
+        total += rc
+        if rc > 0:
+            fired_any = True
+        if r_on.stdout != exp_out or r_on.exit != exp_exit:
+            all_ok = False
+            print(f"  [RCXCLEAN corpus '{name}'] MISCOMPILE on=({r_on.stdout},"
+                  f"{r_on.exit}) oracle=({exp_out},{exp_exit}) rcxclean={rc}")
+            continue
+        if r_off.stdout != exp_out or r_off.exit != exp_exit:
+            all_ok = False
+            print(f"  [RCXCLEAN corpus '{name}'] OFF wrong=({r_off.stdout},"
+                  f"{r_off.exit}) oracle=({exp_out},{exp_exit})")
+            continue
+        if rc_off != 0:
+            all_ok = False
+            print(f"  [RCXCLEAN corpus '{name}'] NOT byte-inert OFF (rcxclean={rc_off})")
+            continue
+        if want_fire and rc == 0:
+            all_ok = False
+            print(f"  [RCXCLEAN corpus '{name}'] correct but RCXCLEAN NEVER FIRED "
+                  f"(want_fire=True)")
+            continue
+    if not fired_any:
+        all_ok = False
+        print("  [RCXCLEAN corpus FAIL] no program exercised the store-value elision")
+
+    # DELIBERATE BREAK: on the binary-index store, --rcxclean-break claims the
+    # address is rcx-clean, so the value parked in %rcx is clobbered by the index
+    # computation → wrong stored value. The differential MUST catch it (broken !=
+    # oracle). The oracle is the same program's correct sum.
+    out5 = [0] * 128
+    for i in range(100):
+        out5[i + 1] = (i * 3 + 5) & M
+    exp = 0
+    for i in range(128):
+        exp = (exp + out5[i]) & M
+    body = PRELUDE + "\n" + _RCXCLEAN_BREAK_SRC
+    r_brk = host.run_through_codegen_ad("rc_break", body, _AD_WORK, opt=True,
+                                        rcxclean_break=True)
+    break_caught = False
+    if r_brk.kind != "ok":
+        print(f"  [RCXCLEAN break] compile failed: {r_brk.kind} "
+              f"{(r_brk.detail or '')[:120]}")
+        all_ok = False
+    elif r_brk.stdout != str(exp):
+        # The break produced the WRONG value — the rcx-clean gate is load-bearing.
+        break_caught = True
+    else:
+        print(f"  [RCXCLEAN break] --rcxclean-break did NOT miscompile the binary-"
+              f"index store (got {r_brk.stdout}=={exp}) — the rcx-clean gate is NOT "
+              f"proven load-bearing")
+        all_ok = False
+    return (all_ok, total, break_caught)
+
+
+# --------------------------------------------------------------------------
 # Phase-4 REGISTER-PRESSURE corpus. Hand-written programs with MANY
 # simultaneously-live scalar locals — more than the 5-register callee-saved pool
 # — so the linear-scan allocator is FORCED to spill, plus call-crossing values
@@ -8206,6 +8487,20 @@ def _run_ad_codegen_batch(base, args):
             opt_lane_fail = True
             print("  [ADDER_OPT FAIL] p3store corpus miscompiled, a store-glue "
                   "lever never fired, a fallback shape routed, or OFF not byte-inert")
+        # STORE-VALUE ROUND-TRIP ELISION corpus: `arr[i] = <expr>` with a direct-SIB
+        # (%rcx-clean) address holds the value in %rcx via a reg-reg mov instead of a
+        # stack push/pop round-trip. Asserts (a) correctness vs oracle ON+OFF over
+        # self-ref/licm/saxpy/sub-8/plain-store/binary-index-fallback shapes, (b) the
+        # elision fired (RCXCLEAN>0) and byte-inert OFF (RCXCLEAN==0), (c) the
+        # deliberate break (--rcxclean-break, address NOT rcx-clean) is CAUGHT.
+        rc_ok, rc_total, rc_brk = _run_rcxclean_corpus()
+        print(f"--- ADDER_OPT=1 RCXCLEAN corpus (store-value round-trip elision) ---")
+        print(f"  indexed stores elided:      {rc_total}   break-caught={rc_brk}")
+        if not rc_ok or not rc_brk:
+            opt_lane_fail = True
+            print("  [ADDER_OPT FAIL] rcxclean corpus miscompiled, elision never "
+                  "fired, a fallback miscompiled, OFF not byte-inert, or the "
+                  "deliberate break was NOT caught")
         # FLOAT IR-EMIT corpus: float arith/compares (f32/f64/mixed/nested/neg)
         # lowered through the SSE float IR path. Asserts correctness vs an IEEE
         # oracle, the float IR path fired (IREMITFLOAT>0), and the OFF path is
