@@ -338,6 +338,26 @@ user_pref("browser.aboutwelcome.enabled", false);
 user_pref("browser.tabs.remote.autostart", false);
 user_pref("dom.ipc.processCount", 1);
 user_pref("browser.startup.page", 0);
+// ---- minimise child-process dependence (Hamnix Linux-ns futex is still the
+// O(n^2) poll-yield path pending the bounded-park fix #117: every extra
+// Firefox child = ~10 more threads parking on the slow futex, and a child
+// that crashes/stalls during its OWN gfxPlatform font-list init emits the
+// late "Fontconfig error: ... (null)" then can wedge the parent's launch
+// before the chrome toplevel maps). The browser CHROME window is drawn by
+// the PARENT and needs NO child process to map, so disable every optional
+// out-of-process child: Fission/site-isolation, the RDD (media decode),
+// the network/socket process, the utility process, and privileged content.
+// This is a pure throwaway-profile pref change (no effect on weston-terminal
+// or the DE) that gives the parent's xdg_toplevel the best chance to map. ----
+user_pref("fission.autostart", false);
+user_pref("media.rdd-process.enabled", false);
+user_pref("network.process.enabled", false);
+user_pref("browser.tabs.remote.separatePrivilegedContentProcess", false);
+user_pref("browser.tabs.remote.useCrossOriginOpenerPolicy", false);
+user_pref("browser.tabs.remote.useCrossOriginEmbedderPolicy", false);
+user_pref("dom.ipc.forkserver.enable", false);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("extensions.pocket.enabled", false);
 PREFS
 printf '%s\n' "$FF_PREFS" > "$PROFILE/prefs.js"
 printf '%s\n' "$FF_PREFS" > "$PROFILE/user.js"
