@@ -256,7 +256,7 @@ from sys.src.port9.port.namec import (
     namec, namec_create, namec_mkdir,
     namec_read, namec_read_nb, namec_write, namec_close,
     namec_chan_is_mounted, namec_chan_dev_type, namec_chan_back_slot,
-    namec_chan_back_ptr,
+    namec_chan_back_ptr, namec_chan_ref,
     namec_open_ext4_file, namec_open_fat_file, namec_open_dir_file,
     namec_open_buf_file, namec_open_proc_file, namec_open_auth_file,
     namec_open_blk_file,
@@ -367,6 +367,10 @@ from fs.socketpair import (
     sockpair_close, sockpair_peer_alive,
     sockpair_readable,
     sockpair_unpack_slot, sockpair_unpack_dir,
+    # SCM_RIGHTS fd passing over a socketpair channel (the Chromium /
+    # Mozilla IPC transport) + the teardown-drain release hook.
+    sockpair_scm_send, sockpair_scm_recv, sockpair_scm_pending,
+    sockpair_set_scm_release_hook,
 )
 # U-socket: read/write/close on a connected AF_INET SOCK_STREAM fd
 # routes through the real in-kernel TCP stack. tcp.ad is an import
@@ -724,6 +728,24 @@ usfd_release_hook:   Fn[None, int32]
 uino_release_hook:   Fn[None, int32]
 uino_readable_hook:  Fn[int32, int32]
 uepoll_release_hook: Fn[None, int32]
+
+# SCM_RIGHTS fd-passing: an eventfd / timerfd / signalfd object can be
+# conducted to another process over an AF_UNIX socket. Passing it means
+# the receiver's new fd must reference the SAME pool object, so capture
+# takes an extra reference (uefd_ref_hook et al) that the receiver's fd
+# — or the socket-teardown drain — later drops via the release hook
+# (now refcounted: release frees only on the LAST reference).
+uefd_ref_hook: Fn[None, int32]
+utfd_ref_hook: Fn[None, int32]
+usfd_ref_hook: Fn[None, int32]
+
+
+def register_scm_ref_hooks(ev: Fn[None, int32],
+                           tf: Fn[None, int32],
+                           sf: Fn[None, int32]):
+    uefd_ref_hook = ev
+    utfd_ref_hook = tf
+    usfd_ref_hook = sf
 
 
 def register_epoll_family_ops_hook(
@@ -6056,11 +6078,13 @@ def vfs_socket_chan_release(fdbuf: uint64):
     ux_ep: int32 = afunix_ep_for_fdbuf(fdbuf)
     if ux_ep >= 0:
         # Drain any SCM_RIGHTS fds queued-but-never-recvmsg'd on this
-        # endpoint so their backing anon memfd slots don't leak (the
-        # same drain _u_close used to do inline before afunix_close).
+        # endpoint so their backing objects don't leak (the same drain
+        # _u_close used to do inline before afunix_close). The queued
+        # value is now a generic vfs SCM token (any fd type), so release
+        # it through the token decoder — not the tmpfs-only path.
         ux_scm: int32 = afunix_scm_recv(ux_ep)
         while ux_scm >= 0:
-            tmpfs_release_anon(ux_scm)
+            vfs_scm_release_token(ux_scm)
             ux_scm = afunix_scm_recv(ux_ep)
         afunix_close(ux_ep)
         return
@@ -7393,6 +7417,196 @@ def vfs_install_tmpfs_slot_fd(slot: int32) -> int32:
     task[0].fd_buf[fdu]    = cast[uint64](cast[uint32](cid))
     task[0].fd_buflen[fdu] = 0
     return fd
+
+
+# =====================================================================
+# §SCM_RIGHTS generic fd passing (any fd type, not just tmpfs/memfd)
+# =====================================================================
+#
+# Linux SCM_RIGHTS "dups the struct file into the receiver": the passed
+# fd's backing object gets an extra reference and the receiver installs
+# a new fd referencing THAT SAME object. Firefox/Chromium multiprocess
+# bootstrap passes channel socketpairs, pipe ends and eventfd wakeups
+# (beyond shared-memory memfds) this way; the old shim rejected anything
+# that wasn't tmpfs/memfd with -EINVAL, stranding the child mid-bootstrap.
+#
+# A pass is expressed as an opaque int32 "SCM token" carried on the
+# afunix / socketpair SCM conduit. Encoding: (kind << 24) | value.
+#   * kind is 4 bits (bits 24-27), value is 24 bits (bits 0-23).
+#   * kind 0 (TMPFS) keeps value == the raw tmpfs anon slot, so the
+#     in-kernel Wayland server (linux_abi/wayland.ad), which enqueues a
+#     bare slot and dequeues one expecting tmpfs_page_phys, is byte-for-
+#     byte unaffected (its shm-pool slots are small; the kind nibble is 0).
+#   * bit 30 (CHAN_INLINE_TAG) is never set here — only refcounted POOL
+#     chans (socketpair/pipe/tmpfs/regular/9P) are passed as CHAN tokens.
+SCM_TK_KSHIFT:     uint32 = 24
+SCM_TK_VMASK:      int32  = 0x00FFFFFF
+SCM_KIND_TMPFS:    int32  = 0
+SCM_KIND_CHAN:     int32  = 1
+SCM_KIND_EVENTFD:  int32  = 2
+SCM_KIND_TIMERFD:  int32  = 3
+SCM_KIND_SIGNALFD: int32  = 4
+
+
+def _scm_encode(kind: int32, val: int32) -> int32:
+    return cast[int32]((cast[uint32](kind) << SCM_TK_KSHIFT) \
+                       | (cast[uint32](val) & cast[uint32](SCM_TK_VMASK)))
+
+
+def _scm_tk_kind(token: int32) -> int32:
+    return cast[int32]((cast[uint32](token) >> SCM_TK_KSHIFT) & 0xF)
+
+
+def _scm_tk_val(token: int32) -> int32:
+    return token & SCM_TK_VMASK
+
+
+def vfs_scm_capture_fd(fd: int32) -> int32:
+    # §SCM_RIGHTS send: take a reference on `fd`'s backing object and
+    # return an SCM token the peer's recvmsg reconstructs an equivalent
+    # fd from. The extra reference keeps the backing alive even if the
+    # sender close(2)s its fd before the peer receives. Returns a token
+    # (>= 0) or a negative errno if the fd is not passable.
+    rc: int32 = _check_fd(fd)
+    if rc != 0:
+        return EBADF
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
+    fdu: uint64 = cast[uint64](fd)
+    marker: uint32 = task[0].fd_idx[fdu]
+    if marker == FD_CHAN_MARK:
+        cid: int32 = _fd_chan_id(task, fdu)
+        dt: int32 = namec_chan_dev_type(cid)
+        if dt == DEV_TMPFS_FILE:
+            # Keep the Wayland-compatible tmpfs-slot token: the receiver
+            # opens a FRESH chan on the slot (vfs_install_tmpfs_slot_fd),
+            # so both ends map the same physical frames. The anon ref
+            # survives the sender's close and is dropped by that fresh
+            # chan's last close.
+            slot: int32 = namec_chan_back_slot(cid)
+            tmpfs_anon_ref(slot)
+            return _scm_encode(SCM_KIND_TMPFS, slot)
+        # Any other pool chan — socketpair/pipe/regular/ext4/fat/9P.
+        # Share the SAME chan (bump its refcount); the receiver's fd
+        # inherits the reference we take here (no double-ref on install),
+        # exactly like copy_fd_entry's fork/dup CHAN arm.
+        namec_chan_ref(cid)
+        return _scm_encode(SCM_KIND_CHAN, cid)
+    if marker == FD_EVENTFD_MARK:
+        eslot: int32 = cast[int32](task[0].fd_buf[fdu]) - 1
+        if uefd_ref_hook != cast[Fn[None, int32]](0):
+            uefd_ref_hook(eslot)
+        return _scm_encode(SCM_KIND_EVENTFD, eslot)
+    if marker == FD_TIMERFD_MARK:
+        tslot: int32 = cast[int32](task[0].fd_buf[fdu]) - 1
+        if utfd_ref_hook != cast[Fn[None, int32]](0):
+            utfd_ref_hook(tslot)
+        return _scm_encode(SCM_KIND_TIMERFD, tslot)
+    if marker == FD_SIGNALFD_MARK:
+        sslot: int32 = cast[int32](task[0].fd_buf[fdu]) - 1
+        if usfd_ref_hook != cast[Fn[None, int32]](0):
+            usfd_ref_hook(sslot)
+        return _scm_encode(SCM_KIND_SIGNALFD, sslot)
+    # Not passable in this shim (epoll/inotify/pidfd/stdio/etc.).
+    return EINVAL
+
+
+def _vfs_install_layer2_fd(marker: uint32, slot: int32) -> int32:
+    # Bind a NEW fd in the current task referencing an already-referenced
+    # Layer-2 object slot (eventfd/timerfd/signalfd). The reference was
+    # taken by vfs_scm_capture_fd; on alloc failure it is dropped.
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        if marker == FD_EVENTFD_MARK and \
+                uefd_release_hook != cast[Fn[None, int32]](0):
+            uefd_release_hook(slot)
+        if marker == FD_TIMERFD_MARK and \
+                utfd_release_hook != cast[Fn[None, int32]](0):
+            utfd_release_hook(slot)
+        if marker == FD_SIGNALFD_MARK and \
+                usfd_release_hook != cast[Fn[None, int32]](0):
+            usfd_release_hook(slot)
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu]    = marker
+    task[0].fd_pos[fdu]    = 0
+    task[0].fd_buf[fdu]    = cast[uint64](cast[uint32](slot + 1))
+    task[0].fd_buflen[fdu] = 0
+    return fd
+
+
+def vfs_install_chan_fd(cid: int32) -> int32:
+    # §SCM_RIGHTS receive: bind a new FD_CHAN_MARK fd in the CURRENT task
+    # to an already-referenced pool chan `cid` (the reference was taken by
+    # vfs_scm_capture_fd). The new fd's last close routes through
+    # namec_close, dropping that reference. On alloc failure, drop it now.
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        namec_close(cid)
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu]    = FD_CHAN_MARK
+    task[0].fd_pos[fdu]    = 0
+    task[0].fd_buf[fdu]    = cast[uint64](cast[uint32](cid))
+    task[0].fd_buflen[fdu] = 0
+    return fd
+
+
+def vfs_scm_install_token(token: int32) -> int32:
+    # §SCM_RIGHTS receive: reconstruct an fd in the current task from an
+    # SCM token (consuming the reference the sender's capture took).
+    # Returns the new fd, or a negative errno.
+    kind: int32 = _scm_tk_kind(token)
+    val: int32 = _scm_tk_val(token)
+    if kind == SCM_KIND_TMPFS:
+        return vfs_install_tmpfs_slot_fd(val)
+    if kind == SCM_KIND_CHAN:
+        return vfs_install_chan_fd(val)
+    if kind == SCM_KIND_EVENTFD:
+        return _vfs_install_layer2_fd(FD_EVENTFD_MARK, val)
+    if kind == SCM_KIND_TIMERFD:
+        return _vfs_install_layer2_fd(FD_TIMERFD_MARK, val)
+    if kind == SCM_KIND_SIGNALFD:
+        return _vfs_install_layer2_fd(FD_SIGNALFD_MARK, val)
+    return EINVAL
+
+
+def vfs_scm_release_token(token: int32):
+    # §SCM_RIGHTS teardown: drop the reference a token holds when its
+    # destination endpoint is closed with the fd never recvmsg'd (drained
+    # from the afunix / socketpair SCM queue). Mirror of the install path
+    # but releasing instead of binding.
+    kind: int32 = _scm_tk_kind(token)
+    val: int32 = _scm_tk_val(token)
+    if kind == SCM_KIND_TMPFS:
+        tmpfs_release_anon(val)
+    elif kind == SCM_KIND_CHAN:
+        namec_close(val)
+    elif kind == SCM_KIND_EVENTFD:
+        if uefd_release_hook != cast[Fn[None, int32]](0):
+            uefd_release_hook(val)
+    elif kind == SCM_KIND_TIMERFD:
+        if utfd_release_hook != cast[Fn[None, int32]](0):
+            utfd_release_hook(val)
+    elif kind == SCM_KIND_SIGNALFD:
+        if usfd_release_hook != cast[Fn[None, int32]](0):
+            usfd_release_hook(val)
+
+
+def vfs_fd_sockpair_packed(fd: int32) -> int64:
+    # The DEV_SOCKETPAIR packed (slot<<1|dir) for a socketpair endpoint
+    # fd, or -1 if `fd` is not one. Lets the sendmsg/recvmsg SCM path
+    # route fd-passing over a socketpair CHANNEL (the Firefox IPC
+    # transport) without duplicating the chan-representation probe.
+    rc: int32 = _check_fd(fd)
+    if rc != 0:
+        return -1
+    task: Ptr[TaskStruct] = fd_owner_task(current_task())
+    if task[0].fd_idx[cast[uint64](fd)] != FD_CHAN_MARK:
+        return -1
+    return cast[int64](namec_chan_sockpair_packed(
+        _fd_chan_id(task, cast[uint64](fd))))
 
 
 def vfs_fd_tmpfs_slot(fd: int32) -> int32:

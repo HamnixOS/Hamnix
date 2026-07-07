@@ -147,6 +147,7 @@ def sockpair_alloc() -> int32:
     sockpair_table[su].refs_b  = 1
     sockpair_table[su].used    = 1
     sockpair_table[su].lock    = 0
+    sockpair_scm_init_slot(slot)
     return slot
 
 
@@ -176,7 +177,20 @@ def sockpair_close(slot: int32, direction: int32):
     else:
         if sockpair_table[su].refs_b > 0:
             sockpair_table[su].refs_b = sockpair_table[su].refs_b - 1
+    # If THIS end is fully closed (no dup/fork co-owners left), any fds a
+    # peer passed to it that were never recvmsg'd are now undeliverable —
+    # release their backing so a passed socketpair/pipe/memfd doesn't leak.
+    if direction == 0:
+        if sockpair_table[su].refs_a == 0:
+            _sockpair_scm_drain_dir(slot, 0)
+    else:
+        if sockpair_table[su].refs_b == 0:
+            _sockpair_scm_drain_dir(slot, 1)
     if sockpair_table[su].refs_a == 0 and sockpair_table[su].refs_b == 0:
+        # Belt-and-suspenders: drain both directions before the slot is
+        # recycled (either end may still hold queued-but-unread tokens).
+        _sockpair_scm_drain_dir(slot, 0)
+        _sockpair_scm_drain_dir(slot, 1)
         if sockpair_table[su].buf_a != 0:
             kfree(sockpair_table[su].buf_a)
             sockpair_table[su].buf_a = 0
@@ -223,6 +237,115 @@ def sockpair_readable(slot: int32, direction: int32) -> int32:
     if sockpair_table[su].count_a > 0:
         return 1
     return 0
+
+
+# --- SCM_RIGHTS ancillary conduit (per endpoint, per direction) -----
+#
+# A socketpair is the transport a real Chromium/Mozilla-style IPC
+# channel rides: the parent socketpair()s, hands one end to the child
+# across fork+exec, and thereafter passes further fds (more channel
+# socketpairs, pipe ends, shared-memory memfds, eventfd wakeups) to the
+# child by writing them as SCM_RIGHTS ancillary data over that channel.
+# _u_sendmsg / _u_recvmsg (linux_abi/u_syscalls.ad) drive this queue; the
+# opaque int32 token they enqueue is a vfs "SCM token" (fs/vfs.ad
+# vfs_scm_capture_fd) that encodes the passed fd's backing so the
+# receiver can reconstruct an equivalent fd sharing the SAME object.
+#
+# The queue is keyed by the RECEIVING end so it delivers with the bytes
+# the receiver reads: end A reads ring_b, so fds A should receive live
+# in queue[slot*2 + 0]; end B reads ring_a, queue[slot*2 + 1]. A send
+# from end `d` therefore enqueues to queue[slot*2 + (1 - d)].
+SP_SCM_Q: uint64 = 32
+# Flattened 32 slots * 2 directions * SP_SCM_Q int32 tokens.
+sp_scm:       Array[2048, int32]     # 32 * 2 * 32
+sp_scm_head:  Array[64, uint64]      # 32 * 2
+sp_scm_tail:  Array[64, uint64]
+sp_scm_count: Array[64, uint64]
+
+# vfs sets this so a token whose destination endpoint is torn down
+# (closed with the fd never recvmsg'd) still drops its backing reference
+# — the exact leak the afunix drain in fs/vfs.ad plugs for AF_UNIX eps.
+# fs/socketpair.ad can't import fs/vfs.ad (that cycles), so the release
+# is a registered hook, mirroring uefd_release_hook et al.
+sp_scm_release_hook: Fn[None, int32]
+
+
+def sockpair_scm_init_slot(slot: int32):
+    # Reset both directions' SCM queues for a freshly-allocated slot.
+    su: uint64 = cast[uint64](slot)
+    d: uint64 = 0
+    while d < 2:
+        qi: uint64 = su * 2 + d
+        sp_scm_head[qi]  = 0
+        sp_scm_tail[qi]  = 0
+        sp_scm_count[qi] = 0
+        d = d + 1
+
+
+def sockpair_set_scm_release_hook(h: Fn[None, int32]):
+    sp_scm_release_hook = h
+
+
+def sockpair_scm_send(slot: int32, send_dir: int32, token: int32) -> int32:
+    # Enqueue one SCM token, destined for the peer of `send_dir`.
+    # Returns 0, -1 if the SCM queue is full or the slot is dead, or -32
+    # (-EPIPE) if the receiving peer end has already hung up.
+    su: uint64 = cast[uint64](slot)
+    if su >= SOCKPAIR_MAX or sockpair_table[su].used == 0:
+        return -1
+    if sockpair_peer_alive(slot, send_dir) == 0:
+        return -32
+    recv_dir: uint64 = cast[uint64](1 - (send_dir & 1))
+    qi: uint64 = su * 2 + recv_dir
+    if sp_scm_count[qi] >= SP_SCM_Q:
+        return -1
+    base: uint64 = qi * SP_SCM_Q
+    tail: uint64 = sp_scm_tail[qi]
+    sp_scm[base + tail] = token
+    tail = tail + 1
+    if tail >= SP_SCM_Q:
+        tail = 0
+    sp_scm_tail[qi]  = tail
+    sp_scm_count[qi] = sp_scm_count[qi] + 1
+    return 0
+
+
+def sockpair_scm_pending(slot: int32, dir: int32) -> int32:
+    # Count of SCM tokens queued for endpoint `dir`'s own recvmsg.
+    su: uint64 = cast[uint64](slot)
+    if su >= SOCKPAIR_MAX or sockpair_table[su].used == 0:
+        return 0
+    return cast[int32](sp_scm_count[su * 2 + cast[uint64](dir & 1)])
+
+
+def sockpair_scm_recv(slot: int32, dir: int32) -> int32:
+    # Dequeue the oldest SCM token for endpoint `dir`, or -1 if none.
+    su: uint64 = cast[uint64](slot)
+    if su >= SOCKPAIR_MAX or sockpair_table[su].used == 0:
+        return -1
+    qi: uint64 = su * 2 + cast[uint64](dir & 1)
+    if sp_scm_count[qi] == 0:
+        return -1
+    base: uint64 = qi * SP_SCM_Q
+    head: uint64 = sp_scm_head[qi]
+    val: int32 = sp_scm[base + head]
+    head = head + 1
+    if head >= SP_SCM_Q:
+        head = 0
+    sp_scm_head[qi]  = head
+    sp_scm_count[qi] = sp_scm_count[qi] - 1
+    return val
+
+
+def _sockpair_scm_drain_dir(slot: int32, dir: int32):
+    # Release every token still queued for endpoint `dir` (its receiver
+    # is going away and will never recvmsg them) via the vfs hook.
+    if sp_scm_release_hook == cast[Fn[None, int32]](0):
+        return
+    t: int32 = sockpair_scm_recv(slot, dir)
+    while t >= 0:
+        sp_scm_release_hook(t)
+        t = sockpair_scm_recv(slot, dir)
 
 
 # --- fd_buf packing -----------------------------------------------

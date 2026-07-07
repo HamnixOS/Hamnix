@@ -85,7 +85,7 @@ from fs.pipe import (
 from fs.vfs import (
     vfs_open, vfs_open_write, vfs_open_write_t, vfs_read, vfs_write, vfs_close, vfs_lseek,
     vfs_dup, vfs_dup2, vfs_unlink, vfs_mkdir, vfs_rmdir, resolve_path,
-    resolve_path_canonical, vfs_pipe,
+    resolve_path_canonical, vfs_pipe, vfs_socketpair,
     vfs_listdir, vfs_rename, vfs_fsync, vfs_ftruncate, vfs_truncate,
     # symlink(2)/link(2)/utimensat(2): the VFS backends for these were
     # implemented but never wired into the Linux-ABI dispatch.
@@ -134,6 +134,16 @@ from fs.vfs import (
     # backing slot (sendmsg side) and bind a fresh fd to an existing slot
     # (recvmsg side) so both ends map the SAME physical pages.
     vfs_open_memfd, vfs_fd_tmpfs_slot, vfs_install_tmpfs_slot_fd,
+    # §SCM_RIGHTS all-fd passing: capture ANY passable fd's backing to an
+    # opaque token, install a token back into a fresh fd, and route SCM
+    # over a socketpair CHANNEL (the Chromium/Mozilla IPC transport).
+    vfs_scm_capture_fd, vfs_scm_install_token, vfs_scm_release_token,
+    vfs_fd_sockpair_packed,
+)
+from fs.socketpair import (
+    sockpair_scm_send, sockpair_scm_recv, sockpair_scm_pending,
+    sockpair_readable, sockpair_peer_alive,
+    sockpair_unpack_slot, sockpair_unpack_dir,
 )
 # #164: the Linux-ABI terminal line discipline. A console-backed read(2)
 # (an interactive `enter linux { /bin/sh }` guest's fd 0) routes through
@@ -5946,6 +5956,72 @@ def _u_afunix_send_all(uxep: int32, fd: int32, ubuf: uint64,
     return cast[int64](done)
 
 
+def _u_sendmsg_sockpair(fd: int32, sp_slot: int32, sp_dir: int32,
+                        iovp: uint64, iovn: uint64,
+                        ctl: uint64, ctllen: uint64,
+                        snd_dontwait: int32, snd_nosignal: int32) -> int64:
+    # sendmsg over a socketpair() channel: conduct any SCM_RIGHTS fds to
+    # the peer end's SCM queue (via vfs "SCM tokens"), THEN gather-write
+    # the data iovs. This is the Chromium/Mozilla IPC transport — the
+    # parent passes channel/pipe/eventfd fds to a child over the inherited
+    # socketpair, so dropping the control here strands the child.
+    if ctl != 0 and ctllen >= CMSG_HDR_LEN:
+        c_len:   Array[1, uint64]
+        c_level: Array[1, uint32]
+        c_type:  Array[1, uint32]
+        if get_user_64(ctl + 0, &c_len[0]) != 0:
+            return ELINUX_EFAULT
+        if get_user_32(ctl + 8, &c_level[0]) != 0:
+            return ELINUX_EFAULT
+        if get_user_32(ctl + 12, &c_type[0]) != 0:
+            return ELINUX_EFAULT
+        if c_level[0] == SCM_SOL_SOCKET and c_type[0] == SCM_RIGHTS_TYPE:
+            if c_len[0] < CMSG_HDR_LEN or c_len[0] > ctllen:
+                return ELINUX_INVAL
+            nfds: uint64 = (c_len[0] - CMSG_HDR_LEN) / 4
+            fi: uint64 = 0
+            while fi < nfds:
+                pfd: Array[1, uint32]
+                if get_user_32(ctl + CMSG_HDR_LEN + fi * 4, &pfd[0]) != 0:
+                    return ELINUX_EFAULT
+                tok: int32 = vfs_scm_capture_fd(cast[int32](pfd[0]))
+                if tok < 0:
+                    set_current_errstr("sendmsg: SCM_RIGHTS fd not passable")
+                    return ELINUX_INVAL
+                sr: int32 = sockpair_scm_send(sp_slot, sp_dir, tok)
+                if sr != 0:
+                    vfs_scm_release_token(tok)
+                    if sr == -32:
+                        if snd_nosignal == 0:
+                            signal_post(current_idx_get(), SIGPIPE)
+                        return ELINUX_PIPE
+                    return ELINUX_INVAL              # SCM queue full
+                fi = fi + 1
+    # Gather-write the data iovs over the socketpair ring (via _u_write,
+    # which routes DEV_SOCKETPAIR fds through sockpair_write_blocking).
+    total: int64 = 0
+    di: uint64 = 0
+    while di < iovn:
+        ib: Array[1, uint64]
+        il: Array[1, uint64]
+        if get_user_64(iovp + di * 16, &ib[0]) != 0:
+            return ELINUX_EFAULT
+        if get_user_64(iovp + di * 16 + 8, &il[0]) != 0:
+            return ELINUX_EFAULT
+        if il[0] > 0:
+            gw: int64 = _u_write(cast[uint64](fd), ib[0], il[0], 0, 0, 0)
+            if gw == ELINUX_PIPE:
+                if snd_nosignal == 0:
+                    signal_post(current_idx_get(), SIGPIPE)
+            if gw < 0:
+                if total > 0:
+                    return total
+                return gw
+            total = total + gw
+        di = di + 1
+    return total
+
+
 def _u_sendmsg(a0: uint64, a1: uint64, a2: uint64,
                a3: uint64, a4: uint64, a5: uint64) -> int64:
     # ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
@@ -5990,9 +6066,19 @@ def _u_sendmsg(a0: uint64, a1: uint64, a2: uint64,
 
     uxep: int32 = _u_afunix_ep(fd)
     if uxep < 0 or afunix_get_type(uxep) != AFU_SOCK_STREAM:
-        # Not an AF_UNIX stream — degrade to a gather write of the data
-        # iovs (SCM control is dropped: only the AF_UNIX conduit passes
-        # fds here). A NULL data iov with only control is a no-op success.
+        # Not an AF_UNIX-socket stream endpoint. A socketpair() channel is
+        # the OTHER AF_UNIX stream shape (an FD_CHAN_MARK DEV_SOCKETPAIR
+        # fd, not an afunix ep) and IS the Chromium/Mozilla IPC transport
+        # that carries SCM_RIGHTS fd passes. Route those here so the child
+        # bootstrap's socketpair/pipe/eventfd passes don't silently vanish;
+        # every other fd type degrades to a bare gather write (control
+        # dropped — no conduit).
+        sp_pkd: int64 = vfs_fd_sockpair_packed(fd)
+        if sp_pkd >= 0:
+            return _u_sendmsg_sockpair(fd,
+                sockpair_unpack_slot(cast[uint64](sp_pkd)),
+                sockpair_unpack_dir(cast[uint64](sp_pkd)),
+                iovp, iovn, ctl, ctllen, snd_dontwait, snd_nosignal)
         gtotal: int64 = 0
         gi: uint64 = 0
         while gi < iovn:
@@ -6012,7 +6098,11 @@ def _u_sendmsg(a0: uint64, a1: uint64, a2: uint64,
             gi = gi + 1
         return gtotal
 
-    # --- 1) SCM_RIGHTS control: conduct each passed fd's backing slot ---
+    # --- 1) SCM_RIGHTS control: conduct each passed fd's backing to the
+    #        peer via a vfs "SCM token" (any fd type — socketpair/pipe
+    #        endpoint, eventfd/timerfd/signalfd, regular file, tmpfs/memfd
+    #        — not just memfd, so a real multiprocess app's bootstrap fds
+    #        survive). vfs_scm_capture_fd takes the backing reference. -----
     if ctl != 0 and ctllen >= CMSG_HDR_LEN:
         c_len:   Array[1, uint64]
         c_level: Array[1, uint32]
@@ -6032,19 +6122,13 @@ def _u_sendmsg(a0: uint64, a1: uint64, a2: uint64,
                 pfd: Array[1, uint32]
                 if get_user_32(ctl + CMSG_HDR_LEN + fi * 4, &pfd[0]) != 0:
                     return ELINUX_EFAULT
-                pslot: int32 = vfs_fd_tmpfs_slot(cast[int32](pfd[0]))
-                if pslot < 0:
-                    # Only memfd / tmpfs-backed fds are passable in this
-                    # shim (a Wayland wl_shm pool always is).
-                    set_current_errstr("sendmsg: SCM_RIGHTS fd not a memfd/tmpfs object")
+                tok: int32 = vfs_scm_capture_fd(cast[int32](pfd[0]))
+                if tok < 0:
+                    set_current_errstr("sendmsg: SCM_RIGHTS fd not passable")
                     return ELINUX_INVAL
-                # Take the extra anon reference BEFORE enqueue so the
-                # backing survives even if the sender closes its fd before
-                # the peer recvmsg's.
-                tmpfs_anon_ref(pslot)
-                sr: int64 = afunix_scm_send(uxep, pslot)
+                sr: int64 = afunix_scm_send(uxep, tok)
                 if sr != 0:
-                    tmpfs_release_anon(pslot)      # drop the ref we took
+                    vfs_scm_release_token(tok)     # drop the ref we took
                     return sr
                 fi = fi + 1
 
@@ -6077,6 +6161,86 @@ def _u_sendmsg(a0: uint64, a1: uint64, a2: uint64,
     return total
 
 
+def _u_recvmsg_sockpair(fd: int32, sp_slot: int32, sp_dir: int32,
+                        umsg: uint64, iovp: uint64, iovn: uint64,
+                        ctl: uint64, ctllen: uint64, flags: uint64) -> int64:
+    # recvmsg over a socketpair() channel: block until data is readable OR
+    # a passed fd is pending OR the peer hung up (unless MSG_DONTWAIT /
+    # O_NONBLOCK), then scatter-read the data and install any SCM_RIGHTS
+    # tokens into the control buffer. The receive half of the
+    # Chromium/Mozilla IPC transport.
+    nb: int32 = _u_fd_is_nonblock(fd)
+    if (flags & 0x40) != 0:
+        nb = 1
+    while sockpair_readable(sp_slot, sp_dir) == 0:
+        if sockpair_scm_pending(sp_slot, sp_dir) > 0:
+            break                                   # fds arrived without data
+        if sockpair_peer_alive(sp_slot, sp_dir) == 0:
+            break                                   # peer closed -> EOF (0)
+        if nb != 0:
+            return ELINUX_AGAIN
+        yield_to_others()
+
+    # --- 1) scatter-read available data into the iovs -------------------
+    total: int64 = 0
+    di: uint64 = 0
+    while di < iovn:
+        ib: Array[1, uint64]
+        il: Array[1, uint64]
+        if get_user_64(iovp + di * 16, &ib[0]) != 0:
+            return ELINUX_EFAULT
+        if get_user_64(iovp + di * 16 + 8, &il[0]) != 0:
+            return ELINUX_EFAULT
+        if il[0] == 0:
+            di = di + 1
+        elif sockpair_readable(sp_slot, sp_dir) == 0:
+            di = iovn                               # ring drained
+        else:
+            rr: int64 = _u_read(cast[uint64](fd), ib[0], il[0], 0, 0, 0)
+            if rr <= 0:
+                di = iovn                           # EOF / would-block
+            else:
+                total = total + rr
+                if cast[uint64](rr) < il[0]:
+                    di = iovn                       # ring drained
+                else:
+                    di = di + 1
+
+    # --- 2) install any passed fds into a single SCM_RIGHTS cmsg --------
+    ctl_written: uint64 = 0
+    if ctl != 0 and ctllen >= CMSG_HDR_LEN \
+            and sockpair_scm_pending(sp_slot, sp_dir) > 0:
+        maxfds: uint64 = (ctllen - CMSG_HDR_LEN) / 4
+        nfds: uint64 = 0
+        while nfds < maxfds:
+            tok: int32 = sockpair_scm_recv(sp_slot, sp_dir)
+            if tok < 0:
+                nfds = maxfds                       # queue drained
+            else:
+                newfd: int32 = vfs_scm_install_token(tok)
+                if newfd < 0:
+                    vfs_scm_release_token(tok)
+                    nfds = maxfds
+                else:
+                    if put_user_32(cast[uint32](newfd),
+                                   ctl + CMSG_HDR_LEN + nfds * 4) != 0:
+                        return ELINUX_EFAULT
+                    nfds = nfds + 1
+        if nfds > 0:
+            cmsg_len: uint64 = CMSG_HDR_LEN + nfds * 4
+            if put_user_64(cmsg_len, ctl + 0) != 0:
+                return ELINUX_EFAULT
+            if put_user_32(SCM_SOL_SOCKET, ctl + 8) != 0:
+                return ELINUX_EFAULT
+            if put_user_32(SCM_RIGHTS_TYPE, ctl + 12) != 0:
+                return ELINUX_EFAULT
+            ctl_written = _u_scm_align8(cmsg_len)
+
+    put_user_64(ctl_written, umsg + MSGH_CONTROLLEN)
+    put_user_32(0, umsg + MSGH_FLAGS)
+    return total
+
+
 def _u_recvmsg(a0: uint64, a1: uint64, a2: uint64,
                a3: uint64, a4: uint64, a5: uint64) -> int64:
     # ssize_t recvmsg(int fd, struct msghdr *msg, int flags)
@@ -6103,6 +6267,15 @@ def _u_recvmsg(a0: uint64, a1: uint64, a2: uint64,
 
     uxep: int32 = _u_afunix_ep(fd)
     if uxep < 0 or afunix_get_type(uxep) != AFU_SOCK_STREAM:
+        # A socketpair() channel carries SCM_RIGHTS fds too — deliver them
+        # (the receive half of the Chromium/Mozilla IPC transport). Every
+        # other fd type degrades to a scatter read with no ancillary fds.
+        sp_pkd: int64 = vfs_fd_sockpair_packed(fd)
+        if sp_pkd >= 0:
+            return _u_recvmsg_sockpair(fd,
+                sockpair_unpack_slot(cast[uint64](sp_pkd)),
+                sockpair_unpack_dir(cast[uint64](sp_pkd)),
+                umsg, iovp, iovn, ctl, ctllen, a2)
         # Not an AF_UNIX stream — degrade to a scatter read of the data
         # iovs via read(2) (no ancillary fds delivered). Report an empty
         # control buffer + zeroed flags.
@@ -6193,15 +6366,15 @@ def _u_recvmsg(a0: uint64, a1: uint64, a2: uint64,
         maxfds: uint64 = (ctllen - CMSG_HDR_LEN) / 4
         nfds: uint64 = 0
         while nfds < maxfds:
-            slot: int32 = afunix_scm_recv(uxep)
-            if slot < 0:
+            tok: int32 = afunix_scm_recv(uxep)
+            if tok < 0:
                 nfds = maxfds                       # queue drained
             else:
-                newfd: int32 = vfs_install_tmpfs_slot_fd(slot)
+                newfd: int32 = vfs_scm_install_token(tok)
                 if newfd < 0:
                     # Could not install — drop the sender's enqueue ref and
                     # stop (leave remaining fds queued for a later recvmsg).
-                    tmpfs_release_anon(slot)
+                    vfs_scm_release_token(tok)
                     nfds = maxfds
                 else:
                     if put_user_32(cast[uint32](newfd),
@@ -17253,6 +17426,233 @@ def wlspike_scm_selftest() -> int32:
     _msync_restore_fds(boot_task, &fd_save[0])
     printk0("[wlspike] SCM_RIGHTS memfd round-trip OK: WLSPIKE_OK\n")
     printk0("[wlspike] PASS\n")
+    return 0
+
+
+# =====================================================================
+# [boot:37b.scmall] SCM_RIGHTS ALL-fd-type passing self-test
+# =====================================================================
+#
+# The Firefox/Chromium blocker: their multiprocess bootstrap passes
+# channel socketpairs, pipe ends and eventfd wakeups (not just memfd
+# shared memory) to children via SCM_RIGHTS — over a socketpair() IPC
+# CHANNEL, not the AF_UNIX-name socket wlspike used. The old shim
+# rejected every non-tmpfs fd with -EINVAL AND dropped control entirely
+# on a socketpair channel, stranding the child.
+#
+# This test drives the REAL sendmsg/recvmsg syscall dispatch:
+#   1. process-A creates a socketpair CHANNEL (chA/chB) — the transport.
+#   2. A creates a PAYLOAD socketpair (peA/peB) and an eventfd (evfd).
+#   3. A sends {peA, evfd} + 8 data bytes over chA (SCM_RIGHTS).
+#   4. B recvmsg's chB → gets the 8 bytes + TWO new fds (rpeA, revfd)
+#      that reference the SAME backing objects.
+#   5. round-trip PROOF:
+#        * write "PZ12" into peB → read it back through rpeA (the passed
+#          socketpair endpoint shares peA's ring);
+#        * eventfd_write(evfd, 5) → eventfd_read(revfd) == 5 (shared
+#          counter).
+# Marker: [scmall] SCM_RIGHTS all-fd round-trip OK: SCMALL_OK / [scmall] PASS
+
+SCMALL_MSG_VADDR: uint64 = 0x0000567A00000000
+
+
+def _scmall_fail(msg: Ptr[uint8]):
+    printk0("[scmall] FAIL: ")
+    printk0(msg)
+    printk0("\n")
+
+
+def scmall_selftest() -> int32:
+    PG: uint64 = 4096
+    boot_task: Ptr[TaskStruct] = fd_owner_task(current_task())
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = boot_task[0].fd_idx[fdi]
+        boot_task[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+    boot_pml4: uint64 = task_pml4(cast[int32](current_idx_get()))
+
+    # ---- 1) channel socketpair (the IPC transport) --------------------
+    chfds: Array[2, int32]
+    if vfs_socketpair(&chfds[0]) != 0:
+        _scmall_fail("channel socketpair")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    chA: int32 = chfds[0]
+    chB: int32 = chfds[1]
+
+    # ---- 2) payload socketpair + eventfd (the fds to pass) ------------
+    pefds: Array[2, int32]
+    if vfs_socketpair(&pefds[0]) != 0:
+        _scmall_fail("payload socketpair")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    peA: int32 = pefds[0]
+    peB: int32 = pefds[1]
+    evfd: int64 = linux_u_syscall_dispatch(SYS_eventfd2, 0, 0, 0, 0, 0, 0)
+    if evfd < 0:
+        _scmall_fail("eventfd2")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- 3) user page: msghdr@0 iov@64 data@128 cmsg@256 rbuf@512 -----
+    p: uint64 = alloc_page()
+    if p == 0 or vm_map_user_page(boot_pml4, SCMALL_MSG_VADDR, p, 1) < 0:
+        _scmall_fail("map msg page")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    V: uint64 = SCMALL_MSG_VADDR
+    put_user_64(0, V + MSGH_NAME)
+    put_user_32(0, V + MSGH_NAMELEN)
+    put_user_64(V + 64, V + MSGH_IOV)
+    put_user_64(1, V + MSGH_IOVLEN)
+    put_user_64(V + 256, V + MSGH_CONTROL)
+    put_user_64(24, V + MSGH_CONTROLLEN)          # >= CMSG_LEN(8)=24
+    put_user_32(0, V + MSGH_FLAGS)
+    put_user_64(V + 128, V + 64)                  # iov_base
+    put_user_64(8, V + 64 + 8)                     # iov_len
+    dpl: Array[8, uint8]
+    dpl[0] = 83  # S
+    dpl[1] = 67  # C
+    dpl[2] = 77  # M
+    dpl[3] = 65  # A
+    dpl[4] = 76  # L
+    dpl[5] = 76  # L
+    dpl[6] = 33  # !
+    dpl[7] = 33  # !
+    copy_to_user(V + 128, cast[uint64](&dpl[0]), 8)
+    # cmsg: two fds (peA, evfd) => cmsg_len = 16 + 8 = 24.
+    put_user_64(24, V + 256 + 0)
+    put_user_32(SCM_SOL_SOCKET, V + 256 + 8)
+    put_user_32(SCM_RIGHTS_TYPE, V + 256 + 12)
+    put_user_32(cast[uint32](peA), V + 256 + 16)
+    put_user_32(cast[uint32](evfd), V + 256 + 20)
+
+    sn: int64 = linux_u_syscall_dispatch(SYS_sendmsg,
+                                         cast[uint64](chA), V, 0, 0, 0, 0)
+    if sn != 8:
+        printk1("[scmall] FAIL: sendmsg rc=%d (want 8)\n", cast[uint64](sn))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- 4) recvmsg over chB ------------------------------------------
+    put_user_64(V + 320, V + MSGH_IOV)            # reuse: recv iov @320
+    put_user_64(1, V + MSGH_IOVLEN)
+    put_user_64(V + 384, V + MSGH_CONTROL)        # recv cmsg @384
+    put_user_64(64, V + MSGH_CONTROLLEN)
+    put_user_32(0, V + MSGH_FLAGS)
+    put_user_64(V + 512, V + 320)                 # recv iov_base @512
+    put_user_64(32, V + 320 + 8)                   # recv iov_len
+    put_user_64(0, V + 384 + 0)                    # zero cmsg hdr
+    put_user_32(0, V + 384 + 16)
+    put_user_32(0, V + 384 + 20)
+
+    rn: int64 = linux_u_syscall_dispatch(SYS_recvmsg,
+                                         cast[uint64](chB), V, 0, 0, 0, 0)
+    if rn != 8:
+        printk1("[scmall] FAIL: recvmsg rc=%d (want 8)\n", cast[uint64](rn))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    # Received control must carry two fds.
+    rclen: Array[1, uint64]
+    get_user_64(V + MSGH_CONTROLLEN, &rclen[0])
+    if rclen[0] < 24:
+        printk1("[scmall] FAIL: recv controllen=%d (want >=24)\n", rclen[0])
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    rcl: Array[1, uint32]
+    rct: Array[1, uint32]
+    get_user_32(V + 384 + 8, &rcl[0])
+    get_user_32(V + 384 + 12, &rct[0])
+    if rcl[0] != SCM_SOL_SOCKET or rct[0] != SCM_RIGHTS_TYPE:
+        _scmall_fail("recv cmsg not SOL_SOCKET/SCM_RIGHTS")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    rf0: Array[1, uint32]
+    rf1: Array[1, uint32]
+    get_user_32(V + 384 + 16, &rf0[0])
+    get_user_32(V + 384 + 20, &rf1[0])
+    rpeA: int32 = cast[int32](rf0[0])
+    revfd: int32 = cast[int32](rf1[0])
+    if rpeA < 0 or revfd < 0 or rpeA == peA or revfd == cast[int32](evfd):
+        _scmall_fail("received fds invalid / not fresh")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- 5a) socketpair round-trip: peB -> rpeA -----------------------
+    wbuf: Array[4, uint8]
+    wbuf[0] = 80  # P
+    wbuf[1] = 90  # Z
+    wbuf[2] = 49  # 1
+    wbuf[3] = 50  # 2
+    copy_to_user(V + 640, cast[uint64](&wbuf[0]), 4)
+    ww: int64 = linux_u_syscall_dispatch(SYS_write,
+                                         cast[uint64](peB), V + 640, 4, 0, 0, 0)
+    if ww != 4:
+        printk1("[scmall] FAIL: write peB rc=%d\n", cast[uint64](ww))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    rr: int64 = linux_u_syscall_dispatch(SYS_read,
+                                         cast[uint64](rpeA), V + 704, 4, 0, 0, 0)
+    if rr != 4:
+        printk1("[scmall] FAIL: read rpeA rc=%d (passed socketpair end dead)\n",
+                cast[uint64](rr))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    rback: Array[4, uint8]
+    copy_from_user(cast[uint64](&rback[0]), V + 704, 4)
+    ci: uint64 = 0
+    while ci < 4:
+        if rback[ci] != wbuf[ci]:
+            _scmall_fail("passed socketpair round-trip data mismatch")
+            _msync_restore_fds(boot_task, &fd_save[0])
+            return 1
+        ci = ci + 1
+
+    # ---- 5b) eventfd round-trip: write evfd(5) -> read revfd ==5 ------
+    ev8: Array[8, uint8]
+    ev8[0] = 5
+    ev8[1] = 0
+    ev8[2] = 0
+    ev8[3] = 0
+    ev8[4] = 0
+    ev8[5] = 0
+    ev8[6] = 0
+    ev8[7] = 0
+    copy_to_user(V + 768, cast[uint64](&ev8[0]), 8)
+    ew: int64 = linux_u_syscall_dispatch(SYS_write,
+                                         cast[uint64](evfd), V + 768, 8, 0, 0, 0)
+    if ew != 8:
+        printk1("[scmall] FAIL: eventfd write rc=%d\n", cast[uint64](ew))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    er: int64 = linux_u_syscall_dispatch(SYS_read,
+                                         cast[uint64](revfd), V + 776, 8, 0, 0, 0)
+    if er != 8:
+        printk1("[scmall] FAIL: eventfd read revfd rc=%d (passed eventfd dead)\n",
+                cast[uint64](er))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    evr: Array[8, uint8]
+    copy_from_user(cast[uint64](&evr[0]), V + 776, 8)
+    if evr[0] != 5:
+        printk1("[scmall] FAIL: eventfd value=%d (want 5)\n",
+                cast[uint64](evr[0]))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- cleanup + verdict --------------------------------------------
+    vfs_close(rpeA)
+    vfs_close(revfd)
+    vfs_close(peA)
+    vfs_close(peB)
+    vfs_close(cast[int32](evfd))
+    vfs_close(chA)
+    vfs_close(chB)
+    _msync_restore_fds(boot_task, &fd_save[0])
+    printk0("[scmall] SCM_RIGHTS all-fd round-trip OK: SCMALL_OK\n")
+    printk0("[scmall] PASS\n")
     return 0
 
 
