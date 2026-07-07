@@ -101,6 +101,24 @@ from fs.pipe import pipe_alloc_chan
 # non-tmpfs (cpio / ext4 / FAT) file is a stage-9+ follow-on (it needs
 # the persistent-backing work the spec's §12 / stage 9 describes).
 from fs.tmpfs import tmpfs_write, tmpfs_size, tmpfs_read
+# SMP row-pool serialization. The devfd row pool (devfd_owner / devfd_kind
+# / devfd_arg / devfd_pos below) is process-GLOBAL, shared across all CPUs.
+# do_rfork() is NOT under the execve serialization lock, so two CPUs can run
+# pgrp_clone() -> devfd_clone_row() -> _devfd_alloc_row() concurrently; the
+# `devfd_owner[i] == 0` check-then-claim is a TOCTOU that can hand the SAME
+# row to two different child Pgrps, cross-wiring their /fd tables and
+# double-/mis-counting pipe reader/writer refcounts -> the child's stdio
+# read/write blocks forever (the intermittent httpd_worker + concurrent
+# curl/hambrowse HANG under -smp 2, #138/#140 root race). A plain spinlock
+# around every ROW-POOL MUTATION (alloc/claim, clone, free, bind) makes the
+# install atomic. Read/write I/O only READS an already-owned row (an aligned
+# 8-byte owner-pointer load is atomic on x86; a task resolves its OWN Pgrp,
+# never the one being freed), so the hot I/O path stays lock-free. A plain
+# spinlock is safe here: no devfd op runs from IRQ context, the critical
+# sections never block, and clone_row runs with IRQs already masked (rfork).
+extern def spinlock_lock(ptr: Ptr[uint32])
+extern def spinlock_unlock(ptr: Ptr[uint32])
+_devfd_row_lock: uint32 = 0
 
 
 # Phase 4c: FD_DEVFD_MARK (0xFFFFFFDF) is RETIRED. An `#d/<N>` fd is an
@@ -268,8 +286,13 @@ def devfd_bind(pgrp: uint64, fdnum: int32, kind: int32,
                arg: int32) -> int32:
     if fdnum < 0 or cast[uint64](fdnum) >= DEVFD_SLOTS:
         return -1
+    # Serialize row-pool mutation (see _devfd_row_lock note at top): the
+    # row-or-alloc claim + slot write must be atomic vs a concurrent
+    # clone/free/bind on another CPU.
+    spinlock_lock(&_devfd_row_lock)
     row: int32 = _devfd_row_or_alloc(pgrp)
     if row < 0:
+        spinlock_unlock(&_devfd_row_lock)
         return -1
     slot: uint64 = cast[uint64](fdnum)
     base: uint64 = cast[uint64](row) * DEVFD_SLOTS
@@ -277,6 +300,7 @@ def devfd_bind(pgrp: uint64, fdnum: int32, kind: int32,
     _devfd_release_slot(row, slot)
     devfd_kind[base + slot] = kind
     devfd_arg[base + slot] = arg
+    spinlock_unlock(&_devfd_row_lock)
     return 0
 
 
@@ -655,11 +679,21 @@ def devfd_poll_readable(pgrp: uint64, fdnum: int32) -> int32:
 # reference. This is what makes "stdio is a name in a COW Pgrp" work.
 
 def devfd_clone_row(src_pgrp: uint64, dst_pgrp: uint64):
+    # THE SMP SPAWN RACE FIX (#138/#140). Serialize the whole find-src +
+    # alloc-dst + row-copy sequence: without the lock, two concurrent
+    # rfork(RFNAMEG) spawns on two CPUs could _devfd_alloc_row() the SAME
+    # free row (TOCTOU on devfd_owner[i]==0), cross-wire both children's
+    # /fd tables and corrupt the pipe reader/writer refcounts, hanging the
+    # child's stdio. Held across the pipe_inc_* bumps so the row's slots +
+    # their backing refcounts land as one atomic unit.
+    spinlock_lock(&_devfd_row_lock)
     src: int32 = _devfd_find_row(src_pgrp)
     if src < 0:
+        spinlock_unlock(&_devfd_row_lock)
         return                                  # parent has no /fd table
     dst: int32 = _devfd_alloc_row(dst_pgrp)
     if dst < 0:
+        spinlock_unlock(&_devfd_row_lock)
         return                                  # pool exhausted; child runs bare
     sbase: uint64 = cast[uint64](src) * DEVFD_SLOTS
     dbase: uint64 = cast[uint64](dst) * DEVFD_SLOTS
@@ -674,6 +708,7 @@ def devfd_clone_row(src_pgrp: uint64, dst_pgrp: uint64):
         elif k == DEVFD_PIPE_W:
             pipe_inc_writer(a)
         s = s + 1
+    spinlock_unlock(&_devfd_row_lock)
 
 
 # devfd_free_row — called from chan.ad's pgrp_ref_dec() when a Pgrp's
@@ -681,14 +716,21 @@ def devfd_clone_row(src_pgrp: uint64, dst_pgrp: uint64):
 # holds, then frees the row.
 
 def devfd_free_row(pgrp: uint64):
+    # Serialize row-pool mutation (see _devfd_row_lock note): a task
+    # exiting (free) on one CPU while another CPU spawns (clone) both
+    # mutate the shared devfd_owner array — without the lock a freed row
+    # index can be claimed mid-release and its pipe refcounts corrupted.
+    spinlock_lock(&_devfd_row_lock)
     row: int32 = _devfd_find_row(pgrp)
     if row < 0:
+        spinlock_unlock(&_devfd_row_lock)
         return
     s: uint64 = 0
     while s < DEVFD_SLOTS:
         _devfd_release_slot(row, s)
         s = s + 1
     devfd_owner[cast[uint64](row)] = 0
+    spinlock_unlock(&_devfd_row_lock)
 
 
 # --- Phase 4c boot self-test ----------------------------------------
