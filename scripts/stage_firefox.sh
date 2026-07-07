@@ -633,8 +633,12 @@ if [ -s "$FFHOME/.ff-profile/prefs.js" ]; then echo "[FF-DIAG] prefs.js delivere
 # the still-running deadlocked process's log (which pinpoints the IPC gap) is
 # captured. Write per-process logs: MOZ_LOG_FILE gets a .child-N suffix per
 # child, so we dump EVERY moz.log* file, not just the parent's.
-export MOZ_LOG='nsWindow:5,WidgetWayland:5,Widget:5,Compositor:4,WebRender:4,ipc:5,IPDL:5,MessageChannel:5,ProcessHangMon:5,sync,timestamp'
-export MOZ_LOG_FILE="$FFHOME/moz.log"
+# PER-PID log files (%PID) so the parent AND each content/GPU child write
+# their OWN moz.<pid>.log — the cross-process IPC handshake stall needs the
+# CHILD's IPDL/MessageChannel trace, not just the parent's. ipc/IPDL first so
+# the earliest channel-open + Bridge/Endpoint messages land before any hang.
+export MOZ_LOG='ipc:5,IPDL:5,MessageChannel:5,Widget:5,WidgetWayland:5,nsWindow:5,Compositor:5,WebRender:5,ProcessHangMon:5,sync,timestamp'
+export MOZ_LOG_FILE="$FFHOME/moz.%PID.log"
 export HOME="$FFHOME"
 export XDG_CONFIG_HOME="$FFHOME/.config"
 export XDG_CACHE_HOME="$FFHOME/.cache"
@@ -681,10 +685,10 @@ echo "[FF-POST] settling 45s to let the forked firefox write its MOZ_LOG ..."
 i=0; while [ "$i" -lt 45 ]; do sleep 1; i=$((i+1)); done
 echo "[FF-POST] === /tmp/ffhome listing ==="
 ls -la "$FFHOME" 2>&1 | while IFS= read -r l; do echo "[FF-POST] $l"; done
-for f in "$FFHOME"/moz.log*; do
+for f in "$FFHOME"/moz.*.log "$FFHOME"/moz.log*; do
     [ -e "$f" ] || continue
     echo "[FF-POST] === $f ($(wc -l < "$f" 2>/dev/null) lines) ==="
-    tail -n 80 "$f" 2>/dev/null | while IFS= read -r l; do echo "[FF-LOG] $l"; done
+    tail -n 120 "$f" 2>/dev/null | while IFS= read -r l; do echo "[FF-LOG] $l"; done
 done
 FFLAUNCH
 chmod +x "$ROOTFS/ff-launch.sh"
