@@ -1049,6 +1049,27 @@ CHAN_POOL_CAP: uint64 = 8192
 
 chan_pool: Array[8192, ChanT]
 chan_pool_inited: int32 = 0
+# SMP refcount serialization for the pool. The chan_pool is process-GLOBAL,
+# shared across all CPUs. A forked/dup'd pipe or stdio fd SHARES one pool
+# chan whose refcount is bumped on fork (namec_chan_ref) and dropped on
+# close/exit (namec_close). Those refcount RMWs — and the _chan_alloc
+# free-slot claim — were lock-free. Under -smp 2 two concurrent closes of
+# the SAME shared chan (e.g. an httpd CGI worker closing its pipe write-end
+# while its cgi_echo child exits closing the inherited copy on the other
+# CPU) both read refcount=2, both write 1: a LOST DECREMENT that leaves a
+# phantom reference, so the LAST-close backing release (pipe_close_writer)
+# NEVER runs. The pipe keeps a phantom writer, the reader never sees EOF,
+# and the worker's drain loop spins ~400s (> the test's 300s) — the
+# intermittent httpd/#140 "hang". Two concurrent _chan_alloc could likewise
+# claim the same slot. A plain spinlock around the refcount decrement/
+# increment + the alloc claim makes them atomic. The heavy last-ref backing
+# release + _chan_free run OUTSIDE the lock (the release is claimed
+# atomically by zeroing the refcount under the lock, so no other CPU can
+# also reach the last-ref path). No namec op runs from IRQ context and the
+# locked regions never block, so a plain spinlock is deadlock-free.
+extern def spinlock_lock(ptr: Ptr[uint32])
+extern def spinlock_unlock(ptr: Ptr[uint32])
+_chan_pool_lock: uint32 = 0
 
 
 def namec_init():
@@ -1076,15 +1097,23 @@ def _chan_alloc() -> int32:
     # payload; the caller stamps dev_type / back_slot / back_ptr.
     if chan_pool_inited == 0:
         namec_init()
+    # SMP: claim the free slot ATOMICALLY. Set in_use=1 under the lock so a
+    # concurrent _chan_alloc on another CPU can't pick the same slot in the
+    # window before the caller stamps in_use (the callers re-set it to 1,
+    # which is idempotent). refcount=1 marks the single fd namec hands back.
+    spinlock_lock(&_chan_pool_lock)
     s: uint64 = 1
     while s < CHAN_POOL_CAP:
         if chan_pool[s].in_use == 0:
+            chan_pool[s].in_use      = 1
             chan_pool[s].refcount    = 1
             chan_pool[s].back_slot   = -1
             chan_pool[s].back_ptr    = 0
             chan_pool[s].p9_dir_mode = 0
+            spinlock_unlock(&_chan_pool_lock)
             return cast[int32](s)
         s = s + 1
+    spinlock_unlock(&_chan_pool_lock)
     return -1
 
 
@@ -3654,9 +3683,28 @@ def namec_close(cid: int32) -> int32:
     su: uint64 = cast[uint64](cid)
     # Drop one reference. Not the last? leave the chan live for the
     # other holders (a forked/dup'd fd).
+    #
+    # SMP (THE #140 httpd/CGI HANG FIX): this decrement + last-ref detection
+    # MUST be atomic. Two concurrent closes of the same shared chan (a CGI
+    # worker closing its pipe write-end while its cgi_echo child exits
+    # closing the inherited copy on the other CPU) otherwise both read
+    # refcount=2 and both write 1 — a lost decrement that leaves a phantom
+    # ref so NEITHER runs pipe_close_writer. The pipe never sees EOF and the
+    # worker's drain spins ~400s (> the 300s timeout). We claim the last-ref
+    # release atomically by zeroing refcount UNDER the lock, then run the
+    # (potentially heavy / re-entrant) backing release + _chan_free OUTSIDE
+    # the lock — exactly one CPU can win the 1->0 transition.
+    spinlock_lock(&_chan_pool_lock)
     if chan_pool[su].refcount > 1:
         chan_pool[su].refcount = chan_pool[su].refcount - 1
+        spinlock_unlock(&_chan_pool_lock)
         return 0
+    # We are the last reference: claim the release so a racing close can't
+    # also enter this path (it would see refcount 0 — treated as last too,
+    # but _chan_free below makes the slot in_use=0 so a stale second close
+    # on a reused id is caught by _chan_id_valid on entry).
+    chan_pool[su].refcount = 0
+    spinlock_unlock(&_chan_pool_lock)
     # Last reference — run the per-dev_type backing release, then free.
     if chan_pool[su].dev_type == DEV_MNT:
         p9c_clunk(chan_pool[su].srvfd, chan_pool[su].p9_fid)
@@ -3798,7 +3846,11 @@ def namec_chan_ref(cid: int32) -> int32:
     if _chan_id_is_inline(cid) != 0:
         return 0
     su: uint64 = cast[uint64](cid)
+    # SMP: atomic bump — races a concurrent namec_close decrement on the
+    # other CPU (see _chan_pool_lock note).
+    spinlock_lock(&_chan_pool_lock)
     chan_pool[su].refcount = chan_pool[su].refcount + 1
+    spinlock_unlock(&_chan_pool_lock)
     return 0
 
 
