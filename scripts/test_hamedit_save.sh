@@ -173,17 +173,22 @@ def read_wid():
         return None
     with lock:
         text = buf[start:].decode("latin1", "replace")
-    # The shell echoes char-by-char, so the BEGIN/END markers appear many
-    # times (once per partial echo). Scan EVERY BEGIN..END region; the wid
-    # was written by the editor as a line that is JUST the number ("8\n").
-    # Kernel log noise ([NNNN] ... 0x...) is interleaved, so match only a
-    # bare-number line. Take the last such value across all regions.
+    # The interactive hamsh echoes each typed char with a cursor-redraw
+    # escape, so "WIDFILE_BEGIN"/"WIDFILE_END" appear DOZENS of times (one
+    # partial copy per keystroke). The old BEGIN(.*?)END region match paired
+    # those polluted echo copies and matched an empty region -> wid parsed to
+    # None even though `cat /tmp/.hamedit_wid` printed the wid cleanly on its
+    # OWN line ("9\n"). ROBUST parse: strip ANSI/cursor escapes from the whole
+    # post-send text, then take the LAST line that is JUST a 1..3 digit number
+    # (the wid file's bare-number output). Command echoes never leave a bare
+    # digit on its own line; kernel log noise ("[NNNN] ...") is bracketed, not
+    # bare. This is the same parse the ad-hoc DE-QA driver uses successfully.
+    clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text).replace("\r", "\n")
     last = None
-    for m in re.finditer(r"WIDFILE_BEGIN(.*?)WIDFILE_END", text, re.S):
-        region = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", m.group(1))
-        for c in re.findall(r"(?m)^\s*(\d{1,3})\s*$", region):
-            if 1 <= int(c) <= 256:
-                last = int(c)
+    for ln in clean.split("\n"):
+        t = ln.strip()
+        if t.isdigit() and 1 <= len(t) <= 3 and 1 <= int(t) <= 256:
+            last = int(t)
     return last
 
 # PRIMARY input path: inject straight into the editor's own /keys ring by
@@ -239,9 +244,24 @@ try:
         print("[save_gate] driver: never reached handoff", file=sys.stderr)
     else:
         print("[save_gate] driver: handoff reached", file=sys.stderr)
-        # Let the rl5 scene DE settle.
+        # Let the rl5 scene DE settle. CRITICAL: the rc.5 visual_gate runner
+        # floods /dev/cons with "[visual_gate] launching/launched <app>"
+        # markers for ~40s AFTER the interactive handoff. Those lines contend
+        # with every serial command we send — garbling the `cat
+        # /tmp/.hamedit_wid` readback (ED_WID parses to None) and the
+        # `printf ... > /keys` injections alike, which is why this gate was
+        # intermittently reporting "wid = None" / empty readbacks. WAIT for
+        # the visual_gate's terminal "[visual_gate] done" marker so the
+        # console is QUIET before we read the wid and inject keys.
         wait_for("launching text editor", 60)
-        time.sleep(10)
+        if not wait_for("[visual_gate] done", 200):
+            print("[save_gate] driver: visual_gate 'done' not seen; "
+                  "driving anyway (console may be noisy)", file=sys.stderr)
+        time.sleep(4)
+        # Flush a couple of newlines to clear any partial prompt line left
+        # by the flood before the first real command.
+        send(""); send("")
+        time.sleep(1)
         screendump("boot")
 
         # ---- ARM A: writable round-trip -----------------------------
