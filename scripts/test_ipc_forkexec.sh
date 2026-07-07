@@ -71,7 +71,10 @@ for m in \
     fi
 done
 
-grep -aiE "NX exec-fault|capturing core|code=139|coredump|IPCFE: FAIL" "$LOG" \
+# Fault markers only — NB: match "capturing core" (a real coredump) not the
+# benign boot "[coredump] gate / skipped" line, and the fixture's own
+# "IPCFE: FAIL" self-report.
+grep -aiE "NX exec-fault|capturing core|code=139|IPCFE: FAIL" "$LOG" \
     && { echo "[ipcfe] FAULT/FAIL marker seen"; fail=1; } || true
 
 echo "=== VERDICT ==="
