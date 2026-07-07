@@ -11728,8 +11728,10 @@ def futex_table_dump():
     any: int32 = 0
     while i < FUTEX_NSLOTS:
         if futex_addr[i] != 0:
+            printk_set_level(PRINTK_LEVEL_EMERG)
             printk3("[nosys-wd]   futex slot=%d key=%p waiter_task=%d\n",
                     i, futex_addr[i], cast[uint64](futex_slot[i]))
+            printk_set_level(PRINTK_LEVEL_EMERG)
             printk2("[nosys-wd]   futex slot=%d timed=%d (1=timeout supplied)\n",
                     i, cast[uint64](futex_timed[i]))
             any = 1
@@ -11754,7 +11756,7 @@ def _futex_wkdiag_zero_match(uaddr: uint64, key: uint64, priv: int32):
     _futex_wkdiag_ring[_futex_wkdiag_head] = uaddr
     _futex_wkdiag_head = (_futex_wkdiag_head + 1) % FUTEX_WKDIAG_N
     _futex_wkdiag_count = _futex_wkdiag_count + 1
-    printk_set_level(PRINTK_LEVEL_WARN)
+    printk_set_level(PRINTK_LEVEL_EMERG)
     printk3("[ff-wake0] FUTEX_WAKE matched 0 waiters uaddr=%p key=%p priv=%d\n",
             uaddr, key, cast[uint64](priv))
 
@@ -11821,6 +11823,25 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
     # arch/x86/kernel/syscall_64.S — we preserve %rdi only for FUTEX
     # to make musl pthread mutex contention work).
     op: uint64 = a1 & FUTEX_OP_MASK
+    # TIMEOUT DISCRIMINATOR (read from the RAW op before folding). The Linux
+    # futex(2) timeout arg (a3) means RELATIVE for a bare FUTEX_WAIT (op 0) and
+    # ABSOLUTE for FUTEX_WAIT_BITSET (op 9). glibc's pthread_cond_timedwait and
+    # NSPR's PR_WaitCondVar(deadline) always use FUTEX_WAIT_BITSET|(optionally
+    # FUTEX_CLOCK_REALTIME) with an ABSOLUTE deadline; a bare relative timeout
+    # comes from older sem_timedwait paths. Firefox/NSPR/Rust background threads
+    # lean HEAVILY on timed waits as their "wake up periodically to advance
+    # timers / re-check the work queue / detect a hang" mechanism — so a futex
+    # that never honours the timeout leaves such a thread parked forever, which
+    # (as the FF startup deadlock shows) can wedge the whole thread group when
+    # that thread is the one that would signal a sibling. Capture the flavour
+    # here; the FUTEX_WAIT arm below converts a3 into a monotonic-ns deadline
+    # and returns -ETIMEDOUT when it passes.
+    _futex_abs_to: int32 = 0
+    if op == FUTEX_WAIT_BITSET:
+        _futex_abs_to = 1
+    _futex_clk_rt: int32 = 0
+    if (a1 & FUTEX_CLOCK_REALTIME) != 0:
+        _futex_clk_rt = 1
     # FUTEX_WAIT_BITSET (9) and FUTEX_WAKE_BITSET (10) are the same as
     # WAIT/WAKE plus a per-bit mask in val3 (a5). glibc's pthread_join
     # uses BITSET with mask = FUTEX_BITSET_MATCH_ANY (0xffffffff), so
@@ -11859,6 +11880,45 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
             return ELINUX_EFAULT
         if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
             return ELINUX_AGAIN
+        # ---- TIMED-WAIT DEADLINE (a3 timeout ptr) ----------------------
+        # Convert the user timeout into an absolute CLOCK_MONOTONIC-ns deadline
+        # (tsc_monotonic_ns' base). a3==0 means an infinite wait — _has_deadline
+        # stays 0 and the wait behaves EXACTLY as before (untimed path fully
+        # unchanged, so the proven weston-terminal / pthread_join / mutex-lock
+        # cases are byte-for-byte identical). Only a supplied timeout adds the
+        # -ETIMEDOUT exit that Linux mandates and that the untimed-forever bug
+        # was silently dropping.
+        _has_deadline: int32 = 0
+        _deadline_ns: uint64 = 0
+        if a3 != 0:
+            _to_sec: uint64 = 0
+            _to_nsec: uint64 = 0
+            if get_user_64(a3, &_to_sec) != 0:
+                return ELINUX_EFAULT
+            if get_user_64(a3 + 8, &_to_nsec) != 0:
+                return ELINUX_EFAULT
+            _req_ns: uint64 = _to_sec * 1000000000 + _to_nsec
+            if _futex_abs_to != 0:
+                # ABSOLUTE deadline. CLOCK_MONOTONIC absolute times share
+                # tsc_monotonic_ns' base directly; a CLOCK_REALTIME absolute
+                # time is rebased to monotonic by subtracting the RTC boot
+                # epoch (realtime_ns = rtc_boot_epoch*1e9 + monotonic_ns).
+                if _futex_clk_rt != 0:
+                    _rt_base_ns: uint64 = rtc_boot_epoch_get() * 1000000000
+                    if _req_ns > _rt_base_ns:
+                        _deadline_ns = _req_ns - _rt_base_ns
+                    else:
+                        _deadline_ns = 0
+                else:
+                    _deadline_ns = _req_ns
+            else:
+                # RELATIVE timeout: deadline = now + requested span.
+                _deadline_ns = tsc_monotonic_ns() + _req_ns
+            _has_deadline = 1
+            # Already expired at entry -> -ETIMEDOUT immediately (glibc/NSPR
+            # then re-evaluate the predicate under their own lock).
+            if tsc_monotonic_ns() >= _deadline_ns:
+                return ELINUX_TIMEDOUT
         # ---------------------------------------------------------------
         # WAIT STRATEGY SELECTION (the reconciliation of efficiency vs the
         # weston-terminal render regression). The O(n^2) poll-yield collapse
@@ -11928,6 +11988,13 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
                     futex_addr[py_su] = 0
                     futex_slot[py_su] = -1
                     break
+                # Timed wait: honour the deadline (Linux -ETIMEDOUT). Untimed
+                # (_has_deadline==0) never takes this branch, so the render-
+                # critical elided-wake cadence is unchanged.
+                if _has_deadline != 0 and tsc_monotonic_ns() >= _deadline_ns:
+                    futex_addr[py_su] = 0
+                    futex_slot[py_su] = -1
+                    return ELINUX_TIMEDOUT
             while 1
             return 0
         # ---- BOUNDED BLOCKING park (LARGE thread group) -----------------
@@ -12051,6 +12118,16 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
                 return ELINUX_EFAULT
             if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
                 return 0
+            # Timed wait: the caller supplied a deadline (glibc/NSPR
+            # pthread_cond_timedwait etc.). The FUTEX_PARK_TICKS recheck above
+            # is only the lost-wake self-heal; the REAL user deadline is honored
+            # here. If it has passed, return -ETIMEDOUT (Linux semantics) so the
+            # thread re-evaluates its predicate instead of re-registering + re-
+            # sleeping forever — the untimed-futex bug that parked timed-waiting
+            # Firefox/NSPR threads permanently. Untimed waits (_has_deadline==0)
+            # loop exactly as before.
+            if _has_deadline != 0 and tsc_monotonic_ns() >= _deadline_ns:
+                return ELINUX_TIMEDOUT
         return 0                                        # unreachable
     if op == FUTEX_WAKE:
         if a0 == 0:
