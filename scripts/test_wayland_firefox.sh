@@ -190,12 +190,12 @@ FF_CMD="spawn linux { /bin/sh /ff-launch.sh }"
 # LADDER RUNG (a): Firefox connects to the native Wayland server.
 # =====================================================================
 echo "$TAG --- RUNG (a): launch firefox-esr (MOZ_ENABLE_WAYLAND=1) ---"
-pre_reg=$(grep -acF "$REGISTRY_MARKER" "$LOG" 2>/dev/null || echo 0)
-pre_commits=$(grep -acF "$COMMIT_MARKER" "$LOG" 2>/dev/null || echo 0)
+pre_reg=$(grep -acF "$REGISTRY_MARKER" "$LOG" 2>/dev/null | head -1)
+pre_commits=$(grep -acF "$COMMIT_MARKER" "$LOG" 2>/dev/null | head -1)
 echo "$TAG pre-launch: registry=$pre_reg commits=$pre_commits"
 rung_a=0
 if send_until "$FF_CMD" "$REGISTRY_MARKER" "$CMD_WAIT"; then
-    post_reg=$(grep -acF "$REGISTRY_MARKER" "$LOG" 2>/dev/null || echo 0)
+    post_reg=$(grep -acF "$REGISTRY_MARKER" "$LOG" 2>/dev/null | head -1)
     if [ "$post_reg" -gt "$pre_reg" ]; then
         echo "$TAG PASS (a): native Wayland registry advertised to Firefox (reg $pre_reg->$post_reg)."
         rung_a=1
@@ -216,7 +216,7 @@ rung_b=0
 post_commits="$pre_commits"
 for _i in $(seq 1 "$CMD_WAIT"); do
     kill -0 "$QEMU_PID" 2>/dev/null || break
-    post_commits=$(grep -acF "$COMMIT_MARKER" "$LOG" 2>/dev/null || echo 0)
+    post_commits=$(grep -acF "$COMMIT_MARKER" "$LOG" 2>/dev/null | head -1)
     [ "$post_commits" -gt "$pre_commits" ] && break
     sleep 1
 done
