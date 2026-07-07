@@ -372,22 +372,27 @@ user_pref("widget.wayland.use-dmabuf", false);
 user_pref("media.ffmpeg.vaapi.enabled", false);
 user_pref("media.hardware-video-decoding.enabled", false);
 user_pref("layers.acceleration.disabled", true);
-// GPU/CONTENT CHILD PROCESSES DISABLED (symbolicated diagnosis, deb13
-// 140.12.0 + dbgsym run): with gpu-process=true + e10s the parent builds
-// FULL GTK chrome then DEADLOCKS — pid 94 ends with ~13 threads ALL parked
-// (main thread in a glib main-loop futex; the rest in libxul MessageLoop /
-// mojo::core::ports / nsSocketTransportService IPC waits + pipe reads) while
-// EVERY spawned child process (GPU/content/probe, pids 79-92) EXITED during
-// startup. The kernel futex diag confirms it is NOT a futex-key mismatch:
-// stuck-waiter keys are consistent (priv=1, same-process) and NO FUTEX_WAKE
-// is ever issued on the main thread's uaddr — a genuine cross-process IPC
-// circular wait, the parent blocked forever on a child that died. So remove
-// the cross-process dependency entirely: no GPU process (compositor runs in
-// the PARENT and presents software-WebRender straight into a wl_shm buffer),
-// no content process, single process. The parent then owns + maps the chrome
-// toplevel with no child it must wait on.
-user_pref("layers.gpu-process.enabled", false);
-user_pref("layers.gpu-process.force-enabled", false);
+// SYMBOLICATED DEADLOCK DIAGNOSIS (deb13 140.12.0esr + matching dbgsym,
+// build-id fb3be86..., two full -m 6G runs). The wl_shm-no-commit deadlock is
+// MODEL-INDEPENDENT: it reproduces IDENTICALLY with gpu-process+e10s AND with
+// pure single-process (gpu-process=false, tabs.remote.autostart=false,
+// processCount=1 — both tested). In BOTH cases the parent builds FULL GTK
+// chrome (GtkHeaderBar/GtkMenuBar/Scrollbars all styled) then parks all ~12-13
+// threads: the MAIN thread in a GLib main-loop futex (backtrace = libglib /
+// libgobject / libpango), the rest in libxul MessageLoop / mojo::core::ports /
+// nsSocketTransportService IPC waits + pipe reads / ppoll / epoll. It is NOT a
+// futex-KEY mismatch: the kernel futex diag shows the stuck-waiter keys are
+// consistent (priv=1, same-process cr3) and only ~10 BENIGN zero-match wakes
+// fire, NONE on any stuck-waiter uaddr — i.e. NO FUTEX_WAKE is ever issued on
+// the main thread's futex word. So the root cause is an intra-process circular
+// wait / lost wakeup in the parent's render/present bring-up (the thread that
+// would signal the main thread's glib source never does), NOT the process
+// model and NOT the Debian-version alignment (the minbase rootfs is already
+// TRIXIE-aligned: glibc 2.41 + GTK 3.24.49). NEXT: instrument the GLib source
+// dispatch / eventfd-or-pipe self-wake path the render thread uses to signal
+// the main loop, at the Hamnix futex/pipe-wakeup layer. Multiprocess is kept
+// as the documented baseline (single-process gained nothing).
+user_pref("layers.gpu-process.enabled", true);
 user_pref("webgl.disabled", true);
 // ---- suppress the startup GPU-probe CHILD (glxtest / vaapitest). Firefox
 // launches these as separate helper binaries via g_spawn (fork+exec) to
@@ -409,8 +414,8 @@ user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
 user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("browser.aboutwelcome.enabled", false);
-user_pref("browser.tabs.remote.autostart", false);
-user_pref("dom.ipc.processCount", 1);
+user_pref("browser.tabs.remote.autostart", true);
+user_pref("dom.ipc.processCount", 4);
 user_pref("browser.startup.page", 0);
 // ---- minimise child-process dependence (Hamnix Linux-ns futex is still the
 // O(n^2) poll-yield path pending the bounded-park fix #117: every extra
