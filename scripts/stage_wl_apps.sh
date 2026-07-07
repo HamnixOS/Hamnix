@@ -156,6 +156,45 @@ if [ -f "$APPROOT/etc/xdg/foot/foot.ini" ]; then
     echo "[stage-wlapps] staged /etc/xdg/foot/foot.ini"
 fi
 
+# --- 4. COMPLETE the fontconfig cache prime ----------------------------
+# stage_weston_term.sh primed the cache, but its run predated some font dirs
+# (notably /usr/share/fonts/X11/*), so the cache for the TOP-LEVEL
+# /usr/share/fonts directory (md5 3830d5c3…-le64.cache-9) was never written.
+# weston-terminal resolves DejaVu straight from the truetype/dejavu SUBDIR
+# cache and never touches the top-dir cache, so it renders fine. But a client
+# that ENUMERATES the full fontset (foot's fcft calls FcFontList; pango does
+# too for fallback) forces fontconfig to (re)scan /usr/share/fonts and then
+# WRITE the missing top-dir cache — and fontconfig's cache-WRITE lock path
+# HANGS SILENTLY under the Linux-ABI (same failure the weston-terminal chain
+# documents). foot then parks forever in font setup, never creating its
+# xdg_surface → no window. Re-priming the WHOLE cache tree here (so every
+# directory, including the top level, ships a ready cache) means no client
+# ever needs to write a cache at runtime → no hang. GENERAL fix: benefits
+# every fontconfig client (foot, pango/GTK apps, the weston toytoolkit demos).
+if command -v fc-cache >/dev/null 2>&1; then
+    fc-cache --sysroot="$ROOTFS" -f >/dev/null 2>&1 || true
+    # Mirror the complete primed set into the other cachedirs listed in
+    # fonts.conf (harmless if pruned at image-build; makes direct-rootfs boots
+    # + un-pruned builds work too).
+    SRC="$ROOTFS/etc/fonts/cache"
+    if ls "$SRC"/*.cache-* >/dev/null 2>&1; then
+        for d in "$ROOTFS/run/fontconfig" "$ROOTFS/var/cache/fontconfig"; do
+            mkdir -p "$d"; cp -f "$SRC"/*.cache-* "$d/" 2>/dev/null || true
+        done
+        # mtime hardening: fontconfig treats a cache as STALE (→ rescan + the
+        # hanging rewrite) if the font dir's mtime is NEWER than the cache.
+        # Stamp every cache to "now" so it is newer than every staged font dir.
+        find "$ROOTFS/etc/fonts/cache" "$ROOTFS/run/fontconfig" \
+             "$ROOTFS/var/cache/fontconfig" -name '*.cache-*' \
+             -exec touch {} + 2>/dev/null || true
+        echo "[stage-wlapps] completed fontconfig cache prime ($(ls "$SRC"/*.cache-* | wc -l) caches incl. top-level /usr/share/fonts)"
+    else
+        echo "[stage-wlapps] WARNING: fc-cache produced no caches — foot/pango may HANG in font setup."
+    fi
+else
+    echo "[stage-wlapps] WARNING: host fc-cache absent — cannot complete the font cache prime."
+fi
+
 echo "[stage-wlapps] DONE. rootfs now carries weston demos + foot."
 echo "[stage-wlapps]   demos:  weston-simple-damage weston-flower weston-smoke weston-eventdemo weston-clickdot"
 echo "[stage-wlapps]   foot:   /usr/bin/foot (+ footclient)"
