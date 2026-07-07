@@ -1067,10 +1067,38 @@ def _send_channel_close() -> int32:
 # A small cooperative yield keeps the loop from busy-spinning.
 
 def _peek_socket_has_data() -> int32:
+    # A byte already stashed by a blocking idle-wait counts as "data
+    # ready" — don't consume a second byte off the stream.
+    if sock_peek_valid[0] != 0:
+        return 1
     n: int64 = sys_read_nb(conn_fd[0], &sock_peek[0], cast[uint64](1))
     if n < 0:
         return -1
     if n == 0:
+        return 0
+    sock_peek_valid[0] = 1
+    return 1
+
+
+def _wait_socket_byte() -> int32:
+    # BLOCKING wait for the next inbound byte, used by the bridge's idle
+    # branch instead of a sys_yield() spin. tcp_recv parks the task on
+    # the connection's rx wait queue and tcp_rx wakes it (wq_wake_all)
+    # the instant a segment is deposited — a wakeup that crosses CPUs,
+    # so it fires even when the peer's data lands via the in-kernel
+    # loopback deposit on ANOTHER core under SMP. sys_yield()'s idle
+    # `hlt` does NOT: on an AP with no other ready task it halts until
+    # an IRQ, and a loopback deposit raises none, so the bridge would
+    # sleep forever waiting for output it already had queued. The 5 s
+    # (NET_BLOCK_JIFFIES) cap bounds a genuinely-idle wait so we loop
+    # back to re-poll stdin. Returns 1 = byte stashed, 0 = timeout,
+    # -1 = EOF/error.
+    if sock_peek_valid[0] != 0:
+        return 1
+    r: int64 = sys_read(conn_fd[0], &sock_peek[0], cast[uint64](1))
+    if r < 0:
+        return -1
+    if r == 0:
         return 0
     sock_peek_valid[0] = 1
     return 1
@@ -1092,16 +1120,6 @@ def _recv_packet_enc_peek() -> int32:
     if _recv_exact_peek(&enc_len_buf[0], 4) != 0:
         return -1
     return _decrypt_after_len()
-
-
-def _short_sleep():
-    # Cooperative yield — Hamnix multitasks cooperatively, so the bridge
-    # must give up the CPU between non-blocking polls or it starves the
-    # peer (sshd + its hamsh) and no output ever comes back.
-    i: uint64 = 0
-    while i < 4:
-        sys_yield()
-        i = i + 1
 
 
 # Feed received channel bytes through a rolling match for the selftest
@@ -1132,21 +1150,37 @@ def _rtt_feed(buf: Ptr[uint8], n: uint64):
 def _bridge_session(want_status: Ptr[int32]) -> int32:
     _log("[ssh] bridging channel <-> stdin/stdout\n")
     sock_peek_valid[0] = 0
-    stdin_eof: int32 = 0
-    got_status: int32 = 0
-    exit_code: uint32 = 0
-    idle_loops: uint32 = 0
+    stdin_eof:    int32 = 0
+    got_status:   int32 = 0
+    exit_code:    uint32 = 0
+    server_eof:   int32 = 0            # peer sent CHANNEL_EOF (no more data)
+    server_close: int32 = 0           # peer sent CHANNEL_CLOSE / TCP EOF
+    we_closed:    int32 = 0           # we already sent our CHANNEL_CLOSE
+    idle_loops:   uint32 = 0
     while True:
         did_work: int32 = 0
 
         # --- 1. socket -> stdout -------------------------------------
-        probe: int32 = _peek_socket_has_data()
-        if probe < 0:
-            _log("[ssh] server disconnected\n")
-            break
-        if probe > 0:
+        # DRAIN the whole queued burst: the server emits the command
+        # output as a run of CHANNEL_DATA packets immediately followed by
+        # exit-status + EOF + CLOSE, and on the synchronous in-kernel
+        # loopback they all land in our rx ring at once. Read-until-
+        # would-block here so the tail of the output AND the session-end
+        # packets are consumed in the SAME iteration — a one-packet-per-
+        # iteration reader that then falls through to the stdin poll can
+        # strand the closing packets and hang forever.
+        while True:
+            probe: int32 = _peek_socket_has_data()
+            if probe < 0:
+                # TCP EOF: the peer closed the connection underneath us.
+                # Treat exactly like a channel close so we finalize.
+                _log("[ssh] server disconnected\n")
+                server_close = 1
+            if probe <= 0:
+                break
             if _recv_packet_enc_peek() != 0:
                 _log("[ssh] packet read error / close\n")
+                server_close = 1
                 break
             did_work = 1
             mt: uint8 = pkt_in[0]
@@ -1182,13 +1216,27 @@ def _bridge_session(want_status: Ptr[int32]) -> int32:
                         exit_code = _get_u32(&pkt_in[0], coff)
                         got_status = 1
             elif mt == SSH_MSG_CHANNEL_EOF:
-                pass
+                # Peer will send no more channel data. Remember it; once
+                # the ring is drained we finalize without waiting on a
+                # separate CLOSE that a half-close peer might not send.
+                server_eof = 1
             elif mt == SSH_MSG_CHANNEL_CLOSE or mt == SSH_MSG_DISCONNECT:
                 _log("[ssh] server closed the channel\n")
-                _send_channel_close()
-                break
+                server_close = 1
+            # keep draining until the ring is empty (probe <= 0)
 
-        # --- 2. stdin -> socket --------------------------------------
+        # --- 2. session-end finalize ---------------------------------
+        # Once the peer has signalled end-of-session (CLOSE, TCP EOF, or
+        # EOF after we've drained every buffered byte), reply with our
+        # own CHANNEL_CLOSE and leave. stdout already carries the full
+        # decrypted output because the drain loop above ran to empty.
+        if server_close != 0 or server_eof != 0:
+            if we_closed == 0:
+                _send_channel_close()
+                we_closed = 1
+            break
+
+        # --- 3. stdin -> socket --------------------------------------
         if stdin_eof == 0:
             n: int64 = sys_read_nb(0, &chan_data[0], cast[uint64](2048))
             if n > 0:
@@ -1203,10 +1251,20 @@ def _bridge_session(want_status: Ptr[int32]) -> int32:
         if did_work != 0:
             idle_loops = 0
         else:
-            idle_loops = idle_loops + 1
-            _short_sleep()
-            if idle_loops > 60000:
-                break
+            # Nothing pending right now. Block on the socket until the
+            # peer sends more (woken by tcp_rx even when the deposit
+            # happens on another CPU — see _wait_socket_byte) or the
+            # 5 s cap returns us to re-poll stdin. This replaces a
+            # sys_yield() idle spin that never woke for an SMP loopback
+            # deposit, hanging the loopback self-test under -smp 2.
+            wr: int32 = _wait_socket_byte()
+            if wr < 0:
+                _log("[ssh] server disconnected\n")
+                server_close = 1
+            elif wr == 0:
+                idle_loops = idle_loops + 1
+                if idle_loops > 120:
+                    break
 
     want_status[0] = 0
     if got_status != 0:
