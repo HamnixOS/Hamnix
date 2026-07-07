@@ -58,7 +58,7 @@ mkdir -p "$DEBS" "$XWROOT"
 # a warning without it, but cheap to include).
 PKGS=(
   xwayland xserver-common
-  x11-utils x11-apps x11-xkb-utils
+  x11-utils x11-apps x11-xkb-utils x11-xserver-utils
   xfonts-base xfonts-encodings
   # --- Xwayland DT_NEEDED closure (front stubs; mesa backend stays lazy) --
   libgl1 libglx0 libglvnd0 libgbm1 libepoxy0 libdrm2
@@ -99,7 +99,7 @@ LIBDIRS = ["usr/lib/x86_64-linux-gnu","lib/x86_64-linux-gnu",
            "usr/lib","lib","usr/lib64","lib64"]
 BINS = ["usr/bin/Xwayland","usr/bin/xdpyinfo","usr/bin/xset",
         "usr/bin/xeyes","usr/bin/xclock","usr/bin/xkbcomp",
-        "usr/bin/xwininfo","usr/bin/xlsclients"]
+        "usr/bin/xwininfo","usr/bin/xlsclients","usr/bin/xsetroot"]
 
 def needed(p):
     try: out=subprocess.check_output(["readelf","-d",p],stderr=subprocess.DEVNULL).decode()
