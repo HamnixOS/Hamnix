@@ -372,15 +372,22 @@ user_pref("widget.wayland.use-dmabuf", false);
 user_pref("media.ffmpeg.vaapi.enabled", false);
 user_pref("media.hardware-video-decoding.enabled", false);
 user_pref("layers.acceleration.disabled", true);
-// MULTIPROCESS RE-ENABLED (#125): the single-process prefs below were a
-// WORKAROUND for the OLD cross-process child deadlock, now FIXED on main
-// (afunix fd-inherit c63406c1 + pgrp d6567770 + futex 4fc6c713/b775a4ae).
-// Firefox's single-process software-WebRender path intra-deadlocks (main
-// thread cond-waits on a compositor thread blocked on a self-pipe whose
-// writer sibling is also parked). The NORMAL multiprocess render path runs
-// content + GPU/compositor in a persistent child (2nd cr3) and avoids that
-// intra-process circular init. Allow the GPU process; keep pure software.
-user_pref("layers.gpu-process.enabled", true);
+// GPU/CONTENT CHILD PROCESSES DISABLED (symbolicated diagnosis, deb13
+// 140.12.0 + dbgsym run): with gpu-process=true + e10s the parent builds
+// FULL GTK chrome then DEADLOCKS — pid 94 ends with ~13 threads ALL parked
+// (main thread in a glib main-loop futex; the rest in libxul MessageLoop /
+// mojo::core::ports / nsSocketTransportService IPC waits + pipe reads) while
+// EVERY spawned child process (GPU/content/probe, pids 79-92) EXITED during
+// startup. The kernel futex diag confirms it is NOT a futex-key mismatch:
+// stuck-waiter keys are consistent (priv=1, same-process) and NO FUTEX_WAKE
+// is ever issued on the main thread's uaddr — a genuine cross-process IPC
+// circular wait, the parent blocked forever on a child that died. So remove
+// the cross-process dependency entirely: no GPU process (compositor runs in
+// the PARENT and presents software-WebRender straight into a wl_shm buffer),
+// no content process, single process. The parent then owns + maps the chrome
+// toplevel with no child it must wait on.
+user_pref("layers.gpu-process.enabled", false);
+user_pref("layers.gpu-process.force-enabled", false);
 user_pref("webgl.disabled", true);
 // ---- suppress the startup GPU-probe CHILD (glxtest / vaapitest). Firefox
 // launches these as separate helper binaries via g_spawn (fork+exec) to
@@ -402,8 +409,8 @@ user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
 user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("browser.aboutwelcome.enabled", false);
-user_pref("browser.tabs.remote.autostart", true);
-user_pref("dom.ipc.processCount", 4);
+user_pref("browser.tabs.remote.autostart", false);
+user_pref("dom.ipc.processCount", 1);
 user_pref("browser.startup.page", 0);
 // ---- minimise child-process dependence (Hamnix Linux-ns futex is still the
 // O(n^2) poll-yield path pending the bounded-park fix #117: every extra
