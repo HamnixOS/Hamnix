@@ -32,6 +32,12 @@ INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer.img}"
 LIVE_DISTRO_IMG="${LIVE_DISTRO_IMG:-build/hamnix-live-distro.img}"
 BOOT_WAIT="${BOOT_WAIT:-300}"
 CMD_WAIT="${CMD_WAIT:-180}"
+# The render rung needs a longer window than a plain command: the X app's
+# FIRST spawn cold-loads its whole dynamic closure (ld.so + libX11/libxcb/…)
+# under the live RAM-disk, which under -m 3G + host load can take ~3 min
+# before it draws. Xwayland's own root commit fires quickly; the app's commit
+# lands late. Give rung (c) its own generous bound so it isn't a flaky miss.
+RENDER_WAIT="${RENDER_WAIT:-360}"
 QEMU_MEM="${QEMU_MEM:-4G}"
 OUTDIR="${OUTDIR:-$PROJ_ROOT}"
 TAG="[test_wl5_xwl]"
@@ -271,36 +277,46 @@ fi
 # intermittent poisoned-PTE write fault (all-ones leaf PTE) can still make
 # xeyes abort on some ASLR layouts; when it does it now dies cleanly (exit
 # 134) instead of storming, and a later boot with a clean layout renders.
-echo "$TAG --- RUNG (c): DISPLAY=:0 xeyes (X11 app renders) ---"
-# Screendump BEFORE the app maps, to diff for the new rendered content.
+echo "$TAG --- RUNG (c): DISPLAY=:0 X11 app renders (xsetroot -solid red) ---"
+# Screendump BEFORE the app draws, to diff for the new rendered content.
 PPM_PRE="$OUTDIR/wl5_xwl_pre.ppm"
 PPM_APP="$OUTDIR/wl5_xwl_app.ppm"
-PNG_APP="$OUTDIR/wl5_xwayland_xeyes.png"
+PNG_APP="$OUTDIR/wl5_xwayland_xsetroot.png"
 rm -f "$PPM_PRE" "$PPM_APP" "$PNG_APP"
 mon "screendump $PPM_PRE" >/dev/null; sleep 1
 
-APP_CMD="export DISPLAY=':0' ; spawn linux { /usr/bin/xeyes -geometry '300x200+20+20' }"
+# The DETERMINISTIC render rung: `xsetroot -solid red` fills the whole rootful
+# X screen with one colour via a single XSetWindowBackground+XClearWindow — no
+# timers, no SIGALRM, no client-side surface. It is the cleanest proof that the
+# GL-free software `-shm` present path re-presents X client damage: the entire
+# 800x600 root re-commits and the compositor logs nonzero_px=480000 (full red).
+# (Earlier this rung used `xeyes`, but xeyes is transparent/ParentRelative over
+# the DEFAULT BLACK X root, so its buffer reads black-on-black — a test-fixture
+# artefact, not a pipeline gap. xeyes is still exercised as a supplementary
+# SIGALRM/storm probe below.) rootful mode == one DE window shows the X screen.
+APP_CMD="export DISPLAY=':0' ; spawn linux { /usr/bin/xsetroot -solid red }"
 rung_c=0
-# Count commits BEFORE launching xeyes. Xwayland already committed its root
-# surface at rung (a), so the "shm buffer committed" marker is ALREADY in the
-# log — we must detect a NEW commit (count INCREASE), not the marker's mere
-# presence (the old send_until matched the pre-existing commit and returned
-# instantly, screendumping before xeyes had even finished its dynamic-load
-# startup). In rootful mode xeyes' redraw re-commits the SAME root wid, so a
-# fresh commit == xeyes drew. xeyes drives that redraw off setitimer(ITIMER_-
-# REAL) -> SIGALRM (now implemented), so a commit increase here is the payoff.
+# Xwayland already committed its root surface at rung (a), so the "shm buffer
+# committed" marker is ALREADY in the log — detect a NEW commit (count INCREASE),
+# not the marker's mere presence. In rootful mode the root re-commits the SAME
+# wid, so a fresh commit == the X app drew into the screen.
 pre_commits=$(grep -acF "$COMMIT_MARKER" "$LOG" 2>/dev/null || echo 0)
-# Launch xeyes once (a settle newline first so hamsh has a clean prompt).
+# Fill the root red (a settle newline first so hamsh has a clean prompt).
 printf '\n' >&3; sleep 1; send "$APP_CMD"
-echo "$TAG (c) xeyes launched; waiting up to ${CMD_WAIT}s for a NEW root-surface commit (xeyes redraw)..."
+echo "$TAG (c) xsetroot launched; waiting up to ${RENDER_WAIT}s for a NEW root-surface commit (red fill)..."
 post_commits="$pre_commits"
-for _i in $(seq 1 "$CMD_WAIT"); do
+for _i in $(seq 1 "$RENDER_WAIT"); do
     kill -0 "$QEMU_PID" 2>/dev/null || break
     post_commits=$(grep -acF "$COMMIT_MARKER" "$LOG" 2>/dev/null || echo 0)
     [ "$post_commits" -gt "$pre_commits" ] && break
     sleep 1
 done
 echo "$TAG NOTE (c): commits before=$pre_commits after=$post_commits"
+# Supplementary probe: xeyes exercises the setitimer(ITIMER_REAL)->SIGALRM
+# redraw path + the fatal-fault STORM GUARD below (non-gating; it draws over
+# the now-red root so its window is visible too).
+send "export DISPLAY=':0' ; spawn linux { /usr/bin/xeyes -geometry '300x200+40+40' }"
+sleep 4
 # Let a couple more redraw ticks land so the screendump captures a full frame.
 sleep 6
 WID="$(grep -aF "$COMMIT_MARKER" "$LOG" | tail -1 | grep -aoE 'wid [0-9]+' | awk '{print $2}')"

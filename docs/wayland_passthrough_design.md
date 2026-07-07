@@ -476,11 +476,40 @@ experiment that most cheaply converts the "feasible-but-blocked" verdict into
 
 ## 9. Native-Wayland Firefox bring-up (2026-07-04)
 
-The XWayland X11 path is render-blocked in this GL-free environment
-(rootful X → glamor needs GL/Mesa we do not ship; the shm-pixman fallback
-paints black). Per the pivot, the real modern-browser path is **Firefox as
+**UPDATE 2026-07-07 — XWayland X11 apps now RENDER (Phase 4 done).** The
+earlier "render-blocked / shm-pixman paints black" verdict was wrong for the
+*software* path: modern Xwayland only drives *glamor* through GL/EGL (hence
+"GLX: no usable GL providers"), but the `Xwayland -shm` flag (mutually
+exclusive with `-glamor`) selects a pure-pixman software screen that copies
+into `wl_shm` buffers with **no GL at all** — no llvmpipe/Mesa needed. On the
+native compositor `DISPLAY=:0 xsetroot -solid red` re-presents the full X
+root: the compositor logs `shm buffer committed 800x600 … nonzero_px=480000`
+and the screendump shows a solid-red "Xwayland on :0" window composited into a
+Hamnix DE window. `xdpyinfo` reports display `:0` (11.0, 800x600, 1 screen).
+The full ladder passes: (a) Xwayland↔compositor, (b) X display up, (c) X11 app
+renders. Frame callbacks (`linux_abi/wayland.ad:1317`) drive the re-present, so
+the "one commit then black" theory is retired. `xeyes` looks black only because
+it is transparent/`ParentRelative` over the DEFAULT black X root (black-on-
+black `nonzero_px=45`), not a pipeline gap — run `xsetroot` first and its
+window shows on the red root. Test: `scripts/test_wayland_phase5_xwayland.sh`
+(rung (c) = `xsetroot -solid red`; xeyes kept as a SIGALRM/storm probe).
+
+**Known blocker at `-m 6G` (NOT XWayland/ABI):** verify XWayland at **`-m 3G`**.
+At 6G the 2nd X-client exec dies with a kernel #PF that *halts* the box: the
+faulting `memset` is in `mm/vma.ad::_vma_alloc_large` (`:3537`), zeroing a
+freshly `alloc_pages`'d chunk **via its physical/identity VA**. When RAM > 4 GiB
+that chunk sits above 4 GiB (e.g. cphys≈4.9 GiB); the running Linux-ABI *task's*
+cr3 (whose low half is the user address space) does not identity-map that high
+physical page, so the kernel-mode write faults (present under boot cr3 via a
+1 GiB huge page, absent under the task cr3). This is a high-memory
+identity-map gap (agent #69 page-allocator territory), independent of Wayland/
+X — it will bite any large-RAM Hamnix workload. At ≤ 4 GiB no page exists above
+4 GiB, so the path is safe and XWayland works end-to-end.
+
+Per the earlier pivot, the real modern-browser path remains **Firefox as
 a native Wayland client** via `MOZ_ENABLE_WAYLAND=1`, bypassing X entirely —
-the same transport `weston-terminal` already renders over.
+the same transport `weston-terminal` already renders over; XWayland now gives
+the *legacy X11 app* path for free alongside it.
 
 ### 9.1 Fixture + image (DONE, verified)
 
