@@ -680,15 +680,42 @@ echo "[FF] launching firefox-esr (native wayland)"
 } | while IFS= read -r line; do echo "[FF] $line"; done
 echo "[FF] firefox pipeline ended"
 # The REAL forked firefox keeps running (deadlocked). Let it settle, then dump
-# EVERY moz.log* (parent + per-child) so the IPC-handshake stall is captured.
-echo "[FF-POST] settling 45s to let the forked firefox write its MOZ_LOG ..."
-i=0; while [ "$i" -lt 45 ]; do sleep 1; i=$((i+1)); done
-echo "[FF-POST] === /tmp/ffhome listing ==="
+# EVERY moz*.log* (parent + per-child) so the IPC-handshake stall is captured.
+echo "[FF-POST] settling 40s to let the forked firefox write its MOZ_LOG ..."
+i=0; while [ "$i" -lt 40 ]; do sleep 1; i=$((i+1)); done
+# FLUSH THE MOZ_LOG (the 0-byte-parent-log fix). Firefox's NSPR log buffers its
+# MOZ_LOG output and, even with `sync`, the buffered tail is only guaranteed to
+# hit the file on PR_Close at shutdown. A DEADLOCKED parent never exits, so its
+# moz.<pid>.log stays 0 bytes and the IPC-handshake trace we need is invisible
+# (validated on the host: a freely-running firefox writes MBs; the Hamnix
+# deadlocked parent wrote 0). Send SIGTERM to every firefox-esr process to drive
+# its shutdown path (PR_Close -> flush) BEFORE dumping. Best-effort: use whatever
+# the busybox rootfs provides (pkill or a /proc scan); a still-parked handler
+# just means we fall back to whatever `sync` already flushed.
+echo "[FF-POST] SIGTERM firefox-esr to flush buffered MOZ_LOG ..."
+if command -v pkill >/dev/null 2>&1; then
+    pkill -TERM -f firefox-esr 2>/dev/null || true
+else
+    for pd in /proc/[0-9]*; do
+        c=$(tr '\0' ' ' < "$pd/cmdline" 2>/dev/null)
+        case "$c" in *firefox-esr*) kill -TERM "${pd#/proc/}" 2>/dev/null || true;; esac
+    done
+fi
+i=0; while [ "$i" -lt 5 ]; do sleep 1; i=$((i+1)); done
+echo "[FF-POST] === $FFHOME listing ==="
 ls -la "$FFHOME" 2>&1 | while IFS= read -r l; do echo "[FF-POST] $l"; done
-for f in "$FFHOME"/moz.*.log "$FFHOME"/moz.log*; do
+# Firefox names its logs moz.-main.<pid>.log.moz_log (parent) and
+# moz.-child.<pid>.log.child-N.moz_log (children) — the `.moz_log` suffix means
+# the previous `moz.*.log` / `moz.log*` globs matched NEITHER, so the dump was
+# always empty even when content existed. Enumerate every log file by content
+# suffix instead, and dump the IPC-relevant tail of each.
+for f in "$FFHOME"/*moz_log "$FFHOME"/moz.*.log "$FFHOME"/moz.log*; do
     [ -e "$f" ] || continue
     echo "[FF-POST] === $f ($(wc -l < "$f" 2>/dev/null) lines) ==="
-    tail -n 120 "$f" 2>/dev/null | while IFS= read -r l; do echo "[FF-LOG] $l"; done
+    # Surface the IPC/handshake-relevant lines first (bounded), then the tail.
+    grep -aE "ipc|IPDL|MessageChannel|Bridge|Endpoint|Open|Connect|handshake|error|fail|abort|ABORT" "$f" 2>/dev/null \
+        | tail -n 80 | while IFS= read -r l; do echo "[FF-LOG] $l"; done
+    tail -n 60 "$f" 2>/dev/null | while IFS= read -r l; do echo "[FF-TAIL] $l"; done
 done
 FFLAUNCH
 chmod +x "$ROOTFS/ff-launch.sh"
