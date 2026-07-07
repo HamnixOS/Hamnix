@@ -108,11 +108,26 @@ echo "[stage-ff] downloading ${#PKGS[@]} closure packages into $DEBS ..."
     for p in "${PKGS[@]}"; do ( cd "$DEBS" && apt-get download "$p" >/dev/null 2>&1 ) || echo "[stage-ff]   - skip $p"; done
 }
 
-# --- 1b. firefox-esr itself: mirror download, else host-install copy ----
+# --- 1b. firefox-esr itself: explicit .deb, else mirror download, else host --
+# FF_DEB=<path>   stage THIS exact firefox-esr .deb (version-alignment /
+#                 debug-symbol control). Preferred over the host copy so the
+#                 staged libxul's build-id matches a downloaded firefox-esr-
+#                 dbgsym (offline addr2line symbolication of parked-wd RIPs).
+#                 The rootfs is BOOKWORM-based (deb12 GTK stack), so a
+#                 firefox-esr_*~deb12u1_amd64.deb build is the version-aligned
+#                 choice — the host's installed firefox-esr is a deb13/trixie
+#                 build against newer glibc/GTK than the rootfs carries.
 FF_SRC=""
+FF_DEB_FILE=""
 echo "[stage-ff] fetching firefox-esr ..."
-if ( cd "$DEBS" && apt-get download firefox-esr >/dev/null 2>&1 ) && ls "$DEBS"/firefox-esr_*.deb >/dev/null 2>&1; then
+if [ -n "${FF_DEB:-}" ] && [ -f "${FF_DEB}" ]; then
+    echo "[stage-ff]   using explicit FF_DEB=${FF_DEB}"
+    cp -f "${FF_DEB}" "$DEBS/"
+    FF_DEB_FILE="$DEBS/$(basename "${FF_DEB}")"
+    FF_SRC="deb"
+elif ( cd "$DEBS" && apt-get download firefox-esr >/dev/null 2>&1 ) && ls "$DEBS"/firefox-esr_*.deb >/dev/null 2>&1; then
     echo "[stage-ff]   got firefox-esr .deb from mirror."
+    FF_DEB_FILE="$(ls "$DEBS"/firefox-esr_*.deb | head -1)"
     FF_SRC="deb"
 elif [ -d /usr/lib/firefox-esr ] && [ -e /usr/lib/firefox-esr/libxul.so ]; then
     echo "[stage-ff]   mirror firefox-esr unavailable; copying HOST /usr/lib/firefox-esr."
@@ -144,6 +159,17 @@ mkdir -p "$ROOTFS/usr/bin"
 ln -sf ../lib/firefox-esr/firefox-esr "$ROOTFS/usr/bin/firefox-esr"
 FF_DU="$(du -sh "$ROOTFS/usr/lib/firefox-esr" | awk '{print $1}')"
 echo "[stage-ff]   firefox-esr payload staged ($FF_DU)."
+# Record the staged libxul build-id so an offline addr2line can pick the
+# matching firefox-esr-dbgsym .debug for parked-wd RIP symbolication.
+if command -v readelf >/dev/null 2>&1 && [ -e "$ROOTFS/usr/lib/firefox-esr/libxul.so" ]; then
+    LIBXUL_BID="$(readelf -n "$ROOTFS/usr/lib/firefox-esr/libxul.so" 2>/dev/null \
+        | grep -oiE 'Build ID: [0-9a-f]+' | awk '{print $3}')"
+    echo "[stage-ff]   staged libxul build-id: ${LIBXUL_BID:-<unknown>}"
+    echo "${LIBXUL_BID:-unknown}" > "$ROOTFS/usr/lib/firefox-esr/.libxul-build-id" 2>/dev/null || true
+    if [ -n "${FF_DEB_FILE}" ]; then
+        echo "[stage-ff]   staged from: $(basename "${FF_DEB_FILE}")"
+    fi
+fi
 
 # --- 3. walk the transitive DT_NEEDED closure --------------------------
 # Seed from the firefox launcher + every bundled .so; resolve each soname
