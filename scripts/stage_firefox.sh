@@ -581,6 +581,14 @@ export WAYLAND_DISPLAY=wayland-0
 export MOZ_ENABLE_WAYLAND=1
 export MOZ_DISABLE_WAYLAND_PROXY=1
 export GDK_BACKEND=wayland
+# WIRE-LEVEL WAYLAND TRACE. libwayland-client prints every request it sends and
+# every event it receives (with interface.method names) to STDERR when
+# WAYLAND_DEBUG=1. Firefox's main process here does NOT detach its stdio (the
+# [FF] serial stream carries its Gtk-DEBUG output live to the timeout kill), so
+# this trace rides the [FF] stream and is captured WITHOUT the settle/dump
+# dance. It is the ground truth for "which request is Firefox's last, and which
+# event is it waiting on" at the realize->map gap.
+export WAYLAND_DEBUG=1
 export MOZ_DISABLE_CONTENT_SANDBOX=1
 export MOZ_DISABLE_GMP_SANDBOX=1
 export MOZ_DISABLE_RDD_SANDBOX=1
@@ -675,8 +683,17 @@ if [ -s "$FFHOME/.ff-profile/prefs.js" ]; then echo "[FF-DIAG] prefs.js delivere
 # their OWN moz.<pid>.log — the cross-process IPC handshake stall needs the
 # CHILD's IPDL/MessageChannel trace, not just the parent's. ipc/IPDL first so
 # the earliest channel-open + Bridge/Endpoint messages land before any hang.
-export MOZ_LOG='ipc:5,IPDL:5,MessageChannel:5,Widget:5,WidgetWayland:5,nsWindow:5,Compositor:5,WebRender:5,ProcessHangMon:5,sync,timestamp'
-export MOZ_LOG_FILE="$FFHOME/moz.%PID.log"
+# STREAM MOZ_LOG LIVE ON STDERR (the [FF] serial stream), NOT to a file. Prior
+# forms pointed MOZ_LOG_FILE at $FFHOME/moz.%PID.log and dumped it AFTER a 40s
+# settle + SIGTERM — but the test's `timeout` kills QEMU before that dump runs,
+# so the file was NEVER surfaced (the "empty [FF-LOG]" prior agents hit). The
+# main firefox process keeps its stdio on our pipe (proven: Gtk-DEBUG streams
+# live), so with MOZ_LOG_FILE UNSET, MOZ_LOG goes to stderr and rides [FF] in
+# real time. `sync` flushes each line so nothing is lost on the timeout kill.
+# Modules focus on the Wayland widget/map path (nsWindow/ipc are NOT Firefox log
+# module names). Widget+WidgetWayland name why realize does/doesn't reach map.
+export MOZ_LOG='Widget:5,WidgetWayland:5,WaylandVsync:5,WaylandBuffer:5,Compositor:4,sync,timestamp'
+unset MOZ_LOG_FILE
 export HOME="$FFHOME"
 export XDG_CONFIG_HOME="$FFHOME/.config"
 export XDG_CACHE_HOME="$FFHOME/.cache"
@@ -696,7 +713,10 @@ export FONTCONFIG_FILE=fonts.conf
 export FONTCONFIG_PATH=/etc/fonts
 export FONTCONFIG_SYSROOT=/
 export G_SLICE=always-malloc
-export G_MESSAGES_DEBUG=all
+# Quiet GTK's per-widget theme-state debug spam (thousands of "State X doesn't
+# match" lines) so the WAYLAND_DEBUG wire trace + MOZ_LOG dominate the [FF]
+# stream and stay readable. GLib warnings/criticals still print regardless.
+export G_MESSAGES_DEBUG=
 mkdir -p "$FFHOME/.cache" "$FFHOME/.mozilla" /run
 # drop any stale profile lock from a prior crashed run
 rm -f "$FFHOME/.ff-profile/lock" "$FFHOME/.ff-profile/.parentlock" 2>/dev/null
