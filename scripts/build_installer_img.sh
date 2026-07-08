@@ -40,7 +40,8 @@
 #
 # Env overrides:
 #   HAMNIX_INSTALLER_IMG_OUT   output image      (default: build/hamnix-installer.img)
-#   HAMNIX_ROOTFS_SIZE_MB      shipped ext4 MiB  (default: 512)
+#   HAMNIX_ROOTFS_SIZE_MB      shipped ext4 MiB  (default: auto-size)
+#   HAMNIX_ROOTFS_MIN_MB       shipped ext4 floor MiB (default: 512)
 #   HAMNIX_TARGET_ESP_MB       NVMe ESP FAT MiB  (default: 64; must match
 #                              install_nvme.hamsh's ESP partition size)
 
@@ -75,7 +76,12 @@ INSTALLER_KERNEL="$OUTDIR/hamnix-installer-kernel.elf"
 EFI_STUB="$OUTDIR/hamnix-bootx64.efi"
 ROOTFS_IMG="$OUTDIR/hamnix-rootfs.img"
 SQFS_IMG="$OUTDIR/hamnix-rootfs.sqfs"
-export HAMNIX_ROOTFS_SIZE_MB="${HAMNIX_ROOTFS_SIZE_MB:-512}"
+# Auto-size the shipped ext4 (staged bytes + metadata + apt scratch) with a
+# 512 MiB FLOOR. Do NOT pin a fixed size here: the Debian fixture grows (real
+# debootstrap closure + staged GUI clients), and a pinned 512 MiB made
+# mkfs.ext4 fail with "Could not allocate block" once the closure passed it.
+# An explicit HAMNIX_ROOTFS_SIZE_MB still overrides both.
+export HAMNIX_ROOTFS_MIN_MB="${HAMNIX_ROOTFS_MIN_MB:-512}"
 TARGET_ESP_MB="${HAMNIX_TARGET_ESP_MB:-64}"
 
 # --- Host-tool sanity -------------------------------------------------

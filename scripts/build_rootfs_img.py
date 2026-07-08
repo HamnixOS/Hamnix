@@ -1106,11 +1106,19 @@ def _pick_size_mb(staging_bytes: int, live: bool = False) -> int:
         size_mib = staged_mib + 16 + scratch
         return max(size_mib, 48)
     # Auto-size: staging bytes + 64 MiB ext4 metadata + 32 MiB future
-    # apt-install scratch headroom. Floor at 96 MiB so an empty image
-    # still has comfortable headroom for an apt cache.
+    # apt-install scratch headroom. Floor at HAMNIX_ROOTFS_MIN_MB (96 MiB
+    # by default) so an empty image still has comfortable headroom for an
+    # apt cache. Callers that want a guaranteed minimum (the installer
+    # image ships 512 MiB of apt scratch) set the FLOOR, never a fixed
+    # size — a fixed size silently stops tracking a growing fixture and
+    # fails the build with mkfs.ext4 "Could not allocate block".
+    try:
+        floor = int(os.environ.get("HAMNIX_ROOTFS_MIN_MB", "96"))
+    except ValueError:
+        floor = 96
     size_mib = staged_mib + 64 + 32
-    if size_mib < 96:
-        size_mib = 96
+    if size_mib < floor:
+        size_mib = floor
     return size_mib
 
 

@@ -3761,24 +3761,74 @@ def _vma_drop_overlapping_aliases(slot: uint64, lo: uint64, hi: uint64,
     # descriptor; the enclosing reservation's pages (and its PTEs, which
     # the new overlay re-stamps) are untouched.
     #
-    # Only drop an alias that lies ENTIRELY within [lo, hi): the new overlay
-    # fully covers it, so it is a genuine REPLACE with no coverage loss. A
-    # pure alias that merely STRADDLES the new range keeps a region the new
-    # overlay does not cover, so it is left in place (the common ld.so case
-    # is a re-overlay of the SAME [lo, hi), i.e. full containment — exactly
-    # the duplicate-stacking we must kill).
+    # INVARIANT enforced here: after the new overlay [lo, hi) is installed,
+    # NO prior pure-alias (other than `keep`) may still cover ANY page in
+    # [lo, hi). MAP_FIXED has REPLACE semantics over exactly [lo, hi), so a
+    # surviving alias that overlaps the new range is a stale duplicate for
+    # that range.
+    #
+    # A fully-contained alias (s>=lo and e<=hi) is dropped whole — the new
+    # overlay fully covers it. But an alias that only PARTIALLY overlaps
+    # ([lo,hi) covers just one end, or sits strictly inside the alias) must
+    # NOT be left intact: doing so leaves TWO pure-alias nodes covering the
+    # overlap region, and the interval-stab point query (_vt_stab_max_start)
+    # returns the GREATEST-START cover. When the stale alias's start falls
+    # INSIDE (lo, hi) — a right-straddle lo<=s0<hi<e0 — the stale node's
+    # start s0 > lo beats the new overlay, so a demand fault on the boundary
+    # page [s0, hi) resolves to the STALE alias and stamps the leaf PTE with
+    # its prot/backing/file_offset (NX-onto-exec, or wrong file bytes) — the
+    # ASLR-layout-dependent apt "Reading package lists" crash. (Whether an
+    # alias straddles vs. is enclosed depends on the random mmap slide, which
+    # is why the fault is ASLR-flaky.)
+    #
+    # FIX: trim any overlapping alias to its NON-overlapping remainder(s) —
+    # the parts outside [lo, hi) — and drop the middle. Coverage outside the
+    # new overlay is preserved (a fresh alias node per surviving remainder,
+    # carrying the original prot/flags/fd and the correctly-advanced
+    # file_offset); coverage inside [lo, hi) belongs solely to the new
+    # overlay. Pure aliases own no frames, so trimming frees only descriptors
+    # and never touches the enclosing reservation's pages.
     cur: uint64 = task_vma_list_head(slot)
     while cur != 0:
         nxt: uint64 = _vma_node_get_next(cur)
         if cur != keep:
             s: uint64 = _vma_node_start(cur)
             e: uint64 = _vma_node_end(cur)
-            if s >= lo and e <= hi and s < hi and lo < e \
-                    and _vma_node_is_pure_alias(cur) != 0:
+            if s < hi and lo < e and _vma_node_is_pure_alias(cur) != 0:
+                # Snapshot metadata before the node is freed so surviving
+                # remainders inherit the alias's prot/backing identity.
+                a_prot:  int32  = cast[Ptr[VmaNode]](cur)[0].prot
+                a_flags: int32  = cast[Ptr[VmaNode]](cur)[0].flags
+                a_fd:    int32  = cast[Ptr[VmaNode]](cur)[0].file_fd
+                a_off:   uint64 = cast[Ptr[VmaNode]](cur)[0].file_offset
+                a_isf:   int32  = cast[Ptr[VmaNode]](cur)[0].is_file
+                a_fmk:   uint64 = cast[Ptr[VmaNode]](cur)[0].file_marker
+                a_fsz:   uint64 = cast[Ptr[VmaNode]](cur)[0].file_size
                 _vma_unlink(slot, cur)
                 if nr_vma_nodes_live > 0:
                     nr_vma_nodes_live = nr_vma_nodes_live - 1
                 kfree(cur)
+                # Left remainder [s, lo): keeps the original file_offset.
+                if s < lo:
+                    lrem: uint64 = _vma_node_new()
+                    if lrem != 0:
+                        _vma_node_set(lrem, s, lo, a_prot, a_flags, a_fd,
+                                      a_off, 0, 0)
+                        cast[Ptr[VmaNode]](lrem)[0].is_file     = a_isf
+                        cast[Ptr[VmaNode]](lrem)[0].file_marker = a_fmk
+                        cast[Ptr[VmaNode]](lrem)[0].file_size   = a_fsz
+                        _vma_insert_sorted(slot, lrem)
+                # Right remainder [hi, e): file_offset advances by the bytes
+                # the dropped [s, hi) prefix consumed.
+                if e > hi:
+                    rrem: uint64 = _vma_node_new()
+                    if rrem != 0:
+                        _vma_node_set(rrem, hi, e, a_prot, a_flags, a_fd,
+                                      a_off + (hi - s), 0, 0)
+                        cast[Ptr[VmaNode]](rrem)[0].is_file     = a_isf
+                        cast[Ptr[VmaNode]](rrem)[0].file_marker = a_fmk
+                        cast[Ptr[VmaNode]](rrem)[0].file_size   = a_fsz
+                        _vma_insert_sorted(slot, rrem)
         cur = nxt
 
 
@@ -6544,9 +6594,42 @@ def vma_tree_selftest(scratch_slot: uint64) -> int32:
     ok: int32 = 1
     N: uint64 = 256
     # Build N disjoint metadata-only VMAs at well-separated, page-aligned
-    # bases far above any real mapping (8 GiB + i*64 KiB), each one page.
-    BASE: uint64 = 0x200000000              # 8 GiB
+    # bases ABOVE THE WINDOWED-MMAP REGION (16 GiB + i*64 KiB), each one page.
+    #
+    # BASE USED TO BE 0x200000000 == VMA_LARGE_BASE, i.e. the FIRST address
+    # `_vma_win_alloc` hands out for a windowed (large / demand / file-shared)
+    # mmap. The scratch slot passed here is the BOOT task's own slot, and the
+    # mm self-test (mm/reclaim.ad) allocates its PART A (64-page) and PART C
+    # (32-page) demand VMAs from exactly that window BEFORE calling us. So the
+    # "clear region far above any real mapping" comment was false: real VMAs
+    # already covered the first few strides. Consequences, both observed:
+    #   * E1's gap probes (b + 4 KiB) resolved to those real demand VMAs ->
+    #     gapmiss=6 (part A spans 4 strides, part C spans 2);
+    #   * E5's teardown filter (`start >= BASE`) then DELETED the self-test's
+    #     own part-A/part-C VMAs, and a real VMA whose start sits BELOW BASE
+    #     while its end reaches into it survived and still covered 4 probes ->
+    #     leftover=4.
+    # Neither was an interval-tree defect. The whole test range now lives
+    # above VMA_LARGE_LIMIT (0x3FFC00000), which no windowed mmap can reach,
+    # so the range is clear by construction — and the pre-flight check below
+    # FAILS LOUDLY instead of silently mis-asserting if that ever stops being
+    # true.
+    BASE: uint64 = 0x400000000              # 16 GiB, above VMA_LARGE_LIMIT
     STRIDE: uint64 = 0x10000                # 64 KiB apart -> a gap between
+
+    # Pre-flight: the test range must be virgin. A pre-existing cover here
+    # would make every E1/E5 assertion below meaningless.
+    pf: uint64 = 0
+    dirty_probe: uint64 = 0
+    while pf < N:
+        if vma_find(scratch_slot, BASE + pf * STRIDE) != 0:
+            dirty_probe = dirty_probe + 1
+        pf = pf + 1
+    if dirty_probe != 0:
+        printk1("[mm] FAIL: vma tree self-test range not clear (%d probes covered)\n",
+                dirty_probe)
+        return 0
+
     i: uint64 = 0
     built: uint64 = 0
     while i < N:
@@ -6607,7 +6690,7 @@ def vma_tree_selftest(scratch_slot: uint64) -> int32:
     # split it. (vma_register_anon made it one page; widen by re-registering
     # over a fresh 3-page base in a clear region to avoid carve complexity.)
     cnt_before: uint64 = vma_count(scratch_slot)
-    SPLBASE: uint64 = 0x300000000           # 12 GiB, clear region
+    SPLBASE: uint64 = 0x410000000           # 16.25 GiB, clear region (>= BASE)
     vma_register_anon(scratch_slot, SPLBASE, 3 * VMA_PAGE_SIZE,
                       VMA_PROT_READ | VMA_PROT_WRITE)
     spl: uint64 = vma_find(scratch_slot, SPLBASE)
@@ -6722,6 +6805,73 @@ def vma_tree_selftest(scratch_slot: uint64) -> int32:
     else:
         printk2("[mm] FAIL: vma overlap point query gap=%p exec=%p\n",
                 f_gap, f_x)
+        ok = 0
+
+    # E7b — STRADDLING-alias REPLACE (#471 residual). The ASLR-dependent apt
+    # crash: a MAP_FIXED re-overlay only PARTIALLY covers a PRIOR pure-alias,
+    # so _vma_drop_overlapping_aliases (old code) — which dropped ONLY
+    # fully-contained aliases — left the straddling stale alias in place. Its
+    # start falls inside the new overlay's range, so the interval stab
+    # returns the STALE node (greatest start) for the boundary page and a
+    # demand fault stamps the wrong prot/backing -> NX-onto-exec / wrong
+    # bytes. Reproduce DETERMINISTICALLY (no ASLR): reservation R2, a stale
+    # prior alias A straddling the right edge of a new overlay V, then the
+    # exact install sequence (drop overlapping aliases -> insert V), and
+    # assert the stab resolves the overlap to V (not A) and preserves A's
+    # non-overlapping remainder.
+    OVB2:  uint64 = 0x600000000              # 24 GiB, clear region (>= BASE)
+    # Reservation R2 = [OVB2, OVB2+64KiB) — the enclosing DSO span (`keep`).
+    vma_register_anon(scratch_slot, OVB2, 0x10000, VMA_PROT_READ)
+    r2: uint64 = _vma_tree_find(scratch_slot, OVB2)
+    # Prior stale alias A = [OVB2+0x4000, OVB2+0x8000), read-only.
+    vma_register_anon(scratch_slot, OVB2 + 0x4000, 0x4000, VMA_PROT_READ)
+    # New overlay V = [OVB2+0x2000, OVB2+0x6000), read+write. It right-
+    # straddles A (A.start 0x4000 is INSIDE V; A.end 0x8000 is past V).
+    v_lo: uint64 = OVB2 + 0x2000
+    v_hi: uint64 = OVB2 + 0x6000
+    _vma_drop_overlapping_aliases(scratch_slot, v_lo, v_hi, r2)
+    vov: uint64 = _vma_node_new()
+    if vov != 0:
+        _vma_node_set(vov, v_lo, v_hi, VMA_PROT_READ | VMA_PROT_WRITE,
+                      0, -1, 0, 0, 0)
+        _vma_insert_sorted(scratch_slot, vov)
+    st_ok: int32 = 1
+    # (1) Boundary page [0x4000,0x6000): must resolve to V (writable), NOT
+    # the stale alias A. Pre-fix this returned A (start 0x4000) with NO
+    # write -> the wrong-prot stamp.
+    f_bnd: uint64 = _vma_tree_find(scratch_slot, OVB2 + 0x5000)
+    if f_bnd == 0 or _vma_node_start(f_bnd) != v_lo:
+        st_ok = 0
+    elif (cast[Ptr[VmaNode]](f_bnd)[0].prot & VMA_PROT_WRITE) == 0:
+        st_ok = 0
+    # (2) A's non-overlapping remainder [0x6000,0x8000) survives, read-only,
+    # as a fresh trimmed alias starting at v_hi.
+    f_rem: uint64 = _vma_tree_find(scratch_slot, OVB2 + 0x7000)
+    if f_rem == 0 or _vma_node_start(f_rem) != v_hi:
+        st_ok = 0
+    elif (cast[Ptr[VmaNode]](f_rem)[0].prot & VMA_PROT_WRITE) != 0:
+        st_ok = 0
+    # (3) Head of V not covered by A [0x2000,0x4000): resolves to V.
+    f_vh: uint64 = _vma_tree_find(scratch_slot, OVB2 + 0x3000)
+    if f_vh == 0 or _vma_node_start(f_vh) != v_lo:
+        st_ok = 0
+    # (4) Region only R2 covers (before V) -> R2, no stale overlap.
+    f_r2: uint64 = _vma_tree_find(scratch_slot, OVB2 + 0x1000)
+    if f_r2 == 0 or _vma_node_start(f_r2) != OVB2:
+        st_ok = 0
+    # (5) No two aliases overlap any page of V now: every page in [v_lo,v_hi)
+    # must resolve to V exactly (greatest start == v_lo).
+    sp: uint64 = v_lo
+    while sp < v_hi:
+        q: uint64 = _vma_tree_find(scratch_slot, sp)
+        if q == 0 or _vma_node_start(q) != v_lo:
+            st_ok = 0
+        sp = sp + VMA_PAGE_SIZE
+    if st_ok != 0:
+        printk0("[mm] PASS: vma straddling-alias MAP_FIXED replace (#471 residual)\n")
+    else:
+        printk2("[mm] FAIL: vma straddle replace bnd=%p rem=%p\n",
+                f_bnd, f_rem)
         ok = 0
 
     # E5 — remove consistency: tear down ONLY the VMAs THIS test built

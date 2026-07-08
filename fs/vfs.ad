@@ -1300,19 +1300,41 @@ def _is_initramfs_dir(name: Ptr[char]) -> int32:
 def _cpio_listdir(name: Ptr[char], buf: Ptr[uint8],
                   count: uint64) -> int64:
     # Pack immediate children of `name` into buf as "BASENAME\n"
-    # lines. `name` is the directory path WITHOUT a trailing slash
+    # lines, starting at offset 0. Thin wrapper over _cpio_listdir_at.
+    return _cpio_listdir_at(name, buf, count, 0)
+
+
+def _cpio_listdir_at(name: Ptr[char], buf: Ptr[uint8],
+                     count: uint64, base: uint64) -> int64:
+    # Pack immediate children of `name` into buf as "BASENAME\n"
+    # lines, APPENDING after `base` bytes of already-rendered listing.
+    # `name` is the directory path WITHOUT a trailing slash
     # (e.g. "/etc"), or "/" for the archive root. Recursive
     # grandchildren collapse to their first path component so we
     # don't list "/etc/profile" twice for "/etc". A "NAME" only
     # appears once even if multiple files live below it.
+    #
+    # The dedup scan covers [0, out), so it also sees whatever the
+    # caller already rendered into [0, base). That is what makes the
+    # tmpfs-over-cpio union (see _open_dir_with backend 3) collapse a
+    # name present in BOTH backings to a single entry, with the tmpfs
+    # (writable, shadowing) copy winning — it was emitted first.
+    #
+    # Cost: one O(nr_files) prefix scan per listdir (1297 entries on a
+    # stock image) plus an O(bytes-emitted) dedup probe per surviving
+    # child. A directory index built at cpio_init() would trade extra
+    # BSS and a second parse pass for a constant-factor win on an
+    # operation that only ever runs behind an interactive `ls`. The scan
+    # is the cheaper engineering choice, and it keeps fs/cpio.ad a pure
+    # flat archive reader with no directory model of its own.
     if count == 0:
-        return 0
+        return cast[int64](base)
     nlen: uint64 = _cstr_len(name)
     is_root: int32 = 0
     if nlen == 1 and name[0] == 47:
         is_root = 1
     cnt: uint64 = initramfs_entry_count()
-    out: uint64 = 0
+    out: uint64 = base
     i: uint64 = 0
     while i < cnt:
         candidate: Ptr[char] = initramfs_entry_name(i)
@@ -2181,11 +2203,31 @@ def _vfs_open_post_perm(name: Ptr[char]) -> int32:
     fk: uint32 = vfs_fs_kind(rname)
     if fk == FS_KIND_TMPFS:
         if vfs_fs_shadow(rname) != 0:
-            # /var subtree: tmpfs-first, cpio-baked fallthrough on a miss.
+            # Shadow overlay root (/usr /etc /bin /sbin /lib /lib64 /opt
+            # /run /srv /var): tmpfs-first per ENTRY, cpio-baked
+            # fall-through on a miss.
+            #
+            # DIRECTORIES must not take the file arm. tmpfs materialises
+            # each overlay root as a synthetic DIRECTORY on first touch
+            # (fs/tmpfs.ad::_tmpfs_init_root_registry), so before this
+            # guard `open("/bin")` handed back a readable 0-byte tmpfs
+            # FILE fd — `ls /bin` printed nothing and exited 0, i.e. it
+            # looked like an empty directory rather than a broken one.
+            # A directory in EITHER backing gets the union listing.
+            if tmpfs_path_is_dir(rname) != 0:
+                return _open_dir_tmpfs_union(rname)
             if tmpfs_path_exists(rname) != 0:
                 return _open_tmpfs_read(rname)
+            # tmpfs miss. A cpio-baked directory nested under the overlay
+            # (/lib/modules, /usr/share, /etc/rc.d, ...) still has to
+            # enumerate; anything else falls through to the cpio FILE
+            # lookup below.
+            if _is_initramfs_dir(rname) != 0:
+                return _open_dir_tmpfs_union(rname)
         else:
             # /tmp subtree (+ bare mountpoints): tmpfs-authoritative.
+            if tmpfs_path_is_dir(rname) != 0:
+                return _open_dir_tmpfs(rname)
             return _open_tmpfs_read(rname)
     elif fk == FS_KIND_FAT:
         # Try a FAT FILE open first; if the name isn't a file (ENOENT)
@@ -2347,10 +2389,25 @@ def _open_dir_ext(name: Ptr[char]) -> int32:
     return _open_dir_with(name, 2)
 
 
+def _open_dir_tmpfs_union(name: Ptr[char]) -> int32:
+    # A directory under a SHADOW tmpfs overlay mount (/usr /etc /bin
+    # /sbin /lib /lib64 /opt /run /srv /var). Its true contents are the
+    # union of the writable tmpfs layer and the read-only cpio-baked
+    # layer, tmpfs winning on a name collision.
+    return _open_dir_with(name, 3)
+
+
+def _open_dir_tmpfs(name: Ptr[char]) -> int32:
+    # A directory under an AUTHORITATIVE tmpfs mount (/tmp). No cpio
+    # fall-through: /tmp is tmpfs and nothing else.
+    return _open_dir_with(name, 4)
+
+
 def _open_dir_with(name: Ptr[char], backend: int32) -> int32:
     # Common allocate-fd / kmalloc / fill / install pattern for the
-    # three readdir backends. `backend` selects which listdir fills
-    # the buffer (0 = cpio initramfs, 1 = FAT, 2 = ext4).
+    # readdir backends. `backend` selects which listdir fills the
+    # buffer (0 = cpio initramfs, 1 = FAT, 2 = ext4,
+    # 3 = tmpfs UNION cpio (shadow overlay roots), 4 = tmpfs only).
     #
     # #450 F6 (Phase G, SYS_LISTDIR retirement): the retired
     # vfs_listdir_ns syscall arm used to append namespace mount-table
@@ -2378,8 +2435,19 @@ def _open_dir_with(name: Ptr[char], backend: int32) -> int32:
         # vfs_fs_rel yields "" for the bare /mnt mountpoint (the FAT
         # volume root), so the old explicit "/mnt" special case folds in.
         n = fat_listdir(vfs_fs_rel(name), bufp, DIR_BUF_SIZE)
-    else:
+    elif backend == 2:
         n = ext4_listdir(vfs_fs_rel(name), bufp, DIR_BUF_SIZE)
+    elif backend == 3:
+        # Shadow overlay root: tmpfs entries FIRST (they shadow), then
+        # the cpio-baked names appended with dedup against them. A dir
+        # that exists in only one backing still lists: a tmpfs miss
+        # yields 0 bytes and the cpio scan supplies everything.
+        tn: int64 = tmpfs_listdir(name, bufp, DIR_BUF_SIZE)
+        if tn < 0:
+            tn = 0
+        n = _cpio_listdir_at(name, bufp, DIR_BUF_SIZE, cast[uint64](tn))
+    else:
+        n = tmpfs_listdir(name, bufp, DIR_BUF_SIZE)
     if n < 0:
         kfree(buf)
         return ENOENT
@@ -2506,10 +2574,27 @@ def _dir_xform_lookup_meta(abs_path: Ptr[uint8],
     srv: int32 = vfs_path_owning_server(cast[Ptr[char]](abs_path))
     # Defaults: regular file, mode 0644, qpath = 0, length = 0.
     out_qtype[0]  = P9_QTFILE
-    out_mode[0]   = cast[uint32](0644)
+    out_mode[0]   = cast[uint32](0o644)
     out_qpath[0]  = 0
     out_length[0] = 0
-    if srv == SERVER_CPIO:
+    if srv == SERVER_TMPFS:
+        slot: int32 = tmpfs_lookup(cast[Ptr[char]](abs_path))
+        if slot >= 0:
+            out_qpath[0] = cast[uint64](cast[uint32](slot))
+            if tmpfs_is_dir(slot) != 0:
+                out_qtype[0] = P9_QTDIR
+                out_mode[0]  = P9_DMDIR | cast[uint32](0o755)
+            else:
+                out_length[0] = tmpfs_size(slot)
+            return 0
+        # tmpfs MISS under a shadow overlay root (/bin/ls, /etc/motd,
+        # /lib/modules, ...). The name the union listing emitted came
+        # from the cpio layer, so its metadata must too — otherwise
+        # every cpio-baked entry under /bin, /etc, /lib, /usr reported
+        # the QTFILE/0644/length-0 defaults and `ls -l /bin` showed
+        # size 0 for all 228 binaries while hamfm drew a file icon on
+        # every cpio-baked subdirectory. Fall through to the cpio arm.
+    if srv == SERVER_CPIO or srv == SERVER_TMPFS:
         # Inline cpio name lookup. Mirrors sysfile.ad::_cpio_lookup; the
         # symbol there is module-private so we re-do the walk here.
         idx: int32 = -1
@@ -2546,17 +2631,16 @@ def _dir_xform_lookup_meta(abs_path: Ptr[uint8],
             else:
                 out_mode[0]  = cast[uint32](m & 0xFFF)
                 if out_mode[0] == 0:
-                    out_mode[0] = cast[uint32](0644)
-        return 0
-    if srv == SERVER_TMPFS:
-        slot: int32 = tmpfs_lookup(cast[Ptr[char]](abs_path))
-        if slot >= 0:
-            out_qpath[0] = cast[uint64](cast[uint32](slot))
-            if tmpfs_is_dir(slot) != 0:
-                out_qtype[0] = P9_QTDIR
-                out_mode[0]  = P9_DMDIR | cast[uint32](0755)
-            else:
-                out_length[0] = tmpfs_size(slot)
+                    out_mode[0] = cast[uint32](0o644)
+            return 0
+        # No exact entry. A cpio archive is FLAT: a directory exists only
+        # implicitly, as the prefix of some file's pathname. `ls -l /lib`
+        # and hamfm's folder-vs-file icon both need `modules` to report
+        # QTDIR, so synthesize the directory record here rather than
+        # letting it fall out as the QTFILE default.
+        if _is_initramfs_dir(cast[Ptr[char]](abs_path)) != 0:
+            out_qtype[0] = P9_QTDIR
+            out_mode[0]  = P9_DMDIR | cast[uint32](0o755)
         return 0
     if srv == SERVER_EXT4:
         leaf: Ptr[char] = vfs_fs_rel(cast[Ptr[char]](abs_path))
@@ -2569,7 +2653,7 @@ def _dir_xform_lookup_meta(abs_path: Ptr[uint8],
         dinum: uint32 = ext4_resolve_dir(leaf)
         if dinum != 0:
             out_qtype[0] = P9_QTDIR
-            out_mode[0]  = P9_DMDIR | cast[uint32](0755)
+            out_mode[0]  = P9_DMDIR | cast[uint32](0o755)
             out_qpath[0] = cast[uint64](dinum)
         return 0
     # Other servers (devs / proc / srv / net / auth / block / root /
@@ -2621,7 +2705,7 @@ def vfs_dir_xform_to_records(parent_path: Ptr[uint8],
             nlen,
             cast[Ptr[uint8]](&join_buf[0]), 512)
         qtype: uint8 = P9_QTFILE
-        mode: uint32 = cast[uint32](0644)
+        mode: uint32 = cast[uint32](0o644)
         qpath: uint64 = 0
         length: uint64 = 0
         if abs_len > 0:
@@ -4972,8 +5056,21 @@ def vfs_listdir(name: Ptr[char], buf: Ptr[uint8],
     # directory still lists.
     if lfk == FS_KIND_TMPFS:
         if vfs_fs_shadow(name) != 0:
+            # Shadow overlay root: the listing is the UNION of the
+            # writable tmpfs layer and the read-only cpio-baked layer,
+            # tmpfs winning a name collision. Returning only the tmpfs
+            # half here is what made a getdents64 `ls /bin` (busybox in
+            # the Linux ns) report an empty directory. Mirrors the
+            # _open_dir_with backend-3 union exactly, so getdents and
+            # the NAME\n dir-fd stream agree.
+            tn: int64 = 0
             if tmpfs_path_is_dir(name) != 0:
-                return tmpfs_listdir(name, buf, count)
+                tn = tmpfs_listdir(name, buf, count)
+                if tn < 0:
+                    tn = 0
+            elif _is_initramfs_dir(name) == 0:
+                return cast[int64](EINVAL)
+            return _cpio_listdir_at(name, buf, count, cast[uint64](tn))
         else:
             if tmpfs_path_is_dir(name) != 0:
                 return tmpfs_listdir(name, buf, count)
