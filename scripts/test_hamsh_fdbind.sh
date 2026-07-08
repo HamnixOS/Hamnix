@@ -42,8 +42,15 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 # fixed-sleep flake this harness exists to kill). Command list, in
 # order:
 #   * §6 tripwire: sample /dev/mountrpc BEFORE a local pipe.
-#   * pipe: a | b carries data through a pipe Chan.
-#   * a 3-stage pipeline still wires every /fd correctly.
+#   * pipe: a | b carries data through a pipe Chan. The assertion is the
+#     CONSUMER's computed answer (`seq 1000 1041 | wc -l` -> 42), not a
+#     payload string: `echo PIPE_PAYLOAD | cat` used to "prove" the pipe,
+#     but `echo` is a hamsh BUILTIN — when the builtin bypassed the pipe and
+#     wrote to the console, the payload still appeared on serial and this
+#     gate stayed green while pipelines were entirely broken. A count no
+#     stage prints cannot be faked by a leak. See scripts/test_pipe.sh.
+#   * a 3-stage pipeline still wires every /fd correctly (19 matches x 5
+#     bytes = 95).
 #   * §6 tripwire: sample mountrpc AFTER — a local pipe must NOT
 #     marshal 9P, so the counter is unchanged.
 #   * redirect: cmd > file binds a file Chan at /fd/1. echo is a hamsh
@@ -53,8 +60,8 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 120 \
     -- 'echo MRPC_BEFORE `{ cat /dev/mountrpc }' 2 \
-       'echo PIPE_PAYLOAD | cat' 3 \
-       'echo three stage line | cat | cat' 3 \
+       'seq 1000 1041 | wc -l' 4 \
+       'seq 1000 1099 | grep 7 | wc -c' 5 \
        'echo MRPC_AFTER `{ cat /dev/mountrpc }' 2 \
        'echo REDIR_CONTENT | cat > /tmp/fdbind_out' 3 \
        'cat /tmp/fdbind_out' 2 \
@@ -80,9 +87,29 @@ check() {
     fi
 }
 
-# pipe carries the payload — proves the pipe Chan binds at /fd/1 + /fd/0
-check "PIPE_PAYLOAD"          "a | b — pipe Chan carries data"
-check "three stage line"     "3-stage pipeline wires every /fd"
+# pipe carries the payload — proves the pipe Chan binds at /fd/1 + /fd/0.
+# EXACT-LINE match: a substring grep for "42" also matches the kernel's
+# "[001042]" timestamps and the "[hamsh-alive] tick=42" heartbeat.
+check_eq() {
+    if hamsh_out_eq "$LOG" "$1"; then
+        echo "[test_hamsh_fdbind] OK: $2"
+    else
+        echo "[test_hamsh_fdbind] MISS: $2"
+        fail=1
+    fi
+}
+check_absent() {
+    if hamsh_out_eq "$LOG" "$1"; then
+        echo "[test_hamsh_fdbind] MISS: $2"
+        fail=1
+    else
+        echo "[test_hamsh_fdbind] OK: $2"
+    fi
+}
+check_eq "42" "a | b — pipe Chan carries data (seq | wc -l = 42)"
+check_absent "1000" "a | b — producer did NOT leak to the console"
+check_eq "95" "3-stage pipeline wires every /fd (grep | wc -c = 95)"
+check_absent "1007" "3-stage — no intermediate stage output on the console"
 # redirect lands the bytes in the file via a file-Chan bind at /fd/1
 check "REDIR_CONTENT"        "cmd > file — file Chan bound at /fd/1"
 # dup-as-bind: 2>&1 reaches stdout

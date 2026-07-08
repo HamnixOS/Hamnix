@@ -50,3 +50,41 @@ hamsh_ran() {
 hamsh_ran_count() {
     _ho_outlines "$1" | grep -a -F -c "$2" || true
 }
+
+# --- EXACT-LINE assertions -------------------------------------------
+#
+# WHY A SUBSTRING GREP IS NOT ENOUGH FOR A PIPE TEST
+#
+# A pipe gate has to prove the bytes travelled the PIPE rather than
+# leaking to the console. The only assertion that can tell those apart is
+# the CONSUMER's computed answer — a number the producer never prints,
+# e.g. `seq 1000 1041 | wc -l` -> 42. But a substring grep for "42" also
+# matches the kernel's own "[001042]" serial timestamps, hamsh's
+# "[hamsh-alive] tick=42" heartbeat, and the "task: pid 42 exited" log.
+# So the check must be: some command printed a line whose ENTIRE content
+# is "42", with the shell's CR-repainted prompt echo and all kernel
+# chatter removed first.
+#
+# hamsh_outlines <logfile> — genuine command-output lines, one per line:
+# prompt/input-echo lines dropped (_ho_outlines), CR repaints split into
+# real lines, ANSI escapes stripped, kernel + heartbeat chatter removed,
+# surrounding whitespace trimmed.
+hamsh_outlines() {
+    _ho_outlines "$1" \
+        | tr '\r' '\n' \
+        | sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b[()][A-Za-z0-9]//g' \
+        | grep -a -vE '^\[[0-9]{6}\]|^task: pid |^\[hamsh' \
+        | sed -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//'
+}
+
+# hamsh_out_eq <logfile> <text> — succeeds iff some command printed a line
+# whose entire content is <text>.
+hamsh_out_eq() {
+    hamsh_outlines "$1" | grep -a -q -x -F "$2"
+}
+
+# hamsh_out_count <logfile> <text> — how many command-output lines have
+# exactly <text> as their whole content.
+hamsh_out_count() {
+    hamsh_outlines "$1" | grep -a -c -x -F "$2" || true
+}

@@ -155,8 +155,25 @@ P9_SPAWN_STDIO_INHERIT: int32 = -1
 
 # DEVFD backing kinds (mirror sys/src/9/port/devfd.ad). Used by
 # spawn_stdio_pipes() to bind the child's /fd/0,1,2 to pipe ends.
+P9_DEVFD_CONS:   int32 = 1       # bind the console device
 P9_DEVFD_PIPE_R: int32 = 2       # bind the READ end of a pipe slot
 P9_DEVFD_PIPE_W: int32 = 3       # bind the WRITE end of a pipe slot
+
+# Scratch /fd names a pipeline-launching shell uses to PIN a pipe end's
+# refcount across a spawn (see spawn_pipeline_stage). Every stage child
+# CLEARS all four right after binding its real stdio, so no stage carries a
+# stray reference to a pipe it does not actually use — that matters:
+# a leftover reader ref would suppress EPIPE for a producer whose consumer
+# has died (`yes | head -1` would never stop), and a leftover writer ref
+# would suppress EOF for the consumer. Both sides must agree on the numbers,
+# so they live here, next to the spawn that consumes them.
+#
+# devfd gives each Pgrp 16 slots (/fd/0 .. /fd/15). 0-2 are stdio; hamsh
+# claims 9 (capture), 10 (svc log) and 11 (redirect scratch).
+P9_PIPE_PIN_RA: int32 = 12       # shell's rolling pin on a pipe's READ end
+P9_PIPE_PIN_RB: int32 = 13       # ... alternating partner of RA
+P9_PIPE_PIN_W:  int32 = 14       # shell's pin on this stage's WRITE end
+P9_PIPE_PIN_R:  int32 = 15       # shell's pin on this stage's READ end
 
 
 # _p9_path_buf: scratch path renderer for /proc/<pid>/note. Single-file
@@ -376,6 +393,96 @@ def spawn_stdio_pipes(path: Ptr[char], argv: Ptr[uint64],
     sys_fdbind(0, 0, P9_DEVFD_PIPE_R, pin_slot)
     sys_fdbind(0, 1, P9_DEVFD_PIPE_W, pout_slot)
     sys_fdbind(0, 2, P9_DEVFD_PIPE_W, pout_slot)
+    _p9_route_stdio_through_fdname(0, cast[Ptr[char]]("/fd/0"))
+    _p9_route_stdio_through_fdname(1, cast[Ptr[char]]("/fd/1"))
+    _p9_route_stdio_through_fdname(2, cast[Ptr[char]]("/fd/2"))
+    sys_execve_env(path, argv, envp)
+    sys_exit(127)                                # unreached on success
+    return 127
+
+
+def p9_pipe_pins_release():
+    # Drop every pipeline pin bound in the CALLING task's Pgrp. Rebinding
+    # CONS over CONS/NONE is a harmless no-op, so this is safe to call
+    # unconditionally (a single-stage command pinned nothing).
+    sys_fdbind(0, P9_PIPE_PIN_RA, P9_DEVFD_CONS, 0)
+    sys_fdbind(0, P9_PIPE_PIN_RB, P9_DEVFD_CONS, 0)
+    sys_fdbind(0, P9_PIPE_PIN_W,  P9_DEVFD_CONS, 0)
+    sys_fdbind(0, P9_PIPE_PIN_R,  P9_DEVFD_CONS, 0)
+
+
+# --- spawn_pipeline_stage() — race-free `a | b` stage launch ---------
+#
+# THE BUG THIS EXISTS TO KILL
+#
+# hamsh used to launch a pipeline stage as
+#
+#     pid = spawn(path, argv, SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
+#     sys_fdbind(pid, 1, DEVFD_PIPE_W, out_slot)      # <-- PARENT-side
+#
+# resting on run_one_command_x's claim that "the child is still
+# STATE_READY (cooperative scheduler), so these binds land before its
+# first instruction runs". That is FALSE the moment a second CPU exists —
+# the same falsehood spawn_stdio_pipes() above was written to correct for
+# the SSH path (#136). Under KVM the child really does run concurrently:
+# it can route its stdio, execve, and START WRITING before the parent's
+# sys_fdbind arrives. Its /fd/1 is then still the COW-inherited CONSOLE,
+# so `seq 1 5 | wc -l` prints 1 2 3 4 5 on the terminal and wc, whose
+# pipe never received a byte, reads EOF and prints 0. On TCG the parent
+# always won the race, so no `-kernel` test ever saw it.
+#
+# THE FIX, and why it is the same shape as spawn_stdio_pipes
+#
+# The child binds its OWN /fd/0 and /fd/1 in its private COW Pgrp BEFORE
+# execve — a straight-line sequence in the child's single thread. No
+# cross-CPU ordering is involved and the parent does NO post-spawn stdio
+# bind at all. Pipe slots are GLOBAL, address-independent handles, so the
+# values the parent computed are valid in the child's COW-copied frame.
+#
+# THE REFCOUNT PIN, and why the caller must take it
+#
+# A pipe end's reader/writer count is what makes EOF and EPIPE work:
+#   * a reader sees EOF exactly when writers == 0;
+#   * a writer gets EPIPE exactly when readers == 0.
+# If the child were the FIRST holder of the write end, the shell would
+# already have launched the downstream stage — which would find
+# writers == 0 and read instant EOF — before the child's bind ever ran.
+# Symmetrically a producer that starts writing before its consumer binds
+# the read end gets EPIPE and its output is silently discarded.
+#
+# So the CALLER must, before calling:
+#     sys_fdbind(0, P9_PIPE_PIN_W, P9_DEVFD_PIPE_W, out_slot)   (out >= 0)
+#     sys_fdbind(0, P9_PIPE_PIN_R, P9_DEVFD_PIPE_R, in_slot)    (in  >= 0)
+# pgrp_clone (inside rfork) copies those rows and bumps the refcounts
+# again, so the child owns a live reference the instant it exists. The
+# child then binds its real stdio names and DROPS the inherited pins, and
+# the caller drops its own pin after the rfork returns. The count is
+# >= 1 from before the fork until the stage exits — in every interleaving.
+#
+#   in_slot  : pipe slot whose READ end becomes the child's /fd/0. -1 = none
+#              (first stage keeps the inherited stdin).
+#   out_slot : pipe slot whose WRITE end becomes the child's /fd/1. -1 = none
+#              (last stage keeps the inherited stdout).
+#
+# Unlike spawn_stdio_pipes, /fd/2 is NOT redirected: a pipeline stage's
+# stderr belongs on the terminal, not in the next stage's stdin.
+def spawn_pipeline_stage(path: Ptr[char], argv: Ptr[uint64],
+                         in_slot: int32, out_slot: int32,
+                         envp: Ptr[uint64]) -> int32:
+    flags: int32 = P9_RFPROC | P9_RFFDG | P9_RFNAMEG
+    pid: int32 = sys_rfork(flags)
+    if pid < 0:
+        return -1
+    if pid != 0:
+        # Parent: child pid. NO post-spawn sys_fdbind — nothing to race.
+        return pid
+    # Child. Bind our real stdio names FIRST (so the refcount never dips),
+    # then release the pins we inherited from the caller's Pgrp.
+    if in_slot >= 0:
+        sys_fdbind(0, 0, P9_DEVFD_PIPE_R, in_slot)
+    if out_slot >= 0:
+        sys_fdbind(0, 1, P9_DEVFD_PIPE_W, out_slot)
+    p9_pipe_pins_release()
     _p9_route_stdio_through_fdname(0, cast[Ptr[char]]("/fd/0"))
     _p9_route_stdio_through_fdname(1, cast[Ptr[char]]("/fd/1"))
     _p9_route_stdio_through_fdname(2, cast[Ptr[char]]("/fd/2"))
