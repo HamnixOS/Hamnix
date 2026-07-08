@@ -67,11 +67,24 @@ set +e
 # .text). At -m 256M the BIOS GRUB ISO loader (via _kernel_iso.sh) #PFs
 # "error: out of memory" before it can hand control to the kernel. 1G
 # matches the installer/rl5 harness budget and leaves GRUB room to load.
-# Use KVM when the host offers it. This gate asserts a WALL-CLOCK cadence (N
-# heartbeat ticks inside a host-timed window), so under pure TCG on a loaded
-# host it never observes the ticks and reports INCONCLUSIVE — which is honest
-# but useless. Two agents hit exactly that on 2026-07-08. KVM makes the guest's
-# tick rate track real time, which is the thing this canary is actually about.
+# This gate asserts a WALL-CLOCK cadence (N heartbeat ticks inside a host-timed
+# window), so it MUST run under a hardware accelerator or it cannot distinguish a
+# slow guest from a stopped one.
+#
+# CORRECTION (2026-07-08): it already did. `_build_lock.sh` sources
+# `_kernel_iso.sh`, whose `qemu-system-x86_64` PATH shim injects `-accel kvm`
+# (plus `-cpu host`) whenever /dev/kvm is readable+writable and the caller has not
+# chosen an accelerator. So this gate has always been on KVM on a KVM host, and the
+# `-enable-kvm` below is belt-and-braces: it makes the requirement explicit at the
+# call site and survives anyone invoking this script outside the shim.
+#
+# The consequence matters more than the flag. Two agents (and the orchestrator)
+# read this gate's INCONCLUSIVE at -smp 2 as host starvation. It was not. It was a
+# REAL guest wedge, under KVM, all along — see the -smp 1 vs -smp 2 control in
+# commit 41b5fd0d's message. A canary asserting a wall-clock rate cannot separate
+# "wedged" from "slow"; only a control can. Until this gate grows an -smp 1
+# comparison arm, a repeated INCONCLUSIVE here should be treated as a WEDGE
+# HYPOTHESIS to be tested, never as a verdict about the host.
 KVM_ARGS=""
 if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     KVM_ARGS="-enable-kvm -cpu host"
