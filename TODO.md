@@ -459,6 +459,20 @@ straight; do NOT implement them in Python.
 (IR coverage is ~87% of binary-op roots today; the rest still falls back to the
 stack-machine emit path), and instruction-selection IR (#493+).
 
+## Kernel hygiene — the `name0` byte-order trap
+
+- [ ] **Two `name0` fields, opposite byte orders, same name.**
+  `TaskStruct.name0` (`kernel/sched/core.ad:248`) packs **MSB = char 0**;
+  `KmemCache.name0` (`mm/slab.ad:72`) packs **LSB first**. Each is
+  self-consistent, but the collision is what produced the `driftfok` bug:
+  `kernel/softirq.ad` spelled its task tag in slab's order, so `ps` rendered
+  PID 1 as garbage, and three sibling tags (`kworker`, `irq#thr`, `kthread`)
+  were 7 chars so their packed word led with a NUL and rendered an **empty**
+  COMM. Fixed in `06b1bf11`, but the trap is structural — it will bite again.
+  Give the two fields distinct names (`comm_tag_be` / `cache_tag_le`) or a
+  shared `pack_tag()` helper, so the convention travels with the type rather
+  than living in comments.
+
 ## CI / verification gap
 
 - [ ] **CI must build the shipped image.** Nothing in CI runs
