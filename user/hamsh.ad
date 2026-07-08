@@ -37,7 +37,11 @@ extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 # #450 F6: SYS_SPAWN is retired. spawn() is the Plan-9 rfork+exec
 # userland wrapper from lib/p9.ad — exact same signature so call sites
 # keep their integer-fd / SPAWN_STDIO_NS sentinels (-2 / -1 / 0..15).
-from lib.p9 import spawn, p9_note, p9_listdir
+from lib.p9 import (
+    spawn, p9_note, p9_listdir,
+    spawn_pipeline_stage, p9_pipe_pins_release,
+    P9_PIPE_PIN_W, P9_PIPE_PIN_R, P9_PIPE_PIN_RA, P9_PIPE_PIN_RB,
+)
 extern def sys_waitpid(pid: int32) -> int64
 extern def sys_open(path: Ptr[char]) -> int32
 extern def sys_open_write(path: Ptr[char]) -> int32
@@ -3303,6 +3307,30 @@ def _path_execable(path: Ptr[uint8]) -> int32:
     return 1
 
 
+# Pipe slots for the stage spawn_resolved is about to launch, or -1. Set
+# by run_one_command_x immediately before the call; consumed by _spawn_at.
+# Module scope rather than a parameter so the three PATH-resolution call
+# sites below stay one-liners.
+sr_in_pipe:  int32 = -1
+sr_out_pipe: int32 = -1
+
+
+def _spawn_at(path: Ptr[char], argv: Ptr[uint64],
+              envp: Ptr[uint64]) -> int32:
+    # Launch `path`. A PIPELINE STAGE goes through spawn_pipeline_stage,
+    # which binds the child's /fd/0 and /fd/1 to the pipe ends CHILD-side,
+    # before execve. The old shape — plain spawn() plus a parent-side
+    # sys_fdbind(pid, …) after it returned — is a data race the moment a
+    # second CPU exists: under KVM the child can execve and start writing
+    # before the parent's bind lands, so its /fd/1 is still the inherited
+    # CONSOLE and the pipe never receives a byte. See lib/p9.ad's
+    # spawn_pipeline_stage header. The caller has already pinned the pipe
+    # ends' refcounts at P9_PIPE_PIN_W / P9_PIPE_PIN_R.
+    if sr_in_pipe >= 0 or sr_out_pipe >= 0:
+        return spawn_pipeline_stage(path, argv, sr_in_pipe, sr_out_pipe, envp)
+    return spawn(path, argv, SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
+
+
 def spawn_resolved(cmd: Ptr[uint8], argv: Ptr[uint64]) -> int32:
     # Resolve `cmd` to a path and spawn() it. A command containing
     # '/' is taken verbatim; otherwise PATH dirs are tried in order.
@@ -3310,8 +3338,10 @@ def spawn_resolved(cmd: Ptr[uint8], argv: Ptr[uint64]) -> int32:
     # HAMSH §7: stdio is ALWAYS spawned in namespace-bind mode
     # (SPAWN_STDIO_NS). The child gets a private COW namespace whose
     # /fd table is a copy of the shell's (console at 0/1/2); the
-    # caller rebinds the child's /fd/N for any pipe / redirect / dup
-    # via sys_fdbind AFTER this returns and BEFORE waiting on it.
+    # caller rebinds the child's /fd/N for any redirect / dup via
+    # sys_fdbind AFTER this returns and BEFORE waiting on it. PIPE ends
+    # are the exception — they are bound child-side by _spawn_at, because
+    # a post-spawn parent bind races the child on SMP.
     envp: Ptr[uint64] = _build_envp()
     has_slash: int32 = 0
     i: uint64 = 0
@@ -3328,8 +3358,7 @@ def spawn_resolved(cmd: Ptr[uint8], argv: Ptr[uint64]) -> int32:
         # to -1 here and the caller prints "command not found".
         if _path_execable(cmd) == 0:
             return -1
-        return spawn(cast[Ptr[char]](cmd), argv,
-                         SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
+        return _spawn_at(cast[Ptr[char]](cmd), argv, envp)
     # (1) Walk $PATH colon-separated dirs first, so a command resolves
     # wherever the active namespace's $PATH advertises it. Inside
     # `enter linux { sh }` the body inherits the shell's $PATH
@@ -3349,8 +3378,8 @@ def spawn_resolved(cmd: Ptr[uint8], argv: Ptr[uint64]) -> int32:
                         cast[Ptr[uint8]](cast[uint64](pv) + seg), dlen, cmd)
                     # BUG 2 FIX: existence-gate the spawn (see has_slash case).
                     if _path_execable(cast[Ptr[uint8]](&spawn_path[0])) != 0:
-                        pid: int32 = spawn(cast[Ptr[char]](&spawn_path[0]),
-                                argv, SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
+                        pid: int32 = _spawn_at(
+                            cast[Ptr[char]](&spawn_path[0]), argv, envp)
                         if pid >= 0:
                             return pid
                 seg = j + 1
@@ -3365,8 +3394,8 @@ def spawn_resolved(cmd: Ptr[uint8], argv: Ptr[uint64]) -> int32:
         _build_path(_path_prefix(pi), cmd)
         # BUG 2 FIX: existence-gate the spawn (see has_slash case).
         if _path_execable(cast[Ptr[uint8]](&spawn_path[0])) != 0:
-            pid2: int32 = spawn(cast[Ptr[char]](&spawn_path[0]),
-                                   argv, SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
+            pid2: int32 = _spawn_at(
+                cast[Ptr[char]](&spawn_path[0]), argv, envp)
             if pid2 >= 0:
                 return pid2
         pi = pi + 1
@@ -5112,6 +5141,133 @@ def _unwire_redirects_self(ctx: Ptr[int32]):
     sys_fdbind(0, REDIRECT_SCRATCH_FD, DEVFD_CONS, 0)
 
 
+# RFFDG — copy the fd table into the child. Declared next to the other
+# RF* bits below (RFPROC / RFNAMEG / ...); mirrored from
+# sys/src/9/port/sysproc.ad. A forked builtin stage needs its OWN fd
+# table so dup2'ing the pipe Chan onto fd 0/1 cannot disturb the shell's.
+RFFDG_BIT: int32 = 0x004
+
+def _route_self_stdio(fdnum: int32, fdname: Ptr[char]):
+    # Make the CALLING task's integer fd `fdnum` resolve through the
+    # /fd/<fdnum> name in its own Pgrp. Same trick lib/p9.ad's
+    # _p9_route_stdio_through_fdname plays for a spawned child: open the
+    # /fd name (namec hands back an FD_CHAN_MARK / DEV_DEVFD chan that is
+    # resolved per-I/O against the caller's Pgrp) and dup2 it onto the
+    # integer slot. Without this, a builtin's write_cstr1 -> sys_write(1)
+    # goes straight to the console-backed FD_STDOUT_MARK and BYPASSES the
+    # /fd substrate entirely, no matter what /fd/1 is bound to.
+    newfd: int32 = sys_open(fdname)
+    if newfd < 0:
+        return
+    if newfd != fdnum:
+        sys_dup2(newfd, fdnum)
+        sys_close(newfd)
+
+
+def _run_builtin_in_pipeline(cmdnode: int32, cmd: Ptr[uint8], argc: int32,
+                             in_pipe: int32, out_pipe: int32,
+                             do_wait: int32) -> int32:
+    # A builtin that is a PIPELINE STAGE must run as a real PROCESS.
+    #
+    # Three independent reasons, any one of which is fatal on its own:
+    #
+    #   1. CORRECTNESS. The in-process builtin arm below never touched
+    #      in_pipe / out_pipe. `echo X | wc -c` therefore wrote X to the
+    #      SHELL's console-backed fd 1 while wc, whose /fd/0 was a pipe
+    #      with no writer, read instant EOF and printed 0. The left-hand
+    #      side of a pipe silently bypassed the pipe.
+    #
+    #   2. DEADLOCK. run_pipeline launches stages in order, so an inline
+    #      builtin runs to completion BEFORE its reader exists. Any
+    #      builtin whose output exceeds the pipe buffer would block
+    #      forever with nothing on the other end.
+    #
+    #   3. THE WAIT CONTRACT. run_pipeline stores what this function
+    #      returns in pl_pids and sys_waitpid()s it. The inline arm
+    #      returned an exit STATUS, so a builtin exiting 1 made the shell
+    #      wait on pid 1 (init) — a wait that never returns. That is the
+    #      "shell wedges after the pipeline, with both children already
+    #      reaped" hang.
+    #
+    # Consequence, and it is the RIGHT one: a builtin in a pipeline runs
+    # in a subshell, so state it mutates (`cd`, `export`, `read`) does not
+    # survive the stage. POSIX shells behave identically. A single-command
+    # `cd /x` is not a pipeline and still runs at prompt scope.
+    #
+    # RFPROC|RFFDG|RFNAMEG mirrors lib/p9.ad's _spawn_flags: new process,
+    # private fd table, private COW Pgrp. The child wires its OWN /fd
+    # names before running the verb — a straight-line, pre-verb sequence
+    # in the child's single thread, so no cross-CPU ordering is involved
+    # (the same reason spawn_stdio_pipes binds child-side, cf. #136).
+    #
+    # PIN THE REFCOUNTS BEFORE THE FORK. A pipe end's reader/writer count
+    # lives on the pipe slot, and devfd_bind_pipe_w bumps it. If the child
+    # were the FIRST holder of the write end, run_pipeline would already
+    # have launched the downstream stage — which would find writers == 0
+    # and read instant EOF — before the child's bind ever ran. So bind the
+    # ends at scratch /fd names HERE, in the shell: pgrp_clone (inside
+    # rfork) copies the row and bumps the refcounts again, so the child
+    # inherits a live reference the moment it exists, and the shell can
+    # drop its own pin immediately afterwards. The count is >= 1 from
+    # before the fork until the child exits and devfd_free_row runs.
+    if out_pipe >= 0:
+        sys_fdbind(0, P9_PIPE_PIN_W, DEVFD_PIPE_W, out_pipe)
+    if in_pipe >= 0:
+        sys_fdbind(0, P9_PIPE_PIN_R, DEVFD_PIPE_R, in_pipe)
+    pid: int32 = sys_rfork(RFPROC | RFFDG_BIT | RFNAMEG)
+    if pid < 0:
+        # Drop the pins we just took; nothing inherited them.
+        if out_pipe >= 0:
+            sys_fdbind(0, P9_PIPE_PIN_W, DEVFD_CONS, 0)
+        if in_pipe >= 0:
+            sys_fdbind(0, P9_PIPE_PIN_R, DEVFD_CONS, 0)
+        errstr_set("pipe: cannot fork builtin stage")
+        write_cstr1("hamsh: cannot fork builtin pipeline stage: ")
+        write_cstr1(cmd)
+        write_cstr1("\n")
+        if do_wait == 0:
+            return -1
+        return 1
+    if pid == 0:
+        # Child. Bind the pipe ends at our own /fd names, then route the
+        # integer fds through those names so the verb's sys_write(1, …)
+        # lands in the pipe. Finally drop the inherited pins so THIS
+        # process holds exactly one reference per end — otherwise the
+        # writer count never reaches 0 and the reader never sees EOF.
+        if in_pipe >= 0:
+            sys_fdbind(0, 0, DEVFD_PIPE_R, in_pipe)
+            _route_self_stdio(0, cast[Ptr[char]]("/fd/0"))
+        if out_pipe >= 0:
+            sys_fdbind(0, 1, DEVFD_PIPE_W, out_pipe)
+            _route_self_stdio(1, cast[Ptr[char]]("/fd/1"))
+        p9_pipe_pins_release()
+        # An explicit redirect on the stage still wins over the pipe
+        # (`echo x > f | cat` writes the file, cat sees EOF) — same
+        # precedence the external path gives _wire_redirects.
+        ctx_c: Array[3, int32]
+        rc_child: int32 = 0
+        if _cmd_has_redirect(cmdnode) != 0:
+            if _wire_redirects_self(cmdnode, &ctx_c[0]) == 0:
+                rc_child = run_builtin(cmd, argc)
+            else:
+                rc_child = 1
+            _unwire_redirects_self(&ctx_c[0])
+        else:
+            rc_child = run_builtin(cmd, argc)
+        sys_exit(cast[uint64](cast[int64](rc_child)))
+    # Parent. The child's cloned Pgrp holds a reference to each end, so we
+    # release our per-stage pins right away. run_pipeline's rolling READ pin
+    # (P9_PIPE_PIN_RA/RB) is NOT ours to drop — it guards this stage's output
+    # pipe until the downstream stage binds it.
+    if out_pipe >= 0:
+        sys_fdbind(0, P9_PIPE_PIN_W, DEVFD_CONS, 0)
+    if in_pipe >= 0:
+        sys_fdbind(0, P9_PIPE_PIN_R, DEVFD_CONS, 0)
+    if do_wait == 0:
+        return pid
+    return cast[int32](sys_waitpid(pid))
+
+
 def run_one_command_x(cmdnode: int32, in_pipe: int32, out_pipe: int32,
                       do_wait: int32, prebuilt: int32) -> int32:
     # Execute a single ND_CMD. in_pipe / out_pipe are pipe SLOT ids
@@ -5143,6 +5299,13 @@ def run_one_command_x(cmdnode: int32, in_pipe: int32, out_pipe: int32,
     # bypasses the /fd substrate even when /fd/1 is bound elsewhere.
     rc_dispatch_check: int32 = _builtin_dispatch_kind_check(cmd)
     if rc_dispatch_check != 0:
+        # A builtin that is a PIPELINE STAGE cannot run in-process: it
+        # would write past the pipe to the console, it could deadlock on
+        # a full pipe with no reader yet, and it would hand run_pipeline
+        # an exit status where a PID is required. Fork it.
+        if in_pipe >= 0 or out_pipe >= 0:
+            return _run_builtin_in_pipeline(cmdnode, cmd, argc,
+                                            in_pipe, out_pipe, do_wait)
         ctx: Array[3, int32]
         has_redir: int32 = _cmd_has_redirect(cmdnode)
         wire_rc: int32 = 0
@@ -5164,7 +5327,31 @@ def run_one_command_x(cmdnode: int32, in_pipe: int32, out_pipe: int32,
         return rc_builtin
 
     # external command — spawn it in namespace-bind stdio mode (§7).
+    #
+    # Pin the pipe ends' refcounts in the SHELL's /fd table across the
+    # spawn, then hand the slots to spawn_pipeline_stage (through sr_*),
+    # which binds them CHILD-side before execve. Both halves are
+    # load-bearing: the pin stops the downstream stage seeing writers == 0
+    # (instant EOF) and stops the producer seeing readers == 0 (EPIPE,
+    # output silently discarded); the child-side bind stops the child
+    # racing past a parent-side bind and writing to the inherited console.
+    # See lib/p9.ad :: spawn_pipeline_stage for the full argument.
+    if out_pipe >= 0:
+        sys_fdbind(0, P9_PIPE_PIN_W, DEVFD_PIPE_W, out_pipe)
+    if in_pipe >= 0:
+        sys_fdbind(0, P9_PIPE_PIN_R, DEVFD_PIPE_R, in_pipe)
+    sr_in_pipe = in_pipe
+    sr_out_pipe = out_pipe
     pid: int32 = spawn_resolved(cmd, cast[Ptr[uint64]](&argv_ptr[0]))
+    sr_in_pipe = -1
+    sr_out_pipe = -1
+    # The child's cloned Pgrp holds its own reference to each end now, so
+    # the shell drops its pins. (On the failure path nothing inherited
+    # them, and dropping is equally correct.)
+    if out_pipe >= 0:
+        sys_fdbind(0, P9_PIPE_PIN_W, DEVFD_CONS, 0)
+    if in_pipe >= 0:
+        sys_fdbind(0, P9_PIPE_PIN_R, DEVFD_CONS, 0)
     if pid < 0:
         errstr_set("command not found")
         write_cstr1("hamsh: command not found: ")
@@ -5179,13 +5366,10 @@ def run_one_command_x(cmdnode: int32, in_pipe: int32, out_pipe: int32,
         if do_wait == 0:
             return -1
         return 127
-    # Wire the child's /fd/N — ONE bind per stream (§7). The child is
-    # still STATE_READY (cooperative scheduler), so these binds land
-    # in its namespace before its first instruction runs.
-    if in_pipe >= 0:
-        sys_fdbind(pid, 0, DEVFD_PIPE_R, in_pipe)
-    if out_pipe >= 0:
-        sys_fdbind(pid, 1, DEVFD_PIPE_W, out_pipe)
+    # Pipe ends are ALREADY bound, child-side, by spawn_pipeline_stage.
+    # Redirects are still wired parent-side: their target Chan is opened
+    # here (a tmpfs / device slot) and the child must execve before it can
+    # write, which is a far wider window than a pipe stage's.
     _wire_redirects(cmdnode, pid)
     if do_wait == 0:
         # caller manages the pid (pipeline / background)
@@ -5235,8 +5419,25 @@ def run_pipeline(plnode: int32) -> int32:
             return 1
         pl_pipe[pi] = slot
         pi = pi + 1
-    # Launch each stage; bind its in/out pipe Chans at /fd/0 and /fd/1.
+    # Launch each stage. Its pipe ends are bound CHILD-side (see
+    # lib/p9.ad :: spawn_pipeline_stage and _run_builtin_in_pipeline).
+    #
+    # THE ROLLING READ PIN. A pipe's write end gets its refcount from the
+    # producer stage itself, but nothing holds its READ end until the
+    # CONSUMER stage is forked one iteration later. In that window the
+    # producer is already running, and a write to a pipe with readers == 0
+    # is EPIPE — the bytes are silently discarded. So the shell holds a
+    # reader reference on pl_pipe[si] from before stage si is forked until
+    # after stage si+1 is forked (at which point the consumer's own clone
+    # owns one). The windows for successive pipes abut and overlap by
+    # exactly one fork, hence two alternating pin slots, not one.
+    #
+    # Every stage child clears the whole pin block right after binding its
+    # real stdio, so no stage carries a stray reference: EOF (writers == 0)
+    # and EPIPE (readers == 0) both still fire exactly when they should.
     si: uint64 = 0
+    cur_rpin:  int32 = -1               # slot pinning pl_pipe[si]'s read end
+    prev_rpin: int32 = -1               # slot pinning pl_pipe[si-1]'s read end
     while si < nstages:
         in_p:  int32 = -1
         out_p: int32 = -1
@@ -5244,13 +5445,39 @@ def run_pipeline(plnode: int32) -> int32:
             in_p = pl_pipe[si - 1]       # consumer's /fd/0 = prev pipe
         if si < npipes:
             out_p = pl_pipe[si]          # producer's /fd/1 = this pipe
+        cur_rpin = -1
+        if out_p >= 0:
+            if prev_rpin == P9_PIPE_PIN_RA:
+                cur_rpin = P9_PIPE_PIN_RB
+            else:
+                cur_rpin = P9_PIPE_PIN_RA
+            sys_fdbind(0, cur_rpin, DEVFD_PIPE_R, out_p)
         pl_pids[si] = run_one_command(nd_kid_at(plnode, si),
                                       in_p, out_p, 0)
+        # Stage si has been forked, so its clone owns a reader reference on
+        # pl_pipe[si-1]. Our pin on that pipe has done its job.
+        if prev_rpin >= 0:
+            sys_fdbind(0, prev_rpin, DEVFD_CONS, 0)
+        prev_rpin = cur_rpin
         si = si + 1
+    # The last stage has no output pipe, so prev_rpin was already released
+    # above. Belt and braces: never leave a pipe end pinned in the shell —
+    # it would keep readers > 0 forever and suppress EPIPE.
+    if prev_rpin >= 0:
+        sys_fdbind(0, prev_rpin, DEVFD_CONS, 0)
     # Wait on every stage; the pipeline's status is the last stage's.
     # The shell holds no pipe fd of its own — each pipe Chan is owned
     # entirely by the two /fd names it was bound at, so EOF propagates
     # when a stage exits and its Pgrp's /fd table is released.
+    #
+    # EVERY entry in pl_pids is a real PID or a negative sentinel — never
+    # an exit status. That invariant used to be violated: run_one_command_x
+    # ran a BUILTIN stage in-process and returned its STATUS here, so a
+    # builtin exiting 0 made the shell sys_waitpid(0) and one exiting 1
+    # made it sys_waitpid(1) — a blocking wait on init, which never exits.
+    # The shell wedged in this very loop with both real children already
+    # reaped. _run_builtin_in_pipeline now forks the stage, so a builtin
+    # yields a PID like any other stage.
     last: int32 = 0
     si = 0
     while si < nstages:
