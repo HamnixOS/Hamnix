@@ -525,6 +525,46 @@ stack-machine emit path), and instruction-selection IR (#493+).
 - [ ] **F10-4 … F10-12** — remaining F10-audit findings (afd Tauth,
   `init/main.ad` split, full Dir-record atime/mtime + per-task uid, etc.).
 
+## Interactive-QA sweep 2026-07-08 (orchestrator, shipped image over serial)
+
+Every item below was found by DRIVING the shipped `hamnix-installer.img` under
+UEFI/OVMF, or by disbelieving a green/red gate — none by the suite behaving as
+designed. Seven gates were found lying (five false-red, two false-green).
+
+Landed + pushed:
+- [x] Installer image build restored (pinned 512 MiB rootfs → auto-size w/ floor).
+- [x] `/proc/{mounts,stat,diskstats}` honour the read offset — `df` no longer
+  spins forever and wedges the console.
+- [x] `uptime` reports seconds not seconds/100 (two `/proc/uptime` renderers).
+- [x] `ps` no longer prints uninitialized memory for PID 1 (`name0` byte-order);
+  `/proc/tasks` renders full `comm`; closed a latent `/proc` buffer overrun.
+- [x] `ls /bin` enumerates — shadow tmpfs overlay roots opened as 0-byte FILES.
+- [x] **#471** apt-NX VMA straddling-alias fix, gated by a differential run.
+- [x] **hamsh pipelines actually carry bytes** — were 100% broken behind a
+  false-green `test_pipe.sh` (builtin LHS never bound a pipe; external stages
+  raced the post-spawn parent bind, invisible under TCG).
+- [x] **ext4**: the 9th concurrently-open file no longer reported as ENOENT
+  (global 8-entry table → 512; EMFILE no longer laundered into ENOENT).
+- [x] **Infinite `FUTEX_WAIT` park** for large thread groups — the "bounded"
+  park had no timer to fire its self-heal; killed every heavily-threaded Linux
+  app. Fixed with `_futex_sweep_expired()` on the arch tick + locked slots.
+- [x] `test_mm_pressure.sh` resurrected (was unbootable: 337 MiB kernel into
+  256 MiB); heartbeat canary given an `-smp 1` control arm.
+
+Open blockers (agent-owned):
+- [ ] **`-smp 2` guest wedge** — an idle shell (and any pipeline) halts in
+  `kernel/sched/core.ad::yield_to_others`; `-smp 1` fine. Repro is 70 s / one
+  command; suspect #413 steal-window. See [[project_smp2_idle_wedge]] in memory.
+- [ ] **Firefox last mile** — futex fix cleared the wedge; Firefox now realizes
+  full GTK chrome but never calls `wl_compositor.create_surface`. Downstream of
+  GTK realize, non-futex. vDSO `clock_gettime` is unversioned → syscall-traps
+  every call (~1240/boot), being fixed.
+- [ ] `ls /dev` hardcodes `blk`, so a stripped (non-hostowner) namespace names a
+  path it cannot open (`lsblk` fails). Fix via mount-table synthesis, NOT by
+  re-binding `/dev/blk` (that undoes a security boundary).
+- [ ] Flip `test_pipe.sh` / `test_multipipe.sh` back to `-smp 2` once the wedge
+  lands — they default to `-smp 1` to dodge it, which hides it.
+
 ## hamUI / DE track
 
 - [~] **`lib/hamui.ad` MATE-class widget set** — menu/menubar,
