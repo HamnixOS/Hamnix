@@ -67,7 +67,17 @@ set +e
 # .text). At -m 256M the BIOS GRUB ISO loader (via _kernel_iso.sh) #PFs
 # "error: out of memory" before it can hand control to the kernel. 1G
 # matches the installer/rl5 harness budget and leaves GRUB room to load.
+# Use KVM when the host offers it. This gate asserts a WALL-CLOCK cadence (N
+# heartbeat ticks inside a host-timed window), so under pure TCG on a loaded
+# host it never observes the ticks and reports INCONCLUSIVE — which is honest
+# but useless. Two agents hit exactly that on 2026-07-08. KVM makes the guest's
+# tick rate track real time, which is the thing this canary is actually about.
+KVM_ARGS=""
+if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    KVM_ARGS="-enable-kvm -cpu host"
+fi
 timeout "${HEARTBEAT_TIMEOUT}s" qemu-system-x86_64 \
+    $KVM_ARGS \
     -kernel "$ELF" -smp 2 -nographic -no-reboot -m 1G \
     -monitor none -serial stdio < /dev/null > "$LOG" 2>&1
 rc=$?
