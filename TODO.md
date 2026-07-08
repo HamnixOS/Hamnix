@@ -551,6 +551,26 @@ Landed + pushed:
 - [x] `test_mm_pressure.sh` resurrected (was unbootable: 337 MiB kernel into
   256 MiB); heartbeat canary given an `-smp 1` control arm.
 
+Systemic test-infra finding (HIGH — up to ~600 gates affected):
+- [ ] **The `-kernel` `-m 256M` gates are GREEN on CI and RED on any dev host
+  that has run debootstrap.** `build_initramfs.py` defaults
+  `HAMNIX_DEFAULT_REAL_DEBIAN=1`, which stages the whole debootstrap closure
+  (`tests/distros/debian-minbase/rootfs/`, 351 MiB) into the initramfs blob
+  linked *into* the kernel ELF → ~337 MiB. GRUB then fails to load it at
+  `-m 256M` (`error: out of memory. / you need to load the kernel first.`),
+  before the kernel runs a single instruction, so EVERY assertion "fails". The
+  fixture is **gitignored**, so a fresh CI checkout has only busybox → a small
+  kernel → the same gates pass. Confirmed on `test_devtime`/`test_devpid`
+  (identical GRUB OOM to `test_mm_pressure`, which was fixed with
+  `HAMNIX_DEFAULT_REAL_DEBIAN=0`). ~600 scripts match `-m 256M` + `-kernel` +
+  `build_initramfs` without that flag. These are kernel/unit tests that need no
+  Debian userland. **Fix at the source, not 600 files** — e.g. the `-kernel`
+  test path defaults to a busybox initramfs (real-Debian tests opt IN), or the
+  `_kernel_iso.sh` shim bumps `-m` when the kernel ELF is large. Architectural
+  call — one sweeping agent, on a quiet host. NOT a product regression (the
+  shipped installer image boots + the DE renders; only the dev-host `-kernel`
+  unit lane is affected).
+
 Open blockers (agent-owned):
 - [ ] **`-smp 2` guest wedge** — an idle shell (and any pipeline) halts in
   `kernel/sched/core.ad::yield_to_others`; `-smp 1` fine. Repro is 70 s / one
