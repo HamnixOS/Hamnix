@@ -387,10 +387,26 @@ RCU read-side for task/VFS traversal.
 gap is concentrated in a few classic passes, not anything LLVM-scale.
 
 **Goal:** rough C ballpark — **target ≤ ~2× of `-O2`** (from ~4.3×).
-Non-goal: `-O2` parity / auto-vectorization. **Progress: 4.28× (`-O0`) →
-3.47× (`-O1`) → 3.03× (`-O2`)** geomean of `-O2`, all fuzz-clean. lcg is
-down to 1.51×; the remaining prize is `collatz`/`mmul` (5×, division- and
-array-address-bound) which want LICM/CSE on a real IR.
+Non-goal: `-O2` parity / auto-vectorization.
+
+> ### ★★★ TARGET MET (2026-07-07, orchestrator-verified on a quiet host)
+> The **native Adder** optimizer (`--opt` / `ADDER_OPT=1`, 6 passes: const-fold,
+> CSE, LICM, DCE, branch-fold, copy-prop) is at **geomean 1.83× of `gcc -O2`** —
+> inside the ≤2× target, and *faster than* `gcc -O0` (0.56×). Optimizer ON vs OFF
+> = 3.52×. Every kernel is now <2× of `-O2` except **fib (2.93×)** — irreducible
+> recursive call/prologue overhead, which inlining cannot help; diminishing
+> returns, left alone. Numbers: `docs/bench_opt_results.md`
+> (`bash scripts/bench_opt.sh`; `rm -rf build/fuzz_ad_codegen` first).
+> Measure on a QUIET host — the previously-committed 2.49× was a stale,
+> under-load measurement, not a real regression.
+>
+> **This track is therefore on HOLD**, behind Firefox + interactive-OS QA per the
+> user's sequencing. Do not open a new optimizer agent unless the user
+> re-prioritizes. Default codegen (flag OFF) stays byte-identical to the seed.
+
+The stale Python-era progression below (4.28× `-O0` → 3.47× `-O1` → 3.03× `-O2`,
+geomean of `-O2`) is the **frozen Python seed's** asm-level passes, kept only as a
+baseline + differential oracle. It is NOT the product optimizer.
 
 - [x] **Increment 1 — `-O1` peephole optimizer (LANDED 2026-06-20).**
   `adder/compiler/peephole_x86.py`, gated behind `adder compile -O1` (default
@@ -422,20 +438,26 @@ array-address-bound) which want LICM/CSE on a real IR.
   `-O1` peephole, and it captures the single biggest win (memory round-trips)
   the IR was wanted for. The from-AST IR + the remaining IR-level passes below
   are still the next increment.
-- [ ] **Step 0 — introduce a minimal IR.** Today's backend is single-pass,
-  no IR (`adder/compiler/codegen_x86.py`); the `-O1`/`-O2` passes work on
-  emitted asm text. A basic-block + virtual-register IR between AST and x86
-  emission would enable LICM/CSE (below) which the asm-level passes can't
-  express across control flow. (Reusable if LLVM is ever adopted — see
-  Decision points.)
-- [ ] **Loop-invariant code motion + strength reduction.** Hoist
-  invariant base addresses; strength-reduce index math like `i*DIM+k`.
-  Directly attacks the largest `-O2` gaps (mmul 7.8×, collatz 6.8×).
-- [ ] **CSE + simple inlining** of small leaf functions (`putc`, leaf
-  recursion).
-- [ ] **Validate:** every pass must preserve results — gate on the fuzzer
-  (Track 2) + `scripts/bench_adder_host.sh` correctness check; track the
-  Adder/`-O2` ratio falling in `docs/bench_adder_host.md`.
+The three steps below were the *Python-track* plan. They were **superseded by the
+2026-06-21 redirect and are now DONE natively in Adder** (`adder/compiler/{ir,cfg,opt,regalloc}.ad`,
+STATUS T4/T8/T18/T18b) — the IR, LICM, CSE, DCE, copy-prop and linear-scan regalloc all
+live in the self-hosted compiler and run on-device. Kept here only so the history reads
+straight; do NOT implement them in Python.
+
+- [x] ~~**Step 0 — introduce a minimal IR.**~~ Done in Adder: basic-block + value IR
+  (`ir.ad`) + whole-function CFG/liveness (`cfg.ad`).
+- [x] ~~**Loop-invariant code motion + strength reduction.**~~ LICM landed (`opt.ad`,
+  zero-trip/trap-safe). Strength reduction not separately needed to hit the target.
+- [x] ~~**CSE + simple inlining.**~~ Cross-statement CSE on extended basic blocks landed
+  (with conservative aliasing-store invalidation). Inlining not needed to hit ≤2×.
+- [x] **Validate:** every pass preserves results — gated on the fuzzer's `ADDER_OPT=1`
+  correctness lane, flag-off objdiff byte-identity, and `scripts/bench_opt.sh`'s
+  per-kernel checksum equality (a miscompiling kernel is excluded from the speed
+  table, not timed). Ratio tracked in `docs/bench_opt_results.md`.
+
+**Remaining (only if the user re-prioritizes perf):** a full IR-consuming backend
+(IR coverage is ~87% of binary-op roots today; the rest still falls back to the
+stack-machine emit path), and instruction-selection IR (#493+).
 
 ## CI / verification gap
 
