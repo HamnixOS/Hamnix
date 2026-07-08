@@ -165,8 +165,11 @@ check "system survived OOM kill" \
 # PART C — rmap + active/inactive LRU + LRU-driven reclaim
 check "rmap records the anon page's mapper" \
       "[mm] PASS: rmap records mapper for anon page"
+# The DELTA, not the absolute total: the LRU legitimately still holds the
+# boot tasks' COW-shared (mapcount>1, hence unevictable) anon pages, so an
+# absolute "32 pages on LRU" was never a well-formed expectation.
 check "fault-in populates the LRU" \
-      "[mm] PASS: 32 pages on LRU after fault-in"
+      "[mm] PASS: fault-in added 32 pages to LRU"
 check "second-chance promotes referenced pages" \
       "[mm] PASS: referenced pages promoted not evicted"
 check "LRU-shrink evicts cold pages via rmap" \
