@@ -28,6 +28,7 @@
 # Fail marker:  [test_mm] FAIL
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,7 +40,25 @@ echo "[test_mm] (1/3) Build userland (init)"
 bash scripts/build_user.sh >/dev/null
 
 echo "[test_mm] (2/3) Build kernel with /etc/mm-test marker"
-INIT_ELF=build/user/init.elf ENABLE_MM_TEST=1 \
+# HAMNIX_DEFAULT_REAL_DEBIAN=0 is LOAD-BEARING, not an optimisation.
+#
+# build_initramfs.py defaults that knob to 1, which stages the whole
+# debootstrap Debian closure (766 of 1297 cpio entries) into the initramfs
+# blob that gets linked INTO the kernel ELF. That pushes build/hamnix-kernel.elf
+# to ~337 MiB — and this test deliberately boots with `-m 256M` to create memory
+# pressure, so GRUB cannot load the image at all:
+#
+#     Booting `Hamnix'
+#     error: out of memory.
+#     error: you need to load the kernel first.
+#     Failed to boot both default and fallback entries.
+#
+# Every [mm] marker is then absent and every assertion below "fails". This gate
+# has therefore been unrunnable on any checkout that has the Debian fixture
+# staged (i.e. the normal developer machine), which is why the #471
+# straddling-alias assertion could never be gated. The mm self-test is a pure
+# KERNEL test — it needs no Debian userland.
+INIT_ELF=build/user/init.elf ENABLE_MM_TEST=1 HAMNIX_DEFAULT_REAL_DEBIAN=0 \
     python3 scripts/build_initramfs.py >/dev/null
 python3 -m compiler.adder compile \
     --target=x86_64-bare-metal \
@@ -50,8 +69,18 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
 
 echo "[test_mm] (3/3) Boot QEMU and run the memory-pressure self-test"
+# Use KVM when the host offers it. Under pure TCG this kernel (a ~350 MiB ELF,
+# GRUB-ISO-wrapped by _kernel_iso.sh because QEMU's multiboot1 loader rejects
+# ELFCLASS64) does not reach the self-test inside 180 s on a loaded host — the
+# run then produces ZERO [mm] markers and every assertion below "fails",
+# which reads as a catastrophic mm regression when nothing regressed at all.
+KVM_ARGS=""
+if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    KVM_ARGS="-enable-kvm -cpu host"
+fi
 set +e
 timeout 180s qemu-system-x86_64 \
+    $KVM_ARGS \
     -kernel "$ELF" \
     -smp 1 \
     -nographic \
@@ -66,6 +95,33 @@ set -e
 echo "[test_mm] --- mm self-test output ---"
 grep -E "\[mm\]|\[swap\]|\[reclaim\]|\[oom\]" "$LOG" || true
 echo "[test_mm] --- end ---"
+
+# INCONCLUSIVE, not FAIL, when the guest produced NOTHING.
+#
+# Every assertion below is of the form "marker X absent -> FAIL". If the boot
+# never reached the self-test at all (host starved the VM and `timeout` killed
+# a still-running QEMU), EVERY marker is absent and the script reports a dozen
+# substantive mm failures — swap broken, OOM broken, interval tree broken. That
+# is a FALSE RED, and it is indistinguishable from a real regression by exit
+# code alone. Observed 2026-07-08: with three QEMU-heavy agents on the host and
+# no KVM, this gate reported total mm collapse while nothing had regressed.
+#
+# The discriminator is whether we OBSERVED anything: zero markers + rc=124 means
+# we watched nothing happen, which supports no verdict. See docs/TEST_VERDICTS.md.
+markers=$(grep -c -E "\[mm\]|\[swap\]|\[reclaim\]|\[oom\]" "$LOG" || true)
+if [ "$markers" -eq 0 ]; then
+    echo "[test_mm] qemu rc=$rc, kvm='${KVM_ARGS:-none}'"
+    tail -20 "$LOG" | strings
+    if [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "test_mm_pressure" \
+            "the guest emitted ZERO [mm] markers and qemu was killed by timeout" \
+            "(rc=124) — the self-test never ran, so nothing was observed." \
+            "Re-run on a QUIET host; if it repeats there, the boot is genuinely wedged."
+    fi
+    verdict_fail "test_mm_pressure" \
+        "the guest emitted ZERO [mm] markers and qemu exited on its own (rc=$rc)" \
+        "— an observed early exit before the self-test."
+fi
 
 fail=0
 
