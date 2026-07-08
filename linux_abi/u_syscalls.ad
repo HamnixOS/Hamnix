@@ -742,7 +742,8 @@ from kernel.block.blk import blk_read_sectors
 # BSP's inherited 1 GiB identity stamp; M16.36 makes each user-owned
 # region present in the task's OWN PML4 as a private 4 KiB PTE chain.
 from fs.elf import elf_install_user_heap, vm_map_user_page
-from arch.x86.kernel.time import get_jiffies, tsc_monotonic_ns, HZ
+from arch.x86.kernel.time import get_jiffies, tsc_monotonic_ns, HZ, \
+    register_linux_futex_tick_hook
 # membarrier(2): MEMBARRIER_CMD_GLOBAL / PRIVATE_EXPEDITED issue a real
 # system-wide memory barrier — a local fence plus an all-but-self IPI that
 # forces every other online CPU through a serialising interrupt entry.
@@ -876,6 +877,10 @@ extern def cpu_relax()
 # time.ad's preempt_tick gate).
 extern def spinlock_lock(ptr: Ptr[uint32])
 extern def spinlock_unlock(ptr: Ptr[uint32])
+# Returns 1 if the lock was acquired, 0 if it was already held. Used by the
+# IRQ-context bounded-futex-park sweep, which must never block on a lock a
+# preempted task holds on this same CPU.
+extern def spinlock_trylock(ptr: Ptr[uint32]) -> uint32
 # msync_selftest runs at boot:37.msy, BEFORE syscall_init (boot:39) arms
 # IA32_EFER.NXE. Shared-writable file pages are WRITABLE NX DATA, so a
 # data access would otherwise take a reserved-bit #PF. Arm NXE first
@@ -11781,6 +11786,31 @@ futex_tag:    Array[512, int32]
 # whether the permanently-parked Firefox thread was in a TIMED wait (=> the
 # missing-timeout ABI gap) or an untimed one (=> a genuine missing wake).
 futex_timed:  Array[512, int32]
+# Per-slot BOUNDED-PARK deadline, in jiffies (0 = "no deadline": a poll-yield
+# or futex_waitv registration, which self-heals by re-reading *uaddr).
+#
+# WHY THIS EXISTS (the Firefox hang root cause, half 2 of 2). The bounded park
+# calls wq_wait_commit_timeout(&futex_wq, FUTEX_PARK_TICKS), whose deadline is
+# only ever evaluated by the PARKED TASK ITSELF, in its own loop. But that loop
+# only spins while `_another_task_ready() == 0` (the sti;hlt idle arm). The
+# instant ANY other task is runnable, the parked task calls schedule() and is
+# switched out in STATE_WAIT — and `_pick_next` never selects a STATE_WAIT task,
+# and no timer wheel exists to re-ready it. So on a BUSY box the "bounded" park
+# is in fact INFINITE and the advertised lost-wake self-heal NEVER RUNS.
+#
+# A small thread group (weston-terminal, foot: 2-4 threads) quiesces the box, so
+# the hlt arm runs and the timeout does fire — which is exactly why they never
+# hit this and Firefox (12-42 threads, something always runnable) always does.
+#
+# Fix, scoped to Layer 2 (no scheduler surgery): record each bounded parker's
+# deadline here and have _futex_sweep_expired() — run at every SYS_futex entry,
+# i.e. thousands of times a second in any threaded client — directed-wake any
+# parker whose interval elapsed. The woken task re-reads *uaddr and either
+# returns (lost-wake self-heal, as designed) or re-parks for another interval.
+futex_deadline: Array[512, uint64]
+# Count of live registrations carrying a non-zero futex_deadline. Lets the
+# per-tick sweep bail out with a single load when nothing is bounded-parked.
+_futex_nparked: uint64 = 0
 # DIAG(ff-futex, probe b): bounded dedup ring of the last N distinct uaddrs
 # that a FUTEX_WAKE issued while matching ZERO table waiters. A zero-match
 # private wake on the stuck uaddr == the waker RAN but its key MIS-MATCHED the
@@ -11885,16 +11915,29 @@ def futexv_claim_slot(uaddr: uint64, vec_idx: int32, private: int32) -> int32:
     # uaddr clears the matching slot just like a single-uaddr waiter. The
     # slot is keyed via _futex_key (private -> (mm,VA); shared -> phys) so a
     # cross-process FUTEX_WAKE matches exactly as a single-uaddr waiter does.
+    #
+    # LOCKING (the Firefox hang root cause, half 1 of 2): the scan-for-free +
+    # claim MUST be atomic against every other slot claimer, so it runs under
+    # _futex_lock — the same lock FUTEX_WAKE / futex_wake_all take. Claiming a
+    # slot unlocked lets two claimers pick the SAME "free" index and one silently
+    # overwrite the other's registration; the overwritten waiter is then parked
+    # in futex(2) yet ABSENT from the wait table, so its FUTEX_WAKE matches zero
+    # waiters and evaporates.
     key: uint64 = _futex_key(uaddr, private)
     my_slot: int32 = cast[int32](current_idx_get())
+    spinlock_lock(&_futex_lock)
     i: uint64 = 0
     while i < FUTEX_NSLOTS:
         if futex_addr[i] == 0:
             futex_addr[i] = key
             futex_slot[i] = my_slot
             futex_tag[i] = vec_idx
+            futex_timed[i] = 0
+            futex_deadline[i] = 0
+            spinlock_unlock(&_futex_lock)
             return cast[int32](i)
         i = i + 1
+    spinlock_unlock(&_futex_lock)
     return -1
 
 
@@ -11903,7 +11946,12 @@ def futexv_slot_woken(slot: int32) -> int32:
     # FUTEX_WAKE / futex_wake_all, 0 if it is still parked.
     if slot < 0:
         return 0
-    if futex_addr[cast[uint64](slot)] == 0:
+    su: uint64 = cast[uint64](slot)
+    if futex_addr[su] == 0:
+        return 1
+    # Defensive: the slot was cleared by a wake and has since been re-claimed by
+    # another task. Our registration is gone either way, so we were woken.
+    if futex_slot[su] != cast[int32](current_idx_get()):
         return 1
     return 0
 
@@ -11915,16 +11963,101 @@ def futexv_slot_tag(slot: int32) -> int32:
     return futex_tag[cast[uint64](slot)]
 
 
+def _futex_free_slot_locked(su: uint64):
+    # Vacate one table slot. Caller holds _futex_lock.
+    if futex_deadline[su] != 0:
+        if _futex_nparked != 0:
+            _futex_nparked = _futex_nparked - 1
+    futex_addr[su] = 0
+    futex_slot[su] = -1
+    futex_tag[su] = 0
+    futex_timed[su] = 0
+    futex_deadline[su] = 0
+
+
+def _futex_release_owned(su: uint64, my_slot: int32) -> int32:
+    # Release table slot `su` ONLY if this task still owns it. Returns 1 if we
+    # released our own live registration, 0 if the slot was already vacated (a
+    # real FUTEX_WAKE cleared it) or has since been re-claimed by another task.
+    #
+    # The ownership test is what makes the release race-free: a bare
+    # `futex_addr[su] = 0` would clobber whoever legitimately owns the slot now.
+    spinlock_lock(&_futex_lock)
+    owned: int32 = 0
+    if futex_addr[su] != 0 and futex_slot[su] == my_slot:
+        owned = 1
+        _futex_free_slot_locked(su)
+    spinlock_unlock(&_futex_lock)
+    return owned
+
+
+def _futex_claim_slot_locked(key: uint64, my_slot: int32,
+                             timed: int32, deadline: uint64) -> int32:
+    # Scan for a free table slot and claim it for the current task. Caller
+    # holds _futex_lock. Returns the slot index, or -1 when the table is full.
+    i: uint64 = 0
+    while i < FUTEX_NSLOTS:
+        if futex_addr[i] == 0:
+            futex_addr[i] = key
+            futex_slot[i] = my_slot
+            futex_tag[i] = 0
+            futex_timed[i] = timed
+            futex_deadline[i] = deadline
+            if deadline != 0:
+                _futex_nparked = _futex_nparked + 1
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _futex_sweep_expired():
+    # Bounded-park watchdog — THE CLOCK the blocking FUTEX_WAIT arm needs.
+    #
+    # Directed-wake every parker whose FUTEX_PARK_TICKS recheck interval has
+    # elapsed. See futex_deadline's comment: a STATE_WAIT task on a busy box can
+    # NEVER run its own deadline check (schedule() switched it out and
+    # _pick_next won't pick a STATE_WAIT task), so an independent agent must do
+    # it. Registered as the arch timer's linux_futex_tick_hook, so it runs at
+    # HZ regardless of what userspace is doing; also called on SYS_futex entry
+    # so the common case is serviced without waiting for a tick.
+    #
+    # IRQ-CONTEXT SAFETY: _futex_lock is a plain (non-IRQ-saving) spinlock, so a
+    # timer IRQ can land on a CPU that already holds it. TRYLOCK and skip the
+    # tick on contention — the next tick (10 ms) retries, and the FUTEX_WAKE /
+    # WAIT critical sections are a few hundred cycles long.
+    #
+    # We deliberately do NOT clear futex_addr[]: the woken task must observe
+    # "slot still mine" and treat this as a TIMEOUT/recheck, not as a real
+    # FUTEX_WAKE. It re-reads *uaddr and either returns (the lost- or elided-
+    # wake self-heal) or re-registers with a fresh deadline.
+    if _futex_nparked == 0:
+        return
+    if spinlock_trylock(&_futex_lock) == 0:
+        return
+    now: uint64 = get_jiffies()
+    i: uint64 = 0
+    while i < FUTEX_NSLOTS:
+        if futex_addr[i] != 0 and futex_deadline[i] != 0:
+            if now >= futex_deadline[i]:
+                ws: int32 = futex_slot[i]
+                futex_deadline[i] = 0
+                if _futex_nparked != 0:
+                    _futex_nparked = _futex_nparked - 1
+                if ws >= 0:
+                    wq_wake_slot(cast[uint64](ws))
+        i = i + 1
+    spinlock_unlock(&_futex_lock)
+
+
 def futexv_release_slot(slot: int32):
     # Vacate a table slot the waitv path claimed (used to unwind all the
     # OTHER registered slots once one of them woke, and to clean up on an
     # early-return enqueue mismatch). Idempotent on an already-free slot.
+    # Under _futex_lock, and ownership-checked, so we can never clobber a
+    # registration that a concurrent claimer has since installed in this slot.
     if slot < 0:
         return
-    su: uint64 = cast[uint64](slot)
-    futex_addr[su] = 0
-    futex_slot[su] = -1
-    futex_tag[su] = 0
+    _futex_release_owned(cast[uint64](slot), cast[int32](current_idx_get()))
 
 
 def futex_wake_all(uaddr: uint64) -> int32:
@@ -11953,8 +12086,7 @@ def futex_wake_all(uaddr: uint64) -> int32:
     while i < FUTEX_NSLOTS:
         if futex_addr[i] == key:
             wslot: int32 = futex_slot[i]
-            futex_addr[i] = 0
-            futex_slot[i] = -1
+            _futex_free_slot_locked(i)
             if wslot >= 0:
                 wq_wake_slot(cast[uint64](wslot))
             woke = woke + 1
@@ -12015,6 +12147,11 @@ def u_syscalls_init():
     # clone()d pthread's exit unblocks pthread_join's FUTEX_WAIT loop
     # WITHOUT the scheduler statically depending on this Layer-2 file.
     register_cleartid_wake_hook(futex_wake_all)
+    # Publish the bounded-futex-park sweep to the arch timer. Without this the
+    # large-thread-group FUTEX_WAIT park has no clock: a STATE_WAIT task cannot
+    # service its own recheck deadline once schedule() has switched it out, so
+    # an elided/lost FUTEX_WAKE would park a Firefox thread forever.
+    register_linux_futex_tick_hook(_futex_sweep_expired)
     printk0("[u_syscalls] CLEARTID futex-wake hook registered\n")
     # U27: initialise the global futex sleeper wait queue (empty head).
     wq_init(&futex_wq)
@@ -12069,6 +12206,13 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
     # in %rdi across this syscall and re-CASes after wake (see
     # arch/x86/kernel/syscall_64.S — we preserve %rdi only for FUTEX
     # to make musl pthread mutex contention work).
+    # Bounded-park watchdog: service any parked waiter whose FUTEX_PARK_TICKS
+    # recheck interval elapsed. A STATE_WAIT task cannot run its own deadline
+    # check on a busy box (see futex_deadline), so every futex caller does a
+    # sweep on the way in. Cheap (a 512-entry scan), and threaded clients call
+    # futex constantly, so a lost wake now costs a recheck interval rather than
+    # the process's life.
+    _futex_sweep_expired()
     op: uint64 = a1 & FUTEX_OP_MASK
     # TIMEOUT DISCRIMINATOR (read from the RAW op before folding). The Linux
     # futex(2) timeout arg (a3) means RELATIVE for a bare FUTEX_WAIT (op 0) and
@@ -12205,42 +12349,44 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
             # (futex_wake_all) OR the user value moves off `val`. We re-check
             # *uaddr each iteration so a missed / elided wake is a one-yield
             # delay — the microsecond cadence render-critical clients need.
+            # Slot claim runs under _futex_lock. Previously this arm scanned and
+            # claimed UNLOCKED, so a poll-yielder could hand out a slot index
+            # that a bounded parker was concurrently claiming under the lock,
+            # then stamp its own key over the parker's registration — leaving
+            # that parker blocked in futex(2) yet INVISIBLE to FUTEX_WAKE. On
+            # exit it did a bare `futex_addr[py_su] = 0`, clobbering whatever
+            # registration then occupied the slot. Both are lost-wake generators
+            # and both are fixed by locking + an ownership-checked release.
             py_slot: int32 = cast[int32](current_idx_get())
-            py_i: uint64 = 0
-            py_spot: int32 = -1
-            while py_i < FUTEX_NSLOTS:
-                if futex_addr[py_i] == 0:
-                    py_spot = cast[int32](py_i)
-                    py_i = FUTEX_NSLOTS
-                else:
-                    py_i = py_i + 1
+            py_timed: int32 = 0
+            if a3 != 0:
+                py_timed = 1
+            spinlock_lock(&_futex_lock)
+            py_spot: int32 = _futex_claim_slot_locked(_futex_key(a0, priv),
+                                                      py_slot, py_timed, 0)
+            spinlock_unlock(&_futex_lock)
             if py_spot < 0:
                 return ELINUX_AGAIN
             py_su: uint64 = cast[uint64](py_spot)
-            futex_addr[py_su] = _futex_key(a0, priv)
-            futex_slot[py_su] = py_slot
-            if a3 != 0:
-                futex_timed[py_su] = 1
-            else:
-                futex_timed[py_su] = 0
             do:
                 yield_to_others()
+                # Unlocked fast read: a cleared / re-owned slot means a real
+                # FUTEX_WAKE already took us off the table.
                 if futex_addr[py_su] == 0:
                     break
+                if futex_slot[py_su] != py_slot:
+                    break
                 if get_user_32(a0, &cur) != 0:          # #163
-                    futex_addr[py_su] = 0
-                    futex_slot[py_su] = -1
+                    _futex_release_owned(py_su, py_slot)
                     return ELINUX_EFAULT
                 if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
-                    futex_addr[py_su] = 0
-                    futex_slot[py_su] = -1
+                    _futex_release_owned(py_su, py_slot)
                     break
                 # Timed wait: honour the deadline (Linux -ETIMEDOUT). Untimed
                 # (_has_deadline==0) never takes this branch, so the render-
                 # critical elided-wake cadence is unchanged.
                 if _has_deadline != 0 and tsc_monotonic_ns() >= _deadline_ns:
-                    futex_addr[py_su] = 0
-                    futex_slot[py_su] = -1
+                    _futex_release_owned(py_su, py_slot)
                     return ELINUX_TIMEDOUT
             while 1
             return 0
@@ -12298,28 +12444,22 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
             if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
                 spinlock_unlock(&_futex_lock)
                 return 0
-            # Claim a table slot — the WAKE side matches waiters on it.
-            spot: int32 = -1
-            i: uint64 = 0
-            while i < FUTEX_NSLOTS:
-                if futex_addr[i] == 0:
-                    spot = cast[int32](i)
-                    i = FUTEX_NSLOTS
-                else:
-                    i = i + 1
+            # Claim a table slot — the WAKE side matches waiters on it. Record
+            # the bounded-park deadline so _futex_sweep_expired() (run by any
+            # other task entering SYS_futex) can service our recheck interval:
+            # once we are STATE_WAIT and schedule() runs, we cannot service it
+            # ourselves — _pick_next never selects a STATE_WAIT task.
+            bp_timed: int32 = 0
+            if a3 != 0:
+                bp_timed = 1
+            spot: int32 = _futex_claim_slot_locked(wait_key, my_slot, bp_timed,
+                                                   get_jiffies() + FUTEX_PARK_TICKS)
             if spot < 0:
                 # Table full (extreme vector-wait fan-out) — degrade to
                 # EAGAIN; glibc/musl re-try the cmpxchg in userspace.
                 spinlock_unlock(&_futex_lock)
                 return ELINUX_AGAIN
             su: uint64 = cast[uint64](spot)
-            futex_addr[su] = wait_key
-            futex_slot[su] = my_slot
-            # DIAG(ff-futex): a3 (timeout ptr) non-null => this is a TIMED wait.
-            if a3 != 0:
-                futex_timed[su] = 1
-            else:
-                futex_timed[su] = 0
             # Prepare-to-wait: link onto futex_wq + STATE_WAIT, still under
             # _futex_lock so no wake can slip in before we commit to sleep.
             wq_wait_prepare(&futex_wq)
@@ -12327,14 +12467,12 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
             # first recheck and prepare): a wake OR a value-move here means
             # cancel the prepared wait and return without sleeping.
             if get_user_32(a0, &cur) != 0:              # #163
-                futex_addr[su] = 0
-                futex_slot[su] = -1
+                _futex_free_slot_locked(su)
                 wq_wait_cancel(&futex_wq)
                 spinlock_unlock(&_futex_lock)
                 return ELINUX_EFAULT
             if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
-                futex_addr[su] = 0
-                futex_slot[su] = -1
+                _futex_free_slot_locked(su)
                 wq_wait_cancel(&futex_wq)
                 spinlock_unlock(&_futex_lock)
                 return 0
@@ -12349,9 +12487,11 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
             spinlock_lock(&_futex_lock)
             cleared: int32 = 0
             if futex_addr[su] == 0:
-                cleared = 1
-            futex_addr[su] = 0
-            futex_slot[su] = -1
+                cleared = 1                             # a real FUTEX_WAKE
+            elif futex_slot[su] != my_slot:
+                cleared = 1                             # cleared, then re-owned
+            else:
+                _futex_free_slot_locked(su)             # still ours: vacate it
             spinlock_unlock(&_futex_lock)
             if cleared != 0:
                 return 0                                # real FUTEX_WAKE
@@ -12395,8 +12535,7 @@ def _u_futex(a0: uint64, a1: uint64, a2: uint64,
         while i < FUTEX_NSLOTS:
             if futex_addr[i] == wake_key and cast[uint64](woke) < max_wake:
                 wslot: int32 = futex_slot[i]
-                futex_addr[i] = 0
-                futex_slot[i] = -1
+                _futex_free_slot_locked(i)
                 if wslot >= 0:
                     wq_wake_slot(cast[uint64](wslot))
                 woke = woke + 1
