@@ -575,10 +575,14 @@ Open blockers (agent-owned):
 - [ ] **`-smp 2` guest wedge** — an idle shell (and any pipeline) halts in
   `kernel/sched/core.ad::yield_to_others`; `-smp 1` fine. Repro is 70 s / one
   command; suspect #413 steal-window. See [[project_smp2_idle_wedge]] in memory.
-- [ ] **Firefox last mile** — futex fix cleared the wedge; Firefox now realizes
-  full GTK chrome but never calls `wl_compositor.create_surface`. Downstream of
-  GTK realize, non-futex. vDSO `clock_gettime` is unversioned → syscall-traps
-  every call (~1240/boot), being fixed.
+- [ ] **Firefox last mile** — futex fix cleared the wedge; Firefox now REACHES
+  `wl_compositor.create_surface` (x2) then stops with no `xdg_wm_base` request at
+  all. Creates the `wl_surface` at GDK *realize* but never advances to *map*
+  (`gdk_wayland_window_map` → `gdk_wayland_window_create_xdg_surface`, GDK3).
+  Client-side; compositor is xdg-ready. (The vDSO/~1240-trap theory was a red
+  herring — 13 traps either way, glibc already uses the fast path; vdso work
+  preserved unmerged on `worktree-agent-a97e5b76315365853`.) Next: get MOZ_LOG
+  out of the forked child; find why GDK realize never maps.
 - [ ] `ls /dev` hardcodes `blk`, so a stripped (non-hostowner) namespace names a
   path it cannot open (`lsblk` fails). Fix via mount-table synthesis, NOT by
   re-binding `/dev/blk` (that undoes a security boundary).
