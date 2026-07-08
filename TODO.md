@@ -461,6 +461,15 @@ stack-machine emit path), and instruction-selection IR (#493+).
 
 ## CI / verification gap
 
+- [ ] **CI must build the shipped image.** Nothing in CI runs
+  `build_installer_img.sh`, so the image build sat BROKEN (`mkfs.ext4:
+  Could not allocate block`) until a QA pass tripped over it —
+  `HAMNIX_ROOTFS_SIZE_MB` was pinned at 512 MiB while the Debian fixture
+  closure grew to 555 MiB staged. Fixed in `106b9ebb` (auto-size + a
+  512 MiB floor), but the *class* of bug recurs: add a CI job that builds
+  the installer image on every push. A pinned size constant that silently
+  stops tracking a growing input is exactly the "regression-prone, needs a
+  test" pattern.
 - [ ] **Gate the two real boot paths in CI.** Today `ci.yml` gates 14
   tests, all `-kernel` multiboot (only `test_efi_gop` touches OVMF, and
   only checks pixels). Add as gates: `test_installer_boot_heartbeat.sh`
