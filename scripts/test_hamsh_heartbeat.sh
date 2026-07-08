@@ -22,6 +22,7 @@
 # follow — i.e. the idle loop keeps getting CPU.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -73,17 +74,47 @@ rc=$?
 set -e
 
 echo "[test_hamsh_heartbeat] (3/3) Assertions"
+TAG=test_hamsh_heartbeat
 
-# Sanity: the prompt actually came up. This is the load-bearing
-# requirement — if stage-07 is absent the kernel/userland is genuinely
-# wedged before the REPL, no amount of waiting will help. Don't relax
-# this one.
+# Sanity: the prompt actually came up.
+#
+# If stage-07 is absent we must be careful about what we can honestly
+# claim. Two very different worlds produce that same observation:
+#
+#   (a) the kernel/userland is genuinely wedged before the REPL, OR
+#   (b) the boot was simply still crawling when our host wall-clock
+#       window closed (the historical note below documents exactly
+#       this: "0 heartbeat lines on first run, 24-26 on the immediate
+#       retry without code changes").
+#
+# From "stage-07 absent" alone these are INDISTINGUISHABLE. The
+# discriminator is HOW QEMU died:
+#
+#   * rc != 124  -> QEMU exited on its own before the prompt. We
+#                   OBSERVED a crash / early exit. That is a real FAIL.
+#   * rc == 124  -> `timeout` killed a still-running QEMU. We observed
+#                   nothing except that it hadn't finished booting yet.
+#                   INCONCLUSIVE.
+#
+# Note what this is NOT: it is not a licence to ignore a wedge. An
+# INCONCLUSIVE never counts as a pass, run_gate.sh retries it once, and
+# gate_summary.sh renders the whole battery as NOT VERIFIED. A genuine
+# boot wedge produces INCONCLUSIVE *every* time, including on a quiet
+# host, which is the signal to go look. The previous code's response to
+# this same ambiguity was to stretch the timeout 90s -> 180s until the
+# flake went away; that hid the ambiguity instead of reporting it.
 if ! grep -F -q "[hamsh:stage-07] loop-enter" "$LOG"; then
-    echo "[test_hamsh_heartbeat] FAIL: hamsh never reached the interactive" \
-         "loop (stage-07 marker absent — boot wedged before the prompt)"
     echo "[test_hamsh_heartbeat] qemu rc=$rc timeout=${HEARTBEAT_TIMEOUT}s"
     tail -50 "$LOG" | strings
-    exit 1
+    if [ "$rc" -ne 124 ]; then
+        verdict_fail "$TAG" "hamsh never reached the interactive loop" \
+            "(stage-07 marker absent) and qemu exited on its own with" \
+            "rc=$rc — an observed crash before the prompt."
+    fi
+    verdict_inconclusive "$TAG" "boot had not reached stage-07 when the" \
+        "${HEARTBEAT_TIMEOUT}s window closed (qemu rc=124, still running)." \
+        "Cannot distinguish a wedged kernel from a host-starved boot." \
+        "If this repeats on a QUIET host, treat it as a wedge and debug it."
 fi
 
 # Count heartbeat ticks (total lines + distinct tick numbers).
@@ -106,21 +137,21 @@ fi
 # tick fires before host timeout. Hence the observed flake.
 #
 # Two-tier check:
-#   1. HARD: stage-07 reached. Same as before (above).
-#   2. SOFT: ≥2 distinct tick values within window. ≥2 implies the
-#      rearm path in _hb_check_and_emit ran at least once (so a
-#      tick=0-forever rearm bug still fails). Under quiet conditions
-#      we'd see 0..25; under load we may see only 0,1 (or even just 1
-#      since tick=0 is NOT emitted — see _hb_check_and_emit, which
-#      seeds and returns silently on first call). If we see <2 AND
-#      stage-07 was reached AND QEMU exited via timeout (rc=124, the
-#      normal exit — no shutdown command in the test), treat as
-#      "INCONCLUSIVE under host contention" rather than FAIL. The
-#      heartbeat semantic is genuinely unobservable in that window;
-#      shouting FAIL creates the false-positive boot regressions that
-#      cost orchestrator cycles. A real shell-starvation bug would
-#      ALSO take down the rest of the test suite, which is the
-#      defence-in-depth here.
+#   1. stage-07 reached (above).
+#   2. ≥2 distinct tick values within window. ≥2 implies the rearm path
+#      in _hb_check_and_emit ran at least once (so a tick=0-forever
+#      rearm bug still fails). Under quiet conditions we'd see 0..25;
+#      under load we may see only 0,1 (or even just 1 since tick=0 is
+#      NOT emitted — see _hb_check_and_emit, which seeds and returns
+#      silently on first call).
+#
+# Zero ticks means the heartbeat semantic was NEVER OBSERVED. The old
+# code called that "PASS (inconclusive: ...)" and exited 0, which is a
+# contradiction in terms and precisely the false green this project
+# keeps getting burned by: the entire purpose of this canary is to
+# observe heartbeat cadence, so a run that observed none proved
+# NOTHING. It is now reported as INCONCLUSIVE (exit 125) — not a pass,
+# not a code failure. See scripts/_verdict.sh.
 tick_count=$(grep -F -c "[hamsh-alive] tick=" "$LOG" || true)
 distinct_ticks=$(grep -Eo "\[hamsh-alive\] tick=[0-9]+ " "$LOG" \
                  | sort -u | wc -l || true)
@@ -132,35 +163,38 @@ echo "[test_hamsh_heartbeat] observed $tick_count heartbeat lines," \
 # emitted, but the rearm-on-next-jiffies path never advanced. This is
 # a different failure shape than "no ticks at all" and IS a hard fail.
 if [ "$tick_count" -gt 0 ] && [ "$distinct_ticks" -lt 2 ]; then
-    echo "[test_hamsh_heartbeat] FAIL: $tick_count heartbeat lines but only" \
-         "$distinct_ticks distinct tick value(s). The idle poll loop emitted" \
-         "but never rearmed — likely a heartbeat-rearm regression in" \
-         "_hb_check_and_emit (hb_next_jiffies not advancing) or a" \
-         "tick=0-forever corruption."
     echo "[test_hamsh_heartbeat] --- tail ---"
     tail -50 "$LOG" | strings
-    exit 1
+    verdict_fail "$TAG" "$tick_count heartbeat lines but only" \
+        "$distinct_ticks distinct tick value(s). The idle poll loop emitted" \
+        "but never rearmed — likely a heartbeat-rearm regression in" \
+        "_hb_check_and_emit (hb_next_jiffies not advancing) or a" \
+        "tick=0-forever corruption. OBSERVED, and wrong."
 fi
 
-# No heartbeats at all + stage-07 reached + clean timeout exit = host
-# contention starved the guest timer; the shell never got enough guest
-# CPU for HB_PERIOD_JIFFIES of guest time to elapse before our host
-# wall-clock window closed. Inconclusive, not a failure.
+# No heartbeats at all.
+#
+#   rc != 124 -> QEMU exited on its own at or just after the prompt: an
+#                OBSERVED crash. FAIL.
+#   rc == 124 -> `timeout` killed a live QEMU. The guest's jiffies
+#                counter never advanced HB_PERIOD_JIFFIES within our
+#                host wall-clock window. We did not observe a heartbeat
+#                and we did not observe its absence-under-fair-scheduling
+#                either. INCONCLUSIVE — say so, and exit 125.
 if [ "$tick_count" -eq 0 ]; then
-    if [ "$rc" -eq 124 ]; then
-        echo "[test_hamsh_heartbeat] PASS (inconclusive: 0 heartbeats but" \
-             "stage-07 reached AND qemu rc=124 — guest timer likely starved" \
-             "by concurrent host load; retry on a quiet host to confirm" \
-             "heartbeat cadence)"
-        exit 0
-    fi
-    echo "[test_hamsh_heartbeat] FAIL: 0 heartbeats and qemu rc=$rc" \
-         "(non-timeout exit — kernel/userland likely crashed at or just" \
-         "after the prompt). This is NOT the host-contention case."
     echo "[test_hamsh_heartbeat] --- tail ---"
     tail -50 "$LOG" | strings
-    exit 1
+    if [ "$rc" -ne 124 ]; then
+        verdict_fail "$TAG" "0 heartbeats and qemu rc=$rc (non-timeout exit" \
+            "— kernel/userland crashed at or just after the prompt)." \
+            "This is NOT the host-contention case."
+    fi
+    verdict_inconclusive "$TAG" "0 heartbeats observed in ${HEARTBEAT_TIMEOUT}s." \
+        "stage-07 was reached and qemu was still running when the window" \
+        "closed (rc=124) — the guest timer was probably starved by host" \
+        "load. The heartbeat cadence this canary exists to check was" \
+        "NEVER OBSERVED, so this run proves nothing about it, either way."
 fi
 
-echo "[test_hamsh_heartbeat] PASS (qemu rc=$rc, $tick_count ticks," \
-     "$distinct_ticks distinct)"
+verdict_pass "$TAG" "qemu rc=$rc, $tick_count heartbeat lines," \
+    "$distinct_ticks distinct tick values (≥2 required: rearm confirmed)"
