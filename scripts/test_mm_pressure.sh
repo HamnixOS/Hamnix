@@ -133,6 +133,8 @@ check "interval-tree height is logarithmic (O(log n), not O(n))" \
       "[mm] PASS: vma tree height="
 check "interval-tree overlap query correct" \
       "[mm] PASS: vma interval-tree overlap query correct"
+check "straddling-alias MAP_FIXED replace (#471 residual)" \
+      "[mm] PASS: vma straddling-alias MAP_FIXED replace"
 check "split keeps tree+list consistent" \
       "[mm] PASS: vma split keeps tree+list consistent"
 check "per-VMA lock: same VMA serializes, distinct VMAs concurrent" \
