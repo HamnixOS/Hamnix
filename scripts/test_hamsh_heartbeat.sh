@@ -58,7 +58,8 @@ trap 'rm -f "$LOG"' EXIT
 # HAMNIX_HEARTBEAT_TIMEOUT=<seconds> for one-off debugging.
 HEARTBEAT_TIMEOUT="${HAMNIX_HEARTBEAT_TIMEOUT:-180}"
 
-set +e
+# boot_arm <ncpus> <logfile> -> echoes qemu's rc; log lands in <logfile>.
+#
 # Pure observation — production boot path with all services running.
 # No input piped in: a fully idle interactive shell MUST still emit
 # heartbeats. If it doesn't, a kernel busy-loop or a userland CPU hog
@@ -69,35 +70,77 @@ set +e
 # matches the installer/rl5 harness budget and leaves GRUB room to load.
 # This gate asserts a WALL-CLOCK cadence (N heartbeat ticks inside a host-timed
 # window), so it MUST run under a hardware accelerator or it cannot distinguish a
-# slow guest from a stopped one.
-#
-# CORRECTION (2026-07-08): it already did. `_build_lock.sh` sources
-# `_kernel_iso.sh`, whose `qemu-system-x86_64` PATH shim injects `-accel kvm`
-# (plus `-cpu host`) whenever /dev/kvm is readable+writable and the caller has not
-# chosen an accelerator. So this gate has always been on KVM on a KVM host, and the
-# `-enable-kvm` below is belt-and-braces: it makes the requirement explicit at the
-# call site and survives anyone invoking this script outside the shim.
-#
-# The consequence matters more than the flag. Two agents (and the orchestrator)
-# read this gate's INCONCLUSIVE at -smp 2 as host starvation. It was not. It was a
-# REAL guest wedge, under KVM, all along — see the -smp 1 vs -smp 2 control in
-# commit 41b5fd0d's message. A canary asserting a wall-clock rate cannot separate
-# "wedged" from "slow"; only a control can. Until this gate grows an -smp 1
-# comparison arm, a repeated INCONCLUSIVE here should be treated as a WEDGE
-# HYPOTHESIS to be tested, never as a verdict about the host.
+# slow guest from a stopped one. In practice the `_kernel_iso.sh` PATH shim
+# (sourced via _build_lock.sh) already injects `-accel kvm -cpu host` when
+# /dev/kvm is usable and no accelerator was chosen; the explicit KVM_ARGS here is
+# belt-and-braces so the requirement is visible at the call site and survives
+# anyone invoking this script outside the shim. Even under KVM a wall-clock canary
+# cannot separate "wedged" from "slow" on its own — that is what the -smp 1
+# CONTROL arm below is for (the comparison the earlier version of this comment
+# said the gate still needed; it now exists).
 KVM_ARGS=""
 if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     KVM_ARGS="-enable-kvm -cpu host"
 fi
-timeout "${HEARTBEAT_TIMEOUT}s" qemu-system-x86_64 \
-    $KVM_ARGS \
-    -kernel "$ELF" -smp 2 -nographic -no-reboot -m 1G \
-    -monitor none -serial stdio < /dev/null > "$LOG" 2>&1
-rc=$?
+
+# boot_arm <ncpus> <logfile> -> echoes qemu's rc; log lands in <logfile>.
+boot_arm() {
+    local ncpus="$1" log="$2" arm_rc=0
+    timeout "${HEARTBEAT_TIMEOUT}s" qemu-system-x86_64 \
+        $KVM_ARGS \
+        -kernel "$ELF" -smp "$ncpus" -nographic -no-reboot -m 1G \
+        -monitor none -serial stdio < /dev/null > "$log" 2>&1 || arm_rc=$?
+    echo "$arm_rc"
+}
+
+tick_lines()    { grep -F -c "[hamsh-alive] tick=" "$1" 2>/dev/null || true; }
+distinct_tick() { grep -Eo "\[hamsh-alive\] tick=[0-9]+ " "$1" 2>/dev/null \
+                  | sort -u | wc -l || true; }
+reached_repl()  { grep -F -q "[hamsh:stage-07] loop-enter" "$1"; }
+
+set +e
+rc=$(boot_arm 2 "$LOG")
 set -e
 
 echo "[test_hamsh_heartbeat] (3/3) Assertions"
 TAG=test_hamsh_heartbeat
+
+# ─── The -smp 1 CONTROL ARM ─────────────────────────────────────────────────
+#
+# WHY THIS EXISTS. Everything below used to collapse "the guest wedged" and
+# "the host was too slow to boot it in time" into a single INCONCLUSIVE,
+# because from a truncated log they are indistinguishable. That ambiguity hid
+# a real, deterministic `-smp 2` kernel wedge for WEEKS: the shared global
+# `quantum_left` meant an AP's idle-loop dispatches kept re-arming the BSP's
+# time slice, so the BSP never preempted and hamsh sat STATE_READY forever
+# (see kernel/sched/core.ad). Every run reported INCONCLUSIVE; nobody looked.
+#
+# The discriminator is a CONTROL: re-run the SAME kernel, SAME window, SAME
+# host, at `-smp 1`. The bug is SMP-only, so:
+#
+#   -smp 1 heartbeats, -smp 2 none  -> the host was demonstrably fast enough.
+#                                      The delta is the kernel. FAIL.
+#   neither arm produces heartbeats -> the host really is starved (or boot is
+#                                      broken for both). INCONCLUSIVE.
+#
+# Only run the control when the -smp 2 arm came up empty; a passing run costs
+# nothing extra.
+# Sets the globals CTRL_LOG / CTRL_RC / CTRL_TICKS and RETURNS 0 ("live") if the
+# -smp 1 control reached the REPL and emitted ≥1 heartbeat, else returns 1
+# ("dead"). MUST be called directly (not in `$(...)`) so the globals survive.
+CTRL_LOG=""; CTRL_RC=""; CTRL_TICKS=0
+smp1_control_is_live() {
+    CTRL_LOG=$(mktemp /tmp/hamsh-heartbeat-smp1.XXXXXX.log)
+    echo "[test_hamsh_heartbeat] -smp 2 came up empty — running the -smp 1" \
+         "control arm to tell a wedge apart from a starved host"
+    set +e
+    CTRL_RC=$(boot_arm 1 "$CTRL_LOG")
+    set -e
+    CTRL_TICKS=$(tick_lines "$CTRL_LOG")
+    echo "[test_hamsh_heartbeat] control: -smp 1 rc=$CTRL_RC" \
+         "heartbeats=$CTRL_TICKS"
+    reached_repl "$CTRL_LOG" && [ "$CTRL_TICKS" -gt 0 ]
+}
 
 # Sanity: the prompt actually came up.
 #
@@ -126,7 +169,7 @@ TAG=test_hamsh_heartbeat
 # host, which is the signal to go look. The previous code's response to
 # this same ambiguity was to stretch the timeout 90s -> 180s until the
 # flake went away; that hid the ambiguity instead of reporting it.
-if ! grep -F -q "[hamsh:stage-07] loop-enter" "$LOG"; then
+if ! reached_repl "$LOG"; then
     echo "[test_hamsh_heartbeat] qemu rc=$rc timeout=${HEARTBEAT_TIMEOUT}s"
     tail -50 "$LOG" | strings
     if [ "$rc" -ne 124 ]; then
@@ -134,10 +177,20 @@ if ! grep -F -q "[hamsh:stage-07] loop-enter" "$LOG"; then
             "(stage-07 marker absent) and qemu exited on its own with" \
             "rc=$rc — an observed crash before the prompt."
     fi
+    # rc == 124: still running at the deadline. Ask the control arm whether
+    # this host can boot the SAME kernel to a live prompt at -smp 1.
+    if smp1_control_is_live; then
+        verdict_fail "$TAG" "-smp 2 never reached stage-07 in" \
+            "${HEARTBEAT_TIMEOUT}s, but the -smp 1 control arm reached the" \
+            "prompt and emitted $CTRL_TICKS heartbeats on this same host in" \
+            "the same window. The host is not the problem — the kernel wedges" \
+            "with more than one CPU. Control log: $CTRL_LOG"
+    fi
     verdict_inconclusive "$TAG" "boot had not reached stage-07 when the" \
-        "${HEARTBEAT_TIMEOUT}s window closed (qemu rc=124, still running)." \
-        "Cannot distinguish a wedged kernel from a host-starved boot." \
-        "If this repeats on a QUIET host, treat it as a wedge and debug it."
+        "${HEARTBEAT_TIMEOUT}s window closed (qemu rc=124, still running)," \
+        "AND the -smp 1 control arm did not reach a live prompt either" \
+        "(rc=$CTRL_RC, $CTRL_TICKS heartbeats) — so the host, not the" \
+        "kernel, is the likely cause. Re-run on a quiet host."
 fi
 
 # Count heartbeat ticks (total lines + distinct tick numbers).
@@ -175,9 +228,8 @@ fi
 # observe heartbeat cadence, so a run that observed none proved
 # NOTHING. It is now reported as INCONCLUSIVE (exit 125) — not a pass,
 # not a code failure. See scripts/_verdict.sh.
-tick_count=$(grep -F -c "[hamsh-alive] tick=" "$LOG" || true)
-distinct_ticks=$(grep -Eo "\[hamsh-alive\] tick=[0-9]+ " "$LOG" \
-                 | sort -u | wc -l || true)
+tick_count=$(tick_lines "$LOG")
+distinct_ticks=$(distinct_tick "$LOG")
 echo "[test_hamsh_heartbeat] observed $tick_count heartbeat lines," \
      "$distinct_ticks distinct tick values"
 
@@ -212,11 +264,23 @@ if [ "$tick_count" -eq 0 ]; then
             "— kernel/userland crashed at or just after the prompt)." \
             "This is NOT the host-contention case."
     fi
+    # rc == 124 and stage-07 WAS reached: the shell came up and then went
+    # quiet. This is the exact signature of the -smp>1 wedge (hamsh parked
+    # STATE_READY on a runqueue whose CPU stopped preempting). The control
+    # arm settles whether the host or the kernel is at fault.
+    if smp1_control_is_live; then
+        verdict_fail "$TAG" "0 heartbeats at -smp 2 after reaching stage-07," \
+            "but the -smp 1 control arm emitted $CTRL_TICKS heartbeats on the" \
+            "same host in the same ${HEARTBEAT_TIMEOUT}s window. The prompt" \
+            "came up and then stopped being scheduled: an SMP wedge, not host" \
+            "starvation. Control log: $CTRL_LOG"
+    fi
     verdict_inconclusive "$TAG" "0 heartbeats observed in ${HEARTBEAT_TIMEOUT}s." \
         "stage-07 was reached and qemu was still running when the window" \
-        "closed (rc=124) — the guest timer was probably starved by host" \
-        "load. The heartbeat cadence this canary exists to check was" \
-        "NEVER OBSERVED, so this run proves nothing about it, either way."
+        "closed (rc=124), AND the -smp 1 control arm was also unable to" \
+        "produce a heartbeat (rc=$CTRL_RC, $CTRL_TICKS heartbeats) — so the" \
+        "guest timer really was starved by host load. The heartbeat cadence" \
+        "this canary exists to check was NEVER OBSERVED, either way."
 fi
 
 verdict_pass "$TAG" "qemu rc=$rc, $tick_count heartbeat lines," \
