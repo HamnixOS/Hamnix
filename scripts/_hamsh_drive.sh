@@ -62,10 +62,15 @@ hamsh_boot() {
     # The binshim on PATH rewrites `-kernel <elf64>` into a GRUB `-cdrom`
     # boot. No `timeout` wrapper: each wait below is individually bounded
     # and hamsh_shutdown reaps the process, so QEMU cannot outlive us.
+    # QEMU_EXTRA_ARGS (space-separated, unquoted so it word-splits — same
+    # convention as scripts/_qemu_drive.sh) lets a gate add machine flags
+    # like `-cpu max`; it defaults to empty so existing callers are unaffected.
+    # shellcheck disable=SC2086
     qemu-system-x86_64 \
         -kernel "$kernel" \
         -smp "$smp" -m "$mem" \
         -nographic -no-reboot -monitor none \
+        ${QEMU_EXTRA_ARGS:-} \
         < "$HD_FIFO" > "$HD_LOG" 2>&1 &
     HD_QEMU_PID=$!
     # Hold the FIFO open for writing for the whole run so the guest's
