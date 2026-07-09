@@ -59,6 +59,10 @@
 #   <Debian release token in /etc/debian_version, anywhere in the log>
 
 . "$(dirname "$0")/_build_lock.sh"
+# Real-Debian opt-in: this gate asserts genuine Debian identity, so it
+# needs the debootstrap closure that _build_lock.sh defaults OFF for the
+# bare-kernel unit lane. _kernel_iso.sh raises -m for the large kernel.
+export HAMNIX_DEFAULT_REAL_DEBIAN=1
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

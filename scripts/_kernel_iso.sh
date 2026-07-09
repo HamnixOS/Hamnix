@@ -220,6 +220,7 @@ KAPPEND=""
 HAS_BOOT=0
 HAS_CPU=0
 HAS_ACCEL=0
+MIDX=-1          # argv index of the `-m` VALUE (i.e. i+1), or -1 if absent
 args=("$@")
 n=$#
 for (( i=0; i<n; i++ )); do
@@ -227,6 +228,8 @@ for (( i=0; i<n; i++ )); do
         KELF="${args[$((i+1))]}"
     elif [ "${args[$i]}" = "-append" ] && [ $((i+1)) -lt "$n" ]; then
         KAPPEND="${args[$((i+1))]}"
+    elif [ "${args[$i]}" = "-m" ] && [ $((i+1)) -lt "$n" ]; then
+        MIDX=$((i+1))
     elif [ "${args[$i]}" = "-boot" ]; then
         HAS_BOOT=1
     elif [ "${args[$i]}" = "-cpu" ]; then
@@ -271,6 +274,89 @@ if [ "$is_elf64" -ne 1 ]; then
     # boot such as test_bios_boot / test_uefi_boot / test_iso_qemu).
     # Still inject the accelerator so these paths get KVM too.
     qemu_exec "${ACCEL_ARGS[@]}" "$@"
+fi
+
+# --- guest-RAM floor for a large kernel ELF -------------------------
+# The Hamnix initramfs is LINKED INTO the kernel ELF (fs/initramfs_blob.S),
+# so build/hamnix-kernel.elf grows with whatever the initramfs stages.
+# With HAMNIX_DEFAULT_REAL_DEBIAN=1 (build_initramfs.py's default) the
+# whole debootstrap closure (~305 MiB) is embedded and the ELF balloons
+# to ~334 MiB. GRUB's multiboot loader must place that entire image in
+# guest RAM before the kernel runs its FIRST instruction — so a gate that
+# boots `-m 256M` (≈600 of them: unit/kernel tests that pass -kernel
+# through this shim) dies in GRUB with
+#
+#     error: out of memory.
+#     error: you need to load the kernel first.
+#
+# and every marker the gate greps for is absent → a wall of false FAILs.
+# The fixture (tests/distros/debian-minbase/rootfs/) is gitignored, so a
+# fresh CI checkout has only busybox → a ~46 MiB ELF → 256M is plenty and
+# the SAME gate is green on CI but red for any developer who has run
+# debootstrap (which the Firefox/Wayland work requires). See commit
+# 2b34b273 (test_mm_pressure) for the first hand-patched instance.
+#
+# Fixing it here — the ONE chokepoint every `-kernel` boot funnels
+# through — repairs the whole class with zero per-test edits and zero
+# change to any test's semantics: the bump fires ONLY for an ELF too big
+# to fit the requested RAM, i.e. exactly the boots that would otherwise
+# never start. Small-kernel gates (busybox, or HAMNIX_DEFAULT_REAL_DEBIAN=0)
+# keep their exact `-m`, so memory-pressure tests like test_mm_pressure
+# (which deliberately boots `-m 256M` with a small kernel) are untouched.
+# A developer can still force a specific size that DOES fit the ELF; we
+# only ever RAISE, never lower. Set HAMNIX_NO_MEM_FLOOR=1 to disable.
+#
+# The real long-term shrink is to stop embedding the Debian closure in
+# the ELF at all (flip HAMNIX_DEFAULT_REAL_DEBIAN=0 for the bare-kernel
+# unit lane, or move the closure onto rootfs.img via HAMNIX_CPIO_LEAN=1).
+# This floor makes the dead gates boot TODAY without touching 600 files;
+# the shrink is orthogonal and can land later.
+_mib_of() {
+    # Parse a QEMU `-m` value to whole MiB. Accepts "256", "256M",
+    # "1G", "2048M", "512m", "size=256M" (takes the leading size).
+    local v="${1#size=}"; v="${v%%,*}"
+    local num unit
+    num="$(printf '%s' "$v" | grep -oE '^[0-9]+' || echo 0)"
+    unit="$(printf '%s' "$v" | grep -oiE '[kmgt]?$' | tr '[:lower:]' '[:upper:]')"
+    case "$unit" in
+        G) echo $(( num * 1024 )) ;;
+        T) echo $(( num * 1024 * 1024 )) ;;
+        K) echo $(( num / 1024 )) ;;
+        ""|M) echo "$num" ;;              # bare number = MiB (QEMU default unit)
+        *) echo "$num" ;;
+    esac
+}
+if [ "${HAMNIX_NO_MEM_FLOOR:-0}" != "1" ]; then
+    elf_bytes="$(stat -c %s "$KELF" 2>/dev/null || echo 0)"
+    elf_mib=$(( elf_bytes / 1024 / 1024 ))
+    # Only a genuinely large ELF can overflow a small `-m`. 200 MiB is
+    # well above the busybox kernel (~46 MiB) and well below the
+    # real-Debian kernel (~334 MiB), so this never fires for the small
+    # lane. GRUB must hold the image AND the kernel needs working RAM
+    # after unpacking, so floor at ~3x the ELF (334 MiB → 1 GiB, the
+    # size empirically shown to boot the real-Debian kernel to userland),
+    # rounded up to a 512-MiB boundary.
+    if [ "$elf_mib" -ge 200 ]; then
+        need_mib=$(( elf_mib * 3 ))
+        need_mib=$(( ( (need_mib + 511) / 512 ) * 512 ))
+        cur_mib=0
+        [ "$MIDX" -ge 0 ] && cur_mib="$(_mib_of "${args[$MIDX]}")"
+        if [ "$cur_mib" -lt "$need_mib" ]; then
+            if [ "$MIDX" -ge 0 ]; then
+                echo "[qemu-shim] NOTE: kernel ELF is ${elf_mib} MiB but -m" \
+                     "was ${args[$MIDX]} (${cur_mib} MiB) — raising to" \
+                     "${need_mib}M so GRUB can load it (HAMNIX_NO_MEM_FLOOR=1" \
+                     "to disable)." >&2
+                args[$MIDX]="${need_mib}M"
+            else
+                echo "[qemu-shim] NOTE: kernel ELF is ${elf_mib} MiB and no" \
+                     "-m was given (QEMU default 128M) — adding -m" \
+                     "${need_mib}M so GRUB can load it." >&2
+                args+=("-m" "${need_mib}M")
+                n=$(( n + 2 ))
+            fi
+        fi
+    fi
 fi
 
 # Wrap the ELFCLASS64 Hamnix kernel in a BIOS GRUB ISO. Any `-append`

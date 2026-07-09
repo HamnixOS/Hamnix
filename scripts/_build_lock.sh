@@ -60,6 +60,40 @@ _HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-120}"
 # passed through untouched. See scripts/_kernel_iso.sh.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_kernel_iso.sh"
 
+# --- bare-kernel unit lane gets a SMALL initramfs by default ---------
+#
+# build_initramfs.py defaults HAMNIX_DEFAULT_REAL_DEBIAN=1, which stages
+# the WHOLE debootstrap closure (~305 MiB) into fs/initramfs_blob.S —
+# and that blob is linked INTO the kernel ELF, so build/hamnix-kernel.elf
+# balloons from ~46 MiB (busybox) to ~334 MiB (real Debian). The ~600
+# `-kernel` UNIT gates boot that ELF with a small `-m` and a SHORT
+# `timeout` (15–30 s): a 334 MiB kernel cannot even be loaded by GRUB
+# under `-m 256M` (out-of-memory before the first instruction), and even
+# with _kernel_iso.sh's memory floor it cannot finish GRUB-load + cpio
+# unpack inside a 15 s budget. So every marker is absent and the gate
+# emits a wall of false FAILs. The fixture is gitignored, so this is
+# INVISIBLE on a fresh CI checkout (busybox → 46 MiB → green) and only
+# bites developers who have run debootstrap (which the Firefox/Wayland
+# work requires). See scripts/_kernel_iso.sh and commit 2b34b273.
+#
+# These are KERNEL/unit tests — they need no Debian userland. So the
+# test harness defaults the knob OFF (busybox-only, small fast kernel).
+# This does NOT change build_initramfs.py's own default (still 1), so the
+# product/installer image and any direct `python3 build_initramfs.py`
+# caller that does NOT source this harness still ship real Debian. And
+# build_rootfs_img.py (the shipped ext4 root) has its OWN independent
+# default=1, so the DISTRO the user boots is unaffected.
+#
+# A test that genuinely exercises the Debian namespace (enter linux
+# running real apt/dpkg/dash, the distro-identity tests) OPTS BACK IN
+# with `export HAMNIX_DEFAULT_REAL_DEBIAN=1` right after sourcing this
+# file (or by prefixing its build_initramfs.py invocation). Those tests
+# have long timeouts (60–2400 s) and larger `-m`, so the big kernel boots
+# fine there — and _kernel_iso.sh raises `-m` for them automatically.
+# `:-` means an explicit pre-set value (from the caller's environment)
+# always wins, so the opt-in and CI overrides are honoured.
+export HAMNIX_DEFAULT_REAL_DEBIAN="${HAMNIX_DEFAULT_REAL_DEBIAN:-0}"
+
 # Reentrancy guard: many test_*.sh scripts source us AND invoke
 # scripts/build_iso.sh which also sources us. The child process
 # inherits fd 200 from the parent, but the child's `flock -x 200`

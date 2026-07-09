@@ -126,6 +126,67 @@ verdict_pass_structural() {
     exit "$VERDICT_PASS_RC"
 }
 
+# verdict_boot_gate <tag> <logfile> <qemu-rc> <marker-egrep> [min]
+#
+# The zero-marker / GRUB-OOM discriminator, factored out of
+# scripts/test_mm_pressure.sh so every `-kernel` gate can share it.
+#
+# A bare-kernel gate greps its serial log for markers (PASS lines, [mm]
+# lines, hamsh output, …) and turns each ABSENT marker into a FAIL. That
+# logic is only sound if the guest actually BOOTED. When it did not —
+# GRUB died with "out of memory" before the kernel ran (a 334 MiB
+# real-Debian kernel booted `-m 256M`; see scripts/_kernel_iso.sh), or
+# the host starved the VM and timeout(1) killed a still-loading QEMU —
+# then EVERY marker is absent and the gate emits a wall of substantive
+# FAILs describing regressions that did not happen. That is a FALSE RED,
+# indistinguishable from a real regression by exit code alone.
+#
+# Call this FIRST, right after the QEMU run, before any assertion:
+#
+#     markers_re='\[mm\]|\[swap\]'
+#     verdict_boot_gate test_mm "$LOG" "$rc" "$markers_re"
+#     # ... only reached if >=1 marker was observed; run assertions ...
+#
+# It returns 0 (and the script continues) IFF at least <min> (default 1)
+# markers matched — i.e. the guest demonstrably booted and produced
+# observable output. Otherwise it EXITS the script with a verdict:
+#
+#   * GRUB "out of memory" in the log  -> INCONCLUSIVE (the image never
+#     loaded; this is an ENVIRONMENT/config problem — the kernel ELF is
+#     too big for the requested -m — not a regression in the code under
+#     test). _kernel_iso.sh now auto-raises -m for a large ELF, so this
+#     should be rare; kept as a belt-and-braces net.
+#   * qemu rc=124 (timeout) with zero markers -> INCONCLUSIVE (we watched
+#     nothing happen; the assertion was never observed).
+#   * anything else with zero markers -> FAIL (an OBSERVED early exit
+#     before the gate could print a single marker).
+verdict_boot_gate() {
+    local tag="$1" log="$2" rc="$3" marker_re="$4" min="${5:-1}"
+    local markers
+    markers=$(grep -c -aE "$marker_re" "$log" 2>/dev/null || echo 0)
+    if [ "$markers" -ge "$min" ]; then
+        return 0
+    fi
+    # Zero (or too few) markers: decide WHY nothing was observed.
+    if grep -qaiE "out of memory|you need to load the kernel first" "$log" 2>/dev/null; then
+        verdict_inconclusive "$tag" \
+            "GRUB reported 'out of memory' and the kernel never ran — the" \
+            "kernel ELF is too large for the requested -m (real-Debian" \
+            "initramfs embedded in the ELF). This is a build/config issue," \
+            "NOT a regression. _kernel_iso.sh should auto-raise -m; if you" \
+            "see this, check HAMNIX_NO_MEM_FLOOR or the shim PATH."
+    fi
+    if [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$tag" \
+            "the guest emitted ZERO markers (/$marker_re/) and qemu was" \
+            "killed by timeout (rc=124) — the gate never ran, so nothing" \
+            "was observed. Re-run on a QUIET host."
+    fi
+    verdict_fail "$tag" \
+        "the guest emitted ZERO markers (/$marker_re/) and qemu exited on" \
+        "its own (rc=$rc) — an OBSERVED early exit before the gate ran."
+}
+
 # verdict_name <rc> — human name for a verdict exit status.
 verdict_name() {
     case "$1" in

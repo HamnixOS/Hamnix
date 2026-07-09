@@ -67,6 +67,11 @@
 #   [nsrun_test] isolation OK       (parent /var/lib/dpkg empty, run B)
 
 . "$(dirname "$0")/_build_lock.sh"
+# Real-Debian opt-in: this gate uses the real /var/lib/dpkg tree as an
+# isolation witness, so it needs the debootstrap closure that
+# _build_lock.sh defaults OFF for the bare-kernel unit lane.
+# _kernel_iso.sh raises -m for the large kernel.
+export HAMNIX_DEFAULT_REAL_DEBIAN=1
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

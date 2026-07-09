@@ -112,16 +112,14 @@ markers=$(grep -c -E "\[mm\]|\[swap\]|\[reclaim\]|\[oom\]" "$LOG" || true)
 if [ "$markers" -eq 0 ]; then
     echo "[test_mm] qemu rc=$rc, kvm='${KVM_ARGS:-none}'"
     tail -20 "$LOG" | strings
-    if [ "$rc" -eq 124 ]; then
-        verdict_inconclusive "test_mm_pressure" \
-            "the guest emitted ZERO [mm] markers and qemu was killed by timeout" \
-            "(rc=124) — the self-test never ran, so nothing was observed." \
-            "Re-run on a QUIET host; if it repeats there, the boot is genuinely wedged."
-    fi
-    verdict_fail "test_mm_pressure" \
-        "the guest emitted ZERO [mm] markers and qemu exited on its own (rc=$rc)" \
-        "— an observed early exit before the self-test."
 fi
+# Shared zero-marker / GRUB-OOM discriminator (scripts/_verdict.sh):
+# returns 0 if >=1 [mm]/[swap]/[reclaim]/[oom] marker was observed;
+# otherwise EXITS INCONCLUSIVE (GRUB OOM or timeout) or FAIL (observed
+# early exit). Keeps a starved/never-booted run from reading as a dozen
+# substantive mm regressions.
+verdict_boot_gate "test_mm_pressure" "$LOG" "$rc" \
+    '\[mm\]|\[swap\]|\[reclaim\]|\[oom\]'
 
 fail=0
 
