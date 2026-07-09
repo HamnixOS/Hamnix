@@ -60,6 +60,15 @@ OUTDIR="${HAMNIX_BUILD_DIR:-$PROJ_ROOT/build}"
 mkdir -p "$OUTDIR"
 export HAMNIX_BUILD_DIR="$OUTDIR"
 
+# The installer is the PRIMARY ship vehicle and must carry the real
+# Debian userland. _build_lock.sh (sourced just below) defaults
+# HAMNIX_DEFAULT_REAL_DEBIAN=0 for the bare-kernel unit lane; the shipped
+# image OPTS BACK IN so its initramfs/rootfs keep genuine apt/dpkg. This
+# MUST run BEFORE sourcing _build_lock.sh (which would otherwise stamp 0
+# first, and this `:-` would then see it already set). An explicit caller
+# value still wins.
+export HAMNIX_DEFAULT_REAL_DEBIAN="${HAMNIX_DEFAULT_REAL_DEBIAN:-1}"
+
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
 
