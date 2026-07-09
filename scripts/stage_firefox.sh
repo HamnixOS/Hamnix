@@ -499,14 +499,6 @@ user_pref("browser.tabs.remote.separatePrivilegedContentProcess", false);
 user_pref("browser.tabs.remote.useCrossOriginOpenerPolicy", false);
 user_pref("browser.tabs.remote.useCrossOriginEmbedderPolicy", false);
 user_pref("dom.ipc.forkserver.enable", false);
-// Disable the LAUNCHER PROCESS. Firefox's default startup forks a short-lived
-// "launcher" that re-execs the real browser as a NEW process; that re-exec'd
-// process DETACHES the inherited stdio, so its live MOZ_LOG/WAYLAND_DEBUG no
-// longer rides the [FF] serial pipe (observed: launcher exits FFEXIT=255, then
-// pid 108+ re-launch with stdio gone -> the map-path trace is lost, and the
-// child then parks). Keeping a single process preserves the live trace through
-// nsWindow::Create -> the toplevel map, and removes one fork/park hazard.
-user_pref("browser.launcherProcess.enabled", false);
 user_pref("toolkit.telemetry.enabled", false);
 user_pref("extensions.pocket.enabled", false);
 PREFS
