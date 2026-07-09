@@ -763,7 +763,14 @@ if [ -s "$FFHOME/.ff-profile/prefs.js" ]; then echo "[FF-DIAG] prefs.js delivere
 # real time. `sync` flushes each line so nothing is lost on the timeout kill.
 # Modules focus on the Wayland widget/map path (nsWindow/ipc are NOT Firefox log
 # module names). Widget+WidgetWayland name why realize does/doesn't reach map.
-export MOZ_LOG='Widget:5,WidgetWayland:5,WaylandVsync:5,WaylandBuffer:5,Compositor:4,sync,timestamp'
+# WIDENED to the IPC / thread / process-hang layer (brief task 1). The Widget/
+# WidgetWayland modules name the realize->map path; add the Gecko IPC + thread
+# + hang-monitor modules so the log NAMES which process/thread/IPC handshake or
+# condvar the startup parks on before any xdg_surface / wl_shm commit. Module
+# names verified against Gecko's StaticPrefs/log registry: ipc, IPDL,
+# MessageChannel, Sync (IPC sync-message send/recv), nsThread (thread
+# create/dispatch), ProcessHangMonitor (the hung-thread detector).
+export MOZ_LOG='Widget:5,WidgetWayland:5,WaylandVsync:5,WaylandBuffer:5,Compositor:4,ipc:5,IPDL:5,MessageChannel:5,Sync:5,nsThread:5,ProcessHangMonitor:5,sync,timestamp'
 unset MOZ_LOG_FILE
 export HOME="$FFHOME"
 export XDG_CONFIG_HOME="$FFHOME/.config"
