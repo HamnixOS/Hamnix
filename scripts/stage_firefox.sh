@@ -456,7 +456,24 @@ user_pref("layers.acceleration.disabled", true);
 // dispatch / eventfd-or-pipe self-wake path the render thread uses to signal
 // the main loop, at the Hamnix futex/pipe-wakeup layer. Multiprocess is kept
 // as the documented baseline (single-process gained nothing).
-user_pref("layers.gpu-process.enabled", true);
+// GPU PROCESS DISABLED (re-tested per the window-map brief, 2026-07-09). The
+// prior diagnosis above described an ALL-THREADS-PARKED futex DEADLOCK with
+// full GTK chrome built — but after the recent futex/do_wait4 fixes the LIVE
+// symptom is DIFFERENT: the parent (pid N) is fully alive, its pool threads
+// (Socket/StreamTrans/Cache2/IndexedDB/QuotaManager/Compositor) actively churn,
+// and the MAIN thread SPINS a nested ProcessNextEvent loop that never runs a
+// named runnable — i.e. it is SpinEventLoopUntil-blocked UPSTREAM of any window
+// (Widget/WidgetWayland/nsAppStartup emit ZERO output; GTK only creates two
+// bare wl_surfaces then destroys them). That signature matches gfxPlatform::Init
+// blocking in GPUProcessManager::EnsureGPUReady: with the GPU process ENABLED
+// the parent launches a GPU child that cannot initialise in this GL-free ns
+// (no EGL/DRM), and a recurring userspace fault at a fixed libxul rip (~+20s)
+// is consistent with that child crash-looping. Forcing the GPU process OFF runs
+// WebRender in-process on the parent's render thread, which presents straight
+// into a wl_shm buffer — the only path this compositor supports.
+user_pref("layers.gpu-process.enabled", false);
+user_pref("layers.gpu-process.force-enabled", false);
+user_pref("media.gpu-process-decoder", false);
 user_pref("webgl.disabled", true);
 // ---- suppress the startup GPU-probe CHILD (glxtest / vaapitest). Firefox
 // launches these as separate helper binaries via g_spawn (fork+exec) to
@@ -501,6 +518,37 @@ user_pref("browser.tabs.remote.useCrossOriginEmbedderPolicy", false);
 user_pref("dom.ipc.forkserver.enable", false);
 user_pref("toolkit.telemetry.enabled", false);
 user_pref("extensions.pocket.enabled", false);
+// ---- KILL the offline-impossible STARTUP NETWORK FETCHES (2026-07-09). The
+// widened necko/cache2 MOZ_LOG proved the parent's MAIN THREAD, right after it
+// creates the initial 1x1 toplevel (nsWindow::Create + moz_container_init),
+// pours its startup time into an HTTP fetch of
+// https://location.services.mozilla.com/v1/country (the Mozilla region service)
+// — cache2 index build + AltSvc lookups + nsSocketTransport churn (187 log hits,
+// 68 E/nsHttp) — for a host that has NO route in this ns, so the channel never
+// completes and the window-show/xdg/commit steps are starved behind it. This is
+// a GL-free OFFLINE namespace: disable the region update, the captive-portal /
+// connectivity probes, DNS prefetch, and network geolocation so startup does NOT
+// depend on unreachable services and the window path runs to a wl_shm commit.
+user_pref("browser.region.update.enabled", false);
+user_pref("browser.region.network.url", "");
+user_pref("browser.region.network.scan", false);
+user_pref("network.connectivity-service.enabled", false);
+user_pref("network.captive-portal-service.enabled", false);
+user_pref("captivedetect.canonicalURL", "");
+user_pref("network.dns.disablePrefetch", true);
+user_pref("network.prefetch-next", false);
+user_pref("geo.enabled", false);
+user_pref("geo.provider.network.url", "");
+user_pref("browser.safebrowsing.malware.enabled", false);
+user_pref("browser.safebrowsing.phishing.enabled", false);
+user_pref("browser.safebrowsing.downloads.enabled", false);
+user_pref("app.normandy.enabled", false);
+user_pref("app.update.enabled", false);
+user_pref("services.settings.server", "");
+user_pref("browser.newtabpage.activity-stream.feeds.telemetry", false);
+user_pref("browser.newtabpage.activity-stream.telemetry", false);
+user_pref("browser.ping-centre.telemetry", false);
+user_pref("network.trr.mode", 5);
 PREFS
 printf '%s\n' "$FF_PREFS" > "$PROFILE/prefs.js"
 printf '%s\n' "$FF_PREFS" > "$PROFILE/user.js"
@@ -793,7 +841,13 @@ if [ -s "$FFHOME/.ff-profile/prefs.js" ]; then echo "[FF-DIAG] prefs.js delivere
 # BURIED the signal, so DROP it and light up the startup + necko/DNS/cache
 # path so the log NAMES the async op the main thread is waiting on before the
 # first window opens. Keep timestamp; keep sync so every line is on disk.
-export MOZ_LOG='Widget:5,WidgetWayland:5,nsAppStartup:5,Process:5,IPCLauncher:5,GfxTest:5,ipc:4,IPDL:4,MessageChannel:4,Timeout:5,nsHostResolver:5,nsSocketTransport:5,nsHttp:4,cache2:4,StartupCache:5,DNS:5,RequestContext:5,sync,timestamp'
+# LEAN diagnostic set. The heavy necko/cache2 modules (nsHttp:4/cache2:4/
+# nsSocketTransport/RequestContext) already served their purpose — they proved
+# the main thread's post-window-create time was spent on the offline region
+# fetch (now killed by prefs) — but they also flooded the log and slowed the
+# already CPU-starved guest. Keep only the window/startup/IPC path so the trace
+# stays cheap and NAMES the realize->show->xdg->commit progression.
+export MOZ_LOG='Widget:5,WidgetWayland:5,nsAppStartup:5,Process:5,IPCLauncher:5,GfxTest:5,ipc:4,IPDL:4,MessageChannel:4,Timeout:5,sync,timestamp'
 # MOZ_LOG TO A FILE, NOT LIVE STDERR. The `firefox-esr` binary re-execs /
 # detaches its stdio very early (the launch pipe closed with only "[FF]
 # launching firefox-esr" streamed, then NOTHING — no MOZ_LOG, no
@@ -853,48 +907,32 @@ echo "[FF] launching firefox-esr (native wayland)"
     -profile "$FFHOME/.ff-profile" -no-remote -new-instance 'about:blank' 2>&1 \
   | while IFS= read -r line; do echo "[FF] $line"; done ) &
 FF_PIPE_PID=$!
-# Independent settle: let firefox reach its idle-startup stall (~+4s per the
-# widened trace) and write its MOZ_LOG, then flush+dump REGARDLESS of whether
-# the pipe ever closed. 20s of GUEST time is plenty (firefox parks at ~+4s)
-# and — critically — lands the dump well inside the harness's 240s rung-(b)
-# wait even when firefox's CPU burn slows the guest clock relative to wall.
-echo "[FF-POST] settling 20s (independent timer) to let firefox write MOZ_LOG ..."
-i=0; while [ "$i" -lt 20 ]; do sleep 1; i=$((i+1)); done
-# NO SIGTERM. A prior form SIGTERM'd firefox-esr to force PR_Close -> flush, but
-# on Hamnix delivering SIGTERM to the (stalled) firefox parent triggers a
-# repeating userspace FAULT STORM (observed: a fault re-fired 41x at a fixed
-# libxul rip during signal delivery), which trips the harness storm-guard and
-# kills QEMU BEFORE the dump — and separately corrupts the "clean termination"
-# gate. We do NOT need the flush: MOZ_LOG carries the `sync` modifier, so each
-# log record is written to the raw file as it is logged (NSPR synchronous
-# logging), and the startup-sequencing trace we need (nsAppStartup / Widget /
-# Process / the open-first-window path) is emitted in the first ~4s and is on
-# disk well before this +20s dump. Just read the file with firefox left alive.
-echo "[FF-POST] === $FFHOME listing ==="
-ls -la "$FFHOME" 2>&1 | while IFS= read -r l; do echo "[FF-POST] $l"; done
-# Firefox names its logs moz.-main.<pid>.log.moz_log (parent) and
-# moz.-child.<pid>.log.child-N.moz_log (children) — the `.moz_log` suffix means
-# the previous `moz.*.log` / `moz.log*` globs matched NEITHER, so the dump was
-# always empty even when content existed. Enumerate every log file by content
-# suffix instead, and dump the IPC-relevant tail of each.
-for f in "$FFHOME"/*moz_log "$FFHOME"/moz.*.log "$FFHOME"/moz.log*; do
-    [ -e "$f" ] || continue
-    echo "[FF-POST] === $f ($(wc -l < "$f" 2>/dev/null) lines) ==="
-    # FULL semantic dump: every line that is NOT the nsThread event-loop churn,
-    # from the HEAD of the log onward, so the startup ORDER + the last async op
-    # before the main-thread spin are visible. nsThread is dropped from MOZ_LOG
-    # now, but keep this filter as a belt in case a module re-adds it.
-    grep -avE 'D/nsThread' "$f" 2>/dev/null \
-        | while IFS= read -r l; do echo "[FF-SEM] $l"; done
-    # STARTUP-SEQUENCING lines FIRST (brief task 1: what nsAppStartup / the
-    # open-first-window path waits on): child-launch, gfx-probe, timers,
-    # the last thing the main thread's nsThread event loop did.
-    grep -aE "nsAppStartup|AppStartup|OpenWindow|CreateChromeWindow|IPCLauncher|GeckoChild|LaunchAndWait|SandboxBroker|GfxTest|glxtest|vaapitest|Timeout|nsTimer|TimerThread|ProcessNextEvent|ProcessHangMon|WaitingForProcess|final-ui-startup|sessionstore|browser-delayed" "$f" 2>/dev/null \
-        | tail -n 120 | while IFS= read -r l; do echo "[FF-START] $l"; done
-    # IPC/handshake-relevant lines next.
-    grep -aE "ipc|IPDL|MessageChannel|Bridge|Endpoint|Open|Connect|handshake|error|fail|abort|ABORT" "$f" 2>/dev/null \
-        | tail -n 80 | while IFS= read -r l; do echo "[FF-LOG] $l"; done
-    tail -n 80 "$f" 2>/dev/null | while IFS= read -r l; do echo "[FF-TAIL] $l"; done
+# EARLY + REPEATED dump. Firefox reaches its startup stall at ~+4s but a
+# recurring userspace fault (a libxul thread re-faulting at a fixed rip) tends
+# to hit at ~+20s and can trip the harness storm-guard / halt the guest,
+# truncating a single late dump. So dump the SEMANTIC (non-nsThread) MOZ_LOG in
+# short ROUNDS starting at +6s: the first round lands the startup trace well
+# before the fault window. `sync` (in MOZ_LOG) keeps each record on disk as
+# logged, so an early read already has the full startup sequence.
+ff_dump_round() {
+    echo "[FF-POST] === round $1: $FFHOME listing ==="
+    ls -la "$FFHOME" 2>&1 | while IFS= read -r l; do echo "[FF-POST] $l"; done
+    for f in "$FFHOME"/*moz_log "$FFHOME"/moz.*.log "$FFHOME"/moz.log*; do
+        [ -e "$f" ] || continue
+        echo "[FF-POST] === round $1: $f ($(wc -l < "$f" 2>/dev/null) lines) ==="
+        # FULL semantic dump: every line that is NOT the nsThread event-loop
+        # churn, from the HEAD onward, so the startup ORDER + the last async op
+        # the main thread SpinEventLoopUntil-waits on are visible.
+        grep -avE 'D/nsThread' "$f" 2>/dev/null \
+            | while IFS= read -r l; do echo "[FF-SEM] $l"; done
+    done
+}
+r=1
+while [ "$r" -le 10 ]; do
+    echo "[FF-POST] settling ~3s before dump round $r ..."
+    i=0; while [ "$i" -lt 3 ]; do sleep 1; i=$((i+1)); done
+    ff_dump_round "$r"
+    r=$((r+1))
 done
 FFLAUNCH
 chmod +x "$ROOTFS/ff-launch.sh"
