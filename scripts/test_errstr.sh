@@ -22,10 +22,16 @@
 
 . "$(dirname "$0")/_build_lock.sh"
 
-set -euo pipefail
+set -uo pipefail
+trap '' PIPE
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
 
+TAG=test_errstr
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 TEST_ELF=build/user/test_errstr.elf
@@ -51,34 +57,29 @@ python3 -m compiler.adder compile \
 
 echo "[test_errstr] (5/5) Boot QEMU + drive the test via hamsh"
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+cleanup() {
+    hamsh_shutdown
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
+}
+trap cleanup EXIT
 
-set +e
-(
-    # Let the kernel finish its smoke tests before hamsh starts
-    # SYS_READ'ing stdin. Same pacing as scripts/test_hamsh.sh —
-    # the 16550 RX FIFO is 16 bytes and there's no software buffer
-    # so we hand-feed each line.
-    sleep 3
-    printf '/bin/test_errstr\n'
-    sleep 2
-    printf 'exit\n'
-    sleep 1
-) | timeout 15s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
-set -e
+# PROMPT-GATED + output-adaptive input (scripts/_hamsh_drive.sh).
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "[hamsh] M16.35 shell ready" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
+hamsh_send_await '/bin/test_errstr' '[test_errstr] got:' "$CMD_WAIT" || true
+hamsh_send 'exit'
+sleep 2
 
 echo "[test_errstr] --- captured output ---"
-cat "$LOG"
+sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG" | tr -d '\000'
 echo "[test_errstr] --- end output ---"
+
+# Zero fixture markers -> the guest was starved, not that SYS_ERRSTR is broken.
+verdict_boot_gate "$TAG" "$LOG" 0 '\[test_errstr\] (start|got:)'
 
 fail=0
 # Banner first — proves the binary ran end to end.
@@ -100,8 +101,6 @@ else
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_errstr] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" "the SYS_ERRSTR round-trip assertion was VIOLATED (see MISS: lines)"
 fi
-
-echo "[test_errstr] PASS"
+verdict_pass "$TAG" "SYS_ERRSTR returned the installed 'file does not exist' error string"

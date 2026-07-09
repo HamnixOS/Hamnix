@@ -43,15 +43,20 @@ body="$(awk '
 echo "$body" | grep -q 'invlpg_one(vaddr)' \
   || fail "_vma_free_cow_range no longer flushes the TLB (invlpg_one missing)"
 
-echo "$body" | grep -qE '\[0\]\s*=\s*0' \
-  || fail "_vma_free_cow_range no longer clears the PTE slot (= 0 missing)"
+# The PTE clear. The frame's leaf slot may live in high RAM the live task
+# CR3 aliases, so the clear now goes through the boot-CR3-bracketed
+# _vma_pte_raw_write(..., 0) helper rather than a bare `slot[0] = 0` store
+# (refactor 2026-07; same invariant, see the body comment). Accept either
+# idiom so the guard tracks the invariant, not one spelling of it.
+echo "$body" | grep -qE '_vma_pte_raw_write\([^)]*,[[:space:]]*0\)|\[0\][[:space:]]*=[[:space:]]*0' \
+  || fail "_vma_free_cow_range no longer clears the PTE slot (write-0 missing)"
 
 echo "$body" | grep -q 'cow_drop_page' \
   || fail "_vma_free_cow_range no longer routes frees through cow_drop_page"
 
-# Order check: the PTE clear (= 0) must appear BEFORE the free_page call
-# in the body so a freed buddy frame is never mapped present.
-clear_line="$(echo "$body" | grep -nE '\[0\]\s*=\s*0' | head -1 | cut -d: -f1)"
+# Order check: the PTE clear must appear BEFORE the free_page call in the
+# body so a freed buddy frame is never mapped present.
+clear_line="$(echo "$body" | grep -nE '_vma_pte_raw_write\([^)]*,[[:space:]]*0\)|\[0\][[:space:]]*=[[:space:]]*0' | head -1 | cut -d: -f1)"
 free_line="$(echo "$body"  | grep -n  'free_page(phys)'    | head -1 | cut -d: -f1)"
 [ -n "$clear_line" ] || fail "could not locate PTE-clear line"
 [ -n "$free_line" ]  || fail "could not locate free_page(phys) line"

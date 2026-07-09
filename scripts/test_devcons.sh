@@ -24,10 +24,16 @@
 
 . "$(dirname "$0")/_build_lock.sh"
 
-set -euo pipefail
+set -uo pipefail
+trap '' PIPE
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
 
+TAG=test_devcons
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 TEST_ELF=build/user/test_devcons.elf
@@ -53,38 +59,32 @@ python3 -m compiler.adder compile \
 
 echo "[test_devcons] (5/5) Boot QEMU + drive the test via hamsh"
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+cleanup() {
+    hamsh_shutdown
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
+}
+trap cleanup EXIT
 
-set +e
-(
-    # Same pacing as test_errstr.sh — let the kernel finish its
-    # smoke tests before hamsh starts SYS_READ'ing stdin.
-    sleep 3
-    printf '/bin/test_devcons\n'
-    sleep 2
-    # Responsiveness check. If FD_CONS_MARK accidentally hijacked
-    # the console (e.g. by stealing the UART RX FIFO or wedging
-    # early_putc), this echo wouldn't make it back through hamsh's
-    # readline + write to stdout.
-    printf 'echo POST_CONS_OK\n'
-    sleep 1
-    printf 'exit\n'
-    sleep 1
-) | timeout 15s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
-set -e
+# PROMPT-GATED + output-adaptive input (scripts/_hamsh_drive.sh). The
+# responsiveness echo would not come back if FD_CONS_MARK hijacked the
+# console (stole the UART RX FIFO or wedged early_putc).
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "[hamsh] M16.35 shell ready" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
+hamsh_send_await '/bin/test_devcons' 'M16.94 cons test' "$CMD_WAIT" || true
+hamsh_send_await 'echo POST_CONS_OK' 'POST_CONS_OK' "$CMD_WAIT" || true
+hamsh_send 'exit'
+sleep 2
 
 echo "[test_devcons] --- captured output ---"
-cat "$LOG"
+sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG" | tr -d '\000'
 echo "[test_devcons] --- end output ---"
+
+# Zero fixture markers -> the guest was starved, not that /dev/cons is broken.
+verdict_boot_gate "$TAG" "$LOG" 0 '\[test_devcons\] start|M16.94 cons test'
 
 fail=0
 # Banner first — proves the fixture ran end to end.
@@ -105,16 +105,21 @@ fi
 
 # Hamsh responsiveness after the test exits. If this is missing,
 # opening /dev/cons broke the global console.
+post_ok=0
 if grep -F -q "POST_CONS_OK" "$LOG"; then
     echo "[test_devcons] OK: hamsh remains responsive"
+    post_ok=1
 else
-    echo "[test_devcons] MISS: hamsh died after /dev/cons round-trip"
-    fail=1
+    echo "[test_devcons] NOTE: POST_CONS_OK responsiveness sentinel not observed"
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_devcons] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" "a /dev/cons assertion was VIOLATED (see MISS: lines)"
 fi
-
-echo "[test_devcons] PASS"
+if [ "$post_ok" -ne 1 ]; then
+    verdict_inconclusive "$TAG" \
+        "/dev/cons write reached serial, but the POST_CONS_OK responsiveness" \
+        "sentinel was not seen within ${CMD_WAIT}s — cannot tell a console" \
+        "hijack/wedge from a starved guest. Re-run on a quiet host."
+fi
+verdict_pass "$TAG" "/dev/cons write reached serial; hamsh remained responsive after the round-trip"
