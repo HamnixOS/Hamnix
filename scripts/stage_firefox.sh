@@ -268,8 +268,19 @@ PY
     QL="/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders"
     [ -x "$QL" ] || QL="$(command -v gdk-pixbuf-query-loaders || true)"
     if [ -n "$QL" ] && [ -x "$QL" ]; then
+        # Rewrite the staging prefix to the ABSOLUTE in-image path (leading
+        # "/"), NOT a relative "usr/lib/..." path. gdk-pixbuf dlopens each
+        # module by the cache path; a relative path only resolves if the
+        # process CWD happens to be "/". On a robust host a relative dlopen
+        # fails gracefully and the built-in PNG/JPEG loaders still work, which
+        # is why this slipped through — but in the Hamnix Linux-ns a failed
+        # relative dlopen during gdk_pixbuf_io_init leaves the loader table
+        # unusable, so GTK cannot decode even its built-in gresource fallback
+        # icons and aborts at CSD-titlebar bring-up (window-close-symbolic ->
+        # image-missing "Unrecognized image file format" g_assert). Absolute
+        # paths make every loader dlopen from its real /usr/lib location.
         "$QL" "$ROOTFS/$PIXBUF_REL/loaders/"*.so 2>/dev/null \
-          | sed "s|$ROOTFS/||g" > "$ROOTFS/$PIXBUF_REL/loaders.cache"
+          | sed "s|$ROOTFS/|/|g" > "$ROOTFS/$PIXBUF_REL/loaders.cache"
         echo "[stage-ff] wrote gdk-pixbuf loaders.cache ($(grep -c '\.so' "$ROOTFS/$PIXBUF_REL/loaders.cache" || echo 0) loaders)"
     else
         echo "[stage-ff] WARNING: gdk-pixbuf-query-loaders absent; no loaders.cache (icons may not decode)."
@@ -287,7 +298,7 @@ if [ -d "$FFROOT/$IMMOD_REL" ]; then
     [ -x "$QI" ] || QI="$(command -v gtk-query-immodules-3.0 || true)"
     if [ -n "$QI" ] && [ -x "$QI" ]; then
         "$QI" "$ROOTFS/$IMMOD_REL/"*.so 2>/dev/null \
-          | sed "s|$ROOTFS/||g" > "$ROOTFS/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache" || true
+          | sed "s|$ROOTFS/|/|g" > "$ROOTFS/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache" || true
         echo "[stage-ff] wrote gtk immodules.cache"
     fi
 fi
@@ -312,9 +323,62 @@ if [ -d "$FFROOT/$SCHEMA_REL" ]; then
 fi
 
 # --- 7. shared-mime-info (GIO content-type db; GTK file chooser) -------
-if [ -d "$FFROOT/usr/share/mime" ]; then
+# Copying the .deb's /usr/share/mime tree gives us the source `packages/`
+# XML but NOT the compiled `mime.cache` (Debian generates it in postinst via
+# update-mime-database, which never runs when we just unpack files). GIO's
+# content-type lookup + GTK's icon/file machinery consult mime.cache; without
+# it GTK emits "the mime database could not be found" during icon bring-up.
+# Prefer the HOST's ready-made /usr/share/mime (already compiled), else
+# compile ours with update-mime-database.
+if [ -d /usr/share/mime ] && [ -f /usr/share/mime/mime.cache ]; then
+    mkdir -p "$ROOTFS/usr/share/mime"
+    cp -a /usr/share/mime/. "$ROOTFS/usr/share/mime/" 2>/dev/null || true
+    echo "[stage-ff] staged host /usr/share/mime (incl. mime.cache)"
+elif [ -d "$FFROOT/usr/share/mime" ]; then
     mkdir -p "$ROOTFS/usr/share/mime"
     cp -a "$FFROOT/usr/share/mime/." "$ROOTFS/usr/share/mime/" 2>/dev/null || true
+    command -v update-mime-database >/dev/null 2>&1 \
+      && update-mime-database "$ROOTFS/usr/share/mime" >/dev/null 2>&1 \
+      && echo "[stage-ff] compiled mime.cache" \
+      || echo "[stage-ff] WARNING: no mime.cache (GTK may warn on icon load)."
+fi
+
+# --- 7a. icon theme (Adwaita) + hicolor index + icon caches ------------
+# THE WINDOW-MAP BLOCKER (verified via WAYLAND_DEBUG + MOZ_LOG Widget trace):
+# Firefox reaches nsWindow::Create() Toplevel + moz_container_init, then GTK
+# renders the client-side-decoration titlebar (Wayland has no server-side
+# decorations, so GTK MUST draw its own window controls). The close button
+# needs `window-close-symbolic`; with NO icon theme installed (adwaita-icon-
+# theme absent, hicolor has no index.theme) GTK falls through to its built-in
+# gresource fallback icons, which fail to decode here and hit a hard
+# g_assert in gtk_icon_helper's ensure_surface_for_gicon -> abort(), BEFORE
+# any xdg_wm_base.get_xdg_surface is ever issued. So the window never maps.
+# Staging a real Adwaita theme (its symbolic icons load as SVG from the
+# filesystem via the now-absolute-path svg pixbuf loader) gives the CSD
+# buttons real icons and lets the toplevel map. General fix: helps EVERY GTK
+# client, not just Firefox.
+for ICONSRC in /usr/share/icons/Adwaita "$FFROOT/usr/share/icons/Adwaita"; do
+    if [ -d "$ICONSRC" ]; then
+        mkdir -p "$ROOTFS/usr/share/icons"
+        cp -a "$ICONSRC" "$ROOTFS/usr/share/icons/" 2>/dev/null || true
+        echo "[stage-ff] staged Adwaita icon theme ($(du -sh "$ICONSRC" 2>/dev/null | cut -f1))"
+        break
+    fi
+done
+# hicolor must carry an index.theme or GTK rejects it as a theme root.
+if [ -d "$ROOTFS/usr/share/icons/hicolor" ] && \
+   [ ! -f "$ROOTFS/usr/share/icons/hicolor/index.theme" ]; then
+    [ -f /usr/share/icons/hicolor/index.theme ] && \
+      cp -a /usr/share/icons/hicolor/index.theme \
+            "$ROOTFS/usr/share/icons/hicolor/index.theme" 2>/dev/null || true
+fi
+# Rebuild the per-theme icon-theme.cache so GTK's fast path finds icons.
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    for th in "$ROOTFS/usr/share/icons/Adwaita" \
+              "$ROOTFS/usr/share/icons/hicolor"; do
+        [ -d "$th" ] && gtk-update-icon-cache -q -f -t "$th" 2>/dev/null \
+          && echo "[stage-ff] icon-theme.cache: $(basename "$th")" || true
+    done
 fi
 
 # --- 7b. fontconfig DTD (belt) -----------------------------------------
@@ -581,6 +645,21 @@ export WAYLAND_DISPLAY=wayland-0
 export MOZ_ENABLE_WAYLAND=1
 export MOZ_DISABLE_WAYLAND_PROXY=1
 export GDK_BACKEND=wayland
+# WIRE-LEVEL WAYLAND TRACE. libwayland-client prints every request it sends and
+# every event it receives (with interface.method names) to STDERR when
+# WAYLAND_DEBUG=1. Firefox's main process here does NOT detach its stdio (the
+# [FF] serial stream carries its Gtk-DEBUG output live to the timeout kill), so
+# this trace rides the [FF] stream and is captured WITHOUT the settle/dump
+# dance. It is the ground truth for "which request is Firefox's last, and which
+# event is it waiting on" at the realize->map gap.
+export WAYLAND_DEBUG=1
+# gdk-pixbuf: point explicitly at the absolute-path loaders.cache + module dir
+# so gdk_pixbuf_io_init deterministically finds the PNG/SVG loaders (the CSD
+# titlebar icons decode) regardless of the process CWD. XDG_DATA_DIRS must
+# include /usr/share so GTK finds the Adwaita icon theme + the mime db.
+export GDK_PIXBUF_MODULE_FILE=/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache
+export GDK_PIXBUF_MODULEDIR=/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders
+export XDG_DATA_DIRS=/usr/share:/usr/local/share
 export MOZ_DISABLE_CONTENT_SANDBOX=1
 export MOZ_DISABLE_GMP_SANDBOX=1
 export MOZ_DISABLE_RDD_SANDBOX=1
@@ -675,8 +754,17 @@ if [ -s "$FFHOME/.ff-profile/prefs.js" ]; then echo "[FF-DIAG] prefs.js delivere
 # their OWN moz.<pid>.log — the cross-process IPC handshake stall needs the
 # CHILD's IPDL/MessageChannel trace, not just the parent's. ipc/IPDL first so
 # the earliest channel-open + Bridge/Endpoint messages land before any hang.
-export MOZ_LOG='ipc:5,IPDL:5,MessageChannel:5,Widget:5,WidgetWayland:5,nsWindow:5,Compositor:5,WebRender:5,ProcessHangMon:5,sync,timestamp'
-export MOZ_LOG_FILE="$FFHOME/moz.%PID.log"
+# STREAM MOZ_LOG LIVE ON STDERR (the [FF] serial stream), NOT to a file. Prior
+# forms pointed MOZ_LOG_FILE at $FFHOME/moz.%PID.log and dumped it AFTER a 40s
+# settle + SIGTERM — but the test's `timeout` kills QEMU before that dump runs,
+# so the file was NEVER surfaced (the "empty [FF-LOG]" prior agents hit). The
+# main firefox process keeps its stdio on our pipe (proven: Gtk-DEBUG streams
+# live), so with MOZ_LOG_FILE UNSET, MOZ_LOG goes to stderr and rides [FF] in
+# real time. `sync` flushes each line so nothing is lost on the timeout kill.
+# Modules focus on the Wayland widget/map path (nsWindow/ipc are NOT Firefox log
+# module names). Widget+WidgetWayland name why realize does/doesn't reach map.
+export MOZ_LOG='Widget:5,WidgetWayland:5,WaylandVsync:5,WaylandBuffer:5,Compositor:4,sync,timestamp'
+unset MOZ_LOG_FILE
 export HOME="$FFHOME"
 export XDG_CONFIG_HOME="$FFHOME/.config"
 export XDG_CACHE_HOME="$FFHOME/.cache"
@@ -696,7 +784,10 @@ export FONTCONFIG_FILE=fonts.conf
 export FONTCONFIG_PATH=/etc/fonts
 export FONTCONFIG_SYSROOT=/
 export G_SLICE=always-malloc
-export G_MESSAGES_DEBUG=all
+# Quiet GTK's per-widget theme-state debug spam (thousands of "State X doesn't
+# match" lines) so the WAYLAND_DEBUG wire trace + MOZ_LOG dominate the [FF]
+# stream and stay readable. GLib warnings/criticals still print regardless.
+export G_MESSAGES_DEBUG=
 mkdir -p "$FFHOME/.cache" "$FFHOME/.mozilla" /run
 # drop any stale profile lock from a prior crashed run
 rm -f "$FFHOME/.ff-profile/lock" "$FFHOME/.ff-profile/.parentlock" 2>/dev/null
