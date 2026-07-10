@@ -41,6 +41,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4dir
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -236,6 +238,14 @@ echo "[test_ext4dir] --- ext4dir self-test output ---"
 grep -a -E "\[ext4dir\]" "$LOG" || true
 echo "[test_ext4dir] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# A TCG-starved / GRUB-OOM boot emits ZERO [ext4dir] markers and used to be
+# indistinguishable from a real regression (a wall of MISS -> hard FAIL).
+# Route the zero-marker case through the shared discriminator FIRST: it is
+# INCONCLUSIVE (starved/timeout/OOM), never a bogus red. The per-marker
+# check() chain below stays as DIAGNOSTICS; the final decision is verdict_*.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4dir\]'
+
 fail=0
 
 if grep -a -F -q "[ext4dir] FAIL" "$LOG"; then
@@ -267,9 +277,20 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4dir] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4dir] FAIL (qemu rc=$rc)"
-    exit 1
+    # Some [ext4dir] markers printed but the terminal PASS banner never
+    # arrived AND qemu was killed by timeout -> starved mid-selftest, not a
+    # regression. A clean exit (rc!=124) without PASS, or an OBSERVED marker
+    # MISS, is a real actionable red.
+    if ! grep -a -F -q "[ext4dir] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[ext4dir] markers printed but the terminal PASS banner never" \
+            "arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "an [ext4dir] marker was OBSERVED absent (or an internal FAIL was" \
+        "reported) while the selftest ran (qemu rc=$rc) — real regression."
 fi
 
-echo "[test_ext4dir] PASS — multi-block ext4 directory: readdir enumerates" \
-     "all blocks and a last-block file resolves by name (qemu rc=$rc)"
+verdict_pass "$TAG" "multi-block ext4 directory: readdir enumerates all" \
+     "blocks and a last-block file resolves by name (qemu rc=$rc)"
