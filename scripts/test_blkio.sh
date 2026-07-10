@@ -20,6 +20,7 @@
 # Fail marker:  [test_blkio] FAIL
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -62,6 +63,11 @@ echo "[test_blkio] --- blkio self-test output ---"
 grep -a -E "\[BLKIO\]" "$LOG" || true
 echo "[test_blkio] --- end ---"
 
+# Three-valued gate: zero [BLKIO] markers => the selftest never ran.
+# Under host starvation / rc=124 that is INCONCLUSIVE, not a hard FAIL
+# indistinguishable from a real regression; an OBSERVED crash is a FAIL.
+verdict_boot_gate test_blkio "$LOG" "$rc" '\[BLKIO\]'
+
 fail=0
 
 if grep -a -F -q "[BLKIO] FAIL" "$LOG"; then
@@ -78,9 +84,7 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_blkio] --- full log ---"
     cat "$LOG"
-    echo "[test_blkio] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail test_blkio "the guest booted and ran the blkio selftest, but it did not report [BLKIO] PASS — a real, observed accounting/getrusage regression (qemu rc=$rc)"
 fi
 
-echo "[test_blkio] PASS — getrusage reports real per-task block I/O" \
-     "(qemu rc=$rc)"
+verdict_pass test_blkio "getrusage reports real per-task block I/O (qemu rc=$rc)"
