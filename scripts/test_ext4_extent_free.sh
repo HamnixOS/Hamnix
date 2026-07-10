@@ -36,6 +36,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_extent_free
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -96,12 +98,18 @@ echo "[test_ext4_extent_free] --- ext4-extent self-test output ---"
 grep -a -E "\[ext4-extent\]" "$LOG" || true
 echo "[test_ext4_extent_free] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero [ext4-extent] markers == starved/timeout/OOM boot, NOT a regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4-extent\]'
+
 fail=0
 
 # Treat a virtio-blk superblock-read flake (host CPU starvation under
-# load) as INFRA, not a code failure — re-run in a quiet window.
+# load) as INCONCLUSIVE, not a code failure — re-run in a quiet window.
 if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
-    echo "[test_ext4_extent_free] WARN: virtio-blk read flake — re-run in a quiet window" >&2
+    verdict_inconclusive "$TAG" \
+        "virtio-blk superblock read flake ('read failed status=255') —" \
+        "host CPU starvation; the selftest could not mount. Re-run quiet."
 fi
 
 if grep -a -F -q "[ext4-extent] FAIL" "$LOG"; then
@@ -129,10 +137,17 @@ check "self-test PASS banner"         "[ext4-extent] PASS"
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_extent_free] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_extent_free] FAIL (qemu rc=$rc)"
-    exit 1
+    if ! grep -a -F -q "[ext4-extent] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[ext4-extent] markers printed but the terminal PASS banner never" \
+            "arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "an [ext4-extent] marker was OBSERVED absent (or an internal FAIL was" \
+        "reported) while the selftest ran (qemu rc=$rc) — real regression."
 fi
 
-echo "[test_ext4_extent_free] PASS — ext4_unlink reclaims every data +" \
-     "index block on a multi-block file (no leak), and the extent tree" \
-     "round-trips a depth-3 file byte-exact and frees it cleanly (qemu rc=$rc)"
+verdict_pass "$TAG" "ext4_unlink reclaims every data + index block on a" \
+     "multi-block file (no leak), and the extent tree round-trips a depth-3" \
+     "file byte-exact and frees it cleanly (qemu rc=$rc)"

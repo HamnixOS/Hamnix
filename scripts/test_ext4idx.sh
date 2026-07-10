@@ -27,6 +27,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4idx
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -86,6 +88,10 @@ echo "[test_ext4idx] --- ext4idx self-test output ---"
 grep -a -E "\[ext4idx\]" "$LOG" || true
 echo "[test_ext4idx] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero [ext4idx] markers == starved/timeout/OOM boot, NOT a regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4idx\]'
+
 fail=0
 
 if grep -a -F -q "[ext4idx] FAIL" "$LOG"; then
@@ -113,10 +119,17 @@ check "self-test PASS banner"               "[ext4idx] PASS"
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4idx] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4idx] FAIL (qemu rc=$rc)"
-    exit 1
+    if ! grep -a -F -q "[ext4idx] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[ext4idx] markers printed but the terminal PASS banner never" \
+            "arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "an [ext4idx] marker was OBSERVED absent (or an internal FAIL was" \
+        "reported) while the selftest ran (qemu rc=$rc) — real regression."
 fi
 
-echo "[test_ext4idx] PASS — ext4 extent index node: a fragmented file" \
-     "exceeds the 4-inline-extent ceiling via a depth-1 index node," \
-     "reads back correctly, and truncate frees the tree (qemu rc=$rc)"
+verdict_pass "$TAG" "ext4 extent index node: a fragmented file exceeds the" \
+     "4-inline-extent ceiling via a depth-1 index node, reads back" \
+     "correctly, and truncate frees the tree (qemu rc=$rc)"

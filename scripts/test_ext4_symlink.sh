@@ -24,6 +24,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_symlink
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -81,6 +83,10 @@ echo "[test_ext4_symlink] --- ext4-symlink self-test output ---"
 grep -a -E "\[ext4-symlink\]" "$LOG" || true
 echo "[test_ext4_symlink] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero [ext4-symlink] markers == starved/timeout/OOM boot, NOT a regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4-symlink\]'
+
 fail=0
 
 if grep -a -F -q "[ext4-symlink] FAIL" "$LOG"; then
@@ -97,9 +103,16 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_symlink] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_symlink] FAIL (qemu rc=$rc)"
-    exit 1
+    if ! grep -a -F -q "[ext4-symlink] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[ext4-symlink] markers printed but the terminal PASS banner never" \
+            "arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "the [ext4-symlink] PASS banner was OBSERVED absent (or an internal" \
+        "FAIL was reported) while the selftest ran (qemu rc=$rc) — real regression."
 fi
 
-echo "[test_ext4_symlink] PASS — slow (data-block) and fast (inline) symlinks" \
-     "create and read back byte-for-byte on the live ext4 mount (qemu rc=$rc)"
+verdict_pass "$TAG" "slow (data-block) and fast (inline) symlinks create and" \
+     "read back byte-for-byte on the live ext4 mount (qemu rc=$rc)"

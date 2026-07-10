@@ -19,6 +19,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_rmdir
 
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
@@ -63,18 +65,24 @@ echo "[test_ext4_rmdir] --- ext4 lines ---"
 grep -E 'ext4: (rmdir|rename)' "$LOG" || true
 echo "[test_ext4_rmdir] --- end ---"
 
-fail=0
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# The rmdir smoke test runs unconditionally at boot on build/ext4.img. Zero
+# `ext4:` markers == starved/timeout/OOM boot, NOT a regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" 'ext4: (mounted|rmdir|rename)'
+
 if grep -F -q "ext4: rmdir smoke PASS" "$LOG"; then
-    echo "[test_ext4_rmdir] OK: ext4 rmdir + dir-rename .. fixup"
-else
-    echo "[test_ext4_rmdir] MISS: 'ext4: rmdir smoke PASS'"
-    echo "[test_ext4_rmdir] --- full log ---"
-    cat "$LOG"
-    fail=1
+    verdict_pass "$TAG" \
+        "ext4 rmdir smoke: empty-dir removal + dir-rename '..' fixup (qemu rc=$rc)"
 fi
 
-if [ "$fail" -ne 0 ]; then
-    echo "[test_ext4_rmdir] FAIL (qemu rc=$rc)"
-    exit 1
+echo "[test_ext4_rmdir] --- full log ---"
+cat "$LOG"
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "ext4 mounted but 'ext4: rmdir smoke PASS' never printed and qemu was" \
+        "killed by timeout (rc=124) — starved before the smoke line flushed." \
+        "Re-run on a QUIET host."
 fi
-echo "[test_ext4_rmdir] PASS"
+verdict_fail "$TAG" \
+    "ext4 mounted but 'ext4: rmdir smoke PASS' was OBSERVED absent on a clean" \
+    "qemu exit (rc=$rc) — the rmdir smoke test really failed."

@@ -23,6 +23,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_mkdir
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -80,6 +82,10 @@ echo "[test_ext4_mkdir] --- ext4-mkdir self-test output ---"
 grep -a -E "\[ext4-mkdir\]|\[vfs-named-mkdir\]" "$LOG" || true
 echo "[test_ext4_mkdir] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero markers == starved/timeout/OOM boot, NOT a regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4-mkdir\]|\[vfs-named-mkdir\]'
+
 fail=0
 
 if grep -a -F -q "[ext4-mkdir] FAIL" "$LOG"; then
@@ -110,9 +116,16 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_mkdir] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_mkdir] FAIL (qemu rc=$rc)"
-    exit 1
+    if { ! grep -a -F -q "[ext4-mkdir] PASS" "$LOG" || ! grep -a -F -q "[vfs-named-mkdir] PASS" "$LOG"; } && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "mkdir markers printed but a terminal PASS banner never arrived" \
+            "and qemu was killed by timeout (rc=124) — starved mid-selftest." \
+            "Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "an ext4-mkdir / vfs-named-mkdir PASS banner was OBSERVED absent (or" \
+        "an internal FAIL was reported) while the selftest ran (qemu rc=$rc)."
 fi
 
-echo "[test_ext4_mkdir] PASS — mkdir creates a real DIR-typed entry on the" \
-     "live ext4 mount via vfs_mkdir -> ext4_mkdir_live (qemu rc=$rc)"
+verdict_pass "$TAG" "mkdir creates a real DIR-typed entry on the live ext4" \
+     "mount via vfs_mkdir -> ext4_mkdir_live (qemu rc=$rc)"

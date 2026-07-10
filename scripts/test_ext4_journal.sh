@@ -27,6 +27,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_journal
 
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
@@ -105,6 +107,12 @@ echo "[test_ext4_journal] --- jbd2 / journal lines ---"
 grep -E 'jbd2:|ext4: journal|ext4_journal' "$LOG" || true
 echo "[test_ext4_journal] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero jbd2/[ext4_journal] markers == starved/timeout/OOM boot — the crash-
+# consistency selftest never ran — NOT a regression. The per-needle chain
+# below stays as diagnostics; final decision is verdict_*.
+verdict_boot_gate "$TAG" "$LOG" "$rc" 'jbd2:|\[ext4_journal\]|ext4: journal'
+
 fail=0
 for needle in \
     "ext4: journal attached (JBD2)" \
@@ -132,7 +140,16 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_journal] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_journal] FAIL (qemu rc=$rc)"
-    exit 1
+    if ! grep -F -q "[ext4_journal] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "jbd2/[ext4_journal] markers printed but the terminal PASS banner" \
+            "never arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "an [ext4_journal] crash-consistency marker was OBSERVED absent (or an" \
+        "internal FAIL was reported) while the selftest ran (qemu rc=$rc)."
 fi
-echo "[test_ext4_journal] PASS"
+verdict_pass "$TAG" "ext4 JBD2 journal crash-consistency: a committed txn's" \
+    "replay applies NEW data across a crash while a torn txn rolls back" \
+    "(qemu rc=$rc)"

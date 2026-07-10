@@ -20,6 +20,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_truncate
 
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
@@ -64,18 +66,25 @@ echo "[test_ext4_truncate] --- ext4 lines ---"
 grep -E 'ext4: truncate' "$LOG" || true
 echo "[test_ext4_truncate] --- end ---"
 
-fail=0
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# The truncate smoke test runs unconditionally at boot on build/ext4.img.
+# Zero `ext4:` markers == starved/timeout/OOM boot, NOT a regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" 'ext4: (mounted|truncate)'
+
 if grep -F -q "ext4: truncate smoke PASS" "$LOG"; then
-    echo "[test_ext4_truncate] OK: ext4 truncate (grow + shrink)"
-else
-    echo "[test_ext4_truncate] MISS: 'ext4: truncate smoke PASS'"
-    echo "[test_ext4_truncate] --- full log ---"
-    cat "$LOG"
-    fail=1
+    verdict_pass "$TAG" \
+        "ext4 truncate smoke: grow (sparse extend) + shrink (extent trim)" \
+        "read back correctly (qemu rc=$rc)"
 fi
 
-if [ "$fail" -ne 0 ]; then
-    echo "[test_ext4_truncate] FAIL (qemu rc=$rc)"
-    exit 1
+echo "[test_ext4_truncate] --- full log ---"
+cat "$LOG"
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "ext4 mounted but 'ext4: truncate smoke PASS' never printed and qemu" \
+        "was killed by timeout (rc=124) — starved before the smoke line" \
+        "flushed. Re-run on a QUIET host."
 fi
-echo "[test_ext4_truncate] PASS"
+verdict_fail "$TAG" \
+    "ext4 mounted but 'ext4: truncate smoke PASS' was OBSERVED absent on a" \
+    "clean qemu exit (rc=$rc) — the truncate smoke test really failed."

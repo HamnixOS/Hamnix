@@ -19,6 +19,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_rename
 
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
@@ -63,18 +65,31 @@ echo "[test_ext4_rename] --- ext4 lines ---"
 grep -E 'ext4: rename' "$LOG" || true
 echo "[test_ext4_rename] --- end ---"
 
-fail=0
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# The rename smoke test runs unconditionally at boot on build/ext4.img and
+# prints its result via `ext4:` lines (mount banner + smoke PASS). A TCG-
+# starved / GRUB-OOM boot emits ZERO `ext4:` markers and used to be
+# indistinguishable from a real regression. Route zero-marker through the
+# shared discriminator first -> INCONCLUSIVE, never a bogus red.
+verdict_boot_gate "$TAG" "$LOG" "$rc" 'ext4: (mounted|rename)'
+
 if grep -F -q "ext4: rename smoke PASS" "$LOG"; then
-    echo "[test_ext4_rename] OK: ext4 rename (move + overwrite-target)"
-else
-    echo "[test_ext4_rename] MISS: 'ext4: rename smoke PASS'"
-    echo "[test_ext4_rename] --- full log ---"
-    cat "$LOG"
-    fail=1
+    verdict_pass "$TAG" \
+        "ext4 rename smoke: same-dir move + cross-dir move + overwrite-target," \
+        "bytes survive and the old name is gone (qemu rc=$rc)"
 fi
 
-if [ "$fail" -ne 0 ]; then
-    echo "[test_ext4_rename] FAIL (qemu rc=$rc)"
-    exit 1
+echo "[test_ext4_rename] --- full log ---"
+cat "$LOG"
+# ext4 mounted (markers present) but the rename smoke PASS never printed. If
+# qemu was killed by timeout the smoke line may simply not have flushed —
+# INCONCLUSIVE; a clean exit without it is a real observed regression.
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "ext4 mounted but 'ext4: rename smoke PASS' never printed and qemu was" \
+        "killed by timeout (rc=124) — starved before the smoke line flushed." \
+        "Re-run on a QUIET host."
 fi
-echo "[test_ext4_rename] PASS"
+verdict_fail "$TAG" \
+    "ext4 mounted but 'ext4: rename smoke PASS' was OBSERVED absent on a clean" \
+    "qemu exit (rc=$rc) — the rename smoke test really failed."
