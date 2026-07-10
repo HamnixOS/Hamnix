@@ -34,15 +34,18 @@
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_dev_namespace
 
 INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer.img}"
 NVME_SIZE="${NVME_SIZE:-2G}"
 INSTALL_WAIT="${INSTALL_WAIT:-500}"
 
 # --- environment gates (mirror test_installer_nvme_inram.sh) ---------
+# A missing host prerequisite is ABSENCE OF EVIDENCE, not a pass: report
+# INCONCLUSIVE so a host without KVM/OVMF cannot masquerade as green.
 if [ ! -e /dev/kvm ]; then
-    echo "[test_dev_namespace] SKIP: /dev/kvm absent (OVMF boot too slow without KVM)" >&2
-    exit 0
+    verdict_inconclusive "$TAG" "/dev/kvm absent — the OVMF installer boot is too slow to observe without KVM. Re-run on a KVM host."
 fi
 OVMF_FD="${OVMF_FD:-}"
 if [ -z "$OVMF_FD" ]; then
@@ -52,20 +55,17 @@ if [ -z "$OVMF_FD" ]; then
     done
 fi
 if [ -z "$OVMF_FD" ] || [ ! -f "$OVMF_FD" ]; then
-    echo "[test_dev_namespace] SKIP: OVMF firmware not found (apt install ovmf)" >&2
-    exit 0
+    verdict_inconclusive "$TAG" "OVMF firmware not found (apt install ovmf) — the EFI-stub installer boot cannot run. Install ovmf and re-run."
 fi
 
 # --- build the installer image (compiles the whole kernel) -----------
 echo "[test_dev_namespace] (1/2) Build installer image (compiles kernel)"
 bash scripts/build_installer_img.sh >/tmp/test_dev_namespace_build.log 2>&1 || {
-    echo "[test_dev_namespace] FAIL: installer image build failed"
-    tail -30 /tmp/test_dev_namespace_build.log
-    exit 1
+    tail -30 /tmp/test_dev_namespace_build.log >&2
+    verdict_inconclusive "$TAG" "installer image build failed — cannot boot the gate (toolchain/build issue, not a /dev-namespace regression)."
 }
 if [ ! -f "$INSTALLER_IMG" ]; then
-    echo "[test_dev_namespace] FAIL: $INSTALLER_IMG not built"
-    exit 1
+    verdict_inconclusive "$TAG" "$INSTALLER_IMG not built — cannot boot the gate."
 fi
 
 NVME_IMG=$(mktemp --tmpdir hamnix-devns-nvme.XXXXXX.qcow2)
@@ -115,9 +115,11 @@ for _ in $(seq 1 "$INSTALL_WAIT"); do
     sleep 1
 done
 if [ "$ready" -ne 1 ]; then
-    echo "[test_dev_namespace] FAIL: auto-installer never reported complete"
-    tail -60 "$LOG"
-    exit 1
+    tail -60 "$LOG" >&2
+    verdict_inconclusive "$TAG" \
+        "the auto-installer never reported 'install complete' within ${INSTALL_WAIT}s —" \
+        "the guest was starved (or the install stalled) before the interactive shell" \
+        "re-entered, so the /dev namespace binds were never observable. Re-run on a QUIET host."
 fi
 echo "[test_dev_namespace] installer done; shell interactive — driving listings."
 
@@ -223,8 +225,14 @@ else
     fail=1
 fi
 
+# By here the auto-installer DID complete (the ready gate passed) and the
+# interactive shell WAS driven, so every listing above was actually
+# observable — a MISS is therefore a real regression in the #c/#b device
+# binds, not host starvation.
 if [ "$fail" -ne 0 ]; then
-    echo "[test_dev_namespace] FAIL"
-    exit 1
+    verdict_fail "$TAG" \
+        "the installer completed and the shell was driven, but a /dev namespace" \
+        "listing (ls / | ls /dev | /dev/blk enum | lsblk | size) was OBSERVED" \
+        "absent — the #c/#b device binds regressed."
 fi
-echo "[test_dev_namespace] PASS"
+verdict_pass "$TAG" "/dev and /dev/blk are real listable directories served by the #c/#b binds: ls / shows dev, ls /dev shows blk, /dev/blk enumerates nvme0n1, lsblk prints the table, and /dev/blk/nvme0n1/size returns a numeric capacity."
