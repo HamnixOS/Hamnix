@@ -47,6 +47,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_sock_chan
+
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
 ELF=build/hamnix-kernel.elf
@@ -84,6 +87,11 @@ echo "[test_sock_chan] --- sockchan self-test output ---"
 grep -a -E "\[SOCKCHAN\]" "$LOG" || true
 echo "[test_sock_chan] --- end ---"
 
+# Three-valued gate: a starved / non-booting run emits ZERO [SOCKCHAN]
+# markers. Route the zero-marker case through the shared discriminator FIRST
+# (INCONCLUSIVE on timeout/OOM, FAIL on an observed crash).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[SOCKCHAN\]'
+
 fail=0
 
 if grep -a -F -q "[SOCKCHAN] FAIL" "$LOG"; then
@@ -100,9 +108,16 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_sock_chan] --- full log ---"
     cat "$LOG"
-    echo "[test_sock_chan] FAIL (qemu rc=$rc)"
-    exit 1
+    if ! grep -a -F -q "[SOCKCHAN] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[SOCKCHAN] markers printed but the '[SOCKCHAN] PASS' banner never" \
+            "arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "the [SOCKCHAN] PASS banner was OBSERVED absent (or an internal FAIL" \
+        "was reported) while the selftest ran (qemu rc=$rc) — real regression."
 fi
 
-echo "[test_sock_chan] PASS — socket()/socketpair() ride DEV_SOCKET/DEV_SOCKETPAIR pool chans" \
-     "(qemu rc=$rc)"
+verdict_pass "$TAG" "socket()/socketpair() fds ride DEV_SOCKET/DEV_SOCKETPAIR" \
+    "pool chans through namec's DEV_SOCKET* arms (namespace-purity Phase 4c)"

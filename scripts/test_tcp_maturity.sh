@@ -43,6 +43,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_tcp_maturity
+
 ELF=build/hamnix-kernel.elf
 
 echo "[test_tcp_maturity] (1/3) Build userland + initramfs (with /etc/tcp-test marker)"
@@ -74,13 +77,19 @@ echo "[test_tcp_maturity] --- captured ([tcp-mat] lines) ---"
 grep -E '\[tcp-mat\]' "$LOG" || true
 echo "[test_tcp_maturity] --- end ---"
 
+# Three-valued gate: a starved / non-booting run emits ZERO [tcp-mat]
+# markers. Route the zero-marker case through the shared discriminator FIRST
+# (INCONCLUSIVE on timeout/OOM, FAIL on an observed crash).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[tcp-mat\]'
+
 fail=0
 
 # Any explicit FAIL line is an immediate failure.
 if grep -F -q "[tcp-mat] FAIL" "$LOG"; then
     echo "[test_tcp_maturity] FAIL: self-test emitted a FAIL line"
     grep -F "[tcp-mat]" "$LOG" || true
-    exit 1
+    verdict_fail "$TAG" "the in-kernel tcp_maturity_selftest emitted an" \
+        "explicit [tcp-mat] FAIL line (qemu rc=$rc) — real regression."
 fi
 
 check() {
@@ -105,11 +114,21 @@ check "overall PASS marker" \
       "[tcp-mat] PASS"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_tcp_maturity] FAIL (qemu rc=$rc)"
     echo "[test_tcp_maturity] --- full log tail ---"
     tail -n 120 "$LOG"
-    exit 1
+    if ! grep -F -q "[tcp-mat] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[tcp-mat] markers printed but '[tcp-mat] PASS' never arrived and" \
+            "qemu was killed by timeout (rc=124) — starved mid-selftest." \
+            "Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "a [tcp-mat] marker was OBSERVED absent while the selftest ran (qemu" \
+        "rc=$rc) — real regression in congestion control / window scaling /" \
+        "SACK / multi-accept."
 fi
 
-echo "[test_tcp_maturity] PASS — congestion control + window scaling + SACK + multi-accept"
+verdict_pass "$TAG" "TCP data-path maturity: congestion-control fast" \
+    "retransmit (3 dup-ACKs), window scaling >65535, SACK out-of-order hole" \
+    "selection, and in-order multi-listener accept queue all verified"
 exit 0

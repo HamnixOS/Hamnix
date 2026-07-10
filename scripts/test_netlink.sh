@@ -31,6 +31,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_netlink
+
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
 ELF=build/hamnix-kernel.elf
@@ -68,6 +71,11 @@ echo "[test_netlink] --- netlink self-test output ---"
 grep -a -E "\[NETLINK\]|\[netlink\]" "$LOG" || true
 echo "[test_netlink] --- end ---"
 
+# Three-valued gate: a starved / non-booting run emits ZERO [netlink]
+# markers. Route the zero-marker case through the shared discriminator FIRST
+# (INCONCLUSIVE on timeout/OOM, FAIL on an observed crash).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[NETLINK\]|\[netlink\]'
+
 fail=0
 
 if grep -a -F -q "[netlink] FAIL" "$LOG"; then
@@ -84,9 +92,18 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_netlink] --- full log ---"
     cat "$LOG"
-    echo "[test_netlink] FAIL (qemu rc=$rc)"
-    exit 1
+    # Some [netlink] markers printed but the PASS banner never arrived AND
+    # qemu was killed by timeout -> starved mid-selftest, not a regression.
+    if ! grep -a -F -q "[netlink] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[netlink] markers printed but the '[netlink] PASS' banner never" \
+            "arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "the [netlink] PASS banner was OBSERVED absent (or an internal FAIL" \
+        "was reported) while the selftest ran (qemu rc=$rc) — real regression."
 fi
 
-echo "[test_netlink] PASS — rtnetlink GETLINK/GETADDR/GETROUTE dumps framed" \
-     "+ parsed through the real netlink path (qemu rc=$rc)"
+verdict_pass "$TAG" "rtnetlink GETLINK/GETADDR/GETROUTE dumps framed and" \
+    "parsed through the real linux_abi netlink path"

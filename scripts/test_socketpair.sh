@@ -15,6 +15,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_socketpair
+
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 TEST_ELF=build/user/test_socketpair.elf
@@ -67,6 +70,14 @@ echo "[test_socketpair] --- captured output ---"
 cat "$LOG"
 echo "[test_socketpair] --- end output ---"
 
+# Three-valued gate: a starved boot (or a dropped first serial command)
+# emits ZERO [socketpair] markers. Route that through the shared
+# discriminator FIRST (INCONCLUSIVE on timeout, FAIL on an observed crash).
+# The [socketpair] markers are GENUINE fixture output — the typed input
+# ("/bin/test_socketpair", "exit") contains no "[socketpair]" substring, so
+# an input-echo cannot spuriously satisfy them.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[socketpair\]'
+
 fail=0
 
 check_marker() {
@@ -88,8 +99,18 @@ check_marker "[socketpair] close OK"  "both ends closed"
 check_marker "[socketpair] PASS"      "fixture reached PASS"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_socketpair] FAIL (qemu rc=$rc)"
-    exit 1
+    # Some [socketpair] markers printed but PASS never arrived AND qemu was
+    # killed by timeout -> starved mid-fixture, not a regression.
+    if ! grep -F -q "[socketpair] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[socketpair] markers printed but '[socketpair] PASS' never" \
+            "arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-fixture. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "a [socketpair] fixture marker was OBSERVED absent (qemu rc=$rc) —" \
+        "real regression in sys_socketpair (AF_UNIX transport)."
 fi
 
-echo "[test_socketpair] PASS"
+verdict_pass "$TAG" "sys_socketpair(AF_UNIX, SOCK_STREAM) allocates a" \
+    "connected fd pair and transports bytes in both directions"

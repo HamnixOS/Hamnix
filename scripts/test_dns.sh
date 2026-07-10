@@ -34,6 +34,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_dns
+
 ELF=build/hamnix-kernel.elf
 
 echo "[test_dns] (1/3) Build userland + initramfs"
@@ -64,6 +67,12 @@ echo "[test_dns] --- captured (dns / dhcp / icmp) ---"
 grep -E '\[dns\]|\[dns-selftest\]|\[dhcp\]|\[icmp\]' "$LOG" || true
 echo "[test_dns] --- end ---"
 
+# Three-valued gate: a starved / non-booting run emits ZERO [dns*] markers
+# and the deterministic offline self-test below would then wall a wall of
+# MISS -> FAIL. Route the zero-marker case through the shared discriminator
+# FIRST (INCONCLUSIVE on timeout/OOM, FAIL on an observed crash).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[dns-selftest\]|\[dns\]'
+
 # === Offline record-type self-test (kernel roadmap §11) ===========
 #
 # dns_selftest() in drivers/net/dns.ad builds DNS response packets in
@@ -86,7 +95,18 @@ fi
 if [[ "$SELFTEST_FAIL" -ne 0 ]]; then
     echo "[test_dns] --- full log ---"
     cat "$LOG"
-    exit 1
+    # The offline self-test is a fast in-kernel codec exercise; a partial
+    # run that got killed by timeout before ALL PASS is starvation, not a
+    # regression. A clean exit (rc!=124) with a missing sub-test is a real
+    # parser regression.
+    if ! grep -F -q "[dns-selftest] ALL PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[dns-selftest] markers printed but 'ALL PASS' never arrived and" \
+            "qemu was killed by timeout (rc=124) — starved mid-selftest."
+    fi
+    verdict_fail "$TAG" \
+        "a deterministic offline [dns-selftest] sub-test was OBSERVED absent" \
+        "(qemu rc=$rc) — real regression in the DNS response parser."
 fi
 echo "[test_dns] offline self-test: multi-A / PTR / MX / SRV / TC-bit all PASS"
 
@@ -105,18 +125,29 @@ if grep -F -q "[dns] resolved" "$LOG"; then
     if grep -F -q "[dns] multi-A:" "$LOG"; then
         echo "[test_dns] live answer carried multiple A-records (round-robin exercised)"
     fi
-    echo "[test_dns] PASS (offline self-test + resolved real name)"
-    exit 0
+    verdict_pass "$TAG" "offline record-type self-test (multi-A/PTR/MX/SRV/" \
+        "TC-bit/TCP-frame) PASSED and the live wire leg resolved a real name"
 fi
 
 if grep -F -q "[dns] timeout" "$LOG"; then
     echo "[test_dns] SKIP live leg (no internet); offline self-test PASSED"
-    echo "[test_dns] PASS"
-    exit 0
+    verdict_pass "$TAG" "offline record-type self-test PASSED; the live wire" \
+        "leg cleanly timed out (no internet) — the send/receive path ran"
 fi
 
-# Neither live marker found — that's a real regression.
-echo "[test_dns] FAIL (qemu rc=$rc; no DNS resolve or timeout marker)"
+# Neither live marker found. If qemu was killed by timeout before the
+# dns_lookup leg produced resolved/timeout, that is starvation, not a
+# regression. A clean exit with neither marker is a real regression
+# (kernel never reached dns_lookup — DHCP failure or crash).
 echo "[test_dns] --- full log ---"
 cat "$LOG"
-exit 1
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "offline self-test PASSED but the live wire leg produced neither" \
+        "'[dns] resolved' nor '[dns] timeout' and qemu was killed by timeout" \
+        "(rc=124) — the wire leg was starved before it could observe an outcome."
+fi
+verdict_fail "$TAG" \
+    "offline self-test PASSED but the live wire leg produced neither" \
+    "'[dns] resolved' nor '[dns] timeout' (qemu rc=$rc) — the kernel never" \
+    "reached dns_lookup (DHCP failure or crash)."

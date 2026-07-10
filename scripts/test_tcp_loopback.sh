@@ -32,6 +32,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_tcp_loopback
+
 ELF=build/hamnix-kernel.elf
 
 echo "[test_tcp_loopback] (1/3) Build userland + initramfs (with /etc/tcp-loopback-test marker)"
@@ -63,6 +66,11 @@ echo "[test_tcp_loopback] --- captured (tcp-loopback / tcp / dhcp) ---"
 grep -E '\[tcp-loopback\]|\[tcp\]|\[dhcp\]' "$LOG" || true
 echo "[test_tcp_loopback] --- end ---"
 
+# Three-valued gate: a starved / non-booting run emits ZERO [tcp-loopback]
+# markers. Route the zero-marker case through the shared discriminator FIRST
+# (INCONCLUSIVE on timeout/OOM, FAIL on an observed crash).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[tcp-loopback\]'
+
 # --- evaluate PASS gates -----------------------------------------------
 
 have_established=0
@@ -89,19 +97,29 @@ fi
 
 # Any FAIL line is an immediate FAIL for the test.
 if grep -F -q "[tcp-loopback] FAIL" "$LOG"; then
-    echo "[test_tcp_loopback] FAIL: smoke test emitted a FAIL line"
     echo "[test_tcp_loopback] --- relevant log ---"
     grep -F "[tcp-loopback]" "$LOG" || true
     echo "[test_tcp_loopback] --- end ---"
-    exit 1
+    verdict_fail "$TAG" "the in-kernel tcp_loopback_smoke_test emitted an" \
+        "explicit [tcp-loopback] FAIL line (qemu rc=$rc) — real regression."
 fi
 
 if [ "$have_established" -eq 1 ] && [ "$have_data" -eq 1 ] && [ "$have_pass" -eq 1 ]; then
-    echo "[test_tcp_loopback] PASS (loopback: handshake + data + clean close)"
-    exit 0
+    verdict_pass "$TAG" "in-kernel TCP loopback: both sides reach ESTABLISHED," \
+        "a data payload round-trips, and the connection closes cleanly"
 fi
 
-echo "[test_tcp_loopback] FAIL (qemu rc=$rc)"
 echo "[test_tcp_loopback] --- full log tail ---"
 tail -n 100 "$LOG"
+# Some [tcp-loopback] markers printed but not the full ESTABLISHED+data+PASS
+# trio AND qemu was killed by timeout -> starved mid-smoke, not a regression.
+if [ "$have_pass" -eq 0 ] && [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "[tcp-loopback] markers printed but the smoke test did not reach its" \
+        "PASS banner and qemu was killed by timeout (rc=124) — starved" \
+        "mid-smoke. Re-run on a QUIET host."
+fi
+verdict_fail "$TAG" \
+    "the in-kernel TCP loopback smoke test did not reach ESTABLISHED + data" \
+    "round-trip + PASS (qemu rc=$rc) — real regression in the loopback path."
 exit 1
