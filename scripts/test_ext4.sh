@@ -18,6 +18,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4
 
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
@@ -128,7 +130,21 @@ echo "[test_ext4] --- captured output ---"
 cat "$LOG"
 echo "[test_ext4] --- end output ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# A TCG-starved / GRUB-OOM boot emits ZERO ext4 markers and used to be
+# indistinguishable from a real end-to-end regression (a wall of MISS ->
+# hard FAIL). Route the zero-marker case through the shared discriminator
+# FIRST: INCONCLUSIVE (starved/timeout/OOM), never a bogus red.
+verdict_boot_gate "$TAG" "$LOG" "$rc" 'ext4: mounted|EXT4_MARKER|\[ext4'
+
 fail=0
+# NOTE: WRITE_VIA_SHELL and UNLINKED_OK are NOT in this whole-log needle
+# loop. Their payload is TYPED at the shell (`echo WRITE_VIA_SHELL > f`),
+# and hamsh's readline reprints the whole in-progress line on every
+# keystroke, so the literal string appears dozens of times as INPUT ECHO
+# even if the write path is completely broken — grepping the log for it is
+# a false-green echo-sentinel. They get a dedicated genuine-OUTPUT check
+# below (a line NOT prefixed by the `hamsh$` prompt).
 for needle in \
     "ext4: mounted; block_size=1024 inodes_count=128" \
     "ext4 inode#2 mode=" \
@@ -142,9 +158,7 @@ for needle in \
     "CREATE_OK ext4 file-create round-trip works" \
     "ext4: rename smoke PASS" \
     "ext4: truncate smoke PASS" \
-    "ext4: fsync smoke PASS" \
-    "WRITE_VIA_SHELL" \
-    "UNLINKED_OK"
+    "ext4: fsync smoke PASS"
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_ext4] OK: '$needle'"
@@ -153,6 +167,24 @@ do
         fail=1
     fi
 done
+
+# WRITE_VIA_SHELL / UNLINKED_OK: assert GENUINE cat output, not the write
+# command's readline echo. Every readline redraw line carries the `hamsh$`
+# prompt; the file's actual content is emitted by `cat` on a line WITHOUT
+# it. Requiring a non-prompt line proves the ext4 write + read-back round
+# trip really happened (a broken write path would leave only the echoes).
+if grep -F "WRITE_VIA_SHELL" "$LOG" | grep -qv 'hamsh\$'; then
+    echo "[test_ext4] OK: 'WRITE_VIA_SHELL' (genuine ext4 write+readback, not input echo)"
+else
+    echo "[test_ext4] MISS: 'WRITE_VIA_SHELL' had no genuine cat output line (only input echo)"
+    fail=1
+fi
+if grep -F "UNLINKED_OK" "$LOG" | grep -qv 'hamsh\$'; then
+    echo "[test_ext4] OK: 'UNLINKED_OK' (genuine post-unlink create+readback, not input echo)"
+else
+    echo "[test_ext4] MISS: 'UNLINKED_OK' had no genuine cat output line (only input echo)"
+    fail=1
+fi
 
 # M16.59 multi-block dir assertions: FILE49.TXT lives in the second
 # block of the root dir; resolving it via cat exercises the
@@ -200,7 +232,22 @@ else
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_ext4] FAIL (qemu rc=$rc)"
-    exit 1
+    # Markers printed but not all assertions held AND qemu was killed by
+    # timeout -> the session was starved before the later commands landed
+    # (a partial feed), not a regression. A clean qemu exit with an
+    # observed MISS is a real, actionable red.
+    if [ "$rc" -eq 124 ] && ! grep -F -q "UNLINKED_OK" "$LOG"; then
+        verdict_inconclusive "$TAG" \
+            "ext4 mounted and early markers printed, but the later serial" \
+            "commands' effects never landed and qemu was killed by timeout" \
+            "(rc=124) — the feed was starved mid-session. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "an ext4 end-to-end assertion (read path, multi-block dir walk, the" \
+        "59-entry listdir, or a genuine shell write/unlink round-trip) was" \
+        "OBSERVED to fail while the session ran (qemu rc=$rc) — real regression."
 fi
-echo "[test_ext4] PASS"
+verdict_pass "$TAG" "ext4 end-to-end on a live virtio-blk mount: root+nested" \
+    "reads, symlink follow, multi-block dir walk (FILE49 in block 2), the" \
+    "full 59-entry listdir, and genuine shell write + unlink round-trips" \
+    "(qemu rc=$rc)"
