@@ -69,7 +69,7 @@ cd "$PROJ_ROOT"
 TAG="test_multipipe"
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
-SMP="${HAMNIX_TEST_SMP:-1}"     # see the -smp note in the header
+SMP="${HAMNIX_TEST_SMP:-2}"     # see the -smp note in the header
 BOOT_WAIT="${BOOT_WAIT:-420}"
 CMD_WAIT="${CMD_WAIT:-240}"
 

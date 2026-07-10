@@ -76,10 +76,13 @@
 # only wait that yields while a sibling task is still running, so a pipeline
 # is the reliable trigger.
 #
-# A gate that wedges cannot observe its own assertions. Until that scheduler
-# stall is fixed, drive the guest UP: every assertion below is about the
-# pipe substrate, not about SMP. Re-check with HAMNIX_TEST_SMP=2 once the
-# scheduler bug is closed, and then make 2 the default again.
+# FIXED (default flipped back to 2): the wedge was a recursive rq-lock
+# self-deadlock in schedule()'s BSP idle-loop — it re-acquired rq_locks[0]
+# without releasing the outer hold whenever a child exited on the BSP while the
+# parent had been work-stolen onto an AP. See kernel/sched/core.ad and
+# scripts/test_smp2_foreground_external.sh. This gate now runs at -smp 2 to
+# exercise the pipeline path (hamsh's other sibling-still-running wait) on the
+# fixed scheduler.
 #
 # VERDICTS (scripts/_verdict.sh, docs/TEST_VERDICTS.md)
 #   PASS         (0)   every assertion was OBSERVED to hold
@@ -115,7 +118,7 @@ HAMSH_ELF=build/user/hamsh.elf
 # character at a time), so the driver below is ADAPTIVE: it waits for each
 # command's own output rather than sleeping a fixed amount. This is only
 # the backstop.
-SMP="${HAMNIX_TEST_SMP:-1}"     # see the -smp note in the header
+SMP="${HAMNIX_TEST_SMP:-2}"     # see the -smp note in the header
 BOOT_WAIT="${BOOT_WAIT:-420}"
 CMD_WAIT="${CMD_WAIT:-240}"
 

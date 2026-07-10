@@ -30,7 +30,12 @@
 # header for the same finding and the same -smp 1 workaround; the wedge
 # itself is kernel-scope (cf. the #413 steal-window race).
 #
-# So this gate runs the guest at -smp ${HAMNIX_TEST_SMP:-1}. It exercises
+# FIXED: the wedge was a recursive rq-lock self-deadlock in schedule()'s BSP
+# idle-loop (it re-acquired rq_locks[0] without releasing the outer hold) — see
+# kernel/sched/core.ad and scripts/test_smp2_foreground_external.sh. This gate is
+# flipped BACK to -smp ${HAMNIX_TEST_SMP:-2} to prove the fix on the exact path.
+#
+# This gate runs the guest at -smp ${HAMNIX_TEST_SMP:-2}. It exercises
 # the exact parse_program / exec_block / run_one_command_x / spawn path a
 # statement list uses; a genuine statement-list regression (e.g.
 # exec_block returning after the first ND_CMD) reds it even at -smp 1.
@@ -76,7 +81,7 @@ cd "$PROJ_ROOT"
 TAG="test_hamsh_semicolon"
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
-export HAMNIX_TEST_SMP="${HAMNIX_TEST_SMP:-1}"   # see the ROOT-CAUSE NOTE
+export HAMNIX_TEST_SMP="${HAMNIX_TEST_SMP:-2}"   # -smp 2: the wedge is FIXED (below)
 BOOT_WAIT="${BOOT_WAIT:-420}"
 CMD_WAIT="${CMD_WAIT:-240}"
 
