@@ -175,6 +175,25 @@ verdict_boot_gate() {
         return 0
     fi
     # Zero (or too few) markers: decide WHY nothing was observed.
+    #
+    # OBSERVED CRASH vs ABSENCE OF EVIDENCE. A guest that double-faulted,
+    # panicked, or oopsed and then wedged (with -no-reboot it just sits
+    # until timeout kills qemu at rc=124) is NOT "starved" — its failure was
+    # directly OBSERVED on the serial log. Treating that as INCONCLUSIVE
+    # would launder a real, deterministic crash into a re-run-and-hope
+    # non-result. Check for unambiguous kernel-crash signatures FIRST and
+    # report them as an actionable FAIL. (Only reached on the zero-marker
+    # path — a boot that produced its markers already returned 0 above — so
+    # this can never turn a genuine PASS red.)
+    if grep -qaE 'TRAP: vector|[Kk]ernel panic|double fault|triple fault|Oops:|Unhandled exception' "$log" 2>/dev/null; then
+        local sig
+        sig=$(grep -aE 'TRAP: vector|[Kk]ernel panic|double fault|triple fault|Oops:|Unhandled exception' "$log" 2>/dev/null | head -1)
+        verdict_fail "$tag" \
+            "the guest emitted ZERO gate markers (/$marker_re/) but the serial" \
+            "log shows an OBSERVED kernel crash before the gate ran:" \
+            "\"$sig\" (qemu rc=$rc). This is a deterministic boot-path crash," \
+            "NOT host starvation — re-running will not help. Root-cause it."
+    fi
     if grep -qaiE "out of memory|you need to load the kernel first" "$log" 2>/dev/null; then
         verdict_inconclusive "$tag" \
             "GRUB reported 'out of memory' and the kernel never ran — the" \
