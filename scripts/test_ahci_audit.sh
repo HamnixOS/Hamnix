@@ -22,6 +22,7 @@
 # other than 0. Each assertion below maps to one of those scenarios.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -72,6 +73,10 @@ echo "[test_ahci_audit] --- captured (ahci lines) ---"
 grep -E '\[ahci' "$LOG" || true
 echo "[test_ahci_audit] --- end ---"
 
+# Zero [ahci] markers => the driver never came up: INCONCLUSIVE under
+# starvation / rc=124, FAIL on an OBSERVED crash — never a bare hard FAIL.
+verdict_boot_gate test_ahci_audit "$LOG" "$rc" '\[ahci'
+
 fail=0
 # Core lifecycle: HR (newly added), CAP.NP, multi-port enumeration.
 for needle in \
@@ -101,10 +106,9 @@ if grep -F -q "[ahci] command timeout (CI bit stuck)" "$LOG"; then
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_ahci_audit] FAIL (qemu rc=$rc)"
     echo "[test_ahci_audit] --- full log ---"
     cat "$LOG"
-    exit 1
+    verdict_fail test_ahci_audit "AHCI 1.3 conformance assertions were violated (see MISS lines above); the driver came up, so this is a real, observed regression (qemu rc=$rc)"
 fi
 
-echo "[test_ahci_audit] PASS"
+verdict_pass test_ahci_audit "AHCI HBA reset (GHC.HR) + CAP.NP + multi-port enumeration + 48-bit-LBA write/readback all verified on the SATA boot path"

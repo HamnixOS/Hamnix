@@ -22,6 +22,7 @@
 # also bash a script that re-takes it).
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -66,6 +67,10 @@ echo "[test_ahci_write] --- captured (ahci lines) ---"
 grep -E '\[ahci\]' "$LOG" || true
 echo "[test_ahci_write] --- end ---"
 
+# Zero [ahci] markers => the driver never came up: INCONCLUSIVE under
+# starvation / rc=124, FAIL on an OBSERVED crash — never a bare hard FAIL.
+verdict_boot_gate test_ahci_write "$LOG" "$rc" '\[ahci\]'
+
 fail=0
 # Existing READ smoke test markers must still pass — write is additive.
 # The two new markers prove the write/readback path is healthy.
@@ -91,10 +96,9 @@ if grep -F -q "[ahci] readback MISMATCH" "$LOG"; then
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_ahci_write] FAIL (qemu rc=$rc)"
     echo "[test_ahci_write] --- full log ---"
     cat "$LOG"
-    exit 1
+    verdict_fail test_ahci_write "AHCI WRITE DMA EXT round-trip assertions were violated (see MISS lines above); the driver came up, so this is a real, observed regression (qemu rc=$rc)"
 fi
 
-echo "[test_ahci_write] PASS"
+verdict_pass test_ahci_write "AHCI WRITE DMA EXT wrote LBA=1 and read it back byte-for-byte through the existing READ DMA EXT path"

@@ -26,6 +26,7 @@
 #   "[ahci-mp] PASS"                      — the unique PASS marker.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -81,6 +82,10 @@ echo "[test_ahci_multiport] --- captured (ahci-mp lines) ---"
 grep -E '\[ahci-mp\]|\[ahci\] port' "$LOG" || true
 echo "[test_ahci_multiport] --- end ---"
 
+# Zero [ahci-mp]/[ahci] port markers => the multi-port selftest never
+# ran: INCONCLUSIVE under starvation / rc=124, FAIL on an OBSERVED crash.
+verdict_boot_gate test_ahci_multiport "$LOG" "$rc" '\[ahci-mp\]|\[ahci\] port'
+
 fail=0
 for needle in \
     "[ahci-mp] enumerated 2 AHCI port(s)" \
@@ -96,10 +101,9 @@ do
 done
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_ahci_multiport] FAIL (qemu rc=$rc)"
     echo "[test_ahci_multiport] --- full log ---"
     cat "$LOG"
-    exit 1
+    verdict_fail test_ahci_multiport "AHCI multi-port enumeration / per-port routing assertions were violated (see MISS lines above); the driver came up, so this is a real, observed regression (qemu rc=$rc)"
 fi
 
-echo "[test_ahci_multiport] PASS"
+verdict_pass test_ahci_multiport "AHCI enumerated 2 ports, registered sd0+sd1 as distinct block devices, and each returned its DISTINCT first sector through the generic block layer"

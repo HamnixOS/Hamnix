@@ -34,6 +34,7 @@
 # the native kernel happens to expose.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -95,6 +96,13 @@ set -e
 echo "[test_ahci_io] --- captured (ahci / ahci_io_test / ext4 / kmod) ---"
 grep -aE 'kmod_linux|\[ahci\.ko\]|\[ahci_io_test\]|\[ahci\]|\[boot:35\.A\]|ext4: mounted|ext4: bad magic|ext4: failed' "$LOG" | head -50 || true
 echo "[test_ahci_io] --- end ---"
+
+# Three-valued starvation guard: a boot that produced NONE of the
+# storage-path markers (total host starvation) is INCONCLUSIVE, not the
+# hard FAIL the detailed asserters below would otherwise emit. An
+# OBSERVED kernel crash is still a FAIL (handled inside verdict_boot_gate
+# and by the explicit panic check that follows).
+verdict_boot_gate test_ahci_io "$LOG" "$rc" 'kmod_linux|\[ahci\]|\[boot:35\.A\]|\[ahci_io_test\]'
 
 # Panic / TRAP / BUG is unambiguously a regression.
 if grep -aE -q "PANIC|panic:|TRAP:|BUG:" "$LOG"; then

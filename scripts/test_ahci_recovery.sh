@@ -37,6 +37,7 @@
 # Fail markers: [ahci-rec] FAIL / self-test reported FAIL
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -86,12 +87,11 @@ echo "[test_ahci_recovery] --- captured ([ahci-rec] / [ahci] PASS lines) ---"
 grep -E '\[ahci-rec\]|\[ahci\] PASS' "$LOG" || true
 echo "[test_ahci_recovery] --- end ---"
 
-fail=0
+# Zero [ahci-rec] markers => the recovery selftest never ran:
+# INCONCLUSIVE under starvation / rc=124, FAIL on an OBSERVED crash.
+verdict_boot_gate test_ahci_recovery "$LOG" "$rc" '\[ahci-rec\]'
 
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_ahci_recovery] FAIL: qemu exited rc=$rc" >&2
-    fail=1
-fi
+fail=0
 
 if grep -qF "[ahci-rec] FAIL" "$LOG"; then
     echo "[test_ahci_recovery] FAIL: recovery self-test reported an internal failure" >&2
@@ -122,8 +122,7 @@ check "hot-plug edge poll"         "[ahci] PASS hotplug"
 check "overall recovery PASS"      "[ahci-rec] PASS"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_ahci_recovery] FAIL"
-    exit 1
+    verdict_fail test_ahci_recovery "one or more AHCI error-recovery assertions were violated (see [test_ahci_recovery] FAIL lines above); the guest booted and ran the selftest, so this is a real, observed regression"
 fi
 
-echo "[test_ahci_recovery] PASS — AHCI performs the real STOP/CLEAR/COMRESET/RESTART error-recovery dance, the disk is usable again afterward (post-recovery IDENTIFY + LBA read), hot-plug edges are detected + acked, and command failures recover-and-retry rather than wedging"
+verdict_pass test_ahci_recovery "AHCI performs the real STOP/CLEAR/COMRESET/RESTART error-recovery dance, the disk is usable again afterward (post-recovery IDENTIFY + LBA read), hot-plug edges are detected + acked, and command failures recover-and-retry rather than wedging"

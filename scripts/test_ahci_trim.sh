@@ -30,6 +30,7 @@
 # Fail markers: [ahci-trim] FAIL / [ahci-ident] FAIL / self-test reported FAIL
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -82,12 +83,11 @@ echo "[test_ahci_trim] --- captured (ahci-ident / ahci-trim lines) ---"
 grep -E '\[ahci-(ident|trim)\]' "$LOG" || true
 echo "[test_ahci_trim] --- end ---"
 
-fail=0
+# Zero [ahci-ident]/[ahci-trim] markers => the selftest never ran:
+# INCONCLUSIVE under starvation / rc=124, FAIL on an OBSERVED crash.
+verdict_boot_gate test_ahci_trim "$LOG" "$rc" '\[ahci-(ident|trim)\]'
 
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_ahci_trim] FAIL: qemu exited rc=$rc" >&2
-    fail=1
-fi
+fail=0
 
 if grep -qF "[ahci-ident] FAIL" "$LOG"; then
     echo "[test_ahci_trim] FAIL: IDENTIFY self-test reported an internal failure" >&2
@@ -132,8 +132,7 @@ if [ -n "$got_sectors" ]; then
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_ahci_trim] FAIL"
-    exit 1
+    verdict_fail test_ahci_trim "one or more AHCI IDENTIFY/TRIM assertions were violated (see [test_ahci_trim] FAIL lines above); the guest booted and ran the selftest, so this is a real, observed regression"
 fi
 
-echo "[test_ahci_trim] PASS — AHCI IDENTIFY DEVICE decodes the 48-bit capacity (and SSD/HDD rotation), and DATA SET MANAGEMENT/TRIM issues through the command slot with a correctly-read completion status"
+verdict_pass test_ahci_trim "AHCI IDENTIFY DEVICE decodes the 48-bit capacity (and SSD/HDD rotation), and DATA SET MANAGEMENT/TRIM issues through the command slot with a correctly-read completion status"

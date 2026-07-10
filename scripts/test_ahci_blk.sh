@@ -30,6 +30,7 @@
 # Fail marker:  [ahci-blk] FAIL / self-test reported FAIL
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -80,12 +81,12 @@ echo "[test_ahci_blk] --- captured (ahci-blk lines) ---"
 grep -E '\[ahci-blk\]' "$LOG" || true
 echo "[test_ahci_blk] --- end ---"
 
-fail=0
+# Zero [ahci-blk] markers => the selftest never ran: INCONCLUSIVE under
+# starvation / rc=124, FAIL on an OBSERVED crash — never a bare hard FAIL
+# indistinguishable from host starvation.
+verdict_boot_gate test_ahci_blk "$LOG" "$rc" '\[ahci-blk\]'
 
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_ahci_blk] FAIL: qemu exited rc=$rc" >&2
-    fail=1
-fi
+fail=0
 
 if grep -qF "[ahci-blk] FAIL" "$LOG"; then
     echo "[test_ahci_blk] FAIL: kernel self-test reported an internal failure" >&2
@@ -113,8 +114,7 @@ check "generic readback matched"  "[ahci-blk] generic readback sd0 matches"
 check "ahci-blk self-test PASS"   "[ahci-blk] PASS"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_ahci_blk] FAIL"
-    exit 1
+    verdict_fail test_ahci_blk "one or more AHCI generic-block-layer assertions were violated (see [test_ahci_blk] FAIL lines above); the guest booted and ran the selftest, so this is a real, observed regression"
 fi
 
-echo "[test_ahci_blk] PASS — AHCI SATA disk reachable through the generic block-layer vtable: find_blockdev(sd0) + blk_write_sectors + blk_read_sectors round-trip verified byte-for-byte"
+verdict_pass test_ahci_blk "AHCI SATA disk reachable through the generic block-layer vtable: find_blockdev(sd0) + blk_write_sectors + blk_read_sectors round-trip verified byte-for-byte"

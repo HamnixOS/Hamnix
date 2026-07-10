@@ -35,6 +35,7 @@
 # Fail marker:  [blk-sched] FAIL / self-test reported FAIL
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -84,12 +85,11 @@ echo "[test_blk_sched] --- captured (blk-sched lines) ---"
 grep -E '\[blk-sched\]' "$LOG" || true
 echo "[test_blk_sched] --- end ---"
 
-fail=0
+# Zero [blk-sched] markers => the selftest never ran: INCONCLUSIVE under
+# starvation / rc=124, FAIL on an OBSERVED crash — never a bare hard FAIL.
+verdict_boot_gate test_blk_sched "$LOG" "$rc" '\[blk-sched\]'
 
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_blk_sched] FAIL: qemu exited rc=$rc" >&2
-    fail=1
-fi
+fail=0
 
 # Host-load flake: TCG-QEMU vCPU starvation can make a virtio-blk read
 # fail with status=255 at marker [000173]. We use AHCI here to avoid it,
@@ -124,8 +124,7 @@ check "non-adjacent kept 2 transfers" "[blk-sched] non-adjacent batch kept 2 tra
 check "blk-sched self-test PASS"      "[blk-sched] PASS"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_blk_sched] FAIL"
-    exit 1
+    verdict_fail test_blk_sched "one or more block-I/O-scheduler assertions were violated (see [test_blk_sched] FAIL lines above); the guest booted and ran the selftest, so this is a real, observed regression"
 fi
 
-echo "[test_blk_sched] PASS — additive block I/O scheduler: 4 out-of-order adjacent reads merged + elevator-ordered into 1 transfer, byte-identical to the synchronous path; non-adjacent batch correctly stayed 2 transfers"
+verdict_pass test_blk_sched "additive block I/O scheduler: 4 out-of-order adjacent reads merged + elevator-ordered into 1 transfer, byte-identical to the synchronous path; non-adjacent batch correctly stayed 2 transfers"

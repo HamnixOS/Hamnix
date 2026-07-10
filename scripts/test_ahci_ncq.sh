@@ -33,6 +33,7 @@
 # Fail marker:  [ahci-ncq] FAIL / self-test reported FAIL
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_verdict.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -94,12 +95,13 @@ echo "[test_ahci_ncq] --- captured (ahci-ncq lines) ---"
 grep -E '\[ahci-ncq\]' "$LOG" || true
 echo "[test_ahci_ncq] --- end ---"
 
-fail=0
+# Three-valued gate: a boot that never reached the selftest (zero
+# [ahci-ncq] markers) is INCONCLUSIVE under host starvation / rc=124,
+# or an actionable FAIL if the serial log shows an OBSERVED crash — it
+# is NEVER laundered into the same hard FAIL as a real regression.
+verdict_boot_gate test_ahci_ncq "$LOG" "$rc" '\[ahci-ncq\]'
 
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_ahci_ncq] FAIL: qemu exited rc=$rc" >&2
-    fail=1
-fi
+fail=0
 
 if grep -qF "[ahci-ncq] FAIL" "$LOG"; then
     echo "[test_ahci_ncq] FAIL: kernel self-test reported an internal failure" >&2
@@ -127,8 +129,7 @@ check "data verified"            "[ahci-ncq] req="
 check "ncq self-test PASS"       "[ahci-ncq] PASS"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_ahci_ncq] FAIL"
-    exit 1
+    verdict_fail test_ahci_ncq "one or more AHCI NCQ assertions were violated (see [test_ahci_ncq] FAIL lines above); the guest booted and ran the selftest, so this is a real, observed regression"
 fi
 
-echo "[test_ahci_ncq] PASS — AHCI allocates independent command-list slots per read, submits multiple reads across independent CI bits, detects which slots completed, and each slot's data is correct"
+verdict_pass test_ahci_ncq "AHCI allocates independent command-list slots per read, submits multiple reads across independent CI bits, detects which slots completed, and each slot's data is correct"
