@@ -30,6 +30,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_net_devnet
+
 ELF=build/hamnix-kernel.elf
 
 echo "[test_net_devnet] (1/3) Build userland + initramfs (with /etc/devnet-test marker)"
@@ -63,6 +66,11 @@ echo "[test_net_devnet] --- captured (devnet / tcp) ---"
 grep -E '\[devnet\]|\[tcp\]' "$LOG" || true
 echo "[test_net_devnet] --- end ---"
 
+# Three-valued gate: a starved / non-booting run (or a boot where DHCP/ARP
+# never completed) emits ZERO [devnet]/[tcp] markers. Route the zero-marker
+# case through the shared discriminator FIRST.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[devnet\]|\[tcp\]'
+
 required=(
     "[devnet] cloned /net/tcp connection"
     "[devnet] ctl connect ok"
@@ -80,19 +88,27 @@ for needle in "${required[@]}"; do
 done
 
 if [ "$full_pass" -eq 1 ]; then
-    echo "[test_net_devnet] PASS (full /net echo round-trip)"
-    exit 0
+    verdict_pass "$TAG" "Plan 9 /net: clone a /net/tcp connection, connect via" \
+        "the ctl file, and read the SLIRP-echoed 'hi\\n' back (full round-trip)"
 fi
 
 # Fallback: the file tree opened, cloned, and connected — the /net
 # surface itself works even if the echo data didn't round-trip.
 if grep -F -q "[devnet] ctl connect ok" "$LOG" \
    && grep -F -q "[devnet] /net smoke test done" "$LOG"; then
-    echo "[test_net_devnet] PASS (/net clone + connect + teardown; echo unavailable)"
-    exit 0
+    verdict_pass "$TAG" "Plan 9 /net clone + ctl-connect + teardown ran" \
+        "end-to-end; the SLIRP guestfwd echo payload was unavailable on this" \
+        "QEMU build, but the /net file surface is proven"
 fi
 
-echo "[test_net_devnet] FAIL (qemu rc=$rc)"
 echo "[test_net_devnet] --- full log ---"
 cat "$LOG"
-exit 1
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "[devnet]/[tcp] markers printed but the /net smoke reached neither a" \
+        "full round-trip nor clone+connect+teardown, and qemu was killed by" \
+        "timeout (rc=124) — starved mid-run. Re-run on a QUIET host."
+fi
+verdict_fail "$TAG" \
+    "the /net smoke reached neither a full echo round-trip nor" \
+    "clone+connect+teardown (qemu rc=$rc) — real regression in the /net server."

@@ -33,6 +33,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_net_dns_cache
+
 ELF=build/hamnix-kernel.elf
 
 echo "[test_net_dns_cache] (1/3) Build userland + initramfs"
@@ -63,14 +66,33 @@ echo "[test_net_dns_cache] --- captured (dns / dhcp / http) ---"
 grep -E '\[dns\]|\[dhcp\]|\[http\]' "$LOG" || true
 echo "[test_net_dns_cache] --- end ---"
 
-# Skip cleanly if DHCP didn't complete — the wire query never ran, so
-# there's nothing for the cache to short-circuit. test_dns.sh / the
-# other net tests use the same skip rule for no-internet CI sandboxes.
+# Three-valued gate: a starved / non-booting run emits ZERO [dns]/[dhcp]
+# markers. Route the zero-marker case through the shared discriminator FIRST
+# (INCONCLUSIVE on timeout/OOM, FAIL on an observed crash).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[dns\]|\[dhcp\]'
+
+# The cold wire query never ran. Previously this SKIPed to a bogus PASS —
+# a false green: the gate reported success while asserting NOTHING about
+# the cache. It is now INCONCLUSIVE (we did not observe the assertion),
+# never PASS. Requires real internet, so this gate is NOT in the offline
+# battery; a cold path that never fires means no internet or no DHCP lease.
 if ! grep -F -q "[dns] querying" "$LOG"; then
-    echo "[test_net_dns_cache] SKIP (no [dns] querying — DHCP didn't" \
-         "complete? cold path didn't run)"
-    echo "[test_net_dns_cache] PASS"
-    exit 0
+    verdict_inconclusive "$TAG" \
+        "no '[dns] querying' line — the cold DNS lookup never ran (DHCP" \
+        "didn't complete, or no internet), so the cache short-circuit could" \
+        "not be observed. This is NOT proof the cache works. Run online."
+fi
+
+# The cold query ran but the resolver never got an answer (no '[dns] cache
+# store' / '[dns] resolved') — that is an OFFLINE runner, not a broken
+# cache. Without an answer there is nothing to store and the http leg
+# cannot cache-hit. INCONCLUSIVE, not FAIL.
+if ! grep -F -q "[dns] cache store example.com" "$LOG" \
+   && ! grep -F -q "[dns] resolved example.com" "$LOG"; then
+    verdict_inconclusive "$TAG" \
+        "'[dns] querying' fired but the resolver got no answer to store" \
+        "(no '[dns] cache store'/'[dns] resolved') — the wire query timed out" \
+        "(no internet). The cache cannot short-circuit an answer it never got."
 fi
 
 # Find the line number of the first "[dns] querying" and the first
@@ -82,22 +104,24 @@ querying_line=$(grep -n -F "[dns] querying" "$LOG" | head -1 | cut -d: -f1)
 hit_line=$(grep -n -F "[dns] cache hit example.com" "$LOG" | head -1 | cut -d: -f1)
 
 if [[ -z "${hit_line}" ]]; then
-    echo "[test_net_dns_cache] FAIL (no '[dns] cache hit example.com'" \
-         "after cold lookup — cache not storing answers?)"
     echo "[test_net_dns_cache] --- full log ---"
     cat "$LOG"
-    exit 1
+    verdict_fail "$TAG" \
+        "the resolver stored an answer for example.com but the second lookup" \
+        "produced no '[dns] cache hit example.com' — the cache is not storing" \
+        "or not consulting answers (qemu rc=$rc). Real regression."
 fi
 
 if (( hit_line <= querying_line )); then
-    echo "[test_net_dns_cache] FAIL (cache hit at line $hit_line came" \
-         "BEFORE querying line $querying_line — order inverted)"
     echo "[test_net_dns_cache] --- full log ---"
     cat "$LOG"
-    exit 1
+    verdict_fail "$TAG" \
+        "the '[dns] cache hit' at line $hit_line came BEFORE the '[dns]" \
+        "querying' at line $querying_line — order inverted, the cold path" \
+        "did not store before the hot path read (qemu rc=$rc). Real regression."
 fi
 
 echo "[test_net_dns_cache] cold query at line $querying_line, cache" \
      "hit at line $hit_line — order OK"
-echo "[test_net_dns_cache] PASS"
-exit 0
+verdict_pass "$TAG" "the cold dns_lookup(example.com) stored the answer and" \
+    "the subsequent lookup short-circuited on a '[dns] cache hit' (in order)"

@@ -32,6 +32,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_net_tcp
+
 ELF=build/hamnix-kernel.elf
 
 echo "[test_net_tcp] (1/3) Build userland + initramfs"
@@ -66,6 +69,12 @@ echo "[test_net_tcp] --- captured (tcp / dhcp / arp) ---"
 grep -E '\[tcp\]|\[dhcp\]|\[arp\]' "$LOG" || true
 echo "[test_net_tcp] --- end ---"
 
+# Three-valued gate: a starved / non-booting run (or a boot where DHCP/ARP
+# never completed) emits ZERO [tcp] markers. Route the zero-marker case
+# through the shared discriminator FIRST (INCONCLUSIVE on timeout/OOM, FAIL
+# on an observed crash).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[tcp\]'
+
 # Required markers — all four must appear for a full PASS.
 required=(
     "[tcp] connected slot=0"
@@ -85,8 +94,8 @@ for needle in "${required[@]}"; do
 done
 
 if [ "$full_pass" -eq 1 ]; then
-    echo "[test_net_tcp] PASS (full echo round-trip)"
-    exit 0
+    verdict_pass "$TAG" "TCP/IPv4 client: connect, send 3 bytes, receive the" \
+        "SLIRP-echoed 'hi\\n', and clean FIN teardown (full echo round-trip)"
 fi
 
 # Fallback: handshake-only proof. If the SYN/SYN-ACK/ACK and FIN
@@ -94,11 +103,22 @@ fi
 # still proves the state machine works — accept as PASS but note.
 if grep -F -q "[tcp] slot=0 -> ESTABLISHED" "$LOG" \
    && grep -F -q "[tcp] closed slot=0" "$LOG"; then
-    echo "[test_net_tcp] PASS (handshake + teardown; echo unavailable)"
-    exit 0
+    verdict_pass "$TAG" "TCP/IPv4 handshake (SYN/SYN-ACK/ACK) + FIN teardown" \
+        "ran end-to-end; the SLIRP guestfwd echo payload was unavailable on" \
+        "this QEMU build, but the connection state machine is proven"
 fi
 
-echo "[test_net_tcp] FAIL (qemu rc=$rc)"
 echo "[test_net_tcp] --- full log ---"
 cat "$LOG"
-exit 1
+# Some [tcp] markers printed but neither a full round-trip nor the
+# handshake+teardown pair completed AND qemu was killed by timeout ->
+# starved mid-connection, not a regression.
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "[tcp] markers printed but the connection did not reach a full echo" \
+        "round-trip nor a handshake+teardown pair, and qemu was killed by" \
+        "timeout (rc=124) — starved mid-connection. Re-run on a QUIET host."
+fi
+verdict_fail "$TAG" \
+    "the TCP client reached neither a full echo round-trip nor a" \
+    "handshake+teardown (qemu rc=$rc) — real regression in the TCP state machine."

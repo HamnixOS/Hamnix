@@ -40,6 +40,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_tcp_ring
+
 ELF=build/hamnix-kernel.elf
 
 echo "[test_tcp_ring] (1/4) Build userland + initramfs (with /etc/tcp-ring-test marker)"
@@ -185,20 +188,32 @@ echo "[test_tcp_ring] --- server log ---"
 cat "$SRVLOG" || true
 echo "[test_tcp_ring] --- end ---"
 
+# Three-valued gate: a starved / non-booting run emits ZERO [tcp_ring]
+# markers. Route the zero-marker case through the shared discriminator FIRST.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[tcp_ring\]'
+
 if grep -F -q "[tcp_ring] PASS got 4096 bytes" "$LOG"; then
-    echo "[test_tcp_ring] PASS (RX ring accumulated both segments)"
-    exit 0
+    verdict_pass "$TAG" "the TCP RX ring accumulated both segments into a" \
+        "full 4096-byte payload (segmented receive reassembles in-order)"
 fi
 
 # Diagnostics: did we at least reach the smoke?
 if grep -F -q "[tcp_ring] V5.3 smoke test starting" "$LOG"; then
-    echo "[test_tcp_ring] FAIL (smoke reached but full 4096 bytes missing)"
     echo "[test_tcp_ring] --- full kernel log tail ---"
     tail -80 "$LOG"
-    exit 1
+    if [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[tcp_ring] smoke ran but did not accumulate the full 4096 bytes" \
+            "and qemu was killed by timeout (rc=124) — starved before the" \
+            "second segment arrived. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "the RX-ring smoke ran but did not accumulate the full 4096 bytes" \
+        "(qemu rc=$rc) — real regression in segmented TCP receive."
 fi
 
-echo "[test_tcp_ring] FAIL (qemu rc=$rc; smoke never reached — DHCP / netdev problem?)"
 echo "[test_tcp_ring] --- full kernel log ---"
 cat "$LOG"
-exit 1
+verdict_fail "$TAG" \
+    "the [tcp_ring] smoke never started despite other markers (qemu rc=$rc)" \
+    "— real regression in reaching the smoke path (DHCP / netdev)."

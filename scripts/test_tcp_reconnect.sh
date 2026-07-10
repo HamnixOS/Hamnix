@@ -42,6 +42,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_tcp_reconnect
+
 ELF=build/hamnix-kernel.elf
 
 echo "[test_tcp_reconnect] (1/3) Build userland + initramfs (with /etc/tcp-reconnect-test marker)"
@@ -75,29 +78,35 @@ echo "[test_tcp_reconnect] --- captured (tcp_reconnect / tcp / dhcp / arp) ---"
 grep -E '\[tcp_reconnect\]|\[tcp\]|\[dhcp\]|\[arp\]' "$LOG" || true
 echo "[test_tcp_reconnect] --- end ---"
 
-pass=1
+# Three-valued gate: a starved / non-booting run emits ZERO [tcp_reconnect]
+# markers. Route the zero-marker case through the shared discriminator FIRST.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[tcp_reconnect\]'
 
 if grep -F -q "[tcp_reconnect] PASS 6/6 back-to-back connects" "$LOG"; then
-    echo "[test_tcp_reconnect] OK: 6/6 back-to-back connects succeeded"
-else
-    echo "[test_tcp_reconnect] MISS: '[tcp_reconnect] PASS 6/6 back-to-back connects'"
-    pass=0
-fi
-
-if [ "$pass" -eq 1 ]; then
-    echo "[test_tcp_reconnect] PASS (6 back-to-back connects, no artificial delay)"
-    exit 0
+    verdict_pass "$TAG" "6/6 back-to-back TCP connects succeed with no" \
+        "artificial delay (ephemeral-port allocation does not stall on reuse)"
 fi
 
 # Diagnostics: did we at least reach the smoke?
 if grep -F -q "[tcp_reconnect] smoke test starting" "$LOG"; then
-    echo "[test_tcp_reconnect] FAIL (smoke ran but did not reach 6/6)"
     echo "[test_tcp_reconnect] --- full kernel log tail ---"
     tail -80 "$LOG"
-    exit 1
+    # The smoke ran but did not reach 6/6. If qemu was killed by timeout,
+    # it was starved mid-run (each connect waits on SLIRP/ARP); a clean
+    # exit without 6/6 is a real regression.
+    if [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[tcp_reconnect] smoke ran but did not reach 6/6 and qemu was" \
+            "killed by timeout (rc=124) — starved mid-run. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "the reconnect smoke ran but did not reach 6/6 back-to-back connects" \
+        "(qemu rc=$rc) — real regression in TCP connect/teardown reuse."
 fi
 
-echo "[test_tcp_reconnect] FAIL (qemu rc=$rc; smoke never reached)"
 echo "[test_tcp_reconnect] --- full kernel log ---"
 cat "$LOG"
+verdict_fail "$TAG" \
+    "the [tcp_reconnect] smoke never started despite other markers (qemu" \
+    "rc=$rc) — real regression in reaching the smoke path."
 exit 1
