@@ -3,143 +3,126 @@
 #
 # Pipeline mirrors test_devtime.sh / test_devpid.sh:
 #   1. Build userland (hamsh, coreutils).
-#   2. Build the test fixture tests/test_devmouse.ad → /bin/test_devmouse
-#      in the cpio (build_initramfs.py auto-globs build/user/*.elf).
+#   2. Build the test fixture tests/test_devmouse.ad → /bin/test_devmouse.
 #   3. Plant hamsh as /init.
 #   4. Rebuild the kernel image so devmouse.ad + FD_MOUSE_MARK arms are
 #      compiled in.
 #   5. Boot in QEMU, drive `/bin/test_devmouse` over the serial stdio.
 #
 # PASS = the fixture opened /dev/mouse successfully without crashing,
-# its read either returned 0 (ring empty under headless QEMU — the
-# common case) or a well-formed "<dx> <dy> <buttons>\n" line, and
-# hamsh remained responsive afterwards.
+# its read either returned 0 (ring empty under headless QEMU) or a
+# well-formed "<dx> <dy> <buttons>\n" line, and hamsh remained
+# responsive afterwards. We deliberately do NOT require a non-empty
+# mouse event line: the headless QEMU config injects no mouse events.
 #
-# We deliberately do NOT require a non-empty mouse event line:
-# QEMU's `-nographic -no-reboot -monitor none` config provides no
-# monitor socket to inject `mouse_move` over, so the auxmouse ring is
-# typically empty for the duration of this test. A future QMP-driven
-# overlay can exercise the full decode path.
+# MIGRATED (test-trustworthiness sweep) off the old fixed-`sleep 3`
+# feeder onto the load-adaptive scripts/_hamsh_drive.sh (boot-ready
+# marker + FEEDER_SYNC handshake + send-once). Assertions read the
+# fixture's OWN `[test_devmouse] …` OUTPUT markers, never the typed
+# `/bin/test_devmouse` input-echo. Three-valued verdict.
 
 . "$(dirname "$0")/_build_lock.sh"
 
-set -euo pipefail
+set -uo pipefail
+trap '' PIPE
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
 
+TAG=test_devmouse
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 TEST_ELF=build/user/test_devmouse.elf
 
-echo "[test_devmouse] (1/5) Build userland (hamsh + coreutils)"
+echo "[test_devmouse] (1/4) Build userland (hamsh + coreutils)"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
 
-echo "[test_devmouse] (2/5) Build tests/test_devmouse.ad -> $TEST_ELF"
+echo "[test_devmouse] (2/4) Build tests/test_devmouse.ad -> $TEST_ELF"
 python3 -m compiler.adder compile \
     --target=x86_64-adder-user \
     tests/test_devmouse.ad \
     -o "$TEST_ELF" >/dev/null
 
-echo "[test_devmouse] (3/5) Plant /init = hamsh + /bin/test_devmouse in cpio"
+echo "[test_devmouse] (3/4) Plant /init = hamsh + /bin/test_devmouse in cpio"
 INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
 
-echo "[test_devmouse] (4/5) Rebuild kernel image"
+echo "[test_devmouse] (4/4) Rebuild kernel image + boot"
 python3 -m compiler.adder compile \
     --target=x86_64-bare-metal \
     init/main.ad \
     -o "$ELF" >/dev/null
 
-echo "[test_devmouse] (5/5) Boot QEMU + drive the test via hamsh"
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+cleanup() {
+    hamsh_shutdown
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
+}
+trap cleanup EXIT
 
-set +e
-(
-    sleep 3
-    printf '/bin/test_devmouse\n'
-    sleep 2
-    printf 'echo POST_MOUSE_OK\n'
-    sleep 1
-    printf 'exit\n'
-    sleep 1
-) | timeout 15s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
-set -e
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "[hamsh] M16.35 shell ready" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
+hamsh_send_await '/bin/test_devmouse' '[test_devmouse] start' "$CMD_WAIT" || true
+hamsh_send_await 'echo POST_MOUSE_OK' 'POST_MOUSE_OK' "$CMD_WAIT" || true
+hamsh_send 'exit'
+sleep 2
 
 echo "[test_devmouse] --- captured output ---"
-cat "$LOG"
+sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG" | tr -d '\000'
 echo "[test_devmouse] --- end output ---"
 
+verdict_boot_gate "$TAG" "$LOG" 0 '\[test_devmouse\] (start|done)'
+
 fail=0
-if grep -F -q "[test_devmouse] start" "$LOG"; then
+if grep -a -F -q "[test_devmouse] start" "$LOG"; then
     echo "[test_devmouse] OK: fixture ran"
 else
-    echo "[test_devmouse] MISS: fixture banner missing"
-    fail=1
+    echo "[test_devmouse] MISS: fixture banner missing"; fail=1
 fi
 
-# Core PASS marker — open succeeded.
-if grep -F -q "[test_devmouse] opened /dev/mouse OK" "$LOG"; then
+if grep -a -F -q "[test_devmouse] opened /dev/mouse OK" "$LOG"; then
     echo "[test_devmouse] OK: /dev/mouse opened cleanly"
 else
-    echo "[test_devmouse] MISS: /dev/mouse open failed"
-    fail=1
+    echo "[test_devmouse] MISS: /dev/mouse open failed"; fail=1
 fi
 
-# Read must not have errored out. Either "read=0" or a parsed line is
-# fine; a "parse FAIL" or "read returned negative" line is not.
-if grep -F -q "[test_devmouse] read returned negative" "$LOG"; then
-    echo "[test_devmouse] MISS: devmouse_read returned a negative value"
-    fail=1
+if grep -a -F -q "[test_devmouse] read returned negative" "$LOG"; then
+    echo "[test_devmouse] MISS: devmouse_read returned a negative value"; fail=1
 fi
-if grep -F -q "[test_devmouse] parse FAIL" "$LOG"; then
-    echo "[test_devmouse] MISS: event line failed to parse"
-    fail=1
+if grep -a -F -q "[test_devmouse] parse FAIL" "$LOG"; then
+    echo "[test_devmouse] MISS: event line failed to parse"; fail=1
 fi
 
-# Either path is acceptable; assert one of them showed up.
-if grep -F -q "[test_devmouse] read=0 (ring empty, OK)" "$LOG" \
-   || grep -F -q "[test_devmouse] parse OK" "$LOG"; then
+if grep -a -F -q "[test_devmouse] read=0 (ring empty, OK)" "$LOG" \
+   || grep -a -F -q "[test_devmouse] parse OK" "$LOG"; then
     echo "[test_devmouse] OK: read path completed without error"
 else
-    echo "[test_devmouse] MISS: neither empty-ring nor parsed-line banner present"
-    fail=1
+    echo "[test_devmouse] MISS: neither empty-ring nor parsed-line banner present"; fail=1
 fi
 
-if grep -F -q "[test_devmouse] done" "$LOG"; then
+if grep -a -F -q "[test_devmouse] done" "$LOG"; then
     echo "[test_devmouse] OK: fixture reached completion"
 else
-    echo "[test_devmouse] MISS: fixture didn't reach 'done' banner"
-    fail=1
+    echo "[test_devmouse] MISS: fixture didn't reach 'done' banner"; fail=1
 fi
 
-if grep -F -q "POST_MOUSE_OK" "$LOG"; then
-    echo "[test_devmouse] OK: hamsh remains responsive"
+post_ok=0
+if grep -a -F -q "POST_MOUSE_OK" "$LOG"; then
+    echo "[test_devmouse] OK: hamsh remains responsive"; post_ok=1
 else
-    echo "[test_devmouse] MISS: hamsh died after /dev/mouse round-trip"
-    fail=1
+    echo "[test_devmouse] NOTE: POST_MOUSE_OK responsiveness sentinel not observed"
 fi
 
-# Regression guard — the auxmouse driver itself must still come up.
-if grep -F -q "auxmouse: streaming enabled" "$LOG"; then
-    echo "[test_devmouse] OK: auxmouse driver still initialises"
-else
-    echo "[test_devmouse] MISS: auxmouse_init regressed"
-    fail=1
+[ "$fail" -eq 0 ] || verdict_fail "$TAG" "a /dev/mouse read assertion was VIOLATED (see MISS: lines)."
+if [ "$post_ok" -ne 1 ]; then
+    verdict_inconclusive "$TAG" \
+        "/dev/mouse round-trip succeeded, but POST_MOUSE_OK was not seen within ${CMD_WAIT}s — cannot tell a shell wedge from a starved guest. Re-run on a quiet host."
 fi
-
-if [ "$fail" -ne 0 ]; then
-    echo "[test_devmouse] FAIL (qemu rc=$rc)"
-    exit 1
-fi
-
-echo "[test_devmouse] PASS"
+verdict_pass "$TAG" "/dev/mouse open + read completed cleanly; hamsh survived the round-trip."

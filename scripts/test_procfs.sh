@@ -1,100 +1,86 @@
 #!/usr/bin/env bash
 # scripts/test_procfs.sh - M16.36 verification.
 #
-# Boots hamsh as /init, drives it through `/ps` + `exit`, and greps
-# the captured serial log for:
+# Boots hamsh as /init, drives it through `ps` + `exit`, and greps the
+# captured serial log for:
 #
 #   1. the /proc/version banner            → procfs renderer ran
-#   2. the /proc/uptime line                → uptime helper formatted
-#   3. the "__init__" comm                  → /proc/tasks walked the
+#   2. the /proc/uptime line               → uptime helper formatted
+#   3. the "__init__" comm                 → /proc/tasks walked the
 #                                            task table and rendered
 #                                            the live shell process
 #
-# Verdicts follow scripts/_verdict.sh: PASS=0, FAIL=1, INCONCLUSIVE=125.
-# A guest that never reaches `ps` within the window proves nothing about
-# the renderer (this host starves TCG guests), so it is INCONCLUSIVE
-# rather than a false red.
+# MIGRATED (test-trustworthiness sweep) off the old fixed-`sleep 3` +
+# resend feeder onto the load-adaptive scripts/_hamsh_drive.sh:
+# boot-ready marker + FEEDER_SYNC handshake, then `ps` is sent exactly
+# ONCE and waited on its own observable /proc/tasks output. The
+# assertions read genuine `ps` OUTPUT (the /proc renderers' bytes), NOT
+# the typed `ps` input-echo. Three-valued verdict (scripts/_verdict.sh):
+# a guest that never reaches `ps` proves nothing about the renderers
+# (this host starves TCG guests) → INCONCLUSIVE, not a false red.
 
 . "$(dirname "$0")/_build_lock.sh"
-. "$(dirname "$0")/_verdict.sh"
 
 set -uo pipefail
-
-TAG="test_procfs"
+trap '' PIPE
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
+. "$PROJ_ROOT/scripts/_hamsh_log.sh"
 
+TAG=test_procfs
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
-QEMU_TIMEOUT="${QEMU_TIMEOUT:-180}"
-PS_TRIES="${PS_TRIES:-12}"
-PS_INTERVAL="${PS_INTERVAL:-10}"
+echo "[test_procfs] (1/3) Build userland"
+bash scripts/build_user.sh >/dev/null
+bash scripts/build_modules.sh >/dev/null
 
-echo "[test_procfs] (1/4) Build userland"
-bash scripts/build_user.sh
-bash scripts/build_modules.sh
+echo "[test_procfs] (2/3) Swap /init = $HAMSH_ELF"
+INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
 
-echo "[test_procfs] (2/4) Swap /init = $HAMSH_ELF"
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py
-
-echo "[test_procfs] (3/4) Rebuild kernel image"
+echo "[test_procfs] (3/3) Rebuild kernel image + boot"
 python3 -m compiler.adder compile \
     --target=x86_64-bare-metal \
     init/main.ad \
-    -o "$ELF"
+    -o "$ELF" >/dev/null
 
-echo "[test_procfs] (4/4) Boot QEMU and run ps via hamsh"
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+cleanup() {
+    hamsh_shutdown
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
+}
+trap cleanup EXIT
 
-set +e
-# TCG boot to a live hamsh prompt takes tens of seconds on a loaded
-# host; the old fixed `sleep 3` + 15s cap shoved `ps` at the 16550 RX
-# FIFO long before readline existed and then killed the guest. Send `ps`
-# repeatedly (a freshly-booted hamsh drops the FIRST serial command) and
-# give the run a window it can actually finish in.
-(
-    for _ in $(seq 1 "$PS_TRIES"); do
-        printf 'ps\n'
-        sleep "$PS_INTERVAL"
-    done
-    printf 'exit\n'
-    sleep 2
-) | timeout "${QEMU_TIMEOUT}s" qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
-set -e
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "[hamsh] M16.35 shell ready" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
+hamsh_send_await 'ps' '/proc/tasks ---' "$CMD_WAIT" || true
+hamsh_send 'exit'
+sleep 2
 
 echo "[test_procfs] --- captured output ---"
-cat "$LOG"
+sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG" | tr -d '\000'
 echo "[test_procfs] --- end output ---"
 
-# The guest must have reached `ps` at all, else we observed nothing.
-if ! grep -a -F -q -- "--- /proc/tasks ---" "$LOG"; then
-    verdict_inconclusive "$TAG" \
-        "guest never reached \`ps\` within ${QEMU_TIMEOUT}s (qemu rc=$rc); the /proc renderers were never exercised."
-fi
+# Zero /proc/tasks output -> the guest was starved, not the renderer broken.
+verdict_boot_gate "$TAG" "$LOG" 0 '/proc/tasks ---'
 
 fail=0
-# /proc/version renders the "hamnix/<ver>" banner; /proc/uptime renders
-# Linux-shape "<up> <idle>" seconds; /proc/tasks renders one row per live
-# task, and the hamsh-as-init task never execve's so it keeps its
-# creation-time name0 tag "__init__".
+# Assert on genuine command OUTPUT (drop prompt/input-echo lines).
 for needle in \
     "hamnix/" \
-    "--- /proc/uptime ---" \
+    "/proc/uptime ---" \
     "PID	STATE	COMM" \
     "__init__"
 do
-    if grep -a -F -q -- "$needle" "$LOG"; then
+    if hamsh_ran "$LOG" "$needle"; then
         echo "[$TAG] OK: '$needle'"
     else
         echo "[$TAG] MISS: '$needle'"
@@ -117,5 +103,5 @@ if [ -n "$EMPTY" ]; then
     fail=1
 fi
 
-[ "$fail" -eq 0 ] || verdict_fail "$TAG" "one or more /proc renderers MISSed (qemu rc=$rc)."
-verdict_pass "$TAG" "/proc/version, /proc/uptime and /proc/tasks all rendered (qemu rc=$rc)."
+[ "$fail" -eq 0 ] || verdict_fail "$TAG" "one or more /proc renderers MISSed."
+verdict_pass "$TAG" "/proc/version, /proc/uptime and /proc/tasks all rendered."
