@@ -163,7 +163,14 @@ verdict_pass_structural() {
 verdict_boot_gate() {
     local tag="$1" log="$2" rc="$3" marker_re="$4" min="${5:-1}"
     local markers
-    markers=$(grep -c -aE "$marker_re" "$log" 2>/dev/null || echo 0)
+    # `grep -c` already PRINTS the count (0 when none) but EXITS 1 on zero
+    # matches; a `|| echo 0` here appended a SECOND "0", yielding a two-line
+    # "0\n0" that made the `-ge` test below abort with "integer expression
+    # expected" on exactly the zero-marker path this function exists to
+    # handle. Mask grep's exit with `|| true` (its "0" stdout is kept) and
+    # default an empty capture (missing log) to 0.
+    markers=$(grep -c -aE "$marker_re" "$log" 2>/dev/null || true)
+    [ -n "$markers" ] || markers=0
     if [ "$markers" -ge "$min" ]; then
         return 0
     fi
