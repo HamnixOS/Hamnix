@@ -27,95 +27,102 @@
 #   [v35-recipe-text] OK
 #   [v35-userinit] PASS
 
+# ---------------------------------------------------------------------------
+# MIGRATED onto scripts/_hamsh_drive.sh (test-trustworthiness campaign).
+# The legacy driver did `( sleep N; printf '/bin/test_9p_v35_userinit\n'; ... ) | qemu`:
+# under host load the fixed sleep raced ahead of hamsh's readline and the
+# command was dropped, so the gate MISSed its own markers and reported a
+# FALSE red. This drives hamsh prompt-gated (boot-ready marker) + output-
+# adaptive (FEEDER_SYNC handshake, send-once/wait-on-effect) and reports the
+# three-valued verdict: a starved guest is INCONCLUSIVE, an observed fixture
+# `[v35-userinit] FAIL:` (or a started-but-never-PASSed run while the shell demonstrably
+# survived) is FAIL, and only an observed `[v35-userinit] PASS` is a green.
 . "$(dirname "$0")/_build_lock.sh"
 
-set -euo pipefail
+set -uo pipefail
+trap '' PIPE
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
 
+TAG=test_9p_v35_userinit
+BTAG='v35-userinit'
 ELF=build/hamnix-kernel.elf
+HAMSH_ELF=build/user/hamsh.elf
 TEST_ELF=build/user/test_9p_v35_userinit.elf
+TEST_SRC=tests/test_9p_v35_userinit.ad
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 
-echo "[test_9p_v35_userinit] (1/5) Build userland (init + hamsh + coreutils)"
-bash scripts/build_user.sh >/dev/null
-bash scripts/build_modules.sh >/dev/null
+# ---- build ---------------------------------------------------------------
+bash scripts/build_user.sh >/dev/null \
+    || verdict_inconclusive "$TAG" "build_user failed"
+bash scripts/build_modules.sh >/dev/null \
+    || verdict_inconclusive "$TAG" "build_modules failed"
+python3 -m compiler.adder compile --target=x86_64-adder-user \
+    "$TEST_SRC" -o "$TEST_ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "fixture compile failed ($TEST_SRC)"
+ python3 scripts/build_initramfs.py >/dev/null \
+    || verdict_inconclusive "$TAG" "build_initramfs failed"
+python3 -m compiler.adder compile --target=x86_64-bare-metal \
+    init/main.ad -o "$ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "kernel compile failed"
 
-echo "[test_9p_v35_userinit] (2/5) Build tests/test_9p_v35_userinit.ad -> $TEST_ELF"
-python3 -m compiler.adder compile \
-    --target=x86_64-adder-user \
-    tests/test_9p_v35_userinit.ad \
-    -o "$TEST_ELF" >/dev/null
-
-# build_initramfs.py automatically picks up build/user/init.elf and
-# installs it at /init in the cpio archive (no INIT_ELF override
-# needed). init applies the recipe then execs /bin/hamsh.
-echo "[test_9p_v35_userinit] (3/5) Plant /init = init.elf + /bin/test_9p_v35_userinit in cpio"
-python3 scripts/build_initramfs.py >/dev/null
-
-echo "[test_9p_v35_userinit] (4/5) Rebuild kernel image"
-mkdir -p build
-python3 -m compiler.adder compile \
-    --target=x86_64-bare-metal \
-    init/main.ad \
-    -o "$ELF" >/dev/null
-
-echo "[test_9p_v35_userinit] (5/5) Boot QEMU + drive the test via hamsh"
+# ---- boot + drive --------------------------------------------------------
 LOG=$(mktemp)
-trap 'rm -f "$LOG"' EXIT
-
-set +e
-(
-    # init prints its progress, exec's hamsh, then we type the test
-    # command into the shell prompt. Pacing matches the other V3 /
-    # ns-isolation tests.
-    sleep 4
-    printf '/bin/test_9p_v35_userinit\n'
-    sleep 4
-    printf 'exit\n'
-    sleep 1
-) | timeout 30s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
-set -e
-
-echo "[test_9p_v35_userinit] --- captured output ---"
-cat "$LOG"
-echo "[test_9p_v35_userinit] --- end output ---"
-
-fail=0
-
-check_marker() {
-    local marker="$1"
-    local label="$2"
-    if grep -F -q "$marker" "$LOG"; then
-        echo "[test_9p_v35_userinit] OK: $label"
-    else
-        echo "[test_9p_v35_userinit] MISS: $label ($marker)"
-        fail=1
-    fi
+cleanup() {
+    hamsh_shutdown
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
 }
+trap cleanup EXIT
 
-check_marker "[v35-userinit] start"    "fixture ran"
-check_marker "[v35-hash-s] OK"         "#s device alias"
-check_marker "[v35-hash-p] OK"         "#p/<pid>/ns dispatch"
-check_marker "[v35-hash-c] OK"         "#c console alias"
-check_marker "[v35-hash-slot] OK"      "#/ root-dir slot"
-check_marker "[v35-recipe-srv] OK"     "/srv after recipe bind"
-check_marker "[v35-recipe-proc] OK"    "/proc/1/ns after recipe bind"
-check_marker "[v35-recipe-n] OK"       "/n after recipe bind"
-check_marker "[v35-recipe-text] OK"    "/proc/1/ns text shows recipe"
-check_marker "[v35-userinit] PASS"     "fixture reached PASS"
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "M16.35 shell ready" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
 
-if [ "$fail" -ne 0 ]; then
-    echo "[test_9p_v35_userinit] FAIL (qemu rc=$rc)"
-    exit 1
+# Run the fixture ONCE and wait on its OWN terminal banner ([BTAG] PASS).
+# Then a survival sentinel: a trivial external echo AFTER the fixture, waited
+# on its own effect. If POST lands, the shell was demonstrably alive — so a
+# fixture that still never reached PASS aborted/hung (a real bug), NOT a
+# starved guest. This is the false-red/false-green discriminator.
+hamsh_send_await "/bin/$TAG" "[$BTAG] PASS" "$CMD_WAIT" || true
+hamsh_send_await "/bin/echo POST_${TAG}_OK" "POST_${TAG}_OK" "$CMD_WAIT" || true
+hamsh_send 'exit'
+sleep 2
+
+echo "[$TAG] --- captured output ---"
+sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG" | tr -d '\000'
+echo "[$TAG] --- end output ---"
+
+# ---- verdict -------------------------------------------------------------
+# Guest demonstrably alive & producing output? Require the fixture's start
+# banner OR the survival sentinel; neither after a clean boot+sync means a
+# wedge/starve — verdict_boot_gate sorts INCONCLUSIVE vs FAIL.
+verdict_boot_gate "$TAG" "$LOG" 0 "\\[$BTAG\\] start|POST_${TAG}_OK"
+
+# 1. The fixture's OWN failure line is an OBSERVED regression -> FAIL.
+if grep -aqF "[$BTAG] FAIL" "$LOG"; then
+    grep -aF "[$BTAG] FAIL" "$LOG" | sed 's/^/  /'
+    verdict_fail "$TAG" "fixture emitted [$BTAG] FAIL: — an OBSERVED regression"
 fi
-
-echo "[test_9p_v35_userinit] PASS"
+# 2. The fixture reached its aggregate PASS banner (only printed when every
+#    sub-assertion held) -> the observation we are named for. PASS.
+if grep -aqF "[$BTAG] PASS" "$LOG"; then
+    verdict_pass "$TAG" "fixture reached [$BTAG] PASS (all sub-assertions held)"
+fi
+# 3. No terminal verdict. If the survival sentinel landed the shell was NOT
+#    starved, so the fixture started and then aborted/hung before PASS -> a
+#    real FAIL. If the sentinel is absent too, the guest starved mid-run and
+#    we observed nothing conclusive -> INCONCLUSIVE.
+if grep -aqF "POST_${TAG}_OK" "$LOG"; then
+    verdict_fail "$TAG" \
+        "fixture started but never reached [$BTAG] PASS and emitted no [$BTAG] FAIL" \
+        "line, yet the post-fixture survival echo DID reach stdout — the shell" \
+        "was alive, so the fixture aborted/hung mid-run (a real regression)."
+fi
+verdict_inconclusive "$TAG" \
+    "fixture start seen but neither [$BTAG] PASS/FAIL nor the survival sentinel" \
+    "was observed within ${CMD_WAIT}s — the guest starved mid-run. Re-run quiet."

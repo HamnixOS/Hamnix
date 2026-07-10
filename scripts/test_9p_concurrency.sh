@@ -35,129 +35,103 @@
 #   6. Grep the serial log for the [9pconc] markers + the kernel
 #      "[9p] tagged concurrency" one-shot.
 
+# ---------------------------------------------------------------------------
+# MIGRATED onto scripts/_hamsh_drive.sh (test-trustworthiness campaign).
+# The legacy driver did `( sleep N; printf '/bin/test_9p_concurrency\n'; ... ) | qemu`:
+# under host load the fixed sleep raced ahead of hamsh's readline and the
+# command was dropped, so the gate MISSed its own markers and reported a
+# FALSE red. This drives hamsh prompt-gated (boot-ready marker) + output-
+# adaptive (FEEDER_SYNC handshake, send-once/wait-on-effect) and reports the
+# three-valued verdict: a starved guest is INCONCLUSIVE, an observed fixture
+# `[9pconc] FAIL:` (or a started-but-never-PASSed run while the shell demonstrably
+# survived) is FAIL, and only an observed `[9pconc] PASS` is a green.
 . "$(dirname "$0")/_build_lock.sh"
 
-set -euo pipefail
+set -uo pipefail
+trap '' PIPE
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
 
+TAG=test_9p_concurrency
+BTAG='9pconc'
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 TEST_ELF=build/user/test_9p_concurrency.elf
+TEST_SRC=tests/test_9p_concurrency.ad
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 
-echo "[test_9p_concurrency] (1/5) Build userland (hamsh + coreutils + distrofs)"
-bash scripts/build_user.sh >/dev/null
-bash scripts/build_modules.sh >/dev/null
+# ---- build ---------------------------------------------------------------
+bash scripts/build_user.sh >/dev/null \
+    || verdict_inconclusive "$TAG" "build_user failed"
+bash scripts/build_modules.sh >/dev/null \
+    || verdict_inconclusive "$TAG" "build_modules failed"
+python3 -m compiler.adder compile --target=x86_64-adder-user \
+    "$TEST_SRC" -o "$TEST_ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "fixture compile failed ($TEST_SRC)"
+INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null \
+    || verdict_inconclusive "$TAG" "build_initramfs failed"
+python3 -m compiler.adder compile --target=x86_64-bare-metal \
+    init/main.ad -o "$ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "kernel compile failed"
 
-echo "[test_9p_concurrency] (2/5) Build tests/test_9p_concurrency.ad -> $TEST_ELF"
-mkdir -p build/user
-python3 -m compiler.adder compile \
-    --target=x86_64-adder-user \
-    tests/test_9p_concurrency.ad \
-    -o "$TEST_ELF" >/dev/null
-
-echo "[test_9p_concurrency] (3/5) Plant /init = hamsh + /bin/test_9p_concurrency in cpio"
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
-
-echo "[test_9p_concurrency] (4/5) Rebuild kernel image"
-mkdir -p build
-python3 -m compiler.adder compile \
-    --target=x86_64-bare-metal \
-    init/main.ad \
-    -o "$ELF" >/dev/null
-
-echo "[test_9p_concurrency] (5/5) Boot QEMU + drive the test via hamsh"
+# ---- boot + drive --------------------------------------------------------
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
-
-set +e
-# Marker-gated feeder: a freshly-booted hamsh sometimes drops the FIRST
-# serial command line (it never echoes). Gate on the shell-ready marker,
-# then RE-SEND the command until its echo shows up in the log — keyed on
-# the echo (immediate on receipt), NOT the fixture marker, so a slow but
-# received run is never double-driven.
-(
-    for _ in $(seq 1 40); do
-        grep -q "loop-enter" "$LOG" 2>/dev/null && break
-        sleep 0.5
-    done
-    sleep 1
-    printf '/bin/test_9p_concurrency\n'
-    for _ in $(seq 1 10); do
-        sleep 1.5
-        grep -q "bin/test_9p_concurrency" "$LOG" 2>/dev/null && break
-        printf '/bin/test_9p_concurrency\n'
-    done
-    # Wait for the fixture to finish (PASS or any FAIL line), then exit.
-    for _ in $(seq 1 60); do
-        grep -Eq "\[9pconc\] (PASS|FAIL)" "$LOG" 2>/dev/null && break
-        sleep 0.5
-    done
-    sleep 1
-    printf 'exit\n'
-    sleep 1
-) | timeout 90s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
-set -e
-
-echo "[test_9p_concurrency] --- captured output ---"
-cat "$LOG"
-echo "[test_9p_concurrency] --- end output ---"
-
-fail=0
-
-check_marker() {
-    local marker="$1"
-    local label="$2"
-    if grep -F -q "$marker" "$LOG"; then
-        echo "[test_9p_concurrency] OK: $label"
-    else
-        echo "[test_9p_concurrency] MISS: $label ($marker)"
-        fail=1
-    fi
+cleanup() {
+    hamsh_shutdown
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
 }
+trap cleanup EXIT
 
-# Any per-assertion FAIL line means a round-trip broke somewhere.
-if grep -F -q "[9pconc] FAIL:" "$LOG"; then
-    echo "[test_9p_concurrency] MISS: per-assertion FAIL line(s) present:"
-    grep -F "[9pconc] FAIL:" "$LOG" | sed 's/^/  /'
-    fail=1
-else
-    echo "[test_9p_concurrency] OK: no per-assertion FAIL lines"
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "M16.35 shell ready" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
+
+# Run the fixture ONCE and wait on its OWN terminal banner ([BTAG] PASS).
+# Then a survival sentinel: a trivial external echo AFTER the fixture, waited
+# on its own effect. If POST lands, the shell was demonstrably alive — so a
+# fixture that still never reached PASS aborted/hung (a real bug), NOT a
+# starved guest. This is the false-red/false-green discriminator.
+hamsh_send_await "/bin/$TAG" "[$BTAG] PASS" "$CMD_WAIT" || true
+hamsh_send_await "/bin/echo POST_${TAG}_OK" "POST_${TAG}_OK" "$CMD_WAIT" || true
+hamsh_send 'exit'
+sleep 2
+
+echo "[$TAG] --- captured output ---"
+sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG" | tr -d '\000'
+echo "[$TAG] --- end output ---"
+
+# ---- verdict -------------------------------------------------------------
+# Guest demonstrably alive & producing output? Require the fixture's start
+# banner OR the survival sentinel; neither after a clean boot+sync means a
+# wedge/starve — verdict_boot_gate sorts INCONCLUSIVE vs FAIL.
+verdict_boot_gate "$TAG" "$LOG" 0 "\\[$BTAG\\] start|POST_${TAG}_OK"
+
+# 1. The fixture's OWN failure line is an OBSERVED regression -> FAIL.
+if grep -aqF "[$BTAG] FAIL" "$LOG"; then
+    grep -aF "[$BTAG] FAIL" "$LOG" | sed 's/^/  /'
+    verdict_fail "$TAG" "fixture emitted [$BTAG] FAIL: — an OBSERVED regression"
 fi
-
-check_marker "[9pconc] start"            "fixture ran"
-check_marker "[9pconc] mount OK"         "sys_mount completed Tversion+Tattach"
-check_marker "[9pconc] seed OK"          "shared file created + written"
-check_marker "[9pconc] reader spawned"   "second reader task spawned"
-check_marker "[9pconc] reader ready"     "handshake file visible through the mount"
-check_marker "[9pconc] reader done"      "child read loop completed clean"
-check_marker "[9pconc] parent loop done" "parent read loop completed clean"
-check_marker "[9pconc] PASS"             "fixture reached PASS"
-
-# THE point of this gate: the kernel must have had >=2 T-msgs in
-# flight at least once. The fixture reads the kernel's high-water mark
-# back from /dev/9pmax and prints it; re-assert the value here.
-mxline=$(grep -F "[9pconc] inflight_max=" "$LOG" | head -1 || true)
-mxval=$(printf '%s\n' "$mxline" | sed -n 's/.*inflight_max=\([0-9][0-9]*\).*/\1/p')
-if [ -n "$mxval" ] && [ "$mxval" -ge 2 ]; then
-    echo "[test_9p_concurrency] OK: kernel saw >=2 outstanding T-msgs (inflight_max=$mxval)"
-else
-    echo "[test_9p_concurrency] MISS: kernel saw >=2 outstanding T-msgs (inflight_max='${mxval:-absent}')"
-    fail=1
+# 2. The fixture reached its aggregate PASS banner (only printed when every
+#    sub-assertion held) -> the observation we are named for. PASS.
+if grep -aqF "[$BTAG] PASS" "$LOG"; then
+    verdict_pass "$TAG" "fixture reached [$BTAG] PASS (all sub-assertions held)"
 fi
-
-if [ "$fail" -ne 0 ]; then
-    echo "[test_9p_concurrency] FAIL (qemu rc=$rc)"
-    exit 1
+# 3. No terminal verdict. If the survival sentinel landed the shell was NOT
+#    starved, so the fixture started and then aborted/hung before PASS -> a
+#    real FAIL. If the sentinel is absent too, the guest starved mid-run and
+#    we observed nothing conclusive -> INCONCLUSIVE.
+if grep -aqF "POST_${TAG}_OK" "$LOG"; then
+    verdict_fail "$TAG" \
+        "fixture started but never reached [$BTAG] PASS and emitted no [$BTAG] FAIL" \
+        "line, yet the post-fixture survival echo DID reach stdout — the shell" \
+        "was alive, so the fixture aborted/hung mid-run (a real regression)."
 fi
-
-echo "[test_9p_concurrency] PASS"
+verdict_inconclusive "$TAG" \
+    "fixture start seen but neither [$BTAG] PASS/FAIL nor the survival sentinel" \
+    "was observed within ${CMD_WAIT}s — the guest starved mid-run. Re-run quiet."

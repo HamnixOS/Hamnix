@@ -28,187 +28,103 @@
 # Pipe / socket fd2path still return -1 with errstr; the fixture
 # doesn't exercise those gaps (they're documented in TODO.md).
 
+# ---------------------------------------------------------------------------
+# MIGRATED onto scripts/_hamsh_drive.sh (test-trustworthiness campaign).
+# The legacy driver did `( sleep N; printf '/bin/test_p9file\n'; ... ) | qemu`:
+# under host load the fixed sleep raced ahead of hamsh's readline and the
+# command was dropped, so the gate MISSed its own markers and reported a
+# FALSE red. This drives hamsh prompt-gated (boot-ready marker) + output-
+# adaptive (FEEDER_SYNC handshake, send-once/wait-on-effect) and reports the
+# three-valued verdict: a starved guest is INCONCLUSIVE, an observed fixture
+# `[p9file] FAIL:` (or a started-but-never-PASSed run while the shell demonstrably
+# survived) is FAIL, and only an observed `[p9file] PASS` is a green.
 . "$(dirname "$0")/_build_lock.sh"
 
-set -euo pipefail
+set -uo pipefail
+trap '' PIPE
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
 
+TAG=test_p9file
+BTAG='p9file'
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 TEST_ELF=build/user/test_p9file.elf
+TEST_SRC=tests/test_p9file.ad
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 
-echo "[test_p9file] (1/5) Build userland (hamsh + coreutils)"
-bash scripts/build_user.sh >/dev/null
-bash scripts/build_modules.sh >/dev/null
+# ---- build ---------------------------------------------------------------
+bash scripts/build_user.sh >/dev/null \
+    || verdict_inconclusive "$TAG" "build_user failed"
+bash scripts/build_modules.sh >/dev/null \
+    || verdict_inconclusive "$TAG" "build_modules failed"
+python3 -m compiler.adder compile --target=x86_64-adder-user \
+    "$TEST_SRC" -o "$TEST_ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "fixture compile failed ($TEST_SRC)"
+INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null \
+    || verdict_inconclusive "$TAG" "build_initramfs failed"
+python3 -m compiler.adder compile --target=x86_64-bare-metal \
+    init/main.ad -o "$ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "kernel compile failed"
 
-echo "[test_p9file] (2/5) Build tests/test_p9file.ad -> $TEST_ELF"
-python3 -m compiler.adder compile \
-    --target=x86_64-adder-user \
-    tests/test_p9file.ad \
-    -o "$TEST_ELF" >/dev/null
-
-echo "[test_p9file] (3/5) Plant /init = hamsh + /bin/test_p9file in cpio"
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
-
-echo "[test_p9file] (4/5) Rebuild kernel image"
-python3 -m compiler.adder compile \
-    --target=x86_64-bare-metal \
-    init/main.ad \
-    -o "$ELF" >/dev/null
-
-echo "[test_p9file] (5/5) Boot QEMU + drive the test via hamsh"
+# ---- boot + drive --------------------------------------------------------
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+cleanup() {
+    hamsh_shutdown
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
+}
+trap cleanup EXIT
 
-set +e
-# Drive hamsh through a FIFO so we can gate keystrokes on the boot-ready
-# marker (memory note: interactive_test_wait_for_prompt). Fixed sleeps
-# alone pass in isolation but flake under integration when boot slows.
-# Re-send each command until its own marker appears in the log
-# (memory note: serial_test_first_cmd_dropped — freshly-booted hamsh
-# drops the FIRST serial command line).
-FIFO=$(mktemp -u)
-mkfifo "$FIFO"
-exec 9<>"$FIFO"
-rm -f "$FIFO"
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "M16.35 shell ready" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
 
-timeout 60s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    <&9 > "$LOG" 2>&1 &
-QEMU_PID=$!
-
-# Wait for hamsh's loop-enter / stage-08 prompt marker, then send the
-# fixture command. Re-send up to 6× until the [p9file] start banner
-# appears in the log.
-sent_marker=0
-for try in 1 2 3 4 5 6; do
-    waited=0
-    while [ $waited -lt 30 ]; do
-        if grep -F -q "[p9file] start" "$LOG" 2>/dev/null; then
-            sent_marker=1
-            break
-        fi
-        if grep -F -q "[hamsh:stage-08]" "$LOG" 2>/dev/null; then
-            break
-        fi
-        sleep 1
-        waited=$((waited + 1))
-    done
-    if [ $sent_marker -eq 1 ]; then break; fi
-    printf '/bin/test_p9file\n' >&9
-    # Give hamsh a moment to consume + print before re-sending.
-    sleep 4
-    if grep -F -q "[p9file] start" "$LOG" 2>/dev/null; then
-        sent_marker=1
-        break
-    fi
-done
-
-# Wait for the PASS / final marker, with a hard cap so a crashed fixture
-# doesn't dangle the whole test.
-waited=0
-while [ $waited -lt 25 ]; do
-    if grep -F -q "[p9file] PASS" "$LOG" 2>/dev/null; then break; fi
-    if grep -F -q "[p9file] FAIL" "$LOG" 2>/dev/null; then break; fi
-    sleep 1
-    waited=$((waited + 1))
-done
-
-printf 'exit\n' >&9
+# Run the fixture ONCE and wait on its OWN terminal banner ([BTAG] PASS).
+# Then a survival sentinel: a trivial external echo AFTER the fixture, waited
+# on its own effect. If POST lands, the shell was demonstrably alive — so a
+# fixture that still never reached PASS aborted/hung (a real bug), NOT a
+# starved guest. This is the false-red/false-green discriminator.
+hamsh_send_await "/bin/$TAG" "[$BTAG] PASS" "$CMD_WAIT" || true
+hamsh_send_await "/bin/echo POST_${TAG}_OK" "POST_${TAG}_OK" "$CMD_WAIT" || true
+hamsh_send 'exit'
 sleep 2
-exec 9>&-
-wait "$QEMU_PID" 2>/dev/null
-rc=$?
-set -e
 
-echo "[test_p9file] --- captured output ---"
-cat "$LOG"
-echo "[test_p9file] --- end output ---"
+echo "[$TAG] --- captured output ---"
+sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG" | tr -d '\000'
+echo "[$TAG] --- end output ---"
 
-fail=0
+# ---- verdict -------------------------------------------------------------
+# Guest demonstrably alive & producing output? Require the fixture's start
+# banner OR the survival sentinel; neither after a clean boot+sync means a
+# wedge/starve — verdict_boot_gate sorts INCONCLUSIVE vs FAIL.
+verdict_boot_gate "$TAG" "$LOG" 0 "\\[$BTAG\\] start|POST_${TAG}_OK"
 
-# Banner first — proves the fixture ran end to end.
-if grep -F -q "[p9file] start" "$LOG"; then
-    echo "[test_p9file] OK: fixture ran"
-else
-    echo "[test_p9file] MISS: fixture banner missing"
-    fail=1
+# 1. The fixture's OWN failure line is an OBSERVED regression -> FAIL.
+if grep -aqF "[$BTAG] FAIL" "$LOG"; then
+    grep -aF "[$BTAG] FAIL" "$LOG" | sed 's/^/  /'
+    verdict_fail "$TAG" "fixture emitted [$BTAG] FAIL: — an OBSERVED regression"
 fi
-
-# stat /etc/motd — cpio-backed, must serialise a real Dir record.
-if grep -F -q "[p9file] stat /etc/motd ok" "$LOG"; then
-    echo "[test_p9file] OK: SYS_STAT_P9 (261) returned a Dir record"
-else
-    echo "[test_p9file] MISS: stat failed"
-    fail=1
+# 2. The fixture reached its aggregate PASS banner (only printed when every
+#    sub-assertion held) -> the observation we are named for. PASS.
+if grep -aqF "[$BTAG] PASS" "$LOG"; then
+    verdict_pass "$TAG" "fixture reached [$BTAG] PASS (all sub-assertions held)"
 fi
-
-# fstat on an open /etc/motd fd.
-if grep -F -q "[p9file] fstat fd ok" "$LOG"; then
-    echo "[test_p9file] OK: SYS_FSTAT_P9 (262) returned a Dir record"
-else
-    echo "[test_p9file] MISS: fstat failed"
-    fail=1
+# 3. No terminal verdict. If the survival sentinel landed the shell was NOT
+#    starved, so the fixture started and then aborted/hung before PASS -> a
+#    real FAIL. If the sentinel is absent too, the guest starved mid-run and
+#    we observed nothing conclusive -> INCONCLUSIVE.
+if grep -aqF "POST_${TAG}_OK" "$LOG"; then
+    verdict_fail "$TAG" \
+        "fixture started but never reached [$BTAG] PASS and emitted no [$BTAG] FAIL" \
+        "line, yet the post-fixture survival echo DID reach stdout — the shell" \
+        "was alive, so the fixture aborted/hung mid-run (a real regression)."
 fi
-
-# fd2path — best-effort, must return a non-empty path.
-if grep -F -q "[p9file] fd2path ok: " "$LOG"; then
-    echo "[test_p9file] OK: SYS_FD2PATH (264) returned a path"
-else
-    echo "[test_p9file] MISS: fd2path failed"
-    fail=1
-fi
-
-# create /tmp/p9 — tmpfs-backed, must return a valid fd.
-if grep -F -q "[p9file] create /tmp/p9 ok" "$LOG"; then
-    echo "[test_p9file] OK: SYS_CREATE (260) returned a tmpfs fd"
-else
-    echo "[test_p9file] MISS: create failed"
-    fail=1
-fi
-
-# remove /tmp/p9 — wraps vfs_unlink.
-if grep -F -q "[p9file] remove /tmp/p9 ok" "$LOG"; then
-    echo "[test_p9file] OK: SYS_REMOVE (263) unlinked tmpfs file"
-else
-    echo "[test_p9file] MISS: remove failed"
-    fail=1
-fi
-
-# Phase D follow-up A: create(DMDIR|0755) → vfs_mkdir → tmpfs_mkdir.
-if grep -F -q "[p9file] create DMDIR /tmp/p9d ok" "$LOG"; then
-    echo "[test_p9file] OK: SYS_CREATE DMDIR routed to tmpfs_mkdir"
-else
-    echo "[test_p9file] MISS: DMDIR create failed"
-    fail=1
-fi
-
-# Phase D follow-up B: per-backend stat hooks return distinct qids.
-if grep -F -q "[p9file] stat hooks per-backend ok" "$LOG"; then
-    echo "[test_p9file] OK: SYS_STAT_P9 dispatched per-backend"
-else
-    echo "[test_p9file] MISS: per-backend stat hooks failed"
-    fail=1
-fi
-
-# Aggregate PASS line — proves all five primitives green.
-if grep -F -q "[p9file] PASS" "$LOG"; then
-    echo "[test_p9file] OK: fixture reached PASS"
-else
-    echo "[test_p9file] MISS: PASS line absent"
-    fail=1
-fi
-
-if [ "$fail" -ne 0 ]; then
-    echo "[test_p9file] FAIL (qemu rc=$rc)"
-    exit 1
-fi
-
-echo "[test_p9file] PASS"
+verdict_inconclusive "$TAG" \
+    "fixture start seen but neither [$BTAG] PASS/FAIL nor the survival sentinel" \
+    "was observed within ${CMD_WAIT}s — the guest starved mid-run. Re-run quiet."

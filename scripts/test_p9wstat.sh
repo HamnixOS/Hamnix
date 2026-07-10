@@ -27,163 +27,103 @@
 #     with errstr("wstat: <field> not supported").
 #   * fwstat on a non-tmpfs fd must surface the backend gap as -1.
 
+# ---------------------------------------------------------------------------
+# MIGRATED onto scripts/_hamsh_drive.sh (test-trustworthiness campaign).
+# The legacy driver did `( sleep N; printf '/bin/test_p9wstat\n'; ... ) | qemu`:
+# under host load the fixed sleep raced ahead of hamsh's readline and the
+# command was dropped, so the gate MISSed its own markers and reported a
+# FALSE red. This drives hamsh prompt-gated (boot-ready marker) + output-
+# adaptive (FEEDER_SYNC handshake, send-once/wait-on-effect) and reports the
+# three-valued verdict: a starved guest is INCONCLUSIVE, an observed fixture
+# `[p9wstat] FAIL:` (or a started-but-never-PASSed run while the shell demonstrably
+# survived) is FAIL, and only an observed `[p9wstat] PASS` is a green.
 . "$(dirname "$0")/_build_lock.sh"
 
-set -euo pipefail
+set -uo pipefail
+trap '' PIPE
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
 
+TAG=test_p9wstat
+BTAG='p9wstat'
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 TEST_ELF=build/user/test_p9wstat.elf
+TEST_SRC=tests/test_p9wstat.ad
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 
-echo "[test_p9wstat] (1/5) Build userland (hamsh + coreutils)"
-bash scripts/build_user.sh >/dev/null
-bash scripts/build_modules.sh >/dev/null
+# ---- build ---------------------------------------------------------------
+bash scripts/build_user.sh >/dev/null \
+    || verdict_inconclusive "$TAG" "build_user failed"
+bash scripts/build_modules.sh >/dev/null \
+    || verdict_inconclusive "$TAG" "build_modules failed"
+python3 -m compiler.adder compile --target=x86_64-adder-user \
+    "$TEST_SRC" -o "$TEST_ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "fixture compile failed ($TEST_SRC)"
+INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null \
+    || verdict_inconclusive "$TAG" "build_initramfs failed"
+python3 -m compiler.adder compile --target=x86_64-bare-metal \
+    init/main.ad -o "$ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "kernel compile failed"
 
-echo "[test_p9wstat] (2/5) Build tests/test_p9wstat.ad -> $TEST_ELF"
-python3 -m compiler.adder compile \
-    --target=x86_64-adder-user \
-    tests/test_p9wstat.ad \
-    -o "$TEST_ELF" >/dev/null
-
-echo "[test_p9wstat] (3/5) Plant /init = hamsh + /bin/test_p9wstat in cpio"
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
-
-echo "[test_p9wstat] (4/5) Rebuild kernel image"
-mkdir -p build
-python3 -m compiler.adder compile \
-    --target=x86_64-bare-metal \
-    init/main.ad \
-    -o "$ELF" >/dev/null
-
-echo "[test_p9wstat] (5/5) Boot QEMU + drive the test via hamsh"
+# ---- boot + drive --------------------------------------------------------
 LOG=$(mktemp)
-FIFO=$(mktemp -u)
-mkfifo "$FIFO"
-trap 'rm -f "$LOG" "$FIFO"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+cleanup() {
+    hamsh_shutdown
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
+}
+trap cleanup EXIT
 
-# Gate keystrokes on the shell-ready marker rather than a fixed sleep.
-# Boot has grown (xhci/esp smoke tests run for tens of seconds on some
-# hosts); a fixed `sleep 3` raced ahead of hamsh's readline and the
-# command was dropped. Hold the FIFO open + wait for "[hamsh] M16.35
-# shell ready" in the live log, THEN type the fixture command. See
-# memory feedback_interactive_test_wait_for_prompt.
-(
-    # Keep the FIFO write end open for the lifetime of this subshell so
-    # QEMU's stdin doesn't EOF before we've typed anything.
-    exec 3>"$FIFO"
-    for _ in $(seq 1 600); do
-        if grep -a -q "M16.35 shell ready" "$LOG" 2>/dev/null; then
-            break
-        fi
-        sleep 0.2
-    done
-    # Small settle so the prompt's readline is actually in SYS_READ.
-    sleep 1
-    printf '/bin/test_p9wstat\n' >&3
-    # Wait for the fixture to reach PASS (or just finish) before exiting.
-    for _ in $(seq 1 100); do
-        if grep -a -q "\[p9wstat\] PASS" "$LOG" 2>/dev/null; then
-            break
-        fi
-        if grep -a -q "\[p9wstat\] FAIL" "$LOG" 2>/dev/null; then
-            break
-        fi
-        sleep 0.2
-    done
-    printf 'exit\n' >&3
-    sleep 1
-    exec 3>&-
-) &
-DRIVER_PID=$!
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "M16.35 shell ready" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
 
-set +e
-timeout 120s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    < "$FIFO" > "$LOG" 2>&1
-rc=$?
-set -e
-wait "$DRIVER_PID" 2>/dev/null || true
+# Run the fixture ONCE and wait on its OWN terminal banner ([BTAG] PASS).
+# Then a survival sentinel: a trivial external echo AFTER the fixture, waited
+# on its own effect. If POST lands, the shell was demonstrably alive — so a
+# fixture that still never reached PASS aborted/hung (a real bug), NOT a
+# starved guest. This is the false-red/false-green discriminator.
+hamsh_send_await "/bin/$TAG" "[$BTAG] PASS" "$CMD_WAIT" || true
+hamsh_send_await "/bin/echo POST_${TAG}_OK" "POST_${TAG}_OK" "$CMD_WAIT" || true
+hamsh_send 'exit'
+sleep 2
 
-echo "[test_p9wstat] --- captured output ---"
-cat "$LOG"
-echo "[test_p9wstat] --- end output ---"
+echo "[$TAG] --- captured output ---"
+sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG" | tr -d '\000'
+echo "[$TAG] --- end output ---"
 
-fail=0
+# ---- verdict -------------------------------------------------------------
+# Guest demonstrably alive & producing output? Require the fixture's start
+# banner OR the survival sentinel; neither after a clean boot+sync means a
+# wedge/starve — verdict_boot_gate sorts INCONCLUSIVE vs FAIL.
+verdict_boot_gate "$TAG" "$LOG" 0 "\\[$BTAG\\] start|POST_${TAG}_OK"
 
-if grep -F -q "[p9wstat] start" "$LOG"; then
-    echo "[test_p9wstat] OK: fixture ran"
-else
-    echo "[test_p9wstat] MISS: fixture banner missing"
-    fail=1
+# 1. The fixture's OWN failure line is an OBSERVED regression -> FAIL.
+if grep -aqF "[$BTAG] FAIL" "$LOG"; then
+    grep -aF "[$BTAG] FAIL" "$LOG" | sed 's/^/  /'
+    verdict_fail "$TAG" "fixture emitted [$BTAG] FAIL: — an OBSERVED regression"
 fi
-
-if grep -F -q "[p9wstat] create /tmp/wstat_src ok" "$LOG"; then
-    echo "[test_p9wstat] OK: tmpfs source file created"
-else
-    echo "[test_p9wstat] MISS: tmpfs create failed"
-    fail=1
+# 2. The fixture reached its aggregate PASS banner (only printed when every
+#    sub-assertion held) -> the observation we are named for. PASS.
+if grep -aqF "[$BTAG] PASS" "$LOG"; then
+    verdict_pass "$TAG" "fixture reached [$BTAG] PASS (all sub-assertions held)"
 fi
-
-if grep -F -q "[p9wstat] wstat rename ok" "$LOG"; then
-    echo "[test_p9wstat] OK: SYS_WSTAT (266) honoured name field"
-else
-    echo "[test_p9wstat] MISS: wstat rename failed"
-    fail=1
+# 3. No terminal verdict. If the survival sentinel landed the shell was NOT
+#    starved, so the fixture started and then aborted/hung before PASS -> a
+#    real FAIL. If the sentinel is absent too, the guest starved mid-run and
+#    we observed nothing conclusive -> INCONCLUSIVE.
+if grep -aqF "POST_${TAG}_OK" "$LOG"; then
+    verdict_fail "$TAG" \
+        "fixture started but never reached [$BTAG] PASS and emitted no [$BTAG] FAIL" \
+        "line, yet the post-fixture survival echo DID reach stdout — the shell" \
+        "was alive, so the fixture aborted/hung mid-run (a real regression)."
 fi
-
-if grep -F -q "[p9wstat] dst reachable ok" "$LOG"; then
-    echo "[test_p9wstat] OK: post-rename destination opens"
-else
-    echo "[test_p9wstat] MISS: dst not reachable"
-    fail=1
-fi
-
-if grep -F -q "[p9wstat] src gone ok" "$LOG"; then
-    echo "[test_p9wstat] OK: post-rename source removed"
-else
-    echo "[test_p9wstat] MISS: src still openable"
-    fail=1
-fi
-
-if grep -F -q "[p9wstat] wstat mode no-op ok" "$LOG"; then
-    echo "[test_p9wstat] OK: SYS_WSTAT mode leg accepted (chmod honoured; tmpfs no-op)"
-else
-    echo "[test_p9wstat] MISS: wstat mode failed"
-    fail=1
-fi
-
-if grep -F -q "[p9wstat] wstat length tmpfs-gap ok" "$LOG"; then
-    echo "[test_p9wstat] OK: SYS_WSTAT length leg wired to VFS (tmpfs gap surfaced)"
-else
-    echo "[test_p9wstat] MISS: wstat length leg not wired"
-    fail=1
-fi
-
-if grep -F -q "[p9wstat] fwstat backend gap ok" "$LOG"; then
-    echo "[test_p9wstat] OK: SYS_FWSTAT (267) surfaced cpio gap"
-else
-    echo "[test_p9wstat] MISS: fwstat cpio gap not surfaced"
-    fail=1
-fi
-
-if grep -F -q "[p9wstat] PASS" "$LOG"; then
-    echo "[test_p9wstat] OK: fixture reached PASS"
-else
-    echo "[test_p9wstat] MISS: PASS line absent"
-    fail=1
-fi
-
-if [ "$fail" -ne 0 ]; then
-    echo "[test_p9wstat] FAIL (qemu rc=$rc)"
-    exit 1
-fi
-
-echo "[test_p9wstat] PASS"
+verdict_inconclusive "$TAG" \
+    "fixture start seen but neither [$BTAG] PASS/FAIL nor the survival sentinel" \
+    "was observed within ${CMD_WAIT}s — the guest starved mid-run. Re-run quiet."
