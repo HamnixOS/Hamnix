@@ -154,22 +154,28 @@ try:
     # contains the indexed store (a `mov QWORD PTR [reg],reg`). Identify the loop
     # body as the instruction window between an inner-loop-head cmp and the next
     # backward `jmp` to it.
-    # Simpler + robust: locate the window containing the three accumulation adds
-    # `add rax,rN` that precede an `and rax,` (the mask) — that IS the store RHS.
-    add_idxs = [i for i, (_, t) in enumerate(rows)
-                if re.match(r"add\s+rax,r(8|9|10|11|12|13|14|15|di|si|bx|bp)\b", t)]
-    # Group consecutive add-rax runs; the licm accumulation is a run of >=3.
-    run = []
+    # Locate the accumulation: a run of >=3 consecutive `add <ACC>,<srcreg>` that
+    # sum the loaded slot with the hoisted invariants. NOTE the accumulator is NOT
+    # hardcoded to %rax anymore — as the register allocator matured the store RHS is
+    # accumulated in a CALLEE-SAVED scratch (here %r9) so that %rax stays free for
+    # the two element-address leas (the array base itself now hoists into %r8). Match
+    # a run into any single accumulator register.
+    add_all = [(i, mm.group(1), mm.group(2))
+               for i, (_, t) in enumerate(rows)
+               if (mm := re.match(r"add\s+(r\w+),(r\w+)$", t))]
+    # Group maximal consecutive runs that share one accumulator (dst) register.
     best = []
-    prev = None
-    for i in add_idxs:
-        if prev is not None and i == prev + 1:
+    run = []
+    prev_i = None
+    prev_acc = None
+    for i, acc, _src in add_all:
+        if prev_i is not None and i == prev_i + 1 and acc == prev_acc:
             run.append(i)
         else:
             if len(run) > len(best):
                 best = run
             run = [i]
-        prev = i
+        prev_i, prev_acc = i, acc
     if len(run) > len(best):
         best = run
     if len(best) < 3:
@@ -179,7 +185,7 @@ try:
         # Registers read by the accumulation adds.
         add_srcs = []
         for i in best:
-            mm = re.match(r"add\s+rax,(r\w+)", rows[i][1])
+            mm = re.match(r"add\s+r\w+,(r\w+)", rows[i][1])
             add_srcs.append(mm.group(1))
         # Delimit the inner loop body: from the nearest preceding loop-head cmp/jge
         # backwards is the pre-header; the body is between the inner-loop head and
@@ -208,11 +214,12 @@ try:
         # written inside the inner loop body (they are the pre-header hoisted
         # invariants read directly — 0 surviving copies).
         distinct = set(add_srcs)
-        # rax itself is the accumulator (written each add) — exclude it from the
-        # "must be invariant" set; the hoisted-invariant sources are the non-rax,
-        # non-IV operands. The induction var (j -> the last add `add rax,r14`) IS
-        # written in the loop; exclude the single IV add by requiring at least 3
-        # invariant (non-loop-written) sources among the run.
+        # The accumulator register (written each add) is itself in body_regs_written,
+        # so it is naturally excluded from the "must be invariant" set below; the
+        # hoisted-invariant sources are the operands NOT written in the body. The
+        # induction var (j -> the last add in the run) IS written in the loop, so it
+        # is excluded too — hence we require at least 3 invariant (non-loop-written)
+        # sources among the run.
         invariant_srcs = [s for s in distinct if s not in body_regs_written]
         if len(invariant_srcs) < 3:
             surviving = [s for s in distinct if s in body_regs_written and s != "rax"]

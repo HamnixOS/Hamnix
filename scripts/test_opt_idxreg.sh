@@ -123,26 +123,36 @@ try:
     rows = disasm(d_on)
     # Find scaled-index leas whose index is NOT rcx/rax: `lea rax,[<base>+<reg>*1]`
     # where <reg> is a promoted (rbx/r12-r15) register — the direct-SIB coalesce.
+    # The legacy path would instead materialise the index into %rcx and emit
+    # `lea rax,[<base>+rcx*1]`, so a promoted-register SIB index is ITSELF the proof
+    # that the index copy is gone; if the coalesce is reverted this count drops to 0
+    # (the leas become rcx-indexed, which the group(2) filter excludes).
     direct = 0
-    copy_before_sib = 0
+    index_copy_before_sib = 0
     for k, t in enumerate(rows):
         mm = re.match(r"lea\s+rax,\[(\w+)\+(\w+)\*1\]", t)
         if mm and mm.group(2) not in ("rcx", "rax"):
             direct += 1
-            # assert no `mov rcx,rax` in the 2 instrs immediately before (the
-            # legacy index-into-rcx copy). The direct path emits none.
+            # A GENUINE surviving index copy would materialise THIS lea's index
+            # register from %rax right before the address computation, i.e.
+            # `mov <idxreg>,rax`. Assert none such precedes it. (The earlier version
+            # flagged any `mov rcx,rax` here, but that misfires: for a STORE
+            # `arr[i]=v` the store VALUE is staged into %rcx — `mov rcx,rax` then
+            # `mov [rax],cl` — which is NOT an index copy; the index is already in
+            # the promoted SIB register, %rcx is untouched by the address path.)
+            idxreg = mm.group(2)
             prev2 = rows[max(0, k - 2):k]
-            if any(re.match(r"mov\s+rcx,rax", p) for p in prev2):
-                copy_before_sib += 1
+            if any(re.match(rf"mov\s+{idxreg},rax\b", p) for p in prev2):
+                index_copy_before_sib += 1
     if direct < 2:
         print(f"FAIL(disasm) found only {direct} direct-SIB-index leas "
               f"(expected >=2, one per bare-index loop)"); fails += 1
-    elif copy_before_sib != 0:
-        print(f"FAIL(disasm) {copy_before_sib} direct-SIB leas still had a "
-              f"`mov rcx,rax` index copy before them"); fails += 1
+    elif index_copy_before_sib != 0:
+        print(f"FAIL(disasm) {index_copy_before_sib} direct-SIB leas still had a "
+              f"per-access `mov <idx>,rax` index copy before them"); fails += 1
     else:
         print(f"[disasm] {direct} element-address leas read the promoted index "
-              f"register DIRECTLY (0 `mov rcx,rax` index copies) OK")
+              f"register DIRECTLY (0 per-access index copies) OK")
 except Exception as ex:
     print(f"FAIL(disasm) exception: {ex}"); fails += 1
 

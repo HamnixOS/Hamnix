@@ -22,7 +22,7 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 python3 - <<'PY'
-import sys, subprocess
+import sys, subprocess, re
 sys.path.insert(0, "tests/fuzz")
 import ad_codegen_host as h
 import adder_fuzzer as F
@@ -95,9 +95,18 @@ else:
     if bh_off != 0:
         print(f"FAIL routed NOT byte-inert OFF (BASEHOIST={bh_off})"); fails += 1
     text = disasm(d_on.code)
-    hoisted = [l for l in text.splitlines()
-               if "lea" in l and "rcx*8" in l and "rip" not in l
-               and "[rax+rcx*8]" not in l]
+    # The hoisted base lives in a HELD register (not %rax, not %rip-relative): the
+    # element address is `lea <dst>,[<basereg>+<idxreg>*8]`. NOTE the index register
+    # is whatever the loop's index got promoted to (here %rbx) — the direct-SIB-index
+    # coalesce (test_opt_idxreg) routes the promoted local straight into the SIB, so
+    # this is `*8` off %rbx, NOT the legacy materialise-into-%rcx `%rcx*8`. Match any
+    # index register; the load-bearing assertion is that the BASE is a held reg
+    # (not %rax = per-iteration recompute, not %rip = raw global lea).
+    hoisted = []
+    for l in text.splitlines():
+        m = re.match(r"lea\s+\w+,\[(\w+)\+\w+\*8\]", l.split(chr(9))[-1].strip())
+        if m and m.group(1) != "rax" and "rip" not in l:
+            hoisted.append(l)
     if not hoisted:
         print("FAIL routed: no scaled-index lea off a NON-rax hoisted base register"); fails += 1
     else:
