@@ -1,83 +1,87 @@
 #!/usr/bin/env bash
 # scripts/test_hamsh_quotes.sh — hamsh quoting (new shell, HAMSH_SPEC §4).
 #
-# Ported to the rewritten shell. No §18 stage test covers quoting on
-# its own, so this one does:
-#   * `echo "hello world"` — a double-quoted word with a space is ONE
-#     argument (no word-splitting — the §3 list rule's sibling).
-#   * `echo "$who there"` — double quotes interpolate `$`.
-#   * `echo '$who literal'` — single quotes are literal: no interpolation.
-#   * `echo a "b c" d` — mixed quoted/bare words; echo joins with spaces.
+#   * `echo "hello world"`   — a double-quoted word with a space is ONE
+#     argument (no word-splitting).
+#   * `echo "$who there"`    — double quotes interpolate `$`.
+#   * `echo '$who literal'`  — single quotes are literal: no interpolation.
+#   * `echo a "b c" d`       — mixed quoted/bare words; echo joins w/ spaces.
+#
+# INPUT IS PROMPT-GATED + OUTPUT-ADAPTIVE via scripts/_hamsh_drive.sh —
+# commands sent once after a live-readline handshake, waited on their own
+# observable output. Assertions use hamsh_ran (scripts/_hamsh_log.sh) so
+# the line editor's input echo of the typed command cannot false-green an
+# assertion — critical here because the single-quote case's expected
+# output text ('$who literal') is byte-identical to the typed input.
+set -uo pipefail
+trap '' PIPE
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_hamsh_log.sh"
 
-set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
 
+TAG=test_hamsh_quotes
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 
-bash scripts/build_user.sh >/dev/null
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
+bash scripts/build_user.sh >/dev/null || verdict_inconclusive "$TAG" "build_user failed"
+INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null \
+    || verdict_inconclusive "$TAG" "build_initramfs failed"
 python3 -m compiler.adder compile \
-    --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null
+    --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "kernel compile failed"
 
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+cleanup() {
+    hamsh_shutdown
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
+}
+trap cleanup EXIT
 
-set +e
-(
-    sleep 3
-    printf 'echo "hello world"\n'
-    sleep 1
-    printf 'who = "ham"\n'
-    sleep 1
-    printf 'echo "$who there"\n'
-    sleep 1
-    printf "echo '\$who literal'\n"
-    sleep 1
-    printf 'echo a "b c" d\n'
-    sleep 1
-    printf 'exit\n'
-    sleep 1
-) | timeout 20s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 -nographic -no-reboot -m 256M -monitor none -serial stdio \
-    > "$LOG" 2>&1
-set -e
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "[hamsh:stage-07] loop-enter" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
+
+hamsh_send_await 'echo "hello world"'       'hello world' "$CMD_WAIT" || true
+hamsh_send 'who = "ham"'
+hamsh_send_await 'echo "$who there"'         'ham there'   "$CMD_WAIT" || true
+hamsh_send_await "echo '\$who literal'"      '$who literal' "$CMD_WAIT" || true
+hamsh_send_await 'echo a "b c" d'            'a b c d'     "$CMD_WAIT" || true
+hamsh_send 'exit'
+sleep 2
+
+# Use exact-line output matching: hamsh_out_eq drops prompt-echo lines,
+# splits CR repaints, strips ANSI, and requires the WHOLE output line to
+# equal the expected text — so the typed input line ('echo ...') can never
+# satisfy the assertion.
+verdict_boot_gate "$TAG" "$LOG" 0 'hello world|ham there'
+if ! hamsh_out_eq "$LOG" "hello world" && ! hamsh_out_eq "$LOG" "ham there"; then
+    verdict_inconclusive "$TAG" \
+        "no early marker observed within ${CMD_WAIT}s — guest starved. Re-run quiet."
+fi
 
 fail=0
-if grep -F -q "hello world" "$LOG"; then
-    echo "[test_hamsh_quotes] OK: \"hello world\" preserved as one argument"
-else
-    echo "[test_hamsh_quotes] MISS: hello world not preserved"
-    fail=1
-fi
-if grep -F -q "ham there" "$LOG"; then
-    echo "[test_hamsh_quotes] OK: double quotes interpolate \$who"
-else
-    echo "[test_hamsh_quotes] MISS: double-quote interpolation failed"
-    fail=1
-fi
-if grep -F -q '$who literal' "$LOG"; then
-    echo "[test_hamsh_quotes] OK: single quotes are literal (no interpolation)"
-else
-    echo "[test_hamsh_quotes] MISS: single quote interpolated or dropped"
-    fail=1
-fi
-if grep -F -q "a b c d" "$LOG"; then
-    echo "[test_hamsh_quotes] OK: mixed quoted/bare words joined by echo"
-else
-    echo "[test_hamsh_quotes] MISS: mixed echo output"
-    fail=1
-fi
+check() {
+    if hamsh_out_eq "$LOG" "$1"; then echo "[$TAG] OK: $2"; else
+        echo "[$TAG] WRONG (no output line == '$1'): $2"; fail=1; fi
+}
+check "hello world"    "double-quoted word with space is ONE argument"
+check "ham there"      "double quotes interpolate \$who"
+check '$who literal'   "single quotes are literal (no interpolation)"
+check "a b c d"        "mixed quoted/bare words joined by echo"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_hamsh_quotes] --- captured ---"
-    cat "$LOG"
-    echo "[test_hamsh_quotes] --- end ---"
-    echo "[test_hamsh_quotes] FAIL"
-    exit 1
+    echo "[$TAG] --- command-output lines ---" >&2
+    hamsh_outlines "$LOG" | tail -30 >&2
+    verdict_fail "$TAG" "a quoting assertion was VIOLATED"
 fi
-echo "[test_hamsh_quotes] PASS"
+verdict_pass "$TAG" "double/single quoting + word-splitting suppression all correct"

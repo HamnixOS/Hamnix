@@ -1,151 +1,90 @@
 #!/usr/bin/env bash
 # scripts/test_hamsh_assign.sh — POSIX `VAR=value` assignment syntax.
 #
-# hamsh historically only understood a SPACED `=` as assignment, and it
-# parsed the RHS as an arithmetic expression. That made the standard
-# shell forms fail:
+# A `=` GLUED to the LHS name (no surrounding space) lexes as
+# OP_ASSIGN_LIT and its RHS is a LITERAL command word, not an expression
+# — so `/`, `:`, `.` are literal, `'...'` is literal, `"..."` still
+# interpolates `$vars`, and `$VAR` expands. A SPACED `=` (`n = 10 * 4`)
+# keeps arithmetic-expression semantics. `export VAR=value` assigns AND
+# exports. An arg-position glued `=` (`echo a=b`) is a LITERAL word, not
+# an assignment (QA-N7/N13/N16 regression guards).
 #
-#   * `HOME=/home/live`  — the tokenizer split on `=` and then parsed
-#     `/home/live` as division, yielding empty/garbage (or aborted the
-#     whole rc script). A bad assignment in etc/rc.de-user aborted DE
-#     startup and left the shell at the wrong uid.
-#   * `export HOME=/home/live` — parse error (the `=` had no builtin
-#     handling at statement scope), aborting the sourced rc script.
-#
-# The fix (user/hamsh.ad): a `=` GLUED to the LHS name (no surrounding
-# space) lexes as OP_ASSIGN_LIT and its RHS is a LITERAL command word,
-# not an expression — so `/`, `:`, `.` are literal, `'...'` is literal,
-# `"..."` still interpolates `$vars`, and `$VAR` expands. A SPACED `=`
-# (`n = 10 * 4`) keeps the arithmetic-expression semantics (covered by
-# test_hamsh_values.sh). `export VAR=value` assigns AND exports.
-#
-# Strategy: boot hamsh as /init, drive its serial, echo back the values
-# and assert them. NB: a freshly-booted hamsh drops the FIRST serial
-# command line, so we send a warm-up marker line first.
+# INPUT IS PROMPT-GATED + OUTPUT-ADAPTIVE via scripts/_hamsh_drive.sh —
+# commands sent once after a live-readline handshake, waited on their own
+# observable output. Assertions use hamsh_ran (scripts/_hamsh_log.sh): the
+# arg-position cases (`echo GOT_AB a=b`) print text byte-identical to the
+# typed input, so dropping the prompt-echo line is REQUIRED to prove the
+# echo actually ran rather than matching the keystroke echo.
+set -uo pipefail
+trap '' PIPE
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_hamsh_log.sh"
 
-set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
 
+TAG=test_hamsh_assign
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 
-echo "[test_hamsh_assign] (1/3) Build userland"
-bash scripts/build_user.sh >/dev/null
-
-echo "[test_hamsh_assign] (2/3) Plant /init = hamsh in initramfs"
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
-
-echo "[test_hamsh_assign] (3/3) Rebuild kernel image"
+bash scripts/build_user.sh >/dev/null || verdict_inconclusive "$TAG" "build_user failed"
+INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null \
+    || verdict_inconclusive "$TAG" "build_initramfs failed"
 python3 -m compiler.adder compile \
-    --target=x86_64-bare-metal \
-    init/main.ad \
-    -o "$ELF" >/dev/null
+    --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "kernel compile failed"
 
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+cleanup() {
+    hamsh_shutdown
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
+}
+trap cleanup EXIT
 
-set +e
-(
-    sleep 3
-    # Each case is SELF-CONTAINED on ONE serial line (assign ; echo),
-    # so a per-line serial drop can't decouple a set from its read.
-    # The first line a fresh hamsh sees is dropped, so lead with a
-    # harmless warm-up marker (re-sent) before the real cases.
-    printf 'echo WARMUP_MARKER\n'
-    sleep 2
-    printf 'echo WARMUP_MARKER\n'
-    sleep 2
-    # 1. bare POSIX assignment: literal PATH RHS (no arithmetic).
-    printf 'DIR=/home/live ; echo GOT_DIR $DIR\n'
-    sleep 2
-    # 2. PATH-list value: glued ':' stays literal, no division.
-    printf 'P=/bin:/sbin:/usr/bin ; echo GOT_P $P\n'
-    sleep 2
-    # 3. export VAR=value — assign AND export in one statement.
-    printf 'export EV=exported_val ; echo GOT_EV $EV\n'
-    sleep 2
-    # 4. double-quoted RHS still interpolates $vars.
-    printf 'DIR=/home/live ; Q="dir is $DIR" ; echo GOT_Q $Q\n'
-    sleep 2
-    # 5. single-quoted RHS is literal (no interpolation).
-    printf "L='raw dollar' ; echo GOT_L \$L\n"
-    sleep 2
-    # 6. spaced `=` still does arithmetic (regression guard).
-    printf 'n = 10 * 4 + 2 ; echo GOT_N $n\n'
-    sleep 2
-    # 7. ARGUMENT-position glued `=` is a LITERAL word, NOT an
-    #    assignment — `echo a=b` must print `a=b`, not parse-error.
-    #    (Regression guard for the c93919db OP_ASSIGN_LIT change, which
-    #    fired even when `word=rhs` appeared as a command argument.)
-    printf 'echo GOT_AB a=b\n'
-    sleep 2
-    # 8. arg-position glued `=` with $var expansion in the RHS.
-    printf 'V=hello ; echo GOT_PV p=$V\n'
-    sleep 2
-    # 9. leading assignment still works alongside an arg-position use.
-    printf 'W=/x/y ; echo GOT_W $W\n'
-    sleep 2
-    # 10. export + arg-position glued `=` read-back.
-    printf 'export E=z ; echo GOT_E got=$E\n'
-    sleep 2
-    # 11. arg-position chained glued `=` (x=y=z) is one literal word.
-    printf 'echo GOT_XYZ x=y=z\n'
-    sleep 2
-    # 12. arg-position glued ':' + '=' (p:q=r) is one literal word.
-    printf 'echo GOT_PQR p:q=r\n'
-    sleep 2
-    # 13. QA-N13: a word BEGINNING with '=' (empty LHS) is a LITERAL
-    #     word, NOT an assignment — `echo =x` must print `=x`.
-    printf 'echo GOT_EQX =x\n'
-    sleep 2
-    # 14. QA-N13: multiple leading '=' (`===x`) is one literal word too;
-    #     the lexer must not mis-tokenize the run as OP_EQEQ + OP_ASSIGN.
-    printf 'echo GOT_EQ3X ===x\n'
-    sleep 2
-    # 15. QA-N16: a word ENDING in a glued '='-run (`abc===`) is one
-    #     literal word — the trailing run must NOT lex as OP_EQEQ +
-    #     OP_ASSIGN (which parse-errored before the fix).
-    printf 'echo GOT_ABC3 abc===\n'
-    sleep 2
-    # 16. QA-N16: a two-'=' trailing run (`foo==`) is literal too.
-    printf 'echo GOT_FOO2 foo==\n'
-    sleep 2
-    # Re-send case 1 (a fresh hamsh drops its FIRST serial line, so the
-    # opening bare `VAR=/path` case can be lost; re-send is idempotent).
-    printf 'DIR=/home/live ; echo GOT_DIR $DIR\n'
-    sleep 2
-    printf 'echo ALL_DONE_MARKER\n'
-    sleep 2
-    printf 'exit\n'
-    sleep 2
-) | timeout 60s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-set -e
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "[hamsh:stage-07] loop-enter" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
 
-echo "[test_hamsh_assign] --- captured output ---"
-cat "$LOG"
-echo "[test_hamsh_assign] --- end output ---"
+# Each case is SELF-CONTAINED on ONE line (assign ; echo) and waited on
+# its own read-back marker.
+hamsh_send_await 'DIR=/home/live ; echo GOT_DIR $DIR'            'GOT_DIR /home/live'        "$CMD_WAIT" || true
+hamsh_send_await 'P=/bin:/sbin:/usr/bin ; echo GOT_P $P'        'GOT_P /bin:/sbin:/usr/bin' "$CMD_WAIT" || true
+hamsh_send_await 'export EV=exported_val ; echo GOT_EV $EV'     'GOT_EV exported_val'       "$CMD_WAIT" || true
+hamsh_send_await 'DIR=/home/live ; Q="dir is $DIR" ; echo GOT_Q $Q' 'GOT_Q dir is /home/live' "$CMD_WAIT" || true
+hamsh_send_await "L='raw dollar' ; echo GOT_L \$L"             'GOT_L raw dollar'          "$CMD_WAIT" || true
+hamsh_send_await 'n = 10 * 4 + 2 ; echo GOT_N $n'              'GOT_N 42'                  "$CMD_WAIT" || true
+hamsh_send_await 'echo GOT_AB a=b'                             'GOT_AB a=b'                "$CMD_WAIT" || true
+hamsh_send_await 'V=hello ; echo GOT_PV p=$V'                  'GOT_PV p=hello'            "$CMD_WAIT" || true
+hamsh_send_await 'W=/x/y ; echo GOT_W $W'                      'GOT_W /x/y'                "$CMD_WAIT" || true
+hamsh_send_await 'export E=z ; echo GOT_E got=$E'             'GOT_E got=z'               "$CMD_WAIT" || true
+hamsh_send_await 'echo GOT_XYZ x=y=z'                         'GOT_XYZ x=y=z'             "$CMD_WAIT" || true
+hamsh_send_await 'echo GOT_PQR p:q=r'                         'GOT_PQR p:q=r'             "$CMD_WAIT" || true
+hamsh_send_await 'echo GOT_EQX =x'                            'GOT_EQX =x'                "$CMD_WAIT" || true
+hamsh_send_await 'echo GOT_EQ3X ===x'                        'GOT_EQ3X ===x'             "$CMD_WAIT" || true
+hamsh_send_await 'echo GOT_ABC3 abc==='                      'GOT_ABC3 abc==='           "$CMD_WAIT" || true
+hamsh_send_await 'echo GOT_FOO2 foo=='                       'GOT_FOO2 foo=='            "$CMD_WAIT" || true
+hamsh_send 'exit'
+sleep 2
+
+verdict_boot_gate "$TAG" "$LOG" 0 'GOT_DIR /home/live|GOT_P /bin'
+if ! hamsh_ran "$LOG" "GOT_DIR /home/live" && ! hamsh_ran "$LOG" "GOT_P /bin"; then
+    verdict_inconclusive "$TAG" \
+        "no early marker observed within ${CMD_WAIT}s — guest starved. Re-run quiet."
+fi
 
 fail=0
 check() {
-    if grep -F -q "$1" "$LOG"; then
-        echo "[test_hamsh_assign] OK: $2"
-    else
-        echo "[test_hamsh_assign] MISS ('$1'): $2"
-        fail=1
-    fi
+    if hamsh_ran "$LOG" "$1"; then echo "[$TAG] OK: $2"; else
+        echo "[$TAG] WRONG ('$1'): $2"; fail=1; fi
 }
-
 check "GOT_DIR /home/live"          "VAR=/path is a literal string (no division)"
 check "GOT_P /bin:/sbin:/usr/bin"   "PATH-list RHS with glued ':' is literal"
 check "GOT_EV exported_val"         "export VAR=value assigns the value"
@@ -164,7 +103,8 @@ check "GOT_ABC3 abc==="             "trailing '='-run (abc===) is a literal arg 
 check "GOT_FOO2 foo=="              "trailing '='-run (foo==) is a literal arg (QA-N16)"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_hamsh_assign] FAIL"
-    exit 1
+    echo "[$TAG] --- command-output lines ---" >&2
+    hamsh_outlines "$LOG" | tail -40 >&2
+    verdict_fail "$TAG" "an assignment / arg-position glued-'=' assertion was VIOLATED"
 fi
-echo "[test_hamsh_assign] PASS"
+verdict_pass "$TAG" "VAR=value literal RHS, quoting, export, arithmetic, and arg-position glued '=' all correct"

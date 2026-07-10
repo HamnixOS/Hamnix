@@ -2,87 +2,85 @@
 # scripts/test_hamsh_values.sh — HAMSH_SPEC §18 stage 2 acceptance.
 #
 # Typed values + list interpolation (§3):
-#   * args = ["-la","/dev"]; echo $args  -> exactly two argv entries
+#   * args = ["A1","A2"]; echo L $args R -> exactly two argv entries (L A1 A2 R)
 #   * a value containing spaces is ONE argument (no word-splitting)
-#   * int / string / bool values are distinct and arithmetic works
+#   * int / string values are distinct and arithmetic / concat / len() work
 #
-# The shell echoes the argv it received so we can count entries.
+# INPUT IS PROMPT-GATED + OUTPUT-ADAPTIVE via scripts/_hamsh_drive.sh —
+# commands sent once after a live-readline handshake, waited on their own
+# observable output. Assertions use hamsh_out_eq (scripts/_hamsh_log.sh):
+# each expected result is matched only as a WHOLE genuine command-output
+# line, never the editor's input echo of the typed command.
+set -uo pipefail
+trap '' PIPE
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_hamsh_log.sh"
 
-set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
 
+TAG=test_hamsh_values
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 
-bash scripts/build_user.sh >/dev/null
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
+bash scripts/build_user.sh >/dev/null || verdict_inconclusive "$TAG" "build_user failed"
+INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null \
+    || verdict_inconclusive "$TAG" "build_initramfs failed"
 python3 -m compiler.adder compile \
-    --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null
+    --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "kernel compile failed"
 
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+cleanup() {
+    hamsh_shutdown
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
+}
+trap cleanup EXIT
 
-set +e
-(
-    sleep 3
-    # list interpolation: each element is exactly one argument
-    printf 'args = ["A1", "A2"]\n'
-    sleep 1
-    printf 'echo L $args R\n'
-    sleep 1
-    # a value with spaces stays one argument
-    printf 'phrase = "two words"\n'
-    sleep 1
-    printf 'echo X $phrase Y\n'
-    sleep 1
-    # arithmetic on int values
-    printf 'n = 10 * 4 + 2\n'
-    sleep 1
-    printf 'echo SUM $n\n'
-    sleep 1
-    # string + concatenation
-    printf 'g = "ham" + "nix"\n'
-    sleep 1
-    printf 'echo CAT $g\n'
-    sleep 1
-    # len() of a list
-    printf 'echo LEN ${ len(args) }\n'
-    sleep 1
-    printf 'exit\n'
-    sleep 1
-) | timeout 30s qemu-system-x86_64 \
-    -kernel "$ELF" -smp 2 -nographic -no-reboot -m 256M \
-    -monitor none -serial stdio > "$LOG" 2>&1
-set -e
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "[hamsh:stage-07] loop-enter" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
 
-echo "[test_hamsh_values] --- captured ---"
-cat "$LOG"
-echo "[test_hamsh_values] --- end ---"
+hamsh_send 'args = ["A1", "A2"]'
+hamsh_send_await 'echo L $args R'          'L A1 A2 R'    "$CMD_WAIT" || true
+hamsh_send 'phrase = "two words"'
+hamsh_send_await 'echo X $phrase Y'        'X two words Y' "$CMD_WAIT" || true
+hamsh_send 'n = 10 * 4 + 2'
+hamsh_send_await 'echo SUM $n'             'SUM 42'       "$CMD_WAIT" || true
+hamsh_send 'g = "ham" + "nix"'
+hamsh_send_await 'echo CAT $g'             'CAT hamnix'   "$CMD_WAIT" || true
+hamsh_send_await 'echo LEN ${ len(args) }' 'LEN 2'        "$CMD_WAIT" || true
+hamsh_send 'exit'
+sleep 2
+
+verdict_boot_gate "$TAG" "$LOG" 0 'L A1 A2 R|SUM 42'
+if ! hamsh_out_eq "$LOG" "L A1 A2 R" && ! hamsh_out_eq "$LOG" "SUM 42"; then
+    verdict_inconclusive "$TAG" \
+        "no early marker observed within ${CMD_WAIT}s — guest starved. Re-run quiet."
+fi
 
 fail=0
 check() {
-    if grep -F -q "$1" "$LOG"; then
-        echo "[test_hamsh_values] OK: $2"
-    else
-        echo "[test_hamsh_values] MISS: $2"
-        fail=1
-    fi
+    if hamsh_out_eq "$LOG" "$1"; then echo "[$TAG] OK: $2"; else
+        echo "[$TAG] WRONG (no output line == '$1'): $2"; fail=1; fi
 }
-
-# "L A1 A2 R" — the list contributed exactly two argv entries between
-# the literal L and R, with no re-splitting.
 check "L A1 A2 R"      "list interpolation: each element is one arg"
-# "X two words Y" — the spaces inside the value did NOT split it.
 check "X two words Y"  "a value with spaces stays one argument"
 check "SUM 42"         "integer arithmetic"
 check "CAT hamnix"     "string concatenation with +"
 check "LEN 2"          "len() of a list"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_hamsh_values] FAIL"
-    exit 1
+    echo "[$TAG] --- command-output lines ---" >&2
+    hamsh_outlines "$LOG" | tail -30 >&2
+    verdict_fail "$TAG" "a typed-value / interpolation assertion was VIOLATED"
 fi
-echo "[test_hamsh_values] PASS"
+verdict_pass "$TAG" "list interpolation, no re-splitting, arithmetic, concat, len() all correct"

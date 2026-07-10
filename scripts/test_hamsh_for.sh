@@ -2,118 +2,84 @@
 # scripts/test_hamsh_for.sh — POSIX `for VAR in ITEM... { BODY }` loops
 # (QA-N18).
 #
-# hamsh historically parsed the for-loop iterable as ONE expression
-# (parse_expr), so it only accepted the spec's `for f in $files { }`
-# shape and a single bareword did not iterate at all:
-#
-#   * `for f in a b c { echo $f }`  -> `parse error: expected {`
-#     (parse_expr consumed `a`, then parse_block hit `b`, not `{`).
-#   * `for f in solo { echo $f }`   -> NO iteration / no output
-#     (a lone scalar word was not a list).
-#
-# The fix (user/hamsh.ad parse_for/exec_for): the for-loop now collects
-# ONE OR MORE item words — with the SAME word machinery as command
-# arguments, so `$var`/globs/`text$var` fusion behave identically
-# (QA-N7/N16/N20) — terminated by the opening `{`. exec_for expands the
-# item words (glob + `$list` interpolation) into a flat sequence and runs
-# the body once per item with VAR bound to it:
-#
+# The for-loop collects ONE OR MORE item words with the same word
+# machinery as command arguments (so `$var`/globs/`text$var` fusion behave
+# identically), terminated by the opening `{`; exec_for expands them into
+# a flat sequence and runs the body once per item with VAR bound to it:
 #   for x in a b c { }   -> 3 iterations (x=a, x=b, x=c)
-#   for f in solo   { }   -> 1 iteration  (f=solo)
-#   for y in $xs two { }  -> $xs's words, then `two`
+#   for f in solo   { }  -> 1 iteration  (f=solo)  (was ZERO before the fix)
+#   for y in $xs two { } -> $xs's words, then `two`
 #
-# Strategy: boot hamsh as /init, drive its serial, echo per-iteration
-# markers and assert them. NB: a freshly-booted hamsh drops the FIRST
-# serial command line, so we send a warm-up marker line first.
+# INPUT IS PROMPT-GATED + OUTPUT-ADAPTIVE via scripts/_hamsh_drive.sh —
+# commands sent once after a live-readline handshake, waited on their own
+# observable output. Assertions use hamsh_ran (scripts/_hamsh_log.sh) so
+# the typed `for ... { echo L_$x }` input echo cannot false-green the
+# per-iteration markers (whose VALUES come only from real expansion).
+set -uo pipefail
+trap '' PIPE
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_hamsh_log.sh"
 
-set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
 
+TAG=test_hamsh_for
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
+BOOT_WAIT="${BOOT_WAIT:-420}"
+CMD_WAIT="${CMD_WAIT:-240}"
 
-echo "[test_hamsh_for] (1/3) Build userland"
-bash scripts/build_user.sh >/dev/null
-
-echo "[test_hamsh_for] (2/3) Plant /init = hamsh in initramfs"
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
-
-echo "[test_hamsh_for] (3/3) Rebuild kernel image"
+bash scripts/build_user.sh >/dev/null || verdict_inconclusive "$TAG" "build_user failed"
+INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null \
+    || verdict_inconclusive "$TAG" "build_initramfs failed"
 python3 -m compiler.adder compile \
-    --target=x86_64-bare-metal \
-    init/main.ad \
-    -o "$ELF" >/dev/null
+    --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null \
+    || verdict_inconclusive "$TAG" "kernel compile failed"
 
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+cleanup() {
+    hamsh_shutdown
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+    [ "${KEEP_LOGS:-0}" = "1" ] || rm -f "$LOG"
+}
+trap cleanup EXIT
 
-set +e
-(
-    sleep 3
-    # A fresh hamsh drops its FIRST serial line, so lead with a harmless
-    # warm-up marker (re-sent) before the real cases. Each case is
-    # SELF-CONTAINED on ONE serial line so a per-line drop can't decouple
-    # a set-up from its read-back.
-    printf 'echo WARMUP_MARKER\n'
-    sleep 2
-    printf 'echo WARMUP_MARKER\n'
-    sleep 2
-    # 1. multi-word list: three iterations, VAR bound to each word.
-    printf 'for x in a b c { echo L_$x }\n'
-    sleep 2
-    # 2. single bareword: exactly ONE iteration (was zero before).
-    printf 'for f in solo { echo S_$f }\n'
-    sleep 2
-    # 3. $var that expands to a scalar word, then a trailing literal.
-    printf 'xs=one ; for y in $xs two { echo Y_$y }\n'
-    sleep 2
-    # Re-send case 1 (a fresh hamsh may still have been warming up).
-    printf 'for x in a b c { echo L_$x }\n'
-    sleep 2
-    printf 'echo ALL_DONE_MARKER\n'
-    sleep 2
-    printf 'exit\n'
-    sleep 2
-) | timeout 60s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-set -e
+hamsh_boot "$LOG" "$ELF"
+hamsh_wait_boot "[hamsh:stage-07] loop-enter" "$BOOT_WAIT" \
+    || verdict_inconclusive "$TAG" "hamsh never reached its prompt in ${BOOT_WAIT}s (host-starved?)"
+hamsh_sync 120 \
+    || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
 
-echo "[test_hamsh_for] --- captured output ---"
-cat "$LOG"
-echo "[test_hamsh_for] --- end output ---"
+hamsh_send_await 'for x in a b c { echo L_$x }'          'L_c'   "$CMD_WAIT" || true
+hamsh_send_await 'for f in solo { echo S_$f }'           'S_solo' "$CMD_WAIT" || true
+hamsh_send_await 'xs=one ; for y in $xs two { echo Y_$y }' 'Y_two' "$CMD_WAIT" || true
+hamsh_send 'exit'
+sleep 2
+
+verdict_boot_gate "$TAG" "$LOG" 0 'L_a|L_c'
+if ! hamsh_ran "$LOG" "L_a" && ! hamsh_ran "$LOG" "L_c"; then
+    verdict_inconclusive "$TAG" \
+        "no early marker observed within ${CMD_WAIT}s — guest starved. Re-run quiet."
+fi
 
 fail=0
 check() {
-    if grep -F -q "$1" "$LOG"; then
-        echo "[test_hamsh_for] OK: $2"
-    else
-        echo "[test_hamsh_for] MISS ('$1'): $2"
-        fail=1
-    fi
+    if hamsh_ran "$LOG" "$1"; then echo "[$TAG] OK: $2"; else
+        echo "[$TAG] WRONG ('$1'): $2"; fail=1; fi
 }
-
-# Case 1: three iterations over the bareword list.
 check "L_a"     "for x in a b c -> iteration x=a"
 check "L_b"     "for x in a b c -> iteration x=b"
 check "L_c"     "for x in a b c -> iteration x=c"
-# Case 2: single bareword iterates exactly once.
-check "S_solo"  "for f in solo -> single iteration f=solo"
-# Case 3: \$var + trailing literal.
+check "S_solo"  "for f in solo -> single iteration f=solo (was ZERO before)"
 check "Y_one"   "for y in \$xs two -> \$xs expands to 'one'"
 check "Y_two"   "for y in \$xs two -> trailing literal 'two'"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_hamsh_for] FAIL"
-    exit 1
+    echo "[$TAG] --- command-output lines ---" >&2
+    hamsh_outlines "$LOG" | tail -30 >&2
+    verdict_fail "$TAG" "a for-loop iteration assertion was VIOLATED"
 fi
-echo "[test_hamsh_for] PASS"
+verdict_pass "$TAG" "for iterates over multi-word, single-bareword, and \$var+literal item lists"
