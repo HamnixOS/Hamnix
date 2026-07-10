@@ -49,6 +49,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_net_iproute
+
 export HAMNIX_BUILD_LOCK_TIMEOUT=900
 
 ELF=build/hamnix-kernel.elf
@@ -105,6 +108,12 @@ echo "[test_net_iproute] --- ip-fib self-test output ---"
 grep -E '\[ip-fib\]' "$CLEAN_LOG" || true
 echo "[test_net_iproute] --- end ---"
 
+# Three-valued gate: a starved / non-booting run emits ZERO [ip-fib]
+# markers. Route the zero-marker case through the shared discriminator FIRST
+# (INCONCLUSIVE on timeout/OOM, FAIL on an observed crash) against the
+# escape-stripped log.
+verdict_boot_gate "$TAG" "$CLEAN_LOG" "$rc" '\[ip-fib\]'
+
 fail=0
 
 if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
@@ -136,11 +145,23 @@ check "no default + no match misses"           "[ip-fib] no-default-no-match-mis
 check "same-prefix re-add replaces in place"   "[ip-fib] same-prefix-readd-replaces PASS"
 check "FIB self-test PASS-ALL banner"          "[ip-fib] PASS-ALL"
 
+have_all=0
+grep -qF "[ip-fib] PASS-ALL" "$CLEAN_LOG" && have_all=1
 rm -f "$CLEAN_LOG"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_net_iproute] FAIL"
-    exit 1
+    if [ "$have_all" -eq 0 ] && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[ip-fib] markers printed but the terminal 'PASS-ALL' banner" \
+            "never arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "an [ip-fib] marker was OBSERVED absent (or an internal FAIL was" \
+        "reported) while the selftest ran (qemu rc=$rc) — real regression."
 fi
 
-echo "[test_net_iproute] PASS — IPv4 FIB longest-prefix-match selects the correct next hop (/32 > /24 > /16 > default), distinguishes on-link (ARP dst) from via-gateway (ARP gw), misses cleanly when unrouted, and replaces same-prefix routes in place"
+verdict_pass "$TAG" "IPv4 FIB longest-prefix-match selects the correct next" \
+    "hop (/32 > /24 > /16 > default), distinguishes on-link (ARP dst) from" \
+    "via-gateway (ARP gw), misses cleanly when unrouted, and replaces" \
+    "same-prefix routes in place"

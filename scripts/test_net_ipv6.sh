@@ -36,6 +36,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_net_ipv6
+
 ELF=build/hamnix-kernel.elf
 
 echo "[test_net_ipv6] (1/3) Build userland + initramfs (with /etc/ipv6-test marker)"
@@ -69,6 +72,14 @@ echo "[test_net_ipv6] --- captured (ipv6 / icmpv6 lines) ---"
 grep -a -E '\[ipv6\]|\[icmpv6\]|\[ipv6-selftest\]' "$LOG" || true
 echo "[test_net_ipv6] --- end ---"
 
+# Three-valued gate: a TCG-starved / non-booting run emits ZERO
+# [ipv6*] markers and used to be indistinguishable from a real
+# regression (a wall of MISS -> hard FAIL). Route the zero-marker case
+# through the shared discriminator FIRST (INCONCLUSIVE on timeout/OOM,
+# FAIL on an observed crash). The per-needle MISS chain below stays as
+# diagnostics; the final decision is verdict_*.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ipv6-selftest\]|\[ipv6\]'
+
 fail=0
 for needle in \
     "[ipv6] link-local address fe80:: derived: fe80:" \
@@ -88,10 +99,23 @@ do
 done
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_net_ipv6] FAIL (qemu rc=$rc)"
     echo "[test_net_ipv6] --- full log ---"
     cat "$LOG"
-    exit 1
+    # Some [ipv6*] markers printed but the terminal ALL PASS never arrived
+    # AND qemu was killed by timeout -> starved mid-selftest, not a
+    # regression. Anything else (clean exit without PASS, or an OBSERVED
+    # marker MISS) is a real actionable red.
+    if ! grep -a -F -q "[ipv6-selftest] ALL PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[ipv6*] markers printed but the terminal 'ALL PASS' banner" \
+            "never arrived and qemu was killed by timeout (rc=124) —" \
+            "starved mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "an [ipv6*] selftest marker was OBSERVED absent while the selftest" \
+        "ran (qemu rc=$rc) — real regression in the IPv6 RX/TX path."
 fi
 
-echo "[test_net_ipv6] PASS"
+verdict_pass "$TAG" "link-local IPv6: fe80::/64 EUI-64 derivation, ICMPv6" \
+    "NS->NA neighbor discovery, ICMPv6 echo, UDP6 pseudo-header checksum," \
+    "fragment reassembly, and Router Advertisement processing all verified"

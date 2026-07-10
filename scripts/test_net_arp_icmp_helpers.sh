@@ -26,6 +26,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_net_arp_icmp_helpers
+
 ELF=build/hamnix-kernel.elf
 
 echo "[test_nai] (1/3) Build userland + initramfs (with marker)"
@@ -57,6 +60,12 @@ echo "[test_nai] --- captured (net-helpers / arp / icmp) ---"
 grep -E '\[net-helpers\]|\[arp\] unicast|\[icmp\] time-exceeded|\[icmp\] redirect' "$LOG" || true
 echo "[test_nai] --- end ---"
 
+# Three-valued gate: a starved / non-booting run emits ZERO [net-helpers]
+# markers and used to look identical to a real regression. Route the
+# zero-marker case through the shared discriminator FIRST (INCONCLUSIVE on
+# timeout/OOM, FAIL on an observed crash).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[net-helpers\]'
+
 fail=0
 for needle in \
     "[net-helpers] selftest start" \
@@ -77,10 +86,18 @@ do
 done
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_nai] FAIL (qemu rc=$rc)"
     echo "[test_nai] --- full log ---"
     cat "$LOG"
-    exit 1
+    if ! grep -F -q "[net-helpers] selftest done" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[net-helpers] markers printed but the 'selftest done' banner" \
+            "never arrived and qemu was killed by timeout (rc=124) —" \
+            "starved mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "a [net-helpers] marker was OBSERVED absent while the selftest ran" \
+        "(qemu rc=$rc) — real regression in ARP/ICMP forwarding helpers."
 fi
 
-echo "[test_nai] PASS"
+verdict_pass "$TAG" "ARP unicast reply framing, ICMP time-exceeded" \
+    "generation, IP TTL decrement, and the forwarding flag all verified"

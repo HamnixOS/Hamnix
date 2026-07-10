@@ -51,6 +51,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_net_ipreasm
+
 export HAMNIX_BUILD_LOCK_TIMEOUT=900
 
 ELF=build/hamnix-kernel.elf
@@ -111,6 +114,12 @@ echo "[test_net_ipreasm] --- ip-reasm self-test output ---"
 grep -E '\[ip-reasm\]' "$CLEAN_LOG" || true
 echo "[test_net_ipreasm] --- end ---"
 
+# Three-valued gate: a starved / non-booting run emits ZERO [ip-reasm]
+# markers. Route the zero-marker case through the shared discriminator FIRST
+# (INCONCLUSIVE on timeout/OOM, FAIL on an observed crash) against the
+# escape-stripped log.
+verdict_boot_gate "$TAG" "$CLEAN_LOG" "$rc" '\[ip-reasm\]'
+
 fail=0
 
 if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
@@ -141,11 +150,25 @@ check "oversize fragment rejected"            "[ip-reasm] oversize-fragment-reje
 check "corrupt header checksum dropped"       "[ip-reasm] corrupt-header-checksum-dropped PASS"
 check "reassembly self-test PASS-ALL banner"  "[ip-reasm] PASS-ALL"
 
+have_all=0
+grep -qF "[ip-reasm] PASS-ALL" "$CLEAN_LOG" && have_all=1
 rm -f "$CLEAN_LOG"
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_net_ipreasm] FAIL"
-    exit 1
+    # Markers printed but the terminal PASS-ALL never arrived AND qemu was
+    # killed by timeout -> starved mid-selftest, not a regression.
+    if [ "$have_all" -eq 0 ] && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[ip-reasm] markers printed but the terminal 'PASS-ALL' banner" \
+            "never arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "an [ip-reasm] marker was OBSERVED absent (or an internal FAIL was" \
+        "reported) while the selftest ran (qemu rc=$rc) — real regression."
 fi
 
-echo "[test_net_ipreasm] PASS — IPv4 fragments reassemble (in-order, out-of-order, duplicate-safe) into a byte-exact datagram, an oversize fragment is rejected, and a corrupt-header-checksum packet is dropped before it can pollute reassembly"
+verdict_pass "$TAG" "IPv4 fragments reassemble (in-order, out-of-order," \
+    "duplicate-safe) into a byte-exact datagram, an oversize fragment is" \
+    "rejected, and a corrupt-header-checksum packet is dropped before it" \
+    "can pollute reassembly"

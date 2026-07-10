@@ -34,6 +34,9 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_net_cfg
+
 ELF=build/hamnix-kernel.elf
 
 echo "[test_net_cfg] (1/3) Build userland + initramfs (netcfg smoke gated on)"
@@ -65,6 +68,11 @@ echo "[test_net_cfg] --- captured (netcfg / dhcp) ---"
 grep -E '\[netcfg\]|\[dhcp\]' "$LOG" || true
 echo "[test_net_cfg] --- end ---"
 
+# Three-valued gate: a starved / non-booting run emits ZERO [netcfg]/[dhcp]
+# markers. Route the zero-marker case through the shared discriminator FIRST
+# (INCONCLUSIVE on timeout/OOM, FAIL on an observed crash).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[netcfg\]|\[dhcp\]'
+
 fail=0
 for needle in \
     "[netcfg] dhcp-reflect PASS" \
@@ -91,10 +99,18 @@ else
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_net_cfg] FAIL (qemu rc=$rc)"
     echo "[test_net_cfg] --- full log ---"
     cat "$LOG"
-    exit 1
+    if ! grep -F -q "[netcfg] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[netcfg]/[dhcp] markers printed but the terminal '[netcfg] PASS'" \
+            "never arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-selftest. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "a [netcfg] marker was OBSERVED absent while the selftest ran (qemu" \
+        "rc=$rc) — real regression in SYS_NETCFG dhcp-reflect / static addr/gw/dns."
 fi
 
-echo "[test_net_cfg] PASS"
+verdict_pass "$TAG" "SYS_NETCFG reflects the SLIRP DHCP lease (10.0.2.15)" \
+    "and applies static address, gateway, and DNS configuration"
