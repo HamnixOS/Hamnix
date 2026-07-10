@@ -475,21 +475,32 @@ stack-machine emit path), and instruction-selection IR (#493+).
 
 ## CI / verification gap
 
-- [ ] **CI must build the shipped image.** Nothing in CI runs
-  `build_installer_img.sh`, so the image build sat BROKEN (`mkfs.ext4:
-  Could not allocate block`) until a QA pass tripped over it —
-  `HAMNIX_ROOTFS_SIZE_MB` was pinned at 512 MiB while the Debian fixture
-  closure grew to 555 MiB staged. Fixed in `106b9ebb` (auto-size + a
-  512 MiB floor), but the *class* of bug recurs: add a CI job that builds
-  the installer image on every push. A pinned size constant that silently
-  stops tracking a growing input is exactly the "regression-prone, needs a
-  test" pattern.
-- [ ] **Gate the two real boot paths in CI.** Today `ci.yml` gates 14
-  tests, all `-kernel` multiboot (only `test_efi_gop` touches OVMF, and
-  only checks pixels). Add as gates: `test_installer_boot_heartbeat.sh`
-  (USB/installer image, real OVMF) and `test_installer_nvme_inram.sh`
-  (installed-disk, real OVMF). Verify both finish reliably under TCG
-  first; the lane the original `ci.yml` header promised never landed.
+**Overhauled 2026-07-10 (was 14 gates, all green-or-nothing; now 116 gates,
+three-valued, sharded).** `ci.yml` is now: a Tier-1 host-selftest job (compiler/
+optimizer/codegen, no QEMU), a 12-way round-robin-sharded bare-metal battery
+driven by `scripts/ci_battery_manifest.txt` (`scripts/ci_run_battery_shard.sh`,
+per-gate `GATE_TIMEOUT`, 50-min ceiling), and the installer OVMF boot-heartbeat
+job that **does** build `build/hamnix-installer.img` every push. Docs-only pushes
+skip the workflow (`paths-ignore`). Adding a gate = one line in the manifest.
+
+- [ ] **`test_installer_nvme_inram.sh` (installed-disk, real OVMF) still un-gated**
+  — it hard-requires `/dev/kvm` (SKIPs without it) and runs a 3-stage
+  install→reboot→boot flow too slow for TCG. Gate it on a KVM-enabled
+  self-hosted runner, or shrink the install payload. (The USB/installer OVMF
+  boot-heartbeat path IS gated now.)
+- [ ] **Test-migration sweep — continue on a quiet host (the highest-yield bug
+  finder this project has).** Migrating dark `MISS→hard-FAIL` gates onto the
+  three-valued `verdict_boot_gate`/`_hamsh_drive.sh` and investigating whatever
+  doesn't cleanly PASS found **9 real hidden kernel bugs** across the
+  syscall / dm / ext4 / block-storage / AHCI families (2026-07-10). Families
+  SWEPT (mechanical or bug-yielding, now gated): Linux-ABI syscall selftests,
+  /dev+srv, ext4-core, block/storage+AHCI, core net stack (MECHANICAL — stack
+  sound). Families NOT yet swept (candidates, may hide bugs): **usb/xhci**,
+  **mm/page/slab/vma**, **ext4-stretch** (csum/fast_commit/resize/verity/
+  fscrypt/bigalloc/flexbg/eainode/multigroup), the **NIC L-shim** gates
+  (e1000e/r8169/net_irq), the **TLS/HTTPS** net gates (need offline TLS
+  fixtures), and `test_ahci_ko`/heavy `.ko` L-shim gates. Also: `test_socketpair`
+  and `test_net_dns_cache` want a `_hamsh_drive.sh` / offline-fixture follow-up.
 
 ---
 

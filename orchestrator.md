@@ -103,8 +103,24 @@ the orchestrator's framing many times by going to the evidence. Reward disproof.
 
 ## Current front (update this as it moves)
 
-As of 2026-07-09, the high-value **host-tolerant** backlog is cleared. What remains is
-either blocked on host quality or genuinely low-value:
+**2026-07-10 — CI overhaul + a 6-family test-migration sweep (9 real bugs).** The
+GitHub CI was red on every push; it is now green + hardened: a Tier-1 host-selftest
+job, a **12-way round-robin-sharded** bare-metal battery driven by
+`scripts/ci_battery_manifest.txt` (`ci_run_battery_shard.sh`, per-gate `GATE_TIMEOUT`,
+50-min ceiling), and an installer-OVMF boot job that builds the shipped image every
+push; docs-only pushes skip via `paths-ignore`. **116 gates** now guard every push
+(was 14). Adding a gate = one manifest line. The load-bearing discovery: migrating
+dark `MISS→hard-FAIL` gates onto the three-valued `verdict_boot_gate` and
+investigating whatever doesn't cleanly PASS is the **highest-yield bug finder** —
+it surfaced 9 real hidden kernel bugs (syscall `uaccess` brackets, dm bcache
+test-gap, AHCI boot #DF = sleep-before-`sched_init`, `getrusage` -EFAULT, NCQ
+deadlock = `GHC.IE` never set, verdict-helper bugs). The **core net stack came back
+MECHANICAL** (sound) — the first diminishing-return signal, so the sweep is paused.
+To resume it (quiet host): next un-swept families in TODO's "CI / verification gap"
+— usb/xhci, mm, ext4-stretch, NIC L-shims, TLS/HTTPS. New memory:
+`project_no_sleep_before_sched_init`, `project_boot_selftest_uaccess_bracket`.
+
+Older backlog (still true) — either blocked on host quality or genuinely low-value:
 
 - **HOST-BLOCKED (need a healthier machine — this box's firmware-ACPI kworkers make the
   guest ~100× slow, and a reboot does NOT durably clear them):**
