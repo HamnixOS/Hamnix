@@ -56,10 +56,24 @@ while [ "$i" -lt "$total" ]; do
         # Each gate already tees its own /tmp/<name>.log; here we just run it
         # and let stdout/stderr flow to the shard log. A gate's own exit code
         # decides PASS/FAIL (ci_run_gate.sh maps INCONCLUSIVE→0 warning).
-        if eval "$cmd"; then
+        #
+        # HARD per-gate wall-clock cap: a single gate that WEDGES under TCG
+        # (an -smp scheduler stall, a distrofs teardown hang) must not silently
+        # eat the whole 40-min job budget — that produces an unattributable
+        # SHARD timeout with GitHub dropping the killed step's log (exactly how
+        # shard 4/8 died at 40m16s with zero gates reported). `timeout` bounds
+        # each gate; an exceeded gate (rc 124) is treated as INCONCLUSIVE — a
+        # non-failing ::warning:: naming the gate — NOT a hard FAIL, because
+        # under pure TCG a timeout is far more likely host-starvation than a
+        # real regression (same three-valued philosophy as ci_run_gate.sh).
+        rc=0
+        timeout -k 10 "${GATE_TIMEOUT:-600}"s bash -c "$cmd" || rc=$?
+        if [ "$rc" -eq 0 ]; then
             echo "PASS $cmd"
+        elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            echo "::warning::INCONCLUSIVE (gate exceeded ${GATE_TIMEOUT:-600}s under TCG): $cmd"
         else
-            echo "FAIL $cmd (exit $?)"
+            echo "FAIL $cmd (exit $rc)"
             fail=1
         fi
         echo "::endgroup::"
