@@ -25,6 +25,9 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
+TAG=test_ext4_fsync
 
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
@@ -52,49 +55,47 @@ cp build/ext4.img "$DISK"
 
 LOG1=$(mktemp)
 LOG2=$(mktemp)
-trap 'rm -f "$LOG1" "$LOG2" "$DISK"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+READY='[hamsh:stage-07] loop-enter'
+# The disk rides on both boots via QEMU_EXTRA_ARGS (word-splits on spaces;
+# the file= value has no spaces so it stays one token). _hamsh_drive.sh
+# backgrounds QEMU, kills only OUR pid, and waits adaptively — no fixed
+# `sleep 3` racing the prompt (the false-red the driver was built to kill).
+export QEMU_EXTRA_ARGS="-drive file=$DISK,if=virtio,format=raw"
+export HAMNIX_VM_MEM=256M
+
+trap 'hamsh_shutdown; rm -f "$LOG1" "$LOG2" "$DISK"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
 
 echo "[test_ext4_fsync] (4/5) Boot #1 — write $MARKER to /ext, fsync, halt"
-set +e
-(
+b1_ready=0
+hamsh_boot "$LOG1" "$ELF"
+if hamsh_wait_boot "$READY" 420 && hamsh_sync 120; then
+    b1_ready=1
+    # Fire the write (fire-and-forget: the redirect sends echo's output to
+    # the FILE, so the ONLY place $MARKER lands in LOG1 is this command's
+    # own readline echo — awaiting it here would be a false-positive
+    # echo-sentinel, so we don't). Give the ordered write-through path time
+    # to reach the disk image, THEN read it back in-session.
+    hamsh_send "echo $MARKER > /ext/PERSIST.TXT"
     sleep 3
-    printf 'echo %s > /ext/PERSIST.TXT\n' "$MARKER"
+    hamsh_send_await "cat /ext/PERSIST.TXT" "$MARKER" 120 || true
+    hamsh_send 'exit'
     sleep 2
-    printf 'cat /ext/PERSIST.TXT\n'
-    sleep 2
-    printf 'exit\n'
-    sleep 1
-) | timeout 45s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -drive file="$DISK",if=virtio,format=raw \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG1" 2>&1
-rc1=$?
+fi
+hamsh_shutdown
 
 echo "[test_ext4_fsync] (5/5) Boot #2 — re-attach the SAME disk, read it back"
-(
-    sleep 3
-    printf 'cat /ext/PERSIST.TXT\n'
+b2_ready=0
+hamsh_boot "$LOG2" "$ELF"
+if hamsh_wait_boot "$READY" 420 && hamsh_sync 120; then
+    b2_ready=1
+    # Boot #2 types ONLY `cat` — no write command — so $MARKER can appear in
+    # LOG2 ONLY as genuine file content read back off the disk. This is the
+    # load-bearing persistence proof (immune to the echo-sentinel class).
+    hamsh_send_await "cat /ext/PERSIST.TXT" "$MARKER" 120 || true
+    hamsh_send 'exit'
     sleep 2
-    printf 'exit\n'
-    sleep 1
-) | timeout 45s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -drive file="$DISK",if=virtio,format=raw \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG2" 2>&1
-rc2=$?
-set -e
+fi
+hamsh_shutdown
 
 echo "[test_ext4_fsync] --- boot #1 ext4/fsync lines ---"
 grep -E 'ext4: fsync|PERSIST' "$LOG1" || true
@@ -102,9 +103,25 @@ echo "[test_ext4_fsync] --- boot #2 PERSIST lines ---"
 grep -E 'PERSIST' "$LOG2" || true
 echo "[test_ext4_fsync] --- end ---"
 
+# --- three-valued verdict --------------------------------------------------
+# If EITHER boot never reached the shell read-loop, the assertion was never
+# observed — INCONCLUSIVE (starved / OOM), not a regression.
+if [ "$b1_ready" -ne 1 ]; then
+    verdict_inconclusive "$TAG" \
+        "boot #1 never reached '$READY' + FEEDER_SYNC — the fsync/write path" \
+        "was never exercised (starved or OOM boot). Re-run on a QUIET host."
+fi
+if [ "$b2_ready" -ne 1 ]; then
+    verdict_inconclusive "$TAG" \
+        "boot #2 never reached '$READY' + FEEDER_SYNC — persistence could not" \
+        "be observed (starved or OOM boot). Re-run on a QUIET host."
+fi
+
 fail=0
 
-# Part A: fsync smoke marker on the first boot.
+# Part A: the fsync smoke marker is a GENUINE kernel selftest banner
+# (create -> write -> fsync/blk_flush -> read-back), printed unconditionally
+# at boot — not an input echo.
 if grep -F -q "ext4: fsync smoke PASS" "$LOG1"; then
     echo "[test_ext4_fsync] OK: ext4 fsync smoke (flush + read-back)"
 else
@@ -112,17 +129,10 @@ else
     fail=1
 fi
 
-# Boot #1 must echo the marker back (write path works in-session).
-if grep -F -q "$MARKER" "$LOG1"; then
-    echo "[test_ext4_fsync] OK: boot #1 wrote and read $MARKER"
-else
-    echo "[test_ext4_fsync] MISS: boot #1 did not read back $MARKER"
-    fail=1
-fi
-
-# Part B: the marker must survive into the SECOND boot's read.
+# Part B (load-bearing): the marker survived into the SECOND boot's read.
+# LOG2 has NO write command, so this $MARKER is genuine on-disk content.
 if grep -F -q "$MARKER" "$LOG2"; then
-    echo "[test_ext4_fsync] OK: $MARKER survived the reboot (persistence)"
+    echo "[test_ext4_fsync] OK: $MARKER survived the reboot (real persistence)"
 else
     echo "[test_ext4_fsync] MISS: $MARKER NOT found after reboot"
     echo "[test_ext4_fsync] --- boot #2 full log ---"
@@ -131,7 +141,13 @@ else
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_ext4_fsync] FAIL (qemu rc1=$rc1 rc2=$rc2)"
-    exit 1
+    verdict_fail "$TAG" \
+        "either the ext4 fsync smoke banner was OBSERVED absent, or the" \
+        "on-disk $MARKER did NOT survive the reboot — both boots reached the" \
+        "shell, so this is a real fsync/persistence regression."
 fi
-echo "[test_ext4_fsync] PASS"
+
+verdict_pass "$TAG" "ext4 fsync + reboot persistence: the boot-time fsync" \
+    "smoke (create->write->blk_flush->read-back) passes AND a shell-written," \
+    "write-through file survives a full power-cycle onto the SAME detached" \
+    "ext4 image (read back genuinely, no write command in boot #2's log)"
