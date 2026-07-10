@@ -154,8 +154,26 @@ as --64 -o "$STUB_TMP/efi_stub.o" "$EFI_STUB_SRC"
 ld -m i386pep --subsystem 10 -e efi_main --image-base 0 \
    --no-dynamic-linker -nostdlib \
    -o "$EFI_STUB" "$STUB_TMP/efi_stub.o"
-file "$EFI_STUB" | grep -q "PE32+ executable for EFI" \
+# Verify the stub is a genuine PE32+ EFI application by inspecting the
+# PE header bytes directly — NOT by grepping file(1)'s human string,
+# whose wording drifts between versions ("PE32+ executable (EFI
+# application)" on file<=5.45 vs "PE32+ executable for EFI (application)"
+# on file>=5.46). That drift silently reddened this gate on GitHub's
+# runner (older file) while it passed locally. Check the invariant bytes
+# instead: MZ magic, PE signature, optional-header magic 0x020b (PE32+),
+# and subsystem 10 (EFI application).
+python3 - "$EFI_STUB" <<'PY' \
     || { echo "[build_installer_img] ERROR: stub is not PE32+ EFI" >&2; exit 1; }
+import sys, struct
+d = open(sys.argv[1], 'rb').read()
+if d[:2] != b'MZ': sys.exit("no MZ magic")
+pe = struct.unpack_from('<I', d, 0x3c)[0]
+if d[pe:pe+4] != b'PE\0\0': sys.exit("no PE signature")
+magic  = struct.unpack_from('<H', d, pe + 24)[0]          # optional header magic
+subsys = struct.unpack_from('<H', d, pe + 24 + 68)[0]     # PE32+ Subsystem field
+if magic != 0x020b: sys.exit(f"optional-header magic 0x{magic:04x} != 0x020b (PE32+)")
+if subsys != 10:    sys.exit(f"subsystem {subsys} != 10 (EFI application)")
+PY
 
 # --- Stage 3: the INSTALLED kernel (empty cpio; boots off NVMe ext4) --
 # This is the kernel that lands on the NVMe ESP. It carries no installer
