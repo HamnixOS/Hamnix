@@ -39,6 +39,13 @@
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+# NOTE: this gate is a PURE STATIC source scan — no build, no QEMU, no boot.
+# It therefore has NO starvation/INCONCLUSIVE state: the assertion is always
+# fully observed. It adopts the verdict_* vocabulary only so its terminal
+# line matches the standard `[tag] (PASS|FAIL):` grep shape; it stays a
+# DIRECT (unwrapped) manifest gate, never ci_run_gate.sh.
+TAG=test_fd_markers
 
 # Extract every  FD_NAME_MARK : uint32 = 0xFFFFFFxx  definition across
 # all .ad sources, normalize to "0xVALUE NAME" (uppercased hex), one per
@@ -64,8 +71,7 @@ mapfile -t entries < <(
 
 n="${#entries[@]}"
 if [ "$n" -eq 0 ]; then
-    echo "[test_fd_markers] FAIL: found ZERO FD_*_MARK definitions — grep/regex broke?"
-    exit 1
+    verdict_fail "$TAG" "found ZERO FD_*_MARK definitions — grep/regex broke?"
 fi
 
 # Walk the value-sorted list; flag any adjacent pair with equal value.
@@ -86,9 +92,7 @@ done
 echo "[test_fd_markers] scanned $n FD_*_MARK definitions"
 
 if [ "$dup" -ne 0 ]; then
-    echo "[test_fd_markers] FAIL"
-    exit 1
+    verdict_fail "$TAG" "two distinct FD_*_MARK sentinels share a numeric value (see DUPLICATE lines above) — a latent fd-routing collision."
 fi
 
-echo "[test_fd_markers] PASS"
-exit 0
+verdict_pass "$TAG" "all $n FD_*_MARK sentinels have globally-unique values."

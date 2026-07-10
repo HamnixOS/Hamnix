@@ -29,6 +29,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_devnet_local
 
 export HAMNIX_BUILD_LOCK_TIMEOUT=900
 
@@ -66,40 +68,31 @@ echo "[test_devnet_local] --- self-test output ---"
 grep -E "\[DEVNET_LOCAL\]" "$LOG" || true
 echo "[test_devnet_local] --- end ---"
 
-fail=0
+# --- three-valued verdict (migrated off the hard MISS->FAIL tail) -----
+# A zero-marker / rc=124 boot on a TCG-starved host used to look identical
+# to a real regression. verdict_boot_gate resolves zero-marker+timeout to
+# INCONCLUSIVE; an observed FAIL/placeholder is a real red; the PASS banner
+# + real host IP is genuine kernel-selftest OUTPUT (no serial input).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[DEVNET_LOCAL\]'
 
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_devnet_local] FAIL: qemu exited rc=$rc" >&2
-    fail=1
-fi
-
-# Any explicit internal failure is fatal.
 if grep -qF "[DEVNET_LOCAL] FAIL" "$LOG"; then
-    echo "[test_devnet_local] FAIL: kernel self-test reported an internal failure" >&2
-    fail=1
-fi
-
-# The rendered local address must carry the real host IP, not 0.0.0.0.
-if grep -qF "10.0.2.15!" "$LOG"; then
-    echo "[test_devnet_local] PASS: local address rendered real host IP 10.0.2.15!"
-else
-    echo "[test_devnet_local] FAIL: rendered local address missing real host IP '10.0.2.15!'" >&2
-    fail=1
+    grep -F "[DEVNET_LOCAL] FAIL" "$LOG" | head -5 >&2 || true
+    verdict_fail "$TAG" "the /net local-address self-test reported an internal FAIL (observed regression)."
 fi
 
 if grep -qF "0.0.0.0!" "$LOG"; then
-    echo "[test_devnet_local] FAIL: rendered local address still shows the 0.0.0.0 placeholder" >&2
-    fail=1
+    verdict_fail "$TAG" "the rendered local address STILL shows the 0.0.0.0 placeholder (observed regression)."
 fi
 
-if ! grep -qF "[DEVNET_LOCAL] PASS" "$LOG"; then
-    echo "[test_devnet_local] FAIL: missing [DEVNET_LOCAL] PASS banner" >&2
-    fail=1
+if grep -qF "[DEVNET_LOCAL] PASS" "$LOG" && grep -qF "10.0.2.15!" "$LOG"; then
+    verdict_pass "$TAG" "/net local-address renderer reports the real host IP (10.0.2.15), not 0.0.0.0 (qemu rc=$rc)."
 fi
 
-if [ "$fail" -ne 0 ]; then
-    echo "[test_devnet_local] FAIL"
-    exit 1
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "the selftest emitted markers but its PASS banner (or the 10.0.2.15! IP)" \
+        "never printed and qemu was killed by timeout (rc=124). Re-run quiet."
 fi
-
-echo "[test_devnet_local] PASS — /net local-address renderer reports the real host IP (10.0.2.15) instead of the 0.0.0.0 placeholder"
+verdict_fail "$TAG" \
+    "the selftest started and qemu exited on its own (rc=$rc) WITHOUT the PASS" \
+    "banner + real host IP — an OBSERVED incomplete run."

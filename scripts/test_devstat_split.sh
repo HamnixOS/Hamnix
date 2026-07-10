@@ -25,6 +25,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_devstat_split
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -63,25 +65,27 @@ echo "[test_devstat_split] --- devstat-split self-test output ---"
 grep -a -E "\[DEVSTAT_SPLIT\]" "$LOG" || true
 echo "[test_devstat_split] --- end ---"
 
-fail=0
+# --- three-valued verdict (migrated off the hard MISS->FAIL tail) -----
+# A zero-marker / rc=124 boot on a TCG-starved host used to look identical
+# to a real regression. verdict_boot_gate resolves zero-marker+timeout to
+# INCONCLUSIVE; an observed [DEVSTAT_SPLIT] FAIL is a real red; the PASS
+# banner is a genuine kernel-selftest OUTPUT (this gate feeds NO serial input).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[DEVSTAT_SPLIT\]'
 
 if grep -a -F -q "[DEVSTAT_SPLIT] FAIL" "$LOG"; then
-    echo "[test_devstat_split] FAIL: kernel self-test reported an internal failure" >&2
-    grep -a -F "[DEVSTAT_SPLIT] FAIL" "$LOG" >&2 || true
-    fail=1
+    grep -a -F "[DEVSTAT_SPLIT] FAIL" "$LOG" | head -5 >&2 || true
+    verdict_fail "$TAG" "the devstat-split self-test reported an internal FAIL (observed regression)."
 fi
 
-if ! grep -a -F -q "[DEVSTAT_SPLIT] PASS" "$LOG"; then
-    echo "[test_devstat_split] MISS: self-test PASS banner (expected '[DEVSTAT_SPLIT] PASS')" >&2
-    fail=1
+if grep -a -F -q "[DEVSTAT_SPLIT] PASS" "$LOG"; then
+    verdict_pass "$TAG" "/proc/stat reports a real user/system/idle split (qemu rc=$rc)."
 fi
 
-if [ "$fail" -ne 0 ]; then
-    echo "[test_devstat_split] --- full log ---"
-    cat "$LOG"
-    echo "[test_devstat_split] FAIL (qemu rc=$rc)"
-    exit 1
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "the selftest emitted markers but its PASS banner never printed and" \
+        "qemu was killed by timeout (rc=124) — starved mid-selftest. Re-run quiet."
 fi
-
-echo "[test_devstat_split] PASS — /proc/stat reports a real user/system/idle split" \
-     "(qemu rc=$rc)"
+verdict_fail "$TAG" \
+    "the selftest started and qemu exited on its own (rc=$rc) WITHOUT a PASS" \
+    "banner — an OBSERVED incomplete run."

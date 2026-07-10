@@ -73,6 +73,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_devmapper
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -107,12 +109,15 @@ echo "[test_devmapper] --- captured (device-mapper lines) ---"
 grep -E '\[device-mapper\]' "$LOG" || true
 echo "[test_devmapper] --- end ---"
 
-fail=0
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) --
+# A zero-marker / rc=124 boot on a TCG-starved host used to look identical
+# to a real regression. Guard the zero-marker case FIRST: if the guest
+# emitted no dm markers at all it never ran the selftest (starved) —
+# INCONCLUSIVE, not a wall of bogus FAILs. The per-subtest check() chain
+# below stays as DIAGNOSTICS; the final decision routes through verdict_*.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[device-mapper\]|\[devmapper\]|\[dm\]'
 
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_devmapper] FAIL: qemu exited rc=$rc" >&2
-    fail=1
-fi
+fail=0
 
 if grep -qF "[device-mapper] FAIL" "$LOG"; then
     echo "[test_devmapper] FAIL: kernel self-test reported an internal failure" >&2
@@ -191,9 +196,22 @@ check "delay deadline honoured"  "[dm] delay: deferred-completion clock honoured
 check "delay subtest PASS"       "[dm] delay PASS"
 check "device-mapper PASS"       "[device-mapper] PASS"
 
+# --- final three-valued decision ---
+# If the terminal PASS banner is absent AND qemu was killed by timeout, the
+# selftest was starved mid-run (some early markers printed, later subtests
+# never got to run) — INCONCLUSIVE, not a regression. A clean qemu exit
+# (rc!=124) without the PASS banner, or any observed subtest MISS, is a
+# real, actionable red.
+if ! grep -qF "[device-mapper] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "dm markers printed but the terminal '[device-mapper] PASS' banner never" \
+        "arrived and qemu was killed by timeout (rc=124) — starved mid-selftest." \
+        "Re-run on a QUIET host."
+fi
 if [ "$fail" -ne 0 ]; then
-    echo "[test_devmapper] FAIL"
-    exit 1
+    verdict_fail "$TAG" \
+        "a device-mapper subtest marker was OBSERVED absent (or an internal FAIL" \
+        "was reported) while the selftest ran (qemu rc=$rc) — real regression."
 fi
 
-echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector), dm-snapshot copy-on-write (origin-write preserves the snapshot pre-image in a separate exception store; origin advances to new data; never-written chunks pass through to origin), dm-integrity (per-sector salted crc32c tags: a known sector round-trips with its tag validated; corrupting the backing sector behind the target is DETECTED and the read fails instead of returning corrupt data), dm-thin thin provisioning (a thin device over-provisioned 32x the pool reads unprovisioned blocks as zeros consuming no pool space; the first write to a virtual block allocates exactly one pool block on demand and reads back correctly; re-writing a provisioned block allocates nothing; provisioned vs unprovisioned regions are distinguished), and dm-verity (read-only Merkle hash tree of salted SHA-256 over 4096-byte blocks rooted at a trusted root hash: a clean block verifies and round-trips byte-identical; flipping a byte in a data block, in the block's own hash-tree leaf, or in another hash-tree entry — root-hash mismatch — is each DETECTED and the read fails with an I/O error), and dm-cache (a small fast cache device fronting a larger slow origin with LRU eviction: a cold read MISSes and promotes the block into a cache slot so the second read HITs with genuinely-computed hit/miss counters; WRITETHROUGH updates both cache and origin keeping the origin coherent so clean evictions lose no data; WRITEBACK updates only the cache and leaves the origin stale until an explicit flush makes it coherent; and evicting a DIRTY victim writes its newest data back to the origin automatically), and dm-era (per-chunk write-era generation tracking: each write stamps the current era on the touched chunk; advancing the era partitions later writes from earlier ones; a query enumerates EXACTLY the chunks written in or after a target era — the 'blocks changed since N' incremental-backup primitive, with a re-written chunk's era correctly advancing; and the per-chunk era metadata is persisted to a separate metadata device and round-trips through a reload), and dm-delay (per-operation read/write delay over a linear remap: data written through the delay device is a real byte-identical linear passthrough to the mapped backing sector; each read takes the configured read delay and each write the DISTINCT write delay, applied via a deferred-completion deadline queue with a logical tick clock the dm layer advances, with per-path deferred-op counters and summed-delay totals proving the read and write paths each took their own configured value) all verified"
+verdict_pass "$TAG" "native device-mapper: linear remap, two-target concatenation, AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector), dm-snapshot copy-on-write (origin-write preserves the snapshot pre-image in a separate exception store; origin advances to new data; never-written chunks pass through to origin), dm-integrity (per-sector salted crc32c tags: a known sector round-trips with its tag validated; corrupting the backing sector behind the target is DETECTED and the read fails instead of returning corrupt data), dm-thin thin provisioning (a thin device over-provisioned 32x the pool reads unprovisioned blocks as zeros consuming no pool space; the first write to a virtual block allocates exactly one pool block on demand and reads back correctly; re-writing a provisioned block allocates nothing; provisioned vs unprovisioned regions are distinguished), and dm-verity (read-only Merkle hash tree of salted SHA-256 over 4096-byte blocks rooted at a trusted root hash: a clean block verifies and round-trips byte-identical; flipping a byte in a data block, in the block's own hash-tree leaf, or in another hash-tree entry — root-hash mismatch — is each DETECTED and the read fails with an I/O error), and dm-cache (a small fast cache device fronting a larger slow origin with LRU eviction: a cold read MISSes and promotes the block into a cache slot so the second read HITs with genuinely-computed hit/miss counters; WRITETHROUGH updates both cache and origin keeping the origin coherent so clean evictions lose no data; WRITEBACK updates only the cache and leaves the origin stale until an explicit flush makes it coherent; and evicting a DIRTY victim writes its newest data back to the origin automatically), and dm-era (per-chunk write-era generation tracking: each write stamps the current era on the touched chunk; advancing the era partitions later writes from earlier ones; a query enumerates EXACTLY the chunks written in or after a target era — the 'blocks changed since N' incremental-backup primitive, with a re-written chunk's era correctly advancing; and the per-chunk era metadata is persisted to a separate metadata device and round-trips through a reload), and dm-delay (per-operation read/write delay over a linear remap: data written through the delay device is a real byte-identical linear passthrough to the mapped backing sector; each read takes the configured read delay and each write the DISTINCT write delay, applied via a deferred-completion deadline queue with a logical tick clock the dm layer advances, with per-path deferred-op counters and summed-delay totals proving the read and write paths each took their own configured value) all verified"

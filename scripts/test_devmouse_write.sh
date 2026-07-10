@@ -35,6 +35,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_devmouse_write
 
 ELF=build/hamnix-kernel.elf
 BOOT_TIMEOUT="${DEVMOUSE_WRITE_BOOT_TIMEOUT:-120}"
@@ -71,58 +73,43 @@ echo "[test_devmouse_write] --- devmouse-write self-test output ---"
 grep -a -E "\[DEVMOUSE_WRITE\]|\[MOUSE_PUMP\]|\[boot:37.dmw\]" "$LOG" || true
 echo "[test_devmouse_write] --- end ---"
 
-fail=0
+# --- three-valued verdict (migrated off the hard MISS->FAIL tail) -----
+# A zero-marker / rc=124 boot on a TCG-starved host used to look identical
+# to a real regression. verdict_boot_gate resolves zero-marker+timeout to
+# INCONCLUSIVE; observed FAILs are real reds; the PASS banners are genuine
+# kernel-selftest OUTPUT (this gate feeds NO serial input).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[DEVMOUSE_WRITE\]|\[MOUSE_PUMP\]|\[boot:37.dmw\]'
 
-# rc=124 is the expected timeout kill (kernel halts without powering off
-# qemu); rc=0 a clean shutdown. Anything else is a real QEMU failure.
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_devmouse_write] FAIL: qemu exited rc=$rc" >&2
-    fail=1
-fi
-
-# An explicit internal failure is fatal.
+# --- observed internal failures are real reds ---
 if grep -a -qF "[DEVMOUSE_WRITE] FAIL" "$LOG"; then
-    echo "[test_devmouse_write] FAIL: kernel self-test reported an internal failure" >&2
-    grep -a -F "[DEVMOUSE_WRITE] FAIL" "$LOG" >&2 || true
-    fail=1
+    grep -a -F "[DEVMOUSE_WRITE] FAIL" "$LOG" | head -5 >&2 || true
+    verdict_fail "$TAG" "the devmouse-write self-test reported an internal FAIL (observed regression)."
 fi
-
-if ! grep -a -qF "[DEVMOUSE_WRITE] PASS" "$LOG"; then
-    echo "[test_devmouse_write] FAIL: '[DEVMOUSE_WRITE] PASS' not found in serial log." >&2
-    fail=1
-fi
-
-# LIVE-MOUSE PUMP assertion: the HW-mouse-ring -> mouse_pump_to_compositor
-# -> wsys_route path (the previously-DEAD live cursor path) must drain the
-# ring. A [MOUSE_PUMP] FAIL is fatal; the PASS marker is required.
 if grep -a -qF "[MOUSE_PUMP] FAIL" "$LOG"; then
-    echo "[test_devmouse_write] FAIL: mouse-pump self-test reported a failure" >&2
-    grep -a -F "[MOUSE_PUMP] FAIL" "$LOG" >&2 || true
-    fail=1
+    grep -a -F "[MOUSE_PUMP] FAIL" "$LOG" | head -5 >&2 || true
+    verdict_fail "$TAG" "the mouse-pump (live cursor path) self-test reported a FAIL (observed regression)."
 fi
-if ! grep -a -qF "[MOUSE_PUMP] PASS" "$LOG"; then
-    echo "[test_devmouse_write] FAIL: '[MOUSE_PUMP] PASS' not found — the HW mouse-ring pump (live cursor path) is not wired." >&2
-    fail=1
-fi
-
-# SCENE-DE FOCUS-OUT assertion (Bug 2a): the same boot:37 scene-DE input
-# self-test block runs wsys_focusout_selftest(), which asserts the
-# compositor delivers `f out` to the window LOSING focus — the mechanism
-# the in-panel Applications dropdown uses to self-dismiss on a click-away.
-# A FAIL is fatal; the PASS marker is required if the block ran at all.
 if grep -a -qF "[FOCUS_OUT] FAIL" "$LOG"; then
-    echo "[test_devmouse_write] FAIL: focus-out self-test reported a failure (Bug 2a)" >&2
-    grep -a -F "[FOCUS_OUT] FAIL" "$LOG" >&2 || true
-    fail=1
+    grep -a -F "[FOCUS_OUT] FAIL" "$LOG" | head -5 >&2 || true
+    verdict_fail "$TAG" "the scene-DE focus-out self-test reported a FAIL (Bug 2a regression)."
 fi
+# The scene-DE input block ran but never emitted its FOCUS_OUT PASS — an
+# OBSERVED regression, not starvation (the block reached boot:37.dein).
 if grep -a -qF "[boot:37.dein]" "$LOG" && ! grep -a -qF "[FOCUS_OUT] PASS" "$LOG"; then
-    echo "[test_devmouse_write] FAIL: scene-DE input block ran but '[FOCUS_OUT] PASS' is missing — Bug 2a focus-out delivery regressed." >&2
-    fail=1
+    verdict_fail "$TAG" "the scene-DE input block ran but '[FOCUS_OUT] PASS' is absent — Bug 2a focus-out delivery regressed."
 fi
 
-if [ "$fail" -ne 0 ]; then
-    echo "[test_devmouse_write] FAIL"
-    exit 1
+# --- both required PASS banners observed => real green ---
+if grep -a -qF "[DEVMOUSE_WRITE] PASS" "$LOG" && grep -a -qF "[MOUSE_PUMP] PASS" "$LOG"; then
+    verdict_pass "$TAG" "writable /dev/mouse injects synthetic events through the auxmouse ring + the HW mouse-ring pump drains to the compositor (+ scene-DE focus-out) (qemu rc=$rc)."
 fi
 
-echo "[test_devmouse_write] PASS — writable /dev/mouse injects synthetic events through the auxmouse ring (+ scene-DE focus-out delivery)"
+# Markers seen (guest booted) but a required PASS banner is missing.
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "the selftest emitted markers but a required PASS banner never printed" \
+        "and qemu was killed by timeout (rc=124) — starved mid-selftest. Re-run quiet."
+fi
+verdict_fail "$TAG" \
+    "the selftest started and qemu exited on its own (rc=$rc) WITHOUT both" \
+    "[DEVMOUSE_WRITE] PASS and [MOUSE_PUMP] PASS — an OBSERVED incomplete run."

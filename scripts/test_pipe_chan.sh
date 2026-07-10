@@ -39,6 +39,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_pipe_chan
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -77,25 +79,27 @@ echo "[test_pipe_chan] --- pipechan self-test output ---"
 grep -a -E "\[PIPECHAN\]" "$LOG" || true
 echo "[test_pipe_chan] --- end ---"
 
-fail=0
+# --- three-valued verdict (migrated off the hard MISS->FAIL tail) -----
+# A zero-marker / rc=124 boot on a TCG-starved host used to look identical
+# to a real regression. verdict_boot_gate resolves zero-marker+timeout to
+# INCONCLUSIVE; an observed [PIPECHAN] FAIL is a real red; the PASS banner
+# is a genuine kernel-selftest OUTPUT (this gate feeds NO serial input).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[PIPECHAN\]'
 
 if grep -a -F -q "[PIPECHAN] FAIL" "$LOG"; then
-    echo "[test_pipe_chan] FAIL: kernel self-test reported an internal failure" >&2
-    grep -a -F "[PIPECHAN] FAIL" "$LOG" >&2 || true
-    fail=1
+    grep -a -F "[PIPECHAN] FAIL" "$LOG" | head -5 >&2 || true
+    verdict_fail "$TAG" "the pipechan self-test reported an internal FAIL (observed regression)."
 fi
 
-if ! grep -a -F -q "[PIPECHAN] PASS" "$LOG"; then
-    echo "[test_pipe_chan] MISS: self-test PASS banner (expected '[PIPECHAN] PASS')" >&2
-    fail=1
+if grep -a -F -q "[PIPECHAN] PASS" "$LOG"; then
+    verdict_pass "$TAG" "pipe() rides DEV_PIPE_R/DEV_PIPE_W pool chans (qemu rc=$rc)."
 fi
 
-if [ "$fail" -ne 0 ]; then
-    echo "[test_pipe_chan] --- full log ---"
-    cat "$LOG"
-    echo "[test_pipe_chan] FAIL (qemu rc=$rc)"
-    exit 1
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "the selftest emitted markers but its PASS banner never printed and" \
+        "qemu was killed by timeout (rc=124) — starved mid-selftest. Re-run quiet."
 fi
-
-echo "[test_pipe_chan] PASS — pipe() rides DEV_PIPE_R/DEV_PIPE_W pool chans" \
-     "(qemu rc=$rc)"
+verdict_fail "$TAG" \
+    "the selftest started and qemu exited on its own (rc=$rc) WITHOUT a PASS" \
+    "banner — an OBSERVED incomplete run."
