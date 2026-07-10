@@ -33,6 +33,9 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+. "$PROJ_ROOT/scripts/_hamsh_drive.sh"
+TAG=test_ext4_inline
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -124,63 +127,52 @@ python3 -m compiler.adder compile \
     -o "$ELF" >/dev/null
 
 LOG=$(mktemp)
-trap 'rm -f "$LOG" "$DISK"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
+READY='[hamsh:stage-07] loop-enter'
+# Ride the inline_data image in via QEMU_EXTRA_ARGS (word-splits on spaces;
+# the file= value has no spaces). _hamsh_drive.sh backgrounds QEMU,
+# prompt-gates + FEEDER_SYNC-handshakes before typing, waits adaptively on
+# each cat's OWN genuine file output, and kills only OUR qemu.
+export QEMU_EXTRA_ARGS="-drive file=$DISK,if=virtio,format=raw"
+export HAMNIX_VM_MEM=256M
+trap 'hamsh_shutdown; rm -f "$LOG" "$DISK"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
 
 echo "[test_ext4_inline] (5/5) Boot QEMU with the inline_data image"
-# Gate keystrokes on the shell-ready marker, not a fixed sleep: this boot
-# loads kernel modules (xhci/usbcore/...) and the prompt can appear much
-# later under TCG load. A fixed `sleep N` races the prompt and the cats
-# get swallowed. The feeder tails $LOG until hamsh announces it has
-# entered its read loop, THEN types the cats.
-INPUT_FIFO=$(mktemp -u --suffix=.inline-fifo)
-mkfifo "$INPUT_FIFO"
-set +e
-(
-    # Hold the FIFO open for writing for the whole feeder lifetime.
-    exec 3>"$INPUT_FIFO"
-    # Wait (bounded) for the shell read-loop marker to land in the log.
-    waited=0
-    while ! grep -aq "loop-enter" "$LOG" 2>/dev/null; do
-        sleep 1
-        waited=$((waited + 1))
-        if [ "$waited" -ge 110 ]; then
-            break
-        fi
-    done
-    sleep 1
-    printf 'cat /ext/SMALL.TXT\n' >&3
+ready=0
+hamsh_boot "$LOG" "$ELF"
+if hamsh_wait_boot "$READY" 420 && hamsh_sync 120; then
+    ready=1
+    # Await each cat's GENUINE file content ($SMALL_BODY / $OVER_XATTR).
+    # Neither string appears in its cat command's readline echo, so these
+    # are not echo-sentinels — they can only come from the inline read path.
+    hamsh_send_await "cat /ext/SMALL.TXT" "$SMALL_BODY" 120 || true
+    hamsh_send_await "cat /ext/OVER.TXT" "$OVER_XATTR" 120 || true
+    hamsh_send 'exit'
     sleep 2
-    printf 'cat /ext/OVER.TXT\n' >&3
-    sleep 2
-    printf 'exit\n' >&3
-    sleep 1
-    exec 3>&-
-) &
-FEEDER=$!
-timeout 150s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -drive file="$DISK",if=virtio,format=raw \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    < "$INPUT_FIFO" > "$LOG" 2>&1
-rc=$?
-wait "$FEEDER" 2>/dev/null
-rm -f "$INPUT_FIFO"
-set -e
+fi
+hamsh_shutdown
+rc=0
 
 echo "[test_ext4_inline] --- ext4/inline boot output ---"
 grep -a -E "INCOMPAT_INLINE_DATA|INLINE_SMALL_MARKER|system_data_xattr" "$LOG" || true
 echo "[test_ext4_inline] --- end ---"
 
-# Treat a virtio-blk superblock-read flake (host CPU starvation under
-# load) as INFRA, not a code failure — re-run in a quiet window.
-if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
-    echo "[test_ext4_inline] WARN: virtio-blk read flake detected — re-run in a quiet window" >&2
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Never reached the shell read-loop => starved/OOM boot, assertion never
+# observed -> INCONCLUSIVE, not a regression.
+if [ "$ready" -ne 1 ]; then
+    verdict_inconclusive "$TAG" \
+        "the guest never reached '$READY' + FEEDER_SYNC — the inline_data" \
+        "read path was never exercised (starved or OOM boot). Re-run quiet."
 fi
+# A virtio-blk superblock-read flake means the volume never mounted —
+# INCONCLUSIVE (host CPU starvation), not a code failure.
+if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
+    verdict_inconclusive "$TAG" \
+        "virtio-blk superblock read flake — the inline_data volume never" \
+        "mounted (host CPU starvation). Re-run in a quiet window."
+fi
+# Belt-and-braces: zero ext4/inline markers at all -> starved.
+verdict_boot_gate "$TAG" "$LOG" "$rc" 'ext4:|INCOMPAT_INLINE_DATA'
 
 fail=0
 
@@ -212,10 +204,12 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_inline] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_inline] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "the guest reached the shell and ext4 mounted, but an inline_data" \
+        "assertion (INCOMPAT_INLINE_DATA arm, SMALL.TXT i_block read, or" \
+        "OVER.TXT system.data overflow) was OBSERVED to fail — real regression."
 fi
 
 echo "[ext4inline] PASS"
-echo "[test_ext4_inline] PASS — inline_data read (i_block + system.data) on a" \
-     "live ext4 mount (qemu rc=$rc)"
+verdict_pass "$TAG" "inline_data read (i_block[] + system.data xattr overflow)" \
+     "round-trips byte-exact on a live ext4 mount (qemu rc=$rc)"
