@@ -103,11 +103,27 @@ the orchestrator's framing many times by going to the evidence. Reward disproof.
 
 ## Current front (update this as it moves)
 
-- **Firefox last mile** — futex + icon-theme fixes landed; Firefox now realizes full
-  GTK chrome + creates surfaces, then PARKS in Gecko multi-process/futex startup
-  before `xdg_wm_base.get_xdg_surface`. Agent chasing the named park point.
-- **~600 `-kernel` gates** dead on dev hosts (debian fixture bloats the kernel past
-  GRUB's `-m 256M`) — agent fixing at the harness source.
-- Open (tasks): `ls /dev`/`#c` listdir wart; flip pipe gates to `-smp 2`; AP periodic
-  tick for `-smp>=3` (blocked on a futex-sweep lock-ordering AB-BA); `-smp 3/4`
-  AP-launch trap.
+As of 2026-07-09, the high-value **host-tolerant** backlog is cleared. What remains is
+either blocked on host quality or genuinely low-value:
+
+- **HOST-BLOCKED (need a healthier machine — this box's firmware-ACPI kworkers make the
+  guest ~100× slow, and a reboot does NOT durably clear them):**
+  - **Firefox map** — reaches `nsWindow::Create() Toplevel` (gpu-process=false gate found
+    + fixed); one `QEMU_MEM=6G CMD_WAIT=400 scripts/test_wayland_firefox.sh` on a quiet
+    host from a mapped window. The remaining distance to a `wl_shm` commit is SHORT.
+  - `-smp≥3` AP periodic tick (needs the AP LAPIC divide-config programmed in `apic.ad`
+    + the futex sweep made trylock/BSP-only to avoid a hard-IRQ AB-BA) + the `-smp 3/4`
+    AP-launch trap `rip=0xffffffff0000001c`.
+- **Low-value / diminishing (do when adjacent work touches them):**
+  - `ls /dev` names `/dev/blk` a stripped namespace can't open — fix via mount-table
+    synthesis, NOT re-binding (that undoes a security boundary); own commit.
+  - The `_hamsh_drive.sh` sweep long tail (~390 dark fixed-`sleep` gates) — migrate in
+    batches on a quiet host so the currently-INCONCLUSIVE ones can also join CI.
+  - A latent (today-unreachable) `open(O_WRONLY)`-no-`O_TRUNC` no-copy-up soft spot.
+
+**DONE this session (both -smp 2 wedges, Firefox→window-create, ~50-gate trustworthy CI,
+~18 real bugs, dead-code cleanup).** When you take over: if a healthier host is available,
+the Firefox map is the single highest-value finish; otherwise dispatch on the low-value
+list or wait for the user's next bug list. Don't manufacture marginal QEMU work for the
+degraded host — idle-confirm on the hourly check-in when only blocked/low-value work
+remains, per the tick prompt.
