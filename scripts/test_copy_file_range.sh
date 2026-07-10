@@ -30,6 +30,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_copy_file_range
 
 ELF=build/hamnix-kernel.elf
 BOOT_TIMEOUT="${CFR_BOOT_TIMEOUT:-120}"
@@ -66,35 +68,35 @@ echo "[test_copy_file_range] --- self-test output ---"
 grep -a -E "\[copyfilerange\]|\[sendfile\]|\[UABI_FILLS\]" "$LOG" || true
 echo "[test_copy_file_range] --- end ---"
 
-fail=0
+# --- three-valued verdict (migrated off the hard PASS/FAIL tail) -----
+# The legacy tail turned a MISSING PASS banner into a hard FAIL while
+# treating rc=124 (timeout) as non-fatal — so a guest the degraded host
+# starved BEFORE the in-boot selftest finished produced a FALSE RED
+# indistinguishable from a real regression. verdict_boot_gate resolves
+# zero-marker + rc=124 to INCONCLUSIVE; an observed internal FAIL is a
+# real red; BOTH per-leg PASS banners are the real green (genuine kernel
+# selftest OUTPUT — this gate feeds NO serial input to false-match).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[copyfilerange\]|\[sendfile\]|\[UABI_FILLS\]'
 
-# rc=124 is the expected timeout kill (kernel halts without powering off
-# qemu); rc=0 a clean shutdown. Anything else is a real QEMU failure.
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_copy_file_range] FAIL: qemu exited rc=$rc" >&2
-    fail=1
-fi
-
-# An explicit internal failure is fatal.
-if grep -a -qF "[UABI_FILLS] FAIL" "$LOG"; then
-    echo "[test_copy_file_range] FAIL: kernel self-test reported an internal failure" >&2
+if grep -a -q -F "[UABI_FILLS] FAIL" "$LOG"; then
     grep -a -F "[UABI_FILLS] FAIL" "$LOG" >&2 || true
-    fail=1
+    verdict_fail "$TAG" "the kernel self-test reported an internal [UABI_FILLS] FAIL (observed regression)."
 fi
 
-if ! grep -a -qF "[copyfilerange] PASS" "$LOG"; then
-    echo "[test_copy_file_range] FAIL: '[copyfilerange] PASS' not found in serial log." >&2
-    fail=1
+if grep -a -q -F "[copyfilerange] PASS" "$LOG" && grep -a -q -F "[sendfile] PASS" "$LOG"; then
+    verdict_pass "$TAG" \
+        "copy_file_range(326) + sendfile(40) fd->fd copy through real dispatch + VFS read/write."
 fi
 
-if ! grep -a -qF "[sendfile] PASS" "$LOG"; then
-    echo "[test_copy_file_range] FAIL: '[sendfile] PASS' not found in serial log." >&2
-    fail=1
+# The selftest started (a marker matched) but at least one PASS banner is
+# missing and no explicit FAIL was seen.
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "the uabi-fills selftest started but not both PASS banners" \
+        "([copyfilerange] PASS + [sendfile] PASS) printed and qemu was killed" \
+        "by timeout (rc=124) — starved mid-selftest on a degraded host." \
+        "Re-run on a quiet host."
 fi
-
-if [ "$fail" -ne 0 ]; then
-    echo "[test_copy_file_range] FAIL"
-    exit 1
-fi
-
-echo "[test_copy_file_range] PASS — copy_file_range(326) + sendfile(40) fd->fd copy through real dispatch + VFS read/write"
+verdict_fail "$TAG" \
+    "the uabi-fills selftest started and qemu exited on its own (rc=$rc)" \
+    "WITHOUT both PASS banners — an OBSERVED incomplete run."

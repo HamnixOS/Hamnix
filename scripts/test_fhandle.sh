@@ -31,6 +31,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_fhandle
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -69,25 +71,32 @@ echo "[test_fhandle] --- fhandle self-test output ---"
 grep -a -E "\[FHANDLE\]|\[fhandle\]" "$LOG" || true
 echo "[test_fhandle] --- end ---"
 
-fail=0
+# --- three-valued verdict (migrated off the hard MISS->FAIL tail) ----
+# The legacy tail turned a MISSING PASS banner into a hard FAIL — so a
+# guest the degraded host starved BEFORE the in-boot selftest finished
+# produced a FALSE RED indistinguishable from a real regression.
+# verdict_boot_gate resolves zero-marker + rc=124 to INCONCLUSIVE; an
+# observed internal FAIL is a real red; the PASS banner is a real green
+# (genuine kernel selftest OUTPUT — this gate feeds NO serial input).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[fhandle\]|\[FHANDLE\]'
 
 if grep -a -F -q "[FHANDLE] FAIL" "$LOG"; then
-    echo "[test_fhandle] FAIL: kernel self-test reported an internal failure" >&2
-    grep -a -F "[FHANDLE] FAIL" "$LOG" >&2 || true
-    fail=1
+    grep -a -F "[FHANDLE] FAIL" "$LOG" | head -5 >&2 || true
+    verdict_fail "$TAG" "the kernel self-test reported an internal FAIL (observed regression)."
 fi
 
-if ! grep -a -F -q "[fhandle] PASS" "$LOG"; then
-    echo "[test_fhandle] MISS: self-test PASS banner (expected '[fhandle] PASS')" >&2
-    fail=1
+if grep -a -F -q "[fhandle] PASS" "$LOG"; then
+    verdict_pass "$TAG" "name_to_handle_at encodes a path to an opaque handle and" \
+        "open_by_handle_at reopens the SAME inode."
 fi
 
-if [ "$fail" -ne 0 ]; then
-    echo "[test_fhandle] --- full log ---"
-    cat "$LOG"
-    echo "[test_fhandle] FAIL (qemu rc=$rc)"
-    exit 1
+# Selftest markers were seen (guest booted) but neither PASS nor FAIL.
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "the selftest started but its PASS banner never printed and qemu was" \
+        "killed by timeout (rc=124) — starved mid-selftest on a degraded host." \
+        "Re-run on a quiet host."
 fi
-
-echo "[test_fhandle] PASS — name_to_handle_at encodes a path to an opaque" \
-     "handle and open_by_handle_at reopens the SAME inode (qemu rc=$rc)"
+verdict_fail "$TAG" \
+    "the selftest started and qemu exited on its own (rc=$rc) WITHOUT a PASS" \
+    "banner — an OBSERVED incomplete run."

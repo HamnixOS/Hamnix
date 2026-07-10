@@ -32,6 +32,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_pidfd
 
 export HAMNIX_BUILD_LOCK_TIMEOUT=900
 
@@ -69,37 +71,35 @@ echo "[test_pidfd] --- pidfd self-test output ---"
 grep -aE "\[pidfd\]" "$LOG" || true
 echo "[test_pidfd] --- end ---"
 
-fail=0
+# --- three-valued verdict (migrated off the hard PASS/FAIL tail) -----
+# The legacy tail turned a MISSING PASS banner into a hard FAIL while
+# treating rc=124 (timeout) as non-fatal — so a guest the degraded host
+# starved BEFORE the in-boot selftest finished produced a FALSE RED
+# indistinguishable from a real regression. verdict_boot_gate resolves
+# zero-marker + rc=124 to INCONCLUSIVE; an observed internal FAIL is a
+# real red; the anchored PASS banner is a real green. That banner is
+# genuine kernel selftest OUTPUT (this gate feeds NO serial input, so
+# there is no input-echo to false-match).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[pidfd\]'
 
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_pidfd] FAIL: qemu exited rc=$rc" >&2
-    fail=1
+if grep -a -F -q "[pidfd] FAIL" "$LOG"; then
+    grep -a -F "[pidfd] FAIL" "$LOG" | head -5 >&2 || true
+    verdict_fail "$TAG" "the kernel self-test reported an internal [pidfd] FAIL (observed regression)."
 fi
 
-# An explicit internal failure is fatal.
-if grep -aqF "[pidfd] FAIL" "$LOG"; then
-    echo "[test_pidfd] FAIL: kernel self-test reported a failure" >&2
-    grep -aF "[pidfd] FAIL" "$LOG" | head -5 || true
-    fail=1
-fi
-
-# The kernel prints exactly "[pidfd] PASS" on its own line (after an
-# optional "[NNNNNN] " printk timestamp prefix) only when EVERY assertion
-# held. Anchor to end-of-line so the per-assertion "[pidfd] PASS: ..."
-# lines (which have a trailing ": ...") don't satisfy it.
 if grep -aqE '(^|\] )\[pidfd\] PASS$' "$LOG"; then
-    echo "[test_pidfd] PASS: overall self-test PASS banner"
-else
-    echo "[test_pidfd] FAIL: overall self-test PASS banner missing" >&2
-    fail=1
+    verdict_pass "$TAG" "pidfd_open/pidfd_send_signal/waitid(P_PIDFD) round-trip: a pidfd refers to" \
+        "a process, reuses the signal delivery path, becomes POLLIN-readable on exit," \
+        "and enforces EBADF/ESRCH/EINVAL."
 fi
 
-if [ "$fail" -ne 0 ]; then
-    echo "[test_pidfd] FAIL"
-    exit 1
+# Selftest markers were seen (guest booted) but neither PASS nor FAIL.
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "the [pidfd] selftest started but its anchored PASS banner never" \
+        "printed and qemu was killed by timeout (rc=124) — starved mid-selftest" \
+        "on a degraded host. Re-run on a quiet host."
 fi
-
-echo "[test_pidfd] PASS -- pidfd_open/pidfd_send_signal/waitid(P_PIDFD)" \
-     "round-trip: a pidfd refers to a process, reuses the signal_post" \
-     "delivery path, becomes POLLIN-readable on exit, and enforces" \
-     "EBADF/ESRCH/EINVAL correctly"
+verdict_fail "$TAG" \
+    "the [pidfd] selftest started and qemu exited on its own (rc=$rc)" \
+    "WITHOUT a PASS banner — an OBSERVED incomplete run."

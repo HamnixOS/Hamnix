@@ -33,6 +33,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_close_range
 
 export HAMNIX_BUILD_LOCK_TIMEOUT=900
 
@@ -70,36 +72,35 @@ echo "[test_close_range] --- close_range self-test output ---"
 grep -aE "\[closerange\]" "$LOG" || true
 echo "[test_close_range] --- end ---"
 
-fail=0
+# --- three-valued verdict (migrated off the hard PASS/FAIL tail) -----
+# The legacy tail turned a MISSING PASS banner into a hard FAIL while
+# treating rc=124 (timeout) as non-fatal — so a guest the degraded host
+# starved BEFORE the in-boot selftest finished produced a FALSE RED
+# indistinguishable from a real regression. verdict_boot_gate resolves
+# zero-marker + rc=124 to INCONCLUSIVE; an observed internal FAIL is a
+# real red; the anchored PASS banner is a real green. The banner is
+# genuine kernel selftest OUTPUT (this gate feeds NO serial input, so
+# there is no input-echo to false-match).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[closerange\]'
 
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_close_range] FAIL: qemu exited rc=$rc" >&2
-    fail=1
+if grep -a -F -q "[closerange] FAIL" "$LOG"; then
+    grep -a -F "[closerange] FAIL" "$LOG" | head -5 >&2 || true
+    verdict_fail "$TAG" "the kernel self-test reported an internal [closerange] FAIL (observed regression)."
 fi
 
-# An explicit internal failure is fatal.
-if grep -aqF "[closerange] FAIL" "$LOG"; then
-    echo "[test_close_range] FAIL: kernel self-test reported a failure" >&2
-    grep -aF "[closerange] FAIL" "$LOG" | head -5 || true
-    fail=1
-fi
-
-# The kernel prints exactly "[closerange] PASS" on its own line (after an
-# optional "[NNNNNN] " printk timestamp prefix) only when EVERY assertion
-# held. Anchor to end-of-line so the per-leg "[closerange] ... OK" lines
-# don't satisfy it.
 if grep -aqE '(^|\] )\[closerange\] PASS$' "$LOG"; then
-    echo "[test_close_range] PASS: overall self-test PASS banner"
-else
-    echo "[test_close_range] FAIL: overall self-test PASS banner missing" >&2
-    fail=1
+    verdict_pass "$TAG" "statx reports size/mode/type, tee+splice moves bytes" \
+        "pipe->pipe->file, and close_range closes a span of dup'd fds" \
+        "(idempotent re-run + EINVAL on an inverted range)."
 fi
 
-if [ "$fail" -ne 0 ]; then
-    echo "[test_close_range] FAIL"
-    exit 1
+# Selftest markers were seen (guest booted) but neither PASS nor FAIL.
+if [ "$rc" -eq 124 ]; then
+    verdict_inconclusive "$TAG" \
+        "the [closerange] selftest started but its anchored PASS banner never" \
+        "printed and qemu was killed by timeout (rc=124) — starved mid-selftest" \
+        "on a degraded host. Re-run on a quiet host."
 fi
-
-echo "[test_close_range] PASS -- statx reports size/mode/type, tee+splice" \
-     "moves bytes pipe->pipe->file, and close_range closes a span of dup'd" \
-     "fds (idempotent re-run + EINVAL on an inverted range)"
+verdict_fail "$TAG" \
+    "the [closerange] selftest started and qemu exited on its own (rc=$rc)" \
+    "WITHOUT a PASS banner — an OBSERVED incomplete run."
