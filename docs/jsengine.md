@@ -40,12 +40,33 @@ python3 -m compiler.adder compile --target=x86_64-adder-user user/js.ad -o build
 
 **Works:** `var`/`let`/`const` (block scope; per-iteration `let` binding so
 loop closures capture correctly); numbers (IEEE-754 `float64`), strings,
-booleans, `null`, `undefined`; array & object literals; functions, closures,
-recursion, named-function-expression self-reference, IIFEs; arithmetic /
-logical (`&&`/`||` short-circuit) / bitwise (`& | ^ ~ << >> >>>`, int32
-semantics) / comparison / ternary; string concat + coercion; `if/else`,
+booleans, `null`, `undefined`; array & object literals (incl. `{x}` shorthand);
+functions, closures, recursion, named-function-expression self-reference, IIFEs;
+arithmetic / logical (`&&`/`||` short-circuit) / bitwise (`& | ^ ~ << >> >>>`,
+int32 semantics) / comparison / ternary; string concat + coercion; `if/else`,
 `while`, `do/while`, `for`, `for-in`, `break`/`continue`/`return`; `typeof`;
 member access + method calls; implicit-global assignment.
+
+**ES6+ (added this pass, host-verified):**
+- **Arrow functions** — `x => x+1`, `(a,b) => {…}`, concise expression bodies,
+  and **lexical `this`** capture (`xs.map(x => x + this.base)` works).
+- **Default & rest params** — `f(a, b = 10)`, `f(first, ...rest)`.
+- **Template literals** — `` `hi ${name}` ``, nested templates, arbitrary
+  interpolated expressions, escapes, multiline.
+- **`try`/`catch`/`finally` + `throw`** — throw any value; `finally` runs on
+  normal / `return` / exception paths and can override the pending completion.
+  `Error`/`TypeError`/`RangeError`/`SyntaxError`/`ReferenceError` objects
+  (`name`+`message`, rendered `"Name: message"`). Common runtime faults (prop
+  access on null/undefined, calling a non-function, `const` reassignment) now
+  throw **catchable** exceptions.
+- **Classes** — `constructor`, methods, `static` methods, class expressions,
+  `extends`, `super(...)` and `super.method(...)`, multi-level super chains, a
+  real prototype chain, and implicit derived constructors that forward args.
+- **`instanceof`** — walks the prototype chain (user classes and Errors).
+- **Spread / rest** — `[...a]`, `f(...args)`, `{...o}` (array/string/object).
+- **Destructuring** in `var`/`let`/`const` — array patterns (holes, defaults,
+  `...rest`), object patterns (shorthand, `{a: b}` rename, defaults, `...rest`),
+  and nested patterns.
 
 **Builtins:** `console.log` (`error`/`warn`/`info` alias it); `Math.floor/ceil/
 round/abs/sqrt/pow/min/max/trunc`, `Math.PI/E`; `parseInt` (radix + `0x`),
@@ -54,18 +75,17 @@ round/abs/sqrt/pow/min/max/trunc`, `Math.PI/E`; `parseInt` (radix + `0x`),
 `length`, `charAt`, `charCodeAt`, `indexOf`, `slice`, `substring`, `substr`,
 `split`, `toUpperCase`, `toLowerCase`, `trim`, `repeat`, `toString`; Array
 methods `push`, `pop`, `shift`, `length`, `join`, `indexOf`, `map`, `filter`,
-`reduce`, `forEach`, `slice`, `reverse`; `Object.keys`; `Array.isArray`;
+`reduce`, `forEach`, `slice`, `reverse`; `Object.keys/assign/values`;
+`Array.isArray/of`, `Array(...)`; the `Error` constructor family;
 `NaN`/`Infinity`/`undefined` globals.
 
-**Not covered (intentional, out of scope for now):** prototypes / classes /
-`this`-bound method chains beyond direct calls; `instanceof` (returns `false`);
-generators / `async`/`await` / Promises; regex; getters/setters; template
-literals; destructuring / spread / default params / arrow functions (the `=>`
-token lexes but arrow bodies are not parsed); `try`/`catch` (a runtime error
-sets an error flag and aborts eval with a message); tagged Unicode beyond ASCII
-(`\uXXXX` in JSON keeps the low byte). Numbers print with a trimmed
-fixed-precision `dtoa`, not the shortest-round-trip algorithm (e.g.
-`0.1 + 0.2` prints `0.3`).
+**Not covered (intentional, out of scope for now):** **regex** (the largest
+remaining chunk; deferred); generators / `async`/`await` / Promises;
+getters/setters; computed method/property names; destructuring in function
+parameters and in plain assignment (only declarations); `arguments` object;
+tagged Unicode beyond ASCII (`\uXXXX` in JSON keeps the low byte). Numbers print
+with a trimmed fixed-precision `dtoa`, not the shortest-round-trip algorithm
+(e.g. `0.1 + 0.2` prints `0.3`).
 
 ## Memory
 
@@ -186,9 +206,10 @@ seam and stays DOM-agnostic.
 
 - `scripts/test_jsengine_host.sh` — Tier-1, no QEMU. Compiles the host driver
   (and the native tool as a no-regress arm) and asserts the **exact**
-  `console.log` output of 7 fixtures in `tests/fixtures/js/`
+  `console.log` output of 12 fixtures in `tests/fixtures/js/`
   (`arithmetic`, `closures`, `arrays_objects`, `json`, `strings`,
-  `controlflow`, `fib`) plus a spine IIFE-fib check.
+  `controlflow`, `fib`, `templates`, `arrows`, `exceptions`, `classes`,
+  `spread_destructure`) plus a spine IIFE-fib check.
 - `scripts/test_jsengine_native.sh` — boots Hamnix and runs `js` in-guest,
   asserting the exact `JS-OK hamnix sum=15 sq=1,4,9,16,25` demo line (values
   not present in the typed command, so no console-leak false-green). Kills only
