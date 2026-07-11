@@ -28,6 +28,8 @@
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_usbms
 
 ELF=build/hamnix-kernel.elf
 USBMS_TIMEOUT="${USBMS_TIMEOUT:-90}"
@@ -102,10 +104,17 @@ echo "[test_usbms] --- captured (usbms / xhci) ---"
 grep -aE '\[usbms|usbms_test|Enable Slot|Address Device|Configure Endpoint|READ CAPACITY|INQUIRY|/dev/blk/sd0' "$LOG" | head -40 || true
 echo "[test_usbms] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero usbms/xhci markers == the ISO guest never reached USB-storage enum:
+# a starved/timed-out TCG boot, an OBSERVED crash (verdict_boot_gate FAILs on
+# TRAP/panic), or GRUB OOM — NOT a BOT/storage regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[usbms|usbms_test|xhci|/dev/blk/sd0'
+
 if grep -aE -q "PANIC|panic:|TRAP:|BUG:" "$LOG"; then
-    echo "[test_usbms] FAIL: kernel panic / trap"
     tail -n 60 "$LOG"
-    exit 1
+    verdict_fail "$TAG" \
+        "the guest booted and produced USB markers but a kernel panic/TRAP/BUG" \
+        "was OBSERVED (qemu rc=$rc) — a real crash on the USB-MSC path."
 fi
 
 # Enumeration markers.
@@ -114,9 +123,11 @@ for needle in \
     "[usbms] /dev/blk/sd0 ready"
 do
     if ! grep -aF -q "$needle" "$LOG"; then
-        echo "[test_usbms] FAIL: missing '$needle'"
         tail -n 60 "$LOG"
-        exit 1
+        verdict_fail "$TAG" \
+            "enumeration marker '$needle' was OBSERVED absent though the guest" \
+            "booted (qemu rc=$rc) — xHCI Enable-Slot/Address-Device/Configure or" \
+            "the /dev/blk/sd0 registration regressed."
     fi
 done
 echo "[test_usbms] OK: enumerated + registered /dev/blk/sd0"
@@ -130,11 +141,14 @@ fi
 
 # PASS / FAIL channel — the READ(10) of sector 0 returned the tag.
 if grep -aF -q "[usbms_test] PASS" "$LOG"; then
-    echo "[test_usbms] PASS: READ(10) of sector 0 returned the HAMNIXUSB tag"
-    exit 0
+    verdict_pass "$TAG" "USB Bulk-Only Mass Storage end to end: xHCI enumerate" \
+        "(Enable Slot -> Address Device -> Configure bulk EPs), /dev/blk/sd0" \
+        "registered, and a READ(10) of sector 0 returned the HAMNIXUSB tag (qemu rc=$rc)"
 fi
 
-echo "[test_usbms] FAIL: no [usbms_test] PASS marker (qemu rc=$rc)"
 grep -aE "\[usbms_test\]" "$LOG" || true
 tail -n 60 "$LOG"
-exit 1
+verdict_fail "$TAG" \
+    "the guest enumerated the USB stick but the [usbms_test] PASS marker was" \
+    "OBSERVED absent — the READ(10) of sector 0 did not return the tag" \
+    "(qemu rc=$rc). A real BOT read-path regression."

@@ -32,6 +32,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_xhci_ko
 
 ELF=build/hamnix-kernel.elf
 XHCI_BOOT_TIMEOUT="${XHCI_BOOT_TIMEOUT:-25}"
@@ -133,6 +135,12 @@ set -e
 echo "[test_xhci_ko] --- captured (modprobe / kmod_linux / boot:35) ---"
 grep -E '\[modprobe\]|\[boot:35\.M\]|kmod_linux: relocations|kmod_linux_load|0C0330|xhci' "$LOG" || true
 echo "[test_xhci_ko] --- end ---"
+
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero boot/modprobe/xhci markers == the guest never reached module
+# auto-load: a starved/timed-out TCG boot, an OBSERVED crash (verdict_boot_gate
+# FAILs on TRAP/panic), or GRUB OOM — NOT an L-shim loader regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[boot:|\[modprobe\]|kmod_linux|xhci'
 
 # Boot sanity: kernel got past linux_abi_exports_init.
 if grep -E -q '\[boot:|hamnix|rc\.boot:' "$LOG"; then
@@ -269,10 +277,15 @@ else
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_xhci_ko] FAIL (qemu rc=$rc)"
     echo "[test_xhci_ko] --- full log tail ---"
     tail -120 "$LOG"
-    exit 1
+    verdict_fail "$TAG" \
+        "the guest booted and produced module-load markers but a required" \
+        "usbcore/xhci_pci/xhci_hcd load-chain marker was OBSERVED absent or a" \
+        "TRAP/skipped-relocation was reported (qemu rc=$rc) — a real L-shim" \
+        "loader regression."
 fi
 
-echo "[test_xhci_ko] PASS (usbcore + xhci_pci + xhci_hcd load via L-shim auto-discovery)"
+verdict_pass "$TAG" "usbcore + xhci_pci + xhci_hcd load via the L-series loader's" \
+    "PCI auto-discovery: modprobe matched the 0x0C0330 class, every UND symbol" \
+    "resolved, and the xhci_pci probe ran through the bridge (qemu rc=$rc)"
