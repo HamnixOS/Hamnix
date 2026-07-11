@@ -3686,6 +3686,20 @@ def build_archive() -> bytes:
                         blob += cpio_entry(name, data)
                         print(f"  embedded {name} ({len(data)} bytes "
                               f"from etc/{ef.name}/{sub.name})")
+                    elif sub.is_dir():
+                        # One extra nesting level (e.g. etc/hamde/apps/*.desktop
+                        # — the DATA-DRIVEN Applications menu catalogue the
+                        # scene panel scans at /etc/hamde/apps). The cpio is a
+                        # flat name table, so just embed each nested file at its
+                        # full /etc/<a>/<b>/<file> path.
+                        for f2 in sorted(sub.iterdir()):
+                            if f2.is_file():
+                                data = f2.read_bytes()
+                                name = ("/etc/" + ef.name + "/"
+                                        + sub.name + "/" + f2.name)
+                                blob += cpio_entry(name, data)
+                                print(f"  embedded {name} ({len(data)} bytes "
+                                      f"from etc/{ef.name}/{sub.name}/{f2.name})")
 
     # Linux runtime shell: plant a busybox-static binary + applet
     # symlinks into the default distro tree so `enter linux { /bin/sh }`

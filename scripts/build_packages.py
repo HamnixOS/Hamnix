@@ -673,6 +673,14 @@ def _files_desktop_config() -> list[tuple[Path, str]]:
     # Launcher layout.
     _add_etc_file(f, "desktop.icons")
     _add_etc_file(f, "panel.conf")
+    # DATA-DRIVEN Applications menu: one .desktop per app under
+    # /etc/hamde/apps. The scene panel scans this dir at startup, so
+    # adding an app is dropping a file here — no code edit. Ship every
+    # entry the tree carries.
+    apps_dir = ETC_DIR / "hamde" / "apps"
+    if apps_dir.is_dir():
+        for entry in sorted(apps_dir.glob("*.desktop")):
+            f.append((entry, f"etc/hamde/apps/{entry.name}"))
     return f
 
 

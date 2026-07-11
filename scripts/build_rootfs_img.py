@@ -580,6 +580,16 @@ def _stage_sysroot_etc(sysroot: Path) -> int:
                 if sub.is_file():
                     (sub_dst / sub.name).write_bytes(sub.read_bytes())
                     n += 1
+                elif sub.is_dir():
+                    # One extra nesting level (e.g. etc/hamde/apps/*.desktop —
+                    # the DATA-DRIVEN Applications menu catalogue scanned at
+                    # /etc/hamde/apps by the scene panel).
+                    nested_dst = sub_dst / sub.name
+                    nested_dst.mkdir(parents=True, exist_ok=True)
+                    for f2 in sorted(sub.iterdir()):
+                        if f2.is_file():
+                            (nested_dst / f2.name).write_bytes(f2.read_bytes())
+                            n += 1
     return n
 
 
