@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 # scripts/test_jsengine_native.sh — native `js` JavaScript-engine boot gate.
 #
+# ============================ BLOCKED (do not wire into CI yet) ==============
+# This gate cannot PASS today, and the blocker is NOT in the JS engine. JS
+# numbers are IEEE-754 float64, so evaluating ANY script executes SSE. Hamnix
+# does not FXSAVE/XSAVE the FPU/SSE register file across context switches
+# (arch/x86/kernel/cpuregs_asm.S:110 — "SSE state already isn't preserved"),
+# and the native `js` engine is the FIRST native userspace consumer of float64,
+# so it is the first to expose that gap: xmm registers are silently corrupted
+# under preemption and float results come out wrong. Diagnosis (2026-07-10):
+# the native tool loads + runs (an early `JS-BOOT` marker printed) but a
+# 2.0*3.0+1.0 probe returned 1 instead of 7.
+#
+# The engine itself is FULLY proven QEMU-free by scripts/test_jsengine_host.sh
+# (the host Linux target has proper FPU support). This native gate goes live
+# UNCHANGED once the kernel gains per-task FPU/SSE context-switch save/restore
+# (fxsave/fxrstor or xsave/xrstor in the switch path). See docs/jsengine.md
+# "Native blocker". Until then it will report INCONCLUSIVE.
+# ============================================================================
+#
 # Boots Hamnix with hamsh as /init and runs the native `js` tool (user/js.ad,
 # backed by the pure engine lib/jsengine.ad) INSIDE the guest. With no file
 # argument `js` evaluates a built-in shallow self-test snippet (safe on the

@@ -78,6 +78,40 @@ recurses per AST/JS-call depth); the **host** target has a normal 8 MiB stack
 and runs the full suite (incl. recursive `fib(20)`). The native `js` built-in
 demo is deliberately shallow.
 
+## Native blocker (kernel FPU/SSE context-switch save/restore)
+
+The engine is fully proven QEMU-free on the **host** target. The **native**
+tool (`user/js.ad`) compiles, loads, and runs — but its float64 results are
+**corrupted** today, and the cause is in the kernel, not the engine:
+
+- JS numbers are IEEE-754 `float64`, so evaluating *any* script executes SSE
+  (`movsd`/`mulsd`/`addsd`/`cvttsd2si`, `.rodata` FP constant pool). The
+  generated assembly is byte-identical to the working host target.
+- **Hamnix does not FXSAVE/XSAVE the FPU/SSE (xmm) register file across context
+  switches** (`arch/x86/kernel/cpuregs_asm.S:110` — *"Hamnix does not
+  FXSAVE/XSAVE the FPU/vector file across context switches today (SSE state
+  already isn't preserved)"*). Until now no native userspace used float64, so
+  nothing exposed it; the JS engine is the **first** native float64 consumer.
+- Symptom (diagnosed 2026-07-10, `-smp 1`, quiet BSP): the tool prints an early
+  `JS-BOOT` marker (exec + integer paths fine), but a `2.0*3.0+1.0` probe
+  returns `1` instead of `7` — xmm state clobbered by preemption between the FP
+  ops.
+
+**The fix is a kernel change (out of scope for this engine, high-risk to do
+blind):** add per-task FPU/SSE context-switch save/restore — an `fxsave`/
+`fxrstor` (or `xsave`/`xrstor`) of a per-task 512-byte area in the switch path
+(`arch/x86/kernel/sched_asm.S`), plus xmm-clobber discipline on the IRQ/syscall
+entry paths. A **secondary** latent gap surfaced too: APs arm `CR4.OSXSAVE`+
+`XCR0` (for VEX/AVX) but never set `CR4.OSFXSR`/`OSXMMEXCPT` (bit 9/10) that
+*legacy* SSE needs (`arch/x86/kernel/smp.ad` step 2d; the BSP sets them in
+`arch/x86/boot/header.S`), so once FPU save/restore lands, legacy-SSE float64
+user tasks scheduled onto an AP under `-smp>=2` would `#UD` until the APs also
+set OSFXSR/OSXMMEXCPT.
+
+`scripts/test_jsengine_native.sh` is written and correct; it is deliberately
+**not** wired into `ci_battery_manifest.txt` (a gate that cannot pass is a
+false-red). It goes live unchanged once the kernel gains FPU context switching.
+
 ## Embedder API (what the browser track calls)
 
 ```adder
@@ -158,7 +192,8 @@ seam and stays DOM-agnostic.
 - `scripts/test_jsengine_native.sh` — boots Hamnix and runs `js` in-guest,
   asserting the exact `JS-OK hamnix sum=15 sq=1,4,9,16,25` demo line (values
   not present in the typed command, so no console-leak false-green). Kills only
-  its own `$QEMU_PID`.
+  its own `$QEMU_PID`. **BLOCKED / not in CI** — see "Native blocker" above; it
+  goes live once the kernel gains FPU/SSE context-switch save/restore.
 
 ## Files
 
