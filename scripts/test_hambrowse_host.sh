@@ -401,6 +401,111 @@ assert_grepD '^JSLOG getAttribute data-role = banner$'       "getAttribute reads
 assert_grepD '^SEG [0-9]+ 8 #ff0000 b1 .*\|attr target\|' \
     "setAttribute('class','warn') -> .warn CSS rule applies"
 
+# ====================================================================
+# FORMS — <input>/<textarea>/<button>/<select> rendering, the form DOM
+# (value/checked/type/name, form.elements, document.forms), form events
+# (oninput/onchange/onclick/onsubmit) fired via the pointer-free host hooks
+# (he_dom_set_value / he_dom_set_checked / he_dom_submit), and GET-style
+# serialization of a form that does NOT preventDefault.
+# ====================================================================
+FIXF="tests/fixtures/hambrowse_forms.html"
+
+run_forms() {   # args passed straight to the harness after WIDTH
+    "$BIN" "$FIXF" 600 "$@"
+}
+
+# ---- (0) initial render: every control draws a monospace box ------------
+DUMPF="$OUT/dump_forms.txt"
+echo "[hb-host] rendering $FIXF ..."
+if ! run_forms >"$DUMPF" 2>&1; then
+    echo "[hb-host] FAIL: forms harness exited non-zero"; cat "$DUMPF"; exit 1
+fi
+cat "$DUMPF"
+assert_grepF() {
+    local pat="$1" msg="$2" file="${3:-$DUMPF}"
+    if grep -Eq -- "$pat" "$file"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+assert_grepF '^FLOW  Name field: \[hi______\]$' "text input renders [value] padded box"
+assert_grepF '^FLOW  Subscribe: \[x\]$'         "checked checkbox renders [x]"
+assert_grepF '^FLOW  Colour: \(\*\) red$'       "checked radio renders (*)"
+assert_grepF '^FLOW  Notes: \[note text\]$'     "textarea renders its content in a box"
+assert_grepF '^FLOW  Pick: \[ beta v\]$'        "select renders the selected option (beta)"
+assert_grepF '^FLOW  \[ Save \]$'               "<button> renders a [ label ] box"
+assert_grepF 'Search'                            "input type=submit renders a button"
+# the hidden input renders nothing (no box) on the second form's line.
+assert_grepF '^FLOW  \[dogs____\] \[ Go \]$'    "hidden input renders nothing (only visible fields box)"
+# form DOM surface: input.type/name, select.value/selectedIndex, collections.
+assert_grepF '^JSLOG name\.type=text$'  "input.type defaults to text"
+assert_grepF '^JSLOG name\.name=who$'   "element.name reads the name attribute"
+assert_grepF '^JSLOG pick\.value=beta$' "select.value returns the selected option text"
+assert_grepF '^JSLOG pick\.idx=1$'      "select.selectedIndex returns the selected index"
+assert_grepF '^JSLOG f1\.elements=3$'   "form.elements lists the form's controls"
+assert_grepF '^JSLOG doc\.forms=2$'     "document.forms lists the page's forms"
+
+# ---- (1) text input: he_dom_set_value fires oninput -> updates echo -----
+DUMPF1="$OUT/dump_forms_setval.txt"
+run_forms setval name Fluffy >"$DUMPF1" 2>&1
+cat "$DUMPF1"
+awk '/^SETVAL/{c=1} c' "$DUMPF1" > "$OUT/forms_after_setval.txt"
+assert_grepF '^FLOW  Name field: \[Fluffy__\]$' \
+    "he_dom_set_value updates the text input box" "$OUT/forms_after_setval.txt"
+assert_grepF '^FLOW  echo: Fluffy$' \
+    "oninput handler read input.value and updated another element" \
+    "$OUT/forms_after_setval.txt"
+
+# ---- (2) checkbox: he_dom_set_checked fires onchange --------------------
+DUMPF2="$OUT/dump_forms_check.txt"
+run_forms check sub 0 >"$DUMPF2" 2>&1
+cat "$DUMPF2"
+awk '/^CHECK/{c=1} c' "$DUMPF2" > "$OUT/forms_after_check.txt"
+assert_grepF '^FLOW  Subscribe: \[ \]$' \
+    "unchecking the checkbox re-renders [ ]" "$OUT/forms_after_check.txt"
+assert_grepF '^FLOW  sub is off$' \
+    "onchange handler read input.checked and updated the status line" \
+    "$OUT/forms_after_check.txt"
+
+# ---- (3) button onclick mutates the DOM --------------------------------
+DUMPF3="$OUT/dump_forms_click.txt"
+run_forms click go >"$DUMPF3" 2>&1
+cat "$DUMPF3"
+awk '/^CLICK/{c=1} c' "$DUMPF3" > "$OUT/forms_after_click.txt"
+assert_grepF '^FLOW  saved!$' \
+    "<button> onclick handler mutated the DOM" "$OUT/forms_after_click.txt"
+# the pre-click state ('not saved') was present before the click.
+awk '/^CLICK/{exit} {print}' "$DUMPF3" | grep -q 'not saved' && \
+    echo "[hb-host] PASS pre-click button state was 'not saved'" || \
+    { echo "[hb-host] FAIL pre-click button state wrong"; fail=1; }
+
+# ---- (4) onsubmit reads values + preventDefault stops navigation -------
+DUMPF4="$OUT/dump_forms_submit1.txt"
+run_forms submit f1 >"$DUMPF4" 2>&1
+cat "$DUMPF4"
+awk '/^SUBMIT/{c=1} c' "$DUMPF4" > "$OUT/forms_after_submit1.txt"
+assert_grepF '^FLOW  searched cats fancy=yes$' \
+    "onsubmit read input.value + input.checked and updated the page" \
+    "$OUT/forms_after_submit1.txt"
+assert_grepF '^JSLOG submit q=cats$' \
+    "onsubmit handler ran (console.log captured)" "$OUT/forms_after_submit1.txt"
+# preventDefault() was honoured: NO navigation happened.
+if grep -q '^NAV ' "$OUT/forms_after_submit1.txt"; then
+    echo "[hb-host] FAIL preventDefault ignored (form navigated anyway)"; fail=1
+else
+    echo "[hb-host] PASS onsubmit preventDefault suppressed navigation (no NAV)"
+fi
+
+# ---- (5) a form WITHOUT preventDefault GET-serializes its fields --------
+DUMPF5="$OUT/dump_forms_submit2.txt"
+run_forms submit f2 >"$DUMPF5" 2>&1
+cat "$DUMPF5"
+awk '/^SUBMIT/{c=1} c' "$DUMPF5" > "$OUT/forms_after_submit2.txt"
+assert_grepF '^NAV \?term=dogs&lang=en$' \
+    "form without preventDefault serializes visible+hidden fields (submit button excluded)" \
+    "$OUT/forms_after_submit2.txt"
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
     exit 0
