@@ -1635,6 +1635,15 @@ if os.environ.get("ENABLE_ADJTIMEX_TEST"):
 # CPU-time threshold. Default boots omit the marker.
 if os.environ.get("ENABLE_HRTIMER_TEST"):
     FILES.append(("/etc/hrtimer-test", b"1\n"))
+# Bounded-wait hrtimer-timeout self-test. scripts/test_wqtimeout.sh sets
+# ENABLE_WQTIMEOUT_TEST=1 to plant /etc/wqtimeout-test. init/main.ad at
+# boot:37 detects the marker and calls wq_timeout_hrtimer_selftest()
+# (kernel/sched/core.ad): it proves the native bounded wait
+# (wq_wait_commit_timeout) now times out on the ns clocksource with jiffies
+# FROZEN — the class the old jiffies-poll deadline silently failed under
+# NO_HZ idle / early boot. Default boots omit the marker.
+if os.environ.get("ENABLE_WQTIMEOUT_TEST"):
+    FILES.append(("/etc/wqtimeout-test", b"1\n"))
 # NUMA mempolicy round-trip self-test. scripts/test_mempolicy.sh sets
 # ENABLE_MEMPOLICY_TEST=1 to plant /etc/mempolicy-test. init/main.ad detects
 # the marker and calls mempolicy_selftest() (linux_abi/u_mempolicy.ad): it
