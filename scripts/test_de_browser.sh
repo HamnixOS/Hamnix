@@ -67,14 +67,18 @@ SNAPEOF
 chmod +x "$SNAP_HELPER"
 
 python3 - "$IMG_RW" "$OVMF_RW" "$MON" "$LOG" "$SNAP_HELPER" "$BOOT_WAIT" <<'PYDRV'
-import sys, subprocess, time, threading
+import sys, subprocess, time, threading, os
 img, ovmf, mon, logpath, snap, boot_wait = sys.argv[1:7]
 boot_wait = int(boot_wait)
+# DE + browser + fonts need headroom: the scene DE OOM'd at -m 1G during
+# shell/command pre-warm (elf: OOM), so the browser never launched. DE tests
+# default to 2G (see the T20 DE-OOM lesson); override with HAMNIX_VM_MEM.
+vm_mem = os.environ.get("HAMNIX_VM_MEM", "2G")
 qemu = subprocess.Popen([
     "qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
     "-bios", ovmf,
     "-drive", f"file={img},format=raw,if=virtio",
-    "-m", "1G",
+    "-m", vm_mem,
     "-vga", "std", "-display", "none", "-no-reboot",
     "-monitor", f"unix:{mon},server,nowait",
     "-serial", "stdio",
@@ -103,10 +107,14 @@ def send(line):
     except Exception: pass
 def screendump(label):
     subprocess.run([snap, label], timeout=20)
-import os
 LAUNCH_CMD = os.environ.get("HAMBROWSE_LAUNCH", "hambrowse --demo &")
 try:
-    if not wait_for("handing off to interactive shell", boot_wait):
+    # Handoff marker: the scene-DE image boots straight to runlevel 5 and never
+    # prints rc.boot.full's "handing off to interactive shell" — it brings up the
+    # DE and drops an interactive hamsh on the serial console, announced by the
+    # shell-ready banner. Wait for THAT (was stale → the gate never launched the
+    # browser and false-FAILed the whole track).
+    if not wait_for("M16.35 shell ready", boot_wait):
         print("[browser] driver: never reached handoff", file=sys.stderr)
     else:
         print("[browser] driver: handoff reached", file=sys.stderr)
