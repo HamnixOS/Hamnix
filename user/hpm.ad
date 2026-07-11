@@ -158,6 +158,10 @@ from lib.p9 import spawn
 # open" lines that hid the cause.
 from lib.perror import perror
 
+# Ed25519 verification of the repo index signature (see the trust-chain
+# block just before cmd_refresh, and lib/ed25519.ad).
+from lib.ed25519 import ed25519_verify
+
 def strlen_u8(s: Ptr[uint8]) -> uint64:
     n: uint64 = 0
     while s[n] != 0:
@@ -1617,6 +1621,166 @@ def _splice_channel_into_idx(ci: uint64, fbuf_len: uint64,
     return 0
 
 
+# -- index signature trust chain --------------------------------------
+#
+# index.json is the root of trust: it records every package's sha256,
+# which hpm verifies each tarball against. But an UNSIGNED index lets a
+# MITM or a compromised mirror serve a malicious index whose recorded
+# hashes match their malicious tarballs. So each channel's index.json is
+# accompanied by a DETACHED Ed25519 signature index.json.sig; on refresh
+# we fetch it and verify it against the trusted public key BEFORE
+# trusting any hash inside (lib/ed25519.ad does the curve math). A bad
+# or missing signature aborts the refresh with a non-zero status unless
+# the operator passes `--allow-unsigned` (alias `--insecure`), mirroring
+# apt's `--allow-unauthenticated` escape hatch. The per-tarball sha256
+# check remains as the second layer.
+#
+# Trust root: a 32-byte Ed25519 public key. The default is compiled in
+# (the same bytes as etc/hpm/trusted.pub) so it can't be swapped by
+# tampering with an on-disk file; `--trusted-key=<path>` overrides it
+# (used by the test harness and by anyone running a private repo).
+
+trusted_pub:      Array[32, uint8]
+trusted_pub_set:  int32 = 0
+allow_unsigned:   int32 = 0
+# The fetched detached signature: up to 128 hex chars + slack, decoded
+# into 64 raw bytes.
+sig_hex_buf:      Array[512, uint8]
+sig_raw_buf:      Array[64, uint8]
+# Scratch for reading a --trusted-key file.
+tkey_file_buf:    Array[512, uint8]
+
+
+def _hexval(c: uint8) -> int32:
+    if c >= 48 and c <= 57:            # '0'..'9'
+        return cast[int32](c) - 48
+    if c >= 97 and c <= 102:           # 'a'..'f'
+        return cast[int32](c) - 97 + 10
+    if c >= 65 and c <= 70:            # 'A'..'F'
+        return cast[int32](c) - 65 + 10
+    return -1
+
+
+# Decode `n` hex chars from src into dst (dst_cap bytes). Trailing
+# whitespace/newlines stop the scan. Returns the byte count, or -1 on a
+# malformed / oversized input.
+def _hex_decode(src: Ptr[uint8], n: uint64,
+                dst: Ptr[uint8], dst_cap: uint64) -> int64:
+    # Trim trailing whitespace.
+    end: uint64 = n
+    while end > 0:
+        c: uint8 = src[end - 1]
+        if c == 10 or c == 13 or c == 32 or c == 9:
+            end = end - 1
+        else:
+            break
+    if (end & 1) != 0:
+        return -1
+    nbytes: uint64 = end / 2
+    if nbytes > dst_cap:
+        return -1
+    i: uint64 = 0
+    while i < nbytes:
+        hi: int32 = _hexval(src[i * 2])
+        lo: int32 = _hexval(src[i * 2 + 1])
+        if hi < 0 or lo < 0:
+            return -1
+        dst[i] = cast[uint8]((hi << 4) | lo)
+        i = i + 1
+    return cast[int64](nbytes)
+
+
+# Load the compiled-in default trust root (matches etc/hpm/trusted.pub).
+def _load_default_trusted_pub():
+    src: Ptr[uint8] = \
+        "87c67427ce90c5f12718b3ee8fbc7bb8edd164b9ad3a3a7bc613999f00eb336f"
+    if _hex_decode(src, 64, &trusted_pub[0], 32) != 32:
+        # A compile-time constant; can't legitimately fail.
+        write_str(2, "hpm: internal: bad built-in trust root\n")
+    trusted_pub_set = 1
+
+
+# Parse a trusted-key file's contents (skip '#' comment lines, take the
+# first bare 64-hex-char token) into trusted_pub. Returns 0 on success.
+def _set_trusted_key_from_buf(buf: Ptr[uint8], blen: uint64) -> int32:
+    i: uint64 = 0
+    while i < blen:
+        # Skip leading whitespace on the line.
+        while i < blen and (buf[i] == 32 or buf[i] == 9):
+            i = i + 1
+        if i >= blen:
+            break
+        if buf[i] == 10 or buf[i] == 13:
+            i = i + 1
+            continue
+        if buf[i] == 35:                     # '#': comment line
+            while i < blen and buf[i] != 10:
+                i = i + 1
+            continue
+        # A bare token: find its end.
+        start: uint64 = i
+        while i < blen and buf[i] != 10 and buf[i] != 13 \
+                and buf[i] != 32 and buf[i] != 9:
+            i = i + 1
+        toklen: uint64 = i - start
+        if _hex_decode(cast[Ptr[uint8]](cast[uint64](buf) + start), toklen,
+                       &trusted_pub[0], 32) != 32:
+            return 1
+        trusted_pub_set = 1
+        return 0
+    return 1
+
+
+# Load a --trusted-key=<path> file from disk into the trust root.
+def _set_trusted_key_path(path: Ptr[uint8]) -> int32:
+    fd: int32 = sys_open(cast[Ptr[char]](path))
+    if fd < 0:
+        write_str(2, "hpm: cannot open trusted-key file: ")
+        write_str(2, path)
+        write_str(2, "\n")
+        return 1
+    total: uint64 = 0
+    while total < 512:
+        r: int64 = sys_read(fd, &tkey_file_buf[total], 512 - total)
+        if r < 0:
+            sys_close(fd)
+            return 1
+        if r == 0:
+            break
+        total = total + cast[uint64](r)
+    sys_close(fd)
+    if _set_trusted_key_from_buf(&tkey_file_buf[0], total) != 0:
+        write_str(2, "hpm: malformed trusted-key file (want 64 hex chars)\n")
+        return 1
+    return 0
+
+
+# Fetch <channel>/index.json.sig and verify the detached Ed25519
+# signature over `body[0..body_len)` against the trust root. Returns 0
+# if the signature is valid, 1 otherwise (missing/malformed/bad).
+def _verify_index_signature(body: Ptr[uint8], body_len: uint64) -> int32:
+    if trusted_pub_set == 0:
+        _load_default_trusted_pub()
+    sn: int64 = fetch_to_buf(cast[Ptr[uint8]]("index.json.sig"),
+                             &sig_hex_buf[0], 512)
+    if sn < 0:
+        write_str(2, "hpm: no index.json.sig for this channel "
+                     "(unsigned repo). Re-run with --allow-unsigned to "
+                     "trust it anyway.\n")
+        return 1
+    dn: int64 = _hex_decode(&sig_hex_buf[0], cast[uint64](sn),
+                            &sig_raw_buf[0], 64)
+    if dn != 64:
+        write_str(2, "hpm: malformed index.json.sig (want 128 hex chars)\n")
+        return 1
+    if ed25519_verify(&trusted_pub[0], &sig_raw_buf[0],
+                      body, body_len) != 1:
+        write_str(2, "hpm: index signature INVALID — refusing to trust "
+                     "this index (possible tampering or wrong repo key)\n")
+        return 1
+    return 0
+
+
 def cmd_refresh() -> int32:
     # Read enabled channels from /etc/hpm/channels (or default to
     # `main`), then fetch + merge every channel's index.json. The
@@ -1668,6 +1832,22 @@ def cmd_refresh() -> int32:
             n_failed = n_failed + 1
             ci = ci + 1
             continue
+        # Verify the detached Ed25519 signature over the RAW index bytes
+        # BEFORE trusting any hash inside it. --allow-unsigned skips this
+        # (with a loud warning), mirroring apt's escape hatch.
+        if allow_unsigned == 0:
+            if _verify_index_signature(&ch_fetch_buf[0], cast[uint64](n)) != 0:
+                write_str(2, "hpm: refresh: aborting — untrusted index for channel ")
+                sys_write(2, &channel_names_buf[channel_names_off[ci]],
+                          channel_names_len[ci])
+                write_str(2, "\n")
+                return 1
+        else:
+            write_str(2, "hpm: WARNING: --allow-unsigned set — NOT "
+                         "verifying signature for channel ")
+            sys_write(2, &channel_names_buf[channel_names_off[ci]],
+                      channel_names_len[ci])
+            write_str(2, "\n")
         # Splice into idx_buf. Need a leading ',' separator if any
         # previous channel already contributed packages.
         if total_pkgs > 0:
@@ -7602,7 +7782,16 @@ Flags:\n\
   --target-dev=<devpath>  install onto a freshly-mkfs'd ext4 partition\n\
                           (e.g. /dev/blk/nvme0n1p2) via the kernel\n\
                           install_file ctl verb — Debian-style fresh-disk\n\
-                          package install used by `install`\n"
+                          package install used by `install`\n\
+  --allow-unsigned        skip index.json.sig verification (alias\n\
+                          --insecure) — trust an unsigned/dev repo\n\
+  --trusted-key=<path>    use <path>'s Ed25519 public key as the trust\n\
+                          root instead of the built-in one\n\
+\n\
+Security: `refresh`/`update` verify a detached Ed25519 signature\n\
+(index.json.sig) over each channel's index.json against the trust root\n\
+(built-in, or --trusted-key / /etc/hpm/trusted.pub) before trusting any\n\
+package hash. A bad or missing signature aborts unless --allow-unsigned.\n"
     write_str(2, s)
     return 2
 
@@ -7662,6 +7851,27 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             write_str(1, "hpm: target-dev=")
             write_str(1, &target_dev_buf[0])
             write_str(1, " (package install onto fresh ext4 partition)\n")
+            ai = ai + 1
+            continue
+        # --allow-unsigned / --insecure: skip index signature checking.
+        if _streq(a, cast[Ptr[uint8]]("--allow-unsigned")) != 0 \
+           or _streq(a, cast[Ptr[uint8]]("--insecure")) != 0:
+            allow_unsigned = 1
+            ai = ai + 1
+            continue
+        # --trusted-key=<path>: override the compiled-in trust root.
+        pfx_k: Ptr[uint8] = "--trusted-key="
+        is_tk: int32 = 1
+        ik: uint64 = 0
+        while ik < 14:
+            if a[ik] != pfx_k[ik]:
+                is_tk = 0
+                break
+            ik = ik + 1
+        if is_tk != 0:
+            restk: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](a) + 14)
+            if _set_trusted_key_path(restk) != 0:
+                return 1
             ai = ai + 1
             continue
         break

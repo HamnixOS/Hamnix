@@ -128,7 +128,7 @@ set +e
 # settles on the serial RX FIFO.
 qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 480 \
     -- "echo RB_STAGE_START"                                         6 \
-       "hpm '--repo=file:///test-hpm-repo/' refresh"                 4 \
+       "hpm '--repo=file:///test-hpm-repo/' --allow-unsigned refresh"                 4 \
        "echo RB_STAGE_REFRESHED"                                     2 \
        "hpm '--repo=file:///test-hpm-repo/' install roll-a"          6 \
        "echo RB_STAGE_A_INSTALLED"                                   2 \

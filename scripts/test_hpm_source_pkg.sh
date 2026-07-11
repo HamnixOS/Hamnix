@@ -79,7 +79,7 @@ echo "[test_hpm_src] (4/4) Boot QEMU: install (compile on-box) + run"
 set +e
 qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 240 \
     -- "echo SRC_STAGE_START"                                          2 \
-       "hpm '--repo=file:///test-hpm-repo/' refresh"                   4 \
+       "hpm '--repo=file:///test-hpm-repo/' --allow-unsigned refresh"                   4 \
        "echo SRC_STAGE_REFRESHED"                                      2 \
        "hpm '--repo=file:///test-hpm-repo/' install hello-src"        12 \
        "echo SRC_STAGE_INSTALLED"                                      2 \

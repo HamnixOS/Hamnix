@@ -220,7 +220,7 @@ set +e
 # by SHA-256 + inflate, both microseconds.
 qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
     -- "echo HPM_STAGE_START"                                              2 \
-       "hpm '--repo=file:///test-hpm-repo/' refresh"                       4 \
+       "hpm '--repo=file:///test-hpm-repo/' --allow-unsigned refresh"                       4 \
        "echo HPM_STAGE_REFRESHED"                                          2 \
        "hpm '--repo=file:///test-hpm-repo/' search hello"                  3 \
        "echo HPM_STAGE_SEARCHED"                                           2 \
@@ -236,7 +236,7 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
        "echo HPM_STAGE_FILES_DONE"                                         2 \
        "hpm why hpm-hello"                                                 3 \
        "echo HPM_STAGE_WHY_DONE"                                           2 \
-       "hpm '--repo=file:///test-hpm-repo/' upgrade"                       5 \
+       "hpm '--repo=file:///test-hpm-repo/' --allow-unsigned upgrade"                       5 \
        "echo HPM_STAGE_UPGRADE_DONE"                                       2 \
        "hpm remove hpm-hello-dep"                                          4 \
        "echo HPM_STAGE_DEP_REMOVED"                                        2 \
@@ -244,7 +244,7 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
        "echo HPM_STAGE_REMOVED"                                            2 \
        "hpm list"                                                          2 \
        "echo HPM_STAGE_LIST_AFTER_REMOVE"                                  2 \
-       "hpm '--repo=file:///test-hpm-repo-conflict/' refresh"              3 \
+       "hpm '--repo=file:///test-hpm-repo-conflict/' --allow-unsigned refresh"              3 \
        "echo HPM_STAGE_CONFLICT_REFRESHED"                                 2 \
        "hpm '--repo=file:///test-hpm-repo-conflict/' install pkg-a"        4 \
        "echo HPM_STAGE_PKG_A_INSTALLED"                                    2 \

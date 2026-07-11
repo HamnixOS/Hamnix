@@ -105,7 +105,7 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
        "echo HPM_NET_PING_GATEWAY_DONE"               2 \
        "/bin/ping -c 2 -i 200 1.1.1.1"                8 \
        "echo HPM_NET_PING_INTERNET_DONE"              2 \
-       "hpm refresh"                                  20 \
+       "hpm --allow-unsigned refresh"                                  20 \
        "echo HPM_NET_REFRESH_DONE"                    2 \
        "exit"                                         2
 rc="$QEMU_DRIVE_RC"

@@ -132,7 +132,7 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
     -- "echo CHAN_STAGE_START"                                              2 \
        "hpm channels"                                                       2 \
        "echo CHAN_STAGE_LIST_DEFAULT"                                       2 \
-       "hpm '--repo=file:///test-hpm-repo/' refresh"                        4 \
+       "hpm '--repo=file:///test-hpm-repo/' --allow-unsigned refresh"                        4 \
        "echo CHAN_STAGE_REFRESH_DEFAULT"                                    2 \
        "hpm search hello"                                                   2 \
        "echo CHAN_STAGE_SEARCH_DEFAULT"                                     2 \
@@ -140,7 +140,7 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
        "echo CHAN_STAGE_ENABLE_EXTRA"                                       2 \
        "hpm channels"                                                       2 \
        "echo CHAN_STAGE_LIST_AFTER_ENABLE"                                  2 \
-       "hpm '--repo=file:///test-hpm-repo/' refresh"                        5 \
+       "hpm '--repo=file:///test-hpm-repo/' --allow-unsigned refresh"                        5 \
        "echo CHAN_STAGE_REFRESH_TWO"                                        2 \
        "hpm search hello"                                                   2 \
        "echo CHAN_STAGE_SEARCH_TWO"                                         2 \
