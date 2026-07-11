@@ -182,6 +182,55 @@ assert_grep3 '^FLOW  Fruit      Colour  Qty$'  "FLOW renders the header row as a
 assert_grep3 '^FLOW  Blueberry  blue    340$'  "FLOW renders the wide row aligned to the same columns"
 
 # ====================================================================
+# COLSPAN fixture — <thead>/<tbody> wrappers (transparent) + colspan cells.
+# Columns are sized by the single-span cells only:
+#   col0 "Region"(6) -> x=8,  next 8+(6+2)*8   = 72
+#   col1 "Q1"/"10"(2) -> x=72, next 72+(2+2)*8  = 104
+#   col2 "Q2"(2)      -> x=104, right sentinel 104+(2+2)*8 = 136
+# A colspan=2 cell starts at col1 (x=72) and its right edge is col_x[3]=136
+# (spanning col1+col2), so its text flows across BOTH columns' width; a
+# colspan=3 cell starts at col0 (x=8) and spans the whole table.
+# ====================================================================
+FIXS="tests/fixtures/hambrowse_span.html"
+DUMPS="$OUT/dump_span.txt"
+echo "[hb-host] running host harness on $FIXS ..."
+if ! "$BIN" "$FIXS" 600 >"$DUMPS" 2>&1; then
+    echo "[hb-host] FAIL: span harness exited non-zero"; cat "$DUMPS"; exit 1
+fi
+cat "$DUMPS"
+
+assert_grepS() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMPS"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# thead/tbody are transparent: the header <th>s size the columns and the
+# body <td>s align to the SAME x-positions across the wrapper boundary.
+assert_grepS '^SEG 2 8 #101010 b1 .*Region\|'  "th 'Region' bold at col0 x=8 (thead transparent)"
+assert_grepS '^SEG 2 72 #101010 b1 .*Q1\|'     "th 'Q1' bold at col1 x=72"
+assert_grepS '^SEG 2 104 #101010 b1 .*Q2\|'    "th 'Q2' bold at col2 x=104"
+assert_grepS '^SEG 3 8 #101010 b0 .*North\|'   "tbody td 'North' aligns to col0 x=8"
+assert_grepS '^SEG 3 72 #101010 b0 .*10\|'     "tbody td '10' aligns to col1 x=72"
+assert_grepS '^SEG 3 104 #101010 b0 .*20\|'    "tbody td '20' aligns to col2 x=104"
+# colspan=2: cell starts at col1 x=72; wraps at the SPANNED right edge (col_x[3]
+# =136, minus the 2-cell pad = 120 -> 6-char width) not at col1's own 2 chars.
+assert_grepS '^SEG 4 8 #101010 b0 .*Totals\|'  "row: single-span 'Totals' at col0 x=8"
+assert_grepS '^SEG 4 72 #101010 b0 .*All qu\|' "colspan=2 cell starts at col1 x=72, 6-char span width"
+# colspan=3: cell starts at col0 x=8 and spans the whole table width.
+assert_grepS '^SEG [0-9]+ 8 #101010 b0 .*Grand total\|' "colspan=3 cell starts at col0 x=8 across full width"
+# The single-span columns were NOT inflated by the spanning cells' long text
+# (col1 stayed 2 chars wide -> col2 at x=104, not pushed right).
+if grep -Eq '^SEG 2 104 ' "$DUMPS"; then
+    echo "[hb-host] PASS spanning cells do not inflate single-span column widths"
+else
+    echo "[hb-host] FAIL spanning cell inflated a column width"; fail=1
+fi
+
+# ====================================================================
 # LIST fixture — <ul>/<ol>/<li> markers, ordered numbering, <ol start=>,
 # nesting, and hanging indent (marker in the gutter, item text + wrapped
 # continuation lines aligned one level in).
