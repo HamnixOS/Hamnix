@@ -33,6 +33,7 @@ parsing stays under 100 lines.
 """
 
 import os
+import re
 
 # -------------------------------------------------------------------
 # Mono 8x16 glyph data — verbatim from the data block in
@@ -112,6 +113,24 @@ MONO_8x16 = [
 # (16 zero rows). The bitmap font remains usable; uncommon punctuation
 # may render as a blank cell.
 def _norm_mono():
+    # PREFER the clean 8x16 VGA glyph data already vendored in
+    # lib/hamui_host_font.ad (HAMUI_FONT_HEX) — the SAME font the GOP console
+    # and scene compositor draw, and the one ham2048/hamcalc render correctly.
+    # The MONO_8x16 list above suffered paste corruption (several lowercase
+    # glyphs were the wrong length and got blanked), which dropped letters in
+    # <pre>/<code>. Slicing the vendored table gives all 95 printable glyphs.
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(here)
+    fontsrc = os.path.join(root, "lib", "hamui_host_font.ad")
+    try:
+        s = open(fontsrc).read()
+        m = re.search(r'HAMUI_FONT_HEX:\s*Array\[\d+,\s*uint8\]\s*=\s*"([0-9a-fA-F]+)"', s)
+        hx = m.group(1)
+        if len(hx) >= 128 * 32:
+            return [hx[(0x20 + i) * 32:(0x20 + i) * 32 + 32].lower() for i in range(95)]
+    except Exception:
+        pass
+    # Fallback: the legacy (partly corrupted) embedded list.
     out = []
     for g in MONO_8x16:
         if isinstance(g, str) and len(g) == 32 and all(c in "0123456789abcdefABCDEF" for c in g):
@@ -243,11 +262,42 @@ def _row_to_byte(row: str, width: int) -> int:
     return v
 
 
-def _emit_glyph_lines(out, encoding, width, height, rows_hex, char_name):
+def _stencil_used_width(stencil, extra_right=0):
+    """Rightmost lit column (+1) across a 5-wide stencil, i.e. the glyph's
+    ink width. `extra_right` widens it by N (serif caps spill one column
+    right). Returns 0 for an all-blank stencil (e.g. space)."""
+    w = 0
+    for r in stencil:
+        for i in range(5):
+            c = r[i] if i < len(r) else ' '
+            if c == '#' and (i + 1) > w:
+                w = i + 1
+    if w > 0:
+        w = min(5, w + extra_right)
+    return w
+
+
+def _proportional_metrics(ch, stencil, extra_right=0):
+    """(bbx_w, dwidth) for a glyph: bbx_w = ink columns (>=1), dwidth =
+    ink + 1px inter-glyph gap. The SPACE glyph carries no ink, so it gets an
+    explicit word-advance. THIS is what makes the font proportional: 'i'/'.'
+    stay narrow while 'm'/'W' stay wide, each advancing by its own width."""
+    used = _stencil_used_width(stencil, extra_right)
+    if ch == ' ':
+        return 1, 3            # word space: no ink, 3px advance
+    if used == 0:
+        return 1, 4
+    return used, used + 1
+
+
+def _emit_glyph_lines(out, encoding, width, height, rows_hex, char_name,
+                      dwidth=None):
+    if dwidth is None:
+        dwidth = width
     out.append(f"STARTCHAR {char_name}")
     out.append(f"ENCODING {encoding}")
     out.append(f"SWIDTH 480 0")
-    out.append(f"DWIDTH {width} 0")
+    out.append(f"DWIDTH {dwidth} 0")
     out.append(f"BBX {width} {height} 0 0")
     out.append("BITMAP")
     out.extend(rows_hex)
@@ -314,16 +364,19 @@ def gen_sans_bdf(path: str):
         encoding = 0x20 + i
         ch = chr(encoding)
         stencil = STENCIL_5x7.get(ch, ["     "]*7)
+        # PROPORTIONAL: BBX width + DWIDTH advance vary per glyph.
+        bbx_w, dwidth = _proportional_metrics(ch, stencil)
         hex_rows = []
         # row 0: blank
         hex_rows.append("00")
-        # rows 1..7: stencil
+        # rows 1..7: stencil (left-aligned; parser reads only bbx_w columns)
         for r in stencil:
             hex_rows.append(f"{_row_to_byte(r, 5):02X}")
         # rows 8..9: blank (descender room)
         hex_rows.append("00")
         hex_rows.append("00")
-        _emit_glyph_lines(out, encoding, width, height, hex_rows, f"U+{encoding:04X}")
+        _emit_glyph_lines(out, encoding, bbx_w, height, hex_rows,
+                          f"U+{encoding:04X}", dwidth=dwidth)
     out.append("ENDFONT")
     out.append("")
     with open(path, "w") as f:
@@ -352,6 +405,9 @@ def gen_serif_bdf(path: str):
             cap = v | (v << 1) | (v >> 1)
             cap &= 0xF8  # 5 leftmost bits only
             return cap & 0xFF
+        # PROPORTIONAL: serif caps can spill one column right (>>1), so the
+        # ink width is measured with extra_right=1.
+        bbx_w, dwidth = _proportional_metrics(ch, stencil, extra_right=1)
         hex_rows = []
         hex_rows.append("00")           # row 0 blank top
         hex_rows.append(f"{_cap(stencil[0]):02X}")  # row 1: top serif
@@ -360,7 +416,8 @@ def gen_serif_bdf(path: str):
         hex_rows.append(f"{_cap(stencil[6]):02X}")  # row 9: bottom serif
         hex_rows.append("00")           # row 10 blank
         hex_rows.append("00")           # row 11 blank (descender)
-        _emit_glyph_lines(out, encoding, width, height, hex_rows, f"U+{encoding:04X}")
+        _emit_glyph_lines(out, encoding, bbx_w, height, hex_rows,
+                          f"U+{encoding:04X}", dwidth=dwidth)
     out.append("ENDFONT")
     out.append("")
     with open(path, "w") as f:
