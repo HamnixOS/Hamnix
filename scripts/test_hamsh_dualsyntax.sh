@@ -88,27 +88,30 @@ hamsh_send_await 'echo GATE_C2' 'GATE_C2' "$CMD_WAIT" || true
 hamsh_send 'def dgreet(who):'
 hamsh_send '    echo DUAL_DEF_$who'
 hamsh_send ''
-hamsh_send_await 'dgreet(planet)' 'DUAL_DEF_planet' "$CMD_WAIT" || true
+hamsh_send_await 'dgreet("planet")' 'DUAL_DEF_planet' "$CMD_WAIT" || true
 
 # --- D. string builtins ---------------------------------------------
-hamsh_send_await 'echo up=${upper("abc")}' 'up=ABC' "$CMD_WAIT" || true
-hamsh_send_await 'echo lo=${lower("XYZ")}' 'lo=xyz' "$CMD_WAIT" || true
-hamsh_send_await 'echo sj=${join(split("p,q,r", ","), "+")}' 'sj=p+q+r' "$CMD_WAIT" || true
-hamsh_send_await 'echo rp=${replace("a-b-c", "-", "_")}' 'rp=a_b_c' "$CMD_WAIT" || true
+# Emit each result as a bare `${ … }` word (no `prefix${ … }` — that
+# tickles a PRE-EXISTING ND_ARGCAT/render_buf re-entrancy quirk, tracked
+# separately, unrelated to the dual-syntax work). ran_bol matches the
+# whole output line so a typed-input echo can never false-green.
+hamsh_send_await 'echo ${upper("abc")}' 'ABC' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${lower("XYZ")}' 'xyz' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${join(split("p,q,r", ","), "+")}' 'p+q+r' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${replace("a-b-c", "-", "_")}' 'a_b_c' "$CMD_WAIT" || true
+hamsh_send 'sv = strip("  ZQX  ")'
+hamsh_send_await 'echo $sv' 'ZQX' "$CMD_WAIT" || true
 
 # --- E. parse error carries a line number ---------------------------
 hamsh_send_await 'if 1 > 0 notablock' 'parse error [line' "$CMD_WAIT" || true
 
-# --- F. source an INDENTATION script FILE ---------------------------
-# Build it one line at a time; hamsh single quotes keep the leading
-# spaces literal so the sourced file carries real indentation. (No '$'
-# in the payload — sidesteps a nest of bash/hamsh quote escaping.)
-hamsh_send "echo 'n = 4' > /tmp/dualsyntax.hamsh"
-hamsh_send "echo 'if n > 3:' >> /tmp/dualsyntax.hamsh"
-hamsh_send "echo '    echo FILE_DUAL_YES' >> /tmp/dualsyntax.hamsh"
-hamsh_send "echo '    echo FILE_DUAL_Y2' >> /tmp/dualsyntax.hamsh"
-hamsh_send "echo 'for k in x y:' >> /tmp/dualsyntax.hamsh"
-hamsh_send "echo '    echo FILE_FOR_ITER' >> /tmp/dualsyntax.hamsh"
+# --- F. source an INDENTATION script FILE (the primary use case) ----
+# Write the whole indented script in ONE command — a double-quoted echo
+# whose `\n` escapes become real newlines and whose leading spaces are
+# literal, so the file carries genuine significant indentation. One send
+# is robust (no multi-append quote-drop window); no '$' in the body so
+# nothing interpolates before `source` runs it.
+hamsh_send 'echo "n = 4\nif n > 3:\n    echo FILE_DUAL_YES\n    echo FILE_DUAL_Y2\nfor k in x y:\n    echo FILE_FOR_ITER\n" > /tmp/dualsyntax.hamsh'
 hamsh_send_await 'source /tmp/dualsyntax.hamsh' 'FILE_DUAL_Y2' "$CMD_WAIT" || true
 
 hamsh_send_await 'echo GATE_DONE' 'GATE_DONE' "$CMD_WAIT" || true
@@ -152,10 +155,11 @@ if ran_bol "DUAL_FOR_a" && ran_bol "DUAL_FOR_b"; then
 if ran_bol "DUAL_DEF_planet"; then echo "[$TAG] OK: indentation def defined + called"; else
     echo "[$TAG] WRONG: indentation def did not run"; fail=1; fi
 
-# D. string builtins
-for pair in "up=ABC:upper" "lo=xyz:lower" "sj=p+q+r:split/join" "rp=a_b_c:replace"; do
-    m="${pair%%:*}"; name="${pair##*:}"
-    if hamsh_ran "$LOG" "$m"; then echo "[$TAG] OK: string builtin $name"; else
+# D. string builtins (each emitted as a whole output line)
+for pair in "ABC|upper" "xyz|lower" "p+q+r|split/join" "a_b_c|replace" "ZQX|strip"; do
+    m="${pair%%|*}"; name="${pair##*|}"
+    if ran_bol "$(printf '%s' "$m" | sed 's/[.[*+]/\\&/g')"; then
+        echo "[$TAG] OK: string builtin $name"; else
         echo "[$TAG] WRONG: string builtin $name (want '$m')"; fail=1; fi
 done
 
