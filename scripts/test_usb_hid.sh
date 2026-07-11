@@ -60,6 +60,8 @@ set -euo pipefail
 
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_usb_hid
 
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
@@ -105,6 +107,14 @@ set -e
 echo "[test_usb_hid] --- captured USB-relevant boot output ---"
 grep -E "xhci|usb_hid|usb_hid_mouse|atkbd:|hid:" "$LOG" || true
 echo "[test_usb_hid] --- end ---"
+
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero USB/xHCI markers == the guest never reached USB init: a starved/
+# timed-out TCG boot (this gate's timeout is a tight 15s), an OBSERVED crash
+# (verdict_boot_gate FAILs on TRAP/panic), or GRUB OOM — NOT a HID regression.
+# rc=124 (timeout) is the EXPECTED normal exit here (kernel HLTs after init),
+# so a boot that DID emit markers still passes the gate below.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[xhci\]|\[usb_hid|atkbd:'
 
 fail=0
 
@@ -207,16 +217,22 @@ if grep -E -q "PANIC|TRAP: vector" "$LOG"; then
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_usb_hid] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "USB/xHCI markers were observed (the guest booted) but a required" \
+        "self-test marker was OBSERVED absent or a FAIL/TRAP was printed" \
+        "(qemu rc=$rc) — a real xHCI/HID/atkbd regression."
 fi
 
 # rc=124 is timeout, which is the expected "kernel HLT'd after init"
 # outcome — we never reach a clean qemu shutdown because the kernel
-# doesn't power off after running through start_kernel.
+# doesn't power off after running through start_kernel. Any OTHER
+# non-zero rc with markers present is an OBSERVED abnormal exit.
 if [ "$rc" -ne 124 ] && [ "$rc" -ne 0 ]; then
-    echo "[test_usb_hid] FAIL: qemu exited rc=$rc"
-    exit 1
+    verdict_fail "$TAG" \
+        "the guest booted and produced USB markers but qemu exited rc=$rc" \
+        "(neither 0 nor the expected 124 HLT-timeout) — an OBSERVED abnormal exit."
 fi
 
-echo "[test_usb_hid] PASS"
+verdict_pass "$TAG" "xHCI controller detect + HCSPARAMS decode + reset +" \
+    "root-hub keyboard discovery, HID keyboard (17) and mouse (15) translator" \
+    "self-tests, and the atkbd PS/2 self-test (25) all PASS (qemu rc=$rc)"

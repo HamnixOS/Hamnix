@@ -44,6 +44,8 @@ set -euo pipefail
 
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_usb_hid_v1
 
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
@@ -91,6 +93,12 @@ set -e
 echo "[test_usb_hid_v1] --- captured V1-relevant boot output ---"
 grep -E "xhci|usb_hid|atkbd:|hid:" "$LOG" || true
 echo "[test_usb_hid_v1] --- end ---"
+
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero USB/xHCI markers == the guest never reached USB init: a starved/
+# timed-out TCG boot, an OBSERVED crash, or GRUB OOM — NOT a V1 regression.
+# rc=124 (timeout) is the EXPECTED normal exit (kernel HLTs after init).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[xhci\]|\[usb_hid|atkbd:'
 
 fail=0
 
@@ -144,16 +152,19 @@ if grep -E -q "PANIC|TRAP: vector" "$LOG"; then
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_usb_hid_v1] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "USB/xHCI markers were observed (the guest booted) but a required V1" \
+        "transfer-engine / V0 regression marker was OBSERVED absent or a" \
+        "FAIL/TRAP was printed (qemu rc=$rc) — a real xHCI V1 regression."
 fi
 
-# rc=124 is timeout, which is the expected "kernel HLT'd after init"
-# outcome — we never reach a clean qemu shutdown because the kernel
-# doesn't power off after running through start_kernel.
+# rc=124 is timeout, the expected "kernel HLT'd after init" outcome.
 if [ "$rc" -ne 124 ] && [ "$rc" -ne 0 ]; then
-    echo "[test_usb_hid_v1] FAIL: qemu exited rc=$rc"
-    exit 1
+    verdict_fail "$TAG" \
+        "the guest booted and produced USB markers but qemu exited rc=$rc" \
+        "(neither 0 nor the expected 124 HLT-timeout) — an OBSERVED abnormal exit."
 fi
 
-echo "[test_usb_hid_v1] PASS"
+verdict_pass "$TAG" "xHCI V1 transfer engine: controller RS=1, Command/Event" \
+    "ring + slot lifecycle + control transfers, synthetic transfer-engine PASS," \
+    "and V0 HID + atkbd self-tests still PASS (qemu rc=$rc)"

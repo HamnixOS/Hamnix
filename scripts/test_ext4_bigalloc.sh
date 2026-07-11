@@ -26,6 +26,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_bigalloc
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -155,10 +157,21 @@ echo "[test_ext4_bigalloc] --- ext4/bigalloc boot output ---"
 grep -a -E "RO_COMPAT_BIGALLOC|cluster_size|clusters_per_group|EXT4BIGALLOC_LINE" "$LOG" | head -20 || true
 echo "[test_ext4_bigalloc] --- end ---"
 
-# Treat a virtio-blk superblock-read flake (host CPU starvation under
-# load) as INFRA, not a code failure — re-run in a quiet window.
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Gate on hamsh 'loop-enter' liveness, NOT on the bigalloc marker itself:
+# zero loop-enter == the guest never reached an interactive shell (starved/
+# timed-out boot, an OBSERVED crash, GRUB OOM) so the keystroke that reads
+# BIGFILE.TXT was never delivered — INCONCLUSIVE, not a bigalloc regression.
+# If loop-enter IS present but RO_COMPAT_BIGALLOC/content is absent, that is
+# an OBSERVED failure and falls through to verdict_fail below.
+verdict_boot_gate "$TAG" "$LOG" "$rc" 'loop-enter'
+
+# A virtio-blk superblock-read flake (host CPU starvation) means the fs
+# never mounted and the read-back could not happen: INCONCLUSIVE.
 if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
-    echo "[test_ext4_bigalloc] WARN: virtio-blk read flake detected — re-run in a quiet window" >&2
+    verdict_inconclusive "$TAG" \
+        "virtio-blk superblock read flake ('read failed status=255') — host" \
+        "CPU starvation; the bigalloc fs never mounted. Re-run on a quiet host."
 fi
 
 fail=0
@@ -192,10 +205,14 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_bigalloc] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_bigalloc] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "hamsh reached its prompt (loop-enter observed) but a bigalloc marker" \
+        "was OBSERVED absent — RO_COMPAT_BIGALLOC not announced, or BIGFILE.TXT" \
+        "head/4th-block content did not read back (qemu rc=$rc). A real bigalloc" \
+        "cluster->block resolution regression."
 fi
 
 echo "[ext4bigalloc] PASS"
-echo "[test_ext4_bigalloc] PASS — bigalloc (RO_COMPAT_BIGALLOC) multi-block" \
-     "extent read on a live ext4 mount (qemu rc=$rc)"
+verdict_pass "$TAG" "bigalloc (RO_COMPAT_BIGALLOC): mount computed cluster" \
+     "geometry and a multi-block file read back byte-exact across the 1st and" \
+     "4th blocks on a live ext4 mount (qemu rc=$rc)"

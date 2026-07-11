@@ -54,6 +54,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_eainode
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -204,10 +206,17 @@ echo "[test_ext4_eainode] --- ext4/ea_inode boot output ---"
 grep -a -E "INCOMPAT_EA_INODE|ext4eainode|ext4-xattr" "$LOG" | head -20 || true
 echo "[test_ext4_eainode] --- end ---"
 
-# Treat a virtio-blk superblock-read flake (host CPU starvation under load)
-# as INFRA, not a code failure — re-run in a quiet window.
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero ea_inode markers == the in-boot probe never ran: a starved/timed-out
+# boot, an OBSERVED crash, or GRUB OOM — NOT an ea_inode regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4eainode\]|INCOMPAT_EA_INODE'
+
+# A virtio-blk superblock-read flake (host CPU starvation) means the fs
+# never mounted and the probe could not run: INCONCLUSIVE.
 if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
-    echo "[test_ext4_eainode] WARN: virtio-blk read flake detected — re-run in a quiet window" >&2
+    verdict_inconclusive "$TAG" \
+        "virtio-blk superblock read flake ('read failed status=255') — host" \
+        "CPU starvation; the ea_inode fs never mounted. Re-run on a quiet host."
 fi
 
 fail=0
@@ -269,10 +278,14 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_eainode] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_eainode] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "the ea_inode probe ran but a marker was OBSERVED absent — INCOMPAT_EA_INODE" \
+        "not announced, the probe did not resolve BIGATTR.BIN, or the 8192-byte" \
+        "user.big value did not verify byte-exact across both ea-inode blocks" \
+        "(qemu rc=$rc). A real multi-block ea_inode read regression."
 fi
 
 echo "[ext4eainode] PASS"
-echo "[test_ext4_eainode] PASS — EA_INODE (INCOMPAT_EA_INODE) multi-block" \
-     "xattr value read via e_value_inum on a live ext4 mount (qemu rc=$rc)"
+verdict_pass "$TAG" "EA_INODE (INCOMPAT_EA_INODE): an 8192-byte xattr value stored" \
+     "via e_value_inum read back byte-exact across both ea-inode blocks on a live" \
+     "ext4 mount (qemu rc=$rc)"

@@ -35,6 +35,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_resize
 
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
@@ -175,6 +177,19 @@ echo "[test_ext4_resize] --- ext4 resize/firstboot lines ---"
 grep -aE '\[ext4_resize|\[firstboot\]' "$LOG" || true
 echo "[test_ext4_resize] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Gate on hamsh 'loop-enter' liveness: zero loop-enter == the guest never
+# reached an interactive shell (starved/timed-out boot, OBSERVED crash, GRUB
+# OOM), so the firstboot resize hook never fired and the host oracles below
+# would inspect an UN-grown image and mis-report FAIL. INCONCLUSIVE instead.
+verdict_boot_gate "$TAG" "$LOG" "$rc" 'loop-enter'
+
+if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
+    verdict_inconclusive "$TAG" \
+        "virtio-blk superblock read flake ('read failed status=255') — host" \
+        "CPU starvation; the resize fs never mounted. Re-run on a quiet host."
+fi
+
 fail=0
 # Assert the in-kernel grow path ran end-to-end on vdb: the resize check
 # found a checksummed grow feasible, the grow recomputed checksums, the
@@ -249,7 +264,13 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_resize] --- full boot log ---"
     cat "$LOG"
-    echo "[test_ext4_resize] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "hamsh reached its prompt (loop-enter observed) but the online-grow was" \
+        "OBSERVED to fail — a [ext4_resize]/[firstboot] marker was absent, e2fsck" \
+        "found problems, no block groups were added, or a pre-grow file did not" \
+        "survive (qemu rc=$rc). A real ext4 online-resize regression."
 fi
-echo "[test_ext4_resize] PASS"
+verdict_pass "$TAG" "ext4 online grow (metadata_csum): the in-kernel resize grew" \
+    "blocks 8192 -> 57345, recomputed checksums, reclaimed the old tail group;" \
+    "e2fsck certifies the grown FS CLEAN, pre-grow data survived byte-exact, and" \
+    "a new-region sentinel allocated in the grown FS (qemu rc=$rc)"

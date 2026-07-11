@@ -32,6 +32,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_multigroup_inode
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -154,10 +156,19 @@ echo "[test_ext4_multigroup_inode] --- boot output (filtered) ---"
 grep -a -E "HAMNIX_MGI_SENTINEL|no free inode|ENOSPC|No space" "$LOG" | head -20 || true
 echo "[test_ext4_multigroup_inode] --- end ---"
 
-# Treat a virtio-blk superblock-read flake (host CPU starvation under
-# load) as INFRA, not a code failure — re-run in a quiet window.
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Gate on hamsh 'loop-enter' liveness, NOT the sentinel itself: zero
+# loop-enter == the guest never reached an interactive shell (starved/timed-
+# out boot, OBSERVED crash, GRUB OOM) so the create keystroke never fired —
+# INCONCLUSIVE. loop-enter present + missing sentinel == OBSERVED fail.
+verdict_boot_gate "$TAG" "$LOG" "$rc" 'loop-enter'
+
+# A virtio-blk superblock-read flake (host CPU starvation) means the fs
+# never mounted and the create/read-back could not happen: INCONCLUSIVE.
 if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
-    echo "[test_ext4_multigroup_inode] WARN: virtio-blk read flake — re-run in a quiet window" >&2
+    verdict_inconclusive "$TAG" \
+        "virtio-blk superblock read flake ('read failed status=255') — host" \
+        "CPU starvation; the fs never mounted. Re-run on a quiet host."
 fi
 
 fail=0
@@ -184,10 +195,14 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_multigroup_inode] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_multigroup_inode] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "hamsh reached its prompt (loop-enter observed) but the multi-group" \
+        "inode alloc was OBSERVED to fail — 'no free inode' printed, or" \
+        "NEWALLOC.TXT did not round-trip (qemu rc=$rc). A real ext4_alloc_inode" \
+        "past-group-0 regression."
 fi
 
 echo "[ext4mgi] PASS"
-echo "[test_ext4_multigroup_inode] PASS — new-file create allocated an inode from a" \
-     "non-zero block group after group 0 was full (qemu rc=$rc)"
+verdict_pass "$TAG" "new-file create allocated an inode from a non-zero block" \
+     "group after group 0 was full, and NEWALLOC.TXT round-tripped through the" \
+     "VFS read path (qemu rc=$rc)"

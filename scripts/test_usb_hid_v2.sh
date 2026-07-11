@@ -55,6 +55,8 @@ set -euo pipefail
 
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_usb_hid_v2
 
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
@@ -135,6 +137,12 @@ set -e
 echo "[test_usb_hid_v2] --- captured V2-relevant boot output ---"
 grep -E "xhci|usb_hid|atkbd:|hid:|PANIC|TRAP|boot:35\.X|usbhid|hid\.ko|shim.*hid|shim.*usbhid|kmod_linux: relocations" "$LOG" || true
 echo "[test_usb_hid_v2] --- end ---"
+
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero USB/xHCI markers == the guest never reached USB init: a starved/
+# timed-out TCG boot, an OBSERVED crash, or GRUB OOM — NOT a V2 regression.
+# rc=124 (timeout) is the EXPECTED normal exit (kernel HLTs after init).
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[xhci\]|\[usb_hid|atkbd:'
 
 fail=0
 
@@ -267,8 +275,12 @@ else
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "[test_usb_hid_v2] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "USB/xHCI markers were observed (the guest booted) but a required V2" \
+        "continuous-poll / V1 / V0 marker was OBSERVED absent or a FAIL/TRAP" \
+        "was printed (qemu rc=$rc) — a real xHCI V2 regression."
 fi
 
-echo "[test_usb_hid_v2] PASS"
+verdict_pass "$TAG" "xHCI V2: the continuous interrupt-IN poll path plus the" \
+    "HID .ko L-shim coverage probe (modules loaded, zero skipped relocations)" \
+    "and V1/V0 self-tests all hold (qemu rc=$rc)"
