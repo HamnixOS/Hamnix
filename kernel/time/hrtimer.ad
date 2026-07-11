@@ -42,6 +42,22 @@ from kernel.time.clockevent import (
     clockevent_record_deadline, CLOCKEVT_MIN_DELTA_NS,
 )
 
+# SMP protection for the ht_* queue. On -smp >1 the queue is armed /
+# cancelled from arbitrary CPUs (sched timeouts, nanosleep, timerfd,
+# the native bounded wait) while CPU0 concurrently walks + expires it in
+# hrtimer_interrupt from the timer ISR. Without a lock those concurrent
+# mutations corrupt the sorted ht_q array (shift-in-place insert/remove
+# racing the interrupt's dequeue) and wedge the second core. We take a
+# single per-base raw spinlock with IRQs disabled (raw_spin_lock_irqsave
+# shape) around every queue mutation + read. The interrupt path DROPS the
+# lock across each callback invocation (Linux __run_hrtimer semantics) so
+# a callback may re-enter the hrtimer API or take other locks (rq_lock in
+# the force-wake) without an ht_lock <-> rq_lock ordering inversion.
+extern def spinlock_lock(ptr: Ptr[uint32])
+extern def spinlock_unlock(ptr: Ptr[uint32])
+extern def local_irq_save() -> uint64
+extern def local_irq_restore(flags: uint64)
+
 # hrtimer_restart return values.
 HRTIMER_NORESTART: int64 = 0
 HRTIMER_RESTART:   int64 = 1
@@ -69,14 +85,22 @@ ht_used:    Array[256, uint64]   # 1 = slot allocated
 ht_q:       Array[256, uint64]
 ht_qlen:    uint64 = 0
 
+# Per-base raw spinlock guarding every ht_* array + the queue. 0 = free,
+# 1 = held. Acquired with local_irq_save first (IRQ-off critical section),
+# matching Linux's raw_spin_lock_irqsave on cpu_base->lock.
+ht_lock:    uint32 = 0
+
 # Diagnostics.
 ht_fired_count:   uint64 = 0
 ht_enqueue_count: uint64 = 0
 
 
 def hrtimer_init_subsys():
-    # Reset the subsystem. Called once at boot after the clocksource +
-    # clockevent are up.
+    # Reset the subsystem. Called once at boot (before the APs are up)
+    # after the clocksource + clockevent are online. Locked for form's
+    # sake — there is no contention at this point.
+    flags: uint64 = local_irq_save()
+    spinlock_lock(&ht_lock)
     i: uint64 = 0
     while i < MAX_HRTIMERS:
         ht_used[i]    = 0
@@ -88,6 +112,8 @@ def hrtimer_init_subsys():
     ht_qlen = 0
     ht_fired_count = 0
     ht_enqueue_count = 0
+    spinlock_unlock(&ht_lock)
+    local_irq_restore(flags)
     printk0("hrtimer: subsystem online (ns-resolution, clockevent-backed)\n")
 
 
@@ -119,6 +145,11 @@ def _ht_free_slot(slot: uint64):
 
 
 # --- ordered queue ops -----------------------------------------------
+#
+# All _ht_* helpers below (queue + slot ops) and hrtimer_reprogram
+# assume ht_lock is ALREADY HELD by the caller. The public hrtimer_*
+# entry points take the lock; these stay lock-free so the interrupt path
+# can compose them under a single acquisition.
 
 def _ht_queue_find(slot: uint64) -> int64:
     # Position of `slot` in ht_q, or -1 if not queued.
@@ -169,14 +200,25 @@ def _ht_queue_remove_slot(slot: uint64):
 
 def hrtimer_next_expiry() -> uint64:
     # Absolute ns deadline of the earliest enqueued hrtimer, or 0 if the
-    # queue is empty. ht_q[0] is the head by the sorted invariant.
-    if ht_qlen == 0:
-        return 0
-    return ht_expires[ht_q[0]]
+    # queue is empty. ht_q[0] is the head by the sorted invariant. Locked
+    # so a concurrent arm/cancel/expire can't tear the head read.
+    flags: uint64 = local_irq_save()
+    spinlock_lock(&ht_lock)
+    out: uint64 = 0
+    if ht_qlen != 0:
+        out = ht_expires[ht_q[0]]
+    spinlock_unlock(&ht_lock)
+    local_irq_restore(flags)
+    return out
 
 
 def hrtimer_pending_count() -> uint64:
-    return ht_qlen
+    flags: uint64 = local_irq_save()
+    spinlock_lock(&ht_lock)
+    out: uint64 = ht_qlen
+    spinlock_unlock(&ht_lock)
+    local_irq_restore(flags)
+    return out
 
 
 def hrtimer_next_expiry_excluding(skip_slot: int64) -> uint64:
@@ -186,12 +228,18 @@ def hrtimer_next_expiry_excluding(skip_slot: int64) -> uint64:
     # deciding how long the CPU may sleep. Returns 0 if no other timer is
     # pending. The queue is sorted, so we walk from the head until we hit
     # a slot that isn't the skipped one.
+    flags: uint64 = local_irq_save()
+    spinlock_lock(&ht_lock)
+    out: uint64 = 0
     i: uint64 = 0
     while i < ht_qlen:
         if cast[int64](ht_q[i]) != skip_slot:
-            return ht_expires[ht_q[i]]
+            out = ht_expires[ht_q[i]]
+            break
         i = i + 1
-    return 0
+    spinlock_unlock(&ht_lock)
+    local_irq_restore(flags)
+    return out
 
 
 # --- reprogram the clockevent ----------------------------------------
@@ -222,14 +270,17 @@ def hrtimer_create(fn_ptr: uint64, data: uint64) -> int64:
     # Allocate a hrtimer (INACTIVE). fn_ptr is the
     # enum hrtimer_restart (*)(hrtimer*) callback; data is an opaque
     # cookie the caller gets back. Returns a slot id (handle) or -1.
+    flags: uint64 = local_irq_save()
+    spinlock_lock(&ht_lock)
     slot: int64 = _ht_alloc_slot()
-    if slot < 0:
-        return -1
-    si: uint64 = cast[uint64](slot)
-    ht_fn[si]      = fn_ptr
-    ht_data[si]    = data
-    ht_expires[si] = 0
-    ht_state[si]   = HRTIMER_STATE_INACTIVE
+    if slot >= 0:
+        si: uint64 = cast[uint64](slot)
+        ht_fn[si]      = fn_ptr
+        ht_data[si]    = data
+        ht_expires[si] = 0
+        ht_state[si]   = HRTIMER_STATE_INACTIVE
+    spinlock_unlock(&ht_lock)
+    local_irq_restore(flags)
     return slot
 
 
@@ -239,7 +290,11 @@ def hrtimer_start_abs(slot: uint64, expires_ns: uint64) -> int32:
     # Reprograms the clockevent for the (possibly new) earliest deadline.
     if slot >= MAX_HRTIMERS:
         return -1
+    flags: uint64 = local_irq_save()
+    spinlock_lock(&ht_lock)
     if ht_used[slot] == 0:
+        spinlock_unlock(&ht_lock)
+        local_irq_restore(flags)
         return -1
     # Remove from the queue if currently enqueued (re-arm).
     if ht_state[slot] == HRTIMER_STATE_ENQUEUED:
@@ -249,6 +304,8 @@ def hrtimer_start_abs(slot: uint64, expires_ns: uint64) -> int32:
     _ht_queue_insert(slot)
     ht_enqueue_count = ht_enqueue_count + 1
     hrtimer_reprogram()
+    spinlock_unlock(&ht_lock)
+    local_irq_restore(flags)
     return 0
 
 
@@ -262,22 +319,30 @@ def hrtimer_cancel(slot: uint64) -> int32:
     # Cancel hrtimer `slot`. Returns 1 if it was active, 0 otherwise.
     if slot >= MAX_HRTIMERS:
         return 0
-    if ht_used[slot] == 0:
-        return 0
+    flags: uint64 = local_irq_save()
+    spinlock_lock(&ht_lock)
     was_active: int32 = 0
-    if ht_state[slot] == HRTIMER_STATE_ENQUEUED:
-        was_active = 1
-        _ht_queue_remove_slot(slot)
-        ht_state[slot] = HRTIMER_STATE_INACTIVE
-        hrtimer_reprogram()
+    if ht_used[slot] != 0:
+        if ht_state[slot] == HRTIMER_STATE_ENQUEUED:
+            was_active = 1
+            _ht_queue_remove_slot(slot)
+            ht_state[slot] = HRTIMER_STATE_INACTIVE
+            hrtimer_reprogram()
+    spinlock_unlock(&ht_lock)
+    local_irq_restore(flags)
     return was_active
 
 
 def hrtimer_destroy(slot: uint64):
-    # Cancel + free the slot.
+    # Cancel + free the slot. hrtimer_cancel takes ht_lock itself (and
+    # releases it), then we re-acquire to free the slot atomically.
     hrtimer_cancel(slot)
     if slot < MAX_HRTIMERS:
+        flags: uint64 = local_irq_save()
+        spinlock_lock(&ht_lock)
         _ht_free_slot(slot)
+        spinlock_unlock(&ht_lock)
+        local_irq_restore(flags)
 
 
 def hrtimer_forward(slot: uint64, now_ns: uint64,
@@ -333,6 +398,16 @@ def hrtimer_interrupt(now_ns: uint64) -> uint64:
     # arm OTHER timers, mutating the queue mid-walk; we always re-read the
     # head, so newly-due timers added by a callback fire in the same pass
     # if they're already past `now_ns`.
+    # Runs in the timer ISR (hardirq context, IRQs already off). Take
+    # ht_lock for the whole pass so cross-CPU arm/cancel serialize against
+    # the queue walk. We local_irq_save/restore too: a no-op cost when
+    # already off, and it keeps IRQs off across the whole pass. The lock
+    # is DROPPED around each callback invocation (Linux __run_hrtimer):
+    # the callback may re-enter the hrtimer API or take rq_lock (the
+    # force-wake), which would deadlock or invert lock order if we held
+    # ht_lock across it. IRQs stay off across the callback (hardirq).
+    flags: uint64 = local_irq_save()
+    spinlock_lock(&ht_lock)
     fired: uint64 = 0
     # Bound the loop so a pathological self-re-arming-to-the-past callback
     # cannot spin forever in one interrupt.
@@ -356,8 +431,12 @@ def hrtimer_interrupt(now_ns: uint64) -> uint64:
             # cookie (sleeper task id / posix-timer id) as the single arg
             # rather than a struct pointer — Hamnix callbacks key off the
             # cookie. The callback may call hrtimer_forward(head, ...).
+            # Drop ht_lock across the call (the timer is already dequeued,
+            # so its slot is private to us) and re-take it after.
             call_fn: Fn[int64, uint64] = cast[Fn[int64, uint64]](fn)
+            spinlock_unlock(&ht_lock)
             ret = call_fn(data)
+            spinlock_lock(&ht_lock)
         # RESTART: the callback updated ht_expires[head] (via
         # hrtimer_forward) and wants to be re-enqueued.
         if ret == HRTIMER_RESTART and ht_used[head] == 1:
@@ -366,6 +445,8 @@ def hrtimer_interrupt(now_ns: uint64) -> uint64:
     # Reprogram for whatever is now earliest (or leave to the tick layer
     # if empty — NO_HZ decides there).
     hrtimer_reprogram()
+    spinlock_unlock(&ht_lock)
+    local_irq_restore(flags)
     return fired
 
 
