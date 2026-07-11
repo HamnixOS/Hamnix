@@ -277,6 +277,7 @@ build_adder_user hamtermscene         # scene-file DE terminal: glyphs content +
 build_adder_user hamfmscene           # scene-file DE file manager: directory listing as glyphs, click->descend (via lib/hamui hamscene_*)
 build_adder_user hamcalcscene         # scene-file DE calculator: button grid + display, click->compute (via lib/hamui hamscene_*)
 build_adder_user hameditscene         # scene-file DE text editor: scrollable text area + cursor, /keys input, Ctrl-S saves
+build_adder_user ham2048scene         # scene-file DE 2048 game: coloured 4x4 tile board, WASD/arrow keys + on-screen controls (scene port of ham2048; lib/hamui hamscene_*)
 build_adder_user hambrowse            # scene-file DE web browser: fetch HTTP (user/http9) + parse HTML subset + block/inline layout + render (lib/hamui hamscene_*); links click-navigate
 build_adder_user haminstallui         # scene-file DE visual installer: GUI front-end over /bin/haminstall (host name + disk picker + progress)
 build_adder_user hamsettings          # scene-file DE settings: wallpaper swatches (ctl wallpaper verb) + panel position/applet prefs (/etc/panel.conf)
