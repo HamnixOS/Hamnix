@@ -26,15 +26,19 @@
  *      c. SFSP->OpenVolume() to get the volume root EFI_FILE_PROTOCOL.
  *      d. root->Open(L"\\hamnix-kernel.elf", READ) to get the kernel
  *         ELF file handle.
- *      e. BootServices->AllocatePool(KERNEL_ELF_BUF_SIZE) for a scratch
- *         buffer big enough to hold the WHOLE kernel ELF (incl. the
- *         large self-hosted-installer kernel; see KERNEL_ELF_BUF_SIZE).
- *      f. kernel_file->Read(buffer) — pulls the entire ELF into memory.
- *      g. Verify "\x7fELF" magic + ELFCLASS32 (Hamnix kernel is
- *         elf32-i386 by design — every test's `qemu -kernel` argument
- *         depends on it).
+ *      e. kernel_file->Read() the ELF header + program-header table into
+ *         a small (16 KiB) buffer in this stub's .bss. DELIBERATELY no
+ *         whole-file scratch buffer: a multi-MiB AllocatePool buffer can
+ *         be placed by firmware INSIDE the kernel's own fixed-LOW load
+ *         region, where the segment copies then corrupt the in-flight
+ *         phdr walk / segment source (the intermittent OVMF #PF/#GP
+ *         ship-blocker this loader was rewritten to kill).
+ *      f. (folded into h) segments stream straight from the file to
+ *         their load addresses; nothing is staged whole in RAM.
+ *      g. Verify ELF magic + ELFCLASS64 (Hamnix kernel is a true
+ *         elf64-x86-64 higher-half image; see arch/x86/kernel/kernel.lds).
  *      h. Walk e_phnum program headers; for each PT_LOAD (p_type==1),
- *         memcpy p_filesz bytes from buffer+p_offset to physical
+ *         SetPosition(p_offset) + Read(p_filesz) DIRECTLY into physical
  *         address p_paddr, then memset (p_memsz - p_filesz) trailing
  *         bytes to zero (BSS within the segment).
  *      i. Scan the loaded image's first 8 KiB for the multiboot1 magic
@@ -172,17 +176,13 @@
      * MapKey staleness (firmware may allocate between GetMemoryMap
      * and ExitBootServices, invalidating MapKey — re-fetch and retry).
      *
-     * KERNEL_ELF_BUF_SIZE: AllocatePool capacity for the kernel ELF.
-     * EFI_FILE.Read clamps to this capacity (it returns the smaller of
-     * requested/remaining bytes), so a kernel ELF LARGER than this is
-     * silently TRUNCATED: the late PT_LOAD segments then copy garbage and
-     * the kernel faults the instant control jumps to it. The dominant
-     * size driver is the embedded initramfs blob (.byte-encoded cpio in
-     * .rodata, ~6x its raw size). A normal boot kernel is ~7 MB, but the
-     * SELF-HOSTED INSTALLER kernel embeds an in-RAM squashfs payload in
-     * its cpio and weighs ~37 MB. Reserve 96 MiB so the largest installer
-     * kernel loads whole with headroom (AllocatePool of 96 MiB is fine on
-     * OVMF + real HW; the stub's page tables identity-map [0,512 GiB)).
+     * ELF_HDR_BUF_SIZE: capacity of the small header/phdr buffer. The
+     * loader NO LONGER stages the whole ELF in RAM (that whole-file
+     * scratch buffer was the intermittent-#PF root cause — see STEP 4).
+     * It reads only the ELF header + phdr table here, then streams each
+     * PT_LOAD segment straight from the file to its load address, so the
+     * kernel ELF can grow arbitrarily large without any capacity ceiling
+     * or truncation risk (the self-hosted installer kernel is ~45 MB).
      *
      * HAMNIX_HANDOFF_MAGIC: "HAMX" little-endian, used as a sanity
      * check on the handoff table that arch/x86/boot/header.S plants
@@ -194,13 +194,14 @@
      */
     .equ EFI_MMAP_BUF_SIZE,         65536
     .equ EFI_EXIT_RETRY_MAX,        4
-    /* KERNEL_ELF_BUF_SIZE is now only a last-resort fallback used when
-     * EFI_FILE.GetInfo fails to report the kernel's real size; the
-     * primary path queries the actual file size and allocates exactly
-     * that (+1 guard page), so the buffer can never truncate the kernel
-     * ELF however large it grows (the embedded initramfs/squashfs is the
-     * size driver — a self-hosted installer kernel exceeds 120 MiB). */
-    .equ KERNEL_ELF_BUF_SIZE,       (96 * 1024 * 1024)
+    /* ELF_HDR_BUF_SIZE: capacity of the small buffer that holds ONLY the
+     * ELF header + program-header table (the loader streams segments
+     * directly to their load addresses, so no whole-file buffer exists).
+     * 16 KiB comfortably covers e_phoff (64) + e_phnum*e_phentsize for
+     * any sane kernel (the installer kernel has 7 × 56-byte phdrs = 392
+     * bytes at offset 64). The bounds guard in STEP 4h rejects any image
+     * whose phdr table would extend past what we read. */
+    .equ ELF_HDR_BUF_SIZE,          16384
     .equ EFI_FILE_INFO_BUF_SIZE,    512
     .equ HAMNIX_HANDOFF_MAGIC,      0x484D4158  /* "HAMX" */
     .equ MULTIBOOT1_MAGIC,          0x1BADB002
@@ -331,80 +332,47 @@ efi_main:
     testq   %rax, %rax
     jnz     .Lefi_elfload_fail
 
-    /* ----- 4d.5 File->GetInfo(EFI_FILE_INFO) to learn the real size --
+    /* ================================================================
+     * 4d.5 / 4e / 4f — STREAM the kernel ELF straight to its load
+     * addresses. NO whole-file scratch buffer.
      *
-     * EFI_FILE_PROTOCOL.GetInfo is at offset 64.
-     * Signature:
-     *   EFI_STATUS GetInfo(EFI_FILE_PROTOCOL *This,    // rcx
-     *                      EFI_GUID *InformationType,  // rdx
-     *                      UINTN *BufferSize,          // r8 (IN/OUT)
-     *                      VOID *Buffer);              // r9
-     * On success efi_file_info_buf+8 holds the 64-bit FileSize. On any
-     * error we fall back to the fixed KERNEL_ELF_BUF_SIZE allocation.
-     */
-    movq    $EFI_FILE_INFO_BUF_SIZE, efi_file_info_size(%rip)
+     * ROOT-CAUSE HISTORY (ship-blocker, found by OVMF visual QA):
+     *   The previous loader GetInfo'd the file size, AllocatePool'd a
+     *   multi-MiB scratch buffer, File->Read the WHOLE ELF into it, then
+     *   `rep movsb`-copied each PT_LOAD from buffer+p_offset to the
+     *   fixed-LOW p_paddr (0x100000+). Nothing constrained WHERE firmware
+     *   placed that scratch buffer. When OVMF's AllocatePool landed the
+     *   buffer INSIDE the kernel's own load region [0x100000, load_hi)
+     *   — which it does whenever free RAM outside that region is scarce,
+     *   or simply as its allocator layout varies boot-to-boot — the first
+     *   segment copy overwrote the buffer's still-in-flight program-header
+     *   table and/or the not-yet-copied segment source bytes. The phdr
+     *   walk then read a garbage p_paddr and `rep movsb`/`rep stosb`
+     *   wrote through a wild pointer, faulting (#PF CR2 near -1, or #GP)
+     *   right after the "kernel ELF read OK" marker. Intermittent because
+     *   it was gated purely on the firmware's chosen buffer address.
+     *   Reproduced deterministically under OVMF at -m 145/150 (buffer
+     *   forced into the load region → fault every boot); -m 140/160/1280
+     *   placed the buffer clear of the region → clean boot.
+     *
+     *   The FIX eliminates the scratch buffer's existence: we read ONLY
+     *   the ELF header + program-header table into a small fixed buffer
+     *   that lives in this stub's .bss (far above the load region, never
+     *   aliased by it), then read each PT_LOAD segment DIRECTLY from the
+     *   file into its p_paddr. There is no large buffer for firmware to
+     *   mis-place, so no overlap is possible regardless of RAM size or
+     *   allocator state. (This is also how well-behaved UEFI ELF loaders
+     *   stream segments — read-to-load-address, not read-then-copy.)
+     *
+     * ----- 4e'. Read the ELF header + phdr table into efi_hdr_buf -----
+     * The file position is 0 after Open, so the first Read starts at the
+     * ELF header. EFI_FILE_PROTOCOL.Read is at vtable offset 32:
+     *   EFI_STATUS Read(This=rcx, UINTN *Size=rdx [IN/OUT], Buffer=r8);
+     * efi_hdr_read_size is IN (buffer capacity) / OUT (bytes read). */
+    movq    $ELF_HDR_BUF_SIZE, efi_hdr_read_size(%rip)
     movq    efi_kernel_file(%rip), %rcx
-    leaq    file_info_guid(%rip), %rdx
-    leaq    efi_file_info_size(%rip), %r8
-    leaq    efi_file_info_buf(%rip), %r9
-    movq    efi_kernel_file(%rip), %rax
-    movq    64(%rax), %rax                  /* ->GetInfo */
-    subq    $0x20, %rsp
-    call    *%rax
-    addq    $0x20, %rsp
-    testq   %rax, %rax
-    jnz     .Lefi_getinfo_fallback
-
-    /* FileSize lives at offset 8 of EFI_FILE_INFO. Round up to a 4 KiB
-     * page and add one guard page so the ELF magic + phdr walk can never
-     * run off the tail of the allocation. */
-    movq    efi_file_info_buf+8(%rip), %rax
-    addq    $0x1fff, %rax
-    andq    $-0x1000, %rax
-    /* Floor at 1 MiB to guard against a bogus/zero reported size. */
-    cmpq    $0x100000, %rax
-    jae     .Lefi_size_ok
-    movq    $0x100000, %rax
-.Lefi_size_ok:
-    movq    %rax, efi_kernel_alloc_size(%rip)
-    jmp     .Lefi_have_size
-
-.Lefi_getinfo_fallback:
-    movq    $KERNEL_ELF_BUF_SIZE, efi_kernel_alloc_size(%rip)
-
-.Lefi_have_size:
-
-    /* ----- 4e. AllocatePool(EfiLoaderData, alloc_size, &Buffer) ------
-     *
-     * EFI_BOOT_SERVICES.AllocatePool is at offset 64.
-     * Signature:
-     *   EFI_STATUS AllocatePool(EFI_MEMORY_TYPE PoolType,  // rcx
-     *                           UINTN Size,                // rdx
-     *                           VOID **Buffer);            // r8
-     * EfiLoaderData = 2.
-     */
-    movq    $2, %rcx                        /* EfiLoaderData */
-    movq    efi_kernel_alloc_size(%rip), %rdx
-    leaq    efi_kernel_buf(%rip), %r8
-    movq    efi_boot_services(%rip), %rax
-    movq    64(%rax), %rax                  /* ->AllocatePool */
-    subq    $0x20, %rsp
-    call    *%rax
-    addq    $0x20, %rsp
-    testq   %rax, %rax
-    jnz     .Lefi_elfload_fail
-
-    /* ----- 4f. File->Read(File, &BufferSize, Buffer) ---------------
-     *
-     * EFI_FILE_PROTOCOL.Read is at offset 32.
-     * BufferSize is IN/OUT: we set it to our allocation capacity (>= the
-     * real file size), the call writes back the actual bytes read.
-     */
-    movq    efi_kernel_alloc_size(%rip), %rax
-    movq    %rax, efi_kernel_size(%rip)
-    movq    efi_kernel_file(%rip), %rcx
-    leaq    efi_kernel_size(%rip), %rdx
-    movq    efi_kernel_buf(%rip), %r8
+    leaq    efi_hdr_read_size(%rip), %rdx
+    leaq    efi_hdr_buf(%rip), %r8
     movq    efi_kernel_file(%rip), %rax
     movq    32(%rax), %rax                  /* ->Read */
     subq    $0x20, %rsp
@@ -416,8 +384,8 @@ efi_main:
     leaq    efi_msg_elfread(%rip), %rsi
     call    efi_serial_puts
 
-    /* ----- 4g. Verify ELF magic + ELFCLASS64 ------------------------ */
-    movq    efi_kernel_buf(%rip), %rax
+    /* ----- 4g. Verify ELF magic + ELFCLASS64 (from the header copy) -- */
+    leaq    efi_hdr_buf(%rip), %rax
     cmpb    $ELFMAG0, 0(%rax)
     jne     .Lefi_elf_bad
     cmpb    $ELFMAG1, 1(%rax)
@@ -429,42 +397,43 @@ efi_main:
     cmpb    $ELFCLASS64, EI_CLASS(%rax)
     jne     .Lefi_elf_bad
 
-    /* ----- 4h. Walk program headers, copy PT_LOAD segments ----------
+    /* ----- 4h. Walk program headers, STREAM each PT_LOAD to p_paddr ---
      *
-     * The Hamnix kernel is a true elf64-x86-64 higher-half image. For
-     * an ELF64:
-     *   e_phoff       at file offset 32 (uint64)
-     *   e_phentsize   at file offset 54 (uint16)
-     *   e_phnum       at file offset 56 (uint16)
-     *
-     * Each Phdr (Elf64_Phdr) is 56 bytes:
+     * Each Phdr (Elf64_Phdr, 56 bytes):
      *   off 0  p_type   (u32)
-     *   off 4  p_flags  (u32)
-     *   off 8  p_offset (u64)
-     *   off 16 p_vaddr  (u64)  <- HIGH (0xffffffff80...) for the kernel
-     *   off 24 p_paddr  (u64)  <- LOW physical load address
-     *   off 32 p_filesz (u64)
-     *   off 40 p_memsz  (u64)
+     *   off 8  p_offset (u64)  <- byte offset of the segment in the file
+     *   off 24 p_paddr  (u64)  <- LOW physical load address (LMA)
+     *   off 32 p_filesz (u64)  <- bytes present in the file
+     *   off 40 p_memsz  (u64)  <- bytes in memory (>= filesz; BSS tail)
      *
-     * We copy to p_paddr (the LOW physical address) — exactly the
-     * VMA/LMA split the higher-half linker script encodes. The 32-bit
-     * boot stub of a multiboot1 boot maps p_paddr at both the low
-     * identity address and the high half; on the UEFI path STEP 8
-     * below builds the same dual mapping.
-     *
-     * For each phdr with p_type == PT_LOAD:
-     *   memcpy(p_paddr, buffer + p_offset, p_filesz)
+     * For each PT_LOAD:
+     *   File->SetPosition(File, p_offset)          (vtable off 56)
+     *   File->Read(File, &p_filesz, p_paddr)       (vtable off 32)
      *   memset(p_paddr + p_filesz, 0, p_memsz - p_filesz)
-     */
-    movq    efi_kernel_buf(%rip), %rax
-    movq    E_PHOFF64(%rax), %r10           /* r10 = e_phoff (u64) */
-    movzwq  E_PHENTSIZE64(%rax), %r11       /* r11 = e_phentsize */
+     *
+     * The phdr walk state (r12=phnum, r13=phdr ptr, r14=index,
+     * r15=phentsize) is held ONLY in MS-x64 callee-saved registers so it
+     * survives the SetPosition/Read firmware calls made inside the loop.
+     * p_offset/p_paddr/p_filesz/p_memsz are re-read from the stable
+     * efi_hdr_buf copy each time they are needed. */
+    leaq    efi_hdr_buf(%rip), %rax
+    movq    E_PHOFF64(%rax), %r10           /* e_phoff (u64) */
+    movzwq  E_PHENTSIZE64(%rax), %r15       /* r15 = e_phentsize */
     movzwq  E_PHNUM64(%rax), %r12           /* r12 = e_phnum */
 
-    /* r13 = current phdr pointer = buffer + e_phoff. */
+    /* Bounds guard: the whole phdr table must lie within the bytes we
+     * actually read into efi_hdr_buf (e_phoff + e_phnum*e_phentsize <=
+     * bytes-read). Otherwise a phdr would be read from uninitialised
+     * .bss — treat as a malformed image rather than trust garbage. */
+    movq    %r12, %rcx
+    imulq   %r15, %rcx
+    addq    %r10, %rcx                      /* rcx = phdr table end offset */
+    cmpq    efi_hdr_read_size(%rip), %rcx
+    ja      .Lefi_elf_bad
+
+    /* r13 = current phdr pointer = efi_hdr_buf + e_phoff. */
     leaq    (%rax, %r10), %r13
-    /* r14 = phdr index. */
-    xorq    %r14, %r14
+    xorq    %r14, %r14                      /* r14 = phdr index */
 
 .Lphdr_loop:
     cmpq    %r12, %r14
@@ -475,28 +444,48 @@ efi_main:
     cmpl    $PT_LOAD, %eax
     jne     .Lphdr_skip
 
-    /* Compute source = buffer + p_offset. */
-    movq    efi_kernel_buf(%rip), %rsi
-    addq    P_OFFSET(%r13), %rsi
-    /* Destination = p_paddr (the LOW physical load address). */
+    /* File->SetPosition(File, p_offset) — seek to the segment. */
+    movq    efi_kernel_file(%rip), %rcx
+    movq    P_OFFSET(%r13), %rdx
+    movq    efi_kernel_file(%rip), %rax
+    movq    56(%rax), %rax                  /* ->SetPosition */
+    subq    $0x20, %rsp
+    call    *%rax
+    addq    $0x20, %rsp
+    testq   %rax, %rax
+    jnz     .Lefi_elfload_fail
+
+    /* File->Read(File, &size=p_filesz, Buffer=p_paddr) — read the
+     * segment's file bytes DIRECTLY to its physical load address. The
+     * IN/OUT size lives in efi_seg_read_size. */
+    movq    P_FILESZ(%r13), %rax
+    movq    %rax, efi_seg_read_size(%rip)
+    movq    efi_kernel_file(%rip), %rcx
+    leaq    efi_seg_read_size(%rip), %rdx
+    movq    P_PADDR(%r13), %r8
+    movq    efi_kernel_file(%rip), %rax
+    movq    32(%rax), %rax                  /* ->Read */
+    subq    $0x20, %rsp
+    call    *%rax
+    addq    $0x20, %rsp
+    testq   %rax, %rax
+    jnz     .Lefi_elfload_fail
+    /* Short-read guard: firmware must have delivered the full segment. */
+    movq    P_FILESZ(%r13), %rax
+    cmpq    %rax, efi_seg_read_size(%rip)
+    jne     .Lefi_elfload_fail
+
+    /* Trailing-BSS zero: [p_paddr + p_filesz, p_paddr + p_memsz). */
     movq    P_PADDR(%r13), %rdi
-    /* filesz: bytes to copy. */
-    movq    P_FILESZ(%r13), %rcx
-
-    /* memcpy %rcx bytes from %rsi to %rdi. */
-    cld
-    rep movsb                               /* rsi/rdi/rcx all auto-update */
-
-    /* Trailing-BSS zero: rdi now points just past the copied bytes.
-     * Zero (memsz - filesz) trailing bytes. */
-    movq    P_MEMSZ(%r13), %rax
-    subq    P_FILESZ(%r13), %rax            /* rax = trailing zero count */
-    movq    %rax, %rcx
+    addq    P_FILESZ(%r13), %rdi            /* rdi = first BSS byte */
+    movq    P_MEMSZ(%r13), %rcx
+    subq    P_FILESZ(%r13), %rcx            /* rcx = trailing zero count */
     xorl    %eax, %eax
+    cld
     rep stosb
 
 .Lphdr_skip:
-    addq    %r11, %r13                      /* next phdr (r11 = phentsize) */
+    addq    %r15, %r13                      /* next phdr (r15 = phentsize) */
     incq    %r14
     jmp     .Lphdr_loop
 
@@ -1358,15 +1347,6 @@ sfsp_guid:
     .short  0x11d2
     .byte   0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b
 
-    /* EFI_FILE_INFO_GUID:
-     *   09576e92-6d3f-11d2-8e39-00a0c969723b   (UEFI 2.10 §13.5) */
-    .align 8
-file_info_guid:
-    .long   0x09576e92
-    .short  0x6d3f
-    .short  0x11d2
-    .byte   0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b
-
     /* EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID:
      *   9042a9de-23dc-4a38-96fb-7aded080516a   (UEFI 2.10 §12.9) */
     .align 8
@@ -1420,12 +1400,11 @@ efi_sfsp:                   .quad 0
 efi_volume_root:            .quad 0
     .globl efi_kernel_file
 efi_kernel_file:            .quad 0
-    .globl efi_kernel_buf
-efi_kernel_buf:             .quad 0
-    .globl efi_kernel_size
-efi_kernel_size:            .quad 0
-efi_kernel_alloc_size:      .quad 0         /* AllocatePool capacity (real file size +1 page, or fallback) */
-efi_file_info_size:         .quad 0         /* GetInfo BufferSize (IN cap / OUT used) */
+    /* Direct-stream ELF loader scratch (see STEP 4 rewrite). Both are
+     * IN/OUT byte counts for File->Read; tiny, in .data, never aliased
+     * by the kernel's LOW load region. */
+efi_hdr_read_size:          .quad 0         /* header+phdr read: IN cap / OUT bytes */
+efi_seg_read_size:          .quad 0         /* per-segment read: IN filesz / OUT bytes */
     /* Address of _x86_start_after_loader pulled out of the kernel's
      * handoff table (planted by arch/x86/boot/header.S). Stored as a
      * uint32 because the kernel is elf32-i386 (VMAs < 4 GiB). */
@@ -1552,9 +1531,14 @@ efi_stub_stack_top:
 efi_mmap_buf:
     .skip EFI_MMAP_BUF_SIZE
 
+    /* ELF header + program-header table staging buffer. Lives in this
+     * stub's .bss (firmware-loaded image region, far above the kernel's
+     * fixed-LOW load region [0x100000, load_hi)), so a segment stream to
+     * a low p_paddr can never alias/overwrite the phdr table we walk. */
     .align 16
-efi_file_info_buf:
-    .skip EFI_FILE_INFO_BUF_SIZE
+    .globl efi_hdr_buf
+efi_hdr_buf:
+    .skip ELF_HDR_BUF_SIZE
 
     .align 4096
     .globl efi_pml4
