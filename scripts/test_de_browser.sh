@@ -223,23 +223,44 @@ else
     echo "[browser] WARN no screendump captured"
 fi
 
-# BROWSER-DISTINCTIVE PIXEL SIGNATURE.
-# A generic titlebar-blue count is worthless — EVERY DE window (terminal,
-# calculator, file-manager) has a #3a6ea5 title bar, so that gate passes even
-# with no browser on screen. Instead we look for colors that ONLY the
-# hambrowse demo page paints: link blue #1a4fd0 (26,79,208), heading dark
-# blue #14306e (20,48,110), and pre/code teal #0a6b5a (10,107,90). None of
-# these appear in the stock DE chrome. This is a supporting signal; the
-# authoritative render proof stays the serial "segs=N>0" line above.
+# ASSET-LOAD DIAGNOSTIC (#79 regression guard). The browser prints, BEFORE it
+# rebinds stdout off serial, whether every embedded TrueType face loaded and
+# the embedded demo PNG decoded. A device-only stack-overflow in the TTF glyph
+# decoder used to trample these assets nondeterministically, silently degrading
+# to blocky/blank text + an empty image box. Require the healthy line.
+ASSET=$(grep -ao '\[hambrowse\] assets: ttf_faces=[0-9]*/4 demo_img=[0-9]* images=[0-9]*[A-Z ]*' "$LOG" | tail -1)
+if [ -n "$ASSET" ]; then
+    echo "[browser] $ASSET"
+    if echo "$ASSET" | grep -q 'ttf_faces=4/4 demo_img=1'; then
+        echo "[browser] PASS all 4 TTF faces loaded + demo PNG decoded"
+    else
+        echo "[browser] FAIL embedded assets degraded ($ASSET)"; fail=1
+    fi
+    if echo "$ASSET" | grep -q 'DEGRADED'; then
+        echo "[browser] FAIL browser reported DEGRADED assets"; fail=1
+    fi
+else
+    echo "[browser] FAIL no '[hambrowse] assets:' diagnostic line in serial"; fail=1
+fi
+
+# PIXEL PROOF the render is REAL GRAPHICS, not a bitmap-font fallback / empty
+# image. Two independent signals a degraded frame cannot fake:
+#   (A) ANTI-ALIASED TEXT — intermediate-GRAY edge pixels (r==g==b, strictly
+#       between ink and paper) inside the browser content region. Black body
+#       text rendered by the TTF rasteriser paints a smooth grey ramp at every
+#       glyph edge; a 1-bit bitmap font (or a blank page) produces none.
+#   (B) DECODED DEMO IMAGE — the sample PNG's bright-green quadrant (40,200,60)
+#       is a solid block no DE chrome or text colour uses; its presence proves
+#       lib/png decoded + htmlpaint blitted the real bitmap. The browser sits
+#       top-left (geometry 50 40 880 600, first-commit maps-and-raises it), so
+#       the content region is a fixed screen box.
 PIX_PPM="$OUT_DIR/browser.ppm"
 if [ -s "$PIX_PPM" ]; then
     PIXOUT=$(python3 - "$PIX_PPM" <<'PYPIX'
 import sys
-path = sys.argv[1]
-data = open(path, "rb").read()
-# Parse the binary PPM (P6) header: magic, width, height, maxval.
+data = open(sys.argv[1], "rb").read()
 if not data.startswith(b"P6"):
-    print("NOHDR 0"); sys.exit(0)
+    print("NOHDR 0 0 0"); sys.exit(0)
 idx = 2; fields = []
 while len(fields) < 3 and idx < len(data):
     while idx < len(data) and data[idx:idx+1].isspace():
@@ -253,9 +274,12 @@ while len(fields) < 3 and idx < len(data):
         idx += 1
     fields.append(int(data[start:idx]))
 w, h, maxv = fields
-idx += 1  # single whitespace after maxval
+idx += 1
 pix = data[idx:]
-# distinctive target colors (r,g,b)
+def px(x, y):
+    o = (y * w + x) * 3
+    return pix[o], pix[o+1], pix[o+2]
+# distinctive demo-page colours (supporting signal, whole screen).
 targets = [(26, 79, 208), (20, 48, 110), (10, 107, 90)]
 TOL = 55
 hits = 0
@@ -265,22 +289,56 @@ while i < n:
     r = pix[i]; g = pix[i+1]; b = pix[i+2]
     for (tr, tg, tb) in targets:
         if abs(r-tr) <= TOL and abs(g-tg) <= TOL and abs(b-tb) <= TOL:
-            hits += 1
-            break
+            hits += 1; break
     i += 3
-print("OK %d" % hits)
+# (A) grey AA edge pixels inside the browser content box.
+gx0, gy0 = 195, 95
+gx1, gy1 = min(w, 905), min(h, 615)
+gray = 0
+y = gy0
+while y < gy1:
+    x = gx0
+    while x < gx1:
+        r, g, b = px(x, y)
+        if abs(r-g) <= 6 and abs(g-b) <= 6:
+            v = (r + g + b) // 3
+            if 30 <= v <= 225:
+                gray += 1
+        x += 1
+    y += 1
+# (B) decoded demo-image bright-green quadrant, whole screen.
+green = 0
+i = 0
+while i < n:
+    r = pix[i]; g = pix[i+1]; b = pix[i+2]
+    if abs(r-40) <= 35 and abs(g-200) <= 45 and abs(b-60) <= 40:
+        green += 1
+    i += 3
+print("OK %d %d %d" % (hits, gray, green))
 PYPIX
 )
-    PIX_HITS=$(echo "$PIXOUT" | awk '{print $2}')
-    PIX_HITS=${PIX_HITS:-0}
-    echo "[browser] browser-distinctive pixels (link-blue/heading/teal): $PIX_HITS"
-    # Only enforce when a window actually opened this run; if the frame was
-    # grabbed before the compositor blitted, the serial gate already fails.
+    PIX_HITS=$(echo "$PIXOUT" | awk '{print $2}'); PIX_HITS=${PIX_HITS:-0}
+    AA_GRAY=$(echo "$PIXOUT" | awk '{print $3}'); AA_GRAY=${AA_GRAY:-0}
+    IMG_GREEN=$(echo "$PIXOUT" | awk '{print $4}'); IMG_GREEN=${IMG_GREEN:-0}
+    echo "[browser] pixels: distinctive=$PIX_HITS  aa_gray=$AA_GRAY  img_green=$IMG_GREEN"
     if grep -aq '\[hambrowse\] opening scene window' "$LOG"; then
         if [ "$PIX_HITS" -ge 8 ]; then
             echo "[browser] PASS screendump shows hambrowse-distinctive pixels"
         else
             echo "[browser] FAIL screendump has no hambrowse-distinctive pixels (only generic chrome?)"; fail=1
+        fi
+        # AA text: a healthy render paints thousands of grey edge pixels; a
+        # bitmap-fallback or blank page produces at most a handful.
+        if [ "$AA_GRAY" -ge 800 ]; then
+            echo "[browser] PASS anti-aliased text present ($AA_GRAY grey edge pixels)"
+        else
+            echo "[browser] FAIL no anti-aliased text — bitmap fallback / blank page? (aa_gray=$AA_GRAY)"; fail=1
+        fi
+        # Decoded demo image: its bright-green quadrant covers ~1500+ px.
+        if [ "$IMG_GREEN" -ge 200 ]; then
+            echo "[browser] PASS decoded demo PNG blitted (green quadrant, $IMG_GREEN px)"
+        else
+            echo "[browser] FAIL demo image missing — empty <img> box? (img_green=$IMG_GREEN)"; fail=1
         fi
     fi
 else
