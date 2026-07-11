@@ -84,6 +84,26 @@ echo "[fuzz_adder_diff] regression result: $REG_OUT (expect 'ok 1844674284116408
 [ "$REG_OUT" = "ok 18446742841164082190 14" ] \
     || fail "codegen.ad miscompiled the regression fixture: $REG_OUT"
 
+# ---- Regression: FLOAT LITERALS (tests/fuzz/regress_float_literals.ad).
+#      Pins the self-hosted float-literal fixes: a float-literal DIVISION emits
+#      divsd (not integer div / the 0.0/0.0 #DE), and a fractional/exponent
+#      literal (0.5, 1.5e1) carries its exact value (not the truncated integer
+#      part). This was a fuzz gap — the fuzzer's by-construction oracle derives
+#      floats via cast[floatN](int), so it never emitted a bare float literal.
+echo "[fuzz_adder_diff] regression: regress_float_literals.ad through codegen.ad"
+REGF_OUT="$(python3 - <<'PY'
+import sys; sys.path.insert(0, "tests/fuzz")
+import ad_codegen_host as h
+from pathlib import Path
+wd = Path("build/fuzz_ad_codegen")
+r = h.run_through_codegen_ad("regressf", open("tests/fuzz/regress_float_literals.ad").read(), wd)
+print(f"{r.kind} {r.stdout} {r.exit}")
+PY
+)"
+echo "[fuzz_adder_diff] float regression result: $REGF_OUT (expect 'ok 6051507 179')"
+[ "$REGF_OUT" = "ok 6051507 179" ] \
+    || fail "codegen.ad miscompiled the float-literal regression fixture: $REGF_OUT"
+
 # ---- Seeded differential batch -----------------------------------------
 echo "[fuzz_adder_diff] differential: count=$FUZZ_COUNT seed=$FUZZ_SEED"
 python3 tests/fuzz/adder_fuzzer.py --ad-codegen \
