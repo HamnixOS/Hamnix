@@ -54,7 +54,7 @@ run_case() {
 }
 
 for c in arithmetic closures arrays_objects json strings controlflow fib \
-         templates arrows; do
+         templates arrows exceptions; do
     run_case "$c"
 done
 
