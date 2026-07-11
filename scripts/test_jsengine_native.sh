@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
 # scripts/test_jsengine_native.sh — native `js` JavaScript-engine boot gate.
 #
-# ============================ BLOCKED (do not wire into CI yet) ==============
-# This gate cannot PASS today, and the blocker is NOT in the JS engine. JS
-# numbers are IEEE-754 float64, so evaluating ANY script executes SSE. Hamnix
-# does not FXSAVE/XSAVE the FPU/SSE register file across context switches
-# (arch/x86/kernel/cpuregs_asm.S:110 — "SSE state already isn't preserved"),
-# and the native `js` engine is the FIRST native userspace consumer of float64,
-# so it is the first to expose that gap: xmm registers are silently corrupted
-# under preemption and float results come out wrong. Diagnosis (2026-07-10):
-# the native tool loads + runs (an early `JS-BOOT` marker printed) but a
-# 2.0*3.0+1.0 probe returned 1 instead of 7.
-#
-# The engine itself is FULLY proven QEMU-free by scripts/test_jsengine_host.sh
-# (the host Linux target has proper FPU support). This native gate goes live
-# UNCHANGED once the kernel gains per-task FPU/SSE context-switch save/restore
-# (fxsave/fxrstor or xsave/xrstor in the switch path). See docs/jsengine.md
-# "Native blocker". Until then it will report INCONCLUSIVE.
+# ============================ LIVE ==========================================
+# This gate now PASSES. JS numbers are IEEE-754 float64, so evaluating ANY
+# script executes SSE. Two gaps that used to make the native `js` tool corrupt
+# float results are now closed:
+#   (1) the kernel FXSAVE/XSAVE's the FPU/SSE/AVX register file across every
+#       context switch (per-task save/restore), so xmm survives preemption;
+#   (2) the self-hosted (default ADDER_CC=adder) compiler emits float literals
+#       as exact-bits .rodata data-consts and float-types call/array-index
+#       results, so jsengine's arithmetic compiles to divsd/mulsd (not integer
+#       div — the old `0.0/0.0` #DE) and fractional/exponent literals no longer
+#       truncate.
+# The engine itself is ALSO proven QEMU-free by scripts/test_jsengine_host.sh.
 # ============================================================================
 #
 # Boots Hamnix with hamsh as /init and runs the native `js` tool (user/js.ad,
