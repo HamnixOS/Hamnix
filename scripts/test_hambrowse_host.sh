@@ -135,6 +135,45 @@ assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Sub sub heading'  "h4 -> dark-blue bold
 assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Smaller heading'  "h5 -> dark-blue bold heading"
 assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Smallest heading' "h6 -> dark-blue bold heading"
 
+# ====================================================================
+# TABLE fixture — two-pass column layout (measure widest cell per column,
+# then place), <th> bold, per-cell colour + background.
+# ====================================================================
+FIX3="tests/fixtures/hambrowse_table.html"
+DUMP3="$OUT/dump_table.txt"
+echo "[hb-host] running host harness on $FIX3 ..."
+if ! "$BIN" "$FIX3" 600 >"$DUMP3" 2>&1; then
+    echo "[hb-host] FAIL: table harness exited non-zero"; cat "$DUMP3"; exit 1
+fi
+cat "$DUMP3"
+
+assert_grep3() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMP3"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# Column x-positions are computed from the WIDEST cell per column:
+#   col0 "Blueberry"(9) -> next col at 8+(9+2)*8 = 96
+#   col1 "Colour"(6)    -> next col at 96+(6+2)*8 = 160
+# Header + every body row must share these exact column x-positions.
+assert_grep3 '^SEG 2 8 #101010 b1 .*Fruit\|'   "th 'Fruit' bold at col0 x=8"
+assert_grep3 '^SEG 2 96 #101010 b1 .*Colour\|' "th 'Colour' bold at col1 x=96"
+assert_grep3 '^SEG 2 160 #101010 b1 .*Qty\|'   "th 'Qty' bold at col2 x=160"
+assert_grep3 '^SEG 3 8 #101010 b0 .*Apple\|'   "td 'Apple' plain at col0 x=8"
+assert_grep3 '^SEG 3 96 #101010 b0 .*red\|'    "td 'red' at col1 x=96 (aligned to header)"
+assert_grep3 '^SEG 3 160 #101010 b0 .*12\|'    "td '12' at col2 x=160 (aligned to header)"
+assert_grep3 '^SEG 4 96 #101010 b0 .*blue\|'   "wide row 'Blueberry' keeps col1 at x=96"
+# Per-cell colour + background survive the column placement.
+assert_grep3 '^SEG 6 8 #101010 b0 u0 l-1 bg#c0c0c0 .*Lime\|' "td bgcolor=silver fills the cell (#c0c0c0)"
+assert_grep3 '^SEG 6 96 #008000 .*green\|'                   "font color=green inside a cell -> #008000"
+# The FLOW reconstruction shows the columns aligned as a grid.
+assert_grep3 '^FLOW  Fruit      Colour  Qty$'  "FLOW renders the header row as aligned columns"
+assert_grep3 '^FLOW  Blueberry  blue    340$'  "FLOW renders the wide row aligned to the same columns"
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
     exit 0
