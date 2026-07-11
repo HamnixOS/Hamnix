@@ -795,6 +795,61 @@ else
     echo "[hb-host] PASS wide window text is capped at the readable measure (no edge-to-edge)"
 fi
 
+# ====================================================================
+# HTML CHARACTER ENTITIES — named (&amp; &lt; &mdash; &copy; …), numeric
+# decimal (&#8212;) and hex (&#x2014;), decoded to their UTF-8 bytes during
+# TEXT and ATTRIBUTE-VALUE parsing. A malformed/unknown entity (&notanentity;
+# or a bare '&') passes through UNCHANGED (the '&' is not eaten).
+# ====================================================================
+FIXENT="tests/fixtures/hambrowse_entities.html"
+DUMPENT="$OUT/dump_entities.txt"
+echo "[hb-host] running host harness on $FIXENT ..."
+if ! "$BIN" "$FIXENT" 600 >"$DUMPENT" 2>&1; then
+    echo "[hb-host] FAIL: entities harness exited non-zero"; cat "$DUMPENT"; exit 1
+fi
+cat "$DUMPENT"
+
+assert_grepENT() {
+    local pat="$1" msg="$2"
+    if grep -Fq -- "$pat" "$DUMPENT"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+assert_grepENT_re() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMPENT"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# Named: &mdash; -> em dash (U+2014, UTF-8 e2 80 94), rendered in the flow.
+assert_grepENT 'FLOW  DASH A — B' "&mdash; decodes to an em dash (—)"
+# &amp; -> '&'  (the decoded '&' must NOT re-start another entity).
+assert_grepENT 'FLOW  AMP fish & chips' "&amp; decodes to a literal ampersand (&)"
+# &lt; / &gt; -> '<' '>'; the decoded '<' is text, NOT a tag start.
+assert_grepENT 'FLOW  ANGLE <tag> end' "&lt;/&gt; decode to < > as literal text (not markup)"
+# Numeric decimal &#8212; and hex &#x2014; / &#X2014; -> em dash.
+assert_grepENT 'FLOW  DEC — here'   "&#8212; (decimal) decodes to an em dash"
+assert_grepENT 'FLOW  HEX — here'   "&#x2014; (hex) decodes to an em dash"
+assert_grepENT 'FLOW  HEXUP — up'   "&#X2014; (uppercase-X hex) decodes to an em dash"
+# &nbsp; -> a normal space (word stays joined across the entity).
+assert_grepENT 'FLOW  NBSP one two' "&nbsp; decodes to a space"
+# Malformed/unknown entities pass through UNCHANGED (the '&' is not eaten).
+assert_grepENT 'FLOW  BOGUS &notanentity; kept' "unknown &notanentity; passes through unchanged"
+assert_grepENT 'FLOW  BARE fish & chips raw'     "a bare '&' (not an entity) passes through unchanged"
+# Latin-1 / symbol named entities decode to their UTF-8 form.
+assert_grepENT 'FLOW  SYMS ©2026 ® ™' "&copy;/&reg;/&trade; decode to © ® ™"
+assert_grepENT 'FLOW  QUOTES “hi” ‘x’ end' "curly-quote entities decode (&ldquo;&rdquo;&lsquo;&rsquo;)"
+assert_grepENT 'FLOW  MATH 3 × 4 ÷ 2 ± 1 deg °' "&times;/&divide;/&plusmn;/&deg; decode to × ÷ ± °"
+assert_grepENT 'FLOW  MISC – … · € ½' "&ndash;/&hellip;/&middot;/&euro;/&frac12; decode"
+# ATTRIBUTE-VALUE decode: an input value="a&amp;b" renders the decoded '&' in
+# its monospace box (proves entities are decoded in attribute values too).
+assert_grepENT_re '^FLOW  \[a&b_+\]$' "entities decode inside attribute values (input value a&amp;b -> a&b)"
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
     exit 0
