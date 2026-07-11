@@ -182,6 +182,58 @@ assert_grep3 '^FLOW  Fruit      Colour  Qty$'  "FLOW renders the header row as a
 assert_grep3 '^FLOW  Blueberry  blue    340$'  "FLOW renders the wide row aligned to the same columns"
 
 # ====================================================================
+# LIST fixture — <ul>/<ol>/<li> markers, ordered numbering, <ol start=>,
+# nesting, and hanging indent (marker in the gutter, item text + wrapped
+# continuation lines aligned one level in).
+#   level 1 text indent = CONTENT_X(8) + 1*LIST_STEP(32) = 40
+#   level 2 text indent = 8 + 2*32                       = 72
+# The marker hangs at (text_indent - LIST_STEP): level1 -> x=8, level2 -> x=40.
+# ====================================================================
+FIXL="tests/fixtures/hambrowse_lists.html"
+DUMPL="$OUT/dump_lists.txt"
+echo "[hb-host] running host harness on $FIXL ..."
+if ! "$BIN" "$FIXL" 600 >"$DUMPL" 2>&1; then
+    echo "[hb-host] FAIL: lists harness exited non-zero"; cat "$DUMPL"; exit 1
+fi
+cat "$DUMPL"
+
+assert_grepL() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMPL"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# <ul> item: '-' bullet in the gutter at x=8, item text hanging at x=40.
+assert_grepL '^SEG 2 8 #101010 b0 u0 l-1 bg- \|-\|$'      "ul bullet marker '-' hangs at x=8"
+assert_grepL '^SEG 2 40 #101010 b0 u0 l-1 bg- \|Apples\|' "ul item text hangs at x=40 (one level in)"
+# A long item wraps and the continuation line aligns under the TEXT (x=40),
+# NOT back under the marker — this is the hanging indent.
+assert_grepL '^SEG 3 40 .*certainly wrap across the\|$'    "long ul item wraps at the text column"
+assert_grepL '^SEG 4 40 .*available line width so we can check hanging indentation\|' \
+    "wrapped continuation line aligns at x=40 (hanging indent, not x=8)"
+# <ol> items number 1./2./3. in the gutter, text hanging at x=40.
+assert_grepL '^SEG 9 8 #101010 b0 u0 l-1 bg- \|1\.\|'   "ol first item numbered '1.' at x=8"
+assert_grepL '^SEG 9 40 .*Preheat\|'                     "ol item text hangs at x=40"
+assert_grepL '^SEG 10 8 .*\|2\.\|'                        "ol second item numbered '2.'"
+assert_grepL '^SEG 11 8 .*\|3\.\|'                        "ol third item numbered '3.'"
+# Nested <ol> inside a <ul> item: outer '-' at x=8, inner '1.'/'2.' one level
+# deeper (marker at x=40, text at x=72), and the inner counter restarts at 1.
+assert_grepL '^SEG 15 8 .*\|-\|'      "nested: outer ul bullet at x=8"
+assert_grepL '^SEG 15 40 .*Fruit\|'   "nested: outer ul item text at x=40"
+assert_grepL '^SEG 16 40 .*\|1\.\|'   "nested: inner ol marker '1.' hangs at x=40"
+assert_grepL '^SEG 16 72 .*Apple\|'   "nested: inner ol item text hangs at x=72"
+assert_grepL '^SEG 17 40 .*\|2\.\|'   "nested: inner ol counter continues to '2.'"
+# <ol start="10"> seeds the counter: items number 10./11.
+assert_grepL '^SEG [0-9]+ 8 .*\|10\.\|'  "ol start=10 -> first item numbered '10.'"
+assert_grepL '^SEG [0-9]+ 8 .*\|11\.\|'  "ol start=10 -> second item numbered '11.'"
+# FLOW reconstruction shows the marker + hanging text.
+assert_grepL '^FLOW  -   Apples$'    "FLOW shows ul bullet + item"
+assert_grepL '^FLOW  1\.  Preheat$'  "FLOW shows ol number + item"
+
+# ====================================================================
 # CSS-CASCADE fixture — <style> rules with element/.class/#id/descendant
 # selectors + specificity, font-weight, text-align (baked into seg_x),
 # display:none, rgb()/named colours, and inline style="" overriding the sheet.
