@@ -72,6 +72,7 @@ build_adder_user wc                   # M16.57: line/word/byte count
 build_adder_user grep                 # M16.57: substring line filter
 build_adder_user seq                  # M16.64: 1..N or M..N output
 build_adder_user bc                   # native infix arithmetic calculator (integer POSIX subset)
+build_adder_user js                   # native ES5/basic-ES6 JavaScript engine (lib/jsengine.ad); FILE.js or built-in demo
 build_adder_user sha256sum            # SHA-256 digest of files/stdin (+ -c check mode); integrity verification
 build_adder_user fmt                   # reflow text to a goal width (-w N); paragraph-aware greedy fill
 build_adder_user uname                # M16.64: system identification
