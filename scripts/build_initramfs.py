@@ -3387,7 +3387,13 @@ def _embed_modules_dep(here: Path) -> bytes:
 
 
 def build_archive() -> bytes:
-    blob = b""
+    # bytearray, NOT bytes: the archive is assembled by ~hundreds of
+    # `blob += cpio_entry(...)` appends. On an immutable `bytes` each `+=`
+    # copies the whole accumulator (O(n^2)); once a large entry lands (e.g. the
+    # ~500 MiB installer squashfs) every subsequent append recopies it, so
+    # Stage 6 of the full-mirror image spends minutes memcpy-ing. A bytearray
+    # extends in place (amortized O(1) per append) for byte-identical output.
+    blob = bytearray()
     here = Path(__file__).resolve().parent.parent
 
     # HAMNIX_CPIO_EMPTY=1 — emit a cpio that contains NO files, only the
@@ -4989,7 +4995,7 @@ def build_archive() -> bytes:
             name, data = entry
             blob += cpio_entry(name, data)
     blob += cpio_trailer()
-    return blob
+    return bytes(blob)
 
 
 # Above this archive size, emit the cpio via `.incbin` of a raw sidecar file

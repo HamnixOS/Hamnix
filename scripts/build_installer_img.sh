@@ -316,7 +316,19 @@ MEDIA_ESP_MB=$(( (INSTALLER_KERNEL_BYTES + (16 * 1024 * 1024)) / (1024 * 1024) )
 [ "$MEDIA_ESP_MB" -ge 32 ] || MEDIA_ESP_MB=32
 MEDIA_ESP="$STUB_TMP/media_esp.img"
 dd if=/dev/zero of="$MEDIA_ESP" bs=1M count="$MEDIA_ESP_MB" status=none
-mformat -i "$MEDIA_ESP" -h 64 -s 32 -c 32 -t $(( MEDIA_ESP_MB * 64 )) -v HAMNIXINST ::
+# mformat's -t (cylinders) is a 16-bit field: it REJECTS any value > 65535
+# ("Bad number N for -t"). The nominal cylinder count is MEDIA_ESP_MB*64 (64
+# heads * 32 sectors = 2048 sectors = 1 MiB per cylinder), which overflows once
+# the installer kernel exceeds ~1 GiB — e.g. a full-mirror live image carrying
+# the Mesa/LLVM software-GL stack embeds a ~1.5 GiB kernel -> 95872 > 65535 and
+# Stage 7 dies. mformat clamps the on-disk geometry to the ACTUAL file size
+# regardless (verified: a 63 MiB image passed -t 4032 still yields 63
+# cylinders), so capping -t at 65535 lets it size the FS from the file and
+# produce a valid FAT32 ESP for large kernels while leaving every small ESP
+# byte-for-byte unchanged.
+MEDIA_ESP_TRACKS=$(( MEDIA_ESP_MB * 64 ))
+[ "$MEDIA_ESP_TRACKS" -le 65535 ] || MEDIA_ESP_TRACKS=65535
+mformat -i "$MEDIA_ESP" -h 64 -s 32 -c 32 -t "$MEDIA_ESP_TRACKS" -v HAMNIXINST ::
 # Preallocate \LOG.TXT FIRST on the install-medium ESP too (same rationale
 # as the NVMe ESP above): the installer medium IS the USB stick the box
 # boots on the serial-less NUC, so scripts/test_esp_boot_log_usb.sh boots
