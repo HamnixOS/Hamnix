@@ -36,6 +36,7 @@
 # Deterministic: the output is a pure function of the input files.
 
 import os
+import re
 import sys
 
 PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -91,6 +92,14 @@ HOST_BUFFER_OVERRIDES = {
         ("tok_val_start: Array[65536, uint32]", "tok_val_start: Array[4194304, uint32]"),
         ("tok_val_len: Array[65536, uint32]", "tok_val_len: Array[4194304, uint32]"),
         ("tok_num_val: Array[65536, uint64]", "tok_num_val: Array[4194304, uint64]"),
+        # tok_is_float is a PARALLEL token array (emit_tok writes it for EVERY
+        # token). It MUST scale with the other tok_* arrays: with MAX_TOKENS
+        # raised to 4194304 but this array left at 65536, emit_tok's
+        # `tok_is_float[tok_count] = 0` writes OUT OF BOUNDS for any unit with
+        # >65536 tokens (all the large user apps + the compiler self-compile
+        # units), silently corrupting adjacent BSS and derailing name lookups
+        # deep in codegen. Keep this pair lockstep with the tok_* group above.
+        ("tok_is_float: Array[65536, uint32]", "tok_is_float: Array[4194304, uint32]"),
         ("strbuf: Array[524288, uint8]", "strbuf: Array[16777216, uint8]"),
     ],
     "parser.ad": [
@@ -245,6 +254,29 @@ def apply_host_buffer_overrides(mod, text):
                 "update HOST_BUFFER_OVERRIDES." % (mod, old, cnt)
             )
         text = text.replace(anchored_old, anchored_new)
+
+    # Guard against a PARALLEL array being left un-scaled. The token and node
+    # tables are parallel arrays indexed by the SAME cursor (tok_count /
+    # nd_count) up to the scaled MAX_TOKENS / MAX_NODES. If one member of the
+    # group keeps the on-device 65536 size while MAX_* is raised to 4194304,
+    # the lexer/parser writes it OUT OF BOUNDS for any unit with >65536
+    # tokens/nodes (all the large userland apps + the compiler self-compile
+    # units), silently corrupting adjacent .bss. This exact bug (tok_is_float
+    # missing from the list) forced ~13 units to the seed. Fail loudly if any
+    # `tok_*`/`nd_*` array is still 65536-sized after the overrides ran.
+    prefixes = {"lexer.ad": "tok_", "parser.ad": "nd_"}.get(mod)
+    if prefixes is not None:
+        pat = re.compile(
+            r"\n(" + re.escape(prefixes) + r"[A-Za-z0-9_]*): Array\[65536,")
+        leftover = pat.findall(text)
+        if leftover:
+            raise SystemExit(
+                "[concat] ERROR: host build left parallel %s array(s) un-scaled "
+                "at 65536 while MAX was raised: %s — every parallel token/node "
+                "array MUST be in HOST_BUFFER_OVERRIDES['%s'] or the lexer/parser "
+                "writes out of bounds on large units."
+                % (mod, ", ".join(leftover), mod)
+            )
     return text
 
 
