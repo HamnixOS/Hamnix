@@ -296,17 +296,22 @@ assert_grepL '^SEG 3 40 .*certainly wrap across the\|$'    "long ul item wraps a
 assert_grepL '^SEG 4 40 .*available line width so we can check hanging indentation\|' \
     "wrapped continuation line aligns at x=40 (hanging indent, not x=8)"
 # <ol> items number 1./2./3. in the gutter, text hanging at x=40.
-assert_grepL '^SEG 9 8 #101010 b0 u0 l-1 bg- \|1\.\|'   "ol first item numbered '1.' at x=8"
-assert_grepL '^SEG 9 40 .*Preheat\|'                     "ol item text hangs at x=40"
-assert_grepL '^SEG 10 8 .*\|2\.\|'                        "ol second item numbered '2.'"
-assert_grepL '^SEG 11 8 .*\|3\.\|'                        "ol third item numbered '3.'"
+# NOTE: the mid-document <h3> headings each get one blank "section top-margin"
+# line above them (UA default heading spacing), which shifts the rows BELOW the
+# second/third/fourth heading down by 1/2/3 vs the pre-spacing layout. The x
+# columns (marker gutter x=8/40, text x=40/72) are unchanged; only the row
+# indices moved, so these assertions track the new rows.
+assert_grepL '^SEG 10 8 #101010 b0 u0 l-1 bg- \|1\.\|'  "ol first item numbered '1.' at x=8"
+assert_grepL '^SEG 10 40 .*Preheat\|'                    "ol item text hangs at x=40"
+assert_grepL '^SEG 11 8 .*\|2\.\|'                        "ol second item numbered '2.'"
+assert_grepL '^SEG 12 8 .*\|3\.\|'                        "ol third item numbered '3.'"
 # Nested <ol> inside a <ul> item: outer '-' at x=8, inner '1.'/'2.' one level
 # deeper (marker at x=40, text at x=72), and the inner counter restarts at 1.
-assert_grepL '^SEG 15 8 .*\|-\|'      "nested: outer ul bullet at x=8"
-assert_grepL '^SEG 15 40 .*Fruit\|'   "nested: outer ul item text at x=40"
-assert_grepL '^SEG 16 40 .*\|1\.\|'   "nested: inner ol marker '1.' hangs at x=40"
-assert_grepL '^SEG 16 72 .*Apple\|'   "nested: inner ol item text hangs at x=72"
-assert_grepL '^SEG 17 40 .*\|2\.\|'   "nested: inner ol counter continues to '2.'"
+assert_grepL '^SEG 17 8 .*\|-\|'      "nested: outer ul bullet at x=8"
+assert_grepL '^SEG 17 40 .*Fruit\|'   "nested: outer ul item text at x=40"
+assert_grepL '^SEG 18 40 .*\|1\.\|'   "nested: inner ol marker '1.' hangs at x=40"
+assert_grepL '^SEG 18 72 .*Apple\|'   "nested: inner ol item text hangs at x=72"
+assert_grepL '^SEG 19 40 .*\|2\.\|'   "nested: inner ol counter continues to '2.'"
 # <ol start="10"> seeds the counter: items number 10./11.
 assert_grepL '^SEG [0-9]+ 8 .*\|10\.\|'  "ol start=10 -> first item numbered '10.'"
 assert_grepL '^SEG [0-9]+ 8 .*\|11\.\|'  "ol start=10 -> second item numbered '11.'"
@@ -719,6 +724,76 @@ awk '/^SUBMIT/{c=1} c' "$DUMPF5" > "$OUT/forms_after_submit2.txt"
 assert_grepF '^NAV \?term=dogs&lang=en$' \
     "form without preventDefault serializes visible+hidden fields (submit button excluded)" \
     "$OUT/forms_after_submit2.txt"
+
+# ====================================================================
+# DEFAULT UA STYLESHEET (visual-polish) rung — a PLAIN page (no author CSS)
+# should already look intentional: a readable centred measure on wide windows,
+# section spacing above headings, a light code-block/inline-code background,
+# and muted blockquote text. tests/fixtures/hambrowse_article.html is a plain
+# article that exercises all of these.
+# ====================================================================
+FIXA="tests/fixtures/hambrowse_article.html"
+DUMPA="$OUT/dump_article.txt"
+echo "[hb-host] running host harness on $FIXA (600 px) ..."
+if ! "$BIN" "$FIXA" 600 >"$DUMPA" 2>&1; then
+    echo "[hb-host] FAIL: article harness exited non-zero"; cat "$DUMPA"; exit 1
+fi
+cat "$DUMPA"
+
+assert_grepA() {
+    local pat="$1" msg="$2" file="${3:-$DUMPA}"
+    if grep -Eq -- "$pat" "$file"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# The leading <h1> sits at row 0 (no spurious top-margin at the document start)
+# and still lays its heading rule.
+assert_grepA '^SEG 0 8 #14306e b1 u0 l-1 bg- \|The Hamnix Project\|' \
+    "leading h1 at row 0 (heading top-margin suppressed at document start)"
+assert_grepA '^RULE row 0 type 1$' "leading h1 emits a heading rule"
+# A mid-document heading gets ONE blank section-spacing line above it: the h2
+# "Design goals" lands at row 12 with row 11 empty (the top-margin line).
+assert_grepA '^SEG 12 8 #14306e b1 u0 l-1 bg- \|Design goals\|' \
+    "mid-doc h2 gets a section top-margin (lands at row 12, not row 11)"
+if grep -Eq '^SEG 11 ' "$DUMPA"; then
+    echo "[hb-host] FAIL heading top-margin row 11 is not blank"; fail=1
+else
+    echo "[hb-host] PASS heading top-margin inserts a blank line (row 11 empty)"
+fi
+# <pre> renders teal monospace on the light code background (#eef0f3) across
+# every code line.
+assert_grepA '^SEG 37 8 #0a6b5a b0 u0 l-1 bg#eef0f3 \|fn main\(\) \{\|' \
+    "pre line -> teal text on the light code background (#eef0f3)"
+assert_grepA '^SEG 39 8 #0a6b5a b0 u0 l-1 bg#eef0f3 \|\}\|' \
+    "every pre line carries the code background"
+# inline <code> also gets the teal tint + code background (mid-paragraph).
+assert_grepA '^SEG [0-9]+ [0-9]+ #0a6b5a b0 u0 l-1 bg#eef0f3 \| code\|' \
+    "inline <code> -> teal text on the light code background"
+# <blockquote> text renders in a muted grey (#5a5a5a), still indented to x=32.
+assert_grepA '^SEG 29 32 #5a5a5a b0 u0 l-1 bg- \|Anything that can go wrong' \
+    "blockquote text -> muted grey (#5a5a5a), indented to x=32"
+
+# ---- readable-measure default: on a WIDE window the body column is capped at
+# MEASURE_MAX (584 px) and CENTRED, so text does not span edge-to-edge. At 900 px
+# the centring gutter is (900-16-584)/2 = 150, so body text starts at x=158.
+DUMPA9="$OUT/dump_article_wide.txt"
+echo "[hb-host] running host harness on $FIXA (900 px, centred measure) ..."
+if ! "$BIN" "$FIXA" 900 >"$DUMPA9" 2>&1; then
+    echo "[hb-host] FAIL: wide-article harness exited non-zero"; cat "$DUMPA9"; exit 1
+fi
+cat "$DUMPA9"
+assert_grepA '^SEG 2 158 #101010 b0 u0 l-1 bg- \|Hamnix is a native operating system' \
+    "wide window: body column centred at the 584px measure (x=158 at 900px)" "$DUMPA9"
+# the centred column is exactly the measure wide: the wrapped line ends near
+# x=158+584=742, NOT at the 892px window edge (proves the cap engaged).
+if grep -Eq '^SEG 2 (7[5-9][0-9]|8[0-9][0-9]) ' "$DUMPA9"; then
+    echo "[hb-host] FAIL wide window text overflowed the readable measure"; fail=1
+else
+    echo "[hb-host] PASS wide window text is capped at the readable measure (no edge-to-edge)"
+fi
 
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
