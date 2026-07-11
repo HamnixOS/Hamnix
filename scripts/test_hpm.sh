@@ -74,6 +74,23 @@ PKG_SHA=$(sha256sum "$REPO/main/packages/hpm-hello-1.0.tar.gz" \
             | awk '{print $1}')
 PKG_SIZE=$(stat -c%s "$REPO/main/packages/hpm-hello-1.0.tar.gz")
 
+# A second package that DEPENDS on hpm-hello — gives `hpm why hpm-hello`
+# a real reverse-dependency edge to report, and `hpm files` a package to
+# enumerate.
+PKG_DEP_BUILD="$FIXDIR/build/hpm-hello-dep-1.0"
+mkdir -p "$PKG_DEP_BUILD/files/var/lib"
+cat > "$PKG_DEP_BUILD/PKGINFO" <<'EOF'
+name: hpm-hello-dep
+version: 1.0
+arch: any
+description: hpm test package that depends on hpm-hello
+target: #hamnix-system
+EOF
+printf 'dep-mark\n' > "$PKG_DEP_BUILD/files/var/lib/hpm-hello-dep-mark"
+(cd "$FIXDIR/build" && tar czf "$REPO/main/packages/hpm-hello-dep-1.0.tar.gz" hpm-hello-dep-1.0)
+PKG_DEP_SHA=$(sha256sum "$REPO/main/packages/hpm-hello-dep-1.0.tar.gz" | awk '{print $1}')
+PKG_DEP_SIZE=$(stat -c%s "$REPO/main/packages/hpm-hello-dep-1.0.tar.gz")
+
 cat > "$REPO/main/index.json" <<EOF
 {
   "schema": 1,
@@ -93,6 +110,18 @@ cat > "$REPO/main/index.json" <<EOF
       "size": $PKG_SIZE,
       "description": "hpm test package",
       "depends": [],
+      "target": "#hamnix-system"
+    },
+    {
+      "name": "hpm-hello-dep",
+      "version": "1.0",
+      "arch": "any",
+      "channel": "main",
+      "url": "packages/hpm-hello-dep-1.0.tar.gz",
+      "sha256": "$PKG_DEP_SHA",
+      "size": $PKG_DEP_SIZE,
+      "description": "hpm test package depending on hpm-hello",
+      "depends": ["hpm-hello"],
       "target": "#hamnix-system"
     }
   ]
@@ -201,6 +230,16 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
        "echo HPM_STAGE_LISTED"                                             2 \
        "cat /var/lib/hpm-hello-greet"                                          2 \
        "echo HPM_STAGE_CAT_DONE"                                           2 \
+       "hpm '--repo=file:///test-hpm-repo/' install hpm-hello-dep"         6 \
+       "echo HPM_STAGE_DEP_INSTALLED"                                      2 \
+       "hpm files hpm-hello-dep"                                           3 \
+       "echo HPM_STAGE_FILES_DONE"                                         2 \
+       "hpm why hpm-hello"                                                 3 \
+       "echo HPM_STAGE_WHY_DONE"                                           2 \
+       "hpm '--repo=file:///test-hpm-repo/' upgrade"                       5 \
+       "echo HPM_STAGE_UPGRADE_DONE"                                       2 \
+       "hpm remove hpm-hello-dep"                                          4 \
+       "echo HPM_STAGE_DEP_REMOVED"                                        2 \
        "hpm remove hpm-hello"                                              4 \
        "echo HPM_STAGE_REMOVED"                                            2 \
        "hpm list"                                                          2 \
@@ -284,8 +323,54 @@ else
     fail=1
 fi
 
+# 6b. dep install pulled hpm-hello-dep (hpm-hello already present).
+dep_block=$(sed -n '/HPM_STAGE_CAT_DONE/,/HPM_STAGE_DEP_INSTALLED/p' "$LOG")
+if echo "$dep_block" | grep -q "hpm: installed hpm-hello-dep@1.0"; then
+    echo "[test_hpm] OK: hpm-hello-dep installed (dep on hpm-hello satisfied)"
+else
+    echo "[test_hpm] MISS: hpm-hello-dep did not install"
+    fail=1
+fi
+
+# 6c. `hpm files <pkg>` lists the package's installed files.
+files_block=$(sed -n '/HPM_STAGE_DEP_INSTALLED/,/HPM_STAGE_FILES_DONE/p' "$LOG")
+if echo "$files_block" | grep -q "hpm-hello-dep-mark"; then
+    echo "[test_hpm] OK: files listed the installed file"
+else
+    echo "[test_hpm] MISS: files did not list hpm-hello-dep-mark"
+    fail=1
+fi
+
+# 6d. `hpm why hpm-hello` reports the reverse-dependency edge.
+why_block=$(sed -n '/HPM_STAGE_FILES_DONE/,/HPM_STAGE_WHY_DONE/p' "$LOG")
+if echo "$why_block" | grep -q "hpm-hello-dep depends on hpm-hello"; then
+    echo "[test_hpm] OK: why reported the reverse-dependency edge"
+else
+    echo "[test_hpm] MISS: why did not report hpm-hello-dep -> hpm-hello"
+    fail=1
+fi
+
+# 6e. `hpm upgrade` is a working alias for `update` (world upgrade).
+upgrade_block=$(sed -n '/HPM_STAGE_WHY_DONE/,/HPM_STAGE_UPGRADE_DONE/p' "$LOG")
+if echo "$upgrade_block" | grep -q "hpm: update done"; then
+    echo "[test_hpm] OK: upgrade alias drove the world upgrade"
+else
+    echo "[test_hpm] MISS: upgrade alias did not run cmd_update"
+    fail=1
+fi
+
+# 6f. remove the dep before the hpm-hello removal so the empty-DB check
+#     downstream still holds.
+dep_rm_block=$(sed -n '/HPM_STAGE_UPGRADE_DONE/,/HPM_STAGE_DEP_REMOVED/p' "$LOG")
+if echo "$dep_rm_block" | grep -q "hpm: removed hpm-hello-dep"; then
+    echo "[test_hpm] OK: hpm-hello-dep removed"
+else
+    echo "[test_hpm] MISS: hpm-hello-dep removal not reported"
+    fail=1
+fi
+
 # 7. remove deleted the file.
-remove_block=$(sed -n '/HPM_STAGE_CAT_DONE/,/HPM_STAGE_REMOVED/p' "$LOG")
+remove_block=$(sed -n '/HPM_STAGE_DEP_REMOVED/,/HPM_STAGE_REMOVED/p' "$LOG")
 if echo "$remove_block" | grep -q "hpm: removed hpm-hello"; then
     echo "[test_hpm] OK: remove reported success"
 else
