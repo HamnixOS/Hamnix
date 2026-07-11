@@ -137,6 +137,35 @@ def _say(msg: str) -> None:
     print(f"[build_packages] {msg}", flush=True)
 
 
+# --- Index signing (trust root) --------------------------------------
+# hpm treats index.json as the root of trust (it records every
+# package's sha256). To stop a MITM / compromised mirror serving a
+# malicious index with matching hashes, we emit a DETACHED Ed25519
+# signature index.json.sig that hpm verifies against etc/hpm/trusted.pub
+# before trusting any hash inside. Signing needs the repo SECRET key,
+# which is held out of band (never committed) and passed via the
+# HPM_REPO_SECKEY env var (path to a 32-byte hex seed). When it is
+# unset — the common local/dev case, exactly like building an apt repo
+# without the archive key — we skip signing and print a note; hpm will
+# then require `refresh --allow-unsigned` for that repo.
+def _sign_index(index_path: Path) -> None:
+    seckey_path = os.environ.get("HPM_REPO_SECKEY")
+    sig_path = index_path.with_name(index_path.name + ".sig")
+    if sig_path.exists():
+        sig_path.unlink()
+    if not seckey_path:
+        _say(f"NOT signing {index_path} (HPM_REPO_SECKEY unset) — "
+             f"hpm will need `refresh --allow-unsigned` for this repo")
+        return
+    sys.path.insert(0, str(HERE / "scripts"))
+    import hpm_sign
+    seed_hex = Path(seckey_path).read_text()
+    sig = hpm_sign.sign_bytes(index_path.read_bytes(), seed_hex)
+    sig_path.write_text(sig + "\n")
+    _say(f"signed {index_path} -> {sig_path.name} "
+         f"(Ed25519, pub {hpm_sign.pub_of(seed_hex)[:16]}…)")
+
+
 def _stage_dir(staging: Path) -> Path:
     """Create a clean staging dir and return its path."""
     if staging.exists():
@@ -1231,6 +1260,9 @@ def main() -> int:
                   PACKAGES_OUT / "non-free-firmware" / "index.json"):
         if stale.exists():
             stale.unlink()
+        stale_sig = stale.with_name(stale.name + ".sig")
+        if stale_sig.exists():
+            stale_sig.unlink()
 
     entries: list[dict] = []
 
@@ -1274,6 +1306,7 @@ def main() -> int:
                    ensure_ascii=False) + "\n", encoding="utf-8")
     _say(f"wrote {main_dir / 'index.json'} "
          f"({len(entries)} package entries)")
+    _sign_index(main_dir / "index.json")
 
     # Empty channel indexes. Each opt-in channel has a stub index so
     # `hpm refresh` returns `0 packages` cleanly when subscribed but
@@ -1299,6 +1332,7 @@ def main() -> int:
                    ensure_ascii=False) + "\n", encoding="utf-8")
         _say(f"wrote {PACKAGES_OUT / ch_name / 'index.json'} "
              f"(0 package entries — empty channel)")
+        _sign_index(PACKAGES_OUT / ch_name / "index.json")
 
     return 0
 
