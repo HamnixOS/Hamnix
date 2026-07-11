@@ -71,6 +71,7 @@ build_adder_user head                 # M16.57: first N lines
 build_adder_user wc                   # M16.57: line/word/byte count
 build_adder_user grep                 # M16.57: substring line filter
 build_adder_user seq                  # M16.64: 1..N or M..N output
+build_adder_user bc                   # native infix arithmetic calculator (integer POSIX subset)
 build_adder_user uname                # M16.64: system identification
 build_adder_user true                 # M16.64: exit 0
 build_adder_user false                # M16.64: exit 1
