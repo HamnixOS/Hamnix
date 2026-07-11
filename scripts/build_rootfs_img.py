@@ -688,6 +688,39 @@ def _plant_distro_provenance(distro: Path) -> None:
         encoding="ascii")
 
 
+def _plant_linux_demo_app(distro: Path) -> None:
+    """Plant a demonstrable freedesktop .desktop in the distro tree.
+
+    The DE panel (user/hampanelscene.ad) READ-binds this distro tree at
+    /n/linux and scans /n/linux/usr/share/applications/*.desktop into the
+    Applications menu's "Linux" section (launched inside `enter linux`).
+    A default debootstrap minbase ships NO .desktop files, so without this
+    the section would be empty and the scan/bind mechanism undemonstrable on
+    a stock live image. This plants ONE real, full-freedesktop entry — a CLI
+    process viewer run via /bin/busybox top (present on every distro build,
+    even busybox-only) — so the "Linux" section is always populated and the
+    end-to-end discover+launch path is exercised. It is ADDITIVE: a real
+    debootstrap tree's own /usr/share/applications entries appear alongside
+    it. Terminal=true marks it as a CLI app (see lib/desktopentry.ad).
+    """
+    apps = distro / "usr" / "share" / "applications"
+    apps.mkdir(parents=True, exist_ok=True)
+    (apps / "hamnix-linux-demo.desktop").write_text(
+        "[Desktop Entry]\n"
+        "Version=1.0\n"
+        "Type=Application\n"
+        "Name=Linux Process Viewer\n"
+        "Name[de]=Linux-Prozessanzeige\n"
+        "GenericName=Process Viewer\n"
+        "Comment=A Debian-namespace CLI app surfaced in the Hamnix DE menu\n"
+        "Exec=/bin/busybox top\n"
+        "Terminal=true\n"
+        "Icon=utilities-system-monitor\n"
+        "Categories=System;Monitor;\n"
+        "Keywords=process;top;monitor;\n",
+        encoding="ascii")
+
+
 def _stage_weston_closure(distro: Path, minbase: Path) -> tuple[int, int]:
     """Bundle weston-terminal's GL-free closure into the distro tree.
 
@@ -935,6 +968,14 @@ def _stage_distro(distro: Path, live: bool = False) -> None:
               f"(busybox-only fallback — real closure absent/trimmed)",
               flush=True)
     _plant_distro_provenance(distro)
+    # Plant a demonstrable freedesktop .desktop so the DE menu's "Linux"
+    # section (scanned from /n/linux/usr/share/applications by
+    # hampanelscene) is populated on EVERY build, even a busybox-only one
+    # with no debootstrap tree.
+    _plant_linux_demo_app(distro)
+    print("[build_rootfs_img] planted demo Linux .desktop "
+          "(usr/share/applications/hamnix-linux-demo.desktop) for the DE "
+          "menu's Linux section", flush=True)
     # Bundle the Linux-namespace Wayland client (weston-terminal + its
     # GL-free closure) so the DEFAULT (busybox-minimal) live image ships a
     # first-class graphical Linux-ns app — the DE Applications menu's

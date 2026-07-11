@@ -73,6 +73,14 @@ assert_grep '^PARSE noexec ok=0 ' \
 # Keys outside [Desktop Entry] ignored.
 assert_grep '^PARSE scoped ok=1 name=Scoped prog=/bin/hamterm' \
     "keys outside [Desktop Entry] ignored"
+# REAL Debian: full freedesktop Firefox .desktop — extra keys tolerated,
+# C-locale Name (not Name[de]) chosen, %u field code stripped, Network ->
+# Internet, [Desktop Action] group boundary respected, Terminal=false.
+assert_grep '^PARSE firefox ok=1 name=Firefox prog=/usr/bin/firefox cat=Internet nodisplay=0 terminal=0' \
+    "full freedesktop Firefox entry parses (localized keys + Actions tolerated)"
+# Terminal=true Debian CLI app parses and surfaces the terminal flag.
+assert_grep '^PARSE cli ok=1 name=htop prog=htop cat=System nodisplay=0 terminal=1' \
+    "Terminal=true CLI entry parses; terminal flag surfaced"
 # Suffix helper.
 assert_grep '^SUFFIX yes=1 no=0' \
     ".desktop suffix detector works"

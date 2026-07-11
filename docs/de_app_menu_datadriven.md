@@ -15,9 +15,10 @@ staged into every ship vehicle:
 - the ext4 rootfs image (`scripts/build_rootfs_img.py`)
 - the `hamnix-desktop-config` package (`scripts/build_packages.py`)
 
-(`/usr/share/applications/` — the freedesktop standard location — is
-Debian-namespace territory today. The parser is a freedesktop subset so a
-later change can also scan it for installed Linux apps.)
+Secondary directory: **`/n/linux/usr/share/applications/`** — the
+freedesktop standard location inside the **Debian/Linux namespace**. The
+scene panel also scans this and surfaces the installed Linux apps in a
+distinct **"Linux"** menu section (see below).
 
 ## File format
 
@@ -62,14 +63,66 @@ The cascading v2 menu (`hamappmenu`) renders one submenu per section; the
 flat scene panel (`hampanelscene`) renders a single list sorted by
 `(section, Name)` so apps cluster by section.
 
+## Linux-namespace apps (the "Linux" section)
+
+Installed Debian/Linux apps drop their `.desktop` files at the freedesktop
+standard `/usr/share/applications/` **inside the Linux namespace**. The
+scene panel exposes them without leaving Plan 9 shape:
+
+1. **Read-bind of `#distro` at `/n/linux`.** `/etc/rc.d/rc.5` sets up the
+   panel's namespace with `bind '#distro' /n/linux` — the SAME `#distro`
+   file-server primitive `enter linux { bind '#distro' / }` uses, but bound
+   under the conventional `/n/` foreign-namespace prefix. This is a
+   per-process namespace BIND (Plan 9 shape), not a global Unix mount; the
+   panel only ever reads it. The Debian rootfs is then readable at
+   `/n/linux/...` (e.g. `/n/linux/usr/share/applications`, `/n/linux/bin`).
+   *(Readonly note: `#distro` is exposed for READ; the panel never writes
+   it. A general kernel-enforced MRDONLY mount flag does not exist yet — on
+   read-only-backed media (the cpio/squashfs dev-boot distro root) the
+   backing store refuses writes; a writable ext4-backed `#distro` does not.
+   Hardening the bind to reject writes regardless of backing is a
+   follow-up.)*
+
+2. **Scan → "Linux" section.** `hampanelscene._load_apps()` scans
+   `/n/linux/usr/share/applications/*.desktop` with the SAME tolerant
+   `lib/desktopentry.ad` parser, forcing every entry into the distinct
+   `DE_CAT_LINUX` category (code 6, sorts LAST → its own section). Full
+   freedesktop files are tolerated: extra keys (`Version`, `GenericName`,
+   `Keywords`, `MimeType`, `StartupWMClass`, …), localized `Name[xx]`/
+   `Comment[xx]` keys (the C-locale `Name` wins), `Terminal=`, and a
+   trailing `[Desktop Action …]` group are all handled. Each entry's menu
+   label carries a light ` (linux)` namespace tag (informative, not a
+   capability warning).
+
+3. **Launch inside `enter linux`.** Selecting a Linux row routes through
+   `_launch_linux()`, which spawns `/bin/hamsh /etc/rc.de-wayland <Exec>`
+   — the exact launcher that already renders weston-terminal / Xwayland /
+   Qt clients as real windows on the native Wayland server. hamsh stamps
+   `HAMNIX_DE_PROG=<Exec>`; the recipe captures the `linux` ns template,
+   drops privilege, sets the Wayland env, and runs
+   `enter linux { $HAMNIX_DE_PROG }`. Launch is DETACHED (the panel never
+   `wait4`s). GUI Linux apps render through the Wayland passthrough; only
+   Firefox/Chromium-class browsers are parked (their SW-WebRender thread
+   needs a GL/EGL stack). CLI (`Terminal=true`) apps run headless.
+
+A default debootstrap minbase ships no `.desktop` files, so
+`scripts/build_rootfs_img.py` plants one demonstrable entry
+(`usr/share/applications/hamnix-linux-demo.desktop`, a `busybox top`
+process viewer) into the distro tree so the "Linux" section is always
+populated and the discover→bind→launch path is exercised on a stock image.
+
 ## Code map
 
 - **`lib/desktopentry.ad`** — the pure, extern-free parser (one file's
   contents → parsed fields + category classification). Links into both
   the native panel and the `x86_64-linux` host test target.
 - **`user/hampanelscene.ad`** — the LIVE runlevel-5 scene panel. Scans
-  the dir at startup (`_load_apps`), builds the flat dropdown, launches
-  the parsed `Exec`. Falls back to a built-in set if the dir is empty.
+  BOTH `/etc/hamde/apps` (native) and `/n/linux/usr/share/applications`
+  (Linux ns, forced into the `DE_CAT_LINUX` section) at startup via the
+  shared `_scan_apps_dir` helper (`_load_apps`), builds the flat dropdown,
+  and launches the parsed `Exec` — native apps directly, Linux apps via
+  `_launch_linux` → `enter linux`. Falls back to a built-in native set if
+  the native dir is empty; the Linux section is additive.
 - **`user/hamappmenu.ad`** — the v2 cascading menu. Scans the dir
   (`_seed_catalogue` → `_dd_scan`), grouping apps into category flyouts,
   then appends the Run/Lock/Log Out session verbs. Legacy-table fallback.

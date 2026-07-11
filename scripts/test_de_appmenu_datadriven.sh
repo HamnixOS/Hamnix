@@ -105,6 +105,39 @@ else
     done
 fi
 
+# --- 3b. Linux-namespace section: bind + scan + launch-in-ns wiring ---
+# The scene panel surfaces installed Debian/Linux apps in a distinct "Linux"
+# menu section via a readonly-intent bind of #distro at /n/linux, a scan of
+# /n/linux/usr/share/applications, and a launch that enters the linux ns.
+PANEL="user/hampanelscene.ad"
+if grep -q "bind '#distro' /n/linux" etc/rc.d/rc.5; then
+    passed "rc.5 read-binds #distro at /n/linux for the panel ns"
+else
+    failed "rc.5 does not bind #distro at /n/linux (panel can't see Linux apps)"
+fi
+if grep -q '/n/linux/usr/share/applications' "$PANEL"; then
+    passed "panel scans /n/linux/usr/share/applications (Linux catalogue)"
+else
+    failed "panel does not scan the Linux .desktop catalogue"
+fi
+if grep -q 'DE_CAT_LINUX' "$PANEL" && grep -q 'DE_CAT_LINUX' "$PARSER"; then
+    passed "distinct DE_CAT_LINUX menu section defined + used"
+else
+    failed "DE_CAT_LINUX section not wired (parser + panel)"
+fi
+if grep -q 'rc.de-wayland' "$PANEL"; then
+    passed "panel launches Linux apps via the enter-linux (rc.de-wayland) path"
+else
+    failed "panel does not route Linux launches into the linux namespace"
+fi
+# The demo Linux .desktop is planted so the section is demonstrable on a
+# stock (no-debootstrap) image.
+if grep -q 'hamnix-linux-demo.desktop' scripts/build_rootfs_img.py; then
+    passed "build_rootfs_img plants a demo Linux .desktop (section demonstrable)"
+else
+    failed "no demo Linux .desktop planted — 'Linux' section undemonstrable"
+fi
+
 # --- 4. Catalogue dir is staged into every ship vehicle --------------
 if grep -q 'etc/hamde/apps' scripts/build_packages.py; then
     passed "hamnix-desktop-config package ships etc/hamde/apps"
