@@ -182,6 +182,38 @@ assert_grep3 '^FLOW  Fruit      Colour  Qty$'  "FLOW renders the header row as a
 assert_grep3 '^FLOW  Blueberry  blue    340$'  "FLOW renders the wide row aligned to the same columns"
 
 # ====================================================================
+# BLOCK-MARGIN fixture — CSS margin-left/padding-left shift a <p>/<div>'s
+# content column (not just decorate it). Body margin = CONTENT_X = 8.
+#   margin-left:32px            -> x = 8 + 32       = 40
+#   margin-left:16 + padding:16 -> x = 8 + 16 + 16  = 40
+#   outer div margin-left:24px, inner <p> none -> inherits 8 + 24 = 32
+# and the indent POPS back to 8 once the blocks close.
+# ====================================================================
+FIXM="tests/fixtures/hambrowse_margin.html"
+DUMPM="$OUT/dump_margin.txt"
+echo "[hb-host] running host harness on $FIXM ..."
+if ! "$BIN" "$FIXM" 600 >"$DUMPM" 2>&1; then
+    echo "[hb-host] FAIL: margin harness exited non-zero"; cat "$DUMPM"; exit 1
+fi
+cat "$DUMPM"
+
+assert_grepM() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMPM"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+assert_grepM '^SEG 0 8 .*Flush left paragraph'          "no-margin p flows at body margin x=8"
+assert_grepM '^SEG 2 40 .*Indented block shifted'       "div margin-left:32px shifts content to x=40"
+assert_grepM '^SEG 4 40 .*Margin plus padding'          "margin-left:16 + padding-left:16 -> x=40"
+assert_grepM '^SEG 6 32 .*Nested paragraph inherits'    "nested p inherits outer div indent (x=32)"
+assert_grepM '^SEG 7 32 .*own\.'                         "wrapped line of the nested block stays at x=32"
+assert_grepM '^SEG 10 8 .*Back flush at the body margin' "indent pops back to x=8 after blocks close"
+
+# ====================================================================
 # COLSPAN fixture — <thead>/<tbody> wrappers (transparent) + colspan cells.
 # Columns are sized by the single-span cells only:
 #   col0 "Region"(6) -> x=8,  next 8+(6+2)*8   = 72
