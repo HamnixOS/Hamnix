@@ -1,0 +1,803 @@
+# lib/jpeg.ad — a pure-Adder, integer-only BASELINE JPEG decoder.
+#
+# Decodes a baseline (sequential DCT, Huffman) JFIF/JPEG byte buffer into a flat
+# 8-bit RGBA pixel array, mirroring lib/png.ad's shape: the caller slurps the
+# file bytes and hands them here; the decoded RGBA lives in this module's BSS
+# and is read back via jpeg_w/jpeg_h / jpeg_rgba_ptr().
+#
+# Implements, from scratch and with NO extern/syscall/FLOAT (fixed-point only):
+#   1. the marker walk  — SOI / APPn / DQT / SOF0 / DHT / DRI / SOS / EOI;
+#   2. Huffman entropy  — canonical JPEG (Annex C/F) MINCODE/MAXCODE/VALPTR;
+#   3. dequant + de-zigzag + an integer separable 8x8 inverse DCT (a fixed-point
+#      cosine-matrix IDCT, SCALE = 4096) — no float, dodging the native
+#      float-division hazard;
+#   4. chroma upsampling (4:4:4, 4:2:2, 4:2:0 and general Hi/Vi) by nearest
+#      sample, then an integer YCbCr -> RGB.
+#
+# Baseline sequential DCT (SOF0) and extended-sequential Huffman (SOF1) decode.
+# Progressive (SOF2), lossless (SOF3) and arithmetic coding (SOF9..) are OUT of
+# scope: they are detected and rejected (jpeg_decode returns a negative error),
+# and the caller then draws a broken-image placeholder — it never crashes.
+#
+# PURE: no I/O, extern-free, integer-only — compiles for the Linux host AND the
+# native target from the same source.
+
+# ---- capacities (BSS) ----------------------------------------------
+JPEG_MAX_DIM: uint64 = 512          # max width or height accepted
+JPEG_OUT_CAP: uint64 = 1048576      # RGBA output: 512*512*4
+JPLANE_CAP:   uint64 = 262144       # one component sample plane: <=512*512
+
+jpeg_out: Array[1048576, uint8]     # final RGBA, row-major, 4 bytes/px
+jp_plane0: Array[262144, uint8]     # component 0 sample plane (padded to MCUs)
+jp_plane1: Array[262144, uint8]     # component 1
+jp_plane2: Array[262144, uint8]     # component 2
+
+jpeg_w:  int32 = 0
+jpeg_h:  int32 = 0
+jpeg_ok: int32 = 0
+
+# ---- input + parse cursor ------------------------------------------
+jin:     Ptr[uint8]
+jin_len: uint64 = 0
+
+# ---- quant tables (natural order) ----------------------------------
+jqt:      Array[256, uint16]        # 4 tables * 64
+jqt_ok:   Array[4, int32]
+
+# ---- Huffman tables: 8 = class(0=DC,1=AC)*4 + id -------------------
+# per table: maxcode[1..16] (-1 sentinel), mincode[1..16], valptr[1..16],
+# huffval[0..255]. Stored flat: tbl*17 + len, and tbl*256 + i.
+jh_max:  Array[136, int32]          # 8*17
+jh_min:  Array[136, int32]
+jh_ptr:  Array[136, int32]
+jh_val:  Array[2048, uint8]         # 8*256
+jh_ok:   Array[8, int32]
+
+# ---- frame (SOF) ---------------------------------------------------
+jncomp:  int32 = 0
+jc_id:   Array[4, int32]
+jc_h:    Array[4, int32]            # horizontal sampling factor
+jc_v:    Array[4, int32]            # vertical sampling factor
+jc_qt:   Array[4, int32]            # quant table selector
+jc_dc:   Array[4, int32]            # DC huffman table selector (scan)
+jc_ac:   Array[4, int32]            # AC huffman table selector (scan)
+jc_pw:   Array[4, int32]            # plane width  (padded)
+jc_ph:   Array[4, int32]            # plane height (padded)
+jhmax:   int32 = 0
+jvmax:   int32 = 0
+jmcux:   int32 = 0
+jmcuy:   int32 = 0
+jri:     int32 = 0                  # restart interval (MCUs), 0 = none
+
+# ---- entropy bit reader --------------------------------------------
+jepos:   uint64 = 0                 # next entropy byte index
+jebuf:   uint32 = 0                 # current byte
+jecnt:   int32 = 0                  # bits left in jebuf
+jeof:    int32 = 0                  # hit a marker / end of data
+
+# ---- IDCT + block scratch ------------------------------------------
+JCOS:    Array[64, int32]           # fixed-point cosine matrix, SCALE = 4096
+JZZ:     Array[64, uint8]           # zigzag -> natural index
+jblock:  Array[64, int32]           # dequantised coefficients (natural order)
+jtmp:    Array[64, int64]           # IDCT row-pass intermediate
+jsamp:   Array[64, int32]           # 8x8 spatial samples (0..255)
+jpred:   Array[4, int32]            # per-component DC predictor
+jtbl_ready: int32 = 0
+
+
+def _jpeg_init_tables():
+    if jtbl_ready != 0:
+        return
+    # zigzag order: JZZ[k] = natural index of the k-th zig-zag coefficient.
+    JZZ[0]=0
+    JZZ[1]=1
+    JZZ[2]=8
+    JZZ[3]=16
+    JZZ[4]=9
+    JZZ[5]=2
+    JZZ[6]=3
+    JZZ[7]=10
+    JZZ[8]=17
+    JZZ[9]=24
+    JZZ[10]=32
+    JZZ[11]=25
+    JZZ[12]=18
+    JZZ[13]=11
+    JZZ[14]=4
+    JZZ[15]=5
+    JZZ[16]=12
+    JZZ[17]=19
+    JZZ[18]=26
+    JZZ[19]=33
+    JZZ[20]=40
+    JZZ[21]=48
+    JZZ[22]=41
+    JZZ[23]=34
+    JZZ[24]=27
+    JZZ[25]=20
+    JZZ[26]=13
+    JZZ[27]=6
+    JZZ[28]=7
+    JZZ[29]=14
+    JZZ[30]=21
+    JZZ[31]=28
+    JZZ[32]=35
+    JZZ[33]=42
+    JZZ[34]=49
+    JZZ[35]=56
+    JZZ[36]=57
+    JZZ[37]=50
+    JZZ[38]=43
+    JZZ[39]=36
+    JZZ[40]=29
+    JZZ[41]=22
+    JZZ[42]=15
+    JZZ[43]=23
+    JZZ[44]=30
+    JZZ[45]=37
+    JZZ[46]=44
+    JZZ[47]=51
+    JZZ[48]=58
+    JZZ[49]=59
+    JZZ[50]=52
+    JZZ[51]=45
+    JZZ[52]=38
+    JZZ[53]=31
+    JZZ[54]=39
+    JZZ[55]=46
+    JZZ[56]=53
+    JZZ[57]=60
+    JZZ[58]=61
+    JZZ[59]=54
+    JZZ[60]=47
+    JZZ[61]=55
+    JZZ[62]=62
+    JZZ[63]=63
+    # fixed-point 1D IDCT matrix: JCOS[u*8+x] = round(0.5*C(u)*
+    # cos((2x+1)*u*pi/16) * 4096), C(0)=1/sqrt2, C(u>0)=1.
+    JCOS[0]=1448
+    JCOS[1]=1448
+    JCOS[2]=1448
+    JCOS[3]=1448
+    JCOS[4]=1448
+    JCOS[5]=1448
+    JCOS[6]=1448
+    JCOS[7]=1448
+    JCOS[8]=2009
+    JCOS[9]=1703
+    JCOS[10]=1138
+    JCOS[11]=400
+    JCOS[12]=-400
+    JCOS[13]=-1138
+    JCOS[14]=-1703
+    JCOS[15]=-2009
+    JCOS[16]=1892
+    JCOS[17]=784
+    JCOS[18]=-784
+    JCOS[19]=-1892
+    JCOS[20]=-1892
+    JCOS[21]=-784
+    JCOS[22]=784
+    JCOS[23]=1892
+    JCOS[24]=1703
+    JCOS[25]=-400
+    JCOS[26]=-2009
+    JCOS[27]=-1138
+    JCOS[28]=1138
+    JCOS[29]=2009
+    JCOS[30]=400
+    JCOS[31]=-1703
+    JCOS[32]=1448
+    JCOS[33]=-1448
+    JCOS[34]=-1448
+    JCOS[35]=1448
+    JCOS[36]=1448
+    JCOS[37]=-1448
+    JCOS[38]=-1448
+    JCOS[39]=1448
+    JCOS[40]=1138
+    JCOS[41]=-2009
+    JCOS[42]=400
+    JCOS[43]=1703
+    JCOS[44]=-1703
+    JCOS[45]=-400
+    JCOS[46]=2009
+    JCOS[47]=-1138
+    JCOS[48]=784
+    JCOS[49]=-1892
+    JCOS[50]=1892
+    JCOS[51]=-784
+    JCOS[52]=-784
+    JCOS[53]=1892
+    JCOS[54]=-1892
+    JCOS[55]=784
+    JCOS[56]=400
+    JCOS[57]=-1138
+    JCOS[58]=1703
+    JCOS[59]=-2009
+    JCOS[60]=2009
+    JCOS[61]=-1703
+    JCOS[62]=1138
+    JCOS[63]=-400
+    jtbl_ready = 1
+
+
+# ---- big-endian 16-bit reader --------------------------------------
+def _jbe16(o: uint64) -> uint64:
+    return (cast[uint64](jin[o]) << 8) | cast[uint64](jin[o + 1])
+
+
+# ---- entropy bit reader --------------------------------------------
+# Fetch the next entropy byte, transparently un-stuffing 0xFF 0x00 -> 0xFF.
+# Returns -1 (and does NOT advance) at a real marker or end of data, so the
+# restart / EOI logic can inspect it.
+def _jfill_byte() -> int32:
+    if jepos >= jin_len:
+        return -1
+    b: uint32 = cast[uint32](jin[jepos])
+    if b != 255:
+        jepos = jepos + 1
+        return cast[int32](b)
+    # b == 0xFF: peek the following byte
+    nb: uint32 = 256
+    if jepos + 1 < jin_len:
+        nb = cast[uint32](jin[jepos + 1])
+    if nb == 0:
+        jepos = jepos + 2                # stuffed byte -> a literal 0xFF
+        return 255
+    return -1                            # a real marker: leave cursor on 0xFF
+
+
+# One MSB-first entropy bit (0/1). Sets jeof at a marker / end of data.
+def _jbit() -> int32:
+    if jecnt == 0:
+        nb: int32 = _jfill_byte()
+        if nb < 0:
+            jeof = 1
+            return 0
+        jebuf = cast[uint32](nb)
+        jecnt = 8
+    jecnt = jecnt - 1
+    return cast[int32]((jebuf >> cast[uint32](jecnt)) & 1)
+
+
+# Receive `n` (1..16) bits MSB-first as an unsigned value.
+def _jreceive(n: int32) -> int32:
+    v: int32 = 0
+    i: int32 = 0
+    while i < n:
+        b: int32 = _jbit()
+        v = v << 1
+        v = v | b
+        i = i + 1
+    return v
+
+
+# Sign-extend an n-bit magnitude `v` per JPEG (F.2.2.1): values with the top bit
+# clear are negative.
+def _jextend(v: int32, n: int32) -> int32:
+    if n == 0:
+        return 0
+    half: int32 = 1 << cast[uint32](n - 1)
+    if v < half:
+        return v - (1 << cast[uint32](n)) + 1
+    return v
+
+
+# Decode one Huffman-coded symbol from table `tbl` (0..7). Negative on error.
+def _jhuff(tbl: int32) -> int32:
+    base: uint64 = cast[uint64](tbl) * 17
+    vbase: uint64 = cast[uint64](tbl) * 256
+    code: int32 = 0
+    l: int32 = 1
+    while l <= 16:
+        # NB: keep the shift and the _jbit() call in SEPARATE statements — the
+        # Adder backend miscompiles `(code << 1) | _jbit()` in one expression.
+        b: int32 = _jbit()
+        code = code << 1
+        code = code | b
+        if jeof != 0:
+            return -1
+        idx: uint64 = base + cast[uint64](l)
+        mx: int32 = jh_max[idx]
+        if mx >= 0 and code <= mx:
+            mn: int32 = jh_min[idx]
+            p: int32 = jh_ptr[idx]
+            return cast[int32](jh_val[vbase + cast[uint64](p + (code - mn))])
+        l = l + 1
+    return -1
+
+
+# ---- integer separable 8x8 inverse DCT -----------------------------
+# jblock[0..63] holds dequantised coefficients in NATURAL order (index=row*8+col,
+# row=vertical freq, col=horizontal freq). Fills jsamp[0..63] with clamped 0..255
+# spatial samples (index=y*8+x). SCALE = 4096; rounds each pass.
+def _jidct():
+    SCALE: int64 = 4096
+    HALF:  int64 = 2048
+    # row pass: for each row v, transform along horizontal freq u -> jtmp[v*8+x]
+    v: int32 = 0
+    while v < 8:
+        x: int32 = 0
+        while x < 8:
+            acc: int64 = 0
+            u: int32 = 0
+            while u < 8:
+                acc = acc + cast[int64](JCOS[u * 8 + x]) * \
+                            cast[int64](jblock[v * 8 + u])
+                u = u + 1
+            if acc >= 0:
+                jtmp[v * 8 + x] = (acc + HALF) / SCALE
+            else:
+                jtmp[v * 8 + x] = (acc - HALF) / SCALE
+            x = x + 1
+        v = v + 1
+    # column pass: for each column x, transform along vertical freq v -> sample y
+    x2: int32 = 0
+    while x2 < 8:
+        y: int32 = 0
+        while y < 8:
+            acc2: int64 = 0
+            vv: int32 = 0
+            while vv < 8:
+                acc2 = acc2 + cast[int64](JCOS[vv * 8 + y]) * \
+                              jtmp[vv * 8 + x2]
+                vv = vv + 1
+            r: int64 = 0
+            if acc2 >= 0:
+                r = (acc2 + HALF) / SCALE
+            else:
+                r = (acc2 - HALF) / SCALE
+            r = r + 128                              # DC level shift
+            if r < 0:
+                r = 0
+            if r > 255:
+                r = 255
+            jsamp[y * 8 + x2] = cast[int32](r)
+            y = y + 1
+        x2 = x2 + 1
+
+
+# Decode one 8x8 block of component `c` (frame index) into jsamp[]. Uses/updates
+# jpred[c]. Returns 0 on success, negative on a Huffman/stream error.
+def _jdecode_block(c: int32) -> int32:
+    # clear coefficients
+    i: int32 = 0
+    while i < 64:
+        jblock[i] = 0
+        i = i + 1
+    qt: int32 = jc_qt[c]
+    qbase: uint64 = cast[uint64](qt) * 64
+    # DC coefficient (difference from the running predictor)
+    t: int32 = _jhuff(jc_dc[c])
+    if t < 0:
+        return -1
+    diff: int32 = 0
+    if t > 0:
+        diff = _jextend(_jreceive(t), t)
+    jpred[c] = jpred[c] + diff
+    jblock[0] = jpred[c] * cast[int32](jqt[qbase])
+    # AC coefficients (run-length of zeros, then a magnitude)
+    k: int32 = 1
+    while k <= 63:
+        rs: int32 = _jhuff(jc_ac[c])
+        if rs < 0:
+            return -1
+        r: int32 = rs >> 4
+        s: int32 = rs & 15
+        if s == 0:
+            if r == 15:
+                k = k + 16                            # ZRL: 16 zeros
+                continue
+            break                                     # EOB
+        k = k + r
+        if k > 63:
+            break
+        nat: int32 = cast[int32](JZZ[k])
+        val: int32 = _jextend(_jreceive(s), s)
+        jblock[nat] = val * cast[int32](jqt[qbase + cast[uint64](nat)])
+        k = k + 1
+    _jidct()
+    return 0
+
+
+# Skip forward to the next RSTn marker and consume it (restart handling).
+def _jskip_to_restart():
+    while jepos + 1 < jin_len:
+        if jin[jepos] == 255:
+            m: uint8 = jin[jepos + 1]
+            if m >= 208 and m <= 215:                 # 0xD0..0xD7
+                jepos = jepos + 2
+                return
+        jepos = jepos + 1
+
+
+# Write jsamp[] (8x8) into component c's plane at pixel origin (px,py).
+def _jplace(c: int32, px: int32, py: int32):
+    pw: int32 = jc_pw[c]
+    ph: int32 = jc_ph[c]
+    yy: int32 = 0
+    while yy < 8:
+        oy: int32 = py + yy
+        if oy < ph:
+            row: uint64 = cast[uint64](oy) * cast[uint64](pw)
+            xx: int32 = 0
+            while xx < 8:
+                ox: int32 = px + xx
+                if ox < pw:
+                    val: uint8 = cast[uint8](jsamp[yy * 8 + xx])
+                    if c == 0:
+                        jp_plane0[row + cast[uint64](ox)] = val
+                    elif c == 1:
+                        jp_plane1[row + cast[uint64](ox)] = val
+                    else:
+                        jp_plane2[row + cast[uint64](ox)] = val
+                xx = xx + 1
+        yy = yy + 1
+
+
+# Read a component c's sample plane at padded pixel (sx,sy).
+def _jplane_at(c: int32, sx: int32, sy: int32) -> int32:
+    o: uint64 = cast[uint64](sy) * cast[uint64](jc_pw[c]) + cast[uint64](sx)
+    if c == 0:
+        return cast[int32](jp_plane0[o])
+    if c == 1:
+        return cast[int32](jp_plane1[o])
+    return cast[int32](jp_plane2[o])
+
+
+# Decode the full baseline entropy scan (all MCUs) into the component planes.
+# Returns 0 on success, negative on error.
+def _jdecode_scan() -> int32:
+    # jepos is positioned at the entropy data by the caller.
+    jebuf = 0
+    jecnt = 0
+    jeof = 0
+    c: int32 = 0
+    while c < jncomp:
+        jpred[c] = 0
+        c = c + 1
+    mcu: int32 = 0
+    my: int32 = 0
+    while my < jmcuy:
+        mx: int32 = 0
+        while mx < jmcux:
+            if jri > 0 and mcu > 0 and (mcu % jri) == 0:
+                _jskip_to_restart()
+                jebuf = 0
+                jecnt = 0
+                jeof = 0
+                cc: int32 = 0
+                while cc < jncomp:
+                    jpred[cc] = 0
+                    cc = cc + 1
+            ci: int32 = 0
+            while ci < jncomp:
+                by: int32 = 0
+                while by < jc_v[ci]:
+                    bx: int32 = 0
+                    while bx < jc_h[ci]:
+                        if _jdecode_block(ci) != 0:
+                            return -1
+                        px: int32 = (mx * jc_h[ci] + bx) * 8
+                        py: int32 = (my * jc_v[ci] + by) * 8
+                        _jplace(ci, px, py)
+                        bx = bx + 1
+                    by = by + 1
+                ci = ci + 1
+            mcu = mcu + 1
+            mx = mx + 1
+        my = my + 1
+    return 0
+
+
+# ---- YCbCr / grayscale -> RGBA into jpeg_out ------------------------
+def _jcolor_convert():
+    y: int32 = 0
+    while y < jpeg_h:
+        x: int32 = 0
+        while x < jpeg_w:
+            dst: uint64 = (cast[uint64](y) * cast[uint64](jpeg_w) + \
+                           cast[uint64](x)) * 4
+            # component 0 (Y) — nearest sample
+            sx0: int32 = x * jc_h[0] / jhmax
+            sy0: int32 = y * jc_v[0] / jvmax
+            yv: int32 = _jplane_at(0, sx0, sy0)
+            rr: int32 = yv
+            gg: int32 = yv
+            bb: int32 = yv
+            if jncomp == 3:
+                sx1: int32 = x * jc_h[1] / jhmax
+                sy1: int32 = y * jc_v[1] / jvmax
+                sx2: int32 = x * jc_h[2] / jhmax
+                sy2: int32 = y * jc_v[2] / jvmax
+                cb: int32 = _jplane_at(1, sx1, sy1) - 128
+                cr: int32 = _jplane_at(2, sx2, sy2) - 128
+                rr = yv + (1436 * cr) / 1024
+                gg = yv - (352 * cb + 731 * cr) / 1024
+                bb = yv + (1815 * cb) / 1024
+            if rr < 0:
+                rr = 0
+            if rr > 255:
+                rr = 255
+            if gg < 0:
+                gg = 0
+            if gg > 255:
+                gg = 255
+            if bb < 0:
+                bb = 0
+            if bb > 255:
+                bb = 255
+            jpeg_out[dst] = cast[uint8](rr)
+            jpeg_out[dst + 1] = cast[uint8](gg)
+            jpeg_out[dst + 2] = cast[uint8](bb)
+            jpeg_out[dst + 3] = 255
+            x = x + 1
+        y = y + 1
+
+
+# ---- segment parsers -----------------------------------------------
+# DQT: one or more quant tables (Pq/Tq byte + 64 values, zigzag order). Stores
+# de-zigzagged into jqt (natural order). `seg` = payload start, `end` = past it.
+def _jparse_dqt(seg: uint64, end: uint64) -> int32:
+    o: uint64 = seg
+    while o < end:
+        pq: int32 = cast[int32](jin[o]) >> 4                # precision (0=8,1=16)
+        tq: int32 = cast[int32](jin[o]) & 15
+        o = o + 1
+        if tq > 3:
+            return -1
+        qbase: uint64 = cast[uint64](tq) * 64
+        k: int32 = 0
+        while k < 64:
+            v: uint16 = 0
+            if pq == 0:
+                v = cast[uint16](jin[o])
+                o = o + 1
+            else:
+                v = cast[uint16](_jbe16(o))
+                o = o + 2
+            nat: int32 = cast[int32](JZZ[k])
+            jqt[qbase + cast[uint64](nat)] = v
+            k = k + 1
+        jqt_ok[tq] = 1
+    return 0
+
+
+# DHT: one or more Huffman tables (Tc/Th byte + 16 counts + sum-of-counts values).
+def _jparse_dht(seg: uint64, end: uint64) -> int32:
+    o: uint64 = seg
+    while o < end:
+        tc: int32 = cast[int32](jin[o]) >> 4                # class (0=DC,1=AC)
+        th: int32 = cast[int32](jin[o]) & 15                # id 0..3
+        o = o + 1
+        if tc > 1 or th > 3:
+            return -1
+        tbl: int32 = tc * 4 + th
+        base: uint64 = cast[uint64](tbl) * 17
+        vbase: uint64 = cast[uint64](tbl) * 256
+        # 16 bit-length counts
+        counts: Array[17, int32]
+        tot: int32 = 0
+        l: int32 = 1
+        while l <= 16:
+            counts[l] = cast[int32](jin[o])
+            tot = tot + counts[l]
+            o = o + 1
+            l = l + 1
+        if tot > 256:
+            return -1
+        # copy huffval
+        i: int32 = 0
+        while i < tot:
+            jh_val[vbase + cast[uint64](i)] = jin[o]
+            o = o + 1
+            i = i + 1
+        # build MINCODE/MAXCODE/VALPTR (JPEG Annex C/F)
+        code: int32 = 0
+        vp: int32 = 0
+        ll: int32 = 1
+        while ll <= 16:
+            if counts[ll] == 0:
+                jh_max[base + cast[uint64](ll)] = -1
+            else:
+                jh_ptr[base + cast[uint64](ll)] = vp
+                jh_min[base + cast[uint64](ll)] = code
+                code = code + counts[ll]
+                jh_max[base + cast[uint64](ll)] = code - 1
+                vp = vp + counts[ll]
+            code = code << 1
+            ll = ll + 1
+        jh_ok[tbl] = 1
+    return 0
+
+
+# SOF0/1: frame header — precision, dims, components (id + Hi/Vi + Tq).
+def _jparse_sof(seg: uint64, end: uint64) -> int32:
+    prec: int32 = cast[int32](jin[seg])
+    if prec != 8:
+        return -1
+    jpeg_h = cast[int32](_jbe16(seg + 1))
+    jpeg_w = cast[int32](_jbe16(seg + 3))
+    jncomp = cast[int32](jin[seg + 5])
+    if jpeg_w <= 0 or jpeg_h <= 0:
+        return -1
+    if cast[uint64](jpeg_w) > JPEG_MAX_DIM or cast[uint64](jpeg_h) > JPEG_MAX_DIM:
+        return -1
+    if jncomp != 1 and jncomp != 3:
+        return -1
+    o: uint64 = seg + 6
+    jhmax = 1
+    jvmax = 1
+    c: int32 = 0
+    while c < jncomp:
+        jc_id[c] = cast[int32](jin[o])
+        jc_h[c] = cast[int32](jin[o + 1]) >> 4
+        jc_v[c] = cast[int32](jin[o + 1]) & 15
+        jc_qt[c] = cast[int32](jin[o + 2])
+        if jc_h[c] < 1 or jc_h[c] > 4 or jc_v[c] < 1 or jc_v[c] > 4:
+            return -1
+        if jc_qt[c] > 3:
+            return -1
+        if jc_h[c] > jhmax:
+            jhmax = jc_h[c]
+        if jc_v[c] > jvmax:
+            jvmax = jc_v[c]
+        o = o + 3
+        c = c + 1
+    # MCU grid + per-component padded plane geometry
+    mcuw: int32 = jhmax * 8
+    mcuh: int32 = jvmax * 8
+    jmcux = (jpeg_w + mcuw - 1) / mcuw
+    jmcuy = (jpeg_h + mcuh - 1) / mcuh
+    c = 0
+    while c < jncomp:
+        jc_pw[c] = jmcux * jc_h[c] * 8
+        jc_ph[c] = jmcuy * jc_v[c] * 8
+        if cast[uint64](jc_pw[c]) * cast[uint64](jc_ph[c]) > JPLANE_CAP:
+            return -1
+        c = c + 1
+    return 0
+
+
+# SOS: scan header — map each scan component to a frame component and its DC/AC
+# Huffman selectors. Returns the payload byte offset where entropy data begins,
+# or negative on error.
+def _jparse_sos(seg: uint64, end: uint64) -> int64:
+    ns: int32 = cast[int32](jin[seg])
+    if ns != jncomp:
+        return -1
+    o: uint64 = seg + 1
+    s: int32 = 0
+    while s < ns:
+        cs: int32 = cast[int32](jin[o])
+        td: int32 = cast[int32](jin[o + 1]) >> 4
+        ta: int32 = cast[int32](jin[o + 1]) & 15
+        o = o + 2
+        # locate the frame component with this id
+        fc: int32 = -1
+        i: int32 = 0
+        while i < jncomp:
+            if jc_id[i] == cs:
+                fc = i
+            i = i + 1
+        if fc < 0 or td > 3 or ta > 3:
+            return -1
+        jc_dc[fc] = td
+        jc_ac[fc] = ta + 4                            # AC tables live at 4..7
+        s = s + 1
+    # skip Ss, Se, Ah/Al (3 bytes) -> entropy data
+    o = o + 3
+    return cast[int64](o)
+
+
+# Decode JPEG bytes at buf[0..len). On success sets jpeg_w/jpeg_h/jpeg_ok=1 and
+# fills jpeg_out with RGBA; returns 0. Negative return = undecodable / unsupported
+# (caller draws a placeholder). Baseline & extended-sequential Huffman only.
+def jpeg_decode(buf: Ptr[uint8], len: uint64) -> int32:
+    _jpeg_init_tables()
+    jin = buf
+    jin_len = len
+    jpeg_ok = 0
+    jpeg_w = 0
+    jpeg_h = 0
+    jncomp = 0
+    jri = 0
+    i: int32 = 0
+    while i < 4:
+        jqt_ok[i] = 0
+        i = i + 1
+    i = 0
+    while i < 8:
+        jh_ok[i] = 0
+        i = i + 1
+    if len < 2:
+        return -1
+    if buf[0] != 255 or buf[1] != 216:                # SOI
+        return -1
+    seen_sof: int32 = 0
+    o: uint64 = 2
+    while o + 1 < len:
+        # find the marker: skip any fill 0xFF bytes
+        if jin[o] != 255:
+            o = o + 1
+            continue
+        while o < len and jin[o] == 255:
+            o = o + 1
+        if o >= len:
+            break
+        marker: uint32 = cast[uint32](jin[o])
+        o = o + 1
+        if marker == 217:                             # EOI
+            break
+        if marker == 1 or (marker >= 208 and marker <= 215):
+            continue                                  # TEM / RSTn: no payload
+        # every other marker carries a 2-byte length
+        if o + 2 > len:
+            return -1
+        seglen: uint64 = _jbe16(o)
+        if seglen < 2 or o + seglen > len:
+            return -1
+        seg: uint64 = o + 2
+        segend: uint64 = o + seglen
+        if marker == 192 or marker == 193:            # SOF0 / SOF1 (baseline)
+            if _jparse_sof(seg, segend) != 0:
+                return -1
+            seen_sof = 1
+        elif marker == 194 or marker == 195 or (marker >= 197 and marker <= 207):
+            return -1                                 # progressive/lossless/arith
+        elif marker == 196:                           # DHT
+            if _jparse_dht(seg, segend) != 0:
+                return -1
+        elif marker == 219:                           # DQT
+            if _jparse_dqt(seg, segend) != 0:
+                return -1
+        elif marker == 221:                           # DRI
+            jri = cast[int32](_jbe16(seg))
+        elif marker == 218:                           # SOS
+            if seen_sof == 0:
+                return -1
+            estart: int64 = _jparse_sos(seg, segend)
+            if estart < 0:
+                return -1
+            # verify referenced tables exist
+            c: int32 = 0
+            while c < jncomp:
+                if jqt_ok[jc_qt[c]] == 0 or jh_ok[jc_dc[c]] == 0 or \
+                   jh_ok[jc_ac[c]] == 0:
+                    return -1
+                c = c + 1
+            jepos = cast[uint64](estart)
+            if _jdecode_scan() != 0:
+                return -1
+            _jcolor_convert()
+            jpeg_ok = 1
+            return 0
+        # APPn / COM / DNL / others: skip the payload
+        o = segend
+    return -1                                          # no SOS reached
+
+
+def jpeg_width() -> int32:
+    return jpeg_w
+
+
+def jpeg_height() -> int32:
+    return jpeg_h
+
+
+# Packed 0xAARRGGBB for pixel (x,y) of the last successfully decoded image.
+def jpeg_pixel(x: int32, y: int32) -> uint32:
+    if jpeg_ok == 0 or x < 0 or y < 0 or x >= jpeg_w or y >= jpeg_h:
+        return 0
+    o: uint64 = (cast[uint64](y) * cast[uint64](jpeg_w) + cast[uint64](x)) * 4
+    r: uint32 = cast[uint32](jpeg_out[o])
+    g: uint32 = cast[uint32](jpeg_out[o + 1])
+    b: uint32 = cast[uint32](jpeg_out[o + 2])
+    a: uint32 = cast[uint32](jpeg_out[o + 3])
+    return (a << 24) | (r << 16) | (g << 8) | b
+
+
+# Raw RGBA output pointer (row-major, 4 bytes/px) for a bulk copy into a store.
+def jpeg_rgba_ptr() -> Ptr[uint8]:
+    return &jpeg_out[0]
