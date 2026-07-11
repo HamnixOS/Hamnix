@@ -67,20 +67,36 @@ member access + method calls; implicit-global assignment.
 - **Destructuring** in `var`/`let`/`const` — array patterns (holes, defaults,
   `...rest`), object patterns (shorthand, `{a: b}` rename, defaults, `...rest`),
   and nested patterns.
+- **Regular expressions** — regex literals `/pat/flags` (with correct
+  `/`-vs-divide disambiguation) and the `RegExp(src, flags)` constructor. The
+  matcher is a **backtracking bytecode VM** (correct over fast; supports
+  backreferences that an NFA simulation cannot): literals, `.`, char classes
+  `[a-z]`/`[^…]`, anchors `^ $`, quantifiers `* + ? {n} {n,} {n,m}` (greedy +
+  lazy `?`), capturing + non-capturing `(?:…)` groups, alternation `|`,
+  backreferences `\1`..`\9`, escapes `\d \w \s \b` and negations `\D \W \S \B`,
+  `\xHH`/`\uHHHH`/control escapes. Flags `g` (global + `lastIndex`), `i`
+  (ignore-case), `m` (multiline `^`/`$`). API: `re.test`, `re.exec` (capture
+  groups + `.index` + `.input`, `lastIndex` for `/g`), and String `match`,
+  `matchAll`, `replace` (`$1`/`$&`/`$$`/`` $` ``/`$'` and a replacer **function**),
+  `replaceAll`, `split` (splices captured groups), `search`. Regexes render as
+  `/src/flags`. Verified byte-for-byte against Node 20 in `tests/fixtures/js/regex.js`.
 
 **Builtins:** `console.log` (`error`/`warn`/`info` alias it); `Math.floor/ceil/
 round/abs/sqrt/pow/min/max/trunc`, `Math.PI/E`; `parseInt` (radix + `0x`),
 `parseFloat`, `isNaN`, `String`, `Number`, `Boolean`; `JSON.parse` /
 `JSON.stringify` (nested objects/arrays, string escaping); String methods
 `length`, `charAt`, `charCodeAt`, `indexOf`, `slice`, `substring`, `substr`,
-`split`, `toUpperCase`, `toLowerCase`, `trim`, `repeat`, `toString`; Array
+`split`, `toUpperCase`, `toLowerCase`, `trim`, `repeat`, `toString`, `match`,
+`matchAll`, `replace`, `replaceAll`, `search`; Array
 methods `push`, `pop`, `shift`, `length`, `join`, `indexOf`, `map`, `filter`,
 `reduce`, `forEach`, `slice`, `reverse`; `Object.keys/assign/values`;
 `Array.isArray/of`, `Array(...)`; the `Error` constructor family;
 `NaN`/`Infinity`/`undefined` globals.
 
-**Not covered (intentional, out of scope for now):** **regex** (the largest
-remaining chunk; deferred); generators / `async`/`await` / Promises;
+**Not covered (intentional, out of scope for now):** regex lookahead
+`(?=…)`/`(?!…)`, lookbehind, named groups `(?<name>…)`, the sticky `y` and
+dotAll `s` flags, and Unicode-property classes (the engine is byte-oriented) —
+deferred as they would balloon the diff; generators / `async`/`await` / Promises;
 getters/setters; computed method/property names; destructuring in function
 parameters and in plain assignment (only declarations); `arguments` object;
 tagged Unicode beyond ASCII (`\uXXXX` in JSON keeps the low byte). Numbers print
