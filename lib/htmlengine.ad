@@ -1,0 +1,925 @@
+# lib/htmlengine.ad — the PURE HTML parse + block/inline layout engine that
+# backs the native web browser.
+#
+# This module is deliberately I/O-FREE and UI-FREE: it has NO `extern def`
+# syscalls, NO hamUI, NO http9. It consumes a source buffer (src_ptr/src_len,
+# set by whichever front-end fetched the page) and produces a flat display
+# list of styled SEGMENTS plus per-row heading-rule flags. Both front-ends
+# share it byte-for-byte:
+#
+#   * user/hambrowse.ad     — the NATIVE browser: Plan 9-shape http9 fetch +
+#                             hamUI scene render (the shipped bare-metal path).
+#   * user/hambrowse_host.ad — a HOST test harness built for the x86_64-linux
+#                             Adder target: reads a local HTML fixture and
+#                             dumps the layout, so the engine can be iterated
+#                             on the dev host in milliseconds with NO QEMU.
+#
+# Keeping the engine pure is the seam that makes hambrowse dual-target while
+# the native path stays Plan 9-shape (the host harness is a TEST shim only —
+# it never adds sockets to the native code path).
+#
+# MEMORY DISCIPLINE (memory/feedback_compiler_quirks.md U9): every sizable
+# buffer is a top-level BSS Array, NEVER a stack local — the native user
+# stack is a single 4 KiB page. No malloc.
+
+# ====================================================================
+# Tiny helper.
+# ====================================================================
+def _lower(c: uint8) -> uint8:
+    if c >= 65 and c <= 90:
+        return c + 32
+    return c
+
+
+# ====================================================================
+# WINDOW geometry (mutable — a resize re-lays-out from the stored source).
+# These live in the engine because layout wraps to bw and _vis_rows depends
+# on bh; the front-ends read/write them directly (shared globals).
+# ====================================================================
+TITLE_H:   int32 = 18
+ADDR_H:    int32 = 20           # editable address/URL bar (below the title)
+ADDR_Y:    int32 = 18           # == TITLE_H
+GO_W:      int32 = 30           # "Go" button width in the address bar
+CONTENT_X: int32 = 8
+CONTENT_Y: int32 = 38           # == TITLE_H + ADDR_H (page content starts here)
+STATUS_H:  int32 = 16
+LINE_H:    int32 = 16
+CELL_W:    int32 = 8
+bw: int32 = 600                 # window content width  (px)
+bh: int32 = 440                 # window content height (px)
+
+
+def _content_right() -> int32:
+    return bw - CONTENT_X
+
+
+def _vis_rows() -> uint64:
+    r: int32 = (bh - CONTENT_Y - STATUS_H) / LINE_H
+    if r < 1:
+        r = 1
+    return cast[uint64](r)
+
+
+# ====================================================================
+# SOURCE — src_ptr/src_len point at the HTML the front-end wants parsed.
+# ====================================================================
+src_ptr:  Ptr[uint8] = 0
+src_len:  uint64 = 0
+
+
+# ====================================================================
+# LAYOUT MODEL — the parsed page becomes a flat list of styled SEGMENTS.
+# A segment is a run of same-styled text on one visual ROW at a pixel X.
+# ====================================================================
+MAX_SEGS:     uint64 = 6000
+SEG_TEXT_CAP: uint64 = 131072
+MAX_ROWS:     uint64 = 12000
+
+seg_text_buf: Array[131072, uint8]
+seg_text_len: uint64 = 0
+seg_x:    Array[6000, int32]
+seg_line: Array[6000, int32]
+seg_off:  Array[6000, int32]
+seg_len:  Array[6000, int32]
+seg_color: Array[6000, uint8]    # palette index (role colour)
+seg_rgb:  Array[6000, int32]     # explicit 0xRRGGBB, or -1 to use the palette
+seg_bold:  Array[6000, uint8]
+seg_uline: Array[6000, uint8]
+seg_link:  Array[6000, int32]    # link id or -1
+n_segs:   uint64 = 0
+
+row_rule: Array[12000, uint8]    # 0 none, 1 heading rule on this row
+total_rows: uint64 = 0
+top_line:   uint64 = 0
+
+# LINKS — href targets + the spans that point to them.
+MAX_LINKS:    uint64 = 1024
+LINK_HREF_CAP: uint64 = 32768
+link_off: Array[1024, int32]
+link_len: Array[1024, int32]
+link_href_buf: Array[32768, uint8]
+link_href_len: uint64 = 0
+n_links: uint64 = 0
+
+# parse-time "pen" + style state
+cur_row:  uint64 = 0
+pen_x:    int32 = 8
+indent_x: int32 = 8
+row_dirty: int32 = 0
+need_space: int32 = 0
+seg_open:  int32 = 0
+seg_curlen: uint64 = 0
+g_color: int32 = 0
+g_bold:  int32 = 0
+g_uline: int32 = 0
+g_link:  int32 = -1
+g_bold_n: int32 = 0          # nested <b>/<strong> depth
+g_heading: int32 = 0        # 0 none, else 1/2/3
+list_depth: int32 = 0
+pre_mode: int32 = 0
+skip_active: int32 = 0
+skip_name: Array[16, uint8]
+skip_nlen: uint64 = 0
+
+# CSS colour state — a stack of explicit colours pushed by colour-bearing
+# elements (span/font/p/div/h1-h3). g_rgb is the effective colour (topmost
+# non-sentinel entry), or -1 when no explicit colour applies.
+COLOR_STACK_CAP: int32 = 64
+color_stack: Array[64, int32]
+color_sp: int32 = 0
+g_rgb: int32 = -1
+
+# inline word accumulator
+WORD_CAP: uint64 = 2048
+word_buf: Array[2048, uint8]
+word_len: uint64 = 0
+g_ent_char: uint8 = 0
+
+
+def _palette(idx: uint8) -> Ptr[uint8]:
+    if idx == 1:
+        return cast[Ptr[uint8]]("#1a4fd0")          # link blue
+    if idx == 2:
+        return cast[Ptr[uint8]]("#14306e")          # heading dark blue
+    if idx == 3:
+        return cast[Ptr[uint8]]("#0a6b5a")          # pre/code teal
+    return cast[Ptr[uint8]]("#101010")              # body text
+
+
+# Palette index -> packed 0xRRGGBB (mirrors _palette; used to resolve a
+# segment to a concrete colour for rendering / dumping).
+def _palette_rgb(idx: uint8) -> int32:
+    if idx == 1:
+        return 0x1a4fd0
+    if idx == 2:
+        return 0x14306e
+    if idx == 3:
+        return 0x0a6b5a
+    return 0x101010
+
+
+# ---- CSS colour stack ----------------------------------------------
+def _color_effective() -> int32:
+    i: int32 = color_sp - 1
+    while i >= 0:
+        if color_stack[i] >= 0:
+            return color_stack[i]
+        i = i - 1
+    return -1
+
+
+def _color_push(rgb: int32):
+    if color_sp < COLOR_STACK_CAP:
+        color_stack[color_sp] = rgb
+        color_sp = color_sp + 1
+    g_rgb = _color_effective()
+
+
+def _color_pop():
+    if color_sp > 0:
+        color_sp = color_sp - 1
+    g_rgb = _color_effective()
+
+
+def _base_color() -> int32:
+    if g_heading != 0:
+        return 2
+    if pre_mode != 0:
+        return 3
+    return 0
+
+
+def _recompute_style():
+    if g_link >= 0:
+        g_color = 1
+        g_uline = 1
+    else:
+        g_color = _base_color()
+        g_uline = 0
+    if g_bold_n > 0 or g_heading != 0:
+        g_bold = 1
+    else:
+        g_bold = 0
+
+
+# ---- segment building -----------------------------------------------
+def _seg_ensure():
+    if seg_open != 0:
+        return
+    if n_segs >= MAX_SEGS:
+        return
+    seg_open = 1
+    seg_x[n_segs]    = pen_x
+    seg_line[n_segs] = cast[int32](cur_row)
+    seg_off[n_segs]  = cast[int32](seg_text_len)
+    seg_color[n_segs] = cast[uint8](g_color)
+    # An explicit CSS colour overrides the role palette, EXCEPT on links,
+    # which keep their blue role colour.
+    if g_link < 0:
+        seg_rgb[n_segs] = g_rgb
+    else:
+        seg_rgb[n_segs] = -1
+    seg_bold[n_segs]  = cast[uint8](g_bold)
+    seg_uline[n_segs] = cast[uint8](g_uline)
+    seg_link[n_segs]  = g_link
+    seg_curlen = 0
+
+
+def _seg_putc(c: uint8):
+    _seg_ensure()
+    if seg_open == 0:
+        return
+    if seg_text_len < SEG_TEXT_CAP - 1:
+        seg_text_buf[seg_text_len] = c
+        seg_text_len = seg_text_len + 1
+        seg_curlen = seg_curlen + 1
+    row_dirty = 1
+
+
+def _close_seg():
+    if seg_open == 0:
+        return
+    if seg_curlen > 0 and n_segs < MAX_SEGS:
+        seg_len[n_segs] = cast[int32](seg_curlen)
+        n_segs = n_segs + 1
+    seg_open = 0
+    seg_curlen = 0
+
+
+# A style change closes the current segment so the next text opens a fresh
+# one carrying the new attributes.
+def _style_break():
+    _close_seg()
+    _recompute_style()
+
+
+# ---- line breaks ----------------------------------------------------
+def _bump_row():
+    cur_row = cur_row + 1
+    if cur_row >= MAX_ROWS:
+        cur_row = MAX_ROWS - 1
+
+
+def _soft_newline():
+    # Move to a fresh line ONLY if the current one has content.
+    _close_seg()
+    if row_dirty != 0:
+        _bump_row()
+    pen_x = indent_x
+    row_dirty = 0
+    need_space = 0
+
+
+def _newline():
+    # Unconditional line break (<br>, pre newline).
+    _close_seg()
+    _bump_row()
+    pen_x = indent_x
+    row_dirty = 0
+    need_space = 0
+
+
+def _para_break():
+    # End the current line + leave a single blank gap.
+    _soft_newline()
+    _bump_row()
+    pen_x = indent_x
+    need_space = 0
+
+
+# ---- word placement (block+inline flow with word wrap) --------------
+def _emit_word(wptr: Ptr[uint8], wlen: uint64):
+    if wlen == 0:
+        return
+    cw: int32 = CELL_W
+    right: int32 = _content_right()
+    wpx: int32 = cast[int32](wlen) * cw
+    avail: int32 = right - indent_x
+    # Decide a word-wrap (only when the word fits on a fresh line).
+    if pen_x > indent_x:
+        extra: int32 = wpx
+        if need_space != 0:
+            extra = extra + cw
+        if pen_x + extra > right and wpx <= avail:
+            _close_seg()
+            _bump_row()
+            pen_x = indent_x
+            need_space = 0
+            row_dirty = 0
+    # Inter-word space.
+    if need_space != 0 and pen_x > indent_x:
+        _seg_putc(32)
+        pen_x = pen_x + cw
+        need_space = 0
+    # A word longer than a whole line: hard char-break it.
+    if wpx > avail:
+        k: uint64 = 0
+        while k < wlen:
+            if pen_x + cw > right and pen_x > indent_x:
+                _close_seg()
+                _bump_row()
+                pen_x = indent_x
+                row_dirty = 0
+            _seg_putc(wptr[k])
+            pen_x = pen_x + cw
+            k = k + 1
+        need_space = 0
+        return
+    # Normal: whole word into the current segment.
+    k2: uint64 = 0
+    while k2 < wlen:
+        _seg_putc(wptr[k2])
+        pen_x = pen_x + cw
+        k2 = k2 + 1
+    need_space = 0
+
+
+def _word_push(c: uint8):
+    if word_len < WORD_CAP - 1:
+        word_buf[word_len] = c
+        word_len = word_len + 1
+
+
+def _word_flush():
+    if word_len > 0:
+        _emit_word(&word_buf[0], word_len)
+        word_len = 0
+
+
+# ====================================================================
+# ENTITY DECODE — &name; / &#NN; / &#xHH;.  Returns bytes consumed from
+# src starting at `&` (0 if not a recognised entity), and sets g_ent_char.
+# ====================================================================
+def _ent_named_is(start: uint64, lit: Ptr[uint8]) -> int32:
+    # `lit` already includes the trailing ';' — a full match consumes it.
+    i: uint64 = 0
+    while lit[i] != 0:
+        if start + i >= src_len:
+            return 0
+        if src_ptr[start + i] != lit[i]:
+            return 0
+        i = i + 1
+    return cast[int32](i)
+
+
+def _entity(at: uint64) -> uint64:
+    # at points at '&'. Look for a ';' within 10 bytes.
+    body: uint64 = at + 1
+    if body >= src_len:
+        return 0
+    if src_ptr[body] == 35:                          # '#': numeric
+        p: uint64 = body + 1
+        base: uint32 = 10
+        if p < src_len and (src_ptr[p] == 120 or src_ptr[p] == 88):   # x/X
+            base = 16
+            p = p + 1
+        val: uint32 = 0
+        digits: int32 = 0
+        while p < src_len and digits < 8:
+            c: uint8 = src_ptr[p]
+            d: int32 = -1
+            if c >= 48 and c <= 57:
+                d = cast[int32](c - 48)
+            elif base == 16 and c >= 97 and c <= 102:
+                d = cast[int32](c - 97) + 10
+            elif base == 16 and c >= 65 and c <= 70:
+                d = cast[int32](c - 65) + 10
+            else:
+                break
+            val = val * base + cast[uint32](d)
+            digits = digits + 1
+            p = p + 1
+        if digits == 0:
+            return 0
+        if p < src_len and src_ptr[p] == 59:
+            p = p + 1
+        ch: uint32 = val
+        if ch == 0 or ch > 126:
+            ch = 63                                   # '?' for non-ASCII
+        g_ent_char = cast[uint8](ch)
+        return p - at
+    # Named entities.
+    c0: uint8 = _lower(src_ptr[body])
+    if c0 == 97:                                       # a -> amp / apos
+        n: int32 = _ent_named_is(body, cast[Ptr[uint8]]("amp;"))
+        if n > 0:
+            g_ent_char = 38
+            return cast[uint64](1 + n)
+        n = _ent_named_is(body, cast[Ptr[uint8]]("apos;"))
+        if n > 0:
+            g_ent_char = 39
+            return cast[uint64](1 + n)
+    if c0 == 108:                                      # l -> lt
+        n2: int32 = _ent_named_is(body, cast[Ptr[uint8]]("lt;"))
+        if n2 > 0:
+            g_ent_char = 60
+            return cast[uint64](1 + n2)
+    if c0 == 103:                                      # g -> gt
+        n3: int32 = _ent_named_is(body, cast[Ptr[uint8]]("gt;"))
+        if n3 > 0:
+            g_ent_char = 62
+            return cast[uint64](1 + n3)
+    if c0 == 113:                                      # q -> quot
+        n4: int32 = _ent_named_is(body, cast[Ptr[uint8]]("quot;"))
+        if n4 > 0:
+            g_ent_char = 34
+            return cast[uint64](1 + n4)
+    if c0 == 110:                                      # n -> nbsp
+        n5: int32 = _ent_named_is(body, cast[Ptr[uint8]]("nbsp;"))
+        if n5 > 0:
+            g_ent_char = 32
+            return cast[uint64](1 + n5)
+    return 0
+
+
+# ====================================================================
+# COLOUR PARSING — extract a text colour from a tag body src[ts..te).
+# Handles  style="…color:VALUE…"  and  color="VALUE" / color=VALUE
+# (the <font> attribute). VALUE is #rgb, #rrggbb, or a named colour.
+# Returns packed 0xRRGGBB, or -1 if none / unparseable.
+# ====================================================================
+def _hexval(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return cast[int32](c - 48)
+    lc: uint8 = _lower(c)
+    if lc >= 97 and lc <= 102:
+        return cast[int32](lc - 97) + 10
+    return -1
+
+
+# Compare src[at..] against a lowercase literal; returns 1 on full match.
+def _srcword_is(at: uint64, lit: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while lit[i] != 0:
+        if at + i >= src_len:
+            return 0
+        if _lower(src_ptr[at + i]) != lit[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Named colours (the CSS/HTML basics). Returns 0xRRGGBB or -1.
+def _named_color(at: uint64) -> int32:
+    if _srcword_is(at, cast[Ptr[uint8]]("black")) != 0:
+        return 0x000000
+    if _srcword_is(at, cast[Ptr[uint8]]("white")) != 0:
+        return 0xffffff
+    if _srcword_is(at, cast[Ptr[uint8]]("red")) != 0:
+        return 0xff0000
+    if _srcword_is(at, cast[Ptr[uint8]]("green")) != 0:
+        return 0x008000
+    if _srcword_is(at, cast[Ptr[uint8]]("lime")) != 0:
+        return 0x00ff00
+    if _srcword_is(at, cast[Ptr[uint8]]("blue")) != 0:
+        return 0x0000ff
+    if _srcword_is(at, cast[Ptr[uint8]]("navy")) != 0:
+        return 0x000080
+    if _srcword_is(at, cast[Ptr[uint8]]("teal")) != 0:
+        return 0x008080
+    if _srcword_is(at, cast[Ptr[uint8]]("aqua")) != 0:
+        return 0x00ffff
+    if _srcword_is(at, cast[Ptr[uint8]]("olive")) != 0:
+        return 0x808000
+    if _srcword_is(at, cast[Ptr[uint8]]("yellow")) != 0:
+        return 0xffff00
+    if _srcword_is(at, cast[Ptr[uint8]]("orange")) != 0:
+        return 0xffa500
+    if _srcword_is(at, cast[Ptr[uint8]]("purple")) != 0:
+        return 0x800080
+    if _srcword_is(at, cast[Ptr[uint8]]("fuchsia")) != 0:
+        return 0xff00ff
+    if _srcword_is(at, cast[Ptr[uint8]]("maroon")) != 0:
+        return 0x800000
+    if _srcword_is(at, cast[Ptr[uint8]]("silver")) != 0:
+        return 0xc0c0c0
+    if _srcword_is(at, cast[Ptr[uint8]]("gray")) != 0:
+        return 0x808080
+    if _srcword_is(at, cast[Ptr[uint8]]("grey")) != 0:
+        return 0x808080
+    return -1
+
+
+# Parse a colour VALUE starting at src[at]. Returns 0xRRGGBB or -1.
+def _color_value(at: uint64) -> int32:
+    if at >= src_len:
+        return -1
+    if src_ptr[at] == 35:                            # '#rgb' or '#rrggbb'
+        # count hex digits
+        p: uint64 = at + 1
+        nd: int32 = 0
+        while p < src_len and _hexval(src_ptr[p]) >= 0:
+            nd = nd + 1
+            p = p + 1
+        if nd >= 6:
+            r: int32 = _hexval(src_ptr[at + 1]) * 16 + _hexval(src_ptr[at + 2])
+            g: int32 = _hexval(src_ptr[at + 3]) * 16 + _hexval(src_ptr[at + 4])
+            b: int32 = _hexval(src_ptr[at + 5]) * 16 + _hexval(src_ptr[at + 6])
+            return (r * 65536) + (g * 256) + b
+        if nd >= 3:
+            r3: int32 = _hexval(src_ptr[at + 1])
+            g3: int32 = _hexval(src_ptr[at + 2])
+            b3: int32 = _hexval(src_ptr[at + 3])
+            return ((r3 * 16 + r3) * 65536) + ((g3 * 16 + g3) * 256) + \
+                   (b3 * 16 + b3)
+        return -1
+    return _named_color(at)
+
+
+# Find a text-colour value in the tag body [ts,te). Looks for a `color`
+# keyword at a word boundary (so `bgcolor` is NOT matched) followed by ':'
+# (style syntax) or '=' (attribute syntax), then parses the value.
+def _tag_color(ts: uint64, te: uint64) -> int32:
+    i: uint64 = ts
+    while i + 5 <= te:
+        # word boundary: previous char must not be a letter (rejects bgcolor)
+        prev_alpha: int32 = 0
+        if i > ts:
+            pc: uint8 = _lower(src_ptr[i - 1])
+            if pc >= 97 and pc <= 122:
+                prev_alpha = 1
+        if prev_alpha == 0 and _srcword_is(i, cast[Ptr[uint8]]("color")) != 0:
+            j: uint64 = i + 5
+            while j < te and (src_ptr[j] == 32 or src_ptr[j] == 9):
+                j = j + 1
+            if j < te and (src_ptr[j] == 58 or src_ptr[j] == 61):   # ':' '='
+                j = j + 1
+                while j < te and (src_ptr[j] == 32 or src_ptr[j] == 9 or \
+                                  src_ptr[j] == 34 or src_ptr[j] == 39):
+                    j = j + 1
+                cv: int32 = _color_value(j)
+                if cv >= 0:
+                    return cv
+        i = i + 1
+    return -1
+
+
+# ====================================================================
+# TAG HANDLING.  tag content is src[ts .. te) (between '<' and '>').
+# ====================================================================
+def _name_eq(np: uint64, nlen: uint64, lit: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while lit[i] != 0:
+        if i >= nlen:
+            return 0
+        if _lower(src_ptr[np + i]) != lit[i]:
+            return 0
+        i = i + 1
+    if i != nlen:
+        return 0
+    return 1
+
+
+# Extract the href="..."/href='...' value from a tag body into link_href_buf;
+# returns the new link id, or -1 if no href / table full.
+def _capture_href(ts: uint64, te: uint64) -> int32:
+    if n_links >= MAX_LINKS:
+        return -1
+    # find "href" (case-insensitive) within [ts,te)
+    i: uint64 = ts
+    found: int32 = 0
+    while i + 4 <= te:
+        if _lower(src_ptr[i]) == 104 and _lower(src_ptr[i + 1]) == 114 \
+           and _lower(src_ptr[i + 2]) == 101 and _lower(src_ptr[i + 3]) == 102:
+            found = 1
+            i = i + 4
+            break
+        i = i + 1
+    if found == 0:
+        return -1
+    while i < te and (src_ptr[i] == 32 or src_ptr[i] == 9):
+        i = i + 1
+    if i >= te or src_ptr[i] != 61:                  # '='
+        return -1
+    i = i + 1
+    while i < te and (src_ptr[i] == 32 or src_ptr[i] == 9):
+        i = i + 1
+    quote: uint8 = 0
+    if i < te and (src_ptr[i] == 34 or src_ptr[i] == 39):
+        quote = src_ptr[i]
+        i = i + 1
+    start: uint64 = link_href_len
+    cnt: int32 = 0
+    while i < te:
+        c: uint8 = src_ptr[i]
+        if quote != 0:
+            if c == quote:
+                break
+        else:
+            if c == 32 or c == 9 or c == 62:
+                break
+        if link_href_len < LINK_HREF_CAP - 1:
+            link_href_buf[link_href_len] = c
+            link_href_len = link_href_len + 1
+            cnt = cnt + 1
+        i = i + 1
+    if cnt == 0:
+        return -1
+    lid: int32 = cast[int32](n_links)
+    link_off[n_links] = cast[int32](start)
+    link_len[n_links] = cnt
+    n_links = n_links + 1
+    return lid
+
+
+def _enter_skip(np: uint64, nlen: uint64):
+    skip_active = 1
+    skip_nlen = nlen
+    i: uint64 = 0
+    while i < nlen and i < 16:
+        skip_name[i] = _lower(src_ptr[np + i])
+        i = i + 1
+
+
+def _handle_tag(ts: uint64, te: uint64):
+    if ts >= te:
+        return
+    # comment / doctype / processing — ignore.
+    if src_ptr[ts] == 33 or src_ptr[ts] == 63:       # '!' or '?'
+        return
+    is_close: int32 = 0
+    np: uint64 = ts
+    if src_ptr[np] == 47:                            # '/'
+        is_close = 1
+        np = np + 1
+    # tag name end (letters/digits)
+    ne: uint64 = np
+    while ne < te:
+        c: uint8 = src_ptr[ne]
+        if (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or \
+           (c >= 48 and c <= 57):
+            ne = ne + 1
+        else:
+            break
+    nlen: uint64 = ne - np
+    if nlen == 0:
+        return
+
+    # script/style/head/title: drop their content entirely.
+    if is_close == 0:
+        if _name_eq(np, nlen, cast[Ptr[uint8]]("script")) != 0 or \
+           _name_eq(np, nlen, cast[Ptr[uint8]]("style")) != 0 or \
+           _name_eq(np, nlen, cast[Ptr[uint8]]("head")) != 0 or \
+           _name_eq(np, nlen, cast[Ptr[uint8]]("title")) != 0:
+            _word_flush()
+            _enter_skip(np, nlen)
+            return
+
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("br")) != 0:
+        _word_flush()
+        _newline()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("span")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("font")) != 0:
+        # Inline colour-bearing element: no layout effect, only colour.
+        _word_flush()
+        if is_close == 0:
+            _color_push(_tag_color(ne, te))
+        else:
+            _color_pop()
+        _style_break()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("p")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("div")) != 0:
+        _word_flush()
+        if is_close == 0:
+            _soft_newline()
+            _color_push(_tag_color(ne, te))
+        else:
+            _color_pop()
+            _para_break()
+        _style_break()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("h1")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("h2")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("h3")) != 0:
+        _word_flush()
+        lvl: int32 = cast[int32](src_ptr[np + 1] - 48)
+        if is_close == 0:
+            _soft_newline()
+            g_heading = lvl
+            _color_push(_tag_color(ne, te))
+            _style_break()
+        else:
+            # rule under the heading's last content row, then a gap
+            hr: uint64 = cur_row
+            if row_dirty != 0 and lvl <= 2 and hr < MAX_ROWS:
+                row_rule[hr] = 1
+            g_heading = 0
+            _color_pop()
+            _style_break()
+            _para_break()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("b")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("strong")) != 0:
+        _word_flush()
+        if is_close == 0:
+            g_bold_n = g_bold_n + 1
+        else:
+            if g_bold_n > 0:
+                g_bold_n = g_bold_n - 1
+        _style_break()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("i")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("em")) != 0:
+        # parsed but rendered plain (no italic glyph set) — strip the tag.
+        _word_flush()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("a")) != 0:
+        _word_flush()
+        if is_close == 0:
+            lid: int32 = _capture_href(ne, te)
+            g_link = lid
+        else:
+            g_link = -1
+        _style_break()
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("ul")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("ol")) != 0:
+        _word_flush()
+        if is_close == 0:
+            _soft_newline()
+            list_depth = list_depth + 1
+        else:
+            if list_depth > 0:
+                list_depth = list_depth - 1
+            _para_break()
+        indent_x = CONTENT_X + list_depth * 18
+        pen_x = indent_x
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("li")) != 0:
+        _word_flush()
+        if is_close == 0:
+            _soft_newline()
+            indent_x = CONTENT_X + list_depth * 18
+            pen_x = indent_x
+            # bullet marker
+            _seg_putc(42)                            # '*'
+            _seg_putc(32)
+            pen_x = pen_x + 2 * CELL_W
+        return
+    if _name_eq(np, nlen, cast[Ptr[uint8]]("pre")) != 0 or \
+       _name_eq(np, nlen, cast[Ptr[uint8]]("code")) != 0:
+        is_pre: int32 = _name_eq(np, nlen, cast[Ptr[uint8]]("pre"))
+        _word_flush()
+        if is_pre != 0:
+            if is_close == 0:
+                _soft_newline()
+                pre_mode = 1
+            else:
+                pre_mode = 0
+                _para_break()
+        _style_break()
+        return
+    # Unknown tag: ignore it, keep surrounding text.
+    return
+
+
+# ====================================================================
+# LAYOUT — parse src_ptr/src_len into segments.
+# ====================================================================
+def _reset_layout():
+    n_segs = 0
+    seg_text_len = 0
+    n_links = 0
+    link_href_len = 0
+    cur_row = 0
+    pen_x = CONTENT_X
+    indent_x = CONTENT_X
+    row_dirty = 0
+    need_space = 0
+    seg_open = 0
+    seg_curlen = 0
+    g_color = 0
+    g_bold = 0
+    g_uline = 0
+    g_link = -1
+    g_bold_n = 0
+    g_heading = 0
+    list_depth = 0
+    pre_mode = 0
+    skip_active = 0
+    skip_nlen = 0
+    word_len = 0
+    top_line = 0
+    color_sp = 0
+    g_rgb = -1
+    r: uint64 = 0
+    while r < MAX_ROWS:
+        row_rule[r] = 0
+        r = r + 1
+
+
+def _layout():
+    _reset_layout()
+    i: uint64 = 0
+    while i < src_len:
+        c: uint8 = src_ptr[i]
+        if skip_active != 0:
+            if c == 60:                              # '<'
+                if i + 1 < src_len and src_ptr[i + 1] == 47:     # '</'
+                    if _name_eq(i + 2, skip_nlen, &skip_name[0]) != 0:
+                        skip_active = 0
+                # advance past '>'
+                while i < src_len and src_ptr[i] != 62:
+                    i = i + 1
+                if i < src_len:
+                    i = i + 1
+                continue
+            i = i + 1
+            continue
+        if c == 60:                                  # '<'
+            ts: uint64 = i + 1
+            j: uint64 = ts
+            while j < src_len and src_ptr[j] != 62:
+                j = j + 1
+            _word_flush()
+            _handle_tag(ts, j)
+            if j < src_len:
+                i = j + 1
+            else:
+                i = j
+            continue
+        if c == 38:                                  # '&'
+            consumed: uint64 = _entity(i)
+            if consumed > 0:
+                _word_push(g_ent_char)
+                i = i + consumed
+                continue
+            _word_push(38)
+            i = i + 1
+            continue
+        if pre_mode == 0:
+            if c == 32 or c == 9 or c == 10 or c == 13:
+                _word_flush()
+                need_space = 1
+                i = i + 1
+                continue
+            _word_push(c)
+            i = i + 1
+            continue
+        # preformatted: preserve whitespace, honor newlines.
+        if c == 10:
+            _word_flush()
+            _newline()
+            i = i + 1
+            continue
+        if c == 13:
+            i = i + 1
+            continue
+        if c == 9:
+            _word_push(32)
+            _word_push(32)
+            i = i + 1
+            continue
+        _word_push(c)
+        i = i + 1
+    _word_flush()
+    _close_seg()
+    total_rows = cur_row + 1
+
+
+# he_layout — public entry point (non-underscore so front-ends can call it
+# without an underscore import). Lays out src_ptr/src_len into segments.
+def he_layout():
+    _layout()
+
+
+# Resolve segment `si` to a "#rrggbb\0" colour string in the caller's buffer
+# (>= 8 bytes). Explicit CSS colour wins; otherwise the role palette.
+def he_seg_color_hex(si: uint64, out: Ptr[uint8]):
+    rgb: int32 = seg_rgb[si]
+    if rgb < 0:
+        rgb = _palette_rgb(seg_color[si])
+    out[0] = 35                                       # '#'
+    hexd: Ptr[uint8] = cast[Ptr[uint8]]("0123456789abcdef")
+    k: int32 = 0
+    while k < 6:
+        shift: int32 = (5 - k) * 4
+        nib: int32 = (rgb / (1 << shift)) & 15
+        out[1 + k] = hexd[nib]
+        k = k + 1
+    out[7] = 0
+
+
+# ====================================================================
+# SCROLL helpers.
+# ====================================================================
+def _max_top() -> uint64:
+    vr: uint64 = _vis_rows()
+    if total_rows > vr:
+        return total_rows - vr
+    return 0
+
+
+def _scroll_to(t: int64):
+    mt: int64 = cast[int64](_max_top())
+    if t < 0:
+        t = 0
+    if t > mt:
+        t = mt
+    top_line = cast[uint64](t)
+
+
+def _scroll_by(delta: int64):
+    _scroll_to(cast[int64](top_line) + delta)
