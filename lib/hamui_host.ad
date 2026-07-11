@@ -1,0 +1,416 @@
+# lib/hamui_host.ad — the HOST rasterizer sink for the hamUI scene builder.
+#
+# THE DUAL-TARGET SEAM (see docs/hamui_dual_target.md)
+# ====================================================
+# A hamUI scene app builds a display list with lib/hamscene.ad's hamscene_*
+# calls into one text buffer. On the NATIVE target lib/hamui.ad's
+# hamscene_commit() writes that buffer to /dev/wsys/<wid>/scene and the
+# kernel scene compositor rasterizes + blits it. There is no compositor on
+# the developer's host, so THIS module is the second sink: it PARSES the
+# very same buffer (via lib/hamscene.ad's hamscene_bufptr()/hamscene_length()
+# accessors) and RASTERIZES it into an RGB framebuffer using the SAME 8x16
+# VGA font the compositor draws (lib/hamui_host_font.ad), so a host test can
+# dump a PPM/PNG and a human/agent can LOOK at exactly what a native boot
+# would show — in milliseconds, no QEMU.
+#
+# This module is PURE: no `extern`, no syscalls, no I/O. It only reads the
+# scene buffer and fills a BSS framebuffer + builds a PPM header into a
+# caller buffer. The per-app `*_host.ad` driver does the actual file writes
+# (host Linux sys_write) and feeds SCRIPTED input to the app's pure input
+# handlers. It links ONLY into the x86_64-linux host target; the native code
+# path never references it.
+
+from lib.hamscene import hamscene_bufptr, hamscene_length
+from lib.hamui_host_font import hamui_host_font_init, hamui_host_font_row
+
+
+# ====================================================================
+# Framebuffer (BSS, demand-zero on Linux). Sized to a generous window; the
+# active WxH is set by hamui_host_begin(). Row-major RGB, 3 bytes/pixel.
+# ====================================================================
+HOST_MAX_W: uint64 = 1024
+HOST_MAX_H: uint64 = 768
+hostfb: Array[2359296, uint8]        # 1024*768*3
+host_w: int32 = 0
+host_h: int32 = 0
+
+
+def hamui_host_width() -> int32:
+    return host_w
+
+
+def hamui_host_height() -> int32:
+    return host_h
+
+
+def hamui_host_fb_ptr() -> Ptr[uint8]:
+    return &hostfb[0]
+
+
+def hamui_host_fb_bytes() -> uint64:
+    return cast[uint64](host_w) * cast[uint64](host_h) * 3
+
+
+# Packed 0x00RRGGBB at (x,y); 0 if out of range. For gate assertions.
+def hamui_host_pixel(x: int32, y: int32) -> uint32:
+    if x < 0 or y < 0 or x >= host_w or y >= host_h:
+        return 0
+    o: uint64 = (cast[uint64](y) * cast[uint64](host_w) + cast[uint64](x)) * 3
+    r: uint32 = cast[uint32](hostfb[o])
+    g: uint32 = cast[uint32](hostfb[o + 1])
+    b: uint32 = cast[uint32](hostfb[o + 2])
+    return (r << 16) | (g << 8) | b
+
+
+def _put_px(x: int32, y: int32, r: uint8, g: uint8, b: uint8):
+    if x < 0 or y < 0 or x >= host_w or y >= host_h:
+        return
+    o: uint64 = (cast[uint64](y) * cast[uint64](host_w) + cast[uint64](x)) * 3
+    hostfb[o] = r
+    hostfb[o + 1] = g
+    hostfb[o + 2] = b
+
+
+def _fill_rect(x: int32, y: int32, w: int32, h: int32, r: uint8, g: uint8,
+               b: uint8):
+    yy: int32 = y
+    ylim: int32 = y + h
+    while yy < ylim:
+        xx: int32 = x
+        xlim: int32 = x + w
+        while xx < xlim:
+            _put_px(xx, yy, r, g, b)
+            xx = xx + 1
+        yy = yy + 1
+
+
+# ---- colour parsing: "#RRGGBB" / "#RRGGBBAA" -> 3 bytes -------------------
+_col_r: uint8 = 0
+_col_g: uint8 = 0
+_col_b: uint8 = 0
+
+
+def _hex1(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return cast[int32](c) - 48
+    if c >= 97 and c <= 102:
+        return cast[int32](c) - 97 + 10
+    if c >= 65 and c <= 70:
+        return cast[int32](c) - 65 + 10
+    return 0
+
+
+# Parse a colour token from buf at [off..); set _col_r/g/b. Returns the
+# offset just past the token. Accepts "#rgb", "#rrggbb", "#rrggbbaa".
+def _parse_color(buf: Ptr[uint8], off: uint64, end: uint64) -> uint64:
+    i: uint64 = off
+    if i < end and buf[i] == 35:                       # '#'
+        i = i + 1
+    start: uint64 = i
+    while i < end and buf[i] != 32 and buf[i] != 10:
+        i = i + 1
+    ndig: uint64 = i - start
+    if ndig == 3:
+        r4: int32 = _hex1(buf[start])
+        g4: int32 = _hex1(buf[start + 1])
+        b4: int32 = _hex1(buf[start + 2])
+        _col_r = cast[uint8](r4 * 16 + r4)
+        _col_g = cast[uint8](g4 * 16 + g4)
+        _col_b = cast[uint8](b4 * 16 + b4)
+    else:
+        _col_r = cast[uint8](_hex1(buf[start]) * 16 + _hex1(buf[start + 1]))
+        _col_g = cast[uint8](_hex1(buf[start + 2]) * 16 + _hex1(buf[start + 3]))
+        _col_b = cast[uint8](_hex1(buf[start + 4]) * 16 + _hex1(buf[start + 5]))
+    return i
+
+
+# ---- integer parsing -----------------------------------------------------
+_num: int32 = 0
+
+
+def _skip_sp(buf: Ptr[uint8], off: uint64, end: uint64) -> uint64:
+    i: uint64 = off
+    while i < end and buf[i] == 32:
+        i = i + 1
+    return i
+
+
+# Parse a signed decimal at [off..); set _num. Returns offset past it.
+def _parse_int(buf: Ptr[uint8], off: uint64, end: uint64) -> uint64:
+    i: uint64 = _skip_sp(buf, off, end)
+    neg: int32 = 0
+    if i < end and buf[i] == 45:                       # '-'
+        neg = 1
+        i = i + 1
+    v: int32 = 0
+    while i < end and buf[i] >= 48 and buf[i] <= 57:
+        v = v * 10 + cast[int32](buf[i]) - 48
+        i = i + 1
+    if neg != 0:
+        v = 0 - v
+    _num = v
+    return i
+
+
+# ---- text blit -----------------------------------------------------------
+# Blit one 8x16 glyph at top-left (gx,gy) in the current colour; `bold`
+# double-strikes (+1px x) like the compositor's `b` flag.
+def _blit_glyph(ch: uint8, gx: int32, gy: int32, bold: int32):
+    row: int32 = 0
+    while row < 16:
+        bits: uint8 = hamui_host_font_row(ch, cast[uint64](row))
+        col: int32 = 0
+        while col < 8:
+            mask: uint8 = cast[uint8](128 >> col)
+            if (bits & mask) != 0:
+                _put_px(gx + col, gy + row, _col_r, _col_g, _col_b)
+                if bold != 0:
+                    _put_px(gx + col + 1, gy + row, _col_r, _col_g, _col_b)
+            col = col + 1
+        row = row + 1
+
+
+# Draw a quoted string starting at buf[off]=='"'; render 8px cells from
+# (tx,ty). Returns offset just past the closing quote.
+def _draw_text(buf: Ptr[uint8], off: uint64, end: uint64, tx: int32,
+               ty: int32, bold: int32) -> uint64:
+    i: uint64 = off
+    if i < end and buf[i] == 34:                       # opening quote
+        i = i + 1
+    cx: int32 = tx
+    while i < end and buf[i] != 34 and buf[i] != 10:
+        _blit_glyph(buf[i], cx, ty, bold)
+        cx = cx + 8
+        i = i + 1
+    if i < end and buf[i] == 34:
+        i = i + 1
+    return i
+
+
+def _draw_line(x1: int32, y1: int32, x2: int32, y2: int32, thick: int32):
+    # Bresenham; `thick` drawn as a small square brush per plotted point.
+    dx: int32 = x2 - x1
+    if dx < 0:
+        dx = 0 - dx
+    dy: int32 = y2 - y1
+    if dy < 0:
+        dy = 0 - dy
+    sx: int32 = 1
+    if x1 > x2:
+        sx = -1
+    sy: int32 = 1
+    if y1 > y2:
+        sy = -1
+    err: int32 = dx - dy
+    cx: int32 = x1
+    cy: int32 = y1
+    t: int32 = thick
+    if t < 1:
+        t = 1
+    guard: int32 = 0
+    while guard < 100000:
+        _fill_rect(cx, cy, t, t, _col_r, _col_g, _col_b)
+        if cx == x2 and cy == y2:
+            return
+        e2: int32 = err * 2
+        if e2 > (0 - dy):
+            err = err - dy
+            cx = cx + sx
+        if e2 < dx:
+            err = err + dx
+            cy = cy + sy
+        guard = guard + 1
+
+
+# ====================================================================
+# PUBLIC: begin a frame, rasterize the built scene, build a PPM header.
+# ====================================================================
+
+# Set the active framebuffer size and clear to opaque black. Clamped to the
+# BSS ceiling. Call before hamui_host_rasterize().
+def hamui_host_begin(w: int32, h: int32):
+    hamui_host_font_init()
+    ww: int32 = w
+    hh: int32 = h
+    if ww < 1:
+        ww = 1
+    if hh < 1:
+        hh = 1
+    if cast[uint64](ww) > HOST_MAX_W:
+        ww = cast[int32](HOST_MAX_W)
+    if cast[uint64](hh) > HOST_MAX_H:
+        hh = cast[int32](HOST_MAX_H)
+    host_w = ww
+    host_h = hh
+    n: uint64 = cast[uint64](ww) * cast[uint64](hh) * 3
+    i: uint64 = 0
+    while i < n:
+        hostfb[i] = 0
+        i = i + 1
+
+
+# Parse the scene buffer produced by the last hamscene_* build pass and draw
+# every primitive into the framebuffer. Returns the number of primitives
+# drawn (comments/blank lines excluded).
+def hamui_host_rasterize() -> int32:
+    buf: Ptr[uint8] = hamscene_bufptr()
+    end: uint64 = hamscene_length()
+    drawn: int32 = 0
+    i: uint64 = 0
+    while i < end:
+        # Determine the verb by first token.
+        ls: uint64 = i
+        # find end of line
+        le: uint64 = i
+        while le < end and buf[le] != 10:
+            le = le + 1
+        # skip comment / blank
+        if ls < le and buf[ls] != 35:
+            c0: uint8 = buf[ls]
+            # fill / rect / text / glyphs / line / stroke — dispatch on c0
+            # + length by re-reading the verb token.
+            vstart: uint64 = ls
+            vend: uint64 = ls
+            while vend < le and buf[vend] != 32:
+                vend = vend + 1
+            vlen: uint64 = vend - vstart
+            handled: int32 = _draw_verb(buf, vstart, vlen, vend, le)
+            if handled != 0:
+                drawn = drawn + 1
+        i = le + 1
+    return drawn
+
+
+# Dispatch one primitive line. `vend` is the offset just past the verb; the
+# args run [vend..le).
+def _draw_verb(buf: Ptr[uint8], vstart: uint64, vlen: uint64, vend: uint64,
+               le: uint64) -> int32:
+    c0: uint8 = buf[vstart]
+    # fill (102) / rect (114 'r' but 'rect') / stroke (115 's') / line (108)
+    # / text (116 't') / glyphs (103 'g')
+    if (c0 == 102) or (vlen == 4 and c0 == 114 and buf[vstart + 1] == 101):
+        # fill x y w h #col   OR   rect x y w h #col
+        p: uint64 = _parse_int(buf, vend, le)
+        x: int32 = _num
+        p = _parse_int(buf, p, le)
+        y: int32 = _num
+        p = _parse_int(buf, p, le)
+        w: int32 = _num
+        p = _parse_int(buf, p, le)
+        h: int32 = _num
+        p = _skip_sp(buf, p, le)
+        _parse_color(buf, p, le)
+        _fill_rect(x, y, w, h, _col_r, _col_g, _col_b)
+        return 1
+    if c0 == 115:                                       # stroke x y w h thick #col
+        p2: uint64 = _parse_int(buf, vend, le)
+        sx: int32 = _num
+        p2 = _parse_int(buf, p2, le)
+        sy: int32 = _num
+        p2 = _parse_int(buf, p2, le)
+        sw: int32 = _num
+        p2 = _parse_int(buf, p2, le)
+        sh: int32 = _num
+        p2 = _parse_int(buf, p2, le)
+        st: int32 = _num
+        p2 = _skip_sp(buf, p2, le)
+        _parse_color(buf, p2, le)
+        # four edges of thickness st
+        _fill_rect(sx, sy, sw, st, _col_r, _col_g, _col_b)              # top
+        _fill_rect(sx, sy + sh - st, sw, st, _col_r, _col_g, _col_b)    # bottom
+        _fill_rect(sx, sy, st, sh, _col_r, _col_g, _col_b)             # left
+        _fill_rect(sx + sw - st, sy, st, sh, _col_r, _col_g, _col_b)   # right
+        return 1
+    if c0 == 108:                                       # line x1 y1 x2 y2 thick #col
+        p3: uint64 = _parse_int(buf, vend, le)
+        lx1: int32 = _num
+        p3 = _parse_int(buf, p3, le)
+        ly1: int32 = _num
+        p3 = _parse_int(buf, p3, le)
+        lx2: int32 = _num
+        p3 = _parse_int(buf, p3, le)
+        ly2: int32 = _num
+        p3 = _parse_int(buf, p3, le)
+        lt: int32 = _num
+        p3 = _skip_sp(buf, p3, le)
+        _parse_color(buf, p3, le)
+        _draw_line(lx1, ly1, lx2, ly2, lt)
+        return 1
+    if c0 == 116 or c0 == 103:                          # text / glyphs x y "s" #col [b]
+        p4: uint64 = _parse_int(buf, vend, le)
+        tx: int32 = _num
+        p4 = _parse_int(buf, p4, le)
+        ty: int32 = _num
+        p4 = _skip_sp(buf, p4, le)
+        # Peek for a trailing " b" bold flag: colour token then optional 'b'.
+        # We must set the colour BEFORE drawing, so scan the string first to
+        # find its end, parse the colour, note bold, then draw.
+        qs: uint64 = p4                                 # at opening quote
+        # find closing quote
+        qi: uint64 = qs
+        if qi < le and buf[qi] == 34:
+            qi = qi + 1
+        while qi < le and buf[qi] != 34:
+            qi = qi + 1
+        # qi at closing quote; colour begins after it
+        cp: uint64 = _skip_sp(buf, qi + 1, le)
+        _parse_color(buf, cp, le)
+        # bold flag: after colour, a lone 'b'
+        bp: uint64 = cp
+        while bp < le and buf[bp] != 32 and buf[bp] != 10:
+            bp = bp + 1
+        bp = _skip_sp(buf, bp, le)
+        bold: int32 = 0
+        if bp < le and buf[bp] == 98:
+            bold = 1
+        _draw_text(buf, qs, le, tx, ty, bold)
+        return 1
+    return 0
+
+
+# Build a binary PPM (P6) header "P6\n<w> <h>\n255\n" into `out`; returns
+# its length. The driver writes this header, then hamui_host_fb_ptr() for
+# hamui_host_fb_bytes() bytes, to produce a complete .ppm.
+def hamui_host_ppm_header(out: Ptr[uint8]) -> uint64:
+    p: uint64 = 0
+    out[p] = 80                                         # 'P'
+    p = p + 1
+    out[p] = 54                                         # '6'
+    p = p + 1
+    out[p] = 10
+    p = p + 1
+    p = p + _dec(host_w, &out[p])
+    out[p] = 32
+    p = p + 1
+    p = p + _dec(host_h, &out[p])
+    out[p] = 10
+    p = p + 1
+    out[p] = 50                                         # '2'
+    p = p + 1
+    out[p] = 53                                         # '5'
+    p = p + 1
+    out[p] = 53                                         # '5'
+    p = p + 1
+    out[p] = 10
+    p = p + 1
+    return p
+
+
+def _dec(v: int32, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    x: uint32 = cast[uint32](v)
+    digs: Array[16, uint8]
+    n: uint64 = 0
+    while x > 0:
+        digs[n] = cast[uint8](x % 10) + 48
+        x = x / 10
+        n = n + 1
+    w: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digs[n]
+        i = i + 1
+    return w
