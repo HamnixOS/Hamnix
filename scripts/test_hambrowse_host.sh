@@ -238,6 +238,81 @@ assert_grep4 '^SEG [0-9]+ 8 #0a14c8 .*Inline rgb override wins' \
 assert_grep4 '^SEG [0-9]+ (1[0-9][0-9]|[2-9][0-9][0-9]) .*Inline centered paragraph' \
     "inline text-align:center -> centred line"
 
+# ====================================================================
+# JAVASCRIPT + minimal DOM fixture — <script> runs at load; console.log is
+# captured; the DOM the script mutates (textContent, style.color,
+# style.display) changes what renders; document.title is settable.
+# ====================================================================
+FIX5="tests/fixtures/hambrowse_js.html"
+DUMP5="$OUT/dump_js.txt"
+echo "[hb-host] running host harness on $FIX5 ..."
+if ! "$BIN" "$FIX5" 600 >"$DUMP5" 2>&1; then
+    echo "[hb-host] FAIL: js harness exited non-zero"; cat "$DUMP5"; exit 1
+fi
+cat "$DUMP5"
+
+assert_grep5() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMP5"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# console.log output is captured and surfaced.
+assert_grep5 '^JSLOG hello from js$'  "console.log string is captured"
+assert_grep5 '^JSLOG 1\+1 = 2$'       "console.log evaluates + prints an expression (1+1=2)"
+# getElementById(...).textContent = ... changes what renders.
+assert_grep5 '\|JS set this heading\|' "textContent set on #head changes the heading text"
+assert_grep5 '\|mutated by script\|'   "textContent set on #msg changes the paragraph text"
+# The ORIGINAL placeholder text is gone (proves the mutation replaced it).
+if grep -q 'Placeholder heading' "$DUMP5"; then
+    echo "[hb-host] FAIL original #head text still rendered"; fail=1
+else
+    echo "[hb-host] PASS original #head placeholder text replaced by JS"
+fi
+# style.color set by JS -> the element renders in that colour.
+assert_grep5 '^SEG [0-9]+ 8 #ff0000 .*\|tint me\|' "style.color='red' -> #ff0000 text"
+# style.display='none' hides the element (no segment for its text).
+if grep -q 'you should not see this hidden line' "$DUMP5"; then
+    echo "[hb-host] FAIL style.display='none' element still rendered"; fail=1
+else
+    echo "[hb-host] PASS style.display='none' hides the element (no segment)"
+fi
+# The static (non-scripted) tail paragraph is untouched.
+assert_grep5 '\|Static tail paragraph stays put.\|' "un-scripted content renders unchanged"
+# document.title is settable from JS.
+assert_grep5 '^TITLE Title From JS$' "document.title assignment reflected"
+
+# ---- graceful JS error: a runtime error must not crash the render --------
+cat > "$OUT/js_err.html" <<'HTML'
+<html><body>
+<p id="a">before</p>
+<script>
+  document.getElementById('a').textContent = 'set ok';
+  bogusUndefinedRef.doStuff();
+</script>
+<p>after error</p>
+</body></html>
+HTML
+DUMP6="$OUT/dump_js_err.txt"
+if ! "$BIN" "$OUT/js_err.html" 600 >"$DUMP6" 2>&1; then
+    echo "[hb-host] FAIL: js-error harness exited non-zero"; cat "$DUMP6"; exit 1
+fi
+cat "$DUMP6"
+if grep -q 'JSERR 1' "$DUMP6"; then
+    echo "[hb-host] PASS runtime JS error surfaced as JSERR"
+else
+    echo "[hb-host] FAIL runtime JS error not surfaced"; fail=1
+fi
+# the render survives the error: pre-error mutation applied + tail still renders.
+if grep -q '|set ok|' "$DUMP6" && grep -q '|after error|' "$DUMP6"; then
+    echo "[hb-host] PASS render survives a JS error (pre-error DOM change kept, page intact)"
+else
+    echo "[hb-host] FAIL render did not survive the JS error"; fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
     exit 0
