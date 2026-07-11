@@ -99,6 +99,15 @@ else
     echo "[2048-host] FAIL board tile count did not evolve"; fail=1
 fi
 
+# --- Tile-number "junk after the number" regression (button-path bug) ----
+# Root cause: _fmt wrote the digits but no NUL, so the scene glyph sink
+# over-read stack bytes after the number. The garbage differed by call path,
+# so ONLY the deep pointer/click (button) render showed junk; keyboard stayed
+# clean. Fix = _fmt NUL-terminates. These three gates prove it deterministically.
+assert_grep '^FMTCLEAN 1'        "tile formatter NUL-terminates against a poisoned buffer"
+assert_grep '^BTNTILECLEAN 1'    "after a BUTTON move every tile number is digits-only (no junk)"
+assert_grep '^KBTILECLEAN 1'     "after a KEYBOARD move every tile number is digits-only (matches button path)"
+
 if [ "$fail" -eq 0 ]; then
     echo "[2048-host] RESULT: PASS"
     exit 0
