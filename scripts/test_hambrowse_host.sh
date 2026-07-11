@@ -75,17 +75,24 @@ assert_grep '#ffa500 .*| inside orange|'          "span style=color:orange -> #f
 
 # Links keep their role colour even adjacent to a coloured span, and default
 # text is body-black.
-assert_grep '#1a4fd0 b0 u1 l0 | blue link|'       "link stays link-blue (#1a4fd0), underlined, link id 0"
+assert_grep '#1a4fd0 b0 u1 l0 bg- | blue link|'   "link stays link-blue (#1a4fd0), underlined, link id 0"
 assert_grep '#101010 .*|Plain body text'          "uncoloured text stays body-black (#101010)"
 
-# bgcolor must NOT be mistaken for text color (word-boundary check): the
-# text of the bgcolor paragraph must resolve to body-black, not yellow.
-if grep -q '#ffff00 .*bgcolor is not' "$DUMP"; then
+# Background-colour rung: bgcolor / background-color fill the box BEHIND the
+# text (seg bg field) without changing the TEXT colour.
+#   * bgcolor="yellow" paragraph: text body-black, bg #ffff00.
+#   * <span style="background-color:#ffff00"> highlight: text body-black, bg yellow.
+assert_grep '#101010 b0 u0 l-1 bg#ffff00 |bgcolor is not text color.|' \
+    "p bgcolor=yellow -> body-black text on yellow bg"
+assert_grep '#101010 b0 u0 l-1 bg#ffff00 | highlight|' \
+    "span background-color:#ffff00 -> body-black text on yellow bg"
+# The TEXT-colour field (immediately after 'SEG row x ') must never be yellow:
+# that would mean bgcolor leaked into the text colour (word-boundary failure).
+if grep -Eq '^SEG [0-9]+ [0-9]+ #ffff00' "$DUMP"; then
     echo "[hb-host] FAIL bgcolor was mistaken for text color"; fail=1
 else
     echo "[hb-host] PASS bgcolor not mistaken for text color (word boundary)"
 fi
-assert_grep '#101010 .*|bgcolor is not text color.|' "bgcolor paragraph text stays body-black"
 
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
