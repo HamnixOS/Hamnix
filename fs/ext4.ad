@@ -4008,36 +4008,50 @@ def ext4_alloc_inode() -> uint32:
 
 
 def ext4_free_inode(inum: uint32) -> int32:
-    # Clear the inode bitmap bit for `inum`. Refuses cross-group inums
-    # for the same reason ext4_free_block does (group-0 scope until a
-    # follow-up adds multi-group walks).
+    # Clear the inode bitmap bit for `inum`, in WHATEVER group it lives.
+    #
+    # MULTI-GROUP: this used to refuse any inum past group 0
+    # (iu > inodes_per_grp) — the asymmetric twin of the group-0-only
+    # ext4_alloc_inode that QA-N30 already fixed. But ext4_alloc_inode
+    # hands out inodes from EVERY group (a host-seeded image packs group
+    # 0, so new files land in high groups), so refusing to free them
+    # LEAKED the inode bitmap bit of every deleted non-group-0 inode. A
+    # leaked inode whose data block is later reallocated shows up in
+    # e2fsck as a multiply-claimed block shared by the (still-"in-use")
+    # leaked inode and the new owner — the large_dir double-claim this
+    # repro chased (a boot mkdir/rmdir smoke test left a high-group
+    # directory inode behind). The inode-table and group-descriptor
+    # accessors are already group-aware, so freeing across groups is a
+    # matter of deriving the group from the inode number.
     if ext4_blockdev_slot < 0:
         return -1
     if inum == 0:
         return -1
     iu: uint64 = cast[uint64](inum)
-    if iu > ext4_inodes_per_grp:
-        printk0("ext4: free_inode: inode not in group 0\n")
+    if iu > ext4_inodes_count:
         return -1
+    if ext4_inodes_per_grp == 0:
+        return -1
+    grp: uint64 = (iu - 1) / ext4_inodes_per_grp
+    rel: uint64 = (iu - 1) % ext4_inodes_per_grp    # bit index within group
     # bg_inode_bitmap (lo @ 0x04, hi @ 0x24) — descriptor-supplied,
-    # flex-relocated location.
+    # flex-relocated location for THIS inode's group.
     bm_block: uint64 = _ext4_group_desc_block_u64(
-        0, EXT4_BG_INODE_BITMAP_LO, EXT4_BG_INODE_BITMAP_HI)
+        grp, EXT4_BG_INODE_BITMAP_LO, EXT4_BG_INODE_BITMAP_HI)
     if bm_block == 0:
         return -1
     if _ext4_read_block(bm_block, &ext4_bitmap_buf[0]) != 0:
         return -1
-    rel: uint64 = iu - 1                                # bit index within group
     byte_idx: uint64 = rel / 8
     bit_idx:  uint64 = rel % 8
     mask: uint8 = cast[uint8](1) << cast[uint8](bit_idx)
     ext4_bitmap_buf[byte_idx] = ext4_bitmap_buf[byte_idx] & (~mask)
     if _ext4_write_block(bm_block, &ext4_bitmap_buf[0]) != 0:
         return -1
-    # One more free inode in group 0 + the superblock; refresh csums.
+    # One more free inode in this group + the superblock; refresh csums.
     # (itable_unused is a never-used watermark — it only shrinks, so a
     # free leaves it alone.)
-    _ext4_gd_update_after_bitmap(0, 1, &ext4_bitmap_buf[0], 1)
+    _ext4_gd_update_after_bitmap(grp, 1, &ext4_bitmap_buf[0], 1)
     _ext4_sb_adjust_free(0, 1)
     return 0
 
@@ -5637,6 +5651,48 @@ def ext4_pwrite_inode(inum: uint32, src: Ptr[uint8],
 # delete is crash-consistent; on a no-journal image the write goes
 # straight to disk in the same order Linux's no-journal path commits.
 
+def _ext4_drop_inode_link(inum: uint32):
+    # Drop ONE reference to inode `inum` (an unlink or a rename that
+    # overwrites this inode's name):
+    #   * i_links_count > 1  → another hard link remains; just decrement
+    #     the count and keep the inode + ALL its data blocks. Freeing them
+    #     here would corrupt the surviving link (a later allocation
+    #     re-hands-out the "freed" block, which e2fsck then reports as a
+    #     multiply-claimed block shared by the surviving-link inode and the
+    #     new owner — the exact large_dir double-claim this repro hit, from
+    #     the boot links smoke test unlinking one of two hardlinks).
+    #   * last (or only) link → free every data block via
+    #     _ext4_extent_trim_to(..., 0) (walks the inline depth-0 leaf AND a
+    #     depth-1/2/3 index tree, freeing index/leaf blocks and folding the
+    #     in-memory extent header back to empty), then mark the inode
+    #     DELETED — i_links_count = 0 and a stamped i_dtime — and persist it
+    #     BEFORE releasing the bitmap bit. A freed inode whose table entry
+    #     still shows links>0 / dtime==0 looks IN-USE to e2fsck, so it would
+    #     keep "owning" its now-free blocks and multiply-claim any that get
+    #     reallocated. i_links_count is the u16 at 0x1A; i_dtime the u32 at
+    #     0x14.
+    ib: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &ib[0]) != 0:
+        # Can't read it — still reclaim the bitmap slot.
+        ext4_free_inode(inum)
+        return
+    lc: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](cast[uint64](&ib[0]) + 0x1A))
+    if lc > 1:
+        _ext4_write_u16(
+            cast[Ptr[uint8]](cast[uint64](&ib[0]) + 0x1A),
+            cast[uint16](cast[uint64](lc) - 1))
+        _ext4_stamp_mtime(&ib[0])
+        ext4_write_inode(cast[uint64](inum), &ib[0])
+        return
+    _ext4_extent_trim_to(&ib[0], 0)
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](&ib[0]) + 0x1A), 0)
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&ib[0]) + 0x14),
+                    _ext4_now_epoch())
+    ext4_write_inode(cast[uint64](inum), &ib[0])
+    ext4_free_inode(inum)
+
+
 def ext4_unlink(name: Ptr[char]) -> int32:
     if ext4_blockdev_slot < 0:
         set_current_errstr("ext4: volume not mounted")
@@ -5695,17 +5751,11 @@ def ext4_unlink(name: Ptr[char]) -> int32:
         set_current_errstr("ext4: unlink: no such file")
         return -2                                  # -ENOENT
 
-    # Read the file's inode and free every data block via
-    # _ext4_extent_trim_to(..., 0) — the same helper ext4_truncate_inode
-    # uses for a full truncate-to-zero. It now walks both the inline
-    # depth-0 leaf AND a depth-1 index tree (freeing index/leaf blocks),
-    # so an index-node file is fully reclaimed here.
-    finode: Array[256, uint8]
-    if ext4_read_inode(cast[uint64](target_inum), &finode[0]) == 0:
-        _ext4_extent_trim_to(&finode[0], 0)
-    # Free the inode regardless — even if the block free failed,
-    # we want the inode slot reclaimed.
-    ext4_free_inode(target_inum)
+    # Drop one reference to the target inode. _ext4_drop_inode_link
+    # honours i_links_count (a hardlinked file keeps its inode + blocks
+    # until the LAST name goes) and, on the final unlink, marks the inode
+    # deleted before releasing it — see its comment for why that matters.
+    _ext4_drop_inode_link(target_inum)
 
     # Tombstone the dirent. We don't coalesce with the previous
     # entry's rec_len — leaving the slot in-place lets a future
@@ -5824,10 +5874,21 @@ def ext4_rmdir(path: Ptr[char]) -> int32:
     if empty == 0:
         return -39                                  # -ENOTEMPTY
 
-    # Free the directory's data block(s) then its inode — same helper
-    # ext4_unlink uses for a full reclaim (walks inline leaf + depth-1
-    # index tree).
+    # Free the directory's data block(s), then mark the inode DELETED
+    # (links=0, i_dtime stamped) and persist it BEFORE releasing the
+    # bitmap bit. rmdir removes the whole directory, so unlike a hardlink
+    # unlink it always reclaims — but it MUST still clear the inode: a
+    # freed directory whose table entry keeps its nlink (2) and dtime==0
+    # looks IN-USE to e2fsck, which then keeps it "owning" its now-free
+    # block. If that block is later reallocated the fsck reports a
+    # multiply-claimed block + an "Unconnected directory inode" (the same
+    # leak class as the hardlink-unlink bug). _ext4_extent_trim_to walks
+    # the inline leaf + depth-1/2/3 index tree and empties the header.
     _ext4_extent_trim_to(&dnode[0], 0)
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](&dnode[0]) + 0x1A), 0)
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&dnode[0]) + 0x14),
+                    _ext4_now_epoch())
+    ext4_write_inode(cast[uint64](target_inum), &dnode[0])
     ext4_free_inode(target_inum)
 
     # Decrement the parent's i_links_count: removing a child dir drops
@@ -7597,18 +7658,13 @@ def ext4_rename(old_path: Ptr[char], new_path: Ptr[char]) -> int32:
     if dr < 0:
         return -1
     if dr > 0:
-        # Free the overwritten file's inode + its inline-leaf blocks.
-        victim: Array[256, uint8]
-        if ext4_read_inode(cast[uint64](dst_inum), &victim[0]) == 0:
-            vblocks: uint64 = _ext4_inode_block_count(&victim[0])
-            vb: uint64 = 0
-            while vb < vblocks:
-                vphys: uint64 = _ext4_logical_to_physical(&victim[0],
-                                                          vb)
-                if vphys != 0:
-                    ext4_free_block(vphys)
-                vb = vb + 1
-        ext4_free_inode(dst_inum)
+        # Drop the overwritten destination's link the same way unlink
+        # does: _ext4_drop_inode_link honours i_links_count (a hardlinked
+        # dst keeps its inode + blocks) and, on the last link, frees the
+        # full extent tree (index/leaf metadata blocks included, which the
+        # old per-logical-block loop missed) and marks the inode deleted so
+        # its reclaimed slot can't multiply-claim a reallocated block.
+        _ext4_drop_inode_link(dst_inum)
         # Page-cache coherence: the overwritten destination inode is freed
         # (its inum may be reused) — drop its cached pages, no writeback.
         fcache_drop_inode_nowriteback(PC_SRV_EXT4, cast[uint64](dst_inum))
@@ -7828,7 +7884,11 @@ def ext4_rmdir_smoke_test() -> int32:
     # primitives (ext4_unlink is root-dir-scoped, so it can't reach a
     # child inside RMD_N), then rmdir the now-empty dir.
     _ext4_dir_tombstone(cast[uint64](nei_parent), "KID.TXT")
-    ext4_free_inode(kid_inum)
+    # Reclaim the child properly: trim its data block(s) and mark the inode
+    # deleted before releasing it (a bare ext4_free_inode would leave the
+    # block allocated and the inode looking in-use — a leak in the same
+    # class as the unlink/rmdir bugs).
+    _ext4_drop_inode_link(kid_inum)
     if ext4_rmdir("RMD_N") != 0:
         printk0("ext4: rmdir smoke FAIL (rmdir after empty)\n")
         return -1
