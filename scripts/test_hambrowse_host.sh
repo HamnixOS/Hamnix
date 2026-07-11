@@ -313,6 +313,94 @@ else
     echo "[hb-host] FAIL render did not survive the JS error"; fail=1
 fi
 
+# ====================================================================
+# EVENTS — a programmatic click (no pointer) fires a stored JS handler via
+# js_call_fn in the persistent context, then re-lays-out. This is the
+# acceptance path for interactivity.
+# ====================================================================
+FIXE="tests/fixtures/hambrowse_events.html"
+# (a) el.onclick = fn  -> click #btn increments a counter the render reflects.
+DUMPE="$OUT/dump_events_btn.txt"
+echo "[hb-host] running host harness on $FIXE (click btn) ..."
+if ! "$BIN" "$FIXE" 600 btn >"$DUMPE" 2>&1; then
+    echo "[hb-host] FAIL: events harness exited non-zero"; cat "$DUMPE"; exit 1
+fi
+cat "$DUMPE"
+assert_grepE() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMPE"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+# Before the click the counter reads 0; the CLICK separator is emitted.
+assert_grepE '^CLICK btn$' "programmatic click on #btn dispatched"
+# After the click, the onclick handler ran: counter text updated + console.log.
+assert_grepE '^JSLOG clicked, count=1$' "onclick handler ran (console.log after dispatch)"
+# The post-click dump (after CLICK) shows the mutated counter text.
+awk '/^CLICK btn$/{c=1} c' "$DUMPE" | grep -q '|count is 1|' && \
+    echo "[hb-host] PASS el.onclick handler mutation rendered (count is 1)" || \
+    { echo "[hb-host] FAIL onclick DOM mutation did not render"; fail=1; }
+# The counter was 0 BEFORE the click (pre-click dump).
+awk '/^CLICK btn$/{exit} {print}' "$DUMPE" | grep -q '|count is 0|' && \
+    echo "[hb-host] PASS pre-click state was count is 0" || \
+    { echo "[hb-host] FAIL pre-click state wrong"; fail=1; }
+
+# (b) addEventListener('click', fn) -> click #msg mutates text + colour.
+DUMPE2="$OUT/dump_events_msg.txt"
+echo "[hb-host] running host harness on $FIXE (click msg) ..."
+if ! "$BIN" "$FIXE" 600 msg >"$DUMPE2" 2>&1; then
+    echo "[hb-host] FAIL: events harness (msg) exited non-zero"; cat "$DUMPE2"; exit 1
+fi
+cat "$DUMPE2"
+if awk '/^CLICK msg$/{c=1} c' "$DUMPE2" | grep -Eq '#ff0000 .*\|msg was clicked\|'; then
+    echo "[hb-host] PASS addEventListener('click') handler ran (text + red colour rendered)"
+else
+    echo "[hb-host] FAIL addEventListener click handler did not render"; fail=1
+fi
+
+# ====================================================================
+# RICHER DOM — innerHTML, createElement+appendChild, className, querySelector,
+# getAttribute/setAttribute, and background-color/font-weight/text-align.
+# ====================================================================
+FIXD="tests/fixtures/hambrowse_dom2.html"
+DUMPD="$OUT/dump_dom2.txt"
+echo "[hb-host] running host harness on $FIXD ..."
+if ! "$BIN" "$FIXD" 600 >"$DUMPD" 2>&1; then
+    echo "[hb-host] FAIL: dom2 harness exited non-zero"; cat "$DUMPD"; exit 1
+fi
+cat "$DUMPD"
+assert_grepD() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMPD"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+# innerHTML set to markup -> parsed + rendered (the <b> becomes bold).
+assert_grepD '^SEG 0 8 #101010 b1 .*\|bold new\|' "innerHTML set -> <b> renders bold"
+if grep -q 'old inner' "$DUMPD"; then
+    echo "[hb-host] FAIL innerHTML did not replace original inner"; fail=1
+else
+    echo "[hb-host] PASS innerHTML replaced the original inner markup"
+fi
+# style.backgroundColor + fontWeight + textAlign together on #styled.
+assert_grepD '^SEG [0-9]+ (1[0-9][0-9]|[2-9][0-9][0-9]) #101010 b1 .*bg#ffff00 \|style me\|' \
+    "style.backgroundColor/fontWeight/textAlign -> yellow bg, bold, centred"
+# className change -> the .warn CSS rule now applies (red + bold).
+assert_grepD '^SEG [0-9]+ 8 #ff0000 b1 .*\|class target\|' \
+    "element.className='warn' -> .warn CSS rule applies (red bold)"
+# createElement + appendChild -> the new <li> renders, coloured green.
+assert_grepD '#008000 .*\|appended item\|' "createElement+appendChild adds a green <li>"
+# querySelector('.class') + getAttribute reflected via console.log.
+assert_grepD '^JSLOG querySelector .warn text = warn para$' "querySelector('.warn') returns the element"
+assert_grepD '^JSLOG getAttribute data-role = banner$'       "getAttribute reads a source attribute"
+# setAttribute('class','warn') -> .warn rule applies to #attr.
+assert_grepD '^SEG [0-9]+ 8 #ff0000 b1 .*\|attr target\|' \
+    "setAttribute('class','warn') -> .warn CSS rule applies"
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
     exit 0
