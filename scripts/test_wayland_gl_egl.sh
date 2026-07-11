@@ -144,10 +144,18 @@ else
 fi
 
 # --- RENDER: weston-simple-egl (Mesa llvmpipe over wl_shm) -------------
-# Single-threaded llvmpipe (LP_NUM_THREADS=0) minimizes futex/thread churn in
-# the ns; MESA_SHADER_CACHE_DISABLE avoids needing a writable cache dir.
+# KEEP THIS COMMAND SHORT. hamsh's serial console wraps typed input at ~262
+# columns; a longer line silently truncates the trailing `spawn linux { ... }`
+# clause so the client never launches (the same trap documented in
+# test_wayland_firefox.sh). Four exports fit comfortably: XDG_RUNTIME_DIR +
+# WAYLAND_DISPLAY point Mesa's EGL Wayland platform at the compositor socket;
+# LIBGL_ALWAYS_SOFTWARE forces the software path; GALLIUM_DRIVER=llvmpipe picks
+# the llvmpipe swrast driver. The compositor advertises wl_shm only, so Mesa
+# takes dri2_initialize_wayland_swrast automatically (no /dev/dri, no GBM). The
+# remaining knobs (swrast override, single-thread, shader-cache-disable) are
+# Mesa defaults / non-essential and are dropped to stay under the wrap column.
 pre_commits=$(grep -acF "$COMMIT_MARKER" "$LOG" 2>/dev/null | head -1)
-GL_CMD='export XDG_RUNTIME_DIR=/run ; export WAYLAND_DISPLAY=wayland-0 ; export LIBGL_ALWAYS_SOFTWARE=1 ; export GALLIUM_DRIVER=llvmpipe ; export EGL_PLATFORM=wayland ; export MESA_LOADER_DRIVER_OVERRIDE=swrast ; export LP_NUM_THREADS=0 ; export MESA_SHADER_CACHE_DISABLE=true ; spawn linux { /usr/bin/weston-simple-egl }'
+GL_CMD='export XDG_RUNTIME_DIR=/run ; export WAYLAND_DISPLAY=wayland-0 ; export LIBGL_ALWAYS_SOFTWARE=1 ; export GALLIUM_DRIVER=llvmpipe ; spawn linux { /usr/bin/weston-simple-egl }'
 echo "$TAG --- RENDER: launch weston-simple-egl (llvmpipe/swrast) ---"
 committed=0
 if send_until "$GL_CMD" "$COMMIT_MARKER" "$CMD_WAIT"; then
