@@ -504,12 +504,52 @@ skip the workflow (`paths-ignore`). Adding a gate = one line in the manifest.
 
 ---
 
+## Native-capability push (2026-07-10) — reduce Linux-ns reliance
+
+USER DIRECTIVE: make the OS as capable as possible natively; Linux ns is a
+fallback, not a primary. Pushed back on "compete with Firefox/Chrome / full
+Python" parity framing (unwinnable) → reframed to winnable targets. All
+dual-target + host-iterable. See memory `project_native_capability_push`.
+
+Landed + pushed:
+- [x] **Native JS engine** `lib/jsengine.ad` — ES5/basic-ES6 tree-walking
+  interpreter, dual-target; host gate 10/10 exact-output PASS; `js_eval` +
+  host-binding API for the browser's future DOM. Native gate BLOCKED on the
+  FPU gap above (kept in-tree, un-wired). `05ebc230`+`9d9d9ae3`+`b6d2977b`.
+- [x] **Browser CSS cascade** — `<style>` element/`.class`/`#id`/descendant
+  selectors + specificity, `color`/`bg`/`font-weight`/`text-align`/
+  `display:none`, `rgb()`+named colors, inline-style override; `TODO(js)`
+  hook left for `js_eval`. Monospace-grid model (pixel box-model deferred).
+  Host gate 48 assertions PASS. `c3dc99dd`.
+- [x] **ext4 fast-commit + largedir corruption fixes** — page-cache
+  invalidation on FC replay (`f2972fad`); leaked-inode multiply-claim
+  (multi-group `ext4_free_inode` + `_ext4_drop_inode_link`, `6acd2d36`).
+- [~] **hamsh dual-syntax** — Python-indentation ⟷ curly, fully
+  interchangeable (context = default only). Agent in flight (task #44).
+
 ## Kernel hardening & correctness
 
-- [ ] **CPU-mitigations.** SMEP landed; **SMAP CR4-flip + KASLR + KPTI**
-  open. SMAP flip is gated OFF because high-half kernel pages are US=1 —
-  flipping triple-faults until they're re-stamped US=0. Cite:
-  `arch/x86/kernel/trap_diag.ad:382`.
+- [~] **CPU-mitigations.** SMEP + SMAP page-stamp landed; **Spectre-v2
+  landed** (2026-07-10, `c2a56419`): IBRS/STIBP/SSBD via `IA32_SPEC_CTRL`
+  (CPUID-gated) + IBPB on cross-address-space context switch; `-smp 2`
+  heartbeat verified clean. Still **open: SMAP CR4-flip, KPTI, MDS
+  VERW-on-return.** KPTI deferred with a concrete plan — this kernel's
+  swapgs-less `%gs`-offset entry + high-half entry pages make a live CR3
+  switch triple-fault-prone (see task #48). SMAP flip is gated OFF because
+  high-half kernel pages are US=1. Cite: `arch/x86/kernel/trap_diag.ad:382`.
+- [ ] **FPU/SSE/AVX context-switch save/restore (FOUNDATIONAL).** The
+  context switch (`__switch_to_asm`, `arch/x86/kernel/sched_asm.S:50`)
+  swaps only callee-saved GPRs — NO `fxsave`/`xsave` of the FPU/vector
+  file. So any native float64/SIMD corrupts under preemption (found via
+  the native JS engine: `2.0*3.0+1.0`→`1`), and likely corrupts SSE/AVX
+  Debian-ns binaries too. Secondary: APs enable XCR0/OSXSAVE but never
+  `CR4.OSFXSR`/`OSXMMEXCPT`. Fix dispatched (task #49); acceptance = the
+  BLOCKED `test_jsengine_native.sh` goes green. See memory
+  `project_fpu_ctxswitch_gap`.
+- [ ] **Intermittent EFI-stub #PF during kernel load (OVMF).** A #PF in
+  the EFI stub right after "kernel ELF read OK" ("Can't find image
+  information"), intermittent — a shipped/installer boot-reliability risk
+  (task #50). Not introduced by userspace work.
 - [ ] **Suspend/resume.** S3 path real; HW wake-vector trampoline in
   `entry.S` pending. S0ix later.
 - [ ] **F2 thin-shim conversion.** `SYS_NICE`/`SVC_CTL`/`NETCFG`/
@@ -618,8 +658,13 @@ Open blockers (agent-owned):
   loop + persistent state.
 - [ ] X11/Xvfb bridge in a `kind=fb` layer (path to Firefox/Chromium).
 - [~] BDF font store landed; runtime font-file loading deferred.
-- Known bugs: cursor hotspot (clicks at arrow bottom, not tip); terminal
-  ~0.5s input lag.
+- [x] **Cursor hotspot + terminal input lag FIXED** (2026-07-10,
+  `5bed1f72`+`f6878b17`). Cursor hotspot was already correct in the kernel
+  (`cb202157`) but ungated — added `test_de_cursor_hotspot.sh`. The ~0.5s
+  terminal echo lag was hamterm busy-polling (`sys_read_nb`+`sys_yield`
+  kept it READY; `yield_to_others` naps a full 10ms tick, compounding
+  across every always-ready poller); fixed by making hamterm event-driven
+  via `sys_waitfds` (parks on `/keys`,`/pointer`,`shell-stdout`).
 
 ## GPU / graphics (#181–185, native-first)
 
