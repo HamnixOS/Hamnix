@@ -1,0 +1,10 @@
+console.log(1 + 2 * 3 - 4 / 2);
+console.log((2 + 3) * 4);
+console.log(2 % 3, 7 % 3, 10 % 4);
+console.log(2 * 3 == 6, 5 > 3, 5 <= 5, 3 != 4);
+console.log(1 === 1, 1 === "1", 1 == "1", null == undefined);
+console.log(5 & 3, 5 | 2, 5 ^ 1, 1 << 4, 255 >> 4, ~0);
+console.log(-5, +"3", !true, !0);
+console.log(true && "yes", false || "fallback", 0 && "no");
+console.log(3.5 + 1.5, 10 / 4);
+console.log(2 > 1 ? "a" : "b");

@@ -1,0 +1,16 @@
+var a = [1, 2, 3];
+a.push(4);
+a.push(5);
+console.log(a.length, a.join(","));
+console.log(a.pop(), a.length);
+console.log([1,2,3,4].map(function(n){ return n * n; }).join(" "));
+console.log([1,2,3,4,5].filter(function(n){ return n % 2 == 1; }).join(","));
+console.log([1,2,3,4].reduce(function(acc, n){ return acc + n; }, 0));
+console.log([1,2,3].indexOf(2), [1,2,3].indexOf(9));
+var o = { name: "hamnix", version: 1, active: true };
+console.log(o.name, o.version, o.active);
+o.extra = "added";
+console.log(o.extra);
+console.log(Object.keys(o).join(","));
+var nested = { list: [10, 20], inner: { x: 1 } };
+console.log(nested.list[1], nested.inner.x);
