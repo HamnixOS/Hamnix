@@ -94,9 +94,12 @@ the orchestrator's framing many times by going to the evidence. Reward disproof.
   LOOK at the PNG — visual gates go false-green.
 - Brief agents to kill ONLY their own `QEMU_PID` (trap on EXIT). NEVER
   `pkill -9 qemu` — it murders sibling agents' VMs and fakes a wedge.
-- Don't reboot for the chronic D-state ACPI kworkers (they inflate load but KVM is
-  healthy). A real `timeout(1)` kill logs `terminating on signal 15 from pid N
-  (timeout)` (rc 124); a pkill gives 137.
+- The chronic D-state ACPI kworkers were ROOT-CAUSED + FIXED 2026-07-10 (buggy-firmware
+  `acpitz` `_TMP` Sleep() wedging kacpi_notify; disabled via
+  `disable-buggy-acpitz.service` — load 5.3→0.6). If the host degrades again, first
+  `systemctl is-active disable-buggy-acpitz.service`; re-enable if it's off. See
+  `memory/project_degraded_host_acpi_kworkers.md`. A real `timeout(1)` kill logs
+  `terminating on signal 15 from pid N (timeout)` (rc 124); a pkill gives 137.
 - Commit footers:
   `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
   `Claude-Session: <this session's URL>`
@@ -122,8 +125,9 @@ To resume it (quiet host): next un-swept families in TODO's "CI / verification g
 
 Older backlog (still true) — either blocked on host quality or genuinely low-value:
 
-- **HOST-BLOCKED (need a healthier machine — this box's firmware-ACPI kworkers make the
-  guest ~100× slow, and a reboot does NOT durably clear them):**
+- **PREVIOUSLY HOST-BLOCKED — the box's firmware-ACPI thermal degradation was FIXED
+  2026-07-10 (`disable-buggy-acpitz.service`, load 5.3→0.6), so these are now worth
+  RE-ATTEMPTING on the healthier host:**
   - **Firefox map** — reaches `nsWindow::Create() Toplevel` (gpu-process=false gate found
     + fixed); one `QEMU_MEM=6G CMD_WAIT=400 scripts/test_wayland_firefox.sh` on a quiet
     host from a mapped window. The remaining distance to a `wl_shm` commit is SHORT.
