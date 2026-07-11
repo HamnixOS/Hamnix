@@ -128,36 +128,63 @@ and pipes it into a child's argv/envp staging — a dedicated kernel
 
 ## 5. Blocks & control flow
 
-**One uniform brace-delimited block, paste-robust, REPL-friendly.** No
-significant indentation (it fights interactive use and paste). No per-construct
-terminator zoo (`fi`/`done`/`esac` are banned). The parser knows a block is
-incomplete until the closing `}`, which is what makes both paste and the
-continuation prompt work.
+**Two fully-interchangeable block syntaxes; pick per block, mix freely.** Every
+block-structured construct (`if`/`elif`/`else`, `while`, `for`, `def`,
+`try`/`except`, `ns`, `enter`, `spawn`) accepts EITHER form, chosen from the
+token that opens its body:
+
+- **Brace** — `HEADER { statements }`. Paste-robust and REPL-friendly (the parser
+  knows a block is incomplete until the closing `}`). This is the preferred form
+  for interactive one-liners.
+- **Colon / significant-indentation** — `HEADER:` + newline + an indented body,
+  Python-style. The preferred form for static script *files*. A single-statement
+  inline `HEADER: statement` is also allowed (`if $x > 3: echo big`).
+
+No per-construct terminator zoo (`fi`/`done`/`esac` are banned). The two forms
+are decided **per block**, so a script may use indentation for its top-level
+structure and braces for inline one-liners (or vice-versa) — the following three
+programs are identical:
 
 ```
-if $x > 3 {
-    echo big
-} else {
-    echo small
+# brace                          # indentation                 # mixed
+if $x > 3 {                      if $x > 3:                     if $x > 3:
+    echo big                         echo big                      echo big
+} else {                         else:                          else { echo small }
+    echo small                       echo small
 }
 
-for f in $files {
-    process $f
-}
+for f in $files {                for f in $files:               def deploy(target):
+    process $f                       process $f                     stage $target
+}                                                                   push $target
 
-def deploy(target) {
-    ...
+def deploy(target) {             def deploy(target):
+    ...                              ...
 }
 ```
 
-Functions: `def name(params) { body }`. Functions run in the ambient namespace
-(§9) unless wrapped in `ns { }` / `enter` / `spawn`.
+Functions: `def name(params) { body }` or `def name(params):` + indented body.
+Functions run in the ambient namespace (§9) unless wrapped in `ns { }` /
+`enter` / `spawn`.
+
+**Lexing.** Indentation is tracked by the lexer: it emits an `INDENT` token when
+a logical line's leading column exceeds the enclosing level and one `DEDENT` per
+level closed when it falls below. A colon-suite parses its body between a matched
+`INDENT`…`DEDENT`; a brace block and the top level treat a stray `INDENT`/`DEDENT`
+as an ignorable separator (which is what lets the two forms nest inside each
+other). `INDENT`/`DEDENT` are suppressed inside `( )` / `[ ]` so a bracketed
+expression may wrap across lines. Blank and comment-only lines carry no
+indentation. Interactively, a header ending in `:` switches the read loop into
+indentation mode: it keeps reading (continuation prompt) until a blank line,
+mirroring the Python REPL.
 
 `{ }` serves both blocks and dict literals; the two never collide because they
 occur in different positions — a `{` opening a statement body (after a control
 header, `def`, or `ns`/`enter`/`spawn`) is a block; a `{` in expression
 position is a dict literal. The parser disambiguates by position, exactly as
 every C-family language with map literals does.
+
+**Parse errors carry a line number** — `hamsh: parse error [line N]: …` — so a
+syntax error in a sourced multi-line script points at the offending line.
 
 ---
 
@@ -231,6 +258,29 @@ files = `{ ls *.ad } | lines         # → list of lines via explicit converter
 
 `` `{ … }`` runs a command and captures its stdout as a **string** by default;
 use `lines` (or another converter) for structured forms. No implicit splitting.
+
+### 8a. Built-in expression functions
+
+Call-position builtins usable anywhere an expression is (`${ … }`, assignment
+RHS, `if`/`while` conditions):
+
+| function | result |
+|---|---|
+| `len(x)` | length of a string or list |
+| `int(x)` / `str(x)` | type conversion |
+| `lines(s)` | split a string on `\n` into a list |
+| `upper(s)` / `lower(s)` | ASCII case fold |
+| `strip(s)` | drop surrounding whitespace |
+| `split(s, sep)` | list of substrings between each `sep` |
+| `join(list, sep)` | concatenate a list's elements with `sep` |
+| `replace(s, old, new)` | replace every occurrence of `old` |
+
+```
+name = ${upper("hamnix")}                 # HAMNIX
+parts = split("a,b,c", ",")               # ["a", "b", "c"]
+echo ${join(parts, " / ")}                # a / b / c
+echo ${replace("/usr/bin", "/", ":")}     # :usr:bin
+```
 
 ---
 
