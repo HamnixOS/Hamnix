@@ -847,7 +847,13 @@ if [ -s "$FFHOME/.ff-profile/prefs.js" ]; then echo "[FF-DIAG] prefs.js delivere
 # fetch (now killed by prefs) — but they also flooded the log and slowed the
 # already CPU-starved guest. Keep only the window/startup/IPC path so the trace
 # stays cheap and NAMES the realize->show->xdg->commit progression.
-export MOZ_LOG='Widget:5,WidgetWayland:5,nsAppStartup:5,Process:5,IPCLauncher:5,GfxTest:5,ipc:4,IPDL:4,MessageChannel:4,Timeout:5,sync,timestamp'
+# PRIME-SUSPECT SUBSYSTEMS added (brief step 1): Gfx:5 lights up gfxPlatform::Init
+# / gfxPlatformGtk bring-up (where the main thread is suspected to SpinEventLoopUntil
+# an in-process render/GPU-manager readiness that never arrives), and Gp:5 lights up
+# GPUProcessManager::EnsureGPUReady. If the last Gfx/Gp line before the all-threads
+# park names an unfinished init step, that is the deadlocked subsystem. sync keeps
+# each record on disk so the tail survives the timeout kill.
+export MOZ_LOG='Widget:5,WidgetWayland:5,Gfx:5,Gp:5,nsAppStartup:5,Process:5,IPCLauncher:5,GfxTest:5,ipc:4,IPDL:4,MessageChannel:4,Timeout:5,sync,timestamp'
 # MOZ_LOG TO A FILE, NOT LIVE STDERR. The `firefox-esr` binary re-execs /
 # detaches its stdio very early (the launch pipe closed with only "[FF]
 # launching firefox-esr" streamed, then NOTHING — no MOZ_LOG, no
