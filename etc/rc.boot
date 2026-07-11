@@ -120,6 +120,53 @@ if $installer_medium > 0 {
         source /etc/install_nvme.hamsh
     } else {
         echo 'rc.boot: only the boot medium present -- booting LIVE environment'
+        # --- writable-in-RAM live root (#67) --------------------------
+        # The LIVE native session's `/` is the read-only cpio embedded in
+        # the kernel ELF (the kernel default namespace plants `/` -> `#r`;
+        # this branch never `bind '#sysroot' /`, so no ext4 root shadows
+        # it). A read-only `/` means `touch /root/x`, an `apt`-in-ns copy,
+        # a config edit, all fail with EROFS — the live session cannot
+        # write ANYWHERE outside the pre-bound `#t/tmp` + `#t/var` scratch.
+        #
+        # Make the whole live root appear WRITABLE, backed by RAM, using
+        # the proven Plan-9 union-overlay primitive (NOT a Linux
+        # overlayfs): union a writable tmpfs server (`#t`) MBEFORE the
+        # read-only cpio root AND give it MCREATE (`bind -bc`). Now:
+        #   * a READ of an existing cpio file (/bin/hamsh, /etc/passwd)
+        #     misses the empty tmpfs member and falls THROUGH to the
+        #     read-only cpio base — the toolset still resolves;
+        #   * a CREATE anywhere (`touch /root/livetest`) is routed by
+        #     resolve_path_create -> mnttab_create_target to the MCREATE
+        #     tmpfs member (tmpfs auto-registers the `/root` synthetic
+        #     root on demand), so it lands in RAM and reads back;
+        #   * a truncating write to an existing cpio path
+        #     (`echo hi > /etc/motd`) also takes the MCREATE route and
+        #     shadows the cpio copy in tmpfs (copy-up-on-truncate).
+        # Writes are RAM-only and volatile (lost on reboot) — exactly the
+        # live-session contract. This is the SAME recipe the `enter linux`
+        # apt/dpkg overlay uses (scripts/test_linux_apt_install_e2e.sh);
+        # here it is applied to the ambient native root so every spawned
+        # service (gettys, DE at runlevel 5, the interactive shell) that
+        # inherits this boot namespace sees the writable tree. The `/tmp`,
+        # `/var`, `/dev`, `/proc`, `/srv`, `/net` binds are longer-prefix
+        # and keep their existing dedicated servers; the `/` union only
+        # adds the writable member at the root union point.
+        #
+        # Scoped to the LIVE branch ONLY: the installed-to-disk boot binds
+        # a real writable `#sysroot` ext4 at `/` (persistent), and the
+        # `-kernel` dev path wants its cpio root untouched — neither takes
+        # this branch.
+        live_writable_ok = 1
+        try {
+            bind -bc '#t' /
+        } except {
+            live_writable_ok = 0
+        }
+        if $live_writable_ok > 0 {
+            echo 'rc.boot: live root is WRITABLE in RAM (tmpfs union over cpio)'
+        } else {
+            echo 'rc.boot: WARNING could not make live root writable (read-only cpio)'
+        }
         # LIVE Debian namespace (#410 Item 2): extract live-distro.ext4
         # out of the in-RAM /rootfs.sqfs into a RAM block device and
         # post its #distro named root (kernel does the work; see
