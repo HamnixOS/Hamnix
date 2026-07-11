@@ -94,6 +94,47 @@ else
     echo "[hb-host] PASS bgcolor not mistaken for text color (word boundary)"
 fi
 
+# ====================================================================
+# BOX-MODEL fixture — <hr>, <blockquote> indent, <h4>-<h6>.
+# ====================================================================
+FIX2="tests/fixtures/hambrowse_boxmodel.html"
+DUMP2="$OUT/dump_boxmodel.txt"
+echo "[hb-host] running host harness on $FIX2 ..."
+if ! "$BIN" "$FIX2" 600 >"$DUMP2" 2>&1; then
+    echo "[hb-host] FAIL: box-model harness exited non-zero"; cat "$DUMP2"; exit 1
+fi
+cat "$DUMP2"
+
+assert_grep2() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMP2"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# <h1> still lays a heading rule (type 1); <hr> lays a distinct type-2 rule.
+assert_grep2 '^RULE row 0 type 1$'      "h1 emits a heading rule (type 1)"
+assert_grep2 '^RULE row [0-9]+ type 2$' "hr emits a full-width rule (type 2)"
+# The <hr> row must be otherwise empty (no segment sits on the rule's row).
+hr_row=$(grep -E '^RULE row [0-9]+ type 2$' "$DUMP2" | head -1 | awk '{print $3}')
+if [ -n "$hr_row" ] && grep -Eq "^SEG $hr_row " "$DUMP2"; then
+    echo "[hb-host] FAIL hr rule row $hr_row is not empty"; fail=1
+else
+    echo "[hb-host] PASS hr rule sits on its own empty row (row $hr_row)"
+fi
+# <blockquote> content is indented from the body left margin (x 8 -> 32).
+assert_grep2 '^SEG [0-9]+ 32 .*Quoted text that is indented' \
+    "blockquote indents content to x=32"
+# Text before/after the blockquote stays at the x=8 body margin.
+assert_grep2 '^SEG [0-9]+ 8 .*Back to the left margin' \
+    "post-blockquote text returns to the x=8 margin"
+# <h4>/<h5>/<h6> render as dark-blue bold headings, with NO rule row.
+assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Sub sub heading'  "h4 -> dark-blue bold heading"
+assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Smaller heading'  "h5 -> dark-blue bold heading"
+assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Smallest heading' "h6 -> dark-blue bold heading"
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
     exit 0
