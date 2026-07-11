@@ -46,6 +46,8 @@ extern def read_cr4() -> uint64
 extern def write_cr4(value: uint64)
 extern def get_bsp_cr3() -> uint64
 extern def load_cr3(value: uint64)
+extern def read_msr(index: uint32) -> uint64
+extern def write_msr(index: uint32, value: uint64)
 
 # Runtime flags set by setup_smep_smap(). mm/uaccess.ad reads
 # cr4_smap_enabled before calling _stac() / _clac() — on pre-Broadwell
@@ -667,3 +669,166 @@ def cpu_mitig_smap_active() -> uint64:
     # Read accessor for mm/uaccess.ad. Returns 1 if STAC/CLAC are
     # both safe to execute AND required (SMAP is live), else 0.
     return cr4_smap_enabled
+
+
+# ============================================================================
+# Spectre-v2 / MDS / Speculative-Store-Bypass — hardware-MSR mitigations.
+# ============================================================================
+#
+# Spectre variant 2 (CVE-2017-5715, branch-target injection) is mitigated
+# here the ROBUST hardware way — via the IA32_SPEC_CTRL / IA32_PRED_CMD
+# MSRs — rather than a compiler retpoline. Retpoline needs the Adder codegen
+# to route every indirect call/jump through a thunk; the MSR route is a
+# self-contained kernel change that needs no codegen work and, on
+# enhanced-IBRS silicon, is what Linux itself prefers over retpoline anyway.
+#
+#   * IBRS  (IA32_SPEC_CTRL bit 0) — Indirect Branch Restricted Speculation.
+#     Set once at boot; on eIBRS ("IBRS_ALL") parts a single set stays in
+#     force for CPL=0 and no per-transition toggling is needed.
+#   * STIBP (IA32_SPEC_CTRL bit 1) — Single Thread Indirect Branch
+#     Predictors. Stops a sibling SMT thread steering our indirect branches.
+#   * SSBD  (IA32_SPEC_CTRL bit 2) — Speculative Store Bypass Disable
+#     (Spectre-v4 / CVE-2018-3639).
+#   * IBPB  (IA32_PRED_CMD bit 0) — Indirect Branch Prediction Barrier.
+#     A "flush" written on every address-space switch (see cpu_mitig_ibpb,
+#     called from schedule() when CR3 changes) so a task cannot poison the
+#     BTB for the next, mutually-distrusting, task.
+#   * MD_CLEAR (VERW) — Microarchitectural Data Sampling (MDS/CVE-2018-12126
+#     et al.) buffer clear. We only RECORD support here; the VERW-on-return
+#     wiring in the entry asm is the follow-up (documented in the report).
+#
+# EVERY MSR touch is CPUID-GATED. IA32_SPEC_CTRL/PRED_CMD are architectural
+# only when CPUID.07h:EDX advertises them; touching them otherwise #GPs and
+# triple-faults. QEMU TCG advertises NONE of these bits, so on the pure-TCG
+# CI runners this whole path is a probe + "not supported" print and NO MSR
+# is written — boot-green by construction. Under `-cpu host` on Skylake+
+# KVM the bits appear and the MSRs are programmed for real.
+#
+# CPUID.07h:EDX feature bits (leaf 7, subleaf 0, EDX):
+IA32_SPEC_CTRL_MSR:       uint32 = 0x48
+IA32_PRED_CMD_MSR:        uint32 = 0x49
+IA32_ARCH_CAPABILITIES_MSR: uint32 = 0x10a
+
+SPEC_CTRL_IBRS:  uint64 = 0x1   # bit 0
+SPEC_CTRL_STIBP: uint64 = 0x2   # bit 1
+SPEC_CTRL_SSBD:  uint64 = 0x4   # bit 2
+PRED_CMD_IBPB:   uint64 = 0x1   # bit 0
+
+CPUID_07H_EDX_MD_CLEAR_BIT:   uint32 = 10
+CPUID_07H_EDX_IBRS_IBPB_BIT:  uint32 = 26   # STIBP/SPEC_CTRL family root
+CPUID_07H_EDX_STIBP_BIT:      uint32 = 27
+CPUID_07H_EDX_ARCH_CAP_BIT:   uint32 = 29
+CPUID_07H_EDX_SSBD_BIT:       uint32 = 31
+
+# IA32_ARCH_CAPABILITIES bits (RO MSR 0x10a, only when CPUID.07h:EDX[29]).
+ARCH_CAP_IBRS_ALL: uint64 = 0x2   # bit 1: enhanced IBRS ("set once")
+ARCH_CAP_SSB_NO:   uint64 = 0x10  # bit 4: HW immune to SSB, no SSBD needed
+ARCH_CAP_MDS_NO:   uint64 = 0x20  # bit 5: HW immune to MDS, no VERW needed
+
+# Runtime state, published by setup_spectre_v2() and read by the context
+# switch (cpu_mitig_ibpb) + the selftest accessors.
+spec_ctrl_ibpb_supported: uint64 = 0
+spec_ctrl_md_clear:       uint64 = 0
+spec_ctrl_base:           uint64 = 0   # the value we program into MSR 0x48
+spectre_v2_active:        uint64 = 0   # 1 once IA32_SPEC_CTRL was written
+
+
+def setup_spectre_v2():
+    # Probe CPUID.07h:EDX and program IA32_SPEC_CTRL (IBRS+STIBP+SSBD) per
+    # the individually-advertised bits, then record IBPB / MD_CLEAR support
+    # for the context-switch barrier and the MDS follow-up. Called from
+    # start_kernel after setup_smap_late(). All MSR access is gated on the
+    # CPUID advertisement so a non-supporting host (TCG) never issues a
+    # #GP-prone WRMSR.
+    buf: Array[4, uint32]
+    buf[0] = cast[uint32](0)
+    buf[1] = cast[uint32](0)
+    buf[2] = cast[uint32](0)
+    buf[3] = cast[uint32](0)
+    cpuid_get(cast[uint32](7), cast[uint32](0), &buf[0])
+    edx: uint32 = buf[3]
+
+    ibrs_ibpb: uint32 = (edx >> CPUID_07H_EDX_IBRS_IBPB_BIT) & cast[uint32](1)
+    stibp:     uint32 = (edx >> CPUID_07H_EDX_STIBP_BIT) & cast[uint32](1)
+    ssbd:      uint32 = (edx >> CPUID_07H_EDX_SSBD_BIT) & cast[uint32](1)
+    arch_cap:  uint32 = (edx >> CPUID_07H_EDX_ARCH_CAP_BIT) & cast[uint32](1)
+    md_clear:  uint32 = (edx >> CPUID_07H_EDX_MD_CLEAR_BIT) & cast[uint32](1)
+
+    spec_ctrl_md_clear = cast[uint64](md_clear)
+    # IBPB shares the IA32_SPEC_CTRL/PRED_CMD enumeration bit (EDX[26]).
+    spec_ctrl_ibpb_supported = cast[uint64](ibrs_ibpb)
+
+    if ibrs_ibpb == cast[uint32](0):
+        # No SPEC_CTRL MSR at all (TCG, pre-Skylake). Nothing to write.
+        printk0("[cpu-mitig] spectre-v2: SPEC_CTRL not supported (CPUID.07h" \
+                ":EDX[26]=0) — no IBRS/IBPB\n")
+        printk2("[cpu-mitig] spectre-v2: ibrs=0 stibp=0 ssbd=0 ibpb=0" \
+                " md_clear=%d active=0\n",
+                cast[uint64](md_clear), cast[uint64](0))
+        return
+
+    # Read IA32_ARCH_CAPABILITIES (only when advertised) to skip mitigations
+    # the HW says it doesn't need.
+    caps: uint64 = 0
+    if arch_cap != cast[uint32](0):
+        caps = read_msr(IA32_ARCH_CAPABILITIES_MSR)
+
+    want: uint64 = 0
+
+    # IBRS: always set on a SPEC_CTRL-capable part (eIBRS parts want it set
+    # once and left on; legacy-IBRS parts still benefit at CPL=0).
+    want = want | SPEC_CTRL_IBRS
+    ibrs_on: uint64 = 1
+
+    # STIBP: only if its own bit is advertised.
+    stibp_on: uint64 = 0
+    if stibp != cast[uint32](0):
+        want = want | SPEC_CTRL_STIBP
+        stibp_on = 1
+
+    # SSBD: only if advertised AND the HW isn't already SSB-immune.
+    ssbd_on: uint64 = 0
+    if ssbd != cast[uint32](0) and (caps & ARCH_CAP_SSB_NO) == 0:
+        want = want | SPEC_CTRL_SSBD
+        ssbd_on = 1
+
+    spec_ctrl_base = want
+    write_msr(IA32_SPEC_CTRL_MSR, want)
+    spectre_v2_active = 1
+
+    # Read back to confirm the bits latched (a virtualiser may mask some).
+    got: uint64 = read_msr(IA32_SPEC_CTRL_MSR)
+    printk2("[cpu-mitig] spectre-v2 SPEC_CTRL want=%p got=%p\n", want, got)
+    printk2("[cpu-mitig] spectre-v2: ibrs=%d stibp=%d ssbd=%d ibpb=1" \
+            " md_clear=... (see next)\n", ibrs_on, stibp_on)
+    printk2("[cpu-mitig] spectre-v2: ssbd=%d md_clear=%d active=1\n",
+            ssbd_on, cast[uint64](md_clear))
+    if (caps & ARCH_CAP_IBRS_ALL) != 0:
+        printk0("[cpu-mitig] spectre-v2: enhanced IBRS (IBRS_ALL) — set once\n")
+    printk0("[cpu-mitig] spectre-v2 enabled (IBRS + IBPB-on-ctxswitch)\n")
+
+
+def cpu_mitig_ibpb():
+    # Indirect Branch Prediction Barrier. Called from schedule() on every
+    # cross-address-space switch (CR3 change) so the outgoing task cannot
+    # have poisoned the branch predictors for the incoming, distrusting,
+    # task. No-op (and, crucially, no WRMSR) unless the SPEC_CTRL/PRED_CMD
+    # family is advertised — so TCG never #GPs here.
+    if spec_ctrl_ibpb_supported == 0:
+        return
+    write_msr(IA32_PRED_CMD_MSR, PRED_CMD_IBPB)
+
+
+def cpu_mitig_spectre_v2_active() -> uint64:
+    # Selftest accessor: 1 iff IA32_SPEC_CTRL was actually programmed.
+    return spectre_v2_active
+
+
+def cpu_mitig_ibpb_supported() -> uint64:
+    # Selftest accessor: 1 iff the IBPB barrier is armed on ctx-switch.
+    return spec_ctrl_ibpb_supported
+
+
+def cpu_mitig_spec_ctrl_base() -> uint64:
+    # Selftest accessor: the value programmed into IA32_SPEC_CTRL.
+    return spec_ctrl_base

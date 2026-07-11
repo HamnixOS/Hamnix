@@ -69,44 +69,34 @@ fail() {
 
 # Heartbeat-style inconclusive retry: if the kernel never reached the
 # CPUID probe at all, the host was likely starved. Caller can retry.
-if ! grep -a -F -q "[cpu-mitig] smep_supported=" "$LOG"; then
-    echo "[test_cpu_mitigations] INCONCLUSIVE: setup_smep_smap() never logged" \
+# setup_smap_late() unconditionally logs "[cpu-mitig] smap_supported=%d"
+# — that is the marker that start_kernel got as far as the mitigation
+# pass. (SMAP/SMEP CPUID bits are only EXPOSED under a HW accelerator, so
+# we do NOT hard-assert supported=1 here — a TCG-only CI runner reports
+# supported=0 and CR4 stays unflipped, which is a correct, non-failing
+# state. The value this gate proves is that the discipline is WIRED and
+# boot stays green; scripts/test_smap_enforced.sh asserts live SMAP
+# enforcement under KVM.)
+if ! grep -a -F -q "[cpu-mitig] smap_supported=" "$LOG"; then
+    echo "[test_cpu_mitigations] INCONCLUSIVE: setup_smap_late() never logged" \
          "its CPUID probe (boot likely starved before start_kernel reached it)."
     echo "[test_cpu_mitigations] qemu rc=$rc"
     exit 2
 fi
 
-# 1. Probe line present (always — even on hardware without SMEP/SMAP
-#    we'd see smep_supported=0/smap_supported=0).
-PROBE_LINE=$(grep -a -F "[cpu-mitig] smep_supported=" "$LOG" | head -1)
-echo "[test_cpu_mitigations]   probe: ${PROBE_LINE}"
-
-# 2. QEMU TCG advertises both. If smep_supported=0 something is broken
-#    in the CPUID dispatch.
-if ! echo "$PROBE_LINE" | grep -F -q "smep_supported=1"; then
-    fail "QEMU did not advertise SMEP (smep_supported=0). Either the CPUID" \
-         "shim is wrong or the host CPU is too old."
+# 1. SMAP/SMEP probe + CR4 state lines present.
+SMAP_LINE=$(grep -a -F "[cpu-mitig] smap_supported=" "$LOG" | head -1)
+echo "[test_cpu_mitigations]   probe: ${SMAP_LINE}"
+if ! grep -a -F -q "[mitig] CR4 SMEP=" "$LOG"; then
+    fail "missing [mitig] CR4 SMEP= state line"
 fi
-if ! echo "$PROBE_LINE" | grep -F -q "smap_supported=1"; then
-    fail "QEMU did not advertise SMAP (smap_supported=0). Either the CPUID" \
-         "shim is wrong or the host CPU is too old."
-fi
-
-# 3. CR4 transition line (e.g. "[cpu-mitig] cr4: 0x... -> 0x...").
-if ! grep -a -F -q "[cpu-mitig] cr4:" "$LOG"; then
-    fail "missing [cpu-mitig] cr4: transition line"
-fi
-CR4_LINE=$(grep -a -F "[cpu-mitig] cr4:" "$LOG" | head -1)
+CR4_LINE=$(grep -a -F "[mitig] CR4 SMEP=" "$LOG" | tail -1)
 echo "[test_cpu_mitigations]   ${CR4_LINE}"
 
-# 4. SMEP/SMAP markers: each is either ENABLED (CR4 flip landed) or
-#    STAGED (CPU supports; CR4 flip gated until the kernel high-half
-#    PML4 is US=0-stamped). Both bits are flagged STAGED in v1 because
-#    the boot stub stamps US=1 on high-half kernel PDPT/PD entries
-#    (arch/x86/boot/header.S:198) — enabling either bit before that's
-#    re-stamped triple-faults the box. The discipline scaffold (the
-#    probe, the runtime flag, the stac/clac brackets in uaccess.ad) is
-#    the value v1 ships; the bit flip itself is one line once v2 lands.
+# 2. SMEP/SMAP markers: each is either ENABLED (CR4 flip landed, HW-accel
+#    host) or STAGED/NOT (CPUID did not expose the bit, TCG host). We only
+#    require the discipline marker be PRESENT — the enforcement gate
+#    (test_smap_enforced.sh) asserts the enabled path under KVM.
 if ! grep -a -E -q "\[cpu-mitig\] SMEP (enabled|staged)" "$LOG"; then
     fail "missing [cpu-mitig] SMEP enabled OR SMEP staged marker"
 fi
@@ -114,7 +104,19 @@ if ! grep -a -E -q "\[cpu-mitig\] SMAP (enabled|staged)" "$LOG"; then
     fail "missing [cpu-mitig] SMAP enabled OR SMAP staged marker"
 fi
 
-# 5. KASLR scaffold line present.
+# 3. Spectre-v2 hardware-MSR mitigation ran. setup_spectre_v2() always
+#    logs a "[cpu-mitig] spectre-v2" line — either "not supported" (TCG,
+#    no IA32_SPEC_CTRL) or "enabled (IBRS + IBPB-on-ctxswitch)" under KVM
+#    -cpu host. Presence proves the probe ran and boot survived it (a
+#    stray WRMSR to an unsupported MSR would #GP and never reach here).
+if ! grep -a -F -q "[cpu-mitig] spectre-v2" "$LOG"; then
+    fail "missing [cpu-mitig] spectre-v2 marker — setup_spectre_v2() did" \
+         "not run (or a WRMSR #GP'd the box before it could log)"
+fi
+SPECTRE_LINE=$(grep -a -F "[cpu-mitig] spectre-v2:" "$LOG" | tail -1)
+echo "[test_cpu_mitigations]   ${SPECTRE_LINE}"
+
+# 4. KASLR scaffold line present.
 if ! grep -a -F -q "[kaslr] offset=" "$LOG"; then
     fail "missing [kaslr] offset= scaffold marker"
 fi
@@ -141,6 +143,6 @@ if echo "$EARLY" | grep -E -q "TRAP: vector|trap-diag.*vec=14|page fault"; then
          "— probable SMAP stac/clac miswire on the first user-frame touch."
 fi
 
-echo "[test_cpu_mitigations] PASS — CPUID probe + CR4 wiring + stac/clac" \
-     "discipline + KASLR scaffold all in place"
+echo "[test_cpu_mitigations] PASS — SMEP/SMAP CR4 wiring + stac/clac" \
+     "discipline + spectre-v2 SPEC_CTRL/IBPB + KASLR scaffold all in place"
 exit 0
