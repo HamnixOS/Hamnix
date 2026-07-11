@@ -71,20 +71,6 @@ from kernel.sched.cgroup_cpu import (
 # SMP: per-CPU id for current-task tracking and TSS gating.
 from arch.x86.kernel.setup_percpu import get_cpu_id
 from arch.x86.kernel.time import get_jiffies
-# ns-resolution high-resolution timers (kernel/time/hrtimer.ad). The native
-# bounded-wait path (wq_wait_commit_timeout) arms a real hrtimer deadline so
-# a timeout fires on the monotonic CLOCK — independent of jiffies advancing.
-# The old jiffies-poll deadline silently never fired when the tick was
-# stopped (NO_HZ idle) or jiffies was frozen (early boot), wedging the
-# 9p/devfd/net bounded-wait backstops. hrtimer does NOT import sched, so no
-# import cycle.
-from kernel.time.hrtimer import (
-    hrtimer_create, hrtimer_start_rel, hrtimer_cancel, hrtimer_destroy,
-    hrtimer_interrupt, HRTIMER_NORESTART,
-)
-# clocksource_read_ns: the monotonic ns clock the bounded-wait selftest
-# busy-waits on to prove the timeout fires with jiffies frozen.
-from kernel.time.clocksource import clocksource_read_ns, clocksource_is_selected
 # SMP reschedule IPI: kick idle APs out of HLT when a kernel task becomes
 # runnable so they re-scan the shared runqueue (Linux's smp_send_reschedule).
 # No-op on a uniprocessor boot (gated on cpus_online > 1 inside the helper).
@@ -836,18 +822,11 @@ class TaskStruct:
     #   wait_signaled — set to 1 by the signal path when it force-wakes a
     #                   STATE_WAIT task, so wq_sleep_interruptible knows the
     #                   wake was a signal (return -EINTR) rather than data.
-    #   wait_timedout — set to 1 by the hrtimer-timeout force-wake
-    #                   (wq_wake_one_timeout, fired from the hrtimer ISR
-    #                   callback) when a bounded wait's ns deadline elapsed
-    #                   with no data/signal wake. wq_wait_commit_timeout
-    #                   observes it and returns WQ_TIMEOUT. Distinct from
-    #                   wait_signaled (EINTR) — a timeout is not an error.
     # All 0 on a fresh slot — zeroed in sched_init_task_weight. Placed at
     # the END of TaskStruct so no earlier offset shifts.
     wait_next:     uint64
     wait_on:       uint64
     wait_signaled: uint64
-    wait_timedout: uint64
     # Per-CPU runqueue (#6): the logical CPU id whose runqueue currently
     # OWNS this task while it is STATE_READY or STATE_RUNNING. _pick_next()
     # on CPU c considers ONLY slots with rq_cpu == c, so the dispatch hot
@@ -2550,113 +2529,6 @@ def rtsched_selftest() -> int32:
     return 1
 
 
-def wq_timeout_hrtimer_selftest() -> int32:
-    # Deterministic proof that the native bounded-wait timeout now fires on
-    # the ns CLOCKSOURCE — independent of jiffies advancing. This is the
-    # regression guard for the fix that moved wq_wait_commit_timeout off the
-    # jiffies-poll deadline (which silently never tripped when the tick was
-    # stopped in NO_HZ idle or frozen in early boot) onto a real hrtimer.
-    #
-    # Drives the SAME production mechanism the bounded wait uses — the
-    # _wq_timeout_hrtimer_cb callback + wq_wake_one_timeout force-wake — over
-    # a fabricated STATE_WAIT sleeper in a spare slot, with NO real context
-    # switch. Runs on the BSP early in boot while CPU interrupts are OFF, so
-    # the periodic tick ISR does NOT run and get_jiffies() is FROZEN for the
-    # whole probe. We advance ONLY the free-running clocksource (busy-wait)
-    # past the deadline, run the expiry pass, and assert:
-    #   (1) the sleeper was force-woken (STATE_WAIT -> STATE_READY);
-    #   (2) it carries the TIMEOUT marker (wait_timedout == 1), NOT a data
-    #       or signal wake;
-    #   (3) jiffies did NOT advance across the whole probe — so the wake was
-    #       driven purely by the ns clock. The OLD jiffies-poll deadline
-    #       could NEVER satisfy (1)+(2) under (3): with jiffies frozen it
-    #       would spin forever.
-    # Returns 1 PASS / 0 FAIL. PUBLIC so init/main.ad can gate-call it.
-    if clocksource_is_selected() == 0:
-        printk_set_level(PRINTK_LEVEL_EMERG)
-        printk0("[wqtimeout] FAIL no clocksource selected\n")
-        return 0
-
-    # Grab one spare FREE slot for the fixture.
-    s: int32 = -1
-    scan: uint64 = 0
-    while scan < NTASKS:
-        if task_table[scan].state == STATE_FREE:
-            s = cast[int32](scan)
-            break
-        scan = scan + 1
-    if s < 0:
-        printk_set_level(PRINTK_LEVEL_EMERG)
-        printk0("[wqtimeout] FAIL no spare slot for fixture\n")
-        return 0
-    us: uint64 = cast[uint64](s)
-
-    # Fabricate a sleeper: STATE_WAIT, not linked on any real wait queue
-    # (the timeout wake is a DIRECTED wake by slot id, it does not walk a
-    # queue). BSP-homed so _wq_place_woken targets CPU 0.
-    task_table[us].is_user       = 0
-    task_table[us].rq_cpu        = 0
-    task_table[us].wait_next     = 0
-    task_table[us].wait_on       = 0
-    task_table[us].wait_signaled = 0
-    task_table[us].wait_timedout = 0
-    task_table[us].state         = STATE_WAIT
-
-    # Arm the production timeout hrtimer: cookie = slot id, 2 ms deadline.
-    h: int64 = hrtimer_create(cast[uint64](&_wq_timeout_hrtimer_cb), us)
-    if h < 0:
-        task_table[us].state = STATE_FREE
-        printk_set_level(PRINTK_LEVEL_EMERG)
-        printk0("[wqtimeout] FAIL hrtimer_create\n")
-        return 0
-    j0: uint64 = get_jiffies()
-    hrtimer_start_rel(cast[uint64](h), 2000000)          # 2 ms
-
-    # Busy-wait ~2.1 ms of REAL time on the clocksource. Interrupts are off,
-    # so jiffies cannot advance — only the free-running TSC clock does.
-    start_ns: uint64 = clocksource_read_ns()
-    while (clocksource_read_ns() - start_ns) < 2100000:
-        pass
-    now_ns: uint64 = clocksource_read_ns()
-
-    # Run the expiry pass — fires _wq_timeout_hrtimer_cb(us) -> the timeout
-    # force-wake. (Also expires the always-armed sched-tick hrtimer if it is
-    # due; harmless — it just re-arms and does not touch our fixture slot.)
-    hrtimer_interrupt(now_ns)
-    j1: uint64 = get_jiffies()
-
-    ok: int32 = 1
-    if task_table[us].state != STATE_READY:
-        printk_set_level(PRINTK_LEVEL_EMERG)
-        printk0("[wqtimeout] FAIL sleeper not woken by ns deadline\n")
-        ok = 0
-    if task_table[us].wait_timedout != 1:
-        printk_set_level(PRINTK_LEVEL_EMERG)
-        printk0("[wqtimeout] FAIL missing TIMEOUT marker (wait_timedout!=1)\n")
-        ok = 0
-    if j1 != j0:
-        printk_set_level(PRINTK_LEVEL_EMERG)
-        printk2("[wqtimeout] FAIL jiffies advanced during probe j0=%d j1=%d\n",
-                j0, j1)
-        ok = 0
-
-    # Teardown: the timeout wake homed the fixture on CPU 0's run-list via
-    # _wq_place_woken — unlink it before returning the slot to FREE so the
-    # live dispatcher never walks a torn-down scratch slot (same discipline
-    # as rtsched_selftest). Then free the hrtimer slot.
-    _rq_list_remove(us)
-    task_table[us].state         = STATE_FREE
-    task_table[us].wait_timedout = 0
-    task_table[us].wait_signaled = 0
-    hrtimer_destroy(cast[uint64](h))
-
-    if ok == 0:
-        return 0
-    printk_set_level(PRINTK_LEVEL_EMERG)
-    printk0("[wqtimeout] PASS bounded-wait timeout fires on ns clock with jiffies frozen\n")
-    return 1
-
-
 def sched_init_task_weight(slot: uint64):
     # Seed a freshly-created task's CFS-lite fields. nice 0 / NICE0
     # weight by default; vruntime seeded to the current runqueue minimum
@@ -2713,7 +2585,6 @@ def sched_init_task_weight(slot: uint64):
     task_table[slot].wait_next     = 0
     task_table[slot].wait_on       = 0
     task_table[slot].wait_signaled = 0
-    task_table[slot].wait_timedout = 0
     # setitimer(2) ITIMER_REAL disarmed on a fresh/recycled slot so a new task
     # never inherits a live countdown (belt-and-braces with clear_task_itimer on
     # reap; a create that bypassed reap would still start clean here).
@@ -8205,40 +8076,15 @@ def wq_wait_commit_timeout(wq: Ptr[WaitQueue], ticks: uint64) -> int32:
     #
     # This is the TCG net-I/O safety net (see drivers/net/tcp.ad). Under
     # working MSI-X the rx IRQ calls wq_wake_* during our idle hlt → we
-    # return 0 IMMEDIATELY (fast path, zero added latency).
-    #
-    # BOUNDED-WAIT DEADLINE — hrtimer-backed, jiffies-independent. `ticks`
-    # jiffies is converted to a ns deadline and armed as a real hrtimer
-    # (wq_wake_one_timeout fires on the monotonic clocksource, NOT jiffies,
-    # and reprograms the clockevent one-shot to wake even a fully tickless
-    # idle CPU). This fixes the class where the OLD jiffies-poll deadline
-    # never tripped because jiffies was frozen — NO_HZ idle (tick stopped)
-    # or early boot (tick not yet armed) — silently turning the bounded
-    # wait into an UNBOUNDED one and wedging the 9p/devfd/net backstops.
-    #
-    # A `get_jiffies() >= deadline` fallback is RETAINED as belt-and-braces:
-    # whichever of {hrtimer fire, jiffies deadline} trips first ends the
-    # wait, so a build with the clockevent unavailable (periodic-tick-only,
-    # jiffies DOES advance) still bounds the wait exactly as before, and a
-    # full hrtimer table (create fails) degrades to the legacy jiffies path.
+    # return 0 IMMEDIATELY (fast path, zero added latency). Under TCG,
+    # where rx interrupts may not be delivered, the 100 Hz LAPIC timer
+    # still fires during the IF=1 hlt and advances `jiffies`; after
+    # `ticks` of those we return WQ_TIMEOUT and the caller re-runs
+    # virtio_net_poll() — degrading gracefully to today's poll model
+    # with no wedge. The timer-tick dependency is identical to
+    # kernel_cond_resched's: `jiffies` advances during the sti;hlt window.
     cur: uint64 = current_idx_pcpu
-    task_table[cur].wait_timedout = 0
     deadline: uint64 = get_jiffies() + ticks
-
-    # Arm the hrtimer deadline. delta_ns = ticks jiffies in nanoseconds;
-    # clamp to at least one jiffy so ticks==0 still yields a real (non-zero)
-    # deadline. Same-core reentry against the timer ISR is fenced by the
-    # local-IRQ save/restore around the queue mutation.
-    delta_ns: uint64 = ticks * WQ_NS_PER_JIFFY
-    if delta_ns == 0:
-        delta_ns = WQ_NS_PER_JIFFY
-    ht: int64 = -1
-    _sched_irq_push()
-    ht = hrtimer_create(cast[uint64](&_wq_timeout_hrtimer_cb), cur)
-    if ht >= 0:
-        hrtimer_start_rel(cast[uint64](ht), delta_ns)
-    _sched_irq_pop()
-
     rc: int32 = 0
     while True:
         _wq_lock_irq()
@@ -8248,14 +8094,8 @@ def wq_wait_commit_timeout(wq: Ptr[WaitQueue], ticks: uint64) -> int32:
         _wq_unlock_irq()
 
         if still_waiting == 0:
-            # We were woken. Distinguish the three wake sources: a signal
-            # force-wake (EINTR), the hrtimer timeout force-wake (TIMEOUT),
-            # or a producer data-wake (0). Exactly one wins — the loser's
-            # force-wake is a no-op once state left STATE_WAIT.
             if task_table[cur].wait_signaled != 0:
                 rc = WQ_EINTR
-            elif task_table[cur].wait_timedout != 0:
-                rc = WQ_TIMEOUT
             break
 
         if signal_pending(cur) != 0:
@@ -8267,10 +8107,9 @@ def wq_wait_commit_timeout(wq: Ptr[WaitQueue], ticks: uint64) -> int32:
             rc = WQ_EINTR
             break
 
-        # Belt-and-braces jiffies fallback (see header): only reachable when
-        # the hrtimer could not fire (no clockevent AND the periodic tick is
-        # advancing jiffies, or hrtimer_create failed). Under working
-        # hrtimers the timeout arrives via wait_timedout above first.
+        # Bounded-wait expiry: the timer has advanced jiffies past our
+        # deadline without anyone waking us. Unlink and report TIMEOUT so
+        # the caller re-pumps the device. This is the TCG fallback edge.
         if get_jiffies() >= deadline:
             _wq_lock_irq()
             _wq_unlink_locked(wq, cur)
@@ -8289,21 +8128,12 @@ def wq_wait_commit_timeout(wq: Ptr[WaitQueue], ticks: uint64) -> int32:
             cpu_idle_leave()
             local_irq_disable()
 
-    # Disarm + free the hrtimer (idempotent if it already fired). Fenced
-    # against the same-core ISR by the IRQ save/restore.
-    if ht >= 0:
-        _sched_irq_push()
-        hrtimer_cancel(cast[uint64](ht))
-        hrtimer_destroy(cast[uint64](ht))
-        _sched_irq_pop()
-
     _wq_lock_irq()
     _wq_unlink_locked(wq, cur)
     if task_table[cur].state == STATE_WAIT:
         task_table[cur].state = STATE_RUNNING
     _wq_unlock_irq()
     task_table[cur].wait_signaled = 0
-    task_table[cur].wait_timedout = 0
     return rc
 
 
@@ -8406,58 +8236,6 @@ def wq_wake_slot(slot: uint64):
         task_table[slot].state         = STATE_READY
         _wq_place_woken(slot)
     _wq_unlock_irq()
-
-
-# --- hrtimer-backed bounded-wait timeout ----------------------------
-#
-# ns-resolution deadline for wq_wait_commit_timeout. The OLD bounded wait
-# polled get_jiffies() >= deadline inside its sti;hlt;cli loop. That is
-# only correct while the 100 Hz LAPIC tick keeps advancing jiffies during
-# the idle hlt — a dependency the code itself flagged as "identical to
-# kernel_cond_resched's". It FAILS in two real regimes:
-#   * NO_HZ idle — the tick is deliberately STOPPED, so jiffies does not
-#     advance while the CPU sleeps and the deadline never trips;
-#   * early boot — jiffies is frozen before the tick ISR is armed.
-# In both, the bounded wait degenerates to an UNBOUNDED one and the 9p /
-# devfd / net timeout backstops silently wedge.
-#
-# The fix arms a real hrtimer for the deadline. hrtimers expire off the
-# monotonic CLOCKSOURCE (TSC/HPET ns), which never stops, and the
-# clockevent one-shot is reprogrammed to the earliest deadline — so even a
-# fully tickless idle CPU is woken at ~the deadline. When the timer fires,
-# its ISR callback force-wakes the exact sleeper with a TIMEOUT marker.
-
-WQ_NS_PER_JIFFY: uint64 = 10000000        # 10 ms at HZ=100 (jiffy->ns)
-
-
-def wq_wake_one_timeout(slot: uint64):
-    # TIMEOUT force-wake of ONE specific task slot blocked on a wait queue.
-    # Same shape as wq_wake_slot (a DIRECTED wake of a caller-named task)
-    # but stamps wait_timedout=1 instead of doing a data wake, so the
-    # sleeper's wq_wait_commit_timeout tail returns WQ_TIMEOUT rather than 0.
-    # Called from the hrtimer expiry callback (_wq_timeout_hrtimer_cb) in
-    # timer-ISR context; safe from IRQ context, never calls schedule(). A
-    # no-op if the task is no longer STATE_WAIT (a data/signal wake already
-    # raced us and won — the timeout is then discarded, exactly like Linux
-    # del_timer racing an early completion).
-    if slot >= NTASKS:
-        return
-    _wq_lock_irq()
-    if task_table[slot].state == STATE_WAIT:
-        task_table[slot].wait_signaled = 0
-        task_table[slot].wait_timedout = 1
-        task_table[slot].wait_on       = 0
-        task_table[slot].state         = STATE_READY
-        _wq_place_woken(slot)
-    _wq_unlock_irq()
-
-
-def _wq_timeout_hrtimer_cb(cookie: uint64) -> int64:
-    # hrtimer callback: enum hrtimer_restart (*)(cookie). `cookie` is the
-    # sleeping task's slot id (set at arm time). Force-wake it with the
-    # TIMEOUT marker and do not re-arm (one-shot bounded wait).
-    wq_wake_one_timeout(cookie)
-    return HRTIMER_NORESTART
 
 
 # Global console-input wait queue. A task blocked in the FD_STDIN_MARK /
