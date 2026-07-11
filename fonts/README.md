@@ -1,3 +1,49 @@
+# Hamnix Font Store
+
+This directory vendors two kinds of fonts:
+
+1. **Scalable TrueType** (`dejavu-*.ttf`) — the SMOOTH, ANTI-ALIASED,
+   continuously-scalable faces used by the graphical hambrowse pixel
+   renderer (`lib/font_ttf.ad` + `lib/htmlpaint.ad` + `lib/htmlpage.ad`).
+   This is what makes the browser render like a real browser: true
+   `font-size` in pixels, grayscale-anti-aliased glyph edges, and a real
+   heading hierarchy at arbitrary sizes.
+2. **Bitmap BDF** (`hamnix-*.bdf`) — three small public-domain fixed-size
+   bitmap fonts used by the hamUI/DE text-draw path (`lib/font_bdf.ad` +
+   `user/hamUId.ad`'s `raster_text`), and still available to the browser
+   backend for its proportional-advance metric proof.
+
+## Scalable TrueType faces
+
+| File                    | Family              | License        |
+|-------------------------|---------------------|----------------|
+| `dejavu-sans.ttf`       | DejaVu Sans         | Bitstream Vera / DejaVu (permissive) |
+| `dejavu-sans-bold.ttf`  | DejaVu Sans Bold    | Bitstream Vera / DejaVu (permissive) |
+| `dejavu-serif.ttf`      | DejaVu Serif        | Bitstream Vera / DejaVu (permissive) |
+| `dejavu-mono.ttf`       | DejaVu Sans Mono    | Bitstream Vera / DejaVu (permissive) |
+
+These are ASCII-only (U+0020..U+007E) SUBSETS of the upstream DejaVu
+fonts (~8 KB each), produced with `fontTools.subset` (hinting and the
+GPOS/GSUB/kern/OS-2/post/name tables dropped; `glyf`/`loca`/`cmap`
+format-4/`head`/`maxp`/`hhea`/`hmtx` retained). The DejaVu fonts are
+under the permissive Bitstream Vera + DejaVu license (free to use,
+embed, modify and redistribute). `lib/font_ttf.ad` is a from-scratch,
+pure-Adder rasteriser (no FreeType): it decodes the simple glyph
+outlines, flattens the quadratic beziers and scan-converts them with
+4x4 supersampled coverage for grayscale anti-aliasing at any px size.
+
+Re-subset (only if refreshing from a newer DejaVu) with `fontTools`:
+
+```
+python3 -c "from fontTools import subset,ttLib; \
+  o=subset.Options(); o.hinting=False; o.layout_features=[]; \
+  o.drop_tables=['GPOS','GSUB','GDEF','kern','MATH','FFTM','gasp', \
+    'fpgm','prep','cvt ','OS/2','post','name']; \
+  s=subset.Subsetter(options=o); f=ttLib.TTFont('DejaVuSans.ttf'); \
+  s.populate(unicodes=list(range(0x20,0x7f))); s.subset(f); \
+  f.save('fonts/dejavu-sans.ttf')"
+```
+
 # Hamnix Bitmap Font Store (Phase 4d)
 
 This directory vendors three small public-domain bitmap fonts in BDF
