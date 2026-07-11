@@ -135,12 +135,17 @@ assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Sub sub heading'  "h4 -> dark-blue bold
 assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Smaller heading'  "h5 -> dark-blue bold heading"
 assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Smallest heading' "h6 -> dark-blue bold heading"
 
-# <img> alt-text placeholder rung: alt text rendered as inline "[alt]" that
-# flows with surrounding text; a bare <img> (no alt) shows "[img]".
-assert_grep2 'Logo here: \[Hamnix logo\] and text after\.' \
-    "img alt='Hamnix logo' -> inline [Hamnix logo] placeholder in flow"
-assert_grep2 'Bare image: \[img\] ends\.' \
-    "bare img (no alt) -> inline [img] placeholder in flow"
+# <img> PIXEL rung: an <img> is now a real image BOX on its own block row (the
+# pixel renderer blits the decoded PNG into it — see scripts/test_hambrowse_img.sh).
+# In this monospace-grid dump the image box carries the bracketed alt text as a
+# glyph fallback ("[alt]", or "[img]" when no alt), on its own row, with the
+# surrounding prose flowing above and below it.
+assert_grep2 '^SEG [0-9]+ 8 .*\|\[Hamnix logo\]\|' \
+    "img alt='Hamnix logo' -> [Hamnix logo] image-box fallback on its own row"
+assert_grep2 '^SEG [0-9]+ 8 .*\|\[img\]\|' \
+    "bare img (no alt) -> [img] image-box fallback on its own row"
+assert_grep2 '\|Logo here:\|'      "prose before the image still renders"
+assert_grep2 '\|and text after\.\|' "prose after the image still renders"
 
 # ====================================================================
 # TABLE fixture — two-pass column layout (measure widest cell per column,
