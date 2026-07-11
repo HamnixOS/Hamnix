@@ -34,7 +34,12 @@
 . "$(dirname "$0")/_qemu_drive.sh"
 . "$(dirname "$0")/_verdict.sh"
 
-set -uo pipefail
+# NOTE: deliberately NOT `set -e`/`pipefail`. The diagnostic greps below can
+# legitimately match nothing (a starved/failed boot), and a non-zero grep in
+# a pipeline must not abort the script before verdict_boot_gate can classify
+# the run — otherwise a boot with no markers dies silently instead of
+# reporting INCONCLUSIVE. Failures are surfaced via the explicit verdict_*.
+set -u
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
@@ -51,20 +56,27 @@ python3 -m compiler.adder compile \
     --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null
 
 LOG=$(mktemp /tmp/test-spawn-fd-clean.XXXXXX.log)
-trap 'rm -f "$LOG"' EXIT
+# Keep the serial log around for post-mortem (do NOT auto-rm) — a failed or
+# starved boot is only debuggable with the raw serial output. It is a small
+# file under /tmp; the CI runner cleans /tmp between jobs.
 
 echo "[$TAG] (3/3) Boot QEMU + run /bin/spawnfdprobe"
-set +e
-qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
+# Pin -smp 1: the clean-fd contract is NOT SMP-dependent, and on a
+# DE-enabled default boot under host load the -smp 2 default starves the
+# feeder's FEEDER_SYNC readline handshake (rc=124, zero commands land) —
+# a verification confounder, not a code signal. One CPU makes the gate
+# deterministic. (last -smp on the qemu line wins over qemu_drive's -smp 2.)
+export QEMU_EXTRA_ARGS="${QEMU_EXTRA_ARGS:-} -smp 1"
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 240 \
     -- "/bin/spawnfdprobe" 3 \
        "echo SPAWNFDCLEAN_DRIVE_DONE" 2 \
        "exit" 1
 rc="$QEMU_DRIVE_RC"
-set -e
 
+echo "[$TAG] serial log preserved at: $LOG"
 echo "[$TAG] --- probe output (filtered) ---"
-grep -a -E "PARENT |CHILD |SPAWNFDCLEAN_" "$LOG" \
-    | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\000' | head -60
+grep -a -E "PARENT |CHILD |SPAWNFDCLEAN_|shell ready|command not found" "$LOG" 2>/dev/null \
+    | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\000' | head -60 || true
 echo "[$TAG] --- end output ---"
 
 # Three-valued boot gate: if the guest produced ZERO probe/child markers,
