@@ -455,25 +455,56 @@ efi_main:
     testq   %rax, %rax
     jnz     .Lefi_elfload_fail
 
-    /* File->Read(File, &size=p_filesz, Buffer=p_paddr) — read the
-     * segment's file bytes DIRECTLY to its physical load address. The
-     * IN/OUT size lives in efi_seg_read_size. */
+    /* File->Read(File, &size, Buffer) — stream the segment's file bytes
+     * DIRECTLY to its physical load address, in a CHUNKED LOOP.
+     *
+     * EFI_FILE_PROTOCOL.Read is NOT guaranteed to satisfy an arbitrarily
+     * large request in a single call: OVMF's FAT driver returns a partial
+     * (short) read for multi-hundred-MiB requests. The old code issued ONE
+     * Read of the whole p_filesz and asserted it filled the buffer, so a
+     * kernel large enough to carry a ~500 MiB squashfs (the full-mirror live
+     * image with the Mesa/LLVM software-GL stack -> a ~1.5 GiB kernel) failed
+     * at that assert ("SFSP file load failed"). A ~671 MiB baseline kernel
+     * happened to fit one firmware read and worked, masking the bug.
+     *
+     * Loop: request min(remaining, 64 MiB) per call (also dodging any
+     * per-call size ceiling), advance the buffer by the bytes actually read,
+     * and stop when remaining hits 0. A 0-byte read with bytes still owed is
+     * a genuine failure (EOF before p_filesz). Loop state lives in memory
+     * (efi_seg_remaining / efi_seg_bufptr) because the phdr-walk pins the
+     * only callee-saved registers (r12..r15) and firmware calls clobber the
+     * volatiles. Small segments still complete in a single iteration. */
     movq    P_FILESZ(%r13), %rax
-    movq    %rax, efi_seg_read_size(%rip)
+    movq    %rax, efi_seg_remaining(%rip)
+    movq    P_PADDR(%r13), %rax
+    movq    %rax, efi_seg_bufptr(%rip)
+.Lseg_read_loop:
+    movq    efi_seg_remaining(%rip), %rax
+    testq   %rax, %rax
+    jz      .Lseg_read_done
+    /* cap this request at 64 MiB */
+    cmpq    $0x4000000, %rax
+    jbe     .Lseg_read_have_size
+    movq    $0x4000000, %rax
+.Lseg_read_have_size:
+    movq    %rax, efi_seg_read_size(%rip)   /* IN: bytes to read this call */
     movq    efi_kernel_file(%rip), %rcx
     leaq    efi_seg_read_size(%rip), %rdx
-    movq    P_PADDR(%r13), %r8
+    movq    efi_seg_bufptr(%rip), %r8
     movq    efi_kernel_file(%rip), %rax
     movq    32(%rax), %rax                  /* ->Read */
     subq    $0x20, %rsp
     call    *%rax
     addq    $0x20, %rsp
     testq   %rax, %rax
-    jnz     .Lefi_elfload_fail
-    /* Short-read guard: firmware must have delivered the full segment. */
-    movq    P_FILESZ(%r13), %rax
-    cmpq    %rax, efi_seg_read_size(%rip)
-    jne     .Lefi_elfload_fail
+    jnz     .Lefi_elfload_fail              /* Read returned an error */
+    movq    efi_seg_read_size(%rip), %rax   /* OUT: bytes actually read */
+    testq   %rax, %rax
+    jz      .Lefi_elfload_fail              /* 0 bytes but more owed => EOF */
+    addq    %rax, efi_seg_bufptr(%rip)
+    subq    %rax, efi_seg_remaining(%rip)
+    jmp     .Lseg_read_loop
+.Lseg_read_done:
 
     /* Trailing-BSS zero: [p_paddr + p_filesz, p_paddr + p_memsz). */
     movq    P_PADDR(%r13), %rdi
@@ -1405,6 +1436,8 @@ efi_kernel_file:            .quad 0
      * by the kernel's LOW load region. */
 efi_hdr_read_size:          .quad 0         /* header+phdr read: IN cap / OUT bytes */
 efi_seg_read_size:          .quad 0         /* per-segment read: IN filesz / OUT bytes */
+efi_seg_remaining:          .quad 0         /* chunked seg read: bytes still owed */
+efi_seg_bufptr:             .quad 0         /* chunked seg read: current dst phys ptr */
     /* Address of _x86_start_after_loader pulled out of the kernel's
      * handoff table (planted by arch/x86/boot/header.S). Stored as a
      * uint32 because the kernel is elf32-i386 (VMAs < 4 GiB). */
