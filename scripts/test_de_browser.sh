@@ -42,6 +42,21 @@ if [ ! -f "$INSTALLER_IMG" ]; then
     fi
     echo "[browser] building installer image (~6 min)"
     bash "$PWD/scripts/build_installer_img.sh"
+else
+    # STALE-IMAGE QA TRAP GUARD (see memory: project_stale_installer_img_qa_trap).
+    # This gate reuses a prebuilt image for speed, but a QA run after a browser/DE
+    # code change would then boot the OLD binary and (false-)pass or (false-)fail
+    # against stale pixels. If any tracked browser/DE/kernel source is newer than
+    # the image, REBUILD (unless HAMNIX_SKIP_BUILD=1, the CI-shard fast path).
+    newer=$(find lib user sys fs etc scripts -name '*.ad' -o -name '*.S' -newer "$INSTALLER_IMG" 2>/dev/null | head -1)
+    if [ -n "$newer" ]; then
+        if [ "${HAMNIX_SKIP_BUILD:-0}" = "1" ]; then
+            echo "[browser] WARNING: $INSTALLER_IMG is OLDER than source ($newer) but HAMNIX_SKIP_BUILD=1 — booting a STALE image" >&2
+        else
+            echo "[browser] image is stale (source newer: $newer) — rebuilding (~6 min)" >&2
+            bash "$PWD/scripts/build_installer_img.sh"
+        fi
+    fi
 fi
 
 mkdir -p "$OUT_DIR"
