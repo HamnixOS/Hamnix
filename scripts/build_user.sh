@@ -241,6 +241,7 @@ build_adder_user hfw                  # native firewall control: list/add/flush 
 # See HAMSH_SPEC §0/§11 and etc/rc.boot.
 build_adder_user hamwd                # Phase D: Hamnix Window Daemon (Layer 3 / 9P file server skeleton)
 build_adder_user p9srv_demo           # Phase D / V4: minimum-viable userspace 9P server (test fixture)
+build_adder_user spawnfdprobe         # task #28 fixture: proves spawn's clean-fd contract (no launcher-fd leak)
 build_adder_user distrofs             # Plan 9 distro: userland 9P file-server daemon for the distro /var tree
 build_adder_user nsrun                 # Plan 9 shim launcher: runs a program in a private distrofs-backed namespace
 # apt/dpkg/dpkg_deb RETIRED — replaced by real Debian binaries run via
