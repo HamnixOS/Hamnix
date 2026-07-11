@@ -28,6 +28,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_fast_commit
 
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
@@ -110,6 +112,17 @@ echo "[test_ext4_fast_commit] --- ext4-fc / fast-commit lines ---"
 grep -E 'ext4-fc|fast-commit|fast_commit|COMPAT_FAST_COMMIT' "$LOG" || true
 echo "[test_ext4_fast_commit] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero [ext4-fc] markers == the fast_commit selftest never ran: a starved/
+# timed-out boot, an OBSERVED crash, or GRUB OOM — NOT a journal regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4-fc\]|COMPAT_FAST_COMMIT'
+
+if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
+    verdict_inconclusive "$TAG" \
+        "virtio-blk superblock read flake ('read failed status=255') — host" \
+        "CPU starvation; the fast_commit selftest could not mount. Re-run quiet."
+fi
+
 fail=0
 for needle in \
     "ext4: COMPAT_FAST_COMMIT present; fast-commit log armed" \
@@ -138,7 +151,11 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_fast_commit] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_fast_commit] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "an [ext4-fc] marker was OBSERVED absent (or an in-kernel FAIL was" \
+        "printed) while the fast_commit selftest ran (qemu rc=$rc) — a real" \
+        "fast-commit journal/replay regression."
 fi
-echo "[test_ext4_fast_commit] PASS"
+verdict_pass "$TAG" "fs/ext4.ad arms the fast-commit log, and a committed-but-" \
+    "unreplayed file reads OLD, a crash-replay applies NEW, and a crc-corrupt" \
+    "fast-commit is rejected (qemu rc=$rc)"

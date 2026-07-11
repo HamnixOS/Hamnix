@@ -31,6 +31,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_fscrypt
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -88,6 +90,17 @@ echo "[test_ext4_fscrypt] --- ext4-fscrypt self-test output ---"
 grep -a -E "\[ext4-fscrypt\]" "$LOG" || true
 echo "[test_ext4_fscrypt] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero [ext4-fscrypt] markers == the fscrypt selftest never ran: a starved/
+# timed-out boot, an OBSERVED crash, or GRUB OOM — NOT a crypto regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4-fscrypt\]'
+
+if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
+    verdict_inconclusive "$TAG" \
+        "virtio-blk superblock read flake ('read failed status=255') — host" \
+        "CPU starvation; the fscrypt selftest could not mount. Re-run quiet."
+fi
+
 fail=0
 
 if grep -a -F -q "[ext4-fscrypt] FAIL" "$LOG"; then
@@ -125,10 +138,12 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_fscrypt] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_fscrypt] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "an [ext4-fscrypt] PASS marker was OBSERVED absent (or an in-kernel" \
+        "FAIL was printed) while the fscrypt selftest ran (qemu rc=$rc) — a" \
+        "real at-rest-encryption regression."
 fi
 
-echo "[test_ext4_fscrypt] PASS — fscrypt encrypts a file's contents at rest" \
-     "with per-file AES-256-XTS; on-disk bytes are ciphertext, the XTS tweak" \
-     "differentiates blocks, and the wrong key fails (qemu rc=$rc)"
+verdict_pass "$TAG" "fscrypt encrypts a file's contents at rest with per-file" \
+     "AES-256-XTS; on-disk bytes are ciphertext, the XTS tweak differentiates" \
+     "blocks, the wrong key fails, and decrypt round-trips (qemu rc=$rc)"

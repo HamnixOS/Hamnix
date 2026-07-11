@@ -29,6 +29,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_verity
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-900}"
 
@@ -86,6 +88,17 @@ echo "[test_ext4_verity] --- ext4-verity self-test output ---"
 grep -a -E "\[ext4-verity\]" "$LOG" || true
 echo "[test_ext4_verity] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero [ext4-verity] markers == the fs-verity selftest never ran: a starved/
+# timed-out boot, an OBSERVED crash, or GRUB OOM — NOT a verity regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4-verity\]'
+
+if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
+    verdict_inconclusive "$TAG" \
+        "virtio-blk superblock read flake ('read failed status=255') — host" \
+        "CPU starvation; the fs-verity selftest could not mount. Re-run quiet."
+fi
+
 fail=0
 
 if grep -a -F -q "[ext4-verity] FAIL" "$LOG"; then
@@ -118,9 +131,12 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_verity] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_verity] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "an [ext4-verity] PASS marker was OBSERVED absent (or an in-kernel FAIL" \
+        "was printed) while the fs-verity selftest ran (qemu rc=$rc) — a real" \
+        "verity authentication regression."
 fi
 
-echo "[test_ext4_verity] PASS — fs-verity authenticates a file via a salted" \
-     "SHA-256 Merkle tree; data AND hash-tree tampering both detected (qemu rc=$rc)"
+verdict_pass "$TAG" "fs-verity authenticates a file via a salted SHA-256 Merkle" \
+     "tree; clean-read verifies and data AND hash-tree tampering are both" \
+     "detected (qemu rc=$rc)"

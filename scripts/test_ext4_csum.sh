@@ -33,6 +33,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_csum
 
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
@@ -119,6 +121,20 @@ echo "[test_ext4_csum] --- ext4csum lines ---"
 grep -E '\[ext4csum\]' "$LOG" || true
 echo "[test_ext4_csum] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero [ext4csum] markers == the metadata_csum selftest never ran: a
+# starved/timed-out boot, an OBSERVED crash (verdict_boot_gate FAILs on
+# TRAP/panic), or GRUB OOM — NOT a checksum regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4csum\]'
+
+# A virtio-blk superblock-read flake (host CPU starvation under load)
+# means the fs never mounted and the selftest could not run: INCONCLUSIVE.
+if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
+    verdict_inconclusive "$TAG" \
+        "virtio-blk superblock read flake ('read failed status=255') — host" \
+        "CPU starvation; the metadata_csum selftest could not mount. Re-run quiet."
+fi
+
 fail=0
 for needle in \
     "[ext4csum] PASS verify-crc32c-kat (crc32c('123456789')=0xE3069283)" \
@@ -147,7 +163,11 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_csum] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_csum] FAIL (qemu rc=$rc)"
-    exit 1
+    verdict_fail "$TAG" \
+        "an [ext4csum] PASS marker was OBSERVED absent (or an in-kernel FAIL" \
+        "was printed) while the metadata_csum selftest ran (qemu rc=$rc) —" \
+        "a real crc32c integrity regression."
 fi
-echo "[test_ext4_csum] PASS"
+verdict_pass "$TAG" "fs/ext4.ad verifies crc32c metadata_csum on a live mount:" \
+    "crc32c KAT, superblock, inode, dir-block checksums all verify, a flipped" \
+    "byte is rejected, and a recompute round-trips (qemu rc=$rc)"

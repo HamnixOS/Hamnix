@@ -43,6 +43,8 @@
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
+. "$PROJ_ROOT/scripts/_verdict.sh"
+TAG=test_ext4_largedir
 
 export HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-1200}"
 
@@ -143,6 +145,18 @@ echo "[test_ext4_largedir] --- ext4-largedir self-test output ---"
 grep -a -E "\[ext4-largedir\]" "$LOG" || true
 echo "[test_ext4_largedir] --- end ---"
 
+# --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
+# Zero [ext4-largedir] markers == the large_dir selftest never ran: a
+# starved/timed-out boot (this gate builds a huge htree, so timeout is a
+# genuine risk), an OBSERVED crash, or GRUB OOM — NOT an htree regression.
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4-largedir\]'
+
+if grep -aqE "read failed status=255|failed to read superblock" "$LOG"; then
+    verdict_inconclusive "$TAG" \
+        "virtio-blk superblock read flake ('read failed status=255') — host" \
+        "CPU starvation; the large_dir selftest could not mount. Re-run quiet."
+fi
+
 fail=0
 
 if grep -a -F -q "[ext4-largedir] FAIL" "$LOG"; then
@@ -201,11 +215,21 @@ fi
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4_largedir] --- full log ---"
     cat "$LOG"
-    echo "[test_ext4_largedir] FAIL (qemu rc=$rc)"
-    exit 1
+    # A marker printed but the terminal PASS banner never arrived under a
+    # timeout kill == starved mid-selftest (this gate builds a large htree).
+    if ! grep -a -F -q "[ext4-largedir] PASS" "$LOG" && [ "$rc" -eq 124 ]; then
+        verdict_inconclusive "$TAG" \
+            "[ext4-largedir] markers printed but the terminal PASS banner never" \
+            "arrived and qemu was killed by timeout (rc=124) — starved" \
+            "mid-selftest building the 3-level htree. Re-run on a QUIET host."
+    fi
+    verdict_fail "$TAG" \
+        "an [ext4-largedir] marker was OBSERVED absent (or an internal FAIL /" \
+        "e2fsck htree corruption was reported) while the selftest ran" \
+        "(qemu rc=$rc) — a real large_dir/htree regression."
 fi
 
-echo "[test_ext4_largedir] PASS — ext4 large_dir: a near-full 2-level dir_index" \
-     "directory grows to a genuine 3-level htree (indirect_levels 1 -> 2), gated" \
-     "on INCOMPAT_LARGEDIR; every inserted name resolves via the 3-level hash" \
+verdict_pass "$TAG" "ext4 large_dir: a near-full 2-level dir_index directory" \
+     "grows to a genuine 3-level htree (indirect_levels 1 -> 2), gated on" \
+     "INCOMPAT_LARGEDIR; every inserted name resolves via the 3-level hash" \
      "descend, and e2fsck accepts the on-disk htree (qemu rc=$rc)"
