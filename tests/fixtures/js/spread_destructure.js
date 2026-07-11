@@ -31,3 +31,6 @@ var { user: { id, tags: [t0, t1] } } = nested;
 console.log(id, t0, t1);
 function swap(pair){ var [a, b] = pair; return [b, a]; }
 console.log(swap([1, 2]).join(","));
+var full = { a: 1, b: 2, c: 3, d: 4 };
+var { a: aa, ...others } = full;
+console.log(aa, JSON.stringify(others));
