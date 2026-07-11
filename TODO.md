@@ -649,9 +649,13 @@ Open blockers (agent-owned):
   stays behind the native browser per the user's fallback framing; the EGL config
   flip is preserved dark on `worktree-agent-a10dac83395dbcb75`. See
   [[project_firefox_startup_deadlock]].
-- [ ] `ls /dev` hardcodes `blk`, so a stripped (non-hostowner) namespace names a
-  path it cannot open (`lsblk` fails). Fix via mount-table synthesis, NOT by
-  re-binding `/dev/blk` (that undoes a security boundary).
+- [x] `ls /dev` named `blk` unconditionally → a stripped (non-hostowner) ns named a
+  path it couldn't open (`lsblk` failed). FIXED (`50d7d9ec`, #9): the /dev listing
+  now hides `blk` in any ns that can't open it (same hostowner rule as the open
+  gate) across all 3 emitters; also closed an info-leak where `sys_listdir` /
+  `vfs_listdir` bypassed the permission check and enumerated device names for any
+  uid; `lsblk` degrades a denied open to "no accessible block devices". Boundary
+  NOT weakened (not a re-bind). Gate `test_dev_blk_ns_visibility.sh`.
 - [ ] Flip `test_pipe.sh` / `test_multipipe.sh` back to `-smp 2` once the wedge
   lands — they default to `-smp 1` to dodge it, which hides it.
 
