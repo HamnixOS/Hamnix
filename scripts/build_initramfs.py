@@ -589,6 +589,15 @@ if os.environ.get("ENABLE_SMP_SOAK") == "1":
 if os.environ.get("ENABLE_SCHED_FAIR") == "1":
     FILES.append(("/etc/sched-fair", b"1\n"))
 
+# scripts/test_fpu_ctxsw.sh sets ENABLE_FPU_TORTURE=1 to plant /etc/fpu-torture.
+# init/main.ad at boot:37 detects the marker and calls
+# fpu_ctxsw_torture_selftest() (kernel/sched/core.ad): two kthreads ping-pong
+# distinct patterns across the xmm bank over many real context switches and
+# assert ZERO cross-contamination — the direct proof that per-task FPU/SSE
+# state is saved/restored on every switch. Default boots omit the marker.
+if os.environ.get("ENABLE_FPU_TORTURE") == "1":
+    FILES.append(("/etc/fpu-torture", b"1\n"))
+
 # NTASKS-ceiling concurrency proof. scripts/test_ntasks_ceiling.sh sets
 # ENABLE_NTASKS_TEST=1 to plant /etc/ntasks-test. init/main.ad at
 # boot:37.ntasks_test detects the marker and calls ntasks_ceiling_test_run()

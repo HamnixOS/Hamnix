@@ -137,6 +137,23 @@ STEAL_HYSTERESIS_JIFFIES: uint64 = 2
 
 extern def __switch_to_asm(prev: Ptr[uint8], next: Ptr[uint8])
 extern def enter_first_task(task: Ptr[uint8])
+
+# FPU / SSE / AVX extended-state save & restore (arch/x86/kernel/fpu_asm.S).
+# Hamnix now eagerly XSAVEs the outgoing task's x87/SSE/AVX register file and
+# XRSTORs the incoming task's on every context switch — see _fpu_ctx_switch and
+# fpu_init_bsp below. Without this any native float64 / SIMD value corrupts the
+# instant a task is preempted (the `2.0*3.0+1.0 == 1` js-tool bug). XSAVE/XRSTOR
+# take the requested-feature bitmap in EDX:EAX (mask arg); FXSAVE/FXRSTOR are
+# the pre-XSAVE-silicon fallback over the legacy 512-byte area.
+extern def fpu_xsave(area: Ptr[uint8], mask: uint64)
+extern def fpu_xrstor(area: Ptr[uint8], mask: uint64)
+extern def fpu_fxsave(area: Ptr[uint8])
+extern def fpu_fxrstor(area: Ptr[uint8])
+# FPU context-switch torture-test primitives (fpu_asm.S) — used ONLY by
+# fpu_ctxsw_torture_selftest below. store loads a distinct pattern across
+# xmm0..xmm15; verify returns the mismatch count after a round of switches.
+extern def fpu_torture_store(seed: uint64)
+extern def fpu_torture_verify(seed: uint64) -> uint64
 # SMP spinlock: test-and-set via LOCK XCHG, release via plain store+SFENCE.
 # Used to protect shared runqueue mutations so APs and BSP don't race.
 extern def spinlock_lock(ptr: Ptr[uint32])
@@ -1103,6 +1120,20 @@ class TaskStruct:
     sc_ring_nr:  Array[8, uint64]
     sc_ring_ret: Array[8, int64]
     sc_ring_head: uint64
+    # Per-task FPU / SSE / AVX extended-state save area. The context-switch
+    # path XSAVEs the outgoing task's x87/SSE/AVX register file here and
+    # XRSTORs the incoming task's on dispatch (eager FPU — see _fpu_ctx_switch).
+    # Without this a preempted native float64 / SIMD computation corrupts
+    # (the `2.0*3.0+1.0 == 1` js-tool bug that this whole track closes).
+    #
+    # XSAVE requires the area be 64-BYTE ALIGNED; a field inside an array of
+    # TaskStructs has no such guarantee, so the buffer is OVER-ALLOCATED and
+    # fpu_area_ptr() aligns the base up to the next 64-byte boundary at runtime.
+    # FPU_AREA_ALLOC (below) = worst-case XSAVE size for XCR0=0x7 (832 B for
+    # x87+SSE+AVX) + 64 B alignment slack, rounded up generously. Appended at
+    # the END of TaskStruct so no earlier documented offset shifts; a fresh
+    # .bss slot starts zeroed and fpu_task_init() stamps the clean init state.
+    fpu_area:    Array[1024, uint8]
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -1302,6 +1333,151 @@ RFLAGS_INITIAL: uint64 = 0x202           # bit 1 reserved | bit 9 IF=1
 NTASKS:      uint64 = 512
 task_table:  Array[512, TaskStruct]
 next_pid:    uint64 = 1
+
+# =====================================================================
+# FPU / SSE / AVX per-task extended-state save/restore
+# =====================================================================
+# Hamnix used to swap ONLY the 6 callee-saved GPRs across a context switch;
+# the x87/SSE/AVX register file was never preserved, so a native float64 /
+# SIMD value silently corrupted the moment a task was preempted (the native
+# `js` tool computed `2.0*3.0+1.0 == 1`). fpu_init_bsp() arms the control
+# bits + detects the mechanism, fpu_task_init() stamps each new task's area
+# with a CLEAN init state, and _fpu_ctx_switch() eagerly XSAVE/XRSTORs on
+# every dispatch. Eager (not lazy-#NM) — correctness first.
+#
+# g_fpu_ready gates ALL of the above: 0 until fpu_init_bsp() has armed
+# CR4.OSFXSR/OSXMMEXCPT (+ OSXSAVE/XCR0 when XSAVE is present), so the switch
+# path never executes an XSAVE/FXSAVE that would #UD/#GP on an un-armed CPU.
+g_fpu_ready:      uint64 = 0
+# 1 => use XSAVE/XRSTOR (CPUID.01h:ECX bit26); 0 => FXSAVE/FXRSTOR fallback.
+g_fpu_use_xsave:  uint64 = 0
+# The XCR0 / requested-feature bitmap handed to XSAVE/XRSTOR (0x7 x87|SSE|AVX,
+# or 0x3 without AVX). Unused on the FXSAVE fallback path.
+g_fpu_xcr0_mask:  uint64 = 0
+# XSAVE area byte size for the enabled components (CPUID.0Dh:EBX). 512 for the
+# FXSAVE fallback. Only used for the fresh-area zeroing bound; the save/restore
+# instructions size themselves off the feature mask / fixed 512.
+g_fpu_area_size:  uint64 = 512
+
+# Legacy-region field offsets shared by the XSAVE and FXSAVE area formats.
+FPU_OFF_FCW:    uint64 = 0     # x87 control word (2 bytes)
+FPU_OFF_MXCSR:  uint64 = 24    # SIMD control/status (4 bytes)
+FPU_XSTATE_BV:  uint64 = 512   # XSAVE header: XSTATE_BV (8 bytes)
+FPU_XCOMP_BV:   uint64 = 520   # XSAVE header: XCOMP_BV (8 bytes)
+# Clean init values: x87 CW = all exceptions masked, 64-bit precision, round
+# nearest; MXCSR = all SIMD exceptions masked, round nearest, FTZ/DAZ off.
+FPU_INIT_FCW:   uint64 = 0x037F
+FPU_INIT_MXCSR: uint64 = 0x1F80
+
+def fpu_area_ptr(idx: uint64) -> uint64:
+    # 64-byte-aligned pointer into task_table[idx].fpu_area. The buffer is
+    # over-allocated (Array[1024]) so aligning the base up to the next 64-byte
+    # boundary always leaves >= worst-case XSAVE size (832 B) addressable.
+    base: uint64 = cast[uint64](&task_table[idx].fpu_area[0])
+    return (base + 63) & ~cast[uint64](63)
+
+def fpu_task_init(idx: uint64):
+    # Stamp a freshly-created (or recycled) task's FPU area with a CLEAN init
+    # state so it does not inherit stale x87/SSE/AVX lanes from the previous
+    # tenant of the slot NOR from whatever task ran on the CPU just before it.
+    #
+    # Layout is chosen so XRSTOR (with XSTATE_BV=0) loads INIT state for every
+    # component in the requested mask — clean x87 (CW 0x037F), zeroed XMM/YMM —
+    # while MXCSR is ALWAYS loaded from the area (the SDM loads MXCSR from
+    # memory whenever RFBM selects SSE or AVX, independent of XSTATE_BV), so we
+    # write 0x1F80 there to keep SIMD exceptions masked. FXRSTOR reads the same
+    # FCW/MXCSR fields, so this single layout serves both mechanisms.
+    area: uint64 = fpu_area_ptr(idx)
+    # Zero the whole (aligned) area up to the enabled size. 1024 - 64 slack is
+    # the guaranteed-addressable span; zero g_fpu_area_size which is <= 832.
+    z: uint64 = 0
+    n: uint64 = g_fpu_area_size
+    if n < 512:
+        n = 512
+    while z < n:
+        cast[Ptr[uint8]](area + z)[0] = 0
+        z = z + 1
+    # x87 control word (2 bytes) and MXCSR (4 bytes) in the legacy region.
+    cast[Ptr[uint16]](area + FPU_OFF_FCW)[0]   = cast[uint16](FPU_INIT_FCW)
+    cast[Ptr[uint32]](area + FPU_OFF_MXCSR)[0] = cast[uint32](FPU_INIT_MXCSR)
+    # XSAVE header: XSTATE_BV = 0 (all components -> INIT on XRSTOR), XCOMP_BV
+    # = 0 (standard, non-compacted format — we use XSAVE64, not XSAVEC). Both
+    # already zero from the memset above; the explicit stores document intent
+    # and guard against a future non-zero default.
+    if g_fpu_use_xsave != 0:
+        cast[Ptr[uint64]](area + FPU_XSTATE_BV)[0] = 0
+        cast[Ptr[uint64]](area + FPU_XCOMP_BV)[0]  = 0
+
+def _fpu_ctx_switch(prev: uint64, nxt: uint64):
+    # Eager FPU context switch, called from every __switch_to_asm site with
+    # NO rq lock held and IRQs masked (the switch path runs with IF=0). Mirrors
+    # the FS_BASE handling one line above each switch: the OUTGOING task saves
+    # its live vector state, and the INCOMING task's state is loaded BEFORE the
+    # GPR switch so `nxt` resumes (whether via its own paused schedule() or, for
+    # a fresh task, via kthread_bootstrap's iretq) with its FPU already correct.
+    # Loading nxt here rather than "after the switch returns" is what makes a
+    # FRESH task get its clean state — a fresh task never executes any post-
+    # switch restore, it lands directly in kthread_bootstrap.
+    if g_fpu_ready == 0:
+        return
+    prev_area: uint64 = fpu_area_ptr(prev)
+    nxt_area:  uint64 = fpu_area_ptr(nxt)
+    if g_fpu_use_xsave != 0:
+        fpu_xsave(cast[Ptr[uint8]](prev_area), g_fpu_xcr0_mask)
+        fpu_xrstor(cast[Ptr[uint8]](nxt_area), g_fpu_xcr0_mask)
+    else:
+        fpu_fxsave(cast[Ptr[uint8]](prev_area))
+        fpu_fxrstor(cast[Ptr[uint8]](nxt_area))
+
+def fpu_init_bsp():
+    # Arm the BSP's FPU control bits and detect the save mechanism, ONCE,
+    # before the scheduler performs any context switch. Must run before
+    # sched_init() creates the boot task and any kthread. After this returns
+    # g_fpu_ready == 1 and every subsequent _fpu_ctx_switch saves/restores.
+    #
+    # Control bits (per-CPU; the AP path mirrors this in smp.ad::ap_main):
+    #   CR4.OSFXSR   (bit 9)  — enable FXSAVE/FXRSTOR + SSE (legacy control).
+    #   CR4.OSXMMEXCPT (bit10)— route SSE exceptions to #XF, not #UD.
+    #   CR4.OSXSAVE  (bit18)  — unlock XSAVE/XRSTOR/XSETBV (only if supported).
+    # header.S already sets OSFXSR/OSXMMEXCPT on the BSP; we OR them again
+    # (belt-and-suspenders) so this function is self-contained + correct even
+    # if the early-boot path changes.
+    cr4v: uint64 = read_cr4()
+    cr4v = cr4v | (cast[uint64](1) << 9) | (cast[uint64](1) << 10)
+    cpb: Array[4, uint32]
+    cpuid_get(cast[uint32](1), cast[uint32](0), &cpb[0])
+    ecx1: uint64 = cast[uint64](cpb[2])
+    xsave_ok: uint64 = (ecx1 >> 26) & 0x1
+    avx_ok:   uint64 = (ecx1 >> 28) & 0x1
+    if xsave_ok != 0:
+        cr4v = cr4v | (cast[uint64](1) << 18)          # CR4.OSXSAVE
+    write_cr4(cr4v)
+    if xsave_ok != 0:
+        # XCR0: enable x87|SSE (0x3) and AVX (0x7) when advertised. Setting an
+        # unsupported bit #GPs, so AVX is gated on CPUID.01h:ECX bit28.
+        mask: uint64 = 0x3
+        if avx_ok != 0:
+            mask = 0x7
+        xsetbv_xcr0(mask)
+        g_fpu_use_xsave = 1
+        g_fpu_xcr0_mask = mask
+        # XSAVE area size for the enabled feature set: CPUID.0Dh:0.EBX gives
+        # the size required for all components enabled in XCR0.
+        xb: Array[4, uint32]
+        cpuid_get(cast[uint32](0x0D), cast[uint32](0), &xb[0])
+        sz: uint64 = cast[uint64](xb[1])
+        if sz < 512:
+            sz = 512                                    # never below FXSAVE size
+        if sz > 960:
+            sz = 960                                    # clamp to our buffer slack
+        g_fpu_area_size = sz
+    else:
+        g_fpu_use_xsave = 0
+        g_fpu_area_size = 512                            # FXSAVE legacy area
+    # Reset the live FPU to power-on defaults so the very first XSAVE captures a
+    # sane baseline for whichever task is running when the first switch fires.
+    fninit_helper()
+    g_fpu_ready = 1
 
 # =====================================================================
 # O(1) acceleration structures (Track 5 — kill the O(NTASKS) scans)
@@ -3503,6 +3679,10 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     # SMP steal-window: a freshly-built task is NOT mid-switch, so it must
     # start with on_cpu=0 (a recycled STATE_FREE slot may hold a stale 1).
     task_table[s].on_cpu      = 0
+    # FPU/SSE/AVX: stamp a clean x87/SSE/AVX init state so this kthread does
+    # not inherit the slot's previous tenant's (or another CPU's) vector lanes
+    # on its first XRSTOR at dispatch.
+    fpu_task_init(s)
     # RACE FIX (mirrors create_user_thread): do NOT publish the slot as
     # STATE_READY until cr3 + all fd/signal fields are initialized at the
     # end of the function. The slot stays STATE_FREE (invisible to
@@ -3784,6 +3964,13 @@ def create_user_thread(entry: uint64, name0: uint64,
     # SMP steal-window: fresh task is not mid-switch; clear any stale on_cpu
     # left in a recycled STATE_FREE slot before it can become stealable.
     task_table[s].on_cpu      = 0
+    # FPU/SSE/AVX: stamp a clean x87/SSE/AVX init state (CW 0x037F, MXCSR
+    # 0x1F80, zeroed vector regs) so a freshly-created / forked user task does
+    # not inherit stale lanes on its first XRSTOR at dispatch. Matches Linux's
+    # "child starts with a clean FPU" for the exec/spawn case; a fork child's
+    # xmm regs are caller-saved across the fork() call boundary, so a clean
+    # start is safe there too.
+    fpu_task_init(s)
     task_table[s].ustack_base = ustack
     # NOTE: state is DELIBERATELY NOT set to STATE_READY here. The slot
     # stays STATE_FREE (as returned by _find_free_slot) until the very
@@ -4472,6 +4659,10 @@ def _sched_switch_to_ap_idle(my_cpu: uint64, ap_idle: uint64):
         load_cr3(task_table[ap_idle].cr3)
     write_msr(SCHED_IA32_FS_BASE, task_table[ap_idle].fs_base)
 
+    # FPU/SSE/AVX: save the outgoing task's vector file, load ap_idle's, before
+    # the GPR switch (mirrors the FS_BASE line above; no-op until fpu_init_bsp).
+    _fpu_ctx_switch(prev, ap_idle)
+
     __switch_to_asm(cast[Ptr[uint8]](&task_table[prev]),
                     cast[Ptr[uint8]](&task_table[ap_idle]))
 
@@ -4797,6 +4988,13 @@ def schedule():
         printk2("SWITCH-BAD-SP: nxt.state=%d nxt.pid=%d\n",
                 task_table[nxt].state, cast[uint64](task_table[nxt].pid))
         panic("schedule: dispatch into task with uninitialized sp")
+
+    # FPU/SSE/AVX save+restore (mirrors the FS_BASE write above): XSAVE prev's
+    # live x87/SSE/AVX file into prev->fpu_area, XRSTOR nxt->fpu_area, before
+    # the GPR switch so nxt resumes with its vector state intact. Eager, gated
+    # on g_fpu_ready (no-op before fpu_init_bsp). This is the core fix for the
+    # cross-task vector corruption (`2.0*3.0+1.0 == 1`).
+    _fpu_ctx_switch(prev, nxt)
 
     __switch_to_asm(cast[Ptr[uint8]](&task_table[prev]),
                     cast[Ptr[uint8]](&task_table[nxt]))
@@ -5311,6 +5509,10 @@ def sched_ap_idle_loop():
             # save needed for the idle kthread — its nesting is always 0.)
             rcu_note_context_switch()
             rcu_restore_read_nesting(task_table[nxt].rcu_read_nesting)
+
+            # FPU/SSE/AVX: save the idle kthread's vector file, load nxt's,
+            # before the GPR switch (mirrors the FS_BASE write above).
+            _fpu_ctx_switch(my_idle_slot, nxt)
 
             # Context-switch to the real task.  When it eventually calls
             # schedule() and finds the idle slot is STATE_READY, it will
@@ -11394,6 +11596,151 @@ def ntasks_ceiling_test_run():
 # Runs on the BSP boot task (slot 0) before start_first_task(), same as
 # the soak. Workers self-reap (detached).
 # ---------------------------------------------------------------------
+# =====================================================================
+# FPU / SSE context-switch torture self-test
+# =====================================================================
+# Proves per-task x87/SSE/AVX state is preserved across REAL context switches
+# (the fix this whole track lands). Two kthreads ping-pong via a shared turn
+# flag: worker A loads a DISTINCT pattern across xmm0..xmm15, hands the turn to
+# B, B loads its OWN (different) pattern into the same registers, hands back,
+# then A verifies its pattern is INTACT. B's store is GUARANTEED to fall
+# between A's store and A's verify, so without per-task FPU save/restore A's
+# verify sees B's lanes and reports mismatches. With the fix every verify is
+# clean. Asserts ZERO mismatches over many rounds and emits a grep-able banner.
+#
+# The workers yield with schedule() (NOT yield_to_others — that adds an idle
+# hlt) so the ping-pong is fast. The kernel emits no xmm instructions of its
+# own, so the only writer of the xmm bank between A's store and verify is the
+# sibling worker — making the test both sensitive (catches the bug) and free
+# of false positives (the driver / scheduler never clobbers the bank).
+FPU_TT_ROUNDS:  uint64 = 200          # store/verify rounds per worker
+FPU_TT_SEED_A:  uint64 = 0xA5A50000   # distinct base patterns (16 regs each,
+FPU_TT_SEED_B:  uint64 = 0x5B5B1000   # non-overlapping ranges: A..A+15, B..B+15)
+FPU_TT_YCAP:    uint64 = 20000000     # per-wait schedule() cap (anti-hang)
+fpu_tt_turn:       uint64 = 0         # 0 => A's turn, 1 => B's turn
+fpu_tt_mismatch_a: uint64 = 0         # xmm mismatches observed by worker A
+fpu_tt_mismatch_b: uint64 = 0         # xmm mismatches observed by worker B
+fpu_tt_done:       uint64 = 0         # workers that reached self-reap (want 2)
+fpu_tt_started_a:  uint64 = 0         # 1 once A ran its first round
+fpu_tt_started_b:  uint64 = 0         # 1 once B ran its first round
+
+
+def _fpu_tt_worker_a():
+    # Worker A: owns turn==0. Each round: store SEED_A across the xmm bank,
+    # hand the turn to B, wait (via schedule()) until B hands it back, then
+    # verify SEED_A survived. Accumulate any mismatches into the shared total.
+    fpu_tt_started_a = 1
+    local_mis: uint64 = 0
+    r: uint64 = 0
+    while r < FPU_TT_ROUNDS:
+        # Wait for A's turn.
+        guard: uint64 = 0
+        while fpu_tt_turn != 0 and guard < FPU_TT_YCAP:
+            schedule()
+            guard = guard + 1
+        fpu_torture_store(FPU_TT_SEED_A)
+        fpu_tt_turn = 1                      # hand off to B
+        # Wait until B has stored its pattern AND handed the turn back.
+        guard = 0
+        while fpu_tt_turn != 0 and guard < FPU_TT_YCAP:
+            schedule()
+            guard = guard + 1
+        local_mis = local_mis + fpu_torture_verify(FPU_TT_SEED_A)
+        r = r + 1
+    _wq_lock_irq()
+    fpu_tt_mismatch_a = fpu_tt_mismatch_a + local_mis
+    fpu_tt_done = fpu_tt_done + 1
+    fpu_tt_turn = 1                          # release B if it is waiting
+    _wq_unlock_irq()
+    task_exit_current(0)
+
+
+def _fpu_tt_worker_b():
+    # Worker B: owns turn==1. Mirror of A with SEED_B.
+    fpu_tt_started_b = 1
+    local_mis: uint64 = 0
+    r: uint64 = 0
+    while r < FPU_TT_ROUNDS:
+        guard: uint64 = 0
+        while fpu_tt_turn != 1 and guard < FPU_TT_YCAP:
+            schedule()
+            guard = guard + 1
+        fpu_torture_store(FPU_TT_SEED_B)
+        # Verify B's OWN pattern is intact right after storing but before
+        # yielding is trivially true; the meaningful check is AFTER A runs.
+        fpu_tt_turn = 0                      # hand back to A
+        guard = 0
+        while fpu_tt_turn != 1 and guard < FPU_TT_YCAP:
+            schedule()
+            guard = guard + 1
+        local_mis = local_mis + fpu_torture_verify(FPU_TT_SEED_B)
+        r = r + 1
+    _wq_lock_irq()
+    fpu_tt_mismatch_b = fpu_tt_mismatch_b + local_mis
+    fpu_tt_done = fpu_tt_done + 1
+    fpu_tt_turn = 0                          # release A if it is waiting
+    _wq_unlock_irq()
+    task_exit_current(0)
+
+
+def fpu_ctxsw_torture_selftest():
+    # Spawn the two ping-pong workers and drive them to completion on the BSP.
+    # Runs on the boot task (slot 0) before start_first_task(), same context as
+    # the soak / sched-fair self-tests. Emits "[fpu-torture] PASS/FAIL ..." for
+    # the CI gate to grep.
+    printk0("[fpu-torture] starting FPU/SSE context-switch torture self-test\n")
+    if g_fpu_ready == 0:
+        printk0("[fpu-torture] FAIL: fpu not initialised (g_fpu_ready==0)\n")
+        return
+    fpu_tt_turn = 0
+    fpu_tt_mismatch_a = 0
+    fpu_tt_mismatch_b = 0
+    fpu_tt_done = 0
+    fpu_tt_started_a = 0
+    fpu_tt_started_b = 0
+
+    # Pin both workers to the BSP run-list so the ping-pong is deterministic
+    # even under -smp 2 (no cross-CPU steal mid-test). schedule() rotates them
+    # on cpu0; the shared turn flag serialises the store/verify handshake.
+    _wq_lock_irq()
+    sa: int32 = kthread_create(cast[uint64](&_fpu_tt_worker_a), 0)
+    if sa >= 0:
+        task_table[cast[uint64](sa)].detached = 1
+        task_table[cast[uint64](sa)].rq_cpu = 0
+    sb: int32 = kthread_create(cast[uint64](&_fpu_tt_worker_b), 0)
+    if sb >= 0:
+        task_table[cast[uint64](sb)].detached = 1
+        task_table[cast[uint64](sb)].rq_cpu = 0
+    _wq_unlock_irq()
+    if sa < 0 or sb < 0:
+        printk0("[fpu-torture] FAIL: could not create both worker kthreads\n")
+        return
+
+    # Drive: the boot task yields via schedule() until both workers self-reap.
+    # Bounded so a wedged worker cannot hang boot.
+    drive: uint64 = 0
+    dcap: uint64 = 40000000
+    while fpu_tt_done < 2 and drive < dcap:
+        schedule()
+        drive = drive + 1
+
+    if fpu_tt_done < 2:
+        printk2("[fpu-torture] FAIL: only %d/2 workers finished (a_started=%d)\n",
+                fpu_tt_done, fpu_tt_started_a)
+        return
+    if fpu_tt_started_a == 0 or fpu_tt_started_b == 0:
+        printk0("[fpu-torture] FAIL: a worker never ran a round\n")
+        return
+    total_mis: uint64 = fpu_tt_mismatch_a + fpu_tt_mismatch_b
+    if total_mis == 0:
+        printk2("[fpu-torture] PASS: 0 xmm mismatches over %d rounds x2 workers (a=%d)\n",
+                FPU_TT_ROUNDS, fpu_tt_mismatch_a)
+        printk1("[fpu-torture] PASS b_mismatch=%d\n", fpu_tt_mismatch_b)
+    else:
+        printk2("[fpu-torture] FAIL: xmm cross-contamination a=%d b=%d\n",
+                fpu_tt_mismatch_a, fpu_tt_mismatch_b)
+
+
 SCHED_FAIR_NWORKERS: uint64 = 4
 SCHED_FAIR_WORKLOOP: uint64 = 2000000
 
