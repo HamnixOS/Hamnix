@@ -3361,13 +3361,19 @@ class X86CodeGen:
                 # signed and unsigned operands (the low bits are identical).
                 self.emit("    shlq %cl, %rax")
             case BinOp.SHR:
-                # Right shift must honour operand signedness: sarq for a
-                # signed operand (sign-extends, arithmetic), shrq for an
-                # unsigned operand (zero-fills, logical). Emitting shrq for
-                # a negative signed value, or sarq for an unsigned value
-                # with the high bit set, both corrupt the result. See
-                # _binop_signed_op for the operand-signedness rule.
-                if self._binop_signed_op(left, right):
+                # Right shift must honour the signedness of the VALUE being
+                # shifted (the LEFT operand ONLY): sarq for a signed operand
+                # (sign-extends, arithmetic), shrq for an unsigned operand
+                # (zero-fills, logical). The COUNT's type is irrelevant in C —
+                # `x >> n` has the type of the promoted left operand no matter
+                # whether `n` is signed or unsigned. The old rule keyed on
+                # _binop_signed_op(left, right), which let a `uint64` count
+                # force shrq on a clearly-signed value (e.g. `neg_i64 >> ucnt`
+                # or `arr_i64[i] >> ucnt`), silently corrupting every negative
+                # intermediate. _shr_operand_signed also sees THROUGH integer
+                # sub-expressions (`(a - b) >> n`), which get_expr_type reports
+                # as unknown. See _shr_operand_signed.
+                if self._shr_operand_signed(left):
                     self.emit("    sarq %cl, %rax")
                 else:
                     self.emit("    shrq %cl, %rax")
@@ -3841,6 +3847,51 @@ class X86CodeGen:
         # No operand is known-unsigned: signed iff some operand is
         # known-signed (lu/ru is False). All-unknown stays unsigned.
         return lu is False or ru is False
+
+    def _shr_operand_signed(self, left: Expr) -> bool:
+        """Decide whether a `>>` should emit the SIGNED right shift (sarq)
+        rather than the logical one (shrq).
+
+        Unlike `/` and `%`, a shift's signedness is a property of the LEFT
+        (value) operand ALONE — the count's type never matters (C: `x >> n`
+        has the promoted type of `x`). So this ignores the count and asks
+        only whether the shifted value is a signed integer.
+
+        It also sees THROUGH an integer sub-expression: `get_expr_type` has
+        no case for an integer `BinaryExpr` and reports None, so a plain
+        type lookup would call `(a - b) >> n` "unknown" and fall back to the
+        logical shift even when a and b are signed. We recover the value's
+        signedness structurally: a shift follows its own left operand; an
+        arithmetic/bitwise binop is unsigned if EITHER operand is unsigned,
+        else signed if EITHER is signed (C usual-arithmetic-conversion),
+        else unknown. Unknown defaults to logical (the long-standing
+        unsigned-default this backend shipped)."""
+        return self._shr_value_unsigned(left) is False
+
+    def _shr_value_unsigned(self, expr: Expr) -> Optional[bool]:
+        """Signedness tristate (True unsigned / False signed / None unknown)
+        of the VALUE produced by `expr`, for the shift-signedness decision.
+        Understands integer sub-expressions that `get_expr_type` reports as
+        None; every other shape defers to the normal type lookup."""
+        if isinstance(expr, BinaryExpr):
+            op = expr.op
+            if op in (BinOp.SHL, BinOp.SHR):
+                # Shift result carries the signedness of the shifted value.
+                return self._shr_value_unsigned(expr.left)
+            if op in (BinOp.ADD, BinOp.SUB, BinOp.MUL, BinOp.BIT_AND,
+                      BinOp.BIT_OR, BinOp.BIT_XOR, BinOp.DIV, BinOp.IDIV,
+                      BinOp.MOD):
+                lu = self._shr_value_unsigned(expr.left)
+                ru = self._shr_value_unsigned(expr.right)
+                if lu is True or ru is True:
+                    return True
+                if lu is False or ru is False:
+                    return False
+                return None
+            # Comparisons / logical ops yield a 0/1 boolean — not a signed
+            # value; treat as unknown so the shift stays logical.
+            return None
+        return self._is_unsigned_type(self.get_expr_type(expr))
 
     def _cmp_set(self, cc: str) -> None:
         """Compare %rax to %rcx, then materialize a 0/1 result in %rax."""
