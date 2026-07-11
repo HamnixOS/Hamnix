@@ -1,0 +1,822 @@
+# lib/font_ttf.ad — a pure-Adder TrueType (sfnt/glyf) rasteriser with
+# grayscale ANTI-ALIASING, for the graphical hambrowse backend.
+#
+# WHY THIS EXISTS
+# ===============
+# lib/font_bdf.ad decodes FIXED-SIZE 1-bit bitmap fonts: a heading can only be
+# an INTEGER up-scale of a 10px master (blocky), there is no continuous CSS
+# font-size, and every glyph edge is a hard 1-bit staircase (jagged). That was
+# the visible ceiling on "looks like a real browser".
+#
+# This module removes that ceiling. It parses a real .ttf (the `head`, `maxp`,
+# `hhea`, `hmtx`, `cmap` format-4, `loca` and `glyf` tables), decodes the simple
+# glyph outlines (quadratic bezier contours), and SCAN-CONVERTS them at an
+# ARBITRARY target pixel size with 4x4 SUPERSAMPLED coverage — i.e. true
+# scalable, anti-aliased type. A glyph rendered at 14px, 16px, 18px, 32px … is
+# a genuinely different, smooth rasterisation, not a scaled bitmap.
+#
+# PURITY: no `extern`, no syscall, no I/O, no allocation. Font bytes are handed
+# in by the caller (host driver reads the .ttf; native driver embeds it), and
+# all scratch is BSS. It links into BOTH the x86_64-linux host target (PNG dump,
+# no QEMU) and the native target. Integer math throughout (no float): the
+# float-div #DE on native never fires here.
+#
+# GLYPH MODEL
+# ===========
+# render_glyph(face, cp, px_size) rasterises codepoint `cp` in face `face` at
+# em size `px_size` into an internal coverage bitmap (a small glyph cache keys
+# on face/size/cp so body text is not re-rasterised per occurrence). The caller
+# then reads:
+#     glyph_bw()/glyph_bh()   coverage bitmap size in pixels
+#     glyph_xoff()            x offset of the bitmap left edge from the pen
+#     glyph_ytop()            y of the bitmap top RELATIVE TO THE BASELINE
+#                             (negative = above the baseline, the usual case)
+#     glyph_cov(col,row)      coverage 0..255 (the AA alpha for that pixel)
+# and alpha-blends the glyph colour over its canvas with that coverage.
+
+
+# ====================================================================
+# Big-endian byte readers over a raw font buffer.
+# ====================================================================
+def _u8(b: Ptr[uint8], o: uint64) -> uint64:
+    return cast[uint64](b[o])
+
+
+def _u16(b: Ptr[uint8], o: uint64) -> uint64:
+    return (cast[uint64](b[o]) << 8) | cast[uint64](b[o + 1])
+
+
+def _i16(b: Ptr[uint8], o: uint64) -> int64:
+    v: uint64 = _u16(b, o)
+    if v >= 32768:
+        return cast[int64](v) - 65536
+    return cast[int64](v)
+
+
+def _u32(b: Ptr[uint8], o: uint64) -> uint64:
+    return (cast[uint64](b[o]) << 24) | (cast[uint64](b[o + 1]) << 16) | \
+           (cast[uint64](b[o + 2]) << 8) | cast[uint64](b[o + 3])
+
+
+# Floor division / modulo for signed int64 (Adder truncates toward zero;
+# scan-conversion needs floor semantics for negative coordinates).
+def _fdiv(a: int64, b: int64) -> int64:
+    q: int64 = a / b
+    r: int64 = a - q * b
+    if r != 0 and ((r < 0) != (b < 0)):
+        q = q - 1
+    return q
+
+
+# ====================================================================
+# Per-face parsed table metadata (up to FT_NFACE faces).
+# ====================================================================
+FT_NFACE: uint64 = 4
+FACE_TT_SANS:      int32 = 0
+FACE_TT_SANS_BOLD: int32 = 1
+FACE_TT_SERIF:     int32 = 2
+FACE_TT_MONO:      int32 = 3
+
+ft_base:    Array[4, uint64]     # font buffer pointer (as uint64)
+ft_len:     Array[4, uint64]
+ft_loaded:  Array[4, int32]
+ft_upm:     Array[4, int64]      # unitsPerEm
+ft_locfmt:  Array[4, int32]      # indexToLocFormat (0 short, 1 long)
+ft_nglyph:  Array[4, int64]      # numGlyphs
+ft_nhmtx:   Array[4, int64]      # numberOfHMetrics
+ft_asc:     Array[4, int64]      # hhea ascender (font units)
+ft_desc:    Array[4, int64]      # hhea descender (font units, negative)
+ft_off_head: Array[4, uint64]
+ft_off_loca: Array[4, uint64]
+ft_off_glyf: Array[4, uint64]
+ft_off_cmap: Array[4, uint64]    # offset of the chosen cmap SUBTABLE (fmt 4)
+ft_off_hmtx: Array[4, uint64]
+
+
+def _ftbuf(face: int32) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](ft_base[face])
+
+
+# Locate table `tag` (4 ASCII bytes packed big-endian in `tag`) in the sfnt
+# table directory. Returns byte offset (>0) or 0 if absent.
+def _find_table(b: Ptr[uint8], blen: uint64, tag: uint64) -> uint64:
+    if blen < 12:
+        return 0
+    ntab: uint64 = _u16(b, 4)
+    i: uint64 = 0
+    rec: uint64 = 12
+    while i < ntab:
+        if rec + 16 > blen:
+            return 0
+        t: uint64 = _u32(b, rec)
+        if t == tag:
+            return _u32(b, rec + 8)
+        rec = rec + 16
+        i = i + 1
+    return 0
+
+
+# Choose a usable cmap format-4 subtable: prefer (3,1) Windows BMP, else (0,*)
+# Unicode, else the first format-4 present. Returns subtable offset or 0.
+def _pick_cmap(b: Ptr[uint8], cmap_off: uint64) -> uint64:
+    ntab: uint64 = _u16(b, cmap_off + 2)
+    best: uint64 = 0
+    i: uint64 = 0
+    while i < ntab:
+        rec: uint64 = cmap_off + 4 + i * 8
+        plat: uint64 = _u16(b, rec)
+        enc: uint64 = _u16(b, rec + 2)
+        sub: uint64 = cmap_off + _u32(b, rec + 4)
+        fmt: uint64 = _u16(b, sub)
+        if fmt == 4:
+            if plat == 3 and enc == 1:
+                return sub
+            if best == 0:
+                best = sub
+        i = i + 1
+    return best
+
+
+TAG_HEAD: uint64 = 0x68656164        # 'head'
+TAG_MAXP: uint64 = 0x6d617870        # 'maxp'
+TAG_HHEA: uint64 = 0x68686561        # 'hhea'
+TAG_HMTX: uint64 = 0x686d7478        # 'hmtx'
+TAG_CMAP: uint64 = 0x636d6170        # 'cmap'
+TAG_LOCA: uint64 = 0x6c6f6361        # 'loca'
+TAG_GLYF: uint64 = 0x676c7966        # 'glyf'
+
+
+# Parse one .ttf into face slot `face`. Returns 0 on success, negative on error.
+def font_ttf_load(face: int32, buf: Ptr[uint8], blen: uint64) -> int32:
+    if face < 0 or cast[uint64](face) >= FT_NFACE:
+        return -1
+    ft_loaded[face] = 0
+    if blen < 64:
+        return -2
+    hoff: uint64 = _find_table(buf, blen, TAG_HEAD)
+    moff: uint64 = _find_table(buf, blen, TAG_MAXP)
+    hhoff: uint64 = _find_table(buf, blen, TAG_HHEA)
+    hmoff: uint64 = _find_table(buf, blen, TAG_HMTX)
+    coff: uint64 = _find_table(buf, blen, TAG_CMAP)
+    loff: uint64 = _find_table(buf, blen, TAG_LOCA)
+    goff: uint64 = _find_table(buf, blen, TAG_GLYF)
+    if hoff == 0 or moff == 0 or hhoff == 0 or hmoff == 0 or \
+       coff == 0 or loff == 0 or goff == 0:
+        return -3
+    csub: uint64 = _pick_cmap(buf, coff)
+    if csub == 0:
+        return -4
+
+    ft_base[face] = cast[uint64](buf)
+    ft_len[face] = blen
+    ft_upm[face] = _i16(buf, hoff + 18)
+    if ft_upm[face] <= 0:
+        ft_upm[face] = 2048
+    ft_locfmt[face] = cast[int32](_i16(buf, hoff + 50))
+    ft_nglyph[face] = cast[int64](_u16(buf, moff + 4))
+    ft_asc[face] = _i16(buf, hhoff + 4)
+    ft_desc[face] = _i16(buf, hhoff + 6)
+    ft_nhmtx[face] = cast[int64](_u16(buf, hhoff + 34))
+    ft_off_head[face] = hoff
+    ft_off_loca[face] = loff
+    ft_off_glyf[face] = goff
+    ft_off_cmap[face] = csub
+    ft_off_hmtx[face] = hmoff
+    ft_loaded[face] = 1
+    return 0
+
+
+def font_ttf_loaded(face: int32) -> int32:
+    if face < 0 or cast[uint64](face) >= FT_NFACE:
+        return 0
+    return ft_loaded[face]
+
+
+# ---- cmap format-4 lookup: codepoint -> glyph id (0 = .notdef/missing) ----
+def _cp_to_gid(face: int32, cp: uint64) -> uint64:
+    b: Ptr[uint8] = _ftbuf(face)
+    sub: uint64 = ft_off_cmap[face]
+    segx2: uint64 = _u16(b, sub + 6)
+    segc: uint64 = segx2 / 2
+    end_base: uint64 = sub + 14
+    start_base: uint64 = end_base + segx2 + 2       # +2 reservedPad
+    delta_base: uint64 = start_base + segx2
+    range_base: uint64 = delta_base + segx2
+    i: uint64 = 0
+    while i < segc:
+        endc: uint64 = _u16(b, end_base + i * 2)
+        if cp <= endc:
+            startc: uint64 = _u16(b, start_base + i * 2)
+            if cp < startc:
+                return 0
+            idr: uint64 = _u16(b, range_base + i * 2)
+            if idr == 0:
+                delta: uint64 = _u16(b, delta_base + i * 2)
+                return (cp + delta) & 65535
+            # glyphId from the glyphIdArray via the byte-offset trick.
+            gaddr: uint64 = range_base + i * 2 + idr + (cp - startc) * 2
+            g: uint64 = _u16(b, gaddr)
+            if g == 0:
+                return 0
+            delta2: uint64 = _u16(b, delta_base + i * 2)
+            return (g + delta2) & 65535
+        i = i + 1
+    return 0
+
+
+# ---- loca: glyph id -> [glyf offset, next offset) within the glyf table ----
+def _loca(face: int32, gid: uint64) -> uint64:
+    b: Ptr[uint8] = _ftbuf(face)
+    lo: uint64 = ft_off_loca[face]
+    if ft_locfmt[face] == 0:
+        return _u16(b, lo + gid * 2) * 2
+    return _u32(b, lo + gid * 4)
+
+
+# Horizontal advance (font units) for glyph id.
+def _hadv(face: int32, gid: uint64) -> int64:
+    b: Ptr[uint8] = _ftbuf(face)
+    nh: int64 = ft_nhmtx[face]
+    g: int64 = cast[int64](gid)
+    if g >= nh:
+        g = nh - 1
+    if g < 0:
+        return 0
+    return cast[int64](_u16(b, ft_off_hmtx[face] + cast[uint64](g) * 4))
+
+
+# ====================================================================
+# Glyph outline decode scratch.
+# ====================================================================
+FT_MAXPTS: uint64 = 2048
+FT_MAXCONT: uint64 = 128
+gp_x:  Array[2048, int64]        # point coords, font units
+gp_y:  Array[2048, int64]
+gp_on: Array[2048, uint8]        # 1 = on-curve
+gc_end: Array[128, int64]        # per-contour last point index
+
+
+# ====================================================================
+# Flattened device-space edges (SS units) for the current glyph.
+# ====================================================================
+FT_MAXEDGE: uint64 = 16384
+e_x0: Array[16384, int64]
+e_y0: Array[16384, int64]
+e_x1: Array[16384, int64]
+e_y1: Array[16384, int64]
+n_edge: uint64 = 0
+
+FT_SS: int64 = 4                 # 4x4 supersample -> 16 coverage levels
+
+# scanline crossing scratch
+FT_MAXX: uint64 = 4096
+xs_x:   Array[4096, int64]
+xs_dir: Array[4096, int64]
+
+
+def _emit_edge(x0: int64, y0: int64, x1: int64, y1: int64):
+    if y0 == y1:
+        return                       # horizontal edges never cross a scanline
+    if n_edge >= FT_MAXEDGE:
+        return
+    e_x0[n_edge] = x0
+    e_y0[n_edge] = y0
+    e_x1[n_edge] = x1
+    e_y1[n_edge] = y1
+    n_edge = n_edge + 1
+
+
+# ====================================================================
+# Rendered-glyph output (coverage bitmap) + a small glyph cache.
+# ====================================================================
+FT_COVMAX: uint64 = 262144       # up to ~512x512 px glyph coverage
+g_cov:  Array[262144, uint8]     # current glyph coverage (row-major, 0..255)
+g_bw:   int32 = 0
+g_bh:   int32 = 0
+g_xoff: int32 = 0                # left edge from pen (px)
+g_ytop: int32 = 0               # top from baseline (px, negative=above)
+g_adv:  int32 = 0               # advance (px)
+g_blank: int32 = 1              # 1 if no coverage (space etc.)
+
+
+def glyph_bw() -> int32:
+    return g_bw
+
+
+def glyph_bh() -> int32:
+    return g_bh
+
+
+def glyph_xoff() -> int32:
+    return g_xoff
+
+
+def glyph_ytop() -> int32:
+    return g_ytop
+
+
+def glyph_adv() -> int32:
+    return g_adv
+
+
+def glyph_blank() -> int32:
+    return g_blank
+
+
+def glyph_cov(col: int32, row: int32) -> uint8:
+    if col < 0 or row < 0 or col >= g_bw or row >= g_bh:
+        return 0
+    return g_cov[cast[uint64](row * g_bw + col)]
+
+
+# ---- advance width of a codepoint in px (rounded) ----
+def font_ttf_adv_px(face: int32, cp: uint64, px: int32) -> int32:
+    if font_ttf_loaded(face) == 0:
+        return px / 2
+    gid: uint64 = _cp_to_gid(face, cp)
+    fu: int64 = _hadv(face, gid)
+    upm: int64 = ft_upm[face]
+    return cast[int32]((fu * cast[int64](px) + upm / 2) / upm)
+
+
+# ---- face ascent/descent in px (for line box heights) ----
+def font_ttf_ascent_px(face: int32, px: int32) -> int32:
+    if font_ttf_loaded(face) == 0:
+        return px
+    upm: int64 = ft_upm[face]
+    return cast[int32]((ft_asc[face] * cast[int64](px) + upm / 2) / upm)
+
+
+def font_ttf_descent_px(face: int32, px: int32) -> int32:
+    if font_ttf_loaded(face) == 0:
+        return px / 4
+    upm: int64 = ft_upm[face]
+    d: int64 = 0 - ft_desc[face]                 # descender is negative
+    return cast[int32]((d * cast[int64](px) + upm / 2) / upm)
+
+
+# Map a font-unit coordinate to SS device units. `mul` = px*SS, `upm` folded in.
+def _dev(v: int64, mul: int64, upm: int64) -> int64:
+    return _fdiv(v * mul, upm)
+
+
+# Flatten one quadratic bezier (on p0, off c, on p1) in SS device units into
+# edges. Coordinates already device-space. Subdivide into `seg` line segments.
+def _flatten_quad(x0: int64, y0: int64, cx: int64, cy: int64,
+                  x1: int64, y1: int64):
+    # segment count scaled by control-polygon extent (crisper big glyphs).
+    dx: int64 = x1 - x0
+    dy: int64 = y1 - y0
+    if dx < 0:
+        dx = 0 - dx
+    if dy < 0:
+        dy = 0 - dy
+    ext: int64 = dx + dy
+    seg: int64 = ext / (FT_SS * 3) + 2
+    if seg > 24:
+        seg = 24
+    px_prev: int64 = x0
+    py_prev: int64 = y0
+    i: int64 = 1
+    while i <= seg:
+        t: int64 = i
+        u: int64 = seg - t
+        # B(t) = (u^2 p0 + 2 u t c + t^2 p1) / seg^2  (integer)
+        s2: int64 = seg * seg
+        nx: int64 = (u * u * x0 + 2 * u * t * cx + t * t * x1) / s2
+        ny: int64 = (u * u * y0 + 2 * u * t * cy + t * t * y1) / s2
+        _emit_edge(px_prev, py_prev, nx, ny)
+        px_prev = nx
+        py_prev = ny
+        i = i + 1
+
+
+# ====================================================================
+# Rasterise one contour range into edges (device SS space).
+# ====================================================================
+def _build_contour_edges(first: uint64, last: uint64,
+                         mul: int64, upm: int64, ox: int64, oy: int64):
+    # Walk the contour, inserting implied on-curve midpoints between two
+    # consecutive off-curve points, and emit line/quad edges. All output
+    # coordinates are SS device units, y already flipped (device y grows down).
+    n: uint64 = last - first + 1
+    if n < 2:
+        return
+    # Find a starting on-curve point (or synthesise one from two off-curve).
+    # Build device-space arrays inline via helper reads.
+    # Determine start index with an on-curve point.
+    start: uint64 = first
+    have_start: int32 = 0
+    k: uint64 = first
+    while k <= last:
+        if gp_on[k] != 0:
+            start = k
+            have_start = 1
+            k = last + 1
+        else:
+            k = k + 1
+    # starting anchor coords (device space)
+    sx: int64 = 0
+    sy: int64 = 0
+    if have_start != 0:
+        sx = _dev(gp_x[start], mul, upm) + ox
+        sy = oy - _dev(gp_y[start], mul, upm)
+    else:
+        # all off-curve: synthesise start = midpoint of first two points
+        a: uint64 = first
+        bnx: uint64 = first + 1
+        sx = (_dev(gp_x[a], mul, upm) + _dev(gp_x[bnx], mul, upm)) / 2 + ox
+        sy = oy - (_dev(gp_y[a], mul, upm) + _dev(gp_y[bnx], mul, upm)) / 2
+        start = first
+
+    cur_x: int64 = sx
+    cur_y: int64 = sy
+    # iterate n points starting after `start`, wrapping.
+    pend_off: int32 = 0
+    pcx: int64 = 0
+    pcy: int64 = 0
+    j: uint64 = 0
+    while j < n:
+        idx: uint64 = start + 1 + j
+        # wrap within [first,last]
+        while idx > last:
+            idx = idx - n
+        dxp: int64 = _dev(gp_x[idx], mul, upm) + ox
+        dyp: int64 = oy - _dev(gp_y[idx], mul, upm)
+        if gp_on[idx] != 0:
+            if pend_off != 0:
+                _flatten_quad(cur_x, cur_y, pcx, pcy, dxp, dyp)
+                pend_off = 0
+            else:
+                _emit_edge(cur_x, cur_y, dxp, dyp)
+            cur_x = dxp
+            cur_y = dyp
+        else:
+            if pend_off != 0:
+                # implied on-curve midpoint between the two off-curve points
+                mx: int64 = (pcx + dxp) / 2
+                my: int64 = (pcy + dyp) / 2
+                _flatten_quad(cur_x, cur_y, pcx, pcy, mx, my)
+                cur_x = mx
+                cur_y = my
+            pcx = dxp
+            pcy = dyp
+            pend_off = 1
+        j = j + 1
+    # close back to the anchor
+    if pend_off != 0:
+        _flatten_quad(cur_x, cur_y, pcx, pcy, sx, sy)
+    else:
+        _emit_edge(cur_x, cur_y, sx, sy)
+
+
+# ====================================================================
+# Public: render a codepoint to the coverage bitmap (with a glyph cache).
+# ====================================================================
+# Simple direct-mapped glyph cache: key (face, px, cp). Stores the coverage
+# bitmap + metrics so body text is rasterised once per distinct glyph/size.
+FT_CACHE_N: uint64 = 512
+FT_CACHE_POOL: uint64 = 4194304          # 4 MiB coverage pool
+ck_face: Array[512, int32]
+ck_px:   Array[512, int32]
+ck_cp:   Array[512, int32]
+ck_used: Array[512, int32]
+ck_bw:   Array[512, int32]
+ck_bh:   Array[512, int32]
+ck_xoff: Array[512, int32]
+ck_ytop: Array[512, int32]
+ck_adv:  Array[512, int32]
+ck_blank: Array[512, int32]
+ck_poff: Array[512, uint64]
+c_pool:  Array[4194304, uint8]
+c_pool_used: uint64 = 0
+
+
+def _cache_slot(face: int32, cp: int32, px: int32) -> int64:
+    # direct-mapped hash
+    h: uint64 = (cast[uint64](face) * 131 + cast[uint64](cp) * 31 + \
+                 cast[uint64](px) * 17) % FT_CACHE_N
+    if ck_used[h] != 0 and ck_face[h] == face and ck_cp[h] == cp and \
+       ck_px[h] == px:
+        return cast[int64](h)                # hit
+    return 0 - cast[int64](h) - 1            # miss -> -(slot+1)
+
+
+def _load_from_cache(slot: uint64):
+    g_bw = ck_bw[slot]
+    g_bh = ck_bh[slot]
+    g_xoff = ck_xoff[slot]
+    g_ytop = ck_ytop[slot]
+    g_adv = ck_adv[slot]
+    g_blank = ck_blank[slot]
+    if g_blank == 0:
+        po: uint64 = ck_poff[slot]
+        n: uint64 = cast[uint64](g_bw * g_bh)
+        i: uint64 = 0
+        while i < n:
+            g_cov[i] = c_pool[po + i]
+            i = i + 1
+
+
+def _store_to_cache(slot: uint64, face: int32, cp: int32, px: int32):
+    ck_used[slot] = 1
+    ck_face[slot] = face
+    ck_cp[slot] = cp
+    ck_px[slot] = px
+    ck_bw[slot] = g_bw
+    ck_bh[slot] = g_bh
+    ck_xoff[slot] = g_xoff
+    ck_ytop[slot] = g_ytop
+    ck_adv[slot] = g_adv
+    ck_blank[slot] = g_blank
+    if g_blank == 0:
+        n: uint64 = cast[uint64](g_bw * g_bh)
+        if c_pool_used + n <= FT_CACHE_POOL:
+            ck_poff[slot] = c_pool_used
+            i: uint64 = 0
+            while i < n:
+                c_pool[c_pool_used + i] = g_cov[i]
+                i = i + 1
+            c_pool_used = c_pool_used + n
+        else:
+            ck_used[slot] = 0                # pool full: don't cache
+
+
+# Rasterise `cp` in `face` at `px`. Populates g_* (see accessors). Returns 1 if
+# the glyph produced coverage, 0 if blank (space / missing).
+def font_ttf_render(face: int32, cp: int32, px: int32) -> int32:
+    g_bw = 0
+    g_bh = 0
+    g_xoff = 0
+    g_ytop = 0
+    g_blank = 1
+    g_adv = px / 2
+    if font_ttf_loaded(face) == 0 or px <= 0:
+        return 0
+
+    slot: int64 = _cache_slot(face, cp, px)
+    if slot >= 0:
+        _load_from_cache(cast[uint64](slot))
+        if g_blank != 0:
+            return 0
+        return 1
+    real_slot: uint64 = cast[uint64](0 - slot - 1)
+
+    b: Ptr[uint8] = _ftbuf(face)
+    gid: uint64 = _cp_to_gid(face, cast[uint64](cp))
+    upm: int64 = ft_upm[face]
+    g_adv = cast[int32]((_hadv(face, gid) * cast[int64](px) + upm / 2) / upm)
+    if gid == 0:
+        # unmapped codepoint (e.g. a non-ASCII entity in these ASCII subsets):
+        # render nothing rather than the .notdef tofu box. Keep a space-like
+        # advance so surrounding text still flows.
+        if g_adv < px / 3:
+            g_adv = px / 3
+        _store_to_cache(real_slot, face, cp, px)
+        return 0
+
+    goff: uint64 = _loca(face, gid)
+    gend: uint64 = _loca(face, gid + 1)
+    if gend <= goff:
+        # empty glyph (space): cache as blank
+        _store_to_cache(real_slot, face, cp, px)
+        return 0
+    gbase: uint64 = ft_off_glyf[face] + goff
+    ncont: int64 = _i16(b, gbase)
+    if ncont <= 0:
+        # composite or empty -> treat as blank (ASCII has none)
+        _store_to_cache(real_slot, face, cp, px)
+        return 0
+
+    # ---- decode simple glyph ----
+    p: uint64 = gbase + 10                        # skip numberOfContours + bbox
+    nc: uint64 = cast[uint64](ncont)
+    if nc > FT_MAXCONT:
+        return 0
+    ci: uint64 = 0
+    last_pt: int64 = -1
+    while ci < nc:
+        e: int64 = cast[int64](_u16(b, p))
+        gc_end[ci] = e
+        if e > last_pt:
+            last_pt = e
+        p = p + 2
+        ci = ci + 1
+    npts: uint64 = cast[uint64](last_pt + 1)
+    if npts == 0 or npts > FT_MAXPTS:
+        return 0
+    ilen: uint64 = _u16(b, p)
+    p = p + 2 + ilen                              # skip instructions
+
+    # flags (with repeat)
+    FL_ON:    uint64 = 1
+    FL_XSHORT: uint64 = 2
+    FL_YSHORT: uint64 = 4
+    FL_REPEAT: uint64 = 8
+    FL_XSAME:  uint64 = 16                        # X_SHORT: sign; else same-x
+    FL_YSAME:  uint64 = 32
+    flags: Array[2048, uint8]
+    fi: uint64 = 0
+    while fi < npts:
+        fl: uint64 = _u8(b, p)
+        p = p + 1
+        flags[fi] = cast[uint8](fl)
+        fi = fi + 1
+        if (fl & FL_REPEAT) != 0:
+            rep: uint64 = _u8(b, p)
+            p = p + 1
+            while rep > 0 and fi < npts:
+                flags[fi] = cast[uint8](fl)
+                fi = fi + 1
+                rep = rep - 1
+
+    # x coords (delta encoded)
+    xacc: int64 = 0
+    xi: uint64 = 0
+    while xi < npts:
+        fl: uint64 = cast[uint64](flags[xi])
+        if (fl & FL_XSHORT) != 0:
+            d: int64 = cast[int64](_u8(b, p))
+            p = p + 1
+            if (fl & FL_XSAME) == 0:
+                d = 0 - d
+            xacc = xacc + d
+        else:
+            if (fl & FL_XSAME) == 0:
+                xacc = xacc + _i16(b, p)
+                p = p + 2
+        gp_x[xi] = xacc
+        gp_on[xi] = cast[uint8](fl & FL_ON)
+        xi = xi + 1
+    # y coords
+    yacc: int64 = 0
+    yi: uint64 = 0
+    while yi < npts:
+        fl: uint64 = cast[uint64](flags[yi])
+        if (fl & FL_YSHORT) != 0:
+            d: int64 = cast[int64](_u8(b, p))
+            p = p + 1
+            if (fl & FL_YSAME) == 0:
+                d = 0 - d
+            yacc = yacc + d
+        else:
+            if (fl & FL_YSAME) == 0:
+                yacc = yacc + _i16(b, p)
+                p = p + 2
+        gp_y[yi] = yacc
+        yi = yi + 1
+
+    # ---- transform + build edges ----
+    mul: int64 = cast[int64](px) * FT_SS
+    # device bbox in SS units — compute from points.
+    minx: int64 = 0
+    maxx: int64 = 0
+    miny: int64 = 0
+    maxy: int64 = 0
+    first_pt: int32 = 1
+    kk: uint64 = 0
+    while kk < npts:
+        dx: int64 = _dev(gp_x[kk], mul, upm)
+        dy: int64 = 0 - _dev(gp_y[kk], mul, upm)   # flip
+        if first_pt != 0:
+            minx = dx
+            maxx = dx
+            miny = dy
+            maxy = dy
+            first_pt = 0
+        else:
+            if dx < minx:
+                minx = dx
+            if dx > maxx:
+                maxx = dx
+            if dy < miny:
+                miny = dy
+            if dy > maxy:
+                maxy = dy
+        kk = kk + 1
+    # pad 1 SS pixel each side so AA edges are not clipped
+    minx = minx - 1
+    miny = miny - 1
+    maxx = maxx + 1
+    maxy = maxy + 1
+    # origin so device coords map into [0..]; ox/oy fold the -min shift.
+    ox: int64 = 0 - minx
+    oy: int64 = 0 - miny
+    # emit edges per contour
+    n_edge = 0
+    cstart: uint64 = 0
+    cc: uint64 = 0
+    while cc < nc:
+        cendv: uint64 = cast[uint64](gc_end[cc])
+        _build_contour_edges(cstart, cendv, mul, upm, ox, oy)
+        cstart = cendv + 1
+        cc = cc + 1
+
+    # bitmap size (downsampled)
+    ss_w: int64 = maxx - minx
+    ss_h: int64 = maxy - miny
+    bw: int64 = (ss_w + FT_SS - 1) / FT_SS
+    bh: int64 = (ss_h + FT_SS - 1) / FT_SS
+    if bw < 1:
+        bw = 1
+    if bh < 1:
+        bh = 1
+    if bw * bh > cast[int64](FT_COVMAX):
+        return 0
+    # clear coverage
+    z: uint64 = 0
+    ztot: uint64 = cast[uint64](bw * bh)
+    while z < ztot:
+        g_cov[z] = 0
+        z = z + 1
+
+    # ---- scanline scan-convert (non-zero winding), accumulate coverage ----
+    sy: int64 = 0
+    while sy < ss_h:
+        yc: int64 = sy * 2 + 1                     # sample at ss-row center*2
+        # gather crossings at y = (yc)/2  -> use doubled arithmetic to hit centers
+        nx: uint64 = 0
+        ei: uint64 = 0
+        while ei < n_edge:
+            y0: int64 = e_y0[ei] * 2
+            y1: int64 = e_y1[ei] * 2
+            lo: int64 = y0
+            hi: int64 = y1
+            dir: int64 = 1
+            if y0 > y1:
+                lo = y1
+                hi = y0
+                dir = 0 - 1
+            if yc >= lo and yc < hi:
+                # x at yc (in doubled space): x0 + (x1-x0)*(yc-y0)/(y1-y0)
+                x0: int64 = e_x0[ei]
+                x1: int64 = e_x1[ei]
+                num: int64 = (x1 - x0) * (yc - y0)
+                den: int64 = (y1 - y0)
+                xc: int64 = x0 + _fdiv(num, den)
+                if nx < FT_MAXX:
+                    xs_x[nx] = xc
+                    xs_dir[nx] = dir
+                    nx = nx + 1
+            ei = ei + 1
+        # sort crossings by x (insertion sort; counts are small)
+        a: uint64 = 1
+        while a < nx:
+            vx: int64 = xs_x[a]
+            vd: int64 = xs_dir[a]
+            bpos: int64 = cast[int64](a) - 1
+            while bpos >= 0 and xs_x[cast[uint64](bpos)] > vx:
+                xs_x[cast[uint64](bpos + 1)] = xs_x[cast[uint64](bpos)]
+                xs_dir[cast[uint64](bpos + 1)] = xs_dir[cast[uint64](bpos)]
+                bpos = bpos - 1
+            xs_x[cast[uint64](bpos + 1)] = vx
+            xs_dir[cast[uint64](bpos + 1)] = vd
+            a = a + 1
+        # walk spans, non-zero winding: after adding crossing c, if the running
+        # winding is non-zero the span [xs_x[c], xs_x[c+1]) is inside.
+        wind: int64 = 0
+        row: int64 = sy / FT_SS
+        c: uint64 = 0
+        while c < nx:
+            wind = wind + xs_dir[c]
+            if wind != 0 and c + 1 < nx:
+                xa: int64 = xs_x[c]
+                xb: int64 = xs_x[c + 1]
+                sxp: int64 = xa
+                while sxp < xb:
+                    col: int64 = sxp / FT_SS
+                    if col >= 0 and col < bw and row >= 0 and row < bh:
+                        idxc: uint64 = cast[uint64](row * bw + col)
+                        cur: uint64 = cast[uint64](g_cov[idxc])
+                        if cur < 255:
+                            g_cov[idxc] = cast[uint8](cur + 1)
+                    sxp = sxp + 1
+            c = c + 1
+        sy = sy + 1
+
+    # convert accumulated sub-sample counts (0..SS*SS) to 0..255 alpha
+    ncov: uint64 = cast[uint64](bw * bh)
+    denom: int64 = FT_SS * FT_SS
+    any: int32 = 0
+    q: uint64 = 0
+    while q < ncov:
+        cnt: int64 = cast[int64](g_cov[q])
+        if cnt > denom:
+            cnt = denom
+        av: int64 = (cnt * 255) / denom
+        g_cov[q] = cast[uint8](av)
+        if av > 0:
+            any = 1
+        q = q + 1
+
+    g_bw = cast[int32](bw)
+    g_bh = cast[int32](bh)
+    g_xoff = cast[int32](_fdiv(minx, FT_SS))
+    g_ytop = cast[int32](_fdiv(miny, FT_SS))
+    g_blank = 0
+    if any == 0:
+        g_blank = 1
+    _store_to_cache(real_slot, face, cp, px)
+    if g_blank != 0:
+        return 0
+    return 1
