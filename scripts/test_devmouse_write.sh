@@ -70,7 +70,7 @@ rc=$?
 set -e
 
 echo "[test_devmouse_write] --- devmouse-write self-test output ---"
-grep -a -E "\[DEVMOUSE_WRITE\]|\[MOUSE_PUMP\]|\[boot:37.dmw\]" "$LOG" || true
+grep -a -E "\[DEVMOUSE_WRITE\]|\[MOUSE_PUMP\]|\[MOUSE_FLUSH\]|\[boot:37.dmw\]" "$LOG" || true
 echo "[test_devmouse_write] --- end ---"
 
 # --- three-valued verdict (migrated off the hard MISS->FAIL tail) -----
@@ -88,6 +88,14 @@ fi
 if grep -a -qF "[MOUSE_PUMP] FAIL" "$LOG"; then
     grep -a -F "[MOUSE_PUMP] FAIL" "$LOG" | head -5 >&2 || true
     verdict_fail "$TAG" "the mouse-pump (live cursor path) self-test reported a FAIL (observed regression)."
+fi
+# STARTUP-TELEPORT guard: the first live pump tick after the rl5 handoff must
+# DISCARD the pre-flip ring backlog (else the centred cursor teleports, then
+# settles — the long-standing user-reported bug). A FAIL here means the flush
+# regressed and the boot-time cursor jump is back.
+if grep -a -qF "[MOUSE_FLUSH] FAIL" "$LOG"; then
+    grep -a -F "[MOUSE_FLUSH] FAIL" "$LOG" | head -5 >&2 || true
+    verdict_fail "$TAG" "the startup-teleport flush self-test reported a FAIL (boot cursor-jump regression)."
 fi
 if grep -a -qF "[FOCUS_OUT] FAIL" "$LOG"; then
     grep -a -F "[FOCUS_OUT] FAIL" "$LOG" | head -5 >&2 || true
