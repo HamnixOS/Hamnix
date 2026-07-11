@@ -42,8 +42,19 @@ reality, not the header comment's aspirations.
   per-row rule flags (`1` = heading underline, `2` = `<hr>`).
 - Box-model basics: `h1`/`h2` underline rules, `<hr>` full-width rule,
   list + `blockquote` left indent, per-block blank-line vertical margin.
-- Still NO: per-element px margin/padding/width, floats, real image
-  decode (only `alt` placeholders).
+- **CSS box model on `<p>`/`<div>`**, routed through the FULL cascade so it
+  works from `<style>` rules / `.class` / `#id` selectors AND inline
+  `style=""` (inline wins per axis):
+  - `margin`/`padding` (`-left`/`-right`/`-top`/`-bottom` + the 1–4 value
+    TRBL shorthand). Left/right shift the content column and shrink the
+    wrap width; top/bottom insert blank lines (px quantised at `LINE_H`).
+  - `width` (px / em / %) pins the wrap column to `indent_x + width`.
+  - `border` / `border-style` draws a char-grid box (`+---+` top+bottom
+    rules, `|` side bars) and insets the content one cell each side.
+  - **Unit map (char grid)**: `1em == 16px == 2 cells` wide / one line tall
+    (`EM_PX`); `%` is of the body content width (`bw − 2·CONTENT_X`); `px`
+    and unitless map straight to pixels.
+- Still NO: floats, negative margins, real image decode (`alt` only).
 
 **Style / colour**
 - A fixed **4-entry palette by role**: body `#101010`, link `#1a4fd0`,
@@ -73,7 +84,9 @@ reality, not the header comment's aspirations.
 
 1. **CSS colour** — `style="color:…"`, `<font color>`, named + hex. ✅
 2. **Tables** — `table/tr/td/th`, two-pass column layout, `th` bold. ✅
-3. **Box model** — `hr`, `blockquote` indent, `h4`–`h6`, block margins. ✅
+3. **Box model** — `hr`, `blockquote` indent, `h4`–`h6`, block margins,
+   plus cascaded `margin`/`padding`/`width`/`border` on `<p>`/`<div>` from
+   `<style>` classes/ids (not just inline). ✅
 4. **Background colour** — `bgcolor` / `background-color`. ✅
 5. **Images** — inline `alt`-text placeholder (`[alt]` / `[img]`). ✅
 

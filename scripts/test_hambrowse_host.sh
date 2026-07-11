@@ -372,6 +372,87 @@ assert_grep4 '^SEG [0-9]+ (1[0-9][0-9]|[2-9][0-9][0-9]) .*Inline centered paragr
     "inline text-align:center -> centred line"
 
 # ====================================================================
+# CSS-BOX-MODEL fixture — margin/padding/width/border driven by <style> CLASS
+# rules (not just inline style=""), routed through the full cascade so class-
+# based layouts indent/constrain/border like real hand-written pages.
+#   1em == 16px == 2 cells; % of the body content width (bw-2*CONTENT_X=584).
+#   .box{margin-left:32px}          -> x = 8 + 32          = 40
+#   .empad{margin-left:16;padding-left:16} -> x = 8+16+16   = 40
+#   .em{margin-left:2em}            -> x = 8 + 32           = 40
+#   .short{margin:16px 0 0 24px}    -> x = 8 + 24 = 32, +1 blank top-gap line
+#   .narrow{width:120px}            -> wraps at indent_x+120 = 128 (15 cells)
+#   .card{border:1px solid black}   -> 1-cell inset (x=16), '+---+' top/bottom,
+#                                      side '|' bars at x=8 (left) and x=584.
+#   inline style overrides the class/id rule per axis (specificity: inline wins)
+# ====================================================================
+FIXB="tests/fixtures/hambrowse_cssbox.html"
+DUMPB="$OUT/dump_cssbox.txt"
+echo "[hb-host] running host harness on $FIXB ..."
+if ! "$BIN" "$FIXB" 600 >"$DUMPB" 2>&1; then
+    echo "[hb-host] FAIL: cssbox harness exited non-zero"; cat "$DUMPB"; exit 1
+fi
+cat "$DUMPB"
+
+assert_grepB() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMPB"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+assert_grepB '^SEG 0 8 .*Flush left at the body margin' \
+    "no-box block flows at the body margin x=8"
+assert_grepB '^SEG [0-9]+ 40 .*Class margin-left shifts this block' \
+    ".box class margin-left:32px shifts content to x=40 (from a <style> rule)"
+assert_grepB '^SEG [0-9]+ 40 .*Class margin plus padding both shift' \
+    ".empad class margin-left:16 + padding-left:16 -> x=40"
+assert_grepB '^SEG [0-9]+ 40 .*Class margin in em units' \
+    ".em class margin-left:2em -> 32px -> x=40 (em == 16px)"
+assert_grepB '^SEG [0-9]+ 32 .*Shorthand margin left plus top' \
+    ".short shorthand margin:16 0 0 24 -> left 24px -> x=32"
+# the shorthand's 16px top margin adds exactly one blank line before the block:
+# the .em block is at row 6; the .short block lands at row 9 (para-break row 7,
+# top-gap blank row 8, content row 9) — one more than a bare para-break.
+assert_grepB '^SEG 9 32 .*Shorthand margin left plus top' \
+    ".short margin-top:16px inserts one blank line (block at row 9, not row 8)"
+# width:120px constrains the wrap column: the sentence wraps to many short rows
+# instead of one full-width line. First wrapped row starts at x=8; a later row
+# proves the early wrap (a full-width line would not reach row 15+).
+assert_grepB '^SEG 11 8 .*This narrow\|$' \
+    ".narrow width:120px wraps early -> first line 'This narrow' at x=8"
+assert_grepB '^SEG 1[5-9] 8 .*(wraps|rows|page|would|allow)' \
+    ".narrow width:120px keeps wrapping onto later rows (constrained width)"
+# border box: top/bottom '+---+' rules, content inset by one cell (x=16), and
+# vertical '|' bars at the left (x=8) and right (x=584) columns.
+assert_grepB '^SEG [0-9]+ 8 .*\+-+\+\|$' \
+    ".card border draws a '+---+' horizontal rule spanning the box"
+assert_grepB '^SEG [0-9]+ 16 .*Bordered card block with inset content' \
+    ".card border insets the content column by one cell (x=8 -> x=16)"
+assert_grepB '^SEG 22 8 #101010 b0 u0 l-1 bg- \|\|\|$' \
+    ".card border draws a left '|' side bar at x=8 on the content row"
+assert_grepB '^SEG 22 584 #101010 b0 u0 l-1 bg- \|\|\|$' \
+    ".card border draws a right '|' side bar at x=584 on the content row"
+# there must be TWO horizontal border rules (top + bottom) for the one .card.
+if [ "$(grep -Ec '^SEG [0-9]+ 8 .*\+-+\+\|$' "$DUMPB")" -eq 2 ]; then
+    echo "[hb-host] PASS .card border has both a top and a bottom rule"
+else
+    echo "[hb-host] FAIL .card border rule count wrong (want 2)"; fail=1
+fi
+# INLINE style="" overrides the CLASS box rule (specificity: inline wins):
+# a .box element with inline margin-left:0 flows back at x=8, NOT x=40.
+assert_grepB '^SEG [0-9]+ 8 .*Inline zero overrides the class margin' \
+    "inline margin-left:0 overrides the .box class margin (x=8, not x=40)"
+# INLINE overrides an #id rule too: #over{margin-left:64px} + inline
+# margin-left:8px -> x=16 (8 body + 8 inline), not x=72.
+assert_grepB '^SEG [0-9]+ 16 .*Inline eight overrides the id rule' \
+    "inline margin-left:8px overrides #over{margin-left:64px} (x=16, not x=72)"
+# indent/width/border all POP: the trailing paragraph is back at the body x=8.
+assert_grepB '^SEG [0-9]+ 8 .*Back flush at the body margin' \
+    "box state pops -> trailing paragraph back at the body margin x=8"
+
+# ====================================================================
 # JAVASCRIPT + minimal DOM fixture — <script> runs at load; console.log is
 # captured; the DOM the script mutates (textContent, style.color,
 # style.display) changes what renders; document.title is settable.
