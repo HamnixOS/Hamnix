@@ -69,11 +69,46 @@ else
 fi
 need "$TS" "geometry 150 40 " "terminal default origin clears the icon strut (x=150)"
 
+echo "[ux_guard] --- QA-N2: hamterm closes its window when the shell exits ---"
+# `exit` (or Ctrl-D/EOF) in the DE terminal's hamsh must tear the terminal
+# WINDOW down, like any terminal — not leave an orphaned empty window. hamsh
+# exits its process on `exit`, closing its stdout write-end; hamterm's EOF
+# probe (_drain_shell sys_read_nb == -1) clears sh_alive, and the shell-exit
+# branch must now quit the event loop (running = 0) so main returns and the
+# compositor reaps the wid.
+HT="user/hamterm.ad"
+if grep -Pzoq 'if sh_alive == 0 and sh_pid >= 0:(.|\n)*?running = 0' "$HT"; then
+    pass "hamterm quits its loop when the shell exits (window teardown)"
+else
+    failf "hamterm shell-exit branch no longer sets running = 0 (window would orphan)"
+fi
+
+echo "[ux_guard] --- QA-N3: notification tray popup has working [X] + [Clear] ---"
+UID_AD="user/hamUId.ad"; TRAY="user/hamtray.ad"
+# The compositor must hit-test a dedicated [X] close box in the tray header.
+need "$UID_AD" "def in_tray_close_btn" "compositor has an [X] close-box hit-test"
+# The click handler must dismiss the popup on the [X].
+if grep -Pzoq 'if in_tray_close_btn\(CUR_X, CUR_Y, scr_w\) != 0:\n\s*TRAY_OPEN = 0' "$UID_AD"; then
+    pass "[X] close box dismisses the tray popup"
+else
+    failf "[X] close box does not set TRAY_OPEN = 0"
+fi
+# [Clear] must empty the ring AND close the popup.
+if grep -Pzoq 'if in_tray_clear_btn\(CUR_X, CUR_Y, scr_w\) != 0:\n\s*nhist_clear\(\)\n\s*TRAY_OPEN = 0' "$UID_AD"; then
+    pass "[Clear] empties notifications AND closes the popup"
+else
+    failf "[Clear] no longer clears + closes the popup"
+fi
+# The render client must draw both header buttons (close box + clear bar).
+need "$TRAY" "close box" "hamtray renders the [X] close box"
+# DE13 self-test must cover the new close-box zone.
+need "$UID_AD" "in_tray_close_btn(closex, hdr_y, scr_w)" "DE13 asserts the [X] close-box hit-zone"
+
 echo "[ux_guard] --- compile the touched user binaries ---"
 # shellcheck source=_adder_cc.sh
 source "$PROJ_ROOT/scripts/_adder_cc.sh"
 mkdir -p build/user
-for n in hamfmscene hamtermscene; do
+for n in hamfmscene hamtermscene hamterm hamtray hamUId; do
     if adder_cc_compile compile --target=x86_64-adder-user "user/${n}.ad" \
             -o "build/user/${n}.elf" >/dev/null 2>&1; then
         pass "user/${n}.ad compiles"
