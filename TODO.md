@@ -519,8 +519,18 @@ Landed + pushed:
 - [x] **Browser CSS cascade** — `<style>` element/`.class`/`#id`/descendant
   selectors + specificity, `color`/`bg`/`font-weight`/`text-align`/
   `display:none`, `rgb()`+named colors, inline-style override; `TODO(js)`
-  hook left for `js_eval`. Monospace-grid model (pixel box-model deferred).
-  Host gate 48 assertions PASS. `c3dc99dd`.
+  hook left for `js_eval`. Host gate 48 assertions PASS. `c3dc99dd`.
+- [x] **Browser PROPER GRAPHICS (2026-07-11)** — the host pixel engine
+  (`lib/htmlpaint.ad`/`htmlpage.ad`) replaced the monospace char grid with a
+  real pixel canvas: (1) a from-scratch pure-Adder TrueType rasterizer
+  (`lib/font_ttf.ad`) with 4×4-supersampled grayscale anti-aliasing and
+  continuous CSS `font-size` (h1..h6 hierarchy, bold/serif/mono faces); (2) a
+  from-scratch pure-Adder PNG decoder (`lib/png.ad`: DEFLATE inflate + all 5
+  unfilters, RGB/RGBA/gray/palette) wired to `<img>` decode+alpha-blit
+  (`lib/htmlimg.ad`). Host gates `test_hambrowse_gfx.sh` (17) +
+  `test_hambrowse_img.sh` PASS. Gaps: PNG-only, nearest-neighbour scale, no
+  float text-wrap. Presenting this on the NATIVE on-device browser via the v2
+  blit protocol is in flight (task #79).
 - [x] **ext4 fast-commit + largedir corruption fixes** — page-cache
   invalidation on FC replay (`f2972fad`); leaked-inode multiply-claim
   (multi-group `ext4_free_inode` + `_ext4_drop_inode_link`, `6acd2d36`).
@@ -626,14 +636,19 @@ Open blockers (agent-owned):
 - [ ] **`-smp 2` guest wedge** — an idle shell (and any pipeline) halts in
   `kernel/sched/core.ad::yield_to_others`; `-smp 1` fine. Repro is 70 s / one
   command; suspect #413 steal-window. See [[project_smp2_idle_wedge]] in memory.
-- [ ] **Firefox last mile** — futex fix cleared the wedge; Firefox now REACHES
-  `wl_compositor.create_surface` (x2) then stops with no `xdg_wm_base` request at
-  all. Creates the `wl_surface` at GDK *realize* but never advances to *map*
-  (`gdk_wayland_window_map` → `gdk_wayland_window_create_xdg_surface`, GDK3).
-  Client-side; compositor is xdg-ready. (The vDSO/~1240-trap theory was a red
-  herring — 13 traps either way, glibc already uses the fast path; vdso work
-  preserved unmerged on `worktree-agent-a97e5b76315365853`.) Next: get MOZ_LOG
-  out of the forked child; find why GDK realize never maps.
+- [x] **Firefox — DEEP-TRACK, verdict final (2026-07-11).** NOT a Hamnix bug we
+  can fix. Software GL/EGL (Mesa llvmpipe over `wl_shm`) now WORKS on the
+  compositor (weston-simple-egl renders — merged). With EGL present, Firefox's
+  wall MOVED UPSTREAM of gfx: the main thread parks in libc `sem_wait` (never
+  reaches `gfxPlatform`/EGL). A kernel-futex investigation (task #78) DISPROVED a
+  lost-wakeup: `clone(CLONE_VM)` shares the creator's cr3 so every pthread sibling
+  computes an identical private `_futex_key` (WAIT/WAKE match), the blocking-park
+  arm is race-free under `_futex_lock`, and a 9-thread/3200-directed-wake
+  `sem_pingpong` gate PASSES — the `matched 0 waiters` storm is benign counting-
+  semaphore behavior. So it's a Gecko-internal circular wait, confirmed. Firefox
+  stays behind the native browser per the user's fallback framing; the EGL config
+  flip is preserved dark on `worktree-agent-a10dac83395dbcb75`. See
+  [[project_firefox_startup_deadlock]].
 - [ ] `ls /dev` hardcodes `blk`, so a stripped (non-hostowner) namespace names a
   path it cannot open (`lsblk` fails). Fix via mount-table synthesis, NOT by
   re-binding `/dev/blk` (that undoes a security boundary).
