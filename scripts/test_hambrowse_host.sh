@@ -181,6 +181,63 @@ assert_grep3 '^SEG 6 96 #008000 .*green\|'                   "font color=green i
 assert_grep3 '^FLOW  Fruit      Colour  Qty$'  "FLOW renders the header row as aligned columns"
 assert_grep3 '^FLOW  Blueberry  blue    340$'  "FLOW renders the wide row aligned to the same columns"
 
+# ====================================================================
+# CSS-CASCADE fixture — <style> rules with element/.class/#id/descendant
+# selectors + specificity, font-weight, text-align (baked into seg_x),
+# display:none, rgb()/named colours, and inline style="" overriding the sheet.
+# ====================================================================
+FIX4="tests/fixtures/hambrowse_css.html"
+DUMP4="$OUT/dump_css.txt"
+echo "[hb-host] running host harness on $FIX4 ..."
+if ! "$BIN" "$FIX4" 600 >"$DUMP4" 2>&1; then
+    echo "[hb-host] FAIL: css harness exited non-zero"; cat "$DUMP4"; exit 1
+fi
+cat "$DUMP4"
+
+assert_grep4() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMP4"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# element `h1 { color:navy; text-align:center }` — navy + bold heading whose
+# row is shifted right of the x=8 margin by the centring post-pass.
+assert_grep4 '^SEG 0 (1[0-9][0-9]|[2-9][0-9][0-9]) #000080 b1 .*Centered Title\|' \
+    "h1 style rule -> navy bold, centred (seg_x shifted right of margin)"
+# #id beats element: rgb(0,128,0) green wins over p{color:#333}.
+assert_grep4 '^SEG [0-9]+ 8 #008000 .*Lead paragraph green' \
+    "#lead id rule with rgb() -> green (#008000), beats p element rule"
+# element rule p{color:#333}.
+assert_grep4 '^SEG [0-9]+ 8 #333333 b0 .*Normal gray paragraph' \
+    "p element rule -> gray (#333333)"
+# .class beats element; font-weight:bold applies.
+assert_grep4 '^SEG [0-9]+ 8 #ff0000 b1 .*Warning bold red' \
+    ".warn class rule -> red + font-weight:bold (beats p element rule)"
+# descendant `div p { background-color:yellow }` — bg fills, text stays p-gray.
+assert_grep4 '^SEG [0-9]+ 8 #333333 b0 u0 l-1 bg#ffff00 .*Nested para on yellow' \
+    "div p descendant rule -> yellow background, gray text"
+# text-align:right baked into seg_x (line pushed to the right edge).
+assert_grep4 '^SEG [0-9]+ ([4-9][0-9][0-9]) .*Right aligned line' \
+    ".box text-align:right -> line shifted to the right edge"
+# display:none — the hidden paragraph produces NO segment.
+if grep -q 'should not see' "$DUMP4"; then
+    echo "[hb-host] FAIL display:none did not skip the element"; fail=1
+else
+    echo "[hb-host] PASS display:none skips the element (no segment emitted)"
+fi
+# flow continues after a display:none element (skip terminated correctly).
+assert_grep4 '^SEG [0-9]+ 8 #333333 .*Visible after hidden line' \
+    "content after display:none still renders (skip name NUL-terminated)"
+# inline style="" colour (rgb()) overrides the element sheet rule.
+assert_grep4 '^SEG [0-9]+ 8 #0a14c8 .*Inline rgb override wins' \
+    "inline style rgb(10,20,200) overrides p{color:#333}"
+# inline style="text-align:center" also shifts seg_x.
+assert_grep4 '^SEG [0-9]+ (1[0-9][0-9]|[2-9][0-9][0-9]) .*Inline centered paragraph' \
+    "inline text-align:center -> centred line"
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
     exit 0
