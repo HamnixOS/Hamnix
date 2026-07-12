@@ -280,6 +280,82 @@ hamsh_send_await 'echo f"hi {fnm}nix"' 'hi hamnix' "$CMD_WAIT" || true
 # f-string with a call sub-expression + literal braces via {{ }}.
 hamsh_send_await 'echo f"len={len([1, 2, 3])} {{lit}}"' 'len=3 {lit}' "$CMD_WAIT" || true
 
+# --- P. §Mutation + floor-division + call kwargs (the mutation rung) --
+# All results emitted as whole output lines so ran_bol can't false-green.
+# P1. append grows a list in place.
+hamsh_send 'pm = [1, 2]'
+hamsh_send 'pm.append(3)'
+hamsh_send_await 'echo PM $pm' 'PM 1 2 3' "$CMD_WAIT" || true
+# P1b. RELOCATION: append to a list that is NOT at the pool top (another
+# list was built after it) must grow it WITHOUT corrupting the other.
+hamsh_send 'pr = [1, 2]'
+hamsh_send 'po = [9, 9]'
+hamsh_send 'pr.append(3)'
+hamsh_send_await 'echo PR $pr' 'PR 1 2 3' "$CMD_WAIT" || true
+hamsh_send_await 'echo PO $po' 'PO 9 9' "$CMD_WAIT" || true
+# P1c. ALIASING is by REFERENCE (Python): two names, one list object.
+hamsh_send 'pa = [1, 2]'
+hamsh_send 'pb = pa'
+hamsh_send 'pa.append(9)'
+hamsh_send_await 'echo PB $pb' 'PB 1 2 9' "$CMD_WAIT" || true
+# P2. pop() -> last (removed); pop(i) -> the i-th (removed).
+hamsh_send 'pp = [1, 2, 3]'
+hamsh_send_await 'echo ${ pp.pop() }' '3' "$CMD_WAIT" || true
+hamsh_send_await 'echo PPL $pp' 'PPL 1 2' "$CMD_WAIT" || true
+hamsh_send 'pq = [10, 20, 30]'
+hamsh_send_await 'echo ${ pq.pop(0) }' '10' "$CMD_WAIT" || true
+hamsh_send_await 'echo PQL $pq' 'PQL 20 30' "$CMD_WAIT" || true
+# P3. insert(i, v).
+hamsh_send 'pv = [1, 2, 3]'
+hamsh_send 'pv.insert(0, 9)'
+hamsh_send_await 'echo PV $pv' 'PV 9 1 2 3' "$CMD_WAIT" || true
+# P4. index assignment `xs[i] = v`.
+hamsh_send 'ps = [1, 2, 3]'
+hamsh_send 'ps[1] = 7'
+hamsh_send_await 'echo PS $ps' 'PS 1 7 3' "$CMD_WAIT" || true
+# P5. GROW past the initial run (>16 appends) — proves the pool relocates.
+hamsh_send 'pg = []'
+hamsh_send 'for gi in range(20):'
+hamsh_send '    pg.append(gi)'
+hamsh_send ''
+hamsh_send_await 'echo ${ len(pg) }' '20' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ $pg[19] }' '19' "$CMD_WAIT" || true
+# P6. DIFFERENTIAL: append inside a brace loop ≡ inside an indent loop.
+hamsh_send 'mb = []'
+hamsh_send 'for i in [1, 2, 3] { mb.append(i) }'
+hamsh_send_await 'echo MB $mb' 'MB 1 2 3' "$CMD_WAIT" || true
+hamsh_send 'mi = []'
+hamsh_send 'for i in [1, 2, 3]:'
+hamsh_send '    mi.append(i)'
+hamsh_send ''
+hamsh_send_await 'echo MI $mi' 'MI 1 2 3' "$CMD_WAIT" || true
+# P7. floor-division `//` — int, Python-negative, and float.
+hamsh_send_await 'echo ${ 7 // 2 }' '3' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ -7 // 2 }' '-4' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ 7.0 // 2 }' '3' "$CMD_WAIT" || true
+# P7b. floor-mod `%` carries the divisor's sign (Python).
+hamsh_send_await 'echo ${ -7 % 2 }' '1' "$CMD_WAIT" || true
+# P8. sorted() keyword args: reverse= and key=FN (first-class-by-name).
+hamsh_send_await 'echo ${ sorted([3, 1, 2], reverse=1) }' '3 2 1' "$CMD_WAIT" || true
+hamsh_send 'wl = ["ccc", "a", "bb"]'
+hamsh_send_await 'echo ${ sorted(wl, key=len) }' 'a bb ccc' "$CMD_WAIT" || true
+# P9. dict mutation: index-assign, setdefault, update, pop; sep.join(list).
+hamsh_send 'de = { "x": 1 }'
+hamsh_send 'de["y"] = 2'
+hamsh_send_await 'echo ${ $de["y"] }' '2' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ de.setdefault("z", 5) }' '5' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ $de["z"] }' '5' "$CMD_WAIT" || true
+hamsh_send 'de.update({ "x": 8 })'
+hamsh_send_await 'echo ${ $de["x"] }' '8' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ de.pop("y") }' '2' "$CMD_WAIT" || true
+hamsh_send 'jsep = "-"'
+hamsh_send_await 'echo ${ jsep.join(["a", "b", "c"]) }' 'a-b-c' "$CMD_WAIT" || true
+# P10. a glued `name=value` at STATEMENT scope is STILL a POSIX
+# assignment (kwarg parsing is confined to inside call parens) — proves
+# `X=1`/env-prefix tokenisation did NOT regress.
+hamsh_send 'key=hello'
+hamsh_send_await 'echo KV $key' 'KV hello' "$CMD_WAIT" || true
+
 hamsh_send_await 'echo GATE_DONE' 'GATE_DONE' "$CMD_WAIT" || true
 hamsh_send 'exit'
 sleep 2
@@ -462,6 +538,32 @@ for pair in "sum=7|arith-subexpr" "pi is 3.14|float-interp" \
         echo "[$TAG] OK: f-string $name"; else
         echo "[$TAG] WRONG: f-string $name (want '$m')"; fail=1; fi
 done
+
+# P. §Mutation + floor-division + call kwargs (correctness on the GUEST).
+for pair in "PM 1 2 3|list-append" \
+            "PR 1 2 3|append-relocate" "PO 9 9|relocate-no-corrupt" \
+            "PB 1 2 9|append-alias-by-reference" \
+            "3|pop-last-return" "PPL 1 2|pop-last-shrink" \
+            "10|pop-index-return" "PQL 20 30|pop-index-shrink" \
+            "PV 9 1 2 3|insert" "PS 1 7 3|index-assign" \
+            "20|append-grow-len" "19|append-grow-tail" \
+            "MB 1 2 3|append-brace-loop" "MI 1 2 3|append-indent-loop" \
+            "3|floordiv-int" "-4|floordiv-negative" "3|floordiv-float" \
+            "1|floormod-python-sign" \
+            "3 2 1|sorted-reverse-kwarg" "a bb ccc|sorted-key-len" \
+            "2|dict-index-assign" "5|dict-setdefault" "5|dict-setdefault-read" \
+            "8|dict-update" "2|dict-pop" "a-b-c|sep-join-method" \
+            "KV hello|posix-assign-no-regress"; do
+    m="${pair%%|*}"; name="${pair##*|}"
+    if ran_bol "$(printf '%s' "$m" | sed 's/[.[*+]/\\&/g')"; then
+        echo "[$TAG] OK: $name"; else
+        echo "[$TAG] WRONG: $name (want '$m')"; fail=1; fi
+done
+# P6 differential: append-in-brace-loop AND append-in-indent-loop both
+# yield the same list — the accept-either guarantee for mutation.
+if ran_bol "MB 1 2 3" && ran_bol "MI 1 2 3"; then
+    echo "[$TAG] OK: list mutation brace-loop ≡ indent-loop"; else
+    echo "[$TAG] WRONG: mutation brace≢indent"; fail=1; fi
 
 if ! hamsh_ran "$LOG" "GATE_DONE"; then
     echo "[$TAG] WRONG: shell did not survive to the end (GATE_DONE absent)"; fail=1; fi
