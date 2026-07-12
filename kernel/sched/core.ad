@@ -3700,11 +3700,28 @@ def sched_init():
 
 # --- public: task construction ------------------------------------
 
-def kthread_create(entry: uint64, name0: uint64) -> int32:
-    # Create a CPL=0 kernel thread. Returns the new task's slot index,
-    # or -1 on OOM. The first __switch_to into the new task pops 6
-    # zeroed callee-saved, rets to kthread_bootstrap, iretq's into
-    # `entry` with CS = kernel CS, SS = kernel DS, RFLAGS = 0x202.
+def _kthread_build_unpublished(entry: uint64, name0: uint64) -> int32:
+    # Build a CPL=0 kernel thread's task_struct WITHOUT publishing it as
+    # runnable. Returns the new task's slot index, or -1 on OOM. The slot is
+    # popped off the freelist (so no other CPU can re-claim it) and left
+    # STATE_FREE and OFF every run-list — invisible to _pick_next AND to the
+    # cross-CPU work-steal walk — until a caller publishes it. The two public
+    # wrappers below finish the job:
+    #   • kthread_create()               -> STATE_READY + linked on the creating
+    #                                        CPU's run-list (normal kthreads).
+    #   • kthread_create_parked_pinned() -> STATE_PARKED + pinned + UNLINKED
+    #                                        (#109: the per-CPU idle/swapper
+    #                                        kthread, which must never be
+    #                                        stealable before its AP adopts it).
+    # Splitting the publish out of the build is the #109 fix: the idle kthread
+    # is now born parked+pinned+unlinked in ONE step, closing the window where
+    # kthread_create used to publish it READY+linked+affinity-ALL and only
+    # AFTERWARD did sched_prepare_ap_idle pin/park/unlink it — a gap a busy AP's
+    # _sched_try_pull_locked could steal through (two CPUs on one kstack).
+    #
+    # The first __switch_to into the new task pops 6 zeroed callee-saved, rets
+    # to kthread_bootstrap, iretq's into `entry` with CS = kernel CS,
+    # SS = kernel DS, RFLAGS = 0x202.
     slot: int32 = _find_free_slot()
     if slot < 0:
         printk0("kthread_create: no free task slot\n")
@@ -3861,6 +3878,19 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     _init_fd_table(s)
     next_pid = next_pid + 1
     nr_tasks_spawned = nr_tasks_spawned + 1
+    # Build complete; slot is fully initialised but STILL UNPUBLISHED
+    # (STATE_FREE, off the freelist, off every run-list). A public wrapper
+    # (kthread_create / kthread_create_parked_pinned) publishes it.
+    return slot
+
+
+def kthread_create(entry: uint64, name0: uint64) -> int32:
+    # Create a CPL=0 kernel thread and publish it RUNNABLE on the creating
+    # CPU's runqueue. Returns the slot index, or -1 on OOM.
+    slot: int32 = _kthread_build_unpublished(entry, name0)
+    if slot < 0:
+        return -1
+    s: uint64 = cast[uint64](slot)
     # PER-CPU RUNQUEUE (#6): a freshly-created kthread is HOMED on the
     # creating CPU's runqueue. This preserves today's create-then-run-here
     # affinity (the creator's own schedule() picks it up) and the IRQ-mask
@@ -3879,6 +3909,51 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     task_table[s].state = STATE_READY
     _rq_list_insert(s, _pub_cpu)
     _rq_unlock_cpu(_pub_cpu)
+    return slot
+
+
+def kthread_create_parked_pinned(entry: uint64, name0: uint64,
+                                 cpu_id: uint64) -> int32:
+    # #109 FIX. Create a CPL=0 kernel thread that is born STATE_PARKED, PINNED
+    # to `cpu_id`, and NOT linked on any run-list. Used for the per-CPU idle
+    # (swapper/N) kthread, which the BSP prepares while OTHER APs are already
+    # running their idle loops and hammering _sched_try_pull_locked.
+    #
+    # WHY THIS EXISTS (the residual #12/#13 race that capped bring-up at 8):
+    # the old sched_prepare_ap_idle called kthread_create — which publishes the
+    # task STATE_READY + LINKED on rq_head[0] with cpu_affinity == AFFINITY_ALL
+    # — and only AFTERWARD set the pin, flipped it PARKED, and unlinked it. In
+    # the gap between those two steps the idle kthread was a fully-eligible
+    # steal target (READY, on_cpu==0, last_dispatch_jiffy==0 so past the steal
+    # hysteresis, affinity ALL). A concurrently-running AP could _sched_try_pull
+    # it off rq_head[0] and dispatch it; the intended AP then ALSO launched the
+    # same slot via sched_ap_launch → two CPUs executing on one idle-kthread
+    # kstack → canary smash / a `ret` off uninitialised low RAM (observed at
+    # -smp 8 as ~1/4 boots: AP-DISPATCH-BAD-SP cpu=0 nxt=0, or a #UD/#GP at a
+    # low garbage rsp). More APs = more concurrent stealers = the window that
+    # was invisible at ≤3 CPUs became a 1-in-4 event at 8. Publishing the idle
+    # kthread parked+pinned+unlinked in a SINGLE step (before the slot is ever
+    # visible to a stealer) removes the window entirely.
+    #
+    # The slot is private here (popped off the freelist, on no run-list), so no
+    # other CPU can observe it yet — no rq lock is needed to stamp these fields.
+    # The owning AP re-links its idle slot onto its own runqueue later, the
+    # first time sched_ap_idle_loop dispatches real work.
+    slot: int32 = _kthread_build_unpublished(entry, name0)
+    if slot < 0:
+        return -1
+    s: uint64 = cast[uint64](slot)
+    # PIN before publish: sched_cpu_allowed(s, other) is now false for every
+    # CPU except cpu_id, so even if a future change DID link this slot, no other
+    # CPU's _pick_next / _sched_try_pull_locked would touch it.
+    task_table[s].cpu_affinity = cast[uint64](1) << cpu_id
+    task_table[s].rq_cpu       = cpu_id
+    # PARKED: invisible to _pick_next (only picks READY) and to _find_free_slot
+    # (only claims FREE), so create_user_task can't reclaim the slot between now
+    # and sched_ap_launch(), which flips it directly to STATE_RUNNING.
+    task_table[s].state = STATE_PARKED
+    # Deliberately NOT _rq_list_insert'd: a PARKED task must be on NO run-list
+    # (the #13 invariant). That is exactly what makes it unstealable.
     return slot
 
 
@@ -5750,72 +5825,39 @@ def sched_prepare_ap_idle(cpu_id: uint64) -> int32:
     # become non-zero) transitions it directly to STATE_RUNNING.
     # Returns the slot index, or -1 on OOM.
     #
-    # Interrupt-disable window: kthread_create() leaves the slot STATE_READY;
-    # we must flip it to STATE_PARKED before the BSP timer ISR can see it.
-    # _wq_lock_irq() disables local interrupts (IRQ-safe global state lock) so
-    # the timer ISR — which may enter the scheduler and take rq/wq locks —
-    # cannot race us; a concurrently-firing IRQ that also takes the same lock
-    # would deadlock since the ISR can't be preempted.
+    # #109 FIX — CREATE IT PARKED+PINNED+UNLINKED IN ONE STEP. This runs on
+    # the BSP while OTHER, already-launched APs are spinning in their idle
+    # loops hammering _sched_try_pull_locked on rq_head[0]. The old code called
+    # kthread_create (which publishes STATE_READY + LINKED on rq_head[0] with
+    # affinity == AFFINITY_ALL) and only AFTERWARD pinned / parked / unlinked
+    # the slot — leaving a window in which the idle kthread was a fully-
+    # eligible steal target. At high core counts (more concurrent stealers) a
+    # busy AP pulled cpu-N's not-yet-adopted idle kthread off rq_head[0] and
+    # dispatched it; cpu-N then ALSO launched the same slot via sched_ap_launch
+    # → two CPUs on one idle-kthread kstack → canary smash / `ret` off low RAM
+    # (observed at -smp 8 as ~1/4 boots: AP-DISPATCH-BAD-SP cpu=0 nxt=0, or a
+    # #UD/#GP at a low garbage rsp). kthread_create_parked_pinned() builds the
+    # task and publishes it PARKED, pinned to cpu_id, and on NO run-list before
+    # it is ever visible to a stealer, so the window is gone. (This supersedes
+    # the two-step #12/#13 fix; the invariant it enforced — a PARKED idle
+    # kthread is pinned and on no run-list — now holds atomically at birth.)
+    #
+    # _wq_lock_irq() still brackets the create + the ap_idle_slots[] publish so
+    # the BSP's own timer ISR (which may enter the scheduler) can't observe a
+    # half-recorded slot; a concurrently-firing IRQ that also takes the same
+    # lock would deadlock since the ISR can't be preempted.
     _wq_lock_irq()
     # name0 = 'idle' — character 0 in the TOP byte (the order
     # _buf_put_name0 in fs/procfs.ad decodes). Linux calls this task
     # swapper/N; without a tag it rendered as an unnamed row in
     # /proc/tasks, and on the -kernel debug config it is pid 1.
-    slot: int32 = kthread_create(cast[uint64](&sched_ap_idle_loop),
-                                 0x69646C6500000000)
+    slot: int32 = kthread_create_parked_pinned(
+        cast[uint64](&sched_ap_idle_loop), 0x69646C6500000000, cpu_id)
     if slot < 0:
         _wq_unlock_irq()
         printk1("SMP: sched_prepare_ap_idle cpu%d: no free slot\n", cpu_id)
         return -1
     su: uint64 = cast[uint64](slot)
-    # #12/#413 FIX — PIN the AP idle kthread to its own CPU (Linux's swapper/N
-    # is per-CPU and never migrates). kthread_create hands out AFFINITY_ALL, so
-    # WITHOUT this an AP idle kthread is a fully-unpinned task. That is fatal:
-    # the AP idle loop dispatches a real task via __switch_to_asm(idle -> task),
-    # which clears idle->on_cpu=0 AFTER saving idle->sp — but idle is left
-    # STATE_READY and LINKED on its CPU's run-list (so the task can switch back
-    # to it). A READY + on-run-list + on_cpu==0 task is exactly what
-    # _sched_try_pull_locked steals: another CPU pulls this AP's private idle
-    # kthread onto itself and resumes it from idle->sp. The idle-loop body
-    # captured my_cpu_id ONCE at entry, so the migrated idle kthread then
-    # operates on the WRONG CPU's per-CPU state — it takes the ORIGINAL CPU's
-    # rq lock from the thief CPU, writes the wrong current_idx_pcpu, and (when
-    # the two CPUs' idle kthreads collide) runs two contexts on one kernel
-    # stack -> canary smash inside _sched_try_pull_locked / a `ret` off
-    # uninitialised low RAM. Pinning to (1<<cpu_id) makes sched_cpu_allowed()
-    # false for every other CPU, so _pick_next and _sched_try_pull_locked on
-    # any OTHER CPU skip it, while the owning CPU still dispatches it normally.
-    # This is why the box was clean at <=3 CPUs (fewer thieves, the window
-    # rarely hit) but reliably corrupted at 4 (3 APs stealing from each other).
-    task_table[su].cpu_affinity = cast[uint64](1) << cpu_id
-    # kthread_create sets STATE_READY; park it so BSP can't schedule it
-    # and create_user_task can't reclaim the slot.
-    task_table[su].state = STATE_PARKED
-    # #13 FIX: kthread_create publishes the new task STATE_READY AND LINKED on
-    # the creating (BSP) CPU's READY run-list (rq_head[rq_cpu], rq_cpu=0). Both
-    # _pick_next() and the work-steal path (_sched_try_pull_locked) trust the
-    # invariant "a node on a run-list is, by construction, STATE_READY" and
-    # NEVER re-check task state — they only skip on_cpu==1. So a PARKED task
-    # left linked on a run-list stays fully dispatchable. With >=2 APs this is
-    # fatal: while the BSP is still preparing later APs' idle kthreads, an
-    # ALREADY-launched AP's idle loop work-steals a not-yet-launched AP's idle
-    # kthread off rq_head[0] (state unchecked) and runs sched_ap_idle_loop on
-    # the WRONG cpu; the intended AP then also launches that same slot via
-    # sched_ap_launch. Two CPUs execute on one idle-kthread kernel stack →
-    # stack corruption → the AP faults on a wild return/jump (observed: #GP at
-    # get_cpu_id's `ret` under KVM, #UD/#DE at near-null rips under TCG). At
-    # -smp 2 the single AP raced only the BSP and the on_cpu fence (raised in
-    # sched_ap_launch) usually won the window — hence the historical "past core
-    # 2 traps" cap. The correct invariant is that a PARKED task is on NO run-
-    # list; unlink it here under the owning CPU's rq lock (rq_lock is the INNER
-    # lock — wq_lock is already held, so this respects wq_lock -> rq_lock
-    # order, identical to kthread_create's own internal rq-lock use). The AP
-    # re-links its idle slot onto its OWN runqueue later, the first time
-    # sched_ap_idle_loop dispatches real work.
-    _prep_rq_cpu: uint64 = task_table[su].rq_cpu
-    _rq_lock_cpu(_prep_rq_cpu)
-    _rq_list_remove(su)
-    _rq_unlock_cpu(_prep_rq_cpu)
     _wq_unlock_irq()
     # Record for sched_ap_launch to find.  Written AFTER the slot is safely
     # parked: the AP's spin loop reads ap_idle_slots[cpu_id] and enters the

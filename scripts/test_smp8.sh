@@ -73,30 +73,15 @@ python3 -m compiler.adder compile \
     init/main.ad \
     -o "$ELF" >/dev/null
 
-echo "[test_smp8] (3/3) Boot QEMU -smp 8 and check 7-AP bring-up"
+# #109: the AP-idle-loop dispatch corruption was an INTERMITTENT race (~1/4 of
+# -smp 8 boots pre-fix). A single clean boot proves nothing at that frequency,
+# so this gate boots -smp 8 REPEATEDLY (SMP8_REPEAT, default 3) and requires
+# EVERY iteration to pass — the race cannot hide behind one lucky boot. Bump
+# SMP8_REPEAT (e.g. to 10) for a heavier soak.
+REPEAT="${SMP8_REPEAT:-3}"
+echo "[test_smp8] (3/3) Boot QEMU -smp 8 x${REPEAT} and check 7-AP bring-up"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
-
-# -smp 8 on TCG (CI has no /dev/kvm) brings up 7 APs and multiplexes them onto
-# the host cores, so the boot is slower than the -smp 3 gate; give it a
-# generous window. The gate still terminates as soon as the heartbeat markers
-# appear (the box keeps ticking until the timeout — rc=124 is expected/benign).
-set +e
-timeout 300s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 8 \
-    -nographic \
-    -no-reboot \
-    -m 2G \
-    -monitor none \
-    -serial stdio \
-    </dev/null > "$LOG" 2>&1
-rc=$?
-set -e
-
-echo "[test_smp8] --- captured output (SMP-relevant lines) ---"
-grep -aE "SMP:|cpus_online|AP cpu|MADT|kthread alive|idle via hlt|hamsh:stage-07|hamsh-alive|internal error" "$LOG" | tail -40 || true
-echo "[test_smp8] --- end ---"
 
 fail=0
 
@@ -132,30 +117,124 @@ check_absent() {
     fi
 }
 
-check_marker "MADT reports 8 CPUs"            "SMP: MADT reports 8 CPU(s)"
+iter=1
+while [ "$iter" -le "$REPEAT" ]; do
+    echo "[test_smp8] ==== boot $iter / $REPEAT ===="
+    # -smp 8 on TCG (CI has no /dev/kvm) brings up 7 APs and multiplexes them
+    # onto the host cores, so the boot is slower than the -smp 3 gate; give it a
+    # generous window. The gate terminates as soon as the heartbeat markers
+    # appear (the box keeps ticking until the timeout — rc=124 is expected).
+    set +e
+    timeout 300s qemu-system-x86_64 \
+        -kernel "$ELF" \
+        -smp 8 \
+        -nographic \
+        -no-reboot \
+        -m 2G \
+        -monitor none \
+        -serial stdio \
+        </dev/null > "$LOG" 2>&1
+    rc=$?
+    set -e
 
-# Each AP must bump the online counter and run its idle kthread exactly once.
-n=1
-while [ "$n" -le 7 ]; do
-    check_marker "AP cpu$n online"            "SMP: AP cpu$n online (cpus_online=$((n+1)))"
-    check_count  "cpu$n idle kthread ran once" "SMP: cpu$n kthread alive"  1
-    n=$((n+1))
+    echo "[test_smp8] --- boot $iter captured output (SMP-relevant lines) ---"
+    grep -aE "SMP:|cpus_online|AP cpu|MADT|kthread alive|idle via hlt|hamsh:stage-07|hamsh-alive|internal error" "$LOG" | tail -40 || true
+    echo "[test_smp8] --- end boot $iter (qemu rc=$rc) ---"
+
+    check_marker "MADT reports 8 CPUs"            "SMP: MADT reports 8 CPU(s)"
+
+    # Each AP must bump the online counter and run its idle kthread exactly once.
+    n=1
+    while [ "$n" -le 7 ]; do
+        check_marker "AP cpu$n online"            "SMP: AP cpu$n online (cpus_online=$((n+1)))"
+        check_count  "cpu$n idle kthread ran once" "SMP: cpu$n kthread alive"  1
+        n=$((n+1))
+    done
+
+    check_marker "final cpus_online = 8"          "Hamnix: cpus_online = 8"
+    check_marker "BSP reached interactive shell"  "[hamsh:stage-07] loop-enter"
+    check_marker "box stayed alive (heartbeat)"   "[hamsh-alive] tick="
+
+    # #109: the BSP idle/swapper is slot 0; an AP that transiently drove the
+    # WRONG per-CPU state (stolen idle kthread / two-contexts-on-one-stack)
+    # printed a bogus "cpu0 kthread alive" banner (cpu 0 is the BSP and never
+    # runs sched_ap_idle_loop) — so ANY cpu0 idle banner is a hard fail.
+    check_absent "no bogus cpu0 idle banner" "SMP: cpu0 kthread alive"
+
+    # Unambiguous fatal signatures for the #12/#413/#109 AP-dispatch corruption.
+    check_absent "no trap-diag"       "trap-diag\] vec="
+    check_absent "no KVM hard-kill"   "KVM internal error|emulation failure"
+    check_absent "no bad-sp dispatch" "SWITCH-BAD-SP|AP-DISPATCH-BAD-SP"
+    check_absent "no kstack smash"    "stack-smash|KSTACK OVERFLOW"
+    check_absent "no BIOS-fill wild rip" "rip=0xf000"
+
+    if [ "$fail" -ne 0 ]; then
+        echo "[test_smp8] FAIL on boot $iter / $REPEAT (qemu rc=$rc)"
+        exit 1
+    fi
+    iter=$((iter + 1))
 done
 
-check_marker "final cpus_online = 8"          "Hamnix: cpus_online = 8"
-check_marker "BSP reached interactive shell"  "[hamsh:stage-07] loop-enter"
-check_marker "box stayed alive (heartbeat)"   "[hamsh-alive] tick="
+echo "[test_smp8] PASS — 8-core SMP x${REPEAT}: all 7 APs online each boot, each idle kthread ran once on its own core, shell reached + heartbeat, no trap (#12/#413/#109 fixed)"
 
-# Unambiguous fatal signatures for the #12/#413 AP-dispatch corruption.
-check_absent "no trap-diag"       "trap-diag\] vec="
-check_absent "no KVM hard-kill"   "KVM internal error|emulation failure"
-check_absent "no bad-sp dispatch" "SWITCH-BAD-SP|AP-DISPATCH-BAD-SP"
-check_absent "no kstack smash"    "stack-smash|KSTACK OVERFLOW"
-check_absent "no BIOS-fill wild rip" "rip=0xf000"
-
-if [ "$fail" -ne 0 ]; then
-    echo "[test_smp8] FAIL (qemu rc=$rc)"
-    exit 1
+# ---------------------------------------------------------------------------
+# HIGH-COUNT (>8) BRING-UP ASSERTION (#109 cap lift 8 -> 64).
+#
+# With #109 fixed, SMP_BOOT_MAX_CPUS was restored to MAX_CPUS (64), so the OS
+# now brings up min(enumerated, 64) cores instead of capping at 8. Assert a
+# high-count boot actually reaches an interactive shell with EVERY core online
+# and no AP-dispatch corruption. This needs a host with enough logical CPUs +
+# hardware virt (a 12-core -smp 12 boot under pure TCG is far too slow for CI),
+# so it runs ONLY when /dev/kvm exists and nproc >= HIGH_SMP; otherwise it is
+# SKIPPED (not failed) — the 8-core loop above is the CI-portable gate.
+HIGH_SMP="${HIGH_SMP:-12}"
+if [ -w /dev/kvm ] && [ "$(nproc)" -ge "$HIGH_SMP" ]; then
+    echo "[test_smp8] ==== high-count boot: -smp ${HIGH_SMP} (KVM) ===="
+    set +e
+    timeout 120s qemu-system-x86_64 \
+        -enable-kvm -cpu host \
+        -kernel "$ELF" \
+        -smp "$HIGH_SMP" \
+        -nographic -no-reboot -m 2G -monitor none -serial stdio \
+        </dev/null > "$LOG" 2>&1
+    hrc=$?
+    set -e
+    echo "[test_smp8] --- high-count captured (SMP lines) ---"
+    grep -aE "SMP:|cpus_online|AP cpu|MADT|kthread alive|hamsh:stage-07|hamsh-alive" "$LOG" | tail -30 || true
+    echo "[test_smp8] --- end (qemu rc=$hrc) ---"
+    hfail=0
+    if grep -aqF "Hamnix: cpus_online = ${HIGH_SMP}" "$LOG"; then
+        echo "[test_smp8] PASS: high-count cpus_online = ${HIGH_SMP}"
+    else
+        echo "[test_smp8] FAIL: high-count cpus_online != ${HIGH_SMP}" >&2; hfail=1
+    fi
+    # Every AP (cpu 1 .. HIGH_SMP-1) must run its idle kthread exactly once, and
+    # cpu 0 must NEVER print an idle banner (the #109 corruption tell).
+    ap=1
+    while [ "$ap" -le $((HIGH_SMP - 1)) ]; do
+        got=$(grep -acF "SMP: cpu$ap kthread alive" "$LOG")
+        if [ "$got" != "1" ]; then
+            echo "[test_smp8] FAIL: high-count cpu$ap idle banner x$got (want x1)" >&2; hfail=1
+        fi
+        ap=$((ap + 1))
+    done
+    if grep -aqF "SMP: cpu0 kthread alive" "$LOG"; then
+        echo "[test_smp8] FAIL: high-count bogus cpu0 idle banner" >&2; hfail=1
+    fi
+    for pat in "trap-diag\] vec=" "SWITCH-BAD-SP|AP-DISPATCH-BAD-SP" "stack-smash|KSTACK OVERFLOW" "rip=0xf000" "KVM internal error|emulation failure"; do
+        if grep -aqE "$pat" "$LOG"; then
+            echo "[test_smp8] FAIL: high-count forbidden signature /$pat/" >&2
+            grep -anE "$pat" "$LOG" | head -3 >&2; hfail=1
+        fi
+    done
+    if ! grep -aqF "[hamsh:stage-07] loop-enter" "$LOG"; then
+        echo "[test_smp8] FAIL: high-count BSP did not reach shell" >&2; hfail=1
+    fi
+    if [ "$hfail" -ne 0 ]; then
+        echo "[test_smp8] FAIL — high-count -smp ${HIGH_SMP} bring-up (qemu rc=$hrc)"
+        exit 1
+    fi
+    echo "[test_smp8] PASS — high-count -smp ${HIGH_SMP}: all $((HIGH_SMP - 1)) APs online, each idle kthread once, shell reached, no trap (#109 cap lift verified)"
+else
+    echo "[test_smp8] SKIP high-count boot (need /dev/kvm + nproc >= ${HIGH_SMP}; have nproc=$(nproc), kvm=$( [ -w /dev/kvm ] && echo yes || echo no ))"
 fi
-
-echo "[test_smp8] PASS — 8-core SMP: all 7 APs online, each idle kthread ran once on its own core, shell reached + heartbeat, no trap (#12/#413 fixed)"
