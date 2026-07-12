@@ -504,56 +504,68 @@ def free_page(page: uint64):
 #
 # This allocator gives those regions a reclaim path WITHOUT a full
 # buddy/slab rewrite. Backing memory still comes from memblock on a
-# cold miss, but a region_free() pushes the chunk onto an EXACT-SIZE
-# free list so the next region_alloc() of the same size reuses it.
-# That is exactly the spawn-the-same-binary-repeatedly workload: each
-# `hpm` spawn requests the identical span, so a reaped image region is
-# handed straight back to the following spawn and the pool stays flat.
+# cold miss, but a region_free() returns the chunk to a general free
+# list that the next region_alloc() reuses.
 #
-# Different sizes get different buckets (a tiny fixed table); an
-# unrecognised size that can't claim a bucket simply isn't pooled (it
-# falls back to a fresh memblock carve and is dropped on free — the
-# pre-existing behaviour, no worse than before). In practice the system
-# spawns a small handful of distinct large binaries, so the bucket
-# table never fills.
+# WHY A GENERAL (ANY-SIZE) FREE LIST, NOT EXACT-SIZE BUCKETS (#106 leak):
+# the original pool kept one free-list bucket PER EXACT byte size. That
+# only recycles when the SAME binary is respawned at the IDENTICAL span.
+# But the desktop launches ~28 DISTINCT native apps whose image spans
+# differ by a few KiB each (16.78 MiB, 16.79 MiB, 16.92 MiB, 16.97 MiB,
+# 17.90 MiB, 19.03 MiB ...). A freed 16.79 MiB chunk sat in its own
+# exact-size bucket and could NOT satisfy the next 16.97 MiB request, so
+# region_alloc cold-missed into memblock every time — the ONE-WAY bump
+# cursor climbed monotonically (measured: 568 MiB drained across the DE
+# storm, 21 of 27 allocs cold-missing) until memblock_alloc returned 0 →
+# `elf: OOM` → boot wedge. The exact-size pool also STRANDED every pooled
+# chunk in a bucket no differently-sized request could ever touch.
+#
+# The fix: a single ADDRESS-SORTED free list. region_alloc does first-fit
+# (the first chunk large enough) and SPLITS the remainder back onto the
+# list; region_free COALESCES with address-adjacent free neighbours so
+# split fragments re-merge into whole regions. Now ANY freed region backs
+# ANY later request ≤ its size, so a spawn→exit→reap cycle is NET-NEUTRAL
+# on memblock headroom (the reaped image chunk is handed straight to the
+# next spawn regardless of the exact span) and the pool stays flat.
+#
+# Each free chunk is self-describing: its first 16 bytes (dead memory
+# until reused) hold [0]=next-chunk phys (0 = end), [8]=chunk byte size.
+# All chunks are page-aligned and page-multiple-sized (memblock aligns
+# 4096; rsize is page-rounded; splits preserve both), so the header
+# always fits and neighbour tests are exact.
 
-REGION_NBUCKETS: uint64 = 16
-region_bucket_size: Array[16, uint64]   # exact byte size this bucket pools
-region_bucket_head: Array[16, uint64]   # free-list head (0 = empty)
+_region_free_head: uint64 = 0     # lowest-addr free chunk (0 = empty)
 
 
-def _region_bucket_for(size: uint64) -> int32:
-    # Find the bucket that pools `size`, claiming a free one on first
-    # sight. Returns -1 if the table is full of other sizes (caller
-    # then runs unpooled).
-    i: uint64 = 0
-    while i < REGION_NBUCKETS:
-        if region_bucket_size[i] == size:
-            return cast[int32](i)
-        i = i + 1
-    # No existing bucket for this size — claim the first unused one.
-    i = 0
-    while i < REGION_NBUCKETS:
-        if region_bucket_size[i] == 0:
-            region_bucket_size[i] = size
-            region_bucket_head[i] = 0
-            return cast[int32](i)
-        i = i + 1
-    return -1
+def _region_link_get(chunk: uint64) -> uint64:
+    return cast[Ptr[uint64]](chunk)[0]
+
+
+def _region_link_set(chunk: uint64, nxt: uint64):
+    cast[Ptr[uint64]](chunk)[0] = nxt
+
+
+def _region_size_get(chunk: uint64) -> uint64:
+    return cast[Ptr[uint64]](chunk + 8)[0]
+
+
+def _region_size_set(chunk: uint64, sz: uint64):
+    cast[Ptr[uint64]](chunk + 8)[0] = sz
 
 
 def region_alloc(size: uint64) -> uint64:
     # Allocate a page-aligned contiguous region of `size` bytes that can
     # later be returned via region_free(addr, size). Reuses a pooled
-    # chunk of the exact same size if one is free; otherwise carves a
-    # fresh chunk from memblock. Returns 0 on OOM.
+    # chunk (first-fit, splitting the remainder back onto the free list)
+    # if one is big enough; otherwise carves a fresh chunk from memblock.
+    # Returns 0 on OOM.
     if size == 0:
         return 0
     rsize: uint64 = (size + 4095) & ~cast[uint64](4095)
-    # The bucket table + intrusive free-list link are shared RMW state. Run
-    # the WHOLE critical section (bucket claim, head pop, cold-miss carve)
-    # under IRQ-off + boot-CR3 (for the raw-physical link deref) + the SMP
-    # region lock so no two CPUs ever pop the same head or race the claim.
+    # The free list + intrusive header are shared RMW state. Run the WHOLE
+    # critical section (list walk, split, cold-miss carve) under IRQ-off +
+    # boot-CR3 (for the raw-physical header deref) + the SMP region lock so
+    # no two CPUs ever hand out the same chunk or race the splice.
     _ra_live: uint64 = read_cr3()
     _ra_irq: uint64 = local_irq_save()
     _ra_boot: uint64 = cow_boot_cr3()
@@ -564,17 +576,37 @@ def region_alloc(size: uint64) -> uint64:
     spinlock_lock(&_pa_region_lock)
     ret: uint64 = 0
     got: int32 = 0
-    b: int32 = _region_bucket_for(rsize)
-    if b >= 0:
-        head: uint64 = region_bucket_head[cast[uint64](b)]
-        if head != 0:
-            # Pop the pooled chunk; its first 8 bytes hold the next link.
-            region_bucket_head[cast[uint64](b)] = cast[Ptr[uint64]](head)[0]
-            ret = head
+    # First-fit: the first free chunk whose size >= rsize.
+    prev: uint64 = 0
+    cur:  uint64 = _region_free_head
+    while cur != 0 and got == 0:
+        csz: uint64 = _region_size_get(cur)
+        if csz >= rsize:
+            nxt: uint64 = _region_link_get(cur)
+            rem: uint64 = csz - rsize
+            if rem != 0:
+                # Split: hand back the low rsize bytes, re-insert the
+                # remainder [cur+rsize, rem) in cur's sorted slot.
+                remc: uint64 = cur + rsize
+                _region_size_set(remc, rem)
+                _region_link_set(remc, nxt)
+                if prev == 0:
+                    _region_free_head = remc
+                else:
+                    _region_link_set(prev, remc)
+            else:
+                # Exact fit: unlink cur entirely.
+                if prev == 0:
+                    _region_free_head = nxt
+                else:
+                    _region_link_set(prev, nxt)
+            ret = cur
             got = 1
+        else:
+            prev = cur
+            cur = _region_link_get(cur)
     if got == 0:
-        # Cold miss (or unpoolable size): carve fresh from memblock.
-        # memblock_alloc self-locks (leaf); safe to call holding region lock.
+        # Cold miss: carve fresh from memblock (one-way bump; self-locks).
         ret = memblock_alloc(rsize, 4096)
     spinlock_unlock(&_pa_region_lock)
     if _ra_sw != 0:
@@ -584,11 +616,9 @@ def region_alloc(size: uint64) -> uint64:
 
 
 def region_free(addr: uint64, size: uint64):
-    # Return a region to its exact-size pool for reuse by the next
-    # region_alloc(size). If the size has no bucket (table full) the
-    # chunk is simply dropped — identical to the old leak, but bounded
-    # to at most REGION_NBUCKETS-1 distinct foreign sizes, which never
-    # happens in practice.
+    # Return a region to the general free list for reuse by ANY later
+    # region_alloc <= its size. Inserts address-sorted and coalesces with
+    # the immediate physical neighbours so split fragments re-merge.
     if addr == 0 or size == 0:
         return
     rsize: uint64 = (size + 4095) & ~cast[uint64](4095)
@@ -605,10 +635,9 @@ def region_free(addr: uint64, size: uint64):
     if _rf_diag_n != 0:
         printk2("[rfdiag] region_free addr=%p has COW-live frames=%d\n",
                 addr, _rf_diag_n)
-    # Push onto this bucket's free list (intrusive next-link in the
-    # chunk's first 8 bytes — the chunk is dead memory until reused).
-    # Raw physical store: boot-CR3 guard; bucket claim + push under the SMP
-    # region lock so a concurrent region_alloc can't observe a torn head.
+    # Raw physical header writes: boot-CR3 guard; the sorted-insert +
+    # coalesce runs under the SMP region lock so a concurrent region_alloc
+    # can't observe a torn list.
     _rf_live: uint64 = read_cr3()
     _rf_irq: uint64 = local_irq_save()
     _rf_boot: uint64 = cow_boot_cr3()
@@ -617,10 +646,42 @@ def region_free(addr: uint64, size: uint64):
         load_cr3(_rf_boot)
         _rf_sw = 1
     spinlock_lock(&_pa_region_lock)
-    b: int32 = _region_bucket_for(rsize)
-    if b >= 0:
-        cast[Ptr[uint64]](addr)[0] = region_bucket_head[cast[uint64](b)]
-        region_bucket_head[cast[uint64](b)] = addr
+    # Locate the sorted insertion point: prev = highest chunk below addr.
+    prev: uint64 = 0
+    cur:  uint64 = _region_free_head
+    while cur != 0 and cur < addr:
+        prev = cur
+        cur = _region_link_get(cur)
+    # Coalesce backward: prev immediately precedes addr -> extend prev.
+    merged_back: int32 = 0
+    if prev != 0 and prev + _region_size_get(prev) == addr:
+        _region_size_set(prev, _region_size_get(prev) + rsize)
+        addr = prev
+        rsize = _region_size_get(prev)
+        merged_back = 1
+    # Coalesce forward: cur immediately follows addr -> absorb cur.
+    if cur != 0 and addr + rsize == cur:
+        cur_next: uint64 = _region_link_get(cur)
+        rsize = rsize + _region_size_get(cur)
+        _region_size_set(addr, rsize)
+        if merged_back != 0:
+            # addr == prev, already linked; just skip past cur.
+            _region_link_set(prev, cur_next)
+        else:
+            # addr takes cur's slot in the sorted list.
+            _region_link_set(addr, cur_next)
+            if prev == 0:
+                _region_free_head = addr
+            else:
+                _region_link_set(prev, addr)
+    elif merged_back == 0:
+        # No coalesce: insert addr between prev and cur.
+        _region_size_set(addr, rsize)
+        _region_link_set(addr, cur)
+        if prev == 0:
+            _region_free_head = addr
+        else:
+            _region_link_set(prev, addr)
     spinlock_unlock(&_pa_region_lock)
     if _rf_sw != 0:
         load_cr3(_rf_live)
