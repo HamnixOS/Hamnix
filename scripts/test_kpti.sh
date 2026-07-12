@@ -151,6 +151,19 @@ if ! grep -a -F -q "[sched] kstack via page_offset" "$LOG"; then
 fi
 pass "kstacks reach RAM through the page_offset alias (KPTI Brick B)"
 
+# (G) KPTI #94, Brick B consumer 2: the per-CPU area (%gs base) is anchored
+# at its page_offset alias, so every %gs-relative per-CPU access (cpu_id,
+# syscall-entry scratch spills at %gs:72/%gs:80, current-task, rq state)
+# reaches RAM through the kernel-private map. %gs is dereferenced as the
+# FIRST instruction of every syscall entry, so reaching userland already
+# exercises it; this marker proves the base was flipped, not left on PML4[0].
+if ! grep -a -F -q "[percpu] gs.base via page_offset" "$LOG"; then
+    echo "----- percpu-flip boot-log excerpt -----" >&2
+    grep -a -E "\[percpu\]" "$LOG" >&2 || true
+    fail "per-CPU %gs base was not flipped onto the page_offset alias (Brick B)"
+fi
+pass "per-CPU %gs base reaches RAM through the page_offset alias (KPTI Brick B)"
+
 # (C) Boot reached userland — the KPTI scaffold did not regress the boot.
 if ! grep -a -E -q "hamsh\\\$" "$LOG"; then
     echo "[test_kpti] INCONCLUSIVE: boot did not reach a hamsh prompt" \
