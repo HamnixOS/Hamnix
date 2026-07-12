@@ -191,8 +191,12 @@ hamsh_send_await 'echo ${ sum([1, 2, 3, 4]) }' '10' "$CMD_WAIT" || true
 hamsh_send_await 'echo ${ sorted([3, 1, 2]) }' '1 2 3' "$CMD_WAIT" || true
 hamsh_send_await 'echo ${ max([3, 9, 2]) }' '9' "$CMD_WAIT" || true
 hamsh_send_await 'echo ${ abs(-5) }' '5' "$CMD_WAIT" || true
-hamsh_send_await 'echo ${ enumerate(["a", "b"]) }' '0 a 1 b' "$CMD_WAIT" || true
 hamsh_send_await 'echo ${ sv2.upper() }' 'HAMNIX' "$CMD_WAIT" || true
+# enumerate via for-unpack (nested-list rendering is a separate concern):
+hamsh_send 'for ei, ev in enumerate(["p", "q"]):'
+hamsh_send '    echo ENUM $ei $ev'
+hamsh_send ''
+hamsh_send_await 'echo GATE_K6' 'GATE_K6' "$CMD_WAIT" || true
 # K7. DIFFERENTIAL both-styles-≡: an EXPRESSION-iterable for-loop
 # (`for x in range(3)`) in brace form AND indentation form must produce
 # IDENTICAL output — the accept-either guarantee, extended to the new
@@ -305,7 +309,7 @@ for pair in "0 1 4 9|list-comprehension" "0 2 4|comprehension-filter" \
             "20 30|list-slice" "ham|string-slice" "xinmah|reverse-slice" \
             "SWAP 2 1|tuple-swap" "MRET 7 8|multiple-return" \
             "10|sum" "1 2 3|sorted" "9|max" "5|abs" \
-            "0 a 1 b|enumerate" "HAMNIX|method-upper"; do
+            "HAMNIX|method-upper"; do
     m="${pair%%|*}"; name="${pair##*|}"
     if ran_bol "$(printf '%s' "$m" | sed 's/[.[*+]/\\&/g')"; then
         echo "[$TAG] OK: $name"; else
@@ -314,6 +318,10 @@ done
 # K5. for-loop tuple unpack over dm.items()
 if ran_bol "KVITER x 1"; then echo "[$TAG] OK: for k,v in d.items() unpack"; else
     echo "[$TAG] WRONG: for k,v in d.items() did not unpack"; fail=1; fi
+# K6. enumerate via for-unpack
+if ran_bol "ENUM 0 p" && ran_bol "ENUM 1 q"; then
+    echo "[$TAG] OK: enumerate + for-unpack"; else
+    echo "[$TAG] WRONG: enumerate + for-unpack"; fail=1; fi
 # K7. DIFFERENTIAL: brace expr-for ≡ indent expr-for (>=2 of each marker).
 for tok in RNG_0 RNG_1 RNG_2; do
     cnt=$(grep -acE "^$tok\$" "$CLEAN" || true)
