@@ -126,6 +126,79 @@ else
     echo "[hb-svg] FAIL svg_sniff mis-accepted non-SVG"; cat "$GDUMP"; fail=1
 fi
 
+# ---- elliptical arcs (A/a), smooth curves (S/T), rounded rect (rx/ry) -------
+# hambrowse_svg_arcs.svg packs one of each real-icon feature into a 96x64 board:
+#   * a GREEN rounded <rect rx=10 ry=10> at (4,4,40,24) — its quarter-ellipse
+#     corners cut the extreme corner pixel to TRANSPARENT while the centre is
+#     solid green;
+#   * a NAVY square <rect> at (4,36,40,24) — identical box, square corners, so
+#     its extreme corner pixel IS filled: the corner contrast proves rx/ry;
+#   * a RED elliptical-arc pie (<path ... A 18 18 0 0 1 ...>) — interior filled,
+#     the far bounding-box corner beyond the radius stays empty (proves it is a
+#     curve, not a square);
+#   * an ORANGE smooth-cubic S wave (<path ... C ... S ...>) stroked.
+FARC="tests/fixtures/hambrowse_svg_arcs.svg"
+FARC2="tests/fixtures/hambrowse_svg_arcs2.svg"
+for f in "$FARC" "$FARC2"; do
+    [ -s "$f" ] || { echo "[hb-svg] FAIL: missing fixture $f"; exit 1; }
+done
+ADUMP="$OUT/svg_probe_arcs.txt"
+"$PROBE" "$FARC" \
+    24 16  5 5  24 48  5 47  76 22  90 36  74 52 2>&1 >"$ADUMP"
+
+adump_field() { grep -E "^PIX $1 $2 " "$ADUMP" | head -1 | awk '{print $4,$5,$6,$7}'; }
+assert_arc() {  # $1=x $2=y $3=r $4=g $5=b $6=a $7=msg
+    read -r gr gg gb ga <<<"$(adump_field "$1" "$2")"
+    if [ "$gr" = "$3" ] && [ "$gg" = "$4" ] && [ "$gb" = "$5" ] && [ "$ga" = "$6" ]; then
+        echo "[hb-svg] PASS $7 ($gr,$gg,$gb,a$ga)"
+    else
+        echo "[hb-svg] FAIL $7 (got ${gr:-?},${gg:-?},${gb:-?},a${ga:-?} want $3,$4,$5,a$6)"; fail=1
+    fi
+}
+if grep -Eq '^DIM 96 64$' "$ADUMP"; then
+    echo "[hb-svg] PASS arcs SVG renders to 96x64"
+else
+    echo "[hb-svg] FAIL arcs SVG dimensions"; cat "$ADUMP"; fail=1
+fi
+assert_arc 24 16 40 200 60 255 "rounded <rect rx/ry> centre solid green"
+assert_arc 5  5  0  0   0  0   "rounded-rect corner cut away (transparent)"
+assert_arc 24 48 16 48 160 255 "square <rect> centre solid navy"
+assert_arc 5  47 16 48 160 255 "square-rect corner FILLED (rx/ry contrast)"
+assert_arc 76 22 220 40 40 255 "elliptical-arc pie interior filled red"
+assert_arc 90 36 0  0  0  0    "arc pie far corner empty (curve, not square)"
+assert_arc 74 52 255 165 0 255 "smooth-cubic S stroke on the curve (orange)"
+
+# arcs2: RELATIVE arcs with PACKED flags ("a12 12 0 016 12") + smooth-quad T.
+A2DUMP="$OUT/svg_probe_arcs2.txt"
+"$PROBE" "$FARC2" 32 20  16 32  36 48 2>&1 >"$A2DUMP"
+adump2_field() { grep -E "^PIX $1 $2 " "$A2DUMP" | head -1 | awk '{print $4,$5,$6,$7}'; }
+assert_arc2() {
+    read -r gr gg gb ga <<<"$(adump2_field "$1" "$2")"
+    if [ "$gr" = "$3" ] && [ "$gg" = "$4" ] && [ "$gb" = "$5" ] && [ "$ga" = "$6" ]; then
+        echo "[hb-svg] PASS $7 ($gr,$gg,$gb,a$ga)"
+    else
+        echo "[hb-svg] FAIL $7 (got ${gr:-?},${gg:-?},${gb:-?},a${ga:-?} want $3,$4,$5,a$6)"; fail=1
+    fi
+}
+if grep -Eq '^RC 0$' "$A2DUMP"; then
+    echo "[hb-svg] PASS relative packed-flag arcs decode (no crash)"
+else
+    echo "[hb-svg] FAIL relative packed-flag arcs failed to decode"; cat "$A2DUMP"; fail=1
+fi
+assert_arc2 32 20 112 48 192 255 "capsule of relative packed-flag arcs filled purple"
+assert_arc2 16 32 0 128 128 255 "smooth-quad T first hump (teal stroke, up)"
+assert_arc2 36 48 0 128 128 242 "smooth-quad T reflected hump (teal stroke, down)"
+
+# render the arcs board to a viewable PNG (build/host/gfx_svg_arcs.png)
+APPM="$OUT/gfx_svg_arcs.ppm"
+APNG="$OUT/gfx_svg_arcs.png"
+"$PROBE" "$FARC" --ppm "$APPM" 6 >/dev/null 2>&1
+if python3 scripts/ppm_to_png.py "$APPM" "$APNG" 2>"$OUT/svg_arcs_png.log"; then
+    echo "[hb-svg] PASS rendered $APNG ($(file -b "$APNG" 2>/dev/null))"
+else
+    echo "[hb-svg] FAIL arcs png conversion"; cat "$OUT/svg_arcs_png.log"; fail=1
+fi
+
 # ---- full browser render: layout + blit ----
 FIX="tests/fixtures/hambrowse_svg.html"
 BDUMP2="$OUT/svg_dump.txt"

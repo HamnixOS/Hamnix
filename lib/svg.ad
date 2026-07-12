@@ -12,13 +12,14 @@
 #
 # Implements, from scratch:
 #   1. a tiny XML tag scanner — the root <svg> (width/height/viewBox), and the
-#      shape elements <rect> <circle> <ellipse> <line> <polygon> <polyline>
-#      <path>; comments/CDATA/<?...?> skipped; one-level-per-node <g fill=...>
-#      inheritance via a small stack;
+#      shape elements <rect> (incl. rx/ry rounded corners) <circle> <ellipse>
+#      <line> <polygon> <polyline> <path>; comments/CDATA/<?...?> skipped;
+#      one-level-per-node <g fill=...> inheritance via a small stack;
 #   2. presentation attributes — fill (named + #rgb/#rrggbb + none + currentColor),
 #      fill-opacity, stroke, stroke-width; a fill-rule of nonzero / evenodd;
-#   3. a path mini-language — M m L l H h V v C c Q q Z z (absolute + relative),
-#      cubic/quadratic beziers flattened to line segments;
+#   3. a path mini-language — M m L l H h V v C c S s Q q T t A a Z z (absolute +
+#      relative); cubic/quadratic (incl. smooth S/T reflected) beziers and
+#      elliptical arcs flattened to line segments (integer Q16 trig, no float);
 #   4. an anti-aliased scanline polygon fill — SS vertical sub-scanlines plus
 #      analytic horizontal coverage, nonzero OR even-odd winding, straight-alpha
 #      "over" compositing into the RGBA buffer. Basic stroking draws each segment
@@ -34,8 +35,9 @@
 #
 # GAPS (noted, skipped — never crash): gradients / patterns, filters, <text>,
 # <image>, <use>/<defs>/<symbol> references, CSS/<style>, transform= (beyond the
-# viewBox mapping), rect rx/ry rounded corners (drawn square), path arcs (A/a)
-# and smooth curves (S/s T/t), and exponent-form numbers (mantissa only).
+# viewBox mapping), and exponent-form numbers (mantissa only). Arc/rounded-rect
+# geometry uses nearest-degree flattening (~1 deg segments) — smooth at icon
+# sizes, not a high-DPI curve.
 
 # ---- capacities (BSS) ----------------------------------------------
 SVG_MAX_DIM:  uint64 = 512               # max raster width or height
@@ -151,6 +153,64 @@ def _isqrt(v: int64) -> int64:
     return x
 
 
+# ---- integer trig (Q16) via incremental 1-degree rotation ----------
+# No table, no float: a unit vector is rotated one degree at a time using the
+# fixed Q16 rotation constants cos(1 deg)/sin(1 deg). Determinant ~0.99999956,
+# so 360 steps drift the magnitude < 0.01% — plenty for arc flattening. Every
+# divide-by-65536 here has a possibly-negative numerator, so it MUST go through
+# _sdiv (a constant power-of-two divide would emit a logical shift — task #41).
+COS1:   int64 = 65526                      # round(cos(1 deg) * 65536)
+SIN1:   int64 = 1144                       # round(sin(1 deg) * 65536)
+trig_c: int64 = 65536                      # scratch: cos of the last angle (Q16)
+trig_s: int64 = 0                          # scratch: sin of the last angle (Q16)
+
+# cos/sin of `deg` degrees (Q16) -> trig_c / trig_s. `deg` is any integer.
+def _cos_sin(deg: int64):
+    d: int64 = deg
+    while d < 0:
+        d = d + 360
+    while d >= 360:
+        d = d - 360
+    c: int64 = 65536
+    s: int64 = 0
+    k: int64 = 0
+    while k < d:
+        nc: int64 = _sdiv(c * COS1 - s * SIN1, 65536)
+        ns: int64 = _sdiv(s * COS1 + c * SIN1, 65536)
+        c = nc
+        s = ns
+        k = k + 1
+    trig_c = c
+    trig_s = s
+
+# Nearest-degree angle (0..359) of the vector (x,y), y-down like device space.
+# Leaves trig_c / trig_s at the winning angle's unit vector (Q16). Direction-
+# only: it maximizes the dot product with each candidate unit vector.
+def _atan2_deg(y: int64, x: int64) -> int64:
+    c: int64 = 65536
+    s: int64 = 0
+    bestdot: int64 = 0
+    bestd: int64 = 0
+    bestc: int64 = 65536
+    bests: int64 = 0
+    d: int64 = 0
+    while d < 360:
+        dot: int64 = x * c + y * s
+        if d == 0 or dot > bestdot:
+            bestdot = dot
+            bestd = d
+            bestc = c
+            bests = s
+        nc: int64 = _sdiv(c * COS1 - s * SIN1, 65536)
+        ns: int64 = _sdiv(s * COS1 + c * SIN1, 65536)
+        c = nc
+        s = ns
+        d = d + 1
+    trig_c = bestc
+    trig_s = bests
+    return bestd
+
+
 # ---- streaming number reader over svg_src[pcur..limit) -------------
 def _skip_seps(limit: uint64):
     while pcur < limit:
@@ -213,6 +273,21 @@ def _rd_num(limit: uint64) -> int64:
         q8 = 0 - q8
     return q8
 
+# Read a single 0/1 arc flag, advancing pcur. SVG lets large-arc/sweep flags be
+# packed with no separators (e.g. "a5 5 0 016 6" -> 0,1,6), so a flag is exactly
+# one '0' or '1' char, NOT a full number. Malformed -> 0 (fail-clean).
+def _rd_flag(limit: uint64) -> int64:
+    _skip_seps(limit)
+    if pcur < limit:
+        c: uint8 = svg_src[pcur]
+        if c == 48:
+            pcur = pcur + 1
+            return 0
+        if c == 49:
+            pcur = pcur + 1
+            return 1
+    return 0
+
 
 # ---- user Q8 -> device Q8 via the viewBox mapping ------------------
 def _tx(uf: int64) -> int32:
@@ -251,6 +326,131 @@ def _add_dev(dx: int32, dy: int32):
 
 def _add_user(ux: int64, uy: int64):
     _add_dev(_tx(ux), _ty(uy))
+
+
+# ---- elliptical arc flattening -------------------------------------
+# Emit a 90-degree quarter-ellipse (centre ccx,ccy; radii rx,ry, user Q8) as a
+# fan of points starting at angle a0 degrees, sweeping +90. Used for rounded
+# rect corners. cos/sin are Q16, so the /65536 keeps user Q8.
+def _arc_quarter(ccx: int64, ccy: int64, rx: int64, ry: int64, a0: int64):
+    a: int64 = a0
+    aend: int64 = a0 + 90
+    while a <= aend:
+        _cos_sin(a)
+        px: int64 = ccx + _sdiv(rx * trig_c, 65536)
+        py: int64 = ccy + _sdiv(ry * trig_s, 65536)
+        _add_user(px, py)
+        a = a + 6
+
+# Flatten an SVG elliptical-arc path segment from the current pen (x1,y1) to
+# (x2,y2) with radii rx,ry (user Q8), x-axis rotation xrotdeg (degrees), and the
+# large-arc / sweep flags — appending the intermediate + end points (the pen's
+# start point is already in the subpath). Endpoint -> centre parameterization
+# per SVG spec F.6.5, then a per-degree flatten. Integer-only; the ratio math is
+# done in reduced (user-unit) magnitudes to stay well inside int64, and every
+# power-of-two divide with a signed numerator goes through _sdiv.
+def _arc_to(x1: int64, y1: int64, rx: int64, ry: int64, xrotdeg: int64,
+            large: int64, sweep: int64, x2: int64, y2: int64):
+    if x1 == x2 and y1 == y2:
+        return                                     # coincident -> omit (spec)
+    if rx < 0:
+        rx = 0 - rx
+    if ry < 0:
+        ry = 0 - ry
+    if rx == 0 or ry == 0:
+        _add_user(x2, y2)                          # degenerate -> straight line
+        return
+    _cos_sin(xrotdeg)
+    cosphi: int64 = trig_c                         # Q16
+    sinphi: int64 = trig_s
+    # F.6.5.1: (x1',y1') = R(-phi) * ((p1 - p2)/2)
+    dx2: int64 = _sdiv(x1 - x2, 2)                 # Q8
+    dy2: int64 = _sdiv(y1 - y2, 2)
+    x1p: int64 = _sdiv(cosphi * dx2 + sinphi * dy2, 65536)
+    y1p: int64 = _sdiv(cosphi * dy2 - sinphi * dx2, 65536)
+    # F.6.6.2: correct out-of-range radii (reduced units so squares can't wrap)
+    ax: int64 = _sdiv(x1p, 256)
+    ay: int64 = _sdiv(y1p, 256)
+    arx: int64 = _sdiv(rx, 256)
+    ary: int64 = _sdiv(ry, 256)
+    if arx == 0:
+        arx = 1
+    if ary == 0:
+        ary = 1
+    lam_num: int64 = ax * ax * ary * ary + ay * ay * arx * arx
+    lam_den: int64 = arx * arx * ary * ary
+    if lam_den > 0 and lam_num > lam_den:
+        srn: int64 = _isqrt(lam_num)
+        srd: int64 = _isqrt(lam_den)
+        if srd > 0:
+            rx = rx * srn / srd                    # positive operands: safe
+            ry = ry * srn / srd
+    # F.6.5.2: centre' (coef in Q8 to keep sub-unit precision)
+    brx: int64 = _sdiv(rx, 256)
+    bry: int64 = _sdiv(ry, 256)
+    if brx == 0:
+        brx = 1
+    if bry == 0:
+        bry = 1
+    nN: int64 = brx * brx * bry * bry - brx * brx * ay * ay - bry * bry * ax * ax
+    dD: int64 = brx * brx * ay * ay + bry * bry * ax * ax
+    if nN < 0:
+        nN = 0
+    coefq8: int64 = 0
+    if dD > 0:
+        coefq8 = _isqrt(_sdiv(nN * 65536, dD))     # sqrt(nN/dD) * 256
+    sgn: int64 = 1
+    if large == sweep:
+        sgn = -1                                   # sign = (fA != fS) ? + : -
+    coef: int64 = sgn * coefq8
+    cxp: int64 = _sdiv(coef * _sdiv(rx * y1p, ry), 256)
+    cyp: int64 = 0 - _sdiv(coef * _sdiv(ry * x1p, rx), 256)
+    # F.6.5.3: centre in user space
+    hx: int64 = _sdiv(x1 + x2, 2)
+    hy: int64 = _sdiv(y1 + y2, 2)
+    ccx: int64 = _sdiv(cosphi * cxp - sinphi * cyp, 65536) + hx
+    ccy: int64 = _sdiv(sinphi * cxp + cosphi * cyp, 65536) + hy
+    # F.6.5.5/6: start angle theta1 and sweep delta (degrees)
+    ux: int64 = _sdiv((x1p - cxp) * 1024, rx)
+    uy: int64 = _sdiv((y1p - cyp) * 1024, ry)
+    vx: int64 = _sdiv((0 - x1p - cxp) * 1024, rx)
+    vy: int64 = _sdiv((0 - y1p - cyp) * 1024, ry)
+    theta1: int64 = _atan2_deg(uy, ux)
+    sc: int64 = trig_c                             # cos/sin(theta1), Q16
+    ss: int64 = trig_s
+    theta2: int64 = _atan2_deg(vy, vx)
+    delta: int64 = theta2 - theta1
+    if sweep == 0 and delta > 0:
+        delta = delta - 360
+    if sweep != 0 and delta < 0:
+        delta = delta + 360
+    # flatten one degree at a time from theta1 through theta1+delta
+    ec: int64 = sc
+    es: int64 = ss
+    ndir: int64 = 1
+    nsteps: int64 = delta
+    if delta < 0:
+        ndir = -1
+        nsteps = 0 - delta
+    k: int64 = 1
+    while k <= nsteps:
+        if ndir > 0:
+            nc: int64 = _sdiv(ec * COS1 - es * SIN1, 65536)
+            ns: int64 = _sdiv(es * COS1 + ec * SIN1, 65536)
+            ec = nc
+            es = ns
+        else:
+            nc2: int64 = _sdiv(ec * COS1 + es * SIN1, 65536)
+            ns2: int64 = _sdiv(es * COS1 - ec * SIN1, 65536)
+            ec = nc2
+            es = ns2
+        pxe: int64 = _sdiv(rx * ec, 65536)         # Q8, ellipse frame
+        pye: int64 = _sdiv(ry * es, 65536)
+        ppx: int64 = ccx + _sdiv(cosphi * pxe - sinphi * pye, 65536)
+        ppy: int64 = ccy + _sdiv(sinphi * pxe + cosphi * pye, 65536)
+        _add_user(ppx, ppy)
+        k = k + 1
+    _add_user(x2, y2)                              # snap exact endpoint
 
 
 # ---- edge builders + AA scanline fill ------------------------------
@@ -716,10 +916,13 @@ def _resolve_style(start: uint64, end: uint64):
     if _find_attr(start, end, cast[Ptr[uint8]]("stroke-width")) != 0:
         pcur = av_off
         w: int64 = _rd_num(av_off + av_len)         # Q8 user units
-        # scale user width -> device using the x mapping magnitude
-        dw: int64 = w * cast[int64](svg_w) * 256 / vwf / 256
-        if dw < 1:
-            dw = 1
+        # scale user width -> DEVICE Q8 (the same fixed point as stroke_w's 256
+        # default and _stroke_quad's half-width): device_px = user * svg_w*256/vwf
+        # and one more *256 keeps it Q8. (An earlier extra /256 left it in whole
+        # device pixels, so every explicit stroke-width drew ~256x too thin.)
+        dw: int64 = w * cast[int64](svg_w) * 256 / vwf
+        if dw < 64:                                 # floor ~0.25px so it shows
+            dw = 64
         stroke_w = cast[int32](dw)
 
 def _paint_current():
@@ -739,12 +942,46 @@ def _shape_rect(start: uint64, end: uint64):
     h: int64 = _attr_num(start, end, cast[Ptr[uint8]]("height"), 0)
     if w <= 0 or h <= 0:
         return
+    # rx/ry rounded corners (-1 sentinel = attribute absent). One given implies
+    # the other; each is clamped to half the side. Anything non-positive falls
+    # back to square corners.
+    rxq: int64 = _attr_num(start, end, cast[Ptr[uint8]]("rx"), -1)
+    ryq: int64 = _attr_num(start, end, cast[Ptr[uint8]]("ry"), -1)
+    rounded: int32 = 0
+    if rxq >= 0 or ryq >= 0:
+        if rxq < 0:
+            rxq = ryq
+        if ryq < 0:
+            ryq = rxq
+        if rxq < 0:
+            rxq = 0
+        if ryq < 0:
+            ryq = 0
+        hw: int64 = _sdiv(w, 2)
+        hh: int64 = _sdiv(h, 2)
+        if rxq > hw:
+            rxq = hw
+        if ryq > hh:
+            ryq = hh
+        if rxq > 0 and ryq > 0:
+            rounded = 1
     _pts_reset()
     _begin_sub()
-    _add_user(x, y)
-    _add_user(x + w, y)
-    _add_user(x + w, y + h)
-    _add_user(x, y + h)
+    if rounded != 0:
+        _add_user(x + rxq, y)
+        _add_user(x + w - rxq, y)
+        _arc_quarter(x + w - rxq, y + ryq, rxq, ryq, 270)      # top-right
+        _add_user(x + w, y + h - ryq)
+        _arc_quarter(x + w - rxq, y + h - ryq, rxq, ryq, 0)    # bottom-right
+        _add_user(x + rxq, y + h)
+        _arc_quarter(x + rxq, y + h - ryq, rxq, ryq, 90)       # bottom-left
+        _add_user(x, y + ryq)
+        _arc_quarter(x + rxq, y + ryq, rxq, ryq, 180)          # top-left
+    else:
+        _add_user(x, y)
+        _add_user(x + w, y)
+        _add_user(x + w, y + h)
+        _add_user(x, y + h)
     _end_sub(1)
 
 # 48-gon approximation of an ellipse via incremental Q10 rotation.
@@ -840,6 +1077,9 @@ def _shape_path(start: uint64, end: uint64):
     cy: int64 = 0
     sx: int64 = 0
     sy: int64 = 0
+    pcx: int64 = 0                                  # previous control point (Q8)
+    pcy: int64 = 0
+    last_kind: int32 = 0                            # 0 none, 1 cubic C/S, 2 quad Q/T
     open_sub: int32 = 0
     guard: uint64 = 0
     while pcur < lim and guard < 200000:
@@ -887,6 +1127,7 @@ def _shape_path(start: uint64, end: uint64):
                     cx = ax
                     cy = ay
                 _add_user(cx, cy)
+            last_kind = 0
         elif cl == 108:                            # L/l
             pcur = pcur + 1
             while _peek_num(lim) != 0:
@@ -901,6 +1142,7 @@ def _shape_path(start: uint64, end: uint64):
                     cx = ax2
                     cy = ay2
                 _add_user(cx, cy)
+            last_kind = 0
         elif cl == 104:                            # H/h
             pcur = pcur + 1
             while _peek_num(lim) != 0:
@@ -910,6 +1152,7 @@ def _shape_path(start: uint64, end: uint64):
                 else:
                     cx = hx
                 _add_user(cx, cy)
+            last_kind = 0
         elif cl == 118:                            # V/v
             pcur = pcur + 1
             while _peek_num(lim) != 0:
@@ -919,6 +1162,7 @@ def _shape_path(start: uint64, end: uint64):
                 else:
                     cy = vy
                 _add_user(cx, cy)
+            last_kind = 0
         elif cl == 99:                             # C/c
             pcur = pcur + 1
             while _peek_num(lim) != 0:
@@ -936,8 +1180,11 @@ def _shape_path(start: uint64, end: uint64):
                     x3 = cx + x3
                     y3 = cy + y3
                 _bez3(cx, cy, x1, y1, x2, y2, x3, y3)
+                pcx = x2
+                pcy = y2
                 cx = x3
                 cy = y3
+                last_kind = 1
         elif cl == 113:                            # Q/q
             pcur = pcur + 1
             while _peek_num(lim) != 0:
@@ -951,8 +1198,70 @@ def _shape_path(start: uint64, end: uint64):
                     qx2 = cx + qx2
                     qy2 = cy + qy2
                 _bez2(cx, cy, qx1, qy1, qx2, qy2)
+                pcx = qx1
+                pcy = qy1
                 cx = qx2
                 cy = qy2
+                last_kind = 2
+        elif cl == 115:                            # S/s (smooth cubic)
+            pcur = pcur + 1
+            while _peek_num(lim) != 0:
+                srx1: int64 = cx
+                sry1: int64 = cy
+                if last_kind == 1:                 # reflect prev cubic control
+                    srx1 = 2 * cx - pcx
+                    sry1 = 2 * cy - pcy
+                sx2: int64 = _rd_num(lim)
+                sy2: int64 = _rd_num(lim)
+                sx3: int64 = _rd_num(lim)
+                sy3: int64 = _rd_num(lim)
+                if rel != 0:
+                    sx2 = cx + sx2
+                    sy2 = cy + sy2
+                    sx3 = cx + sx3
+                    sy3 = cy + sy3
+                _bez3(cx, cy, srx1, sry1, sx2, sy2, sx3, sy3)
+                pcx = sx2
+                pcy = sy2
+                cx = sx3
+                cy = sy3
+                last_kind = 1
+        elif cl == 116:                            # T/t (smooth quadratic)
+            pcur = pcur + 1
+            while _peek_num(lim) != 0:
+                tqx: int64 = cx
+                tqy: int64 = cy
+                if last_kind == 2:                 # reflect prev quad control
+                    tqx = 2 * cx - pcx
+                    tqy = 2 * cy - pcy
+                tx: int64 = _rd_num(lim)
+                ty: int64 = _rd_num(lim)
+                if rel != 0:
+                    tx = cx + tx
+                    ty = cy + ty
+                _bez2(cx, cy, tqx, tqy, tx, ty)
+                pcx = tqx
+                pcy = tqy
+                cx = tx
+                cy = ty
+                last_kind = 2
+        elif cl == 97:                             # A/a (elliptical arc)
+            pcur = pcur + 1
+            while _peek_num(lim) != 0:
+                arx: int64 = _rd_num(lim)
+                ary: int64 = _rd_num(lim)
+                axr: int64 = _sdiv(_rd_num(lim), 256)   # Q8 -> degrees
+                alarge: int64 = _rd_flag(lim)
+                asweep: int64 = _rd_flag(lim)
+                aex: int64 = _rd_num(lim)
+                aey: int64 = _rd_num(lim)
+                if rel != 0:
+                    aex = cx + aex
+                    aey = cy + aey
+                _arc_to(cx, cy, arx, ary, axr, alarge, asweep, aex, aey)
+                cx = aex
+                cy = aey
+            last_kind = 0
         elif cl == 122:                            # Z/z
             pcur = pcur + 1
             if open_sub != 0:
@@ -960,8 +1269,9 @@ def _shape_path(start: uint64, end: uint64):
                 open_sub = 0
             cx = sx
             cy = sy
+            last_kind = 0
         else:
-            # unsupported command (A/a, S/s, T/t, ...) -> stop cleanly
+            # truly unknown command -> stop cleanly
             break
     if open_sub != 0:
         _end_sub(0)
