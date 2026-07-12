@@ -28,6 +28,9 @@
 
 # Reuse the Plan-9-shaped /net dialing helpers from user/net9.ad.
 from user.net9 import net_dial, net_dial_tls
+# Chunked transfer-decoding lives in its own pure, I/O-free module so its
+# core is host-unit-testable without the /net stack (lib/httpchunk.ad).
+from lib.httpchunk import http_dechunk
 
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
@@ -50,6 +53,21 @@ h9_port:     int64 = 80
 h9_host:     Array[256, uint8]       # NUL-terminated hostname
 h9_path:     Array[1536, uint8]      # request path (always starts '/')
 h9_req:      Array[2048, uint8]      # composed request line + headers
+
+# -- redirect-following state (module-global, single-threaded) --------
+#
+# http_get follows 3xx redirects by re-parsing/reconnecting up to
+# H9_MAX_HOPS times. These buffers hold the URL currently being fetched,
+# a redirect's raw Location value, the resolved next URL, and the FINAL
+# (effective) URL — the base a caller must resolve links against. The
+# visited list is a flat 6*1600 buffer used to break redirect loops.
+H9_MAX_HOPS:      int32  = 6
+h9_url_work:      Array[1600, uint8]   # URL currently being fetched
+h9_loc:           Array[1600, uint8]   # raw Location header value
+h9_next_url:      Array[1600, uint8]   # resolved redirect target
+h9_effective_url: Array[1600, uint8]   # final URL after redirects
+h9_visited:       Array[9600, uint8]   # 6 slots * 1600 bytes
+h9_nvisited:      int32  = 0
 
 
 def _h9_strlen(s: Ptr[uint8]) -> uint64:
@@ -479,24 +497,150 @@ def http_find_header(dst: Ptr[uint8], total: uint64,
     return 0
 
 
-# -- the full request/response loop -----------------------------------
-#
-# http_get parses `url`, connects, sends the GET, drains the response
-# into dst (capped at dst_cap), and reports the HTTP status + body
-# span. Returns 0 on a completed transport (even for a 4xx/5xx status,
-# which the caller inspects via *out_status), or a negative transport /
-# parse error:
-#   -1  malformed URL
-#   -2  connect / TLS failed
-#   -3  short write sending the request
-#   -4  read error on the response
-#   -5  empty / truncated / non-HTTP response
-#   -6  response exceeds dst_cap
-#   -7  Transfer-Encoding: chunked (unsupported — fail clean)
+# -- URL helpers for redirect following -------------------------------
 
-def http_get(url: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
-             out_status: Ptr[int64], out_body_off: Ptr[uint64],
-             out_body_len: Ptr[uint64]) -> int64:
+def _h9_url_copy(dst: Ptr[uint8], src: Ptr[uint8]):
+    i: uint64 = 0
+    while src[i] != 0 and i + 1 < 1600:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+
+
+def _h9_url_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] == b[i]:
+        return 1
+    return 0
+
+
+def _h9_starts(s: Ptr[uint8], pfx: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while pfx[i] != 0:
+        if s[i] != pfx[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _h9_url_is_https(u: Ptr[uint8]) -> int32:
+    return _h9_starts(u, "https://")
+
+
+def _h9_url_has_scheme(u: Ptr[uint8]) -> int32:
+    if _h9_starts(u, "http://") != 0:
+        return 1
+    if _h9_starts(u, "https://") != 0:
+        return 1
+    return 0
+
+
+# Resolve a redirect `loc` (relative or absolute) against `base` into
+# `out` (a >=1600-byte buffer). Absolute (scheme://) locations pass
+# through; a '/'-rooted location replaces base's path; anything else is
+# resolved against base's directory (up to and including its last '/').
+def _h9_resolve_redirect(base: Ptr[uint8], loc: Ptr[uint8],
+                         out: Ptr[uint8]):
+    if _h9_url_has_scheme(loc) != 0:
+        _h9_url_copy(out, loc)
+        return
+    # Find base's authority end: the first '/' after "://", else end.
+    i: uint64 = 0
+    auth_end: uint64 = 0
+    while base[i] != 0:
+        if base[i] == 58 and base[i + 1] == 47 and base[i + 2] == 47:
+            break
+        i = i + 1
+    if base[i] == 0:
+        auth_end = 0
+    else:
+        j: uint64 = i + 3
+        while base[j] != 0 and base[j] != 47:
+            j = j + 1
+        auth_end = j
+    o: uint64 = 0
+    # Copy the "scheme://authority" prefix.
+    k: uint64 = 0
+    while k < auth_end and o + 1 < 1600:
+        out[o] = base[k]
+        o = o + 1
+        k = k + 1
+    if loc[0] == 47:
+        # '/'-rooted: authority + loc (loc already begins with '/').
+        m: uint64 = 0
+        while loc[m] != 0 and o + 1 < 1600:
+            out[o] = loc[m]
+            o = o + 1
+            m = m + 1
+        out[o] = 0
+        return
+    # Relative: append base's directory (authority..last '/') then loc.
+    last_slash: uint64 = auth_end
+    have_slash: int32 = 0
+    s: uint64 = auth_end
+    while base[s] != 0:
+        if base[s] == 47:
+            last_slash = s
+            have_slash = 1
+        s = s + 1
+    if have_slash != 0:
+        d: uint64 = auth_end
+        while d <= last_slash and o + 1 < 1600:
+            out[o] = base[d]
+            o = o + 1
+            d = d + 1
+    else:
+        if o + 1 < 1600:
+            out[o] = 47                                  # '/'
+            o = o + 1
+    m2: uint64 = 0
+    while loc[m2] != 0 and o + 1 < 1600:
+        out[o] = loc[m2]
+        o = o + 1
+        m2 = m2 + 1
+    out[o] = 0
+
+
+def _h9_seen(u: Ptr[uint8]) -> int32:
+    i: int32 = 0
+    while i < h9_nvisited:
+        base: uint64 = cast[uint64](i) * 1600
+        if _h9_url_eq(&h9_visited[base], u) != 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _h9_remember(u: Ptr[uint8]):
+    if h9_nvisited >= H9_MAX_HOPS:
+        return
+    base: uint64 = cast[uint64](h9_nvisited) * 1600
+    _h9_url_copy(&h9_visited[base], u)
+    h9_nvisited = h9_nvisited + 1
+
+
+# The effective (final) URL after any redirects — a caller uses this as
+# the base for resolving relative links. Valid after http_get returns 0.
+def http_effective_url() -> Ptr[uint8]:
+    return &h9_effective_url[0]
+
+
+# -- one HTTP request/response transaction ----------------------------
+#
+# Parses `url`, connects, sends the GET, drains the response into dst
+# (capped at dst_cap), and reports the HTTP status + body span. A
+# chunked body is DECODED in place into a clean body. Returns 0 on a
+# completed transport (even for a 3xx/4xx/5xx status, which the caller
+# inspects via *out_status), or a negative transport/parse error (see
+# the http_get rc table).
+
+def _h9_fetch_once(url: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
+                   out_status: Ptr[int64], out_body_off: Ptr[uint64],
+                   out_body_len: Ptr[uint64]) -> int64:
     out_status[0] = 0
     out_body_off[0] = 0
     out_body_len[0] = 0
@@ -554,12 +698,86 @@ def http_get(url: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
     if found == 0:
         return -5
 
-    # Chunked bodies would leak chunk framing into the body — refuse
-    # rather than hand back garbage. (Content-Length responses, which
-    # 255.one and the hpm fixtures use, are the supported shape.)
+    # Chunked body: DECODE it in place (dst+bo -> dst+bo). http_dechunk
+    # is bounds-safe on attacker-controlled sizes; a malformed frame is
+    # a clean -7 rather than leaked framing.
     if _h9_expected_len(dst, total) == 0 and http_is_chunked(dst, total) != 0:
-        return -7
+        body: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](dst) + bo)
+        dec: Array[1, uint64]
+        dec[0] = 0
+        drc: int32 = http_dechunk(body, total - bo, body,
+                                  dst_cap - bo, &dec[0])
+        if drc < 0:
+            return -7
+        out_body_off[0] = bo
+        out_body_len[0] = dec[0]
+        return 0
 
     out_body_off[0] = bo
     out_body_len[0] = total - bo
     return 0
+
+
+# -- the full request/response loop (with redirect following) ---------
+#
+# http_get fetches `url`, transparently following up to H9_MAX_HOPS 3xx
+# redirects (with a Location header), and reports the FINAL response's
+# HTTP status + body span. It decodes chunked bodies. The effective
+# (final) URL is available via http_effective_url(). Returns 0 on a
+# completed transport (even for a 4xx/5xx status, which the caller
+# inspects via *out_status), or a negative transport/parse error:
+#   -1  malformed URL
+#   -2  connect / TLS failed
+#   -3  short write sending the request
+#   -4  read error on the response
+#   -5  empty / truncated / non-HTTP response
+#   -6  response exceeds dst_cap
+#   -7  chunked body malformed (decode failed)
+#   -8  too many redirect hops / redirect loop
+#   -9  redirect points at https:// (no TLS on the redirect path)
+
+def http_get(url: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
+             out_status: Ptr[int64], out_body_off: Ptr[uint64],
+             out_body_len: Ptr[uint64]) -> int64:
+    out_status[0] = 0
+    out_body_off[0] = 0
+    out_body_len[0] = 0
+
+    h9_nvisited = 0
+    _h9_url_copy(&h9_url_work[0], url)
+    _h9_url_copy(&h9_effective_url[0], url)
+
+    hop: int32 = 0
+    while hop < H9_MAX_HOPS:
+        if _h9_seen(&h9_url_work[0]) != 0:
+            return -8
+        _h9_remember(&h9_url_work[0])
+
+        rc: int64 = _h9_fetch_once(&h9_url_work[0], dst, dst_cap,
+                                   out_status, out_body_off, out_body_len)
+        if rc < 0:
+            return rc
+
+        status: int64 = out_status[0]
+        is_redirect: int32 = 0
+        if status >= 300 and status <= 399 and status != 304:
+            is_redirect = 1
+        if is_redirect == 0:
+            _h9_url_copy(&h9_effective_url[0], &h9_url_work[0])
+            return rc
+
+        # 3xx: need a Location to follow; absent -> treat as the final page.
+        if http_find_header(dst, out_body_off[0],
+                            "location", &h9_loc[0], 1600) == 0:
+            _h9_url_copy(&h9_effective_url[0], &h9_url_work[0])
+            return rc
+
+        _h9_resolve_redirect(&h9_url_work[0], &h9_loc[0], &h9_next_url[0])
+        if _h9_url_is_https(&h9_next_url[0]) != 0:
+            return -9                                    # no TLS on redirect
+        if _h9_seen(&h9_next_url[0]) != 0:
+            return -8                                    # redirect loop
+        _h9_url_copy(&h9_url_work[0], &h9_next_url[0])
+        hop = hop + 1
+
+    return -8
