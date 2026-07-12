@@ -853,7 +853,32 @@ if [ -s "$FFHOME/.ff-profile/prefs.js" ]; then echo "[FF-DIAG] prefs.js delivere
 # GPUProcessManager::EnsureGPUReady. If the last Gfx/Gp line before the all-threads
 # park names an unfinished init step, that is the deadlocked subsystem. sync keeps
 # each record on disk so the tail survives the timeout kill.
-export MOZ_LOG='Widget:5,WidgetWayland:5,Gfx:5,Gp:5,nsAppStartup:5,Process:5,IPCLauncher:5,GfxTest:5,ipc:4,IPDL:4,MessageChannel:4,Timeout:5,sync,timestamp'
+#
+# RENDER-THREAD DIRECT OBSERVATION (2026-07-12, #108). The "Gecko SW-WebRender
+# render-thread readiness wall" has, to date, only ever been INFERRED (from
+# thread-parking + Gfx/Gp) — the log set below NEVER carried a WebRender or
+# render-thread module, so the wall was never directly seen. That inference is
+# in fact contradicted by the repo's own most-recent specific evidence
+# (36e3f7b3, 2026-07-09): with layers.gpu-process.enabled=false the parent
+# main thread reaches real `nsWindow::Create() Toplevel` + `moz_container_init`
+# — i.e. it gets PAST render/GPU init; the readiness "wall" was an artifact of
+# gpu-process=TRUE blocking in EnsureGPUReady (now off in the profile). To turn
+# the last remaining inference into ground truth, light up the actual render
+# path so the trace NAMES whether the SWGL RenderThread starts, whether a
+# RenderCompositor(SWGL) is created for the toplevel, and whether any residual
+# GL/EGL probe fires (it must NOT — libGL/EGL/GBM are removed, §8a):
+#   RenderThread  — gfx/webrender_bindings/RenderThread.cpp (thread start +
+#                   per-window RenderCompositor create; the readiness signal
+#                   the main thread waits on lives here)
+#   GLContext / EGL — gfx/gl: MUST stay silent on the pure-shm path; ANY line
+#                   here means WebRender tried to open a GL/EGL context that
+#                   this GL-free ns cannot satisfy (the real "wall" if it
+#                   exists) — a decisive positive/negative for the brief's
+#                   "does WR demand a GL extension llvmpipe doesn't advertise?"
+#   WebRender / Compositor — bridge + compositor-manager bring-up.
+# Unknown module names are silently ignored by MOZ_LOG (no cost), so this set
+# is safe; the render modules only fire during bounded render init.
+export MOZ_LOG='Widget:5,WidgetWayland:5,Gfx:5,Gp:5,RenderThread:5,WebRender:5,Compositor:5,GLContext:5,EGL:5,nsAppStartup:5,Process:5,IPCLauncher:5,GfxTest:5,ipc:4,IPDL:4,MessageChannel:4,Timeout:5,sync,timestamp'
 # MOZ_LOG TO A FILE, NOT LIVE STDERR. The `firefox-esr` binary re-execs /
 # detaches its stdio very early (the launch pipe closed with only "[FF]
 # launching firefox-esr" streamed, then NOTHING — no MOZ_LOG, no
@@ -931,6 +956,15 @@ ff_dump_round() {
         # the main thread SpinEventLoopUntil-waits on are visible.
         grep -avE 'D/nsThread' "$f" 2>/dev/null \
             | while IFS= read -r l; do echo "[FF-SEM] $l"; done
+        # FOCUSED RENDER-PATH slice (#108): pull just the WebRender / render-
+        # thread / GL/EGL / window-map progression so the render stall point is
+        # readable at a glance amid the churn. A [FF-RENDER] line naming a
+        # GLContext/EGL open on the pure-shm path is the smoking gun for the
+        # "render thread demands GL" theory; its ABSENCE (only RenderThread +
+        # WebRender + nsWindow lines) confirms the SWGL/wl_shm path is taken and
+        # the remaining gap is downstream (xdg_surface/commit), per 36e3f7b3.
+        grep -aiE 'RenderThread|RenderCompositor|SWGL|WebRender|GLContext|/EGL|EGLLibrary|nsWindow|moz_container|xdg_surface|CreateRenderer|readiness|EnsureGPUReady' "$f" 2>/dev/null \
+            | while IFS= read -r l; do echo "[FF-RENDER] $l"; done
     done
 }
 r=1

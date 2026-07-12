@@ -235,6 +235,15 @@ echo "$TAG Firefox surface window id: ${WID:-<unknown>}"
 echo "$TAG --- Firefox / GTK / Wayland serial output ---"
 grep -aiE "firefox|mozilla|libxul|gtk|gdk|wayland|MOZ_|glib|Gdk|Gtk|assert|abort|error|fatal|segfault|not provide|failed" "$LOG" | tail -40 || true
 
+# RENDER-PATH slice (#108): surface the WebRender / render-thread / GL-EGL /
+# window-map progression captured by the baked ff-launch [FF-RENDER] dump (or
+# raw MOZ_LOG render modules). This is the ground-truth for the render-thread-
+# readiness question: a GLContext/EGL open on the pure-shm path is the smoking
+# gun; its absence (only RenderThread/WebRender/nsWindow lines) means SWGL took
+# the wl_shm path and the gap is downstream (xdg_surface/commit).
+echo "$TAG --- render-thread / WebRender / GL-EGL / window-map progression ---"
+grep -aiE "FF-RENDER|RenderThread|RenderCompositor|SWGL|WebRender|GLContext|EGLLibrary|nsWindow|moz_container|xdg_surface|CreateRenderer|EnsureGPUReady" "$LOG" | tail -40 || true
+
 # =====================================================================
 # LADDER RUNG (c): chrome RENDERS — screendump the DE window.
 # =====================================================================
