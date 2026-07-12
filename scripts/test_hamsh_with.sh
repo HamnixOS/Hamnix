@@ -55,6 +55,14 @@ hamsh_wait_boot "[hamsh:stage-07] loop-enter" "$BOOT_WAIT" \
 hamsh_sync 120 \
     || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
 
+# --- CONTROL: a plain builtin bind must show in a child cat's ns dump ---
+# Separates a real feature bug from a /proc/self/ns observability quirk.
+hamsh_send_await 'echo WITH_CTRL_IN' 'WITH_CTRL_IN' "$CMD_WAIT" || true
+hamsh_send 'bind /tmp /wm_ctrl'
+hamsh_send 'cat /proc/self/ns'
+hamsh_send_await 'echo WITH_CTRL_END' 'WITH_CTRL_END' "$CMD_WAIT" || true
+hamsh_send 'unmount /wm_ctrl'
+
 # --- A. brace-form round-trip -------------------------------------------
 hamsh_send_await 'echo WITH_A_IN' 'WITH_A_IN' "$CMD_WAIT" || true
 # The inside `cat /proc/self/ns` prints /wm_brace IFF the bind is live in
@@ -102,8 +110,17 @@ a_after=$(sed -n '/^WITH_A_OUT$/,/^WITH_A_END$/p' "$CLEAN")
 b_inside=$(sed -n '/^WITH_B_IN$/,/^WITH_B_OUT$/p' "$CLEAN")
 b_after=$(sed -n '/^WITH_B_OUT$/,/^WITH_B_END$/p' "$CLEAN")
 c_after=$(sed -n '/^WITH_C_IN$/,/^WITH_C_END$/p' "$CLEAN")
+ctrl_region=$(sed -n '/^WITH_CTRL_IN$/,/^WITH_CTRL_END$/p' "$CLEAN")
 
 fail=0
+
+# CONTROL diagnostic (does not fail the gate): proves whether a child
+# cat's /proc/self/ns can observe a shell bind at all.
+if echo "$ctrl_region" | grep -qE "^bind .*/wm_ctrl"; then
+    echo "[$TAG] CONTROL-OK: a builtin bind IS visible in a child cat's ns (observability works)"
+else
+    echo "[$TAG] CONTROL-MISS: even a builtin bind is NOT visible in a child cat's ns (observability quirk, not the feature)"
+fi
 
 # A `bind /from /to` line in the /proc/self/ns dump proves the graft is
 # live in the Pgrp — anchored `^bind ` so the TYPED command echo
