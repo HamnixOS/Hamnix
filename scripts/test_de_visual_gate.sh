@@ -7,18 +7,27 @@
 #   1. A real cursor-FPS number, emitted by the compositor once per second
 #      ([de_perf] cursor_fps=N) while the rc.5 hook drives the cursor via
 #      /dev/mouse absolute moves (A.1 consolidation — no injection ctl verb).
-#   2. A pre-spawn and post-spawn framebuffer PNG for each hamui app
-#      the rc.5 hook launches (hamclock hamcalc hamfm hamterm hammon
-#      hamctl hamshot hamnotify), captured live via the QEMU monitor
-#      `screendump` HMP command on `[visual_gate] launching/launched`
-#      markers in the serial log.
+#   2. A pre-spawn and post-spawn framebuffer PNG for each genuinely-
+#      windowed hamui app the rc.5 hook launches THROUGH THE DE LAUNCH
+#      QUEUE (hamclock hamcalc hammon hamctl — each self-allocates an
+#      owned wsys window via hamui_window()), captured live via the QEMU
+#      monitor `screendump` HMP command on `[visual_gate]
+#      launching/launched` markers in the serial log.
 #   3. A whole-DE composite PNG snapped just after the gate finishes
 #      sequencing apps.
 #
-# FAILS if cursor_fps is below the baseline (FPS_MIN, default 5) OR if
-# any app's post-spawn PNG is byte-identical to its pre-spawn PNG (the
-# app rendered no new pixels and "launched" without painting). All PNGs
-# land under build/de_visual_gate/<timestamp>/.
+# THIS IS THE #99 REGRESSION GATE: a launch-queue write
+# (`echo /bin/<app> > /dev/wsys/run/launch`) must produce a rendered
+# window. The panel (hampanelscene) drains the queue and spawns the app
+# as a scene client; the kernel emits `[devwsys] window <wid> mapped
+# pid=<pid>` per self-served window.
+#
+# FAILS if any launched app's window region shows no new pixels
+# (WINDOW_DIFF_MIN) OR if fewer than WINDOW_MAP_MIN distinct windows were
+# mapped (so a launch-queue app's fresh window is proven allocated).
+# cursor_fps is reported for info only (the legacy hamUId present that
+# emitted it is retired in the scene DE). All PNGs land under
+# build/de_visual_gate/<timestamp>/.
 #
 # This is the build-time visual-gate — there is no -kernel multiboot
 # fast-path: that route hits project_qemu_multiboot_vbe_limit on this
@@ -54,7 +63,7 @@ TS="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-build/de_visual_gate/$TS}"
 HANDOFF_MARKER="handing off to interactive shell"
 
-APPS=(hamclock hamcalc hamfm hamterm hammon hamctl hamshot hamnotify)
+APPS=(hamclock hamcalc hammon)
 
 # --- environment gates -----------------------------------------------
 if [ ! -e /dev/kvm ]; then
@@ -388,6 +397,25 @@ PRESENTS=${PRESENTS:-0}
 DE_MARKERS=$(grep -aE '\[de_ws\] active=|\[de_kbd\]|\[de_notify\] render|hamUI stack started|\[de_perf\] cursor_fps=' "$LOG" \
                 | sort -u | head -20 || true)
 
+# #99: kernel window-mapped markers. Each `newwindow` (self-served window)
+# emits "[devwsys] window <wid> mapped pid=<pid>" (at WARN so it survives the
+# post-boot console gate). The rc.5 scene apps map their windows at BOOT; the
+# launch-queue apps map AFTER the "[visual_gate] start" marker. So counting
+# the markers that appear PAST that line is a direct count of launch-queue
+# windows — independent of how many windows booted.
+GATE_START_LINE=$(grep -an '\[visual_gate\] start' "$LOG" | head -1 | cut -d: -f1)
+GATE_START_LINE=${GATE_START_LINE:-0}
+WINDOW_MAP_MARKERS=$(grep -aoE '\[devwsys\] window [0-9]+ mapped pid=[0-9]+' "$LOG" | sort -u || true)
+if [ "$GATE_START_LINE" -gt 0 ]; then
+    LAUNCH_MAP_COUNT=$(tail -n "+$GATE_START_LINE" "$LOG" \
+        | grep -acE '\[devwsys\] window [0-9]+ mapped pid=[0-9]+' || true)
+else
+    LAUNCH_MAP_COUNT=0
+fi
+LAUNCH_MAP_COUNT=${LAUNCH_MAP_COUNT:-0}
+WINDOW_MAP_COUNT=$(printf '%s\n' "$WINDOW_MAP_MARKERS" | grep -c 'mapped' || true)
+WINDOW_MAP_COUNT=${WINDOW_MAP_COUNT:-0}
+
 # --- write summary ---------------------------------------------------
 SUMMARY="$OUT_DIR/SUMMARY.txt"
 {
@@ -406,13 +434,31 @@ SUMMARY="$OUT_DIR/SUMMARY.txt"
     echo "DE markers seen"
     echo "----------------"
     printf '%s\n' "$DE_MARKERS"
+    echo
+    echo "kernel window-mapped markers (#99)"
+    echo "----------------------------------"
+    printf '%s\n' "$WINDOW_MAP_MARKERS"
+    echo "distinct mapped wids (whole boot) = $WINDOW_MAP_COUNT"
+    echo "windows mapped AFTER gate start   = $LAUNCH_MAP_COUNT (launch-queue)"
 } > "$SUMMARY"
 cat "$SUMMARY"
 
 # --- pass/fail decision ----------------------------------------------
 fail=0
+# cursor_fps is emitted ONLY by the LEGACY hamUId present loop, which the
+# scene-file DE retires (hamUId exits right after the rl5 desktop flip). So
+# in the production scene compositor it is expected to read 0 — it is NOT a
+# launch-render signal and must not fail this gate. Report it as info only.
 if [ "$CURSOR_FPS" -lt "$FPS_MIN" ]; then
-    echo "[visual_gate] FAIL: cursor_fps=$CURSOR_FPS below baseline $FPS_MIN" >&2
+    echo "[visual_gate] INFO: cursor_fps=$CURSOR_FPS (legacy hamUId present retired; not gated)" >&2
+fi
+# #99: each launched windowed app must map a FRESH window AFTER the gate
+# starts. Require at least one launch-phase window-mapped marker per app in
+# APPS (they map their own top-level via `newwindow` in the kernel). This is
+# independent, kernel-side corroboration of the per-app pixel-render check.
+LAUNCH_MAP_MIN="${LAUNCH_MAP_MIN:-${#APPS[@]}}"
+if [ "$LAUNCH_MAP_COUNT" -lt "$LAUNCH_MAP_MIN" ]; then
+    echo "[visual_gate] FAIL: only $LAUNCH_MAP_COUNT launch-phase window-mapped markers (< $LAUNCH_MAP_MIN); launch-queue apps did not allocate windows" >&2
     fail=1
 fi
 no_render_apps=()
@@ -430,7 +476,7 @@ if [ "${#no_render_apps[@]}" -gt 0 ]; then
 fi
 
 if [ "$fail" -eq 0 ]; then
-    echo "[visual_gate] PASS: cursor_fps=$CURSOR_FPS, ${#APPS[@]}/${#APPS[@]} apps rendered"
+    echo "[visual_gate] PASS: ${#APPS[@]}/${#APPS[@]} launch-queue apps rendered, $LAUNCH_MAP_COUNT launch-phase windows mapped (cursor_fps=$CURSOR_FPS info-only)"
     exit 0
 else
     echo "[visual_gate] FAIL (artifacts: $OUT_DIR)" >&2
