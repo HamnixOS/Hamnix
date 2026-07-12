@@ -84,6 +84,24 @@ OVMF_FD="${OVMF_FD:-/usr/share/ovmf/OVMF.fd}"
 # is valid under both TCG and KVM, so the same line works locally and in CI.
 QEMU_CPU="${QEMU_CPU:-max}"
 
+# Accelerator. DEFAULT is TCG (empty QEMU_ACCEL) so CI — which has no
+# /dev/kvm — is unchanged and the same command boots everywhere. Local
+# runs on a KVM-capable host can export QEMU_ACCEL=kvm for a ~10x faster,
+# deadline-proof boot (the native-compiled kernel executes more insns than
+# the seed build, so under pure TCG it crosses [hamsh-alive] only just
+# before a 180s poll — a chronic local false-FAIL). NOTE: KVM is far faster
+# but can MASK TCG-only timing bugs (e.g. the #413 steal-window race), so it
+# is opt-in for liveness checks, never the CI default.
+QEMU_ACCEL="${QEMU_ACCEL:-}"
+ACCEL_ARGS=()
+if [ "$QEMU_ACCEL" = "kvm" ]; then
+    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        ACCEL_ARGS=(-enable-kvm)
+    else
+        echo "[test_installer_boot_heartbeat] QEMU_ACCEL=kvm requested but /dev/kvm not accessible; falling back to TCG." >&2
+    fi
+fi
+
 # The liveness marker we require, and the fatal-trap markers we reject.
 HEARTBEAT_RE='\[hamsh-alive\]'
 # A fatal first-IRQ-from-userspace triple-fault (regression #402) surfaces
@@ -213,6 +231,7 @@ cp "$OVMF_FD" "$OVMF_RW"
 boot_once() {
     : > "$LOG"
     qemu-system-x86_64 \
+        "${ACCEL_ARGS[@]}" \
         -cpu "$QEMU_CPU" \
         -bios "$OVMF_RW" \
         -drive "file=$IMG,format=raw,if=virtio" \
