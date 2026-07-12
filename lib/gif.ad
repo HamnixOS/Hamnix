@@ -1,0 +1,389 @@
+# lib/gif.ad — a pure-Adder, integer-only GIF decoder (first frame only).
+#
+# Decodes the FIRST image frame of a GIF87a/GIF89a byte buffer into a flat 8-bit
+# RGBA pixel array, mirroring lib/png.ad and lib/jpeg.ad's shape: the caller
+# slurps the file bytes and hands them here; the decoded RGBA lives in this
+# module's BSS and is read back via gif_width()/gif_height() / gif_rgba_ptr() /
+# gif_pixel(). Extern-free, integer-only, no I/O — it compiles for the Linux
+# host AND the native target from the same source.
+#
+# Implements, from scratch:
+#   1. the container    — "GIF87a"/"GIF89a" header, Logical Screen Descriptor,
+#      optional Global Color Table, the block stream (Extensions / Image
+#      Descriptor / Trailer), and Extension sub-block chains;
+#   2. Graphic Control  — honours the TRANSPARENT colour index (-> alpha 0);
+#   3. Image Descriptor — position/size, optional Local Color Table, interlace;
+#   4. LZW decompression — variable-width codes (min-code-size+1 .. 12), CLEAR /
+#      END codes, the string table with the deferred-clear quirk, KwKwK special
+#      case, and the 4-pass interlaced row order.
+#
+# BOUNDS-SAFE: this parses untrusted input. Every table index, code width and
+# output write is bounds-checked; a malformed / oversized / truncated stream is
+# clamped or rejected (a negative gif_decode return -> the caller draws a
+# broken-image placeholder) and NEVER reads or writes out of bounds.
+#
+# GAPS (noted, not attempted): animation loops (only the first frame is drawn),
+# frame disposal methods, and sub-rectangle compositing over the logical screen
+# (a frame smaller than the screen is decoded at its own natural size).
+
+# ---- capacities (BSS) ----------------------------------------------
+GIF_MAX_DIM: uint64 = 512           # max frame width or height accepted
+GIF_OUT_CAP: uint64 = 1048576       # RGBA output: 512*512*4
+GIF_IDX_CAP: uint64 = 262144        # palette-index plane: 512*512
+GIF_LZW_CAP: uint64 = 524288        # concatenated compressed sub-block data
+
+gif_out: Array[1048576, uint8]      # final RGBA, row-major, 4 bytes/px
+gif_idx: Array[262144, uint8]       # decoded palette indices, DECODE-row order
+gif_lzw: Array[524288, uint8]       # gathered LZW-compressed image data
+
+gif_w:  int32 = 0
+gif_h:  int32 = 0
+gif_ok: int32 = 0
+
+# ---- colour tables (RGBA, alpha 255) -------------------------------
+gif_gct: Array[1024, uint8]         # global colour table: up to 256 * 4
+gif_lct: Array[1024, uint8]         # local  colour table: up to 256 * 4
+
+# ---- LZW string table ----------------------------------------------
+# Classic prefix/suffix code table. prefix[c] is the code of the string minus
+# its last byte; suffix[c] is that last byte. Literals (< clear) are implicit.
+gif_prefix: Array[4096, uint16]
+gif_suffix: Array[4096, uint8]
+gif_stack:  Array[4096, uint8]      # reversal stack for one decoded string
+
+# ---- LZW bit reader over gif_lzw[0..glz_len) -----------------------
+glz_len:    uint64 = 0
+glz_pos:    uint64 = 0
+glz_bitbuf: uint32 = 0
+glz_bitcnt: uint32 = 0
+glz_err:    int32 = 0
+
+
+# Little-endian 16-bit read.
+def _gif_le16(p: Ptr[uint8], o: uint64) -> int32:
+    return cast[int32](p[o]) | (cast[int32](p[o + 1]) << 8)
+
+
+# Read `need` (1..12) bits LSB-first from the gathered LZW stream. Sets glz_err
+# and returns 0 on underflow (treated by the caller as an implicit end).
+def _glz_bits(need: uint32) -> uint32:
+    while glz_bitcnt < need:
+        if glz_pos >= glz_len:
+            glz_err = 1
+            return 0
+        b: uint32 = cast[uint32](gif_lzw[glz_pos])
+        glz_pos = glz_pos + 1
+        glz_bitbuf = glz_bitbuf | (b << glz_bitcnt)
+        glz_bitcnt = glz_bitcnt + 8
+    mask: uint32 = (cast[uint32](1) << need) - 1
+    val: uint32 = glz_bitbuf & mask
+    glz_bitbuf = glz_bitbuf >> need
+    glz_bitcnt = glz_bitcnt - need
+    return val
+
+
+# Decode the gathered LZW stream into gif_idx[0..npix) in DECODE (scan) order.
+# `min_code_size` is the byte preceding the image sub-blocks (bits/pixel, 2..8).
+# Returns the number of indices produced (may be < npix on a short stream), or
+# negative on a structurally invalid stream. BOUNDS-SAFE throughout.
+def _gif_lzw_decode(min_code_size: int32, npix: uint64) -> int64:
+    if min_code_size < 2 or min_code_size > 8:
+        return -1
+    clear: int32 = cast[int32](1) << cast[uint32](min_code_size)   # <= 256
+    endc:  int32 = clear + 1
+    code_size: uint32 = cast[uint32](min_code_size) + 1
+    next_code: int32 = clear + 2
+    out:   uint64 = 0
+    old:   int32 = -1
+    first: int32 = 0
+    glz_bitbuf = 0
+    glz_bitcnt = 0
+    glz_pos = 0
+    glz_err = 0
+    while glz_err == 0:
+        code: int32 = cast[int32](_glz_bits(code_size))
+        if glz_err != 0:
+            break                                      # ran out -> implicit end
+        if code == clear:
+            code_size = cast[uint32](min_code_size) + 1
+            next_code = clear + 2
+            old = -1
+            continue
+        if code == endc:
+            break
+        if old == -1:
+            # first code after a CLEAR must be a literal (a single pixel).
+            if code >= clear:
+                return -1
+            if out < npix:
+                gif_idx[out] = cast[uint8](code)
+                out = out + 1
+            old = code
+            first = code
+            continue
+        # a code must reference an existing entry, or be exactly next_code (the
+        # self-referential KwKwK case). Anything else is corrupt input.
+        if code > next_code or code >= 4096:
+            return -1
+        sp: int32 = 0
+        cur: int32 = code
+        if code == next_code:
+            # string(old) followed by first-byte(string(old)); push that first
+            # byte at the BOTTOM of the reversal stack, then decode string(old).
+            gif_stack[sp] = cast[uint8](first)
+            sp = sp + 1
+            cur = old
+        # walk the prefix chain, pushing suffix bytes; guard against a cyclic
+        # (corrupt) table so this can never loop or overflow the stack.
+        guard: int32 = 0
+        while cur >= clear:
+            if sp >= 4096 or guard >= 4096:
+                return -1
+            gif_stack[sp] = gif_suffix[cur]
+            sp = sp + 1
+            cur = cast[int32](gif_prefix[cur])
+            guard = guard + 1
+        if cur < 0 or cur >= clear:
+            return -1
+        if sp >= 4096:
+            return -1
+        gif_stack[sp] = cast[uint8](cur)                # the literal first byte
+        sp = sp + 1
+        first = cur
+        # pop the stack (LIFO reverses it back to forward order) into the output.
+        while sp > 0:
+            sp = sp - 1
+            if out < npix:
+                gif_idx[out] = gif_stack[sp]
+                out = out + 1
+        # add the new table entry old+first, honouring the deferred-clear quirk:
+        # stop growing the table at 4096 and keep decoding until an explicit
+        # CLEAR resets it.
+        if next_code < 4096:
+            gif_prefix[next_code] = cast[uint16](old)
+            gif_suffix[next_code] = cast[uint8](first)
+            next_code = next_code + 1
+            if next_code == (cast[int32](1) << code_size) and code_size < 12:
+                code_size = code_size + 1
+        old = code
+    return cast[int64](out)
+
+
+# Map a DECODE-order row index to its PHYSICAL row for a 4-pass interlaced frame.
+def _gif_interlace_row(dr: int32, h: int32) -> int32:
+    p1: int32 = (h + 7) / 8                             # start 0, step 8
+    p2: int32 = (h + 3) / 8                             # start 4, step 8
+    p3: int32 = (h + 1) / 4                             # start 2, step 4
+    if dr < p1:
+        return dr * 8
+    dr = dr - p1
+    if dr < p2:
+        return 4 + dr * 8
+    dr = dr - p2
+    if dr < p3:
+        return 2 + dr * 4
+    dr = dr - p3
+    return 1 + dr * 2
+
+
+# Skip a sub-block chain starting at the block-size byte `o`. Returns the offset
+# just past the 0-length terminator, or `len` on a truncated chain.
+def _gif_skip_subblocks(buf: Ptr[uint8], o: uint64, len: uint64) -> uint64:
+    while o < len:
+        sz: uint64 = cast[uint64](buf[o])
+        o = o + 1
+        if sz == 0:
+            return o
+        o = o + sz
+        if o > len:
+            return len
+    return len
+
+
+# Decode GIF bytes at buf[0..len). On success sets gif_w/gif_h/gif_ok=1 and fills
+# gif_out with RGBA for the FIRST frame; returns 0. Negative return = undecodable
+# (the caller draws a placeholder). Never crashes on malformed input.
+def gif_decode(buf: Ptr[uint8], len: uint64) -> int32:
+    gif_ok = 0
+    gif_w = 0
+    gif_h = 0
+    # header + logical screen descriptor need at least 13 bytes.
+    if len < 13:
+        return -1
+    # "GIF8" magic (47 49 46 38); byte 4 is '7' or '9', byte 5 is 'a'.
+    if buf[0] != 71 or buf[1] != 73 or buf[2] != 70 or buf[3] != 56:
+        return -1
+    if (buf[4] != 55 and buf[4] != 57) or buf[5] != 97:
+        return -1
+    scr_flags: int32 = cast[int32](buf[10])
+    gct_flag: int32 = (scr_flags >> 7) & 1
+    gct_size: int32 = cast[int32](2) << cast[uint32](scr_flags & 7)     # entries
+    o: uint64 = 13
+    gct_n: int32 = 0
+    if gct_flag != 0:
+        need: uint64 = cast[uint64](gct_size) * 3
+        if o + need > len:
+            return -1
+        k: int32 = 0
+        while k < gct_size:
+            gif_gct[k * 4]     = buf[o + cast[uint64](k * 3)]
+            gif_gct[k * 4 + 1] = buf[o + cast[uint64](k * 3 + 1)]
+            gif_gct[k * 4 + 2] = buf[o + cast[uint64](k * 3 + 2)]
+            gif_gct[k * 4 + 3] = 255
+            k = k + 1
+        gct_n = gct_size
+        o = o + need
+    # transparency carried by a Graphic Control Extension preceding the image.
+    trans_flag: int32 = 0
+    trans_idx:  int32 = -1
+    # ---- block stream ----
+    while o < len:
+        b: uint8 = buf[o]
+        o = o + 1
+        if b == 59:                                     # 0x3B trailer
+            return -1                                   # no image before trailer
+        elif b == 33:                                   # 0x21 extension
+            if o >= len:
+                return -1
+            label: uint8 = buf[o]
+            o = o + 1
+            if label == 249:                            # 0xF9 Graphic Control
+                if o < len:
+                    bs: uint64 = cast[uint64](buf[o])
+                    if bs >= 4 and o + 5 <= len:
+                        gc_flags: int32 = cast[int32](buf[o + 1])
+                        trans_flag = gc_flags & 1
+                        trans_idx = cast[int32](buf[o + 4])
+                o = _gif_skip_subblocks(buf, o, len)
+            else:                                       # comment / app / text
+                o = _gif_skip_subblocks(buf, o, len)
+        elif b == 44:                                   # 0x2C image descriptor
+            if o + 9 > len:
+                return -1
+            iw: int32 = _gif_le16(buf, o + 4)
+            ih: int32 = _gif_le16(buf, o + 6)
+            img_flags: int32 = cast[int32](buf[o + 8])
+            o = o + 9
+            lct_flag:  int32 = (img_flags >> 7) & 1
+            interlace: int32 = (img_flags >> 6) & 1
+            lct_size:  int32 = cast[int32](2) << cast[uint32](img_flags & 7)
+            # active palette: local table overrides the global one.
+            use_lct: int32 = 0
+            pal_n: int32 = gct_n
+            if lct_flag != 0:
+                need2: uint64 = cast[uint64](lct_size) * 3
+                if o + need2 > len:
+                    return -1
+                k2: int32 = 0
+                while k2 < lct_size:
+                    gif_lct[k2 * 4]     = buf[o + cast[uint64](k2 * 3)]
+                    gif_lct[k2 * 4 + 1] = buf[o + cast[uint64](k2 * 3 + 1)]
+                    gif_lct[k2 * 4 + 2] = buf[o + cast[uint64](k2 * 3 + 2)]
+                    gif_lct[k2 * 4 + 3] = 255
+                    k2 = k2 + 1
+                pal_n = lct_size
+                use_lct = 1
+                o = o + need2
+            if iw <= 0 or ih <= 0:
+                return -1
+            if cast[uint64](iw) > GIF_MAX_DIM or cast[uint64](ih) > GIF_MAX_DIM:
+                return -1
+            if pal_n <= 0:
+                return -1                               # no colour table at all
+            # LZW minimum code size, then the image data sub-block chain.
+            if o >= len:
+                return -1
+            min_code_size: int32 = cast[int32](buf[o])
+            o = o + 1
+            glz_len = 0
+            while o < len:
+                sz2: uint64 = cast[uint64](buf[o])
+                o = o + 1
+                if sz2 == 0:
+                    break
+                if o + sz2 > len:
+                    return -1
+                j: uint64 = 0
+                while j < sz2:
+                    if glz_len >= GIF_LZW_CAP:
+                        return -1
+                    gif_lzw[glz_len] = buf[o + j]
+                    glz_len = glz_len + 1
+                    j = j + 1
+                o = o + sz2
+            npix: uint64 = cast[uint64](iw) * cast[uint64](ih)
+            if npix * 4 > GIF_OUT_CAP:
+                return -1
+            n: int64 = _gif_lzw_decode(min_code_size, npix)
+            if n < 0:
+                return -1
+            gif_w = iw
+            gif_h = ih
+            # ---- map palette indices -> RGBA (first frame) ----
+            dr: int32 = 0
+            while dr < ih:
+                pr: int32 = dr
+                if interlace != 0:
+                    pr = _gif_interlace_row(dr, ih)
+                col: int32 = 0
+                while col < iw:
+                    src: uint64 = cast[uint64](dr) * cast[uint64](iw) + \
+                                  cast[uint64](col)
+                    pidx: int32 = 0
+                    if src < cast[uint64](n):
+                        pidx = cast[int32](gif_idx[src])
+                    dst: uint64 = (cast[uint64](pr) * cast[uint64](iw) + \
+                                   cast[uint64](col)) * 4
+                    if pidx >= 0 and pidx < pal_n:
+                        pbase: uint64 = cast[uint64](pidx * 4)
+                        if use_lct != 0:
+                            gif_out[dst]     = gif_lct[pbase]
+                            gif_out[dst + 1] = gif_lct[pbase + 1]
+                            gif_out[dst + 2] = gif_lct[pbase + 2]
+                        else:
+                            gif_out[dst]     = gif_gct[pbase]
+                            gif_out[dst + 1] = gif_gct[pbase + 1]
+                            gif_out[dst + 2] = gif_gct[pbase + 2]
+                        if trans_flag != 0 and pidx == trans_idx:
+                            gif_out[dst + 3] = 0
+                        else:
+                            gif_out[dst + 3] = 255
+                    else:
+                        # index outside the palette -> fully transparent.
+                        gif_out[dst]     = 0
+                        gif_out[dst + 1] = 0
+                        gif_out[dst + 2] = 0
+                        gif_out[dst + 3] = 0
+                    col = col + 1
+                dr = dr + 1
+            gif_ok = 1
+            return 0
+        else:
+            # unknown block byte -> corrupt.
+            return -1
+    return -1                                           # ran out with no image
+
+
+def gif_width() -> int32:
+    return gif_w
+
+
+def gif_height() -> int32:
+    return gif_h
+
+
+# Packed 0xAARRGGBB for pixel (x,y) of the last successfully decoded frame.
+def gif_pixel(x: int32, y: int32) -> uint32:
+    if gif_ok == 0 or x < 0 or y < 0 or x >= gif_w or y >= gif_h:
+        return 0
+    o: uint64 = (cast[uint64](y) * cast[uint64](gif_w) + cast[uint64](x)) * 4
+    r: uint32 = cast[uint32](gif_out[o])
+    g: uint32 = cast[uint32](gif_out[o + 1])
+    b: uint32 = cast[uint32](gif_out[o + 2])
+    a: uint32 = cast[uint32](gif_out[o + 3])
+    return (a << 24) | (r << 16) | (g << 8) | b
+
+
+# Raw RGBA output pointer (row-major, 4 bytes/px) for a bulk copy into a store.
+def gif_rgba_ptr() -> Ptr[uint8]:
+    return &gif_out[0]
