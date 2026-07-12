@@ -233,6 +233,234 @@ def pgtable_page_offset_selftest() -> uint64:
     free_page(p)
     return ok
 
+
+# --- KPTI #94, Brick A: cpu_entry_area -------------------------------
+#
+# A live KPTI trampoline runs from the USER CR3 for the first handful of
+# instructions after a CPL3->CPL0 transition, BEFORE it can reload the
+# kernel CR3. During that window the CPU must be able to reach, at their
+# mapped VAs: the entry .text stub it is executing, the IDT gate it
+# vectored through, the per-CPU GDT/TSS (RSP0 for the stack switch), the
+# #DF IST stack, and the MDS VERW selector word (mds_verw_sel). In Hamnix
+# those pages are SCATTERED across the high-half kernel image (PML4[511]
+# .text/.rodata/.bss) — which the user CR3 strips — so a live switch would
+# triple-fault on the very first fetch.
+#
+# The cpu_entry_area collects exactly those pages into a dedicated,
+# kernel-private VA window at PML4[274] (PGT_CEA_BASE). It is built
+# ADDITIVELY: the pages stay where they are; we add a SECOND mapping at a
+# CEA VA that aliases each one. Every CEA leaf is US=0 (kernel-only), and
+# the window is propagated to every per-task PML4 by the same full-page
+# PML4 memcpy in kernel/sched/core.ad that carries PML4[273]/page_offset —
+# so a future user CR3 will already carry the entry window while the rest
+# of the kernel image stays stripped. This commit builds + proves the
+# window; wiring the entry stubs to reference the CEA VAs (and flipping
+# KPTI_LIVE_ENABLE) is the follow-up.
+#
+# ADDRESS SCHEME: every mapped page keeps its position RELATIVE to the
+# kernel .text base, i.e. CEA_VA(kva) = PGT_CEA_BASE + (kva - text_start).
+# So a single uniform bias translates any kernel-image symbol to its CEA
+# alias, which is exactly what the entry-stub rewrite will need. The span
+# from .text base to the per-CPU .bss structures is < 1 GiB, so the whole
+# window lives under PML4[274] -> PDPT[0] -> one PD, with PT pages
+# allocated lazily only for the (sparse) PDs that actually carry mapped
+# pages (.text at the low end; IDT/TSS/GDT/#DF-stack in .bss near the top).
+#
+# We map only what the entry path provably needs: ALL of executable .text
+# (so every syscall/trap/irq stub is covered without a fragile per-stub
+# section split — code carries no secret a Meltdown probe couldn't read
+# from the on-disk ELF), plus the specific IDT / GDT / TSS / #DF-stack /
+# VERW DATA pages. The confidentiality-sensitive kernel .data/.bss heap is
+# deliberately NOT bulk-mapped here.
+PGT_CEA_PML4_IDX: uint64 = 274                # 0xffff890000000000 >> 39 & 0x1FF
+PGT_CEA_BASE:     uint64 = 0xffff890000000000
+# US=0 RW P for both the CEA non-leaf links and its 4 KiB leaves. Kernel-
+# private: never reachable from CPL3 even before the entry-stub rewrite.
+PGT_CEA_FLAGS:    uint64 = 0x3
+
+# Region sizes (bytes) of the discrete entry structures, mirroring
+# arch/x86/kernel/tss_asm.S (.equ NR_TSS_CPUS 16, strides) and idt.ad
+# (idt_table: Array[512, uint64]).
+PGT_CEA_IDT_BYTES:      uint64 = 4096         # 512 * 8
+PGT_CEA_TSS_BYTES:      uint64 = 2048         # TSS_STRIDE 128 * 16 CPUs
+PGT_CEA_GDT_BYTES:      uint64 = 1024         # GDT_STRIDE 64 * 16 CPUs
+PGT_CEA_DF_BYTES:       uint64 = 65536        # DF_STK_SIZE 4096 * 16 CPUs
+PGT_CEA_VERW_BYTES:     uint64 = 8            # a 16-bit word, rounded up
+
+# Kernel VAs of the entry structures (arch/x86/kernel/cpu_entry_area_asm.S).
+extern def cea_idt_addr() -> uint64
+extern def cea_tss_addr() -> uint64
+extern def cea_gdt_addr() -> uint64
+extern def cea_df_stack_addr() -> uint64
+extern def cea_verw_addr() -> uint64
+extern def cea_entry_text_start() -> uint64
+extern def cea_entry_text_end() -> uint64
+
+# Published once pgtable_build_cpu_entry_area() has installed PML4[274].
+pgt_cea_ready:      uint64 = 0
+# Recorded at build time so CEA_VA() and the selftest agree on the bias.
+pgt_cea_text_start: uint64 = 0
+# The CEA PD physical base (retained for the read-only selftest walk).
+pgt_cea_pd_base:    uint64 = 0
+
+
+def pgtable_cea_ready() -> uint64:
+    # 1 iff the cpu_entry_area is installed (selftest accessor).
+    return pgt_cea_ready
+
+
+def pgtable_cea_va(kva: uint64) -> uint64:
+    # Translate a kernel-image VA to its cpu_entry_area alias VA. Uniform
+    # bias off the .text base recorded at build time. Only meaningful for
+    # pages actually mapped into the CEA (entry .text + the IDT/GDT/TSS/
+    # #DF/VERW structures); a caller must ensure kva is one of those.
+    return PGT_CEA_BASE + (kva - pgt_cea_text_start)
+
+
+def _cea_zero_page(pa: uint64):
+    # Zero a freshly-allocated table page (alloc_page does not guarantee
+    # zeroed). pa is a low identity address == its own VA.
+    i: uint64 = 0
+    while i < cast[uint64](512):
+        cast[Ptr[uint64]](pa + i * 8)[0] = cast[uint64](0)
+        i = i + 1
+
+
+def _cea_map_page(pd_base: uint64, kva: uint64) -> int32:
+    # Alias the 4 KiB page containing kernel-image VA `kva` into the CEA
+    # window at CEA_VA(kva). Lazily allocates the PT page for kva's PD slot.
+    # Returns 1 on success, 0 on OOM.
+    offset: uint64 = kva - pgt_cea_text_start
+    pd_idx: uint64 = (offset >> PGT_2M_SHIFT) & cast[uint64](0x1FF)
+    pt_idx: uint64 = (offset >> 12) & cast[uint64](0x1FF)
+    pd_slot: Ptr[uint64] = cast[Ptr[uint64]](pd_base + pd_idx * 8)
+    pde: uint64 = pd_slot[0]
+    pt_base: uint64 = 0
+    if (pde & PGT_FLAG_P) == 0:
+        pt_base = alloc_page()
+        if pt_base == 0:
+            return 0
+        _cea_zero_page(pt_base)
+        pd_slot[0] = pt_base | PGT_CEA_FLAGS
+    else:
+        pt_base = pde & PGT_ADDR_MASK
+    # Leaf: phys of the image page (high-half VA rebased to low phys).
+    phys: uint64 = virt_to_phys(kva & ~cast[uint64](4095))
+    cast[Ptr[uint64]](pt_base + pt_idx * 8)[0] = phys | PGT_CEA_FLAGS
+    return 1
+
+
+def _cea_map_range(pd_base: uint64, start: uint64, end: uint64) -> uint64:
+    # Map every 4 KiB page in [start, end) into the CEA window. Returns the
+    # number of pages mapped (0 on the first OOM — partial maps are harmless
+    # because nothing references the CEA VAs yet).
+    cur: uint64 = start & ~cast[uint64](4095)
+    mapped: uint64 = 0
+    while cur < end:
+        if _cea_map_page(pd_base, cur) == 0:
+            return mapped
+        mapped = mapped + 1
+        cur = cur + 4096
+    return mapped
+
+
+def pgtable_build_cpu_entry_area():
+    # Build the cpu_entry_area (PML4[274]): alias the entry .text + the
+    # IDT/GDT/TSS/#DF-stack/VERW pages into a kernel-private window at their
+    # CEA VAs. ADDITIVE — the originals stay mapped in PML4[511]/PML4[0], so
+    # this cannot break the running kernel; it only ADDS a second window.
+    #
+    # Must run AFTER page_alloc_init() (needs alloc_page) and BEFORE the
+    # first task clone, so the full-page PML4 memcpy in kernel/sched/core.ad
+    # propagates PML4[274] to every per-task address space (alongside the
+    # PML4[273] page_offset entry from step 1).
+    text_start: uint64 = cea_entry_text_start()
+    text_end:   uint64 = cea_entry_text_end()
+    pgt_cea_text_start = text_start
+
+    pdpt: uint64 = alloc_page()
+    if pdpt == 0:
+        printk0("[pgtable] cpu_entry_area: OOM allocating CEA PDPT\n")
+        return
+    _cea_zero_page(pdpt)
+    pd: uint64 = alloc_page()
+    if pd == 0:
+        printk0("[pgtable] cpu_entry_area: OOM allocating CEA PD\n")
+        return
+    _cea_zero_page(pd)
+    pgt_cea_pd_base = pd
+
+    # Link PML4[274] -> PDPT -> PDPT[0] -> PD (all US=0).
+    cast[Ptr[uint64]](pdpt)[0] = pd | PGT_CEA_FLAGS
+    cr3:  uint64 = get_bsp_cr3()
+    pml4: uint64 = cr3 & PGT_ADDR_MASK
+    cast[Ptr[uint64]](pml4 + PGT_CEA_PML4_IDX * 8)[0] = pdpt | PGT_CEA_FLAGS
+
+    # Map executable .text (every entry stub) contiguously.
+    text_pages: uint64 = _cea_map_range(pd, text_start, text_end)
+    # Map the discrete entry data structures.
+    idt_kva:  uint64 = cea_idt_addr()
+    gdt_kva:  uint64 = cea_gdt_addr()
+    tss_kva:  uint64 = cea_tss_addr()
+    df_kva:   uint64 = cea_df_stack_addr()
+    verw_kva: uint64 = cea_verw_addr()
+    _cea_map_range(pd, idt_kva,  idt_kva  + PGT_CEA_IDT_BYTES)
+    _cea_map_range(pd, gdt_kva,  gdt_kva  + PGT_CEA_GDT_BYTES)
+    _cea_map_range(pd, tss_kva,  tss_kva  + PGT_CEA_TSS_BYTES)
+    _cea_map_range(pd, df_kva,   df_kva   + PGT_CEA_DF_BYTES)
+    _cea_map_range(pd, verw_kva, verw_kva + PGT_CEA_VERW_BYTES)
+
+    # Flush the TLB so the new window is live immediately.
+    load_cr3(cr3)
+    pgt_cea_ready = 1
+    printk2("[pgtable] cpu_entry_area: PML4[%d] base=%p\n",
+            PGT_CEA_PML4_IDX, PGT_CEA_BASE)
+    printk2("[pgtable] cpu_entry_area: entry .text %d pages aliased (text_start=%p)\n",
+            text_pages, text_start)
+
+
+def _cea_alias_matches(kva: uint64) -> uint64:
+    # Read a qword through both the original kernel VA and its CEA alias and
+    # return 1 iff they agree (proving the alias reaches the SAME RAM) AND
+    # the alias resolves to a present leaf. Read-only, non-destructive.
+    cea: uint64 = pgtable_cea_va(kva)
+    if pgtable_walk(cea) == 0:
+        return 0
+    a: uint64 = cast[Ptr[uint64]](kva)[0]
+    b: uint64 = cast[Ptr[uint64]](cea)[0]
+    if a == b:
+        return 1
+    return 0
+
+
+def pgtable_cpu_entry_area_selftest() -> uint64:
+    # Prove the cpu_entry_area resolves the entry structures: each of the
+    # IDT, GDT, TSS, #DF stack, VERW word and the entry .text base must walk
+    # to a PRESENT leaf through the CEA VA, and reading the alias must return
+    # the SAME bytes as the original kernel VA. Read-only (no CR3 switch) so
+    # it is triple-fault-proof and runs on every boot. Returns 1 PASS / 0.
+    if pgt_cea_ready == 0:
+        printk0("[pgtable] cpu_entry_area selftest SKIP: not built\n")
+        return 0
+    idt_ok:  uint64 = _cea_alias_matches(cea_idt_addr())
+    gdt_ok:  uint64 = _cea_alias_matches(cea_gdt_addr())
+    tss_ok:  uint64 = _cea_alias_matches(cea_tss_addr())
+    df_ok:   uint64 = _cea_alias_matches(cea_df_stack_addr())
+    verw_ok: uint64 = _cea_alias_matches(cea_verw_addr())
+    text_ok: uint64 = _cea_alias_matches(cea_entry_text_start())
+    printk2("[pgtable] cpu_entry_area walk: IDT=%d GDT=%d\n", idt_ok, gdt_ok)
+    printk2("[pgtable] cpu_entry_area walk: TSS=%d #DF-stack=%d\n", tss_ok, df_ok)
+    printk2("[pgtable] cpu_entry_area walk: VERW=%d entry.text=%d\n",
+            verw_ok, text_ok)
+    all_ok: uint64 = idt_ok & gdt_ok & tss_ok & df_ok & verw_ok & text_ok
+    if all_ok == 1:
+        printk0("[pgtable] cpu_entry_area PASS: IDT/GDT/TSS/#DF/VERW/entry.text"
+                " resolve through the entry window (same RAM)\n")
+    else:
+        printk0("[pgtable] cpu_entry_area FAIL: an entry structure did not"
+                " resolve through the CEA window\n")
+    return all_ok
+
 # Multiboot1 constants (mirror arch/x86/kernel/e820.ad — kept inline
 # rather than imported to avoid coupling to e820.ad's private surface).
 PGT_MB_MAGIC:        uint64 = 0x2BADB002

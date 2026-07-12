@@ -126,6 +126,14 @@ SECTIONS
         *(.text)
         *(.text.*)
     }
+    /* End of the executable .text ONLY (before .rodata/.data/.bss). The
+     * KPTI cpu_entry_area (arch/x86/mm/pgtable.ad) aliases exactly this
+     * [__kernel_text_start, __kernel_text_only_end) executable range into
+     * a kernel-private entry window, so a future user CR3 can reach the
+     * syscall/trap/irq entry stubs without mapping the whole image. Unlike
+     * __kernel_text_end (which sits after .bss and bounds the WHOLE image
+     * for the frame-pointer walker), this marks the code section boundary. */
+    __kernel_text_only_end = .;
 
     .rodata : AT(kernel_lma + (ADDR(.rodata) - __high_vbase)) ALIGN(16) {
         *(.rodata)

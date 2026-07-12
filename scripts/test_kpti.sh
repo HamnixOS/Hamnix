@@ -121,6 +121,22 @@ if ! grep -a -F -q "[pgtable] page_offset PASS" "$LOG"; then
 fi
 pass "page_offset direct map installed; high-half alias reaches the same RAM"
 
+# (E) KPTI #94, Brick A: the cpu_entry_area (PML4[274]) collects the
+# CPL3->CPL0 entry-critical pages (entry .text stubs, IDT, per-CPU GDT/TSS,
+# #DF IST stacks, MDS VERW word) into a kernel-private window aliased at
+# their CEA VAs. This is the prerequisite for a live per-entry CR3 switch:
+# the future user CR3 must still reach the entry window at its VAs while the
+# rest of the kernel image is stripped. The kernel proves it at boot by
+# WALKING each structure's CEA VA (read-only) and asserting it resolves to a
+# present leaf holding the SAME bytes as the original kernel VA.
+if ! grep -a -F -q "[pgtable] cpu_entry_area PASS" "$LOG"; then
+    echo "----- cpu_entry_area boot-log excerpt -----" >&2
+    grep -a -E "\[pgtable\] cpu_entry_area" "$LOG" >&2 || true
+    fail "cpu_entry_area (KPTI Brick A) did not resolve the entry structures" \
+         "(IDT/GDT/TSS/#DF/VERW/entry.text) through the kernel-private window"
+fi
+pass "cpu_entry_area built; IDT/GDT/TSS/#DF/VERW/entry.text resolve through it"
+
 # (C) Boot reached userland — the KPTI scaffold did not regress the boot.
 if ! grep -a -E -q "hamsh\\\$" "$LOG"; then
     echo "[test_kpti] INCONCLUSIVE: boot did not reach a hamsh prompt" \
