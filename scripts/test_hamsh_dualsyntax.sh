@@ -221,6 +221,65 @@ hamsh_send_await 'echo ${ nsx.mounts() }' '/n/aa /n/bb' "$CMD_WAIT" || true
 # L3. `for m in <ns>` walks the mount-points (inline-colon one-liner).
 hamsh_send_await 'for m in $nsx: echo NSITER $m' 'NSITER /n/bb' "$CMD_WAIT" || true
 
+# --- M. §Float — real floating-point (VT_FLOAT) ----------------------
+# All results emitted as whole output lines (`echo ${ … }` or inline-colon
+# markers) so ran_bol / hamsh_ran can never false-green on a typed echo.
+# hamsh arithmetic is SPACE-separated (`a / b`, never glued — `/` glued is
+# a path); the float literals `3.0` / `0.1` are single-dot so they lex as
+# floats (a 2nd dot = version/IP word).
+# M1. Python-3 true division: `1 / 2` is a FLOAT 0.5 (not integer 0).
+hamsh_send_await 'echo ${ 1 / 2 }' '0.5' "$CMD_WAIT" || true
+# M2. int↔float mixed arithmetic renders integer-valued floats bare.
+hamsh_send_await 'echo ${ 3.0 * 2 }' '6' "$CMD_WAIT" || true
+# M3. exact-bits addition rendered sensibly (0.1 + 0.2 -> 0.3, trimmed).
+hamsh_send_await 'echo ${ 0.1 + 0.2 }' '0.3' "$CMD_WAIT" || true
+# M4. float assignment + interpolation round-trips the literal.
+hamsh_send 'pi = 3.14'
+hamsh_send_await 'echo $pi' '3.14' "$CMD_WAIT" || true
+# M5. a list of floats renders space-joined.
+hamsh_send_await 'echo ${ [1.5, 2.5] }' '1.5 2.5' "$CMD_WAIT" || true
+# M6. float()/int() conversions + abs over a float.
+hamsh_send_await 'echo ${ float("1") / 2 }' '0.5' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ int(3.9) }' '3' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ abs(-2.5) }' '2.5' "$CMD_WAIT" || true
+# M7. sum over floats, min/max over floats.
+hamsh_send_await 'echo ${ sum([1.5, 2.5, 1.0]) }' '5' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ max([1.5, 0.5, 2.5]) }' '2.5' "$CMD_WAIT" || true
+# M8. float comparisons — the exact-bits identities the task calls out.
+hamsh_send_await 'if 1 / 2 == 0.5: echo HALF_OK' 'HALF_OK' "$CMD_WAIT" || true
+hamsh_send_await 'if 3.0 * 2 == 6: echo SIXF_OK' 'SIXF_OK' "$CMD_WAIT" || true
+
+# --- N. §Exceptions — raise + finally --------------------------------
+# N1. DIFFERENTIAL both-styles-≡: `try raise / except as e` in brace AND
+# indent form must each print CAUGHT_boom (a correct pair yields >=2).
+hamsh_send_await 'try { raise "boom" } except as e { echo CAUGHT_$e }' 'CAUGHT_boom' "$CMD_WAIT" || true
+hamsh_send 'try:'
+hamsh_send '    raise "boom"'
+hamsh_send 'except as e:'
+hamsh_send '    echo CAUGHT_$e'
+hamsh_send ''
+hamsh_send_await 'echo GATE_N1' 'GATE_N1' "$CMD_WAIT" || true
+# N2. finally runs on the NORMAL path (both markers appear).
+hamsh_send_await 'try { echo TRY_NORMAL } finally { echo FIN_NORMAL }' 'FIN_NORMAL' "$CMD_WAIT" || true
+# N3. finally runs on the CAUGHT path (both markers appear).
+hamsh_send_await 'try { raise "x" } except { echo TRY_CAUGHT } finally { echo FIN_CAUGHT }' 'FIN_CAUGHT' "$CMD_WAIT" || true
+# N4. finally runs on the UNCAUGHT-propagating path (try/finally, no except):
+# FIN_PROP prints, then the raise propagates to an uncaught-exception report.
+hamsh_send_await 'try { raise "y" } finally { echo FIN_PROP }' 'FIN_PROP' "$CMD_WAIT" || true
+# N5. a `with` body that raises STILL unbinds (teardown) AND propagates the
+# raise so an enclosing try/except catches it (#111 unwind ∩ exceptions).
+hamsh_send_await 'try { with bind(/tmp, /n/wb) as w { raise "wz" } } except as e { echo WCAUGHT_$e }' 'WCAUGHT_wz' "$CMD_WAIT" || true
+
+# --- O. §f-string — Python f"{expr}" interpolation -------------------
+hamsh_send 'fa = 3'
+hamsh_send 'fb = 4'
+hamsh_send_await 'echo f"sum={fa + fb}"' 'sum=7' "$CMD_WAIT" || true
+hamsh_send_await 'echo f"pi is {pi}"' 'pi is 3.14' "$CMD_WAIT" || true
+hamsh_send 'fnm = "ham"'
+hamsh_send_await 'echo f"hi {fnm}nix"' 'hi hamnix' "$CMD_WAIT" || true
+# f-string with a call sub-expression + literal braces via {{ }}.
+hamsh_send_await 'echo f"len={len([1, 2, 3])} {{lit}}"' 'len=3 {lit}' "$CMD_WAIT" || true
+
 hamsh_send_await 'echo GATE_DONE' 'GATE_DONE' "$CMD_WAIT" || true
 hamsh_send 'exit'
 sleep 2
@@ -357,6 +416,52 @@ if ran_bol "/n/aa /n/bb"; then echo "[$TAG] OK: binds(ns) introspection"; else
 if ran_bol "NSITER /n/aa" && ran_bol "NSITER /n/bb"; then
     echo "[$TAG] OK: for m in <ns> iterates the namespace"; else
     echo "[$TAG] WRONG: namespace iteration did not walk its binds"; fail=1; fi
+
+# M. §Float — real floating-point (correctness verified on the GUEST).
+for pair in "0.5|true-division" "6|int-float-mul" "0.3|exact-bits-add" \
+            "3.14|float-literal-roundtrip" "1.5 2.5|list-of-floats" \
+            "0.5|float()-conversion" "3|int()-truncation" "2.5|abs-float" \
+            "5|sum-floats" "2.5|max-floats" \
+            "HALF_OK|cmp-half" "SIXF_OK|cmp-six"; do
+    m="${pair%%|*}"; name="${pair##*|}"
+    if ran_bol "$(printf '%s' "$m" | sed 's/[.[*+]/\\&/g')"; then
+        echo "[$TAG] OK: float $name"; else
+        echo "[$TAG] WRONG: float $name (want '$m')"; fail=1; fi
+done
+
+# N. §Exceptions — raise + finally.
+# N1 differential: CAUGHT_boom must appear in BOTH the brace and indent
+# form, so a correct pair yields >=2 occurrences.
+caught_n=$(grep -acE "^CAUGHT_boom\$" "$CLEAN" || true)
+if [ "$caught_n" -ge 2 ]; then
+    echo "[$TAG] OK: raise/except brace ≡ indent (CAUGHT_boom=$caught_n)"; else
+    echo "[$TAG] WRONG: raise/except brace≢indent (CAUGHT_boom=$caught_n, want >=2)"; fail=1; fi
+if ! hamsh_ran "$LOG" "GATE_N1"; then
+    echo "[$TAG] WRONG: shell did not survive the exceptions section"; fail=1; fi
+# N2/N3: finally runs on BOTH the normal and the caught path.
+if ran_bol "TRY_NORMAL" && ran_bol "FIN_NORMAL"; then
+    echo "[$TAG] OK: finally runs on the normal path"; else
+    echo "[$TAG] WRONG: finally did not run on the normal path"; fail=1; fi
+if ran_bol "TRY_CAUGHT" && ran_bol "FIN_CAUGHT"; then
+    echo "[$TAG] OK: finally runs on the caught path"; else
+    echo "[$TAG] WRONG: finally did not run on the caught path"; fail=1; fi
+# N4: finally runs even when the raise propagates uncaught.
+if ran_bol "FIN_PROP"; then
+    echo "[$TAG] OK: finally runs on the uncaught-propagating path"; else
+    echo "[$TAG] WRONG: finally skipped on the uncaught path"; fail=1; fi
+# N5: a `with` body that raises still unbinds AND propagates to except.
+if ran_bol "WCAUGHT_wz"; then
+    echo "[$TAG] OK: with-body raise unwinds through with + caught"; else
+    echo "[$TAG] WRONG: with-body raise not caught (unwind∩exceptions)"; fail=1; fi
+
+# O. §f-string — Python f"{expr}" interpolation.
+for pair in "sum=7|arith-subexpr" "pi is 3.14|float-interp" \
+            "hi hamnix|adjacent-text" "len=3 {lit}|call+literal-brace"; do
+    m="${pair%%|*}"; name="${pair##*|}"
+    if ran_bol "$(printf '%s' "$m" | sed 's/[.[*+{}]/\\&/g')"; then
+        echo "[$TAG] OK: f-string $name"; else
+        echo "[$TAG] WRONG: f-string $name (want '$m')"; fail=1; fi
+done
 
 if ! hamsh_ran "$LOG" "GATE_DONE"; then
     echo "[$TAG] WRONG: shell did not survive to the end (GATE_DONE absent)"; fail=1; fi
