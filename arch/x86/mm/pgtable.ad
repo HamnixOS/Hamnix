@@ -47,6 +47,7 @@
 # current x86_64 server config Hamnix targets.
 
 from kernel.printk.printk import printk0, printk1, printk2
+from mm.page_alloc import alloc_page, free_page
 
 extern def get_mb_info() -> uint64
 extern def get_mb_magic() -> uint64
@@ -104,6 +105,133 @@ def phys_to_virt(pa: uint64) -> uint64:
     # helper exists for symmetry and for code that specifically wants
     # the high-half alias of an image byte.
     return pa + PGT_KERNEL_VBASE
+
+
+# --- KPTI #94, step 1: high-half kernel direct map (page_offset) -----
+#
+# THE WALL (cpu_mitigations.ad KPTI block): Hamnix reaches all physical
+# RAM — kmalloc heap, kstacks, page tables, task_structs, per-CPU areas —
+# through the LOW identity map in PML4[0]. But PML4[0] is ALSO the subtree
+# that backs user pages, so a Meltdown-protective user CR3 can't drop it
+# without unmapping user memory, and keeping it re-exposes the whole kernel
+# heap. Real isolation needs the kernel's view of physical RAM RELOCATED
+# out of the user-shared low half into a kernel-private high-half window.
+#
+# This is that window: a Linux-style `page_offset` direct map at
+# PGT_PAGE_OFFSET (0xffff888000000000, PML4[273]) that aliases ALL physical
+# RAM with 1 GiB kernel-only (US=0) pages. It is installed ADDITIVELY at
+# mem_init time and the low identity map is KEPT (dual-mapped), so nothing
+# breaks: existing vaddr==phys consumers keep working through PML4[0] while
+# new/converted consumers can reach RAM through the high-half alias via
+# page_offset_va(). The end state of KPTI #94 is that kernel dynamic memory
+# is reached ONLY through this alias, so the user CR3 can drop PML4[0]'s
+# identity exposure. That consumer flip (alloc_page/kmalloc/kstack callers)
+# is the remaining large mm work; this commit lands the alias + proof.
+#
+# US=0 is the whole point: the high-half direct map is kernel-private, so
+# even before the consumer flip a live user CR3 that strips PML4[273] hides
+# it from a CPL3 probe.
+PGT_PAGE_OFFSET:          uint64 = 0xffff888000000000
+PGT_PAGE_OFFSET_PML4_IDX: uint64 = 273        # 0xffff888000000000 >> 39 & 0x1FF
+# PML4-entry flags pointing at the direct-map PDPT: P|RW, US=0 (kernel-only).
+PGT_PML4E_KERN_FLAGS:     uint64 = 0x3
+# 1 GiB leaf flags for the direct map: PS|RW|P, US=0 (0x83). Kernel-only,
+# deliberately NOT matching the identity map's US=1 (0x87) — this alias is
+# never reachable from CPL3.
+PGT_DMAP_1GB_FLAGS:       uint64 = 0x83
+
+# Published once pgtable_build_page_offset_map() has installed PML4[273].
+pgt_page_offset_ready: uint64 = 0
+
+
+def page_offset_va(pa: uint64) -> uint64:
+    # Kernel-private high-half virtual address for a physical RAM byte,
+    # through the page_offset direct map (PML4[273]). This is the alias a
+    # KPTI-isolated kernel uses instead of the low identity map. Only valid
+    # after pgtable_build_page_offset_map(); before that, callers must use
+    # the low identity VA (== pa).
+    return pa + PGT_PAGE_OFFSET
+
+
+def page_offset_pa(va: uint64) -> uint64:
+    # Inverse of page_offset_va: recover the physical address from a
+    # page_offset direct-map VA.
+    return va - PGT_PAGE_OFFSET
+
+
+def pgtable_page_offset_ready() -> uint64:
+    # 1 iff the high-half direct map is installed (selftest accessor).
+    return pgt_page_offset_ready
+
+
+def pgtable_build_page_offset_map():
+    # Install the kernel-private high-half direct map at PML4[273]
+    # (PGT_PAGE_OFFSET). Allocates one PDPT page and stamps 512 × 1 GiB
+    # US=0 leaves aliasing physical [0, 512 GiB). ADDITIVE: the low
+    # identity map in PML4[0] is untouched, so this cannot break any
+    # existing vaddr==phys consumer — it only ADDS a second, kernel-only
+    # window onto the same RAM.
+    #
+    # Must run AFTER page_alloc_init() (needs alloc_page) and BEFORE the
+    # first task clone, so the full-page PML4 memcpy in kernel/sched/core.ad
+    # propagates PML4[273] to every per-task address space automatically
+    # (the kernel executes on the task's CR3 during syscalls, so it needs
+    # the direct map mapped there too).
+    pdpt: uint64 = alloc_page()
+    if pdpt == 0:
+        printk0("[pgtable] page_offset: OOM allocating direct-map PDPT\n")
+        return
+    # Fill 512 × 1 GiB US=0 leaves: PDPT[i] -> phys i*1GiB.
+    i: uint64 = 0
+    while i < PGT_PDPT_ENTRIES:
+        phys: uint64 = i << PGT_1GB_SHIFT
+        cast[Ptr[uint64]](pdpt + i * 8)[0] = phys | PGT_DMAP_1GB_FLAGS
+        i = i + 1
+    # Install the PML4[273] -> PDPT link in the live BSP PML4. The PDPT
+    # page is a low physical address (alloc_page result), directly the
+    # value we store; its own dereference above went through the identity
+    # map, which is still fully present.
+    cr3:  uint64 = get_bsp_cr3()
+    pml4: uint64 = cr3 & PGT_ADDR_MASK
+    cast[Ptr[uint64]](pml4 + PGT_PAGE_OFFSET_PML4_IDX * 8)[0] = \
+        pdpt | PGT_PML4E_KERN_FLAGS
+    # Flush the TLB so the new high-half window is live immediately.
+    load_cr3(cr3)
+    pgt_page_offset_ready = 1
+    printk2("[pgtable] page_offset direct map: PML4[%d] -> PDPT %p\n",
+            PGT_PAGE_OFFSET_PML4_IDX, pdpt)
+    printk1("[pgtable] page_offset base=%p (512 GiB, US=0, dual-mapped)\n",
+            PGT_PAGE_OFFSET)
+
+
+def pgtable_page_offset_selftest() -> uint64:
+    # Prove the high-half direct map aliases the SAME physical RAM as the
+    # low identity map. Alloc a page, write a sentinel through its LOW
+    # identity VA (== phys), read it back through the page_offset alias,
+    # and assert equality. This is the boot-marker proof that KPTI step 1
+    # (relocatable kernel view of RAM) actually resolves. Non-destructive
+    # (frees the page). Returns 1 PASS / 0 FAIL.
+    if pgt_page_offset_ready == 0:
+        printk0("[pgtable] page_offset selftest SKIP: map not built\n")
+        return 0
+    p: uint64 = alloc_page()
+    if p == 0:
+        printk0("[pgtable] page_offset selftest SKIP: OOM\n")
+        return 0
+    sentinel: uint64 = 0x5A17E00DDEADC0DE
+    cast[Ptr[uint64]](p)[0] = sentinel            # write via low identity
+    alias: uint64 = page_offset_va(p)
+    got: uint64 = cast[Ptr[uint64]](alias)[0]     # read via high-half alias
+    ok: uint64 = 0
+    if got == sentinel:
+        ok = 1
+        printk2("[pgtable] page_offset PASS phys=%p alias=%p", p, alias)
+        printk0(" reads the same RAM\n")
+    else:
+        printk2("[pgtable] page_offset FAIL phys=%p alias=%p", p, alias)
+        printk1(" got=%p\n", got)
+    free_page(p)
+    return ok
 
 # Multiboot1 constants (mirror arch/x86/kernel/e820.ad — kept inline
 # rather than imported to avoid coupling to e820.ad's private surface).

@@ -106,6 +106,21 @@ if ! grep -a -E -q "user-PT walk: kernel .text VA .* -> leaf 0x0+$" "$LOG"; then
 fi
 pass "kernel .text VA walks to an absent leaf in the user CR3"
 
+# (D) KPTI #94 step 1: the kernel-private high-half direct map (page_offset,
+# PML4[273]) is installed and aliases the SAME physical RAM as the low
+# identity map. This is the relocation foundation the live user-CR3 switch
+# needs — the kernel's view of RAM must be reachable OUT of the user-shared
+# PML4[0] before that subtree can be dropped from the user CR3. The kernel
+# proves it at boot by writing a sentinel through a page's identity VA and
+# reading it back through the page_offset alias.
+if ! grep -a -F -q "[pgtable] page_offset PASS" "$LOG"; then
+    echo "----- page_offset boot-log excerpt -----" >&2
+    grep -a -E "\[pgtable\] page_offset" "$LOG" >&2 || true
+    fail "high-half direct map (page_offset) did not prove it aliases the" \
+         "same RAM as the identity map (KPTI step-1 relocation foundation)"
+fi
+pass "page_offset direct map installed; high-half alias reaches the same RAM"
+
 # (C) Boot reached userland — the KPTI scaffold did not regress the boot.
 if ! grep -a -E -q "hamsh\\\$" "$LOG"; then
     echo "[test_kpti] INCONCLUSIVE: boot did not reach a hamsh prompt" \
