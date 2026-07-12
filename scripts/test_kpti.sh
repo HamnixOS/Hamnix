@@ -164,6 +164,22 @@ if ! grep -a -F -q "[percpu] gs.base via page_offset" "$LOG"; then
 fi
 pass "per-CPU %gs base reaches RAM through the page_offset alias (KPTI Brick B)"
 
+# (H) KPTI #94, Brick B[3/4]: virt_to_phys()/phys_to_virt() are page_offset-
+# aware, so an alias-backed buffer resolves to the SAME physical address a
+# low-identity buffer does. This is the DMA-safety prerequisite for
+# relocating slab / PT-page backing onto the alias: every device DMA site
+# (virtio/ahci/nvme/r8169) feeds virt_to_phys(buf) to hardware, so the
+# round-trip MUST hold before any consumer flip. The kernel proves it by
+# resolving both a low-identity and an alias VA to one physical frame and
+# reading a sentinel back through the alias.
+if ! grep -a -F -q "[pgtable] dma-roundtrip PASS" "$LOG"; then
+    echo "----- dma-roundtrip boot-log excerpt -----" >&2
+    grep -a -E "\[pgtable\] dma-roundtrip" "$LOG" >&2 || true
+    fail "virt_to_phys/phys_to_virt are not page_offset-aware (alias VA did" \
+         "not resolve to the same physical RAM as the low-identity VA)"
+fi
+pass "virt_to_phys/phys_to_virt page_offset-aware; alias + low-identity DMA round-trip"
+
 # (C) Boot reached userland — the KPTI scaffold did not regress the boot.
 if ! grep -a -E -q "hamsh\\\$" "$LOG"; then
     echo "[test_kpti] INCONCLUSIVE: boot did not reach a hamsh prompt" \

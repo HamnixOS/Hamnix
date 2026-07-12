@@ -89,21 +89,47 @@ PGT_KERNEL_VBASE: uint64 = 0xffffffff80000000
 
 def virt_to_phys(va: uint64) -> uint64:
     # Convert a kernel virtual address to the physical address a device
-    # can DMA to. High-half image addresses are rebased to low physical
-    # RAM; low addresses (alloc_page/kmalloc/memblock results, already
-    # identity-mapped == physical) pass through unchanged.
+    # can DMA to. THREE regimes, checked high-to-low so a high-half image
+    # VA (which is numerically also >= PGT_PAGE_OFFSET) resolves via the
+    # image branch, never the page_offset branch:
+    #   1. High-half kernel IMAGE (>= PGT_KERNEL_VBASE, 0xffffffff80..):
+    #      a global / .text / .bss byte. phys = va - KERNEL_VBASE.
+    #   2. page_offset DIRECT-MAP alias ([PGT_PAGE_OFFSET, PGT_KERNEL_VBASE),
+    #      0xffff8880.. .. 0xffffffff80..): the kernel-private high-half
+    #      window onto physical RAM installed by KPTI #94 step 1. This is
+    #      the alias a KPTI-isolated slab/kstack/PT allocation is reached
+    #      through. phys = va - PGT_PAGE_OFFSET.
+    #   3. Low identity (< PGT_PAGE_OFFSET): an alloc_page/kmalloc/memblock
+    #      result today (already identity-mapped == physical). Passes
+    #      through unchanged.
+    # Branch 2 is DEAD until a consumer flip (Brick B[4/4]) starts handing
+    # out alias VAs — no current caller passes a [PGT_PAGE_OFFSET, VBASE)
+    # address — so adding it is semantics-preserving for every present DMA
+    # site. It is the CENTRAL prerequisite for that flip: once slab returns
+    # alias VAs, ~15 DMA sites doing virt_to_phys(buf) resolve correctly
+    # here instead of feeding the raw alias VA to hardware as a "physical"
+    # address.
     if va >= PGT_KERNEL_VBASE:
         return va - PGT_KERNEL_VBASE
+    if va >= PGT_PAGE_OFFSET:
+        return va - PGT_PAGE_OFFSET
     return va
 
 
 def phys_to_virt(pa: uint64) -> uint64:
-    # Inverse of virt_to_phys for addresses inside the kernel image's
-    # physical footprint. A low physical address is also a valid
-    # virtual address through the low identity map, so callers that
-    # just want to dereference physical RAM can use `pa` directly; this
-    # helper exists for symmetry and for code that specifically wants
-    # the high-half alias of an image byte.
+    # Canonical kernel virtual address for a physical RAM byte, and the
+    # inverse of virt_to_phys's alias branch. Once the page_offset direct
+    # map is live (KPTI #94 step 1; pgt_page_offset_ready==1) the canonical
+    # kernel view of RAM is the kernel-private high-half alias, so we return
+    # pa + PGT_PAGE_OFFSET — which round-trips an alias-backed buffer exactly
+    # (phys_to_virt(virt_to_phys(alias_va)) == alias_va). Before the map is
+    # built (very early boot) we fall back to the high-half IMAGE alias for
+    # the narrow image-footprint symmetry this helper historically served.
+    # A low physical address is ALSO a valid VA through the low identity map,
+    # so callers that just want to dereference physical RAM can still use
+    # `pa` directly; nothing in-tree calls this in a hot path.
+    if pgt_page_offset_ready != 0:
+        return pa + PGT_PAGE_OFFSET
     return pa + PGT_KERNEL_VBASE
 
 
@@ -231,6 +257,66 @@ def pgtable_page_offset_selftest() -> uint64:
         printk2("[pgtable] page_offset FAIL phys=%p alias=%p", p, alias)
         printk1(" got=%p\n", got)
     free_page(p)
+    return ok
+
+
+def pgtable_dma_roundtrip_selftest() -> uint64:
+    # KPTI #94, Brick B[3/4] DMA-safety proof. Before slab / PT-page backing
+    # can be relocated onto the page_offset alias, virt_to_phys() and
+    # phys_to_virt() MUST resolve an alias VA to the SAME physical address a
+    # low-identity VA does. This is load-bearing for DMA: every device site
+    # (virtio-gpu/-modern/-ring/-net, ahci, nvme, r8169) computes its DMA
+    # target with virt_to_phys(kmalloc/alloc_pages result). If the allocator
+    # starts returning alias VAs and virt_to_phys mis-resolved them, the
+    # device would DMA to a garbage physical address — SILENT disk/net/GPU
+    # corruption, not a clean fault. Prove BOTH regimes here on every boot.
+    #
+    # Checks (non-destructive; frees its page):
+    #   (1) low-identity buffer: virt_to_phys(p) passes through == p (phys).
+    #   (2) alias buffer: virt_to_phys(page_offset_va(p)) rebases to the SAME
+    #       physical page p.
+    #   (3) same-RAM: a sentinel written through the low-identity VA reads
+    #       back through the alias VA (both name one physical frame — exactly
+    #       what a device would DMA to).
+    #   (4) inverse: phys_to_virt(virt_to_phys(alias)) round-trips the alias.
+    # Returns 1 PASS / 0 FAIL.
+    if pgt_page_offset_ready == 0:
+        printk0("[pgtable] dma-roundtrip SKIP: page_offset map not built\n")
+        return 0
+    p: uint64 = alloc_page()            # low-identity VA == physical address
+    if p == 0:
+        printk0("[pgtable] dma-roundtrip SKIP: OOM\n")
+        return 0
+    alias:  uint64 = page_offset_va(p)
+    lo_pa:  uint64 = virt_to_phys(p)      # (1) pass-through
+    hi_pa:  uint64 = virt_to_phys(alias)  # (2) alias rebased to phys
+    ok: uint64 = 1
+    if lo_pa != p:
+        printk2("[pgtable] dma-roundtrip FAIL: low-identity v2p(%p)=%p\n",
+                p, lo_pa)
+        ok = 0
+    if hi_pa != p:
+        printk2("[pgtable] dma-roundtrip FAIL: alias v2p(%p)=%p", alias, hi_pa)
+        printk1(" (expected phys %p)\n", p)
+        ok = 0
+    # (3) Same-RAM: write through low identity, read through the alias.
+    sentinel: uint64 = 0xDEADBEEFCAFEF00D
+    cast[Ptr[uint64]](p)[0] = sentinel
+    got: uint64 = cast[Ptr[uint64]](alias)[0]
+    if got != sentinel:
+        printk2("[pgtable] dma-roundtrip FAIL: alias %p read %p", alias, got)
+        printk0(" (not the same RAM as the low-identity VA)\n")
+        ok = 0
+    # (4) Inverse: phys_to_virt returns the canonical alias, round-tripping.
+    back: uint64 = phys_to_virt(hi_pa)
+    if back != alias:
+        printk2("[pgtable] dma-roundtrip FAIL: phys_to_virt(%p)=%p", hi_pa, back)
+        printk1(" (expected alias %p)\n", alias)
+        ok = 0
+    free_page(p)
+    if ok == 1:
+        printk2("[pgtable] dma-roundtrip PASS: phys=%p alias=%p", p, alias)
+        printk0(" v2p/p2v resolve the same RAM (low-identity + alias)\n")
     return ok
 
 
