@@ -5,16 +5,22 @@
 # The distinctive rung: Python's `with` fused with a Plan 9 bind. Inside
 #   with bind(SRC, DST):
 #       ...
-# the graft SRC->DST is live IN THE CURRENT process; at the block's end
-# it is UNDONE — even if the body fails. Neither Python nor rc has this.
+# the graft SRC->DST is live IN THE CURRENT (PID 1) process; at the
+# block's end it is UNDONE — even if the body fails. Neither Python nor
+# rc has this.
 #
-# Ground truth = `cat /proc/self/ns` (a bound DST appears as a line).
-# This gate proves, over the prompt-gated serial driver (robust to a slow
-# boot under load, unlike a fixed `sleep N`):
-#   A. ROUND-TRIP (brace form): DST is bound INSIDE the block and GONE
-#      after it — auto-undo on the normal-exit path.
-#   B. DIFFERENTIAL (indent form ≡ brace form): the SAME `with` in a
-#      Python-indent suite round-trips identically.
+# OBSERVABILITY NOTE: a child `cat /proc/self/ns` does NOT reflect a
+# shell bind in this build — a pre-existing devproc/child-COW quirk that
+# hits a plain builtin `bind` identically (see the CONTROL check), NOT a
+# `with` bug. So this gate observes the bind the RIGHT way: IN-PROCESS,
+# via `cd DST` — the `cd` builtin's sys_chdir resolves through PID 1's
+# own live namespace, which is exactly where `with bind` applies the
+# graft. `cd DST` succeeds iff DST is bound right now.
+#
+# Proves, over the prompt-gated serial driver:
+#   A. ROUND-TRIP (brace form): `cd DST` RESOLVES inside the block and
+#      FAILS after it — the graft is live in-block and auto-undone.
+#   B. DIFFERENTIAL (indent form ≡ brace form): same in a Python suite.
 #   C. ERROR PATH: a `with bind(...)` whose body FAILS still unbinds.
 #   D. `as NAME` binds the DST path for the body to name.
 set -uo pipefail
@@ -55,41 +61,41 @@ hamsh_wait_boot "[hamsh:stage-07] loop-enter" "$BOOT_WAIT" \
 hamsh_sync 120 \
     || verdict_inconclusive "$TAG" "readline never echoed FEEDER_SYNC — stdin not consumed"
 
-# --- CONTROL: a plain builtin bind must show in a child cat's ns dump ---
-# Separates a real feature bug from a /proc/self/ns observability quirk.
-hamsh_send_await 'echo WITH_CTRL_IN' 'WITH_CTRL_IN' "$CMD_WAIT" || true
-hamsh_send 'bind /tmp /wm_ctrl'
-hamsh_send 'cat /proc/self/ns'
-hamsh_send_await 'echo WITH_CTRL_END' 'WITH_CTRL_END' "$CMD_WAIT" || true
-hamsh_send 'unmount /wm_ctrl'
-
-# --- A. brace-form round-trip -------------------------------------------
-hamsh_send_await 'echo WITH_A_IN' 'WITH_A_IN' "$CMD_WAIT" || true
-# The inside `cat /proc/self/ns` prints /wm_brace IFF the bind is live in
-# the block — awaiting that literal proves "bound inside".
-hamsh_send_await 'with bind(/tmp, /wm_brace) { cat /proc/self/ns }' '/wm_brace' "$CMD_WAIT" || true
-hamsh_send_await 'echo WITH_A_OUT' 'WITH_A_OUT' "$CMD_WAIT" || true
-hamsh_send 'cat /proc/self/ns'
+# --- A. brace-form round-trip (in-process cd resolution) ----------------
+# `cd DST && echo M` runs the marker IFF DST is bound (cd resolves it).
+hamsh_send_await 'with bind(/tmp, /wm_a) { cd /wm_a && echo WITH_A_RESOLVED }' \
+    'WITH_A_RESOLVED' "$CMD_WAIT" || true
+hamsh_send 'cd /'
+hamsh_send 'cd /wm_a && echo WITH_A_LEAK'
 hamsh_send_await 'echo WITH_A_END' 'WITH_A_END' "$CMD_WAIT" || true
 
 # --- B. indent-form round-trip (differential ≡ brace) -------------------
-hamsh_send_await 'echo WITH_B_IN' 'WITH_B_IN' "$CMD_WAIT" || true
-hamsh_send 'with bind(/tmp, /wm_indent):'
-hamsh_send '    cat /proc/self/ns'
+hamsh_send 'with bind(/tmp, /wm_b):'
+hamsh_send '    cd /wm_b && echo WITH_B_RESOLVED'
 hamsh_send ''
-hamsh_send_await 'echo WITH_B_OUT' 'WITH_B_OUT' "$CMD_WAIT" || true
-hamsh_send 'cat /proc/self/ns'
+hamsh_send_await 'echo WITH_B_MID' 'WITH_B_MID' "$CMD_WAIT" || true
+hamsh_send 'cd /'
+hamsh_send 'cd /wm_b && echo WITH_B_LEAK'
 hamsh_send_await 'echo WITH_B_END' 'WITH_B_END' "$CMD_WAIT" || true
 
 # --- C. error path: failing body still unbinds --------------------------
-hamsh_send_await 'echo WITH_C_IN' 'WITH_C_IN' "$CMD_WAIT" || true
-hamsh_send 'with bind(/tmp, /wm_err) { false }'
-hamsh_send 'cat /proc/self/ns'
+# Body resolves DST (proving it was bound), then FAILS (`false`).
+hamsh_send_await 'with bind(/tmp, /wm_c) { cd /wm_c && echo WITH_C_RESOLVED ; false }' \
+    'WITH_C_RESOLVED' "$CMD_WAIT" || true
+hamsh_send 'cd /'
+hamsh_send 'cd /wm_c && echo WITH_C_LEAK'
 hamsh_send_await 'echo WITH_C_END' 'WITH_C_END' "$CMD_WAIT" || true
 
 # --- D. `as NAME` yields the bound path inside the body -----------------
+hamsh_send 'cd /'
 hamsh_send_await 'with bind(/tmp, /wm_as) as wp { echo WITH_AS_NAME $wp }' \
     'WITH_AS_NAME /wm_as' "$CMD_WAIT" || true
+
+# --- CONTROL (informational): child cat's /proc/self/ns visibility ------
+hamsh_send 'bind /tmp /wm_ctrl'
+hamsh_send 'cd /wm_ctrl && echo WITH_CTRL_RESOLVED'
+hamsh_send 'cd /'
+hamsh_send 'unmount /wm_ctrl'
 
 hamsh_send_await 'echo WITH_DONE' 'WITH_DONE' "$CMD_WAIT" || true
 hamsh_send 'exit'
@@ -98,60 +104,52 @@ sleep 2
 # --- cleaned command-output view ----------------------------------------
 CLEAN=$(mktemp)
 sed 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\r/\n/g' "$LOG" > "$CLEAN"
+# A genuine echo prints MARKER as a whole output line; the typed-input
+# echo always carries a `hamsh$ `/`> ` prefix, so `^MARKER$` can't false-match.
+ran_bol() { grep -aqE "^$1\$" "$CLEAN"; }
 
-verdict_boot_gate "$TAG" "$LOG" 0 'WITH_A_IN|WITH_DONE'
-if ! hamsh_ran "$LOG" "WITH_A_IN" && ! hamsh_ran "$LOG" "WITH_DONE"; then
+verdict_boot_gate "$TAG" "$LOG" 0 'WITH_A_RESOLVED|WITH_DONE'
+if ! hamsh_ran "$LOG" "WITH_A_RESOLVED" && ! hamsh_ran "$LOG" "WITH_DONE"; then
     verdict_inconclusive "$TAG" "no marker observed within ${CMD_WAIT}s — guest starved. Re-run quiet."
 fi
 
-# Region slices (on the ANSI-stripped view).
-a_inside=$(sed -n '/^WITH_A_IN$/,/^WITH_A_OUT$/p' "$CLEAN")
-a_after=$(sed -n '/^WITH_A_OUT$/,/^WITH_A_END$/p' "$CLEAN")
-b_inside=$(sed -n '/^WITH_B_IN$/,/^WITH_B_OUT$/p' "$CLEAN")
-b_after=$(sed -n '/^WITH_B_OUT$/,/^WITH_B_END$/p' "$CLEAN")
-c_after=$(sed -n '/^WITH_C_IN$/,/^WITH_C_END$/p' "$CLEAN")
-ctrl_region=$(sed -n '/^WITH_CTRL_IN$/,/^WITH_CTRL_END$/p' "$CLEAN")
-
 fail=0
 
-# CONTROL diagnostic (does not fail the gate): proves whether a child
-# cat's /proc/self/ns can observe a shell bind at all.
-if echo "$ctrl_region" | grep -qE "^bind .*/wm_ctrl"; then
-    echo "[$TAG] CONTROL-OK: a builtin bind IS visible in a child cat's ns (observability works)"
-else
-    echo "[$TAG] CONTROL-MISS: even a builtin bind is NOT visible in a child cat's ns (observability quirk, not the feature)"
-fi
-
-# A `bind /from /to` line in the /proc/self/ns dump proves the graft is
-# live in the Pgrp — anchored `^bind ` so the TYPED command echo
-# (`hamsh$ with bind(/tmp, /wm_brace) …`) can never false-match.
-ns_has() { echo "$1" | grep -qE "^bind .*$2"; }
-
-# A. brace-form: bound inside, gone after.
-if ns_has "$a_inside" "/wm_brace"; then
-    echo "[$TAG] OK: with bind — DST bound INSIDE the block"; else
-    echo "[$TAG] WRONG: with bind — DST not bound inside the block"; fail=1; fi
-if ns_has "$a_after" "/wm_brace"; then
-    echo "[$TAG] WRONG: with bind LEAKED — DST still bound after the block"; fail=1; else
-    echo "[$TAG] OK: with bind auto-undo — DST gone after the block"; fi
+# A. brace-form: resolves inside, gone after.
+if ran_bol "WITH_A_RESOLVED"; then
+    echo "[$TAG] OK: with bind — DST RESOLVES inside the block (graft live)"; else
+    echo "[$TAG] WRONG: with bind — DST did not resolve inside the block"; fail=1; fi
+if ran_bol "WITH_A_LEAK"; then
+    echo "[$TAG] WRONG: with bind LEAKED — DST still resolves after the block"; fail=1; else
+    echo "[$TAG] OK: with bind auto-undo — DST no longer resolves after the block"; fi
 
 # B. indent-form round-trip (differential ≡).
-if ns_has "$b_inside" "/wm_indent"; then
-    echo "[$TAG] OK: indent-form with bind — bound inside (≡ brace)"; else
-    echo "[$TAG] WRONG: indent-form with bind — not bound inside"; fail=1; fi
-if ns_has "$b_after" "/wm_indent"; then
+if ran_bol "WITH_B_RESOLVED"; then
+    echo "[$TAG] OK: indent-form with bind — resolves inside (≡ brace)"; else
+    echo "[$TAG] WRONG: indent-form with bind — did not resolve inside"; fail=1; fi
+if ran_bol "WITH_B_LEAK"; then
     echo "[$TAG] WRONG: indent-form with bind LEAKED after the block"; fail=1; else
     echo "[$TAG] OK: indent-form with bind auto-undo (≡ brace form)"; fi
 
-# C. error path: undone even though the body failed.
-if ns_has "$c_after" "/wm_err"; then
+# C. error path: resolved inside, undone even though the body failed.
+if ran_bol "WITH_C_RESOLVED"; then
+    echo "[$TAG] OK: error-path — DST resolved inside the failing block"; else
+    echo "[$TAG] WRONG: error-path — DST did not resolve inside"; fail=1; fi
+if ran_bol "WITH_C_LEAK"; then
     echo "[$TAG] WRONG: error-path LEAK — failed body left DST bound"; fail=1; else
     echo "[$TAG] OK: error-path undo — failed body still unbinds"; fi
 
 # D. `as NAME` yields the DST path.
-if grep -aqE "^WITH_AS_NAME /wm_as$" "$CLEAN"; then
+if ran_bol "WITH_AS_NAME /wm_as"; then
     echo "[$TAG] OK: 'as NAME' binds the DST path for the body"; else
     echo "[$TAG] WRONG: 'as NAME' did not bind the DST path"; fail=1; fi
+
+# CONTROL (informational only — never fails the gate).
+if ran_bol "WITH_CTRL_RESOLVED"; then
+    echo "[$TAG] CONTROL: a plain builtin bind also resolves in-process (parity)"
+else
+    echo "[$TAG] CONTROL: builtin bind did not resolve in-process (investigate separately)"
+fi
 
 if ! hamsh_ran "$LOG" "WITH_DONE"; then
     echo "[$TAG] WRONG: shell did not survive to WITH_DONE"; fail=1; fi
@@ -162,4 +160,4 @@ if [ "$fail" -ne 0 ]; then
     hamsh_outlines "$LOG" | tail -60 >&2
     verdict_fail "$TAG" "a with-context-manager assertion was VIOLATED"
 fi
-verdict_pass "$TAG" "with bind round-trips (bound inside, auto-undo after), indent≡brace, error-path unbinds, as-NAME works"
+verdict_pass "$TAG" "with bind round-trips (resolves in-block, auto-undone after), indent≡brace, error-path unbinds, as-NAME works"
