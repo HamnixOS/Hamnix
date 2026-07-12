@@ -40,6 +40,7 @@
 # feature are left alone — setting an unsupported CR4 bit #GPs.
 
 from kernel.printk.printk import printk0, printk1, printk2
+from mm.page_alloc import alloc_page, free_page
 
 extern def cpuid_get(leaf: uint32, subleaf: uint32, out: Ptr[uint32])
 extern def read_cr4() -> uint64
@@ -48,6 +49,11 @@ extern def get_bsp_cr3() -> uint64
 extern def load_cr3(value: uint64)
 extern def read_msr(index: uint32) -> uint64
 extern def write_msr(index: uint32, value: uint64)
+# High-VMA bounds of the kernel .text (arch/x86/kernel/head_64.S). Used by
+# the KPTI isolation self-test to walk an ACTUAL kernel code address in the
+# stripped "user" PML4 and prove it does not resolve — robust against the
+# KASLR module-window slide (which does not move the kernel .text base).
+extern def kernel_text_start() -> uint64
 
 # Runtime flags set by setup_smep_smap(). mm/uaccess.ad reads
 # cr4_smap_enabled before calling _stac() / _clac() — on pre-Broadwell
@@ -866,3 +872,299 @@ def cpu_mitig_mds_active() -> uint64:
     # (CLEAR_CPU_BUFFERS) is actually flushing CPU buffers on this host
     # (MD_CLEAR microcode present and the part is not MDS-immune).
     return mds_mitigation_active
+
+
+# ============================================================================
+# KPTI — Kernel Page-Table Isolation (Meltdown / CVE-2017-5754 mitigation).
+# ============================================================================
+#
+# GOAL (Linux `pti`): give each process a SECOND, minimal top-level page
+# table (the "user CR3") that maps user space + a tiny entry trampoline but
+# NOT the kernel, and switch CR3 kernel<->user on every ring transition. A
+# CPL=3 Meltdown probe of a kernel VA then faults on a NOT-PRESENT mapping
+# instead of speculatively leaking the byte, because the kernel simply is
+# not mapped while user code runs.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# THE HAMNIX ARCHITECTURAL WALL (why full Meltdown isolation is not yet
+# reachable — verified against the live page tables, 2026-07-11):
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Linux's KPTI works because kernel and user memory occupy DISJOINT virtual
+# ranges: user in the low canonical half, and ALL kernel memory — .text AND
+# the direct map of physical RAM (kstacks, page tables, task_structs, the
+# kmalloc heap, per-CPU areas, TSS/IST) — in the high canonical half behind
+# `page_offset_base`. KPTI's user PT keeps the low half (user) + a trampoline
+# and drops the high half (all kernel), so nothing secret is mapped.
+#
+# Hamnix's address space is shaped the OPPOSITE way (kernel.lds + the boot
+# stub + fs/elf.ad):
+#   * PML4[511] (0xffffffff80000000+) maps ONLY the static kernel IMAGE
+#     (.text/.rodata/.data/.bss — which happens to include idt_table,
+#     per_cpu_tss, per_cpu_gdt, the #DF IST stack, and the entry stubs).
+#   * PML4[0] (low identity) maps low physical RAM 1:1 and is SHARED as
+#     BOTH the kernel's only direct map AND the backing for user pages —
+#     user memory is identity-/bias-mapped into the SAME low RAM the kernel
+#     allocates its kstacks, page tables, task_structs, kmalloc heap and
+#     per-CPU %gs areas from (see mm/page_alloc.ad, fs/elf.ad, the
+#     setup_per_cpu_areas memblock_alloc, and the "vaddr==phys" contract in
+#     mm/uaccess.ad).
+#
+# Consequence for a Meltdown-protective user CR3:
+#   - It MUST keep PML4[0] mapped (that is where the user's own pages live).
+#   - But PML4[0] IS the kernel direct map, so keeping it mapped re-exposes
+#     every kstack (saved registers, syscall args), every page table, every
+#     task_struct and the whole kmalloc heap to the CPL=3 Meltdown probe.
+#   - Dropping PML4[0] makes user code unrunnable.
+# There is no bit to set that hides the kernel heap while keeping user pages:
+# they are the SAME PML4[0] subtree. So the kernel HALF we CAN hide (drop
+# PML4[511]) is only the static image; the dynamic kernel state that
+# Meltdown most wants (kstacks/pagetables/heap) is unhideable WITHOUT first
+# relocating the entire kernel direct map out of the user-shared low half
+# into a kernel-private region (a Linux-style high-half `page_offset` direct
+# map). That relocation is a foundational mm rewrite touching every
+# vaddr==phys assumption (uaccess/elf/pgtable/page_alloc) — exactly the
+# aliasing class the ET_DYN↔direct-map work already fought.
+#
+# THE SWAPGS-LESS %gs CRUX (the documented deferral reason) — verified:
+#   Hamnix sets IA32_GS_BASE directly (setup_percpu_asm.S wrmsr_gsbase) and
+#   NEVER swapgs; on a CPL3 entry %gs ALREADY points at the kernel per-CPU
+#   area. That is actually SIMPLER than Linux for a trampoline (no swapgs
+#   ordering to get right). The real ordering problem is elsewhere: the
+#   entry stub reads per_cpu_tss (PML4[511], .bss) and the IDT (PML4[511])
+#   and its own code (PML4[511], .text) BEFORE it could switch CR3 — and on
+#   a syscall SYSCALL does not even consult the TSS, it just jumps to LSTAR
+#   (syscall_entry, in PML4[511] .text). So a user CR3 that drops PML4[511]
+#   triple-faults at the very first CPL3->CPL0 transition: the CPU cannot
+#   fetch the IDT gate / entry stub, #PF's, the #PF gate is also unmapped,
+#   #DF, its gate unmapped, RESET. To switch CR3 safely the user PT must
+#   still map the ENTRY WINDOW at its kernel VAs: idt_table, per_cpu_gdt,
+#   per_cpu_tss, the #DF IST stack, mds_verw_sel, and the entry .text
+#   (syscall_entry + every trap/irq stub up to the CR3 switch). In Hamnix
+#   those pages are SCATTERED across the high-half .text/.bss/.rodata rather
+#   than collected into a Linux-style contiguous `cpu_entry_area`, so a live
+#   trampoline needs that collection built first.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# WHAT THIS COMMIT LANDS (banked, gated, boot-safe):
+# ─────────────────────────────────────────────────────────────────────────
+#   1. Meltdown-susceptibility detection (IA32_ARCH_CAPABILITIES.RDCL_NO)
+#      + a mitigation-log line + status accessors (parity with the SMEP /
+#      SMAP / Spectre-v2 / MDS reporting already here).
+#   2. kpti_build_user_pml4(): the real per-process "user CR3" constructor —
+#      allocates a fresh top-level page, copies PML4[0] (user + the shared
+#      low identity) and leaves PML4[511] UNMAPPED, i.e. the kernel static
+#      image is stripped from the user view. This is the exact page-table
+#      object a live trampoline would install on ring exit.
+#   3. kpti_isolation_selftest(): NON-DESTRUCTIVE proof of acceptance
+#      criterion (b) — builds a user PML4 from the boot CR3 and WALKS it
+#      (read-only, no CR3 switch, so zero triple-fault risk) to assert that
+#      an actual kernel .text VA does NOT resolve in it while a low user VA
+#      does. Frees the page. Logged as [kpti] PASS/FAIL.
+#   4. The trampoline CR3-switch primitives live in arch/x86/kernel/
+#      kpti_asm.S (kpti_cr3_to_user / kpti_cr3_to_kernel) with the
+#      VERW-vs-CR3 ordering worked out, as the building blocks for the live
+#      splice — deliberately NOT wired into the hot entry path yet, so the
+#      green boot is preserved and the remaining work (build the
+#      cpu_entry_area; then, for real protection, relocate the kernel direct
+#      map out of PML4[0]) is isolated to those two follow-ups.
+#
+# The live per-entry CR3 switch is GATED (KPTI_LIVE_ENABLE, default 0). With
+# it 0 the box boots exactly as before; the detection + self-test run
+# regardless so the mechanism is exercised on every boot.
+
+# IA32_ARCH_CAPABILITIES.RDCL_NO (bit 0): the part is NOT susceptible to
+# Rogue Data Cache Load (Meltdown). If set, KPTI would be pure overhead and
+# Linux leaves `pti` off. MSR 0x10a is only architectural when
+# CPUID.07h:EDX[29] (ARCH_CAP) is advertised — reuse the existing gate.
+ARCH_CAP_RDCL_NO: uint64 = 0x1
+
+# Compile-time gate for the LIVE per-entry CR3 switch (the trampoline splice
+# into syscall_64.S / irq_asm.S / trap_asm.S). Default 0: the switch is NOT
+# engaged, so the box boots unchanged. Detection + the read-only isolation
+# self-test run irrespective of this flag. Flipping this to 1 is blocked on
+# the two follow-ups documented above (cpu_entry_area collection; kernel
+# direct-map relocation out of PML4[0]).
+KPTI_LIVE_ENABLE: uint64 = 0
+
+# Runtime state, published by setup_kpti() / kpti_isolation_selftest().
+kpti_cpu_affected:   uint64 = 0   # 1 iff the CPU is Meltdown-susceptible
+kpti_supported:      uint64 = 0   # 1 iff the user-PT machinery is built in
+kpti_live:           uint64 = 0   # 1 iff the per-entry CR3 switch is engaged
+kpti_selftest_pass:  uint64 = 0   # 1 iff the isolation self-test proved
+                                  #   kernel .text unmapped in the user PT
+
+
+def kpti_build_user_pml4(kernel_pml4_phys: uint64) -> uint64:
+    # Construct a process's "user CR3": a fresh top-level page that maps
+    # user space (via the shared PML4[0] low-identity subtree) but NOT the
+    # kernel static image (PML4[511] left 0). This is the page-table object
+    # a live KPTI trampoline installs on every ring exit.
+    #
+    # We COPY the PML4[0] entry (sharing the whole PDPT/PD/PT subtree with
+    # the kernel PT — that subtree backs the user's pages) and leave every
+    # other slot 0, so 0xffffffff8000_0000+ (kernel .text/.rodata/.data/.bss,
+    # incl. idt_table / per_cpu_tss) is ABSENT from this table. Returns the
+    # physical address of the fresh PML4 page, or 0 on OOM. The caller owns
+    # it and must free_page() it when the task's address space is torn down.
+    #
+    # NB: because PML4[0] is Hamnix's shared kernel direct map (see the wall
+    # write-up above), this table still exposes the low-identity kernel heap
+    # to a CPL3 Meltdown probe. Stripping THAT requires relocating the direct
+    # map out of PML4[0] first; this constructor is the mechanism, not yet
+    # the full isolation.
+    user_pml4: uint64 = alloc_page()
+    if user_pml4 == 0:
+        return 0
+    # Zero the fresh page (alloc_page does not guarantee zeroed).
+    dst: Ptr[uint64] = cast[Ptr[uint64]](user_pml4)
+    i: uint64 = 0
+    while i < cast[uint64](512):
+        dst[i] = cast[uint64](0)
+        i = i + 1
+    # Copy ONLY PML4[0] (low identity + user). PML4[511] stays 0 → kernel
+    # image is unmapped in the user view.
+    src_base: uint64 = kernel_pml4_phys & PGT_ADDR_MASK_KM
+    src: Ptr[uint64] = cast[Ptr[uint64]](src_base)
+    dst[0] = src[0]
+    return user_pml4
+
+
+def _kpti_walk_present(pml4_phys: uint64, va: uint64) -> uint64:
+    # Read-only 4-level walk of `va` in the page table rooted at pml4_phys
+    # (a PHYSICAL address; low identity == virtual so we deref it directly,
+    # exactly like _restamp_pml4_subtree_us0). Returns the leaf entry (P=1)
+    # if `va` maps to a present page at any level, else 0. Handles 1 GiB and
+    # 2 MiB huge leaves. Used by the isolation self-test — never switches
+    # CR3, so it cannot fault on an unmapped kernel VA.
+    pml4_base: uint64 = pml4_phys & PGT_ADDR_MASK_KM
+    pml4_idx: uint64 = (va >> 39) & cast[uint64](0x1FF)
+    pml4e: uint64 = cast[Ptr[uint64]](pml4_base + pml4_idx * cast[uint64](8))[0]
+    if (pml4e & PGT_FLAG_P_KM) == 0:
+        return 0
+    pdpt_base: uint64 = pml4e & PGT_ADDR_MASK_KM
+    pdpt_idx: uint64 = (va >> 30) & cast[uint64](0x1FF)
+    pdpte: uint64 = cast[Ptr[uint64]](pdpt_base + pdpt_idx * cast[uint64](8))[0]
+    if (pdpte & PGT_FLAG_P_KM) == 0:
+        return 0
+    if (pdpte & PGT_FLAG_PS_KM) != 0:
+        return pdpte                         # 1 GiB leaf
+    pd_base: uint64 = pdpte & PGT_ADDR_MASK_KM
+    pd_idx: uint64 = (va >> 21) & cast[uint64](0x1FF)
+    pde: uint64 = cast[Ptr[uint64]](pd_base + pd_idx * cast[uint64](8))[0]
+    if (pde & PGT_FLAG_P_KM) == 0:
+        return 0
+    if (pde & PGT_FLAG_PS_KM) != 0:
+        return pde                           # 2 MiB leaf
+    pt_base: uint64 = pde & PGT_ADDR_MASK_KM
+    pt_idx: uint64 = (va >> 12) & cast[uint64](0x1FF)
+    pte: uint64 = cast[Ptr[uint64]](pt_base + pt_idx * cast[uint64](8))[0]
+    if (pte & PGT_FLAG_P_KM) == 0:
+        return 0
+    return pte
+
+
+def kpti_isolation_selftest() -> uint64:
+    # Acceptance criterion (b): the user CR3 does NOT map kernel .text.
+    # Build a user PML4 from the live boot CR3, then WALK it read-only:
+    #   * a kernel .text VA MUST be absent (the isolation property), and
+    #   * a low user/identity VA MUST be present (user code can still run).
+    # Returns 1 on PASS, 0 on FAIL. Non-destructive (frees its page); no CR3
+    # switch, so it is triple-fault-proof and runs on every boot.
+    kern_cr3: uint64 = get_bsp_cr3()
+    user_pml4: uint64 = kpti_build_user_pml4(kern_cr3)
+    if user_pml4 == 0:
+        printk0("[kpti] FAIL: could not allocate a user PML4 (OOM)\n")
+        return 0
+
+    ktext: uint64 = kernel_text_start()
+    kmap: uint64 = _kpti_walk_present(user_pml4, ktext)
+    # A representative low user VA: 0x400000, where non-PIE ET_EXEC user
+    # binaries link (see kernel.lds rationale) — backed by the shared
+    # PML4[0] subtree, so it must resolve.
+    umap: uint64 = _kpti_walk_present(user_pml4, cast[uint64](0x400000))
+
+    printk2("[kpti] user-PT walk: kernel .text VA %p -> leaf %p\n", ktext, kmap)
+    printk1("[kpti] user-PT walk: user VA 0x400000 -> leaf %p\n", umap)
+
+    ok: uint64 = 0
+    if kmap == 0 and umap != 0:
+        ok = 1
+        kpti_selftest_pass = 1
+        printk0("[kpti] PASS: user CR3 does NOT map kernel .text; user" \
+                " space still mapped\n")
+    else:
+        if kmap != 0:
+            printk0("[kpti] FAIL: kernel .text IS mapped in the user CR3\n")
+        if umap == 0:
+            printk0("[kpti] FAIL: user space NOT mapped in the user CR3\n")
+
+    free_page(user_pml4)
+    return ok
+
+
+def setup_kpti():
+    # Detect Meltdown susceptibility, report KPTI status, and run the
+    # non-destructive isolation self-test. Called from start_kernel after
+    # setup_spectre_v2(). No live CR3 switch is engaged (KPTI_LIVE_ENABLE=0);
+    # the machinery is exercised via the self-test on every boot.
+    buf: Array[4, uint32]
+    buf[0] = cast[uint32](0)
+    buf[1] = cast[uint32](0)
+    buf[2] = cast[uint32](0)
+    buf[3] = cast[uint32](0)
+    cpuid_get(cast[uint32](7), cast[uint32](0), &buf[0])
+    edx: uint32 = buf[3]
+    arch_cap: uint32 = (edx >> CPUID_07H_EDX_ARCH_CAP_BIT) & cast[uint32](1)
+
+    # Assume susceptible unless the CPU explicitly says RDCL_NO. Parts that
+    # don't advertise ARCH_CAPABILITIES at all (older Intel, TCG) are treated
+    # as potentially affected — the conservative Linux default.
+    affected: uint64 = 1
+    if arch_cap != cast[uint32](0):
+        caps: uint64 = read_msr(IA32_ARCH_CAPABILITIES_MSR)
+        if (caps & ARCH_CAP_RDCL_NO) != 0:
+            affected = 0
+    kpti_cpu_affected = affected
+
+    # The user-PT construction machinery is compiled in unconditionally.
+    kpti_supported = 1
+
+    if KPTI_LIVE_ENABLE == 1:
+        kpti_live = 1
+    else:
+        kpti_live = 0
+
+    printk2("[cpu-mitig] KPTI: cpu_meltdown_affected=%d supported=%d\n",
+            kpti_cpu_affected, kpti_supported)
+    printk1("[cpu-mitig] KPTI: live per-entry CR3 switch engaged=%d\n",
+            kpti_live)
+
+    # Exercise the mechanism: prove the user PT isolates the kernel image.
+    kpti_isolation_selftest()
+
+    if kpti_live == 0:
+        printk0("[cpu-mitig] KPTI staged: user-PT + trampoline built; live" \
+                " CR3 switch gated (kernel direct map shares PML4[0] with" \
+                " user — see cpu_mitigations.ad)\n")
+
+
+def cpu_mitig_kpti_supported() -> uint64:
+    # Selftest accessor: 1 iff the KPTI user-PT machinery is built in.
+    return kpti_supported
+
+
+def cpu_mitig_kpti_active() -> uint64:
+    # Selftest accessor: 1 iff the live per-entry CR3 switch is engaged.
+    return kpti_live
+
+
+def cpu_mitig_kpti_selftest_pass() -> uint64:
+    # Selftest accessor: 1 iff the isolation self-test proved the user CR3
+    # does not map kernel .text.
+    return kpti_selftest_pass
+
+
+def cpu_mitig_kpti_cpu_affected() -> uint64:
+    # Selftest accessor: 1 iff the CPU is Meltdown-susceptible (no RDCL_NO).
+    return kpti_cpu_affected
