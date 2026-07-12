@@ -5045,10 +5045,14 @@ def schedule():
     # loudly, instead of diving into a corrupt context.
     if task_table[nxt].sp < cast[uint64](0x100000):
         printk_set_level(PRINTK_LEVEL_EMERG)
-        printk2("SWITCH-BAD-SP: nxt=%d sp=%p\n",
-                cast[uint64](nxt), task_table[nxt].sp)
-        printk2("SWITCH-BAD-SP: nxt.state=%d nxt.pid=%d\n",
-                task_table[nxt].state, cast[uint64](task_table[nxt].pid))
+        printk2("SWITCH-BAD-SP: cpu=%d nxt=%d\n",
+                my_cpu, cast[uint64](nxt))
+        printk2("SWITCH-BAD-SP: sp=%p pid=%d\n",
+                task_table[nxt].sp, cast[uint64](task_table[nxt].pid))
+        printk2("SWITCH-BAD-SP: nxt.state=%d on_cpu=%d\n",
+                task_table[nxt].state, task_table[nxt].on_cpu)
+        printk2("SWITCH-BAD-SP: rq_cpu=%d kstack_top=%p\n",
+                task_table[nxt].rq_cpu, task_table[nxt].kstack_top)
         panic("schedule: dispatch into task with uninitialized sp")
 
     # FPU/SSE/AVX save+restore (mirrors the FS_BASE write above): XSAVE prev's
@@ -5483,6 +5487,32 @@ def sched_ap_idle_loop():
     printk1("SMP: cpu%d kthread alive\n", my_cpu_id)
 
     while True:
+        # #12/#413 FIX (2 of 2) — RUN THE IDLE-LOOP DISPATCH WITH IRQs OFF.
+        # The AP idle loop is the ONLY scheduler dispatch path with an IF=1
+        # baseline: schedule() is always entered from an ISR (IF=0), but the
+        # idle loop is a plain kernel loop. Its dispatch tail publishes
+        # `current_idx_pcpu = nxt` under the rq lock and THEN, after
+        # _rq_unlock_cpu restores the saved IF (==1 here), runs rcu / fpu /
+        # __switch_to_asm with IRQs ENABLED. A timer tick (the #55 AP
+        # preemption tick — newly periodic on APs, which is why this only began
+        # biting once #55 landed) or a reschedule IPI landing in that window
+        # re-enters schedule() while current_idx_pcpu already == nxt but we are
+        # STILL physically on the IDLE kthread's stack. schedule()'s
+        # __switch_to_asm then does `mov %rsp,(prev=nxt)` and saves the IDLE
+        # stack pointer into nxt->sp; nxt is later dispatched onto the idle
+        # kstack -> two contexts on one kernel stack -> canary smash / a `ret`
+        # off uninitialised low BIOS-fill RAM (rip=0xf000ff53...). schedule()
+        # on the BSP is immune: entered at IF=0, it balances its rq lock BEFORE
+        # the switch, so the switch runs at IF=0. Mirror that here — disable
+        # IRQs at the top of every idle iteration so _rq_lock_cpu's push saves
+        # IF=0 and its pop leaves IF=0; the whole dispatch-and-switch then runs
+        # with IRQs off. The no-work branch below re-enables IRQs itself around
+        # safe_halt() (its two-phase lost-wakeup guard already assumes an IF=0
+        # entry), so a halted AP still wakes on the reschedule IPI; the
+        # dispatched task runs at IF=1 (its own switch-in/iretq restores it) —
+        # only the brief switch is fenced. (Companion fix: the AP idle kthread
+        # is now CPU-pinned in sched_prepare_ap_idle so it can never be stolen.)
+        local_irq_disable()
         # PER-CPU RUNQUEUE (#6): acquire ONLY this cpu's rq lock and look for
         # a READY task that THIS cpu's runqueue owns (rq_cpu == my_cpu_id).
         _rq_lock_cpu(my_cpu_id)
@@ -5575,6 +5605,28 @@ def sched_ap_idle_loop():
             # FPU/SSE/AVX: save the idle kthread's vector file, load nxt's,
             # before the GPR switch (mirrors the FS_BASE write above).
             _fpu_ctx_switch(my_idle_slot, nxt)
+
+            # #12/#413 DIAG: never __switch_to_asm on the AP idle-loop
+            # dispatch path into a task whose saved sp is garbage/low (the
+            # schedule() path has this SWITCH-BAD-SP guard; the AP idle-loop
+            # dispatch did NOT). A legitimate kstack sp is always high
+            # (>1MiB); a low sp means we are about to `mov (sp),%rsp; ...;
+            # ret` off uninitialized low BIOS-fill RAM -> wild jump to
+            # 0xf000.... Catch it loudly WITH the full task/cpu state so the
+            # race window is identifiable.
+            if task_table[nxt].sp < cast[uint64](0x100000):
+                printk_set_level(PRINTK_LEVEL_EMERG)
+                printk2("AP-DISPATCH-BAD-SP: cpu=%d nxt=%d\n",
+                        my_cpu_id, nxt)
+                printk2("  sp=%p pid=%d\n",
+                        task_table[nxt].sp, cast[uint64](task_table[nxt].pid))
+                printk2("  state=%d on_cpu=%d\n",
+                        task_table[nxt].state, task_table[nxt].on_cpu)
+                printk2("  rq_cpu=%d is_user=%d\n",
+                        task_table[nxt].rq_cpu, cast[uint64](task_table[nxt].is_user))
+                printk2("  kstack_base=%p kstack_top=%p\n",
+                        task_table[nxt].kstack_base, task_table[nxt].kstack_top)
+                panic("AP idle-loop dispatch into task with low/garbage sp")
 
             # Context-switch to the real task.  When it eventually calls
             # schedule() and finds the idle slot is STATE_READY, it will
@@ -5714,6 +5766,26 @@ def sched_prepare_ap_idle(cpu_id: uint64) -> int32:
         printk1("SMP: sched_prepare_ap_idle cpu%d: no free slot\n", cpu_id)
         return -1
     su: uint64 = cast[uint64](slot)
+    # #12/#413 FIX — PIN the AP idle kthread to its own CPU (Linux's swapper/N
+    # is per-CPU and never migrates). kthread_create hands out AFFINITY_ALL, so
+    # WITHOUT this an AP idle kthread is a fully-unpinned task. That is fatal:
+    # the AP idle loop dispatches a real task via __switch_to_asm(idle -> task),
+    # which clears idle->on_cpu=0 AFTER saving idle->sp — but idle is left
+    # STATE_READY and LINKED on its CPU's run-list (so the task can switch back
+    # to it). A READY + on-run-list + on_cpu==0 task is exactly what
+    # _sched_try_pull_locked steals: another CPU pulls this AP's private idle
+    # kthread onto itself and resumes it from idle->sp. The idle-loop body
+    # captured my_cpu_id ONCE at entry, so the migrated idle kthread then
+    # operates on the WRONG CPU's per-CPU state — it takes the ORIGINAL CPU's
+    # rq lock from the thief CPU, writes the wrong current_idx_pcpu, and (when
+    # the two CPUs' idle kthreads collide) runs two contexts on one kernel
+    # stack -> canary smash inside _sched_try_pull_locked / a `ret` off
+    # uninitialised low RAM. Pinning to (1<<cpu_id) makes sched_cpu_allowed()
+    # false for every other CPU, so _pick_next and _sched_try_pull_locked on
+    # any OTHER CPU skip it, while the owning CPU still dispatches it normally.
+    # This is why the box was clean at <=3 CPUs (fewer thieves, the window
+    # rarely hit) but reliably corrupted at 4 (3 APs stealing from each other).
+    task_table[su].cpu_affinity = cast[uint64](1) << cpu_id
     # kthread_create sets STATE_READY; park it so BSP can't schedule it
     # and create_user_task can't reclaim the slot.
     task_table[su].state = STATE_PARKED
