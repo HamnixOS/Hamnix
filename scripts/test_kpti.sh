@@ -45,12 +45,20 @@ fail() {
     exit 1
 }
 
-echo "[test_kpti] (1/3) Build userland + initramfs + kernel"
+echo "[test_kpti] (1/3) Build userland + initramfs + kernel + ext4 DMA disk"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null 2>&1 || true
 python3 scripts/build_initramfs.py >/dev/null
 python3 -m compiler.adder compile \
     --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null
+# KPTI #94, Brick B[4/4]: a real ext4-over-DMA disk so the boot below is NOT
+# the diskless boot the earlier bricks were limited to. The kernel auto-mounts
+# this ext4 image over virtio-blk (virtqueue descriptors resolved through
+# virt_to_phys) and runs a create-file smoke (write + readback) — the exact
+# DMA path a broken __pa/__va page-table split would corrupt (a mis-stamped
+# PTE -> #PF / mount failure / garbage readback). We boot a FRESH per-run copy
+# because the create smoke mutates the image.
+python3 scripts/build_diskimg.py >/dev/null
 
 echo "[test_kpti] (2/3) Build-time objdump: KPTI machinery linked in"
 
@@ -69,13 +77,17 @@ done
 echo "[test_kpti] (3/3) Boot QEMU + assert isolation self-test + status"
 
 LOG=$(mktemp /tmp/test-kpti-boot.XXXXXX.log)
-trap 'rm -f "$SYM" "$LOG"' EXIT
+DMADISK=$(mktemp /tmp/test-kpti-ext4.XXXXXX.img)
+cp build/ext4.img "$DMADISK"
+trap 'rm -f "$SYM" "$LOG" "$DMADISK"' EXIT
 
 TIMEOUT="${HAMNIX_KPTI_TIMEOUT:-120}"
 ISO=$(kernel_iso "$ELF" 2>/dev/null)
 set +e
 timeout "${TIMEOUT}s" qemu-system-x86_64 \
-    -cdrom "$ISO" -smp 1 -nographic -no-reboot -m 512M \
+    -cdrom "$ISO" \
+    -drive file="$DMADISK",if=virtio,format=raw \
+    -smp 1 -nographic -no-reboot -m 512M \
     -monitor none -serial stdio < /dev/null > "$LOG" 2>&1
 rc=$?
 set -e
@@ -179,6 +191,40 @@ if ! grep -a -F -q "[pgtable] dma-roundtrip PASS" "$LOG"; then
          "not resolve to the same physical RAM as the low-identity VA)"
 fi
 pass "virt_to_phys/phys_to_virt page_offset-aware; alias + low-identity DMA round-trip"
+
+# (I) KPTI #94, Brick B[4/4]: the disciplined __pa()/__va() split. Every page-
+# table builder (page_offset map, cpu_entry_area) now routes an alloc_page
+# result through __pa() at the moment it is stamped into a parent entry as a
+# physical base, and __va() the moment a child base is read back out to be
+# dereferenced — the prerequisite that lets the allocator later hand out
+# page_offset-alias VAs without a raw alias getting written into a PTE as a
+# "physical" frame. Today __pa() is a pass-through no-op for the low VAs
+# alloc_page returns, so it is semantics-preserving; the proof that it did NOT
+# corrupt the page tables is a REAL disk mount over DMA. The kernel auto-mounts
+# the attached ext4 image over virtio-blk (descriptors built via virt_to_phys)
+# and runs a create-file smoke (write + readback). A mis-stamped PTE from a
+# broken split would #PF / fail the mount / corrupt the readback — none of
+# which a diskless boot can catch. This is the ext4-over-DMA verification the
+# earlier bricks explicitly deferred.
+if grep -a -E -q "\[pa-corrupt\]" "$LOG"; then
+    grep -a -E "\[pa-corrupt\]" "$LOG" >&2 || true
+    fail "buddy-allocator corruption detected during the ext4-over-DMA boot" \
+         "(a mis-stamped page-table entry from the __pa/__va split)"
+fi
+if ! grep -a -F -q "ext4 mounted at /ext" "$LOG"; then
+    echo "----- ext4-over-DMA boot-log excerpt -----" >&2
+    grep -a -E "ext4 mounted|ext4 inode#2|create smoke|virtio" "$LOG" >&2 || true
+    fail "ext4 image did not mount over virtio-blk DMA — the __pa/__va split" \
+         "may have corrupted a page-table entry on the DMA path"
+fi
+pass "ext4 rootfs image mounted over virtio-blk DMA (PT builders DMA-safe)"
+if ! grep -a -F -q "ext4: create smoke PASS" "$LOG"; then
+    echo "----- ext4 create-smoke boot-log excerpt -----" >&2
+    grep -a -E "create smoke" "$LOG" >&2 || true
+    fail "ext4 create smoke (write + readback over DMA) did not PASS — a" \
+         "mis-stamped PTE from the __pa/__va split would corrupt this path"
+fi
+pass "ext4 create smoke PASS: write + readback over DMA intact after the split"
 
 # (C) Boot reached userland — the KPTI scaffold did not regress the boot.
 if ! grep -a -E -q "hamsh\\\$" "$LOG"; then

@@ -133,6 +133,44 @@ def phys_to_virt(pa: uint64) -> uint64:
     return pa + PGT_KERNEL_VBASE
 
 
+# --- KPTI #94, Brick B[4/4]: the disciplined __pa()/__va() split -----
+#
+# The load-bearing prerequisite for relocating the kernel allocator onto
+# the page_offset alias (0xffff8880..). A page-table PAGE has TWO
+# identities the code must never conflate:
+#   * its VIRTUAL address  — how the kernel dereferences it to read/write
+#     its 512 entries (`cast[Ptr[uint64]](page + idx*8)`), and
+#   * its PHYSICAL frame base — the value the CPU page walker consumes,
+#     i.e. what is stored into the PARENT entry (`parent[i] = base | flags`)
+#     and what is loaded into CR3.
+# Today alloc_page() returns a LOW identity address where VA==PA, so the
+# two happen to be the same number and the distinction is invisible. The
+# moment alloc_page() hands out an alias VA (the eventual flip), writing
+# the raw alloc result into a PTE as a "physical base" stores 0xffff8880..
+# into the hardware walker → instant corruption (the exact hazard Brick
+# B[3/4] stopped on). The fix is a disciplined vocabulary applied at every
+# page-table builder:
+#   __pa(va)  — call at the MOMENT of storing a page pointer into a parent
+#               entry or CR3. Converts a (possibly-alias) VA to the phys
+#               base the walker needs. Today a pass-through no-op for the
+#               low VAs alloc_page returns, so it changes NO current boot.
+#   __va(pa)  — call the MOMENT a child pointer is read back OUT of an
+#               entry (`child = entry & ADDR_MASK`) before dereferencing
+#               it. Converts a phys base to a dereferenceable kernel VA.
+# These are thin, self-documenting aliases of virt_to_phys/phys_to_virt so
+# a reviewer sees INTENT at the call site ("this number is about to be
+# treated as a physical base / about to be dereferenced") rather than a
+# bare arithmetic helper. Keeping the split in the vocabulary is what makes
+# the future allocator flip a localized, auditable change instead of a
+# hunt across every builder.
+def __pa(va: uint64) -> uint64:
+    return virt_to_phys(va)
+
+
+def __va(pa: uint64) -> uint64:
+    return phys_to_virt(pa)
+
+
 # --- KPTI #94, step 1: high-half kernel direct map (page_offset) -----
 #
 # THE WALL (cpu_mitigations.ad KPTI block): Hamnix reaches all physical
@@ -213,14 +251,20 @@ def pgtable_build_page_offset_map():
         phys: uint64 = i << PGT_1GB_SHIFT
         cast[Ptr[uint64]](pdpt + i * 8)[0] = phys | PGT_DMAP_1GB_FLAGS
         i = i + 1
-    # Install the PML4[273] -> PDPT link in the live BSP PML4. The PDPT
-    # page is a low physical address (alloc_page result), directly the
-    # value we store; its own dereference above went through the identity
-    # map, which is still fully present.
+    # Install the PML4[273] -> PDPT link in the live BSP PML4. `pdpt` is the
+    # alloc_page VA we filled above (dereferenced through its own mapping);
+    # __pa() converts it to the PHYSICAL base the walker consumes for this
+    # entry. Today a no-op pass-through (alloc returns low VA==PA); once the
+    # allocator flips to alias VAs this is what keeps a 0xffff8880.. pointer
+    # from being stamped into the PML4 as a phys base. The `pml4` root itself
+    # is the boot PML4 taken from CR3 (a phys the CPU already walks) and stays
+    # identity-mapped, so it is dereferenced directly — and note this runs
+    # while BUILDING the alias (pgt_page_offset_ready still 0), so __va() is
+    # deliberately NOT used on the root here.
     cr3:  uint64 = get_bsp_cr3()
     pml4: uint64 = cr3 & PGT_ADDR_MASK
     cast[Ptr[uint64]](pml4 + PGT_PAGE_OFFSET_PML4_IDX * 8)[0] = \
-        pdpt | PGT_PML4E_KERN_FLAGS
+        __pa(pdpt) | PGT_PML4E_KERN_FLAGS
     # Flush the TLB so the new high-half window is live immediately.
     load_cr3(cr3)
     pgt_page_offset_ready = 1
@@ -421,15 +465,24 @@ def _cea_map_page(pd_base: uint64, kva: uint64) -> int32:
     pt_idx: uint64 = (offset >> 12) & cast[uint64](0x1FF)
     pd_slot: Ptr[uint64] = cast[Ptr[uint64]](pd_base + pd_idx * 8)
     pde: uint64 = pd_slot[0]
+    # `pt_base` is kept as a dereferenceable VIRTUAL address in BOTH branches
+    # so the leaf store below can index it uniformly:
+    #   * fresh path: alloc_page() already returns a VA;
+    #   * existing path: the child base read out of the PDE is a PHYSICAL
+    #     frame, so __va() converts it back to a kernel VA to dereference.
+    # When storing the freshly-allocated PT page INTO the PDE we go the other
+    # way with __pa(), stamping its physical base (not its VA) into the entry.
+    # This builder runs AFTER pgtable_build_page_offset_map() (see init.ad
+    # ordering), so the page_offset alias __va() targets is already live.
     pt_base: uint64 = 0
     if (pde & PGT_FLAG_P) == 0:
         pt_base = alloc_page()
         if pt_base == 0:
             return 0
         _cea_zero_page(pt_base)
-        pd_slot[0] = pt_base | PGT_CEA_FLAGS
+        pd_slot[0] = __pa(pt_base) | PGT_CEA_FLAGS
     else:
-        pt_base = pde & PGT_ADDR_MASK
+        pt_base = __va(pde & PGT_ADDR_MASK)
     # Leaf: phys of the image page (high-half VA rebased to low phys).
     phys: uint64 = virt_to_phys(kva & ~cast[uint64](4095))
     cast[Ptr[uint64]](pt_base + pt_idx * 8)[0] = phys | PGT_CEA_FLAGS
@@ -476,11 +529,15 @@ def pgtable_build_cpu_entry_area():
     _cea_zero_page(pd)
     pgt_cea_pd_base = pd
 
-    # Link PML4[274] -> PDPT -> PDPT[0] -> PD (all US=0).
-    cast[Ptr[uint64]](pdpt)[0] = pd | PGT_CEA_FLAGS
+    # Link PML4[274] -> PDPT -> PDPT[0] -> PD (all US=0). `pdpt` and `pd` are
+    # dereferenced through their alloc VAs; __pa() converts each to the phys
+    # base the parent entry must hold. No-op today (alloc VA==PA), flip-safe
+    # tomorrow. The `pml4` root is the boot PML4 from CR3 and stays identity-
+    # mapped, so it is dereferenced directly.
+    cast[Ptr[uint64]](pdpt)[0] = __pa(pd) | PGT_CEA_FLAGS
     cr3:  uint64 = get_bsp_cr3()
     pml4: uint64 = cr3 & PGT_ADDR_MASK
-    cast[Ptr[uint64]](pml4 + PGT_CEA_PML4_IDX * 8)[0] = pdpt | PGT_CEA_FLAGS
+    cast[Ptr[uint64]](pml4 + PGT_CEA_PML4_IDX * 8)[0] = __pa(pdpt) | PGT_CEA_FLAGS
 
     # Map executable .text (every entry stub) contiguously.
     text_pages: uint64 = _cea_map_range(pd, text_start, text_end)
