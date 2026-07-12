@@ -139,6 +139,16 @@ if os.environ.get("ENABLE_TLS_SMOKE") == "1":
 if os.environ.get("ENABLE_SMAP_TEST") == "1":
     FILES.append(("/etc/smap-test", b"1\n"))
 
+# ENABLE_MM_CORRUPT_TEST=1 plants /etc/mm-corrupt-test. init/main.ad gates
+# page_alloc_corrupt_inject_test() (tests/mm_smoke.ad) on this marker. That
+# injection deliberately scribbles a free-listed page and proves the buddy
+# allocator's _pa_get_next() self-heal catches it — but it is DESTRUCTIVE
+# (truncating the order-0 list strands the entries behind the scribbled
+# node), so #104 gated it OFF for shipped/installer boots. scripts/
+# test_mm_pa_corrupt.sh sets this to keep the self-heal path covered.
+if os.environ.get("ENABLE_MM_CORRUPT_TEST") == "1":
+    FILES.append(("/etc/mm-corrupt-test", b"1\n"))
+
 # ENABLE_NVME_SELFTEST=1 plants /etc/nvme-selftest. init/main.ad's NVMe
 # bring-up (nvme_init) gates its DESTRUCTIVE self-test battery
 # (write-smoke/blk-smoke/PRP/multi-queue/health/AER — all WRITE to LBA
