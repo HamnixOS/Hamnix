@@ -3839,9 +3839,22 @@ class X86CodeGen:
         overwhelmingly unsigned arithmetic (uint64 register/bit math) and
         that is also the long-standing behaviour this backend shipped;
         only an explicitly signed operand opts into the signed form.
+
+        Operand signedness is resolved STRUCTURALLY via _shr_value_unsigned,
+        which sees THROUGH an integer sub-expression (`a - b`, `a + 0`, ...)
+        that get_expr_type reports as None. A shallow get_expr_type lookup here
+        reported such a dividend as "unknown" and fell back to UNSIGNED div/mod
+        even when its operands are signed — so a computed signed dividend like
+        `(c*COS1 - s*SIN1) / 65536` (lib/svg.ad arc math) used divq/shrq and
+        returned ~2^54 garbage for negatives instead of the round-toward-zero
+        quotient (#102). This mirrors the shift path, which already resolves its
+        operand signedness structurally (_shr_operand_signed). For every
+        non-binary operand _shr_value_unsigned is exactly the old
+        `_is_unsigned_type(get_expr_type(...))`, so identifier/cast/member
+        dividends are byte-identical.
         """
-        lu = self._is_unsigned_type(self.get_expr_type(left))
-        ru = self._is_unsigned_type(self.get_expr_type(right))
+        lu = self._shr_value_unsigned(left)
+        ru = self._shr_value_unsigned(right)
         if lu is True or ru is True:
             return False
         # No operand is known-unsigned: signed iff some operand is

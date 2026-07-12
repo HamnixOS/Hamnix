@@ -153,21 +153,37 @@ def _signed64(reg):
     return reg - (1 << 64) if reg >> 63 else reg
 
 
+_VS_AUTO = object()   # sentinel: derive vs from gt
+
+
 class TV:
     # `gt` = what the compiler's get_expr_type() returns for this node: an
     # IntType when it is statically known (a cast, a typed identifier), or
-    # None when the compiler can't see it. CRITICAL: get_expr_type has NO case
-    # for a BinaryExpr, so EVERY arithmetic/bitwise/division sub-expression
-    # reports None to the signedness logic. The oracle must use `gt` (not the
-    # node's modelled `typ`) when deciding compare/div signedness, because
-    # that is exactly what _rel_cc / _binop_signed_op consult.
-    __slots__ = ("src", "reg", "typ", "gt")
+    # None when the compiler can't see it. get_expr_type has NO case for a
+    # BinaryExpr. The COMPARE-signedness decision (_rel_cc / cmp_is_unsigned)
+    # consults `gt`, so a binary sub-expression stays "unknown" (SIGNED default)
+    # for compares.
+    #
+    # `vs` = the STRUCTURAL value-signedness tristate (None unknown / True
+    # unsigned / False signed) that the DIV/MOD signedness decision consults.
+    # Since #102 the backend resolves a `/ %` operand's signedness THROUGH an
+    # integer sub-expression (div_use_signed / _binop_signed_op walk `a - b`,
+    # `a + 0`, ... to the leaf types via shr_value_signedness / _shr_value_
+    # unsigned), exactly as the shift path already did — so a computed SIGNED
+    # dividend like `(c*COS1 - s*SIN1) / 65536` lowers to a signed idiv/bias-
+    # corrected shift, not a logical shr. For a LEAF node vs is precisely the
+    # get_expr_type view (`_shr_value_unsigned(leaf) == _is_unsigned_type(
+    # get_expr_type(leaf))`); binop/div TVs pass an explicit combined vs.
+    __slots__ = ("src", "reg", "typ", "gt", "vs")
 
-    def __init__(self, src, reg, typ, gt=None):
+    def __init__(self, src, reg, typ, gt=None, vs=_VS_AUTO):
         self.src = src
         self.reg = reg & U64MASK   # the exact bits %rax would hold
         self.typ = typ             # the value's modelled type (for width/val)
         self.gt = gt               # get_expr_type() view: IntType or None
+        # Structural value-signedness for the /%>> decision. A leaf's vs is its
+        # get_expr_type view (unset default); binop/div TVs pass a combined vs.
+        self.vs = _gt_is_unsigned(gt) if vs is _VS_AUTO else vs
 
     @property
     def val(self):
@@ -239,12 +255,30 @@ def eval_cmp(a, b, op):
     return {"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[op]
 
 
+def _combine_vs(lvs, rvs):
+    """Structural value-signedness of an arithmetic/bitwise/div/mod binop from
+    its operands' tristates. Mirrors codegen shr_value_signedness /
+    _shr_value_unsigned: unsigned if EITHER operand is unsigned, else signed if
+    EITHER is signed, else unknown. (True unsigned / False signed / None unknown.)"""
+    if lvs is True or rvs is True:
+        return True
+    if lvs is False or rvs is False:
+        return False
+    return None
+
+
 def divshift_is_signed(a, b):
-    """Mirror codegen _binop_signed_op for / % >>: SIGNED iff some operand is
-    known-signed AND none is known-unsigned; UNSIGNED otherwise (the default,
-    including when both operands are unknown/None)."""
-    au = _gt_is_unsigned(a.gt)
-    bu = _gt_is_unsigned(b.gt)
+    """Mirror codegen div_use_signed / _binop_signed_op for / % >>: SIGNED iff
+    some operand is known-signed AND none is known-unsigned; UNSIGNED otherwise
+    (the default, including when both operands are unknown/None).
+
+    Uses the STRUCTURAL value-signedness `vs` (not the shallow get_expr_type
+    `gt`), so a computed dividend such as `(a - b) / 1024` is judged by its leaf
+    types — the #102 fix. For a leaf operand vs == the old gt-based view, so
+    identifier/cast/typed operands are unchanged; only integer sub-expression
+    operands (previously "unknown" -> unsigned default) now resolve."""
+    au = a.vs
+    bu = b.vs
     if au is True or bu is True:
         return False
     return au is False or bu is False
@@ -284,8 +318,10 @@ class Gen:
         else:  # ^
             r = x ^ y
         src = f"({a.src} {op} {b.src})"
-        # An arithmetic BinaryExpr has NO get_expr_type() case -> gt=None.
-        return TV(src, _to_reg(r), typ, gt=None)
+        # An arithmetic BinaryExpr has NO get_expr_type() case -> gt=None, but its
+        # STRUCTURAL value-signedness (for the /%>> decision that walks through it
+        # since #102) combines its operands'.
+        return TV(src, _to_reg(r), typ, gt=None, vs=_combine_vs(a.vs, b.vs))
 
     # ---- division / modulo: 64-bit idivq/divq; signedness chosen by the
     #      compiler's _binop_signed_op over the operands' get_expr_type().
@@ -354,8 +390,10 @@ class Gen:
             r = au - q * bu
         val = q if op == "/" else r
         src = f"({a.src} {op} {b.src})"
-        # Division BinaryExpr -> gt=None (no get_expr_type case).
-        return TV(src, _to_reg(val), typ, gt=None)
+        # Division BinaryExpr -> gt=None (no get_expr_type case); structural vs
+        # combines the operands (matching shr_value_signedness's DIV/MOD case so
+        # a `(x / y) / z` nest resolves).
+        return TV(src, _to_reg(val), typ, gt=None, vs=_combine_vs(a.vs, b.vs))
 
     # ---- comparison: yields a 0/1 register; signedness of the compare is the
     #      crux of two May bugs. Backend uses an unsigned compare if EITHER
