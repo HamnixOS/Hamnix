@@ -1,0 +1,1250 @@
+# lib/svg.ad — a pure-Adder, integer-only, from-scratch minimal SVG rasterizer.
+#
+# Mirrors lib/png.ad / lib/jpeg.ad / lib/gif.ad's shape: the caller slurps the
+# file bytes and hands them here; the rendered RGBA lives in this module's BSS
+# and is read back via svg_width()/svg_height() / svg_rgba_ptr() / svg_pixel().
+# Extern-free, integer-only, no I/O, no float — it compiles for the Linux host
+# AND the native target from the same source.
+#
+# SVG has NO binary magic (it is XML text), so the <img> decode sites dispatch
+# to it by CONTENT: svg_sniff(buf,len) returns 1 when the buffer looks like SVG
+# (a leading `<?xml` / `<svg`, ignoring BOM + leading whitespace).
+#
+# Implements, from scratch:
+#   1. a tiny XML tag scanner — the root <svg> (width/height/viewBox), and the
+#      shape elements <rect> <circle> <ellipse> <line> <polygon> <polyline>
+#      <path>; comments/CDATA/<?...?> skipped; one-level-per-node <g fill=...>
+#      inheritance via a small stack;
+#   2. presentation attributes — fill (named + #rgb/#rrggbb + none + currentColor),
+#      fill-opacity, stroke, stroke-width; a fill-rule of nonzero / evenodd;
+#   3. a path mini-language — M m L l H h V v C c Q q Z z (absolute + relative),
+#      cubic/quadratic beziers flattened to line segments;
+#   4. an anti-aliased scanline polygon fill — SS vertical sub-scanlines plus
+#      analytic horizontal coverage, nonzero OR even-odd winding, straight-alpha
+#      "over" compositing into the RGBA buffer. Basic stroking draws each segment
+#      as a filled quad (butt caps, miter-free joins) — cheap but legible.
+#
+# BOUNDS-SAFE: this parses UNTRUSTED input. Every buffer read is index<len
+# guarded; every point/edge/crossing append is capacity-checked and DROPS the
+# overflow (clamp, never OOB); coordinates outside the raster are clipped by the
+# scanline; the tag scanner's cursor strictly advances so the parse always
+# terminates. A malformed / unsupported / oversized SVG renders whatever shapes
+# it CAN and, if it cannot even find a sized <svg> root, returns -1 so the caller
+# draws the broken-image placeholder. It NEVER reads or writes out of bounds.
+#
+# GAPS (noted, skipped — never crash): gradients / patterns, filters, <text>,
+# <image>, <use>/<defs>/<symbol> references, CSS/<style>, transform= (beyond the
+# viewBox mapping), rect rx/ry rounded corners (drawn square), path arcs (A/a)
+# and smooth curves (S/s T/t), and exponent-form numbers (mantissa only).
+
+# ---- capacities (BSS) ----------------------------------------------
+SVG_MAX_DIM:  uint64 = 512               # max raster width or height
+SVG_OUT_CAP:  uint64 = 1048576           # RGBA output: 512*512*4
+SVG_EDGE_CAP: uint64 = 16384             # scan-convert edge list for one paint
+SVG_PTS_CAP:  uint64 = 8192              # device-space outline points for a shape
+SVG_SUB_CAP:  uint64 = 1024              # subpaths within one shape
+SVG_XCAP:     uint64 = 1024              # crossings on one sub-scanline
+SS:           int32  = 4                 # vertical sub-scanlines per pixel row
+
+svg_out: Array[1048576, uint8]           # final RGBA, row-major, 4 bytes/px
+svg_w:   int32 = 0
+svg_h:   int32 = 0
+svg_ok:  int32 = 0
+
+# viewBox mapping (Q8 user-space fixed point; device = pixels).
+minxf: int64 = 0
+minyf: int64 = 0
+vwf:   int64 = 256                        # viewBox width  in Q8 user units
+vhf:   int64 = 256                        # viewBox height in Q8 user units
+
+# edge list for the current paint (device space, Q8 fixed point)
+ex0: Array[16384, int32]
+ey0: Array[16384, int32]
+ex1: Array[16384, int32]
+ey1: Array[16384, int32]
+n_edges: uint64 = 0
+
+# outline points for the current shape (device space, Q8)
+pts_x: Array[8192, int32]
+pts_y: Array[8192, int32]
+n_pts: uint64 = 0
+sub_start:  Array[1024, uint32]
+sub_closed: Array[1024, uint8]
+n_sub: uint64 = 0
+
+# per-sub-scanline crossings
+xc_x:   Array[1024, int32]
+xc_dir: Array[1024, int32]
+
+# one-row horizontal coverage accumulator (units: 1/256 px per sub-scanline)
+cov: Array[512, int32]
+
+# the source buffer (set by svg_decode) + a streaming number cursor
+svg_src: Ptr[uint8]
+svg_len: uint64 = 0
+pcur:    uint64 = 0
+
+# current style (resolved for the shape being painted)
+fill_set: int32 = 0                       # 1 => fill with fill_r/g/b
+fill_r: int32 = 0
+fill_g: int32 = 0
+fill_b: int32 = 0
+fill_op: int32 = 255                       # 0..255
+fill_rule: int32 = 0                       # 0 nonzero, 1 evenodd
+stroke_set: int32 = 0
+stroke_r: int32 = 0
+stroke_g: int32 = 0
+stroke_b: int32 = 0
+stroke_w: int32 = 256                       # Q8 device-ish width (user units *256)
+
+# group-inherited fill stack (one entry per open <g>)
+gst_set: Array[64, int32]
+gst_r:   Array[64, int32]
+gst_g:   Array[64, int32]
+gst_b:   Array[64, int32]
+gdepth:  int32 = 0
+
+# scratch outputs from the color parser
+col_ok: int32 = 0
+col_r:  int32 = 0
+col_g:  int32 = 0
+col_b:  int32 = 0
+
+# scratch outputs from the attribute finder
+av_off: uint64 = 0
+av_len: uint64 = 0
+
+
+# ---- small helpers -------------------------------------------------
+def _is_digit(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return 1
+    return 0
+
+def _is_wsp(c: uint8) -> int32:
+    if c == 32 or c == 9 or c == 10 or c == 13:
+        return 1
+    return 0
+
+def _lower(c: uint8) -> uint8:
+    if c >= 65 and c <= 90:
+        return c + 32
+    return c
+
+# Sign-safe divide by a POSITIVE divisor. The Adder backend strength-reduces a
+# division by a constant power of two into a LOGICAL shift, which mangles a
+# negative numerator (task #41). Passing the divisor as a variable forces a real
+# signed idiv, and we keep the numerator non-negative to be doubly safe.
+def _sdiv(a: int64, b: int64) -> int64:
+    if a >= 0:
+        return a / b
+    return 0 - ((0 - a) / b)
+
+def _isqrt(v: int64) -> int64:
+    if v <= 0:
+        return 0
+    x: int64 = v
+    y: int64 = (x + 1) / 2
+    while y < x:
+        x = y
+        y = (x + v / x) / 2
+    return x
+
+
+# ---- streaming number reader over svg_src[pcur..limit) -------------
+def _skip_seps(limit: uint64):
+    while pcur < limit:
+        c: uint8 = svg_src[pcur]
+        if _is_wsp(c) != 0 or c == 44:            # whitespace or comma
+            pcur = pcur + 1
+        else:
+            return
+
+def _peek_num(limit: uint64) -> int32:
+    _skip_seps(limit)
+    if pcur >= limit:
+        return 0
+    c: uint8 = svg_src[pcur]
+    if _is_digit(c) != 0 or c == 45 or c == 43 or c == 46:
+        return 1
+    return 0
+
+# Read one number as Q8 fixed point, advancing pcur. Mantissa only (exponent
+# consumed but ignored). Bounds: pcur is clamped to `limit`.
+def _rd_num(limit: uint64) -> int64:
+    _skip_seps(limit)
+    neg: int32 = 0
+    if pcur < limit:
+        c0: uint8 = svg_src[pcur]
+        if c0 == 45:
+            neg = 1
+            pcur = pcur + 1
+        elif c0 == 43:
+            pcur = pcur + 1
+    ip: int64 = 0
+    while pcur < limit and _is_digit(svg_src[pcur]) != 0:
+        ip = ip * 10 + cast[int64](svg_src[pcur] - 48)
+        if ip > 8000000:                          # clamp absurd magnitudes
+            ip = 8000000
+        pcur = pcur + 1
+    q8: int64 = ip * 256
+    if pcur < limit and svg_src[pcur] == 46:      # '.'
+        pcur = pcur + 1
+        fp: int64 = 0
+        p10: int64 = 1
+        cnt: int32 = 0
+        while pcur < limit and _is_digit(svg_src[pcur]) != 0 and cnt < 6:
+            fp = fp * 10 + cast[int64](svg_src[pcur] - 48)
+            p10 = p10 * 10
+            pcur = pcur + 1
+            cnt = cnt + 1
+        while pcur < limit and _is_digit(svg_src[pcur]) != 0:   # drop extra digits
+            pcur = pcur + 1
+        if p10 > 0:
+            q8 = q8 + (fp * 256) / p10
+    # consume an exponent form (ignored — documented gap)
+    if pcur < limit and (svg_src[pcur] == 101 or svg_src[pcur] == 69):
+        pcur = pcur + 1
+        if pcur < limit and (svg_src[pcur] == 45 or svg_src[pcur] == 43):
+            pcur = pcur + 1
+        while pcur < limit and _is_digit(svg_src[pcur]) != 0:
+            pcur = pcur + 1
+    if neg != 0:
+        q8 = 0 - q8
+    return q8
+
+
+# ---- user Q8 -> device Q8 via the viewBox mapping ------------------
+def _tx(uf: int64) -> int32:
+    d: int64 = _sdiv((uf - minxf) * cast[int64](svg_w) * 256, vwf)
+    return cast[int32](d)
+
+def _ty(uf: int64) -> int32:
+    d: int64 = _sdiv((uf - minyf) * cast[int64](svg_h) * 256, vhf)
+    return cast[int32](d)
+
+
+# ---- outline point / subpath builders ------------------------------
+def _pts_reset():
+    n_pts = 0
+    n_sub = 0
+
+def _begin_sub():
+    if n_sub < SVG_SUB_CAP:
+        sub_start[n_sub] = cast[uint32](n_pts)
+        sub_closed[n_sub] = 0
+
+def _end_sub(closed: int32):
+    if n_sub < SVG_SUB_CAP:
+        # only commit a subpath that actually holds >= 2 points
+        st: uint64 = cast[uint64](sub_start[n_sub])
+        if n_pts > st + 1:
+            if closed != 0:
+                sub_closed[n_sub] = 1
+            n_sub = n_sub + 1
+
+def _add_dev(dx: int32, dy: int32):
+    if n_pts < SVG_PTS_CAP:
+        pts_x[n_pts] = dx
+        pts_y[n_pts] = dy
+        n_pts = n_pts + 1
+
+def _add_user(ux: int64, uy: int64):
+    _add_dev(_tx(ux), _ty(uy))
+
+
+# ---- edge builders + AA scanline fill ------------------------------
+def _edges_reset():
+    n_edges = 0
+
+def _add_edge(x0: int32, y0: int32, x1: int32, y1: int32):
+    if y0 == y1:
+        return                                     # horizontal: no crossing
+    if n_edges < SVG_EDGE_CAP:
+        ex0[n_edges] = x0
+        ey0[n_edges] = y0
+        ex1[n_edges] = x1
+        ey1[n_edges] = y1
+        n_edges = n_edges + 1
+
+# Turn the built subpaths into fill edges (every subpath implicitly closed).
+def _edges_from_pts_fill():
+    _edges_reset()
+    s: uint64 = 0
+    while s < n_sub:
+        st: uint64 = cast[uint64](sub_start[s])
+        en: uint64 = n_pts
+        if s + 1 < n_sub:
+            en = cast[uint64](sub_start[s + 1])
+        i: uint64 = st
+        while i + 1 < en:
+            _add_edge(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
+            i = i + 1
+        if en > st:
+            _add_edge(pts_x[en - 1], pts_y[en - 1], pts_x[st], pts_y[st])
+        s = s + 1
+
+# Emit a stroke quad (butt cap) for the segment (ax,ay)->(bx,by), width w (Q8).
+def _stroke_quad(ax: int32, ay: int32, bx: int32, by: int32, w: int32):
+    dx: int64 = cast[int64](bx) - cast[int64](ax)
+    dy: int64 = cast[int64](by) - cast[int64](ay)
+    ln: int64 = _isqrt(dx * dx + dy * dy)
+    if ln <= 0:
+        return
+    half: int64 = cast[int64](w) / 2
+    nx: int64 = (0 - dy) * half / ln
+    ny: int64 = dx * half / ln
+    ax0: int32 = cast[int32](cast[int64](ax) + nx)
+    ay0: int32 = cast[int32](cast[int64](ay) + ny)
+    bx0: int32 = cast[int32](cast[int64](bx) + nx)
+    by0: int32 = cast[int32](cast[int64](by) + ny)
+    bx1: int32 = cast[int32](cast[int64](bx) - nx)
+    by1: int32 = cast[int32](cast[int64](by) - ny)
+    ax1: int32 = cast[int32](cast[int64](ax) - nx)
+    ay1: int32 = cast[int32](cast[int64](ay) - ny)
+    _add_edge(ax0, ay0, bx0, by0)
+    _add_edge(bx0, by0, bx1, by1)
+    _add_edge(bx1, by1, ax1, ay1)
+    _add_edge(ax1, ay1, ax0, ay0)
+
+def _edges_from_pts_stroke(w: int32):
+    _edges_reset()
+    s: uint64 = 0
+    while s < n_sub:
+        st: uint64 = cast[uint64](sub_start[s])
+        en: uint64 = n_pts
+        if s + 1 < n_sub:
+            en = cast[uint64](sub_start[s + 1])
+        i: uint64 = st
+        while i + 1 < en:
+            _stroke_quad(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1], w)
+            i = i + 1
+        if sub_closed[s] != 0 and en > st + 1:
+            _stroke_quad(pts_x[en - 1], pts_y[en - 1], pts_x[st], pts_y[st], w)
+        s = s + 1
+
+# Accumulate horizontal coverage for the span [xa,xb) (Q8 device x) into cov[].
+def _add_cov(xa: int32, xb: int32):
+    a: int32 = xa
+    b: int32 = xb
+    if a > b:
+        t: int32 = a
+        a = b
+        b = t
+    lim: int32 = svg_w * 256
+    if a < 0:
+        a = 0
+    if b > lim:
+        b = lim
+    if b <= a:
+        return
+    col: int32 = a / 256
+    while col < svg_w:
+        colL: int32 = col * 256
+        if colL >= b:
+            return
+        colR: int32 = colL + 256
+        lo: int32 = a
+        if colL > lo:
+            lo = colL
+        hi: int32 = b
+        if colR < hi:
+            hi = colR
+        if hi > lo:
+            cov[col] = cov[col] + (hi - lo)
+        col = col + 1
+
+# Straight-alpha "over": composite src (sr,sg,sb,sa) onto svg_out pixel (x,y).
+def _blend(x: int32, y: int32, sr: int32, sg: int32, sb: int32, sa: int32):
+    if sa <= 0:
+        return
+    o: uint64 = (cast[uint64](y) * cast[uint64](svg_w) + cast[uint64](x)) * 4
+    dr: int32 = cast[int32](svg_out[o])
+    dg: int32 = cast[int32](svg_out[o + 1])
+    db: int32 = cast[int32](svg_out[o + 2])
+    da: int32 = cast[int32](svg_out[o + 3])
+    t: int32 = da * (255 - sa) / 255
+    oa: int32 = sa + t
+    if oa <= 0:
+        return
+    orr: int32 = (sr * sa + dr * t + oa / 2) / oa
+    og:  int32 = (sg * sa + dg * t + oa / 2) / oa
+    ob:  int32 = (sb * sa + db * t + oa / 2) / oa
+    svg_out[o]     = cast[uint8](orr)
+    svg_out[o + 1] = cast[uint8](og)
+    svg_out[o + 2] = cast[uint8](ob)
+    svg_out[o + 3] = cast[uint8](oa)
+
+# Sort the first `n` crossings by x (insertion sort — n is small per scanline).
+def _sort_xc(n: int32):
+    i: int32 = 1
+    while i < n:
+        kx: int32 = xc_x[i]
+        kd: int32 = xc_dir[i]
+        j: int32 = i - 1
+        while j >= 0 and xc_x[j] > kx:
+            xc_x[j + 1] = xc_x[j]
+            xc_dir[j + 1] = xc_dir[j]
+            j = j - 1
+        xc_x[j + 1] = kx
+        xc_dir[j + 1] = kd
+        i = i + 1
+
+# Scan-convert the current edge list, filling with (r,g,b) at opacity op (0..255).
+def _rasterize(r: int32, g: int32, b: int32, op: int32):
+    if op <= 0 or n_edges == 0:
+        return
+    y: int32 = 0
+    while y < svg_h:
+        cx: int32 = 0
+        while cx < svg_w:
+            cov[cx] = 0
+            cx = cx + 1
+        s: int32 = 0
+        while s < SS:
+            syq: int32 = y * 256 + (s * 512 + 256) / (2 * SS)
+            nx: int32 = 0
+            e: uint64 = 0
+            while e < n_edges:
+                y0: int32 = ey0[e]
+                y1: int32 = ey1[e]
+                ylo: int32 = y0
+                yhi: int32 = y1
+                dir: int32 = 1
+                if y0 > y1:
+                    ylo = y1
+                    yhi = y0
+                    dir = -1
+                if syq >= ylo and syq < yhi:
+                    x0: int32 = ex0[e]
+                    x1: int32 = ex1[e]
+                    dxe: int64 = cast[int64](x1) - cast[int64](x0)
+                    dye: int64 = cast[int64](y1) - cast[int64](y0)
+                    num: int64 = cast[int64](syq) - cast[int64](y0)
+                    xx: int64 = cast[int64](x0) + (dxe * num) / dye
+                    if cast[uint64](nx) < SVG_XCAP:
+                        xc_x[nx] = cast[int32](xx)
+                        xc_dir[nx] = dir
+                        nx = nx + 1
+                e = e + 1
+            _sort_xc(nx)
+            acc: int32 = 0
+            i: int32 = 0
+            while i + 1 < nx:
+                if fill_rule == 0:
+                    acc = acc + xc_dir[i]
+                else:
+                    acc = acc + 1
+                inside: int32 = 0
+                if fill_rule == 0:
+                    if acc != 0:
+                        inside = 1
+                else:
+                    if (acc & 1) != 0:
+                        inside = 1
+                if inside != 0:
+                    _add_cov(xc_x[i], xc_x[i + 1])
+                i = i + 1
+            s = s + 1
+        # composite this row: coverage 0..SS*256 -> alpha
+        full: int32 = SS * 256
+        x: int32 = 0
+        while x < svg_w:
+            c: int32 = cov[x]
+            if c > 0:
+                if c > full:
+                    c = full
+                a: int32 = op * c / full
+                if a > 0:
+                    _blend(x, y, r, g, b, a)
+            x = x + 1
+        y = y + 1
+
+
+# ---- color parsing -------------------------------------------------
+def _hexv(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return cast[int32](c - 48)
+    lc: uint8 = _lower(c)
+    if lc >= 97 and lc <= 102:
+        return cast[int32](lc - 97) + 10
+    return -1
+
+# Compare svg_src[off..off+len) to lowercased literal `lit` (len bytes).
+def _streq_ci(off: uint64, len: uint64, lit: Ptr[uint8]) -> int32:
+    k: uint64 = 0
+    while lit[k] != 0:
+        if k >= len:
+            return 0
+        if _lower(svg_src[off + k]) != lit[k]:
+            return 0
+        k = k + 1
+    if k != len:
+        return 0
+    return 1
+
+def _named_color(off: uint64, len: uint64) -> int32:
+    if _streq_ci(off, len, cast[Ptr[uint8]]("black")) != 0:
+        col_r = 0
+        col_g = 0
+        col_b = 0
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("white")) != 0:
+        col_r = 255
+        col_g = 255
+        col_b = 255
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("red")) != 0:
+        col_r = 255
+        col_g = 0
+        col_b = 0
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("green")) != 0:
+        col_r = 0
+        col_g = 128
+        col_b = 0
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("blue")) != 0:
+        col_r = 0
+        col_g = 0
+        col_b = 255
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("lime")) != 0:
+        col_r = 0
+        col_g = 255
+        col_b = 0
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("yellow")) != 0:
+        col_r = 255
+        col_g = 255
+        col_b = 0
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("orange")) != 0:
+        col_r = 255
+        col_g = 165
+        col_b = 0
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("purple")) != 0:
+        col_r = 128
+        col_g = 0
+        col_b = 128
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("navy")) != 0:
+        col_r = 0
+        col_g = 0
+        col_b = 128
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("teal")) != 0:
+        col_r = 0
+        col_g = 128
+        col_b = 128
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("maroon")) != 0:
+        col_r = 128
+        col_g = 0
+        col_b = 0
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("olive")) != 0:
+        col_r = 128
+        col_g = 128
+        col_b = 0
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("gray")) != 0 or \
+       _streq_ci(off, len, cast[Ptr[uint8]]("grey")) != 0:
+        col_r = 128
+        col_g = 128
+        col_b = 128
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("silver")) != 0:
+        col_r = 192
+        col_g = 192
+        col_b = 192
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("aqua")) != 0 or \
+       _streq_ci(off, len, cast[Ptr[uint8]]("cyan")) != 0:
+        col_r = 0
+        col_g = 255
+        col_b = 255
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("fuchsia")) != 0 or \
+       _streq_ci(off, len, cast[Ptr[uint8]]("magenta")) != 0:
+        col_r = 255
+        col_g = 0
+        col_b = 255
+        return 1
+    if _streq_ci(off, len, cast[Ptr[uint8]]("currentcolor")) != 0:
+        col_r = 0
+        col_g = 0
+        col_b = 0
+        return 1
+    return 0
+
+# Parse a paint value at svg_src[off..off+len). Sets col_ok/col_r/col_g/col_b.
+# col_ok = 0 means "none" / unparseable (no paint).
+def _parse_color(off: uint64, len: uint64):
+    col_ok = 0
+    # trim leading whitespace
+    o: uint64 = off
+    lim: uint64 = off + len
+    while o < lim and _is_wsp(svg_src[o]) != 0:
+        o = o + 1
+    if o >= lim:
+        return
+    if _streq_ci(o, lim - o, cast[Ptr[uint8]]("none")) != 0:
+        return
+    if svg_src[o] == 35:                          # '#'
+        o = o + 1
+        # count hex digits available
+        nh: uint64 = 0
+        while o + nh < lim and _hexv(svg_src[o + nh]) >= 0:
+            nh = nh + 1
+        if nh >= 6:
+            r: int32 = _hexv(svg_src[o]) * 16 + _hexv(svg_src[o + 1])
+            g: int32 = _hexv(svg_src[o + 2]) * 16 + _hexv(svg_src[o + 3])
+            b: int32 = _hexv(svg_src[o + 4]) * 16 + _hexv(svg_src[o + 5])
+            col_r = r
+            col_g = g
+            col_b = b
+            col_ok = 1
+        elif nh >= 3:
+            r3: int32 = _hexv(svg_src[o])
+            g3: int32 = _hexv(svg_src[o + 1])
+            b3: int32 = _hexv(svg_src[o + 2])
+            col_r = r3 * 16 + r3
+            col_g = g3 * 16 + g3
+            col_b = b3 * 16 + b3
+            col_ok = 1
+        return
+    # rgb(...) and url(...) unsupported -> treat as no paint (gap)
+    if _named_color(o, lim - o) != 0:
+        col_ok = 1
+
+
+# ---- attribute finder ----------------------------------------------
+# Find attribute `name` in the tag region svg_src[start..end). On success sets
+# av_off/av_len to the (unquoted) value span and returns 1.
+def _find_attr(start: uint64, end: uint64, name: Ptr[uint8]) -> int32:
+    nlen: uint64 = 0
+    while name[nlen] != 0:
+        nlen = nlen + 1
+    i: uint64 = start
+    while i + nlen < end:
+        # boundary: name must start after whitespace (or at region start)
+        ok: int32 = 0
+        if i == start:
+            ok = 1
+        elif _is_wsp(svg_src[i - 1]) != 0:
+            ok = 1
+        if ok != 0:
+            m: uint64 = 0
+            while m < nlen and _lower(svg_src[i + m]) == name[m]:
+                m = m + 1
+            if m == nlen:
+                j: uint64 = i + nlen
+                while j < end and _is_wsp(svg_src[j]) != 0:
+                    j = j + 1
+                if j < end and svg_src[j] == 61:   # '='
+                    j = j + 1
+                    while j < end and _is_wsp(svg_src[j]) != 0:
+                        j = j + 1
+                    if j < end and (svg_src[j] == 34 or svg_src[j] == 39):
+                        q: uint8 = svg_src[j]
+                        j = j + 1
+                        vs: uint64 = j
+                        while j < end and svg_src[j] != q:
+                            j = j + 1
+                        av_off = vs
+                        av_len = j - vs
+                        return 1
+        i = i + 1
+    return 0
+
+def _attr_num(start: uint64, end: uint64, name: Ptr[uint8], dflt: int64) -> int64:
+    if _find_attr(start, end, name) == 0:
+        return dflt
+    pcur = av_off
+    return _rd_num(av_off + av_len)
+
+
+# ---- style resolution ----------------------------------------------
+def _resolve_style(start: uint64, end: uint64):
+    # fill: own attr wins, else inherit group top, else black
+    fill_set = 0
+    fill_r = 0
+    fill_g = 0
+    fill_b = 0
+    if _find_attr(start, end, cast[Ptr[uint8]]("fill")) != 0:
+        _parse_color(av_off, av_len)
+        if col_ok != 0:
+            fill_set = 1
+            fill_r = col_r
+            fill_g = col_g
+            fill_b = col_b
+    elif gdepth > 0 and gst_set[gdepth - 1] != 0:
+        fill_set = 1
+        fill_r = gst_r[gdepth - 1]
+        fill_g = gst_g[gdepth - 1]
+        fill_b = gst_b[gdepth - 1]
+    else:
+        fill_set = 1                               # SVG default fill = black
+    # fill-opacity
+    fill_op = 255
+    if _find_attr(start, end, cast[Ptr[uint8]]("fill-opacity")) != 0:
+        pcur = av_off
+        fo: int64 = _rd_num(av_off + av_len)       # Q8 (0..256 for 0..1)
+        a: int64 = fo * 255 / 256
+        if a < 0:
+            a = 0
+        if a > 255:
+            a = 255
+        fill_op = cast[int32](a)
+    # fill-rule
+    fill_rule = 0
+    if _find_attr(start, end, cast[Ptr[uint8]]("fill-rule")) != 0:
+        if _streq_ci(av_off, av_len, cast[Ptr[uint8]]("evenodd")) != 0:
+            fill_rule = 1
+    # stroke
+    stroke_set = 0
+    if _find_attr(start, end, cast[Ptr[uint8]]("stroke")) != 0:
+        _parse_color(av_off, av_len)
+        if col_ok != 0:
+            stroke_set = 1
+            stroke_r = col_r
+            stroke_g = col_g
+            stroke_b = col_b
+    stroke_w = 256
+    if _find_attr(start, end, cast[Ptr[uint8]]("stroke-width")) != 0:
+        pcur = av_off
+        w: int64 = _rd_num(av_off + av_len)         # Q8 user units
+        # scale user width -> device using the x mapping magnitude
+        dw: int64 = w * cast[int64](svg_w) * 256 / vwf / 256
+        if dw < 1:
+            dw = 1
+        stroke_w = cast[int32](dw)
+
+def _paint_current():
+    if fill_set != 0:
+        _edges_from_pts_fill()
+        _rasterize(fill_r, fill_g, fill_b, fill_op)
+    if stroke_set != 0:
+        _edges_from_pts_stroke(stroke_w)
+        _rasterize(stroke_r, stroke_g, stroke_b, 255)
+
+
+# ---- shape builders ------------------------------------------------
+def _shape_rect(start: uint64, end: uint64):
+    x: int64 = _attr_num(start, end, cast[Ptr[uint8]]("x"), 0)
+    y: int64 = _attr_num(start, end, cast[Ptr[uint8]]("y"), 0)
+    w: int64 = _attr_num(start, end, cast[Ptr[uint8]]("width"), 0)
+    h: int64 = _attr_num(start, end, cast[Ptr[uint8]]("height"), 0)
+    if w <= 0 or h <= 0:
+        return
+    _pts_reset()
+    _begin_sub()
+    _add_user(x, y)
+    _add_user(x + w, y)
+    _add_user(x + w, y + h)
+    _add_user(x, y + h)
+    _end_sub(1)
+
+# 48-gon approximation of an ellipse via incremental Q10 rotation.
+def _ellipse_pts(cx: int64, cy: int64, rx: int64, ry: int64):
+    if rx <= 0 or ry <= 0:
+        return
+    _pts_reset()
+    _begin_sub()
+    ux: int64 = 1024
+    uy: int64 = 0
+    k: int32 = 0
+    while k < 48:
+        px: int64 = cx + _sdiv(ux * rx, 1024)
+        py: int64 = cy + _sdiv(uy * ry, 1024)
+        _add_user(px, py)
+        nux: int64 = _sdiv(ux * 1015 - uy * 134, 1024)
+        nuy: int64 = _sdiv(ux * 134 + uy * 1015, 1024)
+        ux = nux
+        uy = nuy
+        k = k + 1
+    _end_sub(1)
+
+def _shape_circle(start: uint64, end: uint64):
+    cx: int64 = _attr_num(start, end, cast[Ptr[uint8]]("cx"), 0)
+    cy: int64 = _attr_num(start, end, cast[Ptr[uint8]]("cy"), 0)
+    r:  int64 = _attr_num(start, end, cast[Ptr[uint8]]("r"), 0)
+    _ellipse_pts(cx, cy, r, r)
+
+def _shape_ellipse(start: uint64, end: uint64):
+    cx: int64 = _attr_num(start, end, cast[Ptr[uint8]]("cx"), 0)
+    cy: int64 = _attr_num(start, end, cast[Ptr[uint8]]("cy"), 0)
+    rx: int64 = _attr_num(start, end, cast[Ptr[uint8]]("rx"), 0)
+    ry: int64 = _attr_num(start, end, cast[Ptr[uint8]]("ry"), 0)
+    _ellipse_pts(cx, cy, rx, ry)
+
+def _shape_line(start: uint64, end: uint64):
+    x1: int64 = _attr_num(start, end, cast[Ptr[uint8]]("x1"), 0)
+    y1: int64 = _attr_num(start, end, cast[Ptr[uint8]]("y1"), 0)
+    x2: int64 = _attr_num(start, end, cast[Ptr[uint8]]("x2"), 0)
+    y2: int64 = _attr_num(start, end, cast[Ptr[uint8]]("y2"), 0)
+    _pts_reset()
+    _begin_sub()
+    _add_user(x1, y1)
+    _add_user(x2, y2)
+    _end_sub(0)
+
+def _shape_points(start: uint64, end: uint64, closed: int32):
+    if _find_attr(start, end, cast[Ptr[uint8]]("points")) == 0:
+        _pts_reset()
+        return
+    _pts_reset()
+    _begin_sub()
+    lim: uint64 = av_off + av_len
+    pcur = av_off
+    while _peek_num(lim) != 0:
+        px: int64 = _rd_num(lim)
+        if _peek_num(lim) == 0:
+            break
+        py: int64 = _rd_num(lim)
+        _add_user(px, py)
+    _end_sub(closed)
+
+# Flatten a cubic bezier (user Q8) from (x0,y0) via (x1,y1),(x2,y2) to (x3,y3).
+def _bez3(x0: int64, y0: int64, x1: int64, y1: int64, x2: int64, y2: int64,
+          x3: int64, y3: int64):
+    i: int64 = 1
+    while i <= 16:
+        u: int64 = 16 - i
+        bx: int64 = _sdiv(u * u * u * x0 + 3 * u * u * i * x1 + \
+                          3 * u * i * i * x2 + i * i * i * x3, 4096)
+        by: int64 = _sdiv(u * u * u * y0 + 3 * u * u * i * y1 + \
+                          3 * u * i * i * y2 + i * i * i * y3, 4096)
+        _add_user(bx, by)
+        i = i + 1
+
+def _bez2(x0: int64, y0: int64, x1: int64, y1: int64, x2: int64, y2: int64):
+    i: int64 = 1
+    while i <= 16:
+        u: int64 = 16 - i
+        bx: int64 = _sdiv(u * u * x0 + 2 * u * i * x1 + i * i * x2, 256)
+        by: int64 = _sdiv(u * u * y0 + 2 * u * i * y1 + i * i * y2, 256)
+        _add_user(bx, by)
+        i = i + 1
+
+# Parse a <path d="..."> command list into subpaths.
+def _shape_path(start: uint64, end: uint64):
+    _pts_reset()
+    if _find_attr(start, end, cast[Ptr[uint8]]("d")) == 0:
+        return
+    lim: uint64 = av_off + av_len
+    pcur = av_off
+    cx: int64 = 0
+    cy: int64 = 0
+    sx: int64 = 0
+    sy: int64 = 0
+    open_sub: int32 = 0
+    guard: uint64 = 0
+    while pcur < lim and guard < 200000:
+        guard = guard + 1
+        _skip_seps(lim)
+        if pcur >= lim:
+            break
+        c: uint8 = svg_src[pcur]
+        # a command letter?
+        cl: uint8 = _lower(c)
+        rel: int32 = 0
+        if c >= 97:
+            rel = 1
+        if cl == 109:                              # M/m
+            pcur = pcur + 1
+            if _peek_num(lim) == 0:
+                break
+            nxv: int64 = _rd_num(lim)
+            if _peek_num(lim) == 0:
+                break
+            nyv: int64 = _rd_num(lim)
+            if rel != 0 and open_sub != 0:
+                cx = cx + nxv
+                cy = cy + nyv
+            else:
+                cx = nxv
+                cy = nyv
+            if open_sub != 0:
+                _end_sub(0)
+            _begin_sub()
+            open_sub = 1
+            sx = cx
+            sy = cy
+            _add_user(cx, cy)
+            # subsequent coordinate pairs are implicit L
+            while _peek_num(lim) != 0:
+                ax: int64 = _rd_num(lim)
+                if _peek_num(lim) == 0:
+                    break
+                ay: int64 = _rd_num(lim)
+                if rel != 0:
+                    cx = cx + ax
+                    cy = cy + ay
+                else:
+                    cx = ax
+                    cy = ay
+                _add_user(cx, cy)
+        elif cl == 108:                            # L/l
+            pcur = pcur + 1
+            while _peek_num(lim) != 0:
+                ax2: int64 = _rd_num(lim)
+                if _peek_num(lim) == 0:
+                    break
+                ay2: int64 = _rd_num(lim)
+                if rel != 0:
+                    cx = cx + ax2
+                    cy = cy + ay2
+                else:
+                    cx = ax2
+                    cy = ay2
+                _add_user(cx, cy)
+        elif cl == 104:                            # H/h
+            pcur = pcur + 1
+            while _peek_num(lim) != 0:
+                hx: int64 = _rd_num(lim)
+                if rel != 0:
+                    cx = cx + hx
+                else:
+                    cx = hx
+                _add_user(cx, cy)
+        elif cl == 118:                            # V/v
+            pcur = pcur + 1
+            while _peek_num(lim) != 0:
+                vy: int64 = _rd_num(lim)
+                if rel != 0:
+                    cy = cy + vy
+                else:
+                    cy = vy
+                _add_user(cx, cy)
+        elif cl == 99:                             # C/c
+            pcur = pcur + 1
+            while _peek_num(lim) != 0:
+                x1: int64 = _rd_num(lim)
+                y1: int64 = _rd_num(lim)
+                x2: int64 = _rd_num(lim)
+                y2: int64 = _rd_num(lim)
+                x3: int64 = _rd_num(lim)
+                y3: int64 = _rd_num(lim)
+                if rel != 0:
+                    x1 = cx + x1
+                    y1 = cy + y1
+                    x2 = cx + x2
+                    y2 = cy + y2
+                    x3 = cx + x3
+                    y3 = cy + y3
+                _bez3(cx, cy, x1, y1, x2, y2, x3, y3)
+                cx = x3
+                cy = y3
+        elif cl == 113:                            # Q/q
+            pcur = pcur + 1
+            while _peek_num(lim) != 0:
+                qx1: int64 = _rd_num(lim)
+                qy1: int64 = _rd_num(lim)
+                qx2: int64 = _rd_num(lim)
+                qy2: int64 = _rd_num(lim)
+                if rel != 0:
+                    qx1 = cx + qx1
+                    qy1 = cy + qy1
+                    qx2 = cx + qx2
+                    qy2 = cy + qy2
+                _bez2(cx, cy, qx1, qy1, qx2, qy2)
+                cx = qx2
+                cy = qy2
+        elif cl == 122:                            # Z/z
+            pcur = pcur + 1
+            if open_sub != 0:
+                _end_sub(1)
+                open_sub = 0
+            cx = sx
+            cy = sy
+        else:
+            # unsupported command (A/a, S/s, T/t, ...) -> stop cleanly
+            break
+    if open_sub != 0:
+        _end_sub(0)
+
+
+# ---- tag scanner + root ilocation ----------------------------------
+# Return the index just past the closing '>' of the tag opened at `lt` (the '<'),
+# respecting quoted attribute values. Sets a self-close flag via `selfclose`.
+sc_self: int32 = 0
+
+def _tag_end(lt: uint64) -> uint64:
+    i: uint64 = lt + 1
+    sc_self = 0
+    while i < svg_len:
+        c: uint8 = svg_src[i]
+        if c == 34 or c == 39:
+            q: uint8 = c
+            i = i + 1
+            while i < svg_len and svg_src[i] != q:
+                i = i + 1
+            if i < svg_len:
+                i = i + 1
+        elif c == 62:                              # '>'
+            if i > lt + 1 and svg_src[i - 1] == 47:
+                sc_self = 1
+            return i + 1
+        else:
+            i = i + 1
+    return svg_len
+
+# name matches (case-insensitive) the tag opened at lt+1 against `nm`.
+def _tag_is(lt: uint64, nm: Ptr[uint8]) -> int32:
+    i: uint64 = lt + 1
+    k: uint64 = 0
+    while nm[k] != 0:
+        if i + k >= svg_len:
+            return 0
+        if _lower(svg_src[i + k]) != nm[k]:
+            return 0
+        k = k + 1
+    # the char after the name must be whitespace, '>' or '/'
+    nc: uint8 = 32
+    if i + k < svg_len:
+        nc = svg_src[i + k]
+    if _is_wsp(nc) != 0 or nc == 62 or nc == 47:
+        return 1
+    return 0
+
+# True if the value span has no '%' (so it is a usable length, not a percentage).
+def _pct_free(off: uint64, len: uint64) -> int32:
+    k: uint64 = 0
+    while k < len:
+        if svg_src[off + k] == 37:                 # '%'
+            return 0
+        k = k + 1
+    return 1
+
+# Locate the root <svg ...> and configure raster dims + viewBox. Returns the
+# index just past its '>' (content start), or 0 if there is no sized <svg>.
+def _setup_root() -> uint64:
+    i: uint64 = 0
+    while i < svg_len:
+        if svg_src[i] == 60:                       # '<'
+            if i + 4 < svg_len and svg_src[i + 1] == 33 and \
+               svg_src[i + 2] == 45 and svg_src[i + 3] == 45:
+                # comment: skip to -->
+                i = i + 4
+                while i + 2 < svg_len and not (svg_src[i] == 45 and \
+                      svg_src[i + 1] == 45 and svg_src[i + 2] == 62):
+                    i = i + 1
+                i = i + 3
+                continue
+            if _tag_is(i, cast[Ptr[uint8]]("svg")) != 0:
+                te: uint64 = _tag_end(i)
+                start: uint64 = i + 1
+                # width / height (drop a trailing % -> 0, fall back to viewBox)
+                wpx: int64 = 0
+                hpx: int64 = 0
+                if _find_attr(start, te, cast[Ptr[uint8]]("width")) != 0:
+                    if _pct_free(av_off, av_len) != 0:
+                        pcur = av_off
+                        wpx = _rd_num(av_off + av_len) / 256
+                if _find_attr(start, te, cast[Ptr[uint8]]("height")) != 0:
+                    if _pct_free(av_off, av_len) != 0:
+                        pcur = av_off
+                        hpx = _rd_num(av_off + av_len) / 256
+                have_vb: int32 = 0
+                if _find_attr(start, te, cast[Ptr[uint8]]("viewbox")) != 0:
+                    vlim: uint64 = av_off + av_len
+                    pcur = av_off
+                    minxf = _rd_num(vlim)
+                    minyf = _rd_num(vlim)
+                    vwf = _rd_num(vlim)
+                    vhf = _rd_num(vlim)
+                    if vwf > 0 and vhf > 0:
+                        have_vb = 1
+                # choose raster size
+                if wpx <= 0 and have_vb != 0:
+                    wpx = vwf / 256
+                if hpx <= 0 and have_vb != 0:
+                    hpx = vhf / 256
+                if wpx <= 0 or hpx <= 0:
+                    return 0
+                if wpx > cast[int64](SVG_MAX_DIM):
+                    wpx = cast[int64](SVG_MAX_DIM)
+                if hpx > cast[int64](SVG_MAX_DIM):
+                    hpx = cast[int64](SVG_MAX_DIM)
+                svg_w = cast[int32](wpx)
+                svg_h = cast[int32](hpx)
+                if have_vb == 0:
+                    minxf = 0
+                    minyf = 0
+                    vwf = cast[int64](svg_w) * 256
+                    vhf = cast[int64](svg_h) * 256
+                return te
+        i = i + 1
+    return 0
+
+
+# ---- public API ----------------------------------------------------
+# Render an SVG byte buffer into svg_out (RGBA, transparent background). Returns
+# 0 on success, -1 if there is no sized <svg> root (caller -> placeholder).
+def svg_decode(buf: Ptr[uint8], len: uint64) -> int32:
+    svg_ok = 0
+    svg_w = 0
+    svg_h = 0
+    minxf = 0
+    minyf = 0
+    vwf = 256
+    vhf = 256
+    gdepth = 0
+    svg_src = buf
+    svg_len = len
+    if len < 4:
+        return -1
+    content: uint64 = _setup_root()
+    if content == 0 or svg_w <= 0 or svg_h <= 0:
+        return -1
+    # clear output to fully transparent
+    npx: uint64 = cast[uint64](svg_w) * cast[uint64](svg_h) * 4
+    z: uint64 = 0
+    while z < npx:
+        svg_out[z] = 0
+        z = z + 1
+    # walk the element stream
+    i: uint64 = content
+    guard: uint64 = 0
+    while i < svg_len and guard < 2000000:
+        guard = guard + 1
+        if svg_src[i] != 60:                       # not '<'
+            i = i + 1
+            continue
+        # comment / CDATA / processing-instruction / doctype -> skip
+        if i + 3 < svg_len and svg_src[i + 1] == 33 and \
+           svg_src[i + 2] == 45 and svg_src[i + 3] == 45:
+            i = i + 4
+            while i + 2 < svg_len and not (svg_src[i] == 45 and \
+                  svg_src[i + 1] == 45 and svg_src[i + 2] == 62):
+                i = i + 1
+            i = i + 3
+            continue
+        if i + 1 < svg_len and (svg_src[i + 1] == 63 or svg_src[i + 1] == 33):
+            i = _tag_end(i)
+            continue
+        # </svg> ends the document; </g> pops the group stack
+        if i + 1 < svg_len and svg_src[i + 1] == 47:  # '</'
+            if i + 4 < svg_len and _lower(svg_src[i + 2]) == 115 and \
+               _lower(svg_src[i + 3]) == 118 and _lower(svg_src[i + 4]) == 103:
+                break                              # </svg>
+            if i + 2 < svg_len and _lower(svg_src[i + 2]) == 103:  # </g
+                if gdepth > 0:
+                    gdepth = gdepth - 1
+            i = _tag_end(i)
+            continue
+        te: uint64 = _tag_end(i)
+        start: uint64 = i + 1
+        if _tag_is(i, cast[Ptr[uint8]]("g")) != 0:
+            # push inherited fill (own fill, else parent, else unset)
+            sset: int32 = 0
+            sr: int32 = 0
+            sg: int32 = 0
+            sb: int32 = 0
+            if _find_attr(start, te, cast[Ptr[uint8]]("fill")) != 0:
+                _parse_color(av_off, av_len)
+                if col_ok != 0:
+                    sset = 1
+                    sr = col_r
+                    sg = col_g
+                    sb = col_b
+            elif gdepth > 0 and gst_set[gdepth - 1] != 0:
+                sset = 1
+                sr = gst_r[gdepth - 1]
+                sg = gst_g[gdepth - 1]
+                sb = gst_b[gdepth - 1]
+            if sc_self == 0 and cast[uint64](gdepth) < 64:
+                gst_set[gdepth] = sset
+                gst_r[gdepth] = sr
+                gst_g[gdepth] = sg
+                gst_b[gdepth] = sb
+                gdepth = gdepth + 1
+            i = te
+            continue
+        painted: int32 = 0
+        if _tag_is(i, cast[Ptr[uint8]]("rect")) != 0:
+            _shape_rect(start, te)
+            painted = 1
+        elif _tag_is(i, cast[Ptr[uint8]]("circle")) != 0:
+            _shape_circle(start, te)
+            painted = 1
+        elif _tag_is(i, cast[Ptr[uint8]]("ellipse")) != 0:
+            _shape_ellipse(start, te)
+            painted = 1
+        elif _tag_is(i, cast[Ptr[uint8]]("line")) != 0:
+            _shape_line(start, te)
+            painted = 1
+        elif _tag_is(i, cast[Ptr[uint8]]("polygon")) != 0:
+            _shape_points(start, te, 1)
+            painted = 1
+        elif _tag_is(i, cast[Ptr[uint8]]("polyline")) != 0:
+            _shape_points(start, te, 0)
+            painted = 1
+        elif _tag_is(i, cast[Ptr[uint8]]("path")) != 0:
+            _shape_path(start, te)
+            painted = 1
+        if painted != 0:
+            _resolve_style(start, te)
+            _paint_current()
+        i = te
+    svg_ok = 1
+    return 0
+
+def svg_width() -> int32:
+    return svg_w
+
+def svg_height() -> int32:
+    return svg_h
+
+# Packed 0xAARRGGBB for pixel (x,y); 0 if out of range or not decoded.
+def svg_pixel(x: int32, y: int32) -> uint32:
+    if svg_ok == 0 or x < 0 or y < 0 or x >= svg_w or y >= svg_h:
+        return 0
+    o: uint64 = (cast[uint64](y) * cast[uint64](svg_w) + cast[uint64](x)) * 4
+    r: uint32 = cast[uint32](svg_out[o])
+    g: uint32 = cast[uint32](svg_out[o + 1])
+    b: uint32 = cast[uint32](svg_out[o + 2])
+    a: uint32 = cast[uint32](svg_out[o + 3])
+    return (a << 24) | (r << 16) | (g << 8) | b
+
+def svg_rgba_ptr() -> Ptr[uint8]:
+    return &svg_out[0]
+
+# Content sniff: does this buffer look like SVG? (leading BOM/whitespace, then
+# '<?xml' ... or a '<svg' element within the first stretch of the file.)
+def svg_sniff(buf: Ptr[uint8], len: uint64) -> int32:
+    i: uint64 = 0
+    # optional UTF-8 BOM
+    if len >= 3 and buf[0] == 239 and buf[1] == 187 and buf[2] == 191:
+        i = 3
+    while i < len and (buf[i] == 32 or buf[i] == 9 or buf[i] == 10 or \
+          buf[i] == 13):
+        i = i + 1
+    if i >= len or buf[i] != 60:                   # must start with '<'
+        return 0
+    # scan a bounded window for "<svg"
+    lim: uint64 = len
+    if lim > 4096:
+        lim = 4096
+    j: uint64 = i
+    while j + 3 < lim:
+        if buf[j] == 60:
+            a: uint8 = buf[j + 1]
+            b: uint8 = buf[j + 2]
+            c: uint8 = buf[j + 3]
+            aa: uint8 = a
+            if aa >= 65 and aa <= 90:
+                aa = aa + 32
+            bb: uint8 = b
+            if bb >= 65 and bb <= 90:
+                bb = bb + 32
+            cc: uint8 = c
+            if cc >= 65 and cc <= 90:
+                cc = cc + 32
+            if aa == 115 and bb == 118 and cc == 103:   # 's','v','g'
+                return 1
+        j = j + 1
+    return 0
