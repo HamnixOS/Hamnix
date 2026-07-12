@@ -878,6 +878,22 @@ if [ -s "$FFHOME/.ff-profile/prefs.js" ]; then echo "[FF-DIAG] prefs.js delivere
 #   WebRender / Compositor — bridge + compositor-manager bring-up.
 # Unknown module names are silently ignored by MOZ_LOG (no cost), so this set
 # is safe; the render modules only fire during bounded render init.
+#
+# #108 ROUND-2 RESULT (2026-07-12, quiet host, 6G, CMD_WAIT=400): this MOZ_LOG
+# file comes back EMPTY (0 lines) — NOT an instrumentation failure. The parent
+# main thread parks UPSTREAM of every render/widget module below (it g_cond_waits
+# on a storage/profile worker that never signals in this limited-Linux-ABI ns),
+# so nsAppStartup/RenderThread/WebRender/nsWindow never get to log. The decisive
+# evidence lives in the WAYLAND_DEBUG "[FF]" wire trace instead: Firefox binds
+# the full registry + xdg_wm_base and allocates a GROWING wl_shm pool (SWGL's
+# software buffer, up to ~587 KB) — then STOPS, never calling get_xdg_surface /
+# attach / commit. ZERO egl/GLContext/GBM lines anywhere -> the "Gecko SW-
+# WebRender render-thread GL wall" is DISPROVEN (branch (a) ruled out); this is
+# branch (b): the SWGL wl_shm path is available and the gap is the parked
+# startup deadlock stalling the main thread BEFORE window-map, not a render/GL
+# wall and not merely host slowness (it hard-stops at the same verb across a
+# 400s window + relaunches). See the #108 wire-trace decision block in
+# scripts/test_wayland_firefox.sh, which reports this signature automatically.
 export MOZ_LOG='Widget:5,WidgetWayland:5,Gfx:5,Gp:5,RenderThread:5,WebRender:5,Compositor:5,GLContext:5,EGL:5,nsAppStartup:5,Process:5,IPCLauncher:5,GfxTest:5,ipc:4,IPDL:4,MessageChannel:4,Timeout:5,sync,timestamp'
 # MOZ_LOG TO A FILE, NOT LIVE STDERR. The `firefox-esr` binary re-execs /
 # detaches its stdio very early (the launch pipe closed with only "[FF]

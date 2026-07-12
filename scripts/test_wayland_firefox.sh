@@ -244,6 +244,46 @@ grep -aiE "firefox|mozilla|libxul|gtk|gdk|wayland|MOZ_|glib|Gdk|Gtk|assert|abort
 echo "$TAG --- render-thread / WebRender / GL-EGL / window-map progression ---"
 grep -aiE "FF-RENDER|RenderThread|RenderCompositor|SWGL|WebRender|GLContext|EGLLibrary|nsWindow|moz_container|xdg_surface|CreateRenderer|EnsureGPUReady" "$LOG" | tail -40 || true
 
+# #108 ROUND-2 DECISIVE WIRE-TRACE ANALYSIS. The MOZ_LOG render modules above
+# are frequently SILENT here: the parent main thread parks UPSTREAM of widget/
+# render init (the documented startup deadlock — it g_cond_waits on a storage/
+# profile worker that never signals in this limited-Linux-ABI ns), so NO
+# RenderThread/WebRender/nsWindow record is ever emitted even when the transport
+# is perfectly healthy. The WAYLAND_DEBUG "[FF]" wire trace is therefore the
+# GROUND TRUTH for the GL-wall-vs-window-map question that MOZ_LOG cannot answer:
+#   * ANY Firefox egl/GLContext/GBM/dmabuf line -> branch (a): a real GL/EGL wall.
+#   * wl_shm create_pool (+ growing resize)     -> branch (b): the SWGL wl_shm
+#                                                  software path IS taken (no GL).
+#   * furthest xdg_* verb + whether get_xdg_surface / attach / commit ever fire
+#     -> EXACTLY where the window-map stalls.
+echo "$TAG --- #108 wire-trace decision (WAYLAND_DEBUG ground truth) ---"
+ff_egl=$(grep -acE '^\[FF\].*(egl|EGL|GLContext|glx|GLX|create_context|gbm|GBM|dmabuf|zwp_linux_dmabuf)' "$LOG" 2>/dev/null)
+ff_shmpool=$(grep -acE '^\[FF\].*wl_shm(#[0-9]+)?\.create_pool' "$LOG" 2>/dev/null)
+ff_shmresize=$(grep -aoE 'wl_shm_pool#[0-9]+\.resize\([0-9]+\)' "$LOG" 2>/dev/null | tail -1)
+ff_xdgbind=$(grep -acE '^\[FF\].*bind\([0-9]+, .xdg_wm_base.' "$LOG" 2>/dev/null)
+ff_getxdg=$(grep -acE '^\[FF\].*(get_xdg_surface|get_toplevel|xdg_surface#[0-9]+\.|xdg_toplevel#[0-9]+\.)' "$LOG" 2>/dev/null)
+ff_attach=$(grep -acE '^\[FF\].*wl_surface#[0-9]+\.(attach|commit)' "$LOG" 2>/dev/null)
+echo "$TAG   Firefox EGL/GLContext lines : ${ff_egl:-0}  (>0 => branch (a) GL wall)"
+echo "$TAG   wl_shm create_pool          : ${ff_shmpool:-0}  (>0 => SWGL wl_shm path taken)"
+echo "$TAG   last shm-pool resize        : ${ff_shmresize:-<none>}"
+echo "$TAG   xdg_wm_base bind            : ${ff_xdgbind:-0}"
+echo "$TAG   xdg_surface/toplevel verbs  : ${ff_getxdg:-0}  (0 => window-map never begun)"
+echo "$TAG   wl_surface attach/commit    : ${ff_attach:-0}  (0 => no buffer committed)"
+if [ "${ff_egl:-0}" -gt 0 ]; then
+    echo "$TAG   #108 VERDICT: branch (a) — a GL/EGL context opened on the render path;"
+    echo "$TAG     force RenderCompositorSWGL / gfx.webrender.software.opengl=false."
+elif [ "${ff_shmpool:-0}" -gt 0 ] && [ "${ff_getxdg:-0}" -eq 0 ]; then
+    echo "$TAG   #108 VERDICT: branch (b) — GL wall DISPROVEN; SWGL wl_shm path active,"
+    echo "$TAG     but the main thread parks after the xdg_wm_base bind and never"
+    echo "$TAG     creates the xdg_surface (window-map stall UPSTREAM of render init:"
+    echo "$TAG     the parked Firefox startup deadlock, NOT a GL/render-thread wall)."
+elif [ "${ff_attach:-0}" -eq 0 ]; then
+    echo "$TAG   #108 VERDICT: branch (b) — reached xdg_surface but never committed a"
+    echo "$TAG     wl_shm buffer (map stalls at the attach/commit step)."
+else
+    echo "$TAG   #108 VERDICT: buffer committed — inspect the ladder (b) result above."
+fi
+
 # =====================================================================
 # LADDER RUNG (c): chrome RENDERS — screendump the DE window.
 # =====================================================================
