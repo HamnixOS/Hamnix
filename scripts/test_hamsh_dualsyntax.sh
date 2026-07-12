@@ -152,6 +152,57 @@ hamsh_send '    echo DIFF_FOR_$i'
 hamsh_send ''
 hamsh_send_await 'echo GATE_DIFF' 'GATE_DIFF' "$CMD_WAIT" || true
 
+# --- K. §17 Python-esque data constructs (#110) ---------------------
+# All results are emitted as whole output lines (`echo ${ … }` or an
+# inline-colon marker) so ran_bol / hamsh_ran can never false-green on a
+# typed-input echo.
+# K1. list comprehension (map, filter, method-call receiver).
+hamsh_send_await 'echo ${ [x*x for x in range(4)] }' '0 1 4 9' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ [x for x in range(6) if x % 2 == 0] }' '0 2 4' "$CMD_WAIT" || true
+# K2. dict comprehension + indexed read.
+hamsh_send 'dc = { x: x*x for x in range(3) }'
+hamsh_send_await 'echo ${ $dc[2] }' '4' "$CMD_WAIT" || true
+# K3. list + string indexing, negative index, slicing, reverse slice.
+hamsh_send 'xs = [10, 20, 30, 40]'
+hamsh_send_await 'echo ${ $xs[1] }' '20' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ $xs[-1] }' '40' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ $xs[1:3] }' '20 30' "$CMD_WAIT" || true
+hamsh_send 'sv2 = "hamnix"'
+hamsh_send_await 'echo ${ $sv2[0:3] }' 'ham' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ $sv2[::-1] }' 'xinmah' "$CMD_WAIT" || true
+# K4. tuple assignment + swap + multiple return.
+hamsh_send 'ta = 1'
+hamsh_send 'tb = 2'
+hamsh_send 'ta, tb = tb, ta'
+hamsh_send_await 'echo SWAP $ta $tb' 'SWAP 2 1' "$CMD_WAIT" || true
+hamsh_send 'def mkpair():'
+hamsh_send '    return 7, 8'
+hamsh_send ''
+hamsh_send 'pp, qq = mkpair()'
+hamsh_send_await 'echo MRET $pp $qq' 'MRET 7 8' "$CMD_WAIT" || true
+# K5. for-loop tuple unpack over d.items() (method-call desugar).
+hamsh_send 'dm = { "x": 1 }'
+hamsh_send 'for mk, mv in dm.items():'
+hamsh_send '    echo KVITER $mk $mv'
+hamsh_send ''
+hamsh_send_await 'echo GATE_K5' 'GATE_K5' "$CMD_WAIT" || true
+# K6. core data builtins.
+hamsh_send_await 'echo ${ sum([1, 2, 3, 4]) }' '10' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ sorted([3, 1, 2]) }' '1 2 3' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ max([3, 9, 2]) }' '9' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ abs(-5) }' '5' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ enumerate(["a", "b"]) }' '0 a 1 b' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ sv2.upper() }' 'HAMNIX' "$CMD_WAIT" || true
+# K7. DIFFERENTIAL both-styles-≡: an EXPRESSION-iterable for-loop
+# (`for x in range(3)`) in brace form AND indentation form must produce
+# IDENTICAL output — the accept-either guarantee, extended to the new
+# expression-mode loop.
+hamsh_send_await 'for x in range(3) { echo RNG_$x }' 'RNG_2' "$CMD_WAIT" || true
+hamsh_send 'for x in range(3):'
+hamsh_send '    echo RNG_$x'
+hamsh_send ''
+hamsh_send_await 'echo GATE_K7' 'GATE_K7' "$CMD_WAIT" || true
+
 hamsh_send_await 'echo GATE_DONE' 'GATE_DONE' "$CMD_WAIT" || true
 hamsh_send 'exit'
 sleep 2
@@ -247,6 +298,30 @@ if [ "$diff_a" -ge 2 ] && [ "$diff_b" -ge 2 ]; then
     echo "[$TAG] WRONG: brace/indent loops not equivalent (a=$diff_a b=$diff_b, want >=2 each)"; fail=1; fi
 if ! hamsh_ran "$LOG" "GATE_DIFF"; then
     echo "[$TAG] WRONG: shell did not survive the differential section"; fail=1; fi
+
+# K. §17 Python-esque data constructs (#110)
+for pair in "0 1 4 9|list-comprehension" "0 2 4|comprehension-filter" \
+            "4|dict-comprehension" "20|list-index" "40|negative-index" \
+            "20 30|list-slice" "ham|string-slice" "xinmah|reverse-slice" \
+            "SWAP 2 1|tuple-swap" "MRET 7 8|multiple-return" \
+            "10|sum" "1 2 3|sorted" "9|max" "5|abs" \
+            "0 a 1 b|enumerate" "HAMNIX|method-upper"; do
+    m="${pair%%|*}"; name="${pair##*|}"
+    if ran_bol "$(printf '%s' "$m" | sed 's/[.[*+]/\\&/g')"; then
+        echo "[$TAG] OK: $name"; else
+        echo "[$TAG] WRONG: $name (want '$m')"; fail=1; fi
+done
+# K5. for-loop tuple unpack over dm.items()
+if ran_bol "KVITER x 1"; then echo "[$TAG] OK: for k,v in d.items() unpack"; else
+    echo "[$TAG] WRONG: for k,v in d.items() did not unpack"; fail=1; fi
+# K7. DIFFERENTIAL: brace expr-for ≡ indent expr-for (>=2 of each marker).
+for tok in RNG_0 RNG_1 RNG_2; do
+    cnt=$(grep -acE "^$tok\$" "$CLEAN" || true)
+    if [ "$cnt" -ge 2 ]; then echo "[$TAG] OK: expr-for both-styles ≡ ($tok=$cnt)"; else
+        echo "[$TAG] WRONG: expr-for brace≢indent ($tok=$cnt, want >=2)"; fail=1; fi
+done
+if ! hamsh_ran "$LOG" "GATE_K7"; then
+    echo "[$TAG] WRONG: shell did not survive the §17 data-construct section"; fail=1; fi
 
 if ! hamsh_ran "$LOG" "GATE_DONE"; then
     echo "[$TAG] WRONG: shell did not survive to the end (GATE_DONE absent)"; fail=1; fi
