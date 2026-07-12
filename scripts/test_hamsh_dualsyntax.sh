@@ -114,6 +114,44 @@ hamsh_send_await 'if 1 > 0 notablock' 'parse error [line' "$CMD_WAIT" || true
 hamsh_send 'echo "n = 4\nif n > 3:\n    echo FILE_DUAL_YES\n    echo FILE_DUAL_Y2\nfor k in x y:\n    echo FILE_FOR_ITER\n" > /tmp/dualsyntax.hamsh'
 hamsh_send_await 'source /tmp/dualsyntax.hamsh' 'FILE_DUAL_Y2' "$CMD_WAIT" || true
 
+# --- G. brace BLOCK in a SOURCED FILE (accept-either, file mode) ----
+# Section F proved indentation-in-a-file; this proves the OTHER style —
+# curly braces — is equally legal when a FILE is sourced (not just
+# interactively). Together with A (brace interactive) + C (indent
+# interactive) + F (indent file) this closes the full accept-either
+# matrix: EITHER block syntax works in EITHER context.
+hamsh_send 'echo "if 7 > 3 { echo BRACE_FILE_YES }\nfor k in x y { echo BRACE_FILE_ITER }\n" > /tmp/bracesyntax.hamsh'
+hamsh_send_await 'source /tmp/bracesyntax.hamsh' 'BRACE_FILE_YES' "$CMD_WAIT" || true
+
+# --- H. membership operators: `in` / `not in` -----------------------
+# List element, negated list, string substring, and dict-key membership.
+# Taken branches use the inline-colon one-liner so a false marker can
+# only ever be typed on a filtered prompt line (see the header note).
+hamsh_send_await 'if 2 in [1, 2, 3]: echo MEMB_LIST_YES' 'MEMB_LIST_YES' "$CMD_WAIT" || true
+hamsh_send 'if 9 in [1, 2, 3]: echo MEMB_LIST_NO'
+hamsh_send_await 'if 9 not in [1, 2, 3]: echo MEMB_NOTIN_YES' 'MEMB_NOTIN_YES' "$CMD_WAIT" || true
+hamsh_send_await 'if "mn" in "hamnix": echo MEMB_SUBSTR_YES' 'MEMB_SUBSTR_YES' "$CMD_WAIT" || true
+hamsh_send 'if "zz" in "hamnix": echo MEMB_SUBSTR_NO'
+hamsh_send_await 'if "b" in {"a": 1, "b": 2}: echo MEMB_DICTKEY_YES' 'MEMB_DICTKEY_YES' "$CMD_WAIT" || true
+
+# --- I. new string methods: find / count / startswith / endswith ----
+# Each result feeds a comparison so the taken branch prints a distinct
+# whole-line marker (never a bare integer that could false-match).
+hamsh_send_await 'if find("hello", "ll") == 2: echo FIND_OK' 'FIND_OK' "$CMD_WAIT" || true
+hamsh_send_await 'if count("banana", "a") == 3: echo COUNT_OK' 'COUNT_OK' "$CMD_WAIT" || true
+hamsh_send_await 'if startswith("hamnix", "ham"): echo STARTS_OK' 'STARTS_OK' "$CMD_WAIT" || true
+hamsh_send_await 'if endswith("run.hamsh", ".hamsh"): echo ENDS_OK' 'ENDS_OK' "$CMD_WAIT" || true
+
+# --- J. DIFFERENTIAL: the SAME loop in brace vs indent style ---------
+# Both styles must produce IDENTICAL output — the core "accept-either,
+# same meaning" guarantee. Brace one-liner form first:
+hamsh_send_await 'for i in a b { echo DIFF_FOR_$i }' 'DIFF_FOR_b' "$CMD_WAIT" || true
+# ...then the byte-for-byte-equivalent indentation form:
+hamsh_send 'for i in a b:'
+hamsh_send '    echo DIFF_FOR_$i'
+hamsh_send ''
+hamsh_send_await 'echo GATE_DIFF' 'GATE_DIFF' "$CMD_WAIT" || true
+
 hamsh_send_await 'echo GATE_DONE' 'GATE_DONE' "$CMD_WAIT" || true
 hamsh_send 'exit'
 sleep 2
@@ -172,6 +210,43 @@ file_for_n=$(grep -acE "^FILE_FOR_ITER\$" "$CLEAN" || true)
 if ran_bol "FILE_DUAL_YES" && ran_bol "FILE_DUAL_Y2" && [ "$file_for_n" -ge 2 ]; then
     echo "[$TAG] OK: sourced indentation script executed (for iterated $file_for_n times)"; else
     echo "[$TAG] WRONG: sourced indentation script did not fully execute (for_iters=$file_for_n)"; fail=1; fi
+
+# G. sourced BRACE file (accept-either symmetry, file mode)
+brace_file_n=$(grep -acE "^BRACE_FILE_ITER\$" "$CLEAN" || true)
+if ran_bol "BRACE_FILE_YES" && [ "$brace_file_n" -ge 2 ]; then
+    echo "[$TAG] OK: sourced BRACE script executed (for iterated $brace_file_n times)"; else
+    echo "[$TAG] WRONG: sourced brace script did not fully execute (iters=$brace_file_n)"; fail=1; fi
+
+# H. membership operators (in / not in): list, string, dict; + absence
+for pair in "MEMB_LIST_YES|list-in" "MEMB_NOTIN_YES|list-not-in" \
+            "MEMB_SUBSTR_YES|str-substr" "MEMB_DICTKEY_YES|dict-key"; do
+    m="${pair%%|*}"; name="${pair##*|}"
+    if ran_bol "$m"; then echo "[$TAG] OK: membership $name"; else
+        echo "[$TAG] WRONG: membership $name did not run"; fail=1; fi
+done
+if hamsh_ran "$LOG" "MEMB_LIST_NO"; then
+    echo "[$TAG] WRONG: membership list untaken body leaked"; fail=1; else
+    echo "[$TAG] OK: membership list untaken body skipped"; fi
+if hamsh_ran "$LOG" "MEMB_SUBSTR_NO"; then
+    echo "[$TAG] WRONG: membership substr untaken body leaked"; fail=1; else
+    echo "[$TAG] OK: membership substr untaken body skipped"; fi
+
+# I. new string methods
+for pair in "FIND_OK|find" "COUNT_OK|count" "STARTS_OK|startswith" "ENDS_OK|endswith"; do
+    m="${pair%%|*}"; name="${pair##*|}"
+    if ran_bol "$m"; then echo "[$TAG] OK: string method $name"; else
+        echo "[$TAG] WRONG: string method $name did not run"; fail=1; fi
+done
+
+# J. DIFFERENTIAL both-styles-≡: the brace loop AND the indent loop each
+# emit DIFF_FOR_a + DIFF_FOR_b, so a correct pair yields >=2 of each.
+diff_a=$(grep -acE "^DIFF_FOR_a\$" "$CLEAN" || true)
+diff_b=$(grep -acE "^DIFF_FOR_b\$" "$CLEAN" || true)
+if [ "$diff_a" -ge 2 ] && [ "$diff_b" -ge 2 ]; then
+    echo "[$TAG] OK: brace loop ≡ indent loop (DIFF_FOR_a=$diff_a DIFF_FOR_b=$diff_b)"; else
+    echo "[$TAG] WRONG: brace/indent loops not equivalent (a=$diff_a b=$diff_b, want >=2 each)"; fail=1; fi
+if ! hamsh_ran "$LOG" "GATE_DIFF"; then
+    echo "[$TAG] WRONG: shell did not survive the differential section"; fail=1; fi
 
 if ! hamsh_ran "$LOG" "GATE_DONE"; then
     echo "[$TAG] WRONG: shell did not survive to the end (GATE_DONE absent)"; fail=1; fi
