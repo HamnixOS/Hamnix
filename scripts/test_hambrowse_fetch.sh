@@ -43,7 +43,10 @@ cd "$(dirname "$0")/.." || exit 1
 TS="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-build/hambrowse_fetch/$TS}"
 INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer.img}"
-BOOT_WAIT="${BOOT_WAIT:-260}"
+# 260s was too short: a full network-DE boot (virtio-net + net-fuzz selftests +
+# DE bringup) can take >400s to reach the interactive shell on a busy host, so
+# the gate false-INCONCLUSIVE'd before hambrowse ever launched. 480s covers it.
+BOOT_WAIT="${BOOT_WAIT:-480}"
 OVMF_FD="${OVMF_FD:-/usr/share/OVMF/OVMF_CODE.fd}"
 [ -f "$OVMF_FD" ] || OVMF_FD="/usr/share/ovmf/OVMF.fd"
 
