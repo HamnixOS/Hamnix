@@ -195,6 +195,9 @@ if __name__ == "__main__":
             dumpf = args[i + 1]; i += 2
         else:
             i += 1
-    text = open(dumpf).read() if dumpf else sys.stdin.read()
+    if dumpf:
+        text = open(dumpf, encoding="utf-8", errors="replace").read()
+    else:
+        text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
     render(text, out, url=url, win_title=title or "Browser", status=status)
     print("wrote", out)
