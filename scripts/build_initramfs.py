@@ -107,6 +107,21 @@ _wp_bytes = _build_default_wallpaper_bytes()
 if _wp_bytes:
     FILES.append(("/etc/wallpaper.ppm", _wp_bytes))
 
+# Sample images for the hamview image viewer. On the LIVE/installer medium the
+# native userland rides in this cpio (there is no ext4 sysroot), so the sample
+# PNG + baseline JPEG that `hamview /share/hamview/test.{png,jpg}` opens — and
+# that scripts/test_hamview_png_jpeg.sh decodes + screendumps — must be planted
+# here alongside /bin/hamview. (The installed-disk path gets the same files via
+# the hamnix-desktop-apps package; see scripts/build_packages.py.)
+_hv_fix_dir = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "hamview"
+for _hv_img in ("test.png", "test.jpg"):
+    _hv_src = _hv_fix_dir / _hv_img
+    if _hv_src.is_file():
+        FILES.append((f"/share/hamview/{_hv_img}", _hv_src.read_bytes()))
+    else:
+        print(f"[build_initramfs] WARN: hamview fixture {_hv_src} absent — "
+              f"test_hamview_png_jpeg will not find /share/hamview/{_hv_img}")
+
 # Optional opt-in markers controlled by env vars. Used by per-test
 # harness scripts to enable kernel-side smoke tests that would
 # otherwise hang/regress unrelated test runs. See

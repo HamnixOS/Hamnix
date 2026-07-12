@@ -643,6 +643,14 @@ def _files_desktop_apps() -> list[tuple[Path, str]]:
     f: list[tuple[Path, str]] = []
     for stem in DESKTOP_APP_BINS:
         _add_user_bin(f, stem)
+    # Sample images for the hamview image viewer: a PNG and a baseline JPEG
+    # so `hamview /share/hamview/test.png|test.jpg` opens a real compressed
+    # image out of the box (and scripts/test_hamview_png_jpeg.sh has fixed
+    # on-device targets to decode + screendump).
+    fixtures = HERE / "tests" / "fixtures" / "hamview"
+    for img in ("test.png", "test.jpg"):
+        src = fixtures / img
+        f.append((src, f"share/hamview/{img}"))
     return f
 
 
