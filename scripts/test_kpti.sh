@@ -137,6 +137,20 @@ if ! grep -a -F -q "[pgtable] cpu_entry_area PASS" "$LOG"; then
 fi
 pass "cpu_entry_area built; IDT/GDT/TSS/#DF/VERW/entry.text resolve through it"
 
+# (F) KPTI #94, Brick B: kernel dynamic-memory consumers reach RAM through
+# the page_offset alias instead of the user-shared low identity (PML4[0]).
+# First flipped consumer class = kstacks: alloc stays a low buddy block, but
+# kstack_base/kstack_top/saved-sp/TSS.RSP0 are all page_offset VAs, so the
+# kernel no longer depends on PML4[0] to reach its own stacks. A wrong RSP0
+# triple-faults on the very first CPL3->CPL0 entry, so simply reaching
+# userland below already exercises the flip; this marker proves it was live.
+if ! grep -a -F -q "[sched] kstack via page_offset" "$LOG"; then
+    echo "----- kstack-flip boot-log excerpt -----" >&2
+    grep -a -E "\[sched\] kstack" "$LOG" >&2 || true
+    fail "kstacks were not flipped onto the page_offset alias (KPTI Brick B)"
+fi
+pass "kstacks reach RAM through the page_offset alias (KPTI Brick B)"
+
 # (C) Boot reached userland — the KPTI scaffold did not regress the boot.
 if ! grep -a -E -q "hamsh\\\$" "$LOG"; then
     echo "[test_kpti] INCONCLUSIVE: boot did not reach a hamsh prompt" \
