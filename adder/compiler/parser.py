@@ -703,6 +703,12 @@ class Parser:
                 self.expect(TokenType.RPAREN)
                 return TupleLiteral(elements, self.make_span(tok))
             self.expect(TokenType.RPAREN)
+            # Record explicit parenthesisation on a comparison so codegen's
+            # chained-comparison unwrapper treats `(a<0)` as a boolean atom and
+            # does NOT fold `(a<0) != (b<0)` into the chain `a<0 and 0!=(b<0)`
+            # (issue #114). Only comparison BinaryExprs need the marker.
+            if isinstance(first, BinaryExpr):
+                first.paren = True
             return first
 
         # Lambda

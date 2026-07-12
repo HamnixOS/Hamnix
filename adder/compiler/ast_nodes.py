@@ -255,6 +255,12 @@ class BinaryExpr:
     left: 'Expr'
     right: 'Expr'
     span: Optional[Span] = None
+    # True iff this node was wrapped in explicit parentheses in the source,
+    # i.e. `(a < b)` rather than a bare `a < b`. Parentheses make a comparison
+    # a self-contained boolean atom, which STOPS Python-style chained-comparison
+    # unwrapping from reaching across it: `(a<0) != (b<0)` is a boolean XOR of
+    # two comparisons, NOT the chain `a<0 and 0!=(b<0)`. See issue #114.
+    paren: bool = False
 
 
 @dataclass

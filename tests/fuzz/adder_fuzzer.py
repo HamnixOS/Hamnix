@@ -644,6 +644,7 @@ class Program:
                                               # deep-idle/two-gap/call-gap/used-in-loop
         self._gen_short_circuit_traffic(env)  # logical and/or short-circuit
         self._gen_chained_compare_traffic(env)  # Python chained comparisons (a<b<c)
+        self._gen_bool_xor_traffic(env)         # #114: (a<0)!=(b<0) paren'd-compare XOR
         self._gen_cmpjcc_traffic(env)         # cmp; jcc branch-condition lever (--opt)
         self._gen_helper_calls(env)
         self._gen_saveset_probe(env)          # callee-saved save-set tightening (--opt)
@@ -2168,6 +2169,61 @@ class Program:
                     res = 0
                     break
             self._fold_value(f"cast[uint64]({src})", U64.wrap(res))
+
+    # ---- boolean XOR / equality of two PARENTHESISED comparisons -------------
+    def _gen_bool_xor_traffic(self, env):
+        """Emit `(A cop0 B) OP (C cop1 D)` — a single relational OP whose BOTH
+        operands are explicitly PARENTHESISED comparisons. Regression for issue
+        #114: the backend used to fold this into the Python chained-comparison
+        `A cop0 B OP D` (== `(A cop0 B) and (B OP (C cop1 D))`, comparing the
+        middle operand `B` against the RHS boolean) because the parser dropped
+        the parentheses, so `(a<0) != (b<0)` — a boolean XOR of two signs, the
+        floor-division idiom — computed the WRONG value. The parenthesised form
+        is a self-contained boolean atom and must NOT chain: `(a<0) != (b<0)` is
+        `bool(a<0) != bool(b<0)`.
+
+        Distinct from _gen_chained_compare_traffic: THAT emits BARE `a<b<c`
+        (>=2 links, genuinely chained); THIS emits a SINGLE op over two
+        parenthesised comparisons (the shape the fix stops chaining). The
+        operands are depth-0 exprs so each `(A cop B)` is a clean bare
+        comparison (BinaryExpr) the parser paren-marks. Value = the true boolean
+        XOR/equality/relation of the two 0/1 comparison results. Both subset and
+        default mode emit byte-identically (same rng stream)."""
+        rng = self.rng
+        OPS = ["!=", "==", "<", "<=", ">", ">="]
+        CMP = ["<", "<=", ">", ">=", "==", "!="]
+
+        def bare_compare(g):
+            """A bare parenthesised comparison `(A cop B)`; returns (src, TV).
+            TV models the 0/1 result with gt=None (a BinaryExpr comparison has
+            no get_expr_type -> SIGNED default), exactly like Gen._compare's
+            register value but WITHOUT the outer cast wrapper. Operands are
+            depth-0 (literal/var), so `(A cop B)` is a clean bare comparison."""
+            a = g._expr_typed(0, rng.choice(ALL_TYPES))
+            b = g._expr_typed(0, rng.choice(ALL_TYPES))
+            cop = rng.choice(CMP)
+            res = eval_cmp(a, b, cop)
+            src = f"({a.src} {cop} {b.src})"
+            return src, TV(src, 1 if res else 0, I64, gt=None)
+
+        for _ in range(rng.randint(4, 7)):
+            g = Gen(rng, env)
+            s0, t0 = bare_compare(g)
+            s1, t1 = bare_compare(g)
+            op = rng.choice(OPS)
+            outer_src = f"({s0} {op} {s1})"
+            val = eval_cmp(t0, t1, op)
+            self._fold_value(f"cast[uint64]({outer_src})", U64.wrap(1 if val else 0))
+        # Also pin the exact headline floor-division idiom `(x<0) != (y<0)` over
+        # both-sign combinations so the sign-XOR truth table is always covered.
+        for xv in (-3, 0, 5):
+            for yv in (-7, 0, 9):
+                xs = f"cast[int64](0 - {(-xv)})" if xv < 0 else f"cast[int64]({xv})"
+                ys = f"cast[int64](0 - {(-yv)})" if yv < 0 else f"cast[int64]({yv})"
+                res = (xv < 0) != (yv < 0)
+                self._fold_value(
+                    f"cast[uint64](({xs} < cast[int64](0)) != ({ys} < cast[int64](0)))",
+                    U64.wrap(1 if res else 0))
 
     # ---- short-circuit logical and/or traffic --------------------------------
     def _gen_short_circuit_traffic(self, env):

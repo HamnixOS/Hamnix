@@ -3091,6 +3091,11 @@ class X86CodeGen:
             return None
         if left.op not in self._RELATIONAL_OPS:
             return None
+        # A parenthesised left comparison is a self-contained boolean atom, not
+        # a chain link: `(a<0) != (b<0)` is the boolean XOR of two comparisons,
+        # NOT the chain `a<0 and 0!=(b<0)`. Stop unwrapping here (issue #114).
+        if getattr(left, "paren", False):
+            return None
         # Recursively unwrap the left side.
         inner = self._unwrap_comparison_chain(left.op, left.left, left.right)
         if inner is None:
