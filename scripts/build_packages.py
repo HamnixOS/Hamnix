@@ -383,6 +383,14 @@ COREUTILS_BINS = (
     "modprobe", "nl", "nproc", "oopsread", "paste", "printenv",
     "realpath", "service", "shuf", "split", "stat", "tac", "tar",
     "tree", "truncate", "tty", "unexpand", "uniq", "useradd",
+    # --- drift sweep (2026-07-12, #115 granular-packaging pass): real
+    # shippable CLIs that build into build/user/*.elf but were in NO
+    # package (caught red by test_package_de_coverage.sh). bc = infix
+    # calculator; fmt = text reflow; sha256sum = FIPS-180-4 digest; js =
+    # the native JavaScript engine CLI. (spawnfdprobe = a #28 spawn-FD
+    # fixture and umdf_host = the Track-4 .ko host slice stay UNpackaged
+    # — allowlisted as dev/fixture binaries in the coverage gate.)
+    "bc", "fmt", "sha256sum", "js",
 )
 
 
@@ -618,40 +626,118 @@ def _files_installer_tools() -> list[tuple[Path, str]]:
     return f
 
 
-# ---- hamnix-desktop-apps --------------------------------------------
-# The scene-file Desktop Environment app binaries. Single package
-# staging every DE app (the minimal lift — a per-app split would mirror
-# the COREUTILS_BINS pattern but the DE apps are useless individually:
-# you want the whole desktop or none of it). The hamnix-desktop
-# metapackage depends on this; hamnix-base reaches it transitively.
+# ---- the scene-file Desktop Environment: GRANULAR packaging ---------
+# A REAL distro ships every application as its OWN package (#115: "make
+# it a real distro — everything individually packaged"). The DE therefore
+# splits into:
 #
-# Verified present in build/user/*.elf after scripts/build_user.sh on
-# 2026-06-19: all 31 binaries below build. None dropped.
-DESKTOP_APP_BINS = (
-    "hamUId", "hamde", "hamdesktop", "hampanelscene", "hamtermscene",
-    "hamterm", "hamfmscene", "hamfm", "hamcalcscene", "hamcalc",
-    "hameditscene", "hamedit", "haminstallui", "hamsettings",
-    "hammonscene", "hammon", "hamclock", "hamctl", "hamnotify",
-    "hamshot", "hamtray", "hamappmenu", "hamctxmenu", "hamosd",
-    "hamlock", "hamscreensaver", "hamsession", "hamsessui", "hamrband",
-    "hamresize", "hamview", "hamabout", "hamtoast", "haminbox",
-    "hambrowse", "ham2048scene",
+#   * hamnix-desktop-core — the compositor / window-system daemon
+#     (hamUId), the DE session manager (hamde/hamsession/hamsessui), the
+#     panel + menus + tray + OSD + notification/toast/lock/screensaver
+#     infrastructure. This is the "you must have it for a desktop at all"
+#     substrate; the app packages Depend on it.
+#
+#   * one hamnix-<app> package PER application (hamnix-ham2048,
+#     hamnix-hamterm, hamnix-hamfiles, hamnix-hamcalc, hamnix-hamedit,
+#     hamnix-hammon, hamnix-hamview, hamnix-hambrowse, hamnix-haminbox,
+#     hamnix-hamclock, hamnix-hamsettings, hamnix-haminstallui). Each is
+#     independently installable/removable and carries its own version +
+#     depends (>= hamnix-desktop-core). An app that comes as a
+#     logic-binary + a scene front-end (hamterm + hamtermscene, hamfm +
+#     hamfmscene, ...) ships BOTH in its package.
+#
+#   * hamnix-desktop-apps — now a METAPACKAGE (zero files) depending on
+#     every hamnix-<app> package, mirroring the hamnix-coreutils pattern.
+#     Anything that pulled the old bundled hamnix-desktop-apps still gets
+#     the whole app set transitively.
+#
+#   * hamnix-desktop — the top METAPACKAGE: Depends on hamnix-desktop-core
+#     + hamnix-desktop-apps + hamnix-desktop-config + the shell.
+#
+# Verified present in build/user/*.elf after scripts/build_user.sh: all
+# binaries below build. None dropped.
+
+DESKTOP_CORE_BINS = (
+    "hamUId", "hamde", "hamdesktop", "hampanelscene", "hamctl",
+    "hamnotify", "hamshot", "hamtray", "hamappmenu", "hamctxmenu",
+    "hamosd", "hamlock", "hamscreensaver", "hamsession", "hamsessui",
+    "hamrband", "hamresize", "hamtoast",
 )
 
+# One package per DE application. `bins` is the binary set the package
+# stages; `summary` is the human one-liner; `images` flags the hamview
+# sample-image fixtures.
+DESKTOP_APP_PACKAGES: list[dict] = [
+    {"name": "hamnix-ham2048", "bins": ("ham2048scene",),
+     "summary": "2048 sliding-tile puzzle game"},
+    {"name": "hamnix-hamterm", "bins": ("hamterm", "hamtermscene"),
+     "summary": "terminal emulator"},
+    {"name": "hamnix-hamfiles", "bins": ("hamfm", "hamfmscene"),
+     "summary": "file manager"},
+    {"name": "hamnix-hamcalc", "bins": ("hamcalc", "hamcalcscene"),
+     "summary": "calculator"},
+    {"name": "hamnix-hamedit", "bins": ("hamedit", "hameditscene"),
+     "summary": "text editor"},
+    {"name": "hamnix-hammon", "bins": ("hammon", "hammonscene"),
+     "summary": "system / resource monitor"},
+    {"name": "hamnix-hamview", "bins": ("hamview",),
+     "summary": "image viewer", "images": True},
+    {"name": "hamnix-hambrowse", "bins": ("hambrowse",),
+     "summary": "native web browser"},
+    {"name": "hamnix-haminbox", "bins": ("haminbox",),
+     "summary": "mail inbox"},
+    {"name": "hamnix-hamclock", "bins": ("hamclock",),
+     "summary": "clock"},
+    {"name": "hamnix-hamsettings", "bins": ("hamsettings", "hamabout"),
+     "summary": "settings + about dialog"},
+    {"name": "hamnix-haminstallui", "bins": ("haminstallui",),
+     "summary": "graphical installer front-end"},
+]
 
-def _files_desktop_apps() -> list[tuple[Path, str]]:
+# Flat set of every app-package name — used to keep hamnix-base's direct
+# depends list to the metapackage (hamnix-desktop) rather than every leaf.
+DESKTOP_APP_PKG_NAMES = {d["name"] for d in DESKTOP_APP_PACKAGES}
+
+
+def _files_desktop_core() -> list[tuple[Path, str]]:
     f: list[tuple[Path, str]] = []
-    for stem in DESKTOP_APP_BINS:
+    for stem in DESKTOP_CORE_BINS:
         _add_user_bin(f, stem)
-    # Sample images for the hamview image viewer: a PNG and a baseline JPEG
-    # so `hamview /share/hamview/test.png|test.jpg` opens a real compressed
-    # image out of the box (and scripts/test_hamview_png_jpeg.sh has fixed
-    # on-device targets to decode + screendump).
-    fixtures = HERE / "tests" / "fixtures" / "hamview"
-    for img in ("test.png", "test.jpg"):
-        src = fixtures / img
-        f.append((src, f"share/hamview/{img}"))
     return f
+
+
+def _make_desktop_app_files_fn(bins: tuple, with_images: bool):
+    """Return a files_fn staging `bins` (+ hamview sample images)."""
+    def _files() -> list[tuple[Path, str]]:
+        f: list[tuple[Path, str]] = []
+        for stem in bins:
+            _add_user_bin(f, stem)
+        if with_images:
+            # Sample images for the hamview image viewer: a PNG and a
+            # baseline JPEG so `hamview /share/hamview/test.png|test.jpg`
+            # opens a real compressed image out of the box (and
+            # scripts/test_hamview_png_jpeg.sh has fixed on-device targets
+            # to decode + screendump).
+            fixtures = HERE / "tests" / "fixtures" / "hamview"
+            for img in ("test.png", "test.jpg"):
+                f.append((fixtures / img, f"share/hamview/{img}"))
+        return f
+    return _files
+
+
+def _desktop_app_specs() -> list[dict]:
+    """Generate one PACKAGE_SPEC per DE application package."""
+    specs: list[dict] = []
+    for app in DESKTOP_APP_PACKAGES:
+        specs.append({
+            "name": app["name"],
+            "files_fn": _make_desktop_app_files_fn(
+                app["bins"], app.get("images", False)),
+            "depends": [f"hamnix-desktop-core>={PKG_VERSION}"],
+            "description": f"Hamnix desktop app — {app['summary']}",
+            "target": "#hamnix-system",
+        })
+    return specs
 
 
 # ---- hamnix-desktop-config ------------------------------------------
@@ -811,17 +897,39 @@ PACKAGE_SPECS: list[dict] = [
         "target": "#hamnix-system",
     },
     # ---- the scene-file Desktop Environment -------------------------
-    # hamnix-desktop-apps stages the 31 DE app binaries; hamnix-desktop-
-    # config stages the autostart/config files; hamnix-desktop is the
-    # metapackage that pulls both + the shell. Before this, `hpm install
-    # hamnix-base` yielded a booting CLI system with NO desktop at all.
+    # GRANULAR (#115): hamnix-desktop-core stages the compositor/panel/
+    # session substrate; one hamnix-<app> package per application stages
+    # that app (spliced in below via _desktop_app_specs()); hamnix-desktop-
+    # apps is a METAPACKAGE depending on every app package; hamnix-desktop-
+    # config stages the autostart/config files; hamnix-desktop is the top
+    # metapackage that pulls core + apps + config + shell. Before this,
+    # `hpm install hamnix-base` yielded a booting CLI system with NO
+    # desktop at all; before the granular split every app lived in one
+    # bundled hamnix-desktop-apps package.
+    {
+        "name": "hamnix-desktop-core",
+        "files_fn": _files_desktop_core,
+        "depends": ["hamnix-hamsh>=1"],
+        "description": ("Hamnix Desktop Environment CORE — compositor / "
+                        "window-system daemon (hamUId), session manager, "
+                        "panel, menus, tray, OSD, notifications, lock "
+                        "(no apps)"),
+        "target": "#hamnix-system",
+    },
+    # hamnix-desktop-apps is now a METAPACKAGE: zero files, depends on
+    # every per-app hamnix-<app> package (filled in below from
+    # DESKTOP_APP_PACKAGES). Anything that pulled the old bundled
+    # hamnix-desktop-apps still gets the full app set transitively.
     {
         "name": "hamnix-desktop-apps",
-        "files_fn": _files_desktop_apps,
-        "depends": ["hamnix-init>=1"],
-        "description": ("Hamnix scene-file Desktop Environment app "
-                        "binaries (hamUId/hamde/panel/term/fm/calc/"
-                        "edit/settings/mon/clock/notify/... — 31 apps)"),
+        "files_fn": lambda: [],
+        "depends": [f"hamnix-desktop-core>={PKG_VERSION}"]
+                   + [f"{d['name']}>={PKG_VERSION}"
+                      for d in DESKTOP_APP_PACKAGES],
+        "description": ("Hamnix desktop applications metapackage — pulls "
+                        "in every per-app package (ham2048/hamterm/"
+                        "hamfiles/hamcalc/hamedit/hammon/hamview/"
+                        "hambrowse/haminbox/hamclock/hamsettings/...)"),
         "target": "#hamnix-system",
     },
     {
@@ -837,13 +945,19 @@ PACKAGE_SPECS: list[dict] = [
         "name": "hamnix-desktop",
         "files_fn": lambda: [],
         "depends": ["hamnix-hamsh>=1",
+                    f"hamnix-desktop-core>={PKG_VERSION}",
                     f"hamnix-desktop-apps>={PKG_VERSION}",
                     f"hamnix-desktop-config>={PKG_VERSION}"],
         "description": ("Hamnix desktop metapackage — the scene-file DE "
-                        "(apps + autostart config + shell)"),
+                        "(core + apps + autostart config + shell)"),
         "target": "#hamnix-system",
     },
 ]
+
+# Splice in one leaf package per DE application (hamnix-ham2048,
+# hamnix-hamterm, ...). Generated from DESKTOP_APP_PACKAGES so the table
+# stays maintainable. Each depends on hamnix-desktop-core.
+PACKAGE_SPECS.extend(_desktop_app_specs())
 
 # Splice in one leaf package per command. Generated programmatically
 # from COREUTILS_BINS so the table stays maintainable (no hand-written
@@ -957,7 +1071,14 @@ def build_hamnix_base() -> dict:
     # against an ISO mini-repo gets the full OS shape on disk; the
     # installer copies BOOTX64.EFI separately because the ESP isn't a
     # Hamnix-file-server target.
+    # Exclude the per-command coreutils leaves (reached via the
+    # hamnix-coreutils metapackage) AND the per-app DE leaves + the DE
+    # core (reached via the hamnix-desktop metapackage) so hamnix-base's
+    # direct depends stays the dozen-ish top-level components instead of
+    # ballooning with every leaf. The closure still resolves them all.
     leaf_names = {_cmd_pkg_name(s) for s in COREUTILS_BINS}
+    leaf_names |= DESKTOP_APP_PKG_NAMES
+    leaf_names.add("hamnix-desktop-core")
     depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS
                if s["name"] not in leaf_names]
     depends.append(f"hamnix-bootloader>={PKG_VERSION}")

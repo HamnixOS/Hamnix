@@ -56,6 +56,11 @@ SKIP_BINS = {
     "hello", "dup_demo", "stdin_demo", "p9srv_demo", "preempt_demo",
     "preempt_hog", "nice_demo", "nice_hi", "nice_lo", "u_tlstest",
     "test_errstr_perbackend", "test_hugepage", "live_distro_up",
+    # spawnfdprobe = Task #28 clean-FD spawn fixture; umdf_host = the
+    # Track-4 userland .ko host (first vertical slice, not yet wired into
+    # any runlevel/menu). Both are dev/bring-up binaries, not shipped
+    # userland — packaged by nothing on purpose.
+    "spawnfdprobe", "umdf_host",
     # X11 bridge + scene test harnesses (not the shipped DE)
     "x11apptest", "x11srv", "x11test", "xclient_demo", "xfill",
     "scenetest", "multiwintest", "hamui_demo", "ham2048", "hamsnake",
@@ -156,6 +161,64 @@ uncovered = sorted(b for b in built
 if uncovered:
     fail.append(f"{len(uncovered)} built binaries packaged by NO package: "
                 + ", ".join(uncovered))
+
+# --- 4: GRANULARITY (#115 — a real distro packages every app apart) ---
+# The DE must NOT ship as one bundled hamnix-desktop-apps package. Assert
+# each application is its OWN package, hamnix-desktop-core exists apart
+# from the apps, and the hamnix-desktop metapackage pulls them all in.
+EXPECTED_APP_PKGS = {
+    "hamnix-ham2048": "ham2048scene",
+    "hamnix-hamterm": "hamterm",
+    "hamnix-hamfiles": "hamfm",
+    "hamnix-hamcalc": "hamcalc",
+    "hamnix-hamedit": "hamedit",
+    "hamnix-hammon": "hammon",
+    "hamnix-hamview": "hamview",
+    "hamnix-hambrowse": "hambrowse",
+    "hamnix-haminbox": "haminbox",
+    "hamnix-hamclock": "hamclock",
+    "hamnix-hamsettings": "hamsettings",
+    "hamnix-haminstallui": "haminstallui",
+}
+
+# 4a: hamnix-desktop-core is a real, separate package with the compositor.
+if "hamnix-desktop-core" not in pkgs:
+    fail.append("granularity: hamnix-desktop-core package MISSING")
+else:
+    _, core_bases = pkg_files("hamnix-desktop-core")
+    if "hamUId" not in core_bases:
+        fail.append("granularity: hamnix-desktop-core lacks the hamUId "
+                    "compositor/window-system daemon")
+
+# 4b: every app is its own package staging its own binary — and NOT
+# bundling a sibling app's binary (2048 is its own package, etc.).
+sibling_bins = set(EXPECTED_APP_PKGS.values())
+for pkg, must_have in sorted(EXPECTED_APP_PKGS.items()):
+    if pkg not in pkgs:
+        fail.append(f"granularity: app package {pkg} MISSING")
+        continue
+    _, bases = pkg_files(pkg)
+    if must_have not in bases:
+        fail.append(f"granularity: {pkg} does not stage {must_have}")
+    strays = (set(bases) & sibling_bins) - {must_have}
+    if strays:
+        fail.append(f"granularity: {pkg} bundles sibling app binaries "
+                    f"{sorted(strays)} — apps must be packaged apart")
+
+# 4c: the hamnix-desktop metapackage transitively pulls in core + every
+# app package (closure walk from hamnix-desktop).
+dseen = set()
+dstack = ["hamnix-desktop"]
+while dstack:
+    n = dstack.pop()
+    if n in dseen or n not in pkgs:
+        continue
+    dseen.add(n)
+    dstack += dep_names(pkgs[n])
+for want in ["hamnix-desktop-core", "hamnix-desktop-apps",
+             *EXPECTED_APP_PKGS]:
+    if want not in dseen:
+        fail.append(f"granularity: hamnix-desktop closure MISSING {want}")
 
 if fail:
     print("[de-cov] FAIL:")
