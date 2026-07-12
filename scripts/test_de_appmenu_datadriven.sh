@@ -110,7 +110,10 @@ fi
 # menu section via a readonly-intent bind of #distro at /n/linux, a scan of
 # /n/linux/usr/share/applications, and a launch that enters the linux ns.
 PANEL="user/hampanelscene.ad"
-if grep -q "bind '#distro' /n/linux" etc/rc.d/rc.5; then
+# Flag-tolerant: #69 made this a kernel-enforced read-only bind (`bind -r
+# '#distro' /n/linux`), so match `bind [flags] '#distro' /n/linux` rather than
+# the old flagless form (which this assertion froze at — a stale false-FAIL).
+if grep -qE "bind[[:space:]]+(-[a-z]+[[:space:]]+)*'#distro'[[:space:]]+/n/linux" etc/rc.d/rc.5; then
     passed "rc.5 read-binds #distro at /n/linux for the panel ns"
 else
     failed "rc.5 does not bind #distro at /n/linux (panel can't see Linux apps)"
