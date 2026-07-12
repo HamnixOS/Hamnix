@@ -209,6 +209,18 @@ hamsh_send '    echo RNG_$x'
 hamsh_send ''
 hamsh_send_await 'echo GATE_K7' 'GATE_K7' "$CMD_WAIT" || true
 
+# --- L. §19 (#111): nested-list render + namespace as a Pythonic object
+# L1. #110 render gap: a NESTED list must print its inner elements, not
+# blank. zip() yields a list of pairs; a nested literal is two inner lists.
+hamsh_send_await 'echo ${ zip([1, 2], [3, 4]) }' '[1, 3] [2, 4]' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ [[1, 2], [3, 4]] }' '[1, 2] [3, 4]' "$CMD_WAIT" || true
+# L2. a namespace TEMPLATE is iterable + introspectable (binds()/mounts()).
+hamsh_send 'nsx = ns { bind /tmp /n/aa ; bind /tmp /n/bb }'
+hamsh_send_await 'echo ${ binds($nsx) }' '/n/aa /n/bb' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ nsx.mounts() }' '/n/aa /n/bb' "$CMD_WAIT" || true
+# L3. `for m in <ns>` walks the mount-points (inline-colon one-liner).
+hamsh_send_await 'for m in $nsx: echo NSITER $m' 'NSITER /n/bb' "$CMD_WAIT" || true
+
 hamsh_send_await 'echo GATE_DONE' 'GATE_DONE' "$CMD_WAIT" || true
 hamsh_send 'exit'
 sleep 2
@@ -332,6 +344,19 @@ for tok in RNG_0 RNG_1 RNG_2; do
 done
 if ! hamsh_ran "$LOG" "GATE_K7"; then
     echo "[$TAG] WRONG: shell did not survive the §17 data-construct section"; fail=1; fi
+
+# L. §19 (#111): nested-list render + namespace-as-object
+if ran_bol "$(printf '%s' '[1, 3] [2, 4]' | sed 's/[.[*+]/\\&/g')"; then
+    echo "[$TAG] OK: nested-list render (zip pairs non-empty)"; else
+    echo "[$TAG] WRONG: nested-list render — zip inner lists blank (#110)"; fail=1; fi
+if ran_bol "$(printf '%s' '[1, 2] [3, 4]' | sed 's/[.[*+]/\\&/g')"; then
+    echo "[$TAG] OK: nested-list literal render"; else
+    echo "[$TAG] WRONG: nested-list literal printed blank inner lists (#110)"; fail=1; fi
+if ran_bol "/n/aa /n/bb"; then echo "[$TAG] OK: binds(ns) introspection"; else
+    echo "[$TAG] WRONG: binds(ns) did not list the mount-points"; fail=1; fi
+if ran_bol "NSITER /n/aa" && ran_bol "NSITER /n/bb"; then
+    echo "[$TAG] OK: for m in <ns> iterates the namespace"; else
+    echo "[$TAG] WRONG: namespace iteration did not walk its binds"; fail=1; fi
 
 if ! hamsh_ran "$LOG" "GATE_DONE"; then
     echo "[$TAG] WRONG: shell did not survive to the end (GATE_DONE absent)"; fail=1; fi
