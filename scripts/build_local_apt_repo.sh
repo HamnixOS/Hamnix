@@ -105,6 +105,106 @@ IDXDIR="$REPO/dists/local/main/binary-$ARCH"
 mkdir -p "$POOLDIR" "$IDXDIR"
 cp "$DEB" "$POOLDIR/${PKG}_${VER}_${ARCH}.deb"
 
+# --- DEPENDENCY SCENARIO (multi-package resolve -> unpack -> configure) --
+# hamhello above is a dependency-FREE leaf (proves the base install path).
+# To ALSO exercise apt's dependency resolver + multi-package unpack +
+# ordered configure + a maintainer script (postinst), stage a SECOND pair
+# of packages with a real Depends relationship:
+#
+#   hamdep-lib          (the dependency): installs a data file AND ships a
+#                       postinst that prints a unique marker when dpkg
+#                       CONFIGURES it — proving the dep was not merely
+#                       unpacked but configured, and that a /bin/sh
+#                       maintainer script runs in the namespace.
+#   hamdep-app  Depends: hamdep-lib
+#                       the leaf the test installs; its /usr/bin program
+#                       READS hamdep-lib's data file and echoes it, so a
+#                       successful run proves BOTH packages installed and
+#                       configured in the correct order.
+#
+# `apt-get install -y hamdep-app` must then: resolve hamdep-app, pull in
+# hamdep-lib, download BOTH .debs via the file:// method, unpack both, and
+# configure hamdep-lib BEFORE hamdep-app (Depends ordering) — the full
+# multi-package pipeline, not a single leaf.
+build_gzip_deb() {  # $1=pkgname $2=version $3=builddir(with DEBIAN/ + payload)
+    local name="$1" ver="$2" bdir="$3"
+    local out="$DEBOUT/${name}_${ver}_${ARCH}.deb"
+    dpkg-deb -Zgzip --root-owner-group --build "$bdir" "$out" >/dev/null
+    printf '%s' "$out"
+}
+
+DEP_LIB=hamdep-lib
+DEP_APP=hamdep-app
+DEP_VER=1.0
+DEP_DATA_MARKER="HAMDEP_LIB_DATA_OK"
+DEP_POSTINST_MARKER="HAMDEP_LIB_POSTINST_RAN"
+
+echo "[build_local_apt_repo] (3b/5) Build dependency pair ($DEP_APP -> $DEP_LIB)"
+
+# hamdep-lib: data file + postinst that prints the configure marker.
+LIBW="$(mktemp -d /tmp/hamdep-lib.XXXXXX)"
+mkdir -p "$LIBW/DEBIAN" "$LIBW/usr/share/hamdep"
+echo "$DEP_DATA_MARKER" > "$LIBW/usr/share/hamdep/data.txt"
+cat > "$LIBW/DEBIAN/control" <<EOF
+Package: $DEP_LIB
+Version: $DEP_VER
+Architecture: $ARCH
+Maintainer: Hamnix <root@hamnix>
+Section: misc
+Priority: optional
+Description: Hamnix apt dependency-resolution proof (the dependency)
+ Ships a data file consumed by hamdep-app and a postinst maintainer
+ script that prints a unique marker when dpkg configures the package.
+EOF
+# postinst: runs as `/bin/sh <postinst> configure <old-version>` when dpkg
+# CONFIGURES the package (the "Setting up hamdep-lib" phase). Printing a
+# marker here proves the maintainer-script path runs inside the namespace.
+cat > "$LIBW/DEBIAN/postinst" <<EOF
+#!/bin/sh
+set -e
+if [ "\$1" = configure ]; then
+    echo "$DEP_POSTINST_MARKER"
+fi
+exit 0
+EOF
+chmod 0755 "$LIBW/DEBIAN/postinst"
+
+# hamdep-app: Depends on hamdep-lib; its program reads the lib's data file.
+APPW="$(mktemp -d /tmp/hamdep-app.XXXXXX)"
+mkdir -p "$APPW/DEBIAN" "$APPW/usr/bin"
+cat > "$APPW/usr/bin/$DEP_APP" <<'EOF'
+#!/bin/sh
+# Prints the dependency's data, proving hamdep-lib was installed+configured
+# before this leaf runs. A distinctive run marker for the e2e assertion.
+data="$(cat /usr/share/hamdep/data.txt 2>/dev/null || echo MISSING_DEP_DATA)"
+echo "HAMDEP_APP_RAN:$data"
+EOF
+chmod 0755 "$APPW/usr/bin/$DEP_APP"
+cat > "$APPW/DEBIAN/control" <<EOF
+Package: $DEP_APP
+Version: $DEP_VER
+Architecture: $ARCH
+Maintainer: Hamnix <root@hamnix>
+Section: misc
+Priority: optional
+Depends: $DEP_LIB
+Description: Hamnix apt dependency-resolution proof (the leaf app)
+ Depends on hamdep-lib; the installed program reads hamdep-lib's data
+ file so a successful run proves apt resolved the dependency, unpacked
+ both packages and configured hamdep-lib before hamdep-app.
+EOF
+
+LIB_DEB="$(build_gzip_deb "$DEP_LIB" "$DEP_VER" "$LIBW")"
+APP_DEB="$(build_gzip_deb "$DEP_APP" "$DEP_VER" "$APPW")"
+rm -rf "$LIBW" "$APPW"
+
+# Lay the dependency pair into the pool alongside hamhello.
+LIBPOOL="$REPO/pool/main/h/$DEP_LIB"
+APPPOOL="$REPO/pool/main/h/$DEP_APP"
+mkdir -p "$LIBPOOL" "$APPPOOL"
+cp "$LIB_DEB" "$LIBPOOL/${DEP_LIB}_${DEP_VER}_${ARCH}.deb"
+cp "$APP_DEB" "$APPPOOL/${DEP_APP}_${DEP_VER}_${ARCH}.deb"
+
 echo "[build_local_apt_repo] (4/5) Generate Packages + Release indices"
 # Generate the binary Packages index. Prefer apt-ftparchive; fall back to
 # dpkg-scanpackages. Both emit a Filename: relative to the repo root.
@@ -165,3 +265,5 @@ echo "    repo:    $REPO"
 echo "    sources: $ROOTFS/etc/apt/sources.list.d/local.list"
 echo "    deb:     $ROOTFS/var/cache/apt/archives/${PKG}_${VER}_${ARCH}.deb"
 echo "    marker:  $MARKER"
+echo "    dep-pair: $DEP_APP (Depends: $DEP_LIB) — multi-pkg resolve/unpack/configure"
+echo "    dep run marker: HAMDEP_APP_RAN:$DEP_DATA_MARKER  postinst: $DEP_POSTINST_MARKER"

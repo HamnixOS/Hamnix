@@ -4288,6 +4288,16 @@ def build_archive() -> bytes:
                 "opt/localrepo/dists/local/main/binary-amd64/Packages",
                 "opt/localrepo/dists/local/main/binary-amd64/Packages.gz",
                 "opt/localrepo/pool/main/h/hamhello/hamhello_1.0_amd64.deb",
+                # The DEPENDENCY-scenario pair (scripts/build_local_apt_repo
+                # .sh also stages these): hamdep-app Depends: hamdep-lib.
+                # Embedded in the pool so apt's `file` method genuinely
+                # FETCHES both .debs from file:///opt/localrepo (they are
+                # deliberately NOT pre-cached under archives/, so the pool
+                # file:// fetch path is exercised, not just the cache).
+                # Drives scripts/test_apt_install_e2e.sh (multi-package
+                # resolve -> unpack -> ordered configure -> postinst -> run).
+                "opt/localrepo/pool/main/h/hamdep-lib/hamdep-lib_1.0_amd64.deb",
+                "opt/localrepo/pool/main/h/hamdep-app/hamdep-app_1.0_amd64.deb",
                 # apt sources fragment pointing at the local repo, plus a
                 # cached copy of the .deb for the `dpkg -i` short path.
                 "etc/apt/sources.list.d/local.list",
