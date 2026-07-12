@@ -191,6 +191,17 @@ common_irq:
     /* Drop the vector + dummy error code pushed by the stub. */
     addq  $16, %rsp
 
+    /* MDS mitigation (task #87): CLEAR_CPU_BUFFERS on kernel->user return
+     * ONLY. common_irq iretq's back to WHATEVER was interrupted — kernel
+     * (CPL0) or user (CPL3). Flushing microarch buffers on a kernel->kernel
+     * return is wasted work, so gate on the saved CS RPL: %rsp now points at
+     * the CPU iret frame (RIP=0, CS=8), and CS[1:0]=RPL — nonzero iff we are
+     * returning to CPL3. testb sets ZF without touching any GP register;
+     * verw clobbers only ZF, which iretq discards when it reloads RFLAGS. */
+    testb $3, 8(%rsp)                 /* saved CS RPL != 0 => -> CPL3 */
+    jz    1f
+    verw  mds_verw_sel(%rip)          /* CLEAR_CPU_BUFFERS (MDS) */
+1:
     iretq
 
 /* ---------- irq_stub_table --------------------------------------- *

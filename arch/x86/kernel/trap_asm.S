@@ -185,6 +185,14 @@ trap_diag_stub_0d:
     popq    %rbx
     popq    %rax
     addq    $8, %rsp                    /* discard CPU error code      */
+    /* MDS mitigation (task #87): CLEAR_CPU_BUFFERS iff returning to CPL3.
+     * A staged SIGSEGV handler resumes in user mode; gate on saved CS RPL
+     * (RIP=0, CS=8 in the iret frame). testb touches no GPR; iretq
+     * discards the ZF verw leaves. */
+    testb   $3, 8(%rsp)
+    jz      3f
+    verw    mds_verw_sel(%rip)          /* CLEAR_CPU_BUFFERS (MDS) */
+3:
     iretq
 
 2:  /* CPL=0 kernel #GP. Pop our saved GPRs so the stack is back to the
@@ -323,6 +331,14 @@ trap_diag_stub_0e:
     popq    %rbx
     popq    %rax
     addq    $8, %rsp                    /* discard CPU error code      */
+    /* MDS mitigation (task #87): CLEAR_CPU_BUFFERS iff returning to CPL3.
+     * A resolved COW/demand fault (or a staged SIGSEGV handler) resumes
+     * user code; a kernel-mode COW resolution returns to CPL0 and skips
+     * the flush. Gate on saved CS RPL (RIP=0, CS=8 in the iret frame). */
+    testb   $3, 8(%rsp)
+    jz      4f
+    verw    mds_verw_sel(%rip)          /* CLEAR_CPU_BUFFERS (MDS) */
+4:
     iretq
 
 1:  /* Not a COW fault. Pop our saved GPRs so the stack is back to the

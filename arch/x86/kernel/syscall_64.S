@@ -220,6 +220,18 @@ syscall_entry:
     popq    %r11                      /* -16 user RFLAGS */
     popq    %rsp                      /* -8  user RSP (natural) */
 
+    /* MDS mitigation (task #87): CLEAR_CPU_BUFFERS. VERW against a valid
+     * data-segment selector flushes the store buffer / fill buffers /
+     * load ports when MD_CLEAR microcode is present, closing the
+     * Microarchitectural Data Sampling side channel on the kernel->user
+     * boundary. It MUST run after every GP register is restored and as
+     * close to the ring transition as possible. VERW only writes
+     * FLAGS.ZF + microarch state; SYSRETQ reloads RFLAGS from %r11 so the
+     * ZF clobber is harmless. The selector word (mds_verw_sel = 0x10,
+     * kernel data) lives in .rodata below and is read at CPL0 (US=0), so
+     * this is SMAP-clean and touches no user memory. Unconditional:
+     * VERW is architecturally a no-op-for-correctness without MD_CLEAR. */
+    verw    mds_verw_sel(%rip)        /* CLEAR_CPU_BUFFERS (MDS) */
     sysretq                           /* CPL 0 -> 3, RIP=%rcx       */
 
 /* ---------- write_msr(index, value) ------------------------------ */
@@ -323,6 +335,7 @@ do_execve_finish:
     movq    %rdx, %rdi                 /* user %rdi = argc            */
     movq    %r10, %rsi                 /* user %rsi = argv            */
     movq    $0x202, %r11               /* RFLAGS (IF=1, reserved bit) */
+    verw    mds_verw_sel(%rip)         /* CLEAR_CPU_BUFFERS (MDS, #87) */
     sysretq
 
 /* ---------- enter_user_mode(entry, stack) ------------------------ *
@@ -350,6 +363,7 @@ enter_user_mode:
     pushq   $0x202                     /* RFLAGS (IF=1 - timer fires) */
     pushq   $0x23                      /* CS                          */
     pushq   %rdi                       /* RIP                         */
+    verw    mds_verw_sel(%rip)         /* CLEAR_CPU_BUFFERS (MDS, #87) */
     iretq
 
 /* ---------- user_demo_entry: ring-3 test payload ----------------- *
@@ -521,6 +535,23 @@ smp_user_probe_end:
  * is the 64-byte chunk SYS_READ fills.  Both pages are U=1 because
  * the entire identity-mapped region is.                              */
     .section .rodata
+/* ---------- mds_verw_sel: CLEAR_CPU_BUFFERS operand (task #87) ------ *
+ * A 16-bit word holding a valid, present, writable data-segment
+ * selector (0x10 = kernel data, __KERNEL_DS in gdt64; see
+ * arch/x86/boot/header.S). This is the memory operand for the VERW
+ * instruction inserted before every kernel->user ring transition
+ * (SYSRETQ / IRETQ-to-CPL3) across syscall_64.S, irq_asm.S,
+ * trap_asm.S and sched_asm.S. VERW with MD_CLEAR microcode present
+ * overwrites the store buffer / fill buffers / load ports as a side
+ * effect of the descriptor load, closing the MDS side channel. The
+ * word lives in kernel .rodata (US=0), read only at CPL0, so it never
+ * touches user memory and is SMAP-clean. Defined ONCE here and
+ * referenced %rip-relative from every exit site. Global so the other
+ * .S objects can reach it after the static kernel link. */
+    .align 2
+    .globl mds_verw_sel
+mds_verw_sel:
+    .word 0x10
 fname_motd:
     .asciz "/motd"
 user_banner:

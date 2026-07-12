@@ -106,6 +106,14 @@ kthread_bootstrap:
     /* %rsp now points at the 5-qword iret frame. Zero %r15 so the
      * user task wakes with r15 = 0, then iretq into the task entry. */
     xorq    %r15, %r15                 /* user wakes with r15 = 0    */
+    /* MDS mitigation (task #87): CLEAR_CPU_BUFFERS iff this first dispatch
+     * lands in CPL3. A kernel thread bootstraps with CS=0x08 (CPL0) and
+     * skips the flush; a user task's initial entry frame carries a CPL3
+     * CS. Gate on saved CS RPL (%rsp -> iret frame: RIP=0, CS=8). */
+    testb   $3, 8(%rsp)
+    jz      1f
+    verw    mds_verw_sel(%rip)         /* CLEAR_CPU_BUFFERS (MDS) */
+1:
     iretq                              /* land in task entry, IF=1   */
 
 /* ---------- enter_first_task: bootstrap the very first task ------ *
@@ -252,6 +260,11 @@ sysret_bootstrap:
      *     vol.2 SYSRET pseudocode: RF = R11 with specific bits forced.
      *     0x202 in %r11 maps to 0x202 in user RFLAGS — IF=1, MBS=1.)
      */
+    /* MDS mitigation (task #87): CLEAR_CPU_BUFFERS. The first task always
+     * SYSRETQ's to CPL3, so the VERW is unconditional here. Runs after the
+     * user %rsp is loaded and immediately before the ring transition; only
+     * ZF is clobbered and SYSRETQ reloads RFLAGS from %r11. */
+    verw    mds_verw_sel(%rip)         /* CLEAR_CPU_BUFFERS (MDS) */
     sysretq
 
     /* POST-sysretq is unreachable: sysretq drops to CPL=3 atomically.
