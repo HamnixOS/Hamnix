@@ -45,7 +45,8 @@
     .code64
 
 /* ---------- Per-CPU storage --------------------------------------- *
- * NR_TSS_CPUS must be >= MAX_CPUS (arch/x86/kernel/smp.ad). 16 today.
+ * NR_TSS_CPUS must be >= MAX_CPUS (arch/x86/kernel/smp.ad). 64 today (#107);
+ * scripts/test_max_cpus_lockstep.sh fails the build if it drifts from MAX_CPUS.
  *
  *  - per_cpu_tss[i]   : the i-th CPU's 104-byte TSS, padded to 128 for
  *                       cache-line friendliness and easy index math.
@@ -57,7 +58,7 @@
  *  - per_cpu_gdtr[i]  : a 10-byte lgdt operand (2-byte limit + 8-byte base)
  *                       for the i-th CPU's GDT.
  */
-    .equ NR_TSS_CPUS, 16
+    .equ NR_TSS_CPUS, 64
     .equ TSS_STRIDE,  128
     .equ GDT_STRIDE,  64          /* 56 bytes rounded up to 64          */
     .equ GDT_LIMIT,   0x37        /* 7 entries * 8 - 1                  */
