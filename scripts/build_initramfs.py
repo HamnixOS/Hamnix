@@ -2388,6 +2388,33 @@ if os.path.exists(_ISRG_HOST_PEM):
         # correct fail-closed behaviour.
         pass
 
+# V8 cert validation: bake the production DigiCert Global Root G2 anchor
+# (RSA-2048, sha256WithRSAEncryption) into the initramfs at
+# /etc/tls-ca-digicert-g2.der. This root anchors a large share of the
+# commercial (non-Let's-Encrypt) web — www.digicert.com and, via the
+# cross-signed Microsoft TLS RSA Root G2, www.microsoft.com's SHA-384
+# chain. We prefer the checked-in DER fixture (deterministic, host-store-
+# independent) and fall back to the host trust store. The 914-byte DER is
+# a public trust anchor; pinning it in-tree keeps the anchor identical on
+# CI hosts that don't ship it.
+_DG2_FIXTURE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "tests", "fixtures", "digicert_global_root_g2.der")
+_DG2_HOST_PEM = "/etc/ssl/certs/DigiCert_Global_Root_G2.pem"
+if os.path.exists(_DG2_FIXTURE):
+    with open(_DG2_FIXTURE, "rb") as _f:
+        FILES.append(("/etc/tls-ca-digicert-g2.der", _f.read()))
+elif os.path.exists(_DG2_HOST_PEM):
+    import subprocess
+    try:
+        _dg2_der = subprocess.run(
+            ["openssl", "x509", "-in", _DG2_HOST_PEM, "-outform", "DER"],
+            check=True, capture_output=True,
+        ).stdout
+        FILES.append(("/etc/tls-ca-digicert-g2.der", _dg2_der))
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
 # Test-fixture anchor: scripts/test_net_https.sh writes a path to its
 # generated Hamnix Test CA DER into TLS_CA_DER, and we plant it here.
 # The kernel adds it to the CA store in addition to ISRG Root X1 so the
