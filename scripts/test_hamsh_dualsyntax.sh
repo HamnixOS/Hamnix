@@ -157,10 +157,12 @@ hamsh_send_await 'echo GATE_DIFF' 'GATE_DIFF' "$CMD_WAIT" || true
 # inline-colon marker) so ran_bol / hamsh_ran can never false-green on a
 # typed-input echo.
 # K1. list comprehension (map, filter, method-call receiver).
-hamsh_send_await 'echo ${ [x*x for x in range(4)] }' '0 1 4 9' "$CMD_WAIT" || true
+# (hamsh arithmetic is SPACE-separated — `*` glued to a word is a glob
+# char, per the lexer's documented rule — so the map uses `x * x`.)
+hamsh_send_await 'echo ${ [x * x for x in range(4)] }' '0 1 4 9' "$CMD_WAIT" || true
 hamsh_send_await 'echo ${ [x for x in range(6) if x % 2 == 0] }' '0 2 4' "$CMD_WAIT" || true
 # K2. dict comprehension + indexed read.
-hamsh_send 'dc = { x: x*x for x in range(3) }'
+hamsh_send 'dc = { x: x * x for x in range(3) }'
 hamsh_send_await 'echo ${ $dc[2] }' '4' "$CMD_WAIT" || true
 # K3. list + string indexing, negative index, slicing, reverse slice.
 hamsh_send 'xs = [10, 20, 30, 40]'
