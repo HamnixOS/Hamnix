@@ -225,6 +225,23 @@ def main() -> int:
                 lines.append(f"{rel}    /usr/share/man/{mp.name}")
 
     lines.append("")
+    lines.append("# --- /etc/skel home skeleton ---")
+    lines.append("# The standard per-user home template. Source bytes")
+    lines.append("# live at etc/skel/ in the Hamnix tree; build_initramfs.py")
+    lines.append("# stages them into the cpio at /etc/skel/*, so we source")
+    lines.append("# from the live cpio (like the man pages above), not the")
+    lines.append("# rootfs partition. This puts /etc/skel on the installed")
+    lines.append("# system for any FUTURE useradd/adduser; the wizard's own")
+    lines.append("# install user gets its home populated directly by")
+    lines.append("# user/install.ad::provision_target.")
+    skel_dir = HERE / "etc" / "skel"
+    if skel_dir.is_dir():
+        for sp in sorted(skel_dir.rglob("*")):
+            if sp.is_file():
+                rel = sp.relative_to(HERE).as_posix()      # etc/skel/...
+                lines.append(f"{rel}    /{rel}")
+
+    lines.append("")
     lines.append("# --- busybox + applets (the Linux-ns shell) ---")
     lines.append("# Source paths under /n/distros/bin/. Applet entries")
     lines.append("# install the busybox binary at each applet name.")
