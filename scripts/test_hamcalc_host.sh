@@ -128,6 +128,29 @@ assert_grep '^RESULT divzero ERR'                "divide-by-zero shows ERR"
 assert_grep '^ERR 1'                             "divide-by-zero latches the error flag"
 assert_grep '^RESULT after_div 3[.]333333'       "fixed-point '10/3=' -> 3.333333"
 
+# --- Autostart identity: the desktop must start the GOOD scene calculator,
+#     never the legacy hamui integer calc (/bin/hamcalc) whose fixed-place
+#     "integer calc"/labels overlap the keypad and whose keys are dead. A
+#     user reported the broken calc auto-starting on the installed image; this
+#     asserts every DE launch path points at /bin/hamcalcscene.
+echo "[calc-host] checking desktop autostart points at the good calc ..."
+if grep -vE '^[[:space:]]*#' etc/rc.d/rc.5 | grep -Eq "/bin/hamcalc([^s]|$)|/bin/hamcalc'"; then
+    echo "[calc-host] FAIL: rc.5 still autostarts the legacy /bin/hamcalc"; fail=1
+else
+    echo "[calc-host] PASS rc.5 autostart calc is /bin/hamcalcscene (legacy /bin/hamcalc absent)"
+fi
+if grep -Eq '"/bin/hamcalc"' user/hampanel.ad; then
+    echo "[calc-host] FAIL: hampanel.ad launcher still returns legacy /bin/hamcalc"; fail=1
+else
+    echo "[calc-host] PASS hampanel.ad launcher no longer returns legacy /bin/hamcalc"
+fi
+if grep -q '/bin/hamcalcscene' etc/hamde/apps/calculator.desktop \
+   && grep -q '/bin/hamcalcscene' etc/desktop.icons; then
+    echo "[calc-host] PASS menu (.desktop) + desktop icon launch /bin/hamcalcscene"
+else
+    echo "[calc-host] FAIL: menu/icon do not both launch /bin/hamcalcscene"; fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "[calc-host] RESULT: PASS"
     exit 0

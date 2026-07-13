@@ -9,7 +9,7 @@
 #      /dev/mouse absolute moves (A.1 consolidation — no injection ctl verb).
 #   2. A pre-spawn and post-spawn framebuffer PNG for each genuinely-
 #      windowed hamui app the rc.5 hook launches THROUGH THE DE LAUNCH
-#      QUEUE (hamclock hamcalc hammon hamctl — each self-allocates an
+#      QUEUE (hamclock hamcalcscene hammonscene — each self-allocates an
 #      owned wsys window via hamui_window()), captured live via the QEMU
 #      monitor `screendump` HMP command on `[visual_gate]
 #      launching/launched` markers in the serial log.
@@ -63,7 +63,7 @@ TS="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-build/de_visual_gate/$TS}"
 HANDOFF_MARKER="handing off to interactive shell"
 
-APPS=(hamclock hamcalc hammonscene)
+APPS=(hamclock hamcalcscene hammonscene)
 
 # --- environment gates -----------------------------------------------
 if [ ! -e /dev/kvm ]; then
