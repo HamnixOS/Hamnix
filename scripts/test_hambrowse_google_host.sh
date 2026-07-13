@@ -76,6 +76,27 @@ assert_grep 'hl=en'                              "$D2" "hidden field carried int
 # Regression: the NAV must carry the action path, never a bare '?q='.
 assert_nogrep '^NAV \?q='                        "$D2" "NAV is not a bare ?q= (action dropped) regression"
 
+# (d) THE FRONT-END WIRING (#216): the native front-end no longer drives the
+# engine by element id — it hit-tests a pointer click to a DOM element INDEX,
+# classifies it (text field vs submit button), types into it by index, resolves
+# the enclosing <form>, submits, and consumes he_nav_*. The `fieldnav` verb runs
+# that exact index-based chain (with click-links on, so fields are wrapped in
+# the "#__evt_N" links the pointer hit-test resolves). This guards the path the
+# user actually exercises on-device: click box -> type -> Enter -> navigate.
+D3="$OUT/g_fieldnav.txt"
+"$BIN" "$FIX" 880 fieldnav q "plan 9 os" >"$D3" 2>&1
+grep -E 'FIELDNAV' "$D3" || true
+assert_grep '^FIELDNAV id=q idx=[0-9]+ textfield=1' \
+    "$D3" "the query control classifies as a text field (focus/typing target)"
+assert_grep '^FIELDNAV form=[0-9]+' \
+    "$D3" "the field's enclosing <form> resolves by index"
+assert_grep '^FIELDNAV NAV /search\?q=plan\+9\+os' \
+    "$D3" "index-based type+submit navigates to /search?q=plan+9+os (front-end path)"
+assert_grep 'hl=en'                              "$D3" "hidden field carried on the index path"
+# The field is now pointer-reachable: after the click-links re-layout its box
+# segment carries a link (l>=0), so the front-end's _hit_link resolves it.
+assert_grep '\[plan 9 os\] *\|' "$D3" "typed text renders in the field box (set_value_index)"
+
 if [ "$fail" -ne 0 ]; then
     echo "[hb-google] RESULT: FAIL"; exit 1
 fi
