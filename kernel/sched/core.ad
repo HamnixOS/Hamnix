@@ -179,6 +179,13 @@ extern def smp_user_probe_entry()
 # into a US=1 user page so a CPL3 task can actually fetch it (kernel .text is
 # US=0). Defined in syscall_64.S right after the banner.
 extern def smp_user_probe_end()
+# task #112: a STACKLESS ring-3 payload that sweeps a large demand-zero anon
+# region reading one byte/page. pf_smp_race_selftest() runs TWO copies in
+# ONE shared address space, one per CPU, to collide their demand faults on
+# the SAME not-present page — the cross-CPU shared-mm #PF race behind the
+# intermittent -smp 2 user SIGSEGV. Body in syscall_64.S.
+extern def pf_race_probe_entry()
+extern def pf_race_probe_end()
 extern def local_irq_disable()
 extern def local_irq_enable()
 # Atomic sti;hlt — the idle CPU's race-free wait primitive (Linux's
@@ -12317,3 +12324,140 @@ def smp_user_ap_selftest():
     else:
         printk0("[smp_user] FAIL: probe did not complete a syscall on the AP\n")
     printk0("[smp_user] self-test complete\n")
+
+
+# task #112 — SMP concurrent user demand-fault stress + regression gate.
+#
+# The intermittent `-smp 2` user coredump (`[pf] user fault on unmapped ...
+# -> SIGSEGV`, code=139) is a page-fault CORRECTNESS gap, not a scheduler
+# wedge: a not-present user access is misclassified as a genuine unmapped
+# access under cross-CPU contention. This self-test drives the hot path
+# hard: TWO independent ring-3 tasks each sweep their OWN large demand-zero
+# anon region, dispatched CONCURRENTLY one per CPU (the BSP boot task
+# cooperatively schedules one while the AP work-steals the other), so BOTH
+# CPUs run the vma_demand_fault / do_page_fault path simultaneously for the
+# whole sweep. Each demand-VMA is per-task (its own PML4 + VMA tree), so the
+# two tasks are fully self-consistent and reap cleanly — no shared-mm
+# teardown hazard. A #112 regression surfaces as `[pf] user fault on
+# unmapped` on the serial log (the gate greps for it) and/or a probe reaped
+# with a SIGSEGV code. The SMP spurious-not-present guard added to
+# do_page_fault also reports its lifetime hit count via
+# pf_spurious_recovered_count(): non-zero means a genuine cross-CPU
+# not-present collision was absorbed instead of becoming a false SIGSEGV.
+PF_RACE_CODE_VA:      uint64 = 0x600000       # US=1 exec blob (4 KiB)
+PF_RACE_REGION_BASE:  uint64 = 0x10000000     # matches syscall_64.S immediate
+PF_RACE_REGION_PAGES: uint64 = 0x100          # 256 pages = 1 MiB (matches asm)
+
+
+def _pf_race_make_probe(code_page: uint64) -> int32:
+    # Build one fully self-consistent CPL3 probe: its own PML4 (from
+    # create_user_task), the US=1 exec blob mapped at PF_RACE_CODE_VA, and a
+    # private demand-zero anon region [PF_RACE_REGION_BASE, +N*4K) in its own
+    # VMA tree. Returns the slot, or -1 on failure. Caller holds _wq_lock_irq.
+    si: int32 = create_user_task(PF_RACE_CODE_VA, 0)
+    if si < 0:
+        return -1
+    s: uint64 = cast[uint64](si)
+    task_table[s].detached = 1
+    cr3: uint64 = task_table[s].cr3
+    if elf_install_user_mapping(cr3, PF_RACE_CODE_VA,
+                                PF_RACE_CODE_VA + 4096, code_page, 0) < 0:
+        return -1
+    if vma_register_bss_demand(s, cr3, PF_RACE_REGION_BASE,
+                               PF_RACE_REGION_BASE
+                               + PF_RACE_REGION_PAGES * 4096) < 0:
+        return -1
+    return si
+
+
+def pf_smp_race_selftest():
+    printk0("[pf_race] starting SMP cross-CPU demand-fault race self-test\n")
+    if get_cpus_online() < 2:
+        printk0("[pf_race] NOTE: only 1 CPU online — cannot race two CPUs\n")
+        printk0("[pf_race] self-test complete\n")
+        return
+
+    # Copy the PIC, stackless probe blob into a fresh page (kernel .text is
+    # US=0, unreachable from CPL3 — same constraint as smp_user_ap_selftest).
+    # The single read-only page is mapped US=1 into BOTH probes' PML4s.
+    pe:   uint64 = cast[uint64](&pf_race_probe_entry)
+    pend: uint64 = cast[uint64](&pf_race_probe_end)
+    blob_len: uint64 = pend - pe
+    code_page: uint64 = alloc_page()
+    if code_page == 0:
+        printk0("[pf_race] FAIL: OOM allocating probe code page\n")
+        return
+    memcpy(cast[Ptr[uint8]](code_page), cast[Ptr[uint8]](pe), blob_len)
+
+    # Fence the AP while both tasks are built so neither dispatches mid-setup.
+    # vma_register_bss_demand does a load_cr3(<probe cr3>) to prep the demand
+    # range under the target PML4; that leaves THIS (boot) task running on a
+    # probe's CR3, desynced from task_table[boot].cr3. Snapshot the live boot
+    # CR3 and restore it after setup so schedule() below switches from a
+    # consistent prev.cr3 (else the first dispatch #DFs).
+    boot_cr3: uint64 = read_cr3()
+    sched_ap_steal_enabled = 0
+    _wq_lock_irq()
+    sa_i: int32 = _pf_race_make_probe(code_page)
+    sb_i: int32 = -1
+    if sa_i >= 0:
+        sb_i = _pf_race_make_probe(code_page)
+    load_cr3(boot_cr3)
+    _wq_unlock_irq()
+    if sa_i < 0 or sb_i < 0:
+        printk0("[pf_race] FAIL: could not build both probe tasks\n")
+        return
+    sa: uint64 = cast[uint64](sa_i)
+    sb: uint64 = cast[uint64](sb_i)
+    printk2("[pf_race] probe A slot=%d  probe B slot=%d\n", sa, sb)
+
+    spurious_before: uint64 = pf_spurious_recovered_count()
+
+    # Release BOTH CPUs: enable AP work-steal, then cooperatively schedule()
+    # from the BSP boot task (proven safe — smp_soak drives kthreads the same
+    # way). One probe runs here on the BSP while the AP steals the other, so
+    # both demand-fault CONCURRENTLY for the whole sweep.
+    a_cpu0: uint64 = 0
+    a_cpu1: uint64 = 0
+    b_cpu0: uint64 = 0
+    b_cpu1: uint64 = 0
+    sched_ap_steal_enabled = 1
+    smp_send_reschedule()
+    MAXI_R: uint64 = 200000
+    itr: uint64 = 0
+    while (task_table[sa].state != STATE_FREE
+           or task_table[sb].state != STATE_FREE) and itr < MAXI_R:
+        # Snapshot per-CPU dispatch counts while the slots are still live
+        # (recycled the instant a detached task self-reaps).
+        if task_table[sa].state != STATE_FREE:
+            a_cpu0 = task_table[sa].cpu_runs[0]
+            a_cpu1 = task_table[sa].cpu_runs[1]
+        if task_table[sb].state != STATE_FREE:
+            b_cpu0 = task_table[sb].cpu_runs[0]
+            b_cpu1 = task_table[sb].cpu_runs[1]
+        # Cooperatively schedule() from the BSP boot task (proven safe —
+        # smp_soak drives kthreads the same way): dispatches one probe on the
+        # BSP while the AP work-steals the other, so both make forward
+        # progress AND run concurrently for their sweeps. schedule() is safe
+        # here because we run AFTER trap_pf_install (the productive #PF
+        # handler is live for the probes' demand faults).
+        schedule()
+        smp_send_reschedule()    # re-kick the (tickless) AP
+        itr = itr + 1
+    sched_ap_steal_enabled = 0
+
+    spurious_after: uint64 = pf_spurious_recovered_count()
+    spurious_delta: uint64 = spurious_after - spurious_before
+
+    printk2("[pf_race] probe A ran cpu0=%d cpu1=%d\n", a_cpu0, a_cpu1)
+    printk2("[pf_race] probe B ran cpu0=%d cpu1=%d\n", b_cpu0, b_cpu1)
+    printk1("[pf_race] SMP spurious not-present faults recovered: %d\n",
+            spurious_delta)
+    if task_table[sa].state == STATE_FREE \
+            and task_table[sb].state == STATE_FREE:
+        printk0("[pf_race] PASS: both probes swept the shared demand region and reaped\n")
+    else:
+        printk0("[pf_race] FAIL: a probe never completed its sweep (timed out)\n")
+    # The load-bearing assertion is the ABSENCE of `[pf] user fault on
+    # unmapped` on the serial log — enforced by scripts/test_pf_smp_race.sh.
+    printk0("[pf_race] self-test complete\n")

@@ -530,6 +530,42 @@ smp_user_probe_banner_end:
     .globl smp_user_probe_end
 smp_user_probe_end:
 
+/* ---------- pf_race_probe_entry: task #112 SMP demand-fault racer ----- *
+ * A minimal, POSITION-INDEPENDENT, STACKLESS ring-3 payload used by
+ * pf_smp_race_selftest() to reproduce the intermittent -smp 2 not-present
+ * user #PF (#112). Two copies of this task SHARE ONE address space (one
+ * PML4 + one VMA tree) and run CONCURRENTLY, one per CPU. Each sweeps the
+ * SAME large demand-zero anon region [PF_RACE_REGION_BASE, +N*4K) reading
+ * one byte per page, so both CPUs demand-fault the SAME not-present page in
+ * the same interrupt-latency window — the exact cross-CPU shared-mm fault
+ * collision the fault path must handle without a false SIGSEGV.
+ *
+ * Register-only + immediate (PIC): executes correctly from any load
+ * address once copied into a US=1 user page. Uses NO stack (no push/call),
+ * so the two tasks sharing one PML4 need no private user stack — the only
+ * stack touch, the SYS_EXIT syscall, runs on the per-CPU kernel stack.
+ * Base + page count are patched as immediates to match the kernel-side
+ * PF_RACE_* constants in kernel/sched/core.ad.                          */
+    .align 16
+    .globl pf_race_probe_entry
+pf_race_probe_entry:
+    movabsq $0x10000000, %rsi          /* PF_RACE_REGION_BASE (cursor)   */
+    movq    $0x100, %rcx               /* PF_RACE_REGION_PAGES (256)     */
+.Lpf_race_sweep:
+    movb    (%rsi), %al                /* read 1 byte -> demand-fault it */
+    addq    $4096, %rsi
+    decq    %rcx
+    jnz     .Lpf_race_sweep
+    /* SYS_EXIT(0) — self-reaps to the idle loop. */
+    movq    $0, %rdi
+    movq    $1, %rax
+    syscall
+.Lpf_race_hang:
+    jmp     .Lpf_race_hang
+    .align 16
+    .globl pf_race_probe_end
+pf_race_probe_end:
+
 /* ---------- user-mode .data / .rodata ----------------------------
  * fname_motd is a string literal we point SYS_OPEN at. user_read_buf
  * is the 64-byte chunk SYS_READ fills.  Both pages are U=1 because

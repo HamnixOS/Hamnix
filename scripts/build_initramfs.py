@@ -658,6 +658,16 @@ if os.environ.get("ENABLE_NTASKS_TEST") == "1":
 if os.environ.get("ENABLE_SMP_USER") == "1":
     FILES.append(("/etc/smp-user", b"1\n"))
 
+# task #112 SMP cross-CPU demand-fault race repro. scripts/test_pf_smp_race.sh
+# sets ENABLE_PF_SMP_RACE=1 to plant /etc/pf-smp-race. init/main.ad at
+# boot:37.pf_race detects the marker and calls pf_smp_race_selftest()
+# (kernel/sched/core.ad): two ring-3 tasks sharing one address space sweep a
+# shared demand-zero region concurrently, one per CPU, colliding their
+# demand faults to exercise the SMP not-present fault path. Default boots
+# omit the marker.
+if os.environ.get("ENABLE_PF_SMP_RACE") == "1":
+    FILES.append(("/etc/pf-smp-race", b"1\n"))
+
 # Bottom-half stack proof. scripts/test_bh.sh sets ENABLE_BH_TEST=1 to plant
 # /etc/bh-test. init/main.ad at boot:37.bh detects the marker and calls
 # bh_selftest_run() (kernel/softirq.ad): proves softirq raise/run, tasklet

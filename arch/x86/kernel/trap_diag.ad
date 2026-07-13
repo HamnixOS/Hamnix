@@ -86,7 +86,11 @@ from fs.elf import cow_handle_write_fault, _cow_resolve_pte_slot
 # #167: swap-in fault handler — restores a swapped-out anon page.
 from mm.vma import vma_demand_fault, vma_swap_in_fault, \
     vma_resolve_write_perm_fault, vma_resolve_exec_perm_fault, \
-    vma_dbg_dump_cover
+    vma_dbg_dump_cover, _vma_pte_lookup
+# task #112: read THIS CPU's logical id at the #PF decision point. An
+# intermittent -smp 2 user SIGSEGV on a supposedly-mapped VA needs the
+# faulting CPU stamped on the diagnostic so BSP-vs-AP divergence is visible.
+from arch.x86.kernel.setup_percpu import get_cpu_id
 # userfaultfd(2): a fault in a range registered with an active uffd for the
 # faulting task is owned by the USERSPACE handler — it enqueues a uffd_msg and
 # suppresses the demand-zero path (the page stays not-present until UFFDIO_COPY/
@@ -239,6 +243,25 @@ PF_CR3_ADDR_MASK: uint64 = 0x000FFFFFFFFFF000
 # the boot-time SMAP enforcement proof; it is disarmed immediately after.
 smap_probe_armed:   uint64 = 0      # 1 while the probe load is live
 smap_probe_faulted: uint64 = 0      # set to 1 by the recovery hook
+
+# task #112 — SMP spurious not-present #PF recovery counters. A user #PF
+# whose CPU-walk saw P=0 but whose LIVE leaf PTE is already present (a
+# sibling CPU resolved the page in the window between the faulting walk and
+# this handler) is SPURIOUS: re-running the instruction succeeds because
+# x86 never negatively-caches translations. `pf_spurious_recovered` counts
+# how many times the guard fired (proof the race is real + being masked
+# correctly, not silently). Rate-limit the log so a fault storm can't drown
+# the console.
+pf_spurious_recovered: uint64 = 0
+_pf_spurious_logs:      uint64 = 0
+
+
+def pf_spurious_recovered_count() -> uint64:
+    # Test/selftest accessor: how many spurious not-present faults the SMP
+    # re-validation guard has absorbed since boot. A repro that drives heavy
+    # cross-CPU shared-page demand churn asserts this is > 0 (the race fires)
+    # AND that no false SIGSEGV was delivered.
+    return pf_spurious_recovered
 extern def smap_probe_fault_rip()   # the faulting `movb` RIP (asm symbol)
 extern def smap_probe_fixup()       # recovery landing pad (asm symbol)
 
@@ -426,6 +449,48 @@ def do_page_fault(error_code: uint64, fault_va: uint64,
         if (error_code & PF_ERR_U) != 0:
             is_user_fault = 1
         slot: uint64 = current_idx_get()
+
+        # ── task #112: SMP spurious not-present #PF guard ──────────────────
+        # The CPU generated this fault (error_code P=0) from ITS OWN page-
+        # table walk at the instant of the access. Under -smp 2 another CPU
+        # sharing this mm (a CLONE_VM thread, a COW sibling, or a MAP_SHARED
+        # peer) can resolve the very same page in the (interrupt-latency-
+        # wide) window between that walk and the entry to this handler. By
+        # now the LIVE leaf PTE may already be PRESENT. Re-read it: if it is
+        # present AND satisfies the access (a write fault additionally needs
+        # RW=1), the fault is SPURIOUS — x86 never negatively-caches a
+        # translation, so simply re-running the faulting instruction reloads
+        # the now-present PTE and succeeds. Without this, the code below
+        # would allocate a *second* page for a demand VMA (benign leak) or,
+        # for an EAGER (is_demand=0) VMA whose page a sibling just faulted
+        # in, find dpf_rc==0 and deliver a FALSE SIGSEGV — the intermittent
+        # `-smp 2` user coredump (#112). This can NEVER mask a genuine
+        # unmapped access: it fires ONLY when the live tables already map the
+        # page with adequate permission. Cheap: one read-only, boot-CR3-
+        # bracketed walk, on the (cold) not-present fault path only. Mirrors
+        # Linux's re-check of the pte under the page-table lock in
+        # handle_pte_fault (a pte that became present under us => no-op).
+        _spu_pte: uint64 = _vma_pte_lookup(pml4_phys, fault_va)
+        if (_spu_pte & PF_ERR_P) != 0:
+            _spu_ok: int32 = 0
+            if (error_code & PF_ERR_W) == 0:
+                _spu_ok = 1
+            elif (_spu_pte & PF_ERR_W) != 0:
+                # write fault, and the live leaf grants RW — spurious write.
+                _spu_ok = 1
+            if _spu_ok != 0:
+                pf_spurious_recovered = pf_spurious_recovered + 1
+                if _pf_spurious_logs < 8:
+                    _pf_spurious_logs = _pf_spurious_logs + 1
+                    printk_set_level(PRINTK_LEVEL_EMERG)
+                    printk2("[pf] SPURIOUS not-present va=%p pte=%p\n",
+                            fault_va, _spu_pte)
+                    printk_set_level(PRINTK_LEVEL_EMERG)
+                    printk2("[pf]   cpu=%d err=%p -> re-run (SMP race)\n",
+                            get_cpu_id(), error_code)
+                current_task_account_minor_fault()
+                return cast[int64](1)
+
         # userfaultfd (USER-mode faults only): BEFORE any demand/swap resolution, ask whether this
         # not-present fault lands in a range registered with an active uffd for
         # the faulting task. If so, the USERSPACE handler owns the fault: a
@@ -514,6 +579,19 @@ def do_page_fault(error_code: uint64, fault_va: uint64,
             # printk1) — re-stamp EMERG so this line isn't gated to INFO.
             printk_set_level(PRINTK_LEVEL_EMERG)
             printk1("[pf]   crash rip=%p\n", iret_frame[0])
+            # task #112: stamp the faulting CPU + the LIVE leaf PTE so an
+            # intermittent -smp 2 capture is classifiable at a glance:
+            #   pte=0            -> table entry fully cleared (teardown /
+            #                       reclaim / exec race zapped a live page)
+            #   pte low-bit set  -> present now (would have been caught by
+            #                       the spurious guard above; a leftover here
+            #                       means it became present AFTER that check —
+            #                       an even tighter race)
+            #   otherwise        -> a swap-marker PTE vma_swap_in_fault failed
+            #                       to recognise.
+            printk_set_level(PRINTK_LEVEL_EMERG)
+            printk2("[pf]   cpu=%d livepte=%p\n", get_cpu_id(),
+                    _vma_pte_lookup(pml4_phys, fault_va))
             # DIAG (spawn-heavy enter-linux SIGSEGV class): the dpf_rc==0
             # arm conflates TWO very different states — (a) NO VMA covers
             # fault_va (a genuine wild/NULL deref) and (b) an EAGER
