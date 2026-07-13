@@ -54,6 +54,19 @@ hamsh_sync 120 \
 
 hamsh_send 'cd /nope/nope/nope'
 hamsh_send_await 'echo PAPERCUT_SURVIVED' 'PAPERCUT_SURVIVED' "$CMD_WAIT" || true
+
+# --- leading-'+' argument word (tokenizer papercut) -----------------
+# `find -size +6c`, `git rebase +2`, etc.: a bare word STARTING with '+'
+# must lex as a plain ARGUMENT, not the '+' operator. Pre-fix hamsh died
+# with "unexpected token after command" and forced the user to quote it
+# as '+6c'. The genuine echo output line `PLUSARG +6c` (begin-of-line,
+# distinct from the prompt-prefixed input echo) proves +6c reached the
+# command intact as a literal arg.
+hamsh_send_await 'echo PLUSARG +6c' 'PLUSARG' "$CMD_WAIT" || true
+# The '+' OPERATOR must still work — arithmetic tokenization not regressed
+# (a space-flanked '+' is the operator; only a GLUED leading '+' is a word).
+hamsh_send_await 'if 3 + 4 > 6: echo PLUSOP_OK' 'PLUSOP_OK' "$CMD_WAIT" || true
+
 hamsh_send 'exit'
 sleep 2
 
@@ -75,6 +88,32 @@ else
     fail=1
 fi
 echo "[$TAG] OK: shell survived the failed builtin (PAPERCUT_SURVIVED)"
+
+# ANSI/NUL-stripped view for begin-of-line output assertions (the genuine
+# command output starts a fresh line; the input echo is prompt-prefixed).
+STRIPPED="$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$LOG" | tr -d '\000')"
+
+# Leading-'+' arg reached echo as a literal word (`echo PLUSARG +6c` ->
+# output line `PLUSARG +6c`). If the tokenizer had errored, echo would
+# never run and this output line would be absent.
+if printf '%s\n' "$STRIPPED" | grep -E -q '^PLUSARG \+6c[[:space:]]*$'; then
+    echo "[$TAG] OK: leading-'+' word (+6c) lexes as a literal argument"
+else
+    echo "[$TAG] WRONG: +6c did not reach echo as a literal arg (tokenizer papercut)"
+    fail=1
+fi
+# The tokenizer must not have raised its operator-position error for +6c.
+if grep -a -E -q "unexpected token after command" "$LOG"; then
+    echo "[$TAG] WRONG: 'unexpected token after command' — leading '+' mis-lexed as operator"
+    fail=1
+fi
+# The '+' operator still works in arithmetic (3 + 4 > 6).
+if printf '%s\n' "$STRIPPED" | grep -E -q '^PLUSOP_OK[[:space:]]*$'; then
+    echo "[$TAG] OK: space-flanked '+' still tokenizes as the arithmetic operator"
+else
+    echo "[$TAG] WRONG: arithmetic '+' regressed (3 + 4 > 6 did not evaluate)"
+    fail=1
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "[$TAG] --- captured (stripped) ---" >&2
