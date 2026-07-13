@@ -59,6 +59,56 @@ assert_grep() {
     fi
 }
 
+# --- Anti-aliased DE text assertion --------------------------------------
+# DE scene text now rasterizes through the scalable, supersampled TrueType
+# engine (lib/font_ttf.ad + embedded DejaVu in lib/browserfonts.ad) via
+# lib/hamui_host.ad, replacing the crude on/off 8x16 bitmap that turned the
+# bold "2048" header into a blob. The defining property of the AA path is
+# INTERMEDIATE-coverage pixels: in the header band (over the beige #faf8ef
+# backdrop, ink #776e65) the pure-bitmap path could only ever emit the exact
+# background or exact ink colour; anti-aliasing emits blended greys in between.
+# Requiring a healthy count of such blended pixels in the title band proves the
+# scalable engine is live and would catch a silent regression to the bitmap.
+if python3 - "$BEFORE" <<'PY'
+import sys
+p=sys.argv[1]
+d=open(p,'rb').read()
+# parse P6 header: magic, w, h, maxval, then binary
+assert d[:2]==b'P6', "not P6 ppm"
+i=2; vals=[]
+while len(vals)<3:
+    while i<len(d) and d[i] in b' \t\n\r': i+=1
+    if i<len(d) and d[i:i+1]==b'#':
+        while i<len(d) and d[i] not in b'\n': i+=1
+        continue
+    s=i
+    while i<len(d) and d[i] not in b' \t\n\r': i+=1
+    vals.append(int(d[s:i]))
+w,h,mx=vals
+i+=1  # single whitespace after maxval
+px=d[i:]
+def rgb(x,y):
+    o=(y*w+x)*3
+    return px[o],px[o+1],px[o+2]
+BG=(0xfa,0xf8,0xef); INK=(0x77,0x6e,0x65)
+def near(a,b,t=8): return all(abs(a[k]-b[k])<=t for k in range(3))
+inter=0
+# header band: title/score row lives around y=14..32, x=10..320
+for y in range(12,34):
+    for x in range(10,320):
+        c=rgb(x,y)
+        if not near(c,BG) and not near(c,INK,10):
+            # blended pixel strictly between backdrop and ink
+            inter+=1
+print("AA-INTERMEDIATE-PIXELS", inter)
+sys.exit(0 if inter>=40 else 1)
+PY
+then
+    echo "[2048-host] PASS header text is anti-aliased (blended coverage pixels present)"
+else
+    echo "[2048-host] FAIL header text has no AA blended pixels (bitmap regression?)"; fail=1
+fi
+
 # --- Layout / build assertions (on the raw scene display list) -----------
 assert_grep '^# scene v1 hamui'                 "scene header emitted"
 assert_grep '^fill 0 0 360 470 #faf8ef'         "full-window beige backdrop"
