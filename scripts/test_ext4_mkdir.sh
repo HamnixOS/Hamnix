@@ -79,12 +79,12 @@ rc=$?
 set -e
 
 echo "[test_ext4_mkdir] --- ext4-mkdir self-test output ---"
-grep -a -E "\[ext4-mkdir\]|\[vfs-named-mkdir\]" "$LOG" || true
+grep -a -E "\[ext4-mkdir\]|\[ext4-mkdir-slot\]|\[vfs-named-mkdir\]" "$LOG" || true
 echo "[test_ext4_mkdir] --- end ---"
 
 # --- three-valued verdict gate (migrated off the hard MISS->FAIL tail) ---
 # Zero markers == starved/timeout/OOM boot, NOT a regression.
-verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4-mkdir\]|\[vfs-named-mkdir\]'
+verdict_boot_gate "$TAG" "$LOG" "$rc" '\[ext4-mkdir\]|\[ext4-mkdir-slot\]|\[vfs-named-mkdir\]'
 
 fail=0
 
@@ -96,6 +96,25 @@ fi
 
 if ! grep -a -F -q "[ext4-mkdir] PASS" "$LOG"; then
     echo "[test_ext4_mkdir] MISS: self-test PASS banner (expected '[ext4-mkdir] PASS')" >&2
+    fail=1
+fi
+
+# BUG #132: install-time ext4_mkdir_at_slot must create a trailing-slash
+# nested directory (tar dir-entry shape) instead of "[ext4_mkdir] FAIL".
+if grep -a -F -q "[ext4-mkdir-slot] FAIL" "$LOG"; then
+    echo "[test_ext4_mkdir] FAIL: install-time mkdir-at-slot self-test failed (BUG #132)" >&2
+    grep -a -F "[ext4-mkdir-slot] FAIL" "$LOG" >&2 || true
+    fail=1
+fi
+if ! grep -a -F -q "[ext4-mkdir-slot] PASS" "$LOG"; then
+    echo "[test_ext4_mkdir] MISS: mkdir-at-slot PASS banner (expected '[ext4-mkdir-slot] PASS')" >&2
+    fail=1
+fi
+# The raw kernel-side FAIL log must not appear — that is the exact
+# BUG #132 symptom (every install-time dir logged it).
+if grep -a -E -q "\[ext4_mkdir\] slot=[0-9]+ FAIL" "$LOG"; then
+    echo "[test_ext4_mkdir] FAIL: '[ext4_mkdir] slot=N FAIL' present (BUG #132 regression)" >&2
+    grep -a -E "\[ext4_mkdir\] slot=[0-9]+ FAIL" "$LOG" >&2 || true
     fail=1
 fi
 

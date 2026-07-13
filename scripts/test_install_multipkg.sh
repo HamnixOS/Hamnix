@@ -105,7 +105,21 @@ check_marker '\[gpt\] init OK' "gpt_init"
 check_marker 'mkfs_ext4: /dev/blk/vdbp2' "mkfs_ext4 target rootfs"
 check_marker 'install_file_to_slot: /dev/blk/vdbp2 <- from_a.txt' "package A install"
 check_marker 'install_file_to_slot: /dev/blk/vdbp2 <- from_b.txt' "package B install"
+check_marker 'mkdir_at_slot: /dev/blk/vdbp2 mkdir opt/hamnix/emptydir/ OK' "package C mkdir (empty nested dir, trailing slash)"
 check_marker '\[install_multipkg\] install complete' "installer complete"
+
+# BUG #132: the install-time mkdir verb (ext4_mkdir_at_slot) used to
+# reject the trailing slash tar dir entries carry, logging
+# "[ext4_mkdir] slot=N FAIL" for every dir. Assert that FAIL is GONE.
+if grep -aE -q '\[ext4_mkdir\] slot=[0-9]+ FAIL' "$STAGE_B_LOG"; then
+    echo "[test_install_multipkg]   MISS: [ext4_mkdir] slot=N FAIL present (BUG #132 regression)" >&2
+    grep -aE '\[ext4_mkdir\]' "$STAGE_B_LOG" | head -5 >&2 || true
+    stage_b_fail=1
+else
+    echo "[test_install_multipkg]   OK : no [ext4_mkdir] slot=N FAIL lines (BUG #132)"
+fi
+# Positive: the kernel logged the mkdir OK for the target slot.
+check_marker '\[ext4_mkdir\] slot=[0-9]+ OK' "kernel ext4_mkdir OK"
 
 # Both userland-side OK reports for install_file_to_slot must be present —
 # that line only prints when the kernel's sys_write into <dev>/ctl
@@ -235,19 +249,34 @@ else
     stage_c_fail=1
 fi
 
+# BUG #132: the empty nested dir created via the mkdir verb (with a
+# trailing slash) must actually exist on the installed ext4 — proof
+# that an empty-dir package is no longer silently dropped. Walk the
+# path offline: /opt, /opt/hamnix, /opt/hamnix/emptydir must all be
+# directories.
+"$DEBUGFS_BIN" -R "ls /opt/hamnix" "${TARGET_RAW}?offset=${P2_OFFSET}" \
+        > "${STAGE_C_LOG}.emptydir" 2>&1 || true
+if grep -aE -q ' emptydir' "${STAGE_C_LOG}.emptydir"; then
+    echo "[test_install_multipkg]   OK : /opt/hamnix/emptydir present on target ext4 (nested empty dir)"
+else
+    echo "[test_install_multipkg]   MISS: /opt/hamnix/emptydir absent — empty-dir package dropped (BUG #132)" >&2
+    head -5 "${STAGE_C_LOG}.emptydir" >&2 || true
+    stage_c_fail=1
+fi
+
 rm -f "$TARGET_RAW"
 
 if [ "$stage_c_fail" -ne 0 ]; then
     echo "[test_install_multipkg] Stage C FAILED — both files must be present AND carry their payload" >&2
     if [ "${KEEP_LOGS:-0}" != "1" ]; then
-        rm -f "$STAGE_B_LOG" "$STAGE_C_LOG" "${STAGE_C_LOG}.from_a" "${STAGE_C_LOG}.from_b"
+        rm -f "$STAGE_B_LOG" "$STAGE_C_LOG" "${STAGE_C_LOG}.from_a" "${STAGE_C_LOG}.from_b" "${STAGE_C_LOG}.emptydir"
     fi
     exit 1
 fi
 echo "[test_install_multipkg] Stage C: PASS"
 
 if [ "${KEEP_LOGS:-0}" != "1" ]; then
-    rm -f "$STAGE_B_LOG" "$STAGE_C_LOG" "${STAGE_C_LOG}.from_a" "${STAGE_C_LOG}.from_b"
+    rm -f "$STAGE_B_LOG" "$STAGE_C_LOG" "${STAGE_C_LOG}.from_a" "${STAGE_C_LOG}.from_b" "${STAGE_C_LOG}.emptydir"
     rm -f "$TARGET_IMG"
 fi
 
