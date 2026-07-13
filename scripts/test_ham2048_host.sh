@@ -108,6 +108,71 @@ assert_grep '^FMTCLEAN 1'        "tile formatter NUL-terminates against a poison
 assert_grep '^BTNTILECLEAN 1'    "after a BUTTON move every tile number is digits-only (no junk)"
 assert_grep '^KBTILECLEAN 1'     "after a KEYBOARD move every tile number is digits-only (matches button path)"
 
+# --- SLIDE ANIMATION: tiles occupy INTERMEDIATE positions across frames ----
+# Drive a deterministic single-tile LEFT slide (col3 -> col0) and render EVERY
+# animation frame. The core dumps the moving tile's interpolated pixel-x per
+# frame; we prove at least one mid-slide frame places the tile STRICTLY between
+# its start and end cell (not a before/after teleport), and save the frame PNGs.
+SDUMP="$OUT/2048_slide_dump.txt"
+SPREFIX="$OUT/2048_slide_"
+if ! "$BIN" slide "$SPREFIX" >"$SDUMP" 2>&1; then
+    echo "[2048-host] FAIL: slide harness exited non-zero"; cat "$SDUMP"; fail=1
+fi
+
+# Convert each rendered slide frame to a PNG for eyeballing.
+for ppm in "$SPREFIX"*.ppm; do
+    [ -e "$ppm" ] || continue
+    png="${ppm%.ppm}.png"
+    if python3 scripts/ppm_to_png.py "$ppm" "$png" 2>"$OUT/2048_slide_png.log"; then
+        echo "[2048-host] PASS rendered slide frame $png"
+    else
+        echo "[2048-host] FAIL slide png conversion ($ppm)"; cat "$OUT/2048_slide_png.log"; fail=1
+    fi
+done
+
+if grep -Eq '^SLIDECHANGED 1' "$SDUMP"; then
+    echo "[2048-host] PASS LEFT move armed the slide animation"
+else
+    echo "[2048-host] FAIL slide move did not arm an animation"; fail=1
+fi
+if grep -Eq '^SLIDEN 1' "$SDUMP"; then
+    echo "[2048-host] PASS exactly one tile is tracked as moving"
+else
+    echo "[2048-host] FAIL unexpected moving-tile count"; fail=1
+fi
+
+# The crux: some PHASE 1 (slide) frame must have the tile STRICTLY between the
+# start cell x (SLIDEFROMX) and the end cell x (SLIDETOX) — an intermediate
+# position distinct from BOTH snapped cells. This is what makes it slide, not
+# teleport.
+INTER=$(awk '
+    /^SLIDEFROMX / { fromx=$2 }
+    /^SLIDETOX /   { tox=$2 }
+    /^SLIDEFRAME / {
+        phase=0; x="";
+        for (i=1;i<=NF;i++){ if($i=="PHASE")phase=$(i+1); if($i=="TILE0X")x=$(i+1); }
+        lo=(fromx<tox)?fromx:tox; hi=(fromx<tox)?tox:fromx;
+        if (phase==1 && x!="" && x>lo && x<hi && x!=fromx && x!=tox) found=1;
+    }
+    END { print (found?"YES":"NO") }
+' "$SDUMP")
+if [ "$INTER" = "YES" ]; then
+    fx=$(grep -E '^SLIDEFROMX ' "$SDUMP" | awk '{print $2}')
+    tx=$(grep -E '^SLIDETOX ' "$SDUMP" | awk '{print $2}')
+    mids=$(awk '/^SLIDEFRAME / { for(i=1;i<=NF;i++){if($i=="PHASE")p=$(i+1); if($i=="TILE0X")x=$(i+1)} if(p==1)printf "%s ",x }' "$SDUMP")
+    echo "[2048-host] PASS mid-slide tile is between start($fx) and end($tx): xs=[ $mids]"
+else
+    echo "[2048-host] FAIL no intermediate slide position found (tiles teleport)"; fail=1
+fi
+
+# The FIRST slide frame must sit at the start cell and the LAST settled frame at
+# the end cell — the endpoints bracket the intermediate positions above.
+if awk '/^SLIDEFROMX /{f=$2} /^SLIDEFRAME 0 /{for(i=1;i<=NF;i++)if($i=="TILE0X")x=$(i+1)} END{exit !(x==f)}' "$SDUMP"; then
+    echo "[2048-host] PASS frame 0 starts at the source cell"
+else
+    echo "[2048-host] FAIL frame 0 not at source cell"; fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "[2048-host] RESULT: PASS"
     exit 0
