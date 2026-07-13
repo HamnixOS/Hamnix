@@ -63,7 +63,7 @@ TS="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-build/de_visual_gate/$TS}"
 HANDOFF_MARKER="handing off to interactive shell"
 
-APPS=(hamclock hamcalc hammon)
+APPS=(hamclock hamcalc hammonscene)
 
 # --- environment gates -----------------------------------------------
 if [ ! -e /dev/kvm ]; then
