@@ -356,6 +356,29 @@ opt_splithoist_count: uint32 = 0
 # in-place-reduction hot loops licm bucket[slot]=… / saxpy ys[i]=…). 0 with --opt
 # OFF (isel-gated) -> the default build stays byte-identical.
 opt_rcxclean_count: uint32 = 0
+# CONSTANT-MATERIALIZE-INTO-REGISTER fold (--opt, regalloc peephole lever): each
+# `name = <int literal>` whose target is a register-promoted, store-eliminable
+# plain full-width-8 scalar. The seed/legacy path emits `mov $imm,%rax` (materialize
+# the literal in the stack-machine scratch) then `mov %rax,%reg` (write-through into
+# the promoted register). Since the register is the value's SOLE home (store-elim:
+# no slot-bypass read) and an assignment produces no value in %rax (assignments are
+# statements, not expressions, in this backend — gen_expr never lowers ND_ASSIGN),
+# %rax is DEAD after the store. So the `mov $imm,%rax` is retargeted IN PLACE to
+# `mov $imm,%reg` and the redundant copy is dropped — one fewer instruction (and 3
+# bytes) per constant-into-register store, on every `i = 0` loop reset / accumulator
+# seed. Length-preserving byte patch (same imm32/imm64 encoding, only the dest reg
+# field + REX.B change), so nothing downstream shifts. 0 with --opt OFF: gated on
+# ra_reg_for_name != RA_NONE (which requires ra_enabled), so the default build is
+# byte-identical to the seed. See cg_retarget_imm_rax / store_to_named.
+opt_immfold_count: uint32 = 0
+# Peephole tracker: 1 iff the MOST RECENTLY emitted instruction was a
+# `mov $imm,%rax` (emit_mov_imm_rax, imm32 or imm64 form) with NOTHING emitted
+# since. Set by emit_mov_imm_rax as its final action; CLEARED by emit_b on the very
+# next byte appended (any other emission). A consumer must therefore check it BEFORE
+# it emits anything. cg_imm_rax_at is the code offset where that instruction starts.
+# Pure bookkeeping — never changes emitted bytes, so the default path is unaffected.
+cg_imm_rax_valid: uint32 = 0
+cg_imm_rax_at: uint32 = 0
 
 
 def isel_enable():
@@ -381,6 +404,7 @@ def isel_reset_stats():
     opt_idxreg_count = 0
     opt_splithoist_count = 0
     opt_rcxclean_count = 0
+    opt_immfold_count = 0
 
 
 # -----------------------------------------------------------------------
@@ -1195,6 +1219,9 @@ def emit_b(b: uint32):
     if code_len >= CODE_CAP:
         cg_fail(3, 0)
         return
+    # Any emitted byte invalidates the "last instr was mov $imm,%rax" peephole
+    # window (emit_mov_imm_rax re-sets it AFTER its own emit_b calls complete).
+    cg_imm_rax_valid = 0
     code[code_len] = cast[uint8](b & 255)
     code_len = code_len + 1
 
@@ -3004,6 +3031,7 @@ def emit_push_rcx():
 # IntLiteral case (movq for signed-32 range, else movabsq). Without it a
 # literal like 2745498085935061697 collapses to its sign-extended low 32 bits.
 def emit_mov_imm_rax(v: uint64):
+    at: uint32 = code_len
     # In signed-32 range iff v <= 0x7FFFFFFF (small non-negative) or
     # v >= 0xFFFFFFFF80000000 (a value whose two's-complement is >= -2^31).
     if v <= cast[uint64](0x7FFFFFFF) or v >= cast[uint64](0xFFFFFFFF80000000):
@@ -3011,11 +3039,43 @@ def emit_mov_imm_rax(v: uint64):
         emit_b(0xC7)
         emit_b(0xC0)
         emit_imm32(v)
-        return
-    # movabsq $imm64, %rax  -> 48 B8 <8-byte little-endian immediate>
-    emit_b(0x48)
-    emit_b(0xB8)
-    emit_imm64(v)
+    else:
+        # movabsq $imm64, %rax  -> 48 B8 <8-byte little-endian immediate>
+        emit_b(0x48)
+        emit_b(0xB8)
+        emit_imm64(v)
+    # Arm the constant-into-register peephole: this instruction (at `at`) is a
+    # `mov $imm,%rax`. Set AFTER the emit_b calls above (each cleared the flag);
+    # the next emitted byte re-clears it, so it is valid ONLY for an immediately
+    # following consumer that checks before emitting (store_to_named).
+    cg_imm_rax_valid = 1
+    cg_imm_rax_at = at
+
+
+# PEEPHOLE (--opt): retarget an already-emitted `mov $imm,%rax` instruction at
+# code offset `at` so it writes register encoding `enc` DIRECTLY instead of %rax.
+# Length-preserving in-place byte patch:
+#   imm32 form `48 C7 C0 imm32`: modrm r/m holds the dest -> C0 + (enc&7); REX.B
+#                                (0x01) extends r/m when enc>=8 (r8..r15).
+#   imm64 form `48 B8+rd imm64`: the opcode carries the dest reg -> B8 + (enc&7);
+#                                REX.B extends the opcode reg when enc>=8.
+# The immediate bytes are unchanged. Returns 1 if it patched a recognized imm-load
+# form, 0 otherwise (caller then falls back to emitting the copy). Only called
+# under --opt from store_to_named; never touches default output.
+def cg_retarget_imm_rax(at: uint32, enc: uint32) -> uint32:
+    op: uint32 = cast[uint32](code[at + 1])
+    rex: uint32 = 0x48
+    if enc >= 8:
+        rex = rex | 0x01                 # REX.B extends the dest reg field
+    if op == 0xC7:
+        code[at] = cast[uint8](rex)
+        code[at + 2] = cast[uint8](0xC0 + (enc & 7))
+        return 1
+    if op == 0xB8:
+        code[at] = cast[uint8](rex)
+        code[at + 1] = cast[uint8](0xB8 + (enc & 7))
+        return 1
+    return 0
 
 
 # addq %rcx, %rax  -> 48 01 C8
@@ -10924,8 +10984,20 @@ def store_to_named(name_off: uint32, name_len: uint32):
             # (ra_reg_for_name -> RA_NONE, ra_store_elim_for_name -> 0).
             wenc: uint32 = ra_reg_for_name(name_off, name_len)
             if wenc != RA_NONE:
+                se: uint32 = ra_store_elim_for_name(name_off, name_len)
+                # CONSTANT-MATERIALIZE PEEPHOLE: if the value being stored was JUST
+                # emitted as `mov $imm,%rax` (nothing since) AND this local is
+                # store-eliminable (the register is its sole home, so %rax is dead
+                # after — an assignment yields no value), retarget that imm-load to
+                # write %reg directly and drop the redundant `mov %rax,%reg`. Falls
+                # back to the normal copy if the imm-load form is unrecognized.
+                if se != 0 and cg_imm_rax_valid != 0:
+                    if cg_retarget_imm_rax(cg_imm_rax_at, wenc) != 0:
+                        opt_immfold_count = opt_immfold_count + 1
+                        opt_storeelim_count = opt_storeelim_count + 1
+                        return
                 emit_mov_rax_callee(wenc)
-                if ra_store_elim_for_name(name_off, name_len) != 0:
+                if se != 0:
                     opt_storeelim_count = opt_storeelim_count + 1
                     return
             emit_store_local_rax(off)
