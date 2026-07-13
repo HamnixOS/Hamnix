@@ -55,6 +55,25 @@ from mm.memblock import memblock_alloc, memblock_region_top
 from kernel.printk.printk import printk0, printk1, printk2
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+# SMP atomicity for the per-PFN refcount table (see _cow_lock below). The
+# refcount RMWs (cow_share_page / cow_ref_inc / cow_drop_page) are
+# read-modify-writes on a shared uint16 slot; under `-smp 2` two CPUs run
+# concurrent fork (share, CPU A) and exec-teardown / reap (drop, CPU B) on
+# the SAME region-backed ELF image .text frame, with NO lock between them.
+# The plain RMW loses updates, so a live image frame's count can fall to 0
+# one drop early — cow_drop_page then returns 1 and the caller free_page()s
+# a frame the LIVE parent still executes as .text. The buddy allocator
+# reissues it and the parent faults on its own code with `[pf] user fault
+# on unmapped ... -> SIGSEGV` (code=139), classified by trap_diag as an
+# image-VMA "NO covering VMA / livepte=0" hole (task #112). See the
+# mm/vma.ad::_cow_release_forked_range comment ("a race in the share/drop
+# accounting"). Serialising every refcount RMW under one short spinlock,
+# IRQs masked (so a same-CPU fault/IRQ can never re-enter and self-deadlock),
+# makes the accounting exact and closes the double-free window.
+extern def spinlock_lock(ptr: Ptr[uint32])
+extern def spinlock_unlock(ptr: Ptr[uint32])
+extern def local_irq_save() -> uint64
+extern def local_irq_restore(flags: uint64)
 # get_bsp_cr3() is misnamed — it reads the LIVE %cr3, not a saved
 # "BSP CR3". cow_init() runs in mem_init(), before ANY task is
 # created, so at that moment the live CR3 genuinely IS the pristine
@@ -76,6 +95,13 @@ PAGE_SIZE_4K_C: uint64 = 0x1000
 # number of entries (PFN ceiling). Both 0 until cow_init() runs.
 cow_refcount_base: uint64 = 0
 cow_nr_frames:     uint64 = 0
+
+# Global spinlock protecting every refcount-table RMW. One word guards the
+# whole table: the critical sections are a handful of instructions, so a
+# single lock has negligible contention and cannot deadlock (leaf ops, no
+# reentrancy). Held with IRQs masked so a same-CPU page-fault / timer that
+# also touches a refcount can never re-enter and self-deadlock on the word.
+_cow_lock: uint32 = 0
 
 # Pristine boot page-table root (CR3), snapshotted in cow_init() before
 # any task exists. The COW page-table cracker compares against THIS to
@@ -167,13 +193,15 @@ def cow_share_page(phys: uint64):
     slot: Ptr[uint16] = _cow_slot(_cow_pfn(phys))
     if cast[uint64](slot) == 0:
         return
+    _flags: uint64 = local_irq_save()
+    spinlock_lock(&_cow_lock)
     cur: uint64 = cast[uint64](slot[0])
     if cur == 0:
         slot[0] = 2
-        return
-    if cur >= COW_REFCOUNT_MAX:
-        return
-    slot[0] = cast[uint16](cur + 1)
+    elif cur < COW_REFCOUNT_MAX:
+        slot[0] = cast[uint16](cur + 1)
+    spinlock_unlock(&_cow_lock)
+    local_irq_restore(_flags)
 
 
 def cow_ref_inc(phys: uint64):
@@ -187,10 +215,13 @@ def cow_ref_inc(phys: uint64):
     slot: Ptr[uint16] = _cow_slot(_cow_pfn(phys))
     if cast[uint64](slot) == 0:
         return
+    _flags: uint64 = local_irq_save()
+    spinlock_lock(&_cow_lock)
     cur: uint64 = cast[uint64](slot[0])
-    if cur >= COW_REFCOUNT_MAX:
-        return
-    slot[0] = cast[uint16](cur + 1)
+    if cur < COW_REFCOUNT_MAX:
+        slot[0] = cast[uint16](cur + 1)
+    spinlock_unlock(&_cow_lock)
+    local_irq_restore(_flags)
 
 
 def cow_page_is_shared(phys: uint64) -> int32:
@@ -211,16 +242,23 @@ def cow_drop_page(phys: uint64) -> int32:
     slot: Ptr[uint16] = _cow_slot(_cow_pfn(phys))
     if cast[uint64](slot) == 0:
         return 1
+    _flags: uint64 = local_irq_save()
+    spinlock_lock(&_cow_lock)
     cur: uint64 = cast[uint64](slot[0])
+    ret: int32 = 0
     if cur == 0:
-        return 1
-    if cur >= COW_REFCOUNT_MAX:
+        # Untracked — caller frees normally.
+        ret = 1
+    elif cur >= COW_REFCOUNT_MAX:
         # Saturated — never decrement, never free. Leaks, but safe.
-        return 0
-    slot[0] = cast[uint16](cur - 1)
-    if cur == 1:
-        return 1
-    return 0
+        ret = 0
+    else:
+        slot[0] = cast[uint16](cur - 1)
+        if cur == 1:
+            ret = 1
+    spinlock_unlock(&_cow_lock)
+    local_irq_restore(_flags)
+    return ret
 
 
 def cow_pte_bit() -> uint64:
