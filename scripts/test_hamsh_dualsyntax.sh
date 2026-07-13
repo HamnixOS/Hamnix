@@ -356,6 +356,44 @@ hamsh_send_await 'echo ${ jsep.join(["a", "b", "c"]) }' 'a-b-c' "$CMD_WAIT" || t
 hamsh_send 'key=hello'
 hamsh_send_await 'echo KV $key' 'KV hello' "$CMD_WAIT" || true
 
+# --- Q. §Slice-assign + computed subscript + collection builtins -----
+# All results emitted as whole output lines (`echo ${ … }` or an
+# inline-colon marker) so ran_bol / hamsh_ran can never false-green.
+# Q1. slice-assign SHRINK: xs[1:3] = [9]  ->  [1, 9, 4, 5].
+hamsh_send 'qs = [1, 2, 3, 4, 5]'
+hamsh_send 'qs[1:3] = [9]'
+hamsh_send_await 'echo QS $qs' 'QS 1 9 4 5' "$CMD_WAIT" || true
+# Q2. slice-assign GROW into an empty slice (insert): qr[1:1] = [7, 8].
+hamsh_send 'qr = [1, 2, 3]'
+hamsh_send 'qr[1:1] = [7, 8]'
+hamsh_send_await 'echo QR $qr' 'QR 1 7 8 2 3' "$CMD_WAIT" || true
+# Q3. slice-assign same-length replace over a prefix.
+hamsh_send 'qw = [0, 0, 0]'
+hamsh_send 'qw[0:2] = [5, 6, 7]'
+hamsh_send_await 'echo QW $qw' 'QW 5 6 7 0' "$CMD_WAIT" || true
+# Q4. DIFFERENTIAL both-styles-≡: the SAME slice-assign inside a brace
+# block and an indent block must yield IDENTICAL lists (>=1 marker each).
+hamsh_send 'qb = [1, 2, 3, 4]'
+hamsh_send 'if 1 > 0 { qb[1:3] = [8] }'
+hamsh_send_await 'echo QB $qb' 'QB 1 8 4' "$CMD_WAIT" || true
+hamsh_send 'qi = [1, 2, 3, 4]'
+hamsh_send 'if 1 > 0:'
+hamsh_send '    qi[1:3] = [8]'
+hamsh_send ''
+hamsh_send_await 'echo QI $qi' 'QI 1 8 4' "$CMD_WAIT" || true
+# Q5. COMPUTED-subscript READ (spaced index expression) inside ${ }.
+hamsh_send 'ce = [10, 20, 30]'
+hamsh_send 'cidx = 1'
+hamsh_send_await 'echo ${ $ce[cidx + 1] }' '30' "$CMD_WAIT" || true
+# Q6. new collection builtins: any / all (inline-colon so bool render is
+# never emitted bare), + list index() / count() (function + method form).
+hamsh_send_await 'if all([1, 2, 3]): echo ALL_OK' 'ALL_OK' "$CMD_WAIT" || true
+hamsh_send_await 'if any([0, 0, 3]): echo ANY_OK' 'ANY_OK' "$CMD_WAIT" || true
+hamsh_send 'if any([0, 0, 0]): echo ANY_NO'
+hamsh_send_await 'echo ${ index(["a", "b", "c"], "b") }' '1' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ ["x", "y", "x"].count("x") }' '2' "$CMD_WAIT" || true
+hamsh_send_await 'echo ${ ["p", "q", "r"].index("r") }' '2' "$CMD_WAIT" || true
+
 hamsh_send_await 'echo GATE_DONE' 'GATE_DONE' "$CMD_WAIT" || true
 hamsh_send 'exit'
 sleep 2
@@ -564,6 +602,27 @@ done
 if ran_bol "MB 1 2 3" && ran_bol "MI 1 2 3"; then
     echo "[$TAG] OK: list mutation brace-loop ≡ indent-loop"; else
     echo "[$TAG] WRONG: mutation brace≢indent"; fail=1; fi
+
+# Q. §Slice-assign + computed subscript + collection builtins.
+for pair in "QS 1 9 4 5|slice-assign-shrink" "QR 1 7 8 2 3|slice-assign-grow" \
+            "QW 5 6 7 0|slice-assign-same-prefix" \
+            "QB 1 8 4|slice-assign-brace-block" "QI 1 8 4|slice-assign-indent-block" \
+            "30|computed-subscript-read" \
+            "ALL_OK|builtin-all" "ANY_OK|builtin-any" \
+            "1|list-index-fn" "2|list-count-method" "2|list-index-method"; do
+    m="${pair%%|*}"; name="${pair##*|}"
+    if ran_bol "$(printf '%s' "$m" | sed 's/[.[*+]/\\&/g')"; then
+        echo "[$TAG] OK: $name"; else
+        echo "[$TAG] WRONG: $name (want '$m')"; fail=1; fi
+done
+# Q4 differential: brace-block slice-assign ≡ indent-block slice-assign.
+if ran_bol "QB 1 8 4" && ran_bol "QI 1 8 4"; then
+    echo "[$TAG] OK: slice-assign brace-block ≡ indent-block"; else
+    echo "[$TAG] WRONG: slice-assign brace≢indent"; fail=1; fi
+# Q6 absence: any([0,0,0]) is falsy — its body must NOT run.
+if hamsh_ran "$LOG" "ANY_NO"; then
+    echo "[$TAG] WRONG: any([0,0,0]) truthy — untaken body leaked"; fail=1; else
+    echo "[$TAG] OK: any([0,0,0]) falsy — body skipped"; fi
 
 if ! hamsh_ran "$LOG" "GATE_DONE"; then
     echo "[$TAG] WRONG: shell did not survive to the end (GATE_DONE absent)"; fail=1; fi
