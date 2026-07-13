@@ -659,6 +659,36 @@ Open blockers (agent-owned):
 - [ ] Flip `test_pipe.sh` / `test_multipipe.sh` back to `-smp 2` once the wedge
   lands — they default to `-smp 1` to dodge it, which hides it.
 
+## Interactive-QA sweep 2026-07-13 (orchestrator, hands-on install QA — CLOSED)
+
+The user returned from testing the installed image with a ~18-item hands-on list;
+driven as one agent wave (worktree-isolated), each fix render-/gate-verified
+before merge. All shipped through `1a9b333e`. See STATUS.md "QA-by-using wave 7"
+for the full narrative. Tasks #199–#217. Every item below is DONE + pushed:
+
+- [x] Startup calc = the broken legacy `/bin/hamcalc` → autostart repointed to `/bin/hamcalcscene` (#199).
+- [x] Calendar inert → real stopwatch + date-select relative-time + month/arrow nav; panel-clock unified on `/bin/hamcalscene` (#201).
+- [x] Notes: no save/new → Save (Ctrl-S)/New (Ctrl-N)/multi-note + persistence to `/home/live/Notes` (#202).
+- [x] Menu crowded → MATE menu (search + Recent + category headers all visible) (#206).
+- [x] Linux Process Viewer wouldn't open → CLI (`Terminal=true`) entries now hosted in `/bin/hamtermscene` (real window), not the surface-less Wayland-client path (#207).
+- [x] Panel right-click "giant widget list" → MATE **Add to Panel…** searchable categorized applet chooser (#210).
+- [x] Legacy Settings duplicate → delisted `/bin/hamsettings` everywhere; Control Center is the sole surface (#211).
+- [x] File-manager right-click → added **New File** beside New Folder (#212).
+- [x] 2048 slows down → growth DISPROVED; real cause was the ~1.8s/move blocking animation, cut to ~0.9s (10→5 commits, 200→50ms) (#209/#214).
+- [x] Mouse wheel inverted in EVERY app → raw hardware wheel sign normalized to the `/dev/mouse` contract at the driver layer (PS/2 + USB HID + Wayland); upstream of the correct #123/#141 fixes (#200).
+- [x] Ctrl+Alt+Left/Right (workspace) + Ctrl+Alt+T (terminal) → compositor already dispatched them (#124); PS/2 driver now emits the `ESC[1;7D/C` / CSI-46 sequences (#213).
+- [x] `ifconfig`/Control-Center IP "error" → a #163 uaccess regression: `do_netcfg` ran `access_ok()` on the KERNEL staging buffer; stale checks removed (FIB on-device gate PASS-ALL) (#203).
+- [x] Installer still on the INSTALLED system → launcher gated on the live-only `/etc/installer-medium` via a new `X-Hamnix-LiveOnly` desktop key; completion message moved above the footer buttons (#204).
+- [x] Freshly-provisioned home empty → `/etc/skel` (Desktop/Documents/Downloads/Pictures + welcome), copied by the installer and chowned to the user via a new ext4 `chown` ctl verb (#205).
+- [x] Screenshot claimed `/root/screenshot` (no such home) → routed to `/home/live/Pictures` with a runtime mkdir (#208).
+- [x] google.com "loads but isn't usable" → `_serialize_form` never prepended the form `action` (submit reloaded the homepage); fixed → `NAV /search?q=…` (#215). Then the on-device follow-up: wired the browser front-end so a click focuses a field, typed chars edit the DOM value, and Enter/submit navigates (#216).
+- [x] Systemic: DE scene-client search boxes (app-menu, panel chooser) rendered but weren't typable — the clients now read the per-window `/dev/wsys/<wid>/keys` stream and feed the existing filters; the compositor already delivered keys to the focused window (#217).
+
+Merge-bar lesson banked: an agent's `install.ad` used a `Ptr[uint8]` string global
+the frozen seed accepts but the native x86 backend rejects — caught before push;
+always native-verify (`--target=x86_64-adder-user`), never trust a seed-only
+"compiles clean". See [[feedback-compiler-quirks]].
+
 ## hamUI / DE track
 
 - [~] **`lib/hamui.ad` MATE-class widget set** — menu/menubar,
