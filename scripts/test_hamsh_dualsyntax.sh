@@ -279,6 +279,8 @@ hamsh_send 'fnm = "ham"'
 hamsh_send_await 'echo f"hi {fnm}nix"' 'hi hamnix' "$CMD_WAIT" || true
 # f-string with a call sub-expression + literal braces via {{ }}.
 hamsh_send_await 'echo f"len={len([1, 2, 3])} {{lit}}"' 'len=3 {lit}' "$CMD_WAIT" || true
+# The single-quoted form f'...' interpolates identically to f"...".
+hamsh_send_await "echo f'sq is {fa + fb}'" 'sq is 7' "$CMD_WAIT" || true
 
 # --- P. §Mutation + floor-division + call kwargs (the mutation rung) --
 # All results emitted as whole output lines so ran_bol can't false-green.
@@ -570,7 +572,8 @@ if ran_bol "WCAUGHT_wz"; then
 
 # O. §f-string — Python f"{expr}" interpolation.
 for pair in "sum=7|arith-subexpr" "pi is 3.14|float-interp" \
-            "hi hamnix|adjacent-text" "len=3 {lit}|call+literal-brace"; do
+            "hi hamnix|adjacent-text" "len=3 {lit}|call+literal-brace" \
+            "sq is 7|single-quoted-fstring"; do
     m="${pair%%|*}"; name="${pair##*|}"
     if ran_bol "$(printf '%s' "$m" | sed 's/[.[*+{}]/\\&/g')"; then
         echo "[$TAG] OK: f-string $name"; else
