@@ -69,7 +69,7 @@ build_adder_user lsblk                # enumerate /dev/blk devices + sizes (pre-
 build_adder_user pwd                  # M16.47: print working dir
 build_adder_user head                 # M16.57: first N lines
 build_adder_user wc                   # M16.57: line/word/byte count
-build_adder_user grep                 # M16.57: substring line filter
+build_adder_user grep                 # egrep: ERE (-E) via shared lib/regex.ad; flags -i/-v/-c/-n/-o/-w/-x/-F/-e
 build_adder_user seq                  # M16.64: 1..N or M..N output
 build_adder_user bc                   # native infix arithmetic calculator (integer POSIX subset)
 build_adder_user js                   # native ES5/basic-ES6 JavaScript engine (lib/jsengine.ad); FILE.js or built-in demo

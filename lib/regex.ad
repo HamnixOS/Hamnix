@@ -1,0 +1,661 @@
+# lib/regex.ad
+#
+# A small, self-contained, EXTERN-FREE regular-expression engine shared
+# by the native coreutils (`grep -E`, and the `sed` stream editor). It
+# is a recursive-descent parser into a node tree plus a backtracking
+# matcher. Two syntaxes are supported off one code path:
+#
+#   * BRE  (rx_compile ... ere=0) — Basic REs: literals, `.`, `*`,
+#     `[...]`/`[^...]` classes with ranges + POSIX `[:class:]`, `^`
+#     anchor (only at the very start), `$` anchor (only at the very
+#     end), and `\<c>` = literal c. `+ ? { } ( ) |` are ORDINARY
+#     characters. This is EXACTLY the subset `sed` relied on before it
+#     was rewired onto this lib, so sed semantics are preserved.
+#
+#   * ERE  (rx_compile ... ere=1) — POSIX Extended REs: everything BRE
+#     has, PLUS `+` (1+), `?` (0/1), `{n}`/`{n,}`/`{n,m}` intervals,
+#     alternation `|`, and grouping `( ... )`. Anchors `^`/`$` are
+#     special anywhere.
+#
+# The matcher is greedy + leftmost: quantifiers consume as much as
+# possible then backtrack, and `rx_search` reports the leftmost start.
+# For greedy quantifiers and alternations whose branches don't overlap
+# in length this coincides with POSIX leftmost-longest — which is the
+# subset the callers gate against. `.` matches any byte except newline
+# (callers feed one line at a time, so this is moot in practice).
+#
+# The engine holds ONE compiled program in module globals at a time:
+# call rx_compile(), then rx_search() as many times as needed. It is
+# extern-free and pure compute, so it compiles for BOTH the on-device
+# x86_64-adder-user target and the x86_64-linux host cross-check.
+
+# ---- node types --------------------------------------------------
+# NT_CHAR   literal byte (rx_nch)
+# NT_ANY    '.'  (any byte except '\n')
+# NT_CLASS  '[...]' bracket set (rx_ncls_of -> class row)
+# NT_ASTART '^'
+# NT_AEND   '$'
+# NT_CONCAT rx_na then rx_nb
+# NT_ALT    rx_na or rx_nb
+# NT_REPEAT rx_na repeated [rx_nmin .. rx_nmax] (rx_nmax = -1 == inf)
+# NT_EMPTY  matches the empty string
+NT_CHAR:   int32 = 0
+NT_ANY:    int32 = 1
+NT_CLASS:  int32 = 2
+NT_ASTART: int32 = 3
+NT_AEND:   int32 = 4
+NT_CONCAT: int32 = 5
+NT_ALT:    int32 = 6
+NT_REPEAT: int32 = 7
+NT_EMPTY:  int32 = 8
+
+RX_MAX_NODES:      int32 = 2048
+RX_MAX_CLASS_ROWS: int32 = 128
+
+# ---- compiled program (node arena) -------------------------------
+rx_ntype:   Array[2048, int32]
+rx_nch:     Array[2048, uint8]
+rx_ncls_of: Array[2048, int32]
+rx_nmin:    Array[2048, int32]
+rx_nmax:    Array[2048, int32]
+rx_na:      Array[2048, int32]
+rx_nb:      Array[2048, int32]
+rx_nn:      int32 = 0
+rx_root:    int32 = 0
+
+# bracket-class rows: RX_MAX_CLASS_ROWS * 256 booleans (0/1)
+rx_cls:      Array[32768, uint8]
+rx_nclsrows: int32 = 0
+
+# ---- parser state ------------------------------------------------
+rx_pat:    Ptr[uint8]
+rx_plen:   uint64 = 0
+rx_pp:     uint64 = 0
+rx_ere:    int32 = 0
+rx_icase:  int32 = 0
+rx_err:    int32 = 0
+rx_gdepth: int32 = 0
+
+# ---- matcher state -----------------------------------------------
+rx_text: Ptr[uint8]
+rx_tlen: uint64 = 0
+
+# continuation stack: node indices still to match after the current one
+rx_contstk: Array[4096, int32]
+contdepth:  int32 = 0
+cont_base:  int32 = 0
+
+# per-repeat-depth end-position stacks for greedy backtracking
+RX_MAXREPDEPTH: int32 = 4
+RX_REP_ENDS:    int32 = 32768
+rx_ends:    Array[131072, int32]   # RX_MAXREPDEPTH * RX_REP_ENDS
+rx_repdepth: int32 = 0
+
+# ---- results (leftmost match span, byte offsets into rx_text) ----
+rx_mstart: int64 = 0
+rx_mend:   int64 = 0
+
+
+# ==================================================================
+# Character predicates (ASCII / LC_ALL=C semantics)
+# ==================================================================
+def rx_is_upper(c: uint8) -> int32:
+    if c >= 65 and c <= 90:
+        return 1
+    return 0
+
+def rx_is_lower(c: uint8) -> int32:
+    if c >= 97 and c <= 122:
+        return 1
+    return 0
+
+def rx_is_digit(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return 1
+    return 0
+
+def rx_is_alpha(c: uint8) -> int32:
+    if rx_is_upper(c) == 1 or rx_is_lower(c) == 1:
+        return 1
+    return 0
+
+def rx_lower(c: uint8) -> uint8:
+    if c >= 65 and c <= 90:
+        return c + 32
+    return c
+
+
+# classid: 0 alpha 1 digit 2 alnum 3 upper 4 lower 5 space 6 blank
+#          7 punct 8 xdigit 9 cntrl 10 print 11 graph
+def rx_posix_match(cid: int32, c: uint8) -> int32:
+    if cid == 0:
+        return rx_is_alpha(c)
+    if cid == 1:
+        return rx_is_digit(c)
+    if cid == 2:
+        if rx_is_alpha(c) == 1 or rx_is_digit(c) == 1:
+            return 1
+        return 0
+    if cid == 3:
+        return rx_is_upper(c)
+    if cid == 4:
+        return rx_is_lower(c)
+    if cid == 5:
+        if c == 32 or (c >= 9 and c <= 13):
+            return 1
+        return 0
+    if cid == 6:
+        if c == 32 or c == 9:
+            return 1
+        return 0
+    if cid == 7:
+        # punct: printable, not alnum, not space
+        if c >= 33 and c <= 126:
+            if rx_is_alpha(c) == 0 and rx_is_digit(c) == 0:
+                return 1
+        return 0
+    if cid == 8:
+        if rx_is_digit(c) == 1:
+            return 1
+        if c >= 65 and c <= 70:
+            return 1
+        if c >= 97 and c <= 102:
+            return 1
+        return 0
+    if cid == 9:
+        if c <= 31 or c == 127:
+            return 1
+        return 0
+    if cid == 10:
+        if c >= 32 and c <= 126:
+            return 1
+        return 0
+    if cid == 11:
+        if c >= 33 and c <= 126:
+            return 1
+        return 0
+    return 0
+
+
+def rx_name_is(nb: Ptr[uint8], nl: uint64, s: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while i < nl and s[i] != 0:
+        if nb[i] != s[i]:
+            return 0
+        i = i + 1
+    if i == nl and s[i] == 0:
+        return 1
+    return 0
+
+def rx_classid(nb: Ptr[uint8], nl: uint64) -> int32:
+    if rx_name_is(nb, nl, "alpha") == 1:
+        return 0
+    if rx_name_is(nb, nl, "digit") == 1:
+        return 1
+    if rx_name_is(nb, nl, "alnum") == 1:
+        return 2
+    if rx_name_is(nb, nl, "upper") == 1:
+        return 3
+    if rx_name_is(nb, nl, "lower") == 1:
+        return 4
+    if rx_name_is(nb, nl, "space") == 1:
+        return 5
+    if rx_name_is(nb, nl, "blank") == 1:
+        return 6
+    if rx_name_is(nb, nl, "punct") == 1:
+        return 7
+    if rx_name_is(nb, nl, "xdigit") == 1:
+        return 8
+    if rx_name_is(nb, nl, "cntrl") == 1:
+        return 9
+    if rx_name_is(nb, nl, "print") == 1:
+        return 10
+    if rx_name_is(nb, nl, "graph") == 1:
+        return 11
+    return -1
+
+
+# ==================================================================
+# Node arena helpers
+# ==================================================================
+def rx_node(t: int32) -> int32:
+    i: int32 = rx_nn
+    if i >= RX_MAX_NODES:
+        rx_err = 1
+        return 0
+    rx_nn = rx_nn + 1
+    rx_ntype[i] = t
+    rx_na[i] = -1
+    rx_nb[i] = -1
+    rx_nmin[i] = 0
+    rx_nmax[i] = 0
+    return i
+
+def rx_mk_char(ch: uint8) -> int32:
+    i: int32 = rx_node(NT_CHAR)
+    rx_nch[i] = ch
+    return i
+
+def rx_mk_cls(clsidx: int32) -> int32:
+    i: int32 = rx_node(NT_CLASS)
+    rx_ncls_of[i] = clsidx
+    return i
+
+def rx_mk_concat(a: int32, b: int32) -> int32:
+    i: int32 = rx_node(NT_CONCAT)
+    rx_na[i] = a
+    rx_nb[i] = b
+    return i
+
+def rx_mk_alt(a: int32, b: int32) -> int32:
+    i: int32 = rx_node(NT_ALT)
+    rx_na[i] = a
+    rx_nb[i] = b
+    return i
+
+def rx_mk_repeat(child: int32, mn: int32, mx: int32) -> int32:
+    i: int32 = rx_node(NT_REPEAT)
+    rx_na[i] = child
+    rx_nmin[i] = mn
+    rx_nmax[i] = mx
+    return i
+
+
+# ==================================================================
+# Parser
+# ==================================================================
+def rx_cur() -> int32:
+    if rx_pp < rx_plen:
+        return cast[int32](rx_pat[rx_pp])
+    return -1
+
+def rx_at(pos: uint64) -> int32:
+    if pos < rx_plen:
+        return cast[int32](rx_pat[pos])
+    return -1
+
+
+# Parse `[:name:]` at rx_pp (pointing at '['), set bits into class row
+# `base`. Returns 1 on success, 0 on malformed.
+def rx_posix_bracket(base: uint64) -> int32:
+    rx_pp = rx_pp + 2                       # past '[:'
+    nb: Array[16, uint8]
+    nl: uint64 = 0
+    while True:
+        c: int32 = rx_cur()
+        if c < 0:
+            return 0
+        if c == 58 and rx_at(rx_pp + 1) == 93:      # ':]'
+            rx_pp = rx_pp + 2
+            break
+        if nl < 16:
+            nb[nl] = cast[uint8](c)
+            nl = nl + 1
+        rx_pp = rx_pp + 1
+    cid: int32 = rx_classid(&nb[0], nl)
+    if cid < 0:
+        return 0
+    cc: uint64 = 0
+    while cc < 256:
+        if rx_posix_match(cid, cast[uint8](cc)) == 1:
+            rx_cls[base + cc] = 1
+        cc = cc + 1
+    return 1
+
+
+# Parse a bracket expression starting at rx_pp (pointing at '['),
+# returns a NT_CLASS node.
+def rx_class() -> int32:
+    rx_pp = rx_pp + 1                        # past '['
+    idx: int32 = rx_nclsrows
+    if idx >= RX_MAX_CLASS_ROWS:
+        rx_err = 1
+        return rx_node(NT_EMPTY)
+    rx_nclsrows = rx_nclsrows + 1
+    base: uint64 = cast[uint64](idx) * 256
+    k: uint64 = 0
+    while k < 256:
+        rx_cls[base + k] = 0
+        k = k + 1
+    negate: int32 = 0
+    if rx_cur() == 94:                       # '^'
+        negate = 1
+        rx_pp = rx_pp + 1
+    firstc: int32 = 1
+    while True:
+        c: int32 = rx_cur()
+        if c < 0:
+            rx_err = 1
+            break
+        if c == 93 and firstc == 0:          # closing ']'
+            break
+        firstc = 0
+        if c == 91 and rx_at(rx_pp + 1) == 58:      # '[:'  POSIX class
+            if rx_posix_bracket(base) == 0:
+                rx_err = 1
+                break
+        else:
+            n1: int32 = rx_at(rx_pp + 1)
+            n2: int32 = rx_at(rx_pp + 2)
+            if n1 == 45 and n2 >= 0 and n2 != 93:       # a-z range
+                lo: uint64 = cast[uint64](c)
+                hi: uint64 = cast[uint64](n2)
+                cc2: uint64 = lo
+                while cc2 <= hi:
+                    rx_cls[base + cc2] = 1
+                    cc2 = cc2 + 1
+                rx_pp = rx_pp + 3
+            else:
+                rx_cls[base + cast[uint64](c)] = 1
+                rx_pp = rx_pp + 1
+    if rx_cur() == 93:
+        rx_pp = rx_pp + 1
+    if rx_icase == 1:
+        c3: uint64 = 97
+        while c3 <= 122:
+            if rx_cls[base + c3] == 1:
+                rx_cls[base + c3 - 32] = 1
+            c3 = c3 + 1
+        c4: uint64 = 65
+        while c4 <= 90:
+            if rx_cls[base + c4] == 1:
+                rx_cls[base + c4 + 32] = 1
+            c4 = c4 + 1
+    if negate == 1:
+        k2: uint64 = 0
+        while k2 < 256:
+            rx_cls[base + k2] = 1 - rx_cls[base + k2]
+            k2 = k2 + 1
+    return rx_mk_cls(idx)
+
+
+def rx_atom() -> int32:
+    c: int32 = rx_cur()
+    if c < 0:
+        return rx_node(NT_EMPTY)
+    if rx_ere == 1 and c == 40:              # '(' group (ERE only)
+        rx_pp = rx_pp + 1
+        rx_gdepth = rx_gdepth + 1
+        inner: int32 = rx_alt()
+        if rx_cur() == 41:
+            rx_pp = rx_pp + 1
+        else:
+            rx_err = 1
+        rx_gdepth = rx_gdepth - 1
+        return inner
+    if c == 91:                              # '['
+        return rx_class()
+    if c == 46:                              # '.'
+        rx_pp = rx_pp + 1
+        return rx_node(NT_ANY)
+    if c == 94:                              # '^'
+        if rx_ere == 1 or rx_pp == 0:
+            rx_pp = rx_pp + 1
+            return rx_node(NT_ASTART)
+        rx_pp = rx_pp + 1
+        return rx_mk_char(94)
+    if c == 36:                              # '$'
+        if rx_ere == 1 or rx_pp == rx_plen - 1:
+            rx_pp = rx_pp + 1
+            return rx_node(NT_AEND)
+        rx_pp = rx_pp + 1
+        return rx_mk_char(36)
+    if c == 92:                              # '\' escape -> literal next
+        rx_pp = rx_pp + 1
+        c2: int32 = rx_cur()
+        if c2 < 0:
+            return rx_mk_char(92)
+        rx_pp = rx_pp + 1
+        return rx_mk_char(cast[uint8](c2))
+    # ordinary literal (includes + ? { } ( ) | when not special)
+    rx_pp = rx_pp + 1
+    return rx_mk_char(cast[uint8](c))
+
+
+# Try to parse a `{n}` / `{n,}` / `{n,m}` interval at rx_pp (pointing at
+# '{') and wrap `atom`. On any malformed form, restore rx_pp and return
+# -1 so the caller can treat '{' as a literal.
+def rx_interval(atom: int32) -> int32:
+    save: uint64 = rx_pp
+    rx_pp = rx_pp + 1                        # past '{'
+    if rx_is_digit(cast[uint8](rx_cur())) == 0 or rx_cur() < 0:
+        rx_pp = save
+        return -1
+    n: int32 = 0
+    while rx_cur() >= 0 and rx_is_digit(cast[uint8](rx_cur())) == 1:
+        n = n * 10 + (rx_cur() - 48)
+        rx_pp = rx_pp + 1
+    if rx_cur() == 125:                      # '}'  -> {n}
+        rx_pp = rx_pp + 1
+        return rx_mk_repeat(atom, n, n)
+    if rx_cur() == 44:                       # ','
+        rx_pp = rx_pp + 1
+        if rx_cur() == 125:                  # '}'  -> {n,}
+            rx_pp = rx_pp + 1
+            return rx_mk_repeat(atom, n, -1)
+        if rx_cur() >= 0 and rx_is_digit(cast[uint8](rx_cur())) == 1:
+            m: int32 = 0
+            while rx_cur() >= 0 and rx_is_digit(cast[uint8](rx_cur())) == 1:
+                m = m * 10 + (rx_cur() - 48)
+                rx_pp = rx_pp + 1
+            if rx_cur() == 125:              # '}'  -> {n,m}
+                rx_pp = rx_pp + 1
+                return rx_mk_repeat(atom, n, m)
+    rx_pp = save
+    return -1
+
+
+def rx_repeat_parse() -> int32:
+    a: int32 = rx_atom()
+    if rx_err == 1:
+        return a
+    while True:
+        c: int32 = rx_cur()
+        if c == 42:                          # '*'
+            rx_pp = rx_pp + 1
+            a = rx_mk_repeat(a, 0, -1)
+        elif rx_ere == 1 and c == 43:        # '+'
+            rx_pp = rx_pp + 1
+            a = rx_mk_repeat(a, 1, -1)
+        elif rx_ere == 1 and c == 63:        # '?'
+            rx_pp = rx_pp + 1
+            a = rx_mk_repeat(a, 0, 1)
+        elif rx_ere == 1 and c == 123:       # '{'
+            r: int32 = rx_interval(a)
+            if r < 0:
+                break
+            a = r
+        else:
+            break
+    return a
+
+
+def rx_concat() -> int32:
+    acc: int32 = -1
+    while True:
+        c: int32 = rx_cur()
+        if c < 0:
+            break
+        if rx_ere == 1 and c == 124:         # '|'
+            break
+        if rx_gdepth > 0 and c == 41:        # ')' closing a group
+            break
+        node: int32 = rx_repeat_parse()
+        if rx_err == 1:
+            return acc
+        if acc < 0:
+            acc = node
+        else:
+            acc = rx_mk_concat(acc, node)
+    if acc < 0:
+        acc = rx_node(NT_EMPTY)
+    return acc
+
+
+def rx_alt() -> int32:
+    l: int32 = rx_concat()
+    while rx_ere == 1 and rx_cur() == 124:   # '|'
+        rx_pp = rx_pp + 1
+        r: int32 = rx_concat()
+        l = rx_mk_alt(l, r)
+    return l
+
+
+# Compile pattern[0..plen) with the given syntax/flags into the module
+# program. Returns 0 on success, -1 on a malformed pattern.
+def rx_compile(pat: Ptr[uint8], plen: uint64, ere: int32, icase: int32) -> int32:
+    rx_pat = pat
+    rx_plen = plen
+    rx_pp = 0
+    rx_ere = ere
+    rx_icase = icase
+    rx_err = 0
+    rx_gdepth = 0
+    rx_nn = 0
+    rx_nclsrows = 0
+    root: int32 = rx_alt()
+    if rx_err == 1:
+        return -1
+    if rx_pp != rx_plen:                     # trailing unconsumed input
+        return -1
+    rx_root = root
+    return 0
+
+
+# ==================================================================
+# Matcher (greedy backtracking with an explicit continuation stack)
+# ==================================================================
+def rx_cheq(a: uint8, b: uint8) -> int32:
+    if rx_icase == 1:
+        if rx_lower(a) == rx_lower(b):
+            return 1
+        return 0
+    if a == b:
+        return 1
+    return 0
+
+
+# Match everything still pending on the continuation stack at text
+# position ti. Returns the final end position, or -1.
+def rx_cont(ti: uint64) -> int64:
+    if contdepth == cont_base:
+        return cast[int64](ti)
+    saved: int32 = contdepth - 1
+    c: int32 = rx_contstk[saved]
+    contdepth = saved
+    r: int64 = rx_m(c, ti)
+    contdepth = saved + 1
+    rx_contstk[saved] = c
+    return r
+
+
+# Match node `nidx` at ti, then the pending continuation. Returns the
+# overall end position on success, or -1.
+def rx_m(nidx: int32, ti: uint64) -> int64:
+    t: int32 = rx_ntype[nidx]
+    if t == NT_CHAR:
+        if ti < rx_tlen and rx_cheq(rx_text[ti], rx_nch[nidx]) == 1:
+            return rx_cont(ti + 1)
+        return -1
+    if t == NT_ANY:
+        if ti < rx_tlen and rx_text[ti] != 10:
+            return rx_cont(ti + 1)
+        return -1
+    if t == NT_CLASS:
+        if ti < rx_tlen:
+            base: uint64 = cast[uint64](rx_ncls_of[nidx]) * 256
+            if rx_cls[base + cast[uint64](rx_text[ti])] != 0:
+                return rx_cont(ti + 1)
+        return -1
+    if t == NT_ASTART:
+        if ti == 0:
+            return rx_cont(ti)
+        return -1
+    if t == NT_AEND:
+        if ti == rx_tlen:
+            return rx_cont(ti)
+        return -1
+    if t == NT_EMPTY:
+        return rx_cont(ti)
+    if t == NT_CONCAT:
+        rx_contstk[contdepth] = rx_nb[nidx]
+        contdepth = contdepth + 1
+        r: int64 = rx_m(rx_na[nidx], ti)
+        contdepth = contdepth - 1
+        return r
+    if t == NT_ALT:
+        ra: int64 = rx_m(rx_na[nidx], ti)
+        if ra >= 0:
+            return ra
+        return rx_m(rx_nb[nidx], ti)
+    if t == NT_REPEAT:
+        return rx_repeat(nidx, ti)
+    return -1
+
+
+# Match `child` as a standalone subexpression (empty continuation),
+# returning its end position or -1.
+def rx_match_one(child: int32, ti: uint64) -> int64:
+    saved_base: int32 = cont_base
+    cont_base = contdepth
+    r: int64 = rx_m(child, ti)
+    cont_base = saved_base
+    return r
+
+
+def rx_repeat(nidx: int32, ti: uint64) -> int64:
+    child: int32 = rx_na[nidx]
+    mn: int32 = rx_nmin[nidx]
+    mx: int32 = rx_nmax[nidx]
+    d: int32 = rx_repdepth
+    if d >= RX_MAXREPDEPTH:
+        d = RX_MAXREPDEPTH - 1
+    base: uint64 = cast[uint64](d) * cast[uint64](RX_REP_ENDS)
+    rx_repdepth = d + 1
+    # Greedily collect end positions of 0,1,2,... matches of `child`.
+    ne: int32 = 0
+    rx_ends[base] = cast[int32](ti)
+    cur: uint64 = ti
+    while (mx < 0 or ne < mx) and ne < RX_REP_ENDS - 1:
+        e: int64 = rx_match_one(child, cur)
+        if e < 0:
+            break
+        eu: uint64 = cast[uint64](e)
+        if eu <= cur:                        # no progress -> stop (avoid inf loop)
+            break
+        ne = ne + 1
+        rx_ends[base + cast[uint64](ne)] = cast[int32](eu)
+        cur = eu
+    # Backtrack from the greediest count down to the minimum.
+    k: int32 = ne
+    while k >= mn:
+        endpos: uint64 = cast[uint64](rx_ends[base + cast[uint64](k)])
+        r: int64 = rx_cont(endpos)
+        if r >= 0:
+            rx_repdepth = d
+            return r
+        if k == 0:
+            break
+        k = k - 1
+    rx_repdepth = d
+    return -1
+
+
+# Search text[0..tlen) for the leftmost match at a start index >= start.
+# On success returns the match start (>=0) and sets rx_mstart/rx_mend;
+# returns -1 if there is no match.
+def rx_search(text: Ptr[uint8], tlen: uint64, start: uint64) -> int64:
+    rx_text = text
+    rx_tlen = tlen
+    i: uint64 = start
+    while i <= tlen:
+        contdepth = 0
+        cont_base = 0
+        rx_repdepth = 0
+        r: int64 = rx_m(rx_root, i)
+        if r >= 0:
+            rx_mstart = cast[int64](i)
+            rx_mend = r
+            return cast[int64](i)
+        i = i + 1
+    return -1
