@@ -105,6 +105,9 @@ assert_grep '^CHIT miss -1'                          "choice hit-test: point lef
 assert_grep '^CKIND row2 2'                          "choice hit-test: row 2 is an ENTRY"
 assert_grep '^CAPPLET row2 1'                        "choice hit-test: row 2 inserts the Menu Bar applet"
 
+# --- live typing: the on-device keystroke edit path (push/backspace) --------
+assert_grep '^CTYPE filter=\"work\" len=4 rows=3'    "typed keystrokes edit the chooser filter + narrow the layout"
+
 # --- NATIVE panel consumes the searchable chooser (compiles) -------------
 echo "[ctxmenu-host] compiling NATIVE hampanelscene for x86_64-adder-user ..."
 if ! python3 -m compiler.adder compile --target=x86_64-adder-user \

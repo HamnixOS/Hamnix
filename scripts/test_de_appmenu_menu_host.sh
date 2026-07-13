@@ -105,6 +105,12 @@ assert_grep '^HIT search 0'                        "hit-test: pointer on the sea
 assert_grep '^HIT miss -1'                         "hit-test: pointer left of the box misses"
 assert_grep '^KIND row2 2'                         "row 2 is an APP row (launchable)"
 
+# --- live typing: the on-device keystroke edit path (push/backspace) --------
+# Typing "C","a","z" then Backspace leaves the filter "ca" and narrows the
+# layout to the 5 rows the FILTERED render proves — verifies a typed key both
+# updates the filter buffer and re-narrows the visible set.
+assert_grep '^TYPE filter=\"ca\" len=2 rows=5'     "typed keystrokes edit the filter buffer + narrow the layout"
+
 # --- NATIVE menu client still compiles from the shared model --------------
 echo "[appmenu-host] compiling NATIVE hamappmenu for x86_64-adder-user ..."
 if ! python3 -m compiler.adder compile --target=x86_64-adder-user \
