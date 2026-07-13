@@ -31,7 +31,18 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IMG="${IMG:-build/hamnix-installer.img}"
+# AUTO_INSTALL=1 => build/use an UNATTENDED medium that auto-wipes the target
+# (for testing/CI only). DEFAULT (unset) => the normal LIVE install medium: it
+# boots to the desktop and you run the installer YOURSELF ("Install Hamnix" or
+# `install`), which prompts for the disk and confirms the erase. Distinct image
+# paths so the two never clobber each other.
+if [ -n "${AUTO_INSTALL:-}" ]; then
+    IMG="${IMG:-build/hamnix-installer-autorun.img}"
+    AUTORUN_BUILD_ENV="HAMNIX_INSTALLER_AUTORUN=1"
+else
+    IMG="${IMG:-build/hamnix-installer.img}"
+    AUTORUN_BUILD_ENV=""
+fi
 DISK="${DISK:-/tmp/hamnix-install-target.qcow2}"
 MEM="${MEM:-2G}"
 
@@ -40,7 +51,7 @@ say() { echo "[run_installer] $*"; }
 # --- installer image (build on demand) --------------------------------------
 if [ ! -f "$IMG" ]; then
     say "installer image $IMG absent — building via scripts/build_installer_img.sh (~14 min)"
-    HAMNIX_INSTALLER_IMG_OUT="$IMG" bash scripts/build_installer_img.sh
+    env $AUTORUN_BUILD_ENV HAMNIX_INSTALLER_IMG_OUT="$IMG" bash scripts/build_installer_img.sh
 fi
 [ -f "$IMG" ] || { say "FAIL: $IMG still missing after build."; exit 1; }
 
@@ -78,7 +89,12 @@ else
 fi
 
 say "media=$IMG  target=$DISK  mem=$MEM  accel=${ACCEL[*]}"
-say "inside the guest: run  /etc/install_nvme.hamsh  to install to the NVMe target."
+if [ -n "${AUTO_INSTALL:-}" ]; then
+    say "AUTO_INSTALL: this UNATTENDED medium will auto-wipe $DISK and install — no prompt."
+else
+    say "LIVE medium: the desktop comes up; to install, run the \"Install Hamnix\" launcher"
+    say "(or type  install  at a hamsh prompt) — it prompts for the disk and confirms the erase."
+fi
 
 # The installer media carries \EFI\BOOT\BOOTX64.EFI; bootindex=0 forces OVMF to
 # boot it even with the NVMe target + NIC present (otherwise -> EFI shell / PXE).

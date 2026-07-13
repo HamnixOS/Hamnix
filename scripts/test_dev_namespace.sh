@@ -60,7 +60,7 @@ fi
 
 # --- build the installer image (compiles the whole kernel) -----------
 echo "[test_dev_namespace] (1/2) Build installer image (compiles kernel)"
-bash scripts/build_installer_img.sh >/tmp/test_dev_namespace_build.log 2>&1 || {
+HAMNIX_INSTALLER_AUTORUN=1 bash scripts/build_installer_img.sh >/tmp/test_dev_namespace_build.log 2>&1 || {
     tail -30 /tmp/test_dev_namespace_build.log >&2
     verdict_inconclusive "$TAG" "installer image build failed — cannot boot the gate (toolchain/build issue, not a /dev-namespace regression)."
 }

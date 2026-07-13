@@ -86,7 +86,7 @@ fi
 echo "[build_installed_nvme] Stage A: build ESP-only installer medium + blank NVMe target"
 if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
     rm -f "$INSTALLER_IMG"
-    bash "$PROJ_ROOT/scripts/build_installer_img.sh"
+    HAMNIX_INSTALLER_AUTORUN=1 bash "$PROJ_ROOT/scripts/build_installer_img.sh"  # golden-disk build needs the unattended auto-install path
 fi
 if [ ! -f "$INSTALLER_IMG" ]; then
     echo "[build_installed_nvme] FAIL Stage A: $INSTALLER_IMG not built" >&2

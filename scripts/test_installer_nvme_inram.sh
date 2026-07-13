@@ -89,7 +89,7 @@ fi
 echo "[test_installer_nvme_inram] Stage A: build ESP-only install medium + blank NVMe target"
 if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
     rm -f "$INSTALLER_IMG"
-    bash "$PROJ_ROOT/scripts/build_installer_img.sh"
+    HAMNIX_INSTALLER_AUTORUN=1 bash "$PROJ_ROOT/scripts/build_installer_img.sh"  # E2E install regression needs the unattended auto-install path
 fi
 if [ ! -f "$INSTALLER_IMG" ]; then
     echo "[test_installer_nvme_inram] FAIL Stage A: $INSTALLER_IMG not built" >&2

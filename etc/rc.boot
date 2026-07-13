@@ -99,27 +99,44 @@ try {
 }
 if $installer_medium > 0 {
     # First-class LIVE image: the install medium is a "try before you
-    # install" environment, not an auto-wipe appliance. Decide between
-    # auto-installing and booting the live desktop by asking the installer
-    # whether a target distinct from the boot medium exists.
-    #   `install --probe` exits 0 when a real install target is present
-    #   (e.g. the keyboard-less NUC's blank NVMe) and nonzero when the only
-    #   disk IS the boot medium (e.g. a VM where the image is attached as an
-    #   ordinary virtio disk). In the latter case auto-installing would
-    #   erase the running installer (#410 self-clobber), so we boot live.
-    # try/except reacts ONLY to the LAST command, so the probe is its sole
-    # statement; a nonzero exit lands in except and clears have_target.
-    have_target = 1
+    # install" environment, NOT an auto-wipe appliance. An installer that
+    # erases whatever disk it finds the instant you attach one is a footgun —
+    # so auto-install is OPT-IN, not the default.
+    #
+    # AUTO-INSTALL is gated on the /etc/installer-autorun marker, which is
+    # planted ONLY by an unattended build (HAMNIX_INSTALLER_AUTORUN=1 —
+    # scripts/build_initramfs.py). Two legitimate consumers: the keyboard-less
+    # NUC appliance image (no one to type the command) and the CI install
+    # regressions. A normal desktop install medium carries NO such marker and
+    # ALWAYS boots the LIVE environment; there the user launches the installer
+    # explicitly ("Install Hamnix" on the desktop, or `install` at a prompt),
+    # which shows the disk menu and confirms the ERASE before touching a disk.
+    #
+    # try/except reacts ONLY to the LAST command, so each probe is the sole
+    # statement in its own try. Even in autorun mode we still `install --probe`
+    # so we never auto-install onto the boot medium itself (#410 self-clobber):
+    # exit 0 = a distinct target exists, nonzero = only the boot medium (then
+    # boot live even on an autorun medium — nothing safe to install onto).
+    autorun = 1
     try {
-        install --probe
+        cat /etc/installer-autorun
     } except {
-        have_target = 0
+        autorun = 0
+    }
+    have_target = 0
+    if $autorun > 0 {
+        have_target = 1
+        try {
+            install --probe
+        } except {
+            have_target = 0
+        }
     }
     if $have_target > 0 {
-        echo 'rc.boot: install target present -- auto-running /etc/install_nvme.hamsh'
+        echo 'rc.boot: installer-autorun + distinct target -- auto-running /etc/install_nvme.hamsh'
         source /etc/install_nvme.hamsh
     } else {
-        echo 'rc.boot: only the boot medium present -- booting LIVE environment'
+        echo 'rc.boot: booting LIVE environment (run `install` to install; auto-install is opt-in via /etc/installer-autorun)'
         # --- writable-in-RAM live root (#67) --------------------------
         # The LIVE native session's `/` is the read-only cpio embedded in
         # the kernel ELF (the kernel default namespace plants `/` -> `#r`;

@@ -63,7 +63,7 @@ fi
 
 # --- build the installer image (compiles the whole kernel) -----------
 echo "[test_proc_namespace] (1/2) Build installer image (compiles kernel)"
-bash scripts/build_installer_img.sh >/tmp/test_proc_namespace_build.log 2>&1 || {
+HAMNIX_INSTALLER_AUTORUN=1 bash scripts/build_installer_img.sh >/tmp/test_proc_namespace_build.log 2>&1 || {
     echo "[test_proc_namespace] FAIL: installer image build failed"
     tail -30 /tmp/test_proc_namespace_build.log
     exit 1

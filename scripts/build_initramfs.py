@@ -2771,6 +2771,23 @@ if os.environ.get("HAMNIX_INSTALLER_BLOB") == "1":
           f"({len(_sqfs_bytes)/(1<<20):.1f} MiB) + /etc/installer-medium "
           f"marker.", flush=True)
 
+    # UNATTENDED (auto-wipe) vs INTERACTIVE (default) install.
+    # An installer that erases whatever disk it finds the moment you attach
+    # one is a footgun — that is NOT the default. The default install medium
+    # boots the LIVE environment; the user launches the installer explicitly
+    # ("Install Hamnix" / `install` at a prompt), which prompts for the disk
+    # and confirms the ERASE. rc.boot auto-runs the unattended installer ONLY
+    # when the /etc/installer-autorun marker is present, which is planted ONLY
+    # here under HAMNIX_INSTALLER_AUTORUN=1. Two legitimate consumers set it:
+    #   * the keyboard-less NUC "appliance" image (no one to type the command)
+    #   * the CI install regressions (test_installer_nvme_inram.sh et al.)
+    # A normal desktop install image (the one a person boots) never sets it.
+    if os.environ.get("HAMNIX_INSTALLER_AUTORUN") == "1":
+        FILES.append(("/etc/installer-autorun", b"1\n"))
+        print("[build_initramfs] HAMNIX_INSTALLER_AUTORUN=1: planted "
+              "/etc/installer-autorun — this medium AUTO-INSTALLS onto the "
+              "first blank target (unattended/appliance/CI build).", flush=True)
+
     # DEBIAN-STYLE PACKAGE INSTALL: ship the native package repo IN RAM so
     # the installer can `hpm --repo=file:///iso-packages install hamnix-base`
     # onto the freshly-mkfs'd target ext4 — a real package install (not a
