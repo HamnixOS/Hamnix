@@ -76,7 +76,7 @@ for app in "${CONSUMERS[@]}"; do
 done
 
 # --- 3. Shipped .desktop files are well-formed + Exec is a real binary -
-REQUIRED=(terminal files browser calculator editor settings sysmon ham2048 installer)
+REQUIRED=(terminal files browser calculator editor control-center sysmon ham2048 installer)
 if [ ! -d "$APPS_DIR" ]; then
     failed "$APPS_DIR directory missing"
 else
