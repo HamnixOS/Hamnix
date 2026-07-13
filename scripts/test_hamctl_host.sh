@@ -31,11 +31,12 @@ echo "[ctl-host] PASS native hamctl still compiles"
 
 DUMP="$OUT/ctl_dump.txt"
 if ! "$BIN" "$OUT/ctl_appear.ppm" "$OUT/ctl_dt.ppm" "$OUT/ctl_display.ppm" \
-        "$OUT/ctl_mouse.ppm" "$OUT/ctl_kbd.ppm" "$OUT/ctl_about.ppm" >"$DUMP" 2>&1; then
+        "$OUT/ctl_mouse.ppm" "$OUT/ctl_kbd.ppm" "$OUT/ctl_sound.ppm" \
+        "$OUT/ctl_power.ppm" "$OUT/ctl_net.ppm" "$OUT/ctl_about.ppm" >"$DUMP" 2>&1; then
     echo "[ctl-host] FAIL: host harness exited non-zero"; cat "$DUMP"; exit 1
 fi
 
-for f in appear dt display mouse kbd about; do
+for f in appear dt display mouse kbd sound power net about; do
     if python3 scripts/ppm_to_png.py "$OUT/ctl_$f.ppm" "$OUT/ctl_$f.png" 2>"$OUT/ctl_png.log"; then
         echo "[ctl-host] PASS rendered $OUT/ctl_$f.png"
     else
@@ -83,6 +84,32 @@ assert_grep '^ACT_KBD 6'                            "kbd control returns ACT_KBD
 assert_grep '^KB_DELAY 550'                         "repeat delay bumped 500 -> 550ms"
 assert_grep '^KB_RATE 22'                           "repeat rate bumped 20 -> 22/s"
 assert_grep '^glyphs .*\"us\"'                      "keyboard layout read-out rendered"
+# --- Sound page (honest no-device read-out + volume/mute WIP prefs) ---
+assert_grep '^ACT_CAT_SOUND 1'                      "sidebar switched to Sound (ACT_CAT)"
+assert_grep '^glyphs .*\"Sound\"'                   "Sound heading"
+assert_grep '^glyphs .*\"No audio device\"'         "honest no-audio-device read-out"
+assert_grep '^glyphs .*\"Volume:\"'                 "Sound volume row"
+assert_grep '^ACT_SOUND 8'                          "sound control returns ACT_SOUND(8)"
+assert_grep '^SND_VOL 80'                            "volume bumped 70 -> 80"
+assert_grep '^SND_MUTE 1'                            "mute toggled off -> on"
+# --- Power & Session page (real actions + uptime/power read-out) ---
+assert_grep '^ACT_CAT_POWER 1'                      "sidebar switched to Power (ACT_CAT)"
+assert_grep '^glyphs .*\"Power & Session\"'         "Power heading"
+assert_grep '^glyphs .*\"0:12:34\"'                 "uptime read-out rendered"
+assert_grep '^glyphs .*\"AC \(no battery\)\"'       "honest AC/no-battery power source"
+assert_grep '^glyphs .*\"Lock Screen\"'             "Lock Screen action button rendered"
+assert_grep '^glyphs .*\"Reboot\"'                  "Reboot action button rendered"
+assert_grep '^ACT_LOCK 9'                           "Lock Screen returns ACT_LOCK(9)"
+assert_grep '^ACT_REBOOT 12'                        "Reboot returns ACT_REBOOT(12)"
+# --- Network page (SYS_NETCFG read-out + real SET_DNS sink) ---
+assert_grep '^ACT_CAT_NET 1'                        "sidebar switched to Network (ACT_CAT)"
+assert_grep '^glyphs .*\"Network\"'                 "Network heading"
+assert_grep '^glyphs .*\"192.168.1.50\"'            "IP address read-out rendered"
+assert_grep '^glyphs .*\"255.255.255.0\"'           "netmask read-out rendered"
+assert_grep '^glyphs .*\"dhcp\"'                    "config source (dhcp) rendered"
+assert_grep '^glyphs .*\"8.8.8.8\"'                 "DNS preset button rendered"
+assert_grep '^ACT_NET 13'                           "DNS preset returns ACT_NET(13)"
+assert_grep '^NET_DNS_PREF 1'                       "Google DNS preset latched (pref 1)"
 # --- About page ---
 assert_grep '^ACT_CAT_ABOUT 1'                      "sidebar switched to About"
 assert_grep '^ABOUT_N 7'                            "seven About facts populated"
