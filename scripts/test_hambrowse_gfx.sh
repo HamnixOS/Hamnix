@@ -109,6 +109,27 @@ fi
 assert_grep '^WROTE [0-9]{6,}'        "framebuffer written to PPM"
 assert_grep '^PIX 0 0 #ffffff'        "top-left pixel is white paper"
 
+# UNORDERED LIST as a real browser draws it: each <li> gets a round bullet DISC
+# (not a '-' glyph), and its item text HANGS at an indent so the marker sits in
+# its own gutter instead of gluing to the text. The fixture's <ul> has 3 items.
+assert_grep '^LIST markers 3 '        "three <li> bullet-disc markers rendered"
+# The first bullet disc is actually inked (a dark pixel at its centre), not the
+# white paper — proving a real disc was painted, not an empty gutter.
+if awk '/^LIST /{ for(i=1;i<=NF;i++) if($i=="discpix"){ c=$(i+1); sub(/^#/,"",c);
+          v=strtonum("0x" c); if(v < 0x808080) ok=1 } } END{ exit(ok?0:1) }' "$DUMP"; then
+    echo "[hb-gfx] PASS bullet disc is inked (dark centre pixel, not white paper)"
+else
+    echo "[hb-gfx] FAIL bullet disc centre is not inked"; fail=1
+fi
+# The list item text hangs at a real indent (well past the 8px left pad), i.e.
+# the marker gutter survived the proportional reflow (no '-Ship' gluing).
+if awk '/^LIST /{ for(i=1;i<=NF;i++) if($i=="itemx" && $(i+1)+0 >= 40) ok=1 }
+        END{ exit(ok?0:1) }' "$DUMP"; then
+    echo "[hb-gfx] PASS list item text hangs indented (>=40px, marker gutter kept)"
+else
+    echo "[hb-gfx] FAIL list item text not indented — gutter collapsed"; fail=1
+fi
+
 # Sanity: the CSS page renders too (centered heading via text-align).
 CSS="tests/fixtures/hambrowse_css.html"
 if "$BIN" "$CSS" "$OUT/gfx_css.ppm" 640 >"$OUT/gfx_css_dump.txt" 2>&1 \
