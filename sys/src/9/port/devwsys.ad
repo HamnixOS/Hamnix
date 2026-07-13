@@ -556,6 +556,7 @@ def wsys_free_wid(wid: int32) -> int32:
     # to the buddy allocator so a closed window costs ~0 again.
     _wsys_layer_fb_release(wid)
     _wsys_backbuffer_release(wid)
+    _wsys_img_release_wid(wid)                          # #128 named images
     return 0
 
 
@@ -1997,6 +1998,12 @@ def devwsys_draw_ctl_write(wid: int32, buf: Ptr[uint8],
     # text verbs (mklayer / setz / clear / rmlayer / ls) never start
     # with one of those bytes, so this gate cannot misfire on the
     # existing markup path.
+    # #128: the 'I' (image-store) verb is accepted at ANY protocol version
+    # so a legacy scene client can drop in a named image without converting
+    # its whole window to the v2 backbuffer. No legacy text verb starts with
+    # 'I' (mklayer/rmlayer/clear/setz/ls), so this cannot misfire.
+    if buf[0] == 73:                                   # 'I'
+        return _wsys_blit_parse(wid, buf, count)
     if wsys_win_version_get(wid) >= 2:
         c0: uint8 = buf[0]
         if c0 == 66 or c0 == 68 or c0 == 67:           # 'B' / 'D' / 'C'
@@ -6472,6 +6479,220 @@ def wsys_backbuffer_dims_h() -> uint64:
     return WSYS_BB_H
 
 
+# ====================================================================
+# #128 SCENE IMAGE TIER — named per-window raster images.
+#
+# A scene client that wants a REAL image (a decoded PNG/JPEG, a photo, an
+# icon that isn't expressible as fill/line primitives) can now do it without
+# converting its whole window to the v2 blit backbuffer. The shape is
+# FILE-REF + format tag, kept Plan-9-shape (everything through the window's
+# own file server, no global pixel buffer in the kernel beyond this small
+# named store):
+#
+#   1. the client DECODES the image in USERLAND (lib/png.ad etc. — the
+#      kernel deliberately does NOT link a PNG/inflate decoder into the
+#      present path) and UPLOADS the raw pixels to its window via a binary
+#      'I' verb on /dev/wsys/<wid>/draw/ctl:
+#          'I' <namelen:u8> <name...> <w:i32le> <h:i32le> <fmt:u8> <pixels>
+#      naming the image (a bareword, e.g. "logo"). fmt is a WSYS_BLIT_FMT_*;
+#      the store normalizes everything to RGBA8888. Re-uploading the same
+#      name replaces it.
+#   2. the client references it from its scene display list with the
+#      `image x y w h NAME` verb (lib/hamscene.ad's hamscene_image). The
+#      compositor (this file) looks the name up in the window's store and
+#      blits it into (x,y,w,h), nearest-neighbor scaled, alpha-composited
+#      and clipped by the existing scene clip machinery.
+#
+# WHY raw-upload not kernel-decode: the compositor rasterizes on the present
+# path (IRQ-masked, no sleeping); a full DEFLATE/PNG decoder there (~2.4 MiB
+# of decoder BSS + heavy CPU) is the wrong place. Userland already owns the
+# decoders (hamview/hambrowse). This mirrors the v2 backbuffer 'B' path,
+# which is also raw-pixel upload — but keyed by NAME and decoupled from the
+# full-window backbuffer so a legacy scene client drops in one image.
+#
+# Storage: WSYS_IMG_SLOTS global slots, each backed by a lazily-allocated
+# 256 KiB page block (256x256 RGBA ceiling), keyed by (owning wid, name).
+# Freed when the owning window closes.
+WSYS_IMG_SLOTS:    uint64 = 16
+WSYS_IMG_MAX_W:    int64  = 256
+WSYS_IMG_MAX_H:    int64  = 256
+WSYS_IMG_BYTES:    uint64 = 262144      # 256*256*4
+WSYS_IMG_ORDER:    int32  = 6           # 64 pages = 256 KiB >= WSYS_IMG_BYTES
+WSYS_IMG_NAME_CAP: uint64 = 32          # incl. NUL; max 31 name bytes
+
+wsys_img_wid:  Array[16, int32]         # owning wid; 0 = free slot
+wsys_img_name: Array[512, uint8]        # 16 slots * 32 bytes, NUL-terminated
+wsys_img_w:    Array[16, int32]
+wsys_img_h:    Array[16, int32]
+wsys_img_page: Array[16, uint64]        # lazily-alloc'd RGBA8888 pixels
+
+
+def _wsys_img_name_eq(slot: uint64, buf: Ptr[uint8], ns: uint64,
+                      ne: uint64) -> int32:
+    # 1 iff slot's stored name equals buf[ns..ne).
+    nb: uint64 = slot * WSYS_IMG_NAME_CAP
+    k: uint64 = ns
+    j: uint64 = nb
+    while k < ne:
+        if wsys_img_name[j] == 0:
+            return 0
+        if wsys_img_name[j] != buf[k]:
+            return 0
+        k = k + 1
+        j = j + 1
+    if wsys_img_name[j] != 0:                # stored name is longer
+        return 0
+    return 1
+
+
+def _wsys_img_find(wid: int32, buf: Ptr[uint8], ns: uint64,
+                   ne: uint64) -> int32:
+    # Slot index for (wid, name) or -1. Empty name never matches.
+    if ns >= ne:
+        return -1
+    s: uint64 = 0
+    while s < WSYS_IMG_SLOTS:
+        if wsys_img_wid[s] == wid and _wsys_img_name_eq(s, buf, ns, ne) == 1:
+            return cast[int32](s)
+        s = s + 1
+    return -1
+
+
+def _wsys_img_release_wid(wid: int32):
+    # Free every image slot owned by wid (called on window teardown).
+    if wid <= 0:
+        return
+    s: uint64 = 0
+    while s < WSYS_IMG_SLOTS:
+        if wsys_img_wid[s] == wid:
+            if wsys_img_page[s] != 0:
+                free_pages(wsys_img_page[s], WSYS_IMG_ORDER)
+                wsys_img_page[s] = 0
+            wsys_img_wid[s] = 0
+            wsys_img_name[s * WSYS_IMG_NAME_CAP] = 0
+            wsys_img_w[s] = 0
+            wsys_img_h[s] = 0
+        s = s + 1
+
+
+def _wsys_img_store(wid: int32, name: Ptr[uint8], nlen: uint64,
+                    iw: int32, ih: int32, fmt: uint8,
+                    pixels: Ptr[uint8]) -> int32:
+    # Store (wid, name) -> iw x ih RGBA8888 image, converting from `fmt`.
+    # Reuses an existing (wid,name) slot or the first free slot. 1 on ok.
+    if nlen == 0 or nlen >= WSYS_IMG_NAME_CAP:
+        return 0
+    if iw <= 0 or ih <= 0:
+        return 0
+    if cast[int64](iw) > WSYS_IMG_MAX_W or cast[int64](ih) > WSYS_IMG_MAX_H:
+        return 0
+    bpp: uint64 = _wsys_blit_fmt_bpp(fmt)
+    if bpp == 0:
+        return 0
+    # Locate the target slot: existing (wid,name), else first free.
+    slot: int32 = _wsys_img_find(wid, name, 0, nlen)
+    if slot < 0:
+        s: uint64 = 0
+        while s < WSYS_IMG_SLOTS:
+            if wsys_img_wid[s] == 0:
+                slot = cast[int32](s)
+                s = WSYS_IMG_SLOTS
+            else:
+                s = s + 1
+    if slot < 0:
+        return 0                                # store full
+    u: uint64 = cast[uint64](slot)
+    if wsys_img_page[u] == 0:
+        pg: uint64 = alloc_pages(WSYS_IMG_ORDER)
+        if pg == 0:
+            return 0
+        wsys_img_page[u] = pg
+    dst: Ptr[uint8] = cast[Ptr[uint8]](wsys_img_page[u])
+    # Copy the name (NUL-terminated).
+    nb: uint64 = u * WSYS_IMG_NAME_CAP
+    k: uint64 = 0
+    while k < nlen:
+        wsys_img_name[nb + k] = name[k]
+        k = k + 1
+    wsys_img_name[nb + nlen] = 0
+    wsys_img_wid[u] = wid
+    wsys_img_w[u] = iw
+    wsys_img_h[u] = ih
+    # Normalize pixels to RGBA8888.
+    npx: uint64 = cast[uint64](iw) * cast[uint64](ih)
+    i: uint64 = 0
+    while i < npx:
+        soff: uint64 = i * bpp
+        doff: uint64 = i * 4
+        r: uint8 = 0
+        g: uint8 = 0
+        b: uint8 = 0
+        a: uint8 = 255
+        if fmt == WSYS_BLIT_FMT_RGBA8888:
+            r = pixels[soff]
+            g = pixels[soff + 1]
+            b = pixels[soff + 2]
+            a = pixels[soff + 3]
+        else:
+            if fmt == WSYS_BLIT_FMT_BGRA8888:
+                b = pixels[soff]
+                g = pixels[soff + 1]
+                r = pixels[soff + 2]
+                a = pixels[soff + 3]
+            else:
+                a8: uint8 = pixels[soff]        # A8 -> white * alpha
+                r = a8
+                g = a8
+                b = a8
+                a = a8
+        dst[doff]     = r
+        dst[doff + 1] = g
+        dst[doff + 2] = b
+        dst[doff + 3] = a
+        i = i + 1
+    return 1
+
+
+def _wsys_cache_blit_image(cache: Ptr[uint8], slot: int32, dx: int64,
+                           dy: int64, dw: int64, dh: int64):
+    # Blit image `slot`'s RGBA8888 pixels into rect (dx,dy,dw,dh) of the
+    # window cache, nearest-neighbor scaled. dw/dh <= 0 -> natural size.
+    # Alpha-composited + clipped via _wsys_cache_putpixel.
+    u: uint64 = cast[uint64](slot)
+    if u >= WSYS_IMG_SLOTS:
+        return
+    src: Ptr[uint8] = cast[Ptr[uint8]](wsys_img_page[u])
+    if cast[uint64](src) == 0:
+        return
+    sw: int64 = cast[int64](wsys_img_w[u])
+    sh: int64 = cast[int64](wsys_img_h[u])
+    if sw <= 0 or sh <= 0:
+        return
+    tw: int64 = dw
+    th: int64 = dh
+    if tw <= 0:
+        tw = sw
+    if th <= 0:
+        th = sh
+    yy: int64 = 0
+    while yy < th:
+        sy: int64 = yy * sh / th
+        if sy >= sh:
+            sy = sh - 1
+        xx: int64 = 0
+        while xx < tw:
+            sx: int64 = xx * sw / tw
+            if sx >= sw:
+                sx = sw - 1
+            soff: uint64 = (cast[uint64](sy) * cast[uint64](sw)
+                            + cast[uint64](sx)) * 4
+            _wsys_cache_putpixel(cache, dx + xx, dy + yy,
+                                 src[soff], src[soff + 1],
+                                 src[soff + 2], src[soff + 3])
+            xx = xx + 1
+        yy = yy + 1
+
+
 def wsys_backbuffer_stride() -> uint64:
     return WSYS_BB_STRIDE_BYTES
 
@@ -6856,6 +7077,42 @@ def _wsys_blit_parse(wid: int32, buf: Ptr[uint8], count: uint64) -> int64:
             return -1
         _wsys_cursor_store(wid, chx, chy, cw_, ch_, cfmt, &buf[18])
         return cast[int64](18 + cpix)
+
+    # 'I' <namelen:u8> <name...> <w:i32le> <h:i32le> <fmt:u8> <pixels> —
+    # #128 named image store. Header = 2 + namelen + 9 bytes.
+    if verb == 73:                                     # 'I'
+        if count < 2:
+            set_current_errstr("/dev/wsys/draw/ctl: short I header")
+            return -1
+        nlen: uint64 = cast[uint64](buf[1])
+        if nlen == 0 or nlen >= WSYS_IMG_NAME_CAP:
+            set_current_errstr("/dev/wsys/draw/ctl: I bad name len")
+            return -1
+        hdr: uint64 = 2 + nlen + 9
+        if count < hdr:
+            set_current_errstr("/dev/wsys/draw/ctl: short I header")
+            return -1
+        iw: int32 = _wsys_blit_read_i32_le(buf, 2 + nlen)
+        ih: int32 = _wsys_blit_read_i32_le(buf, 2 + nlen + 4)
+        ifmt: uint8 = buf[2 + nlen + 8]
+        if iw <= 0 or ih <= 0:
+            set_current_errstr("/dev/wsys/draw/ctl: I empty image")
+            return -1
+        if cast[int64](iw) > WSYS_IMG_MAX_W or cast[int64](ih) > WSYS_IMG_MAX_H:
+            set_current_errstr("/dev/wsys/draw/ctl: I image too large")
+            return -1
+        ibpp: uint64 = _wsys_blit_fmt_bpp(ifmt)
+        if ibpp == 0:
+            set_current_errstr("/dev/wsys/draw/ctl: I bad fmt")
+            return -1
+        ipix: uint64 = cast[uint64](iw) * cast[uint64](ih) * ibpp
+        if count < hdr + ipix:
+            set_current_errstr("/dev/wsys/draw/ctl: I short payload")
+            return -1
+        if _wsys_img_store(wid, &buf[2], nlen, iw, ih, ifmt, &buf[hdr]) == 0:
+            set_current_errstr("/dev/wsys/draw/ctl: I store failed")
+            return -1
+        return cast[int64](hdr + ipix)
 
     set_current_errstr("/dev/wsys/draw/ctl: unknown blit verb")
     return -1
@@ -8245,8 +8502,31 @@ def _wsys_rast_line(cache: Ptr[uint8], buf: Ptr[uint8],
             yy = yy + 1
         return
 
-    # image / tiles — Bitmap tier, parse-and-ignore gracefully.
+    # #128 image tier: `image x y w h NAME` — blit the named per-window
+    # image (uploaded via the draw/ctl 'I' verb) into (x,y,w,h), nearest-
+    # neighbor scaled + alpha-composited + clipped. Unknown NAME is a no-op
+    # (forward-compatible: a scene may reference an image not yet uploaded).
     if _wsys_ctl_word_eq(buf, vs, ve, "image") == 1:
+        ix: int64 = 0
+        iy: int64 = 0
+        iw2: int64 = 0
+        ih2: int64 = 0
+        if _wsys_scene_next_int(buf, &p, le, &ix) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &iy) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &iw2) == 0:
+            return
+        if _wsys_scene_next_int(buf, &p, le, &ih2) == 0:
+            return
+        np: uint64 = _wsys_ctl_skip_ws(buf, p, le)
+        ne: uint64 = _wsys_ctl_token_end(buf, np, le)
+        if np >= ne:
+            return
+        slot: int32 = _wsys_img_find(_wsys_rast_wid, buf, np, ne)
+        if slot < 0:
+            return
+        _wsys_cache_blit_image(cache, slot, ix, iy, iw2, ih2)
         return
     if _wsys_ctl_word_eq(buf, vs, ve, "damage") == 1:
         return
