@@ -69,7 +69,7 @@ FILES = [
 # /home/live/Documents). New ext4-backed users get the same subdirs from
 # useradd's make_home_skel() (`#<name>/Desktop` ...). KISS: an empty
 # `.keep` byte stream is enough to make the directory enumerable.
-for _home_sub in ("Desktop", "Documents", "Downloads", "Pictures"):
+for _home_sub in ("Desktop", "Documents", "Downloads", "Pictures", "Notes"):
     FILES.append((f"/home/live/{_home_sub}/.keep", b""))
 # A friendly starter note so /home/live/Documents isn't bare on the live
 # image (also gives the editor's Open picker something to load).
