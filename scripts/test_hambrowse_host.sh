@@ -731,6 +731,63 @@ assert_grepF '^NAV \?term=dogs&lang=en$' \
     "$OUT/forms_after_submit2.txt"
 
 # ====================================================================
+# FORMS DEPTH — radio-group exclusivity, JS `select.selectedIndex = N` writes,
+# and a submit that gathers EVERY control kind (text + select + checkbox +
+# checked radio). tests/fixtures/hambrowse_forms2.html exercises all three.
+# ====================================================================
+FIXG="tests/fixtures/hambrowse_forms2.html"
+run_forms2() { "$BIN" "$FIXG" 600 "$@"; }
+
+# ---- (0) initial render: the "plan" group shows free checked, pro empty ---
+DUMPG="$OUT/dump_forms2.txt"
+echo "[hb-host] rendering $FIXG ..."
+if ! run_forms2 >"$DUMPG" 2>&1; then
+    echo "[hb-host] FAIL: forms2 harness exited non-zero"; cat "$DUMPG"; exit 1
+fi
+cat "$DUMPG"
+assert_grepG() {
+    local pat="$1" msg="$2" file="${3:-$DUMPG}"
+    if grep -Eq -- "$pat" "$file"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+assert_grepG '^FLOW  Plan: \(\*\) free$' "radio group: 'free' starts checked (*)"
+assert_grepG '^FLOW  \( \) pro$'         "radio group: 'pro' starts unchecked ( )"
+assert_grepG '^FLOW  Lang: \[ fr v\]$'   "select renders the source-selected option (fr)"
+
+# ---- (1) radio-group exclusivity: checking 'pro' unchecks 'free' ----------
+DUMPG1="$OUT/dump_forms2_radio.txt"
+run_forms2 check pp 1 >"$DUMPG1" 2>&1
+cat "$DUMPG1"
+awk '/^CHECK/{c=1} c' "$DUMPG1" > "$OUT/forms2_after_radio.txt"
+assert_grepG '^FLOW  \(\*\) pro$' \
+    "checking 'pro' renders it selected (*)" "$OUT/forms2_after_radio.txt"
+assert_grepG '^FLOW  Plan: \( \) free$' \
+    "radio-group exclusivity: 'free' was auto-unchecked ( )" "$OUT/forms2_after_radio.txt"
+assert_grepG '^FLOW  plan is pro$' \
+    "only the newly-checked radio fired onchange (status = pro)" "$OUT/forms2_after_radio.txt"
+
+# ---- (2) select.selectedIndex = 2 write re-renders + reads back -----------
+DUMPG2="$OUT/dump_forms2_select.txt"
+run_forms2 click pickde >"$DUMPG2" 2>&1
+cat "$DUMPG2"
+awk '/^CLICK/{c=1} c' "$DUMPG2" > "$OUT/forms2_after_select.txt"
+assert_grepG '^FLOW  Lang: \[ de v\]$' \
+    "JS select.selectedIndex=2 re-renders the third option (de)" \
+    "$OUT/forms2_after_select.txt"
+
+# ---- (3) submit gathers text + select + checkbox + the checked radio ------
+DUMPG3="$OUT/dump_forms2_submit.txt"
+run_forms2 submit f3 >"$DUMPG3" 2>&1
+cat "$DUMPG3"
+awk '/^SUBMIT/{c=1} c' "$DUMPG3" > "$OUT/forms2_after_submit.txt"
+assert_grepG '^NAV \?user=ada&tier=gold&news=yes&col=blue$' \
+    "submit gathers every field=value (select=gold, checkbox=yes, checked radio col=blue)" \
+    "$OUT/forms2_after_submit.txt"
+
+# ====================================================================
 # DEFAULT UA STYLESHEET (visual-polish) rung — a PLAIN page (no author CSS)
 # should already look intentional: a readable centred measure on wide windows,
 # section spacing above headings, a light code-block/inline-code background,
