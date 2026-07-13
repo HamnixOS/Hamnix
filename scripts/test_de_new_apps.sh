@@ -61,7 +61,11 @@ for app in haminstallui hamsettings hammonscene; do
 done
 
 # Applications menu (hampanelscene) launches each new app.
-for prog in haminstallui hamsettings hammonscene; do
+# NOTE: hamsettings is intentionally DELISTED — the legacy "Settings" app
+# duplicated the Control Center (/bin/hamctl) Appearance/wallpaper capplet, so
+# it was removed from the menu, desktop icons and .desktop entries. Its source
+# still compiles and ships (checked above); it is just no longer launchable.
+for prog in haminstallui hammonscene; do
     if grep -q "/bin/${prog}" user/hampanelscene.ad; then
         passed "$prog wired into the Applications menu"
     else
@@ -70,7 +74,7 @@ for prog in haminstallui hamsettings hammonscene; do
 done
 
 # Desktop icons reference each new app.
-for prog in haminstallui hamsettings hammonscene; do
+for prog in haminstallui hammonscene; do
     if grep -q "/bin/${prog}" etc/desktop.icons; then
         passed "$prog has a desktop icon"
     else
