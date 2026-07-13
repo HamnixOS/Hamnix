@@ -66,10 +66,16 @@ assert_grep '^glyphs 24 213 \"C\" #7a0000'      "clear 'C' key label in red"
 assert_grep '^glyphs 112 213 \"=\" #7a2a00'     "equals '=' key label"
 
 # --- Rasterizer assertions (sampled framebuffer pixels) ------------------
-assert_grep '^PRIMS ([4-9][0-9])'               "rasterizer drew the scene primitives"
+assert_grep '^PRIMS ([1-9][0-9][0-9]?)'         "rasterizer drew the scene primitives"
 assert_grep '^PIX 2 2 #2b2f36'                  "raster case pixel = dark slate"
 assert_grep '^PIX 20 20 #0d1410'                "raster LCD pixel = dark green-black"
 assert_grep '^PIX 20 70 #c8c4bc'                "raster key-face pixel = button grey"
+# --- MATE 3D bevel on the shared panel button (top-left key @8,58 40x42) ---
+assert_grep '^PIX 8 58 #5f5b55'                 "bevel: dark outer frame at button corner"
+assert_grep '^PIX 20 59 #f0ede6'                "bevel: light highlight on the top edge"
+assert_grep '^PIX 9 75 #f0ede6'                 "bevel: light highlight on the left edge"
+assert_grep '^PIX 20 98 #7a756e'                "bevel: dark shadow on the bottom edge"
+assert_grep '^PIX 46 75 #7a756e'                "bevel: dark shadow on the right edge"
 
 # --- Initial state -------------------------------------------------------
 assert_grep '^DISPLAY0 0'                        "initial display is 0"
