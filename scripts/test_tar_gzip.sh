@@ -66,7 +66,7 @@ LOG=$(mktemp /tmp/test-tar-gzip.XXXXXX.log)
 trap '[ "${TG_KEEP_LOG:-0}" = 1 ] || rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
 
 set +e
-qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 300 \
     -- "echo TG_START"                                          2 \
        "cd /tmp"                                                2 \
        "echo hello-from-f1 > /tmp/f1"                           2 \
@@ -89,12 +89,20 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
        "echo TG_GUNZIP_OWN_DONE"                                2 \
        "gunzip -c /tests/realgz/known.txt.gz"                   3 \
        "echo TG_GUNZIP_REAL_DONE"                               2 \
+       "tar -tzf /tests/realgz/tree.tar.gz"                     3 \
+       "echo TG_TARGZ_LISTED"                                   2 \
+       "mkdir /tmp/gzex"                                        2 \
+       "tar -xzf /tests/realgz/tree.tar.gz -C /tmp/gzex"        3 \
+       "echo TG_TARGZ_EXTRACTED"                                2 \
+       "cat /tmp/gzex/tgtree/a.txt"                             2 \
+       "cat /tmp/gzex/tgtree/sub/b.txt"                         2 \
+       "echo TG_TARGZ_CAT_DONE"                                 2 \
        "exit"                                                   2
 rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_tar_gzip] --- captured (relevant lines) ---"
-grep -E 'TG_|hello-from-f1|second-file-2|^f1$|^f2$|quick brown fox|tar:|gzip:|gunzip:' "$LOG" || true
+grep -E 'TG_|hello-from-f1|second-file-2|^f1$|^f2$|quick brown fox|gz-member-one|gz-member-two|tgtree|tar:|gzip:|gunzip:' "$LOG" || true
 echo "[test_tar_gzip] --- end ---"
 
 fail=0
@@ -150,6 +158,28 @@ if echo "$real_block" | grep -F -q "quick brown fox"; then
     echo "[test_tar_gzip] OK: gunzip decoded a real host-gzip (Huffman) stream"
 else
     echo "[test_tar_gzip] FAIL: gunzip could not decode the host .gz fixture"
+    fail=1
+fi
+
+# 6. `tar -tzf` lists a REAL Python-tarfile .tar.gz (differential vs the
+#    stdlib tar writer): both members must appear.
+tgz_list=$(sed -n '/TG_GUNZIP_REAL_DONE/,/TG_TARGZ_LISTED/p' "$LOG")
+if echo "$tgz_list" | grep -F -q "tgtree/a.txt" \
+   && echo "$tgz_list" | grep -F -q "tgtree/sub/b.txt"; then
+    echo "[test_tar_gzip] OK: tar -tzf listed both members of a real .tar.gz"
+else
+    echo "[test_tar_gzip] FAIL: tar -tzf did not list the real .tar.gz members"
+    fail=1
+fi
+
+# 7. `tar -xzf ... -C DIR` extracts the same .tar.gz and the member
+#    bytes round-trip through inflate + nested mkdir + -C prefixing.
+tgz_cat=$(sed -n '/TG_TARGZ_EXTRACTED/,/TG_TARGZ_CAT_DONE/p' "$LOG")
+if echo "$tgz_cat" | grep -F -q "gz-member-one-payload" \
+   && echo "$tgz_cat" | grep -F -q "gz-member-two-payload"; then
+    echo "[test_tar_gzip] OK: tar -xzf -C extracted a real .tar.gz, bytes match"
+else
+    echo "[test_tar_gzip] FAIL: tar -xzf -C did not reproduce the .tar.gz members"
     fail=1
 fi
 

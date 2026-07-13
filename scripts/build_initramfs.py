@@ -279,6 +279,23 @@ if os.environ.get("ENABLE_TAR_GZIP_FIXTURE") == "1":
     FILES.append(("/tests/realgz/known.txt", _realgz_plain))
     FILES.append(("/tests/realgz/known.txt.gz", _realgz_bytes))
 
+    # A REAL .tar.gz produced by Python's stdlib tar+gzip (POSIX/ustar
+    # headers, dynamic-Huffman DEFLATE) — the differential-vs-standard-tar
+    # artifact for the native `tar -tzf` / `-xzf` read path. Two files
+    # under a subdir so extraction exercises mkdir + nested member paths.
+    import io as _io_mod
+    import tarfile as _tar_mod
+    _tg_f1 = b"gz-member-one-payload\n"
+    _tg_f2 = b"gz-member-two-payload\n"
+    _tbuf = _io_mod.BytesIO()
+    with _tar_mod.open(fileobj=_tbuf, mode="w", format=_tar_mod.USTAR_FORMAT) as _tf:
+        for _nm, _data in (("tgtree/a.txt", _tg_f1), ("tgtree/sub/b.txt", _tg_f2)):
+            _ti = _tar_mod.TarInfo(_nm)
+            _ti.size = len(_data)
+            _tf.addfile(_ti, _io_mod.BytesIO(_data))
+    _realtar_gz = _gzip_mod.compress(_tbuf.getvalue(), compresslevel=9)
+    FILES.append(("/tests/realgz/tree.tar.gz", _realtar_gz))
+
 # M16.102 TCP three-way-handshake smoke (10.0.2.100:7 echo via
 # SLIRP `guestfwd=tcp:10.0.2.100:7-cmd:cat`). Gated the same way as
 # /etc/tcp-ring-test below: without the matching guestfwd the connect
