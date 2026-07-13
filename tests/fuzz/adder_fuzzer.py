@@ -644,6 +644,7 @@ class Program:
                                               # deep-idle/two-gap/call-gap/used-in-loop
         self._gen_short_circuit_traffic(env)  # logical and/or short-circuit
         self._gen_chained_compare_traffic(env)  # Python chained comparisons (a<b<c)
+        self._gen_chained_compare_branch_traffic(env)  # chain in if-branch (#121, --opt cmp+jcc)
         self._gen_bool_xor_traffic(env)         # #114: (a<0)!=(b<0) paren'd-compare XOR
         self._gen_cmpjcc_traffic(env)         # cmp; jcc branch-condition lever (--opt)
         self._gen_helper_calls(env)
@@ -2169,6 +2170,57 @@ class Program:
                     res = 0
                     break
             self._fold_value(f"cast[uint64]({src})", U64.wrap(res))
+
+    def _gen_chained_compare_branch_traffic(self, env):
+        """Emit Python-style CHAINED comparisons `a OP0 b OP1 c [...]` as the
+        CONDITION of an `if`/`else` (and a negated `if not (...)`), so the chain
+        feeds a CONDITIONAL BRANCH rather than materializing a boolean.
+
+        Regression for issue #121: under --opt the cmp+jcc branch lever
+        (codegen.ad gen_branch_if_false -> cmpjcc_node_ok) saw the chain's OUTER
+        relational op and emitted `cmp; jcc` for the NAIVE nested form
+        `(a OP0 b) OP1 c` — comparing the 0/1 boolean of `a OP0 b` against `c` —
+        instead of routing the whole node to gen_chained_compare. The bug was
+        BRANCH-ONLY: _gen_chained_compare_traffic folds the chain as a VALUE
+        (gen_expr's chain_is fires first, always correct) and so never exposed
+        it. This generator puts the identical chain in branch position, where
+        the --opt lever is armed, so opt vs no-opt (and the oracle) disagree on
+        any regression.
+
+        Same left-associative operand construction as _gen_chained_compare_traffic
+        (each operand a pure Gen.expr()), with the Python chained AND semantics
+        computed by construction. Result folds into g_accum via a reused local.
+        Byte-identical rng stream in subset and default mode."""
+        rng = self.rng
+        OPS = ["<", "<=", ">", ">=", "==", "!="]
+        self.emit("    ccb_r: uint64 = cast[uint64](0)")
+        for _ in range(rng.randint(3, 6)):
+            g = Gen(rng, env)
+            nlinks = rng.randint(2, 4)                 # 2..4 ops => 3..5 operands
+            operands = [g.expr(2) for _ in range(nlinks + 1)]
+            ops = [rng.choice(OPS) for _ in range(nlinks)]
+            parts = [operands[0].src]
+            for i in range(nlinks):
+                parts.append(ops[i])
+                parts.append(operands[i + 1].src)
+            src = " ".join(parts)
+            res = 1
+            for i in range(nlinks):
+                if not eval_cmp(operands[i], operands[i + 1], ops[i]):
+                    res = 0
+                    break
+            # (1) plain if/else over the chain -> gen_branch_if_false lever.
+            self.emit(f"    if {src}:")
+            self.emit(f"        ccb_r = cast[uint64](7)")
+            self.emit(f"    else:")
+            self.emit(f"        ccb_r = cast[uint64](11)")
+            self._fold_value("ccb_r", U64.wrap(7 if res else 11))
+            # (2) negated `if not (chain)` -> exercises the not-of-chain path.
+            self.emit(f"    if not ({src}):")
+            self.emit(f"        ccb_r = cast[uint64](13)")
+            self.emit(f"    else:")
+            self.emit(f"        ccb_r = cast[uint64](17)")
+            self._fold_value("ccb_r", U64.wrap(13 if not res else 17))
 
     # ---- boolean XOR / equality of two PARENTHESISED comparisons -------------
     def _gen_bool_xor_traffic(self, env):

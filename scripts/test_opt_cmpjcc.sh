@@ -313,6 +313,45 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
 """
 check_value("cmpjcc_forrange", FR, u64(sum(range(9))))
 
+# ===========================================================================
+# (#121) CHAINED COMPARISON IN BRANCH POSITION must NOT be treated as a plain
+#     comparison by the cmp+jcc lever. `a < b < c` parses as
+#     BinaryExpr(<, BinaryExpr(<, a, b), c) whose OUTER op is relational, so
+#     cmpjcc_node_ok used to accept it and emit `cmp; jcc` for the NAIVE nested
+#     `(a<b) < c` (comparing the 0/1 boolean of `a<b` against `c`) instead of
+#     the Python chain `(a<b) and (b<c)`. The fix makes cmpjcc_node_ok refuse a
+#     chain (chain_is), so the branch falls back to gen_expr -> gen_chained_compare.
+#     Assertion: ON == OFF == reference for the true AND false chain outcomes.
+#     The lever must NOT fire on the chain node itself (expect_fire=False): a
+#     regression that DOES fire is exactly the miscompile. We pick operand values
+#     so the naive `(a<b) < c` interpretation gives a DIFFERENT boolean than the
+#     chain — otherwise the bug would be invisible.
+def chain_case(name, a, b, c, op0, op1):
+    src = PRELUDE + f"""
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    a: int64 = cast[int64]({a})
+    b: int64 = cast[int64]({b})
+    c: int64 = cast[int64]({c})
+    r: uint64 = cast[uint64](0)
+    if a {op0} b {op1} c:
+        r = cast[uint64](7)
+    else:
+        r = cast[uint64](11)
+    print_u64(r)
+    return cast[int32](r & cast[uint64](255))
+"""
+    chain = (eval(f"{a} {op0} {b}") and eval(f"{b} {op1} {c}"))
+    check_value(name, src, u64(7 if chain else 11), expect_fire=False)
+
+# a<b<c with b>c: chain FALSE (3<9 True, 9<7 False) but naive (3<9)<7 = 1<7 TRUE.
+chain_case("cmpjcc_chain_false", 3, 9, 7, "<", "<")
+# a<b<c all ordered: chain TRUE.
+chain_case("cmpjcc_chain_true", 3, 5, 7, "<", "<")
+# mixed ops, chain FALSE in the second link.
+chain_case("cmpjcc_chain_le_lt", 5, 5, 5, "<=", "<")
+# descending chain a>b>c TRUE; naive (7>5)>3 = 1>3 FALSE — divergent shapes.
+chain_case("cmpjcc_chain_gt", 7, 5, 3, ">", ">")
+
 print()
 if fails:
     print(f"test_opt_cmpjcc: FAIL ({fails} failure(s))")
