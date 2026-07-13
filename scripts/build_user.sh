@@ -290,6 +290,7 @@ build_adder_user hamsettings          # scene-file DE settings: wallpaper swatch
 build_adder_user hammonscene          # scene-file DE system monitor: uptime + memory bar + /proc/tasks process list (ported from hammon)
 build_adder_user hamcalscene          # scene-file DE calendar: month grid with prev/next + today highlight, real clock (lib/hamcalcore, dual-target)
 build_adder_user hamnotesscene        # scene-file DE Notes scratchpad: keyboard text entry, auto-persists /tmp/hamnix-notes.txt (lib/hamnotescore, dual-target)
+build_adder_user hamlogscene          # scene-file DE Log Viewer: tails /proc/kmsg into a scrollable ring, page/tail/wheel scroll (lib/hamlogcore, dual-target)
 build_adder_user umdf_host            # Track 4: user-mode driver host — loads a stock .ko in USERLAND via the UMDF kernel primitives
 
 # --- X11 server + client (user/x11/ subdirectory) -------------------

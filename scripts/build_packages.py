@@ -692,6 +692,8 @@ DESKTOP_APP_PACKAGES: list[dict] = [
      "summary": "monthly calendar"},
     {"name": "hamnix-hamnotes", "bins": ("hamnotesscene",),
      "summary": "sticky-note scratchpad"},
+    {"name": "hamnix-hamlog", "bins": ("hamlogscene",),
+     "summary": "kernel log viewer"},
     {"name": "hamnix-hamsettings", "bins": ("hamsettings", "hamabout"),
      "summary": "settings + about dialog"},
     {"name": "hamnix-haminstallui", "bins": ("haminstallui",),
