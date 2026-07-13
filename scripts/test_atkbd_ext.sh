@@ -36,8 +36,9 @@
 #  11. F5 -> ESC [ 1 5 ~
 #  12. extended-form right Ctrl + 'c' -> 0x03, release clears state
 #
-# PASS criterion: "atkbd: self-test PASS (25 cases)" appears in the
-# serial log (25 == total expect_byte calls across the 12 scenarios).
+# PASS criterion: "atkbd: self-test PASS (46 cases)" appears in the
+# serial log (46 == total expect_byte calls across the scenarios,
+# incl. the Ctrl+Alt+Left/Right and Ctrl+Alt+T MATE chords).
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -81,10 +82,10 @@ grep -E "atkbd:" "$LOG" || true
 echo "[test_atkbd_ext] --- end ---"
 
 fail=0
-# The exact expected banner. The "25 cases" is derived from the
+# The exact expected banner. The "46 cases" is derived from the
 # number of _selftest_expect_byte calls inside atkbd_self_test —
 # bump together with the driver if you add cases.
-if grep -F -q "atkbd: self-test PASS (25 cases)" "$LOG"; then
+if grep -F -q "atkbd: self-test PASS (46 cases)" "$LOG"; then
     echo "[test_atkbd_ext] OK: self-test PASS banner present"
 else
     echo "[test_atkbd_ext] MISS: self-test PASS banner absent"
