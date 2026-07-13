@@ -128,6 +128,32 @@ if ! grep -q '"/dev/wsys/ctxmenu/show"' <<< "$poke_body"; then
     fail_link "link 5 (hamUId.ad): ctxmenu_poke_show does NOT write /dev/wsys/ctxmenu/show"
 fi
 
+# --- Link 6 (Task #134): per-row LABEL TEXT is carried snapshot -> client
+# and DRAWN as glyphs, so on-device menus show legible labels (not the old
+# placeholder bars). The label text flows:
+#   hamUId ctxmenu_publish_snapshot  -> emits each ctx_item_label() after <w>
+#   kernel wsys_ctxmenu_set/read     -> stores + echoes the label blob
+#   hamctxmenu _parse_snapshot       -> splits the TAB-separated labels
+#   hamctxmenu _hc_draw_label/_hc_glyph -> blits the console font into the v2 bb
+# The compositor must emit the labels in the publish path.
+if ! grep -q 'ctx_item_label' <<< "$pub_body"; then
+    fail_link "link 6 (hamUId.ad): ctxmenu_publish_snapshot does NOT emit per-row ctx_item_label text (Task #134 labels)"
+fi
+# The kernel must store + echo a label blob.
+if ! grep -q 'wsys_ctxmenu_labels' "$KERN_SRC"; then
+    fail_link "link 6 (devwsys.ad): no wsys_ctxmenu_labels store — label blob not carried to the client"
+fi
+# The client must reuse the console font and draw glyphs into the v2 backbuffer.
+if ! grep -q 'hamui_host_font_row' "$CTXMENU_SRC"; then
+    fail_link "link 6 (hamctxmenu.ad): does NOT rasterise the 8x16 console font (hamui_host_font_row)"
+fi
+if ! grep -q '_hc_draw_label' "$CTXMENU_SRC"; then
+    fail_link "link 6 (hamctxmenu.ad): no _hc_draw_label — rows are still blank placeholder bars"
+fi
+if grep -q 'placeholder text bar' "$CTXMENU_SRC"; then
+    fail_link "link 6 (hamctxmenu.ad): still draws the placeholder text bar instead of real labels"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "FAIL: ctxmenu v2 extraction BROKEN (see link(s) above)" >&2
     exit 1
