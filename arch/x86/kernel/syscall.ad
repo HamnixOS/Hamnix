@@ -210,7 +210,7 @@ from fs.procfs import (
     svc_ctl_text_apply,
 )
 from fs.elf import (
-    elf_load_blob, elf_last_was_linux, elf_last_load_oom,
+    elf_load_blob, elf_eager_region_bytes, elf_last_was_linux, elf_last_load_oom,
     elf_last_load_base, elf_last_phoff, elf_last_phnum,
     elf_apply_last_user_mapping,
     # M16.36: per-task PT-entry installation for the user stack — so
@@ -255,7 +255,7 @@ from fs.elf import (
 # routines through the hook block further down. A pure-native build never
 # installs the hook; the call sites become harmless no-ops (vdso_user_code_vaddr
 # returns 0 → AT_SYSINFO_EHDR omitted, vdso_map_into_user becomes a no-op).
-from mm.page_alloc import alloc_page, alloc_pages, free_page
+from mm.page_alloc import alloc_page, alloc_pages, free_page, region_can_alloc
 from mm.slab import kmalloc, kfree
 # Real uaccess translation layer. copy_to_user / copy_from_user /
 # get_user / put_user / strncpy_from_user walk the CURRENT task's page
@@ -2285,6 +2285,34 @@ def _do_execve_inner(a0: uint64, a1: uint64, a2: uint64) -> int64:
         path = ipath
         blob = iblob
         sz = isz
+    # #112 EXECVE OOM PRE-CHECK — restore execve atomicity under memory
+    # pressure. do_execve is otherwise NON-atomic across the point-of-no-
+    # return: for a fork CHILD (image_cow_shared=1) the teardown block below
+    # clears its COW-inherited image/interp/stack PTEs, and THEN elf_load_blob
+    # runs the native loader's eager CONTIGUOUS region_alloc, which OOMs on a
+    # large Linux-ABI binary (/bin/sshd, /bin/login, /bin/hamdesktop) under
+    # -m256M. execve then returned -ENOMEM PAST the point-of-no-return, so the
+    # child resumed its now-UNMAPPED inherited RIP -> instruction-fetch
+    # SIGSEGV at image+0x622a7 (root-caused by log correlation, #112).
+    #
+    # The fix: BEFORE any teardown (address space still fully intact — this
+    # sits ahead of vma_reset_mm_owner / vma_clear / the COW teardown), size
+    # the eager contiguous region the loader will demand for the top-level
+    # image and confirm it will fit. If it will NOT, abort execve cleanly with
+    # -ENOMEM while the caller keeps its OLD image — exactly Linux execve(2)
+    # failure semantics (the fork-child's inherited image stays runnable and
+    # it handles the -ENOMEM), instead of running unmapped code. A size of 0
+    # means the header couldn't be sized (bad/odd ELF) — skip the pre-check
+    # and let the normal load path produce its verdict; region_can_alloc's
+    # tiny window is not a hard guarantee under SMP, so the past-PONR failure
+    # arm below (elf_load_blob == 0) is also hardened to a deterministic kill.
+    exec_eager_bytes: uint64 = elf_eager_region_bytes(
+        cast[Ptr[uint8]](blob), sz)
+    if exec_eager_bytes != 0 and region_can_alloc(exec_eager_bytes) == 0:
+        printk2("execve: image '%s' needs %d contiguous bytes; not available (-ENOMEM, caller intact)\n",
+                cast[uint64](&exec_kpath[0]), exec_eager_bytes)
+        set_current_errstr("execve: out of memory")
+        return cast[int64](-12)           # -ENOMEM, BEFORE point-of-no-return
     # U42 VMA: drop the outgoing image's mappings BEFORE we load the
     # new ELF. Without this, the new program would inherit the parent
     # image's stack/heap/mmap VMAs and a subsequent mprotect or munmap
@@ -2437,18 +2465,39 @@ def _do_execve_inner(a0: uint64, a1: uint64, a2: uint64) -> int64:
         #   (2) an OOM (region_alloc failed) was reported as -ENOEXEC. Read the
         #       loader's OOM flag and return -ENOMEM so the caller/shell sees a
         #       truthful "out of memory", not "bad executable".
-        # The caller's image is gone (exec is past its point-of-no-return), so
-        # a clean errno return lets it die by SIGSEGV / be reaped — one app
-        # failing to launch no longer takes the whole boot down.
+        # #112 PAST-PONR DETERMINISTIC KILL. This site is UNCONDITIONALLY past
+        # the point-of-no-return — vma_clear() (and, for a fork-child, the COW
+        # image/interp/stack teardown) has already run, so the caller's own
+        # instruction stream is gone. Returning an errno here SYSRETQ'd back
+        # into a torn-down/unmapped user image, and a fork-child then resumed
+        # its now-unmapped inherited RIP -> a mysterious later instruction-
+        # fetch SIGSEGV at image+0x622a7 (the #112 signature). The #112 pre-
+        # check above now aborts the common OOM case BEFORE any teardown with
+        # the caller intact; anything that STILL fails here (TOCTOU under SMP,
+        # an interpreter-image OOM, a genuinely bad ELF, or an unparse-able
+        # header that skipped the pre-check) must die DETERMINISTICALLY at the
+        # exec site — exactly like Linux, which force_sigsegv/SIGKILLs a task
+        # whose exec fails past the point-of-no-return — instead of resuming
+        # unmapped code. Release the execve serialization lock FIRST (the
+        # do_execve wrapper's unlock never runs once task_exit_current schedules
+        # away and never returns), record the exit disposition, and terminate.
         if elf_last_load_oom != 0:
-            printk1("execve: ELF load of '%s' failed: out of memory (-ENOMEM)\n",
+            printk1("execve: ELF load of '%s' failed past PONR: out of memory — killing task\n",
                     cast[uint64](&exec_kpath[0]))
             set_current_errstr("execve: out of memory")
-            return cast[int64](-12)       # -ENOMEM
-        printk1("execve: ELF load of '%s' failed (-ENOEXEC)\n",
-                cast[uint64](&exec_kpath[0]))
-        set_current_errstr("execve: bad ELF image")
-        return cast[int64](-8)            # -ENOEXEC
+        else:
+            printk1("execve: ELF load of '%s' failed past PONR (bad image) — killing task\n",
+                    cast[uint64](&exec_kpath[0]))
+            set_current_errstr("execve: bad ELF image")
+        # Release the execve serialization lock FIRST (task_exit_current
+        # schedules away and never returns, so do_execve's wrapper unlock at
+        # the error-return site would otherwise be skipped -> a leaked lock
+        # deadlocks every future execve), then terminate with 128+SIGSEGV(11)
+        # = 139, the conventional "killed by SIGSEGV" wait-status.
+        spinlock_unlock(&_execve_lock)
+        task_exit_current(cast[int64](139))
+        # Not reached (task_exit_current schedules away and never returns).
+        return cast[int64](-12)
     # POSIX execve(2): reset every CAUGHT-signal disposition to SIG_DFL — a
     # handler address is a .text VA into the image we just replaced, so a
     # signal delivered to an inherited/stale handler after exec would jump
