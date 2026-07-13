@@ -223,6 +223,84 @@ else
     echo "[2048-host] FAIL frame 0 not at source cell"; fail=1
 fi
 
+# --- BOUNDED PER-MOVE COST (the "slows down after a few turns" bug class) --
+# User report on the installed image: 2048 "looks really good for a little
+# while. Once you've played it for a few turns it slows way down" — the classic
+# unbounded-growth performance bug, where per-move render work (scene display-
+# list size / animation-list length) accumulates instead of resetting each
+# frame, so every move gets more expensive.
+#
+# The app is BOUNDED by construction: hamscene_begin() resets the display-list
+# buffer at the top of every build, the board/animation state is fixed 16-entry
+# arrays reset each move, and the display list is rebuilt from scratch — so the
+# per-move cost depends only on how many tiles are on the board (a constant
+# ceiling), NOT on how many moves have been played. This gate PROVES that and
+# guards against a future regression (any per-move append) that would reintro-
+# duce the bug. `grow N` plays N real moves (move + full animation drain, reset
+# on game-over) and reports the settled display-list size + moving-tile count at
+# move 5 and move N, plus the maxima over the whole run.
+GDUMP="$OUT/2048_grow_dump.txt"
+GAFTER="$OUT/2048_after120moves.ppm"
+if ! "$BIN" grow 120 "$GAFTER" >"$GDUMP" 2>&1; then
+    echo "[2048-host] FAIL: grow harness exited non-zero"; cat "$GDUMP"; fail=1
+fi
+# Save the after-120-moves board as a PNG for eyeballing (still renders fine).
+if [ -e "$GAFTER" ] && python3 scripts/ppm_to_png.py "$GAFTER" "$OUT/2048_after120moves.png" 2>"$OUT/2048_grow_png.log"; then
+    echo "[2048-host] PASS rendered after-120-moves board $OUT/2048_after120moves.png"
+else
+    echo "[2048-host] FAIL after-120-moves png conversion"; cat "$OUT/2048_grow_png.log" 2>/dev/null; fail=1
+fi
+GSEG5=$(awk '/^SEG5 /{print $2}' "$GDUMP")
+GSEGN=$(awk '/^SEGN /{print $2}' "$GDUMP")
+GSEGMAX=$(awk '/^SEGMAX /{print $2}' "$GDUMP")
+GANIMMAX=$(awk '/^ANIMMAX /{print $2}' "$GDUMP")
+: "${GSEG5:=0}" "${GSEGN:=0}" "${GSEGMAX:=0}" "${GANIMMAX:=0}"
+
+# (1) The settled display list at move 120 must be within a tight band of move 5
+#     — NOT climbing. Allow a 1.5x ceiling to absorb board-fullness variation
+#     (a fuller board legitimately draws a few more tile fills/glyphs); a real
+#     per-move leak blows far past this within a handful of moves.
+if [ "$GSEG5" -gt 0 ] && \
+   awk -v a="$GSEG5" -v b="$GSEGN" 'BEGIN{exit !(b <= a*3/2 && b >= a/2)}'; then
+    echo "[2048-host] PASS per-move display list is bounded: SEG@5=$GSEG5 ~ SEG@120=$GSEGN (no growth)"
+else
+    echo "[2048-host] FAIL per-move display list GREW with move count: SEG@5=$GSEG5 -> SEG@120=$GSEGN"; fail=1
+fi
+# (2) The peak display list over 120 moves must stay well under the 16384-byte
+#     scene cap (past which primitives silently truncate) — proving there is
+#     headroom and no slow creep toward the ceiling.
+if [ "$GSEGMAX" -gt 0 ] && [ "$GSEGMAX" -lt 4000 ]; then
+    echo "[2048-host] PASS peak display list bounded far below the 16384 cap: SEGMAX=$GSEGMAX"
+else
+    echo "[2048-host] FAIL peak display list not bounded below cap: SEGMAX=$GSEGMAX"; fail=1
+fi
+# (3) The moving-tile animation list never exceeds the 16-tile board (fixed
+#     array; reset every move) — it does not accumulate stale entries.
+if [ "$GANIMMAX" -ge 0 ] && [ "$GANIMMAX" -le 16 ]; then
+    echo "[2048-host] PASS animation list bounded by the board (<=16): ANIMMAX=$GANIMMAX"
+else
+    echo "[2048-host] FAIL animation list exceeded the board: ANIMMAX=$GANIMMAX"; fail=1
+fi
+
+# (4) CONTROL — prove the gate above actually has teeth. `growleak 120` runs the
+#     IDENTICAL move loop but deliberately APPENDS m primitives per move without
+#     the begin() reset (exactly the reported bug class). Its display list MUST
+#     climb steeply with move count (SEGN >> SEG5), i.e. it WOULD fail assertion
+#     (1). This confirms a genuine per-move leak is detected, so the real path's
+#     flatness above is meaningful and not a dead assertion.
+LDUMP="$OUT/2048_growleak_dump.txt"
+if ! "$BIN" growleak 120 >"$LDUMP" 2>&1; then
+    echo "[2048-host] FAIL: growleak control exited non-zero"; cat "$LDUMP"; fail=1
+fi
+LSEG5=$(awk '/^SEG5 /{print $2}' "$LDUMP")
+LSEGN=$(awk '/^SEGN /{print $2}' "$LDUMP")
+: "${LSEG5:=0}" "${LSEGN:=0}"
+if [ "$LSEG5" -gt 0 ] && awk -v a="$LSEG5" -v b="$LSEGN" 'BEGIN{exit !(b > a*3/2)}'; then
+    echo "[2048-host] PASS control leak is detectably unbounded: SEG@5=$LSEG5 -> SEG@120=$LSEGN (gate has teeth)"
+else
+    echo "[2048-host] FAIL control leak did not grow — bounded-growth gate would be a dead assertion"; fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "[2048-host] RESULT: PASS"
     exit 0
