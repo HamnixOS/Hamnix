@@ -193,7 +193,7 @@ build_adder_user hamcycler            # DE pivot wave 3: Alt-Tab window switcher
 build_adder_user hamcalpop            # DE pivot wave 4: clock-panel calendar drop-down popup (v2 client; reads /dev/wsys/calpop, poked via /dev/wsys/calpop/show; distinct from /bin/hamclock)
 build_adder_user hamrun               # DE pivot wave 4: Run-Application (Alt-F2) modal dialog (v2 client; reads /dev/wsys/run, poked via /dev/wsys/run/show, launches via /dev/wsys/run/launch)
 build_adder_user hamcalc              # integer calculator on the hamui toolkit (lib/hamui.ad)
-build_adder_user hamctl               # MATE-shape Control Center: 7 category tiles (Appearance/Display/Keyboard/Sound/Network/Power/About); writes wallpaper to /dev/wsys/ctl and master to /dev/audioctl, reads sys_netcfg + /proc + /sys/power/battery
+build_adder_user hamctl               # scene-DE Control Center hub (dual-target lib/hamctlcore): Appearance (wallpaper ctl verb) + Date & Time (clock + UTC offset -> /tmp/hamnix-tz.conf) + About (hostname/kernel/uptime/mem/CPUs/procs)
 build_adder_user hamclock             # clock + stopwatch on the hamui toolkit (lib/hamui.ad)
 build_adder_user hamview              # image viewer (Eye-of-MATE equiv) on the hamui toolkit: decodes PPM(P6)/BMP, blits via an fb draw-layer
 build_adder_user hamabout             # About-this-system dialog (scene client): OS name + kernel + memory + uptime
@@ -288,6 +288,8 @@ build_adder_user hambrowse            # scene-file DE web browser: fetch HTTP (u
 build_adder_user haminstallui         # scene-file DE visual installer: GUI front-end over /bin/haminstall (host name + disk picker + progress)
 build_adder_user hamsettings          # scene-file DE settings: wallpaper swatches (ctl wallpaper verb) + panel position/applet prefs (/etc/panel.conf)
 build_adder_user hammonscene          # scene-file DE system monitor: uptime + memory bar + /proc/tasks process list (ported from hammon)
+build_adder_user hamcalscene          # scene-file DE calendar: month grid with prev/next + today highlight, real clock (lib/hamcalcore, dual-target)
+build_adder_user hamnotesscene        # scene-file DE Notes scratchpad: keyboard text entry, auto-persists /tmp/hamnix-notes.txt (lib/hamnotescore, dual-target)
 build_adder_user umdf_host            # Track 4: user-mode driver host — loads a stock .ko in USERLAND via the UMDF kernel primitives
 
 # --- X11 server + client (user/x11/ subdirectory) -------------------
