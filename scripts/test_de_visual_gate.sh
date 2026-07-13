@@ -63,7 +63,9 @@ TS="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-build/de_visual_gate/$TS}"
 HANDOFF_MARKER="handing off to interactive shell"
 
-APPS=(hamclock hamcalcscene hammonscene)
+# The Calendar/clock is unified on hamcalscene (rc.5 autostarts it, not the
+# legacy stopwatch-only hamclock) — match what rc.5 actually launches.
+APPS=(hamcalscene hamcalcscene hammonscene)
 
 # --- environment gates -----------------------------------------------
 if [ ! -e /dev/kvm ]; then
