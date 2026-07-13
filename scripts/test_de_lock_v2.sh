@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
-# scripts/test_de_lock_v2.sh — DE pivot wave 5 structural guard:
-# the full-screen screen-lock overlay ("Screen Locked / Click to unlock")
-# is no longer drawn by the daemon_pixel monolith. It now lives in
-# /bin/hamlock, a separate-process v2 client that reads its model from
-# /dev/wsys/lock and is woken by writes to /dev/wsys/lock/show. The
-# compositor (user/hamUId.ad) publishes the model on every session_lock
-# / session_unlock mutation, pokes the show serial, and drains
-# /dev/wsys/lock/verify whenever a password attempt is enqueued.
+# scripts/test_de_lock_v2.sh — structural guard for the DE screen lock.
 #
-# Pass marker:  PASS: lock v2 extraction intact
+# HISTORY: the lock overlay was once rendered inline by the hamUId
+# daemon_pixel monolith, then extracted to a v2-blit /bin/hamlock whose
+# locked/unlocked MODEL was owned by the hamUId compositor (published on
+# /dev/wsys/lock). In the scene-file DE that daemon is retired — at
+# runlevel 5 hamUId does the `desktop` flip and EXITS — so a
+# compositor-owned lock model never gets published and that hamlock
+# painted nothing. #138 rewrote hamlock as a SELF-CONTAINED scene lock
+# client: it owns its full-screen window, draws its own curtain + masked
+# password field, reads its own keystrokes, and makes the unlock DECISION
+# itself by authenticating against /dev/auth. On success it closes its own
+# window via the per-window /ctl `close` verb (which recomposites the
+# desktop beneath) and exits. hamsessui's "Lock Screen" row spawns it.
+#
+# This guard asserts that self-contained wiring stays intact.
+#
+# Pass marker:  PASS: lock scene client intact
 # Fail marker:  FAIL: <which link broke>
 
 set -euo pipefail
@@ -17,9 +25,9 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 KERN_SRC="sys/src/9/port/devwsys.ad"
-NAMEC_SRC="sys/src/9/port/namec.ad"
 HAMUID_SRC="user/hamUId.ad"
 LOCK_SRC="user/hamlock.ad"
+SESSUI_SRC="user/hamsessui.ad"
 BUILD_SRC="scripts/build_user.sh"
 
 fail=0
@@ -28,17 +36,17 @@ fail_link() {
     fail=1
 }
 
-for f in "$KERN_SRC" "$NAMEC_SRC" "$HAMUID_SRC" "$LOCK_SRC" "$BUILD_SRC"; do
+for f in "$KERN_SRC" "$HAMUID_SRC" "$LOCK_SRC" "$SESSUI_SRC" "$BUILD_SRC"; do
     if [ ! -f "$f" ]; then
         echo "FAIL: $f missing" >&2
         exit 1
     fi
 done
 
-# --- Link 1: lock-pixel paths are GONE from daemon_pixel ------------
-# The legacy overlay rendered the "Screen Locked" + "Click to unlock"
-# strings inline via str_ink, gated on `if LOCKED != 0:`. The literal
-# strings + the LOCKED-keyed render gate must be gone from daemon_pixel.
+# --- Link 1: the legacy lock-pixel render is GONE from daemon_pixel -----
+# The old overlay rendered "Screen Locked" / "Click to unlock" inline via
+# str_ink, gated on `if LOCKED != 0:`. Those literals must not be back in
+# hamUId's daemon_pixel (they belong to the standalone client now).
 daemon_pixel_body=$(awk '
     /^def[[:space:]]+daemon_pixel[[:space:]]*\(/ { inside=1; print; next }
     /^def[[:space:]]/ { if (inside) { inside=0 } }
@@ -49,134 +57,64 @@ if [ -z "$daemon_pixel_body" ]; then
 fi
 for sym in '"Screen Locked"' '"Click to unlock"'; do
     if grep -qF "$sym" <<< "$daemon_pixel_body"; then
-        fail_link "link 1 (hamUId.ad): daemon_pixel still references '$sym' - lock overlay rendering did not extract cleanly"
+        fail_link "link 1 (hamUId.ad): daemon_pixel still references '$sym' - lock overlay leaked back into the monolith"
     fi
 done
-# A breadcrumb comment marking the extraction must remain so a future
-# refactor doesn't silently re-inline.
-if ! grep -q "LOCK overlay rendering EXTRACTED" <<< "$daemon_pixel_body"; then
-    fail_link "link 1 (hamUId.ad): the 'LOCK overlay rendering EXTRACTED' breadcrumb is gone - regression marker missing"
-fi
 
-# --- Link 2: hamlock binary is registered + sources -----------------
+# --- Link 2: hamlock is built + is a SELF-CONTAINED scene lock client ----
 if ! grep -q "build_adder_user hamlock" "$BUILD_SRC"; then
     fail_link "link 2 (build_user.sh): hamlock is not built - the binary won't ship in the initramfs"
 fi
-# hamlock must opt into v2 + read the snapshot.
-if ! grep -q "hamui_set_protocol_v2" "$LOCK_SRC"; then
-    fail_link "link 2 (hamlock.ad): does NOT call hamui_set_protocol_v2 - it isn't a v2 client"
+# Scene client (not the retired v2-blit path): draws via hamscene_*.
+if ! grep -q "hamscene_commit" "$LOCK_SRC"; then
+    fail_link "link 2 (hamlock.ad): does NOT call hamscene_commit - it isn't a scene client"
 fi
-if ! grep -q '"/dev/wsys/lock"' "$LOCK_SRC"; then
-    fail_link "link 2 (hamlock.ad): does NOT read /dev/wsys/lock snapshot - the model source is missing"
+# Reads its OWN keystrokes from the per-window /keys leaf.
+if ! grep -q '"/keys"' "$LOCK_SRC"; then
+    fail_link "link 2 (hamlock.ad): does NOT open the per-window /keys leaf - it can't read the password"
 fi
-# It must commit dirty rects via the v2 wire protocol.
-if ! grep -q "hamui_v2_commit_rect" "$LOCK_SRC"; then
-    fail_link "link 2 (hamlock.ad): does NOT call hamui_v2_commit_rect - no pixels reach the kernel backbuffer"
-fi
-
-# --- Link 3: kernel exposes /dev/wsys/lock + show + verify leaves ---
-for sym in "DEV_WSYS_LOCK\b" "DEV_WSYS_LOCK_SHOW" "DEV_WSYS_LOCK_VERIFY"; do
-    if ! grep -qE "${sym}" "$NAMEC_SRC"; then
-        fail_link "link 3 (namec.ad): DEV constant ${sym} is missing"
-    fi
-done
-for fn in devwsys_lock_read devwsys_lock_show_read devwsys_lock_show_write \
-          devwsys_lock_verify_read devwsys_lock_verify_write; do
-    if ! grep -qE "def[[:space:]]+${fn}[[:space:]]*\(" "$KERN_SRC"; then
-        fail_link "link 3 (devwsys.ad): ${fn}() definition is missing"
-    fi
-    if ! grep -q "${fn}" "$NAMEC_SRC"; then
-        fail_link "link 3 (namec.ad): ${fn} is not wired into the dispatcher"
-    fi
-done
-if ! grep -q '"lock/show"' "$NAMEC_SRC"; then
-    fail_link "link 3 (namec.ad): lock/show path is not resolved"
-fi
-if ! grep -q '"lock/verify"' "$NAMEC_SRC"; then
-    fail_link "link 3 (namec.ad): lock/verify path is not resolved"
-fi
-if ! grep -q '"lock"' "$NAMEC_SRC"; then
-    fail_link "link 3 (namec.ad): lock path is not resolved"
-fi
-# The /dev/wsys/ctl `lock` verb is how hamUId publishes the model.
-if ! grep -E "_wsys_ctl_word_eq" "$KERN_SRC" | grep -q '"lock"'; then
-    fail_link "link 3 (devwsys.ad): /dev/wsys/ctl 'lock' verb is missing - the compositor can't publish the model"
+# Renders the lock curtain title.
+if ! grep -q '"Screen Locked"' "$LOCK_SRC"; then
+    fail_link "link 2 (hamlock.ad): does NOT render the 'Screen Locked' curtain"
 fi
 
-# --- Link 4: compositor publishes, spawns, pokes, and drains --------
-for fn in lock_publish_snapshot lock_spawn lock_poke_show lock_drain_verify; do
-    if ! grep -qE "def[[:space:]]+${fn}[[:space:]]*\(" "$HAMUID_SRC"; then
-        fail_link "link 4 (hamUId.ad): ${fn}() definition is missing"
-    fi
-done
-# publish + poke must fire from session_lock + session_unlock (so the
-# client sees the locked/unlocked transition each time).
-for hook in session_lock session_unlock; do
-    body=$(awk -v fn="$hook" '
-        $0 ~ "^def[[:space:]]+"fn"[[:space:]]*\\(" { inside=1; print; next }
-        /^def[[:space:]]/ { if (inside) { inside=0 } }
-        inside { print }
-    ' "$HAMUID_SRC")
-    if [ -z "$body" ]; then
-        fail_link "link 4 (hamUId.ad): ${hook}() not found"
-        continue
-    fi
-    if ! grep -q "lock_publish_snapshot()" <<< "$body"; then
-        fail_link "link 4 (hamUId.ad): ${hook}() does NOT call lock_publish_snapshot - hamlock won't see the state change"
-    fi
-    if ! grep -q "lock_poke_show()" <<< "$body"; then
-        fail_link "link 4 (hamUId.ad): ${hook}() does NOT call lock_poke_show - the client never gets woken"
-    fi
-done
-# spawn must be called from daemon startup.
-if ! grep -q "lock_spawn(" "$HAMUID_SRC"; then
-    fail_link "link 4 (hamUId.ad): lock_spawn is never called - the client is never launched"
+# --- Link 3: hamlock owns the unlock DECISION via /dev/auth -------------
+if ! grep -q '"/dev/auth"' "$LOCK_SRC"; then
+    fail_link "link 3 (hamlock.ad): does NOT authenticate via /dev/auth - a lock with no secret check is not a lock"
 fi
-# It must spawn the SEPARATE-PROCESS hamlock binary, not draw inline.
-if ! grep -q '"/bin/hamlock"' "$HAMUID_SRC"; then
-    fail_link "link 4 (hamUId.ad): the compositor does NOT spawn /bin/hamlock - extraction is just a comment, not a behaviour change"
+if ! grep -q '"user "' "$LOCK_SRC" || ! grep -q '"pass "' "$LOCK_SRC"; then
+    fail_link "link 3 (hamlock.ad): missing the /dev/auth 'user '/'pass ' handshake lines"
 fi
-# drain_verify must run in the daemon main loop.
-if ! grep -q "lock_drain_verify(" "$HAMUID_SRC"; then
-    fail_link "link 4 (hamUId.ad): lock_drain_verify is never called - the verify slot is unread"
+# On unlock it closes its OWN window so the desktop repaints.
+if ! grep -q '"close' "$LOCK_SRC"; then
+    fail_link "link 3 (hamlock.ad): does NOT write the per-window 'close' verb - the curtain would stay on screen after unlock"
 fi
 
-# --- Link 5: publish + drain paths use the kernel files -------------
-pub_body=$(awk '
-    /^def[[:space:]]+lock_publish_snapshot[[:space:]]*\(/ { inside=1; print; next }
+# --- Link 4: hamsessui's Lock Screen row spawns /bin/hamlock ------------
+if ! grep -q '"/bin/hamlock"' "$SESSUI_SRC"; then
+    fail_link "link 4 (hamsessui.ad): the End-Session dialog does NOT spawn /bin/hamlock - Lock Screen is unwired"
+fi
+
+# --- Link 5: kernel per-window /ctl exposes the 'close' verb ------------
+winctl_body=$(awk '
+    /^def[[:space:]]+devwsys_winctl_write[[:space:]]*\(/ { inside=1; print; next }
     /^def[[:space:]]/ { if (inside) { inside=0 } }
     inside { print }
-' "$HAMUID_SRC")
-if ! grep -q '"/dev/wsys/ctl"' <<< "$pub_body"; then
-    fail_link "link 5 (hamUId.ad): lock_publish_snapshot does NOT write /dev/wsys/ctl - the model never reaches the kernel"
+' "$KERN_SRC")
+if [ -z "$winctl_body" ]; then
+    fail_link "link 5 (devwsys.ad): devwsys_winctl_write() not found"
 fi
-if ! grep -q '"lock "' <<< "$pub_body"; then
-    fail_link "link 5 (hamUId.ad): lock_publish_snapshot does NOT emit the 'lock' verb - the kernel won't accept the payload"
+if ! grep -q '"close"' <<< "$winctl_body"; then
+    fail_link "link 5 (devwsys.ad): per-window /ctl has no 'close' verb - a client can't tear down its own window"
 fi
-poke_body=$(awk '
-    /^def[[:space:]]+lock_poke_show[[:space:]]*\(/ { inside=1; print; next }
-    /^def[[:space:]]/ { if (inside) { inside=0 } }
-    inside { print }
-' "$HAMUID_SRC")
-if ! grep -q '"/dev/wsys/lock/show"' <<< "$poke_body"; then
-    fail_link "link 5 (hamUId.ad): lock_poke_show does NOT write /dev/wsys/lock/show - the show-serial never bumps"
-fi
-drain_body=$(awk '
-    /^def[[:space:]]+lock_drain_verify[[:space:]]*\(/ { inside=1; print; next }
-    /^def[[:space:]]/ { if (inside) { inside=0 } }
-    inside { print }
-' "$HAMUID_SRC")
-if ! grep -q '"/dev/wsys/lock/verify"' <<< "$drain_body"; then
-    fail_link "link 5 (hamUId.ad): lock_drain_verify does NOT read /dev/wsys/lock/verify - the watcher is wired to nothing"
-fi
-if ! grep -q "lock_pw_try" <<< "$drain_body"; then
-    fail_link "link 5 (hamUId.ad): lock_drain_verify does NOT call lock_pw_try - a posted password never reaches the secret check"
+if ! grep -q "_wsys_close_window" <<< "$winctl_body"; then
+    fail_link "link 5 (devwsys.ad): the 'close' verb does NOT route to _wsys_close_window - the vacated footprint won't recompose"
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "FAIL: lock v2 extraction BROKEN (see link(s) above)" >&2
+    echo "FAIL: lock scene client BROKEN (see link(s) above)" >&2
     exit 1
 fi
 
-echo "PASS: lock v2 extraction intact"
+echo "PASS: lock scene client intact"
 exit 0
