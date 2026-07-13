@@ -740,8 +740,8 @@ DUMPF5="$OUT/dump_forms_submit2.txt"
 run_forms submit f2 >"$DUMPF5" 2>&1
 cat "$DUMPF5"
 awk '/^SUBMIT/{c=1} c' "$DUMPF5" > "$OUT/forms_after_submit2.txt"
-assert_grepF '^NAV \?term=dogs&lang=en$' \
-    "form without preventDefault serializes visible+hidden fields (submit button excluded)" \
+assert_grepF '^NAV /search\?term=dogs&lang=en$' \
+    "form without preventDefault serializes to its action (/search) + visible+hidden fields (submit button excluded)" \
     "$OUT/forms_after_submit2.txt"
 
 # ====================================================================
@@ -797,8 +797,8 @@ DUMPG3="$OUT/dump_forms2_submit.txt"
 run_forms2 submit f3 >"$DUMPG3" 2>&1
 cat "$DUMPG3"
 awk '/^SUBMIT/{c=1} c' "$DUMPG3" > "$OUT/forms2_after_submit.txt"
-assert_grepG '^NAV \?user=ada&tier=gold&news=yes&col=blue$' \
-    "submit gathers every field=value (select=gold, checkbox=yes, checked radio col=blue)" \
+assert_grepG '^NAV /join\?user=ada&tier=gold&news=yes&col=blue$' \
+    "submit gathers to its action (/join) every field=value (select=gold, checkbox=yes, checked radio col=blue)" \
     "$OUT/forms2_after_submit.txt"
 
 # ====================================================================
