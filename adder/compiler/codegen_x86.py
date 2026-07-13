@@ -1395,6 +1395,42 @@ class X86CodeGen:
                 self.emit(f"{g.name}:")
                 self.emit(f"    .quad {fn}")
                 return
+            # Float scalar global: `name: float64 = 1.5`. Emit the constant's
+            # raw IEEE-754 bit pattern directly into `.data` as a `.quad` at the
+            # global's own symbol — exactly how gen_rodata interns an FP constant
+            # (a float64 literal is loaded with an integer movq of these bits, so
+            # no alignment directive is needed, matching the int `.data` path).
+            # Supports a plain float literal and a negated one; an integer/other
+            # initializer is rejected (write `1.5`, not `1`). Only float64 is
+            # supported: a float32 global needs a compile-time double->float
+            # narrowing the self-hosted codegen.ad cannot do, so both backends
+            # reject it, keeping them in lockstep. Mirrored byte-for-byte by
+            # codegen.ad layout_global's float path.
+            fw = self._float_width(g.var_type)
+            if fw is not None:
+                fval = value
+                fneg = False
+                if isinstance(fval, UnaryExpr) and fval.op is UnaryOp.NEG \
+                        and isinstance(fval.operand, FloatLiteral):
+                    fneg = True
+                    fval = fval.operand
+                if not isinstance(fval, FloatLiteral):
+                    raise CodeGenError(
+                        f"x86: float global '{g.name}' must have a float "
+                        f"literal initializer (got {type(value).__name__})"
+                    )
+                if fw != 8:
+                    raise CodeGenError(
+                        f"x86: float32 global '{g.name}' initializer is not "
+                        f"supported (only float64); declare it float64"
+                    )
+                import struct as _struct
+                fv = -fval.value if fneg else fval.value
+                bits = _struct.unpack("<Q", _struct.pack("<d", fv))[0]
+                self.emit(f"    .globl {g.name}")
+                self.emit(f"{g.name}:")
+                self.emit(f"    .quad {bits}")
+                return
             neg = False
             if isinstance(value, UnaryExpr) and value.op is UnaryOp.NEG \
                     and isinstance(value.operand, IntLiteral):
