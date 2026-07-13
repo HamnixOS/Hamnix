@@ -26,11 +26,18 @@
 #      the synthetic FB live so this leg sees real geometry under
 #      -nographic. Banner: "[fbpix-user] PASS".
 #
-#  (C) THE PRODUCT: /bin/hamshot (user/hamshot.ad) run from hamsh writes
-#      /tmp/screenshot.ppm from the live (synthetic) framebuffer and
-#      prints "hamshot: wrote 32x16 -> /tmp/screenshot.ppm".
+#  (C) THE PRODUCT: /bin/hamshot (user/hamshot.ad) run from hamsh writes a
+#      PNG (lib/pngwrite.ad — one stored-DEFLATE-block IDAT per row) of the
+#      live (synthetic) framebuffer to /tmp/shot.png and prints
+#      "hamshot: wrote 32x16 -> /tmp/shot.png".
+#
+#  (D) DECODE-BACK: /bin/test_shotpng (tests/test_shotpng.ad) reads that
+#      PNG, runs it through the REAL lib/png.ad decoder, and asserts a valid
+#      structure, 32x16 dimensions, and NON-UNIFORM pixels (real captured
+#      content, not a blank/garbage frame). Banner "[shotpng] PASS".
 #
 # Pass markers: [fbpix] PASS  AND  [fbpix-user] PASS  AND  hamshot: wrote
+#               AND  [shotpng] PASS
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -43,18 +50,23 @@ export HAMNIX_BUILD_LOCK_TIMEOUT=900
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 TEST_ELF=build/user/test_fbpix.elf
+SHOTPNG_ELF=build/user/test_shotpng.elf
 
 echo "[test_fbpix] (1/5) Build userland (hamsh + coreutils + hamshot)"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
 
-echo "[test_fbpix] (2/5) Build tests/test_fbpix.ad -> $TEST_ELF"
+echo "[test_fbpix] (2/5) Build tests/test_fbpix.ad + tests/test_shotpng.ad"
 python3 -m compiler.adder compile \
     --target=x86_64-adder-user \
     tests/test_fbpix.ad \
     -o "$TEST_ELF" >/dev/null
+python3 -m compiler.adder compile \
+    --target=x86_64-adder-user \
+    tests/test_shotpng.ad \
+    -o "$SHOTPNG_ELF" >/dev/null
 
-echo "[test_fbpix] (3/5) Plant /init = hamsh + /bin/test_fbpix + /bin/hamshot + /etc/fbpix-test marker"
+echo "[test_fbpix] (3/5) Plant /init = hamsh + /bin/test_fbpix + /bin/hamshot + /bin/test_shotpng + /etc/fbpix-test marker"
 INIT_ELF="$HAMSH_ELF" ENABLE_FBPIX_TEST=1 \
     python3 scripts/build_initramfs.py >/dev/null
 
@@ -87,14 +99,23 @@ set +e
         done
         if grep -aqF '[fbpix-user]' "$LOG" 2>/dev/null; then break; fi
     done
-    # (C) the real hamshot CLI against the synthetic FB.
+    # (C) the real hamshot CLI against the synthetic FB -> PNG at a known path.
     for _r in 1 2 3; do
-        printf '/bin/hamshot\n'
+        printf '/bin/hamshot /tmp/shot.png\n'
         for _j in $(seq 1 10); do
             if grep -aqF 'hamshot:' "$LOG" 2>/dev/null; then break; fi
             sleep 0.5
         done
         if grep -aqF 'hamshot:' "$LOG" 2>/dev/null; then break; fi
+    done
+    # (D) decode the captured PNG back + assert dims + non-uniform content.
+    for _r in 1 2 3; do
+        printf '/bin/test_shotpng /tmp/shot.png 32 16\n'
+        for _j in $(seq 1 10); do
+            if grep -aqF '[shotpng]' "$LOG" 2>/dev/null; then break; fi
+            sleep 0.5
+        done
+        if grep -aqF '[shotpng]' "$LOG" 2>/dev/null; then break; fi
     done
     sleep 1
     printf 'exit\n'
@@ -112,7 +133,7 @@ rc=$?
 set -e
 
 echo "[test_fbpix] --- fbpix self-test output ---"
-grep -aE "\[fbpix\]|\[fbpix-user\]|hamshot:" "$LOG" || true
+grep -aE "\[fbpix\]|\[fbpix-user\]|hamshot:|\[shotpng\]" "$LOG" || true
 echo "[test_fbpix] --- end ---"
 
 fail=0
@@ -157,11 +178,24 @@ else
     fail=1
 fi
 
-# (C) hamshot wrote a PPM from the live framebuffer.
-if grep -aqF 'hamshot: wrote 32x16 -> /tmp/screenshot.ppm' "$LOG"; then
-    echo "[test_fbpix] OK: hamshot captured the synthetic framebuffer to PPM"
+# (C) hamshot wrote a PNG from the live framebuffer.
+if grep -aqF 'hamshot: wrote 32x16 -> /tmp/shot.png' "$LOG"; then
+    echo "[test_fbpix] OK: hamshot captured the synthetic framebuffer to PNG"
 else
     echo "[test_fbpix] FAIL: hamshot success line missing" >&2
+    fail=1
+fi
+
+# (D) the captured PNG decodes back to a valid 32x16 non-uniform image.
+if grep -aqF '[shotpng] FAIL' "$LOG"; then
+    echo "[test_fbpix] FAIL: decode-back verifier reported a failure" >&2
+    grep -aF '[shotpng] FAIL' "$LOG" | head -5 || true
+    fail=1
+fi
+if grep -aqF '[shotpng] PASS' "$LOG"; then
+    echo "[test_fbpix] OK: captured PNG decoded back to a valid 32x16 non-uniform image"
+else
+    echo "[test_fbpix] FAIL: decode-back PASS banner missing" >&2
     fail=1
 fi
 
@@ -171,5 +205,6 @@ if [ "$fail" -ne 0 ]; then
 fi
 
 echo "[test_fbpix] PASS -- /dev/fbpix serves the framebuffer's raw bytes" \
-     "(size = pitch*height, byte-exact, EOF-terminated, read-only) and" \
-     "hamshot converts a live capture to a P6 PPM end-to-end"
+     "(size = pitch*height, byte-exact, EOF-terminated, read-only), hamshot" \
+     "encodes a live capture to PNG (lib/pngwrite.ad), and the captured PNG" \
+     "decodes back to a valid non-uniform 32x16 image end-to-end"

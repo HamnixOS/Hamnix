@@ -1,35 +1,44 @@
 # user/hamshot.ad
 #
 # hamshot — the MATE-screenshot equivalent for the Hamnix desktop.
-# A plain CLI (no GUI) that grabs the LIVE framebuffer pixels and
-# writes a P6 PPM image file, viewable with user/hamview.ad.
+# A plain CLI (no GUI) that grabs the LIVE framebuffer pixels and writes a
+# PNG image file, viewable with user/hamview.ad (which decodes PNG via
+# lib/png.ad) or any standard PNG tool.
 #
-#   hamshot [outfile]          default outfile: /tmp/screenshot.ppm
+#   hamshot [outfile]
+#       no arg  -> a timestamped file in the user's home:
+#                  /root/screenshot-<epoch>.png  (falls back to /tmp/… if
+#                  /root is not writable), so successive captures never
+#                  clobber one another.
+#       outfile -> written verbatim (PNG regardless of the extension).
 #
 # HOW IT WORKS (pure Plan 9 file ops, no ioctls):
-#   1. read /dev/fb        -> one geometry line
+#   1. read /proc/realtime -> the wall-clock epoch, for the filename.
+#   2. read /dev/fb        -> one geometry line
 #                             "WIDTH HEIGHT PITCH BPP PIXFMT\n"
-#   2. read /dev/fbpix     -> the raw framebuffer bytes, streamed
-#                             sequentially one scanline (PITCH bytes)
-#                             at a time. /dev/fbpix is the read-only
-#                             pixel leaf (drivers/video/fb_cdev.ad
-#                             devfbpix_read): size = PITCH * HEIGHT,
-#                             EOF past the end.
-#   3. convert each scanline's first WIDTH pixels from the hardware
-#      pixel format to packed RGB and append to the outfile after a
-#      "P6\nW H\n255\n" header.
+#   3. read /dev/fbpix     -> the raw framebuffer bytes, streamed
+#                             sequentially one scanline (PITCH bytes) at a
+#                             time. /dev/fbpix is the read-only pixel leaf
+#                             (drivers/video/fb_cdev.ad devfbpix_read):
+#                             size = PITCH * HEIGHT, EOF past the end.
+#   4. convert each scanline's first WIDTH pixels from the hardware pixel
+#      format to packed RGB and stream it out as PNG (lib/pngwrite.ad):
+#      an IHDR, one IDAT per row (a DEFLATE *stored* block, so no frame is
+#      ever held in memory), then IEND.
+#   5. best-effort post a desktop notification to /dev/wsys/post ("Screenshot
+#      saved …") — the same inbox the DE's hamnotify writes — so a capture
+#      triggered from the panel/menu tells the user where it landed.
 #
 # PIXEL FORMATS (mirrors fb_text.ad's fb_present_rgba_row packing):
 #   bpp 32, pixfmt 0 (RGB / EFI PixelRedGreenBlue...): bytes R,G,B,X
 #   bpp 32, pixfmt 1 (BGR / EFI PixelBlueGreenRed...): bytes B,G,R,X
 #     (the common GOP case — 32-bit BGRX)
-#   bpp 24: 3 bytes per pixel, stored B,G,R (fb_text's 24bpp store
-#     writes b,g,r regardless of pixfmt — see fb_present_rgba_row).
+#   bpp 24: 3 bytes per pixel, stored B,G,R (fb_text's 24bpp store writes
+#     b,g,r regardless of pixfmt — see fb_present_rgba_row).
 #
 # ADDER QUIRKS HONOURED
-#   * No heap — fixed module-level Array buffers, streamed per
-#     scanline (never a whole frame in memory). Globals are prefixed
-#     _hshot_ (the global namespace is shared across imports).
+#   * No heap — fixed module-level Array buffers, streamed per scanline
+#     (never a whole frame in memory). Globals are prefixed _hshot_.
 #   * Strings are Ptr[uint8]; no adjacent-literal concatenation; no
 #     module-scope string-literal globals.
 #
@@ -37,20 +46,32 @@
 #   python3 -m compiler.adder compile --target=x86_64-adder-user \
 #       user/hamshot.ad -o build/user/hamshot.elf
 
+from lib.pngwrite import (
+    pngw_signature, pngw_ihdr, pngw_iend,
+    pngw_idat_begin, pngw_idat_end,
+    pngw_zlib_header, pngw_stored_block_hdr,
+    pngw_adler_reset, pngw_adler_update, pngw_adler_final,
+    pngw_put_u32_be,
+)
+
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_open(path: Ptr[char]) -> int32
 extern def sys_open_write(path: Ptr[char]) -> int32
 extern def sys_close(fd: int32) -> int32
 
-# One scanline of raw framebuffer bytes. 16384 covers up to 4096-pixel-
-# wide 32bpp scanlines (incl. typical GOP pitch padding).
-_hshot_row_in:  Array[16384, uint8]
-# One scanline of converted RGB bytes (3 * up to 4096 pixels).
-_hshot_row_out: Array[12288, uint8]
+# One scanline of raw framebuffer bytes. 16384 covers up to 4096-pixel-wide
+# 32bpp scanlines (incl. typical GOP pitch padding).
+_hshot_row_in: Array[16384, uint8]
+# The framed IDAT chunk for one scanline: 8 (len+type) + 2 (zlib, row 0) +
+# 5 (block hdr) + 1 (filter) + 3*W (RGB) + 4 (adler, last row) + 4 (crc).
+_hshot_out: Array[16384, uint8]
+# The composed default output path / notification record.
+_hshot_path: Array[128, uint8]
+_hshot_note: Array[192, uint8]
 
-_HSHOT_ROW_IN_CAP:  uint64 = 16384
-_HSHOT_ROW_OUT_CAP: uint64 = 12288
+_HSHOT_ROW_IN_CAP: uint64 = 16384
+_HSHOT_OUT_CAP:    uint64 = 16384
 
 
 def _hshot_strlen(s: Ptr[uint8]) -> uint64:
@@ -62,6 +83,16 @@ def _hshot_strlen(s: Ptr[uint8]) -> uint64:
 
 def _hshot_puts(fd: int32, s: Ptr[uint8]):
     sys_write(fd, s, _hshot_strlen(s))
+
+
+def _hshot_copy_str(dst: Ptr[uint8], pos: uint64, src: Ptr[uint8]) -> uint64:
+    p: uint64 = pos
+    i: uint64 = 0
+    while src[i] != 0:
+        dst[p] = src[i]
+        p = p + 1
+        i = i + 1
+    return p
 
 
 def _hshot_put_u64(out: Ptr[uint8], pos: uint64, value: uint64) -> uint64:
@@ -105,9 +136,8 @@ def _hshot_parse_u64(buf: Ptr[uint8], pos: Ptr[uint64],
 
 
 def _hshot_read_full(fd: int32, buf: Ptr[uint8], want: uint64) -> int64:
-    # Read exactly `want` bytes (looping over short reads). Returns the
-    # byte count on success, 0 on clean EOF at a boundary, -1 on error
-    # or truncated tail.
+    # Read exactly `want` bytes (looping over short reads). Returns the byte
+    # count on success, 0 on clean EOF at a boundary, -1 on error/short tail.
     got: uint64 = 0
     while got < want:
         n: int64 = sys_read(fd, &buf[got], want - got)
@@ -132,12 +162,82 @@ def _hshot_write_full(fd: int32, buf: Ptr[uint8], count: uint64) -> int32:
     return 0
 
 
+# Read the wall-clock epoch seconds from /proc/realtime line 1
+# ("<ISO-8601> <epoch>\n", or "unavailable 0\n"). Returns 0 if unavailable.
+def _hshot_read_epoch() -> uint64:
+    fd: int32 = sys_open("/proc/realtime")
+    if fd < 0:
+        return 0
+    buf: Array[96, uint8]
+    n: int64 = sys_read(fd, &buf[0], 95)
+    sys_close(fd)
+    if n <= 0:
+        return 0
+    limit: uint64 = cast[uint64](n)
+    # The first token is the ISO date (leading digits!), so skip to the
+    # first space, then parse the epoch that follows.
+    p: uint64 = 0
+    while p < limit and buf[p] != 32 and buf[p] != 10:
+        p = p + 1
+    if p >= limit or buf[p] == 10:
+        return 0
+    return _hshot_parse_u64(&buf[0], &p, limit)
+
+
+# Compose <dir>screenshot[-<epoch>].png (NUL-terminated) into _hshot_path.
+def _hshot_build_path(dir: Ptr[uint8], epoch: uint64):
+    p: uint64 = 0
+    p = _hshot_copy_str(&_hshot_path[0], p, dir)
+    p = _hshot_copy_str(&_hshot_path[0], p,
+                        cast[Ptr[uint8]]("screenshot"))
+    if epoch != 0:
+        _hshot_path[p] = 45                           # '-'
+        p = p + 1
+        p = _hshot_put_u64(&_hshot_path[0], p, epoch)
+    p = _hshot_copy_str(&_hshot_path[0], p, cast[Ptr[uint8]](".png"))
+    _hshot_path[p] = 0
+
+
+# Best-effort desktop toast: "<title>\t<body>\t<icon>\n" to /dev/wsys/post,
+# the same inbox ring user/hamnotify.ad writes. Silently no-ops off the DE.
+def _hshot_notify(path: Ptr[uint8], w: uint64, h: uint64):
+    fd: int32 = sys_open_write("/dev/wsys/post")
+    if fd < 0:
+        return
+    p: uint64 = 0
+    p = _hshot_copy_str(&_hshot_note[0], p,
+                        cast[Ptr[uint8]]("Screenshot"))
+    _hshot_note[p] = 9                                 # '\t'
+    p = p + 1
+    p = _hshot_copy_str(&_hshot_note[0], p, cast[Ptr[uint8]]("Saved "))
+    p = _hshot_put_u64(&_hshot_note[0], p, w)
+    _hshot_note[p] = 120                               # 'x'
+    p = p + 1
+    p = _hshot_put_u64(&_hshot_note[0], p, h)
+    p = _hshot_copy_str(&_hshot_note[0], p, cast[Ptr[uint8]](" to "))
+    p = _hshot_copy_str(&_hshot_note[0], p, path)
+    _hshot_note[p] = 9                                 # '\t'
+    p = p + 1
+    p = _hshot_copy_str(&_hshot_note[0], p, cast[Ptr[uint8]]("camera"))
+    _hshot_note[p] = 10                                # '\n'
+    p = p + 1
+    sys_write(fd, &_hshot_note[0], p)
+    sys_close(fd)
+
+
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
-    outpath: Ptr[char] = cast[Ptr[char]]("/tmp/screenshot.ppm")
+    # ---- (0) choose an output path --------------------------------------
+    outpath: Ptr[char] = cast[Ptr[char]](0)
+    tried_root: int32 = 0
     if argc > 1:
         outpath = cast[Ptr[char]](argv[1])
+    else:
+        epoch: uint64 = _hshot_read_epoch()
+        _hshot_build_path(cast[Ptr[uint8]]("/root/"), epoch)
+        outpath = cast[Ptr[char]](&_hshot_path[0])
+        tried_root = 1
 
-    # ---- (1) geometry from /dev/fb ---------------------------------
+    # ---- (1) geometry from /dev/fb --------------------------------------
     gfd: int32 = sys_open("/dev/fb")
     if gfd < 0:
         _hshot_puts(2, "hamshot: cannot open /dev/fb\n")
@@ -162,54 +262,50 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         _hshot_puts(2, "hamshot: unsupported bpp\n")
         return 1
     bytespp: uint64 = bpp / 8
-    if pitch > _HSHOT_ROW_IN_CAP or w * 3 > _HSHOT_ROW_OUT_CAP:
+    if pitch > _HSHOT_ROW_IN_CAP:
+        _hshot_puts(2, "hamshot: framebuffer pitch too wide for buffer\n")
+        return 1
+    # Per-row IDAT worst case: 8 + 2 + 5 + 1 + 3*W + 4 + 4 bytes.
+    if w * 3 + 24 > _HSHOT_OUT_CAP:
         _hshot_puts(2, "hamshot: framebuffer too wide for the row buffer\n")
         return 1
     if w * bytespp > pitch:
         _hshot_puts(2, "hamshot: geometry inconsistent (w*bpp > pitch)\n")
         return 1
 
-    # ---- (2) open the pixel stream + the outfile --------------------
+    # ---- (2) open the pixel stream + the outfile ------------------------
     pfd: int32 = sys_open("/dev/fbpix")
     if pfd < 0:
         _hshot_puts(2, "hamshot: cannot open /dev/fbpix\n")
         return 1
     ofd: int32 = sys_open_write(outpath)
+    if ofd < 0 and tried_root != 0:
+        # /root not writable (e.g. a bare initramfs) — fall back to /tmp.
+        epoch2: uint64 = _hshot_read_epoch()
+        _hshot_build_path(cast[Ptr[uint8]]("/tmp/"), epoch2)
+        outpath = cast[Ptr[char]](&_hshot_path[0])
+        ofd = sys_open_write(outpath)
     if ofd < 0:
         _hshot_puts(2, "hamshot: cannot create outfile\n")
         sys_close(pfd)
         return 1
 
-    # ---- (3) P6 header: "P6\nW H\n255\n" ----------------------------
-    hdr: Array[48, uint8]
-    hp: uint64 = 0
-    hdr[hp] = 80                                  # 'P'
-    hp = hp + 1
-    hdr[hp] = 54                                  # '6'
-    hp = hp + 1
-    hdr[hp] = 10                                  # '\n'
-    hp = hp + 1
-    hp = _hshot_put_u64(&hdr[0], hp, w)
-    hdr[hp] = 32                                  # ' '
-    hp = hp + 1
-    hp = _hshot_put_u64(&hdr[0], hp, h)
-    hdr[hp] = 10                                  # '\n'
-    hp = hp + 1
-    hdr[hp] = 50                                  # '2'
-    hp = hp + 1
-    hdr[hp] = 53                                  # '5'
-    hp = hp + 1
-    hdr[hp] = 53                                  # '5'
-    hp = hp + 1
-    hdr[hp] = 10                                  # '\n'
-    hp = hp + 1
-    if _hshot_write_full(ofd, &hdr[0], hp) != 0:
-        _hshot_puts(2, "hamshot: header write failed\n")
+    # ---- (3) PNG signature + IHDR ---------------------------------------
+    sn: uint64 = pngw_signature(&_hshot_out[0])
+    if _hshot_write_full(ofd, &_hshot_out[0], sn) != 0:
+        _hshot_puts(2, "hamshot: signature write failed\n")
+        sys_close(ofd)
+        sys_close(pfd)
+        return 1
+    hn: uint64 = pngw_ihdr(&_hshot_out[0], cast[uint32](w), cast[uint32](h))
+    if _hshot_write_full(ofd, &_hshot_out[0], hn) != 0:
+        _hshot_puts(2, "hamshot: IHDR write failed\n")
         sys_close(ofd)
         sys_close(pfd)
         return 1
 
-    # ---- (4) stream scanlines: read PITCH bytes, emit 3*W RGB -------
+    # ---- (4) stream scanlines: one IDAT (stored DEFLATE block) per row --
+    pngw_adler_reset()
     y: uint64 = 0
     while y < h:
         rn: int64 = _hshot_read_full(pfd, &_hshot_row_in[0], pitch)
@@ -218,8 +314,18 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             sys_close(ofd)
             sys_close(pfd)
             return 1
+        op: uint64 = pngw_idat_begin(&_hshot_out[0])
+        if y == 0:
+            op = pngw_zlib_header(&_hshot_out[0], op)
+        dlen: uint64 = 1 + w * 3                       # filter byte + RGB
+        is_last: int32 = 0
+        if y == h - 1:
+            is_last = 1
+        op = pngw_stored_block_hdr(&_hshot_out[0], op, dlen, is_last)
+        filt: uint64 = op
+        _hshot_out[op] = 0                             # PNG filter type: None
+        op = op + 1
         x: uint64 = 0
-        op: uint64 = 0
         while x < w:
             so: uint64 = x * bytespp
             r: uint8 = 0
@@ -231,26 +337,42 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
                 g = _hshot_row_in[so + 1]
                 b = _hshot_row_in[so + 2]
             else:
-                # BGR byte order: B,G,R[,X] — the common 32-bit GOP
-                # BGRX case, and fb_text's 24bpp store order.
+                # BGR byte order: B,G,R[,X] — the common 32-bit GOP BGRX
+                # case, and fb_text's 24bpp store order.
                 b = _hshot_row_in[so]
                 g = _hshot_row_in[so + 1]
                 r = _hshot_row_in[so + 2]
-            _hshot_row_out[op]     = r
-            _hshot_row_out[op + 1] = g
-            _hshot_row_out[op + 2] = b
+            _hshot_out[op]     = r
+            _hshot_out[op + 1] = g
+            _hshot_out[op + 2] = b
             op = op + 3
             x = x + 1
-        if _hshot_write_full(ofd, &_hshot_row_out[0], op) != 0:
+        # Adler-32 covers the uncompressed bytes (filter + RGB).
+        pngw_adler_update(&_hshot_out[0], filt, dlen)
+        if is_last != 0:
+            op = pngw_put_u32_be(&_hshot_out[0], op, pngw_adler_final())
+        clen: uint64 = op - 8
+        total: uint64 = pngw_idat_end(&_hshot_out[0], clen)
+        if _hshot_write_full(ofd, &_hshot_out[0], total) != 0:
             _hshot_puts(2, "hamshot: pixel write failed\n")
             sys_close(ofd)
             sys_close(pfd)
             return 1
         y = y + 1
 
+    # ---- (5) IEND -------------------------------------------------------
+    en: uint64 = pngw_iend(&_hshot_out[0])
+    if _hshot_write_full(ofd, &_hshot_out[0], en) != 0:
+        _hshot_puts(2, "hamshot: IEND write failed\n")
+        sys_close(ofd)
+        sys_close(pfd)
+        return 1
+
     sys_close(ofd)
     sys_close(pfd)
 
+    # ---- (6) best-effort desktop notification + a stdout line -----------
+    _hshot_notify(cast[Ptr[uint8]](outpath), w, h)
     _hshot_puts(1, "hamshot: wrote ")
     _hshot_print_u64(1, w)
     _hshot_puts(1, "x")
