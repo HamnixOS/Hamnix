@@ -90,7 +90,7 @@ set +e
 #   * We bracket each `cat` output with echo markers so the test can
 #     extract just the file content from the noisy boot log.
 QEMU_EXTRA_ARGS="-drive file=$ROOTFS_IMG,if=virtio,format=raw" \
-qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 120 \
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 260 \
     -- "mkdir /tmp/src"                                       2 \
        "mkdir /tmp/src/sub"                                   2 \
        "echo hello-a > /tmp/src/a.txt"                        2 \
@@ -109,6 +109,18 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 120 \
        "echo EXT_B_BEGIN"                                     2 \
        "cat /ext/dst-on-disk/sub/b.txt"                       2 \
        "echo EXT_B_END"                                       2 \
+       "echo one > /tmp/o1.txt"                              2 \
+       "echo two > /tmp/o2.txt"                              2 \
+       "cp /tmp/o2.txt /tmp/o1.txt"                          2 \
+       "echo OVERWRITE_BEGIN"                                2 \
+       "cat /tmp/o1.txt"                                     2 \
+       "echo OVERWRITE_END"                                  2 \
+       "mkdir /tmp/into"                                     2 \
+       "echo zed > /tmp/zed.txt"                             2 \
+       "cp /tmp/zed.txt /tmp/into/"                          2 \
+       "echo INTODIR_BEGIN"                                  2 \
+       "cat /tmp/into/zed.txt"                               2 \
+       "echo INTODIR_END"                                    2 \
        "seq 1 5000 > /tmp/big.bin"                            5 \
        "echo BIG_TMPFS_WC_BEGIN"                              2 \
        "wc < /tmp/big.bin"                                    3 \
@@ -168,6 +180,19 @@ check_block_has TMPFS_A hello-a
 check_block_has TMPFS_B hello-b
 check_block_has EXT_A   hello-a
 check_block_has EXT_B   hello-b
+
+# --- BUG #146 regression: p9_listdir is not a reliable dir test -------
+# path_is_dir must use the kernel Dir-record probe, NOT a p9_listdir
+# success (which also succeeds on a regular file, reading its CONTENTS).
+#
+# OVERWRITE: `cp o2 o1` where o1 already exists as a REGULAR file must
+# overwrite it with o2's content ("two"), NOT treat o1 as a directory
+# and try to nest o2 inside it.
+check_block_has OVERWRITE two
+# INTODIR: `cp zed.txt into/` where `into` IS a directory must land the
+# file INSIDE it as into/zed.txt. This depends on into/ being correctly
+# detected as a dir (and zed.txt NOT being mis-detected as one).
+check_block_has INTODIR zed
 
 # Multi-block writer assertions. `wc` writes "<lines> <words> <bytes>\n";
 # the source is `seq 1 5000`, which produces 5000 newlines and bytes
