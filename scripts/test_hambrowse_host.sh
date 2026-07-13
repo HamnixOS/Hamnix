@@ -954,6 +954,58 @@ else
     echo "[hb-host] FAIL interactivity: inline onclick did not fire (no live JS context?)"; fail=1
 fi
 
+# ====================================================================
+# HTML COMMENTS — `<!-- … -->` spans are stripped before ANY tokenizer runs,
+# so markup hidden inside a comment (a demo <script>, a stray '>' or '<', an
+# IE `<!--[if IE]>…<![endif]-->` conditional) neither renders as page text NOR
+# executes as script. `<!DOCTYPE …>` is NOT a comment and must not be eaten.
+# ====================================================================
+FIXC="tests/fixtures/hambrowse_comments.html"
+DUMPC="$OUT/dump_comments.txt"
+echo "[hb-host] running host harness on $FIXC ..."
+if ! "$BIN" "$FIXC" 600 >"$DUMPC" 2>&1; then
+    echo "[hb-host] FAIL: comments harness exited non-zero"; cat "$DUMPC"; exit 1
+fi
+cat "$DUMPC"
+
+assert_grepC() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMPC"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# The real, uncommented content all renders (the <!DOCTYPE> did not break parse).
+assert_grepC '^SEG 0 8 #14306e b1 .*\|Comments Fixture\|' "h1 renders (DOCTYPE not mistaken for a comment)"
+assert_grepC '\|Visible lead paragraph\.\|'  "content before the comment renders"
+assert_grepC '\|Between the two comments\.\|' "content between comments renders"
+assert_grepC '\|Final visible paragraph\.\|'  "content after the comments renders"
+# The .lead CSS rule (declared alongside a /* … */ comment) still applied.
+assert_grepC '^SEG [0-9]+ 8 #008000 .*\|Visible lead paragraph\.\|' \
+    ".lead { color:#008000 } applied (stylesheet comment did not break the rule)"
+
+# The commented-out markup must NOT leak as rendered TEXT.
+for leaked in 'HACKED' 'commented script executed' 'a bogus' 'stray' \
+              'legacy IE-only conditional content'; do
+    if grep -q "$leaked" "$DUMPC"; then
+        echo "[hb-host] FAIL commented-out text leaked into the render: '$leaked'"; fail=1
+    else
+        echo "[hb-host] PASS commented-out text not rendered: '$leaked'"
+    fi
+done
+
+# The commented-out <script> must NOT execute: its console.log is absent, the
+# DOM it tried to mutate is untouched, and document.title stays the real title.
+if grep -q '^JSLOG commented script executed$' "$DUMPC"; then
+    echo "[hb-host] FAIL a <script> inside a comment executed"; fail=1
+else
+    echo "[hb-host] PASS <script> inside a comment did NOT execute (no JSLOG)"
+fi
+assert_grepC '^JSLOG real script executed$' "the real (uncommented) <script> still executed"
+assert_grepC '^TITLE Comments Fixture$'      "document.title kept (commented script did not overwrite it)"
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
     exit 0
