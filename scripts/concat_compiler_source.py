@@ -121,7 +121,17 @@ HOST_BUFFER_OVERRIDES = {
     "codegen.ad": [
         ("CODE_CAP: uint32 = 2097152", "CODE_CAP: uint32 = 16777216"),
         ("code: Array[2097152, uint8]", "code: Array[16777216, uint8]"),
-        ("DATA_BASE: uint32 = 2097152", "DATA_BASE: uint32 = 16777216"),
+        # DEMAND-GAP FIX (2026-07-13): DATA_BASE is intentionally NOT scaled to
+        # 16 MiB here. CODE_CAP (above) is the compiler's internal code[] BUFFER
+        # and must be large enough to hold the multi-MiB kernel host_ac compiles;
+        # DATA_BASE is the OUTPUT user image's .data vaddr and only needs to
+        # clear the largest user program's code (<1 MiB). Coupling them forced
+        # every emitted app to place .data at vaddr 16 MiB, so the ELF32 loader
+        # eagerly region_alloc()'d a 16 MiB CONTIGUOUS inter-segment gap per app
+        # and OOM-fragmented the desktop at -m256M. Leaving DATA_BASE at its
+        # on-disk 2 MiB shrinks that gap to 2 MiB with headroom to spare; a
+        # user program whose code overruns 2 MiB fails LOUDLY in elf_emit
+        # (guard changed CODE_CAP->DATA_BASE), never silently corrupting.
         ("GDATA_CAP: uint32 = 65536", "GDATA_CAP: uint32 = 4194304"),
         ("gdata: Array[65536, uint8]", "gdata: Array[4194304, uint8]"),
         # Per-function local/param table. 256 is too small for some large
