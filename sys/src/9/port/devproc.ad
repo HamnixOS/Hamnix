@@ -258,6 +258,21 @@ DEVPROC_KIND_SVC_CTL: uint32 = 15
 # the same signed decimal + '\n' shape as oom_score_adj.
 DEVPROC_KIND_OOM_PGRP_ADJ: uint32 = 16
 
+# BUG #113 (child-COW namespace visibility): `/proc/self/<leaf>` must
+# resolve `self` to the CALLER AT ACCESS TIME, not at open time. The
+# historical encoding baked current_task_pid() into the chan when the
+# fd was opened, so an fd inherited across a fork (RFFDG) kept naming
+# the OPENER's pid — a child reading an inherited /proc/self/ns fd then
+# saw the PARENT's namespace, missing its own COW-diverged binds
+# ("self resolving to the wrong pid for the reader"). We now stamp this
+# SELF flag into the encoding when the path spelled `self/` and re-run
+# current_task_pid() in devproc_read / devproc_write, so `self` tracks
+# whichever task actually performs the read/write. The flag rides bit 24,
+# clear of the pid_field (bits 8..23) and kind (bits 0..7); the encoding
+# stays a small positive int32 (< 0x02000000) so it survives the int32
+# chan back_slot round-trip unchanged.
+DEVPROC_SELF_FLAG: uint32 = 0x01000000
+
 
 def _is_digit(c: uint8) -> int32:
     if c >= 48 and c <= 57:
@@ -335,15 +350,24 @@ def _u64_to_hex(value: uint64, out: Ptr[uint8]) -> uint64:
 
 
 def _parse_proc_path(path: Ptr[char], out_pid: Ptr[uint64],
-                     out_kind: Ptr[uint32]) -> int32:
+                     out_kind: Ptr[uint32],
+                     out_is_self: Ptr[int32]) -> int32:
     # Walk a /proc/<pid>/<file> path. Returns 0 on success and writes
     # the parsed pid + file_kind through the out-pointers. Non-zero
     # means "not a /proc/<pid>/<leaf> path" — the caller falls back to
     # the existing procfs renderer.
     #
+    # BUG #113: out_is_self is set to 1 iff the path spelled `self/`
+    # (as opposed to a literal /proc/<digits>/). out_pid still receives
+    # the caller's pid for the self case (so devproc_open's existence
+    # check + the perm gate keep working), but the caller stamps
+    # DEVPROC_SELF_FLAG so devproc_read/write re-resolve the pid at
+    # access time — an inherited /proc/self/… fd must track the reader.
+    #
     # We don't trust the caller to have already prefix-checked
     # "/proc/" — verifying it here makes this function safe to drop
     # into _any_ vfs_open call site if devproc grows direct callers.
+    out_is_self[0] = 0
     if path[0] != 47:                            # '/'
         return -1
     if path[1] != 112 or path[2] != 114 \
@@ -372,6 +396,7 @@ def _parse_proc_path(path: Ptr[char], out_pid: Ptr[uint64],
             and path[8] == 108 and path[9] == 102 \
             and path[10] == 47:                  # "self/"
         pid = current_task_pid()
+        out_is_self[0] = 1
         i = 11
     else:
         if _is_digit(cast[uint8](path[i] & 0xFF)) == 0:
@@ -470,7 +495,9 @@ def devproc_path_match(path: Ptr[char]) -> int32:
     # Returns 1 iff path looks like /proc/<digits>/<known-leaf>.
     pid_scratch:  uint64 = 0
     kind_scratch: uint32 = 0
-    if _parse_proc_path(path, &pid_scratch, &kind_scratch) == 0:
+    self_scratch: int32  = 0
+    if _parse_proc_path(path, &pid_scratch, &kind_scratch,
+                        &self_scratch) == 0:
         return 1
     return 0
 
@@ -991,7 +1018,8 @@ def devproc_open(path: Ptr[char]) -> int64:
     # value the caller ever sees.
     pid64: uint64 = 0
     kind:  uint32 = 0
-    if _parse_proc_path(path, &pid64, &kind) != 0:
+    is_self: int32 = 0
+    if _parse_proc_path(path, &pid64, &kind, &is_self) != 0:
         set_current_errstr("/proc: malformed pid path")
         return -1
     # F2 #447: system-wide ctl files (DEVPROC_KIND_SVC_CTL) carry pid=0
@@ -1007,6 +1035,11 @@ def devproc_open(path: Ptr[char]) -> int64:
     # sequentially-allocated pids this is comfortable headroom.
     pid_field: uint32 = cast[uint32](pid64 & 0xFFFF)
     enc: uint32 = (pid_field << 8) | (kind & 0xFF)
+    # BUG #113: a `/proc/self/…` open stamps the SELF flag so the read/
+    # write path re-resolves current_task_pid() at access time — an fd
+    # inherited across fork must name the READER, not the opener.
+    if is_self != 0:
+        enc = enc | DEVPROC_SELF_FLAG
     return cast[int64](enc)
 
 
@@ -1727,6 +1760,11 @@ def devproc_read(file_idx: uint32, off: uint64, buf: Ptr[uint8],
         return 0
     pid_field: uint32 = (file_idx >> 8) & 0xFFFF
     kind:      uint32 = file_idx & 0xFF
+    # BUG #113: a `/proc/self/…` fd re-resolves `self` to the READING
+    # task here, so an fd inherited across a fork tracks the reader's
+    # namespace (its own COW-diverged binds) rather than the opener's.
+    if (file_idx & DEVPROC_SELF_FLAG) != 0:
+        pid_field = cast[uint32](current_task_pid() & 0xFFFF)
     # F2 #447: system-wide /proc/svc/ctl carries pid=0 and is write-only.
     # Refuse the read here BEFORE task_lookup_by_pid (pid 0 is not a live
     # task slot — the read would otherwise surface "pid vanished").
@@ -2005,6 +2043,11 @@ def devproc_write(file_idx: uint32, buf: Ptr[uint8],
     # accept writes, and ctl isn't a Phase C surface yet).
     pid_field: uint32 = (file_idx >> 8) & 0xFFFF
     kind:      uint32 = file_idx & 0xFF
+    # BUG #113: a `/proc/self/…` fd re-resolves `self` to the WRITING
+    # task here (symmetry with devproc_read), so an inherited /proc/self
+    # ctl/note fd controls the writer, not the opener.
+    if (file_idx & DEVPROC_SELF_FLAG) != 0:
+        pid_field = cast[uint32](current_task_pid() & 0xFFFF)
     if kind == DEVPROC_KIND_NS:
         # V3: /proc/<pid>/ns is read-only. Plan 9 lets you write
         # control commands ("addmount", "addbind", ...) to it, but
