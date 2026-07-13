@@ -1,18 +1,46 @@
 # user/sed.ad
 #
-# Minimal Hamnix `sed 's/A/B/'`. Reads stdin a line at a time;
-# on each line replaces the FIRST occurrence of literal A with
-# literal B and emits the line. Only the `s/DELIM/REPL/` form
-# is recognized. No `g`, no `&`, no flags, no addresses, no
-# regex metacharacters. The delimiter MUST be `/` (matching the
-# canonical sed form).
+# Native Hamnix `sed` — the everyday stream-editor subset, no Linux
+# namespace. Reads FILE operands (or stdin) as one continuous stream,
+# applies a script of addressed commands per line, and (unless -n)
+# auto-prints each line at the end of the cycle.
 #
-#   /cat /etc/motd | /sed 's/Hamnix/Pynux/'
+# Supported:
+#   * s/RE/replacement/[gp]   substitution
+#       - RE subset (a scoped matcher, NOT the jsengine RegExp — see
+#         the note below): literal chars, `.` (any), `*` (zero-or-more
+#         of the preceding atom), `[...]` / `[^...]` char classes with
+#         `a-z` ranges, `^` (start anchor) and `$` (end anchor), and
+#         `\x` to escape a metacharacter.
+#       - replacement: `&` = whole match, `\&` = literal &, `\\` = \,
+#         `\n` = newline, `\t` = tab, `\<c>` = literal c.
+#       - `g` flag = replace every occurrence; `p` flag = print if a
+#         substitution happened. A numeric flag is accepted but ignored.
+#   * p        print the current line (an extra copy)
+#   * d        delete the line (skip auto-print, start next cycle)
+#   * addresses on any command: `N` (line number), `$` (last line),
+#     `N,M` range (`$` allowed as either endpoint).
+#   * flags: -n (suppress auto-print), -e SCRIPT (may repeat; when any
+#     -e is given, all positional operands are FILEs).
 #
-# Returns 1 on argument errors, 0 on EOF.
+# Delimiter for s/// is the char after `s` (`/` in the canonical form);
+# `\<delim>` inside the pattern/replacement is a literal delimiter.
+#
+# Why a scoped matcher and not lib/jsengine.ad's RegExp: the JS regex
+# is a compiled-program VM welded into the JS object model (obj_re_prog,
+# JS string-ids, JS values, str_regex_replace) — not a clean extern-free
+# core you can call from a coreutil. Dragging it in would pull the whole
+# interpreter. The subset above covers real sed scripts, so we ship a
+# small self-contained backtracking matcher instead.
 
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+# sys_open: the adder-user runtime thunk reads only %rdi (path) and opens
+# read-only; the host (x86_64-linux) thunk is a raw open(2) needing
+# flags/mode in %rsi/%rdx. Declaring all three args satisfies both — the
+# kernel ignores the extras, the host gets O_RDONLY (flags=0, mode=0).
+extern def sys_open(path: Ptr[char], flags: int32, mode: int32) -> int32
+extern def sys_close(fd: int32) -> int32
 
 
 def strlen_u8(s: Ptr[uint8]) -> uint64:
@@ -22,133 +50,580 @@ def strlen_u8(s: Ptr[uint8]) -> uint64:
     return n
 
 
-def write_str(fd: int32, s: Ptr[uint8]):
-    sys_write(fd, s, strlen_u8(s))
+def write_err(s: Ptr[uint8]):
+    sys_write(2, s, strlen_u8(s))
 
 
-# Per-line scratch buffer + the parsed A and B strings.
-line: Array[1024, uint8]
-pat:  Array[256, uint8]
-rep:  Array[256, uint8]
-out:  Array[2048, uint8]
-
-
-def parse_expr(expr: Ptr[uint8],
-               pat_out: Ptr[uint64], rep_out: Ptr[uint64]) -> int32:
-    # Expect: s/PAT/REP/. Returns 0 on success, -1 otherwise.
-    # Fills pat[] and rep[] (NUL-terminated) and writes their lengths
-    # via pat_out / rep_out.
-    if expr[0] != 115 or expr[1] != 47:             # 's' '/'
-        return -1
-    i: uint64 = 2
-    pi: uint64 = 0
-    while expr[i] != 0 and expr[i] != 47:
-        if pi >= 255:
-            return -1
-        pat[pi] = expr[i]
-        pi = pi + 1
+def str_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
         i = i + 1
-    if expr[i] != 47:
-        return -1
-    pat[pi] = 0
-    i = i + 1
-    ri: uint64 = 0
-    while expr[i] != 0 and expr[i] != 47:
-        if ri >= 255:
-            return -1
-        rep[ri] = expr[i]
-        ri = ri + 1
-        i = i + 1
-    if expr[i] != 47:
-        return -1
-    rep[ri] = 0
-    pat_out[0] = pi
-    rep_out[0] = ri
+    if a[i] == b[i]:
+        return 1
     return 0
 
 
-def find_first(hay: Ptr[uint8], hay_len: uint64,
-               needle_len: uint64) -> int64:
-    # Returns the index of the first occurrence of pat[0..needle_len)
-    # in hay[0..hay_len), or -1 if not found.
-    if needle_len == 0:
+# ---- input (all files / stdin concatenated) + line index ----
+input_buf:  Array[262144, uint8]
+input_len:  uint64 = 0
+line_start: Array[8192, int32]
+line_size:  Array[8192, int32]
+n_lines:    int32 = 0
+
+# current line being processed (mutable scratch)
+line:     Array[65536, uint8]
+line_len: uint64 = 0
+
+# substitution output scratch
+sub_out: Array[131072, uint8]
+so:      uint64 = 0
+
+# ---- parsed script text + string pool ----
+script_src:     Array[16384, uint8]
+script_src_len: uint64 = 0
+strbuf:         Array[16384, uint8]
+strbuf_len:     uint64 = 0
+pc:             uint64 = 0        # cursor into script_src while parsing
+
+# ---- parsed commands ----
+# kind: 0 = s, 1 = p, 2 = d
+MAX_CMDS: int32 = 64
+cmd_kind:  Array[64, int32]
+cmd_a1t:   Array[64, int32]       # addr1 type: 0 none, 1 num, 2 $
+cmd_a1v:   Array[64, int32]
+cmd_a2t:   Array[64, int32]       # addr2 type: 0 none(single), 1 num, 2 $
+cmd_a2v:   Array[64, int32]
+cmd_pat_off: Array[64, int32]
+cmd_pat_len: Array[64, int32]
+cmd_rep_off: Array[64, int32]
+cmd_rep_len: Array[64, int32]
+cmd_g:     Array[64, int32]
+cmd_pflag: Array[64, int32]
+n_cmds:    int32 = 0
+
+# transient address parse result
+cur_a_type: int32 = 0
+cur_a_val:  int32 = 0
+
+# ---- compiled regex (scoped matcher) ----
+# atom_kind: 0 = literal (atom_ch), 1 = dot, 2 = class (atom_class row)
+MAX_ATOMS: int32 = 128
+atom_kind:  Array[128, int32]
+atom_ch:    Array[128, uint8]
+atom_star:  Array[128, int32]
+atom_class: Array[32768, uint8]   # 128 rows * 256 cols
+n_atoms:    int32 = 0
+anchor_start: int32 = 0
+anchor_end:   int32 = 0
+g_matchend:   int64 = 0
+
+suppress: int32 = 0
+
+
+def is_digit(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return 1
+    return 0
+
+
+# ------------------------------------------------------------------
+# Regex: compile strbuf[off .. off+plen) into atoms.
+# ------------------------------------------------------------------
+def compile_regex(off: uint64, plen: uint64) -> int32:
+    n_atoms = 0
+    anchor_start = 0
+    anchor_end = 0
+    i: uint64 = off
+    endp: uint64 = off + plen
+    if i < endp and strbuf[i] == 94:            # '^'
+        anchor_start = 1
+        i = i + 1
+    while i < endp:
+        c: uint8 = strbuf[i]
+        if c == 36 and i == endp - 1:           # '$' at very end
+            anchor_end = 1
+            i = i + 1
+            break
+        ai: int32 = n_atoms
+        if ai >= MAX_ATOMS:
+            return -1
+        if c == 92 and i + 1 < endp:            # '\' escape -> literal next
+            atom_kind[ai] = 0
+            atom_ch[ai] = strbuf[i + 1]
+            i = i + 2
+        elif c == 46:                           # '.'
+            atom_kind[ai] = 1
+            i = i + 1
+        elif c == 91:                           # '['
+            i = i + 1
+            negate: int32 = 0
+            if i < endp and strbuf[i] == 94:    # '^'
+                negate = 1
+                i = i + 1
+            base: uint64 = cast[uint64](ai) * 256
+            k: uint64 = 0
+            while k < 256:
+                atom_class[base + k] = 0
+                k = k + 1
+            firstc: int32 = 1
+            while i < endp and (strbuf[i] != 93 or firstc == 1):
+                firstc = 0
+                if i + 2 < endp and strbuf[i + 1] == 45 and strbuf[i + 2] != 93:
+                    lo: uint64 = cast[uint64](strbuf[i])
+                    hi: uint64 = cast[uint64](strbuf[i + 2])
+                    cc: uint64 = lo
+                    while cc <= hi:
+                        atom_class[base + cc] = 1
+                        cc = cc + 1
+                    i = i + 3
+                else:
+                    atom_class[base + cast[uint64](strbuf[i])] = 1
+                    i = i + 1
+            if i < endp and strbuf[i] == 93:    # closing ']'
+                i = i + 1
+            if negate == 1:
+                k2: uint64 = 0
+                while k2 < 256:
+                    atom_class[base + k2] = 1 - atom_class[base + k2]
+                    k2 = k2 + 1
+            atom_kind[ai] = 2
+        else:                                   # ordinary literal
+            atom_kind[ai] = 0
+            atom_ch[ai] = c
+            i = i + 1
+        # postfix '*'
+        if i < endp and strbuf[i] == 42:        # '*'
+            atom_star[ai] = 1
+            i = i + 1
+        else:
+            atom_star[ai] = 0
+        n_atoms = n_atoms + 1
+    return 0
+
+
+def atom_matches(ai: int32, ch: uint8) -> int32:
+    k: int32 = atom_kind[ai]
+    if k == 0:
+        if ch == atom_ch[ai]:
+            return 1
         return 0
-    if needle_len > hay_len:
-        return -1
-    limit: uint64 = hay_len - needle_len
-    i: uint64 = 0
-    while i <= limit:
-        j: uint64 = 0
-        hit: int32 = 1
-        while j < needle_len:
-            if hay[i + j] != pat[j]:
-                hit = 0
+    if k == 1:
+        return 1
+    if atom_class[cast[uint64](ai) * 256 + cast[uint64](ch)] != 0:
+        return 1
+    return 0
+
+
+# Recursive backtracking match starting atom ai at text index ti.
+# Returns the end index on success, or -1.
+def matchhere(ai: int32, ti: uint64) -> int64:
+    if ai == n_atoms:
+        if anchor_end == 1:
+            if ti == line_len:
+                return cast[int64](ti)
+            return -1
+        return cast[int64](ti)
+    if atom_star[ai] == 1:
+        count: uint64 = 0
+        while ti + count < line_len and atom_matches(ai, line[ti + count]) != 0:
+            count = count + 1
+        k: uint64 = count
+        while True:
+            r: int64 = matchhere(ai + 1, ti + k)
+            if r >= 0:
+                return r
+            if k == 0:
                 break
-            j = j + 1
-        if hit != 0:
+            k = k - 1
+        return -1
+    if ti < line_len and atom_matches(ai, line[ti]) != 0:
+        return matchhere(ai + 1, ti + 1)
+    return -1
+
+
+# Find the first match at or after `start`. Sets g_matchend on success.
+def find_from(start: uint64) -> int64:
+    if anchor_start == 1:
+        if start == 0:
+            r: int64 = matchhere(0, 0)
+            if r >= 0:
+                g_matchend = r
+                return 0
+        return -1
+    i: uint64 = start
+    while i <= line_len:
+        r2: int64 = matchhere(0, i)
+        if r2 >= 0:
+            g_matchend = r2
             return cast[int64](i)
         i = i + 1
     return -1
 
 
-def emit_line(line_len: uint64, pat_len: uint64, rep_len: uint64):
-    # Build out[] by copying line[], replacing the first pat match
-    # with rep, then write it + a newline in one shot.
-    hit: int64 = find_first(&line[0], line_len, pat_len)
-    if hit < 0:
-        sys_write(1, &line[0], line_len)
-        sys_write(1, "\n", 1)
+# Expand the replacement for command ci over the matched span [ms,me)
+# into sub_out (advancing the global `so`).
+def expand_rep(ci: int32, ms: uint64, me: uint64):
+    j: uint64 = cast[uint64](cmd_rep_off[ci])
+    endj: uint64 = j + cast[uint64](cmd_rep_len[ci])
+    while j < endj:
+        c: uint8 = strbuf[j]
+        if c == 38:                             # '&'
+            k: uint64 = ms
+            while k < me:
+                sub_out[so] = line[k]
+                so = so + 1
+                k = k + 1
+            j = j + 1
+        elif c == 92 and j + 1 < endj:          # '\' escape
+            nx: uint8 = strbuf[j + 1]
+            if nx == 110:                       # \n
+                sub_out[so] = 10
+            elif nx == 116:                     # \t
+                sub_out[so] = 9
+            else:
+                sub_out[so] = nx                # \& \\ \<c>
+            so = so + 1
+            j = j + 2
+        else:
+            sub_out[so] = c
+            so = so + 1
+            j = j + 1
+
+
+# Apply the s-command ci to the current line in place.
+# Returns 1 if at least one substitution happened.
+def do_subst(ci: int32) -> int32:
+    if compile_regex(cast[uint64](cmd_pat_off[ci]), cast[uint64](cmd_pat_len[ci])) != 0:
+        return 0
+    so = 0
+    pos: uint64 = 0
+    did: int32 = 0
+    while pos <= line_len:
+        ms: int64 = find_from(pos)
+        if ms < 0:
+            break
+        msu: uint64 = cast[uint64](ms)
+        me: uint64 = cast[uint64](g_matchend)
+        # copy line[pos..msu)
+        k: uint64 = pos
+        while k < msu:
+            sub_out[so] = line[k]
+            so = so + 1
+            k = k + 1
+        expand_rep(ci, msu, me)
+        did = 1
+        if me > msu:
+            pos = me
+        else:
+            if msu < line_len:
+                sub_out[so] = line[msu]
+                so = so + 1
+            pos = msu + 1
+        if cmd_g[ci] == 0:
+            break
+    # copy remaining line[pos..line_len)
+    while pos < line_len:
+        sub_out[so] = line[pos]
+        so = so + 1
+        pos = pos + 1
+    # copy sub_out back into line
+    m: uint64 = 0
+    while m < so:
+        line[m] = sub_out[m]
+        m = m + 1
+    line_len = so
+    return did
+
+
+# ------------------------------------------------------------------
+# Script parsing
+# ------------------------------------------------------------------
+def append_script(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0:
+        script_src[script_src_len] = s[i]
+        script_src_len = script_src_len + 1
+        i = i + 1
+    script_src[script_src_len] = 10             # separate with newline
+    script_src_len = script_src_len + 1
+
+
+def skip_seps():
+    while pc < script_src_len:
+        c: uint8 = script_src[pc]
+        if c == 10 or c == 59 or c == 32 or c == 9:   # \n ; space tab
+            pc = pc + 1
+        else:
+            break
+
+
+def skip_blanks():
+    while pc < script_src_len and (script_src[pc] == 32 or script_src[pc] == 9):
+        pc = pc + 1
+
+
+def parse_addr():
+    cur_a_type = 0
+    cur_a_val = 0
+    if pc >= script_src_len:
         return
-    hu: uint64 = cast[uint64](hit)
-    k: uint64 = 0
-    while k < hu:
-        out[k] = line[k]
-        k = k + 1
-    j: uint64 = 0
-    while j < rep_len:
-        out[k] = rep[j]
-        k = k + 1
-        j = j + 1
-    src: uint64 = hu + pat_len
-    while src < line_len:
-        out[k] = line[src]
-        k = k + 1
-        src = src + 1
-    sys_write(1, &out[0], k)
-    sys_write(1, "\n", 1)
+    c: uint8 = script_src[pc]
+    if is_digit(c) != 0:
+        v: int32 = 0
+        while pc < script_src_len and is_digit(script_src[pc]) != 0:
+            v = v * 10 + cast[int32](script_src[pc]) - 48
+            pc = pc + 1
+        cur_a_type = 1
+        cur_a_val = v
+    elif c == 36:                               # '$'
+        cur_a_type = 2
+        pc = pc + 1
 
 
-def main(argc: int32, argv: Ptr[uint64]) -> int32:
-    if argc < 2:
-        write_str(2, "sed: usage: sed 's/A/B/'\n")
-        return 1
-    pat_len_out: Array[1, uint64]
-    rep_len_out: Array[1, uint64]
-    expr: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
-    if parse_expr(expr, &pat_len_out[0], &rep_len_out[0]) != 0:
-        write_str(2, "sed: only s/A/B/ supported\n")
-        return 1
-    pat_len: uint64 = pat_len_out[0]
-    rep_len: uint64 = rep_len_out[0]
-
-    chunk: Array[256, uint8]
-    line_pos: uint64 = 0
+# Returns 0 on success, -1 on a parse error.
+def parse_commands() -> int32:
+    n_cmds = 0
     while True:
-        n: int64 = sys_read(0, &chunk[0], 256)
+        skip_seps()
+        if pc >= script_src_len:
+            break
+        if n_cmds >= MAX_CMDS:
+            return -1
+        ci: int32 = n_cmds
+        cmd_a1t[ci] = 0
+        cmd_a2t[ci] = 0
+        cmd_g[ci] = 0
+        cmd_pflag[ci] = 0
+        # address 1
+        parse_addr()
+        if cur_a_type != 0:
+            cmd_a1t[ci] = cur_a_type
+            cmd_a1v[ci] = cur_a_val
+            # optional ,addr2
+            if pc < script_src_len and script_src[pc] == 44:    # ','
+                pc = pc + 1
+                parse_addr()
+                if cur_a_type == 0:
+                    return -1
+                cmd_a2t[ci] = cur_a_type
+                cmd_a2v[ci] = cur_a_val
+        skip_blanks()
+        if pc >= script_src_len:
+            return -1
+        cmd: uint8 = script_src[pc]
+        if cmd == 115:                          # 's'
+            pc = pc + 1
+            if pc >= script_src_len:
+                return -1
+            delim: uint8 = script_src[pc]
+            pc = pc + 1
+            # pattern
+            cmd_pat_off[ci] = cast[int32](strbuf_len)
+            while pc < script_src_len and script_src[pc] != delim:
+                if script_src[pc] == 92 and pc + 1 < script_src_len and script_src[pc + 1] == delim:
+                    strbuf[strbuf_len] = delim
+                    strbuf_len = strbuf_len + 1
+                    pc = pc + 2
+                else:
+                    strbuf[strbuf_len] = script_src[pc]
+                    strbuf_len = strbuf_len + 1
+                    pc = pc + 1
+            cmd_pat_len[ci] = cast[int32](strbuf_len) - cmd_pat_off[ci]
+            if pc >= script_src_len or script_src[pc] != delim:
+                return -1
+            pc = pc + 1
+            # replacement
+            cmd_rep_off[ci] = cast[int32](strbuf_len)
+            while pc < script_src_len and script_src[pc] != delim:
+                if script_src[pc] == 92 and pc + 1 < script_src_len:
+                    strbuf[strbuf_len] = 92
+                    strbuf_len = strbuf_len + 1
+                    strbuf[strbuf_len] = script_src[pc + 1]
+                    strbuf_len = strbuf_len + 1
+                    pc = pc + 2
+                else:
+                    strbuf[strbuf_len] = script_src[pc]
+                    strbuf_len = strbuf_len + 1
+                    pc = pc + 1
+            cmd_rep_len[ci] = cast[int32](strbuf_len) - cmd_rep_off[ci]
+            if pc >= script_src_len or script_src[pc] != delim:
+                return -1
+            pc = pc + 1
+            # flags
+            while pc < script_src_len:
+                f: uint8 = script_src[pc]
+                if f == 103:                    # 'g'
+                    cmd_g[ci] = 1
+                    pc = pc + 1
+                elif f == 112:                  # 'p'
+                    cmd_pflag[ci] = 1
+                    pc = pc + 1
+                elif is_digit(f) != 0:          # numeric flag: accepted, ignored
+                    pc = pc + 1
+                else:
+                    break
+            cmd_kind[ci] = 0
+        elif cmd == 112:                        # 'p'
+            pc = pc + 1
+            cmd_kind[ci] = 1
+        elif cmd == 100:                        # 'd'
+            pc = pc + 1
+            cmd_kind[ci] = 2
+        else:
+            return -1
+        n_cmds = n_cmds + 1
+    return 0
+
+
+# ------------------------------------------------------------------
+# Input
+# ------------------------------------------------------------------
+def read_fd(fd: int32):
+    chunk: Array[4096, uint8]
+    while True:
+        n: int64 = sys_read(fd, &chunk[0], 4096)
         if n <= 0:
             break
         nu: uint64 = cast[uint64](n)
         i: uint64 = 0
         while i < nu:
-            c: uint8 = chunk[i]
-            if c == 10:
-                emit_line(line_pos, pat_len, rep_len)
-                line_pos = 0
-            else:
-                if line_pos + 1 < 1024:
-                    line[line_pos] = c
-                    line_pos = line_pos + 1
+            if input_len < 262144:
+                input_buf[input_len] = chunk[i]
+                input_len = input_len + 1
             i = i + 1
-    if line_pos > 0:
-        emit_line(line_pos, pat_len, rep_len)
+
+
+def build_line_index():
+    n_lines = 0
+    i: uint64 = 0
+    start: uint64 = 0
+    while i < input_len:
+        if input_buf[i] == 10:
+            if n_lines < 8192:
+                line_start[n_lines] = cast[int32](start)
+                line_size[n_lines] = cast[int32](i - start)
+                n_lines = n_lines + 1
+            start = i + 1
+        i = i + 1
+    if start < input_len:
+        if n_lines < 8192:
+            line_start[n_lines] = cast[int32](start)
+            line_size[n_lines] = cast[int32](input_len - start)
+            n_lines = n_lines + 1
+
+
+def addr_match(ci: int32, ln: int32) -> int32:
+    a1t: int32 = cmd_a1t[ci]
+    if a1t == 0:
+        return 1
+    startv: int32 = cmd_a1v[ci]
+    if a1t == 2:
+        startv = n_lines
+    a2t: int32 = cmd_a2t[ci]
+    if a2t == 0:
+        if ln == startv:
+            return 1
+        return 0
+    endv: int32 = cmd_a2v[ci]
+    if a2t == 2:
+        endv = n_lines
+    if ln >= startv and ln <= endv:
+        return 1
+    return 0
+
+
+def emit_line():
+    sys_write(1, &line[0], line_len)
+    sys_write(1, "\n", 1)
+
+
+def process():
+    ln: int32 = 1
+    while ln <= n_lines:
+        ls: uint64 = cast[uint64](line_start[ln - 1])
+        sz: uint64 = cast[uint64](line_size[ln - 1])
+        k: uint64 = 0
+        while k < sz:
+            line[k] = input_buf[ls + k]
+            k = k + 1
+        line_len = sz
+        deleted: int32 = 0
+        ci: int32 = 0
+        while ci < n_cmds:
+            if addr_match(ci, ln) != 0:
+                kind: int32 = cmd_kind[ci]
+                if kind == 2:                   # d
+                    deleted = 1
+                    break
+                elif kind == 1:                 # p
+                    emit_line()
+                else:                           # s
+                    r: int32 = do_subst(ci)
+                    if cmd_pflag[ci] == 1 and r == 1:
+                        emit_line()
+            ci = ci + 1
+        if deleted == 0 and suppress == 0:
+            emit_line()
+        ln = ln + 1
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    have_e: int32 = 0
+    script_set: int32 = 0
+    n_files: int32 = 0
+    files: Array[64, uint64]
+
+    i: int32 = 1
+    while i < argc:
+        arg: Ptr[uint8] = cast[Ptr[uint8]](argv[i])
+        if str_eq(arg, "-n") == 1:
+            suppress = 1
+        elif str_eq(arg, "-e") == 1:
+            i = i + 1
+            if i >= argc:
+                write_err("sed: -e needs an argument\n")
+                return 1
+            append_script(cast[Ptr[uint8]](argv[i]))
+            have_e = 1
+        elif arg[0] == 45 and arg[1] != 0:      # '-' + something: unknown flag
+            write_err("sed: unknown flag\n")
+            return 1
+        else:
+            if have_e == 0 and script_set == 0:
+                append_script(arg)
+                script_set = 1
+            else:
+                if n_files < 64:
+                    files[n_files] = argv[i]
+                    n_files = n_files + 1
+        i = i + 1
+
+    if have_e == 0 and script_set == 0:
+        write_err("sed: usage: sed [-n] {script | -e script ...} [file ...]\n")
+        return 1
+
+    if parse_commands() != 0:
+        write_err("sed: unsupported or malformed script\n")
+        return 1
+
+    if n_files == 0:
+        read_fd(0)
+    else:
+        fi: int32 = 0
+        while fi < n_files:
+            path: Ptr[char] = cast[Ptr[char]](files[fi])
+            fd: int32 = sys_open(path, 0, 0)
+            if fd < 0:
+                write_err("sed: cannot open ")
+                write_err(cast[Ptr[uint8]](path))
+                write_err("\n")
+                return 2
+            read_fd(fd)
+            sys_close(fd)
+            fi = fi + 1
+
+    build_line_index()
+    process()
     return 0
