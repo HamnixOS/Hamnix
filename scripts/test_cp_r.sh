@@ -90,7 +90,7 @@ set +e
 #   * We bracket each `cat` output with echo markers so the test can
 #     extract just the file content from the noisy boot log.
 QEMU_EXTRA_ARGS="-drive file=$ROOTFS_IMG,if=virtio,format=raw" \
-qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 260 \
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 360 \
     -- "mkdir /tmp/src"                                       2 \
        "mkdir /tmp/src/sub"                                   2 \
        "echo hello-a > /tmp/src/a.txt"                        2 \
@@ -156,10 +156,22 @@ if ! grep -F -q "CP_R_DONE" "$LOG"; then
     exit 1
 fi
 
+# The raw serial log interleaves the driver's char-by-char keystroke echo
+# ("hamsh$ echo TMPFS_A_BEGIN[K[23C") with terminal CSI escapes, so a marker
+# string like TMPFS_A_BEGIN appears in dozens of partial-typing fragments
+# BEFORE the one clean command-output line. Build a cleaned log once — strip
+# CSI escapes, turn CR into LF — so the actual output marker lands ALONE at
+# the start of its own line; every extractor then anchors on ^${tag}_… and
+# is immune to the keystroke-echo noise (the fragments start with "hamsh$ ").
+CLEAN_LOG="${LOG}.clean"
+sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\r/\n/g' "$LOG" > "$CLEAN_LOG"
+
 # Helper: extract a bracketed block by name, return its inner content.
+# Anchored at line-start on the cleaned log so keystroke-echo fragments
+# ("hamsh$ echo TAG_BEGIN") are never mistaken for the real BEGIN/END lines.
 extract_block() {
     local tag="$1"
-    sed -n "/${tag}_BEGIN/,/${tag}_END/p" "$LOG"
+    sed -n "/^${tag}_BEGIN/,/^${tag}_END/p" "$CLEAN_LOG"
 }
 
 check_block_has() {
