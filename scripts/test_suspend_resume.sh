@@ -36,7 +36,10 @@ ELF=build/hamnix-kernel.elf
 echo "[test_suspend] (1/3) Build (user + modules + initramfs + kernel)"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
-ENABLE_SUSPEND_TEST=1 python3 scripts/build_initramfs.py >/dev/null
+# ENABLE_HAMSH_HEARTBEAT=1: the post-resume assertion below keys on the
+# "[hamsh-alive] tick=" heartbeat, which is now OPT-IN (off on a normal
+# shipped boot). This plants the /etc/hamsh-heartbeat marker that arms it.
+ENABLE_SUSPEND_TEST=1 ENABLE_HAMSH_HEARTBEAT=1 python3 scripts/build_initramfs.py >/dev/null
 python3 -m compiler.adder compile --target=x86_64-bare-metal \
     init/main.ad -o "$ELF" >/dev/null
 

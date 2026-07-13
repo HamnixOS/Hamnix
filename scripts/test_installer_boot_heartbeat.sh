@@ -181,7 +181,15 @@ if [ ! -f "$IMG" ]; then
         exit 1
     fi
     say "image $IMG absent -- building via scripts/build_installer_img.sh (~14 min)"
-    HAMNIX_INSTALLER_IMG_OUT="$IMG" bash scripts/build_installer_img.sh
+    # The [hamsh-alive] heartbeat this gate keys on is OPT-IN — off on a
+    # normal shipped boot so the interactive console stays clean. Build the
+    # gate image with ENABLE_HAMSH_HEARTBEAT=1 so build_initramfs.py (invoked
+    # by build_installer_img.sh) plants the /etc/hamsh-heartbeat marker that
+    # arms it. NOTE: a SKIP_BUILD run against a pre-existing image REQUIRES
+    # that image to have been built with this flag, otherwise the heartbeat is
+    # (correctly) absent and this gate FAILs — rebuild via this script.
+    HAMNIX_INSTALLER_IMG_OUT="$IMG" ENABLE_HAMSH_HEARTBEAT=1 \
+        bash scripts/build_installer_img.sh
 fi
 if [ ! -f "$IMG" ]; then
     say "FAIL: $IMG still missing after build_installer_img.sh."

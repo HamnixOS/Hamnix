@@ -33,7 +33,11 @@ ELF=build/hamnix-kernel.elf
 echo "[test_hamsh_heartbeat] (1/3) Build"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
-python3 scripts/build_initramfs.py >/dev/null
+# The [hamsh-alive] heartbeat is OPT-IN (dev/CI liveness canary, kept off a
+# normal shipped boot's console). ENABLE_HAMSH_HEARTBEAT=1 plants the
+# /etc/hamsh-heartbeat marker hamsh's main() probes to arm it — without this
+# the heartbeat never fires and this gate would (correctly) see zero ticks.
+ENABLE_HAMSH_HEARTBEAT=1 python3 scripts/build_initramfs.py >/dev/null
 python3 -m compiler.adder compile --target=x86_64-bare-metal \
     init/main.ad -o "$ELF" >/dev/null
 

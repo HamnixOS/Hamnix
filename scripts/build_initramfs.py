@@ -131,6 +131,17 @@ for _hv_img in ("test.png", "test.jpg"):
 if os.environ.get("ENABLE_TLS_SMOKE") == "1":
     FILES.append(("/etc/tls-test", b"1\n"))
 
+# ENABLE_HAMSH_HEARTBEAT=1 plants /etc/hamsh-heartbeat. hamsh's main()
+# (user/hamsh.ad) probes for this marker at startup and only then arms the
+# periodic "[hamsh-alive] tick=N uptime=Ns" idle-loop heartbeat. That line
+# is a dev/CI liveness canary — on a normal shipped boot it would spam the
+# interactive serial/console prompt every ~3s, so it is OFF unless this
+# marker is present. The three gates that assert on the heartbeat set this:
+# scripts/test_hamsh_heartbeat.sh, scripts/test_suspend_resume.sh, and
+# scripts/test_installer_boot_heartbeat.sh (via build_installer_img.sh).
+if os.environ.get("ENABLE_HAMSH_HEARTBEAT") == "1":
+    FILES.append(("/etc/hamsh-heartbeat", b"1\n"))
+
 # ENABLE_SMAP_TEST=1 plants /etc/smap-test. init/main.ad gates
 # smap_enforced_test() on this marker — a positive SMAP-active proof that
 # does an un-stac'd CPL=0 read of a US=1 user page and asserts it #PF's
