@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# scripts/test_ctxmenu_host.sh — FAST, QEMU-free host gate for the MATE
+# context menus (Task #124). Compiles lib/ctxmenucore.ad (the shared menu
+# model, drawn through lib/hamscene.ad + rasterized by lib/hamui_host.ad) for
+# the x86_64-linux host target, renders the PANEL / APPLET / CHOOSER menus to
+# PNGs a human/agent can LOOK at, asserts the MATE labels + hit-testing, AND
+# confirms the touched NATIVE compositor (user/hamUId.ad) still compiles from
+# the same model — all in milliseconds, no QEMU.
+
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 1
+
+OUT="build/host"
+BIN="$OUT/ctxmenu_host"
+mkdir -p "$OUT"
+fail=0
+
+echo "[ctxmenu-host] compiling core+harness for x86_64-linux ..."
+if ! python3 -m compiler.adder compile --target=x86_64-linux \
+        user/ctxmenuscene_host.ad -o "$BIN" 2>"$OUT/ctxmenu_compile.log"; then
+    echo "[ctxmenu-host] FAIL: host harness did not compile"; cat "$OUT/ctxmenu_compile.log"; exit 1
+fi
+echo "[ctxmenu-host] PASS host harness compiled -> $BIN"
+
+echo "[ctxmenu-host] running host harness ..."
+DUMP="$OUT/ctxmenu_dump.txt"
+if ! "$BIN" "$OUT/ctxmenu_panel.ppm" "$OUT/ctxmenu_applet.ppm" \
+        "$OUT/ctxmenu_chooser.ppm" >"$DUMP" 2>&1; then
+    echo "[ctxmenu-host] FAIL: host harness exited non-zero"; cat "$DUMP"; exit 1
+fi
+
+for f in panel applet chooser; do
+    if python3 scripts/ppm_to_png.py "$OUT/ctxmenu_$f.ppm" "$OUT/ctxmenu_$f.png" 2>"$OUT/ctxmenu_png.log"; then
+        echo "[ctxmenu-host] PASS rendered $OUT/ctxmenu_$f.png ($(file -b "$OUT/ctxmenu_$f.png" 2>/dev/null))"
+    else
+        echo "[ctxmenu-host] FAIL png conversion ($f)"; cat "$OUT/ctxmenu_png.log"; fail=1
+    fi
+done
+
+assert_grep() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMP"; then
+        echo "[ctxmenu-host] PASS $msg"
+    else
+        echo "[ctxmenu-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# --- PANEL menu: the MATE labels appear in the display list ---------------
+assert_grep '^# scene v1 hamui'                       "scene header emitted"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Add to Panel\.\.\.\"' "panel: Add to Panel..."
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Properties\"'     "panel: Properties"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Reset All Panels\"' "panel: Reset All Panels"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Delete This Panel\"' "panel: Delete This Panel"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"New Panel\"'      "panel: New Panel"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Help\"'           "panel: Help"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"About Panels\"'   "panel: About Panels"
+
+# --- APPLET menu: per-applet Preferences + Move/Remove/Lock --------------
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Preferences\"'    "applet: Preferences"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Move\"'           "applet: Move"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Remove From Panel\"' "applet: Remove From Panel"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Lock To Panel\"'  "applet: Lock To Panel"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Clock\"'          "applet: caption names the Clock applet (decentralized prefs)"
+
+# --- CHOOSER: applet picker lists applets --------------------------------
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Application Launcher\"' "chooser: Application Launcher"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"System Monitor\"' "chooser: System Monitor"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Workspace Switcher\"' "chooser: Workspace Switcher"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Window List\"'    "chooser: Window List"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Add to Panel\"'   "chooser: title caption"
+
+# --- geometry + hit-testing ----------------------------------------------
+assert_grep '^MENU PANEL prims=[0-9]+ count=7 '       "panel menu has 7 rows"
+assert_grep '^MENU APPLET prims=[0-9]+ count=4 '      "applet menu has 4 rows"
+assert_grep '^MENU CHOOSER prims=[0-9]+ count=8 '     "chooser has 8 applet rows"
+assert_grep '^HIT panel 50 70 0'                      "hit-test: row 0 under the pointer"
+assert_grep '^HIT panel 50 130 3'                     "hit-test: Delete-This-Panel row 3"
+assert_grep '^HIT panel 50 10 -1'                     "hit-test: point above the box misses"
+assert_grep '^HIT applet 50 130 3'                    "hit-test: applet Lock row 3"
+assert_grep '^PIX 44 70 #4a6fa5'                      "raster: hovered row painted MATE selection blue"
+
+# --- NATIVE compositor still compiles from the shared model --------------
+echo "[ctxmenu-host] compiling NATIVE hamUId for x86_64-adder-user ..."
+if ! python3 -m compiler.adder compile --target=x86_64-adder-user \
+        user/hamUId.ad -o "$OUT/hamUId_native.elf" 2>"$OUT/ctxmenu_native.log"; then
+    echo "[ctxmenu-host] FAIL: native hamUId did not compile"; tail -40 "$OUT/ctxmenu_native.log"; fail=1
+else
+    echo "[ctxmenu-host] PASS native hamUId still compiles"
+fi
+
+if [ "$fail" -eq 0 ]; then
+    echo "[ctxmenu-host] RESULT: PASS"
+    exit 0
+else
+    echo "[ctxmenu-host] RESULT: FAIL"
+    exit 1
+fi
