@@ -11,10 +11,15 @@
 #     4. extract into a fresh dir and `cat` the extracted files —
 #        assert the contents round-trip.
 #
-#   gzip / gunzip (our own stored-block output round-trips):
+#   gzip / gunzip (our own fixed-Huffman + LZ77 output round-trips):
 #     5. `gzip -k f1`                      (keep the original)
 #     6. `gunzip -c f1.gz`                 (to stdout) — assert it
 #        reproduces f1's contents.
+#
+#   tar -czf (native gzip WRITE side, lib/zlib/deflate.ad):
+#     8. `tar -czf g.tgz f1 f2` then `tar -tzf` / `tar -xzf -C` — assert
+#        both members list and their bytes round-trip through our own
+#        inflate (the encoder the host gate proves Linux-interoperable).
 #
 #   gunzip on a REAL host-gzip file (the load-bearing assertion):
 #     7. a .gz produced by the HOST's Python gzip (dynamic-Huffman
@@ -97,6 +102,16 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 300 \
        "cat /tmp/gzex/tgtree/a.txt"                             2 \
        "cat /tmp/gzex/tgtree/sub/b.txt"                         2 \
        "echo TG_TARGZ_CAT_DONE"                                 2 \
+       "tar -czf /tmp/g.tgz f1 f2"                              3 \
+       "echo TG_CZF_CREATED"                                    2 \
+       "tar -tzf /tmp/g.tgz"                                    3 \
+       "echo TG_CZF_LISTED"                                     2 \
+       "mkdir /tmp/czex"                                        2 \
+       "tar -xzf /tmp/g.tgz -C /tmp/czex"                       3 \
+       "echo TG_CZF_EXTRACTED"                                  2 \
+       "cat /tmp/czex/f1"                                       2 \
+       "cat /tmp/czex/f2"                                       2 \
+       "echo TG_CZF_CAT_DONE"                                   2 \
        "exit"                                                   2
 rc="$QEMU_DRIVE_RC"
 set -e
@@ -146,7 +161,7 @@ fi
 # 4. gunzip of our own gzip output round-trips.
 own_block=$(sed -n '/TG_GZIP_DONE/,/TG_GUNZIP_OWN_DONE/p' "$LOG")
 if echo "$own_block" | grep -F -q "hello-from-f1"; then
-    echo "[test_tar_gzip] OK: gzip|gunzip round-trips our own stored-block .gz"
+    echo "[test_tar_gzip] OK: gzip|gunzip round-trips our own fixed-Huffman .gz"
 else
     echo "[test_tar_gzip] FAIL: gunzip of our gzip output did not reproduce f1"
     fail=1
@@ -180,6 +195,29 @@ if echo "$tgz_cat" | grep -F -q "gz-member-one-payload" \
     echo "[test_tar_gzip] OK: tar -xzf -C extracted a real .tar.gz, bytes match"
 else
     echo "[test_tar_gzip] FAIL: tar -xzf -C did not reproduce the .tar.gz members"
+    fail=1
+fi
+
+# 8. `tar -czf` (native gzip WRITE side, fixed-Huffman + LZ77 via
+#    lib/zlib/deflate.ad) then `tar -tzf` must list both members —
+#    proving the compressed stream is self-consistent through our own
+#    inflate (the same encoder the host gate proves Linux-interoperable).
+czf_list=$(sed -n '/TG_CZF_CREATED/,/TG_CZF_LISTED/p' "$LOG")
+if echo "$czf_list" | grep -E -q '(^|[^a-z])f1([^0-9a-z]|$)' \
+   && echo "$czf_list" | grep -E -q '(^|[^a-z])f2([^0-9a-z]|$)'; then
+    echo "[test_tar_gzip] OK: tar -czf|-tzf listed both members of our own .tar.gz"
+else
+    echo "[test_tar_gzip] FAIL: tar -czf output did not list f1 and f2 via -tzf"
+    fail=1
+fi
+
+# 9. `tar -xzf` our own -czf archive round-trips the member bytes.
+czf_cat=$(sed -n '/TG_CZF_EXTRACTED/,/TG_CZF_CAT_DONE/p' "$LOG")
+if echo "$czf_cat" | grep -F -q "hello-from-f1" \
+   && echo "$czf_cat" | grep -F -q "second-file-2"; then
+    echo "[test_tar_gzip] OK: tar -czf|-xzf round-trips (native gzip write side works)"
+else
+    echo "[test_tar_gzip] FAIL: tar -xzf of our -czf archive did not reproduce members"
     fail=1
 fi
 

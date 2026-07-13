@@ -172,8 +172,8 @@ build_adder_user less                 # alias for more (24-line pager)
 build_adder_user xargs                # stdin tokens -> sys_spawn argv
 build_adder_user ascii                # printable ASCII 32..126 table
 build_adder_user base64               # M16.86: RFC 4648 encode/decode
-build_adder_user tar                  # native ustar (POSIX tar): -c/-x/-t -f ARCHIVE
-build_adder_user gzip                 # native gzip: stored-block DEFLATE + .gz framing; -d via inflate
+build_adder_user tar                  # native ustar (POSIX tar): -c/-x/-t -f ARCHIVE; -z read (inflate) + write (-czf, lib/zlib/deflate)
+build_adder_user gzip                 # native gzip: fixed-Huffman + LZ77 DEFLATE (lib/zlib/deflate) + .gz framing; -d via inflate
 build_adder_user gunzip               # native gunzip: full INFLATE (stored/fixed/dynamic) via lib/zlib/inflate
 build_adder_user md5sum               # M16.86: fixed-hash stub (real MD5 deferred)
 build_adder_user env_show             # M16.86: hint about hamsh's `env` builtin

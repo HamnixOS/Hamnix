@@ -11,12 +11,13 @@
 #   gzip -dk FILE.gz   # decompress and keep
 #   gzip -dc FILE.gz   # decompress to stdout
 #
-# COMPRESSION (v1): we emit a valid gzip member whose DEFLATE payload is
-# STORED (uncompressed) blocks, BTYPE=00 (RFC 1951 §3.2.4). This is a
-# legal gzip stream that any conformant `gunzip` (GNU, zlib, our own)
-# reads back identically — correctness first, ratio later. A stored
-# block carries at most 65535 payload bytes; we chunk the input into
-# 65535-byte blocks, the last one flagged BFINAL.
+# COMPRESSION (v2): real fixed-Huffman DEFLATE (BTYPE=01, RFC 1951
+# §3.2.6) with LZ77 back-references, via lib/zlib/deflate.ad. The input
+# is streamed one <= 32 KiB block at a time; each block is a fixed-
+# Huffman block whose literal/length + distance symbols compress
+# repeats, the last flagged BFINAL. This is genuine compression, and the
+# stream is byte-exact-readable by any conformant `gunzip` (GNU, zlib,
+# python, our own inflate). The encoder owns the CRC32/ISIZE trailer.
 #
 # gzip framing (RFC 1952): 10-byte header
 #   ID1=0x1f ID2=0x8b CM=8 FLG=0 MTIME=0 XFL=0 OS=0xff
@@ -32,6 +33,15 @@ from lib.zlib.inflate import (
     InflateState,
     inflate_init,
     inflate_feed,
+)
+
+from lib.zlib.deflate import (
+    Deflater,
+    deflate_init,
+    deflate_gzip_header,
+    deflate_block,
+    deflate_finish,
+    deflate_reset_out,
 )
 
 extern def sys_open(path: Ptr[char]) -> int32
@@ -53,49 +63,19 @@ def write_str(fd: int32, s: Ptr[uint8]):
     sys_write(fd, s, strlen_u8(s))
 
 
-# ---- CRC32 (IEEE 0xEDB88320, gzip/PNG reflected) --------------------
-
-_gz_crc32_tbl:        Array[256, uint32]
-_gz_crc32_tbl_inited: int32 = 0
-
-
-def _gz_crc32_init():
-    if _gz_crc32_tbl_inited != 0:
-        return
-    i: uint32 = 0
-    while i < 256:
-        c: uint32 = i
-        j: int32 = 0
-        while j < 8:
-            if (c & 1) != 0:
-                c = (c >> 1) ^ 0xEDB88320
-            else:
-                c = c >> 1
-            j = j + 1
-        _gz_crc32_tbl[i] = c
-        i = i + 1
-    _gz_crc32_tbl_inited = 1
-
-
-def _gz_crc32_update(crc: uint32, buf: Ptr[uint8], len: uint64) -> uint32:
-    c: uint32 = crc
-    i: uint64 = 0
-    while i < len:
-        idx: uint32 = (c ^ cast[uint32](buf[i])) & 0xFF
-        c = (c >> 8) ^ _gz_crc32_tbl[idx]
-        i = i + 1
-    return c
-
-
-# ---- I/O buffers -----------------------------------------------------
+# ---- compression I/O buffers -----------------------------------------
 #
-# Compression reads the input in 65535-byte windows (one DEFLATE stored
-# block each), so one buffer of that size covers a whole block. The
-# 5-byte stored-block header (BFINAL+BTYPE byte then LEN/NLEN) is built
-# in a tiny stack array.
+# Compression streams the input one <= 32 KiB block at a time (the
+# DEFLATE 32 KiB window), each becoming one fixed-Huffman block. The
+# deflater packs bits into out_blk; after each block we drain out_blk to
+# the fd and rewind it. Worst-case fixed-Huffman expansion of a 32 KiB
+# block is ~9/8 (all 9-bit literals) ~= 37 KiB, so a 64 KiB staging
+# buffer never overflows.
 
-STORED_MAX: uint64 = 65535
-in_blk:  Array[65535, uint8]
+DEFL_BLOCK: uint64 = 32768
+in_blk:  Array[32768, uint8]
+out_blk: Array[65536, uint8]
+deflater: Deflater
 
 # Decompression staging: a feed-input buffer and a drain-output buffer.
 INF_IN:  uint64 = 65536
@@ -118,49 +98,39 @@ def write_all(fd: int32, buf: Ptr[uint8], len: uint64) -> int32:
 
 
 # ---- compression -----------------------------------------------------
+#
+# Stream the input a <= 32 KiB block at a time through the fixed-Huffman
+# + LZ77 encoder (lib/zlib/deflate.ad). BFINAL must be known before a
+# block is emitted, so we carry a single look-ahead byte across block
+# boundaries: after filling a block we read ONE more byte — if it
+# arrives, more input follows (this block is NOT final) and the byte
+# seeds the next block; otherwise the block is final.
 
-def write_gzip_header(out_fd: int32) -> int32:
-    h: Array[10, uint8]
-    h[0] = 0x1F
-    h[1] = 0x8B
-    h[2] = 8            # CM = DEFLATE
-    h[3] = 0            # FLG
-    h[4] = 0            # MTIME
-    h[5] = 0
-    h[6] = 0
-    h[7] = 0
-    h[8] = 0            # XFL
-    h[9] = 0xFF         # OS = unknown
-    return write_all(out_fd, &h[0], 10)
+def _drain(out_fd: int32) -> int32:
+    rc: int32 = write_all(out_fd, &out_blk[0], deflater.pos)
+    deflate_reset_out(&deflater)
+    return rc
 
 
 def compress(in_fd: int32, out_fd: int32) -> int32:
-    _gz_crc32_init()
-    if write_gzip_header(out_fd) != 0:
+    deflate_init(&deflater, &out_blk[0], 65536)
+    deflate_gzip_header(&deflater)
+    if _drain(out_fd) != 0:
         return -1
-    crc: uint32 = 0xFFFFFFFF
-    isize: uint64 = 0
-    # We emit one DEFLATE stored block per <= 65535-byte input chunk.
-    # BFINAL must be known before a block's header is written, so we
-    # carry a single look-ahead byte across block boundaries: after
-    # filling a block to STORED_MAX we read ONE more byte. If it
-    # arrives, more input follows (this block is NOT final) and the
-    # byte seeds the next block; otherwise the block is final.
     have:   uint64 = 0        # payload bytes buffered in in_blk
     carried: int32 = 0        # 1 == in_blk[0] holds a carried look-ahead
     wrote_any: int32 = 0      # 1 once at least one block was emitted
     probe: Array[1, uint8]
     while True:
-        # Fill in_blk up to STORED_MAX, preserving any carried byte at [0].
         if carried != 0:
             have = 1
             carried = 0
         else:
             have = 0
-        while have < STORED_MAX:
+        while have < DEFL_BLOCK:
             n: int64 = sys_read(in_fd,
                                 cast[Ptr[uint8]](cast[uint64](&in_blk[0]) + have),
-                                STORED_MAX - have)
+                                DEFL_BLOCK - have)
             if n < 0:
                 return -1
             if n == 0:
@@ -168,59 +138,34 @@ def compress(in_fd: int32, out_fd: int32) -> int32:
             have = have + cast[uint64](n)
         if have == 0:
             # Clean EOF with nothing buffered. If we never wrote a block
-            # (empty input), emit one empty BFINAL stored block.
+            # (empty input), emit one empty BFINAL block.
             if wrote_any == 0:
-                bh0: Array[5, uint8]
-                bh0[0] = 1
-                bh0[1] = 0
-                bh0[2] = 0
-                bh0[3] = 0xFF
-                bh0[4] = 0xFF
-                if write_all(out_fd, &bh0[0], 5) != 0:
+                deflate_block(&deflater, &in_blk[0], 0, 1)
+                if _drain(out_fd) != 0:
                     return -1
             break
         # One-byte look-ahead to decide BFINAL.
         is_final: int32 = 1
-        if have == STORED_MAX:
+        if have == DEFL_BLOCK:
             pn: int64 = sys_read(in_fd, &probe[0], 1)
             if pn > 0:
                 is_final = 0
-        bh: Array[5, uint8]
-        if is_final != 0:
-            bh[0] = 1
-        else:
-            bh[0] = 0
-        ln: uint64 = have
-        bh[1] = cast[uint8](ln & 0xFF)
-        bh[2] = cast[uint8]((ln >> 8) & 0xFF)
-        nlen: uint64 = (~ln) & 0xFFFF
-        bh[3] = cast[uint8](nlen & 0xFF)
-        bh[4] = cast[uint8]((nlen >> 8) & 0xFF)
-        if write_all(out_fd, &bh[0], 5) != 0:
+        deflate_block(&deflater, &in_blk[0], have, is_final)
+        if _drain(out_fd) != 0:
             return -1
-        if write_all(out_fd, &in_blk[0], have) != 0:
-            return -1
-        crc = _gz_crc32_update(crc, &in_blk[0], have)
-        isize = isize + have
         wrote_any = 1
         if is_final != 0:
             break
         # Seed the next block with the carried look-ahead byte.
         in_blk[0] = probe[0]
         carried = 1
-    # Trailer: CRC32 (final = crc ^ 0xFFFFFFFF) + ISIZE, little-endian.
-    final_crc: uint32 = crc ^ 0xFFFFFFFF
-    tr: Array[8, uint8]
-    tr[0] = cast[uint8](final_crc & 0xFF)
-    tr[1] = cast[uint8]((final_crc >> 8) & 0xFF)
-    tr[2] = cast[uint8]((final_crc >> 16) & 0xFF)
-    tr[3] = cast[uint8]((final_crc >> 24) & 0xFF)
-    is32: uint32 = cast[uint32](isize & 0xFFFFFFFF)
-    tr[4] = cast[uint8](is32 & 0xFF)
-    tr[5] = cast[uint8]((is32 >> 8) & 0xFF)
-    tr[6] = cast[uint8]((is32 >> 16) & 0xFF)
-    tr[7] = cast[uint8]((is32 >> 24) & 0xFF)
-    return write_all(out_fd, &tr[0], 8)
+    # Flush residual bits + CRC32/ISIZE trailer (encoder owns the CRC).
+    deflate_finish(&deflater)
+    if _drain(out_fd) != 0:
+        return -1
+    if deflater.overflow != 0:
+        return -1
+    return 0
 
 
 # ---- decompression (shared with gunzip) ------------------------------

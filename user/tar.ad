@@ -8,15 +8,17 @@
 #   tar -c -f ARCHIVE FILE...     # create  (also: tar -cf ARCHIVE ...)
 #   tar -x -f ARCHIVE [-C DIR]    # extract (optionally under DIR)
 #   tar -t -f ARCHIVE             # list
+#   tar -czf A.tar.gz FILE...     # create a gzip-compressed archive
 #   tar -tzf A.tar.gz             # list a gzip-compressed archive
 #   tar -xzf A.tar.gz [-C DIR]    # extract a gzip-compressed archive
 #   add -v for verbose (print file names)
 #
 # READING .tar.gz (-z): the compressed byte stream is inflated on the
 # fly via lib/zlib/inflate.ad (the gunzip code path), so -tzf/-xzf read
-# any real .tar.gz (e.g. an hpm package tarball). Creating a .tar.gz
-# (-cz) needs DEFLATE and is a documented follow-up; use `tar -cf` then
-# `gzip` for now.
+# any real .tar.gz (e.g. an hpm package tarball). WRITING .tar.gz (-cz):
+# the ustar byte stream is deflated on the fly via lib/zlib/deflate.ad
+# (fixed-Huffman + LZ77), producing a gzip member Linux `tar -tzf`/
+# `gunzip` read back byte-exact.
 # -C DIR (extract): prepend DIR to each member path (mkdir -p DIR first).
 #
 # WIRE FORMAT — ustar (POSIX.1-1988), 512-byte blocks:
@@ -52,6 +54,20 @@ from lib.zlib.inflate import (
     InflateState,
     inflate_init,
     inflate_feed,
+)
+
+# DEFLATE encoder drives the `-cz` write side: `tar -czf A.tar.gz ...`
+# gzip-compresses the ustar byte stream on the fly (fixed-Huffman +
+# LZ77), so a native .tar.gz is produced without a separate `gzip` pass.
+# Every ustar byte the create walk emits is funnelled through arc_out(),
+# which in gzip mode stages bytes into 32 KiB blocks and deflates each.
+from lib.zlib.deflate import (
+    Deflater,
+    deflate_init,
+    deflate_gzip_header,
+    deflate_block,
+    deflate_finish,
+    deflate_reset_out,
 )
 
 PATH_CAP:  uint64 = 256
@@ -334,16 +350,102 @@ def hdr_finalize(typeflag: uint8, size: uint64, mode: uint64):
 
 
 # Write a single block (512 bytes) to out_fd. Returns 0 / -1.
-def write_block(out_fd: int32, blk: Ptr[uint8]) -> int32:
+# ---- create-side output sink (plain fd OR gzip compressor) -----------
+#
+# The create walk emits ustar bytes exclusively through arc_out(). In
+# plain mode they go straight to the fd. In gzip mode (`-cz`) they are
+# staged into 32 KiB blocks and each block is fixed-Huffman + LZ77
+# deflated (lib/zlib/deflate.ad) into a gzip member. gz_create gates the
+# mode; it is set by do_create when `-z` was requested.
+
+DEFL_BLK:    uint64 = 32768
+gz_create:   int32 = 0
+gz_stage:    Array[32768, uint8]
+gz_stage_n:  uint64 = 0
+gz_outblk:   Array[65536, uint8]
+tar_dfl:     Deflater
+
+
+def _gz_drain(out_fd: int32) -> int32:
     wrote: uint64 = 0
-    while wrote < BLOCK:
+    while wrote < tar_dfl.pos:
         wr: int64 = sys_write(out_fd,
-                              cast[Ptr[uint8]](cast[uint64](blk) + wrote),
-                              BLOCK - wrote)
+                              cast[Ptr[uint8]](cast[uint64](&gz_outblk[0]) + wrote),
+                              tar_dfl.pos - wrote)
         if wr <= 0:
             return -1
         wrote = wrote + cast[uint64](wr)
+    deflate_reset_out(&tar_dfl)
     return 0
+
+
+# Deflate the staged block (final flag set on the archive's last block).
+def _gz_flush_block(out_fd: int32, is_final: int32) -> int32:
+    deflate_block(&tar_dfl, &gz_stage[0], gz_stage_n, is_final)
+    gz_stage_n = 0
+    return _gz_drain(out_fd)
+
+
+# Begin the gzip member: 10-byte header, drained to the fd.
+def arc_out_begin(out_fd: int32) -> int32:
+    if gz_create == 0:
+        return 0
+    deflate_init(&tar_dfl, &gz_outblk[0], 65536)
+    deflate_gzip_header(&tar_dfl)
+    gz_stage_n = 0
+    return _gz_drain(out_fd)
+
+
+# Funnel `length` archive bytes to the output. Plain: straight write.
+# Gzip: stage into 32 KiB blocks, deflating each full (non-final) block.
+def arc_out(out_fd: int32, buf: Ptr[uint8], length: uint64) -> int32:
+    if gz_create == 0:
+        wrote: uint64 = 0
+        while wrote < length:
+            wr: int64 = sys_write(out_fd,
+                                  cast[Ptr[uint8]](cast[uint64](buf) + wrote),
+                                  length - wrote)
+            if wr <= 0:
+                return -1
+            wrote = wrote + cast[uint64](wr)
+        return 0
+    off: uint64 = 0
+    while off < length:
+        room: uint64 = DEFL_BLK - gz_stage_n
+        take: uint64 = length - off
+        if take > room:
+            take = room
+        k: uint64 = 0
+        while k < take:
+            gz_stage[gz_stage_n + k] = buf[off + k]
+            k = k + 1
+        gz_stage_n = gz_stage_n + take
+        off = off + take
+        if gz_stage_n == DEFL_BLK:
+            # More bytes surely follow (terminator blocks at least), so
+            # this block is not final.
+            if _gz_flush_block(out_fd, 0) != 0:
+                return -1
+    return 0
+
+
+# Finish the gzip member: deflate the residual block as BFINAL, then the
+# CRC32/ISIZE trailer. No-op in plain mode.
+def arc_out_finish(out_fd: int32) -> int32:
+    if gz_create == 0:
+        return 0
+    if _gz_flush_block(out_fd, 1) != 0:
+        return -1
+    deflate_finish(&tar_dfl)
+    if _gz_drain(out_fd) != 0:
+        return -1
+    if tar_dfl.overflow != 0:
+        return -1
+    return 0
+
+
+def write_block(out_fd: int32, blk: Ptr[uint8]) -> int32:
+    return arc_out(out_fd, blk, BLOCK)
 
 
 # Read exactly `count` bytes (<=512) into buf. Returns the byte count
@@ -390,15 +492,9 @@ def emit_file_body(out_fd: int32, src: Ptr[char], size: uint64) -> int32:
         if n <= 0:
             break
         nu: uint64 = cast[uint64](n)
-        wrote: uint64 = 0
-        while wrote < nu:
-            wr: int64 = sys_write(out_fd,
-                                  cast[Ptr[uint8]](cast[uint64](&io_buf[0]) + wrote),
-                                  nu - wrote)
-            if wr <= 0:
-                sys_close(in_fd)
-                return -1
-            wrote = wrote + cast[uint64](wr)
+        if arc_out(out_fd, &io_buf[0], nu) != 0:
+            sys_close(in_fd)
+            return -1
         remaining = remaining - nu
     sys_close(in_fd)
     # Pad to the next 512-byte boundary: write exactly (512 - size%512)
@@ -406,14 +502,8 @@ def emit_file_body(out_fd: int32, src: Ptr[char], size: uint64) -> int32:
     rem: uint64 = size & 511
     if rem != 0:
         padn: uint64 = BLOCK - rem
-        wrote2: uint64 = 0
-        while wrote2 < padn:
-            wr2: int64 = sys_write(out_fd,
-                                   cast[Ptr[uint8]](cast[uint64](&zero_blk[0]) + wrote2),
-                                   padn - wrote2)
-            if wr2 <= 0:
-                return -1
-            wrote2 = wrote2 + cast[uint64](wr2)
+        if arc_out(out_fd, &zero_blk[0], padn) != 0:
+            return -1
     return 0
 
 
@@ -559,6 +649,10 @@ def do_create(archive: Ptr[char], files: Ptr[uint64], first: int32,
         write_str(2, cast[Ptr[uint8]](archive))
         write_str(2, "\n")
         return 1
+    if arc_out_begin(out_fd) != 0:
+        write_str(2, "tar: gzip write error\n")
+        sys_close(out_fd)
+        return 1
     i: int32 = first
     while i < argc:
         arg: Ptr[char] = cast[Ptr[char]](files[cast[uint64](i)])
@@ -567,6 +661,10 @@ def do_create(archive: Ptr[char], files: Ptr[uint64], first: int32,
     # Two zero blocks terminate.
     write_block(out_fd, &zero_blk[0])
     write_block(out_fd, &zero_blk[0])
+    if arc_out_finish(out_fd) != 0:
+        write_str(2, "tar: gzip write error\n")
+        sys_close(out_fd)
+        return 1
     sys_close(out_fd)
     return 0
 
@@ -841,10 +939,8 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         write_str(2, "tar: -f ARCHIVE is required\n")
         return 1
     if gz_mode != 0 and mode == 99:
-        # Gzip is a read-side feature (-tzf / -xzf). Creating a .tar.gz
-        # needs DEFLATE, which is a documented follow-up.
-        write_str(2, "tar: -z create (gzip compression) is not supported; use plain -cf then gzip\n")
-        return 1
+        # `-cz`: gzip-compress the ustar stream on the fly (arc_out).
+        gz_create = 1
 
     archive: Ptr[char] = cast[Ptr[char]](argv[cast[uint64](archive_idx)])
 
