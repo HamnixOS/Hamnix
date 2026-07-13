@@ -2425,6 +2425,37 @@ elif os.path.exists(_DG2_HOST_PEM):
     except (FileNotFoundError, subprocess.CalledProcessError):
         pass
 
+# BUG #127 cert validation: bake the production GTS Root R1 anchor
+# (RSA-4096, sha256WithRSAEncryption chain) into the initramfs at
+# /etc/tls-ca-gts-r1.der. This root (Google Trust Services) anchors
+# *.google.com and the huge share of the web behind Google Trust
+# Services — the presented chain is leaf(*.google.com, ECDSA-P256) ->
+# WR2 (RSA-2048) -> GTS Root R1 (RSA-4096). Every signature in the
+# chain is sha256WithRSAEncryption, so it reuses the same audited
+# RSA PKCS#1 v1.5 + SHA-256 verify path as ISRG X1 / DigiCert G2 (the
+# ECDSA-P256 leaf key is only used in the TLS CertificateVerify, which
+# is already supported). Without this anchor, google.com fails X.509
+# chain validation ("no trusted root") -> TLS handshake fails ->
+# hambrowse shows "Fetch failed". We prefer the checked-in DER fixture
+# (deterministic) and fall back to the host trust store.
+_GTS_FIXTURE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "tests", "fixtures", "gts_root_r1.der")
+_GTS_HOST_PEM = "/etc/ssl/certs/GTS_Root_R1.pem"
+if os.path.exists(_GTS_FIXTURE):
+    with open(_GTS_FIXTURE, "rb") as _f:
+        FILES.append(("/etc/tls-ca-gts-r1.der", _f.read()))
+elif os.path.exists(_GTS_HOST_PEM):
+    import subprocess
+    try:
+        _gts_der = subprocess.run(
+            ["openssl", "x509", "-in", _GTS_HOST_PEM, "-outform", "DER"],
+            check=True, capture_output=True,
+        ).stdout
+        FILES.append(("/etc/tls-ca-gts-r1.der", _gts_der))
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
 # Test-fixture anchor: scripts/test_net_https.sh writes a path to its
 # generated Hamnix Test CA DER into TLS_CA_DER, and we plant it here.
 # The kernel adds it to the CA store in addition to ISRG Root X1 so the

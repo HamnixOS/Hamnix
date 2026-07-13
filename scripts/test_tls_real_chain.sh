@@ -11,24 +11,31 @@
 # Anchors baked (identical to _tls_validation_init() in drivers/net/tls.ad):
 #   - ISRG Root X1        (Let's Encrypt)          -> host /etc/ssl/certs
 #   - DigiCert Global Root G2                      -> tests/fixtures/*.der
+#   - GTS Root R1         (Google Trust Services)  -> tests/fixtures/*.der
 #
 # Sites (each rooted at one of the baked anchors):
 #   - valid-isrgrootx1.letsencrypt.org  RSA v1.5 SHA-256 -> ISRG Root X1
 #   - www.debian.org                    RSA v1.5 SHA-256 -> ISRG Root X1  (apt)
 #   - www.digicert.com                  RSA v1.5 SHA-256 -> DigiCert G2
 #   - www.microsoft.com                 RSA v1.5 SHA-384 -> DigiCert G2   (v8)
+#   - google.com                        RSA v1.5 SHA-256 -> GTS Root R1   (#127)
+#
+# BUG #127: google.com previously failed ("no trusted root" -> hambrowse
+# "Fetch failed"). Its live chain is leaf(*.google.com, ECDSA-P256) ->
+# WR2 (RSA-2048) -> GTS Root R1 (RSA-4096), every signature
+# sha256WithRSAEncryption — no P-384 anywhere (the old "google is a P-384
+# gap" note was stale; the only gap was the missing GTS Root R1 anchor).
 #
 # If the host has no outbound TLS egress (CI sandbox), the gate SKIPs
 # (exit 0) — the OFFLINE sha256/384/512 dispatch is guarded deterministically
-# by scripts/test_tls_rsa_sigalg.sh, and ECDSA/P-384 chains (github, ietf,
-# google) are a documented gap (no P-384 curve yet).
+# by scripts/test_tls_rsa_sigalg.sh.
 #
 # PASS criterion: at least one real chain validated AND zero validated-FAIL.
 
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-HOSTS=(valid-isrgrootx1.letsencrypt.org www.debian.org www.digicert.com www.microsoft.com)
+HOSTS=(valid-isrgrootx1.letsencrypt.org www.debian.org www.digicert.com www.microsoft.com google.com)
 OUT="build/host"
 TMP="$(mktemp -d -t hamnix-realchain-XXXXXX)"
 FIX="tests/_real_chain_live.ad"
@@ -39,15 +46,18 @@ trap cleanup EXIT
 
 ISRG_PEM="/etc/ssl/certs/ISRG_Root_X1.pem"
 DG2_DER="tests/fixtures/digicert_global_root_g2.der"
+GTS_DER="tests/fixtures/gts_root_r1.der"
 
 # --- anchors: emit DER to temp files ---------------------------------------
 ANCHOR_ISRG="$TMP/isrg_x1.der"
 ANCHOR_DG2="$TMP/digicert_g2.der"
+ANCHOR_GTS="$TMP/gts_r1.der"
 have_isrg=0
 if [[ -f "$ISRG_PEM" ]] && openssl x509 -in "$ISRG_PEM" -outform DER -out "$ANCHOR_ISRG" 2>/dev/null; then
     have_isrg=1
 fi
 cp "$DG2_DER" "$ANCHOR_DG2"
+cp "$GTS_DER" "$ANCHOR_GTS"
 
 # --- fetch live chains ------------------------------------------------------
 declare -a GOT_HOSTS
@@ -68,13 +78,13 @@ if [[ ${#GOT_HOSTS[@]} -eq 0 ]]; then
 fi
 
 # --- generate the host fixture from the fetched DER ------------------------
-python3 - "$TMP" "$have_isrg" "$ANCHOR_ISRG" "$ANCHOR_DG2" "$FIX" "${GOT_HOSTS[@]}" <<'PYEOF'
+python3 - "$TMP" "$have_isrg" "$ANCHOR_ISRG" "$ANCHOR_DG2" "$ANCHOR_GTS" "$FIX" "${GOT_HOSTS[@]}" <<'PYEOF'
 import sys, time, os, re
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
-tmp, have_isrg, anchor_isrg, anchor_dg2, out = sys.argv[1:6]
-hosts = sys.argv[6:]
+tmp, have_isrg, anchor_isrg, anchor_dg2, anchor_gts, out = sys.argv[1:7]
+hosts = sys.argv[7:]
 have_isrg = have_isrg == "1"
 
 def split_pem(path):
@@ -98,7 +108,8 @@ def split_pem(path):
 
 def der(c): return c.public_bytes(serialization.Encoding.DER)
 
-anchors = [("anchor_dg2", open(anchor_dg2,"rb").read())]
+anchors = [("anchor_dg2", open(anchor_dg2,"rb").read()),
+           ("anchor_gts", open(anchor_gts,"rb").read())]
 if have_isrg:
     anchors.insert(0, ("anchor_isrg", open(anchor_isrg,"rb").read()))
 
