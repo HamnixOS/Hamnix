@@ -333,6 +333,125 @@ else
     echo "[2048-host] FAIL control leak did not grow — bounded-growth gate would be a dead assertion"; fail=1
 fi
 
+# --- WIN / LOSE INDICATION (the missing overlay bug) ----------------------
+# Before this fix reaching 2048 (win) or filling the board with no legal move
+# (lose) surfaced nothing usable — the player could not tell they had won or
+# lost. Detection now lives in the pure core (win_overlay / gameover flags) and
+# a centred banner is appended over the board by h2048_draw_overlay(). Two host
+# modes drive the game to BOTH terminal states, render the overlay to a PNG a
+# human/agent can LOOK at, and assert the state + the rendered banner tokens.
+grep_file() {  # grep_file <file> <pattern> <msg>
+    if grep -Eq -- "$2" "$1"; then
+        echo "[2048-host] PASS $3"
+    else
+        echo "[2048-host] FAIL $3 (missing: $2 in $1)"; fail=1
+    fi
+}
+
+# (a) WIN: reach 2048, banner up, dismiss keeps playing, New clears it.
+WDUMP="$OUT/2048_win_dump.txt"
+if ! "$BIN" win "$OUT/2048_" >"$WDUMP" 2>&1; then
+    echo "[2048-host] FAIL: win harness exited non-zero"; cat "$WDUMP"; fail=1
+fi
+for f in win cont; do
+    if [ -e "$OUT/2048_$f.ppm" ] && \
+       python3 scripts/ppm_to_png.py "$OUT/2048_$f.ppm" "$OUT/2048_$f.png" 2>"$OUT/2048_win_png.log"; then
+        echo "[2048-host] PASS rendered $OUT/2048_$f.png"
+    else
+        echo "[2048-host] FAIL win png conversion ($f)"; cat "$OUT/2048_win_png.log" 2>/dev/null; fail=1
+    fi
+done
+grep_file "$WDUMP" '^WINMOVE 1'              "merging two 1024 tiles reaches 2048 (move applied)"
+grep_file "$WDUMP" '^WON 1'                  "win state is set on reaching 2048"
+grep_file "$WDUMP" '^WINOVERLAY 1'           "the one-shot win overlay is armed"
+grep_file "$WDUMP" 'glyphs .* \"YOU WIN!\"'  "the 'YOU WIN!' banner renders in the display list"
+grep_file "$WDUMP" '^fill .* #edc850'        "the gold win panel is drawn"
+grep_file "$WDUMP" '^DISMISS_RC 0'           "a move press while the banner is up is consumed (no move)"
+grep_file "$WDUMP" '^WINOVERLAY_AFTER 0'     "the win overlay is dismissed by a move press"
+grep_file "$WDUMP" '^WON_AFTER 1'            "won stays set after dismissal (do not re-nag)"
+grep_file "$WDUMP" '^GAMEOVER_AFTER 0'       "the game is not over after winning"
+grep_file "$WDUMP" '^CONTINUE 1'             "play continues after dismiss (a real move applies)"
+grep_file "$WDUMP" '^NEW_WON 0'              "New clears the win flag"
+grep_file "$WDUMP" '^NEW_WINOVERLAY 0'       "New clears the win overlay"
+grep_file "$WDUMP" '^NEW_NONEMPTY 2'         "New restores a fresh 2-tile board (win regression)"
+
+# Prove the win overlay actually RASTERIZED (gold panel pixels present).
+if python3 - "$OUT/2048_win.ppm" 0xed 0xc8 0x50 <<'PY'
+import sys
+p=sys.argv[1]; tr,tg,tb=(int(sys.argv[i],0) for i in (2,3,4))
+d=open(p,'rb').read()
+assert d[:2]==b'P6'
+i=2; vals=[]
+while len(vals)<3:
+    while i<len(d) and d[i] in b' \t\n\r': i+=1
+    if d[i:i+1]==b'#':
+        while i<len(d) and d[i] not in b'\n': i+=1
+        continue
+    s=i
+    while i<len(d) and d[i] not in b' \t\n\r': i+=1
+    vals.append(int(d[s:i]))
+w,h,mx=vals; i+=1; px=d[i:]
+n=0
+for k in range(0,len(px)-2,3):
+    if abs(px[k]-tr)<=6 and abs(px[k+1]-tg)<=6 and abs(px[k+2]-tb)<=6: n+=1
+print("WIN-PANEL-PIXELS",n)
+sys.exit(0 if n>=500 else 1)
+PY
+then
+    echo "[2048-host] PASS win overlay panel rasterized (gold pixels present)"
+else
+    echo "[2048-host] FAIL win overlay panel not rasterized"; fail=1
+fi
+
+# (b) LOSE: dead board -> game over banner; New restarts.
+LDUMP2="$OUT/2048_lose_dump.txt"
+if ! "$BIN" lose "$OUT/2048_" >"$LDUMP2" 2>&1; then
+    echo "[2048-host] FAIL: lose harness exited non-zero"; cat "$LDUMP2"; fail=1
+fi
+for f in over new; do
+    if [ -e "$OUT/2048_$f.ppm" ] && \
+       python3 scripts/ppm_to_png.py "$OUT/2048_$f.ppm" "$OUT/2048_$f.png" 2>"$OUT/2048_lose_png.log"; then
+        echo "[2048-host] PASS rendered $OUT/2048_$f.png"
+    else
+        echo "[2048-host] FAIL lose png conversion ($f)"; cat "$OUT/2048_lose_png.log" 2>/dev/null; fail=1
+    fi
+done
+grep_file "$LDUMP2" '^LOSEMOVE 0'             "a move on a full dead board is a no-op"
+grep_file "$LDUMP2" '^GAMEOVER 1'             "game-over is detected on a full no-move board"
+grep_file "$LDUMP2" '^NONEMPTY 16'            "the lose board is completely full"
+grep_file "$LDUMP2" 'glyphs .* \"GAME OVER\"' "the 'GAME OVER' banner renders in the display list"
+grep_file "$LDUMP2" '^fill .* #8f7a66'        "the muted game-over panel is drawn"
+grep_file "$LDUMP2" '^NEW_GAMEOVER 0'         "New clears the game-over state"
+grep_file "$LDUMP2" '^NEW_NONEMPTY 2'         "New restores a fresh 2-tile board (lose regression)"
+
+# Prove the lose overlay actually RASTERIZED (taupe panel pixels present).
+if python3 - "$OUT/2048_over.ppm" 0x8f 0x7a 0x66 <<'PY'
+import sys
+p=sys.argv[1]; tr,tg,tb=(int(sys.argv[i],0) for i in (2,3,4))
+d=open(p,'rb').read()
+assert d[:2]==b'P6'
+i=2; vals=[]
+while len(vals)<3:
+    while i<len(d) and d[i] in b' \t\n\r': i+=1
+    if d[i:i+1]==b'#':
+        while i<len(d) and d[i] not in b'\n': i+=1
+        continue
+    s=i
+    while i<len(d) and d[i] not in b' \t\n\r': i+=1
+    vals.append(int(d[s:i]))
+w,h,mx=vals; i+=1; px=d[i:]
+n=0
+for k in range(0,len(px)-2,3):
+    if abs(px[k]-tr)<=6 and abs(px[k+1]-tg)<=6 and abs(px[k+2]-tb)<=6: n+=1
+print("LOSE-PANEL-PIXELS",n)
+sys.exit(0 if n>=500 else 1)
+PY
+then
+    echo "[2048-host] PASS lose overlay panel rasterized (taupe pixels present)"
+else
+    echo "[2048-host] FAIL lose overlay panel not rasterized"; fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "[2048-host] RESULT: PASS"
     exit 0
