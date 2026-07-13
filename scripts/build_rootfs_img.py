@@ -578,6 +578,17 @@ def _stage_sysroot_etc(sysroot: Path) -> int:
             sub_dst.mkdir(parents=True, exist_ok=True)
             for sub in sorted(ef.iterdir()):
                 if sub.is_file():
+                    # FIRST-BOOT UX: the DE self-test fragment
+                    # etc/rc.d/rc.5.selftest (the demo-app launches + the #99
+                    # [visual_gate] render self-test that rc.5 `source`s) is
+                    # staged ONLY when a DE render gate builds the image with
+                    # HAMNIX_DE_SELFTEST=1. On a normal build it is OMITTED, so
+                    # rc.5's `source` no-ops and a real user's first boot comes
+                    # up CLEAN (wallpaper + panel + taskbar + one welcome
+                    # terminal) instead of buried under demo windows.
+                    if (sub.name == "rc.5.selftest"
+                            and os.environ.get("HAMNIX_DE_SELFTEST") != "1"):
+                        continue
                     (sub_dst / sub.name).write_bytes(sub.read_bytes())
                     n += 1
                 elif sub.is_dir():

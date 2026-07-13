@@ -3814,6 +3814,18 @@ def build_archive() -> bytes:
                                   "etc/services.d/hamde.svc so hamUId "
                                   "autostarts the keystone/spine selftest")
                             continue
+                        # FIRST-BOOT UX: the DE self-test fragment
+                        # etc/rc.d/rc.5.selftest (the demo-app launches + #99
+                        # [visual_gate] render self-test that rc.5 `source`s)
+                        # is embedded ONLY when a DE render gate builds with
+                        # HAMNIX_DE_SELFTEST=1. A normal build omits it, so
+                        # rc.5's `source` no-ops and the first boot is clean.
+                        if (ef.name == "rc.d" and sub.name == "rc.5.selftest"
+                                and os.environ.get("HAMNIX_DE_SELFTEST") != "1"):
+                            print("  [first-boot] omitting etc/rc.d/"
+                                  "rc.5.selftest (clean boot; set "
+                                  "HAMNIX_DE_SELFTEST=1 for the render gate)")
+                            continue
                         data = sub.read_bytes()
                         name = "/etc/" + ef.name + "/" + sub.name
                         blob += cpio_entry(name, data)

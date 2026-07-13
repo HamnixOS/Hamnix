@@ -33,6 +33,17 @@ set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+# By DEFAULT this screendumps the CLEAN first-boot desktop (wallpaper +
+# panel + taskbar + one welcome terminal) — the shipped image no longer
+# auto-opens the demo apps. To screendump the DE render self-test instead
+# (the demo apps launched through /dev/wsys/run/launch), the caller exports
+# HAMNIX_DE_SELFTEST=1: that bakes rc.5's /etc/rc.d/rc.5.selftest fragment
+# into a DEDICATED image at a distinct path (never clobbering the clean one).
+if [ "${HAMNIX_DE_SELFTEST:-0}" = "1" ]; then
+    export HAMNIX_DE_SELFTEST=1
+    INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer-selftest.img}"
+    export HAMNIX_INSTALLER_IMG_OUT="$INSTALLER_IMG"
+fi
 INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer.img}"
 BOOT_WAIT="${BOOT_WAIT:-240}"
 PAINT_WAIT="${PAINT_WAIT:-8}"

@@ -50,7 +50,17 @@ set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer.img}"
+# This gate PROVES the #99 DE launch path: it needs rc.5's boot-time DE
+# self-test (the demo-app launches through /dev/wsys/run/launch + the
+# [visual_gate] launching/launched markers), which lives in the
+# /etc/rc.d/rc.5.selftest fragment. That fragment is packaged into the image
+# ONLY when built with HAMNIX_DE_SELFTEST=1 — a NORMAL user boot omits it so
+# the desktop comes up clean. So build a DEDICATED self-test image here, at
+# a DISTINCT path, so this gate never boots (or clobbers) the clean shipped
+# build/hamnix-installer.img.
+export HAMNIX_DE_SELFTEST=1
+INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer-selftest.img}"
+export HAMNIX_INSTALLER_IMG_OUT="$INSTALLER_IMG"
 BOOT_WAIT="${BOOT_WAIT:-240}"
 GATE_WAIT="${GATE_WAIT:-60}"
 APP_WAIT="${APP_WAIT:-20}"

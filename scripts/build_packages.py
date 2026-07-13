@@ -766,6 +766,15 @@ def _files_desktop_config() -> list[tuple[Path, str]]:
     f: list[tuple[Path, str]] = []
     # Runlevel-5 (graphical) operator hook — the DE entry point.
     _add_etc_file(f, "rc.5", subdir="rc.d")
+    # Boot-time DE self-test + demo-app launches (rc.5 `source`s this). It is
+    # packaged ONLY when a DE render gate builds the image with
+    # HAMNIX_DE_SELFTEST=1, so a NORMAL user boot comes up CLEAN (wallpaper +
+    # panel + taskbar + one welcome terminal) while the render gates
+    # (test_de_visual_gate.sh / test_de_mem_gate.sh) still trigger the app
+    # launches + [visual_gate] markers + window maps. On a normal build the
+    # fragment is ABSENT, rc.5's `source` no-ops, and no demo windows open.
+    if os.environ.get("HAMNIX_DE_SELFTEST") == "1":
+        _add_etc_file(f, "rc.5.selftest", subdir="rc.d")
     # Declarative service definitions discovered by PID-1's supervisor.
     _add_etc_file(f, "hamde.svc", subdir="services.d")
     _add_etc_file(f, "hamuid.svc", subdir="services.d")

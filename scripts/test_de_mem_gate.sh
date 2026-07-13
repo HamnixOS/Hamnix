@@ -15,7 +15,16 @@ set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer.img}"
+# The footprint we want to measure is the DE app SET (compositor + panel +
+# the launched apps). Those app launches now live in rc.5's boot-time DE
+# self-test (/etc/rc.d/rc.5.selftest), baked into the image ONLY when built
+# with HAMNIX_DE_SELFTEST=1 — a normal user boot omits them for a clean
+# desktop. So this gate boots a DEDICATED self-test image (distinct path, so
+# it never clobbers the clean shipped build/hamnix-installer.img). Without
+# it the gate still PASSES but before_apps == after_apps (no app delta).
+export HAMNIX_DE_SELFTEST=1
+INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer-selftest.img}"
+export HAMNIX_INSTALLER_IMG_OUT="$INSTALLER_IMG"
 BOOT_WAIT="${BOOT_WAIT:-240}"
 GATE_WAIT="${GATE_WAIT:-220}"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -30,6 +39,14 @@ if [ -z "$OVMF_FD" ]; then
     done
 fi
 [ -f "$OVMF_FD" ] || { echo "[mem_gate] SKIP: no OVMF" >&2; exit 0; }
+if [ ! -f "$INSTALLER_IMG" ]; then
+    if [ "${HAMNIX_SKIP_BUILD:-0}" = "1" ]; then
+        echo "[mem_gate] SKIP: $INSTALLER_IMG absent and HAMNIX_SKIP_BUILD=1" >&2
+        exit 0
+    fi
+    echo "[mem_gate] building self-test installer image (~6 min)"
+    bash "$PROJ_ROOT/scripts/build_installer_img.sh"
+fi
 [ -f "$INSTALLER_IMG" ] || { echo "[mem_gate] FAIL: no $INSTALLER_IMG" >&2; exit 1; }
 
 mkdir -p "$OUT_DIR"
