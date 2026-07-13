@@ -905,6 +905,55 @@ assert_grepFLX '^SEG 7 402 #101010 b0 u0 l-1 bg- \|Col C\|' "flex: 3-col row, co
 assert_grepFLX '^SEG 10 8 #101010 b0 u0 l-1 bg- \|Tail line\|' \
     "flex: tail paragraph back at the body margin x=8 after the flex row closes"
 
+# ====================================================================
+# INTERACTIVITY fixture — inline on<evt>="" handlers with NO <script>.
+# Proves the DOM-event -> JS-handler -> DOM-mutation -> re-render loop for a
+# page whose only JS is inline handlers: such a page must still get a LIVE JS
+# context, `this` must bind to the element (this.value), and the mutated node
+# must re-render. Drive it with the pointer-free setval/click verbs.
+# ====================================================================
+FIXI="tests/fixtures/hambrowse_interactive.html"
+DBEF="$OUT/dump_interactive_before.txt"
+DINP="$OUT/dump_interactive_input.txt"
+DCLK="$OUT/dump_interactive_click.txt"
+
+echo "[hb-host] running interactivity fixture (before / input / click) ..."
+"$BIN" "$FIXI" 640                     >"$DBEF" 2>&1
+"$BIN" "$FIXI" 640 setval q hamnix     >"$DINP" 2>&1
+"$BIN" "$FIXI" 640 click tog           >"$DCLK" 2>&1
+cat "$DINP"
+
+# BEFORE any input: the result node shows only its original text; the typed
+# query must NOT yet appear (guards a false-green where the render is stale).
+if grep -q 'Results for: hamnix' "$DBEF"; then
+    echo "[hb-host] FAIL interactivity: post-input text present BEFORE input (stale render)"; fail=1
+else
+    echo "[hb-host] PASS interactivity: result node clean before input"
+fi
+
+# AFTER oninput (setval q=hamnix): the handler read this.value and mutated the
+# #out node; the re-render must show it. If the JS context never came up (no
+# <script>) or `this` didn't bind, this line is absent -> FAIL.
+if grep -q 'Results for: hamnix' "$DINP"; then
+    echo "[hb-host] PASS interactivity: oninput this.value drove #out re-render (Results for: hamnix)"
+else
+    echo "[hb-host] FAIL interactivity: oninput handler did not update the render"; fail=1
+fi
+# The typed value is also reflected back into the input box itself.
+if grep -q '\[hamnix' "$DINP"; then
+    echo "[hb-host] PASS interactivity: input box reflects typed value"
+else
+    echo "[hb-host] FAIL interactivity: input box did not reflect typed value"; fail=1
+fi
+
+# AFTER onclick (no <script> on the page): the button's inline onclick fired
+# and mutated a different node.
+if grep -q 'button was clicked' "$DCLK"; then
+    echo "[hb-host] PASS interactivity: inline onclick fired without a <script> element"
+else
+    echo "[hb-host] FAIL interactivity: inline onclick did not fire (no live JS context?)"; fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
     exit 0
