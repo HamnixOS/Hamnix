@@ -103,6 +103,12 @@ if grep -a -F -q "[test_devcpuinfo] start" "$LOG"; then
     grep -a -E -q "\[test_devcpuinfo\] vendor=(GenuineIntel|AuthenticAMD)" "$LOG" \
         && echo "[devcpuinfo] vendor=$(grep -a -E -o 'vendor=(GenuineIntel|AuthenticAMD)' "$LOG" | head -n1 | cut -d= -f2)" \
         || { echo "[test_devsysinfo] MISS: vendor= line absent/unrecognised"; fail=1; }
+    grep -a -F -q "[test_devcpuinfo] processor_line OK" "$LOG" \
+        && echo "[test_devsysinfo] OK: /proc/cpuinfo Linux processor stanza present" \
+        || { echo "[test_devsysinfo] MISS: cpuinfo processor line"; fail=1; }
+    grep -a -F -q "[test_devcpuinfo] model_name OK" "$LOG" \
+        && echo "[test_devsysinfo] OK: /proc/cpuinfo Linux model name present" \
+        || { echo "[test_devsysinfo] MISS: cpuinfo model name"; fail=1; }
     grep -a -F -q "[test_devcpuinfo] done" "$LOG" \
         && echo "[test_devsysinfo] OK: cpuinfo fixture done" \
         || { echo "[test_devsysinfo] MISS: cpuinfo done"; fail=1; }
@@ -120,6 +126,15 @@ if grep -a -F -q "[test_devmeminfo] start" "$LOG2"; then
     grep -a -E -q "\[test_devmeminfo\] MemTotal=[0-9]+ kB" "$LOG2" \
         && echo "[devmeminfo] $(grep -a -E -o 'MemTotal=[0-9]+ kB' "$LOG2" | head -n1)" \
         || { echo "[test_devsysinfo] MISS: MemTotal=<digits> kB line absent"; fail=1; }
+    grep -a -F -q "[test_devmeminfo] MemAvailable OK" "$LOG2" \
+        && echo "[test_devsysinfo] OK: /proc/meminfo MemAvailable present (free 'available')" \
+        || { echo "[test_devsysinfo] MISS: meminfo MemAvailable"; fail=1; }
+    grep -a -F -q "[test_devmeminfo] Buffers OK" "$LOG2" \
+        && echo "[test_devsysinfo] OK: /proc/meminfo Buffers present (free 'buff/cache')" \
+        || { echo "[test_devsysinfo] MISS: meminfo Buffers"; fail=1; }
+    grep -a -F -q "[test_devmeminfo] Cached OK" "$LOG2" \
+        && echo "[test_devsysinfo] OK: /proc/meminfo Cached present (free 'buff/cache')" \
+        || { echo "[test_devsysinfo] MISS: meminfo Cached"; fail=1; }
     grep -a -F -q "[test_devmeminfo] done" "$LOG2" \
         && echo "[test_devsysinfo] OK: meminfo fixture done" \
         || { echo "[test_devsysinfo] MISS: meminfo done"; fail=1; }
