@@ -391,6 +391,12 @@ COREUTILS_BINS = (
     # fixture and umdf_host = the Track-4 .ko host slice stay UNpackaged
     # — allowlisted as dev/fixture binaries in the coverage gate.)
     "bc", "fmt", "sha256sum", "js",
+    # --- coreutils gap-fill (2026-07-12, #143 native-userland batch):
+    # standard file/text CLIs that were absent as native Adder binaries.
+    # sum = BSD/SysV checksum; sha1sum = SHA-1 digest; arch = uname -m;
+    # unlink/link = the thin one-shot unlink(2)/link(2) front ends;
+    # pathchk = portable-pathname validator.
+    "sum", "sha1sum", "arch", "unlink", "link", "pathchk",
 )
 
 

@@ -158,6 +158,12 @@ build_adder_user hamfm                # TUI file manager (navigate dirs, view fi
 build_adder_user column               # format text into columns (fill / -t table / -s sep / -c width)
 build_adder_user hxd                  # TUI hex+ASCII file viewer (xxd/hexdump -C, scrollable)
 build_adder_user tree                 # recursive directory lister with box-drawing connectors
+build_adder_user sum                   # BSD (default) / SysV (-s) 16-bit checksum + block count
+build_adder_user sha1sum               # SHA-1 (FIPS 180-4) digest of files/stdin (+ -c check mode)
+build_adder_user arch                  # print machine hardware name (x86_64) — uname -m
+build_adder_user unlink                # remove exactly ONE file via the unlink primitive
+build_adder_user link                  # create a hard link FILE2 -> FILE1 via the link primitive
+build_adder_user pathchk                # validate a pathname (-p POSIX portability, -P extra checks)
 build_adder_user hdu                  # ncdu-style interactive disk-usage browser (recursive sizes, bar, navigate)
 build_adder_user hlog                 # TUI kernel-log viewer/follower (dmesg -w / journalctl -f) over /proc/kmsg
 build_adder_user oopsread             # F-oops: render persisted kernel panic record from /proc/oops
