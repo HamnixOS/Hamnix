@@ -142,12 +142,16 @@ for i in "${!CASE_ID[@]}"; do
     CMDS+=( "find${guest_paths} ${CASE_PREDS[$i]}" 2 )
     CMDS+=( "echo FTE_${id}" 1 )
 done
-# -print0 separator proof: a single-match -print0 immediately followed by
-# an echo lands the path and the next token on ONE serial line (NUL, not
-# newline, separates them).
+# -print0 vs -print separator proof on the SAME single-match query:
+#   * with -print  the path is a standalone, newline-terminated line;
+#   * with -print0 the NUL (not a newline) terminates it, so the path is
+#     NOT a whole line by itself — whatever the serial emits next is glued
+#     onto the same line.
+CMDS+=( "echo FTB_pN" 1 )
+CMDS+=( "find /tmp/ft -name empty.txt -print" 1 )
+CMDS+=( "echo FTE_pN" 1 )
 CMDS+=( "echo FTB_p0" 1 )
 CMDS+=( "find /tmp/ft -name empty.txt -print0" 1 )
-CMDS+=( "echo P0END" 1 )
 CMDS+=( "echo FTE_p0" 1 )
 CMDS+=( "exit" 2 )
 
@@ -203,15 +207,23 @@ for i in "${!CASE_ID[@]}"; do
     fi
 done
 
-# -print0 proof: the empty.txt path and the P0END token share ONE line
-# (NUL separator), i.e. a line contains both.
-p0line="$(sed -n '/FTB_p0$/,/FTE_p0$/p' "$LOG" | tr -d '\r' \
-          | grep -a 'empty.txt' | grep -a 'P0END' | head -1 || true)"
-if [ -n "$p0line" ]; then
-    echo "[test_find] OK: -print0 emitted a NUL (not newline) separator"
-else
-    echo "[test_find] FAIL: -print0 did not NUL-join the path and next token"
+# -print0 proof. Control: with -print the path IS a standalone line.
+pN_standalone="$(sed -n '/FTB_pN$/,/FTE_pN$/p' "$LOG" | tr -d '\r' \
+                 | grep -axF '/tmp/ft/empty.txt' | head -1 || true)"
+# With -print0 the path must NOT be a standalone (newline-terminated) line,
+# yet its text must still be present (glued to the following bytes by NUL).
+p0_standalone="$(sed -n '/FTB_p0$/,/FTE_p0$/p' "$LOG" | tr -d '\r' \
+                 | grep -axF '/tmp/ft/empty.txt' | head -1 || true)"
+p0_present="$(sed -n '/FTB_p0$/,/FTE_p0$/p' "$LOG" | tr -d '\r' \
+              | grep -a 'empty.txt' | head -1 || true)"
+if [ -z "$pN_standalone" ]; then
+    echo "[test_find] FAIL: -print control did not emit a newline-terminated path"
     fails=$((fails + 1))
+elif [ -n "$p0_standalone" ] || [ -z "$p0_present" ]; then
+    echo "[test_find] FAIL: -print0 did not replace the newline with a NUL"
+    fails=$((fails + 1))
+else
+    echo "[test_find] OK: -print newline vs -print0 NUL separator confirmed"
 fi
 
 if [ "$fails" -ne 0 ]; then
