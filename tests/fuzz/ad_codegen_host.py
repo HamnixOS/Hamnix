@@ -312,6 +312,7 @@ def run_dump(src_path: Path, timeout=30, opt=False, split_break=False,
                       idxreg=meta.get("IDXREG", 0),
                       rcxclean=meta.get("RCXCLEAN", 0),
                       immfold=meta.get("IMMFOLD", 0),
+                      immalu=meta.get("IMMALU", 0),
                       imulimm=meta.get("IMULIMM", 0),
                       cmpjcc=meta.get("CMPJCC", 0))
 
