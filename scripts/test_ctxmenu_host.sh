@@ -25,11 +25,12 @@ echo "[ctxmenu-host] PASS host harness compiled -> $BIN"
 echo "[ctxmenu-host] running host harness ..."
 DUMP="$OUT/ctxmenu_dump.txt"
 if ! "$BIN" "$OUT/ctxmenu_panel.ppm" "$OUT/ctxmenu_applet.ppm" \
-        "$OUT/ctxmenu_chooser.ppm" >"$DUMP" 2>&1; then
+        "$OUT/ctxmenu_chooser.ppm" "$OUT/ctxmenu_choice_full.ppm" \
+        "$OUT/ctxmenu_choice_filtered.ppm" >"$DUMP" 2>&1; then
     echo "[ctxmenu-host] FAIL: host harness exited non-zero"; cat "$DUMP"; exit 1
 fi
 
-for f in panel applet chooser; do
+for f in panel applet chooser choice_full choice_filtered; do
     if python3 scripts/ppm_to_png.py "$OUT/ctxmenu_$f.ppm" "$OUT/ctxmenu_$f.png" 2>"$OUT/ctxmenu_png.log"; then
         echo "[ctxmenu-host] PASS rendered $OUT/ctxmenu_$f.png ($(file -b "$OUT/ctxmenu_$f.png" 2>/dev/null))"
     else
@@ -79,6 +80,39 @@ assert_grep '^HIT panel 50 130 3'                     "hit-test: Delete-This-Pan
 assert_grep '^HIT panel 50 10 -1'                     "hit-test: point above the box misses"
 assert_grep '^HIT applet 50 130 3'                    "hit-test: applet Lock row 3"
 assert_grep '^PIX 44 70 #4a6fa5'                      "raster: hovered row painted MATE selection blue"
+
+# --- SEARCHABLE Add-to-Panel CHOOSER (v2 DIALOG) -------------------------
+# The MATE add-applet dialog the panel's "Add to Panel..." opens: a title, a
+# search box, category headers, and per-applet name + description rows.
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Search applets\.\.\.\"' "choice: search box placeholder renders"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Menus & Launchers\"'    "choice: category header (Menus & Launchers)"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"System & Hardware\"'    "choice: category header (System & Hardware)"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Windows & Workspaces\"' "choice: category header (Windows & Workspaces)"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Menu Bar\"'             "choice: applet name (Menu Bar)"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"CPU and memory usage meters\"' "choice: applet DESCRIPTION renders"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Spacer\"'               "choice: Spacer applet (panel-specific, beyond stock chooser)"
+assert_grep 'glyphs [0-9]+ [0-9]+ \"Session\"'              "choice: Session applet (panel-specific)"
+# Model structure: search row 0, category grouping, entries carry a category.
+assert_grep '^CROW FULL 0 SEARCH'                    "choice model: row 0 is the search box"
+assert_grep '^CROW FULL 1 HEADER Menus & Launchers'  "choice model: first header groups the launcher"
+assert_grep '^CROW FULL 2 ENTRY Menu Bar'            "choice model: Menu Bar grouped under it"
+# Live filter narrows the list: "work" -> only the Workspace Switcher.
+assert_grep '^CHOICE FILTERED prims=[0-9]+ rows=3 ' "choice: filter 'work' narrows to a single applet section"
+assert_grep '^CROW FILTERED 2 ENTRY Workspace Switcher' "choice: filtered result is the Workspace Switcher"
+# Hit-testing on the dialog.
+assert_grep '^CHIT search 0'                         "choice hit-test: search row under the pointer"
+assert_grep '^CHIT miss -1'                          "choice hit-test: point left of the box misses"
+assert_grep '^CKIND row2 2'                          "choice hit-test: row 2 is an ENTRY"
+assert_grep '^CAPPLET row2 1'                        "choice hit-test: row 2 inserts the Menu Bar applet"
+
+# --- NATIVE panel consumes the searchable chooser (compiles) -------------
+echo "[ctxmenu-host] compiling NATIVE hampanelscene for x86_64-adder-user ..."
+if ! python3 -m compiler.adder compile --target=x86_64-adder-user \
+        user/hampanelscene.ad -o "$OUT/hampanelscene_native.elf" 2>"$OUT/ctxmenu_panel_native.log"; then
+    echo "[ctxmenu-host] FAIL: native hampanelscene did not compile"; tail -40 "$OUT/ctxmenu_panel_native.log"; fail=1
+else
+    echo "[ctxmenu-host] PASS native hampanelscene still compiles (wired to the chooser)"
+fi
 
 # --- NATIVE compositor still compiles from the shared model --------------
 echo "[ctxmenu-host] compiling NATIVE hamUId for x86_64-adder-user ..."
