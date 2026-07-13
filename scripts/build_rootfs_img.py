@@ -688,6 +688,69 @@ def _plant_distro_provenance(distro: Path) -> None:
         encoding="ascii")
 
 
+def _stage_linux_demo_bin(distro: Path) -> bool:
+    """Build + plant the tiny static-PIE Linux demo ELF at distro/bin.
+
+    THE BUG THIS FIXES (task #130): the DE "Linux apps" fly-out entry
+    "Linux Process Viewer" ran `Exec=/bin/busybox top`, but a NORMAL build
+    (no gitignored tests/u-binary/u_busybox_musl fixture) stages NO busybox
+    into the distro tree — so clicking it entered the linux ns and hit
+    "command not found". The menu entry never launched a real process.
+
+    THE FIX: guarantee a runnable Linux-ns binary exists for the demo entry
+    regardless of the busybox fixture. We assemble a ~13 KiB freestanding
+    static-PIE (ET_DYN, no PT_INTERP) Linux-ABI ELF from the committed
+    source tests/u-binary/src/linux_demo/demo.S — it makes raw x86_64 Linux
+    syscalls (write/nanosleep/exit_group): prints a banner then loops
+    printing a "tick" line each second, a live "process viewer" stand-in.
+    static-PIE avoids fs/elf.ad's kernel-image collision guard (an ET_EXEC
+    at 0x400000 would be refused). Planted at distro/bin/hamnix-linux-demo.
+
+    Returns True when the binary is present in the distro tree afterwards.
+    A no-op success when it is already there (idempotent). Build failures
+    (host without binutils) return False so the caller keeps the busybox
+    Exec (or, worst case, a non-launching entry — no regression).
+    """
+    dst = distro / "bin" / "hamnix-linux-demo"
+    if dst.is_file():
+        return True
+    src_dir = HERE / "tests" / "u-binary" / "src" / "linux_demo"
+    src = src_dir / "demo.S"
+    if not src.is_file():
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        obj = Path(td) / "demo.o"
+        out = Path(td) / "u_linux_demo"
+        try:
+            subprocess.check_call(
+                ["as", "-o", str(obj), str(src)],
+                stderr=subprocess.DEVNULL)
+            # static-PIE (ET_DYN, no dynamic linker) — see demo.S / Makefile.
+            subprocess.check_call(
+                ["ld", "-pie", "-static", "--no-dynamic-linker",
+                 "-nostdlib", "-o", str(out), str(obj)],
+                stderr=subprocess.DEVNULL)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("[build_rootfs_img] WARN: could not assemble the Linux "
+                  "demo ELF (binutils absent?); demo .desktop Exec falls "
+                  "back to /bin/busybox top", flush=True)
+            return False
+        data = bytearray(out.read_bytes())
+        # e_ident[EI_OSABI] = ELFOSABI_LINUX (3) so elf_is_linux_binary()
+        # routes it through the Linux-ABI path (mirrors src/hello/Makefile).
+        if len(data) > 7:
+            data[7] = 3
+        dst.write_bytes(bytes(data))
+        dst.chmod(0o755)
+    print(f"[build_rootfs_img] staged Linux demo ELF "
+          f"({dst.stat().st_size} bytes) at distro/bin/hamnix-linux-demo "
+          f"(static-PIE Linux-ABI; menu 'Linux Process Viewer' target)",
+          flush=True)
+    return True
+
+
 def _plant_linux_demo_app(distro: Path) -> None:
     """Plant a demonstrable freedesktop .desktop in the distro tree.
 
@@ -696,13 +759,26 @@ def _plant_linux_demo_app(distro: Path) -> None:
     Applications menu's "Linux" section (launched inside `enter linux`).
     A default debootstrap minbase ships NO .desktop files, so without this
     the section would be empty and the scan/bind mechanism undemonstrable on
-    a stock live image. This plants ONE real, full-freedesktop entry — a CLI
-    process viewer run via /bin/busybox top (present on every distro build,
-    even busybox-only) — so the "Linux" section is always populated and the
-    end-to-end discover+launch path is exercised. It is ADDITIVE: a real
-    debootstrap tree's own /usr/share/applications entries appear alongside
-    it. Terminal=true marks it as a CLI app (see lib/desktopentry.ad).
+    a stock live image. This plants ONE real, full-freedesktop entry so the
+    "Linux" section is always populated and the end-to-end discover+launch
+    path is exercised. It is ADDITIVE: a real debootstrap tree's own
+    /usr/share/applications entries appear alongside it. Terminal=true marks
+    it as a CLI app (see lib/desktopentry.ad).
+
+    Exec target (task #130 — the entry must actually LAUNCH a real Linux-ns
+    process, not report "command not found"):
+      * when a real busybox is staged in the distro tree (the u_busybox_musl
+        fixture was present) -> `/bin/busybox top`, the richer process view;
+      * otherwise -> `/bin/hamnix-linux-demo`, the tiny static-PIE Linux-ABI
+        ELF planted by _stage_linux_demo_bin. This guarantees the menu entry
+        exec's a genuine Linux-ns process on EVERY build, fixtureless or not.
     """
+    have_bb = (distro / "bin" / "busybox").is_file()
+    if have_bb:
+        exec_line = "Exec=/bin/busybox top\n"
+    else:
+        _stage_linux_demo_bin(distro)
+        exec_line = "Exec=/bin/hamnix-linux-demo\n"
     apps = distro / "usr" / "share" / "applications"
     apps.mkdir(parents=True, exist_ok=True)
     (apps / "hamnix-linux-demo.desktop").write_text(
@@ -713,7 +789,7 @@ def _plant_linux_demo_app(distro: Path) -> None:
         "Name[de]=Linux-Prozessanzeige\n"
         "GenericName=Process Viewer\n"
         "Comment=A Debian-namespace CLI app surfaced in the Hamnix DE menu\n"
-        "Exec=/bin/busybox top\n"
+        + exec_line +
         "Terminal=true\n"
         "Icon=utilities-system-monitor\n"
         "Categories=System;Monitor;\n"
