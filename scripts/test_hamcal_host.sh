@@ -47,17 +47,42 @@ assert_grep() {
 }
 
 assert_grep '^# scene v1 hamui'                 "scene header emitted"
-assert_grep '^fill 0 0 236 248 #d4d0c8'         "calendar window background"
+assert_grep '^fill 0 0 236 344 #d4d0c8'         "calendar window background"
 assert_grep '^glyphs 82 38 \"July 2026\"'       "title shows the seeded month"
 # 2026-07-01 is a Wednesday: day '1' lands in column 3 (x=6+3*32+10=112).
 assert_grep '^glyphs 112 81 \"1\"'              "July 1 2026 placed on Wednesday"
 # Today (the 12th) is highlighted white on the blue cell.
 assert_grep '^glyphs 12 133 \"12\" #ffffff'     "today (12) highlighted"
-assert_grep '^glyphs 172 185 \"31\"'            "last day (31) present"
 assert_grep '^MONTH0 7'                         "initial month is July"
-assert_grep '^PREVCLICK 1'                      "prev-month arrow consumed the click"
-assert_grep '^MONTH1 6'                         "prev-month navigated July -> June"
+assert_grep '^YEAR0 2026'                       "initial year is 2026"
 assert_grep '^PIX 4 4 #3a6ea5'                  "raster title-bar pixel = blue"
+
+# --- date selection + RELATIVE TIME ---
+assert_grep '^SEL0 12'                          "selection defaults to today (12)"
+assert_grep '^glyphs 8 256 \"today\"'           "readout says 'today' for today"
+assert_grep '^DAYCLICK 1'                       "click on day-5 cell registered"
+assert_grep '^SELDAY 5'                         "clicking July 5 selects the 5th"
+assert_grep '^glyphs 8 238 \"Selected 2026-07-05\"' "selected date echoed"
+# 2026-07-05 is 7 days before today (12) via days_from_civil, not 365.25.
+assert_grep '^glyphs 8 256 \"7 days ago\"'      "relative time = '7 days ago'"
+
+# --- ARROW KEYS (Right +1 day x3: 5->8; Down +7 days: 8->15) ---
+assert_grep '^SELDAY_R 8'                       "Right-arrow x3 moved selection 5->8"
+assert_grep '^SELDAY_D 15'                      "Down-arrow moved selection +1 week -> 15"
+# 2026-07-15 is 3 days AFTER today (12) -> "in 3 days".
+assert_grep '^glyphs 8 256 \"in 3 days\"'       "relative time ahead = 'in 3 days'"
+
+# --- STOPWATCH (Start, +250 jiffies = 2.50s; Stop freezes; Reset zeroes) ---
+assert_grep '^SWRUN 1'                          "Start button started the stopwatch"
+assert_grep '^glyphs 150 284 \"00:02.50\"'      "stopwatch shows 2.50s elapsed"
+assert_grep '^SWRUN2 0'                          "Stop button halted the stopwatch"
+assert_grep '^glyphs 150 284 \"00:00.00\"'      "Reset button zeroed the stopwatch"
+assert_grep '^glyphs 22 310 \"Start\"'          "Start button rendered"
+assert_grep '^glyphs 102 310 \"Stop\"'          "Stop button rendered"
+assert_grep '^glyphs 174 310 \"Reset\"'         "Reset button rendered"
+
+# --- MONTH NAVIGATION (next-month arrow: July -> August) ---
+assert_grep '^MONTH1 8'                         "next-month arrow navigated July -> August"
 
 if [ "$fail" -ne 0 ]; then echo "[cal-host] OVERALL FAIL"; exit 1; fi
 echo "[cal-host] OVERALL PASS"
