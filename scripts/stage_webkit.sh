@@ -334,6 +334,12 @@ export FONTCONFIG_PATH=/etc/fonts
 export G_MESSAGES_DEBUG=all
 export GST_REGISTRY="$WKHOME/gst.reg"
 export GST_REGISTRY_UPDATE=no
+# Wire-level Wayland trace: emit every request/event on stderr so the boot
+# harness can decode exactly how far the client climbs the xdg-shell ladder
+# (registry bind -> get_xdg_surface/get_toplevel -> wl_surface.attach/commit
+# -> the compositor's "[devwsys] window ... mapped"). Toggle off with
+# WK_WAYLAND_DEBUG=0 for a quiet run.
+[ "${WK_WAYLAND_DEBUG:-1}" = "0" ] || export WAYLAND_DEBUG=1
 echo "[WK] uid=$(id -u 2>/dev/null) HOME=$HOME URL=$URL"
 echo "[WK] launching MiniBrowser (WebKitGTK, software wl_shm)"
 { /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/MiniBrowser "$URL" 2>&1
