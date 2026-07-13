@@ -71,16 +71,17 @@ need "$TS" "geometry 150 40 " "terminal default origin clears the icon strut (x=
 
 echo "[ux_guard] --- QA-N2: hamterm closes its window when the shell exits ---"
 # `exit` (or Ctrl-D/EOF) in the DE terminal's hamsh must tear the terminal
-# WINDOW down, like any terminal — not leave an orphaned empty window. hamsh
-# exits its process on `exit`, closing its stdout write-end; hamterm's EOF
-# probe (_drain_shell sys_read_nb == -1) clears sh_alive, and the shell-exit
-# branch must now quit the event loop (running = 0) so main returns and the
-# compositor reaps the wid.
-HT="user/hamterm.ad"
-if grep -Pzoq 'if sh_alive == 0 and sh_pid >= 0:(.|\n)*?running = 0' "$HT"; then
-    pass "hamterm quits its loop when the shell exits (window teardown)"
+# WINDOW down, like any terminal — not leave an orphaned empty window. The DE
+# launches /bin/hamtermscene (NOT the legacy user/hamterm.ad — #126), whose
+# _drain_shell clears sh_alive on the shell stdout-pipe EOF; the main loop must
+# then emit "shell exited; closing window" and break/return so the process
+# exits and the compositor's owner-dead reaper frees the wid. (This guard used
+# to check user/hamterm.ad — the wrong file — a false-green fixed in #133.)
+HT="user/hamtermscene.ad"
+if grep -Pzoq 'shell exited; closing window(.|\n)*?(break|return 0)' "$HT"; then
+    pass "hamtermscene exits its loop when the shell exits (window teardown)"
 else
-    failf "hamterm shell-exit branch no longer sets running = 0 (window would orphan)"
+    failf "hamtermscene shell-exit branch no longer breaks/returns (window would orphan)"
 fi
 
 echo "[ux_guard] --- QA-N3: notification tray popup has working [X] + [Clear] ---"
