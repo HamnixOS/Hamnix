@@ -169,7 +169,7 @@ build_adder_user hlog                 # TUI kernel-log viewer/follower (dmesg -w
 build_adder_user oopsread             # F-oops: render persisted kernel panic record from /proc/oops
 build_adder_user awk                  # literal {print $N} only
 build_adder_user less                 # alias for more (24-line pager)
-build_adder_user xargs                # stdin tokens -> sys_spawn argv
+build_adder_user xargs                # stdin items -> batched fork/exec (-0/-n/-I/-r)
 build_adder_user ascii                # printable ASCII 32..126 table
 build_adder_user base64               # M16.86: RFC 4648 encode/decode
 build_adder_user tar                  # native ustar (POSIX tar): -c/-x/-t -f ARCHIVE; -z read (inflate) + write (-czf, lib/zlib/deflate)

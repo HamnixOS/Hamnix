@@ -1,22 +1,33 @@
 # user/xargs.ad
 #
-# Minimal Hamnix `xargs CMD ARGS...` — drains stdin into one buffer,
-# tokenizes on whitespace, appends up to 16 tokens to CMD's argv,
-# then spawn's CMD once with the combined argv. Output goes to
-# our stdout via the spawned child (we inherit fds 0/1 onto it).
+# Native Hamnix `xargs` — read items from stdin, build a command line by
+# appending those items to a template command, then spawn+wait the child.
+# Spawns real children through the same Plan-9 fork/exec/wait spine hamsh
+# uses for foreground externals (lib.p9 `spawn` + sys_waitpid).
 #
-#   /find /mnt | /xargs /echo
+#   xargs [OPTIONS] [CMD [ARGS...]]
 #
-# Single-shot only (no -n batching, no -I replace) — the shell pipe
-# model already exists for streaming; xargs here is just a CLI
-# adapter so commands that don't read stdin natively can consume it.
+# Cross-checked against GNU xargs:
+#   printf 'a\nb\nc\n' | xargs echo        -> "a b c"
+#   printf 'a\0b\0'    | xargs -0 echo     -> "a b"
+#   ... | xargs -n1 echo                   -> one spawn per item
+#   printf 'a\n'       | xargs -I{} echo X{}Y  -> "XaY"
+#
+# Options:
+#   -0                     items are NUL-delimited (pairs with find -print0)
+#   -n MAX / -nMAX         at most MAX items per command invocation
+#   -I REPLACE / -IREPLACE substitute REPLACE token in the template per line
+#   -r, --no-run-if-empty  do NOT run the command when stdin is empty
+#
+# Default command (none given) is `echo`, matching GNU.
+# A non-zero child exit propagates into xargs's own exit status.
 
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_waitpid(pid: int32) -> int64
 
-
 from lib.p9 import spawn
+
 
 def strlen_u8(s: Ptr[uint8]) -> uint64:
     n: uint64 = 0
@@ -29,30 +40,173 @@ def write_str(fd: int32, s: Ptr[uint8]):
     sys_write(fd, s, strlen_u8(s))
 
 
-# 4 KiB stdin scratch — enough for a `find /mnt` style dump but small
-# enough to keep us on the 16 KiB user stack budget without blowing
-# through page tables.
-STDIN_CAP: uint64 = 4096
-MAX_TOKENS: uint64 = 16
-ARGV_CAP: uint64 = 32                       # CMD args + stdin tokens
+def str_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] == b[i]:
+        return 1
+    return 0
 
-stdin_buf: Array[4096, uint8]
-argv_buf:  Array[32, uint64]
+
+# Parse a non-negative decimal; -1 on any non-digit / empty.
+def parse_uint(s: Ptr[uint8]) -> int32:
+    if s[0] == 0:
+        return -1
+    n: int32 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            return -1
+        n = n * 10 + cast[int32](c - 48)
+        i = i + 1
+    return n
+
+
+# 64 KiB of stdin scratch — big enough for a `find /` style dump while
+# staying in BSS (module scope), off the small user stack.
+STDIN_CAP: uint64 = 65536
+MAX_ITEMS: uint64 = 4096
+ARGV_CAP:  uint64 = 2048                     # per-invocation argv slots
+BASE_CAP:  uint64 = 64                       # template command words
+SUBST_CAP: uint64 = 65536                    # -I substituted-arg scratch
+
+stdin_buf:  Array[65536, uint8]
+items:      Array[4096, uint64]              # pointers into stdin_buf
+argv_buf:   Array[2048, uint64]              # command line handed to spawn
+base:       Array[64, uint64]                # template CMD + fixed ARGS
+subst_buf:  Array[65536, uint8]              # -I substitution scratch
+resolved:   Array[512, uint8]               # "/bin/<cmd>" path scratch
+
+
+# Resolve a bare command name to a spawnable path: a name containing '/'
+# is taken verbatim; otherwise it is looked up under /bin (where the
+# initramfs installs every native tool). Mirrors the '/'-verbatim arm of
+# hamsh's spawn_resolved without pulling in the full $PATH walk.
+def resolve_path(cmd: Ptr[uint8]) -> Ptr[char]:
+    i: uint64 = 0
+    while cmd[i] != 0:
+        if cmd[i] == 47:                     # '/'
+            return cast[Ptr[char]](cmd)
+        i = i + 1
+    prefix: Ptr[uint8] = "/bin/"
+    o: uint64 = 0
+    while prefix[o] != 0:
+        resolved[o] = prefix[o]
+        o = o + 1
+    j: uint64 = 0
+    while cmd[j] != 0 and o < 511:
+        resolved[o] = cmd[j]
+        o = o + 1
+        j = j + 1
+    resolved[o] = 0
+    return cast[Ptr[char]](&resolved[0])
+
+
+# Spawn argv_buf[0..] (already NUL-terminated), wait, return child status.
+def run_argv() -> int32:
+    cmd: Ptr[uint8] = cast[Ptr[uint8]](argv_buf[0])
+    path: Ptr[char] = resolve_path(cmd)
+    pid: int32 = spawn(path, &argv_buf[0], 0, 1, cast[Ptr[uint64]](0))
+    if pid < 0:
+        write_str(2, "xargs: spawn failed\n")
+        return 127
+    return cast[int32](sys_waitpid(pid))
+
+
+# Substitute every occurrence of `token` in `src` with `val`, writing a
+# NUL-terminated result at subst_buf[off]. Returns the offset just past
+# the result's NUL (the next free slot).
+def subst_arg(off: uint64, src: Ptr[uint8], token: Ptr[uint8],
+              val: Ptr[uint8]) -> uint64:
+    tlen: uint64 = strlen_u8(token)
+    i: uint64 = 0
+    o: uint64 = off
+    while src[i] != 0 and o < SUBST_CAP - 1:
+        # Try to match `token` at src[i].
+        m: uint64 = 0
+        while m < tlen and src[i + m] != 0 and src[i + m] == token[m]:
+            m = m + 1
+        if tlen > 0 and m == tlen:
+            k: uint64 = 0
+            while val[k] != 0 and o < SUBST_CAP - 1:
+                subst_buf[o] = val[k]
+                o = o + 1
+                k = k + 1
+            i = i + tlen
+        else:
+            subst_buf[o] = src[i]
+            o = o + 1
+            i = i + 1
+    subst_buf[o] = 0
+    return o + 1
 
 
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
-    if argc < 2:
-        write_str(2, "xargs: usage: xargs CMD [ARGS...]\n")
-        return 1
-    # Copy the caller's CMD + extra args (argv[1..]) into our argv_buf.
-    out_i: uint64 = 0
-    i: int32 = 1
-    while i < argc and out_i < ARGV_CAP - 1:
-        argv_buf[out_i] = argv[cast[uint64](i)]
-        out_i = out_i + 1
-        i = i + 1
+    nul: int32 = 0                           # -0
+    no_empty: int32 = 0                      # -r / --no-run-if-empty
+    max_n: int32 = 0                         # -n MAX (0 = unlimited)
+    repl: Ptr[uint8] = cast[Ptr[uint8]](0)   # -I REPLACE (0 = none)
 
-    # Slurp stdin.
+    # --- option parse: stop at the first non-option word (the command).
+    i: int32 = 1
+    while i < argc:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](i)])
+        if a[0] != 45 or a[1] == 0:          # not '-...' -> command starts
+            break
+        if a[1] == 48 and a[2] == 0:         # -0
+            nul = 1
+            i = i + 1
+        elif a[1] == 114 and a[2] == 0:      # -r
+            no_empty = 1
+            i = i + 1
+        elif str_eq(a, "--no-run-if-empty") != 0:
+            no_empty = 1
+            i = i + 1
+        elif a[1] == 110:                    # -n / -nMAX
+            v: int32 = -1
+            if a[2] != 0:
+                v = parse_uint(cast[Ptr[uint8]](cast[uint64](a) + 2))
+            else:
+                i = i + 1
+                if i < argc:
+                    v = parse_uint(cast[Ptr[uint8]](argv[cast[uint64](i)]))
+            if v < 1:
+                write_str(2, "xargs: bad -n\n")
+                return 1
+            max_n = v
+            i = i + 1
+        elif a[1] == 73:                     # -I / -IREPLACE
+            if a[2] != 0:
+                repl = cast[Ptr[uint8]](cast[uint64](a) + 2)
+            else:
+                i = i + 1
+                if i >= argc:
+                    write_str(2, "xargs: -I needs an argument\n")
+                    return 1
+                repl = cast[Ptr[uint8]](argv[cast[uint64](i)])
+            i = i + 1
+        elif str_eq(a, "--") != 0:
+            i = i + 1
+            break
+        else:
+            write_str(2, "xargs: unknown option\n")
+            return 1
+
+    # --- template command words (CMD + fixed ARGS). Default = echo.
+    base_n: uint64 = 0
+    while i < argc and base_n < BASE_CAP - 1:
+        base[base_n] = argv[cast[uint64](i)]
+        base_n = base_n + 1
+        i = i + 1
+    if base_n == 0:
+        base[0] = cast[uint64](cast[Ptr[uint8]]("echo"))
+        base_n = 1
+
+    # --- slurp stdin.
     total: uint64 = 0
     while total < STDIN_CAP:
         n: int64 = sys_read(0, cast[Ptr[uint8]](
@@ -61,39 +215,96 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             break
         total = total + cast[uint64](n)
 
-    # Tokenize on whitespace, NUL-terminating each token in place so
-    # argv_buf can hold raw pointers into stdin_buf.
-    tokens: uint64 = 0
+    # --- tokenize into items[], NUL-terminating each in place.
+    # Delimiter: NUL for -0; a single newline for -I (one item per line);
+    # otherwise any whitespace run.
+    nitems: uint64 = 0
     p: uint64 = 0
-    while p < total and tokens < MAX_TOKENS:
-        while p < total and (stdin_buf[p] == 32 or stdin_buf[p] == 9 \
-                or stdin_buf[p] == 10 or stdin_buf[p] == 13):
-            p = p + 1
+    while p < total and nitems < MAX_ITEMS:
+        # skip leading delimiters
+        if nul != 0:
+            while p < total and stdin_buf[p] == 0:
+                p = p + 1
+        elif repl != cast[Ptr[uint8]](0):
+            while p < total and (stdin_buf[p] == 10 or stdin_buf[p] == 13):
+                p = p + 1
+        else:
+            while p < total and (stdin_buf[p] == 32 or stdin_buf[p] == 9 \
+                    or stdin_buf[p] == 10 or stdin_buf[p] == 13):
+                p = p + 1
         if p >= total:
             break
         start: uint64 = p
-        while p < total and stdin_buf[p] != 32 and stdin_buf[p] != 9 \
-                and stdin_buf[p] != 10 and stdin_buf[p] != 13:
-            p = p + 1
-        # NUL-terminate this token (overwrites the whitespace OR the
-        # last byte we read, but stdin_buf has room because total <
-        # STDIN_CAP and we cap reads at STDIN_CAP-1 above? No — we
-        # may have filled the buffer. Guard the write.)
+        # scan to next delimiter
+        if nul != 0:
+            while p < total and stdin_buf[p] != 0:
+                p = p + 1
+        elif repl != cast[Ptr[uint8]](0):
+            while p < total and stdin_buf[p] != 10 and stdin_buf[p] != 13:
+                p = p + 1
+        else:
+            while p < total and stdin_buf[p] != 32 and stdin_buf[p] != 9 \
+                    and stdin_buf[p] != 10 and stdin_buf[p] != 13:
+                p = p + 1
         if p < STDIN_CAP:
-            stdin_buf[p] = 0
-        if out_i >= ARGV_CAP - 1:
-            break
-        argv_buf[out_i] = cast[uint64](&stdin_buf[start])
-        out_i = out_i + 1
-        tokens = tokens + 1
+            stdin_buf[p] = 0                 # terminate this item in place
+        items[nitems] = cast[uint64](&stdin_buf[start])
+        nitems = nitems + 1
         p = p + 1
 
-    argv_buf[out_i] = 0
-    cmd: Ptr[char] = cast[Ptr[char]](argv_buf[0])
-    pid: int32 = spawn(cmd, &argv_buf[0], 0, 1,
-                           cast[Ptr[uint64]](0))
-    if pid < 0:
-        write_str(2, "xargs: spawn failed\n")
-        return 1
-    sys_waitpid(pid)
-    return 0
+    exit_code: int32 = 0
+
+    # --- empty input.
+    if nitems == 0:
+        if no_empty != 0 or repl != cast[Ptr[uint8]](0):
+            return 0                         # GNU: nothing to do
+        # Run the command once with no appended items.
+        k: uint64 = 0
+        while k < base_n:
+            argv_buf[k] = base[k]
+            k = k + 1
+        argv_buf[base_n] = 0
+        return run_argv()
+
+    # --- -I REPLACE: one invocation per item, token-substituting the
+    # template args. Implies GNU's per-line, -n1-ish semantics.
+    if repl != cast[Ptr[uint8]](0):
+        it: uint64 = 0
+        while it < nitems:
+            val: Ptr[uint8] = cast[Ptr[uint8]](items[it])
+            off: uint64 = 0
+            k2: uint64 = 0
+            while k2 < base_n and k2 < ARGV_CAP - 1:
+                src: Ptr[uint8] = cast[Ptr[uint8]](base[k2])
+                argv_buf[k2] = cast[uint64](&subst_buf[off])
+                off = subst_arg(off, src, repl, val)
+                k2 = k2 + 1
+            argv_buf[k2] = 0
+            rc: int32 = run_argv()
+            if rc != 0:
+                exit_code = rc
+            it = it + 1
+        return exit_code
+
+    # --- default / -n MAX: append items to the template in batches.
+    per: uint64 = MAX_ITEMS
+    if max_n > 0:
+        per = cast[uint64](max_n)
+    idx: uint64 = 0
+    while idx < nitems:
+        k3: uint64 = 0
+        while k3 < base_n:
+            argv_buf[k3] = base[k3]
+            k3 = k3 + 1
+        cnt: uint64 = 0
+        while idx < nitems and cnt < per and k3 < ARGV_CAP - 1:
+            argv_buf[k3] = items[idx]
+            k3 = k3 + 1
+            idx = idx + 1
+            cnt = cnt + 1
+        argv_buf[k3] = 0
+        rc2: int32 = run_argv()
+        if rc2 != 0:
+            exit_code = rc2
+
+    return exit_code
