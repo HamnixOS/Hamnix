@@ -156,6 +156,53 @@ else
     echo "[hb-gfx] FAIL font-size page not anti-aliased"; fail=1
 fi
 
+# TABLE CELL PADDING (the exact #171 defect): in the rendered article PNG the
+# bordered <table>'s header text ("Subsystem") must sit INSIDE its left border,
+# not overlap/collide with the frame. Locate the table's left border (a tall
+# vertical dark run), then the first inked header glyph just to its right, and
+# assert the glyph starts at least 2px past the border. Guards the padding fix
+# against regressing back to zero-inset "text drawn on the border".
+if python3 - "$PNG" <<'PY'
+import sys
+try:
+    from PIL import Image
+except Exception:
+    print("[hb-gfx] SKIP table-padding pixel check (PIL unavailable)"); sys.exit(0)
+import numpy as np
+a = np.asarray(Image.open(sys.argv[1]).convert("L"))
+H, W = a.shape
+# tallest vertical dark run => a table border rule; take the leftmost such x.
+best_len = 0; border_x = -1; border_y = -1
+for x in range(W):
+    col = a[:, x] < 128
+    cur = start = 0
+    for i, v in enumerate(col):
+        if v:
+            if cur == 0: start = i
+            cur += 1
+            if cur > 60 and (border_x < 0 or x < border_x):
+                border_x = x; border_y = start; break
+        else:
+            cur = 0
+if border_x < 0:
+    print("[hb-gfx] FAIL table-padding: no table border found in PNG"); sys.exit(1)
+# scan a header-text band a little below the top border for the first inked
+# glyph pixel strictly to the RIGHT of the border.
+y0 = border_y + 8
+band = a[y0:y0+16, border_x+1:border_x+80] < 128
+xs = [border_x+1+dx for dx in range(band.shape[1]) if band[:, dx].any()]
+if not xs:
+    print("[hb-gfx] FAIL table-padding: no header glyph right of the border"); sys.exit(1)
+inset = xs[0] - border_x
+if inset >= 2:
+    print(f"[hb-gfx] PASS table cell text inset {inset}px inside its border "
+          f"(border x={border_x}, first glyph x={xs[0]})")
+    sys.exit(0)
+print(f"[hb-gfx] FAIL table header text touches the border (inset {inset}px)")
+sys.exit(1)
+PY
+then :; else fail=1; fi
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-gfx] PASS"
 else

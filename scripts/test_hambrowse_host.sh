@@ -168,23 +168,35 @@ assert_grep3() {
     fi
 }
 
-# Column x-positions are computed from the WIDEST cell per column:
-#   col0 "Blueberry"(9) -> next col at 8+(9+2)*8 = 96
-#   col1 "Colour"(6)    -> next col at 96+(6+2)*8 = 160
-# Header + every body row must share these exact column x-positions.
-assert_grep3 '^SEG 2 8 #101010 b1 .*Fruit\|'   "th 'Fruit' bold at col0 x=8"
-assert_grep3 '^SEG 2 96 #101010 b1 .*Colour\|' "th 'Colour' bold at col1 x=96"
-assert_grep3 '^SEG 2 160 #101010 b1 .*Qty\|'   "th 'Qty' bold at col2 x=160"
-assert_grep3 '^SEG 3 8 #101010 b0 .*Apple\|'   "td 'Apple' plain at col0 x=8"
-assert_grep3 '^SEG 3 96 #101010 b0 .*red\|'    "td 'red' at col1 x=96 (aligned to header)"
-assert_grep3 '^SEG 3 160 #101010 b0 .*12\|'    "td '12' at col2 x=160 (aligned to header)"
-assert_grep3 '^SEG 4 96 #101010 b0 .*blue\|'   "wide row 'Blueberry' keeps col1 at x=96"
-# Per-cell colour + background survive the column placement.
-assert_grep3 '^SEG 6 8 #101010 b0 u0 l-1 bg#c0c0c0 .*Lime\|' "td bgcolor=silver fills the cell (#c0c0c0)"
-assert_grep3 '^SEG 6 96 #008000 .*green\|'                   "font color=green inside a cell -> #008000"
-# The FLOW reconstruction shows the columns aligned as a grid.
-assert_grep3 '^FLOW  Fruit      Colour  Qty$'  "FLOW renders the header row as aligned columns"
-assert_grep3 '^FLOW  Blueberry  blue    340$'  "FLOW renders the wide row aligned to the same columns"
+# Column x-positions are computed from the WIDEST cell per column, and each
+# cell's text is inset CELL_PADX=6px from its left border so it never collides
+# with the frame. A <th> renders BOLD (~1/8 wider than the CELL_W monospace
+# estimate) so its column reserves ~1/3 extra chars to fit the bold header:
+#   col0 "Blueberry"(9)       -> next col at 8+(9+2)*8 = 96
+#   col1 "Colour"(6,th->8)    -> next col at 96+(8+2)*8 = 176
+# Cell text starts at col_x + 6 (the 6px inset): col0 -> 14, col1 -> 102,
+# col2 -> 182. Header + every body row share these exact inset column x's.
+assert_grep3 '^SEG 2 14 #101010 b1 .*Fruit\|'   "th 'Fruit' bold at col0 (x=14, 6px inset)"
+assert_grep3 '^SEG 2 102 #101010 b1 .*Colour\|' "th 'Colour' bold at col1 (x=102, fits bold header)"
+assert_grep3 '^SEG 2 182 #101010 b1 .*Qty\|'    "th 'Qty' bold at col2 (x=182)"
+assert_grep3 '^SEG 3 14 #101010 b0 .*Apple\|'   "td 'Apple' plain at col0 (x=14, aligned to header)"
+assert_grep3 '^SEG 3 102 #101010 b0 .*red\|'    "td 'red' at col1 (x=102, aligned to header)"
+assert_grep3 '^SEG 3 182 #101010 b0 .*12\|'     "td '12' at col2 (x=182, aligned to header)"
+assert_grep3 '^SEG 4 102 #101010 b0 .*blue\|'   "wide row 'Blueberry' keeps col1 at x=102"
+# Per-cell colour + background survive the padded column placement.
+assert_grep3 '^SEG 6 14 #101010 b0 u0 l-1 bg#c0c0c0 .*Lime\|' "td bgcolor=silver fills the cell (#c0c0c0)"
+assert_grep3 '^SEG 6 102 #008000 .*green\|'                   "font color=green inside a cell -> #008000"
+# Cell text must sit strictly INSIDE the cell's left border (x>col_x): col0's
+# border is at x=8, so no cell text may start at x<=8 — proving the padding.
+if grep -Eq '^SEG [2-6] 8 #' "$DUMP3"; then
+    echo "[hb-host] FAIL a cell drew text flush on the col0 border (x=8, no pad)"; fail=1
+else
+    echo "[hb-host] PASS every cell's text is inset from the col0 border (none at x=8)"
+fi
+# The FLOW reconstruction shows the columns aligned as a grid (bold-header col
+# widened so "Colour" is not cramped against "Qty").
+assert_grep3 '^FLOW  Fruit      Colour    Qty$'  "FLOW renders the header row as aligned columns"
+assert_grep3 '^FLOW  Blueberry  blue      340$'  "FLOW renders the wide row aligned to the same columns"
 
 # ====================================================================
 # BLOCK-MARGIN fixture — CSS margin-left/padding-left shift a <p>/<div>'s
@@ -220,13 +232,14 @@ assert_grepM '^SEG 10 8 .*Back flush at the body margin' "indent pops back to x=
 
 # ====================================================================
 # COLSPAN fixture — <thead>/<tbody> wrappers (transparent) + colspan cells.
-# Columns are sized by the single-span cells only:
-#   col0 "Region"(6) -> x=8,  next 8+(6+2)*8   = 72
-#   col1 "Q1"/"10"(2) -> x=72, next 72+(2+2)*8  = 104
-#   col2 "Q2"(2)      -> x=104, right sentinel 104+(2+2)*8 = 136
-# A colspan=2 cell starts at col1 (x=72) and its right edge is col_x[3]=136
+# Columns are sized by the single-span cells only; bold <th>s reserve ~1/3
+# extra chars and every cell's text is inset CELL_PADX=6px from its border:
+#   col0 "Region"(6,th->8) -> x=8,  next 8+(8+2)*8   = 88 ; text at 8+6  = 14
+#   col1 "Q1"(2,th->3)     -> x=88, next 88+(3+2)*8  = 128; text at 88+6 = 94
+#   col2 "Q2"(2,th->3)     -> x=128,right sentinel 128+(3+2)*8 = 168;   = 134
+# A colspan=2 cell starts at col1 (text x=94) and its right edge is col_x[3]
 # (spanning col1+col2), so its text flows across BOTH columns' width; a
-# colspan=3 cell starts at col0 (x=8) and spans the whole table.
+# colspan=3 cell starts at col0 (text x=14) and spans the whole table.
 # ====================================================================
 FIXS="tests/fixtures/hambrowse_span.html"
 DUMPS="$OUT/dump_span.txt"
@@ -247,21 +260,22 @@ assert_grepS() {
 
 # thead/tbody are transparent: the header <th>s size the columns and the
 # body <td>s align to the SAME x-positions across the wrapper boundary.
-assert_grepS '^SEG 2 8 #101010 b1 .*Region\|'  "th 'Region' bold at col0 x=8 (thead transparent)"
-assert_grepS '^SEG 2 72 #101010 b1 .*Q1\|'     "th 'Q1' bold at col1 x=72"
-assert_grepS '^SEG 2 104 #101010 b1 .*Q2\|'    "th 'Q2' bold at col2 x=104"
-assert_grepS '^SEG 3 8 #101010 b0 .*North\|'   "tbody td 'North' aligns to col0 x=8"
-assert_grepS '^SEG 3 72 #101010 b0 .*10\|'     "tbody td '10' aligns to col1 x=72"
-assert_grepS '^SEG 3 104 #101010 b0 .*20\|'    "tbody td '20' aligns to col2 x=104"
-# colspan=2: cell starts at col1 x=72; wraps at the SPANNED right edge (col_x[3]
-# =136, minus the 2-cell pad = 120 -> 6-char width) not at col1's own 2 chars.
-assert_grepS '^SEG 4 8 #101010 b0 .*Totals\|'  "row: single-span 'Totals' at col0 x=8"
-assert_grepS '^SEG 4 72 #101010 b0 .*All qu\|' "colspan=2 cell starts at col1 x=72, 6-char span width"
-# colspan=3: cell starts at col0 x=8 and spans the whole table width.
-assert_grepS '^SEG [0-9]+ 8 #101010 b0 .*Grand total\|' "colspan=3 cell starts at col0 x=8 across full width"
+assert_grepS '^SEG 2 14 #101010 b1 .*Region\|'  "th 'Region' bold at col0 (x=14, thead transparent)"
+assert_grepS '^SEG 2 94 #101010 b1 .*Q1\|'      "th 'Q1' bold at col1 (x=94)"
+assert_grepS '^SEG 2 134 #101010 b1 .*Q2\|'     "th 'Q2' bold at col2 (x=134)"
+assert_grepS '^SEG 3 14 #101010 b0 .*North\|'   "tbody td 'North' aligns to col0 (x=14)"
+assert_grepS '^SEG 3 94 #101010 b0 .*10\|'      "tbody td '10' aligns to col1 (x=94)"
+assert_grepS '^SEG 3 134 #101010 b0 .*20\|'     "tbody td '20' aligns to col2 (x=134)"
+# colspan=2: cell starts at col1 (x=94) and wraps within the SPANNED right edge
+# (col_x[3]) — its text flows across col1+col2, not col1's own 3 chars.
+assert_grepS '^SEG 4 14 #101010 b0 .*Totals\|'  "row: single-span 'Totals' at col0 (x=14)"
+assert_grepS '^SEG 4 94 #101010 b0 .*All\|'     "colspan=2 cell starts at col1 (x=94), spans col1+col2"
+assert_grepS '^SEG [5-6] 94 #101010 b0 .*quarters\|' "colspan=2 body wraps inside the spanned width"
+# colspan=3: cell starts at col0 (x=14) and spans the whole table width.
+assert_grepS '^SEG [0-9]+ 14 #101010 b0 .*Grand total across\|' "colspan=3 cell starts at col0 (x=14) across full width"
 # The single-span columns were NOT inflated by the spanning cells' long text
-# (col1 stayed 2 chars wide -> col2 at x=104, not pushed right).
-if grep -Eq '^SEG 2 104 ' "$DUMPS"; then
+# (col1 stayed 3 chars wide -> col2 text at x=134, not pushed further right).
+if grep -Eq '^SEG 2 134 ' "$DUMPS"; then
     echo "[hb-host] PASS spanning cells do not inflate single-span column widths"
 else
     echo "[hb-host] FAIL spanning cell inflated a column width"; fail=1
@@ -827,15 +841,15 @@ else
 fi
 # <pre> renders teal monospace on the light code background (#eef0f3) across
 # every code line.
-assert_grepA '^SEG 37 8 #0a6b5a b0 u0 l-1 bg#eef0f3 \|fn main\(\) \{\|' \
+assert_grepA '^SEG 56 8 #0a6b5a b0 u0 l-1 bg#eef0f3 \|fn main\(\) \{\|' \
     "pre line -> teal text on the light code background (#eef0f3)"
-assert_grepA '^SEG 39 8 #0a6b5a b0 u0 l-1 bg#eef0f3 \|\}\|' \
+assert_grepA '^SEG 58 8 #0a6b5a b0 u0 l-1 bg#eef0f3 \|\}\|' \
     "every pre line carries the code background"
 # inline <code> also gets the teal tint + code background (mid-paragraph).
 assert_grepA '^SEG [0-9]+ [0-9]+ #0a6b5a b0 u0 l-1 bg#eef0f3 \| code\|' \
     "inline <code> -> teal text on the light code background"
 # <blockquote> text renders in a muted grey (#5a5a5a), still indented to x=32.
-assert_grepA '^SEG 29 32 #5a5a5a b0 u0 l-1 bg- \|Anything that can go wrong' \
+assert_grepA '^SEG 48 32 #5a5a5a b0 u0 l-1 bg- \|Anything that can go wrong' \
     "blockquote text -> muted grey (#5a5a5a), indented to x=32"
 
 # ---- readable-measure default: on a WIDE window the body column is capped at
