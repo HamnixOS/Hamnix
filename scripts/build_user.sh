@@ -168,7 +168,7 @@ build_adder_user pathchk                # validate a pathname (-p POSIX portabil
 build_adder_user hdu                  # ncdu-style interactive disk-usage browser (recursive sizes, bar, navigate)
 build_adder_user hlog                 # TUI kernel-log viewer/follower (dmesg -w / journalctl -f) over /proc/kmsg
 build_adder_user oopsread             # F-oops: render persisted kernel panic record from /proc/oops
-build_adder_user awk                  # literal {print $N} only
+build_adder_user awk                  # tree-walk interpreter: fields/NF/NR, FS/OFS, /re/+relational+&&||! patterns, BEGIN/END, print/printf, if/while/for, assoc arrays, length/substr/index/split/toupper/tolower; flags -F/-v/-f (lib/regex.ad)
 build_adder_user less                 # alias for more (24-line pager)
 build_adder_user xargs                # stdin items -> batched fork/exec (-0/-n/-I/-r)
 build_adder_user ascii                # printable ASCII 32..126 table

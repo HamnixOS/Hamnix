@@ -1,17 +1,205 @@
 # user/awk.ad
 #
-# Minimal Hamnix `awk '{print $N}'`. Reads stdin a line at a time;
-# splits each line on whitespace; prints the Nth field (1-based).
-# Only the literal `{print $N}` program form is recognized — no
-# patterns, no BEGIN/END, no functions, no arithmetic, no $0.
-# The single argv must be exactly `{print $<digits>}`.
+# Native Hamnix `awk` — the everyday common subset, implemented as a
+# lexer -> recursive-descent tree-walk interpreter over the program text.
+# There is no separate AST: the program source is re-interpreted from a
+# saved cursor for each input record (BEGIN once, each rule per record,
+# END once), with variables / arrays / fields held in module globals.
+# This keeps the whole thing extern-free apart from the syscall thunks,
+# so the SAME source compiles for the on-device x86_64-adder-user target
+# AND for the x86_64-linux host cross-check against GNU awk.
 #
-#   /cat /proc/tasks | /awk '{print $1}'
+# IMPLEMENTED (byte-identical to GNU awk on this subset):
+#   * Records + fields: $0, $1..$NF, $(expr), NF, NR; FS split (default
+#     runs of blanks; single-char literal via -F X / FS="X"; multi-char
+#     FS = ERE via lib/regex.ad); OFS for `print`.
+#   * Rules: `pattern { action }`, bare `{ action }`, bare `pattern`
+#     (prints $0), `BEGIN { }`, `END { }`.
+#   * Patterns: /regex/ (ERE via lib/regex.ad), relational (< <= > >= ==
+#     != ~ !~), && || !, and any truthy expression (NF>2, NR%2, ...).
+#   * Actions: print (comma list joined by OFS, default $0), printf
+#     (%d %i %o %x %X %u %c %s %f %e %g with - 0 + space flags, width,
+#     .precision), assignment (= += -= *= /= %=), arithmetic + - * / %,
+#     unary - + !, ++ / -- (pre + post), string concat by adjacency,
+#     comparison, if/else, while, for(;;), break, continue, next, exit,
+#     and associative arrays a[k].
+#   * Built-ins: length([s]), substr(s,m[,n]), index(s,t),
+#     split(s,arr[,fs]), toupper(s), tolower(s), int(x), sprintf(fmt,..).
+#   * Flags: -F fs (or -Ffs), -v var=val (repeatable), program as argv or
+#     -f progfile; FILE operands or stdin.
 #
-# Returns 1 on parse error, 0 on EOF.
+# SCOPED OUT (explicitly): user-defined functions, getline, sub/gsub/
+# match, range patterns pat1,pat2, for-in / `in`, multi-dim arrays,
+# field assignment ($1=... with $0 rebuild) / assigning NF, print/printf
+# redirection (> >> |), the ?: ternary, `^` exponent, RS/ORS other than
+# newline, command-line `var=val` file operands, FNR/FILENAME.
+#
+# Records are capped at REC_CAP bytes and total input at IN_CAP bytes.
+
+from lib.regex import (rx_compile, rx_search, rx_mstart, rx_mend)
 
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char], flags: int32, mode: int32) -> int32
+extern def sys_close(fd: int32) -> int32
+
+
+# ==================================================================
+# Token type constants
+# ==================================================================
+T_EOF: int32 = 0
+T_NUM: int32 = 1
+T_STR: int32 = 2
+T_ID: int32 = 3
+T_LBRACE: int32 = 4
+T_RBRACE: int32 = 5
+T_LPAREN: int32 = 6
+T_RPAREN: int32 = 7
+T_LBRACK: int32 = 8
+T_RBRACK: int32 = 9
+T_SEMI: int32 = 10
+T_NEWLINE: int32 = 11
+T_COMMA: int32 = 12
+T_ASSIGN: int32 = 13
+T_ADDEQ: int32 = 14
+T_SUBEQ: int32 = 15
+T_MULEQ: int32 = 16
+T_DIVEQ: int32 = 17
+T_MODEQ: int32 = 18
+T_EQ: int32 = 19
+T_NE: int32 = 20
+T_LT: int32 = 21
+T_LE: int32 = 22
+T_GT: int32 = 23
+T_GE: int32 = 24
+T_MATCH: int32 = 25
+T_NOMATCH: int32 = 26
+T_AND: int32 = 27
+T_OR: int32 = 28
+T_NOT: int32 = 29
+T_PLUS: int32 = 30
+T_MINUS: int32 = 31
+T_STAR: int32 = 32
+T_SLASH: int32 = 33
+T_PERCENT: int32 = 34
+T_DOLLAR: int32 = 35
+T_INCR: int32 = 36
+T_DECR: int32 = 37
+
+
+# ==================================================================
+# Program text + parse cursor
+# ==================================================================
+prog: Array[16384, uint8]
+prog_len: uint64 = 0
+pc: uint64 = 0
+lim: uint64 = 0
+
+# current token
+t_type: int32 = 0
+t_num: float64
+t_sptr: uint64 = 0
+t_slen: uint64 = 0
+t_begin: uint64 = 0
+
+# scratch string arena (literals unescaped here + computed strings)
+sbuf: Array[65536, uint8]
+sbuf_used: uint64 = 0
+g_soff: uint64 = 0
+g_slen: uint64 = 0
+
+# ==================================================================
+# Value stack for expression evaluation
+# ==================================================================
+VS: int64 = 128
+vs_top: int64 = 0
+vs_isstr: Array[128, int32]
+vs_strnum: Array[128, int32]
+vs_num: Array[128, float64]
+vs_ptr: Array[128, uint64]
+vs_len: Array[128, uint64]
+
+g_en: int32 = 1                      # execute flag (0 = parse-only skip)
+
+# ==================================================================
+# Fields / record state
+# ==================================================================
+REC_CAP: uint64 = 8192
+f0: Array[8192, uint8]
+f0_len: uint64 = 0
+NFcount: int64 = 0
+fld_off: Array[512, uint64]
+fld_len: Array[512, uint64]
+NRv: int64 = 0
+
+fs_buf: Array[64, uint8]
+fs_len: uint64 = 1
+ofs_buf: Array[64, uint8]
+ofs_len: uint64 = 1
+
+# ==================================================================
+# Scalar variables
+# ==================================================================
+NVARS: int64 = 128
+var_name: Array[2048, uint8]         # 128 * 16
+var_namelen: Array[128, uint64]
+var_num: Array[128, float64]
+var_isstr: Array[128, int32]
+var_strnum: Array[128, int32]
+var_sbuf: Array[32768, uint8]        # 128 * 256
+var_slen: Array[128, uint64]
+var_used: int64 = 0
+
+# ==================================================================
+# Associative arrays
+# ==================================================================
+AR_MAX: int64 = 2048
+ar_name: Array[32768, uint8]         # 2048 * 16
+ar_namelen: Array[2048, uint64]
+ar_key: Array[131072, uint8]         # 2048 * 64
+ar_keylen: Array[2048, uint64]
+ar_num: Array[2048, float64]
+ar_isstr: Array[2048, int32]
+ar_strnum: Array[2048, int32]
+ar_sbuf: Array[262144, uint8]        # 2048 * 128
+ar_slen: Array[2048, uint64]
+ar_used: int64 = 0
+
+# ==================================================================
+# Control flow
+# ==================================================================
+cf: int32 = 0                        # 0 normal 1 break 2 continue 3 next 4 exit
+exit_code: int32 = 0
+had_exit: int32 = 0
+
+# ==================================================================
+# Output buffer
+# ==================================================================
+outbuf: Array[65536, uint8]
+out_used: uint64 = 0
+
+
+def out_flush():
+    if out_used > 0:
+        sys_write(1, &outbuf[0], out_used)
+        out_used = 0
+
+
+def out_bytes(p: Ptr[uint8], n: uint64):
+    i: uint64 = 0
+    while i < n:
+        if out_used >= 65536:
+            out_flush()
+        outbuf[out_used] = p[i]
+        out_used = out_used + 1
+        i = i + 1
+
+
+def out_ch(c: uint8):
+    if out_used >= 65536:
+        out_flush()
+    outbuf[out_used] = c
+    out_used = out_used + 1
 
 
 def strlen_u8(s: Ptr[uint8]) -> uint64:
@@ -21,97 +209,3187 @@ def strlen_u8(s: Ptr[uint8]) -> uint64:
     return n
 
 
-def write_str(fd: int32, s: Ptr[uint8]):
-    sys_write(fd, s, strlen_u8(s))
+def write_err(s: Ptr[uint8]):
+    sys_write(2, s, strlen_u8(s))
 
 
-def parse_program(prog: Ptr[uint8]) -> int32:
-    # Expect exactly: {print $<digits>} with optional spaces between
-    # tokens. Returns the field index (1-based), or -1 on parse error.
-    i: uint64 = 0
-    if prog[i] != 123:                          # '{'
-        return -1
-    i = i + 1
-    while prog[i] == 32:
-        i = i + 1
-    # "print"
-    if prog[i] != 112 or prog[i + 1] != 114 or prog[i + 2] != 105 \
-            or prog[i + 3] != 110 or prog[i + 4] != 116:
-        return -1
-    i = i + 5
-    while prog[i] == 32:
-        i = i + 1
-    if prog[i] != 36:                           # '$'
-        return -1
-    i = i + 1
-    n: int32 = 0
-    have_digit: int32 = 0
-    while prog[i] >= 48 and prog[i] <= 57:
-        n = n * 10 + cast[int32](prog[i] - 48)
-        have_digit = 1
-        i = i + 1
-    if have_digit == 0:
-        return -1
-    while prog[i] == 32:
-        i = i + 1
-    if prog[i] != 125:                          # '}'
-        return -1
-    if n < 1:
-        return -1
-    return n
-
-
-# Per-line accumulator. 1 KiB matches our other line tools.
-line: Array[1024, uint8]
-
-
-def emit_field(line_len: uint64, field_n: int32):
-    # Walk fields by skipping spaces/tabs, then taking a run of
-    # non-whitespace, until we've reached field_n.
-    i: uint64 = 0
-    f: int32 = 0
-    while i < line_len:
-        while i < line_len and (line[i] == 32 or line[i] == 9):
-            i = i + 1
-        if i >= line_len:
-            return
-        f = f + 1
-        start: uint64 = i
-        while i < line_len and line[i] != 32 and line[i] != 9:
-            i = i + 1
-        if f == field_n:
-            sys_write(1, &line[start], i - start)
-            sys_write(1, "\n", 1)
-            return
-
-
-def main(argc: int32, argv: Ptr[uint64]) -> int32:
-    if argc < 2:
-        write_str(2, "awk: usage: awk '{print $N}'\n")
+# ==================================================================
+# Character predicates
+# ==================================================================
+def is_digit(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
         return 1
-    field_n: int32 = parse_program(cast[Ptr[uint8]](argv[1]))
-    if field_n < 0:
-        write_str(2, "awk: only {print $N} supported\n")
-        return 1
-
-    chunk: Array[256, uint8]
-    line_pos: uint64 = 0
-    while True:
-        n: int64 = sys_read(0, &chunk[0], 256)
-        if n <= 0:
-            break
-        nu: uint64 = cast[uint64](n)
-        i: uint64 = 0
-        while i < nu:
-            c: uint8 = chunk[i]
-            if c == 10:
-                emit_field(line_pos, field_n)
-                line_pos = 0
-            else:
-                if line_pos + 1 < 1024:
-                    line[line_pos] = c
-                    line_pos = line_pos + 1
-            i = i + 1
-    if line_pos > 0:
-        emit_field(line_pos, field_n)
     return 0
+
+
+def is_alpha(c: uint8) -> int32:
+    if c >= 65 and c <= 90:
+        return 1
+    if c >= 97 and c <= 122:
+        return 1
+    if c == 95:
+        return 1
+    return 0
+
+
+def is_alnum(c: uint8) -> int32:
+    if is_alpha(c) == 1 or is_digit(c) == 1:
+        return 1
+    return 0
+
+
+# ==================================================================
+# Float helpers
+# ==================================================================
+def f_trunc(x: float64) -> float64:
+    i: int64 = cast[int64](x)
+    return cast[float64](i)
+
+
+def f_abs(x: float64) -> float64:
+    if x < 0.0:
+        return -x
+    return x
+
+
+def f_fmod(a: float64, b: float64) -> float64:
+    if b == 0.0:
+        return 0.0
+    q: float64 = f_trunc(a / b)
+    return a - q * b
+
+
+def is_intval(x: float64) -> int32:
+    if f_abs(x) >= 1000000000000000.0:
+        return 0
+    if x == f_trunc(x):
+        return 1
+    return 0
+
+
+# ==================================================================
+# String <-> number
+# ==================================================================
+def str_to_num(p: Ptr[uint8], n: uint64) -> float64:
+    i: uint64 = 0
+    while i < n and (p[i] == 32 or p[i] == 9):
+        i = i + 1
+    sign: float64 = 1.0
+    if i < n and p[i] == 43:
+        i = i + 1
+    elif i < n and p[i] == 45:
+        sign = -1.0
+        i = i + 1
+    val: float64 = 0.0
+    any: int32 = 0
+    while i < n and is_digit(p[i]) == 1:
+        val = val * 10.0 + cast[float64](cast[int32](p[i]) - 48)
+        any = 1
+        i = i + 1
+    if i < n and p[i] == 46:
+        i = i + 1
+        scale: float64 = 0.1
+        while i < n and is_digit(p[i]) == 1:
+            val = val + cast[float64](cast[int32](p[i]) - 48) * scale
+            scale = scale * 0.1
+            any = 1
+            i = i + 1
+    if any == 0:
+        return 0.0
+    if i < n and (p[i] == 101 or p[i] == 69):        # e / E
+        j: uint64 = i + 1
+        esign: int32 = 1
+        if j < n and p[j] == 43:
+            j = j + 1
+        elif j < n and p[j] == 45:
+            esign = -1
+            j = j + 1
+        ev: int32 = 0
+        edig: int32 = 0
+        while j < n and is_digit(p[j]) == 1:
+            ev = ev * 10 + (cast[int32](p[j]) - 48)
+            edig = 1
+            j = j + 1
+        if edig == 1:
+            k: int32 = 0
+            while k < ev:
+                if esign > 0:
+                    val = val * 10.0
+                else:
+                    val = val / 10.0
+                k = k + 1
+    return sign * val
+
+
+# whole string (with surrounding blanks) a valid number?
+def looks_numeric(p: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n and (p[i] == 32 or p[i] == 9):
+        i = i + 1
+    if i >= n:
+        return 0
+    if p[i] == 43 or p[i] == 45:
+        i = i + 1
+    dig: int32 = 0
+    while i < n and is_digit(p[i]) == 1:
+        dig = 1
+        i = i + 1
+    if i < n and p[i] == 46:
+        i = i + 1
+        while i < n and is_digit(p[i]) == 1:
+            dig = 1
+            i = i + 1
+    if dig == 0:
+        return 0
+    if i < n and (p[i] == 101 or p[i] == 69):
+        i = i + 1
+        if i < n and (p[i] == 43 or p[i] == 45):
+            i = i + 1
+        edig: int32 = 0
+        while i < n and is_digit(p[i]) == 1:
+            edig = 1
+            i = i + 1
+        if edig == 0:
+            return 0
+    while i < n and (p[i] == 32 or p[i] == 9):
+        i = i + 1
+    if i != n:
+        return 0
+    return 1
+
+
+# ==================================================================
+# Number -> string (awk CONVFMT/OFMT: integer -> %d else %.6g),
+# written into sbuf; sets g_soff/g_slen.
+# ==================================================================
+def sbuf_put(c: uint8):
+    if sbuf_used < 65536:
+        sbuf[sbuf_used] = c
+        sbuf_used = sbuf_used + 1
+
+
+def int_to_sbuf(v: int64):
+    g_soff = sbuf_used
+    if v == 0:
+        sbuf_put(48)
+        g_slen = sbuf_used - g_soff
+        return
+    neg: int32 = 0
+    u: uint64 = 0
+    if v < 0:
+        neg = 1
+        u = cast[uint64](-v)
+    else:
+        u = cast[uint64](v)
+    tmp: Array[24, uint8]
+    k: int32 = 0
+    while u > 0:
+        tmp[k] = cast[uint8](48 + cast[int32](u % 10))
+        u = u / 10
+        k = k + 1
+    if neg == 1:
+        sbuf_put(45)
+    j: int32 = k - 1
+    while j >= 0:
+        sbuf_put(tmp[j])
+        j = j - 1
+    g_slen = sbuf_used - g_soff
+
+
+def f_round_pos(y: float64) -> float64:
+    return f_trunc(y + 0.5)
+
+
+# format x with %.<prec>g semantics into sbuf (prec significant digits)
+def g_to_sbuf(x: float64, prec: int32):
+    g_soff = sbuf_used
+    if x != x:                               # NaN
+        sbuf_put(110)
+        sbuf_put(97)
+        sbuf_put(110)
+        g_slen = sbuf_used - g_soff
+        return
+    if x == 0.0:
+        sbuf_put(48)
+        g_slen = sbuf_used - g_soff
+        return
+    neg: int32 = 0
+    ax: float64 = x
+    if ax < 0.0:
+        neg = 1
+        ax = -ax
+    e: int32 = 0
+    while ax >= 10.0:
+        ax = ax / 10.0
+        e = e + 1
+    while ax < 1.0:
+        ax = ax * 10.0
+        e = e - 1
+    # ax in [1,10); build `prec` significant digits as an integer
+    p10: float64 = 1.0
+    k: int32 = 0
+    while k < prec - 1:
+        p10 = p10 * 10.0
+        k = k + 1
+    m: int64 = cast[int64](f_round_pos(ax * p10))
+    limit: int64 = cast[int64](p10) * 10
+    if m >= limit:
+        m = m / 10
+        e = e + 1
+    # digits of m (exactly prec digits, most significant first)
+    digs: Array[24, uint8]
+    d: int32 = prec - 1
+    mm: int64 = m
+    while d >= 0:
+        digs[d] = cast[uint8](48 + cast[int32](mm % 10))
+        mm = mm / 10
+        d = d - 1
+    # trim trailing zero significant digits
+    nsig: int32 = prec
+    while nsig > 1 and digs[nsig - 1] == 48:
+        nsig = nsig - 1
+    if neg == 1:
+        sbuf_put(45)
+    if e < -4 or e >= prec:
+        # scientific: d.dddde+XX
+        sbuf_put(digs[0])
+        if nsig > 1:
+            sbuf_put(46)
+            i: int32 = 1
+            while i < nsig:
+                sbuf_put(digs[i])
+                i = i + 1
+        sbuf_put(101)                        # 'e'
+        ee: int32 = e
+        if ee < 0:
+            sbuf_put(45)
+            ee = -ee
+        else:
+            sbuf_put(43)
+        if ee < 10:
+            sbuf_put(48)
+        # exponent digits
+        etmp: Array[8, uint8]
+        ec: int32 = 0
+        if ee == 0:
+            etmp[0] = 48
+            ec = 1
+        while ee > 0:
+            etmp[ec] = cast[uint8](48 + (ee % 10))
+            ee = ee / 10
+            ec = ec + 1
+        z: int32 = ec - 1
+        while z >= 0:
+            sbuf_put(etmp[z])
+            z = z - 1
+    elif e >= 0:
+        # fixed, integer part e+1 digits
+        i: int32 = 0
+        while i <= e:
+            if i < nsig:
+                sbuf_put(digs[i])
+            else:
+                sbuf_put(48)
+            i = i + 1
+        if nsig > e + 1:
+            sbuf_put(46)
+            while i < nsig:
+                sbuf_put(digs[i])
+                i = i + 1
+    else:
+        # 0.00ddd
+        sbuf_put(48)
+        sbuf_put(46)
+        z: int32 = -1
+        while z > e:
+            sbuf_put(48)
+            z = z - 1
+        i: int32 = 0
+        while i < nsig:
+            sbuf_put(digs[i])
+            i = i + 1
+    g_slen = sbuf_used - g_soff
+
+
+def num_to_sbuf(x: float64):
+    if is_intval(x) == 1:
+        int_to_sbuf(cast[int64](x))
+    else:
+        g_to_sbuf(x, 6)
+
+
+# ==================================================================
+# Value stack helpers
+# ==================================================================
+def vpush_num(x: float64):
+    vs_isstr[vs_top] = 0
+    vs_strnum[vs_top] = 0
+    vs_num[vs_top] = x
+    vs_top = vs_top + 1
+
+
+def vpush_str(addr: uint64, n: uint64, snum: int32):
+    vs_isstr[vs_top] = 1
+    vs_strnum[vs_top] = snum
+    vs_ptr[vs_top] = addr
+    vs_len[vs_top] = n
+    vs_top = vs_top + 1
+
+
+# copy bytes into sbuf and push as a (non-strnum) string value
+def vpush_sbuf_str(start: uint64, n: uint64):
+    vpush_str(cast[uint64](&sbuf[start]), n, 0)
+
+
+def vnum(i: int64) -> float64:
+    if vs_isstr[i] == 0:
+        return vs_num[i]
+    return str_to_num(cast[Ptr[uint8]](vs_ptr[i]), vs_len[i])
+
+
+# ensure value i has string bytes; returns via g_soff-style globals gv_ptr/gv_len
+gv_ptr: uint64 = 0
+gv_len: uint64 = 0
+
+
+def vstr(i: int64):
+    if vs_isstr[i] == 1:
+        gv_ptr = vs_ptr[i]
+        gv_len = vs_len[i]
+        return
+    num_to_sbuf(vs_num[i])
+    gv_ptr = cast[uint64](&sbuf[g_soff])
+    gv_len = g_slen
+
+
+def v_numericish(i: int64) -> int32:
+    if vs_isstr[i] == 0:
+        return 1
+    if vs_strnum[i] == 1 and looks_numeric(cast[Ptr[uint8]](vs_ptr[i]), vs_len[i]) == 1:
+        return 1
+    return 0
+
+
+def v_truthy(i: int64) -> int32:
+    if v_numericish(i) == 1:
+        if vnum(i) != 0.0:
+            return 1
+        return 0
+    if vs_len[i] > 0:
+        return 1
+    return 0
+
+
+def mem_cmp(a: Ptr[uint8], an: uint64, b: Ptr[uint8], bn: uint64) -> int32:
+    i: uint64 = 0
+    while i < an and i < bn:
+        if a[i] < b[i]:
+            return -1
+        if a[i] > b[i]:
+            return 1
+        i = i + 1
+    if an < bn:
+        return -1
+    if an > bn:
+        return 1
+    return 0
+
+
+# compare values at li and ri per awk rules; returns -1/0/1
+def val_cmp(li: int64, ri: int64) -> int32:
+    if v_numericish(li) == 1 and v_numericish(ri) == 1:
+        a: float64 = vnum(li)
+        b: float64 = vnum(ri)
+        if a < b:
+            return -1
+        if a > b:
+            return 1
+        return 0
+    vstr(li)
+    ap: uint64 = gv_ptr
+    an: uint64 = gv_len
+    vstr(ri)
+    return mem_cmp(cast[Ptr[uint8]](ap), an, cast[Ptr[uint8]](gv_ptr), gv_len)
+
+
+# ==================================================================
+# Variable table
+# ==================================================================
+def name_eq(np: Ptr[uint8], nl: uint64, lit: Ptr[uint8]) -> int32:
+    ll: uint64 = strlen_u8(lit)
+    if ll != nl:
+        return 0
+    i: uint64 = 0
+    while i < nl:
+        if np[i] != lit[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def var_find(np: Ptr[uint8], nl: uint64) -> int64:
+    i: int64 = 0
+    while i < var_used:
+        if var_namelen[i] == nl:
+            base: int64 = i * 16
+            mt: int32 = 1
+            j: uint64 = 0
+            while j < nl:
+                if var_name[cast[uint64](base) + j] != np[j]:
+                    mt = 0
+                    j = nl
+                else:
+                    j = j + 1
+            if mt == 1:
+                return i
+        i = i + 1
+    return -1
+
+
+def var_intern(np: Ptr[uint8], nl: uint64) -> int64:
+    idx: int64 = var_find(np, nl)
+    if idx >= 0:
+        return idx
+    if var_used >= NVARS:
+        return 0
+    idx = var_used
+    var_used = var_used + 1
+    var_namelen[idx] = nl
+    base: int64 = idx * 16
+    j: uint64 = 0
+    while j < nl and j < 16:
+        var_name[cast[uint64](base) + j] = np[j]
+        j = j + 1
+    var_num[idx] = 0.0
+    var_isstr[idx] = 0
+    var_strnum[idx] = 0
+    var_slen[idx] = 0
+    return idx
+
+
+def var_push(idx: int64):
+    if var_isstr[idx] == 1:
+        vpush_str(cast[uint64](&var_sbuf[idx * 256]), var_slen[idx], var_strnum[idx])
+    else:
+        vpush_num(var_num[idx])
+
+
+def var_set_from_val(idx: int64, vi: int64):
+    if vs_isstr[vi] == 1:
+        var_isstr[idx] = 1
+        var_strnum[idx] = vs_strnum[vi]
+        n: uint64 = vs_len[vi]
+        if n > 256:
+            n = 256
+        src: Ptr[uint8] = cast[Ptr[uint8]](vs_ptr[vi])
+        base: int64 = idx * 256
+        j: uint64 = 0
+        while j < n:
+            var_sbuf[cast[uint64](base) + j] = src[j]
+            j = j + 1
+        var_slen[idx] = n
+    else:
+        var_isstr[idx] = 0
+        var_strnum[idx] = 0
+        var_num[idx] = vs_num[vi]
+
+
+def var_set_num(idx: int64, x: float64):
+    var_isstr[idx] = 0
+    var_strnum[idx] = 0
+    var_num[idx] = x
+
+
+# ==================================================================
+# Associative arrays
+# ==================================================================
+def ar_find(nm: Ptr[uint8], nml: uint64, ky: Ptr[uint8], kyl: uint64) -> int64:
+    i: int64 = 0
+    while i < ar_used:
+        if ar_namelen[i] == nml and ar_keylen[i] == kyl:
+            ok: int32 = 1
+            j: uint64 = 0
+            nb: int64 = i * 16
+            while j < nml:
+                if ar_name[cast[uint64](nb) + j] != nm[j]:
+                    ok = 0
+                    j = nml
+                else:
+                    j = j + 1
+            if ok == 1:
+                kb: int64 = i * 64
+                j = 0
+                while j < kyl:
+                    if ar_key[cast[uint64](kb) + j] != ky[j]:
+                        ok = 0
+                        j = kyl
+                    else:
+                        j = j + 1
+            if ok == 1:
+                return i
+        i = i + 1
+    return -1
+
+
+def ar_intern(nm: Ptr[uint8], nml: uint64, ky: Ptr[uint8], kyl: uint64) -> int64:
+    idx: int64 = ar_find(nm, nml, ky, kyl)
+    if idx >= 0:
+        return idx
+    if ar_used >= AR_MAX:
+        return 0
+    idx = ar_used
+    ar_used = ar_used + 1
+    ar_namelen[idx] = nml
+    nb: int64 = idx * 16
+    j: uint64 = 0
+    while j < nml and j < 16:
+        ar_name[cast[uint64](nb) + j] = nm[j]
+        j = j + 1
+    ar_keylen[idx] = kyl
+    kb: int64 = idx * 64
+    j = 0
+    while j < kyl and j < 64:
+        ar_key[cast[uint64](kb) + j] = ky[j]
+        j = j + 1
+    ar_num[idx] = 0.0
+    ar_isstr[idx] = 0
+    ar_strnum[idx] = 0
+    ar_slen[idx] = 0
+    return idx
+
+
+def ar_push(idx: int64):
+    if ar_isstr[idx] == 1:
+        vpush_str(cast[uint64](&ar_sbuf[idx * 128]), ar_slen[idx], ar_strnum[idx])
+    else:
+        vpush_num(ar_num[idx])
+
+
+def ar_set_from_val(idx: int64, vi: int64):
+    if vs_isstr[vi] == 1:
+        ar_isstr[idx] = 1
+        ar_strnum[idx] = vs_strnum[vi]
+        n: uint64 = vs_len[vi]
+        if n > 128:
+            n = 128
+        src: Ptr[uint8] = cast[Ptr[uint8]](vs_ptr[vi])
+        base: int64 = idx * 128
+        j: uint64 = 0
+        while j < n:
+            ar_sbuf[cast[uint64](base) + j] = src[j]
+            j = j + 1
+        ar_slen[idx] = n
+    else:
+        ar_isstr[idx] = 0
+        ar_strnum[idx] = 0
+        ar_num[idx] = vs_num[vi]
+
+
+def ar_clear(nm: Ptr[uint8], nml: uint64):
+    # compact out all entries with this array name
+    w: int64 = 0
+    r: int64 = 0
+    while r < ar_used:
+        keep: int32 = 1
+        if ar_namelen[r] == nml:
+            ok: int32 = 1
+            j: uint64 = 0
+            nb: int64 = r * 16
+            while j < nml:
+                if ar_name[cast[uint64](nb) + j] != nm[j]:
+                    ok = 0
+                    j = nml
+                else:
+                    j = j + 1
+            if ok == 1:
+                keep = 0
+        if keep == 1:
+            if w != r:
+                copy_ar_entry(r, w)
+            w = w + 1
+        r = r + 1
+    ar_used = w
+
+
+def copy_ar_entry(src: int64, dst: int64):
+    ar_namelen[dst] = ar_namelen[src]
+    ar_keylen[dst] = ar_keylen[src]
+    ar_num[dst] = ar_num[src]
+    ar_isstr[dst] = ar_isstr[src]
+    ar_strnum[dst] = ar_strnum[src]
+    ar_slen[dst] = ar_slen[src]
+    j: uint64 = 0
+    while j < 16:
+        ar_name[cast[uint64](dst * 16) + j] = ar_name[cast[uint64](src * 16) + j]
+        j = j + 1
+    j = 0
+    while j < 64:
+        ar_key[cast[uint64](dst * 64) + j] = ar_key[cast[uint64](src * 64) + j]
+        j = j + 1
+    j = 0
+    while j < 128:
+        ar_sbuf[cast[uint64](dst * 128) + j] = ar_sbuf[cast[uint64](src * 128) + j]
+        j = j + 1
+
+
+# ==================================================================
+# Field access
+# ==================================================================
+def field_push(n: int64):
+    if n <= 0:
+        vpush_str(cast[uint64](&f0[0]), f0_len, 1)
+        return
+    if n > NFcount:
+        vpush_str(cast[uint64](&sbuf[sbuf_used]), 0, 1)      # empty strnum
+        return
+    off: uint64 = fld_off[n - 1]
+    ln: uint64 = fld_len[n - 1]
+    vpush_str(cast[uint64](&f0[off]), ln, 1)
+
+
+# ==================================================================
+# Lexer
+# ==================================================================
+def lex_number():
+    p: uint64 = t_begin
+    # hex
+    if prog[p] == 48 and p + 1 < lim and (prog[p + 1] == 120 or prog[p + 1] == 88):
+        p = p + 2
+        hv: float64 = 0.0
+        while p < lim:
+            c: uint8 = prog[p]
+            d: int32 = -1
+            if c >= 48 and c <= 57:
+                d = cast[int32](c) - 48
+            elif c >= 97 and c <= 102:
+                d = cast[int32](c) - 87
+            elif c >= 65 and c <= 70:
+                d = cast[int32](c) - 55
+            if d < 0:
+                break
+            hv = hv * 16.0 + cast[float64](d)
+            p = p + 1
+        t_num = hv
+        t_type = T_NUM
+        pc = p
+        return
+    val: float64 = 0.0
+    while p < lim and is_digit(prog[p]) == 1:
+        val = val * 10.0 + cast[float64](cast[int32](prog[p]) - 48)
+        p = p + 1
+    if p < lim and prog[p] == 46:
+        p = p + 1
+        scale: float64 = 0.1
+        while p < lim and is_digit(prog[p]) == 1:
+            val = val + cast[float64](cast[int32](prog[p]) - 48) * scale
+            scale = scale * 0.1
+            p = p + 1
+    if p < lim and (prog[p] == 101 or prog[p] == 69):
+        q: uint64 = p + 1
+        esign: int32 = 1
+        if q < lim and prog[q] == 43:
+            q = q + 1
+        elif q < lim and prog[q] == 45:
+            esign = -1
+            q = q + 1
+        if q < lim and is_digit(prog[q]) == 1:
+            ev: int32 = 0
+            while q < lim and is_digit(prog[q]) == 1:
+                ev = ev * 10 + (cast[int32](prog[q]) - 48)
+                q = q + 1
+            k: int32 = 0
+            while k < ev:
+                if esign > 0:
+                    val = val * 10.0
+                else:
+                    val = val / 10.0
+                k = k + 1
+            p = q
+    t_num = val
+    t_type = T_NUM
+    pc = p
+
+
+def lex_string():
+    # opening quote at t_begin; unescape into sbuf
+    start: uint64 = sbuf_used
+    p: uint64 = t_begin + 1
+    while p < lim and prog[p] != 34:
+        c: uint8 = prog[p]
+        if c == 92 and p + 1 < lim:
+            p = p + 1
+            e: uint8 = prog[p]
+            if e == 110:
+                sbuf_put(10)
+            elif e == 116:
+                sbuf_put(9)
+            elif e == 114:
+                sbuf_put(13)
+            elif e == 92:
+                sbuf_put(92)
+            elif e == 34:
+                sbuf_put(34)
+            elif e == 47:
+                sbuf_put(47)
+            elif e == 97:
+                sbuf_put(7)
+            elif e == 98:
+                sbuf_put(8)
+            elif e == 102:
+                sbuf_put(12)
+            elif e == 118:
+                sbuf_put(11)
+            else:
+                sbuf_put(92)
+                sbuf_put(e)
+            p = p + 1
+        else:
+            sbuf_put(c)
+            p = p + 1
+    if p < lim:
+        p = p + 1                    # skip closing quote
+    t_sptr = cast[uint64](&sbuf[start])
+    t_slen = sbuf_used - start
+    t_type = T_STR
+    pc = p
+
+
+def advance():
+    p: uint64 = pc
+    while p < lim:
+        c: uint8 = prog[p]
+        if c == 32 or c == 9 or c == 13:
+            p = p + 1
+        elif c == 92 and p + 1 < lim and prog[p + 1] == 10:
+            p = p + 2
+        elif c == 35:
+            while p < lim and prog[p] != 10:
+                p = p + 1
+        else:
+            break
+    if p >= lim:
+        t_type = T_EOF
+        t_begin = lim
+        pc = lim
+        return
+    t_begin = p
+    c: uint8 = prog[p]
+    if c == 10:
+        t_type = T_NEWLINE
+        pc = p + 1
+        return
+    if is_digit(c) == 1 or (c == 46 and p + 1 < lim and is_digit(prog[p + 1]) == 1):
+        lex_number()
+        return
+    if is_alpha(c) == 1:
+        q: uint64 = p
+        while q < lim and is_alnum(prog[q]) == 1:
+            q = q + 1
+        t_sptr = cast[uint64](&prog[p])
+        t_slen = q - p
+        t_type = T_ID
+        pc = q
+        return
+    if c == 34:
+        lex_string()
+        return
+    # operators
+    c2: uint8 = 0
+    if p + 1 < lim:
+        c2 = prog[p + 1]
+    if c == 43 and c2 == 43:
+        t_type = T_INCR
+        pc = p + 2
+        return
+    if c == 45 and c2 == 45:
+        t_type = T_DECR
+        pc = p + 2
+        return
+    if c == 43 and c2 == 61:
+        t_type = T_ADDEQ
+        pc = p + 2
+        return
+    if c == 45 and c2 == 61:
+        t_type = T_SUBEQ
+        pc = p + 2
+        return
+    if c == 42 and c2 == 61:
+        t_type = T_MULEQ
+        pc = p + 2
+        return
+    if c == 47 and c2 == 61:
+        t_type = T_DIVEQ
+        pc = p + 2
+        return
+    if c == 37 and c2 == 61:
+        t_type = T_MODEQ
+        pc = p + 2
+        return
+    if c == 61 and c2 == 61:
+        t_type = T_EQ
+        pc = p + 2
+        return
+    if c == 33 and c2 == 61:
+        t_type = T_NE
+        pc = p + 2
+        return
+    if c == 60 and c2 == 61:
+        t_type = T_LE
+        pc = p + 2
+        return
+    if c == 62 and c2 == 61:
+        t_type = T_GE
+        pc = p + 2
+        return
+    if c == 38 and c2 == 38:
+        t_type = T_AND
+        pc = p + 2
+        return
+    if c == 124 and c2 == 124:
+        t_type = T_OR
+        pc = p + 2
+        return
+    if c == 33 and c2 == 126:
+        t_type = T_NOMATCH
+        pc = p + 2
+        return
+    pc = p + 1
+    if c == 123:
+        t_type = T_LBRACE
+    elif c == 125:
+        t_type = T_RBRACE
+    elif c == 40:
+        t_type = T_LPAREN
+    elif c == 41:
+        t_type = T_RPAREN
+    elif c == 91:
+        t_type = T_LBRACK
+    elif c == 93:
+        t_type = T_RBRACK
+    elif c == 59:
+        t_type = T_SEMI
+    elif c == 44:
+        t_type = T_COMMA
+    elif c == 61:
+        t_type = T_ASSIGN
+    elif c == 60:
+        t_type = T_LT
+    elif c == 62:
+        t_type = T_GT
+    elif c == 126:
+        t_type = T_MATCH
+    elif c == 33:
+        t_type = T_NOT
+    elif c == 43:
+        t_type = T_PLUS
+    elif c == 45:
+        t_type = T_MINUS
+    elif c == 42:
+        t_type = T_STAR
+    elif c == 47:
+        t_type = T_SLASH
+    elif c == 37:
+        t_type = T_PERCENT
+    elif c == 36:
+        t_type = T_DOLLAR
+    else:
+        t_type = T_EOF
+
+
+def id_is(lit: Ptr[uint8]) -> int32:
+    return name_eq(cast[Ptr[uint8]](t_sptr), t_slen, lit)
+
+
+# ==================================================================
+# Expression evaluation (recursive descent, pushes 1 value)
+# ==================================================================
+def parse_expr():
+    parse_or()
+
+
+def parse_or():
+    parse_and()
+    while t_type == T_OR:
+        advance()
+        li: int64 = vs_top - 1
+        left_true: int32 = v_truthy(li)
+        vs_top = vs_top - 1
+        if left_true == 1:
+            saved: int32 = g_en
+            g_en = 0
+            parse_and()
+            g_en = saved
+            vs_top = vs_top - 1
+            vpush_num(1.0)
+        else:
+            parse_and()
+            r: int64 = vs_top - 1
+            rt: int32 = v_truthy(r)
+            vs_top = vs_top - 1
+            vpush_num(cast[float64](rt))
+
+
+def parse_and():
+    parse_matchexpr()
+    while t_type == T_AND:
+        advance()
+        li: int64 = vs_top - 1
+        left_true: int32 = v_truthy(li)
+        vs_top = vs_top - 1
+        if left_true == 0:
+            saved: int32 = g_en
+            g_en = 0
+            parse_matchexpr()
+            g_en = saved
+            vs_top = vs_top - 1
+            vpush_num(0.0)
+        else:
+            parse_matchexpr()
+            r: int64 = vs_top - 1
+            rt: int32 = v_truthy(r)
+            vs_top = vs_top - 1
+            vpush_num(cast[float64](rt))
+
+
+def parse_matchexpr():
+    parse_rel()
+    while t_type == T_MATCH or t_type == T_NOMATCH:
+        neg: int32 = 0
+        if t_type == T_NOMATCH:
+            neg = 1
+        advance()
+        parse_rel()
+        r: int64 = vs_top - 1
+        l: int64 = vs_top - 2
+        res: int32 = 0
+        if g_en == 1:
+            vstr(l)
+            tp: uint64 = gv_ptr
+            tl: uint64 = gv_len
+            vstr(r)
+            m: int32 = 0
+            if rx_compile(cast[Ptr[uint8]](gv_ptr), gv_len, 1, 0) == 0:
+                if rx_search(cast[Ptr[uint8]](tp), tl, 0) >= 0:
+                    m = 1
+            if neg == 1:
+                if m == 1:
+                    res = 0
+                else:
+                    res = 1
+            else:
+                res = m
+        vs_top = vs_top - 2
+        vpush_num(cast[float64](res))
+
+
+def parse_rel():
+    parse_concat()
+    if t_type == T_LT or t_type == T_LE or t_type == T_GT or t_type == T_GE or t_type == T_EQ or t_type == T_NE:
+        op: int32 = t_type
+        advance()
+        parse_concat()
+        r: int64 = vs_top - 1
+        l: int64 = vs_top - 2
+        res: int32 = 0
+        if g_en == 1:
+            c: int32 = val_cmp(l, r)
+            if op == T_LT:
+                if c < 0:
+                    res = 1
+            elif op == T_LE:
+                if c <= 0:
+                    res = 1
+            elif op == T_GT:
+                if c > 0:
+                    res = 1
+            elif op == T_GE:
+                if c >= 0:
+                    res = 1
+            elif op == T_EQ:
+                if c == 0:
+                    res = 1
+            else:
+                if c != 0:
+                    res = 1
+        vs_top = vs_top - 2
+        vpush_num(cast[float64](res))
+
+
+def starts_concat_operand() -> int32:
+    if t_type == T_NUM or t_type == T_STR or t_type == T_ID:
+        return 1
+    if t_type == T_DOLLAR or t_type == T_LPAREN or t_type == T_NOT:
+        return 1
+    if t_type == T_INCR or t_type == T_DECR or t_type == T_SLASH:
+        return 1
+    return 0
+
+
+def parse_concat():
+    parse_add()
+    while starts_concat_operand() == 1:
+        parse_add()
+        r: int64 = vs_top - 1
+        l: int64 = vs_top - 2
+        if g_en == 1:
+            vstr(l)
+            ap: uint64 = gv_ptr
+            an: uint64 = gv_len
+            # left may live in sbuf; copy left then right into a fresh sbuf run
+            start: uint64 = sbuf_used
+            i: uint64 = 0
+            lp: Ptr[uint8] = cast[Ptr[uint8]](ap)
+            while i < an:
+                sbuf_put(lp[i])
+                i = i + 1
+            vstr(r)
+            rp: Ptr[uint8] = cast[Ptr[uint8]](gv_ptr)
+            i = 0
+            while i < gv_len:
+                sbuf_put(rp[i])
+                i = i + 1
+            vs_top = vs_top - 2
+            vpush_str(cast[uint64](&sbuf[start]), sbuf_used - start, 0)
+        else:
+            vs_top = vs_top - 2
+            vpush_num(0.0)
+
+
+def parse_add():
+    parse_mul()
+    while t_type == T_PLUS or t_type == T_MINUS:
+        op: int32 = t_type
+        advance()
+        parse_mul()
+        r: int64 = vs_top - 1
+        l: int64 = vs_top - 2
+        res: float64 = 0.0
+        if g_en == 1:
+            if op == T_PLUS:
+                res = vnum(l) + vnum(r)
+            else:
+                res = vnum(l) - vnum(r)
+        vs_top = vs_top - 2
+        vpush_num(res)
+
+
+def parse_mul():
+    parse_unary()
+    while t_type == T_STAR or t_type == T_SLASH or t_type == T_PERCENT:
+        op: int32 = t_type
+        advance()
+        parse_unary()
+        r: int64 = vs_top - 1
+        l: int64 = vs_top - 2
+        res: float64 = 0.0
+        if g_en == 1:
+            a: float64 = vnum(l)
+            b: float64 = vnum(r)
+            if op == T_STAR:
+                res = a * b
+            elif op == T_SLASH:
+                if b != 0.0:
+                    res = a / b
+            else:
+                res = f_fmod(a, b)
+        vs_top = vs_top - 2
+        vpush_num(res)
+
+
+def parse_unary():
+    if t_type == T_MINUS:
+        advance()
+        parse_unary()
+        i: int64 = vs_top - 1
+        v: float64 = 0.0
+        if g_en == 1:
+            v = -vnum(i)
+        vs_top = vs_top - 1
+        vpush_num(v)
+        return
+    if t_type == T_PLUS:
+        advance()
+        parse_unary()
+        i: int64 = vs_top - 1
+        v: float64 = 0.0
+        if g_en == 1:
+            v = vnum(i)
+        vs_top = vs_top - 1
+        vpush_num(v)
+        return
+    if t_type == T_NOT:
+        advance()
+        parse_unary()
+        i: int64 = vs_top - 1
+        v: int32 = 0
+        if g_en == 1:
+            if v_truthy(i) == 0:
+                v = 1
+        vs_top = vs_top - 1
+        vpush_num(cast[float64](v))
+        return
+    parse_primary()
+
+
+# ---- lvalue plumbing ----
+# lv_kind: 0 none, 1 scalar var, 2 array elem, 3 field, 4 special
+lv_kind: int32 = 0
+lv_slot: int64 = 0
+lv_field: int64 = 0
+lv_special: int32 = 0                # 1 NR, 2 NF, 3 FS, 4 OFS
+
+
+def lv_get_num() -> float64:
+    if lv_kind == 1:
+        if var_isstr[lv_slot] == 1:
+            return str_to_num(cast[Ptr[uint8]](&var_sbuf[lv_slot * 256]), var_slen[lv_slot])
+        return var_num[lv_slot]
+    if lv_kind == 2:
+        if ar_isstr[lv_slot] == 1:
+            return str_to_num(cast[Ptr[uint8]](&ar_sbuf[lv_slot * 128]), ar_slen[lv_slot])
+        return ar_num[lv_slot]
+    if lv_kind == 3:
+        field_push(lv_field)
+        i: int64 = vs_top - 1
+        v: float64 = vnum(i)
+        vs_top = vs_top - 1
+        return v
+    if lv_kind == 4:
+        if lv_special == 1:
+            return cast[float64](NRv)
+        if lv_special == 2:
+            return cast[float64](NFcount)
+    return 0.0
+
+
+def lv_store_num(x: float64):
+    if lv_kind == 1:
+        var_set_num(lv_slot, x)
+    elif lv_kind == 2:
+        ar_isstr[lv_slot] = 0
+        ar_strnum[lv_slot] = 0
+        ar_num[lv_slot] = x
+    elif lv_kind == 4:
+        if lv_special == 1:
+            NRv = cast[int64](x)
+
+
+def set_fs_from_val(vi: int64):
+    src: Ptr[uint8] = cast[Ptr[uint8]](vs_ptr[vi])
+    n: uint64 = vs_len[vi]
+    if vs_isstr[vi] == 0:
+        vstr(vi)
+        src = cast[Ptr[uint8]](gv_ptr)
+        n = gv_len
+    fs_len = unescape_into(src, n, &fs_buf[0], 64)
+
+
+def set_ofs_from_val(vi: int64):
+    if vs_isstr[vi] == 1:
+        src: Ptr[uint8] = cast[Ptr[uint8]](vs_ptr[vi])
+        n: uint64 = vs_len[vi]
+        if n > 64:
+            n = 64
+        i: uint64 = 0
+        while i < n:
+            ofs_buf[i] = src[i]
+            i = i + 1
+        ofs_len = n
+    else:
+        vstr(vi)
+        src2: Ptr[uint8] = cast[Ptr[uint8]](gv_ptr)
+        n2: uint64 = gv_len
+        if n2 > 64:
+            n2 = 64
+        i2: uint64 = 0
+        while i2 < n2:
+            ofs_buf[i2] = src2[i2]
+            i2 = i2 + 1
+        ofs_len = n2
+
+
+def lv_store_val(vi: int64):
+    if lv_kind == 1:
+        var_set_from_val(lv_slot, vi)
+    elif lv_kind == 2:
+        ar_set_from_val(lv_slot, vi)
+    elif lv_kind == 4:
+        if lv_special == 1:
+            NRv = cast[int64](vnum(vi))
+        elif lv_special == 3:
+            set_fs_from_val(vi)
+        elif lv_special == 4:
+            set_ofs_from_val(vi)
+
+
+# resolve an identifier or $expr already at current token into lv_* (may
+# create). Consumes the lvalue tokens. Returns 1 if an lvalue, else 0.
+def parse_lvalue() -> int32:
+    if t_type == T_DOLLAR:
+        advance()
+        parse_primary()
+        i: int64 = vs_top - 1
+        fn: int64 = cast[int64](vnum(i))
+        vs_top = vs_top - 1
+        lv_kind = 3
+        lv_field = fn
+        return 1
+    if t_type == T_ID:
+        np: uint64 = t_sptr
+        nl: uint64 = t_slen
+        pnm: Ptr[uint8] = cast[Ptr[uint8]](np)
+        if name_eq(pnm, nl, "NR") == 1:
+            advance()
+            lv_kind = 4
+            lv_special = 1
+            return 1
+        if name_eq(pnm, nl, "NF") == 1:
+            advance()
+            lv_kind = 4
+            lv_special = 2
+            return 1
+        if name_eq(pnm, nl, "FS") == 1:
+            advance()
+            lv_kind = 4
+            lv_special = 3
+            return 1
+        if name_eq(pnm, nl, "OFS") == 1:
+            advance()
+            lv_kind = 4
+            lv_special = 4
+            return 1
+        advance()
+        if t_type == T_LBRACK:
+            # array subscript
+            advance()
+            build_subscript()
+            slot: int64 = ar_intern(pnm, nl, cast[Ptr[uint8]](gv_ptr), gv_len)
+            if t_type == T_RBRACK:
+                advance()
+            lv_kind = 2
+            lv_slot = slot
+            return 1
+        lv_kind = 1
+        lv_slot = var_intern(pnm, nl)
+        return 1
+    return 0
+
+
+# parse subscript expression list -> a single key string in sbuf via gv_ptr/gv_len
+def build_subscript():
+    parse_expr()
+    vi: int64 = vs_top - 1
+    vstr(vi)
+    kp: uint64 = gv_ptr
+    kl: uint64 = gv_len
+    # copy to a stable sbuf run
+    start: uint64 = sbuf_used
+    src: Ptr[uint8] = cast[Ptr[uint8]](kp)
+    i: uint64 = 0
+    while i < kl:
+        sbuf_put(src[i])
+        i = i + 1
+    vs_top = vs_top - 1
+    gv_ptr = cast[uint64](&sbuf[start])
+    gv_len = sbuf_used - start
+
+
+def apply_compound(op: int32, cur: float64, rhs: float64) -> float64:
+    if op == T_ADDEQ:
+        return cur + rhs
+    if op == T_SUBEQ:
+        return cur - rhs
+    if op == T_MULEQ:
+        return cur * rhs
+    if op == T_DIVEQ:
+        if rhs != 0.0:
+            return cur / rhs
+        return 0.0
+    return f_fmod(cur, rhs)
+
+
+def parse_primary():
+    if t_type == T_NUM:
+        v: float64 = t_num
+        advance()
+        vpush_num(v)
+        return
+    if t_type == T_STR:
+        p: uint64 = t_sptr
+        n: uint64 = t_slen
+        advance()
+        vpush_str(p, n, 0)
+        return
+    if t_type == T_SLASH:
+        # /regex/ literal -> match against $0
+        rp: uint64 = pc                  # right after the '/'
+        e: uint64 = rp
+        while e < lim and prog[e] != 47:
+            if prog[e] == 92 and e + 1 < lim:
+                e = e + 2
+            else:
+                e = e + 1
+        res: int32 = 0
+        if g_en == 1:
+            if rx_compile(cast[Ptr[uint8]](&prog[rp]), e - rp, 1, 0) == 0:
+                if rx_search(cast[Ptr[uint8]](&f0[0]), f0_len, 0) >= 0:
+                    res = 1
+        pc = e
+        if pc < lim:
+            pc = pc + 1                  # skip closing '/'
+        advance()
+        vpush_num(cast[float64](res))
+        return
+    if t_type == T_LPAREN:
+        advance()
+        parse_expr()
+        if t_type == T_RPAREN:
+            advance()
+        return
+    if t_type == T_NOT:
+        parse_unary()
+        return
+    if t_type == T_INCR or t_type == T_DECR:
+        op: int32 = t_type
+        advance()
+        if parse_lvalue() == 1:
+            cur: float64 = 0.0
+            nv: float64 = 0.0
+            if g_en == 1:
+                cur = lv_get_num()
+                if op == T_INCR:
+                    nv = cur + 1.0
+                else:
+                    nv = cur - 1.0
+                lv_store_num(nv)
+            vpush_num(nv)
+        else:
+            vpush_num(0.0)
+        return
+    if t_type == T_DOLLAR:
+        advance()
+        parse_primary()
+        i: int64 = vs_top - 1
+        fn: int64 = 0
+        if g_en == 1:
+            fn = cast[int64](vnum(i))
+        vs_top = vs_top - 1
+        # post ++/-- on a field: read then (store skipped, field assign scoped out)
+        if g_en == 1:
+            field_push(fn)
+        else:
+            vpush_num(0.0)
+        if t_type == T_INCR or t_type == T_DECR:
+            advance()                    # field post-incr value stays (assign scoped out)
+        return
+    if t_type == T_ID:
+        parse_id_primary()
+        return
+    # unknown -> push 0 and skip a token to avoid infinite loop
+    if t_type != T_EOF:
+        advance()
+    vpush_num(0.0)
+
+
+def parse_id_primary():
+    pnm: Ptr[uint8] = cast[Ptr[uint8]](t_sptr)
+    nl: uint64 = t_slen
+    # builtins
+    if name_eq(pnm, nl, "length") == 1:
+        advance()
+        if t_type == T_LPAREN:
+            advance()
+            if t_type == T_RPAREN:
+                advance()
+                push_len_field0()
+            else:
+                parse_expr()
+                i: int64 = vs_top - 1
+                ln: uint64 = 0
+                if g_en == 1:
+                    vstr(i)
+                    ln = gv_len
+                vs_top = vs_top - 1
+                if t_type == T_RPAREN:
+                    advance()
+                vpush_num(cast[float64](ln))
+        else:
+            push_len_field0()
+        return
+    if name_eq(pnm, nl, "substr") == 1:
+        builtin_substr()
+        return
+    if name_eq(pnm, nl, "index") == 1:
+        builtin_index()
+        return
+    if name_eq(pnm, nl, "split") == 1:
+        builtin_split()
+        return
+    if name_eq(pnm, nl, "toupper") == 1:
+        builtin_case(1)
+        return
+    if name_eq(pnm, nl, "tolower") == 1:
+        builtin_case(0)
+        return
+    if name_eq(pnm, nl, "int") == 1:
+        advance()
+        v: float64 = 0.0
+        if t_type == T_LPAREN:
+            advance()
+            parse_expr()
+            i: int64 = vs_top - 1
+            if g_en == 1:
+                v = f_trunc(vnum(i))
+            vs_top = vs_top - 1
+            if t_type == T_RPAREN:
+                advance()
+        vpush_num(v)
+        return
+    if name_eq(pnm, nl, "sprintf") == 1:
+        builtin_sprintf()
+        return
+    # special vars (assignable)
+    if name_eq(pnm, nl, "NR") == 1:
+        advance()
+        finish_special_use(1)
+        return
+    if name_eq(pnm, nl, "NF") == 1:
+        advance()
+        vpush_num(cast[float64](NFcount))
+        return
+    if name_eq(pnm, nl, "FS") == 1:
+        advance()
+        finish_special_use(3)
+        return
+    if name_eq(pnm, nl, "OFS") == 1:
+        advance()
+        finish_special_use(4)
+        return
+    # plain variable or array element, possibly lvalue/assignment/postfix
+    np: uint64 = t_sptr
+    advance()
+    if t_type == T_LBRACK:
+        advance()
+        build_subscript()
+        slot: int64 = ar_intern(cast[Ptr[uint8]](np), nl, cast[Ptr[uint8]](gv_ptr), gv_len)
+        if t_type == T_RBRACK:
+            advance()
+        finish_lvalue_use(2, slot)
+        return
+    slot2: int64 = var_intern(cast[Ptr[uint8]](np), nl)
+    finish_lvalue_use(1, slot2)
+
+
+def finish_special_use(special: int32):
+    # special: 1 NR, 3 FS, 4 OFS
+    if t_type == T_ASSIGN:
+        advance()
+        parse_expr()
+        vi: int64 = vs_top - 1
+        if g_en == 1:
+            lv_kind = 4
+            lv_special = special
+            lv_store_val(vi)
+        # value stays on stack as the expression result
+        return
+    if t_type == T_ADDEQ or t_type == T_SUBEQ or t_type == T_MULEQ or t_type == T_DIVEQ or t_type == T_MODEQ:
+        op: int32 = t_type
+        advance()
+        parse_expr()
+        vi2: int64 = vs_top - 1
+        nv: float64 = 0.0
+        if g_en == 1 and special == 1:
+            nv = apply_compound(op, cast[float64](NRv), vnum(vi2))
+            NRv = cast[int64](nv)
+        vs_top = vs_top - 1
+        vpush_num(nv)
+        return
+    if special == 1 and (t_type == T_INCR or t_type == T_DECR):
+        op2: int32 = t_type
+        advance()
+        cur: float64 = cast[float64](NRv)
+        if g_en == 1:
+            if op2 == T_INCR:
+                NRv = NRv + 1
+            else:
+                NRv = NRv - 1
+        vpush_num(cur)
+        return
+    # plain read
+    if special == 1:
+        vpush_num(cast[float64](NRv))
+    elif special == 3:
+        vpush_str(cast[uint64](&fs_buf[0]), fs_len, 0)
+    elif special == 4:
+        vpush_str(cast[uint64](&ofs_buf[0]), ofs_len, 0)
+
+
+def finish_lvalue_use(kind: int32, slot: int64):
+    lv_kind = kind
+    lv_slot = slot
+    if t_type == T_ASSIGN or t_type == T_ADDEQ or t_type == T_SUBEQ or t_type == T_MULEQ or t_type == T_DIVEQ or t_type == T_MODEQ:
+        op: int32 = t_type
+        advance()
+        parse_expr()                     # RHS (right assoc)
+        vi: int64 = vs_top - 1
+        if g_en == 1:
+            if op == T_ASSIGN:
+                store_by(kind, slot, vi)
+            else:
+                cur: float64 = get_by(kind, slot)
+                nv: float64 = apply_compound(op, cur, vnum(vi))
+                num_store_by(kind, slot, nv)
+                vs_top = vs_top - 1
+                vpush_num(nv)
+                return
+        # for plain '=', leave RHS value on stack as the expression value
+        if op == T_ASSIGN:
+            return
+        vs_top = vs_top - 1
+        vpush_num(0.0)
+        return
+    if t_type == T_INCR or t_type == T_DECR:
+        op2: int32 = t_type
+        advance()
+        cur2: float64 = 0.0
+        if g_en == 1:
+            cur2 = get_by(kind, slot)
+            if op2 == T_INCR:
+                num_store_by(kind, slot, cur2 + 1.0)
+            else:
+                num_store_by(kind, slot, cur2 - 1.0)
+        vpush_num(cur2)                  # post: value before
+        return
+    # plain read
+    if kind == 1:
+        var_push(slot)
+    else:
+        ar_push(slot)
+
+
+def store_by(kind: int32, slot: int64, vi: int64):
+    if kind == 1:
+        var_set_from_val(slot, vi)
+    else:
+        ar_set_from_val(slot, vi)
+
+
+def num_store_by(kind: int32, slot: int64, x: float64):
+    if kind == 1:
+        var_set_num(slot, x)
+    else:
+        ar_isstr[slot] = 0
+        ar_strnum[slot] = 0
+        ar_num[slot] = x
+
+
+def get_by(kind: int32, slot: int64) -> float64:
+    if kind == 1:
+        if var_isstr[slot] == 1:
+            return str_to_num(cast[Ptr[uint8]](&var_sbuf[slot * 256]), var_slen[slot])
+        return var_num[slot]
+    if ar_isstr[slot] == 1:
+        return str_to_num(cast[Ptr[uint8]](&ar_sbuf[slot * 128]), ar_slen[slot])
+    return ar_num[slot]
+
+
+def push_len_field0():
+    vpush_num(cast[float64](f0_len))
+
+
+# ---- built-ins ----
+def builtin_substr():
+    advance()                            # 'substr'
+    if t_type == T_LPAREN:
+        advance()
+    parse_expr()                         # s
+    si: int64 = vs_top - 1
+    sp: uint64 = 0
+    sl: uint64 = 0
+    if g_en == 1:
+        vstr(si)
+        sp = gv_ptr
+        sl = gv_len
+    mstart: int64 = 1
+    nlen: int64 = -1
+    if t_type == T_COMMA:
+        advance()
+        parse_expr()
+        mi: int64 = vs_top - 1
+        if g_en == 1:
+            mstart = cast[int64](vnum(mi))
+        vs_top = vs_top - 1
+        if t_type == T_COMMA:
+            advance()
+            parse_expr()
+            ni: int64 = vs_top - 1
+            if g_en == 1:
+                nlen = cast[int64](vnum(ni))
+            vs_top = vs_top - 1
+    if t_type == T_RPAREN:
+        advance()
+    vs_top = vs_top - 1                   # pop s
+    if g_en == 0:
+        vpush_num(0.0)
+        return
+    # awk 1-based; clamp
+    start_i: int64 = mstart - 1
+    endi: int64 = 0
+    if nlen < 0:
+        endi = cast[int64](sl)
+    else:
+        endi = start_i + nlen
+    if start_i < 0:
+        start_i = 0
+    if endi > cast[int64](sl):
+        endi = cast[int64](sl)
+    if endi < start_i:
+        endi = start_i
+    outp: uint64 = sbuf_used
+    src: Ptr[uint8] = cast[Ptr[uint8]](sp)
+    k: int64 = start_i
+    while k < endi:
+        sbuf_put(src[k])
+        k = k + 1
+    vpush_str(cast[uint64](&sbuf[outp]), cast[uint64](endi - start_i), 0)
+
+
+def builtin_index():
+    advance()
+    if t_type == T_LPAREN:
+        advance()
+    parse_expr()
+    parse_comma_expr()
+    ti: int64 = vs_top - 1
+    si: int64 = vs_top - 2
+    res: int64 = 0
+    if g_en == 1:
+        vstr(si)
+        hp: uint64 = gv_ptr
+        hl: uint64 = gv_len
+        vstr(ti)
+        np: uint64 = gv_ptr
+        nl2: uint64 = gv_len
+        res = find_sub(cast[Ptr[uint8]](hp), hl, cast[Ptr[uint8]](np), nl2)
+    vs_top = vs_top - 2
+    if t_type == T_RPAREN:
+        advance()
+    vpush_num(cast[float64](res))
+
+
+def parse_comma_expr():
+    if t_type == T_COMMA:
+        advance()
+    parse_expr()
+
+
+def find_sub(h: Ptr[uint8], hl: uint64, n: Ptr[uint8], nl: uint64) -> int64:
+    if nl == 0:
+        return 0
+    if nl > hl:
+        return 0
+    i: uint64 = 0
+    while i + nl <= hl:
+        j: uint64 = 0
+        ok: int32 = 1
+        while j < nl:
+            if h[i + j] != n[j]:
+                ok = 0
+                j = nl
+            else:
+                j = j + 1
+        if ok == 1:
+            return cast[int64](i) + 1
+        i = i + 1
+    return 0
+
+
+def builtin_case(up: int32):
+    advance()
+    if t_type == T_LPAREN:
+        advance()
+    parse_expr()
+    i: int64 = vs_top - 1
+    if t_type == T_RPAREN:
+        advance()
+    if g_en == 0:
+        vs_top = vs_top - 1
+        vpush_num(0.0)
+        return
+    vstr(i)
+    sp: Ptr[uint8] = cast[Ptr[uint8]](gv_ptr)
+    n: uint64 = gv_len
+    outp: uint64 = sbuf_used
+    k: uint64 = 0
+    while k < n:
+        c: uint8 = sp[k]
+        if up == 1:
+            if c >= 97 and c <= 122:
+                c = c - 32
+        else:
+            if c >= 65 and c <= 90:
+                c = c + 32
+        sbuf_put(c)
+        k = k + 1
+    vs_top = vs_top - 1
+    vpush_str(cast[uint64](&sbuf[outp]), n, 0)
+
+
+def builtin_split():
+    advance()
+    if t_type == T_LPAREN:
+        advance()
+    parse_expr()                         # s
+    si: int64 = vs_top - 1
+    sp: uint64 = 0
+    sl: uint64 = 0
+    if g_en == 1:
+        vstr(si)
+        sp = gv_ptr
+        sl = gv_len
+    # copy s to a stable buffer since sbuf will churn
+    tmp: uint64 = sbuf_used
+    j: uint64 = 0
+    srcp: Ptr[uint8] = cast[Ptr[uint8]](sp)
+    while j < sl:
+        sbuf_put(srcp[j])
+        j = j + 1
+    sp = cast[uint64](&sbuf[tmp])
+    vs_top = vs_top - 1
+    if t_type == T_COMMA:
+        advance()
+    # array name
+    arrp: uint64 = t_sptr
+    arrl: uint64 = t_slen
+    advance()
+    # optional fs
+    use_fs: int32 = 0
+    fsp: uint64 = 0
+    fsl: uint64 = 0
+    if t_type == T_COMMA:
+        advance()
+        parse_expr()
+        fi: int64 = vs_top - 1
+        if g_en == 1:
+            vstr(fi)
+            fsp = gv_ptr
+            fsl = gv_len
+            use_fs = 1
+        vs_top = vs_top - 1
+    if t_type == T_RPAREN:
+        advance()
+    if g_en == 0:
+        vpush_num(0.0)
+        return
+    ar_clear(cast[Ptr[uint8]](arrp), arrl)
+    cnt: int64 = do_split(cast[Ptr[uint8]](sp), sl, cast[Ptr[uint8]](arrp), arrl, use_fs, cast[Ptr[uint8]](fsp), fsl)
+    vpush_num(cast[float64](cnt))
+
+
+def do_split(s: Ptr[uint8], sl: uint64, arrnm: Ptr[uint8], arrl: uint64, use_fs: int32, fsp: Ptr[uint8], fsl: uint64) -> int64:
+    # determine separator mode
+    sep_char: int32 = -1
+    ws: int32 = 0
+    chars: int32 = 0
+    if use_fs == 1:
+        if fsl == 0:
+            chars = 1                    # split("") -> one field per character
+        elif fsl == 1 and fsp[0] == 32:
+            ws = 1
+        elif fsl == 1:
+            sep_char = cast[int32](fsp[0])
+        else:
+            sep_char = -2                # regex
+    else:
+        if fs_len == 1 and fs_buf[0] == 32:
+            ws = 1
+        elif fs_len == 1:
+            sep_char = cast[int32](fs_buf[0])
+        else:
+            sep_char = -2
+    cnt: int64 = 0
+    if chars == 1:
+        ci: uint64 = 0
+        while ci < sl:
+            cnt = cnt + 1
+            store_split_field(arrnm, arrl, cnt, &s[ci], 1)
+            ci = ci + 1
+        return cnt
+    if ws == 1:
+        i: uint64 = 0
+        while i < sl:
+            while i < sl and (s[i] == 32 or s[i] == 9 or s[i] == 10):
+                i = i + 1
+            if i >= sl:
+                i = sl
+            else:
+                st: uint64 = i
+                while i < sl and s[i] != 32 and s[i] != 9 and s[i] != 10:
+                    i = i + 1
+                cnt = cnt + 1
+                store_split_field(arrnm, arrl, cnt, &s[st], i - st)
+        return cnt
+    if sep_char == -2:
+        return 0                         # regex split scoped out in split()
+    # single-char literal separator
+    st2: uint64 = 0
+    i2: uint64 = 0
+    while i2 <= sl:
+        if i2 == sl or cast[int32](s[i2]) == sep_char:
+            cnt = cnt + 1
+            store_split_field(arrnm, arrl, cnt, &s[st2], i2 - st2)
+            st2 = i2 + 1
+        i2 = i2 + 1
+    return cnt
+
+
+def store_split_field(arrnm: Ptr[uint8], arrl: uint64, idx: int64, valp: Ptr[uint8], vlen: uint64):
+    keyp: uint64 = sbuf_used
+    int_to_sbuf(idx)
+    kln: uint64 = g_slen
+    slot: int64 = ar_intern(arrnm, arrl, cast[Ptr[uint8]](&sbuf[keyp]), kln)
+    # store value as strnum string
+    ar_isstr[slot] = 1
+    ar_strnum[slot] = 1
+    n: uint64 = vlen
+    if n > 128:
+        n = 128
+    base: int64 = slot * 128
+    j: uint64 = 0
+    while j < n:
+        ar_sbuf[cast[uint64](base) + j] = valp[j]
+        j = j + 1
+    ar_slen[slot] = n
+
+
+def builtin_sprintf():
+    advance()
+    if t_type == T_LPAREN:
+        advance()
+    # reuse printf core but write to sbuf; collect into a fresh run
+    start: uint64 = sbuf_used
+    do_printf(1)
+    if t_type == T_RPAREN:
+        advance()
+    vpush_str(cast[uint64](&sbuf[start]), sbuf_used - start, 0)
+
+
+# ==================================================================
+# printf / sprintf core
+#   to_sbuf=1 writes to sbuf; else writes to stdout
+# Consumes: format expr, then comma-separated arg exprs until ) or EOF.
+# ==================================================================
+pf_isstr: Array[64, int32]
+pf_num: Array[64, float64]
+pf_ptr: Array[64, uint64]
+pf_len: Array[64, uint64]
+pf_arena: Array[16384, uint8]
+pf_n: int64 = 0
+
+
+def emit_out(c: uint8, to_sbuf: int32):
+    if to_sbuf == 1:
+        sbuf_put(c)
+    else:
+        out_ch(c)
+
+
+def do_printf(to_sbuf: int32):
+    # evaluate format
+    parse_expr()
+    fi: int64 = vs_top - 1
+    fmtp: uint64 = 0
+    fmtl: uint64 = 0
+    if g_en == 1:
+        vstr(fi)
+        # copy fmt into pf_arena so sbuf churn during arg eval is safe
+        au: uint64 = 0
+        src: Ptr[uint8] = cast[Ptr[uint8]](gv_ptr)
+        while au < gv_len and au < 8192:
+            pf_arena[au] = src[au]
+            au = au + 1
+        fmtp = cast[uint64](&pf_arena[0])
+        fmtl = au
+    vs_top = vs_top - 1
+    # collect args
+    pf_n = 0
+    aoff: uint64 = 8192
+    while t_type == T_COMMA:
+        advance()
+        parse_expr()
+        vi: int64 = vs_top - 1
+        if g_en == 1 and pf_n < 64:
+            if vs_isstr[vi] == 1:
+                pf_isstr[pf_n] = 1
+                src2: Ptr[uint8] = cast[Ptr[uint8]](vs_ptr[vi])
+                n: uint64 = vs_len[vi]
+                if aoff + n > 16384:
+                    n = 16384 - aoff
+                k: uint64 = 0
+                while k < n:
+                    pf_arena[aoff + k] = src2[k]
+                    k = k + 1
+                pf_ptr[pf_n] = cast[uint64](&pf_arena[aoff])
+                pf_len[pf_n] = n
+                aoff = aoff + n
+            else:
+                pf_isstr[pf_n] = 0
+                pf_num[pf_n] = vs_num[vi]
+            pf_n = pf_n + 1
+        vs_top = vs_top - 1
+    if g_en == 0:
+        return
+    render_printf(cast[Ptr[uint8]](fmtp), fmtl, to_sbuf)
+
+
+def render_printf(fmt: Ptr[uint8], fl: uint64, to_sbuf: int32):
+    i: uint64 = 0
+    argi: int64 = 0
+    while i < fl:
+        c: uint8 = fmt[i]
+        if c != 37:
+            emit_out(c, to_sbuf)
+            i = i + 1
+        else:
+            i = i + 1
+            if i < fl and fmt[i] == 37:
+                emit_out(37, to_sbuf)
+                i = i + 1
+            else:
+                # flags
+                flag_minus: int32 = 0
+                flag_zero: int32 = 0
+                flag_plus: int32 = 0
+                flag_space: int32 = 0
+                while i < fl:
+                    if fmt[i] == 45:
+                        flag_minus = 1
+                        i = i + 1
+                    elif fmt[i] == 48:
+                        flag_zero = 1
+                        i = i + 1
+                    elif fmt[i] == 43:
+                        flag_plus = 1
+                        i = i + 1
+                    elif fmt[i] == 32:
+                        flag_space = 1
+                        i = i + 1
+                    else:
+                        break
+                width: int32 = 0
+                while i < fl and is_digit(fmt[i]) == 1:
+                    width = width * 10 + (cast[int32](fmt[i]) - 48)
+                    i = i + 1
+                prec: int32 = -1
+                if i < fl and fmt[i] == 46:
+                    i = i + 1
+                    prec = 0
+                    while i < fl and is_digit(fmt[i]) == 1:
+                        prec = prec * 10 + (cast[int32](fmt[i]) - 48)
+                        i = i + 1
+                if i >= fl:
+                    argi = argi
+                else:
+                    conv: uint8 = fmt[i]
+                    i = i + 1
+                    do_conv(conv, argi, flag_minus, flag_zero, flag_plus, flag_space, width, prec, to_sbuf)
+                    if conv != 37:
+                        argi = argi + 1
+
+
+gpad: Array[512, uint8]
+gpad_len: uint64 = 0
+
+
+def emit_field_pad(body: Ptr[uint8], bl: uint64, width: int32, left: int32, zero: int32, to_sbuf: int32):
+    pad: int32 = width - cast[int32](bl)
+    if pad < 0:
+        pad = 0
+    if left == 1:
+        k: uint64 = 0
+        while k < bl:
+            emit_out(body[k], to_sbuf)
+            k = k + 1
+        p: int32 = 0
+        while p < pad:
+            emit_out(32, to_sbuf)
+            p = p + 1
+    else:
+        p: int32 = 0
+        pc2: uint8 = 32
+        if zero == 1:
+            pc2 = 48
+        while p < pad:
+            emit_out(pc2, to_sbuf)
+            p = p + 1
+        k: uint64 = 0
+        while k < bl:
+            emit_out(body[k], to_sbuf)
+            k = k + 1
+
+
+def arg_num(argi: int64) -> float64:
+    if argi >= pf_n:
+        return 0.0
+    if pf_isstr[argi] == 1:
+        return str_to_num(cast[Ptr[uint8]](pf_ptr[argi]), pf_len[argi])
+    return pf_num[argi]
+
+
+def do_conv(conv: uint8, argi: int64, minus: int32, zero: int32, plus: int32, space: int32, width: int32, prec: int32, to_sbuf: int32):
+    if conv == 100 or conv == 105:               # d i
+        v: int64 = cast[int64](f_trunc(arg_num(argi)))
+        fmt_signed_int(v, 10, 0, plus, space, width, minus, zero, prec, to_sbuf)
+    elif conv == 120:                            # x
+        fmt_unsigned(cast[uint64](arg_int(argi)), 16, 0, width, minus, zero, prec, to_sbuf)
+    elif conv == 88:                             # X
+        fmt_unsigned(cast[uint64](arg_int(argi)), 16, 1, width, minus, zero, prec, to_sbuf)
+    elif conv == 111:                            # o
+        fmt_unsigned(cast[uint64](arg_int(argi)), 8, 0, width, minus, zero, prec, to_sbuf)
+    elif conv == 117:                            # u
+        fmt_unsigned(cast[uint64](arg_int(argi)), 10, 0, width, minus, zero, prec, to_sbuf)
+    elif conv == 99:                             # c
+        gpad_len = 0
+        if argi < pf_n and pf_isstr[argi] == 1:
+            if pf_len[argi] > 0:
+                gpad[0] = cast[Ptr[uint8]](pf_ptr[argi])[0]
+                gpad_len = 1
+        else:
+            gpad[0] = cast[uint8](cast[int64](arg_num(argi)) % 256)
+            gpad_len = 1
+        emit_field_pad(&gpad[0], gpad_len, width, minus, 0, to_sbuf)
+    elif conv == 115:                            # s
+        sp: uint64 = 0
+        sl: uint64 = 0
+        if argi < pf_n:
+            if pf_isstr[argi] == 1:
+                sp = pf_ptr[argi]
+                sl = pf_len[argi]
+            else:
+                num_to_sbuf(pf_num[argi])
+                sp = cast[uint64](&sbuf[g_soff])
+                sl = g_slen
+        if prec >= 0 and cast[uint64](prec) < sl:
+            sl = cast[uint64](prec)
+        emit_field_pad(cast[Ptr[uint8]](sp), sl, width, minus, 0, to_sbuf)
+    elif conv == 102 or conv == 101 or conv == 70 or conv == 69:  # f e F E
+        fmt_float(arg_num(argi), prec, width, minus, zero, plus, space, to_sbuf)
+    elif conv == 103 or conv == 71:              # g G
+        p2: int32 = prec
+        if p2 < 0:
+            p2 = 6
+        if p2 == 0:
+            p2 = 1
+        start: uint64 = sbuf_used
+        g_to_sbuf(arg_num(argi), p2)
+        emit_field_pad(cast[Ptr[uint8]](&sbuf[start]), g_slen, width, minus, zero, to_sbuf)
+    else:
+        emit_out(37, to_sbuf)
+        emit_out(conv, to_sbuf)
+
+
+def arg_int(argi: int64) -> int64:
+    return cast[int64](f_trunc(arg_num(argi)))
+
+
+def fmt_signed_int(v: int64, base: int32, upper: int32, plus: int32, space: int32, width: int32, minus: int32, zero: int32, prec: int32, to_sbuf: int32):
+    neg: int32 = 0
+    u: uint64 = 0
+    if v < 0:
+        neg = 1
+        u = cast[uint64](-v)
+    else:
+        u = cast[uint64](v)
+    digs: Array[24, uint8]
+    dc: int32 = 0
+    if u == 0:
+        digs[0] = 48
+        dc = 1
+    while u > 0:
+        digs[dc] = cast[uint8](48 + cast[int32](u % 10))
+        u = u / 10
+        dc = dc + 1
+    # precision = min digits
+    body: Array[64, uint8]
+    bl: int32 = 0
+    if neg == 1:
+        body[bl] = 45
+        bl = bl + 1
+    elif plus == 1:
+        body[bl] = 43
+        bl = bl + 1
+    elif space == 1:
+        body[bl] = 32
+        bl = bl + 1
+    zpad: int32 = 0
+    if prec >= 0 and prec > dc:
+        zpad = prec - dc
+    while zpad > 0:
+        body[bl] = 48
+        bl = bl + 1
+        zpad = zpad - 1
+    j: int32 = dc - 1
+    while j >= 0:
+        body[bl] = digs[j]
+        bl = bl + 1
+        j = j - 1
+    z: int32 = zero
+    if prec >= 0:
+        z = 0
+    emit_field_pad(&body[0], cast[uint64](bl), width, minus, z, to_sbuf)
+
+
+def fmt_unsigned(u: uint64, base: int32, upper: int32, width: int32, minus: int32, zero: int32, prec: int32, to_sbuf: int32):
+    digs: Array[24, uint8]
+    dc: int32 = 0
+    if u == 0:
+        digs[0] = 48
+        dc = 1
+    while u > 0:
+        d: int32 = cast[int32](u % cast[uint64](base))
+        ch: uint8 = 0
+        if d < 10:
+            ch = cast[uint8](48 + d)
+        else:
+            if upper == 1:
+                ch = cast[uint8](55 + d)
+            else:
+                ch = cast[uint8](87 + d)
+        digs[dc] = ch
+        u = u / cast[uint64](base)
+        dc = dc + 1
+    body: Array[64, uint8]
+    bl: int32 = 0
+    zpad: int32 = 0
+    if prec >= 0 and prec > dc:
+        zpad = prec - dc
+    while zpad > 0:
+        body[bl] = 48
+        bl = bl + 1
+        zpad = zpad - 1
+    j: int32 = dc - 1
+    while j >= 0:
+        body[bl] = digs[j]
+        bl = bl + 1
+        j = j - 1
+    z: int32 = zero
+    if prec >= 0:
+        z = 0
+    emit_field_pad(&body[0], cast[uint64](bl), width, minus, z, to_sbuf)
+
+
+def fmt_float(x: float64, prec: int32, width: int32, minus: int32, zero: int32, plus: int32, space: int32, to_sbuf: int32):
+    p: int32 = prec
+    if p < 0:
+        p = 6
+    neg: int32 = 0
+    ax: float64 = x
+    if ax < 0.0:
+        neg = 1
+        ax = -ax
+    # scale
+    scale: float64 = 1.0
+    k: int32 = 0
+    while k < p:
+        scale = scale * 10.0
+        k = k + 1
+    scaled: float64 = ax * scale + 0.5
+    total: int64 = cast[int64](f_trunc(scaled))
+    ipart: int64 = total
+    kk: int32 = 0
+    while kk < p:
+        ipart = ipart / 10
+        kk = kk + 1
+    # fractional digits
+    body: Array[80, uint8]
+    bl: int32 = 0
+    if neg == 1:
+        body[bl] = 45
+        bl = bl + 1
+    elif plus == 1:
+        body[bl] = 43
+        bl = bl + 1
+    elif space == 1:
+        body[bl] = 32
+        bl = bl + 1
+    # integer part digits
+    itmp: Array[24, uint8]
+    ic: int32 = 0
+    iu: uint64 = cast[uint64](ipart)
+    if iu == 0:
+        itmp[0] = 48
+        ic = 1
+    while iu > 0:
+        itmp[ic] = cast[uint8](48 + cast[int32](iu % 10))
+        iu = iu / 10
+        ic = ic + 1
+    j: int32 = ic - 1
+    while j >= 0:
+        body[bl] = itmp[j]
+        bl = bl + 1
+        j = j - 1
+    if p > 0:
+        body[bl] = 46
+        bl = bl + 1
+        # fractional = total - ipart*scale
+        fpart: int64 = total
+        m: int32 = 0
+        while m < p:
+            fpart = fpart
+            m = m + 1
+        frac: int64 = total - ipart * cast[int64](f_trunc(scale))
+        # emit p digits of frac, zero padded
+        ftmp: Array[24, uint8]
+        fc: int32 = 0
+        fu: uint64 = cast[uint64](frac)
+        while fc < p:
+            ftmp[fc] = cast[uint8](48 + cast[int32](fu % 10))
+            fu = fu / 10
+            fc = fc + 1
+        z: int32 = p - 1
+        while z >= 0:
+            body[bl] = ftmp[z]
+            bl = bl + 1
+            z = z - 1
+    emit_field_pad(&body[0], cast[uint64](bl), width, minus, zero, to_sbuf)
+
+
+# ==================================================================
+# Statement execution
+# ==================================================================
+def skip_terminators():
+    while t_type == T_SEMI or t_type == T_NEWLINE:
+        advance()
+
+
+def exec_stmt_list():
+    skip_terminators()
+    while t_type != T_EOF and t_type != T_RBRACE and cf == 0:
+        exec_stmt()
+        skip_terminators()
+
+
+def exec_block():
+    # current token is '{'
+    advance()
+    exec_stmt_list()
+    if t_type == T_RBRACE:
+        advance()
+
+
+def exec_stmt():
+    if vs_top == 0:
+        sbuf_used = 0
+    if t_type == T_LBRACE:
+        exec_block()
+        return
+    if t_type == T_SEMI or t_type == T_NEWLINE:
+        advance()
+        return
+    if t_type == T_ID:
+        pnm: Ptr[uint8] = cast[Ptr[uint8]](t_sptr)
+        nl: uint64 = t_slen
+        if name_eq(pnm, nl, "print") == 1:
+            stmt_print()
+            return
+        if name_eq(pnm, nl, "printf") == 1:
+            stmt_printf()
+            return
+        if name_eq(pnm, nl, "if") == 1:
+            stmt_if()
+            return
+        if name_eq(pnm, nl, "while") == 1:
+            stmt_while()
+            return
+        if name_eq(pnm, nl, "for") == 1:
+            stmt_for()
+            return
+        if name_eq(pnm, nl, "next") == 1:
+            advance()
+            if g_en == 1:
+                cf = 3
+            return
+        if name_eq(pnm, nl, "break") == 1:
+            advance()
+            if g_en == 1:
+                cf = 1
+            return
+        if name_eq(pnm, nl, "continue") == 1:
+            advance()
+            if g_en == 1:
+                cf = 2
+            return
+        if name_eq(pnm, nl, "exit") == 1:
+            advance()
+            if t_type != T_SEMI and t_type != T_NEWLINE and t_type != T_RBRACE and t_type != T_EOF:
+                parse_expr()
+                i: int64 = vs_top - 1
+                if g_en == 1:
+                    exit_code = cast[int32](vnum(i))
+                vs_top = vs_top - 1
+            if g_en == 1:
+                cf = 4
+                had_exit = 1
+            return
+    # expression statement
+    parse_expr()
+    vs_top = 0
+
+
+def stmt_print():
+    advance()
+    # no args -> print $0
+    if t_type == T_SEMI or t_type == T_NEWLINE or t_type == T_RBRACE or t_type == T_EOF:
+        if g_en == 1:
+            out_bytes(&f0[0], f0_len)
+            out_ch(10)
+        return
+    first: int32 = 1
+    while True:
+        parse_expr()
+        i: int64 = vs_top - 1
+        if g_en == 1:
+            if first == 0:
+                out_bytes(&ofs_buf[0], ofs_len)
+            vstr(i)
+            out_bytes(cast[Ptr[uint8]](gv_ptr), gv_len)
+        vs_top = vs_top - 1
+        first = 0
+        if t_type == T_COMMA:
+            advance()
+        else:
+            break
+    if g_en == 1:
+        out_ch(10)
+
+
+def stmt_printf():
+    advance()
+    do_printf(0)
+
+
+def stmt_if():
+    advance()                            # 'if'
+    if t_type == T_LPAREN:
+        advance()
+    parse_expr()
+    i: int64 = vs_top - 1
+    cond: int32 = 0
+    if g_en == 1:
+        cond = v_truthy(i)
+    vs_top = vs_top - 1
+    if t_type == T_RPAREN:
+        advance()
+    skip_opt_newlines()
+    # then-branch
+    saved: int32 = g_en
+    if cond == 0:
+        g_en = 0
+    exec_stmt()
+    g_en = saved
+    # else
+    skip_terminators()
+    if t_type == T_ID and name_eq(cast[Ptr[uint8]](t_sptr), t_slen, "else") == 1:
+        advance()
+        skip_opt_newlines()
+        saved2: int32 = g_en
+        if cond == 1:
+            g_en = 0
+        exec_stmt()
+        g_en = saved2
+
+
+def skip_opt_newlines():
+    while t_type == T_NEWLINE:
+        advance()
+
+
+def stmt_while():
+    advance()
+    if t_type == T_LPAREN:
+        advance()
+    cond_pos: uint64 = t_begin
+    # skip mode if disabled entirely
+    if g_en == 0:
+        # parse condition once, then body once, disabled
+        parse_expr()
+        vs_top = vs_top - 1
+        if t_type == T_RPAREN:
+            advance()
+        skip_opt_newlines()
+        exec_stmt()
+        return
+    while True:
+        pc = cond_pos
+        advance()
+        parse_expr()
+        i: int64 = vs_top - 1
+        cond: int32 = v_truthy(i)
+        vs_top = vs_top - 1
+        if t_type == T_RPAREN:
+            advance()
+        skip_opt_newlines()
+        body_pos: uint64 = t_begin
+        if cond == 0:
+            g_en = 0
+            exec_stmt()
+            g_en = 1
+            break
+        exec_stmt()
+        if cf == 1:                      # break
+            cf = 0
+            break
+        if cf == 2:                      # continue
+            cf = 0
+        if cf == 3 or cf == 4:           # next/exit
+            break
+
+
+forin_slots: Array[2048, int64]
+
+
+def stmt_for_in(vnp: uint64, vnl: uint64):
+    # current token is 'in'
+    advance()
+    anp: uint64 = t_sptr
+    anl: uint64 = t_slen
+    advance()
+    if t_type == T_RPAREN:
+        advance()
+    skip_opt_newlines()
+    body_pos: uint64 = t_begin
+    if g_en == 0:
+        exec_stmt()
+        return
+    # snapshot matching array slots
+    nkeys: int64 = 0
+    si: int64 = 0
+    while si < ar_used:
+        if ar_namelen[si] == anl:
+            ok: int32 = 1
+            j: uint64 = 0
+            nb: int64 = si * 16
+            while j < anl:
+                if ar_name[cast[uint64](nb) + j] != cast[Ptr[uint8]](anp)[j]:
+                    ok = 0
+                    j = anl
+                else:
+                    j = j + 1
+            if ok == 1 and nkeys < 2048:
+                forin_slots[nkeys] = si
+                nkeys = nkeys + 1
+        si = si + 1
+    vslot: int64 = var_intern(cast[Ptr[uint8]](vnp), vnl)
+    ki: int64 = 0
+    while ki < nkeys:
+        slot: int64 = forin_slots[ki]
+        # assign loop var = key (strnum)
+        var_isstr[vslot] = 1
+        var_strnum[vslot] = 1
+        kln: uint64 = ar_keylen[slot]
+        if kln > 256:
+            kln = 256
+        base: int64 = vslot * 256
+        kb: int64 = slot * 64
+        j2: uint64 = 0
+        while j2 < kln:
+            var_sbuf[cast[uint64](base) + j2] = ar_key[cast[uint64](kb) + j2]
+            j2 = j2 + 1
+        var_slen[vslot] = kln
+        pc = body_pos
+        advance()
+        exec_stmt()
+        if cf == 1:
+            cf = 0
+            ki = nkeys
+        elif cf == 2:
+            cf = 0
+        elif cf == 3 or cf == 4:
+            ki = nkeys
+        ki = ki + 1
+    # ensure cursor is past body even if zero keys
+    if nkeys == 0:
+        pc = body_pos
+        advance()
+        g_en = 0
+        exec_stmt()
+        g_en = 1
+
+
+def stmt_for():
+    advance()
+    if t_type == T_LPAREN:
+        advance()
+    # detect for (var in array) form
+    hdr_pos: uint64 = t_begin
+    if t_type == T_ID and name_eq(cast[Ptr[uint8]](t_sptr), t_slen, "in") == 0:
+        vnp: uint64 = t_sptr
+        vnl: uint64 = t_slen
+        advance()
+        if t_type == T_ID and name_eq(cast[Ptr[uint8]](t_sptr), t_slen, "in") == 1:
+            stmt_for_in(vnp, vnl)
+            return
+        pc = hdr_pos
+        advance()
+    # init
+    if t_type != T_SEMI:
+        parse_expr()
+        vs_top = 0
+    if t_type == T_SEMI:
+        advance()
+    cond_pos: uint64 = t_begin
+    if g_en == 0:
+        # cond
+        if t_type != T_SEMI:
+            parse_expr()
+            vs_top = 0
+        if t_type == T_SEMI:
+            advance()
+        # post
+        if t_type != T_RPAREN:
+            parse_expr()
+            vs_top = 0
+        if t_type == T_RPAREN:
+            advance()
+        skip_opt_newlines()
+        exec_stmt()
+        return
+    # find post_pos: parse cond then reach post
+    while True:
+        pc = cond_pos
+        advance()
+        cond: int32 = 1
+        if t_type != T_SEMI:
+            parse_expr()
+            i: int64 = vs_top - 1
+            cond = v_truthy(i)
+            vs_top = vs_top - 1
+        if t_type == T_SEMI:
+            advance()
+        post_pos: uint64 = t_begin
+        # skip over post to find body: parse post in disabled mode
+        saved: int32 = g_en
+        g_en = 0
+        if t_type != T_RPAREN:
+            parse_expr()
+            vs_top = 0
+        g_en = saved
+        if t_type == T_RPAREN:
+            advance()
+        skip_opt_newlines()
+        body_pos: uint64 = t_begin
+        if cond == 0:
+            g_en = 0
+            exec_stmt()
+            g_en = 1
+            break
+        exec_stmt()
+        brk: int32 = 0
+        if cf == 1:
+            cf = 0
+            brk = 1
+        elif cf == 2:
+            cf = 0
+        elif cf == 3 or cf == 4:
+            brk = 1
+        if brk == 1:
+            break
+        # run post
+        pc = post_pos
+        advance()
+        if t_type != T_RPAREN:
+            parse_expr()
+            vs_top = 0
+
+
+# ==================================================================
+# Rule table (structural scan)
+# ==================================================================
+RMAX: int64 = 128
+rule_kind: Array[128, int32]         # 0 main 1 BEGIN 2 END
+rule_pp: Array[128, int64]           # pattern start (-1 none)
+rule_pe: Array[128, uint64]
+rule_ap: Array[128, int64]           # action start (-1 none = default print)
+rule_ae: Array[128, uint64]
+rule_n: int64 = 0
+
+
+def prev_sig_divides(last: int32) -> int32:
+    # last = 1 if previous significant char ends a value (=> '/' is divide)
+    return last
+
+
+def scan_rules() -> int32:
+    i: uint64 = 0
+    while i < prog_len:
+        # skip separators + comments
+        while i < prog_len:
+            c: uint8 = prog[i]
+            if c == 32 or c == 9 or c == 13 or c == 10 or c == 59:
+                i = i + 1
+            elif c == 35:
+                while i < prog_len and prog[i] != 10:
+                    i = i + 1
+            elif c == 92 and i + 1 < prog_len and prog[i + 1] == 10:
+                i = i + 2
+            else:
+                break
+        if i >= prog_len:
+            break
+        if rule_n >= RMAX:
+            return -1
+        kind: int32 = 0
+        # BEGIN / END
+        if i + 5 <= prog_len and word_at(i, "BEGIN") == 1:
+            kind = 1
+            i = i + 5
+            i = skip_ws_nl(i)
+        elif i + 3 <= prog_len and word_at(i, "END") == 1:
+            kind = 2
+            i = i + 3
+            i = skip_ws_nl(i)
+        pp: int64 = -1
+        pe: uint64 = 0
+        if kind == 0 and prog[i] != 123:
+            # pattern up to top-level '{' or ';'/newline/EOF
+            pp = cast[int64](i)
+            i = scan_pattern_end(i)
+            pe = i
+            # trim trailing ws
+            while pe > cast[uint64](pp) and (prog[pe - 1] == 32 or prog[pe - 1] == 9 or prog[pe - 1] == 13):
+                pe = pe - 1
+        ap: int64 = -1
+        ae: uint64 = 0
+        i = skip_ws_nl(i)
+        if i < prog_len and prog[i] == 123:
+            i = i + 1
+            ap = cast[int64](i)
+            i = scan_block_end(i)
+            ae = i
+            if i < prog_len and prog[i] == 125:
+                i = i + 1
+        rule_kind[rule_n] = kind
+        rule_pp[rule_n] = pp
+        rule_pe[rule_n] = pe
+        rule_ap[rule_n] = ap
+        rule_ae[rule_n] = ae
+        rule_n = rule_n + 1
+    return 0
+
+
+def word_at(i: uint64, w: Ptr[uint8]) -> int32:
+    n: uint64 = strlen_u8(w)
+    j: uint64 = 0
+    while j < n:
+        if i + j >= prog_len:
+            return 0
+        if prog[i + j] != w[j]:
+            return 0
+        j = j + 1
+    # must not be followed by alnum
+    if i + n < prog_len and is_alnum(prog[i + n]) == 1:
+        return 0
+    return 1
+
+
+def skip_ws_nl(i: uint64) -> uint64:
+    while i < prog_len:
+        c: uint8 = prog[i]
+        if c == 32 or c == 9 or c == 13 or c == 10:
+            i = i + 1
+        elif c == 92 and i + 1 < prog_len and prog[i + 1] == 10:
+            i = i + 2
+        else:
+            return i
+    return i
+
+
+# scan a lexical unit at i (string/char/comment/regex); returns index past
+# it. `last_val` in/out via global g_lastval to decide regex vs divide.
+g_lastval: int32 = 0
+
+
+def scan_pattern_end(i: uint64) -> uint64:
+    depth: int32 = 0
+    g_lastval = 0
+    while i < prog_len:
+        c: uint8 = prog[i]
+        if c == 34:
+            i = skip_string(i)
+            g_lastval = 1
+        elif c == 39:
+            i = skip_char(i)
+            g_lastval = 1
+        elif c == 35:
+            while i < prog_len and prog[i] != 10:
+                i = i + 1
+            g_lastval = 0
+        elif c == 47 and g_lastval == 0:
+            i = skip_regex(i)
+            g_lastval = 1
+        elif c == 40 or c == 91:
+            depth = depth + 1
+            i = i + 1
+            g_lastval = 0
+        elif c == 41 or c == 93:
+            depth = depth - 1
+            i = i + 1
+            g_lastval = 1
+        elif depth == 0 and (c == 123 or c == 59 or c == 10):
+            return i
+        else:
+            if is_alnum(c) == 1 or c == 41 or c == 93:
+                g_lastval = 1
+            elif c == 32 or c == 9 or c == 13:
+                g_lastval = g_lastval
+            else:
+                g_lastval = 0
+            i = i + 1
+    return i
+
+
+def scan_block_end(i: uint64) -> uint64:
+    depth: int32 = 0
+    g_lastval = 0
+    while i < prog_len:
+        c: uint8 = prog[i]
+        if c == 34:
+            i = skip_string(i)
+            g_lastval = 1
+        elif c == 39:
+            i = skip_char(i)
+            g_lastval = 1
+        elif c == 35:
+            while i < prog_len and prog[i] != 10:
+                i = i + 1
+            g_lastval = 0
+        elif c == 47 and g_lastval == 0:
+            i = skip_regex(i)
+            g_lastval = 1
+        elif c == 123:
+            depth = depth + 1
+            i = i + 1
+            g_lastval = 0
+        elif c == 125:
+            if depth == 0:
+                return i
+            depth = depth - 1
+            i = i + 1
+            g_lastval = 0
+        else:
+            if is_alnum(c) == 1 or c == 41 or c == 93:
+                g_lastval = 1
+            elif c == 32 or c == 9 or c == 13:
+                g_lastval = g_lastval
+            else:
+                g_lastval = 0
+            i = i + 1
+    return i
+
+
+def skip_string(i: uint64) -> uint64:
+    i = i + 1
+    while i < prog_len and prog[i] != 34:
+        if prog[i] == 92 and i + 1 < prog_len:
+            i = i + 2
+        else:
+            i = i + 1
+    if i < prog_len:
+        i = i + 1
+    return i
+
+
+def skip_char(i: uint64) -> uint64:
+    i = i + 1
+    while i < prog_len and prog[i] != 39:
+        if prog[i] == 92 and i + 1 < prog_len:
+            i = i + 2
+        else:
+            i = i + 1
+    if i < prog_len:
+        i = i + 1
+    return i
+
+
+def skip_regex(i: uint64) -> uint64:
+    i = i + 1
+    while i < prog_len and prog[i] != 47:
+        if prog[i] == 92 and i + 1 < prog_len:
+            i = i + 2
+        else:
+            i = i + 1
+    if i < prog_len:
+        i = i + 1
+    return i
+
+
+# ==================================================================
+# Record processing
+# ==================================================================
+def split_record():
+    NFcount = 0
+    if fs_len == 1 and fs_buf[0] == 32:
+        i: uint64 = 0
+        while i < f0_len:
+            while i < f0_len and (f0[i] == 32 or f0[i] == 9):
+                i = i + 1
+            if i >= f0_len:
+                i = f0_len
+            else:
+                st: uint64 = i
+                while i < f0_len and f0[i] != 32 and f0[i] != 9:
+                    i = i + 1
+                fld_off[NFcount] = st
+                fld_len[NFcount] = i - st
+                NFcount = NFcount + 1
+        return
+    if fs_len == 1:
+        sep: uint8 = fs_buf[0]
+        st2: uint64 = 0
+        i2: uint64 = 0
+        while i2 <= f0_len:
+            if i2 == f0_len or f0[i2] == sep:
+                fld_off[NFcount] = st2
+                fld_len[NFcount] = i2 - st2
+                NFcount = NFcount + 1
+                st2 = i2 + 1
+            i2 = i2 + 1
+        return
+    # multi-char FS = ERE split
+    if rx_compile(&fs_buf[0], fs_len, 1, 0) != 0:
+        fld_off[0] = 0
+        fld_len[0] = f0_len
+        NFcount = 1
+        return
+    pos: uint64 = 0
+    while pos <= f0_len:
+        r: int64 = rx_search(&f0[0], f0_len, pos)
+        if r < 0:
+            fld_off[NFcount] = pos
+            fld_len[NFcount] = f0_len - pos
+            NFcount = NFcount + 1
+            pos = f0_len + 1
+        else:
+            ms: uint64 = cast[uint64](r)
+            fld_off[NFcount] = pos
+            fld_len[NFcount] = ms - pos
+            NFcount = NFcount + 1
+            # advance past match (guard zero-width)
+            me: uint64 = cast[uint64](rx_mend)
+            if me <= ms:
+                me = ms + 1
+            pos = me
+    NFcount = NFcount
+
+
+def run_record_rules():
+    ri: int64 = 0
+    while ri < rule_n and cf != 4:
+        if rule_kind[ri] == 0:
+            do_one_rule(ri)
+            if cf == 3:                  # next
+                cf = 0
+                ri = rule_n
+            elif cf == 4:
+                ri = rule_n
+        ri = ri + 1
+
+
+def do_one_rule(ri: int64):
+    matched: int32 = 1
+    if rule_pp[ri] >= 0:
+        # evaluate pattern expression
+        vs_top = 0
+        sbuf_used = 0
+        pc = cast[uint64](rule_pp[ri])
+        lim = rule_pe[ri]
+        g_en = 1
+        advance()
+        parse_expr()
+        i: int64 = vs_top - 1
+        matched = v_truthy(i)
+        vs_top = 0
+    if matched == 0:
+        return
+    if rule_ap[ri] < 0:
+        # default action: print $0
+        out_bytes(&f0[0], f0_len)
+        out_ch(10)
+        return
+    vs_top = 0
+    sbuf_used = 0
+    pc = cast[uint64](rule_ap[ri])
+    lim = rule_ae[ri]
+    g_en = 1
+    advance()
+    exec_stmt_list()
+    vs_top = 0
+
+
+def run_special(kind: int32):
+    ri: int64 = 0
+    while ri < rule_n and cf != 4:
+        if rule_kind[ri] == kind:
+            if rule_ap[ri] >= 0:
+                vs_top = 0
+                sbuf_used = 0
+                pc = cast[uint64](rule_ap[ri])
+                lim = rule_ae[ri]
+                g_en = 1
+                advance()
+                exec_stmt_list()
+                vs_top = 0
+                if cf == 4:
+                    ri = rule_n
+        ri = ri + 1
+
+
+def process_record(rp: Ptr[uint8], rl: uint64):
+    n: uint64 = rl
+    if n > REC_CAP:
+        n = REC_CAP
+    i: uint64 = 0
+    while i < n:
+        f0[i] = rp[i]
+        i = i + 1
+    f0_len = n
+    NRv = NRv + 1
+    split_record()
+    run_record_rules()
+
+
+# ==================================================================
+# Input
+# ==================================================================
+inbuf: Array[1048576, uint8]
+in_len: uint64 = 0
+
+
+def read_fd_all(fd: int32):
+    in_len = 0
+    while True:
+        if in_len >= 1048576:
+            break
+        r: int64 = sys_read(fd, &inbuf[in_len], 1048576 - in_len)
+        if r <= 0:
+            break
+        in_len = in_len + cast[uint64](r)
+
+
+def process_buffer():
+    start: uint64 = 0
+    i: uint64 = 0
+    while i < in_len:
+        if inbuf[i] == 10:
+            process_record(&inbuf[start], i - start)
+            start = i + 1
+            if cf == 4:
+                i = in_len
+            else:
+                i = i + 1
+        else:
+            i = i + 1
+    if cf != 4 and start < in_len:
+        process_record(&inbuf[start], in_len - start)
+
+
+# ==================================================================
+# Argument / escape helpers
+# ==================================================================
+def unescape_into(src: Ptr[uint8], n: uint64, dst: Ptr[uint8], cap: uint64) -> uint64:
+    w: uint64 = 0
+    i: uint64 = 0
+    while i < n and w < cap:
+        c: uint8 = src[i]
+        if c == 92 and i + 1 < n:
+            i = i + 1
+            e: uint8 = src[i]
+            if e == 116:
+                dst[w] = 9
+            elif e == 110:
+                dst[w] = 10
+            elif e == 114:
+                dst[w] = 13
+            elif e == 92:
+                dst[w] = 92
+            else:
+                dst[w] = e
+            w = w + 1
+            i = i + 1
+        else:
+            dst[w] = c
+            w = w + 1
+            i = i + 1
+    return w
+
+
+def set_var_string_cmdline(np: Ptr[uint8], nl: uint64, vp: Ptr[uint8], vl: uint64):
+    idx: int64 = var_intern(np, nl)
+    # unescape value into var slot, mark strnum
+    var_isstr[idx] = 1
+    var_strnum[idx] = 1
+    tmp: Array[256, uint8]
+    w: uint64 = unescape_into(vp, vl, &tmp[0], 256)
+    base: int64 = idx * 256
+    j: uint64 = 0
+    while j < w:
+        var_sbuf[cast[uint64](base) + j] = tmp[j]
+        j = j + 1
+    var_slen[idx] = w
+
+
+def apply_v_assignment(arg: Ptr[uint8]):
+    # arg is "name=value"
+    n: uint64 = strlen_u8(arg)
+    eq: uint64 = 0
+    found: int32 = 0
+    i: uint64 = 0
+    while i < n:
+        if arg[i] == 61:
+            eq = i
+            found = 1
+            i = n
+        else:
+            i = i + 1
+    if found == 0:
+        return
+    set_var_string_cmdline(arg, eq, &arg[eq + 1], n - eq - 1)
+
+
+def load_prog_from_arg(arg: Ptr[uint8]):
+    n: uint64 = strlen_u8(arg)
+    if n > 16384:
+        n = 16384
+    i: uint64 = 0
+    while i < n:
+        prog[i] = arg[i]
+        i = i + 1
+    prog_len = n
+
+
+def load_prog_from_file(path: Ptr[char]) -> int32:
+    fd: int32 = sys_open(path, 0, 0)
+    if fd < 0:
+        return -1
+    prog_len = 0
+    while True:
+        if prog_len >= 16384:
+            break
+        r: int64 = sys_read(fd, &prog[prog_len], 16384 - prog_len)
+        if r <= 0:
+            break
+        prog_len = prog_len + cast[uint64](r)
+    sys_close(fd)
+    return 0
+
+
+# ==================================================================
+# main
+# ==================================================================
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # defaults
+    fs_buf[0] = 32
+    fs_len = 1
+    ofs_buf[0] = 32
+    ofs_len = 1
+
+    have_prog: int32 = 0
+    prog_from_file: int32 = 0
+
+    # file operands collected as argv indices
+    files: Array[64, int32]
+    nfiles: int32 = 0
+
+    ai: int32 = 1
+    while ai < argc:
+        arg: Ptr[uint8] = cast[Ptr[uint8]](argv[ai])
+        if have_prog == 0 and arg[0] == 45 and arg[1] != 0:
+            # option
+            if arg[1] == 70:                     # -F
+                if arg[2] != 0:
+                    fs_len = unescape_into(&arg[2], strlen_u8(&arg[2]), &fs_buf[0], 64)
+                else:
+                    ai = ai + 1
+                    if ai < argc:
+                        a2: Ptr[uint8] = cast[Ptr[uint8]](argv[ai])
+                        fs_len = unescape_into(a2, strlen_u8(a2), &fs_buf[0], 64)
+            elif arg[1] == 118:                  # -v
+                if arg[2] != 0:
+                    apply_v_assignment(&arg[2])
+                else:
+                    ai = ai + 1
+                    if ai < argc:
+                        apply_v_assignment(cast[Ptr[uint8]](argv[ai]))
+            elif arg[1] == 102:                  # -f
+                if arg[2] != 0:
+                    load_prog_from_file(cast[Ptr[char]](&arg[2]))
+                else:
+                    ai = ai + 1
+                    if ai < argc:
+                        load_prog_from_file(cast[Ptr[char]](argv[ai]))
+                have_prog = 1
+                prog_from_file = 1
+            elif arg[1] == 45 and arg[2] == 0:   # --
+                ai = ai
+            ai = ai + 1
+        elif have_prog == 0:
+            load_prog_from_arg(arg)
+            have_prog = 1
+            ai = ai + 1
+        else:
+            if nfiles < 64:
+                files[nfiles] = ai
+                nfiles = nfiles + 1
+            ai = ai + 1
+
+    if have_prog == 0:
+        write_err("awk: no program text\n")
+        return 2
+
+    if scan_rules() != 0:
+        write_err("awk: too many rules\n")
+        return 2
+
+    # BEGIN
+    run_special(1)
+
+    # main input (unless exit already, or only BEGIN rules and no main/END)
+    need_input: int32 = 0
+    ri: int64 = 0
+    while ri < rule_n:
+        if rule_kind[ri] != 1:
+            need_input = 1
+        ri = ri + 1
+
+    if cf != 4 and need_input == 1:
+        if nfiles == 0:
+            read_fd_all(0)
+            process_buffer()
+        else:
+            fi: int32 = 0
+            while fi < nfiles and cf != 4:
+                path: Ptr[char] = cast[Ptr[char]](argv[files[fi]])
+                # "-" means stdin
+                pb: Ptr[uint8] = cast[Ptr[uint8]](argv[files[fi]])
+                if pb[0] == 45 and pb[1] == 0:
+                    read_fd_all(0)
+                    process_buffer()
+                else:
+                    fd: int32 = sys_open(path, 0, 0)
+                    if fd < 0:
+                        write_err("awk: cannot open file\n")
+                    else:
+                        read_fd_all(fd)
+                        sys_close(fd)
+                        process_buffer()
+                fi = fi + 1
+
+    # END (runs even after exit, unless exit occurred inside END)
+    if had_exit == 1:
+        cf = 0
+    else:
+        cf = 0
+    run_special(2)
+
+    out_flush()
+    return exit_code
