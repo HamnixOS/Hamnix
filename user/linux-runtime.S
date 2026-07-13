@@ -162,6 +162,91 @@ sys_lseek:
     .size sys_lseek, .-sys_lseek
 
 
+    /* --- sys_mkdir(path) -> int32 -----------------------------------
+     * The native primitive takes ONLY a path (mode is fixed on-device).
+     * On the HOST we supply mode 0755 (=493) ourselves so the SAME native
+     * source that mkdir()s on-device also creates a real host directory.
+     * Returns 0 or -errno. */
+    .globl sys_mkdir
+    .type sys_mkdir, @function
+sys_mkdir:
+    movq    $493, %rsi              /* mode 0755 */
+    movq    $SYS_mkdir, %rax
+    syscall
+    ret
+    .size sys_mkdir, .-sys_mkdir
+
+
+    /* --- sys_unlink(path) -> int32 ---------------------------------- */
+    .globl sys_unlink
+    .type sys_unlink, @function
+sys_unlink:
+    movq    $SYS_unlink, %rax
+    syscall
+    ret
+    .size sys_unlink, .-sys_unlink
+
+
+    /* --- sys_dup2(oldfd, newfd) -> int32 ---------------------------- */
+    .globl sys_dup2
+    .type sys_dup2, @function
+sys_dup2:
+    movq    $SYS_dup2, %rax
+    syscall
+    ret
+    .size sys_dup2, .-sys_dup2
+
+
+    /* --- Plan 9 / process-spawn primitives with NO host equivalent ---
+     * lib/p9.ad (transitively imported by lib/hamfmcore.ad) references
+     * these Hamnix-only syscalls. A host binary that only exercises the
+     * browse core's FILE ops (mkdir/touch/unlink/rename via the wrappers
+     * above) never CALLS them, but they must RESOLVE for the link to
+     * succeed. Provide stubs that fail closed (return -1); if a host path
+     * ever reaches one it errors cleanly rather than corrupting state. */
+    .globl sys_rfork
+    .type sys_rfork, @function
+sys_rfork:
+    movq    $-1, %rax
+    ret
+    .size sys_rfork, .-sys_rfork
+
+    .globl sys_execve_env
+    .type sys_execve_env, @function
+sys_execve_env:
+    movq    $-1, %rax
+    ret
+    .size sys_execve_env, .-sys_execve_env
+
+    .globl sys_fdbind
+    .type sys_fdbind, @function
+sys_fdbind:
+    movq    $-1, %rax
+    ret
+    .size sys_fdbind, .-sys_fdbind
+
+    .globl sys_chan_dir_mode
+    .type sys_chan_dir_mode, @function
+sys_chan_dir_mode:
+    movq    $-1, %rax
+    ret
+    .size sys_chan_dir_mode, .-sys_chan_dir_mode
+
+    .globl sys_listdir_records
+    .type sys_listdir_records, @function
+sys_listdir_records:
+    movq    $-1, %rax
+    ret
+    .size sys_listdir_records, .-sys_listdir_records
+
+    .globl sys_stat_p9
+    .type sys_stat_p9, @function
+sys_stat_p9:
+    movq    $-1, %rax
+    ret
+    .size sys_stat_p9, .-sys_stat_p9
+
+
     /* --- sys_exit(code) — never returns ----------------------------- */
     .globl sys_exit
     .type sys_exit, @function

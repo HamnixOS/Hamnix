@@ -41,6 +41,9 @@
     .set SYS_open,   2
     .set SYS_close,  3
     .set SYS_lseek,  8
+    .set SYS_mkdir,  83
+    .set SYS_unlink, 87
+    .set SYS_dup2,   33
     .set SYS_exit,   60
 #endif /* LINUX_ABI */
 
