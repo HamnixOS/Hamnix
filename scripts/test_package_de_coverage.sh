@@ -61,9 +61,13 @@ SKIP_BINS = {
     # any runlevel/menu). Both are dev/bring-up binaries, not shipped
     # userland — packaged by nothing on purpose.
     "spawnfdprobe", "umdf_host",
-    # X11 bridge + scene test harnesses (not the shipped DE)
+    # X11 bridge + scene test harnesses (not the shipped DE). hamimgscene =
+    # the #128 scene-IMAGE-tier demo (synthesizes an RGBA image + exercises
+    # the draw/ctl 'I' upload verb); a dev demo tested by test_hamimg_host.sh,
+    # referenced by no autostart/menu/desktop.icons — not shipped userland.
     "x11apptest", "x11srv", "x11test", "xclient_demo", "xfill",
     "scenetest", "multiwintest", "hamui_demo", "ham2048", "hamsnake",
+    "hamimgscene",
     # Legacy PRE-scene-pivot DE widgets (hamui-toolkit era). The DE was
     # rearchitected onto scene FILES (docs/de_scene_file_arch.md); the
     # *scene variants (hampanelscene/hamfmscene/...) in

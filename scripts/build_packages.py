@@ -544,6 +544,7 @@ def _files_fs_ext4() -> list[tuple[Path, str]]:
     f: list[tuple[Path, str]] = []
     _add_user_bin(f, "mkfs_ext4")
     _add_user_bin(f, "install_file_to_slot")
+    _add_user_bin(f, "mkdir_at_slot")
     _add_user_bin(f, "install_rootfs_from_manifest")
     return f
 
