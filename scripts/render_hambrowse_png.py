@@ -63,6 +63,7 @@ def _load_fonts():
 def parse_dump(text):
     width = 600
     segs = []      # (row, x, color, bold, uline, link, bg, text)
+    fills = []     # (top, bot, lx, rx, color) — element background boxes
     rules = {}     # row -> type
     title = None
     for line in text.splitlines():
@@ -72,6 +73,10 @@ def parse_dump(text):
                     width = int(tok[6:])
         elif line.startswith("TITLE "):
             title = line[6:]
+        elif line.startswith("FILL "):
+            # FILL top bot lx rx #rrggbb — an element background rectangle.
+            p = line.split()
+            fills.append((int(p[1]), int(p[2]), int(p[3]), int(p[4]), p[5]))
         elif line.startswith("RULE row "):
             p = line.split()
             rules[int(p[2])] = int(p[4])
@@ -88,12 +93,12 @@ def parse_dump(text):
             bg = None if bgtok == "-" else bgtok
             text = rest[:-1] if rest.endswith("|") else rest
             segs.append((row, x, color, bold, uline, link, bg, text))
-    return width, segs, rules, title
+    return width, segs, rules, title, fills
 
 
 def render(text, out_path, url="about:demo", win_title="Browser",
            status="demo page", max_rows=None):
-    width, segs, rules, ptitle = parse_dump(text)
+    width, segs, rules, ptitle, fills = parse_dump(text)
     total_rows = (max(([r for (r, *_ ) in segs] + list(rules.keys())),
                       default=0) + 1)
     if max_rows:
@@ -119,6 +124,16 @@ def render(text, out_path, url="about:demo", win_title="Browser",
 
     # ---- content background ----
     rect(0, CONTENT_Y, width, total_rows * LINE_H, C_PAGE)
+
+    # ---- element backgrounds (behind the whole box, under the text) ----
+    for (ftop, fbot, lx, rx, col) in fills:
+        if ftop >= total_rows:
+            continue
+        fb = min(fbot, total_rows)
+        y = CONTENT_Y + ftop * LINE_H
+        h = (fb - ftop) * LINE_H
+        if h > 0 and rx > lx:
+            rect(lx, y, rx - lx, h, col)
 
     # ---- title bar ----
     rect(0, 0, width, TITLE_H, C_TITLEBAR)
