@@ -223,6 +223,38 @@ else
     echo "[2048-host] FAIL frame 0 not at source cell"; fail=1
 fi
 
+# --- PER-MOVE ANIMATION BUDGET (the "slows way down once you play" bug) -----
+# The live native driver (user/ham2048scene.ad::_run_anim) emits one /scene
+# commit per animation frame — 1 (frame 0) + SLIDE_FRAMES + POP_FRAMES commits —
+# each followed by a fixed _delay(J) busy-wait (J jiffies @ 100Hz = 10ms each).
+# On the software rasterizer EVERY commit is a full-board re-raster, so the
+# per-move blocking cost scales with the COMMIT COUNT. The original 6+3 frames
+# at 2 jiffies = 10 commits x 20ms = 200ms of busy-wait (and 10 full re-rasters
+# ~= 1.8s on-device) made an active game feel like it ground to a halt. This
+# gate reads the shipping constants straight from source and asserts the
+# per-move animation budget stayed SNAPPY (commits x delay well under 250ms),
+# guarding against a regression that re-inflates the frame count or delay.
+SLIDE_FRAMES=$(grep -E '^SLIDE_FRAMES:' lib/ham2048core.ad | grep -oE '= *[0-9]+' | grep -oE '[0-9]+' | head -1)
+POP_FRAMES=$(grep -E '^POP_FRAMES:' lib/ham2048core.ad | grep -oE '= *[0-9]+' | grep -oE '[0-9]+' | head -1)
+DELAY_J=$(awk '/def _run_anim/{r=1} r&&/_delay\(/{print; exit}' user/ham2048scene.ad | grep -oE '_delay\([0-9]+\)' | grep -oE '[0-9]+' | head -1)
+: "${SLIDE_FRAMES:=0}" "${POP_FRAMES:=0}" "${DELAY_J:=0}"
+COMMITS=$(( 1 + SLIDE_FRAMES + POP_FRAMES ))
+PERMOVE_MS=$(( COMMITS * DELAY_J * 10 ))
+echo "[2048-host] per-move animation: SLIDE_FRAMES=$SLIDE_FRAMES POP_FRAMES=$POP_FRAMES delay=${DELAY_J}j -> $COMMITS commits x ${DELAY_J}0ms = ${PERMOVE_MS}ms busy-wait"
+# Slide must still animate (>=2 slide frames so tiles travel, not teleport).
+if [ "$SLIDE_FRAMES" -ge 2 ]; then
+    echo "[2048-host] PASS slide still animates (SLIDE_FRAMES=$SLIDE_FRAMES >= 2)"
+else
+    echo "[2048-host] FAIL slide has too few frames to animate: SLIDE_FRAMES=$SLIDE_FRAMES"; fail=1
+fi
+# Budget: well under 250ms (target ~snappy). Old 6+3@2j was 200ms; regressing
+# back to that (or worse) trips this. A pop frame is required so the merge reads.
+if [ "$COMMITS" -gt 0 ] && [ "$DELAY_J" -gt 0 ] && [ "$PERMOVE_MS" -le 120 ] && [ "$POP_FRAMES" -ge 1 ]; then
+    echo "[2048-host] PASS per-move animation budget is snappy: ${PERMOVE_MS}ms (<=120ms), $COMMITS commits/move"
+else
+    echo "[2048-host] FAIL per-move animation budget too heavy: ${PERMOVE_MS}ms, $COMMITS commits, pop=$POP_FRAMES"; fail=1
+fi
+
 # --- BOUNDED PER-MOVE COST (the "slows down after a few turns" bug class) --
 # User report on the installed image: 2048 "looks really good for a little
 # while. Once you've played it for a few turns it slows way down" — the classic
