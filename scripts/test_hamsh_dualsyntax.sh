@@ -269,6 +269,33 @@ hamsh_send_await 'try { raise "y" } finally { echo FIN_PROP }' 'FIN_PROP' "$CMD_
 # N5. a `with` body that raises STILL unbinds (teardown) AND propagates the
 # raise so an enclosing try/except catches it (#111 unwind ∩ exceptions).
 hamsh_send_await 'try { with bind(/tmp, /n/wb) as w { raise "wz" } } except as e { echo WCAUGHT_$e }' 'WCAUGHT_wz' "$CMD_WAIT" || true
+# N6. DIFFERENTIAL both-styles-≡: the Python-lite `except NAME:` BIND
+# shorthand (no `as`) binds the raised value to NAME — brace AND indent.
+hamsh_send_await 'try { raise "bx" } except er { echo SHORT_$er }' 'SHORT_bx' "$CMD_WAIT" || true
+hamsh_send 'try:'
+hamsh_send '    raise "bx"'
+hamsh_send 'except er:'
+hamsh_send '    echo SHORT_$er'
+hamsh_send ''
+hamsh_send_await 'echo GATE_N6' 'GATE_N6' "$CMD_WAIT" || true
+# N7. `except NAME as e:` FILTER — a matching type is caught + bound; a
+# NON-matching one re-propagates to the outer handler (WRONGCATCH must NOT
+# leak). "ValueError: bad" matches `except ValueError` by the "NAME:" prefix.
+hamsh_send_await 'try { raise "ValueError: bad" } except ValueError as e { echo FILT_$e }' 'FILT_ValueError: bad' "$CMD_WAIT" || true
+hamsh_send 'try:'
+hamsh_send '    try:'
+hamsh_send '        raise "TypeError: nope"'
+hamsh_send '    except ValueError as e:'
+hamsh_send '        echo WRONGCATCH'
+hamsh_send 'except as e2:'
+hamsh_send '    echo OUTERCATCH_$e2'
+hamsh_send ''
+hamsh_send_await 'echo GATE_N7' 'GATE_N7' "$CMD_WAIT" || true
+# N8. `else` runs ONLY on the no-exception path (ELSE_RAN + FIN_E8 both
+# appear); on the exception path the else body is skipped (ELSE_NO absent).
+hamsh_send_await 'try { echo TRY_OK8 } else { echo ELSE_RAN } finally { echo FIN_E8 }' 'FIN_E8' "$CMD_WAIT" || true
+hamsh_send 'try { raise "e8" } except { echo CAUGHT8 } else { echo ELSE_NO }'
+hamsh_send_await 'echo GATE_N8' 'GATE_N8' "$CMD_WAIT" || true
 
 # --- O. §f-string — Python f"{expr}" interpolation -------------------
 hamsh_send 'fa = 3'
@@ -569,6 +596,33 @@ if ran_bol "FIN_PROP"; then
 if ran_bol "WCAUGHT_wz"; then
     echo "[$TAG] OK: with-body raise unwinds through with + caught"; else
     echo "[$TAG] WRONG: with-body raise not caught (unwind∩exceptions)"; fail=1; fi
+# N6 differential: the `except NAME:` bind shorthand — SHORT_bx in BOTH
+# the brace and indent form, so a correct pair yields >=2 occurrences.
+short_n=$(grep -acE "^SHORT_bx\$" "$CLEAN" || true)
+if [ "$short_n" -ge 2 ]; then
+    echo "[$TAG] OK: except NAME: bind shorthand brace ≡ indent (SHORT_bx=$short_n)"; else
+    echo "[$TAG] WRONG: except NAME: shorthand brace≢indent (SHORT_bx=$short_n, want >=2)"; fail=1; fi
+# N7: filtered `except NAME as e:` — the matching handler catches + binds,
+# the non-matching inner handler re-propagates to the outer one, and the
+# WRONGCATCH body never runs.
+if ran_bol "$(printf '%s' 'FILT_ValueError: bad' | sed 's/[.[*+]/\\&/g')"; then
+    echo "[$TAG] OK: except NAME as e: filter matches + binds"; else
+    echo "[$TAG] WRONG: except NAME as e: filter did not catch/bind"; fail=1; fi
+if ran_bol "$(printf '%s' 'OUTERCATCH_TypeError: nope' | sed 's/[.[*+]/\\&/g')"; then
+    echo "[$TAG] OK: filter miss re-propagates to the outer handler"; else
+    echo "[$TAG] WRONG: filter miss did not re-propagate"; fail=1; fi
+if hamsh_ran "$LOG" "WRONGCATCH"; then
+    echo "[$TAG] WRONG: non-matching filter caught the exception (WRONGCATCH leaked)"; fail=1; else
+    echo "[$TAG] OK: non-matching filter did not catch (WRONGCATCH absent)"; fi
+# N8: `else` runs on the no-exception path, is skipped on the exception path.
+if ran_bol "TRY_OK8" && ran_bol "ELSE_RAN" && ran_bol "FIN_E8"; then
+    echo "[$TAG] OK: else runs on the no-exception path (before finally)"; else
+    echo "[$TAG] WRONG: else did not run on the no-exception path"; fail=1; fi
+if ran_bol "CAUGHT8"; then echo "[$TAG] OK: except still catches with an else present"; else
+    echo "[$TAG] WRONG: except body did not run with an else present"; fail=1; fi
+if hamsh_ran "$LOG" "ELSE_NO"; then
+    echo "[$TAG] WRONG: else ran on the exception path (ELSE_NO leaked)"; fail=1; else
+    echo "[$TAG] OK: else skipped on the exception path (ELSE_NO absent)"; fi
 
 # O. §f-string — Python f"{expr}" interpolation.
 for pair in "sum=7|arith-subexpr" "pi is 3.14|float-interp" \
