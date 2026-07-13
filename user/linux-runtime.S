@@ -124,6 +124,24 @@ sys_open:
     .size sys_open, .-sys_open
 
 
+    /* --- sys_open_write(path) -> int32 ------------------------------
+     * Mirrors user/runtime.S's SYS_OPEN_WRITE (open-or-create for write,
+     * truncating an existing file). On the HOST this is a real Linux
+     * open(2) with O_WRONLY|O_CREAT|O_TRUNC (0x241) and mode 0644 (0644
+     * octal = 420). Only %rdi (path) is supplied by the caller; we load
+     * the flags/mode ourselves so the SAME native source that writes a
+     * file on-device also writes a real host file under x86_64-linux. */
+    .globl sys_open_write
+    .type sys_open_write, @function
+sys_open_write:
+    movq    $0x241, %rsi            /* O_WRONLY|O_CREAT|O_TRUNC */
+    movq    $420, %rdx             /* mode 0644 */
+    movq    $SYS_open, %rax
+    syscall
+    ret
+    .size sys_open_write, .-sys_open_write
+
+
     /* --- sys_close(fd) -> int32 ------------------------------------- */
     .globl sys_close
     .type sys_close, @function

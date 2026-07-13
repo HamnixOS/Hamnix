@@ -1,0 +1,819 @@
+# user/patch.ad - native `patch`: apply unified/normal diffs to a file.
+#
+# Applies a diff (as produced by our own `diff` (user/diff.ad) or by GNU
+# `diff`) to a target file, interoperating with GNU `patch` in both
+# directions. Supports:
+#   * UNIFIED hunks  (@@ -l,c +l,c @@  with ' '/'-'/'+' bodies)
+#   * NORMAL diffs   (Na,Mc / Nd / Na  with '< '/'---'/'> ' bodies)
+#   * -pN / --strip=N   strip N leading path components from the header
+#   * -R / --reverse    apply the patch backwards
+#   * --dry-run         verify only; change nothing
+#   * -i FILE           read the patch from FILE (default: stdin)
+#   * -o FILE           write the result to FILE (default: in place)
+#   * -b / --backup     save the unmodified original as FILE.orig
+# Each hunk is located at its stated line, then by an outward OFFSET search
+# (GNU relocates a drifted hunk); a hunk whose context cannot be found FAILS
+# the patch. Exit status: 0 all applied, 1 some hunk failed, 2 trouble.
+#
+# HOST cross-check (QEMU-free): compiled for x86_64-linux the SAME source
+# runs as a host process — the 3-arg sys_open opens real files read-only,
+# sys_open_write creates/truncates the real target. On-device it uses the
+# Hamnix SYS_OPEN / SYS_OPEN_WRITE syscalls.
+
+# 3-arg sys_open: host thunk is a raw open(2) (flags=0 => O_RDONLY); the
+# on-device thunk forwards to SYS_OPEN. Declaring all three args satisfies
+# both. sys_open_write opens-or-creates for write (truncating) on both.
+extern def sys_open(path: Ptr[char], flags: int32, mode: int32) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+
+CAP:       uint64 = 131072       # patch / target / output buffer caps
+MAXLINES:  uint64 = 4096         # max lines in the target file
+MAXP:      uint64 = 8192         # max patch body-line spans (each side)
+MAXHUNKS:  uint64 = 1024         # max hunks in the patch
+
+pbuf: Array[131072, uint8]       # the patch text
+tbuf: Array[131072, uint8]       # the target (original) file text
+obuf: Array[131072, uint8]       # the reconstructed output
+ob_len: uint64 = 0
+
+pn: uint64 = 0                   # patch byte length
+tn: uint64 = 0                   # target byte length
+t_final_nl: int32 = 1            # did the target end with '\n'?
+
+# Patch text split into lines (offset + length, no newline).
+pl_off: Array[8192, uint64]
+pl_len: Array[8192, uint64]
+npl: uint64 = 0
+
+# Target text split into lines.
+t_off: Array[4096, uint64]
+t_len: Array[4096, uint64]
+nt: uint64 = 0
+
+# Old/new side span pools (indices into pbuf), one flat pool each.
+hol_off: Array[8192, uint64]     # OLD side (to verify against the target)
+hol_len: Array[8192, uint64]
+hnl_off: Array[8192, uint64]     # NEW side (to emit)
+hnl_len: Array[8192, uint64]
+ho_top: uint64 = 0
+hn_top: uint64 = 0
+
+# Per-hunk descriptors.
+hk_ho_begin: Array[1024, uint64]
+hk_ho_cnt:   Array[1024, uint64]
+hk_hn_begin: Array[1024, uint64]
+hk_hn_cnt:   Array[1024, uint64]
+hk_guess:    Array[1024, int64]   # 0-based expected old-side start
+hk_found:    Array[1024, int64]   # matched position (set at apply time)
+nhunks: uint64 = 0
+
+# Scratch for the decimal scanner.
+gnum: int64  = 0
+gpos: uint64 = 0
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def emit_dec(fd: int32, v: int64):
+    if v == 0:
+        sys_write(fd, "0", 1)
+        return
+    neg: int32 = 0
+    if v < 0:
+        neg = 1
+        v = 0 - v
+    out: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        out[23 - n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    if neg != 0:
+        sys_write(fd, "-", 1)
+    sys_write(fd, cast[Ptr[uint8]](cast[uint64](&out[0]) + 24 - n), n)
+
+
+def streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] == b[i]:
+        return 1
+    return 0
+
+
+# Does string `s` begin with the (NUL-terminated) prefix `p`?
+def starts_with(s: Ptr[uint8], p: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while p[i] != 0:
+        if s[i] != p[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Parse a base-10 integer out of a NUL-terminated string.
+def atoi_u8(s: Ptr[uint8]) -> int64:
+    v: int64 = 0
+    i: uint64 = 0
+    while s[i] >= 48 and s[i] <= 57:
+        v = v * 10 + cast[int64](s[i] - 48)
+        i = i + 1
+    return v
+
+
+# ---- file I/O -----------------------------------------------------------
+
+def read_fd(fd: int32, b: Ptr[uint8]) -> int64:
+    total: uint64 = 0
+    while total < CAP:
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](cast[uint64](b) + total),
+                            CAP - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    return cast[int64](total)
+
+
+def load_file(b: Ptr[uint8], path: Ptr[char]) -> int64:
+    fd: int32 = sys_open(path, 0, 0)
+    if fd < 0:
+        return -1
+    total: int64 = read_fd(fd, b)
+    sys_close(fd)
+    return total
+
+
+# Split buffer `b` of `len` bytes into line spans (newline stripped).
+def split_lines(b: Ptr[uint8], len: uint64,
+                off: Ptr[uint64], ln: Ptr[uint64], cap: uint64) -> uint64:
+    count: uint64 = 0
+    i: uint64 = 0
+    while i < len and count < cap:
+        start: uint64 = i
+        while i < len and b[i] != 10:
+            i = i + 1
+        off[count] = start
+        ln[count] = i - start
+        count = count + 1
+        if i < len:
+            i = i + 1
+    return count
+
+
+# ---- decimal scan over pbuf --------------------------------------------
+
+# Read digits from pbuf starting at index `i` (bounded by `end`). Leaves the
+# value in gnum and the next index in gpos.
+def scan_dec(i: uint64, end: uint64):
+    v: int64 = 0
+    while i < end and pbuf[i] >= 48 and pbuf[i] <= 57:
+        v = v * 10 + cast[int64](pbuf[i] - 48)
+        i = i + 1
+    gnum = v
+    gpos = i
+
+
+# ---- output emit --------------------------------------------------------
+
+def append_bytes(base: Ptr[uint8], off: uint64, len: uint64):
+    k: uint64 = 0
+    while k < len and ob_len < CAP:
+        obuf[ob_len] = base[off + k]
+        ob_len = ob_len + 1
+        k = k + 1
+
+
+def append_line(base: Ptr[uint8], off: uint64, len: uint64):
+    append_bytes(base, off, len)
+    if ob_len < CAP:
+        obuf[ob_len] = 10
+        ob_len = ob_len + 1
+
+
+# ---- hunk building ------------------------------------------------------
+
+def push_old(off: uint64, len: uint64):
+    hol_off[ho_top] = off
+    hol_len[ho_top] = len
+    ho_top = ho_top + 1
+
+
+def push_new(off: uint64, len: uint64):
+    hnl_off[hn_top] = off
+    hnl_len[hn_top] = len
+    hn_top = hn_top + 1
+
+
+# Compare target line `ti` against a pooled OLD-side span at pool index `pi`.
+def old_eq_target(pi: uint64, ti: uint64) -> int32:
+    if hol_len[pi] != t_len[ti]:
+        return 0
+    a: uint64 = hol_off[pi]
+    b: uint64 = t_off[ti]
+    k: uint64 = 0
+    while k < hol_len[pi]:
+        if pbuf[a + k] != tbuf[b + k]:
+            return 0
+        k = k + 1
+    return 1
+
+
+# Does hunk h's OLD side match the target starting at line `p`?
+def hunk_matches(h: uint64, p: int64) -> int32:
+    cnt: uint64 = hk_ho_cnt[h]
+    if p < 0:
+        return 0
+    if cast[uint64](p) + cnt > nt:
+        return 0
+    base: uint64 = hk_ho_begin[h]
+    k: uint64 = 0
+    while k < cnt:
+        if old_eq_target(base + k, cast[uint64](p) + k) == 0:
+            return 0
+        k = k + 1
+    return 1
+
+
+# ---- unified / normal parsing ------------------------------------------
+# reverse != 0 swaps the old/new roles as each hunk is built.
+
+def build_unified_hunk(bstart: uint64, os: int64, oc: int64,
+                       ns: int64, nc: int64, reverse: int32):
+    # bstart = index into pl[] of the first body line.
+    # Collect ' '/'-' as old-order and ' '/'+' as new-order into the pools;
+    # for reverse we swap which pool each side lands in.
+    ho_begin: uint64 = ho_top
+    hn_begin: uint64 = hn_top
+    need_old: int64 = oc
+    need_new: int64 = nc
+    i: uint64 = bstart
+    while (need_old > 0 or need_new > 0) and i < npl:
+        L: uint64 = pl_len[i]
+        if L == 0:
+            break
+        tag: uint8 = pbuf[pl_off[i]]
+        coff: uint64 = pl_off[i] + 1
+        clen: uint64 = L - 1
+        if tag == 32:                       # ' ' context: both sides
+            if reverse == 0:
+                push_old(coff, clen)
+                push_new(coff, clen)
+            else:
+                push_new(coff, clen)
+                push_old(coff, clen)
+            need_old = need_old - 1
+            need_new = need_new - 1
+        elif tag == 45:                     # '-' old side
+            if reverse == 0:
+                push_old(coff, clen)
+            else:
+                push_new(coff, clen)
+            need_old = need_old - 1
+        elif tag == 43:                     # '+' new side
+            if reverse == 0:
+                push_new(coff, clen)
+            else:
+                push_old(coff, clen)
+            need_new = need_new - 1
+        elif tag == 92:                     # '\' "No newline" marker: skip
+            i = i + 1
+            continue
+        else:
+            break
+        i = i + 1
+
+    hk_ho_begin[nhunks] = ho_begin
+    hk_hn_begin[nhunks] = hn_begin
+    if reverse == 0:
+        hk_ho_cnt[nhunks] = ho_top - ho_begin
+        hk_hn_cnt[nhunks] = hn_top - hn_begin
+        if oc > 0:
+            hk_guess[nhunks] = os - 1
+        else:
+            hk_guess[nhunks] = os
+    else:
+        hk_ho_cnt[nhunks] = ho_top - ho_begin
+        hk_hn_cnt[nhunks] = hn_top - hn_begin
+        if nc > 0:
+            hk_guess[nhunks] = ns - 1
+        else:
+            hk_guess[nhunks] = ns
+    hk_found[nhunks] = -1
+    nhunks = nhunks + 1
+
+
+# Build a hunk from a NORMAL-diff command. lt_begin/lt_cnt describe the '<'
+# (old) body spans already pushed to a scratch pool; gt likewise for '>'.
+# We (re)push into the old/new pools honoring reverse.
+def build_normal_hunk(op: uint8, a1: int64, a2: int64, b1: int64, b2: int64,
+                      lt_off: Ptr[uint64], lt_len: Ptr[uint64], lt_cnt: uint64,
+                      gt_off: Ptr[uint64], gt_len: Ptr[uint64], gt_cnt: uint64,
+                      reverse: int32):
+    ho_begin: uint64 = ho_top
+    hn_begin: uint64 = hn_top
+    # Forward semantics: 'a' insert-after a1 (no old); 'd' delete a1..a2
+    # (old = '<'); 'c' replace a1..a2 with '>' (old = '<', new = '>').
+    # reverse swaps sides and uses the b-range for the guess.
+    guess: int64 = 0
+    old_from_lt: int32 = 0    # old side pulls from '<'  (else '>')
+    new_from_gt: int32 = 0    # new side pulls from '>'  (else '<')
+    old_empty: int32 = 0
+    new_empty: int32 = 0
+    if reverse == 0:
+        if op == 97:                    # 'a'
+            old_empty = 1
+            new_from_gt = 1
+            guess = a1
+        elif op == 100:                 # 'd'
+            old_from_lt = 1
+            new_empty = 1
+            guess = a1 - 1
+        else:                           # 'c'
+            old_from_lt = 1
+            new_from_gt = 1
+            guess = a1 - 1
+    else:
+        if op == 97:                    # reversed 'a' -> delete b1..b2
+            old_from_lt = 0             # old pulls from '>'
+            new_empty = 1
+            guess = b1 - 1
+        elif op == 100:                 # reversed 'd' -> insert '<' at b1
+            old_empty = 1
+            new_from_gt = 0            # new pulls from '<'
+            guess = b1
+        else:                           # reversed 'c'
+            old_from_lt = 0            # old pulls from '>'
+            new_from_gt = 0            # new pulls from '<'
+            guess = b1 - 1
+
+    # Populate old side.
+    if old_empty == 0:
+        if old_from_lt != 0:
+            k: uint64 = 0
+            while k < lt_cnt:
+                push_old(lt_off[k], lt_len[k])
+                k = k + 1
+        else:
+            k2: uint64 = 0
+            while k2 < gt_cnt:
+                push_old(gt_off[k2], gt_len[k2])
+                k2 = k2 + 1
+    # Populate new side.
+    if new_empty == 0:
+        if new_from_gt != 0:
+            k3: uint64 = 0
+            while k3 < gt_cnt:
+                push_new(gt_off[k3], gt_len[k3])
+                k3 = k3 + 1
+        else:
+            k4: uint64 = 0
+            while k4 < lt_cnt:
+                push_new(lt_off[k4], lt_len[k4])
+                k4 = k4 + 1
+
+    hk_ho_begin[nhunks] = ho_begin
+    hk_hn_begin[nhunks] = hn_begin
+    hk_ho_cnt[nhunks] = ho_top - ho_begin
+    hk_hn_cnt[nhunks] = hn_top - hn_begin
+    hk_guess[nhunks] = guess
+    hk_found[nhunks] = -1
+    nhunks = nhunks + 1
+
+
+# Scratch pools for a normal command's '<' and '>' bodies.
+lt_o: Array[4096, uint64]
+lt_l: Array[4096, uint64]
+gt_o: Array[4096, uint64]
+gt_l: Array[4096, uint64]
+
+
+# Parse the whole patch (pl[] already split) into hunks. Handles the FIRST
+# file section of a (possibly multi-file) patch. Returns 0 ok, 2 on trouble.
+def parse_patch(reverse: int32) -> int32:
+    i: uint64 = 0
+    seen_hunk: int32 = 0
+    while i < npl:
+        L: uint64 = pl_len[i]
+        off: uint64 = pl_off[i]
+        c0: uint8 = 0
+        if L > 0:
+            c0 = pbuf[off]
+        # A second file header after we already have hunks -> stop.
+        if L >= 4 and starts_with(cast[Ptr[uint8]](cast[uint64](&pbuf[0]) + off), "--- ") != 0:
+            if seen_hunk != 0:
+                return 0
+            i = i + 1
+            continue
+        if L >= 4 and starts_with(cast[Ptr[uint8]](cast[uint64](&pbuf[0]) + off), "+++ ") != 0:
+            i = i + 1
+            continue
+        if L >= 2 and c0 == 64 and pbuf[off + 1] == 64:      # "@@"
+            # Parse "@@ -l[,c] +l[,c] @@".
+            j: uint64 = off
+            end: uint64 = off + L
+            while j < end and pbuf[j] != 45:                 # to '-'
+                j = j + 1
+            j = j + 1
+            scan_dec(j, end)
+            os: int64 = gnum
+            j = gpos
+            oc: int64 = 1
+            if j < end and pbuf[j] == 44:                    # ','
+                scan_dec(j + 1, end)
+                oc = gnum
+                j = gpos
+            while j < end and pbuf[j] != 43:                 # to '+'
+                j = j + 1
+            j = j + 1
+            scan_dec(j, end)
+            ns: int64 = gnum
+            j = gpos
+            nc: int64 = 1
+            if j < end and pbuf[j] == 44:
+                scan_dec(j + 1, end)
+                nc = gnum
+                j = gpos
+            build_unified_hunk(i + 1, os, oc, ns, nc, reverse)
+            seen_hunk = 1
+            # Advance past the body we consumed.
+            need: int64 = oc + nc
+            i = i + 1
+            while need > 0 and i < npl:
+                bl: uint64 = pl_len[i]
+                if bl == 0:
+                    break
+                bt: uint8 = pbuf[pl_off[i]]
+                if bt == 32:
+                    need = need - 2
+                elif bt == 45 or bt == 43:
+                    need = need - 1
+                elif bt == 92:
+                    i = i + 1
+                    continue
+                else:
+                    break
+                i = i + 1
+            continue
+        # Normal-diff command: starts with a digit.
+        if L > 0 and c0 >= 48 and c0 <= 57:
+            end2: uint64 = off + L
+            scan_dec(off, end2)
+            a1: int64 = gnum
+            j2: uint64 = gpos
+            a2: int64 = a1
+            if j2 < end2 and pbuf[j2] == 44:
+                scan_dec(j2 + 1, end2)
+                a2 = gnum
+                j2 = gpos
+            if j2 >= end2:
+                i = i + 1
+                continue
+            op: uint8 = pbuf[j2]
+            j2 = j2 + 1
+            b1: int64 = 0
+            b2: int64 = 0
+            if j2 < end2 and pbuf[j2] >= 48 and pbuf[j2] <= 57:
+                scan_dec(j2, end2)
+                b1 = gnum
+                b2 = b1
+                j2 = gpos
+                if j2 < end2 and pbuf[j2] == 44:
+                    scan_dec(j2 + 1, end2)
+                    b2 = gnum
+                    j2 = gpos
+            # Gather '<' / '>' body lines.
+            lc: uint64 = 0
+            gc: uint64 = 0
+            i = i + 1
+            while i < npl:
+                bl2: uint64 = pl_len[i]
+                if bl2 < 1:
+                    break
+                bt2: uint8 = pbuf[pl_off[i]]
+                if bt2 == 60:                                # '<'
+                    lt_o[lc] = pl_off[i] + 2
+                    lt_l[lc] = bl2 - 2
+                    lc = lc + 1
+                elif bt2 == 62:                              # '>'
+                    gt_o[gc] = pl_off[i] + 2
+                    gt_l[gc] = bl2 - 2
+                    gc = gc + 1
+                elif bt2 == 45 and bl2 == 3:                 # '---' separator
+                    i = i + 1
+                    continue
+                else:
+                    break
+                i = i + 1
+            build_normal_hunk(op, a1, a2, b1, b2,
+                              &lt_o[0], &lt_l[0], lc,
+                              &gt_o[0], &gt_l[0], gc, reverse)
+            seen_hunk = 1
+            continue
+        i = i + 1
+    return 0
+
+
+# ---- apply --------------------------------------------------------------
+
+# Locate every hunk (offset search). Returns count of FAILED hunks; sets
+# hk_found[h] to the matched target line (or -1). Reports to stderr.
+def locate_hunks() -> uint64:
+    failed: uint64 = 0
+    run_off: int64 = 0
+    cursor: int64 = 0
+    h: uint64 = 0
+    while h < nhunks:
+        g0: int64 = hk_guess[h]
+        guess: int64 = g0 + run_off
+        oldn: uint64 = hk_ho_cnt[h]
+        found: int64 = -1
+        if oldn == 0:
+            # Pure insertion: clamp the guess into range; nothing to match.
+            p: int64 = guess
+            if p < cursor:
+                p = cursor
+            if p > cast[int64](nt):
+                p = cast[int64](nt)
+            found = p
+        else:
+            dist: int64 = 0
+            maxoff: int64 = cast[int64](nt) + 1
+            while dist <= maxoff and found < 0:
+                cand: int64 = guess + dist
+                if cand >= cursor and hunk_matches(h, cand) != 0:
+                    found = cand
+                elif dist > 0:
+                    cand = guess - dist
+                    if cand >= cursor and hunk_matches(h, cand) != 0:
+                        found = cand
+                dist = dist + 1
+        hk_found[h] = found
+        write_str(2, "Hunk #")
+        emit_dec(2, cast[int64](h + 1))
+        if found < 0:
+            write_str(2, " FAILED\n")
+            failed = failed + 1
+        else:
+            write_str(2, " succeeded at ")
+            emit_dec(2, found + 1)
+            d: int64 = found - guess
+            if d != 0:
+                write_str(2, " (offset ")
+                emit_dec(2, d)
+                write_str(2, " lines)")
+            write_str(2, "\n")
+            run_off = found - g0
+            cursor = found + cast[int64](oldn)
+        h = h + 1
+    return failed
+
+
+# Build obuf from the target + located hunks.
+def build_output():
+    ob_len = 0
+    cursor: uint64 = 0
+    h: uint64 = 0
+    while h < nhunks:
+        p: int64 = hk_found[h]
+        pu: uint64 = cast[uint64](p)
+        # Copy unchanged target lines [cursor, p).
+        while cursor < pu:
+            append_line(&tbuf[0], t_off[cursor], t_len[cursor])
+            cursor = cursor + 1
+        # Emit the new side.
+        base: uint64 = hk_hn_begin[h]
+        cnt: uint64 = hk_hn_cnt[h]
+        k: uint64 = 0
+        while k < cnt:
+            append_line(&pbuf[0], hnl_off[base + k], hnl_len[base + k])
+            k = k + 1
+        cursor = pu + hk_ho_cnt[h]
+        h = h + 1
+    while cursor < nt:
+        append_line(&tbuf[0], t_off[cursor], t_len[cursor])
+        cursor = cursor + 1
+    # Preserve the target's trailing-newline state.
+    if t_final_nl == 0 and ob_len > 0 and obuf[ob_len - 1] == 10:
+        ob_len = ob_len - 1
+
+
+def write_out(path: Ptr[char]) -> int32:
+    fd: int32 = sys_open_write(path)
+    if fd < 0:
+        write_str(2, "patch: cannot write ")
+        write_str(2, cast[Ptr[uint8]](path))
+        write_str(2, "\n")
+        return 2
+    wrote: uint64 = 0
+    while wrote < ob_len:
+        n: int64 = sys_write(fd, cast[Ptr[uint8]](cast[uint64](&obuf[0]) + wrote),
+                            ob_len - wrote)
+        if n <= 0:
+            break
+        wrote = wrote + cast[uint64](n)
+    sys_close(fd)
+    return 0
+
+
+def write_backup(path: Ptr[char]):
+    # path.orig — append ".orig" onto a bounded copy of the path.
+    nm: Array[512, uint8]
+    i: uint64 = 0
+    p: Ptr[uint8] = cast[Ptr[uint8]](path)
+    while p[i] != 0 and i < 500:
+        nm[i] = p[i]
+        i = i + 1
+    nm[i] = 46      # '.'
+    nm[i + 1] = 111 # 'o'
+    nm[i + 2] = 114 # 'r'
+    nm[i + 3] = 105 # 'i'
+    nm[i + 4] = 103 # 'g'
+    nm[i + 5] = 0
+    fd: int32 = sys_open_write(cast[Ptr[char]](&nm[0]))
+    if fd < 0:
+        return
+    wrote: uint64 = 0
+    while wrote < tn:
+        n: int64 = sys_write(fd, cast[Ptr[uint8]](cast[uint64](&tbuf[0]) + wrote),
+                            tn - wrote)
+        if n <= 0:
+            break
+        wrote = wrote + cast[uint64](n)
+    sys_close(fd)
+
+
+# Strip N leading '/'-delimited components from a header filename span,
+# stopping the name at the first tab. Copies the result into `dst` (NUL
+# terminated). Returns 1 on success.
+def strip_path(src: Ptr[uint8], off: uint64, len: uint64, strip: int64,
+               dst: Ptr[uint8]) -> int32:
+    # Determine the name end (first tab or end).
+    e: uint64 = 0
+    while e < len and src[off + e] != 9:
+        e = e + 1
+    # Skip `strip` leading components.
+    s: uint64 = 0
+    done: int64 = 0
+    while done < strip and s < e:
+        if src[off + s] == 47:                # '/'
+            done = done + 1
+        s = s + 1
+    if s >= e:
+        return 0
+    k: uint64 = 0
+    while s < e and k < 500:
+        dst[k] = src[off + s]
+        s = s + 1
+        k = k + 1
+    dst[k] = 0
+    return 1
+
+
+# Find the target-file name in the patch header. Prefers the "--- " line for
+# a forward patch, the "+++ " line for a reverse patch. Returns 1 on success.
+def header_target(reverse: int32, strip: int64, dst: Ptr[uint8]) -> int32:
+    want: Ptr[uint8] = "--- "
+    if reverse != 0:
+        want = "+++ "
+    i: uint64 = 0
+    while i < npl:
+        off: uint64 = pl_off[i]
+        L: uint64 = pl_len[i]
+        if L >= 4 and starts_with(cast[Ptr[uint8]](cast[uint64](&pbuf[0]) + off), want) != 0:
+            return strip_path(&pbuf[0], off + 4, L - 4, strip, dst)
+        i = i + 1
+    return 0
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    strip: int64 = 0
+    reverse: int32 = 0
+    dry: int32 = 0
+    backup: int32 = 0
+    patchfile: uint64 = 0          # 0 => stdin
+    outfile: uint64 = 0            # 0 => in place
+    target: uint64 = 0
+    second_pos: uint64 = 0
+
+    ai: int32 = 1
+    while ai < argc:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](ai)])
+        if streq(a, "-R") != 0 or streq(a, "--reverse") != 0:
+            reverse = 1
+        elif streq(a, "--dry-run") != 0:
+            dry = 1
+        elif streq(a, "-b") != 0 or streq(a, "--backup") != 0:
+            backup = 1
+        elif streq(a, "-i") != 0:
+            ai = ai + 1
+            if ai < argc:
+                patchfile = argv[cast[uint64](ai)]
+        elif starts_with(a, "--input=") != 0:
+            patchfile = cast[uint64](cast[Ptr[uint8]](cast[uint64](a) + 8))
+        elif streq(a, "-o") != 0:
+            ai = ai + 1
+            if ai < argc:
+                outfile = argv[cast[uint64](ai)]
+        elif starts_with(a, "--output=") != 0:
+            outfile = cast[uint64](cast[Ptr[uint8]](cast[uint64](a) + 9))
+        elif streq(a, "-p") != 0:
+            ai = ai + 1
+            if ai < argc:
+                strip = atoi_u8(cast[Ptr[uint8]](argv[cast[uint64](ai)]))
+        elif starts_with(a, "-p") != 0:
+            strip = atoi_u8(cast[Ptr[uint8]](cast[uint64](a) + 2))
+        elif starts_with(a, "--strip=") != 0:
+            strip = atoi_u8(cast[Ptr[uint8]](cast[uint64](a) + 8))
+        elif streq(a, "--strip") != 0:
+            ai = ai + 1
+            if ai < argc:
+                strip = atoi_u8(cast[Ptr[uint8]](argv[cast[uint64](ai)]))
+        elif a[0] == 45 and a[1] != 0:
+            write_str(2, "patch: unknown flag: ")
+            write_str(2, a)
+            write_str(2, "\n")
+            return 2
+        else:
+            if target == 0:
+                target = argv[cast[uint64](ai)]
+            elif second_pos == 0:
+                second_pos = argv[cast[uint64](ai)]
+        ai = ai + 1
+
+    # Second positional is the patch file unless -i already set one.
+    if patchfile == 0 and second_pos != 0:
+        patchfile = second_pos
+
+    # Load the patch text.
+    if patchfile != 0:
+        pr: int64 = load_file(&pbuf[0], cast[Ptr[char]](patchfile))
+        if pr < 0:
+            write_str(2, "patch: cannot open patch file\n")
+            return 2
+        pn = cast[uint64](pr)
+    else:
+        pn = cast[uint64](read_fd(0, &pbuf[0]))
+
+    npl = split_lines(&pbuf[0], pn, &pl_off[0], &pl_len[0], MAXP)
+
+    # Resolve the target path (positional wins, else the header + -pN).
+    tgt_buf: Array[512, uint8]
+    tgt_ptr: uint64 = target
+    if tgt_ptr == 0:
+        if header_target(reverse, strip, &tgt_buf[0]) == 0:
+            write_str(2, "patch: cannot determine target file\n")
+            return 2
+        tgt_ptr = cast[uint64](&tgt_buf[0])
+
+    # Load the target.
+    tr: int64 = load_file(&tbuf[0], cast[Ptr[char]](tgt_ptr))
+    if tr < 0:
+        write_str(2, "patch: cannot open ")
+        write_str(2, cast[Ptr[uint8]](tgt_ptr))
+        write_str(2, "\n")
+        return 2
+    tn = cast[uint64](tr)
+    t_final_nl = 1
+    if tn == 0 or tbuf[tn - 1] != 10:
+        t_final_nl = 0
+    nt = split_lines(&tbuf[0], tn, &t_off[0], &t_len[0], MAXLINES)
+
+    # Parse + locate + apply.
+    parse_patch(reverse)
+    failed: uint64 = locate_hunks()
+
+    if failed != 0:
+        write_str(2, "patch: ")
+        emit_dec(2, cast[int64](failed))
+        write_str(2, " hunk(s) FAILED -- file left unchanged\n")
+        return 1
+
+    if dry != 0:
+        write_str(2, "patch: dry run -- all hunks would apply cleanly\n")
+        return 0
+
+    build_output()
+
+    dst: uint64 = tgt_ptr
+    if outfile != 0:
+        dst = outfile
+    elif backup != 0:
+        write_backup(cast[Ptr[char]](tgt_ptr))
+
+    return write_out(cast[Ptr[char]](dst))

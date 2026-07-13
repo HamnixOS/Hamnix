@@ -127,6 +127,7 @@ build_adder_user date                 # /proc/realtime — RTC + TSC delta
 build_adder_user more                 # M16.67: 24-line pager over stdin
 build_adder_user find                 # M16.67: recursive listdir walk
 build_adder_user diff                 # LCS line diff: normal + unified (-u) output
+build_adder_user patch                # apply unified/normal diffs (-pN/-R/--dry-run/-i/-o/-b); GNU-interoperable
 build_adder_user motd  # M16.68: print /etc/motd
 build_adder_user df                   # M16.70: dump /proc/mounts
 build_adder_user du                   # M16.70: entry-count under path
