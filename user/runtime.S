@@ -298,6 +298,23 @@ sys_listdir_records:
     ret
     .size sys_listdir_records, .-sys_listdir_records
 
+    /* --- sys_stat_p9(path, buf, nbuf) -> int64 ----------------------
+     * Phase C / M16.101: 9P stat record by path. Kernel resolves `path`,
+     * writes ONE Dir wire-format record into `buf` (capped at `nbuf`),
+     * and returns bytes written (> 0) or -1 with an errstr. The Dir
+     * record's qid_type byte carries QTDIR for a directory / QTFILE for a
+     * plain file (see lib/p9dir.ad), so a caller can classify a path
+     * without the p9_listdir open+read heuristic (which a REGULAR file
+     * also satisfies, mis-reporting it as a directory).
+     */
+    .globl sys_stat_p9
+    .type sys_stat_p9, @function
+sys_stat_p9:
+    movq    $261, %rax              /* SYS_STAT_P9 */
+    syscall
+    ret
+    .size sys_stat_p9, .-sys_stat_p9
+
 
     /* --- sys_chan_dir_mode(fd, mode, path) -> int32 ------------------
      * #458 F10-6 followup: flip a directory fd's Chan into Dir-record
