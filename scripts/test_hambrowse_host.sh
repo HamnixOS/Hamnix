@@ -1006,6 +1006,53 @@ fi
 assert_grepC '^JSLOG real script executed$' "the real (uncommented) <script> still executed"
 assert_grepC '^TITLE Comments Fixture$'      "document.title kept (commented script did not overwrite it)"
 
+# ====================================================================
+# CSS POSITION fixture — position:relative (in-flow, offset) + position:
+# absolute (out of flow, placed against the nearest positioned ancestor).
+# A `.card { position:relative }` box holds two absolutely-positioned badges:
+# `.tl { top:0; left:0 }` pins to the card's top-LEFT, `.tr { top:0; right:0 }`
+# pins to its top-RIGHT. Being out of flow they OVERLAY the card body (same row)
+# instead of stacking below it, and the card stays compact. A relatively-
+# positioned paragraph is shifted right+down from its in-flow spot.
+# ====================================================================
+FIXP="tests/fixtures/hambrowse_position.html"
+DUMPP="$OUT/dump_position.txt"
+echo "[hb-host] running host harness on $FIXP ..."
+if ! "$BIN" "$FIXP" 600 >"$DUMPP" 2>&1; then
+    echo "[hb-host] FAIL: position harness exited non-zero"; cat "$DUMPP"; exit 1
+fi
+cat "$DUMPP"
+
+assert_grepP() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMPP"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# The card body text sits at the card's content origin (row 3, x=16).
+assert_grepP '^SEG 3 16 #101010 b0 u0 l-1 bg- \|Card body text line one here\.\|' \
+    "position: card body text at the card content origin (row 3, x=16)"
+# ABSOLUTE top-left: the .tl badge lands at the card's top-LEFT (x=16) and,
+# being out of flow, shares the card body's row (row 3) instead of pushing it
+# down. Same x as the body text proves left:0 maps to the containing-block left.
+assert_grepP '^SEG 3 16 #ffffff b0 u0 l-1 bg#ff0000 \|TL\|' \
+    "position:absolute top:0 left:0 -> card top-left, out of flow (row 3, x=16)"
+# ABSOLUTE top-right: the .tr badge is pinned to the card's RIGHT edge (x=320,
+# = 336 right edge - 2-char badge width) on the SAME top row.
+assert_grepP '^SEG 3 320 #ffffff b0 u0 l-1 bg#00aa00 \|TR\|' \
+    "position:absolute top:0 right:0 -> card top-right, right-anchored (row 3, x=320)"
+# Out of flow means the card stays COMPACT (bottom border at row 5), so the
+# trailing plain paragraph is at row 9 — NOT shoved far down by in-flow badges.
+assert_grepP '^SEG 9 8 #101010 b0 u0 l-1 bg- \|Plain trailing paragraph\.\|' \
+    "position: absolute badges are out of flow (card compact, trailing para at row 9)"
+# RELATIVE offset: the nudged paragraph is shifted right by left:48px (x 8->56)
+# and down by top:16px (one row) from its normal-flow position.
+assert_grepP '^SEG 8 56 #0000ff b0 u0 l-1 bg- \|Nudged para here\.\|' \
+    "position:relative left:48 top:16 -> shifted right (x=56) and down (row 8)"
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
     exit 0
