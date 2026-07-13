@@ -855,6 +855,56 @@ assert_grepENT 'FLOW  MISC – … · € ½' "&ndash;/&hellip;/&middot;/&euro;/
 # its monospace box (proves entities are decoded in attribute values too).
 assert_grepENT_re '^FLOW  \[a&b_+\]$' "entities decode inside attribute values (input value a&amp;b -> a&b)"
 
+# ====================================================================
+# FLEXBOX — display:flex lays a container's DIRECT-CHILD block boxes out
+# HORIZONTALLY as equal-width columns (the real-page pattern the old block
+# model got wrong: an article body beside its infobox, a card/nav row). Each
+# child column shares the container's top row; the flow resumes full-width
+# below the tallest column. At 600px the body content column is 8..592 (584px
+# wide): 2 cols -> width (584-8)/2=288, col1 at x=8+(288+8)=304; 3 cols ->
+# width (584-16)/3=189, col1 at x=205, col2 at x=402.
+# ====================================================================
+FIXFLX="tests/fixtures/hambrowse_flex.html"
+DUMPFLX="$OUT/dump_flex.txt"
+echo "[hb-host] running host harness on $FIXFLX ..."
+if ! "$BIN" "$FIXFLX" 600 >"$DUMPFLX" 2>&1; then
+    echo "[hb-host] FAIL: flex harness exited non-zero"; cat "$DUMPFLX"; exit 1
+fi
+cat "$DUMPFLX"
+
+assert_grepFLX() {
+    local pat="$1" msg="$2"
+    if grep -Eq -- "$pat" "$DUMPFLX"; then
+        echo "[hb-host] PASS $msg"
+    else
+        echo "[hb-host] FAIL $msg (missing: $pat)"; fail=1
+    fi
+}
+
+# Two flex columns sit on the SAME top row (row 0): the first at the body
+# margin x=8, the second pinned one column over at x=304 — side by side, NOT
+# stacked. The second column keeps its background-color.
+assert_grepFLX '^SEG 0 8 #101010 b0 u0 l-1 bg- \|Left alpha one\|' \
+    "flex: first column at the body margin x=8 on row 0"
+assert_grepFLX '^SEG 0 304 #101010 b0 u0 l-1 bg#eef0f3 \|Right beta\|' \
+    "flex: second column laid HORIZONTALLY beside the first (x=304, same row 0)"
+# The first (taller) column's second line flows DOWN inside its own column
+# (still x=8), proving columns have independent vertical flow.
+assert_grepFLX '^SEG 2 8 #101010 b0 u0 l-1 bg- \|Left alpha two\|' \
+    "flex: first column's second line flows down within its column (x=8, row 2)"
+# After the flex row, normal flow resumes FULL-WIDTH at the body margin, BELOW
+# the tallest column (row 5, past the 2-line left column) — not overlapping.
+assert_grepFLX '^SEG 5 8 #101010 b0 u0 l-1 bg- \|After the flex row here\|' \
+    "flex: flow resumes full-width below the tallest column (row 5, x=8)"
+# A THREE-column flex row places all three children on one row at evenly
+# stepped x-positions (x=8 / 205 / 402) — equal-width column division.
+assert_grepFLX '^SEG 7 8 #101010 b0 u0 l-1 bg- \|Col A\|'   "flex: 3-col row, column 0 at x=8"
+assert_grepFLX '^SEG 7 205 #101010 b0 u0 l-1 bg- \|Col B\|' "flex: 3-col row, column 1 at x=205 (equal share)"
+assert_grepFLX '^SEG 7 402 #101010 b0 u0 l-1 bg- \|Col C\|' "flex: 3-col row, column 2 at x=402 (equal share)"
+# The tail paragraph pops back to the body margin after the 3-col row.
+assert_grepFLX '^SEG 10 8 #101010 b0 u0 l-1 bg- \|Tail line\|' \
+    "flex: tail paragraph back at the body margin x=8 after the flex row closes"
+
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
     exit 0
