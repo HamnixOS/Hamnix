@@ -281,15 +281,11 @@ hamsh_send_await 'echo GATE_N6' 'GATE_N6' "$CMD_WAIT" || true
 # N7. `except NAME as e:` FILTER — a matching type is caught + bound; a
 # NON-matching one re-propagates to the outer handler (WRONGCATCH must NOT
 # leak). "ValueError: bad" matches `except ValueError` by the "NAME:" prefix.
+# The MISS case is an ABSENCE test (WRONGCATCH must not run) so it stays a
+# SINGLE physical line — a typed echo on a `> ` continuation line is NOT
+# filtered by hamsh_ran (see the header note) and would false-red.
 hamsh_send_await 'try { raise "ValueError: bad" } except ValueError as e { echo FILT_$e }' 'FILT_ValueError: bad' "$CMD_WAIT" || true
-hamsh_send 'try:'
-hamsh_send '    try:'
-hamsh_send '        raise "TypeError: nope"'
-hamsh_send '    except ValueError as e:'
-hamsh_send '        echo WRONGCATCH'
-hamsh_send 'except as e2:'
-hamsh_send '    echo OUTERCATCH_$e2'
-hamsh_send ''
+hamsh_send_await 'try { try { raise "TypeError: nope" } except ValueError as e { echo WRONGCATCH } } except as e2 { echo OUTERCATCH_$e2 }' 'OUTERCATCH_TypeError: nope' "$CMD_WAIT" || true
 hamsh_send_await 'echo GATE_N7' 'GATE_N7' "$CMD_WAIT" || true
 # N8. `else` runs ONLY on the no-exception path (ELSE_RAN + FIN_E8 both
 # appear); on the exception path the else body is skipped (ELSE_NO absent).

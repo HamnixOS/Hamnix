@@ -80,15 +80,20 @@ hamsh_send_await 'try { raise "x" } except { echo E4_CAUGHT } finally { echo E4_
 # E5_FIN prints, then the raise propagates to an uncaught-exception report.
 hamsh_send_await 'try { raise "prop" } finally { echo E5_FIN }' 'E5_FIN' "$CMD_WAIT" || true
 # --- 6. typed filter: match catches + binds; non-match re-propagates -
+# 6a. MATCH, brace form (presence).
 hamsh_send_await 'try { raise "ValueError: bad" } except ValueError as e { echo E6_$e }' 'E6_ValueError: bad' "$CMD_WAIT" || true
+# 6b. MATCH, indent form (presence — the both-syntaxes coverage).
 hamsh_send 'try:'
-hamsh_send '    try:'
-hamsh_send '        raise "TypeError: nope"'
-hamsh_send '    except ValueError as e:'
-hamsh_send '        echo E6_WRONG'
-hamsh_send 'except as e2:'
-hamsh_send '    echo E6_OUTER_$e2'
+hamsh_send '    raise "KeyError: k"'
+hamsh_send 'except KeyError as e:'
+hamsh_send '    echo E6I_$e'
 hamsh_send ''
+hamsh_send_await 'echo GATE_E6I' 'GATE_E6I' "$CMD_WAIT" || true
+# 6c. MISS re-propagates to the outer handler. This is an ABSENCE test
+# (E6_WRONG must NOT run), so it MUST be a single physical line — a typed
+# echo on a `> ` continuation line is NOT filtered by hamsh_ran and would
+# false-red. Inline nested brace form keeps the echo on the `hamsh$ ` prompt.
+hamsh_send_await 'try { try { raise "TypeError: nope" } except ValueError as e { echo E6_WRONG } } except as e2 { echo E6_OUTER_$e2 }' 'E6_OUTER_TypeError: nope' "$CMD_WAIT" || true
 hamsh_send_await 'echo GATE_E6' 'GATE_E6' "$CMD_WAIT" || true
 # --- 7. `else` runs only when nothing raised ------------------------
 hamsh_send_await 'try { echo E7_TRY } else { echo E7_ELSE } finally { echo E7_FIN }' 'E7_FIN' "$CMD_WAIT" || true
@@ -166,7 +171,8 @@ _want 'E3_FIN' 'finally runs on the normal path'
 _want 'E4_CAUGHT' 'finally caught path: except body ran'
 _want 'E4_FIN' 'finally runs on the caught path'
 _want 'E5_FIN' 'finally runs on the uncaught-propagating path'
-_want 'E6_ValueError: bad' 'typed `except NAME as e` matches + binds'
+_want 'E6_ValueError: bad' 'typed `except NAME as e` matches + binds (brace)'
+_want 'E6I_KeyError: k' 'typed `except NAME as e` matches + binds (indent)'
 _want 'E6_OUTER_TypeError: nope' 'filter miss re-propagates to the outer handler'
 _absent 'E6_WRONG' 'a non-matching filter does not catch'
 _want 'E7_TRY' 'else path: try body ran'
