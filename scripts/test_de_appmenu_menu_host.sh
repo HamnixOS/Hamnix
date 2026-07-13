@@ -34,11 +34,12 @@ fi
 echo "[appmenu-host] PASS host harness compiled -> $BIN"
 
 DUMP="$OUT/appmenu_dump.txt"
-if ! "$BIN" "$OUT/appmenu_full.ppm" "$OUT/appmenu_filtered.ppm" >"$DUMP" 2>&1; then
+if ! "$BIN" "$OUT/appmenu_full.ppm" "$OUT/appmenu_filtered.ppm" \
+        "$OUT/appmenu_flyout.ppm" >"$DUMP" 2>&1; then
     echo "[appmenu-host] FAIL: host harness exited non-zero"; cat "$DUMP"; exit 1
 fi
 
-for f in full filtered; do
+for f in full filtered flyout; do
     if python3 scripts/ppm_to_png.py "$OUT/appmenu_$f.ppm" "$OUT/appmenu_$f.png" \
             2>"$OUT/appmenu_png.log"; then
         echo "[appmenu-host] PASS rendered $OUT/appmenu_$f.png ($(file -b "$OUT/appmenu_$f.png" 2>/dev/null))"
@@ -60,30 +61,34 @@ assert_grep() {
 assert_grep '^# scene v1 hamui'                    "scene header emitted"
 assert_grep 'glyphs [0-9]+ [0-9]+ \"Search\.\.\.\"' "search box renders (placeholder) in FULL menu"
 
-# --- FULL menu: category grouping (each app under its header) --------------
+# --- FULL menu: Recent stays INLINE; categories are PARENT BUTTONS ----------
+# The USER design correction: each category is now a hover fly-out BUTTON
+# (like the panel's "Linux apps ▸"), NOT an inline header with its apps listed
+# underneath. The EXCEPTION is Recent, which stays inline exactly as before.
 assert_grep '^ROW FULL 0 SEARCH'                   "row 0 is the SEARCH box"
-assert_grep '^ROW FULL 1 HEADER-RECENT Recent'     "Recent section header present"
-assert_grep '^ROW FULL 2 APP Calculator  \[Recent\]'   "Recent lists the last-launched Calculator first"
-assert_grep '^ROW FULL 3 APP Web Browser  \[Recent\]'  "Recent also lists the earlier-launched Web Browser"
-assert_grep '^ROW FULL 4 HEADER Accessories'       "Accessories header"
-assert_grep '^ROW FULL 5 APP Calculator  \[Accessories\]'  "Calculator grouped under Accessories"
-assert_grep '^ROW FULL 6 APP Text Editor  \[Accessories\]' "Text Editor grouped under Accessories"
-assert_grep '^ROW FULL 7 HEADER Graphics'          "Graphics header"
-assert_grep '^ROW FULL 8 APP Image Viewer  \[Graphics\]'   "Image Viewer grouped under Graphics"
-assert_grep '^ROW FULL 9 APP Camera  \[Graphics\]'         "Camera grouped under Graphics"
-assert_grep '^ROW FULL 1[0-9] HEADER Internet'     "Internet header"
-assert_grep '^ROW FULL 1[0-9] APP Web Browser  \[Internet\]' "Web Browser grouped under Internet"
-assert_grep '^ROW FULL 1[0-9] HEADER Office'       "Office header"
-assert_grep '^ROW FULL 1[0-9] APP Word Processor  \[Office\]' "Word Processor grouped under Office"
-assert_grep '^ROW FULL 1[0-9] HEADER Games'        "Games header"
-assert_grep '^ROW FULL 1[0-9] APP 2048  \[Games\]' "2048 grouped under Games"
-assert_grep '^ROW FULL 1[0-9] HEADER System'       "System header"
-assert_grep '^ROW FULL 1[0-9] APP System Monitor  \[System\]' "System Monitor grouped under System"
-assert_grep '^ROW FULL 19 HEADER Settings'         "Settings header"
-assert_grep '^ROW FULL 20 APP Control Center  \[Settings\]' "Control Center grouped under Settings"
+assert_grep '^ROW FULL 1 HEADER-RECENT Recent'     "Recent section header present (still INLINE)"
+assert_grep '^ROW FULL 2 APP Calculator  \[Recent\]'   "Recent lists the last-launched Calculator INLINE"
+assert_grep '^ROW FULL 3 APP Web Browser  \[Recent\]'  "Recent also lists the earlier-launched Web Browser INLINE"
+# Categories: each is a single CATBTN PARENT row, in MATE order, with NO
+# inline app rows following it.
+assert_grep '^ROW FULL 4 CATBTN Accessories'       "Accessories is a parent BUTTON (not an inline header)"
+assert_grep '^ROW FULL 5 CATBTN Graphics'          "Graphics is a parent BUTTON"
+assert_grep '^ROW FULL 6 CATBTN Internet'          "Internet is a parent BUTTON"
+assert_grep '^ROW FULL 7 CATBTN Office'            "Office is a parent BUTTON"
+assert_grep '^ROW FULL 8 CATBTN Games'             "Games is a parent BUTTON"
+assert_grep '^ROW FULL 9 CATBTN System'            "System is a parent BUTTON"
+assert_grep '^ROW FULL 10 CATBTN Settings'         "Settings is a parent BUTTON"
+# CRITICAL: no category app is listed INLINE in the FULL menu (they all live
+# behind the hover fly-outs). Only Recent apps may appear as APP rows.
+if grep -Eq '^ROW FULL [0-9]+ APP .*\[(Accessories|Graphics|Internet|Office|Games|System|Settings|Other)\]' "$DUMP"; then
+    echo "[appmenu-host] FAIL a category app leaked INLINE (should be behind a fly-out)"; fail=1
+else
+    echo "[appmenu-host] PASS category apps are behind fly-outs, not inline"
+fi
 
-# The MODEL summary reflects 10 apps + 2 recent.
-assert_grep '^MODEL FULL rows=21 apps=10 recent=2' "FULL model: 21 rows, 10 apps, 2 recent"
+# The MODEL summary: 4 non-category rows (search + recent hdr + 2 recent) + 7
+# category buttons = 11 rows; 10 apps; 2 recent.
+assert_grep '^MODEL FULL rows=11 apps=10 recent=2' "FULL model: 11 rows (7 category buttons), 10 apps, 2 recent"
 
 # --- FILTERED menu: typing "ca" live-narrows to Calculator + Camera -------
 assert_grep '^MODEL FILTERED rows=5 apps=10 recent=2' "FILTERED collapses to 5 rows"
@@ -99,6 +104,19 @@ else
     echo "[appmenu-host] PASS filter dropped every non-matching section"
 fi
 assert_grep 'glyphs [0-9]+ [0-9]+ \"ca\"'          "filtered menu draws the live search text 'ca'"
+
+# --- FLY-OUT: hovering the "Graphics" category opens its child submenu -----
+# Mirrors the panel's "Linux apps ▸" hover fly-out: a CHILD box, aligned to
+# the parent CATBTN row, listing that category's apps; a click in it launches.
+assert_grep '^FLYOUT cat=1 apps=2 box='            "Graphics fly-out is open with 2 apps and a box geometry"
+# The box top (y=116) aligns to the Graphics parent row (BY=16 + row5*20=100).
+assert_grep '^FLYOUT cat=1 apps=2 box=227,116,200,40' "fly-out box aligned to the Graphics parent row, opened to the RIGHT"
+assert_grep '^CHILD 0 APP Image Viewer'            "fly-out lists Image Viewer"
+assert_grep '^CHILD 1 APP Camera'                  "fly-out lists Camera"
+# Hit-test: a point in the fly-out's 2nd row maps to the right APP index (4 ==
+# Camera) so a click launches it; a point outside the box misses.
+assert_grep '^CHILDHIT row1 app=4 name=Camera'     "fly-out hit-test maps a point to the correct app index -> launch"
+assert_grep '^CHILDHIT miss -1'                    "fly-out hit-test misses a point outside the box"
 
 # --- hit-test + row-kind sanity -------------------------------------------
 assert_grep '^HIT search 0'                        "hit-test: pointer on the search box -> row 0"
