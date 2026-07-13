@@ -66,8 +66,11 @@ def parse_dump(text):
     fills = []     # (top, bot, lx, rx, color) — element background boxes
     rules = {}     # row -> type
     title = None
+    page_bg = None  # <body>/<html> page-level background (whole viewport)
     for line in text.splitlines():
-        if line.startswith("LAYOUT "):
+        if line.startswith("PAGEBG "):
+            page_bg = line.split()[1]
+        elif line.startswith("LAYOUT "):
             for tok in line.split():
                 if tok.startswith("width="):
                     width = int(tok[6:])
@@ -93,12 +96,12 @@ def parse_dump(text):
             bg = None if bgtok == "-" else bgtok
             text = rest[:-1] if rest.endswith("|") else rest
             segs.append((row, x, color, bold, uline, link, bg, text))
-    return width, segs, rules, title, fills
+    return width, segs, rules, title, fills, page_bg
 
 
 def render(text, out_path, url="about:demo", win_title="Browser",
            status="demo page", max_rows=None):
-    width, segs, rules, ptitle, fills = parse_dump(text)
+    width, segs, rules, ptitle, fills, page_bg = parse_dump(text)
     total_rows = (max(([r for (r, *_ ) in segs] + list(rules.keys())),
                       default=0) + 1)
     if max_rows:
@@ -122,8 +125,8 @@ def render(text, out_path, url="about:demo", win_title="Browser",
             d.text((cx, y * S), ch, font=fnt, fill=col)
             cx += CELL_W * S
 
-    # ---- content background ----
-    rect(0, CONTENT_Y, width, total_rows * LINE_H, C_PAGE)
+    # ---- content background (page-level <body>/<html> bg, or white) ----
+    rect(0, CONTENT_Y, width, total_rows * LINE_H, page_bg or C_PAGE)
 
     # ---- element backgrounds (behind the whole box, under the text) ----
     for (ftop, fbot, lx, rx, col) in fills:
