@@ -1,50 +1,356 @@
 # user/find.ad
 #
-# Recursive walk: print PATH, then every entry beneath. This OS has no
-# stat syscall; a p9_listdir return is NOT a reliable dir test because
-# it also succeeds on a regular file (sys_open+sys_read returns the
-# file's contents), so a content-bearing file would be walked as a
-# directory of garbage entries. We gate recursion on a reliable
-# Dir-record-mode probe (path_is_dir, below). Per-level scratch buffers
-# + depth cap keep recursion bounded; sys_getcwd anchors relative
-# invocations.
+# Native `find`: walk one or more start paths and print every entry that
+# satisfies the (implicitly AND-ed) predicate expression.
+#
+#   find [PATH...] [PREDICATES...]
+#
+# Supported predicates (everyday-script subset):
+#   -name  GLOB     basename shell-glob match (* ? [set] [!set] a-z ranges)
+#   -iname GLOB     ... case-insensitive
+#   -type  f|d      regular file / directory  (see note on -type l below)
+#   -maxdepth N     descend at most N levels below each start point
+#   -mindepth N     only act on entries at depth >= N (start point = depth 0)
+#   -size [+-]N[ckMGwb]   size test (c=bytes, k=1024, M/G, w=2, b/none=512-blocks;
+#                        block/K/M/G units round the file size UP like GNU find)
+#   -empty          zero-length file OR a directory with no entries
+#   -print          print PATH + '\n'   (the default action)
+#   -print0         print PATH + '\0'   (NUL-separated, for `xargs -0`)
+#
+# Multiple predicates are AND-ed; multiple start paths are each walked.
+#
+# NOTE on -type l: this namespace's stat record carries only the QTDIR
+# qid bit (sys/src/9/port/sysfile.ad: "Only QTDIR matters today"), so a
+# symlink is indistinguishable from a regular file by stat. -type l is
+# therefore rejected rather than silently mis-matching.
+#
+# DIRECTORY vs FILE is decided by the reliable Dir-record stat probe
+# (sys_stat_p9 -> qid.type QTDIR), NOT by a p9_listdir "success": a
+# regular file's open+read also succeeds and would be walked as a
+# directory of garbage entries (the bug #146 fixed). The same single
+# stat per node yields both the -type/-size/-empty facts and the
+# descend decision.
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_getcwd(buf: Ptr[uint8], count: uint64) -> int64
-extern def sys_open(path: Ptr[char]) -> int32
-extern def sys_close(fd: int32) -> int32
-from lib.p9 import p9_listdir, p9_chan_dir_mode
+# sys_stat_p9(path, buf, nbuf): 9P stat wire record by path. qid.type is
+# at byte 8 (QTDIR bit); length (u64 LE) at byte 33. Returns bytes
+# written (>= the fixed prefix) or -1. Same syscall lib/p9.ad::p9_is_dir
+# uses.
+extern def sys_stat_p9(path: Ptr[char], buf: Ptr[uint8],
+                       nbuf: uint64) -> int64
+from lib.p9 import p9_listdir
 
-MAX_DEPTH: int32 = 8
+QTDIR: uint8 = 0x80
+
+MAX_DEPTH: int32 = 32           # hard recursion safety cap
 LIST_CAP: uint64 = 1024
 PATH_CAP: uint64 = 256
-levels: Array[8192, uint8]
+MAX_PREDS: uint64 = 32
+MAX_PATHS: uint64 = 32
+
+levels: Array[32768, uint8]     # MAX_DEPTH * LIST_CAP per-level scratch
 path: Array[256, uint8]
+find_stat_buf: Array[560, uint8]
+empty_scan: Array[1024, uint8]
+nul_byte: Array[1, uint8]       # a single 0 byte for -print0 separator
+
+# --- parsed expression state -----------------------------------------
+# Test predicates (name/iname/type/size/empty), AND-ed. maxdepth/mindepth
+# and the print action are pulled out into scalars below.
+PK_NAME:  int32 = 1
+PK_INAME: int32 = 2
+PK_TYPE:  int32 = 3
+PK_SIZE:  int32 = 4
+PK_EMPTY: int32 = 5
+
+pred_kind: Array[32, int32]
+pred_sptr: Array[32, uint64]    # glob string ptr (name/iname)
+pred_type: Array[32, int32]     # 'f'=102 / 'd'=100 for PK_TYPE
+pred_scmp: Array[32, int32]     # size compare: -1 <, 0 ==, 1 >
+pred_sunit: Array[32, uint64]   # size unit in bytes
+pred_snum: Array[32, uint64]    # size threshold in units
+npred: uint64 = 0
+
+g_maxdepth: int32 = 1000000
+g_mindepth: int32 = 0
+action_print0: int32 = 0        # 0 = newline, 1 = NUL
 
 
-# 1 if `path` (NUL-terminated) is itself a directory: open it and ask
-# the kernel to flip the fd into Dir-record mode. namec_chan_set_p9_dir_mode
-# accepts only DEV_DIR_FILE pool chans (real directories) and returns -1
-# for a regular-file backing, so a p9_listdir "success" can't fool it.
-def path_is_dir(path: Ptr[char]) -> int32:
-    fd: int32 = sys_open(path)
-    if fd < 0:
-        return 0
-    d: int32 = p9_chan_dir_mode(fd, 1, path)
-    sys_close(fd)
-    if d == 0:
+def cstr_len(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, cstr_len(s))
+
+
+def streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] == b[i]:
         return 1
     return 0
 
 
-def walk(path_len: uint64, depth: int32):
+def to_lower(c: uint8) -> uint8:
+    if c >= 65 and c <= 90:
+        return c + 32
+    return c
+
+
+def char_eq(a: uint8, b: uint8, ci: int32) -> int32:
+    if ci != 0:
+        if to_lower(a) == to_lower(b):
+            return 1
+        return 0
+    if a == b:
+        return 1
+    return 0
+
+
+# --- glob matcher ----------------------------------------------------
+# Match one pattern UNIT at pat[p] against character c. A unit is a
+# literal, '?', or a '[...]' class. Returns the pattern index AFTER the
+# unit on a match, or -1 on no-match. '*' is handled by the caller's
+# backtracking loop, so it is never passed here.
+def match_unit(pat: Ptr[uint8], p: uint64, plen: uint64,
+               c: uint8, ci: int32) -> int64:
+    ch: uint8 = pat[p]
+    if ch == 63:                                   # '?'
+        return cast[int64](p + 1)
+    if ch == 91:                                   # '['
+        q: uint64 = p + 1
+        negate: int32 = 0
+        if q < plen and (pat[q] == 33 or pat[q] == 94):   # '!' or '^'
+            negate = 1
+            q = q + 1
+        # A ']' immediately after the (optional) negation is a literal.
+        found: int32 = 0
+        first: int32 = 1
+        while q < plen and (pat[q] != 93 or first != 0):
+            first = 0
+            # Range a-z: member, '-', member (and '-' is not last).
+            if q + 2 < plen and pat[q + 1] == 45 and pat[q + 2] != 93:
+                lo: uint8 = pat[q]
+                hi: uint8 = pat[q + 2]
+                cc: uint8 = c
+                if ci != 0:
+                    lo = to_lower(lo)
+                    hi = to_lower(hi)
+                    cc = to_lower(cc)
+                if cc >= lo and cc <= hi:
+                    found = 1
+                q = q + 3
+            else:
+                if char_eq(pat[q], c, ci) != 0:
+                    found = 1
+                q = q + 1
+        if q >= plen:
+            # No closing ']': treat the '[' as a literal character.
+            if char_eq(91, c, ci) != 0:
+                return cast[int64](p + 1)
+            return cast[int64](-1)
+        # q points at the closing ']'.
+        ok: int32 = found
+        if negate != 0:
+            if found != 0:
+                ok = 0
+            else:
+                ok = 1
+        if ok != 0:
+            return cast[int64](q + 1)
+        return cast[int64](-1)
+    # Literal.
+    if char_eq(ch, c, ci) != 0:
+        return cast[int64](p + 1)
+    return cast[int64](-1)
+
+
+def glob_match(pat: Ptr[uint8], plen: uint64, txt: Ptr[uint8],
+               tlen: uint64, ci: int32) -> int32:
+    p: uint64 = 0
+    t: uint64 = 0
+    star: int64 = -1                               # pattern index of last '*'
+    tstar: uint64 = 0                              # text index when '*' seen
+    while t < tlen:
+        if p < plen and pat[p] == 42:              # '*'
+            star = cast[int64](p)
+            p = p + 1
+            tstar = t
+        elif p < plen:
+            nx: int64 = match_unit(pat, p, plen, txt[t], ci)
+            if nx >= 0:
+                p = cast[uint64](nx)
+                t = t + 1
+            elif star >= 0:
+                p = cast[uint64](star) + 1
+                tstar = tstar + 1
+                t = tstar
+            else:
+                return 0
+        elif star >= 0:
+            p = cast[uint64](star) + 1
+            tstar = tstar + 1
+            t = tstar
+        else:
+            return 0
+    while p < plen and pat[p] == 42:
+        p = p + 1
+    if p == plen:
+        return 1
+    return 0
+
+
+# --- stat: fill g_is_dir / g_size for `path` -------------------------
+g_is_dir: int32 = 0
+g_size: uint64 = 0
+g_stat_ok: int32 = 0
+
+
+def read_le64(b: Ptr[uint8], off: uint64) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < 8:
+        v = v | (cast[uint64](b[off + i]) << (i * 8))
+        i = i + 1
+    return v
+
+
+def stat_node(p: Ptr[char]) -> int32:
+    g_is_dir = 0
+    g_size = 0
+    g_stat_ok = 0
+    n: int64 = sys_stat_p9(p, cast[Ptr[uint8]](&find_stat_buf[0]), 560)
+    if n < 34:
+        return -1                                  # error / too short
+    g_stat_ok = 1
+    if (find_stat_buf[8] & QTDIR) != 0:
+        g_is_dir = 1
+    g_size = read_le64(cast[Ptr[uint8]](&find_stat_buf[0]), 33)
+    return 0
+
+
+# --- directory emptiness (for -empty) --------------------------------
+def dir_is_empty(p: Ptr[char]) -> int32:
+    n: int64 = p9_listdir(p, cast[Ptr[uint8]](&empty_scan[0]), LIST_CAP)
+    if n <= 0:
+        return 1                                   # no entries
+    nu: uint64 = cast[uint64](n)
+    i: uint64 = 0
+    while i < nu:
+        j: uint64 = i
+        while j < nu and empty_scan[j] != 10:
+            j = j + 1
+        nl: uint64 = j - i
+        real: int32 = 1
+        if nl == 0:
+            real = 0
+        if nl == 1 and empty_scan[i] == 46:
+            real = 0
+        if nl == 2 and empty_scan[i] == 46 and empty_scan[i + 1] == 46:
+            real = 0
+        if real != 0:
+            return 0
+        i = j + 1
+    return 1
+
+
+# --- predicate evaluation --------------------------------------------
+def size_matches(idx: uint64) -> int32:
+    unit: uint64 = pred_sunit[idx]
+    # ceil(g_size / unit)
+    units: uint64 = 0
+    if g_size > 0:
+        units = (g_size + unit - 1) / unit
+    cmp: int32 = pred_scmp[idx]
+    n: uint64 = pred_snum[idx]
+    if cmp == 0:
+        if units == n:
+            return 1
+        return 0
+    if cmp > 0:
+        if units > n:
+            return 1
+        return 0
+    if units < n:
+        return 1
+    return 0
+
+
+def basename_off(path_len: uint64) -> uint64:
+    i: uint64 = path_len
+    while i > 0:
+        i = i - 1
+        if path[i] == 47:
+            return i + 1
+    return 0
+
+
+def node_matches(path_len: uint64, p: Ptr[char]) -> int32:
+    # Every test predicate must hold. maxdepth/mindepth/actions are NOT
+    # tests and are handled in the walk.
+    boff: uint64 = basename_off(path_len)
+    blen: uint64 = path_len - boff
+    bptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&path[0]) + boff)
+    k: uint64 = 0
+    while k < npred:
+        kind: int32 = pred_kind[k]
+        if kind == PK_NAME or kind == PK_INAME:
+            ci: int32 = 0
+            if kind == PK_INAME:
+                ci = 1
+            gp: Ptr[uint8] = cast[Ptr[uint8]](pred_sptr[k])
+            if glob_match(gp, cstr_len(gp), bptr, blen, ci) == 0:
+                return 0
+        elif kind == PK_TYPE:
+            if pred_type[k] == 100:                # 'd'
+                if g_is_dir == 0:
+                    return 0
+            else:                                  # 'f'
+                if g_is_dir != 0:
+                    return 0
+        elif kind == PK_SIZE:
+            if g_is_dir != 0:                      # size tests only files
+                return 0
+            if size_matches(k) == 0:
+                return 0
+        elif kind == PK_EMPTY:
+            if g_is_dir != 0:
+                if dir_is_empty(p) == 0:
+                    return 0
+            else:
+                if g_size != 0:
+                    return 0
+        k = k + 1
+    return 1
+
+
+def emit(path_len: uint64):
     sys_write(1, &path[0], path_len)
-    sys_write(1, "\n", 1)
-    if depth >= MAX_DEPTH:
+    if action_print0 != 0:
+        sys_write(1, &nul_byte[0], 1)
+    else:
+        sys_write(1, "\n", 1)
+
+
+def walk(path_len: uint64, depth: int32):
+    # One stat per node -> is_dir + size for predicates AND descend.
+    ok: int32 = stat_node(cast[Ptr[char]](&path[0]))
+    # Act on this node if it clears mindepth and all tests pass. A stat
+    # failure means the node vanished; skip it but do not abort the walk.
+    if ok == 0 and depth >= g_mindepth:
+        if node_matches(path_len, cast[Ptr[char]](&path[0])) != 0:
+            emit(path_len)
+    if depth >= MAX_DEPTH or depth >= g_maxdepth:
         return
-    # Only descend into real directories — a regular file's p9_listdir
-    # would return its byte contents and get walked as bogus entries.
-    if path_is_dir(cast[Ptr[char]](&path[0])) == 0:
+    if ok != 0 or g_is_dir == 0:
         return
     lbuf: Ptr[uint8] = cast[Ptr[uint8]](
         cast[uint64](&levels[0]) + cast[uint64](depth) * LIST_CAP)
@@ -58,50 +364,178 @@ def walk(path_len: uint64, depth: int32):
         while j < nu and lbuf[j] != 10:
             j = j + 1
         nl: uint64 = j - i
-        # Drop empty/"."/".." so we never recurse back into ourselves.
-        ok: int32 = 1
+        keep: int32 = 1
         if nl == 0:
-            ok = 0
+            keep = 0
         if nl == 1 and lbuf[i] == 46:
-            ok = 0
+            keep = 0
         if nl == 2 and lbuf[i] == 46 and lbuf[i + 1] == 46:
-            ok = 0
-        if ok != 0 and path_len + 1 + nl < PATH_CAP:
+            keep = 0
+        if keep != 0 and path_len + 1 + nl < PATH_CAP:
             np: uint64 = path_len
             if path_len != 1 or path[0] != 47:
                 path[np] = 47
                 np = np + 1
-            k: uint64 = 0
-            while k < nl:
-                path[np + k] = lbuf[i + k]
-                k = k + 1
+            m: uint64 = 0
+            while m < nl:
+                path[np + m] = lbuf[i + m]
+                m = m + 1
             path[np + nl] = 0
             walk(np + nl, depth + 1)
             path[path_len] = 0
         i = j + 1
 
 
-def main(argc: int32, argv: Ptr[uint64]) -> int32:
-    # Default starting point is "." (relative-to-cwd); the if-target-
-    # isn't-absolute branch below anchors with sys_getcwd. Old default
-    # was "/mnt" (legacy FAT mount, predates per-task CWD).
-    target: Ptr[uint8] = cast[Ptr[uint8]](".")
-    if argc >= 2:
-        target = cast[Ptr[uint8]](argv[1])
-    n: uint64 = 0
-    if target[0] != 47:
-        cwd: int64 = sys_getcwd(&path[0], PATH_CAP)
-        if cwd <= 0:
-            return 1
-        n = cast[uint64](cwd - 1)
-        if n != 1 or path[0] != 47:
-            path[n] = 47
-            n = n + 1
+# --- argument parsing ------------------------------------------------
+def parse_uint(s: Ptr[uint8]) -> uint64:
+    v: uint64 = 0
     i: uint64 = 0
-    while target[i] != 0 and n + i < PATH_CAP - 1:
-        path[n + i] = target[i]
+    while s[i] >= 48 and s[i] <= 57:
+        v = v * 10 + cast[uint64](s[i] - 48)
         i = i + 1
-    n = n + i
-    path[n] = 0
-    walk(n, 0)
+    return v
+
+
+def add_size_pred(arg: Ptr[uint8]):
+    cmp: int32 = 0
+    s: uint64 = 0
+    if arg[0] == 43:                               # '+'
+        cmp = 1
+        s = 1
+    elif arg[0] == 45:                             # '-'
+        cmp = -1
+        s = 1
+    num: uint64 = 0
+    while arg[s] >= 48 and arg[s] <= 57:
+        num = num * 10 + cast[uint64](arg[s] - 48)
+        s = s + 1
+    unit: uint64 = 512                             # default: 512-byte blocks
+    suf: uint8 = arg[s]
+    if suf == 99:                                  # 'c'
+        unit = 1
+    elif suf == 119:                               # 'w'
+        unit = 2
+    elif suf == 98:                                # 'b'
+        unit = 512
+    elif suf == 107:                               # 'k'
+        unit = 1024
+    elif suf == 77:                                # 'M'
+        unit = 1048576
+    elif suf == 71:                                # 'G'
+        unit = 1073741824
+    pred_kind[npred] = PK_SIZE
+    pred_scmp[npred] = cmp
+    pred_sunit[npred] = unit
+    pred_snum[npred] = num
+    npred = npred + 1
+
+
+# Collected start paths (raw argv pointers).
+start_paths: Array[32, uint64]
+n_paths: uint64 = 0
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    nul_byte[0] = 0
+    i: uint64 = 1
+    ac: uint64 = cast[uint64](argc)
+    # Start paths: leading args that do not begin with '-'.
+    while i < ac:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv[i])
+        if a[0] == 45:                             # '-'
+            break
+        if n_paths < MAX_PATHS:
+            start_paths[n_paths] = argv[i]
+            n_paths = n_paths + 1
+        i = i + 1
+    # Predicates / actions.
+    while i < ac:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv[i])
+        if streq(a, "-name") != 0 or streq(a, "-iname") != 0:
+            if i + 1 >= ac:
+                write_str(2, "find: missing argument to -name\n")
+                return 1
+            if npred < MAX_PREDS:
+                if streq(a, "-iname") != 0:
+                    pred_kind[npred] = PK_INAME
+                else:
+                    pred_kind[npred] = PK_NAME
+                pred_sptr[npred] = argv[i + 1]
+                npred = npred + 1
+            i = i + 2
+        elif streq(a, "-type") != 0:
+            if i + 1 >= ac:
+                write_str(2, "find: missing argument to -type\n")
+                return 1
+            ta: Ptr[uint8] = cast[Ptr[uint8]](argv[i + 1])
+            if ta[0] != 102 and ta[0] != 100:      # not 'f'/'d'
+                write_str(2, "find: -type only supports f and d\n")
+                return 1
+            if npred < MAX_PREDS:
+                pred_kind[npred] = PK_TYPE
+                pred_type[npred] = cast[int32](ta[0])
+                npred = npred + 1
+            i = i + 2
+        elif streq(a, "-maxdepth") != 0:
+            if i + 1 >= ac:
+                write_str(2, "find: missing argument to -maxdepth\n")
+                return 1
+            g_maxdepth = cast[int32](parse_uint(cast[Ptr[uint8]](argv[i + 1])))
+            i = i + 2
+        elif streq(a, "-mindepth") != 0:
+            if i + 1 >= ac:
+                write_str(2, "find: missing argument to -mindepth\n")
+                return 1
+            g_mindepth = cast[int32](parse_uint(cast[Ptr[uint8]](argv[i + 1])))
+            i = i + 2
+        elif streq(a, "-size") != 0:
+            if i + 1 >= ac:
+                write_str(2, "find: missing argument to -size\n")
+                return 1
+            if npred < MAX_PREDS:
+                add_size_pred(cast[Ptr[uint8]](argv[i + 1]))
+            i = i + 2
+        elif streq(a, "-empty") != 0:
+            if npred < MAX_PREDS:
+                pred_kind[npred] = PK_EMPTY
+                npred = npred + 1
+            i = i + 1
+        elif streq(a, "-print") != 0:
+            action_print0 = 0
+            i = i + 1
+        elif streq(a, "-print0") != 0:
+            action_print0 = 1
+            i = i + 1
+        else:
+            write_str(2, "find: unknown predicate\n")
+            return 1
+    # Default start path is "." if none given.
+    if n_paths == 0:
+        start_paths[0] = cast[uint64](cast[Ptr[uint8]]("."))
+        n_paths = 1
+    # Walk each start path in turn.
+    pi: uint64 = 0
+    while pi < n_paths:
+        target: Ptr[uint8] = cast[Ptr[uint8]](start_paths[pi])
+        n: uint64 = 0
+        if target[0] != 47:                        # relative: anchor at cwd
+            cwd: int64 = sys_getcwd(&path[0], PATH_CAP)
+            if cwd <= 0:
+                return 1
+            n = cast[uint64](cwd - 1)
+            if n != 1 or path[0] != 47:
+                path[n] = 47
+                n = n + 1
+        k: uint64 = 0
+        while target[k] != 0 and n + k < PATH_CAP - 1:
+            path[n + k] = target[k]
+            k = k + 1
+        n = n + k
+        # Strip a trailing '/' (except a bare "/") so basename math and
+        # child-path joins stay canonical.
+        if n > 1 and path[n - 1] == 47:
+            n = n - 1
+        path[n] = 0
+        walk(n, 0)
+        pi = pi + 1
     return 0
