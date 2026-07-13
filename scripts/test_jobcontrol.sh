@@ -65,6 +65,9 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 300 \
     "bg"                       2 \
     "echo JC_AFTER_BG2"        6 \
     "jobs"                     1 \
+    "sleep 3 &"                1 \
+    "wait"                     6 \
+    "echo JC_WAIT_DONE"        1 \
     "echo JC_END"              2 \
     "exit"                     1
 rc="$QEMU_DRIVE_RC"
@@ -148,7 +151,23 @@ else
     fail=1
 fi
 
-# Never a 'command not found' for sleep / jobs / fg / bg.
+# 8. `wait` (no argument) blocked on the live background `sleep 3 &` and
+#    returned cleanly: the shell survived, printed JC_WAIT_DONE, and did
+#    NOT report 'no such job'. (Proving the exact block DURATION over the
+#    output-adaptive driver is not reliable; this asserts the new verb is
+#    dispatched, drains the job table, and returns to the prompt.)
+if have "JC_WAIT_DONE"; then
+    echo "[test_jobcontrol] OK: 'wait' drained bg jobs and returned to the prompt"
+else
+    echo "[test_jobcontrol] FAIL: shell did not return to the prompt after 'wait'"
+    fail=1
+fi
+if printf '%s\n' "$FLAT" | grep -a -q 'no such job'; then
+    echo "[test_jobcontrol] FAIL: 'wait' reported 'no such job'"
+    fail=1
+fi
+
+# Never a 'command not found' for sleep / jobs / fg / bg / wait.
 if printf '%s\n' "$FLAT" | grep -a -q 'command not found'; then
     echo "[test_jobcontrol] FAIL: a job-control command was 'command not found'"
     fail=1
