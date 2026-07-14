@@ -2893,6 +2893,17 @@ if os.environ.get("HAMNIX_INSTALLER_BLOB") == "1":
 if os.environ.get("ENABLE_AUDIO_TEST") == "1":
     FILES.append(("/etc/audio-test", b"1\n"))
 
+# #279: optional master-volume marker for the audio self-test. When set,
+# audio_selftest() writes `master <pct>` (+ `mute` if the marker contains
+# "mute") to /dev/audioctl BEFORE streaming the tone, so the WAV-capture
+# gate (scripts/test_hda_volume.sh) can prove the DE master level actually
+# changes the captured output (loud vs quiet vs silent). No marker ->
+# master stays at unity (100%), so the plain /etc/audio-test gate is
+# unaffected.
+_audio_master = os.environ.get("AUDIO_MASTER")
+if _audio_master:
+    FILES.append(("/etc/audio-master", (_audio_master + "\n").encode()))
+
 # Native Intel HDA PCM CAPTURE (record) self-test. ENABLE_AUDIOCAP_TEST=1
 # plants /etc/audiocap-test; init/main.ad's boot:37.acap gate then runs
 # audio_capture_selftest(), which arms the HDA input-stream DMA ring, feeds
