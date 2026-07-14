@@ -47,7 +47,7 @@ assert_grep() {
 }
 
 assert_grep '^# scene v1 hamui'                 "scene header emitted"
-assert_grep '^fill 0 0 236 344 #d4d0c8'         "calendar window background"
+assert_grep '^fill 0 0 236 366 #d4d0c8'         "calendar window background"
 assert_grep '^glyphs 82 38 \"July 2026\"'       "title shows the seeded month"
 # 2026-07-01 is a Wednesday: day '1' lands in column 3 (x=6+3*32+10=112).
 assert_grep '^glyphs 112 81 \"1\"'              "July 1 2026 placed on Wednesday"
@@ -80,6 +80,10 @@ assert_grep '^glyphs 150 284 \"00:00.00\"'      "Reset button zeroed the stopwat
 assert_grep '^glyphs 22 310 \"Start\"'          "Start button rendered"
 assert_grep '^glyphs 102 310 \"Stop\"'          "Stop button rendered"
 assert_grep '^glyphs 174 310 \"Reset\"'         "Reset button rendered"
+
+# --- UPTIME CLOCK (superset of the retired /bin/hamclock; H:MM:SS since boot) -
+assert_grep '^glyphs 8 340 \"Uptime\"'          "uptime-clock label rendered"
+assert_grep '^glyphs 72 340 \"1:02:03\"'        "uptime clock shows H:MM:SS since boot"
 
 # --- MONTH NAVIGATION (next-month arrow: July -> August) ---
 assert_grep '^MONTH1 8'                         "next-month arrow navigated July -> August"
