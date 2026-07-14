@@ -511,6 +511,12 @@ class Parser:
                     expr = StructInitExpr(expr.name, fields)
                 else:
                     raise ParseError("Struct initialization requires identifier", self.current())
+
+            elif self.check(TokenType.QUESTION):
+                # Postfix `?` propagation: `expr?` on a Result/Option value.
+                qtok = self.advance()
+                expr = TryExpr(expr, self.make_span(qtok))
+
             else:
                 break
 
@@ -1407,6 +1413,79 @@ class Parser:
         self.expect(TokenType.DEDENT)
         return UnionDef(name, fields, decorators or [], self.make_span(tok))
 
+    def _parse_enum_variant(self) -> "EnumVariant":
+        """Parse one enum variant: `Name` or `Name(Type, Type, ...)`.
+
+        The variant name is normally an IDENT, but the built-in
+        `Option.None` variant is spelled with the `None` keyword, so the
+        NONE token is accepted here too (yielding the name "None")."""
+        vtok = self.current()
+        if self.check(TokenType.NONE):
+            self.advance()
+            vname = "None"
+        else:
+            vname = self.expect(TokenType.IDENT).value
+        payload: list[Type] = []
+        if self.match(TokenType.LPAREN):
+            if not self.check(TokenType.RPAREN):
+                payload.append(self.parse_type())
+                while self.match(TokenType.COMMA):
+                    if self.check(TokenType.RPAREN):
+                        break
+                    payload.append(self.parse_type())
+            self.expect(TokenType.RPAREN)
+        return EnumVariant(vname, payload, self.make_span(vtok))
+
+    def parse_enum(self, decorators: list[str] = None) -> EnumDef:
+        """Parse a tagged sum type (discriminated union).
+
+            enum Shape:
+                Empty
+                Circle(int32)
+                Rect(int16, int16)
+
+        An inline `;`-separated body is also accepted:
+
+            enum Shape: Empty ; Circle(int32) ; Rect(int16, int16)
+        """
+        tok = self.current()
+        self.expect(TokenType.ENUM)
+        name = self.expect(TokenType.IDENT).value
+        self.expect(TokenType.COLON)
+
+        variants: list[EnumVariant] = []
+
+        # Inline form: `enum E: A ; B(int32)` — variants on the header line.
+        if not self.check(TokenType.NEWLINE):
+            variants.append(self._parse_enum_variant())
+            while self.match(TokenType.SEMICOLON):
+                if self.check(TokenType.NEWLINE):
+                    break
+                variants.append(self._parse_enum_variant())
+            self.expect(TokenType.NEWLINE)
+            return EnumDef(name, variants, self.make_span(tok))
+
+        # Indented-block form (one or more variants per line, `;` optional).
+        self.expect(TokenType.NEWLINE)
+        self.skip_newlines()
+        self.expect(TokenType.INDENT)
+        while not self.check(TokenType.DEDENT, TokenType.EOF):
+            self.skip_newlines()
+            if self.check(TokenType.DEDENT, TokenType.EOF):
+                break
+            if self.match(TokenType.PASS):
+                self.expect(TokenType.NEWLINE)
+                continue
+            variants.append(self._parse_enum_variant())
+            # Allow several `;`-separated variants on one physical line.
+            while self.match(TokenType.SEMICOLON):
+                if self.check(TokenType.NEWLINE):
+                    break
+                variants.append(self._parse_enum_variant())
+            self.expect(TokenType.NEWLINE)
+        self.expect(TokenType.DEDENT)
+        return EnumDef(name, variants, self.make_span(tok))
+
     def parse_import(self) -> ImportDecl:
         """Parse an import declaration."""
         tok = self.current()
@@ -1535,6 +1614,12 @@ class Parser:
                 # Union
                 if self.check(TokenType.UNION):
                     declarations.append(self.parse_union(decorators))
+                    self.skip_newlines()
+                    continue
+
+                # Enum (tagged sum type)
+                if self.check(TokenType.ENUM):
+                    declarations.append(self.parse_enum(decorators))
                     self.skip_newlines()
                     continue
 

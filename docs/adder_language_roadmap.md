@@ -68,6 +68,33 @@ spot is a **hybrid**:
    and `?` propagation (desugars to a branch — zero runtime, kernel-friendly). One
    stroke gives safe error handling **without exceptions**, safe nullability, and the
    most Rust+Python thing there is.
+
+   **STATUS (increment 1, SEED backend — landed):** `enum` decls (indented or
+   inline `;` form), variant construction (`E.V` / `V` / `E.V(a)` / `V(a)`),
+   `match` with payload binding + a non-exhaustiveness *warning*, prelude
+   `Option`/`Result`, and postfix `?` propagation all work end to end — compile
+   **and run** on `x86_64-linux`, compile for `x86_64-adder-user`, and stay
+   **zero-cost** on `x86_64-bare-metal` (no `ud2`/alloc; `?` = a plain tag
+   compare + early return). Gate: `scripts/test_adder_enums.sh`.
+
+   *Representation:* an enum value is a single 64-bit **scalar-packed** tagged
+   union — an 8-bit tag in the low byte, payload fields packed above it — so it
+   flows through the existing scalar codegen (params, **returns**, `?`) with no
+   new ABI, no allocation. This is what makes `Result`/`Option` returnable given
+   Adder has no by-value aggregate ABI.
+
+   *Deferred (disproved for one pass):* (a) **generics** — `Option`/`Result`
+   are monomorphized to an `int32` payload; full `[T]`/`[T,E]` generics are a
+   follow-up. (b) **multi-word enums** — a variant whose tag+payload exceeds 64
+   bits (e.g. a `Ptr` + `int`, or any `int64` payload) is rejected with a clear
+   "multi-word enum deferred" error; supporting them needs an sret/`rax:rdx`
+   return ABI. (c) **NATIVE backend (`codegen.ad`)** — the native backend has no
+   `match` support *at all* today (match is seed-only), so `enum`/`match`/`?`
+   land in the seed this increment; the native backend continues to *reject*
+   enum syntax as a pre-existing acceptance gap (not a divergence — objdiff over
+   the enum-free corpus stays byte-clean). Staged plan: first port `match` to
+   `codegen.ad`/`parser.ad`/`ir.ad`, then mirror the enum layout/ctor/`?`
+   desugar there so seed+native emit identical bytes for enum code.
 2. **Non-null-by-default** pointers/refs + opt-in `Optional` deref checks (leans on #1).
 3. **Descriptive bounds/null trap** (`bounds: idx N of len M at file:line`) + **`@unsafe`
    / `unsafe def`** attribute + `# adder: unsafe` file pragma (small, already designed).

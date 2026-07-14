@@ -157,6 +157,7 @@ class TokenType(Enum):
     COMMA = auto()          # ,
     COLON = auto()          # :
     SEMICOLON = auto()      # ;
+    QUESTION = auto()       # ?  (postfix Result/Option `?` propagation)
     DOT = auto()            # .
     DOTDOT = auto()         # ..
     ELLIPSIS = auto()       # ...
@@ -216,6 +217,7 @@ KEYWORDS: dict[str, TokenType] = {
     "defer": TokenType.DEFER,
     "match": TokenType.MATCH,
     "case": TokenType.CASE,
+    "enum": TokenType.ENUM,
     "volatile": TokenType.VOLATILE,
     "packed": TokenType.PACKED,
     "union": TokenType.UNION,
@@ -1097,6 +1099,11 @@ class Lexer:
                 case ';':
                     self.advance()
                     self.tokens.append(Token(TokenType.SEMICOLON, None,
+                                           start_line, start_col, self.line, self.column))
+
+                case '?':
+                    self.advance()
+                    self.tokens.append(Token(TokenType.QUESTION, None,
                                            start_line, start_col, self.line, self.column))
 
                 case '.':

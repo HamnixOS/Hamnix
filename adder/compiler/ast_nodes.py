@@ -337,6 +337,20 @@ class TupleLiteral:
 
 
 @dataclass
+class TryExpr:
+    """Postfix `?` propagation: `expr?`.
+
+    `expr` must evaluate to a Result[T,E]/Option[T] enum value. Desugars
+    to a branch: on the success variant (index 0 — Ok/Some) the whole
+    expression evaluates to the unwrapped payload; on the error/empty
+    variant (Err/None) the enclosing function early-returns the same
+    packed enum value. Zero runtime cost (one tag compare + a branch),
+    no exceptions, kernel-friendly."""
+    expr: 'Expr'
+    span: Optional[Span] = None
+
+
+@dataclass
 class StructInitExpr:
     """Struct initialization: Point{x=10, y=20}"""
     struct_name: str
@@ -431,7 +445,7 @@ Expr = (IntLiteral | FloatLiteral | StringLiteral | FStringLiteral |
         IndexExpr | SliceExpr | MemberExpr | ListLiteral |
         DictLiteral | TupleLiteral | ListComprehension | ConditionalExpr |
         LambdaExpr | SizeOfExpr | CastExpr | AsmExpr | ContainerOfExpr |
-        WalrusExpr)
+        WalrusExpr | TryExpr)
 
 
 # Statements

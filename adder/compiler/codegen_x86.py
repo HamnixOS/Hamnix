@@ -32,6 +32,7 @@ Calling convention (System V AMD64):
   - Vector-arg count for varargs: %al (we set to 0 before extern calls)
 """
 
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -51,6 +52,7 @@ from .ast_nodes import (
     ListType, DictType, TupleType, OptionalType,
     MatchStmt, MatchArm, Pattern, LiteralPattern, WildcardPattern,
     NamePattern, OrPattern, SequencePattern,
+    EnumDef, EnumVariant, TryExpr,
 )
 
 
@@ -207,6 +209,56 @@ class StructInfo:
     total_size: int                       # 8-byte-aligned total
 
 
+# ---------------------------------------------------------------------------
+# Tagged sum types (enums)
+# ---------------------------------------------------------------------------
+#
+# An enum value is a *scalar-packed* tagged union that occupies exactly one
+# 64-bit word — so it flows through the existing scalar codegen (registers,
+# parameters, RETURN values, `?` propagation) with ZERO new ABI work and no
+# hidden allocation. This matters because Adder has no by-value aggregate ABI
+# (structs cross function boundaries only via Ptr[T]); a multi-word enum could
+# not be returned, which `?` requires.
+#
+# Layout of the 64-bit word:
+#   bits [0, ENUM_TAG_BITS)  -> the variant tag (discriminant)
+#   bits [ENUM_TAG_BITS, 64) -> the active variant's payload fields, packed
+#                               consecutively at their natural bit widths.
+#
+# Construction ORs the tag with each field shifted to its slot; a `match`
+# arm compares the low tag bits and sign/zero-extends each payload field out
+# of its slot. All of this desugars to ordinary integer shift/and/or AST, so
+# it reuses fully byte-tested codegen and emits no new instruction shapes.
+#
+# A variant whose packed payload would not fit in 64 bits (e.g. a Ptr + int,
+# or any int64/uint64 field alongside the tag) is REJECTED with a clear
+# "multi-word enum deferred" error — multi-word / sret-returned enums are a
+# separate future increment.
+ENUM_TAG_BITS = 8   # up to 256 variants; payload gets the remaining 56 bits
+
+
+@dataclass
+class EnumVariantInfo:
+    """One variant of a scalar-packed enum."""
+    name: str
+    tag: int
+    field_types: list[Type]      # payload field types (may be empty)
+    field_offsets: list[int]     # bit offset of each field within the word
+    field_widths: list[int]      # bit width of each field
+
+
+@dataclass
+class EnumInfo:
+    """Layout + metadata for a tagged sum type."""
+    name: str
+    variants: list[EnumVariantInfo]
+    variant_by_name: dict[str, EnumVariantInfo]
+    # `?`-propagation support: for Option/Result, variant index 0 is the
+    # "continue" variant (Some/Ok) whose single payload `?` unwraps; any
+    # other tag short-circuits with an early `return` of the whole value.
+    is_try: bool = False
+
+
 @dataclass
 class LoopContext:
     """Tracks loop labels for break/continue.
@@ -299,6 +351,15 @@ class X86CodeGen:
         self.percpu_offsets: dict[str, int] = {}
         self.percpu_size: int = 0
         self.structs: dict[str, StructInfo] = {}
+        # Tagged sum types. `enums` maps enum name -> EnumInfo;
+        # `variant_owners` maps an (unqualified) variant name -> the list
+        # of enum names that declare it, for resolving bare constructors
+        # like `Some(x)` / `Ok(x)` / `Circle(5)` without a qualifier.
+        self.enums: dict[str, EnumInfo] = {}
+        self.variant_owners: dict[str, list[str]] = {}
+        # Declared return type of the function currently being emitted;
+        # consulted by `?` propagation and NoneLiteral->Option coercion.
+        self._cur_return_type: Optional[Type] = None
         # Per-class method tables: class_methods[cls_name][method_name]
         # = (owner_class_name, FunctionDef, receiver_offset). owner is
         # the class that literally declared the method; for inherited
@@ -386,6 +447,16 @@ class X86CodeGen:
     def get_expr_type(self, expr: Expr) -> Optional[Type]:
         """Best-effort type of an expression. Returns None when unknown
         (callers must have a safe default)."""
+        # Enum constructor -> the enum's own type (a scalar packed word).
+        ctor = self._enum_ctor_info(expr)
+        if ctor is not None:
+            return Type(ctor[0].name)
+        if isinstance(expr, TryExpr):
+            # `operand?` evaluates to the success variant's unwrapped payload.
+            ei = self._lookup_enum_type(self.get_expr_type(expr.expr))
+            if ei is not None and ei.variants and ei.variants[0].field_types:
+                return ei.variants[0].field_types[0]
+            return None
         if isinstance(expr, FloatLiteral):
             # A bare float literal models as float64 (Python double). A
             # surrounding cast retypes it; this default lets FP arithmetic
@@ -748,6 +819,9 @@ class X86CodeGen:
             if isinstance(decl, ClassDef):
                 self._layout_class_ordered(
                     decl, program, class_defs_by_name, laying_out)
+
+        # Register tagged sum types (enums) + the built-in Option/Result.
+        self._register_enums(program)
         # Build the per-class method table BEFORE Pass-1 symbol
         # registration so the registration loop can register each
         # method's mangled symbol (`Class__method`) as a defined
@@ -840,6 +914,10 @@ class X86CodeGen:
                         self.defined_funcs.add(sym)
                         if mdef.return_type is not None:
                             self.func_return_types[sym] = mdef.return_type
+                case EnumDef():
+                    # Enums are compile-time layout only — no symbol,
+                    # no code. Registration happened in _register_enums.
+                    pass
                 case VarDecl(name=name, var_type=var_type):
                     self.global_var_types[name] = var_type
                     if isinstance(var_type, PercpuType):
@@ -871,6 +949,8 @@ class X86CodeGen:
                     self.gen_function(decl)
                 case VarDecl():
                     pass  # emitted in the .data/.bss pass below
+                case EnumDef():
+                    pass  # no code emitted for a tagged sum type
                 case ClassDef():
                     # Emit each method as a free function named
                     # `<ClassName>__<methodName>`. Inherited methods are
@@ -1733,6 +1813,7 @@ class X86CodeGen:
 
     def gen_function(self, func: FunctionDef) -> None:
         self.ctx = FunctionContext(name=func.name)
+        self._cur_return_type = func.return_type
         self.ctx.needs_canary = self._function_needs_canary(func)
         self.ctx.epilogue_label = f".__epilogue_{func.name}"
 
@@ -1903,6 +1984,7 @@ class X86CodeGen:
                 self.emit("    ret")
         self.emit(f"    .size {func.name}, .-{func.name}")
         self.ctx = None
+        self._cur_return_type = None
 
     # -- statements ---------------------------------------------------------
 
@@ -1972,6 +2054,9 @@ class X86CodeGen:
                     cname = self._ctor_call_class(value)
                     if cname is not None:
                         self._emit_ctor_init(var, cname, value)
+                    elif self._maybe_gen_none_coercion(value, var_type):
+                        # `x: Option = None` -> the empty variant word.
+                        self._emit_local_store(var, "%rax")
                     else:
                         self.gen_expr(value)
                         # Sized store for sub-8-byte scalar locals so the
@@ -1998,7 +2083,11 @@ class X86CodeGen:
 
             case ReturnStmt(value=value):
                 if value is not None:
-                    self.gen_expr(value)
+                    # `return None` in an Option-returning function means the
+                    # empty variant, not the integer 0.
+                    if not self._maybe_gen_none_coercion(
+                            value, self._cur_return_type):
+                        self.gen_expr(value)
                 # Canary-protected functions route every return through
                 # the shared epilogue label so the check happens exactly
                 # once per function regardless of how many `return`s the
@@ -2060,6 +2149,458 @@ class X86CodeGen:
                 )
 
     # -------------------------------------------------------------------------
+    # Tagged sum types (enums): registration, construction, `?` propagation
+    # -------------------------------------------------------------------------
+
+    def _enum_field_bit_width(self, t: Type, enum_name: str) -> int:
+        """Bit width a payload field of type `t` occupies in the packed word.
+
+        Only scalar integer / pointer payloads are supported (they pack
+        into the word by value). Structs/arrays/floats have no by-value
+        scalar packing and are rejected — as is any nested enum."""
+        if isinstance(t, (PointerType, FunctionPointerType)):
+            return 64
+        if isinstance(t, ArrayType):
+            raise CodeGenError(
+                f"x86: enum '{enum_name}' payload of array type is not "
+                f"supported (only scalar int/ptr payloads pack into the "
+                f"64-bit enum word)"
+            )
+        name = getattr(t, "name", None)
+        if name in self.structs or name in self.enums:
+            raise CodeGenError(
+                f"x86: enum '{enum_name}' payload of aggregate/enum type "
+                f"'{name}' is not supported (multi-word enums are deferred "
+                f"to a follow-up increment; use a Ptr[{name}] payload)"
+            )
+        if name in ("float32", "float64"):
+            raise CodeGenError(
+                f"x86: enum '{enum_name}' float payloads are not supported "
+                f"in this increment"
+            )
+        if name not in self._INT_NAMES:
+            raise CodeGenError(
+                f"x86: enum '{enum_name}' payload type '{name}' is not a "
+                f"scalar integer/pointer type"
+            )
+        return self.get_type_size(t) * 8
+
+    def _register_one_enum(self, edef: EnumDef, is_try: bool) -> None:
+        """Compute the scalar-packed layout of one enum and record it."""
+        variants: list[EnumVariantInfo] = []
+        by_name: dict[str, EnumVariantInfo] = {}
+        for tag, v in enumerate(edef.variants):
+            offsets: list[int] = []
+            widths: list[int] = []
+            off = ENUM_TAG_BITS
+            for ft in v.payload_types:
+                w = self._enum_field_bit_width(ft, edef.name)
+                offsets.append(off)
+                widths.append(w)
+                off += w
+            if off > 64:
+                raise CodeGenError(
+                    f"x86: enum '{edef.name}' variant '{v.name}' needs "
+                    f"{off} bits (tag + payload) but the scalar enum word is "
+                    f"64 bits — multi-word enums are deferred to a follow-up "
+                    f"increment"
+                )
+            vi = EnumVariantInfo(v.name, tag, list(v.payload_types),
+                                 offsets, widths)
+            variants.append(vi)
+            by_name[v.name] = vi
+        if len(edef.variants) > (1 << ENUM_TAG_BITS):
+            raise CodeGenError(
+                f"x86: enum '{edef.name}' has too many variants for an "
+                f"{ENUM_TAG_BITS}-bit tag"
+            )
+        info = EnumInfo(edef.name, variants, by_name, is_try)
+        self.enums[edef.name] = info
+        for vi in variants:
+            self.variant_owners.setdefault(vi.name, []).append(edef.name)
+
+    def _register_enums(self, program: Program) -> None:
+        """Register user enums, then the built-in Option/Result — but ONLY
+        when the program actually references them.
+
+        Byte-inertness: a program that declares no enums and never names
+        `Option`/`Result` in a signature leaves `self.enums` empty, so the
+        constructor/`?`/match interception in gen_expr/get_expr_type/_gen_match
+        all no-op and the emitted bytes are identical to the pre-feature
+        compiler. Auto-registering the built-ins unconditionally would let a
+        stray `Ok(...)`/`Some(...)` call in existing code be reinterpreted as
+        an enum constructor — so we gate it on a real reference.
+
+        Option/Result are monomorphized to an int32 payload in this
+        increment; full generics over T/E are a documented follow-up (see
+        docs/adder_language_roadmap.md)."""
+        for decl in program.declarations:
+            if isinstance(decl, EnumDef):
+                is_try = decl.name in ("Option", "Result")
+                self._register_one_enum(decl, is_try)
+        # Built-in prelude enums (concrete int32 payload), gated on reference
+        # and only when the name isn't already taken by a user type.
+        referenced = self._referenced_type_names(program)
+        if "Option" in referenced and "Option" not in self.enums \
+                and "Option" not in self.structs:
+            self._register_one_enum(EnumDef("Option", [
+                EnumVariant("Some", [Type("int32")]),
+                EnumVariant("None", []),
+            ]), is_try=True)
+        if "Result" in referenced and "Result" not in self.enums \
+                and "Result" not in self.structs:
+            self._register_one_enum(EnumDef("Result", [
+                EnumVariant("Ok", [Type("int32")]),
+                EnumVariant("Err", [Type("int32")]),
+            ]), is_try=True)
+
+    def _referenced_type_names(self, program: Program) -> set:
+        """Set of bare type names appearing in any declaration signature
+        (function return/params, extern, vardecl, class fields). Used to
+        decide whether the built-in Option/Result enums are needed."""
+        names: set = set()
+
+        def collect(t) -> None:
+            if t is None:
+                return
+            if isinstance(t, (PointerType,)):
+                collect(t.base_type)
+                return
+            if isinstance(t, ArrayType):
+                collect(t.element_type)
+                return
+            if isinstance(t, PercpuType):
+                collect(t.base_type)
+                return
+            if isinstance(t, FunctionPointerType):
+                collect(getattr(t, "return_type", None))
+                for pt in getattr(t, "param_types", []) or []:
+                    collect(pt)
+                return
+            nm = getattr(t, "name", None)
+            if nm is not None:
+                names.add(nm)
+
+        for decl in program.declarations:
+            if isinstance(decl, (FunctionDef, ExternDecl)):
+                collect(getattr(decl, "return_type", None))
+                for p in getattr(decl, "params", []):
+                    collect(getattr(p, "param_type", None))
+            elif isinstance(decl, VarDecl):
+                collect(getattr(decl, "var_type", None))
+            elif isinstance(decl, ClassDef):
+                for f in getattr(decl, "fields", []):
+                    collect(getattr(f, "field_type", None))
+                for m in getattr(decl, "methods", []):
+                    collect(getattr(m, "return_type", None))
+                    for p in getattr(m, "params", []):
+                        collect(getattr(p, "param_type", None))
+        return names
+
+    def _lookup_enum_type(self, t) -> Optional[EnumInfo]:
+        """EnumInfo for a bare `Type` naming an enum, else None."""
+        if t is None:
+            return None
+        if isinstance(t, (PointerType, ArrayType, FunctionPointerType,
+                          PercpuType)):
+            return None
+        name = getattr(t, "name", None)
+        return self.enums.get(name)
+
+    def _enum_ctor_info(self, expr: Expr):
+        """If `expr` is an enum-variant constructor, return
+        `(EnumInfo, EnumVariantInfo, args)`; otherwise None. Pure
+        detection — never raises, never emits.
+
+        Recognised shapes:
+          * `E.V(a, ...)`   qualified, with payload   (CallExpr/MemberExpr)
+          * `V(a, ...)`     unqualified, with payload  (variant name unique)
+          * `E.V`           qualified, no payload      (MemberExpr)
+          * `V`             unqualified, no payload     (variant name unique,
+                                                         not a live variable)
+        """
+        # Call forms: E.V(args) or V(args)
+        if isinstance(expr, CallExpr):
+            f = expr.func
+            if isinstance(f, MemberExpr) and isinstance(f.obj, Identifier) \
+                    and f.obj.name in self.enums:
+                ei = self.enums[f.obj.name]
+                vi = ei.variant_by_name.get(f.member)
+                if vi is not None:
+                    return (ei, vi, expr.args)
+                return None
+            if isinstance(f, Identifier):
+                ei = self._unique_variant_enum(f.name)
+                if ei is not None:
+                    return (ei, ei.variant_by_name[f.name], expr.args)
+            return None
+        # No-payload forms: E.V or V
+        if isinstance(expr, MemberExpr) and isinstance(expr.obj, Identifier) \
+                and expr.obj.name in self.enums:
+            ei = self.enums[expr.obj.name]
+            vi = ei.variant_by_name.get(expr.member)
+            if vi is not None:
+                return (ei, vi, [])
+            return None
+        if isinstance(expr, Identifier):
+            # Only a bare identifier that is NOT a live variable and names a
+            # unique no-payload variant is a constructor.
+            if self.ctx is not None and expr.name in self.ctx.locals:
+                return None
+            if expr.name in self.global_var_types:
+                return None
+            ei = self._unique_variant_enum(expr.name)
+            if ei is not None and not ei.variant_by_name[expr.name].field_types:
+                return (ei, ei.variant_by_name[expr.name], [])
+            return None
+        return None
+
+    def _unique_variant_enum(self, variant: str) -> Optional[EnumInfo]:
+        """The EnumInfo owning `variant` iff exactly one enum declares it."""
+        owners = self.variant_owners.get(variant)
+        if owners is not None and len(owners) == 1:
+            return self.enums[owners[0]]
+        return None
+
+    def _enum_pack_expr(self, ei: EnumInfo, vi: EnumVariantInfo,
+                        args: list, span) -> Expr:
+        """Build the integer AST that constructs the packed enum word.
+
+            word = tag | ((arg0 & mask0) << off0) | ((arg1 & mask1) << off1)...
+
+        Each field is masked to its width so a sign-extended negative
+        argument doesn't corrupt neighbouring slots; a `match` arm
+        re-extracts and re-signs it. This desugars entirely to shift/and/or
+        over existing codegen — zero new instruction shapes, no allocation."""
+        if len(args) != len(vi.field_types):
+            raise CodeGenError(
+                f"x86: enum variant '{ei.name}.{vi.name}' expects "
+                f"{len(vi.field_types)} payload value(s), got {len(args)}"
+            )
+        word: Expr = IntLiteral(vi.tag, span)
+        for i, arg in enumerate(args):
+            off = vi.field_offsets[i]
+            w = vi.field_widths[i]
+            mask = (1 << w) - 1
+            masked = BinaryExpr(BinOp.BIT_AND,
+                                CastExpr(Type("int64", span), arg, span),
+                                IntLiteral(mask, span), span)
+            slot = BinaryExpr(BinOp.SHL, masked, IntLiteral(off, span), span)
+            word = BinaryExpr(BinOp.BIT_OR, word, slot, span)
+        return word
+
+    def _enum_extract_expr(self, vi: EnumVariantInfo, i: int,
+                           word: Expr, span) -> Expr:
+        """Build the AST that extracts payload field `i` of `vi` from `word`.
+
+        Signed fields are sign-extended (shl to bit 63 then arithmetic shr);
+        unsigned fields are masked out of their slot."""
+        off = vi.field_offsets[i]
+        w = vi.field_widths[i]
+        ft = vi.field_types[i]
+        if self._is_unsigned_type(ft) is False:
+            # Signed: shift the field up so its top bit is bit 63, then an
+            # arithmetic right shift (guaranteed by the int64 cast) fills the
+            # sign. Handles the full-width (off+w==64) case too.
+            shl = BinaryExpr(BinOp.SHL, word,
+                             IntLiteral(64 - off - w, span), span)
+            return BinaryExpr(BinOp.SHR,
+                              CastExpr(Type("int64", span), shl, span),
+                              IntLiteral(64 - w, span), span)
+        # Unsigned (or bool/char): isolate the slot with a mask.
+        mask = (1 << w) - 1
+        shifted = BinaryExpr(BinOp.SHR, word, IntLiteral(off, span), span)
+        return BinaryExpr(BinOp.BIT_AND, shifted, IntLiteral(mask, span), span)
+
+    def _gen_enum_ctor(self, ei: EnumInfo, vi: EnumVariantInfo,
+                       args: list, span) -> None:
+        """Evaluate an enum constructor, leaving the packed word in %rax."""
+        self.gen_expr(self._enum_pack_expr(ei, vi, args, span))
+
+    def _gen_try(self, expr: 'TryExpr') -> None:
+        """Lower `operand?` to a tag test + early return, leaving the
+        unwrapped success payload in %rax (zero runtime cost)."""
+        operand = expr.expr
+        ei = self._lookup_enum_type(self.get_expr_type(operand))
+        if ei is None or not ei.is_try:
+            raise CodeGenError(
+                "x86: `?` operates on a Result/Option value only "
+                f"at {_span_location(getattr(expr, 'span', None))}"
+            )
+        if self._lookup_enum_type(self._cur_return_type) is None:
+            raise CodeGenError(
+                "x86: `?` used in a function that does not return a "
+                f"Result/Option at {_span_location(getattr(expr, 'span', None))}"
+            )
+        span = getattr(expr, "span", None)
+        success = ei.variants[0]     # Some / Ok
+        # Materialise the operand once into an int64 temp.
+        label_id = self.ctx.new_label("try").rsplit("_", 1)[-1]
+        tmp_name = f"__try_{label_id}"
+        var = self.ctx.alloc_local(tmp_name, 8, Type("int64", span))
+        self.gen_expr(operand)
+        self._emit_local_store(var, "%rax")
+        tmp = Identifier(tmp_name, span)
+        # if (word & TAGMASK) != success_tag: return word   (short-circuit)
+        tag_expr = BinaryExpr(BinOp.BIT_AND, tmp,
+                              IntLiteral((1 << ENUM_TAG_BITS) - 1, span), span)
+        not_success = BinaryExpr(BinOp.NEQ, tag_expr,
+                                 IntLiteral(success.tag, span), span)
+        self.gen_stmt(IfStmt(not_success, [ReturnStmt(tmp, span)], [],
+                             None, span))
+        # Success: evaluate the unwrapped payload into %rax.
+        if success.field_types:
+            self.gen_expr(self._enum_extract_expr(success, 0, tmp, span))
+        else:
+            self.gen_expr(tmp)
+
+    def _enum_none_word(self, ei: EnumInfo, span):
+        """Emit the no-payload word for `ei`'s `None` variant (Option)."""
+        vi = ei.variant_by_name.get("None")
+        if vi is None:
+            return False
+        self._gen_enum_ctor(ei, vi, [], span)
+        return True
+
+    def _maybe_gen_none_coercion(self, value: Expr, target_type) -> bool:
+        """If `value` is a bare `None` in an Option-typed position, emit the
+        Option.None word and return True; else False. Lets `return None` /
+        `x: Option = None` mean the empty variant rather than the integer 0."""
+        if not isinstance(value, NoneLiteral):
+            return False
+        ei = self._lookup_enum_type(target_type)
+        if ei is None or not ei.is_try:
+            return False
+        return self._enum_none_word(ei, getattr(value, "span", None))
+
+    # -------------------------------------------------------------------------
+    # Enum `match` lowering
+    # -------------------------------------------------------------------------
+
+    def _enum_arm_variant(self, ei: EnumInfo, pat):
+        """Resolve a match arm's pattern to (EnumVariantInfo, binding_names)
+        or ('_', []) for a catch-all, or (None, [name]) for a name binding.
+
+        Returns a tuple `(kind, variant, names)` where kind is one of
+        'variant' | 'wild' | 'bind'."""
+        if isinstance(pat, WildcardPattern):
+            return ('wild', None, [])
+        if isinstance(pat, Pattern):
+            if pat.name == "_":
+                return ('wild', None, [])
+            vi = ei.variant_by_name.get(pat.name)
+            if vi is not None:
+                return ('variant', vi, list(pat.bindings))
+            raise CodeGenError(
+                f"x86: '{pat.name}' is not a variant of enum '{ei.name}'"
+            )
+        if isinstance(pat, LiteralPattern) and isinstance(pat.value,
+                                                          NoneLiteral):
+            vi = ei.variant_by_name.get("None")
+            if vi is not None:
+                return ('variant', vi, [])
+            raise CodeGenError(
+                f"x86: enum '{ei.name}' has no `None` variant to match"
+            )
+        if isinstance(pat, NamePattern):
+            vi = ei.variant_by_name.get(pat.name)
+            if vi is not None:
+                # A bare variant name with no payload binding.
+                return ('variant', vi, [])
+            # Otherwise a catch-all binding of the whole scrutinee word.
+            return ('bind', None, [pat.name])
+        raise CodeGenError(
+            f"x86: pattern {type(pat).__name__} is not valid for a match on "
+            f"enum '{ei.name}'"
+        )
+
+    def _gen_enum_match(self, scrut: Expr, arms: list, ei: EnumInfo,
+                        span) -> None:
+        """Lower `match` over an enum value to a tag-dispatch if/elif chain.
+
+        The scrutinee is evaluated once into an int64 temp; each arm tests
+        `(word & TAGMASK) == variant.tag` (or is a catch-all) and binds any
+        payload names via sign/zero-extended slot extraction. Non-exhaustive
+        matches (no wildcard and a missing variant) emit a warning."""
+        if not arms:
+            return
+        # Materialise the scrutinee once.
+        label_id = self.ctx.new_label("ematch").rsplit("_", 1)[-1]
+        tmp_name = f"__ematch_{label_id}"
+        var = self.ctx.alloc_local(tmp_name, 8, Type("int64", span))
+        self.gen_expr(scrut)
+        self._emit_local_store(var, "%rax")
+        word = Identifier(tmp_name, span)
+
+        tagmask = (1 << ENUM_TAG_BITS) - 1
+        covered: set[int] = set()
+        has_wild = False
+
+        # Build the chain from the back, mirroring _build_arm_chain.
+        rest_stmts: list = []
+        for arm in reversed(arms):
+            kind, vi, names = self._enum_arm_variant(ei, arm.pattern)
+            bindings: list = []
+            if kind == 'variant':
+                tag_expr = BinaryExpr(BinOp.BIT_AND, word,
+                                      IntLiteral(tagmask, span), span)
+                cond: Expr = BinaryExpr(BinOp.EQ, tag_expr,
+                                        IntLiteral(vi.tag, span), span)
+                if names:
+                    if len(names) != len(vi.field_types):
+                        raise CodeGenError(
+                            f"x86: variant '{ei.name}.{vi.name}' binds "
+                            f"{len(vi.field_types)} field(s), pattern has "
+                            f"{len(names)}"
+                        )
+                    for i, nm in enumerate(names):
+                        if nm == "_":
+                            continue
+                        ftype = vi.field_types[i]
+                        bindings.append(VarDecl(
+                            nm, ftype,
+                            self._enum_extract_expr(vi, i, word, span),
+                            False, span))
+            elif kind == 'bind':
+                cond = IntLiteral(1, span)
+                bindings.append(VarDecl(names[0], Type("int64", span),
+                                        word, False, span))
+            else:  # wild
+                cond = IntLiteral(1, span)
+
+            if kind == 'variant':
+                covered.add(vi.tag)
+            else:
+                has_wild = True
+
+            user_body = list(arm.body)
+            if arm.guard is not None:
+                inner_if = IfStmt(arm.guard, user_body, [],
+                                  rest_stmts if rest_stmts else None, span)
+                arm_body = bindings + [inner_if]
+                outer_else = None
+            else:
+                arm_body = bindings + user_body
+                outer_else = rest_stmts if rest_stmts else None
+            outer_if = IfStmt(cond, arm_body, [], outer_else, span)
+            rest_stmts = [outer_if]
+
+        # Exhaustiveness: warn (non-fatal) if a variant is unmatched and
+        # there is no catch-all.
+        if not has_wild:
+            missing = [v.name for v in ei.variants if v.tag not in covered]
+            if missing:
+                print(
+                    f"warning: non-exhaustive match on enum '{ei.name}': "
+                    f"missing variant(s) {', '.join(missing)} "
+                    f"at {_span_location(span)}",
+                    file=sys.stderr,
+                )
+
+        for s in rest_stmts:
+            self.gen_stmt(s)
+
+    # -------------------------------------------------------------------------
     # Match-statement lowering
     # -------------------------------------------------------------------------
 
@@ -2094,7 +2635,16 @@ class X86CodeGen:
             (no slice is produced — Adder has no slice type yet).
             Nested literal/name sub-patterns work; nested sequence/OR
             sub-patterns are rejected with a clear error.
+
+        When the scrutinee's static type is a registered enum, dispatch to
+        the dedicated tag-based `_gen_enum_match` lowering instead.
         """
+        # Enum scrutinee: variant tag dispatch + payload binding.
+        einfo = self._lookup_enum_type(self.get_expr_type(scrut))
+        if einfo is not None:
+            self._gen_enum_match(scrut, arms, einfo, span)
+            return
+
         # 1) Materialise the scrutinee.
         #
         # Special case: if the scrutinee is a bare Identifier referring
@@ -2823,6 +3373,18 @@ class X86CodeGen:
 
     def gen_expr(self, expr: Expr) -> None:
         """Evaluate `expr`, leaving its value in %rax."""
+        # Tagged sum types: a variant constructor packs into the enum word;
+        # `expr?` lowers to a tag test + early return. Both are intercepted
+        # before the generic dispatch because they masquerade as
+        # Call/Member/Identifier expressions.
+        if isinstance(expr, TryExpr):
+            self._gen_try(expr)
+            return
+        ctor = self._enum_ctor_info(expr)
+        if ctor is not None:
+            self._gen_enum_ctor(ctor[0], ctor[1], ctor[2],
+                                getattr(expr, "span", None))
+            return
         match expr:
             case IntLiteral(value=v):
                 # movq accepts any signed 32-bit immediate; movabsq handles
