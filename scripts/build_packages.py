@@ -364,7 +364,7 @@ COREUTILS_BINS = (
     "insmod", "kill", "less", "ln", "login", "ls", "lsblk", "lsmod",
     "md5sum",
     "mkdir", "more", "motd", "mv", "nsbindprobe", "nsrun", "numfmt", "od",
-    "p9srv_demo", "passwd", "pgrep", "poweroff", "pr", "preempt_demo",
+    "p9srv_demo", "passwd", "patch", "pgrep", "poweroff", "pr", "preempt_demo",
     "preempt_hog", "printf", "ps", "pwd", "reboot", "rev", "rm",
     "rmmod", "sed", "seq", "sleep", "sort", "strings", "su", "tail",
     "tee", "test", "top", "touch", "tr", "true", "tsort", "uname", "uptime",
