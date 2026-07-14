@@ -41,16 +41,19 @@ for marker in \
     'KEY_CSI_PARAM == 47' \
     'KEY_CSI_PARAM == 48' \
     'KEY_CSI_PARAM == 49' \
+    'KEY_CSI_PARAM == 51' \
     '[de_kbd] alt_tab=1' \
     '[de_kbd] ctrl_alt_t=1' \
     '[de_kbd] alt_f4=1' \
     '[de_kbd] super=1' \
     '[de_kbd] super_d=1' \
+    '[de_kbd] prtsc=1' \
     'cycle_step(1)' \
     'daemon_spawn_terminal(cat_x' \
     'daemon_close_slot(kc4)' \
     'appmenu_spawn(scr_w, scr_h)' \
-    'show_desktop_toggle()' ; do
+    'show_desktop_toggle()' \
+    'daemon_spawn_screenshot()' ; do
     if ! grep -aFq "$marker" "$HAMUID"; then
         echo "[test_de_kbd_shortcuts] FAIL: hamUId marker missing: $marker" >&2
         struct_fail=1
@@ -59,12 +62,21 @@ done
 
 # Every advertised chord must have a non-empty action label (the
 # Control Center "Keyboard" pane scans the registry).
-for chord in 'Alt+Tab' 'Ctrl+Alt+T' 'Alt+F4' 'Super+D' ; do
+for chord in 'Alt+Tab' 'Ctrl+Alt+T' 'Alt+F4' 'Super+D' 'Print Screen' ; do
     if ! grep -aFq "\"$chord\"" "$HAMUID"; then
         echo "[test_de_kbd_shortcuts] FAIL: chord registry missing: $chord" >&2
         struct_fail=1
     fi
 done
+
+# The Print Screen key (#266): the atkbd driver maps the PrtSc extended
+# scancode (E0 37) to the dedicated CSI 51 (ESC [ 5 1 ~) that the compositor
+# turns into a /bin/hamshot capture.
+ATKBD=drivers/input/atkbd.ad
+if ! grep -aFq "scancode == 0x37" "$ATKBD"; then
+    echo "[test_de_kbd_shortcuts] FAIL: atkbd PrtSc (0x37) mapping missing" >&2
+    struct_fail=1
+fi
 
 if [ "$struct_fail" -ne 0 ]; then
     exit 1
@@ -160,7 +172,7 @@ fi
 
 # Inject each shortcut. Spaced so the compositor's key drain cycle has
 # time to consume the previous CSI before the next one queues.
-for code in 48 46 45 49 49 47 ; do
+for code in 48 46 45 49 49 47 51 ; do
     printf 'echo kbd %d > /dev/wsys/ctl\n' "$code" >&3
     sleep 0.4
 done
@@ -177,7 +189,7 @@ QEMU_PID=""
 
 fail=0
 seen=""
-for tag in alt_tab ctrl_alt_t alt_f4 super super_d ; do
+for tag in alt_tab ctrl_alt_t alt_f4 super super_d prtsc ; do
     if grep -aqE "^\[de_kbd\] ${tag}=1" "$LOG"; then
         seen="$seen $tag"
     else
