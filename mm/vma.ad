@@ -138,6 +138,7 @@ from fs.elf import (
     elf_install_user_mapping, vm_cow_share_range,
     vm_share_range, vm_protect_range, vm_pin_range,
     elf_prepare_demand_range, elf_map_one_page,
+    elf_demand_leaf_absent,
     elf_prepare_huge_demand_range, elf_map_one_huge_pde,
     PT_FLAG_NX, PT_FLAG_RW, PT_FLAG_COW,
 )
@@ -356,7 +357,22 @@ VMA_PT_ADDR_MASK: uint64 = 0x000FFFFFFFFFF000    # bits [51:12]: phys base
 # monotonic bump pointer carves 4-MiB-aligned windows out of it (freed
 # windows reclaimed via the per-task free-list below).
 VMA_LARGE_BASE:   uint64 = 0x200000000          # 8 GiB (above RAM + all user regions)
-VMA_LARGE_LIMIT:  uint64 = 0x3FFC00000          # just under 16 GiB (~8 GiB window)
+# Window TOP. WAS ~16 GiB (an 8 GiB window). That is far too small for a
+# MODERN language runtime: JavaScriptCore/V8/the JVM/Go each reserve MANY
+# multi-GiB PROT_NONE VA regions up front (JSC's Gigacage — primitive +
+# JSValue cages — plus the JIT executable pool, WTF::OSAllocator arenas),
+# then commit sub-ranges lazily. WebKitGTK's MiniBrowser UIProcess exhausted
+# the 8 GiB window (each windowed alloc is 4-MiB-rounded and the bump pointer
+# is monotonic), so a later large reservation got -ENOMEM from _vma_win_alloc
+# and JavaScriptCore never finished init → no window ever mapped. VA is FREE
+# above physical RAM, so widen the window to ~508 GiB. The cardinal invariant
+# holds: no kernel RAM sits behind identity at [8 GiB, 508 GiB) on any guest
+# (RAM tops well under 8 GiB even at QEMU_MEM=6G), so a user overlay there can
+# never shadow a kernel object. Kept strictly BELOW 512 GiB (0x8000000000) so
+# the entire window lives in PML4 entry 0 — the existing single-PML4-entry
+# crack machinery (elf_prepare_demand_range / elf_map_one_page) is unchanged.
+# 4-MiB-aligned.
+VMA_LARGE_LIMIT:  uint64 = 0x7F00000000          # 508 GiB (~500 GiB window, all in PML4[0])
 
 
 # PER-TASK bump pointer for the next free multi-chunk virtual window.
@@ -4113,13 +4129,41 @@ def vma_alloc_demand(slot: uint64, addr_in: uint64, len_in: uint64,
     # same logical CPU. A process (no thread group) still takes its own
     # per-mm lock cheaply.
     vma_mm_write_lock(slot)
-    _lr: int64 = _vma_alloc_demand_locked(slot, addr_in, len_in, prot, flags)
+    _lr: int64 = _vma_alloc_demand_locked(slot, addr_in, len_in, prot, flags, 1)
+    vma_mm_write_unlock(slot)
+    return _lr
+
+
+# vma_alloc_reserve — LAZY-PT large VA reservation (JS engines / JVM / Go).
+#
+# Same as vma_alloc_demand (a demand-paged anonymous VMA in the large window)
+# EXCEPT the covering page tables are NOT cracked at reservation time. A
+# multi-GiB PROT_NONE / MAP_NORESERVE / large-anonymous mmap is a *reservation*
+# — the program claims VA now and touches sub-ranges later. Eagerly cracking a
+# 4 GiB reservation's PTs allocates ~8 MiB of page-table frames for memory that
+# is never touched; several such reservations (JavaScriptCore's Gigacage + JIT
+# pools) intermittently exhausted the page allocator and returned -ENOMEM from
+# the eager prep — the WebKitGTK UIProcess mmap-loop -12 that stalled the whole
+# browser before it could map a window. This path instead registers ONLY the
+# VMA; vma_demand_fault materialises each covering 2 MiB PT on the FIRST touch
+# of a page in it (elf_demand_leaf_absent + elf_prepare_demand_range), exactly
+# like Linux demand-pages all anonymous memory. A never-touched reservation
+# therefore costs one VmaNode and ZERO page-table / data RAM.
+#
+# Only used by the linux-ABI mmap reservation gate; every existing
+# vma_alloc_demand caller (umdf MMIO overlay, userfaultfd, /proc scratch, the
+# native SYS_MMAP) keeps the EAGER path because it writes into the range from
+# kernel code immediately after and needs the PTs present.
+def vma_alloc_reserve(slot: uint64, len_in: uint64,
+                      prot: int32, flags: int32) -> int64:
+    vma_mm_write_lock(slot)
+    _lr: int64 = _vma_alloc_demand_locked(slot, 0, len_in, prot, flags, 0)
     vma_mm_write_unlock(slot)
     return _lr
 
 
 def _vma_alloc_demand_locked(slot: uint64, addr_in: uint64, len_in: uint64,
-                     prot: int32, flags: int32) -> int64:
+                     prot: int32, flags: int32, eager: int32) -> int64:
     if len_in == 0:
         return cast[int64](-22)
     length: uint64 = (len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
@@ -4144,26 +4188,32 @@ def _vma_alloc_demand_locked(slot: uint64, addr_in: uint64, len_in: uint64,
             printk1("vma: demand window exhausted (need 0x%x)\n", window)
             return cast[int64](-12)
 
-    # Prepare page tables for the demand range (crack PDPT/PD/PT without
-    # installing any physical mappings).
     pml4: uint64 = task_pml4(cast[int32](slot))
 
-    # elf_prepare_demand_range requires the range to be within one 1 GiB
-    # PDPT entry. A large demand VMA (> 1 GiB) needs multiple calls; for
-    # now split into per-GiB chunks (same as elf_install_user_range).
-    GIB: uint64 = 0x40000000
-    cur: uint64 = base
-    while cur < base + length:
-        gib_end: uint64 = (cur + GIB) & ~(GIB - 1)
-        chunk_end: uint64 = gib_end
-        if chunk_end > base + length:
-            chunk_end = base + length
-        if elf_prepare_demand_range(pml4, cur, chunk_end) < 0:
-            printk1("vma: demand PT prep OOM @ 0x%x\n", cur)
-            return cast[int64](-12)
-        cur = chunk_end
-
-    load_cr3(pml4)
+    # LAZY reserve (eager == 0): skip PT cracking entirely — the VMA carries
+    # the range and vma_demand_fault cracks each 2 MiB PT on first touch (only
+    # ever in the [VMA_LARGE_BASE, ...) window, where a fresh zeroed PT has no
+    # identity siblings to preserve). A MAP_FIXED reserve is not offered here
+    # (is_fixed can be a LOW-VA overlay needing identity-seeded PTs), but the
+    # linux-ABI reservation gate never sets MAP_FIXED for a reserve.
+    if eager != 0 or is_fixed != 0:
+        # Prepare page tables for the demand range (crack PDPT/PD/PT without
+        # installing any physical mappings).
+        # elf_prepare_demand_range requires the range to be within one 1 GiB
+        # PDPT entry. A large demand VMA (> 1 GiB) needs multiple calls; for
+        # now split into per-GiB chunks (same as elf_install_user_range).
+        GIB: uint64 = 0x40000000
+        cur: uint64 = base
+        while cur < base + length:
+            gib_end: uint64 = (cur + GIB) & ~(GIB - 1)
+            chunk_end: uint64 = gib_end
+            if chunk_end > base + length:
+                chunk_end = base + length
+            if elf_prepare_demand_range(pml4, cur, chunk_end) < 0:
+                printk1("vma: demand PT prep OOM @ 0x%x\n", cur)
+                return cast[int64](-12)
+            cur = chunk_end
+        load_cr3(pml4)
 
     node: uint64 = _vma_node_new()
     if node == 0:
@@ -4873,6 +4923,29 @@ def _vma_demand_fault_inner(slot: uint64, pml4_phys: uint64,
     # huge handler before the ordinary 4 KiB path.
     if cast[Ptr[VmaNode]](node)[0].is_huge != 0:
         return _vma_demand_fault_huge(slot, pml4_phys, fault_va, node)
+
+    # LAZY-PT reservation (vma_alloc_reserve): a large PROT_NONE/reserve mmap
+    # registered its VMA WITHOUT cracking page tables, so the covering 2 MiB PT
+    # may not exist yet. Materialise it on this first touch — one 2 MiB PT per
+    # 2 MiB region, cracked here rather than eagerly across the whole multi-GiB
+    # reservation. Confined to the [VMA_LARGE_BASE, ...) window (the only home
+    # of a lazy reserve), where a fresh zeroed PT has no kernel identity
+    # siblings. The cheap absent-check keeps this a no-op for an already-cracked
+    # PT (a re-fault, or an EAGER demand VMA that shares this VA range); only
+    # when the container is genuinely absent do we take the mm write lock and
+    # crack — double-checked so two threads faulting the same absent 2 MiB
+    # serialize and only the first allocates the PT.
+    fva_al: uint64 = fault_va & ~(VMA_PAGE_SIZE - 1)
+    if fault_va >= VMA_LARGE_BASE:
+        if elf_demand_leaf_absent(pml4_phys, fva_al) != 0:
+            vma_mm_write_lock(slot)
+            if elf_demand_leaf_absent(pml4_phys, fva_al) != 0:
+                if elf_prepare_demand_range(pml4_phys, fva_al,
+                                            fva_al + VMA_PAGE_SIZE) < 0:
+                    vma_mm_write_unlock(slot)
+                    printk1("vma: lazy-PT crack OOM at va=0x%x\n", fault_va)
+                    return -1
+            vma_mm_write_unlock(slot)
 
     prot: int32 = cast[Ptr[VmaNode]](node)[0].prot
     want_write: int32 = 0
