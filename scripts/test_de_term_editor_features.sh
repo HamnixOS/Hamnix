@@ -70,6 +70,25 @@ need   "$HAMSH" "_ed_delete_at_cursor" "Backspace/Delete remove at the cursor"
 needre "$HTS"   "code >= 1 and code < 127" \
     "hamtermscene forwards control bytes (incl. ESC=27) to the shell stdin"
 
+note "--- (1b) visible '_' cursor tracks the edit caret column ---"
+# REGRESSION (hands-on QA): arrow keys moved the edit position but the
+# underscore cursor indicator stayed pinned to the END of the line. Root
+# cause was _paint_scene appending the '_' at rlen unconditionally instead
+# of drawing it at the caret column. _redraw_edit_line already parks the
+# streaming cursor (term_col) at the in-line caret; the paint must overlay
+# the '_' at that column, and only APPEND it past the text when the caret
+# sits at end-of-line.
+needre "$HTS" "cur_col: uint64 = term_col" \
+    "_paint_scene reads the caret column from term_col (the parked edit caret)"
+needre "$HTS" "k == cur_col" \
+    "the '_' cursor overlays the glyph at the caret column (mid-line tracking)"
+needre "$HTS" "cur_col >= rlen" \
+    "the '_' is only appended past the text when the caret is at end-of-line"
+# _redraw_edit_line must keep parking term_col at the caret so the overlay
+# column is correct after Left/Right/Home/End/insert/delete.
+needre "$HTS" "term_col = edit_base \+ \(term_line_cur - start\)" \
+    "_redraw_edit_line parks term_col at the in-line edit caret"
+
 note "--- (2) command history (Up/Down) ---"
 need   "$HAMSH" "hist_append" "history ring append exists"
 need   "$HAMSH" "_hist_load"  "history recall loads a stored line"
