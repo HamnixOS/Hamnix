@@ -72,6 +72,8 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 180 \
        "echo CURL_HTTPS_DONE"                                    2 \
        "curl http://255.one/main/index.json"                    6 \
        "echo CURL_HTTP_DONE"                                     2 \
+       "curl 255.one/main/index.json"                            6 \
+       "echo CURL_SCHEMELESS_DONE"                               2 \
        "wget -O /tmp/idx.json https://255.one/main/index.json"  6 \
        "cat /tmp/idx.json"                                       3 \
        "echo CURL_WGET_DONE"                                     2 \
@@ -141,8 +143,21 @@ if echo "$http_block" | grep -E -q "$KEYRE"; then
     echo "[test_curl] OK: curl HTTP fetch returned JSON (plain TCP works)"
 fi
 
+# 6b. Scheme-less fetch (`curl 255.one/...`, no http://) — the hands-on-QA
+# bug shape. Must behave like the explicit-http path (curl defaults to
+# http://), NOT fail "malformed or unsupported URL".
+schemeless_block=$(sed -n '/CURL_HTTP_DONE/,/CURL_SCHEMELESS_DONE/p' "$LOG")
+schemeless_ok=0
+if echo "$schemeless_block" | grep -F -q "malformed or unsupported URL"; then
+    echo "[test_curl] FAIL: scheme-less 'curl 255.one/...' still rejects the URL"
+    fail=1
+elif echo "$schemeless_block" | grep -E -q "$KEYRE"; then
+    schemeless_ok=1
+    echo "[test_curl] OK: scheme-less curl fetch returned JSON (http:// default)"
+fi
+
 # 7. wget -> file -> cat round-trip.
-wget_block=$(sed -n '/CURL_HTTP_DONE/,/CURL_WGET_DONE/p' "$LOG")
+wget_block=$(sed -n '/CURL_SCHEMELESS_DONE/,/CURL_WGET_DONE/p' "$LOG")
 wget_ok=0
 if echo "$wget_block" | grep -E -q "saved [0-9]+ bytes"; then
     if echo "$wget_block" | grep -E -q "$KEYRE"; then
@@ -151,11 +166,11 @@ if echo "$wget_block" | grep -E -q "saved [0-9]+ bytes"; then
     fi
 fi
 
-if [ "$https_ok" -eq 1 ] && [ "$http_ok" -eq 1 ] && [ "$wget_ok" -eq 1 ]; then
-    echo "[test_curl] OK: curl + wget fetch HTTP and HTTPS correctly"
+if [ "$https_ok" -eq 1 ] && [ "$http_ok" -eq 1 ] && [ "$schemeless_ok" -eq 1 ] && [ "$wget_ok" -eq 1 ]; then
+    echo "[test_curl] OK: curl + wget fetch HTTP, HTTPS and scheme-less correctly"
 elif [ "$internet_alive" -eq 1 ]; then
     echo "[test_curl] FAIL: internet reachable but a fetch assertion missed"
-    echo "[test_curl]       (https_ok=$https_ok http_ok=$http_ok wget_ok=$wget_ok)"
+    echo "[test_curl]       (https_ok=$https_ok http_ok=$http_ok schemeless_ok=$schemeless_ok wget_ok=$wget_ok)"
     fail=1
 else
     echo "[test_curl] SKIP: fetch assertions — no host internet egress"

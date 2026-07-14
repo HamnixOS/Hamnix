@@ -246,6 +246,19 @@ sys_stat_p9:
     ret
     .size sys_stat_p9, .-sys_stat_p9
 
+    /* --- sys_resolve(hostname, hlen) -> int64 ----------------------
+       Native-ABI in-kernel DNS resolve (Hamnix syscall 269). The host
+       Linux kernel has no such resolver, so this is a host stub that
+       reports failure — it exists only so http9.ad (which imports it)
+       links for the x86_64-linux host unit tests. On-device the real
+       wrapper lives in the native user runtime, not here. */
+    .globl sys_resolve
+    .type sys_resolve, @function
+sys_resolve:
+    movq    $-1, %rax
+    ret
+    .size sys_resolve, .-sys_resolve
+
 
     /* --- sys_exit(code) — never returns ----------------------------- */
     .globl sys_exit
