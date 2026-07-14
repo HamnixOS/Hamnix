@@ -54,6 +54,13 @@ assert_grep '^glyphs 10 8 \"Control Center\"'      "hub title bar"
 assert_grep '^glyphs 152 40 \"Desktop Wallpaper\"' "Appearance page heading"
 assert_grep '^ACT_SWATCH 2'                         "swatch click returns ACT_WALL(2)"
 assert_grep '^SEL_SWATCH 3'                         "picked swatch index 3"
+# Default wallpaper option: the DE's out-of-box indigo-slate gradient is now a
+# labelled, selectable picker entry (image index 0) that routes to the same
+# wallpaper sink — so a user who picked Sunset/Ocean/Tiles/a colour can get back.
+assert_grep '^glyphs .*\"Default\"'                 "Default wallpaper option labelled in picker"
+assert_grep '^ACT_WALLIMG 7'                        "Default thumbnail click returns ACT_WALLIMG(7)"
+assert_grep '^SEL_IMAGE 0'                           "Default is image index 0 (routes to wallpaper sink)"
+assert_grep '^SEL_KIND 1'                            "Default selection latched as an image wallpaper"
 # --- Date & Time page ---
 assert_grep '^ACT_CAT_DT 1'                         "sidebar switched to Date & Time (ACT_CAT)"
 assert_grep '^glyphs .*\"Date & Time\"'             "Date & Time heading"
