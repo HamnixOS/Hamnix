@@ -430,8 +430,13 @@ extern def cea_entry_text_end() -> uint64
 pgt_cea_ready:      uint64 = 0
 # Recorded at build time so CEA_VA() and the selftest agree on the bias.
 pgt_cea_text_start: uint64 = 0
-# The CEA PD physical base (retained for the read-only selftest walk).
-pgt_cea_pd_base:    uint64 = 0
+# The CEA PDPT base (VA) — root of the window under PML4[274]. The mapper
+# walks from here, lazily allocating a PD per touched 1 GiB PDPT slot and a
+# PT per touched 2 MiB PD slot, so the window can span the WHOLE kernel
+# image no matter how far the entry .bss structures sit from .text (a large
+# embedded initramfs/rootfs can push the IDT/GDT/TSS/#DF past the first
+# GiB; a single fixed PD silently dropped them — KPTI CEA UEFI divergence).
+pgt_cea_pdpt_base:  uint64 = 0
 
 
 def pgtable_cea_ready() -> uint64:
@@ -456,47 +461,58 @@ def _cea_zero_page(pa: uint64):
         i = i + 1
 
 
-def _cea_map_page(pd_base: uint64, kva: uint64) -> int32:
-    # Alias the 4 KiB page containing kernel-image VA `kva` into the CEA
-    # window at CEA_VA(kva). Lazily allocates the PT page for kva's PD slot.
-    # Returns 1 on success, 0 on OOM.
-    offset: uint64 = kva - pgt_cea_text_start
-    pd_idx: uint64 = (offset >> PGT_2M_SHIFT) & cast[uint64](0x1FF)
-    pt_idx: uint64 = (offset >> 12) & cast[uint64](0x1FF)
-    pd_slot: Ptr[uint64] = cast[Ptr[uint64]](pd_base + pd_idx * 8)
-    pde: uint64 = pd_slot[0]
-    # `pt_base` is kept as a dereferenceable VIRTUAL address in BOTH branches
-    # so the leaf store below can index it uniformly:
-    #   * fresh path: alloc_page() already returns a VA;
-    #   * existing path: the child base read out of the PDE is a PHYSICAL
-    #     frame, so __va() converts it back to a kernel VA to dereference.
-    # When storing the freshly-allocated PT page INTO the PDE we go the other
-    # way with __pa(), stamping its physical base (not its VA) into the entry.
-    # This builder runs AFTER pgtable_build_page_offset_map() (see init.ad
-    # ordering), so the page_offset alias __va() targets is already live.
-    pt_base: uint64 = 0
-    if (pde & PGT_FLAG_P) == 0:
-        pt_base = alloc_page()
-        if pt_base == 0:
+def _cea_walk_child(parent: uint64, idx: uint64) -> uint64:
+    # Return a dereferenceable VA for the child table under parent[idx],
+    # lazily allocating + linking it if absent. Both parent and the returned
+    # child are handled as VIRTUAL addresses; __pa() converts a freshly
+    # allocated child to the physical base stamped into the entry, and __va()
+    # rebases an existing child's physical base back to a kernel VA. Runs
+    # AFTER pgtable_build_page_offset_map() so __va() targets a live alias.
+    # Returns 0 on OOM.
+    slot: Ptr[uint64] = cast[Ptr[uint64]](parent + idx * 8)
+    ent: uint64 = slot[0]
+    if (ent & PGT_FLAG_P) == 0:
+        child: uint64 = alloc_page()
+        if child == 0:
             return 0
-        _cea_zero_page(pt_base)
-        pd_slot[0] = __pa(pt_base) | PGT_CEA_FLAGS
-    else:
-        pt_base = __va(pde & PGT_ADDR_MASK)
+        _cea_zero_page(child)
+        slot[0] = __pa(child) | PGT_CEA_FLAGS
+        return child
+    return __va(ent & PGT_ADDR_MASK)
+
+
+def _cea_map_page(kva: uint64) -> int32:
+    # Alias the 4 KiB page containing kernel-image VA `kva` into the CEA
+    # window at CEA_VA(kva). Walks the CEA's OWN indices from the PDPT root
+    # (pgt_cea_pdpt_base), lazily allocating the PD for kva's 1 GiB slot and
+    # the PT for its 2 MiB slot. Keyed on the CEA VA's indices — NOT a fixed
+    # single PD — so a structure any distance past .text (e.g. a .bss IDT
+    # beyond the first GiB when a large embedded rootfs bloats .data) still
+    # maps. Returns 1 on success, 0 on OOM.
+    cea: uint64 = pgtable_cea_va(kva)
+    pdpt_idx: uint64 = (cea >> PGT_1GB_SHIFT) & cast[uint64](0x1FF)
+    pd_idx:   uint64 = (cea >> PGT_2M_SHIFT) & cast[uint64](0x1FF)
+    pt_idx:   uint64 = (cea >> 12) & cast[uint64](0x1FF)
+    pd: uint64 = _cea_walk_child(pgt_cea_pdpt_base, pdpt_idx)
+    if pd == 0:
+        return 0
+    pt: uint64 = _cea_walk_child(pd, pd_idx)
+    if pt == 0:
+        return 0
     # Leaf: phys of the image page (high-half VA rebased to low phys).
     phys: uint64 = virt_to_phys(kva & ~cast[uint64](4095))
-    cast[Ptr[uint64]](pt_base + pt_idx * 8)[0] = phys | PGT_CEA_FLAGS
+    cast[Ptr[uint64]](pt + pt_idx * 8)[0] = phys | PGT_CEA_FLAGS
     return 1
 
 
-def _cea_map_range(pd_base: uint64, start: uint64, end: uint64) -> uint64:
+def _cea_map_range(start: uint64, end: uint64) -> uint64:
     # Map every 4 KiB page in [start, end) into the CEA window. Returns the
     # number of pages mapped (0 on the first OOM — partial maps are harmless
     # because nothing references the CEA VAs yet).
     cur: uint64 = start & ~cast[uint64](4095)
     mapped: uint64 = 0
     while cur < end:
-        if _cea_map_page(pd_base, cur) == 0:
+        if _cea_map_page(cur) == 0:
             return mapped
         mapped = mapped + 1
         cur = cur + 4096
@@ -522,36 +538,38 @@ def pgtable_build_cpu_entry_area():
         printk0("[pgtable] cpu_entry_area: OOM allocating CEA PDPT\n")
         return
     _cea_zero_page(pdpt)
-    pd: uint64 = alloc_page()
-    if pd == 0:
-        printk0("[pgtable] cpu_entry_area: OOM allocating CEA PD\n")
-        return
-    _cea_zero_page(pd)
-    pgt_cea_pd_base = pd
+    pgt_cea_pdpt_base = pdpt
 
-    # Link PML4[274] -> PDPT -> PDPT[0] -> PD (all US=0). `pdpt` and `pd` are
-    # dereferenced through their alloc VAs; __pa() converts each to the phys
-    # base the parent entry must hold. No-op today (alloc VA==PA), flip-safe
-    # tomorrow. The `pml4` root is the boot PML4 from CR3 and stays identity-
-    # mapped, so it is dereferenced directly.
-    cast[Ptr[uint64]](pdpt)[0] = __pa(pd) | PGT_CEA_FLAGS
+    # Link PML4[274] -> PDPT (US=0). The per-1 GiB PDs and per-2 MiB PTs are
+    # allocated LAZILY by _cea_map_page as ranges are mapped, so the window
+    # can span the whole kernel image regardless of how far the entry .bss
+    # structures sit from .text. `pdpt` is dereferenced through its alloc VA;
+    # __pa() converts it to the phys base the parent entry must hold (no-op
+    # today, alloc VA==PA). The `pml4` root is the boot PML4 from CR3 and
+    # stays identity-mapped, so it is dereferenced directly.
     cr3:  uint64 = get_bsp_cr3()
     pml4: uint64 = cr3 & PGT_ADDR_MASK
     cast[Ptr[uint64]](pml4 + PGT_CEA_PML4_IDX * 8)[0] = __pa(pdpt) | PGT_CEA_FLAGS
 
-    # Map executable .text (every entry stub) contiguously.
-    text_pages: uint64 = _cea_map_range(pd, text_start, text_end)
-    # Map the discrete entry data structures.
+    # Map executable .text (every entry stub) contiguously, then the discrete
+    # entry data structures. Each returns the pages mapped; a short count
+    # means alloc_page() ran dry building a lazy PD/PT — surfaced below so an
+    # incomplete CEA is never mistaken for a healthy one.
     idt_kva:  uint64 = cea_idt_addr()
     gdt_kva:  uint64 = cea_gdt_addr()
     tss_kva:  uint64 = cea_tss_addr()
     df_kva:   uint64 = cea_df_stack_addr()
     verw_kva: uint64 = cea_verw_addr()
-    _cea_map_range(pd, idt_kva,  idt_kva  + PGT_CEA_IDT_BYTES)
-    _cea_map_range(pd, gdt_kva,  gdt_kva  + PGT_CEA_GDT_BYTES)
-    _cea_map_range(pd, tss_kva,  tss_kva  + PGT_CEA_TSS_BYTES)
-    _cea_map_range(pd, df_kva,   df_kva   + PGT_CEA_DF_BYTES)
-    _cea_map_range(pd, verw_kva, verw_kva + PGT_CEA_VERW_BYTES)
+    text_pages: uint64 = _cea_map_range(text_start, text_end)
+    m_idt:  uint64 = _cea_map_range(idt_kva,  idt_kva  + PGT_CEA_IDT_BYTES)
+    m_gdt:  uint64 = _cea_map_range(gdt_kva,  gdt_kva  + PGT_CEA_GDT_BYTES)
+    m_tss:  uint64 = _cea_map_range(tss_kva,  tss_kva  + PGT_CEA_TSS_BYTES)
+    m_df:   uint64 = _cea_map_range(df_kva,   df_kva   + PGT_CEA_DF_BYTES)
+    m_verw: uint64 = _cea_map_range(verw_kva, verw_kva + PGT_CEA_VERW_BYTES)
+    if (m_idt == 0) | (m_gdt == 0) | (m_tss == 0) | (m_df == 0) \
+            | (m_verw == 0):
+        printk0("[pgtable] cpu_entry_area: WARN OOM mapping an entry"
+                " structure (incomplete CEA)\n")
 
     # Flush the TLB so the new window is live immediately.
     load_cr3(cr3)
