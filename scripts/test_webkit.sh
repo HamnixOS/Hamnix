@@ -233,46 +233,84 @@ echo "$TAG --- WebKit / GTK / Wayland serial output ---"
 grep -aiE "\[WK\]|webkit|MiniBrowser|WebProcess|NetworkProcess|GPUProcess|gtk|gdk|wayland|glib|assert|abort|error|fatal|segfault|not provide|failed|bwrap|sandbox" "$LOG" | tail -60 || true
 
 # =====================================================================
-# WIRE-TRACE DECISION (WAYLAND_DEBUG ground truth — the "[WK]" lines).
+# WIRE-TRACE DECISION (KERNEL ground truth — [wayland]/[wl-req]/[wktrace],
+# NOT the client's [WK] WAYLAND_DEBUG lines, which never reach the serial
+# console under `spawn linux`; see the block below).
 # =====================================================================
-# The same decision block the Firefox gate uses, adapted to WebKit's "[WK]"
-# prefix: distinguish a GL/EGL wall from the software wl_shm path, and pin the
-# EXACT xdg-shell verb the window-map reaches.
-#   * ANY egl/GLContext/GBM/dmabuf line   -> branch (a): a real GL/EGL wall.
-#   * wl_shm create_pool (+ growing resize) -> branch (b): SWGL/Skia wl_shm
-#                                              software path IS taken (no GL).
-#   * furthest xdg_* verb + whether get_xdg_surface / attach / commit fire ->
-#     EXACTLY where the window-map stalls.
-echo "$TAG --- wire-trace decision (WAYLAND_DEBUG ground truth) ---"
-wk_egl=$(grep -acE '^\[WK\].*(egl|EGL|GLContext|glx|GLX|create_context|gbm|GBM|dmabuf|zwp_linux_dmabuf)' "$LOG" 2>/dev/null)
-wk_shmpool=$(grep -acE '^\[WK\].*wl_shm(#[0-9]+)?\.create_pool' "$LOG" 2>/dev/null)
-wk_shmresize=$(grep -aoE 'wl_shm_pool#[0-9]+\.resize\([0-9]+\)' "$LOG" 2>/dev/null | tail -1)
-wk_xdgbind=$(grep -acE '^\[WK\].*bind\([0-9]+, .xdg_wm_base.' "$LOG" 2>/dev/null)
-wk_getxdg=$(grep -acE '^\[WK\].*(get_xdg_surface|get_toplevel|xdg_surface#[0-9]+\.|xdg_toplevel#[0-9]+\.)' "$LOG" 2>/dev/null)
-wk_attach=$(grep -acE '^\[WK\].*wl_surface#[0-9]+\.(attach|commit)' "$LOG" 2>/dev/null)
-echo "$TAG   WebKit EGL/GLContext lines  : ${wk_egl:-0}  (>0 => branch (a) GL wall)"
-echo "$TAG   wl_shm create_pool          : ${wk_shmpool:-0}  (>0 => Skia wl_shm path taken)"
-echo "$TAG   last shm-pool resize        : ${wk_shmresize:-<none>}"
-echo "$TAG   xdg_wm_base bind            : ${wk_xdgbind:-0}"
-echo "$TAG   xdg_surface/toplevel verbs  : ${wk_getxdg:-0}  (0 => window-map never begun)"
-echo "$TAG   wl_surface attach/commit    : ${wk_attach:-0}  (0 => no buffer committed)"
-if [ "${wk_egl:-0}" -gt 0 ]; then
-    echo "$TAG   VERDICT: branch (a) — a GL/EGL context opened on the render path;"
-    echo "$TAG     force WEBKIT_DISABLE_COMPOSITING_MODE=1 / WEBKIT_DISABLE_DMABUF_RENDERER=1."
-elif [ "${wk_shmpool:-0}" -gt 0 ] && [ "${wk_getxdg:-0}" -eq 0 ]; then
-    echo "$TAG   VERDICT: branch (b) — GL wall DISPROVEN; Skia wl_shm path active,"
-    echo "$TAG     but the client parks after the xdg_wm_base bind and never creates"
-    echo "$TAG     the xdg_surface (window-map stall UPSTREAM of surface commit)."
-elif [ "${wk_getxdg:-0}" -gt 0 ] && [ "${wk_attach:-0}" -eq 0 ]; then
-    echo "$TAG   VERDICT: branch (b) — reached xdg_surface but never committed a"
-    echo "$TAG     wl_shm buffer (map stalls at the attach/commit step)."
-elif [ "${wk_attach:-0}" -gt 0 ]; then
-    echo "$TAG   VERDICT: buffer committed / attach fired — inspect the ladder (b) result above."
+# Wire-trace decision keyed on the KERNEL's ground-truth markers (compositor
+# `[wayland] ...` + `[wl-req]` + the `[wktrace]` syscall probe + `[devwsys]`
+# map), NOT the client's own WAYLAND_DEBUG `[WK]` lines.
+#
+# WHY (root cause of the recurring "MiniBrowser dies before wl connect"
+# MISCHARACTERIZATION): MiniBrowser runs under `spawn linux { ... }`, whose
+# child stdout/stderr is NOT wired to the boot serial console — so WAYLAND_DEBUG
+# (which prints the `wl_display@...->get_xdg_surface` wire to the client's
+# stderr) NEVER reaches $LOG. Only a handful of `[WK]` launcher-echo lines make
+# it through the pipe; the actual `[WK]`-prefixed wire trace this block used to
+# grep is ALWAYS empty, so every run fell into the final "no [WK] wire trace
+# captured — may not have reached wl connection" branch even when MiniBrowser
+# had in fact connected, bound the full registry and issued dozens of requests.
+# That false-negative is exactly what produced the "ZERO [WK] output" premise.
+#
+# The compositor (linux_abi/wayland.ad) and the `[wktrace]` probe
+# (linux_abi/u_syscalls.ad) print to the KERNEL log, which IS on the serial
+# console — the true, always-captured ground truth:
+#   * `[wktrace] pid=N (MiniBrowser) ...`     -> the UIProcess exec'd + is
+#                                                issuing syscalls (it is ALIVE).
+#   * MiniBrowser nr=41/nr=42 (socket/connect) -> it opened the AF_UNIX Wayland
+#                                                 connection.
+#   * `[wayland] registry advertised`          -> it bound the full registry
+#                                                 (incl xdg_wm_base).
+#   * `[wl-req]` count                          -> N Wayland wire requests issued.
+#   * `[wayland] xdg get_xdg_surface`           -> it began the window map.
+#   * `[wayland] xdg get_toplevel`              -> toplevel role created.
+#   * `[wayland] surface commit` / `[devwsys] window N mapped` -> buffer
+#                                                 committed / window mapped.
+# grep -aoF | wc -l counts occurrences even when the kernel concatenates two
+# markers on one serial line (no trailing newline flush under load).
+echo "$TAG --- wire-trace decision (KERNEL ground truth: [wayland]/[wl-req]/[wktrace]) ---"
+cnt() { grep -aoF "$1" "$LOG" 2>/dev/null | wc -l | tr -d ' '; }
+k_alive=$(cnt "(MiniBrowser)")
+k_sock=$(grep -aoE 'wktrace. pid=[0-9]+ .MiniBrowser. nr=(41|42)\b' "$LOG" 2>/dev/null | wc -l | tr -d ' ')
+k_reg=$(cnt "registry advertised")
+k_wlreq=$(cnt "[wl-req]")
+k_getxdg=$(cnt "xdg get_xdg_surface")
+k_toplevel=$(cnt "xdg get_toplevel")
+k_commit=$(cnt "[wayland] surface commit")
+k_map=$(grep -aoE '\[devwsys\] window [0-9]+ mapped pid=[0-9]+' "$LOG" 2>/dev/null | wc -l | tr -d ' ')
+# Secondary (informational only): a GL/EGL line, if any [WK] output survived.
+wk_egl=$(grep -acE '\[WK\].*(egl|EGL|GLContext|glx|GLX|gbm|GBM|dmabuf)' "$LOG" 2>/dev/null)
+echo "$TAG   MiniBrowser [wktrace] events : ${k_alive:-0}  (>0 => UIProcess exec'd + running)"
+echo "$TAG   Wayland socket/connect       : ${k_sock:-0}  (>0 => AF_UNIX wl connection opened)"
+echo "$TAG   registry advertised          : ${k_reg:-0}  (>0 => full registry bound)"
+echo "$TAG   [wl-req] wire requests        : ${k_wlreq:-0}"
+echo "$TAG   xdg get_xdg_surface          : ${k_getxdg:-0}  (0 => window-map never begun)"
+echo "$TAG   xdg get_toplevel             : ${k_toplevel:-0}"
+echo "$TAG   surface commit               : ${k_commit:-0}  (0 => no buffer committed)"
+echo "$TAG   [devwsys] window mapped       : ${k_map:-0}"
+echo "$TAG   ([WK] GL/EGL lines, info-only : ${wk_egl:-0})"
+if [ "${k_map:-0}" -gt "$pre_maps" ] || [ "${k_commit:-0}" -gt 0 ]; then
+    echo "$TAG   VERDICT: window MAPPED — MiniBrowser committed a wl_shm buffer;"
+    echo "$TAG     inspect the ladder (b)/(c) result + screendump above."
+elif [ "${k_getxdg:-0}" -gt 0 ]; then
+    echo "$TAG   VERDICT: reached xdg_surface (get_xdg_surface fired) but never"
+    echo "$TAG     committed a wl_shm buffer — map stalls at the attach/commit step."
+elif [ "${k_reg:-0}" -gt 0 ]; then
+    echo "$TAG   VERDICT: connected + bound the FULL registry (incl xdg_wm_base) and"
+    echo "$TAG     issued ${k_wlreq:-0} wire requests, but NEVER created the xdg_surface"
+    echo "$TAG     (get_xdg_surface=0) — window-map stall UPSTREAM of surface role,"
+    echo "$TAG     the SAME rung Firefox walls at (GTK multi-thread startup-readiness"
+    echo "$TAG     barrier: main thread spins / worker threads park in a libc futex"
+    echo "$TAG     BEFORE the toplevel is created — engine-internal, not a wl gap)."
+elif [ "${k_sock:-0}" -gt 0 ]; then
+    echo "$TAG   VERDICT: opened the wl socket but did not complete the registry"
+    echo "$TAG     handshake — check the connect/roundtrip path."
+elif [ "${k_alive:-0}" -gt 0 ]; then
+    echo "$TAG   VERDICT: MiniBrowser exec'd + ran (traced syscalls) but never opened"
+    echo "$TAG     the Wayland socket — stalled in early GTK/GDK init, pre-connect."
 else
-    echo "$TAG   VERDICT: no [WK] wire trace captured — MiniBrowser may not have"
-    echo "$TAG     reached wl connection (check the multi-process fork/exec + AF_UNIX"
-    echo "$TAG     SCM_RIGHTS IPC path: which of MiniBrowser/WebProcess/NetworkProcess"
-    echo "$TAG     stalled, on which syscall/fd)."
+    echo "$TAG   VERDICT: no [wktrace] events — MiniBrowser did not exec (check the"
+    echo "$TAG     spawn linux fork/exec + the ~120MB libwebkit2gtk dynamic load)."
 fi
 
 # =====================================================================
