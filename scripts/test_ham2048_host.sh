@@ -225,34 +225,51 @@ fi
 
 # --- PER-MOVE ANIMATION BUDGET (the "slows way down once you play" bug) -----
 # The live native driver (user/ham2048scene.ad::_run_anim) emits one /scene
-# commit per animation frame — 1 (frame 0) + SLIDE_FRAMES + POP_FRAMES commits —
-# each followed by a fixed _delay(J) busy-wait (J jiffies @ 100Hz = 10ms each).
-# On the software rasterizer EVERY commit is a full-board re-raster, so the
-# per-move blocking cost scales with the COMMIT COUNT. The original 6+3 frames
-# at 2 jiffies = 10 commits x 20ms = 200ms of busy-wait (and 10 full re-rasters
-# ~= 1.8s on-device) made an active game feel like it ground to a halt. This
-# gate reads the shipping constants straight from source and asserts the
-# per-move animation budget stayed SNAPPY (commits x delay well under 250ms),
-# guarding against a regression that re-inflates the frame count or delay.
+# commit per animation frame. A `commit` is SYNCHRONOUS on-device: devwsys
+# handles it by re-rasterizing the whole window (memset w*h*4 + every AA glyph)
+# and presenting it BEFORE the client's commit write returns. So the per-move
+# input-stall scales with the COMMIT COUNT x a full re-raster (tens of ms each on
+# HW), and the tiny _delay(J) busy-wait between frames is a minor addend. The
+# driver now uses an advance-THEN-emit loop that SKIPS the redundant frame-0
+# render (the pre-move board already shows every tile at its source cell), so the
+# live commit count is exactly SLIDE_FRAMES + POP_FRAMES — no leading +1. The
+# original 6+3 frames = 10 commits (~1.8s on-device); 3+1 cut it to 5; this cut
+# it to 2+1 = 3. This gate reads the shipping constants + the driver's loop shape
+# straight from source and asserts the per-move animation budget stayed SNAPPY,
+# guarding against a regression that re-inflates the frame count, delay, or
+# reintroduces a redundant pre-loop emit.
 SLIDE_FRAMES=$(grep -E '^SLIDE_FRAMES:' lib/ham2048core.ad | grep -oE '= *[0-9]+' | grep -oE '[0-9]+' | head -1)
 POP_FRAMES=$(grep -E '^POP_FRAMES:' lib/ham2048core.ad | grep -oE '= *[0-9]+' | grep -oE '[0-9]+' | head -1)
 DELAY_J=$(awk '/def _run_anim/{r=1} r&&/_delay\(/{print; exit}' user/ham2048scene.ad | grep -oE '_delay\([0-9]+\)' | grep -oE '[0-9]+' | head -1)
 : "${SLIDE_FRAMES:=0}" "${POP_FRAMES:=0}" "${DELAY_J:=0}"
-COMMITS=$(( 1 + SLIDE_FRAMES + POP_FRAMES ))
+# Verify the advance-then-emit loop shape: _run_anim must NOT emit_scene_anim
+# BEFORE its `while` (the dropped redundant frame-0). If a pre-loop emit is
+# reintroduced the commit count is SLIDE+POP+1, not SLIDE+POP — fail loudly so
+# the budget below stays honest.
+PRELOOP_EMIT=$(awk '/def _run_anim/{r=1;next} r&&/while /{exit} r&&/emit_scene_anim/{print "yes";exit}' user/ham2048scene.ad)
+if [ -z "$PRELOOP_EMIT" ]; then
+    echo "[2048-host] PASS _run_anim drops the redundant frame-0 emit (advance-then-emit)"
+    COMMITS=$(( SLIDE_FRAMES + POP_FRAMES ))
+else
+    echo "[2048-host] FAIL _run_anim emits before its loop (redundant frame-0 re-raster reintroduced)"; fail=1
+    COMMITS=$(( 1 + SLIDE_FRAMES + POP_FRAMES ))
+fi
 PERMOVE_MS=$(( COMMITS * DELAY_J * 10 ))
-echo "[2048-host] per-move animation: SLIDE_FRAMES=$SLIDE_FRAMES POP_FRAMES=$POP_FRAMES delay=${DELAY_J}j -> $COMMITS commits x ${DELAY_J}0ms = ${PERMOVE_MS}ms busy-wait"
+echo "[2048-host] per-move animation: SLIDE_FRAMES=$SLIDE_FRAMES POP_FRAMES=$POP_FRAMES delay=${DELAY_J}j -> $COMMITS commits (synchronous re-rasters) + ${PERMOVE_MS}ms busy-wait"
 # Slide must still animate (>=2 slide frames so tiles travel, not teleport).
 if [ "$SLIDE_FRAMES" -ge 2 ]; then
     echo "[2048-host] PASS slide still animates (SLIDE_FRAMES=$SLIDE_FRAMES >= 2)"
 else
     echo "[2048-host] FAIL slide has too few frames to animate: SLIDE_FRAMES=$SLIDE_FRAMES"; fail=1
 fi
-# Budget: well under 250ms (target ~snappy). Old 6+3@2j was 200ms; regressing
-# back to that (or worse) trips this. A pop frame is required so the merge reads.
-if [ "$COMMITS" -gt 0 ] && [ "$DELAY_J" -gt 0 ] && [ "$PERMOVE_MS" -le 120 ] && [ "$POP_FRAMES" -ge 1 ]; then
-    echo "[2048-host] PASS per-move animation budget is snappy: ${PERMOVE_MS}ms (<=120ms), $COMMITS commits/move"
+# Budget: <=4 commits/move (target ~snappy). The dominant on-device cost is the
+# synchronous re-raster PER COMMIT, so the commit count is the real lever — bound
+# it directly. 2+1 = 3 passes; regressing back to 5 (3+1+1) or 10 trips this. A
+# pop frame is required so the merge reads. Delay stays a minor addend.
+if [ "$COMMITS" -gt 0 ] && [ "$DELAY_J" -gt 0 ] && [ "$COMMITS" -le 4 ] && [ "$PERMOVE_MS" -le 120 ] && [ "$POP_FRAMES" -ge 1 ]; then
+    echo "[2048-host] PASS per-move animation budget is snappy: $COMMITS commits/move (<=4), ${PERMOVE_MS}ms busy-wait"
 else
-    echo "[2048-host] FAIL per-move animation budget too heavy: ${PERMOVE_MS}ms, $COMMITS commits, pop=$POP_FRAMES"; fail=1
+    echo "[2048-host] FAIL per-move animation budget too heavy: $COMMITS commits, ${PERMOVE_MS}ms, pop=$POP_FRAMES"; fail=1
 fi
 
 # --- BOUNDED PER-MOVE COST (the "slows down after a few turns" bug class) --
