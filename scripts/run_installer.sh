@@ -79,6 +79,26 @@ ACCEL=(); if [ -z "${NO_KVM:-}" ] && [ -e /dev/kvm ]; then ACCEL=(-enable-kvm -c
 
 NET=(); if [ -z "${NO_NET:-}" ]; then NET=(-netdev user,id=hnet0 -device virtio-net-pci,netdev=hnet0); fi
 
+# --- audio: attach an Intel HDA controller + output codec -------------------
+# So the native HDA driver enumerates a class-0403 device at boot and the DE's
+# volume applet / aplay / playtone find a live /dev/audio. Without this the guest
+# has NO sound device at all (hda_init skips) — the "nothing is audible" report.
+# HDA_AUDIODEV picks the HOST backend: default auto-detect (PulseAudio socket ->
+# pa, else none). Set HDA_AUDIODEV=pa|pipewire|alsa|sdl|none to override, or
+# HDA_AUDIODEV=wav,path=/tmp/out.wav to capture guest audio to a file. `none`
+# still enumerates the device (DE works) but you won't hear it.
+if [ -z "${HDA_AUDIODEV:-}" ]; then
+    if [ -n "${NO_AUDIO:-}" ]; then
+        HDA_AUDIODEV="none"
+    elif [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse/native" ]; then
+        HDA_AUDIODEV="pa"
+    else
+        HDA_AUDIODEV="none"
+        [ -z "${HEADLESS:-}" ] && say "no PulseAudio socket found: audio device enumerated but muted (set HDA_AUDIODEV=pipewire|alsa|sdl to hear it)"
+    fi
+fi
+AUDIO=(-audiodev "${HDA_AUDIODEV},id=snd0" -device intel-hda -device hda-output,audiodev=snd0)
+
 DISPLAY_ARGS=(); LOG=""
 if [ -n "${HEADLESS:-}" ]; then
     DISPLAY_ARGS=(-display none -serial stdio)
@@ -107,6 +127,7 @@ exec qemu-system-x86_64 \
     -device nvme,drive=nvmetgt,serial=hamtgt01 \
     -drive "file=$DISK,format=qcow2,if=none,id=nvmetgt" \
     "${NET[@]}" \
+    "${AUDIO[@]}" \
     "${DISPLAY_ARGS[@]}" \
     -no-reboot \
     -monitor none
