@@ -3336,6 +3336,15 @@ _AD_WORK = None          # work dir for the codegen.ad ELFs
 # same behavior). Default OFF: codegen.ad runs on its exact pre-opt path and
 # the gate stays byte-exact against the seed.
 ADDER_OPT = os.environ.get("ADDER_OPT", "0") not in ("", "0", "off", "false")
+# ADDER_CHECK_BOUNDS=1 additionally arms opt-in runtime array-bounds checking
+# (--check-bounds) in the codegen.ad differential lane. Because the fuzzer's
+# by-construction oracle only ever generates IN-RANGE indices, the checks are
+# behaviorally transparent — this lane proves the (increment-2) bounds
+# instrumentation, including the --opt isel index paths, never corrupts a
+# correct program's result. Default OFF (byte-inert). Pair with ADDER_OPT=1 to
+# exercise the isel-path checks the seed's opt-0 gate cannot reach.
+ADDER_CHECK_BOUNDS = os.environ.get("ADDER_CHECK_BOUNDS", "0") \
+    not in ("", "0", "off", "false")
 _AD_OPT_FOLDS_TOTAL = 0   # running fold count across the ADDER_OPT=1 lane
 _AD_OPT_PROGS_FOLDED = 0  # programs in which >=1 fold fired
 _AD_OPT_CSE_TOTAL = 0     # running CSE-elimination count across the lane
@@ -3444,7 +3453,8 @@ def run_through_ad_codegen(seed, body):
     global _AD_OPT_CONSTBRANCH_TOTAL, _AD_OPT_PROGS_CONSTBRANCH
     global _AD_OPT_COPYPROP_TOTAL, _AD_OPT_PROGS_COPYPROP
     host = _ad_host()
-    r = host.run_through_codegen_ad(seed, body, _AD_WORK, opt=ADDER_OPT)
+    r = host.run_through_codegen_ad(seed, body, _AD_WORK, opt=ADDER_OPT,
+                                    check_bounds=ADDER_CHECK_BOUNDS)
     if r.kind == "unsupported":
         return ("unsupported", r.detail)
     if r.kind == "ok":

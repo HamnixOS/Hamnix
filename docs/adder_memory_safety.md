@@ -1,11 +1,14 @@
 # Memory safety in Adder
 
-Status: **increment 1 + 1b landed** (opt-in runtime array-bounds checking for
+Status: **increment 1 + 1b + 2 landed** (opt-in runtime array-bounds checking for
 userspace, with an `unsafe:` opt-out). Increment 1 landed the checks in the
 frozen Python seed (the oracle); **increment 1b mirrors them into the native
 `.ad` backend** (`adder/compiler/codegen.ad` + `parser.ad` + the host driver),
-so the DEFAULT shipping compiler emits the identical bytes. This document is
-both the design and the roadmap.
+so the DEFAULT shipping compiler emits the identical bytes; **increment 2 extends
+the native check to the `--opt` isel index paths** (direct-SIB register +
+index-into-`%rcx`), which previously routed the index out of `%rax` and silently
+dropped the check (see roadmap item 2b). This document is both the design and the
+roadmap.
 
 ## Motivation & constraints
 
@@ -220,10 +223,27 @@ Ordered by value/effort; each stays opt-in + kernel-bypassable.
    no-op via `expr_array_type == 0`. Bytes match GNU `as`
    (`48 83 F8 ib | 48 81 F8 id` / `72 02` / `0F 0B`). `unsafe:` is a native
    soft-keyword (`parser.ad`, `ND_UNSAFE`) and suppresses via `cg_unsafe_depth`.
-   **Limitation:** under `--opt` (isel) the direct-SIB index path routes the
-   index straight into a register (never `%rax`), so the check is currently
-   emitted only on the opt-0 legacy path — matching the shipping default;
-   `--opt` + `--check-bounds` co-instrumentation is a follow-up.
+2b. **`--opt` co-instrumentation (increment 2) — DONE.** Under `--opt` the native
+   isel lowers a flat-array index straight into a register (never `%rax`) via one
+   of two paths, both of which previously SKIPPED the `%rax`-only check:
+   * the **direct-SIB coalesce** — a bare full-width register-promoted index goes
+     straight into the SIB index register `idxreg` (`index_reg_direct`), and
+   * **`try_sel_index_into_rcx`** — a binary index computed straight into `%rcx`.
+
+   `gen_index_addr` now calls `maybe_emit_bounds_check_reg(node, reg)` (a
+   register-parametrized form of `maybe_emit_bounds_check`, `reg` = the encoding
+   holding the index: `idxreg`, or `%rcx`=1) right before the address `lea` reads
+   that register: `cmp $N,%reg; jb +2; ud2` (`emit_cmp_imm_reg` adds REX.B for
+   `reg>=8`). `cmp/jb/ud2` do not clobber the index register, so the SIB address
+   is unaffected. Still guarded by `cg_check_bounds`/`cg_unsafe_depth`, so it is
+   byte-inert when off and honors `unsafe:`. The SEED needs no change: its `--opt`
+   is a text peephole/regalloc post-pass over asm the opt-0 codegen already
+   emitted with the check, so the `cmpq $N,%rax; jb; ud2` survives (verified: the
+   OOB fixtures trap at `-O0/-O1/-O2`). Lockstep here is BEHAVIORAL — the
+   byte-exact objdiff runs at opt-0 (unchanged), and both backends now trap a
+   `--opt`-compiled OOB index (wait-status 132) and run in-range code unaffected.
+   Verified by `scripts/test_adder_bounds_check_opt.sh` (both isel shapes, both
+   backends) + the `ADDER_OPT=1 ADDER_CHECK_BOUNDS=1` differential-fuzzer lane.
 3. **`@unsafe` / `unsafe def` + `# adder: unsafe` file pragma.**
 4. **Sized slices / length-carrying pointers.** A `Slice[T] = {ptr, len}` fat
    pointer so dynamically-sized buffers get the same check; `Ptr[T]` stays the

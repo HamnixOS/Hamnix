@@ -209,7 +209,7 @@ def _hex_to_bytes(lines):
 
 def run_dump(src_path: Path, timeout=30, opt=False, split_break=False,
              alelide_break=False, rcxclean_break=False,
-             castcall_break=False) -> DumpResult:
+             castcall_break=False, check_bounds=False) -> DumpResult:
     build_driver()
     rel = src_path
     # opt=True passes the dump driver's opt-in --opt flag, enabling the native
@@ -230,6 +230,8 @@ def run_dump(src_path: Path, timeout=30, opt=False, split_break=False,
         argv.append("--rcxclean-break")
     if castcall_break:
         argv.append("--castcall-break")
+    if check_bounds:
+        argv.append("--check-bounds")
     argv.append(str(rel))
     cp = subprocess.run(argv,
                         capture_output=True, text=True, timeout=timeout)
@@ -703,7 +705,7 @@ class CodegenRun:
 
 def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
                            split_break=False, rcxclean_break=False,
-                           castcall_break=False):
+                           castcall_break=False, check_bounds=False):
     work_dir.mkdir(parents=True, exist_ok=True)
     cg_body = codegen_compatible_source(body)
     src = work_dir / f"ad_{seed}.ad"
@@ -712,7 +714,8 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
     try:
         dump = run_dump(src, opt=opt, split_break=split_break,
                         rcxclean_break=rcxclean_break,
-                        castcall_break=castcall_break)
+                        castcall_break=castcall_break,
+                        check_bounds=check_bounds)
     except subprocess.TimeoutExpired:
         return CodegenRun("drivererror", detail="dump driver timeout")
     if dump.status in ("cgfail", "parsefail", "readfail"):
