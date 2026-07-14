@@ -1,8 +1,11 @@
 # Memory safety in Adder
 
-Status: **increment 1 landed** (opt-in runtime array-bounds checking for
-userspace, with an `unsafe:` opt-out). This document is both the design and
-the roadmap.
+Status: **increment 1 + 1b landed** (opt-in runtime array-bounds checking for
+userspace, with an `unsafe:` opt-out). Increment 1 landed the checks in the
+frozen Python seed (the oracle); **increment 1b mirrors them into the native
+`.ad` backend** (`adder/compiler/codegen.ad` + `parser.ad` + the host driver),
+so the DEFAULT shipping compiler emits the identical bytes. This document is
+both the design and the roadmap.
 
 ## Motivation & constraints
 
@@ -110,11 +113,26 @@ instrumentation on for a *userspace* target:
 do_bounds = check_bounds and spec.get("userspace", False)
 ```
 
-`x86_64-bare-metal` (and, today, `x86_64-adder-user`, which shares the
-bare-metal codegen path) have `userspace = False`, so `--check-bounds` is a
-no-op for them and kernel bytes never change. Extending eligibility to the
-on-device `x86_64-adder-user` user target is a one-line follow-up once its
-runtime has a fault path we want to route through.
+`x86_64-bare-metal` has `userspace = False`, so `--check-bounds` is a no-op
+for it and kernel bytes never change.
+
+**`x86_64-adder-user` is now bounds-eligible (increment 1b).** It shares the
+bare-metal *codegen* path (`bare_metal = True`, RIP-relative, no `.modinfo`)
+but is genuine CPL-3 userspace whose `#UD` faults the Adder kernel delivers as
+a clean signal — so the gate treats it as eligible:
+
+```python
+userspace_bounds = spec.get("userspace", False) or target == "x86_64-adder-user"
+do_bounds = check_bounds and userspace_bounds
+```
+
+This matters because the native backend's ONLY userspace target *is*
+`x86_64-adder-user` (the on-device user ELF, `ELF_FMT_USER`). Promoting it in
+the seed keeps seed and native in **lockstep on the flag** — the differential
+objdiff (`scripts/test_native_vs_seed_objdiff.sh`) compares them on this exact
+target, so an on-flag divergence (native emits a check, seed does not) would
+break the gate. The native driver mirrors the gate: it sets `cg_check_bounds`
+only for `ELF_FMT_USER`, never `ELF_FMT_KERNEL`.
 
 ## How it is gated (default OFF, opt-in)
 
@@ -146,6 +164,15 @@ byte-inert + lockstep-safe). All in the seed / driver:
 | `adder/compiler/codegen_x86.py` | `check_bounds`/`unsafe_depth` state; `UnsafeStmt` codegen; `_maybe_emit_bounds_check`; call site in `gen_index_address`; `generate(..., check_bounds)`. |
 | `adder/compiler/adder.py` | `--check-bounds` flag; userspace-only gating in `get_generator`; thread through `compile_source`/`compile_with_imports`. |
 | `tests/membounds/*.ad`, `scripts/test_adder_bounds_check.sh` | regression test. |
+
+Increment 1b (native mirror):
+
+| File | Change |
+|------|--------|
+| `adder/compiler/codegen.ad` | `cg_check_bounds`/`cg_unsafe_depth` state; `maybe_emit_bounds_check` + call sites in `gen_index_addr`; `ND_UNSAFE` in `gen_stmt` + `prescan_block`. |
+| `adder/compiler/parser.ad` | `ND_UNSAFE` node; `unsafe:` soft-keyword parse; `tok_text_is` helper. |
+| `adder/compiler/fused_driver_host_main.ad` | `--check-bounds` flag; userspace-only `cg_check_bounds` gate (never kernel). |
+| `adder/compiler/adder.py` (seed gate) | `x86_64-adder-user` promoted to bounds-eligible so seed↔native stay in lockstep on the flag. |
 
 ### Why seed-first, native next
 
@@ -184,8 +211,19 @@ Ordered by value/effort; each stays opt-in + kernel-bypassable.
    helper that writes `"bounds: idx N of len M at file:line\n"` to fd 2 and
    `exit_group(134)`. Pass idx/len/site via a tiny out-of-line slow path so the
    fast path stays one `cmp`.
-2. **Mirror into `codegen.ad` (increment 1b).** Same guarded block in the
-   native backend so the default compiler instruments userspace.
+2. **Mirror into `codegen.ad` (increment 1b) — DONE.** The same guarded block
+   is emitted by the native backend so the default compiler instruments
+   userspace. Chokepoint: `gen_index_addr` calls `maybe_emit_bounds_check` right
+   after the index lands in `%rax` in every `Array[N,T]`-base branch (local /
+   global / multi-dim / nested / `Array[N,Struct]` global / array member);
+   `Ptr[T]`/cast/call/string/scalar bases carry no length and self-gate to a
+   no-op via `expr_array_type == 0`. Bytes match GNU `as`
+   (`48 83 F8 ib | 48 81 F8 id` / `72 02` / `0F 0B`). `unsafe:` is a native
+   soft-keyword (`parser.ad`, `ND_UNSAFE`) and suppresses via `cg_unsafe_depth`.
+   **Limitation:** under `--opt` (isel) the direct-SIB index path routes the
+   index straight into a register (never `%rax`), so the check is currently
+   emitted only on the opt-0 legacy path — matching the shipping default;
+   `--opt` + `--check-bounds` co-instrumentation is a follow-up.
 3. **`@unsafe` / `unsafe def` + `# adder: unsafe` file pragma.**
 4. **Sized slices / length-carrying pointers.** A `Slice[T] = {ptr, len}` fat
    pointer so dynamically-sized buffers get the same check; `Ptr[T]` stays the

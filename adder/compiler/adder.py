@@ -125,7 +125,17 @@ def get_generator(target: str, opt_level: int = 0,
         # NEVER enabled for a bare-metal/kernel target, so kernel codegen stays
         # byte-for-byte unchanged (docs/adder_memory_safety.md). Even with the
         # flag on, a non-userspace target passes check_bounds=False here.
-        do_bounds = check_bounds and spec.get("userspace", False)
+        #
+        # `x86_64-adder-user` is the ON-DEVICE CPL-3 user target (increment 1b):
+        # it shares the bare-metal CODEGEN path (bare_metal=True above) but is
+        # genuine userspace whose #UD faults are delivered as a clean signal by
+        # the Adder kernel's fault path — so it IS bounds-eligible, matching the
+        # native backend (adder/compiler/codegen.ad), which enables checks for
+        # its ELF_FMT_USER target. Keeping seed and native in lockstep here is
+        # required: an on-flag divergence would break the differential objdiff.
+        userspace_bounds = spec.get("userspace", False) \
+            or target == "x86_64-adder-user"
+        do_bounds = check_bounds and userspace_bounds
 
         def _gen_x86(program):
             asm = generate_x86(program, bare_metal=no_modinfo,
