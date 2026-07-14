@@ -83,18 +83,33 @@ spot is a **hybrid**:
    new ABI, no allocation. This is what makes `Result`/`Option` returnable given
    Adder has no by-value aggregate ABI.
 
+   **STATUS (increment 1b, NATIVE backend — landed):** `match`, `enum`, variant
+   construction, `?` propagation, the prelude `Option`/`Result`, and the
+   `return None` → `Option.None` coercion are now ported to the **native `.ad`
+   backend** (`lexer.ad` lexes `enum`/`?`; `parser.ad` parses `enum` decls, the
+   postfix `?`, and `case None`; `codegen.ad` registers the scalar-packed enum
+   layout and DESUGARS ctor/`?`/`match` to shift/and/or/if/return AST built with
+   `node_new` and routed through the byte-tested `gen_expr`/`gen_stmt`). The
+   prescan reserves the `match`/`?` temp + payload-binding slots in the seed's
+   exact allocation order, so **seed + native emit byte-identical machine code**.
+   Verified: `test_adder_enums` PASS (incl. a native objdiff-lockstep step);
+   objdiff **254/260 native-accepted, 0 diverged** (was 253 — enum_smoke now
+   native-accepted CLEAN, every enum-free unit byte-inert); differential fuzzer
+   **500/500, 0 miscompiles**; `test_native_kernel_links` PASS (the native
+   compiler still links the kernel with no seed fallback); `run_compiler_tests`
+   ALL PASS; the `-O2` bench is byte-identical to HEAD (no `.py`/seed change, so
+   no codegen-perf regression). The enum desugar is target-independent, so the
+   kernel stays zero-cost on `x86_64-bare-metal` on the native path too.
+
    *Deferred (disproved for one pass):* (a) **generics** — `Option`/`Result`
    are monomorphized to an `int32` payload; full `[T]`/`[T,E]` generics are a
    follow-up. (b) **multi-word enums** — a variant whose tag+payload exceeds 64
    bits (e.g. a `Ptr` + `int`, or any `int64` payload) is rejected with a clear
-   "multi-word enum deferred" error; supporting them needs an sret/`rax:rdx`
-   return ABI. (c) **NATIVE backend (`codegen.ad`)** — the native backend has no
-   `match` support *at all* today (match is seed-only), so `enum`/`match`/`?`
-   land in the seed this increment; the native backend continues to *reject*
-   enum syntax as a pre-existing acceptance gap (not a divergence — objdiff over
-   the enum-free corpus stays byte-clean). Staged plan: first port `match` to
-   `codegen.ad`/`parser.ad`/`ir.ad`, then mirror the enum layout/ctor/`?`
-   desugar there so seed+native emit identical bytes for enum code.
+   "multi-word enum deferred" error (both backends); supporting them needs an
+   sret/`rax:rdx` return ABI. (c) **native non-exhaustiveness** — the native
+   backend emits the same stderr "non-exhaustive match" warning; a same-name
+   binding reused across two `match` arms still shares one slot on native (the
+   pre-existing re-decl divergence), untested by the current fixtures.
 2. **Non-null-by-default** pointers/refs + opt-in `Optional` deref checks (leans on #1).
 3. **Descriptive bounds/null trap** (`bounds: idx N of len M at file:line`) + **`@unsafe`
    / `unsafe def`** attribute + `# adder: unsafe` file pragma (small, already designed).

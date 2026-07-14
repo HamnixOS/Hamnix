@@ -59,6 +59,26 @@ python3 -m compiler.adder compile "$FIX/enum_smoke.ad" \
     || { cat "$WORK/cerr"; fail "x86_64-adder-user compile failed"; }
 echo "[enums]   x86_64-adder-user ELF built ($(stat -c%s "$WORK/enum_smoke.user.elf") bytes)"
 
+echo "[enums] (1c) the NATIVE .ad backend compiles enums to byte-lockstep code"
+# The native self-hosted compiler (build/cutover/host_ac.elf) — the path the
+# kernel + userland ship through — must ACCEPT enum/match/? and emit machine
+# code semantically identical to the seed oracle (objdiff-clean). This is the
+# increment-1b lockstep proof: match/enum ported to codegen.ad.
+source "$PROJ_ROOT/scripts/_adder_cc.sh"
+ADDER_CC=adder adder_cc_bootstrap >/dev/null 2>&1 || fail "host_ac bootstrap failed"
+HOSTAC="$PROJ_ROOT/build/cutover/host_ac.elf"
+"$HOSTAC" --target=x86_64-adder-user "$FIX/enum_smoke.ad" "$WORK/enum_smoke.native.elf" \
+    >/dev/null 2>"$WORK/cerr" \
+    || { cat "$WORK/cerr"; fail "NATIVE .ad backend rejected enum_smoke (match/enum not ported?)"; }
+python3 -m compiler.adder compile "$FIX/enum_smoke.ad" \
+    --target=x86_64-adder-user -o "$WORK/enum_smoke.seed.elf" >/dev/null 2>&1 \
+    || fail "seed adder-user compile failed"
+if ! python3 "$PROJ_ROOT/scripts/objdiff_normalize.py" \
+        "$WORK/enum_smoke.seed.elf" "$WORK/enum_smoke.native.elf" enum_smoke; then
+    fail "native enum codegen DIVERGES from the seed (objdiff)"
+fi
+echo "[enums]   native == seed machine code (objdiff clean) — seed+native lockstep"
+
 echo "[enums] (3) non-exhaustive match emits a diagnostic warning"
 cc "$FIX/nonexhaustive.ad" x86_64-linux >/dev/null 2>"$WORK/warn.txt" || true
 grep -qi "non-exhaustive match" "$WORK/warn.txt" \

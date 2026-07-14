@@ -110,6 +110,14 @@ from compiler.parser import (
     ND_DO_WHILE,
     ND_CONTAINER_OF,
     ND_SIZEOF,
+    ND_NONE_LIT,
+    ND_MATCH,
+    ND_MATCH_ARM,
+    ND_PATTERN,
+    ND_TRY_EXPR,
+    ND_ENUM,
+    ND_ENUM_VARIANT,
+    node_new,
     BINOP_ADD,
     BINOP_SUB,
     BINOP_MUL,
@@ -142,6 +150,8 @@ from compiler.parser import (
 
 from compiler.lexer import (
     strbuf,
+    strbuf_pos,
+    strbuf_append,
 )
 
 # Phase-4 register allocator (linear scan). OFF by default: ra_reg_for_name
@@ -1204,6 +1214,52 @@ sf_elem_struct: Array[4096, uint32]
 # level (the outer index scales by the row stride). 0 for non-array fields.
 sf_type_node: Array[4096, uint32]
 sf_count: uint32 = 0
+
+# -----------------------------------------------------------------------
+# Tagged sum types (enums) — scalar-packed 64-bit tagged unions.
+#
+# An enum value is ONE 64-bit word: an 8-bit tag in the low byte, payload
+# fields packed above it at their natural widths. It flows through the
+# existing scalar codegen (params/returns/`?`) with no new ABI and no
+# allocation. Construction/extraction/`?`/match all DESUGAR to shift/and/or/
+# if/return AST routed through gen_expr/gen_stmt — reusing byte-tested paths
+# so seed+native emit identical bytes. Mirrors codegen_x86's EnumInfo /
+# EnumVariantInfo / _register_enums / _gen_enum_match / _gen_try.
+# A variant whose tag+payload exceeds 64 bits is REJECTED (multi-word enums
+# deferred to a follow-up increment).
+# -----------------------------------------------------------------------
+ENUM_TAG_BITS: uint32 = 8               # up to 256 variants; payload gets 56 bits
+
+MAX_ENUMS: uint32 = 64
+en_name_off: Array[64, uint32]
+en_name_len: Array[64, uint32]
+en_is_try: Array[64, uint32]            # 1 for Option/Result (`?`-capable)
+en_var_start: Array[64, uint32]         # first index into the ev_* variant arrays
+en_var_count: Array[64, uint32]
+en_count: uint32 = 0
+
+MAX_ENUM_VARIANTS: uint32 = 512
+ev_name_off: Array[512, uint32]
+ev_name_len: Array[512, uint32]
+ev_tag: Array[512, uint32]
+ev_enum: Array[512, uint32]             # owning enum index
+ev_field_start: Array[512, uint32]      # first index into the ef_* field arrays
+ev_field_count: Array[512, uint32]
+ev_count: uint32 = 0
+
+MAX_ENUM_FIELDS: uint32 = 1024
+ef_type_node: Array[1024, uint32]       # ND_TYPE (or Ptr/Fn) node of the field
+ef_offset: Array[1024, uint32]          # bit offset within the packed word
+ef_width: Array[1024, uint32]           # bit width
+ef_count: uint32 = 0
+
+# A cached ND_TYPE node named "int64" for the desugar's casts, and the strbuf
+# offset of the interned "int64" / "Option" / "Result" / "None" name bytes.
+cg_int64_type: uint32 = 0
+
+# Current function's declared return-type node (nd_b of ND_FUNCTION); consulted
+# by `?` propagation and the `return None` -> Option.None coercion.
+cg_cur_return_type: uint32 = 0
 
 # Program declaration-chain head, stashed at layout time so a class can be
 # looked up by name (for inheritance base resolution).
@@ -7905,6 +7961,19 @@ def gen_expr(node: uint32):
         return
     k: uint32 = nd_kind[node]
 
+    # Tagged sum types: a variant constructor packs into the enum word; `expr?`
+    # lowers to a tag test + early return. Both masquerade as Call/Member/Ident
+    # expressions, so intercept before the generic dispatch. Byte-inert when the
+    # program declares/references no enums (en_count == 0).
+    if k == ND_TRY_EXPR:
+        gen_try(node)
+        return
+    if en_count != 0:
+        cev: uint32 = enum_ctor_ev(node)
+        if cev != 0:
+            gen_expr(enum_pack_expr(cev, cg_ctor_args))
+            return
+
     # Chained comparison `a OP1 b OP2 c` (Python semantics: `(a OP1 b) and
     # (b OP2 c)`) — detect and lower BEFORE the IR/arith paths, exactly as
     # codegen_x86.gen_binary delegates to gen_chained_compare first.
@@ -11692,6 +11761,10 @@ def declare_local(name_off: uint32, name_len: uint32, tnode: uint32):
             loc_set_float(fw_d)
             if fw_d == 4:
                 loc_set_scalar_size(4)
+        # Record an enum-typed local's type node so a later `match`/`?` on it can
+        # resolve the enum. Byte-inert: only fires for a registered enum type.
+        if en_count != 0 and enum_index_of_type(tnode) != 0 and loc_count > 0:
+            loc_type_node[loc_count - 1] = tnode
 
 
 def gen_stmt(node: uint32):
@@ -11705,7 +11778,20 @@ def gen_stmt(node: uint32):
     cg_cur_stmt = node
     k: uint32 = nd_kind[node]
 
+    if k == ND_MATCH:
+        men0: uint32 = resolve_expr_enum(nd_a[node])
+        if men0 != 0:
+            gen_enum_match(node, men0)
+        else:
+            cg_fail(2, node)              # non-enum match not supported natively
+        return
+
     if k == ND_RETURN:
+        # `return None` in an Option-returning function means the empty variant,
+        # not the integer 0. Byte-inert when the program uses no enums.
+        if en_count != 0 and maybe_gen_none_coercion(nd_a[node], cg_cur_return_type) != 0:
+            emit_function_epilogue()
+            return
         gen_expr(nd_a[node])
         emit_function_epilogue()
         return
@@ -12844,25 +12930,736 @@ def prescan_name(name_off: uint32, name_len: uint32):
         alloc_local(name_off, name_len)
 
 
+# =======================================================================
+# Tagged sum types (enums): registration, resolution, and the ctor / `?` /
+# match desugar. Every construct desugars to shift/and/or/if/return AST built
+# with node_new and routed through gen_expr/gen_stmt, so seed+native emit
+# byte-identical machine code (mirrors codegen_x86's EnumInfo machinery).
+# =======================================================================
+
+# ---- synthetic AST node builders --------------------------------------
+# A cached ND_TYPE "int64" for the desugar's casts (int64 => arithmetic shr).
+def mk_int64_type() -> uint32:
+    if cg_int64_type == 0:
+        t: uint32 = node_new(ND_TYPE)
+        nd_aux[t] = 5                     # int64 primitive code
+        cg_int64_type = t
+    return cg_int64_type
+
+
+def mk_int32_type() -> uint32:
+    t: uint32 = node_new(ND_TYPE)
+    nd_aux[t] = 4                         # int32 primitive code
+    return t
+
+
+def mk_int_lit(v: uint64) -> uint32:
+    id: uint32 = node_new(ND_INT_LIT)
+    nd_num[id] = v
+    return id
+
+
+def mk_ident(off: uint32, len_: uint32) -> uint32:
+    id: uint32 = node_new(ND_IDENT)
+    nd_name_off[id] = off
+    nd_name_len[id] = len_
+    return id
+
+
+def mk_binary(op: uint32, a: uint32, b: uint32) -> uint32:
+    id: uint32 = node_new(ND_BINARY)
+    nd_aux[id] = op
+    nd_a[id] = a
+    nd_b[id] = b
+    return id
+
+
+# cast[int64](e) — makes a following `>>` arithmetic (matches the seed).
+def mk_cast_i64(e: uint32) -> uint32:
+    id: uint32 = node_new(ND_CAST)
+    nd_a[id] = mk_int64_type()            # ND_CAST: a = type node, b = expr
+    nd_b[id] = e
+    return id
+
+
+def mk_return(v: uint32) -> uint32:
+    id: uint32 = node_new(ND_RETURN)
+    nd_a[id] = v
+    return id
+
+
+def mk_var_decl(off: uint32, len_: uint32, tnode: uint32, val: uint32) -> uint32:
+    id: uint32 = node_new(ND_VAR_DECL)
+    nd_name_off[id] = off
+    nd_name_len[id] = len_
+    nd_a[id] = tnode
+    nd_b[id] = val
+    return id
+
+
+# if (cond): then_head  [else: else_head]   — nested if/else (no elif).
+def mk_if(cond: uint32, then_head: uint32, else_head: uint32) -> uint32:
+    id: uint32 = node_new(ND_IF)
+    nd_a[id] = cond
+    nd_b[id] = then_head
+    nd_c[id] = 0
+    nd_d[id] = else_head
+    return id
+
+
+# Stash a unique synthetic local name (5 raw bytes: SOH + the 4 node-id bytes)
+# for `node`'s reserved temp slot into its name_off/name_len. SOH (byte 1) can
+# never begin a real identifier, so it never collides with a user local. The
+# prescan reserves the slot under this name; codegen reads it back off the node.
+def mk_temp_name(node: uint32):
+    off: uint32 = strbuf_pos
+    strbuf_append(cast[uint8](1))
+    strbuf_append(cast[uint8](node & cast[uint32](255)))
+    strbuf_append(cast[uint8]((node >> 8) & cast[uint32](255)))
+    strbuf_append(cast[uint8]((node >> 16) & cast[uint32](255)))
+    strbuf_append(cast[uint8]((node >> 24) & cast[uint32](255)))
+    nd_name_off[node] = off
+    nd_name_len[node] = 5
+
+
+# ---- enum registration -------------------------------------------------
+# Bit width a payload field of type `tnode` occupies in the packed word.
+# Ptr/Fn -> 64; scalar int -> sizeof*8; aggregate/array/enum/float -> reject
+# (cg_fail => a clear diagnostic; multi-word enums are deferred).
+def enum_field_bit_width(tnode: uint32, edef: uint32) -> uint32:
+    if tnode == 0:
+        cg_fail(20, edef)
+        return 0
+    tk: uint32 = nd_kind[tnode]
+    if tk == ND_PTR_TYPE or tk == ND_FN_TYPE:
+        return 64
+    if tk == ND_ARRAY_TYPE:
+        cg_fail(20, edef)                 # array payload unsupported
+        return 0
+    if tk != ND_TYPE:
+        cg_fail(20, edef)
+        return 0
+    # A named (class/enum) type payload — aggregate, multi-word: reject.
+    if nd_aux[tnode] == 0:
+        cg_fail(20, edef)
+        return 0
+    # Float payload unsupported in this increment.
+    if type_float_width(tnode) != 0:
+        cg_fail(20, edef)
+        return 0
+    return prim_type_size(tnode) * 8
+
+
+def register_one_enum(edef: uint32, is_try: uint32):
+    if en_count >= MAX_ENUMS:
+        cg_fail(6, edef)
+        return
+    ei: uint32 = en_count
+    en_name_off[ei] = nd_name_off[edef]
+    en_name_len[ei] = nd_name_len[edef]
+    en_is_try[ei] = is_try
+    en_var_start[ei] = ev_count
+    tag: uint32 = 0
+    v: uint32 = nd_a[edef]                # ND_ENUM_VARIANT chain
+    while v != 0:
+        if ev_count >= MAX_ENUM_VARIANTS:
+            cg_fail(6, edef)
+            return
+        vi: uint32 = ev_count
+        ev_name_off[vi] = nd_name_off[v]
+        ev_name_len[vi] = nd_name_len[v]
+        ev_tag[vi] = tag
+        ev_enum[vi] = ei
+        ev_field_start[vi] = ef_count
+        off: uint32 = ENUM_TAG_BITS
+        ft: uint32 = nd_a[v]              # payload-type chain (ND_TYPE...)
+        while ft != 0:
+            if ef_count >= MAX_ENUM_FIELDS:
+                cg_fail(6, edef)
+                return
+            w: uint32 = enum_field_bit_width(ft, edef)
+            ef_type_node[ef_count] = ft
+            ef_offset[ef_count] = off
+            ef_width[ef_count] = w
+            off = off + w
+            ef_count = ef_count + 1
+            ft = nd_next[ft]
+        if off > 64:
+            cg_fail(20, edef)             # tag+payload > 64 bits: multi-word deferred
+            return
+        ev_field_count[vi] = ef_count - ev_field_start[vi]
+        ev_count = ev_count + 1
+        tag = tag + 1
+        v = nd_next[v]
+    en_var_count[ei] = ev_count - en_var_start[ei]
+    en_count = en_count + 1
+
+
+# Append a C string to the strbuf; return its length, stash its offset.
+cg_last_intern_off: uint32 = 0
+def intern_cstr(s: Ptr[uint8]) -> uint32:
+    off: uint32 = strbuf_pos
+    i: uint32 = 0
+    while s[i] != cast[uint8](0):
+        strbuf_append(s[i])
+        i = i + 1
+    cg_last_intern_off = off
+    return i
+
+
+# Build a built-in prelude enum node (Option/Result) and register it. Payload
+# is monomorphized to int32, matching the seed's built-ins.
+def register_builtin_option():
+    e: uint32 = node_new(ND_ENUM)
+    ln: uint32 = intern_cstr("Option")
+    nd_name_off[e] = cg_last_intern_off
+    nd_name_len[e] = ln
+    v0: uint32 = node_new(ND_ENUM_VARIANT)
+    l0: uint32 = intern_cstr("Some")
+    nd_name_off[v0] = cg_last_intern_off
+    nd_name_len[v0] = l0
+    nd_a[v0] = mk_int32_type()
+    v1: uint32 = node_new(ND_ENUM_VARIANT)
+    l1: uint32 = intern_cstr("None")
+    nd_name_off[v1] = cg_last_intern_off
+    nd_name_len[v1] = l1
+    nd_next[v0] = v1
+    nd_a[e] = v0
+    register_one_enum(e, 1)
+
+
+def register_builtin_result():
+    e: uint32 = node_new(ND_ENUM)
+    ln: uint32 = intern_cstr("Result")
+    nd_name_off[e] = cg_last_intern_off
+    nd_name_len[e] = ln
+    v0: uint32 = node_new(ND_ENUM_VARIANT)
+    l0: uint32 = intern_cstr("Ok")
+    nd_name_off[v0] = cg_last_intern_off
+    nd_name_len[v0] = l0
+    nd_a[v0] = mk_int32_type()
+    v1: uint32 = node_new(ND_ENUM_VARIANT)
+    l1: uint32 = intern_cstr("Err")
+    nd_name_off[v1] = cg_last_intern_off
+    nd_name_len[v1] = l1
+    nd_a[v1] = mk_int32_type()
+    nd_next[v0] = v1
+    nd_a[e] = v0
+    register_one_enum(e, 1)
+
+
+# True if any declaration signature (function return/params, extern, vardecl)
+# mentions a bare type named `s`. Gates the built-in Option/Result on real use.
+def type_mentions(tnode: uint32, s: Ptr[uint8]) -> uint32:
+    if tnode == 0:
+        return 0
+    tk: uint32 = nd_kind[tnode]
+    if tk == ND_PTR_TYPE or tk == ND_OPTIONAL_TYPE or tk == ND_VOLATILE_TYPE or tk == ND_LIST_TYPE:
+        return type_mentions(nd_a[tnode], s)
+    if tk == ND_ARRAY_TYPE:
+        return type_mentions(nd_a[tnode], s)
+    if tk == ND_TYPE:
+        if name_eq_cstr(nd_name_off[tnode], nd_name_len[tnode], s) != 0:
+            return 1
+        return 0
+    return 0
+
+
+def program_references_type(prog: uint32, s: Ptr[uint8]) -> uint32:
+    cur: uint32 = nd_b[prog]
+    while cur != 0:
+        k: uint32 = nd_kind[cur]
+        if k == ND_FUNCTION or k == ND_EXTERN:
+            if type_mentions(nd_b[cur], s) != 0:      # return type
+                return 1
+            p: uint32 = nd_a[cur]
+            while p != 0:
+                if nd_kind[p] == ND_PARAM and type_mentions(nd_a[p], s) != 0:
+                    return 1
+                p = nd_next[p]
+        elif k == ND_VAR_DECL:
+            if type_mentions(nd_a[cur], s) != 0:
+                return 1
+        cur = nd_next[cur]
+    return 0
+
+
+# Register user enums, then the built-in Option/Result (only if referenced and
+# not already user-declared). Byte-inert when unused: an enum-free program
+# leaves en_count==0 so every interception below no-ops.
+def register_enums(prog: uint32):
+    en_count = 0
+    ev_count = 0
+    ef_count = 0
+    cg_int64_type = 0
+    cur: uint32 = nd_b[prog]
+    while cur != 0:
+        if nd_kind[cur] == ND_ENUM:
+            is_try: uint32 = 0
+            if name_eq_cstr(nd_name_off[cur], nd_name_len[cur], "Option") != 0:
+                is_try = 1
+            if name_eq_cstr(nd_name_off[cur], nd_name_len[cur], "Result") != 0:
+                is_try = 1
+            register_one_enum(cur, is_try)
+        cur = nd_next[cur]
+    if enum_index_by_cstr("Option") == 0 and program_references_type(prog, "Option") != 0:
+        register_builtin_option()
+    if enum_index_by_cstr("Result") == 0 and program_references_type(prog, "Result") != 0:
+        register_builtin_result()
+
+
+# ---- enum / variant resolution ----------------------------------------
+def enum_index_by_cstr(s: Ptr[uint8]) -> uint32:
+    i: uint32 = 0
+    while i < en_count:
+        if name_eq_cstr(en_name_off[i], en_name_len[i], s) != 0:
+            return i + 1
+        i = i + 1
+    return 0
+
+
+def enum_index_by_name(off: uint32, len_: uint32) -> uint32:
+    i: uint32 = 0
+    while i < en_count:
+        if name_match(en_name_off[i], en_name_len[i], off, len_) != 0:
+            return i + 1
+        i = i + 1
+    return 0
+
+
+# The enum index (+1) named by a bare ND_TYPE, else 0. Primitive types (aux
+# code != 0) are never enums.
+def enum_index_of_type(tnode: uint32) -> uint32:
+    if tnode == 0 or nd_kind[tnode] != ND_TYPE:
+        return 0
+    if nd_aux[tnode] != 0:
+        return 0
+    return enum_index_by_name(nd_name_off[tnode], nd_name_len[tnode])
+
+
+# The variant global index (+1) of `name` within enum en0, or 0.
+def variant_find_in_enum(en0: uint32, off: uint32, len_: uint32) -> uint32:
+    if en0 == 0:
+        return 0
+    ei: uint32 = en0 - 1
+    s: uint32 = en_var_start[ei]
+    n: uint32 = en_var_count[ei]
+    i: uint32 = 0
+    while i < n:
+        if name_match(ev_name_off[s + i], ev_name_len[s + i], off, len_) != 0:
+            return s + i + 1
+        i = i + 1
+    return 0
+
+
+# The variant global index (+1) iff exactly one enum declares a variant `name`.
+def variant_find_unique(off: uint32, len_: uint32) -> uint32:
+    found: uint32 = 0
+    cnt: uint32 = 0
+    i: uint32 = 0
+    while i < ev_count:
+        if name_match(ev_name_off[i], ev_name_len[i], off, len_) != 0:
+            found = i + 1
+            cnt = cnt + 1
+        i = i + 1
+    if cnt == 1:
+        return found
+    return 0
+
+
+# The None variant (+1) of an Option-like enum, or 0.
+def variant_find_none(en0: uint32) -> uint32:
+    if en0 == 0:
+        return 0
+    ei: uint32 = en0 - 1
+    s: uint32 = en_var_start[ei]
+    n: uint32 = en_var_count[ei]
+    i: uint32 = 0
+    while i < n:
+        if name_eq_cstr(ev_name_off[s + i], ev_name_len[s + i], "None") != 0:
+            return s + i + 1
+        i = i + 1
+    return 0
+
+
+# The enum index (+1) of the static type of an expression used as a match
+# scrutinee / `?` operand: a local/param ident, a call return, or a cast.
+def resolve_expr_enum(node: uint32) -> uint32:
+    if node == 0:
+        return 0
+    k: uint32 = nd_kind[node]
+    if k == ND_IDENT:
+        return enum_index_of_type(lookup_local_type_node(nd_name_off[node], nd_name_len[node]))
+    if k == ND_CALL:
+        return enum_index_of_type(call_return_type(node))
+    if k == ND_CAST:
+        return enum_index_of_type(nd_a[node])
+    return 0
+
+
+# True if an ND_PATTERN / binding ident is the wildcard `_`.
+def pat_is_wildcard(off: uint32, len_: uint32) -> uint32:
+    if len_ != 1:
+        return 0
+    if strbuf[off] == cast[uint8](95):        # '_'
+        return 1
+    return 0
+
+
+# ---- enum constructor detection + codegen -----------------------------
+cg_ctor_args: uint32 = 0                  # arg chain head for the detected ctor
+
+# If `node` is an enum-variant constructor, return its variant global index
+# (+1) and set cg_ctor_args to the payload arg chain; else 0. Read-only.
+def enum_ctor_ev(node: uint32) -> uint32:
+    cg_ctor_args = 0
+    k: uint32 = nd_kind[node]
+    if k == ND_CALL:
+        callee: uint32 = nd_a[node]
+        if nd_kind[callee] == ND_MEMBER:
+            obj: uint32 = nd_a[callee]
+            if nd_kind[obj] == ND_IDENT:
+                en0: uint32 = enum_index_by_name(nd_name_off[obj], nd_name_len[obj])
+                ev0: uint32 = variant_find_in_enum(en0, nd_name_off[callee], nd_name_len[callee])
+                if ev0 != 0:
+                    cg_ctor_args = nd_b[node]
+                    return ev0
+            return 0
+        if nd_kind[callee] == ND_IDENT:
+            ev1: uint32 = variant_find_unique(nd_name_off[callee], nd_name_len[callee])
+            if ev1 != 0:
+                cg_ctor_args = nd_b[node]
+                return ev1
+        return 0
+    if k == ND_MEMBER:
+        obj2: uint32 = nd_a[node]
+        if nd_kind[obj2] == ND_IDENT:
+            en2: uint32 = enum_index_by_name(nd_name_off[obj2], nd_name_len[obj2])
+            ev2: uint32 = variant_find_in_enum(en2, nd_name_off[node], nd_name_len[node])
+            if ev2 != 0:
+                return ev2
+        return 0
+    if k == ND_IDENT:
+        # A bare no-payload variant that is not a live local/global.
+        off_: int32 = 0
+        if lookup_local(nd_name_off[node], nd_name_len[node], &off_) != 0:
+            return 0
+        if glob_lookup(nd_name_off[node], nd_name_len[node]) != 0:
+            return 0
+        ev3: uint32 = variant_find_unique(nd_name_off[node], nd_name_len[node])
+        if ev3 != 0 and ev_field_count[ev3 - 1] == 0:
+            return ev3
+        return 0
+    return 0
+
+
+# Build the integer AST that constructs the packed enum word:
+#   word = tag | ((cast[int64](arg0) & mask0) << off0) | ...
+def enum_pack_expr(ev0: uint32, args_head: uint32) -> uint32:
+    ev: uint32 = ev0 - 1
+    word: uint32 = mk_int_lit(cast[uint64](ev_tag[ev]))
+    fs: uint32 = ev_field_start[ev]
+    nf: uint32 = ev_field_count[ev]
+    arg: uint32 = args_head
+    i: uint32 = 0
+    while i < nf:
+        if arg == 0:
+            cg_fail(22, 0)                # too few payload values
+            return word
+        off: uint32 = ef_offset[fs + i]
+        w: uint32 = ef_width[fs + i]
+        mask: uint64 = (cast[uint64](1) << w) - cast[uint64](1)
+        masked: uint32 = mk_binary(BINOP_BIT_AND, mk_cast_i64(arg), mk_int_lit(mask))
+        slot: uint32 = mk_binary(BINOP_SHL, masked, mk_int_lit(cast[uint64](off)))
+        word = mk_binary(BINOP_BIT_OR, word, slot)
+        arg = nd_next[arg]
+        i = i + 1
+    return word
+
+
+# Build the AST that extracts payload field `i` of variant ev0 from `word`
+# (a fresh ND_IDENT for the temp named toff/tlen). Signed fields sign-extend
+# (shl to bit 63 then arithmetic shr); unsigned fields mask out of the slot.
+def enum_extract_expr(ev0: uint32, i: uint32, toff: uint32, tlen: uint32) -> uint32:
+    ev: uint32 = ev0 - 1
+    fs: uint32 = ev_field_start[ev]
+    off: uint32 = ef_offset[fs + i]
+    w: uint32 = ef_width[fs + i]
+    ft: uint32 = ef_type_node[fs + i]
+    word: uint32 = mk_ident(toff, tlen)
+    if type_signedness(ft) == 2:
+        shl: uint32 = mk_binary(BINOP_SHL, word, mk_int_lit(cast[uint64](64 - off - w)))
+        return mk_binary(BINOP_SHR, mk_cast_i64(shl), mk_int_lit(cast[uint64](64 - w)))
+    mask: uint64 = (cast[uint64](1) << w) - cast[uint64](1)
+    shifted: uint32 = mk_binary(BINOP_SHR, word, mk_int_lit(cast[uint64](off)))
+    return mk_binary(BINOP_BIT_AND, shifted, mk_int_lit(mask))
+
+
+# ---- `?` propagation lowering -----------------------------------------
+# operand? -> materialise into the prescan-reserved temp; if the tag isn't the
+# success variant (0), early-return the whole word; else leave the unwrapped
+# success payload in %rax. Zero runtime cost.
+def gen_try(trynode: uint32):
+    operand: uint32 = nd_a[trynode]
+    en0: uint32 = resolve_expr_enum(operand)
+    if en0 == 0 or en_is_try[en0 - 1] == 0:
+        cg_fail(21, trynode)
+        return
+    if resolve_expr_type_is_enum(cg_cur_return_type) == 0:
+        cg_fail(21, trynode)
+        return
+    ei: uint32 = en0 - 1
+    succ_ev: uint32 = en_var_start[ei]           # global index of variant 0
+    toff: uint32 = nd_name_off[trynode]
+    tlen: uint32 = nd_name_len[trynode]
+    gen_expr(operand)
+    store_to_named(toff, tlen)
+    tagmask: uint64 = (cast[uint64](1) << ENUM_TAG_BITS) - cast[uint64](1)
+    tag_and: uint32 = mk_binary(BINOP_BIT_AND, mk_ident(toff, tlen), mk_int_lit(tagmask))
+    cond: uint32 = mk_binary(BINOP_NEQ, tag_and, mk_int_lit(cast[uint64](ev_tag[succ_ev])))
+    ifn: uint32 = mk_if(cond, mk_return(mk_ident(toff, tlen)), 0)
+    gen_stmt(ifn)
+    if ev_field_count[succ_ev] != 0:
+        gen_expr(enum_extract_expr(succ_ev + 1, 0, toff, tlen))
+    else:
+        gen_expr(mk_ident(toff, tlen))
+
+
+# True (1) if `tnode` names a registered enum (used to validate a `?` site's
+# enclosing return type).
+def resolve_expr_type_is_enum(tnode: uint32) -> uint32:
+    if enum_index_of_type(tnode) != 0:
+        return 1
+    return 0
+
+
+# ---- `match` lowering (enum scrutinee) --------------------------------
+# Lower `match` over an enum value to a tag-dispatch nested-if chain. The
+# scrutinee is evaluated once into the prescan-reserved temp; each arm tests
+# `(word & TAGMASK) == variant.tag` (or is a catch-all) and binds payload names
+# via sign/zero-extended slot extraction. Non-exhaustive matches warn.
+def gen_enum_match(matchnode: uint32, en0: uint32):
+    arms_head: uint32 = nd_b[matchnode]
+    if arms_head == 0:
+        return
+    ei: uint32 = en0 - 1
+    toff: uint32 = nd_name_off[matchnode]
+    tlen: uint32 = nd_name_len[matchnode]
+    gen_expr(nd_a[matchnode])
+    store_to_named(toff, tlen)
+    tagmask: uint64 = (cast[uint64](1) << ENUM_TAG_BITS) - cast[uint64](1)
+
+    # Gather arm node ids so we can build the nested if/else from the back.
+    arm_ids: Array[128, uint32]
+    narms: uint32 = 0
+    a: uint32 = arms_head
+    while a != 0 and narms < cast[uint32](128):
+        arm_ids[narms] = a
+        narms = narms + 1
+        a = nd_next[a]
+
+    # Exhaustiveness: warn if a variant is unmatched and there is no catch-all.
+    covered: Array[256, uint32]
+    ci: uint32 = 0
+    while ci < cast[uint32](256):
+        covered[ci] = 0
+        ci = ci + 1
+    has_wild: uint32 = 0
+
+    rest: uint32 = 0                       # else-chain (a single nested if) or 0
+    idx: uint32 = narms
+    while idx > 0:
+        idx = idx - 1
+        arm: uint32 = arm_ids[idx]
+        pat: uint32 = nd_a[arm]
+        poff: uint32 = nd_name_off[pat]
+        plen: uint32 = nd_name_len[pat]
+        user_body: uint32 = nd_b[arm]
+        ev0: uint32 = variant_find_in_enum(en0, poff, plen)
+        cond: uint32 = 0
+        body_head: uint32 = user_body
+        if ev0 != 0:
+            # variant arm: build binding VarDecls, splice before the body.
+            covered[ev_tag[ev0 - 1]] = 1
+            tag_and: uint32 = mk_binary(BINOP_BIT_AND, mk_ident(toff, tlen), mk_int_lit(tagmask))
+            cond = mk_binary(BINOP_EQ, tag_and, mk_int_lit(cast[uint64](ev_tag[ev0 - 1])))
+            bhead: uint32 = 0
+            btail: uint32 = 0
+            b: uint32 = nd_a[pat]          # binding-ident chain
+            j: uint32 = 0
+            while b != 0:
+                if pat_is_wildcard(nd_name_off[b], nd_name_len[b]) == 0:
+                    vd: uint32 = mk_var_decl(nd_name_off[b], nd_name_len[b], ef_type_node[ev_field_start[ev0 - 1] + j], enum_extract_expr(ev0, j, toff, tlen))
+                    if bhead == 0:
+                        bhead = vd
+                    else:
+                        nd_next[btail] = vd
+                    btail = vd
+                b = nd_next[b]
+                j = j + 1
+            if bhead != 0:
+                nd_next[btail] = user_body
+                body_head = bhead
+        elif pat_is_wildcard(poff, plen) != 0:
+            has_wild = 1
+            cond = mk_int_lit(cast[uint64](1))
+        else:
+            # catch-all binding of the whole scrutinee word.
+            has_wild = 1
+            vd2: uint32 = mk_var_decl(poff, plen, mk_int64_type(), mk_ident(toff, tlen))
+            nd_next[vd2] = user_body
+            body_head = vd2
+            cond = mk_int_lit(cast[uint64](1))
+        rest = mk_if(cond, body_head, rest)
+    if has_wild == 0:
+        vv: uint32 = en_var_start[ei]
+        nvar: uint32 = en_var_count[ei]
+        vk: uint32 = 0
+        missing: uint32 = 0
+        while vk < nvar:
+            if covered[ev_tag[vv + vk]] == 0:
+                missing = 1
+            vk = vk + 1
+        if missing != 0:
+            emit_nonexhaustive_warning()
+    gen_stmt(rest)
+
+
+# Emit a non-exhaustive-match warning to stderr (fd 2). Mirrors the seed's
+# stderr diagnostic; the test greps for "non-exhaustive match".
+def emit_nonexhaustive_warning():
+    msg: Ptr[uint8] = "warning: non-exhaustive match on enum\n"
+    n: uint32 = 0
+    while msg[n] != cast[uint8](0):
+        n = n + 1
+    __syscall3(1, 2, cast[uint64](msg), cast[uint64](n))
+
+
+# ---- `None` -> Option.None coercion -----------------------------------
+# If `value` is a bare `None` in an Option-typed position, emit the Option.None
+# word into %rax and return 1; else 0 (so `return None` means the empty variant).
+def maybe_gen_none_coercion(value: uint32, target_tnode: uint32) -> uint32:
+    if value == 0 or nd_kind[value] != ND_NONE_LIT:
+        return 0
+    en0: uint32 = enum_index_of_type(target_tnode)
+    if en0 == 0 or en_is_try[en0 - 1] == 0:
+        return 0
+    ev0: uint32 = variant_find_none(en0)
+    if ev0 == 0:
+        return 0
+    gen_expr(enum_pack_expr(ev0, 0))
+    return 1
+
+
+# ---- prescan support for enum temps + bindings ------------------------
+# Reserve a temp slot for every `?` in an expression tree (pre-order), stashing
+# each temp's name on its ND_TRY_EXPR node. Order mirrors the seed's codegen-
+# time allocation for the single top-level `?` the language currently produces.
+def prescan_reserve_tries(node: uint32):
+    if node == 0:
+        return
+    k: uint32 = nd_kind[node]
+    if k == ND_TRY_EXPR:
+        mk_temp_name(node)
+        declare_local(nd_name_off[node], nd_name_len[node], mk_int64_type())
+        prescan_reserve_tries(nd_a[node])
+        return
+    if k == ND_BINARY:
+        prescan_reserve_tries(nd_a[node])
+        prescan_reserve_tries(nd_b[node])
+        return
+    if k == ND_UNARY:
+        prescan_reserve_tries(nd_a[node])
+        return
+    if k == ND_CAST:
+        prescan_reserve_tries(nd_b[node])
+        return
+    if k == ND_MEMBER:
+        prescan_reserve_tries(nd_a[node])
+        return
+    if k == ND_INDEX:
+        prescan_reserve_tries(nd_a[node])
+        prescan_reserve_tries(nd_b[node])
+        return
+    if k == ND_CALL:
+        prescan_reserve_tries(nd_a[node])
+        arg: uint32 = nd_b[node]
+        while arg != 0:
+            prescan_reserve_tries(arg)
+            arg = nd_next[arg]
+        return
+
+
+# Reserve the scrutinee temp + payload-binding slots of a `match`, in the exact
+# order the seed allocates them (temp first, then arm0 bindings + body locals,
+# arm1 bindings + body locals, ...).
+def prescan_match(matchnode: uint32):
+    mk_temp_name(matchnode)
+    declare_local(nd_name_off[matchnode], nd_name_len[matchnode], mk_int64_type())
+    en0: uint32 = resolve_expr_enum(nd_a[matchnode])
+    arm: uint32 = nd_b[matchnode]
+    while arm != 0:
+        pat: uint32 = nd_a[arm]
+        poff: uint32 = nd_name_off[pat]
+        plen: uint32 = nd_name_len[pat]
+        ev0: uint32 = 0
+        if en0 != 0:
+            ev0 = variant_find_in_enum(en0, poff, plen)
+        if ev0 != 0:
+            fs: uint32 = ev_field_start[ev0 - 1]
+            b: uint32 = nd_a[pat]
+            j: uint32 = 0
+            while b != 0:
+                if pat_is_wildcard(nd_name_off[b], nd_name_len[b]) == 0:
+                    declare_local(nd_name_off[b], nd_name_len[b], ef_type_node[fs + j])
+                b = nd_next[b]
+                j = j + 1
+        elif pat_is_wildcard(poff, plen) == 0:
+            # catch-all binding of the whole word.
+            declare_local(poff, plen, mk_int64_type())
+        prescan_block(nd_b[arm])
+        arm = nd_next[arm]
+
+
 def prescan_block(head: uint32):
     s: uint32 = head
     while s != 0:
         k: uint32 = nd_kind[s]
         if k == ND_VAR_DECL:
             declare_local(nd_name_off[s], nd_name_len[s], nd_a[s])
+            # A `?` in the initialiser reserves its temp AFTER the local, matching
+            # the seed's alloc-local-then-eval-RHS order. Byte-inert when unused.
+            if en_count != 0:
+                prescan_reserve_tries(nd_b[s])
+        elif k == ND_MATCH:
+            prescan_match(s)
         elif k == ND_ASSIGN:
             tgt: uint32 = nd_a[s]
             if nd_kind[tgt] == ND_IDENT:
                 prescan_name(nd_name_off[tgt], nd_name_len[tgt])
             # ND_INDEX targets address an already-declared array; no slot.
+            if en_count != 0:
+                prescan_reserve_tries(nd_b[s])
+        elif k == ND_RETURN:
+            if en_count != 0:
+                prescan_reserve_tries(nd_a[s])
+        elif k == ND_EXPR_STMT:
+            if en_count != 0:
+                prescan_reserve_tries(nd_a[s])
         elif k == ND_IF:
+            if en_count != 0:
+                prescan_reserve_tries(nd_a[s])
             prescan_block(nd_b[s])
             e: uint32 = nd_c[s]
             while e != 0:
+                if en_count != 0:
+                    prescan_reserve_tries(nd_a[e])
                 prescan_block(nd_b[e])
                 e = nd_next[e]
             prescan_block(nd_d[s])
         elif k == ND_WHILE:
+            if en_count != 0:
+                prescan_reserve_tries(nd_a[s])
             prescan_block(nd_b[s])
         elif k == ND_DO_WHILE:
             prescan_block(nd_b[s])
@@ -12957,6 +13754,7 @@ def gen_function(fn: uint32) -> uint32:
     cg_stack_size = 0
     fi_count = 0
     cg_self_struct = 0          # a plain function has no `self` receiver
+    cg_cur_return_type = nd_b[fn]   # for `?` and `return None` Option coercion
 
     # Reject a by-value struct RETURN type (ND_FUNCTION's return type is on
     # nd_b). Same rule as params: aggregates leave a function through a
@@ -13012,6 +13810,10 @@ def gen_function(fn: uint32) -> uint32:
             pfw_d: uint32 = type_float_width(ptnode)
             if pfw_d != 0:
                 loc_set_float(pfw_d)
+            # Record an enum-typed param's type node so a `match`/`?` on it can
+            # resolve the enum. Byte-inert: only fires for a registered enum type.
+            if en_count != 0 and enum_index_of_type(ptnode) != 0 and loc_count > 0:
+                loc_type_node[loc_count - 1] = ptnode
         nparams = nparams + 1
         p = nd_next[p]
 
@@ -13506,6 +14308,9 @@ def gen_program_with_globals(prog: uint32) -> uint32:
     if cg_target_kernel != 0:
         collect_externs(prog)
     layout_classes(prog)
+    # Register tagged sum types (enums) + the referenced built-in Option/Result
+    # AFTER classes (so struct names are known) and before any function codegen.
+    register_enums(prog)
     layout_globals(prog)
     decls: uint32 = nd_b[prog]
     cur: uint32 = decls
