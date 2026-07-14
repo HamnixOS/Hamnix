@@ -11994,6 +11994,101 @@ def _hist_load(back: uint64):
     ed_cur = n
 
 
+# --- history persistence across sessions ----------------------------
+# The interactive history ring is mirrored to a per-user file so that
+# Up-arrow / Ctrl-R recall survives a restart. On startup we reload it
+# into the ring; on a clean exit we write the live ring back out. Both
+# use the shell's own native file ops (sys_open / sys_open_write /
+# sys_read / sys_write / sys_close) — NOT a reimplemented Linux path —
+# in keeping with the native-Plan9-files invariant. The file lives at
+# $HOME/.hamsh_history (falling back to /.hamsh_history when HOME is
+# unset or the bare root placeholder), one command per line, capped at
+# the ring depth (O_TRUNC on save keeps it bounded).
+HIST_FILE_MAX: uint64 = 49152    # read cap == HIST_MAX * HIST_WID
+hist_path_buf: Array[256, uint8]
+hist_file_buf: Array[49152, uint8]
+
+
+def _hist_path() -> Ptr[char]:
+    # Compose the history file path into hist_path_buf and return it.
+    # "$HOME/.hamsh_history"; a "/"-only or unset HOME yields the root
+    # "/.hamsh_history" (always writable on the tmpfs root).
+    p: uint64 = 0
+    h: Ptr[uint8] = env_get(cast[Ptr[uint8]]("HOME"))
+    if cast[uint64](h) != 0 and h[0] != 0:
+        i: uint64 = 0
+        while h[i] != 0 and p + 1 < 256:
+            hist_path_buf[p] = h[i]
+            p = p + 1
+            i = i + 1
+        # Drop a single trailing '/' so we don't emit a doubled slash
+        # ("/" -> "" here, then the suffix supplies the leading slash).
+        if p > 0 and hist_path_buf[p - 1] == 47:
+            p = p - 1
+    suffix: Ptr[uint8] = "/.hamsh_history"
+    j: uint64 = 0
+    while suffix[j] != 0 and p + 1 < 256:
+        hist_path_buf[p] = suffix[j]
+        p = p + 1
+        j = j + 1
+    hist_path_buf[p] = 0
+    return cast[Ptr[char]](&hist_path_buf[0])
+
+
+def hist_load_file():
+    # Reload saved history at startup. Missing file is a silent no-op
+    # (returns 0 from sys_open). Each newline-terminated line is fed
+    # through hist_append, so the ring's dedup / cap logic applies and
+    # a file longer than the ring keeps only the newest HIST_MAX lines.
+    path: Ptr[char] = _hist_path()
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return
+    total: uint64 = 0
+    while total < HIST_FILE_MAX:
+        n: int64 = sys_read(fd, &hist_file_buf[total], HIST_FILE_MAX - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    # Split on '\n' and append each non-empty line.
+    p: uint64 = 0
+    while p < total:
+        s: uint64 = p
+        while p < total and hist_file_buf[p] != 10:
+            p = p + 1
+        llen: uint64 = p - s
+        if p < total:
+            p = p + 1
+        if llen > 0:
+            hist_append(&hist_file_buf[s], llen)
+
+
+def hist_save_file():
+    # Persist the live ring on a clean exit, oldest entry first so a
+    # reload preserves chronological order. O_TRUNC (via sys_open_write)
+    # keeps the file bounded to the ring depth. A failed open (e.g. a
+    # read-only or absent home dir) is a silent no-op — never fatal.
+    if hist_count == 0:
+        return
+    path: Ptr[char] = _hist_path()
+    fd: int32 = sys_open_write(path)
+    if fd < 0:
+        return
+    nl: Array[1, uint8]
+    nl[0] = 10
+    depth: uint64 = _hist_depth()
+    b: uint64 = depth
+    while b > 0:
+        b = b - 1
+        slot: uint64 = (hist_count - 1 - b) % HIST_MAX
+        n: uint64 = hist_len[slot]
+        if n > 0:
+            sys_write(fd, &hist_buf[slot * HIST_WID], n)
+            sys_write(fd, &nl[0], 1)
+    sys_close(fd)
+
+
 # The prompt in effect for the current ed_readline call. The editor
 # re-emits it verbatim on every redraw so a CR-to-column-0 repaint
 # never clobbers the prompt text. ed_prompt_kind selects which prompt
@@ -12881,6 +12976,84 @@ def _ed_complete_list():
     _ed_redraw()
 
 
+# --- context-aware completion (variables + command flags) -----------
+def _cmp_offer_env(pfx: Ptr[uint8], plen: uint64):
+    # Offer every exported environment name that begins with `pfx`. Used
+    # for `$`-prefixed tokens (the `$` sigil is not part of the name, so
+    # callers pass the post-`$` leaf and re-supply the sigil on apply).
+    i: uint64 = 0
+    while i < ENV_MAX:
+        if env_used[i] != 0:
+            nm: Ptr[uint8] = &env_name[i * ENV_NAME_MAX]
+            if nm[0] != 0:
+                _cmp_offer_if_prefix(nm, cstr_len(nm), pfx, plen, 0)
+        i = i + 1
+
+
+ed_fw_buf: Array[128, uint8]
+
+
+def _ed_first_word() -> uint64:
+    # Copy the command word (first whitespace-delimited token on the
+    # line) into ed_fw_buf, NUL-terminated, and return its length. Used
+    # to key flag completion off the command being invoked.
+    i: uint64 = 0
+    while i < ed_len and (ed_buf[i] == 32 or ed_buf[i] == 9):
+        i = i + 1
+    p: uint64 = 0
+    while i < ed_len and ed_buf[i] != 32 and ed_buf[i] != 9 and p + 1 < 128:
+        ed_fw_buf[p] = ed_buf[i]
+        p = p + 1
+        i = i + 1
+    ed_fw_buf[p] = 0
+    return p
+
+
+def _cmp_flags_for(cmd: Ptr[uint8]) -> Ptr[uint8]:
+    # Best-effort flag hint table: map a command name to a space-
+    # separated set of its common flags, or 0 when unknown. This is a
+    # static convenience list — it does not require the command to be
+    # installed — so the set stays deterministic for tests and offline
+    # use. Long (`--`) and short (`-`) forms both live here; the prefix
+    # filter in _cmp_offer_flags picks whichever the user started typing.
+    if cstr_eq(cmd, "ls") != 0:
+        return "-l -a -h -R -t -r -S --all --almost-all --human-readable --reverse --recursive"
+    if cstr_eq(cmd, "grep") != 0:
+        return "-i -v -n -r -c -w -E -l --ignore-case --invert-match --line-number --recursive --count --color"
+    if cstr_eq(cmd, "cat") != 0:
+        return "-n -A -E -T --number --show-ends --show-all"
+    if cstr_eq(cmd, "rm") != 0:
+        return "-r -f -i -v --recursive --force --interactive --verbose"
+    if cstr_eq(cmd, "cp") != 0:
+        return "-r -f -i -v -p --recursive --force --preserve --verbose"
+    if cstr_eq(cmd, "mv") != 0:
+        return "-f -i -v -n --force --interactive --verbose --no-clobber"
+    if cstr_eq(cmd, "mkdir") != 0:
+        return "-p -v -m --parents --verbose --mode"
+    if cstr_eq(cmd, "echo") != 0:
+        return "-n -e -E"
+    if cstr_eq(cmd, "ps") != 0:
+        return "-e -f -a -u -x --help"
+    if cstr_eq(cmd, "kill") != 0:
+        return "-9 -15 -l -s --signal --list"
+    return cast[Ptr[uint8]](0)
+
+
+def _cmp_offer_flags(flags: Ptr[uint8], pfx: Ptr[uint8], plen: uint64):
+    # Walk the space-separated flag string, offering each flag that
+    # begins with the `plen`-byte prefix `pfx`.
+    i: uint64 = 0
+    while flags[i] != 0:
+        s: uint64 = i
+        while flags[i] != 0 and flags[i] != 32:
+            i = i + 1
+        wlen: uint64 = i - s
+        if wlen > 0:
+            _cmp_offer_if_prefix(&flags[s], wlen, pfx, plen, 0)
+        while flags[i] == 32:
+            i = i + 1
+
+
 def _ed_complete():
     # Tab handler. Completes the token under the cursor against either
     # the command set (first word) or namespace paths (later words).
@@ -12900,6 +13073,26 @@ def _ed_complete():
     # `leaf` is the part of the token actually being prefix-matched;
     # `leaf_off` is its offset within `tok` (past any directory part).
     leaf_off: uint64 = 0
+
+    # Variable completion: a token that opens with '$' completes against
+    # the exported environment. The '$' sigil stays on the line (leaf_off
+    # = 1) and the matched name is inserted after it.
+    if ti >= 1 and tok[0] == 36:               # '$'
+        _cmp_offer_env(&tok[1], ti - 1)
+        _ed_complete_apply(tok_start, 1, ti, 0)
+        return
+
+    # Flag completion: a NON-command token that opens with '-' completes
+    # against the invoking command's known flags (best-effort table). If
+    # the command has no flag table, fall through to path completion so a
+    # literal `-name` file still tab-completes.
+    if first == 0 and ti >= 1 and tok[0] == 45:  # '-'
+        _ed_first_word()
+        flags: Ptr[uint8] = _cmp_flags_for(&ed_fw_buf[0])
+        if cast[uint64](flags) != 0:
+            _cmp_offer_flags(flags, &tok[0], ti)
+            _ed_complete_apply(tok_start, 0, ti, 0)
+            return
 
     if first != 0:
         # Command-name completion. A token that contains a '/' is a
@@ -13201,6 +13394,10 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     # a correct $HOME. See _set_home_from_passwd.
     _set_home_from_passwd()
     _load_per_user_namespace()
+    # Reload the saved history ring now that $HOME is final, so Up-arrow
+    # / Ctrl-R recall spans previous sessions. Done AFTER _set_home_from_
+    # passwd so the per-user path resolves; a missing file is a no-op.
+    hist_load_file()
     # TEMP_DEBUG_HAMSH_BRINGUP — entering the interactive read-eval
     # loop. Next marker fires once per ed_readline call.
     _dbg_stage(cast[Ptr[uint8]]("[hamsh:stage-07] loop-enter\n"))
@@ -13239,6 +13436,7 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             if el == -1:
                 # EOF on stdin — exit cleanly.
                 write_cstr1("\n")
+                hist_save_file()
                 return cast[int32](eval_status)
             if el == -2:
                 # Ctrl-C — abandon the whole logical line, fresh prompt.
@@ -13280,6 +13478,8 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             if total + 2 >= LINE_MAX:
                 done = 1
         if run_source(&line_buf[0], total) != 0:
+            # `exit` (or another unwind) — persist history before leaving.
+            hist_save_file()
             return cast[int32](eval_status)
     return 0
 

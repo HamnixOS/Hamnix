@@ -3701,7 +3701,19 @@ def build_archive() -> bytes:
         for elf in sorted(user_dir.glob("*.elf")):
             if init_override_real is not None:
                 if elf.resolve() == init_override_real:
-                    continue          # already embedded above as /init
+                    # This ELF is already embedded above as /init. Still
+                    # expose it at /bin/<name> so a NESTED invocation (a
+                    # subshell — e.g. `hamsh` launched from the interactive
+                    # hamsh that is running as /init) can be found on PATH.
+                    # The /init slot keeps its own copy; this is an extra,
+                    # harmless world-exec entry (~a few hundred KiB).
+                    bin_name = "/bin/" + elf.stem
+                    blob += cpio_entry(bin_name, elf.read_bytes(),
+                                       mode=0o100755)
+                    print(f"  embedded {bin_name} ({elf.stat().st_size} "
+                          f"bytes from build/user/{elf.name}, override "
+                          f"also on PATH)")
+                    continue
                 if elf.name == "init.elf":
                     continue          # /init slot is taken by override
             data = elf.read_bytes()
