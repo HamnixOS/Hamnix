@@ -197,8 +197,19 @@ PY
     QL="$HOSTLIB/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders"
     [ -x "$QL" ] || QL="$(command -v gdk-pixbuf-query-loaders || true)"
     if [ -n "$QL" ] && [ -x "$QL" ]; then
-        "$QL" "$ROOTFS/$PIXBUF_REL/loaders/"*.so 2>/dev/null | sed "s|$ROOTFS/||g" > "$ROOTFS/$PIXBUF_REL/loaders.cache"
-        echo "[stage-webkit] wrote gdk-pixbuf loaders.cache"
+        # ABSOLUTE loader paths (leading '/'): gdk-pixbuf dlopen()s each module
+        # by the path recorded here. `s|$ROOTFS/||g` (the old form) stripped the
+        # leading slash too, yielding a RELATIVE path (usr/lib/...) that dlopen
+        # resolves against the CWD and FAILS ("cannot open shared object file"),
+        # so NO loader — including the SVG loader the Adwaita symbolic CSD icons
+        # need — can load. GTK then aborts in ensure_surface_for_gicon (a fatal
+        # g_assert) while decorating the window, BEFORE it ever issues
+        # xdg_wm_base.get_xdg_surface — i.e. every GTK/GDK client (MiniBrowser,
+        # gtk-hello, Firefox) parks pre-map. Map $ROOTFS/ -> / so the cache
+        # holds absolute paths that resolve inside the distro namespace (matches
+        # stage_firefox.sh's #127 fix, which stage_webkit previously clobbered).
+        "$QL" "$ROOTFS/$PIXBUF_REL/loaders/"*.so 2>/dev/null | sed "s|$ROOTFS/|/|g" > "$ROOTFS/$PIXBUF_REL/loaders.cache"
+        echo "[stage-webkit] wrote gdk-pixbuf loaders.cache (absolute paths)"
     fi
 fi
 
