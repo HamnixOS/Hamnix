@@ -610,8 +610,8 @@ fi
 # panel rendered its grey bar only to ~1024 (the "grey bar stops at ~80%" bug
 # the user caught in the screendump). That clamp is now an AREA budget, not a
 # per-dim cap, so the rendered bar must reach (near) the full screen width.
-# Scan row y=12 of the POST screendump: the grey panel colour (#eceef2 ~=
-# 212,208,200) must extend to within 16px of the right edge. Advisory unless
+# Scan row y=12 of the POST screendump: the grey panel colour (#eceef2 =
+# 236,238,242) must extend to within 16px of the right edge. Advisory unless
 # a post screendump exists (screendump authoritative for the visual bug).
 if [ -f "$OUT_DIR/post.ppm" ]; then
     barw=$(python3 - "$OUT_DIR/post.ppm" <<'PYBAR'
@@ -638,7 +638,7 @@ rightmost=0
 for x in range(w):
     o=(y*w+x)*3
     r,g,b=px[o],px[o+1],px[o+2]
-    if abs(r-212)<=24 and abs(g-208)<=24 and abs(b-200)<=24:
+    if abs(r-236)<=24 and abs(g-238)<=24 and abs(b-242)<=24:
         rightmost=x
 print(rightmost+1)
 print(w)
