@@ -53,34 +53,51 @@ assert_grep() {
     else echo "[notes-host] FAIL $2 (missing: $1)"; fail=1; fi
 }
 
-# --- scene / toolbar renders ------------------------------------------------
+# --- scene / toolbar / sidebar / title-field renders -----------------------
 assert_grep '^# scene v1 hamui'                 "scene header emitted"
-assert_grep '^fill 0 0 360 280 #eceef2'         "notes window background"
-assert_grep '^glyphs 10 6 \"Notes\"'            "title label"
+assert_grep '^fill 0 0 480 300 #eceef2'         "notes window background"
+assert_grep '^glyphs 10 6 \"Notes\"'            "app title label"
 assert_grep 'glyphs .*\"New\"'                  "New toolbar button rendered"
 assert_grep 'glyphs .*\"Save\"'                 "Save toolbar button rendered"
-assert_grep 'glyphs .*\"Note 1/2\"'             "note indicator rendered (paged back to note 1 of 2)"
-assert_grep '^PIX 20 120 #fffef0'               "raster paper pixel = pale note"
+assert_grep 'glyphs .*\"Delete\"'               "Delete toolbar button rendered"
+assert_grep 'glyphs .*\"Note 1/2\"'             "note indicator rendered (note 1 of 2)"
+assert_grep 'glyphs .*\"NOTES\"'                "sidebar selector header rendered"
+assert_grep '^fill 0 48 140 252 #f7f8fa'        "sidebar note-list panel rendered"
+assert_grep 'glyphs .*\"Title\"'                "title-field label rendered"
+assert_grep '^PIX 20 120 #f7f8fa'               "raster sidebar pixel"
+assert_grep '^PIX 200 150 #fffef0'              "raster body paper pixel = pale note"
 
-# --- typing -----------------------------------------------------------------
-assert_grep '^LEN0 0'                           "buffer starts empty"
-# Default script types "Buy milk\nCall Sam" then one backspace -> 16 chars.
-assert_grep '^LEN1 16'                          "typed text + backspace edit gives 16 chars"
+# --- the note SELECTOR lists both notes by their title ----------------------
+assert_grep 'glyphs .*\"Groceries\"'            "note-0 title shown (title field + sidebar row)"
+assert_grep 'glyphs .*\"Todo\"'                 "note-1 title shown in the sidebar selector"
+
+# --- typing: TITLE field + BODY edit area -----------------------------------
+assert_grep '^LEN0 0'                           "body starts empty"
+assert_grep '^TITLE_LEN 9'                       "title field holds \"Groceries\" (9 chars)"
+# Body script types "Buy milk\nCall Sam" then one backspace -> 16 chars.
+assert_grep '^LEN1 16'                          "typed body + backspace edit gives 16 chars"
 assert_grep '^DIRTY 1'                          "buffer marked dirty after edits"
-assert_grep 'glyphs .*\"Buy milk\"'             "first line rendered"
-assert_grep 'glyphs .*\"Call Sa\"'             "second line rendered (backspaced)"
+assert_grep 'glyphs .*\"Buy milk\"'             "first body line rendered"
+assert_grep 'glyphs .*\"Call Sa\"'             "second body line rendered (backspaced)"
 
-# --- SAVE persists to a real file ------------------------------------------
+# --- SAVE persists title+body together to a real file -----------------------
 assert_grep '^DIRTY_AFTER_SAVE 0'              "Ctrl-S clears the dirty flag"
-assert_grep '^FILE0_LEN 16'                     "Ctrl-S wrote 16 bytes to note-0.txt on disk"
+assert_grep '^FILE0_LEN 26'                     "Ctrl-S wrote title+body (26 bytes) to note-0.txt"
 
 # --- NEW blanks the editor onto a fresh note --------------------------------
 assert_grep '^LEN_AFTER_NEW 0'                  "Ctrl-N clears the editor"
 assert_grep '^IDX_AFTER_NEW 1'                  "Ctrl-N advances to a new note index"
 
-# --- paging back RELOADS the saved note off disk ----------------------------
-assert_grep '^IDX_AFTER_PREV 0'                 "Prev returns to note-0"
-assert_grep '^LEN_AFTER_RELOAD 16'              "note-0 reloaded from disk (16 bytes)"
+# --- clicking a sidebar row SELECTS + reloads that note off disk ------------
+assert_grep '^HIT_ROW0 5'                        "clicking a sidebar row hit-tests to select"
+assert_grep '^IDX_AFTER_SELECT 0'               "selecting sidebar row 0 returns to note-0"
+assert_grep '^LEN_AFTER_RELOAD 16'              "note-0 body reloaded from disk (16 bytes)"
+assert_grep '^TITLE_AFTER_RELOAD 9'             "note-0 title reloaded from disk (Groceries)"
+
+# --- DELETE removes the current note ----------------------------------------
+assert_grep '^HIT_DELETE 6'                      "clicking Delete hit-tests to delete"
+assert_grep '^COUNT_AFTER_DELETE 1'             "delete drops the note count 2 -> 1"
+assert_grep '^TITLE_AFTER_DELETE 4'             "surviving note (Todo) shifted into slot 0"
 
 # --- the scratch dir really holds the note + state files --------------------
 if [ -s "$ROOT/note-0.txt" ]; then echo "[notes-host] PASS note-0.txt exists on disk";
