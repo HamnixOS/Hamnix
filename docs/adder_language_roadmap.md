@@ -21,6 +21,15 @@ Companion doc: `docs/adder_memory_safety.md` (the bounds-check increments 1/1b/2
    identically (objdiff on `x86_64-adder-user`), or it's rejected.
 4. **Incremental, not big-bang.** Land the cheap high-value wins first; the heavy
    compile-time analyses (ownership/regions) come last, and stay opt-in.
+5. **No codegen-perf regression (USER, 2026-07-14).** Adder-compiled code is at
+   **geomean 1.83× of `gcc -O2`** (the `-O2` register-promotion pipeline, `BENCH_OPT=2
+   bash scripts/bench_adder_host.sh`) — inside the ≤2× target. Every increment must keep
+   that number **flat or better, never slower**. Invariant #2 (byte-inert-off) protects
+   it structurally — code that doesn't use a new feature objdiffs identical, so it runs
+   identically — but any increment that touches the emitted-instruction path (not just
+   opt-in-by-use syntax) must run the bench and show no regression. Making the generated
+   code *faster* is squarely in scope of "best systems language" — optimizer wins count
+   as roadmap progress, not a distraction.
 
 ## Where Adder already is (strong base)
 
