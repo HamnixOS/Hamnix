@@ -59,6 +59,13 @@ cat "$D0"
 assert_grep 'TITLE Google'                       "$D0" "title is Google"
 assert_grep '\[cats_+\]'                          "$D0" "query box renders with its value"
 assert_grep '\[ Google Search \]'                "$D0" "submit button renders"
+# THE noscript FIX: hambrowse runs JS (jsengine is always wired), so the
+# <noscript> "Please enable JavaScript" fallback that real sites ship MUST be
+# suppressed exactly like a JS-enabled browser. Before the fix this text leaked
+# into the render flow (the user's "it tells me to turn on JavaScript" bug) and
+# added a stray block that skewed the layout.
+assert_nogrep 'enable JavaScript'                "$D0" "noscript 'enable JavaScript' fallback is NOT rendered (JS is on)"
+assert_nogrep 'does not support it'              "$D0" "noscript fallback body is fully skipped"
 
 # (b) Typing a query updates the box (oninput/DOM value flows to the render).
 D1="$OUT/g_type.txt"
@@ -96,6 +103,11 @@ assert_grep 'hl=en'                              "$D3" "hidden field carried on 
 # The field is now pointer-reachable: after the click-links re-layout its box
 # segment carries a link (l>=0), so the front-end's _hit_link resolves it.
 assert_grep '\[plan 9 os\] *\|' "$D3" "typed text renders in the field box (set_value_index)"
+
+# (e) UA: the HTTP client must present a browser-like "Mozilla/5.0" User-Agent
+# so sites that sniff the UA (Google) serve the modern scripting variant rather
+# than a degraded no-JS page. Static guard on the request builder.
+assert_grep 'User-Agent: Mozilla/5\.0'           "user/http9.ad" "http9 sends a browser-like Mozilla User-Agent"
 
 if [ "$fail" -ne 0 ]; then
     echo "[hb-google] RESULT: FAIL"; exit 1
