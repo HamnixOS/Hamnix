@@ -203,7 +203,8 @@ build_adder_user hamcalc              # integer calculator on the hamui toolkit 
 build_adder_user hamctl               # scene-DE Control Center hub (dual-target lib/hamctlcore): Appearance (wallpaper ctl verb) + Date & Time (clock + UTC offset -> /tmp/hamnix-tz.conf) + About (hostname/kernel/uptime/mem/CPUs/procs)
 build_adder_user hamview              # image viewer (Eye-of-MATE equiv) on the hamui toolkit: decodes PPM(P6)/BMP, blits via an fb draw-layer
 build_adder_user hamabout             # About-this-system dialog (scene client): OS name + kernel + memory + uptime
-build_adder_user hamshot              # screenshot CLI (MATE-screenshot equiv): /dev/fb geometry + /dev/fbpix pixel stream -> timestamped PNG (lib/pngwrite.ad; view with hamview) + desktop notification
+build_adder_user hamshot              # screenshot CLI (MATE-screenshot equiv): /dev/fb geometry + /dev/fbpix pixel stream -> timestamped PNG (lib/pngwrite.ad; view with hamview) + desktop notification; [--crop X Y W H] captures a sub-rectangle
+build_adder_user hamshotui            # screenshot chooser (scene client): Whole Desktop / Select Area (rubber-band) / Application Window -> spawns hamshot [--crop] (app-drawer Screenshot entry)
 build_adder_user hammon               # live system monitor (uptime/mem/process list) on the hamui toolkit (lib/hamui.ad) — reads /proc/uptime,/proc/meminfo,/proc/tasks
 build_adder_user hamecho              # Increment-1 DE rewrite: first SEPARATE-PROCESS app; echoes routed keys (proves focus-gated input ownership)
 build_adder_user hamlock              # DE pivot wave 5: full-screen screen-lock overlay (v2 client; reads /dev/wsys/lock, poked via /dev/wsys/lock/show, verify posted to /dev/wsys/lock/verify)

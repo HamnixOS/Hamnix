@@ -1,0 +1,605 @@
+# user/hamshotui.ad
+#
+# hamshotui — the DE "Take Screenshot" chooser (MATE-screenshot-dialog
+# equivalent), a SCENE-mode client (docs/de_scene_file_arch.md). Launched
+# from the application drawer's "Screenshot" entry
+# (etc/hamde/apps/screenshot.desktop -> Exec=/bin/hamshotui); the Print Screen
+# key still fires a direct whole-desktop /bin/hamshot capture.
+#
+# It offers the three capture modes the user asked for:
+#   * Whole Desktop      -> spawn /bin/hamshot                 (full frame)
+#   * Select Area        -> rubber-band a rectangle -> hamshot --crop X Y W H
+#   * Application Window  -> rubber-band over a window -> hamshot --crop ...
+#
+# Structure mirrors user/hamabout.ad (the About dialog): create our own window
+# via /dev/wsys/ctl newwindow, set geometry/decorate/z/title on /ctl, emit a
+# scene display list to /dev/wsys/<wid>/scene, and drive input from
+# /dev/wsys/<wid>/keys (+ /event) with the shared lib/hamsceneloop.ad park
+# helper so it is responsive without a busy-spin.
+#
+# AREA / APP SELECTION mechanic
+# =============================
+# Both "Select Area" and "Application Window" switch the SAME window to a
+# fullscreen, undecorated overlay (window-local coords == screen coords). The
+# overlay draws a SEMI-TRANSPARENT dim fill (#RRGGBBAA alpha-blends against the
+# live desktop, so the user still sees what they are framing) plus a bright
+# selection rectangle tracked live from pointer press -> drag -> release. On
+# release we HIDE the overlay (move it fully off-screen + commit an empty
+# scene) and yield so the compositor recomposes the CLEAN desktop, THEN spawn
+# `/bin/hamshot --crop X Y W H` — so the dim overlay never bleeds into the
+# capture. hamshot clamps the rect to the framebuffer and writes the PNG under
+# ~/Pictures with the usual "Screenshot saved" toast.
+#
+# ADDER QUIRKS HONOURED: Ptr[uint8] strings, no adjacent-literal concat, fixed
+# module-scope Array buffers, while-loops.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield() -> int32
+extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
+extern def sys_exit(code: int32)
+
+from lib.hamsceneloop import hamscene_park, HAMSCENE_IDLE_MS
+from lib.hamui import hamscene_begin, hamscene_fill, hamscene_rect, \
+    hamscene_glyphs, hamscene_stroke, hamscene_panel_button, hamscene_commit
+from lib.p9 import spawn_detached, P9_SPAWN_STDIO_NS
+
+
+# ====================================================================
+# Small helpers (idioms from hamabout.ad).
+# ====================================================================
+def _slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _writeall(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _slen(s))
+
+
+def _u64_to_dec(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    x: uint64 = v
+    while x > 0:
+        digs[n] = cast[uint8](x % 10) + 48
+        x = x / 10
+        n = n + 1
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digs[n]
+        i = i + 1
+    return i
+
+
+def _parse_u64(buf: Ptr[uint8], pos: Ptr[uint64], limit: uint64) -> uint64:
+    p: uint64 = pos[0]
+    while p < limit and buf[p] == 32:
+        p = p + 1
+    v: uint64 = 0
+    while p < limit and buf[p] >= 48 and buf[p] <= 57:
+        v = v * 10 + cast[uint64](buf[p]) - 48
+        p = p + 1
+    pos[0] = p
+    return v
+
+
+def _newwindow() -> int32:
+    wfd: int32 = sys_open_write(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if wfd < 0:
+        return -1
+    sys_write(wfd, cast[Ptr[uint8]]("newwindow\n"), 10)
+    sys_close(wfd)
+    rfd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if rfd < 0:
+        return -1
+    rbuf: Array[32, uint8]
+    r: int64 = sys_read(rfd, &rbuf[0], 31)
+    sys_close(rfd)
+    if r <= 0:
+        return -1
+    wid: int32 = 0
+    i: uint64 = 0
+    while i < cast[uint64](r):
+        c: uint8 = rbuf[i]
+        if c >= 48 and c <= 57:
+            wid = wid * 10 + cast[int32](c) - 48
+        i = i + 1
+    return wid
+
+
+ctlp:  Array[64, uint8]
+evp:   Array[64, uint8]
+keysp: Array[64, uint8]
+
+
+def _winpath(out: Ptr[uint8], wid: int32, leaf: Ptr[uint8]):
+    p: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("/dev/wsys/")
+    j: uint64 = 0
+    while pre[j] != 0:
+        out[p] = pre[j]
+        p = p + 1
+        j = j + 1
+    p = p + _u64_to_dec(cast[uint64](wid), &out[p])
+    k: uint64 = 0
+    while leaf[k] != 0:
+        out[p] = leaf[k]
+        p = p + 1
+        k = k + 1
+    out[p] = 0
+
+
+def _ctl_line(s: Ptr[uint8]):
+    # Fresh open/write/close of our window's /ctl (each verb is one write).
+    cfd: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+    if cfd >= 0:
+        _writeall(cfd, s)
+        sys_close(cfd)
+
+
+# Parse "m <x> <y> <buttons> ..." -> 1 + fills bx/by/bbtn; else 0.
+def _parse_pointer(s: Ptr[uint8], n: uint64, bx: Ptr[int64], by: Ptr[int64],
+                   bbtn: Ptr[int64]) -> int32:
+    if n < 1 or s[0] != 109:                            # 'm'
+        return 0
+    i: uint64 = 1
+    vals: Array[3, int64]
+    v: uint64 = 0
+    while v < 3:
+        while i < n and s[i] == 32:
+            i = i + 1
+        neg: int32 = 0
+        if i < n and s[i] == 45:
+            neg = 1
+            i = i + 1
+        acc: int64 = 0
+        got: int32 = 0
+        while i < n and s[i] >= 48 and s[i] <= 57:
+            acc = acc * 10 + cast[int64](s[i]) - 48
+            i = i + 1
+            got = 1
+        if got == 0:
+            return 0
+        if neg != 0:
+            acc = 0 - acc
+        vals[v] = acc
+        v = v + 1
+    bx[0] = vals[0]
+    by[0] = vals[1]
+    bbtn[0] = vals[2]
+    return 1
+
+
+# ====================================================================
+# Screen geometry (read once from /dev/fb) + module state.
+# ====================================================================
+SCR_W: int64 = 1024
+SCR_H: int64 = 768
+
+MODE_CHOOSE: int32 = 0
+MODE_AREA:   int32 = 1
+g_mode: int32 = 0
+g_wid:  int32 = -1
+
+# Live rubber-band selection (screen coords).
+sel_anchor_x: int64 = 0
+sel_anchor_y: int64 = 0
+sel_cur_x:    int64 = 0
+sel_cur_y:    int64 = 0
+dragging:     int32 = 0
+
+# Chooser geometry (window-local).
+CH_W: int32 = 320
+CH_H: int32 = 196
+BTN_X: int32 = 20
+BTN_W: int32 = 280
+BTN_H: int32 = 38
+BTN0_Y: int32 = 44
+BTN_GAP: int32 = 12
+GLYPH_W: int32 = 8
+
+
+def _read_screen_dims():
+    gfd: int32 = sys_open(cast[Ptr[char]]("/dev/fb"))
+    if gfd < 0:
+        return
+    geo: Array[64, uint8]
+    gn: int64 = sys_read(gfd, &geo[0], 63)
+    sys_close(gfd)
+    if gn <= 0:
+        return
+    glen: uint64 = cast[uint64](gn)
+    gpos: uint64 = 0
+    w: uint64 = _parse_u64(&geo[0], &gpos, glen)
+    h: uint64 = _parse_u64(&geo[0], &gpos, glen)
+    if w > 0 and h > 0:
+        SCR_W = cast[int64](w)
+        SCR_H = cast[int64](h)
+
+
+# ====================================================================
+# Spawning /bin/hamshot (inherits our regular-user namespace, so it reaches
+# #c /dev/fb, /dev/fbpix, /dev/wsys/post and ~/Pictures).
+# ====================================================================
+def _spawn_whole():
+    p: Ptr[char] = cast[Ptr[char]]("/bin/hamshot")
+    argv: Array[2, uint64]
+    argv[0] = cast[uint64](p)
+    argv[1] = 0
+    spawn_detached(p, &argv[0], P9_SPAWN_STDIO_NS, P9_SPAWN_STDIO_NS,
+                   cast[Ptr[uint64]](0))
+
+
+crop_bx: Array[16, uint8]
+crop_by: Array[16, uint8]
+crop_bw: Array[16, uint8]
+crop_bh: Array[16, uint8]
+
+
+def _spawn_crop(x: int64, y: int64, w: int64, h: int64):
+    nx: uint64 = _u64_to_dec(cast[uint64](x), &crop_bx[0])
+    crop_bx[nx] = 0
+    ny: uint64 = _u64_to_dec(cast[uint64](y), &crop_by[0])
+    crop_by[ny] = 0
+    nw: uint64 = _u64_to_dec(cast[uint64](w), &crop_bw[0])
+    crop_bw[nw] = 0
+    nh: uint64 = _u64_to_dec(cast[uint64](h), &crop_bh[0])
+    crop_bh[nh] = 0
+    p: Ptr[char] = cast[Ptr[char]]("/bin/hamshot")
+    f: Ptr[char] = cast[Ptr[char]]("--crop")
+    argv: Array[7, uint64]
+    argv[0] = cast[uint64](p)
+    argv[1] = cast[uint64](f)
+    argv[2] = cast[uint64](&crop_bx[0])
+    argv[3] = cast[uint64](&crop_by[0])
+    argv[4] = cast[uint64](&crop_bw[0])
+    argv[5] = cast[uint64](&crop_bh[0])
+    argv[6] = 0
+    spawn_detached(p, &argv[0], P9_SPAWN_STDIO_NS, P9_SPAWN_STDIO_NS,
+                   cast[Ptr[uint64]](0))
+
+
+# ====================================================================
+# CHOOSER render + hit-test.
+# ====================================================================
+def _btn_y(i: int32) -> int32:
+    return BTN0_Y + i * (BTN_H + BTN_GAP)
+
+
+def _btn_label(i: int32) -> Ptr[uint8]:
+    if i == 0:
+        l0: Ptr[uint8] = "Whole Desktop"
+        return l0
+    if i == 1:
+        l1: Ptr[uint8] = "Select Area"
+        return l1
+    l2: Ptr[uint8] = "Application Window"
+    return l2
+
+
+def _emit_chooser():
+    hamscene_begin()
+    hamscene_fill(0, 0, CH_W, CH_H, cast[Ptr[uint8]]("#2b2f3e"))
+    hamscene_stroke(0, 0, CH_W, CH_H, 1, cast[Ptr[uint8]]("#78aad2"))
+    head: Ptr[uint8] = "Take Screenshot"
+    hamscene_glyphs(20, 16, head, cast[Ptr[uint8]]("#e8f0ff"))
+    hamscene_glyphs(21, 16, head, cast[Ptr[uint8]]("#e8f0ff"))
+    i: int32 = 0
+    while i < 3:
+        by: int32 = _btn_y(i)
+        hamscene_panel_button(BTN_X, by, BTN_W, BTN_H, 0)
+        lbl: Ptr[uint8] = _btn_label(i)
+        lw: int32 = cast[int32](_slen(lbl)) * GLYPH_W
+        gx: int32 = BTN_X + (BTN_W - lw) / 2
+        gy: int32 = by + (BTN_H - 8) / 2
+        hamscene_glyphs(gx, gy, lbl, cast[Ptr[uint8]]("#101014"))
+        i = i + 1
+    hamscene_commit(g_wid)
+
+
+# Which chooser button contains window-local (lx,ly)? -1 = none.
+def _chooser_hit(lx: int64, ly: int64) -> int32:
+    i: int32 = 0
+    while i < 3:
+        by: int64 = cast[int64](_btn_y(i))
+        if lx >= cast[int64](BTN_X) and lx < cast[int64](BTN_X + BTN_W) and \
+           ly >= by and ly < by + cast[int64](BTN_H):
+            return i
+        i = i + 1
+    return -1
+
+
+# ====================================================================
+# AREA overlay render (fullscreen; window-local == screen coords).
+# ====================================================================
+g_intent_app: int32 = 0
+
+
+def _sel_rect(rx: Ptr[int64], ry: Ptr[int64], rw: Ptr[int64], rh: Ptr[int64]):
+    x0: int64 = sel_anchor_x
+    x1: int64 = sel_cur_x
+    if x1 < x0:
+        t: int64 = x0
+        x0 = x1
+        x1 = t
+    y0: int64 = sel_anchor_y
+    y1: int64 = sel_cur_y
+    if y1 < y0:
+        t2: int64 = y0
+        y0 = y1
+        y1 = t2
+    if x0 < 0:
+        x0 = 0
+    if y0 < 0:
+        y0 = 0
+    if x1 > SCR_W:
+        x1 = SCR_W
+    if y1 > SCR_H:
+        y1 = SCR_H
+    rx[0] = x0
+    ry[0] = y0
+    rw[0] = x1 - x0
+    rh[0] = y1 - y0
+
+
+def _emit_area():
+    hamscene_begin()
+    # Dim the live desktop (alpha-blended) so the user still sees what they
+    # are framing.
+    hamscene_fill(0, 0, cast[int32](SCR_W), cast[int32](SCR_H),
+                  cast[Ptr[uint8]]("#00000066"))
+    # Instruction banner.
+    banner: Ptr[uint8] = "Drag to select an area  -  Esc to cancel"
+    if g_intent_app != 0:
+        banner = "Drag a box over a window  -  Esc to cancel"
+    hamscene_fill(0, 0, cast[int32](SCR_W), 26, cast[Ptr[uint8]]("#1b3a5b"))
+    hamscene_glyphs(12, 9, banner, cast[Ptr[uint8]]("#e8f0ff"))
+    # Live selection rectangle (bright, un-dimmed border).
+    if dragging != 0:
+        rx: int64 = 0
+        ry: int64 = 0
+        rw: int64 = 0
+        rh: int64 = 0
+        _sel_rect(&rx, &ry, &rw, &rh)
+        if rw > 0 and rh > 0:
+            # Clear (lighter) fill inside the selection so it reads as the
+            # "un-dimmed" capture region, plus a crisp border.
+            hamscene_fill(cast[int32](rx), cast[int32](ry), cast[int32](rw),
+                          cast[int32](rh), cast[Ptr[uint8]]("#ffffff22"))
+            hamscene_stroke(cast[int32](rx), cast[int32](ry), cast[int32](rw),
+                            cast[int32](rh), 2, cast[Ptr[uint8]]("#ffd166"))
+    hamscene_commit(g_wid)
+
+
+# Enter the fullscreen selection overlay.
+def _enter_area(intent_app: int32):
+    g_mode = MODE_AREA
+    g_intent_app = intent_app
+    dragging = 0
+    _ctl_line(cast[Ptr[uint8]]("decorate 0\n"))
+    _ctl_line(cast[Ptr[uint8]]("z 95\n"))
+    gbuf: Array[64, uint8]
+    p: uint64 = 0
+    pre: Ptr[uint8] = "geometry 0 0 "
+    k: uint64 = 0
+    while pre[k] != 0:
+        gbuf[p] = pre[k]
+        p = p + 1
+        k = k + 1
+    p = p + _u64_to_dec(cast[uint64](SCR_W), &gbuf[p])
+    gbuf[p] = 32
+    p = p + 1
+    p = p + _u64_to_dec(cast[uint64](SCR_H), &gbuf[p])
+    gbuf[p] = 10
+    p = p + 1
+    gbuf[p] = 0
+    _ctl_line(&gbuf[0])
+    _emit_area()
+
+
+# Finalise a selection: hide the overlay, let the compositor repaint the
+# clean desktop, then fire the cropped capture and exit.
+def _finish_area():
+    rx: int64 = 0
+    ry: int64 = 0
+    rw: int64 = 0
+    rh: int64 = 0
+    _sel_rect(&rx, &ry, &rw, &rh)
+    if rw < 2 or rh < 2:
+        # Too small — treat as a cancel back to the chooser.
+        dragging = 0
+        return
+    # Hide: move fully off-screen + commit an empty scene so our dim overlay
+    # is gone from the composited framebuffer before hamshot samples it.
+    _ctl_line(cast[Ptr[uint8]]("geometry -30000 -30000 1 1\n"))
+    hamscene_begin()
+    hamscene_commit(g_wid)
+    # Yield so the compositor recomposes the vacated footprint (clean desktop)
+    # before the capture reads /dev/fbpix.
+    s: int32 = 0
+    while s < 16:
+        sys_yield()
+        s = s + 1
+    _spawn_crop(rx, ry, rw, rh)
+    sys_exit(0)
+
+
+# ====================================================================
+# Chooser button action.
+# ====================================================================
+def _chooser_action(idx: int32):
+    if idx == 0:
+        _spawn_whole()
+        sys_exit(0)
+    elif idx == 1:
+        _enter_area(0)
+    elif idx == 2:
+        _enter_area(1)
+
+
+# ====================================================================
+# Pointer + key handling.
+# ====================================================================
+btn_down: int32 = 0
+
+
+def _handle_pointer(bx: int64, by: int64, bbtn: int64):
+    now_down: int32 = 0
+    if (bbtn & 1) != 0:
+        now_down = 1
+    if g_mode == MODE_CHOOSE:
+        if now_down != 0 and btn_down == 0:
+            hit: int32 = _chooser_hit(bx, by)
+            if hit >= 0:
+                btn_down = now_down
+                _chooser_action(hit)
+                return
+        btn_down = now_down
+        return
+    # MODE_AREA rubber-band.
+    if now_down != 0 and btn_down == 0:
+        sel_anchor_x = bx
+        sel_anchor_y = by
+        sel_cur_x = bx
+        sel_cur_y = by
+        dragging = 1
+        _emit_area()
+    elif now_down != 0 and dragging != 0:
+        sel_cur_x = bx
+        sel_cur_y = by
+        _emit_area()
+    elif now_down == 0 and btn_down != 0:
+        # Release edge.
+        if dragging != 0:
+            sel_cur_x = bx
+            sel_cur_y = by
+            _finish_area()          # may sys_exit
+            dragging = 0
+    btn_down = now_down
+
+
+def main() -> int32:
+    sys_bind(cast[Ptr[char]]("/dev"), cast[Ptr[char]]("#c"), 0)
+    _read_screen_dims()
+
+    g_wid = _newwindow()
+    if g_wid < 0:
+        _writeall(1, cast[Ptr[uint8]]("[hamshotui] FAIL newwindow\n"))
+        return 1
+
+    _winpath(&ctlp[0], g_wid, cast[Ptr[uint8]]("/ctl"))
+    _winpath(&evp[0], g_wid, cast[Ptr[uint8]]("/event"))
+    _winpath(&keysp[0], g_wid, cast[Ptr[uint8]]("/keys"))
+
+    # Centred chooser window.
+    gbuf: Array[64, uint8]
+    p: uint64 = 0
+    pre: Ptr[uint8] = "geometry "
+    k: uint64 = 0
+    while pre[k] != 0:
+        gbuf[p] = pre[k]
+        p = p + 1
+        k = k + 1
+    gx: int64 = (SCR_W - cast[int64](CH_W)) / 2
+    gy: int64 = (SCR_H - cast[int64](CH_H)) / 2
+    if gx < 0:
+        gx = 0
+    if gy < 0:
+        gy = 0
+    p = p + _u64_to_dec(cast[uint64](gx), &gbuf[p])
+    gbuf[p] = 32
+    p = p + 1
+    p = p + _u64_to_dec(cast[uint64](gy), &gbuf[p])
+    gbuf[p] = 32
+    p = p + 1
+    p = p + _u64_to_dec(cast[uint64](CH_W), &gbuf[p])
+    gbuf[p] = 32
+    p = p + 1
+    p = p + _u64_to_dec(cast[uint64](CH_H), &gbuf[p])
+    gbuf[p] = 10
+    p = p + 1
+    gbuf[p] = 0
+    _ctl_line(&gbuf[0])
+    _ctl_line(cast[Ptr[uint8]]("decorate 1\n"))
+    _ctl_line(cast[Ptr[uint8]]("z 8\n"))
+    _ctl_line(cast[Ptr[uint8]]("title Take Screenshot\n"))
+
+    _emit_chooser()
+    _writeall(1, cast[Ptr[uint8]]("[hamshotui] scene window ready\n"))
+
+    kfd: int32 = sys_open(cast[Ptr[char]](&keysp[0]))
+    evbuf: Array[256, uint8]
+    kbuf:  Array[256, uint8]
+    while True:
+        # --- KEYBOARD: Escape cancels (chooser: quit; area: back to chooser).
+        if kfd >= 0:
+            kr: int64 = sys_read_nb(kfd, &kbuf[0], 255)
+            if kr > 0:
+                kls: uint64 = 0
+                kj: uint64 = 0
+                while kj <= cast[uint64](kr):
+                    atend: int32 = 0
+                    if kj == cast[uint64](kr):
+                        atend = 1
+                    if atend == 1 or kbuf[kj] == 10:
+                        if kj > kls and kbuf[kls] == 100:      # 'd' press line
+                            ci: uint64 = kls + 1
+                            while ci < kj and kbuf[ci] == 32:
+                                ci = ci + 1
+                            code: int32 = 0
+                            got: int32 = 0
+                            while ci < kj and kbuf[ci] >= 48 and kbuf[ci] <= 57:
+                                code = code * 10 + cast[int32](kbuf[ci]) - 48
+                                ci = ci + 1
+                                got = 1
+                            if got != 0 and code == 27:
+                                if g_mode == MODE_AREA:
+                                    # Back to the chooser.
+                                    g_mode = MODE_CHOOSE
+                                    dragging = 0
+                                    _ctl_line(cast[Ptr[uint8]](
+                                        "decorate 1\n"))
+                                    _ctl_line(cast[Ptr[uint8]]("z 8\n"))
+                                    _ctl_line(&gbuf[0])
+                                    _emit_chooser()
+                                else:
+                                    sys_exit(0)
+                        kls = kj + 1
+                    kj = kj + 1
+
+        # --- POINTER: non-blocking drain of /event.
+        efd: int32 = sys_open(cast[Ptr[char]](&evp[0]))
+        if efd >= 0:
+            r: int64 = sys_read_nb(efd, &evbuf[0], 255)
+            sys_close(efd)
+            if r > 0:
+                ls: uint64 = 0
+                i: uint64 = 0
+                while i <= cast[uint64](r):
+                    atend2: int32 = 0
+                    if i == cast[uint64](r):
+                        atend2 = 1
+                    if atend2 == 1 or evbuf[i] == 10:
+                        if i > ls:
+                            bx: int64 = 0
+                            by: int64 = 0
+                            bbtn: int64 = 0
+                            if _parse_pointer(&evbuf[ls], i - ls, &bx, &by,
+                                              &bbtn) == 1:
+                                _handle_pointer(bx, by, bbtn)
+                        ls = i + 1
+                    i = i + 1
+
+        hamscene_park(kfd, HAMSCENE_IDLE_MS)
+    return 0

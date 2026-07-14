@@ -666,7 +666,7 @@ def _files_installer_tools() -> list[tuple[Path, str]]:
 
 DESKTOP_CORE_BINS = (
     "hamUId", "hamde", "hamdesktop", "hampanelscene", "hamctl",
-    "hamnotify", "hamshot", "hamtray", "hamappmenu", "hamctxmenu",
+    "hamnotify", "hamshot", "hamshotui", "hamtray", "hamappmenu", "hamctxmenu",
     "hamosd", "hamlock", "hamscreensaver", "hamsession", "hamsessui",
     "hamrband", "hamresize", "hamtoast",
 )
