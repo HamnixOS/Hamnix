@@ -66,7 +66,8 @@ assert_grep '^# scene v1 hamui'                 "scene header emitted"
 assert_grep '^fill 0 0 188 300 #2b2f36'         "calculator case background"
 assert_grep '^fill 8 8 172 42 #0d1410'          "sunken LCD display bar"
 assert_grep '^glyphs 164 22 \"0\" #9ff09f'      "display shows 0 in LCD green, right-aligned"
-assert_grep '^fill 8 60 40 35 #e6e8ec'          "top-left key face geometry"
+assert_grep '^roundrect 8 60 40 35 5 #c2c5cd 15' "top-left key rounded frame base"
+assert_grep '^roundrect 9 61 38 33 4 #e6e8ec 15' "top-left key rounded face inset"
 assert_grep '^glyphs 24 147 \"7\" #202020'      "digit '7' key label in dark"
 assert_grep '^glyphs 156 69 \"/\" #7a2a00'      "operator '/' key label in orange"
 assert_grep '^glyphs 68 69 \"C\" #7a0000'       "clear 'C' key label in red"
@@ -86,12 +87,12 @@ assert_grep '^PRIMS ([1-9][0-9][0-9]?)'         "rasterizer drew the scene primi
 assert_grep '^PIX 2 2 #2b2f36'                  "raster case pixel = dark slate"
 assert_grep '^PIX 20 20 #0d1410'                "raster LCD pixel = dark green-black"
 assert_grep '^PIX 12 64 #e6e8ec'                "raster key-face pixel = flat button neutral"
-# --- modern flat button chrome on the shared panel button (@8,60 40x35) ---
-assert_grep '^PIX 8 60 #c2c5cd'                 "flat: soft hairline border at button corner"
-assert_grep '^PIX 20 61 #f6f7f9'                "flat: faint top-edge sheen"
-assert_grep '^PIX 9 72 #f6f7f9'                 "flat: faint left-edge sheen"
-assert_grep '^PIX 20 93 #d6d9df'                "flat: faint bottom-edge shadow"
-assert_grep '^PIX 46 72 #d6d9df'                "flat: faint right-edge shadow"
+# --- modern ROUNDED flat button chrome on the shared panel button (@8,60 40x35, r5) ---
+assert_grep '^PIX 8 60 #2b2f36'                 "rounded: hard corner cut away -> case bg shows"
+assert_grep '^PIX 8 77 #c2c5cd'                 "rounded: straight left edge is the hairline frame"
+assert_grep '^PIX 20 61 #f6f7f9'                "rounded: faint top-edge sheen"
+assert_grep '^PIX 20 93 #d6d9df'                "rounded: faint bottom-edge shadow"
+assert_grep '^PIX 10 60 #767981'                "rounded: AA corner band blends frame ink with bg"
 
 # --- Initial state -------------------------------------------------------
 assert_grep '^DISPLAY0 0'                        "initial display is 0"
