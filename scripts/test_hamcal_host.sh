@@ -47,7 +47,7 @@ assert_grep() {
 }
 
 assert_grep '^# scene v1 hamui'                 "scene header emitted"
-assert_grep '^fill 0 0 236 366 #d4d0c8'         "calendar window background"
+assert_grep '^fill 0 0 236 366 #eceef2'         "calendar window background"
 assert_grep '^glyphs 82 38 \"July 2026\"'       "title shows the seeded month"
 # 2026-07-01 is a Wednesday: day '1' lands in column 3 (x=6+3*32+10=112).
 assert_grep '^glyphs 112 81 \"1\"'              "July 1 2026 placed on Wednesday"
@@ -55,7 +55,7 @@ assert_grep '^glyphs 112 81 \"1\"'              "July 1 2026 placed on Wednesday
 assert_grep '^glyphs 12 133 \"12\" #ffffff'     "today (12) highlighted"
 assert_grep '^MONTH0 7'                         "initial month is July"
 assert_grep '^YEAR0 2026'                       "initial year is 2026"
-assert_grep '^PIX 4 4 #3a6ea5'                  "raster title-bar pixel = blue"
+assert_grep '^PIX 4 4 #3584e4'                  "raster title-bar pixel = blue"
 
 # --- date selection + RELATIVE TIME ---
 assert_grep '^SEL0 12'                          "selection defaults to today (12)"

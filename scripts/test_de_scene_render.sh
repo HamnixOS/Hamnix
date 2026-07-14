@@ -593,12 +593,12 @@ fi
 
 # (6f) FULL-WIDTH PANEL: the panel bar's background fill spans the whole
 # screen width. The panel queries /dev/fb and fills "fill 0 0 <sw> 26
-# #d4d0c8" — for the 1280x800 (or 800x600) fb modes the width token must be
+# #eceef2" — for the 1280x800 (or 800x600) fb modes the width token must be
 # the FULL screen width, never a short hardcode. Assert a wide (>=800px)
 # panel fill is present (regression guard for the "grey bar stops ~80%" bug
 # the user caught — the panel must request full width client-side).
-if grep -aEq 'fill +0 +0 +(8[0-9][0-9]|9[0-9][0-9]|1[0-9][0-9][0-9]) +26 +#d4d0c8' "$LOG"; then
-    pw=$(grep -aoE 'fill +0 +0 +[0-9]+ +26 +#d4d0c8' "$LOG" | grep -oE '[0-9]+' | sed -n '3p' | head -1)
+if grep -aEq 'fill +0 +0 +(8[0-9][0-9]|9[0-9][0-9]|1[0-9][0-9][0-9]) +26 +#eceef2' "$LOG"; then
+    pw=$(grep -aoE 'fill +0 +0 +[0-9]+ +26 +#eceef2' "$LOG" | grep -oE '[0-9]+' | sed -n '3p' | head -1)
     echo "[scene_gate] PASS panel bar fills full screen width (${pw}px wide)"
 else
     echo "[scene_gate] NOTE full-width panel fill not captured this boot window (serial flood; screendump authoritative)"
@@ -610,7 +610,7 @@ fi
 # panel rendered its grey bar only to ~1024 (the "grey bar stops at ~80%" bug
 # the user caught in the screendump). That clamp is now an AREA budget, not a
 # per-dim cap, so the rendered bar must reach (near) the full screen width.
-# Scan row y=12 of the POST screendump: the grey panel colour (#d4d0c8 ~=
+# Scan row y=12 of the POST screendump: the grey panel colour (#eceef2 ~=
 # 212,208,200) must extend to within 16px of the right edge. Advisory unless
 # a post screendump exists (screendump authoritative for the visual bug).
 if [ -f "$OUT_DIR/post.ppm" ]; then

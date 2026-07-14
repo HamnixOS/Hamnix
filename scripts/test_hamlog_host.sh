@@ -48,7 +48,7 @@ assert_grep() {
 }
 
 assert_grep '^# scene v1 hamui'                     "scene header emitted"
-assert_grep '^fill 0 0 568 360 #d4d0c8'             "log window background"
+assert_grep '^fill 0 0 568 360 #eceef2'             "log window background"
 assert_grep '^fill 8 34 524 296 #10161c'            "dark console text area"
 assert_grep '^glyphs 10 8 \"Kernel Log  \(60 lines\)\"' "header shows the line count"
 # top page: first seeded line visible, last (line #59) NOT yet visible.
@@ -63,7 +63,7 @@ assert_grep '^TAIL 3'                               "tail button returns ACT_LOG
 assert_grep '^SCROLL3 42'                           "tail snapped to the newest page (42)"
 # tailed page: the newest line (#59) is now on screen.
 assert_grep 'glyphs .*subsystem init line #59'      "newest line visible after tail"
-assert_grep '^PIX 4 4 #3a6ea5'                      "raster title-bar pixel = blue"
+assert_grep '^PIX 4 4 #3584e4'                      "raster title-bar pixel = blue"
 
 if [ "$fail" -ne 0 ]; then echo "[log-host] OVERALL FAIL"; exit 1; fi
 echo "[log-host] OVERALL PASS"

@@ -19,7 +19,7 @@
 #
 #   (2-4) IN-VM — boots, runs `hamui_demo` then `hamUId render 1`, and asserts
 #        the render HARNESS ran (DUMP header + DUMP END). The older per-pixel
-#        widget-content probes (#4a6da7 in the composited draw LAYERS) are now
+#        widget-content probes (#3584e4 in the composited draw LAYERS) are now
 #        INFORMATIONAL NOTEs: `hamUId render <wid>` composites the legacy draw
 #        layers, which the scene-migrated toolkit no longer feeds, so they
 #        read all-background even on a working toolkit (verified identical on
@@ -82,7 +82,7 @@ demo_fail=0
 # calls hamscene_fill). These tokens prove the new widgets' paint code is
 # linked + reachable through lib/hamscene.ad, not just the v1 set.
 for tok in '# scene v1 hamui' 'fill ' 'glyphs ' 'line ' 'stroke ' 'commit' \
-           '#4a6da7' '#5fc46d' '#303848' '#5f86c4' \
+           '#3584e4' '#5fc46d' '#303848' '#5a9bf0' \
            'mklayer ui markup' 'setz ui'; do
     if grep -aF -q "$tok" build/user/hamui_demo.elf; then
         echo "[test_hamui_render] OK: demo binary contains scene/protocol token: ${tok}"
@@ -102,7 +102,7 @@ done
 # and carries no `hamui_*` names, so this loop MISSes every symbol regardless
 # of correctness (verified identical on origin/main). The widgets' paint code
 # IS linked and reachable — proven by the distinctive per-widget scene fills
-# already asserted above (#5fc46d progress, #303848 image, #5f86c4) and by the
+# already asserted above (#5fc46d progress, #303848 image, #5a9bf0) and by the
 # in-VM PIX render below. So: enforce the name grep ONLY when the compiler
 # actually emitted names (some symbol present => a name-emitting build, so ALL
 # must be present — that still catches a real partial-link regression). If NO
@@ -251,7 +251,7 @@ assert_has "DUMP END" "dump terminated cleanly"
 # This stage was written when the hamui toolkit painted its widgets as hamML
 # markup into a window's `ui` DRAW LAYER (/dev/wsys/<wid>/draw/ui/markup),
 # which `hamUId render <wid>` composites + probes for the button fill
-# #4a6da7. The toolkit has since MIGRATED to the scene backend: hamui_step()
+# #3584e4. The toolkit has since MIGRATED to the scene backend: hamui_step()
 # publishes the widget tree as a scene DISPLAY LIST to /dev/wsys/<wid>/scene
 # via hamscene_commit() (lib/hamui.ad ~L2151), and `hamUId render <wid>`
 # composites the legacy draw LAYERS, NOT the scene file — so these draw-layer
@@ -279,7 +279,7 @@ note_probe '^HAMUI_DEMO ready'        "demo bound a window (HAMUI_DEMO ready)" \
     "demo 'ready' marker absent (headless -kernel wsys / scene-migrated path)"
 note_probe '^HAMUI_DEMO rendered'     "demo completed a render pass" \
     "demo 'rendered' marker absent (scene-migrated path)"
-note_probe '^PIX (80|120) 80 #4a6da7' "button fill #4a6da7 rasterised in the draw-layer render" \
+note_probe '^PIX (80|120) 80 #3584e4' "button fill #3584e4 rasterised in the draw-layer render" \
     "button fill not in the draw-layer render (toolkit paints the scene file now; see test_de_scene_menu_input.sh)"
 
 if [ "$fail" -ne 0 ]; then

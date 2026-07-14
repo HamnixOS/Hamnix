@@ -117,7 +117,7 @@ assert_grep '^glyphs 12 14 \"2048\" #776e65 b'  "bold title '2048' at header"
 assert_grep '^glyphs 68 16 \"Score 0\"'         "live score readout starts at 0"
 assert_grep '^fill 23 81 71 71 #cdc1b4'         "top-left empty tile colour+geometry"
 assert_grep '^glyphs 135 191 \"2\" #776e65 b'   "a spawned '2' tile number is drawn"
-assert_grep '^fill 12 435 59 30 #c8c4bc'        "New control button face"
+assert_grep '^fill 12 435 59 30 #e6e8ec'        "New control button face"
 assert_grep '^glyphs 232 444 \"Down\"'          "Down control button label"
 assert_grep '^glyphs 297 444 \"Right\"'         "Right control button label"
 

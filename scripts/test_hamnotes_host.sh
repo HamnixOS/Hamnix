@@ -55,7 +55,7 @@ assert_grep() {
 
 # --- scene / toolbar renders ------------------------------------------------
 assert_grep '^# scene v1 hamui'                 "scene header emitted"
-assert_grep '^fill 0 0 360 280 #d4d0c8'         "notes window background"
+assert_grep '^fill 0 0 360 280 #eceef2'         "notes window background"
 assert_grep '^glyphs 10 6 \"Notes\"'            "title label"
 assert_grep 'glyphs .*\"New\"'                  "New toolbar button rendered"
 assert_grep 'glyphs .*\"Save\"'                 "Save toolbar button rendered"

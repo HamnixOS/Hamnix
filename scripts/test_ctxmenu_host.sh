@@ -79,7 +79,7 @@ assert_grep '^HIT panel 50 70 0'                      "hit-test: row 0 under the
 assert_grep '^HIT panel 50 130 3'                     "hit-test: Delete-This-Panel row 3"
 assert_grep '^HIT panel 50 10 -1'                     "hit-test: point above the box misses"
 assert_grep '^HIT applet 50 130 3'                    "hit-test: applet Lock row 3"
-assert_grep '^PIX 44 70 #4a6fa5'                      "raster: hovered row painted MATE selection blue"
+assert_grep '^PIX 44 70 #3584e4'                      "raster: hovered row painted modern accent blue"
 
 # --- SEARCHABLE Add-to-Panel CHOOSER (v2 DIALOG) -------------------------
 # The MATE add-applet dialog the panel's "Add to Panel..." opens: a title, a

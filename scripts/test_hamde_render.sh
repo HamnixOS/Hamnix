@@ -62,7 +62,7 @@ check_tok() {  # $1=token  $2=label
 
 echo "[test_hamde_render] (2/4) Panel chrome paints through the toolkit (hamML emitters)"
 # Core protocol + primitive emitters + the menubar/menu fills the panel
-# uses (#333333 menubar bg, #252525 popdown, #4a6da7 open/selection).
+# uses (#333333 menubar bg, #252525 popdown, #3584e4 open/selection).
 check_tok '<rect x='          'toolkit rect emitter linked'
 check_tok '<text x='          'toolkit text emitter linked'
 check_tok 'fill='             'hamML fill attribute emitted'
@@ -70,7 +70,7 @@ check_tok 'mklayer ui markup' 'panel creates its ui markup layer'
 check_tok 'setz ui'           'panel z-orders its ui layer'
 check_tok '#333333'           'menubar background fill'
 check_tok '#252525'           'menu popdown fill'
-check_tok '#4a6da7'           'menu open / selection highlight'
+check_tok '#3584e4'           'menu open / selection highlight'
 
 echo "[test_hamde_render] (3/4) Applications menu launches the shipped GUI apps"
 check_tok 'Applications'   'Applications menu title'

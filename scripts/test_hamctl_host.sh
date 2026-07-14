@@ -117,10 +117,10 @@ assert_grep '^glyphs .*\"About This System\"'       "About heading"
 assert_grep 'glyphs .*\"hamnix\"'                   "hostname value rendered"
 assert_grep 'glyphs .*\"2048 MB\"'                  "memory value rendered"
 # --- rasterizer sanity ---
-assert_grep '^PIX 4 4 #3a6ea5'                      "raster title-bar pixel = blue"
-# Selected sidebar category = MATE selection-blue row (#4a6fa5), matching the
+assert_grep '^PIX 4 4 #3584e4'                      "raster title-bar pixel = blue"
+# Selected sidebar category = MATE selection-blue row (#3584e4), matching the
 # context-menu / applet-chooser highlight instead of a barely-darker sunk button.
-assert_grep '^PIX 120 55 #4a6fa5'                   "selected sidebar row = MATE blue"
+assert_grep '^PIX 120 55 #3584e4'                   "selected sidebar row = MATE blue"
 
 if [ "$fail" -ne 0 ]; then echo "[ctl-host] OVERALL FAIL"; exit 1; fi
 echo "[ctl-host] OVERALL PASS"
