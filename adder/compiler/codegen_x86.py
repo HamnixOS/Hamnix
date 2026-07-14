@@ -40,6 +40,7 @@ from .ast_nodes import (
     ClassDef, ClassField,
     VarDecl, Assignment, ExprStmt, ReturnStmt, IfStmt, WhileStmt,
     DoWhileStmt, ForStmt, ForUnpackStmt, BreakStmt, ContinueStmt, PassStmt,
+    UnsafeStmt,
     Expr, Stmt,
     CallExpr, Identifier, StringLiteral, IntLiteral, CharLiteral, BoolLiteral,
     NoneLiteral, FloatLiteral,
@@ -267,7 +268,8 @@ class FunctionContext:
 class X86CodeGen:
     """x86_64 (System V AMD64) code generator for the kernel-module target."""
 
-    def __init__(self, bare_metal: bool = False) -> None:
+    def __init__(self, bare_metal: bool = False,
+                 check_bounds: bool = False) -> None:
         self.output: list[str] = []
         self.string_literals: dict[str, str] = {}
         self.string_counter: int = 0
@@ -314,6 +316,14 @@ class X86CodeGen:
         # kbuild-specific bits like the .modinfo license stamp that modpost
         # consumes when building a .ko inside the Linux source tree.
         self.bare_metal = bare_metal
+        # Memory-safety instrumentation (docs/adder_memory_safety.md).
+        # `check_bounds` is opt-in (default OFF) and set true by the driver
+        # ONLY for userspace targets — NEVER for bare-metal/kernel. When it is
+        # False the codegen is byte-for-byte identical to the pre-feature
+        # compiler (every emission site is guarded by `if self.check_bounds`).
+        # `unsafe_depth` > 0 inside an `unsafe:` block suppresses the checks.
+        self.check_bounds = check_bounds
+        self.unsafe_depth = 0
 
     # -- emission helpers ---------------------------------------------------
 
@@ -1292,9 +1302,12 @@ class X86CodeGen:
             DoWhileStmt as _DoWhileStmt,
             ForStmt as _ForStmt,
             ForUnpackStmt as _ForUnpackStmt,
+            UnsafeStmt as _UnsafeStmt,
         )
         for s in stmts:
-            if isinstance(s, _VarDecl):
+            if isinstance(s, _UnsafeStmt):
+                self._validate_stmts_supported(s.body, where)
+            elif isinstance(s, _VarDecl):
                 _reject_unsupported_type(
                     s.var_type, f"{where} local '{s.name}'"
                 )
@@ -2028,6 +2041,18 @@ class X86CodeGen:
 
             case MatchStmt(expr=scrut, arms=arms):
                 self._gen_match(scrut, arms, stmt.span)
+
+            case UnsafeStmt(body=body):
+                # Memory-safety opt-out: generate the body with bounds-check
+                # instrumentation suppressed (docs/adder_memory_safety.md).
+                # Semantically transparent — no new frame/scope, only a
+                # codegen toggle. Nesting is handled by the depth counter.
+                self.unsafe_depth += 1
+                try:
+                    for s in body:
+                        self.gen_stmt(s)
+                finally:
+                    self.unsafe_depth -= 1
 
             case _:
                 raise CodeGenError(
@@ -4050,6 +4075,35 @@ class X86CodeGen:
                 f"x86: cannot take address of {type(operand).__name__}"
             )
 
+    def _maybe_emit_bounds_check(self, expr: IndexExpr) -> None:
+        """Emit a runtime array-bounds check for `expr` (an IndexExpr).
+
+        Precondition: the index VALUE is live in %rax. On the in-range path
+        this method must not clobber %rax (cmp/jb/ud2 do not), so the caller's
+        subsequent `pushq %rax` still spills the correct index.
+
+        No-op — emits ZERO instructions — unless bounds checking is active
+        (`self.check_bounds`) and we are outside any `unsafe:` block. This is
+        what makes the feature byte-inert when off. Scope of this increment:
+        fixed-size `Array[N, T]` bases with a compile-time-constant length N.
+        Pointer bases (`Ptr[T]`) carry no length and are left unchecked.
+        See docs/adder_memory_safety.md.
+        """
+        if not self.check_bounds or self.unsafe_depth > 0:
+            return
+        obj_type = self.get_expr_type(expr.obj)
+        if not isinstance(obj_type, ArrayType):
+            return
+        n = obj_type.size
+        if not isinstance(n, int) or n < 0:
+            return
+        ok = self.ctx.new_label("bcheck_ok")
+        # Single UNSIGNED compare catches idx < 0 (wraps huge) AND idx >= N.
+        self.emit(f"    cmpq ${n}, %rax")
+        self.emit(f"    jb {ok}")
+        self.emit("    ud2")            # out-of-range -> SIGILL (clean trap)
+        self.emit(f"{ok}:")
+
     def gen_index_address(self, expr: IndexExpr) -> None:
         """Compute the address of `expr` (an IndexExpr) into %rax."""
         # Evaluate index, push, compute base address (NOT value), pop index.
@@ -4063,6 +4117,18 @@ class X86CodeGen:
         # the nested-arrays case works. Pointer-typed bases (`Ptr[T]`)
         # carry the address as their value, so `gen_expr` is correct there.
         self.gen_expr(expr.index)
+        # --- Runtime array-bounds check (opt-in; userspace; non-unsafe) ------
+        # Emitted only when `--check-bounds` is active AND we are not inside an
+        # `unsafe:` block. Scope of THIS increment: fixed-size `Array[N, T]`
+        # bases, whose length N is a compile-time constant. The index is live
+        # in %rax (evaluated exactly once — the check reuses this value, it does
+        # NOT re-evaluate expr.index, so side-effecting indices stay correct).
+        # An UNSIGNED compare catches both negative indices (which wrap to a
+        # huge unsigned value) and idx >= N in a single test; out-of-range
+        # traps via `ud2` (SIGILL) — a clean, deterministic userspace fault.
+        # When self.check_bounds is False NOTHING is emitted here, so the
+        # instruction stream is byte-identical to the historical compiler.
+        self._maybe_emit_bounds_check(expr)
         self.emit("    pushq %rax")
         obj_type = self.get_expr_type(expr.obj)
         if isinstance(obj_type, ArrayType):
@@ -4826,6 +4892,13 @@ class X86CodeGen:
         self.emit("    syscall")
 
 
-def generate(program: Program, bare_metal: bool = False) -> str:
-    """Generate x86_64 assembly from a Adder AST."""
-    return X86CodeGen(bare_metal=bare_metal).gen_program(program)
+def generate(program: Program, bare_metal: bool = False,
+             check_bounds: bool = False) -> str:
+    """Generate x86_64 assembly from a Adder AST.
+
+    `check_bounds` enables opt-in runtime array-bounds checking (userspace
+    only; see docs/adder_memory_safety.md). Default False keeps the output
+    byte-identical to the historical compiler."""
+    return X86CodeGen(
+        bare_metal=bare_metal, check_bounds=check_bounds
+    ).gen_program(program)

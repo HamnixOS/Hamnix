@@ -765,6 +765,19 @@ class Parser:
         """Parse a single statement."""
         tok = self.current()
 
+        # Unsafe block: `unsafe:` <indented body>. `unsafe` is a SOFT keyword —
+        # recognised only in statement position when immediately followed by
+        # `:` and a NEWLINE (i.e. a block header). This keeps `unsafe` usable
+        # as an ordinary identifier elsewhere and, crucially, disambiguates it
+        # from a `unsafe: Type = ...` VarDecl (whose colon is followed by a
+        # type, not a NEWLINE). See docs/adder_memory_safety.md.
+        if (self.check(TokenType.IDENT) and tok.value == "unsafe"
+                and self.peek(1).type == TokenType.COLON
+                and self.peek(2).type == TokenType.NEWLINE):
+            self.advance()  # consume `unsafe`
+            body = self.parse_block()
+            return UnsafeStmt(body, self.make_span(tok))
+
         # Return statement
         if self.match(TokenType.RETURN):
             value = None

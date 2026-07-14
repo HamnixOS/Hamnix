@@ -94,7 +94,8 @@ TARGETS = {
 DEFAULT_TARGET = "x86_64-bare-metal"
 
 
-def get_generator(target: str, opt_level: int = 0):
+def get_generator(target: str, opt_level: int = 0,
+                  check_bounds: bool = False):
     """Return a callable program -> assembly string for the target.
 
     ``opt_level`` selects the optimization pipeline. ``0`` (default) is the
@@ -120,8 +121,15 @@ def get_generator(target: str, opt_level: int = 0):
         # which elsewhere means "no OS / boot-stub link".
         no_modinfo = spec.get("bare_metal", False) or spec.get("userspace", False)
 
+        # Runtime array-bounds checking is opt-in AND userspace-only: it is
+        # NEVER enabled for a bare-metal/kernel target, so kernel codegen stays
+        # byte-for-byte unchanged (docs/adder_memory_safety.md). Even with the
+        # flag on, a non-userspace target passes check_bounds=False here.
+        do_bounds = check_bounds and spec.get("userspace", False)
+
         def _gen_x86(program):
-            asm = generate_x86(program, bare_metal=no_modinfo)
+            asm = generate_x86(program, bare_metal=no_modinfo,
+                               check_bounds=do_bounds)
             if opt_level >= 1:
                 asm = peephole_x86(asm)
             if opt_level >= 2:
@@ -541,9 +549,10 @@ def merge_programs(files: list[Path]) -> Program:
 
 
 def compile_source(source: str, filename: str = "<stdin>",
-                   target: str = DEFAULT_TARGET, opt_level: int = 0) -> str:
+                   target: str = DEFAULT_TARGET, opt_level: int = 0,
+                   check_bounds: bool = False) -> str:
     """Compile Adder source to assembly (single file, no imports)."""
-    generate = get_generator(target, opt_level)
+    generate = get_generator(target, opt_level, check_bounds)
     try:
         program = parse(source, filename)
         return generate(program)
@@ -553,9 +562,9 @@ def compile_source(source: str, filename: str = "<stdin>",
 
 
 def compile_with_imports(main_file: Path, target: str = DEFAULT_TARGET,
-                         opt_level: int = 0) -> str:
+                         opt_level: int = 0, check_bounds: bool = False) -> str:
     """Compile Adder source with import resolution."""
-    generate = get_generator(target, opt_level)
+    generate = get_generator(target, opt_level, check_bounds)
     project_root = find_hamnix_root()
 
     # Collect all imported files
@@ -1042,7 +1051,8 @@ def cmd_compile(args: argparse.Namespace) -> int:
         return 1
 
     asm = compile_with_imports(source_file, target=args.target,
-                               opt_level=getattr(args, "opt_level", 0))
+                               opt_level=getattr(args, "opt_level", 0),
+                               check_bounds=getattr(args, "check_bounds", False))
 
     # kbuild targets: the Linux kernel build system owns assembly + link, so
     # we stop at emitting a .S file for it to consume.
@@ -1114,7 +1124,8 @@ def cmd_asm(args: argparse.Namespace) -> int:
 
     source = source_file.read_text()
     asm = compile_source(source, str(source_file), target=args.target,
-                         opt_level=getattr(args, "opt_level", 0))
+                         opt_level=getattr(args, "opt_level", 0),
+                         check_bounds=getattr(args, "check_bounds", False))
 
     if args.output:
         Path(args.output).write_text(asm)
@@ -1146,6 +1157,13 @@ def main() -> int:
                                     "single-pass (default), 1 = x86 peephole "
                                     "optimizer, 2 = + stack-slot register "
                                     "promotion (Track 6)")
+    compile_parser.add_argument("--check-bounds", dest="check_bounds",
+                               action="store_true",
+                               help="Emit runtime array-bounds checks for "
+                                    "Array[N, T] indexing (userspace targets "
+                                    "only; suppressed inside `unsafe:` blocks; "
+                                    "no-op for kernel/bare-metal targets). "
+                                    "See docs/adder_memory_safety.md")
     compile_parser.set_defaults(func=cmd_compile)
 
     # Asm command
@@ -1160,6 +1178,12 @@ def main() -> int:
                            help="Optimization level: 0 = trusted single-pass "
                                 "(default), 1 = x86 peephole optimizer, "
                                 "2 = + stack-slot register promotion")
+    asm_parser.add_argument("--check-bounds", dest="check_bounds",
+                           action="store_true",
+                           help="Emit runtime array-bounds checks for "
+                                "Array[N, T] indexing (userspace targets only; "
+                                "suppressed inside `unsafe:` blocks). "
+                                "See docs/adder_memory_safety.md")
     asm_parser.set_defaults(func=cmd_asm)
 
     args = parser.parse_args()

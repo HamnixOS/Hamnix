@@ -548,6 +548,18 @@ class DeferStmt:
 
 
 @dataclass
+class UnsafeStmt:
+    """Unsafe block: `unsafe:` <indented body>.
+
+    Memory-safety opt-out (see docs/adder_memory_safety.md). Statements in
+    `body` are code-generated with runtime memory-safety instrumentation
+    (currently array-bounds checks) SUPPRESSED. Semantically transparent —
+    it does not introduce a scope, only a codegen instrumentation toggle."""
+    body: 'list[Stmt]'
+    span: Optional[Span] = None
+
+
+@dataclass
 class AssertStmt:
     """Assert statement: assert condition, "message" """
     condition: Expr
@@ -624,7 +636,7 @@ Stmt = (VarDecl | Assignment | ExprStmt | ReturnStmt | IfStmt |
         WhileStmt | DoWhileStmt | ForStmt | ForUnpackStmt |
         BreakStmt | ContinueStmt |
         PassStmt | DeferStmt | AssertStmt | GlobalStmt | TupleUnpackAssign |
-        TryStmt | RaiseStmt | YieldStmt | WithStmt)
+        TryStmt | RaiseStmt | YieldStmt | WithStmt | UnsafeStmt)
 
 
 # Declarations
