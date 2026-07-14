@@ -10,10 +10,23 @@
 #                             DE autostart marker fires.
 #
 # Boots build/hamnix-installer.img under OVMF/KVM matching the user's ship
-# command (mirrors scripts/test_installer_de_runlevel5.sh), waits for the
-# rc.5 "hamUI stack started by supervisor" marker (or a fallback timer),
-# sleeps to let the desktop paint, then issues `screendump` to the QEMU
-# monitor and converts the resulting PPM to PNG.
+# command (mirrors scripts/run_installer.sh's DETERMINISTIC boot), waits for
+# the rc.5 handoff marker (or a fallback timer), sleeps to let the desktop
+# paint, then issues `screendump` to the QEMU monitor and converts the
+# resulting PPM to PNG.
+#
+# RELIABILITY (two defects this harness previously had, now fixed):
+#   * REBUILD BY DEFAULT. A plain invocation REBUILDS the installer image
+#     first so the screendump reflects the CURRENT source — never a stale
+#     pre-change desktop (the "stale-installer-img QA trap"). Export
+#     HAMNIX_SKIP_BUILD=1 to deliberately reuse an image you already built.
+#   * DETERMINISTIC BOOT TO THE OS. Boots with SPLIT OVMF_CODE + a FRESH
+#     copy of OVMF_VARS every run (so no stale boot-order — e.g. a prior
+#     interrupted run leaving "EFI Internal Shell" selected — can survive
+#     across runs) AND pins bootindex=0 on the boot drive, so OVMF always
+#     launches \EFI\BOOT\BOOTX64.EFI and reaches the DE, never the Shell>
+#     prompt. Falls back to a fresh copy of the combined OVMF.fd when the
+#     split firmware is unavailable.
 #
 # Skips cleanly (exit 0) when /dev/kvm, OVMF, the installer image, or a
 # PPM->PNG converter is unavailable. The screenshot itself is the
@@ -26,7 +39,9 @@
 #   BOOT_WAIT          seconds to wait for the handoff marker (default: 240)
 #   PAINT_WAIT         extra seconds to let the DE paint (default: 8)
 #   SHOT_OUT           output PNG path   (default: build/de_screenshot.png)
-#   HAMNIX_SKIP_BUILD  1 = require an existing image (no rebuild)
+#   HAMNIX_SKIP_BUILD  1 = do NOT rebuild; reuse the existing image as-is
+#                          (SKIPs cleanly if that image is absent).
+#                          UNSET (default) = rebuild the image before booting.
 
 set -uo pipefail
 
@@ -56,17 +71,34 @@ if [ ! -e /dev/kvm ]; then
     exit 0
 fi
 
-OVMF_FD="${OVMF_FD:-}"
-if [ -z "$OVMF_FD" ]; then
-    if [ -f /usr/share/ovmf/OVMF.fd ]; then
-        OVMF_FD=/usr/share/ovmf/OVMF.fd
-    elif [ -f /usr/share/OVMF/OVMF_CODE.fd ]; then
-        OVMF_FD=/usr/share/OVMF/OVMF_CODE.fd
-    elif [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ]; then
-        OVMF_FD=/usr/share/OVMF/OVMF_CODE_4M.fd
-    fi
+# Resolve OVMF firmware. PREFER the SPLIT build (OVMF_CODE + OVMF_VARS): it
+# lets us boot a FRESH copy of the VARS store every run so no stale boot-order
+# (e.g. "EFI Internal Shell" left selected by a prior interrupted boot) can
+# persist across runs and drop us to the Shell> prompt. Fall back to the
+# combined OVMF.fd when the split firmware is absent (still booted from a
+# fresh copy + bootindex=0 so OVMF auto-launches the media).
+#   OVMF_CODE : firmware code volume (or the combined image)
+#   OVMF_VARS : template var store, or "" when only a combined image exists
+OVMF_CODE="${OVMF_FD:-}"
+OVMF_VARS=""
+if [ -z "$OVMF_CODE" ]; then
+    for pair in \
+        "/usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd" \
+        "/usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd" \
+        "/usr/share/edk2/x64/OVMF_CODE.4m.fd:/usr/share/edk2/x64/OVMF_VARS.4m.fd"; do
+        c="${pair%%:*}"; v="${pair##*:}"
+        if [ -f "$c" ] && [ -f "$v" ]; then
+            OVMF_CODE="$c"; OVMF_VARS="$v"; break
+        fi
+    done
 fi
-if [ -z "$OVMF_FD" ] || [ ! -f "$OVMF_FD" ]; then
+if [ -z "$OVMF_CODE" ]; then
+    # No split firmware — fall back to a combined image (vars live inside it).
+    for c in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd; do
+        [ -f "$c" ] && { OVMF_CODE="$c"; break; }
+    done
+fi
+if [ -z "$OVMF_CODE" ] || [ ! -f "$OVMF_CODE" ]; then
     echo "[test_de_screenshot] SKIP: OVMF firmware not found (apt install ovmf)" >&2
     exit 0
 fi
@@ -96,42 +128,74 @@ else
     exit 0
 fi
 
-# --- ensure the installer image exists --------------------------------
-if [ ! -f "$INSTALLER_IMG" ]; then
-    if [ "${HAMNIX_SKIP_BUILD:-0}" = "1" ]; then
-        echo "[test_de_screenshot] SKIP: $INSTALLER_IMG absent and HAMNIX_SKIP_BUILD=1." >&2
+# --- installer image: REBUILD BY DEFAULT ------------------------------
+# A plain invocation rebuilds so the screendump reflects CURRENT source (the
+# stale-installer-img trap). HAMNIX_SKIP_BUILD=1 reuses the existing image.
+if [ "${HAMNIX_SKIP_BUILD:-0}" = "1" ]; then
+    if [ ! -f "$INSTALLER_IMG" ]; then
+        echo "[test_de_screenshot] SKIP: HAMNIX_SKIP_BUILD=1 but $INSTALLER_IMG absent." >&2
         exit 0
     fi
-    echo "[test_de_screenshot] installer image absent; building via build_installer_img.sh (~6 min)"
-    bash "$PROJ_ROOT/scripts/build_installer_img.sh"
+    echo "[test_de_screenshot] HAMNIX_SKIP_BUILD=1: reusing existing $INSTALLER_IMG (no rebuild)."
+else
+    echo "[test_de_screenshot] rebuilding $INSTALLER_IMG via build_installer_img.sh (~10-15 min)..."
+    # HAMNIX_INSTALLER_IMG_OUT is already exported for the selftest image;
+    # for the default clean image it defaults to build/hamnix-installer.img.
+    if ! bash "$PROJ_ROOT/scripts/build_installer_img.sh"; then
+        echo "[test_de_screenshot] SKIP: installer image build failed/gated." >&2
+        exit 0
+    fi
 fi
 if [ ! -f "$INSTALLER_IMG" ]; then
-    echo "[test_de_screenshot] SKIP: $INSTALLER_IMG unavailable (build gated)." >&2
+    echo "[test_de_screenshot] SKIP: $INSTALLER_IMG unavailable after build." >&2
     exit 0
 fi
 
-OVMF_RW=$(mktemp --tmpdir hamnix-de-shot.ovmf.XXXXXX.fd)
+CODE_RW=$(mktemp --tmpdir hamnix-de-shot.code.XXXXXX.fd)
+VARS_RW=$(mktemp --tmpdir hamnix-de-shot.vars.XXXXXX.fd)
 IMG_RW=$(mktemp --tmpdir hamnix-de-shot.img.XXXXXX.raw)
 LOG=$(mktemp --tmpdir hamnix-de-shot.XXXXXX.log)
 MON=$(mktemp --tmpdir -u hamnix-de-shot-mon.XXXXXX)
 SHOT_PPM=$(mktemp --tmpdir hamnix-de-shot.XXXXXX.ppm)
-cp "$OVMF_FD" "$OVMF_RW"
+# A FRESH copy of the image each run: OVMF's fallback NvVars file (written to
+# the ESP when there is no pflash var store) lands on this throwaway copy, so
+# no boot-order pollution survives to the next run.
 cp "$INSTALLER_IMG" "$IMG_RW"
+
+# Assemble the firmware args. SPLIT firmware => pflash pair with a FRESH VARS
+# copy every run (deterministic boot order, no stale "EFI Internal Shell").
+# Combined firmware => a fresh -bios copy (vars reset each run since we copy).
+if [ -n "$OVMF_VARS" ]; then
+    cp "$OVMF_CODE" "$CODE_RW"
+    cp "$OVMF_VARS" "$VARS_RW"
+    FW_ARGS=(
+        -drive "if=pflash,format=raw,unit=0,readonly=on,file=$CODE_RW"
+        -drive "if=pflash,format=raw,unit=1,file=$VARS_RW"
+    )
+    echo "[test_de_screenshot] firmware: split OVMF (fresh VARS each run) $OVMF_CODE"
+else
+    cp "$OVMF_CODE" "$CODE_RW"
+    FW_ARGS=(-bios "$CODE_RW")
+    echo "[test_de_screenshot] firmware: combined OVMF (fresh copy) $OVMF_CODE"
+fi
 
 QEMU_PID=""
 cleanup() {
     [ -n "$QEMU_PID" ] && kill "$QEMU_PID" 2>/dev/null
-    rm -f "$OVMF_RW" "$IMG_RW" "$MON" "$SHOT_PPM"
+    rm -f "$CODE_RW" "$VARS_RW" "$IMG_RW" "$MON" "$SHOT_PPM"
 }
 trap cleanup EXIT
 
 mkdir -p "$(dirname "$SHOT_OUT")"
 
-# Mirror the user's exact ship command, headlessly with a monitor socket.
+# Mirror scripts/run_installer.sh's DETERMINISTIC boot: bootindex=0 on the
+# installer media forces OVMF to launch \EFI\BOOT\BOOTX64.EFI first (otherwise
+# it falls through to the EFI Internal Shell) so we reach the DE, not Shell>.
 qemu-system-x86_64 \
     -enable-kvm -cpu host \
-    -bios "$OVMF_RW" \
-    -drive file="$IMG_RW",format=raw,if=virtio \
+    "${FW_ARGS[@]}" \
+    -drive "file=$IMG_RW,format=raw,if=none,id=instmedia" \
+    -device virtio-blk-pci,drive=instmedia,bootindex=0 \
     -m "${HAMNIX_VM_MEM:-2G}" \
     -vga std -display none -no-reboot \
     -monitor "unix:$MON,server,nowait" \
