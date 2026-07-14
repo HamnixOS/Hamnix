@@ -78,7 +78,7 @@ extern def sys_get_jiffies() -> uint64
 extern def sys_yield() -> int32
 extern def sys_waitfds(fds: Ptr[int32], nfds: uint64, timeout_ms: int64) -> int64
 extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
-from lib.p9 import spawn, spawn_detached, p9_listdir
+from lib.p9 import spawn, spawn_detached, p9_listdir, p9_note
 from lib.desktopentry import (
     desktop_parse, desktop_name_ptr, desktop_name_len,
     desktop_prog_ptr, desktop_prog_len, desktop_catcode,
@@ -266,6 +266,13 @@ def _switch_workspace(n0: int64):
 # unread count.
 notif_unread: int64 = 0                 # unread notifications since last inbox
 notif_last_ack: uint64 = 0             # highest slot serial we've acked
+# pid of the notification INBOX popup (/bin/haminbox) we last spawned, or 0.
+# The bell click TOGGLES the popup off this: a click while the tracked pid is
+# still alive terminates it (and never spawns a second one), so repeated bell
+# clicks can never STACK duplicate inbox windows at the same geometry — the
+# stack was the "the Close button does nothing, the popup stays stuck" bug
+# (closing the top one just revealed an identical popup behind it).
+notif_inbox_pid: int32 = 0
 
 # Parsed head record from the last _drain_notifications poll.
 _nb_count: int64 = 0
@@ -2425,6 +2432,9 @@ def _set_geometry_xy(ctlpath: Ptr[char], x: int64, y: int64, w: int64, h: int64)
 
 # Spawn a scene app by absolute path. Detached stdio (-2/-2).
 launch_argv: Array[2, uint64]
+# pid of the most recent _launch() spawn (or <0 on failure). Read straight
+# after a _launch call to associate the spawned app with a tracked slot.
+last_launched_pid: int32 = 0
 def _launch(prog: Ptr[char]):
     launch_argv[0] = cast[uint64](prog)
     launch_argv[1] = 0
@@ -2434,10 +2444,82 @@ def _launch(prog: Ptr[char]):
     # and stopped launching. RFNOWAIT lets the kernel reclaim them at exit.
     pid: int32 = spawn_detached(prog, &launch_argv[0], -2, -2,
                                 cast[Ptr[uint64]](0))
+    last_launched_pid = pid
     if pid >= 0:
         _writeall(1, cast[Ptr[uint8]]("[panel] launched "))
         _writeall(1, cast[Ptr[uint8]](prog))
         _writeall(1, cast[Ptr[uint8]]("\n"))
+
+
+# Is `pid` still the LIVE inbox popup we spawned? Reads /proc/<pid>/comm (the
+# task's command name) and returns 1 iff it is "haminbox". Checking the comm
+# name — not merely that /proc/<pid> exists — closes the pid-REUSE hole: once
+# our inbox exits, its pid may be recycled by an unrelated task, and we must
+# NOT send that task a terminate note (nor treat it as "popup still open").
+_pidpath: Array[40, uint8]
+_commbuf: Array[32, uint8]
+def _inbox_alive(pid: int32) -> int32:
+    if pid <= 0:
+        return 0
+    p: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("/proc/")
+    j: uint64 = 0
+    while pre[j] != 0:
+        _pidpath[p] = pre[j]
+        p = p + 1
+        j = j + 1
+    p = p + _u64_to_dec(cast[uint64](pid), &_pidpath[p])
+    leaf: Ptr[uint8] = cast[Ptr[uint8]]("/comm")
+    k: uint64 = 0
+    while leaf[k] != 0:
+        _pidpath[p] = leaf[k]
+        p = p + 1
+        k = k + 1
+    _pidpath[p] = 0
+    fd: int32 = sys_open(cast[Ptr[char]](&_pidpath[0]))
+    if fd < 0:
+        return 0
+    n: int64 = sys_read(fd, &_commbuf[0], 31)
+    sys_close(fd)
+    if n <= 0:
+        return 0
+    # Compare against "haminbox" (comm is the basename + '\n').
+    want: Ptr[uint8] = cast[Ptr[uint8]]("haminbox")
+    m: uint64 = 0
+    while want[m] != 0:
+        if m >= cast[uint64](n):
+            return 0
+        if _commbuf[m] != want[m]:
+            return 0
+        m = m + 1
+    return 1
+
+
+# The bell/tray click TOGGLES the notification inbox popup:
+#   * if our last-spawned /bin/haminbox is still alive, terminate it (the
+#     kernel's wsys reaper frees its window on the next panel tick) and do
+#     NOT spawn another — a second click closes the popup instead of
+#     stacking a duplicate on top of it;
+#   * otherwise spawn a fresh inbox and clear the unread badge.
+# Tracking the pid + liveness guarantees at most ONE inbox window exists, so
+# the popup's own Close button (and Escape / click-away) always fully
+# dismisses it. This is the fix for the "close button does nothing, the
+# popup stays stuck" report (repeated bell clicks used to stack identical
+# popups, so closing the top one merely revealed the one behind it).
+def _toggle_notif_inbox():
+    if _inbox_alive(notif_inbox_pid) != 0:
+        # Popup already open: ask it to close (best-effort terminate note)
+        # and, crucially, do NOT spawn a duplicate. We KEEP tracking the pid
+        # so that even if the note is a no-op on this kernel, a further bell
+        # click still refuses to stack a second popup — the popup's own Close
+        # button (proven working) then dismisses the single window. Once it
+        # does exit, _inbox_alive() reads a dead/recycled pid and the next
+        # click opens a fresh inbox.
+        p9_note(notif_inbox_pid, cast[Ptr[uint8]]("terminate"))
+        return
+    _launch(cast[Ptr[char]]("/bin/haminbox"))
+    notif_inbox_pid = last_launched_pid
+    notif_unread = 0
 
 
 def _raise_focus(idx: uint64):
@@ -2813,9 +2895,13 @@ def _handle_click(x: int64, y: int64, bar: int64) -> int32:
                             menu_open = 0
                         return 1
                     elif ak == WK_TRAY:
-                        # Open the scene notification inbox and mark all read.
-                        _launch(cast[Ptr[char]]("/bin/haminbox"))
-                        notif_unread = 0
+                        # TOGGLE the scene notification inbox popup (open it +
+                        # mark all read, or close the one already showing). The
+                        # toggle NEVER stacks a second /bin/haminbox at the same
+                        # geometry, so its Close button always fully dismisses
+                        # the popup (the "close does nothing / stays stuck" bug
+                        # was a click on the bell spawning a duplicate popup).
+                        _toggle_notif_inbox()
                         if menu_open != 0:
                             menu_open = 0
                         return 1

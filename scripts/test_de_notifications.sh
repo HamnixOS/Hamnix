@@ -81,6 +81,30 @@ if ! grep -q "notif_unread" "$PANEL_SRC"; then
     fail_link "link 4 ($PANEL_SRC): no unread-count state — tray badge can't render"
 fi
 
+# --- Link 4b: the bell TOGGLES / dedups the inbox popup --------------
+# A tray click must go through _toggle_notif_inbox (which tracks the spawned
+# pid in notif_inbox_pid and refuses to spawn a SECOND haminbox while one is
+# alive). The old code called _launch("/bin/haminbox") UNCONDITIONALLY on
+# every click, so repeated bell clicks stacked identical popups at the same
+# geometry — closing the top one just revealed the one behind it, and the
+# user reported "the close button does nothing, the popup stays stuck". If
+# any of these links break, the stacking regression is back.
+if ! grep -q "_toggle_notif_inbox" "$PANEL_SRC"; then
+    fail_link "link 4b ($PANEL_SRC): the tray click no longer routes through _toggle_notif_inbox — repeated bell clicks can stack duplicate popups again"
+fi
+if ! grep -q "notif_inbox_pid" "$PANEL_SRC"; then
+    fail_link "link 4b ($PANEL_SRC): no notif_inbox_pid tracking — the bell can't dedup/toggle the single inbox popup"
+fi
+# The tray (WK_TRAY) branch must call the toggle, NOT an unconditional
+# _launch of the inbox (which is what stacked duplicates).
+tray_branch=$(awk '
+    /ak == WK_TRAY:/ { inside=1; n=0 }
+    inside { print; n=n+1; if (n>8) inside=0 }
+' "$PANEL_SRC")
+if ! grep -q "_toggle_notif_inbox()" <<< "$tray_branch"; then
+    fail_link "link 4b ($PANEL_SRC): the WK_TRAY click branch does not call _toggle_notif_inbox() — the dedup/toggle guard is bypassed"
+fi
+
 # --- Link 5: the welcome publisher still posts via /dev/wsys/post ----
 if ! grep -q "/bin/hamnotify" "$WELCOME_SVC"; then
     fail_link "link 5 ($WELCOME_SVC): welcome notification publisher is gone"
