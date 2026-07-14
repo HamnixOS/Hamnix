@@ -63,14 +63,35 @@ FILES = [
 # (/etc/passwd: live:x:1:1::/home/live:/bin/hamsh). The cpio is a FLAT name
 # table — directories are implicit, materialised by the files inside
 # them — so we plant a `.keep` placeholder in each standard home subdir
-# (Desktop/Documents/Downloads/Pictures). This gives the live user a
+# (Documents/Downloads/Pictures/Notes). This gives the live user a
 # familiar home layout AND sensible default locations for the DE file
 # manager / hameditscene file-picker (which defaults to
 # /home/live/Documents). New ext4-backed users get the same subdirs from
 # useradd's make_home_skel() (`#<name>/Desktop` ...). KISS: an empty
 # `.keep` byte stream is enough to make the directory enumerable.
-for _home_sub in ("Desktop", "Documents", "Downloads", "Pictures", "Notes"):
+for _home_sub in ("Documents", "Downloads", "Pictures", "Notes"):
     FILES.append((f"/home/live/{_home_sub}/.keep", b""))
+# The DESKTOP is now REAL, filesystem-backed: /bin/hamdesktop renders its
+# icon grid from the CONTENTS of /home/live/Desktop (parsing `.desktop`
+# launcher files for name/exec, and showing plain files/folders as
+# file/folder icons), so `ls ~/Desktop` shows the launchers AND a folder
+# created from the CLI appears on the desktop via hamdesktop's periodic
+# re-scan. Plant the default launcher set from the /etc/skel/Desktop
+# template (the single source of truth, also installed for future
+# useradd) at /home/live/Desktop/*.desktop. If the template is absent the
+# desktop dir is left implicit-empty and hamdesktop falls back to its
+# built-in default icon set.
+_skel_desktop = Path(__file__).resolve().parent.parent / "etc" / "skel" / "Desktop"
+_planted_desktop = 0
+if _skel_desktop.is_dir():
+    for _de in sorted(_skel_desktop.iterdir()):
+        if _de.is_file() and _de.name.endswith(".desktop"):
+            FILES.append((f"/home/live/Desktop/{_de.name}", _de.read_bytes()))
+            _planted_desktop += 1
+if _planted_desktop == 0:
+    # No template shipped — keep the directory enumerable so hamdesktop can
+    # still create folders in it.
+    FILES.append(("/home/live/Desktop/.keep", b""))
 # A friendly starter note so /home/live/Documents isn't bare on the live
 # image (also gives the editor's Open picker something to load).
 FILES.append((

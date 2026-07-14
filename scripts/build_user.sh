@@ -213,7 +213,7 @@ build_adder_user hamnotify            # libnotify-shape CLI sender: writes "<tit
 build_adder_user hamtoast             # scene-native transient notification toast (top-right, auto-dismiss); title/body via argv, spawned by the panel notification broker
 build_adder_user haminbox             # scene-native notification inbox/history (reads /tmp/hamnix-notif.log written by the panel broker); spawned from the tray bell
 build_adder_user hamsessui            # DE pivot wave 8: modal End Session dialog (Lock/Log Out/Shut Down/Cancel) (v2 client; reads /dev/wsys/sessui, poked via /dev/wsys/sessui/show)
-build_adder_user hamdesktop           # scene-file DE desktop backdrop + clickable launcher icons (scene client; reads /etc/desktop.icons, double-click spawns via lib/p9 spawn)
+build_adder_user hamdesktop           # scene-file DE desktop backdrop + clickable launcher icons (scene client; renders icons from the REAL ~/Desktop dir — .desktop launchers + files/folders — with a periodic re-scan; double-click spawns via lib/p9 spawn)
 build_adder_user hamsysmon            # DE pivot wave 2 (round 2): desktop system-monitor applet (CPU/MEM bars) (v2 client; reads /dev/wsys/sysmon, poked via /dev/wsys/sysmon/show)
 build_adder_user hamctxmenu           # DE pivot wave 3 (round 2): right-click context menu (v2 client; reads /dev/wsys/ctxmenu, poked via /dev/wsys/ctxmenu/show)
 build_adder_user hamsnap              # DE pivot wave 4 (round 2): snap-zone preview during window move-drag (v2 client; reads /dev/wsys/snap, poked via /dev/wsys/snap/show)

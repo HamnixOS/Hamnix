@@ -53,7 +53,10 @@ fi
 # scene client (display list via lib/hamui hamscene_*), NOT the retired
 # hamui_v2 bitmap-blit client. The structural contract is: it is built, it
 # emits a scene via hamscene_commit, it draws icons with the scene icon
-# helpers, and it reads its launcher set from /etc/desktop.icons.
+# helpers, and it renders its icon set from the REAL desktop DIRECTORY
+# (~/Desktop) — parsing `.desktop` launchers + showing files/folders — so
+# `ls ~/Desktop` shows the icons and a CLI-created folder appears on a
+# periodic re-scan.
 RC5_SRC="etc/rc.d/rc.5"
 if ! grep -q "build_adder_user hamdesktop" "$BUILD_SRC"; then
     fail_link "link 2 (build_user.sh): hamdesktop is not built"
@@ -64,8 +67,28 @@ fi
 if ! grep -qE "hamscene_icon_folder|hamscene_icon_file" "$DESKTOP_SRC"; then
     fail_link "link 2 (hamdesktop.ad): does NOT draw scene icon glyphs"
 fi
-if ! grep -q '"/etc/desktop.icons"' "$DESKTOP_SRC"; then
-    fail_link "link 2 (hamdesktop.ad): does NOT read /etc/desktop.icons config"
+# Directory-backed icon source: it points at ~/Desktop, lists it through the
+# shared FM directory scanner, and parses `.desktop` launcher files.
+if ! grep -q '"/home/live/Desktop"' "$DESKTOP_SRC"; then
+    fail_link "link 2 (hamdesktop.ad): does NOT target the ~/Desktop directory"
+fi
+if ! grep -q 'fmc_load_dir' "$DESKTOP_SRC"; then
+    fail_link "link 2 (hamdesktop.ad): does NOT scan the desktop dir (fmc_load_dir)"
+fi
+if ! grep -q 'desktop_parse' "$DESKTOP_SRC"; then
+    fail_link "link 2 (hamdesktop.ad): does NOT parse .desktop launcher files"
+fi
+# Periodic external-change re-scan so a CLI-created folder/file appears.
+if ! grep -q 'fmc_refresh_if_changed' "$DESKTOP_SRC"; then
+    fail_link "link 2 (hamdesktop.ad): missing the periodic dir re-scan (fmc_refresh_if_changed)"
+fi
+# The default launcher template ships as REAL .desktop files under
+# /etc/skel/Desktop (build_initramfs plants them at /home/live/Desktop).
+if ! ls etc/skel/Desktop/*.desktop >/dev/null 2>&1; then
+    fail_link "link 2 (etc/skel/Desktop): no default .desktop launcher template shipped"
+fi
+if ! grep -q 'skel.*Desktop\|Desktop.*desktop' scripts/build_initramfs.py; then
+    fail_link "link 2 (build_initramfs.py): does NOT plant the ~/Desktop launcher template"
 fi
 if [ -f "$RC5_SRC" ] && ! grep -q "/bin/hamdesktop" "$RC5_SRC"; then
     fail_link "link 2 (rc.5): hamdesktop is not launched at runlevel 5"

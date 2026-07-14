@@ -73,12 +73,17 @@ for prog in haminstallui hammonscene; do
     fi
 done
 
-# Desktop icons reference each new app.
+# Desktop icons reference each new app. The desktop is now REAL, filesystem-
+# backed: /bin/hamdesktop renders its icon grid from the CONTENTS of
+# ~/Desktop, whose default launcher template ships as real `.desktop` files
+# under /etc/skel/Desktop (build_initramfs plants them at /home/live/Desktop).
+# So the registration invariant is "the app has a .desktop launcher in the
+# skel Desktop template", grep'd across those files' Exec= lines.
 for prog in haminstallui hammonscene; do
-    if grep -q "/bin/${prog}" etc/desktop.icons; then
-        passed "$prog has a desktop icon"
+    if grep -rq "Exec=/bin/${prog}\b" etc/skel/Desktop/; then
+        passed "$prog has a desktop launcher (.desktop in etc/skel/Desktop)"
     else
-        failed "$prog NOT in /etc/desktop.icons"
+        failed "$prog NOT launchable from ~/Desktop (no .desktop in etc/skel/Desktop)"
     fi
 done
 
@@ -206,14 +211,30 @@ else
     failed "install.ad lost the live-medium REFUSING backstop"
 fi
 
-# --- 4. Desktop-icon drag-persist wiring -----------------------------
-# hamdesktop must parse the optional position fields and write them back.
-if grep -q '_save_config' user/hamdesktop.ad \
-        && grep -q 'sys_open_write(cast\[Ptr\[char\]\]("/etc/desktop.icons"))' \
-            user/hamdesktop.ad; then
-    passed "hamdesktop persists the icon layout to /etc/desktop.icons"
+# --- 4. Desktop-icon rendering + drag-persist wiring -----------------
+# The desktop renders its icons from the REAL ~/Desktop directory (scanned
+# via the shared FM directory scanner) and parses `.desktop` launchers.
+if grep -q '_load_icons_from_dir' user/hamdesktop.ad \
+        && grep -q 'fmc_load_dir' user/hamdesktop.ad \
+        && grep -q 'desktop_parse' user/hamdesktop.ad; then
+    passed "hamdesktop renders icons from the ~/Desktop directory contents"
 else
-    failed "hamdesktop missing the persist-on-drop path"
+    failed "hamdesktop does not render from a real directory (dir scan missing)"
+fi
+# A CLI-created folder/file must appear via the periodic re-scan.
+if grep -q 'fmc_refresh_if_changed' user/hamdesktop.ad \
+        && grep -q 'sys_waitfds' user/hamdesktop.ad; then
+    passed "hamdesktop periodically re-scans ~/Desktop (CLI changes appear)"
+else
+    failed "hamdesktop missing the periodic re-scan / waitfds park"
+fi
+# Drag positions persist to the writable ~/Desktop sidecar (NOT the read-only
+# /etc), keyed by label so a rearrange survives a re-scan + relaunch.
+if grep -q '_save_positions' user/hamdesktop.ad \
+        && grep -q '.hamdesktop.pos' user/hamdesktop.ad; then
+    passed "hamdesktop persists drag positions to the ~/Desktop sidecar"
+else
+    failed "hamdesktop missing the position-persist path"
 fi
 if grep -q 'DRAG_THRESH' user/hamdesktop.ad \
         && grep -q 'dragging' user/hamdesktop.ad; then
@@ -221,14 +242,19 @@ if grep -q 'DRAG_THRESH' user/hamdesktop.ad \
 else
     failed "hamdesktop missing the drag-threshold logic"
 fi
-# The config parser must still accept BOTH the 3-field legacy lines and the
-# 5-field (with |x|y) persisted lines: confirm the shipped config + the
-# optional-field parse branch are both present.
-if grep -q 'ic_x\[n_icons\]' user/hamdesktop.ad \
-        && grep -Eq '^[A-Za-z].*\|(folder|file)\|/bin/' etc/desktop.icons; then
-    passed "hamdesktop config carries per-icon positions + legacy lines parse"
+# The shipped default launcher template must be real, valid `.desktop` files
+# under etc/skel/Desktop (each with a Name + an Exec=/bin program) so a fresh
+# boot shows the same icon set, now as CLI-manipulable files.
+skel_ok=1
+for f in etc/skel/Desktop/*.desktop; do
+    [ -e "$f" ] || { skel_ok=0; break; }
+    grep -q '^Name=' "$f" && grep -q '^Exec=/bin/' "$f" || skel_ok=0
+done
+if [ "$skel_ok" = "1" ] && ls etc/skel/Desktop/*.desktop >/dev/null 2>&1 \
+        && grep -q 'ic_x\[n_icons\]' user/hamdesktop.ad; then
+    passed "etc/skel/Desktop ships valid .desktop launchers + icons carry positions"
 else
-    failed "hamdesktop position fields / legacy config not round-trippable"
+    failed "etc/skel/Desktop launcher template missing/invalid or position fields gone"
 fi
 
 if [ "$fail" = "0" ]; then
