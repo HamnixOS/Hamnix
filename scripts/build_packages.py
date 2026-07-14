@@ -647,7 +647,7 @@ def _files_installer_tools() -> list[tuple[Path, str]]:
 #   * one hamnix-<app> package PER application (hamnix-ham2048,
 #     hamnix-hamterm, hamnix-hamfiles, hamnix-hamcalc, hamnix-hamedit,
 #     hamnix-hammon, hamnix-hamview, hamnix-hambrowse, hamnix-haminbox,
-#     hamnix-hamclock, hamnix-hamsettings, hamnix-haminstallui). Each is
+#     hamnix-hamsettings, hamnix-haminstallui). Each is
 #     independently installable/removable and carries its own version +
 #     depends (>= hamnix-desktop-core). An app that comes as a
 #     logic-binary + a scene front-end (hamterm + hamtermscene, hamfm +
@@ -693,8 +693,6 @@ DESKTOP_APP_PACKAGES: list[dict] = [
      "summary": "native web browser"},
     {"name": "hamnix-haminbox", "bins": ("haminbox",),
      "summary": "mail inbox"},
-    {"name": "hamnix-hamclock", "bins": ("hamclock",),
-     "summary": "clock"},
     {"name": "hamnix-hamcalendar", "bins": ("hamcalscene",),
      "summary": "monthly calendar"},
     {"name": "hamnix-hamnotes", "bins": ("hamnotesscene",),
@@ -951,7 +949,7 @@ PACKAGE_SPECS: list[dict] = [
         "description": ("Hamnix desktop applications metapackage — pulls "
                         "in every per-app package (ham2048/hamterm/"
                         "hamfiles/hamcalc/hamedit/hammon/hamview/"
-                        "hambrowse/haminbox/hamclock/hamsettings/...)"),
+                        "hambrowse/haminbox/hamsettings/...)"),
         "target": "#hamnix-system",
     },
     {

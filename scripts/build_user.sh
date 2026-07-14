@@ -201,7 +201,6 @@ build_adder_user hamcalpop            # DE pivot wave 4: clock-panel calendar dr
 build_adder_user hamrun               # DE pivot wave 4: Run-Application (Alt-F2) modal dialog (v2 client; reads /dev/wsys/run, poked via /dev/wsys/run/show, launches via /dev/wsys/run/launch)
 build_adder_user hamcalc              # integer calculator on the hamui toolkit (lib/hamui.ad)
 build_adder_user hamctl               # scene-DE Control Center hub (dual-target lib/hamctlcore): Appearance (wallpaper ctl verb) + Date & Time (clock + UTC offset -> /tmp/hamnix-tz.conf) + About (hostname/kernel/uptime/mem/CPUs/procs)
-build_adder_user hamclock             # clock + stopwatch on the hamui toolkit (lib/hamui.ad)
 build_adder_user hamview              # image viewer (Eye-of-MATE equiv) on the hamui toolkit: decodes PPM(P6)/BMP, blits via an fb draw-layer
 build_adder_user hamabout             # About-this-system dialog (scene client): OS name + kernel + memory + uptime
 build_adder_user hamshot              # screenshot CLI (MATE-screenshot equiv): /dev/fb geometry + /dev/fbpix pixel stream -> timestamped PNG (lib/pngwrite.ad; view with hamview) + desktop notification

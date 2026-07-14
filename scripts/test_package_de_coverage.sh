@@ -180,7 +180,6 @@ EXPECTED_APP_PKGS = {
     "hamnix-hamview": "hamview",
     "hamnix-hambrowse": "hambrowse",
     "hamnix-haminbox": "haminbox",
-    "hamnix-hamclock": "hamclock",
     "hamnix-hamsettings": "hamsettings",
     "hamnix-haminstallui": "haminstallui",
 }
