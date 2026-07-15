@@ -306,6 +306,53 @@ spot is a **hybrid**:
    `match` (exhaustiveness warnings), closures that capture env, a small app std-lib
    (collections/strings/io), integer-overflow-checked arithmetic opt-in.
 
+   **STATUS (increment 7a — landed, BOTH backends, byte-lockstep): DEFAULT
+   PARAMETER VALUES + KEYWORD ARGUMENTS.** The two highest-daily-value items
+   from the list, sharing one clean mechanism (call-site normalization). A
+   DIRECT call to an in-unit `def` may now:
+   * **omit trailing arguments** — filled from the parameter's declared
+     default: `def f(x: int32, y: int32 = 10)`; `f(5)` desugars to `f(5, 10)`;
+     and/or
+   * **pass arguments by name** — `f(y=2, x=1)`, in any order, mixed with
+     leading positionals (`scale(3, factor=4)`).
+
+   *Desugaring approach.* Pure **call-site normalization** — no ABI change, no
+   runtime cost. At each direct call to a known function, kwargs are bound to
+   parameter positions by name and every unfilled slot is filled from its
+   parameter's default expression, producing a plain positional argument list
+   that flows through the existing SysV marshalling unchanged. The default
+   expression AST is spliced **read-only** into the callee's argument slot (both
+   backends emit the same node), so no aggregate/heap machinery is involved and
+   the representation is identical to writing the call out longhand.
+
+   *Byte-inert when unused.* A call that already supplies every argument
+   positionally takes the fast path and emits bytes **identical to HEAD** — the
+   seed returns `call.args` unchanged; the native backend leaves the normalization
+   flag 0 and walks the original arg chain. Proven: a fully-explicit call site is
+   byte-for-byte identical whether or not the callee declares a trailing default.
+   Existing code declared no defaults (the seed rejected them before this
+   increment), so no production `.ad` moves a byte.
+
+   *Both backends, byte-lockstep.* SEED (`codegen_x86.py`: `func_params` table +
+   `_normalize_call_args`, called at the top of `gen_call`; the FunctionDef
+   default-param rejection replaced by a trailing-default-ordering check).
+   NATIVE (`codegen.ad`: `find_prog_function` + `normalize_call_args` pushing a
+   **re-entrant window** onto `norm_stack` — a nested normalized call inside an
+   argument expression pushes/pops its own window — consumed by `gen_call`; plus
+   the same trailing-default check in `gen_function`). The parser already parsed
+   both surfaces (defaults on `Parameter`/ND_PARAM.b, kwargs as an ND_ASSIGN in
+   the arg chain), so no lexer/parser or new-keyword change — maximally byte-inert.
+   Gate: `scripts/test_adder_app_sugar.sh`.
+
+   *Deferred (honest):* (a) **string methods** — `.upper()/.split()/.replace()`
+   etc. need a heap-backed string type; Adder strings are raw `Ptr[uint8]` today,
+   so this is a std-lib/representation increment, NOT a cheap byte-inert desugar.
+   (b) default/keyword args on **methods** and **externs** — methods route
+   through `MethodCallExpr` (never `gen_call`) and externs have no visible body;
+   both keep the pre-existing "default params unsupported" rejection. (c)
+   `*args`/`**kwargs`, closures capturing env, integer-overflow-checked
+   arithmetic, and the app std-lib — future passes.
+
 Each increment: opt-in or byte-inert-off, kernel-bypassable, seed+native lockstep,
 verified by objdiff + differential fuzzer + `test_native_kernel_links` +
 `run_compiler_tests` + a new feature gate.

@@ -342,6 +342,12 @@ class X86CodeGen:
         # arrow as "no return value"; calls in those positions can't
         # appear in member-access chains anyway).
         self.func_return_types: dict[str, Type] = {}
+        # Map function name -> its declared Parameter list, populated in
+        # pass 1. Used by gen_call to resolve keyword arguments and to fill
+        # omitted trailing arguments from their declared defaults
+        # (roadmap item 7 — app-ergonomics sugar). Only direct calls to a
+        # known in-unit `def` consult this; indirect / extern calls do not.
+        self.func_params: dict[str, list] = {}
         self.global_var_types: dict[str, Type] = {}
         # Per-CPU globals: live in .data..percpu. To avoid the elf32-i386
         # absolute-symbol-relocation pothole, we track each percpu
@@ -964,6 +970,7 @@ class X86CodeGen:
                         self.func_return_types[name] = decl.return_type
                 case FunctionDef(name=name):
                     self.defined_funcs.add(name)
+                    self.func_params[name] = decl.params
                     if decl.return_type is not None:
                         self.func_return_types[name] = decl.return_type
                 case ClassDef():
@@ -1403,14 +1410,20 @@ class X86CodeGen:
                         f"@{_bad[0]} at "
                         f"{_span_location(decl.span)})"
                     )
+                # Default-valued parameters (roadmap item 7) are supported
+                # for free functions: an omitted trailing argument is filled
+                # from the default at the call site (gen_call). Enforce
+                # Python's rule that a default must not precede a
+                # non-default parameter.
+                _seen_default = False
                 for p in decl.params:
                     if p.default is not None:
+                        _seen_default = True
+                    elif _seen_default:
                         raise CodeGenError(
-                            f"x86: default-valued parameters are not "
-                            f"supported (function '{decl.name}', "
-                            f"parameter '{p.name}' at "
-                            f"{_span_location(p.span)}); pass the "
-                            f"default explicitly at every call site"
+                            f"x86: non-default parameter '{p.name}' follows "
+                            f"a default-valued parameter (function "
+                            f"'{decl.name}' at {_span_location(p.span)})"
                         )
                     _reject_unsupported_type(
                         p.param_type,
@@ -5341,11 +5354,65 @@ class X86CodeGen:
         self.emit("    cmpq %rcx, %rax")       # result vs hi
         self.emit("    cmovg %rcx, %rax")      # if result > hi: rax = hi
 
+    def _normalize_call_args(self, call: CallExpr) -> list:
+        """Resolve keyword arguments and fill omitted trailing arguments
+        from the callee's declared defaults, returning a plain positional
+        argument list (roadmap item 7).
+
+        BYTE-INERT: for an all-positional call whose argument count already
+        matches (or exceeds — variadic/unknown) the declared parameters,
+        this returns `call.args` UNCHANGED, so codegen for existing code is
+        bit-identical. The kwarg / default-fill machinery is only reached by
+        code that actually uses the new sugar.
+        """
+        fname = call.func.name if isinstance(call.func, Identifier) else None
+        params = self.func_params.get(fname) if fname is not None else None
+        # Fast path: no kwargs and either an unknown callee (indirect /
+        # extern) or already-sufficient positional arity -> unchanged.
+        if not call.kwargs and (params is None
+                                or len(call.args) >= len(params)):
+            return call.args
+        if params is None:
+            # kwargs against an unresolvable callee (indirect / extern):
+            # we have no parameter names to bind them to.
+            raise CodeGenError(
+                f"x86: keyword arguments require a known function "
+                f"({fname if fname is not None else '<indirect>'})")
+        n = len(params)
+        if len(call.args) > n:
+            raise CodeGenError(
+                f"x86: too many positional arguments to '{fname}' "
+                f"({len(call.args)} for {n} parameters)")
+        slots: list = [None] * n
+        for i, a in enumerate(call.args):
+            slots[i] = a
+        name_to_idx = {p.name: i for i, p in enumerate(params)}
+        for kname, kval in call.kwargs.items():
+            j = name_to_idx.get(kname)
+            if j is None:
+                raise CodeGenError(
+                    f"x86: '{fname}' has no parameter named '{kname}'")
+            if slots[j] is not None:
+                raise CodeGenError(
+                    f"x86: argument '{kname}' to '{fname}' given twice")
+            slots[j] = kval
+        for i in range(n):
+            if slots[i] is None:
+                if params[i].default is None:
+                    raise CodeGenError(
+                        f"x86: missing argument '{params[i].name}' in call "
+                        f"to '{fname}'")
+                slots[i] = params[i].default
+        return slots
+
     def gen_call(self, call: CallExpr) -> None:
-        if call.kwargs:
-            fname = (call.func.name if isinstance(call.func, Identifier)
-                     else type(call.func).__name__)
-            raise CodeGenError(f"x86: keyword arguments not supported ({fname})")
+        # Resolve kwargs + default-fill into a positional list. Byte-inert
+        # for existing all-positional calls (returns call.args unchanged).
+        norm_args = self._normalize_call_args(call)
+        if norm_args is not call.args or call.kwargs:
+            # Re-dispatch on a positional-only shape so the marshalling
+            # below (and every intrinsic guard) sees a plain arg list.
+            call = CallExpr(call.func, norm_args, {}, call.span)
 
         # ---- classify the call target -------------------------------------
         # A call is "direct" iff `call.func` is a bare Identifier naming a
