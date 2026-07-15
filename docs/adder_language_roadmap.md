@@ -514,15 +514,39 @@ spot is a **hybrid**:
    * **Kernel opt-out intact:** the kernel passes aggregates by-ref everywhere
      and never declares a by-value aggregate param, so it never hits the new
      path (zero-cost, opt-in-by-use).
-   * **Native:** `codegen.ad` does not yet emit the convention; it REJECTS a
-     by-value struct param (pre-existing `cg_fail(9)`) and now also a by-value
-     `Slice[T]` param with `cg_fail(9)` (never mis-spills one register + reads
-     the rest as stack garbage). Gate `scripts/test_adder_aggparam.sh`
-     (host-only) asserts struct/Slice/String params run correct exit codes
-     (134/107/105), the param+return interaction, all three rejections fire, and
-     the native binary rejects directly (`reason=9`). FOLLOW-UPS: native
-     acceptance (byte-lockstep), SysV stack-passing of a boundary-splitting
-     aggregate, and indirect (function-pointer) calls with aggregate params.
+   * **Native (increment 9):** `codegen.ad` did not yet emit the convention; it
+     REJECTED a by-value struct/`Slice[T]` param with `cg_fail(9)` — superseded
+     by increment 10 below.
+
+10. **By-value aggregate ABI — NATIVE backend (completes increments 8 & 9).**
+
+    **STATUS (increment 10 — landed):** The self-hosted `codegen.ad` now EMITS
+    both halves of the by-value aggregate ABI **byte-identically to the seed**,
+    instead of rejecting them. The seed stays the frozen oracle (`codegen_x86.py`
+    unchanged); native mirrors its exact instruction bytes.
+    * **RETURN side (#302):** the `return` of a `≤16`-byte float-free struct /
+      `Slice[T]` materialises the aggregate into `rax:rdx` (byte `8..15 → rdx`
+      loaded FIRST, then `0..7 → rax`; a `≤8`-byte aggregate uses `rax` only); a
+      `return make()` of an aggregate-returning call tail-forwards the pair with
+      no reload; and a call site `x = make()` (VarDecl-init **and** plain
+      Assignment) stores the `rax:rdx` pair into `x`'s slot.
+    * **PARAM side (#307):** the call site expands each aggregate arg into its
+      two INTEGER eightbytes (address `→ %rax`, `movq (%rax),%r10` / `movq
+      8(%rax),%r10`, push/pop into `rdi..r9` in SysV order); the callee prologue
+      spills the arg registers into the param's struct/`{ptr,len}` slot using a
+      running INTEGER-register ordinal (a 2-register aggregate shifts following
+      params).
+    * **Same rejects, both backends:** `> 16`-byte, float/SSE-class, and
+      register-split aggregates still `cg_fail(9)` in native (never
+      accept-but-diverge).
+    * **Byte-lockstep proof:** the `tests/aggret/*` + `tests/aggparam/*` struct
+      and slice fixtures are native-ACCEPTED and objdiff-CLEAN; the whole
+      `x86_64-adder-user` corpus stays `0`-diverged (only the compiler-source-
+      embedding units move, as with #302/#307). `String` stays seed-only (the
+      native parser has no `String` annotation). Kernel opt-out intact and links
+      native. Gates `scripts/test_adder_aggret.sh` /
+      `scripts/test_adder_aggparam.sh` now assert native **accept + per-function
+      objdiff byte-match** (keeping the `> 16`/float/split native-reject arms).
 
 Each increment: opt-in or byte-inert-off, kernel-bypassable, seed+native lockstep,
 verified by objdiff + differential fuzzer + `test_native_kernel_links` +
