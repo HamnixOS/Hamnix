@@ -61,17 +61,31 @@ release, and middle-click paste of PRIMARY at the click.
 
 ## Verification
 
-`scripts/test_hamedit_clipboard.sh` (OVMF/KVM, fresh installer image):
-- Hard gate (PASS): editor loads a file, Ctrl+A select-all, Ctrl+C, then the
-  shell reads the copied payload back from `/dev/snarf` — the full chain
-  (selection + Ctrl+C + `htb_clip_put` + device + cross-process read).
-- Screendump `armA_selectall.ppm` shows the blue selection band over the text.
-- Direct device probes confirmed `/dev/snarf` and `/dev/snarf.primary` write +
-  read independently.
+Two gates, both green (and a native kernel-link check — ship blocker — passes):
+
+1. **`scripts/test_hamtextbox_host.sh`** — QEMU-free, deterministic host unit
+   test (`user/hamtextbox_host.ad`, `--target=x86_64-linux`). 16/16 assertions:
+   `htb_hit_test` is the EXACT inverse of `htb_caret_x` (for every caret index
+   `i`, hitting caret `i`'s pixel returns `i`), boundary cases, monotonicity,
+   and the full selection model (click collapses; drag forward/backward sets
+   `[start,end)`; a typed key collapses). Runs on the real proportional-font
+   path in milliseconds.
+
+2. **`scripts/test_hamedit_clipboard.sh`** — on-device (OVMF/KVM, fresh
+   installer image), **DETERMINISTIC** (no mouse / wid / keystroke injection on
+   the critical path — those were load-sensitive). A `--selftest-copyall` hook
+   makes the editor GENERATE a known payload and run the real
+   `_handle_code(Ctrl+A)` + `_handle_code(Ctrl+C)` handlers on startup; the
+   shell then reads that payload back from `/dev/snarf` (cross-process,
+   device-only), and a SEPARATE `--selftest-paste` editor pastes it into a file
+   the shell reads back. **3/3 PASS on a CPU-loaded host.** Screendump
+   `armE_copyall.ppm` shows the blue selection band. Direct device probes also
+   confirmed `/dev/snarf` and `/dev/snarf.primary` write+read independently.
 
 Deferred: (a) terminal scrollback-grid selection (the terminal renders a grid,
 not a single text box — the #1 follow-up); (b) automated MOUSE
 click-to-position / drag-select / middle-paste confirmation (the infra is in
-place and delivered by the compositor, but the DE key/mouse-injection harness
-is too timing-sensitive to drive it deterministically — verified by
-construction + screendump, not by an automated assertion).
+place and the compositor delivers the events — window-local `m x y buttons dz`
+with middle=bit2 — but the DE mouse-injection harness is too pixel/timing
+sensitive to assert deterministically; a best-effort arm + screendump cover
+it, and the host unit test proves the click-to-position MATH exactly).
