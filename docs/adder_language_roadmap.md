@@ -245,6 +245,62 @@ spot is a **hybrid**:
    monomorphised generic beyond that.
 5. **`own T` move-only handles + `drop`** (Tier B) — the biggest Rust-like leap, as a
    compile-time affine check; catches UAF/double-free. Uses the existing `defer`.
+
+   **STATUS (increment 5 — landed; move / use-after-move / double-free core,
+   ZERO runtime cost):** A move-only **affine** type qualifier, spelled
+   **`Own[T]`** (surface syntax — recognised by NAME like `Slice[T]`, so NO new
+   lexer token and NO keyword collision; the bare word `own` collides with real
+   identifiers in `drivers/`/`sys/` and was rejected). `Own[T]` is
+   **representationally IDENTICAL to a plain `T`** — the parser strips the
+   qualifier and yields the inner type, so an `own` binding compiles to bytes
+   byte-for-byte identical to a non-`own` one (proven: `Own[int32]` ≡ `int32`,
+   `cmp`-identical ELF). The affine analysis is a **compile-time-only** AST pass
+   (`adder/compiler/affine_check.py`, run from the seed driver) that emits
+   NOTHING at runtime — the kernel and all non-`own` code pay exactly zero.
+
+   *Semantics.* A per-function flow analysis tracks each `own` binding as LIVE
+   or MOVED. A binding is **moved** when a bare `own` identifier appears as (a) a
+   call/method argument (pass-by-value), (b) the RHS of a binding/assignment, (c)
+   a `return` value, or (d) an element of a tuple/list in any of those positions;
+   `drop(x)` is just case (a). **Reading a MOVED binding in any position is a
+   compile error** ("use after move"); an explicit `drop(x)` moves x so a second
+   `drop(x)`/use is caught as a **double-free**. To BORROW without moving, pass
+   the address — `foo(&x)` (any non-bare-identifier form) reads x without
+   consuming it. **Conditional-move rule:** after an `if`/`match`, a binding is
+   MOVED if it was moved on ANY branch (conservative — only ever rejects more,
+   never lets a real use-after-move through); re-assigning a moved binding
+   revives it; moving an outer `own` binding inside a loop body is rejected
+   (double-move across iterations). **Opt-out:** `unsafe:` blocks and `@unsafe`
+   functions are not analysed (the escape hatch), matching the runtime-check
+   relaxations.
+
+   *Both backends, byte-lockstep.* The SEED (`parser.py` `Own[T]` strip +
+   `is_own` on `VarDecl`/`Parameter`; `affine_check.py`; `adder.py`
+   `_run_affine_check` hook) is the enforcing oracle. The NATIVE `.ad` backend
+   (`parser.ad` `parse_type` `Own[T]`→inner strip) parses `own` **transparently**
+   and emits identical code — so seed↔native stay byte-locked on any `own`
+   program (objdiff CLEAN on `own_ok`). Gate: `scripts/test_adder_own_move.sh`.
+   Verified: the new gate ALL PASS (correct single-move runs; borrow-via-`&`;
+   use-after-move rejected; double-drop rejected; seed↔native objdiff clean;
+   `Own[T]`≡`T` byte-inert; `@unsafe` opt-out); full-corpus objdiff **256/256, 0
+   diverged**; differential fuzzer **500/500, 0 miscompiles**;
+   `test_native_kernel_links` PASS; `run_compiler_tests` ALL PASS; `build_user`
+   full userland OK; bench binaries **md5-identical to HEAD at `-O2`** (no
+   codegen-perf regression); byte-inert-off proven HEAD-vs-worktree on
+   `x86_64-linux` (ELF) and `x86_64-bare-metal` (asm).
+
+   *Deferred (honest):* **auto-`drop`-insertion** — emitting `drop(x)` at scope
+   exit for an un-moved `own` binding (via the `defer` lowering) is NOT in this
+   increment. The high-value core (move / use-after-move / double-free) landed
+   solidly first; auto-drop is a follow-up because it (a) would require inserting
+   real `drop` calls into the AST that BOTH backends must emit identically — a
+   codegen-level change to the native `.ad` backend, not just a seed analysis —
+   to preserve lockstep on `own`-using code, and (b) needs a per-binding
+   destructor-resolution rule. **Native affine ENFORCEMENT** is also deferred: the
+   check is seed-authoritative this pass (it emits no bytes, so lockstep is
+   unaffected); porting the per-function flow analysis into the 14.7k-line
+   `codegen.ad` is a separate effort with no byte impact. The native backend
+   already accepts `own` syntax byte-transparently.
 6. **Region/arena lifetimes** (long-horizon) — scoped "ref can't outlive region."
 7. **App-ergonomics sugar** (interleaved): default/keyword args, string methods, richer
    `match` (exhaustiveness warnings), closures that capture env, a small app std-lib

@@ -512,6 +512,10 @@ class VarDecl:
     span: Optional[Span] = None
     module: Optional[str] = None
     orig_name: Optional[str] = None
+    # True iff the annotation was `Own[T]` — a move-only (affine) binding.
+    # Codegen ignores this entirely (an `own` binding is byte-identical to a
+    # plain `T`); it is consumed ONLY by the compile-time affine_check pass.
+    is_own: bool = False
 
 
 @dataclass
@@ -709,6 +713,9 @@ class Parameter:
     param_type: Optional[Type] = None
     default: Optional[Expr] = None
     span: Optional[Span] = None
+    # True iff the parameter type was `Own[T]` — a move-only (affine) handle
+    # the callee takes ownership of. Consumed only by affine_check; byte-inert.
+    is_own: bool = False
 
 
 @dataclass

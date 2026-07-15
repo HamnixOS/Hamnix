@@ -577,6 +577,19 @@ def merge_programs(files: list[Path]) -> Program:
     return Program(imports=all_imports, declarations=all_declarations)
 
 
+def _run_affine_check(program) -> None:
+    """Compile-time affine move-check for `Own[T]` bindings (roadmap increment
+    5). A no-op for any program that uses no `own`, so it is byte-inert and
+    cannot perturb the kernel/userland corpus. On a use-after-move / double-free
+    it prints a diagnostic and exits non-zero (a compile error)."""
+    from .affine_check import check_affine, AffineError
+    try:
+        check_affine(program)
+    except AffineError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def compile_source(source: str, filename: str = "<stdin>",
                    target: str = DEFAULT_TARGET, opt_level: int = 0,
                    check_bounds: bool = False) -> str:
@@ -585,6 +598,7 @@ def compile_source(source: str, filename: str = "<stdin>",
                              file_unsafe=_source_has_unsafe_pragma(source))
     try:
         program = parse(source, filename)
+        _run_affine_check(program)
         return generate(program)
     except (LexerError, ParseError, CodeGenError) as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -613,6 +627,7 @@ def compile_with_imports(main_file: Path, target: str = DEFAULT_TARGET,
 
     # Generate assembly
     try:
+        _run_affine_check(merged_program)
         return generate(merged_program)
     except CodeGenError as e:
         print(f"Error: {e}", file=sys.stderr)

@@ -28,6 +28,9 @@ class Parser:
         self.filename = filename
         self.pos = 0
         self.errors: list[ParseError] = []  # Collected errors for recovery
+        # Set by parse_type when it strips an `Own[T]` qualifier; read+cleared
+        # by the binding sites (VarDecl / Parameter) to mark an affine binding.
+        self._own_qualified = False
 
     def has_errors(self) -> bool:
         """Check if any parse errors occurred."""
@@ -233,6 +236,19 @@ class Parser:
                     inner = self.parse_type()
                     self.expect(TokenType.RBRACKET)
                     return SliceType(inner, self.make_span(tok))
+                # Move-only affine handle: Own[T] (roadmap increment 5, Tier B).
+                # Recognised by NAME (like Slice) so no new lexer token /
+                # keyword collision. `Own[T]` is REPRESENTATIONALLY IDENTICAL to
+                # a plain `T` — it strips to the inner type for all codegen, so
+                # a binding is byte-identical whether or not it is `own`. The
+                # only effect is a `self._own_qualified` flag the binding site
+                # (VarDecl / Parameter) records for the compile-time affine
+                # move-check; codegen never sees `Own`.
+                if name == "Own":
+                    inner = self.parse_type()
+                    self.expect(TokenType.RBRACKET)
+                    self._own_qualified = True
+                    return inner
                 # For now, just parse as string
                 type_args = [self.parse_type()]
                 while self.match(TokenType.COMMA):
@@ -1027,12 +1043,16 @@ class Parser:
 
             # Type annotation: x: int32 or x: int32 = value
             if self.match(TokenType.COLON):
+                self._own_qualified = False
                 var_type = self.parse_type()
+                is_own = self._own_qualified
+                self._own_qualified = False
                 value = None
                 if self.match(TokenType.ASSIGN):
                     value = self.parse_expression()
                 self.expect(TokenType.NEWLINE)
-                return VarDecl(name, var_type, value, span=self.make_span(tok))
+                return VarDecl(name, var_type, value, span=self.make_span(tok),
+                               is_own=is_own)
 
             # Assignment: x = value or x += value
             if self.match(TokenType.ASSIGN):
@@ -1231,13 +1251,18 @@ class Parser:
         param_type = None
         default = None
 
+        is_own = False
         if self.match(TokenType.COLON):
+            self._own_qualified = False
             param_type = self.parse_type()
+            is_own = self._own_qualified
+            self._own_qualified = False
 
         if self.match(TokenType.ASSIGN):
             default = self.parse_expression()
 
-        return Parameter(name, param_type, default, self.make_span(tok))
+        return Parameter(name, param_type, default, self.make_span(tok),
+                         is_own=is_own)
 
     def parse_function(self, decorators: list[str] = None,
                        class_name: Optional[str] = None) -> FunctionDef:
