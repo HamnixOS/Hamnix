@@ -55,7 +55,9 @@ assert_grep '^glyphs 112 81 \"1\"'              "July 1 2026 placed on Wednesday
 assert_grep '^glyphs 12 133 \"12\" #ffffff'     "today (12) highlighted"
 assert_grep '^MONTH0 7'                         "initial month is July"
 assert_grep '^YEAR0 2026'                       "initial year is 2026"
-assert_grep '^PIX 4 4 #3584e4'                  "raster title-bar pixel = blue"
+# Modern cohesive headerbar: a cool-blue vertical gradient (was a flat
+# #3584e4). Scanline 4 of the azure gradient rasterizes to #618ac5.
+assert_grep '^PIX 4 4 #618ac5'                  "raster headerbar pixel = cool-blue gradient"
 
 # --- date selection + RELATIVE TIME ---
 assert_grep '^SEL0 12'                          "selection defaults to today (12)"
