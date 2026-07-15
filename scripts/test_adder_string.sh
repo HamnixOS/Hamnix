@@ -12,9 +12,11 @@
 # lib/strview.ad as ORDINARY Adder over raw (ptr,len) pairs — so they compile
 # through the byte-tested path and are seed<->native lockstep for free.
 #
-# STATUS: SEED backend (increment 7-tail-a). The native `.ad` backend REJECTS
-# `String` with a clear error (native support pending) rather than miscompile.
-# See docs/adder_language_roadmap.md.
+# STATUS: SEED + NATIVE. `String` is native since increment 11/#309 (bound
+# locals) and #312 (member access on an UNBOUND `String(...)` temporary, e.g.
+# `String(" world").ptr` — no bind-to-a-local first). The native backend emits
+# byte-identically to the seed (objdiff-clean), so String-using units are
+# seed<->native lockstep, not seed-only. See docs/adder_language_roadmap.md.
 #
 # Verifies end to end:
 #   (1) BEHAVIOUR: construct-from-literal, .len/.ptr/.cstr (NUL round-trip),
@@ -27,11 +29,11 @@
 #   (4) LOCKSTEP: lib/strview.ad (the helper layer) compiles seed==native,
 #       byte-identical (objdiff 0 divergences) — native accepts the String-free
 #       helpers cleanly.
-#   (5) NATIVE REJECTS STRING: the native `.ad` backend REJECTS a String-typed
-#       source (non-zero exit, NO ELF emitted) — a clean codegen error, NOT a
-#       miscompile. String is seed-only until the native port lands; the native
-#       backend carries zero String code, so every String-free unit stays
-#       byte-identical to base (the make-or-break byte-inert-off invariant).
+#   (5) NATIVE ACCEPTS STRING: the native `.ad` backend ACCEPTS a String-typed
+#       source (bound local + an UNBOUND `String(...).ptr` temporary), emits an
+#       ELF, and its bytes match the seed (objdiff-clean) — a real port, not a
+#       miscompile. The roadmap fixture tests/string/string_smoke.ad (which uses
+#       the unbound `String(" world").ptr` form) native-compiles too (#312).
 #
 # Usage:  bash scripts/test_adder_string.sh
 
@@ -95,22 +97,40 @@ grep -q "native-accepted=1" "$WORK/objdiff.log" \
     || { tail -20 "$WORK/objdiff.log"; fail "native did not accept the helper unit"; }
 echo "[string]   $(grep 'PASS' "$WORK/objdiff.log" | head -1)"
 
-echo "[string] (5) native backend REJECTS a String-typed source (no miscompile)"
+echo "[string] (5) native backend ACCEPTS String (bound + unbound temp), no miscompile"
 adder_cc_bootstrap || fail "could not bootstrap the native host_ac.elf"
 HOST_AC="build/cutover/host_ac.elf"
 [ -x "$HOST_AC" ] || fail "native host_ac.elf not built"
-rm -f "$WORK/probe.elf"
 # Invoke host_ac.elf DIRECTLY (not adder_cc_compile) so the Python-seed
-# fallback can't mask the native rejection.
-if "$HOST_AC" --target=x86_64-adder-user "$FIX/string_native_probe.ad" \
-        "$WORK/probe.elf" >"$WORK/native.log" 2>&1; then
-    cat "$WORK/native.log"
-    fail "native backend accepted String (must reject the seed-only feature)"
-fi
-[ ! -s "$WORK/probe.elf" ] \
-    || fail "native emitted an ELF for a String source (miscompile risk)"
-echo "[string]   native rejected String cleanly: $(cat "$WORK/native.log" | head -1)"
+# fallback can't mask a native rejection — the native backend must accept it.
+rm -f "$WORK/probe.elf"
+"$HOST_AC" --target=x86_64-adder-user "$FIX/string_native_probe.ad" \
+        "$WORK/probe.elf" >"$WORK/native.log" 2>&1 \
+    || { cat "$WORK/native.log"; fail "native backend REJECTED a bound String source"; }
+[ -s "$WORK/probe.elf" ] \
+    || fail "native accepted String but emitted no ELF"
+echo "[string]   native accepted a bound String source ($(stat -c%s "$WORK/probe.elf") bytes)"
+
+# #312: member access on an UNBOUND String(...) temporary — the roadmap's own
+# string_smoke.ad uses `String(" world").ptr`, which the native backend rejected
+# before the fix. It must native-compile now.
+rm -f "$WORK/smoke.native.elf"
+"$HOST_AC" --target=x86_64-adder-user "$FIX/string_smoke.ad" \
+        "$WORK/smoke.native.elf" >"$WORK/native.smoke.log" 2>&1 \
+    || { cat "$WORK/native.smoke.log"; fail "native REJECTED string_smoke.ad (unbound String(...).ptr — #312)"; }
+[ -s "$WORK/smoke.native.elf" ] \
+    || fail "native accepted string_smoke.ad but emitted no ELF"
+echo "[string]   native compiled string_smoke.ad ($(stat -c%s "$WORK/smoke.native.elf") bytes; unbound String(...).ptr)"
+
+# The temporary-member acceptance fixture is byte-identical seed<->native.
+bash scripts/test_native_vs_seed_objdiff.sh "$FIX/string_temp_member.ad" \
+    >"$WORK/objdiff_tm.log" 2>&1 \
+    || { tail -20 "$WORK/objdiff_tm.log"; fail "String temporary-member objdiff diverged"; }
+grep -q "zero semantic divergences" "$WORK/objdiff_tm.log" \
+    || { tail -20 "$WORK/objdiff_tm.log"; fail "temp-member objdiff not zero-divergence"; }
+echo "[string]   String temporary-member fixture seed==native (objdiff-clean)"
 
 echo "[string] PASS — String construct/len/ptr/cstr/eq/find/contains/substr/"
 echo "[string]        concat-into-buffer correct, on-device + kernel-safe,"
-echo "[string]        helper layer seed==native, native rejects String cleanly."
+echo "[string]        helper layer seed==native, native accepts String"
+echo "[string]        (bound + unbound String(...).ptr temp; string_smoke native)."

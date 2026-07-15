@@ -237,13 +237,16 @@ spot is a **hybrid**:
      HEAD-vs-worktree on both `x86_64-linux` and `x86_64-bare-metal`.
 
    *Deferred (disproved / honest):* (a) **sub-slicing** (`s[a:b]`) — not this
-   pass; the slice type + checked indexing land solidly first. (b) A **bare
-   `Slice[T](...)` subexpression** not bound to a local needs an anonymous
-   prescan-reserved stack temp on the native path (the seed supports it via
-   `gen_slice_new`; native `cg_fail`s and requires binding to a local first) —
-   an acceptance gap, not a miscompile, and no corpus uses it. (c) **generics**
-   — `T` is carried on the type for element sizing but `Slice[T]` is not a
-   monomorphised generic beyond that.
+   pass; the slice type + checked indexing land solidly first. (b) ~~A bare
+   `Slice[T](...)` subexpression not bound to a local~~ — **CLOSED (#312)**: a
+   member/field access on an unbound `Slice[T](...)` / `String(...)` temporary
+   (e.g. `String(" world").ptr`) now materialises into an anonymous
+   prescan-reserved 16-byte stack temp on the native path too, byte-identically
+   to the seed's `gen_slice_new` / `gen_string_new` (objdiff-clean). *(Still
+   deferred: indexing the returned pointer inline — `String(x).ptr[i]` — is a
+   separate pre-existing native gap; bind the ptr to a local first.)* (c)
+   **generics** — `T` is carried on the type for element sizing but `Slice[T]`
+   is not a monomorphised generic beyond that.
 5. **`own T` move-only handles + `drop`** (Tier B) — the biggest Rust-like leap, as a
    compile-time affine check; catches UAF/double-free. Uses the existing `defer`.
 
@@ -345,7 +348,7 @@ spot is a **hybrid**:
    the arg chain), so no lexer/parser or new-keyword change — maximally byte-inert.
    Gate: `scripts/test_adder_app_sugar.sh`.
 
-   **STATUS (increment 7-tail — the foundational `String` type, SEED backend,
+   **STATUS (increment 7-tail — the foundational `String` type; SEED + NATIVE,
    landed):** the deferred "needs a heap-backed string type" blocker below is
    now addressed by a `String` VALUE type: a 16-byte `{ptr@0, len@8}`
    by-reference aggregate VIEW (representationally a `Slice[uint8]`, same ABI
@@ -361,10 +364,14 @@ spot is a **hybrid**:
    through the byte-tested path and are seed<->native byte-lockstep for FREE
    (objdiff clean, no new codegen). USERLAND-only: `String` is pure pointer
    math with ZERO runtime, so the kernel keeps raw `Ptr[uint8]` and pays
-   nothing (byte-inert-off; the native backend carries no String code at all, so
-   every String-free unit is byte-identical to base). Gate:
-   `scripts/test_adder_string.sh` (behaviour checksum 42, on-device +
-   kernel-safe, helper-layer lockstep, native-rejects-String cleanly).
+   nothing. **NATIVE backend:** `String` is native since increment 11/#309
+   (bound locals) and #312 (member access on an UNBOUND `String(...)` /
+   `Slice[T](...)` temporary — e.g. `String(" world").ptr` — via an anonymous
+   prescan-reserved 16-byte temp, byte-identical to the seed); every String-free
+   unit stays byte-identical to base (only `codegen.ad` + compiler-embedding
+   units move). Gate: `scripts/test_adder_string.sh` (behaviour checksum 42,
+   on-device + kernel-safe, helper-layer lockstep, native ACCEPTS String —
+   bound + unbound temp — and `tests/string/string_smoke.ad` native-compiles).
 
    *Design finding — no owning heap-String (disproof, evidence-backed):* a TRUE
    *owning* heap string (per-string small allocations, growable `+`) is
