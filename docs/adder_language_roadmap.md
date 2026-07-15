@@ -111,6 +111,42 @@ spot is a **hybrid**:
    binding reused across two `match` arms still shares one slot on native (the
    pre-existing re-decl divergence), untested by the current fixtures.
 2. **Non-null-by-default** pointers/refs + opt-in `Optional` deref checks (leans on #1).
+
+   **STATUS (increment 2, null-safety — landed, opt-in Optional-deref half):**
+   A postfix **`!` force-unwrap** operator on `Option[T]`/`Result[T,E]`:
+   `opt!` evaluates to the success variant's (Some/Ok) unwrapped payload. Under
+   the opt-in **userspace safety flag** (reused `--check-bounds` — the
+   established flag + `userspace && flag` gate, so the KERNEL is structurally
+   exempt), a non-success value (None/Err) **traps CLEANLY** with `ud2` →
+   SIGILL (wait-status 132) — the null-safety mirror of the array-bounds check,
+   not a silent garbage-payload read. **Byte-inert when off:** with the flag
+   clear (and ALWAYS on `x86_64-bare-metal`, where the driver never sets it) NO
+   check is emitted, so `!` is a zero-cost payload extraction that assumes
+   success — kernel-friendly and inert for code that uses no `!`. `unsafe:`
+   suppresses the trap like it does for bounds (`cg_unsafe_depth`).
+
+   *Both backends, byte-lockstep.* The seed (`lexer.py`/`parser.py`/
+   `ast_nodes.py` `UnwrapExpr`/`codegen_x86.py` `_gen_unwrap`) and the native
+   `.ad` backend (`lexer.ad` `TOK_BANG`; `parser.ad` `ND_UNWRAP`; `codegen.ad`
+   `gen_unwrap` + `prescan_reserve_tries`) emit **byte-identical** machine code
+   — the emitted check is `cmpq $0,%rax; je +2; ud2` (`48 83 F8 00 / 74 02 /
+   0F 0B`). objdiff CLEAN on both flag states; the lexer's lone-`!` was
+   previously a hard error, so no existing corpus byte moves. Lowering desugars
+   through the shared enum-extract machinery (materialise-once into a
+   prescan-reserved int64 temp, exactly like `?`), so it inherits increment 1's
+   scalar-packed representation with no new ABI. Gate:
+   `scripts/test_adder_null_safety.sh`.
+
+   *Deferred (disproved for this pass):* (a) a **non-null `Ref[T]`** wrapper
+   type — it needs compile-time non-null-construction analysis (proving a
+   `Ref[T]` can never be built from a null `Ptr[T]`) that the enum machinery
+   does NOT provide; it is a genuine type-checker addition, not a desugar, so
+   it does not fit "cleanly on top of increment 1" and would balloon scope.
+   Deferred so the opt-in Optional-deref check lands solidly. (b) **flipping
+   `Ptr[T]` to non-null-by-default** — explicitly rejected by design (the
+   kernel escape hatch; thousands of call sites assume nullable raw pointers;
+   flipping it violates byte-inert-off). Null-safety is delivered as the opt-in
+   `!` layer instead.
 3. **Descriptive bounds/null trap** (`bounds: idx N of len M at file:line`) + **`@unsafe`
    / `unsafe def`** attribute + `# adder: unsafe` file pragma (small, already designed).
 4. **`Slice[T]` fat pointers** — dynamic-buffer bounds checks; `Ptr[T]` stays the raw
