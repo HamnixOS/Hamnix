@@ -321,7 +321,9 @@ class X86CodeGen:
     """x86_64 (System V AMD64) code generator for the kernel-module target."""
 
     def __init__(self, bare_metal: bool = False,
-                 check_bounds: bool = False) -> None:
+                 check_bounds: bool = False,
+                 host_userspace: bool = False,
+                 file_unsafe: bool = False) -> None:
         self.output: list[str] = []
         self.string_literals: dict[str, str] = {}
         self.string_counter: int = 0
@@ -385,8 +387,50 @@ class X86CodeGen:
         # `unsafe_depth` > 0 inside an `unsafe:` block suppresses the checks.
         self.check_bounds = check_bounds
         self.unsafe_depth = 0
+        # Descriptive-trap plumbing (roadmap item 3). When a bounds/None-unwrap
+        # check trips under `--check-bounds`, we optionally write a
+        # `bounds: … at file:line` / `unwrap of None … at file:line` diagnostic
+        # to fd 2 (stderr) on the FAILING path, right before the `ud2` trap, so
+        # a developer sees WHAT/WHERE. This is emitted ONLY for the host Linux
+        # ELF target (`host_userspace`, i.e. x86_64-linux), which has real
+        # `.rodata` sections, standard Linux `write(2)`/`syscall`, and is run
+        # directly on the host so stderr is observable. The on-device
+        # x86_64-adder-user target and the kernel keep the compact `ud2` trap
+        # (byte-identical to before), which is what preserves the seed<->native
+        # objdiff lockstep (native's only userspace target is adder-user). The
+        # message path is on the COLD (already-branched-away) failing path, so
+        # the fast in-range path is unchanged (one cmp + not-taken jb), and it
+        # is byte-inert when `check_bounds` is off (nothing is emitted).
+        self.host_userspace = host_userspace
+        # Whole-file `# adder: unsafe` pragma: when set, every function in this
+        # translation unit is compiled as if wrapped in an `unsafe:` block
+        # (safety checks suppressed) — the coarsest opt-out, for hot/low-level
+        # files. Set by the driver after scanning the main source for the
+        # pragma. Byte-inert unless the pragma is present AND checks are on.
+        self.file_unsafe = file_unsafe
 
     # -- emission helpers ---------------------------------------------------
+
+    def _emit_trap_message(self, msg: str) -> None:
+        """Write `msg` to fd 2 (stderr) via a raw `write(2)` syscall, for the
+        descriptive-trap slow path. Emitted ONLY for the host Linux ELF target
+        (`host_userspace`); a no-op everywhere else so the on-device
+        adder-user/kernel trap bytes are unchanged (seed<->native lockstep).
+
+        Clobbers caller-saved regs — fine: the caller emits `ud2` immediately
+        after (the process dies), and this runs only on the already-failed
+        branch, so the fast path and the live index in %rax are untouched.
+        The interned string is NUL-terminated (`.asciz`), but we write exactly
+        `len(msg)` bytes, so the terminator is not emitted to stderr."""
+        if not self.host_userspace:
+            return
+        label = self.add_string(msg)
+        nbytes = len(msg.encode("utf-8"))
+        self.emit(f"    leaq {label}(%rip), %rsi")   # buf
+        self.emit(f"    movl ${nbytes}, %edx")        # count
+        self.emit("    movl $2, %edi")                # fd = stderr
+        self.emit("    movl $1, %eax")                # __NR_write
+        self.emit("    syscall")
 
     def emit(self, line: str = "") -> None:
         self.output.append(line)
@@ -1301,11 +1345,12 @@ class X86CodeGen:
                 # it has no default and a known type, so this loop
                 # accepts it transparently.
                 for m in decl.methods:
-                    if m.decorators:
+                    _bad = [d for d in (m.decorators or []) if d != "unsafe"]
+                    if _bad:
                         raise CodeGenError(
                             f"x86: decorators are not supported "
                             f"(method '{decl.name}.{m.name}', got "
-                            f"@{m.decorators[0]} at "
+                            f"@{_bad[0]} at "
                             f"{_span_location(m.span)})"
                         )
                     for p in m.params:
@@ -1329,11 +1374,16 @@ class X86CodeGen:
                         m.body, f"method '{decl.name}.{m.name}'"
                     )
             elif isinstance(decl, FunctionDef):
-                if decl.decorators:
+                # `@unsafe` is the one supported decorator: it suppresses the
+                # opt-in runtime safety checks in the whole function body (a
+                # function-level form of the `unsafe:` block — roadmap item 3).
+                # Any OTHER decorator is still rejected.
+                _bad = [d for d in (decl.decorators or []) if d != "unsafe"]
+                if _bad:
                     raise CodeGenError(
                         f"x86: decorators are not supported "
                         f"(function '{decl.name}', got "
-                        f"@{decl.decorators[0]} at "
+                        f"@{_bad[0]} at "
                         f"{_span_location(decl.span)})"
                     )
                 for p in decl.params:
@@ -1930,9 +1980,19 @@ class X86CodeGen:
                 self.emit(f"    movq {stack_off}(%rbp), %rax")
                 self._emit_local_store(var, "%rax")
 
-        # Body.
+        # Body. A `@unsafe`-decorated function — or ANY function when the whole
+        # file carries the `# adder: unsafe` pragma — suppresses the opt-in
+        # safety checks in its entire body, exactly as if the body were wrapped
+        # in an `unsafe:` block. Implemented via the same `unsafe_depth` counter
+        # so it composes with nested `unsafe:` blocks and is byte-inert when
+        # checks are off.
+        _func_unsafe = self.file_unsafe or ("unsafe" in (func.decorators or []))
+        if _func_unsafe:
+            self.unsafe_depth += 1
         for stmt in func.body:
             self.gen_stmt(stmt)
+        if _func_unsafe:
+            self.unsafe_depth -= 1
 
         # Patch the reserve placeholder with the final 16-byte-aligned frame
         # size. (At function entry, %rsp ≡ 8 (mod 16); after pushq %rbp it is
@@ -2501,6 +2561,10 @@ class X86CodeGen:
             ok = self.ctx.new_label("unwrap_ok")
             self.emit(f"    cmpq ${success.tag}, %rax")
             self.emit(f"    je {ok}")
+            # Descriptive trap (host Linux ELF only): print WHAT/WHERE to stderr
+            # on the failing path before trapping. No-op for adder-user/kernel.
+            loc = _span_location(span)
+            self._emit_trap_message(f"unwrap of None/Err at {loc}\n")
             self.emit("    ud2")             # None/Err -> SIGILL (clean trap)
             self.emit(f"{ok}:")
         # Success: evaluate the unwrapped payload into %rax.
@@ -4721,6 +4785,15 @@ class X86CodeGen:
         # Single UNSIGNED compare catches idx < 0 (wraps huge) AND idx >= N.
         self.emit(f"    cmpq ${n}, %rax")
         self.emit(f"    jb {ok}")
+        # Descriptive trap (host Linux ELF only): print WHAT/WHERE to stderr on
+        # the failing path before trapping. No-op for adder-user/kernel.
+        # IndexExpr itself carries no span (parser builds it postfix), so fall
+        # back to the base/index sub-expressions' spans for the file:line.
+        span = (getattr(expr, "span", None)
+                or getattr(expr.obj, "span", None)
+                or getattr(expr.index, "span", None))
+        loc = _span_location(span)
+        self._emit_trap_message(f"bounds: index out of range (len {n}) at {loc}\n")
         self.emit("    ud2")            # out-of-range -> SIGILL (clean trap)
         self.emit(f"{ok}:")
 
@@ -5513,12 +5586,19 @@ class X86CodeGen:
 
 
 def generate(program: Program, bare_metal: bool = False,
-             check_bounds: bool = False) -> str:
+             check_bounds: bool = False, host_userspace: bool = False,
+             file_unsafe: bool = False) -> str:
     """Generate x86_64 assembly from a Adder AST.
 
     `check_bounds` enables opt-in runtime array-bounds checking (userspace
     only; see docs/adder_memory_safety.md). Default False keeps the output
-    byte-identical to the historical compiler."""
+    byte-identical to the historical compiler.
+
+    `host_userspace` (x86_64-linux only) enables the descriptive stderr trap
+    message on the failing safety-check path. `file_unsafe` (set from the
+    `# adder: unsafe` file pragma) suppresses safety checks in every function.
+    Both are byte-inert unless used AND `check_bounds` is on."""
     return X86CodeGen(
-        bare_metal=bare_metal, check_bounds=check_bounds
+        bare_metal=bare_metal, check_bounds=check_bounds,
+        host_userspace=host_userspace, file_unsafe=file_unsafe
     ).gen_program(program)

@@ -149,6 +149,46 @@ spot is a **hybrid**:
    `!` layer instead.
 3. **Descriptive bounds/null trap** (`bounds: idx N of len M at file:line`) + **`@unsafe`
    / `unsafe def`** attribute + `# adder: unsafe` file pragma (small, already designed).
+
+   **STATUS (increment 3 — landed):** All three opt-in / byte-inert-off:
+   * **Descriptive trap.** On the FAILING path of a bounds check or a `!`
+     None/Err-unwrap under `--check-bounds`, the compiler now writes a
+     `bounds: index out of range (len M) at file:line\n` /
+     `unwrap of None/Err at file:line\n` diagnostic to fd 2 (stderr) via a raw
+     `write(2)` syscall, THEN traps with `ud2` (SIGILL, wait-status 132 — the
+     status is unchanged, so the existing bounds/null gates still pass). The
+     write is on the COLD, already-branched-away path, so the fast in-range path
+     is one `cmp` + a not-taken `jb` exactly as before, and it is byte-inert
+     when the flag is off. *Emitted ONLY for the host `x86_64-linux` ELF* (real
+     `.rodata` + Linux `write`, run directly on the host so stderr is
+     observable). The on-device `x86_64-adder-user` target and the kernel keep
+     the compact `ud2` (no message) — this is what preserves the seed<->native
+     objdiff byte-lockstep, since native's only userspace target IS adder-user.
+     The runtime *index value* N is NOT formatted into the message (it would
+     need an out-of-line int→dec routine); the compile-time bound M + the
+     file:line site carry the load-bearing "what/where".
+   * **`@unsafe` function attribute (chosen surface: the `@unsafe` decorator).**
+     A function decorated `@unsafe` suppresses the runtime safety checks in its
+     WHOLE body, via the same `unsafe_depth`/`cg_unsafe_depth` counter as the
+     `unsafe:` block (composes with nested `unsafe:`; works on free functions
+     and methods). Chosen over `unsafe def` because both backends already lex
+     `@` + parse a decorator ident chain onto the function node, so it is a pure
+     codegen wiring change with no lexer/parser ambiguity. Any decorator other
+     than `unsafe` is still rejected by the seed.
+   * **`# adder: unsafe` file pragma.** A whole-file comment pragma
+     (`^\s*#\s*adder:\s*unsafe\s*$`) marks every function in the TU unsafe. Seed
+     scans the main source in the driver; the native `.ad` driver scans the
+     merged source buffer. Byte-inert: no production `.ad` carries it.
+
+     *Both backends, byte-lockstep.* Seed: `codegen_x86.py`
+     (`_emit_trap_message`, `host_userspace`/`file_unsafe` state, `@unsafe`
+     whitelist + body wrap) + `adder.py` (`host_userspace` gate,
+     `_source_has_unsafe_pragma`). Native: `codegen.ad` (`cg_file_unsafe`,
+     `func_is_unsafe`, body wrap in `gen_function`/`gen_method`) +
+     `fused_driver_host_main.ad` (`drv_scan_unsafe_pragma`). objdiff CLEAN on
+     the OOB / unwrap / `@unsafe` / pragma fixtures WITH the flag; the descriptive
+     message is seed-only (host x86_64-linux), so it never enters the adder-user
+     lockstep. Gate: `scripts/test_adder_descriptive_trap.sh`.
 4. **`Slice[T]` fat pointers** — dynamic-buffer bounds checks; `Ptr[T]` stays the raw
    escape hatch.
 5. **`own T` move-only handles + `drop`** (Tier B) — the biggest Rust-like leap, as a

@@ -94,8 +94,18 @@ TARGETS = {
 DEFAULT_TARGET = "x86_64-bare-metal"
 
 
+def _source_has_unsafe_pragma(source: str) -> bool:
+    """True if `source` carries a whole-file `# adder: unsafe` pragma (roadmap
+    item 3) — a comment line (leading whitespace allowed) of the exact form
+    `# adder: unsafe`. Coarsest safety opt-out: marks every function in the
+    file unsafe. Parsed at the preprocessor level so it needs no new token."""
+    import re as _re
+    return bool(_re.search(r'(?m)^[ \t]*#[ \t]*adder:[ \t]*unsafe[ \t]*$',
+                           source or ""))
+
+
 def get_generator(target: str, opt_level: int = 0,
-                  check_bounds: bool = False):
+                  check_bounds: bool = False, file_unsafe: bool = False):
     """Return a callable program -> assembly string for the target.
 
     ``opt_level`` selects the optimization pipeline. ``0`` (default) is the
@@ -137,9 +147,18 @@ def get_generator(target: str, opt_level: int = 0,
             or target == "x86_64-adder-user"
         do_bounds = check_bounds and userspace_bounds
 
+        # Descriptive-trap stderr message (roadmap item 3) is emitted ONLY for
+        # the host Linux ELF (x86_64-linux, the sole x86 `userspace` target) —
+        # it has real .rodata sections + Linux write(2) and is run directly on
+        # the host so stderr is observable. adder-user/kernel keep the compact
+        # `ud2` trap, which is what preserves the seed<->native objdiff lockstep.
+        host_userspace = spec.get("userspace", False)
+
         def _gen_x86(program):
             asm = generate_x86(program, bare_metal=no_modinfo,
-                               check_bounds=do_bounds)
+                               check_bounds=do_bounds,
+                               host_userspace=host_userspace,
+                               file_unsafe=file_unsafe)
             if opt_level >= 1:
                 asm = peephole_x86(asm)
             if opt_level >= 2:
@@ -562,7 +581,8 @@ def compile_source(source: str, filename: str = "<stdin>",
                    target: str = DEFAULT_TARGET, opt_level: int = 0,
                    check_bounds: bool = False) -> str:
     """Compile Adder source to assembly (single file, no imports)."""
-    generate = get_generator(target, opt_level, check_bounds)
+    generate = get_generator(target, opt_level, check_bounds,
+                             file_unsafe=_source_has_unsafe_pragma(source))
     try:
         program = parse(source, filename)
         return generate(program)
@@ -574,7 +594,11 @@ def compile_source(source: str, filename: str = "<stdin>",
 def compile_with_imports(main_file: Path, target: str = DEFAULT_TARGET,
                          opt_level: int = 0, check_bounds: bool = False) -> str:
     """Compile Adder source with import resolution."""
-    generate = get_generator(target, opt_level, check_bounds)
+    # The `# adder: unsafe` pragma is scoped to the MAIN file (a whole-file
+    # opt-out for a hot/low-level TU), scanned before import merge.
+    generate = get_generator(
+        target, opt_level, check_bounds,
+        file_unsafe=_source_has_unsafe_pragma(main_file.read_text()))
     project_root = find_hamnix_root()
 
     # Collect all imported files
