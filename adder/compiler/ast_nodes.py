@@ -103,6 +103,25 @@ class ArrayType:
 
 
 @dataclass
+class SliceType:
+    """Fat-pointer slice: Slice[T] = {ptr: Ptr[T] @0, len: uint64 @8}.
+
+    A 16-byte by-reference aggregate — the base pointer plus a RUNTIME
+    length — so a dynamically-sized buffer carries its length with it and
+    `slice[i]` can be bounds-checked at runtime (unlike `Ptr[T]`, which
+    stays the raw, length-free escape hatch). Same ABI class as a struct:
+    it decays to its address and crosses function boundaries only via
+    `Ptr[Slice[T]]` (Adder has no by-value aggregate ABI). See
+    docs/adder_memory_safety.md."""
+    element_type: Type
+    span: Optional[Span] = None
+
+    @property
+    def name(self) -> str:
+        return f"Slice[{self.element_type.name}]"
+
+
+@dataclass
 class PercpuType:
     """Per-CPU storage: Percpu[T].
 
@@ -367,6 +386,19 @@ class UnwrapExpr:
 
 
 @dataclass
+class SliceNewExpr:
+    """Slice construction: `Slice[T](arr)` or `Slice[T](ptr, len)`.
+
+    One argument = build from a fixed `Array[N, T]` (base = &arr[0],
+    len = N, a compile-time constant). Two arguments = an explicit
+    `(ptr, len)` pair. Evaluates to the address of a freshly materialised
+    16-byte `{ptr, len}` aggregate (the by-reference Slice value)."""
+    element_type: Type
+    args: list['Expr'] = field(default_factory=list)
+    span: Optional[Span] = None
+
+
+@dataclass
 class StructInitExpr:
     """Struct initialization: Point{x=10, y=20}"""
     struct_name: str
@@ -461,7 +493,7 @@ Expr = (IntLiteral | FloatLiteral | StringLiteral | FStringLiteral |
         IndexExpr | SliceExpr | MemberExpr | ListLiteral |
         DictLiteral | TupleLiteral | ListComprehension | ConditionalExpr |
         LambdaExpr | SizeOfExpr | CastExpr | AsmExpr | ContainerOfExpr |
-        WalrusExpr | TryExpr | UnwrapExpr)
+        WalrusExpr | TryExpr | UnwrapExpr | SliceNewExpr)
 
 
 # Statements

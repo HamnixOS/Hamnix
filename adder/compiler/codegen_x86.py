@@ -49,6 +49,7 @@ from .ast_nodes import (
     IndexExpr, MemberExpr, CastExpr, ContainerOfExpr,
     ConditionalExpr, WalrusExpr, SizeOfExpr,
     Type, PointerType, ArrayType, FunctionPointerType, PercpuType,
+    SliceType, SliceNewExpr,
     ListType, DictType, TupleType, OptionalType,
     MatchStmt, MatchArm, Pattern, LiteralPattern, WildcardPattern,
     NamePattern, OrPattern, SequencePattern,
@@ -463,6 +464,9 @@ class X86CodeGen:
             return 8
         if isinstance(t, ArrayType):
             return t.size * self.get_type_size(t.element_type)
+        if isinstance(t, SliceType):
+            # {ptr @0, len @8} — a two-word by-reference aggregate.
+            return 16
         if isinstance(t, (PointerType, FunctionPointerType)):
             return 8
         if isinstance(t, PercpuType):
@@ -539,8 +543,12 @@ class X86CodeGen:
             if isinstance(t, PercpuType):
                 return t.base_type
             return t
+        if isinstance(expr, SliceNewExpr):
+            return SliceType(expr.element_type)
         if isinstance(expr, IndexExpr):
             obj_type = self.get_expr_type(expr.obj)
+            if isinstance(obj_type, SliceType):
+                return obj_type.element_type
             if isinstance(obj_type, ArrayType):
                 return obj_type.element_type
             if isinstance(obj_type, PointerType):
@@ -548,6 +556,13 @@ class X86CodeGen:
             return None
         if isinstance(expr, MemberExpr):
             obj_type = self.get_expr_type(expr.obj)
+            if isinstance(obj_type, SliceType):
+                # `.ptr` -> Ptr[T]; `.len` -> uint64.
+                if expr.member == "ptr":
+                    return PointerType(obj_type.element_type)
+                if expr.member == "len":
+                    return Type("uint64")
+                return None
             if obj_type is not None and hasattr(obj_type, "name") \
                     and obj_type.name in self.structs:
                 for fname, ftype, _ in self.structs[obj_type.name].fields:
@@ -589,6 +604,8 @@ class X86CodeGen:
     def element_size_of(self, container: Expr) -> int:
         """Element size for indexing / deref. Defaults to 8 if unknown."""
         t = self.get_expr_type(container)
+        if isinstance(t, SliceType):
+            return self.get_type_size(t.element_type)
         if isinstance(t, ArrayType):
             return self.get_type_size(t.element_type)
         if isinstance(t, PointerType):
@@ -1879,6 +1896,15 @@ class X86CodeGen:
         # unaffected. Skip the first param when this is a synthesised
         # method body (its receiver is always a Ptr and already typed so).
         for param in func.params:
+            if isinstance(param.param_type, SliceType):
+                span = getattr(param, "span", None) or getattr(func, "span", None)
+                raise CodeGenError(
+                    f"x86: by-value Slice parameter '{param.name}: "
+                    f"{param.param_type.name}' in '{func.name}' is not "
+                    f"supported at {_span_location(span)}; pass "
+                    f"`Ptr[{param.param_type.name}]` — Adder has no by-value "
+                    f"aggregate ABI (a Slice is a 16-byte {{ptr,len}} value)"
+                )
             if self._is_byvalue_struct_type(param.param_type):
                 span = getattr(param, "span", None) or getattr(func, "span", None)
                 raise CodeGenError(
@@ -1888,6 +1914,14 @@ class X86CodeGen:
                     f"`Ptr[{param.param_type.name}]` (the caller takes "
                     f"`&obj`) — Adder has no by-value aggregate ABI"
                 )
+        if isinstance(func.return_type, SliceType):
+            span = getattr(func, "span", None)
+            raise CodeGenError(
+                f"x86: by-value Slice return `-> {func.return_type.name}` in "
+                f"'{func.name}' is not supported at {_span_location(span)}; "
+                f"return through a `Ptr[{func.return_type.name}]` "
+                f"out-parameter — Adder has no by-value aggregate ABI"
+            )
         if self._is_byvalue_struct_type(func.return_type):
             span = getattr(func, "span", None)
             raise CodeGenError(
@@ -2113,6 +2147,12 @@ class X86CodeGen:
                     name, self.get_type_size(var_type), var_type
                 )
                 if value is not None:
+                    # Slice construction: `s: Slice[T] = Slice[T](...)` writes
+                    # the {ptr,len} pair straight into the local's 16-byte slot
+                    # (a Slice has no register value — it is a by-ref aggregate).
+                    if isinstance(value, SliceNewExpr):
+                        self._emit_slice_new_into(var.offset, value)
+                        return
                     # Constructor sugar: `f: Foo = Foo(args)` lowers to
                     # Foo__init(&f, args) — Adder doesn't have struct
                     # return values, so we can't go through the normal
@@ -2136,6 +2176,15 @@ class X86CodeGen:
                         self._emit_local_store(var, "%rax")
 
             case Assignment(target=target, value=value, op=op):
+                # Slice re-assignment: `s = Slice[T](...)` rewrites the
+                # local's 16-byte {ptr,len} cell in place.
+                if op is None and isinstance(value, SliceNewExpr) \
+                        and isinstance(target, Identifier) \
+                        and self.ctx is not None \
+                        and target.name in self.ctx.locals:
+                    self._emit_slice_new_into(
+                        self.ctx.locals[target.name].offset, value)
+                    return
                 # Constructor sugar: `f = Foo(args)` where Foo is a
                 # class with __init__ lowers to Foo__init(&f, args).
                 if op is None and isinstance(target, Identifier):
@@ -3542,6 +3591,9 @@ class X86CodeGen:
             case UnaryExpr(op=op, operand=operand):
                 self.gen_unary(op, operand)
 
+            case SliceNewExpr():
+                self.gen_slice_new(expr)
+
             case IndexExpr():
                 self.gen_index_load(expr)
 
@@ -3674,12 +3726,12 @@ class X86CodeGen:
             var = self.ctx.locals[name]
             t = var.var_type
             is_aggregate = (
-                isinstance(t, ArrayType)
+                isinstance(t, (ArrayType, SliceType))
                 or (t is not None and hasattr(t, "name")
                     and t.name in self.structs)
             )
             if is_aggregate:
-                # Array / struct local: decay to the slot's address.
+                # Array / struct / slice local: decay to the slot's address.
                 self.emit(f"    leaq {var.offset}(%rbp), %rax")
             else:
                 # Sized load for sub-8-byte scalar locals (sign- or
@@ -4797,8 +4849,104 @@ class X86CodeGen:
         self.emit("    ud2")            # out-of-range -> SIGILL (clean trap)
         self.emit(f"{ok}:")
 
+    def _emit_slice_new_into(self, dest_offset: int, snew: SliceNewExpr) -> None:
+        """Materialise a `Slice[T]` {ptr,len} pair into the 16-byte stack
+        cell at `dest_offset(%rbp)`."""
+        if len(snew.args) == 1:
+            # From an Array[N, T]: ptr = &arr[0], len = N (compile-time).
+            arr = snew.args[0]
+            arr_t = self.get_expr_type(arr)
+            if not isinstance(arr_t, ArrayType):
+                raise CodeGenError(
+                    "x86: Slice[T](x) single-argument construction requires "
+                    f"an Array[N, T] source at "
+                    f"{_span_location(getattr(snew, 'span', None))}"
+                )
+            self.gen_addr_of(arr)
+            self.emit(f"    movq %rax, {dest_offset}(%rbp)")
+            self.emit(f"    movq ${arr_t.size}, %rax")
+            self.emit(f"    movq %rax, {dest_offset + 8}(%rbp)")
+        elif len(snew.args) == 2:
+            # Explicit (ptr, len).
+            self.gen_expr(snew.args[0])
+            self.emit(f"    movq %rax, {dest_offset}(%rbp)")
+            self.gen_expr(snew.args[1])
+            self.emit(f"    movq %rax, {dest_offset + 8}(%rbp)")
+        else:
+            raise CodeGenError(
+                "x86: Slice[T](...) takes 1 (Array) or 2 (ptr, len) "
+                f"arguments, got {len(snew.args)} at "
+                f"{_span_location(getattr(snew, 'span', None))}"
+            )
+
+    def gen_slice_new(self, snew: SliceNewExpr) -> None:
+        """Evaluate `Slice[T](...)` in a general expression context —
+        materialise an anonymous 16-byte {ptr,len} temp and leave ITS
+        ADDRESS in %rax (a Slice decays to its address, like a struct)."""
+        label_id = self.ctx.new_label("slice").rsplit("_", 1)[-1]
+        tmp = self.ctx.alloc_local(
+            f"__slice_{label_id}", 16, SliceType(snew.element_type))
+        self._emit_slice_new_into(tmp.offset, snew)
+        self.emit(f"    leaq {tmp.offset}(%rbp), %rax")
+
+    def _maybe_emit_slice_bounds_check(self, expr: IndexExpr) -> None:
+        """Runtime bounds check for a `Slice[T]` index: trap unless
+        idx < slice.len (a RUNTIME value loaded from the fat pointer).
+
+        Precondition: the index VALUE is live in %rax. Preserves %rax on the
+        in-range path (the caller spills it next). No-op — zero bytes — unless
+        `--check-bounds` is active and we are outside any `unsafe:` block, so
+        it is byte-inert when off and never emitted for the kernel."""
+        if not self.check_bounds or self.unsafe_depth > 0:
+            return
+        ok = self.ctx.new_label("bcheck_ok")
+        self.emit("    pushq %rax")             # save index
+        self.gen_expr(expr.obj)                 # %rax = &{ptr,len}
+        self.emit("    movq 8(%rax), %rcx")     # %rcx = len (runtime)
+        self.emit("    popq %rax")              # restore index
+        self.emit("    cmpq %rcx, %rax")        # idx (unsigned) vs len
+        self.emit(f"    jb {ok}")               # 0 <= idx < len -> in range
+        span = (getattr(expr, "span", None)
+                or getattr(expr.obj, "span", None)
+                or getattr(expr.index, "span", None))
+        loc = _span_location(span)
+        self._emit_trap_message(
+            f"bounds: slice index out of range at {loc}\n")
+        self.emit("    ud2")                    # out of range -> SIGILL
+        self.emit(f"{ok}:")
+
+    def gen_slice_index_address(self, expr: IndexExpr,
+                                slice_type: SliceType) -> None:
+        """Compute &slice[i] into %rax: load the base pointer from the fat
+        pointer's ptr field and add the scaled index (opt-in bounds-checked
+        against the len field first)."""
+        self.gen_expr(expr.index)               # %rax = index
+        self._maybe_emit_slice_bounds_check(expr)
+        self.emit("    pushq %rax")             # save index
+        self.gen_expr(expr.obj)                 # %rax = &{ptr,len}
+        self.emit("    movq (%rax), %rax")      # %rax = base ptr (field 0)
+        self.emit("    popq %rcx")              # %rcx = index
+        elem_size = self.get_type_size(slice_type.element_type)
+        if elem_size == 1:
+            pass
+        elif elem_size == 2:
+            self.emit("    shlq $1, %rcx")
+        elif elem_size == 4:
+            self.emit("    shlq $2, %rcx")
+        elif elem_size == 8:
+            self.emit("    shlq $3, %rcx")
+        else:
+            self.emit(f"    imulq ${elem_size}, %rcx, %rcx")
+        self.emit("    addq %rcx, %rax")
+
     def gen_index_address(self, expr: IndexExpr) -> None:
         """Compute the address of `expr` (an IndexExpr) into %rax."""
+        # Fat-pointer slice base: load the pointer field + bounds-check
+        # against the runtime len (docs/adder_memory_safety.md item 4).
+        obj_type_pre = self.get_expr_type(expr.obj)
+        if isinstance(obj_type_pre, SliceType):
+            self.gen_slice_index_address(expr, obj_type_pre)
+            return
         # Evaluate index, push, compute base address (NOT value), pop index.
         #
         # For obj typed Array[N, T], we want the BASE ADDRESS — `gen_expr`
@@ -5029,6 +5177,20 @@ class X86CodeGen:
         # Special-case Percpu[Struct] field load: emit a `%gs:`-prefixed
         # load directly. The default path leaqs the flat-address copy
         # of the symbol and loses the per-CPU base.
+        # Fat-pointer slice member: `.ptr` (field @0) / `.len` (field @8).
+        obj_type = self.get_expr_type(expr.obj)
+        if isinstance(obj_type, SliceType):
+            self.gen_expr(expr.obj)             # %rax = &{ptr,len}
+            if expr.member == "ptr":
+                self.emit("    movq (%rax), %rax")
+            elif expr.member == "len":
+                self.emit("    movq 8(%rax), %rax")
+            else:
+                raise CodeGenError(
+                    f"x86: Slice[T] has no member '{expr.member}' "
+                    f"(only .ptr and .len)"
+                )
+            return
         info = self._percpu_aggregate_info(expr.obj)
         if info is not None:
             name, base_offset, base_type = info
@@ -5199,6 +5361,15 @@ class X86CodeGen:
         # function pointers in locals, globals, struct fields and arrays
         # all compose for free. Indirect calls emit `call *%r11`.
         name = call.func.name if isinstance(call.func, Identifier) else None
+
+        # `len(slice)` sugar -> the fat pointer's runtime len field. Only
+        # intercepted when the single argument is statically a Slice[T], so
+        # code that has no slices is byte-identical (and a user function
+        # literally named `len` over non-slice args is unaffected).
+        if name == "len" and len(call.args) == 1 \
+                and isinstance(self.get_expr_type(call.args[0]), SliceType):
+            self.gen_member_load(MemberExpr(call.args[0], "len"))
+            return
 
         # Intrinsics short-circuit before the standard ABI shuffle — they
         # need operands in specific registers (AL/DX) rather than the

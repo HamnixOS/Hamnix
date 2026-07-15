@@ -226,6 +226,13 @@ class Parser:
                     inner = self.parse_type()
                     self.expect(TokenType.RBRACKET)
                     return PercpuType(inner, self.make_span(tok))
+                # Fat-pointer slice: Slice[T] — a {ptr, len} aggregate.
+                # Recognised by NAME here (not a dedicated token) so no new
+                # keyword perturbs the lexer / collides with identifiers.
+                if name == "Slice":
+                    inner = self.parse_type()
+                    self.expect(TokenType.RBRACKET)
+                    return SliceType(inner, self.make_span(tok))
                 # For now, just parse as string
                 type_args = [self.parse_type()]
                 while self.match(TokenType.COMMA):
@@ -575,6 +582,20 @@ class Parser:
                 target_type = self.parse_type()
                 self.expect(TokenType.RPAREN)
                 return SizeOfExpr(target_type, self.make_span(tok))
+            # Slice construction: Slice[T](arr) or Slice[T](ptr, len).
+            # Mirrors the Ptr[T](value) constructor form.
+            if name == "Slice" and self.check(TokenType.LBRACKET):
+                self.expect(TokenType.LBRACKET)
+                elem_type = self.parse_type()
+                self.expect(TokenType.RBRACKET)
+                self.expect(TokenType.LPAREN)
+                args = []
+                if not self.check(TokenType.RPAREN):
+                    args.append(self.parse_expression())
+                    while self.match(TokenType.COMMA):
+                        args.append(self.parse_expression())
+                self.expect(TokenType.RPAREN)
+                return SliceNewExpr(elem_type, args, self.make_span(tok))
             # Check for type cast: int32(x)
             if name in ("int8", "int16", "int32", "int64", "uint8", "uint16",
                         "uint32", "uint64", "float32", "float64", "bool", "char"):
