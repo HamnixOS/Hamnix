@@ -377,10 +377,16 @@ spot is a **hybrid**:
    invariant-honoring foundational type; an owning `String` awaits a real
    userland allocator (a std-lib increment, not a compiler one).
 
-   *Deferred (honest):* (a) **native `String` backend** — this increment is
+   *Deferred (honest):* (a) **native `String` backend** — ~~this increment is
    SEED-first (like increment 1 was); `codegen.ad` REJECTS a `String`-typed
    source with a clean codegen error (no ELF, no miscompile), pending the
-   native port of the construction/member emission. (b) **method-call sugar**
+   native port of the construction/member emission.~~ **LANDED (increment 11,
+   below):** the native parser now recognises `String` as an `ND_SLICE_TYPE`
+   whose element is `uint8` — structurally identical to `Slice[uint8]`, so the
+   #308 by-value aggregate ABI and `.ptr`/`.len` decay apply unchanged and
+   byte-identically; `String("lit")` reuses `ND_SLICE_NEW` with the interned
+   string-literal arg. `aggret_string`/`aggparam_string` are now
+   native-accepted + objdiff-CLEAN. (b) **method-call sugar**
    (`s.eq(t)` / `s.find(t)`) over the free-function form — desugaring
    aggregate-receiver method calls in both byte-lockstep backends is a
    follow-up; the free functions ship the capability today. (c) `.upper()`/
@@ -547,6 +553,35 @@ spot is a **hybrid**:
       native. Gates `scripts/test_adder_aggret.sh` /
       `scripts/test_adder_aggparam.sh` now assert native **accept + per-function
       objdiff byte-match** (keeping the `> 16`/float/split native-reject arms).
+
+11. **Native `String` type annotation (completes the String story from 7-tail).**
+
+    **STATUS (increment 11 — landed):** The last named gap from #299/#308 — the
+    native parser had no `String` annotation, so a `String`-typed source was
+    seed-only. `parser.ad`/`codegen.ad` now recognise and emit `String`
+    **byte-identically to the seed**, closing the loop.
+    * **Representation — String IS Slice[uint8]-shaped:** `String` is a 16-byte
+      `{ptr@0, len@8}` aggregate structurally identical to `Slice[uint8]` (same
+      layout, same INTEGER ABI class). The native backend needs NO dedicated node
+      kind: the parser lowers the `String` type annotation to an `ND_SLICE_TYPE`
+      whose element type is `uint8`, so the **entire** #308 by-value aggregate
+      return/param ABI and the `.ptr`/`.len` decay apply unchanged and
+      byte-identically — zero new codegen dispatch site for the type.
+    * **Construction:** `String("literal")` (and `String(ptr, len)`) lower to
+      `ND_SLICE_NEW` with a synthesized `uint8` element and the raw args. In
+      `emit_slice_new_into`, the single-arg form detects an `ND_STRING_LIT` arg
+      and takes the intern + RIP-relative-`leaq` + compile-time-byte-length path
+      (byte-identical to the seed's `_emit_string_new_into`); the interning is
+      the same code that already backs `ND_STRING_LIT`. `.cstr` reads field `@0`
+      (same bytes as `.ptr`).
+    * **Byte-lockstep proof:** `tests/aggret/aggret_string.ad` +
+      `tests/aggparam/aggparam_string.ad` are now native-ACCEPTED and
+      objdiff-CLEAN; the whole `x86_64-adder-user` corpus stays `0`-diverged
+      (only the compiler-source-embedding units move). Byte-inert on every
+      String-free unit (no unit in `user/`/`lib/`/`sys/` uses the `String`
+      aggregate — verified by grep). Kernel opt-out intact + links native. Gates
+      `scripts/test_adder_aggret.sh` / `scripts/test_adder_aggparam.sh` flip the
+      `String` arms from seed-only to native accept + per-function objdiff match.
 
 Each increment: opt-in or byte-inert-off, kernel-bypassable, seed+native lockstep,
 verified by objdiff + differential fuzzer + `test_native_kernel_links` +
