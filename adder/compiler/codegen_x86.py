@@ -5367,11 +5367,20 @@ class X86CodeGen:
         """
         fname = call.func.name if isinstance(call.func, Identifier) else None
         params = self.func_params.get(fname) if fname is not None else None
-        # Fast path: no kwargs and either an unknown callee (indirect /
-        # extern) or already-sufficient positional arity -> unchanged.
-        if not call.kwargs and (params is None
-                                or len(call.args) >= len(params)):
-            return call.args
+        # Fast path (BYTE-INERT): no kwargs and either an unknown callee
+        # (indirect / extern) or already-sufficient positional arity ->
+        # unchanged. A call that under-supplies positional args whose
+        # missing slots have NO default is left EXACTLY as-is (legacy
+        # marshalling) — we only ever ADD default-fill / kwarg binding, we
+        # never newly reject an existing positional call shape.
+        if not call.kwargs:
+            if params is None or len(call.args) >= len(params):
+                return call.args
+            # under-supply: only normalize if every missing trailing slot
+            # actually has a default to fill.
+            for i in range(len(call.args), len(params)):
+                if params[i].default is None:
+                    return call.args
         if params is None:
             # kwargs against an unresolvable callee (indirect / extern):
             # we have no parameter names to bind them to.
