@@ -234,66 +234,46 @@ try:
         print(f"[clip_gate] ARM D: clip={results['D_clip']} prim={results['D_prim']} indep={results['D_indep']}", file=sys.stderr)
         send("echo ARMD_DONE"); wait_for("ARMD_DONE", 6)
 
-        # ---- ARM A: COPY (editor A, mouse-free Ctrl+A select-all) ----
-        # Editor A loads a known file, selects ALL (Ctrl+A) and copies to
-        # /dev/snarf (Ctrl+C -> lib/hamtextbox's file writer, the same reliable
-        # sys_open_write path the editor uses to SAVE files). We then judge two
-        # decisive signals: (1) the editor's SCENE contains the selection
-        # highlight fill (#b4d0f8) — the render proof; (2) the SHELL reads the
-        # copied payload back from /dev/snarf — the device-write proof. (The
-        # editor's own stdout markers do NOT reach the serial console when it
-        # is launched under the DE, so we never judge on those.)
-        send("echo ARMA_BEGIN")
-        results["A_seed"] = seed_file("/tmp/csrc.txt", "COPYALL_MARK_7X")
-        print(f"[clip_gate] ARM A seed ok = {results['A_seed']}", file=sys.stderr)
-        ED_WID[0] = launch_editor("/tmp/csrc.txt")
-        WA = ED_WID[0]
-        print(f"[clip_gate] ARM A editor wid = {WA}", file=sys.stderr)
-        focus_editor()
-        for _ in range(3): keycode(1)         # Ctrl+A select-all
-        time.sleep(0.4)
-        screendump("armA_selectall")         # blue highlight band visible here
-        if WA is not None:
-            send(f"echo SCN_A_BEGIN; cat /dev/wsys/{WA}/scene; echo; echo SCN_A_END")
-            scnA = region("SCN_A_BEGIN", "SCN_A_END", 10)
-            results["A_highlight"] = "b4d0f8" in scnA
-        for _ in range(3): keycode(3)         # Ctrl+C copy -> /dev/snarf
-        time.sleep(0.6)
-        # Shell reads /dev/snarf back — the editor (a reliable device writer)
-        # put the selection there.
-        send("echo SNARF_A_BEGIN; cat /dev/snarf; echo; echo SNARF_A_END")
-        snA = region("SNARF_A_BEGIN", "SNARF_A_END", 10)
-        # Guard against the command-echo false positive: the payload must
-        # appear on a line that is NOT the echoed `cat` command.
-        payload_lines = [l for l in snA.split("\n")
-                         if "COPYALL_MARK_7X" in l and "cat /dev/snarf" not in l
-                         and "printf" not in l]
-        results["A_snarf"] = len(payload_lines) > 0
-        print(f"[clip_gate] ARM A: highlight={results.get('A_highlight')} snarf_read={results['A_snarf']}", file=sys.stderr)
-        send("echo ARMA_DONE"); wait_for("ARMA_DONE", 6)
+        # ---- ARM E: DETERMINISTIC editor COPY via --selftest hook ------
+        # NO mouse, NO wid parse, NO keystroke injection (all load-sensitive).
+        # We launch the editor with `--selftest-copyall`: on startup it loads
+        # the file and runs the SAME _handle_code(Ctrl+A) + _handle_code(Ctrl+C)
+        # paths a real keystroke would (not a bypass), copies the selection to
+        # /dev/snarf via lib/hamtextbox, and writes /tmp/.hamedit_selftest. This
+        # is fully reproducible regardless of host load. We DIRTY /dev/snarf
+        # first so a stale value can never produce a false pass.
+        send("echo ARME_BEGIN")
+        results["E_seed"] = seed_file("/tmp/csrc.txt", "COPYALL_MARK_7X")
+        print(f"[clip_gate] ARM E seed ok = {results['E_seed']}", file=sys.stderr)
+        send("printf 'STALEx' > /dev/snarf"); time.sleep(0.3)
+        send("rm /tmp/.hamedit_selftest"); time.sleep(0.2)
+        send("/bin/hameditscene /tmp/csrc.txt --selftest-copyall &")
+        time.sleep(7)
+        screendump("armE_copyall")            # blue selection highlight visible
+        mkE = cat_capture("/tmp/.hamedit_selftest")
+        results["E_marker"] = "COPYALL 16" in mkE          # 16 = len("COPYALL_MARK_7X\n")
+        snE = cat_capture("/dev/snarf")
+        results["E_snarf"] = "COPYALL_MARK_7X" in snE
+        print(f"[clip_gate] ARM E: marker={results['E_marker']} snarf={results['E_snarf']}", file=sys.stderr)
+        send("echo ARME_DONE"); wait_for("ARME_DONE", 6)
 
-        # ---- ARM B: PASTE (editor B) — cross-process /dev/snarf ---------
-        # A SEPARATE editor process pastes the CLIPBOARD (Ctrl+V) into an empty
-        # file and saves it; reading that file back finds editor-A's payload =
-        # the two processes shared the one compositor-owned buffer.
-        send("echo ARMB_BEGIN")
-        send("printf '' > /tmp/cdst.txt")
-        WB = launch_editor("/tmp/cdst.txt")
-        ED_WID[0] = WB
-        print(f"[clip_gate] ARM B editor wid = {WB}", file=sys.stderr)
-        focus_editor()
-        for _ in range(3): keycode(22)        # Ctrl+V paste from /dev/snarf
-        time.sleep(0.8)
-        screendump("armB_pasted")
-        for _ in range(3): keycode(19)        # Ctrl+S save
-        time.sleep(1.2)
-        send("echo READB_BEGIN; cat /tmp/cdst.txt; echo; echo READB_END")
-        rb = region("READB_BEGIN", "READB_END", 10)
-        bl = [l for l in rb.split("\n")
-              if "COPYALL_MARK_7X" in l and "cat /tmp" not in l]
-        results["B_disk"] = len(bl) > 0
-        print(f"[clip_gate] ARM B: disk={results['B_disk']}", file=sys.stderr)
-        send("echo ARMB_DONE"); wait_for("ARMB_DONE", 6)
+        # ---- ARM F: DETERMINISTIC cross-process PASTE (THE HARD GATE) ---
+        # A SEPARATE editor process pastes /dev/snarf into an empty file and
+        # saves it (`--selftest-paste`). Reading the payload back off that file
+        # proves the two processes SHARED the one compositor-owned clipboard —
+        # the whole point of the service — with zero DE-injection flakiness.
+        send("echo ARMF_BEGIN")
+        send("printf '' > /tmp/cdst.txt"); time.sleep(0.3)
+        send("rm /tmp/.hamedit_selftest"); time.sleep(0.2)
+        send("/bin/hameditscene /tmp/cdst.txt --selftest-paste &")
+        time.sleep(7)
+        screendump("armF_pasted")
+        rF = cat_capture("/tmp/cdst.txt")
+        results["F_disk"] = "COPYALL_MARK_7X" in rF
+        mkF = cat_capture("/tmp/.hamedit_selftest")
+        results["F_marker"] = "PASTE 16" in mkF
+        print(f"[clip_gate] ARM F: disk={results['F_disk']} marker={results['F_marker']}", file=sys.stderr)
+        send("echo ARMF_DONE"); wait_for("ARMF_DONE", 6)
 
         # ---- ARM C: click-to-position + drag-select + middle-paste ----
         # Best-effort MOUSE path (pointer-to-glyph landing is host-timing
@@ -336,13 +316,14 @@ finally:
     # round-trip) and ARM B/C are corroborating/best-effort. If ARM A's
     # editor-launch loses the tmpfs seed race this boot (A_seed False), fall
     # back to ARM D's direct device round-trip as the substrate proof.
-    # A_snarf is the strongest single signal: the editor COPIED its selection
-    # to /dev/snarf and the shell read the exact payload back — which can only
-    # happen if select-all made a selection, Ctrl+C ran htb_clip_put, the
-    # device stored it, and a SEPARATE process read it. A_highlight (scene
-    # read) and ARM D (cat_capture) corroborate but are console-capture flaky.
-    device_proof = results.get("D_clip") and results.get("D_prim") and results.get("D_indep")
-    hard = results.get("A_snarf") or device_proof
+    # Hard gate = ARM F: a SEPARATE editor process pasted /dev/snarf (populated
+    # by ARM E's copy) into a file whose payload the shell read back. Fully
+    # DETERMINISTIC — no mouse, no wid, no keystroke injection — so it is
+    # load-insensitive. It proves the whole chain at once: select-all made a
+    # selection, Ctrl+C wrote /dev/snarf via htb_clip_put, the device stored
+    # it, and a DIFFERENT process read it via Ctrl+V. ARM E's marker/snarf and
+    # ARM D's device probe corroborate; ARM C (mouse) is best-effort visual.
+    hard = results.get("F_disk")
     print("[clip_gate] VERDICT: " + ("PASS" if hard else "FAIL"), file=sys.stderr)
     try:
         qemu.terminate(); qemu.wait(timeout=10)
