@@ -63,7 +63,9 @@ assert_grep '^TAIL 3'                               "tail button returns ACT_LOG
 assert_grep '^SCROLL3 42'                           "tail snapped to the newest page (42)"
 # tailed page: the newest line (#59) is now on screen.
 assert_grep 'glyphs .*subsystem init line #59'      "newest line visible after tail"
-assert_grep '^PIX 4 4 #3584e4'                      "raster title-bar pixel = blue"
+# Modern cohesive headerbar: a cool-blue vertical gradient (was a flat
+# #3584e4). Scanline 4 of the azure gradient rasterizes to #618ac5.
+assert_grep '^PIX 4 4 #618ac5'                      "raster headerbar pixel = cool-blue gradient"
 
 if [ "$fail" -ne 0 ]; then echo "[log-host] OVERALL FAIL"; exit 1; fi
 echo "[log-host] OVERALL PASS"
