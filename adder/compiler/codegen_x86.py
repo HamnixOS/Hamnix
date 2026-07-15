@@ -52,7 +52,7 @@ from .ast_nodes import (
     ListType, DictType, TupleType, OptionalType,
     MatchStmt, MatchArm, Pattern, LiteralPattern, WildcardPattern,
     NamePattern, OrPattern, SequencePattern,
-    EnumDef, EnumVariant, TryExpr,
+    EnumDef, EnumVariant, TryExpr, UnwrapExpr,
 )
 
 
@@ -453,6 +453,12 @@ class X86CodeGen:
             return Type(ctor[0].name)
         if isinstance(expr, TryExpr):
             # `operand?` evaluates to the success variant's unwrapped payload.
+            ei = self._lookup_enum_type(self.get_expr_type(expr.expr))
+            if ei is not None and ei.variants and ei.variants[0].field_types:
+                return ei.variants[0].field_types[0]
+            return None
+        if isinstance(expr, UnwrapExpr):
+            # `operand!` also evaluates to the success variant's payload.
             ei = self._lookup_enum_type(self.get_expr_type(expr.expr))
             if ei is not None and ei.variants and ei.variants[0].field_types:
                 return ei.variants[0].field_types[0]
@@ -2454,6 +2460,55 @@ class X86CodeGen:
         else:
             self.gen_expr(tmp)
 
+    def _gen_unwrap(self, expr: 'UnwrapExpr') -> None:
+        """Lower `operand!` (force-unwrap) to a payload extraction, leaving the
+        success variant's payload in %rax.
+
+        Null-safety mirror of the array-bounds check: when the opt-in userspace
+        safety flag (`self.check_bounds`) is on AND we are outside an `unsafe:`
+        block, a non-success value (None / Err) traps cleanly with `ud2`
+        (SIGILL) instead of silently yielding garbage payload bits. With the
+        flag off — and ALWAYS on a bare-metal/kernel target, where the driver
+        never sets the flag — no check is emitted and this is a zero-cost
+        payload extraction that assumes success, so it is byte-inert when the
+        program uses no `!` and kernel-friendly."""
+        operand = expr.expr
+        ei = self._lookup_enum_type(self.get_expr_type(operand))
+        if ei is None or not ei.is_try:
+            raise CodeGenError(
+                "x86: `!` force-unwrap operates on a Result/Option value only "
+                f"at {_span_location(getattr(expr, 'span', None))}"
+            )
+        span = getattr(expr, "span", None)
+        success = ei.variants[0]     # Some / Ok
+        # Materialise the operand once into an int64 temp (payload extraction
+        # references the word, and so does the optional tag check).
+        label_id = self.ctx.new_label("unwrap").rsplit("_", 1)[-1]
+        tmp_name = f"__unwrap_{label_id}"
+        var = self.ctx.alloc_local(tmp_name, 8, Type("int64", span))
+        self.gen_expr(operand)
+        self._emit_local_store(var, "%rax")
+        tmp = Identifier(tmp_name, span)
+        # Opt-in None/Err trap: if (word & TAGMASK) != success_tag -> ud2.
+        # A single equality compare on the masked tag; `je` skips the trap on
+        # the success variant. cmp/je/ud2 encode byte-identically to the native
+        # backend (48 83 F8 ib / 74 02 / 0F 0B). Byte-inert when off.
+        if self.check_bounds and self.unsafe_depth == 0:
+            tag_expr = BinaryExpr(BinOp.BIT_AND, tmp,
+                                  IntLiteral((1 << ENUM_TAG_BITS) - 1, span),
+                                  span)
+            self.gen_expr(tag_expr)          # masked tag -> %rax
+            ok = self.ctx.new_label("unwrap_ok")
+            self.emit(f"    cmpq ${success.tag}, %rax")
+            self.emit(f"    je {ok}")
+            self.emit("    ud2")             # None/Err -> SIGILL (clean trap)
+            self.emit(f"{ok}:")
+        # Success: evaluate the unwrapped payload into %rax.
+        if success.field_types:
+            self.gen_expr(self._enum_extract_expr(success, 0, tmp, span))
+        else:
+            self.gen_expr(tmp)
+
     def _enum_none_word(self, ei: EnumInfo, span):
         """Emit the no-payload word for `ei`'s `None` variant (Option)."""
         vi = ei.variant_by_name.get("None")
@@ -3379,6 +3434,9 @@ class X86CodeGen:
         # Call/Member/Identifier expressions.
         if isinstance(expr, TryExpr):
             self._gen_try(expr)
+            return
+        if isinstance(expr, UnwrapExpr):
+            self._gen_unwrap(expr)
             return
         ctor = self._enum_ctor_info(expr)
         if ctor is not None:

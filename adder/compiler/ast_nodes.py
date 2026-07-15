@@ -351,6 +351,22 @@ class TryExpr:
 
 
 @dataclass
+class UnwrapExpr:
+    """Postfix `!` force-unwrap: `expr!`.
+
+    `expr` must evaluate to a Result[T,E]/Option[T] enum value. Evaluates to
+    the unwrapped success payload (Some/Ok, variant 0). Under the opt-in
+    userspace safety flag (`--check-bounds`), a non-success value (None/Err)
+    traps cleanly with `ud2` (SIGILL) instead of silently yielding garbage
+    payload bits — the null-safety mirror of the array-bounds check. With the
+    flag off (and always on a bare-metal/kernel target), it is a zero-cost
+    payload extraction (assumes success), so it is byte-inert when unused and
+    kernel-friendly. `unsafe:` suppresses the check like it does for bounds."""
+    expr: 'Expr'
+    span: Optional[Span] = None
+
+
+@dataclass
 class StructInitExpr:
     """Struct initialization: Point{x=10, y=20}"""
     struct_name: str
@@ -445,7 +461,7 @@ Expr = (IntLiteral | FloatLiteral | StringLiteral | FStringLiteral |
         IndexExpr | SliceExpr | MemberExpr | ListLiteral |
         DictLiteral | TupleLiteral | ListComprehension | ConditionalExpr |
         LambdaExpr | SizeOfExpr | CastExpr | AsmExpr | ContainerOfExpr |
-        WalrusExpr | TryExpr)
+        WalrusExpr | TryExpr | UnwrapExpr)
 
 
 # Statements

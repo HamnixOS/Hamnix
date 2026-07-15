@@ -158,6 +158,7 @@ class TokenType(Enum):
     COLON = auto()          # :
     SEMICOLON = auto()      # ;
     QUESTION = auto()       # ?  (postfix Result/Option `?` propagation)
+    BANG = auto()           # !  (postfix Option/Result force-unwrap `expr!`)
     DOT = auto()            # .
     DOTDOT = auto()         # ..
     ELLIPSIS = auto()       # ...
@@ -966,8 +967,13 @@ class Lexer:
                         self.tokens.append(Token(TokenType.NOT_EQUALS, None,
                                                start_line, start_col, self.line, self.column))
                     else:
-                        raise LexerError("Unexpected '!' (use 'not' for negation)",
-                                       start_line, start_col)
+                        # Lone `!` is the postfix force-unwrap operator
+                        # (`opt!` -> unwrap an Option/Result, trapping on
+                        # None/Err under the userspace safety flag). Prefix
+                        # negation is still spelled `not`; `!` only ever
+                        # appears in postfix position, so this is unambiguous.
+                        self.tokens.append(Token(TokenType.BANG, None,
+                                               start_line, start_col, self.line, self.column))
 
                 case '<':
                     self.advance()

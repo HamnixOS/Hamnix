@@ -517,6 +517,11 @@ class Parser:
                 qtok = self.advance()
                 expr = TryExpr(expr, self.make_span(qtok))
 
+            elif self.check(TokenType.BANG):
+                # Postfix `!` force-unwrap: `expr!` on a Result/Option value.
+                btok = self.advance()
+                expr = UnwrapExpr(expr, self.make_span(btok))
+
             else:
                 break
 
