@@ -191,6 +191,58 @@ spot is a **hybrid**:
      lockstep. Gate: `scripts/test_adder_descriptive_trap.sh`.
 4. **`Slice[T]` fat pointers** — dynamic-buffer bounds checks; `Ptr[T]` stays the raw
    escape hatch.
+
+   **STATUS (increment 4 — landed, BOTH backends, byte-lockstep):** A
+   `Slice[T]` type: a **16-byte by-reference aggregate** laid out
+   `{ ptr: Ptr[T] @0, len: uint64 @8 }` — a base pointer plus a **runtime**
+   length, so a dynamically-sized buffer carries its length with it and
+   `slice[i]` is bounds-checked against the *runtime* `len` field (unlike
+   `Array[N,T]`'s compile-time `N`, and unlike `Ptr[T]`, which stays the raw,
+   length-free escape hatch).
+   * **Representation / ABI choice.** A Slice is the *same ABI class as a
+     struct*: it **decays to its address** and never travels in a single
+     register. Adder has no by-value aggregate ABI (increment 1's wall), so a
+     Slice is materialised as a 16-byte stack cell and expressions yield its
+     address; **passing/returning a Slice by value across a function boundary
+     is rejected** (loud error, both backends) exactly like a by-value struct —
+     cross-function transfer is via `Ptr[Slice[T]]`. This is the honest answer
+     given the ABI, and it reuses the existing struct-storage machinery.
+   * **Construction.** `Slice[T](arr)` from an `Array[N,T]` (base `= &arr[0]`,
+     `len = N` a compile-time constant) and `Slice[T](ptr, len)` from an
+     explicit `(ptr, len)` pair. `Slice` is recognised by **name** (no new
+     lexer token → no keyword-collision risk, maximally byte-inert), mirroring
+     the `Ptr[T](value)` constructor form.
+   * **Indexing / access.** `slice[i]` (load *and* store) emits, under the
+     opt-in `--check-bounds` userspace gate, `cmpq %rcx,%rax; jb ok; ud2`
+     against the len field (`%rcx = 8(&slice)`), the runtime mirror of the
+     Array check; out-of-range traps CLEANLY (SIGILL / wait-status 132) with
+     the host-linux descriptive `bounds: slice index out of range at
+     file:line` message (adder-user/kernel keep the compact `ud2`, preserving
+     the seed↔native byte-lockstep). `.len` / `len(slice)` read the len field;
+     `.ptr` reads the raw base pointer. **Byte-inert when off**, **kernel
+     structurally exempt** (never emitted on `x86_64-bare-metal`), and
+     `unsafe:` / `@unsafe` suppress the check via the shared `unsafe_depth`.
+   * **Both backends, byte-lockstep.** Seed (`ast_nodes.py` `SliceType`/
+     `SliceNewExpr`; `parser.py`; `codegen_x86.py` `gen_slice_new` /
+     `_maybe_emit_slice_bounds_check` / `gen_slice_index_address` + member/len
+     paths) and the native `.ad` backend (`parser.ad` `ND_SLICE_TYPE`/
+     `ND_SLICE_NEW`; `codegen.ad` `alloc_slice_local` / `gen_slice_index_addr`
+     / `emit_slice_new_into` + member/len, composed from the byte-tested emit
+     primitives). Gate: `scripts/test_adder_slice.sh`. Verified: slice objdiff
+     **5/5 CLEAN**, full-corpus objdiff **256/256, 0 diverged**, fuzzer
+     **500/500, 0 miscompiles**, `test_native_kernel_links` PASS,
+     `run_compiler_tests` ALL PASS, `build_user` full userland OK, the `-O2`
+     bench byte-identical to HEAD (no perf regression), byte-inert-off proven
+     HEAD-vs-worktree on both `x86_64-linux` and `x86_64-bare-metal`.
+
+   *Deferred (disproved / honest):* (a) **sub-slicing** (`s[a:b]`) — not this
+   pass; the slice type + checked indexing land solidly first. (b) A **bare
+   `Slice[T](...)` subexpression** not bound to a local needs an anonymous
+   prescan-reserved stack temp on the native path (the seed supports it via
+   `gen_slice_new`; native `cg_fail`s and requires binding to a local first) —
+   an acceptance gap, not a miscompile, and no corpus uses it. (c) **generics**
+   — `T` is carried on the type for element sizing but `Slice[T]` is not a
+   monomorphised generic beyond that.
 5. **`own T` move-only handles + `drop`** (Tier B) — the biggest Rust-like leap, as a
    compile-time affine check; catches UAF/double-free. Uses the existing `defer`.
 6. **Region/arena lifetimes** (long-horizon) — scoped "ref can't outlive region."
