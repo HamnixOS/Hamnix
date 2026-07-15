@@ -5908,6 +5908,51 @@ class X86CodeGen:
         self.emit("    xorl %eax, %eax")
         self.emit(f"    call {name}")
 
+    # Aggregate-receiver method sugar: method name -> free function symbol.
+    # Every operand (receiver + each argument) is a String and expands to its
+    # (.ptr, .len) pair (these free fns take raw Ptr[uint8]+uint64 args), so a
+    # SINGLE uniform rule covers the whole allowlist. String-only for now;
+    # Slice[T] has no allowlisted methods yet (extend here when it does).
+    _AGGREGATE_STRING_METHODS = {
+        "eq": "str_eq",
+        "find": "str_find",
+        "contains": "str_contains",
+        "upper": "ham_str_upper",
+        "lower": "ham_str_lower",
+        "trim": "ham_str_trim",
+        "starts_with": "ham_str_starts_with",
+        "ends_with": "ham_str_ends_with",
+        "replace": "ham_str_replace",
+    }
+
+    def _gen_aggregate_string_method(self, mc) -> None:
+        """Desugar an allowlisted String-receiver method call to its free
+        function, expanding the receiver and every String argument into a
+        `(.ptr, .len)` pair, then emit through the ordinary direct-call path.
+        Byte-identical to the hand-written free-function call."""
+        from .ast_nodes import (
+            CallExpr as _CallExpr,
+            Identifier as _Identifier,
+            MemberExpr as _MemberExpr,
+        )
+        sym = self._AGGREGATE_STRING_METHODS[mc.method]
+        span = getattr(mc, "span", None)
+
+        def expand(operand):
+            # A String value -> its two scalar fields, in ptr-then-len order.
+            return [
+                _MemberExpr(operand, "ptr", span),
+                _MemberExpr(operand, "len", span),
+            ]
+
+        call_args: list = []
+        call_args.extend(expand(mc.obj))
+        for a in mc.args:
+            call_args.extend(expand(a))
+
+        synth = _CallExpr(_Identifier(sym, span), call_args, {}, span)
+        self.gen_call(synth)
+
     def gen_method_call(self, mc) -> None:
         """Lower `obj.method(args)` to a direct call against the
         mangled `<OwnerClass>__<method>` symbol, passing `&obj` (or
@@ -5926,6 +5971,23 @@ class X86CodeGen:
         # Resolve obj's class name (handle both value-receiver and
         # pointer-receiver shapes).
         obj_type = self.get_expr_type(mc.obj)
+
+        # --- Aggregate-receiver method-call sugar (roadmap increment 12) ---
+        # When the receiver is a String, an allowlisted method name
+        # (`s.eq(t)`, `s.upper()`, ...) desugars to the corresponding free
+        # function, expanding EVERY String operand — the receiver and each
+        # String argument — into its `(.ptr, .len)` pair, since those free
+        # functions carry the raw (Ptr[uint8], uint64) ABI. The result is
+        # BYTE-IDENTICAL to writing the free call by hand (same synthesized
+        # MemberExpr/CallExpr AST fed through gen_call). Struct receivers are
+        # NOT StringType, so they never enter here — the existing class-method
+        # path below is untouched. String has no user methods, so there is no
+        # ambiguity.
+        if isinstance(obj_type, StringType) \
+                and mc.method in self._AGGREGATE_STRING_METHODS:
+            self._gen_aggregate_string_method(mc)
+            return
+
         class_name: Optional[str] = None
         is_ptr_receiver = False
         if obj_type is not None and hasattr(obj_type, "name") \
