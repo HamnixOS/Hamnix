@@ -395,6 +395,28 @@ spot is a **hybrid**:
    `*args`/`**kwargs`, closures capturing env, integer-overflow-checked
    arithmetic, and the app std-lib — future passes.
 
+   *Increment 7-tail follow-up — userland heap allocator (landed, LIBRARY, no
+   compiler change):* the "owning `String` awaits a real userland allocator"
+   blocker above is now UNBLOCKED. `lib/hamalloc.ad` is a pure-Adder
+   general-purpose heap — `ham_alloc(nbytes)` / `ham_free(ptr)` /
+   `ham_realloc(ptr, nbytes)` — built ENTIRELY over the existing
+   `sys_mmap`/`sys_munmap` page primitives (no new syscall, no compiler
+   change, no kernel wiring). Design: segregated LIFO free-lists over a fixed
+   set of 16-byte-multiple size classes (16 … 2048) carved from `sys_mmap`'d
+   256 KiB page arenas that grow on demand; a 16-byte boundary header
+   (size + magic-tagged class/kind) gives O(1) alloc/free, 16-byte-aligned
+   payloads, and magic-guarded double/wild-free refusal. Requests > 2048 B are
+   served by a direct page-rounded `sys_mmap` and returned to the OS via
+   `sys_munmap` on free. Freed small blocks are always reused by a later
+   same-class alloc, so a bounded working set under churn never grows the
+   mapped footprint — proven by `scripts/test_adder_hamalloc.sh` (on-device
+   QEMU): alloc/readback + non-overlap, free-then-alloc reuse, alignment across
+   every class, realloc grow+preserve, large mmap/munmap, and a 20k-cycle
+   stress that verifies a per-block pattern on every free and asserts a bounded
+   footprint after warm-up. Because it is plain Adder over existing primitives
+   it is seed↔native objdiff-clean by construction. This is the std-lib
+   foundation an owning heap `String` / dynamic vector / map can now build on.
+
 Each increment: opt-in or byte-inert-off, kernel-bypassable, seed+native lockstep,
 verified by objdiff + differential fuzzer + `test_native_kernel_links` +
 `run_compiler_tests` + a new feature gate.
