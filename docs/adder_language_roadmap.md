@@ -479,6 +479,51 @@ spot is a **hybrid**:
      directly. FOLLOW-UPS: native acceptance (byte-lockstep), by-value PARAM
      passing, and `> 16`-byte sret return unblock `split → String[]`.
 
+9. **By-value aggregate PARAMETER passing** — the symmetric complement to
+   increment 8's RETURN ABI: a function could not RECEIVE a small aggregate by
+   value (every `Struct`/`Slice[T]`/`String` param had to be `Ptr[T]`).
+
+   **STATUS (increment 9 — landed, SEED backend; native rejects cleanly,
+   seed-first like increments 1 & 8):** A function may now declare a parameter
+   of aggregate type **by value** — `x: Struct` / `x: Slice[T]` / `x: String` —
+   when `sizeof ≤ 16` bytes and float-free. The call site materialises the
+   aggregate's two INTEGER eightbytes into the next two INTEGER argument
+   registers (**System V AMD64** order `rdi,rsi,rdx,rcx,r8,r9`; a `≤8`-byte
+   aggregate uses one register, a `9..16`-byte one uses two consecutive
+   registers), and the callee prologue spills them into the param's 16-byte
+   slot so `.field` / `.len` / `s[i]` read back correctly. A two-register
+   aggregate correctly shifts the register ordinals of the following params.
+   * **What is accepted:** `Slice[T]` / `String` (the 16-byte `{ptr,len}`), and
+     any struct `≤16` bytes **and** float-free, PROVIDED both eightbytes fit in
+     the remaining argument registers. Composes with increment 8: a function may
+     take an aggregate by value AND return one by value.
+   * **Purely additive / byte-inert:** no existing translation unit declares a
+     by-value aggregate param, so the new marshaling path never fires on the
+     corpus — all 248 `x86_64-adder-user` units (and the bench binaries) compile
+     **byte-identical** to base with the isolated `codegen_x86.py` change (the
+     call-site aggregate path is gated on the callee actually declaring such a
+     param; the prologue's register counter is identical to the old
+     `enumerate` index when no aggregate is present).
+   * **What is REJECTED (loud, actionable error):** a struct `> 16` bytes, a
+     **float-containing (SSE-class)** struct, and **register EXHAUSTION** — an
+     aggregate whose two eightbytes would split across the 6-register boundary
+     (SysV would stack-pass the whole aggregate; this increment does NOT
+     implement stack-passing a by-value aggregate, so it rejects with a clear
+     "reorder before the scalar args / pass `Ptr[…]`" message). Variadics and
+     `> 16`-byte / SSE-class aggregates stay by-ref exactly as before.
+   * **Kernel opt-out intact:** the kernel passes aggregates by-ref everywhere
+     and never declares a by-value aggregate param, so it never hits the new
+     path (zero-cost, opt-in-by-use).
+   * **Native:** `codegen.ad` does not yet emit the convention; it REJECTS a
+     by-value struct param (pre-existing `cg_fail(9)`) and now also a by-value
+     `Slice[T]` param with `cg_fail(9)` (never mis-spills one register + reads
+     the rest as stack garbage). Gate `scripts/test_adder_aggparam.sh`
+     (host-only) asserts struct/Slice/String params run correct exit codes
+     (134/107/105), the param+return interaction, all three rejections fire, and
+     the native binary rejects directly (`reason=9`). FOLLOW-UPS: native
+     acceptance (byte-lockstep), SysV stack-passing of a boundary-splitting
+     aggregate, and indirect (function-pointer) calls with aggregate params.
+
 Each increment: opt-in or byte-inert-off, kernel-bypassable, seed+native lockstep,
 verified by objdiff + differential fuzzer + `test_native_kernel_links` +
 `run_compiler_tests` + a new feature gate.

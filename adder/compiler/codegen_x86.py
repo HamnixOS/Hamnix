@@ -1962,6 +1962,30 @@ class X86CodeGen:
         rt = self.func_return_types.get(expr.func.name)
         return self._aggregate_return_class(rt)
 
+    def _call_arg_agg_classes(self, name, args) -> Optional[list]:
+        """For a DIRECT call to `name` with positional `args`, return a list
+        (one entry per arg) of the by-value-aggregate byte size (<=16) for each
+        parameter declared as a by-value aggregate, else None for that slot;
+        return None outright if the callee has NO by-value aggregate parameter
+        (so the caller takes the byte-inert scalar marshaling path unchanged).
+
+        Keyed off the CALLEE's declared parameter types (self.func_params), so
+        this fires only when a function actually declares a by-value aggregate
+        param — no existing unit does, hence byte-inert on the whole corpus."""
+        if name is None:
+            return None
+        params = self.func_params.get(name)
+        if params is None or len(params) != len(args):
+            return None
+        classes = []
+        any_agg = False
+        for prm in params:
+            cls = self._aggregate_return_class(getattr(prm, "param_type", None))
+            classes.append(cls)
+            if cls is not None:
+                any_agg = True
+        return classes if any_agg else None
+
     def gen_function(self, func: FunctionDef) -> None:
         self.ctx = FunctionContext(name=func.name)
         self._cur_return_type = func.return_type
@@ -1973,26 +1997,36 @@ class X86CodeGen:
         # Ptr[Class]` receiver of a method is a Ptr, so methods are
         # unaffected. Skip the first param when this is a synthesised
         # method body (its receiver is always a Ptr and already typed so).
+        # By-value aggregate PARAMS (roadmap increment 9): symmetric with the
+        # by-value aggregate RETURN ABI (#302). A parameter may be declared by
+        # value when its type is a <=16-byte pure-INTEGER aggregate — Slice[T] /
+        # String (the 16-byte {ptr,len} view) or a <=16B float-free struct. The
+        # caller materializes the two eightbytes into the next two INTEGER arg
+        # registers (SysV rdi,rsi,rdx,rcx,r8,r9); the prologue below spills them
+        # into the param's slot. Anything larger, or float-containing (SSE
+        # class), stays by-ref and is rejected here as before. Register
+        # exhaustion (the two eightbytes would split across the 6-register
+        # boundary) is rejected loudly in the prologue — we do NOT stack-pass an
+        # aggregate in this increment. Byte-inert: no existing unit declares a
+        # by-value aggregate param, so the accept path never perturbs the corpus.
         for param in func.params:
             if isinstance(param.param_type, (SliceType, StringType)):
-                span = getattr(param, "span", None) or getattr(func, "span", None)
-                raise CodeGenError(
-                    f"x86: by-value {param.param_type.name} parameter "
-                    f"'{param.name}: {param.param_type.name}' in "
-                    f"'{func.name}' is not supported at "
-                    f"{_span_location(span)}; pass "
-                    f"`Ptr[{param.param_type.name}]` — Adder has no by-value "
-                    f"aggregate ABI (a 16-byte {{ptr,len}} value)"
-                )
-            if self._is_byvalue_struct_type(param.param_type):
-                span = getattr(param, "span", None) or getattr(func, "span", None)
-                raise CodeGenError(
-                    f"x86: by-value struct parameter '{param.name}: "
-                    f"{param.param_type.name}' in '{func.name}' is not "
-                    f"supported at {_span_location(span)}; pass "
-                    f"`Ptr[{param.param_type.name}]` (the caller takes "
-                    f"`&obj`) — Adder has no by-value aggregate ABI"
-                )
+                pass                        # <=16B {ptr,len} -> two INTEGER regs
+            elif self._is_byvalue_struct_type(param.param_type):
+                if self._aggregate_return_class(param.param_type) is None:
+                    span = getattr(param, "span", None) \
+                        or getattr(func, "span", None)
+                    size = self.get_type_size(param.param_type)
+                    why = ("larger than 16 bytes" if size > 16
+                           else "contains a float/SSE-class field")
+                    raise CodeGenError(
+                        f"x86: by-value struct parameter '{param.name}: "
+                        f"{param.param_type.name}' in '{func.name}' is not "
+                        f"supported at {_span_location(span)} ({why}); pass "
+                        f"`Ptr[{param.param_type.name}]` (the caller takes "
+                        f"`&obj`) — only <=16-byte pure-integer aggregates are "
+                        f"passed by value (two INTEGER arg registers)"
+                    )
         # By-value aggregate RETURN (previously rejected outright) is now
         # allowed when the type is a <=16-byte pure-INTEGER aggregate: it is
         # returned in rax:rdx (System V AMD64 two-INTEGER-eightbyte rule).
@@ -2071,33 +2105,71 @@ class X86CodeGen:
         # to the return address). Sized stores for sub-8-byte scalar
         # params keep the slot's layout consistent with what `&param`
         # would expose — same reasoning as VarDecl init.
-        for i, param in enumerate(func.params):
+        #
+        # `reg_idx` is the running SysV INTEGER argument-register ordinal. It
+        # increments by 1 per scalar/by-ref param (identical to the old
+        # `enumerate` index when no aggregate is present — byte-inert) and by
+        # 1-or-2 for a by-value aggregate param (one eightbyte per register).
+        reg_idx = 0
+        for param in func.params:
             var = self.ctx.locals[param.name]
+            agg = self._aggregate_return_class(param.param_type)
+            if agg is not None:
+                # By-value aggregate param: the caller placed the two eightbytes
+                # in the next INTEGER arg registers. A <=8B aggregate uses one
+                # register; a 9..16B aggregate uses two. If the pair would split
+                # across the 6-register boundary, SysV says pass the WHOLE
+                # aggregate on the stack — this increment does NOT implement
+                # stack-passing, so reject loudly rather than mis-spill.
+                nregs = 2 if agg > 8 else 1
+                if reg_idx + nregs > len(ARG_REGS):
+                    span = getattr(param, "span", None) \
+                        or getattr(func, "span", None)
+                    raise CodeGenError(
+                        f"x86: by-value aggregate parameter '{param.name}' in "
+                        f"'{func.name}' at {_span_location(span)} would split "
+                        f"across the {len(ARG_REGS)}-register argument boundary "
+                        f"(needs INTEGER regs {reg_idx}..{reg_idx + nregs - 1}); "
+                        f"reorder it before the scalar arguments, or pass "
+                        f"`Ptr[...]` — this backend does not stack-pass a "
+                        f"by-value aggregate (only both eightbytes in registers)"
+                    )
+                self.emit(
+                    f"    movq {ARG_REGS[reg_idx]}, {var.offset}(%rbp)"
+                )
+                if nregs == 2:
+                    self.emit(
+                        f"    movq {ARG_REGS[reg_idx + 1]}, "
+                        f"{var.offset + 8}(%rbp)"
+                    )
+                reg_idx += nregs
+                continue
             sz = self._scalar_local_size(var)
-            if i < len(ARG_REGS):
+            if reg_idx < len(ARG_REGS):
                 if sz == 4:
                     self.emit(
-                        f"    movl {self._ARG_REGS32[i]}, "
+                        f"    movl {self._ARG_REGS32[reg_idx]}, "
                         f"{var.offset}(%rbp)"
                     )
                 elif sz == 2:
                     self.emit(
-                        f"    movw {self._ARG_REGS16[i]}, "
+                        f"    movw {self._ARG_REGS16[reg_idx]}, "
                         f"{var.offset}(%rbp)"
                     )
                 elif sz == 1:
                     self.emit(
-                        f"    movb {self._ARG_REGS8[i]}, "
+                        f"    movb {self._ARG_REGS8[reg_idx]}, "
                         f"{var.offset}(%rbp)"
                     )
                 else:
                     self.emit(
-                        f"    movq {ARG_REGS[i]}, {var.offset}(%rbp)"
+                        f"    movq {ARG_REGS[reg_idx]}, {var.offset}(%rbp)"
                     )
             else:
-                stack_off = 16 + (i - len(ARG_REGS)) * 8
+                stack_off = 16 + (reg_idx - len(ARG_REGS)) * 8
                 self.emit(f"    movq {stack_off}(%rbp), %rax")
                 self._emit_local_store(var, "%rax")
+            reg_idx += 1
 
         # Body. A `@unsafe`-decorated function — or ANY function when the whole
         # file carries the `# adder: unsafe` pragma — suppresses the opt-in
@@ -5685,6 +5757,18 @@ class X86CodeGen:
             and not (self.ctx is not None and name in self.ctx.locals)
         )
 
+        # By-value aggregate ARGUMENTS (roadmap increment 9): if this is a
+        # direct call whose callee declares a by-value aggregate parameter, take
+        # the dedicated marshaling path that expands each aggregate into its two
+        # INTEGER eightbytes across consecutive arg registers. Fires ONLY when a
+        # callee actually declares such a param (none in the existing corpus), so
+        # the scalar path below stays byte-identical when the feature is unused.
+        if is_direct:
+            agg_classes = self._call_arg_agg_classes(name, call.args)
+            if agg_classes is not None:
+                self._gen_call_with_agg_args(name, call.args, agg_classes)
+                return
+
         n_args = len(call.args)
         n_reg  = min(n_args, len(ARG_REGS))
         n_stk  = n_args - n_reg
@@ -5759,6 +5843,70 @@ class X86CodeGen:
         # Reclaim the 16-byte function-pointer stash (indirect calls only).
         if target_pushed:
             self.emit("    addq $16, %rsp")
+
+    def _gen_call_with_agg_args(self, name, args, agg_classes) -> None:
+        """Marshal a DIRECT call in which one or more arguments are by-value
+        aggregates (each expanded into two INTEGER eightbytes). SysV order
+        rdi,rsi,rdx,rcx,r8,r9: a scalar arg consumes one register; a <=8B
+        aggregate one; a 9..16B aggregate two consecutive registers.
+
+        This increment requires every argument to fit in the 6 INTEGER
+        registers (no stack arguments alongside an aggregate); if the total
+        register demand exceeds 6 — or an aggregate pair would split across the
+        boundary — the call is rejected loudly (the callee prologue applies the
+        same rule, so both sides agree). Byte-inertness is not a concern here
+        because this method only runs when an aggregate arg is present, which no
+        existing unit has.
+
+        Marshaling mirrors the scalar path: evaluate each argument and push its
+        eightbyte(s) in register order, then pop in reverse so value j lands in
+        ARG_REGS[j]. A scalar arg's value is `%rax`; an aggregate decays to its
+        ADDRESS in `%rax`, from which the low (and, for >8B, high) eightbyte are
+        loaded and pushed."""
+        # Register-slot plan: total INTEGER registers demanded, rejecting on
+        # exhaustion / split.
+        reg_slots = []          # list of (arg_index, eightbyte_or_None)
+        for i, cls in enumerate(agg_classes):
+            if cls is None:
+                reg_slots.append((i, None))
+            else:
+                reg_slots.append((i, 0))
+                if cls > 8:
+                    reg_slots.append((i, 8))
+        if len(reg_slots) > len(ARG_REGS):
+            raise CodeGenError(
+                f"x86: call to '{name}' passes by-value aggregate arguments "
+                f"whose eightbytes need {len(reg_slots)} INTEGER registers "
+                f"(> {len(ARG_REGS)}); this backend passes a by-value aggregate "
+                f"only when both its eightbytes fit in the argument registers "
+                f"(no stack-passed aggregate). Reduce the argument count or "
+                f"pass `Ptr[...]`"
+            )
+
+        # Push each register slot's value in ARG_REGS order, then reverse-pop.
+        n = len(reg_slots)
+        for arg_i, eb in reg_slots:
+            if eb is None:
+                self.gen_expr(args[arg_i])          # scalar -> %rax
+                self.emit("    pushq %rax")
+            elif eb == 0:
+                # First eightbyte of this aggregate: evaluate the arg (address
+                # in %rax) and push its low word. If a high word follows in the
+                # NEXT slot, this same arg is NOT re-evaluated — see eb == 8.
+                self.gen_expr(args[arg_i])          # aggregate address -> %rax
+                self.emit("    movq (%rax), %r10")
+                self.emit("    pushq %r10")
+            else:
+                # High eightbyte: %rax still holds this aggregate's address
+                # (the previous slot's gen_expr left it there, and pushq does
+                # not clobber it), so load byte 8..15 directly.
+                self.emit("    movq 8(%rax), %r10")
+                self.emit("    pushq %r10")
+        for j in reversed(range(n)):
+            self.emit(f"    popq {ARG_REGS[j]}")
+
+        self.emit("    xorl %eax, %eax")
+        self.emit(f"    call {name}")
 
     def gen_method_call(self, mc) -> None:
         """Lower `obj.method(args)` to a direct call against the
