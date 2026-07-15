@@ -127,6 +127,18 @@ assert_nogrep 'SyntaxError' "$D4" \
 assert_nogrep '\|pending\|' "$D4" \
     "final script ran despite the earlier throw (status placeholder replaced)"
 
+# (g) #317 NAME-BASED FIELD RESOLUTION: real google identifies its query control
+# by `name="q"` (no id) inside `<form name="f">`. The native type+submit chain
+# must fall back to `name`, classify it as a text field, resolve the enclosing
+# form, and navigate to /search?q=... — proven against the id-less shape.
+D5="$OUT/g_named.txt"
+"$BIN" "tests/fixtures/hambrowse_google_named.html" 880 fieldnav q "plan 9 os" >"$D5" 2>&1
+grep -E 'FIELDNAV' "$D5" || true
+assert_grep '^FIELDNAV id=q idx=[0-9]+ textfield=1' "$D5" \
+    "id-less query field resolves by name= and classifies as a text field"
+assert_grep '^FIELDNAV NAV /search\?q=plan\+9\+os' "$D5" \
+    "type+submit on a name-only field navigates to /search?q=plan+9+os (real-google shape)"
+
 if [ "$fail" -ne 0 ]; then
     echo "[hb-google] RESULT: FAIL"; exit 1
 fi
