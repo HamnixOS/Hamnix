@@ -109,6 +109,24 @@ assert_grep '\[plan 9 os\] *\|' "$D3" "typed text renders in the field box (set_
 # than a degraded no-JS page. Static guard on the request builder.
 assert_grep 'User-Agent: Mozilla/5\.0'           "user/http9.ad" "http9 sends a browser-like Mozilla User-Agent"
 
+# (f) #317 REAL-GOOGLE SCRIPT COMPAT: a fixture shaped like google.com's inline
+# scripts (labeled block+break, |=, .call, switch, for-in, window.google) plus
+# SCRIPT ISOLATION — an early <script> deliberately throws and must NOT stop the
+# later script that wires the page. The final script computes a status via
+# textContent, so a clean run is visible in the render as "g5-five-k2".
+D4="$OUT/g_scripts.txt"
+"$BIN" "tests/fixtures/hambrowse_google_js.html" 880 >"$D4" 2>&1
+grep -E 'JSLOG|g5-five-k2' "$D4" || true
+assert_grep 'g5-five-k2' "$D4" \
+    "google-shaped scripts run end-to-end (labeled block/|=/.call/switch/for-in/window.google)"
+assert_nogrep 'SyntaxError' "$D4" \
+    "no SyntaxError: void/delete/switch/labels/compound-assign/for-in all parse"
+# The status text was REPLACED by the final script (proving script isolation:
+# the earlier deliberate throw did not abort the wiring), so the placeholder is
+# gone from the render.
+assert_nogrep '\|pending\|' "$D4" \
+    "final script ran despite the earlier throw (status placeholder replaced)"
+
 if [ "$fail" -ne 0 ]; then
     echo "[hb-google] RESULT: FAIL"; exit 1
 fi
