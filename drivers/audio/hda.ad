@@ -133,6 +133,7 @@ HDA_PARAM_NODE_COUNT:        uint32 = 0x04   # subordinate node count
 HDA_PARAM_FN_GROUP_TYPE:     uint32 = 0x05
 HDA_PARAM_AUDIO_WIDGET_CAP:  uint32 = 0x09   # widget capabilities
 HDA_PARAM_PIN_CAP:           uint32 = 0x0C
+HDA_PARAM_OUTPUT_AMP_CAP:    uint32 = 0x12   # output amplifier capabilities
 
 # Widget type (bits 20..23 of AUDIO_WIDGET_CAP)
 HDA_WIDGET_AUDIO_OUT:        uint32 = 0x0     # DAC / output converter
@@ -162,6 +163,8 @@ HDA_AMP_SET_INPUT:           uint32 = 0x4000
 HDA_AMP_SET_LEFT:            uint32 = 0x2000
 HDA_AMP_SET_RIGHT:           uint32 = 0x1000
 HDA_AMP_UNMUTE_MAXGAIN:      uint32 = 0x002A   # gain 0x2A, mute bit clear
+HDA_AMP_MUTE:                uint32 = 0x0080   # bit7 = mute
+HDA_AMP_GAIN_MASK:           uint32 = 0x007F   # bits0..6 = gain steps
 
 
 # --- module state ---------------------------------------------------
@@ -176,6 +179,16 @@ hda_pin_nid:     uint32 = 0          # discovered output pin widget node id
 hda_out_sd:      uint64 = 0          # output stream descriptor base (MMIO)
 hda_stream_tag:  uint32 = 1          # stream tag we use
 hda_initialized: int32  = 0
+
+# Master output level, driven by the DE volume/mute control through the
+# mixer ctl verbs (#279). This is the REAL codec output-amp gain, not a
+# software PCM scale: it is written into the DAC's "Set Amplifier Gain/Mute"
+# verb so the analog output level (what QEMU's wav backend captures, and a
+# real speaker) actually changes. _hda_connect_codec_path re-applies it on
+# every stream start so a `start` never clobbers the chosen volume.
+hda_out_gain_pct: uint64 = 100       # 0..100 %, default full
+hda_out_muted:    int32  = 0         # 1 == master muted
+hda_out_amp_steps: uint32 = 0        # cached DAC output-amp numsteps (0=unknown)
 
 # Stream DMA: one BDL + one PCM buffer.
 hda_bdl:         uint64 = 0          # BDL DMA buffer (phys/virt)
@@ -596,9 +609,77 @@ def _hda_program_bdl(pcm_len: uint64):
     _sd_w16(HDA_SD_FMT, _hda_fmt_word())
 
 
+# Send a "Set Amplifier Gain/Mute" command with the FULL 16-bit payload.
+#
+# NOTE: the generic _hda_command() routes the pre-shifted 4-bit verb 0x300
+# through its 12-bit-verb branch, which masks the payload to 8 bits — that
+# strips the output/left/right SELECT bits (0xB000) so the write never
+# actually targets the output amp. That truncation is invisible for the
+# boot unmute (QEMU still played) but it is exactly why volume changes had
+# no effect (#279). Here we compose the command directly so all 16 payload
+# bits reach the codec: verb nibble 0x3 at bits 16..19, payload at 0..15.
+def _hda_amp_cmd(codec: uint32, nid: uint32, payload: uint32) -> uint32:
+    cmd: uint32 = (codec << 28) | (nid << 20) \
+        | (HDA_VERB_SET_AMP_GAIN_MUTE << 8) | (payload & 0xFFFF)
+    _hda_corb_send(cmd)
+    return _hda_rirb_recv()
+
+
+def _hda_dac_amp_steps() -> uint32:
+    # DAC output-amp numsteps (bits 8..14 of the OUTPUT_AMP_CAP param).
+    # Cached after the first query. Falls back to 0x2A (the historical
+    # max-gain constant) if the codec reports no per-widget amp caps.
+    if hda_out_amp_steps != 0:
+        return hda_out_amp_steps
+    cap: uint32 = _hda_get_param(hda_codec_addr, hda_dac_nid,
+                                 HDA_PARAM_OUTPUT_AMP_CAP)
+    steps: uint32 = (cap >> 8) & 0x7F
+    if steps == 0:
+        steps = 0x2A
+    hda_out_amp_steps = steps
+    return steps
+
+
+def _hda_apply_out_gain():
+    # Write the stored master level (hda_out_gain_pct / hda_out_muted) into
+    # the DAC output amp. Maps percent -> gain steps over the amp's range.
+    if hda_initialized == 0:
+        return
+    steps: uint32 = _hda_dac_amp_steps()
+    pct: uint64 = hda_out_gain_pct
+    if pct > 100:
+        pct = 100
+    gain: uint32 = cast[uint32]((pct * cast[uint64](steps)) / 100)
+    if gain > HDA_AMP_GAIN_MASK:
+        gain = HDA_AMP_GAIN_MASK
+    payload: uint32 = HDA_AMP_SET_OUTPUT | HDA_AMP_SET_LEFT \
+        | HDA_AMP_SET_RIGHT | (gain & HDA_AMP_GAIN_MASK)
+    if hda_out_muted != 0:
+        payload = payload | HDA_AMP_MUTE
+    _hda_amp_cmd(hda_codec_addr, hda_dac_nid, payload)
+
+
+def hda_set_output_amp(pct: uint64, muted: int32):
+    # Public: set the master output level (0..100 %) and mute latch. Called
+    # from the mixer ctl verbs (master/mute), which the DE Sound capplet
+    # drives via /dev/audioctl. Stored + applied to the DAC output amp; the
+    # store survives a subsequent `start` (which re-applies it).
+    p: uint64 = pct
+    if p > 100:
+        p = 100
+    hda_out_gain_pct = p
+    if muted != 0:
+        hda_out_muted = 1
+    else:
+        hda_out_muted = 0
+    _hda_apply_out_gain()
+    printk2("[hda] output amp: gain_pct=%d mute=%d\n",
+            hda_out_gain_pct, cast[uint64](cast[int64](hda_out_muted)))
+
+
 def _hda_connect_codec_path():
-    # Power up + format the DAC, tag it with our stream, unmute it, and
-    # enable the output pin (powered + unmuted + output-enabled).
+    # Power up + format the DAC, tag it with our stream, apply the current
+    # master volume/mute, and enable the output pin.
     codec: uint32 = hda_codec_addr
     _hda_command(codec, hda_dac_nid, HDA_VERB_SET_POWER_STATE, HDA_POWER_D0)
     _hda_command(codec, hda_pin_nid, HDA_VERB_SET_POWER_STATE, HDA_POWER_D0)
@@ -607,12 +688,12 @@ def _hda_connect_codec_path():
                  (hda_stream_tag << 4) | 0)
     # DAC converter format (16-bit value, 4-bit verb 0x2).
     _hda_command(codec, hda_dac_nid, HDA_VERB_SET_CONV_FMT, _hda_fmt_word())
-    # Unmute DAC output amp (left+right, max gain).
-    _hda_command(codec, hda_dac_nid, HDA_VERB_SET_AMP_GAIN_MUTE,
-                 HDA_AMP_SET_OUTPUT | HDA_AMP_SET_LEFT | HDA_AMP_SET_RIGHT
-                 | HDA_AMP_UNMUTE_MAXGAIN)
-    # Unmute pin output amp too (harmless if the pin has no amp).
-    _hda_command(codec, hda_pin_nid, HDA_VERB_SET_AMP_GAIN_MUTE,
+    # DAC output amp = the current master level (NOT a hardcoded max, so a
+    # `start` after the DE lowered the volume preserves it). Uses the full
+    # 16-bit amp payload via _hda_amp_cmd.
+    _hda_apply_out_gain()
+    # Unmute pin output amp (full-scale; the DAC amp carries the volume).
+    _hda_amp_cmd(codec, hda_pin_nid,
                  HDA_AMP_SET_OUTPUT | HDA_AMP_SET_LEFT | HDA_AMP_SET_RIGHT
                  | HDA_AMP_UNMUTE_MAXGAIN)
     # Enable the pin as an output (+ HP amp).
