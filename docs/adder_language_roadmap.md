@@ -445,6 +445,40 @@ spot is a **hybrid**:
    empty-needle no-op, trailing-sep, all-whitespace trim), frees each result,
    and churns 2000 allocations to prove the heap is uncorrupted after the frees.
 
+8. **By-value aggregate RETURN ABI** — retire the recurring wall that forced
+   `Slice[T]` (increment 4), `String` (7-tail), and `split→String[]` all to be
+   by-ref-only: a function could not RETURN a small aggregate by value.
+
+   **STATUS (increment 8 — landed, SEED backend; native rejects cleanly,
+   seed-first like increments 1 & 7-tail):** A function may now declare
+   `-> Struct` / `-> Slice[T]` / `-> String` and `return aggexpr` **by value**
+   when `sizeof ≤ 16` bytes. The result is materialised into `rax:rdx` at the
+   `ret` per the **System V AMD64 two-INTEGER-eightbyte** rule (byte 0-7 → rax,
+   byte 8-15 → rdx — the `{ptr,len}` view and small int/ptr structs are both
+   INTEGER class), and a call site `x = make()` stores the `rax:rdx` pair into
+   x's ≤16-byte slot (both the VarDecl-init and plain-Assignment forms; a
+   `return make()` tail-forwards the pair without a reload).
+   * **What is accepted:** `Slice[T]` / `String` (the 16-byte `{ptr,len}`), and
+     any struct that is ≤16 bytes **and** float-free. This is the ONLY
+     previously-rejected path now allowed, so it is **purely additive** — every
+     existing translation unit (none returns an aggregate by value) compiles
+     **byte-identical** to base (verified md5-identical across all 261
+     `x86_64-adder-user` units + the bench binaries on both backends).
+   * **What is REJECTED (loud, actionable error):** a struct `> 16` bytes and a
+     **float-containing (SSE-class)** struct — those need sret / XMM-class
+     handling not yet implemented, so they stay by-ref (`Ptr[T]` out-parameter)
+     exactly as before. By-value PARAM passing also stays out of scope.
+   * **Kernel opt-out intact:** the kernel returns aggregates by-ref everywhere
+     and never hits the new path; `x86_64-bare-metal` is byte-for-byte unchanged
+     (zero-cost, opt-in-by-use).
+   * **Native:** `codegen.ad` does not yet emit the convention; it REJECTS a
+     by-value `Slice[T]`/struct return with `cg_fail(9)` (never mis-returns the
+     aggregate's address). Gate `scripts/test_adder_aggret.sh` (host-only)
+     asserts struct/Slice/String returns run correct exit codes (142/206/105),
+     the two rejections fire, bare-metal compiles, and the native binary rejects
+     directly. FOLLOW-UPS: native acceptance (byte-lockstep), by-value PARAM
+     passing, and `> 16`-byte sret return unblock `split → String[]`.
+
 Each increment: opt-in or byte-inert-off, kernel-bypassable, seed+native lockstep,
 verified by objdiff + differential fuzzer + `test_native_kernel_links` +
 `run_compiler_tests` + a new feature gate.

@@ -1906,6 +1906,62 @@ class X86CodeGen:
                                        FunctionPointerType))
                 and getattr(t, "name", None) in self.structs)
 
+    def _struct_has_float_field(self, name: str) -> bool:
+        """True iff struct `name` (recursively) embeds a float field.
+
+        A float/SSE-class eightbyte would need XMM return registers; this
+        backend only implements the INTEGER-class register-return path
+        (rax:rdx), so such aggregates are NOT by-value-returnable and stay
+        by-ref. Nested by-value structs are inspected recursively; an array
+        field is inspected by its element type."""
+        si = self.structs.get(name)
+        if si is None:
+            return False
+        for _fname, ftype, _off in si.fields:
+            et = ftype
+            while isinstance(et, ArrayType):
+                et = et.element_type
+            fn = getattr(et, "name", None)
+            if fn in ("float32", "float64"):
+                return True
+            if fn in self.structs and self._struct_has_float_field(fn):
+                return True
+        return False
+
+    def _aggregate_return_class(self, t) -> Optional[int]:
+        """Byte size iff `t` is a <=16-byte pure-INTEGER-class aggregate that
+        may be RETURNED BY VALUE in rax:rdx (two INTEGER eightbytes), else
+        None.
+
+        Returnable: Slice[T] / String (the 16-byte {ptr,len} view), and a
+        struct whose size <= 16 that embeds no float field. Anything larger,
+        or float-containing (SSE class), returns None — the caller keeps the
+        by-ref (Ptr[T] out-parameter) convention and, at a def site, rejects
+        it loudly. This is the ONLY previously-rejected path now allowed, so
+        it is purely additive: no existing unit returns an aggregate by value,
+        hence codegen is byte-identical to base when the feature is unused."""
+        if isinstance(t, (SliceType, StringType)):
+            return 16                       # {ptr @0, len @8}, both INTEGER
+        if self._is_byvalue_struct_type(t):
+            size = self.get_type_size(t)
+            if size == 0 or size > 16:
+                return None
+            if self._struct_has_float_field(t.name):
+                return None
+            return size
+        return None
+
+    def _call_aggregate_return_class(self, expr) -> Optional[int]:
+        """If `expr` is a direct call whose callee returns a <=16-byte
+        pure-integer aggregate by value, its byte size; else None. Used at
+        assignment/return sites to store/forward the rax:rdx pair."""
+        if not isinstance(expr, CallExpr):
+            return None
+        if not isinstance(expr.func, Identifier):
+            return None
+        rt = self.func_return_types.get(expr.func.name)
+        return self._aggregate_return_class(rt)
+
     def gen_function(self, func: FunctionDef) -> None:
         self.ctx = FunctionContext(name=func.name)
         self._cur_return_type = func.return_type
@@ -1937,24 +1993,29 @@ class X86CodeGen:
                     f"`Ptr[{param.param_type.name}]` (the caller takes "
                     f"`&obj`) — Adder has no by-value aggregate ABI"
                 )
+        # By-value aggregate RETURN (previously rejected outright) is now
+        # allowed when the type is a <=16-byte pure-INTEGER aggregate: it is
+        # returned in rax:rdx (System V AMD64 two-INTEGER-eightbyte rule).
+        # Slice[T] / String (the 16-byte {ptr,len} view) always qualify; a
+        # struct qualifies iff <=16 bytes and float-free. Anything else stays
+        # by-ref and is rejected here as before. By-value PARAM passing is
+        # still unsupported (handled above).
         if isinstance(func.return_type, (SliceType, StringType)):
-            span = getattr(func, "span", None)
-            raise CodeGenError(
-                f"x86: by-value {func.return_type.name} return "
-                f"`-> {func.return_type.name}` in "
-                f"'{func.name}' is not supported at {_span_location(span)}; "
-                f"return through a `Ptr[{func.return_type.name}]` "
-                f"out-parameter — Adder has no by-value aggregate ABI"
-            )
-        if self._is_byvalue_struct_type(func.return_type):
-            span = getattr(func, "span", None)
-            raise CodeGenError(
-                f"x86: by-value struct return "
-                f"`-> {func.return_type.name}` in '{func.name}' is not "
-                f"supported at {_span_location(span)}; return through a "
-                f"`Ptr[{func.return_type.name}]` out-parameter the caller "
-                f"supplies — Adder has no by-value aggregate ABI"
-            )
+            pass                            # <=16B {ptr,len} -> rax:rdx
+        elif self._is_byvalue_struct_type(func.return_type):
+            if self._aggregate_return_class(func.return_type) is None:
+                span = getattr(func, "span", None)
+                size = self.get_type_size(func.return_type)
+                why = ("larger than 16 bytes" if size > 16
+                       else "contains a float/SSE-class field")
+                raise CodeGenError(
+                    f"x86: by-value struct return "
+                    f"`-> {func.return_type.name}` in '{func.name}' is not "
+                    f"supported at {_span_location(span)} ({why}); return "
+                    f"through a `Ptr[{func.return_type.name}]` out-parameter "
+                    f"the caller supplies — only <=16-byte pure-integer "
+                    f"aggregates are returned by value (rax:rdx)"
+                )
 
         # Stack-protector V0: when needs_canary is set, reserve the 8-byte
         # canary slot at the TOP of the frame (closest to saved %rbp / the
@@ -2187,7 +2248,17 @@ class X86CodeGen:
                     # return values, so we can't go through the normal
                     # evaluate-then-store path.
                     cname = self._ctor_call_class(value)
-                    if cname is not None:
+                    agg_call = self._call_aggregate_return_class(value)
+                    if agg_call is not None:
+                        # `x: Slice[T] = make(...)` — the callee returns the
+                        # aggregate by value in rax:rdx; store the pair into the
+                        # local's <=16-byte slot (low word -> [slot], high word
+                        # -> [slot+8]).
+                        self.gen_expr(value)
+                        self.emit(f"    movq %rax, {var.offset}(%rbp)")
+                        if agg_call > 8:
+                            self.emit(f"    movq %rdx, {var.offset + 8}(%rbp)")
+                    elif cname is not None:
                         self._emit_ctor_init(var, cname, value)
                     elif self._maybe_gen_none_coercion(value, var_type):
                         # `x: Option = None` -> the empty variant word.
@@ -2223,6 +2294,20 @@ class X86CodeGen:
                     self._emit_string_new_into(
                         self.ctx.locals[target.name].offset, value)
                     return
+                # By-value aggregate return: `x = make(...)` where make
+                # returns a <=16-byte aggregate stores the rax:rdx pair into
+                # x's slot (the local is a 16-byte aggregate).
+                if op is None and isinstance(target, Identifier) \
+                        and self.ctx is not None \
+                        and target.name in self.ctx.locals:
+                    agg_call = self._call_aggregate_return_class(value)
+                    if agg_call is not None:
+                        var = self.ctx.locals[target.name]
+                        self.gen_expr(value)
+                        self.emit(f"    movq %rax, {var.offset}(%rbp)")
+                        if agg_call > 8:
+                            self.emit(f"    movq %rdx, {var.offset + 8}(%rbp)")
+                        return
                 # Constructor sugar: `f = Foo(args)` where Foo is a
                 # class with __init__ lowers to Foo__init(&f, args).
                 if op is None and isinstance(target, Identifier):
@@ -2236,9 +2321,27 @@ class X86CodeGen:
 
             case ReturnStmt(value=value):
                 if value is not None:
+                    agg_ret = self._aggregate_return_class(
+                        self._cur_return_type)
+                    if agg_ret is not None:
+                        # By-value aggregate return: materialize the <=16-byte
+                        # aggregate into rax:rdx (two INTEGER eightbytes). If
+                        # the value is itself an aggregate-returning call, the
+                        # callee already left the pair in rax:rdx (tail-
+                        # forward, no reload). Otherwise the aggregate decays
+                        # to its address in %rax; load byte 0-7 -> rax and (for
+                        # a >8-byte aggregate) byte 8-15 -> rdx. rdx is loaded
+                        # FIRST since the low-word load clobbers the address.
+                        if self._call_aggregate_return_class(value) is not None:
+                            self.gen_expr(value)
+                        else:
+                            self.gen_expr(value)
+                            if agg_ret > 8:
+                                self.emit("    movq 8(%rax), %rdx")
+                            self.emit("    movq (%rax), %rax")
                     # `return None` in an Option-returning function means the
                     # empty variant, not the integer 0.
-                    if not self._maybe_gen_none_coercion(
+                    elif not self._maybe_gen_none_coercion(
                             value, self._cur_return_type):
                         self.gen_expr(value)
                 # Canary-protected functions route every return through
