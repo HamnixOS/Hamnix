@@ -11537,6 +11537,18 @@ def gen_call(node: uint32):
     if is_local_call != 0 or is_glob_fnptr != 0:
         is_indirect = 1
 
+    # By-value aggregate ARGUMENTS (roadmap increment 9): a DIRECT, positional
+    # call whose callee declares a by-value aggregate parameter takes the
+    # dedicated marshaling path (each aggregate expands into its two INTEGER
+    # eightbytes across consecutive arg registers). Fires ONLY when a callee
+    # actually declares such a param — none in the existing corpus — so the
+    # scalar path below stays byte-identical when the feature is unused. Mirrors
+    # the seed's is_direct + _call_arg_agg_classes gate.
+    if is_indirect == 0 and use_norm == 0:
+        if callee_has_byval_agg_param(callee) != 0:
+            gen_call_agg_args(node, callee)
+            return
+
     # Indirect call: evaluate the function-pointer FIRST into a 16-byte stash
     # (keeps %rsp 16-aligned at the call), reclaimed into %r11 before the call.
     # Mirrors codegen_x86.gen_call's indirect path.
@@ -11931,6 +11943,215 @@ def call_return_type(callnode: uint32) -> uint32:
     return 0
 
 
+# -----------------------------------------------------------------------
+# By-value aggregate ABI (roadmap increments 8 & 9): a <=16-byte pure-INTEGER
+# aggregate crosses a function boundary in registers — RETURNED in rax:rdx and
+# PASSED in the SysV INTEGER arg registers. These helpers + the emit/accept
+# sites below mirror codegen_x86 (the seed oracle) BYTE-FOR-BYTE.
+# -----------------------------------------------------------------------
+
+# True iff struct `sidx1-1` (recursively) embeds a float/SSE-class field. Such
+# an aggregate would need XMM registers; this backend only implements the
+# INTEGER-class register path, so a float-containing struct is NOT by-value
+# eligible and stays by-ref. An array field is inspected by its element type;
+# a nested struct field is inspected recursively. Mirrors codegen_x86
+# _struct_has_float_field.
+def struct_has_float_field(sidx1: uint32) -> uint32:
+    si: uint32 = sidx1 - 1
+    base: uint32 = st_field_base[si]
+    n: uint32 = st_nfields[si]
+    i: uint32 = 0
+    while i < n:
+        idx: uint32 = base + i
+        et: uint32 = sf_type_node[idx]
+        while et != 0 and nd_kind[et] == ND_ARRAY_TYPE:
+            et = nd_a[et]
+        if type_float_width(et) != 0:
+            return 1
+        nsi: uint32 = struct_lookup_by_node(et)
+        if nsi != 0:
+            if struct_has_float_field(nsi) != 0:
+                return 1
+        i = i + 1
+    return 0
+
+
+# Byte size (8 or 16) iff `tnode` is a <=16-byte pure-INTEGER aggregate that
+# may cross a boundary BY VALUE (returned in rax:rdx / passed in INTEGER arg
+# regs), else 0. Eligible: the ND_SLICE_TYPE {ptr,len} view (always 16 bytes,
+# both INTEGER), and a struct whose 8-byte-rounded size <=16 that embeds no
+# float. Anything larger, or float-containing (SSE class), returns 0 — the
+# caller keeps the by-ref (Ptr[T]) convention and rejects at the def site.
+# (Native has no String type node, so String is not represented here.) Mirrors
+# codegen_x86._aggregate_return_class.
+def aggregate_class(tnode: uint32) -> uint32:
+    if tnode == 0:
+        return 0
+    if nd_kind[tnode] == ND_SLICE_TYPE:
+        return 16                       # {ptr @0, len @8}, both INTEGER
+    si: uint32 = struct_lookup_by_node(tnode)
+    if si != 0:
+        size: uint32 = st_total[si - 1]
+        if size == 0 or size > 16:
+            return 0
+        if struct_has_float_field(si) != 0:
+            return 0
+        return size
+    return 0
+
+
+# If `expr` is a DIRECT call whose callee returns a <=16-byte pure-INTEGER
+# aggregate by value, its byte size (8/16); else 0. Used at assignment/return
+# sites to store/forward the rax:rdx pair. Mirrors codegen_x86
+# _call_aggregate_return_class.
+def call_agg_return_class(expr: uint32) -> uint32:
+    if expr == 0:
+        return 0
+    if nd_kind[expr] != ND_CALL:
+        return 0
+    callee: uint32 = nd_a[expr]
+    if nd_kind[callee] != ND_IDENT:
+        return 0
+    return aggregate_class(call_return_type(expr))
+
+
+# The by-value-aggregate byte size (8/16) of a parameter node's declared type,
+# else 0. The param's type node is on nd_a (same slot spill_params reads).
+def param_agg_class(param: uint32) -> uint32:
+    return aggregate_class(nd_a[param])
+
+
+# True iff the DIRECT-call callee named by `callee` (an ND_IDENT) is an in-unit
+# function that declares at least one by-value aggregate parameter — the gate
+# for the dedicated arg-marshaling path. Byte-inert: no existing unit declares
+# such a param, so this returns 0 across the whole corpus. Mirrors the seed's
+# _call_arg_agg_classes "any_agg" test.
+def callee_has_byval_agg_param(callee: uint32) -> uint32:
+    fnnode: uint32 = find_prog_function(nd_name_off[callee], nd_name_len[callee])
+    if fnnode == 0:
+        return 0
+    prm: uint32 = nd_a[fnnode]
+    while prm != 0:
+        if param_agg_class(prm) != 0:
+            return 1
+        prm = nd_next[prm]
+    return 0
+
+
+# movq %rdx, off(%rbp)  — store the HIGH eightbyte of a returned aggregate.
+#   -> 48 89 {55 disp8 | 95 disp32}   (modrm.reg = rdx = 010)
+def emit_store_local_rdx(off: int32):
+    emit_b(0x48)
+    emit_b(0x89)
+    emit_rbp_mem(0x55, off)
+
+
+# movq disp8(%rax), %rdx  -> 48 8B 50 disp8
+# Load the HIGH eightbyte (byte 8..15) of a by-value aggregate whose ADDRESS is
+# in %rax into %rdx, at the `ret` of a >8-byte aggregate return. Loaded BEFORE
+# the low-word `movq (%rax),%rax`, which clobbers the address. Mirrors the seed.
+def emit_mov_rax_disp8_rdx(disp: uint32):
+    emit_b(0x48)
+    emit_b(0x8B)
+    emit_b(0x50)
+    emit_b(disp)
+
+
+# movq disp(%rax), %r10  — load an aggregate ARGUMENT's eightbyte (from the
+# address in %rax) into the scratch %r10 for the push/pop marshalling.
+#   movq (%rax),%r10   -> 4C 8B 10          (disp 0)
+#   movq 8(%rax),%r10  -> 4C 8B 50 08       (disp8)
+# Mirrors codegen_x86._gen_call_with_agg_args's `movq disp(%rax),%r10`.
+def emit_mov_rax_disp_r10(disp: uint32):
+    emit_b(0x4C)
+    emit_b(0x8B)
+    if disp == 0:
+        emit_b(0x10)                    # mod=00 reg=r10 rm=rax
+    else:
+        emit_b(0x50)                    # mod=01 reg=r10 rm=rax + disp8
+        emit_b(disp)
+
+
+# pushq %r10  -> 41 52
+def emit_push_r10():
+    emit_b(0x41)
+    emit_b(0x52)
+
+
+# Store an aggregate-returning call's rax:rdx pair into the slot at `off`
+# (low eightbyte -> off, high -> off+8 when the aggregate is >8 bytes). The
+# callee already left the pair in rax:rdx, so we just evaluate the call and
+# spill. Mirrors the seed's VarDecl-init / plain-Assignment agg-call store.
+def emit_store_agg_call(off: int32, val: uint32, cls: uint32):
+    gen_expr(val)
+    emit_store_local_rax(off)
+    if cls > 8:
+        emit_store_local_rdx(off + 8)
+
+
+# Marshal a DIRECT call `callee(args)` in which one or more parameters are
+# declared by value as a <=16-byte aggregate. Each aggregate arg expands into
+# its two INTEGER eightbytes across consecutive arg registers (SysV order
+# rdi,rsi,rdx,rcx,r8,r9); a scalar arg consumes one register, a <=8B aggregate
+# one, a 9..16B aggregate two. Evaluate each arg and PUSH its eightbyte(s) in
+# register order, then POP in reverse so slot j lands in ARG_REGS[j]. A scalar
+# arg's value is %rax; an aggregate decays to its ADDRESS in %rax, from which
+# the low (and, for >8B, high) eightbyte are loaded via %r10 and pushed. If the
+# eightbytes would need more than 6 registers (or split across the boundary),
+# reject loudly — this backend does not stack-pass a by-value aggregate. Mirrors
+# codegen_x86._gen_call_with_agg_args byte-for-byte.
+def gen_call_agg_args(node: uint32, callee: uint32):
+    fnnode: uint32 = find_prog_function(nd_name_off[callee], nd_name_len[callee])
+    # Pass 1: count the total INTEGER register slots the args demand; reject on
+    # exhaustion BEFORE emitting anything (mirrors the seed building reg_slots
+    # then checking len > 6).
+    prm: uint32 = nd_a[fnnode]
+    arg: uint32 = nd_b[node]
+    nslots: uint32 = 0
+    while prm != 0 and arg != 0:
+        clsc: uint32 = param_agg_class(prm)
+        if clsc == 0:
+            nslots = nslots + 1
+        else:
+            nslots = nslots + 1
+            if clsc > 8:
+                nslots = nslots + 1
+        prm = nd_next[prm]
+        arg = nd_next[arg]
+    if nslots > 6:
+        cg_fail(9, node)                # by-value aggregate arg register exhaustion
+        return
+    # Pass 2: evaluate + push each register slot in ARG_REGS order.
+    prm = nd_a[fnnode]
+    arg = nd_b[node]
+    while prm != 0 and arg != 0:
+        clse: uint32 = param_agg_class(prm)
+        if clse == 0:
+            gen_expr(arg)               # scalar -> %rax
+            emit_push_rax()
+        else:
+            gen_expr(arg)               # aggregate ADDRESS -> %rax
+            emit_mov_rax_disp_r10(0)    # movq (%rax),%r10   (low eightbyte)
+            emit_push_r10()
+            if clse > 8:
+                emit_mov_rax_disp_r10(8)  # movq 8(%rax),%r10 (high eightbyte)
+                emit_push_r10()
+        prm = nd_next[prm]
+        arg = nd_next[arg]
+    # Reverse-pop so value j lands in ARG_REGS[j].
+    j: uint32 = nslots
+    while j > 0:
+        j = j - 1
+        emit_pop_argreg(j)
+    # Direct call: SysV variadic AL-zeroing then `call rel32` (fixup resolved
+    # once all functions are emitted) — identical bytes to the scalar direct path.
+    emit_xor_eax_eax()
+    emit_b(0xE8)
+    at: uint32 = code_len
+    emit_imm32(cast[uint64](0))
+    add_call_fixup(at, nd_name_off[callee], nd_name_len[callee])
+
+
 # The pointee struct index (+1) of an expression whose static type is a
 # Ptr[Struct]: a cast `cast[Ptr[S]](e)`, a function call returning `Ptr[S]`.
 # Used so an indexed base `EXPR[i].leaf` resolves the element struct uniformly.
@@ -12261,6 +12482,24 @@ def gen_stmt(node: uint32):
         return
 
     if k == ND_RETURN:
+        # By-value aggregate return (roadmap 8): materialize the <=16-byte
+        # aggregate into rax:rdx (System V AMD64 two-INTEGER-eightbyte rule). If
+        # the value is itself an aggregate-returning call, the callee already
+        # left the pair in rax:rdx (tail-forward, no reload). Otherwise the
+        # aggregate decays to its ADDRESS in %rax; load byte 8-15 -> rdx (for a
+        # >8-byte aggregate) FIRST, since the low-word load into %rax clobbers
+        # the address, then byte 0-7 -> rax. Mirrors codegen_x86's ReturnStmt.
+        agg_ret: uint32 = aggregate_class(cg_cur_return_type)
+        if agg_ret != 0:
+            if call_agg_return_class(nd_a[node]) != 0:
+                gen_expr(nd_a[node])                 # pair already in rax:rdx
+            else:
+                gen_expr(nd_a[node])                 # aggregate address -> %rax
+                if agg_ret > 8:
+                    emit_mov_rax_disp8_rdx(8)        # movq 8(%rax),%rdx
+                emit_load_mem_rax(8)                 # movq (%rax),%rax
+            emit_function_epilogue()
+            return
         # `return None` in an Option-returning function means the empty variant,
         # not the integer 0. Byte-inert when the program uses no enums.
         if en_count != 0 and maybe_gen_none_coercion(nd_a[node], cg_cur_return_type) != 0:
@@ -12293,6 +12532,14 @@ def gen_stmt(node: uint32):
             declare_local(nd_name_off[node], nd_name_len[node], tnode)
             val0: uint32 = nd_b[node]
             if val0 != 0:
+                # `x: Struct = make(...)` where make returns the struct by value:
+                # the callee left the rax:rdx pair; store it into x's slot.
+                sc0: uint32 = call_agg_return_class(val0)
+                if sc0 != 0:
+                    off_c0: int32 = 0
+                    if lookup_local(nd_name_off[node], nd_name_len[node], &off_c0) != 0:
+                        emit_store_agg_call(off_c0, val0, sc0)
+                    return
                 gen_ctor_init(node, tnode, val0)
             return
         # Slice[T] local: the 16-byte slot was reserved in the prescan. A
@@ -12304,7 +12551,14 @@ def gen_stmt(node: uint32):
             if val_s != 0:
                 off_s: int32 = 0
                 if lookup_local(nd_name_off[node], nd_name_len[node], &off_s) != 0:
-                    emit_slice_new_into(off_s, val_s)
+                    # `s: Slice[T] = make(...)` returning a Slice by value: store
+                    # the rax:rdx {ptr,len} pair. A Slice[T](...) constructor
+                    # writes the pair in place instead (no register value).
+                    sc_s: uint32 = call_agg_return_class(val_s)
+                    if sc_s != 0:
+                        emit_store_agg_call(off_s, val_s, sc_s)
+                    else:
+                        emit_slice_new_into(off_s, val_s)
             return
         val: uint32 = nd_b[node]
         if val != 0:
@@ -12349,6 +12603,16 @@ def gen_stmt(node: uint32):
             if lookup_local(nd_name_off[tgt], nd_name_len[tgt], &off_sa) != 0:
                 emit_slice_new_into(off_sa, nd_b[node])
                 return
+        # By-value aggregate return: `x = make(...)` where make returns a
+        # <=16-byte aggregate stores the rax:rdx pair into x's (aggregate) slot.
+        # Mirrors codegen_x86's plain-Assignment agg-call form.
+        if nd_aux[node] == AUGOP_NONE:
+            sc_a: uint32 = call_agg_return_class(nd_b[node])
+            if sc_a != 0:
+                off_ca: int32 = 0
+                if lookup_local(nd_name_off[tgt], nd_name_len[tgt], &off_ca) != 0:
+                    emit_store_agg_call(off_ca, nd_b[node], sc_a)
+                    return
         aug: uint32 = nd_aux[node]
         if aug == AUGOP_NONE:
             # P1 Phase 1: under --opt, try the destination-driven selector for
@@ -14237,6 +14501,18 @@ def prescan_block(head: uint32):
 # byte offset in code[] where this function's machine code begins.
 # -----------------------------------------------------------------------
 
+# The by-value-aggregate byte size (8/16) of the local at slot index `idx` if it
+# is an in-place struct value or a Slice[T] fat pointer (a by-value aggregate
+# PARAM homes in such a slot), else 0. spill_params reads this to expand an
+# aggregate param across one or two INTEGER arg registers.
+def loc_byval_agg_size(idx: uint32) -> uint32:
+    if loc_type_node[idx] != 0 and nd_kind[loc_type_node[idx]] == ND_SLICE_TYPE:
+        return 16
+    if loc_struct_idx[idx] != 0 and loc_struct_is_ptr[idx] == 0:
+        return st_total[loc_struct_idx[idx] - 1]
+    return 0
+
+
 # Spill the parameter chain `params` (an ND_PARAM list) from the SysV arg
 # registers (args 0..5) and the stack (args 6+) into their frame slots,
 # mirroring codegen_x86.gen_function's spill pass. Each param's slot index
@@ -14248,7 +14524,32 @@ def prescan_block(head: uint32):
 def spill_params(params: uint32):
     p: uint32 = params
     idx: uint32 = 0
+    reg_idx: uint32 = 0
     while p != 0:
+        # By-value aggregate param (roadmap 9): the caller placed its two
+        # INTEGER eightbytes in the next arg registers. A <=8B aggregate uses one
+        # register (low -> slot base); a 9..16B aggregate uses two consecutive
+        # registers (low -> base, high -> base+8). If the pair would split across
+        # the 6-register boundary, SysV says stack-pass the WHOLE aggregate —
+        # this increment does NOT implement that, so reject loudly rather than
+        # mis-spill. reg_idx advances by the register count so later params get
+        # the right ordinal. Mirrors codegen_x86's per-param agg spill.
+        agg: uint32 = loc_byval_agg_size(idx)
+        if agg != 0:
+            nregs: uint32 = 1
+            if agg > 8:
+                nregs = 2
+            if reg_idx + nregs > 6:
+                cg_fail(9, p)       # by-value aggregate param register split
+                return
+            off_a: int32 = loc_offset[idx]
+            emit_spill_arg(reg_idx, off_a)
+            if nregs == 2:
+                emit_spill_arg(reg_idx + 1, off_a + 8)
+            reg_idx = reg_idx + nregs
+            idx = idx + 1
+            p = nd_next[p]
+            continue
         # DEAD PARAM-HOME ELISION (--opt): a register-promoted, store-eliminable,
         # plain-scalar param's home slot has no reader (the init reload is replaced
         # by a direct arg-reg move in ra_emit_init_regs), so its spill store is
@@ -14256,12 +14557,13 @@ def spill_params(params: uint32):
         # default spill path is byte-identical to the seed.
         if param_home_elidable(p, idx) != 0:
             idx = idx + 1
+            reg_idx = reg_idx + 1
             p = nd_next[p]
             continue
         sz: uint32 = loc_scalar_size[idx]
         off: int32 = loc_offset[idx]
-        if idx < 6:
-            emit_spill_arg_sized(idx, off, sz)
+        if reg_idx < 6:
+            emit_spill_arg_sized(reg_idx, off, sz)
         else:
             # Stack arg: with NO callee-saved pushes, arg 6 sits at +16(%rbp)
             # (just above the return addr + saved %rbp), arg 7 at +24, ... When the
@@ -14272,10 +14574,11 @@ def spill_params(params: uint32):
             # 7th+ argument is read from the wrong slot (a latent miscompile that
             # only surfaces with >=7 params AND an active callee-save prologue).
             callee_disp: int32 = cast[int32](cg_saved_count() * 8)
-            stack_off: int32 = cast[int32](16 + (idx - 6) * 8) + callee_disp
+            stack_off: int32 = cast[int32](16 + (reg_idx - 6) * 8) + callee_disp
             emit_load_local_rax(stack_off)        # movq stack_off(%rbp),%rax
             emit_store_local_rax_sized(off, sz)   # sized store into the slot
         idx = idx + 1
+        reg_idx = reg_idx + 1
         p = nd_next[p]
 
 
@@ -14293,21 +14596,20 @@ def gen_function(fn: uint32) -> uint32:
     cg_self_struct = 0          # a plain function has no `self` receiver
     cg_cur_return_type = nd_b[fn]   # for `?` and `return None` Option coercion
 
-    # Reject a by-value aggregate RETURN type (ND_FUNCTION's return type is on
-    # nd_b): a struct, or the ND_SLICE_TYPE {ptr,len} view. The SEED backend
-    # (codegen_x86, the default $ADDER_CC) implements the <=16-byte pure-INTEGER
-    # rax:rdx return convention; the native backend does NOT yet, so it REJECTS
-    # such returns cleanly rather than mis-returning the aggregate's ADDRESS.
-    # Byte-inert: no existing unit returns an aggregate by value, so this never
-    # fires on the userland/kernel/objdiff corpus. (`-> String` is not a native
-    # return type — the native parser has no String annotation — so no case for
-    # it here.)
+    # By-value aggregate RETURN type (ND_FUNCTION's return type is on nd_b): a
+    # struct, or the ND_SLICE_TYPE {ptr,len} view. A <=16-byte pure-INTEGER
+    # aggregate is now RETURNED in rax:rdx (System V AMD64 two-INTEGER-eightbyte
+    # rule) — the ND_RETURN site materializes the pair, and a call site `x=mk()`
+    # stores it. Anything larger, or a float/SSE-class struct, stays by-ref and
+    # is still REJECTED cleanly (reason=9) rather than mis-returning the
+    # aggregate's ADDRESS. Byte-inert: no existing unit returns an aggregate by
+    # value. (`-> String` is not a native return type — the native parser has no
+    # String annotation — so no case for it here.) Mirrors codegen_x86.
     if struct_lookup_by_node(nd_b[fn]) != 0:
-        cg_fail(9, fn)              # by-value struct return: unsupported
-        return start
-    if nd_b[fn] != 0 and nd_kind[nd_b[fn]] == ND_SLICE_TYPE:
-        cg_fail(9, fn)              # by-value Slice[T] return: unsupported (native)
-        return start
+        if aggregate_class(nd_b[fn]) == 0:
+            cg_fail(9, fn)          # >16B or float struct return: still by-ref
+            return start
+    # (an ND_SLICE_TYPE return always qualifies — 16-byte {ptr,len}, both INTEGER)
 
     # A default-valued parameter (roadmap 7) must not precede a
     # non-default one — mirror the seed's validation so both backends
@@ -14331,26 +14633,32 @@ def gen_function(fn: uint32) -> uint32:
         # holds the pointer value), but we record its pointee width so the
         # body's p[i] indexing dereferences with the right element size.
         ptnode: uint32 = nd_a[p]
-        # Reject a by-value struct parameter (a bare class-named type, NOT a
-        # Ptr[Class]). Adder has no by-value aggregate ABI: aggregates cross
-        # function boundaries through Ptr[T] (the caller passes &obj). The
-        # seed (codegen_x86) raises the same error; this keeps the backends
-        # in lockstep instead of silently spilling one register's worth and
-        # reading the rest as stack garbage.
-        if struct_lookup_by_node(ptnode) != 0:
-            cg_fail(9, p)            # by-value struct param: unsupported (native)
-            return start
-        # By-value Slice[T] parameter (the ND_SLICE_TYPE {ptr,len} view). The
-        # SEED backend now passes a <=16-byte pure-INTEGER aggregate param in
-        # two INTEGER arg registers (roadmap increment 9); the native backend
-        # does NOT yet emit that convention, so it REJECTS cleanly rather than
-        # spilling one register's worth and reading the rest as stack garbage —
-        # seed-first, exactly like the by-value aggregate RETURN side (#302).
-        # Byte-inert: no existing unit declares a by-value Slice param, so this
-        # never fires on the userland/kernel/objdiff corpus.
+        # By-value aggregate PARAMETER (roadmap increment 9): a <=16-byte
+        # pure-INTEGER aggregate — a Slice[T] {ptr,len} view or a <=16B
+        # float-free struct — is now PASSED in the SysV INTEGER arg registers
+        # (the caller materializes its eightbytes; spill_params below spills them
+        # into the param's slot). Allocate the slot like the matching LOCAL (a
+        # struct slot for a struct, a 16-byte {ptr,len} slot for a slice) so
+        # `.field` / `.len` / `s[i]` reads resolve against it. A >16B or
+        # float/SSE-class struct param stays by-ref and is still REJECTED cleanly
+        # (reason=9). Byte-inert: no existing unit declares such a param. Mirrors
+        # codegen_x86's per-param accept + FunctionContext slot.
         if ptnode != 0 and nd_kind[ptnode] == ND_SLICE_TYPE:
-            cg_fail(9, p)            # by-value Slice[T] param: unsupported (native)
-            return start
+            alloc_slice_local(nd_name_off[p], nd_name_len[p])
+            if loc_count > 0:
+                loc_type_node[loc_count - 1] = ptnode
+            nparams = nparams + 1
+            p = nd_next[p]
+            continue
+        pssi: uint32 = struct_lookup_by_node(ptnode)
+        if pssi != 0:
+            if aggregate_class(ptnode) == 0:
+                cg_fail(9, p)        # >16B or float struct param: still by-ref
+                return start
+            alloc_struct_local(nd_name_off[p], nd_name_len[p], st_total[pssi - 1], pssi)
+            nparams = nparams + 1
+            p = nd_next[p]
+            continue
         psz: uint32 = ptr_pointee_size(ptnode)
         if psz != 0:
             psidx_pp: uint32 = ptr_struct_idx(ptnode)

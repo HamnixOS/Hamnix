@@ -113,32 +113,49 @@ python3 -m compiler.adder asm "$FIX/aggret_slice.ad" --target=x86_64-bare-metal 
     || fail "bare-metal asm of the slice fixture failed: $(cat "$WORK/km.err")"
 echo "[aggret]   bare-metal codegen OK (feature is opt-in-by-use, zero-cost off)"
 
-echo "[aggret] (6) NATIVE seed-first: host_ac.elf REJECTS by-value Slice return"
-# Invoke the self-hosted compiler binary DIRECTLY (NOT adder_cc_compile, which
-# falls back to the seed on a native reject and would mask it). A clean reject
-# is a non-zero exit with codegen reason=9 (by-value aggregate return), NOT a
-# produced .elf that mis-returns the aggregate's address.
+echo "[aggret] (6) NATIVE ACCEPTS + byte-matches: the self-hosted .ad backend"
+echo "[aggret]     (host_ac.elf) now EMITS the rax:rdx return convention"
+echo "[aggret]     byte-identically to the seed (roadmap increment 10)."
+# The native backend now implements the ABI; it must ACCEPT a <=16B float-free
+# struct / Slice[T] return and emit BYTE-IDENTICAL machine code to the seed
+# (verified per-function by scripts/objdiff_normalize.py). A >16B / float struct
+# return STILL rejects in both backends. (String has no native parser
+# annotation, so aggret_string stays seed-only and is not exercised here.)
 if [ -f scripts/_adder_cc.sh ]; then
     source scripts/_adder_cc.sh
     if ADDER_CC=adder adder_cc_bootstrap >"$WORK/boot.log" 2>&1 \
             && [ -x build/cutover/host_ac.elf ]; then
-        rm -f "$WORK/slice.native"
+        for u in aggret_struct aggret_slice; do
+            ADDER_CC=python adder_cc_compile compile --target=x86_64-adder-user \
+                "$FIX/$u.ad" -o "$WORK/$u.seed.elf" >/dev/null 2>"$WORK/$u.se" \
+                || fail "seed native-target compile failed for $u: $(cat "$WORK/$u.se")"
+            ADDER_CC=adder adder_cc_compile compile --target=x86_64-adder-user \
+                "$FIX/$u.ad" -o "$WORK/$u.nat.elf" >/dev/null 2>"$WORK/$u.ne" \
+                || fail "native host_ac.elf REJECTED $u (expected accept: $(cat "$WORK/$u.ne"))"
+            python3 scripts/objdiff_normalize.py "$WORK/$u.seed.elf" \
+                "$WORK/$u.nat.elf" "$u" >"$WORK/$u.odiff" 2>&1 \
+                || fail "native $u DIVERGES from the seed (not byte-clean): $(cat "$WORK/$u.odiff")"
+            echo "[aggret]   native accepts + byte-matches $u: $(cat "$WORK/$u.odiff")"
+        done
+        # A >16-byte struct return is still unsupported and must REJECT cleanly
+        # in native too (reason=9), never mis-return an address. Invoke
+        # host_ac.elf directly so the seed fallback can't mask it.
+        rm -f "$WORK/big.native"
         if build/cutover/host_ac.elf --target=x86_64-adder-user \
-                "$FIX/aggret_slice.ad" "$WORK/slice.native" \
-                >"$WORK/native.out" 2>&1; then
-            fail "native host_ac.elf ACCEPTED a by-value Slice return (expected clean reject — do not ship a native miscompile)"
+                "$WORK/big.ad" "$WORK/big.native" >"$WORK/big.nout" 2>&1; then
+            fail "native host_ac.elf ACCEPTED a >16B struct return (expected clean reject)"
         fi
-        [ -s "$WORK/slice.native" ] && fail "native reject still produced an ELF (miscompile risk)"
-        grep -q "reason=9" "$WORK/native.out" \
-            || fail "native reject was not the by-value-aggregate reason=9: $(cat "$WORK/native.out")"
-        echo "[aggret]   native rejected: $(grep -o 'codegen error reason=9.*' "$WORK/native.out" | head -1)"
+        [ -s "$WORK/big.native" ] && fail "native reject still produced an ELF (miscompile risk)"
+        grep -q "reason=9" "$WORK/big.nout" \
+            || fail "native >16B reject was not the by-value-aggregate reason=9: $(cat "$WORK/big.nout")"
+        echo "[aggret]   native rejected >16B struct: $(grep -o 'codegen error reason=9.*' "$WORK/big.nout" | head -1)"
     else
-        echo "[aggret]   (native host_ac.elf bootstrap unavailable; skipping native-reject check)"
+        echo "[aggret]   (native host_ac.elf bootstrap unavailable; skipping native-accept check)"
     fi
 else
-    echo "[aggret]   (_adder_cc.sh absent; skipping native-reject check)"
+    echo "[aggret]   (_adder_cc.sh absent; skipping native-accept check)"
 fi
 
 echo "[aggret] PASS — struct/Slice/String <=16B pure-integer aggregates return"
 echo "[aggret]        by value in rax:rdx; >16B & float structs rejected; native"
-echo "[aggret]        rejects (seed-first); bare-metal zero-cost."
+echo "[aggret]        ACCEPTS + byte-matches the seed; bare-metal zero-cost."

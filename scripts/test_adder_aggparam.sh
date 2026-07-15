@@ -137,33 +137,51 @@ python3 -m compiler.adder asm "$FIX/aggparam_slice.ad" --target=x86_64-bare-meta
 echo "[aggparam]   bare-metal codegen OK (feature is opt-in-by-use; the kernel"
 echo "[aggparam]   declares no by-value aggregate param, so it is byte-inert/zero-cost)"
 
-echo "[aggparam] (6) NATIVE seed-first: host_ac.elf REJECTS a by-value Slice param"
-# Invoke the self-hosted compiler binary DIRECTLY (NOT adder_cc_compile, which
-# falls back to the seed on a native reject and would mask it). A clean reject
-# is a non-zero exit with codegen reason=9 (by-value aggregate param), NOT a
-# produced .elf that mis-spills one register and reads the rest as stack garbage.
+echo "[aggparam] (6) NATIVE ACCEPTS + byte-matches: the self-hosted .ad backend"
+echo "[aggparam]     (host_ac.elf) now EMITS the by-value aggregate param convention"
+echo "[aggparam]     byte-identically to the seed (roadmap increment 10)."
+# The native backend now implements the ABI; it must ACCEPT a <=16B float-free
+# struct / Slice[T] param and emit BYTE-IDENTICAL machine code to the seed
+# (verified per-function by scripts/objdiff_normalize.py, the objdiff gate's
+# comparator). A >16B / float / register-splitting param STILL rejects in both
+# backends. (String has no native parser annotation, so aggparam_string stays
+# seed-only and is not exercised here.)
 if [ -f scripts/_adder_cc.sh ]; then
     source scripts/_adder_cc.sh
     if ADDER_CC=adder adder_cc_bootstrap >"$WORK/boot.log" 2>&1 \
             && [ -x build/cutover/host_ac.elf ]; then
-        rm -f "$WORK/slice.native"
+        for u in aggparam_struct aggparam_slice; do
+            ADDER_CC=python adder_cc_compile compile --target=x86_64-adder-user \
+                "$FIX/$u.ad" -o "$WORK/$u.seed.elf" >/dev/null 2>"$WORK/$u.se" \
+                || fail "seed native-target compile failed for $u: $(cat "$WORK/$u.se")"
+            ADDER_CC=adder adder_cc_compile compile --target=x86_64-adder-user \
+                "$FIX/$u.ad" -o "$WORK/$u.nat.elf" >/dev/null 2>"$WORK/$u.ne" \
+                || fail "native host_ac.elf REJECTED $u (expected accept: $(cat "$WORK/$u.ne"))"
+            python3 scripts/objdiff_normalize.py "$WORK/$u.seed.elf" \
+                "$WORK/$u.nat.elf" "$u" >"$WORK/$u.odiff" 2>&1 \
+                || fail "native $u DIVERGES from the seed (not byte-clean): $(cat "$WORK/$u.odiff")"
+            echo "[aggparam]   native accepts + byte-matches $u: $(cat "$WORK/$u.odiff")"
+        done
+        # Register-EXHAUSTION (aggregate splits the 6-reg boundary) is still
+        # unsupported and must REJECT cleanly in native too (reason=9), never
+        # mis-spill. Invoke host_ac.elf directly so the seed fallback can't mask it.
+        rm -f "$WORK/exh.native"
         if build/cutover/host_ac.elf --target=x86_64-adder-user \
-                "$FIX/aggparam_slice.ad" "$WORK/slice.native" \
-                >"$WORK/native.out" 2>&1; then
-            fail "native host_ac.elf ACCEPTED a by-value Slice param (expected clean reject — do not ship a native miscompile)"
+                "$WORK/exh.ad" "$WORK/exh.native" >"$WORK/exh.nout" 2>&1; then
+            fail "native host_ac.elf ACCEPTED a register-splitting aggregate param (expected clean reject)"
         fi
-        [ -s "$WORK/slice.native" ] && fail "native reject still produced an ELF (miscompile risk)"
-        grep -q "reason=9" "$WORK/native.out" \
-            || fail "native reject was not the by-value-aggregate reason=9: $(cat "$WORK/native.out")"
-        echo "[aggparam]   native rejected: $(grep -o 'codegen error reason=9.*' "$WORK/native.out" | head -1)"
+        [ -s "$WORK/exh.native" ] && fail "native reject still produced an ELF (miscompile risk)"
+        grep -q "reason=9" "$WORK/exh.nout" \
+            || fail "native exhaustion reject was not the by-value-aggregate reason=9: $(cat "$WORK/exh.nout")"
+        echo "[aggparam]   native rejected register-split: $(grep -o 'codegen error reason=9.*' "$WORK/exh.nout" | head -1)"
     else
-        echo "[aggparam]   (native host_ac.elf bootstrap unavailable; skipping native-reject check)"
+        echo "[aggparam]   (native host_ac.elf bootstrap unavailable; skipping native-accept check)"
     fi
 else
-    echo "[aggparam]   (_adder_cc.sh absent; skipping native-reject check)"
+    echo "[aggparam]   (_adder_cc.sh absent; skipping native-accept check)"
 fi
 
 echo "[aggparam] PASS — struct/Slice/String <=16B pure-integer aggregates pass"
 echo "[aggparam]        by value in the INTEGER arg registers; >16B, float, and"
-echo "[aggparam]        register-splitting params rejected; native rejects"
-echo "[aggparam]        (seed-first); bare-metal zero-cost."
+echo "[aggparam]        register-splitting params rejected; native ACCEPTS +"
+echo "[aggparam]        byte-matches the seed; bare-metal zero-cost."
