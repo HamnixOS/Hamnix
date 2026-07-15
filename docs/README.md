@@ -55,6 +55,7 @@ column.
 | Desktop & userland | [subsystems/userland-de.md](subsystems/userland-de.md) | `user/`, `user/x11/` | full |
 | hamsh shell | [subsystems/hamsh.md](subsystems/hamsh.md) + [HAMSH_SPEC.md](HAMSH_SPEC.md) | `user/hamsh*` | full |
 | Adder language & compiler | [subsystems/adder-compiler.md](subsystems/adder-compiler.md) | `adder/`, `compiler/` | full |
+| Adder language guide (how to write it) | [adder_language_guide.md](adder_language_guide.md) | `adder/`, `lib/`, `tests/` | full |
 | Build & test | [subsystems/build-test.md](subsystems/build-test.md) | `scripts/`, `tests/` | full |
 | Crypto & support libs | [subsystems/libs.md](subsystems/libs.md) | `lib/` | full |
 | Package manager (hpm) | [packages.md](packages.md) | `user/hpm*`, `scripts/build_packages.py` | design spec |

@@ -7,7 +7,8 @@ to write (and easy for an LLM to emit correctly); expressive enough for real app
 still first-class for kernel work, where raw pointers/MMIO and zero overhead are the
 whole point.
 
-Companion doc: `docs/adder_memory_safety.md` (the bounds-check increments 1/1b/2, shipped).
+Companion docs: `docs/adder_memory_safety.md` (the bounds-check increments 1/1b/2, shipped)
+and `docs/adder_language_guide.md` (the human/agent-facing usage guide to the shipped feature set).
 
 ## Design invariants (every increment obeys these)
 
