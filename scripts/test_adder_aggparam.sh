@@ -144,13 +144,14 @@ echo "[aggparam]     byte-identically to the seed (roadmap increment 10)."
 # struct / Slice[T] param and emit BYTE-IDENTICAL machine code to the seed
 # (verified per-function by scripts/objdiff_normalize.py, the objdiff gate's
 # comparator). A >16B / float / register-splitting param STILL rejects in both
-# backends. (String has no native parser annotation, so aggparam_string stays
-# seed-only and is not exercised here.)
+# backends. (Roadmap increment 11: the native parser now recognises `String` as
+# an ND_SLICE_TYPE(uint8) 16-byte {ptr,len} aggregate, so aggparam_string is
+# native-accepted + byte-clean too.)
 if [ -f scripts/_adder_cc.sh ]; then
     source scripts/_adder_cc.sh
     if ADDER_CC=adder adder_cc_bootstrap >"$WORK/boot.log" 2>&1 \
             && [ -x build/cutover/host_ac.elf ]; then
-        for u in aggparam_struct aggparam_slice; do
+        for u in aggparam_struct aggparam_slice aggparam_string; do
             ADDER_CC=python adder_cc_compile compile --target=x86_64-adder-user \
                 "$FIX/$u.ad" -o "$WORK/$u.seed.elf" >/dev/null 2>"$WORK/$u.se" \
                 || fail "seed native-target compile failed for $u: $(cat "$WORK/$u.se")"

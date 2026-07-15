@@ -117,15 +117,16 @@ echo "[aggret] (6) NATIVE ACCEPTS + byte-matches: the self-hosted .ad backend"
 echo "[aggret]     (host_ac.elf) now EMITS the rax:rdx return convention"
 echo "[aggret]     byte-identically to the seed (roadmap increment 10)."
 # The native backend now implements the ABI; it must ACCEPT a <=16B float-free
-# struct / Slice[T] return and emit BYTE-IDENTICAL machine code to the seed
-# (verified per-function by scripts/objdiff_normalize.py). A >16B / float struct
-# return STILL rejects in both backends. (String has no native parser
-# annotation, so aggret_string stays seed-only and is not exercised here.)
+# struct / Slice[T] / String return and emit BYTE-IDENTICAL machine code to the
+# seed (verified per-function by scripts/objdiff_normalize.py). A >16B / float
+# struct return STILL rejects in both backends. (Roadmap increment 11: the
+# native parser now recognises `String` as an ND_SLICE_TYPE(uint8) 16-byte
+# {ptr,len} aggregate, so aggret_string is native-accepted + byte-clean too.)
 if [ -f scripts/_adder_cc.sh ]; then
     source scripts/_adder_cc.sh
     if ADDER_CC=adder adder_cc_bootstrap >"$WORK/boot.log" 2>&1 \
             && [ -x build/cutover/host_ac.elf ]; then
-        for u in aggret_struct aggret_slice; do
+        for u in aggret_struct aggret_slice aggret_string; do
             ADDER_CC=python adder_cc_compile compile --target=x86_64-adder-user \
                 "$FIX/$u.ad" -o "$WORK/$u.seed.elf" >/dev/null 2>"$WORK/$u.se" \
                 || fail "seed native-target compile failed for $u: $(cat "$WORK/$u.se")"
