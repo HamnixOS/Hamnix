@@ -49,7 +49,7 @@ from .ast_nodes import (
     IndexExpr, MemberExpr, CastExpr, ContainerOfExpr,
     ConditionalExpr, WalrusExpr, SizeOfExpr,
     Type, PointerType, ArrayType, FunctionPointerType, PercpuType,
-    SliceType, SliceNewExpr,
+    SliceType, SliceNewExpr, StringType, StringNewExpr,
     ListType, DictType, TupleType, OptionalType,
     MatchStmt, MatchArm, Pattern, LiteralPattern, WildcardPattern,
     NamePattern, OrPattern, SequencePattern,
@@ -470,7 +470,7 @@ class X86CodeGen:
             return 8
         if isinstance(t, ArrayType):
             return t.size * self.get_type_size(t.element_type)
-        if isinstance(t, SliceType):
+        if isinstance(t, (SliceType, StringType)):
             # {ptr @0, len @8} — a two-word by-reference aggregate.
             return 16
         if isinstance(t, (PointerType, FunctionPointerType)):
@@ -551,6 +551,8 @@ class X86CodeGen:
             return t
         if isinstance(expr, SliceNewExpr):
             return SliceType(expr.element_type)
+        if isinstance(expr, StringNewExpr):
+            return StringType()
         if isinstance(expr, IndexExpr):
             obj_type = self.get_expr_type(expr.obj)
             if isinstance(obj_type, SliceType):
@@ -566,6 +568,13 @@ class X86CodeGen:
                 # `.ptr` -> Ptr[T]; `.len` -> uint64.
                 if expr.member == "ptr":
                     return PointerType(obj_type.element_type)
+                if expr.member == "len":
+                    return Type("uint64")
+                return None
+            if isinstance(obj_type, StringType):
+                # `.ptr`/`.cstr` -> Ptr[uint8]; `.len` -> uint64.
+                if expr.member in ("ptr", "cstr"):
+                    return PointerType(Type("uint8"))
                 if expr.member == "len":
                     return Type("uint64")
                 return None
@@ -1909,14 +1918,15 @@ class X86CodeGen:
         # unaffected. Skip the first param when this is a synthesised
         # method body (its receiver is always a Ptr and already typed so).
         for param in func.params:
-            if isinstance(param.param_type, SliceType):
+            if isinstance(param.param_type, (SliceType, StringType)):
                 span = getattr(param, "span", None) or getattr(func, "span", None)
                 raise CodeGenError(
-                    f"x86: by-value Slice parameter '{param.name}: "
-                    f"{param.param_type.name}' in '{func.name}' is not "
-                    f"supported at {_span_location(span)}; pass "
+                    f"x86: by-value {param.param_type.name} parameter "
+                    f"'{param.name}: {param.param_type.name}' in "
+                    f"'{func.name}' is not supported at "
+                    f"{_span_location(span)}; pass "
                     f"`Ptr[{param.param_type.name}]` — Adder has no by-value "
-                    f"aggregate ABI (a Slice is a 16-byte {{ptr,len}} value)"
+                    f"aggregate ABI (a 16-byte {{ptr,len}} value)"
                 )
             if self._is_byvalue_struct_type(param.param_type):
                 span = getattr(param, "span", None) or getattr(func, "span", None)
@@ -1927,10 +1937,11 @@ class X86CodeGen:
                     f"`Ptr[{param.param_type.name}]` (the caller takes "
                     f"`&obj`) — Adder has no by-value aggregate ABI"
                 )
-        if isinstance(func.return_type, SliceType):
+        if isinstance(func.return_type, (SliceType, StringType)):
             span = getattr(func, "span", None)
             raise CodeGenError(
-                f"x86: by-value Slice return `-> {func.return_type.name}` in "
+                f"x86: by-value {func.return_type.name} return "
+                f"`-> {func.return_type.name}` in "
                 f"'{func.name}' is not supported at {_span_location(span)}; "
                 f"return through a `Ptr[{func.return_type.name}]` "
                 f"out-parameter — Adder has no by-value aggregate ABI"
@@ -2166,6 +2177,11 @@ class X86CodeGen:
                     if isinstance(value, SliceNewExpr):
                         self._emit_slice_new_into(var.offset, value)
                         return
+                    # String construction: `s: String = String(...)` writes the
+                    # {ptr,len} pair straight into the local's 16-byte slot.
+                    if isinstance(value, StringNewExpr):
+                        self._emit_string_new_into(var.offset, value)
+                        return
                     # Constructor sugar: `f: Foo = Foo(args)` lowers to
                     # Foo__init(&f, args) — Adder doesn't have struct
                     # return values, so we can't go through the normal
@@ -2196,6 +2212,15 @@ class X86CodeGen:
                         and self.ctx is not None \
                         and target.name in self.ctx.locals:
                     self._emit_slice_new_into(
+                        self.ctx.locals[target.name].offset, value)
+                    return
+                # String re-assignment: `s = String(...)` rewrites the local's
+                # 16-byte {ptr,len} cell in place.
+                if op is None and isinstance(value, StringNewExpr) \
+                        and isinstance(target, Identifier) \
+                        and self.ctx is not None \
+                        and target.name in self.ctx.locals:
+                    self._emit_string_new_into(
                         self.ctx.locals[target.name].offset, value)
                     return
                 # Constructor sugar: `f = Foo(args)` where Foo is a
@@ -3607,6 +3632,9 @@ class X86CodeGen:
             case SliceNewExpr():
                 self.gen_slice_new(expr)
 
+            case StringNewExpr():
+                self.gen_string_new(expr)
+
             case IndexExpr():
                 self.gen_index_load(expr)
 
@@ -3739,7 +3767,7 @@ class X86CodeGen:
             var = self.ctx.locals[name]
             t = var.var_type
             is_aggregate = (
-                isinstance(t, (ArrayType, SliceType))
+                isinstance(t, (ArrayType, SliceType, StringType))
                 or (t is not None and hasattr(t, "name")
                     and t.name in self.structs)
             )
@@ -4902,6 +4930,48 @@ class X86CodeGen:
         self._emit_slice_new_into(tmp.offset, snew)
         self.emit(f"    leaq {tmp.offset}(%rbp), %rax")
 
+    def _emit_string_new_into(self, dest_offset: int,
+                              snew: StringNewExpr) -> None:
+        """Materialise a `String` {ptr,len} pair into the 16-byte stack cell
+        at `dest_offset(%rbp)`. Mirrors `_emit_slice_new_into` but the
+        one-argument form takes a STRING LITERAL (interned bytes) rather than
+        an Array, and the len is the compile-time UTF-8 byte length."""
+        if len(snew.args) == 1:
+            lit = snew.args[0]
+            if not isinstance(lit, StringLiteral):
+                raise CodeGenError(
+                    "x86: String(x) single-argument construction requires a "
+                    "string literal (use String(ptr, len) for a (ptr, len) "
+                    f"pair) at {_span_location(getattr(snew, 'span', None))}"
+                )
+            label = self.add_string(lit.value)
+            nbytes = len(lit.value.encode("utf-8"))
+            self.emit(f"    leaq {label}(%rip), %rax")
+            self.emit(f"    movq %rax, {dest_offset}(%rbp)")
+            self.emit(f"    movq ${nbytes}, %rax")
+            self.emit(f"    movq %rax, {dest_offset + 8}(%rbp)")
+        elif len(snew.args) == 2:
+            # Explicit (ptr, len) — caller-owned buffer / substring view.
+            self.gen_expr(snew.args[0])
+            self.emit(f"    movq %rax, {dest_offset}(%rbp)")
+            self.gen_expr(snew.args[1])
+            self.emit(f"    movq %rax, {dest_offset + 8}(%rbp)")
+        else:
+            raise CodeGenError(
+                "x86: String(...) takes 1 (string literal) or 2 (ptr, len) "
+                f"arguments, got {len(snew.args)} at "
+                f"{_span_location(getattr(snew, 'span', None))}"
+            )
+
+    def gen_string_new(self, snew: StringNewExpr) -> None:
+        """Evaluate `String(...)` in a general expression context — materialise
+        an anonymous 16-byte {ptr,len} temp and leave ITS ADDRESS in %rax (a
+        String decays to its address, like a struct / Slice)."""
+        label_id = self.ctx.new_label("string").rsplit("_", 1)[-1]
+        tmp = self.ctx.alloc_local(f"__string_{label_id}", 16, StringType())
+        self._emit_string_new_into(tmp.offset, snew)
+        self.emit(f"    leaq {tmp.offset}(%rbp), %rax")
+
     def _maybe_emit_slice_bounds_check(self, expr: IndexExpr) -> None:
         """Runtime bounds check for a `Slice[T]` index: trap unless
         idx < slice.len (a RUNTIME value loaded from the fat pointer).
@@ -5202,6 +5272,19 @@ class X86CodeGen:
                 raise CodeGenError(
                     f"x86: Slice[T] has no member '{expr.member}' "
                     f"(only .ptr and .len)"
+                )
+            return
+        if isinstance(obj_type, StringType):
+            # String member: `.ptr`/`.cstr` (field @0) / `.len` (field @8).
+            self.gen_expr(expr.obj)             # %rax = &{ptr,len}
+            if expr.member in ("ptr", "cstr"):
+                self.emit("    movq (%rax), %rax")
+            elif expr.member == "len":
+                self.emit("    movq 8(%rax), %rax")
+            else:
+                raise CodeGenError(
+                    f"x86: String has no member '{expr.member}' "
+                    f"(only .ptr, .cstr and .len)"
                 )
             return
         info = self._percpu_aggregate_info(expr.obj)

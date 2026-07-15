@@ -122,6 +122,29 @@ class SliceType:
 
 
 @dataclass
+class StringType:
+    """Heap/byte-backed string VIEW: String = {ptr: Ptr[uint8] @0, len: uint64 @8}.
+
+    A 16-byte by-reference aggregate — a base pointer into UTF-8/byte storage
+    plus a RUNTIME byte length — so a string carries its length instead of a
+    NUL scan. REPRESENTATIONALLY it is exactly a `Slice[uint8]`, but with
+    string-flavoured construction (`String("lit")` interns the literal bytes)
+    and accessors (`.ptr`/`.cstr` round-trip back to the raw `Ptr[uint8]`
+    C-string world, `.len` is the byte length). Same ABI class as a struct /
+    Slice: it decays to its address and crosses function boundaries only via
+    `Ptr[String]` (Adder has no by-value aggregate ABI). USERLAND-only: the
+    kernel keeps using raw `Ptr[uint8]` and pays nothing (byte-inert-off). The
+    backing bytes are caller-owned (a `.rodata` literal, a stack `Array`, an
+    `mmap`'d/`kmalloc`'d buffer) — String owns no allocator. See
+    docs/adder_language_roadmap.md (increment 7-tail)."""
+    span: Optional[Span] = None
+
+    @property
+    def name(self) -> str:
+        return "String"
+
+
+@dataclass
 class PercpuType:
     """Per-CPU storage: Percpu[T].
 
@@ -399,6 +422,20 @@ class SliceNewExpr:
 
 
 @dataclass
+class StringNewExpr:
+    """String construction: `String("literal")` or `String(ptr, len)`.
+
+    One STRING-LITERAL argument = intern the literal's bytes into `.rodata`
+    (NUL-terminated, so `.cstr` round-trips to the C world) with the base =
+    &bytes and len = the compile-time byte length. Two arguments = an explicit
+    `(ptr: Ptr[uint8], len: uint64)` pair — the caller-owned-buffer / substring
+    form (no allocation). Evaluates to the address of a freshly materialised
+    16-byte `{ptr, len}` aggregate (the by-reference String value)."""
+    args: list['Expr'] = field(default_factory=list)
+    span: Optional[Span] = None
+
+
+@dataclass
 class StructInitExpr:
     """Struct initialization: Point{x=10, y=20}"""
     struct_name: str
@@ -493,7 +530,7 @@ Expr = (IntLiteral | FloatLiteral | StringLiteral | FStringLiteral |
         IndexExpr | SliceExpr | MemberExpr | ListLiteral |
         DictLiteral | TupleLiteral | ListComprehension | ConditionalExpr |
         LambdaExpr | SizeOfExpr | CastExpr | AsmExpr | ContainerOfExpr |
-        WalrusExpr | TryExpr | UnwrapExpr | SliceNewExpr)
+        WalrusExpr | TryExpr | UnwrapExpr | SliceNewExpr | StringNewExpr)
 
 
 # Statements

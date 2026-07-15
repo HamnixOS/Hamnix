@@ -344,7 +344,49 @@ spot is a **hybrid**:
    the arg chain), so no lexer/parser or new-keyword change — maximally byte-inert.
    Gate: `scripts/test_adder_app_sugar.sh`.
 
-   *Deferred (honest):* (a) **string methods** — `.upper()/.split()/.replace()`
+   **STATUS (increment 7-tail — the foundational `String` type, SEED backend,
+   landed):** the deferred "needs a heap-backed string type" blocker below is
+   now addressed by a `String` VALUE type: a 16-byte `{ptr@0, len@8}`
+   by-reference aggregate VIEW (representationally a `Slice[uint8]`, same ABI
+   class — decays to its address, crosses fn boundaries only via `Ptr[String]`,
+   Adder has no by-value aggregate ABI). Construction `String("literal")`
+   interns the bytes into `.rodata` (NUL-terminated, so `.cstr` round-trips
+   straight back to the raw `Ptr[uint8]` C-string world); `String(ptr, len)` is
+   the caller-owned-buffer / substring form. Accessors: `.len` (byte length,
+   no NUL scan), `.ptr`/`.cstr` (Ptr[uint8]). The core methods live in
+   `lib/strview.ad` as ORDINARY Adder over raw `(ptr, len)` pairs — `str_eq`,
+   `str_find`, `str_contains`, `str_at` (substring-view helper), and
+   `str_concat_into` (concat into a **caller-owned** buffer) — so they compile
+   through the byte-tested path and are seed<->native byte-lockstep for FREE
+   (objdiff clean, no new codegen). USERLAND-only: `String` is pure pointer
+   math with ZERO runtime, so the kernel keeps raw `Ptr[uint8]` and pays
+   nothing (byte-inert-off; the native backend carries no String code at all, so
+   every String-free unit is byte-identical to base). Gate:
+   `scripts/test_adder_string.sh` (behaviour checksum 42, on-device +
+   kernel-safe, helper-layer lockstep, native-rejects-String cleanly).
+
+   *Design finding — no owning heap-String (disproof, evidence-backed):* a TRUE
+   *owning* heap string (per-string small allocations, growable `+`) is
+   **blocked** — the Adder userland has NO general-purpose allocator. The only
+   primitives are page-granular `sys_mmap` (an extern syscall wrapper, 4 KiB
+   minimum) and the kernel's `kmalloc`; userland code uses fixed `Array`s. The
+   brief forbids inventing an allocator or dragging a heap runtime into the
+   kernel, so `String` is deliberately a length-carrying VIEW over caller-owned
+   storage (exactly how `Slice[T]` relates to `Array[N,T]`), and concatenation
+   writes into a caller-provided buffer. That is the codebase-consistent,
+   invariant-honoring foundational type; an owning `String` awaits a real
+   userland allocator (a std-lib increment, not a compiler one).
+
+   *Deferred (honest):* (a) **native `String` backend** — this increment is
+   SEED-first (like increment 1 was); `codegen.ad` REJECTS a `String`-typed
+   source with a clean codegen error (no ELF, no miscompile), pending the
+   native port of the construction/member emission. (b) **method-call sugar**
+   (`s.eq(t)` / `s.find(t)`) over the free-function form — desugaring
+   aggregate-receiver method calls in both byte-lockstep backends is a
+   follow-up; the free functions ship the capability today. (c) `.upper()`/
+   `.split()`/`.replace()` and formatting — std-lib helpers atop this base.
+
+   *Superseded note:* (a) **string methods** — `.upper()/.split()/.replace()`
    etc. need a heap-backed string type; Adder strings are raw `Ptr[uint8]` today,
    so this is a std-lib/representation increment, NOT a cheap byte-inert desugar.
    (b) default/keyword args on **methods** and **externs** — methods route

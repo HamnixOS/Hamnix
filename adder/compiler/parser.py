@@ -217,6 +217,12 @@ class Parser:
         # Identifier type (class name)
         if self.check(TokenType.IDENT):
             name = self.advance().value
+            # Heap/byte-backed string VIEW: `String` — a {ptr, len} aggregate
+            # (representationally a Slice[uint8]). Takes NO `[T]` (element type
+            # is fixed uint8). Recognised by NAME (like Slice) so no new lexer
+            # token / keyword collision. See docs/adder_language_roadmap.md.
+            if name == "String":
+                return StringType(self.make_span(tok))
             # Check for generic args: MyClass[T]
             if self.match(TokenType.LBRACKET):
                 # Per-CPU storage: Percpu[T] — recognised here rather than
@@ -612,6 +618,17 @@ class Parser:
                         args.append(self.parse_expression())
                 self.expect(TokenType.RPAREN)
                 return SliceNewExpr(elem_type, args, self.make_span(tok))
+            # String construction: String("literal") or String(ptr, len).
+            # Mirrors Slice construction but with no `[T]` (element = uint8).
+            if name == "String" and self.check(TokenType.LPAREN):
+                self.expect(TokenType.LPAREN)
+                args = []
+                if not self.check(TokenType.RPAREN):
+                    args.append(self.parse_expression())
+                    while self.match(TokenType.COMMA):
+                        args.append(self.parse_expression())
+                self.expect(TokenType.RPAREN)
+                return StringNewExpr(args, self.make_span(tok))
             # Check for type cast: int32(x)
             if name in ("int8", "int16", "int32", "int64", "uint8", "uint16",
                         "uint32", "uint64", "float32", "float64", "bool", "char"):
