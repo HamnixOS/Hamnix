@@ -583,6 +583,46 @@ spot is a **hybrid**:
       `scripts/test_adder_aggret.sh` / `scripts/test_adder_aggparam.sh` flip the
       `String` arms from seed-only to native accept + per-function objdiff match.
 
+12. **Aggregate-receiver method-call sugar (app-ergonomics — "best language for humans").**
+
+    **STATUS (increment 12 — landed):** `s.method(args)` on a `String` receiver
+    desugars to the corresponding free function, so the string library reads as
+    methods (`s.eq(t)`, `s.upper()`, `s.find(w)`) instead of raw `(ptr,len)`
+    free calls — WITHOUT a trait system (that is Tier C, deliberately skipped).
+    * **The desugar — every String operand expands to `(.ptr, .len)`:** the free
+      functions in `lib/strview.ad` / `lib/hamstr.ad` carry the raw
+      `(Ptr[uint8], uint64)` ABI, so a single uniform rule covers the whole
+      allowlist: the receiver AND each String argument each expand to its two
+      `{ptr,len}` fields. `s.eq(t)` → `str_eq(s.ptr, s.len, t.ptr, t.len)`;
+      `s.upper()` → `ham_str_upper(s.ptr, s.len)`;
+      `s.replace(a, b)` → `ham_str_replace(s.ptr, s.len, a.ptr, a.len, b.ptr, b.len)`.
+    * **Fixed, explicit allowlist (method name → free function), String-only:**
+      `eq`→`str_eq`, `find`→`str_find`, `contains`→`str_contains`,
+      `upper`→`ham_str_upper`, `lower`→`ham_str_lower`, `trim`→`ham_str_trim`,
+      `starts_with`→`ham_str_starts_with`, `ends_with`→`ham_str_ends_with`,
+      `replace`→`ham_str_replace`. `Slice[T]` has no allowlisted methods yet
+      (the map is the sole extension point).
+    * **Disambiguation — struct methods WIN, byte-inert when unused:** the sugar
+      fires ONLY when the receiver's type is a `String` (a slice-typed 16-byte
+      aggregate) AND the method name is allowlisted; struct receivers are not
+      slice-typed, so they keep the existing `gen_method`/`Class__method` path
+      untouched. `String` has no user methods, so there is no collision (grep
+      confirms no existing `.eq`/`.upper`/… on a String/Slice in `user/`/`lib/`).
+    * **BYTE-IDENTICAL to the hand-written free call:** the seed synthesizes a
+      `CallExpr` over `MemberExpr` `.ptr`/`.len` nodes and routes it through the
+      ordinary `gen_call`; the native backend synthesizes the equivalent
+      `ND_CALL`/`ND_MEMBER` nodes via `node_new` and routes through its own
+      `gen_call`. Neither invents a new emission path, so `s.eq(t)` compiles to
+      the SAME bytes as `str_eq(s.ptr, s.len, t.ptr, t.len)` in BOTH backends —
+      the natural correctness oracle.
+    * **Byte-lockstep proof:** `tests/methodsugar/sugar_form.ad` (sugar) and
+      `plain_form.ad` (the hand-written twin) are both native-ACCEPTED and
+      objdiff-CLEAN vs the seed; the sugar `check` and the plain `check` are
+      byte-identical (call-relocation aside). The whole `x86_64-adder-user`
+      corpus stays `0`-diverged (byte-inert on every unit that does not use the
+      sugar). Kernel opt-out intact + links native. Gate:
+      `scripts/test_adder_methodsugar.sh`.
+
 Each increment: opt-in or byte-inert-off, kernel-bypassable, seed+native lockstep,
 verified by objdiff + differential fuzzer + `test_native_kernel_links` +
 `run_compiler_tests` + a new feature gate.
