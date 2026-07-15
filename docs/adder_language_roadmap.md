@@ -417,6 +417,34 @@ spot is a **hybrid**:
    it is seed↔native objdiff-clean by construction. This is the std-lib
    foundation an owning heap `String` / dynamic vector / map can now build on.
 
+   *Increment 7-tail payoff — owning-heap String METHODS (landed, LIBRARY, no
+   compiler change):* the app-ergonomics layer real programs reach for, built
+   as `lib/hamstr.ad` — a PURE LIBRARY composing the two layers above
+   (`lib/hamalloc.ad` mints/owns bytes, `lib/strview.ad` searches/sub-slices
+   without copying) with NO compiler change. Every function carries the raw
+   `(ptr, len)` / `Ptr[uint8]` ABI — never a `String` aggregate — so the native
+   `.ad` backend accepts it exactly like hamalloc and it is seed↔native
+   byte-lockstep (objdiff clean; 49 functions match). Methods + ownership:
+     * `ham_str_upper/lower(src,len)` — ASCII case fold; owning copy.
+     * `ham_str_trim(src,len)` — strip leading/trailing ASCII whitespace; owning.
+     * `ham_str_replace(src,len, needle,nlen, repl,rlen)` — all non-overlapping
+       occurrences (longer- or shorter-than-needle); owning.
+     * `ham_str_from_int(n)` / `ham_str_from_uint(n)` — integer→decimal; owning.
+       Correct for zero, negatives, and INT_MIN (magnitude via unsigned negate)
+       and UINT64_MAX. First way to stringify a number in userland Adder.
+     * `ham_str_starts_with/ends_with(...)` — non-owning view predicates.
+   Every owning return is a fresh NUL-terminated allocation the CALLER frees
+   with `ham_str_free`; null on OOM. **split** cannot return a `String[]` (no
+   by-value aggregate return, no dynamic array-of-String yet), so it is exposed
+   as a ZERO-ALLOCATION stateful iterator `ham_split_next(src,len,sep, &pos,
+   &fptr, &flen)` yielding each field as a non-owning VIEW into the caller's
+   buffer (N separators → N+1 fields, empties included) — the allocation-free
+   shape a `for f in s.split(sep)` desugars to; a `String[]` return awaits a
+   dynamic-array aggregate ABI. Gate: `scripts/test_adder_hamstr.sh` (on-device
+   QEMU) asserts every method against expected output (incl INT_MIN/UINT64_MAX,
+   empty-needle no-op, trailing-sep, all-whitespace trim), frees each result,
+   and churns 2000 allocations to prove the heap is uncorrupted after the frees.
+
 Each increment: opt-in or byte-inert-off, kernel-bypassable, seed+native lockstep,
 verified by objdiff + differential fuzzer + `test_native_kernel_links` +
 `run_compiler_tests` + a new feature gate.
