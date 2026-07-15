@@ -1,0 +1,253 @@
+# lib/hamalloc.ad
+#
+# A general-purpose userland heap allocator for Adder — a pure `.ad`
+# LIBRARY built over the existing `sys_mmap` / `sys_munmap` page
+# primitives. It unblocks owning heap data (owning String, dynamic
+# vectors/maps) that the fixed-`Array` userland could not express.
+#
+# ── DESIGN ────────────────────────────────────────────────────────
+# Segregated free-lists + page-arena backing + direct-mmap for large.
+#
+#   * SMALL requests (<= HAM_SMALL_MAX bytes) are rounded UP to one of a
+#     fixed set of size classes (multiples of 16). Each class owns a
+#     singly-linked LIFO free list. A free is O(1): push the block onto
+#     its class list. An alloc is O(1): pop the class list, or — when
+#     empty — carve a fresh block off the current arena by bumping a
+#     pointer. When the arena is exhausted we `sys_mmap` a NEW arena
+#     (arena growth). Freed small blocks are ALWAYS reused by a later
+#     same-class alloc, so churn of a bounded working set never grows
+#     the mapped footprint without bound (proven by the stress gate).
+#
+#   * LARGE requests (> HAM_SMALL_MAX) are served by a direct
+#     page-rounded `sys_mmap`, and `ham_free` returns them to the OS
+#     with `sys_munmap`. No fragmentation, exact release.
+#
+# We deliberately do NOT coalesce across the segregated small classes:
+# arenas obtained from `sys_mmap(0,…)` are NON-contiguous, so a global
+# boundary-tag coalescing free-list cannot merge across arenas anyway.
+# Reuse-within-class is what bounds churn; correctness + no-corruption
+# + no-unbounded-growth is the contract, not peak packing efficiency.
+#
+# ── HEADER LAYOUT (16 bytes, immediately BEFORE the returned pointer)─
+#   [ 0 ..  8)  size  : uint64
+#                 small -> the class byte size (usable payload bytes)
+#                 large -> the TOTAL mmap length (header+payload+pad)
+#   [ 8 .. 16)  tag   : uint64 = HAM_MAGIC | kind | class
+#                 HAM_MAGIC   0xA10C0000  (guards double/wild free)
+#                 kind        bit 0x100 set == LARGE (direct mmap)
+#                 class       low 8 bits  == size-class index (small)
+#
+# The returned pointer is `header + 16`, and because the header is 16
+# bytes, every class size is a multiple of 16, arenas are page-aligned,
+# and the bump pointer only ever advances by (16 + classsize) multiples
+# of 16 — every returned payload is 16-byte aligned.
+#
+# When a small block is FREE its first 8 payload bytes hold the `next`
+# free-list link (payload is >= 16 bytes, so this never overruns).
+#
+# ── COMPILER QUIRKS HONOURED ──────────────────────────────────────
+#   * big state (free-list heads, class table) at MODULE scope
+#   * string literals only at call sites; no adjacent-literal concat
+#   * pure Adder over the existing mmap extern — NO compiler change
+
+extern def sys_mmap(addr: uint64, len: uint64, prot: int32, flags: int32,
+                    fd: int32, off: uint64) -> int64
+extern def sys_munmap(addr: uint64, len: uint64) -> int32
+
+# mmap prot/flags (native SYS_MMAP, Linux-numbered).
+HAM_PROT_RW:   int32 = 0x3          # PROT_READ | PROT_WRITE
+HAM_MAP_PANON: int32 = 0x22         # MAP_PRIVATE | MAP_ANONYMOUS
+
+HAM_PAGE:   uint64 = 4096
+HAM_HDR:    uint64 = 16             # header bytes (also the alignment)
+HAM_ARENA:  uint64 = 262144        # 256 KiB per small-block arena
+
+# Header tag bit-fields.
+HAM_MAGIC:      uint64 = 0xA10C0000
+HAM_MAGIC_MASK: uint64 = 0xFFFF0000
+HAM_KIND_LARGE: uint64 = 0x100
+HAM_CLASS_MASK: uint64 = 0xFF
+
+# ── size-class table (multiples of 16) ────────────────────────────
+HAM_NCLASS:    uint64 = 14
+HAM_SMALL_MAX: uint64 = 2048
+ham_class_size: Array[14, uint64]
+
+# Per-class free-list heads (0 == empty). Each entry is a raw header
+# address (uint64) whose payload[0] links to the next free block.
+ham_free_head: Array[14, uint64]
+
+# Current arena bump state and lifetime mmap accounting.
+ham_arena_next: uint64 = 0          # next free byte in the current arena
+ham_arena_end:  uint64 = 0          # one-past-end of the current arena
+ham_total_mapped: uint64 = 0        # sum of every byte ever sys_mmap'd
+ham_ready: uint64 = 0               # class table initialised yet?
+
+
+# ── low-level 64-bit load/store at a raw address ──────────────────
+def _ham_ld64(addr: uint64) -> uint64:
+    p: Ptr[uint64] = cast[Ptr[uint64]](addr)
+    return p[0]
+
+
+def _ham_st64(addr: uint64, val: uint64):
+    p: Ptr[uint64] = cast[Ptr[uint64]](addr)
+    p[0] = val
+
+
+def _ham_init():
+    # Idempotent one-time class-table setup.
+    if ham_ready != 0:
+        return
+    ham_class_size[0] = 16
+    ham_class_size[1] = 32
+    ham_class_size[2] = 48
+    ham_class_size[3] = 64
+    ham_class_size[4] = 96
+    ham_class_size[5] = 128
+    ham_class_size[6] = 192
+    ham_class_size[7] = 256
+    ham_class_size[8] = 384
+    ham_class_size[9] = 512
+    ham_class_size[10] = 768
+    ham_class_size[11] = 1024
+    ham_class_size[12] = 1536
+    ham_class_size[13] = 2048
+    ci: uint64 = 0
+    while ci < HAM_NCLASS:
+        ham_free_head[ci] = 0
+        ci = ci + 1
+    ham_ready = 1
+
+
+def _ham_class_index(n: uint64) -> uint64:
+    # Smallest class whose byte size is >= n. Caller guarantees
+    # 1 <= n <= HAM_SMALL_MAX.
+    ci: uint64 = 0
+    while ci < HAM_NCLASS:
+        if ham_class_size[ci] >= n:
+            return ci
+        ci = ci + 1
+    return HAM_NCLASS - 1
+
+
+def _ham_round_page(n: uint64) -> uint64:
+    return (n + HAM_PAGE - 1) & ~(HAM_PAGE - 1)
+
+
+# Carve `total` bytes off the current arena, mmap'ing a fresh arena when
+# the current one cannot satisfy the request. Returns the raw header
+# address, or 0 on mmap failure.
+def _ham_arena_carve(total: uint64) -> uint64:
+    if ham_arena_next + total > ham_arena_end:
+        want: uint64 = HAM_ARENA
+        if total > want:
+            want = _ham_round_page(total)
+        got: int64 = sys_mmap(0, want, HAM_PROT_RW, HAM_MAP_PANON, -1, 0)
+        if got <= 0:
+            return 0
+        ham_arena_next = cast[uint64](got)
+        ham_arena_end = ham_arena_next + want
+        ham_total_mapped = ham_total_mapped + want
+    raw: uint64 = ham_arena_next
+    ham_arena_next = ham_arena_next + total
+    return raw
+
+
+# ── public API ────────────────────────────────────────────────────
+
+def ham_alloc(nbytes: uint64) -> Ptr[uint8]:
+    _ham_init()
+    req: uint64 = nbytes
+    if req == 0:
+        req = 1                     # malloc(0): hand back a real 1-byte-min block
+
+    if req > HAM_SMALL_MAX:
+        # Large: one direct page-rounded mapping, header at the base.
+        total: uint64 = _ham_round_page(HAM_HDR + req)
+        got: int64 = sys_mmap(0, total, HAM_PROT_RW, HAM_MAP_PANON, -1, 0)
+        if got <= 0:
+            return cast[Ptr[uint8]](0)
+        hdr: uint64 = cast[uint64](got)
+        ham_total_mapped = ham_total_mapped + total
+        _ham_st64(hdr, total)
+        _ham_st64(hdr + 8, HAM_MAGIC | HAM_KIND_LARGE)
+        return cast[Ptr[uint8]](hdr + HAM_HDR)
+
+    ci: uint64 = _ham_class_index(req)
+    csz: uint64 = ham_class_size[ci]
+
+    head: uint64 = ham_free_head[ci]
+    if head != 0:
+        # Pop the LIFO free list; next link lives in payload[0].
+        ham_free_head[ci] = _ham_ld64(head + HAM_HDR)
+        return cast[Ptr[uint8]](head + HAM_HDR)
+
+    raw: uint64 = _ham_arena_carve(HAM_HDR + csz)
+    if raw == 0:
+        return cast[Ptr[uint8]](0)
+    _ham_st64(raw, csz)
+    _ham_st64(raw + 8, HAM_MAGIC | ci)
+    return cast[Ptr[uint8]](raw + HAM_HDR)
+
+
+def ham_free(p: Ptr[uint8]):
+    if p == cast[Ptr[uint8]](0):
+        return
+    hdr: uint64 = cast[uint64](p) - HAM_HDR
+    tag: uint64 = _ham_ld64(hdr + 8)
+    if (tag & HAM_MAGIC_MASK) != HAM_MAGIC:
+        return                      # not ours / double-free / corruption: refuse
+    if (tag & HAM_KIND_LARGE) != 0:
+        total: uint64 = _ham_ld64(hdr)
+        # Poison the tag so a double-free is caught (munmap'd page is gone,
+        # but if it lingers mapped the magic no longer matches).
+        _ham_st64(hdr + 8, 0)
+        sys_munmap(hdr, total)
+        return
+    ci: uint64 = tag & HAM_CLASS_MASK
+    # Push onto the class free list (link stored in payload[0]).
+    _ham_st64(hdr + HAM_HDR, ham_free_head[ci])
+    ham_free_head[ci] = hdr
+
+
+# Usable payload capacity of a live block (for realloc copy sizing).
+def _ham_usable(hdr: uint64) -> uint64:
+    tag: uint64 = _ham_ld64(hdr + 8)
+    if (tag & HAM_KIND_LARGE) != 0:
+        return _ham_ld64(hdr) - HAM_HDR
+    return _ham_ld64(hdr)
+
+
+def ham_realloc(p: Ptr[uint8], nbytes: uint64) -> Ptr[uint8]:
+    if p == cast[Ptr[uint8]](0):
+        return ham_alloc(nbytes)
+    if nbytes == 0:
+        ham_free(p)
+        return cast[Ptr[uint8]](0)
+
+    hdr: uint64 = cast[uint64](p) - HAM_HDR
+    tag: uint64 = _ham_ld64(hdr + 8)
+    if (tag & HAM_MAGIC_MASK) != HAM_MAGIC:
+        return cast[Ptr[uint8]](0)  # not ours: refuse
+
+    old_use: uint64 = _ham_usable(hdr)
+    if nbytes <= old_use:
+        return p                    # fits in place (same class / same mapping)
+
+    np: Ptr[uint8] = ham_alloc(nbytes)
+    if np == cast[Ptr[uint8]](0):
+        return cast[Ptr[uint8]](0)  # old block left intact on failure
+    # Copy the smaller of old/new usable bytes.
+    n: uint64 = old_use
+    i: uint64 = 0
+    while i < n:
+        np[i] = p[i]
+        i = i + 1
+    ham_free(p)
+    return np
+
+
+# Introspection for the test gate: total bytes ever obtained from the OS.
+def ham_total_bytes() -> uint64:
+    return ham_total_mapped
