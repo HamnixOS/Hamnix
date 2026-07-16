@@ -107,6 +107,63 @@ assert_grep '^SEG [0-9]+ [0-9]+ #[0-9a-f]+ b0 u0 s0 l-1 bg#[0-9a-f]+ \|\[_+\]\|'
 assert_grep 'Example Domain'        "$OUT/real_example.txt"   "example.com renders its heading text"
 assert_grep 'Plan 9'                "$OUT/real_wikipedia.txt" "wikipedia article renders its real body text"
 
+# ---- (e) a WIDER real-site corpus (r2): a modern dev site, a real app, and
+# the first-ever website. Each must run without crashing and render content.
+run_ok cern "$FX/cern_project.html" 980
+run_ok hackernews "$FX/hackernews.html" 980
+run_ok mdn "$FX/mdn_html.html" 980
+assert_grep 'World Wide Web'  "$OUT/real_cern.txt"       "cern first-website renders its heading"
+assert_grep 'Hacker News'     "$OUT/real_hackernews.txt" "news.ycombinator renders its masthead"
+assert_grep 'HyperText Markup' "$OUT/real_mdn.txt"       "MDN article renders its real title"
+
+# MDN's very first inline <script> reads localStorage un-guarded to set the
+# colour theme; before r2 that was a ReferenceError that ABORTED the whole
+# script (JSERR). localStorage is now an in-memory Web Storage global.
+assert_nogrep 'localStorage is not defined' "$OUT/real_mdn.txt" "MDN: localStorage is defined (no ReferenceError)"
+assert_nogrep 'sessionStorage is not defined' "$OUT/real_mdn.txt" "MDN: sessionStorage is defined"
+
+# ---- (f) REGEX: lookahead / lookbehind / named groups / \k backref ----------
+# Real site scripts use these constantly; before r2 any such regex literal threw
+# an UN-catchable "unsupported regex group" SyntaxError that aborted the script.
+cat > "$OUT/real_rx.html" <<'HTML'
+<html><head><title>rx</title></head><body><p id="r">x</p><script>
+var o=[];
+o.push(/foo(?=bar)/.test('foobar')===true && /foo(?=bar)/.test('foobaz')===false ? 'LA-OK':'LA-BAD');
+o.push(/foo(?!bar)/.test('foobaz')===true && /foo(?!bar)/.test('foobar')===false ? 'NLA-OK':'NLA-BAD');
+var m='2024-03-15'.match(/(?<y>\d{4})-(?<mo>\d{2})-(?<d>\d{2})/);
+o.push(m && m.groups.y==='2024' && m.groups.mo==='03' && m.groups.d==='15' ? 'NAMED-OK':'NAMED-BAD');
+o.push(/(?<=\$)\d+/.exec('price $42')[0]==='42' ? 'LB-OK':'LB-BAD');
+o.push(/(?<q>\w)\k<q>/.test('mississippi')===true && /(?<q>\w)\k<q>/.test('abc')===false ? 'KREF-OK':'KREF-BAD');
+document.getElementById('r').textContent = o.join(' ');
+</script></body></html>
+HTML
+"$BIN" "$OUT/real_rx.html" 880 >"$OUT/real_rx.txt" 2>&1
+assert_nogrep 'unsupported regex group' "$OUT/real_rx.txt" "regex lookaround/named no longer throws SyntaxError"
+assert_grep 'LA-OK'    "$OUT/real_rx.txt" "positive lookahead (?=) matches"
+assert_grep 'NLA-OK'   "$OUT/real_rx.txt" "negative lookahead (?!) matches"
+assert_grep 'NAMED-OK' "$OUT/real_rx.txt" "named groups (?<name>..) populate .groups"
+assert_grep 'LB-OK'    "$OUT/real_rx.txt" "positive lookbehind (?<=) matches"
+assert_grep 'KREF-OK'  "$OUT/real_rx.txt" "named backreference \\k<name> matches"
+
+# ---- (g) localStorage / sessionStorage in-memory Web Storage ----------------
+cat > "$OUT/real_ls.html" <<'HTML'
+<html><head><title>ls</title></head><body><p id="r">x</p><script>
+var o=[];
+o.push(localStorage.getItem('k')===null ? 'MISS-OK':'MISS-BAD');
+localStorage.setItem('k','v1'); localStorage.setItem('k2','v2');
+o.push(localStorage.getItem('k')==='v1' && localStorage.length===2 ? 'SET-OK':'SET-BAD');
+localStorage.removeItem('k');
+o.push(localStorage.getItem('k')===null && localStorage.length===1 ? 'RM-OK':'RM-BAD');
+o.push(sessionStorage.getItem('k2')===null ? 'SEP-OK':'SEP-BAD');
+document.getElementById('r').textContent = o.join(' ');
+</script></body></html>
+HTML
+"$BIN" "$OUT/real_ls.html" 880 >"$OUT/real_ls.txt" 2>&1
+assert_grep 'MISS-OK' "$OUT/real_ls.txt" "localStorage.getItem returns null for absent keys"
+assert_grep 'SET-OK'  "$OUT/real_ls.txt" "localStorage set/get + length work"
+assert_grep 'RM-OK'   "$OUT/real_ls.txt" "localStorage.removeItem updates store + length"
+assert_grep 'SEP-OK'  "$OUT/real_ls.txt" "sessionStorage is a store separate from localStorage"
+
 if [ "$fail" -ne 0 ]; then
     echo "[hb-real] RESULT: FAIL"; exit 1
 fi
