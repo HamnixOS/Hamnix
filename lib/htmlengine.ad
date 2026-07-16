@@ -7192,6 +7192,29 @@ dom_txtbuf:  Array[65536, uint8]
 dom_txt_len: int32 = 0
 dom_n:       int32 = 0
 
+# ---- DOM tree index (task #324, browser round 2) -------------------
+# The DOM was flat/source-anchored (round 1): each element carried its source
+# span but no parent/child links, so tree-walking (`el.parentNode.children[0]
+# .nextElementSibling`) and true selector combinators (`a > b`, `a + b`)
+# could not work. This is a compact INTEGER tree overlay computed ONCE per
+# page from the source spans every element already records: element B is a
+# child of A iff B's '<' sits inside A's content span [cstart,cend) and A is
+# the innermost such container. A single left-to-right pass with a span stack
+# recovers the whole nesting. It is ints-only (no JS objects), so it can index
+# far more elements (TX_MAX) than the JS-object cap (DOM_MAX); JS element
+# objects are still registered lazily and their traversal properties are wired
+# from this index (see _dom_wire_tree). tx_parent[i] = -1 for a root.
+TX_MAX:     int32 = 512
+tx_anchor:  Array[512, int32]        # source offset of the element's '<'
+tx_cs:      Array[512, int32]        # inner-content start (just past '>')
+tx_ce:      Array[512, int32]        # inner-content end (the matching '</')
+tx_ns:      Array[512, int32]        # tag-name span start
+tx_nl:      Array[512, int32]        # tag-name span length
+tx_parent:  Array[512, int32]        # parent tx index, or -1 for a root
+tx_stack:   Array[512, int32]        # scratch: open-element stack while building
+tx_n:       int32 = 0
+tx_built:   int32 = 0
+
 # event handlers (parallel to 0..dom_n)
 dom_onclick_fn:  Array[64, int32]    # stored JS function value, or -1
 dom_onclick_src: Array[64, int32]    # inline onclick="..." source off, or -1
@@ -7433,6 +7456,8 @@ def _dom_reset():
     dom_nav_present = 0
     g_prevent_default = 0
     canv_n = 0
+    tx_n = 0
+    tx_built = 0
     htmlcanvas_reset()
 
 
@@ -7703,15 +7728,269 @@ def _sel_rightmost(sel: Ptr[uint8], seln: int32):
         j = j + 1
 
 
+# ====================================================================
+# DOM tree index build + true selector combinators (task #324).
+# ====================================================================
+
+# Build the integer tree overlay for the current (comment-stripped) source.
+# One left-to-right pass over every start tag; a span stack recovers nesting
+# (an element's parent is the innermost still-open enclosing element). Void /
+# self-closing elements get an empty content span (_find_close returns `from`
+# on a miss) so nothing nests inside them. Idempotent per page.
+def _dom_build_tree_index():
+    tx_n = 0
+    sp: int32 = 0
+    i: uint64 = 0
+    while i < src_len and tx_n < TX_MAX:
+        if src_ptr[i] == 60 and i + 1 < src_len and \
+           src_ptr[i + 1] != 47 and src_ptr[i + 1] != 33 and \
+           src_ptr[i + 1] != 63:
+            ts: uint64 = i + 1
+            je: uint64 = ts
+            while je < src_len and src_ptr[je] != 62:
+                je = je + 1
+            ne: uint64 = ts
+            while ne < je and _alnum_at(ne) != 0:
+                ne = ne + 1
+            if ne > ts:                                   # a real named element
+                _find_close(ts, ne - ts, je + 1)
+                cs: int32 = cast[int32](je + 1)
+                ce: int32 = cast[int32](g_close_lt)
+                if ce < cs:
+                    ce = cs
+                anchor: int32 = cast[int32](i)
+                while sp > 0 and tx_ce[tx_stack[sp - 1]] <= anchor:
+                    sp = sp - 1
+                par: int32 = -1
+                if sp > 0:
+                    par = tx_stack[sp - 1]
+                k: int32 = tx_n
+                tx_anchor[k] = anchor
+                tx_cs[k] = cs
+                tx_ce[k] = ce
+                tx_ns[k] = cast[int32](ts)
+                tx_nl[k] = cast[int32](ne - ts)
+                tx_parent[k] = par
+                tx_n = k + 1
+                if sp < TX_MAX:
+                    tx_stack[sp] = k
+                    sp = sp + 1
+            i = je
+        i = i + 1
+    tx_built = 1
+
+
+# tx index whose '<' is at source offset `anchor`, or -1.
+def _tx_by_anchor(anchor: int32) -> int32:
+    j: int32 = 0
+    while j < tx_n:
+        if tx_anchor[j] == anchor:
+            return j
+        j = j + 1
+    return -1
+
+
+# Previous / next ELEMENT sibling of tx entry `t` (same parent, doc order).
+def _tx_prev_sibling(t: int32) -> int32:
+    par: int32 = tx_parent[t]
+    r: int32 = -1
+    j: int32 = 0
+    while j < t:
+        if tx_parent[j] == par:
+            r = j
+        j = j + 1
+    return r
+
+
+def _tx_next_sibling(t: int32) -> int32:
+    par: int32 = tx_parent[t]
+    j: int32 = t + 1
+    while j < tx_n:
+        if tx_parent[j] == par:
+            return j
+        j = j + 1
+    return -1
+
+
+# 1-based element-child index of `t` under its parent (for :nth-child).
+def _tx_child_index(t: int32) -> int32:
+    par: int32 = tx_parent[t]
+    n: int32 = 0
+    j: int32 = 0
+    while j <= t:
+        if tx_parent[j] == par:
+            n = n + 1
+        j = j + 1
+    return n
+
+
+# ---- selector parse: split into compound[] + combinator[] ----------
+# g_comb[c] is the combinator LINKING compound c-1 (left) to compound c
+# (right): 32 ' ' descendant, 62 '>' child, 43 '+' adjacent, 126 '~' general.
+# g_comb[0] is unused. The selector bytes are copied into g_selbuf so the
+# matchers are re-entrancy-safe against the query scan. g_sel_adv is set when the
+# selector needs the tree (a combinator, or a structural pseudo-class).
+g_selbuf:   Array[256, uint8]
+g_seln:     int32 = 0
+g_nc:       int32 = 0
+g_comp_off: Array[8, int32]
+g_comp_len: Array[8, int32]
+g_comb:     Array[8, uint8]
+g_sel_adv:      int32 = 0
+
+
+def _sel_parse(sel: Ptr[uint8], seln: int32):
+    n: int32 = seln
+    if n > 255:
+        n = 255
+    k: int32 = 0
+    while k < n:
+        g_selbuf[k] = sel[k]
+        k = k + 1
+    g_seln = n
+    g_nc = 0
+    g_sel_adv = 0
+    i: int32 = 0
+    pending: uint8 = 0
+    while i < n and g_nc < 8:
+        sawspace: int32 = 0
+        while i < n and g_selbuf[i] == 32:
+            sawspace = 1
+            i = i + 1
+        if i >= n:
+            break
+        c: uint8 = g_selbuf[i]
+        if c == 62 or c == 43 or c == 126:                # '>' '+' '~'
+            pending = c
+            i = i + 1
+            while i < n and g_selbuf[i] == 32:
+                i = i + 1
+        elif sawspace != 0 and g_nc > 0:
+            pending = 32                                  # descendant
+        s: int32 = i
+        while i < n:
+            ch: uint8 = g_selbuf[i]
+            if ch == 32 or ch == 62 or ch == 43 or ch == 126:
+                break
+            if ch == 91:                                  # '[' — skip to ']'
+                while i < n and g_selbuf[i] != 93:
+                    i = i + 1
+            if i < n and g_selbuf[i] == 58:               # ':' pseudo present
+                g_sel_adv = 1
+            i = i + 1
+        if i > s:
+            g_comp_off[g_nc] = s
+            g_comp_len[g_nc] = i - s
+            if g_nc == 0:
+                g_comb[0] = 0
+            else:
+                g_comb[g_nc] = pending
+                g_sel_adv = 1
+            g_nc = g_nc + 1
+            pending = 0
+
+
+# Does compound `c` (base + optional structural pseudo) match tx entry `t`?
+def _compound_matches_tx(t: int32, c: int32) -> int32:
+    off: int32 = g_comp_off[c]
+    ln: int32 = g_comp_len[c]
+    bl: int32 = 0
+    while bl < ln and g_selbuf[off + bl] != 58:           # up to ':'
+        bl = bl + 1
+    ts: uint64 = cast[uint64](tx_ns[t])
+    ne: uint64 = ts + cast[uint64](tx_nl[t])
+    je: uint64 = cast[uint64](tx_cs[t]) - 1
+    if bl > 0:
+        if _sel_match_at(ts, je, ne, &g_selbuf[off], bl) == 0:
+            return 0
+    # structural pseudo-classes
+    p: int32 = off + bl
+    while p < off + ln and g_selbuf[p] == 58:             # ':'
+        p = p + 1
+        ps: int32 = p
+        while p < off + ln and _sel_isname(g_selbuf[p]) != 0:
+            p = p + 1
+        pl: int32 = p - ps
+        if _bytes_eq(&g_selbuf[ps], pl, cast[Ptr[uint8]]("first-child"), 11) != 0:
+            if _tx_prev_sibling(t) >= 0:
+                return 0
+        elif _bytes_eq(&g_selbuf[ps], pl, cast[Ptr[uint8]]("last-child"), 10) != 0:
+            if _tx_next_sibling(t) >= 0:
+                return 0
+        elif _bytes_eq(&g_selbuf[ps], pl, cast[Ptr[uint8]]("nth-child"), 9) != 0:
+            want: int32 = 0
+            if p < off + ln and g_selbuf[p] == 40:        # '('
+                p = p + 1
+                while p < off + ln and g_selbuf[p] >= 48 and g_selbuf[p] <= 57:
+                    want = want * 10 + cast[int32](g_selbuf[p] - 48)
+                    p = p + 1
+                if p < off + ln and g_selbuf[p] == 41:    # ')'
+                    p = p + 1
+            if _tx_child_index(t) != want:
+                return 0
+        else:
+            return 0                                      # unknown pseudo -> no match
+    return 1
+
+
+# Match tx entry `cur` against compound `c` AND its left chain (combinators).
+def _match_chain(cur: int32, c: int32) -> int32:
+    if _compound_matches_tx(cur, c) == 0:
+        return 0
+    if c == 0:
+        return 1
+    cb: uint8 = g_comb[c]
+    if cb == 62:                                          # '>' parent
+        pp: int32 = tx_parent[cur]
+        if pp < 0:
+            return 0
+        return _match_chain(pp, c - 1)
+    if cb == 32:                                          # ' ' ancestor
+        a: int32 = tx_parent[cur]
+        while a >= 0:
+            if _match_chain(a, c - 1) != 0:
+                return 1
+            a = tx_parent[a]
+        return 0
+    if cb == 43:                                          # '+' adjacent sibling
+        ps: int32 = _tx_prev_sibling(cur)
+        if ps < 0:
+            return 0
+        return _match_chain(ps, c - 1)
+    if cb == 126:                                         # '~' general sibling
+        s: int32 = _tx_prev_sibling(cur)
+        while s >= 0:
+            if _match_chain(s, c - 1) != 0:
+                return 1
+            s = _tx_prev_sibling(s)
+        return 0
+    return 0
+
+
+# The full selector matches the source element anchored at offset `anchor`
+# (only reached when g_sel_adv != 0). Verifies the whole compound/combinator chain
+# against the tree index.
+def _sel_adv_match(anchor: int32) -> int32:
+    t: int32 = _tx_by_anchor(anchor)
+    if t < 0:
+        return 0
+    return _match_chain(t, g_nc - 1)
+
+
 # Locate the FIRST element in source span [lo,hi) matching selector sel. Sets
 # the g_el_* globals; returns 1 on a hit.
 def _dom_find_selector_scoped(sel: Ptr[uint8], seln: int32, lo: uint64, \
                               hi: uint64) -> int32:
     if seln == 0:
         return 0
-    _sel_rightmost(sel, seln)
-    ssel: Ptr[uint8] = &sel[g_sel_off]
-    sslen: int32 = seln - g_sel_off
+    _sel_parse(sel, seln)
+    if g_nc == 0:
+        return 0
+    rc: int32 = g_nc - 1                                   # rightmost compound
+    rbl: int32 = 0
+    while rbl < g_comp_len[rc] and g_selbuf[g_comp_off[rc] + rbl] != 58:
+        rbl = rbl + 1
+    ssel: Ptr[uint8] = &g_selbuf[g_comp_off[rc]]
     i: uint64 = lo
     while i < hi:
         if src_ptr[i] == 60 and i + 1 < src_len and \
@@ -7724,7 +8003,12 @@ def _dom_find_selector_scoped(sel: Ptr[uint8], seln: int32, lo: uint64, \
             ne: uint64 = ts
             while ne < je and _alnum_at(ne) != 0:
                 ne = ne + 1
-            if _sel_match_at(ts, je, ne, ssel, sslen) != 0:
+            hit: int32 = 0
+            if rbl == 0:
+                hit = 1                                    # bare pseudo (e.g. :first-child)
+            elif _sel_match_at(ts, je, ne, ssel, rbl) != 0:
+                hit = 1
+            if hit != 0 and (g_sel_adv == 0 or _sel_adv_match(cast[int32](i)) != 0):
                 return _scan_start_tag(i)
             i = je
         i = i + 1
@@ -7742,9 +8026,14 @@ def _dom_collect_selector(sel: Ptr[uint8], seln: int32, lo: uint64, \
                           hi: uint64, arr: int32):
     if seln == 0:
         return
-    _sel_rightmost(sel, seln)
-    ssel: Ptr[uint8] = &sel[g_sel_off]
-    sslen: int32 = seln - g_sel_off
+    _sel_parse(sel, seln)
+    if g_nc == 0:
+        return
+    rc: int32 = g_nc - 1                                   # rightmost compound
+    rbl: int32 = 0
+    while rbl < g_comp_len[rc] and g_selbuf[g_comp_off[rc] + rbl] != 58:
+        rbl = rbl + 1
+    ssel: Ptr[uint8] = &g_selbuf[g_comp_off[rc]]
     i: uint64 = lo
     while i < hi:
         if src_ptr[i] == 60 and i + 1 < src_len and \
@@ -7757,7 +8046,12 @@ def _dom_collect_selector(sel: Ptr[uint8], seln: int32, lo: uint64, \
             ne: uint64 = ts
             while ne < je and _alnum_at(ne) != 0:
                 ne = ne + 1
-            if _sel_match_at(ts, je, ne, ssel, sslen) != 0:
+            hit: int32 = 0
+            if rbl == 0:
+                hit = 1
+            elif _sel_match_at(ts, je, ne, ssel, rbl) != 0:
+                hit = 1
+            if hit != 0 and (g_sel_adv == 0 or _sel_adv_match(cast[int32](i)) != 0):
                 _scan_start_tag(i)
                 js_array_push(arr, _dom_register_el())
             i = je
@@ -8171,6 +8465,96 @@ def _kind_of(ns: uint64, nl: int32) -> int32:
     return 0
 
 
+# Build a JS string of tag-name bytes p[0..n) upper-cased (spec-uppercase
+# `.tagName`, e.g. `div` -> `DIV`). The internal lowercase tag names the layout
+# engine reads (dom_ns/dom_nl, cre_tag) are untouched — only the JS view is
+# normalized.
+g_tagup: Array[64, uint8]
+
+
+def _tagname_upper(p: Ptr[uint8], n: int32) -> int32:
+    i: int32 = 0
+    while i < n and i < 63:
+        g_tagup[i] = _upper(p[i])
+        i = i + 1
+    return js_new_string(&g_tagup[0], cast[uint64](i))
+
+
+# Register the source element at tree-index `txi` and return its JS object.
+# Sets the g_el_* globals from the tree index, then defers to _dom_register_el
+# (which dedups by anchor). Used to materialize a traversal neighbour.
+def _dom_register_tx(txi: int32) -> int32:
+    if txi < 0 or txi >= tx_n:
+        return js_null()
+    g_el_lt = cast[uint64](tx_anchor[txi])
+    g_el_ns = cast[uint64](tx_ns[txi])
+    g_el_nl = cast[uint64](tx_nl[txi])
+    g_el_cs = cast[uint64](tx_cs[txi])
+    g_el_ce = cast[uint64](tx_ce[txi])
+    return _dom_register_el()
+
+
+# Wire the live traversal properties of the just-registered element `idx` from
+# the integer tree index: parentNode/parentElement, previous/nextElementSibling
+# (+ firstChild/nextSibling aliases), children/childNodes, first/lastElement-
+# Child. Each neighbour is materialized as a real element object via
+# _dom_register_tx; the recursion is bounded by the DOM_MAX object cap and
+# terminates because _dom_register_el dedups an already-registered anchor.
+# childNodes is element-only here (text nodes are not modelled as nodes — a
+# documented round-2 approximation), so firstChild==firstElementChild.
+def _dom_wire_tree(idx: int32):
+    if tx_built == 0:
+        return
+    t: int32 = _tx_by_anchor(dom_anchor[idx])
+    if t < 0:
+        return
+    o: int32 = dom_obj[idx]
+    # parent
+    par: int32 = tx_parent[t]
+    if par >= 0:
+        pv: int32 = _dom_register_tx(par)
+        js_set_prop(o, cast[Ptr[uint8]]("parentNode"), 10, pv)
+        js_set_prop(o, cast[Ptr[uint8]]("parentElement"), 13, pv)
+    else:
+        js_set_prop(o, cast[Ptr[uint8]]("parentNode"), 10, js_null())
+        js_set_prop(o, cast[Ptr[uint8]]("parentElement"), 13, js_null())
+    # siblings (same parent, document order == tx order)
+    prevs: int32 = _tx_prev_sibling(t)
+    nexts: int32 = _tx_next_sibling(t)
+    if prevs >= 0:
+        js_set_prop(o, cast[Ptr[uint8]]("previousElementSibling"), 22, \
+                    _dom_register_tx(prevs))
+    else:
+        js_set_prop(o, cast[Ptr[uint8]]("previousElementSibling"), 22, js_null())
+    if nexts >= 0:
+        nso: int32 = _dom_register_tx(nexts)
+        js_set_prop(o, cast[Ptr[uint8]]("nextElementSibling"), 18, nso)
+        js_set_prop(o, cast[Ptr[uint8]]("nextSibling"), 11, nso)
+    else:
+        js_set_prop(o, cast[Ptr[uint8]]("nextElementSibling"), 18, js_null())
+        js_set_prop(o, cast[Ptr[uint8]]("nextSibling"), 11, js_null())
+    # children
+    ch: int32 = js_new_array_v()
+    havef: int32 = 0
+    firsto: int32 = js_null()
+    lasto: int32 = js_null()
+    k: int32 = 0
+    while k < tx_n:
+        if tx_parent[k] == t:
+            co: int32 = _dom_register_tx(k)
+            js_array_push(ch, co)
+            if havef == 0:
+                firsto = co
+                havef = 1
+            lasto = co
+        k = k + 1
+    js_set_prop(o, cast[Ptr[uint8]]("children"), 8, ch)
+    js_set_prop(o, cast[Ptr[uint8]]("childNodes"), 10, ch)
+    js_set_prop(o, cast[Ptr[uint8]]("firstElementChild"), 17, firsto)
+    js_set_prop(o, cast[Ptr[uint8]]("firstChild"), 10, firsto)
+    js_set_prop(o, cast[Ptr[uint8]]("lastElementChild"), 16, lasto)
+
+
 # Register (or return the existing record for) the element described by the
 # current g_el_* globals. Returns its JS object value-handle.
 def _dom_register_el() -> int32:
@@ -8287,7 +8671,7 @@ def _dom_register_el() -> int32:
     js_set_prop(o, cast[Ptr[uint8]]("className"), 9, \
                 js_new_string(&dom_txtbuf[oc], cast[uint64](ocl)))
     js_set_prop(o, cast[Ptr[uint8]]("tagName"), 7, \
-                js_new_string(&src_ptr[g_el_ns], g_el_nl))
+                _tagname_upper(&src_ptr[g_el_ns], cast[int32](g_el_nl)))
     js_set_prop(o, cast[Ptr[uint8]]("style"), 5, _new_style_obj())
     # form-control DOM properties: value / checked / type / name (+ selectedIndex).
     if kind == 1 or kind == 2 or kind == 3 or kind == 4:
@@ -8334,6 +8718,21 @@ def _dom_register_el() -> int32:
     _build_dataset(o, g_el_ns + g_el_nl, te)
     dom_obj[idx] = o
     dom_n = idx + 1
+    # Wire live traversal links. This recurses into _dom_register_el for each
+    # neighbour, which CLOBBERS the g_el_* scan globals; save + restore them so
+    # callers that read g_el_lt (e.g. _lookup_or_register, _radio_enforce_group)
+    # right after this returns still see THIS element.
+    s_lt: uint64 = g_el_lt
+    s_ns: uint64 = g_el_ns
+    s_nl: uint64 = g_el_nl
+    s_cs: uint64 = g_el_cs
+    s_ce: uint64 = g_el_ce
+    _dom_wire_tree(idx)
+    g_el_lt = s_lt
+    g_el_ns = s_ns
+    g_el_nl = s_nl
+    g_el_cs = s_cs
+    g_el_ce = s_ce
     return o
 
 
@@ -8897,8 +9296,7 @@ def _js_host_dispatch(id: int32) -> int32:
         cre_gone[clid] = 0
         clo: int32 = js_new_object_v()
         js_set_prop(clo, cast[Ptr[uint8]]("tagName"), 7, \
-                    js_new_string(&dom_idbuf[cre_tag_off[clid]], \
-                                  cast[uint64](tagl)))
+                    _tagname_upper(&dom_idbuf[cre_tag_off[clid]], tagl))
         js_set_prop(clo, cast[Ptr[uint8]]("id"), 2, \
                     js_get_prop(base, cast[Ptr[uint8]]("id"), 2))
         js_set_prop(clo, cast[Ptr[uint8]]("className"), 9, \
@@ -8933,7 +9331,7 @@ def _js_host_dispatch(id: int32) -> int32:
         js_set_prop(co, cast[Ptr[uint8]]("className"), 9, \
                     js_new_string(&dom_txtbuf[0], 0))
         js_set_prop(co, cast[Ptr[uint8]]("tagName"), 7, \
-                    js_new_string(&dom_idbuf[cre_tag_off[cid]], cast[uint64](tn)))
+                    _tagname_upper(&dom_idbuf[cre_tag_off[cid]], tn))
         js_set_prop(co, cast[Ptr[uint8]]("style"), 5, _new_style_obj())
         # created elements are first-class: appendChild / insertBefore /
         # removeChild / remove / set|getAttribute / addEventListener, so a
@@ -9023,10 +9421,25 @@ def _js_host_dispatch(id: int32) -> int32:
                 par: int32 = _find_el_by_obj(js_this())
                 if par >= 0:
                     _ap_add(par, ch, -1)
+                    # keep the parent's live JS .children/.childNodes in sync so
+                    # a subsequent read sees the appended node, and give the
+                    # child a parentNode back-link (round 2 real-tree mutation).
+                    pch: int32 = js_get_prop(dom_obj[par], \
+                                             cast[Ptr[uint8]]("children"), 8)
+                    if js_is_array(pch) != 0:
+                        js_array_push(pch, js_arg(0))
+                    js_set_prop(js_arg(0), cast[Ptr[uint8]]("parentNode"), 10, \
+                                dom_obj[par])
+                    js_set_prop(js_arg(0), cast[Ptr[uint8]]("parentElement"), 13, \
+                                dom_obj[par])
                 else:
                     pcid: int32 = _find_cre_by_obj(js_this())
                     if pcid >= 0:
                         _cc_add(pcid, ch, -1)
+                        js_set_prop(js_arg(0), cast[Ptr[uint8]]("parentNode"), 10, \
+                                    js_this())
+                        js_set_prop(js_arg(0), \
+                                    cast[Ptr[uint8]]("parentElement"), 13, js_this())
         return js_arg(0)
     if rel == NID_INSBEF:
         # parent.insertBefore(newNode, refNode) — refNode null => append.
@@ -9606,6 +10019,7 @@ def _run_scripts() -> int32:
     js_hbase = js_host_base()
     js_set_host_dispatch(cast[Fn[int32, int32]](cast[uint64](_js_host_dispatch)))
     _js_build_document()
+    _dom_build_tree_index()                               # parent/child overlay (round 2)
     js_ctx_live = 1
     i: uint64 = 0
     while i < src_len:

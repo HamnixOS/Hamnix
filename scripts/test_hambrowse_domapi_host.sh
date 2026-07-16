@@ -74,7 +74,7 @@ assert_grep '^JSLOG clist true$'            "classList.add + contains still work
 # Events: addEventListener + dispatchEvent counted twice, removeEventListener stops it.
 assert_grep '^JSLOG evt 2$'                 "dispatchEvent fires the listener; removeEventListener detaches it"
 # cloneNode.
-assert_grep '^JSLOG clone li Alpha$'        "cloneNode copies tagName + textContent"
+assert_grep '^JSLOG clone LI Alpha$'        "cloneNode copies spec-uppercase tagName + textContent"
 # No uncaught error anywhere in the run.
 assert_nogrep '^JSERR'                      "no uncaught JS error across the DOM-API script"
 assert_nogrep 'Uncaught'                    "no 'Uncaught' TypeError from a missing DOM API"
