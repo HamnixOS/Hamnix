@@ -293,6 +293,7 @@ build_adder_user hamcalcscene         # scene-file DE calculator: button grid + 
 build_adder_user hameditscene         # scene-file DE text editor: scrollable text area + cursor, /keys input, Ctrl-S saves
 build_adder_user ham2048scene         # scene-file DE 2048 game: coloured 4x4 tile board, WASD/arrow keys + on-screen controls (scene port of ham2048; lib/hamui hamscene_*)
 build_adder_user hamimgscene          # scene-file DE image demo (#128): synthesizes an RGBA image, uploads via draw/ctl 'I' verb, draws it with the scene `image` verb (compositor blits+scales)
+build_adder_user sdlpong              # hamSDL demo game: one-paddle bounce built entirely on the lib/hamsdl.ad game API (drawing + events + timing); dual-target (host gate: scripts/test_hamsdl_host.sh)
 build_adder_user hambrowse            # scene-file DE web browser: fetch HTTP (user/http9) + parse HTML subset + block/inline layout + render (lib/hamui hamscene_*); links click-navigate
 build_adder_user haminstallui         # scene-file DE visual installer: GUI front-end over /bin/haminstall (host name + disk picker + progress)
 build_adder_user hamsettings          # scene-file DE settings: wallpaper swatches (ctl wallpaper verb) + panel position/applet prefs (/etc/panel.conf)
