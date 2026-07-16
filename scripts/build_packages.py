@@ -702,6 +702,9 @@ DESKTOP_APP_PACKAGES: list[dict] = [
     {"name": "hamnix-hamaudio", "bins": ("hamaudioscene",),
      "summary": "audio player (.wav playback through the HDA sink)",
      "sounds": True},
+    {"name": "hamnix-hamvideo", "bins": ("hamvideoscene",),
+     "summary": "video player (Motion-JPEG .hmjv playback to the window)",
+     "videos": True},
     {"name": "hamnix-hamsettings", "bins": ("hamsettings", "hamabout"),
      "summary": "settings + about dialog"},
     {"name": "hamnix-haminstallui", "bins": ("haminstallui",),
@@ -721,13 +724,22 @@ def _files_desktop_core() -> list[tuple[Path, str]]:
 
 
 def _make_desktop_app_files_fn(bins: tuple, with_images: bool,
-                               with_sounds: bool = False):
+                               with_sounds: bool = False,
+                               with_videos: bool = False):
     """Return a files_fn staging `bins` (+ hamview sample images / the
-    hamaudio royalty-free test clip)."""
+    hamaudio royalty-free test clip / the hamvideo royalty-free test clip)."""
     def _files() -> list[tuple[Path, str]]:
         f: list[tuple[Path, str]] = []
         for stem in bins:
             _add_user_bin(f, stem)
+        if with_videos:
+            # The royalty-free (CC0) Motion-JPEG test clip the player opens out
+            # of the box: `hamvideoscene` defaults to /usr/share/videos/
+            # test.hmjv. Generated deterministically by scripts/gen_test_video.py
+            # (synthesized animation — no third-party footage), an original
+            # public-domain work.
+            vid = HERE / "tests" / "fixtures" / "videos" / "test.hmjv"
+            f.append((vid, "usr/share/videos/test.hmjv"))
         if with_sounds:
             # The royalty-free (CC0) audio test clip the player opens out of
             # the box: `hamaudioscene` (and `aplay`) default to
@@ -757,7 +769,7 @@ def _desktop_app_specs() -> list[dict]:
             "name": app["name"],
             "files_fn": _make_desktop_app_files_fn(
                 app["bins"], app.get("images", False),
-                app.get("sounds", False)),
+                app.get("sounds", False), app.get("videos", False)),
             "depends": [f"hamnix-desktop-core>={PKG_VERSION}"],
             "description": f"Hamnix desktop app — {app['summary']}",
             "target": "#hamnix-system",

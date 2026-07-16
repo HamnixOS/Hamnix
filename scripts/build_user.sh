@@ -302,6 +302,8 @@ build_adder_user hamnotesscene        # scene-file DE Notes scratchpad: keyboard
 build_adder_user hamlogscene          # scene-file DE Log Viewer: tails /proc/kmsg into a scrollable ring, page/tail/wheel scroll (lib/hamlogcore, dual-target)
 build_adder_user hamaudioscene        # scene-file DE Audio Player: decodes a .wav (lib/wavdecode) + streams PCM to the native HDA sink (/dev/audio), progress bar + level meter + play/pause/stop/seek (lib/hamaudiocore, dual-target)
 build_adder_user hamaudioselftest     # on-device audio-playback self-test /init: reads /usr/share/sounds/test.wav, decodes (lib/wavdecode), streams PCM to the HDA sink (scripts/test_hamaudio_playback.sh captures + verifies the codec output)
+build_adder_user hamvideoscene        # scene-file DE Video Player: demuxes a Motion-JPEG .hmjv (lib/mjpegdemux) + decodes each frame (lib/jpeg) + blits it to the window's named image ('I' verb), jiffies-paced playback, scrub bar + play/pause/stop (lib/hamvideocore, dual-target)
+build_adder_user hamvideoselftest     # on-device video-decode self-test /init: reads /usr/share/videos/test.hmjv, demuxes + decodes every frame (lib/mjpegdemux + lib/jpeg), blits a mid frame to a wsys window (scripts/test_hamvideo_playback.sh screendumps the rendered frame)
 build_adder_user umdf_host            # Track 4: user-mode driver host — loads a stock .ko in USERLAND via the UMDF kernel primitives
 
 # --- X11 server + client (user/x11/ subdirectory) -------------------

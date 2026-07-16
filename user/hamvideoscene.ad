@@ -1,0 +1,408 @@
+# user/hamvideoscene.ad — NATIVE driver for the hamvideo player scene app.
+#
+# The player's UI STATE, LAYOUT, scene DISPLAY-LIST builder and pure input
+# handlers live in lib/hamvideocore.ad (extern-free, dual-target) so they can
+# ALSO be rendered on the dev host (user/hamvideoscene_host.ad +
+# scripts/test_hamvideo_host.sh). The trivial Motion-JPEG container parse lives
+# in the equally pure lib/mjpegdemux.ad and the per-frame baseline-JPEG decode
+# in lib/jpeg.ad. This file keeps ONLY the Hamnix-only side:
+#   * open a wsys window, read its /keys + /event, commit the scene;
+#   * READ the .hmjv file into memory and demux its frame index (lib/mjpegdemux);
+#   * per playback tick, DECODE the current frame (lib/jpeg) to RGBA and UPLOAD
+#     it to the window's named image store as "frame" via the binary 'I' verb on
+#     /dev/wsys/<wid>/draw/ctl (the SAME #128 path hamimgscene uses), then commit
+#     the scene which references that image — the compositor scales+blits it.
+#   Playback advances the frame index against the 100 Hz jiffies clock at the
+#   container's fps. Audio is out of scope for round 1 (silent video); the .hmjv
+#   container has an audio-track slot reserved for the A/V-sync follow-up.
+#
+# USAGE:  hamvideoscene [file.hmjv]   (defaults to /usr/share/videos/test.hmjv)
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_get_jiffies() -> uint64
+extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
+
+from lib.hamsceneloop import hamscene_park, HAMSCENE_IDLE_MS
+from lib.hamui import hamscene_commit
+from lib.hamscene import hamscene_bufptr, hamscene_length
+from lib.mjpegdemux import mjv_parse, mjv_ok, mjv_width, mjv_height, mjv_fps, \
+    mjv_frame_count, mjv_frame_ptr, mjv_frame_len
+from lib.jpeg import jpeg_decode, jpeg_width, jpeg_height, jpeg_rgba_ptr
+from lib.hamvideocore import hamvideo_init, hamvideo_set_name, \
+    hamvideo_set_meta, hamvideo_set_frame, hamvideo_frame, hamvideo_nframes, \
+    hamvideo_fps, hamvideo_set_playing, hamvideo_is_playing, \
+    hamvideo_take_command, hamvideo_seek_frame, hamvideo_key_line, \
+    hamvideo_press_at, hamvideo_release, hamvideo_build_scene, hamvideo_layout, \
+    HAMVIDEO_CMD_PLAYPAUSE, HAMVIDEO_CMD_STOP, HAMVIDEO_CMD_SEEK
+
+# The whole file, read into memory (bounded). 512 KiB covers the shipped
+# fixture (~120 KiB) with plenty of headroom for a longer clip.
+FILE_CAP: uint64 = 524288
+vf_filebuf: Array[524288, uint8]
+vf_filelen: uint64 = 0
+
+# 'I'-verb upload staging: header (2 + 5("frame") + 9 = 16) + up to 256x256
+# RGBA8888 pixels. The kernel reassembles the 4 KiB-chunked write.
+UBUF_CAP: uint64 = 262176               # 16 + 256*256*4
+ubuf: Array[262176, uint8]
+
+# Playback timing anchors (jiffies clock, HZ=100 => 10 ms/tick).
+play_start_j: uint64 = 0
+base_frame:   int32  = 0
+last_shown:   int32  = -1
+
+WIN_W: int32 = 288
+WIN_H: int32 = 360
+
+
+def _slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _writeall(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _slen(s))
+
+
+def _u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    if value == 0:
+        out[0] = 48
+        out[1] = 0
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    out[written] = 0
+    return written
+
+
+# ---- wsys window transport (mirrors user/hamimgscene.ad) -----------------
+def _newwindow() -> int32:
+    wfd: int32 = sys_open_write(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if wfd < 0:
+        return -1
+    sys_write(wfd, cast[Ptr[uint8]]("newwindow\n"), 10)
+    sys_close(wfd)
+    rfd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if rfd < 0:
+        return -1
+    rbuf: Array[32, uint8]
+    r: int64 = sys_read(rfd, &rbuf[0], 31)
+    sys_close(rfd)
+    if r <= 0:
+        return -1
+    wid: int32 = 0
+    i: uint64 = 0
+    while i < cast[uint64](r):
+        c: uint8 = rbuf[i]
+        if c >= 48 and c <= 57:
+            wid = wid * 10 + cast[int32](c) - 48
+        i = i + 1
+    return wid
+
+
+def _winpath(out: Ptr[uint8], wid: int32, leaf: Ptr[uint8]):
+    p: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("/dev/wsys/")
+    j: uint64 = 0
+    while pre[j] != 0:
+        out[p] = pre[j]
+        p = p + 1
+        j = j + 1
+    p = p + _u64_to_dec(cast[uint64](wid), &out[p])
+    k: uint64 = 0
+    while leaf[k] != 0:
+        out[p] = leaf[k]
+        p = p + 1
+        k = k + 1
+    out[p] = 0
+
+
+# ---- per-frame decode + 'I'-verb upload ----------------------------------
+def _put_i32le(off: uint64, v: int32):
+    u: uint32 = cast[uint32](v)
+    ubuf[off]     = cast[uint8](u & 255)
+    ubuf[off + 1] = cast[uint8]((u >> 8) & 255)
+    ubuf[off + 2] = cast[uint8]((u >> 16) & 255)
+    ubuf[off + 3] = cast[uint8]((u >> 24) & 255)
+
+
+# Decode frame `idx` and upload its RGBA to the window's "frame" image. Returns
+# 1 on success. The single sys_write is delivered to the kernel as 4 KiB chunks
+# and reassembled by devwsys's 'I' streaming path.
+def _show_frame(drawfd: int32, idx: int32) -> int32:
+    if drawfd < 0:
+        return 0
+    p: Ptr[uint8] = mjv_frame_ptr(idx)
+    ln: uint64 = mjv_frame_len(idx)
+    if jpeg_decode(p, ln) < 0:
+        return 0
+    w: int32 = jpeg_width()
+    h: int32 = jpeg_height()
+    npx: uint64 = cast[uint64](w) * cast[uint64](h)
+    if 16 + npx * 4 > UBUF_CAP:
+        return 0
+    ubuf[0] = 73                                       # 'I'
+    ubuf[1] = 5                                         # namelen
+    ubuf[2] = 102                                       # 'f'
+    ubuf[3] = 114                                       # 'r'
+    ubuf[4] = 97                                        # 'a'
+    ubuf[5] = 109                                       # 'm'
+    ubuf[6] = 101                                       # 'e'
+    _put_i32le(7, w)
+    _put_i32le(11, h)
+    ubuf[15] = 1                                        # WSYS_BLIT_FMT_RGBA8888
+    rgba: Ptr[uint8] = jpeg_rgba_ptr()
+    total: uint64 = npx * 4
+    k: uint64 = 0
+    while k < total:
+        ubuf[16 + k] = rgba[k]
+        k = k + 1
+    sys_write(drawfd, &ubuf[0], 16 + total)
+    return 1
+
+
+def emit_scene(scenefd: int32, ctlfd: int32):
+    hamvideo_build_scene()
+    if scenefd >= 0:
+        sys_write(scenefd, hamscene_bufptr(), hamscene_length())
+    if ctlfd >= 0:
+        sys_write(ctlfd, cast[Ptr[uint8]]("commit\n"), 7)
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    sys_bind(cast[Ptr[char]]("/dev"), cast[Ptr[char]]("#c"), 0)
+
+    path: Ptr[char] = cast[Ptr[char]]("/usr/share/videos/test.hmjv")
+    if argc >= 2:
+        path = cast[Ptr[char]](argv[1])
+
+    # --- read the file into memory ---
+    infd: int32 = sys_open(path)
+    if infd >= 0:
+        while vf_filelen < FILE_CAP:
+            r: int64 = sys_read(infd, &vf_filebuf[vf_filelen],
+                                FILE_CAP - vf_filelen)
+            if r <= 0:
+                break
+            vf_filelen = vf_filelen + cast[uint64](r)
+        sys_close(infd)
+
+    hamvideo_init()
+
+    ok: int32 = mjv_parse(&vf_filebuf[0], vf_filelen)
+    if ok != 0:
+        hamvideo_set_meta(mjv_width(), mjv_height(), mjv_fps(),
+                          mjv_frame_count())
+        # Display just the basename of the path.
+        nm: Ptr[uint8] = cast[Ptr[uint8]](path)
+        base: Ptr[uint8] = nm
+        z: uint64 = 0
+        while nm[z] != 0:
+            if nm[z] == 47:
+                base = &nm[z + 1]
+            z = z + 1
+        hamvideo_set_name(base)
+    else:
+        hamvideo_set_name(cast[Ptr[uint8]]("(unreadable video)"))
+
+    # --- window ---
+    wid: int32 = _newwindow()
+    if wid < 0:
+        _writeall(1, cast[Ptr[uint8]]("[hamvideo] FAIL newwindow\n"))
+        return 1
+
+    ctlp: Array[64, uint8]
+    evp: Array[64, uint8]
+    keysp: Array[64, uint8]
+    scenep: Array[64, uint8]
+    drawp: Array[64, uint8]
+    _winpath(&ctlp[0], wid, cast[Ptr[uint8]]("/ctl"))
+    _winpath(&evp[0], wid, cast[Ptr[uint8]]("/event"))
+    _winpath(&keysp[0], wid, cast[Ptr[uint8]]("/keys"))
+    _winpath(&scenep[0], wid, cast[Ptr[uint8]]("/scene"))
+    _winpath(&drawp[0], wid, cast[Ptr[uint8]]("/draw/ctl"))
+
+    wcfd: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+    if wcfd >= 0:
+        _writeall(wcfd, cast[Ptr[uint8]]("geometry 440 160 288 360\n"))
+        _writeall(wcfd, cast[Ptr[uint8]]("decorate 1\n"))
+        _writeall(wcfd, cast[Ptr[uint8]]("z 6\n"))
+        _writeall(wcfd, cast[Ptr[uint8]]("title Video Player\n"))
+        sys_close(wcfd)
+
+    hamvideo_layout(WIN_W, WIN_H)
+
+    # Persistent fds for the hot path.
+    drawfd: int32 = sys_open_write(cast[Ptr[char]](&drawp[0]))
+    scenefd: int32 = sys_open_write(cast[Ptr[char]](&scenep[0]))
+    ctlfd: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+
+    # First frame up + scene committed.
+    if ok != 0:
+        _show_frame(drawfd, 0)
+        last_shown = 0
+    emit_scene(scenefd, ctlfd)
+    _writeall(1, cast[Ptr[uint8]]("[hamvideo] scene window ready\n"))
+
+    kfd: int32 = sys_open(cast[Ptr[char]](&keysp[0]))
+
+    # Autoplay so a bare launch shows motion immediately.
+    if ok != 0:
+        base_frame = 0
+        play_start_j = sys_get_jiffies()
+        hamvideo_set_playing(1)
+        _writeall(1, cast[Ptr[uint8]]("[hamvideo] playing\n"))
+
+    evbuf: Array[256, uint8]
+    kbuf: Array[256, uint8]
+    while True:
+        changed: int32 = 0
+
+        # --- KEYBOARD ---
+        if kfd >= 0:
+            kr: int64 = sys_read_nb(kfd, &kbuf[0], 255)
+            if kr > 0:
+                kls: uint64 = 0
+                ki: uint64 = 0
+                while ki <= cast[uint64](kr):
+                    katend: int32 = 0
+                    if ki == cast[uint64](kr):
+                        katend = 1
+                    if katend == 1 or kbuf[ki] == 10:
+                        if ki > kls:
+                            if hamvideo_key_line(&kbuf[kls], ki - kls) == 1:
+                                changed = 1
+                        kls = ki + 1
+                    ki = ki + 1
+
+        # --- POINTER (non-blocking drain of /event) ---
+        efd: int32 = sys_open(cast[Ptr[char]](&evp[0]))
+        if efd >= 0:
+            r2: int64 = sys_read_nb(efd, &evbuf[0], 255)
+            sys_close(efd)
+            if r2 > 0:
+                ls: uint64 = 0
+                i: uint64 = 0
+                while i <= cast[uint64](r2):
+                    atend: int32 = 0
+                    if i == cast[uint64](r2):
+                        atend = 1
+                    if atend == 1 or evbuf[i] == 10:
+                        if i > ls:
+                            if _handle_pointer(&evbuf[ls], i - ls) == 1:
+                                changed = 1
+                        ls = i + 1
+                    i = i + 1
+
+        # --- drain any queued command from the input handlers ---
+        cmd: int32 = hamvideo_take_command()
+        if cmd == HAMVIDEO_CMD_PLAYPAUSE:
+            if hamvideo_is_playing() != 0:
+                hamvideo_set_playing(0)
+            else:
+                base_frame = hamvideo_frame()
+                play_start_j = sys_get_jiffies()
+                hamvideo_set_playing(1)
+            changed = 1
+        elif cmd == HAMVIDEO_CMD_STOP:
+            hamvideo_set_playing(0)
+            hamvideo_set_frame(0)
+            base_frame = 0
+            changed = 1
+        elif cmd == HAMVIDEO_CMD_SEEK:
+            sf: int32 = hamvideo_seek_frame()
+            hamvideo_set_frame(sf)
+            base_frame = sf
+            play_start_j = sys_get_jiffies()
+            changed = 1
+
+        # --- advance the frame index while playing ---
+        if hamvideo_is_playing() != 0:
+            nf: int32 = hamvideo_nframes()
+            fps: uint64 = cast[uint64](hamvideo_fps())
+            elapsed_j: uint64 = sys_get_jiffies() - play_start_j
+            adv: int32 = cast[int32](elapsed_j * fps / 100)
+            tgt: int32 = base_frame + adv
+            if nf > 0 and tgt >= nf:
+                tgt = nf - 1
+                hamvideo_set_playing(0)                # settle at the last frame
+            hamvideo_set_frame(tgt)
+            changed = 1
+
+        # --- if the displayed frame changed, decode + upload it ---
+        cur: int32 = hamvideo_frame()
+        if cur != last_shown and ok != 0:
+            _show_frame(drawfd, cur)
+            last_shown = cur
+            changed = 1
+
+        if changed != 0:
+            emit_scene(scenefd, ctlfd)
+        hamscene_park(kfd, HAMSCENE_IDLE_MS)
+    return 0
+
+
+btn_down: int32 = 0
+
+
+# Parse one /event line "<...> x y btn"; drive press/release edges through the
+# core's pointer handlers. Mirrors hamaudioscene's parser.
+def _handle_pointer(line: Ptr[uint8], n: uint64) -> int32:
+    xs: Array[8, int64]
+    nints: int32 = 0
+    i: uint64 = 0
+    while i < n and nints < 8:
+        while i < n and (line[i] < 48 or line[i] > 57) and line[i] != 45:
+            i = i + 1
+        if i >= n:
+            break
+        neg: int32 = 0
+        if line[i] == 45:
+            neg = 1
+            i = i + 1
+        val: int64 = 0
+        got: int32 = 0
+        while i < n and line[i] >= 48 and line[i] <= 57:
+            val = val * 10 + cast[int64](line[i] - 48)
+            i = i + 1
+            got = 1
+        if got == 1:
+            if neg == 1:
+                val = 0 - val
+            xs[nints] = val
+            nints = nints + 1
+    if nints < 3:
+        return 0
+    bx: int64 = xs[nints - 3]
+    by: int64 = xs[nints - 2]
+    bbtn: int64 = xs[nints - 1]
+    now_down: int32 = 0
+    if (bbtn & 1) != 0:
+        now_down = 1
+    changed: int32 = 0
+    if now_down != 0 and btn_down == 0:
+        if hamvideo_press_at(bx, by) == 1:
+            changed = 1
+    elif now_down == 0 and btn_down != 0:
+        if hamvideo_release() == 1:
+            changed = 1
+    btn_down = now_down
+    return changed
