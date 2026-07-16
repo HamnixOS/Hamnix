@@ -76,22 +76,23 @@ assert_grep '^ROW FULL 5 CATBTN Graphics'          "Graphics is a parent BUTTON"
 assert_grep '^ROW FULL 6 CATBTN Internet'          "Internet is a parent BUTTON"
 assert_grep '^ROW FULL 7 CATBTN Office'            "Office is a parent BUTTON"
 assert_grep '^ROW FULL 8 CATBTN Games'             "Games is a parent BUTTON"
-assert_grep '^ROW FULL 9 CATBTN System'            "System is a parent BUTTON"
-assert_grep '^ROW FULL 10 CATBTN Settings'         "Settings is a parent BUTTON"
+assert_grep '^ROW FULL 9 CATBTN Sound & Video'     "Sound & Video (Multimedia) is a parent BUTTON"
+assert_grep '^ROW FULL 10 CATBTN System'           "System is a parent BUTTON"
+assert_grep '^ROW FULL 11 CATBTN Settings'         "Settings is a parent BUTTON"
 # CRITICAL: no category app is listed INLINE in the FULL menu (they all live
 # behind the hover fly-outs). Only Recent apps may appear as APP rows.
-if grep -Eq '^ROW FULL [0-9]+ APP .*\[(Accessories|Graphics|Internet|Office|Games|System|Settings|Other)\]' "$DUMP"; then
+if grep -Eq '^ROW FULL [0-9]+ APP .*\[(Accessories|Graphics|Internet|Office|Games|Sound & Video|System|Settings|Other)\]' "$DUMP"; then
     echo "[appmenu-host] FAIL a category app leaked INLINE (should be behind a fly-out)"; fail=1
 else
     echo "[appmenu-host] PASS category apps are behind fly-outs, not inline"
 fi
 
-# The MODEL summary: 4 non-category rows (search + recent hdr + 2 recent) + 7
-# category buttons = 11 rows; 10 apps; 2 recent.
-assert_grep '^MODEL FULL rows=11 apps=10 recent=2' "FULL model: 11 rows (7 category buttons), 10 apps, 2 recent"
+# The MODEL summary: 4 non-category rows (search + recent hdr + 2 recent) + 8
+# category buttons = 12 rows; 12 apps; 2 recent.
+assert_grep '^MODEL FULL rows=12 apps=12 recent=2' "FULL model: 12 rows (8 category buttons), 12 apps, 2 recent"
 
 # --- FILTERED menu: typing "ca" live-narrows to Calculator + Camera -------
-assert_grep '^MODEL FILTERED rows=5 apps=10 recent=2' "FILTERED collapses to 5 rows"
+assert_grep '^MODEL FILTERED rows=5 apps=12 recent=2' "FILTERED collapses to 5 rows"
 assert_grep '^ROW FILTERED 0 SEARCH'               "filtered: search box still row 0"
 assert_grep '^ROW FILTERED 1 HEADER Accessories'   "filtered: Accessories header kept (has a match)"
 assert_grep '^ROW FILTERED 2 APP Calculator  \[Accessories\]' "filtered: Calculator matches 'ca'"
@@ -117,6 +118,20 @@ assert_grep '^CHILD 1 APP Camera'                  "fly-out lists Camera"
 # Camera) so a click launches it; a point outside the box misses.
 assert_grep '^CHILDHIT row1 app=4 name=Camera'     "fly-out hit-test maps a point to the correct app index -> launch"
 assert_grep '^CHILDHIT miss -1'                    "fly-out hit-test misses a point outside the box"
+
+# --- SOUND & VIDEO fly-out: AudioVideo apps classify to the NEW Multimedia
+# bucket (NOT Graphics), so the shipped Video Player + Audio Player are
+# discoverable under "Sound & Video" — the media-discoverability regression. --
+assert_grep '^MMFLYOUT cat=5 apps=2'               "Sound & Video (Multimedia==5) fly-out lists 2 apps"
+assert_grep '^MMCHILD 0 APP Video Player'          "Sound & Video lists the Video Player (AudioVideo -> Multimedia, not Graphics)"
+assert_grep '^MMCHILD 1 APP Audio Player'          "Sound & Video lists the Audio Player"
+# And the AudioVideo apps did NOT leak into the Graphics fly-out (still 2 apps).
+if grep -Eq '^(CHILD|MMCHILD) [0-9]+ APP (Video|Audio) Player' "$DUMP" && \
+   grep -q '^FLYOUT cat=1 apps=2 ' "$DUMP"; then
+    echo "[appmenu-host] PASS media apps live under Sound & Video, Graphics fly-out unchanged"
+else
+    echo "[appmenu-host] FAIL media-app classification regressed"; fail=1
+fi
 
 # --- hit-test + row-kind sanity -------------------------------------------
 assert_grep '^HIT search 0'                        "hit-test: pointer on the search box -> row 0"
