@@ -143,6 +143,19 @@ for _hv_img in ("test.png", "test.jpg"):
         print(f"[build_initramfs] WARN: hamview fixture {_hv_src} absent — "
               f"test_hamview_png_jpeg will not find /share/hamview/{_hv_img}")
 
+# Royalty-free (CC0) audio test clip for the hamaudio player. On the LIVE/
+# installer medium native userland rides in this cpio (no ext4 sysroot), so
+# the clip `hamaudioscene`/`aplay` default to (/usr/share/sounds/test.wav) —
+# and that scripts/test_hamaudio_playback.sh streams through the HDA sink —
+# must be planted here. (The installed-disk path gets the same file via the
+# hamnix-hamaudio package; see scripts/build_packages.py.) ~103 KiB.
+_wav_src = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "sounds" / "test.wav"
+if _wav_src.is_file():
+    FILES.append(("/usr/share/sounds/test.wav", _wav_src.read_bytes()))
+else:
+    print(f"[build_initramfs] WARN: audio fixture {_wav_src} absent — "
+          f"hamaudio has no default clip")
+
 # Optional opt-in markers controlled by env vars. Used by per-test
 # harness scripts to enable kernel-side smoke tests that would
 # otherwise hang/regress unrelated test runs. See
