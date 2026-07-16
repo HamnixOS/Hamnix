@@ -84,6 +84,18 @@ for col in '#0d1b2a' '#12345a' '#eef2f7'; do
     fi
 done
 
+# (6) the `position:fixed; left:0; right:0` flex top bar (#0d1b2a) stretches to
+# the FULL content width, not its natural flex-content width. Pre-fix the bar's
+# background fill ended at x1~568 (audit #6: content-width, right:0 ignored);
+# with both edges anchored it now spans to the content-right (x1 >= 700 at a
+# 900px viewport). Proves absolute/fixed both-edge stretch.
+BARX1=$(awk '$1=="POSFILL" && $14=="#0d1b2a" {print $10; exit}' "$DUMP")
+if [ -n "$BARX1" ] && [ "$BARX1" -ge 700 ]; then
+    echo "[hb-land] PASS fixed bar stretched to full content width (x1=$BARX1 >= 700)"
+else
+    echo "[hb-land] FAIL fixed bar did not stretch to full width (x1=${BARX1:-none}, want >=700)"; fail=1
+fi
+
 # (5) prose does not overflow the viewport.
 OVER=$(awk '$1=="REFLOW" {for(i=1;i<=NF;i++) if($i=="overflow") print $(i+1)}' "$DUMP")
 if [ "${OVER:-1}" = "0" ]; then
