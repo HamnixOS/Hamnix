@@ -97,6 +97,13 @@ assert_grep '^PIX 10 60 #767981'                "rounded: AA corner band blends 
 # --- Initial state -------------------------------------------------------
 assert_grep '^DISPLAY0 0'                        "initial display is 0"
 
+# --- #329 running EXPRESSION on the LCD (show the whole formula as you type) --
+assert_grep '^EXPR d1 5$'                         "typing '5' shows '5'"
+assert_grep '^EXPR op 5[+]$'                       "then '+' shows the running expr '5+'"
+assert_grep '^EXPR d2 5[+]5$'                      "then '5' shows '5+5' (not just '5')"
+assert_grep '^EXPR eq 10$'                         "'=' collapses to the result '10'"
+assert_grep '^EXPR chain 12[+]3[*]2$'              "longer running expr '12+3*2' mid-entry"
+
 # --- Core four-function + chaining (fixed-point) -------------------------
 assert_grep '^DISPLAY1 42'                       "keyboard '7*6=' computes 42"
 assert_grep '^RESULT chain 9'                    "chained ops '2+3+4=' -> 9"
