@@ -659,13 +659,31 @@ spot is a **hybrid**:
       entirely). A BARE inline sub-slice in expression position (`s[a:b][i]`, a
       call argument) is REJECTED cleanly by both backends (deferred; bind it to
       a local first) — never miscompiled.
-    * **Opt-in-by-use / byte-inert / kernel-exempt.** The sub-slice itself emits
-      no bounds check (the range check `a<=b<=len` is a documented follow-up),
-      but the RESULT slice's element indexing stays runtime-checked against its
-      narrowed `len` under `--check-bounds` exactly as any `Slice[T]`. No
-      production `.ad` uses `[a:b]`, so the whole `x86_64-adder-user` corpus is
-      `0`-diverged and the kernel (`x86_64-bare-metal`) is byte-for-byte
-      unchanged (0 ud2).
+    * **Opt-in-by-use / byte-inert / kernel-exempt.** The sub-slice pointer math
+      itself emits no bounds check, and the RESULT slice's element indexing stays
+      runtime-checked against its narrowed `len` under `--check-bounds` exactly as
+      any `Slice[T]`. No production `.ad` uses `[a:b]`, so the whole
+      `x86_64-adder-user` corpus is `0`-diverged and the kernel
+      (`x86_64-bare-metal`) is byte-for-byte unchanged (0 ud2).
+    * **RANGE CHECK `0 <= start <= end <= base.len` (increment-13 follow-up —
+      LANDED, BOTH backends, byte-lockstep).** ONLY under `--check-bounds` (and
+      outside `unsafe:`), a sub-slice verifies its MATERIALISED bounds (an omitted
+      `start` is `0`, an omitted `end` is `base.len`) before forming the narrowed
+      view: three `cmp`/`jCC`-over-`ud2` triples (`testq;jns` for `0<=start`,
+      `cmpq;jge` for `start<=end` and `end<=len`) trapping via `ud2`→SIGILL — the
+      SAME clean-trap mechanism as the Array/Slice element checks. Covers the
+      VarDecl-init and Assignment forms and every omitted-bound shape. Emits ZERO
+      bytes when the flag is off (byte-inert; the shipped default build is
+      unchanged) and is never emitted for the kernel (the driver never sets
+      `check_bounds`/`cg_check_bounds` for a bare-metal target — structurally
+      exempt). SEED `codegen_x86._maybe_emit_subslice_range_check`; NATIVE
+      `codegen.ad emit_subslice_range_check`. Verified: in-bounds `s[2:5]` / `s[:]`
+      run cleanly; `s[5:2]` (start>end), `s[2:9]` (end>len) and a negative-start
+      bound each SIGILL under the flag but are a silent no-op without it; the
+      isolated fixture emits exactly 3 `ud2` on `adder-user`+flag / 0 off / 0 on
+      bare-metal; and a direct flag-ON seed↔native objdiff is CLEAN on 6 range
+      fixtures (the corpus harness runs flag-off). Gate: the new steps (9a–9e) in
+      `scripts/test_adder_subslice.sh`.
     * **Both backends, byte-lockstep.** SEED (`codegen_x86.py`
       `_subslice_ptr_len_exprs` / `_emit_subslice_into`; the `SliceExpr` cases in
       `get_expr_type`, `gen_stmt` VarDecl + Assignment, and the bare-`gen_expr`
@@ -678,13 +696,12 @@ spot is a **hybrid**:
       proven, and the `-O2` bench unchanged (no `.py`/seed instruction-path
       change on any corpus unit → no codegen-perf regression).
 
-    *Deferred (honest):* (a) a **sub-slice range check** (`a<=b<=len` trapping
-    cleanly under `--check-bounds`) — the pointer math lands solidly first; the
-    result slice's own indexing is already checked. (b) **bare inline
-    sub-slices** — need an anonymous prescan-reserved temp (the #312 machinery);
-    bind to a local for now. (c) a **non-identifier base** and side-effecting
-    bounds — the base must be a plain variable and bounds may be read more than
-    once (mirrors the method-sugar receiver rule).
+    *Deferred (honest):* (a) — DONE (the sub-slice range check above).
+    (b) **bare inline sub-slices** — need an anonymous prescan-reserved temp (the
+    #312 machinery); bind to a local for now. (c) a **non-identifier base** and
+    side-effecting bounds — the base must be a plain variable and bounds may be
+    read more than once (the range check re-evaluates each bound), mirroring the
+    method-sugar receiver rule.
 
 Each increment: opt-in or byte-inert-off, kernel-bypassable, seed+native lockstep,
 verified by objdiff + differential fuzzer + `test_native_kernel_links` +

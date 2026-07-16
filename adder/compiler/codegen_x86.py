@@ -5205,11 +5205,74 @@ class X86CodeGen:
             len_expr = BinaryExpr(BinOp.SUB, end_expr, start, span)
         return ptr_expr, len_expr
 
+    def _maybe_emit_subslice_range_check(self, sexpr: SliceExpr) -> None:
+        """Opt-in range check for `base[start:end]`: trap (ud2 -> SIGILL) unless
+        `0 <= start <= end <= base.len`, using the MATERIALISED bounds (an
+        omitted `start` is `0`, an omitted `end` is `base.len`). The roadmap
+        follow-up to increment 13 (the sub-slice pointer math itself is
+        byte-inert); the result slice's element indexing stays separately
+        checked against its narrowed `len`.
+
+        Emits ZERO instructions — byte-inert — unless `--check-bounds` is active
+        AND we are outside any `unsafe:` block, so the shipped default build is
+        unchanged and the kernel (which the driver never compiles with
+        `check_bounds`) is structurally exempt. Each condition is a
+        `cmp`/`jCC`-over-`ud2` triple whose adder-user bytes are identical to
+        the native backend's raw-byte emission (a descriptive stderr message is
+        inserted before each `ud2` for the host Linux target only, on the COLD
+        already-branched path, so the on-device trap bytes stay lockstep).
+
+        The bounds are re-evaluated here (once each), so — as documented for the
+        pointer math — they must be side-effect free."""
+        if not self.check_bounds or self.unsafe_depth > 0:
+            return
+        obj = sexpr.obj
+        span = getattr(sexpr, "span", None)
+        loc = _span_location(span)
+        start = sexpr.start
+        end = sexpr.end
+        # cond 1: 0 <= start (signed; narrower signed scalars sign-extend).
+        start_expr: Expr = start if start is not None else IntLiteral(0, span)
+        self.gen_expr(start_expr)                # %rax = start
+        self.emit("    testq %rax, %rax")
+        ok1 = self.ctx.new_label("subslice_ok")
+        self.emit(f"    jns {ok1}")              # start >= 0 -> ok
+        self._emit_trap_message(
+            f"bounds: sub-slice start < 0 at {loc}\n")
+        self.emit("    ud2")                     # start < 0 -> SIGILL
+        self.emit(f"{ok1}:")
+        # cond 2: start <= end.
+        self.emit("    pushq %rax")              # save start
+        end_expr: Expr = end if end is not None else MemberExpr(obj, "len", span)
+        self.gen_expr(end_expr)                  # %rax = end
+        self.emit("    popq %rcx")               # %rcx = start
+        self.emit("    cmpq %rcx, %rax")         # end - start
+        ok2 = self.ctx.new_label("subslice_ok")
+        self.emit(f"    jge {ok2}")              # end >= start -> ok
+        self._emit_trap_message(
+            f"bounds: sub-slice start > end at {loc}\n")
+        self.emit("    ud2")                     # start > end -> SIGILL
+        self.emit(f"{ok2}:")
+        # cond 3: end <= base.len.
+        self.emit("    pushq %rax")              # save end
+        self.gen_expr(MemberExpr(obj, "len", span))  # %rax = len
+        self.emit("    popq %rcx")               # %rcx = end
+        self.emit("    cmpq %rcx, %rax")         # len - end
+        ok3 = self.ctx.new_label("subslice_ok")
+        self.emit(f"    jge {ok3}")              # len >= end -> ok
+        self._emit_trap_message(
+            f"bounds: sub-slice end > len at {loc}\n")
+        self.emit("    ud2")                     # end > len -> SIGILL
+        self.emit(f"{ok3}:")
+
     def _emit_subslice_into(self, dest_offset: int, sexpr: SliceExpr) -> None:
         """Materialise a sub-slice `base[a:b]` {ptr,len} pair into the 16-byte
         stack cell at `dest_offset(%rbp)` — the same store shape as
         `_emit_slice_new_into`'s explicit-(ptr,len) form."""
         ptr_expr, len_expr = self._subslice_ptr_len_exprs(sexpr)
+        # Opt-in range check `0 <= start <= end <= len` (byte-inert when off,
+        # kernel-exempt) BEFORE forming the narrowed view.
+        self._maybe_emit_subslice_range_check(sexpr)
         self.gen_expr(ptr_expr)
         self.emit(f"    movq %rax, {dest_offset}(%rbp)")
         self.gen_expr(len_expr)
