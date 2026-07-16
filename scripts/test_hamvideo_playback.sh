@@ -1,154 +1,106 @@
 #!/usr/bin/env bash
-# scripts/test_hamvideo_playback.sh — on-device proof for the hamvideo player.
+# scripts/test_hamvideo_playback.sh — on-device video DECODE + wsys-BLIT gate.
 #
-# Boots the installer image into the scene DE, waits for the interactive serial
-# shell, launches the REAL hamvideoscene player (which demuxes the planted
-# /usr/share/videos/test.hmjv, decodes each baseline-JPEG frame with lib/jpeg,
-# and blits it to its window's named image via the 'I' verb — exercising the
-# devwsys 'I'-verb 4 KiB-chunk STREAMING REASSEMBLY on real hardware/TCG), then
-# SCREENDUMPS the framebuffer mid-playback. A rendered frame in the PNG (the
-# animated clip visible in the player window) is the proof — a "[hamvideo]
-# playing" log alone is NOT (the console-leak lesson).
+# The sibling of scripts/test_hamaudio_playback.sh (#321), built on the SAME
+# proven, deterministic, headless path: run a guest program AS /init (no DE, no
+# compositor, no mouse — none of the flaky windowed-launch machinery), with the
+# royalty-free clip planted in the initramfs, and boot QEMU with `-kernel`.
 #
-# It also runs the headless native decode self-test (user/hamvideoselftest.ad)
-# whose per-frame markers assert every frame decoded to non-blank content.
+# It proves the hamvideo player's real media path, guest-program-first:
+#   user/hamvideoselftest.ad (userland /init)
+#     STAGE 1  read /usr/share/videos/test.hmjv
+#              -> lib/mjpegdemux demux -> geometry / fps / frame index
+#              -> lib/jpeg decode EVERY frame -> assert each is NON-BLANK
+#     STAGE 2  open /dev/wsys, newwindow, and UPLOAD a full-resolution decoded
+#              frame (256x192 RGBA8888) via ONE 'I'-verb sys_write to draw/ctl.
+#              The kernel delivers that write as 4 KiB chunks; the devwsys
+#              'I'-verb STREAMING REASSEMBLY fix stores the whole frame. The
+#              write returns the full byte count ONLY when reassembly+store
+#              succeeded — before the fix the identical oversized write returned
+#              -EINVAL. So `blit_ret == expect` is a precise on-device
+#              regression gate on the kernel fix, with no window paint required.
 #
-# rc=124 timeout is NOT a fail; the floor is build-green + boot + no panic +
-# the player markers + a captured screendump. SKIPs cleanly when /dev/kvm,
-# OVMF, socat or the installer image are absent (dev hosts without KVM).
-set -u
-cd "$(dirname "$0")/.." || exit 1
+# Pass criteria (objective, headless):
+#   * the guest demuxed the shipped clip (30 frames @ 256x192, 10 fps);
+#   * lib/jpeg decoded ALL 30 frames to NON-BLANK content on the native target;
+#   * the full-frame 'I'-verb blit round-tripped the kernel reassembly
+#     (blit_ret == 196624), proving the chunked-'I' kernel fix on-device;
+#   * no kernel panic.
 
-TS="$(date +%Y%m%d-%H%M%S)"
-OUT_DIR="${OUT_DIR:-build/hamvideo_playback/$TS}"
-mkdir -p "$OUT_DIR"
-INSTALLER_IMG="${INSTALLER_IMG:-build/hamnix-installer.img}"
-BOOT_WAIT="${BOOT_WAIT:-240}"
-OVMF_FD="${OVMF_FD:-/usr/share/OVMF/OVMF_CODE.fd}"
-[ -f "$OVMF_FD" ] || OVMF_FD="/usr/share/ovmf/OVMF.fd"
+. "$(dirname "$0")/_build_lock.sh"
 
-[ -e /dev/kvm ] || { echo "[hamvideo_pb] SKIP: /dev/kvm absent" >&2; exit 0; }
-[ -f "$OVMF_FD" ] || { echo "[hamvideo_pb] SKIP: OVMF firmware not found" >&2; exit 0; }
-command -v socat >/dev/null 2>&1 || { echo "[hamvideo_pb] SKIP: socat required" >&2; exit 0; }
-[ -f "$INSTALLER_IMG" ] || { echo "[hamvideo_pb] SKIP: $INSTALLER_IMG absent (build it first)" >&2; exit 0; }
+set -uo pipefail
+PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJ_ROOT"
 
-echo "[hamvideo_pb] output dir: $OUT_DIR"
-OVMF_RW=$(mktemp --tmpdir hamnix-hv.ovmf.XXXXXX.fd)
-IMG_RW=$(mktemp --tmpdir hamnix-hv.img.XXXXXX.raw)
-LOG="$OUT_DIR/serial.log"
-MON=$(mktemp --tmpdir -u hamnix-hv-mon.XXXXXX)
-cp "$OVMF_FD" "$OVMF_RW"
-cp "$INSTALLER_IMG" "$IMG_RW"
-cleanup() { rm -f "$OVMF_RW" "$IMG_RW" "$MON"; }
-trap cleanup EXIT
-: > "$LOG"
+ELF=build/hamnix-kernel.elf
+LOG=$(mktemp)
+trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
 
-SNAP_HELPER="$OUT_DIR/.snap.sh"
-cat > "$SNAP_HELPER" <<SNAPEOF
-#!/bin/bash
-label="\$1"
-ppm="$OUT_DIR/\$label.ppm"
-printf 'screendump %s\n' "\$ppm" | socat - "UNIX-CONNECT:$MON" >/dev/null 2>&1
-for i in \$(seq 1 30); do [ -s "\$ppm" ] && break; sleep 0.1; done
-SNAPEOF
-chmod +x "$SNAP_HELPER"
+echo "[test_hamvideo_playback] (1/3) Build userland (hamvideoselftest + init)"
+bash scripts/build_user.sh >/dev/null
 
-python3 - "$IMG_RW" "$OVMF_RW" "$MON" "$LOG" "$SNAP_HELPER" "$BOOT_WAIT" <<'PYDRV'
-import sys, subprocess, time, threading
-img, ovmf, mon, logpath, snap, boot_wait = sys.argv[1:7]
-boot_wait = int(boot_wait)
-qemu = subprocess.Popen([
-    "qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
-    "-bios", ovmf,
-    "-drive", f"file={img},format=raw,if=virtio",
-    "-m", "1G",
-    "-vga", "std", "-display", "none", "-no-reboot",
-    "-monitor", f"unix:{mon},server,nowait",
-    "-serial", "stdio",
-], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-   bufsize=0)
-logf = open(logpath, "wb")
-buf = bytearray(); lock = threading.Lock()
-def reader():
-    while True:
-        b = qemu.stdout.read(1)
-        if not b: break
-        logf.write(b); logf.flush()
-        with lock: buf.extend(b)
-threading.Thread(target=reader, daemon=True).start()
-def wait_for(marker, timeout):
-    m = marker.encode(); deadline = time.time() + timeout
-    while time.time() < deadline:
-        with lock:
-            if m in buf: return True
-        if qemu.poll() is not None: return False
-        time.sleep(0.2)
-    return False
-def send(line):
-    try:
-        qemu.stdin.write((line + "\n").encode()); qemu.stdin.flush()
-    except Exception: pass
-def screendump(label):
-    subprocess.run([snap, label], timeout=20)
-try:
-    if not wait_for("handing off to interactive shell", boot_wait):
-        print("[hamvideo_pb] driver: never reached handoff", file=sys.stderr)
-    else:
-        print("[hamvideo_pb] driver: handoff reached", file=sys.stderr)
-        time.sleep(3)
-        # Launch the real player; it autoplays the planted clip.
-        send("hamvideoscene /usr/share/videos/test.hmjv &")
-        wait_for("[hamvideo] scene window ready", 60)
-        wait_for("[hamvideo] playing", 30)
-        # Let a few frames advance (10 fps clip), then screendump mid-playback.
-        time.sleep(6)
-        screendump("hamvideo_mid")
-        time.sleep(3)
-        screendump("hamvideo_mid2")
-        print("[hamvideo_pb] driver: captured mid-playback", file=sys.stderr)
-finally:
-    try: qemu.stdin.close()
-    except Exception: pass
-    try: qemu.terminate()
-    except Exception: pass
-    try: qemu.wait(timeout=10)
-    except Exception:
-        qemu.kill()
-PYDRV
+# Make sure the fixture clip exists (deterministic regen).
+[ -s tests/fixtures/videos/test.hmjv ] || python3 scripts/gen_test_video.py >/dev/null
 
-for f in hamvideo_mid hamvideo_mid2; do
-    if [ -s "$OUT_DIR/$f.ppm" ] && command -v pnmtopng >/dev/null 2>&1; then
-        pnmtopng "$OUT_DIR/$f.ppm" > "$OUT_DIR/$f.png" 2>/dev/null || true
-    fi
-done
+echo "[test_hamvideo_playback] (2/3) Build kernel with hamvideoselftest as /init + clip in initramfs"
+INIT_ELF=build/user/hamvideoselftest.elf \
+    python3 scripts/build_initramfs.py >/dev/null
+python3 -m compiler.adder compile \
+    --target=x86_64-bare-metal \
+    init/main.ad \
+    -o "$ELF" >/dev/null
 
-echo "[hamvideo_pb] --- playback evidence ---"
+echo "[test_hamvideo_playback] (3/3) Boot QEMU (-kernel, headless) — guest decodes + blits"
+set +e
+timeout 240s qemu-system-x86_64 \
+    -kernel "$ELF" \
+    -smp 1 \
+    -nographic \
+    -no-reboot \
+    -m 512M \
+    -monitor none \
+    -serial stdio \
+    </dev/null > "$LOG" 2>&1
+rc=$?
+set -e
+
+echo "[test_hamvideo_playback] --- guest output ---"
+grep -E "\[hamvideo-selftest\]" "$LOG" || true
+echo "[test_hamvideo_playback] --- end ---"
+
 fail=0
-if grep -aq '\[hamvideo\] scene window ready' "$LOG"; then
-    echo "[hamvideo_pb] PASS player opened its window"
-else
-    echo "[hamvideo_pb] FAIL player window-ready marker missing"; fail=1
-fi
-if grep -aq '\[hamvideo\] playing' "$LOG"; then
-    echo "[hamvideo_pb] PASS player started playback"
-else
-    echo "[hamvideo_pb] FAIL player playing marker missing"; fail=1
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+    echo "[test_hamvideo_playback] FAIL: qemu exited rc=$rc" >&2
+    fail=1
 fi
 if grep -aqi 'kernel panic\|#UD\|triple fault' "$LOG"; then
-    echo "[hamvideo_pb] FAIL panic/fault in serial log"; fail=1
+    echo "[test_hamvideo_playback] FAIL: panic/fault in serial log" >&2
+    fail=1
 else
-    echo "[hamvideo_pb] PASS no panic during boot/playback"
-fi
-if [ -s "$OUT_DIR/hamvideo_mid.png" ] || [ -s "$OUT_DIR/hamvideo_mid.ppm" ]; then
-    echo "[hamvideo_pb] screendump: $OUT_DIR/hamvideo_mid.png — LOOK: the animated clip should be visible in the player window"
-else
-    echo "[hamvideo_pb] WARN no mid-playback screendump captured"
+    echo "[test_hamvideo_playback] PASS: no panic (kernel 'I'-reassembly is boot-safe)"
 fi
 
-echo "[hamvideo_pb] artifacts in $OUT_DIR"
-if [ "$fail" -eq 0 ]; then
-    echo "[hamvideo_pb] RESULT: PASS"
-else
-    echo "[hamvideo_pb] RESULT: FAIL"
+check() {
+    local label="$1" needle="$2"
+    if grep -qF "$needle" "$LOG"; then
+        echo "[test_hamvideo_playback] PASS: $label"
+    else
+        echo "[test_hamvideo_playback] FAIL: $label (expected '$needle')" >&2
+        fail=1
+    fi
+}
+# STAGE 1 — on-device demux + decode.
+check "guest demuxed the clip (30 frames)"       "[hamvideo-selftest] frames 30"
+check "guest decoded all 30 frames"              "[hamvideo-selftest] decoded 30"
+check "all 30 decoded frames NON-BLANK"          "[hamvideo-selftest] nonblank 30"
+# STAGE 2 — on-device 'I'-verb chunked reassembly (the kernel fix).
+check "full-frame 'I' blit round-tripped kernel" "[hamvideo-selftest] blit_ret 196624 expect 196624"
+check "'I'-verb frame stored (fix proven)"        "[hamvideo-selftest] blit_ok"
+check "self-test overall PASS"                    "[hamvideo-selftest] DONE PASS"
+
+if [ "$fail" -ne 0 ]; then
+    echo "[test_hamvideo_playback] FAIL"
+    exit 1
 fi
-exit 0
+echo "[test_hamvideo_playback] PASS — the guest decoded the shipped Motion-JPEG clip to non-blank frames on-device AND a full-resolution frame round-tripped the devwsys 'I'-verb chunked-reassembly kernel fix"
