@@ -62,10 +62,19 @@ OVMF_FD="${OVMF_FD:-/usr/share/ovmf/OVMF.fd}"
 QEMU_CPU="${QEMU_CPU:-max}"
 QEMU_ACCEL="${QEMU_ACCEL:-}"
 
-HEARTBEAT_RE='\[hamsh-alive\]'
+# Readiness marker: the image-agnostic "boot reached the interactive shell"
+# signal used across the gate ecosystem (test_auth / test_de_fps /
+# build_installed_nvme / ...). The DE app-spawn storm runs during rc.boot
+# BEFORE this handoff, so reaching it means the whole storm survived without a
+# #DF. The opt-in [hamsh-alive] heartbeat (off on a shipped boot) is also
+# accepted as a secondary liveness signal.
+HEARTBEAT_RE='handing off to interactive shell|\[hamsh-alive\]'
 # Fatal wedge markers — the exact corruption class the fix eliminates. A stack
-# aliased over physical 0 SMAP-#PF'd (cr2==rsp) then #DF'd to a one-shot halt.
-FATAL_RE='TRAP: vector|triple fault|double fault|cpu_reset|#DF|\[trap-diag\] halting'
+# aliased over physical 0 SMAP-#PF'd (cr2==rsp) then #DF'd (vector 0x08) to the
+# trap-diag one-shot halt. NB: match the FAULT prints ("TRAP: vector 0x..",
+# "[trap-diag] halting"), NOT the benign boot-time "IST-backed #DF handler
+# installed" / "trap_df_install" lines — a bare "#DF" would false-match those.
+FATAL_RE='TRAP: vector|triple fault|\[trap-diag\] halting|cpu_reset'
 # Any ELF/stack load-failure print must be COMPLETE (carry a reason word), never
 # a truncated %s-kernel-#PF wedge.
 ELFLOAD_RE='ELF load of'
@@ -97,7 +106,7 @@ evaluate() {
     # (c) The heartbeat must be reached — the DE bring-up survived the low-RAM
     #     app-spawn storm (pre-fix it #DF-halted before the shell).
     if [ "$hb" -lt 1 ]; then
-        say "FAIL: no '[hamsh-alive]' heartbeat — boot wedged/starved during the"
+        say "FAIL: interactive-shell handoff not reached — boot wedged/starved during the"
         say "      native app-spawn storm at -m ${MEM}M."
         say "--- last 40 serial lines ---"
         tail -40 "$log" | strings | sed 's/^/    /' >&2
