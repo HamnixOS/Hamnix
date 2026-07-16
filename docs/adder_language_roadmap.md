@@ -236,8 +236,9 @@ spot is a **hybrid**:
      bench byte-identical to HEAD (no perf regression), byte-inert-off proven
      HEAD-vs-worktree on both `x86_64-linux` and `x86_64-bare-metal`.
 
-   *Deferred (disproved / honest):* (a) **sub-slicing** (`s[a:b]`) — not this
-   pass; the slice type + checked indexing land solidly first. (b) ~~A bare
+   *Deferred (disproved / honest):* (a) ~~**sub-slicing** (`s[a:b]`) — not this
+   pass; the slice type + checked indexing land solidly first.~~ **CLOSED
+   (increment 13, below).** (b) ~~A bare
    `Slice[T](...)` subexpression not bound to a local~~ — **CLOSED (#312)**: a
    member/field access on an unbound `Slice[T](...)` / `String(...)` temporary
    (e.g. `String(" world").ptr`) now materialises into an anonymous
@@ -630,6 +631,60 @@ spot is a **hybrid**:
       corpus stays `0`-diverged (byte-inert on every unit that does not use the
       sugar). Kernel opt-out intact + links native. Gate:
       `scripts/test_adder_methodsugar.sh`.
+
+13. **Sub-slicing `s[a:b]` on `Slice[T]` / `String` (completes increment 4).**
+
+    **STATUS (increment 13 — landed, BOTH backends, byte-lockstep):** the top
+    deferred item of increment 4 — a Python-shaped `base[start:end]` sub-slice —
+    now narrows a `Slice[T]` / `String`'s 16-byte `{ptr,len}` view into a NEW
+    `{ptr,len}` over the SAME element storage, with no ABI change and no runtime
+    cost beyond the pointer/length arithmetic.
+    * **Pure DESUGAR onto byte-locked nodes (the correctness oracle).**
+      `base[start:end]` lowers to `{ ptr, len }` where
+      `ptr = base.ptr + start` (element size 1: no scaling) or
+      `cast[int64](base.ptr) + start*sizeof(T)` (element size > 1 — the `int64`
+      cast defeats the seed's `Ptr[T] + N` scaling so the EXPLICIT byte offset
+      agrees with the native backend, which never scales `+`), and
+      `len = end - start` (`end` defaults to `base.len`, `start` to `0`). Every
+      piece is an already-byte-locked AST node — member `.ptr`/`.len`, `+`/`-`/
+      `*`, `cast` — routed through the ordinary `gen_expr`, so neither backend
+      invents an emission path and `s[a:b]` compiles to the SAME bytes in both.
+      Omitted-bound forms `s[a:]`, `s[:b]`, `s[:]` all work; `s[a:b:c]` (step)
+      is rejected.
+    * **Materialises into the destination slot (no temp).** The VarDecl-init
+      (`sub: Slice[T] = s[a:b]`) and plain-Assignment (`sub = s[a:b]`) forms
+      write the narrowed pair straight into the local's 16-byte cell — the same
+      shape as `Slice[T](ptr, len)` construction — so NO anonymous temp / no
+      prescan reservation is needed (the byte-lockstep-risky part is sidestepped
+      entirely). A BARE inline sub-slice in expression position (`s[a:b][i]`, a
+      call argument) is REJECTED cleanly by both backends (deferred; bind it to
+      a local first) — never miscompiled.
+    * **Opt-in-by-use / byte-inert / kernel-exempt.** The sub-slice itself emits
+      no bounds check (the range check `a<=b<=len` is a documented follow-up),
+      but the RESULT slice's element indexing stays runtime-checked against its
+      narrowed `len` under `--check-bounds` exactly as any `Slice[T]`. No
+      production `.ad` uses `[a:b]`, so the whole `x86_64-adder-user` corpus is
+      `0`-diverged and the kernel (`x86_64-bare-metal`) is byte-for-byte
+      unchanged (0 ud2).
+    * **Both backends, byte-lockstep.** SEED (`codegen_x86.py`
+      `_subslice_ptr_len_exprs` / `_emit_subslice_into`; the `SliceExpr` cases in
+      `get_expr_type`, `gen_stmt` VarDecl + Assignment, and the bare-`gen_expr`
+      reject). NATIVE (`codegen.ad` `emit_subslice_into`; the `ND_SLICE` cases in
+      `gen_expr` (reject), the `ND_SLICE_TYPE` VarDecl init, and `ND_ASSIGN`).
+      Gate: `scripts/test_adder_subslice.sh`. Verified: sub-slice objdiff
+      **4/4 CLEAN**, full-corpus objdiff **0 diverged**, differential fuzzer
+      **0 miscompiles**, `test_native_kernel_links` PASS, `run_compiler_tests`
+      ALL PASS, `build_user` full userland OK, byte-inert-off + kernel-exempt
+      proven, and the `-O2` bench unchanged (no `.py`/seed instruction-path
+      change on any corpus unit → no codegen-perf regression).
+
+    *Deferred (honest):* (a) a **sub-slice range check** (`a<=b<=len` trapping
+    cleanly under `--check-bounds`) — the pointer math lands solidly first; the
+    result slice's own indexing is already checked. (b) **bare inline
+    sub-slices** — need an anonymous prescan-reserved temp (the #312 machinery);
+    bind to a local for now. (c) a **non-identifier base** and side-effecting
+    bounds — the base must be a plain variable and bounds may be read more than
+    once (mirrors the method-sugar receiver rule).
 
 Each increment: opt-in or byte-inert-off, kernel-bypassable, seed+native lockstep,
 verified by objdiff + differential fuzzer + `test_native_kernel_links` +

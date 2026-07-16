@@ -49,7 +49,7 @@ from .ast_nodes import (
     IndexExpr, MemberExpr, CastExpr, ContainerOfExpr,
     ConditionalExpr, WalrusExpr, SizeOfExpr,
     Type, PointerType, ArrayType, FunctionPointerType, PercpuType,
-    SliceType, SliceNewExpr, StringType, StringNewExpr,
+    SliceType, SliceNewExpr, StringType, StringNewExpr, SliceExpr,
     ListType, DictType, TupleType, OptionalType,
     MatchStmt, MatchArm, Pattern, LiteralPattern, WildcardPattern,
     NamePattern, OrPattern, SequencePattern,
@@ -553,6 +553,14 @@ class X86CodeGen:
             return SliceType(expr.element_type)
         if isinstance(expr, StringNewExpr):
             return StringType()
+        if isinstance(expr, SliceExpr):
+            # A sub-slice `s[a:b]` has the SAME aggregate type as its base
+            # (Slice[T] -> Slice[T]; String -> String) — it is a narrowed
+            # {ptr,len} view over the same element storage.
+            obj_t = self.get_expr_type(expr.obj)
+            if isinstance(obj_t, (SliceType, StringType)):
+                return obj_t
+            return None
         if isinstance(expr, IndexExpr):
             obj_type = self.get_expr_type(expr.obj)
             if isinstance(obj_type, SliceType):
@@ -2310,6 +2318,12 @@ class X86CodeGen:
                     if isinstance(value, SliceNewExpr):
                         self._emit_slice_new_into(var.offset, value)
                         return
+                    # Sub-slice: `sub: Slice[T] = s[a:b]` / `v: String = s[a:b]`
+                    # narrows the base's {ptr,len} view straight into the local's
+                    # 16-byte slot (roadmap increment 4 follow-up — sub-slicing).
+                    if isinstance(value, SliceExpr):
+                        self._emit_subslice_into(var.offset, value)
+                        return
                     # String construction: `s: String = String(...)` writes the
                     # {ptr,len} pair straight into the local's 16-byte slot.
                     if isinstance(value, StringNewExpr):
@@ -2355,6 +2369,15 @@ class X86CodeGen:
                         and self.ctx is not None \
                         and target.name in self.ctx.locals:
                     self._emit_slice_new_into(
+                        self.ctx.locals[target.name].offset, value)
+                    return
+                # Sub-slice re-assignment: `s = base[a:b]` narrows the base's
+                # {ptr,len} view into s's 16-byte cell in place.
+                if op is None and isinstance(value, SliceExpr) \
+                        and isinstance(target, Identifier) \
+                        and self.ctx is not None \
+                        and target.name in self.ctx.locals:
+                    self._emit_subslice_into(
                         self.ctx.locals[target.name].offset, value)
                     return
                 # String re-assignment: `s = String(...)` rewrites the local's
@@ -3807,6 +3830,20 @@ class X86CodeGen:
             case SliceNewExpr():
                 self.gen_slice_new(expr)
 
+            case SliceExpr():
+                # A sub-slice is a 16-byte {ptr,len} aggregate. Its VarDecl /
+                # assignment forms materialise directly into the destination
+                # slot (see gen_stmt); a BARE sub-slice in expression position
+                # (a call argument, `s[a:b][i]`, …) would need an anonymous
+                # prescan-reserved temp and is deferred this pass — bind it to a
+                # local first (`sub: Slice[T] = s[a:b]`).
+                raise CodeGenError(
+                    "x86: a bare sub-slice `s[a:b]` must be bound to a local "
+                    "(e.g. `sub: Slice[T] = s[a:b]`) — inline sub-slice "
+                    "temporaries are deferred at "
+                    f"{_span_location(getattr(expr, 'span', None))}"
+                )
+
             case StringNewExpr():
                 self.gen_string_new(expr)
 
@@ -5104,6 +5141,79 @@ class X86CodeGen:
             f"__slice_{label_id}", 16, SliceType(snew.element_type))
         self._emit_slice_new_into(tmp.offset, snew)
         self.emit(f"    leaq {tmp.offset}(%rbp), %rax")
+
+    def _subslice_ptr_len_exprs(self, sexpr: SliceExpr):
+        """Desugar `base[start:end]` into the `(ptr_expr, len_expr)` pair for
+        the narrowed {ptr,len} view, composed ENTIRELY from already-byte-locked
+        AST nodes (member `.ptr`/`.len`, `+`/`-`/`*`, cast) so both backends
+        emit identical machine code:
+
+            ptr = base.ptr + start        (element size 1: no scaling)
+                = cast[int64](base.ptr) + start*sizeof(T)   (element size > 1;
+                  the int64 cast defeats the seed's pointer-arith scaling so the
+                  explicit byte offset matches the native backend, which never
+                  scales `+`)
+            len = end - start             (end defaults to base.len; start to 0)
+
+        The base must be a plain slice/String variable (an Identifier). Bounds
+        are evaluated as written and MAY be read more than once, so keep them
+        side-effect free (mirrors the method-sugar receiver rule)."""
+        obj = sexpr.obj
+        span = getattr(sexpr, "span", None)
+        if not isinstance(obj, Identifier):
+            raise CodeGenError(
+                "x86: sub-slice base must be a plain slice/String variable — "
+                f"bind it to a local first at {_span_location(span)}"
+            )
+        obj_t = self.get_expr_type(obj)
+        if isinstance(obj_t, SliceType):
+            elem = obj_t.element_type
+        elif isinstance(obj_t, StringType):
+            elem = Type("uint8")
+        else:
+            raise CodeGenError(
+                "x86: sub-slice `[a:b]` requires a Slice[T] / String base at "
+                f"{_span_location(span)}"
+            )
+        if sexpr.step is not None:
+            raise CodeGenError(
+                "x86: sub-slice step `[a:b:c]` is not supported at "
+                f"{_span_location(span)}"
+            )
+        start = sexpr.start
+        end = sexpr.end
+        for bound in (start, end):
+            if isinstance(bound, (SliceNewExpr, StringNewExpr, SliceExpr)):
+                raise CodeGenError(
+                    "x86: sub-slice bound must be an integer expression at "
+                    f"{_span_location(span)}"
+                )
+        ptr_member = MemberExpr(obj, "ptr", span)
+        esz = self.get_type_size(elem)
+        if start is None:
+            ptr_expr: Expr = ptr_member
+        elif esz <= 1:
+            ptr_expr = BinaryExpr(BinOp.ADD, ptr_member, start, span)
+        else:
+            base_i = CastExpr(Type("int64"), ptr_member, span)
+            off = BinaryExpr(BinOp.MUL, start, IntLiteral(esz, span), span)
+            ptr_expr = BinaryExpr(BinOp.ADD, base_i, off, span)
+        end_expr: Expr = end if end is not None else MemberExpr(obj, "len", span)
+        if start is None:
+            len_expr: Expr = end_expr
+        else:
+            len_expr = BinaryExpr(BinOp.SUB, end_expr, start, span)
+        return ptr_expr, len_expr
+
+    def _emit_subslice_into(self, dest_offset: int, sexpr: SliceExpr) -> None:
+        """Materialise a sub-slice `base[a:b]` {ptr,len} pair into the 16-byte
+        stack cell at `dest_offset(%rbp)` — the same store shape as
+        `_emit_slice_new_into`'s explicit-(ptr,len) form."""
+        ptr_expr, len_expr = self._subslice_ptr_len_exprs(sexpr)
+        self.gen_expr(ptr_expr)
+        self.emit(f"    movq %rax, {dest_offset}(%rbp)")
+        self.gen_expr(len_expr)
+        self.emit(f"    movq %rax, {dest_offset + 8}(%rbp)")
 
     def _emit_string_new_into(self, dest_offset: int,
                               snew: StringNewExpr) -> None:
