@@ -61,6 +61,12 @@ SKIP_BINS = {
     # any runlevel/menu). Both are dev/bring-up binaries, not shipped
     # userland — packaged by nothing on purpose.
     "spawnfdprobe", "umdf_host",
+    # Audio playback SELF-TEST inits — run AS /init by the HDA gates
+    # (scripts/test_audio_playback.sh runs playtone; test_hamaudio_playback.sh
+    # runs hamaudioselftest), never launched from a menu/autostart. The SHIPPED
+    # audio userland is aplay + the hamaudioscene player (hamnix-hamaudio); these
+    # two are test fixtures, packaged by nothing on purpose.
+    "playtone", "hamaudioselftest",
     # X11 bridge + scene test harnesses (not the shipped DE). hamimgscene =
     # the #128 scene-IMAGE-tier demo (synthesizes an RGBA image + exercises
     # the draw/ctl 'I' upload verb); a dev demo tested by test_hamimg_host.sh,
