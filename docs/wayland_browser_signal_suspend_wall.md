@@ -101,6 +101,40 @@ for an unrelated reason. Treat Firefox as "consistent with, pending its own `[no
 RIP resolution." Fixing the preemptive-delivery gap is necessary for the WebKit arm
 regardless and is the right next experiment for both.
 
+## On-the-wire capture (2026-07-16, KVM boot of the full-mirror WebKit image)
+
+Booting the shipped `wk-ffbridge-installer.img` under KVM/OVMF, MiniBrowser reached
+**rung (a)** exactly as documented — connected + bound the FULL registry incl
+`xdg_wm_base` (`[wayland] registry advertised: wl_compositor wl_shm xdg_wm_base wl_seat
+wl_output wl_data_device_manager wl_subcompositor`) — then **rung (b) failed** (no
+`wl_shm` commit, no window map). The kernel watchdogs then pinned the thread group
+(shared `cr3=0xa28a5000`, pids 48-52):
+
+- **`[nosys-wd] slot=27 spun 704 ticks (10ms) with NO syscall`** — the MiniBrowser
+  **main thread (pid 48)**, whose syscall history ends `... openat, read=128, mmap,
+  munmap` then goes silent: it is **spinning in userspace right after a `munmap`**, the
+  exact "post-munmap userspace spin" signature from `project_firefox_startup_deadlock`.
+- Sibling threads parked (all same `cr3`): **slot 29 (pid 49)** in `futex` with history
+  `... 202=>-110 202=>-110` (repeated `FUTEX_WAIT` ETIMEDOUT), its `[parked-wd]`
+  backtrace running **through `libjavascriptcoregtk` -> glibc `pthread_cond_timedwait`
+  (+0x14d) / `pthread_cond_signal`**; **slot 21 (pid 50)** in an **untimed (infinite)
+  `futex` wait** (`[nosys-wd] futex slot=1 ... waiter_task=21 timed=0`); slots 22/24 in
+  `ppoll`.
+- Library identification (resolved offline against the staged libs' dynsyms): the parked
+  RIP/return-address base with `foff=0x28000` is **libc** (its `R E` LOAD segment is at
+  file offset `0x28000`; the frames land in `pthread_cond_timedwait` / `pthread_cond_signal`
+  / `clone`), and the deeper base `0x215578000`/`foff=0x178000` frame resolves **tightly
+  inside libjavascriptcoregtk** (`+0x31a` of a JSC symbol) vs a nonsensical `+0x167k` if
+  interpreted as libwebkit2gtk — i.e. the parked worker's call chain is **JSC/WTF ->
+  glibc condvar wait**.
+
+So on the wire: **one thread of the WebKit group spins in userspace making zero syscalls
+while its JSC/WTF peers sit in condvar/futex waits, one of them forever (untimed).** A
+running thread that never syscalls cannot receive an async-posted signal under the
+cooperative-only delivery model — which is precisely the deadlock. (The spinner's exact
+RIP symbol was dropped by the post-handoff console INFO-gate on this boot — see the
+`fix(nosys-wd)` commit that re-stamps EMERG so a re-boot captures it.)
+
 ## Why the earlier "not fixable from our side" verdict was too pessimistic
 
 The earlier rounds correctly cleared the *futex delivery* layer (WAIT/WAKE keying,
