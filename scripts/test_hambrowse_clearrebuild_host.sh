@@ -93,7 +93,12 @@ assert_grep   '^FLOW +- +bulletitem' "a sibling <ul> WITHOUT list-style:none sti
 # element (SEG strike column s1), the same as the <s> tag. Both must be s1.
 assert_grep '^SEG .* s1 .*classstrike\|' "text-decoration:line-through (CSS class) sets the strike flag"
 assert_grep '^SEG .* s1 .*\| tagstrike\|'  "<s> tag strike still fires (regression guard)"
-assert_nogrep '^SEG .* s1 .*\|ROWITEM\|'   "plain rows are NOT struck (no false strike leak)"
+# Round 13: <li> now applies its OWN class cascade, so the ONE rebuilt row with
+# className='done' (i===1) is struck + greyed, while the other THREE plain rows
+# stay default. This both proves <li class> styling AND guards the style-stack
+# leak: if the strike bled past the done <li>, MORE than one ROWITEM would be s1.
+assert_count '^SEG .* s1 .*\|ROWITEM\|$' 1 "exactly the className='done' row is struck (<li> class cascade)"
+assert_count '^SEG .* s0 .*\|ROWITEM\|$' 3 "the other three plain rows stay unstruck (no strike leak past the done <li>)"
 
 # ---- no uncaught error ---------------------------------------------------
 assert_nogrep '^JSERR'   "no uncaught JS error across the clear+rebuild script"
