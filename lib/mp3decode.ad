@@ -1,0 +1,1115 @@
+# lib/mp3decode.ad — PURE, extern-free MPEG-1 Audio Layer III (.mp3) decoder.
+#
+# WHY THIS FILE EXISTS
+# ====================
+# The audio player (user/hamaudioscene.ad) plays WAV through the HDA sink by
+# handing the raw PCM span to /dev/audio (see lib/wavdecode.ad). MP3 is not a
+# raw container: the bytes must be DECODED to PCM first. This module is that
+# decoder. It takes the whole .mp3 byte buffer and produces interleaved signed
+# 16-bit little-endian PCM into an internal buffer, exactly the shape the WAV
+# path streams, so the player feeds the SAME sink with only a decode step
+# spliced in.
+#
+# Like lib/wavdecode.ad it is deliberately PURE: no `extern`, no I/O, no
+# syscalls — it operates on an in-memory byte buffer the caller already read.
+# That makes it DUAL-TARGET: it links into BOTH the native x86_64-adder-user
+# player AND the x86_64-linux host test harness, so scripts/test_mp3decode_host
+# can decode the shipped fixture on the dev host (no QEMU) and check the PCM
+# against an ffmpeg/pdmp3 reference — a real, deterministic decoder signal.
+#
+# SCOPE (honest): MPEG-1 (id==1) Layer III, constant-bitrate, the common case.
+# It fully implements the Layer III pipeline — bit reservoir, scalefactors,
+# Huffman (big-values + count1, all 34 tables incl. linbits), requantize,
+# short-block reorder, alias reduction, IMDCT + windowing + overlap-add,
+# frequency inversion and the 32-band polyphase synthesis filterbank — for
+# mono AND for stereo (independent channels + middle/side). DEFERRED: MPEG-2/
+# 2.5 (lower sample rates), free-format, and intensity-stereo (a rare joint
+# mode); those frames decode to silence rather than wrong audio. ID3v2 tags at
+# the start of the file are skipped.
+#
+# The big fixed data (Huffman trees, synthesis dewindow, band tables) lives in
+# the GENERATED lib/mp3tables.ad (scripts/gen_mp3_tables.py); the trig and
+# pow(x,4/3) tables are computed here at run time from first principles so the
+# decoder needs no libm.
+
+from lib.mp3tables import mp3t_init, mp3t_ht, mp3t_dtbl, mp3t_cs, mp3t_ca, \
+    mp3t_hoff, mp3t_htl, mp3t_hlin, mp3t_sfbl, mp3t_sfbs, mp3t_slen1, \
+    mp3t_slen2, mp3t_bitrate, mp3t_samprate, mp3t_pretab
+
+MP3_PCM_CAP:  uint64 = 2000000            # int16 samples (~45s mono @44.1k)
+MD_CAP:       int32  = 8192               # main-data reservoir bytes
+MP3_PI:       float64 = 3.14159265358979323846
+
+# ---- decoded-output state (public, mirrors wavdecode) --------------------
+mp3_ok:        int32  = 0
+mp3_rate:      uint32 = 0
+mp3_channels:  uint32 = 0
+mp3_pcm_frames: uint64 = 0                # sample-frames written
+
+pcm_buf:  Array[2000000, int16]
+
+# ---- input cursor --------------------------------------------------------
+in_buf:  Ptr[uint8]
+in_len:  uint64 = 0
+in_pos:  uint64 = 0
+
+# ---- frame header --------------------------------------------------------
+h_layer: int32 = 0
+h_prot:  int32 = 0
+h_bri:   int32 = 0
+h_sfi:   int32 = 0
+h_pad:   int32 = 0
+h_mode:  int32 = 0
+h_modext: int32 = 0
+h_nch:   int32 = 1
+
+# ---- side info (per granule[2], channel[2]) ------------------------------
+si_mdb:   int32 = 0
+si_scfsi: Array[2, Array[4, int32]]                 # [ch][band]
+si_p23:   Array[2, Array[2, int32]]
+si_big:   Array[2, Array[2, int32]]
+si_gain:  Array[2, Array[2, int32]]
+si_scmp:  Array[2, Array[2, int32]]
+si_wsf:   Array[2, Array[2, int32]]
+si_btype: Array[2, Array[2, int32]]
+si_mixed: Array[2, Array[2, int32]]
+si_r0:    Array[2, Array[2, int32]]
+si_r1:    Array[2, Array[2, int32]]
+si_pre:   Array[2, Array[2, int32]]
+si_scale: Array[2, Array[2, int32]]
+si_c1sel: Array[2, Array[2, int32]]
+si_count1: Array[2, Array[2, int32]]
+si_tsel:  Array[2, Array[2, Array[3, int32]]]
+si_sbg:   Array[2, Array[2, Array[3, int32]]]
+
+# ---- scalefactors --------------------------------------------------------
+scf_l:  Array[2, Array[2, Array[23, int32]]]        # [gr][ch][sfb]
+scf_s:  Array[2, Array[2, Array[13, Array[3, int32]]]]
+
+# ---- main-data reservoir + bit cursor ------------------------------------
+md_vec:  Array[8192, uint8]
+md_top:  int32 = 0
+md_bit:  int32 = 0
+
+# ---- side-info byte buffer + bit cursor ----------------------------------
+si_vec:  Array[64, uint8]
+si_bit:  int32 = 0
+
+# ---- frequency lines [gr][ch][576] ---------------------------------------
+is_data: Array[2, Array[2, Array[576, float64]]]
+
+# ---- hybrid overlap store + subband V buffer (persist across frames) -----
+hy_store: Array[2, Array[576, float64]]             # [ch][sb*18+i]
+v_vec:    Array[2, Array[1024, float64]]
+
+# ---- run-time trig / pow tables ------------------------------------------
+imdct_win: Array[4, Array[36, float64]]
+cos36:     Array[18, Array[36, float64]]
+cos12:     Array[6, Array[12, float64]]
+nwin:      Array[64, Array[32, float64]]
+pow2q:     Array[4, float64]                        # 2^(0/4..3/4)
+tables_ready: int32 = 0
+
+
+# ==========================================================================
+#  math (no libm): sin/cos via range reduction + Taylor, cbrt via Newton
+# ==========================================================================
+def _mp3_sin(x: float64) -> float64:
+    hp: float64 = MP3_PI * 0.5
+    q: float64 = x / hp
+    k: int64 = 0
+    if q >= 0.0:
+        k = cast[int64](q + 0.5)
+    else:
+        k = cast[int64](q - 0.5)
+    r: float64 = x - cast[float64](k) * hp
+    r2: float64 = r * r
+    sinr: float64 = r * (1.0 - r2 / 6.0 + r2 * r2 / 120.0 \
+        - r2 * r2 * r2 / 5040.0 + r2 * r2 * r2 * r2 / 362880.0 \
+        - r2 * r2 * r2 * r2 * r2 / 39916800.0)
+    cosr: float64 = 1.0 - r2 / 2.0 + r2 * r2 / 24.0 - r2 * r2 * r2 / 720.0 \
+        + r2 * r2 * r2 * r2 / 40320.0 - r2 * r2 * r2 * r2 * r2 / 3628800.0 \
+        + r2 * r2 * r2 * r2 * r2 * r2 / 479001600.0
+    kk: int64 = k % 4
+    if kk < 0:
+        kk = kk + 4
+    if kk == 0:
+        return sinr
+    if kk == 1:
+        return cosr
+    if kk == 2:
+        return 0.0 - sinr
+    return 0.0 - cosr
+
+
+def _mp3_cos(x: float64) -> float64:
+    return _mp3_sin(x + MP3_PI * 0.5)
+
+
+def _mp3_cbrt(a: float64) -> float64:
+    if a <= 0.0:
+        return 0.0
+    c: float64 = 1.0
+    if a > 1.0:
+        c = a
+    i: int32 = 0
+    while i < 24:
+        c = (2.0 * c + a / (c * c)) / 3.0
+        i = i + 1
+    return c
+
+
+# is_pos^(4/3), is_pos >= 0
+def _mp3_pow43(v: int32) -> float64:
+    if v <= 0:
+        return 0.0
+    fv: float64 = cast[float64](v)
+    return fv * _mp3_cbrt(fv)
+
+
+# 2^e, where e is (known to be) a multiple of 0.25
+def _mp3_pow2(e: float64) -> float64:
+    t: float64 = e * 4.0
+    n4: int32 = 0
+    if t >= 0.0:
+        n4 = cast[int32](t + 0.5)
+    else:
+        n4 = cast[int32](t - 0.5)
+    rem: int32 = n4 % 4
+    if rem < 0:
+        rem = rem + 4
+    ip: int32 = (n4 - rem) / 4
+    base: float64 = 1.0
+    if ip >= 0:
+        j: int32 = 0
+        while j < ip:
+            base = base * 2.0
+            j = j + 1
+    else:
+        j2: int32 = 0
+        while j2 < (0 - ip):
+            base = base / 2.0
+            j2 = j2 + 1
+    return base * pow2q[rem]
+
+
+def _mp3_build_tables():
+    if tables_ready != 0:
+        return
+    mp3t_init()
+    # IMDCT windows (block types 0..3)
+    i: int32 = 0
+    while i < 36:
+        imdct_win[0][i] = _mp3_sin(MP3_PI / 36.0 * (cast[float64](i) + 0.5))
+        i = i + 1
+    i = 0
+    while i < 18:
+        imdct_win[1][i] = _mp3_sin(MP3_PI / 36.0 * (cast[float64](i) + 0.5))
+        i = i + 1
+    i = 18
+    while i < 24:
+        imdct_win[1][i] = 1.0
+        i = i + 1
+    i = 24
+    while i < 30:
+        imdct_win[1][i] = _mp3_sin(MP3_PI / 12.0 * (cast[float64](i) + 0.5 - 18.0))
+        i = i + 1
+    i = 30
+    while i < 36:
+        imdct_win[1][i] = 0.0
+        i = i + 1
+    i = 0
+    while i < 12:
+        imdct_win[2][i] = _mp3_sin(MP3_PI / 12.0 * (cast[float64](i) + 0.5))
+        i = i + 1
+    i = 12
+    while i < 36:
+        imdct_win[2][i] = 0.0
+        i = i + 1
+    i = 0
+    while i < 6:
+        imdct_win[3][i] = 0.0
+        i = i + 1
+    i = 6
+    while i < 12:
+        imdct_win[3][i] = _mp3_sin(MP3_PI / 12.0 * (cast[float64](i) + 0.5 - 6.0))
+        i = i + 1
+    i = 12
+    while i < 18:
+        imdct_win[3][i] = 1.0
+        i = i + 1
+    i = 18
+    while i < 36:
+        imdct_win[3][i] = _mp3_sin(MP3_PI / 36.0 * (cast[float64](i) + 0.5))
+        i = i + 1
+    # cos tables for the IMDCT
+    m: int32 = 0
+    while m < 18:
+        p: int32 = 0
+        while p < 36:
+            cos36[m][p] = _mp3_cos(MP3_PI / 72.0 \
+                * cast[float64](2 * p + 1 + 18) * cast[float64](2 * m + 1))
+            p = p + 1
+        m = m + 1
+    m = 0
+    while m < 6:
+        p2: int32 = 0
+        while p2 < 12:
+            cos12[m][p2] = _mp3_cos(MP3_PI / 24.0 \
+                * cast[float64](2 * p2 + 1 + 6) * cast[float64](2 * m + 1))
+            p2 = p2 + 1
+        m = m + 1
+    # synthesis matrixing window
+    ii: int32 = 0
+    while ii < 64:
+        jj: int32 = 0
+        while jj < 32:
+            nwin[ii][jj] = _mp3_cos(cast[float64]((16 + ii) * (2 * jj + 1)) \
+                * (MP3_PI / 64.0))
+            jj = jj + 1
+        ii = ii + 1
+    pow2q[0] = 1.0
+    pow2q[1] = 1.18920711500272107
+    pow2q[2] = 1.41421356237309515
+    pow2q[3] = 1.68179283050742909
+    tables_ready = 1
+
+
+# ==========================================================================
+#  bit readers
+# ==========================================================================
+def _get_byte() -> int32:
+    if in_pos >= in_len:
+        return -1
+    b: int32 = cast[int32](in_buf[in_pos])
+    in_pos = in_pos + 1
+    return b
+
+
+# side-info: read n bits MSB-first from si_vec at si_bit
+def _sbits(n: int32) -> uint32:
+    val: uint32 = 0
+    i: int32 = 0
+    while i < n:
+        bytev: uint32 = cast[uint32](si_vec[si_bit >> 3])
+        bit: uint32 = (bytev >> (7 - (si_bit & 7))) & 1
+        val = (val << 1) | bit
+        si_bit = si_bit + 1
+        i = i + 1
+    return val
+
+
+# main-data: read n bits MSB-first from md_vec at md_bit
+def _mbits(n: int32) -> uint32:
+    if n == 0:
+        return 0
+    val: uint32 = 0
+    i: int32 = 0
+    while i < n:
+        bytev: uint32 = cast[uint32](md_vec[md_bit >> 3])
+        bit: uint32 = (bytev >> (7 - (md_bit & 7))) & 1
+        val = (val << 1) | bit
+        md_bit = md_bit + 1
+        i = i + 1
+    return val
+
+
+def _mbit() -> uint32:
+    bytev: uint32 = cast[uint32](md_vec[md_bit >> 3])
+    bit: uint32 = (bytev >> (7 - (md_bit & 7))) & 1
+    md_bit = md_bit + 1
+    return bit
+
+
+# ==========================================================================
+#  header + side info
+# ==========================================================================
+# Returns 1 if a valid MPEG-1 Layer III header was found (in_pos left just past
+# the 4 header bytes), 0 at EOF.
+def _read_header() -> int32:
+    b1: int32 = _get_byte()
+    b2: int32 = _get_byte()
+    b3: int32 = _get_byte()
+    b4: int32 = _get_byte()
+    if b1 < 0 or b2 < 0 or b3 < 0 or b4 < 0:
+        return 0
+    while True:
+        header: uint32 = (cast[uint32](b1) << 24) | (cast[uint32](b2) << 16) \
+            | (cast[uint32](b3) << 8) | cast[uint32](b4)
+        if (header & 4292870144) == 4292870144:          # 0xffe00000 sync
+            idv: int32 = cast[int32]((header >> 19) & 1)
+            layer: int32 = cast[int32]((header >> 17) & 3)
+            bri: int32 = cast[int32]((header >> 12) & 15)
+            sfi: int32 = cast[int32]((header >> 10) & 3)
+            # accept only MPEG-1 (id==1), Layer III (layer bits==1), valid rate
+            if idv == 1 and layer == 1 and bri != 0 and bri != 15 and sfi != 3:
+                h_layer = 3
+                h_prot = cast[int32]((header >> 16) & 1)
+                h_bri = bri
+                h_sfi = sfi
+                h_pad = cast[int32]((header >> 9) & 1)
+                h_mode = cast[int32]((header >> 6) & 3)
+                h_modext = cast[int32]((header >> 4) & 3)
+                if h_mode == 3:
+                    h_nch = 1
+                else:
+                    h_nch = 2
+                return 1
+        # slide one byte and keep scanning
+        b1 = b2
+        b2 = b3
+        b3 = b4
+        b4 = _get_byte()
+        if b4 < 0:
+            return 0
+
+
+def _read_sideinfo(size: int32):
+    i: int32 = 0
+    while i < size:
+        v: int32 = _get_byte()
+        if v < 0:
+            v = 0
+        si_vec[i] = cast[uint8](v)
+        i = i + 1
+    si_bit = 0
+    nch: int32 = h_nch
+    si_mdb = cast[int32](_sbits(9))
+    if h_mode == 3:
+        _sbits(5)
+    else:
+        _sbits(3)
+    ch: int32 = 0
+    while ch < nch:
+        b: int32 = 0
+        while b < 4:
+            si_scfsi[ch][b] = cast[int32](_sbits(1))
+            b = b + 1
+        ch = ch + 1
+    gr: int32 = 0
+    while gr < 2:
+        ch2: int32 = 0
+        while ch2 < nch:
+            si_p23[gr][ch2] = cast[int32](_sbits(12))
+            si_big[gr][ch2] = cast[int32](_sbits(9))
+            si_gain[gr][ch2] = cast[int32](_sbits(8))
+            si_scmp[gr][ch2] = cast[int32](_sbits(4))
+            si_wsf[gr][ch2] = cast[int32](_sbits(1))
+            if si_wsf[gr][ch2] == 1:
+                si_btype[gr][ch2] = cast[int32](_sbits(2))
+                si_mixed[gr][ch2] = cast[int32](_sbits(1))
+                r: int32 = 0
+                while r < 2:
+                    si_tsel[gr][ch2][r] = cast[int32](_sbits(5))
+                    r = r + 1
+                w: int32 = 0
+                while w < 3:
+                    si_sbg[gr][ch2][w] = cast[int32](_sbits(3))
+                    w = w + 1
+                if si_btype[gr][ch2] == 2 and si_mixed[gr][ch2] == 0:
+                    si_r0[gr][ch2] = 8
+                else:
+                    si_r0[gr][ch2] = 7
+                si_r1[gr][ch2] = 20 - si_r0[gr][ch2]
+                si_tsel[gr][ch2][2] = 0
+            else:
+                r2: int32 = 0
+                while r2 < 3:
+                    si_tsel[gr][ch2][r2] = cast[int32](_sbits(5))
+                    r2 = r2 + 1
+                si_r0[gr][ch2] = cast[int32](_sbits(4))
+                si_r1[gr][ch2] = cast[int32](_sbits(3))
+                si_btype[gr][ch2] = 0
+                si_mixed[gr][ch2] = 0
+                si_sbg[gr][ch2][0] = 0
+                si_sbg[gr][ch2][1] = 0
+                si_sbg[gr][ch2][2] = 0
+            si_pre[gr][ch2] = cast[int32](_sbits(1))
+            si_scale[gr][ch2] = cast[int32](_sbits(1))
+            si_c1sel[gr][ch2] = cast[int32](_sbits(1))
+            ch2 = ch2 + 1
+        gr = gr + 1
+
+
+# ==========================================================================
+#  scalefactors + Huffman (fills is_data + si_count1)
+# ==========================================================================
+# Huffman decode one code word from main data. Returns packed result via the
+# module globals hd_x/hd_y/hd_v/hd_w.
+hd_x: int32 = 0
+hd_y: int32 = 0
+hd_v: int32 = 0
+hd_w: int32 = 0
+
+
+def _huffman_decode(tn: int32):
+    off: int32 = mp3t_hoff(tn)
+    treelen: int32 = mp3t_htl(tn)
+    linbits: int32 = mp3t_hlin(tn)
+    x: int32 = 0
+    y: int32 = 0
+    if treelen == 0:
+        hd_x = 0
+        hd_y = 0
+        hd_v = 0
+        hd_w = 0
+        return
+    point: int32 = 0
+    bitsleft: int32 = 32
+    while True:
+        node: uint32 = mp3t_ht(off + point)
+        if (node & 65280) == 0:                     # 0xff00 -> leaf
+            x = cast[int32]((node >> 4) & 15)
+            y = cast[int32](node & 15)
+            break
+        if _mbit() == 1:
+            while (mp3t_ht(off + point) & 255) >= 250:
+                point = point + cast[int32](mp3t_ht(off + point) & 255)
+            point = point + cast[int32](mp3t_ht(off + point) & 255)
+        else:
+            while (mp3t_ht(off + point) >> 8) >= 250:
+                point = point + cast[int32](mp3t_ht(off + point) >> 8)
+            point = point + cast[int32](mp3t_ht(off + point) >> 8)
+        bitsleft = bitsleft - 1
+        if bitsleft <= 0 or point >= treelen:
+            break
+    v: int32 = 0
+    w: int32 = 0
+    if tn > 31:
+        v = (y >> 3) & 1
+        w = (y >> 2) & 1
+        x = (y >> 1) & 1
+        y = y & 1
+        if v > 0 and _mbit() == 1:
+            v = 0 - v
+        if w > 0 and _mbit() == 1:
+            w = 0 - w
+        if x > 0 and _mbit() == 1:
+            x = 0 - x
+        if y > 0 and _mbit() == 1:
+            y = 0 - y
+    else:
+        if linbits > 0 and x == 15:
+            x = x + cast[int32](_mbits(linbits))
+        if x > 0 and _mbit() == 1:
+            x = 0 - x
+        if linbits > 0 and y == 15:
+            y = y + cast[int32](_mbits(linbits))
+        if y > 0 and _mbit() == 1:
+            y = 0 - y
+    hd_x = x
+    hd_y = y
+    hd_v = v
+    hd_w = w
+
+
+def _read_scalefactors(gr: int32, ch: int32):
+    slen1: int32 = mp3t_slen1(si_scmp[gr][ch])
+    slen2: int32 = mp3t_slen2(si_scmp[gr][ch])
+    sfb: int32 = 0
+    if si_wsf[gr][ch] != 0 and si_btype[gr][ch] == 2:
+        if si_mixed[gr][ch] != 0:
+            sfb = 0
+            while sfb < 8:
+                scf_l[gr][ch][sfb] = cast[int32](_mbits(slen1))
+                sfb = sfb + 1
+            sfb = 3
+            while sfb < 12:
+                nb: int32 = slen2
+                if sfb < 6:
+                    nb = slen1
+                win: int32 = 0
+                while win < 3:
+                    scf_s[gr][ch][sfb][win] = cast[int32](_mbits(nb))
+                    win = win + 1
+                sfb = sfb + 1
+        else:
+            sfb = 0
+            while sfb < 12:
+                nb2: int32 = slen2
+                if sfb < 6:
+                    nb2 = slen1
+                win2: int32 = 0
+                while win2 < 3:
+                    scf_s[gr][ch][sfb][win2] = cast[int32](_mbits(nb2))
+                    win2 = win2 + 1
+                sfb = sfb + 1
+    else:
+        _read_scf_long_group(gr, ch, 0, 6, slen1, 0)
+        _read_scf_long_group(gr, ch, 6, 11, slen1, 1)
+        _read_scf_long_group(gr, ch, 11, 16, slen2, 2)
+        _read_scf_long_group(gr, ch, 16, 21, slen2, 3)
+
+
+def _read_scf_long_group(gr: int32, ch: int32, a: int32, b: int32, sl: int32,
+                         grp: int32):
+    sfb: int32 = a
+    if si_scfsi[ch][grp] == 0 or gr == 0:
+        while sfb < b:
+            scf_l[gr][ch][sfb] = cast[int32](_mbits(sl))
+            sfb = sfb + 1
+    elif si_scfsi[ch][grp] == 1 and gr == 1:
+        while sfb < b:
+            scf_l[1][ch][sfb] = scf_l[0][ch][sfb]
+            sfb = sfb + 1
+
+
+def _read_huffman(gr: int32, ch: int32, part2_start: int32):
+    ispos: int32 = 0
+    while ispos < 576:
+        is_data[gr][ch][ispos] = 0.0
+        ispos = ispos + 1
+    if si_p23[gr][ch] == 0:
+        si_count1[gr][ch] = 0
+        return
+    bit_pos_end: int32 = part2_start + si_p23[gr][ch] - 1
+    r1: int32 = 0
+    r2: int32 = 0
+    if si_wsf[gr][ch] != 0 and si_btype[gr][ch] == 2:
+        r1 = 36
+        r2 = 576
+    else:
+        r1 = mp3t_sfbl(h_sfi, si_r0[gr][ch] + 1)
+        r2 = mp3t_sfbl(h_sfi, si_r0[gr][ch] + si_r1[gr][ch] + 2)
+    ispos = 0
+    bigend: int32 = si_big[gr][ch] * 2
+    while ispos < bigend:
+        tn: int32 = si_tsel[gr][ch][2]
+        if ispos < r1:
+            tn = si_tsel[gr][ch][0]
+        elif ispos < r2:
+            tn = si_tsel[gr][ch][1]
+        _huffman_decode(tn)
+        is_data[gr][ch][ispos] = cast[float64](hd_x)
+        ispos = ispos + 1
+        is_data[gr][ch][ispos] = cast[float64](hd_y)
+        ispos = ispos + 1
+    tn2: int32 = si_c1sel[gr][ch] + 32
+    ispos = si_big[gr][ch] * 2
+    while ispos <= 572 and md_bit <= bit_pos_end:
+        _huffman_decode(tn2)
+        is_data[gr][ch][ispos] = cast[float64](hd_v)
+        ispos = ispos + 1
+        if ispos >= 576:
+            break
+        is_data[gr][ch][ispos] = cast[float64](hd_w)
+        ispos = ispos + 1
+        if ispos >= 576:
+            break
+        is_data[gr][ch][ispos] = cast[float64](hd_x)
+        ispos = ispos + 1
+        if ispos >= 576:
+            break
+        is_data[gr][ch][ispos] = cast[float64](hd_y)
+        ispos = ispos + 1
+    if md_bit > bit_pos_end + 1:
+        ispos = ispos - 4
+    si_count1[gr][ch] = ispos
+    while ispos < 576:
+        is_data[gr][ch][ispos] = 0.0
+        ispos = ispos + 1
+    md_bit = bit_pos_end + 1
+
+
+# ==========================================================================
+#  requantize
+# ==========================================================================
+def _rq_long(gr: int32, ch: int32, i: int32, sfb: int32):
+    sfm: float64 = 0.5
+    if si_scale[gr][ch] != 0:
+        sfm = 1.0
+    pf: int32 = si_pre[gr][ch] * mp3t_pretab(sfb)
+    t1: float64 = _mp3_pow2(0.0 - (sfm * cast[float64](scf_l[gr][ch][sfb] + pf)))
+    t2: float64 = _mp3_pow2(0.25 * cast[float64](si_gain[gr][ch] - 210))
+    s: float64 = is_data[gr][ch][i]
+    t3: float64 = 0.0
+    if s < 0.0:
+        t3 = 0.0 - _mp3_pow43(cast[int32](0.0 - s))
+    else:
+        t3 = _mp3_pow43(cast[int32](s))
+    is_data[gr][ch][i] = t1 * t2 * t3
+
+
+def _rq_short(gr: int32, ch: int32, i: int32, sfb: int32, win: int32):
+    sfm: float64 = 0.5
+    if si_scale[gr][ch] != 0:
+        sfm = 1.0
+    t1: float64 = _mp3_pow2(0.0 - (sfm * cast[float64](scf_s[gr][ch][sfb][win])))
+    t2: float64 = _mp3_pow2(0.25 * cast[float64](si_gain[gr][ch] - 210 \
+        - 8 * si_sbg[gr][ch][win]))
+    s: float64 = is_data[gr][ch][i]
+    t3: float64 = 0.0
+    if s < 0.0:
+        t3 = 0.0 - _mp3_pow43(cast[int32](0.0 - s))
+    else:
+        t3 = _mp3_pow43(cast[int32](s))
+    is_data[gr][ch][i] = t1 * t2 * t3
+
+
+def _requantize(gr: int32, ch: int32):
+    sfi: int32 = h_sfi
+    cnt: int32 = si_count1[gr][ch]
+    if si_wsf[gr][ch] != 0 and si_btype[gr][ch] == 2:
+        if si_mixed[gr][ch] != 0:
+            sfb: int32 = 0
+            nsfb: int32 = mp3t_sfbl(sfi, 1)
+            i: int32 = 0
+            while i < 36:
+                if i == nsfb:
+                    sfb = sfb + 1
+                    nsfb = mp3t_sfbl(sfi, sfb + 1)
+                _rq_long(gr, ch, i, sfb)
+                i = i + 1
+            sfb = 3
+            nsfb = mp3t_sfbs(sfi, sfb + 1) * 3
+            wl: int32 = mp3t_sfbs(sfi, sfb + 1) - mp3t_sfbs(sfi, sfb)
+            i = 36
+            while i < cnt:
+                if i == nsfb:
+                    sfb = sfb + 1
+                    nsfb = mp3t_sfbs(sfi, sfb + 1) * 3
+                    wl = mp3t_sfbs(sfi, sfb + 1) - mp3t_sfbs(sfi, sfb)
+                win: int32 = 0
+                while win < 3:
+                    j: int32 = 0
+                    while j < wl:
+                        _rq_short(gr, ch, i, sfb, win)
+                        i = i + 1
+                        j = j + 1
+                    win = win + 1
+        else:
+            sfb2: int32 = 0
+            nsfb2: int32 = mp3t_sfbs(sfi, 1) * 3
+            wl2: int32 = mp3t_sfbs(sfi, 1) - mp3t_sfbs(sfi, 0)
+            i2: int32 = 0
+            while i2 < cnt:
+                if i2 == nsfb2:
+                    sfb2 = sfb2 + 1
+                    nsfb2 = mp3t_sfbs(sfi, sfb2 + 1) * 3
+                    wl2 = mp3t_sfbs(sfi, sfb2 + 1) - mp3t_sfbs(sfi, sfb2)
+                win2: int32 = 0
+                while win2 < 3:
+                    j2: int32 = 0
+                    while j2 < wl2:
+                        _rq_short(gr, ch, i2, sfb2, win2)
+                        i2 = i2 + 1
+                        j2 = j2 + 1
+                    win2 = win2 + 1
+    else:
+        sfb3: int32 = 0
+        nsfb3: int32 = mp3t_sfbl(sfi, 1)
+        i3: int32 = 0
+        while i3 < cnt:
+            if i3 == nsfb3:
+                sfb3 = sfb3 + 1
+                nsfb3 = mp3t_sfbl(sfi, sfb3 + 1)
+            _rq_long(gr, ch, i3, sfb3)
+            i3 = i3 + 1
+
+
+# ==========================================================================
+#  reorder (short blocks)
+# ==========================================================================
+reorder_tmp: Array[576, float64]
+
+
+def _reorder(gr: int32, ch: int32):
+    if si_wsf[gr][ch] == 0 or si_btype[gr][ch] != 2:
+        return
+    sfi: int32 = h_sfi
+    sfb: int32 = 0
+    if si_mixed[gr][ch] != 0:
+        sfb = 3
+    nsfb: int32 = mp3t_sfbs(sfi, sfb + 1) * 3
+    wl: int32 = mp3t_sfbs(sfi, sfb + 1) - mp3t_sfbs(sfi, sfb)
+    i: int32 = 0
+    if sfb != 0:
+        i = 36
+    while i < 576:
+        if i == nsfb:
+            j: int32 = 0
+            while j < 3 * wl:
+                is_data[gr][ch][3 * mp3t_sfbs(sfi, sfb) + j] = reorder_tmp[j]
+                j = j + 1
+            if i >= si_count1[gr][ch]:
+                return
+            sfb = sfb + 1
+            nsfb = mp3t_sfbs(sfi, sfb + 1) * 3
+            wl = mp3t_sfbs(sfi, sfb + 1) - mp3t_sfbs(sfi, sfb)
+        win: int32 = 0
+        while win < 3:
+            j2: int32 = 0
+            while j2 < wl:
+                reorder_tmp[j2 * 3 + win] = is_data[gr][ch][i]
+                i = i + 1
+                j2 = j2 + 1
+            win = win + 1
+    j3: int32 = 0
+    while j3 < 3 * wl:
+        is_data[gr][ch][3 * mp3t_sfbs(sfi, 12) + j3] = reorder_tmp[j3]
+        j3 = j3 + 1
+
+
+# ==========================================================================
+#  stereo (middle/side); intensity stereo is deferred
+# ==========================================================================
+def _stereo(gr: int32):
+    if h_mode != 1 or h_modext == 0:
+        return
+    # middle/side
+    if (h_modext & 2) != 0:
+        c0: int32 = si_count1[gr][0]
+        c1: int32 = si_count1[gr][1]
+        maxp: int32 = c0
+        if c1 > c0:
+            maxp = c1
+        inv: float64 = 0.70710678118654752
+        i: int32 = 0
+        while i < maxp:
+            l: float64 = (is_data[gr][0][i] + is_data[gr][1][i]) * inv
+            r: float64 = (is_data[gr][0][i] - is_data[gr][1][i]) * inv
+            is_data[gr][0][i] = l
+            is_data[gr][1][i] = r
+            i = i + 1
+
+
+# ==========================================================================
+#  alias reduction
+# ==========================================================================
+def _antialias(gr: int32, ch: int32):
+    if si_wsf[gr][ch] == 1 and si_btype[gr][ch] == 2 and si_mixed[gr][ch] == 0:
+        return
+    sblim: int32 = 32
+    if si_wsf[gr][ch] == 1 and si_btype[gr][ch] == 2 and si_mixed[gr][ch] == 1:
+        sblim = 2
+    sb: int32 = 1
+    while sb < sblim:
+        i: int32 = 0
+        while i < 8:
+            li: int32 = 18 * sb - 1 - i
+            ui: int32 = 18 * sb + i
+            csi: float64 = mp3t_cs(i)
+            cai: float64 = mp3t_ca(i)
+            lb: float64 = is_data[gr][ch][li] * csi - is_data[gr][ch][ui] * cai
+            ub: float64 = is_data[gr][ch][ui] * csi + is_data[gr][ch][li] * cai
+            is_data[gr][ch][li] = lb
+            is_data[gr][ch][ui] = ub
+            i = i + 1
+        sb = sb + 1
+
+
+# ==========================================================================
+#  IMDCT + windowing, overlap-add (hybrid synthesis)
+# ==========================================================================
+imdct_out: Array[36, float64]
+
+
+def _imdct_win(gr: int32, ch: int32, base: int32, bt: int32):
+    i: int32 = 0
+    while i < 36:
+        imdct_out[i] = 0.0
+        i = i + 1
+    if bt == 2:
+        k: int32 = 0
+        while k < 3:
+            p: int32 = 0
+            while p < 12:
+                sum: float64 = 0.0
+                m: int32 = 0
+                while m < 6:
+                    sum = sum + is_data[gr][ch][base + k + 3 * m] * cos12[m][p]
+                    m = m + 1
+                imdct_out[6 * k + p + 6] = imdct_out[6 * k + p + 6] \
+                    + sum * imdct_win[2][p]
+                p = p + 1
+            k = k + 1
+    else:
+        p2: int32 = 0
+        while p2 < 36:
+            sum2: float64 = 0.0
+            m2: int32 = 0
+            while m2 < 18:
+                sum2 = sum2 + is_data[gr][ch][base + m2] * cos36[m2][p2]
+                m2 = m2 + 1
+            imdct_out[p2] = sum2 * imdct_win[bt][p2]
+            p2 = p2 + 1
+
+
+def _hybrid(gr: int32, ch: int32):
+    sb: int32 = 0
+    while sb < 32:
+        bt: int32 = si_btype[gr][ch]
+        if si_wsf[gr][ch] == 1 and si_mixed[gr][ch] == 1 and sb < 2:
+            bt = 0
+        _imdct_win(gr, ch, sb * 18, bt)
+        i: int32 = 0
+        while i < 18:
+            is_data[gr][ch][sb * 18 + i] = imdct_out[i] + hy_store[ch][sb * 18 + i]
+            hy_store[ch][sb * 18 + i] = imdct_out[i + 18]
+            i = i + 1
+        sb = sb + 1
+
+
+def _freq_inversion(gr: int32, ch: int32):
+    sb: int32 = 1
+    while sb < 32:
+        i: int32 = 1
+        while i < 18:
+            is_data[gr][ch][sb * 18 + i] = 0.0 - is_data[gr][ch][sb * 18 + i]
+            i = i + 2
+        sb = sb + 2
+
+
+# ==========================================================================
+#  32-band polyphase synthesis filterbank -> PCM
+# ==========================================================================
+u_vec: Array[512, float64]
+s_vec: Array[32, float64]
+
+
+def _subband(gr: int32, ch: int32, base_frame: uint64):
+    nch: int32 = h_nch
+    ss: int32 = 0
+    while ss < 18:
+        i: int32 = 1023
+        while i > 63:
+            v_vec[ch][i] = v_vec[ch][i - 64]
+            i = i - 1
+        i = 0
+        while i < 32:
+            s_vec[i] = is_data[gr][ch][i * 18 + ss]
+            i = i + 1
+        i = 0
+        while i < 64:
+            sum: float64 = 0.0
+            j: int32 = 0
+            while j < 32:
+                sum = sum + nwin[i][j] * s_vec[j]
+                j = j + 1
+            v_vec[ch][i] = sum
+            i = i + 1
+        i = 0
+        while i < 8:
+            j2: int32 = 0
+            while j2 < 32:
+                u_vec[(i << 6) + j2] = v_vec[ch][(i << 7) + j2]
+                u_vec[(i << 6) + j2 + 32] = v_vec[ch][(i << 7) + j2 + 96]
+                j2 = j2 + 1
+            i = i + 1
+        i = 0
+        while i < 512:
+            u_vec[i] = u_vec[i] * mp3t_dtbl(i)
+            i = i + 1
+        i = 0
+        while i < 32:
+            sum2: float64 = 0.0
+            j3: int32 = 0
+            while j3 < 16:
+                sum2 = sum2 + u_vec[(j3 << 5) + i]
+                j3 = j3 + 1
+            samp: int32 = cast[int32](sum2 * 32767.0)
+            if samp > 32767:
+                samp = 32767
+            elif samp < -32767:
+                samp = -32767
+            p: uint64 = cast[uint64](32 * ss + i)
+            idx: uint64 = (base_frame + p) * cast[uint64](nch) + cast[uint64](ch)
+            if idx < MP3_PCM_CAP:
+                pcm_buf[idx] = cast[int16](samp)
+            i = i + 1
+        ss = ss + 1
+
+
+# ==========================================================================
+#  frame assembly + main-data reservoir
+# ==========================================================================
+# Reads one frame's main data into md_vec, honoring the bit reservoir. Returns
+# 1 if this frame is decodable, 0 if it must be skipped (not enough reservoir).
+def _get_main_data(main_data_size: int32) -> int32:
+    if si_mdb > md_top:
+        i: int32 = 0
+        while i < main_data_size:
+            v: int32 = _get_byte()
+            if v < 0:
+                v = 0
+            if md_top + i < MD_CAP:
+                md_vec[md_top + i] = cast[uint8](v)
+            i = i + 1
+        md_top = md_top + main_data_size
+        if md_top > 4096:
+            md_top = 0
+        md_bit = 0
+        return 0
+    if si_mdb + main_data_size > MD_CAP:
+        md_top = 0
+        si_mdb = 0
+    i2: int32 = 0
+    while i2 < si_mdb:
+        md_vec[i2] = md_vec[md_top - si_mdb + i2]
+        i2 = i2 + 1
+    i3: int32 = 0
+    while i3 < main_data_size:
+        v2: int32 = _get_byte()
+        if v2 < 0:
+            v2 = 0
+        md_vec[si_mdb + i3] = cast[uint8](v2)
+        i3 = i3 + 1
+    md_top = si_mdb + main_data_size
+    md_bit = 0
+    return 1
+
+
+# ==========================================================================
+#  public API
+# ==========================================================================
+# Decode the whole .mp3 buffer into the internal PCM buffer. Returns 1 on
+# success (at least one frame decoded), 0 otherwise.
+def mp3decode_parse(buf: Ptr[uint8], length: uint64) -> int32:
+    _mp3_build_tables()
+    mp3_ok = 0
+    mp3_rate = 0
+    mp3_channels = 0
+    mp3_pcm_frames = 0
+    in_buf = buf
+    in_len = length
+    in_pos = 0
+    md_top = 0
+    md_bit = 0
+    # reset persistent synthesis state
+    ci: int32 = 0
+    while ci < 2:
+        k: int32 = 0
+        while k < 576:
+            hy_store[ci][k] = 0.0
+            k = k + 1
+        k = 0
+        while k < 1024:
+            v_vec[ci][k] = 0.0
+            k = k + 1
+        ci = ci + 1
+    # skip an ID3v2 tag if present ("ID3" + ver(2) + flags(1) + size(4,synchsafe))
+    if length >= 10 and buf[0] == 73 and buf[1] == 68 and buf[2] == 51:
+        sz: uint64 = (cast[uint64](buf[6]) << 21) | (cast[uint64](buf[7]) << 14) \
+            | (cast[uint64](buf[8]) << 7) | cast[uint64](buf[9])
+        in_pos = sz + 10
+        if in_pos >= length:
+            in_pos = 0
+    frames: int32 = 0
+    while True:
+        if _read_header() == 0:
+            break
+        nch: int32 = h_nch
+        sideinfo_size: int32 = 32
+        if nch == 1:
+            sideinfo_size = 17
+        framesize: int32 = (144 * mp3t_bitrate(h_bri)) / mp3t_samprate(h_sfi) + h_pad
+        if framesize > 2000 or framesize < 24:
+            continue
+        main_data_size: int32 = framesize - sideinfo_size - 4
+        if h_prot == 0:
+            _get_byte()
+            _get_byte()
+            main_data_size = main_data_size - 2
+        if main_data_size < 0:
+            main_data_size = 0
+        _read_sideinfo(sideinfo_size)
+        mp3_rate = cast[uint32](mp3t_samprate(h_sfi))
+        mp3_channels = cast[uint32](nch)
+        if _get_main_data(main_data_size) == 0:
+            continue
+        # ---- phase 1: scalefactors + Huffman for all granules/channels ----
+        gr: int32 = 0
+        while gr < 2:
+            ch: int32 = 0
+            while ch < nch:
+                part2_start: int32 = md_bit
+                _read_scalefactors(gr, ch)
+                _read_huffman(gr, ch, part2_start)
+                ch = ch + 1
+            gr = gr + 1
+        # ---- phase 2: DSP per granule ----
+        gr = 0
+        while gr < 2:
+            ch2: int32 = 0
+            while ch2 < nch:
+                _requantize(gr, ch2)
+                _reorder(gr, ch2)
+                ch2 = ch2 + 1
+            _stereo(gr)
+            base_frame: uint64 = mp3_pcm_frames
+            ch3: int32 = 0
+            while ch3 < nch:
+                _antialias(gr, ch3)
+                _hybrid(gr, ch3)
+                _freq_inversion(gr, ch3)
+                _subband(gr, ch3, base_frame)
+                ch3 = ch3 + 1
+            mp3_pcm_frames = mp3_pcm_frames + 576
+            if mp3_pcm_frames + 576 >= MP3_PCM_CAP / cast[uint64](nch):
+                # output buffer full; stop cleanly
+                mp3_ok = 1
+                return 1
+            gr = gr + 1
+        frames = frames + 1
+    if frames > 0:
+        mp3_ok = 1
+        return 1
+    return 0
+
+
+def mp3decode_ok() -> int32:
+    return mp3_ok
+
+
+def mp3decode_rate() -> uint32:
+    return mp3_rate
+
+
+def mp3decode_channels() -> uint32:
+    return mp3_channels
+
+
+def mp3decode_bits() -> uint32:
+    return 16
+
+
+def mp3decode_nframes() -> uint64:
+    return mp3_pcm_frames
+
+
+def mp3decode_frame_bytes() -> uint64:
+    return cast[uint64](mp3_channels) * 2
+
+
+def mp3decode_data_len() -> uint64:
+    return mp3_pcm_frames * cast[uint64](mp3_channels) * 2
+
+
+def mp3decode_pcm_ptr() -> Ptr[uint8]:
+    return cast[Ptr[uint8]](&pcm_buf[0])
+
+
+def mp3decode_duration_ms() -> uint64:
+    if mp3_rate == 0:
+        return 0
+    return mp3_pcm_frames * 1000 / cast[uint64](mp3_rate)
+
+
+# Peak |sample| over a PCM byte span [off, off+n) of the decoded output. `off`
+# and `n` are byte offsets into the whole PCM buffer (s16le). Mirrors
+# wavdecode_peak so the player's level meter can be driven identically.
+def mp3decode_peak(off: uint64, n: uint64) -> uint32:
+    base: Ptr[uint8] = cast[Ptr[uint8]](&pcm_buf[0])
+    peak: uint32 = 0
+    i: uint64 = 0
+    while i + 1 < n:
+        lo: uint32 = cast[uint32](base[off + i])
+        hi: uint32 = cast[uint32](base[off + i + 1])
+        raw: uint32 = lo | (hi << 8)
+        mag: uint32 = raw
+        if raw >= 32768:
+            mag = 65536 - raw
+        if mag > peak:
+            peak = mag
+        i = i + 2
+    return peak
