@@ -255,7 +255,7 @@ from fs.elf import (
 # routines through the hook block further down. A pure-native build never
 # installs the hook; the call sites become harmless no-ops (vdso_user_code_vaddr
 # returns 0 → AT_SYSINFO_EHDR omitted, vdso_map_into_user becomes a no-op).
-from mm.page_alloc import alloc_page, alloc_pages, free_page, region_can_alloc
+from mm.page_alloc import alloc_page, alloc_pages, free_page, region_can_alloc, pages_can_alloc, free_pages
 from mm.slab import kmalloc, kfree
 from mm.memblock import memblock_region_top
 # Real uaccess translation layer. copy_to_user / copy_from_user /
@@ -277,7 +277,7 @@ from mm.uaccess import (
 from mm.vma import (
     vma_clear, vma_fork_copy, vma_free_reserved_range,
     vma_release_forked_range,
-    vma_register_bss_demand,
+    vma_register_bss_demand, vma_register_stack_demand,
     vma_alloc, vma_alloc_demand, vma_alloc_file_demand,
     vma_alloc_huge_demand,
     vma_alloc_file_shared, vma_writeback_range,
@@ -1135,6 +1135,27 @@ MAX_ENV_BYTES: uint64 = 256
 # do_clone COW-shares this whole region by VA on fork().
 LINUX_USTACK_ORDER: int32  = 8
 LINUX_USTACK_SIZE:  uint64 = 1048576     # 256 * 4096 = 1 MiB
+
+# LOW-RAM / ANTI-FRAGMENTATION STACK BACKING (fix/execve-ustack-oom).
+# The 1 MiB fixed stack window [VBASE, VBASE+SIZE) is no longer backed by a
+# single EAGER order-8 (1 MiB) CONTIGUOUS alloc_pages() run. Under memory
+# fragmentation that order-8 run fails even with many MiB free, and — worse —
+# the old code passed the resulting phys 0 straight to elf_install_user_range,
+# which stamped the window's US=1 leaves onto physical [0, 1 MiB) (the boot
+# page tables / AP trampoline) and #DF-halted the box when the DE launched
+# apps at low RAM. Now only a small CONTIGUOUS PREFIX at the TOP of the window
+# is eager-allocated (order-6, 256 KiB) — where the argv/envp/auxv builder
+# writes and where glibc's __libc_stack_end lands — and the LOWER remainder
+# [VBASE, prefix_lo) is a DEMAND-ZERO VMA that faults in page-by-page as the
+# program pushes (reusing the proven BSS demand machinery, #195/#196). Total
+# LOGICAL size is unchanged (1 MiB, matching the seeded RLIMIT_STACK); the
+# stack still never grows PAST VBASE. Order-6 is 4x more fragmentation-
+# tolerant than order-8, and a pre-PONR pages_can_alloc() guard + a hard
+# null-check make a genuine OOM a clean -ENOMEM (caller intact) instead of a
+# corrupting past-the-point-of-no-return failure. ASLR_STACK_MAX_PAGES (16 =
+# 64 KiB) + realistic argv/env stay well inside the 256 KiB prefix.
+LINUX_USTACK_EAGER_ORDER: int32  = 6
+LINUX_USTACK_EAGER_SIZE:  uint64 = 262144     # 64 * 4096 = 256 KiB
 
 # DIRECT-MAP / KERNEL-STACK ALIASING FIX (2026-06-25): the Linux user
 # stack's USER virtual base now lives HIGH — above the 4 GiB kernel
@@ -2402,6 +2423,22 @@ def _do_execve_inner(a0: uint64, a1: uint64, a2: uint64) -> int64:
                 cast[uint64](&exec_kpath[0]), exec_eager_bytes)
         set_current_errstr("execve: out of memory")
         return cast[int64](-12)           # -ENOMEM, BEFORE point-of-no-return
+    # EAGER USER-STACK PREFIX pre-check (fix/execve-ustack-oom). The stack
+    # setup below EAGER-allocates a small CONTIGUOUS prefix via
+    # alloc_pages(LINUX_USTACK_EAGER_ORDER) PAST the point-of-no-return
+    # (vma_clear). If that order-6 run is unavailable under fragmentation and
+    # we only discovered it there, alloc_pages returns 0 and — historically —
+    # phys 0 got stamped into the fixed stack window's US=1 leaves, aliasing
+    # physical [0, ...) (boot page tables / AP trampoline) and #DF-halting the
+    # box. Confirm the run is available HERE, while the caller's address space
+    # is still fully intact, so a genuine OOM fails execve cleanly with
+    # -ENOMEM (Linux semantics) and the DE stays alive. The real alloc below
+    # keeps a hard null-check backstop for the SMP race window.
+    if pages_can_alloc(LINUX_USTACK_EAGER_ORDER) == 0:
+        printk1("execve: user-stack prefix (%d bytes contiguous) not available (-ENOMEM, caller intact)\n",
+                LINUX_USTACK_EAGER_SIZE)
+        set_current_errstr("execve: out of memory")
+        return cast[int64](-12)           # -ENOMEM, BEFORE point-of-no-return
     # U42 VMA: drop the outgoing image's mappings BEFORE we load the
     # new ELF. Without this, the new program would inherit the parent
     # image's stack/heap/mmap VMAs and a subsequent mprotect or munmap
@@ -2662,8 +2699,6 @@ def _do_execve_inner(a0: uint64, a1: uint64, a2: uint64) -> int64:
     # on its private stack. 256 KiB (64 pages, buddy order 6) gives
     # that call tower comfortable headroom and matches the floor the
     # mission set for the Linux user stack.
-    # The PHYSICAL backing of the user stack: one low alloc_pages() run.
-    new_ustack_phys: uint64 = alloc_pages(LINUX_USTACK_ORDER)
     # The USER VIRTUAL base of the stack is DECOUPLED to a HIGH window
     # (7 GiB, LINUX_USTACK_VBASE) so the stack is no longer identity-mapped
     # at low RAM where its frames could alias a live kernel stack / direct-
@@ -2676,24 +2711,61 @@ def _do_execve_inner(a0: uint64, a1: uint64, a2: uint64) -> int64:
     # CR4.SMAP (see linux_ustack_vbase). Byte-identical (== LINUX_USTACK_VBASE)
     # on <=4 GiB machines.
     new_ustack_vbase: uint64 = linux_ustack_vbase()
+    # ANTI-FRAGMENTATION BACKING (fix/execve-ustack-oom): back only a small
+    # CONTIGUOUS PREFIX at the TOP of the window eagerly; demand-page the rest.
+    #   prefix = [ustack_prefix_lo, ustack_prefix_hi) = the top EAGER_SIZE bytes
+    #   tail   = [new_ustack_vbase, ustack_prefix_lo)  = demand-zero VMA
+    # The builder writes argv/envp/auxv from the top down (well inside the
+    # prefix, since ASLR slide <=64 KiB + realistic argv/env << 256 KiB), and
+    # glibc's __libc_stack_end lands in the prefix. Deeper stack use faults in
+    # from the demand tail. This eliminates the old order-8 (1 MiB) contiguous
+    # requirement that failed under fragmentation at low RAM.
+    ustack_prefix_hi: uint64 = new_ustack_vbase + LINUX_USTACK_SIZE
+    ustack_prefix_lo: uint64 = ustack_prefix_hi - LINUX_USTACK_EAGER_SIZE
+    # The PHYSICAL backing of the eager stack prefix: one small contiguous
+    # alloc_pages() run. HARD NULL-CHECK: alloc_pages returns 0 on OOM; the
+    # pre-PONR pages_can_alloc() guard above already rejected a genuine OOM
+    # with the caller intact, but an SMP rival could drain the run in the
+    # window since — so if it fails HERE (past the point-of-no-return) fail the
+    # execve deterministically WITHOUT ever passing phys 0 to
+    # elf_install_user_range (which would stamp the fixed window's US=1 leaves
+    # onto physical [0, ...) — the boot page tables / AP trampoline — and #DF-
+    # halt the box). The caller's address space is already torn down here, so
+    # -ENOMEM terminates this task cleanly rather than corrupting kernel memory.
+    new_ustack_phys: uint64 = alloc_pages(LINUX_USTACK_EAGER_ORDER)
+    if new_ustack_phys == 0:
+        printk0("execve: user-stack prefix alloc OOM past PONR -> clean -ENOMEM (no phys-0 map)\n")
+        set_current_errstr("execve: cannot back stack")
+        return cast[int64](-12)             # -ENOMEM (address space already torn down)
     # Stage 2 ASLR (stack base): perturb the initial RSP DOWN by a random
     # page multiple inside the stack VA window. The slide stays an INTRA-
     # region virtual offset, so the high-VA top simply starts a few pages
     # lower; the builder's stores (now high-VA, US=1) and the kernel's
     # uaccess walks both honour it.
-    new_ustack_top:  uint64 = new_ustack_vbase + LINUX_USTACK_SIZE \
-                              - aslr_stack_slide()
-    # Install per-task PT entries mapping the HIGH user VA window onto the
-    # LOW physical run (phys_base = new_ustack_phys, decoupled from vlow).
+    new_ustack_top:  uint64 = ustack_prefix_hi - aslr_stack_slide()
+    # Install per-task PT entries mapping the HIGH user VA PREFIX onto the LOW
+    # physical run (phys_base = new_ustack_phys, decoupled from vlow).
     # elf_install_user_range stamps US=1 | RW | NX leaves and supports
     # phys_base != vlow. A < 0 return is an OOM cracking page tables (the
-    # underlying alloc_pages already succeeded) -> -ENOMEM.
-    if elf_install_user_range(cur_pml4, new_ustack_vbase,
-                              new_ustack_vbase + LINUX_USTACK_SIZE,
+    # prefix alloc_pages above already succeeded) -> free it and return -ENOMEM.
+    if elf_install_user_range(cur_pml4, ustack_prefix_lo,
+                              ustack_prefix_hi,
                               new_ustack_phys, "stack",
                               PT_FLAG_NX | PT_FLAG_RW) < 0:
+        free_pages(new_ustack_phys, LINUX_USTACK_EAGER_ORDER)
         printk0("execve: user-stack install failed (OOM in page-table walk?)\n")
         set_current_errstr("execve: cannot map stack")
+        return cast[int64](-12)             # -ENOMEM
+    # Register the LOWER remainder [vbase, prefix_lo) as a demand-zero anon
+    # RW+NX VMA (BSS-style). Deeper stack pushes fault it in page-by-page; a
+    # (rare) argv-builder overflow below the prefix also lands here and is
+    # serviced by do_page_fault's kernel-mode demand path. MUST be registered
+    # BEFORE the argv builder runs so any such overflow hits a live VMA.
+    if vma_register_stack_demand(current_idx_get(), cur_pml4,
+                                 new_ustack_vbase, ustack_prefix_lo) < 0:
+        free_pages(new_ustack_phys, LINUX_USTACK_EAGER_ORDER)
+        printk0("execve: stack demand-VMA register failed (OOM)\n")
+        set_current_errstr("execve: cannot register stack")
         return cast[int64](-12)             # -ENOMEM
     load_cr3(cur_pml4)
     # Record the loaded image span + the user stack region on THIS
@@ -2713,9 +2785,18 @@ def _do_execve_inner(a0: uint64, a1: uint64, a2: uint64) -> int64:
     set_task_interp_range(current_idx_get(),
                           elf_last_interp_img_vlow_get(),
                           elf_last_interp_img_vhigh_get())
-    # ustack RANGE is the HIGH user VA window (fork COW-shares by VA).
+    # ustack RANGE is the eager CONTIGUOUS PREFIX at the top of the window
+    # (fix/execve-ustack-oom). fork() COW-shares THIS range by VA and
+    # task_reap free_pages() it as one order-6 run — both machineries stay
+    # unchanged, just over the prefix. The demand TAIL below the prefix is a
+    # separate VMA that vma_fork_copy mirrors to a child and vma_clear frees
+    # at reap (the proven BSS demand path), DISJOINT from this by-VA range so
+    # there is no double-processing. /proc/self/maps' synthetic [stack] line
+    # (mm/vma.ad) reports this prefix; it contains __libc_stack_end, and glibc
+    # sizes the main-thread stack from RLIMIT_STACK (still 1 MiB), so a shorter
+    # reported range is safe.
     set_task_ustack_range(current_idx_get(),
-                          new_ustack_vbase, LINUX_USTACK_SIZE)
+                          ustack_prefix_lo, LINUX_USTACK_EAGER_SIZE)
     # Leak 2 fix: free the task's PRE-execve OWNER-ONLY regions (old ELF
     # image, old interp, old user stack) BEFORE overwriting the owner
     # fields with the new image's coords. On the direct-spawn-then-execve
@@ -2734,9 +2815,12 @@ def _do_execve_inner(a0: uint64, a1: uint64, a2: uint64) -> int64:
     set_task_image_phys(current_idx_get(),
                         elf_last_img_phys_get(),
                         elf_last_img_hi_get() - elf_last_img_lo_get())
-    # ustack PHYS is the LOW alloc_pages() run (task_reap free_pages it).
+    # ustack PHYS is the LOW alloc_pages() run backing the eager PREFIX
+    # (task_reap free_pages it as one order-6 run; _order_for_bytes(EAGER_SIZE)
+    # == LINUX_USTACK_EAGER_ORDER). The demand-tail pages are owned by the
+    # stack demand VMA and freed via vma_clear at reap, not through this field.
     set_task_ustack_phys(current_idx_get(),
-                        new_ustack_phys, LINUX_USTACK_SIZE)
+                        new_ustack_phys, LINUX_USTACK_EAGER_SIZE)
     set_task_interp_phys(current_idx_get(),
                         elf_last_interp_img_phys_get(),
                         elf_last_interp_img_sz_get())
