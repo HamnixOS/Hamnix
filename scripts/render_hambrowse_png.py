@@ -84,16 +84,25 @@ def parse_dump(text):
             p = line.split()
             rules[int(p[2])] = int(p[4])
         elif line.startswith("SEG "):
-            # SEG row x #rrggbb b0 u0 l-1 bg#ffffff |text|
+            # SEG row x #rrggbb b0 u0 [s0] l-1 bg#ffffff |text|
+            # Parse the flag fields by prefix rather than fixed index so the
+            # renderer tolerates optional fields (e.g. the s<strike> flag that
+            # the engine emits between u<uline> and l<link>).
             head, _, rest = line.partition(" |")
             p = head.split()
             row, x = int(p[1]), int(p[2])
             color = p[3]
-            bold = int(p[4][1:])
-            uline = int(p[5][1:])
-            link = int(p[6][1:])
-            bgtok = p[7][2:]
-            bg = None if bgtok == "-" else bgtok
+            bold = uline = link = 0
+            bg = None
+            for tok in p[4:]:
+                if tok.startswith("bg"):
+                    bg = None if tok[2:] == "-" else tok[2:]
+                elif tok.startswith("b"):
+                    bold = int(tok[1:])
+                elif tok.startswith("u"):
+                    uline = int(tok[1:])
+                elif tok.startswith("l"):
+                    link = int(tok[1:])
             text = rest[:-1] if rest.endswith("|") else rest
             segs.append((row, x, color, bold, uline, link, bg, text))
     return width, segs, rules, title, fills, page_bg
