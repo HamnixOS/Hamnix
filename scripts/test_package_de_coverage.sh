@@ -179,6 +179,7 @@ EXPECTED_APP_PKGS = {
     "hamnix-hammon": "hammon",
     "hamnix-hamview": "hamview",
     "hamnix-hambrowse": "hambrowse",
+    "hamnix-hamaudio": "hamaudioscene",
     "hamnix-haminbox": "haminbox",
     "hamnix-hamsettings": "hamsettings",
     "hamnix-haminstallui": "haminstallui",

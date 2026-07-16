@@ -300,6 +300,7 @@ build_adder_user hammonscene          # scene-file DE system monitor: uptime + m
 build_adder_user hamcalscene          # scene-file DE calendar: month grid with prev/next + today highlight, real clock (lib/hamcalcore, dual-target)
 build_adder_user hamnotesscene        # scene-file DE Notes scratchpad: keyboard text entry, auto-persists /tmp/hamnix-notes.txt (lib/hamnotescore, dual-target)
 build_adder_user hamlogscene          # scene-file DE Log Viewer: tails /proc/kmsg into a scrollable ring, page/tail/wheel scroll (lib/hamlogcore, dual-target)
+build_adder_user hamaudioscene        # scene-file DE Audio Player: decodes a .wav (lib/wavdecode) + streams PCM to the native HDA sink (/dev/audio), progress bar + level meter + play/pause/stop/seek (lib/hamaudiocore, dual-target)
 build_adder_user umdf_host            # Track 4: user-mode driver host — loads a stock .ko in USERLAND via the UMDF kernel primitives
 
 # --- X11 server + client (user/x11/ subdirectory) -------------------

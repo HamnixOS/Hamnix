@@ -1,0 +1,448 @@
+# user/hamaudioscene.ad — NATIVE driver for the hamaudio player scene app.
+#
+# The player's UI STATE, LAYOUT, scene DISPLAY-LIST builder and pure input
+# handlers live in lib/hamaudiocore.ad (extern-free, dual-target) so they can
+# ALSO be rendered on the dev host (user/hamaudioscene_host.ad +
+# scripts/test_hamaudio_host.sh). The .wav CONTAINER parse lives in the equally
+# pure lib/wavdecode.ad. This file keeps ONLY the Hamnix-only side:
+#   * open a wsys window, read its /keys + /event, commit the scene;
+#   * READ the .wav file into memory and decode its header (lib/wavdecode);
+#   * STREAM the decoded PCM to the native HDA sink — set rate/channels/format
+#     by echoing verbs to /dev/audioctl, stage the sample bytes to /dev/audio,
+#     and `start` — the SAME Plan-9 file path aplay/playtone use (no ioctls,
+#     no sockets, just file writes). Playback position is tracked against the
+#     100 Hz jiffies clock; the level meter reads the PCM around the cursor.
+#
+# USAGE:  hamaudioscene [file.wav]   (defaults to /usr/share/sounds/test.wav)
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_get_jiffies() -> uint64
+extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
+
+from lib.hamsceneloop import hamscene_park, HAMSCENE_IDLE_MS
+from lib.hamui import hamscene_commit
+from lib.wavdecode import wavdecode_parse, wavdecode_ok, wavdecode_rate, \
+    wavdecode_channels, wavdecode_bits, wavdecode_data_off, wavdecode_data_len, \
+    wavdecode_frame_bytes, wavdecode_duration_ms, wavdecode_peak
+from lib.hamaudiocore import hamaudio_init, hamaudio_set_name, \
+    hamaudio_set_format, hamaudio_set_duration_ms, hamaudio_set_position_ms, \
+    hamaudio_set_level, hamaudio_set_playing, hamaudio_is_playing, \
+    hamaudio_duration_ms, hamaudio_take_command, hamaudio_seek_ms, \
+    hamaudio_key_line, hamaudio_press_at, hamaudio_release, \
+    hamaudio_build_scene, hamaudio_layout, \
+    HAMAUDIO_CMD_PLAYPAUSE, HAMAUDIO_CMD_STOP, HAMAUDIO_CMD_SEEK
+
+# The whole file, read into memory (bounded). 320 KiB covers the shipped
+# fixture (~105 KiB) with headroom; the HDA DMA buffer caps a single stage at
+# 256 KiB, so anything past that is truncated for v1 (see the MP3/streaming
+# follow-up in docs/audio_media_track.md).
+FILE_CAP: uint64 = 327680
+au_filebuf: Array[327680, uint8]
+au_filelen: uint64 = 0
+
+HDA_CAP: uint64 = 262144                    # HDA stream DMA buffer capacity
+
+# Playback timing anchors (jiffies clock, HZ=100 => 10 ms/tick).
+play_start_j: uint64 = 0
+play_base_ms: uint64 = 0
+
+ctlfd_g: int32 = -1
+
+
+def _slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _writeall(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _slen(s))
+
+
+def _u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    if value == 0:
+        out[0] = 48
+        out[1] = 0
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    out[written] = 0
+    return written
+
+
+# ---- wsys window transport (mirrors user/hamcalcscene.ad) ----------------
+def _newwindow() -> int32:
+    wfd: int32 = sys_open_write(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if wfd < 0:
+        return -1
+    sys_write(wfd, cast[Ptr[uint8]]("newwindow\n"), 10)
+    sys_close(wfd)
+    rfd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if rfd < 0:
+        return -1
+    rbuf: Array[32, uint8]
+    r: int64 = sys_read(rfd, &rbuf[0], 31)
+    sys_close(rfd)
+    if r <= 0:
+        return -1
+    wid: int32 = 0
+    i: uint64 = 0
+    while i < cast[uint64](r):
+        c: uint8 = rbuf[i]
+        if c >= 48 and c <= 57:
+            wid = wid * 10 + cast[int32](c) - 48
+        i = i + 1
+    return wid
+
+
+def _winpath(out: Ptr[uint8], wid: int32, leaf: Ptr[uint8]):
+    p: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("/dev/wsys/")
+    j: uint64 = 0
+    while pre[j] != 0:
+        out[p] = pre[j]
+        p = p + 1
+        j = j + 1
+    p = p + _u64_to_dec(cast[uint64](wid), &out[p])
+    k: uint64 = 0
+    while leaf[k] != 0:
+        out[p] = leaf[k]
+        p = p + 1
+        k = k + 1
+    out[p] = 0
+
+
+def emit_scene(wid: int32):
+    hamaudio_build_scene()
+    hamscene_commit(wid)
+
+
+# ---- HDA control -----------------------------------------------------
+def _ctl_verb(verb: Ptr[uint8], value: uint64):
+    if ctlfd_g < 0:
+        return
+    line: Array[48, uint8]
+    p: uint64 = 0
+    j: uint64 = 0
+    while verb[j] != 0:
+        line[p] = verb[j]
+        p = p + 1
+        j = j + 1
+    line[p] = 32
+    p = p + 1
+    p = p + _u64_to_dec(value, &line[p])
+    line[p] = 10
+    p = p + 1
+    sys_write(ctlfd_g, &line[0], p)
+
+
+def _ctl_word(s: Ptr[uint8]):
+    if ctlfd_g >= 0:
+        _writeall(ctlfd_g, s)
+
+
+# Stage PCM from `from_byte` (a byte offset into the PCM payload) into the
+# HDA DMA buffer starting at buffer offset 0, then START DMA. Returns the
+# byte where staging stopped. Reopens /dev/audio so the file offset is 0.
+def _stage_and_start(from_byte: uint64):
+    data_off: uint64 = wavdecode_data_off()
+    data_len: uint64 = wavdecode_data_len()
+    if from_byte >= data_len:
+        return
+    # Reset any previously-staged PCM.
+    _ctl_word(cast[Ptr[uint8]]("reset\n"))
+    audfd: int32 = sys_open_write(cast[Ptr[char]]("/dev/audio"))
+    if audfd < 0:
+        return
+    span: uint64 = data_len - from_byte
+    if span > HDA_CAP:
+        span = HDA_CAP
+    # Frame-align the span so DMA gets whole sample-frames.
+    fb: uint64 = wavdecode_frame_bytes()
+    if fb > 0:
+        span = (span / fb) * fb
+    src: uint64 = data_off + from_byte
+    written: uint64 = 0
+    while written < span:
+        chunk: uint64 = span - written
+        if chunk > 4096:
+            chunk = 4096
+        sys_write(audfd, &au_filebuf[src + written], chunk)
+        written = written + chunk
+    sys_close(audfd)
+    _ctl_word(cast[Ptr[uint8]]("start\n"))
+
+
+# Peak-level sample of the PCM window around the current byte cursor, fed to
+# the level meter. Reads straight from the in-memory file buffer.
+def _level_at(cur_byte: uint64) -> uint32:
+    data_off: uint64 = wavdecode_data_off()
+    data_len: uint64 = wavdecode_data_len()
+    if cur_byte >= data_len:
+        return 0
+    win: uint64 = 2048
+    if cur_byte + win > data_len:
+        win = data_len - cur_byte
+    return wavdecode_peak(&au_filebuf[0], data_off + cur_byte, win)
+
+
+def _ms_to_bytes(ms: uint64) -> uint64:
+    # bytes = ms/1000 * rate * frame_bytes
+    rate: uint64 = cast[uint64](wavdecode_rate())
+    fb: uint64 = wavdecode_frame_bytes()
+    return ms * rate * fb / 1000
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    sys_bind(cast[Ptr[char]]("/dev"), cast[Ptr[char]]("#c"), 0)
+
+    path: Ptr[char] = cast[Ptr[char]]("/usr/share/sounds/test.wav")
+    if argc >= 2:
+        path = cast[Ptr[char]](argv[1])
+
+    # --- read the file into memory ---
+    infd: int32 = sys_open(path)
+    if infd >= 0:
+        while au_filelen < FILE_CAP:
+            r: int64 = sys_read(infd, &au_filebuf[au_filelen],
+                                FILE_CAP - au_filelen)
+            if r <= 0:
+                break
+            au_filelen = au_filelen + cast[uint64](r)
+        sys_close(infd)
+
+    hamaudio_init()
+
+    # --- decode the container ---
+    ok: int32 = 0
+    if au_filelen >= 44:
+        ok = wavdecode_parse(&au_filebuf[0], au_filelen)
+    if ok != 0:
+        hamaudio_set_format(wavdecode_rate(), wavdecode_channels())
+        hamaudio_set_duration_ms(wavdecode_duration_ms())
+        # Display just the basename of the path.
+        nm: Ptr[uint8] = cast[Ptr[uint8]](path)
+        base: Ptr[uint8] = nm
+        z: uint64 = 0
+        while nm[z] != 0:
+            if nm[z] == 47:
+                base = &nm[z + 1]
+            z = z + 1
+        hamaudio_set_name(base)
+    else:
+        hamaudio_set_name(cast[Ptr[uint8]]("(unreadable .wav)"))
+
+    # --- window ---
+    wid: int32 = _newwindow()
+    if wid < 0:
+        _writeall(1, cast[Ptr[uint8]]("[hamaudio] FAIL newwindow\n"))
+        return 1
+
+    ctlp: Array[64, uint8]
+    evp: Array[64, uint8]
+    keysp: Array[64, uint8]
+    _winpath(&ctlp[0], wid, cast[Ptr[uint8]]("/ctl"))
+    _winpath(&evp[0], wid, cast[Ptr[uint8]]("/event"))
+    _winpath(&keysp[0], wid, cast[Ptr[uint8]]("/keys"))
+
+    wcfd: int32 = sys_open_write(cast[Ptr[char]](&ctlp[0]))
+    if wcfd >= 0:
+        _writeall(wcfd, cast[Ptr[uint8]]("geometry 480 200 360 220\n"))
+        _writeall(wcfd, cast[Ptr[uint8]]("decorate 1\n"))
+        _writeall(wcfd, cast[Ptr[uint8]]("z 6\n"))
+        _writeall(wcfd, cast[Ptr[uint8]]("title Audio Player\n"))
+        sys_close(wcfd)
+
+    hamaudio_layout(360, 200)
+
+    # --- HDA control fd; configure the stream format ---
+    ctlfd_g = sys_open_write(cast[Ptr[char]]("/dev/audioctl"))
+    if ctlfd_g >= 0 and ok != 0:
+        _ctl_verb(cast[Ptr[uint8]]("rate"), cast[uint64](wavdecode_rate()))
+        _ctl_verb(cast[Ptr[uint8]]("channels"),
+                  cast[uint64](wavdecode_channels()))
+        if wavdecode_bits() == 8:
+            _ctl_word(cast[Ptr[uint8]]("format u8\n"))
+        else:
+            _ctl_word(cast[Ptr[uint8]]("format s16le\n"))
+
+    emit_scene(wid)
+    _writeall(1, cast[Ptr[uint8]]("[hamaudio] scene window ready\n"))
+
+    kfd: int32 = sys_open(cast[Ptr[char]](&keysp[0]))
+
+    # Autoplay the loaded clip on start so a bare launch produces sound (the
+    # on-device gate opens the window and immediately hears playback).
+    cur_byte: uint64 = 0
+    if ok != 0:
+        _stage_and_start(0)
+        play_start_j = sys_get_jiffies()
+        play_base_ms = 0
+        hamaudio_set_playing(1)
+        _writeall(1, cast[Ptr[uint8]]("[hamaudio] playing\n"))
+        emit_scene(wid)
+
+    evbuf: Array[256, uint8]
+    kbuf: Array[256, uint8]
+    while True:
+        changed: int32 = 0
+
+        # --- KEYBOARD ---
+        if kfd >= 0:
+            kr: int64 = sys_read_nb(kfd, &kbuf[0], 255)
+            if kr > 0:
+                kls: uint64 = 0
+                ki: uint64 = 0
+                while ki <= cast[uint64](kr):
+                    katend: int32 = 0
+                    if ki == cast[uint64](kr):
+                        katend = 1
+                    if katend == 1 or kbuf[ki] == 10:
+                        if ki > kls:
+                            if hamaudio_key_line(&kbuf[kls], ki - kls) == 1:
+                                changed = 1
+                        kls = ki + 1
+                    ki = ki + 1
+
+        # --- POINTER (non-blocking drain of /event) ---
+        efd: int32 = sys_open(cast[Ptr[char]](&evp[0]))
+        if efd >= 0:
+            r2: int64 = sys_read_nb(efd, &evbuf[0], 255)
+            sys_close(efd)
+            if r2 > 0:
+                ls: uint64 = 0
+                i: uint64 = 0
+                while i <= cast[uint64](r2):
+                    atend: int32 = 0
+                    if i == cast[uint64](r2):
+                        atend = 1
+                    if atend == 1 or evbuf[i] == 10:
+                        if i > ls:
+                            if _handle_pointer(&evbuf[ls], i - ls) == 1:
+                                changed = 1
+                        ls = i + 1
+                    i = i + 1
+
+        # --- drain any queued command from the input handlers ---
+        cmd: int32 = hamaudio_take_command()
+        if cmd == HAMAUDIO_CMD_PLAYPAUSE:
+            if hamaudio_is_playing() != 0:
+                # Pause: freeze position, stop DMA.
+                play_base_ms = play_base_ms + \
+                    (sys_get_jiffies() - play_start_j) * 10
+                _ctl_word(cast[Ptr[uint8]]("stop\n"))
+                hamaudio_set_playing(0)
+            else:
+                cur_byte = _ms_to_bytes(play_base_ms)
+                _stage_and_start(cur_byte)
+                play_start_j = sys_get_jiffies()
+                hamaudio_set_playing(1)
+            changed = 1
+        elif cmd == HAMAUDIO_CMD_STOP:
+            _ctl_word(cast[Ptr[uint8]]("stop\n"))
+            _ctl_word(cast[Ptr[uint8]]("reset\n"))
+            hamaudio_set_playing(0)
+            play_base_ms = 0
+            cur_byte = 0
+            hamaudio_set_position_ms(0)
+            hamaudio_set_level(0)
+            changed = 1
+        elif cmd == HAMAUDIO_CMD_SEEK:
+            play_base_ms = hamaudio_seek_ms()
+            cur_byte = _ms_to_bytes(play_base_ms)
+            if hamaudio_is_playing() != 0:
+                _stage_and_start(cur_byte)
+                play_start_j = sys_get_jiffies()
+            hamaudio_set_position_ms(play_base_ms)
+            hamaudio_set_level(_level_at(cur_byte))
+            changed = 1
+
+        # --- advance the play position while playing ---
+        if hamaudio_is_playing() != 0:
+            now_ms: uint64 = play_base_ms + \
+                (sys_get_jiffies() - play_start_j) * 10
+            dur: uint64 = hamaudio_duration_ms()
+            if dur > 0 and now_ms >= dur:
+                # Reached the end: settle at the end, stop.
+                now_ms = dur
+                _ctl_word(cast[Ptr[uint8]]("stop\n"))
+                hamaudio_set_playing(0)
+                play_base_ms = dur
+            hamaudio_set_position_ms(now_ms)
+            cur_byte = _ms_to_bytes(now_ms)
+            hamaudio_set_level(_level_at(cur_byte))
+            changed = 1
+
+        if changed != 0:
+            emit_scene(wid)
+        hamscene_park(kfd, HAMSCENE_IDLE_MS)
+    return 0
+
+
+btn_down: int32 = 0
+
+
+# Parse one /event line "<...> x y btn"; drive press/release edges through the
+# core's pointer handlers. Mirrors hamcalc's parse but inlined for the two
+# transport buttons + progress-bar seek. Returns 1 if state changed.
+def _handle_pointer(line: Ptr[uint8], n: uint64) -> int32:
+    # /event pointer line: fields are space-separated; the LAST three ints are
+    # x, y, buttons. Parse the trailing integers.
+    xs: Array[8, int64]
+    nints: int32 = 0
+    i: uint64 = 0
+    while i < n and nints < 8:
+        # skip non-digit/non-sign
+        while i < n and (line[i] < 48 or line[i] > 57) and line[i] != 45:
+            i = i + 1
+        if i >= n:
+            break
+        neg: int32 = 0
+        if line[i] == 45:
+            neg = 1
+            i = i + 1
+        val: int64 = 0
+        got: int32 = 0
+        while i < n and line[i] >= 48 and line[i] <= 57:
+            val = val * 10 + cast[int64](line[i] - 48)
+            i = i + 1
+            got = 1
+        if got == 1:
+            if neg == 1:
+                val = 0 - val
+            xs[nints] = val
+            nints = nints + 1
+    if nints < 3:
+        return 0
+    bx: int64 = xs[nints - 3]
+    by: int64 = xs[nints - 2]
+    bbtn: int64 = xs[nints - 1]
+    now_down: int32 = 0
+    if (bbtn & 1) != 0:
+        now_down = 1
+    changed: int32 = 0
+    if now_down != 0 and btn_down == 0:
+        if hamaudio_press_at(bx, by) == 1:
+            changed = 1
+    elif now_down == 0 and btn_down != 0:
+        if hamaudio_release() == 1:
+            changed = 1
+    btn_down = now_down
+    return changed
