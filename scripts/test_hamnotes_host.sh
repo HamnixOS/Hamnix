@@ -35,12 +35,18 @@ fi
 echo "[notes-host] PASS native hamnotesscene still compiles"
 
 DUMP="$OUT/notes_dump.txt"
+# #328: the trailing WORD.ppm/LINE.ppm args make the harness also exercise the
+# double-click (select word) + triple-click (select line) paths and render each.
+# argv[6] keeps the harness's DEFAULT body script ("Buy milk"<nl>"Call Sam") so
+# the existing edit/save assertions below are unchanged; the word/line renders
+# seed their own body via hamnotes_set_text, independent of this.
 if ! "$BIN" "$ROOT" "$OUT/notes_before.ppm" "$OUT/notes_after.ppm" \
-        "$OUT/notes_new.ppm" "$OUT/notes_reload.ppm" >"$DUMP" 2>&1; then
+        "$OUT/notes_new.ppm" "$OUT/notes_reload.ppm" $'Buy milk\nCall Sam' \
+        "$OUT/notes_word.ppm" "$OUT/notes_line.ppm" >"$DUMP" 2>&1; then
     echo "[notes-host] FAIL: host harness exited non-zero"; cat "$DUMP"; exit 1
 fi
 
-for f in before after new reload; do
+for f in before after new reload word line; do
     if python3 scripts/ppm_to_png.py "$OUT/notes_$f.ppm" "$OUT/notes_$f.png" 2>"$OUT/notes_png.log"; then
         echo "[notes-host] PASS rendered $OUT/notes_$f.png"
     else
@@ -93,6 +99,12 @@ assert_grep '^HIT_ROW0 5'                        "clicking a sidebar row hit-tes
 assert_grep '^IDX_AFTER_SELECT 0'               "selecting sidebar row 0 returns to note-0"
 assert_grep '^LEN_AFTER_RELOAD 16'              "note-0 body reloaded from disk (16 bytes)"
 assert_grep '^TITLE_AFTER_RELOAD 9'             "note-0 title reloaded from disk (Groceries)"
+
+# --- #328 double/triple click: word vs line selection -----------------------
+# Body "hello world foo": a double-click mid-"world" selects the 5-char word;
+# a triple-click selects the whole 15-char line (also rendered to PNG).
+assert_grep '^WORD_SEL 5'                        "double-click selects the word (\"world\", 5 chars)"
+assert_grep '^LINE_SEL 15'                       "triple-click selects the whole line (15 chars)"
 
 # --- DELETE removes the current note ----------------------------------------
 assert_grep '^HIT_DELETE 6'                      "clicking Delete hit-tests to delete"
