@@ -129,6 +129,18 @@ assert_grep '^KIND row2 2'                         "row 2 is an APP row (launcha
 # updates the filter buffer and re-narrows the visible set.
 assert_grep '^TYPE filter=\"ca\" len=2 rows=5'     "typed keystrokes edit the filter buffer + narrow the layout"
 
+# --- FRAME-1 DISMISS GUARD (#287/#313/#330 one-frame-flash regression) -------
+# The menu is a detached child spawned on the panel button's PRESS edge with the
+# mouse still held; it must NOT self-dismiss on frame 1, but a genuine click-away
+# or focus-out (after it has settled) must STILL dismiss. These drive the exact
+# pure helpers the /event drain uses (amc_focus_out_dismiss / amc_press_edge).
+assert_grep '^DISMISS focus_out_before_in 0'   "spurious 'f out' before any 'f in' does NOT dismiss (no frame-1 flash)"
+assert_grep '^DISMISS focus_out_after_in 1'    "genuine 'f out' after the menu was focused STILL dismisses"
+assert_grep '^DISMISS focus_in 0'              "'f in' itself never dismisses (#313)"
+assert_grep '^DISMISS press_first_held 0'      "held opening click on the FIRST 'm' event is no press-outside edge"
+assert_grep '^DISMISS press_still_held 0'      "button still held on the next sample is no new press edge"
+assert_grep '^DISMISS press_after_release 1'   "a real NEW press after a release STILL edges (click-away dismiss preserved)"
+
 # --- NATIVE menu client still compiles from the shared model --------------
 echo "[appmenu-host] compiling NATIVE hamappmenu for x86_64-adder-user ..."
 if ! python3 -m compiler.adder compile --target=x86_64-adder-user \
