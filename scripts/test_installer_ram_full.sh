@@ -39,25 +39,34 @@
 #
 # WHY MIN_FREE_MIB is well below `-m`, not near it
 # ------------------------------------------------
-# The INSTALLER kernel ELF embeds the entire live rootfs as an in-place
-# cpio initramfs (~1.1 GiB): the root filesystem is served DIRECTLY out
-# of that blob (fs/cpio.ad initramfs_entry_data), so it can never be
-# reclaimed and permanently reserves the low ~1.1 GiB of RAM. At -m 2G
-# the kernel therefore registers ~800 MiB free, at -m 4G ~2.8 GiB — the
-# free pool scales 1:1 with `-m`, offset by that fixed initramfs. The
-# threshold is set safely ABOVE the 240 MiB fallback ceiling and BELOW
-# the observed free figure, so a regression to the fallback (which would
-# yield <=240 MiB, or drop the "[memblock] free" line entirely) fails the
-# gate while the healthy in-place-initramfs boot passes.
+# The INSTALLER kernel ELF embeds its live payload as an in-place cpio
+# initramfs served DIRECTLY out of the blob (fs/cpio.ad
+# initramfs_entry_data), which can never be reclaimed and permanently
+# reserves that low RAM. Since the LEAN-cpio reclaim
+# (scripts/build_installer_img.sh Stage 6, HAMNIX_CPIO_LEAN=1) the giant
+# ~1.1 GiB /var/lib/distros/default Debian GUI tree is NO LONGER embedded
+# — only the compact ~21.5 MiB /rootfs.sqfs + native /bin + /lib/modules
+# + /iso-packages ride in the cpio, so the fixed footprint is now well
+# under ~150 MiB. At -m 2G the kernel therefore registers ~1.8 GiB free
+# (was ~800 MiB pre-lean); the free pool scales 1:1 with `-m` offset by
+# that much smaller initramfs. The threshold is set safely ABOVE the
+# 240 MiB fallback ceiling AND above the pre-lean ~800 MiB footprint (so
+# a regression that re-fattened the cpio would also trip it) and BELOW
+# the observed ~1.8 GiB, so a regression to the fallback (<=240 MiB, or a
+# dropped "[memblock] free" line) fails the gate while the healthy
+# lean-initramfs boot passes.
 #
 # Env overrides
 # -------------
 #   IMG           installer image      (default: build/hamnix-installer.img)
 #   MEM           qemu -m value        (default: 2G)
-#   MIN_FREE_MIB  min registered free  (default: 600) MiB the kernel must
-#                 install. 600 is comfortably above the 240 MiB fallback
-#                 ceiling and below the ~800 MiB seen at -m 2G. Raise it
-#                 together with MEM if you gate a bigger -m.
+#   MIN_FREE_MIB  min registered free  (default: 1500) MiB the kernel must
+#                 install. 1500 is comfortably above BOTH the 240 MiB
+#                 fallback ceiling and the pre-lean ~800 MiB footprint,
+#                 and below the ~1.8 GiB seen at -m 2G with the lean cpio
+#                 — so a fallback regression OR a re-fattened cpio both
+#                 fail it. Raise it together with MEM if you gate a
+#                 bigger -m.
 #   BOOT_TIMEOUT  deadline seconds for the e820 marker (default: 150). The
 #                 e820 lines print very early (pre-userspace) so this is a
 #                 generous upper bound; the poll exits the instant the
@@ -81,7 +90,7 @@ cd "$PROJ_ROOT"
 
 IMG="${IMG:-build/hamnix-installer.img}"
 MEM="${MEM:-2G}"
-MIN_FREE_MIB="${MIN_FREE_MIB:-600}"
+MIN_FREE_MIB="${MIN_FREE_MIB:-1500}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-150}"
 OVMF_FD="${OVMF_FD:-/usr/share/ovmf/OVMF.fd}"
 QEMU_CPU="${QEMU_CPU:-max}"

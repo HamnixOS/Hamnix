@@ -277,8 +277,28 @@ SQFS_BYTES=$(stat -c%s "$SQFS_IMG")
 echo "[build_installer_img]   squashfs: $SQFS_IMG ($(( SQFS_BYTES / 1024 / 1024 )) MiB; live distro $(stat -c%s "$LIVE_DISTRO_IMG") B raw)."
 
 # --- Stage 6: the INSTALLER kernel (cpio embeds the squashfs) ---------
-echo "[build_installer_img] Stage 6: compile INSTALLER kernel (cpio embeds /rootfs.sqfs)."
+# LEAN CPIO (daily-driver RAM reclaim): HAMNIX_CPIO_LEAN=1 makes
+# build_initramfs.py SKIP embedding the ~1.1 GiB /var/lib/distros/default
+# Debian GUI tree into the kernel .rodata cpio. That tree is reserved
+# FOREVER below kernel_image_end() (arch/x86/boot/head_64.S; e820.ad
+# bumps the memblock floor past it), so at -m 2G it stole ~1.1 GiB of the
+# guest's usable RAM. It is DEAD WEIGHT on the live/installer image: the
+# live desktop's #distro is served from the compact ~21.5 MiB
+# /rootfs.sqfs (drivers/block/loop.ad loop_sqfs_live_root, bound in
+# etc/rc.boot.full) — NOT from this cpio tree — and the native DE +
+# native /bin Adder apps (hambrowse, calc, video, audio) never touch it.
+# Its only real consumers are the `-kernel` apt/dpkg DEV tests
+# (test_linux_apt_install.sh, which builds its OWN fat-cpio
+# build/hamnix-kernel.elf — unaffected here) and the not-yet-working
+# Firefox/WebKit-via-Linux-ns bridge (follow-up: move that substrate to a
+# disk-backed root). Everything load-bearing on the live path stays in the
+# cpio: /init, /rootfs.sqfs, the native /bin tools + DE, /lib/modules .ko,
+# and /iso-packages. HAMNIX_DEFAULT_REAL_DEBIAN=1 still drives Stages 1/5
+# (rootfs.img + live-distro sqfs) unchanged; cpio_lean short-circuits the
+# in-cpio embed only.
+echo "[build_installer_img] Stage 6: compile INSTALLER kernel (cpio embeds /rootfs.sqfs, LEAN — no in-cpio Debian tree)."
 env HAMNIX_INSTALLER_BLOB=1 HAMNIX_INSTALLER_SQFS="$SQFS_IMG" \
+    HAMNIX_CPIO_LEAN=1 \
     ENABLE_LOG_SLOW="${ENABLE_LOG_SLOW:-0}" \
     INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
 if [ "${ENABLE_LOG_SLOW:-0}" = "1" ]; then
