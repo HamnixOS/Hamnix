@@ -2946,6 +2946,18 @@ if _audio_master:
 if os.environ.get("ENABLE_AUDIOCAP_TEST") == "1":
     FILES.append(("/etc/audiocap-test", b"1\n"))
 
+# Native on-device MP3 PLAYBACK self-test. ENABLE_MP3_TEST=1 plants
+# /etc/mp3-test; init/main.ad's boot:37.mp3 gate then runs
+# audio_mp3_selftest(), which reads the initramfs-staged
+# /usr/share/sounds/test.mp3, decodes it to PCM with lib/mp3decode
+# (MPEG-1 Layer III), and streams the decoded PCM to /dev/audio (the
+# SAME Plan-9 cdev + HDA stream DMA the square-wave tone uses). QEMU's
+# wav audiodev captures the played samples to a host file the test
+# asserts is non-silent — proving the decode->HDA path end-to-end.
+# Uniquely-named marker so it never collides with the tone gate.
+if os.environ.get("ENABLE_MP3_TEST") == "1":
+    FILES.append(("/etc/mp3-test", b"1\n"))
+
 # Native device-mapper self-test. scripts/test_devmapper.sh sets
 # ENABLE_DEVMAPPER_TEST=1 to plant /etc/devmapper-test; init/main.ad's
 # boot:37.dm gate then runs dm_selftest() (drivers/block/dm.ad), which
