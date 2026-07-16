@@ -95,6 +95,12 @@ send '/bin/hamfmscene --opentest
 wait_for "[hamfm] opentest done" 60 "opentest complete"
 
 sleep 1
+# #329: hamfm must open in the user's HOME (/home/live), not "/".
+send '/bin/hamfmscene --homedirtest
+'
+wait_for "[hamfm] homedirtest" 60 "homedirtest complete"
+
+sleep 1
 send 'exit
 '
 wait_for "no live tasks" 60 "shell exited"
@@ -130,6 +136,17 @@ assert_pick "notes.txt" "/bin/hameditscene"
 assert_pick "readme.md" "/bin/hameditscene"
 assert_pick "main.ad"   "/bin/hameditscene"
 assert_pick "noext"     "/bin/hameditscene"   # no extension -> editor
+
+# #329: assert hamfm resolved its launch dir to HOME (/home/live), not "/".
+echo "[test_hamfm_open] --- homedir line ---"
+grep -F -a "[hamfm] homedir" "$LOG" || true
+if grep -F -a -q "[hamfm] homedirtest PASS" "$LOG" \
+   && grep -F -a -q "[hamfm] homedir=/home/live" "$LOG"; then
+    echo "[test_hamfm_open] OK: hamfm opens in /home/live"
+else
+    echo "[test_hamfm_open] MISS: hamfm did not open in /home/live" >&2
+    fail=1
+fi
 
 if [ "$fail" = "0" ]; then
     echo "[test_hamfm_open] PASS type-dispatched open routes images to hamview, else the editor"
