@@ -54,7 +54,8 @@ the passing host gates found the following.
 - html5-parsing: implied end tags (gate `impliedtags`); quote-aware tag tokenization (gate `tagquote`).
 - ecmascript: for-of, optional chaining/nullish, Map/Set/WeakMap/WeakSet, accessor get/set, Symbol +
   Symbol.iterator, generators/yield, Object.create/defineProperty, Reflect, Proxy, typed arrays,
-  structuredClone (R1-7 above). Only ES modules (import/export) and class private `#fields` remain open.
+  structuredClone (R1-7 above), **ES modules import/export (R9, gate `modules`)**. Only class
+  private `#fields` remains open.
 
 **Genuinely OPEN, ranked (keyed to current files) — the live worklist:**
 1. DOM geometry: `getBoundingClientRect`/`offsetWidth/Height/Top/Left`/`clientWidth/Height`/`offsetParent`/
@@ -71,7 +72,22 @@ the passing host gates found the following.
 11. Constraint Validation breadth (setCustomValidity/reportValidity/validity/pattern/min/max/step/maxlength/novalidate)
     — only `checkValidity` exists. `dom/query.ad`+`dom/canvas.ad`+`dom/forms.ad`.
 12. grid-row / row-axis placement & spanning — missing (`cascade.ad:1680`). `css/cascade.ad`+`layout/box.ad`.
-13. ES modules import/export — missing (`js/lexer.ad`/`js/parser.ad`); needs a runtime loader.
+13. ES modules import/export — **DONE (R9, gate `modules` + browser gate `esm`).** Parser (`js/parser.ad`
+    `parse_import`/`parse_export`), AST (`ND_IMPORT`/`ND_EXPORT`/`ND_IMPSPEC`/`ND_EXPSPEC`), and a full
+    loader/linker/evaluator (`js/module.ad`): every import form (default, named `{a,b as c}`, namespace
+    `* as ns`, side-effect `import "x"`) and export form (`const/function/class`, `default`, named list,
+    re-export `{x} from`, `* from`); relative-specifier resolution via an embedder resolver seam
+    (`js_set_module_resolver` — browser fetch / host file read, NO sockets), a specifier-keyed module cache
+    (diamond deps evaluate once), dependency-ORDER (post-order) evaluation, and `<script type=module>`
+    wired into `dom/canvas.ad:_run_scripts` (inline + `src` sibling imports). Exports live on a per-module
+    namespace object (also the value of `* as ns`). **Coverage boundary (honest):** named/default imports
+    are SNAPSHOT bindings (value copied at link time — correct for the near-universal
+    export-then-never-reassign case; a later reassignment of an exported `let` is not reflected — true LIVE
+    bindings deferred). `import * as ns` IS live (property reads hit the current export values). Import
+    cycles are best-effort (function exports resolve across the edge via hoisting; a value import taken
+    across a cycle back-edge before the exporter finished is undefined). Top-level `await` NOT supported.
+    Specifier canonicalization is leading-`./` strip only (flat/single-base-dir graph; `../` collapse +
+    query strings deferred). Next: true live bindings + top-level await + per-importer nested URL resolution.
 14. class private `#fields` — missing. `js/lexer.ad`/`js/parser.ad`/`js/interp.ad`.
 15. specialized input types email/number/date/search/tel/url — degrade to plain text. `dom/forms.ad`.
 

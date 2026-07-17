@@ -1,0 +1,285 @@
+# lib/web/js/module.ad — part of the modular web engine (extracted spine).
+# ES MODULES: loader + linker + evaluator for `import` / `export`.
+#
+# Behavior-preserving with the rest of the engine: Adder is a single-
+# compilation-unit language (merge_programs merges all imported files into one
+# Program), so every public top-level name here resolves globally across the
+# merged engine.
+#
+# MODEL. A module graph is loaded from an ENTRY specifier: each module's source
+# is parsed into an AST (ND_BLOCK), its import specifiers are resolved through
+# the embedder-registered resolver (browser fetch / host file read — NO sockets
+# here, the engine is I/O-free), and dependencies are loaded transitively with a
+# specifier-keyed cache so a diamond graph loads each module once.
+#
+# EVALUATION is depth-first post-order over the dependency graph: a module's
+# dependencies fully evaluate before it does, so by the time an importer binds
+# its imported names the exporter's exports are ready. Each module evaluates in
+# its own function-scope environment (child of the global env, so builtins are
+# visible). Exports are stored as properties on the module's NAMESPACE OBJECT,
+# which is also the value handed to `import * as ns`.
+#
+# BINDING SEMANTICS (v1, honest boundary):
+#   * Named / default imports are SNAPSHOT bindings: the value is copied from the
+#     exporter's namespace at link time. Correct for the overwhelmingly common
+#     case (modules export functions / classes / constants that are not
+#     reassigned after init). A later reassignment of an exported `let` in the
+#     exporter is NOT reflected in an already-linked named import — true live
+#     bindings are deferred.
+#   * `import * as ns` binds the namespace OBJECT itself, so property reads on it
+#     ARE live (they read the exporter's current export values).
+#   * Cycles are handled best-effort per the spec's intent: on a back-edge the
+#     partially-evaluated module's namespace is used as-is (a named import taken
+#     across a cycle edge before the exporter finished may be undefined). Function
+#     exports across a cycle work because function decls are hoisted.
+#   * Top-level `await` is NOT supported (deferred).
+
+
+# Canonicalize a specifier for use as the module-cache key: strip a leading
+# "./" so `import "./x.js"` and `import "x.js"` name the same module. (Deeper URL
+# normalization — "../" collapse, query strings — is deferred; a flat / single
+# base-directory graph is the v1 target.)
+def module_canon(spec_sid: int32) -> int32:
+    p: Ptr[uint8] = str_ptr(spec_sid)
+    n: int32 = str_len(spec_sid)
+    if n >= 2 and p[0] == 46 and p[1] == 47:      # leading "./"
+        return str_new(&p[2], n - 2)
+    return spec_sid
+
+
+# Find a registered module by its canonical specifier (compared by TEXT).
+def module_find(spec_sid: int32) -> int32:
+    key: int32 = module_canon(spec_sid)
+    i: int32 = 0
+    while i < mod_n:
+        if str_eq(mod_spec[i], key) != 0:
+            return i
+        i = i + 1
+    return -1
+
+
+# Register a module row: copy its source into the shared arena (so a later
+# module's tokenize over the shared token pool cannot clobber it) and mark it
+# un-parsed (state 0). Returns the module index or -1 on capacity exhaustion.
+def module_intern(spec_sid: int32, src: Ptr[uint8], slen: int32) -> int32:
+    if mod_n >= MODULE_CAP:
+        mod_load_err = 1
+        return -1
+    if mod_src_top + slen >= MODULE_SRC_CAP:
+        mod_load_err = 1
+        return -1
+    off: int32 = mod_src_top
+    i: int32 = 0
+    while i < slen:
+        mod_src[off + i] = src[i]
+        i = i + 1
+    mod_src_top = off + slen
+    idx: int32 = mod_n
+    mod_spec[idx] = module_canon(spec_sid)
+    mod_ast[idx] = -1
+    mod_env[idx] = -1
+    mod_ns[idx] = -1
+    mod_state[idx] = cast[uint8](0)
+    mod_src_off[idx] = off
+    mod_src_len[idx] = slen
+    mod_n = mod_n + 1
+    return idx
+
+
+# Ask the embedder-registered resolver for a specifier's source bytes and
+# register it. Returns the (possibly cached) module index, or -1 if unresolved.
+def module_resolve(spec_sid: int32) -> int32:
+    idx: int32 = module_find(spec_sid)
+    if idx >= 0:
+        return idx
+    if module_resolver_set == 0:
+        mod_load_err = 1
+        return -1
+    mod_cur_base = spec_sid
+    rfn: Fn[Ptr[uint8], int32, Ptr[int32], Ptr[uint8]] = \
+        cast[Fn[Ptr[uint8], int32, Ptr[int32], Ptr[uint8]]](module_resolver_addr)
+    outlen: int32 = 0
+    srcp: Ptr[uint8] = rfn(str_ptr(spec_sid), str_len(spec_sid), &outlen)
+    if cast[uint64](srcp) == 0 or outlen <= 0:
+        mod_load_err = 1
+        return -1
+    nidx: int32 = module_intern(spec_sid, srcp, outlen)
+    if nidx < 0:
+        return -1
+    module_load(nidx)
+    return nidx
+
+
+# Parse a module and transitively load every specifier it imports / re-exports.
+def module_load(idx: int32):
+    if idx < 0:
+        return
+    if cast[int32](mod_state[idx]) >= 1:      # already parsed / loading
+        return
+    mod_state[idx] = cast[uint8](1)
+    tokenize(&mod_src[mod_src_off[idx]], mod_src_len[idx])
+    ast: int32 = parse_program()
+    mod_ast[idx] = ast
+    if err_flag != 0:
+        mod_load_err = 1
+        return
+    # transitively load dependencies (imports + `... from` re-exports)
+    s: int32 = n_a[ast]
+    while s >= 0:
+        k: int32 = cast[int32](n_kind[s])
+        if k == ND_IMPORT and n_str[s] >= 0:
+            module_resolve(n_str[s])
+        elif k == ND_EXPORT and n_op[s] == 3 and n_str[s] >= 0:
+            module_resolve(n_str[s])
+        s = n_next[s]
+
+
+# Install a module's imported names into its environment from already-evaluated
+# dependency namespace objects (snapshot for named/default; object for `* as`).
+def module_bind_imports(idx: int32):
+    env: int32 = mod_env[idx]
+    s: int32 = n_a[mod_ast[idx]]
+    while s >= 0:
+        if cast[int32](n_kind[s]) == ND_IMPORT and n_a[s] >= 0:
+            depidx: int32 = module_find(n_str[s])
+            if depidx >= 0 and mod_ns[depidx] >= 0:
+                depns: int32 = mod_ns[depidx]
+                sp: int32 = n_a[s]
+                while sp >= 0:
+                    op: int32 = n_op[sp]
+                    if op == 2:                 # `* as ns` -> the namespace object
+                        env_define(env, n_d[sp], depns, 0)
+                    elif op == 1:               # default import
+                        dv: int32 = member_get(depns, str_from_cstr(cast[Ptr[uint8]]("default")))
+                        env_define(env, n_d[sp], dv, 0)
+                    else:                        # named import
+                        nv: int32 = member_get(depns, n_str[sp])
+                        env_define(env, n_d[sp], nv, 0)
+                    sp = n_next[sp]
+        s = n_next[s]
+
+
+# Read a module-env binding's current value (undefined if absent).
+def module_env_val(env: int32, name_sid: int32) -> int32:
+    b: int32 = env_lookup_bind(env, name_sid)
+    if b < 0:
+        return v_undef()
+    return b_val[b]
+
+
+# Fill a module's namespace object from its export declarations after its body
+# has run (so exported values are final for this module).
+def module_populate_exports(idx: int32):
+    env: int32 = mod_env[idx]
+    nsv: int32 = mod_ns[idx]
+    nso: int32 = objid_of(nsv)
+    s: int32 = n_a[mod_ast[idx]]
+    while s >= 0:
+        if cast[int32](n_kind[s]) == ND_EXPORT:
+            kind: int32 = n_op[s]
+            if kind == 0:
+                # `export <decl>` — pull the declared names out of the env.
+                inner: int32 = n_a[s]
+                ik: int32 = cast[int32](n_kind[inner])
+                if ik == ND_VAR:
+                    d: int32 = n_a[inner]
+                    while d >= 0:
+                        if n_str[d] >= 0:
+                            obj_set(nso, n_str[d], module_env_val(env, n_str[d]))
+                        d = n_next[d]
+                elif ik == ND_FUNCDECL or ik == ND_CLASSDECL:
+                    if n_str[inner] >= 0:
+                        obj_set(nso, n_str[inner], module_env_val(env, n_str[inner]))
+            elif kind == 1:
+                # `export { local as exported, ... }`
+                sp: int32 = n_a[s]
+                while sp >= 0:
+                    obj_set(nso, n_d[sp], module_env_val(env, n_str[sp]))
+                    sp = n_next[sp]
+            elif kind == 2:
+                # `export default <value>`
+                obj_set(nso, str_from_cstr(cast[Ptr[uint8]]("default")), \
+                        module_env_val(env, module_default_key()))
+            elif kind == 3:
+                # re-export: `export { x } from 's'` / `export * [as ns] from 's'`
+                depidx: int32 = module_find(n_str[s])
+                if depidx >= 0:
+                    depns: int32 = mod_ns[depidx]
+                    if n_a[s] < 0:
+                        # `export * from 's'` — copy all own props except default
+                        depo: int32 = objid_of(depns)
+                        p: int32 = obj_head[depo]
+                        while p >= 0:
+                            if str_eq_cstr(p_key[p], cast[Ptr[uint8]]("default")) == 0:
+                                obj_set(nso, p_key[p], p_val[p])
+                            p = p_next[p]
+                    else:
+                        sp2: int32 = n_a[s]
+                        while sp2 >= 0:
+                            if n_str[sp2] < 0:
+                                # `export * as ns from 's'` — the namespace object
+                                obj_set(nso, n_d[sp2], depns)
+                            else:
+                                obj_set(nso, n_d[sp2], member_get(depns, n_str[sp2]))
+                            sp2 = n_next[sp2]
+        s = n_next[s]
+
+
+# Publish a module's LOCAL function / class exports onto its namespace object
+# right after hoisting — before its dependencies are evaluated. These bindings
+# already have their final values (function decls hoist), so a module in an
+# import CYCLE can still resolve function exports of a not-yet-evaluated peer
+# (the common, spec-supported cyclic pattern). Value exports (const/let/default)
+# and re-exports are filled later by module_populate_exports.
+def module_prepopulate_funcs(idx: int32):
+    env: int32 = mod_env[idx]
+    nso: int32 = objid_of(mod_ns[idx])
+    s: int32 = n_a[mod_ast[idx]]
+    while s >= 0:
+        if cast[int32](n_kind[s]) == ND_EXPORT and n_op[s] == 0:
+            inner: int32 = n_a[s]
+            ik: int32 = cast[int32](n_kind[inner])
+            if (ik == ND_FUNCDECL or ik == ND_CLASSDECL) and n_str[inner] >= 0:
+                obj_set(nso, n_str[inner], module_env_val(env, n_str[inner]))
+        s = n_next[s]
+
+
+# Depth-first post-order evaluation of a module and its dependencies. Each module
+# runs exactly once. The environment + namespace object are created and the body
+# is hoisted BEFORE dependencies evaluate, so an import cycle sees a peer's
+# function exports; VALUE snapshots still bind after the exporter's body runs
+# (post-order), so acyclic named/default imports observe final values.
+def module_evaluate(idx: int32):
+    if idx < 0:
+        return
+    if cast[int32](mod_state[idx]) >= 2:       # evaluating (2) or evaluated (3)
+        return
+    mod_state[idx] = cast[uint8](2)            # on the evaluation stack
+    # 1) module scope + namespace object, hoisted body, early function exports
+    mod_env[idx] = env_new(g_env, 1)
+    mod_ns[idx] = v_new_object()
+    st: int32 = n_a[mod_ast[idx]]
+    while st >= 0:
+        hoist_stmt(st, mod_env[idx])
+        st = n_next[st]
+    module_prepopulate_funcs(idx)
+    # 2) evaluate dependencies (post-order): their value exports become final
+    s: int32 = n_a[mod_ast[idx]]
+    while s >= 0:
+        k: int32 = cast[int32](n_kind[s])
+        if k == ND_IMPORT and n_str[s] >= 0:
+            module_evaluate(module_find(n_str[s]))
+        elif k == ND_EXPORT and n_op[s] == 3 and n_str[s] >= 0:
+            module_evaluate(module_find(n_str[s]))
+        s = n_next[s]
+    if err_flag != 0:
+        return
+    # 3) install this module's imports (deps' namespaces now populated), run body
+    module_bind_imports(idx)
+    st2: int32 = n_a[mod_ast[idx]]
+    while st2 >= 0 and ctl == CTL_NONE and err_flag == 0:
+        exec_stmt(st2, mod_env[idx])
+        st2 = n_next[st2]
+    # 4) publish the full export set (values, defaults, re-exports)
+    module_populate_exports(idx)
+    mod_state[idx] = cast[uint8](3)

@@ -84,6 +84,30 @@ HTML
 assert_grep 'PROBE-OK'   "$OUT/real_probe.txt" "eval() computes and navigator.userAgent reads (real behaviour, not a stub)"
 assert_nogrep 'PROBE-BAD' "$OUT/real_probe.txt" "eval/navigator probe did not fall to the BAD branch"
 
+# ---- ES modules through the HTML path: <script type=module> --------------
+# Modern sites' entry point is an ES module; an engine that cannot parse+link
+# `import`/`export` blanks the page. A classic <script> and a module <script>
+# coexist; the module has its OWN scope, imports a sibling module (resolved from
+# the page's directory), and runs deferred. Assert BOTH ran and no JS error.
+cat > "$OUT/real_esm_dep.js" <<'JS'
+export default function(name){ return "hi " + name; }
+export const K = 7;
+JS
+cat > "$OUT/real_esm.html" <<'HTML'
+<html><head><title>esm</title></head><body><h1>ESM page</h1>
+<script>console.log("MOD-CLASSIC");</script>
+<script type="module">
+import greet, { K } from "./real_esm_dep.js";
+const label = ["a","b"].map(s => s.toUpperCase()).join("");
+console.log("MOD-MODULE " + greet("x") + " K=" + K + " " + label);
+</script>
+</body></html>
+HTML
+"$BIN" "$OUT/real_esm.html" 880 >"$OUT/real_esm.txt" 2>&1
+assert_grep 'MOD-CLASSIC'                  "$OUT/real_esm.txt" "classic <script> still runs alongside a module"
+assert_grep 'MOD-MODULE hi x K=7 AB'       "$OUT/real_esm.txt" "<script type=module> links a sibling import (default+named) and runs"
+assert_nogrep 'is not defined'             "$OUT/real_esm.txt" "module scope did not leak / error out"
+
 # ---- (c) THE USER FLOW on REAL google.com HTML -----------------------------
 # The real homepage identifies its query control by name="q" inside
 # <form action="/search" name="f">. Render must classify it as a text field,
