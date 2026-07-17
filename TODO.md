@@ -106,15 +106,17 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
   tasks at floor+one-slice penalty (CFS place_entity). On-device -smp2 fairness gate proven
   (revert-proof). CAVEAT: proven at the scheduler DECISION; full enter-linux wall-clock
   before/after not measured (would confirm the 30s→~few-s user-visible win on-device).
-- [~] **Adder → C-speed PARITY (target 1.1×/1.0×)** — at **1.69×** of gcc-O2. Fused indexed
-  LOADS landed (`8f9fd17b`, 1.86→1.69×). Fused indexed STORES built + VERIFIED-CORRECT (objdiff
-  0/290, fuzzer 500/0) but **DO-NOT-MERGE: alignment-shadowed** — real licm/saxpy uop wins but
-  dcecopy +65% (#108 DSB lottery) → geomean worse (1.71→1.79). Patch saved for post-#108 re-enable.
-  **PEEPHOLE FRONTIER EXHAUSTED at ~1.69×.** USER GREEN-LIT (2026-07-17) both big-bangs, IN
-  PARALLEL: [~] **XL P1-IR statement-machine rewrite** (`codegen.ad`, route statements
-  destination-passing to kill the stack-machine plumbing — multi-session, incremental,
-  fuzzer-gated) + [~] **fib recursion→iteration** (`opt.ad`, tail/linear/tree recursion → loop).
-  Both --opt-gated (flag-OFF byte-identical to seed), objdiff+fuzzer+checksum gated. Agents in flight.
+- [~] **Adder → C-speed PARITY (target 1.1×/1.0×)** — HONEST metric now **1.64× of gcc-O2**
+  (fib RETIRED as degenerate + replaced by tak/Takeuchi, `a6d682fd`; see
+  [[feedback_universal_not_benchmark_gaming]]). Peephole frontier exhausted at ~1.69× (fused
+  LOADS `8f9fd17b`; fused STORES DO-NOT-MERGE alignment-shadowed, patch parked). USER GREEN-LIT both
+  big-bangs: **(A) XL P1-IR statement-machine rewrite** (`codegen.ad`) — foundation increment
+  `cf343155` (compare-operand dest-passing, objdiff-clean, universal but perf-neutral on this
+  bandwidth-bound suite); NEXT increment IN FLIGHT = immediate-indexed-store + collatz dst-alias/div
+  (the ALU-visible residuals where the geomean moves). **(B) fib recursion→iteration** DONE
+  `54969cda` (narrow two-term-recurrence matcher — correct, kept, but why fib was retired as a metric).
+  All --opt-gated (flag-OFF byte-identical), objdiff+fuzzer+checksum gated; reject alignment-shadowed
+  levers even if correct.
 
 ---
 
