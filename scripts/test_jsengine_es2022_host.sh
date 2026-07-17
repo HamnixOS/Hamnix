@@ -8,7 +8,8 @@
 #   Built-ins: Object.prototype.{hasOwnProperty,propertyIsEnumerable,isPrototypeOf};
 #              String.{raw,fromCharCode,fromCodePoint};
 #              Symbol() basics (typeof, uniqueness, description, Symbol.iterator,
-#              symbol-keyed properties).
+#              symbol-keyed properties);
+#              Array.prototype.{toReversed,toSorted,with} (change-array-by-copy).
 #   Language:  object-literal getters/setters (get x(){}/set x(v){}),
 #              computed property/method names {[expr]:v}/{[expr](){}},
 #              class instance + static fields (x=v / static y=v),
@@ -124,6 +125,13 @@ assert sym_iterwk   'console.log(Symbol.iterator===Symbol.iterator)'            
 assert sym_key      'var s=Symbol();var o={};o[s]=42;console.log(o[s])'                                  '42'
 assert sym_key2     'var a=Symbol(),b=Symbol();var o={};o[a]=1;o[b]=2;console.log(o[a],o[b])'           '1 2'
 assert sym_wkkey    'var o={};o[Symbol.iterator]=9;console.log(o[Symbol.iterator])'                     '9'
+
+# ---- Array change-by-copy: toReversed / toSorted / with (original untouched) ----
+assert acp_torev    'var a=[1,2,3];console.log(a.toReversed().join(","),a.join(","))'                    '3,2,1 1,2,3'
+assert acp_tosort   'var a=[3,1,2];console.log(a.toSorted().join(","),a.join(","))'                      '1,2,3 3,1,2'
+assert acp_sortcmp  'console.log([3,10,1].toSorted(function(x,y){return x-y}).join(","))'                '1,3,10'
+assert acp_with     'var a=[1,2,3];console.log(a.with(1,9).join(","),a.join(","))'                       '1,9,3 1,2,3'
+assert acp_withneg  'console.log([1,2,3].with(-1,9).join(","))'                                          '1,2,9'
 
 if [ "$fail" -eq 0 ]; then
     echo "[js-es2022] RESULT: PASS"
