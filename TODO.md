@@ -71,8 +71,12 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
     byte-identical pixels (cmp-verified), 6 DE gates pass. Bench 24.3→**32.7 ms/frame** = ~35% CPU
     REGRESSION (RGBA 4B vs RGB 3B + per-pixel clip checks; CLEAR doubled), AS ANTICIPATED (vk2d =
     same SW fill math). USER call: merge now + fix CPU path + start GPU. Kernel devwsys = C.2.
-  - [~] **CPU-path opt** IN FLIGHT — hoist per-pixel clip→per-primitive + opaque/row fast-paths +
-    fast clear in `lib/vk/vk_2d.ad`, byte-identical, to recover the regression. Benefits games too.
+  - [x] **CPU-path opt** DONE (`ad371b2d`): clip-hoist to per-primitive + packed-word opaque
+    fill + hoisted-const blend in `lib/vk/vk_2d.ad`, byte-identical (cmp), 12 gates green. DE bench
+    **32.7→9.1 ms/frame** — not just recovered: **2.7× FASTER than the original 24.3ms** pre-vk
+    rasterizer (CLEAR 9.6→1.8). Games share vk2d → same speedup free. Residual (RGBA 4B blend +
+    flatten) only the GPU erases. NOTE: `PACKED` is a reserved Adder token — can't be a local name
+    (worked around as `pword`); consider un-reserving for identifier use [[feedback_compiler_quirks]].
   - [~] **Phase D — virtio-gpu backend behind the vk API** IN FLIGHT (foundation): native
     virtio-gpu device-up + scanout, a `vk_core` backend seam (default stays SW), GPU CLEAR PoC;
     new `lib/vk/vk_gpu.ad`. Turns the CPU cost into a real DE+games speedup. Then C.2 (kernel
