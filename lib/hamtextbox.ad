@@ -536,6 +536,183 @@ def htb_sel_copy(h: int32, prim: int32) -> uint64:
     return n
 
 
+# ---- SYSTEM-WIDE X11 PRIMARY pointer plumbing (task #315 completion) --------
+# BEFORE this block every text surface hand-rolled three things: (a) the
+# "m <x> <y> <buttons> <dz>" wire-line parse, (b) the button-1 press/drag/
+# release -> select-and-copy-to-PRIMARY gesture state machine, and (c) the
+# middle-button rising-edge -> paste-PRIMARY detection. Four copies existed
+# (terminal, editor, Notes, browser URL bar) and every OTHER editable field
+# (installer host/user, dialog inputs, any managed htb box) had NONE — so
+# "highlight-to-copy + middle-click-to-paste" was NOT system-wide. These
+# helpers are the ONE shared implementation every surface calls, so the
+# behaviour is uniform and a single host test covers the live event path.
+
+# Canonical parse of a pointer wire line "m <x> <y> <buttons> [<dz>]". Returns
+# 1 and fills the out-params on a well-formed 'm' line (btn/dz default 0 when a
+# field is absent), 0 otherwise. This is the SAME field walk the apps used to
+# open-code; centralising it means the live-path host test exercises the exact
+# parser the shipped apps run. Buttons bitmap: bit0=Left bit1=Right bit2=Middle.
+def htb_evt_parse_m(line: Ptr[uint8], n: uint64, bx: Ptr[int64],
+                    by: Ptr[int64], bbtn: Ptr[int64], bdz: Ptr[int64]) -> int32:
+    if n == 0 or line[0] != 109:               # 'm'
+        return 0
+    p: uint64 = 1
+    vals: Array[4, int64]
+    vals[0] = 0
+    vals[1] = 0
+    vals[2] = 0
+    vals[3] = 0
+    f: uint64 = 0
+    while f < 4:
+        while p < n and line[p] == 32:
+            p = p + 1
+        neg: int32 = 0
+        if p < n and line[p] == 45:            # '-'
+            neg = 1
+            p = p + 1
+        acc: int64 = 0
+        got: int32 = 0
+        while p < n and line[p] >= 48 and line[p] <= 57:
+            acc = acc * 10 + cast[int64](line[p]) - 48
+            p = p + 1
+            got = 1
+        if neg != 0:
+            acc = 0 - acc
+        vals[f] = acc
+        if got == 0:
+            f = 4                              # stop: no more numeric fields
+        else:
+            f = f + 1
+    # x and y are mandatory; buttons/dz are optional (default 0).
+    bx[0] = vals[0]
+    by[0] = vals[1]
+    bbtn[0] = vals[2]
+    bdz[0] = vals[3]
+    return 1
+
+
+# Middle-button (bit2) RISING edge: 1 iff the middle button is down now and was
+# up in the previous bitmap. This is the paste trigger — edge-detected so a held
+# / jittering middle button pastes exactly once. The ONE detector every surface
+# shares (the editor/Notes used to open-code `b2 != 0 and pb2 == 0`).
+def htb_mid_edge(btn: int64, prev: int64) -> int32:
+    if (btn & 4) != 0 and (prev & 4) == 0:
+        return 1
+    return 0
+
+
+# Delete a managed box's live selection (if any), collapsing the caret+anchor
+# to the selection start. Returns 1 if bytes were removed. Byte-inert when no
+# selection is live.
+def htb_box_delete_sel(h: int32) -> int32:
+    if htb_sel_active(h) == 0:
+        return 0
+    hu: uint64 = cast[uint64](h)
+    ss: uint64 = htb_sel_start(h)
+    se: uint64 = htb_sel_end(h)
+    base: uint64 = _htb_base(h)
+    ln: uint64 = _htb_len[hu]
+    span: uint64 = se - ss
+    j: uint64 = ss
+    while j + span < ln:
+        _htb_buf[base + j] = _htb_buf[base + j + span]
+        j = j + 1
+    _htb_len[hu] = ln - span
+    _htb_buf[base + ln - span] = 0
+    _htb_cur[hu] = ss
+    _htb_anc[hu] = ss
+    _htb_selon[hu] = 0
+    return 1
+
+
+# Insert `n` bytes of `src` at the caret, first replacing any live selection
+# (paste semantics). Non-printable bytes (control chars, newline) are skipped so
+# a multi-line PRIMARY payload pasted into a single-line field never injects raw
+# escape/newline garbage. Returns the number of bytes actually inserted.
+def htb_box_insert_str(h: int32, src: Ptr[uint8], n: uint64) -> uint64:
+    htb_box_delete_sel(h)
+    ins: uint64 = 0
+    i: uint64 = 0
+    while i < n:
+        c: uint8 = src[i]
+        if c >= 32 and c < 127:
+            if _htb_insert(h, c) != 0:
+                ins = ins + 1
+        i = i + 1
+    return ins
+
+
+# Copy a managed box's live selection into the PRIMARY selection buffer
+# (/dev/snarf.primary). Returns bytes copied (0 if nothing selected). This is
+# the "highlight -> X11 PRIMARY" half; the caller invokes it on button-1 release.
+def htb_box_set_primary(h: int32) -> uint64:
+    return htb_sel_copy(h, 1)
+
+
+# Paste the PRIMARY selection into a managed box at the caret (replacing any
+# live selection). Reads /dev/snarf.primary and inserts it. Returns bytes
+# pasted. This is the "middle-click -> paste PRIMARY" half.
+_htb_paste_scratch: Array[256, uint8]
+
+def htb_box_paste_at(h: int32) -> uint64:
+    n: uint64 = htb_clip_get(1, &_htb_paste_scratch[0], HTB_CAP - 1)
+    if n == 0:
+        return 0
+    return htb_box_insert_str(h, &_htb_paste_scratch[0], n)
+
+
+# Decide what a pointer event does to a managed box, WITHOUT touching the
+# clipboard files (so it is pure and host-testable). `x0` is the box text's left
+# edge, `click_x` the pointer X, `btn`/`prevbtn` the current/previous button
+# bitmaps. Updates the box's caret/anchor/selection in place and returns an
+# ACTION code the caller acts on:
+#   0 = nothing changed
+#   1 = caret/selection changed (redraw; no clipboard I/O)
+#   2 = button-1 released over a live selection -> caller SETS PRIMARY
+#   3 = middle button pressed -> caller PASTES PRIMARY at the caret
+# Splitting the pure decision from the I/O lets the host gate drive the real
+# state machine with a synthetic "m ... 4" event and assert the outcome without
+# a live device, while apps use htb_box_pointer() below for the full behaviour.
+def htb_box_pointer_decide(h: int32, x0: int32, click_x: int32,
+                           btn: int64, prevbtn: int64) -> int32:
+    action: int32 = 0
+    b1: int64 = btn & 1
+    pb1: int64 = prevbtn & 1
+    if b1 != 0 and pb1 == 0:                    # button-1 PRESS
+        htb_sel_click(h, x0, click_x)
+        action = 1
+    elif b1 != 0 and pb1 != 0:                  # button-1 DRAG
+        htb_sel_drag(h, x0, click_x)
+        action = 1
+    elif b1 == 0 and pb1 != 0:                  # button-1 RELEASE
+        if htb_sel_active(h) != 0:
+            action = 2                          # a fresh highlight -> PRIMARY
+    if htb_mid_edge(btn, prevbtn) != 0:         # MIDDLE press -> paste
+        # A middle press collapses any selection to the click point first, then
+        # the caller pastes there (X11: middle-click drops PRIMARY at the click).
+        htb_sel_click(h, x0, click_x)
+        action = 3
+    return action
+
+
+# Full managed-box pointer handler: run the shared state machine AND perform the
+# PRIMARY clipboard I/O. Every editable htb field calls this ONE function per
+# pointer event to inherit highlight->PRIMARY + middle-click paste uniformly.
+# Returns 1 if the box changed (caller should redraw).
+def htb_box_pointer(h: int32, x0: int32, click_x: int32,
+                    btn: int64, prevbtn: int64) -> int32:
+    action: int32 = htb_box_pointer_decide(h, x0, click_x, btn, prevbtn)
+    if action == 2:
+        htb_box_set_primary(h)
+        return 1
+    if action == 3:
+        htb_box_paste_at(h)
+        return 1
+    if action == 1:
+        return 1
+    return 0
+
+
 # ---- word / line boundaries + multi-click (task #328) ---------------------
 # Linux/Windows convention: a SINGLE click places the caret, a DOUBLE click
 # selects the WORD under it, a TRIPLE click selects the whole LINE. The two
