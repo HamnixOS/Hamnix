@@ -67,6 +67,15 @@ from lib.vk.vk_raster import (
 from lib.vk.vk_gpu import (
     vk_gpu_backend_available, vk_gpu_clear, vk_gpu_present,
     vk_gpu_backing_base,
+    vk_gpu_scanout_width, vk_gpu_scanout_height, vk_gpu_present_image,
+)
+
+# Phase-D present benchmark deps: the monotonic TSC clock and the software
+# GOP present path (per-pixel framebuffer STORE) we measure the GPU
+# TRANSFER+FLUSH present against.
+from arch.x86.kernel.time import tsc_monotonic_ns
+from drivers.video.console.fb_text import (
+    fb_get_initialized, fb_get_width, fb_get_height, fb_present_rgba_row,
 )
 
 
@@ -481,4 +490,199 @@ def vk_gpu_backend_selftest() -> int32:
         printk0("[vgpu-vk] PASS: Phase-D GPU backend clear+present OK\n")
         return 1
     printk0("[vgpu-vk] FAIL: Phase-D GPU backend self-test had failures\n")
+    return 0
+
+
+# ===================================================================
+# PHASE D — PRESENT-PATH BENCHMARK (SW GOP present vs GPU scanout)
+# ===================================================================
+#
+# The honest Phase-D win on BASE virtio-gpu-2d is the PRESENT/scanout
+# path, NOT the fills. Base virtio-gpu 2D is a SCANOUT device: the pixels
+# are still drawn by the CPU into the resource backing; the device only
+# composites the backing onto the display. So the fills stay CPU-bound
+# (real fill/compute acceleration needs venus/virgl 3D — a separate,
+# larger GPU track, #182 venus). What the device DOES accelerate is the
+# present: replacing the software present's per-pixel GOP-MMIO framebuffer
+# STOREs (fb_present_rgba_row, ~W*H uncached device-memory writes) with a
+# single bulk DMA (TRANSFER_TO_HOST_2D) + composite (RESOURCE_FLUSH).
+#
+# This benchmark measures a full-scanout frame presented BOTH ways,
+# best-of-N, and prints the nanosecond numbers so the flip-to-GPU-present
+# decision rests on real on-device data. It also proves correctness: the
+# GPU-presented backing must equal the software source frame pixel for
+# pixel (RGBA source → BGRA backing).
+#
+# Prints [vgpu-bench] lines. Returns 1 PASS, 0 FAIL, -1 SKIP.
+
+VGPU_BENCH_REPS: uint64 = 5
+
+
+def _vgpu_bench_fill_frame(base: uint64, w: uint64, h: uint64):
+    # Deterministic RGBA gradient so the frame is representative content
+    # (not a single solid color the compiler/device could special-case).
+    y: uint64 = 0
+    while y < h:
+        row: uint64 = base + y * w * 4
+        x: uint64 = 0
+        while x < w:
+            o: uint64 = row + x * 4
+            cast[Ptr[uint8]](o + 0)[0] = cast[uint8](x & 0xFF)          # R
+            cast[Ptr[uint8]](o + 1)[0] = cast[uint8](y & 0xFF)          # G
+            cast[Ptr[uint8]](o + 2)[0] = cast[uint8]((x + y) & 0xFF)    # B
+            cast[Ptr[uint8]](o + 3)[0] = 255                            # A
+            x = x + 1
+        y = y + 1
+
+
+def _vgpu_bench_verify(src: uint64, w: uint64, h: uint64) -> uint64:
+    # After a GPU present, the BGRA scanout backing must equal the RGBA
+    # source converted (R↔B swapped). Return the mismatch count (0 == OK).
+    dst: uint64 = vk_gpu_backing_base()
+    if dst == 0:
+        return w * h
+    dw: uint64 = cast[uint64](vk_gpu_scanout_width())
+    dh: uint64 = cast[uint64](vk_gpu_scanout_height())
+    cw: uint64 = w
+    if cw > dw:
+        cw = dw
+    ch: uint64 = h
+    if ch > dh:
+        ch = dh
+    bad: uint64 = 0
+    y: uint64 = 0
+    while y < ch:
+        sp: uint64 = src + y * w * 4
+        dp: uint64 = dst + y * dw * 4
+        x: uint64 = 0
+        while x < cw:
+            sr: uint8 = cast[Ptr[uint8]](sp + 0)[0]
+            sg: uint8 = cast[Ptr[uint8]](sp + 1)[0]
+            sb: uint8 = cast[Ptr[uint8]](sp + 2)[0]
+            db: uint8 = cast[Ptr[uint8]](dp + 0)[0]
+            dg: uint8 = cast[Ptr[uint8]](dp + 1)[0]
+            dr: uint8 = cast[Ptr[uint8]](dp + 2)[0]
+            if sr != dr or sg != dg or sb != db:
+                bad = bad + 1
+            sp = sp + 4
+            dp = dp + 4
+            x = x + 1
+        y = y + 1
+    return bad
+
+
+def vk_gpu_present_benchmark() -> int32:
+    printk0("[vgpu-bench] Phase-D present-path benchmark starting\n")
+    if vk_gpu_backend_available() == 0:
+        printk0("[vgpu-bench] SKIP: no virtio-gpu device\n")
+        return -1
+    w: uint64 = cast[uint64](vk_gpu_scanout_width())
+    h: uint64 = cast[uint64](vk_gpu_scanout_height())
+    if w == 0 or h == 0:
+        printk0("[vgpu-bench] SKIP: scanout size 0\n")
+        return -1
+    printk2("[vgpu-bench] frame %dx%d\n", w, h)
+    printk1("[vgpu-bench] best-of-%d reps\n", VGPU_BENCH_REPS)
+
+    nbytes: uint64 = w * h * 4
+    src: uint64 = kmalloc(nbytes)
+    if src == 0:
+        printk0("[vgpu-bench] SKIP: frame alloc failed\n")
+        return -1
+    _vgpu_bench_fill_frame(src, w, h)
+    srcp: Ptr[uint8] = cast[Ptr[uint8]](src)
+
+    # --- (a) software GOP present: per-pixel framebuffer STOREs --------
+    # This is the exact path vkQueuePresent's SW branch and the DE use
+    # today: fb_present_rgba_row repacks + stores each pixel to the GOP
+    # linear framebuffer (device MMIO). No shadow is installed this early
+    # in boot, so these are real scanout writes — the honest SW cost.
+    sw_best: uint64 = 0xFFFFFFFFFFFFFFFF
+    fb_ok: int32 = fb_get_initialized()
+    if fb_ok != 0:
+        pw: uint64 = w
+        if pw > fb_get_width():
+            pw = fb_get_width()
+        ph: uint64 = h
+        if ph > fb_get_height():
+            ph = fb_get_height()
+        rep: uint64 = 0
+        while rep < VGPU_BENCH_REPS:
+            t0: uint64 = tsc_monotonic_ns()
+            yy: uint64 = 0
+            while yy < ph:
+                fb_present_rgba_row(yy, 0, yy, pw, srcp, w)
+                yy = yy + 1
+            t1: uint64 = tsc_monotonic_ns()
+            dt: uint64 = t1 - t0
+            if dt < sw_best:
+                sw_best = dt
+            rep = rep + 1
+        printk1("[vgpu-bench] SW  GOP present  = %d ns (best of N)\n",
+                sw_best)
+    else:
+        printk0("[vgpu-bench] NOTE: no GOP fb up — SW present not measured\n")
+
+    # --- (b) GPU present: RGBA→BGRA convert + TRANSFER_TO_HOST + FLUSH -
+    gpu_best: uint64 = 0xFFFFFFFFFFFFFFFF
+    gpu_fail: int32 = 0
+    rep2: uint64 = 0
+    while rep2 < VGPU_BENCH_REPS:
+        t0b: uint64 = tsc_monotonic_ns()
+        grc: int32 = vk_gpu_present_image(src, cast[uint32](w),
+                                          cast[uint32](h))
+        t1b: uint64 = tsc_monotonic_ns()
+        if grc != 0:
+            gpu_fail = 1
+        dtb: uint64 = t1b - t0b
+        if dtb < gpu_best:
+            gpu_best = dtb
+        rep2 = rep2 + 1
+    if gpu_fail != 0:
+        printk0("[vgpu-bench] FAIL: GPU present returned error\n")
+        kfree(src)
+        return 0
+    printk1("[vgpu-bench] GPU present      = %d ns (best of N)\n", gpu_best)
+
+    # --- (c) pure device present: TRANSFER_TO_HOST + FLUSH only -------
+    # vk_gpu_present_image (b) includes a CPU-side RGBA→BGRA convert copy
+    # into the backing. The backing now already holds that converted frame,
+    # so vk_gpu_present() times the DEVICE scanout offload ALONE (no CPU
+    # copy) — the true ceiling of the base virtio-gpu-2d present win, and
+    # exactly the cost a BGRA-native compositor would pay (render straight
+    # into the backing, present = pure DMA + composite).
+    dev_best: uint64 = 0xFFFFFFFFFFFFFFFF
+    rep3: uint64 = 0
+    while rep3 < VGPU_BENCH_REPS:
+        t0c: uint64 = tsc_monotonic_ns()
+        vk_gpu_present()
+        t1c: uint64 = tsc_monotonic_ns()
+        dtc: uint64 = t1c - t0c
+        if dtc < dev_best:
+            dev_best = dtc
+        rep3 = rep3 + 1
+    printk1("[vgpu-bench] GPU present (no convert) = %d ns (best of N)\n",
+            dev_best)
+    if fb_ok != 0 and dev_best > 0:
+        ratio2_x100: uint64 = (sw_best * 100) / dev_best
+        printk1("[vgpu-bench] SW / device-only present speedup = %d (x100)\n",
+                ratio2_x100)
+
+    # --- ratio (integer x100) so no FPU is needed ---------------------
+    if fb_ok != 0 and gpu_best > 0:
+        ratio_x100: uint64 = (sw_best * 100) / gpu_best
+        printk1("[vgpu-bench] SW/GPU present speedup = %d (x100)\n",
+                ratio_x100)
+        if sw_best > gpu_best:
+            printk0("[vgpu-bench] RESULT: GPU present is FASTER than SW GOP present\n")
+        else:
+            printk0("[vgpu-bench] RESULT: GPU present is NOT faster than SW GOP present\n")
+
+    # --- correctness: GPU-presented backing == SW source frame --------
+    bad: uint64 = _vgpu_bench_verify(src, w, h)
+    kfree(src)
+    if bad == 0:
+        printk0("[vgpu-bench] PASS: GPU-presented backing matches SW frame pixel-for-pixel\n")
+        return 1
+    printk1("[vgpu-bench] FAIL: GPU backing mismatch (%d px)\n", bad)
     return 0

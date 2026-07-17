@@ -238,3 +238,51 @@ frame-timing pass** (instrument `_wsys_present_window` recompose→present with
 damage-clip + fb-present costs that the host path does not model are captured.
 The host bench proves the *compositing kernel* got faster; the on-device pass
 proves the *whole DE frame* got faster.
+
+## Phase D — on-device present-path measurement (virtio-gpu scanout offload)
+
+Measured on-device under OVMF with a GOP linear framebuffer + a native
+virtio-gpu device present simultaneously (`-device virtio-vga`, which exposes
+BOTH the OVMF GOP linear FB and the virtio-1.0 GPU control device), full
+**1280×800** scanout frame, best-of-5, `tsc_monotonic_ns()` timing. Driven by
+`vk_gpu_present_benchmark()` (lib/vk/vk_selftest.ad), gated on the boot:37.vgpu
+self-test. `[vgpu-bench]` serial markers.
+
+| Present path | best-of-5 | vs SW |
+|---|---|---|
+| **SW GOP present** — `fb_present_rgba_row` per-pixel repack + MMIO STORE, ~1.02M px | **11.77 ms** | 1.00× |
+| **GPU present** — `vk_gpu_present_image`: CPU RGBA→BGRA convert copy **+** TRANSFER_TO_HOST_2D + RESOURCE_FLUSH | **11.28 ms** | **1.04×** |
+| **GPU present, device-only** — pure TRANSFER_TO_HOST_2D + RESOURCE_FLUSH (backing already BGRA, no CPU copy) | **0.19 ms** | **61×** |
+
+**Correctness:** the GPU-presented BGRA backing matches the SW RGBA source frame
+pixel-for-pixel (`_vgpu_bench_verify`, full-frame compare, 0 mismatches).
+
+### What this proves — and the honest fill story
+
+* **The present/scanout offload is real and large (≈61×)** — but only when the
+  frame is already in the device's BGRA backing, so present is a pure device
+  DMA (`TRANSFER_TO_HOST_2D`) + composite (`RESOURCE_FLUSH`) with no CPU work.
+  The SW path's cost is ~1M uncached GOP-MMIO stores; the device path replaces
+  all of them with one bulk DMA + one flush.
+* **With the RGBA→BGRA convert copy included, the win collapses to ~4%**: the
+  convert copy (cacheable RAM, ~1M px) costs about the same as the SW per-pixel
+  MMIO present it replaces. So `vk_gpu_present_image` (convert-then-present) is
+  the *wrong* shape to capture the win. **The next optimization is to render the
+  vk color image / DE composite directly into a BGRA backing** so present drops
+  the convert and becomes the 61× device-only path. That is a clean follow-up on
+  the SAME seam (no new device work).
+* **Fills stay CPU-bound on base virtio-gpu-2d.** virtio-gpu 2D is a *scanout*
+  device: it presents a host resource but does NOT rasterize into it — the CPU
+  still draws every fill/line/blit/glyph into the backing. `vk_gpu_clear`/
+  `vk_gpu_fill_rect` are CPU loops over the backing, not device blits. Real
+  fill/compute acceleration requires **venus/virgl 3D** (GL/Vulkan command
+  passthrough to the host GPU) — a separate, larger GPU track (#182 venus), NOT
+  attempted here.
+
+### Decision (this round)
+
+Default stays **SW** (`vk_set_backend` seam unchanged; `vk_try_enable_gpu_present`
+added as the DE/compositor opt-in). The convert-included GPU present is only ~4%
+faster, so flipping the default is **not** justified yet. The recommended next
+step is the BGRA-native present (drop the convert → 61× present) followed by
+venus/virgl for actual fill/compute acceleration.

@@ -162,7 +162,7 @@ kill "$QEMU_PID" 2>/dev/null
 wait "$QEMU_PID" 2>/dev/null
 
 echo "[test_vgpu] --- virtio-gpu / vgpu boot log ---"
-grep -a -E "virtio-gpu|virtio-modern|\[vgpu\]" "$LOG" || true
+grep -a -E "virtio-gpu|virtio-modern|\[vgpu\]|\[vgpu-vk\]|\[vgpu-bench\]" "$LOG" || true
 echo "[test_vgpu] --- end ---"
 
 fail=0
@@ -187,6 +187,12 @@ check_log "present self-test PASS"       "\[vgpu\] PASS"
 check_log "GPU clear matches SW ref"     "\[vgpu-vk\] PASS: GPU clear matches SW reference"
 check_log "GPU present ran"              "\[vgpu-vk\] PASS: GPU present"
 check_log "GPU backend self-test PASS"   "\[vgpu-vk\] PASS: GPU backend self-test complete"
+# Phase D present-path benchmark: proves the GPU-presented backing matches
+# the SW frame pixel-for-pixel and records the SW-vs-GPU present numbers.
+# (The ns numbers themselves are informational — printed above — and vary
+# by host/accel; only the correctness + completion markers gate.)
+check_log "present benchmark correct"    "\[vgpu-bench\] PASS: GPU-presented backing matches SW frame"
+check_log "present benchmark complete"   "\[vgpu-bench\] PASS: present benchmark complete"
 
 if grep -a -q -E "\[vgpu-vk\] FAIL" "$LOG"; then
     echo "[test_vgpu] FAIL: kernel reported [vgpu-vk] FAIL" >&2
