@@ -50,11 +50,11 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
   length regression gate added.
 
 ### Queued fronts (USER 2026-07-17) — dispatch on trigger, protect timing-sensitive slots
-- [ ] **hamsh pygame-style bindings** — expose the hamSDL API (`lib/hamsdl.ad`:
-  sdl_init/draw/blit/poll_event) INTO the hamsh script language so games are written
-  in the shell, not just Adder. TRIGGER: dispatch once the hamsh host dual-target lands
-  (host-verify the bindings through that seam, no QEMU). Adder core + host renderer
-  (`hamsdl_host.ad`/`hamgame_host.ad`) already exist.
+- [x] **hamsh pygame-style bindings** DONE (`9acecdea`): `builtin_pygame` verb + rgb()/
+  pixel()/poll_event()/ev_* expression fns in `user/hamsh.ad` → hamSDL engine; a game is
+  writable in hamsh. `examples/pygame_bounce.hsh` runs 90 frames, host PPM verified. Device
+  build unaffected. Gaps: on-device `flip`→/dev/wsys commit, sound, file-loaded sprites,
+  fps precision, collision helpers.
 - **★ Vulkan UNIFICATION campaign (USER: "make DE + SDL use the vulkan backend").**
   Today `lib/vk` is an ISLAND — hamSDL, the DE compositor (`hamui_host`/`devwsys`), and
   `vk_raster` are THREE separate SW rasterizers. Unify everything onto the vk API so a
@@ -63,9 +63,12 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
     fill_rect/alpha/blit/line as recorded vk cmd-buffer ops; host PPM gate 10/10). Delivered
     the hamSDL/DE→vk2d primitive-mapping table. Gaps for B/C: glyph AA coverage-mask op,
     rounded-rect AA op, scissor/clip rect (windowed compositing).
-  - [ ] **Phase B — route hamSDL through vk** (sdl_fill_rect/blit/draw_text → vk2d ops;
-    games become vk clients, get depth/3D + future accel). TRIGGER: after the pygame-bindings
-    agent lands (both edit lib/hamsdl.ad — sequence to avoid conflict).
+  - [~] **Phase B — route hamSDL through vk** (sdl_fill_rect/blit/draw_text → vk2d ops;
+    games become vk clients). IN FLIGHT. Impl-only change; sdl_* API stable so pygame + games
+    keep working. Verify: all game host gates still render identical PNGs.
+  - [~] **DE-speed baseline (USER)** — bench the DE compositor NOW (pre-vk) so Phase C's
+    DE-through-vk can be proven as-fast-or-faster. `scripts/bench_de_compositor.sh` +
+    `docs/de_perf_baseline.md`. IN FLIGHT (measurement-only, host).
   - [ ] **Phase C — route the DE compositor through vk** (hamui_host/devwsys composite
     window scenes via vk present/blits). Biggest/riskiest (touches kernel). After B.
   - [ ] **Phase D (parallel/later) — virtio-gpu / silicon backend behind the SAME vk API**
