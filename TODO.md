@@ -63,9 +63,13 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
     fill_rect/alpha/blit/line as recorded vk cmd-buffer ops; host PPM gate 10/10). Delivered
     the hamSDL/DE→vk2d primitive-mapping table. Gaps for B/C: glyph AA coverage-mask op,
     rounded-rect AA op, scissor/clip rect (windowed compositing).
-  - [~] **Phase B — route hamSDL through vk** (sdl_fill_rect/blit/draw_text → vk2d ops;
-    games become vk clients). IN FLIGHT. Impl-only change; sdl_* API stable so pygame + games
-    keep working. Verify: all game host gates still render identical PNGs.
+  - [x] **Phase B — route hamSDL through vk** DONE (`de0dbf5f`): `lib/hamsdl_vk.ad` vk2d-backed
+    rasterizer; sdlpong/Coin Dash/pygame now vk clients, byte-identical PNGs (cmp-verified).
+    Added vk2d `cov_mask` (glyph coverage) + `fill_roundrect`. ham2048/snake/chess left on
+    hamui_host (DE-scene apps, never call sdl_* → Phase C). sdl_* API unchanged.
+  - [~] **Phase C — route the DE compositor (hamui_host) through vk** IN FLIGHT: same vk2d ops,
+    byte-identical pixels; RE-RUN `bench_de_compositor.sh` vs the 24.3ms baseline. Expect PARITY
+    (vk2d fill = same SW math; real speedup awaits Phase D GPU). Kernel devwsys may defer to C.2.
   - [x] **DE-speed baseline (USER)** DONE (`b3b6e710`): `scripts/bench_de_compositor.sh` +
     `docs/de_perf_baseline.md`. BEFORE = **24.3 ms/frame** @1024×768 (58 prims), fills
     dominate **17.3 ms (~87%)**, glyphs 2.1, image 0.3, fb-clear 4.4; variance <1.5%. Phase C
