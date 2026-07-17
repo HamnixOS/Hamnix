@@ -83,18 +83,34 @@ NET=(); if [ -z "${NO_NET:-}" ]; then NET=(-netdev user,id=hnet0 -device virtio-
 # So the native HDA driver enumerates a class-0403 device at boot and the DE's
 # volume applet / aplay / playtone find a live /dev/audio. Without this the guest
 # has NO sound device at all (hda_init skips) — the "nothing is audible" report.
-# HDA_AUDIODEV picks the HOST backend: default auto-detect (PulseAudio socket ->
-# pa, else none). Set HDA_AUDIODEV=pa|pipewire|alsa|sdl|none to override, or
-# HDA_AUDIODEV=wav,path=/tmp/out.wav to capture guest audio to a file. `none`
-# still enumerates the device (DE works) but you won't hear it.
+#
+# HDA_AUDIODEV picks the HOST backend. Default = auto-detect a backend that
+# ACTUALLY EMITS to the host speakers: a modern desktop runs PipeWire (native
+# `pipewire-0` socket) and MAY or may NOT expose the PulseAudio compat socket, so
+# detecting only pulse (the old behaviour) silently fell through to `none` =
+# SILENCE on a pipewire-only session — that is the "audio never reaches the host
+# speakers" report. We now prefer the native `pipewire` QEMU backend when a
+# pipewire socket exists AND this QEMU build supports it, then fall back to `pa`
+# (works against pipewire-pulse too), and only pick `none` when there is no
+# running sound server at all. Set HDA_AUDIODEV=pipewire|pa|alsa|sdl|none to
+# override, or HDA_AUDIODEV=wav,path=/tmp/out.wav to capture guest audio to a
+# file. `none` still enumerates the device (DE works) but you won't hear it.
+_qemu_has_audiodev() {   # $1=backend name -> 0 if this qemu build lists it
+    qemu-system-x86_64 -audiodev help 2>/dev/null | grep -qx "$1"
+}
 if [ -z "${HDA_AUDIODEV:-}" ]; then
+    _xrd="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     if [ -n "${NO_AUDIO:-}" ]; then
         HDA_AUDIODEV="none"
-    elif [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse/native" ]; then
+    elif [ -S "$_xrd/pipewire-0" ] && _qemu_has_audiodev pipewire; then
+        HDA_AUDIODEV="pipewire"
+        [ -z "${HEADLESS:-}" ] && say "audio backend: pipewire (native socket $_xrd/pipewire-0)"
+    elif [ -S "$_xrd/pulse/native" ]; then
         HDA_AUDIODEV="pa"
+        [ -z "${HEADLESS:-}" ] && say "audio backend: pa (PulseAudio socket)"
     else
         HDA_AUDIODEV="none"
-        [ -z "${HEADLESS:-}" ] && say "no PulseAudio socket found: audio device enumerated but muted (set HDA_AUDIODEV=pipewire|alsa|sdl to hear it)"
+        [ -z "${HEADLESS:-}" ] && say "no PipeWire/PulseAudio socket found: audio device enumerated but muted (set HDA_AUDIODEV=pipewire|pa|alsa|sdl to hear it)"
     fi
 fi
 AUDIO=(-audiodev "${HDA_AUDIODEV},id=snd0" -device intel-hda -device hda-output,audiodev=snd0)
