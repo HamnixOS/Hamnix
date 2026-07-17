@@ -87,6 +87,11 @@ assert_pix "scaled blit reproduces source green"     "PIX_BLIT_SCALED 44 20" "#0
 assert_pix "line hits the expected pixel"            "PIX_LINE 20 40"      "#ffff00"
 assert_pix "line thickness covers y+1"               "PIX_LINE_THICK 20 41" "#ffff00"
 assert_pix "line does not bleed to y+3 (bg)"         "PIX_LINE_BELOW 20 43" "#101828"
+assert_pix "roundrect interior is solid (fill_roundrect)" "PIX_RR_IN 52 52"  "#00ffff"
+assert_pix "roundrect corner rounded away to bg"     "PIX_RR_CORNER 44 44" "#101828"
+assert_pix "cov-mask full coverage == ink color"     "PIX_COV_FULL 4 46"   "#ff0000"
+assert_pix "cov-mask half coverage source-over blend" "PIX_COV_HALF 5 47"  "#870b13"
+assert_ne  "cov-mask half coverage is blended (not bg)" "PIX_COV_HALF 5 47" "#101828"
 
 if [ "$fail" -eq 0 ]; then
     echo "[test_vk_2d] PASS — vk 2D primitive layer rendered fill/alpha/blit/line into a vk color image"

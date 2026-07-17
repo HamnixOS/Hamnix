@@ -1,0 +1,608 @@
+# lib/hamsdl_vk.ad — the vk-BACKED host rasterizer sink for hamSDL / hamGame.
+#
+# PHASE B of unifying graphics onto the native Vulkan spine (GPU track #181).
+# ============================================================================
+# hamSDL games build a frame as the shared lib/hamscene.ad display list (via
+# the sdl_* / pygame API — sdl_fill_rect, sdl_blit, sdl_draw_line,
+# sdl_draw_text, sdl_fill_round_rect, ...). On the developer HOST there is no
+# compositor, so the frame has to be RASTERIZED to a framebuffer a human/agent
+# can LOOK at. Historically that was lib/hamui_host.ad's own private software
+# rasterizer (direct _put_px writes). This module is the REPLACEMENT sink for
+# the hamSDL family: it parses the SAME display list but paints every primitive
+# through the vk 2D primitive layer (lib/vk/vk_2d.ad — the exact functions the
+# kernel vk command buffer replays at vkQueueSubmit) into a vk-style RGBA8888
+# COLOR IMAGE, then presents that image (RGBA -> RGB) as a PPM. So a hamSDL game
+# on the host is now a vk CLIENT: it inherits the vk pipeline (and, later, GPU
+# acceleration behind the same vk2d API) for free — while the public sdl_* API
+# and the game code stay byte-for-byte unchanged.
+#
+# BYTE-EXACTNESS: vk_2d's blend math is byte-identical to hamui_host's
+# _put_px_blend / _fill_rect_a / _fill_roundrect / _blit_glyph_prop (Phase A
+# guaranteed this, and the roundrect + glyph-coverage ops were ported verbatim).
+# The verb parser + font layout below mirror hamui_host_rasterize exactly, so
+# the rendered pixels — and the primitive count — match the old path.
+#
+# HOST-CLEAN: no `extern`, no syscalls. It only reads the scene buffer, fills a
+# BSS color image, and builds an RGB present buffer + PPM header into caller
+# storage. The per-app *_host.ad driver does the actual file writes. It links
+# ONLY into the x86_64-linux host target (font_ttf + the DejaVu faces are host
+# assets); the native device path presents through the vk command buffer /
+# compositor instead (Phase C).
+
+from lib.hamscene import hamscene_bufptr, hamscene_length
+from lib.hamui_host_font import hamui_host_font_init, hamui_host_font_row
+from lib.browserfonts import browserfonts_load
+from lib.font_ttf import font_ttf_loaded, font_ttf_render, font_ttf_ascent_px, \
+    glyph_bw, glyph_bh, glyph_xoff, glyph_ytop, glyph_blank, glyph_cov, \
+    glyph_adv, FACE_TT_MONO, FACE_TT_SANS, FACE_TT_SANS_BOLD
+from lib.vk.vk_2d import (
+    vk2d_raster_fill_rect, vk2d_raster_fill_rect_alpha,
+    vk2d_raster_blit, vk2d_raster_draw_line,
+    vk2d_raster_fill_roundrect, vk2d_raster_cov_mask,
+)
+
+
+# ====================================================================
+# The vk COLOR IMAGE (BSS, demand-zero on Linux). Row-major RGBA8888 — the
+# exact backing a VkImage(VK_FORMAT_R8G8B8A8_UNORM) render pass + present path
+# use. Sized to a generous window; the active WxH is set by hamsdl_vk_begin().
+# A separate RGB present buffer holds the flattened frame for the PPM writer.
+# ====================================================================
+HSVK_MAX_W: uint64 = 1024
+HSVK_MAX_H: uint64 = 768
+hsvk_img: Array[3145728, uint8]      # 1024*768*4 RGBA color image
+hsvk_rgb: Array[2359296, uint8]      # 1024*768*3 RGB present buffer
+hsvk_w: int32 = 0
+hsvk_h: int32 = 0
+
+# Per-glyph coverage scratch (row-major cov_w*cov_h uint8), fed to the vk2d
+# coverage-mask op. 128*128 comfortably holds a 14px cell glyph bitmap.
+hsvk_cov: Array[16384, uint8]
+
+# Mono em size — identical to hamui_host TTF_PX so the 8px grid + baseline math
+# land the glyph ink on exactly the same pixels.
+HSVK_TTF_PX: int32 = 14
+
+
+def _hsvk_cbase() -> uint64:
+    return cast[uint64](&hsvk_img[0])
+
+
+def hamsdl_vk_width() -> int32:
+    return hsvk_w
+
+
+def hamsdl_vk_height() -> int32:
+    return hsvk_h
+
+
+# Packed 0x00RRGGBB at (x,y); 0 if out of range. For gate assertions.
+def hamsdl_vk_pixel(x: int32, y: int32) -> uint32:
+    if x < 0 or y < 0 or x >= hsvk_w or y >= hsvk_h:
+        return 0
+    o: uint64 = _hsvk_cbase() + (cast[uint64](y) * cast[uint64](hsvk_w)
+                                 + cast[uint64](x)) * 4
+    r: uint32 = cast[uint32](cast[Ptr[uint8]](o)[0])
+    g: uint32 = cast[uint32](cast[Ptr[uint8]](o + 1)[0])
+    b: uint32 = cast[uint32](cast[Ptr[uint8]](o + 2)[0])
+    return (r << 16) | (g << 8) | b
+
+
+# ====================================================================
+# IMAGE REGISTRY — the host-side named image store (twin of hamui_host's). A
+# host driver registers decoded RGBA8888 bytes BY NAME before rasterizing; the
+# `image NAME` scene verb looks it up and blits it through vk2d_raster_blit.
+# ====================================================================
+HSVK_IMG_SLOTS:    uint64 = 8
+HSVK_IMG_NAME_CAP: uint64 = 32
+hsvk_img_name: Array[256, uint8]      # 8 * 32, NUL-terminated
+hsvk_img_w:    Array[8, int32]
+hsvk_img_h:    Array[8, int32]
+hsvk_img_ptr:  Array[8, uint64]       # RGBA8888 source (caller-owned)
+hsvk_img_used: Array[8, int32]
+
+
+def _hsvk_img_name_eq(slot: uint64, name: Ptr[uint8]) -> int32:
+    nb: uint64 = slot * HSVK_IMG_NAME_CAP
+    k: uint64 = 0
+    while name[k] != 0:
+        if hsvk_img_name[nb + k] == 0:
+            return 0
+        if hsvk_img_name[nb + k] != name[k]:
+            return 0
+        k = k + 1
+    if hsvk_img_name[nb + k] != 0:
+        return 0
+    return 1
+
+
+def hamsdl_vk_register_image(name: Ptr[uint8], w: int32, h: int32,
+                             rgba: Ptr[uint8]) -> int32:
+    slot: int32 = -1
+    s: uint64 = 0
+    while s < HSVK_IMG_SLOTS:
+        if hsvk_img_used[s] != 0 and _hsvk_img_name_eq(s, name) == 1:
+            slot = cast[int32](s)
+            s = HSVK_IMG_SLOTS
+        else:
+            s = s + 1
+    if slot < 0:
+        s2: uint64 = 0
+        while s2 < HSVK_IMG_SLOTS:
+            if hsvk_img_used[s2] == 0:
+                slot = cast[int32](s2)
+                s2 = HSVK_IMG_SLOTS
+            else:
+                s2 = s2 + 1
+    if slot < 0:
+        return 0
+    u: uint64 = cast[uint64](slot)
+    nb: uint64 = u * HSVK_IMG_NAME_CAP
+    k: uint64 = 0
+    while name[k] != 0 and k < HSVK_IMG_NAME_CAP - 1:
+        hsvk_img_name[nb + k] = name[k]
+        k = k + 1
+    hsvk_img_name[nb + k] = 0
+    hsvk_img_w[u] = w
+    hsvk_img_h[u] = h
+    hsvk_img_ptr[u] = cast[uint64](rgba)
+    hsvk_img_used[u] = 1
+    return 1
+
+
+# Find the slot for the bareword name buf[ns..ne); -1 if none.
+def _hsvk_img_find(buf: Ptr[uint8], ns: uint64, ne: uint64) -> int32:
+    if ns >= ne:
+        return -1
+    s: uint64 = 0
+    while s < HSVK_IMG_SLOTS:
+        if hsvk_img_used[s] != 0:
+            nb: uint64 = s * HSVK_IMG_NAME_CAP
+            k: uint64 = ns
+            j: uint64 = nb
+            mt: int32 = 1
+            while k < ne and mt == 1:
+                if hsvk_img_name[j] == 0 or hsvk_img_name[j] != buf[k]:
+                    mt = 0
+                k = k + 1
+                j = j + 1
+            if mt == 1 and hsvk_img_name[j] == 0:
+                return cast[int32](s)
+        s = s + 1
+    return -1
+
+
+# ====================================================================
+# COLOUR + INTEGER PARSING (mirrors hamui_host — the scene grammar is shared).
+# ====================================================================
+_col_r: uint8 = 0
+_col_g: uint8 = 0
+_col_b: uint8 = 0
+_col_a: uint8 = 255
+_num: int32 = 0
+
+
+def _hex1(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return cast[int32](c) - 48
+    if c >= 97 and c <= 102:
+        return cast[int32](c) - 97 + 10
+    if c >= 65 and c <= 70:
+        return cast[int32](c) - 65 + 10
+    return 0
+
+
+def _parse_color(buf: Ptr[uint8], off: uint64, end: uint64) -> uint64:
+    i: uint64 = off
+    if i < end and buf[i] == 35:                       # '#'
+        i = i + 1
+    start: uint64 = i
+    while i < end and buf[i] != 32 and buf[i] != 10:
+        i = i + 1
+    ndig: uint64 = i - start
+    _col_a = 255
+    if ndig == 3:
+        r4: int32 = _hex1(buf[start])
+        g4: int32 = _hex1(buf[start + 1])
+        b4: int32 = _hex1(buf[start + 2])
+        _col_r = cast[uint8](r4 * 16 + r4)
+        _col_g = cast[uint8](g4 * 16 + g4)
+        _col_b = cast[uint8](b4 * 16 + b4)
+    else:
+        _col_r = cast[uint8](_hex1(buf[start]) * 16 + _hex1(buf[start + 1]))
+        _col_g = cast[uint8](_hex1(buf[start + 2]) * 16 + _hex1(buf[start + 3]))
+        _col_b = cast[uint8](_hex1(buf[start + 4]) * 16 + _hex1(buf[start + 5]))
+        if ndig == 8:
+            _col_a = cast[uint8](_hex1(buf[start + 6]) * 16
+                                 + _hex1(buf[start + 7]))
+    return i
+
+
+def _skip_sp(buf: Ptr[uint8], off: uint64, end: uint64) -> uint64:
+    i: uint64 = off
+    while i < end and buf[i] == 32:
+        i = i + 1
+    return i
+
+
+def _parse_int(buf: Ptr[uint8], off: uint64, end: uint64) -> uint64:
+    i: uint64 = _skip_sp(buf, off, end)
+    neg: int32 = 0
+    if i < end and buf[i] == 45:                       # '-'
+        neg = 1
+        i = i + 1
+    v: int32 = 0
+    while i < end and buf[i] >= 48 and buf[i] <= 57:
+        v = v * 10 + cast[int32](buf[i]) - 48
+        i = i + 1
+    if neg != 0:
+        v = 0 - v
+    _num = v
+    return i
+
+
+# Current parsed scene colour, packed 0xRRGGBBAA for the vk2d ops.
+def _hsvk_packed() -> uint32:
+    return (cast[uint32](_col_r) << 24) | (cast[uint32](_col_g) << 16) | \
+           (cast[uint32](_col_b) << 8) | cast[uint32](_col_a)
+
+
+# ====================================================================
+# TEXT — each glyph rasterized to a coverage bitmap and stamped through the
+# vk2d coverage-mask op. Device-faithful: mirrors hamui_host _draw_text /
+# _blit_glyph_prop exactly (same SANS/bold face at 14px, same proportional
+# advance, same baseline anchoring). Text ink is opaque (coverage IS the
+# alpha), matching the compositor.
+# ====================================================================
+
+# Blit one AA glyph of `face` with pen origin x=penx on baseline `base`.
+# Returns the glyph's proportional advance (glyph_adv()).
+def _hsvk_blit_glyph_prop(face: int32, ch: uint8, penx: int32, base: int32,
+                          rgba: uint32) -> int32:
+    got: int32 = font_ttf_render(face, cast[int32](ch), HSVK_TTF_PX)
+    adv: int32 = glyph_adv()
+    if got == 1 and glyph_blank() == 0:
+        bw: int32 = glyph_bw()
+        bh: int32 = glyph_bh()
+        if bw > 0 and bh > 0 and cast[uint64](bw) * cast[uint64](bh) <= 16384:
+            x0: int32 = penx + glyph_xoff()
+            y0: int32 = base + glyph_ytop()
+            row: int32 = 0
+            while row < bh:
+                col: int32 = 0
+                while col < bw:
+                    hsvk_cov[cast[uint64](row * bw + col)] = glyph_cov(col, row)
+                    col = col + 1
+                row = row + 1
+            vk2d_raster_cov_mask(_hsvk_cbase(), cast[uint64](hsvk_w),
+                                 cast[uint64](hsvk_h), cast[uint64](&hsvk_cov[0]),
+                                 cast[int64](bw), cast[int64](bh),
+                                 cast[int64](x0), cast[int64](y0), rgba)
+    return adv
+
+
+# Legacy 8x16 monospace bitmap cell (embedded face unavailable). Opaque bits,
+# bold double-strikes +1px — mirrors hamui_host _blit_glyph.
+def _hsvk_blit_glyph_mono(ch: uint8, gx: int32, gy: int32, bold: int32,
+                          rgba: uint32):
+    row: int32 = 0
+    while row < 16:
+        bits: uint8 = hamui_host_font_row(ch, cast[uint64](row))
+        col: int32 = 0
+        while col < 8:
+            mask: uint8 = cast[uint8](128 >> col)
+            if (bits & mask) != 0:
+                vk2d_raster_fill_rect(_hsvk_cbase(), cast[uint64](hsvk_w),
+                                      cast[uint64](hsvk_h),
+                                      cast[int64](gx + col),
+                                      cast[int64](gy + row), 1, 1, rgba)
+                if bold != 0:
+                    vk2d_raster_fill_rect(_hsvk_cbase(), cast[uint64](hsvk_w),
+                                          cast[uint64](hsvk_h),
+                                          cast[int64](gx + col + 1),
+                                          cast[int64](gy + row), 1, 1, rgba)
+            col = col + 1
+        row = row + 1
+
+
+def _hsvk_draw_text(buf: Ptr[uint8], off: uint64, end: uint64, tx: int32,
+                    ty: int32, bold: int32, is_glyphs: int32) -> uint64:
+    # Opaque ink: coverage supplies the alpha, so pack alpha 0xFF.
+    ink: uint32 = (cast[uint32](_col_r) << 24) | (cast[uint32](_col_g) << 16) | \
+                  (cast[uint32](_col_b) << 8) | 255
+    i: uint64 = off
+    if i < end and buf[i] == 34:                       # opening quote
+        i = i + 1
+    if font_ttf_loaded(FACE_TT_SANS) == 1:
+        face: int32 = FACE_TT_SANS
+        if bold != 0 and font_ttf_loaded(FACE_TT_SANS_BOLD) == 1:
+            face = FACE_TT_SANS_BOLD
+        base: int32 = ty
+        if is_glyphs != 0:
+            base = ty + 12
+        cx: int32 = tx
+        while i < end and buf[i] != 34 and buf[i] != 10:
+            cx = cx + _hsvk_blit_glyph_prop(face, buf[i], cx, base, ink)
+            i = i + 1
+        if i < end and buf[i] == 34:
+            i = i + 1
+        return i
+    # Fallback: legacy 8px monospace bitmap cell.
+    cx2: int32 = tx
+    while i < end and buf[i] != 34 and buf[i] != 10:
+        _hsvk_blit_glyph_mono(buf[i], cx2, ty, bold, ink)
+        cx2 = cx2 + 8
+        i = i + 1
+    if i < end and buf[i] == 34:
+        i = i + 1
+    return i
+
+
+# ====================================================================
+# PUBLIC: begin a frame, rasterize the built scene, present.
+# ====================================================================
+
+# Set the active color-image size and clear to OPAQUE BLACK (0,0,0,255).
+# Loads the fonts. Clamped to the BSS ceiling. Call before rasterize.
+def hamsdl_vk_begin(w: int32, h: int32):
+    hamui_host_font_init()
+    browserfonts_load()             # register the embedded DejaVu TTF faces
+    ww: int32 = w
+    hh: int32 = h
+    if ww < 1:
+        ww = 1
+    if hh < 1:
+        hh = 1
+    if cast[uint64](ww) > HSVK_MAX_W:
+        ww = cast[int32](HSVK_MAX_W)
+    if cast[uint64](hh) > HSVK_MAX_H:
+        hh = cast[int32](HSVK_MAX_H)
+    hsvk_w = ww
+    hsvk_h = hh
+    # Clear the color image to opaque black via the vk2d fill op.
+    vk2d_raster_fill_rect(_hsvk_cbase(), cast[uint64](ww), cast[uint64](hh),
+                          0, 0, cast[int64](ww), cast[int64](hh), 0x000000FF)
+
+
+# Parse the scene buffer produced by the last hamscene_* build pass and paint
+# every primitive into the color image through vk2d. Returns the number of
+# primitives drawn (comments/blank lines excluded) — matches hamui_host.
+def hamsdl_vk_rasterize() -> int32:
+    buf: Ptr[uint8] = hamscene_bufptr()
+    end: uint64 = hamscene_length()
+    drawn: int32 = 0
+    i: uint64 = 0
+    while i < end:
+        ls: uint64 = i
+        le: uint64 = i
+        while le < end and buf[le] != 10:
+            le = le + 1
+        if ls < le and buf[ls] != 35:                  # skip comment/blank
+            vstart: uint64 = ls
+            vend: uint64 = ls
+            while vend < le and buf[vend] != 32:
+                vend = vend + 1
+            vlen: uint64 = vend - vstart
+            handled: int32 = _draw_verb(buf, vstart, vlen, vend, le)
+            if handled != 0:
+                drawn = drawn + 1
+        i = le + 1
+    return drawn
+
+
+def _draw_verb(buf: Ptr[uint8], vstart: uint64, vlen: uint64, vend: uint64,
+               le: uint64) -> int32:
+    cb: uint64 = _hsvk_cbase()
+    iw: uint64 = cast[uint64](hsvk_w)
+    ih: uint64 = cast[uint64](hsvk_h)
+    c0: uint8 = buf[vstart]
+    # roundrect x y w h radius #col [corners] — 'r' 'o', len 9 (before rect)
+    if vlen == 9 and c0 == 114 and buf[vstart + 1] == 111:
+        pr: uint64 = _parse_int(buf, vend, le)
+        rx: int32 = _num
+        pr = _parse_int(buf, pr, le)
+        ry: int32 = _num
+        pr = _parse_int(buf, pr, le)
+        rw: int32 = _num
+        pr = _parse_int(buf, pr, le)
+        rh: int32 = _num
+        pr = _parse_int(buf, pr, le)
+        rrad: int32 = _num
+        pr = _skip_sp(buf, pr, le)
+        pr = _parse_color(buf, pr, le)
+        cm: int32 = 15
+        cs: uint64 = _skip_sp(buf, pr, le)
+        if cs < le and buf[cs] >= 48 and buf[cs] <= 57:
+            _parse_int(buf, cs, le)
+            cm = _num
+        vk2d_raster_fill_roundrect(cb, iw, ih, cast[int64](rx), cast[int64](ry),
+                                   cast[int64](rw), cast[int64](rh),
+                                   cast[int64](rrad), cm, _hsvk_packed())
+        return 1
+    # fill (102 'f') / rect (114 'r' + 'e') — solid rectangle.
+    if (c0 == 102) or (vlen == 4 and c0 == 114 and buf[vstart + 1] == 101):
+        p: uint64 = _parse_int(buf, vend, le)
+        x: int32 = _num
+        p = _parse_int(buf, p, le)
+        y: int32 = _num
+        p = _parse_int(buf, p, le)
+        w: int32 = _num
+        p = _parse_int(buf, p, le)
+        h: int32 = _num
+        p = _skip_sp(buf, p, le)
+        _parse_color(buf, p, le)
+        _hsvk_fill(x, y, w, h)
+        return 1
+    if c0 == 115:                                       # stroke x y w h thick #col
+        p2: uint64 = _parse_int(buf, vend, le)
+        sx: int32 = _num
+        p2 = _parse_int(buf, p2, le)
+        sy: int32 = _num
+        p2 = _parse_int(buf, p2, le)
+        sw: int32 = _num
+        p2 = _parse_int(buf, p2, le)
+        sh: int32 = _num
+        p2 = _parse_int(buf, p2, le)
+        st: int32 = _num
+        p2 = _skip_sp(buf, p2, le)
+        _parse_color(buf, p2, le)
+        _hsvk_fill(sx, sy, sw, st)                       # top
+        _hsvk_fill(sx, sy + sh - st, sw, st)             # bottom
+        _hsvk_fill(sx, sy, st, sh)                       # left
+        _hsvk_fill(sx + sw - st, sy, st, sh)             # right
+        return 1
+    if c0 == 108:                                       # line x1 y1 x2 y2 thick #col
+        p3: uint64 = _parse_int(buf, vend, le)
+        lx1: int32 = _num
+        p3 = _parse_int(buf, p3, le)
+        ly1: int32 = _num
+        p3 = _parse_int(buf, p3, le)
+        lx2: int32 = _num
+        p3 = _parse_int(buf, p3, le)
+        ly2: int32 = _num
+        p3 = _parse_int(buf, p3, le)
+        lt: int32 = _num
+        p3 = _skip_sp(buf, p3, le)
+        _parse_color(buf, p3, le)
+        vk2d_raster_draw_line(cb, iw, ih, cast[int64](lx1), cast[int64](ly1),
+                              cast[int64](lx2), cast[int64](ly2),
+                              cast[int64](lt), _hsvk_packed())
+        return 1
+    if c0 == 116 or c0 == 103:                          # text / glyphs x y "s" #col [b]
+        p4: uint64 = _parse_int(buf, vend, le)
+        tx: int32 = _num
+        p4 = _parse_int(buf, p4, le)
+        ty: int32 = _num
+        p4 = _skip_sp(buf, p4, le)
+        qs: uint64 = p4
+        qi: uint64 = qs
+        if qi < le and buf[qi] == 34:
+            qi = qi + 1
+        while qi < le and buf[qi] != 34:
+            qi = qi + 1
+        cp: uint64 = _skip_sp(buf, qi + 1, le)
+        _parse_color(buf, cp, le)
+        bp: uint64 = cp
+        while bp < le and buf[bp] != 32 and buf[bp] != 10:
+            bp = bp + 1
+        bp = _skip_sp(buf, bp, le)
+        bold: int32 = 0
+        if bp < le and buf[bp] == 98:
+            bold = 1
+        is_glyphs: int32 = 0
+        if c0 == 103:
+            is_glyphs = 1
+        _hsvk_draw_text(buf, qs, le, tx, ty, bold, is_glyphs)
+        return 1
+    # image x y w h NAME (#128) — 'i' 'm'
+    if vlen == 5 and c0 == 105 and buf[vstart + 1] == 109:
+        p5: uint64 = _parse_int(buf, vend, le)
+        ix: int32 = _num
+        p5 = _parse_int(buf, p5, le)
+        iy: int32 = _num
+        p5 = _parse_int(buf, p5, le)
+        iiw: int32 = _num
+        p5 = _parse_int(buf, p5, le)
+        iih: int32 = _num
+        ns: uint64 = _skip_sp(buf, p5, le)
+        ne: uint64 = ns
+        while ne < le and buf[ne] != 32 and buf[ne] != 10:
+            ne = ne + 1
+        if ns >= ne:
+            return 0
+        slot: int32 = _hsvk_img_find(buf, ns, ne)
+        if slot < 0:
+            return 1                                     # unknown name: no-op
+        u: uint64 = cast[uint64](slot)
+        vk2d_raster_blit(cb, iw, ih, hsvk_img_ptr[u],
+                         cast[uint64](hsvk_img_w[u]), cast[uint64](hsvk_img_h[u]),
+                         cast[int64](ix), cast[int64](iy),
+                         cast[int64](iiw), cast[int64](iih), 0, 0, 0, 0)
+        return 1
+    return 0
+
+
+# Solid rectangle in the current parsed colour. Opaque -> the plain vk2d fill
+# op (mapping-table's opaque path); translucent -> the source-over alpha op.
+# Both are byte-identical to hamui_host _fill_rect_a for their alpha.
+def _hsvk_fill(x: int32, y: int32, w: int32, h: int32):
+    if _col_a == 0:
+        return
+    if _col_a >= 255:
+        vk2d_raster_fill_rect(_hsvk_cbase(), cast[uint64](hsvk_w),
+                              cast[uint64](hsvk_h), cast[int64](x), cast[int64](y),
+                              cast[int64](w), cast[int64](h), _hsvk_packed())
+    else:
+        vk2d_raster_fill_rect_alpha(_hsvk_cbase(), cast[uint64](hsvk_w),
+                                    cast[uint64](hsvk_h), cast[int64](x),
+                                    cast[int64](y), cast[int64](w),
+                                    cast[int64](h), _hsvk_packed())
+
+
+# ====================================================================
+# PRESENT — flatten the RGBA color image into the RGB present buffer for the
+# PPM writer, and build the P6 header. (RGBA -> RGB, dropping the alpha; the
+# color target is an opaque compositing surface.)
+# ====================================================================
+def hamsdl_vk_fb_rgb_ptr() -> Ptr[uint8]:
+    n: uint64 = cast[uint64](hsvk_w) * cast[uint64](hsvk_h)
+    src: uint64 = _hsvk_cbase()
+    i: uint64 = 0
+    while i < n:
+        so: uint64 = src + i * 4
+        dofs: uint64 = i * 3
+        hsvk_rgb[dofs] = cast[Ptr[uint8]](so)[0]
+        hsvk_rgb[dofs + 1] = cast[Ptr[uint8]](so + 1)[0]
+        hsvk_rgb[dofs + 2] = cast[Ptr[uint8]](so + 2)[0]
+        i = i + 1
+    return &hsvk_rgb[0]
+
+
+def hamsdl_vk_fb_rgb_bytes() -> uint64:
+    return cast[uint64](hsvk_w) * cast[uint64](hsvk_h) * 3
+
+
+def _dec(v: int32, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    x: uint32 = cast[uint32](v)
+    digs: Array[16, uint8]
+    n: uint64 = 0
+    while x > 0:
+        digs[n] = cast[uint8](x % 10) + 48
+        x = x / 10
+        n = n + 1
+    w: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digs[n]
+        i = i + 1
+    return w
+
+
+# Build a binary PPM (P6) header "P6\n<w> <h>\n255\n" into `out`; returns len.
+def hamsdl_vk_ppm_header(out: Ptr[uint8]) -> uint64:
+    p: uint64 = 0
+    out[p] = 80                                         # 'P'
+    p = p + 1
+    out[p] = 54                                         # '6'
+    p = p + 1
+    out[p] = 10
+    p = p + 1
+    p = p + _dec(hsvk_w, &out[p])
+    out[p] = 32
+    p = p + 1
+    p = p + _dec(hsvk_h, &out[p])
+    out[p] = 10
+    p = p + 1
+    out[p] = 50                                         # '2'
+    p = p + 1
+    out[p] = 53                                         # '5'
+    p = p + 1
+    out[p] = 53                                         # '5'
+    p = p + 1
+    out[p] = 10
+    p = p + 1
+    return p
