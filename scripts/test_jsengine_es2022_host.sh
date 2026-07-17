@@ -72,6 +72,18 @@ assert oc_num       'var o={[1+1]:"two"};console.log(o[2])'                     
 assert om_kwkey     'var o={if:1,default:2};console.log(o.if,o.default)'                               '1 2'
 assert om_mixed     'var k="c";var o={a:1,b(){return 2},[k]:3};console.log(o.a,o.b(),o.c)'            '1 2 3'
 
+# ---- object-literal getters/setters + Object.defineProperty accessors ----
+assert acc_getter   'var o={get x(){return 42}};console.log(o.x)'                                      '42'
+assert acc_setter   'var o={_v:0,set x(v){this._v=v*2}};o.x=5;console.log(o._v)'                       '10'
+assert acc_getset   'var o={_v:1,get x(){return this._v},set x(v){this._v=v}};o.x=9;console.log(o.x)'  '9'
+assert acc_this     'var o={n:10,get d(){return this.n*2}};console.log(o.d)'                           '20'
+assert acc_getkey   'var o={get:1,set:2};console.log(o.get,o.set)'                                     '1 2'
+assert acc_getmeth  'var o={get(){return 5}};console.log(o.get())'                                     '5'
+assert acc_dp_get   'var o={};Object.defineProperty(o,"x",{get:function(){return 7}});console.log(o.x)' '7'
+assert acc_dp_set   'var o={_v:0};Object.defineProperty(o,"x",{set:function(v){this._v=v+1}});o.x=4;console.log(o._v)' '5'
+assert acc_computed 'var k="y";var o={get [k](){return 8}};console.log(o.y)'                           '8'
+assert acc_nosetter 'var o={get x(){return 3}};o.x=99;console.log(o.x)'                                '3'
+
 if [ "$fail" -eq 0 ]; then
     echo "[js-es2022] RESULT: PASS"
     exit 0
