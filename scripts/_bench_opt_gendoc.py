@@ -134,15 +134,26 @@ def main():
                    f"{geomean[1]}× | {geomean[2]}× | |")
     out.append("")
     if geomean:
+        # A ratio < 1.0 means Adder-ON is actually FASTER than that C build, so
+        # calling it "N× slower" would be nonsensical. Word it by direction.
+        def phrase(ratio_str):
+            try:
+                r = float(ratio_str)
+            except ValueError:
+                return f"{ratio_str}× slower"
+            if r < 1.0:
+                return f"{1.0 / r:.2f}× faster"
+            return f"{ratio_str}× slower"
+
         out.append("## Headline")
         out.append("")
         out.append(f"- **Optimizer ON vs OFF:** the `ADDER_OPT=1` 6-pass "
                    f"optimizer is **{geomean[0]}× faster** than the baseline "
                    f"backend (geomean over the correct kernels).")
-        out.append(f"- **Adder-ON vs C -O2:** Adder-ON is **{geomean[1]}× "
-                   f"slower** than gcc -O2 (geomean).")
-        out.append(f"- **Adder-ON vs C -O0:** Adder-ON is **{geomean[2]}× "
-                   f"slower** than gcc -O0 (geomean).")
+        out.append(f"- **Adder-ON vs C -O2:** Adder-ON is **{phrase(geomean[1])}"
+                   f"** than gcc -O2 (geomean).")
+        out.append(f"- **Adder-ON vs C -O0:** Adder-ON is **{phrase(geomean[2])}"
+                   f"** than gcc -O0 (geomean).")
         out.append("")
     if miscompiles:
         out.append("## Correctness finding — `ADDER_OPT=1` miscompiles")

@@ -58,8 +58,15 @@ WORK = REPO_ROOT / "build" / "bench_opt"
 PRELUDE = (SRC / "_prelude.ad").read_text()
 
 # Kernel order = the suite. Each must have <name>.ad and <name>.c.
-KERNELS = ["matmul", "sieve", "licm", "dcecopy", "fib", "collatz", "mandel",
-           "saxpy"]  # saxpy added 2026-06-28 (perf_2x_roadmap.md): honest
+KERNELS = ["matmul", "sieve", "licm", "dcecopy", "tak", "collatz", "mandel",
+           "saxpy"]  # tak (Takeuchi) REPLACED fib 2026-07-17: the recursion->
+                     # iteration lever (54969cda) exact-matches fib's linear
+                     # two-term recurrence and floored it to the process-spawn
+                     # floor, polluting the geomean into a false "faster than C"
+                     # headline. tak is genuine irreducible tree recursion (3
+                     # args) that gcc does NOT transform and no single-shape
+                     # matcher can game — an HONEST call-overhead metric.
+                     # saxpy added 2026-06-28 (perf_2x_roadmap.md): honest
                      # array-update reduction, NO hand-hoisted scalar accumulator
                      # (matmul hand-hoists its dot-product accumulator into `s`,
                      # masking the accumulator-regalloc lever; saxpy does not).
