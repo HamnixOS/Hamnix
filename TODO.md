@@ -49,6 +49,21 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
 - [x] Small: `test_hambrowse_float.sh` stale SEG regex fixed (`0a0ba1dd`); + decimal
   length regression gate added.
 
+### Queued fronts (USER 2026-07-17) — dispatch on trigger, protect timing-sensitive slots
+- [ ] **hamsh pygame-style bindings** — expose the hamSDL API (`lib/hamsdl.ad`:
+  sdl_init/draw/blit/poll_event) INTO the hamsh script language so games are written
+  in the shell, not just Adder. TRIGGER: dispatch once the hamsh host dual-target lands
+  (host-verify the bindings through that seam, no QEMU). Adder core + host renderer
+  (`hamsdl_host.ad`/`hamgame_host.ad`) already exist.
+- [ ] **Vulkan track: 3D + acceleration prep** — the SW spine `lib/vk/{vk_core,vk_raster,
+  vk_selftest,vk_window_demo}.ad` ALREADY does depth-buffered triangle raster (Phase 0,
+  GPU #181). Next increment: a VERTEX-TRANSFORM stage (mat4 MVP + perspective projection
+  + perspective-correct interp), indexed meshes (`vkCmdDrawIndexed`), a rotating-cube 3D
+  demo+gate, and scaffold the **virtio-gpu backend behind the SAME VK API** (`drivers/
+  video/virtio_gpu.ad`) so real acceleration slots in later. TRIGGER: dispatch when the
+  P1 (bench-timing) OR scheduler (-smp2-timing) agent frees — a build/QEMU-heavy Vulkan
+  agent would corrupt their timing measurements if run concurrently.
+
 ### New fronts green-lit by USER (2026-07-17)
 - [~] **Scheduler fairness (D3 fix) — USER: "scheduler work is fine."** Fix the `-smp 2`
   starvation where a fresh foreground fork/exec is blocked by the runlevel-5 DE bring-up
