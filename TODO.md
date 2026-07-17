@@ -104,9 +104,11 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
   LOADS landed (`8f9fd17b`, 1.86→1.69×). Fused indexed STORES built + VERIFIED-CORRECT (objdiff
   0/290, fuzzer 500/0) but **DO-NOT-MERGE: alignment-shadowed** — real licm/saxpy uop wins but
   dcecopy +65% (#108 DSB lottery) → geomean worse (1.71→1.79). Patch saved for post-#108 re-enable.
-  **PEEPHOLE FRONTIER EXHAUSTED at ~1.69×.** The last ~0.7× to 1.0× needs the XL **P1-IR
-  statement-machine rewrite** OR **fib recursion→iteration** (algorithmic) — a multi-session
-  big-bang, NOT tick-sized. ⚠ SURFACE TO USER before committing to it (1.69× = ~59% of C).
+  **PEEPHOLE FRONTIER EXHAUSTED at ~1.69×.** USER GREEN-LIT (2026-07-17) both big-bangs, IN
+  PARALLEL: [~] **XL P1-IR statement-machine rewrite** (`codegen.ad`, route statements
+  destination-passing to kill the stack-machine plumbing — multi-session, incremental,
+  fuzzer-gated) + [~] **fib recursion→iteration** (`opt.ad`, tail/linear/tree recursion → loop).
+  Both --opt-gated (flag-OFF byte-identical to seed), objdiff+fuzzer+checksum gated. Agents in flight.
 
 ---
 
