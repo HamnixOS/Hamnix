@@ -146,6 +146,63 @@ entirely — with the vk2d call sites and the byte-exact golden pixels unchanged
 The value delivered here is architectural (the DE is now one vk client sharing
 the hamSDL/hamGame spine from Phase B), not a CPU-speed win.
 
+## AFTER (optimized) — vk2d CPU inner-loop optimization
+
+The Phase-C reroute overhead was *not* inherent to becoming a vk client — it
+was the `vk_2d.ad` inner loops doing a per-pixel clipped, byte-at-a-time store
+where the old private rasterizers could not (they shared the same scalar shape).
+Optimizing **only** `lib/vk/vk_2d.ad` (no call-site or format change; output
+proven byte-identical) recovers the whole regression **and** beats the original
+pre-vk baseline:
+
+1. **Clip hoisted to per-primitive.** Every `fill_rect` / `fill_rect_alpha` /
+   `blit` / `cov_mask` (glyph) / `roundrect` clamps its rectangle to the image
+   bounds **once**, so the inner pixel loop has **no** per-pixel bounds branch
+   (was four compare-branches per pixel). This is the single biggest win — it
+   is what more-than-doubled CLEAR in the regression.
+2. **Opaque packed-word fast path.** A fully-opaque fill (the whole-screen
+   CLEAR, wallpaper, window bodies, opaque `fill_rect_alpha`) now writes one
+   packed little-endian RGBA `uint32` per pixel (`r|g<<8|b<<16|0xFF<<24`)
+   instead of four byte stores — byte-identical bytes, ~4× fewer stores. The
+   CLEAR is now a tight packed-word row fill of the whole image.
+3. **Hoisted-constant translucent blend.** The source-over fill lifts the
+   constant `src*a` terms out of the inner loop (only the dest load varies) and
+   drops the per-pixel function call.
+
+### AFTER-optimized numbers (same host, i7-8086K @ 4 GHz; load ~1.0–1.3; 100 iters, 3 runs, min-ms variance <0.5%)
+
+| Scene   | ORIG baseline (RGB) | Phase-C REGRESSED (RGBA) | **AFTER-optimized (RGBA)** |
+|---------|--------------------:|-------------------------:|---------------------------:|
+| CLEAR   |                4.41 |                     9.57 |                   **1.76** |
+| **FULL**|           **24.32** |                **32.74** |                  **9.14**  |
+| FILLS   |               21.78 |                    29.59 |                   **6.32** |
+| GLYPHS  |                6.59 |                    12.23 |                   **4.16** |
+| IMAGE   |                4.79 |                    10.00 |                   **2.15** |
+| full composite-only | 19.91       |                    23.18 |                   **7.37** |
+
+**Result: the ~8.4 ms Phase-C regression is FULLY recovered — and then some.**
+FULL went 32.74 → **9.14 ms**, i.e. the entire +8.4 ms regression plus ~15 ms
+*below* the original 24.32 ms pre-vk baseline (a 3.6× speedup vs the regressed
+path, 2.7× vs the original private rasterizer). CLEAR (4.41→9.57→**1.76**) shows
+the packed-word whole-image fill; FILLS (21.78→29.59→**6.32**) the hoisted clip
++ opaque word store. Pixels are **byte-identical**: the representative 58-prim
+bench frame (`BENCH_DE_PPM=1`) `cmp`s equal before vs after, the vk2d 64×64
+render `cmp`s equal, and all five DE host gates + the seven game/hamSDL host
+gates (`test_vk_2d_host`, `test_ham2048_host`, `test_hamsnake_host`,
+`test_hamchess_host`, `test_hamsdl_host`, `test_hamgame_host`,
+`test_hamsh_pygame_host`) PASS unchanged. Because vk2d is the shared spine, the
+same win lands on every hamSDL game for free.
+
+**Residual gap (the RGBA-format cost only a GPU erases).** The color target is
+still `VK_FORMAT_R8G8B8A8_UNORM` (4 bytes/px vs the old RGB 3 bytes/px) — that
+is the vk image contract and is unchanged here. The optimization neutralizes it
+on the *opaque* path (a packed 32-bit store moves 4 bytes in one instruction,
+so 4-vs-3-byte no longer costs) but the *translucent* blend and glyph paths
+still touch the 4th channel; that irreducible ~fraction, plus the RGBA→RGB
+flatten (outside the timed loop), is the sliver a GPU backend (Phase D:
+`vkCmdClearColorImage` / render-pass load-op + bulk fills off the scalar CPU)
+removes entirely. But on the CPU path the regression is gone.
+
 ### Kernel compositor (`sys/src/9/port/devwsys.ad`) — deferred to Phase C.2
 
 Only the **host** compositor was rerouted this round (it is what the bench +
