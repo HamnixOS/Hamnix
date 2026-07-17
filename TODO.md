@@ -66,9 +66,12 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
   - [~] **Phase B — route hamSDL through vk** (sdl_fill_rect/blit/draw_text → vk2d ops;
     games become vk clients). IN FLIGHT. Impl-only change; sdl_* API stable so pygame + games
     keep working. Verify: all game host gates still render identical PNGs.
-  - [~] **DE-speed baseline (USER)** — bench the DE compositor NOW (pre-vk) so Phase C's
-    DE-through-vk can be proven as-fast-or-faster. `scripts/bench_de_compositor.sh` +
-    `docs/de_perf_baseline.md`. IN FLIGHT (measurement-only, host).
+  - [x] **DE-speed baseline (USER)** DONE (`b3b6e710`): `scripts/bench_de_compositor.sh` +
+    `docs/de_perf_baseline.md`. BEFORE = **24.3 ms/frame** @1024×768 (58 prims), fills
+    dominate **17.3 ms (~87%)**, glyphs 2.1, image 0.3, fb-clear 4.4; variance <1.5%. Phase C
+    target: collapse the fill cost. Re-run the SAME bench after DE→vk for the comparison.
+    Caveat: host metric = compositing-kernel math only; on-device frame-timing also needed
+    for a true end-to-end claim (noted in the doc).
   - [ ] **Phase C — route the DE compositor through vk** (hamui_host/devwsys composite
     window scenes via vk present/blits). Biggest/riskiest (touches kernel). After B.
   - [ ] **Phase D (parallel/later) — virtio-gpu / silicon backend behind the SAME vk API**
