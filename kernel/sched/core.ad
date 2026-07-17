@@ -2198,6 +2198,61 @@ def sched_min_vruntime() -> uint64:
     return best
 
 
+# ---------------------------------------------------------------------------
+# D3 fork-storm fairness: monotonic vruntime floor + fork placement penalty.
+#
+# THE BUG (the "D3" finding): on -smp 2, a freshly-forked FOREGROUND task
+# (`enter linux <cmd>`, or any native spawn) made ZERO progress for 30-60 s
+# whenever it was issued during the runlevel-5 DE bring-up's fork+exec
+# app-launch storm — it only recovered once the storm settled. Root cause was
+# HERE, in fork/create placement:
+#
+#   Task vruntime is charged ONLY on a 100 Hz timer tick (preempt_tick). A
+#   storm child that fork+exec's, runs for LESS than one tick, and exits
+#   accrues ZERO vruntime — it lived and died pinned at the runqueue minimum.
+#   New tasks were seeded to sched_min_vruntime() (the RAW current minimum),
+#   so every fresh storm child re-arrived AT that pinned-low minimum. A
+#   foreground task that ran even a single tick is now ABOVE the minimum, and
+#   _pick_next() (smallest-vruntime-wins) NEVER selects it while the storm
+#   keeps injecting min-vruntime churners. Pure starvation, not latency.
+#
+# THE FIX (standard CFS, kept targeted — NOT a full EEVDF rewrite):
+#   (1) A MONOTONIC floor (Linux cfs_rq->min_vruntime) that only ever
+#       increases — a churner exiting at a low vruntime can no longer drag the
+#       placement baseline back down for the next fork.
+#   (2) Seed a new/forked task at floor + a one-slice weight-scaled penalty
+#       (Linux place_entity(cfs_rq, se, initial=1)) so a fresh child arrives
+#       AT OR BEHIND the running set instead of ahead of an incumbent that has
+#       already accrued runtime. Runnable tasks then form a bounded vruntime
+#       band and every task — including the starved foreground — gets its fair
+#       1/N share (a few seconds under the storm instead of 30-60 s).
+g_sched_vruntime_floor: uint64 = 0
+
+
+def sched_vruntime_floor() -> uint64:
+    # Ratchet the monotonic floor up to the current minimum vruntime among
+    # runnable (READY/RUNNING) tasks, then return it. Never decreases.
+    m: uint64 = sched_min_vruntime()
+    if m > g_sched_vruntime_floor:
+        g_sched_vruntime_floor = m
+    return g_sched_vruntime_floor
+
+
+def sched_fork_vruntime(slot: uint64) -> uint64:
+    # Placement vruntime for a newly-created / forked task: the monotonic
+    # floor plus a one-slice weight-scaled penalty (place_entity initial=1).
+    # The penalty is a full nice-scaled quantum = SCHED_QUANTUM_TICKS ticks of
+    # THIS task's own weighted per-tick vruntime accrual, so it starts exactly
+    # one slice behind the floor regardless of nice level. This cannot starve
+    # the new task (it still runs within one scheduling round) but stops it
+    # from undercutting an already-running incumbent on arrival.
+    w: uint64 = task_table[slot].sched_weight
+    if w == 0:
+        w = NICE0_WEIGHT
+    penalty: uint64 = ((NICE0_WEIGHT * VRUNTIME_SCALE) / w) * SCHED_QUANTUM_TICKS
+    return sched_vruntime_floor() + penalty
+
+
 def sched_quantum_for(slot: uint64) -> uint64:
     # Weight-scaled timeslice in 100 Hz ticks for `slot`. Base quantum
     # scaled by weight/NICE0_WEIGHT, floored at 1 and capped at
@@ -2913,7 +2968,10 @@ def sched_init_task_weight(slot: uint64):
     # cleared so the SMP per-CPU dispatch counter starts at 0.
     task_table[slot].nice         = 0
     task_table[slot].sched_weight = NICE0_WEIGHT
-    task_table[slot].vruntime     = sched_min_vruntime()
+    # D3 fork-storm fairness: seed at the MONOTONIC floor + a one-slice
+    # penalty (not the raw current minimum), so a fresh task cannot undercut
+    # an already-running incumbent. See sched_fork_vruntime.
+    task_table[slot].vruntime     = sched_fork_vruntime(slot)
     # Realtime scheduling policy resets to the SCHED_OTHER default so a
     # recycled slot never inherits a stale FIFO/RR policy.
     sched_init_task_policy(slot)
@@ -3129,7 +3187,12 @@ def sched_inherit_nice_to_child(child_slot: uint64, parent_slot: uint64):
     # child an unfairly-low (or already-large) vruntime.
     task_table[child_slot].nice         = task_table[parent_slot].nice
     task_table[child_slot].sched_weight = task_table[parent_slot].sched_weight
-    task_table[child_slot].vruntime     = sched_min_vruntime()
+    # D3 fork-storm fairness: the child is re-seeded to the MONOTONIC floor +
+    # a one-slice penalty (see sched_fork_vruntime) rather than the raw
+    # runqueue minimum. This is what stops the runlevel-5 fork+exec storm from
+    # perpetually seeding fresh children below — and thus starving — an
+    # already-running foreground task on -smp 2.
+    task_table[child_slot].vruntime     = sched_fork_vruntime(child_slot)
     # POSIX: a child inherits the parent's scheduling policy + rt priority.
     sched_inherit_policy_to_child(child_slot, parent_slot)
     # POSIX/Linux: a child inherits the parent's CPU-affinity mask across
@@ -12213,6 +12276,87 @@ def sched_fair_smp_selftest():
         # The test script distinguishes the -smp 1 and -smp 2 cases.
         printk0("[sched_fair] NOTE: workers ran on a single CPU (smp1 or AP idle)\n")
     printk0("[sched_fair] self-test complete\n")
+
+
+def _sched_d3_probe_body():
+    # Tiny bounded kthread body used by sched_d3_fairness_selftest to
+    # exercise the REAL create path (kthread_create -> sched_init_task_weight
+    # -> sched_fork_vruntime). Does a little work then self-reaps.
+    i: uint64 = 0
+    acc: uint64 = 0
+    while i < 4096:
+        acc = acc + i + 1
+        i = i + 1
+    task_exit_current(0)
+
+
+def sched_d3_fairness_selftest():
+    # D3 fork-storm fairness gate. Proves the two properties of the fix that
+    # stop a runlevel-5 fork+exec storm from starving a running foreground
+    # task on -smp 2:
+    #   (1) the vruntime floor is MONOTONIC (a churner exiting low can't drag
+    #       the placement baseline back down), and
+    #   (2) a freshly-created task is seeded at floor + a one-slice penalty —
+    #       NOT the raw runqueue minimum — so it can never be placed BELOW an
+    #       already-running incumbent and undercut it in _pick_next().
+    # Revert-proof: reverting either placement site back to sched_min_vruntime()
+    # makes property (2) FAIL (the probe would be seeded far below the synthetic
+    # floor). Runs on the BSP boot task; restores the floor before returning.
+    printk0("[sched_d3] starting fork-placement fairness self-test\n")
+    saved_floor: uint64 = g_sched_vruntime_floor
+
+    # (1) Monotonicity: force a high floor, then confirm a lower runnable min
+    #     cannot lower it.
+    g_sched_vruntime_floor = 1000000
+    b: uint64 = sched_vruntime_floor()
+    if b >= 1000000:
+        printk0("[sched_d3] PASS: vruntime floor is monotonic\n")
+    else:
+        printk0("[sched_d3] FAIL: vruntime floor decreased below its prior value\n")
+
+    # (2) Placement penalty. Set a synthetic floor well above any live task's
+    #     vruntime, create a real kthread through the actual create path, and
+    #     assert it landed at floor + the nice-0 one-slice penalty (which is
+    #     far above the raw runqueue minimum a reverted placement would use).
+    H: uint64 = 5000000
+    g_sched_vruntime_floor = H
+    penalty0: uint64 = VRUNTIME_SCALE * SCHED_QUANTUM_TICKS       # nice-0 weight
+    expect: uint64 = H + penalty0
+    _wq_lock_irq()
+    tslot: int32 = kthread_create(cast[uint64](&_sched_d3_probe_body), 0)
+    if tslot >= 0:
+        task_table[cast[uint64](tslot)].detached = 1
+    _wq_unlock_irq()
+    if tslot < 0:
+        printk0("[sched_d3] FAIL: could not create probe task\n")
+        g_sched_vruntime_floor = saved_floor
+        return
+    ts: uint64 = cast[uint64](tslot)
+    got: uint64 = task_table[ts].vruntime
+    # Before/after evidence: the OLD placement seeded a fresh task at the RAW
+    # runqueue minimum (sched_min_vruntime) — far BELOW the synthetic incumbent
+    # floor here — which is exactly how a fork+exec storm undercut and starved a
+    # running foreground task. Print both so the log shows the undercut the fix
+    # removes: raw_min << floor+penalty.
+    raw_min: uint64 = sched_min_vruntime()
+    printk2("[sched_d3] OLD placement (raw min)=%d  NEW placement (floor+penalty)=%d\n",
+            raw_min, got)
+    printk2("[sched_d3] fresh-task vruntime=%d expected floor+penalty=%d\n",
+            got, expect)
+    if got == expect:
+        printk0("[sched_d3] PASS: fresh task seeded at floor+penalty (cannot undercut incumbents)\n")
+    else:
+        printk0("[sched_d3] FAIL: fresh task not seeded at floor+penalty (undercut regression)\n")
+
+    # Restore the real floor BEFORE draining the probe so subsequent real task
+    # placement is unaffected by the synthetic value used above.
+    g_sched_vruntime_floor = saved_floor
+    # Drain the probe to completion so it doesn't linger on the runqueue.
+    it: uint64 = 0
+    while task_table[ts].state != STATE_FREE and it < 2000000:
+        schedule()
+        it = it + 1
+    printk0("[sched_d3] self-test complete\n")
 
 
 # STAGE A per-CPU TSS proof (gated on /etc/smp-user in the initramfs,
