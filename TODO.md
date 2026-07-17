@@ -18,28 +18,31 @@ Markers: `[ ]` open · `[~]` in flight.
 
 ## ⚠ On-device QA bug list (2026-07-17, user testing the shipped image)
 
-Daily-driver blockers found by driving the OVMF image. Dispatched as disjoint
-worktree agents; verify on the shipped image / host render before merge.
+Daily-driver blockers found by driving the OVMF image. Verified by looking at the
+render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
 
-- [~] **Browser: search input renders as `[_______]` not a real box, + JS error on search.**
-  `<input>` (esp. search) draws as an underscored text run rather than a rendered
-  box; submitting a Google search throws a JS error. Engine: `lib/htmlengine.ad`
-  `_emit_input` (~5690) + forms submit path. (Sequence after css-backgrounds round.)
-- [ ] **Browser: add a Firefox/Chrome-style search box IN ADDITION to the URL bar;
-  default engine Google.** Chrome/shell: `user/hambrowse*.ad`.
-- [~] **Middle-mouse X11 primary-selection: highlight-to-select + middle-click paste
-  not functional** (Ctrl-C/Ctrl-V work). Window system + `lib/hamscene.ad`/wsys.
-- [~] **Audio: guest playback does not reach host speakers.** `lib/hamaudiocore.ad`
-  + kernel HDA + QEMU `-audiodev` wiring in the boot/run scripts.
-- [~] **Games menu: wire existing `hamsnake` + `hamgamedemo` (SDL game) next to 2048;
-  add a new Snake polish + a Chess game.** `etc/hamde/apps/*.desktop` + DE app menu;
-  games already exist as `user/hamsnake.ad`, `user/hamgamedemo.ad`.
-- [ ] **Screenshot app "select area" draws selection on a BLACK screen** instead of
-  the live desktop. `lib/hamui_host.ad` / screenshot capture ordering.
-- [ ] **Apps don't resize (control center): only correct maximized in default state,
-  huge black area otherwise.** hamUI resize: `lib/hamui.ad` + `lib/hamctlcore.ad`.
-- [ ] **`enter linux` (sh) takes ~30s to enter (fast once in).** Linux-namespace
-  bring-up latency: `user/hamsh.ad` / `user/live_distro_up.ad` ns-entry path.
+- [x] Browser `<input>` renders as a real bordered box (was `[___]` underscores);
+  Google search box added beside the URL bar (default engine Google). `66176e7f`
+- [x] Browser Google JS error partly fixed (`new Image()` stub). Remaining Google
+  homepage TypeErrors + `eval` parse gap = broad ES/DOM completeness (own the search
+  box → results-page path instead; do NOT boil the ocean).
+- [~] **Middle-mouse PRIMARY selection: make it SYSTEM-WIDE + fix editor/Notes.**
+  URL bar + independence gate shipped (`0f43e98d`), but user reports select/paste
+  still fails in editor/Notes on-device (prior host unit test passed — live event
+  path differs). Follow-up agent in flight: wire select→PRIMARY + button-2→paste
+  into shared text widgets (`lib/hamtextbox.ad`/`lib/htermsel.ad`) + fix button-2
+  event delivery through `devwsys.ad`; verify the REAL event loop, not a buffer unit.
+- [x] Audio prefers ALSA host backend. `e07b1fb4` — USER to confirm they hear it.
+- [x] Games: Snake + Chess new apps + Coin Dash wired into Games menu. `c143b446`
+  (chess v1 lacks castling/en-passant/under-promotion — documented.)
+- [x] Screenshot "select area" dims the LIVE desktop, not black. `03173344`
+- [x] Control Center relayouts on resize (black gutter gone). `c29297f2`
+  Latent same-bug follow-up: `user/hammonscene.ad` (sysmon) discards resize events.
+- [D] **`enter linux` ~30s is DIAGNOSIS-ONLY, not a latency bug** — it's `-smp 2`
+  DE-bring-up starvation (self-clears), the D3 SMP-fairness problem. Fix lives in
+  the scheduler/DE-bring-up, NOT hamsh. See memory `project_enter_linux_slow_is_d3`.
+- [ ] Small: `test_hambrowse_float.sh` red on main — stale SEG regex omits the `s0`
+  strike field HEAD now emits; fix the regex.
 
 ---
 
