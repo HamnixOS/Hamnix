@@ -677,6 +677,12 @@ DESKTOP_CORE_BINS = (
 DESKTOP_APP_PACKAGES: list[dict] = [
     {"name": "hamnix-ham2048", "bins": ("ham2048scene",),
      "summary": "2048 sliding-tile puzzle game"},
+    {"name": "hamnix-hamsnake", "bins": ("hamsnakescene",),
+     "summary": "Snake arcade game"},
+    {"name": "hamnix-hamchess", "bins": ("hamchessscene",),
+     "summary": "two-player hot-seat chess"},
+    {"name": "hamnix-hamgamedemo", "bins": ("hamgamedemo",),
+     "summary": "Coin Dash (hamGame demo game)"},
     {"name": "hamnix-hamterm", "bins": ("hamterm", "hamtermscene"),
      "summary": "terminal emulator"},
     {"name": "hamnix-hamfiles", "bins": ("hamfm", "hamfmscene"),

@@ -178,6 +178,9 @@ if uncovered:
 # from the apps, and the hamnix-desktop metapackage pulls them all in.
 EXPECTED_APP_PKGS = {
     "hamnix-ham2048": "ham2048scene",
+    "hamnix-hamsnake": "hamsnakescene",
+    "hamnix-hamchess": "hamchessscene",
+    "hamnix-hamgamedemo": "hamgamedemo",
     "hamnix-hamterm": "hamterm",
     "hamnix-hamfiles": "hamfm",
     "hamnix-hamcalc": "hamcalc",

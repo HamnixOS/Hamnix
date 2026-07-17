@@ -292,6 +292,8 @@ build_adder_user hamfmscene           # scene-file DE file manager: directory li
 build_adder_user hamcalcscene         # scene-file DE calculator: button grid + display, click->compute (via lib/hamui hamscene_*)
 build_adder_user hameditscene         # scene-file DE text editor: scrollable text area + cursor, /keys input, Ctrl-S saves
 build_adder_user ham2048scene         # scene-file DE 2048 game: coloured 4x4 tile board, WASD/arrow keys + on-screen controls (scene port of ham2048; lib/hamui hamscene_*)
+build_adder_user hamsnakescene        # scene-file DE Snake game: 16x16 board, WASD/arrow keys + on-screen controls, food/grow/collision/score (lib/hamsnakecore, dual-target; host gate: scripts/test_hamsnake_host.sh)
+build_adder_user hamchessscene        # scene-file DE Chess game: 8x8 board, full legal move gen + check/checkmate/stalemate, click-to-move hot-seat two-player (lib/hamchesscore, dual-target; host gate: scripts/test_hamchess_host.sh)
 build_adder_user hamimgscene          # scene-file DE image demo (#128): synthesizes an RGBA image, uploads via draw/ctl 'I' verb, draws it with the scene `image` verb (compositor blits+scales)
 build_adder_user sdlpong              # hamSDL demo game: one-paddle bounce built entirely on the lib/hamsdl.ad game API (drawing + events + timing); dual-target (host gate: scripts/test_hamsdl_host.sh)
 build_adder_user hamgamedemo          # hamGame demo "Coin Dash": pygame-shaped Surface/Sprite/Rect/Clock over hamSDL (lib/hamgame.ad + lib/hamgame_dev.ad; shared game lib/hamgamedemo.ad); arrow-key sprite + AABB coin pickup; dual-target (host gate: scripts/test_hamgame_host.sh)
