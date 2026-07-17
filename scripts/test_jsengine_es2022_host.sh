@@ -9,7 +9,8 @@
 #              String.{raw,fromCharCode,fromCodePoint};
 #              Symbol() basics (typeof, uniqueness, description, Symbol.iterator,
 #              symbol-keyed properties);
-#              Array.prototype.{toReversed,toSorted,with} (change-array-by-copy).
+#              Array.prototype.{toReversed,toSorted,with} (change-array-by-copy);
+#              RegExp `$<name>` named-group replacement in String.replace.
 #   Language:  object-literal getters/setters (get x(){}/set x(v){}),
 #              computed property/method names {[expr]:v}/{[expr](){}},
 #              class instance + static fields (x=v / static y=v),
@@ -132,6 +133,11 @@ assert acp_tosort   'var a=[3,1,2];console.log(a.toSorted().join(","),a.join(","
 assert acp_sortcmp  'console.log([3,10,1].toSorted(function(x,y){return x-y}).join(","))'                '1,3,10'
 assert acp_with     'var a=[1,2,3];console.log(a.with(1,9).join(","),a.join(","))'                       '1,9,3 1,2,3'
 assert acp_withneg  'console.log([1,2,3].with(-1,9).join(","))'                                          '1,2,9'
+
+# ---- RegExp `$<name>` named-group replacement ----
+assert rng_swap     'console.log("2020-01".replace(/(?<y>\d+)-(?<m>\d+)/,"$<m>/$<y>"))'                  '01/2020'
+assert rng_global   'console.log("HELLO".replace(/(?<a>L)/g,"[$<a>]"))'                                  'HE[L][L]O'
+assert rng_unknown  'console.log("ab".replace(/(?<x>a)/,"[$<z>]"))'                                      '[]b'
 
 if [ "$fail" -eq 0 ]; then
     echo "[js-es2022] RESULT: PASS"
