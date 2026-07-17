@@ -67,19 +67,20 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
     rasterizer; sdlpong/Coin Dash/pygame now vk clients, byte-identical PNGs (cmp-verified).
     Added vk2d `cov_mask` (glyph coverage) + `fill_roundrect`. ham2048/snake/chess left on
     hamui_host (DE-scene apps, never call sdl_* → Phase C). sdl_* API unchanged.
-  - [~] **Phase C — route the DE compositor (hamui_host) through vk** IN FLIGHT: same vk2d ops,
-    byte-identical pixels; RE-RUN `bench_de_compositor.sh` vs the 24.3ms baseline. Expect PARITY
-    (vk2d fill = same SW math; real speedup awaits Phase D GPU). Kernel devwsys may defer to C.2.
-  - [x] **DE-speed baseline (USER)** DONE (`b3b6e710`): `scripts/bench_de_compositor.sh` +
-    `docs/de_perf_baseline.md`. BEFORE = **24.3 ms/frame** @1024×768 (58 prims), fills
-    dominate **17.3 ms (~87%)**, glyphs 2.1, image 0.3, fb-clear 4.4; variance <1.5%. Phase C
-    target: collapse the fill cost. Re-run the SAME bench after DE→vk for the comparison.
-    Caveat: host metric = compositing-kernel math only; on-device frame-timing also needed
-    for a true end-to-end claim (noted in the doc).
-  - [ ] **Phase C — route the DE compositor through vk** (hamui_host/devwsys composite
-    window scenes via vk present/blits). Biggest/riskiest (touches kernel). After B.
-  - [ ] **Phase D (parallel/later) — virtio-gpu / silicon backend behind the SAME vk API**
-    (`drivers/video/virtio_gpu.ad`) → accelerates DE + games once they're vk clients.
+  - [x] **Phase C — route the DE compositor (hamui_host) through vk** DONE (`12fdb90e`):
+    byte-identical pixels (cmp-verified), 6 DE gates pass. Bench 24.3→**32.7 ms/frame** = ~35% CPU
+    REGRESSION (RGBA 4B vs RGB 3B + per-pixel clip checks; CLEAR doubled), AS ANTICIPATED (vk2d =
+    same SW fill math). USER call: merge now + fix CPU path + start GPU. Kernel devwsys = C.2.
+  - [~] **CPU-path opt** IN FLIGHT — hoist per-pixel clip→per-primitive + opaque/row fast-paths +
+    fast clear in `lib/vk/vk_2d.ad`, byte-identical, to recover the regression. Benefits games too.
+  - [~] **Phase D — virtio-gpu backend behind the vk API** IN FLIGHT (foundation): native
+    virtio-gpu device-up + scanout, a `vk_core` backend seam (default stays SW), GPU CLEAR PoC;
+    new `lib/vk/vk_gpu.ad`. Turns the CPU cost into a real DE+games speedup. Then C.2 (kernel
+    devwsys glyph atlas) + flip to GPU-default once faster.
+  - [x] **DE-speed baseline (USER)** DONE (`b3b6e710`): BEFORE = **24.3 ms/frame** @1024×768,
+    fills **17.3 ms (~87%)**. `bench_de_compositor.sh` + `docs/de_perf_baseline.md`. Re-run after
+    CPU-opt + GPU for the comparison. Caveat: host metric = compositing math; on-device frame-timing
+    also needed for a true end-to-end claim.
   - [ ] **3D/accel-prep (parallel):** MVP vertex transform + perspective + indexed meshes
     (`vkCmdDrawIndexed`) + rotating-cube demo — extends the same API. vk_raster already
     does depth-buffered triangles.
