@@ -82,9 +82,15 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
     byte-unchanged). GPU **CLEAR + PRESENT/scanout** on native virtio-gpu, VERIFIED ON-DEVICE
     (OVMF+virtio-gpu-pci): GPU clear == SW reference byte-for-byte + 4-quadrant scanout screendump
     correct, no leaked qemu. Fixed a dead gate (`HAMNIX_FORCE_SELFTESTS=1`, default off). Still SW: 2D/3D ops.
-  - [ ] **Phase D.2 / next GPU increments** — route 2D ops (fills→blits→roundrect) to write device
-    backing directly under the GPU backend; kernel `devwsys.ad` + glyph atlas; flip DE/games to
-    GPU-default once measured faster than the (already 2.7×-faster) SW path.
+  - [x] **Phase D.2 — GPU present measurement** DONE (`625ec551`): on-device (OVMF, 1280×800):
+    SW GOP present 11.77ms vs GPU present 11.28ms (1.04×, convert-limited) vs **GPU present
+    BGRA-native = 0.19ms = 61×**. GPU fb == SW pixel-for-pixel. The convert (RGBA→BGRA) eats the
+    win; default stays SW (opt-in `vk_try_enable_gpu_present`). CONFIRMED: base virtio-gpu-2d is a
+    scanout device — fills stay CPU-bound (real fill accel needs venus/virgl #182).
+  - [ ] **Phase D.3 — BGRA-native present** (unlocks the 61× GPU present) — render the vk color
+    image / DE composite directly into a BGRA backing, drop the convert, then flip DE to GPU present
+    by default. HOLD: needs virtio-gpu QEMU → wait for the parity big-bangs to free the host (bench).
+  - [ ] **venus/virgl 3D (#182)** — real GPU fill/compute accel (the only path to offloading fills).
   - [x] **DE-speed baseline (USER)** DONE (`b3b6e710`): BEFORE = **24.3 ms/frame** @1024×768,
     fills **17.3 ms (~87%)**. `bench_de_compositor.sh` + `docs/de_perf_baseline.md`. Re-run after
     CPU-opt + GPU for the comparison. Caveat: host metric = compositing math; on-device frame-timing
