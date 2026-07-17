@@ -107,7 +107,18 @@ awk '/\[mem_gate\] before_apps/{f=1;next} /\[mem_gate\] after_apps/{f=0} f' "$LO
 echo "--- after_apps (full app set incl. visual-gate apps) ---"
 awk '/\[mem_gate\] after_apps/{f=1;next} /\[visual_gate\] done/{f=0} f' "$LOG" | grep -aE 'Mem:|total *free' | head -3
 echo "--- OOM / alloc-fail check ---"
-if grep -aiE 'elf: OOM|memblock_alloc.*fail|OOM|out of memory' "$LOG"; then
+# Catch genuine OOM / allocation-failure markers, but NOT the benign
+# "<N> OOM" success COUNTER that stress self-tests print on a clean boot
+# (e.g. mm_smoke's "[pa-stress] churn done: 256 iters, 0 OOM"). The old
+# bare-`OOM` pattern matched that counter and made the gate ALWAYS report
+# "OOM markers present" even when the boot was clean — a false-red. The
+# `[0-9]+ OOM` filter drops the count-suffixed diagnostic lines only; real
+# failures like "elf: OOM", "memblock_alloc ... failed", "out of memory",
+# "OOM killer ..." and "[memcg] OOM cgroup ..." carry no "<N> OOM" suffix
+# and still trip the check.
+OOM_HITS="$(grep -aiE 'elf6?4?: OOM|memblock_alloc.*fail|OOM[ -]kill|OOM cgroup|out of memory' "$LOG" | grep -avE '[0-9]+ OOM')"
+if [ -n "$OOM_HITS" ]; then
+    printf '%s\n' "$OOM_HITS"
     echo "[mem_gate] *** OOM/alloc-fail markers present ***"
 else
     echo "[mem_gate] no OOM/alloc-fail markers"
