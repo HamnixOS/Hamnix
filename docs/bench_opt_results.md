@@ -32,19 +32,19 @@ Timings in seconds (best-of-N, lower is better). `ON/OFF` > 1 means the optimize
 
 | kernel | Adder-OFF | Adder-ON | C-O0 | C-O2 | ON/OFF (speedup) | ON / C-O2 | ON / C-O0 | opt passes fired |
 |---|--:|--:|--:|--:|--:|--:|--:|---|
-| matmul | 0.1424s | 0.0348s | 0.0749s | 0.0184s | **4.09×** | 1.89× | 0.46× | licm=5, strengthred=2 |
-| sieve | 0.2297s | 0.0794s | 0.1913s | 0.0404s | **2.89×** | 1.97× | 0.42× | — |
-| licm | 0.2807s | 0.0563s | 0.1235s | 0.0326s | **4.99×** | 1.73× | 0.46× | cse=1, licm=3, dce=4, copyprop=4 |
-| dcecopy | 0.5272s | 0.0829s | 0.3037s | 0.0558s | **6.36×** | 1.49× | 0.27× | dce=5, constbranch=1, copyprop=2 |
-| fib | 0.5405s | 0.3316s | 0.3945s | 0.1132s | **1.63×** | 2.93× | 0.84× | — |
-| collatz | 1.3776s | 0.2707s | 0.3905s | 0.1404s | **5.09×** | 1.93× | 0.69× | strengthred=1 |
-| mandel | 0.1031s | 0.0360s | 0.0369s | 0.0211s | **2.87×** | 1.71× | 0.98× | — |
-| saxpy | 0.2397s | 0.0905s | 0.1294s | 0.0658s | **2.65×** | 1.37× | 0.70× | strengthred=2 |
-| **geomean** | | | | | **3.52×** | 1.83× | 0.56× | |
+| matmul | 0.1458s | 0.0288s | 0.0757s | 0.0184s | **5.07×** | 1.56× | 0.38× | licm=5, strengthred=2 |
+| sieve | 0.2337s | 0.0827s | 0.1947s | 0.0425s | **2.83×** | 1.95× | 0.42× | — |
+| licm | 0.2878s | 0.0684s | 0.1252s | 0.0328s | **4.21×** | 2.09× | 0.55× | cse=1, licm=3, dce=4, copyprop=4 |
+| dcecopy | 0.5405s | 0.0839s | 0.3112s | 0.0563s | **6.44×** | 1.49× | 0.27× | dce=5, constbranch=1, copyprop=2 |
+| fib | 0.5568s | 0.3456s | 0.4038s | 0.1156s | **1.61×** | 2.99× | 0.86× | — |
+| collatz | 1.4113s | 0.2948s | 0.4020s | 0.1439s | **4.79×** | 2.05× | 0.73× | strengthred=1 |
+| mandel | 0.1050s | 0.0359s | 0.0376s | 0.0211s | **2.93×** | 1.70× | 0.96× | — |
+| saxpy | 0.2455s | 0.0878s | 0.1333s | 0.0629s | **2.80×** | 1.39× | 0.66× | strengthred=2 |
+| **geomean** | | | | | **3.54×** | 1.85× | 0.56× | |
 
 ## Headline
 
-- **Optimizer ON vs OFF:** the `ADDER_OPT=1` 6-pass optimizer is **3.52× faster** than the baseline backend (geomean over the correct kernels).
-- **Adder-ON vs C -O2:** Adder-ON is **1.83× slower** than gcc -O2 (geomean).
+- **Optimizer ON vs OFF:** the `ADDER_OPT=1` 6-pass optimizer is **3.54× faster** than the baseline backend (geomean over the correct kernels).
+- **Adder-ON vs C -O2:** Adder-ON is **1.85× slower** than gcc -O2 (geomean).
 - **Adder-ON vs C -O0:** Adder-ON is **0.56× slower** than gcc -O0 (geomean).
 

@@ -4962,6 +4962,52 @@ def emit_lea_local_sib_reg(off: int32, idx: uint32, sbits: uint32):
         emit_disp32(off)
 
 
+# leaq (%<base>, %<idx>, scale), %rcx  — the %rcx-DESTINATION twin of
+# emit_lea_base_index_reg (ModRM reg field = %rcx(001) instead of %rax(000)).
+# Used by the alu-load fold's ADDRESS-INTO-%rcx fast path: for a direct-SIB
+# element whose base is a register (a hoisted global-array base) and whose index
+# is a register-promoted local, the element ADDRESS is one lea straight into %rcx
+# — no %rax clobber, so the fold's other operand (already in %rax) needs no
+# push/pop round-trip. Encoding mirrors emit_lea_base_index_reg with reg=001:
+# ModRM byte 0x0C (mod=00) / 0x4C (mod=01, %rbp/%r13 SIB base needs disp8=0).
+def emit_lea_base_index_reg_rcx(base: uint32, idx: uint32, sbits: uint32):
+    rex: uint32 = 0x48
+    if base >= 8:
+        rex = rex | 0x01                 # REX.B extends SIB base
+    if idx >= 8:
+        rex = rex | 0x02                 # REX.X extends SIB index
+    emit_b(rex)
+    emit_b(0x8D)
+    sib: uint32 = (sbits << 6) + ((idx & 7) << 3) + (base & 7)
+    if (base & 7) == 5:
+        emit_b(0x4C)                     # mod=01, reg=rcx(001), rm=100(SIB)
+        emit_b(sib)
+        emit_b(0)                        # disp8 = 0
+    else:
+        emit_b(0x0C)                     # mod=00, reg=rcx(001), rm=100(SIB)
+        emit_b(sib)
+
+
+# leaq off(%rbp, %<idx>, scale), %rcx  — the %rcx-DESTINATION twin of
+# emit_lea_local_sib_reg (ModRM reg field = %rcx(001)). Same alu-load
+# address-into-%rcx fast path, for an ARRAY-LOCAL base (SIB base = %rbp).
+def emit_lea_local_sib_reg_rcx(off: int32, idx: uint32, sbits: uint32):
+    rex: uint32 = 0x48
+    if idx >= 8:
+        rex = rex | 0x02                 # REX.X extends SIB index
+    emit_b(rex)
+    emit_b(0x8D)
+    sib: uint32 = (sbits << 6) + ((idx & 7) << 3) + 5    # scale|index|base=rbp
+    if disp_fits8(off) != 0:
+        emit_b(0x4C)                     # mod=01, reg=rcx(001), rm=100(SIB)
+        emit_b(sib)
+        emit_b(cast[uint32](off) & 255)
+    else:
+        emit_b(0x8C)                     # mod=10, reg=rcx(001), rm=100(SIB)
+        emit_b(sib)
+        emit_disp32(off)
+
+
 # leaq <data_off>(%rip), %rax  -> 48 8D 05 <rel32>   (address of a global /
 # string in the data section). The rel32 is a placeholder; a data fixup is
 # recorded against the global's data offset and patched after layout, so it
@@ -6216,6 +6262,20 @@ def gen_expr_ir(v: uint32):
                 mem_idx = ir_leaf_foldable_mem8(ir_a[v])
                 reg_side = ir_b[v]
             if mem_idx != 0:
+                # ADDRESS-INTO-%rcx FAST PATH: when the element address is a single
+                # %rax-clean lea (array-local, or a hoisted-global base — direct-SIB
+                # with a register-promoted index), compute it STRAIGHT into %rcx and
+                # skip the push/mov/pop round-trip entirely. The register operand
+                # stays live in %rax (the lea touches only %rcx + the index/base
+                # regs). matmul's `s += A[i*N+k] * B[k*N+j]` inner imul: 3 fewer
+                # instrs/iter (push %rax, mov %rax,%rcx, pop %rax) — the element is
+                # still fetched in-place by `op (%rcx),%rax`. Any shape the fast path
+                # refuses falls through to the byte-correct stack-hold path below.
+                gen_expr_ir(reg_side)        # register operand -> %rax
+                if try_alu_mem_addr_into_rcx(mem_idx) != 0:
+                    emit_aluload_op(op, l_sgn, r_sgn)  # op (%rcx),%rax
+                    opt_aluload_count = opt_aluload_count + 1
+                    return
                 # Hold the register operand on the STACK across the element-address
                 # computation (gen_index_addr clobbers %rax). The stack is always
                 # available — no callee-saved scratch reg required — so the fold
@@ -6225,7 +6285,6 @@ def gen_expr_ir(v: uint32):
                 # combine: the element is fetched in-place by `op (%rcx),%rax` and
                 # never materialises in a temp. gen_index_addr balances its own
                 # stack, so the push/pop pair around it is sound.
-                gen_expr_ir(reg_side)        # register operand -> %rax
                 emit_push_rax()              # hold it on the stack
                 gen_index_addr(mem_idx)      # &arr[i] -> %rax
                 emit_mov_rax_rcx()           # element address -> %rcx
@@ -7758,6 +7817,60 @@ def index_reg_direct(idx_raw: uint32) -> uint32:
     if lookup_local_scalar_size(nd_name_off[idx], nd_name_len[idx]) != 0:
         return RA_NONE
     return r
+
+
+# ALU-LOAD ADDRESS-INTO-%rcx fast path. For an 8-byte integer array element
+# `arr[i]` that the alu-load fold sources as `op (%rcx),%rax`, compute the
+# element ADDRESS straight into %rcx with a SINGLE lea — WITHOUT clobbering
+# %rax — so the fold's other operand (already in %rax) needs no push/pop
+# round-trip. Returns 1 if it emitted `lea ...,%rcx`, else 0 (caller keeps the
+# byte-correct push / gen_index_addr(%rax) / mov %rax,%rcx / pop path).
+#
+# ONLY the two %rax-clean single-lea shapes are handled — both require a
+# register-promoted (direct-SIB) index and a power-of-2 (here fixed 8-byte)
+# stride:
+#   * ARRAY-LOCAL base:   lea disp(%rbp, %idx, 8), %rcx
+#   * GLOBAL-ARRAY base HOISTED into a register: lea (%hb, %idx, 8), %rcx
+# Every other base flavour (non-hoisted rip-relative global — needs `lea
+# g(%rip),%rax` first; Ptr[T]/scalar — loads the pointer into %rax; multi-dim /
+# array-of-struct — earlier gen_index_addr branches) would clobber %rax, so this
+# refuses them (returns 0) and the legacy round-trip path runs. The address bits
+# are identical to gen_index_addr's direct-SIB emission (same base, index, scale)
+# — only the destination register differs (%rcx vs %rax). Gated by the caller's
+# --opt isel arm; default build never reaches here. Precondition (caller): `node`
+# is an ND_INDEX with an 8-byte non-float element (ir_leaf_foldable_mem8).
+def try_alu_mem_addr_into_rcx(node: uint32) -> uint32:
+    if isel_is_enabled() == 0:
+        return 0
+    if nd_kind[node] != ND_INDEX:
+        return 0
+    base: uint32 = nd_a[node]
+    if nd_kind[base] != ND_IDENT:
+        return 0
+    idxreg: uint32 = index_reg_direct(nd_b[node])
+    if idxreg == RA_NONE:
+        return 0
+    # Multi-dimensional / array-of-struct bases take earlier gen_index_addr
+    # branches (scaled row/struct stride) that clobber %rcx/%rax — refuse.
+    bt: uint32 = expr_array_type(base)
+    if bt != 0 and nd_kind[nd_a[bt]] == ND_ARRAY_TYPE:
+        return 0
+    if bt != 0 and struct_lookup_by_node(nd_a[bt]) != 0:
+        return 0
+    # ARRAY-LOCAL base: element = 8, stride bits = 3, SIB base = %rbp.
+    off: int32 = 0
+    es_l: uint32 = lookup_elem_size(nd_name_off[base], nd_name_len[base])
+    if es_l == 8 and lookup_local(nd_name_off[base], nd_name_len[base], &off) != 0:
+        emit_lea_local_sib_reg_rcx(off, idxreg, 3)
+        return 1
+    # GLOBAL-ARRAY base that was HOISTED into a register this loop.
+    gi: uint32 = glob_lookup(nd_name_off[base], nd_name_len[base])
+    if gi != 0 and glob_elem_size[gi - 1] == 8:
+        hb: uint32 = hb_lookup_global(gi)
+        if hb != RA_NONE:
+            emit_lea_base_index_reg_rcx(hb, idxreg, 3)
+            return 1
+    return 0
 
 
 # Try the IR-consuming emit path for AST expression `node`. Returns 1 if it
