@@ -3345,7 +3345,15 @@ if os.environ.get("ENABLE_OVERLAYFS_TEST") == "1":
 # them set these production flags; a marker is only useful with this present.
 _is_production = (os.environ.get("HAMNIX_CPIO_EMPTY") == "1"
                   or os.environ.get("HAMNIX_INSTALLER_BLOB") == "1")
-if not _is_production:
+# HAMNIX_FORCE_SELFTESTS=1 arms the boot:37 battery even on a production
+# kernel. This exists so an OVMF-bootable installer medium can run a
+# device self-test that needs real firmware + a device QEMU only exposes
+# under UEFI (e.g. the virtio-gpu present/backend test, whose -kernel
+# path is blocked by this host's multiboot/VBE limit). Off by default —
+# production ships never set it — so real installer/hardware images are
+# unchanged.
+_force_selftests = os.environ.get("HAMNIX_FORCE_SELFTESTS") == "1"
+if (not _is_production) or _force_selftests:
     FILES.append(("/etc/run-selftests", b"1\n"))
 
 

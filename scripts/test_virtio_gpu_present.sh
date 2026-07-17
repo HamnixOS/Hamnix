@@ -83,7 +83,13 @@ fi
 if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
     echo "[test_vgpu] (1/2) building installer medium (ENABLE_VIRTIO_GPU_TEST=1)"
     rm -f "$HAMNIX_INSTALLER_IMG"
-    ENABLE_VIRTIO_GPU_TEST=1 bash "$PROJ_ROOT/scripts/build_installer_img.sh"
+    # HAMNIX_FORCE_SELFTESTS=1 arms the boot:37 battery on the (production)
+    # installer kernel so the boot:37.vgpu present hook + the Phase-D GPU
+    # backend self-test actually run under OVMF (the only path that gives
+    # us real firmware + a virtio-gpu display; -kernel is blocked by this
+    # host's multiboot/VBE limit). Production ships never set this.
+    ENABLE_VIRTIO_GPU_TEST=1 HAMNIX_FORCE_SELFTESTS=1 \
+        bash "$PROJ_ROOT/scripts/build_installer_img.sh"
 fi
 if [ ! -f "$HAMNIX_INSTALLER_IMG" ]; then
     echo "[test_vgpu] FAIL: $HAMNIX_INSTALLER_IMG missing after build_installer_img.sh" >&2
@@ -175,6 +181,17 @@ check_log "modern transport bound"       "virtio-gpu: modern transport bound"
 check_log "DISPLAY_INFO ok"              "virtio-gpu: DISPLAY_INFO scanout0"
 check_log "FLUSH ok"                     "virtio-gpu: FLUSH ok"
 check_log "present self-test PASS"       "\[vgpu\] PASS"
+# Phase D: the native GPU backend (vk_core -> vk_gpu -> virtio-gpu). The
+# self-test clears a color two ways (SW rasterizer vs GPU device backing)
+# and asserts they match byte-for-byte, then runs GPU clear+present.
+check_log "GPU clear matches SW ref"     "\[vgpu-vk\] PASS: GPU clear matches SW reference"
+check_log "GPU present ran"              "\[vgpu-vk\] PASS: GPU present"
+check_log "GPU backend self-test PASS"   "\[vgpu-vk\] PASS: GPU backend self-test complete"
+
+if grep -a -q -E "\[vgpu-vk\] FAIL" "$LOG"; then
+    echo "[test_vgpu] FAIL: kernel reported [vgpu-vk] FAIL" >&2
+    fail=1
+fi
 
 if grep -a -q -E "\[vgpu\] FAIL" "$LOG"; then
     echo "[test_vgpu] FAIL: kernel reported [vgpu] FAIL" >&2
