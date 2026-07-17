@@ -31,7 +31,54 @@ From a 14-agent parallel audit (2026-07-16). Dual-target, host-iterated (~40 gat
 | ecmascript-builtins | 55% | 15 | 6 |
 | dom-core | 57% | 12 | 3 |
 
-## High-impact worklist (56)
+## FRESH AUDIT 2026-07-17 (verified against the modular lib/web/ tree)
+
+The 2026-07-16 "High-impact worklist (56)" below was captured on the PRE-refactor monoliths
+— its `lib/htmlengine.ad`/`lib/jsengine.ad` line numbers are dead, and many items have since
+landed. A read-only re-audit against the current `lib/web/{js,html,css,dom,layout}/` tree +
+the passing host gates found the following.
+
+**Confirmed ALREADY IMPLEMENTED (do NOT re-dispatch — the old worklist is stale on these):**
+- css-values-units: decimal/fractional lengths, `rem`, `vh/vw/vmin/vmax`, `calc()`+`min/max/clamp`,
+  `var()`/custom-properties+fallback, `box-sizing` — `css/cascade.ad` `_len` (~376-431, 595).
+  Gates: `cssvalues`, `cssnl`, `varfallback`.
+- css-flexbox: flex-grow / flex shorthand / flex-basis / flex-shrink — `cascade.ad` r_flexg/r_flexs.
+  Gates: `flexmin/flexalign/flexjustify/flexwrap/flexgap`.
+- css-grid: `minmax()`, `repeat(auto-fill/auto-fit)` — `cascade.ad:~1608-1744`. Gates: `grid/gridr2/gridspan/gridjustify`.
+- css-selectors: attribute selectors (gate `attrsel`). css-positioning: `position:sticky`/`fixed` parsed (gate `position`).
+- dom: `Element.closest`/`matches` (`query.ad:841`, gate `matches`); arbitrary event types +
+  `Event`/`CustomEvent` ctors + document/window `addEventListener` (gates `events/evttypes`).
+- html5-parsing: implied end tags (gate `impliedtags`); quote-aware tag tokenization (gate `tagquote`).
+- ecmascript: for-of, optional chaining/nullish, Map/Set/WeakMap/WeakSet, accessor get/set, Symbol +
+  Symbol.iterator, generators/yield, Object.create/defineProperty, Reflect, Proxy, typed arrays,
+  structuredClone (R1-7 above). Only ES modules (import/export) and class private `#fields` remain open.
+
+**Genuinely OPEN, ranked (keyed to current files) — the live worklist:**
+1. DOM geometry: `getBoundingClientRect`/`offsetWidth/Height/Top/Left`/`clientWidth/Height`/`offsetParent`/
+   `getComputedStyle` — missing. `dom/query.ad` + `dom/bindings.ad` + `dom/canvas.ad` (reads `layout/box.ad`). **[in progress]**
+2. `document.body`/`documentElement`/`head` — missing. `dom/canvas.ad` document build. **[in progress]**
+3. opacity + rgba()/hsla() alpha compositing — swallowed. `css/values.ad`+`css/cascade.ad`+`layout/box.ad`. **[in progress]**
+4. linear/radial/conic-gradient backgrounds — swallowed (no bg). `css/cascade.ad`+`layout/box.ad`. **[in progress]**
+5. border-radius — swallowed (`cascade.ad:1021-1026`). `css/cascade.ad`+`layout/box.ad`. **[in progress]**
+6. box-shadow — missing. `css/cascade.ad`+`layout/box.ad`. **[in progress]**
+7. background-image:url() (+position/size/repeat) — missing as a background. `css/cascade.ad`+`layout/box.ad`.
+8. HTTP method=POST submission + enctype — GET-only. `dom/canvas.ad` `_do_submit`.
+9. overflow/overflow-x/y/clip/text-overflow — missing (no clip stage). `css/cascade.ad`+`layout/box.ad`+`layout/scroll.ad`.
+10. FormData ctor + append/get/entries — missing. `js/builtins/native.ad`+`dom/canvas.ad`.
+11. Constraint Validation breadth (setCustomValidity/reportValidity/validity/pattern/min/max/step/maxlength/novalidate)
+    — only `checkValidity` exists. `dom/query.ad`+`dom/canvas.ad`+`dom/forms.ad`.
+12. grid-row / row-axis placement & spanning — missing (`cascade.ad:1680`). `css/cascade.ad`+`layout/box.ad`.
+13. ES modules import/export — missing (`js/lexer.ad`/`js/parser.ad`); needs a runtime loader.
+14. class private `#fields` — missing. `js/lexer.ad`/`js/parser.ad`/`js/interp.ad`.
+15. specialized input types email/number/date/search/tel/url — degrade to plain text. `dom/forms.ad`.
+
+Disjoint dispatch clusters (no write-collision): **JS** (`js/*` only: #13,#14) · **CSS-PAINT+LAYOUT**
+(`css/*`+`layout/*`: #3-7,#9,#12) · **DOM-GEOMETRY** (`dom/query,bindings` + geometry half of `canvas.ad`: #1,#2)
+· **FORMS** (`dom/canvas,forms` + `js/builtins/native.ad`: #8,#10,#11,#15 — shares canvas.ad with DOM-GEOMETRY, so serialize).
+
+---
+
+## High-impact worklist (56) — ORIGINAL 2026-07-16 pre-refactor audit (line numbers STALE; see fresh audit above)
 
 - **[html5-parsing] Quote-aware tag tokenization ('>' inside an attribute value)** (buggy) — `lib/htmlengine.ad: _layout tag scan (7391-7394), _scan_start_tag (7913), _find_close (7860), _parse_fragment (10462)` — Every tag-boundary scan naively advances to the first '>' byte with no awareness of quoted attribute values. Markup like <a title="a>b">, <div data-x="if(x>1)">, onclick="if(a>b)...", or inline SVG pa
 - **[html5-parsing] Optional / implied end tags (general)** (partial) — `lib/htmlengine.ad: _handle_tag block branches (~6700-7050); only <li> (4945/6779) and table cell (6984) auto-close exist` — There is no general implied-end-tag algorithm. <p> is never auto-closed by a following block (<p>a<div>...), and <dt>/<dd>, <option>/<optgroup>, <thead>/<tbody>/<tfoot>/<tr>/<td>/<th>, <colgroup>, <rp
