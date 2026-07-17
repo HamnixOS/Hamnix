@@ -51,6 +51,16 @@ assert pie_basic    'console.log({a:1}.propertyIsEnumerable("a"),{a:1}.propertyI
 assert ipo_class    'class A{};var a=new A();console.log(A.prototype.isPrototypeOf(a),A.prototype.isPrototypeOf({}))' 'true false'
 assert ipo_create   'var p={};var o=Object.create(p);console.log(p.isPrototypeOf(o),o.isPrototypeOf(p))' 'true false'
 
+# ---- class fields (instance `x = v`, static `static y = v`, bare `x;`) ----
+assert cf_basic     'class A{x=5;getx(){return this.x}}console.log(new A().getx(),new A().x)'          '5 5'
+assert cf_ctor      'class A{x=5;constructor(){this.y=this.x*2}}var a=new A();console.log(a.x,a.y)'    '5 10'
+assert cf_bare      'class A{x;}var a=new A();console.log("x"in a,a.x)'                                 'true undefined'
+assert cf_static    'class A{static y=9;static get(){return A.y}}console.log(A.y,A.get())'             '9 9'
+assert cf_static_nm 'class A{static(){return 7}}console.log(new A().static())'                         '7'
+assert cf_expr      'var Z=3;class A{v=Z+1}console.log(new A().v)'                                     '4'
+assert cf_mix       'class C{n=10;inc(){this.n++;return this.n}}var c=new C();console.log(c.inc(),c.inc())' '11 12'
+assert cf_per_inst  'class A{arr=[]}var a=new A();var b=new A();a.arr.push(1);console.log(a.arr.length,b.arr.length)' '1 0'
+
 if [ "$fail" -eq 0 ]; then
     echo "[js-es2022] RESULT: PASS"
     exit 0
