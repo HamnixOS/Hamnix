@@ -83,6 +83,17 @@ assert_grep 'FILL 16 17 100 276 #445566'  "width:10rem -> 160px (176px box)"
 assert_grep 'FILL .* #112233'             "#11223344 8-digit hex -> #112233 (alpha dropped)"
 assert_grep 'FILL .* #4682b4'             "named colour steelblue -> #4682b4"
 
+# (E) CSS math functions min()/max()/clamp() resolve to px widths (and nest
+# inside calc()). Content column here is ~584px, so:
+#   min(100%, 300px)          -> 300px  (box x1 = 100 + 300 + 16 chrome = 416)
+#   max(200px, 40%=~233)      -> 233px  (x1 = 349)
+#   clamp(150px, 10%=~58, 400)-> 150px  (clamped up to the floor; x1 = 266)
+#   calc(min(100px,50px)+20px)-> 70px   (nested min in calc; x1 = 186)
+assert_grep 'FILL 24 25 100 416 #778899'  "min(100%, 300px) -> 300px width"
+assert_grep 'FILL 26 27 100 349 #99aabb'  "max(200px, 40%) -> 233px width"
+assert_grep 'FILL 28 29 100 266 #bbccdd'  "clamp(150px, 10%, 400px) -> 150px (floor)"
+assert_grep 'FILL 30 32 100 186 #ddeeff'  "calc(min(100px,50px)+20px) -> 70px (nested)"
+
 if [ "$fail" -ne 0 ]; then
     echo "[hb-cssvalues] RESULT: FAIL"; exit 1
 fi
