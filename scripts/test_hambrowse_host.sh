@@ -75,16 +75,16 @@ assert_grep '#ffa500 .*| inside orange|'          "span style=color:orange -> #f
 
 # Links keep their role colour even adjacent to a coloured span, and default
 # text is body-black.
-assert_grep '#1a4fd0 b0 u1 l0 bg- | blue link|'   "link stays link-blue (#1a4fd0), underlined, link id 0"
+assert_grep '#1a4fd0 b0 u1 s0 l0 bg- | blue link|'   "link stays link-blue (#1a4fd0), underlined, link id 0"
 assert_grep '#101010 .*|Plain body text'          "uncoloured text stays body-black (#101010)"
 
 # Background-colour rung: bgcolor / background-color fill the box BEHIND the
 # text (seg bg field) without changing the TEXT colour.
 #   * bgcolor="yellow" paragraph: text body-black, bg #ffff00.
 #   * <span style="background-color:#ffff00"> highlight: text body-black, bg yellow.
-assert_grep '#101010 b0 u0 l-1 bg#ffff00 |bgcolor is not text color.|' \
+assert_grep '#101010 b0 u0 s0 l-1 bg#ffff00 |bgcolor is not text color.|' \
     "p bgcolor=yellow -> body-black text on yellow bg"
-assert_grep '#101010 b0 u0 l-1 bg#ffff00 | highlight|' \
+assert_grep '#101010 b0 u0 s0 l-1 bg#ffff00 | highlight|' \
     "span background-color:#ffff00 -> body-black text on yellow bg"
 # The TEXT-colour field (immediately after 'SEG row x ') must never be yellow:
 # that would mean bgcolor leaked into the text colour (word-boundary failure).
@@ -184,7 +184,7 @@ assert_grep3 '^SEG 3 102 #101010 b0 .*red\|'    "td 'red' at col1 (x=102, aligne
 assert_grep3 '^SEG 3 182 #101010 b0 .*12\|'     "td '12' at col2 (x=182, aligned to header)"
 assert_grep3 '^SEG 4 102 #101010 b0 .*blue\|'   "wide row 'Blueberry' keeps col1 at x=102"
 # Per-cell colour + background survive the padded column placement.
-assert_grep3 '^SEG 6 14 #101010 b0 u0 l-1 bg#c0c0c0 .*Lime\|' "td bgcolor=silver fills the cell (#c0c0c0)"
+assert_grep3 '^SEG 6 14 #101010 b0 u0 s0 l-1 bg#c0c0c0 .*Lime\|' "td bgcolor=silver fills the cell (#c0c0c0)"
 assert_grep3 '^SEG 6 102 #008000 .*green\|'                   "font color=green inside a cell -> #008000"
 # Cell text must sit strictly INSIDE the cell's left border (x>col_x): col0's
 # border is at x=8, so no cell text may start at x<=8 — proving the padding.
@@ -307,8 +307,8 @@ assert_grepL() {
 }
 
 # <ul> item: '-' bullet in the gutter at x=8, item text hanging at x=40.
-assert_grepL '^SEG 2 8 #101010 b0 u0 l-1 bg- \|-\|$'      "ul bullet marker '-' hangs at x=8"
-assert_grepL '^SEG 2 40 #101010 b0 u0 l-1 bg- \|Apples\|' "ul item text hangs at x=40 (one level in)"
+assert_grepL '^SEG 2 8 #101010 b0 u0 s0 l-1 bg- \|-\|$'      "ul bullet marker '-' hangs at x=8"
+assert_grepL '^SEG 2 40 #101010 b0 u0 s0 l-1 bg- \|Apples\|' "ul item text hangs at x=40 (one level in)"
 # A long item wraps and the continuation line aligns under the TEXT (x=40),
 # NOT back under the marker — this is the hanging indent.
 assert_grepL '^SEG 3 40 .*certainly wrap across the\|$'    "long ul item wraps at the text column"
@@ -320,7 +320,7 @@ assert_grepL '^SEG 4 40 .*available line width so we can check hanging indentati
 # second/third/fourth heading down by 1/2/3 vs the pre-spacing layout. The x
 # columns (marker gutter x=8/40, text x=40/72) are unchanged; only the row
 # indices moved, so these assertions track the new rows.
-assert_grepL '^SEG 10 8 #101010 b0 u0 l-1 bg- \|1\.\|'  "ol first item numbered '1.' at x=8"
+assert_grepL '^SEG 10 8 #101010 b0 u0 s0 l-1 bg- \|1\.\|'  "ol first item numbered '1.' at x=8"
 assert_grepL '^SEG 10 40 .*Preheat\|'                    "ol item text hangs at x=40"
 assert_grepL '^SEG 11 8 .*\|2\.\|'                        "ol second item numbered '2.'"
 assert_grepL '^SEG 12 8 .*\|3\.\|'                        "ol third item numbered '3.'"
@@ -374,7 +374,7 @@ assert_grep4 '^SEG [0-9]+ 8 #333333 b0 .*Normal gray paragraph' \
 assert_grep4 '^SEG [0-9]+ 8 #ff0000 b1 .*Warning bold red' \
     ".warn class rule -> red + font-weight:bold (beats p element rule)"
 # descendant `div p { background-color:yellow }` — bg fills, text stays p-gray.
-assert_grep4 '^SEG [0-9]+ 8 #333333 b0 u0 l-1 bg#ffff00 .*Nested para on yellow' \
+assert_grep4 '^SEG [0-9]+ 8 #333333 b0 u0 s0 l-1 bg#ffff00 .*Nested para on yellow' \
     "div p descendant rule -> yellow background, gray text"
 # text-align:right baked into seg_x (line pushed to the right edge).
 assert_grep4 '^SEG [0-9]+ ([4-9][0-9][0-9]) .*Right aligned line' \
@@ -454,9 +454,9 @@ assert_grepB '^SEG [0-9]+ 8 .*\+-+\+\|$' \
     ".card border draws a '+---+' horizontal rule spanning the box"
 assert_grepB '^SEG [0-9]+ 16 .*Bordered card block with inset content' \
     ".card border insets the content column by one cell (x=8 -> x=16)"
-assert_grepB '^SEG 22 8 #101010 b0 u0 l-1 bg- \|\|\|$' \
+assert_grepB '^SEG 22 8 #101010 b0 u0 s0 l-1 bg- \|\|\|$' \
     ".card border draws a left '|' side bar at x=8 on the content row"
-assert_grepB '^SEG 22 584 #101010 b0 u0 l-1 bg- \|\|\|$' \
+assert_grepB '^SEG 22 584 #101010 b0 u0 s0 l-1 bg- \|\|\|$' \
     ".card border draws a right '|' side bar at x=584 on the content row"
 # there must be TWO horizontal border rules (top + bottom) for the one .card.
 if [ "$(grep -Ec '^SEG [0-9]+ 8 .*\+-+\+\|$' "$DUMPB")" -eq 2 ]; then
@@ -827,12 +827,12 @@ assert_grepA() {
 
 # The leading <h1> sits at row 0 (no spurious top-margin at the document start)
 # and still lays its heading rule.
-assert_grepA '^SEG 0 8 #14306e b1 u0 l-1 bg- \|The Hamnix Project\|' \
+assert_grepA '^SEG 0 8 #14306e b1 u0 s0 l-1 bg- \|The Hamnix Project\|' \
     "leading h1 at row 0 (heading top-margin suppressed at document start)"
 assert_grepA '^RULE row 0 type 1$' "leading h1 emits a heading rule"
 # A mid-document heading gets ONE blank section-spacing line above it: the h2
 # "Design goals" lands at row 12 with row 11 empty (the top-margin line).
-assert_grepA '^SEG 12 8 #14306e b1 u0 l-1 bg- \|Design goals\|' \
+assert_grepA '^SEG 12 8 #14306e b1 u0 s0 l-1 bg- \|Design goals\|' \
     "mid-doc h2 gets a section top-margin (lands at row 12, not row 11)"
 if grep -Eq '^SEG 11 ' "$DUMPA"; then
     echo "[hb-host] FAIL heading top-margin row 11 is not blank"; fail=1
@@ -841,15 +841,15 @@ else
 fi
 # <pre> renders teal monospace on the light code background (#eef0f3) across
 # every code line.
-assert_grepA '^SEG 56 8 #0a6b5a b0 u0 l-1 bg#eef0f3 \|fn main\(\) \{\|' \
+assert_grepA '^SEG 56 8 #0a6b5a b0 u0 s0 l-1 bg#eef0f3 \|fn main\(\) \{\|' \
     "pre line -> teal text on the light code background (#eef0f3)"
-assert_grepA '^SEG 58 8 #0a6b5a b0 u0 l-1 bg#eef0f3 \|\}\|' \
+assert_grepA '^SEG 58 8 #0a6b5a b0 u0 s0 l-1 bg#eef0f3 \|\}\|' \
     "every pre line carries the code background"
 # inline <code> also gets the teal tint + code background (mid-paragraph).
-assert_grepA '^SEG [0-9]+ [0-9]+ #0a6b5a b0 u0 l-1 bg#eef0f3 \| code\|' \
+assert_grepA '^SEG [0-9]+ [0-9]+ #0a6b5a b0 u0 s0 l-1 bg#eef0f3 \| code\|' \
     "inline <code> -> teal text on the light code background"
 # <blockquote> text renders in a muted grey (#5a5a5a), still indented to x=32.
-assert_grepA '^SEG 48 32 #5a5a5a b0 u0 l-1 bg- \|Anything that can go wrong' \
+assert_grepA '^SEG 48 32 #5a5a5a b0 u0 s0 l-1 bg- \|Anything that can go wrong' \
     "blockquote text -> muted grey (#5a5a5a), indented to x=32"
 
 # ---- readable-measure default: on a WIDE window the body column is capped at
@@ -861,7 +861,7 @@ if ! "$BIN" "$FIXA" 900 >"$DUMPA9" 2>&1; then
     echo "[hb-host] FAIL: wide-article harness exited non-zero"; cat "$DUMPA9"; exit 1
 fi
 cat "$DUMPA9"
-assert_grepA '^SEG 2 158 #101010 b0 u0 l-1 bg- \|Hamnix is a native operating system' \
+assert_grepA '^SEG 2 158 #101010 b0 u0 s0 l-1 bg- \|Hamnix is a native operating system' \
     "wide window: body column centred at the 584px measure (x=158 at 900px)" "$DUMPA9"
 # the centred column is exactly the measure wide: the wrapped line ends near
 # x=158+584=742, NOT at the 892px window edge (proves the cap engaged).
@@ -955,25 +955,25 @@ assert_grepFLX() {
 # Two flex columns sit on the SAME top row (row 0): the first at the body
 # margin x=8, the second pinned one column over at x=304 — side by side, NOT
 # stacked. The second column keeps its background-color.
-assert_grepFLX '^SEG 0 8 #101010 b0 u0 l-1 bg- \|Left alpha one\|' \
+assert_grepFLX '^SEG 0 8 #101010 b0 u0 s0 l-1 bg- \|Left alpha one\|' \
     "flex: first column at the body margin x=8 on row 0"
-assert_grepFLX '^SEG 0 304 #101010 b0 u0 l-1 bg#eef0f3 \|Right beta\|' \
+assert_grepFLX '^SEG 0 304 #101010 b0 u0 s0 l-1 bg#eef0f3 \|Right beta\|' \
     "flex: second column laid HORIZONTALLY beside the first (x=304, same row 0)"
 # The first (taller) column's second line flows DOWN inside its own column
 # (still x=8), proving columns have independent vertical flow.
-assert_grepFLX '^SEG 2 8 #101010 b0 u0 l-1 bg- \|Left alpha two\|' \
+assert_grepFLX '^SEG 2 8 #101010 b0 u0 s0 l-1 bg- \|Left alpha two\|' \
     "flex: first column's second line flows down within its column (x=8, row 2)"
 # After the flex row, normal flow resumes FULL-WIDTH at the body margin, BELOW
 # the tallest column (row 5, past the 2-line left column) — not overlapping.
-assert_grepFLX '^SEG 5 8 #101010 b0 u0 l-1 bg- \|After the flex row here\|' \
+assert_grepFLX '^SEG 5 8 #101010 b0 u0 s0 l-1 bg- \|After the flex row here\|' \
     "flex: flow resumes full-width below the tallest column (row 5, x=8)"
 # A THREE-column flex row places all three children on one row at evenly
 # stepped x-positions (x=8 / 205 / 402) — equal-width column division.
-assert_grepFLX '^SEG 7 8 #101010 b0 u0 l-1 bg- \|Col A\|'   "flex: 3-col row, column 0 at x=8"
-assert_grepFLX '^SEG 7 205 #101010 b0 u0 l-1 bg- \|Col B\|' "flex: 3-col row, column 1 at x=205 (equal share)"
-assert_grepFLX '^SEG 7 402 #101010 b0 u0 l-1 bg- \|Col C\|' "flex: 3-col row, column 2 at x=402 (equal share)"
+assert_grepFLX '^SEG 7 8 #101010 b0 u0 s0 l-1 bg- \|Col A\|'   "flex: 3-col row, column 0 at x=8"
+assert_grepFLX '^SEG 7 205 #101010 b0 u0 s0 l-1 bg- \|Col B\|' "flex: 3-col row, column 1 at x=205 (equal share)"
+assert_grepFLX '^SEG 7 402 #101010 b0 u0 s0 l-1 bg- \|Col C\|' "flex: 3-col row, column 2 at x=402 (equal share)"
 # The tail paragraph pops back to the body margin after the 3-col row.
-assert_grepFLX '^SEG 10 8 #101010 b0 u0 l-1 bg- \|Tail line\|' \
+assert_grepFLX '^SEG 10 8 #101010 b0 u0 s0 l-1 bg- \|Tail line\|' \
     "flex: tail paragraph back at the body margin x=8 after the flex row closes"
 
 # ====================================================================
@@ -1104,24 +1104,24 @@ assert_grepP() {
 }
 
 # The card body text sits at the card's content origin (row 3, x=16).
-assert_grepP '^SEG 3 16 #101010 b0 u0 l-1 bg- \|Card body text line one here\.\|' \
+assert_grepP '^SEG 3 16 #101010 b0 u0 s0 l-1 bg- \|Card body text line one here\.\|' \
     "position: card body text at the card content origin (row 3, x=16)"
 # ABSOLUTE top-left: the .tl badge lands at the card's top-LEFT (x=16) and,
 # being out of flow, shares the card body's row (row 3) instead of pushing it
 # down. Same x as the body text proves left:0 maps to the containing-block left.
-assert_grepP '^SEG 3 16 #ffffff b0 u0 l-1 bg#ff0000 \|TL\|' \
+assert_grepP '^SEG 3 16 #ffffff b0 u0 s0 l-1 bg#ff0000 \|TL\|' \
     "position:absolute top:0 left:0 -> card top-left, out of flow (row 3, x=16)"
 # ABSOLUTE top-right: the .tr badge is pinned to the card's RIGHT edge (x=320,
 # = 336 right edge - 2-char badge width) on the SAME top row.
-assert_grepP '^SEG 3 320 #ffffff b0 u0 l-1 bg#00aa00 \|TR\|' \
+assert_grepP '^SEG 3 320 #ffffff b0 u0 s0 l-1 bg#00aa00 \|TR\|' \
     "position:absolute top:0 right:0 -> card top-right, right-anchored (row 3, x=320)"
 # Out of flow means the card stays COMPACT (bottom border at row 5), so the
 # trailing plain paragraph is at row 9 — NOT shoved far down by in-flow badges.
-assert_grepP '^SEG 9 8 #101010 b0 u0 l-1 bg- \|Plain trailing paragraph\.\|' \
+assert_grepP '^SEG 9 8 #101010 b0 u0 s0 l-1 bg- \|Plain trailing paragraph\.\|' \
     "position: absolute badges are out of flow (card compact, trailing para at row 9)"
 # RELATIVE offset: the nudged paragraph is shifted right by left:48px (x 8->56)
 # and down by top:16px (one row) from its normal-flow position.
-assert_grepP '^SEG 8 56 #0000ff b0 u0 l-1 bg- \|Nudged para here\.\|' \
+assert_grepP '^SEG 8 56 #0000ff b0 u0 s0 l-1 bg- \|Nudged para here\.\|' \
     "position:relative left:48 top:16 -> shifted right (x=56) and down (row 8)"
 
 if [ "$fail" -eq 0 ]; then
