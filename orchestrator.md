@@ -10,6 +10,23 @@ you are the primary bug finder.
 
 ---
 
+## ★ LATEST STATE — 2026-07-17 restart (read this first)
+
+**Full pickup detail:** memory `project_session_pickup_2026-07-17.md` (indexed in `MEMORY.md`).
+
+- **Repo:** `origin/main` = `c59b2158`, **0 unpushed, tree clean, all gates green.** Nothing on `main` is unsaved.
+- **DO FIRST — re-arm the heartbeat keeper** so the hourly cron (`launch_session.sh`, `17 * * * *`) DEFERS to this interactive session instead of spawning a parallel headless `claude -p`:
+  run a persistent background loop: `while true; do touch /home/david/hamnix-orchestrator/heartbeat; sleep 200; done`.
+  You (the terminal / remote-control session) are the intended sole orchestrator; the cron only fills in when the heartbeat is stale.
+- **Do NOT re-panic about a "second orchestrator."** If `ps` shows another `claude --dangerously-skip-permissions`, check `$PPID` — your own ancestors are you, and your Agent-tool subagents run under your process. (This confused me twice; see `feedback_agent_cd_escapes_worktree`.)
+- **Standing USER directives (2026-07-17):** keep pushing **(1) the browser toward W3C conformance** (host-iterated rounds; ~30-55%/area, NOT full-compliant — be honest) and **(2) Adder → C speed** (optimizer parity, narrow 1.83×→~1.0× of gcc-O2). Plus the 7-front daily-driver campaign (`project_daily_driver_campaign_2026-07-16`).
+- **Two rounds were STOPPED for this restart (no commits — just re-launch them):**
+  `w3c/css-backgrounds-r9` (css-backgrounds-borders, the 18% lowest-coverage area: real border color/width painting + backgrounds + border-radius) and `feat/optimizer-c-parity-rN2` (native optimizer increment toward C parity). Nothing to salvage; dispatch fresh worktree agents.
+- **Browser engine is now the modular `lib/web/{js,html,css,dom,layout}/` tree** (8 W3C rounds landed this run). Per-module agents work disjoint files → fan out. Roadmap: `docs/browser_w3c_conformance.md`.
+- **QA harnesses that work (reuse):** `scripts/test_de_screenshot.sh` (SHOT_OUT=…, HAMNIX_SKIP_BUILD=1 reuses a fresh img), `test_de_browser.sh` (drives hambrowse in DE + screendump; HAMBROWSE_LAUNCH=… for a URL), `test_hambrowse_fetch.sh` (on-device fetch+render, PASSES). Rebuild the installer img before visual QA. Don't trust a boot FAIL under concurrent load — re-run isolated.
+
+---
+
 ## What the orchestrator does
 
 You **explore, brief, merge, verify, document** — you do **not** hand-write product
