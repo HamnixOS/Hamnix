@@ -26,12 +26,17 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
 - [x] Browser Google JS error partly fixed (`new Image()` stub). Remaining Google
   homepage TypeErrors + `eval` parse gap = broad ES/DOM completeness (own the search
   box → results-page path instead; do NOT boil the ocean).
-- [~] **Middle-mouse PRIMARY selection: make it SYSTEM-WIDE + fix editor/Notes.**
-  URL bar + independence gate shipped (`0f43e98d`), but user reports select/paste
-  still fails in editor/Notes on-device (prior host unit test passed — live event
-  path differs). Follow-up agent in flight: wire select→PRIMARY + button-2→paste
-  into shared text widgets (`lib/hamtextbox.ad`/`lib/htermsel.ad`) + fix button-2
-  event delivery through `devwsys.ad`; verify the REAL event loop, not a buffer unit.
+- [x] **Middle-mouse PRIMARY selection made SYSTEM-WIDE** (`87f63a33`): consolidated
+  select→PRIMARY + button-2→paste into shared `lib/hamtextbox.ad` (one place), converged
+  editor/Notes/terminal/browser-URL onto it, + a LIVE-event-path gate (feeds raw
+  `m x y 4` wire line, 17/17). Root cause was verification+architecture (hand-rolled in
+  4 places, prior gate only tested the buffer API), NOT a dropped button-2 event — the
+  code path is correct end-to-end (hid→devwsys→app all preserve bit2). ⚠ CAVEAT: the
+  on-device failure the USER saw in editor/Notes was NOT reproduced (‑smp2 on-device
+  skipped, wedges). If it still fails on-device after this, it's an on-device-only
+  event-routing/focus issue the host gate can't see → re-test on a healthier host.
+  OPEN follow-ups: browser rendered-PAGE text selection (pixel→DOM-run map, larger);
+  file-manager rename / calculator / dialog flat-buffer fields (per-app, 1-liner each).
 - [x] Audio prefers ALSA host backend. `e07b1fb4` — USER to confirm they hear it.
 - [x] Games: Snake + Chess new apps + Coin Dash wired into Games menu. `c143b446`
   (chess v1 lacks castling/en-passant/under-promotion — documented.)
@@ -41,8 +46,18 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
 - [D] **`enter linux` ~30s is DIAGNOSIS-ONLY, not a latency bug** — it's `-smp 2`
   DE-bring-up starvation (self-clears), the D3 SMP-fairness problem. Fix lives in
   the scheduler/DE-bring-up, NOT hamsh. See memory `project_enter_linux_slow_is_d3`.
-- [ ] Small: `test_hambrowse_float.sh` red on main — stale SEG regex omits the `s0`
-  strike field HEAD now emits; fix the regex.
+- [x] Small: `test_hambrowse_float.sh` stale SEG regex fixed (`0a0ba1dd`); + decimal
+  length regression gate added.
+
+### New fronts green-lit by USER (2026-07-17)
+- [~] **Scheduler fairness (D3 fix) — USER: "scheduler work is fine."** Fix the `-smp 2`
+  starvation where a fresh foreground fork/exec is blocked by the runlevel-5 DE bring-up
+  storm (root of the `enter linux` 30s AND the on-device -smp2 verification wedges).
+  `kernel/sched/core.ad` fork placement / load-balance / fairness. Agent in flight.
+- [~] **Adder → C-speed PARITY — USER RAISED THE BAR to 1.1× or 1.0× of gcc-O2** (was
+  ≤2×, met at 1.85×). The lever is the **P1 keystone**: destination-driven 2-operand
+  codegen in `adder/compiler/codegen.ad` to kill the stack-machine push/pop plumbing.
+  XL, fuzzer-gated, incremental. Agent in flight.
 
 ---
 
