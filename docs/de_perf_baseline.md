@@ -86,6 +86,74 @@ from scratch every time.
 - **Image blit** is cheap here (~0.34 ms) because it is one small 96×96 source;
   it scales with image area, not frame area.
 
+## AFTER — Phase C: DE host rasterizer routed through the vk 2D spine
+
+Phase C landed: `lib/hamui_host.ad` no longer owns a private software
+rasterizer. Every primitive now paints through the vk 2D primitive layer
+(`lib/vk/vk_2d.ad` — the exact ops the kernel vk command buffer replays at
+`vkQueueSubmit`) into a vk-style **RGBA8888** colour image
+(`VK_FORMAT_R8G8B8A8_UNORM`), which is flattened (RGBA → RGB) into a present
+buffer for the PPM writer. Mapping: `_fill_rect`→`vk2d_raster_fill_rect`,
+`_fill_rect_a`→`vk2d_raster_fill_rect_alpha`, `_host_blit_image`→
+`vk2d_raster_blit`, `_fill_roundrect`→`vk2d_raster_fill_roundrect`, glyph blits
+→`vk2d_raster_cov_mask` (font rasterizes each glyph to a coverage bitmap; the op
+stamps it), `_draw_line`→`vk2d_raster_draw_line`. The public `hamui_host_*` /
+hamscene API and all DE app code are unchanged.
+
+**Byte-identical pixels: PROVEN.** The representative bench frame
+(`BENCH_DE_PPM=1`, 58 primitives, 1024×768) is `cmp` byte-for-byte identical
+before vs after the reroute, and all six QEMU-free DE host gates
+(`test_shotoverlay_host`, `test_de_panel_clock_host`, `test_hamctl_host`,
+`test_hamctl_resize_host`, `test_hamctl_wallpaper_host`, `test_de_icon_wrap_host`)
+still PASS — including their per-pixel probes (headerbar gradient, MATE-blue
+selection row, dark-glyph-pixel counts, scrim-see-through). vk_2d's integer
+source-over/coverage math is identical to the old `_put_px_blend`, so the colour
+image's RGB channels evolve exactly as the old RGB framebuffer did (the
+write-only alpha byte is dropped at flatten).
+
+### AFTER numbers (same host, i7-8086K @ 4 GHz; load ~0.8–1.3; 200 iters, 3 runs, min-ms variance <0.4%)
+
+| Scene   | BEFORE min ms | AFTER min ms | composite-only BEFORE → AFTER |
+|---------|--------------:|-------------:|------------------------------:|
+| CLEAR   |          4.41 |     **9.57** |                           — |
+| **FULL**|     **24.29** |    **32.74** |         **19.88 → 23.18**   |
+| FILLS   |         21.72 |        29.59 |             17.31 → 20.02   |
+| GLYPHS  |          6.56 |        12.23 |              2.15 →  2.65   |
+| IMAGE   |          4.80 |        10.00 |              0.39 →  0.42   |
+
+**Result: a small–moderate REGRESSION on the CPU replay path, exactly as
+expected — NOT a speedup.** This is the honest outcome: vk2d's fills run the
+*same* software fill math as the old `hamui_host` inner loops, so no algorithmic
+speedup was possible on the CPU. Where the overhead comes from:
+
+1. **RGBA (4 bytes/px) vs the old RGB (3 bytes/px) colour target.** The vk image
+   is `VK_FORMAT_R8G8B8A8_UNORM`, so every pixel write moves 33% more bytes and
+   the frame carries a 4th channel. This is the dominant cost on the
+   fill-dominated frame (fills composite-only +2.7 ms, +16%).
+2. **Per-pixel clip bounds-checks in the shared vk2d store/blend.** The biggest
+   single jump is CLEAR (4.41 → 9.57 ms): the old `hamui_host_begin` cleared with
+   a tight `hostfb[i]=0` byte loop, whereas the clear now routes through
+   `vk2d_raster_fill_rect` → per-pixel `_vk2d_store` with four clip branches and
+   four byte stores per pixel. The composite-only classes (fills/glyphs/image)
+   grow only ~16% / ~23% / ~8%; the flatten pass (RGBA→RGB) is outside the timed
+   `hamui_host_rasterize`/`hamui_host_begin` loop.
+
+**This transitional CPU overhead is the price of becoming a vk client, and it is
+exactly what a GPU backend behind the same vk2d API (Phase D) erases:** a
+render-pass load-op clear (or `vkCmdClearColorImage`) collapses the CLEAR cost,
+and bulk rectangle fills / blits / a glyph atlas move off the scalar CPU path
+entirely — with the vk2d call sites and the byte-exact golden pixels unchanged.
+The value delivered here is architectural (the DE is now one vk client sharing
+the hamSDL/hamGame spine from Phase B), not a CPU-speed win.
+
+### Kernel compositor (`sys/src/9/port/devwsys.ad`) — deferred to Phase C.2
+
+Only the **host** compositor was rerouted this round (it is what the bench +
+before/after comparison measure). The kernel `devwsys.ad` twin routing is the
+deeper Phase C.2 follow-up: device-side text needs a **glyph atlas** to feed the
+coverage-mask op (the kernel has no host font rasterizer in the compositor path),
+so it is a larger change kept separate to hold this round byte-clean.
+
 ## Honesty note — does this host metric represent on-device DE compositing?
 
 **Mostly yes for the primitive math, with two caveats.**
