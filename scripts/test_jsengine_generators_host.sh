@@ -102,6 +102,15 @@ assert proto_break      'function* g(){yield 1;yield 2;yield 3}var r=[];for(cons
 # ---- bounded infinite generator: eager cap replays the first N correctly ----
 assert gen_bounded_fib  'function* fib(){let a=0,b=1;while(true){yield a;let t=a+b;a=b;b=t}}var it=fib();var r=[];for(let i=0;i<8;i++)r.push(it.next().value);console.log(r.join(","))' '0,1,1,2,3,5,8,13'
 
+# ---- generator methods: *name(){} in object literals and class bodies (round 7) ----
+assert genmeth_objlit    'var o={*g(){yield 1;yield 2;yield 3}};console.log([...o.g()].join(","))' '1,2,3'
+assert genmeth_obj_forof 'var o={*g(){yield 4;yield 5}};var s=0;for(const x of o.g())s+=x;console.log(s)' '9'
+assert genmeth_class     'class C{*nums(){yield "a";yield "b"}}console.log([...new C().nums()].join(","))' 'a,b'
+assert genmeth_static    'class C{static *ids(){yield 10;yield 20}}console.log([...C.ids()].join(","))' '10,20'
+assert genmeth_yieldstar 'class C{*g(){yield* [7,8,9]}}console.log([...new C().g()].join(","))' '7,8,9'
+assert genmeth_thisref   'class C{constructor(){this.v=3}*g(){yield this.v;yield this.v*2}}console.log([...new C().g()].join(","))' '3,6'
+assert genmeth_nextapi   'var o={*g(){yield 1;yield 2}};var it=o.g();console.log(it.next().value,it.next().value,it.next().done)' '1 2 true'
+
 if [ "$fail" -eq 0 ]; then
     echo "[js-gen] ALL PASS"
 else
