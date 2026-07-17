@@ -77,10 +77,14 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
     rasterizer (CLEAR 9.6→1.8). Games share vk2d → same speedup free. Residual (RGBA 4B blend +
     flatten) only the GPU erases. NOTE: `PACKED` is a reserved Adder token — can't be a local name
     (worked around as `pword`); consider un-reserving for identifier use [[feedback_compiler_quirks]].
-  - [~] **Phase D — virtio-gpu backend behind the vk API** IN FLIGHT (foundation): native
-    virtio-gpu device-up + scanout, a `vk_core` backend seam (default stays SW), GPU CLEAR PoC;
-    new `lib/vk/vk_gpu.ad`. Turns the CPU cost into a real DE+games speedup. Then C.2 (kernel
-    devwsys glyph atlas) + flip to GPU-default once faster.
+  - [x] **Phase D — virtio-gpu backend behind the vk API** DONE (`c732f5ba`+`5fa3bc4e`): new
+    `lib/vk/vk_gpu.ad` + `vk_core` seam (SW default / GPU opt-in, refuses if no device; SW present
+    byte-unchanged). GPU **CLEAR + PRESENT/scanout** on native virtio-gpu, VERIFIED ON-DEVICE
+    (OVMF+virtio-gpu-pci): GPU clear == SW reference byte-for-byte + 4-quadrant scanout screendump
+    correct, no leaked qemu. Fixed a dead gate (`HAMNIX_FORCE_SELFTESTS=1`, default off). Still SW: 2D/3D ops.
+  - [ ] **Phase D.2 / next GPU increments** — route 2D ops (fills→blits→roundrect) to write device
+    backing directly under the GPU backend; kernel `devwsys.ad` + glyph atlas; flip DE/games to
+    GPU-default once measured faster than the (already 2.7×-faster) SW path.
   - [x] **DE-speed baseline (USER)** DONE (`b3b6e710`): BEFORE = **24.3 ms/frame** @1024×768,
     fills **17.3 ms (~87%)**. `bench_de_compositor.sh` + `docs/de_perf_baseline.md`. Re-run after
     CPU-opt + GPU for the comparison. Caveat: host metric = compositing math; on-device frame-timing
