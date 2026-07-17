@@ -1,0 +1,419 @@
+# user/bench_de_host.ad — HOST performance benchmark for the DE compositor's
+# rasterization / compositing path (lib/hamscene.ad display-list builder ->
+# lib/hamui_host.ad rasterizer, the dual-target twin of the kernel scene
+# compositor in sys/src/9/port/devwsys.ad). Built for the x86_64-linux Adder
+# target; runs directly on the dev host, NO QEMU.
+#
+# WHY: before the Vulkan-unification work routes the DE through the vk spine
+# (a later phase), we need a REPEATABLE, deterministic BEFORE baseline for how
+# long it takes to composite one full DE frame on the CPU rasterizer, broken
+# down by primitive class, so the AFTER (vk-routed) run can be compared
+# apples-to-apples. This module does NOT change any DE rendering behavior — it
+# only builds representative scenes and times hamui_host_rasterize().
+#
+# WHAT IT MEASURES (all at a fixed resolution, see W/H below, over N iters):
+#   * FULL   — a representative DE frame: wallpaper + panel + taskbar + several
+#              windows (title bars, body text) + desktop icons + one image
+#              blit. This is the headline "ms per composited frame".
+#   * CLEAR  — hamui_host_begin() alone (the per-frame framebuffer clear), so
+#              the per-primitive-class numbers can be reported net of the clear.
+#   * FILLS  — only the solid/rounded rectangle fills of that frame.
+#   * GLYPHS — only the anti-aliased TrueType text of that frame.
+#   * IMAGE  — only the image (nearest-neighbor scaled RGBA) blits.
+# Per-class COMPOSITE cost is reported as (class_min - clear_min).
+#
+# Timing uses CLOCK_MONOTONIC via the raw Linux clock_gettime syscall (228) so
+# there is no dependence on any host-runtime symbol beyond sys_open/write/close.
+# The embedded DejaVu TTF faces and the 8x16 VGA font are loaded ONCE (guarded)
+# by the first hamui_host_begin(), so the timed loop measures pure raster cost.
+#
+# USAGE (built to build/host/bench_de_host):
+#   bench_de_host [ITERS] [OUT.ppm]
+#     ITERS   timed iterations per scene (default 100)
+#     OUT.ppm optional: also dump the representative FULL frame as a PPM
+
+extern def sys_open(path: Ptr[char], flags: int32, mode: int32) -> int32
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+from lib.hamscene import hamscene_begin, hamscene_fill, hamscene_rect, \
+    hamscene_roundrect, hamscene_stroke, hamscene_line, hamscene_text, \
+    hamscene_glyphs, hamscene_glyphs_bold, hamscene_image, \
+    hamscene_bufptr, hamscene_length
+from lib.hamui_host import hamui_host_begin, hamui_host_rasterize, \
+    hamui_host_register_image, hamui_host_ppm_header, hamui_host_fb_ptr, \
+    hamui_host_fb_bytes
+
+
+# ---- stdout helpers ------------------------------------------------------
+obuf: Array[1024, uint8]
+obuf_n: uint64 = 0
+
+
+def _o_ch(c: uint8):
+    if obuf_n < 1023:
+        obuf[obuf_n] = c
+        obuf_n = obuf_n + 1
+
+
+def _o_str(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0:
+        _o_ch(s[i])
+        i = i + 1
+
+
+def _o_dec(v: uint64):
+    if v == 0:
+        _o_ch(48)
+        return
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    while v > 0:
+        digs[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    while n > 0:
+        n = n - 1
+        _o_ch(digs[n])
+
+
+# Print a fixed-point value: whole.frac with `frac_digits` fractional digits,
+# from an integer numerator scaled by 10^frac_digits.
+def _o_fixed(scaled: uint64, frac_digits: uint64):
+    div: uint64 = 1
+    k: uint64 = 0
+    while k < frac_digits:
+        div = div * 10
+        k = k + 1
+    _o_dec(scaled / div)
+    _o_ch(46)                                            # '.'
+    rem: uint64 = scaled % div
+    # zero-pad the fractional part
+    p: uint64 = div / 10
+    while p >= 1:
+        _o_dec((rem / p) % 10)
+        if p == 1:
+            p = 0
+        else:
+            p = p / 10
+
+
+def _o_flush():
+    if obuf_n > 0:
+        sys_write(1, &obuf[0], obuf_n)
+        obuf_n = 0
+
+
+# ---- monotonic clock (raw Linux clock_gettime, syscall 228) --------------
+def _now_ns() -> uint64:
+    ts: Array[2, uint64]
+    ts[0] = 0
+    ts[1] = 0
+    __syscall2(228, 1, cast[uint64](&ts[0]))             # CLOCK_MONOTONIC = 1
+    return ts[0] * 1000000000 + ts[1]
+
+
+# ====================================================================
+# Synthetic 96x96 RGBA image (a diagonal gradient) so the IMAGE class has a
+# real, deterministic source to nearest-neighbor scale + alpha-composite.
+# ====================================================================
+IMG_W: int32 = 96
+IMG_H: int32 = 96
+img_rgba: Array[36864, uint8]                            # 96*96*4
+
+
+def _build_image():
+    y: int32 = 0
+    while y < IMG_H:
+        x: int32 = 0
+        while x < IMG_W:
+            o: uint64 = (cast[uint64](y) * cast[uint64](IMG_W)
+                         + cast[uint64](x)) * 4
+            img_rgba[o]     = cast[uint8]((x * 255) / IMG_W)
+            img_rgba[o + 1] = cast[uint8]((y * 255) / IMG_H)
+            img_rgba[o + 2] = cast[uint8](128)
+            img_rgba[o + 3] = cast[uint8](220)           # mostly opaque
+            x = x + 1
+        y = y + 1
+    hamui_host_register_image(cast[Ptr[uint8]]("bench_img"), IMG_W, IMG_H,
+                              &img_rgba[0])
+
+
+# ====================================================================
+# Scene builders. Each targets the SAME representative DE frame, but the
+# per-class builders emit ONLY their own primitive class so the timed
+# rasterize isolates that class's compositing cost.
+#
+# `mode`: 0 = FULL, 1 = FILLS only, 2 = GLYPHS only, 3 = IMAGE only.
+# ====================================================================
+W: int32 = 1024
+H: int32 = 768
+
+# Colour constants are accessor functions: Adder module globals require an
+# integer initializer, so a string-literal `cast[Ptr[uint8]]` cannot be a
+# global. Tiny functions returning the literal keep the call sites readable.
+def WALL() -> Ptr[uint8]:
+    return cast[Ptr[uint8]]("#2e3440")
+
+
+def PANEL() -> Ptr[uint8]:
+    return cast[Ptr[uint8]]("#b8b4ac")
+
+
+def EDGE() -> Ptr[uint8]:
+    return cast[Ptr[uint8]]("#707070")
+
+
+def WINBG() -> Ptr[uint8]:
+    return cast[Ptr[uint8]]("#f4f4f4")
+
+
+def TITLE() -> Ptr[uint8]:
+    return cast[Ptr[uint8]]("#3b6ea5")
+
+
+def FG() -> Ptr[uint8]:
+    return cast[Ptr[uint8]]("#202020")
+
+
+def WHITE() -> Ptr[uint8]:
+    return cast[Ptr[uint8]]("#ffffff")
+
+
+def ICONBG() -> Ptr[uint8]:
+    return cast[Ptr[uint8]]("#5e81ac")
+
+
+def _emit_fill(mode: int32, x: int32, y: int32, w: int32, h: int32,
+               c: Ptr[uint8]):
+    if mode == 0 or mode == 1:
+        hamscene_fill(x, y, w, h, c)
+
+
+def _emit_roundrect(mode: int32, x: int32, y: int32, w: int32, h: int32,
+                    r: int32, c: Ptr[uint8]):
+    if mode == 0 or mode == 1:
+        hamscene_roundrect(x, y, w, h, r, c)
+
+
+def _emit_stroke(mode: int32, x: int32, y: int32, w: int32, h: int32,
+                 t: int32, c: Ptr[uint8]):
+    if mode == 0 or mode == 1:
+        hamscene_stroke(x, y, w, h, t, c)
+
+
+def _emit_glyphs(mode: int32, x: int32, y: int32, s: Ptr[uint8],
+                 c: Ptr[uint8]):
+    if mode == 0 or mode == 2:
+        hamscene_glyphs(x, y, s, c)
+
+
+def _emit_image(mode: int32, x: int32, y: int32, w: int32, h: int32):
+    if mode == 0 or mode == 3:
+        hamscene_image(x, y, w, h, cast[Ptr[uint8]]("bench_img"))
+
+
+# Draw one window at (wx,wy) sized (ww,wh) with a title bar + N body lines.
+def _window(mode: int32, wx: int32, wy: int32, ww: int32, wh: int32,
+            title: Ptr[uint8], with_image: int32):
+    _emit_fill(mode, wx, wy, ww, wh, WINBG())              # body
+    _emit_stroke(mode, wx, wy, ww, wh, 1, EDGE())          # frame
+    _emit_roundrect(mode, wx, wy, ww, 26, 6, TITLE())      # title bar
+    _emit_glyphs(mode, wx + 8, wy + 6, title, WHITE())     # title text
+    # body text lines
+    ln: int32 = 0
+    ty: int32 = wy + 36
+    while ln < 8 and ty < wy + wh - 16:
+        _emit_glyphs(mode, wx + 10, ty,
+                     cast[Ptr[uint8]]("The quick brown fox jumps over 0123456789"),
+                     FG())
+        ty = ty + 18
+        ln = ln + 1
+    if with_image != 0:
+        _emit_image(mode, wx + ww - 108, wy + wh - 108, 96, 96)
+
+
+# Build the full representative DE frame (or one primitive class of it).
+def _build_scene(mode: int32) -> int32:
+    hamscene_begin()
+    # Wallpaper.
+    _emit_fill(mode, 0, 0, W, H, WALL())
+    # Top panel (menu bar) with app-menu + clock text.
+    _emit_fill(mode, 0, 0, W, 28, PANEL())
+    _emit_stroke(mode, 0, 0, W, 28, 1, EDGE())
+    _emit_glyphs(mode, 8, 6, cast[Ptr[uint8]]("Applications  Places  System"), FG())
+    _emit_glyphs(mode, W - 150, 6, cast[Ptr[uint8]]("Sat Jul 17  14:30"), FG())
+    # Bottom taskbar with three window buttons.
+    _emit_fill(mode, 0, H - 28, W, 28, PANEL())
+    _emit_stroke(mode, 0, H - 28, W, 28, 1, EDGE())
+    _emit_roundrect(mode, 6, H - 24, 150, 20, 4, TITLE())
+    _emit_glyphs(mode, 14, H - 23, cast[Ptr[uint8]]("Terminal"), WHITE())
+    _emit_roundrect(mode, 162, H - 24, 150, 20, 4, ICONBG())
+    _emit_glyphs(mode, 170, H - 23, cast[Ptr[uint8]]("Files"), WHITE())
+    _emit_roundrect(mode, 318, H - 24, 150, 20, 4, ICONBG())
+    _emit_glyphs(mode, 326, H - 23, cast[Ptr[uint8]]("Browser"), WHITE())
+    # Desktop icons (left column): icon tile + label.
+    di: int32 = 0
+    iy: int32 = 44
+    while di < 4:
+        _emit_roundrect(mode, 24, iy, 48, 48, 8, ICONBG())
+        _emit_glyphs(mode, 14, iy + 52, cast[Ptr[uint8]]("Folder"), WHITE())
+        iy = iy + 90
+        di = di + 1
+    # Three overlapping application windows; the middle one carries an image.
+    _window(mode, 120, 60, 520, 360, cast[Ptr[uint8]]("Terminal  -  bash"), 0)
+    _window(mode, 300, 180, 560, 400,
+            cast[Ptr[uint8]]("Files  -  /home/david"), 1)
+    _window(mode, 200, 320, 480, 300, cast[Ptr[uint8]]("hambrowse"), 0)
+    return cast[int32](hamscene_length())
+
+
+# ====================================================================
+# Timing: run one scene `mode` for `iters` timed iterations (after a few
+# warmups), returning the MIN and MEAN frame time in nanoseconds via out
+# params. Each iteration is a full frame: clear (hamui_host_begin) + raster.
+# ====================================================================
+_last_min_ns: uint64 = 0
+_last_mean_ns: uint64 = 0
+_last_prims: int32 = 0
+
+
+def _time_scene(mode: int32, iters: uint64, do_raster: int32):
+    _build_scene(mode)
+    # Warmups (also trigger the one-time font decode on the first begin).
+    w: uint64 = 0
+    while w < 3:
+        hamui_host_begin(W, H)
+        if do_raster != 0:
+            hamui_host_rasterize()
+        w = w + 1
+    best: uint64 = 0
+    sum: uint64 = 0
+    i: uint64 = 0
+    prims: int32 = 0
+    while i < iters:
+        t0: uint64 = _now_ns()
+        hamui_host_begin(W, H)
+        if do_raster != 0:
+            prims = hamui_host_rasterize()
+        t1: uint64 = _now_ns()
+        dt: uint64 = t1 - t0
+        if i == 0 or dt < best:
+            best = dt
+        sum = sum + dt
+        i = i + 1
+    _last_min_ns = best
+    if iters > 0:
+        _last_mean_ns = sum / iters
+    else:
+        _last_mean_ns = 0
+    _last_prims = prims
+
+
+# Report one row: LABEL min_ms mean_ms (ms to 3 decimals from ns).
+def _row(label: Ptr[uint8]):
+    _o_str(label)
+    _o_str(cast[Ptr[uint8]](" min_ms="))
+    _o_fixed(_last_min_ns / 1000, 3)                     # ns/1000 = us; /1000 -> ms w/ 3dp
+    _o_str(cast[Ptr[uint8]](" mean_ms="))
+    _o_fixed(_last_mean_ns / 1000, 3)
+    _o_ch(10)
+    _o_flush()
+
+
+ppm_hdr: Array[64, uint8]
+
+
+def _write_ppm(path: Ptr[char]):
+    fd: int32 = sys_open(path, 577, 420)                 # O_WRONLY|O_CREAT|O_TRUNC, 0644
+    if fd < 0:
+        return
+    hlen: uint64 = hamui_host_ppm_header(&ppm_hdr[0])
+    sys_write(fd, &ppm_hdr[0], hlen)
+    sys_write(fd, hamui_host_fb_ptr(), hamui_host_fb_bytes())
+    sys_close(fd)
+
+
+def _parse_uint(s: Ptr[uint8]) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while s[i] >= 48 and s[i] <= 57:
+        v = v * 10 + cast[uint64](s[i]) - 48
+        i = i + 1
+    return v
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    iters: uint64 = 100
+    if argc >= 2:
+        p: uint64 = _parse_uint(cast[Ptr[uint8]](argv[1]))
+        if p > 0:
+            iters = p
+
+    _build_image()
+
+    _o_str(cast[Ptr[uint8]]("BENCH-DE-COMPOSITOR\n"))
+    _o_str(cast[Ptr[uint8]]("res "))
+    _o_dec(cast[uint64](W))
+    _o_ch(120)                                           # 'x'
+    _o_dec(cast[uint64](H))
+    _o_str(cast[Ptr[uint8]](" iters "))
+    _o_dec(iters)
+    _o_ch(10)
+    _o_flush()
+
+    # CLEAR: framebuffer clear only (begin without rasterize).
+    _time_scene(0, iters, 0)
+    _row(cast[Ptr[uint8]]("CLEAR "))
+    clear_min: uint64 = _last_min_ns
+
+    # FULL frame (headline).
+    _time_scene(0, iters, 1)
+    _row(cast[Ptr[uint8]]("FULL  "))
+    full_prims: int32 = _last_prims
+    full_min: uint64 = _last_min_ns
+
+    # Per-primitive-class isolation.
+    _time_scene(1, iters, 1)
+    _row(cast[Ptr[uint8]]("FILLS "))
+    fills_min: uint64 = _last_min_ns
+    _time_scene(2, iters, 1)
+    _row(cast[Ptr[uint8]]("GLYPHS"))
+    glyphs_min: uint64 = _last_min_ns
+    _time_scene(3, iters, 1)
+    _row(cast[Ptr[uint8]]("IMAGE "))
+    image_min: uint64 = _last_min_ns
+
+    # Net-of-clear composite cost per class (guard against underflow).
+    _o_str(cast[Ptr[uint8]]("--- composite-only (class_min - clear_min), ms ---\n"))
+    _emit_net(cast[Ptr[uint8]]("fills_ms  "), fills_min, clear_min)
+    _emit_net(cast[Ptr[uint8]]("glyphs_ms "), glyphs_min, clear_min)
+    _emit_net(cast[Ptr[uint8]]("image_ms  "), image_min, clear_min)
+    _emit_net(cast[Ptr[uint8]]("full_ms   "), full_min, clear_min)
+    _o_flush()
+
+    _o_str(cast[Ptr[uint8]]("prims "))
+    _o_dec(cast[uint64](full_prims))
+    _o_ch(10)
+    _o_flush()
+
+    # Optional PPM dump of the representative FULL frame for visual sanity.
+    if argc >= 3:
+        _build_scene(0)
+        hamui_host_begin(W, H)
+        hamui_host_rasterize()
+        _write_ppm(cast[Ptr[char]](argv[2]))
+        _o_str(cast[Ptr[uint8]]("wrote-ppm\n"))
+        _o_flush()
+
+    return 0
+
+
+def _emit_net(label: Ptr[uint8], class_min: uint64, clear_min: uint64):
+    net: uint64 = 0
+    if class_min > clear_min:
+        net = class_min - clear_min
+    _o_str(label)
+    _o_fixed(net / 1000, 3)
+    _o_ch(10)
