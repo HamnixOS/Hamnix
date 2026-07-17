@@ -2,6 +2,16 @@
 
 From a 14-agent parallel audit (2026-07-16). Dual-target, host-iterated (~40 gates). ~30-50% conformant/area; full conformance needs real spec ALGORITHMS per subsystem — enabled by the modular lib/web/ tree refactor.
 
+## ECMAScript rounds landed (lib/web/js/*, host gates in scripts/test_jsengine_*_host.sh)
+
+- R1-6: templates/tagged templates, classes + fields + accessors, Symbol + well-known symbols, change-array-by-copy, regex named groups, generators (`function*`/`yield`/`yield*`, bounded-eager model) + the iteration protocol, Map/Set, optional chaining/nullish, for-of, Object/Reflect-ish statics.
+- **R7** (this round):
+  - **Generator methods** — `*name(){}` in object literals and class bodies (incl. `static *m(){}`). `test_jsengine_generators_host.sh`.
+  - **Reflect** — get/set/has/ownKeys/getPrototypeOf/setPrototypeOf/defineProperty/deleteProperty/apply/construct (thin wrappers over core ops). Also fixed the `in` operator to walk the prototype chain. `test_jsengine_reflect_host.sh`.
+  - **Proxy** — `new Proxy(target, handler)` with the get/set/has/deleteProperty/ownKeys traps routed through member-get/set, `in`, `delete`, Object.keys/Reflect.ownKeys; absent trap forwards to target. Deferred: apply/construct/defineProperty/getOwnPropertyDescriptor/get(set)PrototypeOf traps, revocable. `test_jsengine_proxy_host.sh`.
+  - **Typed arrays + ArrayBuffer** — byte-backed (shared pool, little-endian pointer load/store): Int8/Uint8/Uint8Clamped/Int16/Uint16/Int32/Uint32/Float32/Float64. Construct from length / array / iterable / ArrayBuffer (shared view); indexed get/set with ToInt32+mask (clamp for Uint8Clamped); length/byteLength/byteOffset/buffer/BYTES_PER_ELEMENT; set()/subarray()/slice()/fill(); for-of/spread/Array.from; static of()/from(). Deferred: full Array method suite on views, DataView, BigInt64 arrays, endianness control. `test_jsengine_typedarray_host.sh`.
+  - **structuredClone(value)** — deep clone preserving shared refs + cycles; plain objects/arrays/Map/Set/Date/ArrayBuffer/typed arrays; functions/symbols throw DataCloneError. Deferred: accessor props, transfer list. `test_jsengine_structuredclone_host.sh`.
+
 ## Coverage by area
 
 | Area | Coverage | Gaps | High |
