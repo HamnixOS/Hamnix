@@ -55,6 +55,11 @@ assert_grep 'GREEKVAR μ ν ξ ρ τ φ ψ ς'   "&mu;/&nu;/&xi;/&rho;/&tau;/&ph
 # Prefix disambiguation: &sigma; and &sigmaf; are distinct; &eta;/&theta; too.
 assert_grep 'PREFIX σ=ς η/θ ok'           "prefix pairs (&sigma; vs &sigmaf;, &eta; vs &theta;) do not cross-match"
 
+# Double-struck arrows + set-theory / logic relations.
+assert_grep 'DBLARR ⇐ ⇑ ⇒ ⇓ ⇔'          "double arrows &lArr;/&uArr;/&rArr;/&dArr;/&hArr; decode"
+assert_grep 'LOGIC ∀ ∃ ∅ ∇ ∈ ∉ ∧ ∨'    "logic &forall;/&exist;/&empty;/&nabla;/&isin;/&notin;/&and;/&or; decode"
+assert_grep 'SETREL ∩ ∪ ⊂ ⊃ ⊆ ⊇ ≅ ⊥'   "set relations &cap;/&cup;/&sub;/&sup;/&sube;/&supe;/&cong;/&perp; decode"
+
 if [ "$fail" -ne 0 ]; then
     echo "[hb-e2] RESULT: FAIL"; exit 1
 fi
