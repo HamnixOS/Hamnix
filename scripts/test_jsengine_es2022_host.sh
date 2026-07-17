@@ -6,11 +6,12 @@
 #
 # Covered this round:
 #   Built-ins: Object.prototype.{hasOwnProperty,propertyIsEnumerable,isPrototypeOf};
-#              Symbol() basics (typeof, uniqueness, description, Symbol.iterator).
+#              String.{raw,fromCharCode,fromCodePoint}.
 #   Language:  object-literal getters/setters (get x(){}/set x(v){}),
 #              computed property/method names {[expr]:v}/{[expr](){}},
 #              class instance + static fields (x=v / static y=v),
-#              tagged templates (substitution values passed to the tag fn).
+#              tagged templates (proper template AST: the tag fn receives
+#              (strings, ...values) with strings.raw = verbatim chunks).
 #
 # Builds with the frozen Python seed compiler (dependency-light, no self-host).
 
@@ -91,6 +92,24 @@ assert cg_field     'class C{n=10;get d(){return this.n*2}}console.log(new C().d
 assert cg_static    'class C{static get v(){return 99}}console.log(C.v)'                                '99'
 assert cg_getmeth   'class C{get(){return 7}}console.log(new C().get())'                               '7'
 assert cg_mixed     'class C{constructor(){this._n=1}get n(){return this._n}set n(v){this._n=v}dbl(){return this._n*2}}var c=new C();c.n=4;console.log(c.n,c.dbl())' '4 8'
+
+# ---- tagged templates (proper template node: strings + values + strings.raw) ----
+assert tt_values    'function t(s,x,y){return s[0]+x+s[1]+y+s[2]}console.log(t`a${1}b${2}c`)'          'a1b2c'
+assert tt_count     'function t(s,...v){return s.length+":"+v.length}console.log(t`a${1}b${2}c`)'       '3:2'
+assert tt_raw       'function t(s){return s.raw[0]}console.log(t`a\nb`)'                                 'a\nb'
+assert tt_cooked    'function t(s){return s[0].length+","+s.raw[0].length}console.log(t`x\ty`)'         '3,4'
+assert tt_nosub     'function t(s){return s.length+s[0]}console.log(t`hi`)'                              '1hi'
+assert tt_expr      'var n=5;function t(s,v){return v*2}console.log(t`${n}`)'                            '10'
+assert tt_untagged  'var x=3;console.log(`v=${x+1}!`)'                                                   'v=4!'
+assert tt_nested    'var a="Z";console.log(`o${`i${a}`}o`)'                                              'oiZo'
+assert sr_basic     'console.log(String.raw`a\n${1}b`)'                                                  'a\n1b'
+assert sr_tab       'console.log(String.raw`\t${1+1}A`)'                                                 '\t2A'
+assert sr_nosub     'console.log(String.raw`plain\d`)'                                                   'plain\d'
+
+# ---- String.fromCharCode / fromCodePoint ----
+assert scc_basic    'console.log(String.fromCharCode(72,105))'                                           'Hi'
+assert scc_one      'console.log(String.fromCharCode(65))'                                               'A'
+assert scp_basic    'console.log(String.fromCodePoint(97,98,99))'                                        'abc'
 
 if [ "$fail" -eq 0 ]; then
     echo "[js-es2022] RESULT: PASS"
