@@ -55,14 +55,21 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
   in the shell, not just Adder. TRIGGER: dispatch once the hamsh host dual-target lands
   (host-verify the bindings through that seam, no QEMU). Adder core + host renderer
   (`hamsdl_host.ad`/`hamgame_host.ad`) already exist.
-- [ ] **Vulkan track: 3D + acceleration prep** — the SW spine `lib/vk/{vk_core,vk_raster,
-  vk_selftest,vk_window_demo}.ad` ALREADY does depth-buffered triangle raster (Phase 0,
-  GPU #181). Next increment: a VERTEX-TRANSFORM stage (mat4 MVP + perspective projection
-  + perspective-correct interp), indexed meshes (`vkCmdDrawIndexed`), a rotating-cube 3D
-  demo+gate, and scaffold the **virtio-gpu backend behind the SAME VK API** (`drivers/
-  video/virtio_gpu.ad`) so real acceleration slots in later. TRIGGER: dispatch when the
-  P1 (bench-timing) OR scheduler (-smp2-timing) agent frees — a build/QEMU-heavy Vulkan
-  agent would corrupt their timing measurements if run concurrently.
+- **★ Vulkan UNIFICATION campaign (USER: "make DE + SDL use the vulkan backend").**
+  Today `lib/vk` is an ISLAND — hamSDL, the DE compositor (`hamui_host`/`devwsys`), and
+  `vk_raster` are THREE separate SW rasterizers. Unify everything onto the vk API so a
+  future GPU backend behind that API accelerates the whole desktop + all games at once.
+  - [~] **Phase A — vk 2D primitive layer** (`lib/vk/vk_2d.ad`: fill_rect, alpha, blit/
+    textured-quad, line) so vk can express what the DE/SDL draw. Host-render gate. IN FLIGHT.
+  - [ ] **Phase B — route hamSDL through vk** (sdl_fill_rect/blit/draw_text → vk2d ops;
+    games become vk clients, get depth/3D + future accel). TRIGGER: after Phase A lands.
+  - [ ] **Phase C — route the DE compositor through vk** (hamui_host/devwsys composite
+    window scenes via vk present/blits). Biggest/riskiest (touches kernel). After B.
+  - [ ] **Phase D (parallel/later) — virtio-gpu / silicon backend behind the SAME vk API**
+    (`drivers/video/virtio_gpu.ad`) → accelerates DE + games once they're vk clients.
+  - [ ] **3D/accel-prep (parallel):** MVP vertex transform + perspective + indexed meshes
+    (`vkCmdDrawIndexed`) + rotating-cube demo — extends the same API. vk_raster already
+    does depth-buffered triangles.
 
 ### New fronts green-lit by USER (2026-07-17)
 - [~] **Scheduler fairness (D3 fix) — USER: "scheduler work is fine."** Fix the `-smp 2`
