@@ -270,5 +270,239 @@ sys_exit:
     jmp     .L_exit_hang
     .size sys_exit, .-sys_exit
 
+    /* ================================================================
+     * hamsh host-language runtime (scripts/test_hamsh_lang_host.sh)
+     *
+     * user/hamsh.ad — the SAME shell that runs as /init on-device —
+     * compiled for x86_64-linux so its Python-flavored LANGUAGE core
+     * (lexer, parser, tree-walking evaluator: arithmetic, strings,
+     * if/for/while, def/call, variable expansion) can be unit-tested on
+     * the developer's host with NO QEMU. hamsh binds ~30 kernel /
+     * namespace / 9P syscalls that do not exist on Linux. Two honest
+     * classes:
+     *
+     *   (1) Ops with a faithful host equivalent — mapped to the real
+     *       Linux syscall so the shared native source behaves the same on
+     *       host (cwd, chdir, dup, mmap arena, getuid, yield, setpgid,
+     *       and a genuine non-blocking read for the line editor).
+     *   (2) Plan 9 namespace / chan / spawn / service ops with NO host
+     *       analog — fail-closed stubs (return -1, or 0/empty where the
+     *       type demands it). This mirrors the fail-closed spawn stubs
+     *       above (sys_rfork / sys_execve_env / ...). A host language
+     *       test never reaches these; if a namespace / pipeline path ever
+     *       did, it errors cleanly rather than faking success.
+     *
+     * The test drives the shell over a stdin PIPE with `--no-echo`, so
+     * two stubs are shaped to make the interactive editor consume piped
+     * input honestly: sys_fdslot_kind reports fd 0 as a pipe read-end
+     * (DEVFD_PIPE_R = 2) so ed_readline skips its console getty-flush that
+     * would otherwise discard the buffered script, and sys_read_nb is a
+     * true non-blocking read that maps -EAGAIN to 0 (the on-device
+     * "no byte ready yet" contract, distinct from a negative true EOF).
+     * ================================================================ */
+
+    /* --- (1) real host syscalls ------------------------------------- */
+
+    /* sys_getcwd(buf, count) -> int64  (rdi=buf, rsi=count already aligned) */
+    .globl sys_getcwd
+    .type sys_getcwd, @function
+sys_getcwd:
+    movq    $SYS_getcwd, %rax
+    syscall
+    ret
+    .size sys_getcwd, .-sys_getcwd
+
+    /* sys_chdir(path) -> int32 */
+    .globl sys_chdir
+    .type sys_chdir, @function
+sys_chdir:
+    movq    $SYS_chdir, %rax
+    syscall
+    ret
+    .size sys_chdir, .-sys_chdir
+
+    /* sys_dup(oldfd) -> int32 */
+    .globl sys_dup
+    .type sys_dup, @function
+sys_dup:
+    movq    $SYS_dup, %rax
+    syscall
+    ret
+    .size sys_dup, .-sys_dup
+
+    /* sys_getuid() -> uint32 */
+    .globl sys_getuid
+    .type sys_getuid, @function
+sys_getuid:
+    movq    $SYS_getuid, %rax
+    syscall
+    ret
+    .size sys_getuid, .-sys_getuid
+
+    /* sys_yield() -> int32  (sched_yield) */
+    .globl sys_yield
+    .type sys_yield, @function
+sys_yield:
+    movq    $SYS_sched_yield, %rax
+    syscall
+    ret
+    .size sys_yield, .-sys_yield
+
+    /* sys_setpgid(pid, pgid) -> int32  (rdi=pid, rsi=pgid) */
+    .globl sys_setpgid
+    .type sys_setpgid, @function
+sys_setpgid:
+    movq    $SYS_setpgid, %rax
+    syscall
+    ret
+    .size sys_setpgid, .-sys_setpgid
+
+    /* sys_mmap(addr, len, prot, flags, fd, off) -> int64
+     * Fn convention rdi,rsi,rdx,rcx,r8,r9 -> syscall wants arg4 in r10.
+     * Backs hamUI's module arena (_h_v2_alloc) so any host allocation
+     * path works rather than fail-closed. */
+    .globl sys_mmap
+    .type sys_mmap, @function
+sys_mmap:
+    movq    %rcx, %r10
+    movq    $SYS_mmap, %rax
+    syscall
+    ret
+    .size sys_mmap, .-sys_mmap
+
+    /* sys_read_nb(fd, buf, count) -> int64 : genuine non-blocking read.
+     * Mark the fd O_NONBLOCK (F_SETFL=4, O_NONBLOCK=0x800) then read. Map
+     * -EAGAIN (-11) to 0 so the on-device contract holds: 0 == "no byte
+     * ready yet" (editor idles + yields), a negative == true EOF/error.
+     * This is what lets the hamsh line editor consume a piped host script
+     * over fd 0 (scripts/test_hamsh_lang_host.sh). F_SETFL cannot alter
+     * the access mode, so a read fd stays readable. */
+    .globl sys_read_nb
+    .type sys_read_nb, @function
+sys_read_nb:
+    pushq   %rdi
+    pushq   %rsi
+    pushq   %rdx
+    movq    $4, %rsi               /* F_SETFL */
+    movq    $0x800, %rdx           /* O_NONBLOCK */
+    movq    $SYS_fcntl, %rax
+    syscall
+    popq    %rdx
+    popq    %rsi
+    popq    %rdi
+    movq    $SYS_read, %rax
+    syscall
+    cmpq    $-11, %rax             /* -EAGAIN -> report 0 (no data yet) */
+    jne     .L_read_nb_done
+    xorq    %rax, %rax
+.L_read_nb_done:
+    ret
+    .size sys_read_nb, .-sys_read_nb
+
+    /* --- (2) Plan 9 / namespace / chan / spawn — fail-closed stubs --- */
+
+    /* sys_fdslot_kind(pid, fdnum) -> int32 : the shell probes fd 0's kind
+     * to decide whether to run its console getty-flush. Report fd 0 as a
+     * pipe read-end (DEVFD_PIPE_R = 2) so the flush is skipped and piped
+     * script bytes survive; every other fd has no host slot (-1). */
+    .globl sys_fdslot_kind
+    .type sys_fdslot_kind, @function
+sys_fdslot_kind:
+    testq   %rsi, %rsi             /* fdnum == 0 ? */
+    jnz     .L_fdslot_notzero
+    movq    $2, %rax               /* DEVFD_PIPE_R */
+    ret
+.L_fdslot_notzero:
+    movq    $-1, %rax
+    ret
+    .size sys_fdslot_kind, .-sys_fdslot_kind
+
+    /* sys_errstr(buf, nbuf) -> int32 : no Plan 9 error string on host.
+     * NUL-terminate the caller buffer (if any) and report empty. */
+    .globl sys_errstr
+    .type sys_errstr, @function
+sys_errstr:
+    testq   %rsi, %rsi
+    jz      .L_errstr_done
+    movb    $0, (%rdi)
+.L_errstr_done:
+    xorq    %rax, %rax
+    ret
+    .size sys_errstr, .-sys_errstr
+
+    /* sys_nsid() -> uint64 : no namespace id on host. */
+    .globl sys_nsid
+    .type sys_nsid, @function
+sys_nsid:
+    xorq    %rax, %rax
+    ret
+    .size sys_nsid, .-sys_nsid
+
+    /* sys_get_jiffies() -> uint64 : no kernel tick; report 0. */
+    .globl sys_get_jiffies
+    .type sys_get_jiffies, @function
+sys_get_jiffies:
+    xorq    %rax, %rax
+    ret
+    .size sys_get_jiffies, .-sys_get_jiffies
+
+    /* The remaining ops share one fail-closed body: return -1. */
+    .globl sys_bind
+    .type sys_bind, @function
+sys_bind:
+    .globl sys_unmount
+    .type sys_unmount, @function
+sys_unmount:
+    .globl sys_mount
+    .type sys_mount, @function
+sys_mount:
+    .globl sys_nslabel
+    .type sys_nslabel, @function
+sys_nslabel:
+    .globl sys_srv_open
+    .type sys_srv_open, @function
+sys_srv_open:
+    .globl sys_openchan
+    .type sys_openchan, @function
+sys_openchan:
+    .globl sys_pipechan
+    .type sys_pipechan, @function
+sys_pipechan:
+    .globl sys_fdslot_arg
+    .type sys_fdslot_arg, @function
+sys_fdslot_arg:
+    .globl sys_svc_publish
+    .type sys_svc_publish, @function
+sys_svc_publish:
+    .globl sys_svc_ctl
+    .type sys_svc_ctl, @function
+sys_svc_ctl:
+    .globl sys_setuid
+    .type sys_setuid, @function
+sys_setuid:
+    .globl sys_setuid_auth
+    .type sys_setuid_auth, @function
+sys_setuid_auth:
+    .globl sys_pgrp_kill
+    .type sys_pgrp_kill, @function
+sys_pgrp_kill:
+    .globl sys_tcsetpgrp
+    .type sys_tcsetpgrp, @function
+sys_tcsetpgrp:
+    .globl sys_waitpid
+    .type sys_waitpid, @function
+sys_waitpid:
+    .globl sys_waitpid_jc
+    .type sys_waitpid_jc, @function
+sys_waitpid_jc:
+    .globl sys_waitpid_nb_raw
+    .type sys_waitpid_nb_raw, @function
+sys_waitpid_nb_raw:
+    .globl sys_waitfds
+    .type sys_waitfds, @function
+sys_waitfds:
+    movq    $-1, %rax
+    ret
+
     /* Non-executable stack marker (suppress ld's executable-stack warn). */
     .section .note.GNU-stack, "", @progbits

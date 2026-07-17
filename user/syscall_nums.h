@@ -45,6 +45,17 @@
     .set SYS_unlink, 87
     .set SYS_dup2,   33
     .set SYS_exit,   60
+    /* Extra host syscalls the hamsh host-language runtime maps onto
+     * (scripts/test_hamsh_lang_host.sh); everything else the shell's
+     * kernel/namespace externs need is an honest fail-closed stub. */
+    .set SYS_mmap,        9
+    .set SYS_sched_yield, 24
+    .set SYS_dup,         32
+    .set SYS_fcntl,       72
+    .set SYS_getcwd,      79
+    .set SYS_chdir,       80
+    .set SYS_getuid,      102
+    .set SYS_setpgid,     109
 #endif /* LINUX_ABI */
 
 /* -------------------------------------------------------------------------
