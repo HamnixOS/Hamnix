@@ -85,16 +85,15 @@ NET=(); if [ -z "${NO_NET:-}" ]; then NET=(-netdev user,id=hnet0 -device virtio-
 # has NO sound device at all (hda_init skips) — the "nothing is audible" report.
 #
 # HDA_AUDIODEV picks the HOST backend. Default = auto-detect a backend that
-# ACTUALLY EMITS to the host speakers: a modern desktop runs PipeWire (native
-# `pipewire-0` socket) and MAY or may NOT expose the PulseAudio compat socket, so
-# detecting only pulse (the old behaviour) silently fell through to `none` =
-# SILENCE on a pipewire-only session — that is the "audio never reaches the host
-# speakers" report. We now prefer the native `pipewire` QEMU backend when a
-# pipewire socket exists AND this QEMU build supports it, then fall back to `pa`
-# (works against pipewire-pulse too), and only pick `none` when there is no
-# running sound server at all. Set HDA_AUDIODEV=pipewire|pa|alsa|sdl|none to
-# override, or HDA_AUDIODEV=wav,path=/tmp/out.wav to capture guest audio to a
-# file. `none` still enumerates the device (DE works) but you won't hear it.
+# ACTUALLY EMITS to the host speakers. We prefer **alsa** first: it is the
+# lowest-level, most universally present sink and it works even when a session's
+# PipeWire/PulseAudio routing is broken or misconfigured (observed on the dev box
+# — pipewire did NOT emit there, ALSA to the default card did). We only need a
+# real ALSA playback card present. Then fall back to native `pipewire`, then `pa`
+# (works against pipewire-pulse too), and only pick `none` when nothing is usable.
+# Set HDA_AUDIODEV=alsa|pipewire|pa|sdl|none to override, or
+# HDA_AUDIODEV=wav,path=/tmp/out.wav to capture guest audio to a file. `none`
+# still enumerates the device (DE works) but you won't hear it.
 _qemu_has_audiodev() {   # $1=backend name -> 0 if this qemu build lists it
     qemu-system-x86_64 -audiodev help 2>/dev/null | grep -qx "$1"
 }
@@ -102,6 +101,9 @@ if [ -z "${HDA_AUDIODEV:-}" ]; then
     _xrd="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     if [ -n "${NO_AUDIO:-}" ]; then
         HDA_AUDIODEV="none"
+    elif _qemu_has_audiodev alsa && [ -e /proc/asound/cards ] && grep -q '[0-9]' /proc/asound/cards 2>/dev/null; then
+        HDA_AUDIODEV="alsa"
+        [ -z "${HEADLESS:-}" ] && say "audio backend: alsa (default host card; override with HDA_AUDIODEV=pipewire|pa)"
     elif [ -S "$_xrd/pipewire-0" ] && _qemu_has_audiodev pipewire; then
         HDA_AUDIODEV="pipewire"
         [ -z "${HEADLESS:-}" ] && say "audio backend: pipewire (native socket $_xrd/pipewire-0)"
@@ -110,7 +112,7 @@ if [ -z "${HDA_AUDIODEV:-}" ]; then
         [ -z "${HEADLESS:-}" ] && say "audio backend: pa (PulseAudio socket)"
     else
         HDA_AUDIODEV="none"
-        [ -z "${HEADLESS:-}" ] && say "no PipeWire/PulseAudio socket found: audio device enumerated but muted (set HDA_AUDIODEV=pipewire|pa|alsa|sdl to hear it)"
+        [ -z "${HEADLESS:-}" ] && say "no ALSA card / PipeWire / PulseAudio found: audio device enumerated but muted (set HDA_AUDIODEV=alsa|pipewire|pa|sdl to hear it)"
     fi
 fi
 AUDIO=(-audiodev "${HDA_AUDIODEV},id=snd0" -device intel-hda -device hda-output,audiodev=snd0)
