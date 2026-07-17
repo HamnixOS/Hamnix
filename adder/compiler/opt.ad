@@ -1252,6 +1252,21 @@ def opt_run(prog: uint32):
     # Program-wide GLOBAL-name set — the dead-STORE elimination consults it so it
     # never drops an externally-observable store to a global scalar.
     opt_gname_build(decls)
+    # Phase 0 — RECURSION -> ITERATION. Runs FIRST (before fold/CSE/LICM/DCE) so
+    # the emitted iterative loop is then seen by the ordinary loop passes. Rewrites
+    # a two-term ADDITIVE linear-recurrence self-recursion (the Fibonacci shape
+    # `if n < B: return n` / `return f(n-1)+f(n-2)`) into an equivalent bottom-up
+    # `while` loop that carries the two running values — killing the exponential
+    # call-tree. --opt-gated (opt_run already returned if disabled) and strictly
+    # value-preserving: the iterative locals are typed with the function's own
+    # integer return type so every add wraps at the SAME width the recursion did,
+    # and the seeds are the base-case identity values f(B-2), f(B-1). A CONSERVATIVE
+    # exact-shape match only (see opt_rec2iter_function) — anything else is refused.
+    cur0: uint32 = decls
+    while cur0 != 0:
+        if nd_kind[cur0] == ND_FUNCTION:
+            opt_rec2iter_function(cur0)
+        cur0 = nd_next[cur0]
     cur: uint32 = decls
     while cur != 0:
         opt_walk(cur)
@@ -1330,6 +1345,320 @@ def opt_run(prog: uint32):
         if nd_kind[cur] == ND_FUNCTION:
             opt_dce_function(cur)
         cur = nd_next[cur]
+
+
+# =======================================================================
+# Phase 0 — RECURSION -> ITERATION (two-term additive linear recurrence).
+# =======================================================================
+#
+# gcc-O2's edge on the naive recursive `fib` kernel is ALGORITHMIC: it turns the
+# exponential call tree into a bottom-up O(n) loop. This pass does the same for
+# the exact, conservatively-recognised Fibonacci shape:
+#
+#     def f(n: intT) -> intT:            def f(n: intT) -> intT:
+#         if n < B:                          if n < B:            # guard KEPT
+#             return n                           return n
+#         return f(n-1) + f(n-2)  ===>       prev = B-2           # f(B-2)
+#                                            cur  = B-1           # f(B-1)
+#                                            nxt  = 0
+#                                            i    = B
+#                                            while i <= n:
+#                                                nxt  = prev + cur
+#                                                prev = cur
+#                                                cur  = nxt
+#                                                i    = i + 1
+#                                            return cur
+#
+# CORRECTNESS. The recurrence f(k)=f(k-1)+f(k-2) with the identity base case
+# f(k)=k for k<B has the closed iterative form above: for n<B the guard returns
+# n unchanged; for n>=B, seeding prev=f(B-2), cur=f(B-1) (both base values,
+# since B-2<B and B-1<B) and iterating i=B..n leaves cur=f(n). Integer addition
+# is associative/commutative modulo 2^width, so the iterative additions produce
+# the IDENTICAL wrapped value the recursion would — including overflow. The
+# iterative locals are typed with f's own integer return type (same width code),
+# so every add wraps exactly as the recursive returns did. Values match for all
+# inputs incl. n<0 (guard true -> return n) and huge n (same wraparound).
+#
+# ELIGIBILITY (all required; anything else is refused — a conservative miss just
+# leaves the recursion intact):
+#   * exactly one param, integer-typed; integer return type of the SAME type code
+#   * no decorators
+#   * body is EXACTLY two statements: an `if` guard then a `return`
+#   * guard: `if <param> < B:` (B a constant integer literal >= 2, cast-peeled),
+#     no elif, no else, whose then-body is EXACTLY `return <param>` (identity base)
+#   * final stmt: `return <self-call> + <self-call>` (ADD), each call `f(<param> - d)`
+#     with d a constant integer; the two decrements are exactly {1, 2}
+# The exact-shape match guarantees the two self-calls are the function's ONLY
+# calls and there is no other side-effecting statement to reorder, so the rewrite
+# is unconditionally safe.
+
+r2i_seq: uint32 = 0
+r2i_name_off: uint32 = 0
+r2i_name_len: uint32 = 0
+r2i_transformed: uint32 = 0
+
+
+def r2i_putc(c: uint32):
+    strbuf[strbuf_pos] = cast[uint8](c)
+    strbuf_pos = strbuf_pos + 1
+
+
+# Mint a fresh, unique local name "__r2i_<tag><seq>" into strbuf; result in
+# r2i_name_off/len (mirrors cse_mint_temp_name's global-return convention).
+def r2i_mint(tag: uint32):
+    start: uint32 = strbuf_pos
+    r2i_putc(95)       # '_'
+    r2i_putc(95)       # '_'
+    r2i_putc(114)      # 'r'
+    r2i_putc(50)       # '2'
+    r2i_putc(105)      # 'i'
+    r2i_putc(95)       # '_'
+    r2i_putc(tag)
+    r2i_seq = r2i_seq + 1
+    cse_emit_digits(r2i_seq)
+    r2i_name_off = start
+    r2i_name_len = strbuf_pos - start
+
+
+def r2i_ident(off: uint32, len_: uint32) -> uint32:
+    id: uint32 = node_new(ND_IDENT)
+    nd_name_off[id] = off
+    nd_name_len[id] = len_
+    return id
+
+
+def r2i_intlit(v: uint64) -> uint32:
+    id: uint32 = node_new(ND_INT_LIT)
+    nd_num[id] = v
+    return id
+
+
+def r2i_binop(op: uint32, a: uint32, b: uint32) -> uint32:
+    id: uint32 = node_new(ND_BINARY)
+    nd_aux[id] = op
+    nd_a[id] = a
+    nd_b[id] = b
+    return id
+
+
+# Fresh primitive integer ND_TYPE carrying `tcode` (int8..uint64), so a minted
+# local is codegen-typed at the recurrence's exact width (never an untyped
+# 8-byte slot that would mis-wrap a narrower int type).
+def r2i_int_type(tcode: uint32) -> uint32:
+    id: uint32 = node_new(ND_TYPE)
+    nd_aux[id] = tcode
+    return id
+
+
+def r2i_vardecl(off: uint32, len_: uint32, tcode: uint32, val: uint32) -> uint32:
+    id: uint32 = node_new(ND_VAR_DECL)
+    nd_name_off[id] = off
+    nd_name_len[id] = len_
+    nd_a[id] = r2i_int_type(tcode)
+    nd_b[id] = val
+    return id
+
+
+def r2i_assign(target: uint32, val: uint32) -> uint32:
+    id: uint32 = node_new(ND_ASSIGN)
+    nd_a[id] = target
+    nd_b[id] = val
+    nd_aux[id] = 0
+    return id
+
+
+# Is `call` a single-arg self-call `f(<param> - d)` with d a constant integer?
+# On success writes d through *outd and returns 1; else 0.
+def r2i_check_self_call(call: uint32, fnoff: uint32, fnlen: uint32, poff: uint32, plen: uint32, outd: Ptr[int64]) -> uint32:
+    if call == 0:
+        return 0
+    if nd_kind[call] != ND_CALL:
+        return 0
+    if nd_aux[call] != 1:                 # argc == 1
+        return 0
+    callee: uint32 = nd_a[call]
+    if callee == 0:
+        return 0
+    if nd_kind[callee] != ND_IDENT:
+        return 0
+    if ir_name_eq(nd_name_off[callee], nd_name_len[callee], fnoff, fnlen) == 0:
+        return 0
+    arg: uint32 = nd_b[call]
+    if arg == 0:
+        return 0
+    if nd_next[arg] != 0:                 # exactly one arg
+        return 0
+    if nd_kind[arg] != ND_BINARY:
+        return 0
+    if nd_aux[arg] != BINOP_SUB:
+        return 0
+    al: uint32 = nd_a[arg]
+    if al == 0:
+        return 0
+    if nd_kind[al] != ND_IDENT:
+        return 0
+    if ir_name_eq(nd_name_off[al], nd_name_len[al], poff, plen) == 0:
+        return 0
+    dv: int64 = 0
+    if opt_const_int(nd_b[arg], &dv) == 0:
+        return 0
+    outd[0] = dv
+    return 1
+
+
+def opt_rec2iter_function(fn: uint32):
+    if p_err != 0:
+        return
+    if nd_kind[fn] != ND_FUNCTION:
+        return
+    if nd_d[fn] != 0:                     # no decorators
+        return
+    if nd_aux[fn] != 1:                   # exactly one param
+        return
+    param: uint32 = nd_a[fn]
+    if param == 0:
+        return
+    if nd_kind[param] != ND_PARAM:
+        return
+    ptype: uint32 = nd_a[param]
+    if opt_type_is_scalar_int(ptype) == 0:
+        return
+    rtype: uint32 = nd_b[fn]
+    if opt_type_is_scalar_int(rtype) == 0:
+        return
+    tcode: uint32 = nd_aux[rtype]
+    if nd_aux[ptype] != tcode:            # same integer width/signedness
+        return
+    poff: uint32 = nd_name_off[param]
+    plen: uint32 = nd_name_len[param]
+    fnoff: uint32 = nd_name_off[fn]
+    fnlen: uint32 = nd_name_len[fn]
+    # Body must be EXACTLY two statements: guard `if`, then `return`.
+    s1: uint32 = nd_c[fn]
+    if s1 == 0:
+        return
+    s2: uint32 = nd_next[s1]
+    if s2 == 0:
+        return
+    if nd_next[s2] != 0:
+        return
+    # --- S1: `if <param> < B: return <param>` (no elif/else) ---
+    if nd_kind[s1] != ND_IF:
+        return
+    if nd_c[s1] != 0:                     # no elif chain
+        return
+    if nd_d[s1] != 0:                     # no else block
+        return
+    cond: uint32 = nd_a[s1]
+    if cond == 0:
+        return
+    if nd_kind[cond] != ND_BINARY:
+        return
+    if nd_aux[cond] != BINOP_LT:
+        return
+    cl: uint32 = nd_a[cond]
+    if cl == 0:
+        return
+    if nd_kind[cl] != ND_IDENT:
+        return
+    if ir_name_eq(nd_name_off[cl], nd_name_len[cl], poff, plen) == 0:
+        return
+    bval: int64 = 0
+    if opt_const_int(nd_b[cond], &bval) == 0:
+        return
+    if bval < 2:
+        return
+    # then-body must be EXACTLY `return <param>` (identity base case).
+    tb: uint32 = nd_b[s1]
+    if tb == 0:
+        return
+    if nd_next[tb] != 0:
+        return
+    if nd_kind[tb] != ND_RETURN:
+        return
+    br: uint32 = nd_a[tb]
+    if br == 0:
+        return
+    if nd_kind[br] != ND_IDENT:
+        return
+    if ir_name_eq(nd_name_off[br], nd_name_len[br], poff, plen) == 0:
+        return
+    # --- S2: `return f(<param>-d1) + f(<param>-d2)`; {d1,d2} == {1,2} ---
+    if nd_kind[s2] != ND_RETURN:
+        return
+    add: uint32 = nd_a[s2]
+    if add == 0:
+        return
+    if nd_kind[add] != ND_BINARY:
+        return
+    if nd_aux[add] != BINOP_ADD:
+        return
+    d1: int64 = 0
+    d2: int64 = 0
+    if r2i_check_self_call(nd_a[add], fnoff, fnlen, poff, plen, &d1) == 0:
+        return
+    if r2i_check_self_call(nd_b[add], fnoff, fnlen, poff, plen, &d2) == 0:
+        return
+    ok: uint32 = 0
+    if d1 == 1:
+        if d2 == 2:
+            ok = 1
+    if d1 == 2:
+        if d2 == 1:
+            ok = 1
+    if ok == 0:
+        return
+    # ---- Eligible. Build the iterative replacement body. ----
+    r2i_mint(112)                         # 'p' -> prev
+    prev_off: uint32 = r2i_name_off
+    prev_len: uint32 = r2i_name_len
+    r2i_mint(99)                          # 'c' -> cur
+    cur_off: uint32 = r2i_name_off
+    cur_len: uint32 = r2i_name_len
+    r2i_mint(110)                         # 'n' -> nxt
+    nxt_off: uint32 = r2i_name_off
+    nxt_len: uint32 = r2i_name_len
+    r2i_mint(105)                         # 'i' -> i
+    i_off: uint32 = r2i_name_off
+    i_len: uint32 = r2i_name_len
+
+    bconst: uint64 = cast[uint64](bval)
+    d_prev: uint32 = r2i_vardecl(prev_off, prev_len, tcode, r2i_intlit(bconst - 2))
+    d_cur: uint32 = r2i_vardecl(cur_off, cur_len, tcode, r2i_intlit(bconst - 1))
+    d_nxt: uint32 = r2i_vardecl(nxt_off, nxt_len, tcode, r2i_intlit(0))
+    d_i: uint32 = r2i_vardecl(i_off, i_len, tcode, r2i_intlit(bconst))
+
+    # while i <= n:
+    wcond: uint32 = r2i_binop(BINOP_LTE, r2i_ident(i_off, i_len), r2i_ident(poff, plen))
+    a_nxt: uint32 = r2i_assign(r2i_ident(nxt_off, nxt_len), r2i_binop(BINOP_ADD, r2i_ident(prev_off, prev_len), r2i_ident(cur_off, cur_len)))
+    a_prev: uint32 = r2i_assign(r2i_ident(prev_off, prev_len), r2i_ident(cur_off, cur_len))
+    a_cur: uint32 = r2i_assign(r2i_ident(cur_off, cur_len), r2i_ident(nxt_off, nxt_len))
+    a_i: uint32 = r2i_assign(r2i_ident(i_off, i_len), r2i_binop(BINOP_ADD, r2i_ident(i_off, i_len), r2i_intlit(1)))
+    nd_next[a_nxt] = a_prev
+    nd_next[a_prev] = a_cur
+    nd_next[a_cur] = a_i
+    nd_next[a_i] = 0
+    wh: uint32 = node_new(ND_WHILE)
+    nd_a[wh] = wcond
+    nd_b[wh] = a_nxt
+    # return cur
+    ret: uint32 = node_new(ND_RETURN)
+    nd_a[ret] = r2i_ident(cur_off, cur_len)
+
+    # If the node arena exhausted mid-build, node_new set p_err and returned 0s;
+    # abort WITHOUT mutating the function (nd_c[fn] is still the original chain).
+    if p_err != 0:
+        return
+
+    # Commit: S1(guard) -> prev -> cur -> nxt -> i -> while -> return cur.
+    nd_next[s1] = d_prev
+    nd_next[d_prev] = d_cur
+    nd_next[d_cur] = d_nxt
+    nd_next[d_nxt] = d_i
+    nd_next[d_i] = wh
+    nd_next[wh] = ret
+    nd_next[ret] = 0
+    r2i_transformed = r2i_transformed + 1
 
 
 # =======================================================================

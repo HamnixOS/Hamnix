@@ -649,6 +649,7 @@ class Program:
         self._gen_cmpjcc_traffic(env)         # cmp; jcc branch-condition lever (--opt)
         self._gen_helper_calls(env)
         self._gen_saveset_probe(env)          # callee-saved save-set tightening (--opt)
+        self._gen_rec2iter_traffic(env)       # recursion->iteration (Fibonacci shape, --opt Phase 0)
         self._gen_paramhome_traffic(env)      # dead param-home spill elision (--opt)
         self._gen_regpressure_scratch_traffic(env)  # caller-saved IR scratch (--opt)
         self._gen_region_callsplit_traffic(env)  # per-region caller-saved regalloc (--opt)
@@ -2488,6 +2489,67 @@ class Program:
         # g_ssacc == running now; read it (twice) alongside the 4 live locals.
         self.emit("    sse: int64 = g_ssacc + sb0 + sb1 + sb2 + sb3 + g_ssacc")
         self._fold_value("cast[uint64](sse)", w64(running + sum(vals) + running) & M)
+
+    # ---- recursion->iteration traffic (--opt Phase 0) ------------------------
+    def _gen_rec2iter_traffic(self, env):
+        """Exercise the RECURSION->ITERATION optimizer pass (opt.ad Phase 0, --opt):
+        a two-term ADDITIVE linear-recurrence self-recursion (Fibonacci shape
+        `if n < B: return n` / `return f(n-1)+f(n-2)`) is rewritten to a bottom-up
+        `while` loop carrying the two running values. The transform must be
+        value-IDENTICAL to the recursion for every input, so each call's result is
+        folded into the by-construction checksum: under ADDER_OPT=1 a wrong rewrite
+        (bad seed, wrong wrap width, mis-ordered update) diverges the summed
+        checksum and the differential seed-vs-native lane FAILS.
+
+        Emits variants with DIFFERENT base thresholds B (2/3/5) AND the two
+        recursive calls in BOTH decrement orders, so the general seed formula
+        prev=f(B-2), cur=f(B-1) is exercised — not just the classic B=2 case.
+        Top-level defs are unconditional so the rng draw stream is byte-identical
+        across subset/default generation modes.
+        """
+        rng = self.rng
+        M = (1 << 64) - 1
+
+        def w64(v):
+            v &= M
+            return v - (1 << 64) if (v >> 63) else v
+
+        # Base f(k)=k for k<B; f(n)=f(n-1)+f(n-2) for n>=B (all 64-bit wrapping).
+        def pyrec(n, B):
+            if n < B:
+                return w64(n)
+            a = w64(B - 2)   # f(B-2)
+            b = w64(B - 1)   # f(B-1)
+            i = B
+            while i <= n:
+                a, b = b, w64(a + b)
+                i += 1
+            return b
+
+        # r2i_fib2 — classic B=2, decrements (1,2).
+        self.emit_top("def r2i_fib2(n: int64) -> int64:")
+        self.emit_top("    if n < cast[int64](2):")
+        self.emit_top("        return n")
+        self.emit_top("    return r2i_fib2(n - cast[int64](1)) + r2i_fib2(n - cast[int64](2))")
+        self.emit_top("")
+        # r2i_fib3 — B=3, calls in SWAPPED order (n-2 first) -> decrements (2,1).
+        self.emit_top("def r2i_fib3(n: int64) -> int64:")
+        self.emit_top("    if n < cast[int64](3):")
+        self.emit_top("        return n")
+        self.emit_top("    return r2i_fib3(n - cast[int64](2)) + r2i_fib3(n - cast[int64](1))")
+        self.emit_top("")
+        # r2i_fib5 — B=5, decrements (1,2).
+        self.emit_top("def r2i_fib5(n: int64) -> int64:")
+        self.emit_top("    if n < cast[int64](5):")
+        self.emit_top("        return n")
+        self.emit_top("    return r2i_fib5(n - cast[int64](1)) + r2i_fib5(n - cast[int64](2))")
+        self.emit_top("")
+
+        for (name, B) in (("r2i_fib2", 2), ("r2i_fib3", 3), ("r2i_fib5", 5)):
+            for _ in range(rng.randint(2, 3)):
+                k = rng.randint(B, 24)
+                self.emit(f"    rri: int64 = {name}(cast[int64]({k}))")
+                self._fold_value("cast[uint64](rri)", pyrec(k, B) & M)
 
     # ---- register-pressure / caller-saved-scratch traffic --------------------
     def _gen_regpressure_scratch_traffic(self, env):
