@@ -100,10 +100,13 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
   tasks at floor+one-slice penalty (CFS place_entity). On-device -smp2 fairness gate proven
   (revert-proof). CAVEAT: proven at the scheduler DECISION; full enter-linux wall-clock
   before/after not measured (would confirm the 30s→~few-s user-visible win on-device).
-- [~] **Adder → C-speed PARITY (target 1.1×/1.0×)** — P1 round landed FUSED INDEXED LOADS
-  (`lea+movq`→single `movq`): geomean **1.86×→1.69×** of gcc-O2 (licm 2.08→1.31), fuzzer
-  500/500 + 8/8 checksums. `ec38fe60`, merging on objdiff-verify. Next P1 lever: fused indexed
-  STORES (reuse index reg + store-addr CSE) for the licm/saxpy residual; then fib call-glue.
+- [~] **Adder → C-speed PARITY (target 1.1×/1.0×)** — at **1.69×** of gcc-O2. Fused indexed
+  LOADS landed (`8f9fd17b`, 1.86→1.69×). Fused indexed STORES ATTEMPTED (`e647aa11`) but the
+  agent staged a full REVERT of it — NOT merged (reason pending its report: failed objdiff/fuzzer
+  vs alignment-shadowed/no-gain, the DO-NOT-MERGE pattern). Next lever uncertain — the memory
+  (`project_optimizer_2x_track`) flags the residual frontier as XL/alignment-shadowed; the last
+  ~0.7× to 1.0× likely needs the P1-IR statement-machine rewrite or fib recursion→iteration, not
+  a peephole. Reassess after the store-revert reason.
 
 ---
 
