@@ -59,10 +59,13 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
   Today `lib/vk` is an ISLAND — hamSDL, the DE compositor (`hamui_host`/`devwsys`), and
   `vk_raster` are THREE separate SW rasterizers. Unify everything onto the vk API so a
   future GPU backend behind that API accelerates the whole desktop + all games at once.
-  - [~] **Phase A — vk 2D primitive layer** (`lib/vk/vk_2d.ad`: fill_rect, alpha, blit/
-    textured-quad, line) so vk can express what the DE/SDL draw. Host-render gate. IN FLIGHT.
+  - [x] **Phase A — vk 2D primitive layer** DONE (`d2a333ad`, `lib/vk/vk_2d.ad`:
+    fill_rect/alpha/blit/line as recorded vk cmd-buffer ops; host PPM gate 10/10). Delivered
+    the hamSDL/DE→vk2d primitive-mapping table. Gaps for B/C: glyph AA coverage-mask op,
+    rounded-rect AA op, scissor/clip rect (windowed compositing).
   - [ ] **Phase B — route hamSDL through vk** (sdl_fill_rect/blit/draw_text → vk2d ops;
-    games become vk clients, get depth/3D + future accel). TRIGGER: after Phase A lands.
+    games become vk clients, get depth/3D + future accel). TRIGGER: after the pygame-bindings
+    agent lands (both edit lib/hamsdl.ad — sequence to avoid conflict).
   - [ ] **Phase C — route the DE compositor through vk** (hamui_host/devwsys composite
     window scenes via vk present/blits). Biggest/riskiest (touches kernel). After B.
   - [ ] **Phase D (parallel/later) — virtio-gpu / silicon backend behind the SAME vk API**
@@ -72,14 +75,16 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
     does depth-buffered triangles.
 
 ### New fronts green-lit by USER (2026-07-17)
-- [~] **Scheduler fairness (D3 fix) — USER: "scheduler work is fine."** Fix the `-smp 2`
-  starvation where a fresh foreground fork/exec is blocked by the runlevel-5 DE bring-up
-  storm (root of the `enter linux` 30s AND the on-device -smp2 verification wedges).
-  `kernel/sched/core.ad` fork placement / load-balance / fairness. Agent in flight.
-- [~] **Adder → C-speed PARITY — USER RAISED THE BAR to 1.1× or 1.0× of gcc-O2** (was
-  ≤2×, met at 1.85×). The lever is the **P1 keystone**: destination-driven 2-operand
-  codegen in `adder/compiler/codegen.ad` to kill the stack-machine push/pop plumbing.
-  XL, fuzzer-gated, incremental. Agent in flight.
+- [x] **Scheduler fairness (D3 fix)** DONE (`571d7494`): root cause = fresh forks seeded at
+  RAW min-vruntime, so sub-tick DE-bringup storm children (exit with 0 vruntime) re-arrive at
+  the pinned-low min and starve a foreground task. Fix = monotonic vruntime floor + seed new
+  tasks at floor+one-slice penalty (CFS place_entity). On-device -smp2 fairness gate proven
+  (revert-proof). CAVEAT: proven at the scheduler DECISION; full enter-linux wall-clock
+  before/after not measured (would confirm the 30s→~few-s user-visible win on-device).
+- [~] **Adder → C-speed PARITY (target 1.1×/1.0×)** — P1 round landed FUSED INDEXED LOADS
+  (`lea+movq`→single `movq`): geomean **1.86×→1.69×** of gcc-O2 (licm 2.08→1.31), fuzzer
+  500/500 + 8/8 checksums. `ec38fe60`, merging on objdiff-verify. Next P1 lever: fused indexed
+  STORES (reuse index reg + store-addr CSE) for the licm/saxpy residual; then fib call-glue.
 
 ---
 
