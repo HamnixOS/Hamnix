@@ -101,12 +101,12 @@ render / running the gate before merge. Most SHIPPED; see STATUS.md for SHAs.
   (revert-proof). CAVEAT: proven at the scheduler DECISION; full enter-linux wall-clock
   before/after not measured (would confirm the 30s→~few-s user-visible win on-device).
 - [~] **Adder → C-speed PARITY (target 1.1×/1.0×)** — at **1.69×** of gcc-O2. Fused indexed
-  LOADS landed (`8f9fd17b`, 1.86→1.69×). Fused indexed STORES ATTEMPTED (`e647aa11`) but the
-  agent staged a full REVERT of it — NOT merged (reason pending its report: failed objdiff/fuzzer
-  vs alignment-shadowed/no-gain, the DO-NOT-MERGE pattern). Next lever uncertain — the memory
-  (`project_optimizer_2x_track`) flags the residual frontier as XL/alignment-shadowed; the last
-  ~0.7× to 1.0× likely needs the P1-IR statement-machine rewrite or fib recursion→iteration, not
-  a peephole. Reassess after the store-revert reason.
+  LOADS landed (`8f9fd17b`, 1.86→1.69×). Fused indexed STORES built + VERIFIED-CORRECT (objdiff
+  0/290, fuzzer 500/0) but **DO-NOT-MERGE: alignment-shadowed** — real licm/saxpy uop wins but
+  dcecopy +65% (#108 DSB lottery) → geomean worse (1.71→1.79). Patch saved for post-#108 re-enable.
+  **PEEPHOLE FRONTIER EXHAUSTED at ~1.69×.** The last ~0.7× to 1.0× needs the XL **P1-IR
+  statement-machine rewrite** OR **fib recursion→iteration** (algorithmic) — a multi-session
+  big-bang, NOT tick-sized. ⚠ SURFACE TO USER before committing to it (1.69× = ~59% of C).
 
 ---
 
