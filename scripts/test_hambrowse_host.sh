@@ -1086,7 +1086,11 @@ assert_grepC '^TITLE Comments Fixture$'      "document.title kept (commented scr
 # instead of stacking below it, and the card stays compact. A relatively-
 # positioned paragraph is shifted right+down from its in-flow spot.
 # ====================================================================
-FIXP="tests/fixtures/hambrowse_position.html"
+# NOTE: the SEG assertions below describe a `.card{position:relative}` box with
+# top-left/top-right absolute badges plus a relative-offset paragraph. Round-10
+# (852710cb) repurposed hambrowse_position.html for the POSFILL pixel gate, so
+# this SEG gate uses its own fixture (hambrowse_position_card.html) to keep both.
+FIXP="tests/fixtures/hambrowse_position_card.html"
 DUMPP="$OUT/dump_position.txt"
 echo "[hb-host] running host harness on $FIXP ..."
 if ! "$BIN" "$FIXP" 600 >"$DUMPP" 2>&1; then
