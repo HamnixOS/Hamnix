@@ -70,19 +70,19 @@ refute_grep '^TITLE .*&mdash;'                   "title &mdash; entity decoded (
 
 # --- float:right infobox pinned to the RIGHT of the measure ----------
 # INFOBOXTOP renders at a large seg x (>= 500 px) with the infobox background.
-assert_grep '^SEG [0-9]+ (5|6|7)[0-9][0-9] #[0-9a-f]+ b1 u[0-9] l-1 bg#ebebd2 .INFOBOXTOP.' \
+assert_grep '^SEG [0-9]+ (5|6|7)[0-9][0-9] #[0-9a-f]+ b1 u[0-9] s[0-9] l-1 bg#ebebd2 .INFOBOXTOP.' \
     "float:right infobox pinned to the right edge (large x) with its bg"
 
 # --- body text wraps to the LEFT of the right float ------------------
 # BODYONE flows at the left margin (x=158) on an early row that OVERLAPS the
 # infobox's rows (proving beside-flow, not a stack below it).
-assert_grep '^SEG 2 158 #[0-9a-f]+ b0 u0 l-1 bg- .BODYONE' \
+assert_grep '^SEG 2 158 #[0-9a-f]+ b0 u0 s[0-9] l-1 bg- .BODYONE' \
     "body paragraph flows on the LEFT of the right float, same top row"
 
 # --- float:left figure indents the following paragraph ---------------
 # FIGBOX box on the left; BODYTHREE's left edge pushed to ~x=326 beside it.
 assert_grep '.FIGBOX a tabby cat.'  "float:left figure box rendered"
-assert_grep '^SEG 1[0-9] (3|4)[0-9][0-9] #[0-9a-f]+ b0 u0 l-1 bg- .BODYTHREE' \
+assert_grep '^SEG 1[0-9] (3|4)[0-9][0-9] #[0-9a-f]+ b0 u0 s[0-9] l-1 bg- .BODYTHREE' \
     "paragraph after a float:left is indented to its RIGHT (beside it)"
 
 echo "[hb-float] compiling native hambrowse for x86_64-adder-user (no regress) ..."
