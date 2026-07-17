@@ -61,6 +61,17 @@ assert cf_expr      'var Z=3;class A{v=Z+1}console.log(new A().v)'              
 assert cf_mix       'class C{n=10;inc(){this.n++;return this.n}}var c=new C();console.log(c.inc(),c.inc())' '11 12'
 assert cf_per_inst  'class A{arr=[]}var a=new A();var b=new A();a.arr.push(1);console.log(a.arr.length,b.arr.length)' '1 0'
 
+# ---- object-literal method shorthand + computed property/method names ----
+assert om_method    'var o={f(){return 7}};console.log(o.f())'                                         '7'
+assert om_args      'var o={add(a,b){return a+b}};console.log(o.add(3,4))'                             '7'
+assert om_this      'var o={n:5,get(){return this.n}};console.log(o.get())'                            '5'
+assert oc_key       'var k="x";var o={[k]:5};console.log(o.x)'                                         '5'
+assert oc_expr      'var o={["a"+"b"]:9};console.log(o.ab)'                                            '9'
+assert oc_method    'var k="m";var o={[k](){return 3}};console.log(o.m())'                             '3'
+assert oc_num       'var o={[1+1]:"two"};console.log(o[2])'                                            'two'
+assert om_kwkey     'var o={if:1,default:2};console.log(o.if,o.default)'                               '1 2'
+assert om_mixed     'var k="c";var o={a:1,b(){return 2},[k]:3};console.log(o.a,o.b(),o.c)'            '1 2 3'
+
 if [ "$fail" -eq 0 ]; then
     echo "[js-es2022] RESULT: PASS"
     exit 0
