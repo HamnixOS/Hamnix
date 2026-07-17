@@ -6,7 +6,9 @@
 #
 # Covered this round:
 #   Built-ins: Object.prototype.{hasOwnProperty,propertyIsEnumerable,isPrototypeOf};
-#              String.{raw,fromCharCode,fromCodePoint}.
+#              String.{raw,fromCharCode,fromCodePoint};
+#              Symbol() basics (typeof, uniqueness, description, Symbol.iterator,
+#              symbol-keyed properties).
 #   Language:  object-literal getters/setters (get x(){}/set x(v){}),
 #              computed property/method names {[expr]:v}/{[expr](){}},
 #              class instance + static fields (x=v / static y=v),
@@ -110,6 +112,18 @@ assert sr_nosub     'console.log(String.raw`plain\d`)'                          
 assert scc_basic    'console.log(String.fromCharCode(72,105))'                                           'Hi'
 assert scc_one      'console.log(String.fromCharCode(65))'                                               'A'
 assert scp_basic    'console.log(String.fromCodePoint(97,98,99))'                                        'abc'
+
+# ---- Symbol basics (typeof, uniqueness, description, well-known, symbol keys) ----
+assert sym_typeof   'console.log(typeof Symbol())'                                                       'symbol'
+assert sym_ctorfn   'console.log(typeof Symbol)'                                                         'function'
+assert sym_uniq     'console.log(Symbol()===Symbol(),Symbol("a")===Symbol("a"))'                        'false false'
+assert sym_same     'var s=Symbol("x");console.log(s===s)'                                               'true'
+assert sym_desc     'console.log(Symbol("hi").description)'                                              'hi'
+assert sym_iter     'console.log(typeof Symbol.iterator)'                                                'symbol'
+assert sym_iterwk   'console.log(Symbol.iterator===Symbol.iterator)'                                     'true'
+assert sym_key      'var s=Symbol();var o={};o[s]=42;console.log(o[s])'                                  '42'
+assert sym_key2     'var a=Symbol(),b=Symbol();var o={};o[a]=1;o[b]=2;console.log(o[a],o[b])'           '1 2'
+assert sym_wkkey    'var o={};o[Symbol.iterator]=9;console.log(o[Symbol.iterator])'                     '9'
 
 if [ "$fail" -eq 0 ]; then
     echo "[js-es2022] RESULT: PASS"
