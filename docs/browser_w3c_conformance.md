@@ -28,7 +28,7 @@ From a 14-agent parallel audit (2026-07-16). Dual-target, host-iterated (~40 gat
 | css-box-model | 35% | 10 | 4 |
 | css-selectors | 40% | 1 | 1 |
 | ecmascript-language | 40% | 12 | 7 |
-| css-flexbox | 42% | 11 | 3 |
+| css-flexbox | 52% | 11 | 3 |
 | css-text-fonts | 45% | 1 | 1 |
 | css-positioning | 52% | 10 | 4 |
 | ecmascript-builtins | 55% | 15 | 6 |
@@ -45,8 +45,12 @@ the passing host gates found the following.
 - css-values-units: decimal/fractional lengths, `rem`, `vh/vw/vmin/vmax`, `calc()`+`min/max/clamp`,
   `var()`/custom-properties+fallback, `box-sizing` — `css/cascade.ad` `_len` (~376-431, 595).
   Gates: `cssvalues`, `cssnl`, `varfallback`.
-- css-flexbox: flex-grow / flex shorthand / flex-basis / flex-shrink — `cascade.ad` r_flexg/r_flexs.
-  Gates: `flexmin/flexalign/flexjustify/flexwrap/flexgap`.
+- css-flexbox: flex-grow / flex shorthand / flex-basis now DISTRIBUTE (not just parse) — free space is
+  split proportional to inline flex-grow over each item's flex-basis/content size (`layout/box.ad`
+  `_flex_grow_scan`/`_flx_layout_grow`, wired into `_flex_container_open`). Gates:
+  `flexgrow` (NEW: flex:1 even split, flex:2/flex:1 → 2:1, flex:0 0 200px fixed+grow),
+  `flexmin/flexalign/flexjustify/flexwrap/flexgap`. Boundary: grow read from INLINE style only
+  (class `.col{flex:1}` keeps the equal-column approximation); flex-shrink on overflow still TBD.
 - css-grid: `minmax()`, `repeat(auto-fill/auto-fit)` — `cascade.ad:~1608-1744`. Gates: `grid/gridr2/gridspan/gridjustify`.
 - css-selectors: attribute selectors (gate `attrsel`). css-positioning: `position:sticky`/`fixed` parsed (gate `position`).
 - dom: `Element.closest`/`matches` (`query.ad:841`, gate `matches`); arbitrary event types +
@@ -107,9 +111,9 @@ Disjoint dispatch clusters (no write-collision): **JS** (`js/*` only: #13,#14) �
 - **[css-box-model] margin vs padding separation (box edges)** (buggy) — `lib/htmlengine.ad _box_add_l/_r/_t/_b, _box_shorthand, _box_decl (~3462-3640)` — margin-left and padding-left (and each other side) are summed into a SINGLE inset column (_box_add_* is called for both). CSS treats padding as inside the border/background and margin as outside; fold
 - **[css-box-model] border-width / border-style / border-color / per-side borders** (partial) — `lib/htmlengine.ad _box_decl border branch (~3552-3560); bbox_rgb (233), border draw` — Any border-* (except radius/image/collapse/spacing) collapses to a single boolean d_bd=1 that draws a fixed 1px rectangle on all four sides. Thickness (border-width, thin/medium/thick), style (dashed/
 - **[css-box-model] box-sizing (content-box / border-box)** (missing) — `lib/htmlengine.ad _box_decl (~3540); no box_sizing state anywhere` — 'box-sizing' is not parsed at all. The near-universal reset '*{box-sizing:border-box}' and per-component border-box declarations are ignored, so declared widths are interpreted inconsistently vs how t
-- **[css-flexbox] flex-grow / flex shorthand (flex:1)** (missing) — `lib/htmlengine.ad property parser ~4046-4101 + _flex_layout_natural ~1765-1804` — The `flex`/`flex-grow` properties are never parsed and no free space is distributed to items proportional to their grow factor. `flex:1` (the single most common flex idiom, used for equal-width column
-- **[css-flexbox] flex shorthand / flex-basis parsing** (missing) — `lib/htmlengine.ad property parse block ~4046-4101 and item-open path ~6273-6390` — No handling of `flex: 0 0 200px`, `flex: 1 1 auto`, `flex-basis`. Item main-size always derived from character-count measurement (_flex_measure_children ~1701, which counts visible chars * CELL_W and 
-- **[css-flexbox] flex-shrink / overflow handling** (missing) — `lib/htmlengine.ad _flex_container_open ~1917-1931` — flex-shrink is not parsed or applied. When natural widths overflow the container, the code abandons the natural path and reverts to equal columns (or bails to block stacking if colw < 6*CELL_W). Spec:
+- **[css-flexbox] flex-grow / flex shorthand (flex:1)** (DONE 2026-07-17, gate `flexgrow`) — `lib/web/layout/box.ad _flex_grow_scan/_flx_layout_grow, wired into _flex_container_open`. Each container's free space is now distributed to items in proportion to their inline flex-grow: three `flex:1` items split the row evenly, `flex:2` vs `flex:1` split ~2:1. Reuses the existing per-column `flex_child_x/_w` placement (the justify natural path). Boundary: grow is read from each child's INLINE `style="…"`; class-resolved `.col{flex:1}` keeps the equal-column approximation (which already yields equal widths for uniform flex:1).
+- **[css-flexbox] flex shorthand / flex-basis parsing** (DONE 2026-07-17, gate `flexgrow`) — `lib/web/layout/box.ad _flx_parse_shorthand/_flx_scan_style`. `flex: G [S] [B]`, `flex: 0 0 200px`, `flex: 1 1 auto`, `flex-basis:Npx`, and the `flex:<n>` one-value form (which resolves flex-basis to 0 per spec) are parsed. An explicit flex-basis pins the item's main-size as the base for grow distribution; `auto`/unset falls back to the natural content-width measurement. (Class-resolved flex-basis is not yet honoured — inline style only.)
+- **[css-flexbox] flex-shrink / overflow handling** (partial) — `lib/web/layout/box.ad _flx_scan_style (shrink token parsed, not applied) + _flx_layout_grow (free clamps to 0 on overflow)` — flex-shrink is parsed out of the shorthand but not yet applied: when items overflow the container the free space clamps to 0 (items keep their base size and overflow) rather than shrinking proportionally. NEXT flexbox gap.
 - **[css-grid] repeat(auto-fill / auto-fit, ...)** (missing) — `lib/htmlengine.ad ~3957-3982 (_grid_parse_template repeat branch)` — repeat() only reads a literal integer count; the auto-fill/auto-fit keywords are not recognized, so the whole most-common responsive grid idiom `repeat(auto-fill, minmax(200px,1fr))` fails to parse an
 - **[css-grid] minmax()** (missing) — `lib/htmlengine.ad ~3849-3871 (_grid_one_track) and 3949 (parse template)` — minmax(min,max) is not parsed at all (explicitly deferred per comment at 3946-3948). _grid_one_track sees the leading 'minmax' keyword, finds no digits, and returns -1 (1fr), discarding both bounds. S
 - **[css-grid] grid-template-areas / grid-area (named areas)** (missing) — `lib/htmlengine.ad (no parser; noted deferred at 3947)` — No parsing of grid-template-areas strings and no grid-area name resolution. Page-shell layouts (header/nav/main/aside/footer via named areas) do not lay out as authored. Spec: the ASCII-art rows defin
