@@ -84,6 +84,14 @@ assert acc_dp_set   'var o={_v:0};Object.defineProperty(o,"x",{set:function(v){t
 assert acc_computed 'var k="y";var o={get [k](){return 8}};console.log(o.y)'                           '8'
 assert acc_nosetter 'var o={get x(){return 3}};o.x=99;console.log(o.x)'                                '3'
 
+# ---- class getters/setters (instance + static) ----
+assert cg_getter    'class C{get x(){return 42}}console.log(new C().x)'                                '42'
+assert cg_setter    'class C{constructor(){this._v=0}set x(v){this._v=v*3}get x(){return this._v}}var c=new C();c.x=5;console.log(c.x)' '15'
+assert cg_field     'class C{n=10;get d(){return this.n*2}}console.log(new C().d)'                     '20'
+assert cg_static    'class C{static get v(){return 99}}console.log(C.v)'                                '99'
+assert cg_getmeth   'class C{get(){return 7}}console.log(new C().get())'                               '7'
+assert cg_mixed     'class C{constructor(){this._n=1}get n(){return this._n}set n(v){this._n=v}dbl(){return this._n*2}}var c=new C();c.n=4;console.log(c.n,c.dbl())' '4 8'
+
 if [ "$fail" -eq 0 ]; then
     echo "[js-es2022] RESULT: PASS"
     exit 0
