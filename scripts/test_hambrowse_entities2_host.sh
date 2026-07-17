@@ -7,6 +7,10 @@
 #     &piv;. Ubiquitous in math/science copy. Prefix pairs (&sigma; vs
 #     &sigmaf;, &eta; vs &theta;) must not cross-match — the trailing ';' in
 #     each literal anchors the match.
+#   * Double-struck arrows (&lArr;..&hArr;) + set-theory / logic relations
+#     (&forall; &isin; &cap; &sub; &sube; &cong; &perp; …).
+#   * Accented Latin-1 letters — case-sensitive &Aacute;/&auml;/&ntilde;/… so
+#     café / résumé / Señor / Zürich render.
 #
 # Asserts on the reconstructed FLOW (decoded UTF-8 text, never glyph-ink
 # pixels). Builds the host harness (x86_64-linux) AND the native browser
@@ -59,6 +63,10 @@ assert_grep 'PREFIX σ=ς η/θ ok'           "prefix pairs (&sigma; vs &sigmaf;
 assert_grep 'DBLARR ⇐ ⇑ ⇒ ⇓ ⇔'          "double arrows &lArr;/&uArr;/&rArr;/&dArr;/&hArr; decode"
 assert_grep 'LOGIC ∀ ∃ ∅ ∇ ∈ ∉ ∧ ∨'    "logic &forall;/&exist;/&empty;/&nabla;/&isin;/&notin;/&and;/&or; decode"
 assert_grep 'SETREL ∩ ∪ ⊂ ⊃ ⊆ ⊇ ≅ ⊥'   "set relations &cap;/&cup;/&sub;/&sup;/&sube;/&supe;/&cong;/&perp; decode"
+
+# Accented Latin-1 letters (case-sensitive; common in names / loanwords).
+assert_grep 'ACCENTS café résumé naïve Señor Zürich' "lowercase accented letters &eacute;/&iuml;/&ntilde;/&uuml; decode in words"
+assert_grep 'ACCUP Á Ç Ñ Ö Ü Æ Ø Þ'                 "uppercase accented letters &Aacute;/&Ccedil;/&Ntilde;/&Ouml;/&Uuml;/&AElig;/&Oslash;/&THORN; decode"
 
 if [ "$fail" -ne 0 ]; then
     echo "[hb-e2] RESULT: FAIL"; exit 1
