@@ -60,7 +60,9 @@ assert oct_low      'console.log(0o17)'                                       '1
 assert oct_up       'console.log(0O777)'                                      '511'
 assert oct_sep      'console.log(0o1_7)'                                      '15'
 
-# ---- BigInt suffix (kept as Number — enough to keep scripts running) ----
+# ---- BigInt `n` suffix (now a TRUE arbitrary-precision BigInt; see
+#      test_jsengine_bigint_host.sh for the full value-type coverage). The
+#      console.log form matches String() semantics (no trailing `n`). ----
 assert bigint_add   'console.log(10n + 20n)'                                  '30'
 assert bigint_hex   'console.log(0xffn)'                                      '255'
 

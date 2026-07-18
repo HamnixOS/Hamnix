@@ -1,0 +1,755 @@
+# lib/web/js/bigint.ad — arbitrary-precision BigInt for the modular web engine.
+#
+# A JS BigInt value is an int32 HANDLE with v_tag == TAG_BIGINT and v_ref == a
+# bigint-record id (index into the bi_* arrays). A record is a SIGN + a MAGNITUDE
+# stored little-endian in base 2^32 (uint32 limbs):
+#
+#   bi_sign[id]  0 = non-negative, 1 = negative   (zero is always sign 0)
+#   bi_off[id]   start index of the magnitude in the shared limb pool bi_limbs
+#   bi_len[id]   number of SIGNIFICANT limbs (0 => the value is exactly zero)
+#
+# Records are IMMUTABLE once made (bigints are immutable JS values), so two
+# records may share the same limb window with different signs (bi_with_sign) —
+# no copy needed. Limbs are bump-allocated and never individually freed (freed
+# wholesale at js_init, like every other engine pool). Arithmetic writes its
+# result into a fresh limb window then normalizes the length by trimming leading
+# zero limbs (bi_make).
+#
+# Behavior-preserving split: Adder is a single-compilation-unit language, so
+# every public name here resolves globally across the merged engine.
+
+# ====================================================================
+# POOLS.
+# ====================================================================
+MAX_BI: int32 = 100000
+bi_sign: Array[100000, int32]
+bi_off:  Array[100000, int32]
+bi_len:  Array[100000, int32]
+n_bis:   int32 = 0
+
+BI_LIMB_CAP: int32 = 2000000
+bi_limbs: Array[2000000, uint32]
+bi_top:   int32 = 0
+
+# scratch for base-conversion digits (least-significant first), reused per call
+BI_DIG_CAP: int32 = 200000
+bi_digs: Array[200000, uint32]
+
+# divmod returns the quotient; the remainder record id lands here
+g_bi_rem: int32 = 0
+
+BI_ALLONES: uint32 = 4294967295
+
+
+# ====================================================================
+# low-level limb allocation + record construction.
+# ====================================================================
+def bi_alloc_limbs(n: int32) -> int32:
+    off: int32 = bi_top
+    if bi_top + n > BI_LIMB_CAP:
+        set_error(cast[Ptr[uint8]]("bigint limb pool exhausted"))
+        return off
+    i: int32 = 0
+    while i < n:
+        bi_limbs[bi_top] = cast[uint32](0)
+        bi_top = bi_top + 1
+        i = i + 1
+    return off
+
+
+# Wrap an already-filled limb window [off, off+len) into a record, trimming the
+# leading (most-significant) zero limbs so bi_len is the significant length.
+def bi_make(sign: int32, off: int32, len: int32) -> int32:
+    while len > 0 and bi_limbs[off + len - 1] == cast[uint32](0):
+        len = len - 1
+    if n_bis >= MAX_BI:
+        set_error(cast[Ptr[uint8]]("bigint record pool exhausted"))
+        return MAX_BI - 1
+    id: int32 = n_bis
+    if len == 0:
+        bi_sign[id] = 0
+    else:
+        bi_sign[id] = sign
+    bi_off[id] = off
+    bi_len[id] = len
+    n_bis = n_bis + 1
+    return id
+
+
+# A new record sharing the same magnitude limbs with a (possibly) different sign.
+def bi_with_sign(id: int32, sign: int32) -> int32:
+    if bi_len[id] == 0:
+        return id
+    nid: int32 = n_bis
+    if n_bis >= MAX_BI:
+        set_error(cast[Ptr[uint8]]("bigint record pool exhausted"))
+        return MAX_BI - 1
+    bi_sign[nid] = sign
+    bi_off[nid] = bi_off[id]
+    bi_len[nid] = bi_len[id]
+    n_bis = n_bis + 1
+    return nid
+
+
+def bi_neg(id: int32) -> int32:
+    if bi_len[id] == 0:
+        return id
+    return bi_with_sign(id, 1 - bi_sign[id])
+
+
+def bi_zero() -> int32:
+    return bi_make(0, bi_top, 0)
+
+
+def bi_one() -> int32:
+    off: int32 = bi_alloc_limbs(1)
+    bi_limbs[off] = cast[uint32](1)
+    return bi_make(0, off, 1)
+
+
+def bi_is_zero(id: int32) -> int32:
+    if bi_len[id] == 0:
+        return 1
+    return 0
+
+
+# ====================================================================
+# value wrappers.
+# ====================================================================
+def v_bigint(id: int32) -> int32:
+    h: int32 = mk_val(TAG_BIGINT)
+    v_ref[h] = id
+    return h
+
+
+def bigid_of(h: int32) -> int32:
+    return v_ref[h]
+
+
+def is_bigint(h: int32) -> int32:
+    if tag_of(h) == TAG_BIGINT:
+        return 1
+    return 0
+
+
+# ====================================================================
+# constructors from primitives.
+# ====================================================================
+def bi_from_i64(x: int64) -> int32:
+    sign: int32 = 0
+    ux: uint64 = cast[uint64](x)
+    if x < 0:
+        sign = 1
+        ux = cast[uint64](0 - x)
+    off: int32 = bi_alloc_limbs(2)
+    bi_limbs[off] = cast[uint32](ux)
+    bi_limbs[off + 1] = cast[uint32](ux >> 32)
+    return bi_make(sign, off, 2)
+
+
+# a decimal/hex/binary/octal literal (with optional sign, 0x/0b/0o prefix, and
+# ES2021 `_` separators). Stops at the first character that is not a valid digit
+# for the base (so a trailing `n` or whitespace ends the run).
+def bi_hexval(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return cast[int32](c) - 48
+    if c >= 97 and c <= 102:
+        return cast[int32](c) - 87
+    if c >= 65 and c <= 70:
+        return cast[int32](c) - 55
+    return -1
+
+
+# multiply magnitude window by `mul` and add `add`; returns the new length.
+def bi_limbs_muladd(off: int32, len: int32, cap: int32, mul: uint32, add: uint32) -> int32:
+    carry: uint64 = cast[uint64](add)
+    i: int32 = 0
+    while i < len:
+        cur: uint64 = cast[uint64](bi_limbs[off + i]) * cast[uint64](mul) + carry
+        bi_limbs[off + i] = cast[uint32](cur)
+        carry = cur >> 32
+        i = i + 1
+    while carry != cast[uint64](0):
+        if len >= cap:
+            set_error(cast[Ptr[uint8]]("bigint literal overflow"))
+            return len
+        bi_limbs[off + len] = cast[uint32](carry)
+        carry = carry >> 32
+        len = len + 1
+    return len
+
+
+def bi_parse(p: Ptr[uint8], n: int32) -> int32:
+    i: int32 = 0
+    while i < n and is_ws(p[i]) != 0:
+        i = i + 1
+    sign: int32 = 0
+    if i < n and p[i] == 43:
+        i = i + 1
+    elif i < n and p[i] == 45:
+        sign = 1
+        i = i + 1
+    base: uint32 = cast[uint32](10)
+    if i + 1 < n and p[i] == 48 and (p[i + 1] == 120 or p[i + 1] == 88):
+        base = cast[uint32](16)
+        i = i + 2
+    elif i + 1 < n and p[i] == 48 and (p[i + 1] == 98 or p[i + 1] == 66):
+        base = cast[uint32](2)
+        i = i + 2
+    elif i + 1 < n and p[i] == 48 and (p[i + 1] == 111 or p[i + 1] == 79):
+        base = cast[uint32](8)
+        i = i + 2
+    cap: int32 = n + 2
+    off: int32 = bi_alloc_limbs(cap)
+    len: int32 = 0
+    while i < n:
+        c: uint8 = p[i]
+        if c == 95:
+            i = i + 1
+        else:
+            d: int32 = bi_hexval(c)
+            if d < 0 or cast[uint32](d) >= base:
+                i = n
+            else:
+                len = bi_limbs_muladd(off, len, cap, base, cast[uint32](d))
+                i = i + 1
+    return bi_make(sign, off, len)
+
+
+# ====================================================================
+# magnitude helpers.
+# ====================================================================
+def bi_mag_cmp(a: int32, b: int32) -> int32:
+    la: int32 = bi_len[a]
+    lb: int32 = bi_len[b]
+    if la != lb:
+        if la < lb:
+            return -1
+        return 1
+    i: int32 = la - 1
+    oa: int32 = bi_off[a]
+    ob: int32 = bi_off[b]
+    while i >= 0:
+        va: uint32 = bi_limbs[oa + i]
+        vb: uint32 = bi_limbs[ob + i]
+        if va < vb:
+            return -1
+        if va > vb:
+            return 1
+        i = i - 1
+    return 0
+
+
+# |a| + |b|  -> a sign-0 record
+def bi_mag_add(a: int32, b: int32) -> int32:
+    la: int32 = bi_len[a]
+    lb: int32 = bi_len[b]
+    ml: int32 = la
+    if lb > ml:
+        ml = lb
+    off: int32 = bi_alloc_limbs(ml + 1)
+    oa: int32 = bi_off[a]
+    ob: int32 = bi_off[b]
+    carry: uint64 = cast[uint64](0)
+    i: int32 = 0
+    while i < ml:
+        s: uint64 = carry
+        if i < la:
+            s = s + cast[uint64](bi_limbs[oa + i])
+        if i < lb:
+            s = s + cast[uint64](bi_limbs[ob + i])
+        bi_limbs[off + i] = cast[uint32](s)
+        carry = s >> 32
+        i = i + 1
+    bi_limbs[off + ml] = cast[uint32](carry)
+    return bi_make(0, off, ml + 1)
+
+
+# |a| - |b|, REQUIRES |a| >= |b|  -> a sign-0 record
+def bi_mag_sub(a: int32, b: int32) -> int32:
+    la: int32 = bi_len[a]
+    lb: int32 = bi_len[b]
+    off: int32 = bi_alloc_limbs(la)
+    oa: int32 = bi_off[a]
+    ob: int32 = bi_off[b]
+    borrow: int64 = 0
+    i: int32 = 0
+    while i < la:
+        yb: int64 = 0
+        if i < lb:
+            yb = cast[int64](cast[uint64](bi_limbs[ob + i]))
+        diff: int64 = cast[int64](cast[uint64](bi_limbs[oa + i])) - yb - borrow
+        if diff < 0:
+            diff = diff + 4294967296
+            borrow = 1
+        else:
+            borrow = 0
+        bi_limbs[off + i] = cast[uint32](cast[uint64](diff))
+        i = i + 1
+    return bi_make(0, off, la)
+
+
+# |a| * |b|  -> a sign-0 record
+def bi_mag_mul(a: int32, b: int32) -> int32:
+    la: int32 = bi_len[a]
+    lb: int32 = bi_len[b]
+    if la == 0 or lb == 0:
+        return bi_zero()
+    off: int32 = bi_alloc_limbs(la + lb)
+    oa: int32 = bi_off[a]
+    ob: int32 = bi_off[b]
+    i: int32 = 0
+    while i < la:
+        carry: uint64 = cast[uint64](0)
+        ai: uint64 = cast[uint64](bi_limbs[oa + i])
+        j: int32 = 0
+        while j < lb:
+            cur: uint64 = ai * cast[uint64](bi_limbs[ob + j]) + cast[uint64](bi_limbs[off + i + j]) + carry
+            bi_limbs[off + i + j] = cast[uint32](cur)
+            carry = cur >> 32
+            j = j + 1
+        bi_limbs[off + i + lb] = cast[uint32](carry)
+        i = i + 1
+    return bi_make(0, off, la + lb)
+
+
+# bit length of the magnitude
+def bi_bitlen(a: int32) -> int32:
+    l: int32 = bi_len[a]
+    if l == 0:
+        return 0
+    top: uint32 = bi_limbs[bi_off[a] + l - 1]
+    b: int32 = 0
+    while top != cast[uint32](0):
+        b = b + 1
+        top = top >> 1
+    return (l - 1) * 32 + b
+
+
+def bi_mag_bit(a: int32, i: int32) -> int32:
+    limb: int32 = i >> 5
+    if limb >= bi_len[a]:
+        return 0
+    within: int32 = i & 31
+    return cast[int32]((bi_limbs[bi_off[a] + limb] >> within) & cast[uint32](1))
+
+
+# magnitude divmod via bit-by-bit binary long division.
+# Returns the quotient record (sign 0); stores the remainder record in g_bi_rem.
+def bi_mag_divmod(a: int32, b: int32) -> int32:
+    if bi_len[b] == 0:
+        throw_error(cast[Ptr[uint8]]("RangeError"), cast[Ptr[uint8]]("Division by zero"))
+        g_bi_rem = bi_zero()
+        return bi_zero()
+    if bi_mag_cmp(a, b) < 0:
+        g_bi_rem = bi_with_sign(a, 0)
+        return bi_zero()
+    la: int32 = bi_len[a]
+    lb: int32 = bi_len[b]
+    qoff: int32 = bi_alloc_limbs(la)              # quotient
+    rcap: int32 = lb + 2
+    roff: int32 = bi_alloc_limbs(rcap)            # running remainder
+    rlen: int32 = 0
+    ob: int32 = bi_off[b]
+    nbits: int32 = bi_bitlen(a)
+    bit: int32 = nbits - 1
+    while bit >= 0:
+        # r = (r << 1) | bit_of_a
+        carry: uint32 = cast[uint32](bi_mag_bit(a, bit))
+        i: int32 = 0
+        while i < rlen:
+            v: uint32 = bi_limbs[roff + i]
+            bi_limbs[roff + i] = (v << 1) | carry
+            carry = v >> 31
+            i = i + 1
+        if carry != cast[uint32](0):
+            bi_limbs[roff + rlen] = carry
+            rlen = rlen + 1
+        # compare r with b (both trimmed): if r >= b, subtract and set quotient bit
+        cmp: int32 = 1
+        if rlen < lb:
+            cmp = -1
+        elif rlen > lb:
+            cmp = 1
+        else:
+            k: int32 = rlen - 1
+            cmp = 0
+            while k >= 0:
+                rv: uint32 = bi_limbs[roff + k]
+                bv: uint32 = bi_limbs[ob + k]
+                if rv < bv:
+                    cmp = -1
+                    k = -1
+                elif rv > bv:
+                    cmp = 1
+                    k = -1
+                else:
+                    k = k - 1
+        if cmp >= 0:
+            borrow: int64 = 0
+            j: int32 = 0
+            while j < rlen:
+                yb: int64 = 0
+                if j < lb:
+                    yb = cast[int64](cast[uint64](bi_limbs[ob + j]))
+                diff: int64 = cast[int64](cast[uint64](bi_limbs[roff + j])) - yb - borrow
+                if diff < 0:
+                    diff = diff + 4294967296
+                    borrow = 1
+                else:
+                    borrow = 0
+                bi_limbs[roff + j] = cast[uint32](cast[uint64](diff))
+                j = j + 1
+            while rlen > 0 and bi_limbs[roff + rlen - 1] == cast[uint32](0):
+                rlen = rlen - 1
+            qlimb: int32 = bit >> 5
+            qwithin: int32 = bit & 31
+            bi_limbs[qoff + qlimb] = bi_limbs[qoff + qlimb] | (cast[uint32](1) << qwithin)
+        bit = bit - 1
+    g_bi_rem = bi_make(0, roff, rlen)
+    return bi_make(0, qoff, la)
+
+
+# ====================================================================
+# signed arithmetic.
+# ====================================================================
+def bi_add(a: int32, b: int32) -> int32:
+    sa: int32 = bi_sign[a]
+    sb: int32 = bi_sign[b]
+    if sa == sb:
+        return bi_with_sign(bi_mag_add(a, b), sa)
+    c: int32 = bi_mag_cmp(a, b)
+    if c == 0:
+        return bi_zero()
+    if c > 0:
+        return bi_with_sign(bi_mag_sub(a, b), sa)
+    return bi_with_sign(bi_mag_sub(b, a), sb)
+
+
+def bi_sub(a: int32, b: int32) -> int32:
+    return bi_add(a, bi_neg(b))
+
+
+def bi_mul(a: int32, b: int32) -> int32:
+    s: int32 = bi_sign[a] ^ bi_sign[b]
+    return bi_with_sign(bi_mag_mul(a, b), s)
+
+
+def bi_div(a: int32, b: int32) -> int32:
+    q: int32 = bi_mag_divmod(a, b)          # sets g_bi_rem
+    s: int32 = bi_sign[a] ^ bi_sign[b]
+    return bi_with_sign(q, s)
+
+
+def bi_rem(a: int32, b: int32) -> int32:
+    bi_mag_divmod(a, b)                       # remainder -> g_bi_rem
+    return bi_with_sign(g_bi_rem, bi_sign[a])
+
+
+def bi_pow(a: int32, b: int32) -> int32:
+    if bi_sign[b] == 1:
+        throw_error(cast[Ptr[uint8]]("RangeError"), cast[Ptr[uint8]]("Exponent must be non-negative"))
+        return bi_zero()
+    result: int32 = bi_one()
+    base: int32 = a
+    nbits: int32 = bi_bitlen(b)
+    i: int32 = 0
+    while i < nbits:
+        if bi_mag_bit(b, i) == 1:
+            result = bi_mul(result, base)
+        if i + 1 < nbits:
+            base = bi_mul(base, base)
+        i = i + 1
+    return result
+
+
+# signed compare: -1 / 0 / 1
+def bi_cmp(a: int32, b: int32) -> int32:
+    sa: int32 = bi_sign[a]
+    sb: int32 = bi_sign[b]
+    if sa != sb:
+        if sa == 1:
+            return -1
+        return 1
+    c: int32 = bi_mag_cmp(a, b)
+    if sa == 1:
+        return 0 - c
+    return c
+
+
+# ====================================================================
+# bitwise (two's-complement, infinite-width semantics).
+# ====================================================================
+# Write the two's-complement of `a` into a W-limb window at `off` (W large
+# enough to hold a sign limb). Negative values are stored as ~mag + 1.
+def bi_to_twos(a: int32, off: int32, W: int32):
+    l: int32 = bi_len[a]
+    oa: int32 = bi_off[a]
+    i: int32 = 0
+    while i < W:
+        limb: uint32 = cast[uint32](0)
+        if i < l:
+            limb = bi_limbs[oa + i]
+        bi_limbs[off + i] = limb
+        i = i + 1
+    if bi_sign[a] == 1:
+        carry: uint64 = cast[uint64](1)
+        j: int32 = 0
+        while j < W:
+            t: uint64 = cast[uint64](BI_ALLONES - bi_limbs[off + j]) + carry
+            bi_limbs[off + j] = cast[uint32](t)
+            carry = t >> 32
+            j = j + 1
+
+
+# Interpret a W-limb two's-complement window at `off` as a signed bigint.
+def bi_from_twos(off: int32, W: int32) -> int32:
+    neg: uint32 = (bi_limbs[off + W - 1] >> 31) & cast[uint32](1)
+    if neg == cast[uint32](0):
+        return bi_make(0, off, W)
+    carry: uint64 = cast[uint64](1)                # magnitude = ~R + 1
+    i: int32 = 0
+    while i < W:
+        t: uint64 = cast[uint64](BI_ALLONES - bi_limbs[off + i]) + carry
+        bi_limbs[off + i] = cast[uint32](t)
+        carry = t >> 32
+        i = i + 1
+    return bi_with_sign(bi_make(0, off, W), 1)
+
+
+# op: 0 AND, 1 OR, 2 XOR
+def bi_bitwise(a: int32, b: int32, op: int32) -> int32:
+    la: int32 = bi_len[a]
+    lb: int32 = bi_len[b]
+    W: int32 = la
+    if lb > W:
+        W = lb
+    W = W + 1
+    aoff: int32 = bi_alloc_limbs(W)
+    boff: int32 = bi_alloc_limbs(W)
+    roff: int32 = bi_alloc_limbs(W)
+    bi_to_twos(a, aoff, W)
+    bi_to_twos(b, boff, W)
+    i: int32 = 0
+    while i < W:
+        av: uint32 = bi_limbs[aoff + i]
+        bv: uint32 = bi_limbs[boff + i]
+        rv: uint32 = cast[uint32](0)
+        if op == 0:
+            rv = av & bv
+        elif op == 1:
+            rv = av | bv
+        else:
+            rv = av ^ bv
+        bi_limbs[roff + i] = rv
+        i = i + 1
+    return bi_from_twos(roff, W)
+
+
+# a << shift (shift is a signed limb count of BITS). Negative shift => a >> -shift.
+def bi_shl(a: int32, shift: int32) -> int32:
+    if shift < 0:
+        return bi_shr(a, 0 - shift)
+    if bi_len[a] == 0 or shift == 0:
+        return a
+    words: int32 = shift >> 5
+    bits: int32 = shift & 31
+    la: int32 = bi_len[a]
+    oa: int32 = bi_off[a]
+    outn: int32 = la + words + 1
+    off: int32 = bi_alloc_limbs(outn)
+    i: int32 = 0
+    while i < la:
+        v: uint64 = cast[uint64](bi_limbs[oa + i]) << bits
+        bi_limbs[off + words + i] = bi_limbs[off + words + i] | cast[uint32](v)
+        bi_limbs[off + words + i + 1] = bi_limbs[off + words + i + 1] | cast[uint32](v >> 32)
+        i = i + 1
+    return bi_with_sign(bi_make(0, off, outn), bi_sign[a])
+
+
+# a >> shift  — ARITHMETIC (floor) shift: rounds toward -Infinity for negatives.
+def bi_shr(a: int32, shift: int32) -> int32:
+    if shift < 0:
+        return bi_shl(a, 0 - shift)
+    if bi_len[a] == 0 or shift == 0:
+        return a
+    words: int32 = shift >> 5
+    bits: int32 = shift & 31
+    la: int32 = bi_len[a]
+    oa: int32 = bi_off[a]
+    # detect whether any 1-bit is shifted out (needed for negative floor rounding)
+    dropped: int32 = 0
+    k: int32 = 0
+    while k < shift and k < la * 32:
+        if bi_mag_bit(a, k) == 1:
+            dropped = 1
+            k = shift
+        else:
+            k = k + 1
+    if words >= la:
+        if bi_sign[a] == 1:
+            return bi_neg(bi_one())              # -1n
+        return bi_zero()
+    outn: int32 = la - words
+    off: int32 = bi_alloc_limbs(outn)
+    i: int32 = 0
+    while i < outn:
+        lo: uint32 = bi_limbs[oa + words + i] >> bits
+        if bits != 0 and (words + i + 1) < la:
+            lo = lo | (bi_limbs[oa + words + i + 1] << (32 - bits))
+        bi_limbs[off + i] = lo
+        i = i + 1
+    mag: int32 = bi_make(0, off, outn)
+    if bi_sign[a] == 1:
+        signed: int32 = bi_with_sign(mag, 1)
+        if dropped == 1:
+            return bi_sub(signed, bi_one())      # floor: -x rounds further from 0
+        return signed
+    return mag
+
+
+# ====================================================================
+# conversions out.
+# ====================================================================
+# low signed 32-bit value (used for small shift counts). Saturates silently.
+def bi_to_i32(a: int32) -> int32:
+    if bi_len[a] == 0:
+        return 0
+    v: int32 = cast[int32](bi_limbs[bi_off[a]])
+    if v < 0:
+        v = 2147483647                      # clamp huge magnitudes
+    if bi_sign[a] == 1:
+        return 0 - v
+    return v
+
+
+def bi_to_float(a: int32) -> float64:
+    r: float64 = 0.0
+    i: int32 = bi_len[a] - 1
+    oa: int32 = bi_off[a]
+    while i >= 0:
+        r = r * 4294967296.0 + cast[float64](bi_limbs[oa + i])
+        i = i - 1
+    if bi_sign[a] == 1:
+        return 0.0 - r
+    return r
+
+
+# divide magnitude window in place by a small divisor; return the remainder.
+def bi_limbs_divsmall(off: int32, len: int32, d: uint32) -> uint32:
+    rem: uint64 = cast[uint64](0)
+    i: int32 = len - 1
+    dd: uint64 = cast[uint64](d)
+    while i >= 0:
+        cur: uint64 = (rem << 32) | cast[uint64](bi_limbs[off + i])
+        bi_limbs[off + i] = cast[uint32](cur / dd)
+        rem = cur % dd
+        i = i - 1
+    return cast[uint32](rem)
+
+
+# emit the value in the given radix (2..36) via current emit_tgt.
+def bi_emit_radix(a: int32, radix: int32):
+    if bi_len[a] == 0:
+        emit_c(48)
+        return
+    if bi_sign[a] == 1:
+        emit_c(45)
+    l: int32 = bi_len[a]
+    off: int32 = bi_alloc_limbs(l)
+    oa: int32 = bi_off[a]
+    i: int32 = 0
+    while i < l:
+        bi_limbs[off + i] = bi_limbs[oa + i]
+        i = i + 1
+    cur_len: int32 = l
+    nd: int32 = 0
+    rd: uint32 = cast[uint32](radix)
+    while cur_len > 0:
+        if nd >= BI_DIG_CAP:
+            cur_len = 0
+        else:
+            r: uint32 = bi_limbs_divsmall(off, cur_len, rd)
+            bi_digs[nd] = r
+            nd = nd + 1
+            while cur_len > 0 and bi_limbs[off + cur_len - 1] == cast[uint32](0):
+                cur_len = cur_len - 1
+    k: int32 = nd - 1
+    while k >= 0:
+        d: int32 = cast[int32](bi_digs[k])
+        if d < 10:
+            emit_c(cast[uint8](48 + d))
+        else:
+            emit_c(cast[uint8](87 + d))
+        k = k - 1
+
+
+def bi_to_strid(a: int32, radix: int32) -> int32:
+    save: int32 = emit_tgt
+    emit_tgt = 0
+    bld_begin()
+    bi_emit_radix(a, radix)
+    id: int32 = bld_end()
+    emit_tgt = save
+    return id
+
+
+# ====================================================================
+# BigInt() conversion + BigInt.asIntN / asUintN.
+# ====================================================================
+def bi_from_value(h: int32) -> int32:
+    t: int32 = tag_of(h)
+    if t == TAG_BIGINT:
+        return bigid_of(h)
+    if t == TAG_BOOL:
+        if h == 2:
+            return bi_one()
+        return bi_zero()
+    if t == TAG_NUM:
+        x: float64 = v_num[h]
+        if is_nan(x) != 0 or is_inf(x) != 0 or f_floor(x) != x:
+            throw_error(cast[Ptr[uint8]]("RangeError"), cast[Ptr[uint8]]("The number is not a safe integer"))
+            return bi_zero()
+        return bi_from_i64(cast[int64](x))
+    if t == TAG_STR:
+        sid: int32 = strid_of(h)
+        return bi_parse(str_ptr(sid), str_len(sid))
+    throw_error(cast[Ptr[uint8]]("TypeError"), cast[Ptr[uint8]]("Cannot convert value to a BigInt"))
+    return bi_zero()
+
+
+# BigInt.asUintN(bits, x): x mod 2^bits, result in [0, 2^bits).
+def bi_as_uintn(bits: int32, a: int32) -> int32:
+    if bits <= 0:
+        return bi_zero()
+    W: int32 = (bits >> 5) + 2
+    off: int32 = bi_alloc_limbs(W)
+    bi_to_twos(a, off, W)                     # low `bits` bits are the wrapped value
+    fullw: int32 = bits >> 5
+    rem: int32 = bits & 31
+    i: int32 = 0
+    while i < W:
+        if i < fullw:
+            pass
+        elif i == fullw:
+            if rem == 0:
+                bi_limbs[off + i] = cast[uint32](0)
+            else:
+                bi_limbs[off + i] = bi_limbs[off + i] & ((cast[uint32](1) << rem) - cast[uint32](1))
+        else:
+            bi_limbs[off + i] = cast[uint32](0)
+        i = i + 1
+    return bi_make(0, off, W)
+
+
+# BigInt.asIntN(bits, x): interpret asUintN(bits, x) as a two's-complement signed
+# integer of `bits` bits.
+def bi_as_intn(bits: int32, a: int32) -> int32:
+    if bits <= 0:
+        return bi_zero()
+    u: int32 = bi_as_uintn(bits, a)
+    # if bit (bits-1) is set, subtract 2^bits
+    if bi_mag_bit(u, bits - 1) == 1:
+        two_n: int32 = bi_shl(bi_one(), bits)
+        return bi_sub(u, two_n)
+    return u
