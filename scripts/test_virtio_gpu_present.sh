@@ -57,6 +57,104 @@ source "$PROJ_ROOT/scripts/_build_lock.sh"
 HAMNIX_INSTALLER_IMG="${HAMNIX_INSTALLER_IMG:-build/hamnix-installer.img}"
 BOOT_WAIT="${BOOT_WAIT:-200}"
 
+# ======================================================================
+# OPT-IN real-GPU gate (host-GPU bridge) — HAMNIX_REAL_GPU_GATE=1
+# ======================================================================
+# The in-VM virtio-gpu-gl/VIRGL path only reaches a REAL host GPU when
+# QEMU's `-display egl-headless` can build a GL context on the DRM render
+# node. On an NVIDIA-proprietary host that FAILS: QEMU egl-headless uses
+# the EGL *GBM* platform, and the NVIDIA driver's GBM-headless backend
+# errors ("nv_gbm_create_device_native failed"), so virglrenderer falls
+# back to llvmpipe (SOFTWARE) — no RTX pixels. (The NVIDIA card DOES do
+# HW GL headless, but only via the EGL *device* platform, which QEMU
+# egl-headless does not use.) See docs/real_gpu_bridge_2026-07-18.md.
+#
+# So this gate drives the REAL GPU the reliable way: the host-GPU bridge
+# (scripts/vk_hostgpu_bridge.c) runs the vk_2d compositor op vocabulary
+# as a real Vulkan COMPUTE pipeline on the discrete GPU and byte-verifies
+# the readback against a bit-exact SW oracle. It renders a genuine
+# full-frame DE + browser-page workload (`pageraster`) — not a synthetic
+# fill — and captures nvidia-smi per-process residency as GPU-exec proof.
+#
+# SKIPS CLEANLY (exit 0) when: libvulkan/gcc absent, no non-CPU Vulkan
+# device (only llvmpipe), or the shader SPIR-V is missing.
+# Pass marker: [test_realgpu] PASS   Fail marker: [test_realgpu] FAIL
+if [ "${HAMNIX_REAL_GPU_GATE:-0}" = "1" ]; then
+    echo "[test_realgpu] opt-in real-GPU bridge gate"
+    LIBVK=""
+    for cand in /usr/lib/x86_64-linux-gnu/libvulkan.so.1 /usr/lib/libvulkan.so.1; do
+        [ -f "$cand" ] && LIBVK="$cand" && break
+    done
+    if [ -z "$LIBVK" ]; then
+        echo "[test_realgpu] SKIP: libvulkan.so.1 not found"; exit 0
+    fi
+    if ! command -v gcc >/dev/null 2>&1; then
+        echo "[test_realgpu] SKIP: gcc not available to build the bridge"; exit 0
+    fi
+    if [ ! -f scripts/shaders/vk2d_raster.comp.spv ]; then
+        echo "[test_realgpu] SKIP: scripts/shaders/vk2d_raster.comp.spv missing"; exit 0
+    fi
+    mkdir -p build/host
+    BR=build/host/vk_hostgpu_bridge
+    if ! gcc -O2 scripts/vk_hostgpu_bridge.c -o "$BR" "$LIBVK" 2>build/host/vk_bridge_build.log; then
+        echo "[test_realgpu] FAIL: bridge build failed"; sed 's/^/[test_realgpu]   /' build/host/vk_bridge_build.log; exit 1
+    fi
+    # Require a non-CPU (real) Vulkan device; else SKIP (llvmpipe-only host).
+    INFO=$("$BR" info 2>&1)
+    echo "$INFO" | sed 's/^/[test_realgpu] /'
+    DEVLINE=$(echo "$INFO" | grep '^VK_DEVICE' | head -1)
+    if echo "$DEVLINE" | grep -q '\[CPU'; then
+        echo "[test_realgpu] SKIP: only a CPU (software) Vulkan device present — no real GPU"; exit 0
+    fi
+    if [ -z "$DEVLINE" ]; then
+        echo "[test_realgpu] SKIP: no Vulkan device enumerated"; exit 0
+    fi
+    RGPPM=$(mktemp --tmpdir hamnix-realgpu.XXXXXX.ppm)
+    RGLOG=$(mktemp --tmpdir hamnix-realgpu.XXXXXX.log)
+    rg_cleanup() { rm -f "$RGPPM" "$RGLOG"; }
+    trap 'rg_cleanup' EXIT
+    # Sustained 3s run so nvidia-smi can observe this pid resident on the GPU.
+    "$BR" pageraster 1280 720 "$RGPPM" 3 >"$RGLOG" 2>/dev/null &
+    RGPID=$!
+    SMI_HIT=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        for _ in $(seq 1 60); do
+            APPS=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null)
+            if echo "$APPS" | grep -q "^$RGPID,"; then
+                SMI_HIT=$(echo "$APPS" | grep "^$RGPID,")
+                break
+            fi
+            kill -0 "$RGPID" 2>/dev/null || break
+            sleep 0.1
+        done
+    fi
+    wait "$RGPID"; RGRC=$?
+    echo "[test_realgpu] --- bridge output ---"; sed 's/^/[test_realgpu] /' "$RGLOG"
+    rgfail=0
+    grep -q '^PAGERASTER_OK' "$RGLOG" || { echo "[test_realgpu] FAIL: pageraster did not complete" >&2; rgfail=1; }
+    MISM=$(grep '^PAGERASTER_GPUvsCPUport_MISMATCH' "$RGLOG" | awk '{print $2}')
+    if [ "${MISM:-x}" = "0" ]; then
+        echo "[test_realgpu] PASS: GPU readback byte-identical to SW oracle (0 mismatches)"
+    else
+        echo "[test_realgpu] FAIL: GPU vs SW-oracle mismatch=${MISM:-?}" >&2; rgfail=1
+    fi
+    RGDEV=$(grep '^VK_DEVICE' "$RGLOG" | head -1)
+    if echo "$RGDEV" | grep -qi 'discrete-GPU\|integrated-GPU'; then
+        echo "[test_realgpu] PASS: rendered on a real GPU — ${RGDEV#VK_DEVICE }"
+    else
+        echo "[test_realgpu] FAIL: not a real GPU device (${RGDEV#VK_DEVICE })" >&2; rgfail=1
+    fi
+    if [ -n "$SMI_HIT" ]; then
+        echo "[test_realgpu] PASS: nvidia-smi observed this pid resident on the GPU: $SMI_HIT"
+    else
+        echo "[test_realgpu] NOTE: nvidia-smi per-process residency not captured (fast run / non-NVIDIA); byte-verify + discrete-GPU selection still prove GPU execution"
+    fi
+    [ "$RGRC" -ne 0 ] && [ "$rgfail" -eq 0 ] && { echo "[test_realgpu] FAIL: bridge rc=$RGRC" >&2; rgfail=1; }
+    if [ "$rgfail" -ne 0 ]; then echo "[test_realgpu] FAIL"; exit 1; fi
+    echo "[test_realgpu] PASS — real-GPU host bridge rasterized a full DE+browser frame on the discrete GPU, byte-identical to the SW oracle"
+    exit 0
+fi
+
 # --- environment gates (skip cleanly) ---------------------------------
 if [ ! -e /dev/kvm ]; then
     echo "[test_vgpu] SKIP: /dev/kvm absent (KVM required; boot too slow without it)" >&2

@@ -1418,11 +1418,343 @@ static int mode_rasterbench(uint32_t W, uint32_t H) {
     return 0;
 }
 
+/* ======================================================================
+ * pageraster W H OUT.ppm [SECONDS] — a REAL Hamnix workload on the GPU.
+ *
+ * Unlike the fixed 96x64 `raster` scene, this composes a full-frame
+ * (e.g. 1280x720) DE + browser-page-shaped frame from the SAME vk_2d op
+ * vocabulary the DE compositor and the hambrowse painter emit: a page
+ * background fill, a browser chrome bar, a rounded URL box, a translucent
+ * hero banner (source-over alpha), rows of text-line block fills (the
+ * shape of laid-out text runs), image blits, card roundrects with AA
+ * corners, and separator lines. It runs on the RTX 3090 via the compute
+ * pipeline and byte-verifies the GPU readback against a bit-exact runtime
+ * CPU port (the SW oracle). With SECONDS given, it keeps submitting GPU
+ * frames for that long so an external `nvidia-smi --query-compute-apps`
+ * observes THIS pid actively resident on the GPU — unforgeable proof the
+ * real hardware executed the pixels.
+ *
+ * This mode is fully self-contained (its own runtime-dim CPU port + op
+ * builder) so the proven `raster`/`rasterbench` paths are untouched.
+ * ==================================================================== */
+#define PR_MAXOPS 4096
+static int      pr_nops;
+static PushC    pr_ops[PR_MAXOPS];
+static uint32_t pr_grp[PR_MAXOPS][2];
+static int      PR_W, PR_H;
+
+/* ---- runtime-dimension CPU port (bit-exact twin of vk2d_raster.comp) ---- */
+static inline void pr_blend_at(uint8_t* p, uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
+    if (a == 0) return;
+    if (a >= 255) { p[0]=r; p[1]=g; p[2]=b; p[3]=255; return; }
+    uint32_t ia = 255 - a;
+    p[0]=(uint8_t)((r*a+p[0]*ia)/255); p[1]=(uint8_t)((g*a+p[1]*ia)/255);
+    p[2]=(uint8_t)((b*a+p[2]*ia)/255); p[3]=255;
+}
+static void pr_cpu_fill(uint8_t* img, int x,int y,int w,int h, uint32_t rgba){
+    if (w<=0||h<=0) return;
+    uint32_t r=(rgba>>24)&0xFF,g=(rgba>>16)&0xFF,b=(rgba>>8)&0xFF;
+    int x0=x<0?0:x,y0=y<0?0:y,x1=x+w>PR_W?PR_W:x+w,y1=y+h>PR_H?PR_H:y+h;
+    for (int yy=y0;yy<y1;yy++) for (int xx=x0;xx<x1;xx++){
+        uint8_t* p=img+(yy*PR_W+xx)*4; p[0]=r;p[1]=g;p[2]=b;p[3]=255; }
+}
+static void pr_cpu_fill_alpha(uint8_t* img, int x,int y,int w,int h, uint32_t rgba){
+    if (w<=0||h<=0) return;
+    uint32_t r=(rgba>>24)&0xFF,g=(rgba>>16)&0xFF,b=(rgba>>8)&0xFF,a=rgba&0xFF;
+    if (a==0) return;
+    int x0=x<0?0:x,y0=y<0?0:y,x1=x+w>PR_W?PR_W:x+w,y1=y+h>PR_H?PR_H:y+h;
+    for (int yy=y0;yy<y1;yy++) for (int xx=x0;xx<x1;xx++)
+        pr_blend_at(img+(yy*PR_W+xx)*4, r,g,b,a);
+}
+static void pr_cpu_blit(uint8_t* img, const uint8_t* src, int sw,int sh,
+                        int dx,int dy,int dw,int dh){
+    int rsw=sw,rsh=sh,tw=dw>0?dw:rsw,th=dh>0?dh:rsh;
+    int yy0=dy<0?-dy:0, yy1=dy+th>PR_H?PR_H-dy:th, xx0=dx<0?-dx:0, xx1=dx+tw>PR_W?PR_W-dx:tw;
+    for (int yy=yy0;yy<yy1;yy++){
+        int syi=(yy*rsh/th); if(syi>=sh) syi=sh-1;
+        for (int xx=xx0;xx<xx1;xx++){
+            int sxi=(xx*rsw/tw); if(sxi>=sw) sxi=sw-1;
+            const uint8_t* s=src+(syi*sw+sxi)*4;
+            pr_blend_at(img+((dy+yy)*PR_W+(dx+xx))*4, s[0],s[1],s[2],s[3]);
+        }
+    }
+}
+static void pr_cpu_roundrect(uint8_t* img,int x,int y,int w,int h,int rad,int corners,uint32_t rgba){
+    if (w<=0||h<=0) return;
+    uint32_t r=(rgba>>24)&0xFF,g=(rgba>>16)&0xFF,b=(rgba>>8)&0xFF,a=rgba&0xFF;
+    if (a==0) return;
+    int rr=rad; if(rr<0)rr=0; if(rr>w/2)rr=w/2; if(rr>h/2)rr=h/2;
+    if (rr<=0){ pr_cpu_fill_alpha(img,x,y,w,h,rgba); return; }
+    int r2=2*rr, tlx2=2*(x+rr),tly2=2*(y+rr), trx2=2*(x+w-rr),try2=tly2,
+        blx2=tlx2,bly2=2*(y+h-rr), brx2=trx2,bry2=bly2;
+    int px0=x<0?0:x,px1=x+w>PR_W?PR_W:x+w,py0=y<0?0:y,py1=y+h>PR_H?PR_H:y+h;
+    for (int py=py0;py<py1;py++) for (int px=px0;px<px1;px++){
+        int cov=255, it=py<y+rr,ib=py>=y+h-rr,il=px<x+rr,ir=px>=x+w-rr;
+        if (it&&il&&(corners&1)) cov=cpu_rr_cov(px,py,tlx2,tly2,r2);
+        else if (it&&ir&&(corners&2)) cov=cpu_rr_cov(px,py,trx2,try2,r2);
+        else if (ib&&il&&(corners&4)) cov=cpu_rr_cov(px,py,blx2,bly2,r2);
+        else if (ib&&ir&&(corners&8)) cov=cpu_rr_cov(px,py,brx2,bry2,r2);
+        if (cov>0){ uint32_t ae=a*(uint32_t)cov/255; pr_blend_at(img+(py*PR_W+px)*4, r,g,b,ae); }
+    }
+}
+static void pr_cpu_line(uint8_t* img,int x1,int y1,int x2,int y2,int thick,uint32_t rgba){
+    uint32_t r=(rgba>>24)&0xFF,g=(rgba>>16)&0xFF,b=(rgba>>8)&0xFF;
+    int dx=abs(x2-x1),dy=abs(y2-y1),sx=x1>x2?-1:1,sy=y1>y2?-1:1,err=dx-dy,cx=x1,cy=y1;
+    int t=thick<1?1:thick,guard=0;
+    while (guard<100000){
+        for(int by=0;by<t;by++)for(int bx=0;bx<t;bx++){
+            int X=cx+bx,Y=cy+by;
+            if(X>=0&&Y>=0&&X<PR_W&&Y<PR_H){uint8_t*p=img+(Y*PR_W+X)*4;p[0]=r;p[1]=g;p[2]=b;p[3]=255;}
+        }
+        if(cx==x2&&cy==y2)return;
+        int e2=err*2; if(e2>-dy){err-=dy;cx+=sx;} if(e2<dx){err+=dx;cy+=sy;}
+        guard++;
+    }
+}
+
+/* ---- GPU op list builders (runtime dims; clamp mirrors the CPU port) ---- */
+static void pr_push(PushC pc,int dispw,int disph){
+    if (dispw<=0||disph<=0||pr_nops>=PR_MAXOPS) return;
+    pc.img_w=PR_W; pc.img_h=PR_H; pc.dispw=dispw; pc.disph=disph;
+    pr_ops[pr_nops]=pc; pr_grp[pr_nops][0]=(uint32_t)((dispw+7)/8);
+    pr_grp[pr_nops][1]=(uint32_t)((disph+7)/8); pr_nops++;
+}
+static void pr_gpu_fill(int op,int x,int y,int w,int h,uint32_t rgba){
+    if (w<=0||h<=0) return;
+    if (op==OP_FILL_ALPHA && (rgba&0xFF)==0) return;
+    int x0=x<0?0:x,y0=y<0?0:y,x1=x+w>PR_W?PR_W:x+w,y1=y+h>PR_H?PR_H:y+h;
+    if (x0>=x1||y0>=y1) return;
+    PushC pc={0}; pc.op=op; pc.rgba=rgba; pc.bx=x0; pc.by=y0;
+    pr_push(pc, x1-x0, y1-y0);
+}
+static void pr_gpu_blit(int sw,int sh,int dx,int dy,int dw,int dh){
+    int rsw=sw,rsh=sh,tw=dw>0?dw:rsw,th=dh>0?dh:rsh;
+    int yy0=dy<0?-dy:0, yy1=dy+th>PR_H?PR_H-dy:th, xx0=dx<0?-dx:0, xx1=dx+tw>PR_W?PR_W-dx:tw;
+    if (xx0>=xx1||yy0>=yy1) return;
+    PushC pc={0}; pc.op=OP_BLIT; pc.bx=dx+xx0; pc.by=dy+yy0;
+    pc.dx=dx; pc.dy=dy; pc.rsx=0; pc.rsy=0; pc.rsw=rsw; pc.rsh=rsh;
+    pc.tw=tw; pc.th=th; pc.src_w=sw; pc.src_h=sh;
+    pr_push(pc, xx1-xx0, yy1-yy0);
+}
+static void pr_gpu_line(int x1,int y1,int x2,int y2,int thick,uint32_t rgba){
+    PushC pc={0}; pc.op=OP_LINE; pc.rgba=rgba;
+    pc.px=x1; pc.py=y1; pc.pw=x2; pc.ph=y2; pc.rad=thick;
+    pr_push(pc, 1, 1);
+}
+static void pr_gpu_roundrect(int x,int y,int w,int h,int rad,int corners,uint32_t rgba){
+    if (w<=0||h<=0||(rgba&0xFF)==0) return;
+    int rr=rad; if(rr<0)rr=0; if(rr>w/2)rr=w/2; if(rr>h/2)rr=h/2;
+    if (rr<=0){ pr_gpu_fill(OP_FILL_ALPHA,x,y,w,h,rgba); return; }
+    int px0=x<0?0:x,px1=x+w>PR_W?PR_W:x+w,py0=y<0?0:y,py1=y+h>PR_H?PR_H:y+h;
+    if (px0>=px1||py0>=py1) return;
+    PushC pc={0}; pc.op=OP_ROUNDRECT; pc.rgba=rgba; pc.bx=px0; pc.by=py0;
+    pc.px=x; pc.py=y; pc.pw=w; pc.ph=h; pc.rad=rr; pc.corners=corners;
+    pr_push(pc, px1-px0, py1-py0);
+}
+
+/* Two dispatch back-ends over the same op stream: GPU (record+submit) and the
+ * CPU oracle. Called with distinct fn pointers so the scene is authored ONCE. */
+enum { EMIT_GPU, EMIT_CPU };
+static uint8_t* g_pr_cpuimg; static const uint8_t* g_pr_sprite;
+static int g_pr_sw, g_pr_sh; static int g_pr_emit;
+
+static void e_fill(int x,int y,int w,int h,uint32_t c){
+    if (g_pr_emit==EMIT_GPU) pr_gpu_fill(OP_FILL,x,y,w,h,c);
+    else pr_cpu_fill(g_pr_cpuimg,x,y,w,h,c); }
+static void e_fill_a(int x,int y,int w,int h,uint32_t c){
+    if (g_pr_emit==EMIT_GPU) pr_gpu_fill(OP_FILL_ALPHA,x,y,w,h,c);
+    else pr_cpu_fill_alpha(g_pr_cpuimg,x,y,w,h,c); }
+static void e_blit(int dx,int dy,int dw,int dh){
+    if (g_pr_emit==EMIT_GPU) pr_gpu_blit(g_pr_sw,g_pr_sh,dx,dy,dw,dh);
+    else pr_cpu_blit(g_pr_cpuimg,g_pr_sprite,g_pr_sw,g_pr_sh,dx,dy,dw,dh); }
+static void e_line(int x1,int y1,int x2,int y2,int t,uint32_t c){
+    if (g_pr_emit==EMIT_GPU) pr_gpu_line(x1,y1,x2,y2,t,c);
+    else pr_cpu_line(g_pr_cpuimg,x1,y1,x2,y2,t,c); }
+static void e_rr(int x,int y,int w,int h,int r,int cn,uint32_t c){
+    if (g_pr_emit==EMIT_GPU) pr_gpu_roundrect(x,y,w,h,r,cn,c);
+    else pr_cpu_roundrect(g_pr_cpuimg,x,y,w,h,r,cn,c); }
+
+/* Author the frame ONCE; emit selects GPU op-list vs CPU oracle draw. A DE
+ * desktop (wallpaper, top panel, dock) hosting a browser window that has
+ * laid out a real page (chrome, URL bar, hero image, headings, paragraph
+ * text runs, cards, links). ~1300 ops at 1280x720 — a genuine frame. */
+static void pr_author_frame(void) {
+    int W=PR_W, H=PR_H;
+    /* --- DE: wallpaper + top panel + dock --- */
+    e_fill(0,0,W,H, 0x101828FF);                 /* desktop wallpaper */
+    e_fill_a(0,0,W,H, 0x2A3A6010);               /* subtle vignette wash */
+    e_fill(0,0,W,28, 0x0B1020FF);                /* top panel bar */
+    for (int i=0;i<6;i++) e_fill(12+i*84,7,70,14, 0x33406AFF); /* panel menus */
+    e_rr(W-160,4,150,20, 8,15, 0x1E2A4AFF);      /* clock/tray pill */
+    /* dock along the bottom */
+    e_rr(W/2-220,H-56,440,48, 14,15, 0x0A0F1CCC);
+    for (int i=0;i<8;i++) e_rr(W/2-206+i*54,H-50,40,36, 8,15, 0x3B6FF0FF);
+
+    /* --- browser window --- */
+    int bx=120, by=56, bw=W-240, bh=H-140;
+    e_rr(bx,by,bw,bh, 10, 3, 0xF4F6FBFF);        /* window body (top corners) */
+    e_fill(bx,by,bw,36, 0x232A3AFF);             /* title/tab strip */
+    e_rr(bx+10,by+6,180,26, 8,3, 0xF4F6FBFF);    /* active tab */
+    e_fill(bx,by+36,bw,40, 0xE7EAF2FF);          /* toolbar */
+    e_rr(bx+90,by+44,bw-180,24, 12,15, 0xFFFFFFFF); /* URL box */
+    e_fill(bx+100,by+52,220,8, 0x9AA3B8FF);      /* URL text run */
+    e_rr(bx+16,by+44,24,24, 6,15, 0x5B78E6FF);   /* back button */
+    e_rr(bx+48,by+44,24,24, 6,15, 0x5B78E6FF);   /* fwd button */
+
+    int cx=bx, cy=by+76, cw=bw, ch=bh-76;        /* content viewport */
+    e_fill(cx,cy,cw,ch, 0xFFFFFFFF);             /* page background */
+    /* hero banner image + translucent gradient scrim + heading */
+    e_blit(cx+40,cy+24,cw-80,150);
+    e_fill_a(cx+40,cy+24,cw-80,150, 0x0A122888);
+    e_fill(cx+70,cy+120,360,26, 0xFFFFFFFF);     /* hero H1 */
+    e_fill(cx+70,cy+152,240,14, 0xD6DEECFF);
+    /* article: heading + paragraph text-run blocks */
+    int ty=cy+200;
+    e_fill(cx+40,ty,300,22, 0x1A2233FF); ty+=34; /* H2 */
+    for (int ln=0; ln<9; ln++){                  /* paragraph lines (text runs) */
+        int lw = (ln%3==2)? (cw-80)*3/5 : cw-80;
+        e_fill(cx+40,ty, lw,10, 0x515A6EFF); ty+=18;
+    }
+    ty+=14;
+    e_fill(cx+40,ty,260,22, 0x1A2233FF); ty+=34; /* H2 */
+    for (int ln=0; ln<7; ln++){
+        int lw=(ln%4==3)?(cw-80)/2:cw-80;
+        e_fill(cx+40,ty, lw,10, 0x515A6EFF); ty+=18;
+    }
+    /* a row of link/nav lines */
+    e_line(cx+40,ty+10, cx+cw-40,ty+10, 2, 0xC7CEDBFF);
+    /* --- sidebar: 3 cards with thumbnails, headings, and text --- */
+    int sx=cx+cw-300, sy=cy+200;
+    for (int card=0; card<3; card++){
+        int yy=sy+card*150;
+        e_rr(sx,yy,260,132, 12,15, 0xF7F9FDFF);  /* card body */
+        e_line(sx,yy+131, sx+260,yy+131, 1, 0xDFE4EEFF);
+        e_blit(sx+12,yy+12,72,72);               /* thumbnail */
+        e_fill(sx+96,yy+16,150,14, 0x27304AFF);  /* card title */
+        for (int ln=0; ln<3; ln++)
+            e_fill(sx+96,yy+40+ln*16, (ln==2?100:150),8, 0x6B7488FF);
+        e_rr(sx+96,yy+96,88,24, 12,15, 0x3B6FF0FF); /* CTA button */
+    }
+    /* scrollbar */
+    e_fill(cx+cw-10,cy,10,ch, 0xEDEFF5FF);
+    e_rr(cx+cw-9,cy+40,8,160, 4,15, 0xB4BDD0FF);
+}
+
+/* readback + byte-verify GPU SSBO against the CPU oracle image. */
+static int mode_pageraster(int W, int H, const char* out, double seconds) {
+    PR_W=W; PR_H=H;
+    size_t spvsz;
+    uint32_t* spv = read_spv("scripts/shaders/vk2d_raster.comp.spv", &spvsz);
+    if (!spv) return -1;
+    VkDeviceSize dstsz=(VkDeviceSize)W*H*4;
+    /* a small procedural sprite as the "image" source for blits */
+    int SW=64, SH=64; VkDeviceSize srcsz=(VkDeviceSize)SW*SH*4;
+    uint8_t* sprite = malloc(srcsz);
+    for (int y=0;y<SH;y++) for (int x=0;x<SW;x++){ uint8_t*p=sprite+(y*SW+x)*4;
+        p[0]=(uint8_t)(x*4); p[1]=(uint8_t)(y*4); p[2]=(uint8_t)(160-x); p[3]=255; }
+    g_pr_sprite=sprite; g_pr_sw=SW; g_pr_sh=SH;
+
+    VkBuffer dbuf,sbuf; VkDeviceMemory dmem,smem;
+    if (make_storagebuf(dstsz,&dbuf,&dmem)) return -1;
+    if (make_storagebuf(srcsz,&sbuf,&smem)) return -1;
+    void* map; CK(vkMapMemory(g_dev,smem,0,srcsz,0,&map));
+    memcpy(map,sprite,srcsz); vkUnmapMemory(g_dev,smem);
+
+    VkShaderModuleCreateInfo smi={ .sType=ST_SHADER_MODULE_CREATE_INFO, .codeSize=spvsz, .pCode=spv };
+    VkShaderModule module; CK(vkCreateShaderModule(g_dev,&smi,0,&module)); free(spv);
+    VkDescriptorSetLayoutBinding binds[2]={
+        {.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT},
+        {.binding=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT}};
+    VkDescriptorSetLayoutCreateInfo dli={ .sType=ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=2,.pBindings=binds};
+    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(g_dev,&dli,0,&dsl));
+    VkPushConstantRange pcr={ .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT,.offset=0,.size=sizeof(PushC)};
+    VkPipelineLayoutCreateInfo pli={ .sType=ST_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&dsl,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr};
+    VkPipelineLayout playout; CK(vkCreatePipelineLayout(g_dev,&pli,0,&playout));
+    VkComputePipelineCreateInfo cpi={ .sType=ST_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage={.sType=ST_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=module,.pName="main"},.layout=playout};
+    VkPipeline pipe; CK(vkCreateComputePipelines(g_dev,0,1,&cpi,0,&pipe));
+    VkDescriptorPoolSize psz={ .type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=2};
+    VkDescriptorPoolCreateInfo dpi={ .sType=ST_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&psz};
+    VkDescriptorPool dpool; CK(vkCreateDescriptorPool(g_dev,&dpi,0,&dpool));
+    VkDescriptorSetAllocateInfo dsai={ .sType=ST_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=dpool,.descriptorSetCount=1,.pSetLayouts=&dsl};
+    VkDescriptorSet dset; CK(vkAllocateDescriptorSets(g_dev,&dsai,&dset));
+    VkDescriptorBufferInfo dbi={.buffer=dbuf,.offset=0,.range=dstsz}, sbi={.buffer=sbuf,.offset=0,.range=srcsz};
+    VkWriteDescriptorSet wr[2]={
+        {.sType=ST_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi},
+        {.sType=ST_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&sbi}};
+    vkUpdateDescriptorSets(g_dev,2,wr,0,0);
+
+    /* author the GPU op list once */
+    pr_nops=0; g_pr_emit=EMIT_GPU; pr_author_frame();
+
+    VkMemoryBarrier mb={ .sType=ST_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT};
+
+    /* One record; timed submit loop. If SECONDS>0 keep resubmitting so
+     * nvidia-smi can observe this pid resident on the GPU. */
+    double gpu_best=1e30; int frames=0; double t_start=now_ms();
+    int min_iters = seconds>0 ? 1000000000 : 200;
+    for (int it=0; it<min_iters; it++) {
+        VkCommandBuffer cb; if (begin_cmd(&cb)) return -1;
+        vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
+        vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,playout,0,1,&dset,0,0);
+        for (int i=0;i<pr_nops;i++){
+            vkCmdPushConstants(cb,playout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(PushC),&pr_ops[i]);
+            vkCmdDispatch(cb,pr_grp[i][0],pr_grp[i][1],1);
+            if (i+1<pr_nops) vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,0,0,0);
+        }
+        double t0=now_ms(); if (submit_wait(cb)) return -1; double ms=now_ms()-t0;
+        if (ms<gpu_best) gpu_best=ms;
+        vkFreeCommandBuffers(g_dev,g_pool,1,&cb);
+        frames++;
+        if (seconds>0 && (now_ms()-t_start)>=seconds*1000.0 && frames>=60) break;
+        if (seconds<=0 && it>=199) break;
+    }
+
+    /* CPU oracle: author the SAME frame on the CPU. */
+    uint8_t* cbuf=calloc((size_t)W*H,4);
+    g_pr_cpuimg=cbuf; g_pr_emit=EMIT_CPU;
+    double cpu_best=1e30;
+    int cpu_iters = seconds>0?20:200;
+    for (int it=0; it<cpu_iters; it++){
+        memset(cbuf,0,(size_t)W*H*4);
+        double t0=now_ms(); pr_author_frame(); double ms=now_ms()-t0;
+        if (ms<cpu_best) cpu_best=ms;
+    }
+
+    /* readback GPU SSBO, byte-verify RGB against the CPU oracle */
+    CK(vkMapMemory(g_dev,dmem,0,dstsz,0,&map));
+    uint8_t* gpix=(uint8_t*)map;
+    long mism=0, first=-1;
+    for (long i=0;i<(long)W*H;i++) for (int c=0;c<3;c++)
+        if (gpix[i*4+c]!=cbuf[i*4+c]){ if(first<0) first=i; mism++; }
+    write_ppm(out,gpix,W,H);
+    vkUnmapMemory(g_dev,dmem);
+
+    printf("VK_DEVICE %s\n", g_devname);
+    printf("PAGERASTER_OK %s %dx%d ops=%d gpu_frames=%d\n", out, W, H, pr_nops, frames);
+    printf("PAGERASTER_GPU_MS %.4f\nPAGERASTER_SW_MS %.4f\nPAGERASTER_SPEEDUP %.2fx\n",
+           gpu_best, cpu_best, cpu_best/gpu_best);
+    printf("PAGERASTER_GPUvsCPUport_MISMATCH %ld", mism);
+    if (first>=0) printf(" first@%ld,%ld", first%W, first/W);
+    printf("\n");
+
+    free(cbuf); free(sprite);
+    vkDestroyDescriptorPool(g_dev,dpool,0); vkDestroyPipeline(g_dev,pipe,0);
+    vkDestroyPipelineLayout(g_dev,playout,0); vkDestroyDescriptorSetLayout(g_dev,dsl,0);
+    vkDestroyShaderModule(g_dev,module,0);
+    vkDestroyBuffer(g_dev,dbuf,0); vkFreeMemory(g_dev,dmem,0);
+    vkDestroyBuffer(g_dev,sbuf,0); vkFreeMemory(g_dev,smem,0);
+    return mism==0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s info | clear W H 0xRRGGBBAA OUT.ppm | upload IN.ppm OUT.ppm\n"
-                        "       %s blit IN.ppm SCALE OUT.ppm | raster OUT.ppm | rasterbench W H | present IN.ppm [SCALE] [FRAMES]\n",
-                argv[0], argv[0]);
+                        "       %s blit IN.ppm SCALE OUT.ppm | raster OUT.ppm | rasterbench W H\n"
+                        "       %s pageraster W H OUT.ppm [SECONDS] | present IN.ppm [SCALE] [FRAMES]\n",
+                argv[0], argv[0], argv[0]);
         return 2;
     }
     /* present mode runs an entirely self-contained WSI init (own instance +
@@ -1458,6 +1790,10 @@ int main(int argc, char** argv) {
         rc = mode_raster(argv[2]);
     } else if (!strcmp(argv[1], "rasterbench") && argc == 4) {
         rc = mode_rasterbench((uint32_t)strtoul(argv[2],0,0), (uint32_t)strtoul(argv[3],0,0));
+    } else if (!strcmp(argv[1], "pageraster") && (argc == 5 || argc == 6)) {
+        int W = (int)strtoul(argv[2],0,0), H = (int)strtoul(argv[3],0,0);
+        double secs = (argc == 6) ? strtod(argv[5],0) : 0.0;
+        rc = mode_pageraster(W, H, argv[4], secs);
     } else {
         fprintf(stderr, "bad args\n"); rc = 2;
     }
