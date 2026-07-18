@@ -111,6 +111,16 @@ improvement, no regression.
 
 ## What remains for HW-NVIDIA (RTX 3090 silicon)
 
+> **UPDATE 2026-07-18 — DONE.** The HW-NVIDIA path is reached and byte-verified;
+> see `docs/inguest_gpu_hw_nvidia_2026-07-18.md` + `scripts/test_inguest_gpu_hw.sh`.
+> The fix was **not** an EGLDevice/vhost-user-gpu backend (below): virglrenderer
+> 1.1.0's winsys is GBM-only with no reachable EGLDevice path. Instead,
+> `-display sdl,gl=on` on a live NVIDIA X server makes QEMU's SDL UI create the
+> GL context on the NVIDIA/GLX driver and hand it to virglrenderer — the guest
+> virgl stream then runs on the RTX 3090 (GL 4.6, nvidia-smi resident), no guest
+> change. The paragraph below is the original (now superseded) hypothesis.
+
+
 The guest path is renderer-agnostic — it works on whatever GL context QEMU's
 virtio-gpu-gl hands to virglrenderer. Today that is llvmpipe because QEMU
 `egl-headless` builds its context on the EGL **GBM** platform, and the NVIDIA
