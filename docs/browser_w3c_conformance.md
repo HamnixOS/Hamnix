@@ -192,6 +192,44 @@ the passing host gates found the following.
   back/forward/go `popstate` state, location component parsing + hashchange). **Scope deferred:**
   cross-page-load PERSISTENCE (headless single-document engine — the API SEMANTICS are what matter);
   `StorageEvent`; state is stored by reference (not structured-clone-copied).
+- **observer APIs (2026-07-18): MutationObserver + IntersectionObserver + ResizeObserver** — the three
+  observer surfaces modern frameworks (React reconcilers, Vue, lazy-load libs, auto-sizing widgets) depend
+  on. All live in `lib/web/dom/canvas.ad` (state + `_obs_dispatch` + delivery) with NID ids 87–99 in
+  `lib/web/dom/bindings.ad`; constructors registered as native globals in `_js_build_document`; NO
+  `lib/web/js/` engine edits (delivery rides the EXISTING microtask queue via the global `queueMicrotask`).
+  **MutationObserver** — `new MutationObserver(cb)`, `observe(target, options)`, `disconnect()`,
+  `takeRecords()`. Every DOM mutation made during a script is RECORDED at the existing mutation points
+  (`appendChild`/`insertBefore`/`removeChild`/`replaceChild`/`remove` → childList; `setAttribute`/
+  `removeAttribute` → attributes; `textContent`/`nodeValue`/`data` member-set → characterData) into a
+  batched record queue, and the observer callback is delivered **ONCE as a MICROTASK after the current
+  script finishes** — the spec's microtask-checkpoint "notify mutation observers" step (verified: the
+  synchronous post-mutation log line precedes the callback's log line). Options honoured:
+  `childList`/`attributes`/`characterData`/`subtree` (subtree matches via a bounded `parentNode`-chain
+  ancestor walk), `attributeOldValue` (captured BEFORE the write clobbers it),
+  `characterDataOldValue`, and `attributeFilter` (case-insensitive name allowlist). `MutationRecord`
+  carries `type`/`target`/`addedNodes`/`removedNodes`/`attributeName`/`oldValue` (+ null
+  `previousSibling`/`nextSibling`/`attributeNamespace`). `disconnect()` deactivates the observer's
+  registrations AND empties its record queue; `takeRecords()` drains the queue SYNCHRONOUSLY (and the
+  already-scheduled delivery microtask then finds nothing to deliver). The record queue is gated by a
+  live-registry check (`mreg_n != 0`) so script-free pages and internal node-building pay nothing and
+  emit no spurious records → zero regression across the DOM/JS gates.
+  **IntersectionObserver** — `observe(el)`/`unobserve(el)`/`disconnect()`; each entry
+  (`isIntersecting`/`intersectionRatio`/`boundingClientRect`/`intersectionRect`/`target`/`time`) is computed
+  by intersecting the element's laid-out box (`_el_bbox` → viewport-relative `_new_rect_obj`) against the
+  viewport root (`innerWidth`×`innerHeight`). **ResizeObserver** — `observe(el)`/`unobserve`/`disconnect`;
+  the entry's `contentRect` (+ `contentBoxSize`/`borderBoxSize` inline/block) reports the element's
+  laid-out content box. **HEADLESS delivery model (honest):** this is a SINGLE-LAYOUT render — there is NO
+  live scroll or resize loop, so IntersectionObserver and ResizeObserver deliver their entries **ONCE**,
+  as a microtask after `observe()`, against the one layout the engine produced (an on-screen element reports
+  `isIntersecting=true`; an element placed far off-screen via `position:absolute;top:6000px` reports
+  `false`). They do NOT re-fire on scroll/resize/mutation because the headless engine has no continuous
+  frame loop. Delivery is coalesced: the first queued observer work schedules ONE `NID_OBS_DELIVER`
+  microtask that flushes MutationObserver batches, then IntersectionObserver entries, then ResizeObserver
+  entries (the queued flag is cleared before callbacks fire, so a callback that mutates/observes schedules
+  a fresh microtask — chained observers compose). Gate `test_hambrowse_observers_host.sh` (14 asserts:
+  batched-as-one-microtask timing + added/removed counts + observer identity; attributeName/oldValue;
+  attributeFilter exclusion; disconnect silence; synchronous takeRecords drain; IO on/off-screen; RO
+  contentRect; zero JSERR).
 - html5-parsing: implied end tags (gate `impliedtags`); quote-aware tag tokenization (gate `tagquote`).
 - dom-core / CSSOM-view: **layout geometry** — `getBoundingClientRect()` (DOMRect: x/y/width/height/
   top/left/right/bottom), `getClientRects()` (single-fragment DOMRectList), `offsetWidth/Height/Left/Top`,
