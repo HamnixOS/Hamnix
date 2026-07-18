@@ -16,9 +16,8 @@
 # and driven DIRECTLY on the host in milliseconds — no boot, no QEMU. It also
 # re-compiles the NATIVE (device) build to prove /init is byte-unaffected.
 #
-# Receivers are VARIABLES / function-form, not string LITERALS: a quoted-literal
-# method receiver (`"abc".upper()`) is a pre-existing hamsh parse limitation that
-# affects every method equally and is out of scope here.
+# Receivers here are VARIABLES / function-form. Quoted-literal method receivers
+# (`"abc".upper()`) are now ALSO supported — covered by test_hamsh_parser2_host.sh.
 
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
