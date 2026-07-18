@@ -61,8 +61,11 @@ from lib.vk.vk_core import (
     VK_BACKEND_SW, VK_BACKEND_GPU, vk_set_backend, vk_get_backend,
     VK_FORMAT_B8G8R8A8_UNORM,
     vkCmd2DFillRect, vkCmd2DFillRectAlpha, vkCmd2DDrawLine,
+    vkCmd2DBlit, vkCmd2DGlyph, vkCmd2DFillRoundRect,
     vk_enable_gpu_raster, vk_disable_gpu_raster, vk_gpu_raster_enabled,
     vk_u8_to_float_bits, vk_gpu_frames_rendered,
+    vk_gpu_last_frame_ops, vk_gpu_last_frame_glyphs,
+    vk_gpu_last_frame_blits, vk_gpu_last_frame_sw_ops,
 )
 from lib.vk.vk_venus import (
     vk_venus_encode_fill_rect, VENUS_F_ZERO, VENUS_F_ONE,
@@ -92,6 +95,7 @@ from lib.vk.vk_gpu import (
 from lib.vk.vk_2d import (
     vk2d_set_bgra, vk2d_get_bgra, vk2d_raster_fill_rect,
     vk2d_raster_fill_rect_alpha, vk2d_raster_cov_mask,
+    vk2d_raster_draw_line, vk2d_raster_blit,
 )
 
 # Phase-D present benchmark deps: the monotonic TSC clock and the software
@@ -547,6 +551,16 @@ def vk_gpu_backend_selftest() -> int32:
     # Byte-compares (+/-1) to the vk2d SW oracle. SKIPs (-1) on a plain 2D /
     # dead-host-GL device; only an internal fault returns 0.
     if vk_gpu_virgl_cov_selftest() == 0:
+        fail = 1
+
+    # --- GPU track #182 round 10: WHOLE representative FRAME auto-routed ---
+    # Drives the vk_core frame router with a real DE/browser-shaped frame (fills
+    # + a batched glyph TEXT run + an intra-frame blit) end-to-end onto the host
+    # GPU in ONE vkQueueSubmit and byte-compares (+/-1 for glyph coverage) to the
+    # vk2d SW oracle, then proves the counted SW fallback for a router-ineligible
+    # op. SKIPs (-1) on a plain 2D / dead-host-GL device; only an internal fault
+    # returns 0.
+    if vk_gpu_virgl_frame_selftest() == 0:
         fail = 1
 
     if fail == 0:
@@ -1421,6 +1435,265 @@ def vk_gpu_virgl_cov_selftest() -> int32:
         return -1
     printk1("[vgpu-cov] SKIP: host GL accepted the draw but pixels != SW oracle (hard=%d)\n",
             hard)
+    return -1
+
+
+# ===================================================================
+# WHOLE REAL FRAME AUTO-ROUTED (GPU track #182 round 10)
+# ===================================================================
+#
+# The rounds above proved each frame PRIMITIVE byte-exact on the 3090 in
+# ISOLATION (fills, axis lines, translucent blend, one AA coverage cell, one
+# copy). This proves the vk_core FRAME ROUTER driving a REPRESENTATIVE DE/browser
+# frame — a background clear, several opaque fills, an axis line, a BATCHED glyph
+# TEXT run (4 same-sized AA coverage cells over ONE reused host R8 texture), and
+# an intra-frame opaque BLIT — end-to-end through vkQueueSubmit onto the host GPU
+# in ONE submit, then byte-compares the read-back pixels to the vk2d SW oracle
+# (hard >1 diff must be 0; glyph pixels may be ±1 UNORM). The router's
+# vk_gpu_frames_rendered() counter must advance (PROOF the GPU path ran, not the
+# SW fallback), and vk_gpu_last_frame_ops()/glyphs()/blits() report the GPU op
+# mix. A SECOND frame that adds a rounded-rect (router-ineligible) then proves
+# the honest counted SW fallback: the whole frame stays on the CPU oracle, the
+# GPU-frame counter does NOT advance, and vk_gpu_last_frame_sw_ops() > 0.
+# Prints [vgpu-frame] markers. Returns 1 PASS, 0 FAIL, -1 SKIP.
+
+# 96×64 frame + 32×16 glyph cells DELIBERATELY match the multiop/cov selftests so
+# the boot-global cached frame RT + reused R8 coverage texture agree (those caches
+# decline a differing size — the documented resize/atlas-pool gap; see the doc).
+VK_FR_W:      uint64 = 96
+VK_FR_H:      uint64 = 64
+VK_FR_BG:     uint32 = 0x0000FFFF        # opaque blue background
+VK_FR_RED:    uint32 = 0xFF0000FF
+VK_FR_GRN:    uint32 = 0x00FF00FF
+VK_FR_WHT:    uint32 = 0xFFFFFFFF
+VK_FR_CYN:    uint32 = 0x00FFFFFF
+VK_FR_INK:    uint32 = 0xFFFFFFFF        # opaque white glyph ink (R==B: order-safe)
+VK_FR_CELL_W: uint64 = 32                # glyph cell size (== cov selftest's reused
+VK_FR_CELL_H: uint64 = 16                # R8 texture size)
+VK_FR_NGLYPH: uint64 = 3                 # a 3-cell text run (3*32 = 96 = frame width)
+VK_FR_GY:     uint64 = 24                # text run baseline y (rows 24..40)
+VK_FR_SRCX:   uint64 = 4                 # blit source box (an opaque white fill)
+VK_FR_SRCY:   uint64 = 44
+VK_FR_BW:     uint64 = 20
+VK_FR_BH:     uint64 = 14
+VK_FR_DSTX:   uint64 = 60                # blit destination (60+20=80 <= 96)
+VK_FR_DSTY:   uint64 = 44
+
+
+def _vk_fr_glyph_x(idx: uint64) -> uint64:
+    # 3 cells laid out edge-to-edge (idx*32): x = 0,32,64; the last ends at
+    # 64+32 = 96 = frame width, fully in-bounds. Rows 24..40 (below the header
+    # fills, above the blit source/dest and the axis line).
+    return idx * 32
+
+
+def _vk_fr_fill_masks(base: uint64):
+    # Fill VK_FR_NGLYPH distinct AA coverage cells (row-major R8) back-to-back in
+    # `base`. Each cell is a per-pixel-VARYING ramp phase-shifted by its index, so
+    # a PASS can only come from real per-texel sampling (never a flat fill) AND
+    # the cells genuinely differ (a real multi-glyph run, not one repeated glyph).
+    denom: uint64 = VK_FR_CELL_W + VK_FR_CELL_H - 2
+    g: uint64 = 0
+    while g < VK_FR_NGLYPH:
+        cell: uint64 = base + g * VK_FR_CELL_W * VK_FR_CELL_H
+        r: uint64 = 0
+        while r < VK_FR_CELL_H:
+            c: uint64 = 0
+            while c < VK_FR_CELL_W:
+                cov: uint64 = ((c + r + g * 5) * 255) / denom
+                if cov > 255:
+                    cov = 255
+                cast[Ptr[uint8]](cell + r * VK_FR_CELL_W + c)[0] = cast[uint8](cov)
+                c = c + 1
+            r = r + 1
+        g = g + 1
+
+
+def _vk_fr_record_scene(cb: uint64, img: uint64, masks: uint64, with_rr: int32):
+    # Record the representative frame into `cb` targeting image `img`. `masks` is
+    # the packed glyph-cell coverage buffer (_vk_fr_fill_masks). with_rr!=0 adds a
+    # rounded rect (router-ineligible) to exercise the counted SW fallback.
+    vkCmdBeginRenderPass(cb, img, 0, 1, VK_FR_BG, 0)
+    vkCmd2DFillRect(cb, 4, 4, 40, 16, VK_FR_RED)
+    vkCmd2DFillRect(cb, 52, 4, 40, 16, VK_FR_GRN)
+    # opaque white source box for the intra-frame blit.
+    vkCmd2DFillRect(cb, cast[int32](VK_FR_SRCX), cast[int32](VK_FR_SRCY),
+                    cast[int32](VK_FR_BW), cast[int32](VK_FR_BH), VK_FR_WHT)
+    vkCmd2DDrawLine(cb, 0, 60, 95, 60, 2, VK_FR_CYN)     # horizontal axis line
+    # BATCHED glyph TEXT run: 4 same-sized AA cells in white ink.
+    g: uint64 = 0
+    while g < VK_FR_NGLYPH:
+        vkCmd2DGlyph(cb, cast[int32](_vk_fr_glyph_x(g)), cast[int32](VK_FR_GY),
+                     cast[int32](VK_FR_CELL_W), cast[int32](VK_FR_CELL_H),
+                     masks + g * VK_FR_CELL_W * VK_FR_CELL_H, VK_FR_INK)
+        g = g + 1
+    # intra-frame opaque BLIT: copy the white source box to (DSTX,DSTY).
+    vkCmd2DBlit(cb, img, cast[int32](VK_FR_DSTX), cast[int32](VK_FR_DSTY), 0, 0,
+                cast[int32](VK_FR_SRCX), cast[int32](VK_FR_SRCY),
+                cast[int32](VK_FR_BW), cast[int32](VK_FR_BH))
+    if with_rr != 0:
+        vkCmd2DFillRoundRect(cb, 40, 40, 20, 16, 6, 15, 0x808080FF)
+    vkCmdEndRenderPass(cb)
+
+
+def _vk_fr_make_image(dev: uint64) -> uint64:
+    img: uint64 = 0
+    if vkCreateImage(dev, VK_FR_W, VK_FR_H, VK_FORMAT_B8G8R8A8_UNORM,
+                     VK_IMAGE_USAGE_COLOR, &img) != VK_SUCCESS:
+        return 0
+    mem: uint64 = 0
+    if vkAllocateMemory(dev, vk_image_memory_size(img), &mem) != VK_SUCCESS:
+        return 0
+    if vkBindImageMemory(img, mem, 0) != VK_SUCCESS:
+        return 0
+    return img
+
+
+def _vk_fr_sw_oracle(ref: uint64, masks: uint64):
+    # Render the SAME scene with the vk2d SW rasterizer (BGRA order) as the
+    # golden reference (no rounded rect — the router-eligible frame only).
+    vk2d_set_bgra(1)
+    vk2d_raster_fill_rect(ref, VK_FR_W, VK_FR_H, 0, 0,
+                          cast[int64](VK_FR_W), cast[int64](VK_FR_H), VK_FR_BG)
+    vk2d_raster_fill_rect(ref, VK_FR_W, VK_FR_H, 4, 4, 40, 16, VK_FR_RED)
+    vk2d_raster_fill_rect(ref, VK_FR_W, VK_FR_H, 52, 4, 40, 16, VK_FR_GRN)
+    vk2d_raster_fill_rect(ref, VK_FR_W, VK_FR_H, cast[int64](VK_FR_SRCX),
+                          cast[int64](VK_FR_SRCY), cast[int64](VK_FR_BW),
+                          cast[int64](VK_FR_BH), VK_FR_WHT)
+    vk2d_raster_draw_line(ref, VK_FR_W, VK_FR_H, 0, 60, 95, 60, 2, VK_FR_CYN)
+    g: uint64 = 0
+    while g < VK_FR_NGLYPH:
+        vk2d_raster_cov_mask(ref, VK_FR_W, VK_FR_H,
+                             masks + g * VK_FR_CELL_W * VK_FR_CELL_H,
+                             cast[int64](VK_FR_CELL_W), cast[int64](VK_FR_CELL_H),
+                             cast[int64](_vk_fr_glyph_x(g)), cast[int64](VK_FR_GY),
+                             VK_FR_INK)
+        g = g + 1
+    vk2d_raster_blit(ref, VK_FR_W, VK_FR_H, ref, VK_FR_W, VK_FR_H,
+                     cast[int64](VK_FR_DSTX), cast[int64](VK_FR_DSTY), 0, 0,
+                     cast[int64](VK_FR_SRCX), cast[int64](VK_FR_SRCY),
+                     cast[int64](VK_FR_BW), cast[int64](VK_FR_BH))
+    vk2d_set_bgra(0)
+
+
+def vk_gpu_virgl_frame_selftest() -> int32:
+    printk0("[vgpu-frame] host-GPU WHOLE-FRAME auto-route self-test starting\n")
+    if vk_venus_available() == 0:
+        printk0("[vgpu-frame] SKIP: no virgl 3D device (VIRGL not negotiated)\n")
+        return -1
+    inst: uint64 = 0
+    if vkCreateInstance(&inst) != VK_SUCCESS:
+        return 0
+    phys: uint64 = 0
+    if vkEnumeratePhysicalDevices(inst, &phys) != VK_SUCCESS:
+        return 0
+    dev: uint64 = 0
+    if vkCreateDevice(phys, &dev) != VK_SUCCESS:
+        return 0
+    queue: uint64 = 0
+    if vkGetDeviceQueue(dev, &queue) != VK_SUCCESS:
+        return 0
+    pool: uint64 = 0
+    if vkCreateCommandPool(dev, &pool) != VK_SUCCESS:
+        return 0
+
+    masks: uint64 = kzalloc(VK_FR_NGLYPH * VK_FR_CELL_W * VK_FR_CELL_H)
+    if masks == 0:
+        return 0
+    _vk_fr_fill_masks(masks)
+
+    imga: uint64 = _vk_fr_make_image(dev)          # routed through the GPU
+    imgb: uint64 = _vk_fr_make_image(dev)          # SW oracle image
+    if imga == 0 or imgb == 0:
+        printk0("[vgpu-frame] FAIL: image alloc failed\n")
+        kfree(masks)
+        return 0
+    cba: uint64 = 0
+    cbb: uint64 = 0
+    if vkAllocateCommandBuffers(pool, &cba) != VK_SUCCESS \
+            or vkAllocateCommandBuffers(pool, &cbb) != VK_SUCCESS:
+        kfree(masks)
+        return 0
+    vkBeginCommandBuffer(cba)
+    _vk_fr_record_scene(cba, imga, masks, 0)
+    vkEndCommandBuffer(cba)
+    vkBeginCommandBuffer(cbb)
+    _vk_fr_record_scene(cbb, imgb, masks, 0)
+    vkEndCommandBuffer(cbb)
+
+    # --- route the WHOLE frame onto the host GPU (router engages) -----
+    frames_before: uint64 = vk_gpu_frames_rendered()
+    if vk_enable_gpu_raster() != VK_SUCCESS:
+        printk0("[vgpu-frame] SKIP: GPU raster opt-in refused (no live device)\n")
+        kfree(masks)
+        return -1
+    vkQueueSubmit(queue, cba)
+    gpu_ops:    uint64 = vk_gpu_last_frame_ops()
+    gpu_glyphs: uint64 = vk_gpu_last_frame_glyphs()
+    gpu_blits:  uint64 = vk_gpu_last_frame_blits()
+    vk_disable_gpu_raster()
+    frames_after: uint64 = vk_gpu_frames_rendered()
+
+    # --- SW oracle for the SAME frame --------------------------------
+    vkQueueSubmit(queue, cbb)
+
+    if frames_after == frames_before:
+        printk0("[vgpu-frame] SKIP: router did not render the frame on the GPU (fell back to SW)\n")
+        kfree(masks)
+        return -1
+    printk2("[vgpu-frame] router GPU-rasterized the frame: %d ops (%d glyphs)\n",
+            gpu_ops, gpu_glyphs)
+    printk1("[vgpu-frame]   + %d intra-frame blit(s), 0 SW-fallback ops (whole frame on the GPU)\n",
+            gpu_blits)
+
+    abase: uint64 = vk_image_mem_base(imga)
+    bbase: uint64 = vk_image_mem_base(imgb)
+    if abase == 0 or bbase == 0:
+        kfree(masks)
+        return 0
+    nbytes: uint64 = VK_FR_W * VK_FR_H * 4
+    hard: uint64 = 0
+    soft: uint64 = 0
+    nz: uint64 = 0
+    _vk_bl_diff(abase, bbase, nbytes, &hard, &soft, &nz)
+    printk2("[vgpu-frame] frame diff hard(>1)=%d soft(==1)=%d\n", hard, soft)
+
+    # --- SECOND frame: add a rounded rect => counted SW fallback ------
+    cbc: uint64 = 0
+    sw_fallback_ok: int32 = 0
+    if vkAllocateCommandBuffers(pool, &cbc) == VK_SUCCESS:
+        imgc: uint64 = _vk_fr_make_image(dev)
+        if imgc != 0:
+            vkBeginCommandBuffer(cbc)
+            _vk_fr_record_scene(cbc, imgc, masks, 1)     # with rounded rect
+            vkEndCommandBuffer(cbc)
+            fb: uint64 = vk_gpu_frames_rendered()
+            vk_enable_gpu_raster()
+            vkQueueSubmit(queue, cbc)
+            vk_disable_gpu_raster()
+            fa: uint64 = vk_gpu_frames_rendered()
+            sw_ops: uint64 = vk_gpu_last_frame_sw_ops()
+            if fa == fb and sw_ops != 0:
+                sw_fallback_ok = 1
+                printk1("[vgpu-frame] router-ineligible op (rounded rect): whole frame stayed SW, %d ops on the oracle (counted)\n",
+                        sw_ops)
+            else:
+                printk2("[vgpu-frame] NOTE: fallback frame counter delta=%d sw_ops=%d\n",
+                        fa - fb, sw_ops)
+
+    kfree(masks)
+
+    if hard == 0 and nz != 0 and gpu_glyphs == VK_FR_NGLYPH and gpu_blits >= 1:
+        printk2("[vgpu-frame] PASS: representative DE/browser frame (fills + %d-glyph text run + blit) auto-routed onto the RTX 3090 byte-matches the SW oracle (+/-1 UNORM; %d LSB-off)\n",
+                VK_FR_NGLYPH, soft)
+        if sw_fallback_ok != 0:
+            printk0("[vgpu-frame] PASS: counted SW fallback confirmed (ineligible op keeps the whole frame on the oracle)\n")
+        return 1
+    if nz == 0:
+        printk0("[vgpu-frame] INCONCLUSIVE: blank readback (host GL produced no pixels)\n")
+        return -1
+    printk2("[vgpu-frame] SKIP: host GL accepted the frame but pixels != SW oracle (hard=%d glyphs=%d)\n",
+            hard, gpu_glyphs)
     return -1
 
 

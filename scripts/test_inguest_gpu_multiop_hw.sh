@@ -117,7 +117,7 @@ for _ in $(seq 1 "$((BOOT_WAIT * 4))"); do
         NVIDIA_RESIDENT=1
         echo "$smi" >> "$SMILOG"
     fi
-    grep -a -q -E "\[vgpu-cov\] (PASS|SKIP|INCONCLUSIVE)" "$GLLOG" && break
+    grep -a -q -E "\[vgpu-frame\] (PASS|SKIP|INCONCLUSIVE|FAIL)" "$GLLOG" && break
     grep -a -q -E "\[vgpu-multiop\] FAIL" "$GLLOG" && break
     kill -0 "$QEMU_PID" 2>/dev/null || break
     sleep 0.25
@@ -131,6 +131,8 @@ echo "[test_inguest_gpu_multiop_hw] --- guest translucent-blend markers ---"
 grep -a -E "\[vgpu-blend\]" "$GLLOG" | head -20
 echo "[test_inguest_gpu_multiop_hw] --- guest AA-coverage-mask (glyph text) markers ---"
 grep -a -E "\[vgpu-cov\]" "$GLLOG" | head -20
+echo "[test_inguest_gpu_multiop_hw] --- guest WHOLE-FRAME auto-route markers ---"
+grep -a -E "\[vgpu-frame\]" "$GLLOG" | head -20
 echo "[test_inguest_gpu_multiop_hw] --- host GL context (virglrenderer) ---"
 GLVER_LINE="$(grep -a -E "gl_version [0-9]+ - core profile" "$GLLOG" | head -1)"
 GLREND_LINE="$(grep -a -iE "GL_RENDERER=NVIDIA|NVIDIA GeForce RTX|llvmpipe" "$GLLOG" | head -2)"
@@ -168,6 +170,16 @@ grep -a -q -E "\[vgpu-blend\] PASS: .*translucent source-over fill.* on the RTX 
 COV_GREEN=0
 grep -a -q -E "\[vgpu-cov\] PASS: AA coverage mask sampled .* on the RTX 3090" "$GLLOG" && COV_GREEN=1
 
+# Round 10: did the WHOLE representative FRAME (fills + batched glyph text run +
+# blit) auto-route onto the 3090 and byte-verify against the SW oracle?
+FRAME_GREEN=0
+grep -a -q -E "\[vgpu-frame\] PASS: representative DE/browser frame .* auto-routed onto the RTX 3090" "$GLLOG" && FRAME_GREEN=1
+if grep -a -q -E "\[vgpu-frame\] FAIL" "$GLLOG"; then
+    echo "[test_inguest_gpu_multiop_hw] FAIL: guest reported a whole-frame auto-route failure" >&2
+    trap 'cleanup' EXIT
+    exit 1
+fi
+
 if [ "$GREEN" -eq 1 ] && [ "$NV_CTX" -eq 1 ] && [ "$NVIDIA_RESIDENT" -eq 1 ]; then
     OPS="$(grep -a -oE "\[vgpu-multiop\] PASS: [34] op types[^\\\\]*" "$GLLOG" | head -1)"
     echo "[test_inguest_gpu_multiop_hw] PASS: MULTI-OP frame rasterized on the RTX 3090 —"
@@ -182,6 +194,13 @@ if [ "$GREEN" -eq 1 ] && [ "$NV_CTX" -eq 1 ] && [ "$NVIDIA_RESIDENT" -eq 1 ]; th
         echo "[test_inguest_gpu_multiop_hw]   + AA COVERAGE-MASK (glyph TEXT) sampler (R8 texture + TEX shader + GL_BLEND) byte-matches SW (+/-1 UNORM rounding)"
     else
         echo "[test_inguest_gpu_multiop_hw]   (AA coverage-mask sampler not byte-confirmed this run; see [vgpu-cov] markers — stays SW-fallback)"
+    fi
+    if [ "$FRAME_GREEN" -eq 1 ]; then
+        echo "[test_inguest_gpu_multiop_hw]   + WHOLE REPRESENTATIVE FRAME (fills + batched glyph TEXT run + intra-frame blit) auto-routed end-to-end onto the RTX 3090 in ONE submit, byte-matches SW (+/-1 UNORM)"
+        FR="$(grep -a -oE "\[vgpu-frame\] router GPU-rasterized the frame: .*glyphs\)" "$GLLOG" | head -1)"
+        [ -n "$FR" ] && echo "[test_inguest_gpu_multiop_hw]   ${FR#\[vgpu-frame\] }"
+    else
+        echo "[test_inguest_gpu_multiop_hw]   (whole-frame auto-route not byte-confirmed this run; see [vgpu-frame] markers)"
     fi
     exit 0
 fi
