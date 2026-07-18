@@ -40,7 +40,7 @@ From a 14-agent parallel audit (2026-07-16). Dual-target, host-iterated (~40 gat
 |---|---:|---:|---:|
 | css-backgrounds-borders | 30% | 10 | 4 |
 | css-grid | 30% | 14 | 5 |
-| html-forms | 30% | 11 | 4 |
+| html-forms | 48% | 9 | 2 |
 | html5-parsing | 32% | 10 | 3 |
 | dom-events | 55% | 5 | 1 |
 | css-values-units | 33% | 12 | 5 |
@@ -158,12 +158,30 @@ the passing host gates found the following.
 5. border-radius — swallowed (`cascade.ad:1021-1026`). `css/cascade.ad`+`layout/box.ad`. **[in progress]**
 6. box-shadow — **DONE v1 (gate `boxshadow`).** Parsed in `css/cascade.ad` (`_box_shadow_class`: offset/blur/spread lengths + `none`) into a coarse 2-bit size class packed into the fill colour (bits 29-30), and painted BEHIND the border-box before the element's own fill (`htmlpage.ad` fill loop → `htmlpaint_shadow_round_rect`: an offset, spread-expanded, radius-aware rounded rect feathered by stacking `blur`+1 alpha-blended concentric rects). Verified: a dark 30% grey drop shadow, offset down/right, fading to the paper, respecting the fill geometry. LIMITATIONS: single shadow only (no comma list); NO inset; offset/blur/colour are approximated by a default dark-30% shadow whose SIZE scales with the declared class (per-element geometry/colour can't be plumbed through the `layout/box.ad`+`dom/canvas.ad` record set, which this track does not own); only elements that also have a background (a `bfill` record) get a shadow.
 7. background-image:url() (+position/size/repeat) — missing as a background. `css/cascade.ad`+`layout/box.ad`.
-8. HTTP method=POST submission + enctype — GET-only. `dom/canvas.ad` `_do_submit`.
+8. HTTP method=POST submission + enctype — **DONE (gate `formvalid`).** A form's `method` attribute is
+   now honoured: `method=POST` serializes the named controls into a `application/x-www-form-urlencoded`
+   REQUEST BODY ("a=1&b=2") in `dom_body_buf` and leaves the action target query-free, with
+   `dom_nav_method`=1; `method=GET` keeps the existing `action?a=1&b=2` query string. Exposed to the
+   front-end via `he_nav_method()`/`he_nav_body_ptr()`/`he_nav_body_len()` beside `he_nav_ptr`.
+   `dom/canvas.ad` (`_serialize_form`/`_serialize_field`/`_form_is_post` + `_sfld_putc`/`_sfld_encoded`
+   target-dispatch; body accessors). LIMITATIONS: only urlencoded enctype (multipart/FormData deferred, #10);
+   the NATIVE front-end's http9 client is GET-only so a real over-the-wire POST awaits an http9 `http_post`
+   (engine-side serialization + API is complete and host-verified; no new sockets).
 9. overflow/overflow-x/y (hidden|scroll|auto|clip) — **DONE (gate `overflow`).** A non-visible overflow box establishes a padding-edge clip rect; descendant segments/fills/borders outside it are removed (tall child clamped to the box, nowrap line truncated at the right edge). `css/cascade.ad` (`_box_decl` `_overflow_value` + `m_ovfx/m_ovfy`) + `layout/box.ad` (`_apply_overflow_clip` at `_block_box_close`). REMAINING: interactive scroll offset/scrollbars for auto|scroll (static first paint only). `layout/scroll.ad` still holds only the legacy viewport-scroll helpers.
 9b. text-overflow (clip|ellipsis) — **DONE (gate `ellipsis`).** The single-line `overflow:hidden;white-space:nowrap;text-overflow:ellipsis` idiom renders a `…` (emitted as "..." — the monospace glyph set has no U+2026) at the overflow-x clip's truncation point, pulling the visible text back up to 3 cells so text+ellipsis fits the content box; `clip` (the default) hard-cuts. `css/cascade.ad` (`text-overflow` decl + `m_txtovf/r_txtovf`) + `layout/box.ad` (`box_txtovf_stack`, ellipsis branch in `_apply_overflow_clip`). REMAINING (deferred): multi-line `-webkit-line-clamp`, the `<string>`/left/`fade` text-overflow variants, and the case where the truncation boundary falls between segments rather than through a text run.
 10. FormData ctor + append/get/entries — missing. `js/builtins/native.ad`+`dom/canvas.ad`.
-11. Constraint Validation breadth (setCustomValidity/reportValidity/validity/pattern/min/max/step/maxlength/novalidate)
-    — only `checkValidity` exists. `dom/query.ad`+`dom/canvas.ad`+`dom/forms.ad`.
+11. Constraint Validation breadth — **DONE high-value subset (gate `formvalid`).** Beyond the pre-existing
+    `checkValidity()`, controls now expose `reportValidity()`, `setCustomValidity(msg)`, a live `validity`
+    ValidityState object (`valueMissing`/`typeMismatch`/`badInput`/`tooLong`/`rangeUnderflow`/`rangeOverflow`/
+    `customError`/`valid` refreshed each validation), `validationMessage`, and `willValidate`. Enforcement:
+    `required` empty → `valueMissing`; `type=email`/`url` basic shape → `typeMismatch` (rejects "abc");
+    `type=number` non-numeric → `badInput` and `min`/`max` → `rangeUnderflow`/`rangeOverflow`; `maxlength`
+    exceeded → `tooLong`. A `submit()` on an invalid form is now BLOCKED (no navigation) unless the form
+    carries `novalidate`. `dom/bindings.ad` (NIDs + validity/customval state), `dom/query.ad`
+    (`_attach_el_methods` binds reportValidity/setCustomValidity + the validity object), `dom/canvas.ad`
+    (`_dom_control_valid`/`_form_check_all`/`_write_validity` + email/url/number validators, `_do_submit`
+    gate). DEFERRED (documented): `pattern` regex (`patternMismatch` always false — no regex engine),
+    `step`/`stepMismatch`, `tooShort`/`minlength`, `:invalid` CSS pseudo, live per-keystroke UI reporting.
 12. grid-row / row-axis placement & spanning — missing (`cascade.ad:1680`). `css/cascade.ad`+`layout/box.ad`.
 13. ES modules import/export — **DONE (R9, gate `modules` + browser gate `esm`).** Parser (`js/parser.ad`
     `parse_import`/`parse_export`), AST (`ND_IMPORT`/`ND_EXPORT`/`ND_IMPSPEC`/`ND_EXPSPEC`), and a full
@@ -186,7 +204,7 @@ the passing host gates found the following.
 
 Disjoint dispatch clusters (no write-collision): **JS** (`js/*` only: #13,#14) · **CSS-PAINT+LAYOUT**
 (`css/*`+`layout/*`: #3-7,#9,#12) · **DOM-GEOMETRY** (`dom/query,bindings` + geometry half of `canvas.ad`: #2; #1 LANDED gate `geom`)
-· **FORMS** (`dom/canvas,forms` + `js/builtins/native.ad`: #8,#10,#11,#15 — shares canvas.ad with DOM-GEOMETRY, so serialize).
+· **FORMS** (`dom/canvas,forms` + `js/builtins/native.ad`: #8 + #11 LANDED gate `formvalid`; remaining #10,#15 — shares canvas.ad with DOM-GEOMETRY, so serialize).
 
 ---
 
