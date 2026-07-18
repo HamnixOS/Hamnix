@@ -76,6 +76,35 @@ echo SUBSET_Y ${ issubset({1, 2}, {1, 2, 3}) }
 echo SUBSET_N ${ issubset({1, 4}, {1, 2, 3}) }
 echo SUPERSET_Y ${ issuperset({1, 2, 3}, {1, 2}) }
 echo UNION_METHOD ${ join(sorted(union({1, 2}, [3, 4])), ",") }
+echo EQ_Y ${ {1, 2} == {2, 1} }
+echo EQ_N ${ {1, 2} == {1, 2, 3} }
+echo NE_Y ${ {1, 2} != {3, 4} }
+echo NE_N ${ {1, 2, 3} != {3, 2, 1} }
+echo EQ_EMPTY ${ set() == set() }
+echo SYMDIFF ${ join(sorted({1, 2, 3} ^ {2, 3, 4}), ",") }
+echo SYMDIFF_METHOD ${ join(sorted(symmetric_difference({1, 2}, [2, 3])), ",") }
+echo XOR_PREC ${ join(sorted({1, 2} ^ {2, 3} & {3, 9}), ",") }
+fs = frozenset([1, 2, 2, 3])
+echo FROZEN_LEN ${ len(fs) }
+echo "FROZEN_RENDER ${ fs }"
+echo "FROZEN_EMPTY ${ frozenset() }"
+echo FROZEN_IN ${ 2 in fs }
+echo FROZEN_EQ ${ frozenset([1, 2]) == {1, 2} }
+echo FROZEN_ALG ${ join(sorted(fs | {4}), ",") }
+fs.add(99)
+echo FROZEN_IMMUT ${ len(fs) }
+m = {1, 2}
+m.update([3, 4, 2])
+echo UPDATE ${ join(sorted(m), ",") }
+c = m.copy()
+c.add(7)
+echo COPY_INDEP ${ join(sorted(m), ",") }
+m.clear()
+echo CLEAR ${ len(m) }
+w = {7, 8, 9}
+wt = 0
+for z in w { wt = wt + z }
+echo ITER_BAREVAR $wt
 exit
 HSH
 
@@ -121,6 +150,25 @@ check "SUBSET_Y true"      "{1,2}.issubset({1,2,3})"
 check "SUBSET_N false"     "{1,4} is not a subset of {1,2,3}"
 check "SUPERSET_Y true"    "{1,2,3}.issuperset({1,2})"
 check "UNION_METHOD 1,2,3,4" "union(set, list) accepts any iterable"
+check "EQ_Y true"          "{1,2} == {2,1} order-independent"
+check "EQ_N false"         "{1,2} == {1,2,3} differs on cardinality"
+check "NE_Y true"          "{1,2} != {3,4}"
+check "NE_N false"         "{1,2,3} != {3,2,1} is false (equal)"
+check "EQ_EMPTY true"      "set() == set()"
+check "SYMDIFF 1,4"        "{1,2,3} ^ {2,3,4} == {1,4}"
+check "SYMDIFF_METHOD 1,3" "symmetric_difference({1,2},[2,3]) == {1,3}"
+check "XOR_PREC 1,2"       "^ binds looser than & : {1,2} ^ ({2,3}&{3,9}) == {1,2}"
+check "FROZEN_LEN 3"       "frozenset([1,2,2,3]) dedups to 3"
+check "FROZEN_RENDER frozenset({1, 2, 3})" "frozenset renders wrapped"
+check "FROZEN_EMPTY frozenset()" "empty frozenset renders frozenset()"
+check "FROZEN_IN true"     "membership on a frozenset"
+check "FROZEN_EQ true"     "frozenset([1,2]) == {1,2} (cross-type equality)"
+check "FROZEN_ALG 1,2,3,4" "frozenset | set algebra works"
+check "FROZEN_IMMUT 3"     "fs.add(99) is a no-op on a frozenset"
+check "UPDATE 1,2,3,4"     "m.update([3,4,2]) adds in place, deduped"
+check "COPY_INDEP 1,2,3,4" "c = m.copy(); c.add(7) leaves m unchanged"
+check "CLEAR 0"            "m.clear() empties in place"
+check "ITER_BAREVAR 24"    "for z in w (bare set var) iterates typed elements, sum 24"
 
 if [ "$fail" -ne 0 ]; then
     echo "[set-host] FAIL"

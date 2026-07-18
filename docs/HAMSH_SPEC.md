@@ -352,16 +352,32 @@ equality dict keys use).
   `{1, 4, 9}`).
 - **Membership:** `x in s` / `x not in s`.
 - **Algebra** (both operands sets): `a | b` union, `a & b` intersection,
-  `a - b` difference. Method forms — `union(a, b)`, `intersection(a, b)`,
-  `difference(a, b)` — accept **any iterable** as the second argument.
+  `a - b` difference, `a ^ b` **symmetric difference** (elements in exactly one
+  set). `^` binds between `|` and `&` (Python's bitwise precedence). Method
+  forms — `union(a, b)`, `intersection(a, b)`, `difference(a, b)`,
+  `symmetric_difference(a, b)` — accept **any iterable** as the second argument.
+- **Equality:** `a == b` / `a != b` on two sets is **order-independent** (equal
+  cardinality plus mutual containment). A `frozenset` compares equal to a plain
+  set with the same members.
 - **Mutation:** `s.add(x)` (no-op if present), `s.discard(x)` and `s.remove(x)`
-  (both tolerant of an absent element — no raise).
+  (both tolerant of an absent element — no raise), `s.update(iterable)` (add
+  every item in place), `s.clear()` (empty in place), and `s.copy()` (a fresh
+  independent **mutable** set).
 - **Introspection:** `len(s)`, `issubset(a, b)` / `issuperset(a, b)`.
-- **Iteration:** `for x in s { … }` (in insertion order). A `{…}` set literal is
-  a valid loop iterable — `for x in {10, 20, 30} { … }` — because the literal
-  consumes through its own `}`, leaving the body's `{` unambiguous. (A bare set
-  *variable* follows the shell word-list rule like any other iterable; use the
-  expression form `set(v)` or a `{…}` literal to iterate its elements.)
+- **`frozenset`:** `frozenset(iterable)` (or empty `frozenset()`) is an
+  **immutable** set. It shares every set operation — membership, `|`/`&`/`-`/`^`
+  algebra, equality, iteration, comprehension source — but `add`/`discard`/
+  `update`/`clear` are silently refused, and it renders wrapped:
+  `frozenset({1, 2, 3})` / `frozenset()`. (A frozenset is **not** currently
+  hashable as a dict key — dict keys compare by string form, and a frozenset's
+  string form is not stable as a key; document-only limitation.)
+- **Iteration:** `for x in s { … }` (in insertion order). Three iterable forms:
+  a `{…}` set literal (`for x in {10, 20, 30} { … }` — the literal consumes
+  through its own `}`, leaving the body's `{` unambiguous), an expression such
+  as `set(v)`, **and a bare set *variable*** — `for x in s { … }` where `s`
+  names an in-scope set iterates its **typed** elements (ints stay ints), the
+  shell-word analog of the expression form. Every other bare word-list
+  (`for f in a b`, globs, `$xs`) keeps the shell word-list soul.
 
 ```
 s = set([1, 2, 2, 3])
@@ -370,14 +386,19 @@ echo ${ 2 in s }                       # true
 echo ${ {1, 2} | {2, 3} }              # {1, 2, 3}
 echo ${ {1, 2, 3} & {2, 3, 4} }        # {2, 3}
 echo ${ {1, 2, 3} - {2} }              # {1, 3}
+echo ${ {1, 2, 3} ^ {2, 3, 4} }        # {1, 4}
+echo ${ {1, 2} == {2, 1} }             # true
+fs = frozenset([1, 2, 2, 3])
+echo "${ fs }"                         # frozenset({1, 2, 3})
 s.add(5)
 echo ${ join(sorted(s), ",") }         # 1,2,3,5
 ```
 
 Internally a set reuses the list element layout (single slot per element in the
 shared value pool), so iteration/subscript/`len` share the list machinery; the
-only added invariant is dedup-on-insert. `frozenset` and symmetric difference
-(`^`) are not yet implemented.
+only added invariants are dedup-on-insert and — for a `frozenset` — an
+immutability flag (`val_pay`) that shares the layout and every read path while
+refusing mutation.
 
 ---
 
