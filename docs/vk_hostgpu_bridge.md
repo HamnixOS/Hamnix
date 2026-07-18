@@ -14,14 +14,19 @@ with genuine hardware 3D acceleration — complementing the in-VM virtio-gpu pat
 | Real GPU | **NVIDIA GeForce RTX 3090**, driver 550.163.01, Vulkan 1.3.277 |
 | SW Vulkan | **lavapipe / llvmpipe** (`libvulkan_lvp.so`, `lvp_icd.json`), Vulkan 1.4.305 |
 | Other ICDs | intel, intel_hasvk, radeon, nouveau, virtio, gfxstream (installed, unused here) |
-| SPIR-V toolchain | **absent** (no `glslc` / `glslangValidator`) |
+| SPIR-V toolchain (binary) | **absent** (no `glslc` / `glslangValidator` / `spirv-*`) |
+| SPIR-V toolchain (**library**) | **present** — `libshaderc.so.1` (Debian `libshaderc1`); glslc's whole compiler as a shared object (no `-dev` headers) |
 | QEMU GL | `virtio-gpu-gl-pci`, `virtio-vga-gl` available (that's the other agent's path) |
 
 Consequences that shaped the design:
-- **No SPIR-V compiler** → the bridge uses only fixed-function transfer ops
-  (`vkCmdClearColorImage`, buffer↔image copy). No shaders required.
-- **No Vulkan headers** → the bridge hand-declares the minimal, ABI-stable
-  subset it needs and links the versioned `libvulkan.so.1` directly.
+- **No Vulkan/shaderc headers** → the bridge hand-declares the minimal,
+  ABI-stable subset it needs and links the versioned `.so` directly. Same
+  pattern for both `libvulkan.so.1` and `libshaderc.so.1`.
+- **The SPIR-V blocker is resolved by the *library*.** The `glslc` binary is
+  not installed, but `libshaderc.so.1` is — so `scripts/shaderc_compile.c`
+  hand-declares shaderc's tiny C API, links the `.so`, and compiles our GLSL to
+  SPIR-V at gate time. This unlocked a **real compute pipeline** (below); the
+  earlier "fixed-function transfer ops only" limitation no longer applies.
 
 ## Why a C bridge and a file seam (not a direct call from Adder)
 
@@ -64,6 +69,13 @@ losslessly through real Linux Vulkan on the actual GPU.
   - `blit IN.ppm SCALE OUT.ppm` — upload, then **`vkCmdBlitImage`** scales the
     frame by `SCALE` on the GPU (LINEAR filter; NEAREST if `VK_HOSTGPU_NEAREST`
     is set), readback. Prints `BLIT_MS` (isolated GPU blit time). Headless.
+  - **`raster OUT.ppm`** — GPU-rasterize the reference scene through a real
+    **compute pipeline** (`scripts/shaders/vk2d_raster.comp.spv`) over storage
+    buffers, readback. Prints `RASTER_GPU_MS` / `RASTER_SW_MS` and asserts a
+    `0`-mismatch against a C port of the vk_2d ops. See "GPU rasterization".
+  - **`rasterbench W H`** — fill+alpha-blend workload at arbitrary resolution
+    over a **device-local** (VRAM) storage buffer; prints
+    `RASTERBENCH_GPU_MS` / `_SW_MS` / `_SPEEDUP` — the crossover number.
   - `present IN.ppm [SCALE] [FRAMES]` — create a real **`VkSurfaceKHR` +
     `VkSwapchainKHR`** (Xlib WSI) and, for `FRAMES` iterations, acquire a
     swapchain image, `vkCmdBlitImage` the frame onto it (GPU scale +
@@ -71,7 +83,14 @@ losslessly through real Linux Vulkan on the actual GPU.
     hambrowse frame **on screen** through Vulkan. Prints mean `PRESENT_MS`.
     Compiled in only when built `-DHAVE_XLIB -lX11`; needs a reachable
     `$DISPLAY`.
-- **`scripts/test_vk_hostgpu.sh`** — the gate (7 steps). Renders the SW
+- **`scripts/shaders/vk2d_raster.comp`** (+ committed `.spv`) — the compute
+  shader porting vk_2d's `fill_rect` / `fill_rect_alpha` / `blit` / `roundrect`
+  / `draw_line` with **bit-identical integer math** (packed LE RGBA8888, `/255`
+  source-over, integer isqrt AA corners, Bresenham line). Op-selected by push
+  constant; dest is one `uint` per pixel matching the vk color image layout.
+- **`scripts/shaderc_compile.c`** — GLSL→SPIR-V via hand-declared `libshaderc`
+  ABI. This is how the "no SPIR-V toolchain" blocker was cleared.
+- **`scripts/test_vk_hostgpu.sh`** — the gate (7 steps + step 6b). Renders the SW
   reference, builds the bridge (plus an optional Xlib present build), runs the
   real-GPU upload round-trip (assert byte-identical), a real-GPU clear (assert
   corner pixel), a lavapipe round-trip, a **GPU blit** (assert NEAREST is
@@ -99,6 +118,51 @@ the scaled output is **byte-identical** to the RTX 3090 output — but at
 **29.4 ms** vs the RTX's **0.15 ms** (a ~195x real-GPU speedup on the scale op).
 
 `scripts/test_vk_2d_host.sh` still PASSes (no regression to the SW host render).
+
+## GPU rasterization (the core win) — a real SPIR-V compute pipeline
+
+The gap analysis found ~91% of a game frame (and much of a browser frame) is the
+CPU software rasterizer's fill/blit inner loops. The bridge now runs those on
+the GPU. `scripts/shaders/vk2d_raster.comp` ports the **exact integer math** of
+`lib/vk/vk_2d.ad` — `fill_rect`, `fill_rect_alpha` (source-over `/255`), `blit`
+(nearest, source-over), `fill_roundrect` (integer-isqrt AA corners), and
+`draw_line` (Bresenham) — into a compute shader. Compute (not a graphics
+pipeline) is deliberate: reproducing the SW rasterizer's arithmetic verbatim
+makes the result **bit-identical**, which is the strongest proof of the port
+(a graphics rasterizer's own coverage/rounding could diverge at edges).
+
+**Toolchain:** the `glslc` binary is absent but `libshaderc.so.1` is installed;
+`scripts/shaderc_compile.c` hand-declares its C ABI, links the `.so`, and
+compiles the GLSL to 14 756 bytes of SPIR-V. The `.spv` is committed so the gate
+runs even without libshaderc, but the gate regenerates it from source when the
+library is present (proving the toolchain live).
+
+```
+GPU-raster of the 96x64 vk2d scene  ==(BYTE-IDENTICAL)== vk_2d.ad SW reference
+     fill + alpha-blend + blit + rounded-rect + line, all pixel-exact on the RTX 3090
+
+Crossover (fill + full-screen alpha-blend, device-local VRAM, best of N):
+     res         GPU raster   SW raster   speedup
+     96x64        0.088 ms     0.012 ms    0.14x   (overhead-bound: submit/fence dominates)
+     640x480      0.10  ms     0.64  ms    6.2x
+     1280x720     0.11  ms     1.87  ms    16.4x
+     1920x1080    0.16  ms     4.28  ms    27.4x
+     3840x2160    0.35  ms     18.1  ms    51x
+```
+
+GPU raster time is nearly **flat** with resolution (the fills are trivially
+parallel; the RTX 3090 is overhead-bound until 4K), while the CPU cost scales
+linearly with pixel count — exactly why the SW rasterizer dominates real frames
+and the GPU erases it. At tiny sizes (a 96×64 icon) the GPU *loses* to submit
+overhead; the win is at frame scale.
+
+**Next step (on-device):** route `lib/vk/vk_2d.ad`'s actual rasterization
+through this pipeline on the in-VM virtio-gpu/venus path. The op semantics are
+already proven bit-identical, so the device path is a plumbing change: emit the
+same push-constant op list from `vk_core`'s `VK_OP_2D_*` command-buffer records
+into a virtio-gpu compute submission instead of the CPU inner loops, keeping the
+SW path as the golden oracle. Batch all ops of a frame into one submit (as the
+bench does) so per-frame overhead is amortized.
 
 ### Seeing hambrowse on the real GPU (a machine with a display)
 

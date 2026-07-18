@@ -23,6 +23,12 @@
 #      the GPU (NEAREST + LINEAR). Assert NEAREST is byte-exact vs a CPU
 #      nearest-upscale and LINEAR is within tolerance of a CPU bilinear
 #      reference -> the swapchain present blit path is correct. Reports GPU ms.
+#   6b. GPU RASTERIZATION (the core win): compile scripts/shaders/vk2d_raster.comp
+#      GLSL -> SPIR-V through the host's libshaderc (the glslc BINARY is absent,
+#      the LIBRARY is not), then run vk_2d's fill/blit/blend/roundrect/line as a
+#      real Vulkan COMPUTE pipeline over storage buffers. Assert the readback is
+#      BYTE-IDENTICAL to the vk_2d.ad SW rasterizer reference, and report the
+#      GPU-vs-SW raster crossover (overhead-bound at 96x64; ~27x at 1080p).
 #   7. WINDOWED PRESENT (best-effort): if libX11 + a reachable $DISPLAY exist,
 #      create a real VkSurfaceKHR + VkSwapchainKHR and present the framebuffer
 #      to an on-screen window through the real GPU. SKIPPED (not failed) when
@@ -196,6 +202,78 @@ PY
 else
     echo "[test_vk_hostgpu] FAIL bridge blit op errored"
     cat "$OUT/vk_hostgpu_blit_n.log" "$OUT/vk_hostgpu_blit_l.log"; fail=1
+fi
+
+# ---- 6b. GPU RASTERIZATION via a real SPIR-V compute pipeline ---------------
+# The core win: run vk_2d's fill/blit/blend/roundrect ON the GPU (compute
+# shader) and prove the readback is BYTE-IDENTICAL to the vk_2d.ad SW
+# rasterizer, then measure the GPU-vs-SW raster crossover at frame sizes.
+LIBSHADERC="/usr/lib/x86_64-linux-gnu/libshaderc.so.1"
+SPV="scripts/shaders/vk2d_raster.comp.spv"
+# (i) regenerate the .spv from GLSL via the host's libshaderc — proves the
+#     SPIR-V toolchain is live (glslc binary is absent; the library is not).
+if [ -e "$LIBSHADERC" ]; then
+    echo "[test_vk_hostgpu] (6b) compiling GLSL->SPIR-V via libshaderc ..."
+    if gcc -O2 -w scripts/shaderc_compile.c -o "$OUT/shaderc_compile" "$LIBSHADERC" \
+            2>"$OUT/shaderc_cc.log"; then
+        if "$OUT/shaderc_compile" scripts/shaders/vk2d_raster.comp "$SPV" \
+                >"$OUT/shaderc.log" 2>&1; then
+            echo "[test_vk_hostgpu] PASS libshaderc compiled vk2d_raster.comp -> $SPV"
+            grep -o '[0-9]* bytes SPIR-V' "$OUT/shaderc.log" | sed 's/^/[test_vk_hostgpu]   /'
+        else
+            echo "[test_vk_hostgpu] FAIL libshaderc compile"; cat "$OUT/shaderc.log"; fail=1
+        fi
+    else
+        echo "[test_vk_hostgpu] SKIP shaderc build failed; using committed $SPV"
+        cat "$OUT/shaderc_cc.log"
+    fi
+else
+    echo "[test_vk_hostgpu] (6b) libshaderc absent; using committed $SPV (checked in)."
+fi
+# (ii) GPU-rasterize the reference scene; assert byte-identical to SW reference.
+if [ -e "$SPV" ]; then
+    echo "[test_vk_hostgpu] (6b) GPU compute-raster of the vk2d scene ..."
+    RAST_PPM="$OUT/vk_hostgpu_raster.ppm"
+    if "$BRIDGE" raster "$RAST_PPM" >"$OUT/vk_hostgpu_raster.log" 2>&1; then
+        GMS=$(awk '/^RASTER_GPU_MS/{print $2}' "$OUT/vk_hostgpu_raster.log")
+        SMS=$(awk '/^RASTER_SW_MS/{print $2}' "$OUT/vk_hostgpu_raster.log")
+        MM=$(awk '/^RASTER_GPUvsCPUport_MISMATCH/{print $2}' "$OUT/vk_hostgpu_raster.log")
+        echo "[test_vk_hostgpu] GPU-raster ${GMS}ms  SW-raster ${SMS}ms (96x64 reference scene)"
+        if cmp -s "$REF_PPM" "$RAST_PPM"; then
+            echo "[test_vk_hostgpu] PASS GPU compute-raster BYTE-IDENTICAL to vk_2d.ad SW reference"
+        else
+            echo "[test_vk_hostgpu] FAIL GPU compute-raster differs from SW reference"; fail=1
+        fi
+        if [ "$MM" = "0" ]; then
+            echo "[test_vk_hostgpu] PASS GPU output matches CPU-port oracle (0 mismatches)"
+        else
+            echo "[test_vk_hostgpu] FAIL GPU vs CPU-port mismatch=$MM"; fail=1
+        fi
+    else
+        echo "[test_vk_hostgpu] FAIL bridge raster op errored"; cat "$OUT/vk_hostgpu_raster.log"; fail=1
+    fi
+    # (iii) crossover benchmark — the headline "quantifies the win" number.
+    echo "[test_vk_hostgpu] (6b) GPU-vs-SW raster crossover ..."
+    for RES in "96 64" "1280 720" "1920 1080"; do
+        if "$BRIDGE" rasterbench $RES >"$OUT/vk_hostgpu_bench.log" 2>&1; then
+            SU=$(awk '/^RASTERBENCH_SPEEDUP/{print $2}' "$OUT/vk_hostgpu_bench.log")
+            BG=$(awk '/^RASTERBENCH_GPU_MS/{print $2}' "$OUT/vk_hostgpu_bench.log")
+            BS=$(awk '/^RASTERBENCH_SW_MS/{print $2}' "$OUT/vk_hostgpu_bench.log")
+            echo "[test_vk_hostgpu]   ${RES// /x}: GPU ${BG}ms  SW ${BS}ms  speedup ${SU}"
+            if [ "$RES" = "1920 1080" ]; then
+                # at 1080p the GPU raster must beat the CPU (crossover proven).
+                if awk "BEGIN{exit !(${SU%x}>1.0)}"; then
+                    echo "[test_vk_hostgpu] PASS GPU raster faster than SW at 1080p (${SU})"
+                else
+                    echo "[test_vk_hostgpu] FAIL GPU raster not faster than SW at 1080p (${SU})"; fail=1
+                fi
+            fi
+        else
+            echo "[test_vk_hostgpu] FAIL rasterbench $RES errored"; cat "$OUT/vk_hostgpu_bench.log"; fail=1
+        fi
+    done
+else
+    echo "[test_vk_hostgpu] SKIP GPU-raster: no $SPV (toolchain + committed artifact both absent)."
 fi
 
 # ---- 7. windowed present (best-effort; SKIP when headless) -----------------

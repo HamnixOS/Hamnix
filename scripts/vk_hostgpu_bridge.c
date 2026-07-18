@@ -250,6 +250,7 @@ extern void     vkUnmapMemory(VkDevice, VkDeviceMemory);
 extern VkResult vkCreateCommandPool(VkDevice, const VkCommandPoolCreateInfo*, const void*, VkCommandPool*);
 extern void     vkDestroyCommandPool(VkDevice, VkCommandPool, const void*);
 extern VkResult vkAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer*);
+extern void     vkFreeCommandBuffers(VkDevice, VkCommandPool, uint32_t, const VkCommandBuffer*);
 extern VkResult vkBeginCommandBuffer(VkCommandBuffer, const VkCommandBufferBeginInfo*);
 extern VkResult vkEndCommandBuffer(VkCommandBuffer);
 extern void     vkCmdPipelineBarrier(VkCommandBuffer, VkFlags, VkFlags, VkFlags,
@@ -275,6 +276,86 @@ typedef struct {
 extern void vkCmdBlitImage(VkCommandBuffer, VkImage srcImage, uint32_t srcLayout,
                            VkImage dstImage, uint32_t dstLayout,
                            uint32_t regionCount, const VkImageBlit*, uint32_t filter);
+
+/* ============ minimal COMPUTE ABI (SPIR-V pipeline for GPU 2D raster) ======= */
+/* GPU-raster path: run vk_2d's fill/blit/blend/roundrect as a real compute
+ * pipeline (scripts/shaders/vk2d_raster.comp.spv) over storage buffers. */
+typedef uint64_t VkShaderModule;
+typedef uint64_t VkDescriptorSetLayout;
+typedef uint64_t VkPipelineLayout;
+typedef uint64_t VkPipeline;
+typedef uint64_t VkPipelineCache;
+typedef uint64_t VkDescriptorPool;
+typedef void*    VkDescriptorSet;
+
+#define ST_SHADER_MODULE_CREATE_INFO           16
+#define ST_PIPELINE_SHADER_STAGE_CREATE_INFO   18
+#define ST_COMPUTE_PIPELINE_CREATE_INFO        29
+#define ST_PIPELINE_LAYOUT_CREATE_INFO         30
+#define ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO   32
+#define ST_DESCRIPTOR_POOL_CREATE_INFO         33
+#define ST_DESCRIPTOR_SET_ALLOCATE_INFO        34
+#define ST_WRITE_DESCRIPTOR_SET                35
+#define ST_MEMORY_BARRIER                      46
+
+#define VK_SHADER_STAGE_COMPUTE_BIT      0x20
+#define VK_DESCRIPTOR_TYPE_STORAGE_BUFFER 7
+#define VK_PIPELINE_BIND_POINT_COMPUTE    1
+#define VK_BUFFER_USAGE_STORAGE_BUFFER_BIT 0x20
+#define VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT 0x800
+#define VK_ACCESS_SHADER_READ_BIT  0x20
+#define VK_ACCESS_SHADER_WRITE_BIT 0x40
+
+typedef struct { uint32_t sType; const void* pNext; VkFlags flags;
+    size_t codeSize; const uint32_t* pCode; } VkShaderModuleCreateInfo;
+typedef struct { uint32_t binding; uint32_t descriptorType; uint32_t descriptorCount;
+    VkFlags stageFlags; const void* pImmutableSamplers; } VkDescriptorSetLayoutBinding;
+typedef struct { uint32_t sType; const void* pNext; VkFlags flags;
+    uint32_t bindingCount; const VkDescriptorSetLayoutBinding* pBindings;
+    } VkDescriptorSetLayoutCreateInfo;
+typedef struct { VkFlags stageFlags; uint32_t offset; uint32_t size; } VkPushConstantRange;
+typedef struct { uint32_t sType; const void* pNext; VkFlags flags;
+    uint32_t setLayoutCount; const VkDescriptorSetLayout* pSetLayouts;
+    uint32_t pushConstantRangeCount; const VkPushConstantRange* pPushConstantRanges;
+    } VkPipelineLayoutCreateInfo;
+typedef struct { uint32_t sType; const void* pNext; VkFlags flags;
+    VkFlags stage; VkShaderModule module; const char* pName;
+    const void* pSpecializationInfo; } VkPipelineShaderStageCreateInfo;
+typedef struct { uint32_t sType; const void* pNext; VkFlags flags;
+    VkPipelineShaderStageCreateInfo stage; VkPipelineLayout layout;
+    VkPipeline basePipelineHandle; int32_t basePipelineIndex; } VkComputePipelineCreateInfo;
+typedef struct { uint32_t type; uint32_t descriptorCount; } VkDescriptorPoolSize;
+typedef struct { uint32_t sType; const void* pNext; VkFlags flags;
+    uint32_t maxSets; uint32_t poolSizeCount; const VkDescriptorPoolSize* pPoolSizes;
+    } VkDescriptorPoolCreateInfo;
+typedef struct { uint32_t sType; const void* pNext; VkDescriptorPool descriptorPool;
+    uint32_t descriptorSetCount; const VkDescriptorSetLayout* pSetLayouts;
+    } VkDescriptorSetAllocateInfo;
+typedef struct { VkBuffer buffer; VkDeviceSize offset; VkDeviceSize range; } VkDescriptorBufferInfo;
+typedef struct { uint32_t sType; const void* pNext; VkDescriptorSet dstSet;
+    uint32_t dstBinding; uint32_t dstArrayElement; uint32_t descriptorCount;
+    uint32_t descriptorType; const void* pImageInfo;
+    const VkDescriptorBufferInfo* pBufferInfo; const void* pTexelBufferView;
+    } VkWriteDescriptorSet;
+typedef struct { uint32_t sType; const void* pNext;
+    VkFlags srcAccessMask; VkFlags dstAccessMask; } VkMemoryBarrier;
+
+extern VkResult vkCreateShaderModule(VkDevice, const VkShaderModuleCreateInfo*, const void*, VkShaderModule*);
+extern void     vkDestroyShaderModule(VkDevice, VkShaderModule, const void*);
+extern VkResult vkCreateDescriptorSetLayout(VkDevice, const VkDescriptorSetLayoutCreateInfo*, const void*, VkDescriptorSetLayout*);
+extern void     vkDestroyDescriptorSetLayout(VkDevice, VkDescriptorSetLayout, const void*);
+extern VkResult vkCreatePipelineLayout(VkDevice, const VkPipelineLayoutCreateInfo*, const void*, VkPipelineLayout*);
+extern void     vkDestroyPipelineLayout(VkDevice, VkPipelineLayout, const void*);
+extern VkResult vkCreateComputePipelines(VkDevice, VkPipelineCache, uint32_t, const VkComputePipelineCreateInfo*, const void*, VkPipeline*);
+extern void     vkDestroyPipeline(VkDevice, VkPipeline, const void*);
+extern VkResult vkCreateDescriptorPool(VkDevice, const VkDescriptorPoolCreateInfo*, const void*, VkDescriptorPool*);
+extern void     vkDestroyDescriptorPool(VkDevice, VkDescriptorPool, const void*);
+extern VkResult vkAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo*, VkDescriptorSet*);
+extern void     vkUpdateDescriptorSets(VkDevice, uint32_t, const VkWriteDescriptorSet*, uint32_t, const void*);
+extern void     vkCmdBindPipeline(VkCommandBuffer, uint32_t, VkPipeline);
+extern void     vkCmdBindDescriptorSets(VkCommandBuffer, uint32_t, VkPipelineLayout, uint32_t, uint32_t, const VkDescriptorSet*, uint32_t, const uint32_t*);
+extern void     vkCmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkFlags, uint32_t, uint32_t, const void*);
+extern void     vkCmdDispatch(VkCommandBuffer, uint32_t, uint32_t, uint32_t);
 
 /* ============ minimal WSI ABI (VK_KHR_surface / _swapchain / _xlib) ========= */
 typedef uint64_t VkSurfaceKHR;
@@ -900,10 +981,447 @@ static int mode_present(const char* in, double scale, uint32_t frames) {
 }
 #endif /* HAVE_XLIB */
 
+/* =================== GPU 2D raster (real compute pipeline) ===============
+ * Runs vk_2d's core primitives — fill_rect, fill_rect_alpha (source-over),
+ * blit (nearest, source-over), fill_roundrect (AA corners), draw_line — as a
+ * REAL Vulkan compute pipeline (scripts/shaders/vk2d_raster.comp.spv), then
+ * reads the SSBO back. The result is compared BIT-FOR-BIT to the vk_2d.ad SW
+ * rasterizer reference (build/host/vk_hostgpu_ref.ppm). A parallel C port of
+ * the same ops (cpu_* below) provides the SW-raster TIMING baseline on the
+ * same machine and doubles as an independent oracle.
+ *
+ * Scene is IDENTICAL to lib/vk/vk_hostgpu.ad vk_hostgpu_compose(): 96x64. */
+
+#define RW 96
+#define RH 64
+#define SRC_W 4
+#define SRC_H 4
+
+/* PushC layout MUST match scripts/shaders/vk2d_raster.comp push_constant. */
+typedef struct {
+    int32_t  op, bx, by, dispw, disph, img_w, img_h;
+    uint32_t rgba;
+    int32_t  px, py, pw, ph, rad, corners;
+    int32_t  dx, dy, rsx, rsy, rsw, rsh, tw, th, src_w, src_h;
+} PushC;
+enum { OP_FILL=0, OP_FILL_ALPHA=1, OP_BLIT=2, OP_ROUNDRECT=3, OP_LINE=4 };
+
+/* ---- CPU reference port of the vk_2d ops (byte-identical integer math) ---- */
+static inline void cpu_blend_at(uint8_t* p, uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
+    if (a == 0) return;
+    if (a >= 255) { p[0]=r; p[1]=g; p[2]=b; p[3]=255; return; }
+    uint32_t ia = 255 - a;
+    p[0] = (uint8_t)((r*a + p[0]*ia)/255);
+    p[1] = (uint8_t)((g*a + p[1]*ia)/255);
+    p[2] = (uint8_t)((b*a + p[2]*ia)/255);
+    p[3] = 255;
+}
+static void cpu_fill(uint8_t* img, int x, int y, int w, int h, uint32_t rgba) {
+    if (w<=0||h<=0) return;
+    uint32_t r=(rgba>>24)&0xFF, g=(rgba>>16)&0xFF, b=(rgba>>8)&0xFF;
+    int x0=x<0?0:x, y0=y<0?0:y, x1=x+w>RW?RW:x+w, y1=y+h>RH?RH:y+h;
+    for (int yy=y0; yy<y1; yy++) for (int xx=x0; xx<x1; xx++) {
+        uint8_t* p=img+(yy*RW+xx)*4; p[0]=r;p[1]=g;p[2]=b;p[3]=255;
+    }
+}
+static void cpu_fill_alpha(uint8_t* img, int x, int y, int w, int h, uint32_t rgba) {
+    if (w<=0||h<=0) return;
+    uint32_t r=(rgba>>24)&0xFF, g=(rgba>>16)&0xFF, b=(rgba>>8)&0xFF, a=rgba&0xFF;
+    if (a==0) return;
+    int x0=x<0?0:x, y0=y<0?0:y, x1=x+w>RW?RW:x+w, y1=y+h>RH?RH:y+h;
+    for (int yy=y0; yy<y1; yy++) for (int xx=x0; xx<x1; xx++)
+        cpu_blend_at(img+(yy*RW+xx)*4, r,g,b,a);
+}
+static void cpu_blit(uint8_t* img, const uint8_t* src, int dx, int dy, int dw, int dh) {
+    int rsw=SRC_W, rsh=SRC_H, tw=dw>0?dw:rsw, th=dh>0?dh:rsh;
+    int yy0=dy<0?-dy:0, yy1=dy+th>RH?RH-dy:th;
+    int xx0=dx<0?-dx:0, xx1=dx+tw>RW?RW-dx:tw;
+    for (int yy=yy0; yy<yy1; yy++) {
+        int syi=(yy*rsh/th); if (syi>=SRC_H) syi=SRC_H-1;
+        for (int xx=xx0; xx<xx1; xx++) {
+            int sxi=(xx*rsw/tw); if (sxi>=SRC_W) sxi=SRC_W-1;
+            const uint8_t* s=src+(syi*SRC_W+sxi)*4;
+            cpu_blend_at(img+((dy+yy)*RW+(dx+xx))*4, s[0],s[1],s[2],s[3]);
+        }
+    }
+}
+static uint32_t cpu_isqrt(uint32_t n){ if(!n)return 0; uint32_t x=n,y=(x+1)/2; while(y<x){x=y;y=(x+n/x)/2;} return x; }
+static int cpu_rr_cov(int px,int py,int ccx2,int ccy2,int r2){
+    int dxh=(2*px+1)-ccx2, dyh=(2*py+1)-ccy2, d2=dxh*dxh+dyh*dyh;
+    int dh=(int)cpu_isqrt((uint32_t)d2);
+    if (dh<=r2-1) return 255; if (dh>=r2+1) return 0; return (r2+1-dh)*255/2;
+}
+static void cpu_roundrect(uint8_t* img, int x,int y,int w,int h,int rad,int corners,uint32_t rgba){
+    if (w<=0||h<=0) return;
+    uint32_t r=(rgba>>24)&0xFF, g=(rgba>>16)&0xFF, b=(rgba>>8)&0xFF, a=rgba&0xFF;
+    if (a==0) return;
+    int rr=rad; if(rr<0)rr=0; if(rr>w/2)rr=w/2; if(rr>h/2)rr=h/2;
+    if (rr<=0){ cpu_fill_alpha(img,x,y,w,h,rgba); return; }
+    int r2=2*rr, tlx2=2*(x+rr),tly2=2*(y+rr), trx2=2*(x+w-rr),try2=tly2,
+        blx2=tlx2,bly2=2*(y+h-rr), brx2=trx2,bry2=bly2;
+    int px0=x<0?0:x, px1=x+w>RW?RW:x+w, py0=y<0?0:y, py1=y+h>RH?RH:y+h;
+    for (int py=py0; py<py1; py++) for (int px=px0; px<px1; px++) {
+        int cov=255;
+        int it=py<y+rr, ib=py>=y+h-rr, il=px<x+rr, ir=px>=x+w-rr;
+        if (it&&il&&(corners&1)) cov=cpu_rr_cov(px,py,tlx2,tly2,r2);
+        else if (it&&ir&&(corners&2)) cov=cpu_rr_cov(px,py,trx2,try2,r2);
+        else if (ib&&il&&(corners&4)) cov=cpu_rr_cov(px,py,blx2,bly2,r2);
+        else if (ib&&ir&&(corners&8)) cov=cpu_rr_cov(px,py,brx2,bry2,r2);
+        if (cov>0){ uint32_t ae=a*(uint32_t)cov/255; cpu_blend_at(img+(py*RW+px)*4, r,g,b,ae); }
+    }
+}
+static void cpu_line(uint8_t* img,int x1,int y1,int x2,int y2,int thick,uint32_t rgba){
+    uint32_t r=(rgba>>24)&0xFF, g=(rgba>>16)&0xFF, b=(rgba>>8)&0xFF;
+    int dx=abs(x2-x1), dy=abs(y2-y1), sx=x1>x2?-1:1, sy=y1>y2?-1:1, err=dx-dy, cx=x1, cy=y1;
+    int t=thick<1?1:thick, guard=0;
+    while (guard<100000){
+        for(int by=0;by<t;by++)for(int bx=0;bx<t;bx++){
+            int X=cx+bx,Y=cy+by;
+            if(X>=0&&Y>=0&&X<RW&&Y<RH){uint8_t*p=img+(Y*RW+X)*4;p[0]=r;p[1]=g;p[2]=b;p[3]=255;}
+        }
+        if(cx==x2&&cy==y2)return;
+        int e2=err*2; if(e2>-dy){err-=dy;cx+=sx;} if(e2<dx){err+=dx;cy+=sy;}
+        guard++;
+    }
+}
+
+static void make_sprite(uint8_t* src) {
+    for (int i=0;i<SRC_W*SRC_H;i++){ src[i*4]=0; src[i*4+1]=255; src[i*4+2]=0; src[i*4+3]=255; }
+    uint8_t* p=src+(3*SRC_W+3)*4; p[0]=0;p[1]=0;p[2]=255;p[3]=255;   /* blue at (3,3) */
+}
+/* Render the reference scene on the CPU (mirrors vk_hostgpu_compose). */
+static void cpu_raster_scene(uint8_t* img, const uint8_t* src) {
+    cpu_fill(img, 0,0,RW,RH, 0x0D1220FF);
+    cpu_fill(img, 0,0,RW,10, 0x2B3350FF);
+    cpu_fill(img, 8,16,60,40, 0xFFFFFFFF);
+    cpu_fill_alpha(img, 20,24,24,16, 0x00CCFF80);
+    cpu_blit(img, src, 74,20,8,8);
+    cpu_line(img, 8,58,88,58, 2, 0xFFFF00FF);
+    cpu_roundrect(img, 68,44,20,12, 4,15, 0xFF33CCFF);
+}
+
+/* ---- scene as a GPU dispatch list (same 7 ops, CPU-clamped like vk_2d) ---- */
+static int g_nops = 0;
+static PushC g_ops[16];
+static uint32_t g_grp[16][2];
+static void push_op(PushC pc, int dispw, int disph) {
+    if (dispw<=0 || disph<=0) return;
+    pc.img_w=RW; pc.img_h=RH; pc.dispw=dispw; pc.disph=disph;
+    g_ops[g_nops]=pc;
+    g_grp[g_nops][0]=(uint32_t)((dispw+7)/8);
+    g_grp[g_nops][1]=(uint32_t)((disph+7)/8);
+    g_nops++;
+}
+static void gpu_fill(int op,int x,int y,int w,int h,uint32_t rgba){
+    if (w<=0||h<=0) return;
+    if (op==OP_FILL_ALPHA && (rgba&0xFF)==0) return;
+    int x0=x<0?0:x,y0=y<0?0:y,x1=x+w>RW?RW:x+w,y1=y+h>RH?RH:y+h;
+    if (x0>=x1||y0>=y1) return;
+    PushC pc={0}; pc.op=op; pc.rgba=rgba; pc.bx=x0; pc.by=y0;
+    push_op(pc, x1-x0, y1-y0);
+}
+static void gpu_blit(int dx,int dy,int dw,int dh){
+    int rsw=SRC_W,rsh=SRC_H,tw=dw>0?dw:rsw,th=dh>0?dh:rsh;
+    int yy0=dy<0?-dy:0, yy1=dy+th>RH?RH-dy:th, xx0=dx<0?-dx:0, xx1=dx+tw>RW?RW-dx:tw;
+    if (xx0>=xx1||yy0>=yy1) return;
+    PushC pc={0}; pc.op=OP_BLIT; pc.bx=dx+xx0; pc.by=dy+yy0;
+    pc.dx=dx; pc.dy=dy; pc.rsx=0; pc.rsy=0; pc.rsw=rsw; pc.rsh=rsh;
+    pc.tw=tw; pc.th=th; pc.src_w=SRC_W; pc.src_h=SRC_H;
+    push_op(pc, xx1-xx0, yy1-yy0);
+}
+static void gpu_line(int x1,int y1,int x2,int y2,int thick,uint32_t rgba){
+    PushC pc={0}; pc.op=OP_LINE; pc.rgba=rgba; pc.bx=0; pc.by=0;
+    pc.px=x1; pc.py=y1; pc.pw=x2; pc.ph=y2; pc.rad=thick;
+    push_op(pc, 1, 1);
+}
+static void gpu_roundrect(int x,int y,int w,int h,int rad,int corners,uint32_t rgba){
+    if (w<=0||h<=0||(rgba&0xFF)==0) return;
+    int rr=rad; if(rr<0)rr=0; if(rr>w/2)rr=w/2; if(rr>h/2)rr=h/2;
+    if (rr<=0){ gpu_fill(OP_FILL_ALPHA,x,y,w,h,rgba); return; }
+    int px0=x<0?0:x,px1=x+w>RW?RW:x+w,py0=y<0?0:y,py1=y+h>RH?RH:y+h;
+    if (px0>=px1||py0>=py1) return;
+    PushC pc={0}; pc.op=OP_ROUNDRECT; pc.rgba=rgba; pc.bx=px0; pc.by=py0;
+    pc.px=x; pc.py=y; pc.pw=w; pc.ph=h; pc.rad=rr; pc.corners=corners;
+    push_op(pc, px1-px0, py1-py0);
+}
+static void build_scene(void) {
+    g_nops=0;
+    gpu_fill(OP_FILL, 0,0,RW,RH, 0x0D1220FF);
+    gpu_fill(OP_FILL, 0,0,RW,10, 0x2B3350FF);
+    gpu_fill(OP_FILL, 8,16,60,40, 0xFFFFFFFF);
+    gpu_fill(OP_FILL_ALPHA, 20,24,24,16, 0x00CCFF80);
+    gpu_blit(74,20,8,8);
+    gpu_line(8,58,88,58, 2, 0xFFFF00FF);
+    gpu_roundrect(68,44,20,12, 4,15, 0xFF33CCFF);
+}
+
+static uint32_t* read_spv(const char* path, size_t* sz) {
+    FILE* f=fopen(path,"rb"); if(!f){fprintf(stderr,"[vk_hostgpu] cannot open %s\n",path);return 0;}
+    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+    uint32_t* buf=malloc((size_t)n);
+    if (fread(buf,1,(size_t)n,f)!=(size_t)n){fclose(f);free(buf);return 0;}
+    fclose(f); *sz=(size_t)n; return buf;
+}
+
+/* Make a host-visible+coherent storage buffer (also transfer src for readback). */
+static int make_storagebuf(VkDeviceSize sz, VkBuffer* buf, VkDeviceMemory* mem) {
+    VkBufferCreateInfo bc = { .sType = ST_BUFFER_CREATE_INFO, .size = sz,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+               | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    CK(vkCreateBuffer(g_dev, &bc, 0, buf));
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_dev, *buf, &mr);
+    int mt = find_mem(mr.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt < 0) { fprintf(stderr, "[vk_hostgpu] no host-visible storage mem\n"); return -1; }
+    VkMemoryAllocateInfo ai = { .sType = ST_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
+    CK(vkAllocateMemory(g_dev, &ai, 0, mem));
+    CK(vkBindBufferMemory(g_dev, *buf, *mem, 0));
+    return 0;
+}
+
+/* Device-local storage buffer (fast on-GPU memory; not host-mappable). Used by
+ * the bench so the measured GPU-raster time reflects true VRAM throughput, not
+ * PCIe-bound host-visible access. */
+static int make_storagebuf_devlocal(VkDeviceSize sz, VkBuffer* buf, VkDeviceMemory* mem) {
+    VkBufferCreateInfo bc = { .sType = ST_BUFFER_CREATE_INFO, .size = sz,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+               | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    CK(vkCreateBuffer(g_dev, &bc, 0, buf));
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_dev, *buf, &mr);
+    int mt = find_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt < 0) mt = find_mem(mr.memoryTypeBits, 0);
+    VkMemoryAllocateInfo ai = { .sType = ST_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
+    CK(vkAllocateMemory(g_dev, &ai, 0, mem));
+    CK(vkBindBufferMemory(g_dev, *buf, *mem, 0));
+    return 0;
+}
+
+/* raster IN_UNUSED OUT.ppm : GPU-rasterize the reference scene, readback PPM,
+ * print GPU-raster and SW-raster per-frame timings. */
+static int mode_raster(const char* out) {
+    size_t spvsz;
+    uint32_t* spv = read_spv("scripts/shaders/vk2d_raster.comp.spv", &spvsz);
+    if (!spv) return -1;
+
+    VkDeviceSize dstsz = (VkDeviceSize)RW*RH*4, srcsz = (VkDeviceSize)SRC_W*SRC_H*4;
+    VkBuffer dbuf, sbuf; VkDeviceMemory dmem, smem;
+    if (make_storagebuf(dstsz, &dbuf, &dmem)) return -1;
+    if (make_storagebuf(srcsz, &sbuf, &smem)) return -1;
+
+    /* upload the 4x4 sprite into the src storage buffer */
+    uint8_t sprite[SRC_W*SRC_H*4]; make_sprite(sprite);
+    void* map; CK(vkMapMemory(g_dev, smem, 0, srcsz, 0, &map));
+    memcpy(map, sprite, srcsz); vkUnmapMemory(g_dev, smem);
+
+    /* shader module + descriptor/pipeline layout + compute pipeline */
+    VkShaderModuleCreateInfo smi = { .sType = ST_SHADER_MODULE_CREATE_INFO,
+        .codeSize = spvsz, .pCode = spv };
+    VkShaderModule module; CK(vkCreateShaderModule(g_dev, &smi, 0, &module));
+    free(spv);
+
+    VkDescriptorSetLayoutBinding binds[2] = {
+        { .binding=0, .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount=1, .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding=1, .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount=1, .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT } };
+    VkDescriptorSetLayoutCreateInfo dli = { .sType=ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount=2, .pBindings=binds };
+    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(g_dev,&dli,0,&dsl));
+
+    VkPushConstantRange pcr = { .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT, .offset=0, .size=sizeof(PushC) };
+    VkPipelineLayoutCreateInfo pli = { .sType=ST_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount=1, .pSetLayouts=&dsl, .pushConstantRangeCount=1, .pPushConstantRanges=&pcr };
+    VkPipelineLayout playout; CK(vkCreatePipelineLayout(g_dev,&pli,0,&playout));
+
+    VkComputePipelineCreateInfo cpi = { .sType=ST_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { .sType=ST_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                   .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=module, .pName="main" },
+        .layout=playout };
+    VkPipeline pipe; CK(vkCreateComputePipelines(g_dev, 0, 1, &cpi, 0, &pipe));
+
+    VkDescriptorPoolSize psz = { .type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount=2 };
+    VkDescriptorPoolCreateInfo dpi = { .sType=ST_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets=1, .poolSizeCount=1, .pPoolSizes=&psz };
+    VkDescriptorPool dpool; CK(vkCreateDescriptorPool(g_dev,&dpi,0,&dpool));
+    VkDescriptorSetAllocateInfo dsai = { .sType=ST_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool=dpool, .descriptorSetCount=1, .pSetLayouts=&dsl };
+    VkDescriptorSet dset; CK(vkAllocateDescriptorSets(g_dev,&dsai,&dset));
+
+    VkDescriptorBufferInfo dbi = { .buffer=dbuf, .offset=0, .range=dstsz };
+    VkDescriptorBufferInfo sbi = { .buffer=sbuf, .offset=0, .range=srcsz };
+    VkWriteDescriptorSet wr[2] = {
+        { .sType=ST_WRITE_DESCRIPTOR_SET, .dstSet=dset, .dstBinding=0, .descriptorCount=1,
+          .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo=&dbi },
+        { .sType=ST_WRITE_DESCRIPTOR_SET, .dstSet=dset, .dstBinding=1, .descriptorCount=1,
+          .descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo=&sbi } };
+    vkUpdateDescriptorSets(g_dev, 2, wr, 0, 0);
+
+    build_scene();
+
+    /* GPU raster: record all ops (barrier between each) + submit, timed over N. */
+    const int N = 200;
+    VkMemoryBarrier mb = { .sType=ST_MEMORY_BARRIER,
+        .srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT };
+    double gpu_best = 1e30;
+    for (int it=0; it<N; it++) {
+        VkCommandBuffer cb; if (begin_cmd(&cb)) return -1;
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, playout, 0, 1, &dset, 0, 0);
+        for (int i=0; i<g_nops; i++) {
+            vkCmdPushConstants(cb, playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushC), &g_ops[i]);
+            vkCmdDispatch(cb, g_grp[i][0], g_grp[i][1], 1);
+            if (i+1 < g_nops)
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, 0, 0, 0);
+        }
+        double t0 = now_ms();
+        if (submit_wait(cb)) return -1;
+        double ms = now_ms() - t0;
+        if (ms < gpu_best) gpu_best = ms;
+        vkFreeCommandBuffers(g_dev, g_pool, 1, &cb);
+    }
+
+    /* SW raster baseline on the same machine (best of N). */
+    uint8_t* cbuf = malloc(RW*RH*4);
+    double cpu_best = 1e30;
+    for (int it=0; it<N; it++) {
+        double t0 = now_ms();
+        cpu_raster_scene(cbuf, sprite);
+        double ms = now_ms() - t0;
+        if (ms < cpu_best) cpu_best = ms;
+    }
+
+    /* readback GPU SSBO -> PPM; compare GPU vs CPU-port in memory. */
+    CK(vkMapMemory(g_dev, dmem, 0, dstsz, 0, &map));
+    uint8_t* gpix = (uint8_t*)map;
+    int mism = 0, first = -1;
+    for (int i=0;i<RW*RH;i++)
+        for (int c=0;c<3;c++)
+            if (gpix[i*4+c] != cbuf[i*4+c]) { if (first<0) first=i; mism++; }
+    write_ppm(out, gpix, RW, RH);
+    vkUnmapMemory(g_dev, dmem);
+
+    printf("VK_DEVICE %s\nRASTER_OK %s %dx%d ops=%d\n", g_devname, out, RW, RH, g_nops);
+    printf("RASTER_GPU_MS %.4f\nRASTER_SW_MS %.4f\n", gpu_best, cpu_best);
+    printf("RASTER_GPUvsCPUport_MISMATCH %d", mism);
+    if (first>=0) printf(" first@%d,%d", first%RW, first/RW);
+    printf("\n");
+
+    free(cbuf);
+    vkDestroyDescriptorPool(g_dev, dpool, 0);
+    vkDestroyPipeline(g_dev, pipe, 0);
+    vkDestroyPipelineLayout(g_dev, playout, 0);
+    vkDestroyDescriptorSetLayout(g_dev, dsl, 0);
+    vkDestroyShaderModule(g_dev, module, 0);
+    vkDestroyBuffer(g_dev, dbuf, 0); vkFreeMemory(g_dev, dmem, 0);
+    vkDestroyBuffer(g_dev, sbuf, 0); vkFreeMemory(g_dev, smem, 0);
+    return 0;
+}
+
+/* rasterbench W H : fill/blend-heavy workload at an arbitrary resolution to
+ * quantify the GPU-vs-SW-raster CROSSOVER — the number that shows the win at
+ * real browser/game frame sizes (the 96x64 `raster` scene is overhead-bound).
+ * Workload per frame: full-screen opaque fill + full-screen translucent blend
+ * (the expensive per-pixel source-over path) + a half-screen opaque fill. The
+ * shader is fully parameterized on img_w/img_h, so it needs no code changes. */
+static int mode_rasterbench(uint32_t W, uint32_t H) {
+    size_t spvsz;
+    uint32_t* spv = read_spv("scripts/shaders/vk2d_raster.comp.spv", &spvsz);
+    if (!spv) return -1;
+    VkDeviceSize dstsz = (VkDeviceSize)W*H*4, srcsz = (VkDeviceSize)SRC_W*SRC_H*4;
+    VkBuffer dbuf, sbuf; VkDeviceMemory dmem, smem;
+    if (make_storagebuf_devlocal(dstsz, &dbuf, &dmem)) return -1;   /* fast VRAM */
+    if (make_storagebuf(srcsz, &sbuf, &smem)) return -1;
+    uint8_t sprite[SRC_W*SRC_H*4]; make_sprite(sprite);
+    void* map; CK(vkMapMemory(g_dev, smem, 0, srcsz, 0, &map));
+    memcpy(map, sprite, srcsz); vkUnmapMemory(g_dev, smem);
+
+    VkShaderModuleCreateInfo smi = { .sType=ST_SHADER_MODULE_CREATE_INFO, .codeSize=spvsz, .pCode=spv };
+    VkShaderModule module; CK(vkCreateShaderModule(g_dev,&smi,0,&module)); free(spv);
+    VkDescriptorSetLayoutBinding binds[2] = {
+        { .binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT } };
+    VkDescriptorSetLayoutCreateInfo dli = { .sType=ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount=2, .pBindings=binds };
+    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(g_dev,&dli,0,&dsl));
+    VkPushConstantRange pcr = { .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT, .offset=0, .size=sizeof(PushC) };
+    VkPipelineLayoutCreateInfo pli = { .sType=ST_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount=1, .pSetLayouts=&dsl, .pushConstantRangeCount=1, .pPushConstantRanges=&pcr };
+    VkPipelineLayout playout; CK(vkCreatePipelineLayout(g_dev,&pli,0,&playout));
+    VkComputePipelineCreateInfo cpi = { .sType=ST_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage={ .sType=ST_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=module, .pName="main" }, .layout=playout };
+    VkPipeline pipe; CK(vkCreateComputePipelines(g_dev,0,1,&cpi,0,&pipe));
+    VkDescriptorPoolSize psz = { .type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount=2 };
+    VkDescriptorPoolCreateInfo dpi = { .sType=ST_DESCRIPTOR_POOL_CREATE_INFO, .maxSets=1, .poolSizeCount=1, .pPoolSizes=&psz };
+    VkDescriptorPool dpool; CK(vkCreateDescriptorPool(g_dev,&dpi,0,&dpool));
+    VkDescriptorSetAllocateInfo dsai = { .sType=ST_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool=dpool, .descriptorSetCount=1, .pSetLayouts=&dsl };
+    VkDescriptorSet dset; CK(vkAllocateDescriptorSets(g_dev,&dsai,&dset));
+    VkDescriptorBufferInfo dbi = { .buffer=dbuf, .offset=0, .range=dstsz };
+    VkDescriptorBufferInfo sbi = { .buffer=sbuf, .offset=0, .range=srcsz };
+    VkWriteDescriptorSet wr[2] = {
+        { .sType=ST_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi },
+        { .sType=ST_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&sbi } };
+    vkUpdateDescriptorSets(g_dev, 2, wr, 0, 0);
+
+    /* three fill/blend ops covering the whole frame */
+    PushC ops[3]; uint32_t grp[3][2];
+    int nops=0;
+    #define BOP(OP,X,Y,WW,HH,RGBA) do { PushC p={0}; p.op=(OP); p.rgba=(RGBA); \
+        p.img_w=(int)W; p.img_h=(int)H; p.bx=(X); p.by=(Y); p.dispw=(WW); p.disph=(HH); \
+        ops[nops]=p; grp[nops][0]=((WW)+7)/8; grp[nops][1]=((HH)+7)/8; nops++; } while(0)
+    BOP(OP_FILL,       0,0,(int)W,(int)H,     0x0D1220FF);
+    BOP(OP_FILL_ALPHA, 0,0,(int)W,(int)H,     0x00CCFF80);
+    BOP(OP_FILL,       0,0,(int)W,(int)H/2,   0x2B3350FF);
+    #undef BOP
+
+    VkMemoryBarrier mb = { .sType=ST_MEMORY_BARRIER, .srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT };
+    const int N = 60;
+    double gpu_best = 1e30;
+    for (int it=0; it<N; it++) {
+        VkCommandBuffer cb; if (begin_cmd(&cb)) return -1;
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, playout, 0, 1, &dset, 0, 0);
+        for (int i=0;i<nops;i++){
+            vkCmdPushConstants(cb, playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushC), &ops[i]);
+            vkCmdDispatch(cb, grp[i][0], grp[i][1], 1);
+            if (i+1<nops) vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, 0, 0, 0);
+        }
+        double t0=now_ms(); if (submit_wait(cb)) return -1; double ms=now_ms()-t0;
+        if (ms<gpu_best) gpu_best=ms;
+        vkFreeCommandBuffers(g_dev, g_pool, 1, &cb);
+    }
+    /* SW port: same three ops, generic W/H loops. */
+    uint8_t* cbuf = malloc((size_t)W*H*4);
+    double cpu_best = 1e30;
+    for (int it=0; it<N; it++) {
+        double t0=now_ms();
+        for (uint32_t i=0;i<W*H;i++){ uint8_t*p=cbuf+i*4; p[0]=0x0D;p[1]=0x12;p[2]=0x20;p[3]=255; }
+        uint32_t a=0x80, ia=255-a;
+        for (uint32_t i=0;i<W*H;i++){ uint8_t*p=cbuf+i*4;
+            p[0]=(uint8_t)((0x00*a+p[0]*ia)/255); p[1]=(uint8_t)((0xCC*a+p[1]*ia)/255);
+            p[2]=(uint8_t)((0xFF*a+p[2]*ia)/255); p[3]=255; }
+        for (uint32_t i=0;i<W*(H/2);i++){ uint8_t*p=cbuf+i*4; p[0]=0x2B;p[1]=0x33;p[2]=0x50;p[3]=255; }
+        double ms=now_ms()-t0; if (ms<cpu_best) cpu_best=ms;
+    }
+    free(cbuf);
+    printf("VK_DEVICE %s\nRASTERBENCH %ux%u ops=%d (fill+alpha-blend+fill)\n", g_devname, W, H, nops);
+    printf("RASTERBENCH_GPU_MS %.4f\nRASTERBENCH_SW_MS %.4f\nRASTERBENCH_SPEEDUP %.2fx\n",
+           gpu_best, cpu_best, cpu_best/gpu_best);
+    vkDestroyDescriptorPool(g_dev,dpool,0); vkDestroyPipeline(g_dev,pipe,0);
+    vkDestroyPipelineLayout(g_dev,playout,0); vkDestroyDescriptorSetLayout(g_dev,dsl,0);
+    vkDestroyShaderModule(g_dev,module,0);
+    vkDestroyBuffer(g_dev,dbuf,0); vkFreeMemory(g_dev,dmem,0);
+    vkDestroyBuffer(g_dev,sbuf,0); vkFreeMemory(g_dev,smem,0);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s info | clear W H 0xRRGGBBAA OUT.ppm | upload IN.ppm OUT.ppm\n"
-                        "       %s blit IN.ppm SCALE OUT.ppm | present IN.ppm [SCALE] [FRAMES]\n",
+                        "       %s blit IN.ppm SCALE OUT.ppm | raster OUT.ppm | rasterbench W H | present IN.ppm [SCALE] [FRAMES]\n",
                 argv[0], argv[0]);
         return 2;
     }
@@ -936,6 +1454,10 @@ int main(int argc, char** argv) {
         if (!rc) printf("VK_DEVICE %s\nUPLOAD_OK %s\n", g_devname, argv[3]);
     } else if (!strcmp(argv[1], "blit") && argc == 5) {
         rc = mode_blit(argv[2], strtod(argv[3], 0), argv[4]);
+    } else if (!strcmp(argv[1], "raster") && argc == 3) {
+        rc = mode_raster(argv[2]);
+    } else if (!strcmp(argv[1], "rasterbench") && argc == 4) {
+        rc = mode_rasterbench((uint32_t)strtoul(argv[2],0,0), (uint32_t)strtoul(argv[3],0,0));
     } else {
         fprintf(stderr, "bad args\n"); rc = 2;
     }

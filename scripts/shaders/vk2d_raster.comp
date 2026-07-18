@@ -1,0 +1,195 @@
+#version 450
+/*
+ * scripts/shaders/vk2d_raster.comp — GPU rasterizer for the Hamnix vk 2D
+ * primitive vocabulary (lib/vk/vk_2d.ad).
+ *
+ * GPU track: 91% of a game frame (and much of a browser frame) is the CPU
+ * software rasterizer's fill/blit inner loops. This compute shader ports the
+ * EXACT integer semantics of vk_2d.ad's core ops onto the GPU so the RTX 3090
+ * (or Mesa / lavapipe) runs them, while staying BIT-IDENTICAL to the SW path
+ * that the gate asserts golden pixels against.
+ *
+ * WHY COMPUTE (not a graphics pipeline): vk_2d's fills/blits are axis-aligned
+ * integer pixel writes with a source-over blend using integer /255 division.
+ * A graphics-pipeline rasterizer would introduce its own coverage/rounding
+ * rules and could diverge from the SW reference at edges. A compute shader
+ * writing an SSBO reproduces the SW rasterizer's arithmetic verbatim, so the
+ * readback is pixel-identical — the strongest possible proof of the port.
+ *
+ * The dest is one uint per pixel, packed little-endian RGBA8888 exactly like
+ * the vk color image backing (byte0=R, byte1=G, byte2=B, byte3=A), so a raw
+ * readback of the SSBO bytes equals the SW rasterizer's image byte-for-byte.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer Dst { uint dst[]; };
+layout(std430, binding = 1) readonly buffer Src { uint src[]; };
+
+/* Op selector: mirrors the vk2d_raster_* op set. */
+const int OP_FILL       = 0;   /* vk2d_raster_fill_rect        (opaque)     */
+const int OP_FILL_ALPHA = 1;   /* vk2d_raster_fill_rect_alpha  (source-over)*/
+const int OP_BLIT       = 2;   /* vk2d_raster_blit  (nearest, source-over)  */
+const int OP_ROUNDRECT  = 3;   /* vk2d_raster_fill_roundrect   (AA corners) */
+const int OP_LINE       = 4;   /* vk2d_raster_draw_line (Bresenham, opaque) */
+
+layout(push_constant) uniform PC {
+    int  op;
+    int  bx;        /* dispatch origin x (first pixel col)      */
+    int  by;        /* dispatch origin y (first pixel row)      */
+    int  dispw;     /* dispatch width  (clamped op span)        */
+    int  disph;     /* dispatch height                          */
+    int  img_w;
+    int  img_h;
+    uint rgba;      /* 0xRRGGBBAA — R in the HIGH byte (vk_2d convention) */
+    int  px;        /* op x  (rect x  / line x1)                */
+    int  py;        /* op y  (rect y  / line y1)                */
+    int  pw;        /* op w  (rect w  / line x2)                */
+    int  ph;        /* op h  (rect h  / line y2)                */
+    int  rad;       /* roundrect radius (clamped) / line thickness */
+    int  corners;   /* roundrect corner bitmask 1=TL 2=TR 4=BL 8=BR */
+    int  dx;        /* blit dest x   */
+    int  dy;        /* blit dest y   */
+    int  rsx;       /* blit src rect (already clamped by CPU) */
+    int  rsy;
+    int  rsw;
+    int  rsh;
+    int  tw;        /* blit dest span (target w/h) */
+    int  th;
+    int  src_w;
+    int  src_h;
+} pc;
+
+uint pack(uint r, uint g, uint b, uint a) {
+    return r | (g << 8) | (b << 16) | (a << 24);
+}
+
+/* source-over blend of (r,g,b,a) over the pixel at dst index `idx`.
+ * out = (src*a + dst*(255-a)) / 255 ; a==0 no-op ; a==255 opaque.
+ * Byte-identical integer math to vk_2d _vk2d_blend_at. */
+void blend_at(uint idx, uint r, uint g, uint b, uint a) {
+    if (a == 0u) return;
+    if (a >= 255u) { dst[idx] = pack(r, g, b, 255u); return; }
+    uint d  = dst[idx];
+    uint dr = d & 0xFFu;
+    uint dg = (d >> 8)  & 0xFFu;
+    uint db = (d >> 16) & 0xFFu;
+    uint ia = 255u - a;
+    uint or_ = (r * a + dr * ia) / 255u;
+    uint og  = (g * a + dg * ia) / 255u;
+    uint ob  = (b * a + db * ia) / 255u;
+    dst[idx] = pack(or_, og, ob, 255u);
+}
+
+/* floor(sqrt(n)) via integer Newton iteration — vk_2d _vk2d_rr_isqrt twin. */
+uint rr_isqrt(uint n) {
+    if (n == 0u) return 0u;
+    uint x = n;
+    uint y = (x + 1u) / 2u;
+    while (y < x) { x = y; y = (x + n / x) / 2u; }
+    return x;
+}
+
+/* corner coverage 0..255 in half-pixel (2x) integer units — _vk2d_rr_cov. */
+int rr_cov(int cpx, int cpy, int ccx2, int ccy2, int r2) {
+    int dxh = (2 * cpx + 1) - ccx2;
+    int dyh = (2 * cpy + 1) - ccy2;
+    int d2  = dxh * dxh + dyh * dyh;
+    int dh  = int(rr_isqrt(uint(d2)));
+    if (dh <= r2 - 1) return 255;
+    if (dh >= r2 + 1) return 0;
+    return (r2 + 1 - dh) * 255 / 2;
+}
+
+void main() {
+    /* The LINE op is inherently sequential (Bresenham walk); run the whole
+     * walk on a single invocation. Every other op is per-pixel parallel. */
+    if (pc.op == OP_LINE) {
+        if (gl_GlobalInvocationID.x != 0u || gl_GlobalInvocationID.y != 0u) return;
+        uint r = (pc.rgba >> 24) & 0xFFu;
+        uint g = (pc.rgba >> 16) & 0xFFu;
+        uint b = (pc.rgba >> 8)  & 0xFFu;
+        int x1 = pc.px, y1 = pc.py, x2 = pc.pw, y2 = pc.ph;
+        int ddx = abs(x2 - x1);
+        int ddy = abs(y2 - y1);
+        int sx = (x1 > x2) ? -1 : 1;
+        int sy = (y1 > y2) ? -1 : 1;
+        int err = ddx - ddy;
+        int cx = x1, cy = y1;
+        int t = (pc.rad < 1) ? 1 : pc.rad;
+        int guard = 0;
+        while (guard < 100000) {
+            for (int by = 0; by < t; by++) {
+                for (int bxx = 0; bxx < t; bxx++) {
+                    int X = cx + bxx, Y = cy + by;
+                    if (X >= 0 && Y >= 0 && X < pc.img_w && Y < pc.img_h)
+                        dst[uint(Y * pc.img_w + X)] = pack(r, g, b, 255u);
+                }
+            }
+            if (cx == x2 && cy == y2) return;
+            int e2 = err * 2;
+            if (e2 > -ddy) { err -= ddy; cx += sx; }
+            if (e2 <  ddx) { err += ddx; cy += sy; }
+            guard++;
+        }
+        return;
+    }
+
+    uint gx = gl_GlobalInvocationID.x;
+    uint gy = gl_GlobalInvocationID.y;
+    if (gx >= uint(pc.dispw) || gy >= uint(pc.disph)) return;
+    int X = pc.bx + int(gx);
+    int Y = pc.by + int(gy);
+    uint idx = uint(Y * pc.img_w + X);
+
+    uint r = (pc.rgba >> 24) & 0xFFu;
+    uint g = (pc.rgba >> 16) & 0xFFu;
+    uint b = (pc.rgba >> 8)  & 0xFFu;
+    uint a =  pc.rgba        & 0xFFu;
+
+    if (pc.op == OP_FILL) {
+        dst[idx] = pack(r, g, b, 255u);
+        return;
+    }
+    if (pc.op == OP_FILL_ALPHA) {
+        blend_at(idx, r, g, b, a);
+        return;
+    }
+    if (pc.op == OP_BLIT) {
+        int xx = X - pc.dx;
+        int yy = Y - pc.dy;
+        int syi = pc.rsy + (yy * pc.rsh / pc.th);
+        if (syi >= pc.src_h) syi = pc.src_h - 1;
+        int sxi = pc.rsx + (xx * pc.rsw / pc.tw);
+        if (sxi >= pc.src_w) sxi = pc.src_w - 1;
+        uint s  = src[uint(syi * pc.src_w + sxi)];
+        uint sr = s & 0xFFu;
+        uint sg = (s >> 8)  & 0xFFu;
+        uint sb = (s >> 16) & 0xFFu;
+        uint sa = (s >> 24) & 0xFFu;
+        blend_at(idx, sr, sg, sb, sa);
+        return;
+    }
+    if (pc.op == OP_ROUNDRECT) {
+        int x = pc.px, y = pc.py, w = pc.pw, h = pc.ph, rr = pc.rad;
+        int r2   = 2 * rr;
+        int tlx2 = 2 * (x + rr),     tly2 = 2 * (y + rr);
+        int trx2 = 2 * (x + w - rr), try2 = tly2;
+        int blx2 = tlx2,             bly2 = 2 * (y + h - rr);
+        int brx2 = trx2,             bry2 = bly2;
+        int cov = 255;
+        bool in_top   = Y <  y + rr;
+        bool in_bot   = Y >= y + h - rr;
+        bool in_left  = X <  x + rr;
+        bool in_right = X >= x + w - rr;
+        if      (in_top && in_left  && (pc.corners & 1) != 0) cov = rr_cov(X, Y, tlx2, tly2, r2);
+        else if (in_top && in_right && (pc.corners & 2) != 0) cov = rr_cov(X, Y, trx2, try2, r2);
+        else if (in_bot && in_left  && (pc.corners & 4) != 0) cov = rr_cov(X, Y, blx2, bly2, r2);
+        else if (in_bot && in_right && (pc.corners & 8) != 0) cov = rr_cov(X, Y, brx2, bry2, r2);
+        if (cov > 0) {
+            uint ae = a * uint(cov) / 255u;
+            blend_at(idx, r, g, b, ae);
+        }
+        return;
+    }
+}
