@@ -78,10 +78,12 @@ from compiler.parser import (
     BINOP_MUL,
     BINOP_DIV,
     BINOP_IDIV,
+    BINOP_MOD,
     BINOP_EQ,
     BINOP_NEQ,
     BINOP_AND,
     BINOP_OR,
+    BINOP_BIT_AND,
 )
 
 from compiler.ir import (
@@ -152,6 +154,10 @@ opt_constbranch_count: uint32 = 0
 # Phase-8 DCE removes its decl. See the Phase-9 COPY-PROP section at the bottom.
 opt_copyprop_count: uint32 = 0
 
+# Diagnostics: number of parity/divisibility idioms `x - (x/C)*C == 0` (or
+# `x % C == 0`) folded to `(x & (C-1)) == 0` by the pow2-parity pass below.
+opt_paritymod_count: uint32 = 0
+
 # Diagnostics: number of affine array-index expressions strength-reduced to a
 # running induction variable by Phase-3.6 IVSR (one per distinct affine index
 # `arr[i*K + R]` over a counted loop whose IV `i` advances by a constant step,
@@ -175,6 +181,7 @@ def opt_reset_stats():
     opt_ffold_count = 0
     opt_constbranch_count = 0
     opt_copyprop_count = 0
+    opt_paritymod_count = 0
     opt_ivsr_count = 0
 
 
@@ -1332,6 +1339,16 @@ def opt_run(prog: uint32):
     while cur != 0:
         if nd_kind[cur] == ND_FUNCTION:
             opt_copyprop_function(cur)
+        cur = nd_next[cur]
+    # Phase 9.5 — POW2 PARITY / DIVISIBILITY idiom fold. Runs after copyprop (so
+    # any pure-copy quotient rename settled) and BEFORE DCE (so a quotient left
+    # unread once its only consumer was the folded test falls to DCE). Rewrites
+    # `x - (x/C)*C == 0` / `x % C == 0` (pow2 C) to `(x & (C-1)) == 0` — a sign-
+    # independent divisibility test that codegen emits as a single `and`/`test`.
+    cur = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            opt_paritymod_function(cur)
         cur = nd_next[cur]
     # Phase 8 — DEAD CODE ELIMINATION. Runs LAST, on the fully fold+CSE+LICM
     # simplified graph: those passes have minted synthetic temp locals (__cse_/
@@ -4539,3 +4556,358 @@ def cp_block(head: uint32):
 
 def opt_copyprop_function(fn: uint32):
     cp_block(nd_c[fn])
+
+
+# =======================================================================
+# Phase 9.5 — POW2 PARITY / DIVISIBILITY IDIOM  (`x - (x/C)*C == 0` -> `x & (C-1) == 0`)
+# =======================================================================
+#
+# WHAT / WHY
+# ----------
+# The single remaining ALGEBRAIC gap vs gcc -O2 on the compute-bound `collatz`
+# kernel is its parity test. The source (and its C twin) writes the classic
+# split idiom
+#
+#     half = n / 2
+#     if n - half * 2 == 0:            # n is even
+#
+# which the destination-driven backend lowers literally: a signed div (with the
+# round-toward-zero fixup) for `half`, then `imul $2` + `sub` + `cmp $0` for the
+# test — where gcc emits a single `test $1, n` (`and`). This pass recognises the
+# divisibility-by-power-of-2 TEST and rewrites the compared subtree in place to
+# `x & (C-1)`, so codegen emits the `and`/`test`. `half`'s own `n/2` div is left
+# untouched (it still feeds `n = half` in the taken arm).
+#
+# SIGNEDNESS — WHY THIS IS SAFE FOR ANY SIGN (correctness first)
+# --------------------------------------------------------------
+# We ONLY fire inside an `== 0` / `!= 0` comparison, i.e. a DIVISIBILITY test.
+# For a power-of-two C, `x` is divisible by C  <=>  its low log2(C) bits are all
+# zero  <=>  `(x & (C-1)) == 0`, and this holds for EVERY sign of x. It does NOT
+# depend on the sign/rounding of `/`: e.g. for x = -3, C = 2 the idiom value
+# `x - (x/2)*2 = -1` and `x & 1 = 1` DIFFER in value, but both are non-zero, so
+# the `== 0` test agrees. We therefore NEVER lower a signed value-context `x % C`
+# or `x - (x/C)*C` to a bare `&` (C's truncated `%` differs there); a value-
+# context `x % C` is already lowered correctly per-sign by gen_div_const in
+# codegen.ad, so this pass leaves it alone. Only the sign-independent evenness/
+# divisibility TEST is folded — matching the brief's "if signedness is ambiguous,
+# do NOT transform".
+#
+# The recognised shapes (C a power of two, in an `== 0`/`!= 0` context):
+#   * `x % C`                          (dividend x any expr)
+#   * `x - (x / C) * C`  /  `x - C * (x / C)`     (inline div)
+#   * `x - q * C`  /  `x - C * q`  where a preceding straight-line
+#     `q = x / C` (or `q = x // C`) is still live (the collatz shape).
+# --opt-gated (opt_run returns early when disabled) so flag-OFF output is
+# byte-identical.
+
+PM_MAX: uint32 = 256
+pm_qn_off: Array[256, uint32]      # quotient var name off
+pm_qn_len: Array[256, uint32]      # quotient var name len
+pm_dv_off: Array[256, uint32]      # dividend var name off
+pm_dv_len: Array[256, uint32]      # dividend var name len
+pm_k: Array[256, uint32]           # log2(C)
+pm_live: Array[256, uint32]
+pm_n: uint32 = 0
+
+# Result channel for pm_match_idiom: the AND mask (C-1) of the last match.
+pm_match_mask: uint64 = 0
+
+
+def pm_reset():
+    pm_n = 0
+
+
+# Kill every live entry whose quotient OR dividend name equals (off,len). Called
+# when `name` is written: a stored quotient is stale, and a recorded dividend
+# changing invalidates the `q == x/C` relation.
+def pm_kill_name(off: uint32, len_: uint32):
+    i: uint32 = 0
+    while i < pm_n:
+        if pm_live[i] != 0:
+            if ir_name_eq(pm_qn_off[i], pm_qn_len[i], off, len_) != 0:
+                pm_live[i] = 0
+            elif ir_name_eq(pm_dv_off[i], pm_dv_len[i], off, len_) != 0:
+                pm_live[i] = 0
+        i = i + 1
+
+
+# Record `q = x / C`  (k = log2 C).
+def pm_add(qoff: uint32, qlen: uint32, dvoff: uint32, dvlen: uint32, k: uint32):
+    if pm_n >= PM_MAX:
+        return
+    pm_qn_off[pm_n] = qoff
+    pm_qn_len[pm_n] = qlen
+    pm_dv_off[pm_n] = dvoff
+    pm_dv_len[pm_n] = dvlen
+    pm_k[pm_n] = k
+    pm_live[pm_n] = 1
+    pm_n = pm_n + 1
+
+
+# Find a live quotient entry named (off,len); return index+1 or 0.
+def pm_lookup_quot(off: uint32, len_: uint32) -> uint32:
+    i: uint32 = 0
+    while i < pm_n:
+        if pm_live[i] != 0:
+            if ir_name_eq(pm_qn_off[i], pm_qn_len[i], off, len_) != 0:
+                return i + 1
+        i = i + 1
+    return 0
+
+
+def pm_is_pow2(v: uint64) -> uint32:
+    if v == cast[uint64](0):
+        return 0
+    if (v & (v - cast[uint64](1))) == cast[uint64](0):
+        return 1
+    return 0
+
+
+def pm_log2(v: uint64) -> uint32:
+    k: uint32 = 0
+    x: uint64 = v
+    while (x & cast[uint64](1)) == cast[uint64](0):
+        x = x >> 1
+        k = k + 1
+    return k
+
+
+# If `node` is an ND_INT_LIT holding a power of two, return log2+1; else 0.
+def pm_pow2_lit(node: uint32) -> uint32:
+    if node == 0:
+        return 0
+    if nd_kind[node] != ND_INT_LIT:
+        return 0
+    v: uint64 = nd_num[node]
+    if pm_is_pow2(v) == 0:
+        return 0
+    return pm_log2(v) + 1
+
+
+def pm_is_zero_lit(node: uint32) -> uint32:
+    if node == 0:
+        return 0
+    if nd_kind[node] != ND_INT_LIT:
+        return 0
+    if nd_num[node] == cast[uint64](0):
+        return 1
+    return 0
+
+
+# Is `node` a divisibility-by-pow2 test operand? On a match, sets pm_match_mask
+# to (C-1) and returns 1; the matched node's nd_a is guaranteed to already BE the
+# dividend expression, so the caller rewrites in place by flipping the op to a
+# bitwise-AND and replacing nd_b with the mask literal. `use_map` gates the
+# cross-statement `q = x/C` form (unsafe across a loop back-edge, so disabled for
+# loop conditions).
+def pm_match_idiom(node: uint32, use_map: uint32) -> uint32:
+    if node == 0:
+        return 0
+    if nd_kind[node] != ND_BINARY:
+        return 0
+    op: uint32 = nd_aux[node]
+    # ---- direct `x % C` ---------------------------------------------------
+    if op == BINOP_MOD:
+        c: uint32 = pm_pow2_lit(nd_b[node])
+        if c == 0:
+            return 0
+        pm_match_mask = nd_num[nd_b[node]] - cast[uint64](1)
+        return 1
+    # ---- `x - <mul>` idiom ------------------------------------------------
+    if op != BINOP_SUB:
+        return 0
+    xn: uint32 = nd_a[node]
+    mul: uint32 = nd_b[node]
+    if nd_kind[xn] != ND_IDENT:
+        return 0
+    if nd_kind[mul] != ND_BINARY or nd_aux[mul] != BINOP_MUL:
+        return 0
+    # Split the multiply into (V, C) where C is a pow2 literal.
+    ma: uint32 = nd_a[mul]
+    mb: uint32 = nd_b[mul]
+    vnode: uint32 = 0
+    cbits: uint64 = 0
+    if pm_pow2_lit(mb) != 0:
+        vnode = ma
+        cbits = nd_num[mb]
+    elif pm_pow2_lit(ma) != 0:
+        vnode = mb
+        cbits = nd_num[ma]
+    else:
+        return 0
+    k: uint32 = pm_log2(cbits)
+    # form (a): V is a live quotient `V = x / C`, same dividend x, same C.
+    if nd_kind[vnode] == ND_IDENT:
+        if use_map != 0:
+            idx: uint32 = pm_lookup_quot(nd_name_off[vnode], nd_name_len[vnode])
+            if idx != 0:
+                if pm_k[idx - 1] == k:
+                    if ir_name_eq(pm_dv_off[idx - 1], pm_dv_len[idx - 1],
+                                  nd_name_off[xn], nd_name_len[xn]) != 0:
+                        pm_match_mask = cbits - cast[uint64](1)
+                        return 1
+        return 0
+    # form (b): V is an inline `x / C` (or `x // C`) over the same ident x, same C.
+    if nd_kind[vnode] == ND_BINARY:
+        vop: uint32 = nd_aux[vnode]
+        if vop == BINOP_DIV or vop == BINOP_IDIV:
+            dl: uint32 = nd_a[vnode]
+            dr: uint32 = nd_b[vnode]
+            if nd_kind[dl] == ND_IDENT:
+                if pm_pow2_lit(dr) != 0 and nd_num[dr] == cbits:
+                    if ir_name_eq(nd_name_off[dl], nd_name_len[dl],
+                                  nd_name_off[xn], nd_name_len[xn]) != 0:
+                        pm_match_mask = cbits - cast[uint64](1)
+                        return 1
+    return 0
+
+
+# Turn a matched idiom node into `dividend & pm_match_mask` in place. nd_a is
+# already the dividend; flip the op and swap in the mask literal.
+def pm_to_and(node: uint32):
+    nd_aux[node] = BINOP_BIT_AND
+    nd_b[node] = r2i_intlit(pm_match_mask)
+    opt_paritymod_count = opt_paritymod_count + 1
+
+
+# If `cmp` is `E == 0` / `E != 0` and E is a divisibility idiom, fold E to the
+# `& mask` form (sign-independent for a pow2 divisor).
+def pm_try_eqzero(cmp_: uint32, use_map: uint32):
+    a: uint32 = nd_a[cmp_]
+    b: uint32 = nd_b[cmp_]
+    if pm_is_zero_lit(b) != 0:
+        if pm_match_idiom(a, use_map) != 0:
+            pm_to_and(a)
+            return
+    if pm_is_zero_lit(a) != 0:
+        if pm_match_idiom(b, use_map) != 0:
+            pm_to_and(b)
+
+
+# Descend an r-value expression, folding every `<idiom> == 0` / `!= 0` it holds.
+def pm_rewrite_expr(node: uint32, use_map: uint32):
+    if node == 0:
+        return
+    k: uint32 = nd_kind[node]
+    if k == ND_BINARY:
+        op: uint32 = nd_aux[node]
+        if op == BINOP_EQ or op == BINOP_NEQ:
+            pm_try_eqzero(node, use_map)
+    pm_rewrite_expr(nd_a[node], use_map)
+    pm_rewrite_expr(nd_b[node], use_map)
+    pm_rewrite_expr(nd_c[node], use_map)
+    pm_rewrite_expr(nd_d[node], use_map)
+    pm_rewrite_expr(nd_next[node], use_map)
+
+
+# If `rv` is `x / C` / `x // C` with x a bare ident and C a pow2 literal, return
+# log2(C)+1 and write the dividend ident node through *outx; else 0.
+def pm_rvalue_is_pow2_div(rv: uint32, outx: Ptr[uint32]) -> uint32:
+    if rv == 0:
+        return 0
+    if nd_kind[rv] != ND_BINARY:
+        return 0
+    op: uint32 = nd_aux[rv]
+    if op != BINOP_DIV and op != BINOP_IDIV:
+        return 0
+    dl: uint32 = nd_a[rv]
+    dr: uint32 = nd_b[rv]
+    if nd_kind[dl] != ND_IDENT:
+        return 0
+    c: uint32 = pm_pow2_lit(dr)
+    if c == 0:
+        return 0
+    outx[0] = dl
+    return c
+
+
+# Process one straight-line statement: fold idioms in its consumed r-values,
+# then apply its writes to the `q = x/C` map. Returns 1 if the statement ends the
+# straight-line run (a control-flow / opaque barrier), 0 otherwise.
+def pm_process_stmt(s: uint32) -> uint32:
+    k: uint32 = nd_kind[s]
+    if k == ND_VAR_DECL:
+        rv: uint32 = nd_b[s]
+        pm_rewrite_expr(rv, 1)
+        # The decl writes its own name: kill stale entries first.
+        pm_kill_name(nd_name_off[s], nd_name_len[s])
+        xout: uint32 = 0
+        c: uint32 = pm_rvalue_is_pow2_div(rv, &xout)
+        if c != 0:
+            pm_add(nd_name_off[s], nd_name_len[s],
+                   nd_name_off[xout], nd_name_len[xout], c - 1)
+        return 0
+    if k == ND_ASSIGN:
+        tgt: uint32 = nd_a[s]
+        rv2: uint32 = nd_b[s]
+        pm_rewrite_expr(rv2, 1)
+        if nd_kind[tgt] == ND_IDENT:
+            pm_kill_name(nd_name_off[tgt], nd_name_len[tgt])
+            # A plain (non-augmented) assign of a fresh `x / C` records a mapping;
+            # an augmented assign only writes (kill above), never records.
+            if nd_aux[s] == AUGOP_NONE:
+                xout2: uint32 = 0
+                c2: uint32 = pm_rvalue_is_pow2_div(rv2, &xout2)
+                if c2 != 0:
+                    pm_add(nd_name_off[tgt], nd_name_len[tgt],
+                           nd_name_off[xout2], nd_name_len[xout2], c2 - 1)
+            return 0
+        # Store through index/member/deref: rewrite the address sub-expr too;
+        # it cannot rename a scalar local, so the map survives.
+        pm_rewrite_expr(tgt, 1)
+        return 0
+    if k == ND_EXPR_STMT:
+        pm_rewrite_expr(nd_a[s], 1)
+        return 0
+    if k == ND_RETURN:
+        pm_rewrite_expr(nd_a[s], 1)
+        return 0
+    if k == ND_IF:
+        # The primary and each elif condition evaluate in THIS straight-line
+        # context (pure, no intervening store), so the map is valid for them.
+        pm_rewrite_expr(nd_a[s], 1)
+        e: uint32 = nd_c[s]
+        while e != 0:
+            pm_rewrite_expr(nd_a[e], 1)
+            e = nd_next[e]
+        return 1
+    if k == ND_WHILE or k == ND_DO_WHILE:
+        # A loop condition re-runs across the back-edge, where a map entry built
+        # before the loop is stale; only self-contained (inline) idioms are safe.
+        pm_rewrite_expr(nd_a[s], 0)
+        return 1
+    # Any other control-flow / unknown statement ends the run.
+    return 1
+
+
+# Walk a statement chain in maximal straight-line runs, folding idioms and
+# resetting the map at each barrier; recurse into nested blocks (each a fresh
+# run). Mirrors cp_block's structural recursion.
+def pm_block(head: uint32):
+    pm_reset()
+    s: uint32 = head
+    while s != 0:
+        barrier: uint32 = pm_process_stmt(s)
+        if barrier != 0:
+            pm_reset()
+        k: uint32 = nd_kind[s]
+        if k == ND_IF:
+            pm_block(nd_b[s])
+            e: uint32 = nd_c[s]
+            while e != 0:
+                pm_block(nd_b[e])
+                e = nd_next[e]
+            pm_block(nd_d[s])
+        elif k == ND_WHILE:
+            pm_block(nd_b[s])
+        elif k == ND_DO_WHILE:
+            pm_block(nd_b[s])
+        elif k == ND_FOR:
+            pm_block(nd_b[s])
+        elif k == ND_FOR_UNPACK:
+            pm_block(nd_c[s])
+        s = nd_next[s]
+
+
+def opt_paritymod_function(fn: uint32):
+    pm_block(nd_c[fn])

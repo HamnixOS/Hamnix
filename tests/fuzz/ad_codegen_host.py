@@ -299,6 +299,7 @@ def run_dump(src_path: Path, timeout=30, opt=False, split_break=False,
                       irscratchmiss=meta.get("IRSCRATCHMISS", 0),
                       irborrow=meta.get("IRBORROW", 0),
                       strengthred=meta.get("STRENGTHRED", 0),
+                      paritymod=meta.get("PARITYMOD", 0),
                       isel=meta.get("ISEL", 0),
                       aluload=meta.get("ALULOAD", 0),
                       basehoist=meta.get("BASEHOIST", 0),
@@ -686,6 +687,7 @@ class CodegenRun:
         self.callarg = kw.get("callarg", 0)
         self.spineleaf = kw.get("spineleaf", 0)
         self.strengthred = kw.get("strengthred", 0)
+        self.paritymod = kw.get("paritymod", 0)
         self.isel = kw.get("isel", 0)
         self.aluload = kw.get("aluload", 0)
         self.basehoist = kw.get("basehoist", 0)
@@ -758,6 +760,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
     idxsel = getattr(dump, "idxsel", 0)
     spineleaf = getattr(dump, "spineleaf", 0)
     strengthred = getattr(dump, "strengthred", 0)
+    paritymod = getattr(dump, "paritymod", 0)
     isel = getattr(dump, "isel", 0)
     aluload = getattr(dump, "aluload", 0)
     basehoist = getattr(dump, "basehoist", 0)
@@ -782,7 +785,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
                           irreassoc=irreassoc, iremitfloat=iremitfloat, ffold=ffold,
                           destsel=destsel, accsel=accsel, idxstore=idxstore,
                           idxsel=idxsel,
-                          strengthred=strengthred, isel=isel, aluload=aluload,
+                          strengthred=strengthred, paritymod=paritymod, isel=isel, aluload=aluload,
                           basehoist=basehoist,
                           ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, alelide=alelide, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, rcxclean=rcxclean, storeimm=storeimm, imulimm=imulimm, cmpjcc=cmpjcc)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
@@ -792,7 +795,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
                       irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat,
                       destsel=destsel, accsel=accsel, idxstore=idxstore,
                       idxsel=idxsel, spineleaf=spineleaf,
-                      strengthred=strengthred, isel=isel, aluload=aluload,
+                      strengthred=strengthred, paritymod=paritymod, isel=isel, aluload=aluload,
                       basehoist=basehoist, splithoist=splithoist,
                       ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, alelide=alelide, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, rcxclean=rcxclean, storeimm=storeimm, imulimm=imulimm, cmpjcc=cmpjcc)
 
