@@ -299,6 +299,41 @@ string-concatenation meanings (§eval):
 
 A non-positive repeat count yields the empty sequence, as in Python.
 
+### 8c. `lambda` & higher-order functions
+
+`lambda P1, P2, …: EXPR` is an anonymous function value (a first-class
+callable, printed as `<function>`). Params may take defaults exactly like
+`def` (`lambda x, y=10: x + y`). The body is a single expression.
+
+```
+double = lambda x: x * 2
+echo ${ double(21) }                       # 42
+echo ${ (lambda a, b: a + b)(2, 3) }       # 5
+```
+
+The higher-order builtins take a callable — an inline `lambda`, a named
+builtin (`len`), or a variable holding a lambda:
+
+| function | result |
+|---|---|
+| `map(fn, seq)` | list of `fn(elem)` for each element |
+| `filter(fn, seq)` | elements where `fn(elem)` is truthy (`fn` omitted → element truthiness) |
+| `sorted(seq [, key=fn] [, reverse=BOOL])` | new list ordered by `key(elem)` |
+
+```
+echo ${ map(lambda x: x * x, [1,2,3]) }              # 1 4 9
+echo ${ filter(lambda x: x > 1, [1,2,3]) }           # 2 3
+echo ${ sorted([[1,3],[2,1]], key=lambda p: p[1]) }  # [2, 1] [1, 3]
+echo ${ map(len, ["a","bb","ccc"]) }                 # 1 2 3
+```
+
+**Spacing conventions** (shared with the rest of the expression grammar, not
+lambda-specific): binary `+` / `*` are space-flanked (`x * x`, `a + b`) — a
+glued `x*x` is a glob/`+arg` word; and `lambda P: BODY` needs a space after
+the colon. Comparison (`x > 1`) and subscript (`p[1]`) glue fine — a glued
+subscript READ (`p[1]`, `row[0][1]`) is split into an index in expression
+position.
+
 ---
 
 ## 9. The ambient namespace & running a command directly
