@@ -89,19 +89,27 @@ the passing host gates found the following.
   because the document object is not a registered DOM element.)
 - html5-parsing: implied end tags (gate `impliedtags`); quote-aware tag tokenization (gate `tagquote`).
 - dom-core / CSSOM-view: **layout geometry** — `getBoundingClientRect()` (DOMRect: x/y/width/height/
-  top/left/right/bottom), `offsetWidth/Height/Left/Top`, `clientWidth/Height` (+`scrollWidth/Height`),
-  `offsetParent`, and a basic `getComputedStyle(el)` (`display`/`width`/`height`/`color`). An element's
+  top/left/right/bottom), `getClientRects()` (single-fragment DOMRectList), `offsetWidth/Height/Left/Top`,
+  `clientWidth/Height` (+`scrollWidth/Height`), `offsetParent`, and `getComputedStyle(el)`
+  (`display`/`width`/`height`/`color` + `padding`/`margin`/`font-size`/`background-color`). An element's
   box is READ back from the laid-out SEG display list (`layout/box.ad` `seg_x`/`seg_line`/`seg_len`): the
   bounding rect of the segments whose text reconstructs the element's text content, converted to pixels
   (`seg_line*LINE_H`, `seg_len*CELL_W`). Geometry is exposed entirely from `dom/query.ad` (`_el_bbox`/
-  `_new_rect_obj`/`_new_computed_style`/`_set_el_geom_props`) + dispatch in `dom/canvas.ad` (NID_GETRECT/
-  NID_GETCOMPSTYLE) — NO layout re-implementation. A **pre-layout pass** runs before a page's `<script>`s
+  `_new_rect_obj`/`_new_client_rects`/`_new_computed_style`/`_set_el_geom_props`/`_page_scroll_x/y`) +
+  dispatch in `dom/canvas.ad` (NID_GETRECT/NID_GETCLIENTRECTS/NID_GETCOMPSTYLE) — NO layout
+  re-implementation. Rects are **VIEWPORT-RELATIVE**: `_new_rect_obj` subtracts the live page scroll offset
+  (`document.documentElement`/`body` `scrollTop/scrollLeft`, or the `window.scrollX/Y` / `pageX/YOffset`
+  mirrors — largest non-zero wins), so scrolling the viewport shifts the reported rect by exactly the
+  scroll amount (CSSOM-view). A **pre-layout pass** runs before a page's `<script>`s
   (`canvas.ad:_run_scripts`) so scripts observe box metrics; the final relayout is byte-identical, so the
   rendered output is unchanged. Gate `geom` proves the reported box is byte-identical to the SEG-dump
-  coordinates (coordinate cross-check). **Boundary (honest):** a text-less element (pure box / image-only)
-  reports an empty rect; a run merged across inline siblings over-approximates width; getBoundingClientRect
-  returns DOCUMENT coordinates (no viewport-scroll offset); `getComputedStyle` covers the four common
-  properties (display tag-default + inline override, resolved width/height/color) not the full cascade;
+  coordinates (coordinate cross-check); gate `domgeom2` proves the scroll compensation, `getClientRects()`,
+  and the expanded `getComputedStyle` props. **Boundary (honest):** a text-less element (pure box /
+  image-only) reports an empty rect (and `getClientRects()` an empty list); a run merged across inline
+  siblings over-approximates width; scroll is a static offset a script sets (no live scroll source /
+  interactive scroll-following); `getClientRects()` always collapses to one fragment (no multi-line inline
+  box split); `getComputedStyle` resolves eight common properties (tag/UA defaults + inline-style override:
+  padding/margin `0px`, `font-size` initial `16px`, transparent `background-color`) not the full cascade;
   `offsetParent` approximates as the parent element (nearest-positioned-ancestor rule not modelled).
 - dom-core: **document roots** — `document.body` / `document.documentElement` / `document.head` resolve
   to the `<body>`/`<html>`/`<head>` element nodes (`dom/canvas.ad` `_doc_set_el` in `_js_build_document`);
@@ -122,9 +130,13 @@ the passing host gates found the following.
    `dom/query.ad` (`_el_bbox`/`_new_rect_obj`/`_new_computed_style`) + `dom/canvas.ad` (NID_GETRECT/
    NID_GETCOMPSTYLE + pre-layout in `_run_scripts`) + `dom/bindings.ad` (NID constants). See the
    ALREADY-IMPLEMENTED list above for the honest coverage boundary. REMAINING dom-geometry gaps:
-   `scrollTop/scrollLeft` **static** value now DONE (writable data props default 0, `_set_el_geom_props`
-   in `dom/query.ad`; gate `domcore`) — INTERACTIVE scroll-following still deferred; viewport-relative
-   rects (scroll compensation), `getClientRects()`, and a full-cascade `getComputedStyle` remain open.
+   `scrollTop/scrollLeft` **static** value DONE (writable data props default 0, `_set_el_geom_props`
+   in `dom/query.ad`; gate `domcore`); **viewport-relative rects** (scroll compensation via `_page_scroll_x/y`),
+   `getClientRects()` (single-fragment DOMRectList), and an **expanded `getComputedStyle`**
+   (padding/margin/font-size/background-color) now DONE (gate `domgeom2`, `dom/query.ad` +
+   `NID_GETCLIENTRECTS` in `dom/bindings.ad`/`dom/canvas.ad`). Still OPEN: INTERACTIVE scroll-following
+   (no live scroll/viewport source), multi-fragment `getClientRects()` (inline box split across lines), and
+   a full-cascade `getComputedStyle` (resolved values beyond the eight props / UA-sheet inheritance).
 2. `document.body`/`documentElement`/`head` — **DONE (gate `domcore`).** Each resolves to the
    `<body>`/`<html>`/`<head>` element node — the SAME registered object `getElementById`/`querySelector`
    returns, with live `className`/`style`/`classList` — via `_doc_set_el` in `dom/canvas.ad`
