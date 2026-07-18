@@ -23,7 +23,7 @@ From a 14-agent parallel audit (2026-07-16). Dual-target, host-iterated (~40 gat
 | css-grid | 30% | 14 | 5 |
 | html-forms | 30% | 11 | 4 |
 | html5-parsing | 32% | 10 | 3 |
-| dom-events | 32% | 9 | 4 |
+| dom-events | 55% | 5 | 1 |
 | css-values-units | 33% | 12 | 5 |
 | css-box-model | 35% | 10 | 4 |
 | css-selectors | 40% | 1 | 1 |
@@ -58,7 +58,17 @@ the passing host gates found the following.
 - css-grid: `minmax()`, `repeat(auto-fill/auto-fit)` — `cascade.ad:~1608-1744`. Gates: `grid/gridr2/gridspan/gridjustify`.
 - css-selectors: attribute selectors (gate `attrsel`). css-positioning: `position:sticky`/`fixed` parsed (gate `position`).
 - dom: `Element.closest`/`matches` (`query.ad:841`, gate `matches`); arbitrary event types +
-  `Event`/`CustomEvent` ctors + document/window `addEventListener` (gates `events/evttypes`).
+  `Event`/`CustomEvent`/`MouseEvent`/`KeyboardEvent` ctors + listener options (`once`/`capture`) +
+  `removeEventListener` + `stopImmediatePropagation` (gates `events/evttypes/domr6`). dom-events
+  machinery lives ENTIRELY in `lib/web/dom/{canvas,bindings}.ad` — any string event type is
+  interned into the `GEN_KIND` listener table (`bindings.ad:113`) and bubbles the source tree like
+  the 4 legacy kinds; there is NO 4-kind cap (the old worklist claim below is dead).
+- dom-events: **document lifecycle** — `document.addEventListener('DOMContentLoaded'|'load', fn)`
+  now REGISTERS (document records under the `DOC_EL` sentinel, `bindings.ad:113`) and FIRES once,
+  in spec order, after every page `<script>` runs (`canvas.ad` `_fire_document`, called at the tail
+  of `_run_scripts`). `new Event('keydown')` on an element + `new CustomEvent('foo',{detail:42})`
+  round-trip verified. Gate: `domlifecycle`. (Before this, document listeners were silently dropped
+  because the document object is not a registered DOM element.)
 - html5-parsing: implied end tags (gate `impliedtags`); quote-aware tag tokenization (gate `tagquote`).
 - ecmascript: for-of, optional chaining/nullish, Map/Set/WeakMap/WeakSet, accessor get/set, Symbol +
   Symbol.iterator, generators/yield, Object.create/defineProperty, Reflect, Proxy, typed arrays,
@@ -145,10 +155,10 @@ Disjoint dispatch clusters (no write-collision): **JS** (`js/*` only: #13,#14) �
 - **[dom-core] Layout/geometry APIs: getBoundingClientRect(), offsetWidth/Height/Top/Left, clientWidth/Height, scrollTop/scrollHeight/scrollLeft, offsetParent, getComputedStyle()** (missing) — `lib/htmlengine.ad _attach_el_methods (~9433) / _js_build_document (~11276); no NID_* for any geometry op` — None of these exist on element or window/document. Accessing them yields undefined; el.getBoundingClientRect() throws 'not a function'. Sticky headers, dropdown/tooltip positioning, lazy-load, carouse
 - **[dom-core] document.body, document.documentElement, document.head** (missing) — `lib/htmlengine.ad _js_build_document (~11276)` — document exposes getElementById/createElement/querySelector*/forms/title but not body/documentElement/head. Extremely common patterns (document.body.appendChild(...), document.documentElement.classLis
 - **[dom-core] Element.closest(selector) and Element.matches(selector)** (missing) — `lib/htmlengine.ad _attach_el_methods (~9433); would reuse _match_chain / tx tree` — Neither is attached to elements. Event-delegation code (e.target.closest('.item'), if(el.matches(sel))) is ubiquitous in modern sites and frameworks and will throw. The selector/tree machinery (_match
-- **[dom-events] Event type coverage (keydown/keyup/keypress, mousedown/up/move/over/out/enter/leave, focus/blur/focusin/focusout, scroll, resize, load, DOMContentLoaded, wheel, contextmenu, touch)** (missing) — `lib/htmlengine.ad ~10901-10908 (NID_ADDEVT), ~10748-10755 (NID_DISPATCH), evl_kind model at 7543` — addEventListener/removeEventListener/dispatchEvent map the type string to only 4 integer kinds (click/input/change/submit); any other type sets ek=-1 and is dropped, so listeners for keydown, mouseove
-- **[dom-events] document/window addEventListener (event delegation, DOMContentLoaded, load, scroll/resize)** (buggy) — `lib/htmlengine.ad:11295 (document.addEventListener->NID_ADDEVT) and 10898 (_find_el_by_obj(js_this()))` — document.addEventListener is wired to the same NID_ADDEVT handler, but that handler resolves the target via _find_el_by_obj(js_this()); the document object is not a registered DOM element, so el<0 and
-- **[dom-events] Event and CustomEvent constructors (new Event(type,{bubbles,cancelable}), new CustomEvent(type,{detail}))** (missing) — `lib/jsengine.ad ~9508 global setup / lib/htmlengine.ad host object install ~11295` — No Event, CustomEvent, MouseEvent, or KeyboardEvent constructor is defined anywhere. Pages that do el.dispatchEvent(new Event('change')) or new CustomEvent('foo',{detail}) throw/blank because the cons
-- **[dom-events] dispatchEvent of a custom/unknown event type fires no listeners** (buggy) — `lib/htmlengine.ad:10764-10769` — In NID_DISPATCH, when the type does not map to one of the 4 known kinds (dk<0), the code only resets g_prevent_default/g_stop_prop and returns without calling _dispatch_event, so no registered listene
+- ~~**[dom-events] Event type coverage (keydown/keyup/keypress, mousedown/up/move/over/out/enter/leave, focus/blur/focusin/focusout, scroll, resize, load, DOMContentLoaded, wheel, contextmenu, touch)**~~ **RESOLVED** — line numbers dead (pre-refactor). ANY string event type is now interned into the `GEN_KIND` listener table (`lib/web/dom/bindings.ad:113`); `addEventListener`/`removeEventListener`/`dispatchEvent` resolve string types and bubble the source tree exactly like the 4 legacy kinds. No `ek=-1` drop. Gates: `evttypes` (keydown/mouseover/custom fire + no cross-fire + removeEventListener), `domlifecycle`.
+- ~~**[dom-events] document/window addEventListener (DOMContentLoaded, load, scroll/resize)**~~ **RESOLVED (document)** — `document.addEventListener` now registers under the `DOC_EL` sentinel and `DOMContentLoaded`/`load` FIRE once, in spec order, after the page scripts run (`lib/web/dom/canvas.ad` `_fire_document`, tail of `_run_scripts`). Gate: `domlifecycle`. REMAINING: no `window` object yet (`window.addEventListener('load')`/`window.onload`); `scroll`/`resize` never dispatched (no scroll/viewport-resize source in the host render). — next dom-events gap.
+- ~~**[dom-events] Event and CustomEvent constructors (new Event(type,{bubbles,cancelable}), new CustomEvent(type,{detail}))**~~ **RESOLVED** — `Event`/`CustomEvent`/`MouseEvent`/`KeyboardEvent` are global constructors (`_make_event`, `canvas.ad`); reflect type/bubbles/cancelable, CustomEvent `detail`, MouseEvent clientX/Y/button, KeyboardEvent key. Gates: `domr6`, `domlifecycle` (`new CustomEvent('foo',{detail:42})` round-trip).
+- ~~**[dom-events] dispatchEvent of a custom/unknown event type fires no listeners**~~ **RESOLVED** — `NID_DISPATCH` routes an unknown type through `_dispatch_generic`, bubbling the `GEN_KIND` listeners up the source tree. Gates: `evttypes`, `domlifecycle`.
 - **[html-forms] FormData constructor + API (new FormData(form), append/get/entries)** (missing) — `lib/htmlengine.ad (no FormData symbol anywhere; would add a native constructor + methods near the DOM/native-method registration ~9431-9477 and JS-side object plumbing)` — There is no FormData at all. Modern forms submit via fetch(url,{body:new FormData(form)}) or read fields with fd.get(name). Every AJAX/single-page form and multipart upload depends on it; its absence 
 - **[html-forms] HTTP method=POST submission (and enctype)** (missing) — `lib/htmlengine.ad _serialize_form / _do_submit ~12549-12660` — Submission is hardcoded to GET: _serialize_form always builds an action?name=value query string into the nav buffer regardless of the form's method attribute, and enctype is ignored. Login/signup/chec
 - **[html-forms] Constraint Validation API (required, checkValidity(), reportValidity(), setCustomValidity(), validity, willValidate, :invalid, novalidate, pattern, min/max/step, maxlength enforcement)** (missing) — `lib/htmlengine.ad _do_submit ~12640 and element property attach ~9812-9850` — No validation exists. required does not block submission, there is no validity object or checkValidity/reportValidity/setCustomValidity, and maxlength/pattern/min/max/step are not enforced. Many real 
