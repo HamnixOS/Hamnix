@@ -121,24 +121,82 @@ the passing host gates found the following.
 - **[html-forms] `FormData` — DONE (gate `formdata`).** The AJAX form multimap primitive; see live-worklist
   item #10 below. Reuses the URLSearchParams `@@k/@@v` storage + methods; only the constructor is distinct.
 
-**TOP REMAINING W3C GAPS after the 2026-07-18 responsive round (a map for the next round, roughly by
-real-world value — the browser is now broad but NOT "fully W3C-implemented"; these are the concrete holes):**
-1. **[css] CSS transitions + animations (`transition`/`@keyframes`/`animation`) — ABSENT.** Grep-confirmed
-   no support. In a headless single-render engine the animated MID-states have little value, but the
-   FINAL/steady-state and `@keyframes` `to{}` frame do (many pages rely on the end state). Medium value,
-   large surface. (`@keyframes` is already SKIPPED cleanly by the new `_parse_at_rule`.)
-2. **[css] CSS `filter` (`blur`/`brightness`/`grayscale`/`drop-shadow`/…) — ABSENT.** Paint-layer work in
-   `lib/htmlpaint.ad`; medium value (hero images, glassmorphism).
-3. **[ecmascript] RegExp `u`/`v` Unicode mode — ABSENT (byte-oriented VM).** `\u{...}` code-point classes,
+**CSS-ANIMATIONS + matchMedia ROUND 2026-07-18b (two genuinely-missing high-value W3C features, host-verified):**
+- **[css] CSS animations — `@keyframes` + `animation`/`animation-name` STATIC END-STATE (NEW, gate `keyframes`).**
+  The engine had NO animation support: `@keyframes` blocks were brace-skipped by `_parse_at_rule` and
+  `animation`/`animation-name` declarations silently ignored, so an element that settles to a keyframed end
+  colour (fade-in, colour-cycle, reveal) rendered its BASE (pre-animation) state. Now `lib/web/css/cascade.ad`
+  records each `@keyframes NAME { … }` definition's SETTLED frame — the `100%`/`to` keyframe, else the last
+  frame (`_parse_keyframes_body`) — as an INERT end-state pseudo-rule (`_store_keyframe`, tagged `r_kfname` so
+  `_rule_matches` skips it in selector matching) keyed by the interned animation name (`_kf_intern`, a
+  per-`_collect_css` name registry). A rule/element declaring `animation-name: X` or the `animation` shorthand
+  (the name token found by skipping durations/timing-functions/keywords via `_anim_kw_skip`) resolves `X` to a
+  winner (`m_animname`) and `_cascade_match_current` OVERLAYS that keyframe's **background / text-colour /
+  transform / border-colour** onto the cascade winners, regardless of source order (keyframes may be defined
+  after the rule that references them — both are parsed in one `_collect_css` pass, so the id lookup pairs them).
+  Verified HOST-ONLY render-to-PNG (`test_hambrowse_keyframes_host.sh`, fixture `hambrowse_keyframes.html`):
+  a `.fade` box with `animation:fadein …` settles to the `100%` frame `#00aa00` (over its base `#333`), a
+  `.slide` box with `animation-name:reveal` settles to the `to` frame `#cc0000`, a no-animation box keeps its
+  base `#112233`, and a box whose `animation` names a NON-EXISTENT keyframes keeps its base `#445566`.
+  **HONEST SCOPE / LIMITATIONS:** this is the **settled END-STATE** only — the model renders the visually-final
+  frame (equivalent to `animation-fill-mode: forwards` / the end of a finite animation), with **no timeline, no
+  mid-frame interpolation, no live ticking** (a headless single render has no clock — consistent with the whole
+  engine's static-render model). Overlay is limited to the four visually-dominant settle properties
+  (background, colour, transform, border-colour); other keyframed properties (opacity, width/position offsets,
+  per-side margins) are NOT yet overlaid. An `infinite` animation has no true final state — we render its end
+  keyframe anyway (a reasonable static snapshot). `animation-fill-mode`/`-delay`/`-direction` are parsed-and-
+  ignored beyond name resolution. **`transition` is likewise graceful:** a static render already shows the
+  resting/final state a transition animates TO (there is no interactive state change to animate FROM), so
+  `transition` needs no special handling — it is a no-op decl the parser skips, which is the correct rendered
+  result.
+- **[dom] `window.matchMedia(query)` — the JS surface of media queries (NEW, gate `matchmedia`).** SPAs branch
+  on `window.matchMedia('(min-width:…)').matches` for responsive JS (lazy-loading, layout mode,
+  prefers-color-scheme); the engine exposed `@media` in CSS but had NO `matchMedia`, so such a script threw
+  (`matchMedia is not a function`). Now `lib/web/dom/canvas.ad` `_match_media` (NID_MATCHMEDIA, on `window` +
+  the bare global like `getComputedStyle`) returns a **MediaQueryList** whose `.matches` is the LIVE evaluation
+  of the query against the viewport via a new public `he_media_match(p,n)` in `lib/web/css/cascade.ad` — the
+  SAME Media Queries L4 evaluator (`_media_matches`) the stylesheet's `@media` blocks use — plus `.media`
+  (the query text), `.onchange` (null), and `addListener`/`removeListener`/`addEventListener`/
+  `removeEventListener`/`dispatchEvent` (NID_MQL_NOOP). Verified HOST-ONLY (`test_hambrowse_matchmedia_host.sh`,
+  fixture `hambrowse_matchmedia.html`, one page at TWO widths): `(min-width:600px)` is `true` at 880 / `false`
+  at 400, `(max-width:500px)` flips the other way, the `(min-width:600) and (max-width:900)` range matches only
+  at 880, `screen and (min-width:400)` matches, `print`/`prefers-color-scheme:dark` never match (screen/light
+  render), `orientation:landscape` matches at 880×600 but not 400 (portrait), and the listener methods accept
+  args without throwing. **HONEST SCOPE:** the listener registration is a **best-effort no-op** — the headless
+  engine does ONE layout, so a `change` event never fires (there is no live resize/scheme-change source); the
+  MediaQueryList's `.matches` is a correct point-in-time snapshot for the render's viewport.
+
+**TOP REMAINING W3C GAPS after the 2026-07-18b css-animations+matchMedia round (a map for the next round,
+roughly by real-world value — the browser is now broad but NOT "fully W3C-implemented"; these are the concrete
+holes):**
+1. **[css] CSS `filter` (`blur`/`brightness`/`grayscale`/`invert`/`sepia`/`drop-shadow`/…) — ABSENT.** Now the
+   HIGHEST-value CSS hole (hero images, glassmorphism, disabled/reader states). Grep-confirmed no support.
+   Paint-layer work. CONCRETE PLUMBING PATH discovered this round for the next agent: add a `bfill_filter[]`
+   array parallel to `bfill_rgb[]` in `lib/web/layout/box.ad` (set at the two bfill emit sites ~box.ad:1806 /
+   :3364 from a new `m_filter` cascade winner; the reflow in `lib/web/layout/flow.ad` only moves
+   lx/rx/top/bot and never touches rgb, so a filter tag rides along with the box for free), a
+   `he_bfill_filter(i)` accessor, and a post-pass at the END of `htmlpage_render` (`lib/htmlpage.ad`) that,
+   for each bfill with a filter, calls a new `htmlpaint_filter_rect(x,y,w,h,kind,amt)` over the SAME rect the
+   bfill paints (`fx0=he_bfill_lx`, `fy0=row_top[ftop]`, `fy1=row_top[fbot-1]+row_h[fbot-1]`). `htmlpaint`
+   already exposes `htmlpaint_pixel(x,y)` read + `_put_px` write, so grayscale/brightness/invert/sepia/contrast
+   are a per-pixel colour-matrix; `blur` is a box blur (separate neighbour pass). Test via the gfx driver's
+   CLI `PIX x y #hex` pixel sampling. `drop-shadow` is the hard sub-case (defer). Because the post-pass runs
+   after ALL painting, it covers the element's text + children within the box (a true element filter), not
+   just its background.
+2. **[ecmascript] RegExp `u`/`v` Unicode mode — ABSENT (byte-oriented VM).** `\u{...}` code-point classes,
    surrogate handling, `\p{...}` property escapes. Hard (VM rewrite); moderate value.
-4. **[html-forms] specialized input types** (email/number/date/range/color/file) degrade to plain text
+3. **[html-forms] specialized input types** (email/number/date/range/color/file) degrade to plain text
    (live-worklist #15); **`new FormData(formElement)` DOM-scrape** + Blob/File values (the other half of #10).
-5. **[dom] live `matchMedia()` + `MediaQueryList` change events** — the `@media` evaluator is now available
-   to expose a `window.matchMedia(q)` returning `{matches, media, addListener}`; low-risk follow-up.
-6. **[css-grid] named `grid-template-areas`/`grid-area`, `grid-auto-flow:dense`/column, subgrid, >8 tracks**
+4. **[css-grid] named `grid-template-areas`/`grid-area`, `grid-auto-flow:dense`/column, subgrid, >8 tracks**
    (documented OUT-OF-SCOPE items #12/grid entries below) — the remaining grid holes.
-7. **[css-box] true per-side border WIDTH/STYLE** (thick/dashed/dotted) — borders still render a fixed 1px
+5. **[css-box] true per-side border WIDTH/STYLE** (thick/dashed/dotted) — borders still render a fixed 1px
    frame; **margin vs padding box-edge separation** is still summed into one inset (worklist below).
+6. **[css-anim] extend the animation END-STATE overlay** to opacity + width/height + position offsets + margins
+   (currently background/colour/transform/border-colour), and honour `animation-fill-mode` (only `forwards`/
+   `both` should paint the end state; `none`/`backwards` should paint the FROM/`0%` frame). Low risk (the
+   `@keyframes` registry + overlay hook already exist — just widen the copied property set).
+7. **[dom] live `MediaQueryList` change events** — `matchMedia().matches` is now exposed; a `change` event on
+   viewport resize would need the (absent) live resize loop. Low value in the headless model.
 8. **[html5-parsing] adoption-agency / active-formatting-list reconstruction** — misnested inline recovery
    (`<b><i>x</b>y</i>`) is still depth-counted, not spec-correct.
 
