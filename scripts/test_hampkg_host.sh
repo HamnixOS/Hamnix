@@ -77,6 +77,13 @@ assert_grep 'glyphs .*\"available\"'            "available badge rendered"
 # --- live search filter narrows the list ------------------------------------
 assert_grep '^FILT_WEB 2'                       "search \"web\" narrows to 2 packages"
 
+# --- Synaptic-style status HUD: model-derived live counts -------------------
+# full view: 6 listed, 2 installed (hamnix-base + hamnix-hamnotes), 0 upgradable
+assert_grep '^HUD 6 listed   /   2 installed   /   0 upgradable' "status HUD live counts (full view)"
+# the HUD tracks the live search filter: "web" -> only 2 packages listed
+assert_grep '^HUD_WEB 2 listed   /   2 installed   /   0 upgradable' "status HUD reflects search filter (listed=2)"
+assert_grep 'glyphs .*"6 listed'                "HUD rendered into the status bar"
+
 # --- clicking a row selects + populates the detail pane ---------------------
 assert_grep '^HIT 5'                            "row click hit-tests to select"
 assert_grep '^SEL 2'                            "selected package index 2 (hambrowse)"
