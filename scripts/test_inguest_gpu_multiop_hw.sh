@@ -137,6 +137,8 @@ echo "[test_inguest_gpu_multiop_hw] --- guest PER-OP SW/GPU MIXING markers ---"
 grep -a -E "\[vgpu-mix\]" "$GLLOG" | head -20
 echo "[test_inguest_gpu_multiop_hw] --- guest PROPORTIONAL glyph-atlas markers ---"
 grep -a -E "\[vgpu-prop\]" "$GLLOG" | head -20
+echo "[test_inguest_gpu_multiop_hw] --- guest REAL DE-COMPOSITOR-FRAME markers ---"
+grep -a -E "\[vgpu-dew\]" "$GLLOG" | head -20
 echo "[test_inguest_gpu_multiop_hw] --- host GL context (virglrenderer) ---"
 GLVER_LINE="$(grep -a -E "gl_version [0-9]+ - core profile" "$GLLOG" | head -1)"
 GLREND_LINE="$(grep -a -iE "GL_RENDERER=NVIDIA|NVIDIA GeForce RTX|llvmpipe" "$GLLOG" | head -2)"
@@ -220,6 +222,16 @@ if [ "$GREEN" -eq 1 ] && [ "$NV_CTX" -eq 1 ] && [ "$NVIDIA_RESIDENT" -eq 1 ]; th
         echo "[test_inguest_gpu_multiop_hw]   + PROPORTIONAL glyph atlas byte-verified: ${PR#\[vgpu-prop\] PASS: }"
     else
         echo "[test_inguest_gpu_multiop_hw]   (proportional glyph atlas not byte-confirmed this run; see [vgpu-prop] markers)"
+    fi
+    # Culminating step: the REAL DE-compositor window scene (the actual
+    # /dev/wsys/<wid>/scene display list) routed through the GPU frame router.
+    if grep -a -q -E "\[vgpu-dew\] PASS: REAL DE compositor frame rasterized on the RTX 3090" "$GLLOG"; then
+        DE="$(grep -a -oE "\[vgpu-dew\] PASS: REAL DE compositor frame[^\\\\]*" "$GLLOG" | head -1)"
+        echo "[test_inguest_gpu_multiop_hw]   + REAL DE-COMPOSITOR FRAME byte-verified on the 3090: ${DE#\[vgpu-dew\] PASS: }"
+        DEMIX="$(grep -a -oE "\[vgpu-dew\] router rasterized the REAL DE frame:[^\\\\]*" "$GLLOG" | head -1)"
+        [ -n "$DEMIX" ] && echo "[test_inguest_gpu_multiop_hw]     ${DEMIX#\[vgpu-dew\] }"
+    else
+        echo "[test_inguest_gpu_multiop_hw]   (real DE-compositor frame not byte-confirmed this run; see [vgpu-dew] markers)"
     fi
     exit 0
 fi

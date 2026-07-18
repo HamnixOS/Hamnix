@@ -735,6 +735,410 @@ def vkCmd2DGlyph(cb_h: uint64, dx: int32, dy: int32, mw: int32, mh: int32,
 
 
 # ===================================================================
+# DE SCENE DISPLAY-LIST -> VK_OP_2D COMMAND BUFFER (GPU track #182)
+# ===================================================================
+#
+# The Hamnix DE compositor (sys/src/9/port/devwsys.ad `_wsys_rast_line`)
+# rasterizes each window's scene DISPLAY LIST — the exact text grammar an
+# app builds via lib/hamscene.ad and writes to /dev/wsys/<wid>/scene —
+# DIRECTLY into an RGBA cache with its own inner loops. That direct path
+# never produces a VkCommandBuffer, so the GPU frame router (vkQueueSubmit)
+# has never seen a REAL DE frame — only synthetic hand-built op streams.
+#
+# vk_scene_to_cmdbuf() is the seam that closes that gap: it parses the SAME
+# scene grammar the compositor parses and TRANSLATES each primitive into the
+# VK_OP_2D_* op the router already GPU-rasterizes (per-op SW/GPU mixing):
+#     fill / rect    -> vkCmd2DFillRect / vkCmd2DFillRectAlpha
+#     stroke         -> 4x vkCmd2DFillRect (the four edges, as devwsys does)
+#     line           -> vkCmd2DDrawLine (axis-aligned = GPU; diagonal = SW)
+#     roundrect      -> vkCmd2DFillRoundRect (router-ineligible -> SW-composited)
+#     glyphs / text  -> vkCmd2DGlyph per char, 8x16 coverage from the DE
+#                       console font (the compositor's `_wsys_cache_draw_char_w`
+#                       bitmap path) packed into `cov_arena`
+#     image / buffer / clip -> not encodable this round: TALLIED, never faked
+# Emitting the SAME op stream into two command buffers (one submitted with
+# GPU raster ON, one with the SW oracle) lets the caller byte-verify that the
+# router reproduces the vk2d SW rasterizer for a REAL DE frame. Once this is
+# proven, devwsys can call this translator + vkQueueSubmit behind the
+# vk_enable_gpu_raster opt-in instead of its CPU inner loops.
+
+# Scene-op tallies for the LAST vk_scene_to_cmdbuf() call — the honest
+# per-vocabulary breakdown of the translated DE frame.
+_vk_scene_fills:  uint64 = 0        # fill/rect/stroke-edge FILL_RECT[_ALPHA] ops
+_vk_scene_lines:  uint64 = 0        # DRAW_LINE ops
+_vk_scene_glyphs: uint64 = 0        # GLYPH ops (one per char)
+_vk_scene_rrects: uint64 = 0        # FILL_ROUNDRECT ops (router SW-composites)
+_vk_scene_unenc:  uint64 = 0        # scene verbs not encodable this round
+_vk_scene_cov:    uint64 = 0        # coverage bytes consumed from the arena
+
+
+def vk_scene_ops_fills() -> uint64:
+    return _vk_scene_fills
+
+
+def vk_scene_ops_lines() -> uint64:
+    return _vk_scene_lines
+
+
+def vk_scene_ops_glyphs() -> uint64:
+    return _vk_scene_glyphs
+
+
+def vk_scene_ops_rrects() -> uint64:
+    return _vk_scene_rrects
+
+
+def vk_scene_ops_unenc() -> uint64:
+    return _vk_scene_unenc
+
+
+def _vk_sc_is_ws(c: uint8) -> int32:
+    if c == 32 or c == 9 or c == 10 or c == 13:
+        return 1
+    return 0
+
+
+def _vk_sc_skip_ws(buf: Ptr[uint8], pos: uint64, count: uint64) -> uint64:
+    p: uint64 = pos
+    while p < count and _vk_sc_is_ws(buf[p]) == 1:
+        p = p + 1
+    return p
+
+
+def _vk_sc_token_end(buf: Ptr[uint8], pos: uint64, count: uint64) -> uint64:
+    p: uint64 = pos
+    while p < count and _vk_sc_is_ws(buf[p]) == 0:
+        p = p + 1
+    return p
+
+
+def _vk_sc_word_eq(buf: Ptr[uint8], start: uint64, end: uint64,
+                   word: Ptr[uint8]) -> int32:
+    wl: uint64 = 0
+    while word[wl] != 0:
+        wl = wl + 1
+    if end - start != wl:
+        return 0
+    i: uint64 = 0
+    while i < wl:
+        if buf[start + i] != word[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _vk_sc_hex_nibble(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return cast[int32](c) - 48
+    if c >= 97 and c <= 102:
+        return cast[int32](c) - 97 + 10
+    if c >= 65 and c <= 70:
+        return cast[int32](c) - 65 + 10
+    return -1
+
+
+def _vk_sc_next_int(buf: Ptr[uint8], pp: Ptr[uint64], count: uint64,
+                    out: Ptr[int64]) -> int32:
+    # Skip ws, parse a signed decimal token, advance *pp. Returns 1 ok.
+    p: uint64 = _vk_sc_skip_ws(buf, pp[0], count)
+    s: uint64 = p
+    p = _vk_sc_token_end(buf, p, count)
+    e: uint64 = p
+    pp[0] = p
+    if s == e:
+        return 0
+    neg: int32 = 0
+    j: uint64 = s
+    if buf[j] == 45:                              # '-'
+        neg = 1
+        j = j + 1
+    if j >= e:
+        return 0
+    v: int64 = 0
+    while j < e:
+        d: uint8 = buf[j]
+        if d < 48 or d > 57:
+            return 0
+        v = v * 10 + cast[int64](cast[int32](d) - 48)
+        j = j + 1
+    if neg != 0:
+        v = 0 - v
+    out[0] = v
+    return 1
+
+
+def _vk_sc_parse_color(buf: Ptr[uint8], start: uint64, end: uint64,
+                       out_rgba: Ptr[uint32]) -> int32:
+    # Parse #RRGGBB or #RRGGBBAA at buf[start..end) into 0xRRGGBBAA. Returns 1.
+    if start >= end or buf[start] != 35:          # '#'
+        return 0
+    nlen: uint64 = end - start - 1
+    if nlen != 6 and nlen != 8:
+        return 0
+    p: uint64 = start + 1
+    hr: int32 = _vk_sc_hex_nibble(buf[p]) * 16 + _vk_sc_hex_nibble(buf[p + 1])
+    hg: int32 = _vk_sc_hex_nibble(buf[p + 2]) * 16 + _vk_sc_hex_nibble(buf[p + 3])
+    hb: int32 = _vk_sc_hex_nibble(buf[p + 4]) * 16 + _vk_sc_hex_nibble(buf[p + 5])
+    if hr < 0 or hg < 0 or hb < 0:
+        return 0
+    ha: int32 = 255
+    if nlen == 8:
+        ha = _vk_sc_hex_nibble(buf[p + 6]) * 16 + _vk_sc_hex_nibble(buf[p + 7])
+        if ha < 0:
+            return 0
+    out_rgba[0] = (cast[uint32](hr) << 24) | (cast[uint32](hg) << 16) \
+        | (cast[uint32](hb) << 8) | cast[uint32](ha)
+    return 1
+
+
+def _vk_sc_emit_glyph(cb: uint64, ch: int32, dx: int32, dy: int32,
+                      ink_rgba: uint32, font_base: uint64,
+                      cov_arena: uint64, cov_cap: uint64) -> int32:
+    # Build the 8x16 coverage cell for `ch` from the DE console font (255 where
+    # the bitmap bit is set, 0 elsewhere — the compositor's _wsys_cache_draw_char_w
+    # semantics) into the arena, then record ONE VK_OP_2D_GLYPH stamping it at
+    # (dx,dy) in `ink_rgba`. Returns 1 if a glyph op was emitted, 0 if it could
+    # not be encoded (no font / arena exhausted).
+    if font_base == 0:
+        return 0
+    if _vk_scene_cov + 128 > cov_cap:
+        return 0
+    c: int32 = ch
+    if c < 0 or c >= 128:
+        c = 32
+    gbase: uint64 = font_base + cast[uint64](c) * 16
+    cell: uint64 = cov_arena + _vk_scene_cov
+    row: uint64 = 0
+    while row < 16:
+        bits: uint8 = cast[Ptr[uint8]](gbase + row)[0]
+        col: uint64 = 0
+        while col < 8:
+            mask: uint8 = cast[uint8](0x80 >> col)
+            cov: uint8 = 0
+            if (bits & mask) != 0:
+                cov = 255
+            cast[Ptr[uint8]](cell + row * 8 + col)[0] = cov
+            col = col + 1
+        row = row + 1
+    _vk_scene_cov = _vk_scene_cov + 128
+    vkCmd2DGlyph(cb, dx, dy, 8, 16, cell, ink_rgba)
+    return 1
+
+
+def _vk_sc_line(cb: uint64, buf: Ptr[uint8], ls: uint64, le: uint64,
+                font_base: uint64, cov_arena: uint64, cov_cap: uint64):
+    # Translate ONE scene line buf[ls..le) into VK_OP_2D op(s) recorded in `cb`.
+    p: uint64 = _vk_sc_skip_ws(buf, ls, le)
+    if p >= le:
+        return
+    vs: uint64 = p
+    p = _vk_sc_token_end(buf, p, le)
+    ve: uint64 = p
+    if ve - vs >= 1 and buf[vs] == 35:            # '#' comment
+        return
+
+    if _vk_sc_word_eq(buf, vs, ve, "fill") == 1 \
+            or _vk_sc_word_eq(buf, vs, ve, "rect") == 1:
+        fx: int64 = 0
+        fy: int64 = 0
+        fw: int64 = 0
+        fh: int64 = 0
+        if _vk_sc_next_int(buf, &p, le, &fx) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &fy) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &fw) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &fh) == 0:
+            return
+        cp: uint64 = _vk_sc_skip_ws(buf, p, le)
+        ce: uint64 = _vk_sc_token_end(buf, cp, le)
+        rgba: uint32 = 0
+        if _vk_sc_parse_color(buf, cp, ce, &rgba) == 0:
+            return
+        if (rgba & 0xFF) >= 255:
+            vkCmd2DFillRect(cb, cast[int32](fx), cast[int32](fy),
+                            cast[int32](fw), cast[int32](fh), rgba)
+        else:
+            vkCmd2DFillRectAlpha(cb, cast[int32](fx), cast[int32](fy),
+                                 cast[int32](fw), cast[int32](fh), rgba)
+        _vk_scene_fills = _vk_scene_fills + 1
+        return
+
+    if _vk_sc_word_eq(buf, vs, ve, "stroke") == 1:
+        sx: int64 = 0
+        sy: int64 = 0
+        sw: int64 = 0
+        sh: int64 = 0
+        st: int64 = 0
+        if _vk_sc_next_int(buf, &p, le, &sx) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &sy) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &sw) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &sh) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &st) == 0:
+            return
+        cp2: uint64 = _vk_sc_skip_ws(buf, p, le)
+        ce2: uint64 = _vk_sc_token_end(buf, cp2, le)
+        rgba2: uint32 = 0
+        if _vk_sc_parse_color(buf, cp2, ce2, &rgba2) == 0:
+            return
+        if st < 1:
+            st = 1
+        # Four edges of thickness st (same decomposition as devwsys).
+        vkCmd2DFillRect(cb, cast[int32](sx), cast[int32](sy),
+                        cast[int32](sw), cast[int32](st), rgba2)
+        vkCmd2DFillRect(cb, cast[int32](sx), cast[int32](sy + sh - st),
+                        cast[int32](sw), cast[int32](st), rgba2)
+        vkCmd2DFillRect(cb, cast[int32](sx), cast[int32](sy),
+                        cast[int32](st), cast[int32](sh), rgba2)
+        vkCmd2DFillRect(cb, cast[int32](sx + sw - st), cast[int32](sy),
+                        cast[int32](st), cast[int32](sh), rgba2)
+        _vk_scene_fills = _vk_scene_fills + 4
+        return
+
+    if _vk_sc_word_eq(buf, vs, ve, "roundrect") == 1:
+        rx: int64 = 0
+        ry: int64 = 0
+        rw: int64 = 0
+        rh: int64 = 0
+        rr: int64 = 0
+        if _vk_sc_next_int(buf, &p, le, &rx) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &ry) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &rw) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &rh) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &rr) == 0:
+            return
+        rcp: uint64 = _vk_sc_skip_ws(buf, p, le)
+        rce: uint64 = _vk_sc_token_end(buf, rcp, le)
+        rgba3: uint32 = 0
+        if _vk_sc_parse_color(buf, rcp, rce, &rgba3) == 0:
+            return
+        p = rce
+        corners: int64 = 15
+        _vk_sc_next_int(buf, &p, le, &corners)
+        vkCmd2DFillRoundRect(cb, cast[int32](rx), cast[int32](ry),
+                             cast[int32](rw), cast[int32](rh),
+                             cast[int32](rr), cast[int32](corners), rgba3)
+        _vk_scene_rrects = _vk_scene_rrects + 1
+        return
+
+    if _vk_sc_word_eq(buf, vs, ve, "line") == 1:
+        x1: int64 = 0
+        y1: int64 = 0
+        x2: int64 = 0
+        y2: int64 = 0
+        lt: int64 = 0
+        if _vk_sc_next_int(buf, &p, le, &x1) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &y1) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &x2) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &y2) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &lt) == 0:
+            return
+        lcp: uint64 = _vk_sc_skip_ws(buf, p, le)
+        lce: uint64 = _vk_sc_token_end(buf, lcp, le)
+        rgba4: uint32 = 0
+        if _vk_sc_parse_color(buf, lcp, lce, &rgba4) == 0:
+            return
+        if lt < 1:
+            lt = 1
+        vkCmd2DDrawLine(cb, cast[int32](x1), cast[int32](y1),
+                        cast[int32](x2), cast[int32](y2),
+                        cast[int32](lt), rgba4)
+        _vk_scene_lines = _vk_scene_lines + 1
+        return
+
+    is_text: int32 = _vk_sc_word_eq(buf, vs, ve, "text")
+    is_glyphs: int32 = _vk_sc_word_eq(buf, vs, ve, "glyphs")
+    if is_text == 1 or is_glyphs == 1:
+        tx: int64 = 0
+        ty: int64 = 0
+        if _vk_sc_next_int(buf, &p, le, &tx) == 0:
+            return
+        if _vk_sc_next_int(buf, &p, le, &ty) == 0:
+            return
+        q: uint64 = _vk_sc_skip_ws(buf, p, le)
+        if q >= le or buf[q] != 34:               # '"'
+            return
+        q = q + 1
+        ss: uint64 = q
+        while q < le and buf[q] != 34:
+            q = q + 1
+        se: uint64 = q
+        if q >= le:
+            return
+        q = q + 1
+        cp5: uint64 = _vk_sc_skip_ws(buf, q, le)
+        ce5: uint64 = _vk_sc_token_end(buf, cp5, le)
+        rgba5: uint32 = 0
+        if _vk_sc_parse_color(buf, cp5, ce5, &rgba5) == 0:
+            return
+        # glyphs is cell-top-anchored (top = y). Route each char as an 8x16
+        # coverage-cell GLYPH op. `text` (AA proportional TTF in the DE) is not
+        # reproduced by the 8x16 font, so it is TALLIED as unencodable this round.
+        if is_text == 1:
+            si0: uint64 = ss
+            while si0 < se:
+                _vk_scene_unenc = _vk_scene_unenc + 1
+                si0 = si0 + 1
+            return
+        cx: int64 = tx
+        si: uint64 = ss
+        while si < se:
+            if _vk_sc_emit_glyph(cb, cast[int32](buf[si]), cast[int32](cx),
+                                 cast[int32](ty), rgba5, font_base,
+                                 cov_arena, cov_cap) == 1:
+                _vk_scene_glyphs = _vk_scene_glyphs + 1
+            else:
+                _vk_scene_unenc = _vk_scene_unenc + 1
+            cx = cx + 8
+            si = si + 1
+        return
+
+    # image / buffer / clip and any other verb: not encodable this round.
+    _vk_scene_unenc = _vk_scene_unenc + 1
+
+
+def vk_scene_to_cmdbuf(cb: uint64, img: uint64, clear_rgba: uint32,
+                       scene: Ptr[uint8], slen: uint64, font_base: uint64,
+                       cov_arena: uint64, cov_cap: uint64) -> int32:
+    # Translate a DE scene DISPLAY LIST (the /dev/wsys/<wid>/scene grammar) into
+    # a VK_OP_2D command buffer targeting `img`, clearing to `clear_rgba`. Glyph
+    # coverage cells are packed into cov_arena (cov_cap bytes) from the 8x16 DE
+    # console font at font_base (fb_font_glyph_addr(); 0 => glyphs tallied
+    # unencodable). Resets + fills the _vk_scene_* op tallies. Returns VK_SUCCESS.
+    _vk_scene_fills = 0
+    _vk_scene_lines = 0
+    _vk_scene_glyphs = 0
+    _vk_scene_rrects = 0
+    _vk_scene_unenc = 0
+    _vk_scene_cov = 0
+    vkCmdBeginRenderPass(cb, img, 0, 1, clear_rgba, 0)
+    i: uint64 = 0
+    while i < slen:
+        ls: uint64 = i
+        while i < slen and scene[i] != 10:
+            i = i + 1
+        le: uint64 = i
+        if i < slen:
+            i = i + 1
+        _vk_sc_line(cb, scene, ls, le, font_base, cov_arena, cov_cap)
+    vkCmdEndRenderPass(cb)
+    return VK_SUCCESS
+
+
+# ===================================================================
 # BACKEND SELECTION (Phase D — SW default / virtio-gpu opt-in)
 # ===================================================================
 #
