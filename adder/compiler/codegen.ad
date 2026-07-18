@@ -408,6 +408,19 @@ opt_immfold_count: uint32 = 0
 # sized/sign-extending load is a different movzx/movsx opcode, not a plain movq).
 # 0 with --opt OFF (isel-gated) -> the default build stays byte-identical to the seed.
 opt_fuseload_count: uint32 = 0
+# FUSED STORE-IMMEDIATE (--opt, P1 store-immediate lever): each `arr[i] = <int
+# const>` whose element address gen_index_addr materialised as a trailing direct-SIB
+# `lea …,%rax` (the same fusable shape gen_index_load folds) is collapsed from the
+# const-materialize + value-shuffle + `lea; mov %rcx,(%rax)` chain into ONE
+# `movb/movl/movq $imm, disp(%base,%ireg,s)` — the constant is baked into the store's
+# immediate and written straight to the element, exactly what gcc emits. Value-
+# identical: `lea`(0x8D) and `mov r/m,imm` (0xC6 byte / 0xC7 dword+qword, /0) share
+# the identical ModRM/SIB/disp bytes (the lea's dest reg field %rax==000 is the /0
+# extension); the fold patches the opcode (+ clears REX.W for the sub-8 widths) and
+# appends the immediate after the trailing lea. Only 1/4/8-byte non-float elements
+# whose constant fits the store-immediate width (es==8 needs a sign-extended imm32).
+# 0 with --opt OFF (isel-gated) -> the default build stays byte-identical to the seed.
+opt_storeimm_count: uint32 = 0
 # Recorded by gen_index_addr's fusable SIB-lea isel arms for gen_index_load's
 # opcode-patch fold: g_fuse_lea_at = byte offset of the trailing lea's OPCODE
 # (0x8D) in code[]; g_fuse_lea_end = code_len immediately AFTER that lea. The fold
@@ -452,6 +465,7 @@ def isel_reset_stats():
     opt_rcxclean_count = 0
     opt_immfold_count = 0
     opt_fuseload_count = 0
+    opt_storeimm_count = 0
 
 
 # -----------------------------------------------------------------------
@@ -9207,6 +9221,20 @@ def cg_set_rcxclean_break(v: uint32):
     cg_rcxclean_break = v
 
 
+# Deliberate-break switch for the fused store-immediate guard: when armed,
+# try_store_imm_index SKIPS the isel_is_enabled() gate, so the store-immediate fold
+# fires even on the DEFAULT (--opt-OFF) build — which the frozen seed emits as a
+# const-materialize + push/pop store. That breaks the byte-identical-to-seed
+# invariant (STOREIMM_off becomes > 0, the OFF disasm gains a `mov $imm,(mem)` the
+# seed never emits) — the guard/objdiff MUST catch it. Default 0 (sound); NEVER set
+# on a real compile — proves the isel gate is what keeps the fold byte-inert OFF.
+cg_storeimm_break: uint32 = 0
+
+
+def cg_set_storeimm_break(v: uint32):
+    cg_storeimm_break = v
+
+
 # Clear the hoist cache (function entry/exit). Releases the held scratch regs'
 # busy bits so the next function's pool starts clean. A hole-borrow entry holds a
 # regalloc-owned register (not an IR scratch), so it is NOT ir_scratch_released
@@ -13215,12 +13243,139 @@ def gen_stmt(node: uint32):
 #     3. (augmented only) reload value, load *addr, combine)
 #   Then pop addr into a scratch, pop value into %rcx, store %rcx -> (addr).
 # We keep it simple by computing the address LAST and storing immediately.
+# P1 store-immediate lever — COMPILE-TIME CONSTANT store value for `arr[i] = <int
+# const>`. Returns 1 and writes *out with the 64-bit value the seed's gen_expr(rhs)
+# would materialize (so the low `es` bytes of *out are EXACTLY the bytes the seed's
+# emit_store_mem_rcx(es) stores), 0 if the RHS is not a store-immediate-able integer
+# constant. Two accepted shapes, both value-identical to the seed's full evaluation:
+#   (a) a bare integer literal (or its negation): const_int_value gives the exact
+#       64-bit value the seed materializes; the store truncates to `es` either way.
+#   (b) an INTEGER-cast-wrapped small constant `cast[T](V)` with 0 <= V <= 127:
+#       every integer cast maps V -> V (V fits int8/uint8 and every wider type, and
+#       is non-negative so sign/zero extension agree), so the fully-cast value is V
+#       and the low `es` bytes are V. A FLOAT cast anywhere changes the representation
+#       -> refuse. Covers sieve's pervasive `flags[j] = cast[uint8](1)`. Mirrors
+#       cmp_rhs_const_imm case (b). The caller applies the per-width feasibility gate
+#       (es==8 needs a sign-extended imm32; es==1/4 write the low byte/dword exactly).
+def store_rhs_const_val(rhs: uint32, out: Ptr[int64]) -> uint32:
+    if rhs == 0:
+        return 0
+    v0: int64 = 0
+    if const_int_value(rhs, &v0) != 0:
+        out[0] = v0
+        return 1
+    if nd_kind[rhs] != ND_CAST:
+        return 0
+    cur: uint32 = rhs
+    while cur != 0 and nd_kind[cur] == ND_CAST:
+        tnode: uint32 = nd_a[cur]
+        if type_float_width(tnode) != 0:
+            return 0
+        if expr_float_width(nd_b[cur]) != 0:
+            return 0
+        cur = nd_b[cur]
+    vi: int64 = 0
+    if const_int_value(cur, &vi) == 0:
+        return 0
+    if vi < 0:
+        return 0
+    if vi > 127:
+        return 0
+    out[0] = vi
+    return 1
+
+
+# P1 store-immediate lever — `arr[i] = <int const>` emitted as ONE store-immediate.
+# Returns 1 if it emitted the whole store, 0 to fall back to the legacy path. When
+# the RHS is a compile-time integer constant that fits the store-immediate width AND
+# the element address is a direct-SIB lea (the fusable shape gen_index_load folds),
+# gen_index_addr's trailing `lea …,%rax` is patched IN PLACE into a store-immediate:
+# `lea`(0x8D) and `mov r/m,imm` (0xC6 byte / 0xC7 dword+qword, /0) share the identical
+# ModRM/SIB/disp bytes — the lea's dest reg field %rax(000) IS the /0 opcode extension
+# — so only the opcode (+ REX.W for the sub-8 widths) changes and the immediate is
+# appended after the (trailing) lea. This eliminates the const-materialize, the movzx,
+# AND the value shuffle the legacy `mov $c,%rax; …; mov %rcx,(%rax)` chain paid per
+# iteration (sieve's `flags[j] = cast[uint8](1)`, const array fills). CORRECTNESS: a
+# constant RHS has no side effect and reads no memory, so computing it at compile time
+# and emitting it AFTER the address is value-identical to the seed's RHS-then-address
+# order; the immediate reproduces exactly the low `es` bytes the seed stores. OFF ->
+# isel_is_enabled()==0 -> returns 0, byte-identical to the seed.
+def try_store_imm_index(node: uint32, es: uint32) -> uint32:
+    # Deliberate-break (guard only): skip the isel gate so the fold fires even OFF ->
+    # a byte-inertness break the objdiff/guard MUST catch.
+    if cg_storeimm_break == 0:
+        if isel_is_enabled() == 0:
+            return 0
+    tgt: uint32 = nd_a[node]
+    rhs: uint32 = nd_b[node]
+    # Float element -> an integer store-immediate would miscompile the bits.
+    if index_elem_float(tgt) != 0:
+        return 0
+    # Only byte / dword / qword store-immediate forms. movw ($imm16) needs a 0x66
+    # operand-size prefix INSERTED before the REX — a length change the in-place lea
+    # patch cannot do — so a 2-byte element falls to the legacy path.
+    if es != 1 and es != 4 and es != 8:
+        return 0
+    val: int64 = 0
+    if store_rhs_const_val(rhs, &val) == 0:
+        return 0
+    # es==8: the movq store-immediate (C7 /0) is an imm32 SIGN-EXTENDED to 64 bits,
+    # so it can only reproduce a value that fits a signed imm32. es==1/4 write the
+    # low byte/dword exactly, always representable.
+    if es == 8:
+        if sel_imm_fits_i32(cast[uint64](val)) == 0:
+            return 0
+    # The address MUST be a direct-SIB lea (the fusable-lea shape). This is the exact
+    # gen_index_addr use_direct predicate, encapsulated by index_store_addr_rcx_clean.
+    if index_store_addr_rcx_clean(tgt) == 0:
+        return 0
+    g_fuse_lea_at = 0
+    g_fuse_lea_end = 0
+    gen_index_addr(tgt)                       # &arr[i] -> %rax (direct SIB, trailing lea)
+    # Fold only when the recorded SIB-lea is the LAST instruction emitted and its
+    # opcode is still the expected `lea` byte (a defensive mirror of gen_index_load).
+    if g_fuse_lea_end == code_len and g_fuse_lea_at != 0 and \
+       cast[uint32](code[g_fuse_lea_at]) == 0x8D:
+        if es == 8:
+            code[g_fuse_lea_at] = cast[uint8](0xC7)   # movq $imm32, r/m64  (/0)
+            emit_imm32(cast[uint64](val))
+        elif es == 4:
+            code[g_fuse_lea_at] = cast[uint8](0xC7)   # movl $imm32, r/m32  (/0)
+            # clear REX.W (64->32-bit operand); REX.X/REX.B (extended index/base) kept.
+            code[g_fuse_lea_at - 1] = cast[uint8](cast[uint32](code[g_fuse_lea_at - 1]) & 0xF7)
+            emit_imm32(cast[uint64](val))
+        else:
+            code[g_fuse_lea_at] = cast[uint8](0xC6)   # movb $imm8, r/m8  (/0)
+            code[g_fuse_lea_at - 1] = cast[uint8](cast[uint32](code[g_fuse_lea_at - 1]) & 0xF7)
+            emit_b(cast[uint32](val) & 255)
+        g_fuse_lea_at = 0
+        g_fuse_lea_end = 0
+        opt_storeimm_count = opt_storeimm_count + 1
+        return 1
+    # DEFENSIVE: the direct-SIB gate guarantees a trailing fusable lea, but if some
+    # future gen_index_addr shape emitted the address differently, the patch would be
+    # unsafe. The address is already in %rax; complete a correct plain store by
+    # materializing the constant into %rcx (never corrupts the emitted address).
+    g_fuse_lea_at = 0
+    g_fuse_lea_end = 0
+    emit_mov_imm_rax_to_rcx(cast[uint64](val))   # mov $imm, %rcx
+    emit_store_mem_rcx(es)                        # store %rcx -> (%rax), sized
+    opt_storeimm_count = opt_storeimm_count + 1
+    return 1
+
+
 def gen_assign_index(node: uint32):
     tgt: uint32 = nd_a[node]            # ND_INDEX
     es: uint32 = index_elem_size(tgt)
     aug: uint32 = nd_aux[node]
 
     if aug == AUGOP_NONE:
+        # P1 store-immediate lever: `arr[i] = <int const>` -> ONE store-immediate
+        # (const baked into the store's immediate, no materialize / value shuffle /
+        # separate lea). Falls back to the selectors / legacy path below. OFF ->
+        # isel-gated to 0, byte-identical.
+        if try_store_imm_index(node, es) != 0:
+            return
         # P1 Phase 3: route `arr[i] = <pure-arith binop>` through the dest-driven
         # selector — RHS computed into a held register (no value push/pop), then
         # addressed + stored. Falls back to the legacy value-at-a-time path.
