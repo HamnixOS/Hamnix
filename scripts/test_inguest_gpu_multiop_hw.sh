@@ -117,7 +117,7 @@ for _ in $(seq 1 "$((BOOT_WAIT * 4))"); do
         NVIDIA_RESIDENT=1
         echo "$smi" >> "$SMILOG"
     fi
-    grep -a -q -E "\[vgpu-blend\] (PASS|SKIP: host GL accepted)" "$GLLOG" && break
+    grep -a -q -E "\[vgpu-cov\] (PASS|SKIP|INCONCLUSIVE)" "$GLLOG" && break
     grep -a -q -E "\[vgpu-multiop\] FAIL" "$GLLOG" && break
     kill -0 "$QEMU_PID" 2>/dev/null || break
     sleep 0.25
@@ -129,6 +129,8 @@ echo "[test_inguest_gpu_multiop_hw] --- guest multi-op markers ---"
 grep -a -E "\[vgpu-multiop\]|\[vgpu-virgl\] (PASS|SKIP)" "$GLLOG" | head -30
 echo "[test_inguest_gpu_multiop_hw] --- guest translucent-blend markers ---"
 grep -a -E "\[vgpu-blend\]" "$GLLOG" | head -20
+echo "[test_inguest_gpu_multiop_hw] --- guest AA-coverage-mask (glyph text) markers ---"
+grep -a -E "\[vgpu-cov\]" "$GLLOG" | head -20
 echo "[test_inguest_gpu_multiop_hw] --- host GL context (virglrenderer) ---"
 GLVER_LINE="$(grep -a -E "gl_version [0-9]+ - core profile" "$GLLOG" | head -1)"
 GLREND_LINE="$(grep -a -iE "GL_RENDERER=NVIDIA|NVIDIA GeForce RTX|llvmpipe" "$GLLOG" | head -2)"
@@ -162,6 +164,10 @@ fi
 BLEND_GREEN=0
 grep -a -q -E "\[vgpu-blend\] PASS: .*translucent source-over fill.* on the RTX 3090" "$GLLOG" && BLEND_GREEN=1
 
+# Round 9: did the AA COVERAGE-MASK (glyph text) sampler draw byte-verify?
+COV_GREEN=0
+grep -a -q -E "\[vgpu-cov\] PASS: AA coverage mask sampled .* on the RTX 3090" "$GLLOG" && COV_GREEN=1
+
 if [ "$GREEN" -eq 1 ] && [ "$NV_CTX" -eq 1 ] && [ "$NVIDIA_RESIDENT" -eq 1 ]; then
     OPS="$(grep -a -oE "\[vgpu-multiop\] PASS: [34] op types[^\\\\]*" "$GLLOG" | head -1)"
     echo "[test_inguest_gpu_multiop_hw] PASS: MULTI-OP frame rasterized on the RTX 3090 —"
@@ -171,6 +177,11 @@ if [ "$GREEN" -eq 1 ] && [ "$NV_CTX" -eq 1 ] && [ "$NVIDIA_RESIDENT" -eq 1 ]; th
         echo "[test_inguest_gpu_multiop_hw]   + TRANSLUCENT alpha-blended fill (GL DRAW + GL_BLEND) byte-matches SW (+/-1 UNORM rounding)"
     else
         echo "[test_inguest_gpu_multiop_hw]   (translucent blend-draw not byte-confirmed this run; see [vgpu-blend] markers — stays SW-fallback)"
+    fi
+    if [ "$COV_GREEN" -eq 1 ]; then
+        echo "[test_inguest_gpu_multiop_hw]   + AA COVERAGE-MASK (glyph TEXT) sampler (R8 texture + TEX shader + GL_BLEND) byte-matches SW (+/-1 UNORM rounding)"
+    else
+        echo "[test_inguest_gpu_multiop_hw]   (AA coverage-mask sampler not byte-confirmed this run; see [vgpu-cov] markers — stays SW-fallback)"
     fi
     exit 0
 fi

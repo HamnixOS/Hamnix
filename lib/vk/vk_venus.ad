@@ -46,6 +46,8 @@ from drivers.video.virtio_gpu import (
     virtio_gpu_3d_frame_rt_readback, virtio_gpu_3d_create_scratch_rt,
     virtio_gpu_3d_create_vbuf, virtio_gpu_3d_vbuf_backing,
     virtio_gpu_3d_vbuf_upload,
+    virtio_gpu_3d_create_cov_tex, virtio_gpu_3d_cov_tex_backing,
+    virtio_gpu_3d_cov_tex_upload,
 )
 
 
@@ -495,8 +497,10 @@ def vk_venus_encode_copy_region(buf: uint64,
 
 # Scratch DWORD buffer for the encoded command stream (module-level so no
 # per-call allocation; single-threaded boot-time use). Holds the largest
-# stream we emit — the scissored GL fill (47 dwords) — with headroom.
-venus_cmd_buf: Array[64, uint32]
+# stream we emit — the coverage-mask fragment shader (~60 dwords of TGSI text)
+# — with headroom, capped by the device's ~100-dword (400-byte) SUBMIT_3D
+# scratch (virtio_gpu_submit_3d).
+venus_cmd_buf: Array[100, uint32]
 
 
 def vk_venus_available() -> int32:
@@ -1092,6 +1096,219 @@ def vk_venus_blend_fill(x: uint32, y: uint32, w: uint32, h: uint32,
     # Source-over translucent fill of box (x,y,w,h) into the frame RT: aim the
     # viewport at the box, set the fragment colour (RGBA float bits), and draw
     # the blended quad. vk_venus_blend_setup must have run. Returns the submit rc.
+    if virtio_gpu_3d_available() == 0:
+        return -1
+    b: uint64 = cast[uint64](&venus_cmd_buf[0])
+    k: uint32 = 0
+    k = _venus_encode_viewport(b, k, x, y, w, h, rt_h)
+    k = _venus_encode_set_frag_color(b, k, cr, cg, cb, ca)
+    k = _venus_encode_draw_quad(b, k)
+    return virtio_gpu_submit_3d(b, k)
+
+
+# ===================================================================
+# COVERAGE-MASK SAMPLER: anti-aliased glyph TEXT / rounded-rect AA on the GPU
+# (GPU track #182 round 9 — the first GPU op that SAMPLES a texture)
+# ===================================================================
+#
+# A constant-colour translucent FILL (round 8, above) covers the whole box at
+# one alpha. Anti-aliased TEXT needs a PER-PIXEL alpha: each glyph is a small
+# W×H 8-bit COVERAGE mask (the font rasterizer's per-pixel ink coverage),
+# stamped in one ink colour. On the GPU that is a real TEX-sampling draw:
+#   * the mask is an R8_UNORM texture (SAMPLER_VIEW bind) uploaded once;
+#   * a SAMPLER_VIEW object + a NEAREST SAMPLER_STATE make it samplable;
+#   * a fragment shader TEX-samples coverage and emits
+#         OUT.rgb = ink.rgb ,  OUT.a = ink.a * coverage.r
+#     which the SAME source-over blend CSO (round 8) composites as
+#         out = ink.rgb*a_eff + dst*(1-a_eff) ,  a_eff = ink.a*cov
+#     — byte-identical (±1 UNORM rounding) to vk2d_raster_cov_mask's
+#         a_eff = cov*ca/255 ; source-over blend.
+#
+# GEOMETRY reuses the round-8 fullscreen ±1 quad + viewport: the VIEWPORT aims
+# the quad at the pixel box (x,y,w,h); the vertex shader derives the texcoord
+# from clip position (u = x*0.5+0.5, v = y*0.5+0.5) so texel (0,0) lands at the
+# box's TOP-LEFT (top-origin RT, matching round 8's byte-exact placement).
+# NEAREST + CLAMP_TO_EDGE + a box whose size equals the mask size gives a 1:1
+# texel→pixel map (pixel i centre → texcoord (i+0.5)/w → texel i).
+
+# virgl command / object ids for the sampler path (virgl_protocol.h ordering,
+# consistent with the ids already validated in this file: CLEAR=7, DRAW_VBO=8,
+# SET_CONSTANT_BUFFER=12, COPY_REGION=17, BIND_SHADER=31).
+VIRGL_CCMD_SET_SAMPLER_VIEWS:    uint32 = 10
+VIRGL_CCMD_BIND_SAMPLER_STATES:  uint32 = 18
+VIRGL_OBJECT_SAMPLER_VIEW:       uint32 = 6
+VIRGL_OBJECT_SAMPLER_STATE:      uint32 = 7
+# CREATE_OBJECT body sizes (virgl_protocol.h VIRGL_OBJ_*_SIZE).
+VIRGL_OBJ_SAMPLER_VIEW_SIZE:     uint32 = 6    # handle,res,format,layer,level,swizzle
+VIRGL_OBJ_SAMPLER_STATE_SIZE:    uint32 = 9    # handle,S0,lodbias,min,max,border[4]
+# R8_UNORM sampled texture format (virgl_hw.h VIRGL_FORMAT_R8_UNORM = 64).
+VIRGL_FORMAT_R8_UNORM_TEX:       uint32 = 64
+# gallium PIPE_TEX_WRAP_CLAMP_TO_EDGE = 2, PIPE_TEX_FILTER_NEAREST = 0,
+# PIPE_TEX_MIPFILTER_NONE = 2. NEAREST keeps texel→pixel byte-exact.
+PIPE_TEX_WRAP_CLAMP_TO_EDGE:     uint32 = 2
+PIPE_TEX_FILTER_NEAREST:         uint32 = 0
+PIPE_TEX_MIPFILTER_NONE:         uint32 = 2
+# Identity swizzle (PIPE_SWIZZLE X=0,Y=1,Z=2,W=3; 3 bits each: R<<0 G<<3 B<<6 A<<9).
+VIRGL_SWIZZLE_IDENTITY:          uint32 = 0x688   # 0 | 1<<3 | 2<<6 | 3<<9
+
+# Object handles for the coverage sampler path (distinct from the 0x50/0x60
+# ranges and the RT resource ids 2..6).
+VK_VENUS_COV_VS:     uint32 = 0x68   # cov vertex shader (position + derived uv)
+VK_VENUS_COV_FS:     uint32 = 0x69   # cov fragment shader (TEX-sample coverage)
+VK_VENUS_COV_SVIEW:  uint32 = 0x6A   # sampler view over the coverage texture
+VK_VENUS_COV_SSTATE: uint32 = 0x6B   # NEAREST sampler state
+
+
+def _venus_encode_sampler_view(buf: uint64, k: uint32, handle: uint32,
+                               res: uint32, format: uint32) -> uint32:
+    # CREATE_OBJECT/SAMPLER_VIEW over a 2D texture `res`. Body (6 dwords):
+    #   handle, res_handle, format, (first|last layer), (first|last level),
+    #   swizzle. Single-layer/level texture => layer=0, level=0.
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_CREATE_OBJECT,
+                                       VIRGL_OBJECT_SAMPLER_VIEW,
+                                       VIRGL_OBJ_SAMPLER_VIEW_SIZE))
+    k = _venus_put(buf, k, handle)
+    k = _venus_put(buf, k, res)
+    k = _venus_put(buf, k, format)
+    k = _venus_put(buf, k, 0)                            # first_layer|last_layer<<16
+    k = _venus_put(buf, k, 0)                            # first_level|last_level<<8
+    k = _venus_put(buf, k, VIRGL_SWIZZLE_IDENTITY)
+    return k
+
+
+def _venus_sampler_s0() -> uint32:
+    # SAMPLER_STATE word S0 (virgl_protocol.h VIRGL_OBJ_SAMPLER_STATE_S0_*):
+    #   wrap_s<<0 | wrap_t<<3 | wrap_r<<6 | min_img<<9 | min_mip<<11 |
+    #   mag_img<<13 | compare_mode<<15 | compare_func<<16 | ...
+    # CLAMP_TO_EDGE wraps + NEAREST min/mag + NO mip => byte-exact texel fetch.
+    return PIPE_TEX_WRAP_CLAMP_TO_EDGE \
+        | (PIPE_TEX_WRAP_CLAMP_TO_EDGE << 3) \
+        | (PIPE_TEX_WRAP_CLAMP_TO_EDGE << 6) \
+        | (PIPE_TEX_FILTER_NEAREST << 9) \
+        | (PIPE_TEX_MIPFILTER_NONE << 11) \
+        | (PIPE_TEX_FILTER_NEAREST << 13)
+
+
+def _venus_encode_sampler_state(buf: uint64, k: uint32,
+                                handle: uint32) -> uint32:
+    # CREATE_OBJECT/SAMPLER_STATE. Body (9 dwords): handle, S0, lod_bias,
+    # min_lod, max_lod (float bits — all 0.0), border_color[4] (0.0).
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_CREATE_OBJECT,
+                                       VIRGL_OBJECT_SAMPLER_STATE,
+                                       VIRGL_OBJ_SAMPLER_STATE_SIZE))
+    k = _venus_put(buf, k, handle)
+    k = _venus_put(buf, k, _venus_sampler_s0())
+    k = _venus_put(buf, k, 0)                            # lod_bias 0.0
+    k = _venus_put(buf, k, 0)                            # min_lod 0.0
+    k = _venus_put(buf, k, 0)                            # max_lod 0.0
+    k = _venus_put(buf, k, 0)                            # border r
+    k = _venus_put(buf, k, 0)                            # border g
+    k = _venus_put(buf, k, 0)                            # border b
+    k = _venus_put(buf, k, 0)                            # border a
+    return k
+
+
+def _venus_encode_set_sampler_views(buf: uint64, k: uint32,
+                                    view_handle: uint32) -> uint32:
+    # SET_SAMPLER_VIEWS for the FRAGMENT stage, slot 0 = view_handle. Body:
+    # shader_type, start_slot, handle0 (3 dwords).
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3))
+    k = _venus_put(buf, k, PIPE_SHADER_FRAGMENT)
+    k = _venus_put(buf, k, 0)                            # start_slot
+    k = _venus_put(buf, k, view_handle)
+    return k
+
+
+def _venus_encode_bind_sampler_states(buf: uint64, k: uint32,
+                                      state_handle: uint32) -> uint32:
+    # BIND_SAMPLER_STATES for the FRAGMENT stage, slot 0 = state_handle. Body:
+    # shader_type, start_slot, handle0 (3 dwords).
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3))
+    k = _venus_put(buf, k, PIPE_SHADER_FRAGMENT)
+    k = _venus_put(buf, k, 0)                            # start_slot
+    k = _venus_put(buf, k, state_handle)
+    return k
+
+
+# --- coverage-sampler seam (setup once + per-run draw) -----------------
+# venus_cov_res caches the coverage texture resource id (from cov_setup).
+venus_cov_res: uint32 = 0
+
+
+def vk_venus_cov_setup(cov_w: uint32, cov_h: uint32,
+                       frame_surf: uint32) -> int32:
+    # Build the coverage-mask DRAW pipeline for the current frame. REQUIRES
+    # vk_venus_blend_setup to have run first (it creates + binds the shared
+    # quad vertex buffer, vertex-elements CSO and source-over blend CSO, and
+    # sets the framebuffer to `frame_surf`). This adds the coverage-specific
+    # objects: the R8 coverage texture, the cov vertex + fragment shaders, a
+    # sampler view over the texture and a NEAREST sampler state; binds the cov
+    # shaders (replacing the round-8 constant-colour ones) and wires the
+    # sampler. The caller uploads the mask bytes via cov_upload before drawing.
+    # Returns 0 on success, -1 otherwise.
+    if virtio_gpu_3d_available() == 0:
+        return -1
+    cid: uint32 = virtio_gpu_3d_create_cov_tex(cov_w, cov_h)
+    if cid == 0:
+        return -1
+    venus_cov_res = cid
+    # cov vertex shader: pass position through, derive uv = pos*0.5 + 0.5 so
+    # the box's top-left samples texel (0,0) (top-origin RT).
+    vs_txt: Ptr[uint8] = \
+        "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nIMM[0] FLT32 { 0.5000, 0.5000, 0.0000, 0.0000 }\n0: MOV OUT[0], IN[0]\n1: MAD OUT[1], IN[0], IMM[0], IMM[0]\n2: END\n"
+    # cov fragment shader: TEX-sample coverage (R channel), emit ink.rgb and
+    # a = ink.a * coverage; the bound source-over blend CSO composites it.
+    fs_txt: Ptr[uint8] = \
+        "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\nDCL CONST[0]\nDCL TEMP[0]\n0: TEX TEMP[0], IN[0], SAMP[0], 2D\n1: MOV OUT[0], CONST[0]\n2: MUL OUT[0].w, CONST[0], TEMP[0].xxxx\n3: END\n"
+    b: uint64 = cast[uint64](&venus_cmd_buf[0])
+    # Stream 1: cov vertex shader.
+    n: uint32 = _venus_encode_shader(b, 0, VK_VENUS_COV_VS,
+                                     PIPE_SHADER_VERTEX, cast[uint64](vs_txt))
+    if virtio_gpu_submit_3d(b, n) != 0:
+        return -1
+    # Stream 2: cov fragment shader.
+    n = _venus_encode_shader(b, 0, VK_VENUS_COV_FS, PIPE_SHADER_FRAGMENT,
+                             cast[uint64](fs_txt))
+    if virtio_gpu_submit_3d(b, n) != 0:
+        return -1
+    # Stream 3: bind cov shaders, create sampler view + state, wire them, and
+    # re-assert the framebuffer to the frame surface.
+    k: uint32 = 0
+    k = _venus_encode_bind_shader(b, k, VK_VENUS_COV_VS, PIPE_SHADER_VERTEX)
+    k = _venus_encode_bind_shader(b, k, VK_VENUS_COV_FS, PIPE_SHADER_FRAGMENT)
+    k = _venus_encode_sampler_view(b, k, VK_VENUS_COV_SVIEW, venus_cov_res,
+                                   VIRGL_FORMAT_R8_UNORM_TEX)
+    k = _venus_encode_sampler_state(b, k, VK_VENUS_COV_SSTATE)
+    k = _venus_encode_set_sampler_views(b, k, VK_VENUS_COV_SVIEW)
+    k = _venus_encode_bind_sampler_states(b, k, VK_VENUS_COV_SSTATE)
+    k = _venus_put(b, k, _virgl_cmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3))
+    k = _venus_put(b, k, 1)                              # nr_cbufs
+    k = _venus_put(b, k, 0)                              # zsurf_handle
+    k = _venus_put(b, k, frame_surf)                     # cbuf[0]
+    return virtio_gpu_submit_3d(b, k)
+
+
+def vk_venus_cov_backing() -> uint64:
+    # Identity-mapped VA of the coverage texture backing: write w×h row-major
+    # 8-bit coverage here, then vk_venus_cov_upload pushes it to the host.
+    return virtio_gpu_3d_cov_tex_backing()
+
+
+def vk_venus_cov_upload(w: uint32, h: uint32) -> int32:
+    # TRANSFER_TO_HOST_3D the w×h coverage bytes to the host R8 texture.
+    return virtio_gpu_3d_cov_tex_upload(w, h)
+
+
+def vk_venus_cov_draw(x: uint32, y: uint32, w: uint32, h: uint32,
+                      rt_h: uint32,
+                      cr: uint32, cg: uint32, cb: uint32,
+                      ca: uint32) -> int32:
+    # Draw the coverage mask into the frame RT at box (x,y,w,h): aim the
+    # viewport at the box, set the ink colour constant (cr,cg,cb, ca = ink
+    # alpha as float bits), and draw the textured, source-over-blended quad.
+    # vk_venus_cov_setup + vk_venus_cov_upload must have run. Same viewport +
+    # draw encoders as blend_fill; only the bound FS (which multiplies by the
+    # sampled coverage) differs. Returns the submit rc.
     if virtio_gpu_3d_available() == 0:
         return -1
     b: uint64 = cast[uint64](&venus_cmd_buf[0])

@@ -129,6 +129,12 @@ VIRGL_FORMAT_R8_UNORM:        uint32 = 64
 # is (1<<4), not (1<<0). (1<<0 is DEPTH_STENCIL, which virglrenderer rejects for
 # a buffer with "Illegal buffer binding flags 0x1".)
 VIRGL_BIND_VERTEX_BUFFER:     uint32 = 0x10
+# virgl_hw.h VIRGL_BIND_SAMPLER_VIEW = (1<<3). A texture created with this bind
+# can back a SAMPLER_VIEW object and be TEX-sampled by a fragment shader — the
+# transport for an AA glyph / rounded-rect COVERAGE mask (an R8_UNORM texture).
+# (NOT 1<<0 = DEPTH_STENCIL, NOT 1<<4 = VERTEX_BUFFER; a wrong bit yields
+# "Illegal buffer binding flags".)
+VIRGL_BIND_SAMPLER_VIEW:      uint32 = 0x8
 
 # 2D pixel format. B8G8R8A8_UNORM = 1 in the virtio-gpu formats enum.
 # QEMU treats this as little-endian BGRA bytes; we write our backing
@@ -187,6 +193,11 @@ class VirtioGpu:
     vbuf_res_id:   uint32              # DRAW pipeline VERTEX BUFFER resource (0=none)
     vbuf_backing:  uint64              # guest-physical backing of the vertex buffer
     vbuf_ord:      int32               # buddy order of the vertex buffer backing
+    cov_res_id:    uint32              # R8_UNORM COVERAGE-mask SAMPLER texture (0=none)
+    cov_backing:   uint64              # guest-physical backing of the coverage texture
+    cov_w:         uint32              # coverage texture width  (texels == bytes/row)
+    cov_h:         uint32              # coverage texture height
+    cov_ord:       int32               # buddy order of the coverage backing allocation
 
 
 gpu_state: VirtioGpu
@@ -1155,6 +1166,93 @@ def virtio_gpu_3d_vbuf_upload(nbytes: uint32) -> int32:
         return -1
     return _gpu_transfer_to_host_3d(gpu_state.vbuf_res_id, 0, 0,
                                     nbytes, 1, nbytes)
+
+
+# --- COVERAGE-MASK sampler texture (GPU track #182 round 9) --------------
+#
+# Anti-aliased glyph TEXT (and rounded-rect AA corners) are painted from an
+# 8-bit-per-pixel COVERAGE mask: one alpha byte per pixel over the ink's tight
+# bbox. To rasterize that on the host GPU the mask must be a SAMPLABLE texture —
+# an R8_UNORM 2D texture bound VIRGL_BIND_SAMPLER_VIEW, TEX-sampled by a
+# fragment shader that emits (ink.rgb, a = coverage.r * ink.a) and lets the
+# source-over blend CSO composite it. Distinct resource id 6 so it never
+# disturbs the RT/scratch/frame/vbuf resources. Same create+attach+ctx_attach
+# lifecycle + size-cache discipline as the frame RT.
+GPU_3D_COV_RES_ID:   uint32 = 6
+
+
+def virtio_gpu_3d_create_cov_tex(w: uint32, h: uint32) -> uint32:
+    # Create-or-fetch the R8_UNORM coverage SAMPLER texture (w×h), attach a
+    # guest backing, and bind it to the live 3D context. Returns the resource
+    # id (non-zero) or 0 if 3D is not live / any step failed. Cached at its
+    # first size; a differing later size conservatively DECLINES (returns 0)
+    # rather than recreate — a mask-atlas/resize pool is the documented next
+    # step toward multi-glyph text batching.
+    if gpu_state.present == 0 or gpu_state.ctx_ready == 0:
+        return 0
+    if gpu_state.cov_res_id != 0:
+        if gpu_state.cov_w == w and gpu_state.cov_h == h:
+            return gpu_state.cov_res_id
+        return 0
+    nbytes: uint64 = cast[uint64](w) * cast[uint64](h)        # 1 byte / texel
+    order: int32 = _order_for_bytes(nbytes)
+    page: uint64 = alloc_pages(order)
+    if page == 0:
+        printk0("virtio-gpu: 3D coverage texture backing alloc failed\n")
+        return 0
+    memset(cast[Ptr[uint8]](page), 0, _page_size_times(order))
+    phys: uint64 = virt_to_phys(page)
+    # RESOURCE_CREATE_3D: a PIPE_TEXTURE_2D, R8_UNORM, bound SAMPLER_VIEW.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_RESOURCE_CREATE_3D)
+    cast[Ptr[uint32]](a + 24)[0] = GPU_3D_COV_RES_ID
+    cast[Ptr[uint32]](a + 28)[0] = PIPE_TEXTURE_2D
+    cast[Ptr[uint32]](a + 32)[0] = VIRGL_FORMAT_R8_UNORM
+    cast[Ptr[uint32]](a + 36)[0] = VIRGL_BIND_SAMPLER_VIEW
+    cast[Ptr[uint32]](a + 40)[0] = w
+    cast[Ptr[uint32]](a + 44)[0] = h
+    cast[Ptr[uint32]](a + 48)[0] = 1                     # depth
+    cast[Ptr[uint32]](a + 52)[0] = 1                     # array_size
+    cast[Ptr[uint32]](a + 56)[0] = 0                     # last_level
+    cast[Ptr[uint32]](a + 60)[0] = 0                     # nr_samples
+    cast[Ptr[uint32]](a + 64)[0] = 0                     # flags
+    cast[Ptr[uint32]](a + 68)[0] = 0                     # padding
+    resp_type: uint32 = _submit(72, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: COV CREATE_3D bad resp=%x\n",
+                cast[uint64](resp_type))
+        return 0
+    if _gpu_attach_backing_res(GPU_3D_COV_RES_ID, phys,
+                               cast[uint32](nbytes)) != 0:
+        return 0
+    if _gpu_ctx_attach_resource(GPU_3D_COV_RES_ID) != 0:
+        return 0
+    gpu_state.cov_res_id = GPU_3D_COV_RES_ID
+    gpu_state.cov_backing = phys
+    gpu_state.cov_w = w
+    gpu_state.cov_h = h
+    gpu_state.cov_ord = order
+    printk2("virtio-gpu: 3D coverage sampler texture ready %dx%d\n",
+            cast[uint64](w), cast[uint64](h))
+    return GPU_3D_COV_RES_ID
+
+
+def virtio_gpu_3d_cov_tex_backing() -> uint64:
+    # Identity-mapped VA of the coverage texture's guest backing (0 if none).
+    # The caller writes w×h row-major 8-bit coverage here, then cov_tex_upload
+    # pushes it to the host resource.
+    return gpu_state.cov_backing
+
+
+def virtio_gpu_3d_cov_tex_upload(w: uint32, h: uint32) -> int32:
+    # TRANSFER_TO_HOST_3D the w×h coverage bytes from the guest backing into the
+    # host R8 texture so the host GPU sampler reads the current mask. For an R8
+    # texture the row stride is w bytes (1 byte/texel). 0 device-OK, -1 else.
+    if gpu_state.present == 0 or gpu_state.ctx_ready == 0:
+        return -1
+    if gpu_state.cov_res_id == 0:
+        return -1
+    return _gpu_transfer_to_host_3d(gpu_state.cov_res_id, 0, 0, w, h, w)
 
 
 # --- Probe + init --------------------------------------------------
