@@ -162,7 +162,7 @@ kill "$QEMU_PID" 2>/dev/null
 wait "$QEMU_PID" 2>/dev/null
 
 echo "[test_vgpu] --- virtio-gpu / vgpu boot log ---"
-grep -a -E "virtio-gpu|virtio-modern|\[vgpu\]|\[vgpu-vk\]|\[vgpu-bench\]" "$LOG" || true
+grep -a -E "virtio-gpu|virtio-modern|\[vgpu\]|\[vgpu-vk\]|\[vgpu-bench\]|\[vgpu-de\]" "$LOG" || true
 echo "[test_vgpu] --- end ---"
 
 fail=0
@@ -201,6 +201,20 @@ check_log "present benchmark correct"    "\[vgpu-bench\] PASS: GPU-presented bac
 check_log "vk2d BGRA store order"        "\[vgpu-bench\] PASS: vk2d BGRA store lays B,G,R,A"
 check_log "BGRA-native present correct"  "\[vgpu-bench\] PASS: BGRA-native present matches RGBA reference"
 check_log "present benchmark complete"   "\[vgpu-bench\] PASS: present benchmark complete"
+# Phase D.4: the DE compositor present path (vk_de_present_shadow_rect, the
+# exact call _wsys_flush_rect uses under virtio-gpu). Proves the GPU-present
+# default activates, the force-SW flag is reversible, and the GPU-presented
+# frame is pixel-identical to the SW reference — i.e. flipping the DE to GPU
+# present does not change a pixel and never leaves the screen dark.
+check_log "DE GPU present is default"    "\[vgpu-de\] PASS: GPU present is the DE default"
+check_log "DE force-SW reversible"       "\[vgpu-de\] PASS: force-SW flag flips the DE back to SW"
+check_log "DE present pixel-identical"   "\[vgpu-de\] PASS: DE GPU present matches SW reference pixel-for-pixel"
+check_log "DE present verified default"  "\[vgpu-de\] PASS: DE present path verified"
+
+if grep -a -q -E "\[vgpu-de\] FAIL" "$LOG"; then
+    echo "[test_vgpu] FAIL: kernel reported [vgpu-de] FAIL" >&2
+    fail=1
+fi
 
 if grep -a -q -E "\[vgpu-vk\] FAIL" "$LOG"; then
     echo "[test_vgpu] FAIL: kernel reported [vgpu-vk] FAIL" >&2
