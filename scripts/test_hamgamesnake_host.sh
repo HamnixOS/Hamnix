@@ -161,6 +161,44 @@ fi
 # --- COLLISION: driving into the wall ends the game -------------------------
 assert_eq GAMEOVER 1 "wall collision ended the game (game over)"
 
+# --- SOUND EFFECTS: eat / turn / game-over drive DISTINCT mixer tones -------
+# Assert on the real PCM the software mixer renders (lib/hammixer.ad): each event
+# creates exactly one voice, the rendered buffer is NON-SILENT (peak amplitude),
+# and the zero-crossing count tracks the pitch — so eat (880) > turn (520) >
+# over (160) is unforgeable from the samples, not just a function-called flag.
+assert_eq TURN_VOICES 1   "turn click created one mixer voice"
+assert_eq EAT_VOICES  1   "eat blip created one mixer voice"
+assert_eq OVER_VOICES 1   "game-over tone created one mixer voice"
+assert_eq TURN_FREQ   520 "turn tone frequency (Hz)"
+assert_eq EAT_FREQ    880 "eat tone frequency (Hz)"
+assert_eq OVER_FREQ   160 "game-over tone frequency (Hz)"
+assert_eq EAT_SCORE   1   "eat tone sounded on the scoring step"
+assert_eq OVER_FLAG   1   "game-over tone sounded when the game ended"
+
+gt0() {  # gt0 <field> <label>: assert the field's numeric value is > 0
+    local v; v="$(kv "$1")"
+    if [ -n "$v" ] && [ "$v" -gt 0 ]; then
+        echo "[snake-host] PASS $2 ($1=$v)"
+    else
+        echo "[snake-host] FAIL $2 ($1=$v, want > 0)"; fail=1
+    fi
+}
+gtf() {  # gtf <fieldA> <fieldB> <label>: assert A > B numerically
+    local a b; a="$(kv "$1")"; b="$(kv "$2")"
+    if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -gt "$b" ]; then
+        echo "[snake-host] PASS $3 ($1=$a > $2=$b)"
+    else
+        echo "[snake-host] FAIL $3 ($1=$a not > $2=$b)"; fail=1
+    fi
+}
+
+gt0 TURN_PEAK "turn tone PCM is non-silent (mixer produced samples)"
+gt0 EAT_PEAK  "eat tone PCM is non-silent (mixer produced samples)"
+gt0 OVER_PEAK "game-over tone PCM is non-silent (mixer produced samples)"
+gtf EAT_ZC  TURN_ZC "eat pitch > turn pitch in the rendered PCM (zero-crossings)"
+gtf TURN_ZC OVER_ZC "turn pitch > game-over pitch in the rendered PCM"
+gtf EAT_ZC  OVER_ZC "eat pitch > game-over pitch in the rendered PCM"
+
 if [ "$fail" -eq 0 ]; then
     echo "[snake-host] RESULT: PASS"
     exit 0

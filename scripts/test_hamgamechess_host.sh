@@ -160,6 +160,44 @@ assert_eq ILLEGAL_DST   0 "b3 still empty after the rejected move"
 assert_eq ILLEGAL_TURN  0 "side-to-move unchanged after the rejected move"
 assert_eq WRONGSIDE_RET 0 "Black cannot move while it is White's turn"
 
+# --- SOUND EFFECTS: move / capture / illegal drive DISTINCT mixer tones -----
+# Assert on the real PCM the software mixer renders (lib/hammixer.ad): each event
+# creates exactly one voice, the rendered buffer is NON-SILENT (peak amplitude),
+# and the zero-crossing count tracks the pitch — so capture (990) > move (660) >
+# buzz (140) is unforgeable from the samples, not just a function-called flag.
+assert_eq MOVE_VOICES 1   "legal move created one mixer voice"
+assert_eq CAP_VOICES  1   "capture created one mixer voice"
+assert_eq BUZZ_VOICES 1   "illegal move created one mixer voice"
+assert_eq MOVE_FREQ   660 "move tone frequency (Hz)"
+assert_eq CAP_FREQ    990 "capture tone frequency (Hz)"
+assert_eq BUZZ_FREQ   140 "illegal-buzz frequency (Hz)"
+assert_eq CAP_SND_RET 1   "capture that sounded the tone was accepted"
+assert_eq BUZZ_RET    0   "illegal move that sounded the buzz was rejected"
+
+gt0() {  # gt0 <field> <label>: assert the field's numeric value is > 0
+    local v; v="$(kv "$1")"
+    if [ -n "$v" ] && [ "$v" -gt 0 ]; then
+        echo "[chess-host] PASS $2 ($1=$v)"
+    else
+        echo "[chess-host] FAIL $2 ($1=$v, want > 0)"; fail=1
+    fi
+}
+gtf() {  # gtf <fieldA> <fieldB> <label>: assert A > B numerically
+    local a b; a="$(kv "$1")"; b="$(kv "$2")"
+    if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -gt "$b" ]; then
+        echo "[chess-host] PASS $3 ($1=$a > $2=$b)"
+    else
+        echo "[chess-host] FAIL $3 ($1=$a not > $2=$b)"; fail=1
+    fi
+}
+
+gt0 MOVE_PEAK "move tone PCM is non-silent (mixer produced samples)"
+gt0 CAP_PEAK  "capture tone PCM is non-silent (mixer produced samples)"
+gt0 BUZZ_PEAK "illegal-buzz PCM is non-silent (mixer produced samples)"
+gtf CAP_ZC  MOVE_ZC "capture pitch > move pitch in the rendered PCM (zero-crossings)"
+gtf MOVE_ZC BUZZ_ZC "move pitch > buzz pitch in the rendered PCM"
+gtf CAP_ZC  BUZZ_ZC "capture pitch > buzz pitch in the rendered PCM"
+
 if [ "$fail" -eq 0 ]; then
     echo "[chess-host] RESULT: PASS"
     exit 0
