@@ -683,6 +683,8 @@ DESKTOP_APP_PACKAGES: list[dict] = [
      "summary": "two-player hot-seat chess"},
     {"name": "hamnix-hamtetris", "bins": ("hamtetrisscene",),
      "summary": "Tetris falling-blocks game"},
+    {"name": "hamnix-hammine", "bins": ("hamminescene",),
+     "summary": "Minesweeper logic puzzle game"},
     {"name": "hamnix-hamgamedemo", "bins": ("hamgamedemo",),
      "summary": "Coin Dash (hamGame demo game)"},
     {"name": "hamnix-hamterm", "bins": ("hamterm", "hamtermscene"),
