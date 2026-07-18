@@ -1,0 +1,283 @@
+# lib/hamsdl_audio_dev.ad — hamSDL AUDIO device backend (x86_64-adder-user).
+#
+# The Hamnix transport for the SDL_mixer/pygame-style audio API declared over
+# lib/hamsdl_audio.ad: it opens the native HDA sink (/dev/audioctl + /dev/audio),
+# reads + decodes sound files (through lib/hamsdl_audio's wav/mp3 bridge), and
+# STREAMS the decoded PCM — one-shot for SFX, looping for music. It is the audio
+# mirror of lib/hamsdl_dev.ad: extern-using, DEVICE-only, and it reuses the exact
+# /dev/audio staging sequence the DE Audio Player driver uses (configure format
+# on /dev/audioctl -> reset -> write PCM to /dev/audio -> start). It reimplements
+# only that tiny transport (the driver's streaming is not a shared library fn) —
+# NOT decoding, which stays in lib/wavdecode.ad / lib/mp3decode.ad.
+#
+# PUBLIC API (device half of the hamSDL audio spec):
+#   sdl_audio_init()            -> int32   open the audio device (0 ok, -1 fail)
+#   sdl_load_sound(name, path)  -> int32   read+decode a .wav/.mp3 into a named
+#                                          PCM buffer (returns slot, -1 on fail)
+#   sdl_play_sound(name)        -> int32   play a loaded sound once (0 ok)
+#   sdl_play_music(path, loop)  -> int32   stream background music; loop!=0 loops
+#   sdl_stop_music()                       stop the music stream
+#   sdl_set_volume(v)                      (shared, lib/hamsdl_audio) 0..128
+#   sdl_audio_pump()                       call once per frame: re-stages a
+#                                          looping clip when it finishes
+#
+# SINGLE-CHANNEL v1: there is ONE HDA output stream, so a new play REPLACES the
+# current sound (music + SFX are not summed — no software mixer yet). A single
+# staged clip is bounded by HDA_CAP (the DMA buffer); a longer loop replays the
+# staged head. Both limits are documented in docs/hamsdl_audio.md.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_get_jiffies() -> uint64
+extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
+
+from lib.hamsdl_audio import sdl_audio_register_wav, sdl_audio_register_mp3, \
+    sdl_audio_find, sdl_audio_pcm, sdl_audio_len, sdl_audio_rate, \
+    sdl_audio_channels, sdl_audio_bits, sdl_audio_frame_bytes, \
+    sdl_audio_duration_ms, sdl_audio_volume, sdl_audio_note_play, \
+    sdl_audio_set_music, sdl_audio_music_slot, sdl_audio_music_loop
+
+
+HDA_CAP:  uint64 = 262144                  # HDA stream DMA buffer capacity
+FILE_CAP: uint64 = 262144                  # per-load file-read scratch
+
+_sad_ctlfd: int32 = -1
+_sad_filebuf: Array[262144, uint8]         # file-read scratch (one load at a time)
+_sad_chunk:   Array[4096, uint8]           # volume-scaling staging chunk
+
+# Music-loop bookkeeping (jiffies are 100 Hz => 10 ms each).
+_sad_music_on:    int32  = 0
+_sad_music_start: uint64 = 0
+_sad_music_dur:   uint64 = 0
+
+
+def _sad_slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _sad_u64_dec(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    tmp: Array[24, uint8]
+    n: uint64 = 0
+    while v > 0:
+        tmp[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    i: uint64 = 0
+    while i < n:
+        out[i] = tmp[n - 1 - i]
+        i = i + 1
+    return n
+
+
+def _sad_writeall(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _sad_slen(s))
+
+
+# Echo "<verb> <value>\n" to /dev/audioctl.
+def _sad_ctl_verb(verb: Ptr[uint8], value: uint64):
+    if _sad_ctlfd < 0:
+        return
+    line: Array[48, uint8]
+    p: uint64 = 0
+    j: uint64 = 0
+    while verb[j] != 0:
+        line[p] = verb[j]
+        p = p + 1
+        j = j + 1
+    line[p] = 32
+    p = p + 1
+    p = p + _sad_u64_dec(value, &line[p])
+    line[p] = 10
+    p = p + 1
+    sys_write(_sad_ctlfd, &line[0], p)
+
+
+def _sad_ctl_word(s: Ptr[uint8]):
+    if _sad_ctlfd >= 0:
+        _sad_writeall(_sad_ctlfd, s)
+
+
+# Open the native HDA sink. Returns 0 on success, -1 if /dev/audioctl is absent.
+def sdl_audio_init() -> int32:
+    sys_bind(cast[Ptr[char]]("/dev"), cast[Ptr[char]]("#c"), 0)
+    _sad_ctlfd = sys_open_write(cast[Ptr[char]]("/dev/audioctl"))
+    _sad_music_on = 0
+    if _sad_ctlfd < 0:
+        return -1
+    return 0
+
+
+# Read a whole file into _sad_filebuf. Returns byte count, or -1 on open failure.
+def _sad_read_file(path: Ptr[char]) -> int64:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    n: uint64 = 0
+    while n < FILE_CAP:
+        r: int64 = sys_read(fd, &_sad_filebuf[n], FILE_CAP - n)
+        if r <= 0:
+            break
+        n = n + cast[uint64](r)
+    sys_close(fd)
+    return cast[int64](n)
+
+
+# 1 if `path` ends in ".mp3"/".MP3" (mirrors user/hamaudioscene.ad's sniff).
+def _sad_is_mp3(path: Ptr[char]) -> int32:
+    p: Ptr[uint8] = cast[Ptr[uint8]](path)
+    n: uint64 = 0
+    while p[n] != 0:
+        n = n + 1
+    if n < 4:
+        return 0
+    e0: uint8 = p[n - 3]
+    e1: uint8 = p[n - 2]
+    e2: uint8 = p[n - 1]
+    if (e0 == 109 or e0 == 77) and (e1 == 112 or e1 == 80) and e2 == 51:
+        return 1
+    return 0
+
+
+# Decode `path` (.mp3 -> lib/mp3decode, else RIFF/WAVE) into the named PCM slot.
+# Returns the slot index, or -1 on read/decode failure.
+def sdl_load_sound(name: Ptr[uint8], path: Ptr[char]) -> int32:
+    got: int64 = _sad_read_file(path)
+    if got <= 0:
+        return -1
+    if _sad_is_mp3(path) != 0:
+        return sdl_audio_register_mp3(name, &_sad_filebuf[0], cast[uint64](got))
+    return sdl_audio_register_wav(name, &_sad_filebuf[0], cast[uint64](got))
+
+
+# Push a slot's rate/channels/format to /dev/audioctl.
+def _sad_configure(slot: int32):
+    _sad_ctl_verb(cast[Ptr[uint8]]("rate"), cast[uint64](sdl_audio_rate(slot)))
+    _sad_ctl_verb(cast[Ptr[uint8]]("channels"),
+                  cast[uint64](sdl_audio_channels(slot)))
+    if sdl_audio_bits(slot) == 8:
+        _sad_ctl_word(cast[Ptr[uint8]]("format u8\n"))
+    else:
+        _sad_ctl_word(cast[Ptr[uint8]]("format s16le\n"))
+
+
+# Copy `n` bytes from `src` into _sad_chunk, scaling amplitude by the master
+# volume (SDL_mixer 0..128). s16le samples scale linearly about 0; u8 samples
+# scale about the 128 midpoint. `vol`==128 callers skip this (write src direct).
+def _sad_scale_chunk(src: Ptr[uint8], n: uint64, bits: uint32, vol: int32):
+    if bits == 16:
+        i: uint64 = 0
+        while i + 1 < n:
+            raw: uint32 = cast[uint32](src[i]) | (cast[uint32](src[i + 1]) << 8)
+            s: int32 = cast[int32](raw)
+            if s >= 32768:
+                s = s - 65536                       # sign-extend
+            s = s * vol / 128
+            u: uint32 = cast[uint32](s & 65535)
+            _sad_chunk[i]     = cast[uint8](u & 255)
+            _sad_chunk[i + 1] = cast[uint8]((u >> 8) & 255)
+            i = i + 2
+        # carry an odd trailing byte through unscaled (never happens frame-aligned)
+        if i < n:
+            _sad_chunk[i] = src[i]
+    else:
+        j: uint64 = 0
+        while j < n:
+            c: int32 = cast[int32](src[j]) - 128
+            c = c * vol / 128
+            _sad_chunk[j] = cast[uint8](cast[uint32]((c + 128) & 255))
+            j = j + 1
+
+
+# Stage a slot's PCM from byte 0 into the HDA DMA buffer and START DMA. The span
+# is capped at HDA_CAP and frame-aligned; amplitude is scaled by the master
+# volume on the way out. Returns 0 on success, -1 if the device is unavailable.
+def _sad_stage_and_start(slot: int32) -> int32:
+    _sad_ctl_word(cast[Ptr[uint8]]("reset\n"))
+    audfd: int32 = sys_open_write(cast[Ptr[char]]("/dev/audio"))
+    if audfd < 0:
+        return -1
+    base: Ptr[uint8] = sdl_audio_pcm(slot)
+    span: uint64 = sdl_audio_len(slot)
+    if span > HDA_CAP:
+        span = HDA_CAP
+    fb: uint64 = sdl_audio_frame_bytes(slot)
+    if fb > 0:
+        span = span / fb * fb                       # whole sample-frames
+    vol:  int32 = sdl_audio_volume()
+    bits: uint32 = sdl_audio_bits(slot)
+    written: uint64 = 0
+    while written < span:
+        chunk: uint64 = span - written
+        if chunk > 4096:
+            chunk = 4096
+        if vol >= 128:
+            sys_write(audfd, &base[written], chunk)
+        else:
+            _sad_scale_chunk(&base[written], chunk, bits, vol)
+            sys_write(audfd, &_sad_chunk[0], chunk)
+        written = written + chunk
+    sys_close(audfd)
+    _sad_ctl_word(cast[Ptr[uint8]]("start\n"))
+    return 0
+
+
+# Play a loaded sound once. Takes the single HDA channel (stops any music).
+def sdl_play_sound(name: Ptr[uint8]) -> int32:
+    slot: int32 = sdl_audio_find(name)
+    if slot < 0:
+        return -1
+    sdl_audio_note_play(slot)
+    _sad_music_on = 0                                # SFX preempts music (v1)
+    _sad_configure(slot)
+    return _sad_stage_and_start(slot)
+
+
+# Stream background music from `path`. loop!=0 re-stages when it finishes (via
+# sdl_audio_pump). Reuses the reserved "__music__" slot so replays don't churn
+# the arena. Returns 0 on success, -1 on load/stream failure.
+def sdl_play_music(path: Ptr[char], loop: int32) -> int32:
+    slot: int32 = sdl_load_sound(cast[Ptr[uint8]]("__music__"), path)
+    if slot < 0:
+        return -1
+    sdl_audio_set_music(slot, loop)
+    sdl_audio_note_play(slot)
+    _sad_configure(slot)
+    if _sad_stage_and_start(slot) != 0:
+        return -1
+    _sad_music_on = 1
+    _sad_music_start = sys_get_jiffies()
+    _sad_music_dur = sdl_audio_duration_ms(slot)
+    return 0
+
+
+# Stop the music stream (silences the HDA channel).
+def sdl_stop_music():
+    _sad_ctl_word(cast[Ptr[uint8]]("reset\n"))
+    _sad_music_on = 0
+
+
+# Per-frame service: when a looping clip has played past its duration, re-stage
+# it from the head; a non-looping clip simply latches off. Cheap to call every
+# frame (a jiffies compare when idle).
+def sdl_audio_pump():
+    if _sad_music_on == 0:
+        return
+    elapsed: uint64 = (sys_get_jiffies() - _sad_music_start) * 10
+    if _sad_music_dur == 0 or elapsed < _sad_music_dur:
+        return
+    if sdl_audio_music_loop() != 0:
+        slot: int32 = sdl_audio_music_slot()
+        if slot >= 0:
+            _sad_stage_and_start(slot)
+            _sad_music_start = sys_get_jiffies()
+            return
+    _sad_music_on = 0

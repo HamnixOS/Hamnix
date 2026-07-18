@@ -1,0 +1,253 @@
+# lib/hamsdl_audio.ad — hamSDL AUDIO registry: the PURE, target-agnostic core
+# of the SDL_mixer / pygame.mixer-flavored sound API on the hamSDL game surface.
+#
+# WHY THIS FILE EXISTS (the #2 gap: hamSDL had NO audio API)
+# =========================================================
+# SDL2 games reach for SDL_mixer (Mix_LoadWAV / Mix_PlayChannel / Mix_PlayMusic)
+# and pygame games for pygame.mixer (Sound / music.play). hamSDL shipped drawing,
+# events and timing but nothing to make sound. This module adds the DATA half of
+# that API — an in-memory registry of decoded PCM "sounds" keyed by name, plus
+# the master-volume + music-loop state — while staying EXACTLY like lib/hamsdl.ad:
+# it is EXTERN-FREE and target-agnostic, so it links into BOTH x86_64-adder-user
+# (device) and x86_64-linux (host). The I/O half — reading a file and STREAMING
+# the PCM to /dev/audio — lives in the two thin backends beside it, mirroring the
+# hamsdl_dev / hamsdl_host split:
+#     lib/hamsdl_audio_dev.ad   device: open /dev/audioctl, stage PCM to
+#                               /dev/audio, drive one-shot SFX + looping music.
+#     lib/hamsdl_audio_host.ad  host:   read+decode the file (real, structural),
+#                               but the DAC is a no-op so a game's host gate runs.
+#
+# It does NOT reimplement decoding: it BRIDGES to the verified decode stack that
+# the DE Audio Player already uses — lib/wavdecode.ad (RIFF/WAVE PCM) and
+# lib/mp3decode.ad (MPEG-1 Layer III) — copying the decoded PCM span out into its
+# own arena so the file buffer can be reused for the next load.
+#
+# ============================ PUBLIC API ===================================
+# The backend exposes the SDL_mixer/pygame-style verbs (same name on both
+# targets); this module is the shared state they read/write:
+#   sdl_audio_init()                 open the audio device        (backend)
+#   sdl_load_sound(name, path)       decode a .wav/.mp3 -> named PCM (backend)
+#   sdl_play_sound(name)             play a loaded sound one-shot  (backend)
+#   sdl_play_music(path, loop)       stream/loop background music  (backend)
+#   sdl_stop_music()                 stop the music stream         (backend)
+#   sdl_audio_pump()                 per-frame music-loop service  (backend)
+#   sdl_set_volume(v)                master volume 0..128 (SDL_mixer scale)
+#   sdl_audio_volume()  -> int32     read it back
+# The registry + volume + music intent below are the target-agnostic truth; a
+# host gate asserts on them directly (decoded format, which sound "played").
+#
+# SCOPE / LIMITS (honest v1)
+# ==========================
+#   * SINGLE CHANNEL. There is one HDA output stream, so a new sdl_play_sound or
+#     sdl_play_music REPLACES whatever is currently sounding (no software mixer
+#     summing two sources yet). This matches SDL_mixer's "one music + channels"
+#     shape only for the music slot; SFX are one-at-a-time for now.
+#   * Registered PCM is capped by the arena (below) and, on device, a single
+#     staged clip is capped by the HDA DMA buffer — long music loops replay the
+#     staged head. Both limits are documented at the backend.
+# ===========================================================================
+
+from lib.wavdecode import wavdecode_parse, wavdecode_rate, \
+    wavdecode_channels, wavdecode_bits, wavdecode_data_off, wavdecode_data_len
+from lib.mp3decode import mp3decode_parse, mp3decode_rate, \
+    mp3decode_channels, mp3decode_bits, mp3decode_data_len, mp3decode_pcm_ptr
+
+
+# ---- registry (bump-allocated PCM arena, name-keyed) ---------------------
+SDL_AUDIO_MAX_SOUNDS: int32  = 8
+SDL_AUDIO_NAME_CAP:   uint64 = 32          # bytes per slot name (incl. NUL)
+SDL_AUDIO_ARENA:      uint64 = 524288      # 512 KiB shared PCM arena
+
+_sa_arena: Array[524288, uint8]
+_sa_used:  uint64 = 0
+_sa_count: int32  = 0
+_sa_name:  Array[256, uint8]               # 8 slots * 32 bytes
+_sa_off:   Array[8, uint64]                # arena offset of each slot's PCM
+_sa_cap:   Array[8, uint64]               # bytes reserved at first alloc
+_sa_len:   Array[8, uint64]                # bytes actually stored (<= cap)
+_sa_rate:  Array[8, uint32]
+_sa_ch:    Array[8, uint32]
+_sa_bits:  Array[8, uint32]
+
+# ---- master volume (SDL_mixer scale: 0 = silent, 128 = unity) ------------
+_sa_volume: int32 = 128
+
+# ---- playback intent (drained by the device backend; read by host gates) -
+_sa_last_play:  int32 = -1                 # last slot handed to sdl_play_sound
+_sa_music_slot: int32 = -1                 # slot backing the current music
+_sa_music_loop: int32 = 0                  # 1 => re-stage on completion
+
+
+def _sa_slot_streq(slot: int32, name: Ptr[uint8]) -> int32:
+    base: uint64 = cast[uint64](slot) * SDL_AUDIO_NAME_CAP
+    i: uint64 = 0
+    while name[i] != 0:
+        if _sa_name[base + i] != name[i]:
+            return 0
+        i = i + 1
+    if _sa_name[base + i] != 0:
+        return 0
+    return 1
+
+
+# Reset the whole registry + volume + music intent (a fresh mixer).
+def sdl_audio_reset():
+    _sa_used = 0
+    _sa_count = 0
+    _sa_volume = 128
+    _sa_last_play = -1
+    _sa_music_slot = -1
+    _sa_music_loop = 0
+
+
+# Slot index of the sound registered under `name`, or -1 if none.
+def sdl_audio_find(name: Ptr[uint8]) -> int32:
+    s: int32 = 0
+    while s < _sa_count:
+        if _sa_slot_streq(s, name) == 1:
+            return s
+        s = s + 1
+    return -1
+
+
+# Copy `len` bytes of PCM (`pcm`) into the arena under `name` with the given
+# stream format. Idempotent by name: reloading an existing name overwrites its
+# slot in place (clamped to the capacity reserved on the FIRST load, so repeated
+# loads — e.g. successive music tracks through the reserved music slot — never
+# churn the arena). Returns the slot index, or -1 if the registry is full.
+def sdl_audio_register_pcm(name: Ptr[uint8], pcm: Ptr[uint8], len: uint64,
+                           rate: uint32, ch: uint32, bits: uint32) -> int32:
+    slot: int32 = sdl_audio_find(name)
+    if slot < 0:
+        if _sa_count >= SDL_AUDIO_MAX_SOUNDS:
+            return -1
+        reserve: uint64 = len
+        if _sa_used + reserve > SDL_AUDIO_ARENA:
+            reserve = SDL_AUDIO_ARENA - _sa_used       # clamp to remaining arena
+        slot = _sa_count
+        base: uint64 = cast[uint64](slot) * SDL_AUDIO_NAME_CAP
+        i: uint64 = 0
+        while name[i] != 0 and i < SDL_AUDIO_NAME_CAP - 1:
+            _sa_name[base + i] = name[i]
+            i = i + 1
+        _sa_name[base + i] = 0
+        _sa_off[cast[uint64](slot)] = _sa_used
+        _sa_cap[cast[uint64](slot)] = reserve
+        _sa_used = _sa_used + reserve
+        _sa_count = _sa_count + 1
+    store: uint64 = len
+    if store > _sa_cap[cast[uint64](slot)]:
+        store = _sa_cap[cast[uint64](slot)]
+    dst: uint64 = _sa_off[cast[uint64](slot)]
+    j: uint64 = 0
+    while j < store:
+        _sa_arena[dst + j] = pcm[j]
+        j = j + 1
+    _sa_len[cast[uint64](slot)]  = store
+    _sa_rate[cast[uint64](slot)] = rate
+    _sa_ch[cast[uint64](slot)]   = ch
+    _sa_bits[cast[uint64](slot)] = bits
+    return slot
+
+
+# Decode a RIFF/WAVE buffer already read into memory and register its PCM under
+# `name`. Returns the slot index, or -1 if the container did not decode / the
+# registry is full. (Decode is lib/wavdecode.ad — NOT reimplemented here.)
+def sdl_audio_register_wav(name: Ptr[uint8], filebuf: Ptr[uint8],
+                           filelen: uint64) -> int32:
+    if wavdecode_parse(filebuf, filelen) == 0:
+        return -1
+    off: uint64 = wavdecode_data_off()
+    return sdl_audio_register_pcm(name, &filebuf[off], wavdecode_data_len(),
+                                  wavdecode_rate(), wavdecode_channels(),
+                                  wavdecode_bits())
+
+
+# Decode an MPEG-1 Layer III buffer (lib/mp3decode.ad) and register its PCM.
+def sdl_audio_register_mp3(name: Ptr[uint8], filebuf: Ptr[uint8],
+                           filelen: uint64) -> int32:
+    if mp3decode_parse(filebuf, filelen) == 0:
+        return -1
+    return sdl_audio_register_pcm(name, mp3decode_pcm_ptr(), mp3decode_data_len(),
+                                  mp3decode_rate(), mp3decode_channels(),
+                                  mp3decode_bits())
+
+
+# ---- registry accessors (used by the backends + host gates) --------------
+def sdl_audio_count() -> int32:
+    return _sa_count
+
+
+def sdl_audio_pcm(slot: int32) -> Ptr[uint8]:
+    return &_sa_arena[_sa_off[cast[uint64](slot)]]
+
+
+def sdl_audio_len(slot: int32) -> uint64:
+    return _sa_len[cast[uint64](slot)]
+
+
+def sdl_audio_rate(slot: int32) -> uint32:
+    return _sa_rate[cast[uint64](slot)]
+
+
+def sdl_audio_channels(slot: int32) -> uint32:
+    return _sa_ch[cast[uint64](slot)]
+
+
+def sdl_audio_bits(slot: int32) -> uint32:
+    return _sa_bits[cast[uint64](slot)]
+
+
+def sdl_audio_name(slot: int32) -> Ptr[uint8]:
+    return &_sa_name[cast[uint64](slot) * SDL_AUDIO_NAME_CAP]
+
+
+# Bytes per sample-frame (all channels) for a slot: channels * bits/8.
+def sdl_audio_frame_bytes(slot: int32) -> uint64:
+    return cast[uint64](_sa_ch[cast[uint64](slot)]) \
+         * (cast[uint64](_sa_bits[cast[uint64](slot)]) / 8)
+
+
+# Clip duration in milliseconds for a slot (0 if the format is degenerate).
+def sdl_audio_duration_ms(slot: int32) -> uint64:
+    fb: uint64 = sdl_audio_frame_bytes(slot)
+    r:  uint64 = cast[uint64](_sa_rate[cast[uint64](slot)])
+    if fb == 0 or r == 0:
+        return 0
+    return _sa_len[cast[uint64](slot)] / fb * 1000 / r
+
+
+# ---- master volume -------------------------------------------------------
+# SDL_mixer scale: 0 = silent .. 128 = unity (values are clamped into range).
+def sdl_set_volume(v: int32):
+    if v < 0:
+        v = 0
+    if v > 128:
+        v = 128
+    _sa_volume = v
+
+
+def sdl_audio_volume() -> int32:
+    return _sa_volume
+
+
+# ---- playback intent (the backend's single source of truth) --------------
+def sdl_audio_note_play(slot: int32):
+    _sa_last_play = slot
+
+
+def sdl_audio_last_play() -> int32:
+    return _sa_last_play
+
+
+def sdl_audio_set_music(slot: int32, loop: int32):
+    _sa_music_slot = slot
+    _sa_music_loop = loop
+
+
+def sdl_audio_music_slot() -> int32:
+    return _sa_music_slot
+
+
+def sdl_audio_music_loop() -> int32:
+    return _sa_music_loop
