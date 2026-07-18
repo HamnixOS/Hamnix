@@ -687,6 +687,8 @@ DESKTOP_APP_PACKAGES: list[dict] = [
      "summary": "Minesweeper logic puzzle game"},
     {"name": "hamnix-hamgamedemo", "bins": ("hamgamedemo",),
      "summary": "Coin Dash (hamGame demo game)"},
+    {"name": "hamnix-hamgamesnake", "bins": ("hamgamesnake",),
+     "summary": "Snake (hamGame arcade game)"},
     {"name": "hamnix-hamterm", "bins": ("hamterm", "hamtermscene"),
      "summary": "terminal emulator"},
     {"name": "hamnix-hamfiles", "bins": ("hamfm", "hamfmscene"),
