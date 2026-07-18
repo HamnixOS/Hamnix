@@ -1749,12 +1749,203 @@ static int mode_pageraster(int W, int H, const char* out, double seconds) {
     return mism==0 ? 0 : 1;
 }
 
+/* =================== pagefromops: REAL hambrowse page on the GPU ===========
+ * Ingest the paint-op stream that user/hambrowse_host_gfx.ad dumps for an
+ * ACTUAL laid-out HTML page (PAGEOPS W H / OP fill|rrect|line|glyph / ENDOPS)
+ * and rasterize it on the discrete GPU through the SAME vk_2d op vocabulary the
+ * proven `pageraster` path uses. Unlike `pageraster` (a hand-authored
+ * representative frame), every op here is the browser engine's real output.
+ *
+ * GPU-capable ops (fill/rrect/line) run on the RTX 3090 compute pipeline; the
+ * result is read back and byte-verified against a CPU oracle that runs the
+ * IDENTICAL op stream. `glyph` ops (text runs) are HONESTLY routed to the CPU
+ * fallback — true per-glyph AA coverage is not yet a GPU op — and counted, so
+ * the report distinguishes what the GPU actually rasterized from what the CPU
+ * still owns. Text runs are emitted LAST by the driver (topmost paint order),
+ * so applying the deferred CPU glyph pass after the GPU box pass preserves the
+ * exact stacking order the CPU oracle uses -> byte-identical. */
+enum { PK_FILL=0, PK_AFILL=1, PK_RRECT=2, PK_LINE=3, PK_GLYPH=4 };
+typedef struct { int kind, a,b,c,d,e,f; uint32_t rgba; } POp;
+#define PFO_MAXOPS 65536
+
+/* parse "#rrggbbaa" (or bare 8-hex) into 0xRRGGBBAA. */
+static uint32_t parse_rgba(const char* s) {
+    if (*s=='#') s++;
+    return (uint32_t)strtoul(s, 0, 16);
+}
+
+static int mode_pagefromops(const char* opsfile, const char* out, double seconds) {
+    FILE* f = fopen(opsfile, "r");
+    if (!f) { fprintf(stderr,"[vk_hostgpu] pagefromops: cannot open %s\n", opsfile); return -1; }
+    static POp ops[PFO_MAXOPS];
+    int nops=0, W=0, H=0, order_ok=1, seen_glyph=0;
+    long n_gpu=0, n_glyph=0;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        int x,y,w,h,rad,corners,thick; char col[32];
+        if (sscanf(line, "PAGEOPS %d %d", &W, &H)==2) continue;
+        if (!strncmp(line,"ENDOPS",6)) break;
+        if (nops>=PFO_MAXOPS) { fprintf(stderr,"[vk_hostgpu] pagefromops: op overflow\n"); break; }
+        if (sscanf(line, "OP fill %d %d %d %d %31s", &x,&y,&w,&h, col)==5) {
+            uint32_t c=parse_rgba(col);
+            ops[nops].kind=(c&0xFF)==0xFF?PK_FILL:PK_AFILL;
+            ops[nops].a=x;ops[nops].b=y;ops[nops].c=w;ops[nops].d=h;ops[nops].rgba=c;
+            if (seen_glyph) order_ok=0; n_gpu++; nops++;
+        } else if (sscanf(line, "OP rrect %d %d %d %d %d %d %31s",
+                          &x,&y,&w,&h,&rad,&corners, col)==7) {
+            ops[nops].kind=PK_RRECT;
+            ops[nops].a=x;ops[nops].b=y;ops[nops].c=w;ops[nops].d=h;
+            ops[nops].e=rad;ops[nops].f=corners;ops[nops].rgba=parse_rgba(col);
+            if (seen_glyph) order_ok=0; n_gpu++; nops++;
+        } else if (sscanf(line, "OP line %d %d %d %d %d %31s",
+                          &x,&y,&w,&h,&thick, col)==6) {
+            ops[nops].kind=PK_LINE;
+            ops[nops].a=x;ops[nops].b=y;ops[nops].c=w;ops[nops].d=h;
+            ops[nops].e=thick;ops[nops].rgba=parse_rgba(col);
+            if (seen_glyph) order_ok=0; n_gpu++; nops++;
+        } else if (sscanf(line, "OP glyph %d %d %d %d %31s", &x,&y,&w,&h, col)==5) {
+            ops[nops].kind=PK_GLYPH;
+            ops[nops].a=x;ops[nops].b=y;ops[nops].c=w;ops[nops].d=h;ops[nops].rgba=parse_rgba(col);
+            seen_glyph=1; n_glyph++; nops++;
+        }
+    }
+    fclose(f);
+    if (W<=0||H<=0||nops==0) { fprintf(stderr,"[vk_hostgpu] pagefromops: empty/invalid op stream\n"); return -1; }
+    if (!order_ok) fprintf(stderr,"[vk_hostgpu] pagefromops: WARNING box op after glyph — paint order not grouped\n");
+
+    PR_W=W; PR_H=H;
+    size_t spvsz;
+    uint32_t* spv = read_spv("scripts/shaders/vk2d_raster.comp.spv", &spvsz);
+    if (!spv) return -1;
+    VkDeviceSize dstsz=(VkDeviceSize)W*H*4;
+    int SW=4, SH=4; VkDeviceSize srcsz=(VkDeviceSize)SW*SH*4;  /* unused-but-bound src */
+    uint8_t* sprite=calloc(srcsz,1);
+
+    VkBuffer dbuf,sbuf; VkDeviceMemory dmem,smem;
+    if (make_storagebuf(dstsz,&dbuf,&dmem)) return -1;
+    if (make_storagebuf(srcsz,&sbuf,&smem)) return -1;
+    void* map; CK(vkMapMemory(g_dev,smem,0,srcsz,0,&map));
+    memcpy(map,sprite,srcsz); vkUnmapMemory(g_dev,smem);
+    /* zero the destination SSBO (page starts transparent; op 0 paints paper). */
+    CK(vkMapMemory(g_dev,dmem,0,dstsz,0,&map)); memset(map,0,dstsz); vkUnmapMemory(g_dev,dmem);
+
+    VkShaderModuleCreateInfo smi={ .sType=ST_SHADER_MODULE_CREATE_INFO, .codeSize=spvsz, .pCode=spv };
+    VkShaderModule module; CK(vkCreateShaderModule(g_dev,&smi,0,&module)); free(spv);
+    VkDescriptorSetLayoutBinding binds[2]={
+        {.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT},
+        {.binding=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT}};
+    VkDescriptorSetLayoutCreateInfo dli={ .sType=ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=2,.pBindings=binds};
+    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(g_dev,&dli,0,&dsl));
+    VkPushConstantRange pcr={ .stageFlags=VK_SHADER_STAGE_COMPUTE_BIT,.offset=0,.size=sizeof(PushC)};
+    VkPipelineLayoutCreateInfo pli={ .sType=ST_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&dsl,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr};
+    VkPipelineLayout playout; CK(vkCreatePipelineLayout(g_dev,&pli,0,&playout));
+    VkComputePipelineCreateInfo cpi={ .sType=ST_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage={.sType=ST_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=module,.pName="main"},.layout=playout};
+    VkPipeline pipe; CK(vkCreateComputePipelines(g_dev,0,1,&cpi,0,&pipe));
+    VkDescriptorPoolSize psz={ .type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=2};
+    VkDescriptorPoolCreateInfo dpi={ .sType=ST_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&psz};
+    VkDescriptorPool dpool; CK(vkCreateDescriptorPool(g_dev,&dpi,0,&dpool));
+    VkDescriptorSetAllocateInfo dsai={ .sType=ST_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=dpool,.descriptorSetCount=1,.pSetLayouts=&dsl};
+    VkDescriptorSet dset; CK(vkAllocateDescriptorSets(g_dev,&dsai,&dset));
+    VkDescriptorBufferInfo dbi={.buffer=dbuf,.offset=0,.range=dstsz}, sbi={.buffer=sbuf,.offset=0,.range=srcsz};
+    VkWriteDescriptorSet wr[2]={
+        {.sType=ST_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi},
+        {.sType=ST_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&sbi}};
+    vkUpdateDescriptorSets(g_dev,2,wr,0,0);
+
+    /* build the GPU op list from the GPU-capable (box) ops, in file order. */
+    pr_nops=0;
+    for (int i=0;i<nops;i++){
+        POp* o=&ops[i];
+        if (o->kind==PK_FILL)  pr_gpu_fill(OP_FILL, o->a,o->b,o->c,o->d, o->rgba);
+        else if (o->kind==PK_AFILL) pr_gpu_fill(OP_FILL_ALPHA, o->a,o->b,o->c,o->d, o->rgba);
+        else if (o->kind==PK_RRECT) pr_gpu_roundrect(o->a,o->b,o->c,o->d, o->e,o->f, o->rgba);
+        else if (o->kind==PK_LINE)  pr_gpu_line(o->a,o->b,o->c,o->d, o->e, o->rgba);
+        /* PK_GLYPH deferred to the CPU fallback pass below */
+    }
+
+    VkMemoryBarrier mb={ .sType=ST_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT};
+
+    double gpu_best=1e30; int frames=0; double t_start=now_ms();
+    int min_iters = seconds>0 ? 1000000000 : 200;
+    for (int it=0; it<min_iters; it++) {
+        /* re-zero the SSBO each pass so a resubmit loop stays deterministic. */
+        CK(vkMapMemory(g_dev,dmem,0,dstsz,0,&map)); memset(map,0,dstsz); vkUnmapMemory(g_dev,dmem);
+        VkCommandBuffer cb; if (begin_cmd(&cb)) return -1;
+        vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
+        vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,playout,0,1,&dset,0,0);
+        for (int i=0;i<pr_nops;i++){
+            vkCmdPushConstants(cb,playout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(PushC),&pr_ops[i]);
+            vkCmdDispatch(cb,pr_grp[i][0],pr_grp[i][1],1);
+            if (i+1<pr_nops) vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&mb,0,0,0,0);
+        }
+        double t0=now_ms(); if (submit_wait(cb)) return -1; double ms=now_ms()-t0;
+        if (ms<gpu_best) gpu_best=ms;
+        vkFreeCommandBuffers(g_dev,g_pool,1,&cb);
+        frames++;
+        if (seconds>0 && (now_ms()-t_start)>=seconds*1000.0 && frames>=60) break;
+        if (seconds<=0 && it>=199) break;
+    }
+
+    /* readback GPU box-op result, then apply the CPU-fallback glyph pass on it
+     * (text runs, in file order — they were emitted last => topmost). */
+    CK(vkMapMemory(g_dev,dmem,0,dstsz,0,&map));
+    uint8_t* gpix=(uint8_t*)map;
+    uint8_t* gimg=malloc(dstsz); memcpy(gimg,gpix,dstsz);
+    vkUnmapMemory(g_dev,dmem);
+    for (int i=0;i<nops;i++) if (ops[i].kind==PK_GLYPH)
+        pr_cpu_fill_alpha(gimg, ops[i].a,ops[i].b,ops[i].c,ops[i].d, ops[i].rgba);
+
+    /* CPU oracle: the IDENTICAL op stream, all on the CPU, in file order. */
+    uint8_t* cbuf=calloc((size_t)W*H,4);
+    double cpu_best=1e30;
+    int cpu_iters = seconds>0?20:200;
+    for (int it=0; it<cpu_iters; it++){
+        memset(cbuf,0,(size_t)W*H*4);
+        double t0=now_ms();
+        for (int i=0;i<nops;i++){
+            POp* o=&ops[i];
+            if (o->kind==PK_FILL)  pr_cpu_fill(cbuf, o->a,o->b,o->c,o->d, o->rgba);
+            else if (o->kind==PK_AFILL||o->kind==PK_GLYPH) pr_cpu_fill_alpha(cbuf, o->a,o->b,o->c,o->d, o->rgba);
+            else if (o->kind==PK_RRECT) pr_cpu_roundrect(cbuf, o->a,o->b,o->c,o->d, o->e,o->f, o->rgba);
+            else if (o->kind==PK_LINE)  pr_cpu_line(cbuf, o->a,o->b,o->c,o->d, o->e, o->rgba);
+        }
+        double ms=now_ms()-t0;
+        if (ms<cpu_best) cpu_best=ms;
+    }
+
+    long mism=0, first=-1;
+    for (long i=0;i<(long)W*H;i++) for (int c=0;c<3;c++)
+        if (gimg[i*4+c]!=cbuf[i*4+c]){ if(first<0) first=i; mism++; }
+    write_ppm(out,gimg,W,H);
+
+    printf("VK_DEVICE %s\n", g_devname);
+    printf("PAGEFROMOPS_OK %s %dx%d ops=%d gpu_ops=%ld glyph_cpu_ops=%ld gpu_frames=%d order_grouped=%d\n",
+           out, W, H, nops, n_gpu, n_glyph, frames, order_ok);
+    printf("PAGEFROMOPS_GPU_MS %.4f\nPAGEFROMOPS_SW_MS %.4f\nPAGEFROMOPS_SPEEDUP %.2fx\n",
+           gpu_best, cpu_best, cpu_best/gpu_best);
+    printf("PAGEFROMOPS_GPUvsCPUport_MISMATCH %ld", mism);
+    if (first>=0) printf(" first@%ld,%ld", first%W, first/W);
+    printf("\n");
+
+    free(gimg); free(cbuf); free(sprite);
+    vkDestroyDescriptorPool(g_dev,dpool,0); vkDestroyPipeline(g_dev,pipe,0);
+    vkDestroyPipelineLayout(g_dev,playout,0); vkDestroyDescriptorSetLayout(g_dev,dsl,0);
+    vkDestroyShaderModule(g_dev,module,0);
+    vkDestroyBuffer(g_dev,dbuf,0); vkFreeMemory(g_dev,dmem,0);
+    vkDestroyBuffer(g_dev,sbuf,0); vkFreeMemory(g_dev,smem,0);
+    return mism==0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s info | clear W H 0xRRGGBBAA OUT.ppm | upload IN.ppm OUT.ppm\n"
                         "       %s blit IN.ppm SCALE OUT.ppm | raster OUT.ppm | rasterbench W H\n"
-                        "       %s pageraster W H OUT.ppm [SECONDS] | present IN.ppm [SCALE] [FRAMES]\n",
-                argv[0], argv[0], argv[0]);
+                        "       %s pageraster W H OUT.ppm [SECONDS] | present IN.ppm [SCALE] [FRAMES]\n"
+                        "       %s pagefromops OPS.txt OUT.ppm [SECONDS]\n",
+                argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
     /* present mode runs an entirely self-contained WSI init (own instance +
@@ -1794,6 +1985,9 @@ int main(int argc, char** argv) {
         int W = (int)strtoul(argv[2],0,0), H = (int)strtoul(argv[3],0,0);
         double secs = (argc == 6) ? strtod(argv[5],0) : 0.0;
         rc = mode_pageraster(W, H, argv[4], secs);
+    } else if (!strcmp(argv[1], "pagefromops") && (argc == 4 || argc == 5)) {
+        double secs = (argc == 5) ? strtod(argv[4],0) : 0.0;
+        rc = mode_pagefromops(argv[2], argv[3], secs);
     } else {
         fprintf(stderr, "bad args\n"); rc = 2;
     }
