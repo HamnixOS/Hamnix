@@ -65,18 +65,38 @@ else
     echo "[hb-nest] FAIL expected >= 2 borders (inner + outer), got n=${NB:-0}"; fail=1
 fi
 
-# Every sampled border edge must be a dark stroke (real drawn line).
-BADEDGE=$(awk '/^BORDER [0-9]/ {for(i=1;i<=NF;i++) if($i=="edge" && $(i+1)!="#000000") c++} END{print c+0}' "$DUMP")
-if [ "${BADEDGE:-1}" -eq 0 ]; then
-    echo "[hb-nest] PASS every nested-table border edge is a solid dark stroke"
+# A bordered table now paints TWO kinds of border box: the black table FRAME
+# (edge #000000, one per <table>) and the grey per-cell grid lines (edge
+# #808080, one per <td>/<th> — the classic gridded look real browsers draw).
+# The nested fixture must therefore stroke exactly TWO black frames (inner +
+# outer) plus one grey box per cell; every black frame edge is a solid dark
+# stroke and every cell edge is the medium-grey grid colour.
+NFRAME=$(awk '/^BORDER [0-9]/ {for(i=1;i<=NF;i++) if($i=="edge" && $(i+1)=="#000000") c++} END{print c+0}' "$DUMP")
+if [ "${NFRAME:-0}" -eq 2 ]; then
+    echo "[hb-nest] PASS nested fixture strokes exactly 2 black table FRAMES (inner + outer)"
 else
-    echo "[hb-nest] FAIL $BADEDGE border edge(s) were not dark strokes"; fail=1
+    echo "[hb-nest] FAIL expected 2 black table frames, got ${NFRAME:-0}"; fail=1
+fi
+# Every cell border edge is the grey grid colour (no stray colours).
+BADCELL=$(awk '/^BORDER [0-9]/ {for(i=1;i<=NF;i++) if($i=="edge" && $(i+1)!="#000000" && $(i+1)!="#808080") c++} END{print c+0}' "$DUMP")
+if [ "${BADCELL:-1}" -eq 0 ]; then
+    echo "[hb-nest] PASS every border edge is a solid frame (#000000) or grid (#808080) stroke"
+else
+    echo "[hb-nest] FAIL $BADCELL border edge(s) were neither frame nor grid strokes"; fail=1
+fi
+# There must be at least one grey cell grid line (proves cells stroke borders).
+NGRID=$(awk '/^BORDER [0-9]/ {for(i=1;i<=NF;i++) if($i=="edge" && $(i+1)=="#808080") c++} END{print c+0}' "$DUMP")
+if [ "${NGRID:-0}" -ge 1 ]; then
+    echo "[hb-nest] PASS bordered cells stroke grey grid lines (n=$NGRID)"
+else
+    echo "[hb-nest] FAIL expected >= 1 grey cell grid line, got ${NGRID:-0}"; fail=1
 fi
 
-# Border 0 registers first = the innermost table; the highest index = outer.
-# Assert the inner rectangle is strictly INSET within the outer one.
-read IX0 IY0 IX1 IY1 < <(awk '/^BORDER 0 / {for(i=1;i<=NF;i++){if($i=="x0")a=$(i+1);if($i=="y0")b=$(i+1);if($i=="x1")c=$(i+1);if($i=="y1")d=$(i+1)} print a,b,c,d; exit}' "$DUMP")
-read OX0 OY0 OX1 OY1 < <(awk -v n="$NB" '$1=="BORDER" && $2==(n-1) {for(i=1;i<=NF;i++){if($i=="x0")a=$(i+1);if($i=="y0")b=$(i+1);if($i=="x1")c=$(i+1);if($i=="y1")d=$(i+1)} print a,b,c,d; exit}' "$DUMP")
+# Of the two black table FRAMES, the inner (smaller-area) rectangle must be
+# strictly INSET within the outer (larger-area) one. Pick the frames by their
+# #000000 edge, then order by area.
+read IX0 IY0 IX1 IY1 < <(awk '/^BORDER [0-9]/ { x0=y0=x1=y1=e="";for(i=1;i<=NF;i++){if($i=="x0")x0=$(i+1);if($i=="y0")y0=$(i+1);if($i=="x1")x1=$(i+1);if($i=="y1")y1=$(i+1);if($i=="edge")e=$(i+1)} if(e=="#000000"){ar=(x1-x0)*(y1-y0); if(best==""||ar<best){best=ar;R=x0" "y0" "x1" "y1}}} END{print R}' "$DUMP")
+read OX0 OY0 OX1 OY1 < <(awk '/^BORDER [0-9]/ {x0=y0=x1=y1=e="";for(i=1;i<=NF;i++){if($i=="x0")x0=$(i+1);if($i=="y0")y0=$(i+1);if($i=="x1")x1=$(i+1);if($i=="y1")y1=$(i+1);if($i=="edge")e=$(i+1)} if(e=="#000000"){ar=(x1-x0)*(y1-y0); if(best==""||ar>best){best=ar;R=x0" "y0" "x1" "y1}}} END{print R}' "$DUMP")
 echo "[hb-nest] inner rect=($IX0,$IY0)-($IX1,$IY1)  outer rect=($OX0,$OY0)-($OX1,$OY1)"
 if [ -n "${IX0:-}" ] && [ -n "${OX0:-}" ] \
    && [ "$IX0" -ge "$OX0" ] && [ "$IX1" -le "$OX1" ] \
@@ -93,11 +113,13 @@ PPM2="$OUT/nest_flat.ppm"
 echo "[hb-nest] rendering control $FIX2 (no nested table) ..."
 "$BIN" "$FIX2" "$PPM2" 640 >"$DUMP2" 2>&1
 grep -E '^BORDER n' "$DUMP2"
-NB2=$(awk '/^BORDER n / {print $3; exit}' "$DUMP2")
-if [ "${NB2:-0}" -eq 1 ]; then
-    echo "[hb-nest] PASS un-nested control strokes exactly 1 border — depth matters"
+# The control has no nested <table>, so it must stroke exactly ONE black table
+# FRAME (its cells still stroke grey grid lines — that is orthogonal to depth).
+NF2=$(awk '/^BORDER [0-9]/ {for(i=1;i<=NF;i++) if($i=="edge" && $(i+1)=="#000000") c++} END{print c+0}' "$DUMP2")
+if [ "${NF2:-0}" -eq 1 ]; then
+    echo "[hb-nest] PASS un-nested control strokes exactly 1 black table frame — depth matters"
 else
-    echo "[hb-nest] FAIL control expected exactly 1 border, got n=${NB2:-0}"; fail=1
+    echo "[hb-nest] FAIL control expected exactly 1 black frame, got n=${NF2:-0}"; fail=1
 fi
 
 if [ "$fail" -eq 0 ]; then
