@@ -16,6 +16,17 @@ Markers: `[ ]` open · `[~]` in flight.
 
 ---
 
+## ✅ 2026-07-17 session close — ~31 merges, wide 8-agent fan-out (see STATUS.md for the log)
+
+- **GPU track COMPLETE** — DE + all games present via virtio-gpu zero-copy DMA, **0.20 ms/frame (53.9×)**, SW fallback intact. Games are transitively accelerated (compositor owns scanout). NEXT: venus/virgl 3D for real fill/compute accel (#182, foundation agent in flight).
+- **Browser W3C** — broad: flexbox family incl. class-resolved + align-content + shrink; box-sizing/overflow/ellipsis/sticky+fixed/box-shadow+opacity/gradients; JS engine ES-modules→BigInt (+ private-fields/for-await/Symbol.for); DOM lifecycle/geometry/body/viewport-rects. OPEN next: `window` object (in flight), conic-gradient, multi-line getClientRects, full-cascade getComputedStyle, interactive scroll.
+- **Adder→C parity** — HONEST metric **1.62× of gcc-O2** on the non-gameable tak suite (fib retired). P1-IR foundation + fused indexed load `8f9fd17b` + fused store-immediate `cae0328e` landed (no regression). Fused indexed STORES `e647aa11` = DO-NOT-MERGE alignment-shadowed (parked). NEXT: ALU-visible geomean levers (non-bandwidth-bound), then loop-body alignment normalization to unpark shadowed levers.
+- **hamsh** — Python-class: lambda/set/frozenset/comprehensions/f-strings/dict + real compiler-layer fixes (glued-subscript). NEXT: hashable frozenset dict-keys, `*args`.
+- **Games/DE** — Tetris + Minesweeper; polish across file-manager/editor(syntax)/notes/sysmon/pkg-mgr/calendar/audio. Audio guest→host chain CONFIRMED working (ALSA default).
+- **Compiler-correctness fixes IN FLIGHT:** `not` operator codegen (suspected untested/buggy), JS `[a,b]=[b,a]` destructuring-assignment (broken — decl works, assignment doesn't).
+
+---
+
 ## ⚠ On-device QA bug list (2026-07-17, user testing the shipped image)
 
 Daily-driver blockers found by driving the OVMF image. Verified by looking at the
