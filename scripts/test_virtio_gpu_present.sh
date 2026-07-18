@@ -187,6 +187,18 @@ check_log "present self-test PASS"       "\[vgpu\] PASS"
 check_log "GPU clear matches SW ref"     "\[vgpu-vk\] PASS: GPU clear matches SW reference"
 check_log "GPU present ran"              "\[vgpu-vk\] PASS: GPU present"
 check_log "GPU backend self-test PASS"   "\[vgpu-vk\] PASS: GPU backend self-test complete"
+# GPU track #182: the vk_core -> venus FILL-offload seam foundation. On this
+# plain 2D virtio-gpu (no VIRGL negotiated) the GPU fill path is INERT, so the
+# self-test proves the foundation WITHOUT a live host GPU: the virgl
+# CLEAR_TEXTURE fill encoder is byte-exact, the UNORM color->float convert is
+# bit-exact, the opt-in honestly refuses without a virgl device (stays SW),
+# and a fill_rect replayed through vkQueueSubmit is pixel-identical to the SW
+# oracle (the seam never disturbs the golden default fill path).
+check_log "fill encoder byte-exact"      "\[vgpu-raster\] PASS: venus CLEAR_TEXTURE fill encoder byte-exact"
+check_log "u8->float convert bit-exact"  "\[vgpu-raster\] PASS: u8->float color convert bit-exact"
+check_log "GPU-raster opt-in refuses"    "\[vgpu-raster\] PASS: GPU-raster opt-in refuses without a virgl device"
+check_log "fill replay == SW oracle"     "\[vgpu-raster\] PASS: fill_rect replay is pixel-identical to the SW oracle"
+check_log "GPU-raster seam foundation"   "\[vgpu-raster\] PASS: GPU-raster fill-offload seam foundation OK"
 # Phase D present-path benchmark: proves the GPU-presented backing matches
 # the SW frame pixel-for-pixel and records the SW-vs-GPU present numbers.
 # (The ns numbers themselves are informational — printed above — and vary
@@ -231,6 +243,11 @@ fi
 
 if grep -a -q -E "\[vgpu-vk\] FAIL" "$LOG"; then
     echo "[test_vgpu] FAIL: kernel reported [vgpu-vk] FAIL" >&2
+    fail=1
+fi
+
+if grep -a -q -E "\[vgpu-raster\] FAIL" "$LOG"; then
+    echo "[test_vgpu] FAIL: kernel reported [vgpu-raster] FAIL" >&2
     fail=1
 fi
 

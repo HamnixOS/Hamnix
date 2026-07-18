@@ -106,7 +106,7 @@ from lib.vk.vk_gpu import (
 # host GPU until the transport negotiates VIRTIO_GPU_F_VIRGL, so nothing
 # regresses. vk_core → vk_venus → driver (no cycle).
 from lib.vk.vk_venus import (
-    vk_venus_available,
+    vk_venus_available, vk_venus_fill_rect,
 )
 
 
@@ -740,6 +740,41 @@ def vk_gpu_accel_available() -> int32:
     return vk_venus_available()
 
 
+# -------------------------------------------------------------------
+# GPU-RASTER opt-in (GPU track #182 — route VK_OP_2D_* fills to the host
+# GPU via venus/virgl instead of the CPU inner loop). SEPARATE from the
+# PRESENT backend above: _vk_backend chooses the SCANOUT path; this flag
+# chooses whether the recorded 2D FILL ops are rasterized on the host GPU.
+# DEFAULT OFF — the SW rasterizer (lib/vk/vk_2d.ad) stays the golden oracle
+# and the default. A caller opts in with vk_enable_gpu_raster(), which
+# REFUSES (staying SW) unless a virgl/venus 3D device is live, so nothing
+# regresses on a plain 2D virtio-gpu or a device-less boot. Even when
+# enabled, each op falls back to SW if the GPU submit fails, so the frame is
+# never blank/wrong.
+_vk_gpu_raster: int32 = 0
+
+
+def vk_enable_gpu_raster() -> int32:
+    # Opt into host-GPU rasterization of 2D fills. Succeeds (returns
+    # VK_SUCCESS, flag=1) ONLY if vk_venus_available() reports a live virgl
+    # 3D renderer; otherwise leaves the flag OFF and returns VK_ERROR_INVALID
+    # (callers treat that as "no GPU raster, keep SW"). Idempotent.
+    if vk_venus_available() == 0:
+        _vk_gpu_raster = 0
+        return VK_ERROR_INVALID
+    _vk_gpu_raster = 1
+    return VK_SUCCESS
+
+
+def vk_disable_gpu_raster():
+    # Reversible flip back to the SW rasterizer for 2D fills.
+    _vk_gpu_raster = 0
+
+
+def vk_gpu_raster_enabled() -> int32:
+    return _vk_gpu_raster
+
+
 def vk_try_enable_gpu_present() -> int32:
     # Clean, reversible opt-in for the DE / compositor: route PRESENT onto
     # the native virtio-gpu device IF one is present. Returns VK_SUCCESS if
@@ -899,6 +934,74 @@ def _vk_replay_draw(c: Ptr[VkCmd]):
         _vk_vp_x, _vk_vp_y, _vk_vp_w, _vk_vp_h)
 
 
+def vk_u8_to_float_bits(cc: uint32) -> uint32:
+    # IEEE-754 single-precision bit pattern of cc/255.0 for cc in [0,255],
+    # computed with INTEGER math only (no FPU) — the color-channel conversion
+    # the virgl CLEAR_TEXTURE fill needs for a UNORM render target. Endpoints
+    # are exact (0 -> 0.0, 255 -> 1.0); intermediate values are correctly
+    # rounded so the host's float->u8 readback reproduces cc exactly. Exposed
+    # (non-underscore) so the self-test can byte-assert it against known
+    # reference bit patterns.
+    if cc == 0:
+        return 0x00000000
+    if cc >= 255:
+        return 0x3F800000
+    # q = round(cc/255 * 2^31): a Q31 fixed-point of cc/255 in (0, 2^31).
+    q: uint64 = (cast[uint64](cc) << 31) / 255
+    # Highest set bit position b of q (q in [2^23, 2^31) here, so b in [23,30]).
+    b: int32 = 0
+    t: uint64 = q
+    while t > 1:
+        t = t >> 1
+        b = b + 1
+    expf: uint32 = cast[uint32](b + 96)          # (b-31) + 127 exponent bias
+    shift: int32 = b - 23
+    mant: uint64 = (q >> cast[uint64](shift)) & 0x7FFFFF
+    if shift > 0:
+        rb: uint64 = (q >> cast[uint64](shift - 1)) & 1   # round-to-nearest
+        mant = mant + rb
+    if mant > 0x7FFFFF:                           # rounding carried into exp
+        mant = 0
+        expf = expf + 1
+    return (expf << 23) | cast[uint32](mant)
+
+
+def _vk_image_virgl_resource(cimg: Ptr[VkImage]) -> uint32:
+    # The virgl 3D render-target resource id bound to this vk color image, or
+    # 0 if none. Becomes non-zero only once the RESOURCE_CREATE_3D +
+    # ATTACH_BACKING + CTX_ATTACH_RESOURCE lifecycle (documented in
+    # lib/vk/vk_venus.ad "remaining virgl encoding") is built and records the
+    # id on the image. Until then this returns 0, so the GPU fill path below
+    # is INERT and every fill falls back to the SW oracle — the frame is
+    # byte-for-byte unchanged.
+    return 0
+
+
+def _vk_gpu_raster_fill_rect(cimg: Ptr[VkImage], x: int64, y: int64,
+                             w: int64, h: int64, rgba: uint32) -> int32:
+    # Route ONE opaque fill_rect to the host GPU via venus/virgl CLEAR_TEXTURE
+    # (lib/vk/vk_venus.ad), using the SAME solid-rect semantics the host
+    # compute shader proved bit-identical to the SW rasterizer. Returns 0 iff
+    # the host GPU accepted+rasterized the fill; -1 to fall back to the SW
+    # oracle. INERT today: vk_venus_available()==0 on a 2D/absent device, and
+    # no virgl render target is bound to the image yet, so it ALWAYS returns
+    # -1 and vk2d_raster_fill_rect runs — never blank/wrong.
+    if vk_venus_available() == 0:
+        return -1
+    rh: uint32 = _vk_image_virgl_resource(cimg)
+    if rh == 0:
+        return -1
+    if w <= 0 or h <= 0:
+        return 0
+    cr: uint32 = vk_u8_to_float_bits((rgba >> 24) & 0xFF)
+    cg: uint32 = vk_u8_to_float_bits((rgba >> 16) & 0xFF)
+    cb: uint32 = vk_u8_to_float_bits((rgba >> 8) & 0xFF)
+    ca: uint32 = vk_u8_to_float_bits(rgba & 0xFF)
+    return vk_venus_fill_rect(rh, cast[uint32](x), cast[uint32](y),
+                              cast[uint32](w), cast[uint32](h),
+                              cr, cg, cb, ca)
+
+
 def _vk_replay_2d_fill_rect(c: Ptr[VkCmd], with_alpha: int32):
     if _vk_cur_color == 0:
         return
@@ -911,9 +1014,16 @@ def _vk_replay_2d_fill_rect(c: Ptr[VkCmd], with_alpha: int32):
     if with_alpha != 0:
         vk2d_raster_fill_rect_alpha(cimg[0].mem_base, cimg[0].width,
                                     cimg[0].height, x, y, w, h, rgba)
-    else:
-        vk2d_raster_fill_rect(cimg[0].mem_base, cimg[0].width,
-                              cimg[0].height, x, y, w, h, rgba)
+        return
+    # Opaque fill: when GPU raster is opted in AND a virgl device is live, try
+    # the host GPU first; on ANY failure fall through to the SW oracle so the
+    # frame is never blank/wrong. Default (flag off) and 2D/absent devices go
+    # straight to SW — byte-for-byte unchanged.
+    if _vk_gpu_raster != 0:
+        if _vk_gpu_raster_fill_rect(cimg, x, y, w, h, rgba) == 0:
+            return
+    vk2d_raster_fill_rect(cimg[0].mem_base, cimg[0].width,
+                          cimg[0].height, x, y, w, h, rgba)
 
 
 def _vk_replay_2d_blit(c: Ptr[VkCmd]):
