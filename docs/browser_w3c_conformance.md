@@ -39,7 +39,7 @@ From a 14-agent parallel audit (2026-07-16). Dual-target, host-iterated (~40 gat
   - **Unary minus preserves signed zero** — `eval_unary` (`lib/web/js/interp.ad`) now computes `U_NEG` as an IEEE negation (`-1.0 * x`) instead of `0.0 - x`, so `-(+0) === -0` (`1/-0 === -Infinity`). The old `0.0 - x` collapsed `-(+0)` back to `+0`, which broke `Object.is(0, -0)` and any `Math.sign`-of-negative-zero style logic. `String(-0)` stays `"0"` per spec.
   - **RegExp `s` (dotAll) flag** — `.` now also matches U+000A when the `s` flag is set (`re_da` global threaded from `obj_re_flags` bit3 through `regex_search` into the `RI_ANY` opcode); `/x/s.dotAll` is reflected, and dotAll flows through `exec`/`test`/`match`/`matchAll`/`replace`/`split`/`search` and the `new RegExp(src, "s")` constructor. `lib/web/js/{state,setup}.ad`.
   - **RegExp `y` (sticky) flag** — a sticky match must begin **exactly at `.lastIndex`** with no forward scan: `regex_search` returns `-1` after a single anchored attempt when sticky (bit4). `.sticky` is reflected; `exec`/`test` read+advance `.lastIndex` for `y` (not only `g`); and the `matchAll`/`replace`/`match` global loops honor the anchor so a gap stops iteration (correct tokenizer semantics). `lib/web/js/setup.ad`. `test_jsengine_es2022b_host.sh` (34 asserts vs node: hasOwn/is edge cases, `1/-0`, `/a.b/s`, sticky `.lastIndex` progression + non-contiguous stop + named-group×dotAll combo).
-  - Regex flags: **`d` (indices) flag — now DONE (2026-07-18, gate `reindices`)**: `/re/d` reflects `hasIndices`, and a match result carries a parallel `.indices` array of `[start,end)` pairs per capture group (undefined for a non-participating group) plus `.indices.groups` (named-group pairs; undefined when there are none) — only present when `d` is set, threaded through both `exec()` and `matchAll()`. Exposure of the already-tracked `re_cap[]` start/end (`lib/web/js/setup.ad` `js_make_regex` bit5 + `regex_result_array`). STILL missing: **`u`/`v` (Unicode) mode** — the VM is byte-oriented, so `\u{...}` code-point classes and full surrogate handling remain out of scope.
+  - Regex flags: **`d` (indices) flag — now DONE (2026-07-18, gate `reindices`)**: `/re/d` reflects `hasIndices`, and a match result carries a parallel `.indices` array of `[start,end)` pairs per capture group (undefined for a non-participating group) plus `.indices.groups` (named-group pairs; undefined when there are none) — only present when `d` is set, threaded through both `exec()` and `matchAll()`. Exposure of the already-tracked `re_cap[]` start/end (`lib/web/js/setup.ad` `js_make_regex` bit5 + `regex_result_array`). Regex flags: **`u`/`v` (Unicode) mode — now DONE as an honest byte-model subset (2026-07-18, gate `reunicode`)**; see the round-8 section below.
 - **R14** (HTML event-loop APIs — `requestAnimationFrame`/`cancelAnimationFrame` + the ordering guarantees frameworks depend on):
   - **Already present (verified, NOT rebuilt)** — `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`/`queueMicrotask` and the whole **microtask queue** landed with the Promise/async rounds (`lib/web/js/builtins/timers.ad` + `promise.ad`). Timers and promise reactions share ONE bounded deferred-callback table (`lib/web/js/state.ad`, `TIMER_CAP` 4096, `TIMER_DRAIN_CAP` 10000) that `js_eval` DRAINS at end-of-script in **(microtask-first, then delay, then insertion)** order — a `setTimeout(...,0)` scheduled before a `queueMicrotask`/`Promise.resolve().then` still runs AFTER it. NOT wall-clock async; the drain is deterministic and capped so a self-re-enqueuing `setInterval` cannot spin forever.
   - **`requestAnimationFrame(cb)` / `cancelAnimationFrame(id)`** (this round) — rAF callbacks register on the SAME timer table (`raf_schedule`, `timer_raf=1` flag) as one-shot **frame macrotasks**. Each enqueues into a frame indexed by `raf_sched_gen`; its ordering "delay" is the frame's **virtual timestamp** `(gen+1)*FRAME_MS_VC` (`FRAME_MS_VC=16.0`, ~60fps), which is also the `DOMHighResTimeStamp` handed to the callback at fire time. Because the timestamp is derived purely from a frame counter — **no `Date`, no random, no sleeping** — drains stay fully deterministic. Sharing the timer table means timers and frames live on ONE virtual timeline: a `setTimeout(...,0)` (delay 0) fires before frame 0 (t=16), and a microtask still beats both. A rAF that re-schedules a rAF from inside its own callback lands in the **NEXT** frame, not an infinite same-frame loop: `raf_sched_gen` is bumped the moment the first callback of the current frame fires (in `run_one_task`), so an animation loop advances 16→32→48… frame by frame and terminates at the drain cap. `cancelAnimationFrame` reuses `timer_clear` (shared id space). Added in `lib/web/js/builtins/timers.ad` (`raf_schedule` + `run_one_task` rAF branch), `state.ad` (`timer_raf`, `FRAME_MS_VC`, `raf_sched_gen`), `consts.ad` (NAT_REQUEST_ANIM_FRAME/NAT_CANCEL_ANIM_FRAME), `builtins/collections.ad` (dispatch), `setup.ad` (globals), reset in `api.ad` (`js_init`). `test_hambrowse_timers_host.sh` (15 asserts vs node/browser order: microtask-before-macrotask from BOTH `queueMicrotask` and `Promise.resolve().then`; timers by delay-then-insertion; clear cancels; interval-N-then-clear; args forwarded; nested timer→microtask; rAF runs with timestamp; cancelAnimationFrame; rAF-loop virtual-clock 16/32/48; and the shared timer+frame timeline).
@@ -118,6 +118,10 @@ the passing host gates found the following.
 - **[ecmascript] RegExp `d` (indices) flag — DONE (gate `reindices`).** See the R13 regex-flags note below —
   `/re/d` now reflects `hasIndices` and exposes per-capture `[start,end)` `.indices` (+ `.indices.groups`)
   through `exec()`/`matchAll()`.
+- **[ecmascript] RegExp `u`/`v` (Unicode) mode — SUBSET DONE (gate `reunicode`, round-8).** `\u{CP}` code-point
+  escapes + surrogate-pair combining (compiled to UTF-8 byte atoms), ASCII-range `\p{...}`/`\P{...}` property classes,
+  `.unicode`/`.unicodeSets` reflection, and string/template `\u{CP}` decoding. Full code-point-granular semantics
+  (byte-level `.`, astral `\p{}`) deferred — see the round-8 section + round-9 map.
 - **[html-forms] `FormData` — DONE (gate `formdata`).** The AJAX form multimap primitive; see live-worklist
   item #10 below. Reuses the URLSearchParams `@@k/@@v` storage + methods; only the constructor is distinct.
 
@@ -378,10 +382,44 @@ the passing host gates found the following.
   interactive click-to-toggle remains a DOM/event-layer concern; the accent applies to checkbox/radio only (not range/
   progress/other form controls).
 
-**TOP REMAINING W3C GAPS after the 2026-07-18g animation-fill-mode + form-control-polish round (a map for the next/
-round-8 agent, roughly by real-world value — the browser is now broad but NOT "fully W3C-implemented"; concrete holes):**
-1. **[ecmascript] RegExp `u`/`v` Unicode mode — ABSENT (byte-oriented VM).** `\u{...}` code-point classes, surrogate
-   handling, `\p{...}` property escapes. Hard (VM rewrite); moderate value. The single biggest remaining ES gap.
+**REGEXP `u`/`v` UNICODE MODE ROUND 2026-07-18h (round-8 — the map's #1, the single biggest remaining ES gap, host-verified):**
+- The byte-oriented backtracking regex VM (`lib/web/js/setup.ad`) + the string lexer (`lib/web/js/lexer.ad`) now support
+  an **honest byte-model subset** of the `u`/`v` (Unicode / unicodeSets) flags. Because JS strings are stored as **UTF-8
+  byte buffers** in this engine, the design choice throughout is: decode code points to their UTF-8 byte sequence at
+  COMPILE time and match those bytes — which is *exactly correct* for a UTF-8 subject, for the astral cases below.
+  - **Flag + reflection** — `u` (117) / `v` (118) set the `re_uni` compile global (bit6/bit7 of `obj_re_flags`); `/re/u`
+    reflects `.unicode`, `/re/v` reflects `.unicodeSets`, and both appear in `.flags`. `v` is treated as a `u` superset
+    for this subset. `js_make_regex`.
+  - **`\u{CP}` code-point escapes + surrogate pairs** — in u-mode `\u{1F600}` and a `😀` high/low surrogate
+    PAIR combine to one code point and compile to an **`RN_SEQ` of the 2/3/4 UTF-8 bytes** (`re_utf8_atom` /
+    `re_parse_u_cp`). A quantifier binds the whole code point (`/\u{1F600}+/u` matches per-emoji, not per-byte). Works
+    top-level; astral members inside a `[...]` class are dropped (a byte bitmap can't hold them) — code points ≤ 0xFF are
+    added. Verified: `/\u{1F600}/u.test("😀")`, `.match(...).index`, `/😀/u` literal, `+` quantifier, non-match of a
+    different emoji.
+  - **`\p{Name}` / `\P{Name}` property classes** — general categories over the **ASCII range**: `L`/`Letter`/`Alphabetic`,
+    `N`/`Nd`/`Number`, `Lu`/`Uppercase[_Letter]`, `Ll`/`Lowercase[_Letter]`, `White_Space`/`space`, `ASCII`, `Any`
+    (`re_prop_which` + `cls_add_prop`). `\P` negates over 0..255. Supported top-level AND inside `[...]` classes
+    (`[\p{L}\p{N}]+`).
+  - **String/template `\u{CP}` decoding (lexer)** — `"\u{1F600}"`, `` `\u{41}` ``, and `😀` surrogate pairs in
+    string/template literals now decode to their UTF-8 bytes (`lex_emit_uesc` → `emit_utf8`); previously `\u{...}` was
+    silently dropped (the subject string never contained the character, so even a correct regex couldn't match).
+  - **Gate** `scripts/test_jsengine_reunicode_host.sh` (32 inline asserts vs node semantics via the x86_64-linux JS host
+    driver), registered in `ci_battery_manifest.txt`. Legacy non-u behaviour preserved (`\uHHHH` low-byte, `\p`→literal
+    `p`, `\u{3}`→quantified `u`) — verified, and zero regressions across the JS host gate suite + browser render gates.
+  - **DEFERRED (documented, not faked):** `.` and case-folding operate on BYTES, not code points, in u-mode (a
+    non-ASCII `.` matches one UTF-8 byte); `\p{...}` covers only the ASCII range (astral/Latin-1 property matching needs
+    code-point awareness the byte bitmap lacks); astral members inside `[...]` classes; `String.length` counts UTF-8
+    bytes (not UTF-16 code units) — pre-existing to the byte-string model, unchanged. A full code-point VM (the "hard"
+    rewrite the prior map flagged) remains the only way to close these; the subset above covers the dominant real cases
+    (emoji/astral literals + escapes, ASCII property classes) correctly.
+
+**TOP REMAINING W3C GAPS after the 2026-07-18h RegExp `u`/`v` round (a map for the next/round-9 agent, roughly by
+real-world value — the browser is now broad but NOT "fully W3C-implemented"; concrete holes):**
+1. **[ecmascript] RegExp `u`/`v` FULL code-point semantics — SUBSET LANDED (gate `reunicode`); remainder is the hard
+   part.** `\u{...}` escapes, surrogate-pair combining, ASCII `\p{...}` property classes, and string-literal `\u{CP}`
+   decoding are DONE (byte-model, correct for UTF-8 subjects). STILL absent: code-point-granular `.`/case-fold, astral
+   `\p{...}` and astral `[...]` class members, UTF-16 `String.length`/index units. These need a code-point VM rewrite
+   (hard). Lower priority now — the common cases work.
 2. **[css-grid] `grid-auto-flow: dense` / column-flow + `subgrid` — ABSENT.** Row-major auto-flow with occupancy-map
    back-fill exists, but `dense` (back-fill earlier holes left by explicitly-placed spanning items), column-major flow,
    `subgrid`, >8 tracks (`GRID_MAXTRACK`), >12 named areas per container, and distinct-y multi-row areas without an
