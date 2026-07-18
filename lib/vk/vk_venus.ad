@@ -42,6 +42,8 @@ from drivers.video.virtio_gpu import (
     virtio_gpu_3d_available, virtio_gpu_submit_3d,
     virtio_gpu_3d_create_rt, virtio_gpu_3d_rt_backing,
     virtio_gpu_3d_rt_readback, virtio_gpu_3d_rt_roundtrip_probe,
+    virtio_gpu_3d_create_frame_rt, virtio_gpu_3d_frame_rt_backing,
+    virtio_gpu_3d_frame_rt_readback, virtio_gpu_3d_create_scratch_rt,
 )
 
 
@@ -164,9 +166,11 @@ def vk_venus_encode_fill_rect(buf: uint64, res_handle: uint32,
 # host GPU under the shipped virglrenderer.
 VIRGL_CCMD_CREATE_OBJECT:         uint32 = 1
 VIRGL_CCMD_BIND_OBJECT:           uint32 = 2    # bind a created state object
+VIRGL_CCMD_DESTROY_OBJECT:        uint32 = 3    # free a created state object
 VIRGL_CCMD_SET_FRAMEBUFFER_STATE: uint32 = 5
 VIRGL_CCMD_CLEAR7:                uint32 = 7    # the real CLEAR opcode (7)
 VIRGL_CCMD_SET_SCISSOR_STATE:     uint32 = 15   # gallium scissor rectangle(s)
+VIRGL_CCMD_RESOURCE_COPY_REGION:  uint32 = 17   # GPU box copy (glCopyImageSubData)
 VIRGL_OBJECT_SURFACE:             uint32 = 8
 VIRGL_OBJECT_RASTERIZER:          uint32 = 2
 VIRGL_OBJ_SURFACE_SIZE:           uint32 = 5
@@ -319,6 +323,172 @@ def vk_venus_encode_fill_rect_gl(buf: uint64, res_handle: uint32,
     return k                                             # 47
 
 
+# ===================================================================
+# MULTI-OP FRAME encoders (a real DE window / browser box-paint frame)
+# ===================================================================
+#
+# A real frame issues MANY solid rects into ONE render target. The obvious
+# encoding — a scissored CLEAR per rect — is UNRELIABLE on the shipped
+# virglrenderer: on-device (RTX 3090) a scissor-enabled rasterizer + SET_SCISSOR
+# does NOT clip the following CLEAR (every fill clears the WHOLE target, so only
+# the last color survives). The encoding is byte-correct vs mesa/virglrenderer
+# sources (scissor bit 14, VIRGL_OBJ_RS_SIZE=9) but the host clear path ignores
+# it. So the FRAME path uses only primitives PROVEN on this host:
+#   * full-target CLEAR (no scissor)      — the proven GREEN self-test path
+#   * RESOURCE_COPY_REGION (glCopyImageSubData) — a real GPU box copy
+# A solid rect fill = full-CLEAR a same-format SCRATCH RT to the color, then
+# COPY_REGION its (0,0,w,h) box into (x,y) of the frame RT. Encoding:
+#   1. ONE setup stream  — create a surface over the FRAME RT, a surface over
+#      the SCRATCH RT, a scissor-OFF rasterizer, bind it.  vk_venus_encode_frame_setup
+#   2. background        — SET_FRAMEBUFFER(frame) + CLEAR(bg).  vk_venus_encode_fb_clear
+#   3. each rect         — SET_FRAMEBUFFER(scratch) + CLEAR(color) + COPY_REGION
+#                          scratch->frame at (x,y,w,h).       vk_venus_encode_rect_fill
+#   4. intra-frame blit  — COPY_REGION frame->frame.          vk_venus_encode_copy_region
+# Objects persist across SUBMIT_3D, so the fills reuse them. All encoders are
+# EXTERN-free + byte-testable; colors are IEEE-754 float bit patterns.
+
+# Distinct object handles for the FRAME path (must not collide with the fill
+# path's 0x40-range handles nor the RT resource ids 2/3/4).
+VK_VENUS_FRAME_SURF:   uint32 = 0x50   # surface over the FRAME RT
+VK_VENUS_FRAME_SSURF:  uint32 = 0x53   # surface over the SCRATCH RT
+VK_VENUS_FRAME_RS_OFF: uint32 = 0x52   # scissor-OFF rasterizer (full clears)
+
+
+def _venus_put_surface(buf: uint64, k: uint32, surf: uint32,
+                       res: uint32) -> uint32:
+    # CREATE_OBJECT/SURFACE (6 dwords): a B8G8R8A8 color surface over `res`.
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_CREATE_OBJECT,
+                                       VIRGL_OBJECT_SURFACE,
+                                       VIRGL_OBJ_SURFACE_SIZE))
+    k = _venus_put(buf, k, surf)
+    k = _venus_put(buf, k, res)
+    k = _venus_put(buf, k, VIRGL_FMT_B8G8R8A8_UNORM)
+    k = _venus_put(buf, k, 0)                            # texture level 0
+    k = _venus_put(buf, k, 0)                            # first|last layer 0
+    return k
+
+
+def vk_venus_encode_frame_setup(buf: uint64, fres: uint32, sres: uint32,
+                                fsurf: uint32, ssurf: uint32,
+                                rs_off: uint32) -> uint32:
+    # Create a surface over the FRAME RT (fsurf/fres) and one over the SCRATCH
+    # RT (ssurf/sres), a scissor-OFF rasterizer (rs_off), and bind it so all
+    # CLEARs are full-target. Issue ONCE per frame. Writes 30 dwords.
+    #
+    # DESTROY the handles FIRST so re-running setup on a later frame in the same
+    # 3D context does not fail "object already exists"; destroying an absent
+    # handle is a harmless no-op.
+    k: uint32 = 0
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_DESTROY_OBJECT,
+                                       VIRGL_OBJECT_SURFACE, 1))
+    k = _venus_put(buf, k, fsurf)
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_DESTROY_OBJECT,
+                                       VIRGL_OBJECT_SURFACE, 1))
+    k = _venus_put(buf, k, ssurf)
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_DESTROY_OBJECT,
+                                       VIRGL_OBJECT_RASTERIZER, 1))
+    k = _venus_put(buf, k, rs_off)
+    k = _venus_put_surface(buf, k, fsurf, fres)
+    k = _venus_put_surface(buf, k, ssurf, sres)
+    # CREATE_OBJECT / RASTERIZER (scissor disabled) — full clears.
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_CREATE_OBJECT,
+                                       VIRGL_OBJECT_RASTERIZER,
+                                       VIRGL_OBJ_RASTERIZER_SIZE))
+    k = _venus_put(buf, k, rs_off)
+    k = _venus_put(buf, k, 0)                            # S0: all flags off
+    k = _venus_put(buf, k, 0)
+    k = _venus_put(buf, k, 0)
+    k = _venus_put(buf, k, 0)
+    k = _venus_put(buf, k, 0)
+    k = _venus_put(buf, k, 0)
+    k = _venus_put(buf, k, 0)
+    k = _venus_put(buf, k, 0)
+    # BIND the scissor-OFF rasterizer so clears fill the whole target.
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_BIND_OBJECT,
+                                       VIRGL_OBJECT_RASTERIZER, 1))
+    k = _venus_put(buf, k, rs_off)
+    return k                                             # 30
+
+
+def _venus_put_fb_clear(buf: uint64, k: uint32, surf: uint32,
+                        cr: uint32, cg: uint32, cb: uint32,
+                        ca: uint32) -> uint32:
+    # SET_FRAMEBUFFER_STATE(surf) + full CLEAR to (cr,cg,cb,ca). 13 dwords.
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3))
+    k = _venus_put(buf, k, 1)                            # nr_cbufs
+    k = _venus_put(buf, k, 0)                            # zsurf_handle (none)
+    k = _venus_put(buf, k, surf)                         # cbuf[0]
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_CLEAR7, 0, VIRGL_OBJ_CLEAR_SIZE))
+    k = _venus_put(buf, k, PIPE_CLEAR_COLOR0)
+    k = _venus_put(buf, k, cr)
+    k = _venus_put(buf, k, cg)
+    k = _venus_put(buf, k, cb)
+    k = _venus_put(buf, k, ca)
+    k = _venus_put(buf, k, 0)                            # depth lo
+    k = _venus_put(buf, k, 0)                            # depth hi
+    k = _venus_put(buf, k, 0)                            # stencil
+    return k
+
+
+def vk_venus_encode_fb_clear(buf: uint64, surf: uint32,
+                             cr: uint32, cg: uint32, cb: uint32,
+                             ca: uint32) -> uint32:
+    # Bind `surf` as the framebuffer and full-CLEAR it to the color. 13 dwords.
+    return _venus_put_fb_clear(buf, 0, surf, cr, cg, cb, ca)
+
+
+def vk_venus_encode_rect_fill(buf: uint64, fres: uint32, sres: uint32,
+                              ssurf: uint32,
+                              x: uint32, y: uint32, w: uint32, h: uint32,
+                              cr: uint32, cg: uint32, cb: uint32,
+                              ca: uint32) -> uint32:
+    # A GPU solid fill_rect: full-CLEAR the SCRATCH RT (bound via ssurf) to the
+    # color, then COPY_REGION its (0,0,w,h) box into (x,y) of the FRAME RT.
+    # Robust (no scissor). Writes 13 + 14 = 27 dwords; returns the count.
+    k: uint32 = _venus_put_fb_clear(buf, 0, ssurf, cr, cg, cb, ca)
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_RESOURCE_COPY_REGION, 0, 13))
+    k = _venus_put(buf, k, fres)                         # dst_res_handle
+    k = _venus_put(buf, k, 0)                            # dst_level
+    k = _venus_put(buf, k, x)                            # dst x
+    k = _venus_put(buf, k, y)                            # dst y
+    k = _venus_put(buf, k, 0)                            # dst z
+    k = _venus_put(buf, k, sres)                         # src_res_handle
+    k = _venus_put(buf, k, 0)                            # src_level
+    k = _venus_put(buf, k, 0)                            # src_box.x
+    k = _venus_put(buf, k, 0)                            # src_box.y
+    k = _venus_put(buf, k, 0)                            # src_box.z
+    k = _venus_put(buf, k, w)                            # src_box.w
+    k = _venus_put(buf, k, h)                            # src_box.h
+    k = _venus_put(buf, k, 1)                            # src_box.d
+    return k                                             # 27
+
+
+def vk_venus_encode_copy_region(buf: uint64,
+                                dst: uint32, dstx: uint32, dsty: uint32,
+                                src: uint32, sx: uint32, sy: uint32,
+                                w: uint32, h: uint32) -> uint32:
+    # Encode VIRGL_CCMD_RESOURCE_COPY_REGION: GPU-copy the w×h box at (sx,sy) of
+    # resource `src` to (dstx,dsty) of `dst` (glCopyImageSubData on the host).
+    # A 1:1 verbatim texel copy — the accelerated equivalent of an OPAQUE blit.
+    # Writes 14 dwords (1 header + 13 body); returns the count.
+    k: uint32 = 0
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_RESOURCE_COPY_REGION, 0, 13))
+    k = _venus_put(buf, k, dst)                          # dst_res_handle
+    k = _venus_put(buf, k, 0)                            # dst_level
+    k = _venus_put(buf, k, dstx)                         # dst x
+    k = _venus_put(buf, k, dsty)                         # dst y
+    k = _venus_put(buf, k, 0)                            # dst z
+    k = _venus_put(buf, k, src)                          # src_res_handle
+    k = _venus_put(buf, k, 0)                            # src_level
+    k = _venus_put(buf, k, sx)                           # src_box.x
+    k = _venus_put(buf, k, sy)                           # src_box.y
+    k = _venus_put(buf, k, 0)                            # src_box.z
+    k = _venus_put(buf, k, w)                            # src_box.w
+    k = _venus_put(buf, k, h)                            # src_box.h
+    k = _venus_put(buf, k, 1)                            # src_box.d (2D=1)
+    return k                                             # 14
+
+
 # --- vk seam (availability + submit) -------------------------------
 
 # Scratch DWORD buffer for the encoded command stream (module-level so no
@@ -448,6 +618,92 @@ def vk_venus_rt_roundtrip_probe(w: uint32, h: uint32) -> int32:
     # ALIVE (a known pattern survived upload+download), 0 = host produced only
     # zeros (host GL/EGL context non-functional), -1 = unavailable.
     return virtio_gpu_3d_rt_roundtrip_probe(w, h)
+
+
+# --- multi-op FRAME seam (setup + per-op fills/copies + readback) -------
+#
+# The FRAME RT (res id 3) + a same-sized SCRATCH RT (res id 4) give vk_core's
+# VK_OP_2D replay a robust host-GPU frame path built ONLY on primitives proven
+# on this virglrenderer/RTX-3090 host: a full CLEAR and RESOURCE_COPY_REGION.
+# begin (setup + background clear) -> N rect fills (scratch-clear + copy) ->
+# optional intra-frame blit (copy) -> readback. All INERT (-1/0) unless a live
+# virgl 3D device is present, so the SW rasterizer stays the default + oracle.
+# The cached frame + scratch resource ids (from vk_venus_frame_create_rt).
+venus_frame_res:   uint32 = 0
+venus_scratch_res: uint32 = 0
+
+
+def vk_venus_frame_create_rt(w: uint32, h: uint32) -> uint32:
+    # Create-or-fetch BOTH the frame-sized host RT and the same-sized scratch
+    # RT. Returns the FRAME resource id (non-zero) or 0 if either is unavailable.
+    fr: uint32 = virtio_gpu_3d_create_frame_rt(w, h)
+    if fr == 0:
+        return 0
+    sr: uint32 = virtio_gpu_3d_create_scratch_rt(w, h)
+    if sr == 0:
+        return 0
+    venus_frame_res = fr
+    venus_scratch_res = sr
+    return fr
+
+
+def vk_venus_frame_backing() -> uint64:
+    # Identity-mapped VA of the frame RT backing (GPU pixels land here after a
+    # vk_venus_frame_readback). 0 if none.
+    return virtio_gpu_3d_frame_rt_backing()
+
+
+def vk_venus_frame_readback(w: uint32, h: uint32) -> int32:
+    # TRANSFER_FROM_HOST_3D the whole w×h frame RT into its guest backing.
+    return virtio_gpu_3d_frame_rt_readback(w, h)
+
+
+def vk_venus_frame_begin(res_handle: uint32,
+                         cr: uint32, cg: uint32, cb: uint32,
+                         ca: uint32) -> int32:
+    # Set up the frame's GPU objects (frame + scratch surfaces, a scissor-OFF
+    # rasterizer) and full-clear the frame RT to the background (cr,cg,cb,ca).
+    # Two SUBMIT_3D streams. Returns 0 iff the device accepted both, -1 else.
+    # `res_handle` is the frame RT id (== venus_frame_res).
+    if virtio_gpu_3d_available() == 0:
+        return -1
+    n: uint32 = vk_venus_encode_frame_setup(cast[uint64](&venus_cmd_buf[0]),
+                                            res_handle, venus_scratch_res,
+                                            VK_VENUS_FRAME_SURF,
+                                            VK_VENUS_FRAME_SSURF,
+                                            VK_VENUS_FRAME_RS_OFF)
+    if virtio_gpu_submit_3d(cast[uint64](&venus_cmd_buf[0]), n) != 0:
+        return -1
+    n = vk_venus_encode_fb_clear(cast[uint64](&venus_cmd_buf[0]),
+                                 VK_VENUS_FRAME_SURF, cr, cg, cb, ca)
+    return virtio_gpu_submit_3d(cast[uint64](&venus_cmd_buf[0]), n)
+
+
+def vk_venus_frame_fill(x: uint32, y: uint32, w: uint32, h: uint32,
+                        cr: uint32, cg: uint32, cb: uint32,
+                        ca: uint32) -> int32:
+    # GPU-rasterize an opaque fill_rect of box (x,y,w,h) to (cr,cg,cb,ca) into
+    # the frame RT: full-CLEAR the scratch RT to the color, then COPY_REGION its
+    # (0,0,w,h) box to (x,y). vk_venus_frame_begin must have run.
+    if virtio_gpu_3d_available() == 0:
+        return -1
+    n: uint32 = vk_venus_encode_rect_fill(cast[uint64](&venus_cmd_buf[0]),
+                                          venus_frame_res, venus_scratch_res,
+                                          VK_VENUS_FRAME_SSURF,
+                                          x, y, w, h, cr, cg, cb, ca)
+    return virtio_gpu_submit_3d(cast[uint64](&venus_cmd_buf[0]), n)
+
+
+def vk_venus_frame_blit(res_handle: uint32, dstx: uint32, dsty: uint32,
+                        sx: uint32, sy: uint32, w: uint32, h: uint32) -> int32:
+    # GPU-copy the w×h box at (sx,sy) to (dstx,dsty) within the frame RT — the
+    # accelerated OPAQUE 1:1 blit (RESOURCE_COPY_REGION).
+    if virtio_gpu_3d_available() == 0:
+        return -1
+    n: uint32 = vk_venus_encode_copy_region(cast[uint64](&venus_cmd_buf[0]),
+                                            res_handle, dstx, dsty,
+                                            res_handle, sx, sy, w, h)
+    return virtio_gpu_submit_3d(cast[uint64](&venus_cmd_buf[0]), n)
 
 
 # ===================================================================

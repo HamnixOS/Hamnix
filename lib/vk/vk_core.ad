@@ -107,6 +107,8 @@ from lib.vk.vk_gpu import (
 # regresses. vk_core → vk_venus → driver (no cycle).
 from lib.vk.vk_venus import (
     vk_venus_available, vk_venus_fill_rect,
+    vk_venus_frame_create_rt, vk_venus_frame_begin, vk_venus_frame_fill,
+    vk_venus_frame_readback, vk_venus_frame_backing,
 )
 
 
@@ -447,6 +449,15 @@ def vk_image_memory_size(img_h: uint64) -> uint64:
     if img_h == 0 or img[0].magic != VK_MAGIC_IMAGE:
         return 0
     return img[0].width * img[0].height * img[0].bpp
+
+
+def vk_image_mem_base(img_h: uint64) -> uint64:
+    # Host VA of the image's bound backing (0 if unbound). Lets a caller /
+    # self-test read the rendered pixels without holding the memory handle.
+    img: Ptr[VkImage] = cast[Ptr[VkImage]](img_h)
+    if img_h == 0 or img[0].magic != VK_MAGIC_IMAGE:
+        return 0
+    return img[0].mem_base
 
 
 def vkBindImageMemory(img_h: uint64, mem_h: uint64,
@@ -804,6 +815,222 @@ _vk_vp_w: uint64 = 0
 _vk_vp_h: uint64 = 0
 
 
+# ===================================================================
+# GPU FRAME ROUTER (GPU track #182 — a REAL multi-op frame on the host GPU)
+# ===================================================================
+#
+# When GPU raster is opted in (vk_enable_gpu_raster) AND a live virgl device is
+# present AND the whole recorded frame is composed only of ops the host GPU can
+# rasterize BYTE-IDENTICALLY to the vk2d SW oracle, vkQueueSubmit replays the
+# ENTIRE frame on the host GPU (into a frame-sized virgl render target) instead
+# of the CPU inner loop, then reads the pixels back into the color image. The
+# op vocabulary the GPU frame currently covers (each a scissored virgl CLEAR,
+# so pixel-identical to vk2d_raster_fill_rect for the clamped opaque rect):
+#   * the render-pass background CLEAR      (full-target CLEAR)
+#   * VK_OP_2D_FILL_RECT                     (scissored CLEAR)
+#   * VK_OP_2D_FILL_RECT_ALPHA when opaque   (alpha byte == 0xFF; == fill_rect)
+#   * VK_OP_2D_DRAW_LINE when axis-aligned   (h/v thick line == a solid rect)
+# Any other op (translucent alpha, rounded rect, DIAGONAL line, blit, 3D draw)
+# or a non-BGRA / non-cleared target makes the frame INELIGIBLE, and the whole
+# frame stays on the SW rasterizer — never blank/wrong. If ANY GPU submit or the
+# readback fails mid-frame, the router abandons the GPU and re-runs the WHOLE
+# frame on the SW path (the color image is CPU memory the GPU path never wrote).
+# DEFAULT OFF: _vk_gpu_raster is 0 unless a caller opts in on a live device.
+
+_vk_gpu_frame_rt: uint32 = 0        # frame RT resource id, per GPU submit
+_vk_gpu_frame_w: uint64 = 0
+_vk_gpu_frame_h: uint64 = 0
+_vk_gpu_frames: uint64 = 0          # count of frames actually rendered on the GPU
+
+
+def vk_gpu_frames_rendered() -> uint64:
+    # How many vkQueueSubmit frames were rasterized end-to-end on the host GPU
+    # (the router engaged AND every GPU submit + readback succeeded). A caller /
+    # self-test reads this to PROVE the GPU path was taken, not the SW fallback.
+    return _vk_gpu_frames
+
+
+def _vk_op_is_axis_line(c: Ptr[VkCmd]) -> int32:
+    # 1 iff this DRAW_LINE is horizontal or vertical (x1==x2 or y1==y2) — the
+    # only lines whose t×t-brush Bresenham coverage is exactly a solid rect and
+    # can therefore be GPU-encoded as one scissored CLEAR, byte-identical.
+    x1: int64 = _vk_unpack_lo(c[0].a0)
+    y1: int64 = _vk_unpack_hi(c[0].a0)
+    x2: int64 = _vk_unpack_lo(c[0].a1)
+    y2: int64 = _vk_unpack_hi(c[0].a1)
+    if x1 == x2 or y1 == y2:
+        return 1
+    return 0
+
+
+def _vk_frame_gpu_eligible(cb: Ptr[VkCommandBuffer]) -> int32:
+    # 1 iff EVERY op in the recorded frame can be rasterized on the host GPU
+    # byte-identically to the SW oracle (see the router header). The render pass
+    # must target a B8G8R8A8 (GPU scanout order) image AND clear it, so the GPU
+    # RT and the SW image start from the same background.
+    saw_begin: int32 = 0
+    i: uint64 = 0
+    n: uint64 = cb[0].cmd_count
+    while i < n:
+        c: Ptr[VkCmd] = _vk_cmd_at(cb, i)
+        op: uint32 = c[0].op
+        if op == VK_OP_BEGIN_RENDER_PASS:
+            col: uint64 = c[0].a0
+            do_clear: int32 = cast[int32](c[0].a2)
+            if col == 0 or do_clear == 0:
+                return 0
+            cimg: Ptr[VkImage] = cast[Ptr[VkImage]](col)
+            if cimg[0].format != VK_FORMAT_B8G8R8A8_UNORM:
+                return 0
+            saw_begin = 1
+        elif op == VK_OP_END_RENDER_PASS:
+            i = i + 1
+            continue
+        elif op == VK_OP_SET_VIEWPORT:
+            i = i + 1
+            continue
+        elif op == VK_OP_2D_FILL_RECT:
+            i = i + 1
+            continue
+        elif op == VK_OP_2D_FILL_RECT_ALPHA:
+            if (cast[uint32](c[0].a2) & 0xFF) != 0xFF:   # translucent -> SW
+                return 0
+        elif op == VK_OP_2D_DRAW_LINE:
+            if _vk_op_is_axis_line(c) == 0:              # diagonal -> SW
+                return 0
+        else:
+            return 0                                     # blit/roundrect/3D -> SW
+        i = i + 1
+    return saw_begin
+
+
+def _vk_gpu_fill_clamped(x: int64, y: int64, w: int64, h: int64,
+                         rgba: uint32) -> int32:
+    # Clamp (x,y,w,h) to the frame RT bounds (mirroring vk2d_raster_fill_rect's
+    # clip) and GPU-fill it via a scissored CLEAR. Empty after clip = no-op
+    # (0). Colors convert through vk_u8_to_float_bits so the host float->unorm
+    # readback reproduces each 8-bit channel exactly. Returns the submit rc.
+    if w <= 0 or h <= 0:
+        return 0
+    iw: int64 = cast[int64](_vk_gpu_frame_w)
+    ih: int64 = cast[int64](_vk_gpu_frame_h)
+    x0: int64 = x
+    y0: int64 = y
+    x1: int64 = x + w
+    y1: int64 = y + h
+    if x0 < 0:
+        x0 = 0
+    if y0 < 0:
+        y0 = 0
+    if x1 > iw:
+        x1 = iw
+    if y1 > ih:
+        y1 = ih
+    if x0 >= x1 or y0 >= y1:
+        return 0
+    cr: uint32 = vk_u8_to_float_bits((rgba >> 24) & 0xFF)
+    cg: uint32 = vk_u8_to_float_bits((rgba >> 16) & 0xFF)
+    cb2: uint32 = vk_u8_to_float_bits((rgba >> 8) & 0xFF)
+    # vk2d's opaque fill/line ALWAYS deposits alpha 0xFF (ignoring the color's
+    # low byte); match that on the GPU so the readback is byte-identical.
+    ca: uint32 = 0x3F800000                              # 1.0f (opaque)
+    return vk_venus_frame_fill(cast[uint32](x0), cast[uint32](y0),
+                               cast[uint32](x1 - x0), cast[uint32](y1 - y0),
+                               cr, cg, cb2, ca)
+
+
+def _vk_gpu_frame_line(c: Ptr[VkCmd]) -> int32:
+    # GPU-fill an axis-aligned thick line as its exact bounding rectangle: a
+    # horizontal/vertical t×t-brush Bresenham sweep covers [min,max]+t in the
+    # sweep axis and t in the other — identical to vk2d_raster_draw_line.
+    x1: int64 = _vk_unpack_lo(c[0].a0)
+    y1: int64 = _vk_unpack_hi(c[0].a0)
+    x2: int64 = _vk_unpack_lo(c[0].a1)
+    y2: int64 = _vk_unpack_hi(c[0].a1)
+    t: int64 = cast[int64](cast[int32](cast[uint32](c[0].a2)))
+    if t < 1:
+        t = 1
+    rgba: uint32 = cast[uint32](c[0].a3)
+    xlo: int64 = x1
+    if x2 < xlo:
+        xlo = x2
+    ylo: int64 = y1
+    if y2 < ylo:
+        ylo = y2
+    xhi: int64 = x1
+    if x2 > xhi:
+        xhi = x2
+    yhi: int64 = y1
+    if y2 > yhi:
+        yhi = y2
+    return _vk_gpu_fill_clamped(xlo, ylo, (xhi - xlo) + t, (yhi - ylo) + t, rgba)
+
+
+def _vk_gpu_try_frame(cb: Ptr[VkCommandBuffer]) -> int32:
+    # Replay an ELIGIBLE frame entirely on the host GPU into a frame-sized virgl
+    # RT, then read the pixels back into the color image's backing. Returns 0 on
+    # full success (the frame is GPU-rendered) or -1 on ANY failure (the caller
+    # then re-runs the whole frame on the SW path). Assumes _vk_frame_gpu_eligible.
+    img: uint64 = 0
+    i: uint64 = 0
+    n: uint64 = cb[0].cmd_count
+    while i < n:
+        c: Ptr[VkCmd] = _vk_cmd_at(cb, i)
+        op: uint32 = c[0].op
+        if op == VK_OP_BEGIN_RENDER_PASS:
+            img = c[0].a0
+            cimg: Ptr[VkImage] = cast[Ptr[VkImage]](img)
+            _vk_gpu_frame_w = cimg[0].width
+            _vk_gpu_frame_h = cimg[0].height
+            rt: uint32 = vk_venus_frame_create_rt(cast[uint32](_vk_gpu_frame_w),
+                                                  cast[uint32](_vk_gpu_frame_h))
+            if rt == 0:
+                return -1
+            _vk_gpu_frame_rt = rt
+            # Background clear (RGBA bytes -> logical RGBA float bits).
+            crgba: uint32 = cast[uint32](c[0].a3)
+            if vk_venus_frame_begin(
+                    rt,
+                    vk_u8_to_float_bits((crgba >> 24) & 0xFF),
+                    vk_u8_to_float_bits((crgba >> 16) & 0xFF),
+                    vk_u8_to_float_bits((crgba >> 8) & 0xFF),
+                    vk_u8_to_float_bits(crgba & 0xFF)) != 0:
+                return -1
+        elif op == VK_OP_2D_FILL_RECT or op == VK_OP_2D_FILL_RECT_ALPHA:
+            if _vk_gpu_fill_clamped(_vk_unpack_lo(c[0].a0),
+                                    _vk_unpack_hi(c[0].a0),
+                                    _vk_unpack_lo(c[0].a1),
+                                    _vk_unpack_hi(c[0].a1),
+                                    cast[uint32](c[0].a2)) != 0:
+                return -1
+        elif op == VK_OP_2D_DRAW_LINE:
+            if _vk_gpu_frame_line(c) != 0:
+                return -1
+        elif op == VK_OP_END_RENDER_PASS:
+            if img == 0:
+                return -1
+            if vk_venus_frame_readback(cast[uint32](_vk_gpu_frame_w),
+                                       cast[uint32](_vk_gpu_frame_h)) != 0:
+                return -1
+            back: uint64 = vk_venus_frame_backing()
+            if back == 0:
+                return -1
+            fimg: Ptr[VkImage] = cast[Ptr[VkImage]](img)
+            nbytes: uint64 = _vk_gpu_frame_w * _vk_gpu_frame_h * 4
+            _vk_copy_bytes(fimg[0].mem_base, back, nbytes)
+        i = i + 1
+    return 0
+
+
+def _vk_copy_bytes(dst: uint64, src: uint64, nbytes: uint64):
+    # dword-wise copy of the GPU-read-back frame into the color image backing.
+    j: uint64 = 0
+    nw: uint64 = nbytes >> 2
+    while j < nw:
+        cast[Ptr[uint32]](dst + j * 4)[0] = cast[Ptr[uint32]](src + j * 4)[0]
+        j = j + 1
+
+
 def vkQueueSubmit(queue_h: uint64, cb_h: uint64) -> int32:
     q: Ptr[VkQueue] = cast[Ptr[VkQueue]](queue_h)
     cb: Ptr[VkCommandBuffer] = cast[Ptr[VkCommandBuffer]](cb_h)
@@ -811,6 +1038,17 @@ def vkQueueSubmit(queue_h: uint64, cb_h: uint64) -> int32:
         return VK_ERROR_INVALID
     if cb_h == 0 or cb[0].magic != VK_MAGIC_CMDBUF:
         return VK_ERROR_INVALID
+
+    # GPU FRAME ROUTER: when opted in + a live virgl device + a fully GPU-
+    # encodable frame, rasterize the WHOLE frame on the host GPU. On success the
+    # color image holds the read-back GPU pixels and we're done; on any failure
+    # fall through to the SW replay below (the frame is never left blank/wrong).
+    if _vk_gpu_raster != 0 and vk_venus_available() != 0:
+        if _vk_frame_gpu_eligible(cb) != 0:
+            if _vk_gpu_try_frame(cb) == 0:
+                _vk_gpu_frames = _vk_gpu_frames + 1
+                q[0].submit_count = q[0].submit_count + 1
+                return VK_SUCCESS
 
     _vk_cur_color = 0
     _vk_cur_depth = 0
