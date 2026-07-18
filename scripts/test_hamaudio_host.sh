@@ -49,12 +49,13 @@ echo "[hamaudio-host] running host harness on $WAV ..."
 DUMP="$OUT/hamaudio_dump.txt"
 BEFORE="$OUT/hamaudio_before.ppm"
 AFTER="$OUT/hamaudio_after.ppm"
-if ! "$BIN" "$WAV" "$BEFORE" "$AFTER" >"$DUMP" 2>&1; then
+PLAYLIST="$OUT/hamaudio_playlist.ppm"
+if ! "$BIN" "$WAV" "$BEFORE" "$AFTER" "$PLAYLIST" >"$DUMP" 2>&1; then
     echo "[hamaudio-host] FAIL: host harness exited non-zero"; cat "$DUMP"; exit 1
 fi
 
 # Render the PPMs to PNGs (saved for eyeballing) using the stdlib-only converter.
-for f in before after; do
+for f in before after playlist; do
     if python3 scripts/ppm_to_png.py "$OUT/hamaudio_$f.ppm" "$OUT/hamaudio_$f.png" 2>"$OUT/hamaudio_png.log"; then
         echo "[hamaudio-host] PASS rendered $OUT/hamaudio_$f.png ($(file -b "$OUT/hamaudio_$f.png" 2>/dev/null))"
     else
@@ -129,6 +130,24 @@ assert_grep '^roundrect .* 6 #'                    "rounded transport buttons dr
 # level fill (#33d17a = 3395962), sampled from the 'after' (playing) frame.
 [ "$(field PIX_BAR)" = "4029951" ]  && echo "[hamaudio-host] PASS progress bar rasterized blue (#3d7dff)"  || { echo "[hamaudio-host] FAIL progress bar not blue: $(field PIX_BAR)"; fail=1; }
 [ "$(field PIX_METER)" = "3395962" ] && echo "[hamaudio-host] PASS level meter rasterized green (#33d17a)" || { echo "[hamaudio-host] FAIL level meter not green: $(field PIX_METER)"; fail=1; }
+
+# --- PLAYLIST panel (taller frame): track list + active-row highlight + click
+# -> SELECT. The active row (#25406a = 2441322) must be highlighted, and a
+# click on a different row must enqueue HAMAUDIO_CMD_SELECT (4) with that row's
+# index. Proves the new playlist UI both RENDERS and ROUTES input.
+[ "$(field TRACK_COUNT)" = "3" ] && echo "[hamaudio-host] PASS playlist holds 3 tracks" || { echo "[hamaudio-host] FAIL playlist track count: $(field TRACK_COUNT)"; fail=1; }
+PLR=$(field PL_ROWS)
+if [ -n "$PLR" ] && [ "$PLR" -ge 3 ]; then
+    echo "[hamaudio-host] PASS taller window opened $PLR playlist rows"
+else
+    echo "[hamaudio-host] FAIL playlist rows did not open in tall window: $PLR"; fail=1
+fi
+[ "$(field PIX_ACTIVE_ROW)" = "2441322" ] && echo "[hamaudio-host] PASS active track row rasterized highlight (#25406a)" || { echo "[hamaudio-host] FAIL active row not highlighted: $(field PIX_ACTIVE_ROW)"; fail=1; }
+assert_grep '^glyphs 20 [0-9]+ \"Playlist\"' "playlist heading drawn"
+assert_grep '^glyphs [0-9]+ [0-9]+ \"intro.wav\"' "track 0 name drawn"
+assert_grep '^glyphs [0-9]+ [0-9]+ \"outro.mp3\"' "track 2 name drawn"
+[ "$(field CMD_SELECT)" = "4" ] && echo "[hamaudio-host] PASS playlist-row click enqueues a SELECT" || { echo "[hamaudio-host] FAIL row click did not enqueue SELECT: $(field CMD_SELECT)"; fail=1; }
+[ "$(field SEL_INDEX)" = "0" ] && echo "[hamaudio-host] PASS SELECT targets the clicked row (index 0)" || { echo "[hamaudio-host] FAIL SELECT index wrong: $(field SEL_INDEX)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     echo "[hamaudio-host] RESULT: PASS"
