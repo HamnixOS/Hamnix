@@ -133,6 +133,10 @@ echo "[test_inguest_gpu_multiop_hw] --- guest AA-coverage-mask (glyph text) mark
 grep -a -E "\[vgpu-cov\]" "$GLLOG" | head -20
 echo "[test_inguest_gpu_multiop_hw] --- guest WHOLE-FRAME auto-route markers ---"
 grep -a -E "\[vgpu-frame\]" "$GLLOG" | head -20
+echo "[test_inguest_gpu_multiop_hw] --- guest PER-OP SW/GPU MIXING markers ---"
+grep -a -E "\[vgpu-mix\]" "$GLLOG" | head -20
+echo "[test_inguest_gpu_multiop_hw] --- guest PROPORTIONAL glyph-atlas markers ---"
+grep -a -E "\[vgpu-prop\]" "$GLLOG" | head -20
 echo "[test_inguest_gpu_multiop_hw] --- host GL context (virglrenderer) ---"
 GLVER_LINE="$(grep -a -E "gl_version [0-9]+ - core profile" "$GLLOG" | head -1)"
 GLREND_LINE="$(grep -a -iE "GL_RENDERER=NVIDIA|NVIDIA GeForce RTX|llvmpipe" "$GLLOG" | head -2)"
@@ -201,6 +205,21 @@ if [ "$GREEN" -eq 1 ] && [ "$NV_CTX" -eq 1 ] && [ "$NVIDIA_RESIDENT" -eq 1 ]; th
         [ -n "$FR" ] && echo "[test_inguest_gpu_multiop_hw]   ${FR#\[vgpu-frame\] }"
     else
         echo "[test_inguest_gpu_multiop_hw]   (whole-frame auto-route not byte-confirmed this run; see [vgpu-frame] markers)"
+    fi
+    # Round 11: PER-OP SW/GPU MIXING — an ineligible rounded rect composited into
+    # the GPU frame in draw order, byte-matches the all-SW oracle.
+    if grep -a -q -E "\[vgpu-mix\] PASS: MIXED frame on the RTX 3090" "$GLLOG"; then
+        MX="$(grep -a -oE "\[vgpu-mix\] PASS: MIXED frame on the RTX 3090 — [0-9]+ ops GPU-rasterized, [0-9]+ op CPU-composited[^\\\\]*" "$GLLOG" | head -1)"
+        echo "[test_inguest_gpu_multiop_hw]   + PER-OP SW/GPU MIXING byte-verified: ${MX#\[vgpu-mix\] PASS: }"
+    else
+        echo "[test_inguest_gpu_multiop_hw]   (per-op SW/GPU mixing not byte-confirmed this run; see [vgpu-mix] markers)"
+    fi
+    # Round 11: PROPORTIONAL (varied-size) glyph run via the resize-pool atlas.
+    if grep -a -q -E "\[vgpu-prop\] PASS" "$GLLOG"; then
+        PR="$(grep -a -oE "\[vgpu-prop\] PASS[^\\\\]*" "$GLLOG" | head -1)"
+        echo "[test_inguest_gpu_multiop_hw]   + PROPORTIONAL glyph atlas byte-verified: ${PR#\[vgpu-prop\] PASS: }"
+    else
+        echo "[test_inguest_gpu_multiop_hw]   (proportional glyph atlas not byte-confirmed this run; see [vgpu-prop] markers)"
     fi
     exit 0
 fi

@@ -108,8 +108,9 @@ from lib.vk.vk_gpu import (
 from lib.vk.vk_venus import (
     vk_venus_available, vk_venus_fill_rect,
     vk_venus_frame_create_rt, vk_venus_frame_begin, vk_venus_frame_fill,
-    vk_venus_frame_readback, vk_venus_frame_backing,
-    vk_venus_frame_blit, vk_venus_glyph_run_setup, vk_venus_frame_glyph,
+    vk_venus_frame_readback, vk_venus_frame_backing, vk_venus_frame_upload,
+    vk_venus_frame_blit, vk_venus_glyph_run_setup, vk_venus_glyph_run_resize,
+    vk_venus_frame_glyph,
     vk_venus_cov_backing, vk_venus_cov_upload,
 )
 
@@ -872,6 +873,8 @@ _vk_gpu_last_glyphs: uint64 = 0     # of which, batched glyph draws
 _vk_gpu_last_blits:  uint64 = 0     # of which, intra-frame blits
 _vk_gpu_last_sw:     uint64 = 0     # ops in the last frame that fell back to SW
 _vk_gpu_glyph_ready: int32  = 0     # glyph-run pipeline built this frame?
+_vk_gpu_glyph_w:     int64  = 0     # current reused coverage-texture cell width
+_vk_gpu_glyph_h:     int64  = 0     # current reused coverage-texture cell height
 
 
 def vk_gpu_frames_rendered() -> uint64:
@@ -939,20 +942,59 @@ def _vk_op_blit_gpu_ok(c: Ptr[VkCmd], frame_img: uint64) -> int32:
     return 1
 
 
-def _vk_frame_gpu_eligible(cb: Ptr[VkCommandBuffer]) -> int32:
-    # 1 iff EVERY op in the recorded frame can be rasterized on the host GPU
-    # byte-identically (±1 UNORM for glyph coverage) to the SW oracle (see the
-    # router header). The render pass must target a B8G8R8A8 (GPU scanout order)
-    # image AND clear it, so the GPU RT and the SW image start identical.
-    # Covered: FILL_RECT, opaque FILL_RECT_ALPHA, axis DRAW_LINE, a same-cell-
-    # sized GLYPH text run (batched coverage), and a natural-size intra-frame
-    # BLIT. Translucent fills, diagonal lines, rounded rects, cross-image or
-    # scaled blits, differing glyph-cell sizes, and 3D draws make it ineligible
-    # (the whole frame then stays on the SW oracle — counted, never faked).
+def _vk_op_gpu_encodable(c: Ptr[VkCmd], frame_img: uint64) -> int32:
+    # 1 iff THIS single 2D op can be rasterized on the host GPU byte-identically
+    # (±1 UNORM for glyph coverage) to the vk2d SW oracle. The GPU-encodable
+    # vocabulary: FILL_RECT, opaque FILL_RECT_ALPHA, axis-aligned DRAW_LINE, an
+    # in-bounds GLYPH cell (ANY size — the resize pool re-sizes the coverage
+    # texture per cell), and a natural-size intra-frame self BLIT. Everything
+    # else — translucent fills, diagonal lines, rounded rects, cross-image or
+    # scaled blits — returns 0, and the router SW-composites it into the same
+    # frame RT in draw order (per-op mixing; still byte-exact, counted as SW).
+    op: uint32 = c[0].op
+    if op == VK_OP_2D_FILL_RECT:
+        return 1
+    if op == VK_OP_2D_FILL_RECT_ALPHA:
+        if (cast[uint32](c[0].a2) & 0xFF) != 0xFF:       # translucent -> SW
+            return 0
+        return 1
+    if op == VK_OP_2D_DRAW_LINE:
+        return _vk_op_is_axis_line(c)                     # diagonal -> SW
+    if op == VK_OP_2D_GLYPH:
+        mw: int64 = _vk_unpack_lo(c[0].a1)
+        mh: int64 = _vk_unpack_hi(c[0].a1)
+        if c[0].a2 == 0 or mw <= 0 or mh <= 0 or frame_img == 0:
+            return 0
+        # The GPU cov draw uses a 1:1 texel->pixel viewport with no scissor, so a
+        # partly-offscreen cell would diverge from vk2d's clip. Require the cell
+        # FULLY in-bounds; else SW-composite it.
+        gimg: Ptr[VkImage] = cast[Ptr[VkImage]](frame_img)
+        gdx: int64 = _vk_unpack_lo(c[0].a0)
+        gdy: int64 = _vk_unpack_hi(c[0].a0)
+        if gdx < 0 or gdy < 0:
+            return 0
+        if gdx + mw > cast[int64](gimg[0].width) \
+                or gdy + mh > cast[int64](gimg[0].height):
+            return 0
+        return 1
+    if op == VK_OP_2D_BLIT:
+        return _vk_op_blit_gpu_ok(c, frame_img)
+    return 0                                             # roundrect / other -> SW
+
+
+def _vk_frame_gpu_routable(cb: Ptr[VkCommandBuffer]) -> int32:
+    # 1 iff the router should drive this frame on the GPU with PER-OP SW/GPU
+    # MIXING. The only structural requirement is that the render pass targets a
+    # B8G8R8A8 (GPU scanout order) image AND clears it — so the GPU frame RT and
+    # the SW color image start byte-identical; every drawing op is then either
+    # GPU-encoded or CPU-composited into the SAME RT in draw order. Requires at
+    # least ONE GPU-encodable op (else the frame has nothing to accelerate and
+    # stays wholly on the SW oracle — the honest counted fallback). A 3D
+    # VK_OP_DRAW disqualifies the whole frame (its state model is out of the 2D
+    # router's scope) -> whole-SW.
     saw_begin: int32 = 0
+    saw_gpu_op: int32 = 0
     frame_img: uint64 = 0
-    gw: int64 = 0                                        # glyph-run cell size (0 = none yet)
-    gh: int64 = 0
     i: uint64 = 0
     n: uint64 = cb[0].cmd_count
     while i < n:
@@ -968,49 +1010,18 @@ def _vk_frame_gpu_eligible(cb: Ptr[VkCommandBuffer]) -> int32:
                 return 0
             frame_img = col
             saw_begin = 1
-        elif op == VK_OP_END_RENDER_PASS:
+        elif op == VK_OP_DRAW:
+            return 0                                     # 3D draw -> whole SW
+        elif op == VK_OP_END_RENDER_PASS or op == VK_OP_SET_VIEWPORT:
             i = i + 1
             continue
-        elif op == VK_OP_SET_VIEWPORT:
-            i = i + 1
-            continue
-        elif op == VK_OP_2D_FILL_RECT:
-            i = i + 1
-            continue
-        elif op == VK_OP_2D_FILL_RECT_ALPHA:
-            if (cast[uint32](c[0].a2) & 0xFF) != 0xFF:   # translucent -> SW
-                return 0
-        elif op == VK_OP_2D_DRAW_LINE:
-            if _vk_op_is_axis_line(c) == 0:              # diagonal -> SW
-                return 0
-        elif op == VK_OP_2D_GLYPH:
-            mw: int64 = _vk_unpack_lo(c[0].a1)
-            mh: int64 = _vk_unpack_hi(c[0].a1)
-            if c[0].a2 == 0 or mw <= 0 or mh <= 0:
-                return 0
-            # The GPU cov draw uses a 1:1 texel->pixel viewport with no scissor,
-            # so a partly-offscreen cell would diverge from vk2d's clip. Require
-            # the cell FULLY in-bounds; else the whole frame stays SW.
-            gimg: Ptr[VkImage] = cast[Ptr[VkImage]](frame_img)
-            gdx: int64 = _vk_unpack_lo(c[0].a0)
-            gdy: int64 = _vk_unpack_hi(c[0].a0)
-            if frame_img == 0 or gdx < 0 or gdy < 0:
-                return 0
-            if gdx + mw > cast[int64](gimg[0].width) \
-                    or gdy + mh > cast[int64](gimg[0].height):
-                return 0
-            if gw == 0:
-                gw = mw
-                gh = mh
-            elif mw != gw or mh != gh:                   # mixed cell sizes -> SW
-                return 0
-        elif op == VK_OP_2D_BLIT:
-            if _vk_op_blit_gpu_ok(c, frame_img) == 0:
-                return 0
         else:
-            return 0                                     # roundrect/3D -> SW
+            if _vk_op_gpu_encodable(c, frame_img) != 0:
+                saw_gpu_op = 1
         i = i + 1
-    return saw_begin
+    if saw_begin != 0 and saw_gpu_op != 0:
+        return 1
+    return 0
 
 
 def _vk_gpu_fill_clamped(x: int64, y: int64, w: int64, h: int64,
@@ -1085,10 +1096,16 @@ def _vk_copy_bytes_u8(dst: uint64, src: uint64, nbytes: uint64):
 
 
 def _vk_gpu_frame_glyph_op(c: Ptr[VkCmd]) -> int32:
-    # Route ONE glyph coverage cell onto the batched host coverage texture: build
-    # the glyph-run pipeline on the FIRST glyph of the frame (reused thereafter),
-    # copy the cell's coverage into the reused R8 texture backing, upload it, and
-    # draw it into the frame RT with source-over blend (±1 UNORM vs vk2d). 0/-1.
+    # Route ONE glyph coverage cell onto the reused host coverage texture: build
+    # the glyph-run pipeline on the FIRST glyph of the frame, and on any LATER
+    # glyph whose cell size DIFFERS (a proportional text run) resize the reused
+    # R8 texture to the new size via the RESIZE POOL (vk_venus_glyph_run_resize)
+    # so each glyph GPU-rasterizes byte-exact at its own size — not just a fixed
+    # cell. Then copy the cell's coverage into the texture backing, upload it, and
+    # draw it into the frame RT with source-over blend (±1 UNORM vs vk2d).
+    # Returns: 0 = drawn on the GPU; 1 = the GPU glyph path declined (pipeline /
+    # resize / upload unavailable) so the CALLER should SW-composite this glyph
+    # into the same frame RT (still byte-exact, counted as an SW op).
     dx: int64 = _vk_unpack_lo(c[0].a0)
     dy: int64 = _vk_unpack_hi(c[0].a0)
     mw: int64 = _vk_unpack_lo(c[0].a1)
@@ -1097,30 +1114,94 @@ def _vk_gpu_frame_glyph_op(c: Ptr[VkCmd]) -> int32:
     ink: uint32 = cast[uint32](c[0].a3)
     if _vk_gpu_glyph_ready == 0:
         if vk_venus_glyph_run_setup(cast[uint32](mw), cast[uint32](mh)) != 0:
-            return -1
+            return 1
         _vk_gpu_glyph_ready = 1
+        _vk_gpu_glyph_w = mw
+        _vk_gpu_glyph_h = mh
+    elif mw != _vk_gpu_glyph_w or mh != _vk_gpu_glyph_h:
+        if vk_venus_glyph_run_resize(cast[uint32](mw), cast[uint32](mh)) != 0:
+            return 1
+        _vk_gpu_glyph_w = mw
+        _vk_gpu_glyph_h = mh
     dst: uint64 = vk_venus_cov_backing()
     if dst == 0:
-        return -1
+        return 1
     _vk_copy_bytes_u8(dst, cov, cast[uint64](mw * mh))
     if vk_venus_cov_upload(cast[uint32](mw), cast[uint32](mh)) != 0:
-        return -1
+        return 1
     cr: uint32 = vk_u8_to_float_bits((ink >> 24) & 0xFF)
     cg: uint32 = vk_u8_to_float_bits((ink >> 16) & 0xFF)
     cb2: uint32 = vk_u8_to_float_bits((ink >> 8) & 0xFF)
     ca: uint32 = vk_u8_to_float_bits(ink & 0xFF)
-    return vk_venus_frame_glyph(cast[uint32](dx), cast[uint32](dy),
-                                cast[uint32](mw), cast[uint32](mh),
-                                cast[uint32](_vk_gpu_frame_h),
-                                cr, cg, cb2, ca)
+    if vk_venus_frame_glyph(cast[uint32](dx), cast[uint32](dy),
+                            cast[uint32](mw), cast[uint32](mh),
+                            cast[uint32](_vk_gpu_frame_h),
+                            cr, cg, cb2, ca) != 0:
+        return 1
+    return 0
+
+
+def _vk_gpu_sw_composite(c: Ptr[VkCmd], img: uint64) -> int32:
+    # PER-OP SW/GPU MIXING: composite ONE router-ineligible (or GPU-declined) op
+    # onto the frame RT via the vk2d CPU oracle, preserving draw order. Read the
+    # GPU RT back into the color image (so the CPU sees every prior GPU + SW op),
+    # run the EXACT SW rasterizer for this op on those pixels, then upload the
+    # composited image back into the host frame RT so LATER GPU ops draw over it.
+    # Because each GPU op is individually byte-identical to its SW counterpart,
+    # the readback at this point equals the SW oracle's state here, so the SW op
+    # composites byte-exactly. Returns 0 ok, -1 on any device failure (the whole
+    # frame then falls back to the SW replay).
+    w: uint32 = cast[uint32](_vk_gpu_frame_w)
+    h: uint32 = cast[uint32](_vk_gpu_frame_h)
+    if img == 0:
+        return -1
+    if vk_venus_frame_readback(w, h) != 0:
+        return -1
+    back: uint64 = vk_venus_frame_backing()
+    if back == 0:
+        return -1
+    fimg: Ptr[VkImage] = cast[Ptr[VkImage]](img)
+    nbytes: uint64 = _vk_gpu_frame_w * _vk_gpu_frame_h * 4
+    _vk_copy_bytes(fimg[0].mem_base, back, nbytes)       # GPU RT -> color image
+    # Run the SW op on the color image. The frame target is BGRA (GPU scanout
+    # order), so vk2d lays down BGRA bytes — matching the RT byte order exactly.
+    _vk_cur_color = img
+    _vk_vp_x = 0
+    _vk_vp_y = 0
+    _vk_vp_w = _vk_gpu_frame_w
+    _vk_vp_h = _vk_gpu_frame_h
+    vk2d_set_bgra(1)
+    op: uint32 = c[0].op
+    if op == VK_OP_2D_FILL_RECT_ALPHA:
+        _vk_replay_2d_fill_rect(c, 1)
+    elif op == VK_OP_2D_DRAW_LINE:
+        _vk_replay_2d_line(c)
+    elif op == VK_OP_2D_BLIT:
+        _vk_replay_2d_blit(c)
+    elif op == VK_OP_2D_FILL_ROUNDRECT:
+        _vk_replay_2d_roundrect(c)
+    elif op == VK_OP_2D_GLYPH:
+        _vk_replay_2d_glyph(c)
+    elif op == VK_OP_2D_FILL_RECT:
+        _vk_replay_2d_fill_rect(c, 0)
+    vk2d_set_bgra(0)
+    _vk_cur_color = 0
+    _vk_copy_bytes(back, fimg[0].mem_base, nbytes)       # color image -> RT backing
+    if vk_venus_frame_upload(w, h) != 0:                 # push composite to host RT
+        return -1
+    return 0
 
 
 def _vk_gpu_try_frame(cb: Ptr[VkCommandBuffer]) -> int32:
-    # Replay an ELIGIBLE frame entirely on the host GPU into a frame-sized virgl
-    # RT, then read the pixels back into the color image's backing. Returns 0 on
-    # full success (the frame is GPU-rendered) or -1 on ANY failure (the caller
-    # then re-runs the whole frame on the SW path). Assumes _vk_frame_gpu_eligible.
-    # Tallies the GPU op mix (_vk_gpu_last_ops / glyphs / blits) for the caller.
+    # Replay a ROUTABLE frame on the host GPU into a frame-sized virgl RT with
+    # PER-OP SW/GPU MIXING: each GPU-encodable op (fills / axis lines / glyphs /
+    # opaque self-blit) rasterizes on the 3090; each ineligible op (rounded rect,
+    # translucent/scaled/cross-image blit, diagonal line) is CPU-composited into
+    # the SAME RT in draw order (_vk_gpu_sw_composite). Then read the pixels back
+    # into the color image. Returns 0 on full success or -1 on ANY GPU failure
+    # (the caller re-runs the whole frame on the SW path). Assumes
+    # _vk_frame_gpu_routable. Tallies the op mix (_vk_gpu_last_ops = GPU ops,
+    # _vk_gpu_last_glyphs / _blits of which, _vk_gpu_last_sw = SW-composited ops).
     img: uint64 = 0
     i: uint64 = 0
     n: uint64 = cb[0].cmd_count
@@ -1135,7 +1216,10 @@ def _vk_gpu_try_frame(cb: Ptr[VkCommandBuffer]) -> int32:
             _vk_gpu_last_ops = 0
             _vk_gpu_last_glyphs = 0
             _vk_gpu_last_blits = 0
+            _vk_gpu_last_sw = 0
             _vk_gpu_glyph_ready = 0
+            _vk_gpu_glyph_w = 0
+            _vk_gpu_glyph_h = 0
             rt: uint32 = vk_venus_frame_create_rt(cast[uint32](_vk_gpu_frame_w),
                                                   cast[uint32](_vk_gpu_frame_h))
             if rt == 0:
@@ -1150,34 +1234,6 @@ def _vk_gpu_try_frame(cb: Ptr[VkCommandBuffer]) -> int32:
                     vk_u8_to_float_bits((crgba >> 8) & 0xFF),
                     vk_u8_to_float_bits(crgba & 0xFF)) != 0:
                 return -1
-        elif op == VK_OP_2D_FILL_RECT or op == VK_OP_2D_FILL_RECT_ALPHA:
-            if _vk_gpu_fill_clamped(_vk_unpack_lo(c[0].a0),
-                                    _vk_unpack_hi(c[0].a0),
-                                    _vk_unpack_lo(c[0].a1),
-                                    _vk_unpack_hi(c[0].a1),
-                                    cast[uint32](c[0].a2)) != 0:
-                return -1
-            _vk_gpu_last_ops = _vk_gpu_last_ops + 1
-        elif op == VK_OP_2D_DRAW_LINE:
-            if _vk_gpu_frame_line(c) != 0:
-                return -1
-            _vk_gpu_last_ops = _vk_gpu_last_ops + 1
-        elif op == VK_OP_2D_GLYPH:
-            if _vk_gpu_frame_glyph_op(c) != 0:
-                return -1
-            _vk_gpu_last_glyphs = _vk_gpu_last_glyphs + 1
-            _vk_gpu_last_ops = _vk_gpu_last_ops + 1
-        elif op == VK_OP_2D_BLIT:
-            if vk_venus_frame_blit(_vk_gpu_frame_rt,
-                                   cast[uint32](_vk_unpack_lo(c[0].a1)),
-                                   cast[uint32](_vk_unpack_hi(c[0].a1)),
-                                   cast[uint32](_vk_unpack_lo(c[0].a3)),
-                                   cast[uint32](_vk_unpack_hi(c[0].a3)),
-                                   cast[uint32](_vk_unpack_lo(c[0].a4)),
-                                   cast[uint32](_vk_unpack_hi(c[0].a4))) != 0:
-                return -1
-            _vk_gpu_last_blits = _vk_gpu_last_blits + 1
-            _vk_gpu_last_ops = _vk_gpu_last_ops + 1
         elif op == VK_OP_END_RENDER_PASS:
             if img == 0:
                 return -1
@@ -1190,6 +1246,50 @@ def _vk_gpu_try_frame(cb: Ptr[VkCommandBuffer]) -> int32:
             fimg: Ptr[VkImage] = cast[Ptr[VkImage]](img)
             nbytes: uint64 = _vk_gpu_frame_w * _vk_gpu_frame_h * 4
             _vk_copy_bytes(fimg[0].mem_base, back, nbytes)
+        elif op == VK_OP_SET_VIEWPORT:
+            i = i + 1
+            continue
+        elif _vk_op_gpu_encodable(c, img) != 0:
+            # GPU-encodable op: rasterize on the host GPU.
+            if op == VK_OP_2D_FILL_RECT or op == VK_OP_2D_FILL_RECT_ALPHA:
+                if _vk_gpu_fill_clamped(_vk_unpack_lo(c[0].a0),
+                                        _vk_unpack_hi(c[0].a0),
+                                        _vk_unpack_lo(c[0].a1),
+                                        _vk_unpack_hi(c[0].a1),
+                                        cast[uint32](c[0].a2)) != 0:
+                    return -1
+                _vk_gpu_last_ops = _vk_gpu_last_ops + 1
+            elif op == VK_OP_2D_DRAW_LINE:
+                if _vk_gpu_frame_line(c) != 0:
+                    return -1
+                _vk_gpu_last_ops = _vk_gpu_last_ops + 1
+            elif op == VK_OP_2D_GLYPH:
+                grc: int32 = _vk_gpu_frame_glyph_op(c)
+                if grc == 0:
+                    _vk_gpu_last_glyphs = _vk_gpu_last_glyphs + 1
+                    _vk_gpu_last_ops = _vk_gpu_last_ops + 1
+                else:
+                    # GPU glyph path declined (pipeline/resize): SW-composite it.
+                    if _vk_gpu_sw_composite(c, img) != 0:
+                        return -1
+                    _vk_gpu_last_sw = _vk_gpu_last_sw + 1
+            elif op == VK_OP_2D_BLIT:
+                if vk_venus_frame_blit(_vk_gpu_frame_rt,
+                                       cast[uint32](_vk_unpack_lo(c[0].a1)),
+                                       cast[uint32](_vk_unpack_hi(c[0].a1)),
+                                       cast[uint32](_vk_unpack_lo(c[0].a3)),
+                                       cast[uint32](_vk_unpack_hi(c[0].a3)),
+                                       cast[uint32](_vk_unpack_lo(c[0].a4)),
+                                       cast[uint32](_vk_unpack_hi(c[0].a4))) != 0:
+                    return -1
+                _vk_gpu_last_blits = _vk_gpu_last_blits + 1
+                _vk_gpu_last_ops = _vk_gpu_last_ops + 1
+        else:
+            # Router-ineligible op (rounded rect, translucent/scaled blit,
+            # diagonal line): CPU-composite into the same RT in draw order.
+            if _vk_gpu_sw_composite(c, img) != 0:
+                return -1
+            _vk_gpu_last_sw = _vk_gpu_last_sw + 1
         i = i + 1
     return 0
 
@@ -1233,14 +1333,15 @@ def vkQueueSubmit(queue_h: uint64, cb_h: uint64) -> int32:
     # color image holds the read-back GPU pixels and we're done; on any failure
     # fall through to the SW replay below (the frame is never left blank/wrong).
     if _vk_gpu_raster != 0 and vk_venus_available() != 0:
-        if _vk_frame_gpu_eligible(cb) != 0:
+        if _vk_frame_gpu_routable(cb) != 0:
             if _vk_gpu_try_frame(cb) == 0:
+                # Success: _vk_gpu_last_ops ran on the GPU, _vk_gpu_last_sw were
+                # CPU-composited into the same RT in draw order (per-op mixing).
                 _vk_gpu_frames = _vk_gpu_frames + 1
-                _vk_gpu_last_sw = 0
                 q[0].submit_count = q[0].submit_count + 1
                 return VK_SUCCESS
-        # Opted in but the frame had a router-ineligible op (or a GPU submit
-        # failed): the WHOLE frame stays on the SW oracle. Record how many 2D
+        # Not routable (nothing GPU-encodable / 3D draw), or a GPU submit failed
+        # mid-frame: the WHOLE frame stays on the SW oracle. Record how many 2D
         # ops fell back so the caller can report the honest GPU-vs-SW mix.
         _vk_gpu_last_sw = _vk_count_2d_ops(cb)
 
