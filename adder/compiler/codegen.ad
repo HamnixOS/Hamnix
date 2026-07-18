@@ -468,6 +468,36 @@ g_fuse_lea_end: uint32 = 0
 # Pure bookkeeping — never changes emitted bytes, so the default path is unaffected.
 cg_imm_rax_valid: uint32 = 0
 cg_imm_rax_at: uint32 = 0
+# SELF-TAIL-CALL -> LOOP (--opt, tak lever): a call in TAIL position (`return
+# f(...)`) to the CURRENT function is turned into an in-place re-initialisation of
+# the parameter homes + a backward `jmp` to the post-prologue body top, reusing
+# this stack frame instead of emitting call/epilogue/prologue. The new arguments
+# are marshalled into the SysV arg registers EXACTLY as an ordinary call does
+# (gen_call's contract: at the call point every argument is materialised in its
+# ABI register, the old params are dead), then the prologue's own
+# spill_params + ra_emit_init_regs sequence is REPLAYED to move the arg registers
+# into the parameter homes (slots / callee-saved regs) — the identical, already-
+# proven-sound arg-register->home transfer — before the jmp. Converts tak's outer
+# self-recursive tail call from a full recursive call into a loop iteration.
+#   cg_tail_ok       : 1 iff the current function qualifies (set per gen_function).
+#   cg_tail_top      : code offset of the body top (just after the prologue's param
+#                      spill/init), the jmp target.
+#   cg_tail_params   : the ND_FUNCTION parameter chain (nd_a[fn]) to replay.
+#   cg_tail_fn_off/len: the current function's name, to recognise a self-call.
+#   cg_pending_tail_node: the specific ND_CALL node ND_RETURN marked as tail (set
+#                      transiently around gen_expr; gen_call fires ONLY on this node
+#                      so inner argument calls of the same function do NOT loop).
+#   cg_tail_fired    : set by the interception so ND_RETURN skips the epilogue.
+# All zero / gated behind isel_is_enabled(), so the default build never reaches the
+# transform and stays byte-identical to the seed.
+cg_tail_ok: uint32 = 0
+cg_tail_top: uint32 = 0
+cg_tail_params: uint32 = 0
+cg_tail_fn_off: uint32 = 0
+cg_tail_fn_len: uint32 = 0
+cg_pending_tail_node: uint32 = 0
+cg_tail_fired: uint32 = 0
+opt_tailcall_count: uint32 = 0
 
 
 def isel_enable():
@@ -500,6 +530,7 @@ def isel_reset_stats():
     opt_fuseload_count = 0
     opt_storeimm_count = 0
     opt_storereg_count = 0
+    opt_tailcall_count = 0
 
 
 # -----------------------------------------------------------------------
@@ -12534,6 +12565,94 @@ def normalize_call_args(node: uint32, fn: uint32) -> uint32:
     return 1
 
 
+# True iff function `fn` (nparams parameters) qualifies for the self-tail-call ->
+# loop transform: <=6 register-passed parameters, and every parameter AND the
+# return type is a plain INTEGER-class value (no float/SSE, no by-value aggregate,
+# no Slice). Those are exactly the shapes whose incoming argument is moved into the
+# parameter home by the integer spill_params / ra_emit_init_regs sequence the
+# transform replays; a float arg (xmm), an aggregate (two eightbytes), or a slice
+# ({ptr,len}) would need a different re-init the replay does not do. A method's
+# implicit `self` (name len 0) disqualifies — the transform is plain-function only.
+def tail_opt_func_ok(fn: uint32, nparams: uint32) -> uint32:
+    if nparams == 0:
+        return 0
+    if nparams > 6:
+        return 0
+    rt: uint32 = nd_b[fn]
+    if struct_lookup_by_node(rt) != 0:
+        return 0
+    if rt != 0 and nd_kind[rt] == ND_SLICE_TYPE:
+        return 0
+    if type_float_width(rt) != 0:
+        return 0
+    p: uint32 = nd_a[fn]
+    while p != 0:
+        if nd_name_len[p] == 0:
+            return 0                         # implicit self receiver (method)
+        ptnode: uint32 = nd_a[p]
+        if ptnode != 0 and nd_kind[ptnode] == ND_SLICE_TYPE:
+            return 0
+        if struct_lookup_by_node(ptnode) != 0:
+            return 0
+        if type_float_width(ptnode) != 0:
+            return 0
+        p = nd_next[p]
+    return 1
+
+
+# ND_RETURN hook: if `retval` is a qualifying SELF-tail-call, emit it as a loop
+# (arg marshalling + parameter-home re-init + backward jmp) instead of a recursive
+# call + epilogue. Returns 1 iff it fully handled the return (the caller must NOT
+# then emit gen_expr/epilogue), 0 to let the ordinary return path run.
+#
+# It marks the call node as the pending tail node and drives it through gen_expr:
+# gen_call recognises the marked node and replaces the `call` with the loop back-
+# edge (setting cg_tail_fired). If the transform did NOT fire (e.g. the call was
+# keyword-normalised — cg_tail_fired stays 0), the ordinary call was emitted and
+# left its result in %rax, so we finish with the normal epilogue — never a double
+# emit. Gated behind cg_tail_ok (only set under --opt for a qualifying function).
+def try_tail_self_return(retval: uint32) -> uint32:
+    if cg_tail_ok == 0:
+        return 0
+    if retval == 0 or nd_kind[retval] != ND_CALL:
+        return 0
+    callee: uint32 = nd_a[retval]
+    if nd_kind[callee] != ND_IDENT:
+        return 0
+    # The callee name must be THIS function (a self-call) and not shadowed by a
+    # same-named local (which would make it an indirect function-pointer call).
+    if name_match(nd_name_off[callee], nd_name_len[callee], cg_tail_fn_off, cg_tail_fn_len) == 0:
+        return 0
+    shadow_off: int32 = 0
+    if lookup_local(nd_name_off[callee], nd_name_len[callee], &shadow_off) != 0:
+        return 0
+    # Arity must match the parameter count exactly (a defaulted/kwarg call would
+    # normalise inside gen_call, which the interception declines — handled by the
+    # cg_tail_fired fallback below, but gate the common case here).
+    if nd_aux[retval] != tail_param_count():
+        return 0
+    cg_pending_tail_node = retval
+    cg_tail_fired = 0
+    gen_expr(retval)
+    cg_pending_tail_node = 0
+    if cg_tail_fired != 0:
+        return 1                             # loop back-edge emitted; no epilogue
+    # The transform declined (normalised call); the ordinary call already ran and
+    # left its value in %rax — finish as a plain return.
+    emit_function_epilogue()
+    return 1
+
+
+# Number of parameters in the current function's tail-opt parameter chain.
+def tail_param_count() -> uint32:
+    n: uint32 = 0
+    p: uint32 = cg_tail_params
+    while p != 0:
+        n = n + 1
+        p = nd_next[p]
+    return n
+
+
 def gen_call(node: uint32):
     callee: uint32 = nd_a[node]
     if nd_kind[callee] != ND_IDENT:
@@ -12732,6 +12851,24 @@ def gen_call(node: uint32):
         emit_xor_eax_eax()
         emit_call_r11()
     else:
+        # SELF-TAIL-CALL -> LOOP (--opt): this direct call is the ND_CALL that
+        # ND_RETURN marked as a tail self-call, and it uses only register args
+        # (stack_bytes==0) and full positional arity (use_norm==0). Every argument
+        # is now materialised in its SysV arg register and the old parameters are
+        # dead, so instead of `call`/epilogue/prologue we REPLAY the prologue's
+        # own arg-register -> parameter-home transfer (spill_params +
+        # ra_emit_init_regs — the identical, already-sound sequence) and jmp back
+        # to the post-prologue body top, reusing this frame. The stack-arg block and
+        # normalization window are provably empty here, so there is nothing to
+        # reclaim on this path.
+        if cg_pending_tail_node != 0 and node == cg_pending_tail_node and use_norm == 0 and stack_bytes == 0:
+            cg_pending_tail_node = 0
+            spill_params(cg_tail_params)
+            ra_emit_init_regs(cg_tail_params)
+            emit_jmp_back(cg_tail_top)
+            cg_tail_fired = 1
+            opt_tailcall_count = opt_tailcall_count + 1
+            return
         # SysV variadic AL-zeroing: elide for a direct call to an in-unit Adder
         # function (never variadic), --opt only; keep it byte-identical otherwise.
         if call_al_elidable(callee) == 0:
@@ -13635,6 +13772,10 @@ def gen_stmt(node: uint32):
         # not the integer 0. Byte-inert when the program uses no enums.
         if en_count != 0 and maybe_gen_none_coercion(nd_a[node], cg_cur_return_type) != 0:
             emit_function_epilogue()
+            return
+        # SELF-TAIL-CALL -> LOOP (--opt): `return f(...)` to the current function
+        # becomes a parameter re-init + backward jmp instead of a recursive call.
+        if try_tail_self_return(nd_a[node]) != 0:
             return
         gen_expr(nd_a[node])
         emit_function_epilogue()
@@ -16271,6 +16412,20 @@ def gen_function(fn: uint32) -> uint32:
     if fn_unsafe != 0:
         cg_unsafe_depth = cg_unsafe_depth + 1
 
+    # SELF-TAIL-CALL -> LOOP (--opt): record whether this function qualifies for the
+    # transform and the body-top label (code_len HERE — just after the prologue's
+    # param spill + register init, before the first body statement — is exactly the
+    # jmp target a tail self-call reuses). cg_tail_ok is 0 unless --opt is on and the
+    # function is integer-scalar-shaped, so the default build never fires it.
+    cg_tail_ok = 0
+    cg_tail_params = nd_a[fn]
+    cg_tail_fn_off = nd_name_off[fn]
+    cg_tail_fn_len = nd_name_len[fn]
+    if isel_is_enabled() != 0:
+        if tail_opt_func_ok(fn, nparams) != 0:
+            cg_tail_ok = 1
+    cg_tail_top = code_len
+
     # Body (statement chain on nd_c).
     s: uint32 = nd_c[fn]
     last_was_return: uint32 = 0
@@ -16311,6 +16466,7 @@ def gen_method(cls: uint32, m: uint32) -> uint32:
     loc_count = 0
     cg_stack_size = 0
     fi_count = 0
+    cg_tail_ok = 0                            # methods never take the tail-loop path
 
     sidx1: uint32 = struct_lookup(nd_name_off[cls], nd_name_len[cls])
     cg_self_struct = sidx1
