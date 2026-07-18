@@ -90,13 +90,19 @@ fi
 sx=$(seg_x Sidebar); mx=$(seg_x Mainarea); px=$(seg_x Extra)
 echo "[hb-grid] shell x: Sidebar=$sx Mainarea=$mx Extra=$px"
 railstep=$((mx - sx))     # fixed 200px track + 20px gap == 220
-frstep=$((px - mx))       # fr track (172px) + 20px gap == 192
-echo "[hb-grid] shell steps: rail->main=$railstep main->extra=$frstep (expect 220 / 192)"
+frstep=$((px - mx))       # fr track (192px) + 20px gap == 212
+# FULL-WIDTH SCOPING: this page uses display:grid, so the readable-measure gutter
+# is disabled and the grid resolves its fr tracks against the FULL viewport
+# content width (624px at bw=640), like Firefox — not the old 584px readable
+# strip. The fixed 200px rail is unchanged (rail step stays 220); each 1fr track
+# grew 172->192px so the fr step is 192+20gap = 212 (was 172+20 = 192). The
+# grid now fills the window edge-to-edge as a real browser does.
+echo "[hb-grid] shell steps: rail->main=$railstep main->extra=$frstep (expect 220 / 212)"
 
 # (4) explicit list: the FIXED 200px rail step differs from the fr step, and the
 #     rail step isolates the 20px column-gap on top of the known 200px track.
-if [ "$railstep" -eq 220 ] && [ "$frstep" -eq 192 ]; then
-    echo "[hb-grid] PASS explicit '200px 1fr 1fr' + 20px column-gap (fixed rail 200+20, fr 172+20)"
+if [ "$railstep" -eq 220 ] && [ "$frstep" -eq 212 ]; then
+    echo "[hb-grid] PASS explicit '200px 1fr 1fr' + 20px column-gap (fixed rail 200+20, fr 192+20)"
 else
     echo "[hb-grid] FAIL shell track/gap geometry (rail=$railstep fr=$frstep)"; fail=1
 fi

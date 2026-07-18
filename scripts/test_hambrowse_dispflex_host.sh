@@ -74,7 +74,10 @@ else
     echo "[hb-dispflex] FAIL labels did not stack (first=$lr1 second=$lr2)"; fail=1
 fi
 # The block-ified span paints its WHOLE box (a FILL), not just behind the text.
-assert_grep 'FILL [0-9]+ [0-9]+ 100 700 #ffcc00' "display:block span paints its full-width box"
+# FULL-WIDTH SCOPING: this page uses display:flex, so the readable-measure gutter
+# is disabled and the block box spans the true body width (0..800) like Firefox,
+# not the old 584px-centred strip (was 100..700 at width 800). More-correct.
+assert_grep 'FILL [0-9]+ [0-9]+ 0 800 #ffcc00' "display:block span paints its full-width box"
 
 # ---- (2) flex span navbar spreads + container bar + column direction -------
 hx=$(seg_x "Home")
@@ -85,7 +88,9 @@ if [ -n "$hx" ] && [ -n "$cx" ] && [ "$cx" -gt "$((hx + 200))" ]; then
 else
     echo "[hb-dispflex] FAIL flex span nav did not spread (Home=$hx Contact=$cx)"; fail=1
 fi
-assert_grep 'FILL [0-9]+ [0-9]+ 100 700 #223344' "flex container paints its full-width background bar"
+# FULL-WIDTH SCOPING (as above): the flex container's background bar now spans
+# the true body width (0..800) like Firefox, not the 584px-centred strip.
+assert_grep 'FILL [0-9]+ [0-9]+ 0 800 #223344' "flex container paints its full-width background bar"
 # flex-direction:column stacks children on DIFFERENT rows (not side-by-side).
 s1=$(seg_row "Stacked one")
 s2=$(seg_row "Stacked two")
