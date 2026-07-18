@@ -1,0 +1,294 @@
+# lib/hammixer.ad — hamGame MIXER: pure, target-agnostic tone synthesis +
+# multi-voice software mixing (the pygame.mixer / SDL_mixer channel model).
+#
+# WHERE THIS SITS (and why it is separate from lib/hamsdl_audio.ad)
+# ================================================================
+# lib/hamsdl_audio.ad is the SDL_mixer "load a file, play it on the ONE HDA
+# stream" registry — v1 is SINGLE-CHANNEL: a new play REPLACES the current
+# sound (its own header documents "no software mixer summing two sources yet").
+# Games, though, want the pygame.mixer shape: synthesize a beep, load a sound,
+# and play SEVERAL at once (footstep + coin + music) SUMMED into one stream.
+#
+# This module is that missing SOFTWARE MIXER. It is deliberately PURE — no
+# `extern`, no I/O, no imports — exactly like lib/wavdecode.ad and lib/hamsdl.ad,
+# so it links into BOTH x86_64-adder-user (device) AND x86_64-linux (host). It
+# owns three things and nothing else:
+#   1. TONE SYNTHESIS — integer square-wave PCM into a caller buffer or an
+#      internal clip (no float, so it is bit-for-bit deterministic on every
+#      target; a game beep needs no float and float codegen is avoided).
+#   2. A CLIP arena — decoded/synthesized s16le mono PCM copied in, name-free,
+#      referenced by handle (a synthesized tone and a loaded WAV are both clips).
+#   3. VOICES + MIX — a small fixed set of concurrent voices, each a cursor into
+#      a clip at a per-voice volume; mixer_mix() SUMS the active voices sample by
+#      sample with SATURATING (clamped) add into a mono s16le output buffer.
+#
+# The output buffer is the Plan-9-shaped seam: on device the game writes it to
+# /dev/audio (the same staging lib/hamsdl_audio_dev.ad already does — NOT a
+# socket); on the host a test reads it back and asserts on the samples. So the
+# whole thing is verifiable with NO audio hardware and NO QEMU: synth a known
+# tone and check its length / period / amplitude, and mix two loud tones and
+# check the sum SATURATES instead of wrapping.
+#
+# FORMAT (honest v1): everything is MONO signed-16-bit little-endian at a single
+# mixer rate. Loaded clips must already be s16 mono (game_load_sound rejects
+# other formats). Stereo / 8-bit / resampling are future work, documented here
+# rather than half-built.
+#
+# ============================ PUBLIC API ===================================
+#   mixer_reset()                              drop every clip + voice
+#   mixer_set_rate(rate) / mixer_rate()->u32   the one output sample rate
+#   mixer_synth_square(out,cap,freq,ms,vol,rate)->u64   raw synth to a buffer
+#   mixer_add_tone(freq,ms,vol) -> int32       synth a square clip; handle/-1
+#   mixer_register_clip(pcm,nbytes,rate)->int32 copy s16 PCM in; handle/-1
+#   mixer_clip_count()->int32 / mixer_clip_samples(h)->u64 / mixer_clip_rate(h)->u32
+#   mixer_play(clip,vol) -> int32              start a voice; voice id/-1
+#   mixer_stop(voice) / mixer_stop_all()
+#   mixer_active_voices() -> int32             how many voices are sounding
+#   mixer_mix(out,frames) -> u64               sum voices -> mono s16le; bytes
+# ===========================================================================
+
+# ---- limits --------------------------------------------------------------
+MIX_MAX_CLIPS:    int32  = 16
+MIX_MAX_VOICES:   int32  = 8
+MIX_ARENA_BYTES:  uint64 = 262144          # 256 KiB shared clip PCM arena
+MIX_DEFAULT_RATE: uint32 = 22050
+
+# ---- clip arena (bump-allocated s16le mono PCM) --------------------------
+_mx_arena: Array[262144, uint8]
+_mx_used:  uint64 = 0
+_mx_nclips: int32 = 0
+_mx_clip_off:  Array[16, uint64]           # byte offset of clip's PCM in arena
+_mx_clip_ns:   Array[16, uint64]           # sample count (int16 samples)
+_mx_clip_rate: Array[16, uint32]
+
+# ---- voices --------------------------------------------------------------
+_mx_v_active: Array[8, int32]
+_mx_v_clip:   Array[8, int32]
+_mx_v_cur:    Array[8, uint64]             # cursor in samples
+_mx_v_vol:    Array[8, int32]              # 0..128 (SDL_mixer scale)
+
+_mx_rate: uint32 = 22050
+
+
+# ---- little-endian signed-16 helpers -------------------------------------
+def _mx_rd16(buf: Ptr[uint8], i: uint64) -> int32:
+    raw: uint32 = cast[uint32](buf[i]) | (cast[uint32](buf[i + 1]) << 8)
+    s: int32 = cast[int32](raw)
+    if s >= 32768:
+        s = s - 65536                       # sign-extend
+    return s
+
+
+def _mx_wr16(buf: Ptr[uint8], i: uint64, s: int32):
+    u: uint32 = cast[uint32](s) & 65535     # low 16 bits (two's complement)
+    buf[i]     = cast[uint8](u & 255)
+    buf[i + 1] = cast[uint8]((u >> 8) & 255)
+
+
+def _mx_clamp16(s: int32) -> int32:
+    if s > 32767:
+        return 32767
+    if s < 0 - 32768:
+        return 0 - 32768
+    return s
+
+
+def _mx_clampvol(v: int32) -> int32:
+    if v < 0:
+        return 0
+    if v > 128:
+        return 128
+    return v
+
+
+# ---- lifecycle -----------------------------------------------------------
+def mixer_reset():
+    _mx_used = 0
+    _mx_nclips = 0
+    v: int32 = 0
+    while v < MIX_MAX_VOICES:
+        _mx_v_active[v] = 0
+        v = v + 1
+    _mx_rate = MIX_DEFAULT_RATE
+
+
+def mixer_set_rate(rate: uint32):
+    if rate > 0:
+        _mx_rate = rate
+
+
+def mixer_rate() -> uint32:
+    return _mx_rate
+
+
+# ---- tone synthesis ------------------------------------------------------
+# Write a square wave of `freq_hz` for `duration_ms` at `volume` (0..128) and
+# sample rate `rate` into `out` as mono s16le. Integer-only: amplitude is
+# 32767*vol/128; the period is rate/freq samples, high for the first half,
+# low for the second. Returns the number of BYTES written (nframes*2), clamped
+# to `cap_bytes`. A square (not sine) keeps this float-free and gives a crisp,
+# easily-verified zero-crossing count (2*freq*duration_s transitions).
+def mixer_synth_square(out: Ptr[uint8], cap_bytes: uint64, freq_hz: uint32,
+                       duration_ms: uint32, volume: int32, rate: uint32) -> uint64:
+    if freq_hz == 0 or rate == 0:
+        return 0
+    amp: int32 = 32767 * _mx_clampvol(volume) / 128
+    period: uint64 = cast[uint64](rate) / cast[uint64](freq_hz)
+    if period < 2:
+        period = 2
+    half: uint64 = period / 2
+    nframes: uint64 = cast[uint64](rate) * cast[uint64](duration_ms) / 1000
+    max_frames: uint64 = cap_bytes / 2
+    if nframes > max_frames:
+        nframes = max_frames
+    i: uint64 = 0
+    while i < nframes:
+        phase: uint64 = i % period
+        s: int32 = amp
+        if phase >= half:
+            s = 0 - amp
+        _mx_wr16(out, i * 2, s)
+        i = i + 1
+    return nframes * 2
+
+
+# ---- clip arena ----------------------------------------------------------
+# Copy `nbytes` of s16le mono PCM into the arena as a new clip. Returns the clip
+# handle (>=0), or -1 if the table/arena is full. Odd trailing byte is dropped
+# so the clip is whole samples.
+def mixer_register_clip(pcm: Ptr[uint8], nbytes: uint64, rate: uint32) -> int32:
+    if _mx_nclips >= MIX_MAX_CLIPS:
+        return -1
+    store: uint64 = nbytes
+    if _mx_used + store > MIX_ARENA_BYTES:
+        store = MIX_ARENA_BYTES - _mx_used
+    store = store / 2 * 2                                # whole s16 samples
+    if store == 0:
+        return -1
+    h: int32 = _mx_nclips
+    _mx_clip_off[h]  = _mx_used
+    _mx_clip_ns[h]   = store / 2
+    _mx_clip_rate[h] = rate
+    j: uint64 = 0
+    while j < store:
+        _mx_arena[_mx_used + j] = pcm[j]
+        j = j + 1
+    _mx_used = _mx_used + store
+    _mx_nclips = _mx_nclips + 1
+    return h
+
+
+# Synthesize a square-wave TONE directly into the arena as a clip (so it can be
+# played through a voice like any loaded sound). Returns the clip handle or -1.
+def mixer_add_tone(freq_hz: uint32, duration_ms: uint32, volume: int32) -> int32:
+    if _mx_nclips >= MIX_MAX_CLIPS or freq_hz == 0:
+        return -1
+    nframes: uint64 = cast[uint64](_mx_rate) * cast[uint64](duration_ms) / 1000
+    avail: uint64 = (MIX_ARENA_BYTES - _mx_used) / 2
+    if nframes > avail:
+        nframes = avail
+    if nframes == 0:
+        return -1
+    got: uint64 = mixer_synth_square(&_mx_arena[_mx_used], nframes * 2, freq_hz,
+                                     duration_ms, volume, _mx_rate)
+    h: int32 = _mx_nclips
+    _mx_clip_off[h]  = _mx_used
+    _mx_clip_ns[h]   = got / 2
+    _mx_clip_rate[h] = _mx_rate
+    _mx_used = _mx_used + got
+    _mx_nclips = _mx_nclips + 1
+    return h
+
+
+def mixer_clip_count() -> int32:
+    return _mx_nclips
+
+
+def _mx_clip_ok(h: int32) -> int32:
+    if h < 0 or h >= _mx_nclips:
+        return 0
+    return 1
+
+
+def mixer_clip_samples(h: int32) -> uint64:
+    if _mx_clip_ok(h) == 0:
+        return 0
+    return _mx_clip_ns[h]
+
+
+def mixer_clip_rate(h: int32) -> uint32:
+    if _mx_clip_ok(h) == 0:
+        return 0
+    return _mx_clip_rate[h]
+
+
+# ---- voices --------------------------------------------------------------
+# Start playing clip `h` on a free voice at `vol` (0..128). Returns the voice id
+# (>=0), or -1 if the clip is bad or all voices are busy.
+def mixer_play(h: int32, vol: int32) -> int32:
+    if _mx_clip_ok(h) == 0:
+        return -1
+    v: int32 = 0
+    while v < MIX_MAX_VOICES:
+        if _mx_v_active[v] == 0:
+            _mx_v_active[v] = 1
+            _mx_v_clip[v]   = h
+            _mx_v_cur[v]    = 0
+            _mx_v_vol[v]    = _mx_clampvol(vol)
+            return v
+        v = v + 1
+    return -1
+
+
+def mixer_stop(voice: int32):
+    if voice >= 0 and voice < MIX_MAX_VOICES:
+        _mx_v_active[voice] = 0
+
+
+def mixer_stop_all():
+    v: int32 = 0
+    while v < MIX_MAX_VOICES:
+        _mx_v_active[v] = 0
+        v = v + 1
+
+
+def mixer_active_voices() -> int32:
+    n: int32 = 0
+    v: int32 = 0
+    while v < MIX_MAX_VOICES:
+        if _mx_v_active[v] == 1:
+            n = n + 1
+        v = v + 1
+    return n
+
+
+# ---- the mix -------------------------------------------------------------
+# Render `frames` mono s16le samples into `out` by SUMMING every active voice's
+# current sample scaled by its volume, with a SATURATING clamp to [-32768,32767]
+# (so two loud voices distort gracefully instead of wrapping to noise). Each
+# voice advances one sample per frame and deactivates when its clip is spent;
+# frames past the end of all voices are silence (0). Returns bytes written
+# (frames*2). This is the buffer a device backend streams to /dev/audio and a
+# host gate reads back.
+def mixer_mix(out: Ptr[uint8], frames: uint64) -> uint64:
+    f: uint64 = 0
+    while f < frames:
+        acc: int32 = 0
+        v: int32 = 0
+        while v < MIX_MAX_VOICES:
+            if _mx_v_active[v] == 1:
+                clip: int32 = _mx_v_clip[v]
+                cur: uint64 = _mx_v_cur[v]
+                if cur < _mx_clip_ns[clip]:
+                    off: uint64 = _mx_clip_off[clip] + cur * 2
+                    s: int32 = _mx_rd16(&_mx_arena[off], 0)
+                    acc = acc + s * _mx_v_vol[v] / 128
+                    _mx_v_cur[v] = cur + 1
+                    if cur + 1 >= _mx_clip_ns[clip]:
+                        _mx_v_active[v] = 0
+                else:
+                    _mx_v_active[v] = 0
+            v = v + 1
+        _mx_wr16(out, f * 2, _mx_clamp16(acc))
+        f = f + 1
+    return frames * 2
