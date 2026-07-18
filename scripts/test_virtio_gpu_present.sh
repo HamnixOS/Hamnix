@@ -192,6 +192,14 @@ check_log "GPU backend self-test PASS"   "\[vgpu-vk\] PASS: GPU backend self-tes
 # (The ns numbers themselves are informational — printed above — and vary
 # by host/accel; only the correctness + completion markers gate.)
 check_log "present benchmark correct"    "\[vgpu-bench\] PASS: GPU-presented backing matches SW frame"
+# Phase D.3: BGRA-native (zero-convert) present. The frame is rendered
+# DIRECTLY in the device's BGRA scanout order (vk2d BGRA store), so present
+# is the pure device DMA — no RGBA->BGRA convert copy. These markers prove
+# the vk2d BGRA store order is correct AND the BGRA-presented backing shows
+# the same visible colors as the RGBA reference. The "BGRA-native present"
+# ns line printed above is the 61x device-only number the DE flips to.
+check_log "vk2d BGRA store order"        "\[vgpu-bench\] PASS: vk2d BGRA store lays B,G,R,A"
+check_log "BGRA-native present correct"  "\[vgpu-bench\] PASS: BGRA-native present matches RGBA reference"
 check_log "present benchmark complete"   "\[vgpu-bench\] PASS: present benchmark complete"
 
 if grep -a -q -E "\[vgpu-vk\] FAIL" "$LOG"; then
