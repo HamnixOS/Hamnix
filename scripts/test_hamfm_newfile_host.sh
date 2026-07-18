@@ -13,7 +13,14 @@
 #       (fmc_touch -> sys_open_write, the SAME open-create the on-device app
 #       uses) against a scratch directory and creates a real 0-byte file with
 #       the default name "New File.txt".
-#   (3) The NATIVE Hamnix build of user/hamfmscene.ad still compiles from the
+#   (3) The directory-LISTING render: the shared core (lib/hamfmcore.ad) sorts
+#       entries directories-first then A→Z (case-insensitive), flags executables
+#       with a green tint + corner badge, and draws a live entry-count HUD in
+#       the breadcrumb. A representative model (dirs + files + two executables)
+#       is built directly (enumeration is a kernel path the host can't run) and
+#       rendered through the REAL fmc_paint to a PNG a human/agent LOOKs at; the
+#       post-sort model dump + scene display list assert order/exec/count.
+#   (4) The NATIVE Hamnix build of user/hamfmscene.ad still compiles from the
 #       same core (x86_64-adder-user).
 #
 # Built with the frozen Python seed compiler (compiles 100% of the tree).
@@ -46,19 +53,20 @@ trap 'rm -rf "$SCRATCH"' EXIT
 DUMP="$OUT/hamfm_host_dump.txt"
 BEFORE="$OUT/hamfm_menu_before.ppm"
 AFTER="$OUT/hamfm_menu_after.ppm"
+LISTING="$OUT/hamfm_listing.ppm"
 
 echo "[hamfm-host] running host harness (scratch=$SCRATCH) ..."
-if ! "$BIN" "$BEFORE" "$AFTER" "$SCRATCH" >"$DUMP" 2>&1; then
+if ! "$BIN" "$BEFORE" "$AFTER" "$SCRATCH" "$LISTING" >"$DUMP" 2>&1; then
     echo "[hamfm-host] FAIL: host harness exited non-zero"; cat "$DUMP"; exit 1
 fi
 
 # Render the PPMs to PNGs (saved for eyeballing).
-for f in before after; do
-    src="$OUT/hamfm_menu_$f.ppm"; dst="$OUT/hamfm_menu_$f.png"
+for f in "menu_before:$BEFORE" "menu_after:$AFTER" "listing:$LISTING"; do
+    name="${f%%:*}"; src="${f#*:}"; dst="$OUT/hamfm_$name.png"
     if python3 scripts/ppm_to_png.py "$src" "$dst" 2>"$OUT/hamfm_png.log"; then
         echo "[hamfm-host] PASS rendered $dst ($(file -b "$dst" 2>/dev/null))"
     else
-        echo "[hamfm-host] FAIL png conversion ($f)"; cat "$OUT/hamfm_png.log"; fail=1
+        echo "[hamfm-host] FAIL png conversion ($name)"; cat "$OUT/hamfm_png.log"; fail=1
     fi
 done
 
@@ -82,6 +90,32 @@ assert_grep '^BEFORE-ROWS 1$'            "before menu had only 1 row (New Folder
 # (2) The New-File action created a real 0-byte file with the default name.
 assert_grep '^NEWFILE-NAME New File\.txt$' "New-File proposes default name 'New File.txt'"
 assert_grep '^NEWFILE-RC 1$'               "fmc_touch reported success"
+
+# (3) The directory LISTING render: the shared core sorts dirs-first / A→Z,
+# flags executables, and draws the entry-count HUD in the breadcrumb. Proven
+# from the post-sort model dump + the rendered scene display list (no pixels).
+# Input was shuffled (files before dirs, mixed case) so the order proves sort.
+assert_grep '^ENTRY 0 D - \.\.$'          "'..' pinned at row 0"
+assert_grep '^ENTRY 1 D - build$'          "dirs-first: 'build' sorts to row 1 (A→Z, case-insensitive)"
+assert_grep '^ENTRY 2 D - Documents$'      "dir 'Documents' at row 2"
+assert_grep '^ENTRY 3 D - Music$'          "dir 'Music' at row 3 (last dir)"
+assert_grep '^ENTRY 4 F - apple.md$'       "first FILE ('apple.md') sorts AFTER all dirs at row 4"
+assert_grep '^ENTRY 5 F X hello$'          "executable 'hello' flagged X (no extension)"
+assert_grep '^ENTRY 7 F X run.sh$'         "executable 'run.sh' flagged X"
+assert_grep '^ENTRY 8 F - zebra.txt$'      "'zebra.txt' sorts last (A→Z)"
+assert_grep '^LISTING-COUNT 8$'            "entry-count HUD reports 8 real items (excludes '..')"
+# The breadcrumb header glyph string carries the live count HUD "(8)".
+assert_grep '^glyphs .* "hamfm: /home/live \(8\)" ' "breadcrumb draws path + '(8)' item-count HUD"
+# The sorted labels render as real glyphs in the listing scene.
+assert_grep '^glyphs .* "build" '          "listing draws the 'build' folder label"
+assert_grep '^glyphs .* "run.sh" '         "listing draws the 'run.sh' executable label"
+# Executable badge: two green roundrects (dark badge + light dot) are emitted
+# for each of the two exec files — proves the type badge painted.
+if [ "$(grep -Ec '^roundrect .* #2e8b3d( |$)' "$DUMP")" -ge 2 ]; then
+    echo "[hamfm-host] PASS executable badge painted for exec files (>=2 green badges)"
+else
+    echo "[hamfm-host] FAIL executable badge missing (expected >=2 '#2e8b3d' roundrects)"; fail=1
+fi
 
 NEWFILE="$SCRATCH/New File.txt"
 if [ -e "$NEWFILE" ]; then
