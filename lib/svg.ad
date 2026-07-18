@@ -33,11 +33,17 @@
 # it CAN and, if it cannot even find a sized <svg> root, returns -1 so the caller
 # draws the broken-image placeholder. It NEVER reads or writes out of bounds.
 #
+# transform= is now supported on <g> AND on individual shapes: translate / scale
+# / rotate (with optional centre) / matrix / skewX / skewY, composed left-to-
+# right and stacked through nested <g> (the "CTM") in front of the viewBox map.
+# One caveat: stroke-width does NOT scale with the transform (it stays viewBox-
+# relative) — cheap but legible, matching the butt-cap stroker.
+#
 # GAPS (noted, skipped — never crash): gradients / patterns, filters, <text>,
-# <image>, <use>/<defs>/<symbol> references, CSS/<style>, transform= (beyond the
-# viewBox mapping), and exponent-form numbers (mantissa only). Arc/rounded-rect
-# geometry uses nearest-degree flattening (~1 deg segments) — smooth at icon
-# sizes, not a high-DPI curve.
+# <image>, <use>/<defs>/<symbol> references, CSS/<style>, and exponent-form
+# numbers (mantissa only). Arc/rounded-rect geometry uses nearest-degree
+# flattening (~1 deg segments) — smooth at icon sizes, not a high-DPI curve.
+# rotate/skew angles snap to the nearest degree (the table-free integer trig).
 
 # ---- capacities (BSS) ----------------------------------------------
 SVG_MAX_DIM:  uint64 = 512               # max raster width or height
@@ -105,6 +111,36 @@ gst_r:   Array[64, int32]
 gst_g:   Array[64, int32]
 gst_b:   Array[64, int32]
 gdepth:  int32 = 0
+
+# ---- affine transform (CTM), composed IN FRONT of the viewBox map --------
+# The "current transform matrix" accumulates every ancestor <g transform=...>
+# plus a shape's own transform=. A user-space point (x,y) (Q8) maps to
+#   (a*x + c*y)/65536 + e ,  (b*x + d*y)/65536 + f
+# BEFORE the viewBox scale in _tx/_ty. a,b,c,d are Q16 (so identity = 65536);
+# e,f are Q8, the same fixed point as user coordinates. Identity CTM leaves the
+# old viewBox-only mapping bit-for-bit unchanged.
+ctm_a: int64 = 65536
+ctm_b: int64 = 0
+ctm_c: int64 = 0
+ctm_d: int64 = 65536
+ctm_e: int64 = 0
+ctm_f: int64 = 0
+# one saved CTM per open <g> (restored on </g>), parallel to the gst_* stack.
+gtm_a: Array[64, int64]
+gtm_b: Array[64, int64]
+gtm_c: Array[64, int64]
+gtm_d: Array[64, int64]
+gtm_e: Array[64, int64]
+gtm_f: Array[64, int64]
+# single-slot save for a shape's own transform= (shapes do not nest).
+sctm_a: int64 = 65536
+sctm_b: int64 = 0
+sctm_c: int64 = 0
+sctm_d: int64 = 65536
+sctm_e: int64 = 0
+sctm_f: int64 = 0
+# scratch args for the transform-list parser (translate/scale/rotate/matrix/skew)
+xf_arg: Array[6, int64]
 
 # scratch outputs from the color parser
 col_ok: int32 = 0
@@ -289,6 +325,120 @@ def _rd_flag(limit: uint64) -> int64:
     return 0
 
 
+# ---- affine transform (CTM) helpers --------------------------------
+def _ctm_reset():
+    ctm_a = 65536
+    ctm_b = 0
+    ctm_c = 0
+    ctm_d = 65536
+    ctm_e = 0
+    ctm_f = 0
+
+# CTM := CTM * M, apply-M-first semantics. M = [a b c d](Q16) [e f](Q8).
+# Every product has a possibly-negative operand (rotate/negative translate), so
+# each power-of-two divide goes through _sdiv (task #41 logical-shift trap).
+def _ctm_mul(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64):
+    na: int64 = _sdiv(ctm_a * a + ctm_c * b, 65536)
+    nb: int64 = _sdiv(ctm_b * a + ctm_d * b, 65536)
+    nc: int64 = _sdiv(ctm_a * c + ctm_c * d, 65536)
+    nd: int64 = _sdiv(ctm_b * c + ctm_d * d, 65536)
+    ne: int64 = _sdiv(ctm_a * e + ctm_c * f, 65536) + ctm_e
+    nf: int64 = _sdiv(ctm_b * e + ctm_d * f, 65536) + ctm_f
+    ctm_a = na
+    ctm_b = nb
+    ctm_c = nc
+    ctm_d = nd
+    ctm_e = ne
+    ctm_f = nf
+
+# Parse and compose a transform="..." list at svg_src[off..off+len). Supports
+# translate(tx[,ty]) scale(sx[,sy]) rotate(deg[,cx,cy]) matrix(a b c d e f)
+# skewX(deg) skewY(deg); several compose left-to-right (SVG order). Unknown
+# functions are skipped. Bounds-safe: cursor strictly advances, args capped at 6.
+def _apply_transform_list(off: uint64, len: uint64):
+    lim: uint64 = off + len
+    p: uint64 = off
+    guard: int32 = 0
+    while p < lim and guard < 64:
+        guard = guard + 1
+        while p < lim and (_is_wsp(svg_src[p]) != 0 or svg_src[p] == 44):
+            p = p + 1
+        if p >= lim:
+            return
+        ns: uint64 = p                              # function-name start
+        while p < lim:
+            lc: uint8 = _lower(svg_src[p])
+            if lc >= 97 and lc <= 122:
+                p = p + 1
+            else:
+                break
+        nlen: uint64 = p - ns
+        if nlen == 0:
+            return                                  # not a name -> done
+        while p < lim and svg_src[p] != 40:         # skip to '('
+            p = p + 1
+        if p >= lim:
+            return
+        p = p + 1                                   # past '('
+        cs: uint64 = p
+        while p < lim and svg_src[p] != 41:         # up to ')'
+            p = p + 1
+        ce: uint64 = p
+        if p < lim:
+            p = p + 1                               # past ')'
+        # read up to 6 numeric args from [cs,ce)
+        pcur = cs
+        argc: int32 = 0
+        while argc < 6 and _peek_num(ce) != 0:
+            xf_arg[argc] = _rd_num(ce)
+            argc = argc + 1
+        if _streq_ci(ns, nlen, cast[Ptr[uint8]]("translate")) != 0:
+            tx: int64 = 0
+            ty: int64 = 0
+            if argc > 0:
+                tx = xf_arg[0]
+            if argc > 1:
+                ty = xf_arg[1]
+            _ctm_mul(65536, 0, 0, 65536, tx, ty)
+        elif _streq_ci(ns, nlen, cast[Ptr[uint8]]("scale")) != 0:
+            sx: int64 = 65536
+            sy: int64 = 65536
+            if argc > 0:
+                sx = xf_arg[0] * 256                # Q8 -> Q16
+                sy = sx
+            if argc > 1:
+                sy = xf_arg[1] * 256
+            _ctm_mul(sx, 0, 0, sy, 0, 0)
+        elif _streq_ci(ns, nlen, cast[Ptr[uint8]]("rotate")) != 0:
+            deg: int64 = 0
+            if argc > 0:
+                deg = _sdiv(xf_arg[0], 256)         # Q8 degrees -> integer deg
+            if argc >= 3:
+                _ctm_mul(65536, 0, 0, 65536, xf_arg[1], xf_arg[2])
+            _cos_sin(deg)
+            _ctm_mul(trig_c, trig_s, 0 - trig_s, trig_c, 0, 0)
+            if argc >= 3:
+                _ctm_mul(65536, 0, 0, 65536, 0 - xf_arg[1], 0 - xf_arg[2])
+        elif _streq_ci(ns, nlen, cast[Ptr[uint8]]("matrix")) != 0:
+            if argc >= 6:
+                _ctm_mul(xf_arg[0] * 256, xf_arg[1] * 256, xf_arg[2] * 256, \
+                         xf_arg[3] * 256, xf_arg[4], xf_arg[5])
+        elif _streq_ci(ns, nlen, cast[Ptr[uint8]]("skewx")) != 0:
+            if argc > 0:
+                _cos_sin(_sdiv(xf_arg[0], 256))
+                tanq: int64 = 0
+                if trig_c != 0:
+                    tanq = _sdiv(trig_s * 65536, trig_c)
+                _ctm_mul(65536, 0, tanq, 65536, 0, 0)
+        elif _streq_ci(ns, nlen, cast[Ptr[uint8]]("skewy")) != 0:
+            if argc > 0:
+                _cos_sin(_sdiv(xf_arg[0], 256))
+                tanq2: int64 = 0
+                if trig_c != 0:
+                    tanq2 = _sdiv(trig_s * 65536, trig_c)
+                _ctm_mul(65536, tanq2, 0, 65536, 0, 0)
+
+
 # ---- user Q8 -> device Q8 via the viewBox mapping ------------------
 def _tx(uf: int64) -> int32:
     d: int64 = _sdiv((uf - minxf) * cast[int64](svg_w) * 256, vwf)
@@ -325,7 +475,12 @@ def _add_dev(dx: int32, dy: int32):
         n_pts = n_pts + 1
 
 def _add_user(ux: int64, uy: int64):
-    _add_dev(_tx(ux), _ty(uy))
+    # apply the current transform (CTM) in user space, THEN the viewBox map.
+    # ctm_a/c are Q16, ux/uy are Q8 -> product Q24, _sdiv by 65536 -> Q8; then
+    # + ctm_e/f (Q8). An identity CTM yields exactly (ux,uy) — no behaviour drift.
+    txu: int64 = _sdiv(ctm_a * ux + ctm_c * uy, 65536) + ctm_e
+    tyu: int64 = _sdiv(ctm_b * ux + ctm_d * uy, 65536) + ctm_f
+    _add_dev(_tx(txu), _ty(tyu))
 
 
 # ---- elliptical arc flattening -------------------------------------
@@ -1403,6 +1558,7 @@ def svg_decode(buf: Ptr[uint8], len: uint64) -> int32:
     vwf = 256
     vhf = 256
     gdepth = 0
+    _ctm_reset()
     svg_src = buf
     svg_len = len
     if len < 4:
@@ -1444,6 +1600,12 @@ def svg_decode(buf: Ptr[uint8], len: uint64) -> int32:
             if i + 2 < svg_len and _lower(svg_src[i + 2]) == 103:  # </g
                 if gdepth > 0:
                     gdepth = gdepth - 1
+                    ctm_a = gtm_a[gdepth]           # restore this level's CTM
+                    ctm_b = gtm_b[gdepth]
+                    ctm_c = gtm_c[gdepth]
+                    ctm_d = gtm_d[gdepth]
+                    ctm_e = gtm_e[gdepth]
+                    ctm_f = gtm_f[gdepth]
             i = _tag_end(i)
             continue
         te: uint64 = _tag_end(i)
@@ -1471,9 +1633,30 @@ def svg_decode(buf: Ptr[uint8], len: uint64) -> int32:
                 gst_r[gdepth] = sr
                 gst_g[gdepth] = sg
                 gst_b[gdepth] = sb
+                # save the CTM for this level, then compose the group transform=
+                gtm_a[gdepth] = ctm_a
+                gtm_b[gdepth] = ctm_b
+                gtm_c[gdepth] = ctm_c
+                gtm_d[gdepth] = ctm_d
+                gtm_e[gdepth] = ctm_e
+                gtm_f[gdepth] = ctm_f
+                if _find_attr(start, te, cast[Ptr[uint8]]("transform")) != 0:
+                    _apply_transform_list(av_off, av_len)
                 gdepth = gdepth + 1
             i = te
             continue
+        # a shape's OWN transform= composes on top of the group CTM, but only
+        # for this element: save the CTM, compose, build+paint, then restore.
+        had_xf: int32 = 0
+        if _find_attr(start, te, cast[Ptr[uint8]]("transform")) != 0:
+            sctm_a = ctm_a
+            sctm_b = ctm_b
+            sctm_c = ctm_c
+            sctm_d = ctm_d
+            sctm_e = ctm_e
+            sctm_f = ctm_f
+            had_xf = 1
+            _apply_transform_list(av_off, av_len)
         painted: int32 = 0
         if _tag_is(i, cast[Ptr[uint8]]("rect")) != 0:
             _shape_rect(start, te)
@@ -1499,6 +1682,13 @@ def svg_decode(buf: Ptr[uint8], len: uint64) -> int32:
         if painted != 0:
             _resolve_style(start, te)
             _paint_current()
+        if had_xf != 0:                             # restore the group CTM
+            ctm_a = sctm_a
+            ctm_b = sctm_b
+            ctm_c = sctm_c
+            ctm_d = sctm_d
+            ctm_e = sctm_e
+            ctm_f = sctm_f
         i = te
     svg_ok = 1
     return 0
