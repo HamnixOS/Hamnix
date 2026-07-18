@@ -301,6 +301,10 @@ opt_aluload_count: uint32 = 0
 # `imul %dst,%src,$C` instead of materialising C into a scratch register and
 # doing a 2-operand imul. Counts each fired fold. OFF -> byte-identical.
 opt_imulimm_count: uint32 = 0
+# MULTIPLY-ADD DAG-tile folds (--opt Phase-5): a `x*{2,3,5,9} (+/- imm32)` tree
+# emitted as a single `lea disp(%rax,%rax,scale),%rax` (see try_lea_muladd_tile).
+# Counts each fired tile. OFF -> byte-identical to the seed.
+opt_leamuladd_count: uint32 = 0
 # ALU-BY-IMMEDIATE folds (--opt immalu lever): a two-operand binop `x OP C` whose
 # constant operand C is a non-negative imm32 and whose op has a one-operand
 # immediate form (ADD/SUB/AND/OR/XOR) is emitted as the single `op $C,%rax` in the
@@ -478,6 +482,7 @@ def isel_reset_stats():
     opt_isel_count = 0
     opt_aluload_count = 0
     opt_imulimm_count = 0
+    opt_leamuladd_count = 0
     opt_immalu_count = 0
     opt_storeelim_count = 0
     opt_paramhome_count = 0
@@ -5106,6 +5111,48 @@ def emit_lea_base_index_reg(base: uint32, idx: uint32, sbits: uint32):
         emit_b(sib)
 
 
+# leaq disp(%rax, %rax, scale), %rax  — the MULTIPLY-ADD DAG tile emitter (P1
+# Phase-5). Computes `%rax = %rax*(scale_factor+1) + disp` in ONE instruction,
+# where sbits (0/1/2/3) selects scale_factor 1/2/4/8, i.e. the multiplier is
+# {2,3,5,9}. base=index=%rax(000), dest=%rax(000); disp sign-extends 8/32->64.
+# This is the x86 `x*{2,3,5,9}(+disp)` strength-reduced form gcc uses for e.g.
+# `3*n+1` -> `lea 0x1(%rax,%rax,2),%rax`, replacing the `imul $C; add $disp` pair
+# with a single 1-cycle AGU op. Value-identical (two's-complement modular, sign-
+# agnostic; lea sets no flags — the result is a value in %rax, its flags are not
+# a gen_expr_ir contract). disp==0 reproduces emit_lea_base_index_reg(0,0,sbits)
+# byte-for-byte. --opt-gated at the call site; flag-off never reaches it.
+def emit_lea_muladd_rax(sbits: uint32, disp: int32):
+    emit_b(0x48)
+    emit_b(0x8D)
+    sib: uint32 = (sbits << 6) + (0 << 3) + 0    # scale | index=rax(000) | base=rax(000)
+    if disp == 0:
+        emit_b(0x04)                     # mod=00, reg=rax(000), rm=100(SIB)
+        emit_b(sib)
+    elif disp_fits8(disp) != 0:
+        emit_b(0x44)                     # mod=01, reg=rax(000), rm=100(SIB)
+        emit_b(sib)
+        emit_b(cast[uint32](disp) & 255)
+    else:
+        emit_b(0x84)                     # mod=10, reg=rax(000), rm=100(SIB)
+        emit_b(sib)
+        emit_disp32(disp)
+
+
+# Map a small integer multiplier {2,3,5,9} to its lea SIB scale field (0/1/2/3
+# for *1/*2/*4/*8, since lea `base+index*scale` with base==index gives multiplier
+# scale+1). Returns 0xFFFFFFFF for a multiplier lea cannot express with base==idx.
+def lea_mul_sbits(m: uint64) -> uint32:
+    if m == 2:
+        return 0
+    if m == 3:
+        return 1
+    if m == 5:
+        return 2
+    if m == 9:
+        return 3
+    return 4294967295
+
+
 # leaq off(%rbp, %<idx>, scale), %rax  — like emit_lea_local_sib_rax but with an
 # ARBITRARY index register (the direct-SIB coalesce for an Array-local base). With
 # idx==%rcx(1) this reproduces emit_lea_local_sib_rax byte-for-byte.
@@ -6303,6 +6350,77 @@ def gen_expr_ir_add_nonconst(v: uint32):
     gen_expr_ir(v)
 
 
+# MULTIPLY-ADD DAG TILE (P1 Phase-5, --opt). Greedily match the multi-node
+# pattern `x * m (+/- d)` with m in {2,3,5,9} and an optional imm32 constant
+# addend d, emitting it as a SINGLE `lea d(%rax,%rax,scale),%rax` instead of the
+# `imul $m ; add $d` instruction pair the per-node emitter produces. This is the
+# maximal-munch step over three IR nodes (the ADD/SUB root, the MUL, and the two
+# constant leaves) collapsed to one AGU instruction — the first real DAG tile on
+# the dest-driven backend. Matches:
+#   MUL(x, m)                         -> lea (%rax,%rax,s),%rax        (d = 0)
+#   ADD(MUL(x, m), d) / ADD(d, MUL(x,m)) -> lea d(%rax,%rax,s),%rax
+#   SUB(MUL(x, m), d)                 -> lea (-d)(%rax,%rax,s),%rax
+# where m and d are IR_CONST in [0, 0x7FFFFFFF] (so d and -d fit a sign-extended
+# int32 lea displacement; larger/negative constants fall through unchanged).
+# `x` is the sole non-const operand, evaluated ONCE into %rax then used as both
+# the lea base and index (no re-evaluation, no side-effect duplication — the IR
+# only lowers pure subtrees). Value-identical to the imul+add it replaces:
+# `x*m+d` in full 64-bit two's-complement, sign-agnostic, and gen_expr_ir does
+# not export flags so dropping the add's flag side effect is sound. Returns 1 if
+# it emitted the whole subtree into %rax, 0 to fall through to the per-node path.
+# --opt-gated (isel); flag-off never calls it, so default output is byte-identical.
+def try_lea_muladd_tile(v: uint32) -> uint32:
+    if isel_is_enabled() == 0:
+        return 0
+    if ir_kind[v] != IR_BINOP:
+        return 0
+    rootop: uint32 = ir_op[v]
+    mul_node: uint32 = 0             # the MUL subtree to strength-reduce
+    disp: int32 = 0                  # signed lea displacement (the +/- constant)
+    if rootop == BINOP_MUL:
+        mul_node = v
+    elif rootop == BINOP_ADD:
+        # MUL child on either side; the OTHER side must be a small non-neg const.
+        if ir_kind[ir_a[v]] == IR_BINOP and ir_op[ir_a[v]] == BINOP_MUL and ir_kind[ir_b[v]] == IR_CONST:
+            if ir_const[ir_b[v]] <= 2147483647:
+                mul_node = ir_a[v]
+                disp = cast[int32](cast[uint32](ir_const[ir_b[v]]))
+        if mul_node == 0 and ir_kind[ir_b[v]] == IR_BINOP and ir_op[ir_b[v]] == BINOP_MUL and ir_kind[ir_a[v]] == IR_CONST:
+            if ir_const[ir_a[v]] <= 2147483647:
+                mul_node = ir_b[v]
+                disp = cast[int32](cast[uint32](ir_const[ir_a[v]]))
+    elif rootop == BINOP_SUB:
+        # `MUL(x,m) - d` -> displacement -d. (d - MUL(x,m) is not a lea shape.)
+        if ir_kind[ir_a[v]] == IR_BINOP and ir_op[ir_a[v]] == BINOP_MUL and ir_kind[ir_b[v]] == IR_CONST:
+            if ir_const[ir_b[v]] <= 2147483647:
+                mul_node = ir_a[v]
+                disp = cast[int32](cast[uint32](0)) - cast[int32](cast[uint32](ir_const[ir_b[v]]))
+    if mul_node == 0:
+        return 0
+    # Resolve the MUL's constant multiplier m and the variable operand x.
+    mconst: uint64 = 0
+    var_side: uint32 = 0
+    if ir_kind[ir_b[mul_node]] == IR_CONST:
+        mconst = ir_const[ir_b[mul_node]]
+        var_side = ir_a[mul_node]
+    elif ir_kind[ir_a[mul_node]] == IR_CONST:
+        mconst = ir_const[ir_a[mul_node]]
+        var_side = ir_b[mul_node]
+    else:
+        return 0
+    sbits: uint32 = lea_mul_sbits(mconst)
+    if sbits == 4294967295:
+        return 0
+    # A constant variable-operand would mean the whole tree is const (handled by
+    # the fold arm before this is reached); guard anyway so x is a real value.
+    if ir_tree_is_const(var_side) != 0:
+        return 0
+    gen_expr_ir(var_side)                # x -> %rax (byte-correct leaf/subtree)
+    emit_lea_muladd_rax(sbits, disp)     # %rax = x*m + disp, one instruction
+    opt_leamuladd_count = opt_leamuladd_count + 1
+    return 1
+
+
 # This is the genuine AST -> IR -> (fold) -> emit pipeline for the lowered subset.
 def gen_expr_ir(v: uint32):
     if v == 0:
@@ -6334,6 +6452,11 @@ def gen_expr_ir(v: uint32):
         if ir_tree_is_const(v) != 0:
             emit_mov_imm_rax(ir_tree_const_val(v))
             ir_emit_fold_count = ir_emit_fold_count + 1
+            return
+        # MULTIPLY-ADD DAG TILE (Phase-5): match `x*{2,3,5,9}(+/-imm)` and emit one
+        # `lea disp(%rax,%rax,scale),%rax`, before the reassoc / per-node MUL+ADD
+        # arms would emit the `imul $m ; add $d` pair. --opt-gated inside the tile.
+        if try_lea_muladd_tile(v) != 0:
             return
         op: uint32 = ir_op[v]
         # ADD CONSTANT REASSOCIATION (sound under modular two's-complement): if
