@@ -235,33 +235,80 @@ the passing host gates found the following.
   `inset`/`outset` are accepted but rendered as `solid` (no 3-D bevel model). (6) Dashed/dotted dash lengths are a
   fixed heuristic (dash = 2×width, dot = 1×width, equal gaps), not the browser's exact dash algorithm.
 
-**TOP REMAINING W3C GAPS after the 2026-07-18d per-side-border round (a map for the next/round-5 agent, roughly by
-real-world value — the browser is now broad but NOT "fully W3C-implemented"; these are the concrete holes):**
-1. **[html-forms] `new FormData(formElement)` DOM-scrape + specialized input-type SHAPES.** Two halves:
-   (a) `new FormData(formEl)` currently only scrapes a plain OBJECT's keys (`builtins/url.ad` `NAT_FORMDATA`); a
-   DOM `<form>` element is NOT scraped. The reusable scraper ALREADY EXISTS — `lib/web/dom/canvas.ad`
-   `_serialize_form`/`_serialize_field` (iterates `input`/`select`/`textarea` with a `name`, honours checkbox/
-   radio `checked`, skips submit/reset/button) drives `form.submit()`. Round-5 path: a DOM-layer hook that, when
-   the FormData ctor arg is a DOM element, walks that form's controls and appends name→value into the `@@k/@@v`
-   multimap (mind the JS-engine↔DOM layering — the ctor lives in the extern-free engine, the scrape in the DOM
-   layer). (b) input-type VISUALS are already broad (checkbox `[x]`/`[ ]`, radio `(*)`/`( )`, password masking as
-   a real field box, email/number/text as field boxes, file/range/color/submit affordances in `dom/forms.ad`
-   `_emit_input`) — the remaining gap is PIXEL SHAPE: checkbox/radio still paint their ASCII glyphs, not a real
-   drawn square / circle with a checked mark (a new field-seg kind + a htmlpage shape painter, like the password
-   field box). High real-world value (every form).
-2. **[css-backgrounds-borders §4] per-side border COLOURS + rounded per-side corners** — the natural follow-on to
-   this round: add four colour slots (`bbox_rgb_t/r/b/l`) so `border-top:red;border-bottom:blue` paints distinctly,
-   and arc-segment stroking so a per-side border honours `border-radius`. Moderate (the per-side width/style
-   plumbing is now the template; colour needs 4 cascade slots vs the 2 packed ints used here).
+**PER-SIDE BORDER COLOURS + FILTER FUNCTION-LISTS ROUND 2026-07-18e (round-5 — the map's #2 and #5, host-verified):**
+- **[css-backgrounds-borders §4] true per-side border COLOURS (NEW, gate `bordercolor`).** Round-4 landed per-side
+  WIDTH + STYLE but carried ONE uniform border colour (the last `border-*-color` token won for all four sides — so a
+  red-top / blue-bottom box painted one colour). Now `lib/web/css/cascade.ad` parses **`border-top/-right/-bottom/
+  -left-color`** and the **`border-color` TRBL shorthand** (1..4 colours, paren-aware so `rgb(...)` stays one token)
+  into four cascade colour slots (`d_bc_t/r/b/l` scratch → `r_bctop/rt/bot/lft` rule arrays → `m_bctop/…` winners on
+  one shared specificity slot `sbcs`, like the width/style pair). They flow through `layout/box.ad` (`box_bordcr/cb/
+  cl_stack` → `bbox_rgb_r/b/l`, resolved at emit to each side's declared colour or the uniform fallback) and
+  `lib/htmlpage.ad`'s `_hpg_paint_border_sides` now takes FOUR colours and strokes each edge in its own. A per-side
+  colour longhand seeds the uniform fallback `d_bordc` ONLY when it is still unset, so an accent colour never clobbers
+  an earlier uniform `border` colour (the other sides keep it); a full `border` shorthand resets the per-side colours.
+  Verified HOST-ONLY render-to-PNG (`test_hambrowse_bordercolor_host.sh`, fixture `hambrowse_bordercolor.html`, 12
+  pixel asserts): a box with four distinct `border-<side>-color` longhands samples **red/green/blue/yellow** per edge,
+  a `border-color: #dd1111 #11bb22 #1133dd #ddbb22` TRBL shorthand expands T/R/B/L, and a single overriding
+  `border-bottom-color` leaves the three unset sides at the uniform grey fallback. **ZERO REGRESSION:** a box with no
+  per-side colour keeps every side at the uniform colour (byte-identical); the `borderside`/`border`/`keyframes`/
+  `realarticle`/`wordwrap`/`borderradius`/`boxshadow`/`website` gates stay green. **HONEST SCOPE / LIMITATIONS:**
+  (1) per-side colours take VISUAL effect only on the per-side painter path (per-side width/style declared, or a
+  `border-width`/`border-style` shorthand) — a purely-uniform `border:Npx solid` with per-side colours added still
+  paints the uniform colour on the legacy 1px stroke (a documented edge case; the accent-border cases that use a
+  per-side width/style shorthand all route correctly). (2) The four per-side colours ride ONE specificity slot
+  (`sbcs`): the highest-specificity rule that declares ANY side colour wins all four (an unset side falls back to the
+  uniform colour) — matches real usage where side colours are declared together. (3) Rounded per-side corners are
+  still square (per-side edges are axis-aligned fills; arc-segment stroking deferred). (4) No `!important` per-side
+  colour path (uniform `!important` border colour still honoured).
+- **[css-filter] filter FUNCTION-LISTS (chaining) + `hue-rotate()` (NEW, gate `filterlist`).** Round-3 landed single
+  CSS filters but a space-separated LIST collapsed to the FIRST recognised function (`filter: grayscale(1)
+  brightness(1.2)` silently dropped the brightness) and `hue-rotate()` was absent. Now `lib/web/css/cascade.ad`
+  parses the whole function LIST: a **single** function still returns its bare packed int (byte-identical legacy
+  path), but **two or more** intern into a small registry (`filt_reg_items`/`filt_reg_len`, `FILT_REG_CAP` 64,
+  `FILT_MAX` 8 functions) and the value carries `FILT_LIST_MARK` (bit 28, above the 4-bit type + 20-bit amount so it
+  never collides) `| regindex`. `lib/htmlpage.ad` reads the list back (`he_filter_is_list`/`_len`/`_at`) and applies
+  each function IN ORDER over the box rect — true CSS chaining, since each per-pixel pass reads the previous
+  function's framebuffer result. **`hue-rotate(Ndeg)`** is a real luma-preserving colour-matrix rotation in
+  `lib/htmlpaint.ad` (the CSS Filter Effects matrix, integer `_hp_sin1000`/`_hp_cos1000`). Verified HOST-ONLY
+  render-to-PNG whole-image scan (`test_hambrowse_filterlist_host.sh`, fixture `hambrowse_filterlist.html`, probe
+  `hb_filterlist_probe.py`): `grayscale(100%) brightness(150%)` settles to a **brightened grey `#9d9d9d`** (proving
+  BOTH ran — single grayscale is `#696969`), `sepia(100%) invert(100%)` does NOT stop at sepia `#b09d7a` (settles to
+  the inverted-sepia `#4f6285`), `hue-rotate(120deg)` rotates red `#cc0000` toward green `#005a00`, and a
+  single-function `grayscale(100%)` stays byte-identical. Zero regressions (existing `filter` gate green).
+  **HONEST SCOPE / LIMITATIONS:** `drop-shadow()` is still a recognised NO-OP (its offset/blur/colour args are not
+  modelled — a real drop-shadow draws a blurred silhouette OUTSIDE the box, which the in-place post-pass model does
+  not support); `backdrop-filter` (filtering what is BEHIND the element) is still absent; a chained list is capped at
+  8 functions and 64 distinct chained values per page (degrades to the first function past the cap); the chain is
+  applied over the element's border box only (out-of-flow descendants painted outside are not filtered).
+
+**TOP REMAINING W3C GAPS after the 2026-07-18e per-side-colour + filter-list round (a map for the next/round-6 agent,
+roughly by real-world value — the browser is now broad but NOT "fully W3C-implemented"; these are the concrete holes):**
+1. **[html-forms] `new FormData(formElement)` DOM-scrape — PARKED (out of the browser-agent file scope).** The
+   reusable scraper ALREADY EXISTS (`lib/web/dom/canvas.ad` `_serialize_form`/`_serialize_field`), but wiring the
+   extern-free JS-engine FormData ctor (`builtins/url.ad` `NAT_FORMDATA`) to the DOM scrape needs a JS↔DOM SEAM
+   (mirror `js_set_fetch_transport`: a `js_set_formdata_scraper(fn)` the engine calls when the ctor arg is a DOM
+   element). That seam must be REGISTERED in a `user/hambrowse*.ad` driver (as the fetch transport is) AND
+   host-verified through a DOM-capable driver — both `user/hambrowse*.ad`, outside the browser-agent's owned files.
+   Round-6+ path once the driver can register the seam. (The input-type PIXEL SHAPES half moved to item 6 — it is
+   fully within the agent's owned files.)
+2. **[css-backgrounds-borders §4] per-side border COLOURS — DONE round-5 (gate `bordercolor`).** Rounded per-side
+   corners are the remaining half: a per-side-bordered box still paints SQUARE corners (the four edges are
+   axis-aligned fills; honouring `border-radius` needs arc-segment stroking per corner — deferred).
 3. **[ecmascript] RegExp `u`/`v` Unicode mode — ABSENT (byte-oriented VM).** `\u{...}` code-point classes,
    surrogate handling, `\p{...}` property escapes. Hard (VM rewrite); moderate value.
 4. **[css-grid] named `grid-template-areas`/`grid-area`, `grid-auto-flow:dense`/column, subgrid, >8 tracks**
-   (documented OUT-OF-SCOPE items #12/grid entries below) — the remaining grid holes.
-5. **[css-filter] extend `filter`** — a filter FUNCTION LIST (chain grayscale+brightness+…), real
-   `drop-shadow()` (currently a recognised no-op), `hue-rotate()`, and `backdrop-filter` (filter the backdrop).
-   Low risk (the packed-value + post-pass machinery now exists — widen the encoding to a small list + add
-   the offset/HSL passes).
-6. **[css-anim] extend the animation END-STATE overlay** to opacity + width/height + position offsets + margins
+   (documented OUT-OF-SCOPE items #12/grid entries below) — the remaining grid holes. Highest-value untouched CSS
+   gap; the named-area parse + placement is self-contained in cascade/box. GOOD round-6 CANDIDATE.
+5. **[css-filter] `filter` FUNCTION LISTS + `hue-rotate()` — DONE round-5 (gate `filterlist`).** Remaining filter
+   holes: real `drop-shadow()` (still a recognised NO-OP — needs a blurred silhouette painted OUTSIDE the box,
+   which the in-place post-pass model does not support) and `backdrop-filter` (filter what is BEHIND the element).
+   Both need a compositing pass the static single-render model lacks — lower tractability.
+6. **[html-forms] `<input type=checkbox|radio>` PIXEL SHAPES** — checkbox/radio still paint their ASCII glyphs
+   (`[x]`/`( )`), not a real drawn square / circle with a checked mark. Self-contained (a new field-seg kind in
+   `dom/forms.ad` + a htmlpage shape painter, like the password field box). High real-world value; GOOD round-6
+   CANDIDATE. (The FormData(formElement) DOM-scrape half needs a JS↔DOM seam registered in `user/hambrowse*.ad`,
+   which is outside the browser-agent's file scope — park until the driver can register a `formdata_scraper` seam.)
+7. **[css-anim] extend the animation END-STATE overlay** to opacity + width/height + position offsets + margins
    (currently background/colour/transform/border-colour), and honour `animation-fill-mode` (only `forwards`/
    `both` should paint the end state; `none`/`backwards` should paint the FROM/`0%` frame). Low risk (the
    `@keyframes` registry + overlay hook already exist — just widen the copied property set).
