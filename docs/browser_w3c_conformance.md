@@ -41,7 +41,7 @@ From a 14-agent parallel audit (2026-07-16). Dual-target, host-iterated (~40 gat
 | css-text-fonts | 45% | 1 | 1 |
 | css-positioning | 60% | 10 | 4 |
 | ecmascript-builtins | 55% | 15 | 6 |
-| dom-core | 57% | 12 | 3 |
+| dom-core | 62% | 11 | 2 |
 
 ## FRESH AUDIT 2026-07-17 (verified against the modular lib/web/ tree)
 
@@ -79,6 +79,21 @@ the passing host gates found the following.
   round-trip verified. Gate: `domlifecycle`. (Before this, document listeners were silently dropped
   because the document object is not a registered DOM element.)
 - html5-parsing: implied end tags (gate `impliedtags`); quote-aware tag tokenization (gate `tagquote`).
+- dom-core / CSSOM-view: **layout geometry** — `getBoundingClientRect()` (DOMRect: x/y/width/height/
+  top/left/right/bottom), `offsetWidth/Height/Left/Top`, `clientWidth/Height` (+`scrollWidth/Height`),
+  `offsetParent`, and a basic `getComputedStyle(el)` (`display`/`width`/`height`/`color`). An element's
+  box is READ back from the laid-out SEG display list (`layout/box.ad` `seg_x`/`seg_line`/`seg_len`): the
+  bounding rect of the segments whose text reconstructs the element's text content, converted to pixels
+  (`seg_line*LINE_H`, `seg_len*CELL_W`). Geometry is exposed entirely from `dom/query.ad` (`_el_bbox`/
+  `_new_rect_obj`/`_new_computed_style`/`_set_el_geom_props`) + dispatch in `dom/canvas.ad` (NID_GETRECT/
+  NID_GETCOMPSTYLE) — NO layout re-implementation. A **pre-layout pass** runs before a page's `<script>`s
+  (`canvas.ad:_run_scripts`) so scripts observe box metrics; the final relayout is byte-identical, so the
+  rendered output is unchanged. Gate `geom` proves the reported box is byte-identical to the SEG-dump
+  coordinates (coordinate cross-check). **Boundary (honest):** a text-less element (pure box / image-only)
+  reports an empty rect; a run merged across inline siblings over-approximates width; getBoundingClientRect
+  returns DOCUMENT coordinates (no viewport-scroll offset); `getComputedStyle` covers the four common
+  properties (display tag-default + inline override, resolved width/height/color) not the full cascade;
+  `offsetParent` approximates as the parent element (nearest-positioned-ancestor rule not modelled).
 - ecmascript: for-of, optional chaining/nullish, Map/Set/WeakMap/WeakSet, accessor get/set, Symbol +
   Symbol.iterator, generators/yield, Object.create/defineProperty, Reflect, Proxy, typed arrays,
   structuredClone (R1-7 above), **ES modules import/export (R9, gate `modules`)**. Only class
@@ -86,7 +101,13 @@ the passing host gates found the following.
 
 **Genuinely OPEN, ranked (keyed to current files) — the live worklist:**
 1. DOM geometry: `getBoundingClientRect`/`offsetWidth/Height/Top/Left`/`clientWidth/Height`/`offsetParent`/
-   `getComputedStyle` — missing. `dom/query.ad` + `dom/bindings.ad` + `dom/canvas.ad` (reads `layout/box.ad`). **[in progress]**
+   `getComputedStyle` — **DONE (gate `geom`).** Boxes read back from the laid-out SEG display list; a
+   pre-layout pass makes metrics available to page scripts; coordinate cross-check vs the SEG dump.
+   `dom/query.ad` (`_el_bbox`/`_new_rect_obj`/`_new_computed_style`) + `dom/canvas.ad` (NID_GETRECT/
+   NID_GETCOMPSTYLE + pre-layout in `_run_scripts`) + `dom/bindings.ad` (NID constants). See the
+   ALREADY-IMPLEMENTED list above for the honest coverage boundary. REMAINING dom-geometry gaps:
+   `scrollTop/scrollLeft` interactive offsets, viewport-relative rects (scroll compensation),
+   `getClientRects()`, and a full-cascade `getComputedStyle`.
 2. `document.body`/`documentElement`/`head` — missing. `dom/canvas.ad` document build. **[in progress]**
 3. opacity + rgba()/hsla() alpha compositing — **DONE (gate `boxshadow`).** rgba()/hsla()/`#rrggbbaa` alpha is captured (`css/values.ad` `g_cv_alpha`, `_parse_alpha_frac`) and `opacity:X` parsed (`css/cascade.ad`); both are folded into the packed background/border colour at rule-store time (`_pack_fill_rgb`/`_pack_bordc`: bits 24-28 = 5-bit alpha level, bit 31 stays 0 so the value survives the `>=0` guards and never collides with the -1 unset sentinel) and pass UNCHANGED through the layout record set (`bfill_rgb`/`bbox_rgb`); the paint pass composites the fill/border at that alpha over the background (`htmlpage.ad` `_hpg_alpha` + `htmlpaint_fill_round_rect_a`/`stroke_round_rect_a`/`_blend_px`). Verified by blended-pixel asserts: `opacity:.5` on `#3060c0`→(155,178,225), `rgba(255,0,0,.5)`→pink (255,132,132). LIMITATIONS: opacity dims the element's own fill+border only, NOT its text/descendants (no group compositing); alpha is quantised to 32 levels; opacity must share a rule with the background it dims; inline `style=` bg/border alpha not folded.
 4. linear/radial/conic-gradient backgrounds — swallowed (no bg). `css/cascade.ad`+`layout/box.ad`. **[in progress]**
@@ -120,7 +141,7 @@ the passing host gates found the following.
 15. specialized input types email/number/date/search/tel/url — degrade to plain text. `dom/forms.ad`.
 
 Disjoint dispatch clusters (no write-collision): **JS** (`js/*` only: #13,#14) · **CSS-PAINT+LAYOUT**
-(`css/*`+`layout/*`: #3-7,#9,#12) · **DOM-GEOMETRY** (`dom/query,bindings` + geometry half of `canvas.ad`: #1,#2)
+(`css/*`+`layout/*`: #3-7,#9,#12) · **DOM-GEOMETRY** (`dom/query,bindings` + geometry half of `canvas.ad`: #2; #1 LANDED gate `geom`)
 · **FORMS** (`dom/canvas,forms` + `js/builtins/native.ad`: #8,#10,#11,#15 — shares canvas.ad with DOM-GEOMETRY, so serialize).
 
 ---
