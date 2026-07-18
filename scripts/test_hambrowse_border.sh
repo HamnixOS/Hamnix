@@ -88,8 +88,12 @@ fi
 grep -E '^BORDER' "$DUMP2"
 NB2=$(awk '/^BORDER n / {print $3; exit}' "$DUMP2")
 read EDGE2 INSIDE2 < <(awk '/^BORDER 0 / {for(i=1;i<=NF;i++){if($i=="edge")e=$(i+1);if($i=="inside")n=$(i+1)} print e, n; exit}' "$DUMP2")
-if [ "${NB2:-0}" -ge 1 ] && [ "${EDGE2:-}" = "#000000" ] && [ "${INSIDE2:-}" = "#ffffff" ]; then
-    echo "[hb-border] PASS floated infobox strokes a real border (n=$NB2 edge=$EDGE2 inside=$INSIDE2)"
+# The infobox fixture declares `border:1px solid #a2a9b1` (the real Wikipedia
+# infobox rule colour). The stroke must honour that DECLARED colour, not a
+# hard-coded black; `inside` stays white because the sample lands in the reserved
+# top-rule gutter ABOVE where the table's background-color fill begins.
+if [ "${NB2:-0}" -ge 1 ] && [ "${EDGE2:-}" = "#a2a9b1" ] && [ "${INSIDE2:-}" = "#ffffff" ]; then
+    echo "[hb-border] PASS floated infobox strokes a real border in its declared colour (n=$NB2 edge=$EDGE2 inside=$INSIDE2)"
 else
     echo "[hb-border] FAIL floated infobox border wrong (n=${NB2:-0} edge=$EDGE2 inside=$INSIDE2)"; fail=1
 fi
