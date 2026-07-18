@@ -1,0 +1,1019 @@
+# lib/web/js/builtins/url.ad — self-contained Web-platform APIs for the modular
+# JS engine: `URL` / `URLSearchParams` (WHATWG URL) and `btoa` / `atob` (RFC 4648
+# base64). Real sites reach for these everywhere (routing, query manipulation,
+# data: URIs, token codecs); a missing global is a ReferenceError that aborts the
+# whole inline script.
+#
+# Behavior-preserving split: Adder merges every imported file into one Program,
+# so every public top-level name here resolves globally across the merged engine.
+# The URL component split mirrors the WHATWG splitter that lib/web/dom/canvas.ad
+# (`_url_parse_into`) uses for `location`; this module owns the CONSTRUCTORS.
+
+# Shared prototypes (built once in setup): URL.prototype and URLSearchParams
+# .prototype. Kept as globals so the URL constructor can hand its `searchParams`
+# object the URLSearchParams prototype without going through `new`.
+g_url_proto: int32 = -1
+g_urlsp_proto: int32 = -1
+
+# Byte scratch buffers (bump arenas, reused each call; not re-entrant across a
+# single builder, which is fine — each helper consumes its buffer before the next
+# runs). Generous sizing covers real-world URL lengths.
+url_buf_a: Array[8192, uint8]      # resolved-URL assembly
+url_buf_b: Array[8192, uint8]      # path normalization / secondary
+url_dec_buf: Array[8192, uint8]    # percent-decode target
+url_enc_buf: Array[16384, uint8]   # percent-encode / serialize target
+b64_buf: Array[65536, uint8]       # base64 encode/decode target
+
+
+# ---- small byte predicates --------------------------------------------------
+def _u_is_alpha(c: uint8) -> int32:
+    if (c >= 65 and c <= 90) or (c >= 97 and c <= 122):
+        return 1
+    return 0
+
+
+def _u_is_alnum(c: uint8) -> int32:
+    if _u_is_alpha(c) != 0 or (c >= 48 and c <= 57):
+        return 1
+    return 0
+
+
+def _u_hexval(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return cast[int32](c) - 48
+    if c >= 65 and c <= 70:
+        return cast[int32](c) - 55
+    if c >= 97 and c <= 102:
+        return cast[int32](c) - 87
+    return -1
+
+
+def _u_hexdig(v: int32) -> uint8:
+    if v < 10:
+        return cast[uint8](v + 48)
+    return cast[uint8](v + 55)          # uppercase A-F
+
+
+# ---- string helpers over the value model ------------------------------------
+# Byte pointer + length of a JS value coerced to string.
+def _u_strp(v: int32) -> Ptr[uint8]:
+    return str_ptr(strid_of(to_string_val(v)))
+
+
+def _u_strn(v: int32) -> int32:
+    return str_len(strid_of(to_string_val(v)))
+
+
+def _u_mkstr(p: Ptr[uint8], n: int32) -> int32:
+    return v_string_bytes(p, n)
+
+
+# Set a string property on an object id from a byte slice p[start:end].
+def _u_set_slice(o: int32, name: Ptr[uint8], p: Ptr[uint8], start: int32, end: int32):
+    obj_set(o, str_from_cstr(name), v_string_bytes(&p[start], end - start))
+
+
+def _u_set_cstr(o: int32, name: Ptr[uint8], val: Ptr[uint8]):
+    obj_set(o, str_from_cstr(name), v_string_cstr(val))
+
+
+# ====================================================================
+# Percent-encoding (application/x-www-form-urlencoded serialization).
+# ====================================================================
+# form-urlencoded keeps *,-,.,0-9,A-Z,_,a-z; space -> '+'; else -> %XX (upper).
+def _u_form_unreserved(c: uint8) -> int32:
+    if _u_is_alnum(c) != 0:
+        return 1
+    if c == 42 or c == 45 or c == 46 or c == 95:      # * - . _
+        return 1
+    return 0
+
+
+# Encode src[0:n] into url_enc_buf starting at `m`; returns the new write cursor.
+def _u_form_encode(src: Ptr[uint8], n: int32, m: int32) -> int32:
+    i: int32 = 0
+    while i < n and m < 16380:
+        c: uint8 = src[i]
+        if c == 32:                                    # space -> '+'
+            url_enc_buf[m] = 43
+            m = m + 1
+        elif _u_form_unreserved(c) != 0:
+            url_enc_buf[m] = c
+            m = m + 1
+        else:
+            url_enc_buf[m] = 37                         # '%'
+            url_enc_buf[m + 1] = _u_hexdig((cast[int32](c) >> 4) & 15)
+            url_enc_buf[m + 2] = _u_hexdig(cast[int32](c) & 15)
+            m = m + 3
+        i = i + 1
+    return m
+
+
+# Percent-DECODE src[start:end] into url_dec_buf, turning '+' into space; returns
+# the decoded byte length. Used when parsing a query string into pairs.
+def _u_form_decode(src: Ptr[uint8], start: int32, end: int32) -> int32:
+    m: int32 = 0
+    i: int32 = start
+    while i < end and m < 8188:
+        c: uint8 = src[i]
+        if c == 43:                                    # '+' -> space
+            url_dec_buf[m] = 32
+            m = m + 1
+            i = i + 1
+        elif c == 37 and i + 2 < end:                  # %XX
+            hi: int32 = _u_hexval(src[i + 1])
+            lo: int32 = _u_hexval(src[i + 2])
+            if hi >= 0 and lo >= 0:
+                url_dec_buf[m] = cast[uint8]((hi << 4) | lo)
+                m = m + 1
+                i = i + 3
+            else:
+                url_dec_buf[m] = c
+                m = m + 1
+                i = i + 1
+        else:
+            url_dec_buf[m] = c
+            m = m + 1
+            i = i + 1
+    return m
+
+
+# ====================================================================
+# URLSearchParams storage: two parallel JS arrays under hidden keys "@@k"/"@@v".
+# Hidden ("@@") so Object.keys / JSON.stringify never surface them.
+# ====================================================================
+def _usp_karr(o: int32) -> int32:
+    return objid_of(obj_get_cstr(o, cast[Ptr[uint8]]("@@k")))
+
+
+def _usp_varr(o: int32) -> int32:
+    return objid_of(obj_get_cstr(o, cast[Ptr[uint8]]("@@v")))
+
+
+def _usp_len(o: int32) -> int32:
+    return arr_len[_usp_karr(o)]
+
+
+# Attach fresh empty key/value arrays + the URLSearchParams prototype to object o.
+def _usp_init_storage(o: int32):
+    obj_set(o, str_from_cstr(cast[Ptr[uint8]]("@@k")), v_new_array())
+    obj_set(o, str_from_cstr(cast[Ptr[uint8]]("@@v")), v_new_array())
+    if g_urlsp_proto >= 0:
+        obj_proto[o] = objid_of(g_urlsp_proto)
+
+
+# Append a decoded (key,value) pair held as JS string values.
+def _usp_push(o: int32, kv: int32, vv: int32):
+    arr_push(_usp_karr(o), kv)
+    arr_push(_usp_varr(o), vv)
+
+
+# Parse a "?a=1&b=2" query body (src[start:end], WITHOUT the leading '?') into
+# decoded pairs on object o. Empty segments are skipped; a key with no '=' gets
+# an empty-string value (per spec).
+def _usp_parse_query(o: int32, src: Ptr[uint8], start: int32, end: int32):
+    i: int32 = start
+    while i < end:
+        seg_start: int32 = i
+        while i < end and src[i] != 38:                # scan to '&'
+            i = i + 1
+        seg_end: int32 = i
+        if i < end:
+            i = i + 1                                   # skip '&'
+        if seg_end > seg_start:
+            eq: int32 = seg_start
+            while eq < seg_end and src[eq] != 61:      # find first '='
+                eq = eq + 1
+            klen: int32 = _u_form_decode(src, seg_start, eq)
+            kv: int32 = _u_mkstr(&url_dec_buf[0], klen)
+            vv: int32 = v_string_cstr(cast[Ptr[uint8]](""))
+            if eq < seg_end:
+                vlen: int32 = _u_form_decode(src, eq + 1, seg_end)
+                vv = _u_mkstr(&url_dec_buf[0], vlen)
+            _usp_push(o, kv, vv)
+
+
+# Serialize o's pairs to a form-urlencoded string ("a=1&b=2").
+def _usp_serialize(o: int32) -> int32:
+    ka: int32 = _usp_karr(o)
+    va: int32 = _usp_varr(o)
+    n: int32 = arr_len[ka]
+    m: int32 = 0
+    i: int32 = 0
+    while i < n:
+        if i > 0 and m < 16380:
+            url_enc_buf[m] = 38                         # '&'
+            m = m + 1
+        kp: int32 = arr_get(ka, i)
+        m = _u_form_encode(str_ptr(strid_of(kp)), str_len(strid_of(kp)), m)
+        if m < 16380:
+            url_enc_buf[m] = 61                         # '='
+            m = m + 1
+        vp: int32 = arr_get(va, i)
+        m = _u_form_encode(str_ptr(strid_of(vp)), str_len(strid_of(vp)), m)
+        i = i + 1
+    return _u_mkstr(&url_enc_buf[0], m)
+
+
+# Build a fresh URLSearchParams instance (used by `new` and by URL.searchParams).
+def _usp_make() -> int32:
+    v: int32 = v_new_object()
+    _usp_init_storage(objid_of(v))
+    return v
+
+
+# Initialize instance o from an init value: a query string, or an object whose
+# own (non-hidden) enumerable string keys become name=value pairs.
+def _usp_init_from(o: int32, init: int32):
+    if tag_of(init) == TAG_STR:
+        sid: int32 = strid_of(init)
+        p: Ptr[uint8] = str_ptr(sid)
+        n: int32 = str_len(sid)
+        st: int32 = 0
+        if n > 0 and p[0] == 63:                        # tolerate a leading '?'
+            st = 1
+        _usp_parse_query(o, p, st, n)
+    elif tag_of(init) == TAG_OBJ and is_callable(init) == 0:
+        io: int32 = objid_of(init)
+        # own props are stored newest-first; walk into an array to restore order
+        cnt: int32 = 0
+        pw: int32 = obj_head[io]
+        while pw >= 0:
+            cnt = cnt + 1
+            pw = p_next[pw]
+        idx: int32 = cnt - 1
+        while idx >= 0:
+            pw2: int32 = obj_head[io]
+            j: int32 = 0
+            while j < idx:
+                pw2 = p_next[pw2]
+                j = j + 1
+            if pw2 >= 0 and is_hidden_key(p_key[pw2]) == 0:
+                kv: int32 = v_string_id(p_key[pw2])
+                _usp_push(o, kv, to_string_val(p_val[pw2]))
+            idx = idx - 1
+
+
+# Rebuild storage keeping only pairs the filter accepts, optionally overwriting
+# the value of the FIRST kept pair matching `name` (used by set()). mode:
+#   0 delete(name): drop every pair whose key == name
+#   1 set(name,val): first match keeps `newval`, later matches dropped
+def _usp_filter(o: int32, name: int32, mode: int32, newval: int32):
+    ka: int32 = _usp_karr(o)
+    va: int32 = _usp_varr(o)
+    n: int32 = arr_len[ka]
+    nk: int32 = v_new_array()
+    nv: int32 = v_new_array()
+    nko: int32 = objid_of(nk)
+    nvo: int32 = objid_of(nv)
+    seen: int32 = 0
+    i: int32 = 0
+    nsid: int32 = strid_of(name)
+    while i < n:
+        kh: int32 = arr_get(ka, i)
+        if str_eq(strid_of(kh), nsid) != 0:
+            if mode == 1 and seen == 0:
+                seen = 1
+                arr_push(nko, kh)
+                arr_push(nvo, newval)
+            # else: drop (delete, or a subsequent set match)
+        else:
+            arr_push(nko, kh)
+            arr_push(nvo, arr_get(va, i))
+        i = i + 1
+    obj_set(o, str_from_cstr(cast[Ptr[uint8]]("@@k")), nk)
+    obj_set(o, str_from_cstr(cast[Ptr[uint8]]("@@v")), nv)
+
+
+# ---- URLSearchParams native methods -----------------------------------------
+def _usp_get(o: int32, name: int32) -> int32:
+    ka: int32 = _usp_karr(o)
+    va: int32 = _usp_varr(o)
+    n: int32 = arr_len[ka]
+    nsid: int32 = strid_of(to_string_val(name))
+    i: int32 = 0
+    while i < n:
+        if str_eq(strid_of(arr_get(ka, i)), nsid) != 0:
+            return arr_get(va, i)
+        i = i + 1
+    return v_null()
+
+
+def _usp_getall(o: int32, name: int32) -> int32:
+    ka: int32 = _usp_karr(o)
+    va: int32 = _usp_varr(o)
+    n: int32 = arr_len[ka]
+    nsid: int32 = strid_of(to_string_val(name))
+    outv: int32 = v_new_array()
+    outo: int32 = objid_of(outv)
+    i: int32 = 0
+    while i < n:
+        if str_eq(strid_of(arr_get(ka, i)), nsid) != 0:
+            arr_push(outo, arr_get(va, i))
+        i = i + 1
+    return outv
+
+
+def _usp_has(o: int32, name: int32) -> int32:
+    ka: int32 = _usp_karr(o)
+    n: int32 = arr_len[ka]
+    nsid: int32 = strid_of(to_string_val(name))
+    i: int32 = 0
+    while i < n:
+        if str_eq(strid_of(arr_get(ka, i)), nsid) != 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _usp_snapshot(o: int32, which: int32) -> int32:
+    # which: 0 keys, 1 values, 2 entries
+    ka: int32 = _usp_karr(o)
+    va: int32 = _usp_varr(o)
+    n: int32 = arr_len[ka]
+    av: int32 = v_new_array()
+    ao: int32 = objid_of(av)
+    i: int32 = 0
+    while i < n:
+        if which == 0:
+            arr_push(ao, arr_get(ka, i))
+        elif which == 1:
+            arr_push(ao, arr_get(va, i))
+        else:
+            pv: int32 = v_new_array()
+            po: int32 = objid_of(pv)
+            arr_push(po, arr_get(ka, i))
+            arr_push(po, arr_get(va, i))
+            arr_push(ao, pv)
+        i = i + 1
+    return av
+
+
+# Build a one-shot iterator object over a snapshot array (entries/keys/values):
+# holds the array under "@@arr" and a cursor under "@@i"; its .next() is a native.
+def _usp_iter_make(snap: int32) -> int32:
+    it: int32 = v_new_object()
+    ito: int32 = objid_of(it)
+    obj_set(ito, str_from_cstr(cast[Ptr[uint8]]("@@arr")), snap)
+    obj_set(ito, str_from_cstr(cast[Ptr[uint8]]("@@i")), v_number(0.0))
+    obj_add_native(it, cast[Ptr[uint8]]("next"), NAT_URLSP_ITNEXT)
+    # self-iterable: for-of over the iterator returns itself
+    if g_sym_iterator != 0:
+        obj_set(ito, symbol_key(g_sym_iterator), v_new_native(NAT_URLSP_ITER))
+    return it
+
+
+def _usp_iter_next(itv: int32) -> int32:
+    ito: int32 = objid_of(itv)
+    arrv: int32 = obj_get_cstr(ito, cast[Ptr[uint8]]("@@arr"))
+    iv: int32 = obj_get_cstr(ito, cast[Ptr[uint8]]("@@i"))
+    idx: int32 = cast[int32](to_number(iv))
+    res: int32 = v_new_object()
+    ro: int32 = objid_of(res)
+    ao: int32 = objid_of(arrv)
+    if idx >= arr_len[ao]:
+        obj_set(ro, str_from_cstr(cast[Ptr[uint8]]("value")), v_undef())
+        obj_set(ro, str_from_cstr(cast[Ptr[uint8]]("done")), v_boolv(1))
+    else:
+        obj_set(ro, str_from_cstr(cast[Ptr[uint8]]("value")), arr_get(ao, idx))
+        obj_set(ro, str_from_cstr(cast[Ptr[uint8]]("done")), v_boolv(0))
+        obj_set(ito, str_from_cstr(cast[Ptr[uint8]]("@@i")), v_number(cast[float64](idx + 1)))
+    return res
+
+
+def _usp_foreach(o: int32, cb: int32, this_arg: int32, coll: int32):
+    ka: int32 = _usp_karr(o)
+    va: int32 = _usp_varr(o)
+    n: int32 = arr_len[ka]
+    i: int32 = 0
+    while i < n and ctl == CTL_NONE:
+        nb: int32 = call_top
+        call_args[call_top] = arr_get(va, i)           # callback(value, key, params)
+        call_args[call_top + 1] = arr_get(ka, i)
+        call_args[call_top + 2] = coll
+        call_top = call_top + 3
+        ign: int32 = invoke(cb, this_arg, nb, 3)
+        call_top = nb
+        i = i + 1
+
+
+# Insertion sort by key bytes (stable) — URLSearchParams.sort().
+def _usp_sort(o: int32):
+    ka: int32 = _usp_karr(o)
+    va: int32 = _usp_varr(o)
+    n: int32 = arr_len[ka]
+    i: int32 = 1
+    while i < n:
+        kh: int32 = arr_get(ka, i)
+        vh: int32 = arr_get(va, i)
+        ks: int32 = strid_of(kh)
+        j: int32 = i - 1
+        while j >= 0 and _u_bytes_gt(strid_of(arr_get(ka, j)), ks) != 0:
+            arr_set(ka, j + 1, arr_get(ka, j))
+            arr_set(va, j + 1, arr_get(va, j))
+            j = j - 1
+        arr_set(ka, j + 1, kh)
+        arr_set(va, j + 1, vh)
+        i = i + 1
+
+
+# a > b as a lexicographic byte comparison of two string ids.
+def _u_bytes_gt(a: int32, b: int32) -> int32:
+    pa: Ptr[uint8] = str_ptr(a)
+    pb: Ptr[uint8] = str_ptr(b)
+    na: int32 = str_len(a)
+    nb: int32 = str_len(b)
+    i: int32 = 0
+    while i < na and i < nb:
+        if pa[i] != pb[i]:
+            if pa[i] > pb[i]:
+                return 1
+            return 0
+        i = i + 1
+    if na > nb:
+        return 1
+    return 0
+
+
+# ====================================================================
+# WHATWG URL component split (mirrors canvas.ad's _url_parse_into, extended with
+# username/password + a live searchParams object). Operates on absolute bytes.
+# ====================================================================
+def _url_split(o: int32, p: Ptr[uint8], n: int32):
+    obj_set(o, str_from_cstr(cast[Ptr[uint8]]("href")), v_string_bytes(p, n))
+    # scheme: bytes up to first ':' (before any '/','?','#')
+    ci: int32 = 0
+    while ci < n and p[ci] != 58 and p[ci] != 47 and p[ci] != 63 and p[ci] != 35:
+        ci = ci + 1
+    has_scheme: int32 = 0
+    scheme_end: int32 = 0
+    hier: int32 = 0
+    rest_start: int32 = 0
+    if ci < n and p[ci] == 58:
+        has_scheme = 1
+        scheme_end = ci
+        if ci + 2 < n and p[ci + 1] == 47 and p[ci + 2] == 47:
+            hier = 1
+            rest_start = ci + 3
+        else:
+            rest_start = ci + 1
+    # protocol = scheme + ':'
+    if has_scheme != 0:
+        m: int32 = 0
+        pi: int32 = 0
+        while pi < scheme_end and m < 8190:
+            url_buf_a[m] = p[pi]
+            m = m + 1
+            pi = pi + 1
+        url_buf_a[m] = 58
+        m = m + 1
+        obj_set(o, str_from_cstr(cast[Ptr[uint8]]("protocol")), v_string_bytes(&url_buf_a[0], m))
+    else:
+        _u_set_cstr(o, cast[Ptr[uint8]]("protocol"), cast[Ptr[uint8]](""))
+    host_real: int32 = rest_start
+    host_end: int32 = rest_start
+    if hier != 0:
+        he: int32 = rest_start
+        while he < n and p[he] != 47 and p[he] != 63 and p[he] != 35:
+            he = he + 1
+        host_end = he
+        rest_start = he
+        # userinfo: everything before an '@' -> username[:password]
+        at: int32 = -1
+        ak: int32 = host_real
+        while ak < host_end:
+            if p[ak] == 64:
+                at = ak
+            ak = ak + 1
+        if at >= 0:
+            ucolon: int32 = host_real
+            while ucolon < at and p[ucolon] != 58:
+                ucolon = ucolon + 1
+            _u_set_slice(o, cast[Ptr[uint8]]("username"), p, host_real, ucolon)
+            if ucolon < at:
+                _u_set_slice(o, cast[Ptr[uint8]]("password"), p, ucolon + 1, at)
+            else:
+                _u_set_cstr(o, cast[Ptr[uint8]]("password"), cast[Ptr[uint8]](""))
+            host_real = at + 1
+        else:
+            _u_set_cstr(o, cast[Ptr[uint8]]("username"), cast[Ptr[uint8]](""))
+            _u_set_cstr(o, cast[Ptr[uint8]]("password"), cast[Ptr[uint8]](""))
+        _u_set_slice(o, cast[Ptr[uint8]]("host"), p, host_real, host_end)
+        # hostname / port split on the LAST ':'
+        colon: int32 = -1
+        ck: int32 = host_real
+        while ck < host_end:
+            if p[ck] == 58:
+                colon = ck
+            ck = ck + 1
+        if colon >= 0:
+            _u_set_slice(o, cast[Ptr[uint8]]("hostname"), p, host_real, colon)
+            _u_set_slice(o, cast[Ptr[uint8]]("port"), p, colon + 1, host_end)
+        else:
+            _u_set_slice(o, cast[Ptr[uint8]]("hostname"), p, host_real, host_end)
+            _u_set_cstr(o, cast[Ptr[uint8]]("port"), cast[Ptr[uint8]](""))
+        # origin = protocol + "//" + host
+        om: int32 = 0
+        oi: int32 = 0
+        while oi < scheme_end and om < 8180:
+            url_buf_b[om] = p[oi]
+            om = om + 1
+            oi = oi + 1
+        url_buf_b[om] = 58
+        url_buf_b[om + 1] = 47
+        url_buf_b[om + 2] = 47
+        om = om + 3
+        oi = host_real
+        while oi < host_end and om < 8190:
+            url_buf_b[om] = p[oi]
+            om = om + 1
+            oi = oi + 1
+        obj_set(o, str_from_cstr(cast[Ptr[uint8]]("origin")), v_string_bytes(&url_buf_b[0], om))
+    else:
+        _u_set_cstr(o, cast[Ptr[uint8]]("username"), cast[Ptr[uint8]](""))
+        _u_set_cstr(o, cast[Ptr[uint8]]("password"), cast[Ptr[uint8]](""))
+        _u_set_cstr(o, cast[Ptr[uint8]]("host"), cast[Ptr[uint8]](""))
+        _u_set_cstr(o, cast[Ptr[uint8]]("hostname"), cast[Ptr[uint8]](""))
+        _u_set_cstr(o, cast[Ptr[uint8]]("port"), cast[Ptr[uint8]](""))
+        _u_set_cstr(o, cast[Ptr[uint8]]("origin"), cast[Ptr[uint8]]("null"))
+    # pathname / search / hash
+    hpos: int32 = -1
+    hi: int32 = rest_start
+    while hi < n:
+        if p[hi] == 35:
+            hpos = hi
+            hi = n
+        else:
+            hi = hi + 1
+    qlim: int32 = n
+    if hpos >= 0:
+        qlim = hpos
+    qpos: int32 = -1
+    qi: int32 = rest_start
+    while qi < qlim:
+        if p[qi] == 63:
+            qpos = qi
+            qi = qlim
+        else:
+            qi = qi + 1
+    path_end: int32 = n
+    if qpos >= 0:
+        path_end = qpos
+    elif hpos >= 0:
+        path_end = hpos
+    if hier != 0 and path_end == rest_start:
+        _u_set_cstr(o, cast[Ptr[uint8]]("pathname"), cast[Ptr[uint8]]("/"))
+    else:
+        _u_set_slice(o, cast[Ptr[uint8]]("pathname"), p, rest_start, path_end)
+    qbody_start: int32 = 0
+    qbody_end: int32 = 0
+    if qpos >= 0:
+        se: int32 = n
+        if hpos >= 0:
+            se = hpos
+        _u_set_slice(o, cast[Ptr[uint8]]("search"), p, qpos, se)
+        qbody_start = qpos + 1
+        qbody_end = se
+    else:
+        _u_set_cstr(o, cast[Ptr[uint8]]("search"), cast[Ptr[uint8]](""))
+    if hpos >= 0:
+        _u_set_slice(o, cast[Ptr[uint8]]("hash"), p, hpos, n)
+    else:
+        _u_set_cstr(o, cast[Ptr[uint8]]("hash"), cast[Ptr[uint8]](""))
+    # searchParams: a URLSearchParams populated from the query (one-way — see
+    # module note; mutating it does not rewrite url.search).
+    spv: int32 = _usp_make()
+    if qpos >= 0:
+        _usp_parse_query(objid_of(spv), p, qbody_start, qbody_end)
+    obj_set(o, str_from_cstr(cast[Ptr[uint8]]("searchParams")), spv)
+
+
+# ---- relative-to-base resolution -------------------------------------------
+def _url_has_scheme(p: Ptr[uint8], n: int32) -> int32:
+    if n == 0 or _u_is_alpha(p[0]) == 0:
+        return 0
+    i: int32 = 1
+    while i < n:
+        c: uint8 = p[i]
+        if c == 58:                        # ':'
+            return 1
+        if c == 47 or c == 63 or c == 35:  # '/','?','#' before ':' -> no scheme
+            return 0
+        if _u_is_alnum(c) == 0 and c != 43 and c != 45 and c != 46:
+            return 0
+        i = i + 1
+    return 0
+
+
+# RFC 3986 remove_dot_segments over path bytes src[0:n] -> url_buf_b, len out.
+def _url_remove_dots(src: Ptr[uint8], n: int32) -> int32:
+    out: int32 = 0
+    i: int32 = 0
+    while i < n:
+        # "../" or "./" at input head -> skip
+        if src[i] == 46 and i + 1 < n and src[i + 1] == 46 and i + 2 < n and src[i + 2] == 47:
+            i = i + 3
+        elif src[i] == 46 and i + 1 < n and src[i + 1] == 47:
+            i = i + 2
+        elif src[i] == 47 and i + 1 < n and src[i + 1] == 46 and i + 2 < n and src[i + 2] == 47:
+            i = i + 2                       # "/./" -> "/"
+        elif src[i] == 47 and i + 1 < n and src[i + 1] == 46 and i + 2 == n:
+            url_buf_b[out] = 47             # "/." at end -> "/"
+            out = out + 1
+            i = n
+        elif src[i] == 47 and i + 1 < n and src[i + 1] == 46 and i + 2 < n and src[i + 2] == 46 and (i + 3 == n or src[i + 3] == 47):
+            # "/../" or "/.." at end -> pop last output segment (incl. its '/')
+            while out > 0 and url_buf_b[out - 1] != 47:
+                out = out - 1
+            if out > 0:
+                out = out - 1
+            if i + 3 == n:
+                url_buf_b[out] = 47         # "/.." at end -> trailing "/"
+                out = out + 1
+                i = n
+            else:
+                i = i + 3                   # leave the '/' at input head for next seg
+        elif src[i] == 46 and i + 1 == n:
+            i = n                            # lone "." -> nothing
+        elif src[i] == 46 and i + 1 < n and src[i + 1] == 46 and i + 2 == n:
+            i = n                            # lone ".." -> nothing
+        else:
+            # copy one segment: leading char then up to next '/'
+            url_buf_b[out] = src[i]
+            out = out + 1
+            i = i + 1
+            while i < n and src[i] != 47:
+                url_buf_b[out] = src[i]
+                out = out + 1
+                i = i + 1
+    return out
+
+
+# Build an absolute URL from (url, base) into url_buf_a; returns its length.
+# Handles: absolute url; scheme-relative "//h"; path-absolute "/x"; query "?x";
+# fragment "#h"; and relative "x" (replace base's last path segment + dot-fold).
+def _url_resolve(up: Ptr[uint8], un: int32, bp: Ptr[uint8], bn: int32) -> int32:
+    if _url_has_scheme(up, un) != 0 or bn == 0:
+        m: int32 = 0
+        while m < un and m < 8190:
+            url_buf_a[m] = up[m]
+            m = m + 1
+        return m
+    # locate base authority end / path / query / hash
+    bsc: int32 = 0
+    while bsc < bn and bp[bsc] != 58:
+        bsc = bsc + 1
+    auth: int32 = bsc + 1
+    if bsc + 2 < bn and bp[bsc + 1] == 47 and bp[bsc + 2] == 47:
+        auth = bsc + 3
+        while auth < bn and bp[auth] != 47 and bp[auth] != 63 and bp[auth] != 35:
+            auth = auth + 1
+    origin_end: int32 = auth                # base[0:origin_end] = scheme://authority
+    bpath_end: int32 = bn
+    bq: int32 = origin_end
+    while bq < bn and bp[bq] != 63 and bp[bq] != 35:
+        bq = bq + 1
+    bpath_end = bq                          # base path = base[origin_end:bpath_end]
+    bhash: int32 = bpath_end
+    while bhash < bn and bp[bhash] != 35:
+        bhash = bhash + 1                   # base[bpath_end:bhash] = base query
+    m2: int32 = 0
+    # scheme-relative "//host..."
+    if un >= 2 and up[0] == 47 and up[1] == 47:
+        i: int32 = 0
+        while i <= bsc and i < 8190:        # scheme + ':'
+            url_buf_a[m2] = bp[i]
+            m2 = m2 + 1
+            i = i + 1
+        i = 0
+        while i < un and m2 < 8190:
+            url_buf_a[m2] = up[i]
+            m2 = m2 + 1
+            i = i + 1
+        return m2
+    # fragment-only "#h": base minus its fragment + url
+    if un >= 1 and up[0] == 35:
+        i2: int32 = 0
+        while i2 < bpath_end and m2 < 8190:
+            url_buf_a[m2] = bp[i2]
+            m2 = m2 + 1
+            i2 = i2 + 1
+        # include base query (between bpath_end and bhash)
+        i2 = bpath_end
+        while i2 < bhash and m2 < 8190:
+            url_buf_a[m2] = bp[i2]
+            m2 = m2 + 1
+            i2 = i2 + 1
+        i2 = 0
+        while i2 < un and m2 < 8190:
+            url_buf_a[m2] = up[i2]
+            m2 = m2 + 1
+            i2 = i2 + 1
+        return m2
+    # query-only "?x": base path (no query/hash) + url
+    if un >= 1 and up[0] == 63:
+        i3: int32 = 0
+        while i3 < bpath_end and m2 < 8190:
+            url_buf_a[m2] = bp[i3]
+            m2 = m2 + 1
+            i3 = i3 + 1
+        i3 = 0
+        while i3 < un and m2 < 8190:
+            url_buf_a[m2] = up[i3]
+            m2 = m2 + 1
+            i3 = i3 + 1
+        return m2
+    # origin prefix (scheme://authority) for the path cases
+    op: int32 = 0
+    while op < origin_end and m2 < 8190:
+        url_buf_a[m2] = bp[op]
+        m2 = m2 + 1
+        op = op + 1
+    # assemble the merged path into url_dec_buf, then dot-fold it
+    pm: int32 = 0
+    if un >= 1 and up[0] == 47:
+        # path-absolute: url path replaces base path entirely
+        i4: int32 = 0
+        while i4 < un and pm < 8188:
+            url_dec_buf[pm] = up[i4]
+            pm = pm + 1
+            i4 = i4 + 1
+    else:
+        # relative: base path up to and including its last '/', then url
+        lastslash: int32 = origin_end - 1
+        k: int32 = origin_end
+        while k < bpath_end:
+            if bp[k] == 47:
+                lastslash = k
+            k = k + 1
+        j: int32 = origin_end
+        if lastslash < origin_end:
+            url_dec_buf[pm] = 47            # base had no path slash -> root
+            pm = pm + 1
+        else:
+            while j <= lastslash and pm < 8188:
+                url_dec_buf[pm] = bp[j]
+                pm = pm + 1
+                j = j + 1
+        i5: int32 = 0
+        while i5 < un and pm < 8188:
+            url_dec_buf[pm] = up[i5]
+            pm = pm + 1
+            i5 = i5 + 1
+    # split merged path into path / query+hash (dot-fold only the path part)
+    qh: int32 = 0
+    while qh < pm and url_dec_buf[qh] != 63 and url_dec_buf[qh] != 35:
+        qh = qh + 1
+    npath: int32 = _url_remove_dots(&url_dec_buf[0], qh)   # -> url_buf_b
+    pp: int32 = 0
+    while pp < npath and m2 < 8190:
+        url_buf_a[m2] = url_buf_b[pp]
+        m2 = m2 + 1
+        pp = pp + 1
+    tp: int32 = qh
+    while tp < pm and m2 < 8190:            # append the query + hash tail verbatim
+        url_buf_a[m2] = url_dec_buf[tp]
+        m2 = m2 + 1
+        tp = tp + 1
+    return m2
+
+
+# new URL(url [,base]) — parse into components on `thisv`.
+def _url_construct(thisv: int32, base: int32, argc: int32) -> int32:
+    o: int32 = objid_of(thisv)
+    if tag_of(thisv) != TAG_OBJ:
+        thisv = v_new_object()
+        o = objid_of(thisv)
+        if g_url_proto >= 0:
+            obj_proto[o] = objid_of(g_url_proto)
+    up: Ptr[uint8] = _u_strp(arg_or(base, argc, 0))
+    un: int32 = _u_strn(arg_or(base, argc, 0))
+    basearg: int32 = arg_or(base, argc, 1)
+    bn: int32 = 0
+    if argc >= 2 and tag_of(basearg) != TAG_UNDEF and tag_of(basearg) != TAG_NULL:
+        bn = _u_strn(basearg)
+    if bn > 0:
+        bp: Ptr[uint8] = _u_strp(basearg)
+        rn: int32 = _url_resolve(up, un, bp, bn)
+        # copy the resolved bytes out of url_buf_a before _url_split reuses it
+        i: int32 = 0
+        while i < rn and i < 8190:
+            url_buf_b[i] = url_buf_a[i]
+            i = i + 1
+        _url_split(o, &url_buf_b[0], rn)
+    else:
+        if _url_has_scheme(up, un) == 0:
+            throw_error(cast[Ptr[uint8]]("TypeError"), cast[Ptr[uint8]]("Invalid URL"))
+            return v_undef()
+        _url_split(o, up, un)
+    return v_undef()
+
+
+# ====================================================================
+# btoa / atob — RFC 4648 base64.
+# ====================================================================
+def _b64_enc_char(v: int32) -> uint8:
+    if v < 26:
+        return cast[uint8](v + 65)          # A-Z
+    if v < 52:
+        return cast[uint8](v - 26 + 97)     # a-z
+    if v < 62:
+        return cast[uint8](v - 52 + 48)     # 0-9
+    if v == 62:
+        return 43                           # '+'
+    return 47                               # '/'
+
+
+def _b64_dec_char(c: uint8) -> int32:
+    if c >= 65 and c <= 90:
+        return cast[int32](c) - 65
+    if c >= 97 and c <= 122:
+        return cast[int32](c) - 97 + 26
+    if c >= 48 and c <= 57:
+        return cast[int32](c) - 48 + 52
+    if c == 43:
+        return 62
+    if c == 47:
+        return 63
+    return -1
+
+
+# btoa(str): base64 of the string's bytes (latin1 code units). This engine stores
+# strings as bytes, so a byte is always <= 0xFF; the spec's >0xFF InvalidCharacter
+# throw cannot trigger for byte-strings (documented in the conformance note).
+def _btoa(v: int32) -> int32:
+    sid: int32 = strid_of(to_string_val(v))
+    p: Ptr[uint8] = str_ptr(sid)
+    n: int32 = str_len(sid)
+    m: int32 = 0
+    i: int32 = 0
+    while i + 2 < n and m < 65530:
+        b0: int32 = cast[int32](p[i])
+        b1: int32 = cast[int32](p[i + 1])
+        b2: int32 = cast[int32](p[i + 2])
+        b64_buf[m] = _b64_enc_char(b0 >> 2)
+        b64_buf[m + 1] = _b64_enc_char(((b0 & 3) << 4) | (b1 >> 4))
+        b64_buf[m + 2] = _b64_enc_char(((b1 & 15) << 2) | (b2 >> 6))
+        b64_buf[m + 3] = _b64_enc_char(b2 & 63)
+        m = m + 4
+        i = i + 3
+    rem: int32 = n - i
+    if rem == 1:
+        b0b: int32 = cast[int32](p[i])
+        b64_buf[m] = _b64_enc_char(b0b >> 2)
+        b64_buf[m + 1] = _b64_enc_char((b0b & 3) << 4)
+        b64_buf[m + 2] = 61                 # '='
+        b64_buf[m + 3] = 61
+        m = m + 4
+    elif rem == 2:
+        b0c: int32 = cast[int32](p[i])
+        b1c: int32 = cast[int32](p[i + 1])
+        b64_buf[m] = _b64_enc_char(b0c >> 2)
+        b64_buf[m + 1] = _b64_enc_char(((b0c & 3) << 4) | (b1c >> 4))
+        b64_buf[m + 2] = _b64_enc_char((b1c & 15) << 2)
+        b64_buf[m + 3] = 61
+        m = m + 4
+    return _u_mkstr(&b64_buf[0], m)
+
+
+# atob(b64): decode, tolerating ASCII whitespace; invalid chars throw.
+def _atob(v: int32) -> int32:
+    sid: int32 = strid_of(to_string_val(v))
+    p: Ptr[uint8] = str_ptr(sid)
+    n: int32 = str_len(sid)
+    # gather the non-whitespace, non-padding sextets into b64_buf as raw 6-bit vals
+    acc: int32 = 0
+    bits: int32 = 0
+    m: int32 = 0
+    i: int32 = 0
+    while i < n:
+        c: uint8 = p[i]
+        if c == 32 or c == 9 or c == 10 or c == 12 or c == 13:
+            i = i + 1                        # skip ASCII whitespace
+        elif c == 61:
+            i = n                            # '=' padding: stop
+        else:
+            dv: int32 = _b64_dec_char(c)
+            if dv < 0:
+                throw_error(cast[Ptr[uint8]]("InvalidCharacterError"), \
+                            cast[Ptr[uint8]]("atob: invalid base64 character"))
+                return v_undef()
+            acc = (acc << 6) | dv
+            bits = bits + 6
+            if bits >= 8:
+                bits = bits - 8
+                if m < 65530:
+                    b64_buf[m] = cast[uint8]((acc >> bits) & 255)
+                    m = m + 1
+            i = i + 1
+    return _u_mkstr(&b64_buf[0], m)
+
+
+# ====================================================================
+# Native dispatch (overflow arm delegated from call_native_r7).
+# ====================================================================
+def call_native_url(id: int32, thisv: int32, base: int32, argc: int32) -> int32:
+    if id == NAT_URL:
+        return _url_construct(thisv, base, argc)
+    if id == NAT_URL_TOSTRING:
+        return obj_get_cstr(objid_of(thisv), cast[Ptr[uint8]]("href"))
+    if id == NAT_URL_TOJSON:
+        return obj_get_cstr(objid_of(thisv), cast[Ptr[uint8]]("href"))
+    if id == NAT_URLSP:
+        o: int32 = objid_of(thisv)
+        if tag_of(thisv) != TAG_OBJ:
+            thisv = v_new_object()
+            o = objid_of(thisv)
+            if g_urlsp_proto >= 0:
+                obj_proto[o] = objid_of(g_urlsp_proto)
+        _usp_init_storage(o)
+        initv: int32 = arg_or(base, argc, 0)
+        if argc >= 1 and tag_of(initv) != TAG_UNDEF and tag_of(initv) != TAG_NULL:
+            _usp_init_from(o, initv)
+        return v_undef()
+    if id == NAT_URLSP_GET:
+        return _usp_get(objid_of(thisv), arg_or(base, argc, 0))
+    if id == NAT_URLSP_GETALL:
+        return _usp_getall(objid_of(thisv), arg_or(base, argc, 0))
+    if id == NAT_URLSP_HAS:
+        return v_boolv(_usp_has(objid_of(thisv), arg_or(base, argc, 0)))
+    if id == NAT_URLSP_APPEND:
+        _usp_push(objid_of(thisv), to_string_val(arg_or(base, argc, 0)), \
+                  to_string_val(arg_or(base, argc, 1)))
+        return v_undef()
+    if id == NAT_URLSP_SET:
+        so: int32 = objid_of(thisv)
+        nm: int32 = to_string_val(arg_or(base, argc, 0))
+        vv: int32 = to_string_val(arg_or(base, argc, 1))
+        if _usp_has(so, nm) != 0:
+            _usp_filter(so, nm, 1, vv)         # overwrite first, drop the rest
+        else:
+            _usp_push(so, nm, vv)              # absent -> append
+        return v_undef()
+    if id == NAT_URLSP_DELETE:
+        _usp_filter(objid_of(thisv), to_string_val(arg_or(base, argc, 0)), 0, v_undef())
+        return v_undef()
+    if id == NAT_URLSP_TOSTRING:
+        return _usp_serialize(objid_of(thisv))
+    if id == NAT_URLSP_FOREACH:
+        cbv: int32 = arg_or(base, argc, 0)
+        if is_callable(cbv) != 0:
+            _usp_foreach(objid_of(thisv), cbv, arg_or(base, argc, 1), thisv)
+        return v_undef()
+    if id == NAT_URLSP_ENTRIES:
+        return _usp_snapshot(objid_of(thisv), 2)
+    if id == NAT_URLSP_KEYS:
+        return _usp_snapshot(objid_of(thisv), 0)
+    if id == NAT_URLSP_VALUES:
+        return _usp_snapshot(objid_of(thisv), 1)
+    if id == NAT_URLSP_SORT:
+        _usp_sort(objid_of(thisv))
+        return v_undef()
+    if id == NAT_URLSP_ITER:
+        return _usp_iter_make(_usp_snapshot(objid_of(thisv), 2))
+    if id == NAT_URLSP_ITNEXT:
+        return _usp_iter_next(thisv)
+    if id == NAT_BTOA:
+        return _btoa(arg_or(base, argc, 0))
+    if id == NAT_ATOB:
+        return _atob(arg_or(base, argc, 0))
+    return v_undef()
+
+
+# Build URL / URLSearchParams constructors + prototypes and bind the globals.
+# Called from setup after the core globals exist.
+def install_url_apis():
+    # URLSearchParams
+    g_usp: int32 = v_new_native(NAT_URLSP)
+    usp_proto: int32 = v_new_object()
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("get"), NAT_URLSP_GET)
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("getAll"), NAT_URLSP_GETALL)
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("has"), NAT_URLSP_HAS)
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("set"), NAT_URLSP_SET)
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("append"), NAT_URLSP_APPEND)
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("delete"), NAT_URLSP_DELETE)
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("toString"), NAT_URLSP_TOSTRING)
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("forEach"), NAT_URLSP_FOREACH)
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("entries"), NAT_URLSP_ENTRIES)
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("keys"), NAT_URLSP_KEYS)
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("values"), NAT_URLSP_VALUES)
+    obj_add_native(usp_proto, cast[Ptr[uint8]]("sort"), NAT_URLSP_SORT)
+    # default [Symbol.iterator] === entries(), so `for (const [k,v] of params)` works
+    if g_sym_iterator != 0:
+        obj_set(objid_of(usp_proto), symbol_key(g_sym_iterator), v_new_native(NAT_URLSP_ITER))
+    obj_set(objid_of(g_usp), str_from_cstr(cast[Ptr[uint8]]("prototype")), usp_proto)
+    obj_set(objid_of(usp_proto), str_from_cstr(cast[Ptr[uint8]]("constructor")), g_usp)
+    g_urlsp_proto = usp_proto
+    env_define(g_env, str_from_cstr(cast[Ptr[uint8]]("URLSearchParams")), g_usp, 0)
+    # URL
+    g_url: int32 = v_new_native(NAT_URL)
+    url_proto: int32 = v_new_object()
+    obj_add_native(url_proto, cast[Ptr[uint8]]("toString"), NAT_URL_TOSTRING)
+    obj_add_native(url_proto, cast[Ptr[uint8]]("toJSON"), NAT_URL_TOJSON)
+    obj_set(objid_of(g_url), str_from_cstr(cast[Ptr[uint8]]("prototype")), url_proto)
+    obj_set(objid_of(url_proto), str_from_cstr(cast[Ptr[uint8]]("constructor")), g_url)
+    g_url_proto = url_proto
+    env_define(g_env, str_from_cstr(cast[Ptr[uint8]]("URL")), g_url, 0)
+    # base64 globals
+    def_global_native(cast[Ptr[uint8]]("btoa"), NAT_BTOA)
+    def_global_native(cast[Ptr[uint8]]("atob"), NAT_ATOB)
