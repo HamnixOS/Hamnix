@@ -80,8 +80,8 @@ you are simply writing hamsh expressions in the one grammar.
 
 ## 3. Values & variables
 
-Variables hold **typed hamsh values**: string, int, bool, list, dict, and
-**handles** (see §14). Values are **dynamically typed** and evaluated by
+Variables hold **typed hamsh values**: string, int, bool, list, dict, **set**
+(§8d), and **handles** (see §14). Values are **dynamically typed** and evaluated by
 hamsh's own small tree-walking evaluator — no compile step, no shared
 implementation with Adder. Not "everything is a string."
 
@@ -177,11 +177,12 @@ indentation. Interactively, a header ending in `:` switches the read loop into
 indentation mode: it keeps reading (continuation prompt) until a blank line,
 mirroring the Python REPL.
 
-`{ }` serves both blocks and dict literals; the two never collide because they
-occur in different positions — a `{` opening a statement body (after a control
-header, `def`, or `ns`/`enter`/`spawn`) is a block; a `{` in expression
-position is a dict literal. The parser disambiguates by position, exactly as
-every C-family language with map literals does.
+`{ }` serves both blocks and dict/set literals; the two never collide because
+they occur in different positions — a `{` opening a statement body (after a
+control header, `def`, or `ns`/`enter`/`spawn`) is a block; a `{` in expression
+position is a dict or **set** literal (a first element followed by `:` is a
+dict, otherwise a set — see §8d). The parser disambiguates by position, exactly
+as every C-family language with map literals does.
 
 **Parse errors carry a line number** — `hamsh: parse error [line N]: …` — so a
 syntax error in a sourced multi-line script points at the offending line.
@@ -333,6 +334,50 @@ glued `x*x` is a glob/`+arg` word; and `lambda P: BODY` needs a space after
 the colon. Comparison (`x > 1`) and subscript (`p[1]`) glue fine — a glued
 subscript READ (`p[1]`, `row[0][1]`) is split into an index in expression
 position.
+
+### 8d. Sets
+
+A **set** is an unordered collection of unique values, following Python's set
+semantics. Membership and uniqueness compare by value (the same string-form
+equality dict keys use).
+
+- **Construction:** `set(iterable)` deduplicates any iterable
+  (`set([1, 2, 2, 3])` → 3 elements); the `{a, b, c}` **set literal** holds one
+  or more comma-separated elements. A brace group is a set when its first
+  element is **not** followed by a `:` — a `key: value` first element keeps it a
+  dict. Following Python, **empty `{}` is a dict**, and an empty set is written
+  `set()` (and renders as `set()`).
+- **Set comprehension:** `{EXPR for x in ITER [if COND]}` — like a list
+  comprehension, but deduped into a set (`{n * n for n in [1, 2, 3, 2]}` →
+  `{1, 4, 9}`).
+- **Membership:** `x in s` / `x not in s`.
+- **Algebra** (both operands sets): `a | b` union, `a & b` intersection,
+  `a - b` difference. Method forms — `union(a, b)`, `intersection(a, b)`,
+  `difference(a, b)` — accept **any iterable** as the second argument.
+- **Mutation:** `s.add(x)` (no-op if present), `s.discard(x)` and `s.remove(x)`
+  (both tolerant of an absent element — no raise).
+- **Introspection:** `len(s)`, `issubset(a, b)` / `issuperset(a, b)`.
+- **Iteration:** `for x in s { … }` (in insertion order). A `{…}` set literal is
+  a valid loop iterable — `for x in {10, 20, 30} { … }` — because the literal
+  consumes through its own `}`, leaving the body's `{` unambiguous. (A bare set
+  *variable* follows the shell word-list rule like any other iterable; use the
+  expression form `set(v)` or a `{…}` literal to iterate its elements.)
+
+```
+s = set([1, 2, 2, 3])
+echo ${ len(s) }                       # 3
+echo ${ 2 in s }                       # true
+echo ${ {1, 2} | {2, 3} }              # {1, 2, 3}
+echo ${ {1, 2, 3} & {2, 3, 4} }        # {2, 3}
+echo ${ {1, 2, 3} - {2} }              # {1, 3}
+s.add(5)
+echo ${ join(sorted(s), ",") }         # 1,2,3,5
+```
+
+Internally a set reuses the list element layout (single slot per element in the
+shared value pool), so iteration/subscript/`len` share the list machinery; the
+only added invariant is dedup-on-insert. `frozenset` and symmetric difference
+(`^`) are not yet implemented.
 
 ---
 
