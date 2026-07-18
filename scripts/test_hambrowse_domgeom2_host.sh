@@ -91,7 +91,7 @@ assert_grep '^JSLOG mar 0px$'                "getComputedStyle().margin default 
 assert_grep '^JSLOG fs 16px$'                "getComputedStyle().fontSize default resolves to 16px"
 assert_grep '^JSLOG bg rgba\(0, 0, 0, 0\)$'  "getComputedStyle().backgroundColor default is transparent"
 # An inline style the script set wins over the UA default.
-assert_grep '^JSLOG bg2 red$'                "inline style.backgroundColor wins in getComputedStyle()"
+assert_grep '^JSLOG bg2 rgb\(255, 0, 0\)$'   "inline style.backgroundColor resolves to rgb() in getComputedStyle() (CSSOM resolved value)"
 assert_grep '^JSLOG fs2 22px$'               "inline style.fontSize wins in getComputedStyle()"
 
 # No uncaught JS error anywhere in the script.

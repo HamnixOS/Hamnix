@@ -164,7 +164,11 @@ the passing host gates found the following.
 - dom-core / CSSOM-view: **layout geometry** — `getBoundingClientRect()` (DOMRect: x/y/width/height/
   top/left/right/bottom), `getClientRects()` (single-fragment DOMRectList), `offsetWidth/Height/Left/Top`,
   `clientWidth/Height` (+`scrollWidth/Height`), `offsetParent`, and `getComputedStyle(el)`
-  (`display`/`width`/`height`/`color` + `padding`/`margin`/`font-size`/`background-color`). An element's
+  returning **RESOLVED / used values** (CSSOM): colours as `rgb()`/`rgba()` (named + `#hex` + `rgb()`),
+  lengths as used `px` (`width:50%` of a 400px parent → `200px`; `margin`/`padding`/`font-size` px), and
+  computed `display`/`position`/`font-weight`(400/700)/`visibility`/`opacity`/`z-index`/`font-family`, plus
+  a `getPropertyValue(prop)` method (+ kebab-case index access) returning `''` for an unset/unknown property.
+  An element's
   box is READ back from the laid-out SEG display list (`layout/box.ad` `seg_x`/`seg_line`/`seg_len`): the
   bounding rect of the segments whose text reconstructs the element's text content, converted to pixels
   (`seg_line*LINE_H`, `seg_len*CELL_W`). Geometry is exposed entirely from `dom/query.ad` (`_el_bbox`/
@@ -181,9 +185,17 @@ the passing host gates found the following.
   image-only) reports an empty rect (and `getClientRects()` an empty list); a run merged across inline
   siblings over-approximates width; scroll is a static offset a script sets (no live scroll source /
   interactive scroll-following); `getClientRects()` always collapses to one fragment (no multi-line inline
-  box split); `getComputedStyle` resolves eight common properties (tag/UA defaults + inline-style override:
-  padding/margin `0px`, `font-size` initial `16px`, transparent `background-color`) not the full cascade;
-  `offsetParent` approximates as the parent element (nearest-positioned-ancestor rule not modelled).
+  box split); `getComputedStyle` resolves the common properties from the laid-out box (used width/height/text
+  colour) + the script-set inline declaration (a framework's read-back) with UA defaults, resolving colours to
+  `rgb()`/`rgba()` and lengths to used `px` (percentages against the containing block's used width). **Computed
+  vs used (honest):** `width`/`height`/`color` (text) are USED values from layout; `margin`/`padding`/`font-
+  size` are the resolved inline value (or the `0px`/`16px` UA default) — NOT read back from per-element box
+  spacing (unmodelled); `position`/`visibility`/`opacity`/`z-index`/`text-align`/`font-family` are COMPUTED
+  keywords (inline or UA default) that layout does not fully consume back (e.g. `text-align` is baked into
+  `seg_x`, not re-read); percentage width resolves against script-set inline ancestor widths, and a source
+  `style=""` attribute is NOT mirrored into `.style` (only script-set inline props are read). Not the full
+  cascade / UA-sheet inheritance. `offsetParent` approximates as the parent element (nearest-positioned-
+  ancestor rule not modelled). Gate `getcomputedstyle` proves the resolved-value forms end-to-end.
 - dom-core: **document roots** — `document.body` / `document.documentElement` / `document.head` resolve
   to the `<body>`/`<html>`/`<head>` element nodes (`dom/canvas.ad` `_doc_set_el` in `_js_build_document`);
   each is the SAME object `querySelector` returns and carries a live `className`/`style`/`classList`, so
@@ -207,9 +219,14 @@ the passing host gates found the following.
    in `dom/query.ad`; gate `domcore`); **viewport-relative rects** (scroll compensation via `_page_scroll_x/y`),
    `getClientRects()` (single-fragment DOMRectList), and an **expanded `getComputedStyle`**
    (padding/margin/font-size/background-color) now DONE (gate `domgeom2`, `dom/query.ad` +
-   `NID_GETCLIENTRECTS` in `dom/bindings.ad`/`dom/canvas.ad`). Still OPEN: INTERACTIVE scroll-following
-   (no live scroll/viewport source), multi-fragment `getClientRects()` (inline box split across lines), and
-   a full-cascade `getComputedStyle` (resolved values beyond the eight props / UA-sheet inheritance).
+   `NID_GETCLIENTRECTS` in `dom/bindings.ad`/`dom/canvas.ad`). **RESOLVED-VALUE `getComputedStyle`** now DONE
+   (gate `getcomputedstyle`): colours → `rgb()`/`rgba()` (via `css_color_rgb` in `css/cascade.ad`), lengths →
+   used `px` (percentages resolved against the containing block in `_cs_used_width`), computed `position`/
+   `font-weight`/`visibility`/`opacity`/`z-index`/`font-family`, and a `getPropertyValue(prop)` method (kebab
+   access, `''` for unset) — all in `dom/query.ad` `_new_computed_style`. Still OPEN: INTERACTIVE scroll-
+   following (no live scroll/viewport source), multi-fragment `getClientRects()` (inline box split across
+   lines), source-`style=""`-attribute → `.style` mirroring, and full-cascade/UA-sheet-inherited resolution
+   (per-element box spacing read-back, stylesheet-selector-matched widths for percentage bases).
 2. `document.body`/`documentElement`/`head` — **DONE (gate `domcore`).** Each resolves to the
    `<body>`/`<html>`/`<head>` element node — the SAME registered object `getElementById`/`querySelector`
    returns, with live `className`/`style`/`classList` — via `_doc_set_el` in `dom/canvas.ad`
