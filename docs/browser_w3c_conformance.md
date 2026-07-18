@@ -116,6 +116,31 @@ the passing host gates found the following.
   machinery lives ENTIRELY in `lib/web/dom/{canvas,bindings}.ad` — any string event type is
   interned into the `GEN_KIND` listener table (`bindings.ad:113`) and bubbles the source tree like
   the 4 legacy kinds; there is NO 4-kind cap (the old worklist claim below is dead).
+- dom-selectors: **FULL common CSS selector grammar in `querySelector`/`querySelectorAll` (+ `matches`/
+  `closest`)** (2026-07-18, gate `qsa`) — the DOM-side query matcher (`lib/web/dom/{domtree,query,
+  bindings,canvas}.ad`, INDEPENDENT of the `cascade.ad` cascade matcher) now supports the grammar
+  frameworks depend on, over BOTH the source tree and the created-node overlay:
+  - **combinators** descendant (space), child `>`, adjacent `+`, general `~` (right-to-left
+    evaluation from the candidate; `_match_chain`/`_cre_match_chain`);
+  - **attribute operators** `[a]`, `[a=v]`, `[a^=v]` prefix, `[a$=v]` suffix, `[a*=v]` substring,
+    `[a~=v]` whitespace-word, `[a|=v]` dash-match — one shared `_attr_op_match` (case-insensitive,
+    matching the prior `=` behaviour) called from both `_sel_match_at` (source) and `_cre_sel_match`
+    (created);
+  - **structural pseudo-classes** `:first-child`/`:last-child`/`:only-child`, `:first/last/only-of-type`,
+    `:nth-child`/`:nth-last-child`/`:nth-of-type`/`:nth-last-of-type` with `An+B` math (incl.
+    `odd`/`even`), `:not(simple)`, `:empty` (these already existed for both trees);
+  - **compound** selectors (`a.btn[data-x="1"]`) and **SELECTOR LISTS** `a, b, c` — a new top-level
+    comma splitter (`_sel_split`, nesting-aware for `[...]`/`(...)`) makes the scan test every
+    sub-selector per candidate, so `querySelector` returns the first match in DOCUMENT order across
+    the whole list and `querySelectorAll` returns the de-duplicated union in document order.
+  `matches()`/`closest()` were upgraded from the old rightmost-compound approximation to the full
+  combinator/pseudo chain + selector-list union (`_el_matches_sel`/`_tx_matches_sel`). Gate `qsa`
+  (32 asserts: each combinator, all seven attribute operators, `2n`/`odd`/`3n+1` nth math, `:not`,
+  first/last-child, compound, list union/order/uniqueness, matches/closest). Remaining gaps:
+  `:not()` argument is a single simple selector (not a full compound list); `:disabled`/`:checked`/
+  `:hover`/`:nth-*(of S)` and case-sensitivity flags (`[a=v i]`) are not yet honoured; `matches()`
+  on a purely created (never-in-source) node still returns false (the dispatch resolves only source
+  elements).
 - dom-events: **document lifecycle** — `document.addEventListener('DOMContentLoaded'|'load', fn)`
   now REGISTERS (document records under the `DOC_EL` sentinel, `bindings.ad:113`) and FIRES once,
   in spec order, after every page `<script>` runs (`canvas.ad` `_fire_document`, called at the tail
