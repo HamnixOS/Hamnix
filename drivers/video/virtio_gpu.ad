@@ -120,6 +120,15 @@ GPU_3D_RT_RES_ID:    uint32 = 2
 PIPE_TEXTURE_2D:              uint32 = 2
 VIRGL_FORMAT_B8G8R8A8_UNORM: uint32 = 1
 VIRGL_BIND_RENDER_TARGET:    uint32 = 0x2
+# A gallium PIPE_BUFFER (target 0) bound as a VERTEX BUFFER for the DRAW/blend
+# pipeline. bind = VIRGL_BIND_VERTEX_BUFFER (1<<0). Format is largely ignored
+# for a raw vertex buffer; R8_UNORM (64) is a safe byte-addressed choice.
+PIPE_BUFFER:                  uint32 = 0
+VIRGL_FORMAT_R8_UNORM:        uint32 = 64
+# virgl_hw.h VIRGL_BIND_* are NOT the gallium PIPE_BIND_* values: VERTEX_BUFFER
+# is (1<<4), not (1<<0). (1<<0 is DEPTH_STENCIL, which virglrenderer rejects for
+# a buffer with "Illegal buffer binding flags 0x1".)
+VIRGL_BIND_VERTEX_BUFFER:     uint32 = 0x10
 
 # 2D pixel format. B8G8R8A8_UNORM = 1 in the virtio-gpu formats enum.
 # QEMU treats this as little-endian BGRA bytes; we write our backing
@@ -175,6 +184,9 @@ class VirtioGpu:
     srt_w:         uint32              # scratch RT texture width
     srt_h:         uint32              # scratch RT texture height
     srt_ord:       int32               # buddy order of the scratch RT backing
+    vbuf_res_id:   uint32              # DRAW pipeline VERTEX BUFFER resource (0=none)
+    vbuf_backing:  uint64              # guest-physical backing of the vertex buffer
+    vbuf_ord:      int32               # buddy order of the vertex buffer backing
 
 
 gpu_state: VirtioGpu
@@ -1066,6 +1078,83 @@ def virtio_gpu_3d_frame_rt_readback(w: uint32, h: uint32) -> int32:
     if gpu_state.frt_res_id == 0:
         return -1
     return _gpu_transfer_from_host_3d(gpu_state.frt_res_id, 0, 0, w, h, w * 4)
+
+
+# --- DRAW/blend pipeline: vertex buffer resource (GPU track #182 round 8) --
+#
+# The translucent-fill blend pipeline (lib/vk/vk_venus.ad) draws a quad with
+# GL_BLEND src-over. It needs a small VERTEX BUFFER holding the 4 clip-space
+# corners of a fullscreen quad (uploaded ONCE); each translucent fill then only
+# re-aims the VIEWPORT + sets the fragment color constant. This resource is a
+# gallium PIPE_BUFFER bound VERTEX_BUFFER, distinct id 5.
+GPU_3D_VBUF_RES_ID:  uint32 = 5
+
+
+def virtio_gpu_3d_create_vbuf(nbytes: uint32) -> uint32:
+    # Create-or-fetch the DRAW pipeline vertex buffer (a PIPE_BUFFER of nbytes),
+    # attach a guest backing, and bind it to the live 3D context. Returns the
+    # resource id (non-zero) or 0 if 3D is not live / any step failed.
+    if gpu_state.present == 0 or gpu_state.ctx_ready == 0:
+        return 0
+    if gpu_state.vbuf_res_id != 0:
+        return gpu_state.vbuf_res_id
+    order: int32 = _order_for_bytes(cast[uint64](nbytes))
+    page: uint64 = alloc_pages(order)
+    if page == 0:
+        printk0("virtio-gpu: 3D vertex buffer alloc failed\n")
+        return 0
+    memset(cast[Ptr[uint8]](page), 0, _page_size_times(order))
+    phys: uint64 = virt_to_phys(page)
+    # RESOURCE_CREATE_3D for a PIPE_BUFFER: target=0, format=R8_UNORM,
+    # bind=VERTEX_BUFFER, width=nbytes, height=1.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_RESOURCE_CREATE_3D)
+    cast[Ptr[uint32]](a + 24)[0] = GPU_3D_VBUF_RES_ID
+    cast[Ptr[uint32]](a + 28)[0] = PIPE_BUFFER
+    cast[Ptr[uint32]](a + 32)[0] = VIRGL_FORMAT_R8_UNORM
+    cast[Ptr[uint32]](a + 36)[0] = VIRGL_BIND_VERTEX_BUFFER
+    cast[Ptr[uint32]](a + 40)[0] = nbytes                # width = byte count
+    cast[Ptr[uint32]](a + 44)[0] = 1                     # height
+    cast[Ptr[uint32]](a + 48)[0] = 1                     # depth
+    cast[Ptr[uint32]](a + 52)[0] = 1                     # array_size
+    cast[Ptr[uint32]](a + 56)[0] = 0                     # last_level
+    cast[Ptr[uint32]](a + 60)[0] = 0                     # nr_samples
+    cast[Ptr[uint32]](a + 64)[0] = 0                     # flags
+    cast[Ptr[uint32]](a + 68)[0] = 0                     # padding
+    resp_type: uint32 = _submit(72, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: VBUF CREATE_3D bad resp=%x\n",
+                cast[uint64](resp_type))
+        return 0
+    if _gpu_attach_backing_res(GPU_3D_VBUF_RES_ID, phys, nbytes) != 0:
+        return 0
+    if _gpu_ctx_attach_resource(GPU_3D_VBUF_RES_ID) != 0:
+        return 0
+    gpu_state.vbuf_res_id = GPU_3D_VBUF_RES_ID
+    gpu_state.vbuf_backing = phys
+    gpu_state.vbuf_ord = order
+    printk1("virtio-gpu: 3D vertex buffer ready (%d bytes)\n",
+            cast[uint64](nbytes))
+    return GPU_3D_VBUF_RES_ID
+
+
+def virtio_gpu_3d_vbuf_backing() -> uint64:
+    # Identity-mapped VA of the vertex buffer's guest backing (0 if none). The
+    # caller writes clip-space float vertices here, then vbuf_upload() pushes
+    # them to the host resource.
+    return gpu_state.vbuf_backing
+
+
+def virtio_gpu_3d_vbuf_upload(nbytes: uint32) -> int32:
+    # TRANSFER_TO_HOST_3D the first `nbytes` of the vertex buffer backing into
+    # the host resource so the host GPU draw reads the current vertices. For a
+    # PIPE_BUFFER the box is 1-D: x=0, w=nbytes, h=1. 0 device-OK, -1 else.
+    if gpu_state.present == 0 or gpu_state.ctx_ready == 0:
+        return -1
+    if gpu_state.vbuf_res_id == 0:
+        return -1
+    return _gpu_transfer_to_host_3d(gpu_state.vbuf_res_id, 0, 0,
+                                    nbytes, 1, nbytes)
 
 
 # --- Probe + init --------------------------------------------------

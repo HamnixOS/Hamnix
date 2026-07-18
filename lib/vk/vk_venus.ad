@@ -44,6 +44,8 @@ from drivers.video.virtio_gpu import (
     virtio_gpu_3d_rt_readback, virtio_gpu_3d_rt_roundtrip_probe,
     virtio_gpu_3d_create_frame_rt, virtio_gpu_3d_frame_rt_backing,
     virtio_gpu_3d_frame_rt_readback, virtio_gpu_3d_create_scratch_rt,
+    virtio_gpu_3d_create_vbuf, virtio_gpu_3d_vbuf_backing,
+    virtio_gpu_3d_vbuf_upload,
 )
 
 
@@ -704,6 +706,400 @@ def vk_venus_frame_blit(res_handle: uint32, dstx: uint32, dsty: uint32,
                                             res_handle, dstx, dsty,
                                             res_handle, sx, sy, w, h)
     return virtio_gpu_submit_3d(cast[uint64](&venus_cmd_buf[0]), n)
+
+
+# ===================================================================
+# TRANSLUCENT (alpha-blended) FILL via a REAL GL DRAW PIPELINE
+# (GPU track #182 round 8 — the first GPU op that BLENDS)
+# ===================================================================
+#
+# CLEAR + RESOURCE_COPY_REGION give OPAQUE fills/blits only: they OVERWRITE the
+# target, never composite. A translucent fill needs source-over
+#     out = src*a + dst*(1 - a)
+# which on the GPU means a real DRAW with GL_BLEND enabled — a vertex + fragment
+# shader, a vertex buffer, a blend CSO, a viewport, then DRAW_VBO. virglrenderer
+# accepts shaders as TGSI *text* (the host runs tgsi_text_translate), so no
+# in-guest shader compiler is needed — we ship two tiny TGSI programs as text.
+#
+# GEOMETRY: one fullscreen quad (4 clip-space corners at exactly +/-1) lives in
+# a persistent vertex buffer, uploaded ONCE. Each translucent fill re-aims the
+# VIEWPORT (scale/translate, all exact n/2 values) so the quad covers only the
+# pixel box (x,y,w,h), sets the fragment colour constant, and DRAW_VBOs. The
+# blend CSO is source-over (rgb: SRC_ALPHA/INV_SRC_ALPHA, alpha: ONE/INV_SRC_
+# ALPHA so dst alpha stays 1.0 — matching vk2d which forces dst alpha 0xFF).
+#
+# HONEST ROUNDING NOTE: GL UNORM blending rounds to nearest; the vk2d SW oracle
+# floors ( (src*a + dst*(255-a)) / 255 ). So a translucent GPU fill matches the
+# SW oracle within +/-1 per channel (documented tolerance), NOT byte-exact. An
+# OPAQUE fill (a==255) stays byte-exact and keeps using the CLEAR/COPY path.
+
+# Extra virgl opcodes for the draw pipeline (virgl_protocol.h; consistent with
+# the opcodes already validated above — CLEAR7=7, COPY_REGION=17, etc.).
+VIRGL_CCMD_SET_VIEWPORT_STATE:  uint32 = 4
+VIRGL_CCMD_SET_VERTEX_BUFFERS:  uint32 = 6
+VIRGL_CCMD_DRAW_VBO:            uint32 = 8
+VIRGL_CCMD_SET_CONSTANT_BUFFER: uint32 = 12
+VIRGL_CCMD_BIND_SHADER:         uint32 = 31
+# Object types.
+VIRGL_OBJECT_BLEND:             uint32 = 1
+VIRGL_OBJECT_SHADER:            uint32 = 4
+VIRGL_OBJECT_VERTEX_ELEMENTS:   uint32 = 5
+# gallium shader stages.
+PIPE_SHADER_VERTEX:             uint32 = 0
+PIPE_SHADER_FRAGMENT:           uint32 = 1
+# gallium primitive + blend enums.
+PIPE_PRIM_TRIANGLE_STRIP:       uint32 = 5
+PIPE_BLEND_ADD:                 uint32 = 0
+PIPE_BLENDFACTOR_ONE:           uint32 = 1
+PIPE_BLENDFACTOR_SRC_ALPHA:     uint32 = 3
+PIPE_BLENDFACTOR_INV_SRC_ALPHA: uint32 = 0x13   # 19
+PIPE_MASK_RGBA:                 uint32 = 0xF
+# vertex attribute format R32G32B32A32_FLOAT (virgl_hw.h).
+VIRGL_FORMAT_R32G32B32A32_FLOAT: uint32 = 31
+
+# Object handles for the draw pipeline (distinct from the fill/frame ranges).
+VK_VENUS_VS_SHADER: uint32 = 0x60   # vertex shader
+VK_VENUS_FS_SHADER: uint32 = 0x61   # fragment shader
+VK_VENUS_BLEND_OBJ: uint32 = 0x62   # source-over blend CSO
+VK_VENUS_VE_OBJ:    uint32 = 0x63   # vertex-elements CSO
+
+# Y-orientation of the viewport. ON-DEVICE FINDING (RTX 3090 + shipped
+# virglrenderer): the frame RT's TRANSFER_FROM_HOST_3D readback is TOP-origin —
+# it matches a top-origin viewport, so a guest box (y..y+h) maps DIRECTLY to
+# window rows (y..y+h). VK_VENUS_VP_YFLIP=0 selects that (verified byte-exact by
+# the sub-box translucent-fill self-test). =1 would apply the GL bottom-origin
+# flip (H-y-h .. H-y) — kept as a switch for hosts that flip rendered textures.
+VK_VENUS_VP_YFLIP: int32 = 0
+
+
+def _venus_strlen(s: uint64) -> uint32:
+    n: uint32 = 0
+    while cast[Ptr[uint8]](s + cast[uint64](n))[0] != 0:
+        n = n + 1
+    return n
+
+
+def _venus_put_text(buf: uint64, k: uint32, txt: uint64,
+                    tlen: uint32) -> uint32:
+    # Pack `tlen` text bytes + a NUL terminator into the dword stream at index
+    # `k`, little-endian, 4 chars per dword, zero-padding the final dword.
+    # Returns the next dword index.
+    i: uint32 = 0
+    while i < tlen:
+        w: uint32 = 0
+        j: uint32 = 0
+        while j < 4:
+            if i + j < tlen:
+                w = w | (cast[uint32](cast[Ptr[uint8]](txt +
+                        cast[uint64](i + j))[0]) << (j * 8))
+            j = j + 1
+        cast[Ptr[uint32]](buf + cast[uint64](k) * 4)[0] = w
+        k = k + 1
+        i = i + 4
+    # If tlen was a multiple of 4 the NUL terminator has no room yet: append a
+    # zero dword. Otherwise the padding above already supplied a 0 byte.
+    if (tlen & 3) == 0:
+        cast[Ptr[uint32]](buf + cast[uint64](k) * 4)[0] = 0
+        k = k + 1
+    return k
+
+
+def _venus_text_dwords(tlen: uint32) -> uint32:
+    # Dword count _venus_put_text writes for a `tlen`-byte string (incl. NUL).
+    d: uint32 = (tlen + 3) / 4
+    if (tlen & 3) == 0:
+        d = d + 1
+    return d
+
+
+# The two TGSI programs are supplied as text at the call site (module-scope
+# string globals must be Array-typed; string literals are simplest as function
+# locals). virglrenderer host-parses the text via tgsi_text_translate.
+#   Vertex:   pass the clip-space position attribute straight through.
+#   Fragment: emit constant-buffer slot 0 (the RGBA fill colour); the bound
+#             source-over blend CSO composites it using its .a.
+
+
+def _venus_encode_shader(buf: uint64, k: uint32, handle: uint32,
+                         stype: uint32, txt: uint64) -> uint32:
+    # CREATE_OBJECT/SHADER: header + handle,type,offset,num_tokens,num_so + text.
+    tlen: uint32 = _venus_strlen(txt)
+    tdw: uint32 = _venus_text_dwords(tlen)
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_CREATE_OBJECT,
+                                       VIRGL_OBJECT_SHADER, 5 + tdw))
+    k = _venus_put(buf, k, handle)
+    k = _venus_put(buf, k, stype)                        # PIPE_SHADER_*
+    # OFFSET field: for a single (non-continuation) packet virglrenderer reads
+    # this as the TOTAL shader byte length (incl. NUL), NOT 0 — a 0 here yields
+    # "Invalid expected token count" and the CREATE_OBJECT fails (EINVAL).
+    k = _venus_put(buf, k, tlen + 1)                     # total text bytes
+    k = _venus_put(buf, k, 300)                          # num_tokens hint
+    k = _venus_put(buf, k, 0)                            # num_so_outputs
+    k = _venus_put_text(buf, k, txt, tlen)
+    return k
+
+
+def _venus_encode_bind_shader(buf: uint64, k: uint32, handle: uint32,
+                              stype: uint32) -> uint32:
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_BIND_SHADER, 0, 2))
+    k = _venus_put(buf, k, handle)
+    k = _venus_put(buf, k, stype)
+    return k
+
+
+def _venus_blend_rt0() -> uint32:
+    # RT[0] source-over blend word (virgl_protocol.h VIRGL_OBJ_BLEND_S2_*):
+    #   blend_enable<<0 | rgb_func<<1 | rgb_src<<4 | rgb_dst<<9 |
+    #   alpha_func<<14 | alpha_src<<17 | alpha_dst<<22 | colormask<<27
+    # rgb  : SRC_ALPHA / INV_SRC_ALPHA, ADD  -> src*a + dst*(1-a)
+    # alpha: ONE       / INV_SRC_ALPHA, ADD  -> a + dst_a*(1-a) = 1 (dst_a=1)
+    return 1 \
+        | (PIPE_BLEND_ADD << 1) \
+        | (PIPE_BLENDFACTOR_SRC_ALPHA << 4) \
+        | (PIPE_BLENDFACTOR_INV_SRC_ALPHA << 9) \
+        | (PIPE_BLEND_ADD << 14) \
+        | (PIPE_BLENDFACTOR_ONE << 17) \
+        | (PIPE_BLENDFACTOR_INV_SRC_ALPHA << 22) \
+        | (PIPE_MASK_RGBA << 27)
+
+
+def _venus_encode_blend(buf: uint64, k: uint32, handle: uint32) -> uint32:
+    # CREATE_OBJECT/BLEND: handle + S0 + S1 + 8 RT dwords (VIRGL_OBJ_BLEND_SIZE=11).
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_CREATE_OBJECT,
+                                       VIRGL_OBJECT_BLEND, 11))
+    k = _venus_put(buf, k, handle)
+    k = _venus_put(buf, k, 0)                            # S0 (no independent/logicop)
+    k = _venus_put(buf, k, 0)                            # S1 (logicop func)
+    k = _venus_put(buf, k, _venus_blend_rt0())           # RT[0] = source-over
+    ri: uint32 = 1
+    while ri < 8:
+        k = _venus_put(buf, k, 0)                        # RT[1..7] disabled
+        ri = ri + 1
+    return k
+
+
+def _venus_encode_vertex_elements(buf: uint64, k: uint32,
+                                  handle: uint32) -> uint32:
+    # CREATE_OBJECT/VERTEX_ELEMENTS with ONE element: a vec4 float at offset 0
+    # of vertex buffer 0. Per-element 4 dwords: src_offset, instance_divisor,
+    # vertex_buffer_index, src_format. Size = 1 (handle) + 4.
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_CREATE_OBJECT,
+                                       VIRGL_OBJECT_VERTEX_ELEMENTS, 5))
+    k = _venus_put(buf, k, handle)
+    k = _venus_put(buf, k, 0)                            # src_offset
+    k = _venus_put(buf, k, 0)                            # instance_divisor
+    k = _venus_put(buf, k, 0)                            # vertex_buffer_index
+    k = _venus_put(buf, k, VIRGL_FORMAT_R32G32B32A32_FLOAT)
+    return k
+
+
+def _venus_encode_bind_obj(buf: uint64, k: uint32, otype: uint32,
+                           handle: uint32) -> uint32:
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_BIND_OBJECT, otype, 1))
+    k = _venus_put(buf, k, handle)
+    return k
+
+
+def _venus_encode_set_vertex_buffers(buf: uint64, k: uint32,
+                                     vbuf_res: uint32) -> uint32:
+    # SET_VERTEX_BUFFERS, one buffer: stride, offset, res_handle (3 dwords).
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3))
+    k = _venus_put(buf, k, 16)                           # stride = vec4 float
+    k = _venus_put(buf, k, 0)                            # buffer offset
+    k = _venus_put(buf, k, vbuf_res)                     # resource handle
+    return k
+
+
+def _f32_half_bits(x: int64) -> uint32:
+    # IEEE-754 float bits of x/2.0, exact for |x| < 2^24 (our viewport n/2
+    # scale/translate values). EXTERN-free (no float intrinsics).
+    if x == 0:
+        return 0
+    sign: uint32 = 0
+    m: uint64 = 0
+    if x < 0:
+        sign = 0x80000000
+        m = cast[uint64](0 - x)
+    else:
+        m = cast[uint64](x)
+    p: int32 = 0
+    t: uint64 = m
+    while t > 1:
+        t = t >> 1
+        p = p + 1
+    exp: int32 = p + 126                                 # float(m) exp = p+127; /2
+    frac: uint64 = m - (cast[uint64](1) << cast[uint64](p))
+    mant: uint32 = 0
+    if p <= 23:
+        mant = cast[uint32](frac << cast[uint64](23 - p))
+    else:
+        mant = cast[uint32](frac >> cast[uint64](p - 23))
+    return sign | (cast[uint32](exp) << 23) | (mant & 0x7FFFFF)
+
+
+def _venus_encode_viewport(buf: uint64, k: uint32,
+                           x: uint32, y: uint32, w: uint32, h: uint32,
+                           rt_h: uint32) -> uint32:
+    # SET_VIEWPORT_STATE: start_slot + scale[3] + translate[3] (float bits).
+    # Maps the +/-1 clip quad onto the pixel box (x,y,w,h). All params are n/2
+    # so _f32_half_bits is exact.
+    #   scale_x = w/2,          translate_x = x + w/2
+    #   scale_y = h/2,          translate_y = (flip) H-y-h/2  else  y+h/2
+    #   scale_z = 1/2,          translate_z = 1/2   ([-1,1] NDC z -> [0,1])
+    xi: int64 = cast[int64](x)
+    yi: int64 = cast[int64](y)
+    wi: int64 = cast[int64](w)
+    hi: int64 = cast[int64](h)
+    Hi: int64 = cast[int64](rt_h)
+    ty_num: int64 = 2 * yi + hi                          # top-origin: y + h/2
+    if VK_VENUS_VP_YFLIP != 0:
+        ty_num = 2 * (Hi - yi) - hi                      # bottom-origin
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7))
+    k = _venus_put(buf, k, 0)                            # start_slot
+    k = _venus_put(buf, k, _f32_half_bits(wi))           # scale.x = w/2
+    k = _venus_put(buf, k, _f32_half_bits(hi))           # scale.y = h/2
+    k = _venus_put(buf, k, _f32_half_bits(1))            # scale.z = 0.5
+    k = _venus_put(buf, k, _f32_half_bits(2 * xi + wi))  # translate.x = x + w/2
+    k = _venus_put(buf, k, _f32_half_bits(ty_num))       # translate.y
+    k = _venus_put(buf, k, _f32_half_bits(1))            # translate.z = 0.5
+    return k
+
+
+def _venus_encode_set_frag_color(buf: uint64, k: uint32,
+                                 cr: uint32, cg: uint32, cb: uint32,
+                                 ca: uint32) -> uint32:
+    # SET_CONSTANT_BUFFER for the FRAGMENT shader, slot 0 = RGBA float bits.
+    # Body: shader_type, index, then 4 float dwords (size = 2 + 4).
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_SET_CONSTANT_BUFFER, 0, 6))
+    k = _venus_put(buf, k, PIPE_SHADER_FRAGMENT)
+    k = _venus_put(buf, k, 0)                            # constant buffer index 0
+    k = _venus_put(buf, k, cr)
+    k = _venus_put(buf, k, cg)
+    k = _venus_put(buf, k, cb)
+    k = _venus_put(buf, k, ca)
+    return k
+
+
+def _venus_encode_draw_quad(buf: uint64, k: uint32) -> uint32:
+    # DRAW_VBO: a 4-vertex triangle strip (the quad). Size = 12.
+    k = _venus_put(buf, k, _virgl_cmd0(VIRGL_CCMD_DRAW_VBO, 0, 12))
+    k = _venus_put(buf, k, 0)                            # start
+    k = _venus_put(buf, k, 4)                            # count
+    k = _venus_put(buf, k, PIPE_PRIM_TRIANGLE_STRIP)     # mode
+    k = _venus_put(buf, k, 0)                            # indexed
+    k = _venus_put(buf, k, 1)                            # instance_count
+    k = _venus_put(buf, k, 0)                            # index_bias
+    k = _venus_put(buf, k, 0)                            # start_instance
+    k = _venus_put(buf, k, 0)                            # primitive_restart
+    k = _venus_put(buf, k, 0)                            # restart_index
+    k = _venus_put(buf, k, 0)                            # min_index
+    k = _venus_put(buf, k, 0xFFFFFFFF)                   # max_index
+    k = _venus_put(buf, k, 0)                            # cso / indirect (none)
+    return k
+
+
+# --- blend-draw seam (setup once + per-fill) ---------------------------
+
+VK_VENUS_QUAD_BYTES: uint32 = 64   # 4 corners * vec4 float
+venus_vbuf_res: uint32 = 0         # cached vertex buffer resource id
+
+
+def _venus_upload_quad() -> int32:
+    # Fill the vertex buffer backing with the fullscreen clip-space quad
+    # (triangle strip: (-1,-1),(1,-1),(-1,1),(1,1); z=0,w=1) and push it host-
+    # side. Returns 0 on success. The exact +/-1 corners keep pixel coverage
+    # crisp; the VIEWPORT (not the geometry) selects the box.
+    vb: uint64 = virtio_gpu_3d_vbuf_backing()
+    if vb == 0:
+        return -1
+    fN1: uint32 = 0xBF800000                             # -1.0f
+    fP1: uint32 = 0x3F800000                             #  1.0f
+    fZ:  uint32 = 0x00000000                             #  0.0f
+    # v0 (-1,-1) v1 (1,-1) v2 (-1,1) v3 (1,1)
+    cast[Ptr[uint32]](vb + 0)[0]  = fN1
+    cast[Ptr[uint32]](vb + 4)[0]  = fN1
+    cast[Ptr[uint32]](vb + 8)[0]  = fZ
+    cast[Ptr[uint32]](vb + 12)[0] = fP1
+    cast[Ptr[uint32]](vb + 16)[0] = fP1
+    cast[Ptr[uint32]](vb + 20)[0] = fN1
+    cast[Ptr[uint32]](vb + 24)[0] = fZ
+    cast[Ptr[uint32]](vb + 28)[0] = fP1
+    cast[Ptr[uint32]](vb + 32)[0] = fN1
+    cast[Ptr[uint32]](vb + 36)[0] = fP1
+    cast[Ptr[uint32]](vb + 40)[0] = fZ
+    cast[Ptr[uint32]](vb + 44)[0] = fP1
+    cast[Ptr[uint32]](vb + 48)[0] = fP1
+    cast[Ptr[uint32]](vb + 52)[0] = fP1
+    cast[Ptr[uint32]](vb + 56)[0] = fZ
+    cast[Ptr[uint32]](vb + 60)[0] = fP1
+    return virtio_gpu_3d_vbuf_upload(VK_VENUS_QUAD_BYTES)
+
+
+def vk_venus_blend_setup(frame_surf: uint32) -> int32:
+    # Build + bind the translucent-fill DRAW pipeline once for the current
+    # frame: create the vertex buffer (quad), the vertex + fragment shaders, the
+    # source-over blend CSO, and the vertex-elements CSO; bind them all; rebind
+    # the framebuffer to the frame surface (an opaque frame_fill leaves it on
+    # the scratch surface). Split across several SUBMIT_3D streams to respect
+    # the device's per-submit size cap. Returns 0 on success, -1 otherwise.
+    if virtio_gpu_3d_available() == 0:
+        return -1
+    vbid: uint32 = virtio_gpu_3d_create_vbuf(VK_VENUS_QUAD_BYTES)
+    if vbid == 0:
+        return -1
+    venus_vbuf_res = vbid
+    if _venus_upload_quad() != 0:
+        return -1
+    vs_txt: Ptr[uint8] = \
+        "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n"
+    fs_txt: Ptr[uint8] = \
+        "FRAG\nDCL CONST[0]\nDCL OUT[0], COLOR\n0: MOV OUT[0], CONST[0]\n1: END\n"
+    b: uint64 = cast[uint64](&venus_cmd_buf[0])
+    # Stream 1: vertex shader.
+    n: uint32 = _venus_encode_shader(b, 0, VK_VENUS_VS_SHADER,
+                                     PIPE_SHADER_VERTEX,
+                                     cast[uint64](vs_txt))
+    if virtio_gpu_submit_3d(b, n) != 0:
+        return -1
+    # Stream 2: fragment shader.
+    n = _venus_encode_shader(b, 0, VK_VENUS_FS_SHADER, PIPE_SHADER_FRAGMENT,
+                             cast[uint64](fs_txt))
+    if virtio_gpu_submit_3d(b, n) != 0:
+        return -1
+    # Stream 3: bind shaders + blend + vertex-elements + vertex buffer, and
+    # rebind the framebuffer to the frame surface.
+    k: uint32 = 0
+    k = _venus_encode_bind_shader(b, k, VK_VENUS_VS_SHADER, PIPE_SHADER_VERTEX)
+    k = _venus_encode_bind_shader(b, k, VK_VENUS_FS_SHADER, PIPE_SHADER_FRAGMENT)
+    k = _venus_encode_blend(b, k, VK_VENUS_BLEND_OBJ)
+    k = _venus_encode_bind_obj(b, k, VIRGL_OBJECT_BLEND, VK_VENUS_BLEND_OBJ)
+    k = _venus_encode_vertex_elements(b, k, VK_VENUS_VE_OBJ)
+    k = _venus_encode_bind_obj(b, k, VIRGL_OBJECT_VERTEX_ELEMENTS,
+                               VK_VENUS_VE_OBJ)
+    k = _venus_encode_set_vertex_buffers(b, k, venus_vbuf_res)
+    # SET_FRAMEBUFFER_STATE(frame_surf).
+    k = _venus_put(b, k, _virgl_cmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3))
+    k = _venus_put(b, k, 1)                              # nr_cbufs
+    k = _venus_put(b, k, 0)                              # zsurf_handle
+    k = _venus_put(b, k, frame_surf)                     # cbuf[0]
+    return virtio_gpu_submit_3d(b, k)
+
+
+def vk_venus_blend_fill(x: uint32, y: uint32, w: uint32, h: uint32,
+                        rt_h: uint32,
+                        cr: uint32, cg: uint32, cb: uint32,
+                        ca: uint32) -> int32:
+    # Source-over translucent fill of box (x,y,w,h) into the frame RT: aim the
+    # viewport at the box, set the fragment colour (RGBA float bits), and draw
+    # the blended quad. vk_venus_blend_setup must have run. Returns the submit rc.
+    if virtio_gpu_3d_available() == 0:
+        return -1
+    b: uint64 = cast[uint64](&venus_cmd_buf[0])
+    k: uint32 = 0
+    k = _venus_encode_viewport(b, k, x, y, w, h, rt_h)
+    k = _venus_encode_set_frag_color(b, k, cr, cg, cb, ca)
+    k = _venus_encode_draw_quad(b, k)
+    return virtio_gpu_submit_3d(b, k)
 
 
 # ===================================================================

@@ -117,7 +117,8 @@ for _ in $(seq 1 "$((BOOT_WAIT * 4))"); do
         NVIDIA_RESIDENT=1
         echo "$smi" >> "$SMILOG"
     fi
-    grep -a -q -E "\[vgpu-multiop\] (PASS: 3|PASS: 4|SKIP: host GL accepted|FAIL)" "$GLLOG" && break
+    grep -a -q -E "\[vgpu-blend\] (PASS|SKIP: host GL accepted)" "$GLLOG" && break
+    grep -a -q -E "\[vgpu-multiop\] FAIL" "$GLLOG" && break
     kill -0 "$QEMU_PID" 2>/dev/null || break
     sleep 0.25
 done
@@ -126,6 +127,8 @@ kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; QEMU_PID=""
 
 echo "[test_inguest_gpu_multiop_hw] --- guest multi-op markers ---"
 grep -a -E "\[vgpu-multiop\]|\[vgpu-virgl\] (PASS|SKIP)" "$GLLOG" | head -30
+echo "[test_inguest_gpu_multiop_hw] --- guest translucent-blend markers ---"
+grep -a -E "\[vgpu-blend\]" "$GLLOG" | head -20
 echo "[test_inguest_gpu_multiop_hw] --- host GL context (virglrenderer) ---"
 GLVER_LINE="$(grep -a -E "gl_version [0-9]+ - core profile" "$GLLOG" | head -1)"
 GLREND_LINE="$(grep -a -iE "GL_RENDERER=NVIDIA|NVIDIA GeForce RTX|llvmpipe" "$GLLOG" | head -2)"
@@ -155,11 +158,20 @@ if grep -a -q -E "gl_version 4[6-9] - core profile" "$GLLOG" \
     NV_CTX=1
 fi
 
+# Round 8: did the translucent (alpha-blended) DRAW-pipeline fill byte-verify?
+BLEND_GREEN=0
+grep -a -q -E "\[vgpu-blend\] PASS: .*translucent source-over fill.* on the RTX 3090" "$GLLOG" && BLEND_GREEN=1
+
 if [ "$GREEN" -eq 1 ] && [ "$NV_CTX" -eq 1 ] && [ "$NVIDIA_RESIDENT" -eq 1 ]; then
     OPS="$(grep -a -oE "\[vgpu-multiop\] PASS: [34] op types[^\\\\]*" "$GLLOG" | head -1)"
     echo "[test_inguest_gpu_multiop_hw] PASS: MULTI-OP frame rasterized on the RTX 3090 —"
     echo "[test_inguest_gpu_multiop_hw]   byte-identical to the SW oracle, GL_RENDERER=NVIDIA, nvidia-smi resident."
     [ -n "$OPS" ] && echo "[test_inguest_gpu_multiop_hw]   ${OPS#\[vgpu-multiop\] }"
+    if [ "$BLEND_GREEN" -eq 1 ]; then
+        echo "[test_inguest_gpu_multiop_hw]   + TRANSLUCENT alpha-blended fill (GL DRAW + GL_BLEND) byte-matches SW (+/-1 UNORM rounding)"
+    else
+        echo "[test_inguest_gpu_multiop_hw]   (translucent blend-draw not byte-confirmed this run; see [vgpu-blend] markers — stays SW-fallback)"
+    fi
     exit 0
 fi
 
