@@ -122,6 +122,27 @@ the passing host gates found the following.
   event, `this === window`). Gate: `domlifecycle` section (D). REMAINING: `window.dispatchEvent`
   of a synthetic event is a no-op (no window target in `NID_DISPATCH`); `scroll`/`resize` are never
   sourced in the headless render.
+- **webstorage + html/browsers (2026-07-17): Web Storage + History API + Location parsing** — two
+  self-contained browser globals real SPAs/routers depend on. **Web Storage was already present**
+  (`localStorage`/`sessionStorage` as independent `Storage` objects in `lib/web/js/builtins/native.ad`
+  `make_storage` + dispatch in `collections.ad`: `setItem`/`getItem`/`removeItem`/`clear`/`key`/`length`,
+  string coercion of values, `null` for a missing key, insertion-ordered `key(i)`); this round adds the
+  gate + doc. **History API is NEW** (`lib/web/dom/canvas.ad`): a `history` object with
+  `pushState(state,title,url)` / `replaceState` / `state` / `length` / `back()` / `forward()` / `go(delta)`
+  over a session-history model (`jshist_*` index + state + append-only URL ring). `pushState` advances the
+  index, **truncates the forward tail**, and grows `length`; `replaceState` overwrites the current entry
+  **without growing**; `back`/`forward`/`go` walk the index, restore the entry's URL into `location`, and
+  fire a **`popstate` window event carrying `event.state`** (dispatched to `window.addEventListener('popstate')`
+  DOC_EL/GEN_KIND listeners + `window.onpopstate`). **Location parsing** — a full WHATWG-URL component
+  split (`_url_parse_into`): `protocol`/`host`/`hostname`/`port`/`pathname`/`search`/`hash`/`origin`
+  (userinfo stripped, `origin = protocol//host`, bare authority → `pathname "/"`). `location.href = …`
+  re-parses; `location.hash = …` rebuilds `href` and fires **`hashchange`**; `location.assign/replace`
+  parse; `location.toString()` → `href`. A `__setLocation(url)` host test hook drives deterministic
+  parsing (the headless engine has no live navigation). Gate: `test_hambrowse_webstorage_host.sh` (25
+  asserts: Storage coercion+null+independence, pushState/replaceState length + `history.state`,
+  back/forward/go `popstate` state, location component parsing + hashchange). **Scope deferred:**
+  cross-page-load PERSISTENCE (headless single-document engine — the API SEMANTICS are what matter);
+  `StorageEvent`; state is stored by reference (not structured-clone-copied).
 - html5-parsing: implied end tags (gate `impliedtags`); quote-aware tag tokenization (gate `tagquote`).
 - dom-core / CSSOM-view: **layout geometry** — `getBoundingClientRect()` (DOMRect: x/y/width/height/
   top/left/right/bottom), `getClientRects()` (single-fragment DOMRectList), `offsetWidth/Height/Left/Top`,
