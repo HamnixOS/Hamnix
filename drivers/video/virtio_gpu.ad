@@ -62,6 +62,51 @@ VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: uint32 = 0x0106
 VIRTIO_GPU_RESP_OK_NODATA:            uint32 = 0x1100
 VIRTIO_GPU_RESP_OK_DISPLAY_INFO:      uint32 = 0x1101
 
+# --- virtio-gpu 3D / VIRGL (GPU track #182 Phase 2 — venus/virgl) ---
+#
+# Base virtio-gpu is a 2D SCANOUT device: it presents a host resource but
+# does NOT rasterize into it, so fills/blits/triangles run on the guest
+# CPU. Real fill/compute acceleration needs the virtio-gpu 3D context: the
+# guest MARSHALS a virgl (GL) / venus (Vulkan) command stream and the HOST
+# GPU executes it — no in-guest shader compiler. The device advertises this
+# via virtio feature bit 0, VIRTIO_GPU_F_VIRGL (feature WORD 0). QEMU only
+# offers it with `-device virtio-gpu-gl` (or `virtio-vga-gl`) AND a GL
+# display backend (e.g. `-display egl-headless`); a plain `virtio-gpu-pci`
+# never advertises it, so this whole 3D path stays INERT there and the 2D
+# present path is byte-for-byte unchanged.
+#
+# HONEST CURRENT STATE (foundation round): this driver PROBES the VIRGL
+# feature and carries the full 3D command encoders (CTX_CREATE / SUBMIT_3D)
+# gated behind that probe. The modern transport (drivers/virtio/
+# virtio_modern.ad) still negotiates ONLY VIRTIO_F_VERSION_1, so VIRGL is
+# advertised-but-not-negotiated; issuing a 3D command therefore returns the
+# device's error code (reported honestly, never claimed as success). To
+# LIGHT UP the host GPU, the transport must additionally set feature word0
+# bit0 before FEATURES_OK — the single next step, documented in the driver's
+# 3D self-probe. Everything below is that ready-to-fire spine.
+VIRTIO_GPU_F_VIRGL_BIT:  uint32 = 0x1        # feature word0 bit 0
+
+VIRTIO_GPU_CMD_CTX_CREATE:            uint32 = 0x0200
+VIRTIO_GPU_CMD_CTX_DESTROY:           uint32 = 0x0201
+VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:   uint32 = 0x0202
+VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE:   uint32 = 0x0203
+VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:    uint32 = 0x0204
+VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D:   uint32 = 0x0205
+VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D: uint32 = 0x0206
+VIRTIO_GPU_CMD_SUBMIT_3D:             uint32 = 0x0207
+
+VIRTIO_GPU_RESP_ERR_UNSPEC:           uint32 = 0x1200
+
+# Common-config MMIO offsets we read DIRECTLY for the device-feature probe
+# only (a pure read of a device selector/register — it does NOT change
+# feature negotiation, which the modern transport owns). Mirrors
+# drivers/virtio/virtio_modern.ad VIRTIO_PCI_COMMON_DFSELECT / _DF.
+GPU_COMMON_DFSELECT: uint64 = 0
+GPU_COMMON_DF:       uint64 = 4
+
+# The 3D context id this driver uses for its single foundation context.
+GPU_3D_CTX_ID:       uint32 = 1
+
 # 2D pixel format. B8G8R8A8_UNORM = 1 in the virtio-gpu formats enum.
 # QEMU treats this as little-endian BGRA bytes; we write our backing
 # buffer to match.
@@ -99,6 +144,8 @@ class VirtioGpu:
     fb_pages_ord:  int32
     width:         uint32
     height:        uint32
+    virgl_avail:   int32               # 1 if device advertises VIRTIO_GPU_F_VIRGL
+    ctx_ready:     int32               # 1 if a 3D context was created (negotiated)
 
 
 gpu_state: VirtioGpu
@@ -561,6 +608,122 @@ def virtio_gpu_present_rgba(src_base: uint64, src_w: uint32,
     return virtio_gpu_present_frame()
 
 
+# --- 3D / VIRGL capability probe + command encoders ----------------
+#
+# The marshalling spine for host-GPU-executed rendering. All of it is
+# GATED on gpu_state.virgl_avail (set by _gpu_probe_virgl below), so on a
+# plain 2D virtio-gpu-pci device — including the one the 2D present test
+# boots — every function here is INERT (returns -1 without touching the
+# device). The 2D present path never calls into it.
+
+def _gpu_probe_virgl():
+    # Read device-feature WORD 0 bit 0 (VIRTIO_GPU_F_VIRGL) directly from
+    # the common-config MMIO. Selecting a feature word (DFSELECT) and
+    # reading the read-only device-feature register (DF) does NOT alter
+    # negotiation — the transport already latched FEATURES_OK — it only
+    # tells us whether the HOST exposes a virgl/3D renderer. Records the
+    # result so the 3D scaffolding can gate on it.
+    cb: uint64 = gpu_state.dev.common_base
+    cast[Ptr[uint32]](cb + GPU_COMMON_DFSELECT)[0] = 0
+    df0: uint32 = cast[Ptr[uint32]](cb + GPU_COMMON_DF)[0]
+    if (df0 & VIRTIO_GPU_F_VIRGL_BIT) != 0:
+        gpu_state.virgl_avail = 1
+        printk0("virtio-gpu: 3D/VIRGL feature ADVERTISED by device\n")
+    else:
+        gpu_state.virgl_avail = 0
+        printk0("virtio-gpu: 3D/VIRGL not advertised (2D scanout-only device)\n")
+
+
+def _gpu_ctx_create() -> uint32:
+    # virtio_gpu_ctx_create (spec §5.7.6.8): hdr(24, ctx_id carried in the
+    # header's ctx_id field @16) + nlen(u32 @24) + context_init(u32 @28) +
+    # debug_name[64 @32] = 96 bytes. Returns the device response type.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_CTX_CREATE)
+    cast[Ptr[uint32]](a + HDR_CTXID)[0] = GPU_3D_CTX_ID   # 3D commands carry ctx_id
+    cast[Ptr[uint32]](a + 24)[0] = 0                      # nlen (no debug name)
+    cast[Ptr[uint32]](a + 28)[0] = 0                      # context_init
+    memset(cast[Ptr[uint8]](a + 32), 0, 64)              # debug_name[64] = ""
+    return _submit(96, cast[uint32](HDR_SIZE))
+
+
+def _gpu_ctx_destroy() -> uint32:
+    # virtio_gpu_ctx_destroy: bare hdr with ctx_id in the header.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_CTX_DESTROY)
+    cast[Ptr[uint32]](a + HDR_CTXID)[0] = GPU_3D_CTX_ID
+    return _submit(cast[uint32](HDR_SIZE), cast[uint32](HDR_SIZE))
+
+
+# --- Public 3D API (for lib/vk/vk_venus.ad) ------------------------
+
+def virtio_gpu_3d_available() -> int32:
+    # 1 iff the device advertises VIRTIO_GPU_F_VIRGL (host has a virgl/3D
+    # renderer). The venus/virgl seam gates on this.
+    return gpu_state.virgl_avail
+
+
+def virtio_gpu_3d_ctx_ready() -> int32:
+    return gpu_state.ctx_ready
+
+
+def virtio_gpu_3d_ctx_probe() -> int32:
+    # FOUNDATION SELF-PROBE. If the device advertises VIRGL, ATTEMPT a
+    # CTX_CREATE and report the device's REAL response — this exercises the
+    # 3D command encoder + submit spine and proves the device parses it,
+    # WITHOUT ever faking success. Returns:
+    #    1  = CTX_CREATE OK — a host-GPU 3D context is live (full virgl
+    #         negotiated: the transport set feature word0 bit0)
+    #    0  = device returned an error — VIRGL is advertised but NOT
+    #         negotiated by the transport yet (the honest current state).
+    #         To fix: virtio_modern_init must OR VIRTIO_GPU_F_VIRGL into
+    #         driver feature word0 before FEATURES_OK, and QEMU must run
+    #         `-device virtio-gpu-gl -display egl-headless`.
+    #   -1  = 3D not available (device does not advertise VIRGL).
+    if gpu_state.present == 0 or gpu_state.virgl_avail == 0:
+        return -1
+    rt: uint32 = _gpu_ctx_create()
+    if _resp_is_ok(rt) == 1:
+        gpu_state.ctx_ready = 1
+        printk0("virtio-gpu: 3D CTX_CREATE OK — host GPU context LIVE\n")
+        return 1
+    printk1("virtio-gpu: 3D CTX_CREATE resp=%x (VIRGL advertised, not negotiated)\n",
+            cast[uint64](rt))
+    return 0
+
+
+def virtio_gpu_submit_3d(cmd_va: uint64, dwords: uint32) -> int32:
+    # Marshal a virgl/GL command stream (encoded by lib/vk/vk_venus.ad) to
+    # the host GPU via VIRTIO_GPU_CMD_SUBMIT_3D. Wire layout: hdr (ctx_id in
+    # header) + size(u32 @24) + padding(u32 @28) + `size` bytes of command
+    # data @32. The command bytes are copied into the request scratch, which
+    # has ~480 bytes of body headroom past the 32-byte header. INERT (-1)
+    # unless the device advertises 3D. Returns 0 on device-OK, -1 otherwise.
+    if gpu_state.present == 0 or gpu_state.virgl_avail == 0:
+        return -1
+    if cmd_va == 0 or dwords == 0:
+        return -1
+    nbytes: uint32 = dwords * 4
+    if nbytes > 400:
+        printk1("virtio-gpu: SUBMIT_3D too big (%d bytes > scratch)\n",
+                cast[uint64](nbytes))
+        return -1
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_SUBMIT_3D)
+    cast[Ptr[uint32]](a + HDR_CTXID)[0] = GPU_3D_CTX_ID
+    cast[Ptr[uint32]](a + 24)[0] = nbytes                # size
+    cast[Ptr[uint32]](a + 28)[0] = 0                     # padding
+    i: uint32 = 0
+    while i < dwords:
+        cast[Ptr[uint32]](a + 32 + cast[uint64](i) * 4)[0] = \
+            cast[Ptr[uint32]](cmd_va + cast[uint64](i) * 4)[0]
+        i = i + 1
+    rt: uint32 = _submit(32 + nbytes, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(rt) == 1:
+        return 0
+    return -1
+
+
 # --- Probe + init --------------------------------------------------
 
 def virtio_gpu_init() -> int32:
@@ -612,4 +775,20 @@ def virtio_gpu_init() -> int32:
     gpu_state.present = 1
     printk2("virtio-gpu: ready, scanout %dx%d\n",
             cast[uint64](gpu_state.width), cast[uint64](gpu_state.height))
+
+    # GPU track #182 Phase 2: probe for the 3D/VIRGL host renderer and, when
+    # advertised, exercise the 3D-context foundation spine (CTX_CREATE). On a
+    # plain 2D virtio-gpu-pci device this is a no-op after the probe log, so
+    # the 2D present path is completely undisturbed.
+    gpu_state.virgl_avail = 0
+    gpu_state.ctx_ready = 0
+    _gpu_probe_virgl()
+    if gpu_state.virgl_avail == 1:
+        p3d: int32 = virtio_gpu_3d_ctx_probe()
+        if p3d == 1:
+            printk0("virtio-gpu: 3D foundation LIVE (host GPU accel path open)\n")
+            _gpu_ctx_destroy()
+            gpu_state.ctx_ready = 0
+        elif p3d == 0:
+            printk0("virtio-gpu: 3D spine READY; VIRGL not yet negotiated by transport\n")
     return 0
