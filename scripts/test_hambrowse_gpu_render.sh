@@ -11,20 +11,23 @@
 #      the frozen Adder seed.
 #   2. Run the web engine (he_layout + htmlpaint) on a rich real article fixture
 #      and DUMP its laid-out paint records as a stable, GPU-ingestible op stream
-#      (PAGEOPS / OP fill|rrect|line|glyph / ENDOPS) — every op derived from the
-#      live layout (block backgrounds, image boxes, stroked cell borders, text
-#      runs), NOTHING hand-authored.
+#      (PAGEOPS / OP fill|rrect|line|covmask / ENDOPS) — every op derived from
+#      the live layout (block backgrounds, image boxes, stroked cell borders,
+#      and text runs as real AA coverage masks), NOTHING hand-authored.
 #   3. Ingest that op stream in scripts/vk_hostgpu_bridge.c `pagefromops`, map it
 #      to the vk_2d op vocabulary, and rasterize on the RTX 3090 compute pipeline.
 #   4. BYTE-VERIFY the GPU readback against a CPU oracle running the IDENTICAL op
 #      stream (MISMATCH must be 0), assert a discrete-NVIDIA device was selected,
 #      and capture nvidia-smi per-process residency as GPU-exec proof.
 #
-# HONEST FALLBACK: `glyph` ops (text runs) are rasterized on the CPU — true
-# per-glyph AA coverage is not yet a GPU op (an OP_COV_MASK glyph op is future
-# work). The report prints gpu_ops (rasterized on the 3090) vs glyph_cpu_ops
-# (CPU fallback) so the split is explicit. Box paint — page/element backgrounds,
-# rounded rects, and every table-cell/border stroke — runs on the GPU.
+# FULL PAGE ON THE GPU: text runs now rasterize on the device too. Each laid-out
+# run is emitted as an OP_COV_MASK — its TRUE per-pixel AA coverage bitmap (the
+# exact mask font_ttf's rasterizer produced) — which the bridge uploads and the
+# compute shader blends by coverage/255 (src-over) on the RTX 3090. The report
+# prints gpu_ops (all ops on the 3090), text_gpu_ops (the coverage-mask runs),
+# and glyph_cpu_ops (legacy CPU fallback, now 0). Box paint — page/element
+# backgrounds, rounded rects, and every table-cell/border stroke — plus every
+# text run is rasterized on the GPU, byte-identical to the CPU oracle.
 #
 # SKIPS CLEANLY (exit 0) when: the Adder compiler, libvulkan, gcc, or the shader
 # SPIR-V is unavailable, or no non-CPU (real) Vulkan device is present (e.g. an
@@ -122,12 +125,18 @@ if [ "${MISM:-x}" = "0" ]; then
 else
     echo "[hb-gpu] FAIL: GPU vs CPU-oracle mismatch=${MISM:-?}" >&2; fail=1
 fi
-GPUOPS=$(grep '^PAGEFROMOPS_OK' "$GLOG" | sed -n 's/.*gpu_ops=\([0-9]*\).*/\1/p')
+GPUOPS=$(grep '^PAGEFROMOPS_OK' "$GLOG" | sed -n 's/.* gpu_ops=\([0-9]*\).*/\1/p')
 CPUOPS=$(grep '^PAGEFROMOPS_OK' "$GLOG" | sed -n 's/.*glyph_cpu_ops=\([0-9]*\).*/\1/p')
+TXTOPS=$(grep '^PAGEFROMOPS_OK' "$GLOG" | sed -n 's/.*text_gpu_ops=\([0-9]*\).*/\1/p')
 if [ "${GPUOPS:-0}" -gt 0 ]; then
-    echo "[hb-gpu] PASS: $GPUOPS box ops (backgrounds/borders/rects) rasterized on the GPU; ${CPUOPS:-0} glyph/text ops fell back to CPU (per-glyph AA not yet a GPU op)"
+    echo "[hb-gpu] PASS: $GPUOPS ops rasterized on the GPU — backgrounds/borders/rects AND ${TXTOPS:-0} text runs as AA coverage masks (OP_COV_MASK); ${CPUOPS:-0} glyph ops fell back to CPU"
 else
     echo "[hb-gpu] FAIL: no ops rasterized on the GPU" >&2; fail=1
+fi
+if [ "${TXTOPS:-0}" -gt 0 ] && [ "${CPUOPS:-1}" = "0" ]; then
+    echo "[hb-gpu] PASS: all $TXTOPS text runs rendered on the GPU as real anti-aliased glyph coverage — 0 CPU glyph fallback"
+else
+    echo "[hb-gpu] FAIL: text runs did not move to the GPU (text_gpu_ops=${TXTOPS:-?} glyph_cpu_ops=${CPUOPS:-?})" >&2; fail=1
 fi
 GDEV=$(grep '^VK_DEVICE' "$GLOG" | head -1)
 if echo "$GDEV" | grep -qi 'discrete-GPU\|integrated-GPU'; then

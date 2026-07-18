@@ -19,7 +19,8 @@ mock-up.
   OP fill  0 0 888 1126 #ffffffff     stable, GPU-ingestible op stream
   OP rrect ... / OP fill ...          (block backgrounds, image boxes)
   OP line  150 645 265 645 1 #808080ff (every table-cell / border stroke)
-  OP glyph 180 300 496 10 #......a0     (text runs — CPU fallback)
+  OP covmask 150 300 470 24 #101010ff 11280  (text run — real AA coverage → GPU)
+  <11280 hex bytes: 8-bit per-pixel coverage over the tight ink bbox>
   ENDOPS
         │  scripts/vk_hostgpu_bridge.c  pagefromops OPS.txt OUT.ppm [SECONDS]
         ▼
@@ -41,7 +42,7 @@ API — nothing is hand-authored:
 | block background fills (`he_bfill_*`)    | `OP fill` / `OP rrect`| GPU    |
 | image boxes (`he_seg_img>=0`)            | `OP fill` (sampled)   | GPU    |
 | bordered boxes (`htmlpage_border_*`)     | `OP line` ×4 edges    | GPU    |
-| text runs (segments)                     | `OP glyph`            | CPU    |
+| text runs (segments)                     | `OP covmask`          | GPU    |
 
 Colors are real: backgrounds/text use `he_bfill_rgb`/`he_seg_rgb`; borders use
 the actually-painted top-edge pixel. Text runs are emitted **last** (topmost
@@ -49,41 +50,60 @@ paint order). The 32-bit RGBA op colors (`#rrggbbaa`) are distinct from the
 24-bit `_o_hexcol` proof lines the existing gates parse, so those gates are
 unaffected (op lines only appear with `dumpops`).
 
+#### OP_COV_MASK — real anti-aliased text on the GPU
+
+A text run's true per-pixel AA coverage is the exact bitmap `font_ttf`'s
+rasterizer produced. To recover it the driver **re-renders each run's glyphs**
+(via the same `htmlpaint_text_ttf` the page painter uses — same face/size
+mapping, baseline and faux-oblique shear) into a scratch RGBA target painted
+**black-on-white**: `_blend_px` writes `255-cov` per channel, so
+`coverage = 255 - red` — the rasterizer's coverage, exactly, with the internal
+page framebuffer untouched (target redirection only swaps a pointer). The
+coverage is trimmed to its ink bounding box and emitted as:
+
+```
+OP covmask x y w h #rrggbbaa <nbytes>
+<nbytes*2 hex chars — one 8-bit coverage per pixel, row-major, wrapped 64 B/line>
+```
+
+The colour alpha is `ff` (opaque); the **mask carries the per-pixel alpha**. The
+bridge reads the `nbytes` hex bytes after the header (whitespace-skipping), packs
+every run's coverage end-to-end into the `src[]` SSBO (one value per uint), and
+dispatches `OP_COVMASK` on the compute shader: for each pixel it reads
+`cov = src[mask_off + (Y-py)*w + (X-px)]` and blends `colour` by `a*cov/255`
+(src-over) — the **identical** integer math the CPU oracle runs, so the GPU
+readback is byte-for-byte the oracle image.
+
 ### Ingestion (`scripts/vk_hostgpu_bridge.c` → `mode_pagefromops`)
 
 Parses the op stream, maps it onto the same `vk_2d` op vocabulary
-(`OP_FILL`/`OP_FILL_ALPHA`/`OP_ROUNDRECT`/`OP_LINE`) that `pageraster` uses, and:
+(`OP_FILL`/`OP_FILL_ALPHA`/`OP_ROUNDRECT`/`OP_LINE`/`OP_COVMASK`) that `pageraster`
+uses, and:
 
-1. Records the **GPU-capable box ops** onto the RTX 3090 compute pipeline, one
-   dispatch per op with barriers, in a timed submit loop; reads the SSBO back.
-2. Applies the **`glyph` (text) ops on the CPU** over the GPU result, in file
-   order (they were emitted last ⇒ topmost). See fallback note below.
-3. Runs a **CPU oracle** over the identical op stream and byte-verifies the two
+1. Records **every op — boxes AND text coverage masks** — onto the RTX 3090
+   compute pipeline, one dispatch per op with barriers, in file order (text last
+   ⇒ topmost), in a timed submit loop; reads the SSBO back.
+2. Runs a **CPU oracle** over the identical op stream and byte-verifies the two
    images (RGB): `PAGEFROMOPS_GPUvsCPUport_MISMATCH` must be 0.
 
-The GPU shader ops are bit-exact integer twins of the CPU ops, so the box paint
-matches to the byte; the glyph ops are the same CPU code in both paths.
+Every GPU shader op — including `OP_COVMASK` — is a bit-exact integer twin of the
+CPU op, so the whole page (backgrounds, borders **and text**) matches to the byte.
 
-## Honest fallback: text runs
+## Text runs now on the GPU (was: honest CPU fallback)
 
-Text runs are the one thing the bridge cannot yet do on the GPU: **true
-per-glyph anti-aliased coverage is not a GPU op** in this vocabulary. They are:
-
-- emitted as `OP glyph` = the run's measured ink extent, at ~63% alpha to
-  approximate average glyph density (a coverage box, **not** real glyph shapes);
-- rasterized on the **CPU** (`glyph_cpu_ops` in the report), never faked as GPU.
-
-The report prints the split explicitly, e.g. for the fidelity article:
+Text is no longer a CPU fallback: the `OP_COV_MASK` op (above) uploads each run's
+**true per-glyph AA coverage** and blends it in the compute shader, so real
+anti-aliased glyphs composite on the RTX 3090. The report:
 
 ```
-PAGEFROMOPS_OK ... ops=80 gpu_ops=42 glyph_cpu_ops=38 gpu_frames=2231 order_grouped=1
+PAGEFROMOPS_OK ... ops=82 gpu_ops=82 glyph_cpu_ops=0 text_gpu_ops=40 gpu_frames=1899 order_grouped=1
 PAGEFROMOPS_GPUvsCPUport_MISMATCH 0
 ```
 
-So **42 box ops** (page/element backgrounds, rounded rects, and every one of the
-40 table-cell/border strokes) rasterized on the RTX 3090; **38 text runs** fell
-back to CPU. A future `OP_COV_MASK` glyph op (upload per-glyph AA coverage masks
-and blend them in the compute shader) would move text onto the GPU too.
+All **82 ops** (page/element backgrounds, rounded rects, every table-cell/border
+stroke, and all **40 text runs** as coverage masks) rasterized on the RTX 3090;
+`glyph_cpu_ops=0`. The legacy flat `OP glyph` box path is still parsed (routed to
+`OP_FILL_ALPHA`) for backward compatibility, but the driver emits `OP covmask`.
 
 ## Verification
 
@@ -92,20 +112,20 @@ and blend them in the compute shader) would move text onto the GPU too.
 - compiles the driver (frozen Adder seed), renders the fixture, dumps ops;
 - GPU-rasterizes via `pagefromops` for 3s so **nvidia-smi** observes the bridge
   pid resident on the GPU;
-- asserts `MISMATCH 0`, a **discrete-NVIDIA** device was selected, and `gpu_ops>0`;
+- asserts `MISMATCH 0`, a **discrete-NVIDIA** device was selected, `gpu_ops>0`,
+  and **all text runs moved to the GPU** (`text_gpu_ops>0`, `glyph_cpu_ops==0`);
 - regression-checks that the proven `pageraster` path still byte-matches;
 - **SKIPs cleanly (exit 0)** when the Adder compiler, libvulkan, gcc, the shader
   SPIR-V, or a real (non-llvmpipe) Vulkan device is absent.
 
-Measured on the RTX 3090 (host-visible SSBO): GPU ~1.10 ms vs CPU ~1.23 ms per
+Measured on the RTX 3090 (host-visible SSBO): GPU ~1.28 ms vs CPU ~1.41 ms per
 888×1126 frame (~1.1×; small op counts on a PCIe-mapped buffer — the win grows
 with op count/resolution, cf. `rasterbench`). The result is the browser's real
-box paint executing on the discrete GPU, byte-identical to the CPU oracle.
+page paint — backgrounds, borders **and anti-aliased text** — executing on the
+discrete GPU, byte-identical to the CPU oracle.
 
 ## What remains toward full live DE/browser-on-GPU
 
-- **GPU glyphs** — an `OP_COV_MASK` op (per-glyph AA coverage upload + blend in
-  the shader) to move the 38 text ops off the CPU.
 - **Real image texels** — image boxes are currently reduced to a sampled solid
   color; a real `blit` of decoded image pixels (the bridge already has the blit
   op) would render photos on the GPU.

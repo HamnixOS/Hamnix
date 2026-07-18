@@ -1003,8 +1003,10 @@ typedef struct {
     uint32_t rgba;
     int32_t  px, py, pw, ph, rad, corners;
     int32_t  dx, dy, rsx, rsy, rsw, rsh, tw, th, src_w, src_h;
+    int32_t  mask_off;      /* OP_COV_MASK: base offset (in uints) into src[] */
 } PushC;
-enum { OP_FILL=0, OP_FILL_ALPHA=1, OP_BLIT=2, OP_ROUNDRECT=3, OP_LINE=4 };
+enum { OP_FILL=0, OP_FILL_ALPHA=1, OP_BLIT=2, OP_ROUNDRECT=3, OP_LINE=4,
+       OP_COVMASK=5 };
 
 /* ---- CPU reference port of the vk_2d ops (byte-identical integer math) ---- */
 static inline void cpu_blend_at(uint8_t* p, uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
@@ -1551,6 +1553,29 @@ static void pr_gpu_roundrect(int x,int y,int w,int h,int rad,int corners,uint32_
     pc.px=x; pc.py=y; pc.pw=w; pc.ph=h; pc.rad=rr; pc.corners=corners;
     pr_push(pc, px1-px0, py1-py0);
 }
+/* AA glyph coverage-mask blend. bx/by = clamped dispatch origin, px/py/pw/ph =
+ * the (unclamped) mask bbox origin+size so the shader indexes the mask by
+ * (X-px, Y-py); mask_off locates this run's coverage bytes in src[]. */
+static void pr_gpu_covmask(int x,int y,int w,int h,uint32_t rgba,int mask_off){
+    if (w<=0||h<=0||(rgba&0xFF)==0) return;
+    int px0=x<0?0:x,px1=x+w>PR_W?PR_W:x+w,py0=y<0?0:y,py1=y+h>PR_H?PR_H:y+h;
+    if (px0>=px1||py0>=py1) return;
+    PushC pc={0}; pc.op=OP_COVMASK; pc.rgba=rgba; pc.bx=px0; pc.by=py0;
+    pc.px=x; pc.py=y; pc.pw=w; pc.ph=h; pc.mask_off=mask_off;
+    pr_push(pc, px1-px0, py1-py0);
+}
+/* CPU oracle twin of the OP_COVMASK shader path — byte-identical integer math. */
+static void pr_cpu_covmask(uint8_t* img,int x,int y,int w,int h,uint32_t rgba,
+                           const uint8_t* mask){
+    if (w<=0||h<=0) return;
+    uint32_t r=(rgba>>24)&0xFF,g=(rgba>>16)&0xFF,b=(rgba>>8)&0xFF,a=rgba&0xFF;
+    int x0=x<0?0:x,y0=y<0?0:y,x1=x+w>PR_W?PR_W:x+w,y1=y+h>PR_H?PR_H:y+h;
+    for (int yy=y0;yy<y1;yy++) for (int xx=x0;xx<x1;xx++){
+        uint32_t cov=mask[(yy-y)*w+(xx-x)];
+        uint32_t ae=a*cov/255;
+        pr_blend_at(img+(yy*PR_W+xx)*4, r,g,b,ae);
+    }
+}
 
 /* Two dispatch back-ends over the same op stream: GPU (record+submit) and the
  * CPU oracle. Called with distinct fn pointers so the scene is authored ONCE. */
@@ -1764,8 +1789,9 @@ static int mode_pageraster(int W, int H, const char* out, double seconds) {
  * still owns. Text runs are emitted LAST by the driver (topmost paint order),
  * so applying the deferred CPU glyph pass after the GPU box pass preserves the
  * exact stacking order the CPU oracle uses -> byte-identical. */
-enum { PK_FILL=0, PK_AFILL=1, PK_RRECT=2, PK_LINE=3, PK_GLYPH=4 };
-typedef struct { int kind, a,b,c,d,e,f; uint32_t rgba; } POp;
+enum { PK_FILL=0, PK_AFILL=1, PK_RRECT=2, PK_LINE=3, PK_GLYPH=4, PK_COVMASK=5 };
+typedef struct { int kind, a,b,c,d,e,f; uint32_t rgba;
+                 uint8_t* mask; int maskoff; } POp;
 #define PFO_MAXOPS 65536
 
 /* parse "#rrggbbaa" (or bare 8-hex) into 0xRRGGBBAA. */
@@ -1774,15 +1800,34 @@ static uint32_t parse_rgba(const char* s) {
     return (uint32_t)strtoul(s, 0, 16);
 }
 
+/* Read one hex-encoded byte from the op stream, skipping any whitespace/newline
+ * between digits — used for OP_COV_MASK glyph coverage payloads (which are
+ * emitted as wrapped hex lines after the covmask header). */
+static int pfo_hexnyb(int c){
+    if (c>='0'&&c<='9') return c-'0';
+    if (c>='a'&&c<='f') return c-'a'+10;
+    if (c>='A'&&c<='F') return c-'A'+10;
+    return -1;
+}
+static int pfo_read_hex_byte(FILE* f){
+    int c, hi, lo;
+    do { c=fgetc(f); } while (c!=EOF && pfo_hexnyb(c)<0);
+    if (c==EOF) return 0;
+    hi=pfo_hexnyb(c);
+    do { c=fgetc(f); } while (c!=EOF && pfo_hexnyb(c)<0);
+    lo = (c==EOF) ? 0 : pfo_hexnyb(c);
+    return (hi<<4) | (lo<0?0:lo);
+}
+
 static int mode_pagefromops(const char* opsfile, const char* out, double seconds) {
     FILE* f = fopen(opsfile, "r");
     if (!f) { fprintf(stderr,"[vk_hostgpu] pagefromops: cannot open %s\n", opsfile); return -1; }
     static POp ops[PFO_MAXOPS];
     int nops=0, W=0, H=0, order_ok=1, seen_glyph=0;
-    long n_gpu=0, n_glyph=0;
+    long n_gpu=0, n_glyph=0, n_textgpu=0;
     char line[256];
     while (fgets(line, sizeof line, f)) {
-        int x,y,w,h,rad,corners,thick; char col[32];
+        int x,y,w,h,rad,corners,thick,nbytes; char col[32];
         if (sscanf(line, "PAGEOPS %d %d", &W, &H)==2) continue;
         if (!strncmp(line,"ENDOPS",6)) break;
         if (nops>=PFO_MAXOPS) { fprintf(stderr,"[vk_hostgpu] pagefromops: op overflow\n"); break; }
@@ -1803,6 +1848,19 @@ static int mode_pagefromops(const char* opsfile, const char* out, double seconds
             ops[nops].a=x;ops[nops].b=y;ops[nops].c=w;ops[nops].d=h;
             ops[nops].e=thick;ops[nops].rgba=parse_rgba(col);
             if (seen_glyph) order_ok=0; n_gpu++; nops++;
+        } else if (sscanf(line, "OP covmask %d %d %d %d %31s %d",
+                          &x,&y,&w,&h, col, &nbytes)==6) {
+            /* AA glyph coverage mask: header, then `nbytes` (== w*h) hex bytes
+             * of 8-bit per-pixel coverage over the tight ink bbox. Runs on the
+             * GPU via OP_COVMASK — REAL anti-aliased text on the device. */
+            long mcap = (long)w*h > 0 ? (long)w*h : 1;
+            uint8_t* m = (uint8_t*)malloc((size_t)mcap);
+            for (int k=0;k<nbytes;k++){ int bval=pfo_read_hex_byte(f);
+                if (k < mcap) m[k]=(uint8_t)bval; }   /* clamp vs malformed nbytes */
+            ops[nops].kind=PK_COVMASK;
+            ops[nops].a=x;ops[nops].b=y;ops[nops].c=w;ops[nops].d=h;
+            ops[nops].rgba=parse_rgba(col); ops[nops].mask=m;
+            seen_glyph=1; n_gpu++; n_textgpu++; nops++;
         } else if (sscanf(line, "OP glyph %d %d %d %d %31s", &x,&y,&w,&h, col)==5) {
             ops[nops].kind=PK_GLYPH;
             ops[nops].a=x;ops[nops].b=y;ops[nops].c=w;ops[nops].d=h;ops[nops].rgba=parse_rgba(col);
@@ -1818,14 +1876,27 @@ static int mode_pagefromops(const char* opsfile, const char* out, double seconds
     uint32_t* spv = read_spv("scripts/shaders/vk2d_raster.comp.spv", &spvsz);
     if (!spv) return -1;
     VkDeviceSize dstsz=(VkDeviceSize)W*H*4;
-    int SW=4, SH=4; VkDeviceSize srcsz=(VkDeviceSize)SW*SH*4;  /* unused-but-bound src */
-    uint8_t* sprite=calloc(srcsz,1);
+
+    /* src[] SSBO carries every OP_COV_MASK run's AA coverage, one 8-bit value
+     * per uint (packed one-per-uint so the shader byte-reads it directly),
+     * laid end-to-end; each covmask op's maskoff points at its slice. */
+    long cov_total=0;
+    for (int i=0;i<nops;i++) if (ops[i].kind==PK_COVMASK) cov_total += (long)ops[i].c*ops[i].d;
+    if (cov_total < 4) cov_total = 4;                 /* keep the buffer non-empty */
+    VkDeviceSize srcsz=(VkDeviceSize)cov_total*4;
+    uint32_t* covvals=(uint32_t*)calloc((size_t)cov_total,4);
+    { long off=0;
+      for (int i=0;i<nops;i++) if (ops[i].kind==PK_COVMASK) {
+          long n=(long)ops[i].c*ops[i].d; ops[i].maskoff=(int)off;
+          for (long k=0;k<n;k++) covvals[off+k]=ops[i].mask[k];
+          off+=n;
+      } }
 
     VkBuffer dbuf,sbuf; VkDeviceMemory dmem,smem;
     if (make_storagebuf(dstsz,&dbuf,&dmem)) return -1;
     if (make_storagebuf(srcsz,&sbuf,&smem)) return -1;
     void* map; CK(vkMapMemory(g_dev,smem,0,srcsz,0,&map));
-    memcpy(map,sprite,srcsz); vkUnmapMemory(g_dev,smem);
+    memcpy(map,covvals,srcsz); vkUnmapMemory(g_dev,smem);
     /* zero the destination SSBO (page starts transparent; op 0 paints paper). */
     CK(vkMapMemory(g_dev,dmem,0,dstsz,0,&map)); memset(map,0,dstsz); vkUnmapMemory(g_dev,dmem);
 
@@ -1853,7 +1924,9 @@ static int mode_pagefromops(const char* opsfile, const char* out, double seconds
         {.sType=ST_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&sbi}};
     vkUpdateDescriptorSets(g_dev,2,wr,0,0);
 
-    /* build the GPU op list from the GPU-capable (box) ops, in file order. */
+    /* build the GPU op list — ALL ops (boxes AND glyph coverage masks) in file
+     * order, so the paint stacking (text last => topmost) is exact and the whole
+     * page, text included, rasterizes on the GPU. */
     pr_nops=0;
     for (int i=0;i<nops;i++){
         POp* o=&ops[i];
@@ -1861,7 +1934,9 @@ static int mode_pagefromops(const char* opsfile, const char* out, double seconds
         else if (o->kind==PK_AFILL) pr_gpu_fill(OP_FILL_ALPHA, o->a,o->b,o->c,o->d, o->rgba);
         else if (o->kind==PK_RRECT) pr_gpu_roundrect(o->a,o->b,o->c,o->d, o->e,o->f, o->rgba);
         else if (o->kind==PK_LINE)  pr_gpu_line(o->a,o->b,o->c,o->d, o->e, o->rgba);
-        /* PK_GLYPH deferred to the CPU fallback pass below */
+        else if (o->kind==PK_COVMASK) pr_gpu_covmask(o->a,o->b,o->c,o->d, o->rgba, o->maskoff);
+        else if (o->kind==PK_GLYPH) { /* legacy flat glyph box (no covmask stream) */
+            pr_gpu_fill(OP_FILL_ALPHA, o->a,o->b,o->c,o->d, o->rgba); }
     }
 
     VkMemoryBarrier mb={ .sType=ST_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,
@@ -1889,14 +1964,12 @@ static int mode_pagefromops(const char* opsfile, const char* out, double seconds
         if (seconds<=0 && it>=199) break;
     }
 
-    /* readback GPU box-op result, then apply the CPU-fallback glyph pass on it
-     * (text runs, in file order — they were emitted last => topmost). */
+    /* readback the GPU result — the FULL page (backgrounds, borders AND text)
+     * is now rasterized on the GPU, so this is the device image as-is. */
     CK(vkMapMemory(g_dev,dmem,0,dstsz,0,&map));
     uint8_t* gpix=(uint8_t*)map;
     uint8_t* gimg=malloc(dstsz); memcpy(gimg,gpix,dstsz);
     vkUnmapMemory(g_dev,dmem);
-    for (int i=0;i<nops;i++) if (ops[i].kind==PK_GLYPH)
-        pr_cpu_fill_alpha(gimg, ops[i].a,ops[i].b,ops[i].c,ops[i].d, ops[i].rgba);
 
     /* CPU oracle: the IDENTICAL op stream, all on the CPU, in file order. */
     uint8_t* cbuf=calloc((size_t)W*H,4);
@@ -1911,6 +1984,7 @@ static int mode_pagefromops(const char* opsfile, const char* out, double seconds
             else if (o->kind==PK_AFILL||o->kind==PK_GLYPH) pr_cpu_fill_alpha(cbuf, o->a,o->b,o->c,o->d, o->rgba);
             else if (o->kind==PK_RRECT) pr_cpu_roundrect(cbuf, o->a,o->b,o->c,o->d, o->e,o->f, o->rgba);
             else if (o->kind==PK_LINE)  pr_cpu_line(cbuf, o->a,o->b,o->c,o->d, o->e, o->rgba);
+            else if (o->kind==PK_COVMASK) pr_cpu_covmask(cbuf, o->a,o->b,o->c,o->d, o->rgba, o->mask);
         }
         double ms=now_ms()-t0;
         if (ms<cpu_best) cpu_best=ms;
@@ -1922,15 +1996,17 @@ static int mode_pagefromops(const char* opsfile, const char* out, double seconds
     write_ppm(out,gimg,W,H);
 
     printf("VK_DEVICE %s\n", g_devname);
-    printf("PAGEFROMOPS_OK %s %dx%d ops=%d gpu_ops=%ld glyph_cpu_ops=%ld gpu_frames=%d order_grouped=%d\n",
-           out, W, H, nops, n_gpu, n_glyph, frames, order_ok);
+    printf("PAGEFROMOPS_OK %s %dx%d ops=%d gpu_ops=%ld glyph_cpu_ops=%ld text_gpu_ops=%ld gpu_frames=%d order_grouped=%d\n",
+           out, W, H, nops, n_gpu, n_glyph, n_textgpu, frames, order_ok);
     printf("PAGEFROMOPS_GPU_MS %.4f\nPAGEFROMOPS_SW_MS %.4f\nPAGEFROMOPS_SPEEDUP %.2fx\n",
            gpu_best, cpu_best, cpu_best/gpu_best);
     printf("PAGEFROMOPS_GPUvsCPUport_MISMATCH %ld", mism);
     if (first>=0) printf(" first@%ld,%ld", first%W, first/W);
     printf("\n");
 
-    free(gimg); free(cbuf); free(sprite);
+    for (int i=0;i<nops;i++) if (ops[i].mask) free(ops[i].mask);
+    free(covvals);
+    free(gimg); free(cbuf);
     vkDestroyDescriptorPool(g_dev,dpool,0); vkDestroyPipeline(g_dev,pipe,0);
     vkDestroyPipelineLayout(g_dev,playout,0); vkDestroyDescriptorSetLayout(g_dev,dsl,0);
     vkDestroyShaderModule(g_dev,module,0);
