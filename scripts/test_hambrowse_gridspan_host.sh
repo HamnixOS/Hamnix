@@ -48,8 +48,10 @@ D="$OUT/gridspan.txt"
 
 seg_row() { grep -E "SEG [0-9]+ [0-9]+ .*\|$1\|" "$D" | awk '{print $2}' | head -1; }
 seg_x()   { grep -E "SEG [0-9]+ [0-9]+ .*\|$1\|" "$D" | awk '{print $3}' | head -1; }
-# A uniquely-coloured FILL box "FILL top bot lx rx #color" -> "$1"=field index.
-fill_uniq() { grep -E "^FILL .* $2\$" "$D" | awk -v f="$1" '{print $f}' | head -1; }
+# A uniquely-coloured FILL box "FILL top bot lx rx #color <radius>" -> "$1"=field
+# index. Match the colour at field $6 (NOT end-of-line: round-10 border-radius
+# appends a trailing radius field, so the colour is no longer the last token).
+fill_uniq() { awk -v f="$1" -v c="$2" '$1=="FILL" && $6==c{print $f; exit}' "$D"; }
 
 # ---- (A) grid-column: span 2 hero over a repeat(3,1fr) dashboard --------------
 HLX=$(fill_uniq 4 "#ffeeaa"); HRX=$(fill_uniq 5 "#ffeeaa")   # hero box left/right
@@ -72,7 +74,8 @@ fi
 hr=$(seg_row Hero); bvr=$(seg_row Bravo); bvx=$(seg_x Bravo)
 cr=$(seg_row Charlie); dr=$(seg_row Delta); er=$(seg_row Echo)
 echo "[hb-gridspan] dash rows: Hero=$hr Bravo=$bvr(x$bvx) | Charlie=$cr Delta=$dr Echo=$er"
-if [ -n "$hr" ] && [ "$bvr" = "$hr" ] && [ "$bvx" -gt "$HRX" ] && \
+if [ -n "$hr" ] && [ -n "$bvx" ] && [ -n "$HRX" ] && [ "$bvr" = "$hr" ] && \
+   [ "$bvx" -gt "$HRX" ] && \
    [ "$cr" = "$dr" ] && [ "$dr" = "$er" ] && [ "$cr" -gt "$hr" ]; then
     echo "[hb-gridspan] PASS auto-flow: sibling fills track2 beside the hero, next 3 wrap below"
 else
@@ -110,7 +113,8 @@ else
 fi
 # auto-flow after an explicit span: Side keeps the SAME row at the 4th track, and
 # the remaining items wrap to the next row.
-if [ -n "$banr" ] && [ "$sidr" = "$banr" ] && [ "$sidx" -ge "$BRX" ] && [ "$bodr" -gt "$banr" ]; then
+if [ -n "$banr" ] && [ -n "$sidx" ] && [ -n "$BRX" ] && [ "$sidr" = "$banr" ] && \
+   [ "$sidx" -ge "$BRX" ] && [ "$bodr" -gt "$banr" ]; then
     echo "[hb-gridspan] PASS auto-flow resumes after the banner (Side at track3 same row, Body wraps)"
 else
     echo "[hb-gridspan] FAIL auto-flow after explicit span (Banner r$banr Side r$sidr Body r$bodr)"; fail=1
