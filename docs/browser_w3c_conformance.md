@@ -69,7 +69,7 @@ From a 14-agent parallel audit (2026-07-16). Dual-target, host-iterated (~40 gat
 
 | Area | Coverage | Gaps | High |
 |---|---:|---:|---:|
-| css-backgrounds-borders | 38% | 8 | 3 |
+| css-backgrounds-borders | 55% | 6 | 1 |
 | css-grid | 38% | 11 | 4 |
 | html-forms | 48% | 9 | 2 |
 | html5-parsing | 32% | 10 | 3 |
@@ -199,15 +199,60 @@ the passing host gates found the following.
   (filtering what is BEHIND the element) is a distinct feature, still absent. The filter runs only on the
   host render-to-PNG framebuffer path (a no-op when draws are redirected to an external RGBA target).
 
-**TOP REMAINING W3C GAPS after the 2026-07-18c CSS-filter round (a map for the next/round-4 agent, roughly by
+**TRUE PER-SIDE BORDERS ROUND 2026-07-18d (the #1 remaining CSS gap above, host-verified):**
+- **[css-backgrounds-borders §4] true per-side border WIDTH + STYLE (NEW, gate `borderside`).** Previously a CSS
+  border was a single UNIFORM 1px stroke — one width, one style — so a `border-bottom:2px solid` tab underline, a
+  thick coloured accent side, or a dashed frame ALL collapsed to the same thin solid rectangle (the round-3
+  audit's #1 CSS hole). Now `lib/web/css/cascade.ad` parses **`border-top`/`-right`/`-bottom`/`-left`** (and each
+  `-width`/`-style`/`-color` longhand) plus the **`border-width`/`border-style` TRBL shorthands** (1..4 values,
+  CSS top/right/bottom/left expansion) into two PACKED ints — `d_bordps` (8 bits/side width, `top | right<<8 |
+  bottom<<16 | left<<24`, 0..120px) and `d_bordss` (4 bits/side style, `code+1` where 0 solid / 1 dashed / 2
+  dotted / 3 double / 4 none). They ride the cascade/rule machinery as ONE parallel property pair (`r_bordps`/
+  `r_bordss` + a shared `sbps` specificity slot → `m_bordps`/`m_bordss`, inline `d_` wins over sheet `m_` exactly
+  like `d_bordc`), flow through the layout record set (`bbox_ps`/`bbox_ss` in `layout/box.ad`, emitted at block/
+  float close alongside `bbox_rgb`), and `lib/htmlpage.ad` (`_hpg_paint_border_sides`/`_hpg_edge_h`/`_hpg_edge_v`)
+  paints **FOUR INDEPENDENT EDGES** — each its own thickness and solid/dashed/dotted/double pattern (dashed/dotted
+  = repeated `fill_rect` segments with an equal gap; double = two thin rules + a gap; none = skipped side).
+  Cross-rule/decl composition works within a block: a uniform `border:2px solid` seeds all four sides so a
+  following `border-bottom:5px dashed` overrides only the bottom (`_seed_sides_from_uniform`). Verified HOST-ONLY
+  render-to-PNG (`test_hambrowse_borderside_host.sh`, fixture `hambrowse_borderside.html`, 18 pixel asserts via the
+  gfx driver's arbitrary-pixel sampler): a box with a **12px left edge vs a 2px top edge** (ink 9px into the left,
+  paper 2px past the top — distinct widths), a box with a **6px DASHED bottom vs a SOLID top** (bottom alternates
+  ink/paper along its length, top stays continuous ink — dashed != solid), a uniform **`border:3px dashed`**
+  showing an ink dash AND a paper gap on one edge, and a **`border-width:2px 10px 2px 10px`** TRBL shorthand
+  giving a 10px left / 2px top. **ZERO REGRESSION proof:** a plain uniform `border:Npx solid` keeps `d_bordps==0`
+  and stays on the legacy 1px `stroke_round_rect` path — **all 163 existing hambrowse fixtures render BYTE-IDENTICAL
+  (ppm + display-list dump) between base and this change**; the pre-existing `border` gate stays green.
+  **HONEST SCOPE / LIMITATIONS:** (1) per-side COLOURS are NOT yet modelled — the box carries ONE (uniform) border
+  colour (`bbox_rgb`); the last `border-*-color` token wins for all four sides (the common single-accent-side
+  pattern e.g. `border-bottom:2px solid #ccc` is correct because only one side is present, but a red-top/blue-bottom
+  box paints one colour). (2) A uniform thick SOLID border (`border:5px solid`) still renders as the legacy 1px
+  stroke (kept on the legacy path deliberately, for byte-identical regression); only a NON-solid uniform style
+  (dashed/dotted/double) or an actual per-side longhand routes to the multi-px per-side painter. (3) Border widths
+  are clamped to 0..120px (keeps the packed int positive, dodging the signed-`>>` quirk). (4) `border-radius` is
+  honoured only on the legacy uniform stroke — a per-side-bordered box paints square corners (the four edges are
+  axis-aligned fills; a rounded per-side border needs arc-segment stroking, deferred). (5) `groove`/`ridge`/
+  `inset`/`outset` are accepted but rendered as `solid` (no 3-D bevel model). (6) Dashed/dotted dash lengths are a
+  fixed heuristic (dash = 2×width, dot = 1×width, equal gaps), not the browser's exact dash algorithm.
+
+**TOP REMAINING W3C GAPS after the 2026-07-18d per-side-border round (a map for the next/round-5 agent, roughly by
 real-world value — the browser is now broad but NOT "fully W3C-implemented"; these are the concrete holes):**
-1. **[css-box] true per-side border WIDTH/STYLE** (thick/dashed/dotted, distinct per-side widths+colours) —
-   borders still render a fixed 1px frame; **margin vs padding box-edge separation** is still summed into one
-   inset (worklist below). Now the highest-value CSS hole after `filter` (cards/tables/callouts). Paint-layer +
-   cascade work; `border-radius`/`box-shadow`/`filter` all show the parallel-property + paint-pass pattern.
-2. **[html-forms] specialized input types** (email/number/date/range/color/checkbox/radio/password) degrade to
-   plain text (live-worklist #15) — rendering + `type`-specific glyph/box; **`new FormData(formElement)`
-   DOM-scrape** + Blob/File values (the other half of #10). High real-world value (every form).
+1. **[html-forms] `new FormData(formElement)` DOM-scrape + specialized input-type SHAPES.** Two halves:
+   (a) `new FormData(formEl)` currently only scrapes a plain OBJECT's keys (`builtins/url.ad` `NAT_FORMDATA`); a
+   DOM `<form>` element is NOT scraped. The reusable scraper ALREADY EXISTS — `lib/web/dom/canvas.ad`
+   `_serialize_form`/`_serialize_field` (iterates `input`/`select`/`textarea` with a `name`, honours checkbox/
+   radio `checked`, skips submit/reset/button) drives `form.submit()`. Round-5 path: a DOM-layer hook that, when
+   the FormData ctor arg is a DOM element, walks that form's controls and appends name→value into the `@@k/@@v`
+   multimap (mind the JS-engine↔DOM layering — the ctor lives in the extern-free engine, the scrape in the DOM
+   layer). (b) input-type VISUALS are already broad (checkbox `[x]`/`[ ]`, radio `(*)`/`( )`, password masking as
+   a real field box, email/number/text as field boxes, file/range/color/submit affordances in `dom/forms.ad`
+   `_emit_input`) — the remaining gap is PIXEL SHAPE: checkbox/radio still paint their ASCII glyphs, not a real
+   drawn square / circle with a checked mark (a new field-seg kind + a htmlpage shape painter, like the password
+   field box). High real-world value (every form).
+2. **[css-backgrounds-borders §4] per-side border COLOURS + rounded per-side corners** — the natural follow-on to
+   this round: add four colour slots (`bbox_rgb_t/r/b/l`) so `border-top:red;border-bottom:blue` paints distinctly,
+   and arc-segment stroking so a per-side border honours `border-radius`. Moderate (the per-side width/style
+   plumbing is now the template; colour needs 4 cascade slots vs the 2 packed ints used here).
 3. **[ecmascript] RegExp `u`/`v` Unicode mode — ABSENT (byte-oriented VM).** `\u{...}` code-point classes,
    surrogate handling, `\p{...}` property escapes. Hard (VM rewrite); moderate value.
 4. **[css-grid] named `grid-template-areas`/`grid-area`, `grid-auto-flow:dense`/column, subgrid, >8 tracks**
