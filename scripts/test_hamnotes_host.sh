@@ -83,6 +83,12 @@ assert_grep '^TITLE_LEN 9'                       "title field holds \"Groceries\
 # Body script types "Buy milk\nCall Sam" then one backspace -> 16 chars.
 assert_grep '^LEN1 16'                          "typed body + backspace edit gives 16 chars"
 assert_grep '^DIRTY 1'                          "buffer marked dirty after edits"
+assert_grep '^WORDS 4'                          "word count = 4 for \"Buy milk Call Sa\""
+
+# --- live word/char count readout in the status bar (SCENE = reloaded note-0) -
+# The dumped scene is the RELOAD render: note-0 body "Buy milk\\nCall Sa" =
+# 4 words / 16 chars, drawn right-aligned in the toolbar strip.
+assert_grep 'glyphs .*\"4 words  16 chars\"'    "status-bar word/char count rendered"
 assert_grep 'glyphs .*\"Buy milk\"'             "first body line rendered"
 assert_grep 'glyphs .*\"Call Sa\"'             "second body line rendered (backspaced)"
 
