@@ -107,6 +107,25 @@ the passing host gates found the following.
   grow/shrink/basis now read from the CASCADE winner (class/stylesheet rules) AND inline style (inline
   overrides per-property) — `box.ad _flex_grow_scan` calls `cascade.ad _flx_child_cascade` per item.
   Boundary: min-content clamp floors at 0 (frozen-item iteration deferred); single-level only (nested-flex deferred).
+- css-flexbox / css-text / css-box (on-device QA fixes, DONE 2026-07-18, gate `flexwrap_qa` — render-to-PNG):
+  three REAL defects found by QA of a realistic article/landing page. (1) **Flex-item inline text now WRAPS
+  to the item's OWN resolved content-box width.** The flex nowrap guard (`g_flex_nowrap_depth`) was armed for
+  EVERY natural-path item, so a `flex:1` card shrunk below its body sentence laid one line that bled across
+  and PAST the card's right border (multi-column card grids). It is now armed ONLY for a CONTENT-SIZED pill
+  (resolved track ≥ its measured max-content) — recorded per box in `box_flexnowrap_stack` (`layout/box.ad`),
+  set/cleared at the flex-item open/close (`dom/forms.ad`); a shrunk card is left unarmed so its text reflows
+  inside the card, while the nav-pill nowrap (proportional "Log in" not splitting) is preserved (`flexmin`
+  stays green). (2) **`display:flex; gap:Npx` with NO justify-content now PACKS at flex-start with the gap**
+  instead of falling through to the equal-column approximation (which ignored the gap AND spread the items
+  edge-to-edge) — `_flex_container_open` takes the natural flex-start packing path when a `gap`/`column-gap`
+  (or an explicit justify) is set and the items fit (`layout/box.ad`). (3) **A margin-less structural block
+  (`<div>`/`<section>`/… ) no longer emits a phantom paragraph gap on close** — only `<p>`/`<figure>` do, so
+  whitespace-only inline content between blocks generates no box and sibling containers stack flush per CSS
+  (`dom/forms.ad _hx_block_close(paragap)`); real CSS margins still apply via `ftop`/`botg`. Verified
+  HOST-ONLY render-to-PNG (`hb_flexwrap_qa_probe.py`): each card's text wraps to multiple rows with zero ink
+  past its border, a `gap:20px` nav packs 4 links with the ~20px gutter, and two whitespace-separated divs are
+  pixel-adjacent. Zero regressions across the flex/grid/box gates (`overflow`/`boxsizing`/`gridspan` row
+  assertions updated to the corrected tighter block stacking).
 - css-grid: `minmax()`, `repeat(auto-fill/auto-fit)`, PERCENTAGE tracks (`25% 75%`, resolved against the grid CONTAINER inline size) — `cascade.ad _grid_simple_track/_grid_one_track/_grid_parse_template`, tracks sized in `box.ad _grid_resolve_tracks`. Gates: `grid/gridr2/gridjustify/gridpng`.
 - css-selectors: attribute selectors (gate `attrsel`). css-positioning: `position:relative`/`absolute`/`z-index` (gate `position`), with `absolute` `right:`/`bottom:` offsets now anchoring the box's border-box edge to the containing block's padding-box right/bottom taken from the ancestor's LAID-OUT GEOMETRY (works for gradient/transparent/image/solid backgrounds alike, gate `abspos`); `position:sticky` static-pin + `position:fixed` viewport-pinning now RESOLVE, not just parse (gate `sticky`). CSS `float:left`/`right` (single + simultaneous left+right pair; gates `float`/`twofloat`) and now **`clear:left`/`right`/`both`** — a cleared block drops to the bottom edge of the float it clears instead of flowing beside it (gate `clear`).
 - dom: `Element.closest`/`matches` (`query.ad:841`, gate `matches`); arbitrary event types +

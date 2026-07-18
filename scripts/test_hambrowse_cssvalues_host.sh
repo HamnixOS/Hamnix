@@ -59,14 +59,14 @@ assert_grep 'SEG .* #0000ff .*hsla'   "hsla(240,100%,50%,.4) text -> blue (alpha
 # (B) Custom properties: colour token, length token, colour token on text, and
 # the undefined-token fallback.
 assert_grep 'FILL .* #2255aa'                    "var(--brand) colour token resolves"
-assert_grep 'FILL 6 7 100 276 #123456'           "var(--pad-w:160px) length token -> 176px box"
+assert_grep 'FILL 4 5 100 276 #123456'           "var(--pad-w:160px) length token -> 176px box"
 assert_grep 'SEG .* #663399 .*rebecca'           "var(--ink:rebeccapurple) colour token on text"
 assert_grep 'FILL .* #cc0000'                    "var(--missing, #cc0000) uses the fallback"
 
 # (C) calc(): a fixed sum (150px, centred) and a percentage difference
 # (100% of 584 - 200 = 384 -> 400px painted box).
-assert_grep 'FILL 12 13 317 483 #eeeeee'  "calc(100px + 50px)=150px, margin:auto centred"
-assert_grep 'FILL 14 15 100 500 #ff9900'  "calc(100% - 200px) percentage arithmetic"
+assert_grep 'FILL 8 9 317 483 #eeeeee'  "calc(100px + 50px)=150px, margin:auto centred"
+assert_grep 'FILL 9 10 100 500 #ff9900'  "calc(100% - 200px) percentage arithmetic"
 
 # The centred calc box's text must shift RIGHT of a full-width plain row.
 cx=$(grep -E 'SEG [0-9]+ [0-9]+ .*\|calc sum box'        "$D0" | awk '{print $3}' | head -1)
@@ -79,7 +79,7 @@ else
 fi
 
 # (D) rem, 8-digit hex, extended named colours.
-assert_grep 'FILL 16 17 100 276 #445566'  "width:10rem -> 160px (176px box)"
+assert_grep 'FILL 10 11 100 276 #445566'  "width:10rem -> 160px (176px box)"
 assert_grep 'FILL .* #112233'             "#11223344 8-digit hex -> #112233 (alpha dropped)"
 assert_grep 'FILL .* #4682b4'             "named colour steelblue -> #4682b4"
 
@@ -89,10 +89,10 @@ assert_grep 'FILL .* #4682b4'             "named colour steelblue -> #4682b4"
 #   max(200px, 40%=~233)      -> 233px  (x1 = 349)
 #   clamp(150px, 10%=~58, 400)-> 150px  (clamped up to the floor; x1 = 266)
 #   calc(min(100px,50px)+20px)-> 70px   (nested min in calc; x1 = 186)
-assert_grep 'FILL 24 25 100 416 #778899'  "min(100%, 300px) -> 300px width"
-assert_grep 'FILL 26 27 100 349 #99aabb'  "max(200px, 40%) -> 233px width"
-assert_grep 'FILL 28 29 100 266 #bbccdd'  "clamp(150px, 10%, 400px) -> 150px (floor)"
-assert_grep 'FILL 30 32 100 186 #ddeeff'  "calc(min(100px,50px)+20px) -> 70px (nested)"
+assert_grep 'FILL 15 16 100 416 #778899'  "min(100%, 300px) -> 300px width"
+assert_grep 'FILL 16 17 100 349 #99aabb'  "max(200px, 40%) -> 233px width"
+assert_grep 'FILL 17 18 100 266 #bbccdd'  "clamp(150px, 10%, 400px) -> 150px (floor)"
+assert_grep 'FILL 18 20 100 186 #ddeeff'  "calc(min(100px,50px)+20px) -> 70px (nested)"
 
 if [ "$fail" -ne 0 ]; then
     echo "[hb-cssvalues] RESULT: FAIL"; exit 1

@@ -98,7 +98,7 @@ fi
 BLX=$(fill_uniq 4 "#ddffdd"); BRX=$(fill_uniq 5 "#ddffdd")
 banw=$(( BRX - BLX ))
 # banner-shell row1 (Body/Note/Tail across tracks 0-2) FILL extents, sorted L->R.
-readarray -t S1 < <(awk '$1=="FILL" && $2==28 && $6=="#e8eefc"{print $4" "$5}' "$D" | sort -n)
+readarray -t S1 < <(awk '$1=="FILL" && $2==27 && $6=="#e8eefc"{print $4" "$5}' "$D" | sort -n)
 b0lx=$(echo "${S1[0]}" | awk '{print $1}')            # track0 left
 b2rx=$(echo "${S1[2]}" | awk '{print $2}')            # track2 right
 b0w=$(( $(echo "${S1[0]}" | awk '{print $2}') - b0lx ))

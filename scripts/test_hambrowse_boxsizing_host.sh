@@ -75,32 +75,32 @@ assert_grep '^BBOX 1 3 128 336 #cc0000' \
 # ---- (2) border-box: the declared 200px INCLUDES padding(40)+border(10), so the
 # content shrinks and the outer border box reaches only x=286 (exactly 50px
 # narrower than content-box). -------------------------------------------------
-assert_grep '^BBOX 7 10 128 286 #00aa00' \
+assert_grep '^BBOX 6 9 128 286 #00aa00' \
     "border-box outer border box is NARROW (rx=286, 50px = padding+border less)"
 
 # ---- (3) split-rule reset: `*{box-sizing:border-box}` sets the mode, a separate
 # class rule sets width/padding/border. The reduction must still fire -> NARROW
 # (rx=286), identical to the single-rule border-box box. -----------------------
-assert_grep '^BBOX 14 16 128 286 #0000cc' \
+assert_grep '^BBOX 12 14 128 286 #0000cc' \
     "*{box-sizing:border-box} reset reduces a width from a DIFFERENT rule (rx=286)"
 
 # ---- (4) an explicit box-sizing:content-box overrides the `*` reset -> WIDE
 # again (rx=336). --------------------------------------------------------------
-assert_grep '^BBOX 20 22 128 336 #aa00aa' \
+assert_grep '^BBOX 17 19 128 336 #aa00aa' \
     "box-sizing:content-box overrides the * reset (rx=336, WIDE)"
 
 # ---- (5) two border-box width:50% flex items TILE: item B opens exactly at
 # item A's right edge (x=404) and the row stays inside the content column. ------
-assert_grep '^BBOX 25 27 108 404 #333333' \
+assert_grep '^BBOX 21 23 108 404 #333333' \
     "flex border-box 50% item A occupies the left half (108..404)"
-assert_grep '^BBOX 25 27 404 684 #333333' \
+assert_grep '^BBOX 21 23 404 684 #333333' \
     "flex border-box 50% item B tiles from A's right edge with no overflow (404..684)"
 
 # ---- (6) semantic check: content-box outer width - border-box outer width == 50
 # (= 2*padding + 2*border), computed from the BBOX left/right columns. ----------
 diffw=$(awk '
     /^BBOX 1 3 128 / {cb=$5-$4}
-    /^BBOX 7 10 128 / {bb=$5-$4}
+    /^BBOX 6 9 128 / {bb=$5-$4}
     END {print cb-bb}' "$D")
 if [ "$diffw" = "50" ]; then
     echo "[hb-bs] PASS content-box is exactly padding+border (50px) wider than border-box"

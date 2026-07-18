@@ -60,10 +60,10 @@ assert_grep 'LAYOUT segs=[1-9][0-9]* rows=[1-9][0-9]* ' "layout produced segment
 assert_grep '^FILL 5 6 112 328 #ffcc00'  "padding:0.75rem -> 12px left padding (x=112, not 100)"
 
 # --- 33.3% width -> right edge WIDER than an integer 33% (=308) -------
-assert_grep '^FILL 8 10 100 310 #33aa33'  "width:33.3% -> 310px right edge (33% would be 308)"
+assert_grep '^FILL 7 9 100 310 #33aa33'  "width:33.3% -> 310px right edge (33% would be 308)"
 
 # --- 25.5% width -> a fractional percentage box ----------------------
-assert_grep '^FILL 13 15 100 264 #2255aa'  "width:25.5% -> 264px right edge (fractional %)"
+assert_grep '^FILL 11 13 100 264 #2255aa'  "width:25.5% -> 264px right edge (fractional %)"
 
 # --- decimal em/rem font-size boxes render (value path exercised) ----
 assert_grep '^SEG 0 108 #[0-9a-f]+ b1 u0 s0 l-1 bg#eeeeee .Heading at 1.5rem.' \

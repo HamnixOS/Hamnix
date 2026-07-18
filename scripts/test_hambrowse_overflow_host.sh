@@ -83,8 +83,8 @@ refute_grep 'CgoneD' "overflow:hidden clips the child's 4th line (below the box)
 refute_grep 'CgoneF' "overflow:hidden clips the child's 6th line"
 
 # ---- (2) overflow:auto — scroll container, same static clip -------------------
-assert_grep '^FILL 4 7 [0-9]+ [0-9]+ #cc4433' \
-    "overflow:auto clamps the child background to the box (rows 4-7)"
+assert_grep '^FILL 3 6 [0-9]+ [0-9]+ #cc4433' \
+    "overflow:auto clamps the child background to the box (rows 3-6)"
 assert_grep 'SkeepC' "overflow:auto keeps the visible lines"
 refute_grep 'SgoneD' "overflow:auto clips content past the box bottom"
 
@@ -92,15 +92,15 @@ refute_grep 'SgoneD' "overflow:auto clips content past the box bottom"
 # Same oversized child, overflow visible: its FILL is NOT clamped to 3 rows and
 # ALL six lines survive.
 assert_grep 'VkeepF' "overflow:visible does NOT clip — the 6th line survives"
-refute_grep '^FILL 8 11 [0-9]+ [0-9]+ #33aa66' \
+refute_grep '^FILL 6 9 [0-9]+ [0-9]+ #33aa66' \
     "overflow:visible child fill is NOT clamped to the 3-row box"
-assert_grep '^FILL 8 1[45] [0-9]+ [0-9]+ #33aa66' \
+assert_grep '^FILL 6 12 [0-9]+ [0-9]+ #33aa66' \
     "overflow:visible child fill keeps its full 6-row height"
 
 # ---- (4) overflow-x hidden — horizontal truncation ---------------------------
 # The nowrap line is cut at the box's right edge: "Nowrapfront" survives, the
 # trailing "Nowraptail ... right edge here." is truncated away.
-assert_grep 'SEG 12 [0-9]+ .*bg#ffddaa \|Nowrapfront' \
+assert_grep 'SEG 9 [0-9]+ .*bg#ffddaa \|Nowrapfront' \
     "overflow-x:hidden keeps the head of the nowrap line"
 refute_grep 'Nowraptail' \
     "overflow-x:hidden truncates the nowrap line at the box right edge"
