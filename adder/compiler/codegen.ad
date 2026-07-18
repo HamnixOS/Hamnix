@@ -169,6 +169,7 @@ from compiler.regalloc import (
     ra_name_vetoed,
     ra_name_isfloat,
     ra_xmm_for_name,
+    ra_xmm_reg_used_any,
     ra_reg_for_name,
     ra_store_elim_for_name,
     ra_pool_used,
@@ -334,6 +335,15 @@ opt_alelide_count: uint32 = 0
 # register (instead of `lea g(%rip)` every iteration). Counts each hoisted base
 # so the corpus/bench can assert the residency lever fires. 0 with --opt OFF.
 opt_basehoist_count: uint32 = 0
+# LOOP-INVARIANT FLOAT-CONSTANT HOISTS (--opt, mandel `2*zx*zy` lever): each hot
+# loop-invariant float64 LITERAL (e.g. the `2.0` in mandel's inner recurrence)
+# that was materialised ONCE into a persistent xmm HOME (xmm8..15) in the loop
+# preheader, so the in-loop uses read it reg-reg (`movaps %home,%xdst`) instead of
+# rematerialising `mov $bits,%rax; cvtsi2sd/movq; movq %rax,%xmm` every iteration
+# — matching gcc -O2, which parks the constant in an xmm before the loop. Counts
+# each hoisted constant. 0 with --opt OFF (isel + cg_ra_active gate it), so the
+# default build stays byte-identical to the seed. See fch_hoist / fch_lookup.
+opt_fconsthoist_count: uint32 = 0
 # FLOAT DEST-DRIVEN SELECTOR firings (--opt, P1 float-SSE lever): each scalar
 # `name = <float-arith tree>` (float64) whose RHS was computed across live SSE
 # registers (xmm dest + xmm scratches) instead of round-tripping every operand
@@ -458,6 +468,7 @@ def isel_reset_stats():
     opt_paramhome_count = 0
     opt_alelide_count = 0
     opt_basehoist_count = 0
+    opt_fconsthoist_count = 0
     opt_fpsel_count = 0
     opt_fpmov_count = 0
     opt_fpcmp_count = 0
@@ -6929,6 +6940,20 @@ def fp_leaf_f64_local_off(node: uint32, out_off: Ptr[int32]) -> int32:
 # `xdst = xdst OP scratch`. Must run inside ir_emit_enter/leave.
 def sel_fp_expr_into_xmm(v: uint32, xdst: uint32):
     if ir_kind[v] != IR_BINOP:
+        # HOISTED FLOAT-CONSTANT tile: a loop-invariant float64 literal parked in
+        # an xmm home by fch_hoist reads reg-reg (`movaps %home,%xdst`, move-
+        # eliminated) instead of rematerialising `mov $bits,%rax; cvtsi2sd/movq;
+        # movq %rax,%xmm` every iteration — the gcc-parity win. Byte-inert by
+        # default: fch_lookup returns RA_NONE when no hoist ran (fch_count==0).
+        clit: uint32 = ir_ast[v]
+        cktag: uint32 = 0
+        ckval: uint64 = 0
+        if fch_const_key(clit, &cktag, &ckval) != 0:
+            chenc: uint32 = fch_lookup(cktag, ckval)
+            if chenc != RA_NONE:
+                emit_movsd_xmm_xmm(xdst, chenc)
+                opt_fpmov_count = opt_fpmov_count + 1
+                return
         # Leaf-read tile: a direct float64-local read lands straight in xdst
         # (no `... -> %rax ; movq %rax,%xmm` GPR round-trip). A GPR-promoted
         # local reads `movq %gpr,%xmm`; a slot-home local reads `movsd slot,%xmm`.
@@ -9690,6 +9715,280 @@ def hole_acquire_reg(wnode: uint32, out_slot: Ptr[int32]) -> uint32:
     return RA_NONE
 
 
+# =======================================================================
+# LOOP-INVARIANT FLOAT-CONSTANT HOIST (--opt, mandel `2*zx*zy` lever).
+# =======================================================================
+#
+# A float64 LITERAL is loop-invariant by definition. The float-SSE selector's
+# leaf path re-materialises it EVERY iteration (`mov $bits,%rax; cvtsi2sd/movq;
+# movq %rax,%xmm`), whereas gcc -O2 parks the constant in an xmm register ONCE
+# before the loop and reads it reg-reg inside. This lever gives a hot invariant
+# float literal a persistent xmm HOME (xmm8..15, the same class the named-local
+# float homes use) materialised in the loop preheader; the selector leaf then
+# reads it with a move-eliminated `movaps %home,%xdst` (NOT movsd — the 139d5855
+# lesson: a reg-reg movsd is a real FP-port uop that contends with the recurrence
+# it feeds).
+#
+# HOME SELECTION. Only xmm8..15 NOT already owned by a named-local float home
+# (ra_xmm_reg_used_any) and NOT already held by an active hoist entry are used, so
+# a constant home never clobbers a live recurrence value. When every home is
+# taken the constant simply falls back to the per-iteration rematerialise (always
+# correct). Homes are picked in HOTNESS order (a depth-weighted occurrence count):
+# with one free home in mandel the innermost `2.0` wins it, exactly gcc's choice.
+#
+# SCOPE / SOUNDNESS. Hoisting happens in hoist_loop_preheader (gen_while only),
+# which already requires isel + a CALL-FREE body — every xmm8..15 is caller-saved,
+# so the home is valid only across a call-free span, and the float selector itself
+# is call-free-gated. The home is written ONLY in the preheader and read-only in
+# the body (nothing else touches xmm8..15 except the named-local homes, which we
+# avoid), so it persists untouched across every iteration and nested loop. A
+# nested loop finds the constant already active (skipped), so it is hoisted at the
+# OUTERMOST call-free loop containing its uses — the whole-run materialise gcc
+# cannot even reach. Entries are pushed on a stack the caller pops after the loop;
+# a float-const home holds a value DEAD after the loop (caller-saved, no restore),
+# so release is a pure pop (no reload emit).
+#
+# GATING. cg_ra_active (needs an allocation, to query ra_xmm usage) AND isel — 0
+# on the default build, so fch_count stays 0, fch_lookup returns RA_NONE, and the
+# selector leaf + codegen output are byte-identical to the seed.
+FCH_MAX: uint32 = 8                          # active float-const homes (stack)
+fch_count: uint32 = 0                        # stack depth
+fch_aux: Array[8, uint32]                    # ND_FLOAT_LIT nd_aux key
+fch_num: Array[8, uint64]                    # ND_FLOAT_LIT nd_num key
+fch_enc: Array[8, uint32]                    # xmm home encoding (8..15)
+
+FCH_XMM_LO: uint32 = 8                        # first home-class xmm
+FCH_XMM_HI: uint32 = 16                       # one past the last (xmm8..15)
+
+# Candidate accumulator (per hoist_loop_preheader call): distinct invariant float
+# literals in the loop body with a depth-weighted occurrence count.
+FCC_MAX: uint32 = 16
+fcc_aux: Array[16, uint32]
+fcc_num: Array[16, uint64]
+fcc_w: Array[16, uint32]                      # depth-weighted count (hotness)
+fcc_n: uint32 = 0
+
+
+# Recognise a COMPILE-TIME float64 constant leaf and return a canonical key
+# (tag,val) through out_tag/out_val, returning 1; else 0. The key uniquely
+# identifies the constant's VALUE across the loop body (two occurrences with the
+# same key are the same constant and share one home). It does NOT need to be the
+# IEEE bits (computing an integer's double bits at compile time needs float
+# arithmetic the backend avoids) — only STABLE per distinct constant, since the
+# preheader materialise re-emits from a representative NODE via gen_expr.
+#   tag 1: bare ND_FLOAT_LIT (nd_aux==1, exact bits in nd_num) -> val = bits
+#   tag 2: bare ND_FLOAT_LIT (nd_aux==0, integer-valued)       -> val = nd_num
+#   tag 3: cast[float64](<int literal>) — the mandel `cast[float64](2)` shape;
+#          the operand is a constant ND_INT_LIT                -> val = int value
+# All three are loop-invariant by construction (a literal / a cast of a literal).
+def fch_const_key(node: uint32, out_tag: Ptr[uint32], out_val: Ptr[uint64]) -> uint32:
+    if node == 0:
+        return 0
+    k: uint32 = nd_kind[node]
+    if k == ND_FLOAT_LIT:
+        if nd_aux[node] == 1:
+            out_tag[0] = 1
+        else:
+            out_tag[0] = 2
+        out_val[0] = nd_num[node]
+        return 1
+    if k == ND_CAST:
+        if type_float_width(nd_a[node]) == 8:
+            operand: uint32 = nd_b[node]
+            if operand != 0 and nd_kind[operand] == ND_INT_LIT:
+                out_tag[0] = 3
+                out_val[0] = nd_num[operand]
+                return 1
+    return 0
+
+
+# 1 iff xmm encoding `e` is held by an active float-const home entry.
+def fch_enc_active(e: uint32) -> uint32:
+    i: uint32 = 0
+    while i < fch_count:
+        if fch_enc[i] == e:
+            return 1
+        i = i + 1
+    return 0
+
+
+# The xmm home holding the float literal keyed (aux,num), or RA_NONE if that
+# constant is not currently hoisted. Byte-inert by default: fch_count==0 (no
+# hoist ran) -> RA_NONE, so the selector leaf takes its unchanged path.
+def fch_lookup(aux: uint32, num: uint64) -> uint32:
+    i: uint32 = 0
+    while i < fch_count:
+        if fch_aux[i] == aux and fch_num[i] == num:
+            return fch_enc[i]
+        i = i + 1
+    return RA_NONE
+
+
+# Pick a free home-class xmm (8..15) not owned by a named-local float home and not
+# already held by an active constant home, or RA_NONE if none free.
+def fch_pick_free_home() -> uint32:
+    e: uint32 = FCH_XMM_LO
+    while e < FCH_XMM_HI:
+        if ra_xmm_reg_used_any(e) == 0 and fch_enc_active(e) == 0:
+            return e
+        e = e + 1
+    return RA_NONE
+
+
+# Depth weight for a float-literal occurrence at loop-nesting `depth` (relative to
+# the loop being hoisted). A deeper (hotter) use is worth exponentially more, so
+# the innermost-loop constant wins a scarce home. Shift-based, capped so the
+# uint32 weight never overflows.
+def fch_depth_weight(depth: uint32) -> uint32:
+    d: uint32 = depth
+    if d > 20:
+        d = 20
+    return cast[uint32](1) << (d * 2)
+
+
+# Record one float-literal occurrence (aux,num) with weight `w` into the candidate
+# accumulator, deduping by key (accumulate the weight). Skips a constant already
+# held by an active (enclosing-loop) home — it is served there.
+def fcc_add(aux: uint32, num: uint64, w: uint32):
+    if fch_lookup(aux, num) != RA_NONE:
+        return
+    i: uint32 = 0
+    while i < fcc_n:
+        if fcc_aux[i] == aux and fcc_num[i] == num:
+            fcc_w[i] = fcc_w[i] + w
+            return
+        i = i + 1
+    if fcc_n < FCC_MAX:
+        fcc_aux[fcc_n] = aux
+        fcc_num[fcc_n] = num
+        fcc_w[fcc_n] = w
+        fcc_n = fcc_n + 1
+
+
+# 1 iff loop-nesting depth increases through node `n`'s children (a loop header):
+# the condition + body of a nested loop execute more often than the outer body.
+def fch_is_loop_node(n: uint32) -> uint32:
+    k: uint32 = nd_kind[n]
+    if k == ND_WHILE or k == ND_FOR or k == ND_DO_WHILE:
+        return 1
+    return 0
+
+
+# Walk the AST subtree `node` (a/b/c/d + sibling chain — the same descent
+# subtree_has_call trusts to reach every node) collecting compile-time float64
+# constants (fch_const_key) into the candidate accumulator, weighting each by its
+# loop-nesting `depth`. Only the constant-leaf class the selector intercepts
+# counts; each is loop-invariant by construction.
+def fch_collect(node: uint32, depth: uint32):
+    cur: uint32 = node
+    while cur != 0:
+        ktag: uint32 = 0
+        kval: uint64 = 0
+        if fch_const_key(cur, &ktag, &kval) != 0:
+            fcc_add(ktag, kval, fch_depth_weight(depth))
+        cd: uint32 = depth
+        if fch_is_loop_node(cur) != 0:
+            cd = depth + 1
+        fch_collect(nd_a[cur], cd)
+        fch_collect(nd_b[cur], cd)
+        fch_collect(nd_c[cur], cd)
+        fch_collect(nd_d[cur], cd)
+        cur = nd_next[cur]
+
+
+# Materialise the ND_FLOAT_LIT `lit`'s float64 value into xmm home `home` (8..15).
+# Reuses the selector leaf's exact value production (gen_expr -> %rax as IEEE bits,
+# via .rodata movq for a fractional literal or mov-imm+cvtsi2sd for an integer-
+# valued one), then moves the bits into the home. Runs in the loop preheader, so
+# the %rax/%xmm0 it clobbers are dead (before the loop-top label).
+def fch_materialize_into_home(lit: uint32, home: uint32):
+    gen_expr(lit)
+    emit_operand_to_float(expr_float_width(lit), 8)
+    emit_movq_rax_to_xmm_ext(home, 8)
+
+
+# Index of the highest-weight candidate not yet consumed (weight 0 = taken), or
+# FCC_MAX if none remain. Simple selection over the tiny accumulator.
+def fcc_pick_max() -> uint32:
+    best: uint32 = FCC_MAX
+    best_w: uint32 = 0
+    i: uint32 = 0
+    while i < fcc_n:
+        if fcc_w[i] > best_w:
+            best_w = fcc_w[i]
+            best = i
+        i = i + 1
+    return best
+
+
+# Find the first constant leaf node in `node`'s subtree whose canonical key
+# matches (tag,val), returning it (0 if none). The preheader materialise re-emits
+# this representative node via gen_expr, so the EXACT same leaf code produces the
+# value — no compile-time float arithmetic needed here.
+def fch_find_lit_node(node: uint32, tag: uint32, val: uint64) -> uint32:
+    cur: uint32 = node
+    while cur != 0:
+        ktag: uint32 = 0
+        kval: uint64 = 0
+        if fch_const_key(cur, &ktag, &kval) != 0 and ktag == tag and kval == val:
+            return cur
+        r: uint32 = fch_find_lit_node(nd_a[cur], tag, val)
+        if r != 0:
+            return r
+        r = fch_find_lit_node(nd_b[cur], tag, val)
+        if r != 0:
+            return r
+        r = fch_find_lit_node(nd_c[cur], tag, val)
+        if r != 0:
+            return r
+        r = fch_find_lit_node(nd_d[cur], tag, val)
+        if r != 0:
+            return r
+        cur = nd_next[cur]
+    return 0
+
+
+# Hoist hot loop-invariant float constants of loop `node` into xmm homes in the
+# preheader. Called by hoist_loop_preheader (after the base hoist) — same isel +
+# call-free-body guards. Additionally requires cg_ra_active (an allocation, to
+# query which xmm8..15 named-local homes are taken). Pushes fch entries the caller
+# releases after the loop.
+def fch_hoist(node: uint32):
+    if cg_ra_active == 0:
+        return
+    body: uint32 = nd_b[node]
+    fcc_n = 0
+    fch_collect(body, 0)
+    # Greedily assign the hottest remaining candidates to free homes.
+    while 1 != 0:
+        idx: uint32 = fcc_pick_max()
+        if idx >= FCC_MAX:
+            return                           # no candidates left
+        home: uint32 = fch_pick_free_home()
+        if home == RA_NONE:
+            return                           # no free xmm home — stop
+        if fch_count >= FCH_MAX:
+            return
+        lit: uint32 = fch_find_lit_node(body, fcc_aux[idx], fcc_num[idx])
+        if lit == 0:
+            fcc_w[idx] = 0                    # defensive: skip (should not happen)
+        else:
+            fch_materialize_into_home(lit, home)
+            fch_aux[fch_count] = fcc_aux[idx]
+            fch_num[fch_count] = fcc_num[idx]
+            fch_enc[fch_count] = home
+            fch_count = fch_count + 1
+            opt_fconsthoist_count = opt_fconsthoist_count + 1
+            fcc_w[idx] = 0                    # consumed
+
+
+# Release float-const home entries down to `saved` (LIFO with the preheader push).
+# A float-const home holds a value dead after the loop (caller-saved xmm, no
+# post-loop use), so release is a pure pop — no reload/restore emit.
+def fch_release(saved: uint32):
+    fch_count = saved
+
+
 # Per-loop base hoist for `body` into the loop preheader (called by gen_while
 # BEFORE the loop-top label, so the leas run ONCE). No-op unless --opt (isel) is
 # on and the body is CALL-FREE (a caller-saved base must not cross a call).
@@ -9747,6 +10046,11 @@ def hoist_loop_preheader(node: uint32):
                     hb_count = hb_count + 1
                     opt_splithoist_count = opt_splithoist_count + 1
         k = k + 1
+
+    # Loop-invariant FLOAT-CONSTANT hoist: park hot invariant float literals in
+    # xmm homes for this loop's preheader (after the base hoist, sharing the isel
+    # + call-free-body guards above).
+    fch_hoist(node)
 
 
 # Release per-loop hoist entries down to `saved` (LIFO with the preheader push).
@@ -14157,6 +14461,7 @@ def gen_while(node: uint32):
     # the back-edge / `continue` skip them). Only for a call-free body. hb_saved
     # marks the cache depth to release after the loop.
     hb_saved: uint32 = hb_count
+    fch_saved: uint32 = fch_count
     hoist_loop_preheader(node)
 
     emit_loop_align(nd_b[node])          # 32B loop-top align, per-loop offset
@@ -14166,6 +14471,7 @@ def gen_while(node: uint32):
     if loop_depth >= MAX_LOOPS:
         cg_fail(6, node)
         hoist_loop_release(hb_saved)
+        fch_release(fch_saved)
         return
     depth: uint32 = loop_depth
     loop_cont_target[depth] = start
@@ -14183,6 +14489,7 @@ def gen_while(node: uint32):
         i = i + 1
     loop_depth = loop_depth - 1
     hoist_loop_release(hb_saved)         # free per-loop hoisted base registers
+    fch_release(fch_saved)               # free per-loop float-const xmm homes
 
 
 # do-while  (mirrors codegen_x86.gen_do_while): execute the body once
@@ -15758,6 +16065,7 @@ def gen_function(fn: uint32) -> uint32:
         emit_function_epilogue()
 
     hb_reset()                            # release hoisted base regs for next fn
+    fch_count = 0                         # release float-const xmm homes for next fn
     cg_ra_active = 0                      # clear for the next function
     cg_callee_active = 0
     return start
