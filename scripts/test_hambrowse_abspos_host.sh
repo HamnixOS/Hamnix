@@ -65,13 +65,21 @@ read -r BR_X0 BR_Y0 BR_X1 BR_Y1 < <(row_for '#00cc00')   # bottom-right
 read -r BL_X0 BL_Y0 BL_X1 BL_Y1 < <(row_for '#ee00ee')   # bottom-left
 read -r TL_X0 TL_Y0 TL_X1 TL_Y1 < <(row_for '#0000ee')   # top-left (unchanged)
 read -r C_X0  C_Y0  C_X1  C_Y1  < <(row_for '#dddddd')   # containing block
+read -r GR_X0 GR_Y0 GR_X1 GR_Y1 < <(row_for '#ff8800')   # badge in GRADIENT parent
+read -r XR_X0 XR_Y0 XR_X1 XR_Y1 < <(row_for '#ffaa00')   # badge in TRANSPARENT parent
+# The gradient parent paints a gradient rect whose declared colour field is
+# #000000 (the fill records a placeholder colour; the pixel sampled inside is the
+# gradient) — its rect gives the gradient parent's own top row + right edge.
+read -r GP_X0 GP_Y0 GP_X1 GP_Y1 < <(row_for '#000000')
 
 echo "[hb-abspos] cont=($C_X0,$C_Y0)-($C_X1,$C_Y1)"
 echo "[hb-abspos] TR=($TR_X0,$TR_Y0)-($TR_X1,$TR_Y1) BR=($BR_X0,$BR_Y0)-($BR_X1,$BR_Y1)"
 echo "[hb-abspos] BL=($BL_X0,$BL_Y0)-($BL_X1,$BL_Y1) TL=($TL_X0,$TL_Y0)-($TL_X1,$TL_Y1)"
+echo "[hb-abspos] GR=($GR_X0,$GR_Y0)-($GR_X1,$GR_Y1) XR=($XR_X0,$XR_Y0)-($XR_X1,$XR_Y1)"
 
 need() { [ -n "$1" ] || { echo "[hb-abspos] FAIL: missing box ($2)"; fail=1; return 1; }; return 0; }
-for v in "$C_X0:cont" "$TR_X0:TR" "$BR_X0:BR" "$BL_X0:BL" "$TL_X0:TL"; do
+for v in "$C_X0:cont" "$TR_X0:TR" "$BR_X0:BR" "$BL_X0:BL" "$TL_X0:TL" \
+         "$GR_X0:GR" "$XR_X0:XR"; do
     need "${v%%:*}" "${v##*:}" || true
 done
 
@@ -134,6 +142,55 @@ if [ "$fail" -eq 0 ] && [ "$TL_X0" -eq "$LEFT_TGT" ] && [ "$TL_Y0" -eq "$C_Y0" ]
     echo "[hb-abspos] PASS TL left/top unchanged (x0=$TL_X0==$LEFT_TGT, y0=$TL_Y0==cont_top=$C_Y0)"
 else
     echo "[hb-abspos] FAIL TL left/top path regressed (x0=$TL_X0 want $LEFT_TGT, y0=$TL_Y0 cont_top=$C_Y0)"; fail=1
+fi
+
+# The gradient/transparent parents are the same 400px-wide, top-level geometry as
+# .cont, so their padding-box right edge is the same pixel: right-anchor target =
+# cont_right-8. (The old paint-scan fix read cont_right from the ancestor's SOLID
+# fill; with no solid fill it dropped the badge at content-left — the regression.)
+need "$GP_X0" "gcont" || true
+
+# (5) GRADIENT-backed containing block: the parent paints a linear-gradient (NO
+#     solid background-fill record), so the old paint-scan heuristic found no
+#     ancestor fill and dropped the badge at content-LEFT. Geometry-based CB edges
+#     must anchor it top-RIGHT: right edge at gcont_right-8, pinned to the gradient
+#     parent's OWN top row, and NOT flush against the container left edge.
+if [ "$fail" -eq 0 ] && [ "$GR_X1" -eq "$((GP_X1 - 8))" ]; then
+    echo "[hb-abspos] PASS GRADIENT badge right edge at parent_right-8 (x1=$GR_X1 == $((GP_X1 - 8)))"
+else
+    echo "[hb-abspos] FAIL GRADIENT badge not right-anchored (x1=$GR_X1 want $((GP_X1 - 8)))"; fail=1
+fi
+if [ "$fail" -eq 0 ] && [ "$GR_X0" -gt "$((GP_X0 + 40))" ]; then
+    echo "[hb-abspos] PASS GRADIENT badge is NOT at content-left (x0=$GR_X0 >> left=$GP_X0)"
+else
+    echo "[hb-abspos] FAIL GRADIENT badge wrongly near content-left (x0=$GR_X0 left=$GP_X0)"; fail=1
+fi
+if [ "$fail" -eq 0 ] && [ "$GR_Y0" -eq "$GP_Y0" ]; then
+    echo "[hb-abspos] PASS GRADIENT badge pinned to gradient parent top (y0=$GR_Y0 == $GP_Y0)"
+else
+    echo "[hb-abspos] FAIL GRADIENT badge not at parent top (y0=$GR_Y0 want $GP_Y0)"; fail=1
+fi
+
+# (6) TRANSPARENT containing block: no background at all — the case the old
+#     paint-scan fix EXPLICITLY could not anchor (it fell back to content-left).
+#     Geometry-based CB edges anchor it top-RIGHT exactly like the gradient case.
+#     Same-width top-level parent as .cont, so its right edge = RIGHT_TGT.
+if [ "$fail" -eq 0 ] && [ "$XR_X1" -eq "$RIGHT_TGT" ]; then
+    echo "[hb-abspos] PASS TRANSPARENT badge right edge at parent_right-8 (x1=$XR_X1 == $RIGHT_TGT)"
+else
+    echo "[hb-abspos] FAIL TRANSPARENT badge not right-anchored (x1=$XR_X1 want $RIGHT_TGT)"; fail=1
+fi
+if [ "$fail" -eq 0 ] && [ "$XR_X0" -gt "$((C_X0 + 40))" ]; then
+    echo "[hb-abspos] PASS TRANSPARENT badge is NOT at content-left (x0=$XR_X0 >> left=$C_X0)"
+else
+    echo "[hb-abspos] FAIL TRANSPARENT badge wrongly near content-left (x0=$XR_X0 left=$C_X0)"; fail=1
+fi
+# Its top row sits BELOW the gradient card (blocks stack) — anchored to a top
+# edge, not floating at the solid card's origin.
+if [ "$fail" -eq 0 ] && [ "$XR_Y0" -gt "$GR_Y0" ]; then
+    echo "[hb-abspos] PASS TRANSPARENT badge anchored below the gradient card (y0=$XR_Y0 > $GR_Y0)"
+else
+    echo "[hb-abspos] FAIL TRANSPARENT badge vertical anchor wrong (y0=$XR_Y0 GR.y0=$GR_Y0)"; fail=1
 fi
 
 if [ "$fail" -eq 0 ]; then
