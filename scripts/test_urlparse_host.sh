@@ -52,7 +52,9 @@ if ! grep -q '^\[urlparse\] RESULT: PASS' "$DUMP"; then
 fi
 # Guard the specific cases explicitly — the schemeless ones are the fix.
 for c in schemeless-bare-host schemeless-with-path schemeless-with-port \
-         explicit-http explicit-https reject-empty; do
+         explicit-http explicit-https reject-empty \
+         post-request-line post-host-header post-content-type \
+         post-content-length post-default-ctype; do
     if ! grep -q "^\[urlparse\] PASS $c" "$DUMP"; then
         echo "[urlparse-host] RESULT: FAIL (case '$c' did not pass)"; exit 1
     fi

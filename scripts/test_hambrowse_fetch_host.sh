@@ -65,6 +65,10 @@ assert_line ok404   "fetch('http://h.test/404').then(r=>console.log('N',r.ok,r.s
 assert_line reject  "fetch('http://h.test/fail').then(()=>console.log('NO')).catch(e=>console.log('C',e.name));" 'C TypeError'
 # init.method / init.body are forwarded to the transport (POST round-trips a body).
 assert_line post    "fetch('http://h.test/echo',{method:'POST',body:'payload'}).then(r=>r.text()).then(t=>console.log('B',t));" 'B posted:payload'
+# init.headers['content-type'] is forwarded to the transport (the canned transport
+# echoes the received request Content-Type back as X-Req-Content-Type). On-device
+# this same value is what http_post writes onto the wire.
+assert_line postct  "fetch('http://h.test/echo',{method:'POST',body:'x',headers:{'Content-Type':'application/json'}}).then(r=>console.log('CT',r.headers.get('x-req-content-type')));" 'CT application/json'
 # await composes over the real-network path just like the fixture path.
 assert_line await   "async function g(){let r=await fetch('http://h.test/hello');let t=await r.text();return t.length} g().then(v=>console.log('A',v));" 'A 20'
 # json() parses a JSON body slice off the wire.

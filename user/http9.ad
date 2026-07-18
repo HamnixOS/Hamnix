@@ -8,15 +8,20 @@
 #   * URL parsing (scheme / host / port / path; http + https)
 #   * IPv4-literal fast path + sys_resolve(2) DNS fallback
 #   * connect via user/net9.ad's net_dial / net_dial_tls
-#   * an HTTP/1.0 GET with `Connection: close`
+#   * an HTTP/1.0 GET or POST with `Connection: close`
 #   * a bounded response drain that honours Content-Length and stops
 #     as soon as the whole response is in hand (a trailing read past
 #     the body wedges on TLS close_notify — see the drain loop note)
 #
-# Entry point:
+# Entry points:
 #   http_get(url, dst, dst_cap, *out_status, *out_body_off, *out_body_len)
 #     -> 0 on a completed transport (HTTP status in *out_status, even
 #        for 4xx/5xx), or negative on a transport / parse failure.
+#   http_post(url, body, body_len, content_type, dst, dst_cap,
+#             *out_status, *out_body_off, *out_body_len)
+#     -> as http_get, but writes a POST request line + Content-Type /
+#        Content-Length headers + the entity body over the SAME /net
+#        connection (no sockets, no second stack).
 #
 # The body lands at dst[*out_body_off .. *out_body_off+*out_body_len);
 # callers that want a clean buffer slide it down themselves (hpm does).
@@ -53,6 +58,20 @@ h9_port:     int64 = 80
 h9_host:     Array[256, uint8]       # NUL-terminated hostname
 h9_path:     Array[1536, uint8]      # request path (always starts '/')
 h9_req:      Array[2048, uint8]      # composed request line + headers
+
+# -- request method / body state (GET vs POST) ------------------------
+#
+# A POST carries an entity body: _h9_send_request emits `POST <path>` plus
+# Content-Type / Content-Length headers and then writes the body over the
+# SAME /net connection (net_dial/net_dial_tls) — no sockets, no new stack.
+# The body pointer is BORROWED from the caller (valid for the http_post call).
+# These are set by http_post / http_get and read by _h9_send_request; a
+# redirect demotes a POST to GET (browser behaviour), clearing the body.
+h9_method:   int32 = 0               # 0 == GET, 1 == POST
+h9_body_ptr: uint64 = 0              # POST body pointer (borrowed)
+h9_body_len: uint64 = 0             # POST body byte count
+h9_ctype:    Array[256, uint8]      # POST Content-Type (NUL-terminated)
+h9_num:      Array[24, uint8]       # scratch for a decimal itoa
 
 # -- redirect-following state (module-global, single-threaded) --------
 #
@@ -291,9 +310,39 @@ def _h9_connect() -> int32:
 
 # -- send request ------------------------------------------------------
 
-def _h9_send_request(fd: int32) -> int32:
+# Append `val` as decimal ASCII into h9_req at offset `ro`; returns the new
+# offset. Uses the h9_num scratch to reverse the digits (top-level BSS per the
+# 4 KiB-stack discipline).
+def _h9_append_u64(ro: uint64, val: uint64) -> uint64:
+    if val == 0:
+        h9_req[ro] = 48                                  # '0'
+        return ro + 1
+    ndig: uint64 = 0
+    v: uint64 = val
+    while v > 0 and ndig < 24:
+        h9_num[ndig] = cast[uint8](48 + cast[uint8](v % 10))
+        ndig = ndig + 1
+        v = v / 10
+    k: uint64 = ndig
+    while k > 0 and ro < 2000:
+        k = k - 1
+        h9_req[ro] = h9_num[k]
+        ro = ro + 1
+    return ro
+
+
+# Compose the request line + headers + terminating blank line into h9_req from
+# the current h9_method / h9_path / h9_host / h9_ctype / h9_body_len state, and
+# return the byte length. Pure (no fd I/O) so a host unit test can inspect the
+# exact bytes via http_request_bytes(). The POST body is NOT included here (it is
+# written separately, straight from h9_body_ptr, to avoid a large copy).
+def _h9_compose_request() -> uint64:
     ro: uint64 = 0
+    # Request method: GET or (with a body) POST — the SAME /net connection; the
+    # verb is the only wire difference on the request line.
     g: Ptr[uint8] = "GET "
+    if h9_method == 1:
+        g = "POST "
     gi: uint64 = 0
     while g[gi] != 0:
         h9_req[ro] = g[gi]
@@ -319,17 +368,87 @@ def _h9_send_request(fd: int32) -> int32:
     # degraded no-JS/legacy page to unrecognised clients; a "Mozilla/5.0"
     # token identifies us as a graphical, scripting-capable browser so we get
     # the modern variant. NOT a per-site hack — this is the generic contract
-    # every browser honours. Accept advertises we take HTML.
-    tail2: Ptr[uint8] = "\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:1.0) hambrowse/1.0\r\nAccept: text/html,application/xhtml+xml\r\nConnection: close\r\n\r\n"
+    # every browser honours. Accept advertises we take HTML. This block ENDS
+    # after "Connection: close\r\n" (no blank line yet) so a POST can splice in
+    # its Content-Type / Content-Length before the header terminator.
+    tail2: Ptr[uint8] = "\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:1.0) hambrowse/1.0\r\nAccept: text/html,application/xhtml+xml\r\nConnection: close\r\n"
     si: uint64 = 0
     while tail2[si] != 0:
         h9_req[ro] = tail2[si]
         ro = ro + 1
         si = si + 1
+    if h9_method == 1:
+        # Content-Type: <ctype>\r\n
+        ct1: Ptr[uint8] = "Content-Type: "
+        ci: uint64 = 0
+        while ct1[ci] != 0:
+            h9_req[ro] = ct1[ci]
+            ro = ro + 1
+            ci = ci + 1
+        ki: uint64 = 0
+        while h9_ctype[ki] != 0 and ro < 1900:
+            h9_req[ro] = h9_ctype[ki]
+            ro = ro + 1
+            ki = ki + 1
+        h9_req[ro] = 13
+        ro = ro + 1
+        h9_req[ro] = 10
+        ro = ro + 1
+        # Content-Length: <n>\r\n
+        cl1: Ptr[uint8] = "Content-Length: "
+        li: uint64 = 0
+        while cl1[li] != 0:
+            h9_req[ro] = cl1[li]
+            ro = ro + 1
+            li = li + 1
+        ro = _h9_append_u64(ro, h9_body_len)
+        h9_req[ro] = 13
+        ro = ro + 1
+        h9_req[ro] = 10
+        ro = ro + 1
+    # Blank line terminating the header block.
+    h9_req[ro] = 13
+    ro = ro + 1
+    h9_req[ro] = 10
+    ro = ro + 1
+    return ro
+
+
+def _h9_send_request(fd: int32) -> int32:
+    ro: uint64 = _h9_compose_request()
     wn: int64 = _h9_write_full(fd, &h9_req[0], ro)
     if wn < 0 or cast[uint64](wn) != ro:
         return -1
+    # POST body follows the headers on the same connection.
+    if h9_method == 1 and h9_body_len > 0:
+        bw: int64 = _h9_write_full(fd, cast[Ptr[uint8]](h9_body_ptr),
+                                   h9_body_len)
+        if bw < 0 or cast[uint64](bw) != h9_body_len:
+            return -1
     return 0
+
+
+# -- request-builder introspection (host unit tests) ------------------
+#
+# Compose a POST request head for `url` (Content-Length = body_len,
+# Content-Type = content_type, "" => the text/plain;charset=UTF-8 default)
+# into the internal request buffer WITHOUT dialling /net, and return its byte
+# length (or -1 on a malformed URL). The bytes are readable via
+# http_request_bytes(). Lets a QEMU-free harness assert the exact wire request
+# line + headers the POST path emits.
+def http_compose_post_preview(url: Ptr[uint8], body_len: uint64,
+                              content_type: Ptr[uint8]) -> int64:
+    if http_parse_url(url) != 0:
+        return -1
+    h9_method = 1
+    h9_body_ptr = 0
+    h9_body_len = body_len
+    _h9_copy_ctype(content_type)
+    return cast[int64](_h9_compose_request())
+
+
+def http_request_bytes() -> Ptr[uint8]:
+    return &h9_req[0]
 
 
 # -- response length probe --------------------------------------------
@@ -774,9 +893,13 @@ def _h9_fetch_once(url: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
 # (http->https and https->https redirects ARE followed transparently; the
 #  per-hop dial re-runs the TLS handshake when the target is https://.)
 
-def http_get(url: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
-             out_status: Ptr[int64], out_body_off: Ptr[uint64],
-             out_body_len: Ptr[uint64]) -> int64:
+# The shared request/response loop (method-agnostic). http_get and http_post
+# set h9_method / h9_body_* before calling in. A 3xx redirect is followed as a
+# GET (h9_method demoted, body cleared) — matching how browsers turn a POST's
+# 301/302/303 into a bodyless GET of the Location.
+def _h9_run(url: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
+            out_status: Ptr[int64], out_body_off: Ptr[uint64],
+            out_body_len: Ptr[uint64]) -> int64:
     out_status[0] = 0
     out_body_off[0] = 0
     out_body_len[0] = 0
@@ -827,6 +950,11 @@ def http_get(url: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
             _h9_url_copy(&h9_effective_url[0], &h9_url_work[0])
             return rc
 
+        # A redirected POST becomes a bodyless GET of the Location (the common
+        # browser behaviour for 301/302/303), so the next hop carries no entity.
+        h9_method = 0
+        h9_body_ptr = 0
+        h9_body_len = 0
         _h9_resolve_redirect(&h9_url_work[0], &h9_loc[0], &h9_next_url[0])
         # Follow http->https and https->https transparently: _h9_fetch_once
         # re-parses the scheme per hop and _h9_connect dials TLS (net_dial_tls)
@@ -844,3 +972,51 @@ def http_get(url: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
         hop = hop + 1
 
     return -8
+
+
+# http_get — GET `url`, following redirects; the public entry the browser /
+# hpm / curl / wget front-ends use. Signature UNCHANGED; a plain GET.
+def http_get(url: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
+             out_status: Ptr[int64], out_body_off: Ptr[uint64],
+             out_body_len: Ptr[uint64]) -> int64:
+    h9_method = 0
+    h9_body_ptr = 0
+    h9_body_len = 0
+    return _h9_run(url, dst, dst_cap, out_status, out_body_off, out_body_len)
+
+
+# Copy a caller Content-Type into h9_ctype, defaulting to the Fetch-spec string
+# body default when absent/empty. `ct` is a (borrowed) NUL-terminated C string
+# or NULL.
+def _h9_copy_ctype(ct: Ptr[uint8]):
+    if cast[uint64](ct) == 0 or ct[0] == 0:
+        d: Ptr[uint8] = "text/plain;charset=UTF-8"
+        i: uint64 = 0
+        while d[i] != 0 and i + 1 < 256:
+            h9_ctype[i] = d[i]
+            i = i + 1
+        h9_ctype[i] = 0
+        return
+    j: uint64 = 0
+    while ct[j] != 0 and j + 1 < 256:
+        h9_ctype[j] = ct[j]
+        j = j + 1
+    h9_ctype[j] = 0
+
+
+# http_post — POST `body` (body_len bytes, Content-Type `content_type`) to
+# `url` over the SAME Plan-9 /net path as http_get (net_dial / net_dial_tls;
+# sys_resolve DNS; NO sockets). Emits `POST <path> HTTP/1.0` + Host +
+# Content-Type + Content-Length + the body, then drains the response exactly
+# like http_get (Content-Length / chunked). content_type NULL/"" defaults to
+# "text/plain;charset=UTF-8" (Fetch's string-body default). Same rc table as
+# http_get; a 3xx redirect is followed as a bodyless GET.
+def http_post(url: Ptr[uint8], body: Ptr[uint8], body_len: uint64,
+              content_type: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
+              out_status: Ptr[int64], out_body_off: Ptr[uint64],
+              out_body_len: Ptr[uint64]) -> int64:
+    h9_method = 1
+    h9_body_ptr = cast[uint64](body)
+    h9_body_len = body_len
+    _h9_copy_ctype(content_type)
+    return _h9_run(url, dst, dst_cap, out_status, out_body_off, out_body_len)
