@@ -90,5 +90,16 @@ assert_grep '^glyphs 72 340 \"1:02:03\"'        "uptime clock shows H:MM:SS sinc
 # --- MONTH NAVIGATION (next-month arrow: July -> August) ---
 assert_grep '^MONTH1 8'                         "next-month arrow navigated July -> August"
 
+# --- ADJACENT-MONTH SPILL-OVER DAYS (grey, fill the leading/trailing blanks) ---
+# July 2026 starts on Wednesday (first_wd=3): row-0 cols 0..2 spill the prior
+# month's June 28,29,30 in dimmed grey (#a8acb0). Leading col0 -> (12,81).
+assert_grep '^glyphs 12 81 \"28\" #a8acb0'      "leading spill day June 28 rendered grey"
+assert_grep '^glyphs 76 81 \"30\" #a8acb0'      "leading spill day June 30 rendered grey"
+# Trailing spill: after July 31 the grid fills with next-month Aug 1.. in grey.
+assert_grep '^glyphs 208 185 \"1\" #a8acb0'     "trailing spill day Aug 1 rendered grey"
+# Clicking a leading grey cell flips to that month and selects the day.
+assert_grep '^SPILL_M 6'                        "clicking leading spill cell navigated to June"
+assert_grep '^SPILL_D 28'                       "clicking leading spill cell selected June 28"
+
 if [ "$fail" -ne 0 ]; then echo "[cal-host] OVERALL FAIL"; exit 1; fi
 echo "[cal-host] OVERALL PASS"
