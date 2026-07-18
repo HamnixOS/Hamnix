@@ -417,6 +417,19 @@ class Gen:
         src = f"cast[{typ.name}]({a.src} {op} {b.src})"
         return TV(src, 1 if cmpres else 0, typ, gt=typ)
 
+    def _logical_not(self, depth, typ):
+        """Logical `not` (UNOP_NOT). The backend lowers `not x` to
+        `testq %rax,%rax; setz %al; movzbq %al,%rax` on BOTH backends — a full
+        64-bit register test yielding 1 iff the operand's register value is 0,
+        else 0. Wrapped in cast[typ] so the 0/1 result carries an unambiguous
+        static type (mirrors _compare). The operand is parenthesised so `not`
+        (lowest-precedence unary) binds the whole sub-expression regardless of
+        what it lowered to (a compare, an arith binop, a bare literal)."""
+        inner = self.expr(depth - 1)
+        res = 1 if inner.reg == 0 else 0
+        src = f"cast[{typ.name}](not ({inner.src}))"
+        return TV(src, res, typ, gt=typ)
+
     def expr(self, depth):
         typ = self.rng.choice(ALL_TYPES)
         return self._expr_typed(depth, typ)
@@ -428,12 +441,14 @@ class Gen:
                 return cast_to(v, typ)
             return self._random_literal(typ)
         kind = self.rng.random()
-        if kind < 0.45:
+        if kind < 0.42:
             return self._binop(depth, typ)
-        if kind < 0.65:
+        if kind < 0.60:
             return self._divmod(depth, typ)
-        if kind < 0.85:
+        if kind < 0.78:
             return self._compare(depth, typ)
+        if kind < 0.88:
+            return self._logical_not(depth, typ)
         inner_t = self.rng.choice(ALL_TYPES)
         inner = self._expr_typed(depth - 1, inner_t)
         return cast_to(inner, typ)
