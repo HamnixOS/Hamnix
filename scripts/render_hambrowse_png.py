@@ -62,13 +62,16 @@ def _load_fonts():
 
 def parse_dump(text):
     width = 600
-    segs = []      # (row, x, color, bold, uline, link, bg, text)
-    fills = []     # (top, bot, lx, rx, color) — element background boxes
+    segs = []      # (row, x, color, bold, uline, link, bg, text, italic)
+    fills = []     # (top, bot, lx, rx, color, z) — element background boxes
     rules = {}     # row -> type
     title = None
     page_bg = None  # <body>/<html> page-level background (whole viewport)
+    italic_idx = set()   # seg indices flagged faux-oblique by a SEGIT line
     for line in text.splitlines():
-        if line.startswith("PAGEBG "):
+        if line.startswith("SEGIT "):
+            italic_idx.add(int(line.split()[1]))
+        elif line.startswith("PAGEBG "):
             page_bg = line.split()[1]
         elif line.startswith("LAYOUT "):
             for tok in line.split():
@@ -77,9 +80,14 @@ def parse_dump(text):
         elif line.startswith("TITLE "):
             title = line[6:]
         elif line.startswith("FILL "):
-            # FILL top bot lx rx #rrggbb — an element background rectangle.
+            # FILL top bot lx rx #rrggbb [rad] [z] — an element background rect.
+            # `z` is the stacking key (default 0); a CONTAINER's own background is
+            # graded to a negative z so it paints BEHIND the descendant fills it
+            # encloses, mirroring the z-sort in lib/htmlpage.ad. Older dumps omit
+            # the trailing rad/z fields, so treat them as optional (default 0).
             p = line.split()
-            fills.append((int(p[1]), int(p[2]), int(p[3]), int(p[4]), p[5]))
+            fz = int(p[7]) if len(p) > 7 else 0
+            fills.append((int(p[1]), int(p[2]), int(p[3]), int(p[4]), p[5], fz))
         elif line.startswith("RULE row "):
             p = line.split()
             rules[int(p[2])] = int(p[4])
@@ -105,6 +113,9 @@ def parse_dump(text):
                     link = int(tok[1:])
             text = rest[:-1] if rest.endswith("|") else rest
             segs.append((row, x, color, bold, uline, link, bg, text))
+    # Fold the SEGIT flags in by seg index (SEG lines are dumped in index order,
+    # so the Nth appended seg is engine seg N).
+    segs = [s + (1 if i in italic_idx else 0,) for i, s in enumerate(segs)]
     return width, segs, rules, title, fills, page_bg
 
 
@@ -134,11 +145,36 @@ def render(text, out_path, url="about:demo", win_title="Browser",
             d.text((cx, y * S), ch, font=fnt, fill=col)
             cx += CELL_W * S
 
+    def glyphs_italic(x, y, s, col, bold=False):
+        # Faux-oblique: render the run to a tile, shear it horizontally (top
+        # pushed right relative to the baseline, k=0.25), then paste — mirrors
+        # the per-row shear in lib/htmlpaint.ad (_blit_ttf_glyph, divisor 4).
+        if not s:
+            return
+        fnt = fontb if bold else font
+        k = 0.25
+        th = LINE_H * S
+        pad = int(k * th) + 1
+        tw = (len(s) * CELL_W) * S + 2 * pad
+        tile = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+        td = ImageDraw.Draw(tile)
+        cx = pad
+        for ch in s:
+            td.text((cx, 0), ch, font=fnt, fill=col)
+            cx += CELL_W * S
+        # AFFINE maps output->input: x_in = x + k*y - k*th (baseline at tile bot).
+        tile = tile.transform((tw, th), Image.AFFINE,
+                              (1, k, -k * th, 0, 1, 0), resample=Image.BILINEAR)
+        img.paste(tile, (x * S - pad, y * S), tile)
+
     # ---- content background (page-level <body>/<html> bg, or white) ----
     rect(0, CONTENT_Y, width, total_rows * LINE_H, page_bg or C_PAGE)
 
     # ---- element backgrounds (behind the whole box, under the text) ----
-    for (ftop, fbot, lx, rx, col) in fills:
+    # Paint in STABLE z-index order (mirror lib/htmlpage.ad): lower z first, so a
+    # container's negative-z background lands BEHIND the descendant fills (item
+    # chips) it encloses, and positioned boxes' explicit z-index still wins.
+    for (ftop, fbot, lx, rx, col, fz) in sorted(fills, key=lambda f: f[5]):
         if ftop >= total_rows:
             continue
         fb = min(fbot, total_rows)
@@ -171,14 +207,17 @@ def render(text, out_path, url="about:demo", win_title="Browser",
     glyphs(go_x + 7, ADDR_Y + 5, "Go", "#ffffff")
 
     # ---- content segments ----
-    for (row, x, color, bold, uline, link, bg, txt) in segs:
+    for (row, x, color, bold, uline, link, bg, txt, italic) in segs:
         if row >= total_rows:
             continue
         y = CONTENT_Y + row * LINE_H
         n = len(txt)
         if bg:
             rect(x, y, n * CELL_W, LINE_H, bg)
-        glyphs(x, y + 2, txt, color, bold=bool(bold))
+        if italic:
+            glyphs_italic(x, y + 2, txt, color, bold=bool(bold))
+        else:
+            glyphs(x, y + 2, txt, color, bold=bool(bold))
         if uline:
             uw = n * CELL_W
             hline(x, y + LINE_H - 2, x + uw, color)
