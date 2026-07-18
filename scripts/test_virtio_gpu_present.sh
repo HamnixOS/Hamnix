@@ -209,6 +209,19 @@ check_log "present benchmark complete"   "\[vgpu-bench\] PASS: present benchmark
 check_log "DE GPU present is default"    "\[vgpu-de\] PASS: GPU present is the DE default"
 check_log "DE force-SW reversible"       "\[vgpu-de\] PASS: force-SW flag flips the DE back to SW"
 check_log "DE present pixel-identical"   "\[vgpu-de\] PASS: DE GPU present matches SW reference pixel-for-pixel"
+# Phase D.5: the DE compositor now composites the shadow BGRA-native
+# (fb_set_shadow_bgra) so the flush is vk_de_present_shadow_rect_bgra — a pure
+# 1:1 word-copy deposit + DMA with NO per-pixel RGBA->BGRA convert. This marker
+# proves the pure-DMA present is STILL pixel-identical to the convert+SW path
+# (same visible colors, produced without the reorder). The "BGRA-native
+# pure-DMA present" ns line printed above vs "DE GPU present" is the
+# convert->pure-DMA DE-speed payoff (~11 ms -> ~0.4 ms).
+check_log "DE BGRA pure-DMA identical"   "\[vgpu-de\] PASS: BGRA-native pure-DMA present is pixel-identical to convert\+SW"
+# The strongest form the DE actually installs when scanout geometry matches:
+# composite straight into the device backing so the flush is a bare
+# TRANSFER+FLUSH (no deposit). Proven pixel-identical; the "zero-copy pure
+# TRANSFER+FLUSH present" ns line above is the live DE flush cost (~0.4 ms).
+check_log "DE zero-copy identical"       "\[vgpu-de\] PASS: zero-copy composite-in-backing present is pixel-identical"
 check_log "DE present verified default"  "\[vgpu-de\] PASS: DE present path verified"
 
 if grep -a -q -E "\[vgpu-de\] FAIL" "$LOG"; then

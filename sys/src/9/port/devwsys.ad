@@ -176,6 +176,7 @@ from drivers.video.console.fb_text import (
     fb_present_rgba_row, fb_present_rgba_row_keyed, fb_console_suspend,
     fb_present_rgba_row_blend,
     fb_set_shadow, fb_present_flush, fb_shadow_active,
+    fb_set_shadow_bgra, fb_shadow_is_bgra,
 )
 # Phase D.4 — GPU present for the DE compositor. When a virtio-gpu device is
 # present the OVMF GOP is no longer the scanned-out surface (the driver did
@@ -184,8 +185,16 @@ from drivers.video.console.fb_text import (
 # seam routes each finished damage rect through the device (BGRA backing +
 # TRANSFER_TO_HOST + FLUSH) when active, else the SW GOP path is unchanged.
 # devwsys -> vk_gpu -> virtio_gpu; no cycle (vk_gpu never imports devwsys).
+# Phase D.5 — the shadow is composited BGRA-native when a device owns the
+# scanout, so the flush is vk_de_present_shadow_rect_bgra: a pure 1:1 word-copy
+# deposit + DMA (no per-pixel RGBA->BGRA convert). vk_gpu_backend_available()
+# reports raw device presence (the gate for BGRA shadow, since under a device
+# the SW GOP is already dead scanout).
 from lib.vk.vk_gpu import (
     vk_de_gpu_present_active, vk_de_present_shadow_rect,
+    vk_de_present_shadow_rect_bgra, vk_gpu_backend_available,
+    vk_gpu_present, vk_gpu_backing_base,
+    vk_gpu_scanout_width, vk_gpu_scanout_height,
 )
 extern def fb_font_glyph_addr() -> uint64
 # Anti-aliased proportional DE chrome text (#284, subsumes #169). The scene
@@ -9704,6 +9713,10 @@ WSYS_SHADOW_MAX_PX:  uint64 = 1048576     # 4 MiB / 4 = 1,048,576 px
 wsys_shadow_page:    uint64 = 0           # 0 = not yet allocated
 wsys_shadow_pitch:   uint64 = 0           # pixels per shadow row (= fb_width)
 wsys_shadow_ok:      int32  = 0           # 1 = installed & active
+# Phase D.5 zero-copy: 1 = wsys_shadow_page aliases the virtio-gpu BGRA
+# backing itself (composite straight into it; flush = pure TRANSFER+FLUSH, no
+# deposit). 0 = a separate offscreen buffer (buddy RGBA/BGRA shadow).
+wsys_shadow_is_backing: int32 = 0
 
 
 def _wsys_shadow_init_if_needed():
@@ -9719,6 +9732,34 @@ def _wsys_shadow_init_if_needed():
     sh: uint64 = fb_get_height()
     if sw == 0 or sh == 0:
         return
+    # Phase D.5 ZERO-COPY: when a virtio-gpu device owns the scanout, alias the
+    # present shadow directly onto the device's BGRA backing and composite into
+    # it BGRA-native. The flush then does ZERO deposit — a pure TRANSFER_TO_HOST
+    # + RESOURCE_FLUSH (the ~0.4 ms device-DMA present). Safe because:
+    #   * the backing is cacheable direct-mapped RAM (never uncached MMIO), so
+    #     the compositor's read-modify-write blend reads it cheaply;
+    #   * it persists across flushes (the D.4 damage-rect deposit already relies
+    #     on that), so untouched regions keep the prior frame;
+    #   * it is NOT live-scanned — the host only sees it on RESOURCE_FLUSH — so
+    #     writing partial composites into it stays tear-free, exactly like the
+    #     offscreen shadow.
+    # Requires the backing to be valid and its scanout geometry to match the
+    # compositor's fb geometry (the same OVMF mode under virtio-gpu). If it
+    # doesn't line up we fall back to an offscreen BGRA buddy shadow (+ word-copy
+    # deposit present) below; with no device at all, an RGBA buddy shadow + the
+    # byte-identical SW GOP flush.
+    if vk_gpu_backend_available() != 0:
+        bb: uint64 = vk_gpu_backing_base()
+        bw: uint64 = cast[uint64](vk_gpu_scanout_width())
+        bh: uint64 = cast[uint64](vk_gpu_scanout_height())
+        if bb != 0 and bw == sw and bh >= sh:
+            wsys_shadow_page = bb
+            wsys_shadow_pitch = bw
+            wsys_shadow_is_backing = 1
+            fb_set_shadow(bb, bw)
+            fb_set_shadow_bgra(1)
+            wsys_shadow_ok = 1
+            return
     if sw * sh > WSYS_SHADOW_MAX_PX:
         # Screen too large for the shadow — leave wsys_shadow_page 0 so we
         # don't retry every present; present falls back to direct scanout.
@@ -9728,7 +9769,15 @@ def _wsys_shadow_init_if_needed():
         return
     wsys_shadow_page = pg
     wsys_shadow_pitch = sw
+    wsys_shadow_is_backing = 0
     fb_set_shadow(pg, sw)
+    # Offscreen buddy shadow. BGRA-native (+ pure word-copy deposit present,
+    # no per-pixel convert) when a device is present but its geometry differs
+    # from the fb; RGBA (+ byte-identical SW GOP flush) with no device.
+    if vk_gpu_backend_available() != 0:
+        fb_set_shadow_bgra(1)
+    else:
+        fb_set_shadow_bgra(0)
     wsys_shadow_ok = 1
 
 
@@ -9767,10 +9816,26 @@ def _wsys_flush_rect(rx: int64, ry: int64, rw: int64, rh: int64):
     # on any failure (or no device) fall through to the SW GOP flush so a
     # GOP-backed display is never left dark.
     if vk_de_gpu_present_active() != 0:
-        grc: int32 = vk_de_present_shadow_rect(wsys_shadow_page,
-                                               wsys_shadow_pitch,
-                                               cast[int32](rx), cast[int32](ry),
-                                               cast[int32](rw), cast[int32](rh))
+        grc: int32 = -1
+        if wsys_shadow_is_backing != 0:
+            # Phase D.5 ZERO-COPY present: the shadow IS the device backing,
+            # already composited in place BGRA-native. No deposit at all — a
+            # pure TRANSFER_TO_HOST + RESOURCE_FLUSH (the ~0.4 ms device DMA).
+            grc = vk_gpu_present()
+        elif fb_shadow_is_bgra() != 0:
+            # Offscreen BGRA shadow: the deposit is a 1:1 word copy (no
+            # convert) then TRANSFER + FLUSH.
+            grc = vk_de_present_shadow_rect_bgra(wsys_shadow_page,
+                                                 wsys_shadow_pitch,
+                                                 cast[int32](rx), cast[int32](ry),
+                                                 cast[int32](rw), cast[int32](rh))
+        else:
+            # RGBA shadow (should not happen once a device is present) — the
+            # Phase D.4 convert path still reaches the screen correctly.
+            grc = vk_de_present_shadow_rect(wsys_shadow_page,
+                                            wsys_shadow_pitch,
+                                            cast[int32](rx), cast[int32](ry),
+                                            cast[int32](rw), cast[int32](rh))
         if grc == 0:
             return
     fb_present_flush(cast[uint64](rx), cast[uint64](ry),
