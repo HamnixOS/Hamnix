@@ -41,7 +41,7 @@ From a 14-agent parallel audit (2026-07-16). Dual-target, host-iterated (~40 gat
 | css-text-fonts | 45% | 1 | 1 |
 | css-positioning | 60% | 10 | 4 |
 | ecmascript-builtins | 55% | 15 | 6 |
-| dom-core | 62% | 11 | 2 |
+| dom-core | 68% | 13 | 2 |
 
 ## FRESH AUDIT 2026-07-17 (verified against the modular lib/web/ tree)
 
@@ -94,6 +94,13 @@ the passing host gates found the following.
   returns DOCUMENT coordinates (no viewport-scroll offset); `getComputedStyle` covers the four common
   properties (display tag-default + inline override, resolved width/height/color) not the full cascade;
   `offsetParent` approximates as the parent element (nearest-positioned-ancestor rule not modelled).
+- dom-core: **document roots** — `document.body` / `document.documentElement` / `document.head` resolve
+  to the `<body>`/`<html>`/`<head>` element nodes (`dom/canvas.ad` `_doc_set_el` in `_js_build_document`);
+  each is the SAME object `querySelector` returns and carries a live `className`/`style`/`classList`, so
+  `document.body.appendChild(document.createElement('div'))`, `document.documentElement.classList.add(...)`
+  and `document.body.scrollHeight` all work. Element `scrollTop`/`scrollLeft` are writable static offsets
+  (default 0). `_build_rewrite` is now recursive (`_rewrite_range`) so an appended-to/restyled element's
+  descendant overrides still bake into the render. Gate `domcore`.
 - ecmascript: for-of, optional chaining/nullish, Map/Set/WeakMap/WeakSet, accessor get/set, Symbol +
   Symbol.iterator, generators/yield, Object.create/defineProperty, Reflect, Proxy, typed arrays,
   structuredClone (R1-7 above), **ES modules import/export (R9, gate `modules`)**. Only class
@@ -106,9 +113,22 @@ the passing host gates found the following.
    `dom/query.ad` (`_el_bbox`/`_new_rect_obj`/`_new_computed_style`) + `dom/canvas.ad` (NID_GETRECT/
    NID_GETCOMPSTYLE + pre-layout in `_run_scripts`) + `dom/bindings.ad` (NID constants). See the
    ALREADY-IMPLEMENTED list above for the honest coverage boundary. REMAINING dom-geometry gaps:
-   `scrollTop/scrollLeft` interactive offsets, viewport-relative rects (scroll compensation),
-   `getClientRects()`, and a full-cascade `getComputedStyle`.
-2. `document.body`/`documentElement`/`head` — missing. `dom/canvas.ad` document build. **[in progress]**
+   `scrollTop/scrollLeft` **static** value now DONE (writable data props default 0, `_set_el_geom_props`
+   in `dom/query.ad`; gate `domcore`) — INTERACTIVE scroll-following still deferred; viewport-relative
+   rects (scroll compensation), `getClientRects()`, and a full-cascade `getComputedStyle` remain open.
+2. `document.body`/`documentElement`/`head` — **DONE (gate `domcore`).** Each resolves to the
+   `<body>`/`<html>`/`<head>` element node — the SAME registered object `getElementById`/`querySelector`
+   returns, with live `className`/`style`/`classList` — via `_doc_set_el` in `dom/canvas.ad`
+   `_js_build_document` (scans the source for the first matching start tag, registers it through the
+   shared `_dom_register_el` dedup path, and stores it on `document`). `document.body.appendChild(...)`
+   renders AND coexists with a mutation on a node NESTED under body: `_build_rewrite` was refactored into
+   a recursive `_rewrite_range(lo,hi)` so an overridden element (e.g. body with an appended child) whose
+   inner content is not wholly replaced re-processes its own inner range instead of copying it raw —
+   previously a descendant's textContent/style override was silently dropped once its ancestor was
+   appended-to. `document.body.scrollHeight` reads the laid-out body box. **Boundary (honest):** the
+   source-anchored parser does NOT synthesize `html`/`head`/`body` when the tag is literally absent, so
+   a `<head>`-less or `<body>`-less document leaves that accessor unset (browsers synthesize it); nearly
+   all real pages carry the tags.
 3. opacity + rgba()/hsla() alpha compositing — **DONE (gate `boxshadow`).** rgba()/hsla()/`#rrggbbaa` alpha is captured (`css/values.ad` `g_cv_alpha`, `_parse_alpha_frac`) and `opacity:X` parsed (`css/cascade.ad`); both are folded into the packed background/border colour at rule-store time (`_pack_fill_rgb`/`_pack_bordc`: bits 24-28 = 5-bit alpha level, bit 31 stays 0 so the value survives the `>=0` guards and never collides with the -1 unset sentinel) and pass UNCHANGED through the layout record set (`bfill_rgb`/`bbox_rgb`); the paint pass composites the fill/border at that alpha over the background (`htmlpage.ad` `_hpg_alpha` + `htmlpaint_fill_round_rect_a`/`stroke_round_rect_a`/`_blend_px`). Verified by blended-pixel asserts: `opacity:.5` on `#3060c0`→(155,178,225), `rgba(255,0,0,.5)`→pink (255,132,132). LIMITATIONS: opacity dims the element's own fill+border only, NOT its text/descendants (no group compositing); alpha is quantised to 32 levels; opacity must share a rule with the background it dims; inline `style=` bg/border alpha not folded.
 4. linear/radial/conic-gradient backgrounds — swallowed (no bg). `css/cascade.ad`+`layout/box.ad`. **[in progress]**
 5. border-radius — swallowed (`cascade.ad:1021-1026`). `css/cascade.ad`+`layout/box.ad`. **[in progress]**
