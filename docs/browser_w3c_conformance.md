@@ -281,7 +281,55 @@ the passing host gates found the following.
   8 functions and 64 distinct chained values per page (degrades to the first function past the cap); the chain is
   applied over the element's border box only (out-of-flow descendants painted outside are not filtered).
 
-**TOP REMAINING W3C GAPS after the 2026-07-18e per-side-colour + filter-list round (a map for the next/round-6 agent,
+**GRID NAMED AREAS + CHECKBOX/RADIO SHAPES ROUND 2026-07-18f (round-6 — the map's #4 and #6, host-verified):**
+- **[css-grid §7.3/§8.5] `grid-template-areas` / `grid-area: NAME` named placement (NEW, gate `gridareas`).** The
+  #1 untouched CSS-grid gap and the highest-value real-site layout primitive: a page shell declared as a VISUAL map
+  (`grid-template-areas: "head head" "side main" "foot foot"`) with each item claiming a named rectangle via
+  `grid-area: NAME`. Previously `grid-template-areas` was brace/quote-skipped (the parser's own comment said
+  "deferred") and `grid-area` was unrecognised, so such a container fell back to raw source-order auto-flow —
+  header/sidebar/main/footer stacked in the wrong cells. Now `lib/web/css/cascade.ad` parses the quoted-string
+  template (`_grid_parse_areas`/`_ga_add_cell`) into each named area's **bounding rectangle** (0-based start row/col +
+  row/col span), interning names through the shared `_kf_intern` string registry; the rectangles ride the cascade as
+  a full parallel property (`r_gan`/`r_ga_*` rule arrays → `m_ga_*` winners on a dedicated specificity slot `bga`,
+  reset + tracked like the track templates) and the inline-`style=` path (`d_ga_*`). `grid-area` parses either a
+  custom-ident NAME (`_grid_area_parse` → `d_gareaname`/`m_gareaname`) or the line-based `row-start/col-start/
+  row-end/col-end` shorthand (desugared into the existing `grid-row`/`grid-column` start+span). At layout, the
+  container's area map is captured per grid frame in `lib/web/layout/box.ad` (`_flex_container_open` → `flex_gan`/
+  `flex_ga_*`), and `lib/web/dom/forms.ad`'s grid item-open path resolves the item's `grid-area` name to that frame's
+  rectangle, driving the EXISTING explicit-placement machinery (start row/col + spans, occupancy map). When
+  `grid-template-columns` is ABSENT, the column count is DERIVED from the areas template (equal 1fr tracks) so a
+  `grid-template-areas`-only grid still has real track x-positions. Verified HOST-ONLY (`test_hambrowse_gridareas_
+  host.sh`, fixture `hambrowse_gridareas.html`): a `150px 1fr` / `60px 200px 40px` page shell places `head`/`foot`
+  spanning the full width (SEG col 0, PNG width 640) with `side`/`main` side by side on the middle row (side a 150px
+  rail at x0, main starting at x150), and a SECOND grid with NO `grid-template-columns` derives three equal columns
+  from `"aa aa bb" "cc cc bb"` — area `bb` landing in the right (third) column, `cc` a row below `aa`. Pixel-verified
+  via `hb_grid_probe.py`. **HONEST SCOPE / LIMITATIONS:** up to `GAREA_MAX`=12 distinct named areas per container and
+  8 tracks (`GRID_MAXTRACK`); a name's cells are reduced to their **bounding box** (a non-rectangular / disjoint area
+  is tolerated as its bounding rect rather than rejected — a browser drops the whole template, but the useful
+  static-render behaviour is to place the box); multi-ROW areas render at distinct y ONLY when `grid-template-rows`
+  gives fixed heights (auto/content-sized rows compute a 0 track-top, so an explicit-row item without fixed row
+  heights can overlap — real area layouts specify `grid-template-rows`, exercised in the fixture); `grid-auto-flow:
+  dense`/column and `subgrid` remain out of scope.
+- **[html-forms] `<input type=checkbox|radio>` PIXEL SHAPES (NEW, gate `checkradio`).** Checkbox/radio previously
+  painted only their bracket ASCII (`[x]`/`(*)`); now the REAL pixel painter draws widget SHAPES. A new field-seg
+  kind (`lib/web/layout/box.ad` `_mark_check_seg`: 3 = checkbox, 4 = radio; the checked flag stashed in
+  `seg_fieldlen`) is set on the control's segment by `lib/web/dom/forms.ad` (the `[x]`/`( )` text is KEPT for the
+  text/gate view but the pixel painter skips it), and `lib/htmlpage.ad` draws: a **checkbox** as a rounded SQUARE —
+  unchecked a white box + grey border, checked an accent-blue (rgb 26,115,232) fill with a two-stroke white tick; a
+  **radio** as a CIRCLE (a rounded rect with radius = half the side) — unchecked a white circle + grey border,
+  checked the same with a filled accent centre dot. Verified HOST-ONLY through the gfx PPM backend
+  (`test_hambrowse_checkradio_host.sh`, fixture `hambrowse_checkradio.html`, probe `hb_checkradio_probe.py`): the
+  four controls classify top-to-bottom as checkbox SQUARE checked, checkbox SQUARE unchecked, radio CIRCLE checked,
+  radio CIRCLE unchecked — SHAPE from the box's top-edge ink width (a square's top edge is a ~9px horizontal line, a
+  circle's apex is ~1px), CHECKED state from the accent fill's presence, and the checked checkbox's 15×15 fill is
+  distinctly larger than the checked radio's ~9×9 centre dot. Zero regressions (`button`/`inputtypes`/`formvalid`
+  gates green — the text-field/button painter path and the ASCII text view are untouched). **HONEST SCOPE:** the
+  shape is a fixed ~15px widget (does not honour CSS `width`/`height`/`accent-color`/`appearance` on the control);
+  no indeterminate (`:indeterminate`) or focus-ring state; interactive toggle on click is the DOM/event layer's
+  separate concern (the rendered state follows the `checked` attribute, which a JS `.checked=` rewrite updates
+  through the normal re-render path).
+
+**TOP REMAINING W3C GAPS after the 2026-07-18f grid-areas + checkbox/radio round (a map for the next/round-7 agent,
 roughly by real-world value — the browser is now broad but NOT "fully W3C-implemented"; these are the concrete holes):**
 1. **[html-forms] `new FormData(formElement)` DOM-scrape — PARKED (out of the browser-agent file scope).** The
    reusable scraper ALREADY EXISTS (`lib/web/dom/canvas.ad` `_serialize_form`/`_serialize_field`), but wiring the
@@ -296,18 +344,20 @@ roughly by real-world value — the browser is now broad but NOT "fully W3C-impl
    axis-aligned fills; honouring `border-radius` needs arc-segment stroking per corner — deferred).
 3. **[ecmascript] RegExp `u`/`v` Unicode mode — ABSENT (byte-oriented VM).** `\u{...}` code-point classes,
    surrogate handling, `\p{...}` property escapes. Hard (VM rewrite); moderate value.
-4. **[css-grid] named `grid-template-areas`/`grid-area`, `grid-auto-flow:dense`/column, subgrid, >8 tracks**
-   (documented OUT-OF-SCOPE items #12/grid entries below) — the remaining grid holes. Highest-value untouched CSS
-   gap; the named-area parse + placement is self-contained in cascade/box. GOOD round-6 CANDIDATE.
+4. **[css-grid] named `grid-template-areas`/`grid-area` — DONE round-6 (gate `gridareas`).** Remaining grid holes:
+   `grid-auto-flow:dense`/column, `subgrid`, >8 tracks (`GRID_MAXTRACK`), >12 named areas per container, and
+   distinct-y multi-row areas without an explicit `grid-template-rows` (content-sized rows compute a 0 track-top).
+   Lower-value / harder — the high-value named-area layout primitive is now covered.
 5. **[css-filter] `filter` FUNCTION LISTS + `hue-rotate()` — DONE round-5 (gate `filterlist`).** Remaining filter
    holes: real `drop-shadow()` (still a recognised NO-OP — needs a blurred silhouette painted OUTSIDE the box,
    which the in-place post-pass model does not support) and `backdrop-filter` (filter what is BEHIND the element).
    Both need a compositing pass the static single-render model lacks — lower tractability.
-6. **[html-forms] `<input type=checkbox|radio>` PIXEL SHAPES** — checkbox/radio still paint their ASCII glyphs
-   (`[x]`/`( )`), not a real drawn square / circle with a checked mark. Self-contained (a new field-seg kind in
-   `dom/forms.ad` + a htmlpage shape painter, like the password field box). High real-world value; GOOD round-6
-   CANDIDATE. (The FormData(formElement) DOM-scrape half needs a JS↔DOM seam registered in `user/hambrowse*.ad`,
-   which is outside the browser-agent's file scope — park until the driver can register a `formdata_scraper` seam.)
+6. **[html-forms] `<input type=checkbox|radio>` PIXEL SHAPES — DONE round-6 (gate `checkradio`).** Checkbox draws a
+   rounded SQUARE (checked = accent fill + white tick), radio a CIRCLE (checked = filled accent dot). Remaining
+   form-control polish: honour CSS `width`/`height`/`accent-color`/`appearance` on the control, `:indeterminate` /
+   focus-ring states, and the interactive click-to-toggle (a DOM/event-layer concern). (The FormData(formElement)
+   DOM-scrape half still needs a JS↔DOM seam registered in `user/hambrowse*.ad`, outside the browser-agent's file
+   scope — park until the driver can register a `formdata_scraper` seam.)
 7. **[css-anim] extend the animation END-STATE overlay** to opacity + width/height + position offsets + margins
    (currently background/colour/transform/border-colour), and honour `animation-fill-mode` (only `forwards`/
    `both` should paint the end state; `none`/`backwards` should paint the FROM/`0%` frame). Low risk (the
