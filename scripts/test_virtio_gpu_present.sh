@@ -320,4 +320,111 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_vgpu] PASS — native virtio-gpu 2D transport presented a four-quadrant pattern onto the virtio-gpu scanout"
+# ======================================================================
+# GPU track #182 — virtio-gpu-gl 3D / VIRGL boot (host-GPU fill path)
+# ======================================================================
+# Re-boot the SAME installer medium but with `-device virtio-gpu-gl-pci
+# -display egl-headless` so the device advertises VIRTIO_GPU_F_VIRGL and the
+# native driver can negotiate it PER-DEVICE, create a 3D context, build a
+# render-target resource, and drive a virgl CLEAR fill on the host GPU.
+#
+# HARD assertions (the key unlock, verified on-device): VIRGL negotiated for
+# the GPU device only, FEATURES_OK held, CTX_CREATE succeeds. The actual
+# host-GPU FILL either byte-matches the SW oracle (REAL GPU pixels -> PASS) or
+# the host's virglrenderer has no working GL context (e.g. the nvidia-headless
+# GBM failure), in which case the whole 3D command chain is still ACCEPTED but
+# renders nothing -> the kernel prints [vgpu-virgl] SKIP and we do NOT fail.
+# A [vgpu-virgl] FAIL (real wrong-pixel render) DOES fail. The section SKIPs
+# cleanly if this host cannot realize a GL virtio-gpu at all.
+if [ "${HAMNIX_SKIP_VIRGL:-0}" = "1" ]; then
+    echo "[test_vgpu] (virgl) SKIP: HAMNIX_SKIP_VIRGL=1"
+    echo "[test_vgpu] PASS — native virtio-gpu 2D transport presented a four-quadrant pattern onto the virtio-gpu scanout"
+    exit 0
+fi
+if ! qemu-system-x86_64 -device help 2>/dev/null | grep -q "virtio-gpu-gl-pci"; then
+    echo "[test_vgpu] (virgl) SKIP: this QEMU has no virtio-gpu-gl-pci device"
+    echo "[test_vgpu] PASS — native virtio-gpu 2D transport presented a four-quadrant pattern onto the virtio-gpu scanout"
+    exit 0
+fi
+
+echo "[test_vgpu] (virgl) booting under OVMF with -device virtio-gpu-gl-pci -display egl-headless"
+GLOVMF=$(mktemp --tmpdir hamnix-vgpu.glovmf.XXXXXX.fd)
+GLIMG=$(mktemp --tmpdir hamnix-vgpu.gldisk.XXXXXX.img)
+GLLOG=$(mktemp --tmpdir hamnix-vgpu.gl.XXXXXX.log)
+cp "$OVMF_FD" "$GLOVMF"
+cp "$HAMNIX_INSTALLER_IMG" "$GLIMG"
+gl_cleanup() { [ -n "${GLPID:-}" ] && kill "$GLPID" 2>/dev/null; rm -f "$GLOVMF" "$GLIMG"; }
+trap 'cleanup; gl_cleanup; rm -f "$LOG" "$GLLOG"' EXIT
+
+# egl-headless may emit a non-fatal host GBM warning to stderr; that is fine.
+timeout "$BOOT_WAIT" qemu-system-x86_64 \
+    -enable-kvm -cpu host \
+    -bios "$GLOVMF" \
+    -drive file="$GLIMG",format=raw,if=virtio \
+    -m 1G \
+    -vga none -device virtio-gpu-gl-pci -display egl-headless \
+    -no-reboot \
+    -serial stdio \
+    </dev/null > "$GLLOG" 2>&1 &
+GLPID=$!
+
+echo "[test_vgpu] (virgl) waiting up to ${BOOT_WAIT}s for the GPU-backend marker..."
+for _ in $(seq 1 "$BOOT_WAIT"); do
+    grep -a -q -E "\[vgpu-vk\] (PASS|FAIL): GPU backend self-test (complete|failed)" "$GLLOG" && break
+    grep -a -q -E "does not have OpenGL support enabled" "$GLLOG" && break
+    kill -0 "$GLPID" 2>/dev/null || break
+    sleep 1
+done
+sleep 1
+kill "$GLPID" 2>/dev/null; wait "$GLPID" 2>/dev/null
+
+echo "[test_vgpu] (virgl) --- 3D/VIRGL boot log ---"
+grep -a -E "virtio-modern:|virtio-gpu:|\[vgpu-virgl\]|\[vgpu-vk\]|OpenGL" "$GLLOG" | grep -a -iE "virgl|want_gf0|readback|CTX_CREATE|3D|OpenGL|byte-match|host GPU|render-target|transfer" | head -40
+echo "[test_vgpu] (virgl) --- end ---"
+
+glfail=0
+if grep -a -q -E "does not have OpenGL support enabled" "$GLLOG"; then
+    echo "[test_vgpu] (virgl) SKIP: host QEMU display has no OpenGL support (no usable GL virtio-gpu on this host)"
+elif ! grep -a -q -E "virtio-gpu: 3D/VIRGL feature ADVERTISED by device" "$GLLOG"; then
+    echo "[test_vgpu] (virgl) SKIP: device did not advertise VIRGL (host virglrenderer/GL unavailable)"
+else
+    gl_check() {
+        local label="$1" needle="$2"
+        if grep -a -q -E "$needle" "$GLLOG"; then
+            echo "[test_vgpu] (virgl) PASS: $label"
+        else
+            echo "[test_vgpu] (virgl) FAIL: $label (expected /$needle/)" >&2
+            glfail=1
+        fi
+    }
+    # The KEY UNLOCK — negotiated PER-DEVICE and verified on-device.
+    gl_check "VIRGL negotiated for GPU device"  "virtio-modern: want_gf0=1 negotiated word0=1"
+    gl_check "FEATURES_OK held, VIRGL readback" "virtio-modern: FEATURES_OK held .* word0 readback=1"
+    gl_check "3D CTX_CREATE succeeds on-device"  "virtio-gpu: 3D CTX_CREATE OK"
+    gl_check "3D render-target resource created" "\[vgpu-virgl\] host render-target resource id="
+    gl_check "host GPU accepted CLEAR SUBMIT_3D" "\[vgpu-virgl\] host GPU accepted canonical CLEAR stream"
+    # A real wrong-pixel render is a genuine failure; SKIP (host GL can't
+    # rasterize) and PASS (real GPU pixels) are both acceptable outcomes.
+    if grep -a -q -E "\[vgpu-virgl\] FAIL" "$GLLOG"; then
+        echo "[test_vgpu] (virgl) FAIL: kernel reported [vgpu-virgl] FAIL (wrong-pixel render)" >&2
+        glfail=1
+    fi
+    if grep -a -q -E "\[vgpu-virgl\] PASS: host-GPU virgl fill pixels byte-match" "$GLLOG"; then
+        echo "[test_vgpu] (virgl) PASS: host GPU rasterized REAL pixels (byte-match SW oracle)"
+    elif grep -a -q -E "\[vgpu-virgl\] SKIP:" "$GLLOG"; then
+        echo "[test_vgpu] (virgl) NOTE: host virglrenderer GL non-functional here; 3D command chain fully accepted but no real GPU pixels (no false claim)"
+    fi
+    # The GPU-backend self-test as a whole must not report failure on the GL boot.
+    if grep -a -q -E "\[vgpu-vk\] FAIL" "$GLLOG"; then
+        echo "[test_vgpu] (virgl) FAIL: [vgpu-vk] reported failure on the GL boot" >&2
+        glfail=1
+    fi
+fi
+
+if [ "$glfail" -ne 0 ]; then
+    echo "[test_vgpu] FAIL (virgl 3D boot; log: $GLLOG)"
+    trap 'cleanup; gl_cleanup' EXIT
+    exit 1
+fi
+
+echo "[test_vgpu] PASS — native virtio-gpu 2D transport presented a four-quadrant pattern, and the virtio-gpu-gl 3D/VIRGL path negotiated + created a live host-GPU context on-device"

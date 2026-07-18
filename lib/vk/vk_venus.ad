@@ -40,6 +40,8 @@
 
 from drivers.video.virtio_gpu import (
     virtio_gpu_3d_available, virtio_gpu_submit_3d,
+    virtio_gpu_3d_create_rt, virtio_gpu_3d_rt_backing,
+    virtio_gpu_3d_rt_readback, virtio_gpu_3d_rt_roundtrip_probe,
 )
 
 
@@ -149,11 +151,74 @@ def vk_venus_encode_fill_rect(buf: uint64, res_handle: uint32,
     return 13
 
 
+# --- canonical virgl CLEAR path (CREATE surface + framebuffer + CLEAR) --
+#
+# CLEAR_TEXTURE (above) is a newer OPTIONAL virgl command; QEMU's bundled
+# virglrenderer may not implement it (observed on-device: the command is
+# ACCEPTED by virtio-gpu but renders nothing). The CANONICAL, always-
+# supported way to solid-fill a render target on the host GPU is the classic
+# gallium clear: create a SURFACE object over the texture, bind it as color
+# attachment 0 via SET_FRAMEBUFFER_STATE, then VIRGL_CCMD_CLEAR. This
+# encoder emits all three commands as ONE virgl stream. It is EXTERN-free and
+# byte-testable, and — unlike CLEAR_TEXTURE — actually rasterizes on the
+# host GPU under the shipped virglrenderer.
+VIRGL_CCMD_CREATE_OBJECT:         uint32 = 1
+VIRGL_CCMD_SET_FRAMEBUFFER_STATE: uint32 = 5
+VIRGL_CCMD_CLEAR7:                uint32 = 7    # the real CLEAR opcode (7)
+VIRGL_OBJECT_SURFACE:             uint32 = 8
+VIRGL_OBJ_SURFACE_SIZE:           uint32 = 5
+# virgl B8G8R8A8_UNORM format id (matches the RT texture format).
+VIRGL_FMT_B8G8R8A8_UNORM:         uint32 = 1
+
+
+def vk_venus_encode_clear_fill(buf: uint64, res_handle: uint32,
+                               surf_handle: uint32,
+                               cr: uint32, cg: uint32, cb: uint32,
+                               ca: uint32) -> uint32:
+    # Encode a 3-command virgl stream that solid-fills render-target resource
+    # `res_handle` to color (cr,cg,cb,ca) (IEEE-754 float bit patterns, RGBA
+    # logical order) on the HOST GPU:
+    #   1. CREATE_OBJECT(SURFACE)  — a color surface `surf_handle` over the RT
+    #   2. SET_FRAMEBUFFER_STATE   — bind it as color attachment 0
+    #   3. CLEAR                   — glClear the color buffer to the color
+    # Writes 19 dwords (6 + 4 + 9) into `buf`; returns the dword count. `buf`
+    # must hold >= 19 dwords (76 bytes).
+    p: uint64 = buf
+    # (1) CREATE_OBJECT / SURFACE — header + 5 body dwords.
+    cast[Ptr[uint32]](p + 0)[0]  = _virgl_cmd0(VIRGL_CCMD_CREATE_OBJECT,
+                                               VIRGL_OBJECT_SURFACE,
+                                               VIRGL_OBJ_SURFACE_SIZE)
+    cast[Ptr[uint32]](p + 4)[0]  = surf_handle           # surface object handle
+    cast[Ptr[uint32]](p + 8)[0]  = res_handle            # backing resource
+    cast[Ptr[uint32]](p + 12)[0] = VIRGL_FMT_B8G8R8A8_UNORM
+    cast[Ptr[uint32]](p + 16)[0] = 0                     # texture level 0
+    cast[Ptr[uint32]](p + 20)[0] = 0                     # first|last layer = 0
+    # (2) SET_FRAMEBUFFER_STATE — header + 3 body dwords (nr_cbufs, zsurf, cbuf0).
+    cast[Ptr[uint32]](p + 24)[0] = _virgl_cmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE,
+                                               0, 3)
+    cast[Ptr[uint32]](p + 28)[0] = 1                     # nr_cbufs
+    cast[Ptr[uint32]](p + 32)[0] = 0                     # zsurf_handle (none)
+    cast[Ptr[uint32]](p + 36)[0] = surf_handle           # cbuf[0] = our surface
+    # (3) CLEAR — header + 8 body dwords.
+    cast[Ptr[uint32]](p + 40)[0] = _virgl_cmd0(VIRGL_CCMD_CLEAR7, 0,
+                                               VIRGL_OBJ_CLEAR_SIZE)
+    cast[Ptr[uint32]](p + 44)[0] = PIPE_CLEAR_COLOR0     # buffers mask
+    cast[Ptr[uint32]](p + 48)[0] = cr                    # color.f[0]
+    cast[Ptr[uint32]](p + 52)[0] = cg                    # color.f[1]
+    cast[Ptr[uint32]](p + 56)[0] = cb                    # color.f[2]
+    cast[Ptr[uint32]](p + 60)[0] = ca                    # color.f[3]
+    cast[Ptr[uint32]](p + 64)[0] = 0                     # depth (double) lo
+    cast[Ptr[uint32]](p + 68)[0] = 0                     # depth (double) hi
+    cast[Ptr[uint32]](p + 72)[0] = 0                     # stencil
+    return 19
+
+
 # --- vk seam (availability + submit) -------------------------------
 
 # Scratch DWORD buffer for the encoded command stream (module-level so no
-# per-call allocation; single-threaded boot-time use).
-venus_cmd_buf: Array[16, uint32]
+# per-call allocation; single-threaded boot-time use). Holds the largest
+# stream we emit — the canonical CLEAR fill (19 dwords) — with headroom.
+venus_cmd_buf: Array[32, uint32]
 
 
 def vk_venus_available() -> int32:
@@ -201,6 +266,58 @@ def vk_venus_fill_rect(res_handle: uint32,
                                           res_handle, x, y, w, h,
                                           cr, cg, cb, ca)
     return virtio_gpu_submit_3d(cast[uint64](&venus_cmd_buf[0]), n)
+
+
+def vk_venus_clear_fill(res_handle: uint32, surf_handle: uint32,
+                        cr: uint32, cg: uint32, cb: uint32,
+                        ca: uint32) -> int32:
+    # CANONICAL host-GPU solid fill of the WHOLE render-target `res_handle` to
+    # color (cr,cg,cb,ca) via the CREATE-surface + SET_FRAMEBUFFER + CLEAR
+    # stream (vk_venus_encode_clear_fill). Unlike vk_venus_fill_rect
+    # (CLEAR_TEXTURE, optional/unsupported on some hosts) this uses the
+    # always-supported gallium clear and REALLY rasterizes on the host GPU.
+    # INERT (-1) unless a virgl device is live; returns 0 iff the device
+    # accepted the stream. Colors are IEEE-754 float bit patterns.
+    if virtio_gpu_3d_available() == 0:
+        return -1
+    n: uint32 = vk_venus_encode_clear_fill(cast[uint64](&venus_cmd_buf[0]),
+                                           res_handle, surf_handle,
+                                           cr, cg, cb, ca)
+    return virtio_gpu_submit_3d(cast[uint64](&venus_cmd_buf[0]), n)
+
+
+# --- render-target resource lifecycle seam (vk -> venus -> driver) -----
+#
+# These thread the driver's 3D render-target lifecycle up to the vk layer
+# WITHOUT vk importing the driver directly (vk_core -> vk_venus -> driver).
+# All INERT unless a live 3D context exists (VIRGL negotiated + CTX_CREATE
+# ok), so on a 2D / absent device they return 0 / -1.
+
+def vk_venus_create_rt(w: uint32, h: uint32) -> uint32:
+    # Create-or-fetch a host virgl RENDER-TARGET texture of size w×h and bind
+    # it to the live 3D context. Returns the virgl resource handle (non-zero)
+    # or 0 if 3D is not live. This handle is what vk_venus_fill_rect fills.
+    return virtio_gpu_3d_create_rt(w, h)
+
+
+def vk_venus_rt_backing() -> uint64:
+    # Identity-mapped VA of the RT resource's guest backing (0 if none). After
+    # a fill + vk_venus_rt_readback the GPU-produced pixels land here (BGRA).
+    return virtio_gpu_3d_rt_backing()
+
+
+def vk_venus_rt_readback(w: uint32, h: uint32) -> int32:
+    # TRANSFER_FROM_HOST_3D the w×h box of the RT resource back into its guest
+    # backing so the CPU can read the pixels the host GPU rasterized. Returns
+    # 0 on device-OK, -1 otherwise.
+    return virtio_gpu_3d_rt_readback(w, h)
+
+
+def vk_venus_rt_roundtrip_probe(w: uint32, h: uint32) -> int32:
+    # Diagnostic (see virtio_gpu_3d_rt_roundtrip_probe): 1 = host 3D data path
+    # ALIVE (a known pattern survived upload+download), 0 = host produced only
+    # zeros (host GL/EGL context non-functional), -1 = unavailable.
+    return virtio_gpu_3d_rt_roundtrip_probe(w, h)
 
 
 # ===================================================================

@@ -36,7 +36,8 @@ from drivers.virtio.virtio_ring import (
     VirtQueue, VirtBuf, virtq_add_chain3,
 )
 from drivers.virtio.virtio_modern import (
-    VirtioModernDev, virtio_modern_init, virtio_modern_setup_queue,
+    VirtioModernDev, virtio_modern_init, virtio_modern_init_ex,
+    virtio_modern_setup_queue,
     virtio_modern_driver_ok, virtio_modern_kick_and_wait,
 )
 
@@ -107,6 +108,19 @@ GPU_COMMON_DF:       uint64 = 4
 # The 3D context id this driver uses for its single foundation context.
 GPU_3D_CTX_ID:       uint32 = 1
 
+# virgl 3D render-target resource id. Distinct from GPU_RESOURCE_ID (the 2D
+# scanout resource, id 1) so the 3D fill path never disturbs the scanout.
+GPU_3D_RT_RES_ID:    uint32 = 2
+
+# virgl RESOURCE_CREATE_3D parameters (mesa virgl_hw.h / gallium):
+#   target = PIPE_TEXTURE_2D (2)
+#   format = VIRGL_FORMAT_B8G8R8A8_UNORM (1) — same byte order as the 2D
+#            scanout, so a readback lands as B,G,R,A bytes.
+#   bind   = VIRGL_BIND_RENDER_TARGET (1<<1) so CLEAR_TEXTURE can fill it.
+PIPE_TEXTURE_2D:              uint32 = 2
+VIRGL_FORMAT_B8G8R8A8_UNORM: uint32 = 1
+VIRGL_BIND_RENDER_TARGET:    uint32 = 0x2
+
 # 2D pixel format. B8G8R8A8_UNORM = 1 in the virtio-gpu formats enum.
 # QEMU treats this as little-endian BGRA bytes; we write our backing
 # buffer to match.
@@ -146,6 +160,11 @@ class VirtioGpu:
     height:        uint32
     virgl_avail:   int32               # 1 if device advertises VIRTIO_GPU_F_VIRGL
     ctx_ready:     int32               # 1 if a 3D context was created (negotiated)
+    rt_res_id:     uint32              # virgl 3D render-target resource id (0=none)
+    rt_backing:    uint64              # guest-physical backing of the RT resource
+    rt_w:          uint32              # RT texture width
+    rt_h:          uint32              # RT texture height
+    rt_ord:        int32               # buddy order of the RT backing allocation
 
 
 gpu_state: VirtioGpu
@@ -724,6 +743,218 @@ def virtio_gpu_submit_3d(cmd_va: uint64, dwords: uint32) -> int32:
     return -1
 
 
+# --- 3D render-target resource lifecycle (for the venus/virgl fill) ---
+#
+# The concrete lifecycle CLEAR_TEXTURE's `handle` needs to resolve to a real
+# host render target. All of it is GATED on ctx_ready (a live 3D context,
+# which requires VIRGL negotiated) so it is INERT on a plain 2D device.
+
+def _gpu_resource_create_3d(res_id: uint32, w: uint32, h: uint32) -> int32:
+    # virtio_gpu_resource_create_3d: hdr(24) + resource_id@24 + target@28 +
+    # format@32 + bind@36 + width@40 + height@44 + depth@48 + array_size@52 +
+    # last_level@56 + nr_samples@60 + flags@64 + padding@68 = 72 bytes.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_RESOURCE_CREATE_3D)
+    cast[Ptr[uint32]](a + 24)[0] = res_id
+    cast[Ptr[uint32]](a + 28)[0] = PIPE_TEXTURE_2D
+    cast[Ptr[uint32]](a + 32)[0] = VIRGL_FORMAT_B8G8R8A8_UNORM
+    cast[Ptr[uint32]](a + 36)[0] = VIRGL_BIND_RENDER_TARGET
+    cast[Ptr[uint32]](a + 40)[0] = w
+    cast[Ptr[uint32]](a + 44)[0] = h
+    cast[Ptr[uint32]](a + 48)[0] = 1                     # depth
+    cast[Ptr[uint32]](a + 52)[0] = 1                     # array_size
+    cast[Ptr[uint32]](a + 56)[0] = 0                     # last_level
+    cast[Ptr[uint32]](a + 60)[0] = 0                     # nr_samples
+    cast[Ptr[uint32]](a + 64)[0] = 0                     # flags
+    cast[Ptr[uint32]](a + 68)[0] = 0                     # padding
+    resp_type: uint32 = _submit(72, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: RESOURCE_CREATE_3D bad resp=%x\n",
+                cast[uint64](resp_type))
+        return -1
+    return 0
+
+
+def _gpu_attach_backing_res(res_id: uint32, phys: uint64,
+                            length: uint32) -> int32:
+    # Generic RESOURCE_ATTACH_BACKING for an arbitrary resource id (the 2D
+    # path's _gpu_attach_backing is unchanged; this serves the 3D RT). Same
+    # wire layout: hdr(24) + resource_id@24 + nr_entries@28 + one mem_entry
+    # {addr u64 @32, length u32 @40, padding u32 @44} = 48 bytes.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING)
+    cast[Ptr[uint32]](a + 24)[0] = res_id
+    cast[Ptr[uint32]](a + 28)[0] = 1                     # nr_entries
+    cast[Ptr[uint32]](a + 32)[0] = cast[uint32](phys & 0xFFFFFFFF)
+    cast[Ptr[uint32]](a + 36)[0] = cast[uint32](phys >> 32)
+    cast[Ptr[uint32]](a + 40)[0] = length
+    cast[Ptr[uint32]](a + 44)[0] = 0                     # padding
+    resp_type: uint32 = _submit(48, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: ATTACH_BACKING(3D) bad resp=%x\n",
+                cast[uint64](resp_type))
+        return -1
+    return 0
+
+
+def _gpu_ctx_attach_resource(res_id: uint32) -> int32:
+    # virtio_gpu_ctx_resource: hdr(24, ctx_id in header) + resource_id@24 +
+    # padding@28 = 32 bytes. Binds the resource to the 3D context so
+    # CLEAR_TEXTURE's handle resolves.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE)
+    cast[Ptr[uint32]](a + HDR_CTXID)[0] = GPU_3D_CTX_ID
+    cast[Ptr[uint32]](a + 24)[0] = res_id
+    cast[Ptr[uint32]](a + 28)[0] = 0                     # padding
+    resp_type: uint32 = _submit(32, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: CTX_ATTACH_RESOURCE bad resp=%x\n",
+                cast[uint64](resp_type))
+        return -1
+    return 0
+
+
+def _gpu_transfer_from_host_3d(res_id: uint32, x: uint32, y: uint32,
+                               w: uint32, h: uint32,
+                               stride: uint32) -> int32:
+    # virtio_gpu_transfer_host_3d: hdr(24, ctx_id in header) + box{x,y,z,w,h,d
+    # u32 @24..48} + offset u64 @48 + resource_id@56 + level@60 + stride@64 +
+    # layer_stride@68 = 72 bytes. Reads the host-rendered sub-box BACK into
+    # the guest backing so the CPU can inspect the GPU-produced pixels.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D)
+    cast[Ptr[uint32]](a + HDR_CTXID)[0] = GPU_3D_CTX_ID
+    cast[Ptr[uint32]](a + 24)[0] = x                     # box.x
+    cast[Ptr[uint32]](a + 28)[0] = y                     # box.y
+    cast[Ptr[uint32]](a + 32)[0] = 0                     # box.z
+    cast[Ptr[uint32]](a + 36)[0] = w                     # box.w
+    cast[Ptr[uint32]](a + 40)[0] = h                     # box.h
+    cast[Ptr[uint32]](a + 44)[0] = 1                     # box.d
+    cast[Ptr[uint32]](a + 48)[0] = 0                     # offset lo
+    cast[Ptr[uint32]](a + 52)[0] = 0                     # offset hi
+    cast[Ptr[uint32]](a + 56)[0] = res_id
+    cast[Ptr[uint32]](a + 60)[0] = 0                     # level
+    cast[Ptr[uint32]](a + 64)[0] = stride                # stride (bytes/row)
+    cast[Ptr[uint32]](a + 68)[0] = stride * h            # layer_stride
+    resp_type: uint32 = _submit(72, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: TRANSFER_FROM_HOST_3D bad resp=%x\n",
+                cast[uint64](resp_type))
+        return -1
+    return 0
+
+
+def virtio_gpu_3d_create_rt(w: uint32, h: uint32) -> uint32:
+    # Create (once) a virgl 3D RENDER-TARGET texture of size w×h, attach a
+    # guest backing, and bind it to the live 3D context. Returns the resource
+    # id (non-zero) on success, or 0 if 3D is not live / any step failed.
+    # Idempotent: a second call with the existing size returns the cached id.
+    if gpu_state.present == 0 or gpu_state.ctx_ready == 0:
+        return 0
+    if gpu_state.rt_res_id != 0 and gpu_state.rt_w == w \
+            and gpu_state.rt_h == h:
+        return gpu_state.rt_res_id
+    nbytes: uint64 = cast[uint64](w) * cast[uint64](h) * 4
+    order: int32 = _order_for_bytes(nbytes)
+    page: uint64 = alloc_pages(order)
+    if page == 0:
+        printk0("virtio-gpu: 3D RT backing alloc failed\n")
+        return 0
+    memset(cast[Ptr[uint8]](page), 0, _page_size_times(order))
+    phys: uint64 = virt_to_phys(page)
+    if _gpu_resource_create_3d(GPU_3D_RT_RES_ID, w, h) != 0:
+        return 0
+    if _gpu_attach_backing_res(GPU_3D_RT_RES_ID, phys,
+                               cast[uint32](nbytes)) != 0:
+        return 0
+    if _gpu_ctx_attach_resource(GPU_3D_RT_RES_ID) != 0:
+        return 0
+    gpu_state.rt_res_id = GPU_3D_RT_RES_ID
+    gpu_state.rt_backing = phys
+    gpu_state.rt_w = w
+    gpu_state.rt_h = h
+    gpu_state.rt_ord = order
+    printk2("virtio-gpu: 3D render-target resource ready %dx%d\n",
+            cast[uint64](w), cast[uint64](h))
+    return GPU_3D_RT_RES_ID
+
+
+def virtio_gpu_3d_rt_backing() -> uint64:
+    # Identity-mapped VA of the 3D RT resource's guest backing (0 if none).
+    return gpu_state.rt_backing
+
+
+def _gpu_transfer_to_host_3d(res_id: uint32, x: uint32, y: uint32,
+                             w: uint32, h: uint32, stride: uint32) -> int32:
+    # virtio_gpu_transfer_host_3d (same struct as FROM_HOST_3D) but UPLOADS
+    # the guest backing INTO the host resource. Used only by the round-trip
+    # probe below to test whether the host 3D data path is functional.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D)
+    cast[Ptr[uint32]](a + HDR_CTXID)[0] = GPU_3D_CTX_ID
+    cast[Ptr[uint32]](a + 24)[0] = x                     # box.x
+    cast[Ptr[uint32]](a + 28)[0] = y                     # box.y
+    cast[Ptr[uint32]](a + 32)[0] = 0                     # box.z
+    cast[Ptr[uint32]](a + 36)[0] = w                     # box.w
+    cast[Ptr[uint32]](a + 40)[0] = h                     # box.h
+    cast[Ptr[uint32]](a + 44)[0] = 1                     # box.d
+    cast[Ptr[uint32]](a + 48)[0] = 0                     # offset lo
+    cast[Ptr[uint32]](a + 52)[0] = 0                     # offset hi
+    cast[Ptr[uint32]](a + 56)[0] = res_id
+    cast[Ptr[uint32]](a + 60)[0] = 0                     # level
+    cast[Ptr[uint32]](a + 64)[0] = stride
+    cast[Ptr[uint32]](a + 68)[0] = stride * h
+    resp_type: uint32 = _submit(72, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: TRANSFER_TO_HOST_3D bad resp=%x\n",
+                cast[uint64](resp_type))
+        return -1
+    return 0
+
+
+def virtio_gpu_3d_rt_roundtrip_probe(w: uint32, h: uint32) -> int32:
+    # Diagnostic: write a known non-zero pattern (0xAB) into the RT backing,
+    # UPLOAD it to the host resource (TRANSFER_TO_HOST_3D), clobber the guest
+    # backing to zero, then DOWNLOAD it back (TRANSFER_FROM_HOST_3D). Returns:
+    #    1  = the pattern SURVIVED the host round-trip — the host 3D data path
+    #         (virglrenderer GL context + texture storage/transfer) is ALIVE.
+    #    0  = the readback is all-zero — the host produced nothing, i.e. the
+    #         host GL/EGL context is non-functional (e.g. QEMU's egl-headless
+    #         GBM device failed to create). NOT a guest-side bug.
+    #   -1  = 3D not live / a transfer command was rejected by the device.
+    # This lets the fill self-test distinguish a dead host GPU (environment)
+    # from a real encoding failure without ever faking a pixel.
+    if gpu_state.present == 0 or gpu_state.ctx_ready == 0:
+        return -1
+    if gpu_state.rt_res_id == 0:
+        return -1
+    back: uint64 = gpu_state.rt_backing
+    nbytes: uint64 = cast[uint64](w) * cast[uint64](h) * 4
+    memset(cast[Ptr[uint8]](back), 0xAB, nbytes)
+    if _gpu_transfer_to_host_3d(gpu_state.rt_res_id, 0, 0, w, h, w * 4) != 0:
+        return -1
+    memset(cast[Ptr[uint8]](back), 0, nbytes)
+    if _gpu_transfer_from_host_3d(gpu_state.rt_res_id, 0, 0, w, h, w * 4) != 0:
+        return -1
+    i: uint64 = 0
+    while i < nbytes:
+        if cast[Ptr[uint8]](back + i)[0] != 0:
+            return 1                             # pattern survived → path alive
+        i = i + 1
+    return 0                                     # all zero → host path dead
+
+
+def virtio_gpu_3d_rt_readback(w: uint32, h: uint32) -> int32:
+    # TRANSFER_FROM_HOST_3D the full w×h box of the RT resource back into its
+    # guest backing so the CPU can read the GPU-produced pixels. Returns 0 on
+    # device-OK, -1 otherwise (INERT unless the RT is live).
+    if gpu_state.present == 0 or gpu_state.ctx_ready == 0:
+        return -1
+    if gpu_state.rt_res_id == 0:
+        return -1
+    return _gpu_transfer_from_host_3d(gpu_state.rt_res_id, 0, 0, w, h, w * 4)
+
+
 # --- Probe + init --------------------------------------------------
 
 def virtio_gpu_init() -> int32:
@@ -740,7 +971,15 @@ def virtio_gpu_init() -> int32:
         return -1
     printk1("virtio-gpu: found device bdf=%x\n", cast[uint64](bdf))
 
-    if virtio_modern_init(bdf, &gpu_state.dev) != 0:
+    # Negotiate VIRTIO_GPU_F_VIRGL (feature word0 bit0) FOR THIS DEVICE.
+    # virtio_modern_init_ex only accepts the bit if the device actually
+    # offers it (a plain virtio-gpu-pci does not, so word0 negotiates to 0,
+    # byte-identical to the old virtio_modern_init path). virtio-9p and every
+    # other modern consumer keep calling the plain virtio_modern_init and are
+    # unaffected. This is the single transport unlock that lets CTX_CREATE /
+    # SUBMIT_3D succeed on a `-device virtio-gpu-gl` host.
+    if virtio_modern_init_ex(bdf, &gpu_state.dev,
+                             VIRTIO_GPU_F_VIRGL_BIT) != 0:
         printk0("virtio-gpu: modern transport init failed\n")
         return -1
     printk0("virtio-gpu: modern transport bound\n")
@@ -786,9 +1025,12 @@ def virtio_gpu_init() -> int32:
     if gpu_state.virgl_avail == 1:
         p3d: int32 = virtio_gpu_3d_ctx_probe()
         if p3d == 1:
+            # KEEP the context alive (ctx_ready stays 1): the render-target
+            # resource lifecycle (virtio_gpu_3d_create_rt) attaches its
+            # resource to THIS context so a CLEAR_TEXTURE fill can execute on
+            # the host GPU. (Previously we destroyed the probe context; now it
+            # is the live context the fill path uses.)
             printk0("virtio-gpu: 3D foundation LIVE (host GPU accel path open)\n")
-            _gpu_ctx_destroy()
-            gpu_state.ctx_ready = 0
         elif p3d == 0:
             printk0("virtio-gpu: 3D spine READY; VIRGL not yet negotiated by transport\n")
     return 0
