@@ -274,13 +274,30 @@ RHS, `if`/`while` conditions):
 | `split(s, sep)` | list of substrings between each `sep` |
 | `join(list, sep)` | concatenate a list's elements with `sep` |
 | `replace(s, old, new)` | replace every occurrence of `old` |
+| `ord(s)` | integer code of the first byte of `s` |
+| `chr(n)` | one-byte string whose code is `n` |
+| `bool(x)` | `x`'s truthiness as a bool |
+| `round(x)` | nearest integer (ties away from zero); an int passes through |
 
 ```
 name = ${upper("hamnix")}                 # HAMNIX
 parts = split("a,b,c", ",")               # ["a", "b", "c"]
 echo ${join(parts, " / ")}                # a / b / c
 echo ${replace("/usr/bin", "/", ":")}     # :usr:bin
+echo ${chr(ord("A") + 1)}                 # B
+echo ${round(3.7)} ${bool(0)}             # 4 false
 ```
+
+### 8b. Sequence arithmetic
+
+`+` and `*` follow Python's sequence semantics, alongside their numeric and
+string-concatenation meanings (§eval):
+
+- `list + list` → a new concatenated list (`[1,2] + [3,4]` → `[1,2,3,4]`).
+- `str * int` / `int * str` → the string repeated (`"ab" * 3` → `"ababab"`).
+- `list * int` / `int * list` → the list repeated (`[0] * 4` → `[0,0,0,0]`).
+
+A non-positive repeat count yields the empty sequence, as in Python.
 
 ---
 
