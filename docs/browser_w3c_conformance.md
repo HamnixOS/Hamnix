@@ -329,6 +329,79 @@ the passing host gates found the following.
   separate concern (the rendered state follows the `checked` attribute, which a JS `.checked=` rewrite updates
   through the normal re-render path).
 
+**ANIMATION-FILL-MODE + FORM-CONTROL POLISH ROUND 2026-07-18g (round-7 — the map's #7 and #6, host-verified):**
+- **[css-anim] `animation-fill-mode` + WIDENED @keyframes end-state overlay (NEW, gate `animfill`).** Round-2's
+  keyframe overlay ALWAYS painted the settled END frame (equivalent to `animation-fill-mode: forwards`) and overlaid
+  only background / colour / transform / border-colour. Now `lib/web/css/cascade.ad` `_parse_keyframes_body` captures
+  BOTH edge frames — the settled END frame (`100%`/`to`, else the last frame) AND the FROM frame (`0%`/`from`, else
+  the first frame) — as pseudo-rules tagged `r_kf_from` (0 = end, 1 = from). A new `_kf_sel_is_from` detector matches
+  `0%`/`from` (guarded so the trailing `0` of `100%` never false-matches). `animation-fill-mode` is parsed (the
+  `animation-fill-mode` longhand AND the unambiguous `forwards`/`backwards`/`both` keywords inside the `animation`
+  shorthand) into `d_animfill`/`r_animfill`/`m_animfill` (-1 unset / 0 none / 1 forwards / 2 backwards / 3 both), riding
+  the cascade on the same specificity slot as `animation-name`. `_cascade_match_current` now selects WHICH frame to
+  overlay: forwards/both **and the unspecified LEGACY default** overlay the END frame; an explicit **none/backwards**
+  overlay the FROM (0%) frame. The overlay also **widens** from four properties to also copy **width / height /
+  margins** (`r_wd`/`r_ht`/`r_ml`/`r_mr`/`r_mt`/`r_mb` → `m_*`, applied BEFORE the box-sizing + figure-margin passes so
+  they compose). Verified HOST-ONLY render-to-PNG (`test_hambrowse_animfill_host.sh`, fixture `hambrowse_animfill.html`,
+  6 boxes): a `forwards` and a `both` box settle to the end-frame green `#00aa00`, a `backwards` and an explicit-`none`
+  box show the 0%-frame red `#cc0000`, an unspecified box keeps the legacy end-frame green, and a box whose keyframe
+  animates `width` 80→300px settles (with `forwards`) to a painted width ~300px (read off the POSFILL x0/x1). Zero
+  regressions (the `keyframes` gate stays green — its `.fade` uses explicit `forwards`, `.slide` is unspecified → both
+  keep the end frame). **HONEST SCOPE / LIMITATIONS:** still the static settled-frame model (no timeline / no mid-frame
+  interpolation / no ticking). To preserve the round-2 gate the UNSPECIFIED fill-mode is treated as the legacy settled
+  END frame (real CSS default is `none`) — only an EXPLICIT `none`/`backwards` paints the FROM frame; this is the honest
+  zero-regression choice for a headless single render. Opacity is not overlaid as an independent channel (it rides the
+  packed background alpha via `_pack_fill_rgb` — a keyframe that animates ONLY opacity with no background does not shift
+  a bare box's alpha); position offsets (`top`/`left`) are not yet in the widened set. The doubled pseudo-rule count
+  (from + end per name) fits the 256-rule table for typical pages.
+- **[html-forms / css-ui] `accent-color` + `:indeterminate` on checkbox/radio (NEW, gate `accentind`).** Round-6 landed
+  the checkbox/radio pixel SHAPES but with a FIXED accent blue `rgb(26,115,232)` and only 2 states. Now **`accent-color`**
+  is a real cascade property: parsed in a SHARED `_box_decl` branch (so BOTH the stylesheet and inline `style=""` paths
+  honour it — `auto`/`currentcolor` fall back to the UA accent), riding `d_accent`/`r_accent`/`m_accent` on a dedicated
+  specificity slot `sacc` (`lib/web/css/cascade.ad`; a rule that declares ONLY `accent-color` is no longer dropped by the
+  "nothing to store" short-circuit). Because `<input>` is a VOID element (not pushed/cascaded on the normal flow),
+  `lib/web/dom/forms.ad`'s `_emit_input` resolves the control's accent via a transient **`_img_cascade`** (the same
+  push→cascade→inline→pop+restore-nth-child helper `<img>` uses), then merges the inline `style=""` `d_accent` over the
+  cascade `m_accent`, and stashes it per-segment in a new `seg_accent` (`lib/web/layout/box.ad`, exposed via
+  `he_seg_accent` in `lib/web/dom/canvas.ad`). `lib/htmlpage.ad` fills the checked box / radio dot / indeterminate dash in
+  that colour (UA blue when unset). **`:indeterminate`** is honoured via an `indeterminate` boolean attribute on the
+  control (the honest static trigger — `:indeterminate` has no HTML content attribute, only a JS property): it becomes
+  state 2 (`_mark_check_seg` now takes state 0/1/2 + accent), rendered as an accent-filled box with a centred white DASH
+  (distinct from the checked diagonal tick). Verified HOST-ONLY render-to-PNG (`test_hambrowse_accentind_host.sh`, fixture
+  `hambrowse_accentind.html`, probe `hb_accentind_probe.py`): a stylesheet `accent-color:#dd2222` checked checkbox fills
+  RED, an `indeterminate` checkbox is a UA-blue box with a centre dash, a plain checked checkbox is UA blue with no dash,
+  a stylesheet `accent-color:#22aa33` radio dot is GREEN, and an inline `style="accent-color:#ee8800"` checkbox fills
+  ORANGE. Zero regressions (`checkradio`/`inputtypes`/`formvalid`/`button` green). **HONEST SCOPE / LIMITATIONS:** the
+  control is still a fixed ~15px widget (CSS `width`/`height`/`appearance` on the control are NOT honoured — only
+  `accent-color`); `:indeterminate` is driven by the boolean attribute, not a live JS `.indeterminate=` property write
+  (a JS write would need the DOM re-render path to re-emit the segment); no focus-ring / `:checked`-pseudo styling;
+  interactive click-to-toggle remains a DOM/event-layer concern; the accent applies to checkbox/radio only (not range/
+  progress/other form controls).
+
+**TOP REMAINING W3C GAPS after the 2026-07-18g animation-fill-mode + form-control-polish round (a map for the next/
+round-8 agent, roughly by real-world value — the browser is now broad but NOT "fully W3C-implemented"; concrete holes):**
+1. **[ecmascript] RegExp `u`/`v` Unicode mode — ABSENT (byte-oriented VM).** `\u{...}` code-point classes, surrogate
+   handling, `\p{...}` property escapes. Hard (VM rewrite); moderate value. The single biggest remaining ES gap.
+2. **[css-grid] `grid-auto-flow: dense` / column-flow + `subgrid` — ABSENT.** Row-major auto-flow with occupancy-map
+   back-fill exists, but `dense` (back-fill earlier holes left by explicitly-placed spanning items), column-major flow,
+   `subgrid`, >8 tracks (`GRID_MAXTRACK`), >12 named areas per container, and distinct-y multi-row areas without an
+   explicit `grid-template-rows` remain. Tractable (self-contained placement loop in `lib/web/dom/forms.ad`), moderate
+   regression surface (many grid gates).
+3. **[css-filter] real `drop-shadow()` + `backdrop-filter` — ABSENT/no-op.** `drop-shadow()` is a recognised NO-OP
+   (needs a blurred silhouette painted OUTSIDE the box); `backdrop-filter` filters what is BEHIND the element. Both need
+   a compositing pass the static single-render model lacks — lower tractability.
+4. **[html-forms] form-control CSS geometry — checkbox/radio `width`/`height`/`appearance` + range/progress accent.**
+   `accent-color` + `:indeterminate` landed (round-7); the control is still a fixed ~15px widget that ignores CSS
+   `width`/`height`/`appearance`, and `accent-color` covers only checkbox/radio (not `<input type=range>`/`<progress>`).
+   Plus focus-ring / `:checked` pseudo-styling and interactive click-to-toggle (a DOM/event-layer concern).
+5. **[html5-parsing] adoption-agency / active-formatting-list reconstruction** — misnested inline recovery
+   (`<b><i>x</b>y</i>`) is still depth-counted, not spec-correct. Moderate value, self-contained in `lib/web/html`.
+6. **[dom] live `MediaQueryList` change events + `window.dispatchEvent` of a synthetic event + `scroll`/`resize`
+   sourcing** — all no-ops in the headless single-layout model. Low value without a live event loop.
+7. **[css-backgrounds-borders] rounded per-side borders** — a per-side-bordered box paints SQUARE corners (arc-segment
+   stroking per corner deferred). Low value; cosmetic.
+
+**HISTORICAL map (pre-round-7; retained for provenance — items renumbered/closed above):**
 **TOP REMAINING W3C GAPS after the 2026-07-18f grid-areas + checkbox/radio round (a map for the next/round-7 agent,
 roughly by real-world value — the browser is now broad but NOT "fully W3C-implemented"; these are the concrete holes):**
 1. **[html-forms] `new FormData(formElement)` DOM-scrape — PARKED (out of the browser-agent file scope).** The
