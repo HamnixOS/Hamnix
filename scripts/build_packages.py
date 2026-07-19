@@ -929,6 +929,9 @@ def _files_hamwrite() -> list[tuple[Path, str]]:
     # live /etc/hamde/apps ONLY when this package is installed.
     f.append((ETC_DIR / "hamde" / "apps-optional" / "hamwrite.desktop",
               "etc/hamde/apps/hamwrite.desktop"))
+    return f
+
+
 # ---- hamnix-hamangrybirds — repo-ONLY, NOT-preinstalled game --------------
 # Follows the hamnix-hamaudiobook pattern exactly: BUILT + published in the main
 # channel (installable via `hpm install hamnix-hamangrybirds` or the Software
