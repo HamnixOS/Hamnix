@@ -346,6 +346,15 @@ def main(argv):
     modules = list(MODULES)
     if with_driver:
         modules += DRIVER_EXTRA_MODULES
+        # The HOST self-hosting driver (fused_driver_host_main.ad) is the only
+        # driver that arms the Phase-1 AST optimizer (opt_run / opt_enable)
+        # under --opt. opt.ad depends only on parser/ir/lexer (all already
+        # ahead of it) and nothing depends on opt.ad, so appending it after
+        # codegen/elf_emit is dependency-safe. It is fused in ONLY for the host
+        # driver so the on-device compiler (fused_driver_main.ad, 256 MiB
+        # guest) is unaffected.
+        if DRIVER_MAIN == HOST_DRIVER_MAIN:
+            modules += ["opt.ad"]
 
     chunks = []
     header = (

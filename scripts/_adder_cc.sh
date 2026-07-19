@@ -144,7 +144,18 @@ adder_cc_link_kernel() {
     local tmp; tmp="$(mktemp -d)" || return 1
     local main_o="$tmp/main.o"
     # 1) host_ac emits the relocatable Adder object.
-    "$root/build/cutover/host_ac.elf" --target=x86_64-bare-metal "$in_ad" "$main_o" \
+    #    HAMNIX_KERNEL_OPT=1 compiles the kernel object WITH the Phase-1..5
+    #    optimizer (--opt). Default OFF -> byte-identical to the seed
+    #    (kobjdiff/objdiff clean). HAMNIX_KERNEL_OPT_NOVEC=1 additionally passes
+    #    --no-vec (bisection lever; the vectorizer is paint-shaped so normally
+    #    a no-op in the kernel, but the lever is here for isolation runs).
+    local -a kopt=()
+    if [ "${HAMNIX_KERNEL_OPT:-0}" = "1" ]; then
+        kopt+=("--opt")
+        [ "${HAMNIX_KERNEL_OPT_NOVEC:-0}" = "1" ] && kopt+=("--no-vec")
+        echo "[adder_cc] KERNEL --opt build (${kopt[*]})" >&2
+    fi
+    "$root/build/cutover/host_ac.elf" "${kopt[@]}" --target=x86_64-bare-metal "$in_ad" "$main_o" \
         || { echo "[adder_cc] ERROR: host_ac kernel .o emit failed" >&2; rm -rf "$tmp"; return 1; }
     # 2) Assemble the boot stubs + every other hand-written .S under arch/x86,
     #    fs, drivers (excluding the two boot stubs, which lead the link order).
