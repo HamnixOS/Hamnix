@@ -13,14 +13,18 @@ so ImageMagick `compare` is meaningful:
   1. flatten both images onto opaque white (kill any alpha);
   2. trim each image to its own content bounding box (drop uniform white
      margins the browser viewport / the canvas padding leave around content);
-  3. resize the reference content box to the hambrowse content box (WxH) so the
-     two are pixel-for-pixel comparable.
+  3. TOP-LEFT-ALIGN both content boxes on a shared canvas (max width x max
+     height of the two), padding the shorter/narrower one with white.
 
-Because both engines are driven with the SAME DejaVu faces at the SAME default
-UA sizes (16px body / 32px h1 / ...), the vertical + horizontal scale factors
-here are close to 1.0 — the resize is a small correction, not a distortion that
-manufactures agreement. The residual RMSE therefore tracks real LAYOUT + PAINT
-differences (box geometry, borders, radii, shadows, baselines, spacing), which
+Both engines are driven with the SAME DejaVu faces at the SAME default UA sizes
+(16px body / 32px h1 / ...), so horizontal + vertical scale is already ~1.0 and
+NO resize is needed. The OLD normalizer resized the reference to hambrowse's
+content box; that silently masked VERTICAL-RHYTHM errors — if hambrowse's line
+pitch or inter-block spacing was uniformly off, the resize squashed the
+reference to match and the diff normalized away. Padding to a common canvas
+instead makes vertical position / pitch / height differences register as REAL
+pixel diffs, so the residual RMSE honestly tracks LAYOUT + PAINT differences
+(box geometry, borders, radii, shadows, baselines, and — now — spacing), which
 is exactly the signal the engine team needs.
 
 USAGE
@@ -67,6 +71,15 @@ def content_bbox(im, bg=WHITE, pad=2, thresh=6):
     return (minx, miny, maxx, maxy)
 
 
+def pad_topleft(im, cw, ch):
+    """Place `im` at the top-left of a cw x ch white canvas."""
+    if im.size == (cw, ch):
+        return im
+    canvas = Image.new("RGB", (cw, ch), WHITE)
+    canvas.paste(im, (0, 0))
+    return canvas
+
+
 def main():
     hb_path, ref_path, out_hb, out_ref = sys.argv[1:5]
 
@@ -77,11 +90,17 @@ def main():
     ref = flatten_white(Image.open(ref_path))
     ref = ref.crop(content_bbox(ref))
     rw, rh = ref.size
-    ref = ref.resize((hw, hh), Image.LANCZOS)
+
+    # TOP-LEFT-ALIGN both onto a shared canvas (max extent), padding with white.
+    # No resize: vertical position / pitch / height differences must survive as
+    # real pixel diffs (see module docstring).
+    cw, ch = max(hw, rw), max(hh, rh)
+    hb = pad_topleft(hb, cw, ch)
+    ref = pad_topleft(ref, cw, ch)
 
     hb.save(out_hb)
     ref.save(out_ref)
-    print(f"hb_content={hw}x{hh} ref_content={rw}x{rh}->{hw}x{hh}")
+    print(f"hb_content={hw}x{hh} ref_content={rw}x{rh} canvas={cw}x{ch}")
 
 
 if __name__ == "__main__":
