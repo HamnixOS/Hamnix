@@ -934,6 +934,30 @@ def _files_hamwrite() -> list[tuple[Path, str]]:
     return f
 
 
+# ---- hamnix-hamsheet — the office SPREADSHEET, ALSO repo-ONLY -------------
+# HamSheet is the office suite's second app alongside HamWrite: a spreadsheet
+# with a scrollable grid, a recalculating formula engine (cell refs, arithmetic,
+# SUM/AVG/MIN/MAX/COUNT) and a HAMSHEET1 document container that round-trips
+# formulas. Same repo-ONLY pattern as HamWrite — BUILT + published in the main
+# channel (installable via hpm / the Software app), but excluded from the
+# hamnix-base closure so a fresh install does NOT carry it. Its payload is the
+# binary + its .desktop launcher (staged into /etc/hamde/apps ONLY when the
+# package is installed).
+
+HAMSHEET_PKG = "hamnix-hamsheet"
+
+
+def _files_hamsheet() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hamsheet")
+    # Launcher lives in etc/hamde/apps-optional/ (NOT etc/hamde/apps/, which the
+    # base hamnix-desktop-config package globs wholesale) and is staged into the
+    # live /etc/hamde/apps ONLY when this package is installed.
+    f.append((ETC_DIR / "hamde" / "apps-optional" / "hamsheet.desktop",
+              "etc/hamde/apps/hamsheet.desktop"))
+    return f
+
+
 # ---- hamnix-hamangrybirds — repo-ONLY, NOT-preinstalled game --------------
 # Follows the hamnix-hamaudiobook pattern exactly: BUILT + published in the main
 # channel (installable via `hpm install hamnix-hamangrybirds` or the Software
@@ -1197,6 +1221,24 @@ PACKAGE_SPECS.append({
 })
 
 
+# The repo-ONLY office spreadsheet. Same pattern as HamWrite: built + published
+# in the main channel but kept out of the hamnix-base closure below, so
+# `hpm install hamnix-hamsheet` / the Software app is the only way to get it.
+# Depends only on the compositor (scene-file DE) — no extra hardware stack.
+PACKAGE_SPECS.append({
+    "name": HAMSHEET_PKG,
+    "files_fn": _files_hamsheet,
+    "depends": [f"hamnix-desktop-core>={PKG_VERSION}"],
+    "description": ("HamSheet — Hamnix office spreadsheet: a scrollable cell "
+                    "grid holding numbers, text or =formulas with a "
+                    "recalculating engine (cell refs, + - * /, parens, "
+                    "SUM/AVG/MIN/MAX/COUNT over an A1:A5 range), and save/load "
+                    "of a HAMSHEET1 document that round-trips formulas. "
+                    "Repo-only: install from 255.one, not pre-installed."),
+    "target": "#hamnix-system",
+})
+
+
 # ---------------------------------------------------------------------
 # Generic spec-driven package builder
 # ---------------------------------------------------------------------
@@ -1313,6 +1355,8 @@ def build_hamnix_base() -> dict:
     leaf_names.add(HAMAUDIOBOOK_PKG)
     # The repo-only office word processor is likewise NOT pre-installed.
     leaf_names.add(HAMWRITE_PKG)
+    # The repo-only office spreadsheet is likewise NOT pre-installed.
+    leaf_names.add(HAMSHEET_PKG)
     # Likewise the repo-only Angry Birds game — 255.one / `hpm install` only.
     leaf_names.add(HAMANGRYBIRDS_PKG)
     depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS

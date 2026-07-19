@@ -1,0 +1,1278 @@
+# lib/hamsheetcore.ad — PURE, extern-free core for HamSheet, the Hamnix office
+# SPREADSHEET (/bin/hamsheet). The office suite's second app alongside HamWrite:
+# a scrollable grid of cells that hold numbers, text or `=formulas`, with a real
+# recalculating formula engine and a self-describing document file.
+#
+#   1. a scrollable GRID (A/B/C… column headers + 1/2/3… row headers) with a
+#      selected cell you move with the arrow keys / Tab / Enter,
+#   2. CELL VALUES: a cell holds a number, free text, or a `=formula`. Formulas
+#      support cell references (A1, B2), arithmetic (+ - * /), parentheses and
+#      the aggregate functions SUM / AVG / MIN / MAX / COUNT over an A1:A5 range
+#      or a comma list. A recalc pass (with a cycle guard) recomputes every
+#      dependent cell on each edit,
+#   3. a real DOCUMENT FILE (HAMSHEET1 container) that round-trips the RAW cell
+#      text — so formulas survive a save->load verbatim,
+#   4. a formula/status bar showing the current cell ref + its raw contents and
+#      the (basic, per-column) column widths.
+#
+# Like the other dual-target apps (docs/hamui_dual_target.md) this file imports
+# ONLY lib/hamscene (the pure display-list builder) and performs NO syscalls: it
+# owns the grid model, the formula evaluator, the keyboard editing, the toolbar
+# hit-testing and the grid render, and it SERIALISES the document as a pure byte
+# string — but the DRIVERS (native user/hamsheet.ad + the host harness
+# user/hamsheet_host.ad) do the open/read/write. That lets the exact shipping
+# code path render to a PNG on the dev host and be driven by scripted keystrokes
+# deterministically (scripts/test_hamsheet_host.sh).
+#
+# NUMBER MODEL — FIXED POINT (int64, extern-free, no FPU), seeded from
+# lib/hamcalccore.ad: a real value r is stored as `r * SCALE` with SCALE = 10^6.
+# All formula arithmetic is integer, so HamSheet computes IDENTICALLY under the
+# seed Python compiler and the self-hosted native compiler.
+
+from lib.hamscene import hamscene_begin, hamscene_fill, hamscene_stroke, \
+    hamscene_glyphs, hamscene_glyphs_bold, hamscene_line
+
+
+# ---- grid dimensions -------------------------------------------------------
+MAXROWS:  uint64 = 32
+MAXCOLS:  uint64 = 8
+CELLTEXT: uint64 = 40                    # bytes of raw text per cell
+NCELLS:   uint64 = 256                   # MAXROWS * MAXCOLS
+
+# Raw cell text (row-major, CELLTEXT bytes/cell) + its length.
+cell_raw: Array[10240, uint8]            # NCELLS * CELLTEXT
+cell_len: Array[256, uint8]
+
+# Evaluated value cache (rebuilt by hamsheet_recompute).
+#   val_kind: 0 EMPTY  1 NUMBER  2 TEXT  3 ERROR
+val_fp:     Array[256, int64]            # scaled numeric value (kind 1)
+val_kind:   Array[256, uint8]
+eval_state: Array[256, uint8]            # recompute visit state: 0 none 1 busy 2 done
+
+KIND_EMPTY: uint8 = 0
+KIND_NUM:   uint8 = 1
+KIND_TEXT:  uint8 = 2
+KIND_ERR:   uint8 = 3
+
+# Per-column widths (pixels) — "basic column widths".
+DEF_COLW: int32 = 72
+col_w: Array[8, int32]
+
+# Selection + scroll.
+sel_r:    uint64 = 0
+sel_c:    uint64 = 0
+top_row:  uint64 = 0                     # first visible data row
+left_col: uint64 = 0                     # first visible data column
+
+# In-cell edit state.
+EDIT_CAP:  uint64 = 40
+editing:   int32 = 0
+edit_buf:  Array[40, uint8]
+edit_len:  uint64 = 0
+
+dirty: int32 = 0
+flash: int32 = 0                         # "saved!" ack countdown
+
+# Action requested by a keystroke/click, drained by the driver: 0 none 1 save 2 open.
+pending_action: int32 = 0
+
+# CSI escape decode (arrow-key navigation): 0 ground, 1 saw ESC, 2 saw ESC '['.
+hs_esc: int32 = 0
+hs_par: int32 = 0
+
+# Current document filename (display only; the driver owns the real path).
+FNAME_CAP: uint64 = 128
+fname: Array[128, uint8]
+fname_len: uint64 = 0
+
+
+# ---- tiny pure helpers -----------------------------------------------------
+def _hs_slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _hs_udec(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    x: uint64 = v
+    while x > 0:
+        digs[n] = cast[uint8](x % 10) + 48
+        x = x / 10
+        n = n + 1
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digs[n]
+        i = i + 1
+    return i
+
+
+def _append_cstr(out: Ptr[uint8], p: uint64, s: Ptr[uint8]) -> uint64:
+    j: uint64 = 0
+    while s[j] != 0:
+        out[p] = s[j]
+        p = p + 1
+        j = j + 1
+    return p
+
+
+def _cidx(r: uint64, c: uint64) -> uint64:
+    return r * MAXCOLS + c
+
+
+def _cbase(r: uint64, c: uint64) -> uint64:
+    return (r * MAXCOLS + c) * CELLTEXT
+
+
+# ====================================================================
+# FIXED-POINT ARITHMETIC (all int64; SCALE = 10^6) — seeded from hamcalccore
+# ====================================================================
+SCALE:   int64 = 1000000
+SCALE10: int64 = 100000
+
+# Latched during a formula parse/eval when something goes wrong (bad syntax,
+# div-by-zero, out-of-range ref, or a dependency CYCLE) -> the cell reads ERR.
+parse_err: int32 = 0
+
+
+def _fp_mul(a: int64, b: int64) -> int64:
+    sign: int64 = 1
+    aa: int64 = a
+    bb: int64 = b
+    if aa < 0:
+        sign = 0 - sign
+        aa = 0 - aa
+    if bb < 0:
+        sign = 0 - sign
+        bb = 0 - bb
+    ah: int64 = aa / SCALE
+    al: int64 = aa % SCALE
+    bh: int64 = bb / SCALE
+    bl: int64 = bb % SCALE
+    r: int64 = SCALE * ah * bh + ah * bl + al * bh + (al * bl) / SCALE
+    return sign * r
+
+
+def _fp_div(a: int64, b: int64) -> int64:
+    if b == 0:
+        parse_err = 1
+        return 0
+    sign: int64 = 1
+    aa: int64 = a
+    bb: int64 = b
+    if aa < 0:
+        sign = 0 - sign
+        aa = 0 - aa
+    if bb < 0:
+        sign = 0 - sign
+        bb = 0 - bb
+    ip: int64 = aa / bb
+    rem: int64 = aa % bb
+    res: int64 = ip * SCALE
+    f: int64 = SCALE10
+    k: int32 = 0
+    while k < 6:
+        rem = rem * 10
+        d: int64 = rem / bb
+        rem = rem % bb
+        res = res + d * f
+        f = f / 10
+        k = k + 1
+    return sign * res
+
+
+# Render a scaled value into out (NUL-terminated); trailing zeros trimmed.
+def _render_scaled(v: int64, out: Ptr[uint8]) -> uint64:
+    neg: int32 = 0
+    uv: uint64 = 0
+    if v < 0:
+        neg = 1
+        uv = cast[uint64](0 - v)
+    else:
+        uv = cast[uint64](v)
+    su: uint64 = cast[uint64](SCALE)
+    ip: uint64 = uv / su
+    fp: uint64 = uv % su
+    p: uint64 = 0
+    if neg != 0:
+        out[p] = 45
+        p = p + 1
+    p = p + _hs_udec(ip, &out[p])
+    if fp != 0:
+        fd: Array[6, uint8]
+        d: int32 = 5
+        x: uint64 = fp
+        while d >= 0:
+            fd[d] = cast[uint8](x % 10) + 48
+            x = x / 10
+            d = d - 1
+        last: int32 = 5
+        while last > 0 and fd[last] == 48:
+            last = last - 1
+        out[p] = 46
+        p = p + 1
+        i: int32 = 0
+        while i <= last:
+            out[p] = fd[i]
+            p = p + 1
+            i = i + 1
+    out[p] = 0
+    return p
+
+
+# ====================================================================
+# FORMULA PARSER (recursive descent over a cell's raw text)
+# ====================================================================
+# The parser reads directly from a cell's raw bytes via a caller-owned cursor
+# (pos), so it is REENTRANT: evaluating a cell reference recurses into
+# _eval_cell for the target with ITS OWN cursor, while the outer parse resumes
+# from its own local pos. All numbers are scaled int64.
+
+def _is_digit(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return 1
+    return 0
+
+
+def _is_alpha(c: uint8) -> int32:
+    if (c >= 65 and c <= 90) or (c >= 97 and c <= 122):
+        return 1
+    return 0
+
+
+def _up(c: uint8) -> uint8:
+    if c >= 97 and c <= 122:
+        return c - 32
+    return c
+
+
+def _skip_ws(s: Ptr[uint8], n: uint64, pos: Ptr[uint64]):
+    while pos[0] < n and (s[pos[0]] == 32 or s[pos[0]] == 9):
+        pos[0] = pos[0] + 1
+
+
+# Parse a decimal literal at the cursor into a scaled int64.
+def _parse_number(s: Ptr[uint8], n: uint64, pos: Ptr[uint64]) -> int64:
+    ip: int64 = 0
+    while pos[0] < n and _is_digit(s[pos[0]]) != 0:
+        ip = ip * 10 + cast[int64](s[pos[0]]) - 48
+        pos[0] = pos[0] + 1
+    val: int64 = ip * SCALE
+    if pos[0] < n and s[pos[0]] == 46:                 # '.'
+        pos[0] = pos[0] + 1
+        f: int64 = SCALE10
+        while pos[0] < n and _is_digit(s[pos[0]]) != 0:
+            if f > 0:
+                val = val + (cast[int64](s[pos[0]]) - 48) * f
+                f = f / 10
+            pos[0] = pos[0] + 1
+    return val
+
+
+# Try to read a cell reference (letters then digits) at the cursor. On success
+# returns 1 and fills *col,*row (0-based); leaves the cursor past the ref. On
+# failure returns 0 and RESTORES the cursor.
+def _parse_cellref(s: Ptr[uint8], n: uint64, pos: Ptr[uint64],
+                   col: Ptr[uint64], row: Ptr[uint64]) -> int32:
+    start: uint64 = pos[0]
+    c: uint64 = 0
+    letters: int32 = 0
+    while pos[0] < n and _is_alpha(s[pos[0]]) != 0:
+        c = c * 26 + cast[uint64](_up(s[pos[0]]) - 65) + 1
+        pos[0] = pos[0] + 1
+        letters = letters + 1
+    if letters == 0 or pos[0] >= n or _is_digit(s[pos[0]]) == 0:
+        pos[0] = start
+        return 0
+    rr: uint64 = 0
+    while pos[0] < n and _is_digit(s[pos[0]]) != 0:
+        rr = rr * 10 + cast[uint64](s[pos[0]]) - 48
+        pos[0] = pos[0] + 1
+    if c == 0 or rr == 0:
+        pos[0] = start
+        return 0
+    col[0] = c - 1                                      # A -> 0
+    row[0] = rr - 1                                     # 1 -> 0
+    return 1
+
+
+# Function id from an UPPERCASED name; -1 if unknown.
+def _fn_id(s: Ptr[uint8], a: uint64, b: uint64) -> int32:
+    ln: uint64 = b - a
+    nm: Array[8, uint8]
+    i: uint64 = 0
+    while i < ln and i < 7:
+        nm[i] = _up(s[a + i])
+        i = i + 1
+    nm[i] = 0
+    if _streq(&nm[0], cast[Ptr[uint8]]("SUM")) != 0:
+        return 0
+    if _streq(&nm[0], cast[Ptr[uint8]]("AVG")) != 0:
+        return 1
+    if _streq(&nm[0], cast[Ptr[uint8]]("MIN")) != 0:
+        return 2
+    if _streq(&nm[0], cast[Ptr[uint8]]("MAX")) != 0:
+        return 3
+    if _streq(&nm[0], cast[Ptr[uint8]]("COUNT")) != 0:
+        return 4
+    return -1
+
+
+def _streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] == b[i]:
+        return 1
+    return 0
+
+
+# Numeric value of cell (col,row) for use inside a formula. Evaluates it first
+# (recursing, with the cycle guard). Non-numeric or out-of-range -> not-a-number
+# (ok=0). ok is returned; the value via *out.
+def _ref_num(col: uint64, row: uint64, out: Ptr[int64]) -> int32:
+    if row >= MAXROWS or col >= MAXCOLS:
+        out[0] = 0
+        return 0
+    idx: uint64 = _cidx(row, col)
+    if eval_state[idx] == 1:                            # cycle: target in progress
+        parse_err = 1
+        out[0] = 0
+        return 0
+    _eval_cell(row, col)
+    if val_kind[idx] == KIND_NUM:
+        out[0] = val_fp[idx]
+        return 1
+    if val_kind[idx] == KIND_ERR:
+        parse_err = 1
+    out[0] = 0
+    return 0
+
+
+# Aggregate function evaluation. Cursor sits just past the function name; reads
+# '(' args... ')'. Args are ranges (A1:A5), single refs, or expressions.
+def _eval_function(fn: int32, s: Ptr[uint8], n: uint64,
+                   pos: Ptr[uint64]) -> int64:
+    _skip_ws(s, n, pos)
+    if pos[0] >= n or s[pos[0]] != 40:                 # '('
+        parse_err = 1
+        return 0
+    pos[0] = pos[0] + 1
+    fsum: int64 = 0
+    fcnt: int64 = 0
+    fmin: int64 = 0
+    fmax: int64 = 0
+    fhave: int32 = 0
+    while True:
+        _skip_ws(s, n, pos)
+        if pos[0] >= n:
+            parse_err = 1
+            return 0
+        if s[pos[0]] == 41:                            # ')'
+            pos[0] = pos[0] + 1
+            break
+        # Try a range or single reference first.
+        save: uint64 = pos[0]
+        c1: uint64 = 0
+        r1: uint64 = 0
+        if _parse_cellref(s, n, pos, &c1, &r1) != 0:
+            _skip_ws(s, n, pos)
+            if pos[0] < n and s[pos[0]] == 58:         # ':' -> range
+                pos[0] = pos[0] + 1
+                _skip_ws(s, n, pos)
+                c2: uint64 = 0
+                r2: uint64 = 0
+                if _parse_cellref(s, n, pos, &c2, &r2) == 0:
+                    parse_err = 1
+                    return 0
+                ra: uint64 = r1
+                rb: uint64 = r2
+                if rb < ra:
+                    ra = r2
+                    rb = r1
+                ca: uint64 = c1
+                cb: uint64 = c2
+                if cb < ca:
+                    ca = c2
+                    cb = c1
+                rr: uint64 = ra
+                while rr <= rb:
+                    cc: uint64 = ca
+                    while cc <= cb:
+                        rv: int64 = 0
+                        if _ref_num(cc, rr, &rv) != 0:
+                            fsum = fsum + rv
+                            if fhave == 0 or rv < fmin:
+                                fmin = rv
+                            if fhave == 0 or rv > fmax:
+                                fmax = rv
+                            fhave = 1
+                            fcnt = fcnt + 1
+                        cc = cc + 1
+                    rr = rr + 1
+            else:
+                # single ref: rewind & let the expression parser take it so
+                # arithmetic like SUM(A1+1) still works.
+                pos[0] = save
+                ev: int64 = _parse_expr(s, n, pos)
+                fsum = fsum + ev
+                if fhave == 0 or ev < fmin:
+                    fmin = ev
+                if fhave == 0 or ev > fmax:
+                    fmax = ev
+                fhave = 1
+                fcnt = fcnt + 1
+        else:
+            ev2: int64 = _parse_expr(s, n, pos)
+            fsum = fsum + ev2
+            if fhave == 0 or ev2 < fmin:
+                fmin = ev2
+            if fhave == 0 or ev2 > fmax:
+                fmax = ev2
+            fhave = 1
+            fcnt = fcnt + 1
+        _skip_ws(s, n, pos)
+        if pos[0] < n and s[pos[0]] == 44:             # ',' -> more args
+            pos[0] = pos[0] + 1
+            continue
+    if fhave == 0:
+        return 0
+    if fn == 0:                                        # SUM
+        return fsum
+    if fn == 1:                                        # AVG
+        return _fp_div(fsum, fcnt * SCALE)
+    if fn == 2:                                        # MIN
+        return fmin
+    if fn == 3:                                        # MAX
+        return fmax
+    return fcnt * SCALE                                # COUNT
+
+
+def _parse_primary(s: Ptr[uint8], n: uint64, pos: Ptr[uint64]) -> int64:
+    _skip_ws(s, n, pos)
+    if pos[0] >= n:
+        parse_err = 1
+        return 0
+    c: uint8 = s[pos[0]]
+    if c == 43:                                        # unary '+'
+        pos[0] = pos[0] + 1
+        return _parse_primary(s, n, pos)
+    if c == 45:                                        # unary '-'
+        pos[0] = pos[0] + 1
+        return 0 - _parse_primary(s, n, pos)
+    if c == 40:                                        # '(' expr ')'
+        pos[0] = pos[0] + 1
+        v: int64 = _parse_expr(s, n, pos)
+        _skip_ws(s, n, pos)
+        if pos[0] < n and s[pos[0]] == 41:
+            pos[0] = pos[0] + 1
+        else:
+            parse_err = 1
+        return v
+    if _is_digit(c) != 0 or c == 46:                   # number
+        return _parse_number(s, n, pos)
+    if _is_alpha(c) != 0:
+        # name: a function call (NAME '(') or a cell reference (letters+digits).
+        start: uint64 = pos[0]
+        while pos[0] < n and _is_alpha(s[pos[0]]) != 0:
+            pos[0] = pos[0] + 1
+        after: uint64 = pos[0]
+        if pos[0] < n and _is_digit(s[pos[0]]) != 0:
+            # cell reference — rewind & parse it fully.
+            pos[0] = start
+            col: uint64 = 0
+            row: uint64 = 0
+            if _parse_cellref(s, n, pos, &col, &row) == 0:
+                parse_err = 1
+                return 0
+            rv: int64 = 0
+            _ref_num(col, row, &rv)                     # non-numeric ref -> 0
+            return rv
+        _skip_ws(s, n, pos)
+        if pos[0] < n and s[pos[0]] == 40:             # function
+            fn: int32 = _fn_id(s, start, after)
+            if fn < 0:
+                parse_err = 1
+                return 0
+            return _eval_function(fn, s, n, pos)
+        parse_err = 1
+        return 0
+    parse_err = 1
+    return 0
+
+
+def _parse_term(s: Ptr[uint8], n: uint64, pos: Ptr[uint64]) -> int64:
+    v: int64 = _parse_primary(s, n, pos)
+    while True:
+        _skip_ws(s, n, pos)
+        if pos[0] >= n:
+            break
+        op: uint8 = s[pos[0]]
+        if op == 42:                                   # '*'
+            pos[0] = pos[0] + 1
+            v = _fp_mul(v, _parse_primary(s, n, pos))
+        elif op == 47:                                 # '/'
+            pos[0] = pos[0] + 1
+            v = _fp_div(v, _parse_primary(s, n, pos))
+        else:
+            break
+    return v
+
+
+def _parse_expr(s: Ptr[uint8], n: uint64, pos: Ptr[uint64]) -> int64:
+    v: int64 = _parse_term(s, n, pos)
+    while True:
+        _skip_ws(s, n, pos)
+        if pos[0] >= n:
+            break
+        op: uint8 = s[pos[0]]
+        if op == 43:                                   # '+'
+            pos[0] = pos[0] + 1
+            v = v + _parse_term(s, n, pos)
+        elif op == 45:                                 # '-'
+            pos[0] = pos[0] + 1
+            v = v - _parse_term(s, n, pos)
+        else:
+            break
+    return v
+
+
+# ====================================================================
+# CELL EVALUATION + RECALC
+# ====================================================================
+# Classify a raw cell (no '=' -> number if it fully parses, else text).
+def _looks_numeric(base: uint64, ln: uint64) -> int32:
+    i: uint64 = 0
+    if i < ln and (cell_raw[base + i] == 45 or cell_raw[base + i] == 43):
+        i = i + 1
+    seen: int32 = 0
+    dot: int32 = 0
+    while i < ln:
+        ch: uint8 = cell_raw[base + i]
+        if _is_digit(ch) != 0:
+            seen = 1
+        elif ch == 46 and dot == 0:
+            dot = 1
+        else:
+            return 0
+        i = i + 1
+    return seen
+
+
+def _eval_cell(r: uint64, c: uint64):
+    idx: uint64 = _cidx(r, c)
+    if eval_state[idx] == 2:
+        return
+    if eval_state[idx] == 1:                            # cycle
+        val_kind[idx] = KIND_ERR
+        val_fp[idx] = 0
+        eval_state[idx] = 2
+        return
+    eval_state[idx] = 1
+    ln: uint64 = cast[uint64](cell_len[idx])
+    base: uint64 = _cbase(r, c)
+    if ln == 0:
+        val_kind[idx] = KIND_EMPTY
+        val_fp[idx] = 0
+        eval_state[idx] = 2
+        return
+    if cell_raw[base] == 61:                            # '=' formula
+        parse_err = 0
+        pos: uint64 = 1
+        v: int64 = _parse_expr(&cell_raw[base], ln, &pos)
+        _skip_ws(&cell_raw[base], ln, &pos)
+        if parse_err != 0 or pos < ln:
+            val_kind[idx] = KIND_ERR
+            val_fp[idx] = 0
+        else:
+            val_kind[idx] = KIND_NUM
+            val_fp[idx] = v
+        eval_state[idx] = 2
+        return
+    if _looks_numeric(base, ln) != 0:
+        pos2: uint64 = 0
+        neg: int32 = 0
+        if cell_raw[base] == 45:
+            neg = 1
+            pos2 = 1
+        elif cell_raw[base] == 43:
+            pos2 = 1
+        nv: int64 = _parse_number(&cell_raw[base], ln, &pos2)
+        if neg != 0:
+            nv = 0 - nv
+        val_kind[idx] = KIND_NUM
+        val_fp[idx] = nv
+        eval_state[idx] = 2
+        return
+    val_kind[idx] = KIND_TEXT
+    val_fp[idx] = 0
+    eval_state[idx] = 2
+
+
+# PUBLIC: recompute the whole sheet (reset caches, then evaluate every cell).
+def hamsheet_recompute():
+    i: uint64 = 0
+    while i < NCELLS:
+        eval_state[i] = 0
+        i = i + 1
+    r: uint64 = 0
+    while r < MAXROWS:
+        c: uint64 = 0
+        while c < MAXCOLS:
+            _eval_cell(r, c)
+            c = c + 1
+        r = r + 1
+
+
+# ---- cell accessors --------------------------------------------------------
+def hamsheet_set_cell(r: uint64, c: uint64, s: Ptr[uint8]):
+    if r >= MAXROWS or c >= MAXCOLS:
+        return
+    idx: uint64 = _cidx(r, c)
+    base: uint64 = _cbase(r, c)
+    i: uint64 = 0
+    while s[i] != 0 and i < CELLTEXT - 1:
+        cell_raw[base + i] = s[i]
+        i = i + 1
+    cell_len[idx] = cast[uint8](i)
+    dirty = 1
+    hamsheet_recompute()
+
+
+def hamsheet_cell_raw_ptr(r: uint64, c: uint64) -> Ptr[uint8]:
+    return &cell_raw[_cbase(r, c)]
+
+
+def hamsheet_cell_raw_len(r: uint64, c: uint64) -> uint64:
+    return cast[uint64](cell_len[_cidx(r, c)])
+
+
+def hamsheet_cell_kind(r: uint64, c: uint64) -> uint8:
+    return val_kind[_cidx(r, c)]
+
+
+def hamsheet_cell_value_fp(r: uint64, c: uint64) -> int64:
+    return val_fp[_cidx(r, c)]
+
+
+# Display string for a cell into out (NUL-terminated); returns length.
+def hamsheet_cell_display(r: uint64, c: uint64, out: Ptr[uint8]) -> uint64:
+    idx: uint64 = _cidx(r, c)
+    k: uint8 = val_kind[idx]
+    if k == KIND_EMPTY:
+        out[0] = 0
+        return 0
+    if k == KIND_ERR:
+        out[0] = 35                                    # '#'
+        out[1] = 69
+        out[2] = 82
+        out[3] = 82
+        out[4] = 0
+        return 4
+    if k == KIND_NUM:
+        return _render_scaled(val_fp[idx], out)
+    # text: copy the raw bytes
+    base: uint64 = _cbase(r, c)
+    ln: uint64 = cast[uint64](cell_len[idx])
+    i: uint64 = 0
+    while i < ln:
+        out[i] = cell_raw[base + i]
+        i = i + 1
+    out[i] = 0
+    return ln
+
+
+# Column label (0->"A", 25->"Z", 26->"AA") into out; returns length.
+def hamsheet_col_label(c: uint64, out: Ptr[uint8]) -> uint64:
+    tmp: Array[8, uint8]
+    n: uint64 = 0
+    v: uint64 = c + 1
+    while v > 0:
+        rem: uint64 = (v - 1) % 26
+        tmp[n] = cast[uint8](rem) + 65
+        v = (v - 1) / 26
+        n = n + 1
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = tmp[n]
+        i = i + 1
+    out[i] = 0
+    return i
+
+
+# Current cell reference (e.g. "B3") into out; returns length.
+def hamsheet_cur_ref(out: Ptr[uint8]) -> uint64:
+    p: uint64 = hamsheet_col_label(sel_c, out)
+    p = p + _hs_udec(sel_r + 1, &out[p])
+    out[p] = 0
+    return p
+
+
+def hamsheet_sel_row() -> uint64:
+    return sel_r
+
+
+def hamsheet_sel_col() -> uint64:
+    return sel_c
+
+
+def hamsheet_dirty() -> int32:
+    return dirty
+
+
+def hamsheet_editing() -> int32:
+    return editing
+
+
+def hamsheet_mark_saved():
+    dirty = 0
+    flash = 8
+
+
+def hamsheet_take_action() -> int32:
+    a: int32 = pending_action
+    pending_action = 0
+    return a
+
+
+def hamsheet_set_fname(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and i < FNAME_CAP - 1:
+        fname[i] = s[i]
+        i = i + 1
+    fname[i] = 0
+    fname_len = i
+
+
+def hamsheet_clear():
+    i: uint64 = 0
+    while i < NCELLS:
+        cell_len[i] = 0
+        val_kind[i] = KIND_EMPTY
+        val_fp[i] = 0
+        eval_state[i] = 0
+        i = i + 1
+    sel_r = 0
+    sel_c = 0
+    top_row = 0
+    left_col = 0
+    editing = 0
+    edit_len = 0
+    dirty = 0
+
+
+def hamsheet_init():
+    j: uint64 = 0
+    while j < MAXCOLS:
+        col_w[j] = DEF_COLW
+        j = j + 1
+    hamsheet_clear()
+
+
+# ====================================================================
+# EDITING + KEYBOARD
+# ====================================================================
+def _commit_edit():
+    if editing == 0:
+        return
+    edit_buf[edit_len] = 0
+    hamsheet_set_cell(sel_r, sel_c, &edit_buf[0])
+    editing = 0
+    edit_len = 0
+
+
+def _cancel_edit():
+    editing = 0
+    edit_len = 0
+
+
+def _begin_edit_empty():
+    editing = 1
+    edit_len = 0
+
+
+def _move(dr: int64, dc: int64):
+    nr: int64 = cast[int64](sel_r) + dr
+    nc: int64 = cast[int64](sel_c) + dc
+    if nr < 0:
+        nr = 0
+    if nc < 0:
+        nc = 0
+    if nr >= cast[int64](MAXROWS):
+        nr = cast[int64](MAXROWS) - 1
+    if nc >= cast[int64](MAXCOLS):
+        nc = cast[int64](MAXCOLS) - 1
+    sel_r = cast[uint64](nr)
+    sel_c = cast[uint64](nc)
+    _ensure_visible()
+
+
+def _clear_cell():
+    idx: uint64 = _cidx(sel_r, sel_c)
+    if cell_len[idx] != 0:
+        cell_len[idx] = 0
+        dirty = 1
+        hamsheet_recompute()
+
+
+# Arrow / navigation final byte. Commits any active edit first, then moves.
+def _hs_nav(fin: int32) -> int32:
+    if editing != 0:
+        _commit_edit()
+    if fin == 68:                                      # Left
+        _move(0, -1)
+    elif fin == 67:                                    # Right
+        _move(0, 1)
+    elif fin == 65:                                    # Up
+        _move(-1, 0)
+    elif fin == 66:                                    # Down
+        _move(1, 0)
+    elif fin == 51:                                    # Delete (CSI 3~)
+        _clear_cell()
+    else:
+        return 0
+    return 1
+
+
+# Apply one key (ASCII/decoded). Returns 1 if state changed (redraw needed).
+def hamsheet_key(code: int32) -> int32:
+    if hs_esc == 1:
+        if code == 91:                                 # '['
+            hs_esc = 2
+        else:
+            hs_esc = 0
+        return 0
+    if hs_esc == 2:
+        if code >= 48 and code <= 57:
+            hs_par = code
+            return 0
+        hs_esc = 0
+        fin: int32 = code
+        if code == 126:                                # '~' final
+            p: int32 = hs_par
+            hs_par = 0
+            if p == 51:
+                fin = 51
+            else:
+                return 0
+        return _hs_nav(fin)
+    if code == 27:                                     # ESC
+        if editing != 0:
+            _cancel_edit()
+            return 1
+        hs_esc = 1
+        return 0
+    if code == 19:                                     # Ctrl-S -> Save
+        if editing != 0:
+            _commit_edit()
+        pending_action = 1
+        return 1
+    if code == 15:                                     # Ctrl-O -> Open
+        pending_action = 2
+        return 1
+    if code == 9:                                      # Tab -> commit + right
+        _commit_edit()
+        _move(0, 1)
+        return 1
+    if code == 13 or code == 10:                       # Enter -> commit + down
+        if editing != 0:
+            _commit_edit()
+        _move(1, 0)
+        return 1
+    if code == 8 or code == 127:                       # Backspace
+        if editing != 0:
+            if edit_len > 0:
+                edit_len = edit_len - 1
+            return 1
+        _clear_cell()
+        return 1
+    if code >= 32 and code <= 126:                     # printable -> edit
+        if editing == 0:
+            _begin_edit_empty()
+        if edit_len < EDIT_CAP - 1:
+            edit_buf[edit_len] = cast[uint8](code)
+            edit_len = edit_len + 1
+        return 1
+    return 0
+
+
+# Parse a "d <code>" key-press wire line and apply it. Returns 1 if changed.
+def hamsheet_key_line(s: Ptr[uint8], n: uint64) -> int32:
+    if n < 1 or s[0] != 100:                           # 'd' press; ignore 'u'
+        return 0
+    i: uint64 = 1
+    while i < n and s[i] == 32:
+        i = i + 1
+    neg: int32 = 0
+    if i < n and s[i] == 45:
+        neg = 1
+        i = i + 1
+    code: int32 = 0
+    got: int32 = 0
+    while i < n and s[i] >= 48 and s[i] <= 57:
+        code = code * 10 + cast[int32](s[i]) - 48
+        i = i + 1
+        got = 1
+    if got == 0:
+        return 0
+    if neg != 0:
+        code = 0 - code
+    return hamsheet_key(code)
+
+
+# ====================================================================
+# DOCUMENT SERIALISATION (round-trips RAW cell text -> formulas survive)
+# ====================================================================
+# Format (self-describing container):
+#   "HAMSHEET1\n"
+#   "<count>\n"                          number of non-empty cells
+#   for each: "<row> <col> <len>\n" then <len> raw bytes then "\n"
+def hamsheet_serialize(out: Ptr[uint8]) -> uint64:
+    p: uint64 = _append_cstr(out, 0, cast[Ptr[uint8]]("HAMSHEET1"))
+    out[p] = 10
+    p = p + 1
+    count: uint64 = 0
+    i: uint64 = 0
+    while i < NCELLS:
+        if cell_len[i] != 0:
+            count = count + 1
+        i = i + 1
+    p = p + _hs_udec(count, &out[p])
+    out[p] = 10
+    p = p + 1
+    r: uint64 = 0
+    while r < MAXROWS:
+        c: uint64 = 0
+        while c < MAXCOLS:
+            idx: uint64 = _cidx(r, c)
+            ln: uint64 = cast[uint64](cell_len[idx])
+            if ln != 0:
+                p = p + _hs_udec(r, &out[p])
+                out[p] = 32
+                p = p + 1
+                p = p + _hs_udec(c, &out[p])
+                out[p] = 32
+                p = p + 1
+                p = p + _hs_udec(ln, &out[p])
+                out[p] = 10
+                p = p + 1
+                base: uint64 = _cbase(r, c)
+                k: uint64 = 0
+                while k < ln:
+                    out[p] = cell_raw[base + k]
+                    p = p + 1
+                    k = k + 1
+                out[p] = 10
+                p = p + 1
+            c = c + 1
+        r = r + 1
+    return p
+
+
+def _parse_uint(s: Ptr[uint8], n: uint64, pos: Ptr[uint64]) -> uint64:
+    v: uint64 = 0
+    while pos[0] < n and s[pos[0]] >= 48 and s[pos[0]] <= 57:
+        v = v * 10 + cast[uint64](s[pos[0]]) - 48
+        pos[0] = pos[0] + 1
+    return v
+
+
+# Parse a HAMSHEET1 container back into the grid. A buffer that does NOT begin
+# with the magic leaves the sheet empty (defensive).
+def hamsheet_deserialize(s: Ptr[uint8], n: uint64):
+    hamsheet_clear()
+    magic: Ptr[uint8] = cast[Ptr[uint8]]("HAMSHEET1")
+    k: uint64 = 0
+    while magic[k] != 0:
+        if k >= n or s[k] != magic[k]:
+            return
+        k = k + 1
+    pos: uint64 = k
+    if pos < n and s[pos] == 10:
+        pos = pos + 1
+    count: uint64 = _parse_uint(s, n, &pos)
+    if pos < n and s[pos] == 10:
+        pos = pos + 1
+    e: uint64 = 0
+    while e < count and pos < n:
+        r: uint64 = _parse_uint(s, n, &pos)
+        if pos < n and s[pos] == 32:
+            pos = pos + 1
+        c: uint64 = _parse_uint(s, n, &pos)
+        if pos < n and s[pos] == 32:
+            pos = pos + 1
+        ln: uint64 = _parse_uint(s, n, &pos)
+        if pos < n and s[pos] == 10:
+            pos = pos + 1
+        if r < MAXROWS and c < MAXCOLS and ln < CELLTEXT:
+            idx: uint64 = _cidx(r, c)
+            base: uint64 = _cbase(r, c)
+            j: uint64 = 0
+            while j < ln and pos < n:
+                cell_raw[base + j] = s[pos]
+                j = j + 1
+                pos = pos + 1
+            cell_len[idx] = cast[uint8](j)
+        else:
+            # skip the raw bytes of a cell we can't place
+            j2: uint64 = 0
+            while j2 < ln and pos < n:
+                j2 = j2 + 1
+                pos = pos + 1
+        if pos < n and s[pos] == 10:
+            pos = pos + 1
+        e = e + 1
+    dirty = 0
+    hamsheet_recompute()
+
+
+# ====================================================================
+# LAYOUT + RENDER
+# ====================================================================
+WIN_W: int32 = 600
+WIN_H: int32 = 384
+BAR_H: int32 = 22            # title bar
+FB_Y:  int32 = 22           # formula/status bar
+FB_H:  int32 = 24
+OPEN_X: int32 = 476
+OPEN_W: int32 = 52
+SAVE_X: int32 = 532
+SAVE_W: int32 = 52
+
+GRID_Y:   int32 = 46        # top of the column-header strip
+ROWHDR_W: int32 = 34        # left row-number gutter width
+COLHDR_H: int32 = 18        # column-header strip height
+CELL_H:   int32 = 18
+CELLS_Y:  int32 = 64        # GRID_Y + COLHDR_H
+
+disp_buf: Array[48, uint8]
+lbl_buf:  Array[8, uint8]
+ref_buf:  Array[16, uint8]
+
+
+def _vis_rows() -> uint64:
+    return cast[uint64]((WIN_H - CELLS_Y) / CELL_H)
+
+
+def _vis_cols() -> uint64:
+    # count columns that fit from left_col given per-column widths
+    x: int32 = ROWHDR_W
+    c: uint64 = left_col
+    n: uint64 = 0
+    while c < MAXCOLS and x + col_w[c] <= WIN_W:
+        x = x + col_w[c]
+        n = n + 1
+        c = c + 1
+    if n == 0:
+        n = 1
+    return n
+
+
+def _ensure_visible():
+    vr: uint64 = _vis_rows()
+    if sel_r < top_row:
+        top_row = sel_r
+    elif sel_r >= top_row + vr:
+        top_row = sel_r - vr + 1
+    if sel_c < left_col:
+        left_col = sel_c
+    else:
+        # widen the window until the selected column is inside it
+        while sel_c >= left_col + _vis_cols():
+            left_col = left_col + 1
+
+
+# X pixel of the left edge of visible column `c` (c >= left_col).
+def _col_x(c: uint64) -> int32:
+    x: int32 = ROWHDR_W
+    i: uint64 = left_col
+    while i < c:
+        x = x + col_w[i]
+        i = i + 1
+    return x
+
+
+def _draw_clipped(x: int32, y: int32, w: int32, s: Ptr[uint8], ln: uint64,
+                  color: Ptr[uint8], right: int32):
+    maxc: int32 = (w - 6) / 8
+    if maxc < 0:
+        maxc = 0
+    show: uint64 = ln
+    if show > cast[uint64](maxc):
+        show = cast[uint64](maxc)
+    # NUL-terminate a temporary copy
+    tmp: Array[48, uint8]
+    i: uint64 = 0
+    while i < show and i < 47:
+        tmp[i] = s[i]
+        i = i + 1
+    tmp[i] = 0
+    tx: int32 = x + 3
+    if right != 0:
+        tx = x + w - 3 - cast[int32](show) * 8
+        if tx < x + 3:
+            tx = x + 3
+    hamscene_glyphs(tx, y, &tmp[0], color)
+
+
+def _toolbtn(x: int32, w: int32, label: Ptr[uint8]):
+    hamscene_fill(x, FB_Y + 2, w, FB_H - 4, cast[Ptr[uint8]]("#e6e8ec"))
+    hamscene_stroke(x, FB_Y + 2, w, FB_H - 4, 1, cast[Ptr[uint8]]("#a8b0ba"))
+    hamscene_glyphs_bold(x + 8, FB_Y + 6, label, cast[Ptr[uint8]]("#202020"))
+
+
+def hamsheet_build_scene():
+    if flash > 0:
+        flash = flash - 1
+    hamscene_begin()
+    hamscene_fill(0, 0, WIN_W, WIN_H, cast[Ptr[uint8]]("#dfe3e8"))
+
+    # ---- title bar --------------------------------------------------------
+    hamscene_fill(0, 0, WIN_W, BAR_H, cast[Ptr[uint8]]("#2f7d54"))
+    hamscene_fill(0, BAR_H - 1, WIN_W, 1, cast[Ptr[uint8]]("#245f40"))
+    hamscene_glyphs_bold(10, 5, cast[Ptr[uint8]]("HamSheet"),
+                         cast[Ptr[uint8]]("#ffffff"))
+    nm: Ptr[uint8] = cast[Ptr[uint8]]("(untitled)")
+    if fname_len > 0:
+        nm = &fname[0]
+    hamscene_glyphs(96, 5, nm, cast[Ptr[uint8]]("#d6ecdd"))
+    stat: Ptr[uint8] = cast[Ptr[uint8]]("ready")
+    if flash > 0:
+        stat = cast[Ptr[uint8]]("saved!")
+    elif dirty != 0:
+        stat = cast[Ptr[uint8]]("* modified")
+    hamscene_glyphs(WIN_W - 92, 5, stat, cast[Ptr[uint8]]("#eef8f1"))
+
+    # ---- formula / status bar --------------------------------------------
+    hamscene_fill(0, FB_Y, WIN_W, FB_H, cast[Ptr[uint8]]("#eef0f3"))
+    hamscene_stroke(0, FB_Y + FB_H - 1, WIN_W, 1, 1, cast[Ptr[uint8]]("#b4b8bf"))
+    # current-cell reference box
+    hamscene_fill(6, FB_Y + 3, 44, FB_H - 6, cast[Ptr[uint8]]("#ffffff"))
+    hamscene_stroke(6, FB_Y + 3, 44, FB_H - 6, 1, cast[Ptr[uint8]]("#b4b8bf"))
+    rl: uint64 = hamsheet_cur_ref(&ref_buf[0])
+    hamscene_glyphs_bold(12, FB_Y + 6, &ref_buf[0], cast[Ptr[uint8]]("#245f40"))
+    # contents: the edit buffer while editing, else the selected cell's raw text
+    if editing != 0:
+        edit_buf[edit_len] = 0
+        hamscene_glyphs(60, FB_Y + 6, &edit_buf[0], cast[Ptr[uint8]]("#202020"))
+    else:
+        base: uint64 = _cbase(sel_r, sel_c)
+        cl: uint64 = hamsheet_cell_raw_len(sel_r, sel_c)
+        i0: uint64 = 0
+        while i0 < cl and i0 < 47:
+            disp_buf[i0] = cell_raw[base + i0]
+            i0 = i0 + 1
+        disp_buf[i0] = 0
+        hamscene_glyphs(60, FB_Y + 6, &disp_buf[0], cast[Ptr[uint8]]("#202020"))
+    _toolbtn(OPEN_X, OPEN_W, cast[Ptr[uint8]]("Open"))
+    _toolbtn(SAVE_X, SAVE_W, cast[Ptr[uint8]]("Save"))
+
+    # ---- grid: corner + headers ------------------------------------------
+    vr: uint64 = _vis_rows()
+    vc: uint64 = _vis_cols()
+    # corner box
+    hamscene_fill(0, GRID_Y, ROWHDR_W, COLHDR_H, cast[Ptr[uint8]]("#d3d8de"))
+    # column headers
+    c: uint64 = left_col
+    while c < left_col + vc and c < MAXCOLS:
+        cx: int32 = _col_x(c)
+        cw: int32 = col_w[c]
+        hc: Ptr[uint8] = cast[Ptr[uint8]]("#d3d8de")
+        if c == sel_c:
+            hc = cast[Ptr[uint8]]("#bcd6c4")
+        hamscene_fill(cx, GRID_Y, cw, COLHDR_H, hc)
+        hamscene_stroke(cx, GRID_Y, cw, COLHDR_H, 1, cast[Ptr[uint8]]("#b4b8bf"))
+        ll: uint64 = hamsheet_col_label(c, &lbl_buf[0])
+        hamscene_glyphs_bold(cx + (cw - cast[int32](ll) * 8) / 2, GRID_Y + 2,
+                             &lbl_buf[0], cast[Ptr[uint8]]("#33383e"))
+        c = c + 1
+
+    # row headers + cells
+    rr: uint64 = 0
+    while rr < vr and top_row + rr < MAXROWS:
+        row: uint64 = top_row + rr
+        ry: int32 = CELLS_Y + cast[int32](rr) * CELL_H
+        # row-number gutter
+        rhc: Ptr[uint8] = cast[Ptr[uint8]]("#d3d8de")
+        if row == sel_r:
+            rhc = cast[Ptr[uint8]]("#bcd6c4")
+        hamscene_fill(0, ry, ROWHDR_W, CELL_H, rhc)
+        hamscene_stroke(0, ry, ROWHDR_W, CELL_H, 1, cast[Ptr[uint8]]("#b4b8bf"))
+        rnl: uint64 = _hs_udec(row + 1, &lbl_buf[0])
+        lbl_buf[rnl] = 0
+        hamscene_glyphs(ROWHDR_W - 4 - cast[int32](rnl) * 8, ry + 1,
+                        &lbl_buf[0], cast[Ptr[uint8]]("#33383e"))
+        # data cells
+        cc: uint64 = left_col
+        while cc < left_col + vc and cc < MAXCOLS:
+            cx2: int32 = _col_x(cc)
+            cw2: int32 = col_w[cc]
+            selected: int32 = 0
+            if row == sel_r and cc == sel_c:
+                selected = 1
+            cellbg: Ptr[uint8] = cast[Ptr[uint8]]("#ffffff")
+            if selected != 0:
+                cellbg = cast[Ptr[uint8]]("#eaf3ec")
+            hamscene_fill(cx2, ry, cw2, CELL_H, cellbg)
+            hamscene_stroke(cx2, ry, cw2, CELL_H, 1, cast[Ptr[uint8]]("#d7dbe0"))
+            k: uint8 = val_kind[_cidx(row, cc)]
+            if k != KIND_EMPTY:
+                dl: uint64 = hamsheet_cell_display(row, cc, &disp_buf[0])
+                col: Ptr[uint8] = cast[Ptr[uint8]]("#202020")
+                rightj: int32 = 0
+                if k == KIND_NUM:
+                    rightj = 1
+                elif k == KIND_ERR:
+                    col = cast[Ptr[uint8]]("#b02020")
+                _draw_clipped(cx2, ry + 1, cw2, &disp_buf[0], dl, col, rightj)
+            cc = cc + 1
+        rr = rr + 1
+
+    # selected-cell highlight border (drawn last so it sits above gridlines)
+    if sel_r >= top_row and sel_r < top_row + vr and \
+            sel_c >= left_col and sel_c < left_col + vc:
+        sx: int32 = _col_x(sel_c)
+        sy: int32 = CELLS_Y + cast[int32](sel_r - top_row) * CELL_H
+        hamscene_stroke(sx, sy, col_w[sel_c], CELL_H, 2,
+                        cast[Ptr[uint8]]("#2f7d54"))
+
+
+# ---- pointer hit-testing ---------------------------------------------------
+# Returns: 1 save, 2 open, 3 redraw-only (cell selected), 0 nothing.
+def hamsheet_hit(x: int64, y: int64) -> int32:
+    if y >= cast[int64](FB_Y) and y < cast[int64](FB_Y + FB_H):
+        if x >= cast[int64](OPEN_X) and x < cast[int64](OPEN_X + OPEN_W):
+            return 2
+        if x >= cast[int64](SAVE_X) and x < cast[int64](SAVE_X + SAVE_W):
+            return 1
+        return 0
+    if y >= cast[int64](CELLS_Y) and x >= cast[int64](ROWHDR_W):
+        vr: uint64 = _vis_rows()
+        vc: uint64 = _vis_cols()
+        rr: uint64 = cast[uint64]((y - cast[int64](CELLS_Y)) / cast[int64](CELL_H))
+        if rr >= vr:
+            return 0
+        row: uint64 = top_row + rr
+        if row >= MAXROWS:
+            return 0
+        c: uint64 = left_col
+        while c < left_col + vc and c < MAXCOLS:
+            cx: int64 = cast[int64](_col_x(c))
+            if x >= cx and x < cx + cast[int64](col_w[c]):
+                if editing != 0:
+                    _commit_edit()
+                sel_r = row
+                sel_c = c
+                _ensure_visible()
+                return 3
+            c = c + 1
+    return 0
