@@ -856,6 +856,37 @@ def _files_desktop_config() -> list[tuple[Path, str]]:
     return f
 
 
+# ---- hamnix-hamaudiobook — the FIRST repo-ONLY, NOT-preinstalled app ------
+# This package establishes the "installs from 255.one, absent from the base
+# image" pattern the user asked for. Unlike every DE app above (which rides the
+# hamnix-desktop-apps metapackage that hamnix-base depends on), this spec is
+# DELIBERATELY excluded from the hamnix-base dependency closure (see
+# build_hamnix_base()'s leaf_names) so a fresh install does NOT carry it — it is
+# reachable ONLY via `hpm install hamnix-hamaudiobook` or the Software app. Its
+# payload carries the binary, its .desktop launcher (staged into
+# /etc/hamde/apps so INSTALLING the package adds the Applications entry — the
+# base etc/hamde/apps dir never contains it), and a sample book so the default
+# launch plays out of the box.
+
+HAMAUDIOBOOK_PKG = "hamnix-hamaudiobook"
+
+
+def _files_hamaudiobook() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hamaudiobook")
+    # Launcher lives in etc/hamde/apps-optional/ (NOT etc/hamde/apps/, which the
+    # base hamnix-desktop-config package globs wholesale) and is staged into the
+    # live /etc/hamde/apps ONLY when this package is installed.
+    f.append((ETC_DIR / "hamde" / "apps-optional" / "hamaudiobook.desktop",
+              "etc/hamde/apps/hamaudiobook.desktop"))
+    # A royalty-free (CC0) sample book so a bare `hamaudiobook` launch plays and
+    # exercises the MP3 decoder + HDA sink end-to-end (default book path is
+    # /usr/share/sounds/test.mp3). Reuses the deterministic test fixture.
+    mp3 = HERE / "tests" / "fixtures" / "sounds" / "test.mp3"
+    f.append((mp3, "usr/share/sounds/test.mp3"))
+    return f
+
+
 # ---------------------------------------------------------------------
 # Package spec table — the source of truth.
 # ---------------------------------------------------------------------
@@ -1045,6 +1076,24 @@ PACKAGE_SPECS.extend(_desktop_app_specs())
 # all in its depends.
 PACKAGE_SPECS.extend(_cmd_specs())
 
+# The repo-ONLY audiobook app. Appended to PACKAGE_SPECS so it is BUILT and
+# published in the main channel (installable via hpm / the Software app), but it
+# is NOT named by any metapackage's depends AND is explicitly excluded from the
+# hamnix-base closure below, so it never lands in the pre-installed base image.
+# Depends pull the compositor + HDA audio stack so `hpm install
+# hamnix-hamaudiobook` yields a runnable app on a bare base.
+PACKAGE_SPECS.append({
+    "name": HAMAUDIOBOOK_PKG,
+    "files_fn": _files_hamaudiobook,
+    "depends": [f"hamnix-desktop-core>={PKG_VERSION}",
+                f"hamnix-drivers-snd-hda>={PKG_VERSION}"],
+    "description": ("Hamnix Audiobook player — MP3/WAV playback with "
+                    "save/resume position per book + sleep timer (night "
+                    "mode) + skip +-30s. Repo-only: install from 255.one, "
+                    "not pre-installed."),
+    "target": "#hamnix-system",
+})
+
 
 # ---------------------------------------------------------------------
 # Generic spec-driven package builder
@@ -1157,6 +1206,9 @@ def build_hamnix_base() -> dict:
     leaf_names = {_cmd_pkg_name(s) for s in COREUTILS_BINS}
     leaf_names |= DESKTOP_APP_PKG_NAMES
     leaf_names.add("hamnix-desktop-core")
+    # The repo-only audiobook app must NOT be pre-installed: keep it out of the
+    # base closure so it ships ONLY via 255.one / `hpm install`.
+    leaf_names.add(HAMAUDIOBOOK_PKG)
     depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS
                if s["name"] not in leaf_names]
     depends.append(f"hamnix-bootloader>={PKG_VERSION}")

@@ -1,0 +1,727 @@
+# lib/hamaudiobookcore.ad — the PURE, target-agnostic core of the hamaudiobook
+# player (the FIRST repo-only, NOT-preinstalled Hamnix app).
+#
+# WHY (dual-target seam, see docs/hamui_dual_target.md)
+# =====================================================
+# Like lib/hamaudiocore.ad, this holds the player's UI STATE, resize-aware
+# LAYOUT, scene DISPLAY-LIST builder, and the pure keyboard+pointer INPUT
+# handlers — everything EXCEPT the Hamnix-only wsys window transport and the
+# actual PCM streaming / file I/O. It imports ONLY lib/hamscene.ad, has NO
+# `extern`, and links into both the native x86_64-adder-user target and the
+# x86_64-linux host target so the SAME code is host-rendered to a PNG and
+# host-unit-tested (scripts/test_hamaudiobook_host.sh).
+#
+# AUDIOBOOK-SPECIFIC LOGIC (the two defining features, both PURE + host-tested)
+# ============================================================================
+#   * RESUME / SAVE POSITION PER BOOK. The player persists a per-file-path
+#     playback offset to a small text state file. The SERIALIZE + LOOKUP logic
+#     is pure here (hamaudiobook_state_upsert / hamaudiobook_state_lookup): the
+#     native driver just reads/writes the file bytes. Reopening a book resumes
+#     where the listener left off — the defining audiobook feature.
+#   * SLEEP TIMER (night mode). Presets off/15/30/45/60 min; the deadline math
+#     and remaining-time readout are pure (hamaudiobook_sleep_*), so a host gate
+#     proves "stops after N minutes" deterministically with a synthetic clock.
+#
+# Transport is audiobook-shaped: skip BACK 30s / PLAY-PAUSE / skip FWD 30s, a
+# seekable progress bar, and the sleep button. The command queue mirrors
+# lib/hamaudiocore.ad: input handlers enqueue ONE pending command that the
+# native driver drains each tick and turns into ctl-file writes + stream moves.
+
+from lib.hamscene import hamscene_begin, hamscene_fill, hamscene_rect, \
+    hamscene_stroke, hamscene_glyphs, hamscene_glyphs_bold, \
+    hamscene_roundrect, hamscene_text
+
+# ---- command codes (hamaudiobook_take_command) --------------------------
+HAMAUDIOBOOK_CMD_NONE:      int32 = 0
+HAMAUDIOBOOK_CMD_PLAYPAUSE: int32 = 1
+HAMAUDIOBOOK_CMD_STOP:      int32 = 2
+HAMAUDIOBOOK_CMD_SEEK:      int32 = 3
+HAMAUDIOBOOK_CMD_SKIPBACK:  int32 = 4    # skip back 30s
+HAMAUDIOBOOK_CMD_SKIPFWD:   int32 = 5    # skip forward 30s
+HAMAUDIOBOOK_CMD_SLEEP:     int32 = 6    # cycle the sleep-timer preset
+
+SKIP_MS: uint64 = 30000                  # audiobook skip granularity (30s)
+
+# ---- module state --------------------------------------------------------
+hb_w:        int32  = 380
+hb_h:        int32  = 280
+hb_playing:  int32  = 0
+hb_pos_ms:   uint64 = 0
+hb_dur_ms:   uint64 = 0
+hb_level:    uint32 = 0
+hb_rate:     uint32 = 0
+hb_channels: uint32 = 0
+
+hb_pending:  int32  = 0
+hb_seek_ms:  uint64 = 0
+
+hb_name:     Array[64, uint8]
+hb_press:    int32  = -1          # which control is sunk (-1 none)
+hb_resumed:  int32  = 0           # 1 if the last load resumed a saved offset
+hb_resume_ms: uint64 = 0          # the offset we resumed FROM (for the label)
+
+# ---- sleep timer ---------------------------------------------------------
+# Preset index into {off, 15, 30, 45, 60} minutes. deadline_ms == 0 means the
+# timer is disarmed; otherwise it is an absolute clock value (same units the
+# driver feeds in — milliseconds) at which playback must stop.
+hb_sleep_idx: int32 = 0
+hb_sleep_deadline_ms: uint64 = 0
+
+# ---- layout (recomputed by hamaudiobook_layout) --------------------------
+BTN_H:  int32 = 40
+BKW:    int32 = 74               # skip buttons
+PPW:    int32 = 92               # play/pause button
+btn_back_x: int32 = 0
+btn_play_x: int32 = 0
+btn_fwd_x:  int32 = 0
+btn_row_y:  int32 = 0
+bar_x:  int32 = 0
+bar_y:  int32 = 0
+bar_w:  int32 = 0
+bar_h:  int32 = 14
+slp_x:  int32 = 0
+slp_y:  int32 = 0
+slp_w:  int32 = 0
+slp_h:  int32 = 36
+
+
+# ---- tiny pure string helpers (unique _hb_ prefix, no link collisions) ---
+def _hb_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _hb_u64_dec(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    x: uint64 = v
+    while x > 0:
+        digs[n] = cast[uint8](x % 10) + 48
+        x = x / 10
+        n = n + 1
+    i: uint64 = 0
+    written: uint64 = n
+    while n > 0:
+        n = n - 1
+        out[i] = digs[n]
+        i = i + 1
+    return written
+
+
+# Format a millisecond count as "M:SS" into `out` (NUL-terminated).
+def _hb_fmt_mmss(ms: uint64, out: Ptr[uint8]) -> uint64:
+    secs: uint64 = ms / 1000
+    mins: uint64 = secs / 60
+    rem: uint64 = secs % 60
+    p: uint64 = _hb_u64_dec(mins, out)
+    out[p] = 58                                     # ':'
+    p = p + 1
+    out[p] = cast[uint8](rem / 10) + 48
+    p = p + 1
+    out[p] = cast[uint8](rem % 10) + 48
+    p = p + 1
+    out[p] = 0
+    return p
+
+
+# ---- lifecycle -----------------------------------------------------------
+def hamaudiobook_init():
+    hb_playing = 0
+    hb_pos_ms = 0
+    hb_dur_ms = 0
+    hb_level = 0
+    hb_rate = 0
+    hb_channels = 0
+    hb_pending = 0
+    hb_seek_ms = 0
+    hb_press = -1
+    hb_resumed = 0
+    hb_resume_ms = 0
+    hb_sleep_idx = 0
+    hb_sleep_deadline_ms = 0
+    hb_name[0] = 0
+    hamaudiobook_layout(hb_w, hb_h)
+
+
+def hamaudiobook_set_name(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and i < 63:
+        hb_name[i] = s[i]
+        i = i + 1
+    hb_name[i] = 0
+
+
+def hamaudiobook_set_format(rate: uint32, channels: uint32):
+    hb_rate = rate
+    hb_channels = channels
+
+
+def hamaudiobook_set_duration_ms(ms: uint64):
+    hb_dur_ms = ms
+
+
+def hamaudiobook_set_position_ms(ms: uint64):
+    hb_pos_ms = ms
+
+
+def hamaudiobook_set_level(peak: uint32):
+    hb_level = peak
+
+
+def hamaudiobook_set_playing(p: int32):
+    hb_playing = p
+
+
+def hamaudiobook_is_playing() -> int32:
+    return hb_playing
+
+
+def hamaudiobook_position_ms() -> uint64:
+    return hb_pos_ms
+
+
+def hamaudiobook_duration_ms() -> uint64:
+    return hb_dur_ms
+
+
+def hamaudiobook_set_resumed(flag: int32, ms: uint64):
+    hb_resumed = flag
+    hb_resume_ms = ms
+
+
+# ---- command queue -------------------------------------------------------
+def hamaudiobook_take_command() -> int32:
+    c: int32 = hb_pending
+    hb_pending = HAMAUDIOBOOK_CMD_NONE
+    return c
+
+
+def hamaudiobook_seek_ms() -> uint64:
+    return hb_seek_ms
+
+
+# Clamp a skip target to [0, dur]. delta is milliseconds; back == subtract.
+def hamaudiobook_skip_target_ms(cur: uint64, delta: uint64, back: int32) -> uint64:
+    if back != 0:
+        if delta >= cur:
+            return 0
+        return cur - delta
+    t: uint64 = cur + delta
+    if hb_dur_ms > 0 and t > hb_dur_ms:
+        return hb_dur_ms
+    return t
+
+
+# =========================================================================
+# RESUME / SAVE POSITION — pure state-file serialize + lookup
+# =========================================================================
+# The state file is a flat text table, one record per book:
+#
+#     <path>\t<offset_ms>\n
+#
+# The native driver reads the whole file into a byte buffer, calls
+# hamaudiobook_state_lookup(buf, len, path) to find where to resume, and after
+# playback calls hamaudiobook_state_upsert(buf, len, cap, path, offset) to get
+# the new buffer contents to write back (replacing the old record for `path`, or
+# appending a new one). Everything here is pure + deterministic, so
+# scripts/test_hamaudiobook_host.sh proves the round-trip without any disk.
+
+def _hb_path_matches(buf: Ptr[uint8], start: uint64, tab: uint64,
+                     path: Ptr[uint8]) -> int32:
+    # Does buf[start..tab) equal the NUL-terminated `path`?
+    plen: uint64 = _hb_strlen(path)
+    if tab - start != plen:
+        return 0
+    i: uint64 = 0
+    while i < plen:
+        if buf[start + i] != path[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Return the saved offset_ms for `path`, or 0 if the path has no record.
+def hamaudiobook_state_lookup(buf: Ptr[uint8], length: uint64,
+                              path: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while i < length:
+        line_start: uint64 = i
+        # find TAB and end-of-line
+        tab: uint64 = length
+        eol: uint64 = length
+        j: uint64 = i
+        while j < length:
+            c: uint8 = buf[j]
+            if c == 9 and tab == length:
+                tab = j
+            if c == 10:
+                eol = j
+                j = j + 1
+                break
+            j = j + 1
+        if tab < eol and _hb_path_matches(buf, line_start, tab, path) != 0:
+            # parse decimal after the TAB
+            val: uint64 = 0
+            k: uint64 = tab + 1
+            while k < eol and buf[k] >= 48 and buf[k] <= 57:
+                val = val * 10 + cast[uint64](buf[k] - 48)
+                k = k + 1
+            return val
+        i = j
+        if i <= line_start:
+            i = line_start + 1
+    return 0
+
+
+# Rewrite `buf` (capacity `cap`) so `path`'s record holds `offset_ms`: every
+# OTHER line is copied through unchanged, then a fresh "<path>\t<offset>\n" is
+# appended. Returns the new length. A zero offset still writes a record (so the
+# book is remembered as "started"). Idempotent + dedups repeated paths.
+def hamaudiobook_state_upsert(buf: Ptr[uint8], length: uint64, cap: uint64,
+                              path: Ptr[uint8], offset_ms: uint64) -> uint64:
+    # Stage the surviving (non-matching) lines into a scratch region at the end
+    # is unsafe in-place; instead compact in place: walk lines, keep those that
+    # don't match by shifting them down.
+    out: uint64 = 0
+    i: uint64 = 0
+    while i < length:
+        line_start: uint64 = i
+        tab: uint64 = length
+        eol: uint64 = length
+        j: uint64 = i
+        while j < length:
+            c: uint8 = buf[j]
+            if c == 9 and tab == length:
+                tab = j
+            if c == 10:
+                eol = j
+                j = j + 1
+                break
+            j = j + 1
+        line_end: uint64 = j                        # one past the '\n' (or EOF)
+        keep: int32 = 1
+        if tab < eol and _hb_path_matches(buf, line_start, tab, path) != 0:
+            keep = 0
+        if keep != 0 and eol > line_start:
+            # shift this line down to `out` (safe: out <= line_start always)
+            m: uint64 = line_start
+            while m < line_end:
+                buf[out] = buf[m]
+                out = out + 1
+                m = m + 1
+        i = line_end
+        if i <= line_start:
+            i = line_start + 1
+    # Append the fresh record: "<path>\t<offset>\n"
+    plen: uint64 = _hb_strlen(path)
+    p: uint64 = 0
+    while p < plen and out < cap:
+        buf[out] = path[p]
+        out = out + 1
+        p = p + 1
+    if out < cap:
+        buf[out] = 9                                # TAB
+        out = out + 1
+    dbuf: Array[24, uint8]
+    dn: uint64 = _hb_u64_dec(offset_ms, &dbuf[0])
+    q: uint64 = 0
+    while q < dn and out < cap:
+        buf[out] = dbuf[q]
+        out = out + 1
+        q = q + 1
+    if out < cap:
+        buf[out] = 10                               # '\n'
+        out = out + 1
+    return out
+
+
+# =========================================================================
+# SLEEP TIMER (night mode) — pure preset/deadline math
+# =========================================================================
+def hamaudiobook_sleep_preset_min() -> uint32:
+    if hb_sleep_idx == 1:
+        return 15
+    if hb_sleep_idx == 2:
+        return 30
+    if hb_sleep_idx == 3:
+        return 45
+    if hb_sleep_idx == 4:
+        return 60
+    return 0
+
+
+# Advance to the next preset (off -> 15 -> 30 -> 45 -> 60 -> off).
+def hamaudiobook_sleep_cycle():
+    hb_sleep_idx = hb_sleep_idx + 1
+    if hb_sleep_idx > 4:
+        hb_sleep_idx = 0
+
+
+# Arm the timer against the current preset using absolute clock `now_ms`. A
+# preset of 0 (off) disarms.
+def hamaudiobook_sleep_arm(now_ms: uint64):
+    mn: uint32 = hamaudiobook_sleep_preset_min()
+    if mn == 0:
+        hb_sleep_deadline_ms = 0
+    else:
+        hb_sleep_deadline_ms = now_ms + cast[uint64](mn) * 60000
+
+
+def hamaudiobook_sleep_disarm():
+    hb_sleep_deadline_ms = 0
+    hb_sleep_idx = 0
+
+
+def hamaudiobook_sleep_is_armed() -> int32:
+    if hb_sleep_deadline_ms == 0:
+        return 0
+    return 1
+
+
+# Milliseconds until the timer fires (0 when disarmed or already elapsed).
+def hamaudiobook_sleep_remaining_ms(now_ms: uint64) -> uint64:
+    if hb_sleep_deadline_ms == 0:
+        return 0
+    if now_ms >= hb_sleep_deadline_ms:
+        return 0
+    return hb_sleep_deadline_ms - now_ms
+
+
+# 1 once the armed deadline has been reached (the driver then stops playback).
+def hamaudiobook_sleep_expired(now_ms: uint64) -> int32:
+    if hb_sleep_deadline_ms == 0:
+        return 0
+    if now_ms >= hb_sleep_deadline_ms:
+        return 1
+    return 0
+
+
+# ---- layout --------------------------------------------------------------
+def hamaudiobook_layout(w: int32, h: int32):
+    hb_w = w
+    hb_h = h
+    bar_x = 20
+    bar_w = w - 40
+    bar_y = 96
+    bar_h = 14
+    # Transport row: [<< 30] [Play/Pause] [30 >>], centred as a group.
+    gap: int32 = 12
+    total: int32 = BKW + PPW + BKW + gap * 2
+    bx: int32 = (w - total) / 2
+    btn_row_y = 150
+    btn_back_x = bx
+    btn_play_x = bx + BKW + gap
+    btn_fwd_x = bx + BKW + gap + PPW + gap
+    # Sleep-timer button spans the width below the transport row.
+    slp_x = 20
+    slp_w = w - 40
+    slp_y = 208
+    slp_h = 36
+
+
+# ---- input: keyboard -----------------------------------------------------
+# SPACE = play/pause, 's'/'S' = stop, ',' / left = back 30, '.' / right = fwd 30,
+# 't'/'T' = cycle sleep timer. Returns 1 if a command was enqueued.
+def hamaudiobook_key_line(line: Ptr[uint8], n: uint64) -> int32:
+    if n < 3:
+        return 0
+    if line[0] != 100:                              # 'd'
+        return 0
+    code: int32 = 0
+    i: uint64 = 2
+    while i < n and line[i] >= 48 and line[i] <= 57:
+        code = code * 10 + cast[int32](line[i] - 48)
+        i = i + 1
+    if code == 32:                                  # space
+        hb_pending = HAMAUDIOBOOK_CMD_PLAYPAUSE
+        return 1
+    if code == 115 or code == 83:                   # s / S
+        hb_pending = HAMAUDIOBOOK_CMD_STOP
+        return 1
+    if code == 44:                                  # ','  back 30
+        hb_pending = HAMAUDIOBOOK_CMD_SKIPBACK
+        return 1
+    if code == 46:                                  # '.'  fwd 30
+        hb_pending = HAMAUDIOBOOK_CMD_SKIPFWD
+        return 1
+    if code == 116 or code == 84:                   # t / T  sleep timer
+        hb_pending = HAMAUDIOBOOK_CMD_SLEEP
+        return 1
+    return 0
+
+
+# ---- input: pointer ------------------------------------------------------
+# Hit-test (lx,ly): 0=back30, 1=play/pause, 2=fwd30, 3=progress bar (seek),
+# 4=sleep button, -1=miss.
+def hamaudiobook_hit(lx: int64, ly: int64) -> int32:
+    x: int32 = cast[int32](lx)
+    y: int32 = cast[int32](ly)
+    if y >= btn_row_y and y < btn_row_y + BTN_H:
+        if x >= btn_back_x and x < btn_back_x + BKW:
+            return 0
+        if x >= btn_play_x and x < btn_play_x + PPW:
+            return 1
+        if x >= btn_fwd_x and x < btn_fwd_x + BKW:
+            return 2
+    if x >= slp_x and x < slp_x + slp_w and y >= slp_y and y < slp_y + slp_h:
+        return 4
+    if x >= bar_x and x < bar_x + bar_w \
+            and y >= bar_y - 6 and y < bar_y + bar_h + 6:
+        return 3
+    return -1
+
+
+# Apply a press: enqueue the matching command. Returns 1 if enqueued.
+def hamaudiobook_press_at(lx: int64, ly: int64) -> int32:
+    hit: int32 = hamaudiobook_hit(lx, ly)
+    if hit == 0:
+        hb_pending = HAMAUDIOBOOK_CMD_SKIPBACK
+        hb_press = 0
+        return 1
+    if hit == 1:
+        hb_pending = HAMAUDIOBOOK_CMD_PLAYPAUSE
+        hb_press = 1
+        return 1
+    if hit == 2:
+        hb_pending = HAMAUDIOBOOK_CMD_SKIPFWD
+        hb_press = 2
+        return 1
+    if hit == 4:
+        hb_pending = HAMAUDIOBOOK_CMD_SLEEP
+        hb_press = 4
+        return 1
+    if hit == 3:
+        if hb_dur_ms > 0 and bar_w > 0:
+            dx: int32 = cast[int32](lx) - bar_x
+            if dx < 0:
+                dx = 0
+            if dx > bar_w:
+                dx = bar_w
+            hb_seek_ms = hb_dur_ms * cast[uint64](dx) / cast[uint64](bar_w)
+            hb_pending = HAMAUDIOBOOK_CMD_SEEK
+            return 1
+    return 0
+
+
+def hamaudiobook_release() -> int32:
+    if hb_press != -1:
+        hb_press = -1
+        return 1
+    return 0
+
+
+# Centre of the Play button (window-local); lets a host gate synth a click.
+def hamaudiobook_btn_play_cx() -> int64:
+    return cast[int64](btn_play_x + PPW / 2)
+
+
+def hamaudiobook_btn_play_cy() -> int64:
+    return cast[int64](btn_row_y + BTN_H / 2)
+
+
+def hamaudiobook_slp_cx() -> int64:
+    return cast[int64](slp_x + slp_w / 2)
+
+
+def hamaudiobook_slp_cy() -> int64:
+    return cast[int64](slp_y + slp_h / 2)
+
+
+# Held pointer-button state for the edge detector below.
+hb_btn_down: int32 = 0
+
+
+# Parse one /event pointer line "m <x> <y> <buttons> <dz>": FIRST THREE ints
+# after 'm' are x, y, buttons (trailing dz ignored). Drives press/release edges.
+def hamaudiobook_handle_pointer_line(line: Ptr[uint8], n: uint64) -> int32:
+    if n < 1 or line[0] != 109:                         # 'm'
+        return 0
+    xs: Array[8, int64]
+    nints: int32 = 0
+    i: uint64 = 0
+    while i < n and nints < 8:
+        while i < n and (line[i] < 48 or line[i] > 57) and line[i] != 45:
+            i = i + 1
+        if i >= n:
+            break
+        neg: int32 = 0
+        if line[i] == 45:
+            neg = 1
+            i = i + 1
+        val: int64 = 0
+        got: int32 = 0
+        while i < n and line[i] >= 48 and line[i] <= 57:
+            val = val * 10 + cast[int64](line[i] - 48)
+            i = i + 1
+            got = 1
+        if got == 1:
+            if neg == 1:
+                val = 0 - val
+            xs[nints] = val
+            nints = nints + 1
+    if nints < 3:
+        return 0
+    bx: int64 = xs[0]
+    by: int64 = xs[1]
+    bbtn: int64 = xs[2]
+    now_down: int32 = 0
+    if (bbtn & 1) != 0:
+        now_down = 1
+    changed: int32 = 0
+    if now_down != 0 and hb_btn_down == 0:
+        if hamaudiobook_press_at(bx, by) == 1:
+            changed = 1
+    elif now_down == 0 and hb_btn_down != 0:
+        if hamaudiobook_release() == 1:
+            changed = 1
+    hb_btn_down = now_down
+    return changed
+
+
+# ---- scene builder -------------------------------------------------------
+def _hb_progress_fill_w() -> int32:
+    if hb_dur_ms == 0:
+        return 0
+    p: uint64 = hb_pos_ms
+    if p > hb_dur_ms:
+        p = hb_dur_ms
+    return cast[int32](cast[uint64](bar_w) * p / hb_dur_ms)
+
+
+def _hb_draw_btn(x: int32, w: int32, label: Ptr[uint8], sunk: int32):
+    face: Ptr[uint8] = cast[Ptr[uint8]]("#3a4150")
+    if sunk != 0:
+        face = cast[Ptr[uint8]]("#2b303b")
+    hamscene_roundrect(x, btn_row_y, w, BTN_H, 6, face)
+    ll: int32 = cast[int32](_hb_strlen(label))
+    hamscene_glyphs(x + (w - ll * 8) / 2, btn_row_y + (BTN_H - 16) / 2,
+                    label, cast[Ptr[uint8]]("#e6e8ec"))
+
+
+# Build the "Sleep: off" / "Sleep 30m  (12:34 left)" label into `out`.
+def _hb_sleep_label(out: Ptr[uint8], now_ms: uint64) -> uint64:
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("Sleep timer: ")
+    p: uint64 = 0
+    k: uint64 = 0
+    while pre[k] != 0:
+        out[p] = pre[k]
+        p = p + 1
+        k = k + 1
+    mn: uint32 = hamaudiobook_sleep_preset_min()
+    if mn == 0:
+        off: Ptr[uint8] = cast[Ptr[uint8]]("off")
+        k = 0
+        while off[k] != 0:
+            out[p] = off[k]
+            p = p + 1
+            k = k + 1
+        out[p] = 0
+        return p
+    p = p + _hb_u64_dec(cast[uint64](mn), &out[p])
+    out[p] = 109                                    # 'm'
+    p = p + 1
+    if hamaudiobook_sleep_is_armed() != 0:
+        out[p] = 32
+        p = p + 1
+        out[p] = 40                                 # '('
+        p = p + 1
+        p = p + _hb_fmt_mmss(hamaudiobook_sleep_remaining_ms(now_ms), &out[p])
+        out[p] = 41                                 # ')'
+        p = p + 1
+    out[p] = 0
+    return p
+
+
+# now_ms lets the sleep label show a live remaining time. Pass 0 when unknown.
+def hamaudiobook_build_scene_at(now_ms: uint64):
+    hamscene_begin()
+    hamscene_fill(0, 0, hb_w, hb_h, cast[Ptr[uint8]]("#161a20"))
+    hamscene_fill(0, 0, hb_w, 30, cast[Ptr[uint8]]("#2b303b"))
+    hamscene_glyphs_bold(12, 8, cast[Ptr[uint8]]("Audiobook"),
+                         cast[Ptr[uint8]]("#e6e8ec"))
+
+    if hb_name[0] != 0:
+        hamscene_glyphs(20, 44, &hb_name[0], cast[Ptr[uint8]]("#8fd0ff"))
+    else:
+        hamscene_glyphs(20, 44, cast[Ptr[uint8]]("(no book)"),
+                        cast[Ptr[uint8]]("#6b7280"))
+
+    tbuf: Array[48, uint8]
+    p: uint64 = _hb_fmt_mmss(hb_pos_ms, &tbuf[0])
+    tbuf[p] = 32
+    p = p + 1
+    tbuf[p] = 47
+    p = p + 1
+    tbuf[p] = 32
+    p = p + 1
+    p = p + _hb_fmt_mmss(hb_dur_ms, &tbuf[p])
+    hamscene_glyphs(20, 68, &tbuf[0], cast[Ptr[uint8]]("#c8ccd4"))
+
+    # Progress bar + fill + frame + play-head knob.
+    hamscene_fill(bar_x, bar_y, bar_w, bar_h, cast[Ptr[uint8]]("#0e1014"))
+    fw: int32 = _hb_progress_fill_w()
+    if fw > 0:
+        hamscene_fill(bar_x, bar_y, fw, bar_h, cast[Ptr[uint8]]("#3d7dff"))
+    hamscene_stroke(bar_x, bar_y, bar_w, bar_h, 1, cast[Ptr[uint8]]("#3a4150"))
+    if hb_dur_ms > 0:
+        knob_w: int32 = 8
+        knob_x: int32 = bar_x + fw - knob_w / 2
+        if knob_x < bar_x:
+            knob_x = bar_x
+        if knob_x > bar_x + bar_w - knob_w:
+            knob_x = bar_x + bar_w - knob_w
+        hamscene_roundrect(knob_x, bar_y - 3, knob_w, bar_h + 6, 3,
+                           cast[Ptr[uint8]]("#dfe6f2"))
+
+    # Resume note (only when we actually resumed a saved offset).
+    if hb_resumed != 0:
+        rbuf: Array[48, uint8]
+        pre: Ptr[uint8] = cast[Ptr[uint8]]("Resumed at ")
+        rp: uint64 = 0
+        rk: uint64 = 0
+        while pre[rk] != 0:
+            rbuf[rp] = pre[rk]
+            rp = rp + 1
+            rk = rk + 1
+        rp = rp + _hb_fmt_mmss(hb_resume_ms, &rbuf[rp])
+        hamscene_glyphs(20, 122, &rbuf[0], cast[Ptr[uint8]]("#33d17a"))
+
+    # Transport row.
+    bk_sunk: int32 = 0
+    if hb_press == 0:
+        bk_sunk = 1
+    _hb_draw_btn(btn_back_x, BKW, cast[Ptr[uint8]]("<<30"), bk_sunk)
+    pp_sunk: int32 = 0
+    if hb_press == 1:
+        pp_sunk = 1
+    pp_label: Ptr[uint8] = cast[Ptr[uint8]]("Play")
+    if hb_playing != 0:
+        pp_label = cast[Ptr[uint8]]("Pause")
+    _hb_draw_btn(btn_play_x, PPW, pp_label, pp_sunk)
+    fwd_sunk: int32 = 0
+    if hb_press == 2:
+        fwd_sunk = 1
+    _hb_draw_btn(btn_fwd_x, BKW, cast[Ptr[uint8]]("30>>"), fwd_sunk)
+
+    # Sleep-timer button: face turns blue when armed so "night mode" reads at a
+    # glance (and a host gate can sample the pixel).
+    slp_face: Ptr[uint8] = cast[Ptr[uint8]]("#3a4150")
+    if hamaudiobook_sleep_is_armed() != 0:
+        slp_face = cast[Ptr[uint8]]("#25406a")
+    if hb_press == 4:
+        slp_face = cast[Ptr[uint8]]("#2b303b")
+    hamscene_roundrect(slp_x, slp_y, slp_w, slp_h, 6, slp_face)
+    lbuf: Array[64, uint8]
+    _hb_sleep_label(&lbuf[0], now_ms)
+    hamscene_glyphs(slp_x + 12, slp_y + (slp_h - 16) / 2, &lbuf[0],
+                    cast[Ptr[uint8]]("#e6e8ec"))
+
+
+# Convenience wrapper for callers without a clock (static render).
+def hamaudiobook_build_scene():
+    hamaudiobook_build_scene_at(0)
