@@ -453,8 +453,37 @@ of #4 form-control geometry, host-verified):**
   its own value text (the monospace cell model has no clip); non-text controls (button/select/range) keep their
   content-sized width. `height`/`appearance` + range/progress `accent-color` are the remaining half of map-item #4.
 
-**TOP REMAINING W3C GAPS after the 2026-07-18i grid-auto-flow + form-control-width round (a map for the next/round-10
-agent, roughly by real-world value — the browser is now broad but NOT "fully W3C-implemented"; concrete holes):**
+**ROUND 11 2026-07-18 (accent-color on range/progress + grid-auto-rows implicit-track sizing):**
+- **[html-forms / css-ui] `accent-color` on `<input type=range>` + `<progress>` (NEW, gate `rangeprog`).** Round-10 left
+  a range as a static `[--O--]` glyph run (no accent, no value fraction) and `<progress>` as an UNKNOWN tag whose
+  fallback text (`70%`) leaked into the flow. Now a range resolves its cascaded `accent-color` (the same
+  `m_accent`/`d_accent` cascade the checkbox/radio share, via a transient `_img_cascade` for the void `<input>`) plus
+  `min`/`max`/`value` → a fill percentage, committed as a **seg_field kind-5** segment (`_mark_check_seg(5, pct, accent)`
+  in `lib/web/dom/forms.ad`). `<progress value max>` is now a real element handler: it resolves `accent-color` (its own
+  cascade winner, non-void) + `value`/`max` → percentage, commits a **seg_field kind-6** segment, and SKIPS its fallback
+  body (`_el_pop`+`_enter_skip`, like `<button>`/`<select>`). The pixel painter (`lib/htmlpage.ad`) draws a rounded light
+  track with the value fraction filled in the accent colour (a range also gets a round accent thumb at the fill position),
+  UA blue `rgb(26,115,232)` when `accent-color` is unset. GATED: the `[--O--]`/`[####----]` glyphs are kept for the
+  text/gate view and the painter skips them (like the existing field boxes). Gate `test_hambrowse_rangeprog_host.sh`
+  (fixture `hambrowse_rangeprog.html`, probe `hb_rangeprog_probe.py`): a stylesheet `accent-color:#dd2222` value=100 range
+  fills RED full-width, a `#22aa33` value=50 progress fills GREEN half, a default range fills UA-blue half, an inline
+  `style="accent-color:#ee8800"` value=80 progress fills ORANGE — and the full range's coloured run is wider than the
+  half range's (proving the value fraction). STILL absent: `<meter>`, interactive drag, focus ring.
+- **[css-grid] `grid-auto-rows` implicit-track sizing (NEW, gate `gridautorows`).** Round-10 always content-sized the
+  IMPLICIT grid rows (those past `grid-template-rows`), so the ubiquitous `grid-template-columns: repeat(N, 1fr)` +
+  `grid-auto-rows: <px>` dashboard collapsed every row to one text line. Now `grid-auto-rows` rides the cascade
+  (`r_gar`/`m_gar`/`d_gar` + a `bgar` specificity slot in `lib/web/css/cascade.ad`, parsed by the shared
+  `_grid_one_track`), is carried to the grid frame (`g_grid_gar` → `flex_gar[frame]` in `lib/web/layout/box.ad`), and a
+  FIXED-px auto-row gives implicit rows that height in `_grid_row_h_rows`. GATED: an `fr`/`auto` auto-row (enc < 0) or no
+  `grid-auto-rows` leaves `flex_gar=0` → implicit rows stay content-sized, byte-identical to before (all 8 other grid
+  gates verified green). Gate `test_hambrowse_gridautorows_host.sh` (fixture `hambrowse_gridautorows.html`): a 2-col grid
+  with NO `grid-template-rows` and `grid-auto-rows:72px` places its second row's items ~125px (5 text rows @16px) below
+  the first — vs ~25px (one content row) at baseline. `grid-auto-columns` is left ignored (implicit COLUMNS never form in
+  the row-major track model — items wrap to new rows). STILL absent: `subgrid`, `>8` explicit tracks (`GRID_MAXTRACK`),
+  `minmax()` auto-rows, a row-spanning box filling its fixed tracks' height.
+
+**TOP REMAINING W3C GAPS after the 2026-07-18 round-11 accent-range/progress + grid-auto-rows round (a map for the
+round-12 agent, roughly by real-world value — the browser is now broad but NOT "fully W3C-implemented"; concrete holes):**
 1. **[ecmascript] RegExp `u`/`v` FULL code-point semantics — SUBSET LANDED (gate `reunicode`); remainder is the hard
    part.** `\u{...}` escapes, surrogate-pair combining, ASCII `\p{...}` property classes, and string-literal `\u{CP}`
    decoding are DONE (byte-model, correct for UTF-8 subjects). STILL absent: code-point-granular `.`/case-fold, astral
@@ -462,8 +491,9 @@ agent, roughly by real-world value — the browser is now broad but NOT "fully W
    (hard). Lower priority now — the common cases work.
 2. **[css-grid] `grid-auto-flow: dense` / column-flow — DONE round-9 (gate `gridflow`).** Both `dense` (back-fill the
    first free hole from the grid origin) and `column` (column-major flow, needs a known `grid-template-rows`) land, gated
-   so grid-auto-flow-free grids stay byte-identical. REMAINING grid holes: `subgrid`, `grid-auto-columns`/`grid-auto-rows`
-   track sizing, >8 tracks (`GRID_MAXTRACK`), >12 named areas per container, a row-spanning box filling its FIXED tracks'
+   so grid-auto-flow-free grids stay byte-identical. `grid-auto-rows` px sizing — DONE round-11 (gate `gridautorows`).
+   REMAINING grid holes: `subgrid`, `grid-auto-columns` (no-op in row-major flow) + `minmax()` auto-rows, >8 tracks
+   (`GRID_MAXTRACK`), >12 named areas per container, a row-spanning box filling its FIXED tracks'
    height, and the multi-line-cell-into-earlier-row height under-estimate in dense/2-D placement (fixed-row-pitch model).
 3. **[css-filter] real `drop-shadow()` + `backdrop-filter` — ABSENT/no-op.** `drop-shadow()` is a recognised NO-OP
    (needs a blurred silhouette painted OUTSIDE the box); `backdrop-filter` filters what is BEHIND the element. Both need
@@ -473,9 +503,9 @@ agent, roughly by real-world value — the browser is now broad but NOT "fully W
    (r9), `height` (48px→3 rows; the box paints that many rows tall and the layout reserves them — mirrors the tall
    inline-block chip floor), and `appearance:none` (stylesheet + inline + `-webkit-`/`-moz-`; suppresses the default
    field surface/border and button-grey face so author CSS styles the control). Gated: a control WITHOUT these
-   declarations is byte-identical (appear=0, rows=0). STILL absent: `accent-color` on `<input type=range>`/`<progress>`
-   (range is a text-only `[--O--]` glyph with no seg; `<progress>` is not yet an element at all — both need new indicator
-   segments), applying the author BACKGROUND to an appearance:none void `<input>` (the transient `_img_cascade` m_bg/d_bg
+   declarations is byte-identical (appear=0, rows=0). `accent-color` on `<input type=range>`/`<progress>` — DONE round-11
+   (gate `rangeprog`; range = seg kind 5, progress = seg kind 6, both accent-tinted with a value fraction). STILL absent:
+   `<meter>`, applying the author BACKGROUND to an appearance:none void `<input>` (the transient `_img_cascade` m_bg/d_bg
    winners are unreliable across void controls — chrome is suppressed but the author bg is not yet re-painted),
    focus-ring / `:checked` pseudo-styling, and interactive click-to-toggle (a DOM/event-layer concern).
 5. **[html5-parsing] adoption-agency / active-formatting-list reconstruction — box tree ALREADY spec-correct (LOCKED
