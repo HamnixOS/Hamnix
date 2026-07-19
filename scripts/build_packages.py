@@ -887,6 +887,29 @@ def _files_hamaudiobook() -> list[tuple[Path, str]]:
     return f
 
 
+# ---- hamnix-hamwrite — the office word-processor, ALSO repo-ONLY ----------
+# HamWrite is the flagship of a would-be office suite: a rich-text word
+# processor (bold/italic/heading, word-wrap, selection/clipboard, save/load a
+# HAMWRITE1 document container). Like the audiobook player it follows the
+# repo-ONLY pattern — BUILT + published in the main channel (installable via hpm
+# / the Software app), but excluded from the hamnix-base closure so a fresh
+# install does NOT carry it. Its payload is the binary + its .desktop launcher
+# (staged into /etc/hamde/apps ONLY when the package is installed).
+
+HAMWRITE_PKG = "hamnix-hamwrite"
+
+
+def _files_hamwrite() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hamwrite")
+    # Launcher lives in etc/hamde/apps-optional/ (NOT etc/hamde/apps/, which the
+    # base hamnix-desktop-config package globs wholesale) and is staged into the
+    # live /etc/hamde/apps ONLY when this package is installed.
+    f.append((ETC_DIR / "hamde" / "apps-optional" / "hamwrite.desktop",
+              "etc/hamde/apps/hamwrite.desktop"))
+    return f
+
+
 # ---------------------------------------------------------------------
 # Package spec table — the source of truth.
 # ---------------------------------------------------------------------
@@ -1095,6 +1118,23 @@ PACKAGE_SPECS.append({
 })
 
 
+# The repo-ONLY office word processor. Same pattern as the audiobook app: built
+# + published in the main channel but kept out of the hamnix-base closure below,
+# so `hpm install hamnix-hamwrite` / the Software app is the only way to get it.
+# Depends only on the compositor (scene-file DE) — no extra hardware stack.
+PACKAGE_SPECS.append({
+    "name": HAMWRITE_PKG,
+    "files_fn": _files_hamwrite,
+    "depends": [f"hamnix-desktop-core>={PKG_VERSION}"],
+    "description": ("HamWrite — Hamnix office word processor: word-wrapped rich "
+                    "text (bold/italic/heading), selection + clipboard, and "
+                    "save/load of a HAMWRITE1 document that round-trips "
+                    "formatting. Repo-only: install from 255.one, not "
+                    "pre-installed."),
+    "target": "#hamnix-system",
+})
+
+
 # ---------------------------------------------------------------------
 # Generic spec-driven package builder
 # ---------------------------------------------------------------------
@@ -1209,6 +1249,8 @@ def build_hamnix_base() -> dict:
     # The repo-only audiobook app must NOT be pre-installed: keep it out of the
     # base closure so it ships ONLY via 255.one / `hpm install`.
     leaf_names.add(HAMAUDIOBOOK_PKG)
+    # The repo-only office word processor is likewise NOT pre-installed.
+    leaf_names.add(HAMWRITE_PKG)
     depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS
                if s["name"] not in leaf_names]
     depends.append(f"hamnix-bootloader>={PKG_VERSION}")

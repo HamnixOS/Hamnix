@@ -1,0 +1,1011 @@
+# lib/hamwritecore.ad — PURE, extern-free core for HamWrite, the Hamnix office
+# word processor (/bin/hamwrite). This is the flagship of a would-be office
+# suite: a single-document rich-ish text editor with the things a word processor
+# needs —
+#   1. a multi-line, word-wrapped BODY with an editable caret + selection,
+#   2. CHARACTER FORMATTING (bold / italic / heading) toggled from a toolbar or
+#      via Ctrl-B, applied to the live selection or to subsequently-typed text,
+#   3. a real DOCUMENT FILE that round-trips the text AND its formatting, so a
+#      save->load preserves which spans were bold/italic/heading,
+#   4. a live word/character count.
+#
+# Like the other dual-target apps (docs/hamui_dual_target.md) this file imports
+# ONLY lib/hamscene (+ lib/hamtextbox for proportional caret/hit-testing) and
+# performs NO syscalls: it owns the buffers, the keyboard editing, the toolbar
+# hit-testing and the word-wrapped render, and it SERIALISES the document as a
+# pure byte string — but the DRIVERS (native user/hamwrite.ad + the host harness
+# user/hamwrite_host.ad) do the open/read/write. That lets the exact shipping
+# code path render to a PNG on the dev host and be driven by scripted keystrokes
+# deterministically (scripts/test_hamwrite_host.sh).
+#
+# FORMATTING MODEL: parallel to the text buffer we keep an `attr` byte per
+# character — a bitfield (bit0 bold, bit1 italic, bit2 heading). Newly typed
+# characters inherit `cur_attr` (the toolbar's live toggles); applying a format
+# to a selection toggles the bit across that span. The renderer groups runs of
+# equal attr and draws each run bold (double-struck) / tinted (italic) / heading
+# (bold + accent + underline) accordingly.
+
+from lib.hamscene import hamscene_begin, hamscene_fill, hamscene_stroke, \
+    hamscene_glyphs, hamscene_glyphs_bold, hamscene_roundrect, hamscene_line
+from lib.hamtextbox import htb_text_width, htb_hit_test, \
+    htb_word_bounds, htb_line_bounds
+
+
+# ---- formatting bits -------------------------------------------------------
+ATTR_BOLD:    uint8 = 1
+ATTR_ITALIC:  uint8 = 2
+ATTR_HEADING: uint8 = 4
+
+
+CAP: uint64 = 4096
+text: Array[4096, uint8]
+attr: Array[4096, uint8]                # one formatting byte per character
+tlen: uint64 = 0
+dirty: int32 = 0
+
+caret:  uint64 = 0                      # insertion point [0..tlen]
+anchor: uint64 = 0                      # fixed end of a selection
+sel_on: int32 = 0                       # 1 iff a live (possibly-empty) highlight
+
+# Formatting applied to newly-typed characters (toggled with no selection).
+cur_attr: uint8 = 0
+
+# Action requested by a keystroke or a click, drained by the driver:
+#   0 none  1 save  2 open  7 copy  8 paste  9 cut
+pending_action: int32 = 0
+
+# CSI escape decode: 0 ground, 1 saw ESC, 2 saw ESC '['; par = numeric param.
+hw_esc: int32 = 0
+hw_par: int32 = 0
+
+# Current document filename (display only; the driver owns the real path).
+FNAME_CAP: uint64 = 128
+fname: Array[128, uint8]
+fname_len: uint64 = 0
+
+# Brief "saved!" acknowledgement countdown (decremented each render).
+flash: int32 = 0
+
+
+def _hw_slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _hw_udec(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    x: uint64 = v
+    while x > 0:
+        digs[n] = cast[uint8](x % 10) + 48
+        x = x / 10
+        n = n + 1
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digs[n]
+        i = i + 1
+    return i
+
+
+def _append_cstr(out: Ptr[uint8], p: uint64, s: Ptr[uint8]) -> uint64:
+    j: uint64 = 0
+    while s[j] != 0:
+        out[p] = s[j]
+        p = p + 1
+        j = j + 1
+    return p
+
+
+# ---- accessors -------------------------------------------------------------
+def hamwrite_len() -> uint64:
+    return tlen
+
+
+def hamwrite_text_ptr() -> Ptr[uint8]:
+    return &text[0]
+
+
+def hamwrite_attr_ptr() -> Ptr[uint8]:
+    return &attr[0]
+
+
+def hamwrite_dirty() -> int32:
+    return dirty
+
+
+def hamwrite_mark_saved():
+    dirty = 0
+    flash = 8
+
+
+def hamwrite_caret() -> uint64:
+    return caret
+
+
+def hamwrite_attr_at(i: uint64) -> uint8:
+    if i >= tlen:
+        return cur_attr
+    return attr[i]
+
+
+# The formatting that WOULD apply to a character typed now: the char before the
+# caret's attr while a run is being extended, else cur_attr. Used for the
+# toolbar's active-state readout.
+def hamwrite_active_attr() -> uint8:
+    if sel_on != 0 and caret != anchor:
+        # report the attr of the first selected char
+        lo: uint64 = caret
+        if anchor < lo:
+            lo = anchor
+        if lo < tlen:
+            return attr[lo]
+    return cur_attr
+
+
+# Count characters carrying a given bit (used by the host gate to prove a
+# save->load preserved formatting). kind: 1 bold, 2 italic, 4 heading.
+def hamwrite_attr_count(bit: uint8) -> uint64:
+    n: uint64 = 0
+    i: uint64 = 0
+    while i < tlen:
+        if (attr[i] & bit) != 0:
+            n = n + 1
+        i = i + 1
+    return n
+
+
+# Count whitespace-delimited words in the body (a word starts at each blank ->
+# non-blank transition). PURE; drives the status readout + asserted by the gate.
+def hamwrite_word_count() -> uint64:
+    n: uint64 = 0
+    in_word: int32 = 0
+    i: uint64 = 0
+    while i < tlen:
+        c: uint8 = text[i]
+        blank: int32 = 0
+        if c == 32 or c == 9 or c == 10 or c == 13:
+            blank = 1
+        if blank == 0:
+            if in_word == 0:
+                n = n + 1
+                in_word = 1
+        else:
+            in_word = 0
+        i = i + 1
+    return n
+
+
+def hamwrite_take_action() -> int32:
+    a: int32 = pending_action
+    pending_action = 0
+    return a
+
+
+def hamwrite_pending() -> int32:
+    return pending_action
+
+
+def hamwrite_set_fname(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and i < FNAME_CAP - 1:
+        fname[i] = s[i]
+        i = i + 1
+    fname[i] = 0
+    fname_len = i
+
+
+def hamwrite_fname_ptr() -> Ptr[uint8]:
+    return &fname[0]
+
+
+def hamwrite_fname_len() -> uint64:
+    return fname_len
+
+
+# ---- buffer editing (text + parallel attr) --------------------------------
+def _reset_caret():
+    caret = tlen
+    anchor = tlen
+    sel_on = 0
+
+
+def hamwrite_clear():
+    tlen = 0
+    dirty = 0
+    cur_attr = 0
+    _reset_caret()
+
+
+def _sel_lo() -> uint64:
+    if caret < anchor:
+        return caret
+    return anchor
+
+
+def _sel_hi() -> uint64:
+    if caret > anchor:
+        return caret
+    return anchor
+
+
+def _sel_has() -> int32:
+    if sel_on == 0:
+        return 0
+    if caret == anchor:
+        return 0
+    return 1
+
+
+# Delete [a,b) from text+attr; caret collapses to a. Returns 1 if bytes removed.
+def _delete_range(a: uint64, b: uint64) -> int32:
+    if b > tlen:
+        b = tlen
+    if b <= a:
+        return 0
+    span: uint64 = b - a
+    j: uint64 = a
+    while j + span < tlen:
+        text[j] = text[j + span]
+        attr[j] = attr[j + span]
+        j = j + 1
+    tlen = tlen - span
+    caret = a
+    anchor = a
+    return 1
+
+
+def _delete_selection() -> int32:
+    if _sel_has() == 0:
+        sel_on = 0
+        return 0
+    a: uint64 = _sel_lo()
+    b: uint64 = _sel_hi()
+    r: int32 = _delete_range(a, b)
+    sel_on = 0
+    return r
+
+
+# Insert one char with attribute `at` at the caret (shift tail right).
+def _insert_at(c: uint8, at: uint8) -> int32:
+    if tlen + 1 > CAP:
+        return 0
+    j: uint64 = tlen
+    while j > caret:
+        text[j] = text[j - 1]
+        attr[j] = attr[j - 1]
+        j = j - 1
+    text[caret] = c
+    attr[caret] = at
+    tlen = tlen + 1
+    caret = caret + 1
+    anchor = caret
+    return 1
+
+
+def _backspace() -> int32:
+    if caret == 0:
+        return 0
+    j: uint64 = caret - 1
+    while j + 1 < tlen:
+        text[j] = text[j + 1]
+        attr[j] = attr[j + 1]
+        j = j + 1
+    tlen = tlen - 1
+    caret = caret - 1
+    anchor = caret
+    return 1
+
+
+def _delete_fwd() -> int32:
+    if caret >= tlen:
+        return 0
+    j: uint64 = caret
+    while j + 1 < tlen:
+        text[j] = text[j + 1]
+        attr[j] = attr[j + 1]
+        j = j + 1
+    tlen = tlen - 1
+    return 1
+
+
+# Set the document text (host seed / driver load), all plain. Attr cleared.
+def hamwrite_set_text(s: Ptr[uint8], n: uint64):
+    if n > CAP:
+        n = CAP
+    i: uint64 = 0
+    while i < n:
+        text[i] = s[i]
+        attr[i] = 0
+        i = i + 1
+    tlen = n
+    dirty = 0
+    _reset_caret()
+
+
+# ---- formatting toggles ----------------------------------------------------
+# Toggle a formatting bit. With a live selection: if every selected char already
+# has the bit, CLEAR it across the span, else SET it across the span. With no
+# selection: flip the bit in cur_attr so subsequently-typed text carries it.
+def hamwrite_toggle(bit: uint8) -> int32:
+    if _sel_has() != 0:
+        a: uint64 = _sel_lo()
+        b: uint64 = _sel_hi()
+        all_set: int32 = 1
+        i: uint64 = a
+        while i < b:
+            if (attr[i] & bit) == 0:
+                all_set = 0
+            i = i + 1
+        i = a
+        while i < b:
+            if all_set != 0:
+                attr[i] = attr[i] & (255 - bit)
+            else:
+                attr[i] = attr[i] | bit
+            i = i + 1
+        dirty = 1
+        return 1
+    # no selection: toggle the typing attribute
+    if (cur_attr & bit) != 0:
+        cur_attr = cur_attr & (255 - bit)
+    else:
+        cur_attr = cur_attr | bit
+    return 1
+
+
+def hamwrite_toggle_bold() -> int32:
+    return hamwrite_toggle(ATTR_BOLD)
+
+
+def hamwrite_toggle_italic() -> int32:
+    return hamwrite_toggle(ATTR_ITALIC)
+
+
+def hamwrite_toggle_heading() -> int32:
+    return hamwrite_toggle(ATTR_HEADING)
+
+
+# ---- selection / clipboard glue -------------------------------------------
+def hamwrite_sel_active() -> int32:
+    return _sel_has()
+
+
+def hamwrite_sel_ptr() -> Ptr[uint8]:
+    return &text[_sel_lo()]
+
+
+def hamwrite_sel_len() -> uint64:
+    if _sel_has() == 0:
+        return 0
+    return _sel_hi() - _sel_lo()
+
+
+def hamwrite_delete_selection() -> int32:
+    r: int32 = _delete_selection()
+    if r != 0:
+        dirty = 1
+    return r
+
+
+# Paste n bytes at the caret (replacing any selection). Pasted text inherits the
+# current typing attribute. Newlines are kept.
+def hamwrite_paste(s: Ptr[uint8], n: uint64):
+    _delete_selection()
+    i: uint64 = 0
+    while i < n:
+        c: uint8 = s[i]
+        if (c >= 32 and c <= 126) or c == 10:
+            _insert_at(c, cur_attr)
+        i = i + 1
+    dirty = 1
+
+
+def _select_all():
+    if tlen > 0:
+        anchor = 0
+        caret = tlen
+        sel_on = 1
+    else:
+        sel_on = 0
+
+
+# ---- physical-line caret navigation ---------------------------------------
+def _line_start(pos: uint64) -> uint64:
+    i: uint64 = pos
+    while i > 0 and text[i - 1] != 10:
+        i = i - 1
+    return i
+
+
+def _line_end(pos: uint64) -> uint64:
+    i: uint64 = pos
+    while i < tlen and text[i] != 10:
+        i = i + 1
+    return i
+
+
+def _move_up():
+    ls: uint64 = _line_start(caret)
+    if ls == 0:
+        caret = 0
+        return
+    col: uint64 = caret - ls
+    pls: uint64 = _line_start(ls - 1)
+    plen: uint64 = (ls - 1) - pls
+    if col > plen:
+        col = plen
+    caret = pls + col
+
+
+def _move_down():
+    le: uint64 = _line_end(caret)
+    if le >= tlen:
+        caret = tlen
+        return
+    ls: uint64 = _line_start(caret)
+    col: uint64 = caret - ls
+    nls: uint64 = le + 1
+    nle: uint64 = _line_end(nls)
+    nlen: uint64 = nle - nls
+    if col > nlen:
+        col = nlen
+    caret = nls + col
+
+
+# Apply a decoded CSI final byte: caret navigation + forward Delete. Navigation
+# collapses any live selection. Returns 1 if state changed.
+def _hw_nav(fin: int32) -> int32:
+    sel_on = 0
+    if fin == 68:                                      # Left
+        if caret > 0:
+            caret = caret - 1
+    elif fin == 67:                                    # Right
+        if caret < tlen:
+            caret = caret + 1
+    elif fin == 72:                                    # Home -> start of line
+        caret = _line_start(caret)
+    elif fin == 70:                                    # End -> end of line
+        caret = _line_end(caret)
+    elif fin == 65:                                    # Up
+        _move_up()
+    elif fin == 66:                                    # Down
+        _move_down()
+    elif fin == 51:                                    # Delete (CSI 3~)
+        if _delete_fwd() != 0:
+            dirty = 1
+            anchor = caret
+            return 1
+        anchor = caret
+        return 0
+    else:
+        return 0
+    anchor = caret
+    return 1
+
+
+# ---- keyboard --------------------------------------------------------------
+# Apply one key (ASCII/decoded code). Returns 1 if the buffer/caret/action
+# changed (redraw needed). Ctrl-C/V/X + Ctrl-S/O set a pending action the DRIVER
+# performs (keeps this core extern-free); Ctrl-B toggles bold in-core.
+def hamwrite_key(code: int32) -> int32:
+    if hw_esc == 1:                                    # after ESC
+        if code == 91:                                 # '['
+            hw_esc = 2
+        else:
+            hw_esc = 0
+        return 0
+    if hw_esc == 2:                                    # inside CSI
+        if code >= 48 and code <= 57:                  # numeric param (e.g. 3~)
+            hw_par = code
+            return 0
+        hw_esc = 0
+        fin: int32 = code
+        if code == 126:                                # '~' final: map by param
+            p: int32 = hw_par
+            hw_par = 0
+            if p == 51:                                # 3~ Delete
+                fin = 51
+            elif p == 49:                              # 1~ Home
+                fin = 72
+            elif p == 52:                              # 4~ End
+                fin = 70
+            else:
+                return 0
+        return _hw_nav(fin)
+    if code == 27:                                     # ESC -> begin sequence
+        hw_esc = 1
+        return 0
+    if code == 19:                                     # Ctrl-S -> Save
+        pending_action = 1
+        return 1
+    if code == 15:                                     # Ctrl-O -> Open
+        pending_action = 2
+        return 1
+    if code == 2:                                      # Ctrl-B -> bold toggle
+        return hamwrite_toggle(ATTR_BOLD)
+    if code == 1:                                      # Ctrl-A -> select all
+        _select_all()
+        return 1
+    if code == 3:                                      # Ctrl-C -> copy (driver)
+        pending_action = 7
+        return 1
+    if code == 22:                                     # Ctrl-V -> paste (driver)
+        pending_action = 8
+        return 1
+    if code == 24:                                     # Ctrl-X -> cut (driver)
+        pending_action = 9
+        return 1
+    if code == 8 or code == 127:                       # Backspace
+        if _delete_selection() != 0:
+            dirty = 1
+            return 1
+        if _backspace() != 0:
+            dirty = 1
+            return 1
+        return 0
+    if code == 13 or code == 10:                       # Enter -> newline
+        _delete_selection()
+        if _insert_at(10, cur_attr) != 0:
+            dirty = 1
+            return 1
+        return 0
+    if code >= 32 and code <= 126:                     # printable -> insert
+        _delete_selection()
+        if _insert_at(cast[uint8](code), cur_attr) != 0:
+            dirty = 1
+            return 1
+        return 0
+    return 0
+
+
+# Parse a "d <code>" key-press wire line and apply it. Returns 1 if changed.
+def hamwrite_key_line(s: Ptr[uint8], n: uint64) -> int32:
+    if n < 1 or s[0] != 100:                           # 'd' press; ignore 'u'
+        return 0
+    i: uint64 = 1
+    while i < n and s[i] == 32:
+        i = i + 1
+    neg: int32 = 0
+    if i < n and s[i] == 45:
+        neg = 1
+        i = i + 1
+    code: int32 = 0
+    got: int32 = 0
+    while i < n and s[i] >= 48 and s[i] <= 57:
+        code = code * 10 + cast[int32](s[i]) - 48
+        i = i + 1
+        got = 1
+    if got == 0:
+        return 0
+    if neg != 0:
+        code = 0 - code
+    return hamwrite_key(code)
+
+
+# ---- document serialisation (round-trips text AND formatting) -------------
+# Format (a real, self-describing document container):
+#   "HAMWRITE1\n"          magic + version
+#   "<tlen>\n"             decimal character count
+#   <tlen text bytes>      raw body text (may contain newlines)
+#   <tlen attr bytes>      one formatting byte per character (bit0/1/2)
+# Length-prefixed so the raw text+attr can hold ANY byte (newlines included) and
+# still parse deterministically. Returns the serialised byte count.
+def hamwrite_serialize(out: Ptr[uint8]) -> uint64:
+    p: uint64 = _append_cstr(out, 0, cast[Ptr[uint8]]("HAMWRITE1"))
+    out[p] = 10
+    p = p + 1
+    p = p + _hw_udec(tlen, &out[p])
+    out[p] = 10
+    p = p + 1
+    i: uint64 = 0
+    while i < tlen:
+        out[p] = text[i]
+        p = p + 1
+        i = i + 1
+    i = 0
+    while i < tlen:
+        out[p] = attr[i]
+        p = p + 1
+        i = i + 1
+    return p
+
+
+# Parse a HAMWRITE1 container back into text+attr. A buffer that does NOT begin
+# with the magic is treated as PLAIN text (so opening an ordinary .txt works):
+# every byte becomes an unformatted character.
+def hamwrite_deserialize(s: Ptr[uint8], n: uint64):
+    # magic check
+    magic: Ptr[uint8] = cast[Ptr[uint8]]("HAMWRITE1")
+    is_magic: int32 = 1
+    k: uint64 = 0
+    while magic[k] != 0:
+        if k >= n or s[k] != magic[k]:
+            is_magic = 0
+        k = k + 1
+    if is_magic == 0:
+        # plain text import
+        m: uint64 = n
+        if m > CAP:
+            m = CAP
+        i0: uint64 = 0
+        while i0 < m:
+            text[i0] = s[i0]
+            attr[i0] = 0
+            i0 = i0 + 1
+        tlen = m
+        dirty = 0
+        _reset_caret()
+        return
+    i: uint64 = k                                      # just past the magic
+    if i < n and s[i] == 10:
+        i = i + 1
+    # parse the decimal length
+    dl: uint64 = 0
+    while i < n and s[i] >= 48 and s[i] <= 57:
+        dl = dl * 10 + cast[uint64](s[i]) - 48
+        i = i + 1
+    if i < n and s[i] == 10:
+        i = i + 1
+    if dl > CAP:
+        dl = CAP
+    j: uint64 = 0
+    while j < dl and i < n:
+        text[j] = s[i]
+        j = j + 1
+        i = i + 1
+    tlen = j
+    # attr bytes follow the text (may be truncated on a short read -> plain)
+    a: uint64 = 0
+    while a < tlen and i < n:
+        attr[a] = s[i]
+        a = a + 1
+        i = i + 1
+    while a < tlen:
+        attr[a] = 0
+        a = a + 1
+    dirty = 0
+    _reset_caret()
+
+
+def hamwrite_flash_saved():
+    flash = 8
+
+
+# ---- layout ----------------------------------------------------------------
+WIN_W: int32 = 560
+WIN_H: int32 = 384
+BAR_H: int32 = 22           # title bar (filename + status)
+TB_Y: int32 = 22
+TB_H: int32 = 30
+BTN_Y: int32 = 26
+BTN_H: int32 = 22
+
+B_X:  int32 = 8
+B_W:  int32 = 26
+I_X:  int32 = 38
+I_W:  int32 = 26
+H_X:  int32 = 68
+H_W:  int32 = 30
+OPEN_X: int32 = 108
+OPEN_W: int32 = 48
+SAVE_X: int32 = 160
+SAVE_W: int32 = 48
+
+# page (document) area
+PAGE_X: int32 = 12
+PAGE_Y: int32 = 60
+PAGE_W: int32 = 536
+PAGE_H: int32 = 304
+TXT_X:  int32 = 20          # PAGE_X + 8
+TXT_Y:  int32 = 66          # PAGE_Y + 6
+LINE_H: int32 = 18
+MAXCOLS: uint64 = 62        # (PAGE_W-16)/8 (advance-approx; renderer wraps)
+MAXROWS: uint64 = 16
+
+
+# Map a body-area click to a byte offset, replaying the SAME word-wrap the
+# renderer uses (break on '\n' and at MAXCOLS) then hit-testing the target
+# visual row's glyph run — the pixel-exact inverse of where the caret draws.
+rowhit_buf: Array[80, uint8]
+
+
+def _hit_offset(x: int64, y: int64) -> uint64:
+    ry: int64 = y - cast[int64](TXT_Y)
+    if ry < 0:
+        ry = 0
+    target: uint64 = cast[uint64](ry / cast[int64](LINE_H))
+    click_x: int32 = cast[int32](x)
+    x0: int32 = TXT_X
+    row: uint64 = 0
+    lb: uint64 = 0
+    row_start: uint64 = 0
+    i: uint64 = 0
+    while i < tlen:
+        ch: uint8 = text[i]
+        if ch == 10:
+            if row == target:
+                return row_start + htb_hit_test(x0, &rowhit_buf[0], lb, click_x)
+            row = row + 1
+            lb = 0
+            i = i + 1
+            row_start = i
+            continue
+        rowhit_buf[lb] = ch
+        lb = lb + 1
+        i = i + 1
+        if lb >= MAXCOLS:
+            if row == target:
+                return row_start + htb_hit_test(x0, &rowhit_buf[0], lb, click_x)
+            row = row + 1
+            lb = 0
+            row_start = i
+    return row_start + htb_hit_test(x0, &rowhit_buf[0], lb, click_x)
+
+
+# Hit-test a pointer PRESS. Toolbar buttons: 10 bold / 11 italic / 12 heading
+# (applied in-core, return 3 = redraw-only), 1 save, 2 open. A body click places
+# the caret at the clicked glyph (returns 0). Otherwise 0.
+def hamwrite_hit(x: int64, y: int64) -> int32:
+    if y >= cast[int64](TB_Y) and y < cast[int64](TB_Y + TB_H):
+        if x >= cast[int64](B_X) and x < cast[int64](B_X + B_W):
+            hamwrite_toggle(ATTR_BOLD)
+            return 3
+        if x >= cast[int64](I_X) and x < cast[int64](I_X + I_W):
+            hamwrite_toggle(ATTR_ITALIC)
+            return 3
+        if x >= cast[int64](H_X) and x < cast[int64](H_X + H_W):
+            hamwrite_toggle(ATTR_HEADING)
+            return 3
+        if x >= cast[int64](OPEN_X) and x < cast[int64](OPEN_X + OPEN_W):
+            return 2
+        if x >= cast[int64](SAVE_X) and x < cast[int64](SAVE_X + SAVE_W):
+            return 1
+        return 0
+    if x >= cast[int64](PAGE_X) and x < cast[int64](PAGE_X + PAGE_W) and \
+            y >= cast[int64](PAGE_Y) and y < cast[int64](PAGE_Y + PAGE_H):
+        caret = _hit_offset(x, y)
+        anchor = caret
+        sel_on = 0
+        return 0
+    return 0
+
+
+# Is (x,y) inside the editable page? 1 = yes. Gates double/triple-click.
+def hamwrite_in_page(x: int64, y: int64) -> int32:
+    if x >= cast[int64](PAGE_X) and x < cast[int64](PAGE_X + PAGE_W) and \
+            y >= cast[int64](PAGE_Y) and y < cast[int64](PAGE_Y + PAGE_H):
+        return 1
+    return 0
+
+
+# Pointer DRAG (button-1 held): move caret to hit-test, KEEP anchor -> paint a
+# selection. Returns 1 if the caret moved.
+def hamwrite_drag(x: int64, y: int64) -> int32:
+    idx: uint64 = _hit_offset(x, y)
+    if idx == caret:
+        return 0
+    caret = idx
+    if caret != anchor:
+        sel_on = 1
+    else:
+        sel_on = 0
+    return 1
+
+
+# Double-click: select the WORD under the caret. Triple-click: whole LINE.
+def hamwrite_select_word() -> int32:
+    s: uint64 = 0
+    e: uint64 = 0
+    htb_word_bounds(&text[0], tlen, caret, &s, &e)
+    anchor = s
+    caret = e
+    if e > s:
+        sel_on = 1
+    else:
+        sel_on = 0
+    return 1
+
+
+def hamwrite_select_line() -> int32:
+    s: uint64 = 0
+    e: uint64 = 0
+    htb_line_bounds(&text[0], tlen, caret, &s, &e)
+    anchor = s
+    caret = e
+    if e > s:
+        sel_on = 1
+    else:
+        sel_on = 0
+    return 1
+
+
+# ---- render ----------------------------------------------------------------
+line_buf: Array[80, uint8]
+seg_buf:  Array[80, uint8]
+wc_buf:   Array[48, uint8]
+
+
+# Colours for a formatting run.  Bold/heading are double-struck; italic + heading
+# get a tint so the three weights read apart (a true oblique glyph is a future
+# font-engine job — see the roadmap in the driver header).
+def _run_color(a: uint8) -> Ptr[uint8]:
+    if (a & ATTR_HEADING) != 0:
+        return cast[Ptr[uint8]]("#1b3a6b")             # heading accent (navy)
+    if (a & ATTR_ITALIC) != 0:
+        return cast[Ptr[uint8]]("#2f6f4f")             # italic tint (green-slate)
+    return cast[Ptr[uint8]]("#202020")
+
+
+# Draw one wrapped row: selection band UNDER the glyphs, then the glyphs grouped
+# into runs of equal attr (each run bold/tinted/heading-underlined), then the
+# caret if it falls on this row. row_start = buffer index of the row's 1st glyph.
+def _draw_row(row: uint64, lb: uint64, row_start: uint64,
+              caret_donep: Ptr[int32], lo: uint64, hi: uint64):
+    yy: int32 = TXT_Y + cast[int32](row) * LINE_H
+    x0: int32 = TXT_X
+    row_end: uint64 = row_start + lb
+    # selection band
+    if sel_on != 0 and hi > lo:
+        a: uint64 = lo
+        b: uint64 = hi
+        if a < row_start:
+            a = row_start
+        if b > row_end:
+            b = row_end
+        if b > a:
+            sx0: int32 = x0 + htb_text_width(&line_buf[0], a - row_start)
+            sx1: int32 = x0 + htb_text_width(&line_buf[0], b - row_start)
+            hamscene_fill(sx0, yy, sx1 - sx0, 16, cast[Ptr[uint8]]("#b4d0f8"))
+    # glyph runs of equal attr
+    c0: uint64 = 0
+    while c0 < lb:
+        a0: uint8 = attr[row_start + c0]
+        c1: uint64 = c0
+        while c1 < lb and attr[row_start + c1] == a0:
+            c1 = c1 + 1
+        # copy the run into a NUL-terminated seg
+        si: uint64 = 0
+        while c0 + si < c1:
+            seg_buf[si] = line_buf[c0 + si]
+            si = si + 1
+        seg_buf[si] = 0
+        rx: int32 = x0 + htb_text_width(&line_buf[0], c0)
+        col: Ptr[uint8] = _run_color(a0)
+        if (a0 & ATTR_BOLD) != 0 or (a0 & ATTR_HEADING) != 0:
+            hamscene_glyphs_bold(rx, yy, &seg_buf[0], col)
+        else:
+            hamscene_glyphs(rx, yy, &seg_buf[0], col)
+        # heading underline under the run
+        if (a0 & ATTR_HEADING) != 0:
+            rx1: int32 = x0 + htb_text_width(&line_buf[0], c1)
+            hamscene_line(rx, yy + 15, rx1, yy + 15, 1,
+                          cast[Ptr[uint8]]("#1b3a6b"))
+        c0 = c1
+    # caret
+    if caret_donep[0] == 0 and caret >= row_start and caret <= row_end:
+        cx: int32 = x0 + htb_text_width(&line_buf[0], caret - row_start)
+        hamscene_fill(cx, yy, 2, 16, cast[Ptr[uint8]]("#202020"))
+        caret_donep[0] = 1
+
+
+def _toolbtn(x: int32, w: int32, label: Ptr[uint8], active: int32):
+    fillc: Ptr[uint8] = cast[Ptr[uint8]]("#e6e8ec")
+    if active != 0:
+        fillc = cast[Ptr[uint8]]("#c3d7f5")            # depressed/active tint
+    hamscene_roundrect(x, BTN_Y, w, BTN_H, 4, fillc)
+    hamscene_stroke(x, BTN_Y, w, BTN_H, 1, cast[Ptr[uint8]]("#a8b0ba"))
+    hamscene_glyphs_bold(x + 7, BTN_Y + 4, label, cast[Ptr[uint8]]("#202020"))
+
+
+# Build "<n> word[s]  <m> char[s]" into wc_buf (NUL-term); returns length.
+def _wc_text() -> uint64:
+    words: uint64 = hamwrite_word_count()
+    p: uint64 = _hw_udec(words, &wc_buf[0])
+    if words == 1:
+        p = _append_cstr(&wc_buf[0], p, cast[Ptr[uint8]](" word  "))
+    else:
+        p = _append_cstr(&wc_buf[0], p, cast[Ptr[uint8]](" words  "))
+    p = p + _hw_udec(tlen, &wc_buf[p])
+    if tlen == 1:
+        p = _append_cstr(&wc_buf[0], p, cast[Ptr[uint8]](" char"))
+    else:
+        p = _append_cstr(&wc_buf[0], p, cast[Ptr[uint8]](" chars"))
+    wc_buf[p] = 0
+    return p
+
+
+def hamwrite_build_scene():
+    if flash > 0:
+        flash = flash - 1
+    hamscene_begin()
+    hamscene_fill(0, 0, WIN_W, WIN_H, cast[Ptr[uint8]]("#dfe3e8"))
+    # title bar
+    hamscene_fill(0, 0, WIN_W, BAR_H, cast[Ptr[uint8]]("#3f6fb5"))
+    hamscene_fill(0, BAR_H - 1, WIN_W, 1, cast[Ptr[uint8]]("#2c4f84"))
+    hamscene_glyphs_bold(10, 5, cast[Ptr[uint8]]("HamWrite"),
+                         cast[Ptr[uint8]]("#ffffff"))
+    # filename (or "(untitled)") centred-ish, then status at the right
+    nm: Ptr[uint8] = cast[Ptr[uint8]]("(untitled)")
+    if fname_len > 0:
+        nm = &fname[0]
+    hamscene_glyphs(96, 5, nm, cast[Ptr[uint8]]("#dbe6f6"))
+    stat: Ptr[uint8] = cast[Ptr[uint8]]("ready")
+    if flash > 0:
+        stat = cast[Ptr[uint8]]("saved!")
+    elif dirty != 0:
+        stat = cast[Ptr[uint8]]("* modified")
+    hamscene_glyphs(WIN_W - 92, 5, stat, cast[Ptr[uint8]]("#eef4ff"))
+
+    # toolbar strip + formatting buttons (active = the run at the caret / cur_attr)
+    hamscene_fill(0, TB_Y, WIN_W, TB_H, cast[Ptr[uint8]]("#eef0f3"))
+    hamscene_stroke(0, TB_Y + TB_H - 1, WIN_W, 1, 1, cast[Ptr[uint8]]("#b4b8bf"))
+    act: uint8 = hamwrite_active_attr()
+    bold_on: int32 = 0
+    if (act & ATTR_BOLD) != 0:
+        bold_on = 1
+    it_on: int32 = 0
+    if (act & ATTR_ITALIC) != 0:
+        it_on = 1
+    hd_on: int32 = 0
+    if (act & ATTR_HEADING) != 0:
+        hd_on = 1
+    _toolbtn(B_X, B_W, cast[Ptr[uint8]]("B"), bold_on)
+    _toolbtn(I_X, I_W, cast[Ptr[uint8]]("I"), it_on)
+    _toolbtn(H_X, H_W, cast[Ptr[uint8]]("H1"), hd_on)
+    hamscene_stroke(102, BTN_Y, 1, BTN_H, 1, cast[Ptr[uint8]]("#c0c4cb"))
+    _toolbtn(OPEN_X, OPEN_W, cast[Ptr[uint8]]("Open"), 0)
+    _toolbtn(SAVE_X, SAVE_W, cast[Ptr[uint8]]("Save"), 0)
+    # live word/char count, right-aligned in the toolbar
+    wcn: uint64 = _wc_text()
+    wcx: int32 = WIN_W - 8 - htb_text_width(&wc_buf[0], wcn)
+    hamscene_glyphs(wcx, BTN_Y + 4, &wc_buf[0], cast[Ptr[uint8]]("#5a5f66"))
+
+    # ---- document page (white paper) ----------------------------------
+    hamscene_fill(PAGE_X, PAGE_Y, PAGE_W, PAGE_H, cast[Ptr[uint8]]("#ffffff"))
+    hamscene_stroke(PAGE_X, PAGE_Y, PAGE_W, PAGE_H, 1,
+                    cast[Ptr[uint8]]("#c4c8ce"))
+
+    lo: uint64 = 0
+    hi: uint64 = 0
+    if sel_on != 0:
+        lo = _sel_lo()
+        hi = _sel_hi()
+    row: uint64 = 0
+    lb: uint64 = 0
+    row_start: uint64 = 0
+    caret_done: int32 = 0
+    i: uint64 = 0
+    while i < tlen and row < MAXROWS:
+        ch: uint8 = text[i]
+        if ch == 10:
+            line_buf[lb] = 0
+            _draw_row(row, lb, row_start, &caret_done, lo, hi)
+            row = row + 1
+            lb = 0
+            i = i + 1
+            row_start = i
+            continue
+        line_buf[lb] = ch
+        lb = lb + 1
+        i = i + 1
+        if lb >= MAXCOLS:
+            line_buf[lb] = 0
+            _draw_row(row, lb, row_start, &caret_done, lo, hi)
+            row = row + 1
+            lb = 0
+            row_start = i
+    if row < MAXROWS:
+        line_buf[lb] = 0
+        _draw_row(row, lb, row_start, &caret_done, lo, hi)
+
+    # footer hint
+    hamscene_glyphs(PAGE_X, WIN_H - 16,
+                    cast[Ptr[uint8]](
+                        "Ctrl-B bold  toolbar I/H1  Ctrl-S save  Ctrl-O open"),
+                    cast[Ptr[uint8]]("#606870"))

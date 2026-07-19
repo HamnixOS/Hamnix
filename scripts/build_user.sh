@@ -309,6 +309,7 @@ build_adder_user hamsettings          # scene-file DE settings: wallpaper swatch
 build_adder_user hammonscene          # scene-file DE system monitor: uptime + memory bar + /proc/tasks process list (ported from hammon)
 build_adder_user hamcalscene          # scene-file DE calendar: month grid with prev/next + today highlight, real clock (lib/hamcalcore, dual-target)
 build_adder_user hamnotesscene        # scene-file DE Notes scratchpad: keyboard text entry, auto-persists /tmp/hamnix-notes.txt (lib/hamnotescore, dual-target)
+build_adder_user hamwrite             # scene-file DE HamWrite word processor: the office-suite flagship — word-wrapped rich text (bold/italic/heading), selection+clipboard, save/load a HAMWRITE1 document container. REPO-ONLY (hpm install hamnix-hamwrite), NOT pre-installed (lib/hamwritecore, dual-target; host gate: scripts/test_hamwrite_host.sh)
 build_adder_user hampkgscene          # scene-file DE Package Manager: searchable package list + detail pane + Install/Remove/Upgrade over the native hpm engine (lib/hampkgcore, dual-target)
 build_adder_user hamsoftware          # scene-file DE "Software": hampkgscene + a category sidebar (All/Installed/Available/Upgradable) — richer Synaptic front-end over hpm (lib/hampkgcore, dual-target)
 build_adder_user hamlogscene          # scene-file DE Log Viewer: tails /proc/kmsg into a scrollable ring, page/tail/wheel scroll (lib/hamlogcore, dual-target)
