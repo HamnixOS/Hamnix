@@ -224,7 +224,8 @@ build_adder_user hamosd               # DE pivot wave 6 (round 2): workspace/vol
 build_adder_user hamtray              # DE pivot wave 7 (round 2): message-tray history panel (v2 client; reads /dev/wsys/tray, poked via /dev/wsys/tray/show)
 build_adder_user hamscreensaver       # DE screensaver daemon: idle timer then spawns /bin/hamlock; cycle repeats
 build_adder_user hamsession           # DE session save/restore: reads /dev/wsys/session snapshot, persists/replays the open window set
-build_adder_user top                  # M16.87: one-shot /proc dashboard
+build_adder_user top                  # Linux-style live process TUI (sorted %CPU/%MEM/TIME, in-place refresh; -b one-shot) — reads /proc/toptable via lib/toprender.ad
+build_adder_user keydemo              # terminal GAME demo: opts into hamtermscene GAME input (ESC[?9003h) to observe key DOWN *and* UP (lib/gamekey.ad); q quits
 build_adder_user ifconfig             # M16.87: stub lo 127.0.0.1/8
 build_adder_user ping                 # native Adder ping: Plan-9-shaped /net/icmp client
 build_adder_user host                 # native Adder DNS resolver: forward (A) + reverse (PTR) via SYS_RESOLVE/SYS_RESOLVE_PTR

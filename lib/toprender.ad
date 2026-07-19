@@ -1,0 +1,446 @@
+# lib/toprender.ad — PURE model + renderer for the interactive `top` (user/top.ad).
+#
+# Linux `top` is a full-screen TUI: a summary header (uptime, task counts,
+# memory) plus a process table sorted by %CPU that repaints in place every
+# couple of seconds. This module is the extern-free brain behind it: feed it
+# the single-read /proc/toptable snapshot the kernel exposes (see
+# fs/procfs.ad :: render_toptable) and, across two feeds, it derives each
+# task's %CPU as a tick DELTA, its %MEM from the resident set, and its
+# cumulative TIME, sorts by %CPU, and renders an ANSI frame into a caller
+# buffer. user/top.ad only does I/O around it (read /proc, write the frame,
+# poll a key); user/toprender_host.ad drives THIS on the host with synthetic
+# snapshots — no QEMU — so the parse / delta / sort / format is unit-tested.
+#
+# /proc/toptable shape (one header line + one line per live task):
+#   now <jiffies> hz 100 memtotal <kB> memfree <kB>\n
+#   <pid>\t<state>\t<cputicks>\t<rss_kb>\t<start_jiffies>\t<comm>\n
+# cputicks = utime+stime in HZ ticks; HZ=100 so 1 tick == 1 centisecond.
+
+TR_MAXPROC:  uint64 = 256
+TR_COMM_CAP: uint64 = 16
+
+# Current snapshot.
+_tr_pid:     Array[256, uint64]
+_tr_ticks:   Array[256, uint64]
+_tr_rss:     Array[256, uint64]              # kB
+_tr_state:   Array[256, uint8]
+_tr_comm:    Array[4096, uint8]              # TR_MAXPROC * TR_COMM_CAP
+_tr_n:       uint64 = 0
+_tr_now:     uint64 = 0                       # jiffies at snapshot
+_tr_memtotal: uint64 = 0                      # kB
+_tr_memfree:  uint64 = 0                      # kB
+
+# %CPU per current row, in tenths of a percent (e.g. 123 == 12.3%).
+_tr_cpu_tenths: Array[256, uint64]
+
+# Previous snapshot (for the %CPU delta): pid -> ticks + the snapshot jiffy.
+_tr_prev_pid:   Array[256, uint64]
+_tr_prev_ticks: Array[256, uint64]
+_tr_prev_n:     uint64 = 0
+_tr_prev_now:   uint64 = 0
+
+# Sorted view: order[0..n) indexes _tr_* in descending %CPU.
+_tr_order: Array[256, uint64]
+
+
+def _tr_is_digit(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return 1
+    return 0
+
+
+# Read a decimal run starting at *pos; advance *pos past it; return the value.
+def _tr_scan_u64(buf: Ptr[uint8], len: uint64, pos: Ptr[uint64]) -> uint64:
+    i: uint64 = pos[0]
+    v: uint64 = 0
+    while i < len and _tr_is_digit(buf[i]) != 0:
+        v = v * 10 + cast[uint64](buf[i] - 48)
+        i = i + 1
+    pos[0] = i
+    return v
+
+
+# Advance *pos to the next decimal digit (used to skip labels in the header).
+def _tr_to_digit(buf: Ptr[uint8], len: uint64, pos: Ptr[uint64]):
+    i: uint64 = pos[0]
+    while i < len and _tr_is_digit(buf[i]) == 0:
+        i = i + 1
+    pos[0] = i
+
+
+def _tr_prev_ticks_for(pid: uint64) -> uint64:
+    # Ticks this pid had in the previous snapshot, or a sentinel MAX when the
+    # pid is new (so the caller reports 0% rather than a bogus huge delta).
+    i: uint64 = 0
+    while i < _tr_prev_n:
+        if _tr_prev_pid[i] == pid:
+            return _tr_prev_ticks[i]
+        i = i + 1
+    return 0xFFFFFFFFFFFFFFFF
+
+
+def tr_ingest(buf: Ptr[uint8], len: uint64):
+    # Parse a /proc/toptable snapshot into the current arrays and compute each
+    # row's %CPU against the previous snapshot, then roll current -> previous.
+    _tr_n = 0
+    _tr_now = 0
+    _tr_memtotal = 0
+    _tr_memfree = 0
+    pos: uint64 = 0
+    # First line: the header. It opens with a non-digit ("now ..."), so the
+    # first four digit-runs are now / hz / memtotal / memfree.
+    if pos < len and _tr_is_digit(buf[pos]) == 0:
+        # now
+        _tr_to_digit(buf, len, &pos)
+        _tr_now = _tr_scan_u64(buf, len, &pos)
+        # hz (skip the value)
+        _tr_to_digit(buf, len, &pos)
+        _tr_scan_u64(buf, len, &pos)
+        # memtotal
+        _tr_to_digit(buf, len, &pos)
+        _tr_memtotal = _tr_scan_u64(buf, len, &pos)
+        # memfree
+        _tr_to_digit(buf, len, &pos)
+        _tr_memfree = _tr_scan_u64(buf, len, &pos)
+        # advance past the newline
+        while pos < len and buf[pos] != 10:
+            pos = pos + 1
+        if pos < len:
+            pos = pos + 1
+    # Task lines.
+    while pos < len and _tr_n < TR_MAXPROC:
+        # pid
+        if _tr_is_digit(buf[pos]) == 0:
+            # Skip a stray/blank line.
+            while pos < len and buf[pos] != 10:
+                pos = pos + 1
+            if pos < len:
+                pos = pos + 1
+            continue
+        pid: uint64 = _tr_scan_u64(buf, len, &pos)
+        if pos < len and buf[pos] == 9:
+            pos = pos + 1
+        # state (single char)
+        stc: uint8 = 63                         # '?'
+        if pos < len and buf[pos] != 9 and buf[pos] != 10:
+            stc = buf[pos]
+            pos = pos + 1
+        if pos < len and buf[pos] == 9:
+            pos = pos + 1
+        # ticks
+        ticks: uint64 = _tr_scan_u64(buf, len, &pos)
+        if pos < len and buf[pos] == 9:
+            pos = pos + 1
+        # rss kB
+        rss: uint64 = _tr_scan_u64(buf, len, &pos)
+        if pos < len and buf[pos] == 9:
+            pos = pos + 1
+        # start jiffies (parsed, unused in the table)
+        _tr_scan_u64(buf, len, &pos)
+        if pos < len and buf[pos] == 9:
+            pos = pos + 1
+        # comm (rest of line)
+        ci: uint64 = 0
+        base: uint64 = _tr_n * TR_COMM_CAP
+        while pos < len and buf[pos] != 10:
+            if ci + 1 < TR_COMM_CAP:
+                _tr_comm[base + ci] = buf[pos]
+                ci = ci + 1
+            pos = pos + 1
+        _tr_comm[base + ci] = 0
+        if pos < len:
+            pos = pos + 1                       # past newline
+        _tr_pid[_tr_n] = pid
+        _tr_state[_tr_n] = stc
+        _tr_ticks[_tr_n] = ticks
+        _tr_rss[_tr_n] = rss
+        _tr_n = _tr_n + 1
+
+    # %CPU as a tick delta over the elapsed jiffies between snapshots.
+    dj: uint64 = 0
+    if _tr_now > _tr_prev_now:
+        dj = _tr_now - _tr_prev_now
+    i: uint64 = 0
+    while i < _tr_n:
+        pt: uint64 = _tr_prev_ticks_for(_tr_pid[i])
+        pct: uint64 = 0
+        if _tr_prev_n != 0 and dj != 0 and pt != 0xFFFFFFFFFFFFFFFF \
+                and _tr_ticks[i] >= pt:
+            pct = (_tr_ticks[i] - pt) * 1000 / dj
+        _tr_cpu_tenths[i] = pct
+        i = i + 1
+
+    # Roll current -> previous for the next feed.
+    _tr_prev_n = _tr_n
+    _tr_prev_now = _tr_now
+    j: uint64 = 0
+    while j < _tr_n:
+        _tr_prev_pid[j] = _tr_pid[j]
+        _tr_prev_ticks[j] = _tr_ticks[j]
+        j = j + 1
+
+
+def _tr_sort():
+    # Selection sort order[] by %CPU desc, tie-break RSS desc then pid asc.
+    i: uint64 = 0
+    while i < _tr_n:
+        _tr_order[i] = i
+        i = i + 1
+    a: uint64 = 0
+    while a < _tr_n:
+        best: uint64 = a
+        b: uint64 = a + 1
+        while b < _tr_n:
+            ob: uint64 = _tr_order[b]
+            og: uint64 = _tr_order[best]
+            better: int32 = 0
+            if _tr_cpu_tenths[ob] > _tr_cpu_tenths[og]:
+                better = 1
+            elif _tr_cpu_tenths[ob] == _tr_cpu_tenths[og]:
+                if _tr_rss[ob] > _tr_rss[og]:
+                    better = 1
+                elif _tr_rss[ob] == _tr_rss[og] and _tr_pid[ob] < _tr_pid[og]:
+                    better = 1
+            if better != 0:
+                best = b
+            b = b + 1
+        tmp: uint64 = _tr_order[a]
+        _tr_order[a] = _tr_order[best]
+        _tr_order[best] = tmp
+        a = a + 1
+
+
+# --- output builder ---------------------------------------------------
+def _put_str(out: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while s[i] != 0:
+        out[pos] = s[i]
+        pos = pos + 1
+        i = i + 1
+    return pos
+
+
+def _put_u64(out: Ptr[uint8], pos: uint64, v: uint64) -> uint64:
+    if v == 0:
+        out[pos] = 48
+        return pos + 1
+    tmp: Array[24, uint8]
+    t: uint64 = 0
+    x: uint64 = v
+    while x > 0:
+        tmp[t] = cast[uint8](48 + x % 10)
+        x = x / 10
+        t = t + 1
+    while t > 0:
+        t = t - 1
+        out[pos] = tmp[t]
+        pos = pos + 1
+    return pos
+
+
+def _u64_width(v: uint64) -> uint64:
+    if v == 0:
+        return 1
+    w: uint64 = 0
+    x: uint64 = v
+    while x > 0:
+        w = w + 1
+        x = x / 10
+    return w
+
+
+def _put_u64_right(out: Ptr[uint8], pos: uint64, v: uint64, width: uint64) -> uint64:
+    w: uint64 = _u64_width(v)
+    while w < width:
+        out[pos] = 32
+        pos = pos + 1
+        w = w + 1
+    return _put_u64(out, pos, v)
+
+
+# Render a tenths value as "N.n" right-justified into `width` columns.
+def _put_tenths_right(out: Ptr[uint8], pos: uint64, tenths: uint64, width: uint64) -> uint64:
+    whole: uint64 = tenths / 10
+    frac:  uint64 = tenths % 10
+    field: uint64 = _u64_width(whole) + 2        # "W.f"
+    while field < width:
+        out[pos] = 32
+        pos = pos + 1
+        field = field + 1
+    pos = _put_u64(out, pos, whole)
+    out[pos] = 46                                # '.'
+    pos = pos + 1
+    out[pos] = cast[uint8](48 + frac)
+    return pos + 1
+
+
+# Render cumulative ticks (centiseconds at HZ=100) as "M:SS.cc" right-justified.
+def _put_time_right(out: Ptr[uint8], pos: uint64, ticks: uint64, width: uint64) -> uint64:
+    total_s: uint64 = ticks / 100
+    cs:  uint64 = ticks % 100
+    mins: uint64 = total_s / 60
+    secs: uint64 = total_s % 60
+    field: uint64 = _u64_width(mins) + 6         # "M:SS.cc"
+    while field < width:
+        out[pos] = 32
+        pos = pos + 1
+        field = field + 1
+    pos = _put_u64(out, pos, mins)
+    out[pos] = 58                                # ':'
+    pos = pos + 1
+    out[pos] = cast[uint8](48 + secs / 10)
+    out[pos + 1] = cast[uint8](48 + secs % 10)
+    out[pos + 2] = 46                            # '.'
+    out[pos + 3] = cast[uint8](48 + cs / 10)
+    out[pos + 4] = cast[uint8](48 + cs % 10)
+    return pos + 5
+
+
+# Copy the first token (space-delimited) of `src` into out; return new pos.
+def _put_token(out: Ptr[uint8], pos: uint64, src: Ptr[uint8], srclen: uint64,
+               start: Ptr[uint64]) -> uint64:
+    i: uint64 = start[0]
+    while i < srclen and src[i] == 32:
+        i = i + 1
+    while i < srclen and src[i] != 32 and src[i] != 10:
+        out[pos] = src[i]
+        pos = pos + 1
+        i = i + 1
+    start[0] = i
+    return pos
+
+
+# Rows of process table drawn per frame. Kept modest so the 4-line summary
+# header PLUS the table fit inside the DE terminal's default glyph grid
+# (~19 rows) without scrolling the header off the top; a taller VT (serial
+# console) simply shows some blank space below. A full-screen app has no
+# TIOCGWINSZ here, so this is a fixed, height-safe default rather than a query.
+TR_ROWS_SHOWN: uint64 = 15
+
+
+def tr_render(out: Ptr[uint8], cap: uint64,
+              loadavg: Ptr[uint8], load_len: uint64) -> uint64:
+    # Build the full-screen frame. Home the cursor, draw the summary header
+    # and the sorted table, each row clearing to EOL, then clear below so a
+    # shorter frame leaves no stale rows. Returns bytes written.
+    _tr_sort()
+    pos: uint64 = 0
+    pos = _put_str(out, pos, cast[Ptr[uint8]]("\x1b[H"))          # cursor home
+
+    # --- line 1: uptime + task count + load average ---
+    pos = _put_str(out, pos, cast[Ptr[uint8]]("\x1b[7mtop -"))
+    up_s: uint64 = _tr_now / 100
+    hh: uint64 = up_s / 3600
+    mm: uint64 = (up_s % 3600) / 60
+    ss: uint64 = up_s % 60
+    pos = _put_str(out, pos, cast[Ptr[uint8]](" up "))
+    pos = _put_u64(out, pos, hh)
+    out[pos] = 58                                                 # ':'
+    out[pos + 1] = cast[uint8](48 + mm / 10)
+    out[pos + 2] = cast[uint8](48 + mm % 10)
+    out[pos + 3] = 58
+    out[pos + 4] = cast[uint8](48 + ss / 10)
+    out[pos + 5] = cast[uint8](48 + ss % 10)
+    pos = pos + 6
+    pos = _put_str(out, pos, cast[Ptr[uint8]](",  "))
+    pos = _put_u64(out, pos, _tr_n)
+    pos = _put_str(out, pos, cast[Ptr[uint8]](" tasks,  load average: "))
+    # First three tokens of /proc/loadavg are the 1/5/15-minute averages.
+    ls: Array[1, uint64]
+    ls[0] = 0
+    pos = _put_token(out, pos, loadavg, load_len, &ls[0])
+    out[pos] = 32
+    pos = pos + 1
+    pos = _put_token(out, pos, loadavg, load_len, &ls[0])
+    out[pos] = 32
+    pos = pos + 1
+    pos = _put_token(out, pos, loadavg, load_len, &ls[0])
+    pos = _put_str(out, pos, cast[Ptr[uint8]]("\x1b[0m\x1b[K\r\n"))
+
+    # --- line 2: task state breakdown ---
+    nrun: uint64 = 0
+    nslp: uint64 = 0
+    nzomb: uint64 = 0
+    k: uint64 = 0
+    while k < _tr_n:
+        st: uint8 = _tr_state[k]
+        if st == 82:                            # 'R'
+            nrun = nrun + 1
+        elif st == 90:                          # 'Z'
+            nzomb = nzomb + 1
+        else:
+            nslp = nslp + 1
+        k = k + 1
+    pos = _put_str(out, pos, cast[Ptr[uint8]]("Tasks: "))
+    pos = _put_u64(out, pos, _tr_n)
+    pos = _put_str(out, pos, cast[Ptr[uint8]](" total, "))
+    pos = _put_u64(out, pos, nrun)
+    pos = _put_str(out, pos, cast[Ptr[uint8]](" running, "))
+    pos = _put_u64(out, pos, nslp)
+    pos = _put_str(out, pos, cast[Ptr[uint8]](" sleeping, "))
+    pos = _put_u64(out, pos, nzomb)
+    pos = _put_str(out, pos, cast[Ptr[uint8]](" zombie\x1b[K\r\n"))
+
+    # --- line 3: memory ---
+    used: uint64 = 0
+    if _tr_memtotal >= _tr_memfree:
+        used = _tr_memtotal - _tr_memfree
+    pos = _put_str(out, pos, cast[Ptr[uint8]]("MiB Mem: "))
+    pos = _put_u64(out, pos, _tr_memtotal)
+    pos = _put_str(out, pos, cast[Ptr[uint8]](" total, "))
+    pos = _put_u64(out, pos, _tr_memfree)
+    pos = _put_str(out, pos, cast[Ptr[uint8]](" free, "))
+    pos = _put_u64(out, pos, used)
+    pos = _put_str(out, pos, cast[Ptr[uint8]](" used (kB)\x1b[K\r\n"))
+
+    # --- column header ---
+    pos = _put_str(out, pos,
+        cast[Ptr[uint8]]("\x1b[7m   PID S   %CPU   %MEM      TIME+ COMMAND\x1b[0m\x1b[K\r\n"))
+
+    # --- rows, sorted by %CPU desc ---
+    shown: uint64 = 0
+    r: uint64 = 0
+    while r < _tr_n and shown < TR_ROWS_SHOWN:
+        idx: uint64 = _tr_order[r]
+        pos = _put_u64_right(out, pos, _tr_pid[idx], 6)
+        out[pos] = 32
+        out[pos + 1] = _tr_state[idx]
+        pos = pos + 2
+        pos = _put_tenths_right(out, pos, _tr_cpu_tenths[idx], 7)
+        memt: uint64 = 0
+        if _tr_memtotal != 0:
+            memt = _tr_rss[idx] * 1000 / _tr_memtotal
+        pos = _put_tenths_right(out, pos, memt, 7)
+        pos = _put_time_right(out, pos, _tr_ticks[idx], 11)
+        out[pos] = 32
+        pos = pos + 1
+        pos = _put_str(out, pos, &_tr_comm[idx * TR_COMM_CAP])
+        pos = _put_str(out, pos, cast[Ptr[uint8]]("\x1b[K\r\n"))
+        shown = shown + 1
+        r = r + 1
+
+    # Clear from the cursor to the bottom so a shrinking table leaves no stale
+    # rows, then home again so the next repaint overwrites cleanly.
+    pos = _put_str(out, pos, cast[Ptr[uint8]]("\x1b[J"))
+    return pos
+
+
+# Accessors for the host unit test (avoids exporting the raw arrays).
+def tr_count() -> uint64:
+    return _tr_n
+
+
+def tr_cpu_tenths_at(i: uint64) -> uint64:
+    return _tr_cpu_tenths[i]
+
+
+def tr_order_at(i: uint64) -> uint64:
+    return _tr_order[i]
+
+
+def tr_pid_at(i: uint64) -> uint64:
+    return _tr_pid[i]
+
+
+def tr_do_sort():
+    _tr_sort()
