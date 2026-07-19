@@ -80,16 +80,36 @@ source "$PROJ_ROOT/scripts/_build_lock.sh"
 source "$PROJ_ROOT/scripts/_adder_cc.sh"
 
 # OPTIMIZED-ADDER SHIP DEFAULT (user directive: "being able to compile and run
-# the OS should always be the bar for adopting new optimizations"). The shipped
-# installer image is built with the Phase-1..5 optimizer ON for BOTH the kernel
-# (HAMNIX_KERNEL_OPT) and every userland ELF (HAMNIX_USER_OPT). These are
-# exported so the build_user.sh + build_initramfs.py + kernel-compile
-# sub-invocations all agree. An explicit caller value still wins (set
-# HAMNIX_KERNEL_OPT=0 / HAMNIX_USER_OPT=0 for a no-opt reference image), and a
-# single miscompiling binary can be dropped back to no-opt via
-# HAMNIX_USER_OPT_EXCLUDE="name ..." without deoptimizing the rest of the OS.
+# the OS should always be the bar for adopting new optimizations").
+#
+#   HAMNIX_KERNEL_OPT default 1 — the shipped kernel is compiled with the
+#     Phase-1..5 optimizer. VERIFIED: the --opt kernel compiles and boots clean
+#     to userspace under OVMF (fix ab2c060d "reserve parked scratch for routed
+#     indexed stores" unblocked it). This is the safe, upstream-verified --opt
+#     win, so it is ON by default.
+#
+#   HAMNIX_USER_OPT default 0 — userland --opt is NOT yet safe as a blanket
+#     default: it compiles clean (0 cg_fail) but has RUNTIME miscompiles that
+#     FAIL the "OS must run" bar. Two confirmed under OVMF (2026-07-19):
+#       * /bin/hamsh miscompiles under --opt -> an early rc.boot child (pid 6)
+#         takes a read-prot #PF (va=0x34d0f099) -> SIGSEGV and wedges PID 1,
+#         so the box never reaches the desktop. Isolated by bisection: the
+#         crash reproduces with ONLY hamsh --opt (cat/init excluded) and
+#         DISAPPEARS the moment hamsh is built no-opt.
+#       * the scene DE apps (hampanelscene/hamdesktop/...) miscompile under
+#         --opt -> the compositor comes up but paints a BLANK backdrop (panel
+#         + icons never render), even with hamsh/cat/init excluded.
+#     The differential fuzzer + test_opt bench kernels are 0-miscompile, so the
+#     bug is a codegen pattern exercised by large hand-written userland but not
+#     by the microbenchmarks; it must be fixed in adder/compiler before flipping
+#     this to 1. The mechanism + HAMNIX_USER_OPT_EXCLUDE (drop a single binary
+#     back to no-opt) are retained so a partial rollout is a one-line change
+#     once the codegen fix lands. Opt in for the whole userland with
+#     HAMNIX_USER_OPT=1 (currently produces a non-booting desktop image).
+#
+# Exported so build_user.sh + build_initramfs.py + the kernel compile agree.
 export HAMNIX_KERNEL_OPT="${HAMNIX_KERNEL_OPT:-1}"
-export HAMNIX_USER_OPT="${HAMNIX_USER_OPT:-1}"
+export HAMNIX_USER_OPT="${HAMNIX_USER_OPT:-0}"
 export HAMNIX_USER_OPT_EXCLUDE="${HAMNIX_USER_OPT_EXCLUDE:-}"
 
 OUT="${HAMNIX_INSTALLER_IMG_OUT:-$OUTDIR/hamnix-installer.img}"
