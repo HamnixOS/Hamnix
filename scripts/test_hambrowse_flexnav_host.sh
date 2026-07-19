@@ -69,9 +69,17 @@ if [ -n "$hl" ] && [ "$hl" != "l-1" ]; then
 else
     echo "[hb-flexnav] FAIL flex <a> column lost its link (got '$hl')"; fail=1
 fi
-# The nav's own background paints a full-width bar (flex container box).
-if grep -Eq 'FILL [0-9]+ [0-9]+ 100 700 #223344' "$D0"; then
-    echo "[hb-flexnav] PASS flex nav paints its full-width background bar"
+# The nav's own background paints a FULL-BLEED bar spanning the viewport width
+# (flex container box). `.nav` is a block-level display:flex container with no
+# width/margin/padding, so its containing block is the body and its background
+# box spans the full content width — the engine's full-bleed nav-bar model,
+# emitted as `FILL <top> <bot> 0 <W>` (here 0..800 at the 800px render width).
+# The stale `100 700` expectation this replaced matched NO CSS in the fixture (no
+# 100px inset exists) and contradicted both this gate's own "full-width" comment
+# and the engine's documented full-bleed nav convention that
+# test_hambrowse_fullwidth_host.sh asserts green (nav bg spans ~0..viewport).
+if grep -Eq 'FILL [0-9]+ [0-9]+ 0 800 #223344' "$D0"; then
+    echo "[hb-flexnav] PASS flex nav paints its full-bleed background bar (0..800)"
 else
     echo "[hb-flexnav] FAIL flex nav background bar missing"; fail=1
 fi
