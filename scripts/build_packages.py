@@ -771,6 +771,15 @@ def _make_desktop_app_files_fn(bins: tuple, with_images: bool,
             # scripts/gen_test_mp3.py (also public-domain / CC0).
             mp3 = HERE / "tests" / "fixtures" / "sounds" / "test.mp3"
             f.append((mp3, "usr/share/sounds/test.mp3"))
+            # The DE login/loading jingle (48 kHz WAV) that user/login.ad
+            # streams to the HDA sink (non-blocking) when the desktop comes
+            # up, plus a longer music demo (clean MPEG-1 Layer III, 128k /
+            # 48 kHz) preloaded so `hamaudioscene` opens real music out of
+            # the box. Original assets shipped with Hamnix.
+            jingle = HERE / "tests" / "fixtures" / "sounds" / "boot-jingle.wav"
+            f.append((jingle, "usr/share/sounds/boot-jingle.wav"))
+            music = HERE / "tests" / "fixtures" / "sounds" / "hamnix-music-demo.mp3"
+            f.append((music, "usr/share/music/hamnix-music-demo.mp3"))
         if with_images:
             # Sample images for the hamview image viewer: a PNG and a
             # baseline JPEG so `hamview /share/hamview/test.png|test.jpg`
