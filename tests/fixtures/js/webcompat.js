@@ -69,3 +69,36 @@ console.log("forin", seen);
 window.appState = {ready: true};
 self.appState.count = 5;
 console.log("window", typeof window, appState.ready, globalThis.appState.count);
+
+// instanceof against built-in constructors + user constructors, and the ES5
+// prototype pattern (function ctor + Ctor.prototype.method + `new`). Minified
+// and transpiled bundles (google.com) lean on all of these. Before the fix
+// `[] instanceof Array`, `{} instanceof Object`, `new C() instanceof C` and
+// auto-created `C.prototype` were all broken.
+console.log("inst-builtin",
+    [] instanceof Array,
+    [] instanceof Object,
+    ({}) instanceof Object,
+    (/x/) instanceof RegExp,
+    (function(){}) instanceof Function,
+    (5 instanceof Object));
+
+function Widget(id) { this.id = id; }
+Widget.prototype.label = function () { return "w" + this.id; };
+var w = new Widget(7);
+console.log("proto-pattern",
+    typeof Widget.prototype,
+    w instanceof Widget,
+    w instanceof Object,
+    w.label(),
+    w.constructor === Widget);
+
+// prototype inheritance chain (B extends A via `new A()` prototype)
+function A() {} A.prototype.kind = function () { return "A"; };
+function B() {} B.prototype = new A();
+var b = new B();
+console.log("proto-chain", b.kind(), b instanceof A, b instanceof B);
+
+// arrows are not constructable and have no prototype object
+var arrow = function () {};
+console.log("arrow-proto", typeof (() => 1).prototype, arrow instanceof Function);
