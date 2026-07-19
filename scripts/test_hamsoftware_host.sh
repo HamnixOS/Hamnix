@@ -61,6 +61,13 @@ assert_grep() {
 # --- chrome / window / non-blank frame --------------------------------------
 assert_grep '^# scene v1 hamui'                 "scene header emitted"
 assert_grep '^fill 0 0 772 430 #eceef2'         "widened (sidebar) window background"
+# MAXIMIZE / RESIZE (user-reported: the Software window did not fill the screen
+# when maximized, leaving gaps). A compositor resize event (hampkg_set_size)
+# must STRETCH the scene: the background, detail pane and status bar fill the
+# whole 1024x700 maximized content rect.
+assert_grep '^fill 0 0 1024 700 #eceef2'        "maximized: background fills the whole window"
+assert_grep '^fill 0 678 1024 22 #dfe2e8'       "maximized: status bar hugs the new bottom edge"
+assert_grep '^fill 498 106 526 572 #ffffff'     "maximized: detail pane stretches to the right edge"
 assert_grep '^fill 0 0 772 30 #2f5c8f'          "blue header bar spans full width"
 assert_grep 'glyphs .*\"Software\"'             "app title label is Software"
 # a non-trivial primitive count proves the frame is not blank
