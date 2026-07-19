@@ -2649,6 +2649,18 @@ if _HPM_ISO_PACKAGES:
     print(f"  [iso-packages] staged {_n_iso_pkg_files} files "
           f"({_n_iso_pkg_bytes} bytes) at /iso-packages/ from "
           f"{_iso_pkgs_root}")
+    # Point a bare `hpm refresh` (e.g. the Software app on the live image) at
+    # the on-image repo, so it works OFFLINE with no network and no
+    # --allow-unsigned dance (the file:// index is signed by the committed
+    # local key + trusted-by-construction). The installer's own explicit
+    # `hpm --repo=file:///iso-packages ...` flag still overrides this. An
+    # INSTALLED root ships no /etc/hpm/repo, so it defaults to https://255.one/.
+    FILES.append(("/etc/hpm/repo",
+                  b"# hpm default repo base (first bare line). On the live /\n"
+                  b"# installer image this points at the on-image offline repo;\n"
+                  b"# override per-invocation with `hpm --repo=<url> ...`.\n"
+                  b"file:///iso-packages/\n"))
+    print("  [iso-packages] wrote /etc/hpm/repo -> file:///iso-packages/")
 
 _CPIO_STRESS_RAW = os.environ.get("HAMNIX_CPIO_STRESS_FILES", "")
 if _CPIO_STRESS_RAW:

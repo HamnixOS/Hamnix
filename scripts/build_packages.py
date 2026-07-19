@@ -148,22 +148,39 @@ def _say(msg: str) -> None:
 # unset — the common local/dev case, exactly like building an apt repo
 # without the archive key — we skip signing and print a note; hpm will
 # then require `refresh --allow-unsigned` for that repo.
+# The committed LOCAL signing key. It stamps every index with a valid
+# signature even when HPM_REPO_SECKEY (the out-of-band PRODUCTION archive
+# secret) is unset — the common local / offline / on-image build. hpm trusts
+# this key ONLY for file:// (on-image) repos (etc/hpm/local-trusted.pub,
+# compiled in), which are trusted-by-construction, so committing its secret
+# grants no MITM power over the remote 255.one path. When HPM_REPO_SECKEY IS
+# set (CI / production publish), that key signs instead and hpm verifies it
+# against the compiled-in PRODUCTION root (etc/hpm/trusted.pub).
+LOCAL_SECKEY = HERE / "scripts" / "hpm_local_key.seed"
+
+
 def _sign_index(index_path: Path) -> None:
     seckey_path = os.environ.get("HPM_REPO_SECKEY")
     sig_path = index_path.with_name(index_path.name + ".sig")
     if sig_path.exists():
         sig_path.unlink()
-    if not seckey_path:
-        _say(f"NOT signing {index_path} (HPM_REPO_SECKEY unset) — "
-             f"hpm will need `refresh --allow-unsigned` for this repo")
-        return
     sys.path.insert(0, str(HERE / "scripts"))
     import hpm_sign
-    seed_hex = Path(seckey_path).read_text()
+    if seckey_path:
+        seed_hex = Path(seckey_path).read_text()
+        which = "production (HPM_REPO_SECKEY)"
+    elif LOCAL_SECKEY.is_file():
+        seed_hex = LOCAL_SECKEY.read_text()
+        which = "local on-image key"
+    else:
+        _say(f"NOT signing {index_path} (HPM_REPO_SECKEY unset AND "
+             f"{LOCAL_SECKEY} missing) — hpm will need "
+             f"`refresh --allow-unsigned` for this repo")
+        return
     sig = hpm_sign.sign_bytes(index_path.read_bytes(), seed_hex)
     sig_path.write_text(sig + "\n")
     _say(f"signed {index_path} -> {sig_path.name} "
-         f"(Ed25519, pub {hpm_sign.pub_of(seed_hex)[:16]}…)")
+         f"(Ed25519, {which}, pub {hpm_sign.pub_of(seed_hex)[:16]}…)")
 
 
 def _stage_dir(staging: Path) -> Path:
@@ -321,6 +338,11 @@ def _files_init() -> list[tuple[Path, str]]:
     # subscribe to `main` only (the free / first-party channel).
     # `hpm enable non-free-firmware` appends entries post-install.
     _add_etc_file(f, "channels", subdir="hpm")
+    # /etc/hpm/{trusted.pub,local-trusted.pub} — the PRODUCTION (remote
+    # 255.one) and LOCAL (file:// / on-image) repo trust roots, shipped for
+    # inspection/tooling (hpm also has both compiled in).
+    _add_etc_file(f, "trusted.pub", subdir="hpm")
+    _add_etc_file(f, "local-trusted.pub", subdir="hpm")
     # Runlevel operator hooks for the non-graphical base: rc.3 is
     # multi-user (non-graphical), rc.0/rc.6 are halt/reboot. rc.5
     # (graphical) ships in hamnix-desktop-config instead, since it's the

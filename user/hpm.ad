@@ -616,8 +616,79 @@ def fetch_to_buf(tail: Ptr[uint8], dst: Ptr[uint8],
 
 # -- repo default + flag handling -------------------------------------
 
+# Scratch for reading /etc/hpm/repo (the optional on-disk base-URL config).
+repo_cfg_buf: Array[512, uint8]
+
+
+# Read /etc/hpm/repo (first bare, non-# line) into repo_url_buf. This lets an
+# image point hpm at its on-image `file:///...` repo (offline install) or at a
+# mirror without recompiling. Returns 0 if a usable base was loaded, else 1.
+def _load_repo_config() -> int32:
+    fd: int32 = sys_open(cast[Ptr[char]]("/etc/hpm/repo"))
+    if fd < 0:
+        return 1
+    total: uint64 = 0
+    while total < 511:
+        r: int64 = sys_read(fd, &repo_cfg_buf[total], 511 - total)
+        if r < 0:
+            sys_close(fd)
+            return 1
+        if r == 0:
+            break
+        total = total + cast[uint64](r)
+    sys_close(fd)
+    i: uint64 = 0
+    while i < total:
+        # Skip leading whitespace on the line.
+        while i < total and (repo_cfg_buf[i] == 32 or repo_cfg_buf[i] == 9):
+            i = i + 1
+        if i >= total:
+            break
+        if repo_cfg_buf[i] == 10 or repo_cfg_buf[i] == 13:
+            i = i + 1
+            continue
+        if repo_cfg_buf[i] == 35:                    # '#': comment line
+            while i < total and repo_cfg_buf[i] != 10:
+                i = i + 1
+            continue
+        # A bare token: copy to its end (whitespace / newline terminated).
+        o: uint64 = 0
+        while i < total and repo_cfg_buf[i] != 10 and repo_cfg_buf[i] != 13 \
+                and repo_cfg_buf[i] != 32 and repo_cfg_buf[i] != 9 and o < 1023:
+            repo_url_buf[o] = repo_cfg_buf[i]
+            o = o + 1
+            i = i + 1
+        repo_url_buf[o] = 0
+        if o > 0:
+            return 0
+        return 1
+    return 1
+
+
+# Probe for a present on-image file:// repo (the installer/live image mirror).
+# Returns 1 if <path>main/index.json is readable.
+def _onimage_repo_present(path: Ptr[char]) -> int32:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return 0
+    sys_close(fd)
+    return 1
+
+
 def _set_repo_default():
-    # The canonical hosted repo. Override via `--repo=<url>` flag.
+    # Repo-base precedence (all overridable by an explicit `--repo=<url>`):
+    #   1. /etc/hpm/repo config file (operator / image choice),
+    #   2. an on-image /iso-packages/ mirror if one is present (live /
+    #      installer image → works OFFLINE, no --allow-unsigned needed since
+    #      file:// is trusted-by-construction + signed by the local key),
+    #   3. the canonical hosted repo https://255.one/.
+    # An INSTALLED system has no /iso-packages, so it lands on 255.one.
+    if _load_repo_config() == 0:
+        return
+    if _onimage_repo_present(cast[Ptr[char]]("/iso-packages/main/index.json")) != 0:
+        _strcopy_cstr(&repo_url_buf[0],
+                      cast[Ptr[uint8]]("file:///iso-packages/"), 1024)
+        return
     s: Ptr[uint8] = "https://255.one/"
     _strcopy_cstr(&repo_url_buf[0], s, 1024)
 
@@ -1642,6 +1713,15 @@ def _splice_channel_into_idx(ci: uint64, fbuf_len: uint64,
 
 trusted_pub:      Array[32, uint8]
 trusted_pub_set:  int32 = 0
+# Separate trust root for file:// (local / on-image installer) repos. Those
+# are trusted BY CONSTRUCTION, so their integrity stamp uses a DIFFERENT key
+# (etc/hpm/local-trusted.pub) whose secret is committed for offline builds —
+# see _verify_index_signature_local.
+local_trusted_pub:     Array[32, uint8]
+local_trusted_pub_set: int32 = 0
+# Set when the operator passed --trusted-key=<path>: that key then overrides
+# BOTH the production root (remote) AND the local root (file://).
+user_trusted_key_set:  int32 = 0
 allow_unsigned:   int32 = 0
 # The fetched detached signature: up to 128 hex chars + slack, decoded
 # into 64 raw bytes.
@@ -1700,6 +1780,17 @@ def _load_default_trusted_pub():
     trusted_pub_set = 1
 
 
+# Load the compiled-in LOCAL trust root (matches etc/hpm/local-trusted.pub).
+# This authenticates file:// on-image repos only; its secret is committed
+# (scripts/hpm_local_key.seed) because that boundary is trusted-by-construction.
+def _load_local_trusted_pub():
+    src: Ptr[uint8] = \
+        "ef17a867f9c2c000080674acbb66c0b849e21032e55188032f10e4625278cbe7"
+    if _hex_decode(src, 64, &local_trusted_pub[0], 32) != 32:
+        write_str(2, "hpm: internal: bad built-in local trust root\n")
+    local_trusted_pub_set = 1
+
+
 # Parse a trusted-key file's contents (skip '#' comment lines, take the
 # first bare 64-hex-char token) into trusted_pub. Returns 0 on success.
 def _set_trusted_key_from_buf(buf: Ptr[uint8], blen: uint64) -> int32:
@@ -1752,13 +1843,50 @@ def _set_trusted_key_path(path: Ptr[uint8]) -> int32:
     if _set_trusted_key_from_buf(&tkey_file_buf[0], total) != 0:
         write_str(2, "hpm: malformed trusted-key file (want 64 hex chars)\n")
         return 1
+    user_trusted_key_set = 1
     return 0
 
 
-# Fetch <channel>/index.json.sig and verify the detached Ed25519
-# signature over `body[0..body_len)` against the trust root. Returns 0
-# if the signature is valid, 1 otherwise (missing/malformed/bad).
+# Verify a file:// (local / on-image) index.json.sig. A MISSING signature is
+# accepted (trusted-by-construction, printed as an informational note); a
+# PRESENT-but-invalid signature still fails (a local repo tampered after
+# signing). The key is: an explicit --trusted-key (user_trusted_key_set), else
+# the compiled-in LOCAL root (etc/hpm/local-trusted.pub).
+def _verify_index_signature_local(body: Ptr[uint8], body_len: uint64) -> int32:
+    vk: Ptr[uint8] = &local_trusted_pub[0]
+    if user_trusted_key_set != 0:
+        vk = &trusted_pub[0]
+    elif local_trusted_pub_set == 0:
+        _load_local_trusted_pub()
+    sn: int64 = fetch_to_buf(cast[Ptr[uint8]]("index.json.sig"),
+                             &sig_hex_buf[0], 512)
+    if sn < 0:
+        write_str(1, "hpm: local repo has no index.json.sig — trusting by "
+                     "construction (image-local bytes)\n")
+        return 0
+    dn: int64 = _hex_decode(&sig_hex_buf[0], cast[uint64](sn),
+                            &sig_raw_buf[0], 64)
+    if dn != 64:
+        write_str(2, "hpm: malformed index.json.sig (want 128 hex chars)\n")
+        return 1
+    if ed25519_verify(vk, &sig_raw_buf[0],
+                      body, body_len) != 1:
+        write_str(2, "hpm: LOCAL index signature INVALID — refusing to trust "
+                     "this on-image index (repo tampered after signing?)\n")
+        return 1
+    return 0
+
+
 def _verify_index_signature(body: Ptr[uint8], body_len: uint64) -> int32:
+    # file:// (local / on-image installer) repos are trusted BY
+    # CONSTRUCTION: their bytes never crossed a network and are covered by
+    # whatever authenticates the image as a whole (see user/install.ad). We
+    # still verify a signature IF one is shipped — against the LOCAL trust
+    # root — but its ABSENCE is a clear note, not a hard failure, so a fresh
+    # OFFLINE boot has a working `hpm` (search/list/install) with no
+    # --allow-unsigned dance. Remote (http/https) repos stay strict.
+    if url_scheme == 2:
+        return _verify_index_signature_local(body, body_len)
     if trusted_pub_set == 0:
         _load_default_trusted_pub()
     sn: int64 = fetch_to_buf(cast[Ptr[uint8]]("index.json.sig"),
