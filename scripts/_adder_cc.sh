@@ -153,6 +153,7 @@ adder_cc_link_kernel() {
     if [ "${HAMNIX_KERNEL_OPT:-0}" = "1" ]; then
         kopt+=("--opt")
         [ "${HAMNIX_KERNEL_OPT_NOVEC:-0}" = "1" ] && kopt+=("--no-vec")
+        [ "${HAMNIX_KERNEL_OPT_NOIREMIT:-0}" = "1" ] && kopt+=("--no-iremit")
         echo "[adder_cc] KERNEL --opt build (${kopt[*]})" >&2
     fi
     "$root/build/cutover/host_ac.elf" "${kopt[@]}" --target=x86_64-bare-metal "$in_ad" "$main_o" \
