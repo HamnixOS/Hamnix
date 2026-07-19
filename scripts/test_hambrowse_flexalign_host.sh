@@ -47,9 +47,10 @@ D="$OUT/flexalign.txt"
 
 seg_row() { grep -E "SEG [0-9]+ [0-9]+ .*\|$1\|" "$D" | awk '{print $2}' | head -1; }
 seg_x()   { grep -E "SEG [0-9]+ [0-9]+ .*\|$1\|" "$D" | awk '{print $3}' | head -1; }
-# FILL <top> <bot> <lx> <rx> #rgb <z>  -> emit (bot-top) for a given colour
-# (tolerate the trailing z-index suffix appended to the fill dump).
-fill_h()  { grep -E "^FILL [0-9]+ [0-9]+ .*#$1( [0-9]+)?$" "$D" | awk '{print $3-$2}' | head -1; }
+# FILL <top> <bot> <lx> <rx> #rgb <rad> <z>  -> emit (bot-top) for a given
+# colour (tolerate the trailing border-radius + z-index suffix fields appended
+# to the fill dump — the count of trailing numeric fields has grown over time).
+fill_h()  { grep -E "^FILL [0-9]+ [0-9]+ .*#$1( [0-9]+)*$" "$D" | awk '{print $3-$2}' | head -1; }
 
 # tall item first row + short item row, per container
 sa=$(seg_row Sa1); ss=$(seg_row Sshort); ssx=$(seg_x Sshort); sax=$(seg_x Sa1)

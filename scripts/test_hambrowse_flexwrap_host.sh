@@ -57,13 +57,17 @@ else
     echo "[hb-flexwrap] FAIL cards not laid out at CSS width (advance $((bxc-axc)))"; fail=1
 fi
 
-# ---- (2) the overflowing 4th/5th card WRAP to a new flex line ----------------
-dxr=$(seg_row "Delta card body text"); dxx=$(seg_x "Delta card body text")
-echo "[hb-flexwrap] wrap: Alpha row=$ayr  Delta row=$dxr x=$dxx"
-if [ -n "$dxr" ] && [ "$dxr" -gt "$ayr" ] && [ "$dxx" -eq "$axc" ]; then
-    echo "[hb-flexwrap] PASS overflowing cards wrap to a new line (Delta row $dxr, x reset)"
+# ---- (2) the overflowing card WRAPs to a new flex line -----------------------
+# At width 800 (body content ~784px) four 160px cards + three 16px gaps = 688px
+# fit on line 1 (Alpha..Delta); the FIFTH (Epsilon) overflows and wraps to line
+# 2 with its x reset to the container left. This matches Chromium/Firefox exactly
+# (cross-checked headless): four-up on line 1, Epsilon alone on line 2.
+exr=$(seg_row "Epsilon card five"); exx=$(seg_x "Epsilon card five")
+echo "[hb-flexwrap] wrap: Alpha row=$ayr  Epsilon row=$exr x=$exx"
+if [ -n "$exr" ] && [ "$exr" -gt "$ayr" ] && [ "$exx" -eq "$axc" ]; then
+    echo "[hb-flexwrap] PASS overflowing card wraps to a new line (Epsilon row $exr, x reset)"
 else
-    echo "[hb-flexwrap] FAIL cards did not wrap (Delta row=$dxr x=$dxx vs Alpha row=$ayr x=$axc)"; fail=1
+    echo "[hb-flexwrap] FAIL card did not wrap (Epsilon row=$exr x=$exx vs Alpha row=$ayr x=$axc)"; fail=1
 fi
 
 # ---- (3) content-sized nav PILLS wrap responsively at a narrow width ---------
