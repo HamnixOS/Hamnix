@@ -64,6 +64,13 @@ assert_grep '^PANEL flow=250 idx=3$'  "drop mid-bar -> mid-list index (tracks X)
 assert_grep '^PANEL flow=500 idx=4$'  "far-right drop APPENDS (idx 4) — not a fixed spot"
 assert_grep '^PANEL flow=-5 idx=0$'   "drop before everything -> index 0"
 
+# LIVE DROP PREVIEW: the insertion-indicator boundary tracks the cursor and
+# sits BETWEEN neighbouring widgets (the visual twin of the insert index).
+assert_grep '^PREVIEW flow=10 at=100$'  "preview caret midway after the menu (idx 1)"
+assert_grep '^PREVIEW flow=250 at=348$' "preview caret tracks the mid-bar drop (idx 3)"
+assert_grep '^PREVIEW flow=500 at=442$' "preview caret past the last widget on a far-right drag"
+assert_grep '^PREVIEW flow=-5 at=1$'    "preview caret clamps to the left edge before everything"
+
 # Desktop .desktop launcher body is well-formed.
 assert_grep '^\[Desktop Entry\]$'       "desktop entry has the [Desktop Entry] header"
 assert_grep '^Name=Text_Editor$'        "desktop entry Name= is the dropped label"
@@ -82,6 +89,24 @@ if grep -q 'just after the menu' user/hampanelscene.ad; then
     bad "panel still has the fixed 'just after the menu' placement"
 else
     pass "panel's fixed-spot placement is gone"
+fi
+# LIVE DROP PREVIEW: the panel must render an insertion indicator DURING the
+# drag (on pointer-move), not only after release.
+if grep -q '_render_drop_preview(bar)' user/hampanelscene.ad \
+        && grep -q 'def _render_drop_preview' user/hampanelscene.ad; then
+    pass "panel renders a live drop-preview insertion indicator"
+else
+    bad "panel has no live drop-preview indicator"
+fi
+if grep -q 'drop_prev_flow = nf' user/hampanelscene.ad; then
+    pass "panel updates the drop preview on pointer-move (drag)"
+else
+    bad "panel does not update the drop preview during the drag"
+fi
+if grep -q 'dp_panel_insert_boundary' user/hampanelscene.ad; then
+    pass "preview resolves the boundary with the shared placement math"
+else
+    bad "preview does not reuse the shared placement math"
 fi
 if grep -q '_commit_desk_drop(bx, by)' user/hamdesktop.ad; then
     pass "desktop commits a .desktop launcher at the RELEASE point"
