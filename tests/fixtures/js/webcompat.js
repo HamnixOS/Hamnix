@@ -102,3 +102,33 @@ console.log("proto-chain", b.kind(), b instanceof A, b instanceof B);
 // arrows are not constructable and have no prototype object
 var arrow = function () {};
 console.log("arrow-proto", typeof (() => 1).prototype, arrow instanceof Function);
+
+// Real builtin PROTOTYPE method VALUES: transpiled/minified bundles read a
+// prototype method as a first-class value and re-dispatch it with an explicit
+// receiver via .call/.apply/.bind. Before this fix these all threw TypeError.
+function collectArgs() { return Array.prototype.slice.call(arguments); }
+var sliced = collectArgs("a", "b", "c");
+console.log("ap-slice-call", sliced.length, sliced[0], sliced[2],
+    [].slice === Array.prototype.slice);
+
+console.log("op-tostring-call",
+    Object.prototype.toString.call([]),
+    Object.prototype.toString.call({}),
+    Object.prototype.toString.call(null),
+    Object.prototype.toString.call(7));
+
+var rec = {a: 1};
+var hop = Object.prototype.hasOwnProperty;
+console.log("hasown-call", hop.call(rec, "a"), hop.call(rec, "b"));
+
+// Function.prototype.call itself is a real value, so `.call.bind(fn)` chains:
+var boundCall = Function.prototype.call.bind(function (n) { return this.base + n; });
+console.log("call-bind-chain", boundCall({base: 100}, 23));
+
+// Array.prototype.map/forEach.call over an array-like (own length + indices)
+var like = {length: 2, 0: 10, 1: 20};
+console.log("ap-map-call",
+    Array.prototype.map.call(like, function (x) { return x + 1; }).join(","));
+
+// String.prototype method as a value
+console.log("sp-toupper-call", String.prototype.toUpperCase.call("hi"));
