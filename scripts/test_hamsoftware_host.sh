@@ -112,5 +112,44 @@ assert_grep 'glyphs .*\"Depends:\"'             "detail: depends label"
 assert_grep 'glyphs .*\"webkitgtk, hamnix-base\"' "detail: parsed dependency list"
 assert_grep 'glyphs .*\"#hamnix-system\"'       "detail: parsed target"
 
+# --- installed-app registry enumeration (the on-device fix) -----------------
+# The native driver enumerates /etc/hamde/apps/*.desktop into the core via
+# hampkg_add_pkg so the window lists EVERY installed app offline (no `hpm
+# refresh`). This scenario drives that exact core API with a registry-shaped
+# fixture (7 apps incl. multi-word names), proving >1 distinct app enumerates
+# and multi-word Names survive (the search-line tokeniser would truncate them).
+assert_grep '^REG_COUNT 7'                      "registry scan enumerates 7 installed apps (>1)"
+assert_grep '^REG_INST 7'                       "all registry apps marked installed"
+assert_grep '^REG_SEL_NAME Coin Dash$'          "multi-word app name kept intact (not 'Coin')"
+
+# --- native driver is DATA-DRIVEN from the registry -------------------------
+# Guard the load-bearing links the fix relies on so a refactor can't silently
+# revert the app to the network-only (empty-offline) index path.
+SRC="user/hamsoftware.ad"
+for need in 'from lib.desktopentry import' 'p9_listdir' 'desktop_parse' \
+            'hampkg_add_pkg' '/etc/hamde/apps'; do
+    if grep -qF -- "$need" "$SRC"; then
+        echo "[hamsoftware-host] PASS native driver uses '$need'"
+    else
+        echo "[hamsoftware-host] FAIL native driver missing '$need'"; fail=1
+    fi
+done
+
+# --- the registry itself has the full per-app set (each app its own entry) --
+APPS_DIR="etc/hamde/apps"
+n_apps=$(find "$APPS_DIR" -maxdepth 1 -name '*.desktop' 2>/dev/null | wc -l)
+if [ "$n_apps" -gt 1 ]; then
+    echo "[hamsoftware-host] PASS registry has $n_apps app entries (>1)"
+else
+    echo "[hamsoftware-host] FAIL registry has only $n_apps app entries"; fail=1
+fi
+for app in hamsnake hamtetris coindash hamchess terminal editor control-center; do
+    if [ -f "$APPS_DIR/$app.desktop" ]; then
+        echo "[hamsoftware-host] PASS registry entry $app.desktop present"
+    else
+        echo "[hamsoftware-host] FAIL registry entry $app.desktop missing"; fail=1
+    fi
+done
+
 if [ "$fail" -ne 0 ]; then echo "[hamsoftware-host] OVERALL FAIL"; exit 1; fi
 echo "[hamsoftware-host] OVERALL PASS"
