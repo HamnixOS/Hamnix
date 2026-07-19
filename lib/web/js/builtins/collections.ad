@@ -481,6 +481,8 @@ def call_native(id: int32, thisv: int32, base: int32, argc: int32) -> int32:
         newov: int32 = v_new_object()
         if tag_of(proto_arg) == TAG_OBJ:
             obj_proto[objid_of(newov)] = objid_of(proto_arg)
+        elif tag_of(proto_arg) == TAG_NULL:
+            obj_proto[objid_of(newov)] = -1     # Object.create(null): bare object
         return newov
     if id == NAT_OBJECT_GETPROTO:
         garg: int32 = arg_or(base, argc, 0)
@@ -1028,9 +1030,10 @@ def object_keys_rec(p: int32, ro: int32):
     arr_push(ro, v_string_id(p_key[p]))
 
 
-# Object.defineProperty(obj, key, descriptor). We honor a data descriptor's
-# `value` (the common case); an accessor descriptor's `get` is invoked once to
-# seed the value (no live getter storage — a pragmatic approximation).
+# Object.defineProperty(obj, key, descriptor). A data descriptor's `value` is
+# stored directly; an accessor descriptor's `get`/`set` are stored LIVE (invoked
+# on member read/write with this=receiver), the shape transpiled `_createClass`
+# accessors and framework reactivity emit.
 def object_define_property(objv: int32, keyv: int32, descv: int32) -> int32:
     if tag_of(objv) != TAG_OBJ:
         throw_error(cast[Ptr[uint8]]("TypeError"), cast[Ptr[uint8]]("Object.defineProperty called on non-object"))
@@ -1094,6 +1097,24 @@ def make_data_descriptor(val: int32, writable: int32) -> int32:
     return dv
 
 
+# {get, set, enumerable, configurable} for an accessor property. A missing half
+# reflects as undefined (never a bogus function), matching ES.
+def make_accessor_descriptor(pp: int32) -> int32:
+    dv: int32 = v_new_object()
+    dobj: int32 = objid_of(dv)
+    getv: int32 = v_undef()
+    setv: int32 = v_undef()
+    if p_get[pp] >= 0:
+        getv = p_get[pp]
+    if p_set[pp] >= 0:
+        setv = p_set[pp]
+    obj_set(dobj, str_from_cstr(cast[Ptr[uint8]]("get")), getv)
+    obj_set(dobj, str_from_cstr(cast[Ptr[uint8]]("set")), setv)
+    obj_set(dobj, str_from_cstr(cast[Ptr[uint8]]("enumerable")), v_boolv(1))
+    obj_set(dobj, str_from_cstr(cast[Ptr[uint8]]("configurable")), v_boolv(1))
+    return dv
+
+
 def object_get_own_descriptor(objv: int32, keyv: int32) -> int32:
     if tag_of(objv) != TAG_OBJ:
         return v_undef()
@@ -1108,6 +1129,8 @@ def object_get_own_descriptor(objv: int32, keyv: int32) -> int32:
             return make_data_descriptor(arr_get(o, idx), writable)
     pp: int32 = obj_find_prop(o, key_sid)
     if pp >= 0:
+        if p_acc[pp] != 0:                 # accessor: reflect get/set, not value
+            return make_accessor_descriptor(pp)
         return make_data_descriptor(p_val[pp], writable)
     return v_undef()
 
@@ -1163,6 +1186,28 @@ def same_value(a: int32, b: int32) -> int32:
             return 1
         return 0
     return strict_eq(a, b)
+
+
+# Symbol.prototype.{toString,valueOf}. `Symbol("x").toString()` -> "Symbol(x)";
+# valueOf returns the symbol itself. `.description` is a plain own data property
+# on the symbol object, so member-get resolves it directly (no method needed).
+# Returns -2 for any other name so the caller falls through.
+def try_symbol_method(symv: int32, name: int32) -> int32:
+    if str_eq_cstr(name, cast[Ptr[uint8]]("valueOf")) != 0:
+        return symv
+    if str_eq_cstr(name, cast[Ptr[uint8]]("toString")) == 0:
+        return -2
+    desc: int32 = obj_get_cstr(objid_of(symv), cast[Ptr[uint8]]("description"))
+    save: int32 = emit_tgt
+    emit_tgt = 0
+    bld_begin()
+    emit_cstr(cast[Ptr[uint8]]("Symbol("))
+    if tag_of(desc) == TAG_STR:
+        emit_strid(strid_of(desc))
+    emit_c(41)                              # ')'
+    id: int32 = bld_end()
+    emit_tgt = save
+    return v_string_id(id)
 
 
 # Object.prototype.{hasOwnProperty,propertyIsEnumerable,isPrototypeOf} — the
@@ -1421,7 +1466,16 @@ def json_transform_props(p: int32, holder: int32, dst: int32):
         return
     if json_key_allowed(p_key[p]) == 0:
         return
-    tv: int32 = json_rep_value(holder, p_key[p], p_val[p])
+    raw: int32 = p_val[p]
+    if p_acc[p] != 0:                        # accessor: [[Get]] via its getter
+        raw = v_undef()
+        if p_get[p] >= 0:
+            gb: int32 = call_top
+            raw = invoke(p_get[p], holder, gb, 0)
+            call_top = gb
+            if ctl == CTL_THROW or err_flag != 0:
+                return
+    tv: int32 = json_rep_value(holder, p_key[p], raw)
     if ctl == CTL_THROW or err_flag != 0:
         return
     obj_set(dst, p_key[p], json_transform(tv))
@@ -1452,7 +1506,93 @@ def json_stringify_full(v: int32, replacer: int32, indent: int32) -> int32:
     return result
 
 
+# ---- JSON.stringify accessor pre-pass -------------------------------------
+# ES JSON.stringify serializes via [[Get]], so an own accessor's GETTER is
+# invoked and its result serialized. Invoking a getter mid-build would corrupt
+# the shared string cursor (the getter allocates into the same buffer json_emit
+# is writing), so accessors are resolved to plain data values in a pre-pass that
+# runs BEFORE bld_begin. json_has_accessor keeps the common (accessor-free) tree
+# allocation-free: only a tree that actually contains an accessor is cloned, and
+# accessor-free subtrees (incl. Date/RegExp/typed arrays) are shared unchanged so
+# their special serialization is preserved. Depth-capped for cycle safety
+# (a cyclic plain object already overflows json_emit itself — pre-existing).
+JSON_ACC_DEPTH_CAP: int32 = 4096
+
+
+def json_has_accessor(v: int32, depth: int32) -> int32:
+    if depth > JSON_ACC_DEPTH_CAP:
+        return 0
+    if tag_of(v) != TAG_OBJ:
+        return 0
+    if is_callable(v) != 0:
+        return 0
+    o: int32 = objid_of(v)
+    if cast[int32](obj_kind[o]) == OK_ARRAY:
+        i: int32 = 0
+        while i < arr_len[o]:
+            if json_has_accessor(arr_get(o, i), depth + 1) != 0:
+                return 1
+            i = i + 1
+        return 0
+    p: int32 = obj_head[o]
+    while p >= 0:
+        if p_acc[p] != 0:
+            return 1
+        if json_has_accessor(p_val[p], depth + 1) != 0:
+            return 1
+        p = p_next[p]
+    return 0
+
+
+def json_resolve(v: int32, depth: int32) -> int32:
+    if depth > JSON_ACC_DEPTH_CAP:
+        return v
+    if tag_of(v) != TAG_OBJ:
+        return v
+    if is_callable(v) != 0:
+        return v
+    if json_has_accessor(v, 0) == 0:
+        return v                            # accessor-free subtree: share as-is
+    o: int32 = objid_of(v)
+    if cast[int32](obj_kind[o]) == OK_ARRAY:
+        na: int32 = v_new_array()
+        nao: int32 = objid_of(na)
+        i: int32 = 0
+        while i < arr_len[o]:
+            arr_push(nao, json_resolve(arr_get(o, i), depth + 1))
+            i = i + 1
+        return na
+    nv: int32 = v_new_object()
+    json_resolve_props(obj_head[o], v, objid_of(nv), depth)
+    return nv
+
+
+def json_resolve_props(p: int32, holderv: int32, no: int32, depth: int32):
+    if p < 0:
+        return
+    json_resolve_props(p_next[p], holderv, no, depth)
+    if ctl == CTL_THROW or err_flag != 0:
+        return
+    if is_hidden_key(p_key[p]) != 0:
+        return
+    raw: int32 = p_val[p]
+    if p_acc[p] != 0:
+        raw = v_undef()
+        if p_get[p] >= 0:
+            gb: int32 = call_top
+            raw = invoke(p_get[p], holderv, gb, 0)
+            call_top = gb
+            if ctl == CTL_THROW or err_flag != 0:
+                return
+    obj_set(no, p_key[p], json_resolve(raw, depth + 1))
+
+
 def json_stringify(v: int32, indent: int32) -> int32:
+    rv: int32 = v
+    if tag_of(v) == TAG_OBJ and json_has_accessor(v, 0) != 0:
+        rv = json_resolve(v, 0)
+        if ctl == CTL_THROW or err_flag != 0:
+            return v_undef()
     save: int32 = emit_tgt
     save_ind: int32 = json_indent
     save_dep: int32 = json_depth
@@ -1460,7 +1600,7 @@ def json_stringify(v: int32, indent: int32) -> int32:
     json_indent = indent
     json_depth = 0
     bld_begin()
-    json_emit(v)
+    json_emit(rv)
     id: int32 = bld_end()
     emit_tgt = save
     json_indent = save_ind

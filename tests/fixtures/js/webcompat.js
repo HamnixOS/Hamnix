@@ -181,3 +181,86 @@ function _typeof(o) {
         _typeof(o);
 }
 console.log("babel-typeof", _typeof(5), _typeof("s"), _typeof({}), _typeof(null));
+
+// ============================================================================
+// Accessor property descriptors (Object.defineProperty get/set), prototype
+// round-trips, and Symbol.iterator — the ES surface transpiled/minified bundles
+// (Babel _createClass accessors, _objectSpread, __esModule, framework
+// reactivity) lean on. Added for the getter/setter + iterator round.
+// ============================================================================
+
+// defineProperty accessor: get/set invoked on member read/write, this=receiver.
+var box = {};
+var _bv = 1;
+Object.defineProperty(box, "v", {
+    get: function () { return this === box ? _bv * 10 : -1; },
+    set: function (n) { _bv = n; },
+    enumerable: true, configurable: true
+});
+console.log("acc-getset", box.v, (box.v = 5, box.v));   // getter, then setter+getter
+
+// getOwnPropertyDescriptor reflects an accessor as {get,set} (no `value`),
+// and a data property as {value,writable,...}.
+var ad = Object.getOwnPropertyDescriptor(box, "v");
+box.plain = 9;
+var dd = Object.getOwnPropertyDescriptor(box, "plain");
+console.log("acc-desc", typeof ad.get, typeof ad.set, ("value" in ad), ad.enumerable,
+    ("value" in dd), typeof dd.get);
+
+// Object-literal getter + JSON.stringify invokes the getter (ES [[Get]]).
+var lit = { plain: 1, get computed() { return this.plain + 41; } };
+console.log("acc-literal", lit.computed, JSON.stringify(lit),
+    Object.keys(lit).join(","));
+
+// Object.assign / object-spread read accessors via [[Get]] (getter invoked once,
+// result stored as a plain data value on the target).
+var accSrc = { get token() { return "T"; }, id: 7 };
+var asn = Object.assign({}, accSrc);
+var spr = Object.assign({}, {a: 1}, accSrc);   // spread-equivalent copy
+console.log("acc-assign", asn.token, asn.id, JSON.stringify(spr));
+
+// Object.getPrototypeOf / setPrototypeOf round-trip + Object.create(proto).
+var proto = { hi: function () { return "hi"; } };
+var made = Object.create(proto);
+var reparent = {};
+Object.setPrototypeOf(reparent, proto);
+console.log("proto-rt",
+    made.hi(),
+    Object.getPrototypeOf(made) === proto,
+    reparent.hi(),
+    Object.getPrototypeOf(reparent) === proto,
+    Object.getPrototypeOf(Object.create(null)) === null);
+
+// Symbol: uniqueness, typeof, description, toString.
+var symA = Symbol("tag"), symB = Symbol("tag");
+console.log("symbol", symA === symB, typeof symA, symA.description, symA.toString(),
+    Symbol().toString());
+
+// Custom [Symbol.iterator]: for-of, spread and Array.from all drive the protocol.
+var iterable = {};
+iterable[Symbol.iterator] = function () {
+    var i = 0;
+    return { next: function () {
+        return i < 3 ? { value: i++, done: false } : { value: undefined, done: true };
+    } };
+};
+var collected = [];
+for (var it of iterable) collected.push(it);
+console.log("sym-iter", collected.join(","), [...iterable].join(","),
+    Array.from(iterable).join(","));
+
+// REGRESSION GUARD: a prototype accessor is NOT own, so it stays out of the
+// instance's own enumeration/JSON; an accessor whose only half is a SETTER
+// serializes as omitted (getter is undefined -> no value). Data + accessor
+// enumeration must not cross-contaminate.
+function Model() { this._n = 3; }
+Object.defineProperty(Model.prototype, "n", { get: function () { return this._n; }, enumerable: true, configurable: true });
+var model = new Model();
+var writeOnly = {};
+Object.defineProperty(writeOnly, "w", { set: function (x) { this._w = x; }, enumerable: true, configurable: true });
+writeOnly.w = 5;
+console.log("acc-guard",
+    model.n,                                 // inherited accessor read works
+    Object.keys(model).join(","),            // own-only: _n, never n
+    JSON.stringify(model),                   // own data only: {"_n":3}
+    JSON.stringify(writeOnly));              // setter-only getter -> omitted, _w kept
