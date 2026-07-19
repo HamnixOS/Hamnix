@@ -120,27 +120,39 @@ def run(name, src):
     return on, off
 
 # ---------------------------------------------------------------------------
-# CASE 1 — exact fib shape. Recursive, if-compare condition, two recursive-call
-# args. Expect: the fib function pushes EXACTLY {rbx} (writes rbx for n), and NO
-# r12/r13/r14/r15 dead scratch/callee-name push.
+# CASE 1 — genuinely-recursive tak (Takeuchi). fib is NO LONGER a valid recursive
+# probe: --opt now rewrites the fib linear-recurrence shape into an iterative
+# loop (opt.ad, 54969cda) so fib emits NO self-call and this tightness assertion
+# would false-match main/_start. tak stays irreducibly tree-recursive: its OUTER
+# self-call is tail-folded to a loop (a96ab53c) but its THREE inner
+# tak(x-1,y,z)/tak(y-1,z,x)/tak(z-1,x,y) calls are real recursion (arguments to
+# the outer call, NOT in tail position). tak holds x,y,z across those calls in
+# the three callee-saved registers rbx/r12/r13, so the TIGHT expectation is a
+# push-set of EXACTLY {rbx,r12,r13} — its callee-saved writes, no dead scratch or
+# callee-name push (the phantom-promotion / over-reservation residual this guards).
 # ---------------------------------------------------------------------------
-def pyfib(n): return n if n < 2 else pyfib(n-1) + pyfib(n-2)
+from functools import lru_cache
+@lru_cache(maxsize=None)
+def pytak(x, y, z):
+    if x <= y: return z
+    return pytak(pytak(x-1, y, z), pytak(y-1, z, x), pytak(z-1, x, y))
 FIB = PRELUDE + """
-def fib(n: int64) -> int64:
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
+def tak(x: int64, y: int64, z: int64) -> int64:
+    if x <= y:
+        return z
+    return tak(tak(x - 1, y, z), tak(y - 1, z, x), tak(z - 1, x, y))
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
     acc: int64 = cast[int64](0)
-    n: int64 = cast[int64](0)
-    while n < cast[int64](24):
-        acc = acc + fib(n)
-        n = n + cast[int64](1)
+    z: int64 = cast[int64](0)
+    while z < cast[int64](8):
+        acc = acc + tak(cast[int64](18), cast[int64](12), z)
+        z = z + cast[int64](1)
     print_u64(cast[uint64](acc))
     return cast[int32](0)
 """
 fibref = 0
-for n in range(24): fibref = u64(fibref + pyfib(n))
+for z in range(8): fibref = u64(fibref + pytak(18, 12, z))
+TIGHT_PUSHSET = {"rbx", "r12", "r13"}
 
 # ---------------------------------------------------------------------------
 # CASE 2 — GLOBAL summed into a register-pressured expression (phantom-promotion
@@ -192,7 +204,7 @@ def pywork(a,b,c):
 pressref = 0
 for k in range(12): pressref = u64(pressref + pywork(k,k+1,k+2))
 
-CASES = [("fib", FIB, fibref, "tight"),
+CASES = [("tak", FIB, fibref, "tight"),
          ("glob", GLOB, globref, "value"),
          ("press", PRESS, pressref, "press")]
 
@@ -215,13 +227,14 @@ for name, src, ref, mode in CASES:
                   f"pushes {sorted(pushed)} MISSING {sorted(missing)}"); fails += 1
     if mode == "tight":
         # C. TIGHTNESS. Every recursive function must push NO DEAD callee-saved reg
-        # (pushed ⊆ writes), and fib specifically must be de-bloated to EXACTLY
-        # {rbx} (its only callee-saved write, holding `n` across the recursion) —
-        # no phantom-promotion push (%r12 for the callee name `fib`) and no dead
-        # scratch reservation (%r13 for the branch-compare / recursion-arg). NOTE:
-        # the disassembler lumps the trailing `_start` stub (which does `call main`)
-        # into `main`, so `main` can also look self-recursive; the dead-push check
-        # still holds for it (its r12/r13 hold acc/n, genuinely written).
+        # (pushed ⊆ writes), and tak specifically must be de-bloated to EXACTLY
+        # {rbx,r12,r13} (its only callee-saved writes, holding x/y/z across the
+        # inner recursion) — no phantom-promotion push (a callee-name reg) and no
+        # dead scratch reservation (%r14/%r15 for a branch-compare / recursion-arg).
+        # NOTE: the disassembler lumps the trailing `_start` stub (which does
+        # `call main`) into `main`, so `main` can also look self-recursive; the
+        # dead-push check still holds for it (its callee-saved regs hold acc/z,
+        # genuinely written).
         rec = [f for f in funcs if self_recursive(f)]
         if not rec:
             print(f"[{name}] FAIL(no recursive fn found)"); fails += 1
@@ -232,14 +245,15 @@ for name, src, ref, mode in CASES:
                 print(f"[{name}] FAIL(dead-push) recursive fn@0x{f['start']:x} pushes "
                       f"{sorted(pushed)} but body writes only {sorted(writes)} "
                       f"— DEAD {sorted(dead)}"); fails += 1
-        fib_fns = [f for f in rec if push_and_writes(f)[0] == {"rbx"}]
-        if not fib_fns:
+        tak_fns = [f for f in rec if push_and_writes(f)[0] == TIGHT_PUSHSET]
+        if not tak_fns:
             got = {f["start"]: sorted(push_and_writes(f)[0]) for f in rec}
-            print(f"[{name}] FAIL(fib-not-tight) no recursive fn pushes exactly "
-                  f"{{rbx}} — got {got} (a dead %r12/%r13 push regressed)"); fails += 1
+            print(f"[{name}] FAIL(tak-not-tight) no recursive fn pushes exactly "
+                  f"{sorted(TIGHT_PUSHSET)} — got {got} (a dead callee-saved push "
+                  f"regressed)"); fails += 1
         else:
-            print(f"[{name}] TIGHT OK — recursive fib pushes exactly {{rbx}} "
-                  f"(no dead %r12/%r13), value={go}")
+            print(f"[{name}] TIGHT OK — recursive tak pushes exactly "
+                  f"{sorted(TIGHT_PUSHSET)} (no dead callee-saved), value={go}")
     elif mode == "press":
         # D. GENUINE NEED: the pressured `work` (has a self-less internal call and
         # writes multiple callee-saved regs) must actually push them.
@@ -256,8 +270,8 @@ for name, src, ref, mode in CASES:
 print("=" * 60)
 if fails == 0:
     print("[opt_saveset] PASS — save-set is tight (no dead callee-saved push on the "
-          "fib kernels) AND safe (push-set ⊇ body writes) AND the global-promotion "
-          "miscompile is closed")
+          "recursive tak kernel) AND safe (push-set ⊇ body writes) AND the global-"
+          "promotion miscompile is closed")
     sys.exit(0)
 else:
     print(f"[opt_saveset] FAIL — {fails} problem(s)")

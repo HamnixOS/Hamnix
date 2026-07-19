@@ -81,29 +81,38 @@ def check(name, src, ref_out, want_callarg):
     return du_on, du_off
 
 # ---------------------------------------------------------------------------
-# 1) ROUTED: recursive fib summed over a range (the residual kernel).
+# 1) ROUTED: genuinely-recursive tak (Takeuchi). fib is NO LONGER a valid probe —
+# --opt rewrites the fib linear-recurrence into an iterative loop (opt.ad,
+# 54969cda) so it emits no recursive `fib(n-K)` call whose arg could route. tak's
+# inner `tak(x-1,y,z)` recursion IS real (its outer self-call is tail-folded to a
+# loop, the three inner calls are genuine), and its first arg `x-1` is exactly the
+# residual: routed DIRECTLY into %rdi as `mov %rdi,%x; sub %rdi,$1` (immediate) in
+# place of the legacy materialize-into-scratch + push/pop marshalling.
 # ---------------------------------------------------------------------------
-def pyfib(n):
-    return n if n < 2 else pyfib(n - 1) + pyfib(n - 2)
+from functools import lru_cache
+@lru_cache(maxsize=None)
+def pytak(x, y, z):
+    if x <= y: return z
+    return pytak(pytak(x-1, y, z), pytak(y-1, z, x), pytak(z-1, x, y))
 ref1 = 0
-for n in range(20):
-    ref1 = (ref1 + pyfib(n)) & M
+for z in range(8):
+    ref1 = (ref1 + pytak(18, 12, z)) & M
 fib_src = PRELUDE + """
-def fib(n: int64) -> int64:
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
+def tak(x: int64, y: int64, z: int64) -> int64:
+    if x <= y:
+        return z
+    return tak(tak(x - 1, y, z), tak(y - 1, z, x), tak(z - 1, x, y))
 
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
     acc: int64 = 0
-    n: int64 = 0
-    while n < 20:
-        acc = acc + fib(n)
-        n = n + 1
+    z: int64 = 0
+    while z < 8:
+        acc = acc + tak(18, 12, z)
+        z = z + 1
     print_u64(cast[uint64](acc))
     return cast[int32](acc & cast[int64](255))
 """
-du_on, _ = check("fib", fib_src, ref1, True)
+du_on, _ = check("tak", fib_src, ref1, True)
 if du_on is not None:
     t = disasm(du_on.code)
     lines = t.splitlines()
@@ -117,10 +126,10 @@ if du_on is not None:
             window = [mn(x) for x in lines[max(0, i - 3):i + 1]]
             if not any(w.startswith("push") or w.startswith("pop") for w in window):
                 found = True
-                print(f"[fib] arg routed: '{m}' (immediate, no push/pop)")
+                print(f"[tak] arg routed: '{m}' (immediate, no push/pop)")
                 break
     if not found:
-        print("FAIL fib: no push/pop-free `sub rdi,$imm` arg fill (marshalling remains)")
+        print("FAIL tak: no push/pop-free `sub rdi,$imm` arg fill (marshalling remains)")
         fails += 1
 
 # ---------------------------------------------------------------------------
@@ -165,9 +174,13 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     print_u64(cast[uint64](r))
     return cast[int32](r & cast[int64](255))
 """
-# f2's first arg is a call -> all-or-nothing refuses to route f2; g's single arg is
-# a bare ident (not a binop) -> not routed. So CALLARG must be 0 here, value exact.
-check("argcall", callarg_src, ref3, False)
+# f2's FIRST arg is a call `g(xx)` (fails the pure gate) but its SECOND arg
+# `xx + 1` is a pure binop the destination-router now safely computes straight
+# into %rsi AFTER g(xx) has been evaluated and homed — per-arg routing, not the
+# old all-or-nothing refusal. The load-bearing safety proof is unchanged: ON ==
+# OFF == oracle (eval order preserved, no earlier-filled arg register clobbered),
+# so this routes CALLARG=1 (the pure sibling arg) with a bit-exact value.
+check("argcall", callarg_src, ref3, True)
 
 # ---------------------------------------------------------------------------
 # 3b) HAZARD: args sharing a sub-read, dst-arg shape f(a+b, a-b).

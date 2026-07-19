@@ -49,32 +49,29 @@ M = (1 << 64) - 1
 fails = 0
 
 # ---------------------------------------------------------------------------
-# A collatz-shaped kernel: a hot loop with a constant multiply (n*3) — the exact
-# shape the lever targets.
+# A Horner-style checksum hot loop with a constant multiply `acc*101 + i`. NOTE
+# the previous collatz probe (`3*n + 1`) is NO LONGER valid here: the Phase-5 DAG
+# tiler (3a4de73d) now folds a small-scale constant multiply-add into a single
+# `lea [base + idx*S + K]` (S in {1,2,4,8}, absorbing *3/*5/*9), a strictly better
+# lowering than imul — so the imul-imm lever legitimately does NOT fire for those.
+# 101 is not a lea scale, so `acc*101` must still lower to the 3-operand
+# `imul %acc,%acc,$0x65` this lever targets.
 # ---------------------------------------------------------------------------
-N = 200000
-n = N
-steps = 0
-while n != 1:
-    if n & 1:
-        n = 3 * n + 1
-    else:
-        n = n >> 1
-    steps += 1
-ref = steps & M
+N = 100000
+acc = 0
+for i in range(N):
+    acc = (acc * 101 + i) & M
+ref = acc & M
 
 SRC = PRELUDE + f"""
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
-    n: int64 = {N}
-    steps: int64 = 0
-    while n != 1:
-        if n % 2 == 1:
-            n = 3 * n + 1
-        else:
-            n = n / 2
-        steps = steps + 1
-    print_u64(cast[uint64](steps))
-    return cast[int32](steps & cast[int64](255))
+    acc: int64 = 0
+    i: int64 = 0
+    while i < {N}:
+        acc = acc * 101 + i
+        i = i + 1
+    print_u64(cast[uint64](acc))
+    return cast[int32](acc & cast[int64](255))
 """
 
 r_on = h.run_through_codegen_ad("imm_on", SRC, WD, opt=True, keep=True)
@@ -94,8 +91,8 @@ else:
 im_on = int(getattr(r_on, "imulimm", 0) or 0)
 im_off = int(getattr(r_off, "imulimm", 0) or 0)
 if im_on < 1:
-    print(f"FAIL(no-fire) imulimm_on={im_on} (<1: the n*3 multiply did not lower "
-          f"to a 3-operand imul)"); fails += 1
+    print(f"FAIL(no-fire) imulimm_on={im_on} (<1: the acc*101 multiply did not "
+          f"lower to a 3-operand imul)"); fails += 1
 elif im_off != 0:
     print(f"FAIL(off-fired) imulimm_off={im_off} (must be 0 — byte-inert OFF)")
     fails += 1
@@ -131,17 +128,94 @@ try:
             three_op += 1
     if three_op < 1:
         print(f"FAIL(disasm) found {three_op} 3-operand imul (expected >=1 for "
-              f"the n*3 multiply)"); fails += 1
+              f"the acc*101 multiply)"); fails += 1
     else:
         print(f"[disasm] {three_op} 3-operand imul-by-const emitted OK")
 except Exception as ex:
     print(f"FAIL(disasm) exception: {ex}"); fails += 1
 
-# (4) SAFETY: the differential corpus (dst-alias, imm8/imm32 boundary, imm32-max,
-#     signed/unsigned; var*var fallback does not fire).
-im_ok, im_total = F._run_imulimm_corpus()
-if not im_ok:
-    print(f"FAIL(corpus) imulimm differential corpus miscompiled / inert")
+# (4) SAFETY: a differential corpus pinning the emitted immediate + source operand
+#     across dst-alias, the imm8/imm32 boundary (127/128), imm32-max (0x7FFFFFFF)
+#     and signed/unsigned operands, plus a var*var fallback that must NOT fire (a
+#     wrong immediate / wrong source operand = a value mismatch the oracle catches).
+#     INLINED here (previously adder_fuzzer._run_imulimm_corpus) and repointed OFF
+#     the lea-scale constants 3/5/9: the DAG tiler (3a4de73d) now lowers those to a
+#     single `lea` (strictly better than imul), so the imul-imm lever correctly
+#     does not fire for them — 7/11/13/100/127/128/0x7FFFFFFF are not lea scales and
+#     still exercise the lever. The corpus intent (operand pinning, dst-alias,
+#     boundaries, unsigned, fallback-must-not-fire) is preserved verbatim.
+def _imm_case(name, body, exp_out, want_fire):
+    global fails
+    exp_exit = exp_out & 255
+    r_on = h.run_through_codegen_ad(f"cimm_{name}", body, WD, opt=True)
+    r_off = h.run_through_codegen_ad(f"cimm_{name}o", body, WD, opt=False)
+    if r_on.kind != "ok" or r_off.kind != "ok":
+        print(f"  [imulimm corpus '{name}'] codegen on={r_on.kind}/off={r_off.kind}: "
+              f"{(r_on.detail or r_off.detail or '')[:120]}"); fails += 1
+        return 0
+    io = int(getattr(r_on, "imulimm", 0) or 0)
+    iof = int(getattr(r_off, "imulimm", 0) or 0)
+    if r_on.stdout != str(exp_out) or r_on.exit != exp_exit:
+        print(f"  [imulimm corpus '{name}'] MISCOMPILE opt=({r_on.stdout},"
+              f"{r_on.exit}) oracle=({exp_out},{exp_exit})"); fails += 1
+    if r_off.stdout != str(exp_out) or r_off.exit != exp_exit:
+        print(f"  [imulimm corpus '{name}'] OFF wrong=({r_off.stdout},"
+              f"{r_off.exit}) oracle=({exp_out},{exp_exit})"); fails += 1
+    if iof != 0:
+        print(f"  [imulimm corpus '{name}'] NOT byte-inert OFF (imulimm={iof})"); fails += 1
+    if want_fire and io == 0:
+        print(f"  [imulimm corpus '{name}'] lever never fired (imulimm_on=0)"); fails += 1
+    if (not want_fire) and io != 0:
+        print(f"  [imulimm corpus '{name}'] lever fired on a non-const multiply "
+              f"(imulimm_on={io})"); fails += 1
+    return io
+
+def _fn(decls_main):
+    return PRELUDE + "\n" + decls_main
+
+def _f_const(ret_expr, xtype, xval, ret_type="int64"):
+    call = f"cast[uint64](f(cast[int64]({xval})))" if ret_type == "int64" \
+        else f"f(cast[uint64]({xval}))"
+    return _fn(
+        f"def f(x: {xtype}) -> {ret_type}:\n    return {ret_expr}\n"
+        "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+        f"    g_accum = {call}\n"
+        "    print_u64(g_accum)\n"
+        "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n")
+
+im_total = 0
+x = 123456789   # const on the RIGHT, imm8: x * 7
+im_total += _imm_case("mul_c_right", _f_const("x * 7", "int64", x), (x * 7) & M, True)
+x = 98765       # const on the LEFT (commutative), imm8: 11 * x   [was 9*x -> lea]
+im_total += _imm_case("mul_c_left", _f_const("11 * x", "int64", x), (11 * x) & M, True)
+n = 20; s = 1   # dst-ALIAS accumulator loop: s = s*11 + 1   [was s*3+1 -> lea muladd]
+for _ in range(n): s = (s * 11 + 1) & M
+im_total += _imm_case("mul_dst_alias_loop", _fn(
+    "def hot(n: int64) -> int64:\n    s: int64 = 1\n    i: int64 = 0\n"
+    "    while i < n:\n        s = s * 11 + 1\n        i = i + 1\n    return s\n"
+    "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+    f"    g_accum = cast[uint64](hot(cast[int64]({n})))\n"
+    "    print_u64(g_accum)\n"
+    "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n"), s, True)
+x = 777         # imm8 boundary: x*127 (last imm8) and x*128 (first imm32 form)
+im_total += _imm_case("mul_imm8_max", _f_const("x * 127", "int64", x), (x * 127) & M, True)
+im_total += _imm_case("mul_imm32_first", _f_const("x * 128", "int64", x), (x * 128) & M, True)
+x = 3           # imm32-MAX: x * 0x7FFFFFFF (largest C that sign-extends to itself)
+im_total += _imm_case("mul_imm32_max", _f_const("x * 2147483647", "int64", x),
+                      (x * 2147483647) & M, True)
+x = (1 << 40) + 12345   # UNSIGNED operand: (uint64)x * 13   [was *5 -> lea]
+im_total += _imm_case("mul_unsigned", _f_const("x * 13", "uint64", x, "uint64"),
+                      (x * 13) & M, True)
+x, y = 6001, 7  # FALLBACK: x * y (both variable) — lever must NOT fire.
+im_total += _imm_case("mul_var_var_fallback", _fn(
+    "def f(x: int64, y: int64) -> int64:\n    return x * y\n"
+    "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
+    f"    g_accum = cast[uint64](f(cast[int64]({x}), cast[int64]({y})))\n"
+    "    print_u64(g_accum)\n"
+    "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n"), (x * y) & M, False)
+
+if im_total == 0:
+    print(f"FAIL(corpus) imulimm differential corpus inert (0 imul-imm fires)")
     fails += 1
 else:
     print(f"[corpus] imulimm corpus OK ({im_total} imul-imm fires, fallback "

@@ -105,30 +105,37 @@ def check(name, src, ref_out, want_fire, check_mc=False):
     print(f"[{name}] {tag} ON, value {on.stdout} == OFF {off.stdout} == ref {ref_out}")
 
 # ---------------------------------------------------------------------------
-# 1) FIRES: recursive fib summed over a range. Two recursive call sites per
-#    invocation, both direct in-unit calls -> both xor's elided.
+# 1) FIRES: a genuinely-recursive, call-heavy kernel. fib is NO LONGER usable for
+#    the machine-code delta: --opt now folds the fib linear-recurrence into an
+#    iterative loop (opt.ad, 54969cda) — so the ON build has FEWER `call` sites
+#    than OFF and the xor-before-call delta no longer equals ALELIDE. This probe
+#    `rec(n-1)+rec(n-2)+n` keeps two DIRECT self-calls that are neither the exact
+#    fib shape (the trailing `+ n` defeats the linear-recurrence matcher) nor in
+#    tail position (so a96ab53c's tail->loop does not fire either): ON and OFF
+#    have the SAME call set and differ only by the elided xor. Both call sites are
+#    direct in-unit -> both xor's elided.
 # ---------------------------------------------------------------------------
-def pyfib(n):
-    return n if n < 2 else pyfib(n - 1) + pyfib(n - 2)
+def pyrec(n):
+    return n if n < 2 else pyrec(n - 1) + pyrec(n - 2) + n
 ref1 = 0
 for n in range(24):
-    ref1 = (ref1 + pyfib(n)) & M
+    ref1 = (ref1 + pyrec(n)) & M
 fib_src = PRELUDE + """
-def fib(n: int64) -> int64:
+def rec(n: int64) -> int64:
     if n < 2:
         return n
-    return fib(n - 1) + fib(n - 2)
+    return rec(n - 1) + rec(n - 2) + n
 
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
     acc: int64 = 0
     n: int64 = 0
     while n < 24:
-        acc = acc + fib(n)
+        acc = acc + rec(n)
         n = n + 1
     print_u64(cast[uint64](acc))
     return cast[int32](acc & cast[int64](255))
 """
-check("fib", fib_src, ref1, True, check_mc=True)
+check("rec", fib_src, ref1, True, check_mc=True)
 
 # ---------------------------------------------------------------------------
 # 2) MULTI-ARG + CALL-CROSSING: six-int64-param sum (all arg regs) and a

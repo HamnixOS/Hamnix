@@ -95,20 +95,27 @@ else:
     if bh_off != 0:
         print(f"FAIL routed NOT byte-inert OFF (BASEHOIST={bh_off})"); fails += 1
     text = disasm(d_on.code)
-    # The hoisted base lives in a HELD register (not %rax, not %rip-relative): the
-    # element address is `lea <dst>,[<basereg>+<idxreg>*8]`. NOTE the index register
-    # is whatever the loop's index got promoted to (here %rbx) — the direct-SIB-index
-    # coalesce (test_opt_idxreg) routes the promoted local straight into the SIB, so
-    # this is `*8` off %rbx, NOT the legacy materialise-into-%rcx `%rcx*8`. Match any
-    # index register; the load-bearing assertion is that the BASE is a held reg
-    # (not %rax = per-iteration recompute, not %rip = raw global lea).
+    # The hoisted base lives in a HELD register (not %rax, not %rip-relative) and
+    # is reused via a scaled-index memory operand `[<basereg>+<idxreg>*8]`. NOTE
+    # two things the improved codegen changed: (a) the base+index is now FOLDED
+    # straight into the load/store/arith operand (`mov [<basereg>+<idx>*8],..` /
+    # `imul .., [<basereg>+<idx>*8]`) rather than materialised by a separate `lea`
+    # — so match the SIB operand in ANY instruction, not only `lea`; (b) the index
+    # register is whatever the loop's index got promoted to (here %rbx) — the
+    # direct-SIB-index coalesce (test_opt_idxreg) routes the promoted local straight
+    # into the SIB, so this is `*8` off %rbx, NOT the legacy materialise-into-%rcx
+    # `%rcx*8`. Match any index register; the load-bearing assertion is that the
+    # BASE is a held reg (not %rax = per-iteration recompute, not %rip = raw global
+    # lea) — i.e. the multi-use array Y's base was hoisted once into a held reg.
     hoisted = []
     for l in text.splitlines():
-        m = re.match(r"lea\s+\w+,\[(\w+)\+\w+\*8\]", l.split(chr(9))[-1].strip())
+        asm = l.split(chr(9))[-1].strip()
+        m = re.search(r"\[(\w+)\+\w+\*8\]", asm)
         if m and m.group(1) != "rax" and "rip" not in l:
             hoisted.append(l)
     if not hoisted:
-        print("FAIL routed: no scaled-index lea off a NON-rax hoisted base register"); fails += 1
+        print("FAIL routed: no scaled-index [base+idx*8] access off a NON-rax "
+              "hoisted base register"); fails += 1
     else:
         print(f"[routed] BASEHOIST={bh_on} value={r_on.stdout}=ref OK; "
               f"hoisted-base form: '{hoisted[0].split(chr(9))[-1].strip()}'")
