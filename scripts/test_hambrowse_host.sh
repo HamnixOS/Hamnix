@@ -225,10 +225,14 @@ assert_grepM() {
 
 assert_grepM '^SEG 0 8 .*Flush left paragraph'          "no-margin p flows at body margin x=8"
 assert_grepM '^SEG 2 40 .*Indented block shifted'       "div margin-left:32px shifts content to x=40"
-assert_grepM '^SEG 4 40 .*Margin plus padding'          "margin-left:16 + padding-left:16 -> x=40"
-assert_grepM '^SEG 6 32 .*Nested paragraph inherits'    "nested p inherits outer div indent (x=32)"
-assert_grepM '^SEG 7 32 .*own\.'                         "wrapped line of the nested block stays at x=32"
-assert_grepM '^SEG 10 8 .*Back flush at the body margin' "indent pops back to x=8 after blocks close"
+# Margin-less <div> blocks pack ADJACENTLY (no inter-div paragraph gap — matches
+# real browsers), so these land on consecutive rows 2..5; the trailing <p>
+# re-gaps at row 7. Row indices track the (correct) tight block spacing; the
+# x-positions remain the box-model assertion.
+assert_grepM '^SEG 3 40 .*Margin plus padding'          "margin-left:16 + padding-left:16 -> x=40"
+assert_grepM '^SEG 4 32 .*Nested paragraph inherits'    "nested p inherits outer div indent (x=32)"
+assert_grepM '^SEG 5 32 .*own\.'                         "wrapped line of the nested block stays at x=32"
+assert_grepM '^SEG 7 8 .*Back flush at the body margin' "indent pops back to x=8 after blocks close"
 
 # ====================================================================
 # COLSPAN fixture — <thead>/<tbody> wrappers (transparent) + colspan cells.
@@ -437,14 +441,15 @@ assert_grepB '^SEG [0-9]+ 40 .*Class margin in em units' \
 assert_grepB '^SEG [0-9]+ 32 .*Shorthand margin left plus top' \
     ".short shorthand margin:16 0 0 24 -> left 24px -> x=32"
 # the shorthand's 16px top margin adds exactly one blank line before the block:
-# the .em block is at row 6; the .short block lands at row 9 (para-break row 7,
-# top-gap blank row 8, content row 9) — one more than a bare para-break.
-assert_grepB '^SEG 9 32 .*Shorthand margin left plus top' \
-    ".short margin-top:16px inserts one blank line (block at row 9, not row 8)"
+# the margin-less .box/.empad/.em pack adjacently at rows 2/3/4, so a bare
+# adjacent block would be row 5; the 16px top margin pushes .short to row 6 (one
+# blank gap at row 5) — proving the top margin still inserts a line.
+assert_grepB '^SEG 6 32 .*Shorthand margin left plus top' \
+    ".short margin-top:16px inserts one blank line (block at row 6, not row 5)"
 # width:120px constrains the wrap column: the sentence wraps to many short rows
 # instead of one full-width line. First wrapped row starts at x=8; a later row
 # proves the early wrap (a full-width line would not reach row 15+).
-assert_grepB '^SEG 11 8 .*This narrow\|$' \
+assert_grepB '^SEG 7 8 .*This narrow\|$' \
     ".narrow width:120px wraps early -> first line 'This narrow' at x=8"
 assert_grepB '^SEG 1[5-9] 8 .*(wraps|rows|page|would|allow)' \
     ".narrow width:120px keeps wrapping onto later rows (constrained width)"
@@ -454,9 +459,9 @@ assert_grepB '^SEG [0-9]+ 8 .*\+-+\+\|$' \
     ".card border draws a '+---+' horizontal rule spanning the box"
 assert_grepB '^SEG [0-9]+ 16 .*Bordered card block with inset content' \
     ".card border insets the content column by one cell (x=8 -> x=16)"
-assert_grepB '^SEG 22 8 #101010 b0 u0 s0 l-1 bg- \|\|\|$' \
+assert_grepB '^SEG 18 8 #101010 b0 u0 s0 l-1 bg- \|\|\|$' \
     ".card border draws a left '|' side bar at x=8 on the content row"
-assert_grepB '^SEG 22 584 #101010 b0 u0 s0 l-1 bg- \|\|\|$' \
+assert_grepB '^SEG 18 584 #101010 b0 u0 s0 l-1 bg- \|\|\|$' \
     ".card border draws a right '|' side bar at x=584 on the content row"
 # there must be TWO horizontal border rules (top + bottom) for the one .card.
 if [ "$(grep -Ec '^SEG [0-9]+ 8 .*\+-+\+\|$' "$DUMPB")" -eq 2 ]; then
@@ -964,16 +969,16 @@ assert_grepFLX '^SEG 0 304 #101010 b0 u0 s0 l-1 bg#eef0f3 \|Right beta\|' \
 assert_grepFLX '^SEG 2 8 #101010 b0 u0 s0 l-1 bg- \|Left alpha two\|' \
     "flex: first column's second line flows down within its column (x=8, row 2)"
 # After the flex row, normal flow resumes FULL-WIDTH at the body margin, BELOW
-# the tallest column (row 5, past the 2-line left column) — not overlapping.
-assert_grepFLX '^SEG 5 8 #101010 b0 u0 s0 l-1 bg- \|After the flex row here\|' \
-    "flex: flow resumes full-width below the tallest column (row 5, x=8)"
+# the tallest column (row 4, past the 2-line left column) — not overlapping.
+assert_grepFLX '^SEG 4 8 #101010 b0 u0 s0 l-1 bg- \|After the flex row here\|' \
+    "flex: flow resumes full-width below the tallest column (row 4, x=8)"
 # A THREE-column flex row places all three children on one row at evenly
 # stepped x-positions (x=8 / 205 / 402) — equal-width column division.
-assert_grepFLX '^SEG 7 8 #101010 b0 u0 s0 l-1 bg- \|Col A\|'   "flex: 3-col row, column 0 at x=8"
-assert_grepFLX '^SEG 7 205 #101010 b0 u0 s0 l-1 bg- \|Col B\|' "flex: 3-col row, column 1 at x=205 (equal share)"
-assert_grepFLX '^SEG 7 402 #101010 b0 u0 s0 l-1 bg- \|Col C\|' "flex: 3-col row, column 2 at x=402 (equal share)"
+assert_grepFLX '^SEG 6 8 #101010 b0 u0 s0 l-1 bg- \|Col A\|'   "flex: 3-col row, column 0 at x=8"
+assert_grepFLX '^SEG 6 205 #101010 b0 u0 s0 l-1 bg- \|Col B\|' "flex: 3-col row, column 1 at x=205 (equal share)"
+assert_grepFLX '^SEG 6 402 #101010 b0 u0 s0 l-1 bg- \|Col C\|' "flex: 3-col row, column 2 at x=402 (equal share)"
 # The tail paragraph pops back to the body margin after the 3-col row.
-assert_grepFLX '^SEG 10 8 #101010 b0 u0 s0 l-1 bg- \|Tail line\|' \
+assert_grepFLX '^SEG 8 8 #101010 b0 u0 s0 l-1 bg- \|Tail line\|' \
     "flex: tail paragraph back at the body margin x=8 after the flex row closes"
 
 # ====================================================================
@@ -1120,13 +1125,13 @@ assert_grepP '^SEG 3 16 #ffffff b0 u0 s0 l-1 bg#ff0000 \|TL\|' \
 assert_grepP '^SEG 3 320 #ffffff b0 u0 s0 l-1 bg#00aa00 \|TR\|' \
     "position:absolute top:0 right:0 -> card top-right, right-anchored (row 3, x=320)"
 # Out of flow means the card stays COMPACT (bottom border at row 5), so the
-# trailing plain paragraph is at row 9 — NOT shoved far down by in-flow badges.
-assert_grepP '^SEG 9 8 #101010 b0 u0 s0 l-1 bg- \|Plain trailing paragraph\.\|' \
-    "position: absolute badges are out of flow (card compact, trailing para at row 9)"
+# trailing plain paragraph is at row 8 — NOT shoved far down by in-flow badges.
+assert_grepP '^SEG 8 8 #101010 b0 u0 s0 l-1 bg- \|Plain trailing paragraph\.\|' \
+    "position: absolute badges are out of flow (card compact, trailing para at row 8)"
 # RELATIVE offset: the nudged paragraph is shifted right by left:48px (x 8->56)
-# and down by top:16px (one row) from its normal-flow position.
-assert_grepP '^SEG 8 56 #0000ff b0 u0 s0 l-1 bg- \|Nudged para here\.\|' \
-    "position:relative left:48 top:16 -> shifted right (x=56) and down (row 8)"
+# and down by top:16px (one row) from its normal-flow position (x 8->56, row 7).
+assert_grepP '^SEG 7 56 #0000ff b0 u0 s0 l-1 bg- \|Nudged para here\.\|' \
+    "position:relative left:48 top:16 -> shifted right (x=56) and down (row 7)"
 
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
