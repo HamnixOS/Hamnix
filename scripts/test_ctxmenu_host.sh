@@ -85,6 +85,12 @@ assert_grep '^PIX 44 70 #3584e4'                      "raster: hovered row paint
 # The MATE add-applet dialog the panel's "Add to Panel..." opens: a title, a
 # search box, category headers, and per-applet name + description rows.
 assert_grep 'glyphs [0-9]+ [0-9]+ \"Search applets\.\.\.\"' "choice: search box placeholder renders"
+# CARET-ON-FOCUS (user-reported): the add-to-panel applet-search field showed
+# NO cursor until you typed. The modal chooser always holds the keyboard, so it
+# must draw a 1px caret at the insertion point even when EMPTY. The FULL render
+# has an empty filter, so its caret sits at the field start (x=56, the glyph
+# origin) — a distinctive 1x13 fill in the text colour.
+assert_grep 'fill 56 51 1 13 #23262b'                "choice: empty search field shows a caret on focus"
 assert_grep 'glyphs [0-9]+ [0-9]+ \"Menus & Launchers\"'    "choice: category header (Menus & Launchers)"
 assert_grep 'glyphs [0-9]+ [0-9]+ \"System & Hardware\"'    "choice: category header (System & Hardware)"
 assert_grep 'glyphs [0-9]+ [0-9]+ \"Windows & Workspaces\"' "choice: category header (Windows & Workspaces)"
