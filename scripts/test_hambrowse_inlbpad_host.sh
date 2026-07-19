@@ -8,10 +8,14 @@
 #   text-line tall. Following content clears the taller box. This makes badges /
 #   pills / buttons read as real controls, not one-line spans.
 #
-# The fixture has padded badges (`padding:12px 10px` -> 16px line + 24px padding =
-# 40px = 3 rows at LINE_H=16) and flat control chips (no vertical padding -> 1 row).
-# We assert the padded box FILL is 3 rows tall, the flat FILL is 1 row, and the
-# following flat line CLEARS the tall badges (no overlap).
+# The fixture has padded badges (`padding:12px 10px` -> one 16px text line + 24px
+# vertical padding) and flat control chips (no vertical padding). A padded chip is
+# ONE text line tall with PIXEL-accurate top/bottom padding grown onto its FILL
+# (bfill_padt/padb) — NOT quantised up to whole LINE_H rows, which tripled a
+# padding:10px button into an over-tall empty pill (the label centring naturally
+# between the symmetric padding). We assert the padded box FILL is 1 row tall
+# carrying 24px of vertical padding, the flat FILL is 1 row with 0 padding, and the
+# following flat line CLEARS the padded badges (no overlap).
 #
 # Builds BOTH targets (host harness x86_64-linux + native hambrowse
 # x86_64-adder-user) so a break in either is caught.
@@ -42,28 +46,29 @@ fail=0
 D="$OUT/inlbpad.txt"
 "$BIN" "$FIX" 800 >"$D" 2>&1 || { echo "[hb-inlbpad] FAIL: render exited non-zero"; cat "$D"; exit 1; }
 
-# ---- (1) padded badge (#cc3355) paints a 3-row-tall box FILL -----------------
-bh=0
-while read -r t b lx rx col; do
-    [ "$col" = "#cc3355" ] && bh=$((b - t))
-done < <(grep -E '^FILL ' "$D" | awk '{print $2, $3, $4, $5, $6}')
-echo "[hb-inlbpad] padded badge FILL height = $bh rows (expect 3)"
-if [ "$bh" -eq 3 ]; then
-    echo "[hb-inlbpad] PASS vertical padding grows the badge box to 3 rows"
+# ---- (1) padded badge (#cc3355): 1-row FILL carrying 24px vertical padding ----
+# FILL fields: top bot lx rx colour rad z padt padb
+bh=0; bpad=0
+while read -r t b lx rx col rad z padt padb; do
+    if [ "$col" = "#cc3355" ]; then bh=$((b - t)); bpad=$((padt + padb)); fi
+done < <(grep -E '^FILL ' "$D" | awk '{print $2, $3, $4, $5, $6, $7, $8, $9, $10}')
+echo "[hb-inlbpad] padded badge FILL height = $bh row(s), vpad = ${bpad}px (expect 1 row, 24px)"
+if [ "$bh" -eq 1 ] && [ "$bpad" -eq 24 ]; then
+    echo "[hb-inlbpad] PASS vertical padding grows the badge box by pixel-accurate 24px"
 else
-    echo "[hb-inlbpad] FAIL badge box not 3 rows tall (got $bh)"; grep '#cc3355' "$D" | grep FILL; fail=1
+    echo "[hb-inlbpad] FAIL badge box not 1 row + 24px pad (got ${bh} rows, ${bpad}px)"; grep '#cc3355' "$D" | grep FILL; fail=1
 fi
 
-# ---- (2) control chip with NO vertical padding stays 1 row (zero-cost) -------
-fh=0
-while read -r t b lx rx col; do
-    [ "$col" = "#22aa66" ] && fh=$((b - t))
-done < <(grep -E '^FILL ' "$D" | awk '{print $2, $3, $4, $5, $6}')
-echo "[hb-inlbpad] flat chip FILL height = $fh rows (expect 1)"
-if [ "$fh" -eq 1 ]; then
-    echo "[hb-inlbpad] PASS a chip without vertical padding is unchanged (1 row)"
+# ---- (2) control chip with NO vertical padding stays 1 row, 0 pad (zero-cost) -
+fh=0; fpad=1
+while read -r t b lx rx col rad z padt padb; do
+    if [ "$col" = "#22aa66" ]; then fh=$((b - t)); fpad=$((padt + padb)); fi
+done < <(grep -E '^FILL ' "$D" | awk '{print $2, $3, $4, $5, $6, $7, $8, $9, $10}')
+echo "[hb-inlbpad] flat chip FILL height = $fh row(s), vpad = ${fpad}px (expect 1 row, 0px)"
+if [ "$fh" -eq 1 ] && [ "$fpad" -eq 0 ]; then
+    echo "[hb-inlbpad] PASS a chip without vertical padding is unchanged (1 row, no pad)"
 else
-    echo "[hb-inlbpad] FAIL flat chip height changed (got $fh, expected 1)"; fail=1
+    echo "[hb-inlbpad] FAIL flat chip changed (got $fh rows, ${fpad}px)"; fail=1
 fi
 
 # ---- (3) the following flat line CLEARS the tall badges (no overlap) ---------
