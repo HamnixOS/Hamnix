@@ -468,13 +468,25 @@ agent, roughly by real-world value — the browser is now broad but NOT "fully W
 3. **[css-filter] real `drop-shadow()` + `backdrop-filter` — ABSENT/no-op.** `drop-shadow()` is a recognised NO-OP
    (needs a blurred silhouette painted OUTSIDE the box); `backdrop-filter` filters what is BEHIND the element. Both need
    a compositing pass the static single-render model lacks — lower tractability.
-4. **[html-forms] form-control CSS geometry — `width` DONE round-9 (gate `ctrlwidth`); `height`/`appearance` + range/
-   progress accent remain.** A text/password `<input>` now honours cascaded CSS `width` (class + inline). STILL absent:
-   `height` (multi-row field boxes / textarea rows), `appearance` (strip UA chrome), `accent-color` on
-   `<input type=range>`/`<progress>` (checkbox/radio done round-7), focus-ring / `:checked` pseudo-styling, and
-   interactive click-to-toggle (a DOM/event-layer concern). Tractable, low regression surface.
-5. **[html5-parsing] adoption-agency / active-formatting-list reconstruction** — misnested inline recovery
-   (`<b><i>x</b>y</i>`) is still depth-counted, not spec-correct. Moderate value, self-contained in `lib/web/html`.
+4. **[html-forms] form-control CSS geometry — `width` (r9), `height` + `appearance:none` DONE round-10 (gate
+   `ctrlgeom`).** A text/password `<input>`, `<button>` and `<select>`-style control now honours cascaded CSS `width`
+   (r9), `height` (48px→3 rows; the box paints that many rows tall and the layout reserves them — mirrors the tall
+   inline-block chip floor), and `appearance:none` (stylesheet + inline + `-webkit-`/`-moz-`; suppresses the default
+   field surface/border and button-grey face so author CSS styles the control). Gated: a control WITHOUT these
+   declarations is byte-identical (appear=0, rows=0). STILL absent: `accent-color` on `<input type=range>`/`<progress>`
+   (range is a text-only `[--O--]` glyph with no seg; `<progress>` is not yet an element at all — both need new indicator
+   segments), applying the author BACKGROUND to an appearance:none void `<input>` (the transient `_img_cascade` m_bg/d_bg
+   winners are unreliable across void controls — chrome is suppressed but the author bg is not yet re-painted),
+   focus-ring / `:checked` pseudo-styling, and interactive click-to-toggle (a DOM/event-layer concern).
+5. **[html5-parsing] adoption-agency / active-formatting-list reconstruction — box tree ALREADY spec-correct (LOCKED
+   round-10, gate `adoption`).** Verified: the engine models inline emphasis as INDEPENDENT ORTHOGONAL style counters
+   (`g_bold_n`/`g_italic_n`) and does NOT reset a formatting counter on a block boundary — which reproduces the WHATWG
+   adoption-agency + reconstruct-the-active-formatting-elements VISUAL result exactly. `<b>A<i>B</b>C</i>` paints A=bold,
+   B=bold+italic, C=italic (the reconstructed `<i>` keeps C italic, NOT bold); a `<b>` left open across `</p><p>` is
+   reconstructed so the next block stays bold. The new `adoption` gate asserts the per-run `SEGFLAGS` as a regression
+   guard. The only NON-spec residue is DOM STRUCTURE: the span-overlay tree in `lib/web/dom/domtree.ad` uses
+   span-containment (not adoption reparenting), observable only via `querySelector`/`getComputedStyle` traversal — a
+   separate, large concern with no rendering effect in the flag-based box model.
 6. **[dom] live `MediaQueryList` change events + `window.dispatchEvent` of a synthetic event + `scroll`/`resize`
    sourcing** — all no-ops in the headless single-layout model. Low value without a live event loop.
 7. **[css-backgrounds-borders] rounded per-side borders** — a per-side-bordered box paints SQUARE corners (arc-segment
