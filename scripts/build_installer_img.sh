@@ -82,33 +82,42 @@ source "$PROJ_ROOT/scripts/_adder_cc.sh"
 # OPTIMIZED-ADDER SHIP DEFAULT (user directive: "being able to compile and run
 # the OS should always be the bar for adopting new optimizations").
 #
-#   HAMNIX_KERNEL_OPT default 1 — the shipped kernel is compiled with the
-#     Phase-1..5 optimizer. VERIFIED: the --opt kernel compiles and boots clean
-#     to userspace under OVMF (fix ab2c060d "reserve parked scratch for routed
-#     indexed stores" unblocked it). This is the safe, upstream-verified --opt
-#     win, so it is ON by default.
+# STATUS 2026-07-19: the full --opt mechanism (kernel + every userland ELF, with
+# a per-binary exclusion escape hatch) is wired and both halves COMPILE clean (0
+# cg_fail, 0 native->seed fallbacks). But driving the SHIPPED .img under
+# OVMF/KVM to the graphical desktop shows that NEITHER --opt path yet MEETS the
+# "OS must run" bar, so both default OFF. The mechanism stays so flipping either
+# to 1 is a one-line change the moment the underlying codegen bugs land. The
+# differential fuzzer + the test_opt_* bench kernels are 0-miscompile, so these
+# are codegen patterns exercised by large hand-written kernel/userland code that
+# the microbenchmarks do not cover.
 #
-#   HAMNIX_USER_OPT default 0 — userland --opt is NOT yet safe as a blanket
-#     default: it compiles clean (0 cg_fail) but has RUNTIME miscompiles that
-#     FAIL the "OS must run" bar. Two confirmed under OVMF (2026-07-19):
-#       * /bin/hamsh miscompiles under --opt -> an early rc.boot child (pid 6)
-#         takes a read-prot #PF (va=0x34d0f099) -> SIGSEGV and wedges PID 1,
-#         so the box never reaches the desktop. Isolated by bisection: the
-#         crash reproduces with ONLY hamsh --opt (cat/init excluded) and
-#         DISAPPEARS the moment hamsh is built no-opt.
-#       * the scene DE apps (hampanelscene/hamdesktop/...) miscompile under
-#         --opt -> the compositor comes up but paints a BLANK backdrop (panel
-#         + icons never render), even with hamsh/cat/init excluded.
-#     The differential fuzzer + test_opt bench kernels are 0-miscompile, so the
-#     bug is a codegen pattern exercised by large hand-written userland but not
-#     by the microbenchmarks; it must be fixed in adder/compiler before flipping
-#     this to 1. The mechanism + HAMNIX_USER_OPT_EXCLUDE (drop a single binary
-#     back to no-opt) are retained so a partial rollout is a one-line change
-#     once the codegen fix lands. Opt in for the whole userland with
-#     HAMNIX_USER_OPT=1 (currently produces a non-booting desktop image).
+#   HAMNIX_USER_OPT default 0 — userland --opt has RUNTIME miscompiles:
+#       * /bin/hamsh --opt -> an early rc.boot child (pid 6) takes a read-prot
+#         #PF (va=0x34d0f099) -> SIGSEGV and wedges PID 1; the box never reaches
+#         the desktop. Bisected: reproduces with ONLY hamsh --opt (cat/init
+#         excluded) and DISAPPEARS the moment hamsh is built no-opt.
+#       * the scene DE apps (hampanelscene/hamdesktop/...) --opt -> the
+#         compositor comes up but paints a BLANK backdrop (panel + icons never
+#         render), even with hamsh/cat/init excluded.
+#     Per-binary rollback is available via HAMNIX_USER_OPT_EXCLUDE="name ...".
+#
+#   HAMNIX_KERNEL_OPT default 0 — the --opt kernel COMPILES and boots clean to a
+#     shell (it passes scripts/test_opt_kernel_boot.sh, which only asserts
+#     userspace/getty-alive), but driving the scene DESKTOP exposes a deeper
+#     bug: with an IDENTICAL no-opt userland, the --opt kernel boots, starts the
+#     hamUI stack, prints "[scene_de] clean first-boot desktop" and then WEDGES
+#     during DE bring-up -- it never reaches "handing off to interactive shell"
+#     (reproduced 2x under OVMF, -smp 1, no rival qemu, loadavg<3, so not the
+#     known -smp2 starvation stall). The no-opt kernel with the same userland
+#     reaches the full MATE-style desktop (panel + icons, screendumped). So the
+#     kernel --opt has a runtime miscompile in the DE-bring-up path (heavy
+#     rfork/scheduling/mm); it must be fixed in adder/compiler before flipping
+#     this to 1. Opt in with HAMNIX_KERNEL_OPT=1 (boots to a shell; wedges the
+#     graphical desktop).
 #
 # Exported so build_user.sh + build_initramfs.py + the kernel compile agree.
-export HAMNIX_KERNEL_OPT="${HAMNIX_KERNEL_OPT:-1}"
+export HAMNIX_KERNEL_OPT="${HAMNIX_KERNEL_OPT:-0}"
 export HAMNIX_USER_OPT="${HAMNIX_USER_OPT:-0}"
 export HAMNIX_USER_OPT_EXCLUDE="${HAMNIX_USER_OPT_EXCLUDE:-}"
 
