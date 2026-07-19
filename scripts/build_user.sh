@@ -299,9 +299,11 @@ build_adder_user hamminescene         # scene-file DE Minesweeper game: 9x9 fiel
 build_adder_user hamimgscene          # scene-file DE image demo (#128): synthesizes an RGBA image, uploads via draw/ctl 'I' verb, draws it with the scene `image` verb (compositor blits+scales)
 build_adder_user sdlpong              # hamSDL demo game: one-paddle bounce built entirely on the lib/hamsdl.ad game API (drawing + events + timing); dual-target (host gate: scripts/test_hamsdl_host.sh)
 build_adder_user hamgamedemo          # hamGame demo "Coin Dash": pygame-shaped Surface/Sprite/Rect/Clock over hamSDL (lib/hamgame.ad + lib/hamgame_dev.ad; shared game lib/hamgamedemo.ad); arrow-key sprite + AABB coin pickup; dual-target (host gate: scripts/test_hamgame_host.sh)
-build_adder_user hamgamesnake         # hamGame arcade "Snake": pygame-shaped Surface backbuffer + font HUD over hamSDL (lib/hamgame.ad + lib/hamgame_dev.ad; shared game lib/hamgamesnake.ad); grid snake, arrow/WASD turn, deterministic-PRNG food, grow/score/wall+self collision; dual-target (host gate: scripts/test_hamgamesnake_host.sh)
-build_adder_user hamgamechess         # hamGame board game "Chess": pygame-shaped Surface backbuffer + font glyphs over hamSDL (lib/hamgame.ad + lib/hamgame_dev.ad; shared game lib/hamgamechess.ad); 8x8 board, letter-glyph pieces, pseudo-legal move gen for all six types, turn alternation + capture (check/mate/castling/en-passant/promotion deferred); mouse-click driven; dual-target (host gate: scripts/test_hamgamechess_host.sh)
-build_adder_user hambrowse            # scene-file DE web browser: fetch HTTP (user/http9) + parse HTML subset + block/inline layout + render (lib/hamui hamscene_*); links click-navigate
+build_adder_user hamgamesnake         # hamGame arcade "Snake": pygame-shaped Surface backbuffer + font HUD over hamSDL (lib/hamgame.ad + lib/hamgame_dev.ad; shared game lib/hamgamesnake.ad); grid snake, arrow/WASD turn, deterministic-PRNG food, grow/score/wall+self collision, game-over replay prompt; dual-target (host gate: scripts/test_hamgamesnake_host.sh)
+# NOTE: the hamGame "Chess" build (hamgamechess) was retired — it was the inferior,
+# pseudo-legal, mouse-only twin. The shipping Chess is hamchessscene (lib/hamchesscore.ad):
+# full legal moves + check/checkmate/stalemate + promotion (see build line above).
+build_adder_user hambrowse           # scene-file DE web browser: fetch HTTP (user/http9) + parse HTML subset + block/inline layout + render (lib/hamui hamscene_*); links click-navigate
 build_adder_user haminstallui         # scene-file DE visual installer: GUI front-end over /bin/haminstall (host name + disk picker + progress)
 build_adder_user hamsettings          # scene-file DE settings: wallpaper swatches (ctl wallpaper verb) + panel position/applet prefs (/etc/panel.conf)
 build_adder_user hammonscene          # scene-file DE system monitor: uptime + memory bar + /proc/tasks process list (ported from hammon)

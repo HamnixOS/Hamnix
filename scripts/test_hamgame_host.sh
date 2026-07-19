@@ -133,6 +133,14 @@ fi
 assert_grep '^SCOREHIT_BEFORE 0'              "no score before the pickup"
 assert_grep '^SCOREHIT_AFTER 1'               "AABB collision scored the coin pickup (gameplay works)"
 
+# --- OBJECTIVE / WIN-LOSE / RESTART: Coin Dash is now a real timed game -----
+assert_grep '^STATE_PLAYING 0'                "round starts in the playing state"
+assert_grep '^STATE_WIN 1'                    "reaching the coin goal WINS the round"
+assert_grep '^SCORE_WIN 10'                   "the win fires exactly at the goal (10 coins)"
+assert_grep '^STATE_AFTER_R 0'                "pressing R restarts in place (no relaunch)"
+assert_grep '^SCORE_AFTER_R 0'                "restart rewinds the score to zero"
+assert_grep '^STATE_TIMEUP 2'                 "the clock running out LOSES the round"
+
 if [ "$fail" -eq 0 ]; then
     echo "[hamgame-host] RESULT: PASS"
     exit 0

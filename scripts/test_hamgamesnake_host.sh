@@ -161,6 +161,12 @@ fi
 # --- COLLISION: driving into the wall ends the game -------------------------
 assert_eq GAMEOVER 1 "wall collision ended the game (game over)"
 
+# --- RESTART: the app stays open; 'r' replays in place ----------------------
+assert_eq OVER_AFTER_STEER 1 "a steering key does NOT revive a dead snake"
+assert_eq OVER_AFTER_R     0 "pressing R starts a fresh round (no relaunch needed)"
+assert_eq LEN_AFTER_R      3 "restart resets the snake to length 3"
+assert_eq SCORE_AFTER_R    0 "restart rewinds the score to zero"
+
 # --- SOUND EFFECTS: eat / turn / game-over drive DISTINCT mixer tones -------
 # Assert on the real PCM the software mixer renders (lib/hammixer.ad): each event
 # creates exactly one voice, the rendered buffer is NON-SILENT (peak amplitude),
