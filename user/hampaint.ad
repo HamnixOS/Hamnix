@@ -1,0 +1,462 @@
+# user/hampaint.ad
+#
+# HamPaint — the MS-Paint / Tux-Paint equivalent for the Hamnix desktop: a
+# native raster drawing app on the scene-file DE. It owns a private RGBA canvas
+# the user paints into with the mouse (press-drag), a toolbar of tools
+# (pencil / eraser / line / rectangle / filled-rectangle / ellipse / bucket
+# flood-fill) with a small/med/large brush-size control, a colour palette with a
+# current-colour indicator, Clear (new), and Save-as-PNG.
+#
+# ARCHITECTURE (mirrors user/hamview.ad's proven bring-up):
+#   * All drawing + compositing lives in lib/hampaintcore.ad — a PURE,
+#     extern-free, DUAL-TARGET module (native here + host in
+#     user/hampaint_host.ad). This shell only does window/event/file plumbing.
+#   * Pixels reach the screen via the compositor's v2 blit protocol: we own an
+#     RGBA8888 backbuffer (hamui v2), composite the whole UI into it once, then
+#     on each stroke re-blit ONLY the dirtied canvas rectangle and commit that
+#     region (per-damage rendering, not a full-frame repaint per event).
+#   * Save writes a real PNG of the canvas via lib/pngwrite.ad (the same
+#     encoder user/hamshot.ad streams), to the DE user's Pictures dir — openable
+#     with user/hamview.ad or any PNG tool.
+#
+# CONTROLS: left-drag on the canvas paints (freehand tools) or rubber-bands a
+# shape committed on release; click a palette swatch to pick a colour, a tool
+# button to switch tool, S/M/L for brush size, Save PNG / Clear in the title
+# bar. Keys: s=save, c=clear (when the window has key focus).
+#
+# ADDER QUIRKS HONOURED (memory/feedback_compiler_quirks): big buffers at module
+# scope (no malloc/large locals), string literals passed at the call site (never
+# stored in a NUL-initialised global), cast[T](x)/&arr[0] throughout.
+
+from lib.hamui import (
+    hamui_init, hamui_window_on,
+    hamui_set_protocol_v2_dims, hamui_v2_bb_ptr, hamui_v2_bb_w,
+    hamui_v2_bb_h, hamui_v2_commit_rect
+)
+from lib.hampaintcore import (
+    hp_init, hp_render_ui, hp_blit_canvas,
+    hp_press, hp_drag, hp_release, hp_clear,
+    hp_canvas_ptr, hp_canvas_w, hp_canvas_h,
+    hp_dirty_valid, hp_dirty_reset,
+    hp_dirty_x0, hp_dirty_y0, hp_dirty_x1, hp_dirty_y1,
+    HP_WIN_W, HP_WIN_H, HP_CANVAS_X, HP_CANVAS_Y,
+    HP_HIT_SAVE, HP_HIT_CANVAS, HP_HIT_TOOL, HP_HIT_BRUSH, HP_HIT_PAL,
+    HP_HIT_CLEAR
+)
+from lib.pngwrite import (
+    pngw_signature, pngw_ihdr, pngw_iend,
+    pngw_idat_begin, pngw_idat_end,
+    pngw_zlib_header, pngw_stored_block_hdr,
+    pngw_adler_reset, pngw_adler_update, pngw_adler_final,
+    pngw_put_u32_be,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_mkdir(path: Ptr[char]) -> int32
+extern def sys_yield() -> int32
+
+
+# ---- module buffers -------------------------------------------------
+_hp_path_buf:   Array[128, uint8]
+_hp_markup_buf: Array[192, uint8]
+_hp_ev_buf:     Array[256, uint8]
+_hp_ev_carry:   uint64 = 0
+_hp_evt_fd:     int32 = -1
+_hp_keys_fd:    int32 = -1
+
+# Per-row PNG IDAT chunk: 8 + 2 + 5 + 1 + 3*W + 4 + 4; W<=640 -> <=1944.
+_hp_png_out:    Array[2048, uint8]
+_hp_save_path:  Array[160, uint8]
+
+_hp_wid:        int32 = 0
+_hp_btn_prev:   int32 = 0                 # previous button-1 state (edge det)
+_hp_save_seq:   uint64 = 0                # distinguishes successive saves
+
+
+# ====================================================================
+# tiny helpers
+# ====================================================================
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
+
+
+def _put_s(dst: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
+    j: uint64 = 0
+    while s[j] != 0:
+        dst[pos] = s[j]
+        pos = pos + 1
+        j = j + 1
+    return pos
+
+
+def _put_dec(dst: Ptr[uint8], pos: uint64, v: uint64) -> uint64:
+    if v == 0:
+        dst[pos] = 48
+        return pos + 1
+    tmp: Array[24, uint8]
+    t: uint64 = 0
+    while v != 0:
+        tmp[t] = cast[uint8](v % 10) + 48
+        v = v / 10
+        t = t + 1
+    while t > 0:
+        t = t - 1
+        dst[pos] = tmp[t]
+        pos = pos + 1
+    return pos
+
+
+# ====================================================================
+# Window bring-up (mirrors hamview: newwindow -> geometry/decorate/title,
+# then opt into the v2 blit protocol).
+# ====================================================================
+def _newwindow() -> int32:
+    wfd: int32 = sys_open_write(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if wfd < 0:
+        return -1
+    sys_write(wfd, cast[Ptr[uint8]]("newwindow\n"), 10)
+    sys_close(wfd)
+    rfd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if rfd < 0:
+        return -1
+    rbuf: Array[32, uint8]
+    r: int64 = sys_read(rfd, &rbuf[0], 31)
+    sys_close(rfd)
+    if r <= 0:
+        return -1
+    wid: int32 = 0
+    i: uint64 = 0
+    while i < cast[uint64](r):
+        c: uint8 = rbuf[i]
+        if c >= 48 and c <= 57:
+            wid = wid * 10 + cast[int32](c) - 48
+        i = i + 1
+    return wid
+
+
+def _win_path(wid: int32, leaf: Ptr[uint8]):
+    i: uint64 = 0
+    i = _put_s(&_hp_path_buf[0], i, "/dev/wsys/")
+    i = _put_dec(&_hp_path_buf[0], i, cast[uint64](wid))
+    i = _put_s(&_hp_path_buf[0], i, leaf)
+    _hp_path_buf[i] = 0
+
+
+def _wctl(wid: int32, verb: Ptr[uint8]):
+    _win_path(wid, "/ctl")
+    fd: int32 = sys_open_write(cast[Ptr[char]](&_hp_path_buf[0]))
+    if fd >= 0:
+        sys_write(fd, verb, _strlen(verb))
+        sys_close(fd)
+
+
+# Publish the committed v2 backbuffer to the scene compositor (buffer verb +
+# commit), like hamview's _present_v2.
+def _present(wid: int32):
+    _win_path(wid, "/scene")
+    sfd: int32 = sys_open_write(cast[Ptr[char]](&_hp_path_buf[0]))
+    if sfd >= 0:
+        m: uint64 = 0
+        m = _put_s(&_hp_markup_buf[0], m, "buffer 0 0 ")
+        m = _put_dec(&_hp_markup_buf[0], m, cast[uint64](HP_WIN_W))
+        _hp_markup_buf[m] = 32
+        m = m + 1
+        m = _put_dec(&_hp_markup_buf[0], m, cast[uint64](HP_WIN_H))
+        _hp_markup_buf[m] = 10
+        m = m + 1
+        sys_write(sfd, &_hp_markup_buf[0], m)
+        sys_close(sfd)
+    _wctl(wid, "commit\n")
+
+
+# Re-render the whole UI into the backbuffer and present it.
+def _repaint_full(wid: int32):
+    bb: Ptr[uint8] = hamui_v2_bb_ptr()
+    if bb == cast[Ptr[uint8]](0):
+        return
+    hp_render_ui(bb, hamui_v2_bb_w(), hamui_v2_bb_h())
+    hamui_v2_commit_rect(0, 0, HP_WIN_W, HP_WIN_H)
+    _present(wid)
+
+
+# Blit ONLY the dirtied canvas rectangle into the backbuffer and commit that
+# window-space region (per-damage). Clears the dirty flag.
+def _flush_damage(wid: int32):
+    if hp_dirty_valid() == 0:
+        return
+    bb: Ptr[uint8] = hamui_v2_bb_ptr()
+    if bb == cast[Ptr[uint8]](0):
+        return
+    x0: int32 = hp_dirty_x0()
+    y0: int32 = hp_dirty_y0()
+    x1: int32 = hp_dirty_x1()
+    y1: int32 = hp_dirty_y1()
+    hp_blit_canvas(bb, hamui_v2_bb_w(), hamui_v2_bb_h(), x0, y0, x1, y1)
+    wx: int32 = HP_CANVAS_X + x0
+    wy: int32 = HP_CANVAS_Y + y0
+    ww: int32 = (x1 - x0) + 1
+    wh: int32 = (y1 - y0) + 1
+    hamui_v2_commit_rect(wx, wy, ww, wh)
+    hp_dirty_reset()
+    _present(wid)
+
+
+# ====================================================================
+# Save the canvas as a PNG (lib/pngwrite, one stored-DEFLATE IDAT per row —
+# same streaming shape as user/hamshot.ad). Best-effort dir creation; falls
+# back to /tmp if the home tree is not writable.
+# ====================================================================
+def _wr_full(fd: int32, buf: Ptr[uint8], count: uint64) -> int32:
+    done: uint64 = 0
+    while done < count:
+        n: int64 = sys_write(fd, &buf[done], count - done)
+        if n <= 0:
+            return -1
+        done = done + cast[uint64](n)
+    return 0
+
+
+def _build_save_path():
+    sys_mkdir(cast[Ptr[char]]("/home"))
+    sys_mkdir(cast[Ptr[char]]("/home/live"))
+    sys_mkdir(cast[Ptr[char]]("/home/live/Pictures"))
+    p: uint64 = 0
+    p = _put_s(&_hp_save_path[0], p, "/home/live/Pictures/hampaint-")
+    p = _put_dec(&_hp_save_path[0], p, _hp_save_seq)
+    p = _put_s(&_hp_save_path[0], p, ".png")
+    _hp_save_path[p] = 0
+    _hp_save_seq = _hp_save_seq + 1
+
+
+def _save_png() -> int32:
+    _build_save_path()
+    ofd: int32 = sys_open_write(cast[Ptr[char]](&_hp_save_path[0]))
+    if ofd < 0:
+        # fall back to /tmp
+        p: uint64 = 0
+        p = _put_s(&_hp_save_path[0], p, "/tmp/hampaint-")
+        p = _put_dec(&_hp_save_path[0], p, _hp_save_seq)
+        p = _put_s(&_hp_save_path[0], p, ".png")
+        _hp_save_path[p] = 0
+        _hp_save_seq = _hp_save_seq + 1
+        ofd = sys_open_write(cast[Ptr[char]](&_hp_save_path[0]))
+    if ofd < 0:
+        return -1
+    w: uint64 = cast[uint64](hp_canvas_w())
+    h: uint64 = cast[uint64](hp_canvas_h())
+    can: Ptr[uint8] = hp_canvas_ptr()
+    sn: uint64 = pngw_signature(&_hp_png_out[0])
+    if _wr_full(ofd, &_hp_png_out[0], sn) != 0:
+        sys_close(ofd)
+        return -1
+    hn: uint64 = pngw_ihdr(&_hp_png_out[0], cast[uint32](w), cast[uint32](h))
+    if _wr_full(ofd, &_hp_png_out[0], hn) != 0:
+        sys_close(ofd)
+        return -1
+    pngw_adler_reset()
+    y: uint64 = 0
+    while y < h:
+        op: uint64 = pngw_idat_begin(&_hp_png_out[0])
+        if y == 0:
+            op = pngw_zlib_header(&_hp_png_out[0], op)
+        dlen: uint64 = 1 + w * 3
+        is_last: int32 = 0
+        if y == h - 1:
+            is_last = 1
+        op = pngw_stored_block_hdr(&_hp_png_out[0], op, dlen, is_last)
+        filt: uint64 = op
+        _hp_png_out[op] = 0                       # filter: None
+        op = op + 1
+        x: uint64 = 0
+        while x < w:
+            so: uint64 = (y * w + x) * 4
+            _hp_png_out[op]     = can[so]
+            _hp_png_out[op + 1] = can[so + 1]
+            _hp_png_out[op + 2] = can[so + 2]
+            op = op + 3
+            x = x + 1
+        pngw_adler_update(&_hp_png_out[0], filt, dlen)
+        if is_last != 0:
+            op = pngw_put_u32_be(&_hp_png_out[0], op, pngw_adler_final())
+        clen: uint64 = op - 8
+        total: uint64 = pngw_idat_end(&_hp_png_out[0], clen)
+        if _wr_full(ofd, &_hp_png_out[0], total) != 0:
+            sys_close(ofd)
+            return -1
+        y = y + 1
+    en: uint64 = pngw_iend(&_hp_png_out[0])
+    if _wr_full(ofd, &_hp_png_out[0], en) != 0:
+        sys_close(ofd)
+        return -1
+    sys_close(ofd)
+    _puts(2, "hampaint: saved ")
+    _puts(2, &_hp_save_path[0])
+    _puts(2, "\n")
+    return 0
+
+
+# ====================================================================
+# Pointer wire line parse "m x y buttons dz" -> fields[0..3].
+# ====================================================================
+def _parse_m(ls: uint64, le: uint64, fields: Ptr[int64]) -> int32:
+    p: uint64 = ls
+    if p >= le or _hp_ev_buf[p] != 109:               # 'm'
+        return 0
+    p = p + 1
+    f: int32 = 0
+    while f < 4:
+        while p < le and _hp_ev_buf[p] == 32:
+            p = p + 1
+        neg: int32 = 0
+        if p < le and _hp_ev_buf[p] == 45:
+            neg = 1
+            p = p + 1
+        v: int64 = 0
+        d: int32 = 0
+        while p < le and _hp_ev_buf[p] >= 48 and _hp_ev_buf[p] <= 57:
+            v = v * 10 + cast[int64](_hp_ev_buf[p]) - 48
+            p = p + 1
+            d = 1
+        if neg != 0:
+            v = 0 - v
+        if d == 0:
+            break
+        fields[f] = v
+        f = f + 1
+    if f < 3:
+        return 0
+    return 1
+
+
+# Handle one pointer line. Drives the core press/drag/release state machine and
+# flushes damage / repaints chrome as appropriate.
+def _handle_pointer(wid: int32, ls: uint64, le: uint64):
+    fields: Array[4, int64]
+    fields[0] = 0
+    fields[1] = 0
+    fields[2] = 0
+    fields[3] = 0
+    if _parse_m(ls, le, &fields[0]) == 0:
+        return
+    wx: int32 = cast[int32](fields[0])
+    wy: int32 = cast[int32](fields[1])
+    btn: int32 = 0
+    if (fields[2] & 1) != 0:                          # bit0 = left
+        btn = 1
+    if btn != 0 and _hp_btn_prev == 0:                # PRESS edge
+        hit: int32 = hp_press(wx, wy)
+        if hit == HP_HIT_SAVE:
+            _save_png()
+        elif hit == HP_HIT_TOOL or hit == HP_HIT_BRUSH \
+                or hit == HP_HIT_PAL or hit == HP_HIT_CLEAR:
+            _repaint_full(wid)                        # chrome changed
+        elif hit == HP_HIT_CANVAS:
+            _flush_damage(wid)
+    elif btn != 0 and _hp_btn_prev != 0:              # DRAG
+        if hp_drag(wx, wy) == HP_HIT_CANVAS:
+            _flush_damage(wid)
+    elif btn == 0 and _hp_btn_prev != 0:              # RELEASE edge
+        if hp_release(wx, wy) == HP_HIT_CANVAS:
+            _flush_damage(wid)
+    _hp_btn_prev = btn
+
+
+# ====================================================================
+# Non-blocking event/key drain.
+# ====================================================================
+def _poll_events(wid: int32):
+    if _hp_evt_fd < 0:
+        return
+    passes: int32 = 0
+    while passes < 6:
+        passes = passes + 1
+        room: uint64 = 256 - _hp_ev_carry
+        if room == 0:
+            _hp_ev_carry = 0
+            room = 256
+        en: int64 = sys_read_nb(_hp_evt_fd, &_hp_ev_buf[_hp_ev_carry], room)
+        if en <= 0:
+            break
+        total: uint64 = _hp_ev_carry + cast[uint64](en)
+        i: uint64 = 0
+        ls: uint64 = 0
+        while i < total:
+            if _hp_ev_buf[i] == 10:
+                if i > ls and _hp_ev_buf[ls] == 109:
+                    _handle_pointer(wid, ls, i)
+                ls = i + 1
+            i = i + 1
+        if ls < total:
+            k: uint64 = 0
+            while ls + k < total:
+                _hp_ev_buf[k] = _hp_ev_buf[ls + k]
+                k = k + 1
+            _hp_ev_carry = k
+        else:
+            _hp_ev_carry = 0
+
+
+def _poll_keys(wid: int32):
+    if _hp_keys_fd < 0:
+        return
+    kbuf: Array[64, uint8]
+    kr: int64 = sys_read_nb(_hp_keys_fd, &kbuf[0], 63)
+    if kr <= 0:
+        return
+    i: uint64 = 0
+    while i < cast[uint64](kr):
+        c: uint8 = kbuf[i]
+        if c == 115:                                  # 's' -> save
+            _save_png()
+        elif c == 99:                                 # 'c' -> clear
+            hp_clear()
+            _repaint_full(wid)
+        i = i + 1
+
+
+# ====================================================================
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    hamui_init()
+    hp_init()
+
+    wid: int32 = _newwindow()
+    if wid < 1:
+        _puts(2, "hampaint: newwindow failed\n")
+        return 1
+    _hp_wid = wid
+    _wctl(wid, "geometry 80 60 664 556\n")
+    _wctl(wid, "decorate 1\n")
+    _wctl(wid, "z 6\n")
+    _wctl(wid, "title HamPaint\n")
+
+    hamui_window_on(0, wid)
+    if hamui_set_protocol_v2_dims(HP_WIN_W, HP_WIN_H) < 0:
+        _puts(2, "hampaint: v2 blit negotiate failed\n")
+        return 1
+
+    _repaint_full(wid)
+    _puts(2, "HAMPAINT ready\n")
+
+    _win_path(wid, "/event")
+    _hp_evt_fd = sys_open(cast[Ptr[char]](&_hp_path_buf[0]))
+    _win_path(wid, "/keys")
+    _hp_keys_fd = sys_open(cast[Ptr[char]](&_hp_path_buf[0]))
+
+    while True:
+        sys_yield()
+        _poll_events(wid)
+        _poll_keys(wid)
+
+    return 0

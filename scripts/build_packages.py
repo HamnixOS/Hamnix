@@ -958,6 +958,29 @@ def _files_hamsheet() -> list[tuple[Path, str]]:
     return f
 
 
+# ---- hamnix-hampaint — the raster drawing app, ALSO repo-ONLY -------------
+# HamPaint is the MS-Paint / Tux-Paint equivalent: a native raster editor with a
+# canvas, tools (pencil/eraser/line/rect/filled-rect/ellipse/flood-fill), a
+# brush-size control, a colour palette, Clear (new) and save-as-PNG. Same
+# repo-ONLY pattern as HamWrite/HamSheet — BUILT + published in the main channel
+# (installable via hpm / the Software app), but excluded from the hamnix-base
+# closure below so a fresh install does NOT carry it. Its payload is the binary +
+# its .desktop launcher (staged into /etc/hamde/apps ONLY when installed).
+
+HAMPAINT_PKG = "hamnix-hampaint"
+
+
+def _files_hampaint() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hampaint")
+    # Launcher lives in etc/hamde/apps-optional/ (NOT etc/hamde/apps/, which the
+    # base hamnix-desktop-config package globs wholesale) and is staged into the
+    # live /etc/hamde/apps ONLY when this package is installed.
+    f.append((ETC_DIR / "hamde" / "apps-optional" / "hampaint.desktop",
+              "etc/hamde/apps/hampaint.desktop"))
+    return f
+
+
 # ---- hamnix-hamangrybirds — repo-ONLY, NOT-preinstalled game --------------
 # Follows the hamnix-hamaudiobook pattern exactly: BUILT + published in the main
 # channel (installable via `hpm install hamnix-hamangrybirds` or the Software
@@ -1239,6 +1262,24 @@ PACKAGE_SPECS.append({
 })
 
 
+# The repo-ONLY raster drawing app. Same pattern as HamWrite/HamSheet: built +
+# published in the main channel but kept out of the hamnix-base closure below, so
+# `hpm install hamnix-hampaint` / the Software app is the only way to get it.
+# Depends only on the compositor (scene-file DE) — no extra hardware stack.
+PACKAGE_SPECS.append({
+    "name": HAMPAINT_PKG,
+    "files_fn": _files_hampaint,
+    "depends": [f"hamnix-desktop-core>={PKG_VERSION}"],
+    "description": ("HamPaint — Hamnix raster drawing app (MS-Paint / Tux-Paint "
+                    "style): a canvas you paint with the mouse using pencil, "
+                    "eraser, line, rectangle, filled-rectangle, ellipse and "
+                    "flood-fill tools, a small/medium/large brush, a colour "
+                    "palette, Clear/new, and save-as-PNG. Repo-only: install "
+                    "from 255.one, not pre-installed."),
+    "target": "#hamnix-system",
+})
+
+
 # ---------------------------------------------------------------------
 # Generic spec-driven package builder
 # ---------------------------------------------------------------------
@@ -1359,6 +1400,8 @@ def build_hamnix_base() -> dict:
     leaf_names.add(HAMSHEET_PKG)
     # Likewise the repo-only Angry Birds game — 255.one / `hpm install` only.
     leaf_names.add(HAMANGRYBIRDS_PKG)
+    # The repo-only raster drawing app is likewise NOT pre-installed.
+    leaf_names.add(HAMPAINT_PKG)
     depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS
                if s["name"] not in leaf_names]
     depends.append(f"hamnix-bootloader>={PKG_VERSION}")
