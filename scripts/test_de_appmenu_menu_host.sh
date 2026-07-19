@@ -60,6 +60,12 @@ assert_grep() {
 # --- scene emitted + search box renders -----------------------------------
 assert_grep '^# scene v1 hamui'                    "scene header emitted"
 assert_grep 'glyphs [0-9]+ [0-9]+ \"Search\.\.\.\"' "search box renders (placeholder) in FULL menu"
+# REGRESSION GATE (user report 2026-07-17): the menu is a modal popup that owns
+# the keyboard while open, so its search field is always focused — it must show
+# a CARET the instant the menu opens, even with an EMPTY filter (before any
+# keystroke). The FULL menu renders the empty search box, so the 1x12 caret bar
+# (searchtx #23262b) MUST be emitted. Was: no caret until you typed.
+assert_grep '^fill [0-9]+ [0-9]+ 1 12 #23262b'  "empty+focused menu search box renders a caret bar"
 
 # --- FULL menu: Recent stays INLINE; categories are PARENT BUTTONS ----------
 # The USER design correction: each category is now a hover fly-out BUTTON

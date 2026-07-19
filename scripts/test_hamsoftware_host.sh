@@ -69,6 +69,13 @@ assert_grep '^PIX 4 4 3103887'                  "raster header pixel = #2f5c8f (
 
 # --- search field + action buttons ------------------------------------------
 assert_grep 'glyphs .*\"Find\"'                 "search field label"
+# REGRESSION GATE (user report 2026-07-17): the search box must show a blinking
+# CARET the instant it is focused, even while EMPTY (before any keystroke). The
+# default scene renders the search box empty + focused, so the 1x14 caret bar in
+# the caret colour (#2f5c8f) MUST be emitted. Was: empty -> placeholder only, no
+# caret, so a freshly-opened box looked unfocused until you typed.
+assert_grep 'glyphs .*\"search packages\.\.\.\"' "empty search box keeps its placeholder"
+assert_grep '^fill [0-9]+ [0-9]+ 1 14 #2f5c8f'  "empty+focused search box renders a caret bar"
 assert_grep 'glyphs .*\"Refresh\"'              "Refresh button"
 assert_grep 'glyphs .*\"Install\"'              "Install button"
 assert_grep 'glyphs .*\"Remove\"'               "Remove button"
