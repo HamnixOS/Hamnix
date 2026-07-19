@@ -132,3 +132,52 @@ console.log("ap-map-call",
 
 // String.prototype method as a value
 console.log("sp-toupper-call", String.prototype.toUpperCase.call("hi"));
+
+// Reading a builtin method off an INSTANCE (not the literal prototype) as a
+// first-class VALUE, then re-dispatching via .call — the exact shape minified
+// bundles emit: `var has = {}.hasOwnProperty; has.call(o,'k')`. Resolved via the
+// instance's [[Prototype]] chain to Object.prototype / Function.prototype /
+// Array.prototype. Before the chain-wiring these read `undefined` and threw.
+var rec2 = {alpha: 1};
+var hop2 = ({}).hasOwnProperty;                 // off a plain-object instance
+console.log("inst-hasown", typeof hop2, hop2.call(rec2, "alpha"), hop2.call(rec2, "beta"));
+
+function fn2(a, b) { return this.base + a + b; }
+var fcall = fn2.call;                            // off a function instance
+console.log("inst-fcall", typeof fcall, fcall.call(fn2, {base: 100}, 20, 3));
+
+var arr2 = [5, 6, 7, 8];
+var aslice = arr2.slice;                         // off an array instance
+console.log("inst-aslice", typeof aslice, aslice.call(arr2, 1, 3).join(","));
+
+// REGRESSION GUARD: instances chaining to a prototype must NOT leak prototype
+// methods into for-in / Object.keys / JSON.stringify / spread — those are
+// OWN-enumerable only. `hasOwnProperty` is inherited (own-check false) but `in`
+// still sees it (prototype walk), which is correct ES behavior.
+var plain = {x: 1, y: 2, z: 3};
+var seenKeys = "";
+for (var pk in plain) seenKeys += pk;
+var spread2 = Object.assign({}, plain);
+console.log("own-enum",
+    Object.keys(plain).join(","),
+    seenKeys,
+    JSON.stringify(plain),
+    plain.hasOwnProperty("x"),
+    plain.hasOwnProperty("toString"),
+    ("toString" in plain));
+
+// Comma SEQUENCE expression: EVERY operand runs (left→right) for side effects,
+// value is the last. Minified code and the Babel `_typeof` helper depend on it
+// (the helper reassigns its own name then calls it in one comma expression — if
+// the assignment is skipped it self-recurses forever). Before the fix only the
+// last operand ran.
+var seqLog = "";
+var seqVal = (seqLog += "a", seqLog += "b", seqLog += "c", 42);
+console.log("seq", seqLog, seqVal);
+function _typeof(o) {
+    return _typeof = "function" == typeof Symbol && "symbol" == typeof Symbol.iterator
+        ? function (o) { return typeof o; }
+        : function (o) { return o && "function" == typeof Symbol && o.constructor === Symbol && o !== Symbol.prototype ? "symbol" : typeof o; },
+        _typeof(o);
+}
+console.log("babel-typeof", _typeof(5), _typeof("s"), _typeof({}), _typeof(null));
