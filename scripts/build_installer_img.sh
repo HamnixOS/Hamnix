@@ -79,6 +79,19 @@ source "$PROJ_ROOT/scripts/_build_lock.sh"
 # shellcheck source=_adder_cc.sh
 source "$PROJ_ROOT/scripts/_adder_cc.sh"
 
+# OPTIMIZED-ADDER SHIP DEFAULT (user directive: "being able to compile and run
+# the OS should always be the bar for adopting new optimizations"). The shipped
+# installer image is built with the Phase-1..5 optimizer ON for BOTH the kernel
+# (HAMNIX_KERNEL_OPT) and every userland ELF (HAMNIX_USER_OPT). These are
+# exported so the build_user.sh + build_initramfs.py + kernel-compile
+# sub-invocations all agree. An explicit caller value still wins (set
+# HAMNIX_KERNEL_OPT=0 / HAMNIX_USER_OPT=0 for a no-opt reference image), and a
+# single miscompiling binary can be dropped back to no-opt via
+# HAMNIX_USER_OPT_EXCLUDE="name ..." without deoptimizing the rest of the OS.
+export HAMNIX_KERNEL_OPT="${HAMNIX_KERNEL_OPT:-1}"
+export HAMNIX_USER_OPT="${HAMNIX_USER_OPT:-1}"
+export HAMNIX_USER_OPT_EXCLUDE="${HAMNIX_USER_OPT_EXCLUDE:-}"
+
 OUT="${HAMNIX_INSTALLER_IMG_OUT:-$OUTDIR/hamnix-installer.img}"
 INSTALLED_KERNEL="$OUTDIR/hamnix-installed-kernel.elf"
 INSTALLER_KERNEL="$OUTDIR/hamnix-installer-kernel.elf"

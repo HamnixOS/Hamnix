@@ -106,6 +106,27 @@ adder_cc_compile() {
         # Forward the format selector (host_ac accepts the flag anywhere).
         local -a hc=()
         [ -n "$target" ] && hc+=("--target=$target")
+        # USERLAND --opt: HAMNIX_USER_OPT=1 compiles every user ELF WITH the
+        # Phase-1..5 optimizer (the shipped-image default; ~1.42x of gcc-O2 +
+        # SIMD on paint-shaped loops). A specific binary can be EXCLUDED from
+        # --opt (built no-opt) by listing its basename — with or without the
+        # .elf suffix — in HAMNIX_USER_OPT_EXCLUDE (space-separated). Used to
+        # ship the rest of the OS optimized while one miscompiling binary
+        # stays unoptimized. Kernel targets go through adder_cc_link_kernel
+        # below, which is gated on HAMNIX_KERNEL_OPT independently.
+        if [ "$target" != "x86_64-bare-metal" ] && [ "${HAMNIX_USER_OPT:-0}" = "1" ]; then
+            local _bn; _bn="$(basename "$out_elf")"; _bn="${_bn%.elf}"
+            local _excluded=0 _ex
+            for _ex in ${HAMNIX_USER_OPT_EXCLUDE:-}; do
+                _ex="${_ex%.elf}"
+                if [ "$_ex" = "$_bn" ]; then _excluded=1; break; fi
+            done
+            if [ "$_excluded" = "1" ]; then
+                echo "[adder_cc] USER --opt EXCLUDED (no-opt): $_bn" >&2
+            else
+                hc+=("--opt")
+            fi
+        fi
         if [ "$target" = "x86_64-bare-metal" ]; then
             # KERNEL target: host_ac emits a RELOCATABLE .o (ET_REL); we then
             # `as`+`ld` it together with the hand-written boot stubs under
