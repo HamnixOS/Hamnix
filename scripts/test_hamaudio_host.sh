@@ -45,17 +45,57 @@ if ! python3 -m compiler.adder compile --target=x86_64-adder-user \
 fi
 echo "[hamaudio-host] PASS native hamaudioscene still compiles"
 
+# --- DEFAULT-OPEN: bare `hamaudioscene` must default to the shipped music demo,
+# NOT test.wav. Verify (1) at the source level that track 0 of the bare-launch
+# playlist is the music-demo mp3, and (2) by actually DECODING the shipped
+# fixture through the SAME mp3 path the app uses (rate/channels/duration).
+DEMO_MP3="tests/fixtures/sounds/hamnix-music-demo.mp3"
+if grep -Eq 'track_paths\[0\].*hamnix-music-demo\.mp3' user/hamaudioscene.ad; then
+    echo "[hamaudio-host] PASS bare-launch default track 0 = the Hamnix Music Demo mp3"
+else
+    echo "[hamaudio-host] FAIL bare-launch default is not the music demo"; fail=1
+fi
+if grep -Eq 'track_paths\[0\].*test\.wav' user/hamaudioscene.ad; then
+    echo "[hamaudio-host] FAIL test.wav is still the default open (track 0)"; fail=1
+else
+    echo "[hamaudio-host] PASS test.wav is no longer the default open"
+fi
+if [ -s "$DEMO_MP3" ]; then
+    MP3BIN="$OUT/hamaudio_mp3_host"
+    if python3 -m compiler.adder compile --target=x86_64-linux \
+            user/hamaudioscene_mp3_host.ad -o "$MP3BIN" 2>"$OUT/hamaudio_demo_compile.log"; then
+        DEMODUMP="$OUT/hamaudio_demo_dump.txt"
+        if "$MP3BIN" "$DEMO_MP3" "$OUT/demo_b.ppm" "$OUT/demo_a.ppm" >"$DEMODUMP" 2>&1; then
+            df() { grep -E "^$1 " "$DEMODUMP" | head -1 | awk '{print $2}'; }
+            [ "$(df DECODE_OK)" = "1" ] && echo "[hamaudio-host] PASS default music-demo mp3 decodes (lib/mp3decode)" || { echo "[hamaudio-host] FAIL default music-demo mp3 did not decode"; fail=1; }
+            DRATE=$(df RATE); DCH=$(df CHANNELS); DDUR=$(df DURATION_MS)
+            if [ -n "$DRATE" ] && [ "$DRATE" -gt 0 ] && [ -n "$DCH" ] && [ "$DCH" -gt 0 ] && [ -n "$DDUR" ] && [ "$DDUR" -gt 0 ]; then
+                echo "[hamaudio-host] PASS default music-demo format: rate=${DRATE} ch=${DCH} dur=${DDUR}ms"
+            else
+                echo "[hamaudio-host] FAIL default music-demo format bad: rate=$DRATE ch=$DCH dur=$DDUR"; fail=1
+            fi
+        else
+            echo "[hamaudio-host] FAIL music-demo decode harness exited non-zero"; cat "$DEMODUMP"; fail=1
+        fi
+    else
+        echo "[hamaudio-host] FAIL mp3 host harness did not compile"; cat "$OUT/hamaudio_demo_compile.log"; fail=1
+    fi
+else
+    echo "[hamaudio-host] WARN music-demo fixture absent ($DEMO_MP3) — skipping decode check"
+fi
+
 echo "[hamaudio-host] running host harness on $WAV ..."
 DUMP="$OUT/hamaudio_dump.txt"
 BEFORE="$OUT/hamaudio_before.ppm"
 AFTER="$OUT/hamaudio_after.ppm"
 PLAYLIST="$OUT/hamaudio_playlist.ppm"
-if ! "$BIN" "$WAV" "$BEFORE" "$AFTER" "$PLAYLIST" >"$DUMP" 2>&1; then
+TRANSPORT="$OUT/hamaudio_transport.ppm"
+if ! "$BIN" "$WAV" "$BEFORE" "$AFTER" "$PLAYLIST" "$TRANSPORT" >"$DUMP" 2>&1; then
     echo "[hamaudio-host] FAIL: host harness exited non-zero"; cat "$DUMP"; exit 1
 fi
 
 # Render the PPMs to PNGs (saved for eyeballing) using the stdlib-only converter.
-for f in before after playlist; do
+for f in before after playlist transport; do
     if python3 scripts/ppm_to_png.py "$OUT/hamaudio_$f.ppm" "$OUT/hamaudio_$f.png" 2>"$OUT/hamaudio_png.log"; then
         echo "[hamaudio-host] PASS rendered $OUT/hamaudio_$f.png ($(file -b "$OUT/hamaudio_$f.png" 2>/dev/null))"
     else
@@ -148,6 +188,31 @@ assert_grep '^glyphs [0-9]+ [0-9]+ \"intro.wav\"' "track 0 name drawn"
 assert_grep '^glyphs [0-9]+ [0-9]+ \"outro.mp3\"' "track 2 name drawn"
 [ "$(field CMD_SELECT)" = "4" ] && echo "[hamaudio-host] PASS playlist-row click enqueues a SELECT" || { echo "[hamaudio-host] FAIL row click did not enqueue SELECT: $(field CMD_SELECT)"; fail=1; }
 [ "$(field SEL_INDEX)" = "0" ] && echo "[hamaudio-host] PASS SELECT targets the clicked row (index 0)" || { echo "[hamaudio-host] FAIL SELECT index wrong: $(field SEL_INDEX)"; fail=1; }
+
+# --- VLC-style extended transport (tall window): prev/next, volume, repeat,
+# shuffle. Proves each control both APPEARS (extended layout) and ROUTES the
+# right command / toggles the right state.
+[ "$(field EXTENDED)" = "1" ] && echo "[hamaudio-host] PASS tall window enables the extended transport" || { echo "[hamaudio-host] FAIL extended transport not enabled: $(field EXTENDED)"; fail=1; }
+[ "$(field CMD_NEXT)" = "6" ] && echo "[hamaudio-host] PASS Next button enqueues CMD_NEXT" || { echo "[hamaudio-host] FAIL Next button routing: $(field CMD_NEXT)"; fail=1; }
+[ "$(field CMD_PREV)" = "5" ] && echo "[hamaudio-host] PASS Prev button enqueues CMD_PREV" || { echo "[hamaudio-host] FAIL Prev button routing: $(field CMD_PREV)"; fail=1; }
+[ "$(field CMD_VOLUME)" = "7" ] && echo "[hamaudio-host] PASS volume slider enqueues CMD_VOLUME" || { echo "[hamaudio-host] FAIL volume routing: $(field CMD_VOLUME)"; fail=1; }
+VOL=$(field VOLUME)
+if [ -n "$VOL" ] && [ "$VOL" -ge 20 ] && [ "$VOL" -le 30 ]; then
+    echo "[hamaudio-host] PASS quarter-slider click set volume to ~25% ($VOL)"
+else
+    echo "[hamaudio-host] FAIL quarter-slider volume off target: $VOL"; fail=1
+fi
+# Repeat cycles off(0) -> all(1) -> one(2); toggles must NOT enqueue a command.
+[ "$(field REPEAT_1)" = "1" ] && echo "[hamaudio-host] PASS first Repeat click -> repeat-all (1)" || { echo "[hamaudio-host] FAIL repeat click 1: $(field REPEAT_1)"; fail=1; }
+[ "$(field REPEAT_2)" = "2" ] && echo "[hamaudio-host] PASS second Repeat click -> repeat-one (2)" || { echo "[hamaudio-host] FAIL repeat click 2: $(field REPEAT_2)"; fail=1; }
+[ "$(field CMD_AFTER_RPT)" = "0" ] && echo "[hamaudio-host] PASS Repeat toggle is pure UI state (no driver command)" || { echo "[hamaudio-host] FAIL repeat toggle leaked a command: $(field CMD_AFTER_RPT)"; fail=1; }
+[ "$(field SHUFFLE)" = "1" ] && echo "[hamaudio-host] PASS Shuffle click turns shuffle on" || { echo "[hamaudio-host] FAIL shuffle toggle: $(field SHUFFLE)"; fail=1; }
+# The extended transport display list must carry the new controls' labels.
+assert_grep '^glyphs [0-9]+ [0-9]+ \"Prev\"'   "Prev button label drawn"
+assert_grep '^glyphs [0-9]+ [0-9]+ \"Next\"'   "Next button label drawn"
+assert_grep '^glyphs [0-9]+ [0-9]+ \"Volume\"' "Volume slider labelled"
+assert_grep '^glyphs [0-9]+ [0-9]+ \"Shuf\"'   "Shuffle toggle drawn"
+assert_grep '^glyphs [0-9]+ [0-9]+ \"Rpt\"'    "Repeat toggle drawn"
 
 if [ "$fail" -eq 0 ]; then
     echo "[hamaudio-host] RESULT: PASS"

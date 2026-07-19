@@ -780,11 +780,13 @@ def _make_desktop_app_files_fn(bins: tuple, with_images: bool,
             vid = HERE / "tests" / "fixtures" / "videos" / "test.hmjv"
             f.append((vid, "usr/share/videos/test.hmjv"))
         if with_sounds:
-            # The royalty-free (CC0) audio test clip the player opens out of
-            # the box: `hamaudioscene` (and `aplay`) default to
-            # /usr/share/sounds/test.wav. Generated deterministically by
-            # scripts/gen_test_wav.py (synthesized arpeggio — no third-party
-            # recording), so it is an original public-domain work.
+            # The royalty-free (CC0) audio test clip. `aplay` defaults to
+            # /usr/share/sounds/test.wav, and it is one of the playlist rows
+            # the DE audio player seeds on a bare launch (whose DEFAULT open is
+            # now the Hamnix Music Demo mp3 below, not test.wav). Generated
+            # deterministically by scripts/gen_test_wav.py (synthesized arpeggio
+            # — no third-party recording), so it is an original public-domain
+            # work.
             wav = HERE / "tests" / "fixtures" / "sounds" / "test.wav"
             f.append((wav, "usr/share/sounds/test.wav"))
             # The same clip as CBR MPEG-1 Layer III, so `hamaudioscene
