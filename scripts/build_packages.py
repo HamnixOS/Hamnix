@@ -689,8 +689,9 @@ DESKTOP_APP_PACKAGES: list[dict] = [
      "summary": "Coin Dash (hamGame demo game)"},
     {"name": "hamnix-hamgamesnake", "bins": ("hamgamesnake",),
      "summary": "Snake (hamGame arcade game)"},
-    {"name": "hamnix-hamgamechess", "bins": ("hamgamechess",),
-     "summary": "Chess (hamGame board game)"},
+    # hamnix-hamgamechess retired — the inferior hamgamechess build was removed
+    # in favour of hamchessscene (full legal moves + check/mate). Its binary is
+    # no longer built, so the metapackage entry is gone to keep the build sound.
     {"name": "hamnix-hamterm", "bins": ("hamterm", "hamtermscene"),
      "summary": "terminal emulator"},
     {"name": "hamnix-hamfiles", "bins": ("hamfm", "hamfmscene"),
