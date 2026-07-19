@@ -319,22 +319,23 @@ assert_grepL '^SEG 3 40 .*certainly wrap across the\|$'    "long ul item wraps a
 assert_grepL '^SEG 4 40 .*available line width so we can check hanging indentation\|' \
     "wrapped continuation line aligns at x=40 (hanging indent, not x=8)"
 # <ol> items number 1./2./3. in the gutter, text hanging at x=40.
-# NOTE: the mid-document <h3> headings each get one blank "section top-margin"
-# line above them (UA default heading spacing), which shifts the rows BELOW the
-# second/third/fourth heading down by 1/2/3 vs the pre-spacing layout. The x
-# columns (marker gutter x=8/40, text x=40/72) are unchanged; only the row
-# indices moved, so these assertions track the new rows.
-assert_grepL '^SEG 10 8 #101010 b0 u0 s0 l-1 bg- \|1\.\|'  "ol first item numbered '1.' at x=8"
-assert_grepL '^SEG 10 40 .*Preheat\|'                    "ol item text hangs at x=40"
-assert_grepL '^SEG 11 8 .*\|2\.\|'                        "ol second item numbered '2.'"
-assert_grepL '^SEG 12 8 .*\|3\.\|'                        "ol third item numbered '3.'"
+# NOTE: each mid-document <h3> follows a list, and its UA top margin COLLAPSES
+# with that list's bottom margin (Chrome-parity margin collapsing) — one gap row
+# at the boundary, not two. So the ol block sits one row higher than the old
+# double-gap layout (row 9, not 10), and the nested block — below two collapsed
+# heading boundaries — sits two rows higher (row 15, not 17). The x columns
+# (marker gutter x=8/40, text x=40/72) are unchanged; only the row indices moved.
+assert_grepL '^SEG 9 8 #101010 b0 u0 s0 l-1 bg- \|1\.\|'   "ol first item numbered '1.' at x=8"
+assert_grepL '^SEG 9 40 .*Preheat\|'                     "ol item text hangs at x=40"
+assert_grepL '^SEG 10 8 .*\|2\.\|'                        "ol second item numbered '2.'"
+assert_grepL '^SEG 11 8 .*\|3\.\|'                        "ol third item numbered '3.'"
 # Nested <ol> inside a <ul> item: outer '-' at x=8, inner '1.'/'2.' one level
 # deeper (marker at x=40, text at x=72), and the inner counter restarts at 1.
-assert_grepL '^SEG 17 8 .*\|-\|'      "nested: outer ul bullet at x=8"
-assert_grepL '^SEG 17 40 .*Fruit\|'   "nested: outer ul item text at x=40"
-assert_grepL '^SEG 18 40 .*\|1\.\|'   "nested: inner ol marker '1.' hangs at x=40"
-assert_grepL '^SEG 18 72 .*Apple\|'   "nested: inner ol item text hangs at x=72"
-assert_grepL '^SEG 19 40 .*\|2\.\|'   "nested: inner ol counter continues to '2.'"
+assert_grepL '^SEG 15 8 .*\|-\|'      "nested: outer ul bullet at x=8"
+assert_grepL '^SEG 15 40 .*Fruit\|'   "nested: outer ul item text at x=40"
+assert_grepL '^SEG 16 40 .*\|1\.\|'   "nested: inner ol marker '1.' hangs at x=40"
+assert_grepL '^SEG 16 72 .*Apple\|'   "nested: inner ol item text hangs at x=72"
+assert_grepL '^SEG 17 40 .*\|2\.\|'   "nested: inner ol counter continues to '2.'"
 # <ol start="10"> seeds the counter: items number 10./11.
 assert_grepL '^SEG [0-9]+ 8 .*\|10\.\|'  "ol start=10 -> first item numbered '10.'"
 assert_grepL '^SEG [0-9]+ 8 .*\|11\.\|'  "ol start=10 -> second item numbered '11.'"
@@ -835,26 +836,28 @@ assert_grepA() {
 assert_grepA '^SEG 0 8 #14306e b1 u0 s0 l-1 bg- \|The Hamnix Project\|' \
     "leading h1 at row 0 (heading top-margin suppressed at document start)"
 assert_grepA '^RULE row 0 type 1$' "leading h1 emits a heading rule"
-# A mid-document heading gets ONE blank section-spacing line above it: the h2
-# "Design goals" lands at row 12 with row 11 empty (the top-margin line).
-assert_grepA '^SEG 12 8 #14306e b1 u0 s0 l-1 bg- \|Design goals\|' \
-    "mid-doc h2 gets a section top-margin (lands at row 12, not row 11)"
-if grep -Eq '^SEG 11 ' "$DUMPA"; then
-    echo "[hb-host] FAIL heading top-margin row 11 is not blank"; fail=1
+# A mid-document heading gets ONE blank section-spacing line above it — and that
+# margin COLLAPSES with the preceding paragraph's bottom margin (Chrome parity),
+# so the h2 "Design goals" lands at row 11 (preceding prose on row 9, the single
+# collapsed margin on the empty row 10), NOT the old double-gap row 12.
+assert_grepA '^SEG 11 8 #14306e b1 u0 s0 l-1 bg- \|Design goals\|' \
+    "mid-doc h2 gets a collapsed section top-margin (lands at row 11, one gap not two)"
+if grep -Eq '^SEG 10 ' "$DUMPA"; then
+    echo "[hb-host] FAIL heading top-margin row 10 is not blank"; fail=1
 else
-    echo "[hb-host] PASS heading top-margin inserts a blank line (row 11 empty)"
+    echo "[hb-host] PASS heading top-margin inserts a single blank line (row 10 empty)"
 fi
 # <pre> renders teal monospace on the light code background (#eef0f3) across
 # every code line.
-assert_grepA '^SEG 56 8 #0a6b5a b0 u0 s0 l-1 bg#eef0f3 \|fn main\(\) \{\|' \
+assert_grepA '^SEG 52 8 #0a6b5a b0 u0 s0 l-1 bg#eef0f3 \|fn main\(\) \{\|' \
     "pre line -> teal text on the light code background (#eef0f3)"
-assert_grepA '^SEG 58 8 #0a6b5a b0 u0 s0 l-1 bg#eef0f3 \|\}\|' \
+assert_grepA '^SEG 54 8 #0a6b5a b0 u0 s0 l-1 bg#eef0f3 \|\}\|' \
     "every pre line carries the code background"
 # inline <code> also gets the teal tint + code background (mid-paragraph).
 assert_grepA '^SEG [0-9]+ [0-9]+ #0a6b5a b0 u0 s0 l-1 bg#eef0f3 \| code\|' \
     "inline <code> -> teal text on the light code background"
 # <blockquote> text renders in a muted grey (#5a5a5a), still indented to x=32.
-assert_grepA '^SEG 48 32 #5a5a5a b0 u0 s0 l-1 bg- \|Anything that can go wrong' \
+assert_grepA '^SEG 45 32 #5a5a5a b0 u0 s0 l-1 bg- \|Anything that can go wrong' \
     "blockquote text -> muted grey (#5a5a5a), indented to x=32"
 
 # ---- readable-measure default: on a WIDE window the body column is capped at
