@@ -563,6 +563,18 @@ def isel_reset_stats():
 vec_enabled: uint32 = 0
 opt_vec_count: uint32 = 0
 
+# AUTO-VECTORIZER (blend) matcher scratch — one slot per destination byte offset
+# (0=red, 1=green, 2=blue) of the constant-source source-over fill loop. Filled
+# and consumed entirely within try_vectorize_blend (single-threaded codegen), so
+# module-level reuse is safe.
+vb_load: Array[3, uint32]      # the dst-channel byte-load ND_VAR_DECL
+vb_lbase: Array[3, uint32]     # that load's pointer-base ident
+vb_store: Array[3, uint32]     # the blend ND_ASSIGN store
+vb_const: Array[3, uint32]     # the store's loop-invariant src*a constant ident
+vb_local: Array[3, uint32]     # the store's dst-channel local ident (must == load)
+vb_ia: Array[3, uint32]        # the store's (255-a) ident
+vb_sbase: Array[3, uint32]     # the store's pointer-base ident
+
 
 def vec_enable():
     vec_enabled = 1
@@ -15096,12 +15108,506 @@ def vec_emit_fill_loop(creg: uint32, coff: int32, breg: uint32, boff: int32,
     patch_rel32(exit_fix, code_len)       # vend:
 
 
+# =======================================================================
+# AUTO-VECTORIZER (blend): the TRANSLUCENT source-over fill loop
+# (vk2d_raster_fill_rect_alpha's a<255 arm). Per pixel, per channel:
+#     out = (chan_av + dst_chan * ia) / 255   (truncating), alpha forced 255,
+# where chan_av = chan*a and ia = 255-a are LOOP-INVARIANT. Both terms are
+# bounded (chan*a + dst*(255-a) <= 255*255 = 65025 < 2^16), so the whole
+# datapath fits SSE2 16-bit lanes: unpack 4 ARGB pixels to words, pmullw by ia,
+# paddw the src const, then EXACT /255 via pmulhuw 0x8081 + psrlw 7 (verified
+# bit-identical to floor(n/255) over [0,65025]), packuswb back to 4 bytes, and
+# `por` a 0xFF-in-every-alpha-byte mask to set alpha=255. 4 pixels/iter; the
+# caller's scalar loop drains the <4 remainder byte-identically. Armed only
+# under --opt (vec_is_enabled); OFF -> nothing emitted.
+# =======================================================================
+
+# Parse a byte-pointer expression P used as cast[Ptr[uint8]](P)[0]: a bare ident
+# (offset 0) or `ident + INT` (offset INT). Returns 1 with base ident + offset.
+def blend_ptr_parse(p: uint32, out_base: Ptr[uint32], out_off: Ptr[uint64]) -> uint32:
+    if p == 0:
+        return 0
+    if nd_kind[p] == ND_IDENT:
+        out_base[0] = p
+        out_off[0] = cast[uint64](0)
+        return 1
+    if nd_kind[p] != ND_BINARY or nd_aux[p] != BINOP_ADD:
+        return 0
+    la: uint32 = nd_a[p]
+    lb: uint32 = nd_b[p]
+    if nd_kind[la] != ND_IDENT or nd_kind[lb] != ND_INT_LIT:
+        return 0
+    out_base[0] = la
+    out_off[0] = nd_num[lb]
+    return 1
+
+
+# Unwrap `cast[Ptr[uint8]](P)[0]` (a 1-byte INDEX at literal 0 through a
+# Ptr[uint8] cast), returning the pointer expression P through out_p.
+def blend_bidx(tgt: uint32, out_p: Ptr[uint32]) -> uint32:
+    if nd_kind[tgt] != ND_INDEX:
+        return 0
+    base: uint32 = nd_a[tgt]
+    if nd_kind[base] != ND_CAST:
+        return 0
+    ct: uint32 = nd_a[base]
+    if ct == 0 or nd_kind[ct] != ND_PTR_TYPE:
+        return 0
+    idx: uint32 = nd_b[tgt]
+    if idx == 0 or nd_kind[idx] != ND_INT_LIT or nd_num[idx] != cast[uint64](0):
+        return 0
+    if index_elem_size(tgt) != 1:
+        return 0
+    out_p[0] = nd_b[base]
+    return 1
+
+
+# 1 iff `s` is `NAME: T = cast[T](cast[Ptr[uint8]](P)[0])` — the dst-channel
+# byte load; returns the pointer base ident + byte offset through out_base/off.
+def blend_load_is(s: uint32, out_base: Ptr[uint32], out_off: Ptr[uint64]) -> uint32:
+    if nd_kind[s] != ND_VAR_DECL:
+        return 0
+    init: uint32 = nd_b[s]
+    if init == 0 or nd_kind[init] != ND_CAST:
+        return 0
+    p: uint32 = 0
+    if blend_bidx(nd_b[init], &p) == 0:
+        return 0
+    return blend_ptr_parse(p, out_base, out_off)
+
+
+# 1 iff `s` is `cast[Ptr[uint8]](P)[0] = cast[uint8]((CONST + LOCAL * IA) / 255)`
+# — a blend channel store. Returns pointer base+offset and the CONST/LOCAL/IA
+# operand idents. * binds tighter than +, so the add is ADD(CONST, MUL(LOCAL,IA)).
+def blend_store_is(s: uint32, out_base: Ptr[uint32], out_off: Ptr[uint64],
+                   out_const: Ptr[uint32], out_local: Ptr[uint32],
+                   out_ia: Ptr[uint32]) -> uint32:
+    if nd_kind[s] != ND_ASSIGN or nd_aux[s] != 0:
+        return 0
+    p: uint32 = 0
+    if blend_bidx(nd_a[s], &p) == 0:
+        return 0
+    val: uint32 = nd_b[s]
+    if val == 0 or nd_kind[val] != ND_CAST:
+        return 0
+    dv: uint32 = nd_b[val]
+    if dv == 0 or nd_kind[dv] != ND_BINARY or nd_aux[dv] != BINOP_DIV:
+        return 0
+    d255: uint32 = nd_b[dv]
+    if nd_kind[d255] != ND_INT_LIT or nd_num[d255] != cast[uint64](255):
+        return 0
+    ad: uint32 = nd_a[dv]
+    if nd_kind[ad] != ND_BINARY or nd_aux[ad] != BINOP_ADD:
+        return 0
+    cst: uint32 = nd_a[ad]
+    ml: uint32 = nd_b[ad]
+    if nd_kind[cst] != ND_IDENT:
+        return 0
+    if nd_kind[ml] != ND_BINARY or nd_aux[ml] != BINOP_MUL:
+        return 0
+    lo: uint32 = nd_a[ml]
+    io: uint32 = nd_b[ml]
+    if nd_kind[lo] != ND_IDENT or nd_kind[io] != ND_IDENT:
+        return 0
+    out_const[0] = cst
+    out_local[0] = lo
+    out_ia[0] = io
+    return blend_ptr_parse(p, out_base, out_off)
+
+
+# 1 iff `s` is `cast[Ptr[uint8]](P)[0] = 255` — the forced-opaque alpha store.
+def blend_alpha_is(s: uint32, out_base: Ptr[uint32], out_off: Ptr[uint64]) -> uint32:
+    if nd_kind[s] != ND_ASSIGN or nd_aux[s] != 0:
+        return 0
+    p: uint32 = 0
+    if blend_bidx(nd_a[s], &p) == 0:
+        return 0
+    v: uint32 = nd_b[s]
+    if v == 0 or nd_kind[v] != ND_INT_LIT or nd_num[v] != cast[uint64](255):
+        return 0
+    return blend_ptr_parse(p, out_base, out_off)
+
+
+# 1 iff idents a and b name the same local (both non-null).
+def blend_same_ident(a: uint32, b: uint32) -> uint32:
+    if a == 0 or b == 0:
+        return 0
+    if name_match(nd_name_off[a], nd_name_len[a],
+                  nd_name_off[b], nd_name_len[b]) != 0:
+        return 1
+    return 0
+
+
+# 1 iff ident `nm` is loop-INVARIANT: it is not the counter, not the pointer,
+# and not any of the three per-iteration dst-channel load decls (dr/dg/db) — the
+# ONLY names assigned in the body, so anything else is read-only across the loop.
+def blend_is_invariant(nm: uint32, citer: uint32, pbase: uint32) -> uint32:
+    if blend_same_ident(nm, citer) != 0:
+        return 0
+    if blend_same_ident(nm, pbase) != 0:
+        return 0
+    i: uint32 = 0
+    while i < 3:
+        if nm != 0 and vb_load[i] != 0 and \
+           name_match(nd_name_off[nm], nd_name_len[nm],
+                      nd_name_off[vb_load[i]], nd_name_len[vb_load[i]]) != 0:
+            return 0
+        i = i + 1
+    return 1
+
+
+# AUTO-VECTORIZER: recognise the vk_2d translucent source-over rect-fill inner
+# loop and, if matched, emit an SSE2 preamble that blends 4 ARGB pixels/iter.
+# The caller (gen_while) then emits the ordinary scalar loop UNCHANGED, draining
+# the 0..3-pixel remainder, so the fill is byte-identical to scalar. Returns 1 if
+# a vector preamble was emitted, 0 otherwise (nothing emitted).
+def try_vectorize_blend(node: uint32) -> uint32:
+    if vec_is_enabled() == 0:
+        return 0
+    cond: uint32 = nd_a[node]
+    if cond == 0 or nd_kind[cond] != ND_BINARY or nd_aux[cond] != BINOP_LT:
+        return 0
+    citer: uint32 = nd_a[cond]        # loop counter ident
+    cbnd: uint32 = nd_b[cond]         # loop bound ident
+    if nd_kind[citer] != ND_IDENT or nd_kind[cbnd] != ND_IDENT:
+        return 0
+    i: uint32 = 0
+    while i < 3:
+        vb_load[i] = 0
+        vb_store[i] = 0
+        i = i + 1
+    # Classify EXACTLY nine body statements: 3 channel loads, 3 blend stores,
+    # 1 alpha store, 1 pointer-advance (+4), 1 counter-advance (+1).
+    ptr_base: uint32 = 0
+    alpha_base: uint32 = 0
+    ptr_adv: uint32 = 0
+    cnt_adv: uint32 = 0
+    alpha_cnt: uint32 = 0
+    nstmt: uint32 = 0
+    s: uint32 = nd_b[node]
+    while s != 0:
+        nstmt = nstmt + 1
+        if nstmt > 9:
+            return 0
+        ttgt: uint32 = 0
+        base: uint32 = 0
+        off: uint64 = cast[uint64](0)
+        cst: uint32 = 0
+        lcl: uint32 = 0
+        iai: uint32 = 0
+        if vec_self_add_is(s, cast[uint64](1), &ttgt) != 0 and \
+           name_match(nd_name_off[ttgt], nd_name_len[ttgt],
+                      nd_name_off[citer], nd_name_len[citer]) != 0:
+            cnt_adv = cnt_adv + 1
+        elif vec_self_add_is(s, cast[uint64](4), &ttgt) != 0:
+            ptr_base = ttgt
+            ptr_adv = ptr_adv + 1
+        elif blend_alpha_is(s, &base, &off) != 0:
+            if off != cast[uint64](3):
+                return 0
+            alpha_base = base
+            alpha_cnt = alpha_cnt + 1
+        elif blend_store_is(s, &base, &off, &cst, &lcl, &iai) != 0:
+            if off > cast[uint64](2):
+                return 0
+            k: uint32 = cast[uint32](off)
+            if vb_store[k] != 0:
+                return 0
+            vb_store[k] = s
+            vb_const[k] = cst
+            vb_local[k] = lcl
+            vb_ia[k] = iai
+            vb_sbase[k] = base
+        elif blend_load_is(s, &base, &off) != 0:
+            if off > cast[uint64](2):
+                return 0
+            k2: uint32 = cast[uint32](off)
+            if vb_load[k2] != 0:
+                return 0
+            vb_load[k2] = s
+            vb_lbase[k2] = base
+        else:
+            return 0
+        s = nd_next[s]
+    if nstmt != 9:
+        return 0
+    if ptr_adv != 1 or cnt_adv != 1 or alpha_cnt != 1 or ptr_base == 0:
+        return 0
+    # Every channel present; one pointer base across all seven memory ops.
+    if blend_same_ident(ptr_base, alpha_base) == 0:
+        return 0
+    i = 0
+    while i < 3:
+        if vb_load[i] == 0 or vb_store[i] == 0:
+            return 0
+        if blend_same_ident(ptr_base, vb_lbase[i]) == 0:
+            return 0
+        if blend_same_ident(ptr_base, vb_sbase[i]) == 0:
+            return 0
+        # store's dst-local operand must be THIS offset's load decl (no channel
+        # cross-wiring — lane k of the vector path is dst byte k).
+        if name_match(nd_name_off[vb_local[i]], nd_name_len[vb_local[i]],
+                      nd_name_off[vb_load[i]], nd_name_len[vb_load[i]]) == 0:
+            return 0
+        # ia must be ONE ident across the three channels.
+        if blend_same_ident(vb_ia[0], vb_ia[i]) == 0:
+            return 0
+        i = i + 1
+    ia_node: uint32 = vb_ia[0]
+    # The three src constants and ia must be loop-invariant.
+    i = 0
+    while i < 3:
+        if blend_is_invariant(vb_const[i], citer, ptr_base) == 0:
+            return 0
+        i = i + 1
+    if blend_is_invariant(ia_node, citer, ptr_base) == 0:
+        return 0
+    # Counter, bound and pointer are PLAIN full-width-8 scalar locals (the fill
+    # path's promotion class); the invariants are non-float, non-aggregate scalars.
+    if param_is_plain_scalar(nd_name_off[citer], nd_name_len[citer]) == 0:
+        return 0
+    if param_is_plain_scalar(nd_name_off[cbnd], nd_name_len[cbnd]) == 0:
+        return 0
+    if param_is_plain_scalar(nd_name_off[ptr_base], nd_name_len[ptr_base]) == 0:
+        return 0
+    # The src constants + ia are typically sub-8-byte (uint32) locals, so they do
+    # NOT satisfy param_is_plain_scalar (full-width-8). Like the fill path's value,
+    # require only that they are non-float, non-aggregate scalars; ra_reg_for_name
+    # + lookup_local resolve the correct home (promoted reg or vetoed stack slot).
+    i = 0
+    while i < 3:
+        if lookup_local_float(nd_name_off[vb_const[i]],
+                              nd_name_len[vb_const[i]]) != 0:
+            return 0
+        if lookup_local_is_aggregate(nd_name_off[vb_const[i]],
+                                     nd_name_len[vb_const[i]]) != 0:
+            return 0
+        i = i + 1
+    if lookup_local_float(nd_name_off[ia_node], nd_name_len[ia_node]) != 0:
+        return 0
+    if lookup_local_is_aggregate(nd_name_off[ia_node], nd_name_len[ia_node]) != 0:
+        return 0
+    # Resolve promoted register (RA_NONE if unpromoted) + stack slot for each home.
+    creg: uint32 = ra_reg_for_name(nd_name_off[citer], nd_name_len[citer])
+    nreg: uint32 = ra_reg_for_name(nd_name_off[cbnd], nd_name_len[cbnd])
+    preg: uint32 = ra_reg_for_name(nd_name_off[ptr_base], nd_name_len[ptr_base])
+    rreg: uint32 = ra_reg_for_name(nd_name_off[vb_const[0]], nd_name_len[vb_const[0]])
+    greg: uint32 = ra_reg_for_name(nd_name_off[vb_const[1]], nd_name_len[vb_const[1]])
+    xreg: uint32 = ra_reg_for_name(nd_name_off[vb_const[2]], nd_name_len[vb_const[2]])
+    areg: uint32 = ra_reg_for_name(nd_name_off[ia_node], nd_name_len[ia_node])
+    coff: int32 = 0
+    noff: int32 = 0
+    poff: int32 = 0
+    rroff: int32 = 0
+    groff: int32 = 0
+    xroff: int32 = 0
+    aoff: int32 = 0
+    if lookup_local(nd_name_off[citer], nd_name_len[citer], &coff) == 0:
+        return 0
+    if lookup_local(nd_name_off[cbnd], nd_name_len[cbnd], &noff) == 0:
+        return 0
+    if lookup_local(nd_name_off[ptr_base], nd_name_len[ptr_base], &poff) == 0:
+        return 0
+    if lookup_local(nd_name_off[vb_const[0]], nd_name_len[vb_const[0]], &rroff) == 0:
+        return 0
+    if lookup_local(nd_name_off[vb_const[1]], nd_name_len[vb_const[1]], &groff) == 0:
+        return 0
+    if lookup_local(nd_name_off[vb_const[2]], nd_name_len[vb_const[2]], &xroff) == 0:
+        return 0
+    if lookup_local(nd_name_off[ia_node], nd_name_len[ia_node], &aoff) == 0:
+        return 0
+    vec_emit_blend_loop(creg, coff, nreg, noff, preg, poff,
+                        rreg, rroff, greg, groff, xreg, xroff, areg, aoff)
+    opt_vec_count = opt_vec_count + 1
+    return 1
+
+
+# AUTO-VECTORIZER emit: the SSE2 packed source-over blend loop. Builds four
+# invariant xmm constants in a preamble (xmm7=0, xmm2=ia bcast, xmm4=0x8081
+# bcast, xmm3=[rav,gav,bav,0]x2 src const, xmm6=alpha 0xFF mask), then loops
+# blending 16 bytes (4 ARGB pixels) per iter while counter+4<=bound, advancing
+# the pointer home by 16 and the counter home by 4. Uses only %rax/%rcx and
+# xmm0-7 scratch (disjoint from the rbx/r12-r15 & xmm8-15 promotion pools). On
+# exit the counter/pointer homes hold the post-bulk values; the caller's scalar
+# loop drains the 0..3-pixel remainder byte-identically.
+def vec_emit_blend_loop(creg: uint32, coff: int32, nreg: uint32, noff: int32,
+                        preg: uint32, poff: int32,
+                        rreg: uint32, rroff: int32, greg: uint32, groff: int32,
+                        xreg: uint32, xroff: int32, areg: uint32, aoff: int32):
+    # --- preamble: invariant vector constants ---
+    emit_b(0x66)                          # pxor %xmm7,%xmm7   (zero for unpack)
+    emit_b(0x0F)
+    emit_b(0xEF)
+    emit_b(0xFF)
+    vec_read_to_rax(areg, aoff)           # ia -> %eax
+    emit_b(0x66)                          # movd %eax,%xmm2
+    emit_b(0x0F)
+    emit_b(0x6E)
+    emit_b(0xD0)
+    emit_b(0xF2)                          # pshuflw $0,%xmm2,%xmm2
+    emit_b(0x0F)
+    emit_b(0x70)
+    emit_b(0xD2)
+    emit_b(0x00)
+    emit_b(0x66)                          # pshufd $0,%xmm2,%xmm2  (ia -> all 8 words)
+    emit_b(0x0F)
+    emit_b(0x70)
+    emit_b(0xD2)
+    emit_b(0x00)
+    emit_mov_imm_rax(cast[uint64](0x8081))   # /255 magic -> %eax
+    emit_b(0x66)                          # movd %eax,%xmm4
+    emit_b(0x0F)
+    emit_b(0x6E)
+    emit_b(0xE0)
+    emit_b(0xF2)                          # pshuflw $0,%xmm4,%xmm4
+    emit_b(0x0F)
+    emit_b(0x70)
+    emit_b(0xE4)
+    emit_b(0x00)
+    emit_b(0x66)                          # pshufd $0,%xmm4,%xmm4  (0x8081 -> all words)
+    emit_b(0x0F)
+    emit_b(0x70)
+    emit_b(0xE4)
+    emit_b(0x00)
+    vec_read_to_rax(rreg, rroff)          # rav -> %eax
+    emit_b(0x66)                          # pinsrw $0,%eax,%xmm3
+    emit_b(0x0F)
+    emit_b(0xC4)
+    emit_b(0xD8)
+    emit_b(0x00)
+    vec_read_to_rax(greg, groff)          # gav -> %eax
+    emit_b(0x66)                          # pinsrw $1,%eax,%xmm3
+    emit_b(0x0F)
+    emit_b(0xC4)
+    emit_b(0xD8)
+    emit_b(0x01)
+    vec_read_to_rax(xreg, xroff)          # bav -> %eax
+    emit_b(0x66)                          # pinsrw $2,%eax,%xmm3
+    emit_b(0x0F)
+    emit_b(0xC4)
+    emit_b(0xD8)
+    emit_b(0x02)
+    emit_xor_eax_eax()                    # 0 -> alpha src lane
+    emit_b(0x66)                          # pinsrw $3,%eax,%xmm3
+    emit_b(0x0F)
+    emit_b(0xC4)
+    emit_b(0xD8)
+    emit_b(0x03)
+    emit_b(0x66)                          # pshufd $0x44,%xmm3,%xmm3  (dup low 4 words)
+    emit_b(0x0F)
+    emit_b(0x70)
+    emit_b(0xDB)
+    emit_b(0x44)
+    emit_b(0x66)                          # pxor %xmm6,%xmm6
+    emit_b(0x0F)
+    emit_b(0xEF)
+    emit_b(0xF6)
+    emit_mov_imm_rax(cast[uint64](0xFF00))   # 0xFF in the high byte of a word
+    emit_b(0x66)                          # pinsrw $1,%eax,%xmm6
+    emit_b(0x0F)
+    emit_b(0xC4)
+    emit_b(0xF0)
+    emit_b(0x01)
+    emit_b(0x66)                          # pinsrw $3,%eax,%xmm6
+    emit_b(0x0F)
+    emit_b(0xC4)
+    emit_b(0xF0)
+    emit_b(0x03)
+    emit_b(0x66)                          # pshufd $0x44,%xmm6,%xmm6 (alpha mask x4)
+    emit_b(0x0F)
+    emit_b(0x70)
+    emit_b(0xF6)
+    emit_b(0x44)
+    # --- guard: continue while counter + 4 <= bound ---
+    vtop: uint32 = code_len
+    vec_read_to_rax(nreg, noff)           # %rax = bound
+    emit_mov_rax_rcx()                    # %rcx = bound
+    vec_read_to_rax(creg, coff)           # %rax = counter
+    emit_add_imm_rax(cast[uint32](4))     # counter + 4
+    emit_cmp_rcx_rax()                    # rax - rcx
+    exit_fix: uint32 = emit_jcc_fwd(cast[uint32](0x8F))   # jg vend (signed)
+    # --- blend 4 pixels ---
+    vec_read_to_rax(preg, poff)           # %rax = pointer
+    emit_b(0xF3)                          # movdqu (%rax),%xmm0
+    emit_b(0x0F)
+    emit_b(0x6F)
+    emit_b(0x00)
+    emit_b(0x66)                          # movdqa %xmm0,%xmm1
+    emit_b(0x0F)
+    emit_b(0x6F)
+    emit_b(0xC8)
+    emit_b(0x66)                          # punpcklbw %xmm7,%xmm0  (pixels 0,1 -> words)
+    emit_b(0x0F)
+    emit_b(0x60)
+    emit_b(0xC7)
+    emit_b(0x66)                          # punpckhbw %xmm7,%xmm1  (pixels 2,3 -> words)
+    emit_b(0x0F)
+    emit_b(0x68)
+    emit_b(0xCF)
+    emit_b(0x66)                          # pmullw %xmm2,%xmm0   (dst * ia)
+    emit_b(0x0F)
+    emit_b(0xD5)
+    emit_b(0xC2)
+    emit_b(0x66)                          # pmullw %xmm2,%xmm1
+    emit_b(0x0F)
+    emit_b(0xD5)
+    emit_b(0xCA)
+    emit_b(0x66)                          # paddw %xmm3,%xmm0    (+ src*a const)
+    emit_b(0x0F)
+    emit_b(0xFD)
+    emit_b(0xC3)
+    emit_b(0x66)                          # paddw %xmm3,%xmm1
+    emit_b(0x0F)
+    emit_b(0xFD)
+    emit_b(0xCB)
+    emit_b(0x66)                          # pmulhuw %xmm4,%xmm0  (n*0x8081)>>16
+    emit_b(0x0F)
+    emit_b(0xE4)
+    emit_b(0xC4)
+    emit_b(0x66)                          # pmulhuw %xmm4,%xmm1
+    emit_b(0x0F)
+    emit_b(0xE4)
+    emit_b(0xCC)
+    emit_b(0x66)                          # psrlw $7,%xmm0   (>>23 total = /255; /2 = D0)
+    emit_b(0x0F)
+    emit_b(0x71)
+    emit_b(0xD0)
+    emit_b(0x07)
+    emit_b(0x66)                          # psrlw $7,%xmm1
+    emit_b(0x0F)
+    emit_b(0x71)
+    emit_b(0xD1)
+    emit_b(0x07)
+    emit_b(0x66)                          # packuswb %xmm1,%xmm0  (4 pixels -> 16 bytes)
+    emit_b(0x0F)
+    emit_b(0x67)
+    emit_b(0xC1)
+    emit_b(0x66)                          # por %xmm6,%xmm0   (alpha bytes -> 0xFF)
+    emit_b(0x0F)
+    emit_b(0xEB)
+    emit_b(0xC6)
+    emit_b(0xF3)                          # movdqu %xmm0,(%rax)   (%rax still = pointer)
+    emit_b(0x0F)
+    emit_b(0x7F)
+    emit_b(0x00)
+    emit_add_imm_rax(cast[uint32](16))    # pointer += 16
+    vec_write_from_rax(preg, poff)
+    vec_read_to_rax(creg, coff)
+    emit_add_imm_rax(cast[uint32](4))     # counter += 4
+    vec_write_from_rax(creg, coff)
+    emit_jmp_back(vtop)
+    patch_rel32(exit_fix, code_len)       # vend:
+
+
 def gen_while(node: uint32):
     # AUTO-VECTORIZER (--opt): if this is the vk_2d opaque word-fill inner loop,
     # emit an SSE2 packed-store preamble that does the bulk of the fill 4 pixels
     # at a time; the scalar loop below then drains the <4-element remainder. OFF
     # (vec_is_enabled()==0) -> nothing emitted, byte-identical to the seed.
-    try_vectorize_fill(node)
+    # The opaque word-fill and translucent source-over blend shapes are mutually
+    # exclusive (3- vs 9-statement bodies), so try the blend only if fill missed.
+    if try_vectorize_fill(node) == 0:
+        try_vectorize_blend(node)
     # P1 Phase 2: hoist loop-invariant global-array bases into held caller-saved
     # registers in the PREHEADER (before the loop-top label, so they run once and
     # the back-edge / `continue` skip them). Only for a call-free body. hb_saved
