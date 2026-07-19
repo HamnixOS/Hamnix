@@ -907,6 +907,24 @@ def _files_hamwrite() -> list[tuple[Path, str]]:
     # live /etc/hamde/apps ONLY when this package is installed.
     f.append((ETC_DIR / "hamde" / "apps-optional" / "hamwrite.desktop",
               "etc/hamde/apps/hamwrite.desktop"))
+# ---- hamnix-hamangrybirds — repo-ONLY, NOT-preinstalled game --------------
+# Follows the hamnix-hamaudiobook pattern exactly: BUILT + published in the main
+# channel (installable via `hpm install hamnix-hamangrybirds` or the Software
+# app), but NOT named by any metapackage's depends AND excluded from the
+# hamnix-base closure below, so it never lands in the pre-installed base image.
+# Its .desktop lives in etc/hamde/apps-optional/ and is staged into the live
+# /etc/hamde/apps ONLY when this package is installed (the base
+# hamnix-desktop-config package globs etc/hamde/apps wholesale, so keeping the
+# launcher OUT of apps/ until install is what keeps it off a bare desktop).
+
+HAMANGRYBIRDS_PKG = "hamnix-hamangrybirds"
+
+
+def _files_hamangrybirds() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hamangrybirds")
+    f.append((ETC_DIR / "hamde" / "apps-optional" / "hamangrybirds.desktop",
+              "etc/hamde/apps/hamangrybirds.desktop"))
     return f
 
 
@@ -1117,6 +1135,23 @@ PACKAGE_SPECS.append({
     "target": "#hamnix-system",
 })
 
+# The repo-ONLY Angry-Birds-style slingshot physics game. Same repo-only shape
+# as hamnix-hamaudiobook: BUILT + published in the main channel but NOT named by
+# any metapackage's depends AND excluded from the hamnix-base closure below, so
+# it ships ONLY via 255.one / `hpm install`. Depends just the compositor so the
+# window opens on a bare base.
+PACKAGE_SPECS.append({
+    "name": HAMANGRYBIRDS_PKG,
+    "files_fn": _files_hamangrybirds,
+    "depends": [f"hamnix-desktop-core>={PKG_VERSION}"],
+    "description": ("Ham Angry Birds — slingshot physics game: gravity-arc "
+                    "projectile, destructible wood/stone towers + pig "
+                    "targets, aim by keys or on-screen controls, score, 3 "
+                    "levels, win/lose/restart. Repo-only: install from "
+                    "255.one, not pre-installed."),
+    "target": "#hamnix-system",
+})
+
 
 # The repo-ONLY office word processor. Same pattern as the audiobook app: built
 # + published in the main channel but kept out of the hamnix-base closure below,
@@ -1251,6 +1286,8 @@ def build_hamnix_base() -> dict:
     leaf_names.add(HAMAUDIOBOOK_PKG)
     # The repo-only office word processor is likewise NOT pre-installed.
     leaf_names.add(HAMWRITE_PKG)
+    # Likewise the repo-only Angry Birds game — 255.one / `hpm install` only.
+    leaf_names.add(HAMANGRYBIRDS_PKG)
     depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS
                if s["name"] not in leaf_names]
     depends.append(f"hamnix-bootloader>={PKG_VERSION}")
