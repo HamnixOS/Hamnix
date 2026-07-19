@@ -79,7 +79,7 @@ assert_grep '^CANVAS [0-9]{3,} [0-9]{3,}'   "pixel canvas WxN with a tall page"
 # PIXEL BOX MODEL, scalable faces: row 0 is the <h1> at 32px bold (38px line box)
 # — physically TALLER than the 16px body rows (19px line box) stacked below it.
 assert_grep '^ROW 0 top 12 h 38 base 42'  "h1 row is 38px tall (32px bold TrueType)"
-assert_grep '^ROW 1 top 56 h 19 base 71'  "body row is 19px tall (16px TrueType), below h1"
+assert_grep '^ROW 1 top 50 h 19 base 65'  "body row is 19px tall (16px TrueType), below h1 (flush at h1 bottom after ROW_LEAD removed for correct 19px line-height:normal pitch; UA h1 bottom-margin is a separate follow-up)"
 
 # PROPORTIONAL TEXT (BDF store): a narrow run (iiii) is NARROWER than a wide run
 # (WWWW) in the sans face; in mono they are EQUAL. Impossible on a fixed grid.
