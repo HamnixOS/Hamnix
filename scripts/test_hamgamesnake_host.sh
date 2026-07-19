@@ -198,6 +198,36 @@ gtf() {  # gtf <fieldA> <fieldB> <label>: assert A > B numerically
     fi
 }
 
+# --- CONSTANT-COST RENDERING: the per-step repaint does NOT grow with length --
+# The original port shifted the whole body + redrew every cell each step (O(N)),
+# so the framerate sagged the more food you collected. Now a step repaints only a
+# BOUNDED handful of cells (new head, ex-head, vacated tail, +new food on an eat)
+# no matter how long the snake is. The harness grows the snake ~5x with a
+# deterministic controller and asserts the per-step dirty-cell count is IDENTICAL
+# at length 3 and at the long length, and stayed bounded the whole way.
+DS=$(kv DCELLS_SHORT); DL=$(kv DCELLS_LONG); DM=$(kv DCELLS_MAX); LL=$(kv LEN_LONG)
+if [ -n "$LL" ] && [ "$LL" -ge 10 ]; then
+    echo "[snake-host] PASS snake grew to a long body for the perf test (LEN_LONG=$LL)"
+else
+    echo "[snake-host] FAIL snake did not grow long enough to test scaling (LEN_LONG=$LL)"; fail=1
+fi
+if [ -n "$DS" ] && [ -n "$DL" ] && [ "$DS" = "$DL" ]; then
+    echo "[snake-host] PASS per-step repaint cost is CONSTANT as the snake grows (len3=$DS == len$LL=$DL cells)"
+else
+    echo "[snake-host] FAIL per-step repaint cost changed with length (short=$DS long=$DL)"; fail=1
+fi
+if [ -n "$DM" ] && [ "$DM" -ge 1 ] && [ "$DM" -le 4 ]; then
+    echo "[snake-host] PASS worst per-step dirty-cell count stayed bounded across the whole growth run (DCELLS_MAX=$DM)"
+else
+    echo "[snake-host] FAIL per-step dirty-cell count was unbounded (DCELLS_MAX=$DM, want 1..4)"; fail=1
+fi
+assert_eq INCR_MATCHES_FULL 1 "incremental damage repaint is pixel-identical to a full redraw"
+
+# --- SOUND SURVIVES A LONG GAME (no per-beep clip leak) ---------------------
+assert_eq MANY_VOICES 1   "a tone still sounds after 30 prior events (no clip-table exhaustion)"
+assert_eq MANY_FREQ   520 "the surviving late-game tone is the turn pitch"
+gt0 MANY_PEAK "late-game tone PCM is non-silent (reusable clips, not a dead mixer)"
+
 gt0 TURN_PEAK "turn tone PCM is non-silent (mixer produced samples)"
 gt0 EAT_PEAK  "eat tone PCM is non-silent (mixer produced samples)"
 gt0 OVER_PEAK "game-over tone PCM is non-silent (mixer produced samples)"
