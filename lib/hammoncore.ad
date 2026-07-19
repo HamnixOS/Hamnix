@@ -1,21 +1,29 @@
 # lib/hammoncore.ad — PURE, extern-free core for the scene-DE System Monitor
-# (user/hammonscene.ad). It owns the live MODEL (uptime / memory / process
-# rows), the client-area SIZE, and all LAYOUT + rendering. It imports only the
-# target-agnostic lib/hamscene.ad primitives, so the very same code renders
-# through the compositor (the native app) AND through lib/hamui_host.ad (the
-# host render-to-PNG gate) — see scripts/test_hammon_resize_host.sh.
+# (user/hammonscene.ad). It owns the live MODEL (CPU total + per-core history,
+# memory history, uptime, process rows), the client-area SIZE, and all LAYOUT +
+# rendering. It imports only the target-agnostic lib/hamscene.ad primitives, so
+# the very same code renders through the compositor (the native app) AND through
+# lib/hamui_host.ad (the host render-to-PNG gate).
+#
+# MATE / Windows-Task-Manager parity (2026-07 rework):
+#   * CPU % GRAPH OVER TIME — a scrolling history plot with a per-core polyline
+#     plus a bold TOTAL line, driven from /dev/stat user/system/idle deltas.
+#   * MEMORY % GRAPH OVER TIME — a scrolling filled-area history plot, from
+#     /proc/meminfo MemTotal/MemFree deltas.
+#   * PROCESS LIST — PID / CPU% / COMMAND columns, one row per /proc/tasks
+#     entry, CPU% deltaed from the new UTIME/STIME columns.
 #
 # The driver (user/hammonscene.ad on the device; the host harness on the dev
-# box) is responsible ONLY for feeding the model (via the hammon_set_* setters)
-# and committing/rasterizing the scene this module builds.
+# box) feeds the model via the hammon_* setters and commits/rasterizes the
+# scene this module builds.
 #
 # RESIZE: hammon_resize_line() parses the compositor's "r <w> <h>" event and
 # updates the live WIN_W/WIN_H so hammon_build_scene() fills the WHOLE client
-# rect at any size (no black gutter). This mirrors hamctl_resize_line /
-# hamcalc_resize_line so every scene app shares one resize idiom.
+# rect at any size (no black gutter) — see scripts/test_hammon_resize_host.sh.
 
 from lib.hamscene import hamscene_begin, hamscene_fill, \
-    hamscene_glyphs, hamscene_hbar, hamscene_headerbar
+    hamscene_glyphs, hamscene_hbar, hamscene_headerbar, hamscene_line, \
+    hamscene_stroke
 
 
 # ---- small integer -> decimal helper (extern-free) ----------------------
@@ -39,14 +47,58 @@ def _hm_u64_to_dec(v: uint64, out: Ptr[uint8]) -> uint64:
 
 
 # ====================================================================
-# MODEL (fed by the driver via the setters below)
+# HISTORY RING BUFFERS
+# ====================================================================
+# HIST samples of history per series (newest at the highest live index). The
+# ring "scrolls" by shifting left once it is full, so the plot walks leftward as
+# fresh samples arrive — the classic MATE / Task-Manager look. Bounded small so
+# the whole scene (per-core polylines + memory columns) fits hamscene's 16 KB
+# display-list buffer.
+HIST:   uint64 = 48
+NCORES: uint64 = 8                       # stored cores (render caps to 4)
+
+cpu_hist:  Array[48, uint8]              # total CPU% history
+cpu_n:     uint64 = 0
+cpu_cur:   int32 = 0
+
+core_hist: Array[384, uint8]             # NCORES * HIST, per-core CPU% history
+core_n:    Array[8, uint64]
+core_cur:  Array[8, int32]
+core_count: uint64 = 1
+
+mem_hist:  Array[48, uint8]              # memory-used% history
+mem_n:     uint64 = 0
+
+
+def _ring_push(ring: Ptr[uint8], np: Ptr[uint64], v: uint8):
+    n: uint64 = np[0]
+    if n < HIST:
+        ring[n] = v
+        np[0] = n + 1
+        return
+    i: uint64 = 0
+    while i + 1 < HIST:
+        ring[i] = ring[i + 1]
+        i = i + 1
+    ring[HIST - 1] = v
+
+
+def _clamp_pct(p: int32) -> uint8:
+    if p < 0:
+        return 0
+    if p > 100:
+        return 100
+    return cast[uint8](p)
+
+
+# ====================================================================
+# MODEL SETTERS (fed by the driver)
 # ====================================================================
 up_h: uint64 = 0
 up_m: uint64 = 0
 up_s: uint64 = 0
 
 
-# Set the uptime from a whole-second count (the driver parses /proc/uptime).
 def hammon_set_uptime(secs: uint64):
     up_h = secs / 3600
     up_m = (secs % 3600) / 60
@@ -57,32 +109,77 @@ mem_total: uint64 = 0
 mem_used: uint64 = 0
 
 
-# Set the memory model (kB). `used` is clamped to `total`.
+# Set the memory model (kB) AND push the used% into the history ring. `used`
+# is clamped to `total`.
 def hammon_set_mem(total: uint64, used: uint64):
     mem_total = total
     if used > total:
         used = total
     mem_used = used
+    pct: int32 = 0
+    if total > 0:
+        pct = cast[int32]((used * 100) / total)
+    v: uint8 = _clamp_pct(pct)
+    _ring_push(&mem_hist[0], &mem_n, v)
 
 
-# Process list: up to MAX_ROWS "<pid> <state> <comm>" rows.
-MAX_ROWS: uint64 = 14
-ROW_CAP: uint64 = 40
-rows: Array[560, uint8]                 # MAX_ROWS * ROW_CAP
-n_rows: uint64 = 0
+# Set the number of live CPU cores the driver will report (clamped 1..NCORES).
+def hammon_set_ncores(n: uint64):
+    if n < 1:
+        n = 1
+    if n > NCORES:
+        n = NCORES
+    core_count = n
+
+
+# Push a fresh TOTAL CPU% sample (0..100).
+def hammon_set_cpu_total(pct: int32):
+    cpu_cur = pct
+    if cpu_cur < 0:
+        cpu_cur = 0
+    if cpu_cur > 100:
+        cpu_cur = 100
+    _ring_push(&cpu_hist[0], &cpu_n, _clamp_pct(pct))
+
+
+# Push a fresh per-core CPU% sample for core `c` (0-based).
+def hammon_set_core(c: uint64, pct: int32):
+    if c >= NCORES:
+        return
+    cc: int32 = pct
+    if cc < 0:
+        cc = 0
+    if cc > 100:
+        cc = 100
+    core_cur[c] = cc
+    base: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&core_hist[0]) + c * HIST)
+    _ring_push(base, &core_n[c], _clamp_pct(pct))
+
+
+# ====================================================================
+# PROCESS LIST
+# ====================================================================
+# Up to MAX_ROWS rows. A row is EITHER a verbatim preformatted line (legacy
+# hammon_task_add path, used by the resize gate) OR a structured PID/CPU%/COMM
+# row (hammon_proc_add, used by the live driver).
+MAX_ROWS: uint64 = 24
+ROW_CAP:  uint64 = 40
+rows:     Array[960, uint8]              # MAX_ROWS * ROW_CAP (comm/verbatim text)
+n_rows:   uint64 = 0
+pr_pid:   Array[24, uint64]
+pr_cpu:   Array[24, int32]               # -1 == unknown (verbatim row)
 
 
 def row_ptr(i: uint64) -> Ptr[uint8]:
     return cast[Ptr[uint8]](cast[uint64](&rows[0]) + i * ROW_CAP)
 
 
-# Reset the process list before the driver re-adds rows.
 def hammon_tasks_clear():
     n_rows = 0
 
 
-# Append one already-formatted "pid state comm" line (verbatim, tab->space,
-# truncated to ROW_CAP-1). Ignored once MAX_ROWS is reached.
+# Append one already-formatted "pid state comm" line verbatim (tab->space,
+# truncated to ROW_CAP-1). CPU% shows as "-". Kept for the resize host gate.
 def hammon_task_add(s: Ptr[uint8], len: uint64):
     if n_rows >= MAX_ROWS:
         return
@@ -93,11 +190,34 @@ def hammon_task_add(s: Ptr[uint8], len: uint64):
     k: uint64 = 0
     while k < ln:
         c: uint8 = s[k]
-        if c == 9:                                       # tab -> space
+        if c == 9:
             c = 32
         dp[k] = c
         k = k + 1
     dp[ln] = 0
+    pr_pid[n_rows] = 0
+    pr_cpu[n_rows] = -1
+    n_rows = n_rows + 1
+
+
+# Append a STRUCTURED process row: pid, comm text, cpu% (0..100). Used by the
+# live driver so the table shows a real per-process CPU% column.
+def hammon_proc_add(pid: uint64, comm: Ptr[uint8], cpu_pct: int32):
+    if n_rows >= MAX_ROWS:
+        return
+    dp: Ptr[uint8] = row_ptr(n_rows)
+    k: uint64 = 0
+    while comm[k] != 0 and k < ROW_CAP - 1:
+        dp[k] = comm[k]
+        k = k + 1
+    dp[k] = 0
+    pr_pid[n_rows] = pid
+    cc: int32 = cpu_pct
+    if cc < 0:
+        cc = 0
+    if cc > 100:
+        cc = 100
+    pr_cpu[n_rows] = cc
     n_rows = n_rows + 1
 
 
@@ -105,11 +225,9 @@ def hammon_task_add(s: Ptr[uint8], len: uint64):
 # CLIENT-AREA SIZE + RESIZE
 # ====================================================================
 WIN_W: int32 = 360
-WIN_H: int32 = 420
+WIN_H: int32 = 460
 
 
-# PUBLIC: current client width/height (so the driver can seed the initial
-# window geometry from the toolkit default).
 def hammon_win_w() -> int32:
     return WIN_W
 
@@ -118,7 +236,14 @@ def hammon_win_h() -> int32:
     return WIN_H
 
 
-# PUBLIC: set the live client size. Returns 1 if it actually changed.
+def hammon_cpu_total() -> int32:
+    return cpu_cur
+
+
+def hammon_core_count() -> uint64:
+    return core_count
+
+
 def hammon_set_win_size(w: int32, h: int32) -> int32:
     if w <= 0 or h <= 0:
         return 0
@@ -129,8 +254,6 @@ def hammon_set_win_size(w: int32, h: int32) -> int32:
     return 1
 
 
-# PUBLIC: parse an "r <w> <h>" resize line and apply it. Returns 1 if the size
-# changed (mirrors hamctl_resize_line / hamcalc_resize_line).
 def hammon_resize_line(s: Ptr[uint8], n: uint64) -> int32:
     if n < 1 or s[0] != 114:                             # 'r'
         return 0
@@ -157,8 +280,100 @@ def hammon_resize_line(s: Ptr[uint8], n: uint64) -> int32:
 
 
 # ====================================================================
-# LAYOUT + RENDER — builds the display list into lib/hamscene.ad's shared
-# buffer. The driver either commits it (native) or rasterizes it (host).
+# RENDER HELPERS
+# ====================================================================
+# Per-core polyline palette (index 0..3 rendered; extras fold onto the last).
+def _core_color(c: uint64) -> Ptr[uint8]:
+    if c == 0:
+        return cast[Ptr[uint8]]("#57bb6e")               # green
+    if c == 1:
+        return cast[Ptr[uint8]]("#5b8def")               # blue
+    if c == 2:
+        return cast[Ptr[uint8]]("#e0a030")               # amber
+    return cast[Ptr[uint8]]("#c060d0")                   # violet
+
+
+# Map a sample value 0..100 to a Y inside [gy, gy+gh).
+def _val_y(gy: int32, gh: int32, v: uint8) -> int32:
+    return gy + gh - 1 - cast[int32]((cast[uint64](v) * cast[uint64](gh - 1)) / 100)
+
+
+# Map ring index i (of n live) across the graph width.
+def _idx_x(gx: int32, gw: int32, i: uint64, n: uint64) -> int32:
+    if n <= 1:
+        return gx
+    return gx + cast[int32]((cast[uint64](gw - 1) * i) / (n - 1))
+
+
+# Draw a graph frame + 25/50/75% gridlines into [gx,gy,gw,gh].
+def _graph_frame(gx: int32, gy: int32, gw: int32, gh: int32):
+    hamscene_fill(gx, gy, gw, gh, cast[Ptr[uint8]]("#12151b"))
+    g: int32 = 1
+    while g < 4:
+        ly: int32 = gy + (gh * g) / 4
+        hamscene_fill(gx, ly, gw, 1, cast[Ptr[uint8]]("#262c36"))
+        g = g + 1
+    hamscene_stroke(gx, gy, gw, gh, 1, cast[Ptr[uint8]]("#404850"))
+
+
+# Plot a ring as a polyline.
+def _plot_ring(ring: Ptr[uint8], n: uint64, gx: int32, gy: int32, gw: int32,
+               gh: int32, thick: int32, color: Ptr[uint8]):
+    if n == 0:
+        return
+    if n == 1:
+        y: int32 = _val_y(gy, gh, ring[0])
+        hamscene_fill(gx, y, 2, 2, color)
+        return
+    i: uint64 = 1
+    px: int32 = _idx_x(gx, gw, 0, n)
+    py: int32 = _val_y(gy, gh, ring[0])
+    while i < n:
+        cx: int32 = _idx_x(gx, gw, i, n)
+        cy: int32 = _val_y(gy, gh, ring[i])
+        hamscene_line(px, py, cx, cy, thick, color)
+        px = cx
+        py = cy
+        i = i + 1
+
+
+# Plot a ring as filled vertical columns (area chart) — used for memory.
+def _area_ring(ring: Ptr[uint8], n: uint64, gx: int32, gy: int32, gw: int32,
+               gh: int32, color: Ptr[uint8]):
+    if n == 0:
+        return
+    colw: int32 = cast[int32](cast[uint64](gw) / HIST)
+    if colw < 1:
+        colw = 1
+    i: uint64 = 0
+    while i < n:
+        v: uint8 = ring[i]
+        bh: int32 = cast[int32]((cast[uint64](v) * cast[uint64](gh - 1)) / 100)
+        cx: int32 = gx + cast[int32]((cast[uint64](gw - colw) * i) / HIST)
+        hamscene_fill(cx, gy + gh - bh, colw, bh, color)
+        i = i + 1
+
+
+# Append "<label> <pct>%" to a scratch buffer; return NUL-terminated ptr length.
+def _label_pct(out: Ptr[uint8], label: Ptr[uint8], pct: int32) -> uint64:
+    p: uint64 = 0
+    k: uint64 = 0
+    while label[k] != 0:
+        out[p] = label[k]
+        p = p + 1
+        k = k + 1
+    pv: int32 = pct
+    if pv < 0:
+        pv = 0
+    p = p + _hm_u64_to_dec(cast[uint64](pv), &out[p])
+    out[p] = 37                                          # '%'
+    p = p + 1
+    out[p] = 0
+    return p
+
+
+# ====================================================================
+# LAYOUT + RENDER
 # ====================================================================
 def hammon_build_scene():
     hamscene_begin()
@@ -167,8 +382,8 @@ def hammon_build_scene():
     hamscene_glyphs(10, 8, cast[Ptr[uint8]]("System Monitor"),
                     cast[Ptr[uint8]]("#ffffff"))
 
-    # Uptime line.
-    ut: Array[40, uint8]
+    # Uptime line (top-right of the header row area).
+    ut: Array[48, uint8]
     p: uint64 = 0
     pre: Ptr[uint8] = cast[Ptr[uint8]]("Uptime ")
     k: uint64 = 0
@@ -190,35 +405,140 @@ def hammon_build_scene():
         p = p + 1
     p = p + _hm_u64_to_dec(up_s, &ut[p])
     ut[p] = 0
-    hamscene_glyphs(10, 36, &ut[0], cast[Ptr[uint8]]("#c0d0e0"))
+    hamscene_glyphs(10, 34, &ut[0], cast[Ptr[uint8]]("#90a0b0"))
 
-    # Memory bar + label.
-    hamscene_glyphs(10, 56, cast[Ptr[uint8]]("Memory"),
-                    cast[Ptr[uint8]]("#c0d0e0"))
+    gx: int32 = 10
+    gw: int32 = WIN_W - 20
+    if gw < 40:
+        gw = 40
+
+    # ---- CPU section ------------------------------------------------
+    scr: Array[64, uint8]
+    _label_pct(&scr[0], cast[Ptr[uint8]]("CPU  "), cpu_cur)
+    hamscene_glyphs(gx, 48, &scr[0], cast[Ptr[uint8]]("#c0d0e0"))
+
+    cpu_gy: int32 = 62
+    cpu_gh: int32 = 84
+    if WIN_H < 360:
+        cpu_gh = 56
+    _graph_frame(gx, cpu_gy, gw, cpu_gh)
+    # Per-core polylines (cap render to 4), then the bold TOTAL line on top.
+    rc: uint64 = core_count
+    if rc > 4:
+        rc = 4
+    c: uint64 = 0
+    while c < rc:
+        cbase: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&core_hist[0]) + c * HIST)
+        _plot_ring(cbase, core_n[c], gx + 1, cpu_gy + 1, gw - 2, cpu_gh - 2,
+                   1, _core_color(c))
+        c = c + 1
+    _plot_ring(&cpu_hist[0], cpu_n, gx + 1, cpu_gy + 1, gw - 2, cpu_gh - 2,
+               2, cast[Ptr[uint8]]("#ffffff"))
+
+    # Per-core legend line under the graph.
+    leg_y: int32 = cpu_gy + cpu_gh + 3
+    lx: int32 = gx
+    c = 0
+    while c < rc:
+        ls: Array[24, uint8]
+        lp: uint64 = 0
+        ls[lp] = 99                                       # 'c'
+        lp = lp + 1
+        lp = lp + _hm_u64_to_dec(c, &ls[lp])
+        ls[lp] = 32
+        lp = lp + 1
+        cv: int32 = core_cur[c]
+        if cv < 0:
+            cv = 0
+        lp = lp + _hm_u64_to_dec(cast[uint64](cv), &ls[lp])
+        ls[lp] = 37                                       # '%'
+        lp = lp + 1
+        ls[lp] = 0
+        hamscene_glyphs(lx, leg_y, &ls[0], _core_color(c))
+        lx = lx + 8 * cast[int32](lp) + 10
+        c = c + 1
+
+    # ---- Memory section --------------------------------------------
+    mem_lab_y: int32 = leg_y + 16
     pct: int32 = 0
     if mem_total > 0:
         pct = cast[int32]((mem_used * 100) / mem_total)
-    hamscene_hbar(70, 54, WIN_W - 80, 12, pct, cast[Ptr[uint8]]("#4080e0"))
-    ml: Array[48, uint8]
+    ml: Array[64, uint8]
     mp: uint64 = 0
+    mpre: Ptr[uint8] = cast[Ptr[uint8]]("Memory  ")
+    kk: uint64 = 0
+    while mpre[kk] != 0:
+        ml[mp] = mpre[kk]
+        mp = mp + 1
+        kk = kk + 1
     mp = mp + _hm_u64_to_dec(mem_used, &ml[mp])
     ml[mp] = 32
-    ml[mp+1] = 47                                         # '/'
-    ml[mp+2] = 32
+    ml[mp + 1] = 47                                       # '/'
+    ml[mp + 2] = 32
     mp = mp + 3
     mp = mp + _hm_u64_to_dec(mem_total, &ml[mp])
     ml[mp] = 32
-    ml[mp+1] = 107                                        # 'k'
-    ml[mp+2] = 66                                         # 'B'
-    ml[mp+3] = 0
-    hamscene_glyphs(70, 70, &ml[0], cast[Ptr[uint8]]("#90a0b0"))
+    ml[mp + 1] = 107                                      # 'k'
+    ml[mp + 2] = 66                                       # 'B'
+    ml[mp + 3] = 32
+    ml[mp + 4] = 40                                       # '('
+    mp = mp + 5
+    mp = mp + _hm_u64_to_dec(cast[uint64](pct), &ml[mp])
+    ml[mp] = 37                                           # '%'
+    ml[mp + 1] = 41                                       # ')'
+    ml[mp + 2] = 0
+    hamscene_glyphs(gx, mem_lab_y, &ml[0], cast[Ptr[uint8]]("#c0d0e0"))
 
-    # Process list header + rows.
-    hamscene_glyphs(10, 92, cast[Ptr[uint8]]("PID   STATE  COMMAND"),
+    mem_gy: int32 = mem_lab_y + 14
+    mem_gh: int32 = 46
+    if WIN_H < 360:
+        mem_gh = 30
+    _graph_frame(gx, mem_gy, gw, mem_gh)
+    _area_ring(&mem_hist[0], mem_n, gx + 1, mem_gy + 1, gw - 2, mem_gh - 2,
+               cast[Ptr[uint8]]("#5b8def"))
+
+    # ---- Process table ---------------------------------------------
+    hdr_y: int32 = mem_gy + mem_gh + 8
+    hamscene_glyphs(gx, hdr_y, cast[Ptr[uint8]]("PID    CPU%   COMMAND"),
                     cast[Ptr[uint8]]("#80d080"))
-    hamscene_fill(8, 104, WIN_W - 16, 1, cast[Ptr[uint8]]("#404850"))
+    hamscene_fill(gx - 2, hdr_y + 12, gw + 4, 1, cast[Ptr[uint8]]("#404850"))
+
+    row0_y: int32 = hdr_y + 18
+    avail: int32 = WIN_H - row0_y - 4
+    fit: uint64 = 0
+    if avail > 0:
+        fit = cast[uint64](avail / 14)
     i: uint64 = 0
-    while i < n_rows:
-        ry: int32 = 110 + cast[int32](i) * 14
-        hamscene_glyphs(10, ry, row_ptr(i), cast[Ptr[uint8]]("#d0d8e0"))
+    while i < n_rows and i < fit:
+        ry: int32 = row0_y + cast[int32](i) * 14
+        if pr_pid[i] == 0 and pr_cpu[i] < 0:
+            # Verbatim legacy row: draw the whole preformatted line.
+            hamscene_glyphs(gx, ry, row_ptr(i), cast[Ptr[uint8]]("#d0d8e0"))
+        else:
+            line: Array[64, uint8]
+            lp2: uint64 = 0
+            lp2 = lp2 + _hm_u64_to_dec(pr_pid[i], &line[lp2])
+            while lp2 < 7:
+                line[lp2] = 32
+                lp2 = lp2 + 1
+            cv2: int32 = pr_cpu[i]
+            if cv2 < 0:
+                cv2 = 0
+            lp2 = lp2 + _hm_u64_to_dec(cast[uint64](cv2), &line[lp2])
+            line[lp2] = 37                                # '%'
+            lp2 = lp2 + 1
+            while lp2 < 14:
+                line[lp2] = 32
+                lp2 = lp2 + 1
+            cp: Ptr[uint8] = row_ptr(i)
+            cj: uint64 = 0
+            while cp[cj] != 0 and lp2 < ROW_CAP + 20:
+                line[lp2] = cp[cj]
+                lp2 = lp2 + 1
+                cj = cj + 1
+            line[lp2] = 0
+            col: Ptr[uint8] = cast[Ptr[uint8]]("#d0d8e0")
+            if pr_cpu[i] >= 50:
+                col = cast[Ptr[uint8]]("#e0b060")        # hot process
+            hamscene_glyphs(gx, ry, &line[0], col)
         i = i + 1
