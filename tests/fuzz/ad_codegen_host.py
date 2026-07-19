@@ -209,7 +209,7 @@ def _hex_to_bytes(lines):
 
 def run_dump(src_path: Path, timeout=30, opt=False, split_break=False,
              alelide_break=False, rcxclean_break=False,
-             castcall_break=False, check_bounds=False) -> DumpResult:
+             castcall_break=False, check_bounds=False, no_vec=False) -> DumpResult:
     build_driver()
     rel = src_path
     # opt=True passes the dump driver's opt-in --opt flag, enabling the native
@@ -232,6 +232,8 @@ def run_dump(src_path: Path, timeout=30, opt=False, split_break=False,
         argv.append("--castcall-break")
     if check_bounds:
         argv.append("--check-bounds")
+    if no_vec:
+        argv.append("--no-vec")
     argv.append(str(rel))
     cp = subprocess.run(argv,
                         capture_output=True, text=True, timeout=timeout)
@@ -301,6 +303,7 @@ def run_dump(src_path: Path, timeout=30, opt=False, split_break=False,
                       strengthred=meta.get("STRENGTHRED", 0),
                       paritymod=meta.get("PARITYMOD", 0),
                       isel=meta.get("ISEL", 0),
+                      vec=meta.get("VEC", 0),
                       aluload=meta.get("ALULOAD", 0),
                       basehoist=meta.get("BASEHOIST", 0),
                       splithoist=meta.get("SPLITHOIST", 0),
@@ -689,6 +692,7 @@ class CodegenRun:
         self.strengthred = kw.get("strengthred", 0)
         self.paritymod = kw.get("paritymod", 0)
         self.isel = kw.get("isel", 0)
+        self.vec = kw.get("vec", 0)
         self.aluload = kw.get("aluload", 0)
         self.basehoist = kw.get("basehoist", 0)
         self.splithoist = kw.get("splithoist", 0)
@@ -709,7 +713,8 @@ class CodegenRun:
 
 def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
                            split_break=False, rcxclean_break=False,
-                           castcall_break=False, check_bounds=False):
+                           castcall_break=False, check_bounds=False,
+                           no_vec=False):
     work_dir.mkdir(parents=True, exist_ok=True)
     cg_body = codegen_compatible_source(body)
     src = work_dir / f"ad_{seed}.ad"
@@ -719,7 +724,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
         dump = run_dump(src, opt=opt, split_break=split_break,
                         rcxclean_break=rcxclean_break,
                         castcall_break=castcall_break,
-                        check_bounds=check_bounds)
+                        check_bounds=check_bounds, no_vec=no_vec)
     except subprocess.TimeoutExpired:
         return CodegenRun("drivererror", detail="dump driver timeout")
     if dump.status in ("cgfail", "parsefail", "readfail"):
@@ -762,6 +767,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
     strengthred = getattr(dump, "strengthred", 0)
     paritymod = getattr(dump, "paritymod", 0)
     isel = getattr(dump, "isel", 0)
+    vec = getattr(dump, "vec", 0)
     aluload = getattr(dump, "aluload", 0)
     basehoist = getattr(dump, "basehoist", 0)
     splithoist = getattr(dump, "splithoist", 0)
@@ -785,7 +791,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
                           irreassoc=irreassoc, iremitfloat=iremitfloat, ffold=ffold,
                           destsel=destsel, accsel=accsel, idxstore=idxstore,
                           idxsel=idxsel,
-                          strengthred=strengthred, paritymod=paritymod, isel=isel, aluload=aluload,
+                          strengthred=strengthred, paritymod=paritymod, isel=isel, vec=vec, aluload=aluload,
                           basehoist=basehoist,
                           ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, alelide=alelide, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, rcxclean=rcxclean, storeimm=storeimm, imulimm=imulimm, cmpjcc=cmpjcc)
     return CodegenRun("ok", stdout=out, exit=rp.returncode & 0xFF,
@@ -795,7 +801,7 @@ def run_through_codegen_ad(seed, body, work_dir: Path, keep=False, opt=False,
                       irfold=irfold, irreassoc=irreassoc, iremitfloat=iremitfloat,
                       destsel=destsel, accsel=accsel, idxstore=idxstore,
                       idxsel=idxsel, spineleaf=spineleaf,
-                      strengthred=strengthred, paritymod=paritymod, isel=isel, aluload=aluload,
+                      strengthred=strengthred, paritymod=paritymod, isel=isel, vec=vec, aluload=aluload,
                       basehoist=basehoist, splithoist=splithoist,
                       ivsr=ivsr, storeelim=storeelim, paramhome=paramhome, alelide=alelide, fpsel=fpsel, fpmov=fpmov, fpcmp=fpcmp, constif=constif, idxreg=idxreg, rcxclean=rcxclean, storeimm=storeimm, imulimm=imulimm, cmpjcc=cmpjcc)
 
