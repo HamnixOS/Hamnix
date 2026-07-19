@@ -61,6 +61,9 @@ from lib.hamui import (
 from lib.png import png_decode, png_width, png_height, png_rgba_ptr
 from lib.jpeg import jpeg_decode, jpeg_width, jpeg_height, jpeg_rgba_ptr
 from lib.chrometext import chrometext_draw_z
+from lib.imgscale import (
+    imgscale_fit_dims, imgscale_zoom_dims, imgscale_clamp_zoom, imgscale_blit
+)
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
@@ -73,11 +76,16 @@ extern def sys_yield() -> int32
 # ====================================================================
 # Caps (no malloc — every buffer is a fixed module global).
 # ====================================================================
-# Window content is 640x480. fb layers cap at 256x256 RGBA8888 in the
-# compositor, so we scale the source down to fit FB_MAX on its long edge.
-FB_MAX:      uint64 = 256
+# Window content is 640x480. The image is scaled+blitted DIRECTLY into the
+# v2 backbuffer (lib/imgscale nearest-neighbour), so there is no intermediate
+# fb-layer cap: the 100%-zoom "fit" size is the source scaled to fit the
+# content area between the chrome bars, and the scroll wheel scales that up/down.
 WIN_W:       int64  = 640
 WIN_H:       int64  = 480
+# Chrome bands: title bar (top) + status bar (bottom). The image lives in the
+# content area between them, centred.
+BAR_TOP_H:   int64  = 22
+BAR_BOT_H:   int64  = 18
 
 # Raw file bytes. Cap the on-disk image at 8 MiB — enough for a full-desktop
 # (1920x1080) hamshot PNG capture (stored DEFLATE, ~6.3 MB), a 256x256 32bpp
@@ -94,22 +102,43 @@ _hv_src_w:       uint64 = 0
 _hv_src_h:       uint64 = 0
 # Points at the decoded RGBA raster to scale from: &_hv_src_buf[0] for the
 # PPM/BMP paths, or the lib/png|jpeg output buffer for PNG/JPEG (no copy).
-_hv_src_ptr:     Ptr[uint8] = cast[Ptr[uint8]](0)
+_hv_src_ptr:     Ptr[uint8]
 
-# Scaled output buffer pushed to the "pix" fb layer (<=256x256 RGBA8888).
-_hv_fb_buf:      Array[262144, uint8]       # 256*256*4
-_hv_fb_w:        uint64 = 0
-_hv_fb_h:        uint64 = 0
+# The 100%-zoom "fit" display size (source scaled to fit the content area,
+# downscale-only). Zoom scales this; recomputed once after decode.
+_hv_base_w:      uint64 = 0
+_hv_base_h:      uint64 = 0
+
+# ---- scroll-wheel zoom state ----
+# Zoom as an integer PERCENT of the base (fit) size; 100 == fit. Each wheel
+# notch steps by ZOOM_STEP, clamped to [ZOOM_MIN, ZOOM_MAX]. A dw/dh cap keeps
+# a big zoom from running the blit loop past the backbuffer bounds (the image
+# is centre-cropped when it grows past the window — no panning yet).
+ZOOM_MIN:        int64  = 20
+ZOOM_MAX:        int64  = 500
+ZOOM_STEP:       int64  = 20
+ZOOM_CAP:        uint64 = 4096
+_hv_zoom:        int64  = 100
+
+# The event file (/dev/wsys/<wid>/event) delivers pointer lines
+# "m <x> <y> <buttons> <dz>\n"; a non-zero dz is a scroll-wheel notch.
+_hv_evt_fd:      int32  = -1
+_hv_ev_buf:      Array[256, uint8]
+_hv_ev_carry:    uint64 = 0
+
+# Repaint context stashed so the idle/event loop can re-render on a zoom
+# change without re-plumbing main()'s locals. name/note are pointers into
+# rodata / argv, valid for the whole process lifetime.
+_hv_name:        Ptr[uint8]
+_hv_note:        Ptr[uint8]
+_hv_ok:          int32 = 0
+_hv_wid:         int32 = 0
 
 # Scratch / path / markup buffers.
 _hv_path_buf:    Array[128, uint8]
 _hv_ctl_buf:     Array[64, uint8]
 _hv_markup_buf:  Array[256, uint8]
 _hv_status_buf:  Array[128, uint8]
-
-# widget ids
-_hv_lbl_title:   int32 = 0
-_hv_sbar:        int32 = 0
 
 
 # ====================================================================
@@ -384,46 +413,20 @@ def _decode() -> int32:
 
 
 # ====================================================================
-# Scale the decoded RGBA raster at _hv_src_ptr (_hv_src_w x _hv_src_h) down
-# into _hv_fb_buf, preserving aspect, so the long edge is <= FB_MAX.
-# Nearest-neighbour (the compositor blit from fb -> window is also
-# nearest-neighbour, so this is consistent).  Works uniformly for the
-# PPM/BMP raster (_hv_src_buf) and the lib/png|jpeg output buffers.
+# Compute the 100%-zoom "fit" display size for the decoded raster: the source
+# (_hv_src_w x _hv_src_h) scaled to fit the content area between the chrome
+# bars, DOWNSCALE-ONLY (small images stay 1:1). The scroll wheel scales THIS.
+# The actual sampling happens at blit time (lib/imgscale), directly into the v2
+# backbuffer, so an arbitrary zoom needs no intermediate buffer.
 # ====================================================================
-def _scale_to_fb():
-    src: Ptr[uint8] = _hv_src_ptr
-    sw: uint64 = _hv_src_w
-    sh: uint64 = _hv_src_h
-    dw: uint64 = sw
-    dh: uint64 = sh
-    # shrink the long edge to FB_MAX (only ever downscale).
-    if dw > FB_MAX or dh > FB_MAX:
-        if dw >= dh:
-            dh = (dh * FB_MAX) / dw
-            dw = FB_MAX
-        else:
-            dw = (dw * FB_MAX) / dh
-            dh = FB_MAX
-    if dw == 0:
-        dw = 1
-    if dh == 0:
-        dh = 1
-    _hv_fb_w = dw
-    _hv_fb_h = dh
-    y: uint64 = 0
-    while y < dh:
-        sy: uint64 = (y * sh) / dh
-        x: uint64 = 0
-        while x < dw:
-            sx: uint64 = (x * sw) / dw
-            so: uint64 = (sy * sw + sx) * 4
-            dofs: uint64 = (y * dw + x) * 4
-            _hv_fb_buf[dofs]     = src[so]
-            _hv_fb_buf[dofs + 1] = src[so + 1]
-            _hv_fb_buf[dofs + 2] = src[so + 2]
-            _hv_fb_buf[dofs + 3] = src[so + 3]
-            x = x + 1
-        y = y + 1
+def _compute_base_dims():
+    avail_w: uint64 = cast[uint64](WIN_W)
+    avail_h: uint64 = cast[uint64](WIN_H - BAR_TOP_H - BAR_BOT_H)
+    bw: Array[1, uint64]
+    bh: Array[1, uint64]
+    imgscale_fit_dims(_hv_src_w, _hv_src_h, avail_w, avail_h, &bw[0], &bh[0])
+    _hv_base_w = bw[0]
+    _hv_base_h = bh[0]
 
 
 # ====================================================================
@@ -444,35 +447,28 @@ def _draw_text_blocks(x: int32, y: int32, s: Ptr[uint8],
                       x, y, s, r, g, b, max_w)
 
 
-# Opaque-blit the scaled RGBA raster (_hv_fb_buf, _hv_fb_w x _hv_fb_h) into
-# the v2 backbuffer at (px,py), clipped to the buffer bounds.
-def _blit_image_v2(px: int32, py: int32):
+# Current on-screen image size = base (fit) size scaled by the zoom percent,
+# written via out_w/out_h. Kept as a helper so paint + the (future) cursor-
+# centred zoom share one definition.
+def _display_dims(out_w: Ptr[uint64], out_h: Ptr[uint64]):
+    imgscale_zoom_dims(_hv_base_w, _hv_base_h, _hv_zoom, ZOOM_CAP,
+                       out_w, out_h)
+
+
+# Nearest-neighbour scale the decoded raster (_hv_src_ptr, _hv_src_w x
+# _hv_src_h) to (dw,dh) and opaque-blit it into the v2 backbuffer at (px,py),
+# clipped to the backbuffer bounds. Sampling from the ORIGINAL source (not a
+# pre-shrunk copy) keeps zoom-in as crisp as nearest-neighbour allows.
+def _blit_image_v2(px: int32, py: int32, dw: uint64, dh: uint64):
     bb: Ptr[uint8] = hamui_v2_bb_ptr()
     if bb == cast[Ptr[uint8]](0):
         return
     bw: int32 = hamui_v2_bb_w()
     bh: int32 = hamui_v2_bb_h()
     stride: uint64 = cast[uint64](bw) * 4
-    iw: int32 = cast[int32](_hv_fb_w)
-    ih: int32 = cast[int32](_hv_fb_h)
-    yy: int32 = 0
-    while yy < ih:
-        dy: int32 = py + yy
-        if dy >= 0 and dy < bh:
-            xx: int32 = 0
-            while xx < iw:
-                dx: int32 = px + xx
-                if dx >= 0 and dx < bw:
-                    so: uint64 = (cast[uint64](yy) * _hv_fb_w \
-                                  + cast[uint64](xx)) * 4
-                    dofs: uint64 = cast[uint64](dy) * stride \
-                                   + cast[uint64](dx) * 4
-                    bb[dofs]     = _hv_fb_buf[so]
-                    bb[dofs + 1] = _hv_fb_buf[so + 1]
-                    bb[dofs + 2] = _hv_fb_buf[so + 2]
-                    bb[dofs + 3] = 255
-                xx = xx + 1
-        yy = yy + 1
+    imgscale_blit(_hv_src_ptr, _hv_src_w, _hv_src_h,
+                  bb, stride, cast[int64](px), cast[int64](py), dw, dh,
+                  cast[int64](bw), cast[int64](bh))
 
 
 # ====================================================================
@@ -536,6 +532,12 @@ def _build_status_text(name: Ptr[uint8], note: Ptr[uint8]):
         _hv_status_buf[p] = 32
         p = p + 1
     p = _put_s(&_hv_status_buf[0], p, note)
+    # Zoom indicator (only when an image is actually shown).
+    if _hv_ok != 0 and _hv_base_w != 0:
+        p = _put_s(&_hv_status_buf[0], p, "  ")
+        p = _put_dec(&_hv_status_buf[0], p, cast[uint64](_hv_zoom))
+        _hv_status_buf[p] = 37                           # '%'
+        p = p + 1
     _hv_status_buf[p] = 0
 
 
@@ -559,19 +561,20 @@ def _paint_v2(wid: int32, name: Ptr[uint8], note: Ptr[uint8], ok: int32):
     # status text
     _build_status_text(name, note)
     _draw_text_blocks(6, h - 14, &_hv_status_buf[0], 200, 200, 200, w - 12)
-    # image (centred in the area between the two bars)
+    # image (centred in the area between the two bars, scaled by the zoom).
     if ok != 0:
-        iw: int32 = cast[int32](_hv_fb_w)
-        ih: int32 = cast[int32](_hv_fb_h)
-        avail_top: int32 = 22
-        avail_h: int32 = (h - 18) - avail_top
+        dwv: Array[1, uint64]
+        dhv: Array[1, uint64]
+        _display_dims(&dwv[0], &dhv[0])
+        iw: int32 = cast[int32](dwv[0])
+        ih: int32 = cast[int32](dhv[0])
+        avail_top: int32 = cast[int32](BAR_TOP_H)
+        avail_h: int32 = (h - cast[int32](BAR_BOT_H)) - avail_top
+        # Centre; when the zoomed image is larger than the content area the
+        # offset goes negative so it centre-crops (imgscale_blit clips).
         px: int32 = (w - iw) / 2
         py: int32 = avail_top + (avail_h - ih) / 2
-        if px < 0:
-            px = 0
-        if py < avail_top:
-            py = avail_top
-        _blit_image_v2(px, py)
+        _blit_image_v2(px, py, dwv[0], dhv[0])
     hamui_v2_commit_rect(0, 0, w, h)
     # PRESENT: a pure-v2 window is INVISIBLE under the scene compositor until
     # its scene carries the `buffer` verb (which copies the kernel-side v2
@@ -647,9 +650,9 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     else:
         _puts(2, "hamview: decode failed\n")
 
-    # Scale the decoded raster (<=256 long edge) into _hv_fb_buf for blitting.
+    # Compute the 100%-zoom "fit" display size for the scroll-wheel zoom.
     if rc == 0:
-        _scale_to_fb()
+        _compute_base_dims()
 
     # ---- self-allocate an OWNED top-level window, MAP it with an explicit
     # geometry (the visible-window step), decorate + title it, then opt into
@@ -663,7 +666,15 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     _wsys_ctl_path(wid)
     _wctl("geometry 120 80 640 480\n")
     _wctl("decorate 1\n")
-    _wctl("z 12\n")
+    # NORMAL app-band z (matches peer apps: games z6, notes/log/settings z7).
+    # The compositor MAP-AND-RAISEs a window to the top of the app band on its
+    # first commit and re-raises whatever the user next clicks, so a low static
+    # z still opens on top. The OLD `z 12` sat ABOVE every peer app at rest, so
+    # hamview stayed above another window even after that window was focused
+    # (it was never lowered because its static z out-ranked the peers) — the
+    # user-reported "image viewer always stays on top" bug. A normal-band z
+    # lets hamview participate in ordinary z-order/focus stacking.
+    _wctl("z 6\n")
     # SSD title = the filename.
     tn: uint64 = 0
     tn = _put_s(&_hv_ctl_buf[0], tn, "title ")
@@ -678,28 +689,142 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         _puts(2, "hamview: v2 blit negotiate failed\n")
         return 1
 
-    # ---- compose the frame into the backbuffer, commit + present ----
+    # ---- stash the repaint context so the event loop can re-render on zoom ----
+    _hv_wid = wid
+    _hv_name = name
     if rc == 0:
-        _paint_v2(wid, name, "", 1)
+        _hv_note = ""
+        _hv_ok = 1
     elif loaded < 0:
         if has_path != 0:
-            _paint_v2(wid, name, "(cannot open)", 0)
+            _hv_note = "(cannot open)"
         else:
-            _paint_v2(wid, name, "(no image given)", 0)
+            _hv_note = "(no image given)"
+        _hv_ok = 0
     elif rc == -2:
-        _paint_v2(wid, name, "(too large to display)", 0)
+        _hv_note = "(too large to display)"
+        _hv_ok = 0
     else:
-        _paint_v2(wid, name, "(unsupported or corrupt image)", 0)
+        _hv_note = "(unsupported or corrupt image)"
+        _hv_ok = 0
+
+    # ---- compose the first frame into the backbuffer, commit + present ----
+    _repaint()
 
     _puts(2, "HAMVIEW ready\n")
     _loop(wid)
     return 0
 
 
-# Idle loop — the frame is committed + presented and the compositor caches the
-# window's scene, so the static image persists. Re-present periodically to
-# survive an expose/damage from other windows, yielding the CPU between.
+# Re-render the whole window from the stashed context (current zoom included)
+# and present it. Used for the first frame and after every scroll-wheel zoom.
+def _repaint():
+    _paint_v2(_hv_wid, _hv_name, _hv_note, _hv_ok)
+
+
+# Handle one pointer event line already isolated in _hv_ev_buf[ls..le).
+# A non-zero scroll delta (dz, the 4th field of "m x y buttons dz") steps the
+# zoom; returns 1 if the zoom changed (caller repaints). Only meaningful when
+# an image is actually shown (_hv_ok).
+def _handle_pointer(ls: uint64, le: uint64) -> int32:
+    # Parse the 4 signed ints after the leading 'm' token.
+    p: uint64 = ls
+    while p < le and _hv_ev_buf[p] != 32:            # skip the type token
+        p = p + 1
+    fields: Array[4, int64]
+    nf: int32 = 0
+    while nf < 4:
+        while p < le and _hv_ev_buf[p] == 32:
+            p = p + 1
+        if p >= le:
+            break
+        neg: int32 = 0
+        if _hv_ev_buf[p] == 45:                       # '-'
+            neg = 1
+            p = p + 1
+        v: int64 = 0
+        d: int32 = 0
+        while p < le and _hv_ev_buf[p] >= 48 and _hv_ev_buf[p] <= 57:
+            v = v * 10 + cast[int64](_hv_ev_buf[p]) - 48
+            p = p + 1
+            d = 1
+        if d == 0:
+            break
+        if neg != 0:
+            v = 0 - v
+        fields[nf] = v
+        nf = nf + 1
+    if nf < 4:
+        return 0
+    dz: int64 = fields[3]
+    if dz == 0 or _hv_ok == 0:
+        return 0
+    # Wheel up (dz>0) zooms IN, wheel down zooms OUT. Step per notch magnitude.
+    old: int64 = _hv_zoom
+    nz: int64 = _hv_zoom + dz * ZOOM_STEP
+    nz = imgscale_clamp_zoom(nz, ZOOM_MIN, ZOOM_MAX)
+    _hv_zoom = nz
+    if _hv_zoom != old:
+        return 1
+    return 0
+
+
+# Non-blocking drain of the /event ring; returns 1 if any zoom change occurred
+# (caller repaints). Carries a partial trailing line across reads.
+def _poll_events() -> int32:
+    if _hv_evt_fd < 0:
+        return 0
+    changed: int32 = 0
+    passes: int32 = 0
+    while passes < 4:
+        passes = passes + 1
+        room: uint64 = 256 - _hv_ev_carry
+        if room == 0:                                 # oversized line: drop it
+            _hv_ev_carry = 0
+            room = 256
+        en: int64 = sys_read_nb(_hv_evt_fd, &_hv_ev_buf[_hv_ev_carry], room)
+        if en <= 0:
+            break
+        total: uint64 = _hv_ev_carry + cast[uint64](en)
+        i: uint64 = 0
+        ls: uint64 = 0
+        while i < total:
+            if _hv_ev_buf[i] == 10:                   # end of a line
+                if i > ls and _hv_ev_buf[ls] == 109:  # 'm' pointer line
+                    if _handle_pointer(ls, i) != 0:
+                        changed = 1
+                ls = i + 1
+            i = i + 1
+        # Preserve any partial trailing line for the next read.
+        if ls < total:
+            k: uint64 = 0
+            while ls + k < total:
+                _hv_ev_buf[k] = _hv_ev_buf[ls + k]
+                k = k + 1
+            _hv_ev_carry = k
+        else:
+            _hv_ev_carry = 0
+    return changed
+
+
+# Open the per-window event file "/dev/wsys/<wid>/event" for non-blocking reads.
+def _open_events(wid: int32):
+    q: uint64 = 0
+    q = _put_s(&_hv_path_buf[0], q, "/dev/wsys/")
+    q = _put_dec(&_hv_path_buf[0], q, cast[uint64](wid))
+    q = _put_s(&_hv_path_buf[0], q, "/event")
+    _hv_path_buf[q] = 0
+    _hv_evt_fd = sys_open(cast[Ptr[char]](&_hv_path_buf[0]))
+
+
+# Event/idle loop — drain scroll-wheel events (re-render on a zoom change) and
+# re-present periodically so the frame survives an expose/damage from other
+# windows, yielding the CPU between passes.
 def _loop(wid: int32):
+    _open_events(wid)
     while True:
         sys_yield()
-        _present_v2(wid)
+        if _poll_events() != 0:
+            _repaint()
+        else:
+            _present_v2(wid)
