@@ -370,6 +370,15 @@ sys_mmap:
     ret
     .size sys_mmap, .-sys_mmap
 
+    /* sys_munmap(addr, length) -> int32 : real host munmap. */
+    .globl sys_munmap
+    .type sys_munmap, @function
+sys_munmap:
+    movq    $SYS_munmap, %rax
+    syscall
+    ret
+    .size sys_munmap, .-sys_munmap
+
     /* sys_read_nb(fd, buf, count) -> int64 : genuine non-blocking read.
      * Mark the fd O_NONBLOCK (F_SETFL=4, O_NONBLOCK=0x800) then read. Map
      * -EAGAIN (-11) to 0 so the on-device contract holds: 0 == "no byte

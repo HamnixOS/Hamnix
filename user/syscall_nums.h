@@ -49,6 +49,7 @@
      * (scripts/test_hamsh_lang_host.sh); everything else the shell's
      * kernel/namespace externs need is an honest fail-closed stub. */
     .set SYS_mmap,        9
+    .set SYS_munmap,      11
     .set SYS_sched_yield, 24
     .set SYS_dup,         32
     .set SYS_fcntl,       72
