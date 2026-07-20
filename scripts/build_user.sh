@@ -25,6 +25,78 @@ source "$PROJ_ROOT/scripts/_adder_cc.sh"
 
 mkdir -p build/user
 
+# --- Parallel-compile infrastructure --------------------------------------
+# The 250+ Adder userland programs are INDEPENDENT whole-program compiles,
+# each writing its own build/user/<name>.elf. They were historically built
+# strictly sequentially; here we fan them out across cores.
+#
+# CORRECTNESS INVARIANTS (do not break):
+#   * The native-compiler bootstrap (host_ac.elf) is built ONCE, up front,
+#     BEFORE any parallel job starts — otherwise N jobs would race to
+#     produce build/cutover/host_ac.elf. We call adder_cc_bootstrap here
+#     explicitly; every fanned-out job then inherits _ADDER_CC_BOOTSTRAPPED=1
+#     and skips it. Under ADDER_CC=python the bootstrap no-ops (returns 0).
+#   * No shared per-invocation scratch: for ADDER_CC=adder each compile is
+#     `host_ac.elf <in> <out>` writing straight to the unique <out> ELF (no
+#     fixed temp file); for ADDER_CC=python the seed uses tempfile.* which
+#     mints unique paths. So concurrent compiles cannot collide.
+#   * Fail-fast on OUTPUT: every job records a failure marker; after the pool
+#     drains we exit non-zero if ANY compile failed (a backgrounded failure
+#     is never silently swallowed).
+#
+# Concurrency level: HAMNIX_BUILD_JOBS (default: nproc).
+_BUILD_JOBS="${HAMNIX_BUILD_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+[ "$_BUILD_JOBS" -ge 1 ] 2>/dev/null || _BUILD_JOBS=1
+
+# Build host_ac.elf ONCE before fanning out (no-op under ADDER_CC=python).
+adder_cc_bootstrap || { echo "[build_user] ERROR: compiler bootstrap failed" >&2; exit 1; }
+
+# Failure markers land here; presence of any file == a compile failed.
+_FAILDIR="$(mktemp -d)"
+trap 'rm -rf "$_FAILDIR"' EXIT
+
+# Queue of (src -> out) compile jobs, run by _run_compile_pool.
+_Q_SRC=()
+_Q_OUT=()
+
+# queue_adder_compile <src.ad> <out.elf> — enqueue one whole-program compile.
+queue_adder_compile() {
+    _Q_SRC+=("$1")
+    _Q_OUT+=("$2")
+}
+
+# _run_compile_pool — fan the queued compiles out across $_BUILD_JOBS workers
+# with a sliding concurrency gate (wait -n throttles to the pool size). Each
+# job compiles to its unique output ELF and, on failure, drops a marker in
+# $_FAILDIR keyed by the output basename.
+_run_compile_pool() {
+    local n=${#_Q_SRC[@]} i
+    echo "[build_user] compiling $n Adder programs across $_BUILD_JOBS jobs (ADDER_CC=${ADDER_CC:-adder})"
+    for (( i=0; i<n; i++ )); do
+        # Throttle: keep at most $_BUILD_JOBS background jobs in flight.
+        while [ "$(jobs -rp | wc -l)" -ge "$_BUILD_JOBS" ]; do
+            wait -n 2>/dev/null || true
+        done
+        local src="${_Q_SRC[$i]}" out="${_Q_OUT[$i]}"
+        (
+            if adder_cc_compile compile --target=x86_64-adder-user "$src" -o "$out"; then
+                echo "[build_user] wrote $out"
+            else
+                echo "[build_user] ERROR: compile FAILED: $src -> $out" >&2
+                : > "$_FAILDIR/$(basename "$out")"
+            fi
+        ) &
+    done
+    wait
+    # Fail-fast: propagate any backgrounded compile failure to the whole build.
+    if [ -n "$(ls -A "$_FAILDIR" 2>/dev/null)" ]; then
+        echo "[build_user] ERROR: $(ls -1 "$_FAILDIR" | wc -l) user compile(s) FAILED:" >&2
+        ls -1 "$_FAILDIR" >&2
+        exit 1
+    fi
+    echo "[build_user] all $n Adder programs compiled OK"
+}
+
 build_one() {
     local name="$1"
     as --32 -o "build/user/${name}.o" "user/${name}.S"
@@ -49,12 +121,7 @@ build_adder_user() {
     if [ ! -f "$src" ] && [ -f "tests/${name}.ad" ]; then
         src="tests/${name}.ad"
     fi
-    echo "[build_user] compiling ${src} -> build/user/${name}.elf"
-    adder_cc_compile compile \
-        --target=x86_64-adder-user \
-        "$src" \
-        -o "build/user/${name}.elf"
-    file "build/user/${name}.elf"
+    queue_adder_compile "$src" "build/user/${name}.elf"
 }
 
 build_adder_user init                 # PID 1 shim: execs /bin/hamsh with boot rc /etc/rc.boot
@@ -336,12 +403,7 @@ build_adder_user umdf_host            # Track 4: user-mode driver host — loads
 # and installs it at /bin/<name>.
 build_adder_x11() {
     local name="$1"
-    echo "[build_user] compiling user/x11/${name}.ad -> build/user/${name}.elf"
-    adder_cc_compile compile \
-        --target=x86_64-adder-user \
-        "user/x11/${name}.ad" \
-        -o "build/user/${name}.elf"
-    file "build/user/${name}.elf"
+    queue_adder_compile "user/x11/${name}.ad" "build/user/${name}.elf"
 }
 
 build_adder_x11 x11srv        # X11 core-protocol server: listens on :6000, renders into wsys fb layer
@@ -350,72 +412,21 @@ build_adder_x11 x11test       # X11 self-test driver: spawns x11srv + xfill, ass
 build_adder_x11 xclient_demo  # Standalone X11 app client: purple/cyan fill, used by test_x11_app.sh
 build_adder_x11 x11apptest    # X11 app-in-desktop test: spawns x11srv + xclient_demo, checks wsys flush
 
-# --- Self-hosting milestone: Adder-in-Adder lexer --------------------
-echo "[build_user] compiling adder/compiler/lex_selftest.ad -> build/user/lex_selftest.elf"
-adder_cc_compile compile \
-    --target=x86_64-adder-user \
-    adder/compiler/lex_selftest.ad \
-    -o build/user/lex_selftest.elf
-file build/user/lex_selftest.elf
+# --- Self-hosting milestones + on-box compiler drivers ---------------
+# These are ordinary independent whole-program compiles (unique outputs),
+# so they join the same parallel queue as the userland above.
+#   * lex/parse/codegen_selftest      — Adder-in-Adder pipeline selftests
+#   * codegen_elf_selftest            — emits+dumps a loadable ELF (test_selfhost_elf.sh)
+#   * codegen_bss_selftest            — .bss + .data model emitter (test_selfhost_bss.sh)
+#   * codegen_ac_driver               — on-box compile driver from /src/input.ad (hamnix-ac)
+#   * adder_cc                        — generic on-box Adder compiler tool (#186), staged /bin/adder_cc
+queue_adder_compile adder/compiler/lex_selftest.ad       build/user/lex_selftest.elf
+queue_adder_compile adder/compiler/parse_selftest.ad     build/user/parse_selftest.elf
+queue_adder_compile adder/compiler/codegen_selftest.ad   build/user/codegen_selftest.elf
+queue_adder_compile adder/compiler/codegen_elf_selftest.ad build/user/codegen_elf_selftest.elf
+queue_adder_compile adder/compiler/codegen_bss_selftest.ad build/user/codegen_bss_selftest.elf
+queue_adder_compile adder/compiler/codegen_ac_driver.ad  build/user/codegen_ac_driver.elf
+queue_adder_compile adder/compiler/adder_cc_driver.ad    build/user/adder_cc.elf
 
-# --- Self-hosting milestone: Adder-in-Adder parser -------------------
-echo "[build_user] compiling adder/compiler/parse_selftest.ad -> build/user/parse_selftest.elf"
-adder_cc_compile compile \
-    --target=x86_64-adder-user \
-    adder/compiler/parse_selftest.ad \
-    -o build/user/parse_selftest.elf
-file build/user/parse_selftest.elf
-
-# --- Self-hosting milestone: Adder-in-Adder codegen ------------------
-echo "[build_user] compiling adder/compiler/codegen_selftest.ad -> build/user/codegen_selftest.elf"
-adder_cc_compile compile \
-    --target=x86_64-adder-user \
-    adder/compiler/codegen_selftest.ad \
-    -o build/user/codegen_selftest.elf
-file build/user/codegen_selftest.elf
-
-# --- Self-hosting milestone: Adder-in-Adder ELF emit -----------------
-# On-device tool that runs lexer.ad -> parser.ad -> codegen.ad ->
-# elf_emit.ad and dumps a complete, loadable user ELF as hex (consumed by
-# scripts/test_selfhost_elf.sh, which then EXECs the emitted ELF natively).
-echo "[build_user] compiling adder/compiler/codegen_elf_selftest.ad -> build/user/codegen_elf_selftest.elf"
-adder_cc_compile compile \
-    --target=x86_64-adder-user \
-    adder/compiler/codegen_elf_selftest.ad \
-    -o build/user/codegen_elf_selftest.elf
-file build/user/codegen_elf_selftest.elf
-
-# Companion on-device emitter that exercises the .bss + .data model: a
-# zero-init array global (.bss, no file bytes) plus initialised string +
-# scalar globals (.data). Consumed by scripts/test_selfhost_bss.sh, which
-# EXECs the emitted ELF natively to prove the BSS model works on the CPU.
-echo "[build_user] compiling adder/compiler/codegen_bss_selftest.ad -> build/user/codegen_bss_selftest.elf"
-adder_cc_compile compile \
-    --target=x86_64-adder-user \
-    adder/compiler/codegen_bss_selftest.ad \
-    -o build/user/codegen_bss_selftest.elf
-file build/user/codegen_bss_selftest.elf
-
-# --- hamnix-ac: generalized on-device Adder compile driver -----------
-# Same pipeline as codegen_elf_selftest, but reads the source to compile
-# from a host-injected file (/src/input.ad) instead of a baked snippet.
-# Consumed by scripts/hamnix-ac and scripts/test_hamnix_ac.sh.
-echo "[build_user] compiling adder/compiler/codegen_ac_driver.ad -> build/user/codegen_ac_driver.elf"
-adder_cc_compile compile \
-    --target=x86_64-adder-user \
-    adder/compiler/codegen_ac_driver.ad \
-    -o build/user/codegen_ac_driver.elf
-file build/user/codegen_ac_driver.elf
-
-# --- adder_cc: generic ON-BOX Adder compiler tool --------------------
-# Same self-hosted pipeline as codegen_ac_driver, but takes the input +
-# output paths from argv and WRITES the emitted ELF straight to a file
-# on the local fs (no serial round-trip). This is the front-end `hpm`
-# spawns to compile a SOURCE package on the box (#186). Staged at
-# /bin/adder_cc.
-echo "[build_user] compiling adder/compiler/adder_cc_driver.ad -> build/user/adder_cc.elf"
-adder_cc_compile compile \
-    --target=x86_64-adder-user \
-    adder/compiler/adder_cc_driver.ad \
-    -o build/user/adder_cc.elf
-file build/user/adder_cc.elf
+# --- Fan out every queued Adder compile across cores -----------------
+_run_compile_pool
