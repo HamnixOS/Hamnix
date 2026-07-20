@@ -1016,6 +1016,30 @@ def _files_hamslides() -> list[tuple[Path, str]]:
 # hamnix-desktop-config package globs etc/hamde/apps wholesale, so keeping the
 # launcher OUT of apps/ until install is what keeps it off a bare desktop).
 
+# ---- hamnix-hamclock — the clock / calendar / timer utility, repo-ONLY -----
+# HamClock is a small desktop time utility: a large 7-segment digital HH:MM:SS
+# read-out plus an analog clock face (clock view), a real month calendar with
+# today highlighted and prev/next month paging (calendar view), and a start /
+# stop / reset stopwatch (timer view). Same repo-ONLY pattern as
+# HamWrite/HamSheet/HamPaint/HamSlides — BUILT + published in the main channel
+# (installable via hpm / the Software app), but excluded from the hamnix-base
+# closure below so a fresh install does NOT carry it. Its payload is the binary +
+# its .desktop launcher (staged into /etc/hamde/apps ONLY when installed).
+
+HAMCLOCK_PKG = "hamnix-hamclock"
+
+
+def _files_hamclock() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hamclock")
+    # Launcher lives in etc/hamde/apps-optional/ (NOT etc/hamde/apps/, which the
+    # base hamnix-desktop-config package globs wholesale) and is staged into the
+    # live /etc/hamde/apps ONLY when this package is installed.
+    f.append((ETC_DIR / "hamde" / "apps-optional" / "hamclock.desktop",
+              "etc/hamde/apps/hamclock.desktop"))
+    return f
+
+
 HAMANGRYBIRDS_PKG = "hamnix-hamangrybirds"
 
 
@@ -1324,6 +1348,24 @@ PACKAGE_SPECS.append({
 })
 
 
+# The repo-ONLY clock / calendar / timer utility. Same pattern as the office
+# apps: built + published in the main channel but kept out of the hamnix-base
+# closure below, so `hpm install hamnix-hamclock` / the Software app is the only
+# way to get it. Depends only on the compositor (scene-file DE).
+PACKAGE_SPECS.append({
+    "name": HAMCLOCK_PKG,
+    "files_fn": _files_hamclock,
+    "depends": [f"hamnix-desktop-core>={PKG_VERSION}"],
+    "description": ("HamClock — Hamnix clock / calendar / timer utility: a large "
+                    "7-segment digital HH:MM:SS read-out plus an analog clock "
+                    "face, a month calendar with today highlighted and "
+                    "prev/next month paging, and a start/stop/reset stopwatch. "
+                    "Reads the wall clock from /proc/realtime. Repo-only: "
+                    "install from 255.one, not pre-installed."),
+    "target": "#hamnix-system",
+})
+
+
 # ---------------------------------------------------------------------
 # Generic spec-driven package builder
 # ---------------------------------------------------------------------
@@ -1448,6 +1490,7 @@ def build_hamnix_base() -> dict:
     leaf_names.add(HAMPAINT_PKG)
     # The repo-only office presentation app is likewise NOT pre-installed.
     leaf_names.add(HAMSLIDES_PKG)
+    leaf_names.add(HAMCLOCK_PKG)
     depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS
                if s["name"] not in leaf_names]
     depends.append(f"hamnix-bootloader>={PKG_VERSION}")
