@@ -4599,29 +4599,39 @@ def _imulimm_corpus():
          "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
          (x * 7) & M, 1)
 
-    # 2) const on the LEFT (commutative): 9 * x.
+    # 2) const on the LEFT (commutative): 11 * x. NOTE the multiplier must be a
+    #    constant the imul-const lever ACTUALLY lowers to a 3-operand imul. The
+    #    later multiply-add lea DAG tile (try_lea_muladd_tile) intercepts every
+    #    m in {2,3,5,9} (the 2^k and 2^k+1 shapes) FIRST and emits a `lea`
+    #    instead — so a lea-able m (e.g. 9) leaves opt_imulimm_count at 0 and this
+    #    "want_fire" corpus would spuriously report "lever never fired" even
+    #    though the value is optimal + correct. Use 11 (NOT lea-able) so the
+    #    imul-const lever is the one that fires and the coverage assertion is
+    #    meaningful. (lea-able multipliers are covered by the leamuladd corpus.)
     x = 98765
     prog("mul_c_left",
          "def f(x: int64) -> int64:\n"
-         "    return 9 * x\n"
+         "    return 11 * x\n"
          "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
          f"    g_accum = cast[uint64](f(cast[int64]({x})))\n"
          "    print_u64(g_accum)\n"
          "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
-         (9 * x) & M, 1)
+         (11 * x) & M, 1)
 
-    # 3) dst-ALIAS accumulator in a loop: s = s * 3 (the register the product
-    #    lands in is also the source). A wrong operand order clobbers s.
+    # 3) dst-ALIAS accumulator in a loop: s = s * 7 (the register the product
+    #    lands in is also the source). A wrong operand order clobbers s. Uses 7
+    #    (not lea-able; see note above — {2,3,5,9} route to the lea muladd tile,
+    #    not the imul-const lever) so imul-const is the lowering under test.
     n = 20
     s = 1
     for _ in range(n):
-        s = (s * 3 + 1) & M
+        s = (s * 7 + 1) & M
     prog("mul_dst_alias_loop",
          "def hot(n: int64) -> int64:\n"
          "    s: int64 = 1\n"
          "    i: int64 = 0\n"
          "    while i < n:\n"
-         "        s = s * 3 + 1\n"
+         "        s = s * 7 + 1\n"
          "        i = i + 1\n"
          "    return s\n"
          "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
@@ -4661,18 +4671,20 @@ def _imulimm_corpus():
          "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
          (x * 2147483647) & M, 1)
 
-    # 6) UNSIGNED operand: (uint64)x * 5. The low-64 product is identical for
+    # 6) UNSIGNED operand: (uint64)x * 11. The low-64 product is identical for
     #    signed/unsigned, so the same 3-op imul is emitted; value must match the
-    #    unsigned oracle even when x is large.
+    #    unsigned oracle even when x is large. Uses 11 (not lea-able; {2,3,5,9}
+    #    route to the lea muladd tile, not the imul-const lever — see note at
+    #    mul_c_left) so the imul-const lowering is the one exercised.
     x = (1 << 40) + 12345
     prog("mul_unsigned",
          "def f(x: uint64) -> uint64:\n"
-         "    return x * 5\n"
+         "    return x * 11\n"
          "def main(argc: int32, argv: Ptr[uint64]) -> int32:\n"
          f"    g_accum = f(cast[uint64]({x}))\n"
          "    print_u64(g_accum)\n"
          "    return cast[int32](cast[uint64](g_accum) & cast[uint64](255))\n",
-         (x * 5) & M, 1)
+         (x * 11) & M, 1)
 
     # 7) FALLBACK: x * y (both variable) — the lever must NOT fire (no constant),
     #    and the plain 2-operand multiply must stay correct.
