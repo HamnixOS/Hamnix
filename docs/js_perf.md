@@ -4,6 +4,52 @@
 side-by-side compare Chrome and our new browser to see how we stack up — it
 should really stretch the JavaScript side."
 
+---
+
+## UPDATE 2026-07-20 — re-run after the GC landed
+
+Since the first pass below, the value-cell mark-sweep GC (Phase 1) **and** the
+env-scope mark-sweep GC (Phase 3) both landed (`lib/web/js/gc.ad`). This is the
+re-measurement the USER asked for. Headline of the re-run:
+
+- **The dominant blocker is GONE.** Gaps #1 and #3 below (the monotonic value
+  arena and the unguarded env-arena call-cliff) are **fixed**. Empirically a
+  plain numeric loop now completes **5,000,000** boxed-value allocations, and a
+  call-in-loop kernel completes **1,000,000** function-call frames — both to a
+  checksum that matches V8 bit-for-bit. Pre-GC these exhausted at ~400–500k value
+  allocs / a few tens of thousands of frames. New gate:
+  `scripts/test_jsengine_gc_unblocks_host.sh` (fixtures in
+  `tests/fixtures/jsbench_gc/`).
+- **Speed is unchanged: geomean ~34.9x slower than V8** across the same 15
+  kernels (was ~32.5x; within run-to-run noise). The GC does **not** fire on the
+  non-exhausting kernels (they stay under the arena water mark), so it added no
+  measurable interpreter tax. The interpreter-vs-JIT ratio is the same honest
+  ~30x. Good news: GC bought completeness for free.
+- **The new #1 ceiling is the STRING pool, which is *not* GC'd.** `sp_buf` (8 MiB)
+  + the `MAX_STR = 200,000` id table are still bump-only — every `"a"+i` concat
+  permanently consumes a string id. A loop that manufactures a fresh string per
+  iteration exhausts it at ~200k string allocs (~100k such iterations). This is
+  what `test_jsengine_ceiling_host.sh` is bound by, and the single biggest
+  remaining JS-engine gap for real-scale string/DOM-text work.
+- **Concrete fix landed here:** string-pool exhaustion now fails **cleanly**.
+  `bld_end()` (the string-builder behind `+` concatenation) was **unguarded** —
+  when the pool was full it wrote `st_off/st_len[n_strs]` with `n_strs >= MAX_STR`,
+  out of bounds into adjacent BSS (the intern table / globals), which surfaced as
+  a *spurious* `ReferenceError: console is not defined` instead of a catchable
+  "string pool exhausted". `str_new()` already guarded this identical case;
+  `bld_end()` was missed. Now both fail cleanly. Gate:
+  `scripts/test_jsengine_strpool_clean_host.sh`. (This closes the gap-#2
+  "pool-exhaustion mis-reports" item for the string arena.)
+
+**Where hambrowse's JS stands vs Chrome/V8 (honest):** every classic SunSpider
+compute kernel runs correctly, and with GC the engine now sustains multi-million
+allocation loops — it is no longer toy-scale. It remains a tree-walking
+interpreter ~30–35x slower than V8's JIT (expected; a JIT is the only way to
+close that, and is a large separate effort). The next real capability ceiling is
+not speed but the un-GC'd string pool. Ranked next-gaps updated at the bottom.
+
+---
+
 **What this is:** a side-by-side JavaScript **compute** benchmark of hambrowse's
 native JS engine (`lib/web/js/`, the same engine the browser and the native `js`
 tool use) against **V8** — the engine inside Chrome/Chromium (measured through
@@ -72,11 +118,19 @@ is the honest number.
 
 ## Ranked JS-engine gaps (highest-value work first)
 
+> **STATUS 2026-07-20:** #1 (value arena) and #3 (env call-cliff) are **FIXED**
+> by the value-cell + env-scope GC. The current ranked list is: **(1) no GC on
+> the STRING pool** (was gap #2's sibling; now the dominant remaining ceiling —
+> exhausts at ~200k string allocs), **(2) the ~30–35x interpreter-vs-JIT tax**
+> (needs a JIT; large separate effort), **(3) native-stack recursion limit**
+> (old #4, still open). The mis-reporting half of #2 is now fixed for the string
+> pool (clean "string pool exhausted"). Original list kept below for the record.
+
 These are the todos this benchmark exposed, ranked by how much they block real
 JS. #1–#3 are *why the kernels had to be shrunk*; they matter far more than the
 32x interpreter tax.
 
-1. **No garbage collection — monotonic value arena (dominant blocker).**
+1. **[FIXED 2026-07-20] No garbage collection — monotonic value arena (dominant blocker).**
    `lib/web/js/value.ad:mk_val` bump-allocates from a fixed `MAX_VAL = 1_000_000`
    slot pool and **never reclaims** (`n_vals` resets only at `js_init`). Every
    boxed number/temporary in a loop leaks. Empirically a plain numeric loop
@@ -91,7 +145,7 @@ JS. #1–#3 are *why the kernels had to be shrunk*; they matter far more than th
    (`add32 is not defined`, `Angles is not defined`) that were purely pool
    exhaustion. At minimum, propagate the existing "value pool exhausted" error
    as a hard, catchable throw and stop evaluation.
-3. **Severe superlinear cliff in function-call-heavy loops.** A call-in-loop
+3. **[FIXED 2026-07-20] Severe superlinear cliff in function-call-heavy loops.** A call-in-loop
    kernel runs 30 outer iters in 0.06 s but 40 iters in >40 s — a cliff, not a
    curve. `env`/`bind` arenas (`MAX_ENV = 80_000`, `MAX_BIND = 250_000`) are
    bump-allocated per call and, unlike the value pool, are **unguarded** — an
@@ -128,9 +182,18 @@ the digits hambrowse prints.
 
 ## How the kernels were sized
 
-Standard SunSpider iteration counts exhaust the value arena (gap #1), so each
-kernel's outer loop was reduced to fit under the arena / call-cliff while
-remaining a faithful implementation (same algorithm, same per-iteration work,
-deterministic checksum). The ratios are therefore *representative of the
-interpreter-vs-JIT tax per unit work*, not of a full-length SunSpider run —
-which hambrowse cannot complete until gap #1 is addressed.
+Standard SunSpider iteration counts exhausted the value arena (old gap #1), so
+each kernel's outer loop was reduced to fit while remaining a faithful
+implementation (same algorithm, same per-iteration work, deterministic
+checksum). The ratios are *representative of the interpreter-vs-JIT tax per unit
+work*.
+
+**Update 2026-07-20:** with the value + env GC landed, the *pure-numeric* kernels
+here no longer need to be shrunk — the engine sustains multi-million-iteration
+loops (see `tests/fixtures/jsbench_gc/`). The fixtures in
+`tests/fixtures/jsbench/` are kept small deliberately so `jsbench_compare.sh`
+stays a fast, low-noise gate; the ratio is scale-invariant, so a bigger N would
+report the same ~35x. The remaining kernels that still *cannot* be scaled to full
+SunSpider length are the **string-heavy** ones (fasta at 2M chars, any per-iter
+string manufacture) — they hit the un-GC'd string pool (~200k string allocs),
+now surfaced as a clean "string pool exhausted".
