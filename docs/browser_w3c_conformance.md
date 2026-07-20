@@ -754,7 +754,12 @@ roughly by real-world value — the browser is now broad but NOT "fully W3C-impl
   (`canvas.ad:_run_scripts`) so scripts observe box metrics; the final relayout is byte-identical, so the
   rendered output is unchanged. Gate `geom` proves the reported box is byte-identical to the SEG-dump
   coordinates (coordinate cross-check); gate `domgeom2` proves the scroll compensation, `getClientRects()`,
-  and the expanded `getComputedStyle` props. **Boundary (honest):** a text-less element (pure box /
+  and the expanded `getComputedStyle` props; gate `domgeom` (INTEGRATION, 2026-07-20) proves geometry +
+  traversal cooperate on one page — `Element.matches()`/`closest()` (class/compound/id/negative + an
+  event-delegation ancestor walk), `document.body`/`documentElement`/`head` roots, and
+  `getBoundingClientRect()`/`offsetWidth/Height`/`clientWidth/Height` pinned to the laid-out box (a 9-char
+  block → 72×16, with x/y cross-checked vs the SEG dump). ALL of these APIs were ALREADY implemented in the
+  modular `lib/web/{dom,layout}/` tree from prior rounds; this round added only the integration gate. **Boundary (honest):** a text-less element (pure box /
   image-only) reports an empty rect (and `getClientRects()` an empty list); a run merged across inline
   siblings over-approximates width; scroll is a static offset a script sets (no live scroll source /
   interactive scroll-following); `getClientRects()` always collapses to one fragment (no multi-line inline
