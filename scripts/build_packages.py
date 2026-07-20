@@ -981,6 +981,31 @@ def _files_hampaint() -> list[tuple[Path, str]]:
     return f
 
 
+# ---- hamnix-hamslides — the office presentation app, ALSO repo-ONLY --------
+# HamSlides is the PowerPoint / LibreOffice-Impress equivalent and the office
+# suite's third app (after HamWrite + HamSheet): a deck of slides (each a title +
+# bullet list), an EDIT view (thumbnail rail + large current slide) and a
+# full-window PRESENT view, saved/loaded as a HAMSLIDES1 document container that
+# round-trips the deck. Same repo-ONLY pattern as HamWrite/HamSheet/HamPaint —
+# BUILT + published in the main channel (installable via hpm / the Software app),
+# but excluded from the hamnix-base closure below so a fresh install does NOT
+# carry it. Its payload is the binary + its .desktop launcher (staged into
+# /etc/hamde/apps ONLY when installed).
+
+HAMSLIDES_PKG = "hamnix-hamslides"
+
+
+def _files_hamslides() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hamslides")
+    # Launcher lives in etc/hamde/apps-optional/ (NOT etc/hamde/apps/, which the
+    # base hamnix-desktop-config package globs wholesale) and is staged into the
+    # live /etc/hamde/apps ONLY when this package is installed.
+    f.append((ETC_DIR / "hamde" / "apps-optional" / "hamslides.desktop",
+              "etc/hamde/apps/hamslides.desktop"))
+    return f
+
+
 # ---- hamnix-hamangrybirds — repo-ONLY, NOT-preinstalled game --------------
 # Follows the hamnix-hamaudiobook pattern exactly: BUILT + published in the main
 # channel (installable via `hpm install hamnix-hamangrybirds` or the Software
@@ -1280,6 +1305,25 @@ PACKAGE_SPECS.append({
 })
 
 
+# The repo-ONLY office presentation app. Same pattern as HamWrite/HamSheet: built
+# + published in the main channel but kept out of the hamnix-base closure below,
+# so `hpm install hamnix-hamslides` / the Software app is the only way to get it.
+# Depends only on the compositor (scene-file DE) — no extra hardware stack.
+PACKAGE_SPECS.append({
+    "name": HAMSLIDES_PKG,
+    "files_fn": _files_hamslides,
+    "depends": [f"hamnix-desktop-core>={PKG_VERSION}"],
+    "description": ("HamSlides — Hamnix office presentation app (PowerPoint / "
+                    "Impress style): build a deck of slides, each a title + "
+                    "bullet list, with an edit view (thumbnail rail + large "
+                    "current slide) and a full-window present view "
+                    "(Space/arrows to advance, Esc to exit), saved/loaded as a "
+                    "HAMSLIDES1 document that round-trips the deck. Repo-only: "
+                    "install from 255.one, not pre-installed."),
+    "target": "#hamnix-system",
+})
+
+
 # ---------------------------------------------------------------------
 # Generic spec-driven package builder
 # ---------------------------------------------------------------------
@@ -1402,6 +1446,8 @@ def build_hamnix_base() -> dict:
     leaf_names.add(HAMANGRYBIRDS_PKG)
     # The repo-only raster drawing app is likewise NOT pre-installed.
     leaf_names.add(HAMPAINT_PKG)
+    # The repo-only office presentation app is likewise NOT pre-installed.
+    leaf_names.add(HAMSLIDES_PKG)
     depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS
                if s["name"] not in leaf_names]
     depends.append(f"hamnix-bootloader>={PKG_VERSION}")
