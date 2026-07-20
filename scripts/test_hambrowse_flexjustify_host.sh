@@ -91,7 +91,13 @@ else
     echo "[hb-flexjust] FAIL space-between wrong (One=${ONEX[3]} Three=${THREEX[3]})"; fail=1
 fi
 # space-around: a leading margin (not flush left) but less than center's offset.
-if [ "${ONEX[4]}" -gt 150 ] && [ "${ONEX[4]}" -lt "${ONEX[1]}" ]; then
+# Per spec the leading margin is free/(2*n): with this fixture's free≈680 and
+# n=3 items that is ≈113px (item group symmetric — the trailing margin measures
+# the same), so the first item lands at ~121 (engine 124). Chrome renders the
+# same modest inset. The old `>150` lower bound was wrong (it demanded MORE than
+# a full free/2n margin); assert instead a real inset (>100) that is clearly less
+# than center's free/2 offset.
+if [ "${ONEX[4]}" -gt 100 ] && [ "${ONEX[4]}" -lt "${ONEX[1]}" ]; then
     echo "[hb-flexjust] PASS space-around leaves margins around items (One=${ONEX[4]})"
 else
     echo "[hb-flexjust] FAIL space-around wrong (One=${ONEX[4]} center=${ONEX[1]})"; fail=1
@@ -109,11 +115,18 @@ DL="$OUT/flexlist.txt"
 "$BIN" tests/fixtures/hambrowse_flexlist.html 800 >"$DL" 2>&1 \
     || { echo "[hb-flexjust] FAIL: flexlist render exited non-zero"; cat "$DL"; exit 1; }
 
-# (2) the flex <ul style="background:#2b3a55"> paints a full-width background bar.
-if grep -Eq 'FILL [0-9]+ [0-9]+ 1[0-9][0-9] 7[0-9][0-9] #2b3a55' "$DL"; then
-    echo "[hb-flexjust] PASS flex <ul> paints its own background bar (gap #3)"
+# (2) the flex <ul style="background:#2b3a55"> paints a FULL-WIDTH background bar.
+# FILL fields: <top> <bot> <lx> <rx> #rgb ...  ($4=lx $5=rx $6=colour). The bar
+# now spans the whole flex row edge-to-edge ("FILL 2 3 0 800 #2b3a55 ..."), which
+# is the gap-#3 win the comment above describes. The old regex demanded lx∈100-199
+# / rx∈700-799 — a STALE indented expectation from before the list-indent reset
+# (gap #4) made the navbar flush; it never matched the correct full-width bar.
+# Assert a full-width bar: left flush (lx<=8, Chrome insets by the 8px body
+# margin) and right flush (rx>=780).
+if awk '$1=="FILL" && $6=="#2b3a55" && $4<=8 && $5>=780 {f=1} END{exit !f}' "$DL"; then
+    echo "[hb-flexjust] PASS flex <ul> paints its own full-width background bar (gap #3)"
 else
-    echo "[hb-flexjust] FAIL flex <ul> background bar missing"; grep -E 'FILL' "$DL"; fail=1
+    echo "[hb-flexjust] FAIL flex <ul> full-width background bar missing"; grep -E 'FILL' "$DL"; fail=1
 fi
 # (3) the flex list's items sit FLUSH (content-left ~108), not indented (~140).
 hx=$(grep -E 'SEG [0-9]+ [0-9]+ .*\|Home\|' "$DL" | awk '{print $3}' | head -1)

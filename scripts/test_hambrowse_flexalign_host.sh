@@ -47,10 +47,13 @@ D="$OUT/flexalign.txt"
 
 seg_row() { grep -E "SEG [0-9]+ [0-9]+ .*\|$1\|" "$D" | awk '{print $2}' | head -1; }
 seg_x()   { grep -E "SEG [0-9]+ [0-9]+ .*\|$1\|" "$D" | awk '{print $3}' | head -1; }
-# FILL <top> <bot> <lx> <rx> #rgb <rad> <z>  -> emit (bot-top) for a given
-# colour (tolerate the trailing border-radius + z-index suffix fields appended
-# to the fill dump — the count of trailing numeric fields has grown over time).
-fill_h()  { grep -E "^FILL [0-9]+ [0-9]+ .*#$1( [0-9]+)*$" "$D" | awk '{print $3-$2}' | head -1; }
+# FILL <top> <bot> <lx> <rx> #rgb <rad> <z> <...> b-  -> emit (bot-top) for a
+# given colour. The fill dump has grown trailing fields over time; a `b-` BORDER
+# field (non-numeric, appended by the border track: "...#44dd55 0 0 0 0 b-") now
+# terminates the record, so the old `( [0-9]+)*$` numeric-tail anchor no longer
+# matched. Anchor on the colour + a field boundary (space or EOL) instead and
+# ignore all trailing fields — the geometry we read ($3-$2 = bot-top) is intact.
+fill_h()  { grep -E "^FILL [0-9]+ [0-9]+ .*#$1( |$)" "$D" | awk '{print $3-$2}' | head -1; }
 
 # tall item first row + short item row, per container
 sa=$(seg_row Sa1); ss=$(seg_row Sshort); ssx=$(seg_x Sshort); sax=$(seg_x Sa1)

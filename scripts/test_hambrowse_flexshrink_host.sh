@@ -59,7 +59,13 @@ fw()  { grep -E "^FILL [0-9]+ [0-9]+ [0-9]+ [0-9]+ #$1( |\$)" "$D" | awk '{print
 frx() { grep -E "^FILL [0-9]+ [0-9]+ [0-9]+ [0-9]+ #$1( |\$)" "$D" | awk '{print $5}'    | head -1; }
 
 # The flex container's right edge (all three rows share the same content box).
-RIGHT=700          # observed container content right edge at render width 800
+# At render width 800 a body-level flex row spans the full viewport, so the shrunk
+# items end exactly at x=800 (verified: "FILL ... 528 800 #3333cc"). The old 700
+# was stale — it predated the full-width bar geometry and made every correctly-
+# fitting row read as an overflow. (Chrome would inset by the 8px body margin to
+# 792; the engine's separate, consistent full-width-bleed to 800 is out of scope
+# here — the point of this gate is that no item spills PAST the container edge.)
+RIGHT=800          # container content right edge at render width 800
 TOL=6              # px tolerance for the "no overflow past the edge" assertion
 
 # ---- (1) three flex-basis:300 items shrink EQUALLY to fit -------------------
@@ -104,8 +110,13 @@ echo "[hb-flexshrink] mixed-shrink widths: shrink1=$SMLO shrink3=$SMHI  lastRX=$
 if [ -z "$SMLO" ] || [ -z "$SMHI" ]; then
     echo "[hb-flexshrink] FAIL: missing a mixed-shrink fill"; cat "$D"; exit 1
 fi
-# same 400px basis: shrink:3 loses 3x what shrink:1 loses, so it ends clearly
-# narrower (spec: 350 vs 250 px), and the row still fits.
+# same 500px basis: shrink:3 loses 3x what shrink:1 loses. Two 500px items
+# overflow the ~800px row by 200px; that overflow is split 1:3 by scaled shrink
+# factor, so shrink:1 -> 450px and shrink:3 -> 350px (Chrome). shrink:3 ends
+# clearly narrower, and the row still fits. (The fixture previously used 400px
+# bases: 2*400 == the 800px container == ZERO overflow, so there was no free
+# space to distribute and the two items rendered near-equal — the fixture, not
+# the engine, was wrong; bumped to 500px to actually exercise proportional shrink.)
 if [ "$SMLO" -gt "$SMHI" ] && [ "$(( SMLO - SMHI ))" -ge 60 ] \
    && [ "$SMHIRX" -le "$(( RIGHT + TOL ))" ]; then
     echo "[hb-flexshrink] PASS mixed shrink factors distribute proportionally (shrink:3 narrower)"
