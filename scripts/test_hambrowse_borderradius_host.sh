@@ -89,14 +89,19 @@ assert_grep 'FILL [0-9]+ [0-9]+ [0-9]+ [0-9]+ #eeeeff 8' \
 assert_grep 'FILL [0-9]+ [0-9]+ [0-9]+ [0-9]+ #ffffee 0' \
     "background fill of the square box keeps radius 0"
 
-# 3. Pixel path: render to a PPM->PNG so the rounded/coloured frame is exercised
-#    by the real rasteriser (htmlpaint_stroke_round_rect / fill_round_rect).
+# 3. Pixel path: render to a PPM so the rounded/coloured frame is exercised by
+#    the real rasteriser (htmlpaint_stroke_round_rect / fill_round_rect), then
+#    PROVE the corners are actually cut. hb_borderradius_probe.py samples the
+#    large-radius solid #0040ff box: the four CORNER pixels must show the page
+#    background (fill does NOT reach them) while the CENTRE + four edge midpoints
+#    ARE the fill colour — an unambiguous "the corners are round" pixel check.
 PPM="$OUT/br.ppm"; PNG="$OUT/br.png"
 if "$GFX" "$FIX" "$PPM" 800 >"$OUT/br_gfx_dump.txt" 2>&1; then
-    if python3 scripts/ppm_to_png.py "$PPM" "$PNG" 2>"$OUT/br_png.log"; then
-        echo "[hb-br] PASS pixel render -> $PNG ($(file -b "$PNG" 2>/dev/null))"
+    python3 scripts/ppm_to_png.py "$PPM" "$PNG" 2>"$OUT/br_png.log" || true
+    if python3 scripts/hb_borderradius_probe.py "$OUT/br_gfx_dump.txt" "$PPM"; then
+        echo "[hb-br] PASS corner-cut pixel probe (-> $PNG)"
     else
-        echo "[hb-br] FAIL png conversion"; cat "$OUT/br_png.log"; fail=1
+        echo "[hb-br] FAIL corner-cut pixel probe"; fail=1
     fi
 else
     echo "[hb-br] FAIL: pixel render exited non-zero"; cat "$OUT/br_gfx_dump.txt"; fail=1
