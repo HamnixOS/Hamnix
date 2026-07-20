@@ -1054,6 +1054,26 @@ def _files_hammark() -> list[tuple[Path, str]]:
     return f
 
 
+# The repo-ONLY unit converter. Same pattern: built + published in the main
+# channel but kept out of the hamnix-base closure below, so `hpm install
+# hamnix-hamconvert` / the Software app is the only way to get it. Eight
+# categories (Length / Mass / Temperature / Volume / Area / Time / Data / Speed)
+# with exact conversion factors and affine temperature. Depends only on the
+# compositor (scene DE).
+HAMCONVERT_PKG = "hamnix-hamconvert"
+
+
+def _files_hamconvert() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hamconvert")
+    # Launcher lives in etc/hamde/apps-optional/ (NOT etc/hamde/apps/, which the
+    # base hamnix-desktop-config package globs wholesale) and is staged into the
+    # live /etc/hamde/apps ONLY when this package is installed.
+    f.append((ETC_DIR / "hamde" / "apps-optional" / "hamconvert.desktop",
+              "etc/hamde/apps/hamconvert.desktop"))
+    return f
+
+
 HAMANGRYBIRDS_PKG = "hamnix-hamangrybirds"
 
 
@@ -1401,6 +1421,24 @@ PACKAGE_SPECS.append({
 })
 
 
+# The repo-ONLY unit converter. Same pattern: built + published in the main
+# channel but kept out of the hamnix-base closure below. Depends only on the
+# compositor (scene DE).
+PACKAGE_SPECS.append({
+    "name": HAMCONVERT_PKG,
+    "files_fn": _files_hamconvert,
+    "depends": [f"hamnix-desktop-core>={PKG_VERSION}"],
+    "description": ("HamConvert — Hamnix unit converter: eight categories "
+                    "(Length, Mass, Temperature, Volume, Area, Time, Data, "
+                    "Speed) with a category sidebar, FROM/TO unit lists, a live "
+                    "result and a quick 1-to-many table. Exact conversion "
+                    "factors, affine temperature (Celsius / Fahrenheit / "
+                    "Kelvin) and decimal-SI data units (KB = 1000 bytes). "
+                    "Repo-only: install from 255.one, not pre-installed."),
+    "target": "#hamnix-system",
+})
+
+
 # ---------------------------------------------------------------------
 # Generic spec-driven package builder
 # ---------------------------------------------------------------------
@@ -1528,6 +1566,8 @@ def build_hamnix_base() -> dict:
     leaf_names.add(HAMCLOCK_PKG)
     # The repo-only Markdown viewer is likewise NOT pre-installed.
     leaf_names.add(HAMMARK_PKG)
+    # The repo-only unit converter is likewise NOT pre-installed.
+    leaf_names.add(HAMCONVERT_PKG)
     depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS
                if s["name"] not in leaf_names]
     depends.append(f"hamnix-bootloader>={PKG_VERSION}")
