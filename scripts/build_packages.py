@@ -1040,6 +1040,20 @@ def _files_hamclock() -> list[tuple[Path, str]]:
     return f
 
 
+HAMMARK_PKG = "hamnix-hammark"
+
+
+def _files_hammark() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hammark")
+    # Launcher lives in etc/hamde/apps-optional/ (NOT etc/hamde/apps/, which the
+    # base hamnix-desktop-config package globs wholesale) and is staged into the
+    # live /etc/hamde/apps ONLY when this package is installed.
+    f.append((ETC_DIR / "hamde" / "apps-optional" / "hammark.desktop",
+              "etc/hamde/apps/hammark.desktop"))
+    return f
+
+
 HAMANGRYBIRDS_PKG = "hamnix-hamangrybirds"
 
 
@@ -1366,6 +1380,27 @@ PACKAGE_SPECS.append({
 })
 
 
+# The repo-ONLY Markdown document viewer. Same pattern: built + published in the
+# main channel but kept out of the hamnix-base closure below, so `hpm install
+# hamnix-hammark` / the Software app is the only way to get it. Reads the OS's
+# own on-device .md docs as a formatted, scrollable page. Depends only on the
+# compositor (v2-blit DE).
+PACKAGE_SPECS.append({
+    "name": HAMMARK_PKG,
+    "files_fn": _files_hammark,
+    "depends": [f"hamnix-desktop-core>={PKG_VERSION}"],
+    "description": ("HamMark — Hamnix Markdown document viewer: parses a useful "
+                    "CommonMark subset (ATX headings, bold / italic / inline "
+                    "code, links, fenced code blocks, unordered + ordered "
+                    "lists, blockquotes, horizontal rules) and lays it out as a "
+                    "scrollable formatted page — larger headings, wrapped "
+                    "paragraphs, a monospace code slab, a blockquote accent bar "
+                    "and a scrollbar. Arrow / PageUp-Down / mouse-wheel scroll. "
+                    "Repo-only: install from 255.one, not pre-installed."),
+    "target": "#hamnix-system",
+})
+
+
 # ---------------------------------------------------------------------
 # Generic spec-driven package builder
 # ---------------------------------------------------------------------
@@ -1491,6 +1526,8 @@ def build_hamnix_base() -> dict:
     # The repo-only office presentation app is likewise NOT pre-installed.
     leaf_names.add(HAMSLIDES_PKG)
     leaf_names.add(HAMCLOCK_PKG)
+    # The repo-only Markdown viewer is likewise NOT pre-installed.
+    leaf_names.add(HAMMARK_PKG)
     depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS
                if s["name"] not in leaf_names]
     depends.append(f"hamnix-bootloader>={PKG_VERSION}")

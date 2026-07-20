@@ -1,0 +1,368 @@
+# user/hammark.ad
+#
+# HamMark — a native Markdown document VIEWER for the Hamnix desktop
+# (/bin/hammark). A REPO-ONLY app (installed from the packages repo, not baked
+# into the base image) so the OS's own on-device .md docs read as a formatted
+# page instead of raw text.
+#
+# ARCHITECTURE (mirrors user/hampaint.ad / user/hamview.ad's proven bring-up):
+#   * All parse + layout + render lives in lib/hammarkcore.ad — a PURE,
+#     extern-free, DUAL-TARGET module (native here + host in
+#     user/hammark_host.ad). This shell only does window/event/file plumbing.
+#   * Pixels reach the screen via the compositor's v2 blit protocol: we own an
+#     RGBA8888 backbuffer (hamui v2), composite the whole view into it, and
+#     re-blit the full window on each scroll (a document view has no per-damage
+#     hot path — scrolls move everything).
+#   * The TEXT EDGE: the driver reads the .md file named on argv (or a bundled
+#     sample when launched with no argument) and injects the bytes into the
+#     core with hammark_set_text(); the core never does I/O.
+#
+# CONTROLS: Up/Down or j/k scroll a line; PageUp/PageDown or Space/b a page;
+# g/Home top, G/End bottom; the mouse wheel scrolls. Read-only viewer.
+#
+# ADDER QUIRKS HONOURED (memory/feedback_compiler_quirks): big buffers at module
+# scope (no malloc/large locals), string literals passed at the call site,
+# cast[T](x)/&arr[0] throughout.
+
+from lib.hamui import (
+    hamui_init, hamui_window_on,
+    hamui_set_protocol_v2_dims, hamui_v2_bb_ptr, hamui_v2_bb_w,
+    hamui_v2_bb_h, hamui_v2_commit_rect
+)
+from lib.hammarkcore import (
+    hammark_init, hammark_set_text, hammark_set_fname, hammark_render,
+    hammark_key_line, hammark_scroll_wheel, hammark_load_sample,
+    hammark_win_w, hammark_win_h
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield() -> int32
+extern def sys_waitfds(fds: Ptr[int32], nfds: uint64, timeout_ms: int64) -> int64
+extern def sys_bind(new_path: Ptr[char], old_path: Ptr[char], flag: int32) -> int32
+
+
+# ---- module buffers -------------------------------------------------
+_mk_path_buf:   Array[128, uint8]
+_mk_markup_buf: Array[128, uint8]
+_mk_doc:        Array[32768, uint8]
+_mk_ev_buf:     Array[256, uint8]
+_mk_ev_carry:   uint64 = 0
+_mk_kev_buf:    Array[512, uint8]
+_mk_kev_carry:  uint64 = 0
+_mk_evt_fd:     int32 = -1
+_mk_keys_fd:    int32 = -1
+_mk_wid:        int32 = 0
+
+
+# ====================================================================
+# tiny helpers
+# ====================================================================
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _puts(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
+
+
+def _put_s(dst: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
+    j: uint64 = 0
+    while s[j] != 0:
+        dst[pos] = s[j]
+        pos = pos + 1
+        j = j + 1
+    return pos
+
+
+def _put_dec(dst: Ptr[uint8], pos: uint64, v: uint64) -> uint64:
+    if v == 0:
+        dst[pos] = 48
+        return pos + 1
+    tmp: Array[24, uint8]
+    t: uint64 = 0
+    while v != 0:
+        tmp[t] = cast[uint8](v % 10) + 48
+        v = v / 10
+        t = t + 1
+    while t > 0:
+        t = t - 1
+        dst[pos] = tmp[t]
+        pos = pos + 1
+    return pos
+
+
+# ====================================================================
+# Window bring-up (mirrors hampaint: newwindow -> geometry/decorate/title,
+# then opt into the v2 blit protocol).
+# ====================================================================
+def _newwindow() -> int32:
+    wfd: int32 = sys_open_write(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if wfd < 0:
+        return -1
+    sys_write(wfd, cast[Ptr[uint8]]("newwindow\n"), 10)
+    sys_close(wfd)
+    rfd: int32 = sys_open(cast[Ptr[char]]("/dev/wsys/ctl"))
+    if rfd < 0:
+        return -1
+    rbuf: Array[32, uint8]
+    r: int64 = sys_read(rfd, &rbuf[0], 31)
+    sys_close(rfd)
+    if r <= 0:
+        return -1
+    wid: int32 = 0
+    i: uint64 = 0
+    while i < cast[uint64](r):
+        c: uint8 = rbuf[i]
+        if c >= 48 and c <= 57:
+            wid = wid * 10 + cast[int32](c) - 48
+        i = i + 1
+    return wid
+
+
+def _win_path(wid: int32, leaf: Ptr[uint8]):
+    i: uint64 = 0
+    i = _put_s(&_mk_path_buf[0], i, "/dev/wsys/")
+    i = _put_dec(&_mk_path_buf[0], i, cast[uint64](wid))
+    i = _put_s(&_mk_path_buf[0], i, leaf)
+    _mk_path_buf[i] = 0
+
+
+def _wctl(wid: int32, verb: Ptr[uint8]):
+    _win_path(wid, "/ctl")
+    fd: int32 = sys_open_write(cast[Ptr[char]](&_mk_path_buf[0]))
+    if fd >= 0:
+        sys_write(fd, verb, _strlen(verb))
+        sys_close(fd)
+
+
+# Publish the committed v2 backbuffer to the scene compositor.
+def _present(wid: int32):
+    _win_path(wid, "/scene")
+    sfd: int32 = sys_open_write(cast[Ptr[char]](&_mk_path_buf[0]))
+    if sfd >= 0:
+        m: uint64 = 0
+        m = _put_s(&_mk_markup_buf[0], m, "buffer 0 0 ")
+        m = _put_dec(&_mk_markup_buf[0], m, cast[uint64](hammark_win_w()))
+        _mk_markup_buf[m] = 32
+        m = m + 1
+        m = _put_dec(&_mk_markup_buf[0], m, cast[uint64](hammark_win_h()))
+        _mk_markup_buf[m] = 10
+        m = m + 1
+        sys_write(sfd, &_mk_markup_buf[0], m)
+        sys_close(sfd)
+    _wctl(wid, "commit\n")
+
+
+def _repaint(wid: int32):
+    bb: Ptr[uint8] = hamui_v2_bb_ptr()
+    if bb == cast[Ptr[uint8]](0):
+        return
+    hammark_render(bb, hamui_v2_bb_w(), hamui_v2_bb_h())
+    hamui_v2_commit_rect(0, 0, hammark_win_w(), hammark_win_h())
+    _present(wid)
+
+
+# ====================================================================
+# Load the markdown file named on argv into the core; set the title-bar name
+# to its basename. Falls back to the bundled sample if the path is missing.
+# ====================================================================
+def _basename(path: Ptr[uint8]) -> Ptr[uint8]:
+    last: int64 = -1
+    i: uint64 = 0
+    while path[i] != 0:
+        if path[i] == 47:                              # '/'
+            last = cast[int64](i)
+        i = i + 1
+    if last < 0:
+        return path
+    return &path[cast[uint64](last) + 1]
+
+
+def _load_file(path: Ptr[uint8]) -> int32:
+    fd: int32 = sys_open(cast[Ptr[char]](path))
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while total < 32768:
+        r: int64 = sys_read(fd, &_mk_doc[total], 32768 - total)
+        if r <= 0:
+            break
+        total = total + cast[uint64](r)
+    sys_close(fd)
+    hammark_set_fname(_basename(path))
+    hammark_set_text(&_mk_doc[0], total)
+    return 0
+
+
+# ====================================================================
+# Pointer wire line parse "m x y buttons dz" -> the wheel delta (field 3).
+# ====================================================================
+def _handle_pointer(ls: uint64, le: uint64) -> int32:
+    p: uint64 = ls
+    if p >= le or _mk_ev_buf[p] != 109:                # 'm'
+        return 0
+    p = p + 1
+    f: int32 = 0
+    dz: int64 = 0
+    while f < 4:
+        while p < le and _mk_ev_buf[p] == 32:
+            p = p + 1
+        neg: int32 = 0
+        if p < le and _mk_ev_buf[p] == 45:
+            neg = 1
+            p = p + 1
+        v: int64 = 0
+        d: int32 = 0
+        while p < le and _mk_ev_buf[p] >= 48 and _mk_ev_buf[p] <= 57:
+            v = v * 10 + cast[int64](_mk_ev_buf[p]) - 48
+            p = p + 1
+            d = 1
+        if neg != 0:
+            v = 0 - v
+        if d == 0:
+            break
+        if f == 3:
+            dz = v
+        f = f + 1
+    if dz != 0:
+        return hammark_scroll_wheel(cast[int32](dz))
+    return 0
+
+
+def _poll_events(wid: int32) -> int32:
+    if _mk_evt_fd < 0:
+        return 0
+    changed: int32 = 0
+    passes: int32 = 0
+    while passes < 6:
+        passes = passes + 1
+        room: uint64 = 256 - _mk_ev_carry
+        if room == 0:
+            _mk_ev_carry = 0
+            room = 256
+        en: int64 = sys_read_nb(_mk_evt_fd, &_mk_ev_buf[_mk_ev_carry], room)
+        if en <= 0:
+            break
+        total: uint64 = _mk_ev_carry + cast[uint64](en)
+        i: uint64 = 0
+        ls: uint64 = 0
+        while i < total:
+            if _mk_ev_buf[i] == 10:
+                if i > ls and _mk_ev_buf[ls] == 109:
+                    if _handle_pointer(ls, i) != 0:
+                        changed = 1
+                ls = i + 1
+            i = i + 1
+        leftover: uint64 = total - ls
+        k: uint64 = 0
+        while k < leftover:
+            _mk_ev_buf[k] = _mk_ev_buf[ls + k]
+            k = k + 1
+        _mk_ev_carry = leftover
+    return changed
+
+
+def _drain_keys(n: uint64, changed_p: Ptr[int32]) -> uint64:
+    i: uint64 = 0
+    consumed: uint64 = 0
+    while i < n:
+        ls: uint64 = i
+        while i < n and _mk_kev_buf[i] != 10:
+            i = i + 1
+        if i >= n:
+            return consumed
+        if hammark_key_line(&_mk_kev_buf[ls], i - ls) != 0:
+            changed_p[0] = 1
+        i = i + 1
+        consumed = i
+    return consumed
+
+
+def _poll_keys(wid: int32) -> int32:
+    if _mk_keys_fd < 0:
+        return 0
+    room: uint64 = 512 - _mk_kev_carry
+    if room == 0:
+        _mk_kev_carry = 0
+        room = 512
+    kn: int64 = sys_read_nb(_mk_keys_fd, &_mk_kev_buf[_mk_kev_carry], room)
+    if kn <= 0:
+        return 0
+    total: uint64 = _mk_kev_carry + cast[uint64](kn)
+    changed: int32 = 0
+    done: uint64 = _drain_keys(total, &changed)
+    leftover: uint64 = total - done
+    m: uint64 = 0
+    while m < leftover:
+        _mk_kev_buf[m] = _mk_kev_buf[done + m]
+        m = m + 1
+    _mk_kev_carry = leftover
+    return changed
+
+
+# ====================================================================
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    sys_bind(cast[Ptr[char]]("/dev"), cast[Ptr[char]]("#c"), 0)
+    hamui_init()
+    hammark_init()
+
+    if argc >= 2 and argv != cast[Ptr[uint64]](0):
+        if _load_file(cast[Ptr[uint8]](argv[1])) != 0:
+            hammark_load_sample()
+    else:
+        hammark_load_sample()
+
+    wid: int32 = _newwindow()
+    if wid < 1:
+        _puts(2, cast[Ptr[uint8]]("hammark: newwindow failed\n"))
+        return 1
+    _mk_wid = wid
+    _wctl(wid, "geometry 90 50 620 560\n")
+    _wctl(wid, "decorate 1\n")
+    _wctl(wid, "z 6\n")
+    _wctl(wid, "title HamMark\n")
+
+    hamui_window_on(0, wid)
+    if hamui_set_protocol_v2_dims(hammark_win_w(), hammark_win_h()) < 0:
+        _puts(2, cast[Ptr[uint8]]("hammark: v2 blit negotiate failed\n"))
+        return 1
+
+    _repaint(wid)
+    _puts(2, cast[Ptr[uint8]]("HAMMARK ready\n"))
+
+    _win_path(wid, "/event")
+    _mk_evt_fd = sys_open(cast[Ptr[char]](&_mk_path_buf[0]))
+    _win_path(wid, "/keys")
+    _mk_keys_fd = sys_open(cast[Ptr[char]](&_mk_path_buf[0]))
+
+    IDLE_WAIT_MS: int64 = 40
+    while True:
+        did: int32 = 0
+        if _poll_events(wid) != 0:
+            did = 1
+        if _poll_keys(wid) != 0:
+            did = 1
+        if did != 0:
+            _repaint(wid)
+        else:
+            wfds: Array[2, int32]
+            nf: uint64 = 0
+            if _mk_keys_fd >= 0:
+                wfds[nf] = _mk_keys_fd
+                nf = nf + 1
+            if _mk_evt_fd >= 0:
+                wfds[nf] = _mk_evt_fd
+                nf = nf + 1
+            if nf > 0:
+                sys_waitfds(&wfds[0], nf, IDLE_WAIT_MS)
+            else:
+                sys_yield()
+    return 0
