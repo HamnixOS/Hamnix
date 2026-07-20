@@ -1074,6 +1074,27 @@ def _files_hamconvert() -> list[tuple[Path, str]]:
     return f
 
 
+# The repo-ONLY EXPRESSION calculator. Same pattern: built + published in the
+# main channel but kept out of the hamnix-base closure below, so `hpm install
+# hamnix-hammath` / the Software app is the only way to get it. Unlike the
+# pre-installed immediate calculator (hamnix-hamcalc), HamMath builds a whole
+# expression on the LCD and evaluates it with correct operator precedence,
+# parentheses and unary minus (2+3*4 = 14, (2+3)*4 = 20). Depends only on the
+# compositor (scene DE).
+HAMMATH_PKG = "hamnix-hammath"
+
+
+def _files_hammath() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hammath")
+    # Launcher lives in etc/hamde/apps-optional/ (NOT etc/hamde/apps/, which the
+    # base hamnix-desktop-config package globs wholesale) and is staged into the
+    # live /etc/hamde/apps ONLY when this package is installed.
+    f.append((ETC_DIR / "hamde" / "apps-optional" / "hammath.desktop",
+              "etc/hamde/apps/hammath.desktop"))
+    return f
+
+
 HAMANGRYBIRDS_PKG = "hamnix-hamangrybirds"
 
 
@@ -1439,6 +1460,25 @@ PACKAGE_SPECS.append({
 })
 
 
+# The repo-ONLY expression calculator. Same pattern: built + published in the
+# main channel but kept out of the hamnix-base closure below. Depends only on
+# the compositor (scene DE).
+PACKAGE_SPECS.append({
+    "name": HAMMATH_PKG,
+    "files_fn": _files_hammath,
+    "depends": [f"hamnix-desktop-core>={PKG_VERSION}"],
+    "description": ("HamMath — Hamnix expression calculator: build a whole "
+                    "arithmetic expression on the LCD (2+3*4, (2+3)*4, -(3+2)) "
+                    "and evaluate it with correct operator PRECEDENCE, "
+                    "PARENTHESES, unary minus and decimals via a recursive-"
+                    "descent, fixed-point (no-FPU) evaluator. A 5x4 keypad with "
+                    "digits, + - * /, parentheses, backspace and =. Unlike the "
+                    "pre-installed immediate calculator, it honours precedence. "
+                    "Repo-only: install from 255.one, not pre-installed."),
+    "target": "#hamnix-system",
+})
+
+
 # ---------------------------------------------------------------------
 # Generic spec-driven package builder
 # ---------------------------------------------------------------------
@@ -1568,6 +1608,8 @@ def build_hamnix_base() -> dict:
     leaf_names.add(HAMMARK_PKG)
     # The repo-only unit converter is likewise NOT pre-installed.
     leaf_names.add(HAMCONVERT_PKG)
+    # The repo-only expression calculator is likewise NOT pre-installed.
+    leaf_names.add(HAMMATH_PKG)
     depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS
                if s["name"] not in leaf_names]
     depends.append(f"hamnix-bootloader>={PKG_VERSION}")

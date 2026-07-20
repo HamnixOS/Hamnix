@@ -134,10 +134,10 @@ lives in an **extern-free core** that imports only `lib/hamscene.ad`.
 | `lib/hamui.ad` | native toolkit; keeps `hamscene_commit` (9P sink), re-exports the builders |
 | `lib/hamui_host.ad` | HOST rasterizer sink (scene → RGB framebuffer → PPM) |
 | `lib/hamui_host_font.ad` | 8x16 VGA font table (generated) |
-| `lib/ham2048core.ad`, `lib/hamcalccore.ad` | example app cores |
-| `user/ham2048scene.ad`, `user/hamcalcscene.ad` | native drivers (transport only) |
-| `user/ham2048scene_host.ad`, `user/hamcalcscene_host.ad` | host drivers |
-| `scripts/test_ham2048_host.sh`, `scripts/test_hamcalc_host.sh` | Tier-1 gates |
+| `lib/ham2048core.ad`, `lib/hamcalccore.ad`, `lib/hammathcore.ad` | example app cores (hammath = repo-only expression calculator: recursive-descent precedence + parens evaluator) |
+| `user/ham2048scene.ad`, `user/hamcalcscene.ad`, `user/hammath.ad` | native drivers (transport only) |
+| `user/ham2048scene_host.ad`, `user/hamcalcscene_host.ad`, `user/hammath_host.ad` | host drivers |
+| `scripts/test_ham2048_host.sh`, `scripts/test_hamcalc_host.sh`, `scripts/test_hammath_host.sh` | Tier-1 gates |
 | `scripts/ppm_to_png.py` | stdlib-only PPM→PNG converter |
 
 ## Apps ready to be dual-targeted next
